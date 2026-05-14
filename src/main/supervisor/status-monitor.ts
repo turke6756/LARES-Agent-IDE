@@ -45,7 +45,7 @@ export class StatusMonitor extends EventEmitter {
           // Shorter hold for idle transitions (agent finished), longer for working
           this.statusHoldUntil.set(agent.id, Date.now() + (newStatus === 'idle' ? 1500 : 2500));
           addEvent(agent.id, 'status_change', JSON.stringify({ from: agent.status, to: newStatus }));
-          this.emit('statusChanged', { agentId: agent.id, status: newStatus });
+          this.emit('statusChanged', { agentId: agent.id, status: newStatus, fromStatus: agent.status });
         }
       } catch {
         // Ignore individual agent check failures

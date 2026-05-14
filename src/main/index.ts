@@ -197,7 +197,7 @@ app.whenReady().then(async () => {
 
   try {
     console.log('Initializing database...');
-    await initDatabase();
+    initDatabase();
     console.log('Database initialized');
 
     supervisor = new AgentSupervisor();

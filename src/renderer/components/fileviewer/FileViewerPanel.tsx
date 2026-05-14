@@ -14,13 +14,22 @@ import { ArrowLeft } from 'lucide-react';
 function useSwipeRight(onSwipe: () => void) {
   const startRef = useRef<{ x: number; y: number } | null>(null);
   const onPointerDown = useCallback((e: React.PointerEvent) => {
+    if (e.pointerType === 'mouse') {
+      startRef.current = null;
+      return;
+    }
     startRef.current = { x: e.clientX, y: e.clientY };
   }, []);
   const onPointerUp = useCallback((e: React.PointerEvent) => {
+    if (e.pointerType === 'mouse') {
+      startRef.current = null;
+      return;
+    }
     if (!startRef.current) return;
     const dx = e.clientX - startRef.current.x;
     const dy = Math.abs(e.clientY - startRef.current.y);
     startRef.current = null;
+    if (window.getSelection()?.toString()) return;
     if (dx > 80 && dy < 60) onSwipe();
   }, [onSwipe]);
   return { onPointerDown, onPointerUp };

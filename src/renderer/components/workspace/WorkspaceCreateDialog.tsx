@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { createPortal } from 'react-dom';
 import { useDashboardStore } from '../../stores/dashboard-store';
 import type { PathType } from '../../../shared/types';
+import { detectSyncFolder } from '../../../shared/sync-folder-detection';
 
 function uncToLinuxPath(p: string): string | null {
   const match = p.match(/^\\\\wsl[\.\$][^\\]*\\[^\\]+(\\.*)/i);
@@ -56,6 +57,8 @@ export default function WorkspaceCreateDialog({ onClose }: { onClose: () => void
     selectWorkspace(ws.id);
     onClose();
   };
+
+  const syncHit = detectSyncFolder(dirPath);
 
   return createPortal(
     <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50" onClick={onClose}>
@@ -155,6 +158,16 @@ export default function WorkspaceCreateDialog({ onClose }: { onClose: () => void
               placeholder="Optional description"
             />
           </div>
+
+          {syncHit && (
+            <div className="rounded border border-yellow-500/40 bg-yellow-500/10 px-3 py-2 text-[12px] text-yellow-200">
+              This folder is inside {syncHit.provider}. The dashboard's own database is
+              stored under <code>%APPDATA%</code> and is safe. But per-workspace agent
+              state and supervisor files written here may be uploaded mid-write by{' '}
+              {syncHit.provider}, leading to torn syncs across machines. Recommended:
+              use a workspace outside synced folders for active agent work.
+            </div>
+          )}
 
           <div className="flex justify-end gap-2 pt-1">
             <button

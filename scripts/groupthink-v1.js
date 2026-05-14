@@ -168,22 +168,23 @@ async function readNextMessage(base, agentId) {
   return msg;
 }
 
-async function waitTurnComplete(base, agentId, label, timeoutMs = 300000) {
+async function waitTurnComplete(base, agentId, label, timeoutMs = 600000) {
+  // Source of truth: the message stream's `turnComplete` flag, not the agent's
+  // status field. Status lags by minutes on some providers (codex especially)
+  // while the chat-ingestion layer marks `turnComplete: true` the instant the
+  // final assistant message lands. We poll messages directly and only consult
+  // status as a hard-exit signal for crashed/done agents.
+  // See docs/STATUS_FROM_TURNCOMPLETE.md for the underlying issue.
   const deadline = Date.now() + timeoutMs;
-  let stableIdlePolls = 0;
   while (Date.now() < deadline) {
+    const msg = await readNextMessage(base, agentId);
+    if (msg) return msg;
+
     const agent = await apiJson(base, 'GET', `/api/agents/${agentId}`);
-    if (READY_STATUSES.has(agent.status)) {
-      const msg = await readNextMessage(base, agentId);
-      if (msg) {
-        stableIdlePolls++;
-        if (stableIdlePolls >= MIN_READY_POLLS) return msg;
-      } else {
-        stableIdlePolls = 0; // idle but no fresh turn yet
-      }
-    } else {
-      stableIdlePolls = 0;
+    if (agent.status === 'crashed' || agent.status === 'done') {
+      throw new Error(`${label} (${agentId}) exited with status=${agent.status} before completing turn`);
     }
+
     await sleep(POLL_INTERVAL_MS);
   }
   throw new Error(`Timeout waiting for ${label} (${agentId}) to complete turn`);

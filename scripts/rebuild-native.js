@@ -65,3 +65,11 @@ execSync(
 );
 
 console.log('node-pty rebuilt successfully for Electron ' + electronVersion);
+
+// ── better-sqlite3 ─────────────────────────────────────────────────────────
+console.log(`Rebuilding better-sqlite3 for Electron ${electronVersion}...`);
+execSync(
+  `npx @electron/rebuild -f -o better-sqlite3 -v ${electronVersion}`,
+  { cwd: path.join(__dirname, '..'), stdio: 'inherit' }
+);
+console.log('better-sqlite3 rebuilt successfully for Electron ' + electronVersion);

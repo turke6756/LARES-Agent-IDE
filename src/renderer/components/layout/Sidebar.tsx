@@ -8,6 +8,7 @@ import DirectoryTreeNode from '../fileviewer/DirectoryTreeNode';
 import type { DirectoryEntry, PathType } from '../../../shared/types';
 import logoImg from '../../assets/logo.png';
 import { useNamePrompt } from '../../hooks/useNamePrompt';
+import { detectSyncFolder } from '../../../shared/sync-folder-detection';
 
 function InlineWorkspaceTree({ rootPath, pathType, workspaceId }: { rootPath: string; pathType: PathType; workspaceId: string }) {
   const [rootEntries, setRootEntries] = useState<DirectoryEntry[]>([]);
@@ -218,6 +219,14 @@ export default function Sidebar({ width }: SidebarProps) {
     const segments = folderPath.replace(/\\/g, '/').split('/').filter(Boolean);
     const title = segments[segments.length - 1] || 'Workspace';
 
+    const syncHit = detectSyncFolder(folderPath);
+    if (syncHit) {
+      console.warn(
+        `[workspace] ${folderPath} is inside ${syncHit.provider} — ` +
+        `per-workspace state may tear across syncs. See docs/PERSISTENCE_HARDENING.md`
+      );
+    }
+
     try {
       const ws = await window.api.workspaces.create({ title, path: folderPath, pathType });
       await loadWorkspaces();
@@ -339,6 +348,14 @@ export default function Sidebar({ width }: SidebarProps) {
                     <span className="flex-1 text-[13px] font-medium truncate">
                       {ws.title}
                     </span>
+                    {detectSyncFolder(ws.path) && (
+                      <span
+                        className="ml-1 inline-block rounded bg-yellow-500/15 px-1 text-[10px] text-yellow-300"
+                        title={`Inside ${detectSyncFolder(ws.path)!.provider} — sync may tear agent files`}
+                      >
+                        ⚠
+                      </span>
+                    )}
                     {heat && <HeatDot activeCount={heat.activeCount} workingCount={heat.workingCount} />}
                   </div>
 

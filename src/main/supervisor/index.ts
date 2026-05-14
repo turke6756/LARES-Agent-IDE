@@ -328,7 +328,7 @@ export class AgentSupervisor extends EventEmitter {
 
   // ── Event Bridge: auto-notify supervisor of supervised agent changes ──
 
-  private async handleSupervisorEvent(data: { agentId: string; status: AgentStatus }): Promise<void> {
+  private async handleSupervisorEvent(data: { agentId: string; status: AgentStatus; fromStatus?: AgentStatus }): Promise<void> {
     try {
       const agent = getAgent(data.agentId);
       if (!agent || agent.isSupervisor || !agent.isSupervised) return;
@@ -337,8 +337,9 @@ export class AgentSupervisor extends EventEmitter {
       const triggerStatuses: AgentStatus[] = ['idle', 'crashed', 'done'];
       if (!triggerStatuses.includes(data.status)) return;
 
-      // Skip no-op transitions (e.g. idle → idle)
-      if (agent.status === data.status) return;
+      // Skip no-op transitions. data.fromStatus is the pre-update status; agent.status
+      // is read after updateAgentStatus has already committed, so we can't compare to it.
+      if (data.fromStatus !== undefined && data.fromStatus === data.status) return;
 
       const supervisor = getSupervisorAgent(agent.workspaceId);
       if (!supervisor || ['done', 'crashed'].includes(supervisor.status)) return;
@@ -356,7 +357,7 @@ export class AgentSupervisor extends EventEmitter {
         agentId: agent.id,
         agentTitle: agent.title,
         workspaceId: agent.workspaceId,
-        fromStatus: agent.status, // previous status (from DB before update propagates)
+        fromStatus: data.fromStatus ?? agent.status,
         toStatus: data.status,
         lastExitCode: agent.lastExitCode,
         contextPercentage: stats?.contextPercentage,

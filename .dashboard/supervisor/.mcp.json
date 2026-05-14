@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "agent-dashboard": {
+      "command": "node",
+      "args": [
+        "C:/Users/turke/Projects/AgentDashboard/scripts/mcp-supervisor.js"
+      ],
+      "env": {
+        "AGENT_DASHBOARD_API_PORT": "24678"
+      }
+    }
+  }
+}

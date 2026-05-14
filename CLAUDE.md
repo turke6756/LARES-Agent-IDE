@@ -4,18 +4,28 @@ Workspace-centric Claude Agent Dashboard built with Electron + React.
 
 ## Launching the App
 
-### Production build (recommended for testing changes)
+### Restarting (default for agents)
+
+When asked to "restart the app" — for example, to pick up edits made during a
+session — **always rebuild first**. There is no main-process file-watcher, so
+a relaunch without a build silently runs the previous compiled `dist/` and any
+fix you just shipped will appear missing.
 
 ```bash
-npm run build      # builds main (TypeScript) + renderer (Vite)
-npm run start      # launches Electron, loads from dist/
+npm run restart    # builds main + renderer, then launches Electron
 ```
 
-### Development mode (hot-reload)
+Agents should treat `npm run restart` as the canonical restart command. Use it
+even if you're not sure what changed since the last launch — rebuild is cheap
+(~10 seconds) and prevents stale-build confusion.
 
-```bash
-npm run dev        # builds main, starts Vite dev server + Electron concurrently
-```
+### Other modes
+
+| Command            | When to use                                                                                          |
+|--------------------|------------------------------------------------------------------------------------------------------|
+| `npm run dev`      | Active development. Builds main once, launches with Vite HMR for the renderer. **Main-process edits still require a relaunch** — HMR covers React only. |
+| `npm run start`    | Launch the existing `dist/` artifact without rebuilding. Only use if you know `dist/` is already current.   |
+| `npm run build`    | Compile both main + renderer without launching.                                                       |
 
 ### Ghost Vite Server Warning
 
@@ -31,18 +41,19 @@ lsof -i :5173       # or: ps aux | grep vite
 kill -9 <PID>
 
 # Rebuild and launch
-npm run build && npm run start
+npm run restart
 ```
 
 ## Build Commands
 
-| Command              | Description                              |
-|----------------------|------------------------------------------|
-| `npm run build`      | Full build (main + renderer)             |
-| `npm run build:main` | TypeScript compile for Electron main     |
-| `npm run build:renderer` | Vite build for React frontend       |
-| `npm run start`      | Launch Electron (requires prior build)   |
-| `npm run dev`        | Dev mode with Vite HMR + Electron       |
+| Command              | Description                                              |
+|----------------------|----------------------------------------------------------|
+| `npm run restart`    | **Canonical restart** — build (main + renderer) + launch |
+| `npm run build`      | Full build (main + renderer) without launching           |
+| `npm run build:main` | TypeScript compile for Electron main                     |
+| `npm run build:renderer` | Vite build for React frontend                        |
+| `npm run start`      | Launch Electron from existing `dist/` (no rebuild)       |
+| `npm run dev`        | Dev mode with Vite HMR + Electron                        |
 
 ## Project Structure
 

@@ -1,11 +1,11 @@
-import initSqlJs, { Database as SqlJsDatabase } from 'sql.js';
+import Database from 'better-sqlite3';
 import path from 'path';
 import fs from 'fs';
 import { v4 as uuidv4 } from 'uuid';
 import { Agent, AgentProvider, AgentStatus, AgentTemplate, CreateAgentTemplateInput, CreateWorkspaceInput, CreateTeamInput, FileActivity, FileOperation, Team, TeamChannel, TeamMember, TeamMessage, TeamMessageStatus, TeamStatus, TeamTask, TeamTaskStatus, Workspace } from '../shared/types';
 import { DEFAULT_COMMAND, DEFAULT_COMMAND_WSL, SUPERVISOR_AGENT_MD } from '../shared/constants';
 
-let db: SqlJsDatabase;
+let db: Database.Database;
 let dbPath: string;
 
 function getDbPath(): string {
@@ -15,23 +15,14 @@ function getDbPath(): string {
   return path.join(dir, 'dashboard.db');
 }
 
-function saveDb(): void {
-  const data = db.export();
-  fs.writeFileSync(dbPath, Buffer.from(data));
-}
-
-export async function initDatabase(): Promise<void> {
-  const SQL = await initSqlJs();
+export function initDatabase(): void {
   dbPath = getDbPath();
+  db = new Database(dbPath);
+  db.pragma('journal_mode = WAL');
+  db.pragma('synchronous = FULL');
+  db.pragma('foreign_keys = ON');
 
-  if (fs.existsSync(dbPath)) {
-    const fileBuffer = fs.readFileSync(dbPath);
-    db = new SQL.Database(fileBuffer);
-  } else {
-    db = new SQL.Database();
-  }
-
-  db.run(`
+  db.exec(`
     CREATE TABLE IF NOT EXISTS workspaces (
       id              TEXT PRIMARY KEY,
       title           TEXT NOT NULL,
@@ -45,7 +36,7 @@ export async function initDatabase(): Promise<void> {
     )
   `);
 
-  db.run(`
+  db.exec(`
     CREATE TABLE IF NOT EXISTS agents (
       id                    TEXT PRIMARY KEY,
       workspace_id          TEXT NOT NULL,
@@ -70,7 +61,7 @@ export async function initDatabase(): Promise<void> {
     )
   `);
 
-  db.run(`
+  db.exec(`
     CREATE TABLE IF NOT EXISTS file_activities (
       id          INTEGER PRIMARY KEY AUTOINCREMENT,
       agent_id    TEXT NOT NULL,
@@ -81,15 +72,15 @@ export async function initDatabase(): Promise<void> {
   `);
 
   // Migration: add provider column to existing agents tables
-  try { db.run(`ALTER TABLE agents ADD COLUMN provider TEXT NOT NULL DEFAULT 'claude'`); } catch { /* column already exists */ }
+  try { db.exec(`ALTER TABLE agents ADD COLUMN provider TEXT NOT NULL DEFAULT 'claude'`); } catch { /* column already exists */ }
 
   // Migration: add is_supervisor column
-  try { db.run(`ALTER TABLE agents ADD COLUMN is_supervisor INTEGER NOT NULL DEFAULT 0`); } catch { /* column already exists */ }
+  try { db.exec(`ALTER TABLE agents ADD COLUMN is_supervisor INTEGER NOT NULL DEFAULT 0`); } catch { /* column already exists */ }
 
   // Migration: add is_supervised column (opt-in for supervisor event bridge)
-  try { db.run(`ALTER TABLE agents ADD COLUMN is_supervised INTEGER NOT NULL DEFAULT 0`); } catch { /* column already exists */ }
+  try { db.exec(`ALTER TABLE agents ADD COLUMN is_supervised INTEGER NOT NULL DEFAULT 0`); } catch { /* column already exists */ }
 
-  db.run(`
+  db.exec(`
     CREATE TABLE IF NOT EXISTS events (
       id          INTEGER PRIMARY KEY AUTOINCREMENT,
       agent_id    TEXT NOT NULL,
@@ -101,7 +92,7 @@ export async function initDatabase(): Promise<void> {
 
   // ── Team tables ─────────────────────────────────────────────────────────
 
-  db.run(`
+  db.exec(`
     CREATE TABLE IF NOT EXISTS teams (
       id              TEXT PRIMARY KEY,
       workspace_id    TEXT NOT NULL,
@@ -116,7 +107,7 @@ export async function initDatabase(): Promise<void> {
     )
   `);
 
-  db.run(`
+  db.exec(`
     CREATE TABLE IF NOT EXISTS team_members (
       team_id     TEXT NOT NULL,
       agent_id    TEXT NOT NULL,
@@ -126,7 +117,7 @@ export async function initDatabase(): Promise<void> {
     )
   `);
 
-  db.run(`
+  db.exec(`
     CREATE TABLE IF NOT EXISTS team_channels (
       id          TEXT PRIMARY KEY,
       team_id     TEXT NOT NULL,
@@ -138,7 +129,7 @@ export async function initDatabase(): Promise<void> {
     )
   `);
 
-  db.run(`
+  db.exec(`
     CREATE TABLE IF NOT EXISTS team_messages (
       id            INTEGER PRIMARY KEY AUTOINCREMENT,
       team_id       TEXT NOT NULL,
@@ -154,7 +145,7 @@ export async function initDatabase(): Promise<void> {
     )
   `);
 
-  db.run(`
+  db.exec(`
     CREATE TABLE IF NOT EXISTS team_tasks (
       id            TEXT PRIMARY KEY,
       team_id       TEXT NOT NULL,
@@ -172,7 +163,7 @@ export async function initDatabase(): Promise<void> {
 
   // ── Agent templates table ────────────────────────────────────────────
 
-  db.run(`
+  db.exec(`
     CREATE TABLE IF NOT EXISTS agent_templates (
       id                TEXT PRIMARY KEY,
       workspace_id      TEXT,
@@ -191,16 +182,21 @@ export async function initDatabase(): Promise<void> {
   `);
 
   // Migration: add template_id and system_prompt to agents
-  try { db.run(`ALTER TABLE agents ADD COLUMN template_id TEXT`); } catch { /* exists */ }
-  try { db.run(`ALTER TABLE agents ADD COLUMN system_prompt TEXT`); } catch { /* exists */ }
+  try { db.exec(`ALTER TABLE agents ADD COLUMN template_id TEXT`); } catch { /* exists */ }
+  try { db.exec(`ALTER TABLE agents ADD COLUMN system_prompt TEXT`); } catch { /* exists */ }
 
   // Seed built-in supervisor template if not present
   const existingSup = queryAll("SELECT id FROM agent_templates WHERE id = 'builtin-supervisor'");
   if (existingSup.length === 0) {
-    db.run(
+    db.prepare(
       `INSERT INTO agent_templates (id, workspace_id, name, description, system_prompt, role_description, provider, is_supervisor, is_supervised, auto_restart)
-       VALUES (?, NULL, ?, ?, ?, ?, 'claude', 1, 0, 1)`,
-      ['builtin-supervisor', 'Supervisor', 'Coordinates worker agents, approves continuations, manages context.', SUPERVISOR_AGENT_MD, 'Autonomous supervisor agent — coordinates workers, approves continuations, manages context.']
+       VALUES (?, NULL, ?, ?, ?, ?, 'claude', 1, 0, 1)`
+    ).run(
+      'builtin-supervisor',
+      'Supervisor',
+      'Coordinates worker agents, approves continuations, manages context.',
+      SUPERVISOR_AGENT_MD,
+      'Autonomous supervisor agent — coordinates workers, approves continuations, manages context.'
     );
   }
 
@@ -209,7 +205,7 @@ export async function initDatabase(): Promise<void> {
   // Naturally idempotent — the tracker is now gated to claude-only, so re-running
   // this delete is a no-op once the bad rows are cleared.
   try {
-    db.run(`
+    db.exec(`
       DELETE FROM file_activities
       WHERE file_path LIKE '%, %'
         AND agent_id IN (SELECT id FROM agents WHERE provider <> 'claude')
@@ -221,7 +217,7 @@ export async function initDatabase(): Promise<void> {
   // Cleanup for Claude/Codex/Gemini aggregate context summaries that are not
   // files, e.g. "3 files, listed 1 directory" or "1 file, recalled 2 memories".
   try {
-    db.run(`
+    db.exec(`
       DELETE FROM file_activities
       WHERE lower(file_path) LIKE '%listed % director%'
          OR lower(file_path) LIKE '%recalled % memor%'
@@ -229,8 +225,6 @@ export async function initDatabase(): Promise<void> {
   } catch (err) {
     console.warn('[database] aggregate file_activities purge failed:', err);
   }
-
-  saveDb();
 }
 
 function slugify(text: string): string {
@@ -282,24 +276,15 @@ function rowToAgent(row: any): Agent {
 }
 
 function queryAll(sql: string, params: any[] = []): any[] {
-  const stmt = db.prepare(sql);
-  if (params.length) stmt.bind(params);
-  const results: any[] = [];
-  while (stmt.step()) {
-    results.push(stmt.getAsObject());
-  }
-  stmt.free();
-  return results;
+  return db.prepare(sql).all(...params) as any[];
 }
 
 function queryOne(sql: string, params: any[] = []): any | null {
-  const results = queryAll(sql, params);
-  return results[0] || null;
+  return (db.prepare(sql).get(...params) as any) ?? null;
 }
 
 function run(sql: string, params: any[] = []): void {
-  db.run(sql, params);
-  saveDb();
+  db.prepare(sql).run(...params);
 }
 
 // Workspace operations
