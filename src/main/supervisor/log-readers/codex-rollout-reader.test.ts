@@ -548,6 +548,125 @@ test('in-batch task_complete still tags via direct walk-back (no patch emitted)'
   }
 });
 
+test('P2-01: endsWithQuestion set when in-batch task_complete tags a ?-ending text', () => {
+  const sessionId = '77777777-8888-9999-aaaa-bbbbbbbbbbbb';
+  const tmpPath = path.join(os.tmpdir(), `codex-q-inbatch-${Date.now()}.jsonl`);
+  const lines = [
+    JSON.stringify({
+      timestamp: '2026-05-16T13:00:00.000Z',
+      type: 'session_meta',
+      payload: { id: sessionId, cwd: 'C:\\Users\\fixture', model_provider: 'openai', cli_version: '0.128.0' },
+    }),
+    JSON.stringify({
+      timestamp: '2026-05-16T13:00:01.000Z',
+      type: 'response_item',
+      payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Should I proceed?' }] },
+    }),
+    JSON.stringify({
+      timestamp: '2026-05-16T13:00:02.000Z',
+      type: 'event_msg',
+      payload: { type: 'task_complete' },
+    }),
+  ];
+  fs.writeFileSync(tmpPath, lines.join('\n') + '\n');
+  try {
+    const reader = new (class extends CodexRolloutReader {
+      constructor() {
+        super();
+        (this as any).resolvedPaths.set('test-agent', tmpPath);
+      }
+    })();
+    const events = reader.pollSession(makeSession({ sessionId }));
+    const at = events.find((e) => e.type === 'assistant-text');
+    assert.ok(at && at.type === 'assistant-text');
+    assert.equal(at.turnComplete, true);
+    assert.equal(at.endsWithQuestion, true, 'P2-01: trailing ? sets endsWithQuestion=true');
+  } finally {
+    fs.unlinkSync(tmpPath);
+  }
+});
+
+test('P2-01: endsWithQuestion=false when assistant-text does not end with ?', () => {
+  const sessionId = '88888888-9999-aaaa-bbbb-cccccccccccc';
+  const tmpPath = path.join(os.tmpdir(), `codex-q-not-${Date.now()}.jsonl`);
+  const lines = [
+    JSON.stringify({
+      timestamp: '2026-05-16T13:00:00.000Z',
+      type: 'session_meta',
+      payload: { id: sessionId, cwd: 'C:\\Users\\fixture', model_provider: 'openai', cli_version: '0.128.0' },
+    }),
+    JSON.stringify({
+      timestamp: '2026-05-16T13:00:01.000Z',
+      type: 'response_item',
+      payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Done.' }] },
+    }),
+    JSON.stringify({
+      timestamp: '2026-05-16T13:00:02.000Z',
+      type: 'event_msg',
+      payload: { type: 'task_complete' },
+    }),
+  ];
+  fs.writeFileSync(tmpPath, lines.join('\n') + '\n');
+  try {
+    const reader = new (class extends CodexRolloutReader {
+      constructor() {
+        super();
+        (this as any).resolvedPaths.set('test-agent', tmpPath);
+      }
+    })();
+    const events = reader.pollSession(makeSession({ sessionId }));
+    const at = events.find((e) => e.type === 'assistant-text');
+    assert.ok(at && at.type === 'assistant-text');
+    assert.equal(at.turnComplete, true);
+    assert.equal(at.endsWithQuestion, false, 'P2-01: no trailing ? → endsWithQuestion=false');
+  } finally {
+    fs.unlinkSync(tmpPath);
+  }
+});
+
+test('P2-01: split-batch patch carries endsWithQuestion through to ring mutation source', () => {
+  // The patch event itself must carry endsWithQuestion derived from the prior
+  // assistant-text's body, so the dispatcher can mutate the ring event in place.
+  const sessionId = '99999999-aaaa-bbbb-cccc-dddddddddddd';
+  const tmpPath = path.join(os.tmpdir(), `codex-q-split-${Date.now()}.jsonl`);
+  const stage1 = [
+    JSON.stringify({
+      timestamp: '2026-05-16T13:10:00.000Z',
+      type: 'session_meta',
+      payload: { id: sessionId, cwd: 'C:\\Users\\fixture', model_provider: 'openai', cli_version: '0.128.0' },
+    }),
+    JSON.stringify({
+      timestamp: '2026-05-16T13:10:01.000Z',
+      type: 'response_item',
+      payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Want me to continue?' }] },
+    }),
+  ];
+  const stage2Line = JSON.stringify({
+    timestamp: '2026-05-16T13:10:02.000Z',
+    type: 'event_msg',
+    payload: { type: 'task_complete' },
+  });
+
+  fs.writeFileSync(tmpPath, stage1.join('\n') + '\n');
+  try {
+    const reader = new (class extends CodexRolloutReader {
+      constructor() {
+        super();
+        (this as any).resolvedPaths.set('test-agent', tmpPath);
+      }
+    })();
+    reader.pollSession(makeSession({ sessionId }));
+    fs.appendFileSync(tmpPath, stage2Line + '\n');
+    const second = reader.pollSession(makeSession({ sessionId }));
+    const patch = second.find((e) => e.type === 'assistant-text-patch');
+    assert.ok(patch && patch.type === 'assistant-text-patch');
+    assert.equal(patch.turnComplete, true);
+    assert.equal(patch.endsWithQuestion, true, 'patch carries endsWithQuestion=true');
+  } finally {
+    fs.unlinkSync(tmpPath);
+  }
+});
+
 test('subscribed idle path refresh does not replay the same rollout', () => {
   const sessionId = '33333333-4444-5555-6666-777777777777';
   const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-idle-refresh-'));

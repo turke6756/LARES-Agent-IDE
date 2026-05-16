@@ -291,6 +291,9 @@ export class CodexRolloutReader implements ChatLogReader {
           if (ev.type === 'assistant-text') {
             ev.turnComplete = true;
             ev.stopReason = payloadType;
+            // P2-01: compute at the moment turnComplete is set.
+            const trimmed = ev.text.trimEnd();
+            ev.endsWithQuestion = trimmed.length > 0 && trimmed.endsWith('?');
             this.lastAssistantTextEvent.delete(session.agentId);
             return;
           }
@@ -299,6 +302,11 @@ export class CodexRolloutReader implements ChatLogReader {
         // the dispatcher's in-place ring mutation. See §2.1.3.
         const prior = this.lastAssistantTextEvent.get(session.agentId);
         if (prior) {
+          // P2-01: carry endsWithQuestion through the patch so the dispatcher
+          // can mutate the ring event's flag in place. Derived from the prior
+          // event's text since the patch payload itself has no text body.
+          const trimmed = prior.text.trimEnd();
+          const endsWithQuestion = trimmed.length > 0 && trimmed.endsWith('?');
           const patch: AssistantTextPatchEvent = {
             type: 'assistant-text-patch',
             uuid: mkEventUuid('atp'),
@@ -307,6 +315,7 @@ export class CodexRolloutReader implements ChatLogReader {
             targetUuid: prior.uuid,
             turnComplete: true,
             stopReason: payloadType,
+            endsWithQuestion,
           };
           out.push(patch);
           this.lastAssistantTextEvent.delete(session.agentId);

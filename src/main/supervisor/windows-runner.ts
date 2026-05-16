@@ -196,6 +196,16 @@ export class WindowsRunner extends EventEmitter {
     }
   }
 
+  /** P2-02: return the trailing `maxBytes` bytes of the ring buffer joined as
+   *  one string. Used by the PromptPatternDetector via StatusMonitor — pattern
+   *  matching against the tail of the live PTY without disk I/O. */
+  getOutputRingTail(maxBytes = 4096): string {
+    if (this.outputRing.length === 0) return '';
+    const joined = this.outputRing.join('\n');
+    if (joined.length <= maxBytes) return joined;
+    return joined.slice(joined.length - maxBytes);
+  }
+
   /** Return the last N lines from the in-memory ring buffer (instant, no disk I/O). */
   captureOutput(lines = 50): string {
     // If ring buffer is empty, fall back to log file for initial data

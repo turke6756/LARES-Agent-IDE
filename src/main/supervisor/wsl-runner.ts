@@ -29,6 +29,12 @@ export class WslRunner extends EventEmitter {
   private _intentionalKill: boolean = false;
   private buffer: string = '';
   private logStream: fs.WriteStream | null = null;
+  // P2-02: ring buffer sibling for PromptPatternDetector. WindowsRunner ships
+  // one for chat-history use; the WSL path historically pulled tail bytes via
+  // a `tmuxCapturePane` subprocess. We mirror the Windows shape so the
+  // detector can poll the tail in-process without a per-tick exec.
+  private outputRing: string[] = [];
+  private static readonly MAX_RING_LINES = 500;
 
   constructor(sessionName: string) {
     super();
@@ -171,6 +177,23 @@ export class WslRunner extends EventEmitter {
           }
         }
         this.logStream?.write(msg.data);
+        // P2-02: feed the ring buffer for PromptPatternDetector. Same
+        // partial-line handling as WindowsRunner so a chunk ending mid-line
+        // doesn't fragment the next-arriving prompt across two ring entries.
+        {
+          const newLines = msg.data.split('\n');
+          if (this.outputRing.length > 0 && newLines.length > 0) {
+            this.outputRing[this.outputRing.length - 1] += newLines[0];
+            for (let i = 1; i < newLines.length; i++) {
+              this.outputRing.push(newLines[i]);
+            }
+          } else {
+            this.outputRing.push(...newLines);
+          }
+          if (this.outputRing.length > WslRunner.MAX_RING_LINES) {
+            this.outputRing.splice(0, this.outputRing.length - WslRunner.MAX_RING_LINES);
+          }
+        }
         this.emit('data', msg.data);
         break;
 
@@ -222,6 +245,17 @@ export class WslRunner extends EventEmitter {
 
   async captureOutput(lines = 50): Promise<string> {
     return tmuxCapturePane(this.sessionName, lines);
+  }
+
+  /** P2-02: trailing bytes of the in-process ring buffer. Matches the
+   *  Windows runner's shape; called from `StatusMonitor` via the
+   *  `getOutputRingTail` collaborator so the PromptPatternDetector doesn't
+   *  have to shell out to `tmux capture-pane` on every tick. */
+  getOutputRingTail(maxBytes = 4096): string {
+    if (this.outputRing.length === 0) return '';
+    const joined = this.outputRing.join('\n');
+    if (joined.length <= maxBytes) return joined;
+    return joined.slice(joined.length - maxBytes);
   }
 
   /**

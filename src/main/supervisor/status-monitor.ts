@@ -8,8 +8,23 @@ import {
 } from '../../shared/constants';
 import { getActiveAgents, updateAgentStatus, addEvent } from '../database';
 import type { StatusChangedEvent } from './status-events';
+import { PromptPatternDetector } from './prompt-pattern-detector';
 
 export type WaitingKind = 'question' | 'y-n' | 'enter' | 'choice' | 'approve' | 'tty-pattern';
+
+const PTY_QUIET_FOR_PATTERN_MS = 2_000;
+
+/** Strip ANSI escape sequences and control bytes from PTY data so the
+ *  PromptPatternDetector can match against clean text. Mirrors the regex set
+ *  in `windows-runner.ts:hasMeaningfulContent` / `wsl-runner.ts:hasMeaningfulContent`. */
+function stripAnsi(text: string): string {
+  return text
+    .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')
+    .replace(/\x1b\][^\x07]*\x07/g, '')
+    .replace(/\x1b[()][0-9A-Z]/g, '')
+    .replace(/\x1b\[[\?]?[0-9;]*[hlm]/g, '')
+    .replace(/[\x00-\x08\x0b-\x1f]/g, '');
+}
 
 interface TurnLatchEntry {
   state: 'idle' | 'waiting';
@@ -26,6 +41,9 @@ export class StatusMonitor extends EventEmitter {
   private checkAlive: (agent: Agent) => Promise<boolean>;
   private getLastOutput: (agentId: string) => number;
   private getAgentFn: (id: string) => Agent | null;
+  /** P2-02: Pulls the trailing PTY bytes for prompt-pattern matching.
+   *  Defaults to empty string when not injected (tests). */
+  private getOutputRingTail: (agentId: string) => string;
   // Hold a status for a short period after a transition to prevent PTY
   // byte-flicker from immediately undoing it.
   private statusHoldUntil = new Map<string, number>();
@@ -39,13 +57,15 @@ export class StatusMonitor extends EventEmitter {
     checkAlive: (agent: Agent) => Promise<boolean>,
     getLastOutput: (agentId: string) => number,
     getAgentFn: (id: string) => Agent | null,
-    now: () => number = () => Date.now()
+    now: () => number = () => Date.now(),
+    getOutputRingTail: (agentId: string) => string = () => ''
   ) {
     super();
     this.checkAlive = checkAlive;
     this.getLastOutput = getLastOutput;
     this.getAgentFn = getAgentFn;
     this.now = now;
+    this.getOutputRingTail = getOutputRingTail;
   }
 
   start(): void {
@@ -108,6 +128,10 @@ export class StatusMonitor extends EventEmitter {
       status: 'waiting',
       fromStatus: prior,
       source: 'monitor',
+      // P2-03: kind + excerpt ride on the event so the bridge can render
+      // "[DASHBOARD EVENT] Agent waiting for input" without re-reading the latch.
+      waitingKind: kind,
+      waitingExcerpt: excerpt,
     };
     this.emit('statusChanged', payload);
   }
@@ -194,6 +218,24 @@ export class StatusMonitor extends EventEmitter {
 
     const lastOutput = this.getLastOutput(agent.id);
     const elapsed = this.now() - lastOutput;
+
+    // P2-02: PTY prompt-pattern detection. Only runs once the PTY has been
+    // quiet for ≥2s so a still-streaming agent isn't classified as waiting
+    // mid-burst. On match, arm the waiting latch (which `forceWaiting` does
+    // for us) and return 'waiting' for this tick.
+    if (elapsed > PTY_QUIET_FOR_PATTERN_MS) {
+      const tail = this.getOutputRingTail(agent.id);
+      if (tail) {
+        const stripped = stripAnsi(tail);
+        const hit = PromptPatternDetector.match(stripped);
+        if (hit) {
+          // Map the detector's narrow kind to WaitingKind directly — both
+          // unions share the same string literals for tty patterns.
+          this.forceWaiting(agent.id, hit.kind as WaitingKind, hit.excerpt);
+          return 'waiting';
+        }
+      }
+    }
 
     if (elapsed < WORKING_THRESHOLD_MS) return 'working';
     return 'idle';

@@ -286,6 +286,12 @@ export class ClaudeJsonlReader implements ChatLogReader {
               turnComplete,
               stopReason,
             };
+            // P2-01: compute on turnComplete only. Mid-turn assistant chunks
+            // can end on '?' inside a longer monologue and shouldn't surface.
+            if (turnComplete) {
+              const trimmed = text.trimEnd();
+              ev.endsWithQuestion = trimmed.length > 0 && trimmed.endsWith('?');
+            }
             out.push(ev);
           } else if (block.type === 'thinking') {
             const text = (block.thinking || '').trim();

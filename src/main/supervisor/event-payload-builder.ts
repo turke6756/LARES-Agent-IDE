@@ -3,6 +3,10 @@ import { AgentStatus } from '../../shared/types';
 // Team events are not currently emitted. If Teams reintroduces them, restore
 // the type tag (e.g. 'team_created' | 'team_loop_detected') and the matching
 // payload branches in buildEventPayload.
+//
+// Waiting-for-input (P2-03) is intentionally NOT a new type tag — it rides on
+// `status_change` with `toStatus === 'waiting'` plus `waitingKind` /
+// `waitingExcerpt` per §2.3.3.
 export interface SupervisorEvent {
   type: 'status_change' | 'context_threshold';
   agentId: string;
@@ -17,6 +21,11 @@ export interface SupervisorEvent {
   turnCount?: number;
   model?: string;
   logTail?: string;
+  /** P2-03: populated when `toStatus === 'waiting'`. Kind is shared with the
+   *  StatusMonitor's `WaitingKind` union (question / y-n / enter / choice /
+   *  approve / tty-pattern). */
+  waitingKind?: 'question' | 'y-n' | 'enter' | 'choice' | 'approve' | 'tty-pattern';
+  waitingExcerpt?: string;
 }
 
 function formatTokens(n: number): string {
@@ -44,6 +53,26 @@ export function buildEventPayload(event: SupervisorEvent): string {
   const agentLine = `Agent: "${event.agentTitle}" (${event.agentId.slice(0, 8)})`;
 
   if (event.type === 'status_change') {
+    // P2-03: dedicated "waiting for input" rendering when an agent flips to
+    // 'waiting'. We hand the supervisor the kind + excerpt so it can decide
+    // how to reply (send_message_to_agent for text, send_keys_to_agent for
+    // arrow-key pickers).
+    if (event.toStatus === 'waiting') {
+      const kindLine = event.waitingKind
+        ? `Waiting kind: ${event.waitingKind}`
+        : 'Waiting kind: unknown';
+      const excerptLine = event.waitingExcerpt
+        ? `Excerpt: ${JSON.stringify(event.waitingExcerpt)}`
+        : '';
+      return [
+        '[DASHBOARD EVENT] Agent waiting for input',
+        agentLine,
+        kindLine,
+        excerptLine,
+        formatLogTail(event.logTail, 5),
+      ].filter(Boolean).join('\n');
+    }
+
     const statusLine = event.fromStatus && event.toStatus
       ? `Status: ${event.fromStatus} → ${event.toStatus}`
       : `Status: ${event.toStatus || 'unknown'}`;
@@ -79,7 +108,12 @@ export function buildConsolidatedPayload(events: SupervisorEvent[]): string {
   for (const event of events) {
     const title = `"${event.agentTitle}" (${event.agentId.slice(0, 8)})`;
     if (event.type === 'status_change') {
-      lines.push(`- ${title}: ${event.fromStatus} → ${event.toStatus}`);
+      if (event.toStatus === 'waiting') {
+        const kind = event.waitingKind ?? 'unknown';
+        lines.push(`- ${title}: waiting for input (${kind})`);
+      } else {
+        lines.push(`- ${title}: ${event.fromStatus} → ${event.toStatus}`);
+      }
     } else if (event.type === 'context_threshold') {
       lines.push(`- ${title}: context at ${event.contextPercentage}%`);
     }

@@ -90,6 +90,7 @@ Check \`./memory/MEMORY.md\` at session start for context from prior runs. Save 
 You receive \`[DASHBOARD EVENT]\` messages automatically when supervised agents change status. When you receive one:
 
 - **idle/done**: Review the agent's last output via \`read_agent_log\`. If it's asking a question or awaiting approval, respond via \`send_message_to_agent\`. If work is complete, no action needed.
+- **waiting_for_input**: When a supervised agent is waiting on user input (in-text question, terminal prompt, plan-mode approval), the dashboard sends \`[DASHBOARD EVENT] Agent waiting for input\` with a \`Waiting kind:\` and \`Excerpt:\` line. Read the agent log for context, decide a response, and reply with \`send_message_to_agent\` (text answers) or \`send_keys_to_agent\` (arrow-key pickers / Enter).
 - **crashed**: Read the log to diagnose. Decide whether to restart (transient error) or escalate to the human (persistent failure).
 - **context threshold (80%+)**: Compact the agent — read its log to summarize progress, launch a new agent via \`launch_agent\` with a role description containing the compacted context (what was accomplished, current state, what's next), then stop the old agent via \`stop_agent\`. This gives the work a fresh context window without losing continuity.
 

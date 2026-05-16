@@ -232,6 +232,43 @@ test('findGeminiTranscriptByCwd ignores transcripts older than agent start', () 
   }
 });
 
+test('P2-01: endsWithQuestion is set per-turn from trimmed assistant content', () => {
+  const sessionId = 'a7f1aef0-1111-2222-3333-4444aaaaaaaa';
+  const tmpPath = path.join(os.tmpdir(), `gemini-q-${Date.now()}.jsonl`);
+  const header = JSON.stringify({
+    sessionId, projectHash: 'h', startTime: '2026-05-16T13:30:00.000Z', kind: 'main',
+  });
+  const turnQ = JSON.stringify({
+    id: 'tQ', timestamp: '2026-05-16T13:30:05.000Z', type: 'gemini',
+    content: 'Would you like to continue?', model: 'gemini-3-flash-preview',
+  });
+  const turnNotQ = JSON.stringify({
+    id: 'tN', timestamp: '2026-05-16T13:30:10.000Z', type: 'gemini',
+    content: 'Done.', model: 'gemini-3-flash-preview',
+  });
+  const turnTrailingWs = JSON.stringify({
+    id: 'tW', timestamp: '2026-05-16T13:30:15.000Z', type: 'gemini',
+    content: 'What now?   \n\n', model: 'gemini-3-flash-preview',
+  });
+  fs.writeFileSync(tmpPath, [header, turnQ, turnNotQ, turnTrailingWs].join('\n') + '\n');
+  try {
+    const reader = makeReader(tmpPath);
+    const events = reader.pollSession(makeSession({ sessionId }));
+    const texts = events.filter(e => e.type === 'assistant-text');
+    assert.equal(texts.length, 3);
+    const byId = new Map<string, any>();
+    for (const t of texts) byId.set((t as any).text, t);
+    assert.equal(byId.get('Would you like to continue?').endsWithQuestion, true);
+    assert.equal(byId.get('Done.').endsWithQuestion, false);
+    // entry.content is trimmed to 'What now?' before the assistant-text emits;
+    // trailing whitespace doesn't survive that path, so this also reports true.
+    assert.equal(byId.get('What now?').endsWithQuestion, true,
+      'trailing whitespace before ? still produces endsWithQuestion=true after trimEnd');
+  } finally {
+    fs.unlinkSync(tmpPath);
+  }
+});
+
 test('getFullToolResult re-reads the rewritten gemini line', async () => {
   const reader = makeReader();
   const events = pollAll(reader);

@@ -43,7 +43,10 @@ export interface EventBridgeDeps {
   statusMonitor: StatusMonitorForceCollaborator;
 }
 
-const TRIGGER_STATUSES: ReadonlyArray<AgentStatus> = ['idle', 'crashed', 'done'];
+// P2-03: 'waiting' is a trigger status so the supervisor gets a notification
+// when an agent blocks on user input. The waiting → working transition (user
+// answered the prompt) is filtered below as noise.
+const TRIGGER_STATUSES: ReadonlyArray<AgentStatus> = ['idle', 'crashed', 'done', 'waiting'];
 
 export class EventBridge {
   private eventCooldowns = new Map<string, number>();
@@ -60,6 +63,11 @@ export class EventBridge {
 
       if (!TRIGGER_STATUSES.includes(data.status)) return;
       if (data.fromStatus !== undefined && data.fromStatus === data.status) return;
+
+      // P2-03: a waiting → working transition (user just answered the prompt)
+      // is not a notification-worthy event — the latch clears, no need to
+      // wake the supervisor.
+      if (data.fromStatus === 'waiting' && data.status === 'working') return;
 
       const supervisor = this.deps.getSupervisorForWorker(agent);
       if (!supervisor || ['done', 'crashed'].includes(supervisor.status)) return;
@@ -89,6 +97,10 @@ export class EventBridge {
         turnCount: stats?.turnCount,
         model: stats?.model,
         logTail,
+        // P2-03: pass waiting metadata through to the payload builder when
+        // present on the inbound event.
+        waitingKind: data.waitingKind,
+        waitingExcerpt: data.waitingExcerpt,
       };
 
       await this.deliver(supervisor, event);
@@ -132,8 +144,12 @@ export class EventBridge {
           }
           case 'assistant-text-patch': {
             if (event.endsWithQuestion === true) {
-              // Patch carries the question excerpt indirectly via the target;
-              // until P2-01 wires this end-to-end, we only have the flag.
+              // P2-03: the patch event carries the flag but not the text body —
+              // the body lives on the mutated ring entry the dispatcher already
+              // updated in place. The supervisor still gets "Agent waiting for
+              // input" plus log tail; the excerpt slot is left empty here since
+              // pulling the text would require another reach into the chat
+              // service. Acceptable tradeoff for the split-batch corner case.
               this.deps.statusMonitor.forceWaiting(agentId, 'question', '');
             } else if (event.turnComplete === true) {
               if (agent.provider === 'gemini') break;
@@ -281,6 +297,18 @@ export class EventBridge {
     this.eventCooldowns.delete(agentId);
     this.lastContextThreshold.delete(agentId);
     this.supervisorQueuedEvents = this.supervisorQueuedEvents.filter(e => e.agentId !== agentId);
+  }
+
+  /** P2-03: called from `AgentSupervisor.sendInput` after a send resolves.
+   *  If the target agent was waiting on user input, clear the latch via
+   *  `forceWorking` so the status field flips back to 'working' immediately
+   *  (the `waiting → working` transition itself is filtered by the bridge so
+   *  the supervisor doesn't get a noise event). Safe to call on any agent —
+   *  no-op for agents that aren't currently waiting. */
+  notifyUserInputDelivered(agentId: string): void {
+    const agent = this.deps.getAgent(agentId);
+    if (!agent || agent.status !== 'waiting') return;
+    this.deps.statusMonitor.forceWorking(agentId, 'user-input');
   }
 
   /** Test seam: cancel any pending drain timer and run the drain logic now. */

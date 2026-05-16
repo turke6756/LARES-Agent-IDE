@@ -442,8 +442,123 @@ async function onChatEvents_geminiToolUseStillRoutes(): Promise<void> {
   console.log('  onChatEvents ✓ Gemini tool-use still routes through bridge (D-07 is narrow)');
 }
 
+// ── M3: P2-03 waiting_for_input wiring (BR-13, BR-15, BR-20) ────────
+
+async function BR_13_endsWithQuestionFiresForceWaiting(): Promise<void> {
+  const f = makeFakeBridgeDeps();
+  const worker = makeAgent('w-q1', { provider: 'claude', status: 'working' });
+  f.agents.set(worker.id, worker);
+  const bridge = new EventBridge(f.deps);
+
+  bridge.onChatEvents(batchFor(worker.id, [
+    assistantText(worker.id, {
+      text: 'Long preamble. Did that resolve it?',
+      turnComplete: true,
+      endsWithQuestion: true,
+    }),
+  ]));
+
+  assert.equal(f.statusForceCalls.length, 1, 'BR-13: one force call');
+  assert.equal(f.statusForceCalls[0].method, 'forceWaiting');
+  assert.equal(f.statusForceCalls[0].agentId, worker.id);
+  assert.equal(f.statusForceCalls[0].kind, 'question');
+  // Excerpt is text.slice(-300); for a short text that's the whole body.
+  assert.equal(f.statusForceCalls[0].excerpt, 'Long preamble. Did that resolve it?');
+  console.log('  BR-13 ✓ endsWithQuestion=true → forceWaiting(question, tail)');
+}
+
+async function BR_13_endsWithQuestionTakesPriorityOverTurnComplete(): Promise<void> {
+  // Branch order check: endsWithQuestion=true must short-circuit ahead of the
+  // turnComplete=true → forceIdle branch.
+  const f = makeFakeBridgeDeps();
+  const worker = makeAgent('w-q2', { provider: 'codex', status: 'working' });
+  f.agents.set(worker.id, worker);
+  const bridge = new EventBridge(f.deps);
+
+  bridge.onChatEvents(batchFor(worker.id, [
+    assistantText(worker.id, { text: 'OK?', turnComplete: true, endsWithQuestion: true }),
+  ]));
+
+  assert.equal(f.statusForceCalls.length, 1);
+  assert.equal(f.statusForceCalls[0].method, 'forceWaiting',
+    'BR-13: endsWithQuestion wins over turnComplete');
+  console.log('  BR-13 ✓ endsWithQuestion priority over turnComplete');
+}
+
+async function BR_15_notifyUserInputClearsLatchOnWaiting(): Promise<void> {
+  const f = makeFakeBridgeDeps();
+  const worker = makeAgent('w-w1', { provider: 'claude', status: 'waiting' });
+  f.agents.set(worker.id, worker);
+  const bridge = new EventBridge(f.deps);
+
+  bridge.notifyUserInputDelivered(worker.id);
+
+  assert.equal(f.statusForceCalls.length, 1, 'BR-15: one force call');
+  assert.equal(f.statusForceCalls[0].method, 'forceWorking');
+  assert.equal(f.statusForceCalls[0].agentId, worker.id);
+  assert.equal(f.statusForceCalls[0].source, 'user-input');
+  console.log('  BR-15 ✓ sendInput on waiting agent clears latch via forceWorking');
+}
+
+async function BR_15_notifyUserInputNoopWhenNotWaiting(): Promise<void> {
+  const f = makeFakeBridgeDeps();
+  const worker = makeAgent('w-w2', { provider: 'claude', status: 'working' });
+  f.agents.set(worker.id, worker);
+  const bridge = new EventBridge(f.deps);
+
+  bridge.notifyUserInputDelivered(worker.id);
+  assert.equal(f.statusForceCalls.length, 0, 'BR-15: no-op when target is not waiting');
+  console.log('  BR-15 ✓ notifyUserInputDelivered is a no-op outside waiting');
+}
+
+async function BR_20_waitingToWorkingIsSuppressed(): Promise<void> {
+  const f = makeFakeBridgeDeps();
+  const supervisor = makeAgent('sup-1', { isSupervisor: true, isSupervised: false, status: 'idle' });
+  const worker = makeAgent('w-r1', { status: 'working' });
+  f.agents.set(supervisor.id, supervisor);
+  f.agents.set(worker.id, worker);
+  const bridge = new EventBridge(f.deps);
+
+  // First: simulate the waiting transition itself — the supervisor SHOULD be notified.
+  await bridge.onStatusChanged({
+    agentId: worker.id,
+    status: 'waiting',
+    fromStatus: 'working',
+    source: 'monitor',
+    waitingKind: 'question',
+    waitingExcerpt: 'Are you sure?',
+  });
+  assert.equal(f.sendInputCalls.length, 1, 'BR-20: waiting transition fires');
+  assert.ok(
+    f.sendInputCalls[0].text.includes('[DASHBOARD EVENT] Agent waiting for input'),
+    'BR-20: waiting payload renders the dedicated header',
+  );
+  assert.ok(
+    f.sendInputCalls[0].text.includes('Waiting kind: question'),
+    'BR-20: waiting kind line present',
+  );
+  assert.ok(
+    f.sendInputCalls[0].text.includes('Are you sure?'),
+    'BR-20: excerpt rendered',
+  );
+
+  // Bump time past the per-agent cooldown so the next event would otherwise pass.
+  f.setNow(f.getNow() + SUPERVISOR_EVENT_COOLDOWN_MS + 100);
+
+  // Then: waiting → working (user answered). MUST be suppressed.
+  await bridge.onStatusChanged({
+    agentId: worker.id,
+    status: 'working',
+    fromStatus: 'waiting',
+    source: 'monitor',
+  });
+  assert.equal(f.sendInputCalls.length, 1,
+    'BR-20: waiting → working does NOT fire a notification (filtered)');
+  console.log('  BR-20 ✓ waiting → working transition is filtered');
+}
+
 async function main(): Promise<void> {
-  console.log('event-bridge.test: running BR-01..BR-10 + BR-02b + BR-19 + dispatch table');
+  console.log('event-bridge.test: running BR-01..BR-20');
   await BR_01_happyPath();
   await BR_02_crashViaRunnerExit();
   await BR_02b_runnerExitBypassesCooldown();
@@ -455,7 +570,12 @@ async function main(): Promise<void> {
   await BR_08_consolidatedMixesKinds();
   await BR_09_sendInputRejects();
   await BR_10_multiSupervisorIsolation();
+  await BR_13_endsWithQuestionFiresForceWaiting();
+  await BR_13_endsWithQuestionTakesPriorityOverTurnComplete();
+  await BR_15_notifyUserInputClearsLatchOnWaiting();
+  await BR_15_notifyUserInputNoopWhenNotWaiting();
   await BR_19_geminiTurnCompleteOptOut();
+  await BR_20_waitingToWorkingIsSuppressed();
   await onChatEvents_codexTurnComplete();
   await onChatEvents_dispatchTable();
   await onChatEvents_geminiToolUseStillRoutes();

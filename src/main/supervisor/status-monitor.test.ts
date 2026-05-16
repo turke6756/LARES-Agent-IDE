@@ -33,6 +33,7 @@ function makeMonitor(opts: {
   fakes: ReturnType<typeof makeStatusMonitorFakes>;
   agent: Agent;
   alive?: boolean;
+  ringTails?: Map<string, string>;
 }) {
   const { fakes, agent } = opts;
   const alive = opts.alive ?? true;
@@ -40,11 +41,13 @@ function makeMonitor(opts: {
   fakes.aliveOverride.set(agent.id, alive);
   // Default: PTY says "active right now" — we let tests override per scenario.
   fakes.lastOutputAt.set(agent.id, fakes.now.value);
+  const ringTails = opts.ringTails ?? new Map<string, string>();
   const monitor = new StatusMonitor(
     async (a) => fakes.aliveOverride.get(a.id) ?? true,
     (id) => fakes.lastOutputAt.get(id) ?? 0,
     (id) => fakes.agents.get(id) ?? null,
     () => fakes.now.value,
+    (id) => ringTails.get(id) ?? '',
   );
   monitor.on('statusChanged', (payload: StatusChangedEvent) => {
     fakes.emissions.push(payload);
@@ -245,6 +248,55 @@ test('BR-18 boundary: waiting latch still active at exactly TTL ms', async () =>
 
     const inferred = await inferStatus(monitor, agent);
     assert.equal(inferred, 'waiting', 'waiting latch inclusive at TTL');
+  } finally {
+    restore();
+  }
+});
+
+// ── BR-14 ────────────────────────────────────────────────────────────
+test('BR-14: PTY (y/N) prompt in ring tail → inferStatus returns waiting + arms latch', async () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeAgent('w-1', { status: 'working' });
+    const ringTails = new Map<string, string>();
+    ringTails.set(agent.id, 'Do you want to proceed? (y/N) ');
+    const monitor = makeMonitor({ fakes, agent, ringTails });
+
+    // PTY went quiet >2s ago so the detector is allowed to run.
+    fakes.lastOutputAt.set(agent.id, fakes.now.value - 5_000);
+
+    const inferred = await inferStatus(monitor, agent);
+    assert.equal(inferred, 'waiting', 'BR-14: pattern match returns waiting');
+
+    const latch = monitor.getLatchSnapshot(agent.id);
+    assert.ok(latch && latch.state === 'waiting', 'BR-14: forceWaiting armed the latch');
+    assert.equal(latch.waitingKind, 'y-n');
+    assert.match(latch.waitingExcerpt ?? '', /\(y\/N\)/);
+
+    // One statusChanged emission from forceWaiting; updates show the write.
+    const waitingEmits = fakes.emissions.filter(e => e.status === 'waiting');
+    assert.equal(waitingEmits.length, 1, 'BR-14: one waiting transition fired');
+  } finally {
+    restore();
+  }
+});
+
+test('BR-14 guard: PTY pattern is NOT consulted while PTY is still streaming', async () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeAgent('w-1', { status: 'working' });
+    const ringTails = new Map<string, string>();
+    ringTails.set(agent.id, 'Approve?');
+    const monitor = makeMonitor({ fakes, agent, ringTails });
+
+    // PTY active right now — detector must not fire.
+    fakes.lastOutputAt.set(agent.id, fakes.now.value);
+    const inferred = await inferStatus(monitor, agent);
+    assert.equal(inferred, 'working');
+    assert.equal(monitor.getLatchSnapshot(agent.id), undefined,
+      'no waiting latch while PTY is still streaming');
   } finally {
     restore();
   }

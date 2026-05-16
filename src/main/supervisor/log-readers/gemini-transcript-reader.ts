@@ -318,13 +318,20 @@ export class GeminiTranscriptReader implements ChatLogReader {
         if (!seenText.has(turnId)) {
           seenText.add(turnId);
           const model = this.currentModel.get(session.agentId);
+          const text = entry.content.trim();
+          // P2-01: Gemini hardcodes turnComplete: true on every assistant
+          // emission, so compute the flag here too. Even though forceIdle is
+          // gated off for Gemini (D-07), waiting detection still applies.
+          const trimmed = text.trimEnd();
+          const endsWithQuestion = trimmed.length > 0 && trimmed.endsWith('?');
           const ev: AssistantTextEvent = {
             type: 'assistant-text',
             uuid: `${jsonlPath}:${turnId}#a`,
             timestamp,
             agentId: session.agentId,
-            text: entry.content.trim(),
+            text,
             turnComplete: true,
+            endsWithQuestion,
             ...(model ? { model } : {}),
           };
           out.push(ev);

@@ -655,6 +655,7 @@ This is a side effect of P1A-01 step 5; ticket exists to call out the test oblig
 ## Phase 2 — Waiting-state detection
 
 ### P2-01 Add `endsWithQuestion` to `assistant-text` events
+**Status:** Complete — landed 2026-05-16 (agent c89e9a46, M3 bundle). `endsWithQuestion?: boolean` added to `AssistantTextEvent` and `AssistantTextPatchEvent` in `src/shared/session-events.ts`. All three readers compute `text.trimEnd().endsWith('?') && text.trimEnd().length > 0` with intentional per-provider divergence: Claude only when `stop_reason === 'end_turn'`; Codex when `task_complete`/`turn_aborted` retroactively tags an in-batch `assistant-text`, plus on `AssistantTextPatchEvent` (computed from cached `prior.text`); Gemini on every `assistant-text` (D-07: per-emission since Gemini hardcodes `turnComplete: true`). New per-reader fixtures + new `claude-jsonl-reader.test.ts` file (3 P2-01 tests).
 **Phase:** 2
 **Prerequisites:** P1A-02
 **Files:**
@@ -669,6 +670,7 @@ This is a side effect of P1A-01 step 5; ticket exists to call out the test oblig
 **Acceptance:** new fixtures per reader exercise the flag. Existing reader tests continue to pass.
 
 ### P2-02 PromptPatternDetector + waiting status from PTY
+**Status:** Complete — landed 2026-05-16 (agent c89e9a46, M3 bundle). New `src/main/supervisor/prompt-pattern-detector.ts` + `.test.ts` (11 tests, BR-14 + supporting). WSL runner gained sibling `outputRing: string[]` (MAX_RING_LINES = 500) advanced inside the existing `handleMessage('data')` block — same code path as `_lastMeaningfulBurst`. Both runners expose `getOutputRingTail(maxBytes = 4096): string`; partial-line concatenation logic mirrored across both so fragmented prompts coalesce. `StatusMonitor` gained a fourth collaborator `getOutputRingTail`; `inferStatus` runs the detector after latch check on `elapsed > 2_000` and calls `forceWaiting` on match. Inlined `stripAnsi` helper inside `status-monitor.ts` rather than extracting a shared module (judgment call: lower-cost than churning a shared file). BR-14 + 11 status-monitor tests green.
 **Phase:** 2
 **Prerequisites:** P0-02, P1A-01
 **Files:**
@@ -686,6 +688,7 @@ This is a side effect of P1A-01 step 5; ticket exists to call out the test oblig
 **Notes:** the ANSI strip helper exists in `windows-runner.ts:176-184` and `wsl-runner.ts:200-207`; extract to a shared helper or duplicate the regex set inline in the detector — implementer's choice.
 
 ### P2-03 `waiting_for_input` payload + bridge wiring
+**Status:** Complete — landed 2026-05-16 (agent c89e9a46, M3 bundle). `SupervisorEvent` extended with `waitingKind?` + `waitingExcerpt?` (no new type tag — kept as `status_change` to `'waiting'` per D-01). `buildEventPayload` renders the §2.3.3 format. `'waiting'` added to `TRIGGER_STATUSES` at top of `event-bridge.ts`; the `waiting → working` suppression is a separate early return inside `onStatusChanged`, ordered before the supervisor lookup (BR-20). For codex `assistant-text-patch` carrying `endsWithQuestion: true`, bridge calls `forceWaiting(agentId, 'question', '')` — excerpt empty since patch event has no body, supervisor still gets dedicated header + log tail. `sendInput` clearing the latch: implementer chose `bridge.notifyUserInputDelivered(agentId)` hook called from `AgentSupervisor.sendInput` after `_doSendInput` resolves (keeps the "only forceWorking if currently waiting" conditional on the bridge for BR-15 testability while keeping the bottleneck in `sendInput` so HTTP/IPC/MCP all benefit). BR-13×2, BR-15×2, BR-20 green.
 **Phase:** 2
 **Prerequisites:** P2-01, P2-02
 **Files:**
@@ -701,6 +704,7 @@ This is a side effect of P1A-01 step 5; ticket exists to call out the test oblig
 **Acceptance:** BR-13, BR-14, BR-15, BR-20 pass. Manual: a Codex agent emits a `?`-ending final message → supervisor receives `[DASHBOARD EVENT] Agent waiting for input` with the question quoted. Sending a reply via the chat input flips the agent back to `working` immediately.
 
 ### P2-04 Supervisor CLAUDE.md text for waiting_for_input
+**Status:** Complete — landed 2026-05-16 (agent c89e9a46, M3 bundle). `SUPERVISOR_AGENT_MD` constant in `src/shared/constants.ts` (+1 line) gained the `waiting_for_input` bullet under the Automatic Events section. On-disk `.dashboard/supervisor/CLAUDE.md` NOT touched (running supervisor would block the edit). To surface the new bullet in an existing workspace requires the rebuild + force-fresh-scaffold sequence per the project CLAUDE.md "Supervisor scaffold" section.
 **Phase:** 2
 **Prerequisites:** P2-03
 **Files:** `src/shared/constants.ts` (search `SUPERVISOR_AGENT_MD`, "Automatic Events" section).
@@ -711,6 +715,7 @@ This is a side effect of P1A-01 step 5; ticket exists to call out the test oblig
 ## Phase 3 — Multi-supervisor seam audit + integration test
 
 ### P3-01 Multi-supervisor seam audit doc
+**Status:** Complete — landed 2026-05-16 (agent 981fc41a). `docs/SUPERVISOR_ROUTING_SEAMS.md` published (143 lines). 17 seams documented (13 from plan §2.6 verified + 4 surfaced by audit): 3 single-owner safe, 10 need per-owner rework, 1 delete (duplicate-supervisor guard), 1 dev/legacy (`list-ids.js`). Plan §2.6's table was stale (pre-M2A); audit captured the shape change (`event-bridge` extraction collapsed two open-coded sites into one wiring point at `index.ts:245`) and corrected line-number drift on 6 of 11 entries. **New sites the plan missed:** `dashboard-store.ts:555-557` (renderer's single `supervisorAgent` field); `mcp-supervisor.js:594-609` (`launch_agent` MCP handler doesn't propagate `supervisorId` — would orphan MCP-launched workers post-migration); `event-bridge.ts:280 forgetAgent`; `test-helpers/fake-bridge-deps.ts:109`. **Highest-risk silent-bug seams:** singleton queue/drain in `event-bridge.ts:50,52` (events would consolidate to wrong supervisor); `getSupervisorForWorker` wiring at `index.ts:245`; orphaned MCP workers; `queryAgent --continue` fallback at `index.ts:1443`. Audit added an MS-01..MS-05 test matrix proposal for P3-02 (per-owner queue isolation, per-supervisor drain state, explicit `supervisor_id`-based resolution). Minor accounting nit: disposition counts sum to 15 not 17 (worth reconciling on follow-up read).
 **Phase:** 3
 **Prerequisites:** Phase 0, 1A, 1B complete; can run in parallel with Phase 2.
 **Files:** new `docs/SUPERVISOR_ROUTING_SEAMS.md`.
@@ -749,9 +754,9 @@ This is a side effect of P1A-01 step 5; ticket exists to call out the test oblig
 | **M0 — Test convention + payload `source`/`fromStatus`** | P0-00 ✓, P0-01 ✓ | Every subsequent ticket can assert |
 | **M1 — Bridge extracted + baseline tests** | P0-02 ✓, P0-03 ✓ | Phase 1A, 1B, 2 |
 | **M2A — Pipeline B → status (latched)** | P1A-01 ✓, P1A-02 ✓, P1A-03 ✓, P1A-04 ✓ | UX fix for documented Codex stall incident |
-| **M2B — Crash routing + cleanup + attach window** | P1B-01 ✓, P1B-02 ✓, P1B-03 ✓ (uncommitted on master 2026-05-16) | Multi-supervisor migration becomes safe |
-| **M3 — Waiting visible** | P2-01, P2-02, P2-03, P2-04 | Plan-mode + in-text questions reach supervisor |
-| **M4 — Migration-ready** | P3-01, P3-02, P3-03 | Multi-supervisor migration P1-03/P1-04 have integration tests to pass |
+| **M2B — Crash routing + cleanup + attach window** | P1B-01 ✓, P1B-02 ✓, P1B-03 ✓ (committed 3b19a1b) | Multi-supervisor migration becomes safe |
+| **M3 — Waiting visible** | P2-01 ✓, P2-02 ✓, P2-03 ✓, P2-04 ✓ (uncommitted on master 2026-05-16) | Plan-mode + in-text questions reach supervisor |
+| **M4 — Migration-ready** | P3-01 ✓ (uncommitted), P3-02, P3-03 | Multi-supervisor migration P1-03/P1-04 have integration tests to pass |
 
 M2A and M2B are sibling-parallel after M1. **Both M2A and M2B must land before the multi-supervisor migration starts** — M2A so the bridge has authoritative status truth, M2B so the bridge actually sees crashes.
 

@@ -237,7 +237,19 @@ export class AgentSupervisor extends EventEmitter {
     this.monitor = new StatusMonitor(
       (agent) => this.checkAlive(agent),
       (agentId) => this.getLastOutputTime(agentId),
-      (agentId) => getAgent(agentId)
+      (agentId) => getAgent(agentId),
+      () => Date.now(),
+      // P2-02: PTY ring tail for PromptPatternDetector. Falls back through
+      // both runner maps; empty string when no runner exists (terminal /
+      // not-yet-launched). The runners' ring buffers are advanced in the
+      // same data handler that advances `_lastMeaningfulBurst`.
+      (agentId) => {
+        const win = this.windowsRunners.get(agentId);
+        if (win) return win.getOutputRingTail();
+        const wsl = this.wslRunners.get(agentId);
+        if (wsl) return wsl.getOutputRingTail();
+        return '';
+      }
     );
 
     const bridgeDeps: EventBridgeDeps = {
@@ -1601,7 +1613,14 @@ export class AgentSupervisor extends EventEmitter {
     const previous = this.inputQueues.get(agentId) || Promise.resolve();
     const ours: Promise<void> = previous
       .catch(() => undefined) // a prior failed send must not poison the queue
-      .then(() => this._doSendInput(agentId, text));
+      .then(() => this._doSendInput(agentId, text))
+      .then(() => {
+        // P2-03: if the agent was waiting on user input, the send just
+        // answered the prompt — clear the latch so status flips back to
+        // working immediately. Bridge filters the resulting waiting→working
+        // emission so the supervisor doesn't get a noise notification.
+        this.bridge.notifyUserInputDelivered(agentId);
+      });
     this.inputQueues.set(agentId, ours);
     // Clear in-flight only when the chain has fully drained for this agent.
     // If more sends queued behind us, they own the cleanup.
