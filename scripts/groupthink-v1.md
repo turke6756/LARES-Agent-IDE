@@ -125,10 +125,12 @@ If you need to tune behavior, these are at the top of `scripts/groupthink-v1.js`
 |---|---|---|
 | `MAX_TURNS` | `10` | Hard cap on relay turns before stall fires |
 | `POLL_INTERVAL_MS` | `2000` | How often `waitTurnComplete` polls agent status |
-| `MIN_READY_POLLS` | `3` | Consecutive ready+fresh-message observations required before treating a turn as complete |
+| `MIN_READY_POLLS` | `3` | Consecutive `idle`/`waiting` status observations `waitReady` requires before treating an agent as warmed up post-launch. Only consulted during initial launch, not for turn completion. |
 | `DEFAULT_PORTS` | `[24678, 24679, 24680, 24681]` | Port fallback for `connectApi` |
 
 These are not exposed as CLI flags in v1. Edit the script directly if you need to override (rare).
+
+Turn completion no longer gates on `agent.status`; the script reads `turnComplete: true` from the chat stream directly. With Phase 1A landed, the status field flips to `idle` within ~1 s of `turnComplete`, but the script does not depend on this.
 
 ## Pre-flight checklist
 

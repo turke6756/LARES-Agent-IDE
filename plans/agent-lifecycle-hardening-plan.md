@@ -1,6 +1,6 @@
 # Agent Lifecycle & Event Pipeline Hardening
 
-**Status:** planning. Pre-implementation; companion to (and prerequisite for) `docs/MULTI_SUPERVISOR_AND_ORCHESTRATION_MIGRATION.md`.
+**Status:** Complete (M0..M4 all landed 2026-05-16). Companion to (and prerequisite for) `docs/MULTI_SUPERVISOR_AND_ORCHESTRATION_MIGRATION.md`, which is now unblocked.
 
 **Scope:** one architectural defect surfacing as five symptoms. The dashboard runs two unreconciled "what is this agent doing" pipelines:
 
@@ -726,6 +726,7 @@ This is a side effect of P1A-01 step 5; ticket exists to call out the test oblig
 **Acceptance:** doc lists every `getSupervisorAgent` call site in `src/`. Each entry has a "disposition under multi-supervisor" column.
 
 ### P3-02 Bridge integration test: agent-X-transitioned-to-supervisor-Y-received-event
+**Status:** Complete — landed 2026-05-16 (agent aaf1d0ce). New `src/main/supervisor/event-bridge.integration.test.ts` (724 lines). All 5 single-supervisor scenarios pass (`single/idle`, `single/crash` with cooldown-bypass via BR-02b, `single/ctx`, `single/waiting-q` covering BR-13+BR-20, `single/waiting-tty` covering BR-14). All 38 prior `test:supervisor` tests still green. All 5 MS-XX multi-supervisor scenarios under `MULTI_SUPERVISOR=1` fail as designed — each failure points at a specific migration ticket: MS-01/MS-03/MS-05 wait on P1-04 (`getSupervisorForWorker` resolver swap at `index.ts:257`), MS-02/MS-04 wait on P1-03 (split singleton `supervisorQueuedEvents` into per-supervisor map), MS-05 also needs P1-06 (thread `supervisorId` through `scripts/mcp-supervisor.js:594-609 launch_agent`). **Zero production code changes required** — agent reports the bridge is testable as-is, "a credit to the M2A EventBridge extraction." Plumbing decisions: reused `patchDatabaseModule` from `fake-status-deps.ts` for in-memory module-level DB stubs; real `EventBridge` + real `StatusMonitor` wired mirroring `AgentSupervisor:278-296`; `sendInput` dep records into a calls array for payload assertions; drain timer bypassed via explicit `bridge.drainPendingFor(supId)`; `supervisorId` stamped via `ownBy(agent, supId)` cast helper since the field doesn't exist on `Agent` until migration P1-01.
 **Phase:** 3
 **Prerequisites:** P0-03, P1A-02, P1B-01, P2-03
 **Files:** new `src/main/supervisor/event-bridge.integration.test.ts`.
@@ -737,6 +738,7 @@ This is a side effect of P1A-01 step 5; ticket exists to call out the test oblig
 **Acceptance:** all single-supervisor variants pass; the multi-supervisor variant is documented as the acceptance test for migration P1-03/P1-04.
 
 ### P3-03 GroupThink markdown freshness
+**Status:** Complete — landed 2026-05-16 (agent 152051dd). `scripts/groupthink-v1.md` updated at lines 128-131: one table row clarified (`MIN_READY_POLLS` description now scoped to "Consecutive `idle`/`waiting` status observations `waitReady` requires before treating an agent as warmed up post-launch. Only consulted during initial launch, not for turn completion."); new paragraph appended after the table per the ticket text. Agent verified by reading `scripts/groupthink-v1.js`: `MIN_READY_POLLS` appears exactly twice (declared :23, consumed :156 inside `waitReady`); `waitTurnComplete` (:173-193) polls `readNextMessage` directly and only consults `agent.status` as a hard-exit signal for `crashed`/`done`. Script's inline comment at :174-179 corroborates the new doc paragraph.
 **Phase:** 3
 **Prerequisites:** P1A-02
 **Files:** `scripts/groupthink-v1.md:120-129`.
@@ -755,8 +757,8 @@ This is a side effect of P1A-01 step 5; ticket exists to call out the test oblig
 | **M1 — Bridge extracted + baseline tests** | P0-02 ✓, P0-03 ✓ | Phase 1A, 1B, 2 |
 | **M2A — Pipeline B → status (latched)** | P1A-01 ✓, P1A-02 ✓, P1A-03 ✓, P1A-04 ✓ | UX fix for documented Codex stall incident |
 | **M2B — Crash routing + cleanup + attach window** | P1B-01 ✓, P1B-02 ✓, P1B-03 ✓ (committed 3b19a1b) | Multi-supervisor migration becomes safe |
-| **M3 — Waiting visible** | P2-01 ✓, P2-02 ✓, P2-03 ✓, P2-04 ✓ (uncommitted on master 2026-05-16) | Plan-mode + in-text questions reach supervisor |
-| **M4 — Migration-ready** | P3-01 ✓ (uncommitted), P3-02, P3-03 | Multi-supervisor migration P1-03/P1-04 have integration tests to pass |
+| **M3 — Waiting visible** | P2-01 ✓, P2-02 ✓, P2-03 ✓, P2-04 ✓ (committed a997ce5 + d130979) | Plan-mode + in-text questions reach supervisor |
+| **M4 — Migration-ready** | P3-01 ✓ (committed a997ce5), P3-02 ✓, P3-03 ✓ (uncommitted on master 2026-05-16) | Multi-supervisor migration P1-03/P1-04 have integration tests to pass |
 
 M2A and M2B are sibling-parallel after M1. **Both M2A and M2B must land before the multi-supervisor migration starts** — M2A so the bridge has authoritative status truth, M2B so the bridge actually sees crashes.
 
