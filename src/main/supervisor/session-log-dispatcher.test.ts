@@ -7,7 +7,13 @@
 import assert from 'node:assert/strict';
 import { SessionLogDispatcher } from './session-log-dispatcher';
 import type { ChatLogReader, ChatLogReaderSession } from './log-readers/types';
-import type { SessionEvent, UserTextEvent, ChatEventBatch } from '../../shared/session-events';
+import type {
+  SessionEvent,
+  UserTextEvent,
+  ChatEventBatch,
+  AssistantTextEvent,
+  AssistantTextPatchEvent,
+} from '../../shared/session-events';
 
 class FakeReader implements ChatLogReader {
   readonly provider = 'codex' as const;
@@ -144,6 +150,53 @@ test('non-user-text events are never dedupe candidates', () => {
   } as SessionEvent);
   dispatcher.pollNow();
   assert.equal(emitted.length, 2, 'assistant-text never deduped');
+});
+
+test('BR-12 (dispatcher half): assistant-text-patch mutates ring buffer entry in place', () => {
+  const { dispatcher, reader, emitted } = makeDispatcher();
+  // Poll 1: emit the assistant-text only.
+  const at: AssistantTextEvent = {
+    type: 'assistant-text',
+    uuid: 'a:split-1',
+    timestamp: new Date().toISOString(),
+    agentId: 'agent-1',
+    text: 'response body',
+  };
+  reader.queue.push(at);
+  dispatcher.pollNow();
+  assert.equal(emitted.length, 1);
+  const ringAfterPoll1 = dispatcher.getCachedEvents('agent-1').events;
+  const ringEntry = ringAfterPoll1.find(e => e.uuid === 'a:split-1');
+  assert.ok(ringEntry && ringEntry.type === 'assistant-text');
+  assert.equal(ringEntry.turnComplete, undefined, 'pre-patch: turnComplete not yet set');
+
+  // Poll 2: dispatcher receives the patch and must mutate the prior event in place.
+  const patch: AssistantTextPatchEvent = {
+    type: 'assistant-text-patch',
+    uuid: 'atp:split-1',
+    timestamp: new Date().toISOString(),
+    agentId: 'agent-1',
+    targetUuid: 'a:split-1',
+    turnComplete: true,
+    stopReason: 'task_complete',
+  };
+  reader.queue.push(patch);
+  // The dispatcher's per-agent rate limiter would skip a back-to-back tick;
+  // clear it so the second poll actually runs.
+  (dispatcher as any).nextPollAt.clear();
+  dispatcher.pollNow();
+
+  // The patch is in the second batch alongside the existing ring entry.
+  assert.equal(emitted.length, 2);
+  assert.ok(emitted[1].events.some(e => e.type === 'assistant-text-patch'));
+
+  // Ring mutated in place — same object identity, new flags.
+  const ringAfterPoll2 = dispatcher.getCachedEvents('agent-1').events;
+  const mutated = ringAfterPoll2.find(e => e.uuid === 'a:split-1');
+  assert.ok(mutated && mutated.type === 'assistant-text');
+  assert.equal(mutated.turnComplete, true, 'patch propagated turnComplete');
+  assert.equal(mutated.stopReason, 'task_complete', 'patch propagated stopReason');
+  assert.strictEqual(mutated, ringEntry, 'in-place mutation preserves object identity');
 });
 
 test('codex sessions with blank sessionId are still polled', () => {

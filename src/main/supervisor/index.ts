@@ -9,21 +9,24 @@ import {
   SUPERVISOR_AGENT_NAME, SUPERVISOR_AGENT_MD, SUPERVISOR_MEMORY_MD,
   SUPERVISOR_CLAUDE_SETTINGS_JSON, SUPERVISOR_RUN_ORCHESTRATION_SKILL, SUPERVISOR_ORCHESTRATION_SPIKE_SKILL,
   SCRIPT_READ_AGENT_LOG, SCRIPT_LIST_AGENTS, SCRIPT_SEND_MESSAGE, SCRIPT_GET_CONTEXT_STATS,
-  SUPERVISOR_EVENT_COOLDOWN_MS, SUPERVISOR_EVENT_LOG_TAIL_LINES, SUPERVISOR_CONTEXT_THRESHOLDS,
-  SUPERVISOR_EVENT_QUEUE_MAX, SUPERVISOR_EVENT_DRAIN_INTERVAL_MS,
 } from '../../shared/constants';
-import { SupervisorEvent, buildEventPayload, buildConsolidatedPayload } from './event-payload-builder';
+import { EventBridge, EventBridgeDeps } from './event-bridge';
 import { TeamMessageDeliveryEngine } from './team-delivery';
 import { WindowsRunner } from './windows-runner';
 import { WslRunner } from './wsl-runner';
 import { StatusMonitor } from './status-monitor';
+import type { StatusChangedEvent } from './status-events';
 import { ContextStatsMonitor, JsonlFileActivity } from './context-stats-monitor';
 import { SessionLogReader } from './session-log-reader';
 import { ClaudeJsonlReader } from './log-readers/claude-jsonl-reader';
 import { CodexRolloutReader } from './log-readers/codex-rollout-reader';
 import { GeminiTranscriptReader } from './log-readers/gemini-transcript-reader';
 import { AgentChatService } from './agent-chat-service';
-import { snapshotCodexSessions, discoverNewCodexSession } from './session-id-discovery';
+import {
+  snapshotCodexSessions,
+  discoverNewCodexSession,
+  findCodexSessionIdByCwd,
+} from './session-id-discovery';
 import { FileActivityTracker } from './file-activity-tracker';
 import {
   createAgent, getAgent, getActiveAgents, getAllAgents, getSupervisorAgent, getWorkspace, updateAgentStatus, updateAgentPid,
@@ -207,11 +210,8 @@ export class AgentSupervisor extends EventEmitter {
   private chatService: AgentChatService;
   private logsDir: string;
 
-  // Event bridge state
-  private eventCooldowns = new Map<string, number>();
-  private supervisorQueuedEvents: SupervisorEvent[] = [];
-  private eventDrainTimer: ReturnType<typeof setTimeout> | null = null;
-  private lastContextThreshold = new Map<string, number>();
+  // Event bridge — supervisor notification, cooldown, queue, drain state lives here.
+  private bridge: EventBridge;
 
   // Team message delivery
   private teamDeliveryEngine: TeamMessageDeliveryEngine;
@@ -236,18 +236,51 @@ export class AgentSupervisor extends EventEmitter {
 
     this.monitor = new StatusMonitor(
       (agent) => this.checkAlive(agent),
-      (agentId) => this.getLastOutputTime(agentId)
+      (agentId) => this.getLastOutputTime(agentId),
+      (agentId) => getAgent(agentId)
     );
 
+    const bridgeDeps: EventBridgeDeps = {
+      getAgent: (id) => getAgent(id),
+      getSupervisorForWorker: (worker) => getSupervisorAgent(worker.workspaceId),
+      sendInput: (supervisorId, text) => this.sendInput(supervisorId, text),
+      addAuditEvent: (agentId, type, payload) => { addEvent(agentId, type, payload); },
+      getAgentLog: (agentId, lines) => this.getAgentLog(agentId, lines),
+      getContextStats: (agentId) => this.contextStatsMonitor.getStats(agentId),
+      now: () => Date.now(),
+      scheduleDrain: (ms, fn) => {
+        const handle = setTimeout(fn, ms);
+        return { cancel: () => clearTimeout(handle) };
+      },
+      statusMonitor: {
+        forceIdle: (agentId, source) => this.monitor.forceIdle(agentId, source),
+        forceWaiting: (agentId, kind, excerpt) => this.monitor.forceWaiting(agentId, kind, excerpt),
+        forceWorking: (agentId, source) => this.monitor.forceWorking(agentId, source),
+      },
+    };
+    this.bridge = new EventBridge(bridgeDeps);
+
+    // Monitor-sourced status changes: forward on the supervisor's public emitter
+    // (so IPC handlers, ws-server, and team-delivery still receive them) and
+    // feed the bridge with a 'monitor' source tag.
     this.monitor.on('statusChanged', (data) => {
-      this.emit('statusChanged', data);
+      this.emit('statusChanged', { ...data, source: 'monitor' });
       // Handle auto-restart on crash
       const agent = getAgent(data.agentId);
       if (agent && data.status === 'crashed' && agent.autoRestartEnabled) {
         this.handleAutoRestart(agent);
       }
-      // Event bridge: notify supervisor of supervised agent status changes
-      this.handleSupervisorEvent(data);
+      void this.bridge.onStatusChanged({ ...data, source: 'monitor' });
+    });
+
+    // Direct emits from this supervisor (runner-exit / launch / restart / stop /
+    // restart-failed) still need to reach the bridge — those paths bypass
+    // StatusMonitor. Dedup against the monitor listener above by skipping
+    // events whose source is 'monitor' (or missing, for legacy callers).
+    this.on('statusChanged', (data: StatusChangedEvent | undefined) => {
+      if (data && data.source && data.source !== 'monitor') {
+        void this.bridge.onStatusChanged(data);
+      }
     });
 
     // Typed session-event reader — single source of truth for JSONL tailing.
@@ -269,6 +302,7 @@ export class AgentSupervisor extends EventEmitter {
     this.sessionLogReader.register(new GeminiTranscriptReader());
     this.sessionLogReader.on('chat-events', (batch) => {
       this.emit('chatEvents', batch);
+      this.bridge.onChatEvents(batch);
     });
 
     this.contextStatsMonitor = new ContextStatsMonitor(this.sessionLogReader);
@@ -277,7 +311,7 @@ export class AgentSupervisor extends EventEmitter {
     this.contextStatsMonitor.on('statsChanged', (stats: ContextStats) => {
       this.emit('contextStatsChanged', stats);
       // Event bridge: check context thresholds for supervised agents
-      this.checkContextThreshold(stats);
+      this.bridge.onContextStatsChanged(stats);
     });
 
     // JSONL-based file activity tracking (reliable for both Windows and WSL agents)
@@ -324,160 +358,6 @@ export class AgentSupervisor extends EventEmitter {
 
   getSupervisorAgent(workspaceId: string): Agent | null {
     return getSupervisorAgent(workspaceId);
-  }
-
-  // ── Event Bridge: auto-notify supervisor of supervised agent changes ──
-
-  private async handleSupervisorEvent(data: { agentId: string; status: AgentStatus; fromStatus?: AgentStatus }): Promise<void> {
-    try {
-      const agent = getAgent(data.agentId);
-      if (!agent || agent.isSupervisor || !agent.isSupervised) return;
-
-      // Only trigger on meaningful terminal statuses
-      const triggerStatuses: AgentStatus[] = ['idle', 'crashed', 'done'];
-      if (!triggerStatuses.includes(data.status)) return;
-
-      // Skip no-op transitions. data.fromStatus is the pre-update status; agent.status
-      // is read after updateAgentStatus has already committed, so we can't compare to it.
-      if (data.fromStatus !== undefined && data.fromStatus === data.status) return;
-
-      const supervisor = getSupervisorAgent(agent.workspaceId);
-      if (!supervisor || ['done', 'crashed'].includes(supervisor.status)) return;
-
-      // Per-agent cooldown
-      const lastEvent = this.eventCooldowns.get(data.agentId) || 0;
-      if (Date.now() - lastEvent < SUPERVISOR_EVENT_COOLDOWN_MS) return;
-      this.eventCooldowns.set(data.agentId, Date.now());
-
-      // Build event
-      const logTail = await this.getAgentLog(data.agentId, SUPERVISOR_EVENT_LOG_TAIL_LINES);
-      const stats = this.getContextStats(data.agentId);
-      const event: SupervisorEvent = {
-        type: 'status_change',
-        agentId: agent.id,
-        agentTitle: agent.title,
-        workspaceId: agent.workspaceId,
-        fromStatus: data.fromStatus ?? agent.status,
-        toStatus: data.status,
-        lastExitCode: agent.lastExitCode,
-        contextPercentage: stats?.contextPercentage,
-        contextWindowMax: stats?.contextWindowMax,
-        totalContextTokens: stats?.totalContextTokens,
-        turnCount: stats?.turnCount,
-        model: stats?.model,
-        logTail,
-      };
-
-      await this.deliverToSupervisor(supervisor, event);
-    } catch (err) {
-      console.error('[event-bridge] Error handling supervisor event:', err);
-    }
-  }
-
-  private checkContextThreshold(stats: ContextStats): void {
-    try {
-      const agent = getAgent(stats.agentId);
-      if (!agent || agent.isSupervisor || !agent.isSupervised) return;
-
-      // Find highest crossed threshold
-      const crossed = SUPERVISOR_CONTEXT_THRESHOLDS.filter(t => stats.contextPercentage >= t);
-      if (crossed.length === 0) return;
-      const threshold = Math.max(...crossed);
-
-      // Skip if same threshold already reported
-      const lastThreshold = this.lastContextThreshold.get(stats.agentId) || 0;
-      if (threshold <= lastThreshold) return;
-      this.lastContextThreshold.set(stats.agentId, threshold);
-
-      const supervisor = getSupervisorAgent(agent.workspaceId);
-      if (!supervisor || ['done', 'crashed'].includes(supervisor.status)) return;
-
-      const event: SupervisorEvent = {
-        type: 'context_threshold',
-        agentId: agent.id,
-        agentTitle: agent.title,
-        workspaceId: agent.workspaceId,
-        contextPercentage: stats.contextPercentage,
-        contextWindowMax: stats.contextWindowMax,
-        totalContextTokens: stats.totalContextTokens,
-        turnCount: stats.turnCount,
-        model: stats.model,
-      };
-
-      this.deliverToSupervisor(supervisor, event);
-    } catch (err) {
-      console.error('[event-bridge] Error checking context threshold:', err);
-    }
-  }
-
-  private async deliverToSupervisor(supervisor: Agent, event: SupervisorEvent): Promise<void> {
-    // Re-fetch supervisor for fresh status
-    const fresh = getAgent(supervisor.id);
-    if (!fresh) return;
-
-    if (fresh.status === 'working' || fresh.status === 'launching') {
-      // Queue the event — supervisor is busy
-      this.supervisorQueuedEvents.push(event);
-      if (this.supervisorQueuedEvents.length > SUPERVISOR_EVENT_QUEUE_MAX) {
-        this.supervisorQueuedEvents.shift(); // drop oldest
-      }
-      if (!this.eventDrainTimer) {
-        this.eventDrainTimer = setTimeout(() => this.drainEventQueue(supervisor.id), SUPERVISOR_EVENT_DRAIN_INTERVAL_MS);
-      }
-      console.log(`[event-bridge] Queued event (supervisor busy): ${event.type} for "${event.agentTitle}"`);
-      return;
-    }
-
-    if (fresh.status === 'idle' || fresh.status === 'waiting') {
-      // Don't inject events while the user has the terminal open — it types into their input field.
-      // Queue instead and drain when they detach or the supervisor becomes busy/idle again.
-      if (fresh.isAttached) {
-        this.supervisorQueuedEvents.push(event);
-        if (this.supervisorQueuedEvents.length > SUPERVISOR_EVENT_QUEUE_MAX) {
-          this.supervisorQueuedEvents.shift();
-        }
-        if (!this.eventDrainTimer) {
-          this.eventDrainTimer = setTimeout(() => this.drainEventQueue(supervisor.id), SUPERVISOR_EVENT_DRAIN_INTERVAL_MS);
-        }
-        console.log(`[event-bridge] Queued event (supervisor attached/user viewing): ${event.type} for "${event.agentTitle}"`);
-        return;
-      }
-
-      const payload = buildEventPayload(event);
-      await this.sendInput(fresh.id, payload);
-      addEvent(fresh.id, 'supervisor_event', JSON.stringify({ type: event.type, agentId: event.agentId, agentTitle: event.agentTitle }));
-      console.log(`[event-bridge] Sent event to supervisor: ${event.type} for "${event.agentTitle}"`);
-      return;
-    }
-
-    // Supervisor is done/crashed — drop the event
-    console.log(`[event-bridge] Dropped event (supervisor ${fresh.status}): ${event.type} for "${event.agentTitle}"`);
-  }
-
-  private async drainEventQueue(supervisorId: string): Promise<void> {
-    this.eventDrainTimer = null;
-
-    const supervisor = getAgent(supervisorId);
-    if (!supervisor || ['done', 'crashed'].includes(supervisor.status)) {
-      this.supervisorQueuedEvents = [];
-      return;
-    }
-
-    if (supervisor.status === 'working' || supervisor.status === 'launching') {
-      // Still busy — reschedule
-      this.eventDrainTimer = setTimeout(() => this.drainEventQueue(supervisorId), SUPERVISOR_EVENT_DRAIN_INTERVAL_MS);
-      return;
-    }
-
-    if (this.supervisorQueuedEvents.length === 0) return;
-
-    const events = [...this.supervisorQueuedEvents];
-    this.supervisorQueuedEvents = [];
-
-    const payload = buildConsolidatedPayload(events);
-    await this.sendInput(supervisor.id, payload);
-    addEvent(supervisor.id, 'supervisor_event_batch', JSON.stringify({ count: events.length }));
-    console.log(`[event-bridge] Drained ${events.length} queued events to supervisor`);
   }
 
   /** Write ~/.claude/agent-registry.json so other Claude instances can discover agents */
@@ -1036,9 +916,15 @@ export class AgentSupervisor extends EventEmitter {
       }
 
       if (resume && agent.provider === 'codex') {
-        const latest = getAgent(agent.id);
+        let latest = getAgent(agent.id);
         if (!latest?.resumeSessionId) {
-          throw new Error(`Cannot resume ${agent.title} (${agent.id}): no Codex resumeSessionId on record`);
+          // Discovery may have lost the id (app killed mid-launch, slow codex
+          // startup, etc.). Scan rollouts for a cwd-match before giving up.
+          const recovered = this.recoverCodexResumeSessionId(agent);
+          if (recovered) latest = getAgent(agent.id);
+        }
+        if (!latest?.resumeSessionId) {
+          throw new Error(`Cannot resume ${agent.title} (${agent.id}): no Codex resumeSessionId on record and no cwd-matching rollout found`);
         }
         args = buildCodexResumeArgs(args, latest.resumeSessionId);
         console.log(`[Windows] Resuming ${agent.title} (${agent.id}) with codex resume ${latest.resumeSessionId}`);
@@ -1062,9 +948,10 @@ export class AgentSupervisor extends EventEmitter {
       updateAgentExitCode(agent.id, exitCode);
       this.windowsRunners.delete(agent.id);
       const status: AgentStatus = exitCode === 0 ? 'done' : 'crashed';
+      const prior = getAgent(agent.id)?.status;
       updateAgentStatus(agent.id, status);
       addEvent(agent.id, status, JSON.stringify({ exitCode }));
-      this.emit('statusChanged', { agentId: agent.id, status });
+      this.emit('statusChanged', { agentId: agent.id, status, fromStatus: prior, source: 'runner-exit' } satisfies StatusChangedEvent);
 
       // Auto-restart
       const latest = getAgent(agent.id);
@@ -1099,12 +986,38 @@ export class AgentSupervisor extends EventEmitter {
 
     runner.launch(agent.workingDirectory, launchCmd, args, agent.logPath || '', useDirectSpawn);
     updateAgentPid(agent.id, runner.pid);
+    const priorWinLaunch = getAgent(agent.id)?.status;
     updateAgentStatus(agent.id, 'working');
-    this.emit('statusChanged', { agentId: agent.id, status: 'working' });
+    this.emit('statusChanged', { agentId: agent.id, status: 'working', fromStatus: priorWinLaunch, source: 'launch' } satisfies StatusChangedEvent);
 
     if (codexSnapshot) {
       this.captureCodexSessionId(agent.id, codexSnapshot, agent.workingDirectory, codexLaunchStartedAt);
     }
+  }
+
+  /**
+   * Retroactive recovery for codex agents whose `resumeSessionId` was never
+   * persisted at launch time — e.g. the app was killed inside the 10 s
+   * `discoverNewCodexSession` window, or codex flushed `session_meta` later
+   * than the polling timeout. Scans the codex rollout dir for the most recent
+   * rollout whose cwd matches and persists its id to the DB.
+   *
+   * Returns the recovered id, or null when no rollout matches.
+   */
+  private recoverCodexResumeSessionId(agent: Agent): string | null {
+    const home: 'windows' | 'wsl' =
+      detectPathType(agent.workingDirectory) === 'windows' ? 'windows' : 'wsl';
+    const result = findCodexSessionIdByCwd({
+      home,
+      workingDirectory: agent.workingDirectory,
+    });
+    if (!result) return null;
+    updateAgentResumeSessionId(agent.id, result.sessionId);
+    this.sessionLogReader.invalidatePath(agent.id);
+    console.log(
+      `[Codex] Recovered session id ${result.sessionId} for agent ${agent.id} via cwd-match (${result.path})`
+    );
+    return result.sessionId;
   }
 
   private captureCodexSessionId(
@@ -1197,9 +1110,15 @@ export class AgentSupervisor extends EventEmitter {
       }
 
       if (resume && agent.provider === 'codex') {
-        const latest = getAgent(agent.id);
+        let latest = getAgent(agent.id);
         if (!latest?.resumeSessionId) {
-          throw new Error(`Cannot resume ${agent.title} (${agent.id}): no Codex resumeSessionId on record`);
+          // Discovery may have lost the id (app killed mid-launch, slow codex
+          // startup, etc.). Scan rollouts for a cwd-match before giving up.
+          const recovered = this.recoverCodexResumeSessionId(agent);
+          if (recovered) latest = getAgent(agent.id);
+        }
+        if (!latest?.resumeSessionId) {
+          throw new Error(`Cannot resume ${agent.title} (${agent.id}): no Codex resumeSessionId on record and no cwd-matching rollout found`);
         }
         command = buildCodexResumeCommand(command, latest.resumeSessionId);
         console.log(`[WSL] Resuming ${agent.title} (${agent.id}) with codex resume ${latest.resumeSessionId}`);
@@ -1270,9 +1189,10 @@ export class AgentSupervisor extends EventEmitter {
       updateAgentExitCode(agent.id, exitCode);
       this.wslRunners.delete(agent.id);
       const status: AgentStatus = exitCode === 0 ? 'done' : 'crashed';
+      const prior = getAgent(agent.id)?.status;
       updateAgentStatus(agent.id, status);
       addEvent(agent.id, status, JSON.stringify({ exitCode }));
-      this.emit('statusChanged', { agentId: agent.id, status });
+      this.emit('statusChanged', { agentId: agent.id, status, fromStatus: prior, source: 'runner-exit' } satisfies StatusChangedEvent);
 
       const latest = getAgent(agent.id);
       if (latest && status === 'crashed' && latest.autoRestartEnabled) {
@@ -1288,8 +1208,9 @@ export class AgentSupervisor extends EventEmitter {
     const codexLaunchStartedAt = Date.now();
 
     await runner.launch(wslWorkDir, command, nativeLogPath);
+    const priorWslLaunch = getAgent(agent.id)?.status;
     updateAgentStatus(agent.id, 'working');
-    this.emit('statusChanged', { agentId: agent.id, status: 'working' });
+    this.emit('statusChanged', { agentId: agent.id, status: 'working', fromStatus: priorWslLaunch, source: 'launch' } satisfies StatusChangedEvent);
 
     if (codexSnapshot) {
       this.captureCodexSessionId(agent.id, codexSnapshot, wslWorkDir, codexLaunchStartedAt);
@@ -1302,9 +1223,10 @@ export class AgentSupervisor extends EventEmitter {
       return;
     }
 
+    const priorRestart = getAgent(agent.id)?.status;
     updateAgentStatus(agent.id, 'restarting');
     addEvent(agent.id, 'restarting');
-    this.emit('statusChanged', { agentId: agent.id, status: 'restarting' });
+    this.emit('statusChanged', { agentId: agent.id, status: 'restarting', fromStatus: priorRestart, source: 'restart' } satisfies StatusChangedEvent);
     incrementRestartCount(agent.id);
 
     setTimeout(async () => {
@@ -1319,9 +1241,10 @@ export class AgentSupervisor extends EventEmitter {
           await this.launchWslAgent(latest, true);
         }
       } catch (err) {
+        const priorRestartFail = getAgent(agent.id)?.status;
         updateAgentStatus(agent.id, 'crashed');
         addEvent(agent.id, 'restart_failed', String(err));
-        this.emit('statusChanged', { agentId: agent.id, status: 'crashed' });
+        this.emit('statusChanged', { agentId: agent.id, status: 'crashed', fromStatus: priorRestartFail, source: 'restart-failed' } satisfies StatusChangedEvent);
       }
     }, 2000);
   }
@@ -1552,10 +1475,11 @@ export class AgentSupervisor extends EventEmitter {
     }
 
     this.fileTrackers.delete(agentId);
+    const priorStop = getAgent(agentId)?.status;
     updateAgentStatus(agentId, 'done');
     updateAgentExitCode(agentId, 0);
     addEvent(agentId, 'stopped');
-    this.emit('statusChanged', { agentId, status: 'done' });
+    this.emit('statusChanged', { agentId, status: 'done', fromStatus: priorStop, source: 'stop' } satisfies StatusChangedEvent);
   }
 
   async deleteAgent(agentId: string): Promise<void> {
@@ -1573,9 +1497,7 @@ export class AgentSupervisor extends EventEmitter {
     }
 
     this.fileTrackers.delete(agentId);
-    this.eventCooldowns.delete(agentId);
-    this.lastContextThreshold.delete(agentId);
-    this.supervisorQueuedEvents = this.supervisorQueuedEvents.filter(e => e.agentId !== agentId);
+    this.bridge.forgetAgent(agentId);
     dbDeleteAgent(agentId);
     this.emit('agentDeleted', { agentId });
   }
@@ -1585,9 +1507,10 @@ export class AgentSupervisor extends EventEmitter {
     const agent = getAgent(agentId);
     if (!agent) return;
 
+    const priorRestart = getAgent(agentId)?.status;
     updateAgentStatus(agentId, 'restarting');
     incrementRestartCount(agentId);
-    this.emit('statusChanged', { agentId, status: 'restarting' });
+    this.emit('statusChanged', { agentId, status: 'restarting', fromStatus: priorRestart, source: 'restart' } satisfies StatusChangedEvent);
 
     setTimeout(async () => {
       const latest = getAgent(agentId);
@@ -1600,8 +1523,9 @@ export class AgentSupervisor extends EventEmitter {
           await this.launchWslAgent(latest, true);
         }
       } catch (err) {
+        const priorRestartFail = getAgent(agentId)?.status;
         updateAgentStatus(agentId, 'crashed');
-        this.emit('statusChanged', { agentId, status: 'crashed' });
+        this.emit('statusChanged', { agentId, status: 'crashed', fromStatus: priorRestartFail, source: 'restart-failed' } satisfies StatusChangedEvent);
       }
     }, 1000);
   }
@@ -1891,9 +1815,10 @@ export class AgentSupervisor extends EventEmitter {
           addEvent(agent.id, 'reconnected');
         } catch (err) {
           console.error(`Failed to reconnect agent ${agent.id}:`, err);
+          const priorReconnect = getAgent(agent.id)?.status;
           updateAgentStatus(agent.id, 'crashed');
           addEvent(agent.id, 'reconnect_failed', String(err));
-          this.emit('statusChanged', { agentId: agent.id, status: 'crashed' });
+          this.emit('statusChanged', { agentId: agent.id, status: 'crashed', fromStatus: priorReconnect, source: 'restart-failed' } satisfies StatusChangedEvent);
         }
       }
     }

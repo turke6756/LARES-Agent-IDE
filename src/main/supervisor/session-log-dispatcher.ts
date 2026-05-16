@@ -3,6 +3,7 @@ import type {
   SessionEvent,
   ChatEventBatch,
   UserTextEvent,
+  AssistantTextPatchEvent,
 } from '../../shared/session-events';
 import type { AgentProvider } from '../../shared/types';
 import type { ChatLogReader, ChatLogReaderSession } from './log-readers/types';
@@ -225,6 +226,18 @@ export class SessionLogDispatcher extends EventEmitter {
     for (const ev of rawEvents) {
       if (!this.markEventUuidSeen(ev.agentId, ev.uuid)) continue;
       if (this.dedupeAgainstSynthetic(ev)) continue;
+      // Patch events carry a fresh uuid (so dedupe lets them through) and
+      // target a prior `assistant-text` already in the ring. Apply the
+      // mutation here so consumers reading the ring see the updated flags.
+      // Re-audited 2026-05-16: `AgentChatService.getMessages` reads
+      // `getCachedEvents` directly; `ChatPane.tsx` consumes batches via
+      // `pairEvents` without caching envelopes — both pick up the mutation
+      // naturally. The only structural cache of `assistant-text` is the
+      // codex reader's `lastAssistantTextEvent`, which holds a reference
+      // to the same object the dispatcher mutates here (safe).
+      if (ev.type === 'assistant-text-patch') {
+        this.applyAssistantTextPatch(ev.agentId, ev);
+      }
       newEvents.push(ev);
     }
     if (newEvents.length === 0) return;
@@ -242,6 +255,21 @@ export class SessionLogDispatcher extends EventEmitter {
       if (ev.type === 'usage') this.emit('usage', ev);
       else if (ev.type === 'tool-use') this.emit('tool-use', ev);
       else if (ev.type === 'tool-result') this.emit('tool-result', ev);
+    }
+  }
+
+  private applyAssistantTextPatch(agentId: string, patch: AssistantTextPatchEvent): void {
+    const ring = this.eventsByAgent.get(agentId);
+    if (!ring) return;
+    // Walk backwards — the target is virtually always recent.
+    for (let i = ring.length - 1; i >= 0; i--) {
+      const ev = ring[i];
+      if (ev.type !== 'assistant-text') continue;
+      if (ev.uuid !== patch.targetUuid) continue;
+      if (patch.turnComplete !== undefined) ev.turnComplete = patch.turnComplete;
+      if (patch.stopReason !== undefined) ev.stopReason = patch.stopReason;
+      if (patch.endsWithQuestion !== undefined) ev.endsWithQuestion = patch.endsWithQuestion;
+      return;
     }
   }
 

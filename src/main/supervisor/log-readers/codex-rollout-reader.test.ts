@@ -406,6 +406,148 @@ test('byte-offset tail emits incremental events on second poll', () => {
   }
 });
 
+test('task_started emits TaskStartedEvent and updates context window', () => {
+  const sessionId = '44444444-5555-6666-7777-888888888888';
+  const tmpPath = path.join(os.tmpdir(), `codex-task-started-${Date.now()}.jsonl`);
+  const lines = [
+    JSON.stringify({
+      timestamp: '2026-05-16T10:00:00.000Z',
+      type: 'session_meta',
+      payload: { id: sessionId, cwd: 'C:\\Users\\fixture', model_provider: 'openai', cli_version: '0.128.0' },
+    }),
+    JSON.stringify({
+      timestamp: '2026-05-16T10:00:01.000Z',
+      type: 'event_msg',
+      payload: { type: 'task_started', model_context_window: 200_000 },
+    }),
+    JSON.stringify({
+      timestamp: '2026-05-16T10:00:02.000Z',
+      type: 'response_item',
+      payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'hi' }] },
+    }),
+  ];
+  fs.writeFileSync(tmpPath, lines.join('\n') + '\n');
+  try {
+    const reader = new (class extends CodexRolloutReader {
+      constructor() {
+        super();
+        (this as any).resolvedPaths.set('test-agent', tmpPath);
+      }
+    })();
+    const events = reader.pollSession(makeSession({ sessionId }));
+    const ts = events.find((e) => e.type === 'task-started');
+    assert.ok(ts && ts.type === 'task-started', 'task-started event emitted');
+    assert.equal(ts.agentId, 'test-agent');
+    // Ordering: task-started lands before the assistant-text that follows it.
+    const tsIdx = events.indexOf(ts);
+    const atIdx = events.findIndex((e) => e.type === 'assistant-text');
+    assert.ok(tsIdx >= 0 && atIdx >= 0 && tsIdx < atIdx, 'task-started precedes assistant-text');
+  } finally {
+    fs.unlinkSync(tmpPath);
+  }
+});
+
+test('BR-12: split-batch task_complete emits assistant-text-patch targeting prior assistant-text', () => {
+  // Stage 1: write a rollout with assistant-text only (no task_complete yet).
+  // Stage 2: append the task_complete line. Poll twice. First poll emits the
+  // `assistant-text`. Second poll must emit `assistant-text-patch` whose
+  // targetUuid matches stage 1's assistant-text uuid.
+  const sessionId = '55555555-6666-7777-8888-999999999999';
+  const tmpPath = path.join(os.tmpdir(), `codex-split-batch-${Date.now()}.jsonl`);
+  const stage1 = [
+    JSON.stringify({
+      timestamp: '2026-05-16T11:00:00.000Z',
+      type: 'session_meta',
+      payload: { id: sessionId, cwd: 'C:\\Users\\fixture', model_provider: 'openai', cli_version: '0.128.0' },
+    }),
+    JSON.stringify({
+      timestamp: '2026-05-16T11:00:01.000Z',
+      type: 'response_item',
+      payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'response body' }] },
+    }),
+  ];
+  const stage2Line = JSON.stringify({
+    timestamp: '2026-05-16T11:00:02.000Z',
+    type: 'event_msg',
+    payload: { type: 'task_complete' },
+  });
+
+  fs.writeFileSync(tmpPath, stage1.join('\n') + '\n');
+  try {
+    const reader = new (class extends CodexRolloutReader {
+      constructor() {
+        super();
+        (this as any).resolvedPaths.set('test-agent', tmpPath);
+      }
+    })();
+    const first = reader.pollSession(makeSession({ sessionId }));
+    const at = first.find((e) => e.type === 'assistant-text');
+    assert.ok(at && at.type === 'assistant-text', 'stage 1 emits assistant-text');
+    assert.equal(at.turnComplete, undefined, 'stage 1 does not yet flag turnComplete');
+
+    fs.appendFileSync(tmpPath, stage2Line + '\n');
+    const second = reader.pollSession(makeSession({ sessionId }));
+    const patch = second.find((e) => e.type === 'assistant-text-patch');
+    assert.ok(patch && patch.type === 'assistant-text-patch', 'stage 2 emits assistant-text-patch');
+    assert.equal(patch.targetUuid, at.uuid, 'patch targets the stage 1 assistant-text by uuid');
+    assert.equal(patch.turnComplete, true, 'patch sets turnComplete: true');
+    assert.equal(patch.stopReason, 'task_complete', 'patch carries stopReason');
+    // No assistant-text re-emitted in stage 2.
+    assert.equal(
+      second.filter((e) => e.type === 'assistant-text').length,
+      0,
+      'stage 2 does not re-emit assistant-text',
+    );
+  } finally {
+    fs.unlinkSync(tmpPath);
+  }
+});
+
+test('in-batch task_complete still tags via direct walk-back (no patch emitted)', () => {
+  // Sanity: when task_complete arrives in the same poll as the assistant-text,
+  // the reader takes the fast path — no patch event is needed.
+  const sessionId = '66666666-7777-8888-9999-aaaaaaaaaaaa';
+  const tmpPath = path.join(os.tmpdir(), `codex-inbatch-complete-${Date.now()}.jsonl`);
+  const lines = [
+    JSON.stringify({
+      timestamp: '2026-05-16T12:00:00.000Z',
+      type: 'session_meta',
+      payload: { id: sessionId, cwd: 'C:\\Users\\fixture', model_provider: 'openai', cli_version: '0.128.0' },
+    }),
+    JSON.stringify({
+      timestamp: '2026-05-16T12:00:01.000Z',
+      type: 'response_item',
+      payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'all done' }] },
+    }),
+    JSON.stringify({
+      timestamp: '2026-05-16T12:00:02.000Z',
+      type: 'event_msg',
+      payload: { type: 'task_complete' },
+    }),
+  ];
+  fs.writeFileSync(tmpPath, lines.join('\n') + '\n');
+  try {
+    const reader = new (class extends CodexRolloutReader {
+      constructor() {
+        super();
+        (this as any).resolvedPaths.set('test-agent', tmpPath);
+      }
+    })();
+    const events = reader.pollSession(makeSession({ sessionId }));
+    const at = events.find((e) => e.type === 'assistant-text');
+    assert.ok(at && at.type === 'assistant-text');
+    assert.equal(at.turnComplete, true, 'in-batch walk-back tags assistant-text directly');
+    assert.equal(at.stopReason, 'task_complete');
+    assert.equal(
+      events.filter((e) => e.type === 'assistant-text-patch').length,
+      0,
+      'no patch event when in-batch walk-back succeeds',
+    );
+  } finally {
+    fs.unlinkSync(tmpPath);
+  }
+});
+
 test('subscribed idle path refresh does not replay the same rollout', () => {
   const sessionId = '33333333-4444-5555-6666-777777777777';
   const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-idle-refresh-'));

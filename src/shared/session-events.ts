@@ -24,6 +24,36 @@ export interface AssistantTextEvent extends BaseEvent {
   // Metadata for orchestration and structured extraction
   turnComplete?: boolean;
   stopReason?: string;
+  // Set by P2-01 (Phase 2). Until then this is always undefined; the bridge's
+  // dispatch table still branches on it so M3 wiring is a no-op when it lands.
+  endsWithQuestion?: boolean;
+}
+
+/**
+ * Retroactive amendment to an `assistant-text` already in the ring buffer.
+ *
+ * Background: Codex split-batches can deliver `task_complete` in a later
+ * poll than the preceding `assistant-text`. The reader's in-batch walk-back
+ * can't see those events anymore. Patch events carry a fresh uuid (so the
+ * dispatcher dedupe accepts them) plus the `targetUuid` of the event to
+ * mutate; the dispatcher applies the patch in-place to the ring and pushes
+ * the patch through to subscribers so chat consumers re-read the mutation.
+ */
+export interface AssistantTextPatchEvent extends BaseEvent {
+  type: 'assistant-text-patch';
+  targetUuid: string;
+  turnComplete?: boolean;
+  stopReason?: string;
+  endsWithQuestion?: boolean;
+}
+
+/**
+ * Marks the start of a new assistant turn. Emitted by Codex on
+ * `event_msg/task_started`. The status latch needs an explicit "new turn"
+ * signal to clear stale idle/waiting state cleanly.
+ */
+export interface TaskStartedEvent extends BaseEvent {
+  type: 'task-started';
 }
 
 export interface ThinkingEvent extends BaseEvent {
@@ -72,6 +102,8 @@ export interface SystemInitEvent extends BaseEvent {
 export type SessionEvent =
   | UserTextEvent
   | AssistantTextEvent
+  | AssistantTextPatchEvent
+  | TaskStartedEvent
   | ThinkingEvent
   | ToolUseEvent
   | ToolResultEvent

@@ -25,6 +25,13 @@ export const SUPERVISOR_CONTEXT_THRESHOLDS = [80, 90, 95];
 export const SUPERVISOR_EVENT_QUEUE_MAX = 10;
 export const SUPERVISOR_EVENT_DRAIN_INTERVAL_MS = 15_000;
 
+// Turn-latch TTLs — see plans/agent-lifecycle-hardening-plan.md §2.1.1 / D-09.
+// The latch holds Pipeline B's idle/waiting truth against contradictory PTY
+// byte-bursts. TTL exists so a never-resumed agent eventually falls back to
+// PTY truth rather than drifting permanently.
+export const IDLE_LATCH_TIMEOUT_MS = 30 * 60 * 1000;   // 30 min
+export const WAITING_LATCH_TIMEOUT_MS = 5 * 60 * 1000; // 5 min
+
 /** Default CLI commands per provider and environment */
 export const PROVIDER_COMMANDS: Record<AgentProvider, { windows: string; wsl: string }> = {
   claude: { windows: 'claude --dangerously-skip-permissions --chrome', wsl: 'ccode --dangerously-skip-permissions --chrome' },

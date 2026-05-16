@@ -4,6 +4,8 @@ import type {
   SessionEvent,
   UserTextEvent,
   AssistantTextEvent,
+  AssistantTextPatchEvent,
+  TaskStartedEvent,
   ThinkingEvent,
   ToolUseEvent,
   ToolResultEvent,
@@ -75,6 +77,11 @@ export class CodexRolloutReader implements ChatLogReader {
   private toolResultLocations = new Map<string, FullToolResultLocation>(); // `${agentId}:${callId}`
   private eofStreak = new Map<string, number>(); // agentId
   private warnedNewerVersion = new Set<string>(); // cli_version values we've warned about
+  // Per-agent reference to the last `assistant-text` emitted in any prior
+  // batch. Codex split-batches can deliver `task_complete` after the
+  // assistant-text it should mark; without this we can't tag turn end
+  // when the events land in different polls (see §2.1.3 / D-05).
+  private lastAssistantTextEvent = new Map<string, AssistantTextEvent>();
 
   constructor() {
     const { windowsDir, wslUncDir } = resolveHomeSubdir('.codex/sessions');
@@ -262,6 +269,13 @@ export class CodexRolloutReader implements ChatLogReader {
         if (typeof window === 'number' && window > 0) {
           this.modelContextWindow.set(session.agentId, window);
         }
+        const ev: TaskStartedEvent = {
+          type: 'task-started',
+          uuid: mkEventUuid('ts'),
+          timestamp,
+          agentId: session.agentId,
+        };
+        out.push(ev);
         return;
       }
 
@@ -271,14 +285,31 @@ export class CodexRolloutReader implements ChatLogReader {
       }
 
       if (payloadType === 'task_complete' || payloadType === 'turn_aborted') {
-        // Mark the last assistant-text event in this batch as turnComplete
+        // Primary: mark the last assistant-text event in this batch.
         for (let i = out.length - 1; i >= 0; i--) {
           const ev = out[i];
           if (ev.type === 'assistant-text') {
             ev.turnComplete = true;
             ev.stopReason = payloadType;
-            break;
+            this.lastAssistantTextEvent.delete(session.agentId);
+            return;
           }
+        }
+        // Fallback (split-batch): patch the prior batch's assistant-text via
+        // the dispatcher's in-place ring mutation. See §2.1.3.
+        const prior = this.lastAssistantTextEvent.get(session.agentId);
+        if (prior) {
+          const patch: AssistantTextPatchEvent = {
+            type: 'assistant-text-patch',
+            uuid: mkEventUuid('atp'),
+            timestamp,
+            agentId: session.agentId,
+            targetUuid: prior.uuid,
+            turnComplete: true,
+            stopReason: payloadType,
+          };
+          out.push(patch);
+          this.lastAssistantTextEvent.delete(session.agentId);
         }
         return;
       }
@@ -309,6 +340,7 @@ export class CodexRolloutReader implements ChatLogReader {
                 ...(model ? { model } : {}),
               };
               out.push(ev);
+              this.lastAssistantTextEvent.set(session.agentId, ev);
             }
           }
         }
