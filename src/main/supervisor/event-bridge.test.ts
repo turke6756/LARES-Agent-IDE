@@ -1,8 +1,7 @@
 // Baseline tests for EventBridge — covers BR-01 through BR-10 from the
-// agent-lifecycle hardening plan §2.7. BR-02 and BR-04 are HEAD-baseline
-// versions: cooldown still applies to runner-exit (the bypass lands at
-// P1B-01), and drain does not re-check `isAttached` (drain-on-detach is a
-// deferred ticket).
+// agent-lifecycle hardening plan §2.7, plus BR-02b (P1B-01: runner-exit
+// cooldown bypass). BR-04 is the HEAD-baseline variant: drain does not
+// re-check `isAttached` (drain-on-detach is a deferred ticket).
 //
 // Compile via the existing main tsconfig and run with:
 //   npm run build:main
@@ -92,6 +91,45 @@ async function BR_02_crashViaRunnerExit(): Promise<void> {
     'BR-02: payload renders the exit code line',
   );
   console.log('  BR-02 ✓ runner-exit crash payload');
+}
+
+async function BR_02b_runnerExitBypassesCooldown(): Promise<void> {
+  // P1B-01: two runner-exit events for the same agent within the 10s cooldown
+  // window must BOTH deliver. A crash isn't a flicker (D-06). Monitor-source
+  // duplicates inside 10s are still dropped — that's BR-05.
+  const f = makeFakeBridgeDeps();
+  const supervisor = makeAgent('sup-1', { isSupervisor: true, isSupervised: false, status: 'idle' });
+  const worker = makeAgent('w-1', { status: 'working', lastExitCode: 137 });
+  f.agents.set(supervisor.id, supervisor);
+  f.agents.set(worker.id, worker);
+  const bridge = new EventBridge(f.deps);
+
+  await bridge.onStatusChanged({
+    agentId: worker.id,
+    status: 'crashed',
+    fromStatus: 'working',
+    source: 'runner-exit',
+  });
+  assert.equal(f.sendInputCalls.length, 1, 'BR-02b: first runner-exit delivered');
+
+  // Move the clock forward but stay inside the 10s cooldown window.
+  f.setNow(f.getNow() + 5_000);
+  // Simulate a follow-up exit event (e.g. restart attempt also crashed).
+  worker.status = 'working';
+  worker.lastExitCode = 1;
+  await bridge.onStatusChanged({
+    agentId: worker.id,
+    status: 'crashed',
+    fromStatus: 'working',
+    source: 'runner-exit',
+  });
+
+  assert.equal(f.sendInputCalls.length, 2, 'BR-02b: second runner-exit also delivered (cooldown bypassed)');
+  assert.ok(
+    f.sendInputCalls[1].text.includes('Exit code: 1'),
+    'BR-02b: second payload renders the new exit code',
+  );
+  console.log('  BR-02b ✓ runner-exit bypasses 10s cooldown');
 }
 
 async function BR_03_queueAndConsolidate(): Promise<void> {
@@ -405,9 +443,10 @@ async function onChatEvents_geminiToolUseStillRoutes(): Promise<void> {
 }
 
 async function main(): Promise<void> {
-  console.log('event-bridge.test: running BR-01..BR-10 + BR-19 + dispatch table');
+  console.log('event-bridge.test: running BR-01..BR-10 + BR-02b + BR-19 + dispatch table');
   await BR_01_happyPath();
   await BR_02_crashViaRunnerExit();
+  await BR_02b_runnerExitBypassesCooldown();
   await BR_03_queueAndConsolidate();
   await BR_04_attachedQueueDrains();
   await BR_05_cooldownDropsDup();

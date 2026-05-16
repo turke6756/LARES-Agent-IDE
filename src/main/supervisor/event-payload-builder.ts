@@ -1,7 +1,10 @@
 import { AgentStatus } from '../../shared/types';
 
+// Team events are not currently emitted. If Teams reintroduces them, restore
+// the type tag (e.g. 'team_created' | 'team_loop_detected') and the matching
+// payload branches in buildEventPayload.
 export interface SupervisorEvent {
-  type: 'status_change' | 'context_threshold' | 'team_created' | 'team_loop_detected';
+  type: 'status_change' | 'context_threshold';
   agentId: string;
   agentTitle: string;
   workspaceId: string;
@@ -14,14 +17,6 @@ export interface SupervisorEvent {
   turnCount?: number;
   model?: string;
   logTail?: string;
-  // Team fields
-  teamId?: string;
-  teamName?: string;
-  teamMembers?: { agentId: string; title: string; provider: string; role: string }[];
-  teamTemplate?: string;
-  loopAgentA?: string;
-  loopAgentB?: string;
-  loopAlternations?: number;
 }
 
 function formatTokens(n: number): string {
@@ -74,32 +69,7 @@ export function buildEventPayload(event: SupervisorEvent): string {
     ].filter(Boolean).join('\n');
   }
 
-  if (event.type === 'team_created') {
-    const members = (event.teamMembers || [])
-      .map(m => `  - "${m.title}" (${m.agentId.slice(0, 8)}) [${m.provider}] — ${m.role}`)
-      .join('\n');
-    return [
-      '[TEAM EVENT] Team created',
-      `Team: "${event.teamName}" (${event.teamId})`,
-      `Template: ${event.teamTemplate || 'custom'}`,
-      `Members:\n${members}`,
-      '',
-      'Team members now have MCP tools (send_message, get_messages, get_tasks, etc.) to communicate directly. Monitor via get_team.',
-    ].join('\n');
-  }
-
-  if (event.type === 'team_loop_detected') {
-    return [
-      '[TEAM EVENT] Communication loop detected',
-      `Team: "${event.teamName}" (${event.teamId})`,
-      `Between: ${event.loopAgentA} ↔ ${event.loopAgentB}`,
-      `Alternations: ${event.loopAlternations}`,
-      '',
-      'The pair has been temporarily blocked. Assess the situation: modify channels, send new instructions, or remove one agent from the team.',
-    ].join('\n');
-  }
-
-  return `[DASHBOARD EVENT] Unknown event type: ${event.type}`;
+  return `[DASHBOARD EVENT] Unknown event type: ${(event as { type: string }).type}`;
 }
 
 export function buildConsolidatedPayload(events: SupervisorEvent[]): string {

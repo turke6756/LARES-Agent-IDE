@@ -20,6 +20,10 @@ export class WslRunner extends EventEmitter {
   private _lastMeaningfulBurst: number = 0;
   private _recentOutputBytes: number = 0;
   private _outputWindowStart: number = 0;
+  /** While > Date.now(), data bursts do NOT advance `_lastMeaningfulBurst`.
+   *  Set by `markInteractionIgnoreWindow` so a fresh attach (TUI redraw) does
+   *  not flip the agent's status to 'working'. P1B-03. */
+  private _ignoreBurstUntil: number = 0;
   private _pid: number | null = null;
   private _alive: boolean = false;
   private _intentionalKill: boolean = false;
@@ -159,7 +163,10 @@ export class WslRunner extends EventEmitter {
             this._recentOutputBytes = 0;
           }
           this._recentOutputBytes += msg.data.length;
-          if (this._recentOutputBytes > 200) {
+          // P1B-03: during the attach ignore window, count bytes for the
+          // rolling 3s window but do NOT advance the meaningful-burst
+          // timestamp — a TUI redraw on attach is not real activity.
+          if (this._recentOutputBytes > 200 && now >= this._ignoreBurstUntil) {
             this._lastMeaningfulBurst = now;
           }
         }
@@ -239,6 +246,13 @@ export class WslRunner extends EventEmitter {
     if (this.host?.stdin?.writable) {
       this.host.stdin.write(JSON.stringify(msg) + '\n');
     }
+  }
+
+  /** Suppress meaningful-burst advances for `ms` milliseconds. Called by
+   *  `AgentSupervisor.attachAgent` so the initial TUI redraw on attach does
+   *  not flip the agent to 'working'. P1B-03. */
+  markInteractionIgnoreWindow(ms = 750): void {
+    this._ignoreBurstUntil = Date.now() + ms;
   }
 
   write(data: string): void {

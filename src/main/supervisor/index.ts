@@ -1533,6 +1533,10 @@ export class AgentSupervisor extends EventEmitter {
   attachAgent(agentId: string): { write: (data: string) => void; resize: (cols: number, rows: number) => void; onData: (cb: (data: string) => void) => void } {
     const winRunner = this.windowsRunners.get(agentId);
     if (winRunner) {
+      // P1B-03: suppress meaningful-burst advances briefly so the TUI redraw
+      // triggered by the new output channel does not flip the agent to
+      // 'working' purely from terminal repaint bytes.
+      winRunner.markInteractionIgnoreWindow(750);
       updateAgentAttached(agentId, true);
       return {
         write: (data) => winRunner.write(data),
@@ -1543,6 +1547,8 @@ export class AgentSupervisor extends EventEmitter {
 
     const wslRunner = this.wslRunners.get(agentId);
     if (wslRunner) {
+      // P1B-03: same rationale as the Windows branch above.
+      wslRunner.markInteractionIgnoreWindow(750);
       wslRunner.attach();
       updateAgentAttached(agentId, true);
       return {

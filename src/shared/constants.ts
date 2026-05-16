@@ -170,17 +170,8 @@ Agents can only message teammates they have a channel to. The dashboard enforces
 1. **Create team**: Identify a multi-agent task. Use \`create_team\` with appropriate template.
 2. **Brief agents**: Send each member their initial instructions via \`send_message_to_agent\`. Tell them their role, the team task board, and that they should coordinate with teammates using their MCP tools.
 3. **Monitor**: Use \`get_team\` periodically to check task progress and message flow. Agents handle routine coordination themselves.
-4. **Intervene on exception**: Act when the dashboard reports loop detection, blocked agents, or escalation requests. Read logs, adjust channels, or send guidance.
+4. **Intervene on exception**: Act on blocked agents or escalation requests. Read logs, adjust channels, or send guidance.
 5. **Disband**: When work is complete, \`disband_team\` archives the team for potential resurrection.
-
-### Loop Detection
-
-The dashboard automatically detects communication loops between agents:
-- **Global cap**: Too many messages in a short window — all messaging paused
-- **Pair alternation**: Two agents bouncing back and forth with no progress — pair paused, supervisor notified
-- **Low-content filter**: Repetitive "acknowledged" / "standing by" messages blocked
-
-You will receive a \`[TEAM EVENT] Loop detected\` notification when this happens. Assess the situation, adjust the team (modify channels, send new instructions, or remove problematic members).
 
 ### Deliberation
 

@@ -614,6 +614,7 @@ This is a side effect of P1A-01 step 5; ticket exists to call out the test oblig
 ## Phase 1B — Crash routing, dead-code cleanup, ignore window
 
 ### P1B-01 Bridge consumes runner-exit events
+**Status:** Complete — landed 2026-05-16 (agent a485f0b4, M2B bundle). `EventBridge.onStatusChanged` cooldown check now negated as `if (data.source !== 'runner-exit' && nowOnCooldown) return;` (functionally identical to the plan's positive form; D-06 cited inline). BR-02b in `event-bridge.test.ts` verifies two runner-exit events 5 s apart both deliver. `lastExitCode` already populated by the existing runner-exit path; no payload changes required.
 **Phase:** 1B
 **Prerequisites:** P0-02 (bridge listeners wired), P0-01 (source field)
 **Files:** `src/main/supervisor/index.ts:246-255` (the dual-listener wiring); `src/main/supervisor/event-bridge.ts` (cooldown bypass).
@@ -624,6 +625,7 @@ This is a side effect of P1A-01 step 5; ticket exists to call out the test oblig
 **Acceptance:** BR-02 passes. Manual: kill a worker; supervisor terminal receives `[DASHBOARD EVENT] Agent status changed ... Status: working → crashed Exit code: -1` within ~1 s.
 
 ### P1B-02 Delete dead `team_*` event types
+**Status:** Complete — landed 2026-05-16 (agent a485f0b4, M2B bundle). `team_created` + `team_loop_detected` removed from the `SupervisorEvent` union and both `buildEventPayload` branches in `event-payload-builder.ts` (-34/+5); deleted team-only fields (`teamId`, `teamName`, `teamMembers`, `teamTemplate`, `loopAgentA/B`, `loopAlternations`). "Restore here" comment added per plan step 4. Plan line-number was stale (said "near line 126"; actual was at :183 inside a "Loop Detection" subsection) — agent removed the whole subsection from `SUPERVISOR_AGENT_MD` (-9/+1) since no producer exists, and softened Teams workflow item 4 to "Act on blocked agents or escalation requests". `(event as { type: string }).type` cast required in payload-builder fallback after exhaustive union narrowing.
 **Phase:** 1B
 **Prerequisites:** none
 **Files:**
@@ -638,6 +640,7 @@ This is a side effect of P1A-01 step 5; ticket exists to call out the test oblig
 **Notes:** Per the project's CLAUDE.md "Supervisor scaffold" section, verifying the CLAUDE.md change in a workspace that already has a supervisor requires forcing a fresh scaffold (delete `.dashboard/supervisor/CLAUDE.md`, remove + re-add the workspace).
 
 ### P1B-03 Attach-driven ignore window
+**Status:** Complete — landed 2026-05-16 (agent a485f0b4, M2B bundle). Both `windows-runner.ts` and `wsl-runner.ts` (+13 each) gained `_ignoreBurstUntil` field + `markInteractionIgnoreWindow(ms = 750)`; `_lastMeaningfulBurst` advance gated with `&& now >= this._ignoreBurstUntil` inside each runner's existing `if (this._recentOutputBytes > 200)` block. `attachAgent` (+6) calls `markInteractionIgnoreWindow(750)` on both Windows and WSL branches before establishing the new data channel; the lazy `spawnPtyHost` reconnect path runs after the ignore window is set, so reattach redraws are gated. No ring buffer added to WSL (deferred to P2-02). Final `markInteractionIgnoreWindow` grep is 4 hits, not 3 as the plan predicted (Windows+WSL definitions, plus Windows+WSL call sites in `attachAgent`).
 **Phase:** 1B
 **Prerequisites:** none
 **Files:**
@@ -744,9 +747,9 @@ This is a side effect of P1A-01 step 5; ticket exists to call out the test oblig
 | Milestone | Tickets | Unblocks |
 |---|---|---|
 | **M0 — Test convention + payload `source`/`fromStatus`** | P0-00 ✓, P0-01 ✓ | Every subsequent ticket can assert |
-| **M1 — Bridge extracted + baseline tests** | P0-02, P0-03 | Phase 1A, 1B, 2 |
-| **M2A — Pipeline B → status (latched)** | P1A-01, P1A-02, P1A-03, P1A-04 | UX fix for documented Codex stall incident |
-| **M2B — Crash routing + cleanup + attach window** | P1B-01, P1B-02, P1B-03 | Multi-supervisor migration becomes safe |
+| **M1 — Bridge extracted + baseline tests** | P0-02 ✓, P0-03 ✓ | Phase 1A, 1B, 2 |
+| **M2A — Pipeline B → status (latched)** | P1A-01 ✓, P1A-02 ✓, P1A-03 ✓, P1A-04 ✓ | UX fix for documented Codex stall incident |
+| **M2B — Crash routing + cleanup + attach window** | P1B-01 ✓, P1B-02 ✓, P1B-03 ✓ (uncommitted on master 2026-05-16) | Multi-supervisor migration becomes safe |
 | **M3 — Waiting visible** | P2-01, P2-02, P2-03, P2-04 | Plan-mode + in-text questions reach supervisor |
 | **M4 — Migration-ready** | P3-01, P3-02, P3-03 | Multi-supervisor migration P1-03/P1-04 have integration tests to pass |
 

@@ -64,8 +64,13 @@ export class EventBridge {
       const supervisor = this.deps.getSupervisorForWorker(agent);
       if (!supervisor || ['done', 'crashed'].includes(supervisor.status)) return;
 
+      // Crashes / completions bypass the per-agent 10s cooldown (D-06): a
+      // runner exit isn't a flicker, and silently dropping the second of two
+      // close-together exits would lose a real failure. All other sources
+      // (monitor, launch, restart, etc.) still respect the cooldown.
       const lastEvent = this.eventCooldowns.get(data.agentId) || 0;
-      if (this.deps.now() - lastEvent < SUPERVISOR_EVENT_COOLDOWN_MS) return;
+      if (data.source !== 'runner-exit'
+          && this.deps.now() - lastEvent < SUPERVISOR_EVENT_COOLDOWN_MS) return;
       this.eventCooldowns.set(data.agentId, this.deps.now());
 
       const logTail = await this.deps.getAgentLog(data.agentId, SUPERVISOR_EVENT_LOG_TAIL_LINES);
