@@ -41,8 +41,10 @@ function parseArgs(argv) {
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg.startsWith('--')) {
-      const [key, value] = arg.slice(2).split('=');
-      args[key] = value || argv[++i];
+      const eq = arg.indexOf('=');
+      const key = eq === -1 ? arg.slice(2) : arg.slice(2, eq);
+      const value = eq === -1 ? argv[++i] : arg.slice(eq + 1);
+      args[key] = value;
     } else {
       orphans.push(arg);
     }
@@ -168,26 +170,71 @@ async function readNextMessage(base, agentId) {
   return msg;
 }
 
+async function seedLastRelayedTsFromChat(base, agentId, label) {
+  // BUG-06: on resume, the relay loop's lastRelayedTs map starts empty, so the
+  // next poll treats any pre-existing turnComplete message as fresh and re-pastes
+  // it to the other planner. Seed from the latest assistant message so Turn 1
+  // waits for genuinely new content.
+  const result = await apiJson(base, 'GET', `/api/agents/${agentId}/messages?limit=1&role=assistant`);
+  const msg = result?.messages?.[0];
+  if (msg && msg.turnComplete && msg.ts) {
+    lastRelayedTs[agentId] = msg.ts;
+    log('INFO', `Seeded lastRelayedTs[${label} ${agentId}] = ${msg.ts}`);
+  } else {
+    log('INFO', `No prior turnComplete message for ${label} ${agentId}; lastRelayedTs unseeded`);
+  }
+}
+
+const STATUS_CHECK_INTERVAL_MS = 10000;
+
 async function waitTurnComplete(base, agentId, label, timeoutMs = 600000) {
   // Source of truth: the message stream's `turnComplete` flag, not the agent's
   // status field. Status lags by minutes on some providers (codex especially)
   // while the chat-ingestion layer marks `turnComplete: true` the instant the
-  // final assistant message lands. We poll messages directly and only consult
-  // status as a hard-exit signal for crashed/done agents.
-  // See docs/STATUS_FROM_TURNCOMPLETE.md for the underlying issue.
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
+  // final assistant message lands. We poll messages directly and consult
+  // status (a) as a hard-exit signal for crashed/done agents, and (b) to reset
+  // the stall clock while the agent is demonstrably still working.
+  //
+  // BUG-03: a hardcoded 10-min stall produced false timeouts on slow reviewers.
+  // With the post-M2A status latch, `agent.status === 'working'` is reliable
+  // ground truth — we only declare stall after `timeoutMs` of continuous
+  // non-working status with no new turnComplete message.
+  let stallDeadline = Date.now() + timeoutMs;
+  let lastStatusCheck = 0;
+  while (true) {
     const msg = await readNextMessage(base, agentId);
     if (msg) return msg;
 
-    const agent = await apiJson(base, 'GET', `/api/agents/${agentId}`);
-    if (agent.status === 'crashed' || agent.status === 'done') {
-      throw new Error(`${label} (${agentId}) exited with status=${agent.status} before completing turn`);
+    const now = Date.now();
+    if (now - lastStatusCheck >= STATUS_CHECK_INTERVAL_MS) {
+      lastStatusCheck = now;
+      const agent = await apiJson(base, 'GET', `/api/agents/${agentId}`);
+      if (agent.status === 'crashed' || agent.status === 'done') {
+        throw new Error(`${label} (${agentId}) exited with status=${agent.status} before completing turn`);
+      }
+      if (agent.status === 'working') {
+        stallDeadline = now + timeoutMs;
+      }
+    }
+
+    if (Date.now() > stallDeadline) {
+      // Final status check before declaring stall — agent may have transitioned
+      // back to 'working' since our last sample.
+      const agent = await apiJson(base, 'GET', `/api/agents/${agentId}`);
+      lastStatusCheck = Date.now();
+      if (agent.status === 'crashed' || agent.status === 'done') {
+        throw new Error(`${label} (${agentId}) exited with status=${agent.status} before completing turn`);
+      }
+      if (agent.status === 'working') {
+        stallDeadline = lastStatusCheck + timeoutMs;
+        await sleep(POLL_INTERVAL_MS);
+        continue;
+      }
+      throw new Error(`Timeout waiting for ${label} (${agentId}) to complete turn (agent.status=${agent.status})`);
     }
 
     await sleep(POLL_INTERVAL_MS);
   }
-  throw new Error(`Timeout waiting for ${label} (${agentId}) to complete turn`);
 }
 
 // --- Main ---
@@ -197,11 +244,18 @@ async function main() {
   const supervisorId = args.supervisorId;
   const topic = args.topic || "Research and plan a feature.";
   const planPath = args.planPath || "plans/new-plan.md";
+  const turnTimeoutRaw = args['turn-timeout-ms'];
+  const parsedTurnTimeout = turnTimeoutRaw === undefined ? NaN : Number(turnTimeoutRaw);
+  const turnTimeoutMs = Number.isFinite(parsedTurnTimeout) && parsedTurnTimeout > 0
+    ? parsedTurnTimeout
+    : 600000;
 
   if (!workspaceId || !supervisorId) {
-    console.error("Usage: groupthink.js --workspaceId=<id> --supervisorId=<id> [--topic=<topic>] [--planPath=<path>] [--api-host=<host>] [--api-port=<port>]");
+    console.error("Usage: groupthink.js --workspaceId=<id> --supervisorId=<id> [--topic=<topic>] [--planPath=<path>] [--turn-timeout-ms=<ms>] [--api-host=<host>] [--api-port=<port>]");
     process.exit(1);
   }
+
+  log('INFO', `Per-turn timeout: ${turnTimeoutMs}ms${turnTimeoutRaw !== undefined ? ' (overridden via --turn-timeout-ms)' : ' (default)'}`);
 
   const base = await connectApi(resolveHost(args), candidatePorts(args));
 
@@ -215,6 +269,7 @@ async function main() {
   if (leadAgentId) {
       lead = await apiJson(base, 'GET', `/api/agents/${leadAgentId}`);
       log('INFO', `Resuming Lead: ${lead.id}`);
+      await seedLastRelayedTsFromChat(base, lead.id, 'Lead');
   } else {
       lead = await apiJson(base, 'POST', '/api/agents', {
         workspaceId,
@@ -239,6 +294,7 @@ Begin by producing your first draft of the plan as your next message.`
   if (reviewerAgentId) {
       reviewer = await apiJson(base, 'GET', `/api/agents/${reviewerAgentId}`);
       log('INFO', `Resuming Reviewer: ${reviewer.id}`);
+      await seedLastRelayedTsFromChat(base, reviewer.id, 'Reviewer');
   } else {
       reviewer = await apiJson(base, 'POST', '/api/agents', {
         workspaceId,
@@ -275,7 +331,7 @@ Wait for the Lead's first draft; your first message will be your response to it.
         log('INFO', `--- Turn ${turn} ---`);
 
         // Lead -> Reviewer
-        const leadMsg = await waitTurnComplete(base, lead.id, 'Lead');
+        const leadMsg = await waitTurnComplete(base, lead.id, 'Lead', turnTimeoutMs);
         lastRelayedTs[lead.id] = leadMsg.ts;
 
         if (fs.existsSync(planPath)) {
@@ -288,7 +344,7 @@ Wait for the Lead's first draft; your first message will be your response to it.
         });
 
         // Reviewer -> Lead
-        const revMsg = await waitTurnComplete(base, reviewer.id, 'Reviewer');
+        const revMsg = await waitTurnComplete(base, reviewer.id, 'Reviewer', turnTimeoutMs);
         lastRelayedTs[reviewer.id] = revMsg.ts;
 
         log('INFO', `Relaying Reviewer -> Lead`);
@@ -317,7 +373,7 @@ Wait for the Lead's first draft; your first message will be your response to it.
                   { role: "reviewer", ...members.reviewer }
               ],
               planPath,
-              resume_hint: `node scripts/groupthink-v1.js --workspaceId=${workspaceId} --supervisorId=${supervisorId} --resume-lead-id=${members.lead.id} --resume-reviewer-id=${members.reviewer.id} --topic="${topic}" --planPath="${planPath}"`
+              resume_hint: `node scripts/groupthink-v1.js --workspaceId=${workspaceId} --supervisorId=${supervisorId} --resume-lead-id=${members.lead.id} --resume-reviewer-id=${members.reviewer.id} --topic="${topic}" --planPath="${planPath}" --turn-timeout-ms=${turnTimeoutMs}`
           };
           await apiJson(base, 'POST', `/api/agents/${supervisorId}/input`, {
               text: `[DASHBOARD EVENT] orchestration.groupthink.stalled\n${JSON.stringify(event, null, 2)}`

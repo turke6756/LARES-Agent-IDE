@@ -26,6 +26,8 @@ import {
   snapshotCodexSessions,
   discoverNewCodexSession,
   findCodexSessionIdByCwd,
+  ensureCodexResumeSessionId,
+  shouldDiscoverCodexSession,
 } from './session-id-discovery';
 import { FileActivityTracker } from './file-activity-tracker';
 import {
@@ -37,6 +39,7 @@ import {
 import { detectPathType, windowsToWslPath, uncToWslPath } from '../path-utils';
 import { getScriptPath } from './paths';
 import { tmuxListSessions, tmuxSendInput } from '../wsl-bridge';
+import { getWindowsSubmitSequence } from './send-input-encoders';
 
 const BRACKETED_PASTE_START = '\x1b[200~';
 const BRACKETED_PASTE_END = '\x1b[201~';
@@ -523,10 +526,15 @@ export class AgentSupervisor extends EventEmitter {
       console.log(`[supervisor] Custom system prompt (${resolvedInput.systemPrompt.length} chars) — will send as initial message`);
     }
 
+    // BUG-08: freshSession is a launch-time hint for codex agents to skip
+    // post-launch session-id discovery so the new agent isn't bound to any
+    // pre-existing rollout in this cwd. No-op for non-codex providers.
+    const freshSession = resolvedInput.freshSession === true;
+
     if (pathType === 'windows') {
-      await this.launchWindowsAgent(agent, false, agentMdPrompt, sessionId);
+      await this.launchWindowsAgent(agent, false, agentMdPrompt, sessionId, undefined, freshSession);
     } else {
-      await this.launchWslAgent(agent, false, agentMdPrompt, undefined, sessionId);
+      await this.launchWslAgent(agent, false, agentMdPrompt, undefined, sessionId, freshSession);
     }
 
     return getAgent(agent.id)!;
@@ -859,7 +867,7 @@ export class AgentSupervisor extends EventEmitter {
     return tracker;
   }
 
-  private async launchWindowsAgent(agent: Agent, resume = false, agentMdPrompt?: string | null, sessionId?: string, overrideArgs?: string[]): Promise<void> {
+  private async launchWindowsAgent(agent: Agent, resume = false, agentMdPrompt?: string | null, sessionId?: string, overrideArgs?: string[], freshSession = false): Promise<void> {
     const runner = new WindowsRunner();
     this.windowsRunners.set(agent.id, runner);
 
@@ -928,18 +936,15 @@ export class AgentSupervisor extends EventEmitter {
       }
 
       if (resume && agent.provider === 'codex') {
-        let latest = getAgent(agent.id);
-        if (!latest?.resumeSessionId) {
-          // Discovery may have lost the id (app killed mid-launch, slow codex
-          // startup, etc.). Scan rollouts for a cwd-match before giving up.
-          const recovered = this.recoverCodexResumeSessionId(agent);
-          if (recovered) latest = getAgent(agent.id);
-        }
-        if (!latest?.resumeSessionId) {
+        // BUG-04: `discoverNewCodexSession`'s 10 s post-launch poll often
+        // misses the codex `session_meta` flush. Self-heal by falling back to
+        // a cwd-match rollout scan the first time we actually need the sid.
+        const sid = this.resolveCodexResumeSessionId(agent);
+        if (!sid) {
           throw new Error(`Cannot resume ${agent.title} (${agent.id}): no Codex resumeSessionId on record and no cwd-matching rollout found`);
         }
-        args = buildCodexResumeArgs(args, latest.resumeSessionId);
-        console.log(`[Windows] Resuming ${agent.title} (${agent.id}) with codex resume ${latest.resumeSessionId}`);
+        args = buildCodexResumeArgs(args, sid);
+        console.log(`[Windows] Resuming ${agent.title} (${agent.id}) with codex resume ${sid}`);
       }
 
       // Append agent.md content as final positional argument (Claude only)
@@ -992,9 +997,15 @@ export class AgentSupervisor extends EventEmitter {
     }
     const useDirectSpawn = needsDirectSpawn && launchCmd !== cmd;
 
-    const codexSnapshot =
-      agent.provider === 'codex' && !resume ? await snapshotCodexSessions('windows') : null;
+    // BUG-08: `freshSession` opts out of post-launch session-id discovery
+    // so the new agent isn't auto-bound to any pre-existing rollout in this cwd.
+    const codexSnapshot = shouldDiscoverCodexSession({ provider: agent.provider, resume, freshSession })
+      ? await snapshotCodexSessions('windows')
+      : null;
     const codexLaunchStartedAt = Date.now();
+    if (agent.provider === 'codex' && !resume && freshSession) {
+      console.log(`[Windows] freshSession=true — skipping codex session-id discovery for ${agent.title} (${agent.id})`);
+    }
 
     runner.launch(agent.workingDirectory, launchCmd, args, agent.logPath || '', useDirectSpawn);
     updateAgentPid(agent.id, runner.pid);
@@ -1032,6 +1043,23 @@ export class AgentSupervisor extends EventEmitter {
     return result.sessionId;
   }
 
+  /**
+   * Read `resumeSessionId` for a Codex agent, lazy-recovering if it's null.
+   * Use this at every site that needs the sid so BUG-04 (post-launch
+   * discovery missed the `session_meta` flush) is self-healing instead of
+   * requiring a manual recovery call.
+   *
+   * Returns null only when neither the persisted record nor a cwd-matching
+   * rollout produced an id — i.e. the agent truly has no recoverable session.
+   */
+  private resolveCodexResumeSessionId(agent: Agent): string | null {
+    const current = getAgent(agent.id)?.resumeSessionId ?? null;
+    return ensureCodexResumeSessionId({
+      current,
+      recover: () => this.recoverCodexResumeSessionId(agent),
+    });
+  }
+
   private captureCodexSessionId(
     agentId: string,
     before: Awaited<ReturnType<typeof snapshotCodexSessions>>,
@@ -1054,7 +1082,7 @@ export class AgentSupervisor extends EventEmitter {
     });
   }
 
-  private async launchWslAgent(agent: Agent, resume = false, agentMdPrompt?: string | null, overrideCommand?: string, sessionId?: string): Promise<void> {
+  private async launchWslAgent(agent: Agent, resume = false, agentMdPrompt?: string | null, overrideCommand?: string, sessionId?: string, freshSession = false): Promise<void> {
     if (!agent.tmuxSessionName) throw new Error('No tmux session name');
 
     const runner = new WslRunner(agent.tmuxSessionName);
@@ -1122,18 +1150,13 @@ export class AgentSupervisor extends EventEmitter {
       }
 
       if (resume && agent.provider === 'codex') {
-        let latest = getAgent(agent.id);
-        if (!latest?.resumeSessionId) {
-          // Discovery may have lost the id (app killed mid-launch, slow codex
-          // startup, etc.). Scan rollouts for a cwd-match before giving up.
-          const recovered = this.recoverCodexResumeSessionId(agent);
-          if (recovered) latest = getAgent(agent.id);
-        }
-        if (!latest?.resumeSessionId) {
+        // BUG-04: lazy fallback — see launchWindowsAgent for the rationale.
+        const sid = this.resolveCodexResumeSessionId(agent);
+        if (!sid) {
           throw new Error(`Cannot resume ${agent.title} (${agent.id}): no Codex resumeSessionId on record and no cwd-matching rollout found`);
         }
-        command = buildCodexResumeCommand(command, latest.resumeSessionId);
-        console.log(`[WSL] Resuming ${agent.title} (${agent.id}) with codex resume ${latest.resumeSessionId}`);
+        command = buildCodexResumeCommand(command, sid);
+        console.log(`[WSL] Resuming ${agent.title} (${agent.id}) with codex resume ${sid}`);
       }
 
       // Wrap the command to load any of:
@@ -1215,9 +1238,15 @@ export class AgentSupervisor extends EventEmitter {
     console.log(`[WSL] Launching agent '${agent.tmuxSessionName}' in ${wslWorkDir}`);
     console.log(`[WSL] Command: ${command}`);
 
-    const codexSnapshot =
-      agent.provider === 'codex' && !resume ? await snapshotCodexSessions('wsl') : null;
+    // BUG-08: `freshSession` opts out of post-launch session-id discovery
+    // so the new agent isn't auto-bound to any pre-existing rollout in this cwd.
+    const codexSnapshot = shouldDiscoverCodexSession({ provider: agent.provider, resume, freshSession })
+      ? await snapshotCodexSessions('wsl')
+      : null;
     const codexLaunchStartedAt = Date.now();
+    if (agent.provider === 'codex' && !resume && freshSession) {
+      console.log(`[WSL] freshSession=true — skipping codex session-id discovery for ${agent.title} (${agent.id})`);
+    }
 
     await runner.launch(wslWorkDir, command, nativeLogPath);
     const priorWslLaunch = getAgent(agent.id)?.status;
@@ -1604,22 +1633,31 @@ export class AgentSupervisor extends EventEmitter {
    * not `await` the returned promise — it stays pending until typing is done.
    * Synchronous validation (agent exists, has a runner) happens before the
    * promise is even chained, so missing-runner errors still throw eagerly.
+   *
+   * `opts.submit` defaults to true. Set it to false to leave the text in the
+   * agent's prompt buffer without pressing Enter (BUG-01: launch_agent's
+   * `submit:false` flag).
    */
-  sendInput(agentId: string, text: string): Promise<void> {
+  sendInput(agentId: string, text: string, opts: { submit?: boolean } = {}): Promise<void> {
     if (!this.windowsRunners.get(agentId) && !this.wslRunners.get(agentId)) {
       return Promise.reject(new Error(`No runner for agent ${agentId}`));
     }
+    const submit = opts.submit !== false;
     this.inputInFlight.add(agentId);
     const previous = this.inputQueues.get(agentId) || Promise.resolve();
     const ours: Promise<void> = previous
       .catch(() => undefined) // a prior failed send must not poison the queue
-      .then(() => this._doSendInput(agentId, text))
+      .then(() => this._doSendInput(agentId, text, submit))
       .then(() => {
         // P2-03: if the agent was waiting on user input, the send just
         // answered the prompt — clear the latch so status flips back to
         // working immediately. Bridge filters the resulting waiting→working
         // emission so the supervisor doesn't get a noise notification.
-        this.bridge.notifyUserInputDelivered(agentId);
+        // Skip when submit:false — without an Enter the prompt is still
+        // unanswered, so the waiting latch must stay set.
+        if (submit) {
+          this.bridge.notifyUserInputDelivered(agentId);
+        }
       });
     this.inputQueues.set(agentId, ours);
     // Clear in-flight only when the chain has fully drained for this agent.
@@ -1633,7 +1671,7 @@ export class AgentSupervisor extends EventEmitter {
     return ours;
   }
 
-  private async _doSendInput(agentId: string, text: string): Promise<void> {
+  private async _doSendInput(agentId: string, text: string, submit: boolean = true): Promise<void> {
     // For WSL agents, dispatch by provider. All three providers enable the
     // kitty keyboard protocol on Linux, so a bare `\r` from `tmux send-keys
     // Enter` is dropped — submit must be the kitty CSI form `\x1b[13u`.
@@ -1654,7 +1692,7 @@ export class AgentSupervisor extends EventEmitter {
         const provider = agent.provider === 'claude' || agent.provider === 'codex' || agent.provider === 'gemini'
           ? agent.provider
           : 'unknown';
-        await tmuxSendInput(agent.tmuxSessionName, text, provider);
+        await tmuxSendInput(agent.tmuxSessionName, text, provider, submit);
         this.emitSyntheticUserEcho(agent, text);
         return;
       }
@@ -1672,8 +1710,10 @@ export class AgentSupervisor extends EventEmitter {
         // submit, so wrap in bracketed-paste markers and deliver Enter as a
         // separate PTY write.
         winRunner.write(formatBracketedPaste(text));
-        await new Promise((resolve) => setTimeout(resolve, WINDOWS_SEND_INPUT_ENTER_DELAY_MS));
-        winRunner.write('\r');
+        if (submit) {
+          await new Promise((resolve) => setTimeout(resolve, WINDOWS_SEND_INPUT_ENTER_DELAY_MS));
+          winRunner.write(getWindowsSubmitSequence('claude'));
+        }
       } else if (agent?.provider === 'codex' || agent?.provider === 'gemini') {
         // Codex/gemini enable Win32 Input Mode (ESC[?9001h). In this mode the
         // TUI expects key events as CSI sequences with both KEY_DOWN and
@@ -1693,15 +1733,18 @@ export class AgentSupervisor extends EventEmitter {
           }
           await new Promise((resolve) => setTimeout(resolve, WINDOWS_CODEX_TYPING_DELAY_MS));
         }
-        await new Promise((resolve) => setTimeout(resolve, WINDOWS_SEND_INPUT_ENTER_DELAY_MS));
-        winRunner.write(WIN32_KEY_ENTER_DOWN + WIN32_KEY_ENTER_UP);
+        if (submit) {
+          await new Promise((resolve) => setTimeout(resolve, WINDOWS_SEND_INPUT_ENTER_DELAY_MS));
+          winRunner.write(getWindowsSubmitSequence(agent.provider));
+        }
         this.emitSyntheticUserEcho(agent, text);
       } else {
-        winRunner.write(`${text}\r`);
+        winRunner.write(submit ? `${text}\r` : text);
       }
       return;
     }
   }
+
 
   private emitSyntheticUserEcho(agent: Agent, text: string): void {
     if (agent.provider !== 'codex' && agent.provider !== 'gemini') return;

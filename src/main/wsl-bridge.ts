@@ -314,7 +314,7 @@ function shellSingleQuoteEscape(s: string): string {
 // Kitty keyboard protocol (CSI-u) — codex/gemini on Linux enable this and
 // expect Enter as `\x1b[13u`, Shift+Enter as `\x1b[13;2u`. Plain `\r` from
 // `tmux send-keys Enter` is silently dropped in disambiguate mode.
-const TMUX_KITTY_ENTER_HEX = '1b 5b 31 33 75';            // \x1b[13u
+export const TMUX_KITTY_ENTER_HEX = '1b 5b 31 33 75';            // \x1b[13u
 const TMUX_KITTY_SHIFT_ENTER_HEX = '1b 5b 31 33 3b 32 75'; // \x1b[13;2u
 // Bracketed paste markers — claude on Linux treats the wrapped body as pasted
 // content (renders multi-line correctly without entering paste-confirmation),
@@ -327,42 +327,36 @@ const TMUX_BP_END_HEX = '1b 5b 32 30 31 7e';               // \x1b[201~
 // it) so the trailing submit Enter isn't rewritten as newline-insert.
 const POST_BODY_SLEEP_SECONDS = '0.08';
 
+export type TmuxProvider = 'claude' | 'codex' | 'gemini' | 'unknown';
+
 /**
- * Send `text` to a WSL agent via tmux, then submit, using a provider-aware
- * encoding. All three providers enable kitty keyboard protocol on Linux at
- * startup; tmux's `send-keys Enter` (a bare `\r` byte) is dropped in that
- * mode, so submit must be sent as the kitty CSI key event `\x1b[13u`.
+ * Pure builder for the WSL `tmux send-keys` shell command. Exposed so the
+ * provider-specific encoding (and the submit/no-submit branches added for
+ * BUG-01) can be unit-tested without spawning wsl.exe.
  *
- * - claude: bracketed-paste-wrap the body so multi-line content renders without
- *   triggering paste-confirmation, then submit.
- * - codex/gemini: type body line-by-line, encoding embedded `\n` as kitty
- *   Shift+Enter (`\x1b[13;2u`) so the final Enter is the only submit event.
- *   Bracketed paste opens codex's external-editor confirmation flow on Linux
- *   too (same regression as Windows), so don't wrap.
+ * Returns null when the provider is 'unknown' (which falls back to the legacy
+ * tmuxSendKeys path that's already covered elsewhere).
  */
-export async function tmuxSendInput(
+export function buildTmuxSendInputCmd(
   name: string,
   text: string,
-  provider: 'claude' | 'codex' | 'gemini' | 'unknown' = 'unknown'
-): Promise<void> {
+  provider: TmuxProvider,
+  submit: boolean
+): string | null {
   const normalized = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  const submitCmd = `tmux send-keys -t '${name}' -H ${TMUX_KITTY_ENTER_HEX}`;
 
   if (provider === 'claude') {
     // Strip nested bracketed-paste markers so a hostile payload can't escape
     // the wrapper and reach claude's input handler outside paste mode.
     const body = normalized.replaceAll('\x1b[200~', '').replaceAll('\x1b[201~', '');
     const escaped = shellSingleQuoteEscape(body);
-    const cmd =
+    const bodyCmd =
       `tmux send-keys -t '${name}' -H ${TMUX_BP_START_HEX} \\; ` +
       `send-keys -t '${name}' -l '${escaped}' \\; ` +
-      `send-keys -t '${name}' -H ${TMUX_BP_END_HEX} && ` +
-      `sleep ${POST_BODY_SLEEP_SECONDS} && ` +
-      `tmux send-keys -t '${name}' -H ${TMUX_KITTY_ENTER_HEX}`;
-    const result = await wslExec(cmd, 8000);
-    if (result.exitCode !== 0) {
-      throw new Error(`tmux send-keys (claude) failed: ${result.stderr || 'unknown error'}`);
-    }
-    return;
+      `send-keys -t '${name}' -H ${TMUX_BP_END_HEX}`;
+    if (!submit) return bodyCmd;
+    return `${bodyCmd} && sleep ${POST_BODY_SLEEP_SECONDS} && ${submitCmd}`;
   }
 
   if (provider === 'codex' || provider === 'gemini') {
@@ -377,19 +371,51 @@ export async function tmuxSendInput(
       }
     }
     const bodyCmd = parts.length > 0 ? `tmux ${parts.join(' \\; ')}` : '';
-    const submitCmd = `tmux send-keys -t '${name}' -H ${TMUX_KITTY_ENTER_HEX}`;
-    const cmd = bodyCmd
+    if (!submit) return bodyCmd || null;
+    return bodyCmd
       ? `${bodyCmd} && sleep ${POST_BODY_SLEEP_SECONDS} && ${submitCmd}`
       : submitCmd;
-    const result = await wslExec(cmd, 8000);
-    if (result.exitCode !== 0) {
-      throw new Error(`tmux send-keys (${provider}) failed: ${result.stderr || 'unknown error'}`);
-    }
+  }
+
+  return null;
+}
+
+/**
+ * Send `text` to a WSL agent via tmux, then submit, using a provider-aware
+ * encoding. All three providers enable kitty keyboard protocol on Linux at
+ * startup; tmux's `send-keys Enter` (a bare `\r` byte) is dropped in that
+ * mode, so submit must be sent as the kitty CSI key event `\x1b[13u`.
+ *
+ * - claude: bracketed-paste-wrap the body so multi-line content renders without
+ *   triggering paste-confirmation, then submit.
+ * - codex/gemini: type body line-by-line, encoding embedded `\n` as kitty
+ *   Shift+Enter (`\x1b[13;2u`) so the final Enter is the only submit event.
+ *   Bracketed paste opens codex's external-editor confirmation flow on Linux
+ *   too (same regression as Windows), so don't wrap.
+ *
+ * `submit` defaults to true. Set it to false to leave the text in the agent's
+ * prompt buffer without pressing Enter — used by launch_agent's `submit:false`
+ * flag (BUG-01).
+ */
+export async function tmuxSendInput(
+  name: string,
+  text: string,
+  provider: TmuxProvider = 'unknown',
+  submit: boolean = true
+): Promise<void> {
+  if (provider === 'unknown') {
+    // Unknown provider: keep legacy `\r`-via-tmux-Enter path. submit:false has
+    // no effect — the legacy path was always submit-only.
+    await tmuxSendKeys(name, text);
     return;
   }
 
-  // Unknown provider: keep legacy `\r`-via-tmux-Enter path.
-  await tmuxSendKeys(name, text);
+  const cmd = buildTmuxSendInputCmd(name, text, provider, submit);
+  if (!cmd) return; // nothing to do (e.g. empty body + submit:false)
+  const result = await wslExec(cmd, 8000);
+  if (result.exitCode !== 0) {
+    throw new Error(`tmux send-keys (${provider}) failed: ${result.stderr || 'unknown error'}`);
+  }
 }
 
 export async function tmuxKillSession(name: string): Promise<void> {

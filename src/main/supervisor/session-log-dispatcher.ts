@@ -70,8 +70,27 @@ export class SessionLogDispatcher extends EventEmitter {
     }
   }
 
-  pollNow(): void {
-    this.tick();
+  // Force a poll right now, bypassing the per-agent `nextPollAt` rate-limit
+  // gate that `tick()` honors. Used by request-driven callers (e.g.
+  // `AgentChatService.getMessages`) that need the freshest on-disk content,
+  // not whatever the background interval happened to last collect. Pass
+  // `agentId` to scope the force-poll to one agent so the call does not
+  // reset every other agent's gating timer. See BUG-07 (open-bugs.md).
+  pollNow(agentId?: string): void {
+    const sessions = this.getActiveAgentSessions();
+    const now = Date.now();
+    for (const session of sessions) {
+      if (agentId && session.agentId !== agentId) continue;
+      try {
+        this.pollOne(session);
+      } catch {
+        // swallow per-agent errors
+      }
+      const rate = this.subscribers.has(session.agentId)
+        ? SUBSCRIBED_POLL_MS
+        : UNSUBSCRIBED_POLL_MS;
+      this.nextPollAt.set(session.agentId, now + rate);
+    }
   }
 
   addChatSubscriber(agentId: string): void {

@@ -97,6 +97,14 @@ export interface LaunchAgentInput {
   templateId?: string;
   systemPrompt?: string;
   persona?: string;
+  // BUG-08: when true on a codex launch, skip the post-launch
+  // session-id discovery (`captureCodexSessionId`) so the agent is not bound
+  // to any pre-existing rollout in this cwd. Codex still launches bare
+  // (`codex --dangerously-bypass-approvals-and-sandbox`) and mints its own
+  // fresh session on disk; the dashboard just doesn't try to alias the new
+  // agent record to a prior session. Default false / undefined preserves
+  // the original behavior. No-op for non-codex providers.
+  freshSession?: boolean;
 }
 
 export interface AgentPersona {

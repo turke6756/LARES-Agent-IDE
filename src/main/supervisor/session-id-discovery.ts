@@ -12,6 +12,13 @@ import {
   readCodexSessionMeta,
 } from './log-readers/codex-rollout-reader';
 
+export interface RecoverCodexSessionOptions {
+  workingDirectory: string;
+  home: CodexSessionHome;
+  daysBack?: number | 'all';
+  listFiles?: (home: CodexSessionHome) => CodexRolloutFile[];
+}
+
 export interface CodexSessionSnapshot {
   home: CodexSessionHome;
   paths: Set<string>;
@@ -72,6 +79,79 @@ export async function discoverNewCodexSession(
       const valid = validateCandidate(file, targetCwd);
       if (valid) return valid;
     }
+  }
+  return null;
+}
+
+/**
+ * BUG-08 decision helper: should the launch path take a pre-launch rollout
+ * snapshot and run `discoverNewCodexSession` to bind the new agent to the
+ * codex-minted session id?
+ *
+ * - Non-codex providers never need it (claude/gemini handle their own ids).
+ * - When `resume` is true, the launch is using an explicit `codex resume <sid>`
+ *   subcommand; discovery would be redundant.
+ * - When `freshSession` is true (BUG-08), the caller has explicitly asked for
+ *   a clean start. Skipping discovery lets codex mint its own brand-new
+ *   session on disk without the dashboard auto-binding the new agent record
+ *   to any rollout in this cwd. Default behavior (no flag) is unchanged.
+ *
+ * Pure helper so it can be unit-tested without touching the DB or filesystem.
+ */
+export function shouldDiscoverCodexSession(opts: {
+  provider: string;
+  resume: boolean;
+  freshSession?: boolean;
+}): boolean {
+  if (opts.provider !== 'codex') return false;
+  if (opts.resume) return false;
+  if (opts.freshSession) return false;
+  return true;
+}
+
+/**
+ * Lazy-recovery decision helper. Returns the existing sid if present;
+ * otherwise invokes the recovery callback and returns its result. Used at
+ * every site that needs a Codex `resumeSessionId` so that BUG-04 (10 s
+ * `discoverNewCodexSession` poll missed the flush) becomes self-healing —
+ * the first operation that actually reads the sid triggers the rollout-dir
+ * scan instead of failing.
+ *
+ * Pure / synchronous so it can be unit-tested without touching the DB or
+ * filesystem; the recovery callback wraps the I/O.
+ */
+export function ensureCodexResumeSessionId(opts: {
+  current: string | null | undefined;
+  recover: () => string | null;
+}): string | null {
+  if (opts.current) return opts.current;
+  return opts.recover();
+}
+
+/**
+ * Retroactively find a Codex session id by matching `session_meta.cwd`.
+ *
+ * Used when an agent's `resumeSessionId` was never persisted (e.g. the app was
+ * killed mid-launch, before `discoverNewCodexSession` could write to the DB) but
+ * the rollout file is still on disk. Returns the newest matching rollout's
+ * validated session id, or null.
+ *
+ * Caveat: when two agents share the same workingDirectory this picks the most
+ * recent one. The chat-log reader has the same caveat in `findByCwd` — they
+ * agree on which rollout "belongs" to the agent.
+ */
+export function findCodexSessionIdByCwd(
+  options: RecoverCodexSessionOptions
+): DiscoveryResult | null {
+  const targetCwd = normalizeCwd(options.workingDirectory);
+  const files = options.listFiles
+    ? options.listFiles(options.home)
+    : listCodexRolloutFiles({ home: options.home, daysBack: options.daysBack ?? 'all' });
+
+  const sorted = [...files].sort((a, b) => b.mtimeMs - a.mtimeMs);
+  for (const file of sorted) {
+    const valid = validateCandidate(file, targetCwd);
+    if (valid) return valid;
   }
   return null;
 }

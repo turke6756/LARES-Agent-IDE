@@ -208,38 +208,68 @@ function getToolDefinitions() {
     {
       name: 'send_keys_to_agent',
       description:
-        'Send raw keystroke bytes to an agent\'s PTY without bracketed-paste wrapping. ' +
+        'Send keystrokes to an agent\'s PTY without bracketed-paste wrapping. ' +
         'Use this to drive interactive widgets — AskUserQuestion pickers, codex slash-command menus, ' +
         'arrow-key navigation, Ctrl-C / Ctrl-D, Tab completion, digit-jump, filter typing — anywhere ' +
         'the target needs to see each byte as a real key event instead of one pasted blob. ' +
         'For prose messages, use `send_message_to_agent` instead; this tool sends nothing extra ' +
-        '(no automatic Enter, no line-ending normalization). The caller is responsible for the full byte sequence.\n\n' +
-        'Common byte conventions:\n' +
-        '  Down arrow:        "\\x1b[B"\n' +
-        '  Up arrow:          "\\x1b[A"\n' +
-        '  Right / Left:      "\\x1b[C" / "\\x1b[D"\n' +
-        '  Enter (Claude Windows ConPTY, Claude WSL):  "\\r"\n' +
-        '  Enter (codex/gemini Windows ConPTY):        "\\x1b[13;28;13;1;0;1_\\x1b[13;28;13;0;0;1_"\n' +
-        '  Enter (codex/gemini WSL, kitty mode):       "\\x1b[13u"\n' +
-        '  Ctrl-C / SIGINT:   "\\x03"\n' +
-        '  Ctrl-D / EOF:      "\\x04"\n' +
-        '  Tab:               "\\t"\n' +
-        '  Escape:            "\\x1b"\n\n' +
+        '(no automatic Enter, no line-ending normalization).\n\n' +
+        'PREFERRED: pass a named `key` (e.g. {"key": "enter"}). The dashboard looks up the ' +
+        'agent\'s provider and host and emits the correct byte sequence. This is the only reliable ' +
+        'way to submit Enter, because the right bytes for Enter differ across claude vs codex/gemini ' +
+        'and Windows vs WSL. Supported `key` values:\n' +
+        '  "enter"       — submit (provider+host-aware: \\r for claude, Win32 VK_RETURN down+up for\n' +
+        '                  codex/gemini on Windows, kitty CSI-u \\x1b[13u for codex/gemini on WSL)\n' +
+        '  "shift-enter" — newline without submit (Win32 Shift+Enter or kitty \\x1b[13;2u)\n' +
+        '  "esc"         — \\x1b\n' +
+        '  "tab"         — \\t\n' +
+        '  "up" / "down" / "left" / "right" — arrow keys (\\x1b[A/B/C/D)\n' +
+        '  "backspace"   — \\x7f (DEL — what readline-style apps expect)\n' +
+        '  "ctrl-c"      — \\x03 (SIGINT)\n' +
+        '  "ctrl-d"      — \\x04 (EOF)\n' +
+        '  "space"       — single space\n' +
+        'Pass `count` (1-100) to repeat the key, e.g. {"key": "down", "count": 3}.\n\n' +
+        'ADVANCED: pass `keys` (a raw string of bytes) instead of or alongside `key`. The bytes are ' +
+        'written verbatim — JS-style escapes ("\\x1b", "\\r") are interpreted by the JSON parser if ' +
+        'your client encodes them correctly, but if it double-escapes them you get the literal ' +
+        'characters on screen. Use `key` whenever possible to avoid this. If both `key` and `keys` ' +
+        'are supplied, the resolved key bytes are sent first, followed by `keys`.\n\n' +
         'WSL caveat: bytes are forwarded through the attached tmux session to the focused pane. ' +
-        'Do NOT send the tmux prefix byte ("\\x02" by default, C-b) — tmux will swallow it. ' +
-        'For SIGINT inside a WSL agent, "\\x03" works (it reaches the pane unchanged).',
+        'Do NOT send the tmux prefix byte ("\\x02" by default, C-b) via `keys` — tmux will swallow it. ' +
+        '`ctrl-c` works because it reaches the pane unchanged.',
       inputSchema: {
         type: 'object',
         properties: {
           agent_id: { type: 'string', description: 'The agent ID.' },
+          key: {
+            type: 'string',
+            enum: [
+              'enter', 'shift-enter', 'esc', 'tab',
+              'up', 'down', 'left', 'right',
+              'backspace', 'ctrl-c', 'ctrl-d', 'space',
+            ],
+            description:
+              'Named key. The dashboard translates this to the correct byte sequence for the ' +
+              'agent\'s provider (claude / codex / gemini) and host (Windows / WSL). PREFERRED ' +
+              'over `keys` for Enter and any other event whose encoding varies by target.',
+          },
+          count: {
+            type: 'number',
+            description:
+              'Optional repeat count for `key` (1-100, default 1). E.g. {"key": "down", "count": 3} ' +
+              'sends three down-arrow events. Ignored when only `keys` is provided.',
+          },
           keys: {
             type: 'string',
             description:
-              'Literal byte sequence to write to the agent\'s PTY. JS-style escapes ("\\x1b", "\\r", "\\n") ' +
-              'are interpreted by the JSON parser as their byte values, then written verbatim. No wrapping, no Enter appended.',
+              'Optional raw byte string written verbatim to the agent\'s PTY. Use only when no named ' +
+              '`key` fits (e.g. a multi-char filter string or a vendor-specific CSI sequence). ' +
+              'JS-style escapes ("\\x1b", "\\r", "\\n") are interpreted by the JSON parser if the ' +
+              'client encodes them correctly; if not, they arrive as literal characters. No wrapping, ' +
+              'no Enter appended. If both `key` and `keys` are present, key bytes are sent first.',
           },
         },
-        required: ['agent_id', 'keys'],
+        required: ['agent_id'],
       },
     },
     {
@@ -279,14 +309,15 @@ function getToolDefinitions() {
     },
     {
       name: 'launch_agent',
-      description: 'Launch a new worker agent in a workspace. Optionally use a template or persona for pre-configured identity/prompt.',
+      description: 'Launch a new worker agent in a workspace. Optionally use a template or persona for pre-configured identity/prompt. When `prompt` is provided, the dashboard writes it into the agent\'s input buffer and presses Enter to submit (provider-appropriate: CR for Claude on Windows / kitty-encoded Enter for Codex+Gemini and for WSL agents). Pass `submit: false` to leave the prompt in the buffer without submitting (useful when the caller wants to append more input via send_keys_to_agent before the agent processes the turn). For codex agents, pass `fresh_session: true` to skip post-launch session-id discovery so the new agent isn\'t auto-bound to any pre-existing rollout in this workspace — use this when launching a codex worker in a workspace that has had prior codex work and you want a clean context.',
       inputSchema: {
         type: 'object',
         properties: {
           workspace_id: { type: 'string', description: 'The workspace ID.' },
           title: { type: 'string', description: 'Title for the agent.' },
           role_description: { type: 'string', description: 'Optional role description.' },
-          prompt: { type: 'string', description: 'Optional initial prompt to send after launch.' },
+          prompt: { type: 'string', description: 'Optional initial prompt to send after launch. By default the dashboard auto-submits with a provider-appropriate Enter — set `submit: false` to suppress.' },
+          submit: { type: 'boolean', description: 'Whether to auto-submit the initial prompt with Enter (default: true). Only relevant when `prompt` is provided. Pass false to leave the prompt typed but unsubmitted in the input buffer.' },
           template_id: { type: 'string', description: 'Optional template ID. Agent inherits the template persona, prompt, provider, etc.' },
           persona: { type: 'string', description: 'Persona subdirectory name under .claude/agents/. Agent inherits its CLAUDE.md as system instructions.' },
           system_prompt: { type: 'string', description: 'Optional identity prompt injected as the first message. Overrides template system_prompt.' },
@@ -295,6 +326,7 @@ function getToolDefinitions() {
           working_directory: { type: 'string', description: 'Working directory for the agent. Defaults to workspace root.' },
           auto_restart: { type: 'boolean', description: 'Auto-restart the agent on crash (default: true).' },
           supervised: { type: 'boolean', description: 'Whether the supervisor is notified on agent status changes (default: true for supervisor-launched workers — set false to opt out).' },
+          fresh_session: { type: 'boolean', description: 'Codex-only opt-out (default: false). When true, the dashboard skips the post-launch codex session-id discovery poll so the new agent record is not auto-bound to any pre-existing rollout in this workspace cwd. Use this when you want a clean codex context in a workspace that has had prior codex work. No-op for non-codex providers.' },
         },
         required: ['workspace_id', 'title'],
       },
@@ -564,9 +596,30 @@ async function handleToolCall(name, args) {
     }
 
     case 'send_keys_to_agent': {
-      await apiRequest('POST', `/api/agents/${args.agent_id}/keys`, { keys: args.keys });
-      const preview = args.keys.length > 60 ? args.keys.slice(0, 60) + '…' : args.keys;
-      return { content: [{ type: 'text', text: `Sent ${args.keys.length} byte(s) to agent ${args.agent_id}: ${JSON.stringify(preview)}` }] };
+      const body = {};
+      if (args.key !== undefined) body.key = args.key;
+      if (args.count !== undefined) body.count = args.count;
+      if (args.keys !== undefined) body.keys = args.keys;
+      if (body.key === undefined && body.keys === undefined) {
+        throw new Error('send_keys_to_agent requires "key" (named) or "keys" (raw bytes)');
+      }
+      const result = await apiRequest('POST', `/api/agents/${args.agent_id}/keys`, body);
+      const bytes = result?.bytes ?? 0;
+      const parts = [];
+      if (body.key !== undefined) {
+        const count = body.count ?? 1;
+        parts.push(count > 1 ? `key=${body.key} x${count}` : `key=${body.key}`);
+      }
+      if (typeof body.keys === 'string' && body.keys.length > 0) {
+        const preview = body.keys.length > 60 ? body.keys.slice(0, 60) + '…' : body.keys;
+        parts.push(`raw=${JSON.stringify(preview)}`);
+      }
+      return {
+        content: [{
+          type: 'text',
+          text: `Sent ${bytes} byte(s) to agent ${args.agent_id} (${parts.join(', ')})`,
+        }],
+      };
     }
 
     case 'get_context_stats': {
@@ -602,6 +655,11 @@ async function handleToolCall(name, args) {
       if (args.command) input.command = args.command;
       if (args.working_directory) input.workingDirectory = args.working_directory;
       if (args.auto_restart !== undefined) input.autoRestartEnabled = args.auto_restart;
+      // BUG-08: codex-only opt-out for post-launch session-id discovery.
+      // Default unset → backwards-compatible (discovery still runs). Pass
+      // true to start codex with a clean context in a workspace that has
+      // had prior codex work.
+      if (args.fresh_session !== undefined) input.freshSession = args.fresh_session;
       // Default supervised=true when called via the supervisor MCP — workers
       // launched by the supervisor should bump it on idle/done/crashed so it
       // can react without polling. Caller can pass supervised:false to opt out.
@@ -637,9 +695,15 @@ async function handleToolCall(name, args) {
         if (!ready) {
           text += `\nNote: Agent launched but did not reach idle within ${READY_TIMEOUT_MS / 1000}s (last status: ${lastStatus}). Initial prompt NOT sent — retry with send_message_to_agent once the agent is idle.`;
         } else {
+          // BUG-01: submit defaults to true so the prompt is auto-pressed
+          // (Enter is provider-appropriate: CR for Claude, kitty-encoded for
+          // Codex/Gemini and WSL). Pass submit:false to type without submit.
+          const submit = args.submit !== false;
           try {
-            await apiRequest('POST', `/api/agents/${agent.id}/input`, { text: args.prompt });
-            text += `\nSent initial prompt: "${args.prompt.substring(0, 100)}..."`;
+            await apiRequest('POST', `/api/agents/${agent.id}/input`, { text: args.prompt, submit });
+            text += submit
+              ? `\nSent initial prompt: "${args.prompt.substring(0, 100)}..."`
+              : `\nTyped initial prompt without submitting (submit:false): "${args.prompt.substring(0, 100)}..."`;
           } catch (err) {
             text += `\nNote: Agent reached idle but POST /input failed: ${err.message}. Initial prompt NOT sent — retry with send_message_to_agent.`;
           }

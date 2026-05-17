@@ -33,6 +33,7 @@ Check `./memory/MEMORY.md` at session start for context from prior runs. Save im
 You receive `[DASHBOARD EVENT]` messages automatically when supervised agents change status. When you receive one:
 
 - **idle/done**: Review the agent's last output via `read_agent_log`. If it's asking a question or awaiting approval, respond via `send_message_to_agent`. If work is complete, no action needed.
+- **waiting_for_input**: When a supervised agent is waiting on user input (in-text question, terminal prompt, plan-mode approval), the dashboard sends `[DASHBOARD EVENT] Agent waiting for input` with a `Waiting kind:` and `Excerpt:` line. Read the agent log for context, decide a response, and reply with `send_message_to_agent` (text answers) or `send_keys_to_agent` (arrow-key pickers / Enter).
 - **crashed**: Read the log to diagnose. Decide whether to restart (transient error) or escalate to the human (persistent failure).
 - **context threshold (80%+)**: Compact the agent — read its log to summarize progress, launch a new agent via `launch_agent` with a role description containing the compacted context (what was accomplished, current state, what's next), then stop the old agent via `stop_agent`. This gives the work a fresh context window without losing continuity.
 
@@ -113,17 +114,8 @@ Agents can only message teammates they have a channel to. The dashboard enforces
 1. **Create team**: Identify a multi-agent task. Use `create_team` with appropriate template.
 2. **Brief agents**: Send each member their initial instructions via `send_message_to_agent`. Tell them their role, the team task board, and that they should coordinate with teammates using their MCP tools.
 3. **Monitor**: Use `get_team` periodically to check task progress and message flow. Agents handle routine coordination themselves.
-4. **Intervene on exception**: Act when the dashboard reports loop detection, blocked agents, or escalation requests. Read logs, adjust channels, or send guidance.
+4. **Intervene on exception**: Act on blocked agents or escalation requests. Read logs, adjust channels, or send guidance.
 5. **Disband**: When work is complete, `disband_team` archives the team for potential resurrection.
-
-### Loop Detection
-
-The dashboard automatically detects communication loops between agents:
-- **Global cap**: Too many messages in a short window — all messaging paused
-- **Pair alternation**: Two agents bouncing back and forth with no progress — pair paused, supervisor notified
-- **Low-content filter**: Repetitive "acknowledged" / "standing by" messages blocked
-
-You will receive a `[TEAM EVENT] Loop detected` notification when this happens. Assess the situation, adjust the team (modify channels, send new instructions, or remove problematic members).
 
 ### Deliberation
 

@@ -21,6 +21,7 @@ import {
 import { scanPersonas, scaffoldPersona } from './persona-scanner';
 import { TEAM_MAX_MESSAGES_PER_5MIN, TEAM_MAX_ALTERNATIONS, TEAM_ALTERNATION_WINDOW_MS, TEAM_PAIR_COOLDOWN_MS } from '../shared/constants';
 import { TeamMessageStatus } from '../shared/types';
+import { isKeyName, mapKeyToBytes, SUPPORTED_KEY_NAMES } from './supervisor/key-bytes';
 import crypto from 'crypto';
 
 /**
@@ -166,7 +167,7 @@ export class ApiServer {
     if (method === 'POST' && inputMatch) {
       const agentId = inputMatch[1];
       const body = await readBody(req);
-      const { text } = JSON.parse(body);
+      const { text, submit } = JSON.parse(body);
       if (!text) throw Object.assign(new Error('Missing "text" in request body'), { statusCode: 400 });
 
       const agent = getAgent(agentId);
@@ -183,32 +184,70 @@ export class ApiServer {
         );
       }
 
+      // `submit` (optional, default true): pass false to leave the text in
+      // the agent's prompt buffer without pressing Enter. Used by
+      // launch_agent's `submit:false` flag (BUG-01).
+      const opts = submit === false ? { submit: false } : undefined;
+
       // Don't await — typing happens in the background. Errors are logged
       // because there's no caller to return them to once we've responded.
-      this.supervisor.sendInput(agentId, text).catch((err) => {
+      this.supervisor.sendInput(agentId, text, opts).catch((err) => {
         console.error(`[api] Background input delivery to ${agentId} failed:`, err);
       });
-      return { ok: true, agentId, queued: true, message: 'Input queued' };
+      return { ok: true, agentId, queued: true, submit: submit !== false, message: 'Input queued' };
     }
 
-    // POST /api/agents/:id/keys — write raw keystroke bytes to the agent's PTY.
+    // POST /api/agents/:id/keys — write keystroke bytes to the agent's PTY.
     // Bypasses the bracketed-paste wrapping that `:id/input` applies (intentional —
     // pickers and other widgets need bytes dispatched as key events, not as one
     // pasted blob). Synchronous: a single PTY write per call, no typing loop,
     // no per-agent queue. Concurrent calls race like any keyboard input — that
     // matches the dashboard xterm panel's behavior, which uses the same channel
     // (`Supervisor.writeToAgent`, see `terminal:write` IPC handler).
+    //
+    // Accepts either:
+    //   { key: <name>, count?: number }  — named key (preferred). Resolves
+    //     to the right byte sequence for the agent's provider+host. See
+    //     `key-bytes.ts` for the table. BUG-02.
+    //   { keys: <raw string> }           — raw bytes (advanced fallback).
+    //     Sent verbatim. Use only when no named key fits.
+    // Both forms can be combined: `key` bytes are sent first, then `keys`.
     const keysMatch = path.match(/^\/api\/agents\/([^/]+)\/keys$/);
     if (method === 'POST' && keysMatch) {
       const agentId = keysMatch[1];
       const body = await readBody(req);
-      const { keys } = JSON.parse(body);
-      if (typeof keys !== 'string') {
-        throw Object.assign(new Error('Missing or non-string "keys" in request body'), { statusCode: 400 });
+      const parsed = JSON.parse(body);
+      const rawKeys: unknown = parsed.keys;
+      const keyName: unknown = parsed.key;
+      const countRaw: unknown = parsed.count;
+
+      if (keyName !== undefined && !isKeyName(keyName)) {
+        throw Object.assign(
+          new Error(
+            `Unknown "key" value: ${JSON.stringify(keyName)}. ` +
+            `Supported: ${SUPPORTED_KEY_NAMES.join(', ')}`,
+          ),
+          { statusCode: 400 },
+        );
       }
-      // Empty string is a no-op rather than an error — easier to script.
-      if (keys.length === 0) {
-        return { ok: true, agentId, bytes: 0, message: 'No bytes to send' };
+      if (keyName === undefined && rawKeys === undefined) {
+        throw Object.assign(
+          new Error('Request body must include either "key" (named) or "keys" (raw bytes)'),
+          { statusCode: 400 },
+        );
+      }
+      if (rawKeys !== undefined && typeof rawKeys !== 'string') {
+        throw Object.assign(new Error('"keys" must be a string when provided'), { statusCode: 400 });
+      }
+      let count = 1;
+      if (countRaw !== undefined) {
+        if (typeof countRaw !== 'number' || !Number.isInteger(countRaw) || countRaw < 1 || countRaw > 100) {
+          throw Object.assign(
+            new Error('"count" must be an integer in [1, 100] when provided'),
+            { statusCode: 400 },
+          );
+        }
+        count = countRaw;
       }
 
       const agent = getAgent(agentId);
@@ -217,8 +256,32 @@ export class ApiServer {
         throw Object.assign(new Error('Agent has no live runner (likely crashed or stopped)'), { statusCode: 409 });
       }
 
-      this.supervisor.writeToAgent(agentId, keys);
-      return { ok: true, agentId, bytes: keys.length };
+      let toSend = '';
+      let resolvedFrom: 'key' | 'keys' | 'key+keys' | null = null;
+      if (keyName !== undefined) {
+        const workspace = getWorkspace(agent.workspaceId);
+        const pathType = workspace?.pathType ?? 'windows';
+        toSend += mapKeyToBytes(keyName, agent.provider, pathType).repeat(count);
+        resolvedFrom = 'key';
+      }
+      if (typeof rawKeys === 'string' && rawKeys.length > 0) {
+        toSend += rawKeys;
+        resolvedFrom = resolvedFrom === 'key' ? 'key+keys' : 'keys';
+      }
+
+      // Empty payload is a no-op rather than an error — easier to script.
+      if (toSend.length === 0) {
+        return { ok: true, agentId, bytes: 0, message: 'No bytes to send' };
+      }
+
+      this.supervisor.writeToAgent(agentId, toSend);
+      return {
+        ok: true,
+        agentId,
+        bytes: toSend.length,
+        resolvedFrom,
+        ...(keyName !== undefined ? { key: keyName, count } : {}),
+      };
     }
 
     // POST /api/agents — launch a new agent

@@ -23,8 +23,11 @@ export class AgentChatService {
     const agent = getAgent(agentId);
     if (!agent) return [];
 
-    // Trigger a fresh poll to ensure we have the latest messages
-    this.dispatcher.pollNow();
+    // Trigger a fresh poll to ensure we have the latest messages. Scoped to
+    // this agent so the force-poll does not reset other agents' rate-limit
+    // timers. BUG-07: must bypass the dispatcher's `nextPollAt` gate or a
+    // recent background tick can silently keep our read stale.
+    this.dispatcher.pollNow(agentId);
 
     const { events } = this.dispatcher.getCachedEvents(agentId);
     if (events.length === 0) return [];

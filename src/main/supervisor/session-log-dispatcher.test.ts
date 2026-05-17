@@ -199,6 +199,74 @@ test('BR-12 (dispatcher half): assistant-text-patch mutates ring buffer entry in
   assert.strictEqual(mutated, ringEntry, 'in-place mutation preserves object identity');
 });
 
+test('BUG-07: pollNow(agentId) bypasses nextPollAt rate-limit gate', () => {
+  const { dispatcher, reader, emitted } = makeDispatcher();
+
+  // Poll once so any first-call bookkeeping is settled.
+  reader.queue.push({
+    type: 'assistant-text',
+    uuid: 'a:initial',
+    timestamp: new Date().toISOString(),
+    agentId: 'agent-1',
+    text: 'initial',
+  } as SessionEvent);
+  dispatcher.pollNow();
+  assert.equal(emitted.length, 1, 'initial poll emits the seed event');
+
+  // Simulate the background tick having just run for this agent: pin
+  // nextPollAt far enough in the future that `tick()` would skip the agent.
+  (dispatcher as any).nextPollAt.set('agent-1', Date.now() + 60_000);
+
+  // A new event lands on disk (in the fake reader's queue).
+  reader.queue.push({
+    type: 'assistant-text',
+    uuid: 'a:fresh',
+    timestamp: new Date().toISOString(),
+    agentId: 'agent-1',
+    text: 'fresh turn',
+  } as SessionEvent);
+
+  // Pre-fix: pollNow() → tick() would `continue` past agent-1 and never
+  // drain the queue, so emitted.length stays at 1 and the new event is
+  // invisible to AgentChatService.getMessages. Post-fix: pollNow(agentId)
+  // bypasses the gate and pollOne() drains the queue.
+  dispatcher.pollNow('agent-1');
+  assert.equal(emitted.length, 2, 'forced pollNow(agentId) should fire despite future nextPollAt');
+  assert.equal(emitted[1].events[0].uuid, 'a:fresh');
+
+  // It must also refresh the gate (so we don't accidentally promote one
+  // forced call into an unbounded poll storm).
+  const dueAfter = (dispatcher as any).nextPollAt.get('agent-1') as number;
+  assert.ok(dueAfter > Date.now(), 'forced poll must re-arm nextPollAt');
+});
+
+test('BUG-07: pollNow(agentId) does NOT reset other agents\' gating timers', () => {
+  const reader = new FakeReader();
+  const dispatcher = new SessionLogDispatcher(() => [
+    { agentId: 'agent-1', sessionId: 's1', workingDirectory: '/repo', provider: 'codex' as const },
+    { agentId: 'agent-2', sessionId: 's2', workingDirectory: '/repo', provider: 'codex' as const },
+  ]);
+  dispatcher.register(reader);
+  const emitted: ChatEventBatch[] = [];
+  dispatcher.on('chat-events', (b) => emitted.push(b));
+
+  const futureGate = Date.now() + 60_000;
+  (dispatcher as any).nextPollAt.set('agent-1', futureGate);
+  (dispatcher as any).nextPollAt.set('agent-2', futureGate);
+
+  reader.queue.push({
+    type: 'assistant-text',
+    uuid: 'a:only-agent-1-cares',
+    timestamp: new Date().toISOString(),
+    agentId: 'agent-1',
+    text: 'fresh',
+  } as SessionEvent);
+  dispatcher.pollNow('agent-1');
+
+  const after2 = (dispatcher as any).nextPollAt.get('agent-2') as number;
+  assert.equal(after2, futureGate, 'agent-2 gate must be untouched by a scoped pollNow');
+});
+
 test('codex sessions with blank sessionId are still polled', () => {
   const reader = new FakeReader();
   const dispatcher = new SessionLogDispatcher(() => [
