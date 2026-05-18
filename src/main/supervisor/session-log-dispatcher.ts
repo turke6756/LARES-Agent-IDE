@@ -56,6 +56,13 @@ export class SessionLogDispatcher extends EventEmitter {
   private syntheticMarkers = new Map<string, SyntheticMarker[]>(); // agentId -> markers
   private seenEventUuids = new Map<string, Set<string>>();
   private seenEventUuidOrder = new Map<string, string[]>();
+  // BUG-09 §3.8 — agents whose first poll-driven batch has already been
+  // emitted. The dispatcher's first batch per agent contains the
+  // disk-replay of pre-existing events (post-attach reattach, app restart
+  // discovering an active session, etc.). Marking that batch
+  // `initialLoad: true` lets `event-bridge.onChatEvents` skip latch
+  // updates for stale events without rewriting the PTY signal.
+  private emittedInitialBatch = new Set<string>();
 
   constructor(getActiveAgentSessions: () => AgentSession[]) {
     super();
@@ -280,10 +287,18 @@ export class SessionLogDispatcher extends EventEmitter {
 
     this.appendToRingBuffer(session.agentId, newEvents);
 
+    // BUG-09 §3.8 — the first batch we emit for this agent is the on-disk
+    // replay of pre-existing events. Mark it so the event-bridge can suppress
+    // latch updates for historical tool-use/turnComplete that no longer
+    // reflect live state.
+    const isInitial = !this.emittedInitialBatch.has(session.agentId);
+    if (isInitial) this.emittedInitialBatch.add(session.agentId);
+
     const batch: ChatEventBatch = {
       agentId: session.agentId,
       events: newEvents,
       truncated: this.truncatedByAgent.get(session.agentId) || false,
+      initialLoad: isInitial || undefined,
     };
     this.emit('chat-events', batch);
 

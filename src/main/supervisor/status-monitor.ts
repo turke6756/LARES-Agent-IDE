@@ -242,6 +242,22 @@ export class StatusMonitor extends EventEmitter {
       try {
         const newStatus = await this.inferStatus(agent);
         if (newStatus && newStatus !== agent.status) {
+          // BUG-09 §3.6 — re-read the agent record after inferStatus returns
+          // and before writing. If a chat event fired forceWorking/forceIdle/
+          // forceWaiting between the inference and this write (they go
+          // through updateAgentStatus synchronously, see status-monitor's
+          // force* methods), the stale poll write would otherwise overwrite
+          // it back to the inferred-but-wrong status. Re-reading lets the
+          // chat-stream truth win.
+          //
+          // Codex round 3 note: the gap between `await this.inferStatus(agent)`
+          // resolving and the writes below is JS run-to-completion, so the
+          // re-read is belt-and-suspenders today (the force* paths are
+          // synchronous). It becomes load-bearing if any of force*'s writes
+          // ever go async.
+          const fresh = this.getAgentFn(agent.id);
+          if (fresh && fresh.status !== agent.status) continue;
+
           // Debounce: hold a status for a short period to prevent rapid flipping
           const holdUntil = this.statusHoldUntil.get(agent.id) || 0;
           if (this.now() < holdUntil) continue;

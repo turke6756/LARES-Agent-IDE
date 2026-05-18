@@ -126,6 +126,13 @@ export class EventBridge {
    */
   onChatEvents(batch: ChatEventBatch): void {
     try {
+      // BUG-09 §3.8 — the dispatcher's first batch per agent is the on-disk
+      // replay of pre-existing events. Pre-existing tool-use / turnComplete /
+      // endsWithQuestion no longer reflect live state, so we must not call
+      // force* on them. The PTY signal carries the agent's true status
+      // through the brief window between dispatcher attach and the first
+      // live event.
+      if (batch.initialLoad === true) return;
       for (const event of batch.events) {
         const agentId = event.agentId;
         const agent = this.deps.getAgent(agentId);

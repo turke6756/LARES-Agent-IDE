@@ -537,6 +537,55 @@ test('BUG-09 §3.1: PTY (y/N) DOES override model-pending working latch', async 
   }
 });
 
+test('BUG-09 §3.6: poll/chat race — stale poll write skipped when force* moved status', async () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeAgent('w-1', { status: 'idle' });
+    const monitor = makeMonitor({ fakes, agent });
+
+    // Simulate a poll tick whose inferStatus is about to write `idle`
+    // (PTY-quiet path). Race condition: in between inferStatus resolving and
+    // the write, a chat event fires forceWorking, mutating agent.status to
+    // 'working'. We trigger this by manually mutating agent.status here —
+    // semantically equivalent to "the force* path just mutated this record".
+
+    // Drive the poll loop:
+    await (monitor as any).poll();
+    // First poll: agent was 'idle', alive, PTY just printed → returns
+    // 'working' (because lastOutputAt was seeded to now in makeMonitor).
+    // So we expect one update to 'working' and one emission. Sanity check.
+    assert.equal(fakes.updates[0]?.status, 'working');
+
+    // Now set up the race: agent currently 'working' but PTY went quiet long
+    // enough that inferStatus would return 'idle'. Mutate agent.status as if
+    // a force* path just wrote a new value out of band.
+    fakes.lastOutputAt.set(agent.id, fakes.now.value - 20_000);
+    fakes.now.value += 1_000;
+
+    // Wedge a hook so that BEFORE poll's compare/write, a competing force*
+    // mutates the agent record. We use the test's mutable agents map to
+    // simulate that.
+    const origInferStatus = (monitor as any).inferStatus.bind(monitor);
+    (monitor as any).inferStatus = async (a: any) => {
+      const result = await origInferStatus(a);
+      // Race: a chat event just made the agent waiting.
+      const live = fakes.agents.get(a.id);
+      if (live) live.status = 'waiting';
+      return result;
+    };
+
+    const updatesBefore = fakes.updates.length;
+    await (monitor as any).poll();
+    // The stale poll write (intended to flip to 'idle') must be skipped —
+    // the live record moved on to 'waiting'.
+    assert.equal(fakes.updates.length, updatesBefore,
+      'BUG-09 §3.6: stale poll write skipped after force* mutated the record');
+  } finally {
+    restore();
+  }
+});
+
 test('BUG-09 §3.7: forgetAgent drops latch + statusHoldUntil', () => {
   const fakes = makeStatusMonitorFakes();
   const restore = patchDatabaseModule(fakes);

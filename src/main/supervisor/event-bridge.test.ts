@@ -450,6 +450,62 @@ async function onChatEvents_geminiToolUseStillRoutes(): Promise<void> {
   console.log('  onChatEvents ✓ Gemini tool-use still routes through bridge (D-07 is narrow)');
 }
 
+// ── BUG-09 §3.8 — initialLoad replay suppression ─────────────────────
+
+async function onChatEvents_initialLoadSuppressesForceCalls(): Promise<void> {
+  const f = makeFakeBridgeDeps();
+  const claude = makeAgent('cl-il', { provider: 'claude', status: 'idle' });
+  f.agents.set(claude.id, claude);
+  const bridge = new EventBridge(f.deps);
+
+  const toolEv: ToolUseEvent = {
+    type: 'tool-use', uuid: 't', timestamp: '', agentId: claude.id,
+    toolUseId: 'tu-replay', toolName: 'Read', input: {},
+  };
+  const userEv: UserTextEvent = {
+    type: 'user-text', uuid: 'u', timestamp: '', agentId: claude.id, text: 'old',
+  };
+
+  // BUG-09 §3.8 — initial-load batch (disk replay) must NOT touch the latch.
+  bridge.onChatEvents({
+    agentId: claude.id,
+    events: [toolEv, userEv],
+    initialLoad: true,
+  });
+
+  assert.equal(f.statusForceCalls.length, 0,
+    'BUG-09 §3.8: initialLoad=true suppresses all force* calls');
+  console.log('  onChatEvents ✓ initialLoad batch suppresses force* (BUG-09 §3.8)');
+}
+
+async function onChatEvents_secondBatchIsNotInitialLoad(): Promise<void> {
+  const f = makeFakeBridgeDeps();
+  const claude = makeAgent('cl-il2', { provider: 'claude', status: 'idle' });
+  f.agents.set(claude.id, claude);
+  const bridge = new EventBridge(f.deps);
+
+  // First batch: explicit initialLoad=true → suppressed.
+  bridge.onChatEvents({
+    agentId: claude.id,
+    events: [{ type: 'tool-use', uuid: 't1', timestamp: '', agentId: claude.id,
+              toolUseId: 'tu-old', toolName: 'Read', input: {} }],
+    initialLoad: true,
+  });
+  assert.equal(f.statusForceCalls.length, 0);
+
+  // Second batch: no initialLoad flag → real-time, drives the latch.
+  bridge.onChatEvents({
+    agentId: claude.id,
+    events: [{ type: 'tool-use', uuid: 't2', timestamp: '', agentId: claude.id,
+              toolUseId: 'tu-live', toolName: 'Read', input: {} }],
+  });
+  assert.equal(f.statusForceCalls.length, 1,
+    'second non-initial batch drives the latch normally');
+  assert.equal(f.statusForceCalls[0].method, 'forceWorking');
+  assert.equal(f.statusForceCalls[0].workingOpts?.toolUseId, 'tu-live');
+  console.log('  onChatEvents ✓ post-initial batches behave normally (BUG-09 §3.8)');
+}
+
 // ── M3: P2-03 waiting_for_input wiring (BR-13, BR-15, BR-20) ────────
 
 async function BR_13_endsWithQuestionFiresForceWaiting(): Promise<void> {
@@ -587,6 +643,8 @@ async function main(): Promise<void> {
   await onChatEvents_codexTurnComplete();
   await onChatEvents_dispatchTable();
   await onChatEvents_geminiToolUseStillRoutes();
+  await onChatEvents_initialLoadSuppressesForceCalls();
+  await onChatEvents_secondBatchIsNotInitialLoad();
   console.log('event-bridge.test: all tests passed');
 }
 

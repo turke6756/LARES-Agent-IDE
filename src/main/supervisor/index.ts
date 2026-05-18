@@ -1012,6 +1012,11 @@ export class AgentSupervisor extends EventEmitter {
     const priorWinLaunch = getAgent(agent.id)?.status;
     updateAgentStatus(agent.id, 'working');
     this.emit('statusChanged', { agentId: agent.id, status: 'working', fromStatus: priorWinLaunch, source: 'launch' } satisfies StatusChangedEvent);
+    // BUG-09 §3.4 — seed a model-pending working latch immediately on launch so
+    // the launch-window race (the ce44c2db sighting) is closed before any chat
+    // event has had a chance to land. Without this, the first-turn API call's
+    // ~8 s of spinner-only PTY output would flip the agent back to idle.
+    this.monitor.forceWorking(agent.id, { source: 'launch-pending', ttlClass: 'model-pending' });
 
     if (codexSnapshot) {
       this.captureCodexSessionId(agent.id, codexSnapshot, agent.workingDirectory, codexLaunchStartedAt);
@@ -1252,6 +1257,9 @@ export class AgentSupervisor extends EventEmitter {
     const priorWslLaunch = getAgent(agent.id)?.status;
     updateAgentStatus(agent.id, 'working');
     this.emit('statusChanged', { agentId: agent.id, status: 'working', fromStatus: priorWslLaunch, source: 'launch' } satisfies StatusChangedEvent);
+    // BUG-09 §3.4 — seed a model-pending working latch immediately on launch.
+    // See launchWindowsAgent for the full rationale.
+    this.monitor.forceWorking(agent.id, { source: 'launch-pending', ttlClass: 'model-pending' });
 
     if (codexSnapshot) {
       this.captureCodexSessionId(agent.id, codexSnapshot, wslWorkDir, codexLaunchStartedAt);
