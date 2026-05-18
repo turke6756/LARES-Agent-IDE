@@ -176,8 +176,11 @@ export class WslRunner extends EventEmitter {
   private handleMessage(msg: any): void {
     switch (msg.type) {
       case 'data':
-        this._lastOutputTime = Date.now();
+        // BUG-13 Path B: gate the raw output timestamp on meaningful content
+        // (mirrors windows-runner.ts) so ghost-text-only PTY redraws don't
+        // block legitimate `working → idle` downgrades.
         if (this.hasMeaningfulContent(msg.data)) {
+          this._lastOutputTime = Date.now();
           const now = Date.now();
           if (now - this._outputWindowStart > 3000) {
             this._outputWindowStart = now;
@@ -257,7 +260,12 @@ export class WslRunner extends EventEmitter {
                         .replace(/\x1b[()][0-9A-Z]/g, '')
                         .replace(/\x1b\[[\?]?[0-9;]*[hlm]/g, '')
                         .replace(/[\x00-\x1f]/g, '');
-    return stripped.trim().length > 0;
+    const trimmed = stripped.trim();
+    if (trimmed.length === 0) return false;
+    // BUG-13 Path B: ghost-text-only redraws carry tiny payloads with no
+    // newline; real output either spans a newline or comfortably exceeds the
+    // per-event floor. The 200-byte rolling-burst gate above is preserved.
+    return data.includes('\n') || trimmed.length >= 64;
   }
 
   async isStillAlive(): Promise<boolean> {

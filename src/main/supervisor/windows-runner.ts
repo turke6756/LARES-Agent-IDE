@@ -138,11 +138,15 @@ export class WindowsRunner extends EventEmitter {
         if (this._dataCount === 1 || this._dataCount === 10 || this._dataCount === 100) {
           console.log(`[WindowsRunner] data event #${this._dataCount}, total ${this._totalBytes} bytes, ring ${this.outputRing.length} lines`);
         }
-        this._lastOutputTime = Date.now();
-        // Track output volume to distinguish active generation from idle echo.
-        // When Claude is working, it streams lots of text quickly (>200 bytes in 3s).
-        // User keystrokes echo back as tiny chunks.
+        // BUG-13 Path B: gate the raw output timestamp on meaningful content
+        // so a ghost-text-only redraw (cursor save + tiny payload + cursor
+        // restore, no newline) doesn't keep `_lastRawOutputTime` fresh and
+        // silently block legitimate `working → idle` downgrades.
         if (this.hasMeaningfulContent(msg.data)) {
+          this._lastOutputTime = Date.now();
+          // Track output volume to distinguish active generation from idle echo.
+          // When Claude is working, it streams lots of text quickly (>200 bytes in 3s).
+          // User keystrokes echo back as tiny chunks.
           const now = Date.now();
           if (now - this._outputWindowStart > 3000) {
             // Start a new measurement window
@@ -217,7 +221,16 @@ export class WindowsRunner extends EventEmitter {
                         .replace(/\x1b[()][0-9A-Z]/g, '')         // Character set
                         .replace(/\x1b\[[\?]?[0-9;]*[hlm]/g, '') // Mode changes
                         .replace(/[\x00-\x1f]/g, '');              // Control chars
-    return stripped.trim().length > 0;
+    const trimmed = stripped.trim();
+    if (trimmed.length === 0) return false;
+    // BUG-13 Path B: a ghost-text-only burst (e.g. Claude Code rendering
+    // `❯ commit this` as a grey suggestion) carries a tiny payload inside
+    // cursor save/restore wrappers and never contains a newline. Real
+    // assistant streaming, tool output, and paste payloads either ship a
+    // newline-bearing chunk or push well above the per-event byte floor.
+    // The 200-byte rolling-burst threshold above is preserved as a second
+    // line of defense.
+    return data.includes('\n') || trimmed.length >= 64;
   }
 
   private sendToHost(msg: any): void {
