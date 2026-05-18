@@ -50,6 +50,10 @@ function makeMonitor(opts: {
     (id) => fakes.agents.get(id) ?? null,
     () => fakes.now.value,
     (id) => ringTails.get(id) ?? '',
+    // BUG-09 §3.5 — raw PTY signal. Defaults to `lastOutputAt` so legacy
+    // tests behave as before; new dual-signal tests override
+    // `lastRawOutputAt` directly.
+    (id) => fakes.lastRawOutputAt.get(id) ?? fakes.lastOutputAt.get(id) ?? 0,
   );
   monitor.on('statusChanged', (payload: StatusChangedEvent) => {
     fakes.emissions.push(payload);
@@ -602,6 +606,70 @@ test('BUG-09 §3.7: forgetAgent drops latch + statusHoldUntil', () => {
 
     assert.equal(monitor.getLatchSnapshot(agent.id), undefined, 'latch dropped');
     assert.ok(!(monitor as any).statusHoldUntil.has(agent.id), 'hold dropped');
+  } finally {
+    restore();
+  }
+});
+
+// ── BUG-09 §3.5 (Bundle 3) — dual PTY signal logic ───────────────────
+
+test('BUG-09 §3.5: spinner-only redraws keep a working agent from downgrading', async () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeAgent('w-1', { status: 'working' });
+    const monitor = makeMonitor({ fakes, agent });
+
+    // Simulate the Coalescing window: meaningful burst stale (>8s ago),
+    // raw output fresh (spinner glyph just redrew). Pre-Bundle-3 logic
+    // looked at the meaningful signal only and would have returned 'idle'.
+    fakes.now.value += 15_000;
+    fakes.lastOutputAt.set(agent.id, fakes.now.value - 15_000);
+    fakes.lastRawOutputAt.set(agent.id, fakes.now.value - 100);
+
+    const inferred = await inferStatus(monitor, agent);
+    assert.equal(inferred, 'working',
+      'BUG-09 §3.5: raw PTY freshness keeps a working agent working');
+  } finally {
+    restore();
+  }
+});
+
+test('BUG-09 §3.5: idle agent does NOT promote on raw-only PTY freshness', async () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeAgent('w-1', { status: 'idle' });
+    const monitor = makeMonitor({ fakes, agent });
+
+    // Meaningful stale, raw fresh — but the agent is currently idle.
+    // The "raw keeps working alive" rule must NOT promote idle → working.
+    fakes.now.value += 15_000;
+    fakes.lastOutputAt.set(agent.id, fakes.now.value - 15_000);
+    fakes.lastRawOutputAt.set(agent.id, fakes.now.value - 100);
+
+    const inferred = await inferStatus(monitor, agent);
+    assert.equal(inferred, 'idle',
+      'idle agent stays idle without a meaningful burst — raw alone is not enough');
+  } finally {
+    restore();
+  }
+});
+
+test('BUG-09 §3.5: working → idle once BOTH PTY signals go stale', async () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeAgent('w-1', { status: 'working' });
+    const monitor = makeMonitor({ fakes, agent });
+
+    fakes.now.value += 20_000;
+    fakes.lastOutputAt.set(agent.id, fakes.now.value - 20_000);
+    fakes.lastRawOutputAt.set(agent.id, fakes.now.value - 15_000);
+
+    const inferred = await inferStatus(monitor, agent);
+    assert.equal(inferred, 'idle',
+      'both signals stale → real downgrade fires (the latch covers the false-positive case)');
   } finally {
     restore();
   }

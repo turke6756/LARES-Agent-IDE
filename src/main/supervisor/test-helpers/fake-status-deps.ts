@@ -23,8 +23,12 @@ export interface StatusMonitorFakes {
   audit: Array<{ agentId: string; type: string; payload: string }>;
   /** Recorded `statusChanged` emissions from the monitor. */
   emissions: Array<{ agentId: string; status: AgentStatus; fromStatus?: AgentStatus; source: string }>;
-  /** Controllable PTY last-output timestamp per agent. */
+  /** Controllable PTY last-meaningful-burst timestamp per agent. */
   lastOutputAt: Map<string, number>;
+  /** BUG-09 §3.5 — controllable PTY raw-output timestamp per agent. Tests
+   *  that don't set this fall back to `lastOutputAt`, matching the prior
+   *  single-signal behavior. */
+  lastRawOutputAt: Map<string, number>;
   /** Controllable alive predicate. */
   aliveOverride: Map<string, boolean>;
   /** Controllable clock (advanced by the test). */
@@ -38,6 +42,7 @@ export function makeStatusMonitorFakes(): StatusMonitorFakes {
     audit: [],
     emissions: [],
     lastOutputAt: new Map(),
+    lastRawOutputAt: new Map(),
     aliveOverride: new Map(),
     now: { value: 1_000_000 },
   };

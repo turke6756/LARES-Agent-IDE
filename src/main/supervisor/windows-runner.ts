@@ -39,9 +39,24 @@ export class WindowsRunner extends EventEmitter {
     return this._pid;
   }
 
-  /** Time of last sustained output burst (Claude actively generating) */
-  get lastOutputTime(): number {
+  /** BUG-09 §3.5 — last time a sustained meaningful-content burst landed
+   *  (>200 stripped bytes within a 3 s window). Used to promote `idle → working`.
+   *  Stays stale during Claude TUI Coalescing / spinner-only phases.
+   *
+   *  Renamed from `lastOutputTime` — the prior name was a misnomer (it has
+   *  always returned `_lastMeaningfulBurst`, not `_lastOutputTime`) and the
+   *  bug-09 investigation tripped on it. */
+  get lastMeaningfulBurstTime(): number {
     return this._lastMeaningfulBurst;
+  }
+
+  /** BUG-09 §3.5 — raw PTY-output timestamp, advanced by every `data` event
+   *  (spinner redraws included). Used to keep a `working` latch alive: as
+   *  long as the PTY is emitting *anything* — even single-glyph spinner
+   *  redraws — we should not downgrade `working → idle`. Complementary to
+   *  {@link lastMeaningfulBurstTime}. */
+  get lastRawOutputTime(): number {
+    return this._lastOutputTime;
   }
 
   get isAlive(): boolean {

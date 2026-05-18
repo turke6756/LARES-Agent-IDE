@@ -239,7 +239,7 @@ export class AgentSupervisor extends EventEmitter {
 
     this.monitor = new StatusMonitor(
       (agent) => this.checkAlive(agent),
-      (agentId) => this.getLastOutputTime(agentId),
+      (agentId) => this.getLastMeaningfulBurstTime(agentId),
       (agentId) => getAgent(agentId),
       () => Date.now(),
       // P2-02: PTY ring tail for PromptPatternDetector. Falls back through
@@ -252,7 +252,10 @@ export class AgentSupervisor extends EventEmitter {
         const wsl = this.wslRunners.get(agentId);
         if (wsl) return wsl.getOutputRingTail();
         return '';
-      }
+      },
+      // BUG-09 §3.5 — raw PTY-byte timestamp keeps a `working` agent alive
+      // during Coalescing / spinner-only phases.
+      (agentId) => this.getLastRawOutputTime(agentId),
     );
 
     const bridgeDeps: EventBridgeDeps = {
@@ -1903,12 +1906,27 @@ export class AgentSupervisor extends EventEmitter {
     }
   }
 
-  private getLastOutputTime(agentId: string): number {
+  /** BUG-09 §3.5 — meaningful-burst signal (200 B / 3 s gate). Used to
+   *  promote `idle → working` in `inferStatus`. */
+  private getLastMeaningfulBurstTime(agentId: string): number {
     const winRunner = this.windowsRunners.get(agentId);
-    if (winRunner) return winRunner.lastOutputTime;
+    if (winRunner) return winRunner.lastMeaningfulBurstTime;
 
     const wslRunner = this.wslRunners.get(agentId);
-    if (wslRunner) return wslRunner.lastOutputTime;
+    if (wslRunner) return wslRunner.lastMeaningfulBurstTime;
+
+    return 0;
+  }
+
+  /** BUG-09 §3.5 — raw PTY-byte timestamp. Used to keep an already-working
+   *  agent from being downgraded by `inferStatus` during spinner-only
+   *  Coalescing windows. */
+  private getLastRawOutputTime(agentId: string): number {
+    const winRunner = this.windowsRunners.get(agentId);
+    if (winRunner) return winRunner.lastRawOutputTime;
+
+    const wslRunner = this.wslRunners.get(agentId);
+    if (wslRunner) return wslRunner.lastRawOutputTime;
 
     return 0;
   }

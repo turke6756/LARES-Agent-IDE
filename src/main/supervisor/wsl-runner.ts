@@ -46,8 +46,14 @@ export class WslRunner extends EventEmitter {
     this.sessionName = sessionName;
   }
 
-  get lastOutputTime(): number {
+  /** BUG-09 §3.5 — see windows-runner.ts for full docstring. */
+  get lastMeaningfulBurstTime(): number {
     return this._lastMeaningfulBurst;
+  }
+
+  /** BUG-09 §3.5 — see windows-runner.ts for full docstring. */
+  get lastRawOutputTime(): number {
+    return this._lastOutputTime;
   }
 
   get pid(): number | null {

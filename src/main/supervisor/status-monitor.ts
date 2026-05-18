@@ -73,7 +73,13 @@ const TRANSITIONAL_STATUSES: ReadonlyArray<AgentStatus> = ['launching', 'restart
 export class StatusMonitor extends EventEmitter {
   private interval: ReturnType<typeof setInterval> | null = null;
   private checkAlive: (agent: Agent) => Promise<boolean>;
-  private getLastOutput: (agentId: string) => number;
+  /** BUG-09 §3.5 — last meaningful-burst timestamp (used to promote
+   *  `idle → working`). Stays stale during Coalescing / spinner-only phases. */
+  private getLastMeaningfulBurst: (agentId: string) => number;
+  /** BUG-09 §3.5 — last raw PTY byte timestamp (used to keep a `working`
+   *  agent from being downgraded to `idle` while the spinner is still
+   *  redrawing). */
+  private getLastRawOutput: (agentId: string) => number;
   private getAgentFn: (id: string) => Agent | null;
   /** P2-02: Pulls the trailing PTY bytes for prompt-pattern matching.
    *  Defaults to empty string when not injected (tests). */
@@ -89,14 +95,20 @@ export class StatusMonitor extends EventEmitter {
 
   constructor(
     checkAlive: (agent: Agent) => Promise<boolean>,
-    getLastOutput: (agentId: string) => number,
+    getLastMeaningfulBurst: (agentId: string) => number,
     getAgentFn: (id: string) => Agent | null,
     now: () => number = () => Date.now(),
-    getOutputRingTail: (agentId: string) => string = () => ''
+    getOutputRingTail: (agentId: string) => string = () => '',
+    /** BUG-09 §3.5 — optional raw PTY timestamp accessor. Defaults to the
+     *  meaningful-burst accessor when not provided so existing tests don't
+     *  have to thread a second function through. Production callers should
+     *  always supply this. */
+    getLastRawOutput?: (agentId: string) => number,
   ) {
     super();
     this.checkAlive = checkAlive;
-    this.getLastOutput = getLastOutput;
+    this.getLastMeaningfulBurst = getLastMeaningfulBurst;
+    this.getLastRawOutput = getLastRawOutput ?? getLastMeaningfulBurst;
     this.getAgentFn = getAgentFn;
     this.now = now;
     this.getOutputRingTail = getOutputRingTail;
@@ -313,7 +325,7 @@ export class StatusMonitor extends EventEmitter {
           //     still beat the generic latched-working state.
           if (hasOutstandingTools) return 'working';
 
-          const lastOutputForPattern = this.getLastOutput(agent.id);
+          const lastOutputForPattern = this.getLastMeaningfulBurst(agent.id);
           const elapsedForPattern = this.now() - lastOutputForPattern;
           if (elapsedForPattern > PTY_QUIET_FOR_PATTERN_MS) {
             const tail = this.getOutputRingTail(agent.id);
@@ -339,14 +351,16 @@ export class StatusMonitor extends EventEmitter {
       }
     }
 
-    const lastOutput = this.getLastOutput(agent.id);
-    const elapsed = this.now() - lastOutput;
+    const lastMeaningful = this.getLastMeaningfulBurst(agent.id);
+    const lastRaw = this.getLastRawOutput(agent.id);
+    const elapsedMeaningful = this.now() - lastMeaningful;
+    const elapsedRaw = this.now() - lastRaw;
 
-    // P2-02: PTY prompt-pattern detection. Only runs once the PTY has been
-    // quiet for ≥2s so a still-streaming agent isn't classified as waiting
-    // mid-burst. On match, arm the waiting latch (which `forceWaiting` does
-    // for us) and return 'waiting' for this tick.
-    if (elapsed > PTY_QUIET_FOR_PATTERN_MS) {
+    // P2-02: PTY prompt-pattern detection. Only runs once the meaningful
+    // signal has been quiet for ≥2s so a still-streaming agent isn't
+    // classified as waiting mid-burst. On match, arm the waiting latch (which
+    // `forceWaiting` does for us) and return 'waiting' for this tick.
+    if (elapsedMeaningful > PTY_QUIET_FOR_PATTERN_MS) {
       const tail = this.getOutputRingTail(agent.id);
       if (tail) {
         const stripped = stripAnsi(tail);
@@ -360,7 +374,18 @@ export class StatusMonitor extends EventEmitter {
       }
     }
 
-    if (elapsed < WORKING_THRESHOLD_MS) return 'working';
+    // BUG-09 §3.5 — dual PTY signal logic:
+    //   - Promote `idle → working` only when the meaningful-burst signal is
+    //     fresh (current rule, preserved).
+    //   - Keep an already-working agent alive while the raw PTY signal is
+    //     fresh, even if meaningful is stale. This is how spinner-only TUI
+    //     phases (`Coalescing…`, `Reading…`) avoid the false-idle flip:
+    //     spinner glyph redraws advance `lastRawOutputTime` but rarely
+    //     accumulate to the 200-byte/3 s gate that promotes meaningful.
+    if (elapsedMeaningful < WORKING_THRESHOLD_MS) return 'working';
+    if (agent.status === 'working' && elapsedRaw < WORKING_THRESHOLD_MS) {
+      return 'working';
+    }
     return 'idle';
   }
 }
