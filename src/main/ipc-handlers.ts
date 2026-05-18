@@ -44,6 +44,7 @@ export function registerIpcHandlers(supervisor: AgentSupervisor, mainWindow: Bro
   ipcMain.handle('agent:stop', (_e, id) => supervisor.stopAgent(id));
   ipcMain.handle('agent:restart', (_e, id) => supervisor.restartAgent(id));
   ipcMain.handle('agent:get-log', (_e, id, lines) => supervisor.getAgentLog(id, lines));
+  ipcMain.handle('agent:get-ring-buffer', (_e, id) => supervisor.getAgentRingBuffer(id));
   ipcMain.handle('agent:get', (_e, id) => getAgent(id));
   ipcMain.handle('agent:get-file-activities', (_e, agentId, operation) => getFileActivities(agentId, operation));
   ipcMain.handle('agent:delete', (_e, id) => supervisor.deleteAgent(id));

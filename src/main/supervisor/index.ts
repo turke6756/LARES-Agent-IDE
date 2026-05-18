@@ -1792,6 +1792,54 @@ export class AgentSupervisor extends EventEmitter {
     updateAgentAttached(agentId, false);
   }
 
+  /**
+   * BUG-15: return the entire PTY ring buffer for an agent. The terminal
+   * viewer calls this on mount to paint scrollback. For live agents it pulls
+   * from the runner's in-memory ring; for `done` agents it falls back to the
+   * `.scrollback` file the runner wrote on exit.
+   *
+   * Distinct from `getAgentLog` which targets MCP / chat consumers — that
+   * path reads the raw `.log` file for big history requests, but the raw log
+   * replays alt-screen toggles and ends up visually empty in xterm for
+   * exited agents. The ring buffer is the same raw bytes, but bounded so we
+   * can persist a useful snapshot.
+   */
+  async getAgentRingBuffer(agentId: string): Promise<string> {
+    const winRunner = this.windowsRunners.get(agentId);
+    if (winRunner) return winRunner.getFullRing();
+    const wslRunner = this.wslRunners.get(agentId);
+    if (wslRunner) return wslRunner.getFullRing();
+
+    // Runner is gone (agent stopped / done). Fall back to the persisted
+    // scrollback file. The runner writes this on its exit handler / kill().
+    const agent = getAgent(agentId);
+    if (agent?.logPath) {
+      const scrollbackPath = `${agent.logPath}.scrollback`;
+      if (fs.existsSync(scrollbackPath)) {
+        try {
+          return fs.readFileSync(scrollbackPath, 'utf-8');
+        } catch (err) {
+          console.error(`[getAgentRingBuffer] Failed to read scrollback for ${agentId}:`, err);
+        }
+      }
+      // Last-resort: tail of the raw log file. Same content the old
+      // TerminalPanel path used — alt-screen quirks and all — but at least
+      // shows *something* for pre-BUG-15 agents that have no .scrollback yet.
+      if (fs.existsSync(agent.logPath)) {
+        try {
+          const content = fs.readFileSync(agent.logPath, 'utf-8');
+          if (content.length > 1_000_000) {
+            return content.slice(content.length - 1_000_000);
+          }
+          return content;
+        } catch (err) {
+          console.error(`[getAgentRingBuffer] Failed to read log for ${agentId}:`, err);
+        }
+      }
+    }
+    return '';
+  }
+
   async getAgentLog(agentId: string, lines = 50): Promise<string> {
     const agent = getAgent(agentId);
     if (!agent) return '';

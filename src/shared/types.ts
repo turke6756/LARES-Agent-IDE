@@ -362,6 +362,7 @@ export interface IpcApi {
     stop: (id: string) => Promise<void>;
     restart: (id: string) => Promise<void>;
     getLog: (id: string, lines?: number) => Promise<string>;
+    getRingBuffer: (id: string) => Promise<string>;
     delete: (id: string) => Promise<void>;
     checkAgentMd: (workingDirectory: string, pathType: PathType) => Promise<{ found: boolean; fileName: string | null }>;
     getFileActivities: (agentId: string, operation?: FileOperation) => Promise<FileActivity[]>;

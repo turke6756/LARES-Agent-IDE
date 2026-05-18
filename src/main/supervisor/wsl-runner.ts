@@ -33,8 +33,13 @@ export class WslRunner extends EventEmitter {
   // one for chat-history use; the WSL path historically pulled tail bytes via
   // a `tmuxCapturePane` subprocess. We mirror the Windows shape so the
   // detector can poll the tail in-process without a per-tick exec.
+  // BUG-15: also serves as the terminal viewer's scrollback source; bumped
+  // from 500 lines to 10000 / 1MB so the snapshot is useful.
   private outputRing: string[] = [];
-  private static readonly MAX_RING_LINES = 500;
+  private outputRingBytes: number = 0;
+  private static readonly MAX_RING_LINES = 10000;
+  private static readonly MAX_RING_BYTES = 1_000_000;
+  private _logPath: string | null = null;
 
   constructor(sessionName: string) {
     super();
@@ -91,7 +96,10 @@ export class WslRunner extends EventEmitter {
 
     const logDir = path.dirname(logPath);
     if (logPath && !fs.existsSync(logDir)) fs.mkdirSync(logDir, { recursive: true });
-    if (logPath) this.logStream = fs.createWriteStream(logPath, { flags: 'a' });
+    if (logPath) {
+      this.logStream = fs.createWriteStream(logPath, { flags: 'a' });
+      this._logPath = logPath;
+    }
 
     const ptyHostPath = getScriptPath('pty-host.js');
 
@@ -130,6 +138,7 @@ export class WslRunner extends EventEmitter {
         this._alive = false;
         this.logStream?.end();
         this.logStream = null;
+        this.persistScrollback();
         const reportedCode = this._intentionalKill ? 0 : ((code ?? 1) || 137);
         this.emit('exit', reportedCode, null);
       }
@@ -190,8 +199,16 @@ export class WslRunner extends EventEmitter {
           } else {
             this.outputRing.push(...newLines);
           }
-          if (this.outputRing.length > WslRunner.MAX_RING_LINES) {
-            this.outputRing.splice(0, this.outputRing.length - WslRunner.MAX_RING_LINES);
+          this.outputRingBytes += msg.data.length;
+          // BUG-15: trim by line cap AND byte cap; tighter cap wins.
+          while (
+            this.outputRing.length > WslRunner.MAX_RING_LINES ||
+            this.outputRingBytes > WslRunner.MAX_RING_BYTES
+          ) {
+            const dropped = this.outputRing.shift();
+            if (dropped === undefined) break;
+            this.outputRingBytes -= dropped.length + 1;
+            if (this.outputRingBytes < 0) this.outputRingBytes = 0;
           }
         }
         this.emit('data', msg.data);
@@ -207,6 +224,7 @@ export class WslRunner extends EventEmitter {
         this._alive = false;
         this.logStream?.end();
         this.logStream = null;
+        this.persistScrollback();
         {
           const reportedCode = this._intentionalKill ? 0 : ((msg.exitCode ?? 1) || 137);
           this.emit('exit', reportedCode, msg.signal);
@@ -258,6 +276,23 @@ export class WslRunner extends EventEmitter {
     return joined.slice(joined.length - maxBytes);
   }
 
+  /** BUG-15: return the entire ring buffer as a single string. Mirrors
+   *  WindowsRunner.getFullRing — used by the terminal viewer's snapshot IPC. */
+  getFullRing(): string {
+    return this.outputRing.join('\n');
+  }
+
+  /** BUG-15: persist ring buffer to disk so the terminal viewer can recover
+   *  scrollback after the runner has exited. */
+  persistScrollback(): void {
+    if (!this._logPath) return;
+    try {
+      fs.writeFileSync(`${this._logPath}.scrollback`, this.outputRing.join('\n'));
+    } catch {
+      // ignore — runner is shutting down
+    }
+  }
+
   /**
    * attach() is now a no-op for initial data flow (PTY runs from launch).
    * It exists so attachAgent() in the supervisor still works — the caller
@@ -300,6 +335,9 @@ export class WslRunner extends EventEmitter {
   async kill(): Promise<void> {
     this._intentionalKill = true;
     this._alive = false;
+    // BUG-15: persist ring buffer eagerly so a force-kill that bypasses the
+    // pty-host exit handler still leaves a scrollback file for the viewer.
+    this.persistScrollback();
 
     // Graceful shutdown attempt: try to save session state
     if (await isTmuxSessionAlive(this.sessionName)) {

@@ -15,6 +15,7 @@ const api: IpcApi = {
     stop: (id) => ipcRenderer.invoke('agent:stop', id),
     restart: (id) => ipcRenderer.invoke('agent:restart', id),
     getLog: (id, lines) => ipcRenderer.invoke('agent:get-log', id, lines),
+    getRingBuffer: (id) => ipcRenderer.invoke('agent:get-ring-buffer', id),
     delete: (id) => ipcRenderer.invoke('agent:delete', id),
     checkAgentMd: (workingDirectory, pathType) => ipcRenderer.invoke('agent:check-agent-md', workingDirectory, pathType),
     getFileActivities: (agentId, operation) => ipcRenderer.invoke('agent:get-file-activities', agentId, operation),

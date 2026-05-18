@@ -24,9 +24,14 @@ export class WindowsRunner extends EventEmitter {
   private _alive: boolean = false;
   private _intentionalKill: boolean = false;
   private buffer: string = '';
-  // In-memory ring buffer for instant log retrieval (avoids fs.createWriteStream flush delays)
+  // In-memory ring buffer for instant log retrieval (avoids fs.createWriteStream flush delays).
+  // BUG-15: bumped from 500 lines to 10000 / 1MB so the terminal viewer can paint a useful
+  // scrollback snapshot on mount. Both caps apply — the tighter one wins.
   private outputRing: string[] = [];
-  private static readonly MAX_RING_LINES = 500;
+  private outputRingBytes: number = 0;
+  private static readonly MAX_RING_LINES = 10000;
+  private static readonly MAX_RING_BYTES = 1_000_000;
+  private _logPath: string | null = null;
   private _dataCount: number = 0;
   private _totalBytes: number = 0;
 
@@ -48,6 +53,7 @@ export class WindowsRunner extends EventEmitter {
     if (!fs.existsSync(logDir)) fs.mkdirSync(logDir, { recursive: true });
 
     this.logStream = fs.createWriteStream(logPath, { flags: 'a' });
+    this._logPath = logPath;
 
     // Find the pty-host script
     const ptyHostPath = getScriptPath('pty-host.js');
@@ -88,6 +94,7 @@ export class WindowsRunner extends EventEmitter {
         this._alive = false;
         this.logStream?.end();
         this.logStream = null;
+        this.persistScrollback();
         const reportedCode = this._intentionalKill ? 0 : 137;
         this.emit('exit', reportedCode, null);
       }
@@ -147,9 +154,16 @@ export class WindowsRunner extends EventEmitter {
         } else {
           this.outputRing.push(...newLines);
         }
-        // Trim ring buffer
-        if (this.outputRing.length > WindowsRunner.MAX_RING_LINES) {
-          this.outputRing.splice(0, this.outputRing.length - WindowsRunner.MAX_RING_LINES);
+        this.outputRingBytes += msg.data.length;
+        // Trim ring buffer to BOTH line and byte caps; tighter cap wins.
+        while (
+          this.outputRing.length > WindowsRunner.MAX_RING_LINES ||
+          this.outputRingBytes > WindowsRunner.MAX_RING_BYTES
+        ) {
+          const dropped = this.outputRing.shift();
+          if (dropped === undefined) break;
+          this.outputRingBytes -= dropped.length + 1; // +1 for the join newline
+          if (this.outputRingBytes < 0) this.outputRingBytes = 0;
         }
         this.emit('data', msg.data);
         break;
@@ -163,6 +177,7 @@ export class WindowsRunner extends EventEmitter {
         this._alive = false;
         this.logStream?.end();
         this.logStream = null;
+        this.persistScrollback();
         {
           const reportedCode = this._intentionalKill ? 0 : ((msg.exitCode ?? 1) || 137);
           this.emit('exit', reportedCode, msg.signal);
@@ -206,6 +221,25 @@ export class WindowsRunner extends EventEmitter {
     return joined.slice(joined.length - maxBytes);
   }
 
+  /** BUG-15: return the entire ring buffer as a single string. The terminal
+   *  viewer calls this on mount via the `getRingBuffer` IPC to paint the
+   *  initial scrollback before subscribing to live data. */
+  getFullRing(): string {
+    return this.outputRing.join('\n');
+  }
+
+  /** BUG-15: write the current ring contents to disk so the terminal viewer
+   *  can recover scrollback after the runner has exited. Best-effort — any
+   *  error is swallowed (the agent is being torn down anyway). */
+  persistScrollback(): void {
+    if (!this._logPath) return;
+    try {
+      fs.writeFileSync(`${this._logPath}.scrollback`, this.outputRing.join('\n'));
+    } catch {
+      // ignore — runner is shutting down
+    }
+  }
+
   /** Return the last N lines from the in-memory ring buffer (instant, no disk I/O). */
   captureOutput(lines = 50): string {
     // If ring buffer is empty, fall back to log file for initial data
@@ -242,6 +276,10 @@ export class WindowsRunner extends EventEmitter {
   kill(): void {
     this._intentionalKill = true;
     this._alive = false;
+    // BUG-15: persist scrollback eagerly. The pty-host's exit handler also
+    // calls persistScrollback, but kill() may force-terminate the host before
+    // that handler runs — write here so we never lose the snapshot.
+    this.persistScrollback();
     this.sendToHost({ type: 'kill' });
     setTimeout(() => {
       if (this.host && !this.host.killed) {
