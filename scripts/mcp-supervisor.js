@@ -297,6 +297,31 @@ function getToolDefinitions() {
       },
     },
     {
+      name: 'read_agent_files_touched',
+      description:
+        'List files an agent has read, written, or created — paths only, not contents. This is the same data that powers the Context and Outputs tabs in the dashboard. ' +
+        'Use this before launching a follow-up worker to check whether a previous agent has already touched a file you were about to ask the new agent to read. ' +
+        'Far cheaper than read_agent_chat for that question. ' +
+        'Paths are recorded as the tool received them (mix of absolute and workspace-relative, mix of slash and backslash), so the same logical file can appear under multiple strings — the caller does any normalization.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          agent_id: { type: 'string', description: 'The agent ID.' },
+          operation: {
+            type: 'string',
+            enum: ['read', 'write', 'create'],
+            description: 'Filter to one operation. Omit to get all three.',
+          },
+          limit: { type: 'number', description: 'Max rows, newest first (default 200).' },
+          unique: {
+            type: 'boolean',
+            description: 'When true, dedup by (filePath, operation) and add a `count` field. Matches how the dashboard tab groups rows. Default false.',
+          },
+        },
+        required: ['agent_id'],
+      },
+    },
+    {
       name: 'stop_agent',
       description: 'Stop a running agent. Use with caution.',
       inputSchema: {
@@ -635,6 +660,27 @@ async function handleToolCall(name, args) {
       if (q.length) p += '?' + q.join('&');
       const result = await apiRequest('GET', p);
       return { content: [{ type: 'text', text: JSON.stringify(result.messages, null, 2) }] };
+    }
+
+    case 'read_agent_files_touched': {
+      let p = `/api/agents/${args.agent_id}/file-activities`;
+      const q = [];
+      if (args.operation) q.push(`operation=${args.operation}`);
+      if (args.limit) q.push(`limit=${args.limit}`);
+      if (q.length) p += '?' + q.join('&');
+      const result = await apiRequest('GET', p);
+      let rows = result.activities || [];
+      if (args.unique) {
+        const seen = new Map();
+        for (const r of rows) {
+          const key = `${r.filePath}|${r.operation}`;
+          const prev = seen.get(key);
+          if (prev) prev.count++;
+          else seen.set(key, { ...r, count: 1 });
+        }
+        rows = Array.from(seen.values());
+      }
+      return { content: [{ type: 'text', text: JSON.stringify(rows, null, 2) }] };
     }
 
     case 'stop_agent': {

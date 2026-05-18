@@ -3,6 +3,7 @@ import { URL } from 'url';
 import type { AgentSupervisor } from './supervisor';
 import {
   getAgent, getAllAgents, getAgentsByWorkspace, getWorkspace,
+  getFileActivities,
   createTeam, getTeam, listTeams, updateTeamStatus, saveTeamManifest, getTeamManifest,
   addTeamMember, removeTeamMember, getTeamMembers,
   createChannel, removeChannel, getChannel, listChannels,
@@ -154,6 +155,19 @@ export class ApiServer {
       const role = url.searchParams.get('role') as 'assistant' | 'user' | undefined;
       const messages = await this.supervisor.getChatService().getMessages(agentId, { limit, role });
       return { agentId, limit, messages };
+    }
+
+    // GET /api/agents/:id/file-activities — files the agent has read/written/created.
+    // Powers the Context and Outputs dashboard tabs; exposed to MCP so the
+    // supervisor can answer "has this agent already touched file X?" cheaply.
+    const filesMatch = path.match(/^\/api\/agents\/([^/]+)\/file-activities$/);
+    if (method === 'GET' && filesMatch) {
+      const agentId = filesMatch[1];
+      const op = url.searchParams.get('operation');
+      const operation = op === 'read' || op === 'write' || op === 'create' ? op : undefined;
+      const limit = parseInt(url.searchParams.get('limit') || '200', 10);
+      const activities = getFileActivities(agentId, operation).slice(0, limit);
+      return { agentId, operation: operation || null, activities };
     }
 
     // POST /api/agents/:id/input — queue a message for delivery and return.
