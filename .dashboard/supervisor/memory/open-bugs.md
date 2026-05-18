@@ -18,134 +18,100 @@ Format per bug:
 
 ---
 
-## BUG-01: `launch_agent` does not auto-submit its initial `prompt`
+## BUG-09: agent.status cycles working↔idle within a single user turn
 
-- Component: dashboard MCP / launch_agent
-- Severity: medium (causes every supervised launch to need a second tool call)
-- Status: open
-- Gotcha ref: groupthink-running-gotchas.md §1
-- Fix sketch: after writing the prompt into the agent's input buffer, send a
-  provider-appropriate Enter (CR for Claude, kitty-encoded for Codex/Gemini)
-  unless an explicit `submit: false` flag is passed. Document the flag in the
-  tool description.
+- Component: src/main/supervisor/status-monitor.ts + EventBridge
+- Severity: medium (observability noise; cosmetic at agent scale, confusing
+  at supervisor scale; can mask real "task done" idles)
+- Status: open — needs investigation
+- Gotcha ref: groupthink-running-gotchas.md §12
+- Surfaced: 2026-05-17 during the 7-bug fix sweep (commit f4e1a58)
+- Fix sketch: With M2A's `IDLE_LATCH_TIMEOUT_MS = 30 min` and a
+  `turnComplete` chat event latching idle, the latch should hold for 30 min
+  unless a real new `task_started` event arrives. In practice, worker
+  agents cycled working↔idle multiple times per task within
+  seconds-to-minutes — bug-06-fix idled at 8 turns then continued to 35
+  turns; bug-01-fix idled mid-thinking; "events while you were busy"
+  bursts kept arriving. Initially mis-attributed to "running on
+  pre-hardening" — verified by checking Electron process start time
+  (2026-05-17 15:56) vs M4 commit time (2026-05-16 16:41) and confirming
+  `dist/main/main/supervisor/status-monitor.js` contains the M2A turnLatch
+  logic (12 references to `turnLatch` / `forceIdle` / `forceWaiting` /
+  `IDLE_LATCH_TIMEOUT_MS`). The running app DOES have M2A, so this is
+  post-hardening behavior.
 
----
+  Two possible root causes — investigation needed:
 
-## BUG-02: `send_keys_to_agent` JSON `\r` escape is flaky at the tool boundary
+  - **(A) Definitional mismatch.** `EventBridge.onChatEvents` may emit
+    `turnComplete` on each assistant-message-with-tool-result boundary,
+    not just "agent has nothing else to do". If so, the M2A latch is
+    doing exactly what it's coded to do, but the supervisor protocol
+    (and the dashboard UI) reads idle as "task done", which it shouldn't.
+    Fix is semantic: either gate the latch on terminal turn-end only,
+    or redefine the supervisor's idle interpretation, or both.
+  - **(B) Latch leak.** `IDLE_LATCH_TIMEOUT_MS = 30 min` should suppress
+    re-latching working from Pipeline A or any non-chat source for 30
+    min, but the cycling suggests something is clearing or bypassing
+    the latch. Audit `forceWorking()` callers and verify no path resets
+    the latch before the timeout expires.
 
-- Component: dashboard MCP / send_keys_to_agent (tool param handling)
-- Severity: medium (every Enter submission is a coin flip; supervisor often
-  needs 2-3 retries with different encodings)
-- Status: open
-- Gotcha ref: groupthink-running-gotchas.md §2
-- Fix sketch: the tool description claims JS-style escapes (`\r`, `\x1b`,
-  `\n`) are interpreted by the JSON parser, but in practice they're often
-  delivered as literal multi-byte text. Audit the param-decoding path so
-  the documented behavior is reliable, OR change the doc to require
-  literal control bytes (which works) and remove the misleading escape
-  claim. Better: add a `key: 'enter' | 'esc' | 'tab' | ...` enum
-  parameter that the tool translates internally per provider.
-
----
-
-## BUG-03: GroupThink per-turn timeout hardcoded to 10 min
-
-- Component: scripts/groupthink-v1.js (`waitTurnComplete`)
-- Severity: low-medium (causes false-stall on slow reviewers; recoverable
-  via resume but burns supervisor time)
-- Status: open
-- Gotcha ref: groupthink-running-gotchas.md §4
-- Fix sketch: expose `--turn-timeout-ms` (default 10 min) so callers can
-  bump it for complex deliberations. Or, better, have `waitTurnComplete`
-  also consult ground-truth signals (agent.status, fresh PTY activity,
-  message ring) before declaring stall — i.e. don't time out while the
-  agent is demonstrably still working. The latter dovetails with the
-  agent-lifecycle-hardening plan.
-
----
-
-## BUG-04: Codex `resumeSessionId` discovery is unreliable (10s poll often misses)
-
-- Component: dashboard / supervisor `discoverNewCodexSession`
-- Severity: medium (breaks resume/fork/query for affected agents until
-  manually recovered)
-- Status: open
-- Gotcha ref: groupthink-running-gotchas.md §5
-- Fix sketch: `recoverCodexResumeSessionId` (`src/main/supervisor/index.ts:1129`)
-  exists but isn't auto-called when discovery fails. Either extend the
-  poll window beyond 10s, or call the recovery function as a fallback
-  the first time any operation needs `resumeSessionId` and finds it null.
-
----
-
-## BUG-05: Pipeline A status flapping — `working`→`idle` clusters
-
-- Component: src/main/supervisor/status-monitor.ts (Pipeline A heuristic)
-- Severity: high (root cause of supervisor decision errors; surfaced
-  during this very session as 3-flap events on P0-00 and P0-01 worker
-  agents, and as the misread that drove the codex panic-spawn)
-- Status: **in-progress via `plans/agent-lifecycle-hardening-plan.md`**
-  (M2A — P1A-01 through P1A-04). Will be fully fixed when M2A lands.
-- Gotcha ref: groupthink-running-gotchas.md §7
-- Fix sketch: see the plan. Pipeline B (`turnComplete: true` from chat
-  events) is wired into `agent.status` with a per-agent turn-latch so
-  PTY noise cannot oscillate the state. Crash routing through the
-  bridge is M2B.
-
----
-
-## BUG-06: GroupThink resume re-pastes existing turn-complete messages
-
-- Component: scripts/groupthink-v1.js (resume branch / `lastRelayedTs`
-  initialization)
-- Severity: high when triggered (burned the entire Reviewer context
-  window on 2026-05-15)
-- Status: open
-- Gotcha ref: groupthink-running-gotchas.md §9
-- Fix sketch: in the resume branch, after fetching each planner's agent
-  record, also fetch its chat (one message back is enough), find the
-  latest `turnComplete: true` message, and seed
-  `lastRelayedTs[agentId]` with its timestamp. Add a smoke test that
-  resumes against two agents whose chats already contain turn-complete
-  messages and asserts zero `sendInput` calls fire on Turn 1.
-
----
-
-## BUG-07: `read_agent_chat` with `role` filter returns stale data on resumed codex sessions
-
-- Component: dashboard MCP / chat reader (role-filtered query path)
-- Severity: medium-high (caused the panic-spawn cycle on 2026-05-16 —
-  three reviewer agents created when one had already succeeded)
-- Status: open
-- Gotcha ref: groupthink-running-gotchas.md §10
-- Fix sketch: investigate whether the `role` filter hits a different
-  code path than the unfiltered query (likely) and whether that path
-  picks up newly-committed turns from the on-disk codex session log
-  without lag. The unfiltered query path apparently does. Either align
-  the filtered path with the unfiltered one, or document the lag
-  contract and have the role filter return a "stale-as-of" timestamp
-  the caller can compare against.
-
----
-
-## BUG-08: Codex agent fresh-launches inherit saturated prior session
-
-- Component: dashboard MCP / launch_agent (codex provider)
-- Severity: medium (blocks cross-provider review patterns and any other
-  case that wants a fresh codex context in a workspace that has had
-  prior codex work)
-- Status: open
-- Gotcha ref: groupthink-running-gotchas.md §11
-- Fix sketch: add a `resume: false` (or `freshSession: true`) parameter
-  to `launch_agent`. When set, skip the resume-session discovery for
-  this launch and start codex with a brand-new session. Default behavior
-  unchanged for back-compat.
+  Recommended approach: instrument StatusMonitor with a debug log on
+  every latch set/clear, run a multi-agent session, classify each
+  transition by trigger (chat event kind, Pipeline A heuristic, manual
+  force). That tells you which root cause it is in <30 minutes of
+  observation.
 
 ---
 
 # Closed bugs (kept as history; delete entries here whenever you like)
 
+- **2026-05-17** BUG-08: Codex `launch_agent` inherited the saturated prior
+  workspace session. Added `freshSession?: boolean` to `LaunchAgentInput`
+  (`fresh_session` in MCP schema). Pure helper `shouldDiscoverCodexSession()`
+  gates discovery. +4 tests. Commit f4e1a58. Gotcha §11.
+
+- **2026-05-17** BUG-07: `read_agent_chat` could return stale data on
+  resumed codex sessions. Root cause was NOT the role filter but
+  `pollNow()` in `SessionLogDispatcher` being rate-limited to 5s per agent.
+  `pollNow(agentId?)` now bypasses the `nextPollAt` gate and supports
+  targeted single-agent polling. +2 dispatcher tests. Commit f4e1a58.
+  Gotcha §10.
+
+- **2026-05-17** BUG-06: GroupThink resume re-pasted existing turn-complete
+  messages because `lastRelayedTs` initialized to 0. Added
+  `seedLastRelayedTsFromChat()` to seed it from each planner's latest
+  `turnComplete:true` message on resume. +new resume-no-replay.test.js.
+  Commit f4e1a58. Gotcha §9.
+
+- **2026-05-17** BUG-04: `discoverNewCodexSession`'s 10s post-launch poll
+  often missed codex's `session_meta` flush. Generalized two existing
+  inline fallback blocks (index.ts:930-942 / 1124-1136 from M2A commit
+  17555fc) into `ensureCodexResumeSessionId()` helper + private
+  `resolveCodexResumeSessionId(agent)` method. +4 tests. Commit f4e1a58.
+  Gotcha §5.
+
+- **2026-05-17** BUG-03: GroupThink `waitTurnComplete` had a 10-min
+  hardcoded timeout. Exposed `--turn-timeout-ms` (default 600000ms) and
+  made the stall clock reset while `agent.status === 'working'`. +new
+  turn-timeout.test.js. Commit f4e1a58. Gotcha §4.
+
+- **2026-05-17** BUG-02: `send_keys_to_agent` JSON `\r` escape decoding
+  was flaky. Added `key` enum (`enter`, `shift-enter`, `esc`, `tab`,
+  arrow keys, `backspace`, `ctrl-c`, `ctrl-d`, `space`) with
+  provider+host-aware byte mapping via new `key-bytes.ts`. Raw `keys`
+  kept as fallback. +20 tests. Commit f4e1a58. Gotcha §2.
+
+- **2026-05-17** BUG-01: `launch_agent` didn't auto-submit its initial
+  prompt. Added `submit` parameter (default true) with
+  provider+host-aware Enter byte sequence via new `send-input-encoders.ts`.
+  +12 encoder tests. Commit f4e1a58. Gotcha §1.
+
+- **2026-05-16** BUG-05: Pipeline A status flapping (working→idle
+  clusters). Fixed by agent-lifecycle hardening M2A — `StatusMonitor`
+  turnLatch + Pipeline B chat-event-driven status. Commit 17555fc.
+  Gotcha §7. (Note: a related but distinct cycling pattern surfaced
+  2026-05-17 — see BUG-09 above.)
+
 - **2026-05-15** BUG-X: `scripts/groupthink-v1.js` `parseArgs` `split('=')`
   truncated topics containing `=`. Fixed at lines 44-47 by replacing
-  destructured `split('=')` with `indexOf('=')` + `slice`. Gotcha ref:
-  groupthink-running-gotchas.md §3.
+  destructured `split('=')` with `indexOf('=')` + `slice`. Gotcha §3.

@@ -5,6 +5,9 @@ Things that bit me; future-supervisor should know.
 
 ## 1. `launch_agent`'s initial prompt sits un-submitted
 
+(FIXED 2026-05-17, commit f4e1a58 — see BUG-01. `launch_agent` now sends
+provider+host-aware Enter after the prompt unless `submit: false` is passed.)
+
 `mcp__agent-dashboard__launch_agent` writes the prompt into the agent's input
 buffer but does **not** press Enter. The agent shows the prompt text on screen,
 status flaps `working`→`idle` a few times from launch redraws, but no model
@@ -21,6 +24,10 @@ mcp__agent-dashboard__send_keys_to_agent({
 ```
 
 ## 2. `send_keys_to_agent` JSON-escape encoding is flaky for `\r`
+
+(FIXED 2026-05-17, commit f4e1a58 — see BUG-02. The tool now accepts a
+`key` enum with provider+host-aware byte mapping. Raw `keys` kept as
+fallback.)
 
 Sending `"keys": "\r"` once came back as **"Sent 2 byte(s)"** with the literal
 backslash-r appearing in the agent's input buffer. Sending the same call again
@@ -49,6 +56,10 @@ use `indexOf`, not `split('=')`.
 
 ## 4. GroupThink's per-turn timeout is **10 minutes hardcoded**
 
+(FIXED 2026-05-17, commit f4e1a58 — see BUG-03. `--turn-timeout-ms` CLI
+flag (default 600000ms) is now exposed, and `waitTurnComplete` resets the
+stall clock while `agent.status === 'working'`.)
+
 `waitTurnComplete` gives each turn 10 min to produce a `turnComplete: true`
 event. After that the script emits `orchestration.groupthink.stalled` even if
 the agent is still actively producing output.
@@ -70,6 +81,11 @@ signals (agent.status, fresh PTY activity, message ring buffer). Worth
 mentioning to planners on relevant topics.
 
 ## 5. Codex `resumeSessionId` discovery is unreliable
+
+(FIXED 2026-05-17, commit f4e1a58 — see BUG-04. Two existing inline
+fallback blocks (M2A commit 17555fc) are now generalized into
+`ensureCodexResumeSessionId()` + `resolveCodexResumeSessionId(agent)`. When
+any op needs the sid and finds it null, recovery fires automatically.)
 
 The dashboard runs a 10-second `discoverNewCodexSession` poll after launching
 a Codex agent. If Codex doesn't flush `session_meta` in time (which is common),
@@ -111,6 +127,11 @@ or switch the Lead provider to Codex/Gemini.
 
 ## 7. Agent status `working`→`idle` flaps under the Pipeline-A heuristic
 
+(FIXED 2026-05-16, commit 17555fc — see BUG-05. Agent-lifecycle hardening
+M2A added `StatusMonitor.turnLatch` Map and Pipeline B chat-event-driven
+status so PTY-noise heuristics can no longer oscillate the state. A
+distinct cycling pattern surfaced 2026-05-17 — see BUG-09.)
+
 Live confirmation of the bug under investigation. A short worker fix
 (reading one file + applying one Edit) produced **3** `working`→`idle`
 events. These show up as triple-event `[DASHBOARD EVENT]` blocks in the
@@ -145,7 +166,12 @@ cd /c/Users/turke/Projects/AgentDashboard && \
     > "$LOG" 2>&1 &
 ```
 
-## 9. GroupThink resume re-pastes existing turn-complete messages (UNFIXED)
+## 9. GroupThink resume re-pastes existing turn-complete messages
+
+(FIXED 2026-05-17, commit f4e1a58 — see BUG-06. Added
+`seedLastRelayedTsFromChat()` to seed `lastRelayedTs[agentId]` from each
+planner's latest `turnComplete:true` chat message on resume. Smoke test
+at `scripts/groupthink-v1.resume-no-replay.test.js`.)
 
 **The bug.** `scripts/groupthink-v1.js`'s relay loop maintains a
 `lastRelayedTs[agentId]` map to know which turn-complete messages have
@@ -197,6 +223,14 @@ orchestrations alongside the event-bridge work.
 
 ## 10. `read_agent_chat` with `role` filter can return stale data on resumed codex sessions
 
+(FIXED 2026-05-17, commit f4e1a58 — see BUG-07. Root cause was NOT the
+role filter (red herring) but `SessionLogDispatcher.pollNow()` being
+rate-limited to 5s per agent — supervisor MCP calls don't subscribe, so
+freshly-polled state could be up to 5s stale. `pollNow(agentId?)` now
+bypasses the `nextPollAt` gate and supports targeted single-agent polling.
+The "operational takeaway" below — cross-check with an unfiltered query —
+is no longer necessary post-fix, but remains useful general advice.)
+
 Observed 2026-05-16 running a one-shot codex pre-review of P0-02:
 
 1. Launched codex agent, sent prompt via `send_message_to_agent`.
@@ -231,6 +265,11 @@ actually responded.
 
 ## 11. Codex resume-session discovery is broader than gotcha #5 suggested
 
+(FIXED 2026-05-17, commit f4e1a58 — see BUG-08. `launch_agent` now accepts
+`fresh_session: true` (in MCP schema) / `freshSession: true` (in
+`LaunchAgentInput`) to skip post-launch session discovery for codex. Pure
+helper `shouldDiscoverCodexSession()` gates the discovery call.)
+
 Same 2026-05-16 incident. After stopping the first codex agent, I called
 `launch_agent({ provider: 'codex', ... })` for a fresh session. The new
 agent immediately showed:
@@ -251,3 +290,44 @@ fresh-context codex from supervisor MCP today.
 - File a feature request on the dashboard to add `resume: false` to
   `launch_agent` arguments. This would be a small addition and would
   unlock cross-provider review patterns without the panic-spawn cycle.
+
+## 12. agent.status cycles working↔idle within a single user turn (post-hardening)
+
+Observed 2026-05-17 during the 7-bug fix sweep. With 5+ supervised worker
+agents running in parallel, the supervisor received many "events while
+you were busy" notifications that each listed `working → idle` transitions
+for agents that were demonstrably still working on their first user prompt
+(no new user messages had been sent). Examples:
+
+- `bug-06-fix` idled at 8 turns then continued working to 35 turns to
+  finish smoke-testing and post its patch summary.
+- `bug-01-fix` idled while the terminal still showed "Osmosing… thinking".
+- Multiple flap events fired during the same task with no intervening
+  user input.
+
+Initially mis-attributed to "running on pre-hardening" — but verified
+otherwise:
+
+- Electron process started 2026-05-17 15:56 PDT.
+- Latest hardening commit (M4, `4093521`): 2026-05-16 16:41 PDT — ~23 h
+  earlier.
+- `dist/main/main/supervisor/status-monitor.js` contains the M2A
+  `turnLatch` logic (12 references to `turnLatch` / `forceIdle` /
+  `forceWaiting` / `IDLE_LATCH_TIMEOUT_MS` / `WAITING_LATCH_TIMEOUT_MS`).
+
+So the running app DOES have M2A. The cycling is post-hardening behavior.
+Two possible root causes — see BUG-09 for the investigation entry:
+
+- **(A) Definitional mismatch.** `EventBridge.onChatEvents` may emit
+  `turnComplete` on every assistant-message-with-tool-result boundary,
+  not just "agent has nothing else to do". If so, the latch is doing
+  exactly what it's coded to do — but supervisor and UI interpret idle
+  as "task done", which it isn't yet.
+- **(B) Latch leak.** `IDLE_LATCH_TIMEOUT_MS = 30 min` should suppress
+  re-latching working from any non-chat source for 30 min, but something
+  is clearing or bypassing the latch.
+
+**Operational workaround until BUG-09 is fixed:** treat `working → idle`
+events with skepticism within an active multi-agent task. Read the agent
+log before concluding "done"; if the agent is still emitting tool calls
+or thinking spinners, the idle is likely intermediate.

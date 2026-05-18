@@ -8,14 +8,31 @@ Add entries as you learn important things about the agents, project, or decision
 -->
 
 - **[open-bugs.md](open-bugs.md)** — confirmed bugs to fix, then delete the
-  entry once fixed. 8 open (BUG-01..BUG-08) as of 2026-05-16. BUG-05
-  (status flapping) is in-progress via the agent-lifecycle-hardening plan.
-  When fixing a bug, also delete or mark its detail entry in
-  `groupthink-running-gotchas.md`.
+  entry once fixed. **1 open (BUG-09)** as of 2026-05-17. BUG-01..BUG-08
+  (excluding BUG-05) all fixed via commit f4e1a58 (7-bug sweep). BUG-05
+  fixed earlier via M2A (commit 17555fc). When fixing a bug, also delete
+  or mark its detail entry in `groupthink-running-gotchas.md`.
 - [groupthink-running-gotchas.md](groupthink-running-gotchas.md) — full
-  detailed notes on 11 gotchas (8 are bugs cross-referenced from
-  open-bugs.md; the others are operational lore like Claude quota walls
-  and the resume command shape). #1-9 from GroupThink 2026-05-15. #10-11
-  added 2026-05-16 from the codex-review panic-spawn incident.
+  detailed notes on 12 gotchas. 9 are bugs cross-referenced from
+  open-bugs.md (§1, §2, §4, §5, §7, §9, §10, §11 now marked FIXED;
+  §12 added 2026-05-17 for BUG-09); the others are operational lore
+  (§3 closed-bug history, §6 Claude quota walls, §8 resume command shape).
 - [docs/SESSION_2026-05-15_AGENT_LIFECYCLE_PLANNING.md](../../../docs/SESSION_2026-05-15_AGENT_LIFECYCLE_PLANNING.md) — master index for the agent-lifecycle planning session. Points at the produced plan, the three findings docs, the gotchas, the one source-tree fix shipped, and the bugs surfaced but not fixed. Read this first if returning to this work.
-- **Hardening plan progress (`plans/agent-lifecycle-hardening-plan.md`):** M0 (P0-00, P0-01) + M1 (P0-02, P0-03) + **M2A (P1A-01, P1A-02, P1A-03, P1A-04)** complete as of 2026-05-16. M2A landed via agent f2a22815: `StatusMonitor` got `turnLatch` Map + `forceIdle/forceWaiting/forceWorking`; `EventBridge.onChatEvents` dispatches per §2.1 table with narrow Gemini opt-out; Codex reader emits `AssistantTextPatchEvent` (split-batch retag) + `TaskStartedEvent`; dispatcher mutates ring in place with audit comment. New test files: `status-monitor.test.ts` (11 tests, BR-11/16/17/18) + extensions to `event-bridge.test.ts` (BR-19), `session-log-dispatcher.test.ts` (BR-12 half), `codex-rollout-reader.test.ts` (BR-12 half + task_started + regression). All 8 test files green. `IDLE_LATCH_TIMEOUT_MS` (30 min) + `WAITING_LATCH_TIMEOUT_MS` (5 min) in constants. **Codex stall / BUG-05 fixed.** **Next:** M2B (P1B-01..03 — crash routing through bridge + dead team_* event cleanup + attach-driven ignore window). Must land before multi-supervisor migration starts. M3 (waiting detection — P2-01..04) is independent and can ship in parallel with the migration.
+- **Hardening plan (`plans/agent-lifecycle-hardening-plan.md`): COMPLETE
+  through M4** as of 2026-05-16. M0..M4 all committed (17555fc → 4093521).
+  Codex stall / BUG-05 fixed. Pipeline B chat-event-driven status with
+  `IDLE_LATCH_TIMEOUT_MS = 30 min` is in production.
+- **7-bug fix sweep (commit f4e1a58)** — 2026-05-17. Fixed BUG-01
+  (`launch_agent` auto-submit + `submit` param), BUG-02 (`send_keys`
+  `key` enum), BUG-03 (groupthink `--turn-timeout-ms` + agent.status
+  awareness), BUG-04 (`ensureCodexResumeSessionId` helper), BUG-06
+  (groupthink resume `seedLastRelayedTsFromChat`), BUG-07 (pollNow
+  rate-limit bypass with optional agentId), BUG-08 (codex
+  `freshSession` flag). +1661 / −137 across 19 files. Combined tree
+  built clean and `test:supervisor` green before commit.
+- **BUG-09 open (2026-05-17):** agent.status cycles working↔idle within
+  a single user turn post-hardening. Verified the running app has M2A.
+  Two hypotheses: (A) definitional — Pipeline B emits turnComplete on
+  every tool-cycle boundary; (B) latch leak — `forceWorking` path is
+  clearing the latch before the 30-min timeout. Investigation entry in
+  open-bugs.md; symptoms in gotchas §12.
