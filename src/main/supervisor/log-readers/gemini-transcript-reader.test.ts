@@ -269,6 +269,136 @@ test('P2-01: endsWithQuestion is set per-turn from trimmed assistant content', (
   }
 });
 
+test('BUG-09 §3.9: turnComplete gates on allToolsResolved && usageLanded', () => {
+  const sessionId = 'b1c1aef0-aaaa-bbbb-cccc-dddd11112222';
+  const tmpPath = path.join(os.tmpdir(), `gemini-tc-${Date.now()}.jsonl`);
+  const header = JSON.stringify({
+    sessionId, projectHash: 'h', startTime: '2026-05-18T00:00:00.000Z', kind: 'main',
+  });
+
+  // Phase A: assistant content + a tool call WITHOUT a result, no tokens.
+  // Expectation: emit assistant-text with turnComplete=false (not done yet).
+  const phaseA = JSON.stringify({
+    id: 'turn-1',
+    timestamp: '2026-05-18T00:00:01.000Z',
+    type: 'gemini',
+    content: 'Reading the file now.',
+    model: 'gemini-3-flash-preview',
+    toolCalls: [
+      { id: 'tc-1', name: 'read_file', status: 'pending', args: { path: 'a.md' } },
+    ],
+  });
+  fs.writeFileSync(tmpPath, [header, phaseA].join('\n') + '\n');
+
+  const reader = makeReader(tmpPath);
+  const first = reader.pollSession(makeSession({ sessionId }));
+  const textsA = first.filter(e => e.type === 'assistant-text');
+  assert.equal(textsA.length, 1);
+  assert.ok(textsA[0].type === 'assistant-text');
+  assert.equal(textsA[0].turnComplete, false,
+    'BUG-09 §3.9: turnComplete=false until tools resolve + tokens land');
+
+  // Phase B: same turn rewritten — tool now has a result, but tokens still
+  // missing. Expectation: still NOT complete; no patch yet.
+  const phaseB = JSON.stringify({
+    id: 'turn-1',
+    timestamp: '2026-05-18T00:00:02.000Z',
+    type: 'gemini',
+    content: 'Reading the file now.',
+    model: 'gemini-3-flash-preview',
+    toolCalls: [
+      { id: 'tc-1', name: 'read_file', status: 'success', args: { path: 'a.md' }, result: 'contents' },
+    ],
+  });
+  fs.writeFileSync(tmpPath, [header, phaseB].join('\n') + '\n');
+  reader.invalidatePath('test-agent');
+  (reader as any).resolvedPaths.set('test-agent', tmpPath);
+  // Re-emit by simulating fresh agent — easier than mid-file diffing.
+  const reader2 = makeReader(tmpPath);
+  const second = reader2.pollSession(makeSession({ sessionId }));
+  const textsB = second.filter(e => e.type === 'assistant-text');
+  assert.equal(textsB.length, 1);
+  assert.ok(textsB[0].type === 'assistant-text');
+  assert.equal(textsB[0].turnComplete, false,
+    'tools resolved but no tokens yet → still incomplete');
+  const patchesB = second.filter(e => e.type === 'assistant-text-patch');
+  assert.equal(patchesB.length, 0, 'no patch when assistant-text already incomplete');
+
+  // Phase C: tokens land → turnComplete=true on a fresh emit.
+  const phaseC = JSON.stringify({
+    id: 'turn-1',
+    timestamp: '2026-05-18T00:00:03.000Z',
+    type: 'gemini',
+    content: 'Reading the file now.',
+    model: 'gemini-3-flash-preview',
+    toolCalls: [
+      { id: 'tc-1', name: 'read_file', status: 'success', args: { path: 'a.md' }, result: 'contents' },
+    ],
+    tokens: { input: 10, cached: 0, output: 5 },
+  });
+  fs.writeFileSync(tmpPath, [header, phaseC].join('\n') + '\n');
+  const reader3 = makeReader(tmpPath);
+  const third = reader3.pollSession(makeSession({ sessionId }));
+  const textsC = third.filter(e => e.type === 'assistant-text');
+  assert.equal(textsC.length, 1);
+  assert.ok(textsC[0].type === 'assistant-text');
+  assert.equal(textsC[0].turnComplete, true,
+    'tools resolved + tokens landed → turnComplete=true on fresh emit');
+
+  fs.unlinkSync(tmpPath);
+});
+
+test('BUG-09 §3.9: assistant-text-patch flips turnComplete on later poll', () => {
+  const sessionId = 'c2d2aef0-eeee-ffff-0000-1111aaaabbbb';
+  const tmpPath = path.join(os.tmpdir(), `gemini-patch-${Date.now()}.jsonl`);
+  const header = JSON.stringify({
+    sessionId, projectHash: 'h', startTime: '2026-05-18T00:00:00.000Z', kind: 'main',
+  });
+
+  // First poll sees the assistant emission without tokens.
+  const phaseA = JSON.stringify({
+    id: 'turn-X',
+    timestamp: '2026-05-18T00:00:01.000Z',
+    type: 'gemini',
+    content: 'I am thinking.',
+    model: 'gemini-3-flash-preview',
+  });
+  fs.writeFileSync(tmpPath, [header, phaseA].join('\n') + '\n');
+
+  const reader = makeReader(tmpPath);
+  const first = reader.pollSession(makeSession({ sessionId }));
+  const textsA = first.filter(e => e.type === 'assistant-text');
+  assert.equal(textsA.length, 1);
+  assert.ok(textsA[0].type === 'assistant-text');
+  assert.equal(textsA[0].turnComplete, false);
+  const targetUuid = textsA[0].uuid;
+
+  // Second poll: same turn now has tokens. Reader must emit an
+  // assistant-text-patch flipping turnComplete to true.
+  const phaseB = JSON.stringify({
+    id: 'turn-X',
+    timestamp: '2026-05-18T00:00:02.000Z',
+    type: 'gemini',
+    content: 'I am thinking.',
+    model: 'gemini-3-flash-preview',
+    tokens: { input: 8, cached: 0, output: 3 },
+  });
+  fs.appendFileSync(tmpPath, phaseB + '\n');
+  const second = reader.pollSession(makeSession({ sessionId }));
+  const patches = second.filter(e => e.type === 'assistant-text-patch');
+  assert.equal(patches.length, 1, 'BUG-09 §3.9: patch fires on completion');
+  assert.ok(patches[0].type === 'assistant-text-patch');
+  assert.equal(patches[0].turnComplete, true);
+  assert.equal(patches[0].targetUuid, targetUuid);
+
+  // Third poll without further changes: no duplicate patch.
+  const third = reader.pollSession(makeSession({ sessionId }));
+  const dup = third.filter(e => e.type === 'assistant-text-patch');
+  assert.equal(dup.length, 0, 'patch emitted at most once per turn');
+
+  fs.unlinkSync(tmpPath);
+});
+
 test('getFullToolResult re-reads the rewritten gemini line', async () => {
   const reader = makeReader();
   const events = pollAll(reader);

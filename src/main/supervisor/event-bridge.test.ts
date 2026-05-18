@@ -342,7 +342,12 @@ function assistantText(agentId: string, overrides: Partial<AssistantTextEvent> =
   };
 }
 
-async function BR_19_geminiTurnCompleteOptOut(): Promise<void> {
+async function BR_19_geminiTurnCompleteFiresForceIdle_postBug09(): Promise<void> {
+  // BUG-09 §3.9 inverts BR-19. Pre-bug-09 the D-07 gate suppressed
+  // forceIdle for Gemini because the reader hardcoded turnComplete=true on
+  // every emission. With the gemini reader now gating turnComplete on
+  // allToolsResolved && usageLanded, Gemini routes through forceIdle on
+  // the same path as Claude/Codex.
   const f = makeFakeBridgeDeps();
   const gem = makeAgent('gem-1', { provider: 'gemini', status: 'working' });
   f.agents.set(gem.id, gem);
@@ -352,12 +357,11 @@ async function BR_19_geminiTurnCompleteOptOut(): Promise<void> {
     assistantText(gem.id, { turnComplete: true }),
   ]));
 
-  // BR-19: Gemini's hardcoded turnComplete must not arm the idle latch.
-  assert.equal(
-    f.statusForceCalls.length, 0,
-    'BR-19: Gemini turnComplete → forceIdle is suppressed (D-07)',
-  );
-  console.log('  BR-19 ✓ Gemini turnComplete is ignored for forceIdle');
+  assert.equal(f.statusForceCalls.length, 1,
+    'BUG-09 §3.9: Gemini turnComplete now fires forceIdle (D-07 removed)');
+  assert.equal(f.statusForceCalls[0].method, 'forceIdle');
+  assert.equal(f.statusForceCalls[0].source, 'turnComplete');
+  console.log('  BR-19 (BUG-09 §3.9) ✓ Gemini turnComplete fires forceIdle');
 }
 
 async function onChatEvents_codexTurnComplete(): Promise<void> {
@@ -638,7 +642,7 @@ async function main(): Promise<void> {
   await BR_13_endsWithQuestionTakesPriorityOverTurnComplete();
   await BR_15_notifyUserInputClearsLatchOnWaiting();
   await BR_15_notifyUserInputNoopWhenNotWaiting();
-  await BR_19_geminiTurnCompleteOptOut();
+  await BR_19_geminiTurnCompleteFiresForceIdle_postBug09();
   await BR_20_waitingToWorkingIsSuppressed();
   await onChatEvents_codexTurnComplete();
   await onChatEvents_dispatchTable();

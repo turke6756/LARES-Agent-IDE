@@ -4,6 +4,7 @@ import type {
   SessionEvent,
   UserTextEvent,
   AssistantTextEvent,
+  AssistantTextPatchEvent,
   ThinkingEvent,
   ToolUseEvent,
   ToolResultEvent,
@@ -61,6 +62,11 @@ export class GeminiTranscriptReader implements ChatLogReader {
 
   // Mutating-line dedup state (per-agent → per-turn).
   private emittedTextByTurn = new Map<string, Set<string>>(); // agentId -> Set<turnId>
+  /** BUG-09 §3.9 — per-turn flag: have we already emitted an assistant event
+   *  with `turnComplete: true` for this turn? Used to gate the
+   *  `assistant-text-patch` that flips the flag once Gemini's transcript
+   *  catches up with tool-results + usage. */
+  private emittedTurnCompleteByTurn = new Map<string, Set<string>>(); // agentId -> Set<turnId>
   private emittedThinkingCountByTurn = new Map<string, Map<string, number>>(); // agentId -> turnId -> count
   private emittedToolCallByTurn = new Map<string, Set<string>>(); // agentId -> Set<`${turnId}:${toolCallId}`>
   private emittedToolResultByTurn = new Map<string, Set<string>>(); // agentId -> Set<`${turnId}:${toolCallId}`>
@@ -85,6 +91,7 @@ export class GeminiTranscriptReader implements ChatLogReader {
     }
     this.eofStreak.delete(agentId);
     this.emittedTextByTurn.delete(agentId);
+    this.emittedTurnCompleteByTurn.delete(agentId);
     this.emittedThinkingCountByTurn.delete(agentId);
     this.emittedToolCallByTurn.delete(agentId);
     this.emittedToolResultByTurn.delete(agentId);
@@ -308,33 +315,67 @@ export class GeminiTranscriptReader implements ChatLogReader {
         perAgent.set(turnId, entry.thoughts.length);
       }
 
-      // Assistant text — emit once per turn id.
+      // Assistant text — emit once per turn id, plus a follow-up patch when
+      // the turn later becomes complete.
       if (typeof entry.content === 'string' && entry.content.trim().length > 0) {
         let seenText = this.emittedTextByTurn.get(session.agentId);
         if (!seenText) {
           seenText = new Set();
           this.emittedTextByTurn.set(session.agentId, seenText);
         }
+        let seenTurnComplete = this.emittedTurnCompleteByTurn.get(session.agentId);
+        if (!seenTurnComplete) {
+          seenTurnComplete = new Set();
+          this.emittedTurnCompleteByTurn.set(session.agentId, seenTurnComplete);
+        }
+
+        const model = this.currentModel.get(session.agentId);
+        const text = entry.content.trim();
+        const trimmed = text.trimEnd();
+        const endsWithQuestion = trimmed.length > 0 && trimmed.endsWith('?');
+
+        // BUG-09 §3.9 — gate `turnComplete` on tools-resolved + usage-landed.
+        // Pre-Bundle-4 the reader hardcoded `turnComplete: true` on every
+        // assistant emission, which is unsafe — Gemini rewrites the same
+        // turn entry on later polls to add `toolCalls` and `tokens`. The
+        // bridge had to opt Gemini out of `forceIdle` entirely (D-07) to
+        // avoid premature idle flips. With this gate the flag tracks the
+        // real terminal state of the transcript and D-07 can go away.
+        const allToolsResolved = !Array.isArray(entry.toolCalls)
+          || entry.toolCalls.every((tc: any) => tc?.result != null);
+        const usageLanded = entry.tokens != null;
+        const turnComplete = allToolsResolved && usageLanded;
+
+        const uuid = `${jsonlPath}:${turnId}#a`;
         if (!seenText.has(turnId)) {
           seenText.add(turnId);
-          const model = this.currentModel.get(session.agentId);
-          const text = entry.content.trim();
-          // P2-01: Gemini hardcodes turnComplete: true on every assistant
-          // emission, so compute the flag here too. Even though forceIdle is
-          // gated off for Gemini (D-07), waiting detection still applies.
-          const trimmed = text.trimEnd();
-          const endsWithQuestion = trimmed.length > 0 && trimmed.endsWith('?');
+          if (turnComplete) seenTurnComplete.add(turnId);
           const ev: AssistantTextEvent = {
             type: 'assistant-text',
-            uuid: `${jsonlPath}:${turnId}#a`,
+            uuid,
             timestamp,
             agentId: session.agentId,
             text,
-            turnComplete: true,
+            turnComplete,
             endsWithQuestion,
             ...(model ? { model } : {}),
           };
           out.push(ev);
+        } else if (turnComplete && !seenTurnComplete.has(turnId)) {
+          // Turn just transitioned to complete — emit a patch so the bridge
+          // sees `turnComplete: true` and fires forceIdle. Mirrors the
+          // Codex split-batch pattern at session-log-dispatcher.ts.
+          seenTurnComplete.add(turnId);
+          const patch: AssistantTextPatchEvent = {
+            type: 'assistant-text-patch',
+            uuid: `${jsonlPath}:${turnId}#a-patch`,
+            timestamp,
+            agentId: session.agentId,
+            targetUuid: uuid,
+            turnComplete: true,
+            endsWithQuestion,
+          };
+          out.push(patch);
         }
       }
 
@@ -462,6 +503,7 @@ export class GeminiTranscriptReader implements ChatLogReader {
 
   private clearTurnState(agentId: string): void {
     this.emittedTextByTurn.delete(agentId);
+    this.emittedTurnCompleteByTurn.delete(agentId);
     this.emittedThinkingCountByTurn.delete(agentId);
     this.emittedToolCallByTurn.delete(agentId);
     this.emittedToolResultByTurn.delete(agentId);

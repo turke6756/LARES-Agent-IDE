@@ -144,7 +144,11 @@ export class EventBridge {
               const excerpt = event.text.slice(-300);
               this.deps.statusMonitor.forceWaiting(agentId, 'question', excerpt);
             } else if (event.turnComplete === true) {
-              if (agent.provider === 'gemini') break; // D-07 — Gemini opt-out
+              // BUG-09 §3.9 — D-07 gate removed. The Gemini reader now
+              // computes turnComplete from `allToolsResolved && usageLanded`
+              // and emits an assistant-text-patch when the turn later
+              // becomes complete, so we can route Gemini through forceIdle
+              // on the same path as Claude/Codex.
               this.deps.statusMonitor.forceIdle(agentId, 'turnComplete');
             } else {
               // BUG-09 §3.3 / C11 — any non-terminal assistant-text refreshes
@@ -167,7 +171,7 @@ export class EventBridge {
               // service. Acceptable tradeoff for the split-batch corner case.
               this.deps.statusMonitor.forceWaiting(agentId, 'question', '');
             } else if (event.turnComplete === true) {
-              if (agent.provider === 'gemini') break;
+              // BUG-09 §3.9 — D-07 gate removed (see assistant-text branch).
               this.deps.statusMonitor.forceIdle(agentId, 'turnComplete');
             }
             break;
