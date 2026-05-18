@@ -63,7 +63,44 @@ Format per bug:
 
 ---
 
+## BUG-10: launch_agent auto-submit fails for very large initial prompts
+
+- Component: src/main/supervisor/index.ts (sendInput / _doSendInput) + send-input-encoders.ts
+- Severity: medium (silent — agent sits idle with the prompt unsent, supervisor thinks it launched cleanly)
+- Status: open
+- Gotcha ref: groupthink-running-gotchas.md §13 (to be added)
+- Surfaced: 2026-05-17 launching `groupthink-duplicate-relay-investigation`
+- Symptoms: Supervisor called `launch_agent` (Claude provider, Windows) with a ~3 KB multi-paragraph prompt. The dashboard accepted the call and reported "Sent initial prompt". The agent's terminal showed `[Pasted text #1 +46 lines]` with "paste again to expand" — i.e., the prompt was written into the input buffer as a bracketed paste but the trailing Enter never fired (or fired before the paste was fully ingested by Claude Code's input widget). Agent went to idle without processing. Supervisor had to issue a manual `send_keys_to_agent({key:'enter'})` to kick it off.
+- Suspected root cause: race between the bracketed-paste sequence and the immediate `\r` follow-up. For multi-line / many-byte prompts, Claude Code's input handler may still be consuming the paste body when Enter arrives, so the Enter is either dropped or consumed mid-paste.
+- Fix sketch:
+  - **Option A — delay-based:** after writing the prompt body, insert a small delay (50–100 ms, scaling with payload size) before sending Enter. Cheap, low risk, won't catch every edge case.
+  - **Option B — confirm-then-submit:** after writing the prompt, poll the agent's input-buffer state (or wait for a known-good signal that the paste is fully ingested), then send Enter. More robust, more plumbing.
+  - **Option C — provider-aware paste end-marker:** end the bracketed paste with a sentinel that the receiver acks before we send Enter. Most robust, requires Claude Code cooperation.
+- Workaround for now: when launching with a very long prompt, follow up with `send_keys_to_agent({key:'enter'})` after a couple seconds. Or split the launch into `launch_agent` (small prompt) + `send_message_to_agent` (the bulk).
+- Note: this is **not** a regression of BUG-01 — that fix correctly added the Enter to the launch path. The bug is timing/race between the paste body and the Enter for large payloads.
+
+---
+
+## BUG-11: dashboard events interrupt the user's in-progress terminal input by auto-submitting
+
+- Component: dashboard event bridge → supervisor input pane (likely src/main/api-server.ts or supervisor input handler)
+- Severity: medium (UX-breaking — user's sentence gets truncated mid-typing and sent as input)
+- Status: open
+- Gotcha ref: groupthink-running-gotchas.md §14 (to be added)
+- Surfaced: 2026-05-17 during this session (user typing a workflow-change message when a `[DASHBOARD EVENT]` arrived; user's partial sentence was submitted)
+- Symptoms: When the user is actively typing a message into the supervisor's terminal AND a `[DASHBOARD EVENT]` message arrives from the dashboard, the event delivery includes (or triggers) an Enter that submits whatever the user had typed so far, regardless of completion. The user's partial sentence goes to Claude as a separate turn, then the dashboard event lands as another turn.
+- Suspected root cause: dashboard event injection writes its payload to the supervisor's input buffer and presses Enter unconditionally — it does not check whether the supervisor (a) is mid-turn or (b) has user-typed bytes pending in its input buffer.
+- Fix sketch (gated on a prerequisite):
+  - **Prerequisite:** the supervisor itself must expose a reliable "user-is-typing / buffer-non-empty" signal, OR a "ready-for-event" status distinct from "idle". Today the supervisor's status flips per chat events (working↔idle, see BUG-09) but does not reflect "user has uncommitted bytes in input box."
+  - **With that signal:** the dashboard event bridge defers event delivery while the supervisor's input buffer is non-empty (or while it has a "user typing" lock). Events queue and flush on the next safe boundary (buffer empty, last keystroke > N ms ago).
+  - **Stopgap (no signal needed):** never auto-submit on event injection. Write the event text as a separate visible block above the user's input area, and let the user submit when ready. Loses the "supervisor sees it as a chat turn automatically" property but ends the interruption.
+- Related: this couples to BUG-09 — fixing the supervisor's status semantics may unlock the cleanest fix here.
+
+---
+
 # Closed bugs (kept as history; delete entries here whenever you like)
+
+- **2026-05-17** BUG-12: GroupThink relayed messages appeared duplicated in Codex's chat history because `emitSyntheticUserEcho` recorded a synthetic marker with the dashboard's unicode-rich text, but ConPTY flattened em-dashes / smart quotes / ellipsis to ASCII before codex's real `user-text` event landed — text-equality dedupe in `session-log-dispatcher.ts` saw two strings and let both through. Replaced text-equality with recency-only FIFO dedupe (oldest unconsumed marker within ±35s window consumes the real event regardless of payload). `SyntheticMarker` no longer stores text. +8 new tests covering em-dash, en-dash, smart apostrophe, ellipsis, multiple in-flight synthetics, synthetic-after-real edge case, window boundary. Investigation writeup at `plans/groupthink-duplicate-relay-investigation.md`. **Requires `npm run restart` to activate in the running dashboard.**
 
 - **2026-05-17** BUG-08: Codex `launch_agent` inherited the saturated prior
   workspace session. Added `freshSession?: boolean` to `LaunchAgentInput`

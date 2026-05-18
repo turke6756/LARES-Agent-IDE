@@ -1,38 +1,31 @@
-# Supervisor Memory
+# Supervisor Memory — Index
 
-This file indexes the supervisor's persistent memory for this workspace.
-Add entries as you learn important things about the agents, project, or decisions made.
+This is the index for the supervisor's persistent memory. Memory is organized by **category** — load the file whose category matches your situation.
 
-<!-- Example entry:
-- [decision_auth_approach.md](decision_auth_approach.md) - Chose JWT over sessions for auth, approved by human 2026-03-20
--->
+## Categories
 
-- **[open-bugs.md](open-bugs.md)** — confirmed bugs to fix, then delete the
-  entry once fixed. **1 open (BUG-09)** as of 2026-05-17. BUG-01..BUG-08
-  (excluding BUG-05) all fixed via commit f4e1a58 (7-bug sweep). BUG-05
-  fixed earlier via M2A (commit 17555fc). When fixing a bug, also delete
-  or mark its detail entry in `groupthink-running-gotchas.md`.
-- [groupthink-running-gotchas.md](groupthink-running-gotchas.md) — full
-  detailed notes on 12 gotchas. 9 are bugs cross-referenced from
-  open-bugs.md (§1, §2, §4, §5, §7, §9, §10, §11 now marked FIXED;
-  §12 added 2026-05-17 for BUG-09); the others are operational lore
-  (§3 closed-bug history, §6 Claude quota walls, §8 resume command shape).
-- [docs/SESSION_2026-05-15_AGENT_LIFECYCLE_PLANNING.md](../../../docs/SESSION_2026-05-15_AGENT_LIFECYCLE_PLANNING.md) — master index for the agent-lifecycle planning session. Points at the produced plan, the three findings docs, the gotchas, the one source-tree fix shipped, and the bugs surfaced but not fixed. Read this first if returning to this work.
-- **Hardening plan (`plans/agent-lifecycle-hardening-plan.md`): COMPLETE
-  through M4** as of 2026-05-16. M0..M4 all committed (17555fc → 4093521).
-  Codex stall / BUG-05 fixed. Pipeline B chat-event-driven status with
-  `IDLE_LATCH_TIMEOUT_MS = 30 min` is in production.
-- **7-bug fix sweep (commit f4e1a58)** — 2026-05-17. Fixed BUG-01
-  (`launch_agent` auto-submit + `submit` param), BUG-02 (`send_keys`
-  `key` enum), BUG-03 (groupthink `--turn-timeout-ms` + agent.status
-  awareness), BUG-04 (`ensureCodexResumeSessionId` helper), BUG-06
-  (groupthink resume `seedLastRelayedTsFromChat`), BUG-07 (pollNow
-  rate-limit bypass with optional agentId), BUG-08 (codex
-  `freshSession` flag). +1661 / −137 across 19 files. Combined tree
-  built clean and `test:supervisor` green before commit.
-- **BUG-09 open (2026-05-17):** agent.status cycles working↔idle within
-  a single user turn post-hardening. Verified the running app has M2A.
-  Two hypotheses: (A) definitional — Pipeline B emits turnComplete on
-  every tool-cycle boundary; (B) latch leak — `forceWorking` path is
-  clearing the latch before the 30-min timeout. Investigation entry in
-  open-bugs.md; symptoms in gotchas §12.
+| File | Type | When to consult |
+|---|---|---|
+| [behavioral.md](behavioral.md) | **Behavioral patterns** | Situational "when X, do Y" rules. Consult when the current situation matches a trigger. |
+| [playbooks.md](playbooks.md) | **Technical procedures** | Multi-step recipes you've used before. Consult before performing a recurring procedure. |
+| [task-sizing.md](task-sizing.md) | **Task-sizing heuristics** | Pre-launch judgment on whether a task fits an agent's context comfortably. Consult before any `launch_agent`. |
+| [open-bugs.md](open-bugs.md) | **Active bugs** | Confirmed bugs awaiting fix. Consult to avoid re-discovering known issues; cross-reference when filing new bugs. |
+| [groupthink-running-gotchas.md](groupthink-running-gotchas.md) | **Domain gotchas (GroupThink)** | Workarounds specific to running GroupThink. Most entries cross-reference an open bug. |
+
+## Discipline
+
+- **Personality lives in `../CLAUDE.md`** — always loaded, level-sets every session. Memory adds situational depth on top.
+- **Don't load every memory file at session start.** Consult by situation match. The index above tells you which file fits which situation.
+- **Gotchas should be rare.** A gotcha confesses something is broken. Every gotcha should ideally have a matching open-bug entry; when the bug closes, the gotcha goes too. If a gotcha has no bug, either promote it to a playbook (it's how the thing works) or file the bug.
+- **Update after notable interactions.** Playbook P-05 covers the routing recipe.
+
+---
+
+## Session highlights (most recent first)
+
+- **2026-05-17** Memory restructured into category files (behavioral, playbooks, task-sizing). Personality principles added to `../CLAUDE.md`. Driver: user direction to formalize supervisor autonomy + memory organization. New entries B-01..B-07, P-01..P-07.
+- **2026-05-17** GroupThink duplicate-relay bug found and fixed (durable: recency-based dedupe in `session-log-dispatcher.ts`). Worker delivered 19/19 dispatcher tests green. Awaits dashboard restart + commit. Investigation writeup at `plans/groupthink-duplicate-relay-investigation.md`.
+- **2026-05-17** GroupThink produced `plans/multi-supervisor-migration-review.md` (187-line review of multi-supervisor migration doc). 2 blockers, 9 tightenings.
+- **2026-05-17** 7-bug fix sweep (commit f4e1a58). Fixed BUG-01..BUG-08 except BUG-05 (already fixed via M2A). BUG-09 opened (status cycling). BUG-10, BUG-11 opened this session (large-prompt auto-submit race; dashboard event interrupts user typing).
+- **2026-05-16** Agent-lifecycle hardening M0..M4 complete (17555fc → 4093521). Pipeline B chat-event-driven status with `IDLE_LATCH_TIMEOUT_MS = 30 min` in production.
+- **2026-05-15** Agent-lifecycle planning session — master index at `docs/SESSION_2026-05-15_AGENT_LIFECYCLE_PLANNING.md`.
