@@ -5,12 +5,26 @@ import {
   WORKING_THRESHOLD_MS,
   IDLE_LATCH_TIMEOUT_MS,
   WAITING_LATCH_TIMEOUT_MS,
+  WORKING_LATCH_MODEL_PENDING_MS,
+  WORKING_LATCH_TOOL_PENDING_MS,
 } from '../../shared/constants';
 import { getActiveAgents, updateAgentStatus, addEvent } from '../database';
 import type { StatusChangedEvent } from './status-events';
 import { PromptPatternDetector } from './prompt-pattern-detector';
 
 export type WaitingKind = 'question' | 'y-n' | 'enter' | 'choice' | 'approve' | 'tty-pattern';
+
+export type WorkingLatchTtlClass = 'short' | 'model-pending' | 'tool-pending';
+
+/** Typed options for {@link StatusMonitor.forceWorking}. See
+ *  plans/bug-09-fix-design.md §3.1 — the previous `(agentId, source)` shape
+ *  could not carry the toolUseId pairing the consolidated fix needs. */
+export interface ForceWorkingOpts {
+  source: string;
+  toolUseId?: string;
+  resolvedToolUseId?: string;
+  ttlClass: WorkingLatchTtlClass;
+}
 
 const PTY_QUIET_FOR_PATTERN_MS = 2_000;
 
@@ -26,12 +40,32 @@ function stripAnsi(text: string): string {
     .replace(/[\x00-\x08\x0b-\x1f]/g, '');
 }
 
-interface TurnLatchEntry {
-  state: 'idle' | 'waiting';
+interface IdleLatchEntry {
+  state: 'idle';
   setAt: number;
-  waitingKind?: WaitingKind;
-  waitingExcerpt?: string;
 }
+
+interface WaitingLatchEntry {
+  state: 'waiting';
+  setAt: number;
+  waitingKind: WaitingKind;
+  waitingExcerpt: string;
+}
+
+/** BUG-09 §3.1 — `working` is now a first-class latch state. The latch carries
+ *  the set of outstanding `toolUseId`s so a tool that is silently running can
+ *  hold the latch indefinitely (within `tool-pending` TTL) without depending
+ *  on PTY bursts crossing the 200 B/3 s gate. */
+interface WorkingLatchEntry {
+  state: 'working';
+  setAt: number;
+  refreshedAt: number;
+  outstandingToolIds: Set<string>;
+  source: string;
+  ttlClass: WorkingLatchTtlClass;
+}
+
+export type TurnLatchEntry = IdleLatchEntry | WaitingLatchEntry | WorkingLatchEntry;
 
 const TERMINAL_STATUSES: ReadonlyArray<AgentStatus> = ['crashed', 'done'];
 const TRANSITIONAL_STATUSES: ReadonlyArray<AgentStatus> = ['launching', 'restarting'];
@@ -48,8 +82,8 @@ export class StatusMonitor extends EventEmitter {
   // byte-flicker from immediately undoing it.
   private statusHoldUntil = new Map<string, number>();
   // Per-agent latch driven by Pipeline B (chat-stream `turnComplete` / waiting
-  // signals). While set, `inferStatus` returns the latched state regardless
-  // of PTY activity. See plans/agent-lifecycle-hardening-plan.md §2.1.1.
+  // signals, plus BUG-09's `working` variant). While set within TTL,
+  // `inferStatus` honors the latched state. See plans/bug-09-fix-design.md §3.1.
   private turnLatch = new Map<string, TurnLatchEntry>();
   private now: () => number;
 
@@ -82,7 +116,11 @@ export class StatusMonitor extends EventEmitter {
 
   /** Pipeline B has high-confidence end-of-turn truth. Bypasses
    *  `statusHoldUntil` (the hold exists to dampen PTY flicker, which the chat
-   *  stream isn't subject to). No-ops on terminal/transitional states. */
+   *  stream isn't subject to). No-ops on terminal/transitional states.
+   *
+   *  BUG-09 §3.1 / C8: overwrites the prior latch with an `idle` entry rather
+   *  than `delete`-ing it, so the post-turn PTY-noise protection that the idle
+   *  latch provides is preserved even when a prior latch was `working`. */
   forceIdle(agentId: string, source: string): void {
     const agent = this.getAgentFn(agentId);
     if (!agent) return;
@@ -136,21 +174,47 @@ export class StatusMonitor extends EventEmitter {
     this.emit('statusChanged', payload);
   }
 
-  /** Explicit "turn continues" signal from Pipeline B (tool-use, tool-result,
-   *  user-turn, task-started). Clears the latch and updates status via the
-   *  normal path (no debounce bypass — `working` doesn't need it). */
-  forceWorking(agentId: string, source: string): void {
+  /** BUG-09 §3.1 — Explicit "turn continues" signal from Pipeline B. Replaces
+   *  the previous binary "delete latch" behavior with a tagged `working`
+   *  latch that pairs `tool-use` ↔ `tool-result` events by `toolUseId`. Always
+   *  refreshes `refreshedAt`, including when the latch is already `working`
+   *  (closes C7). */
+  forceWorking(agentId: string, opts: ForceWorkingOpts): void {
     const agent = this.getAgentFn(agentId);
     if (!agent) return;
     if (TERMINAL_STATUSES.includes(agent.status)) return;
     if (TRANSITIONAL_STATUSES.includes(agent.status)) return;
 
-    this.turnLatch.delete(agentId);
-    if (agent.status === 'working') return;
+    const now = this.now();
+    const existing = this.turnLatch.get(agentId);
+
+    let outstanding: Set<string>;
+    let setAt: number;
+    if (existing && existing.state === 'working') {
+      outstanding = existing.outstandingToolIds;
+      setAt = existing.setAt;
+    } else {
+      outstanding = new Set<string>();
+      setAt = now;
+    }
+
+    if (opts.toolUseId) outstanding.add(opts.toolUseId);
+    if (opts.resolvedToolUseId) outstanding.delete(opts.resolvedToolUseId);
+
+    this.turnLatch.set(agentId, {
+      state: 'working',
+      setAt,
+      refreshedAt: now,
+      outstandingToolIds: outstanding,
+      source: opts.source,
+      ttlClass: opts.ttlClass,
+    });
+
+    if (agent.status === 'working') return; // already working — latch refreshed, no event needed
 
     const prior = agent.status;
     updateAgentStatus(agentId, 'working');
-    addEvent(agentId, 'status_change', JSON.stringify({ from: prior, to: 'working', source }));
+    addEvent(agentId, 'status_change', JSON.stringify({ from: prior, to: 'working', source: opts.source }));
     const payload: StatusChangedEvent = {
       agentId,
       status: 'working',
@@ -160,8 +224,15 @@ export class StatusMonitor extends EventEmitter {
     this.emit('statusChanged', payload);
   }
 
+  /** BUG-09 §3.7 — drop all per-agent state on delete/restart so a stale
+   *  `tool-pending` latch (up to 15 min) does not survive a runner crash. */
+  forgetAgent(agentId: string): void {
+    this.turnLatch.delete(agentId);
+    this.statusHoldUntil.delete(agentId);
+  }
+
   /** Test seam — used by status-monitor.test.ts to introspect the latch. */
-  getLatchSnapshot(agentId: string): Readonly<TurnLatchEntry> | undefined {
+  getLatchSnapshot(agentId: string): TurnLatchEntry | undefined {
     return this.turnLatch.get(agentId);
   }
 
@@ -209,11 +280,47 @@ export class StatusMonitor extends EventEmitter {
     // the TTL expires or an explicit forceWorking clears it.
     const latched = this.turnLatch.get(agent.id);
     if (latched) {
-      const age = this.now() - latched.setAt;
-      const ttl = latched.state === 'waiting' ? WAITING_LATCH_TIMEOUT_MS : IDLE_LATCH_TIMEOUT_MS;
-      if (age <= ttl) return latched.state;
-      this.turnLatch.delete(agent.id);
-      // fall through to PTY fallback
+      if (latched.state === 'working') {
+        const age = this.now() - latched.refreshedAt;
+        const hasOutstandingTools = latched.outstandingToolIds.size > 0;
+        const effectiveTtl = hasOutstandingTools
+          ? WORKING_LATCH_TOOL_PENDING_MS
+          : WORKING_LATCH_MODEL_PENDING_MS;
+        if (age <= effectiveTtl) {
+          // BUG-09 §3.1 (Codex round 3) — tiered PTY-pattern-detection vs
+          // latched working:
+          //   tool-pending: skip pattern detection. A silently-running tool
+          //     can leave a `(y/N)`-shaped line in the ring tail from an
+          //     earlier turn; pattern detection would spuriously fire
+          //     `forceWaiting` and overwrite the genuine tool-pending latch.
+          //   model-pending: run pattern detection first; real waiting prompts
+          //     still beat the generic latched-working state.
+          if (hasOutstandingTools) return 'working';
+
+          const lastOutputForPattern = this.getLastOutput(agent.id);
+          const elapsedForPattern = this.now() - lastOutputForPattern;
+          if (elapsedForPattern > PTY_QUIET_FOR_PATTERN_MS) {
+            const tail = this.getOutputRingTail(agent.id);
+            if (tail) {
+              const stripped = stripAnsi(tail);
+              const hit = PromptPatternDetector.match(stripped);
+              if (hit) {
+                this.forceWaiting(agent.id, hit.kind as WaitingKind, hit.excerpt);
+                return 'waiting';
+              }
+            }
+          }
+          return 'working';
+        }
+        this.turnLatch.delete(agent.id);
+        // fall through to PTY fallback
+      } else {
+        const age = this.now() - latched.setAt;
+        const ttl = latched.state === 'waiting' ? WAITING_LATCH_TIMEOUT_MS : IDLE_LATCH_TIMEOUT_MS;
+        if (age <= ttl) return latched.state;
+        this.turnLatch.delete(agent.id);
+        // fall through to PTY fallback
+      }
     }
 
     const lastOutput = this.getLastOutput(agent.id);

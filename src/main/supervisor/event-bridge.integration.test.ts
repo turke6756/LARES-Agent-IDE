@@ -381,7 +381,7 @@ async function single_waiting_question_BR_13_20(): Promise<void> {
 
     // BR-20 (negative side): waiting → working transition is suppressed.
     h.now.value += SUPERVISOR_EVENT_COOLDOWN_MS + 100;
-    h.monitor.forceWorking(worker.id, 'user-input');
+    h.monitor.forceWorking(worker.id, { source: 'user-input', ttlClass: 'model-pending' });
     await h.settle();
     assert.equal(h.sendInputCalls.length, 1,
       'single/waiting-q: waiting → working did NOT fire a notification (BR-20)');

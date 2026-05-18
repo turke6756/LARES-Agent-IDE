@@ -1,6 +1,6 @@
 import type { Agent, ContextStats } from '../../../shared/types';
 import type { EventBridgeDeps } from '../event-bridge';
-import type { WaitingKind } from '../status-monitor';
+import type { ForceWorkingOpts, WaitingKind } from '../status-monitor';
 
 interface ScheduledTask {
   id: number;
@@ -75,6 +75,10 @@ export interface StatusForceCall {
   source?: string;
   kind?: WaitingKind;
   excerpt?: string;
+  /** BUG-09 §3.1 — typed-options surface on forceWorking. The flat
+   *  `source` field above is also populated (from `opts.source`) so existing
+   *  tests reading `c.source` keep working. */
+  workingOpts?: ForceWorkingOpts;
 }
 
 export interface FakeBridgeDepsBundle {
@@ -135,8 +139,13 @@ export function makeFakeBridgeDeps(): FakeBridgeDepsBundle {
       forceWaiting: (agentId, kind, excerpt) => {
         statusForceCalls.push({ method: 'forceWaiting', agentId, kind, excerpt });
       },
-      forceWorking: (agentId, source) => {
-        statusForceCalls.push({ method: 'forceWorking', agentId, source });
+      forceWorking: (agentId, opts) => {
+        statusForceCalls.push({
+          method: 'forceWorking',
+          agentId,
+          source: opts.source,
+          workingOpts: opts,
+        });
       },
     },
   };

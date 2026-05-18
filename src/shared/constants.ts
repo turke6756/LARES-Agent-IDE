@@ -32,6 +32,20 @@ export const SUPERVISOR_EVENT_DRAIN_INTERVAL_MS = 15_000;
 export const IDLE_LATCH_TIMEOUT_MS = 30 * 60 * 1000;   // 30 min
 export const WAITING_LATCH_TIMEOUT_MS = 5 * 60 * 1000; // 5 min
 
+// BUG-09 working-latch TTLs — see plans/bug-09-fix-design.md §3.2.
+// Two-tier TTL so the latch holds across Coalescing / spinner-only windows
+// while not wedging forever on a silently-broken CLI.
+//
+// `model-pending` covers inter-event gaps when no tool is outstanding —
+// post-tool-result re-coalesce, rate-limit backoff, model thinking phases.
+// Reviewer convergence picked 120–180 s (Claude) and 5 min (Codex); we land at 3 min.
+export const WORKING_LATCH_MODEL_PENDING_MS = 180_000;
+// `tool-pending` covers windows where a specific `toolUseId` is outstanding —
+// the chat-stream-verified fact that a tool is running outranks PTY silence.
+// `toolUseId` pairing in `event-bridge.ts` means this is a safety floor, not
+// the primary mechanism.
+export const WORKING_LATCH_TOOL_PENDING_MS = 900_000; // 15 min
+
 /** Default CLI commands per provider and environment */
 export const PROVIDER_COMMANDS: Record<AgentProvider, { windows: string; wsl: string }> = {
   claude: { windows: 'claude --dangerously-skip-permissions --chrome', wsl: 'ccode --dangerously-skip-permissions --chrome' },

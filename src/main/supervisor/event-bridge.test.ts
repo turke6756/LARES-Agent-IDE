@@ -409,16 +409,24 @@ async function onChatEvents_dispatchTable(): Promise<void> {
   ]));
 
   assert.equal(f.statusForceCalls.length, 5);
+  // BUG-09 §3.3 — assistant-text without turnComplete now refreshes via the
+  // generic `assistant-text` source (was `turnContinues`, conditioned on
+  // stopReason === 'tool_use'). All forceWorking calls now carry typed opts.
   assert.deepEqual(
     f.statusForceCalls.map(c => `${c.method}:${c.source ?? c.kind}`),
     [
       'forceWorking:user-turn',
       'forceWorking:tool-use',
       'forceWorking:task-started',
-      'forceWorking:turnContinues',
+      'forceWorking:assistant-text',
       'forceIdle:turnComplete',
     ],
   );
+  // Spot-check that tool-use carries toolUseId on its opts.
+  const toolCall = f.statusForceCalls.find(c => c.source === 'tool-use')!;
+  assert.equal(toolCall.workingOpts?.toolUseId, 'tu1',
+    'BUG-09: tool-use forceWorking propagates toolUseId for latch pairing');
+  assert.equal(toolCall.workingOpts?.ttlClass, 'tool-pending');
   console.log('  onChatEvents ✓ dispatch table maps each event type per §2.1');
 }
 

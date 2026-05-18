@@ -1,7 +1,7 @@
 import type { Agent, AgentStatus, ContextStats } from '../../shared/types';
 import type { ChatEventBatch } from '../../shared/session-events';
 import type { StatusChangedEvent } from './status-events';
-import type { WaitingKind } from './status-monitor';
+import type { ForceWorkingOpts, WaitingKind } from './status-monitor';
 import {
   SupervisorEvent,
   buildEventPayload,
@@ -20,7 +20,9 @@ import {
 export interface StatusMonitorForceCollaborator {
   forceIdle(agentId: string, source: string): void;
   forceWaiting(agentId: string, kind: WaitingKind, excerpt: string): void;
-  forceWorking(agentId: string, source: string): void;
+  /** BUG-09 §3.1 — typed options carry `toolUseId` / `resolvedToolUseId` so
+   *  the latch can pair `tool-use` ↔ `tool-result` events. */
+  forceWorking(agentId: string, opts: ForceWorkingOpts): void;
 }
 
 export interface EventBridgeDeps {
@@ -137,8 +139,14 @@ export class EventBridge {
             } else if (event.turnComplete === true) {
               if (agent.provider === 'gemini') break; // D-07 — Gemini opt-out
               this.deps.statusMonitor.forceIdle(agentId, 'turnComplete');
-            } else if (event.stopReason === 'tool_use') {
-              this.deps.statusMonitor.forceWorking(agentId, 'turnContinues');
+            } else {
+              // BUG-09 §3.3 / C11 — any non-terminal assistant-text refreshes
+              // the working latch, not just `stopReason === 'tool_use'`. Closes
+              // the Codex hole and anticipates streamed assistant emissions.
+              this.deps.statusMonitor.forceWorking(agentId, {
+                source: 'assistant-text',
+                ttlClass: 'model-pending',
+              });
             }
             break;
           }
@@ -157,19 +165,43 @@ export class EventBridge {
             }
             break;
           }
+          case 'thinking':
+            // BUG-09 §3.3 / C11 — thinking blocks are high-cadence positive
+            // evidence that the model is still running. The previous "not
+            // status-bearing" comment was correct for the binary latch but
+            // stops being correct once `working` is latchable.
+            this.deps.statusMonitor.forceWorking(agentId, {
+              source: 'thinking',
+              ttlClass: 'model-pending',
+            });
+            break;
           case 'tool-use':
-            this.deps.statusMonitor.forceWorking(agentId, 'tool-use');
+            this.deps.statusMonitor.forceWorking(agentId, {
+              source: 'tool-use',
+              toolUseId: event.toolUseId,
+              ttlClass: 'tool-pending',
+            });
             break;
           case 'tool-result':
-            this.deps.statusMonitor.forceWorking(agentId, 'tool-result');
+            this.deps.statusMonitor.forceWorking(agentId, {
+              source: 'tool-result',
+              resolvedToolUseId: event.toolUseId,
+              ttlClass: 'tool-pending',
+            });
             break;
           case 'user-text':
-            this.deps.statusMonitor.forceWorking(agentId, 'user-turn');
+            this.deps.statusMonitor.forceWorking(agentId, {
+              source: 'user-turn',
+              ttlClass: 'model-pending',
+            });
             break;
           case 'task-started':
-            this.deps.statusMonitor.forceWorking(agentId, 'task-started');
+            this.deps.statusMonitor.forceWorking(agentId, {
+              source: 'task-started',
+              ttlClass: 'model-pending',
+            });
             break;
-          // thinking, usage, system-init: not status-bearing.
+          // usage, system-init: not status-bearing.
         }
       }
     } catch (err) {
@@ -308,7 +340,10 @@ export class EventBridge {
   notifyUserInputDelivered(agentId: string): void {
     const agent = this.deps.getAgent(agentId);
     if (!agent || agent.status !== 'waiting') return;
-    this.deps.statusMonitor.forceWorking(agentId, 'user-input');
+    this.deps.statusMonitor.forceWorking(agentId, {
+      source: 'user-input',
+      ttlClass: 'model-pending',
+    });
   }
 
   /** Test seam: cancel any pending drain timer and run the drain logic now. */

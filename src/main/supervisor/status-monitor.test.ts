@@ -16,6 +16,8 @@ import {
   IDLE_LATCH_TIMEOUT_MS,
   WAITING_LATCH_TIMEOUT_MS,
   WORKING_THRESHOLD_MS,
+  WORKING_LATCH_MODEL_PENDING_MS,
+  WORKING_LATCH_TOOL_PENDING_MS,
 } from '../../shared/constants';
 import type { Agent } from '../../shared/types';
 import type { StatusChangedEvent } from './status-events';
@@ -143,7 +145,7 @@ test('BR-16: idle latch holds against PTY burst — Codex incident in test form'
   }
 });
 
-test('BR-16 corollary: forceWorking clears the latch and lets PTY truth resume', async () => {
+test('BR-16 corollary (BUG-09 inverted): forceWorking overwrites the prior latch with a working entry', async () => {
   const fakes = makeStatusMonitorFakes();
   const restore = patchDatabaseModule(fakes);
   try {
@@ -151,17 +153,24 @@ test('BR-16 corollary: forceWorking clears the latch and lets PTY truth resume',
     const monitor = makeMonitor({ fakes, agent });
 
     monitor.forceIdle(agent.id, 'turnComplete');
-    assert.ok(monitor.getLatchSnapshot(agent.id), 'latch set');
+    const idleLatch = monitor.getLatchSnapshot(agent.id);
+    assert.ok(idleLatch && idleLatch.state === 'idle', 'idle latch set');
 
-    // A real new turn arrives.
-    monitor.forceWorking(agent.id, 'task-started');
-    assert.equal(monitor.getLatchSnapshot(agent.id), undefined, 'forceWorking cleared the latch');
+    // A real new turn arrives. Per BUG-09 §3.1 the latch is now a tagged
+    // `working` entry rather than being deleted — chat-stream truth keeps
+    // governing the agent across the Coalescing window that PTY can't see.
+    monitor.forceWorking(agent.id, { source: 'task-started', ttlClass: 'model-pending' });
+    const workingLatch = monitor.getLatchSnapshot(agent.id);
+    assert.ok(workingLatch && workingLatch.state === 'working',
+      'forceWorking installed a working latch');
     assert.equal(agent.status, 'working');
 
-    // PTY now governs.
-    fakes.lastOutputAt.set(agent.id, fakes.now.value);
+    // PTY going silent must NOT downgrade — the working latch carries us
+    // through. Push elapsed past WORKING_THRESHOLD_MS to prove this.
+    fakes.now.value += WORKING_THRESHOLD_MS + 1_000;
     const inferred = await inferStatus(monitor, agent);
-    assert.equal(inferred, 'working', 'PTY truth resumes after latch cleared');
+    assert.equal(inferred, 'working',
+      'working latch survives PTY silence within model-pending TTL');
   } finally {
     restore();
   }
@@ -303,7 +312,7 @@ test('BR-14 guard: PTY pattern is NOT consulted while PTY is still streaming', a
 });
 
 // ── Misc invariants ──────────────────────────────────────────────────
-test('forceWorking on already-working agent only clears latch, no event', () => {
+test('BUG-09 §3.1: forceWorking on already-working agent installs working latch (no DB write)', () => {
   const fakes = makeStatusMonitorFakes();
   const restore = patchDatabaseModule(fakes);
   try {
@@ -313,10 +322,237 @@ test('forceWorking on already-working agent only clears latch, no event', () => 
     // Seed a stale idle latch.
     (monitor as any).turnLatch.set(agent.id, { state: 'idle', setAt: fakes.now.value });
 
-    monitor.forceWorking(agent.id, 'tool-use');
-    assert.equal(monitor.getLatchSnapshot(agent.id), undefined, 'latch cleared');
+    monitor.forceWorking(agent.id, {
+      source: 'tool-use',
+      toolUseId: 'tu-1',
+      ttlClass: 'tool-pending',
+    });
+    const latch = monitor.getLatchSnapshot(agent.id);
+    assert.ok(latch && latch.state === 'working',
+      'BUG-09: forceWorking overwrites the stale idle latch with a working one');
+    assert.equal(latch.outstandingToolIds.size, 1);
+    assert.ok(latch.outstandingToolIds.has('tu-1'));
     assert.equal(fakes.updates.length, 0, 'no DB write when already working');
     assert.equal(fakes.emissions.length, 0, 'no event when already working');
+  } finally {
+    restore();
+  }
+});
+
+// ── BUG-09 §3.1 / §3.7 (Bundle 1) ────────────────────────────────────
+
+test('BUG-09: working latch holds through Coalescing gap (model-pending TTL)', async () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeAgent('w-1', { status: 'working' });
+    const monitor = makeMonitor({ fakes, agent });
+
+    monitor.forceWorking(agent.id, { source: 'task-started', ttlClass: 'model-pending' });
+
+    // PTY goes silent for 30 s (Coalescing window). The pre-BUG-09 detector
+    // would flip to idle because elapsed > WORKING_THRESHOLD_MS=8s.
+    fakes.now.value += 30_000;
+    fakes.lastOutputAt.set(agent.id, fakes.now.value - 30_000);
+
+    const inferred = await inferStatus(monitor, agent);
+    assert.equal(inferred, 'working',
+      'BUG-09: working latch beats PTY silence within model-pending TTL');
+  } finally {
+    restore();
+  }
+});
+
+test('BUG-09: parallel tools — single tool-result keeps tool-pending TTL', async () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeAgent('w-1', { status: 'working' });
+    const monitor = makeMonitor({ fakes, agent });
+
+    monitor.forceWorking(agent.id, { source: 'tool-use', toolUseId: 'A', ttlClass: 'tool-pending' });
+    monitor.forceWorking(agent.id, { source: 'tool-use', toolUseId: 'B', ttlClass: 'tool-pending' });
+
+    const before = monitor.getLatchSnapshot(agent.id);
+    assert.ok(before && before.state === 'working');
+    assert.equal(before.outstandingToolIds.size, 2);
+
+    // Resolve only A — B is still outstanding.
+    monitor.forceWorking(agent.id, {
+      source: 'tool-result',
+      resolvedToolUseId: 'A',
+      ttlClass: 'tool-pending',
+    });
+
+    const after = monitor.getLatchSnapshot(agent.id);
+    assert.ok(after && after.state === 'working');
+    assert.equal(after.outstandingToolIds.size, 1, 'B is still outstanding');
+    assert.ok(after.outstandingToolIds.has('B'));
+
+    // Beyond model-pending TTL but under tool-pending TTL → still working.
+    fakes.now.value += WORKING_LATCH_MODEL_PENDING_MS + 1_000;
+    fakes.lastOutputAt.set(agent.id, fakes.now.value - WORKING_LATCH_MODEL_PENDING_MS - 1_000);
+    const inferred = await inferStatus(monitor, agent);
+    assert.equal(inferred, 'working',
+      'tool-pending TTL applies while a tool remains outstanding');
+  } finally {
+    restore();
+  }
+});
+
+test('BUG-09: both tools resolve — effective TTL shrinks to model-pending', async () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeAgent('w-1', { status: 'working' });
+    const monitor = makeMonitor({ fakes, agent });
+
+    monitor.forceWorking(agent.id, { source: 'tool-use', toolUseId: 'A', ttlClass: 'tool-pending' });
+    monitor.forceWorking(agent.id, { source: 'tool-use', toolUseId: 'B', ttlClass: 'tool-pending' });
+    monitor.forceWorking(agent.id, {
+      source: 'tool-result',
+      resolvedToolUseId: 'A',
+      ttlClass: 'tool-pending',
+    });
+    monitor.forceWorking(agent.id, {
+      source: 'tool-result',
+      resolvedToolUseId: 'B',
+      ttlClass: 'tool-pending',
+    });
+
+    const latch = monitor.getLatchSnapshot(agent.id);
+    assert.ok(latch && latch.state === 'working');
+    assert.equal(latch.outstandingToolIds.size, 0, 'no outstanding tools');
+
+    // Just past model-pending TTL — latch should be considered expired and PTY
+    // truth resumes.
+    fakes.now.value += WORKING_LATCH_MODEL_PENDING_MS + 1_000;
+    fakes.lastOutputAt.set(agent.id, fakes.now.value - WORKING_THRESHOLD_MS - 1_000);
+    const inferred = await inferStatus(monitor, agent);
+    assert.equal(inferred, 'idle',
+      'effective TTL is model-pending once outstandingToolIds is empty');
+  } finally {
+    restore();
+  }
+});
+
+test('BUG-09 §3.1 / C7: forceWorking refreshes refreshedAt on an already-working latch', () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeAgent('w-1', { status: 'working' });
+    const monitor = makeMonitor({ fakes, agent });
+
+    monitor.forceWorking(agent.id, { source: 'task-started', ttlClass: 'model-pending' });
+    const first = monitor.getLatchSnapshot(agent.id);
+    assert.ok(first && first.state === 'working');
+    const refreshedAt1 = first.refreshedAt;
+
+    fakes.now.value += 5_000;
+    monitor.forceWorking(agent.id, { source: 'tool-use', toolUseId: 'X', ttlClass: 'tool-pending' });
+    const second = monitor.getLatchSnapshot(agent.id);
+    assert.ok(second && second.state === 'working');
+    assert.ok(second.refreshedAt > refreshedAt1,
+      'C7: refreshedAt advances on subsequent forceWorking calls');
+    assert.equal(second.setAt, first.setAt,
+      'setAt is preserved across refresh — only refreshedAt advances');
+    assert.ok(second.outstandingToolIds.has('X'),
+      'tool-use toolUseId is now in the outstanding set');
+  } finally {
+    restore();
+  }
+});
+
+test('BUG-09 §3.1 / C8: forceIdle overwrites a working latch (does not delete)', async () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeAgent('w-1', { status: 'working' });
+    const monitor = makeMonitor({ fakes, agent });
+
+    monitor.forceWorking(agent.id, { source: 'tool-use', toolUseId: 'A', ttlClass: 'tool-pending' });
+    monitor.forceIdle(agent.id, 'turnComplete');
+
+    const idleLatch = monitor.getLatchSnapshot(agent.id);
+    assert.ok(idleLatch && idleLatch.state === 'idle',
+      'C8: idle latch overwrote the working latch instead of deleting it');
+
+    // Within idle latch TTL, even a PTY burst cannot promote back to working.
+    fakes.now.value += 5_000;
+    fakes.lastOutputAt.set(agent.id, fakes.now.value);
+    const inferred = await inferStatus(monitor, agent);
+    assert.equal(inferred, 'idle',
+      'idle latch suppresses PTY-noise promotion as before');
+  } finally {
+    restore();
+  }
+});
+
+test('BUG-09 §3.1 (Codex round 3): PTY (y/N) does NOT override tool-pending working latch', async () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeAgent('w-1', { status: 'working' });
+    const ringTails = new Map<string, string>();
+    // The tail still has a (y/N) line from a prior turn — but a tool is
+    // genuinely outstanding, so pattern detection must not fire forceWaiting.
+    ringTails.set(agent.id, 'Do you want to proceed? (y/N) ');
+    const monitor = makeMonitor({ fakes, agent, ringTails });
+
+    monitor.forceWorking(agent.id, { source: 'tool-use', toolUseId: 'A', ttlClass: 'tool-pending' });
+
+    // PTY quiet >2s so the detector would otherwise fire.
+    fakes.lastOutputAt.set(agent.id, fakes.now.value - 5_000);
+    const inferred = await inferStatus(monitor, agent);
+    assert.equal(inferred, 'working',
+      'tool-pending working latch outranks a (y/N) line in the ring tail');
+    const latch = monitor.getLatchSnapshot(agent.id);
+    assert.ok(latch && latch.state === 'working',
+      'pattern detection did not overwrite the tool-pending latch');
+  } finally {
+    restore();
+  }
+});
+
+test('BUG-09 §3.1: PTY (y/N) DOES override model-pending working latch', async () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeAgent('w-1', { status: 'working' });
+    const ringTails = new Map<string, string>();
+    ringTails.set(agent.id, 'Do you want to proceed? (y/N) ');
+    const monitor = makeMonitor({ fakes, agent, ringTails });
+
+    // model-pending latch with NO outstanding tools — pattern detection still beats it.
+    monitor.forceWorking(agent.id, { source: 'task-started', ttlClass: 'model-pending' });
+
+    fakes.lastOutputAt.set(agent.id, fakes.now.value - 5_000);
+    const inferred = await inferStatus(monitor, agent);
+    assert.equal(inferred, 'waiting',
+      'model-pending latch yields to a real waiting-prompt pattern');
+    const latch = monitor.getLatchSnapshot(agent.id);
+    assert.ok(latch && latch.state === 'waiting');
+  } finally {
+    restore();
+  }
+});
+
+test('BUG-09 §3.7: forgetAgent drops latch + statusHoldUntil', () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeAgent('w-1', { status: 'working' });
+    const monitor = makeMonitor({ fakes, agent });
+
+    monitor.forceWorking(agent.id, { source: 'tool-use', toolUseId: 'A', ttlClass: 'tool-pending' });
+    (monitor as any).statusHoldUntil.set(agent.id, fakes.now.value + 10_000);
+    assert.ok(monitor.getLatchSnapshot(agent.id), 'latch seeded');
+    assert.ok((monitor as any).statusHoldUntil.has(agent.id), 'hold seeded');
+
+    monitor.forgetAgent(agent.id);
+
+    assert.equal(monitor.getLatchSnapshot(agent.id), undefined, 'latch dropped');
+    assert.ok(!(monitor as any).statusHoldUntil.has(agent.id), 'hold dropped');
   } finally {
     restore();
   }

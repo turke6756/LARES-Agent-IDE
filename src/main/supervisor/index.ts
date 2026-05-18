@@ -270,7 +270,7 @@ export class AgentSupervisor extends EventEmitter {
       statusMonitor: {
         forceIdle: (agentId, source) => this.monitor.forceIdle(agentId, source),
         forceWaiting: (agentId, kind, excerpt) => this.monitor.forceWaiting(agentId, kind, excerpt),
-        forceWorking: (agentId, source) => this.monitor.forceWorking(agentId, source),
+        forceWorking: (agentId, opts) => this.monitor.forceWorking(agentId, opts),
       },
     };
     this.bridge = new EventBridge(bridgeDeps);
@@ -1264,6 +1264,10 @@ export class AgentSupervisor extends EventEmitter {
       return;
     }
 
+    // BUG-09 §3.7 — drop the latch before transitioning to `restarting` so a
+    // mid-tool crash does not leave a tool-pending latch alive for 15 min.
+    this.monitor.forgetAgent(agent.id);
+
     const priorRestart = getAgent(agent.id)?.status;
     updateAgentStatus(agent.id, 'restarting');
     addEvent(agent.id, 'restarting');
@@ -1539,6 +1543,9 @@ export class AgentSupervisor extends EventEmitter {
 
     this.fileTrackers.delete(agentId);
     this.bridge.forgetAgent(agentId);
+    // BUG-09 §3.7 — drop the latch + hold-until entries so a 15-min
+    // tool-pending latch can't survive into a future agent record reusing this id.
+    this.monitor.forgetAgent(agentId);
     dbDeleteAgent(agentId);
     this.emit('agentDeleted', { agentId });
   }
@@ -1547,6 +1554,11 @@ export class AgentSupervisor extends EventEmitter {
     await this.stopAgent(agentId);
     const agent = getAgent(agentId);
     if (!agent) return;
+
+    // BUG-09 §3.7 — a runner crash mid-tool would otherwise leave a
+    // tool-pending latch in place for the full 15-min TTL. Clear it before
+    // we transition to `restarting`.
+    this.monitor.forgetAgent(agentId);
 
     const priorRestart = getAgent(agentId)?.status;
     updateAgentStatus(agentId, 'restarting');
