@@ -1010,7 +1010,15 @@ export class AgentSupervisor extends EventEmitter {
       console.log(`[Windows] freshSession=true — skipping codex session-id discovery for ${agent.title} (${agent.id})`);
     }
 
-    runner.launch(agent.workingDirectory, launchCmd, args, agent.logPath || '', useDirectSpawn);
+    // BUG-13 Path A: disable Claude Code's next-prompt ghost-text suggestion
+    // rendering. The grey suggestion bytes (a) flap PTY-fallback status
+    // idle↔working and (b) leak verbatim into the supervisor event's `Last
+    // output:` field. Documented disable knob:
+    // https://code.claude.com/docs/en/interactive-mode
+    const extraEnv = agent.provider === 'claude'
+      ? { CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION: 'false' }
+      : undefined;
+    runner.launch(agent.workingDirectory, launchCmd, args, agent.logPath || '', useDirectSpawn, extraEnv);
     updateAgentPid(agent.id, runner.pid);
     const priorWinLaunch = getAgent(agent.id)?.status;
     updateAgentStatus(agent.id, 'working');
@@ -1102,6 +1110,17 @@ export class AgentSupervisor extends EventEmitter {
 
     let command = overrideCommand || agent.command;
     const isClaude = agent.provider === 'claude';
+
+    // BUG-13 Path A: disable Claude Code's next-prompt ghost-text suggestion
+    // rendering. The grey suggestion bytes (a) flap PTY-fallback status
+    // idle↔working and (b) leak verbatim into the supervisor event's `Last
+    // output:` field. Documented disable knob:
+    // https://code.claude.com/docs/en/interactive-mode
+    // Use `env VAR=value cmd` so the prefix survives the later `exec ${command}`
+    // wrap (env consumes the assignment, then exec's ccode with that env).
+    if (isClaude) {
+      command = `env CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false ${command}`;
+    }
 
     // Supervisor workspace-root contract (see docs/PERSISTENT_AGENT_LAUNCH_CONTRACT.md).
     // Computed up here so it's available both for the bare-command case and for the

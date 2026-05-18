@@ -63,7 +63,7 @@ export class WindowsRunner extends EventEmitter {
     return this._alive;
   }
 
-  launch(workDir: string, command: string, args: string[], logPath: string, directSpawn = false): void {
+  launch(workDir: string, command: string, args: string[], logPath: string, directSpawn = false, extraEnv?: Record<string, string>): void {
     const logDir = path.dirname(logPath);
     if (!fs.existsSync(logDir)) fs.mkdirSync(logDir, { recursive: true });
 
@@ -73,8 +73,12 @@ export class WindowsRunner extends EventEmitter {
     // Find the pty-host script
     const ptyHostPath = getScriptPath('pty-host.js');
 
-    // Spawn pty-host under regular Node.js (not Electron)
-    const env = { ...process.env };
+    // Spawn pty-host under regular Node.js (not Electron). `extraEnv` is
+    // merged in so callers can inject provider-specific vars (e.g. BUG-13
+    // Path A sets CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false on Claude
+    // launches). pty-host forwards its process.env into pty.spawn, so
+    // anything we set here reaches the PTY child.
+    const env = { ...process.env, ...(extraEnv || {}) };
     delete env.CLAUDECODE;
     delete env.ELECTRON_RUN_AS_NODE;
 
