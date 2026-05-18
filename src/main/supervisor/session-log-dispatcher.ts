@@ -26,13 +26,21 @@ const SEEN_UUID_MAX = RING_BUFFER_MAX * 3;
 // `user-text` that arrives on disk seconds later. 30s spec + 5s clock skew slack.
 const SYNTHETIC_DEDUPE_WINDOW_MS = 35_000;
 
+// Recency-only marker. We used to also store a normalized text key here and
+// string-match against the real event, but the PTY input path mangles non-ASCII
+// bytes (em-dashes, smart quotes, ellipsis, etc. flatten to single spaces
+// inside ConPTY / Win32 Input Mode) so the marker text and the real
+// session-log entry no longer collide — every Codex turn with a unicode-rich
+// payload double-emitted in chat. We now consume the oldest in-window marker
+// FIFO regardless of payload, on the invariant that `_doSendInput` is the only
+// path that produces a `user-text` event for codex/gemini agents during a
+// pending synthetic. The known trade-off: a human typing into the codex TUI
+// concurrently with a script send may have their own input visually attributed
+// to the script (the codex side still processed both correctly; only the
+// dashboard chat display can race). See plans/groupthink-duplicate-relay-
+// investigation.md for the full post-mortem.
 interface SyntheticMarker {
-  text: string; // already normalized
   timestamp: number;
-}
-
-function normalizeUserText(s: string): string {
-  return s.trim().replace(/\s+/g, ' ');
 }
 
 export class SessionLogDispatcher extends EventEmitter {
@@ -106,7 +114,7 @@ export class SessionLogDispatcher extends EventEmitter {
   // the on-disk reader; pollOne dedupes it against markers stored here.
   appendSyntheticUserText(agentId: string, text: string): void {
     const now = Date.now();
-    this.recordSyntheticMarker(agentId, text, now);
+    this.recordSyntheticMarker(agentId, now);
 
     const ev: UserTextEvent = {
       type: 'user-text',
@@ -125,7 +133,7 @@ export class SessionLogDispatcher extends EventEmitter {
     this.emit('chat-events', batch);
   }
 
-  private recordSyntheticMarker(agentId: string, text: string, now: number): void {
+  private recordSyntheticMarker(agentId: string, now: number): void {
     let ring = this.syntheticMarkers.get(agentId);
     if (!ring) {
       ring = [];
@@ -140,24 +148,33 @@ export class SessionLogDispatcher extends EventEmitter {
       }
     }
     ring.length = writeIdx;
-    ring.push({ text: normalizeUserText(text), timestamp: now });
+    ring.push({ timestamp: now });
   }
 
-  /** Returns true if `event` should be dropped (matches a recent synthetic marker). */
+  /** Returns true if `event` should be dropped — consumes the oldest in-window synthetic marker FIFO. */
   private dedupeAgainstSynthetic(event: SessionEvent): boolean {
     if (event.type !== 'user-text') return false;
     const ring = this.syntheticMarkers.get(event.agentId);
     if (!ring || ring.length === 0) return false;
     const eventTs = Date.parse(event.timestamp);
     const refTs = isFinite(eventTs) ? eventTs : Date.now();
-    const target = normalizeUserText(event.text);
+    // Drop markers that are too old relative to this real event. We only evict
+    // in the past direction — a marker dated after the event could still match
+    // a later real event whose own timestamp catches up.
+    let writeIdx = 0;
     for (let i = 0; i < ring.length; i++) {
-      const m = ring[i];
-      if (Math.abs(m.timestamp - refTs) > SYNTHETIC_DEDUPE_WINDOW_MS) continue;
-      if (m.text === target) {
-        ring.splice(i, 1); // consume the marker on hit
-        return true;
+      if (refTs - ring[i].timestamp <= SYNTHETIC_DEDUPE_WINDOW_MS) {
+        ring[writeIdx++] = ring[i];
       }
+    }
+    ring.length = writeIdx;
+    if (ring.length === 0) return false;
+    // Ring is kept in chronological insert order; consume the oldest if it's
+    // within ±window of the real event. FIFO by recency, not by text content
+    // (see SyntheticMarker doc for the post-mortem).
+    if (Math.abs(ring[0].timestamp - refTs) <= SYNTHETIC_DEDUPE_WINDOW_MS) {
+      ring.shift();
+      return true;
     }
     return false;
   }

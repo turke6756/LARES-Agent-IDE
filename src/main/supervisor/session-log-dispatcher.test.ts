@@ -77,24 +77,18 @@ test('synthetic followed by matching real within window: real is dropped', () =>
   assert.equal(emitted[0].events[0].uuid.startsWith('synthetic:'), true);
 });
 
-test('different text passes through (no false-positive dedupe)', () => {
+test('recency-only dedupe: real with different text still drops within window', () => {
+  // Post-fix contract: text content is no longer the dedupe key. Any real
+  // user-text arriving within the window of an unconsumed synthetic is
+  // assumed to be the PTY echo of that send (the alternative — concurrent
+  // direct-TUI typing — is rare and explicitly documented as a known
+  // attribution race in SyntheticMarker's comment).
   const { dispatcher, reader, emitted } = makeDispatcher();
   dispatcher.appendSyntheticUserText('agent-1', 'hello');
   reader.queue.push(realUserText('something else', new Date()));
   dispatcher.pollNow();
-  assert.equal(emitted.length, 2, 'synthetic + real both emit');
-  const e0 = emitted[0].events[0];
-  const e1 = emitted[1].events[0];
-  assert.ok(e0.type === 'user-text' && e0.text === 'hello');
-  assert.ok(e1.type === 'user-text' && e1.text === 'something else');
-});
-
-test('whitespace differences still match (normalization)', () => {
-  const { dispatcher, reader, emitted } = makeDispatcher();
-  dispatcher.appendSyntheticUserText('agent-1', 'hello   world');
-  reader.queue.push(realUserText('hello world', new Date()));
-  dispatcher.pollNow();
-  assert.equal(emitted.length, 1, 'normalized text matches');
+  assert.equal(emitted.length, 1, 'synthetic only; real dropped by recency match');
+  assert.equal(emitted[0].events[0].uuid.startsWith('synthetic:'), true);
 });
 
 test('real arriving outside the 35s window passes through', () => {
@@ -114,6 +108,105 @@ test('marker is consumed on hit (second matching real is NOT dropped)', () => {
   dispatcher.pollNow();
   // First real consumed by marker; second real has no marker left.
   assert.equal(emitted.length, 2, 'synthetic batch + second real batch');
+});
+
+// ── Recency dedupe: PTY unicode-mangling repro (the original bug) ────
+
+test('em-dash flattened by PTY still dedupes (the original bug)', () => {
+  // Repro of plans/groupthink-duplicate-relay-investigation.md: ConPTY /
+  // Win32 Input Mode replaces U+2014 (em-dash) with a single space before
+  // codex sees the input. Pre-fix, the text-equality dedupe missed and
+  // both copies emitted. Post-fix, recency wins.
+  const { dispatcher, reader, emitted } = makeDispatcher();
+  dispatcher.appendSyntheticUserText('agent-1', 'Draft 1 — review of doc');
+  reader.queue.push(realUserText('Draft 1   review of doc', new Date()));
+  dispatcher.pollNow();
+  assert.equal(emitted.length, 1, 'mangled real should still be dropped');
+  assert.equal(emitted[0].events[0].uuid.startsWith('synthetic:'), true);
+});
+
+test('en-dash flattened by PTY still dedupes', () => {
+  const { dispatcher, reader, emitted } = makeDispatcher();
+  dispatcher.appendSyntheticUserText('agent-1', 'pages 884–895 reviewed');
+  reader.queue.push(realUserText('pages 884 895 reviewed', new Date()));
+  dispatcher.pollNow();
+  assert.equal(emitted.length, 1);
+});
+
+test('smart apostrophe flattened by PTY still dedupes', () => {
+  const { dispatcher, reader, emitted } = makeDispatcher();
+  dispatcher.appendSyntheticUserText('agent-1', 'don’t skip the heartbeat');
+  reader.queue.push(realUserText('don t skip the heartbeat', new Date()));
+  dispatcher.pollNow();
+  assert.equal(emitted.length, 1);
+});
+
+test('ellipsis flattened by PTY still dedupes', () => {
+  const { dispatcher, reader, emitted } = makeDispatcher();
+  dispatcher.appendSyntheticUserText('agent-1', 'and then… confirm');
+  reader.queue.push(realUserText('and then  confirm', new Date()));
+  dispatcher.pollNow();
+  assert.equal(emitted.length, 1);
+});
+
+test('multiple in-flight synthetics: reals consume markers FIFO', () => {
+  // Two back-to-back script sends, both eventually echoed by codex with
+  // unicode mangled to ASCII. With recency-only dedupe, FIFO consumption
+  // means both reals drop regardless of text identity.
+  const { dispatcher, reader, emitted } = makeDispatcher();
+  dispatcher.appendSyntheticUserText('agent-1', 'first — message');
+  dispatcher.appendSyntheticUserText('agent-1', 'second — message');
+  // Note: real arrival order doesn't matter (and could be reversed in
+  // pathological codex flush patterns) — FIFO marker consumption is robust
+  // either way. Here we use the natural in-order case.
+  reader.queue.push(
+    realUserText('first   message', new Date()),
+    realUserText('second   message', new Date()),
+  );
+  dispatcher.pollNow();
+  // 2 synthetic batches; both reals dropped.
+  assert.equal(emitted.length, 2, 'only the two synthetics should emit');
+  assert.ok(emitted[0].events[0].uuid.startsWith('synthetic:'));
+  assert.ok(emitted[1].events[0].uuid.startsWith('synthetic:'));
+});
+
+test('synthetic recorded after real arrives: both emit (real had no marker)', () => {
+  // Edge case for the dedupe contract: if a real `user-text` event lands
+  // before any synthetic marker exists for that agent, the real flows
+  // through unmodified, and a subsequent synthetic still emits its own
+  // event. Chat ends up with both — documented behavior, not a regression.
+  const { dispatcher, reader, emitted } = makeDispatcher();
+  reader.queue.push(realUserText('preexisting input', new Date()));
+  dispatcher.pollNow();
+  assert.equal(emitted.length, 1, 'real emits (no marker yet)');
+  assert.ok(emitted[0].events[0].uuid.startsWith('real:'));
+
+  dispatcher.appendSyntheticUserText('agent-1', 'preexisting input');
+  assert.equal(emitted.length, 2, 'synthetic still emits after the real');
+  assert.ok(emitted[1].events[0].uuid.startsWith('synthetic:'));
+});
+
+test('window boundary: real at exactly +35s is still dropped', () => {
+  const { dispatcher, reader, emitted } = makeDispatcher();
+  dispatcher.appendSyntheticUserText('agent-1', 'hello');
+  // Pin the marker timestamp deterministically so the boundary math doesn't
+  // race the few-ms between this test's `Date.now()` and the one inside
+  // `appendSyntheticUserText`.
+  const markerTs = 1_000_000_000_000;
+  (dispatcher as any).syntheticMarkers.get('agent-1')[0].timestamp = markerTs;
+  reader.queue.push(realUserText('hello', new Date(markerTs + 35_000)));
+  dispatcher.pollNow();
+  assert.equal(emitted.length, 1, 'boundary is inclusive — dedupe still fires');
+});
+
+test('window boundary: real at +35001ms passes through', () => {
+  const { dispatcher, reader, emitted } = makeDispatcher();
+  dispatcher.appendSyntheticUserText('agent-1', 'hello');
+  const markerTs = 1_000_000_000_000;
+  (dispatcher as any).syntheticMarkers.get('agent-1')[0].timestamp = markerTs;
+  reader.queue.push(realUserText('hello', new Date(markerTs + 35_001)));
+  dispatcher.pollNow();
+  assert.equal(emitted.length, 2, 'one tick past the boundary is outside');
 });
 
 test('real user event dropped by synthetic dedupe is remembered by uuid on replay', () => {
