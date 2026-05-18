@@ -239,42 +239,79 @@ export default function TerminalPanel({ height }: TerminalPanelProps) {
         setIsAtBottom(viewportAtBottom);
       });
 
-      // Pre-load full 10000 line history, then attach to the live stream
-      window.api.agents.getLog(agentId, 10000).then((logContent) => {
-        if (logContent) {
-          terminal.write(logContent);
+      // BUG-15: atomic snapshot-with-tail mount sequence.
+      //   1. Subscribe to live PTY data; bytes arriving before the snapshot
+      //      is written get buffered locally.
+      //   2. Attach (kicks main to start forwarding).
+      //   3. Fetch the ring-buffer snapshot.
+      //   4. Write the snapshot in rAF-paced chunks so a 1 MB scrollback
+      //      doesn't lock up the renderer.
+      //   5. Drain the buffered tail in order.
+      //   6. From then on, live bytes write straight through.
+      // Naive ordering (snapshot → subscribe) would lose bytes emitted during
+      // the IPC round-trip; this ordering closes that window.
+      const pendingTail: string[] = [];
+      let snapshotApplied = false;
+
+      const unsub = window.api.terminal.onData((incomingAgentId: string, data: string) => {
+        if (incomingAgentId !== agentId) return;
+        if (snapshotApplied) {
+          terminal.write(data);
+        } else {
+          pendingTail.push(data);
         }
+      });
+      window.api.terminal.attach(agentId);
 
-        window.api.terminal.attach(agentId);
+      cached = { terminal, fitAddon, unsub };
+      terminalCache.set(agentId, cached);
 
-        const unsub = window.api.terminal.onData((incomingAgentId: string, data: string) => {
-          if (incomingAgentId === agentId) {
-            terminal.write(data);
-          }
-        });
+      // Fit the terminal multiple times after attach to ensure correct sizing.
+      // The container may not have its final dimensions on the first frame,
+      // causing xterm to render at the wrong size (quarter-screen bug).
+      const fitAndSync = () => {
+        try {
+          fitAddon.fit();
+          window.api.terminal.resize(agentId, terminal.cols, terminal.rows);
+        } catch { /* ignore during layout transitions */ }
+      };
 
-        cached = { terminal, fitAddon, unsub };
-        terminalCache.set(agentId, cached);
+      window.api.agents.getRingBuffer(agentId).then((snapshot) => {
+        const finishMount = () => {
+          for (const chunk of pendingTail) terminal.write(chunk);
+          pendingTail.length = 0;
+          snapshotApplied = true;
 
-        // Fit the terminal multiple times after attach to ensure correct sizing.
-        // The container may not have its final dimensions on the first frame,
-        // causing xterm to render at the wrong size (quarter-screen bug).
-        const fitAndSync = () => {
-          try {
-            fitAddon.fit();
-            window.api.terminal.resize(agentId, terminal.cols, terminal.rows);
-          } catch { /* ignore during layout transitions */ }
-        };
-
-        setTimeout(() => {
+          setTimeout(() => {
             fitAndSync();
             terminal.scrollToBottom();
             terminal.focus();
-        }, 50);
-        // Second fit after layout has fully settled
-        setTimeout(fitAndSync, 200);
-        // Third fit as a safety net
-        setTimeout(fitAndSync, 500);
+          }, 50);
+          setTimeout(fitAndSync, 200);
+          setTimeout(fitAndSync, 500);
+        };
+
+        if (!snapshot) {
+          finishMount();
+          return;
+        }
+
+        // Chunked write: xterm's write(data, cb) yields between calls so the
+        // event loop stays responsive even for a 1 MB scrollback. 8 KB strikes
+        // a balance — small enough to avoid jank, large enough to limit the
+        // chain depth.
+        const CHUNK_SIZE = 8192;
+        let offset = 0;
+        const writeNext = () => {
+          if (offset >= snapshot.length) {
+            finishMount();
+            return;
+          }
+          const end = Math.min(offset + CHUNK_SIZE, snapshot.length);
+          terminal.write(snapshot.slice(offset, end), writeNext);
+          offset = end;
+        };
+        writeNext();
       });
     }
 
