@@ -13,6 +13,7 @@ import {
   SUPERVISOR_CONTEXT_THRESHOLDS,
   SUPERVISOR_EVENT_QUEUE_MAX,
   SUPERVISOR_EVENT_DRAIN_INTERVAL_MS,
+  SUPERVISOR_USER_TYPING_QUIESCENT_MS,
 } from '../../shared/constants';
 
 /** Subset of StatusMonitor's public surface that the bridge needs to drive
@@ -43,6 +44,11 @@ export interface EventBridgeDeps {
   scheduleDrain(ms: number, fn: () => void): { cancel(): void };
   /** Pipeline B status hints from `onChatEvents`. Added in P1A-02. */
   statusMonitor: StatusMonitorForceCollaborator;
+  /** BUG-11: epoch-ms of the last byte the user wrote into this agent's PTY
+   *  via `writeToAgent` (xterm keystrokes / paste / drop / query-injection).
+   *  Returns undefined when the agent has never received a user-PTY write.
+   *  Used to defer event auto-submit while the user is actively typing. */
+  getLastUserPtyWriteAt(agentId: string): number | undefined;
 }
 
 // P2-03: 'waiting' is a trigger status so the supervisor gets a notification
@@ -154,9 +160,13 @@ export class EventBridge {
               // BUG-09 §3.3 / C11 — any non-terminal assistant-text refreshes
               // the working latch, not just `stopReason === 'tool_use'`. Closes
               // the Codex hole and anticipates streamed assistant emissions.
+              // BUG-18 Change 3 — mark the turn as in-flight so a subsequent
+              // `tool_result → next-assistant thinking gap` cannot collapse
+              // the latch's effective TTL down to model-pending.
               this.deps.statusMonitor.forceWorking(agentId, {
                 source: 'assistant-text',
                 ttlClass: 'model-pending',
+                turnInFlight: true,
               });
             }
             break;
@@ -181,16 +191,25 @@ export class EventBridge {
             // evidence that the model is still running. The previous "not
             // status-bearing" comment was correct for the binary latch but
             // stops being correct once `working` is latchable.
+            // BUG-18 Change 1 — promote from `model-pending` (180 s) to
+            // `thinking-pending` (900 s). Claude's xhigh extended-thinking
+            // empirically gaps to 311 s before the next event in this
+            // workspace; the new ceiling covers that comfortably.
             this.deps.statusMonitor.forceWorking(agentId, {
               source: 'thinking',
-              ttlClass: 'model-pending',
+              ttlClass: 'thinking-pending',
             });
             break;
           case 'tool-use':
+            // BUG-18 Change 3 — mark the turn as in-flight; the latch keeps
+            // tool-pending TTL even after this tool resolves until either
+            // (a) the next refresh stores a longer ttlClass, or (b)
+            // `forceIdle('turnComplete')` overwrites the latch.
             this.deps.statusMonitor.forceWorking(agentId, {
               source: 'tool-use',
               toolUseId: event.toolUseId,
               ttlClass: 'tool-pending',
+              turnInFlight: true,
             });
             break;
           case 'tool-result':
@@ -207,9 +226,14 @@ export class EventBridge {
             });
             break;
           case 'task-started':
+            // BUG-18 Change 3 — see tool-use comment. task-started is the
+            // earliest positive signal a Codex turn has begun; without
+            // marking it in-flight, the first model-pending refresh that
+            // lands afterwards would collapse the TTL ceiling.
             this.deps.statusMonitor.forceWorking(agentId, {
               source: 'task-started',
               ttlClass: 'model-pending',
+              turnInFlight: true,
             });
             break;
           // usage, system-init: not status-bearing.
@@ -273,6 +297,20 @@ export class EventBridge {
         return;
       }
 
+      // BUG-11: defer auto-submit while the user is actively typing into the
+      // supervisor's PTY (any byte through `writeToAgent` in the last
+      // SUPERVISOR_USER_TYPING_QUIESCENT_MS). The 'isAttached' branch above
+      // is insufficient: it tracks renderer-mounted state, not keystrokes,
+      // so an external tmux client or a freshly-detached terminal would slip
+      // through. Composes with drain (which also re-checks this) — events
+      // queue until the user is quiet, then flush via the normal drain path.
+      if (this.isUserTyping(fresh.id)) {
+        this.queueEvent(event);
+        this.armDrain(supervisor.id);
+        console.log(`[event-bridge] Queued event (user typing): ${event.type} for "${event.agentTitle}"`);
+        return;
+      }
+
       const payload = buildEventPayload(event);
       await this.deps.sendInput(fresh.id, payload);
       this.deps.addAuditEvent(
@@ -285,6 +323,14 @@ export class EventBridge {
     }
 
     console.log(`[event-bridge] Dropped event (supervisor ${fresh.status}): ${event.type} for "${event.agentTitle}"`);
+  }
+
+  /** BUG-11: true iff the user wrote to this agent's PTY in the last
+   *  SUPERVISOR_USER_TYPING_QUIESCENT_MS milliseconds. */
+  private isUserTyping(agentId: string): boolean {
+    const last = this.deps.getLastUserPtyWriteAt(agentId);
+    if (last === undefined) return false;
+    return this.deps.now() - last < SUPERVISOR_USER_TYPING_QUIESCENT_MS;
   }
 
   private queueEvent(event: SupervisorEvent): void {
@@ -312,6 +358,14 @@ export class EventBridge {
     }
 
     if (supervisor.status === 'working' || supervisor.status === 'launching') {
+      this.armDrain(supervisorId);
+      return;
+    }
+
+    // BUG-11: re-check user-typing activity on drain, same as deliver().
+    // Without this, a drain timer that fires while the user is still typing
+    // would ship the queue into the active prompt buffer — the exact bug.
+    if (this.isUserTyping(supervisorId)) {
       this.armDrain(supervisorId);
       return;
     }

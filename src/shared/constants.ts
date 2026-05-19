@@ -24,6 +24,13 @@ export const SUPERVISOR_EVENT_LOG_TAIL_LINES = 5;
 export const SUPERVISOR_CONTEXT_THRESHOLDS = [80, 90, 95];
 export const SUPERVISOR_EVENT_QUEUE_MAX = 10;
 export const SUPERVISOR_EVENT_DRAIN_INTERVAL_MS = 15_000;
+// BUG-11: defer auto-submitting dashboard events while the user is actively
+// typing into the supervisor's PTY. Any byte arriving through
+// `AgentSupervisor.writeToAgent` stamps the agent's last-user-activity time;
+// the bridge defers (queues + re-arms drain) while the gap since that stamp
+// is below this threshold. 3 s covers the gap between successive keystrokes
+// during human typing without locking out events when the user pauses.
+export const SUPERVISOR_USER_TYPING_QUIESCENT_MS = 3_000;
 
 // Turn-latch TTLs — see plans/agent-lifecycle-hardening-plan.md §2.1.1 / D-09.
 // The latch holds Pipeline B's idle/waiting truth against contradictory PTY
@@ -45,6 +52,13 @@ export const WORKING_LATCH_MODEL_PENDING_MS = 180_000;
 // `toolUseId` pairing in `event-bridge.ts` means this is a safety floor, not
 // the primary mechanism.
 export const WORKING_LATCH_TOOL_PENDING_MS = 900_000; // 15 min
+// BUG-18 Change 1 — `thinking-pending` covers Claude extended-thinking
+// (xhigh effort) and equivalent provider phases where no chat event fires
+// for minutes. The 2026-05-19 sighting (311 s gap, Opus 4.7 xhigh) lands
+// comfortably under this ceiling. Set to 900 s to match the tool-pending
+// floor — the bound is "no chat refresh for 15 min" regardless of whether
+// the silence is a tool or pure model thinking.
+export const WORKING_LATCH_THINKING_PENDING_MS = 900_000; // 15 min
 
 /** Default CLI commands per provider and environment */
 export const PROVIDER_COMMANDS: Record<AgentProvider, { windows: string; wsl: string }> = {

@@ -18,6 +18,7 @@ import {
   WORKING_THRESHOLD_MS,
   WORKING_LATCH_MODEL_PENDING_MS,
   WORKING_LATCH_TOOL_PENDING_MS,
+  WORKING_LATCH_THINKING_PENDING_MS,
 } from '../../shared/constants';
 import type { Agent } from '../../shared/types';
 import type { StatusChangedEvent } from './status-events';
@@ -404,7 +405,15 @@ test('BUG-09: parallel tools — single tool-result keeps tool-pending TTL', asy
   }
 });
 
-test('BUG-09: both tools resolve — effective TTL shrinks to model-pending', async () => {
+test('BUG-18 Change 1: both tools resolve — latch still survives past model-pending (ttlClass=tool-pending stored)', async () => {
+  // Updated for BUG-18 Change 1. Before Change 1, `inferStatus` derived the
+  // effective TTL solely from `outstandingToolIds.size` and the stored
+  // `ttlClass` was dead data. That meant a `tool-result` resolving the last
+  // outstanding tool collapsed the TTL back to model-pending (180 s) —
+  // exactly the Claude §2.1 "tool_result → next-assistant thinking gap"
+  // false-idle pathway (3 of 25 sampled gaps cleared 180 s). Change 1 makes
+  // `ttlClass` the source-of-truth, so a latch whose last refresh stored
+  // `tool-pending` keeps the 900 s ceiling even after the last tool resolves.
   const fakes = makeStatusMonitorFakes();
   const restore = patchDatabaseModule(fakes);
   try {
@@ -427,14 +436,24 @@ test('BUG-09: both tools resolve — effective TTL shrinks to model-pending', as
     const latch = monitor.getLatchSnapshot(agent.id);
     assert.ok(latch && latch.state === 'working');
     assert.equal(latch.outstandingToolIds.size, 0, 'no outstanding tools');
+    assert.equal(latch.ttlClass, 'tool-pending',
+      'latch retained tool-pending ttlClass from last forceWorking');
 
-    // Just past model-pending TTL — latch should be considered expired and PTY
-    // truth resumes.
+    // Just past model-pending TTL: pre-Change-1 this would flip to idle.
+    // Post-Change-1 the latch's tool-pending ceiling holds working.
     fakes.now.value += WORKING_LATCH_MODEL_PENDING_MS + 1_000;
     fakes.lastOutputAt.set(agent.id, fakes.now.value - WORKING_THRESHOLD_MS - 1_000);
-    const inferred = await inferStatus(monitor, agent);
+    let inferred = await inferStatus(monitor, agent);
+    assert.equal(inferred, 'working',
+      'Change 1: ttlClass=tool-pending holds past model-pending even with no outstanding tools');
+
+    // Push past tool-pending TTL — latch must finally expire and PTY truth
+    // takes over (stale PTY → idle).
+    fakes.now.value += WORKING_LATCH_TOOL_PENDING_MS;
+    fakes.lastOutputAt.set(agent.id, fakes.now.value - WORKING_THRESHOLD_MS - 1_000);
+    inferred = await inferStatus(monitor, agent);
     assert.equal(inferred, 'idle',
-      'effective TTL is model-pending once outstandingToolIds is empty');
+      'latch eventually expires once age exceeds the tool-pending ceiling');
   } finally {
     restore();
   }
@@ -691,6 +710,260 @@ test('latch invalidation: a second forceIdle/forceWaiting overwrites the prior l
     const t2 = monitor.getLatchSnapshot(agent.id);
     assert.ok(t2 && t2.state === 'waiting' && t2.waitingExcerpt === 'Press Enter');
     assert.ok(t2.setAt > t1.setAt, 'latch setAt advances on overwrite');
+  } finally {
+    restore();
+  }
+});
+
+// ── BUG-18 Changes 1, 2, 3 ───────────────────────────────────────────
+
+test('BUG-18 Change 1: thinking-pending latch survives past 180 s but expires at 900 s', async () => {
+  // The Claude xhigh-effort case from plans/status-flip-bug18-investigation-claude.md §1.
+  // A `thinking` event refreshes the latch with ttlClass='thinking-pending'.
+  // The 2026-05-19 sighting was a 311 s thinking gap; under the old 180 s
+  // model-pending ceiling the latch would have expired and the supervisor
+  // would have paged false-idle. Post-Change-1 the latch holds working for
+  // up to the thinking-pending ceiling (900 s), then falls back to PTY.
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeAgent('w-1', { status: 'working' });
+    const monitor = makeMonitor({ fakes, agent });
+
+    monitor.forceWorking(agent.id, { source: 'thinking', ttlClass: 'thinking-pending' });
+    const latch = monitor.getLatchSnapshot(agent.id);
+    assert.ok(latch && latch.state === 'working');
+    assert.equal(latch.ttlClass, 'thinking-pending');
+
+    // Past model-pending TTL (180 s) but well inside thinking-pending (900 s).
+    // PTY also went stale so the only thing keeping the agent working is the
+    // ttlClass-driven ceiling.
+    fakes.now.value += 300_000; // 5 min
+    fakes.lastOutputAt.set(agent.id, fakes.now.value - WORKING_THRESHOLD_MS - 1_000);
+    let inferred = await inferStatus(monitor, agent);
+    assert.equal(inferred, 'working',
+      'thinking-pending holds working through a 5 min model-thinking gap');
+
+    // Push past the thinking-pending ceiling — latch must finally expire.
+    fakes.now.value += WORKING_LATCH_THINKING_PENDING_MS;
+    fakes.lastOutputAt.set(agent.id, fakes.now.value - WORKING_THRESHOLD_MS - 1_000);
+    inferred = await inferStatus(monitor, agent);
+    assert.equal(inferred, 'idle',
+      'thinking-pending latch expires at the 900 s ceiling');
+  } finally {
+    restore();
+  }
+});
+
+test('BUG-18 Change 1: thinking-pending boundary — still working at exactly 900 s', async () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeAgent('w-1', { status: 'working' });
+    const monitor = makeMonitor({ fakes, agent });
+
+    monitor.forceWorking(agent.id, { source: 'thinking', ttlClass: 'thinking-pending' });
+    fakes.now.value += WORKING_LATCH_THINKING_PENDING_MS;
+    fakes.lastOutputAt.set(agent.id, fakes.now.value - WORKING_THRESHOLD_MS - 1_000);
+
+    const inferred = await inferStatus(monitor, agent);
+    assert.equal(inferred, 'working',
+      'TTL window is inclusive at the ceiling');
+  } finally {
+    restore();
+  }
+});
+
+test('BUG-18 Change 2: user-input-submitted seed (tool-pending) survives past 180 s with no chat events', async () => {
+  // Mirrors the production seed at src/main/supervisor/index.ts after
+  // sendInput delivery: forceWorking(agentId, { source:'user-input-submitted',
+  // ttlClass:'tool-pending' }). Before Change 2 this was model-pending (180 s),
+  // which was too tight for first-turn Claude xhigh extended thinking
+  // (empirical max 311 s in this workspace, p99 = 151 s).
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeAgent('w-1', { status: 'working' });
+    const monitor = makeMonitor({ fakes, agent });
+
+    monitor.forceWorking(agent.id, {
+      source: 'user-input-submitted',
+      ttlClass: 'tool-pending',
+    });
+
+    // Simulate the failure window: no chat events fire for 5 min and PTY is
+    // stale (xhigh "Wrangling…" spinner-only redraws fail the
+    // hasMeaningfulContent gate, see windows-runner.ts:221-238).
+    fakes.now.value += 300_000;
+    fakes.lastOutputAt.set(agent.id, fakes.now.value - WORKING_THRESHOLD_MS - 1_000);
+    fakes.lastRawOutputAt.set(agent.id, fakes.now.value - WORKING_THRESHOLD_MS - 1_000);
+
+    const inferred = await inferStatus(monitor, agent);
+    assert.equal(inferred, 'working',
+      'BUG-18 Change 2: 900 s seed holds through a 5 min first-turn thinking gap');
+  } finally {
+    restore();
+  }
+});
+
+test('BUG-18 Change 3: turnInFlight latch survives tool_result + 200 s of silence', async () => {
+  // The Claude §2.1 mid-turn case: a tool resolves (outstandingToolIds → 0)
+  // and the model spends >180 s thinking before the next event. Pre-Change-3
+  // the latch's effective TTL would collapse to model-pending; with
+  // turnInFlight=true (set by event-bridge on the tool-use that started this
+  // turn), the latch holds tool-pending TTL throughout the thinking gap.
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeAgent('w-1', { status: 'working' });
+    const monitor = makeMonitor({ fakes, agent });
+
+    // Tool-use marks the turn in-flight (mimics event-bridge.ts behavior).
+    monitor.forceWorking(agent.id, {
+      source: 'tool-use',
+      toolUseId: 'A',
+      ttlClass: 'tool-pending',
+      turnInFlight: true,
+    });
+    // The last assistant-text refresh stores model-pending (180 s) and keeps
+    // turnInFlight sticky-true. This is the critical window — without
+    // Change 3, the latch's effective TTL would now be model-pending.
+    monitor.forceWorking(agent.id, {
+      source: 'assistant-text',
+      ttlClass: 'model-pending',
+      turnInFlight: true,
+    });
+    // Tool resolves; no outstanding tools left, ttlClass downgrades to
+    // model-pending on the latest refresh.
+    monitor.forceWorking(agent.id, {
+      source: 'tool-result',
+      resolvedToolUseId: 'A',
+      ttlClass: 'model-pending',
+    });
+
+    const latch = monitor.getLatchSnapshot(agent.id);
+    assert.ok(latch && latch.state === 'working');
+    assert.equal(latch.outstandingToolIds.size, 0, 'no outstanding tools');
+    assert.equal(latch.ttlClass, 'model-pending',
+      'last refresh stored model-pending');
+    assert.equal(latch.turnInFlight, true,
+      'turnInFlight survives the tool-result refresh');
+
+    // 200 s of silence — well past model-pending (180 s) but well inside
+    // tool-pending (900 s). Stale PTY too so the only thing keeping the
+    // agent working is the turnInFlight override.
+    fakes.now.value += 200_000;
+    fakes.lastOutputAt.set(agent.id, fakes.now.value - WORKING_THRESHOLD_MS - 1_000);
+    fakes.lastRawOutputAt.set(agent.id, fakes.now.value - WORKING_THRESHOLD_MS - 1_000);
+
+    const inferred = await inferStatus(monitor, agent);
+    assert.equal(inferred, 'working',
+      'Change 3: turnInFlight overrides the stored model-pending TTL');
+  } finally {
+    restore();
+  }
+});
+
+test('BUG-18 Change 3: turnInFlight latch expires only on forceIdle(turnComplete)', async () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeAgent('w-1', { status: 'working' });
+    const monitor = makeMonitor({ fakes, agent });
+
+    monitor.forceWorking(agent.id, {
+      source: 'tool-use',
+      toolUseId: 'A',
+      ttlClass: 'tool-pending',
+      turnInFlight: true,
+    });
+    monitor.forceWorking(agent.id, {
+      source: 'tool-result',
+      resolvedToolUseId: 'A',
+      ttlClass: 'model-pending',
+    });
+
+    // 200 s of silence — still working because turnInFlight is true.
+    fakes.now.value += 200_000;
+    fakes.lastOutputAt.set(agent.id, fakes.now.value - WORKING_THRESHOLD_MS - 1_000);
+    fakes.lastRawOutputAt.set(agent.id, fakes.now.value - WORKING_THRESHOLD_MS - 1_000);
+    assert.equal(await inferStatus(monitor, agent), 'working',
+      'precondition: turnInFlight keeps working through silence');
+
+    // forceIdle('turnComplete') is the supervisor's truth-signal that the
+    // turn has terminated. It overwrites the latch to idle, which inherently
+    // clears turnInFlight.
+    monitor.forceIdle(agent.id, 'turnComplete');
+    const latch = monitor.getLatchSnapshot(agent.id);
+    assert.ok(latch && latch.state === 'idle',
+      'forceIdle overwrites the working latch with idle (turnInFlight gone)');
+    assert.equal(agent.status, 'idle');
+  } finally {
+    restore();
+  }
+});
+
+test('BUG-18 Change 3: turnInFlight is sticky-true across refreshes that omit the flag', async () => {
+  // The bridge sets turnInFlight=true on tool-use/task-started/non-terminal
+  // assistant-text. Other refreshes (tool-result, user-text) don't set it.
+  // Sticky semantics: once true, subsequent refreshes preserve it until
+  // forceIdle clears the whole latch.
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeAgent('w-1', { status: 'working' });
+    const monitor = makeMonitor({ fakes, agent });
+
+    monitor.forceWorking(agent.id, {
+      source: 'task-started',
+      ttlClass: 'model-pending',
+      turnInFlight: true,
+    });
+    let latch = monitor.getLatchSnapshot(agent.id);
+    assert.ok(latch && latch.state === 'working' && latch.turnInFlight === true);
+
+    // A refresh without turnInFlight (e.g. tool-result) must NOT clear it.
+    monitor.forceWorking(agent.id, {
+      source: 'tool-result',
+      resolvedToolUseId: 'X',
+      ttlClass: 'tool-pending',
+    });
+    latch = monitor.getLatchSnapshot(agent.id);
+    assert.ok(latch && latch.state === 'working');
+    assert.equal(latch.turnInFlight, true,
+      'turnInFlight stays true across a refresh that omits the flag');
+  } finally {
+    restore();
+  }
+});
+
+test('BUG-18 Change 3: turnInFlight stays false when never set (no impact on legacy paths)', async () => {
+  // Regression guard: forceWorking calls that don't carry turnInFlight (e.g.
+  // direct `notifyUserInputDelivered` from sendInput on a waiting agent)
+  // must not silently flip the override on.
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeAgent('w-1', { status: 'working' });
+    const monitor = makeMonitor({ fakes, agent });
+
+    monitor.forceWorking(agent.id, {
+      source: 'user-input',
+      ttlClass: 'model-pending',
+    });
+    const latch = monitor.getLatchSnapshot(agent.id);
+    assert.ok(latch && latch.state === 'working');
+    assert.equal(latch.turnInFlight, false,
+      'turnInFlight defaults to false when the caller omits the flag');
+
+    // Past model-pending TTL with no tools and no turnInFlight — latch must
+    // expire on schedule (no Change-3 override). PTY is stale → idle.
+    fakes.now.value += WORKING_LATCH_MODEL_PENDING_MS + 1_000;
+    fakes.lastOutputAt.set(agent.id, fakes.now.value - WORKING_THRESHOLD_MS - 1_000);
+    fakes.lastRawOutputAt.set(agent.id, fakes.now.value - WORKING_THRESHOLD_MS - 1_000);
+    const inferred = await inferStatus(monitor, agent);
+    assert.equal(inferred, 'idle',
+      'without turnInFlight, model-pending still expires at 180 s as before');
   } finally {
     restore();
   }

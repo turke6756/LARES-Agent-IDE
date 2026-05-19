@@ -7,14 +7,19 @@ import {
   WAITING_LATCH_TIMEOUT_MS,
   WORKING_LATCH_MODEL_PENDING_MS,
   WORKING_LATCH_TOOL_PENDING_MS,
+  WORKING_LATCH_THINKING_PENDING_MS,
 } from '../../shared/constants';
 import { getActiveAgents, updateAgentStatus, addEvent } from '../database';
 import type { StatusChangedEvent } from './status-events';
 import { PromptPatternDetector } from './prompt-pattern-detector';
+import { stripAnsi } from './strip-ansi';
 
 export type WaitingKind = 'question' | 'y-n' | 'enter' | 'choice' | 'approve' | 'tty-pattern';
 
-export type WorkingLatchTtlClass = 'short' | 'model-pending' | 'tool-pending';
+// BUG-18 Change 1 — added `thinking-pending` (900 s ceiling) for Claude
+// extended-thinking and equivalent provider phases where no chat event
+// lands for minutes.
+export type WorkingLatchTtlClass = 'short' | 'model-pending' | 'tool-pending' | 'thinking-pending';
 
 /** Typed options for {@link StatusMonitor.forceWorking}. See
  *  plans/bug-09-fix-design.md §3.1 — the previous `(agentId, source)` shape
@@ -24,20 +29,34 @@ export interface ForceWorkingOpts {
   toolUseId?: string;
   resolvedToolUseId?: string;
   ttlClass: WorkingLatchTtlClass;
+  /** BUG-18 Change 3 — marker that "this turn has begun and has not yet
+   *  hit a terminal event." Set by the bridge on tool-use, task-started,
+   *  and non-terminal assistant-text. Once true, the latch refresh holds
+   *  it true across subsequent refreshes; forceIdle('turnComplete')
+   *  overwrites the whole latch and naturally clears it. While true and
+   *  no tools are outstanding, `inferStatus` forces the effective TTL to
+   *  the tool-pending ceiling so a `tool_result → next assistant thinking
+   *  gap` (Claude writeup §2.1) can survive past the model-pending floor. */
+  turnInFlight?: boolean;
 }
 
 const PTY_QUIET_FOR_PATTERN_MS = 2_000;
 
-/** Strip ANSI escape sequences and control bytes from PTY data so the
- *  PromptPatternDetector can match against clean text. Mirrors the regex set
- *  in `windows-runner.ts:hasMeaningfulContent` / `wsl-runner.ts:hasMeaningfulContent`. */
-function stripAnsi(text: string): string {
-  return text
-    .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')
-    .replace(/\x1b\][^\x07]*\x07/g, '')
-    .replace(/\x1b[()][0-9A-Z]/g, '')
-    .replace(/\x1b\[[\?]?[0-9;]*[hlm]/g, '')
-    .replace(/[\x00-\x08\x0b-\x1f]/g, '');
+/** BUG-18 Change 1 — map the stored {@link WorkingLatchTtlClass} onto its
+ *  TTL ceiling (ms). `'short'` falls back to `model-pending` so the union
+ *  member (declared but currently unused) doesn't widen the window
+ *  accidentally. */
+function ttlForClass(c: WorkingLatchTtlClass): number {
+  switch (c) {
+    case 'thinking-pending':
+      return WORKING_LATCH_THINKING_PENDING_MS;
+    case 'tool-pending':
+      return WORKING_LATCH_TOOL_PENDING_MS;
+    case 'model-pending':
+    case 'short':
+    default:
+      return WORKING_LATCH_MODEL_PENDING_MS;
+  }
 }
 
 interface IdleLatchEntry {
@@ -63,6 +82,11 @@ interface WorkingLatchEntry {
   outstandingToolIds: Set<string>;
   source: string;
   ttlClass: WorkingLatchTtlClass;
+  /** BUG-18 Change 3 — set true by the bridge on tool-use, task-started, or
+   *  non-terminal assistant-text refreshes. Sticks through subsequent
+   *  refreshes; cleared only when `forceIdle('turnComplete')` overwrites
+   *  the latch. See {@link ForceWorkingOpts.turnInFlight}. */
+  turnInFlight: boolean;
 }
 
 export type TurnLatchEntry = IdleLatchEntry | WaitingLatchEntry | WorkingLatchEntry;
@@ -202,9 +226,11 @@ export class StatusMonitor extends EventEmitter {
 
     let outstanding: Set<string>;
     let setAt: number;
+    let priorTurnInFlight = false;
     if (existing && existing.state === 'working') {
       outstanding = existing.outstandingToolIds;
       setAt = existing.setAt;
+      priorTurnInFlight = existing.turnInFlight;
     } else {
       outstanding = new Set<string>();
       setAt = now;
@@ -213,6 +239,11 @@ export class StatusMonitor extends EventEmitter {
     if (opts.toolUseId) outstanding.add(opts.toolUseId);
     if (opts.resolvedToolUseId) outstanding.delete(opts.resolvedToolUseId);
 
+    // BUG-18 Change 3 — turnInFlight is sticky-true across refreshes. It
+    // can only be cleared by `forceIdle('turnComplete')` overwriting the
+    // entire latch (and even then the new latch is `idle`, not `working`).
+    const turnInFlight = priorTurnInFlight || opts.turnInFlight === true;
+
     this.turnLatch.set(agentId, {
       state: 'working',
       setAt,
@@ -220,6 +251,7 @@ export class StatusMonitor extends EventEmitter {
       outstandingToolIds: outstanding,
       source: opts.source,
       ttlClass: opts.ttlClass,
+      turnInFlight,
     });
 
     if (agent.status === 'working') return; // already working — latch refreshed, no event needed
@@ -311,9 +343,31 @@ export class StatusMonitor extends EventEmitter {
       if (latched.state === 'working') {
         const age = this.now() - latched.refreshedAt;
         const hasOutstandingTools = latched.outstandingToolIds.size > 0;
-        const effectiveTtl = hasOutstandingTools
-          ? WORKING_LATCH_TOOL_PENDING_MS
-          : WORKING_LATCH_MODEL_PENDING_MS;
+        // BUG-18 Change 1 — `latched.ttlClass` is the source-of-truth for the
+        // TTL window. The previous code derived TTL solely from
+        // `outstandingToolIds.size`, which made `ttlClass` dead-stored data and
+        // gave the wrong answer when a `tool-result` resolved the last tool but
+        // the model then thought for >180 s before the next event (the Claude
+        // §2.1 case — 3 of 25 instances in 50 recent JSONLs cleared 180 s).
+        //
+        // `tool-pending` is still forced as a floor whenever a tool is genuinely
+        // outstanding so a shorter stored class (e.g. `model-pending`) doesn't
+        // shrink the window while a tool is live.
+        //
+        // BUG-18 Change 3 — while `turnInFlight === true` AND no tools are
+        // outstanding (post-`tool_result` thinking gap), bump the effective
+        // TTL to `tool-pending` regardless of the stored class. This covers
+        // the case where the last refresh was an `assistant-text` (stored as
+        // `model-pending`) but the turn hasn't terminated — the model can
+        // still spend minutes on the next thinking block.
+        let effectiveTtl = ttlForClass(latched.ttlClass);
+        if (hasOutstandingTools && effectiveTtl < WORKING_LATCH_TOOL_PENDING_MS) {
+          effectiveTtl = WORKING_LATCH_TOOL_PENDING_MS;
+        }
+        if (latched.turnInFlight && !hasOutstandingTools
+            && effectiveTtl < WORKING_LATCH_TOOL_PENDING_MS) {
+          effectiveTtl = WORKING_LATCH_TOOL_PENDING_MS;
+        }
         if (age <= effectiveTtl) {
           // BUG-09 §3.1 (Codex round 3) — tiered PTY-pattern-detection vs
           // latched working:

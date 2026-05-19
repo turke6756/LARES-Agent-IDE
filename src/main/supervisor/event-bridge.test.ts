@@ -14,7 +14,10 @@ import {
   makeAgent,
   flushMicrotasks,
 } from './test-helpers/fake-bridge-deps';
-import { SUPERVISOR_EVENT_COOLDOWN_MS } from '../../shared/constants';
+import {
+  SUPERVISOR_EVENT_COOLDOWN_MS,
+  SUPERVISOR_USER_TYPING_QUIESCENT_MS,
+} from '../../shared/constants';
 import type { ContextStats } from '../../shared/types';
 import type {
   AssistantTextEvent,
@@ -625,8 +628,277 @@ async function BR_20_waitingToWorkingIsSuppressed(): Promise<void> {
   console.log('  BR-20 ✓ waiting → working transition is filtered');
 }
 
+// ── BUG-11: user-typing deferral ────────────────────────────────────────
+
+async function BR_11a_deliverDefersWhileUserTyping(): Promise<void> {
+  // Supervisor is idle and NOT attached. Without BUG-11 this would send
+  // immediately. With BUG-11, a recent `writeToAgent` stamp must queue
+  // instead so the event doesn't collide with the user's in-progress
+  // PTY input buffer.
+  const f = makeFakeBridgeDeps();
+  const supervisor = makeAgent('sup-1', {
+    isSupervisor: true,
+    isSupervised: false,
+    status: 'idle',
+    isAttached: false,
+  });
+  const worker = makeAgent('w-1', { status: 'working' });
+  f.agents.set(supervisor.id, supervisor);
+  f.agents.set(worker.id, worker);
+  const bridge = new EventBridge(f.deps);
+
+  // Simulate the user typing one character "now" — well inside the
+  // SUPERVISOR_USER_TYPING_QUIESCENT_MS window.
+  f.setLastUserPtyWriteAt(supervisor.id, f.getNow());
+
+  await bridge.onStatusChanged({
+    agentId: worker.id,
+    status: 'idle',
+    fromStatus: 'working',
+    source: 'monitor',
+  });
+
+  assert.equal(
+    f.sendInputCalls.length,
+    0,
+    'BR-11a: no immediate send while the user is typing into the supervisor PTY',
+  );
+  assert.equal(bridge.getQueueSnapshot().length, 1, 'BR-11a: event queued');
+  assert.equal(f.scheduler.pendingCount(), 1, 'BR-11a: drain scheduled');
+  console.log('  BR-11a ✓ deliver() defers on recent user PTY-write (BUG-11)');
+}
+
+async function BR_11b_drainRedefersWhileUserStillTyping(): Promise<void> {
+  // Queue an event with the user typing, then advance the clock so the
+  // drain timer would fire — but the user is STILL typing (write timestamp
+  // updated to the new now). drain() must re-arm, not ship.
+  const f = makeFakeBridgeDeps();
+  const supervisor = makeAgent('sup-1', {
+    isSupervisor: true,
+    isSupervised: false,
+    status: 'idle',
+    isAttached: false,
+  });
+  const worker = makeAgent('w-1', { status: 'working' });
+  f.agents.set(supervisor.id, supervisor);
+  f.agents.set(worker.id, worker);
+  const bridge = new EventBridge(f.deps);
+
+  f.setLastUserPtyWriteAt(supervisor.id, f.getNow());
+  await bridge.onStatusChanged({
+    agentId: worker.id,
+    status: 'idle',
+    fromStatus: 'working',
+    source: 'monitor',
+  });
+  assert.equal(bridge.getQueueSnapshot().length, 1);
+  assert.equal(f.scheduler.pendingCount(), 1);
+
+  // Time passes; user has continued typing the whole time (stamp is fresh).
+  f.setNow(f.getNow() + 20_000);
+  f.setLastUserPtyWriteAt(supervisor.id, f.getNow());
+
+  await bridge.drainPendingFor(supervisor.id);
+
+  assert.equal(
+    f.sendInputCalls.length,
+    0,
+    'BR-11b: drain refuses to ship while the user is still typing',
+  );
+  assert.equal(bridge.getQueueSnapshot().length, 1, 'BR-11b: event remains queued');
+  assert.equal(
+    f.scheduler.pendingCount(),
+    1,
+    'BR-11b: drain re-armed for a later attempt',
+  );
+  console.log('  BR-11b ✓ drain() re-arms while user still typing (BUG-11)');
+}
+
+async function BR_11c_drainShipsOnceUserQuiet(): Promise<void> {
+  // Same setup as BR-11b, but the user has stopped typing long enough that
+  // the quiescent window has elapsed. drain() must ship.
+  const f = makeFakeBridgeDeps();
+  const supervisor = makeAgent('sup-1', {
+    isSupervisor: true,
+    isSupervised: false,
+    status: 'idle',
+    isAttached: false,
+  });
+  const worker = makeAgent('w-1', { status: 'working' });
+  f.agents.set(supervisor.id, supervisor);
+  f.agents.set(worker.id, worker);
+  const bridge = new EventBridge(f.deps);
+
+  const typedAt = f.getNow();
+  f.setLastUserPtyWriteAt(supervisor.id, typedAt);
+  await bridge.onStatusChanged({
+    agentId: worker.id,
+    status: 'idle',
+    fromStatus: 'working',
+    source: 'monitor',
+  });
+  assert.equal(bridge.getQueueSnapshot().length, 1);
+
+  // User stopped typing; advance the clock past the quiescent window.
+  f.setNow(typedAt + SUPERVISOR_USER_TYPING_QUIESCENT_MS + 1);
+
+  await bridge.drainPendingFor(supervisor.id);
+
+  assert.equal(
+    f.sendInputCalls.length,
+    1,
+    'BR-11c: drain ships once the user has been quiet long enough',
+  );
+  console.log('  BR-11c ✓ drain() flushes once user typing has quiesced (BUG-11)');
+}
+
+async function BR_11d_idleSupervisorNoTypingShipsImmediately(): Promise<void> {
+  // Non-regression for BR-01: when there's no user-typing signal at all
+  // (getLastUserPtyWriteAt returns undefined), deliver() must still go
+  // through the immediate-send path. The BUG-11 gate is strictly additive.
+  const f = makeFakeBridgeDeps();
+  const supervisor = makeAgent('sup-1', {
+    isSupervisor: true,
+    isSupervised: false,
+    status: 'idle',
+    isAttached: false,
+  });
+  const worker = makeAgent('w-1', { status: 'working' });
+  f.agents.set(supervisor.id, supervisor);
+  f.agents.set(worker.id, worker);
+  f.logs.set(worker.id, 'tail\n');
+  const bridge = new EventBridge(f.deps);
+
+  // No setLastUserPtyWriteAt — user has never typed.
+  await bridge.onStatusChanged({
+    agentId: worker.id,
+    status: 'idle',
+    fromStatus: 'working',
+    source: 'monitor',
+  });
+
+  assert.equal(f.sendInputCalls.length, 1, 'BR-11d: idle + no typing → immediate send');
+  console.log('  BR-11d ✓ idle supervisor with no typing signal still auto-submits (BUG-11 non-regression)');
+}
+
+// ── BUG-18 Change 1 + Change 3 — event-bridge wiring ───────────────────
+
+async function BUG_18_thinkingForceWorkingUsesThinkingPending(): Promise<void> {
+  // Change 1: the `thinking` chat event now refreshes the latch with
+  // ttlClass='thinking-pending' (was 'model-pending'). Verify the bridge
+  // passes the new class through and does NOT mark turnInFlight (only
+  // tool-use/task-started/assistant-text do that — thinking is high-
+  // cadence positive evidence but doesn't itself begin a turn).
+  const f = makeFakeBridgeDeps();
+  const claude = makeAgent('cl-bug18-1', { provider: 'claude', status: 'working' });
+  f.agents.set(claude.id, claude);
+  const bridge = new EventBridge(f.deps);
+
+  bridge.onChatEvents(batchFor(claude.id, [
+    { type: 'thinking', uuid: 'tk', timestamp: '', agentId: claude.id, text: '' },
+  ]));
+
+  assert.equal(f.statusForceCalls.length, 1);
+  const call = f.statusForceCalls[0];
+  assert.equal(call.method, 'forceWorking');
+  assert.equal(call.workingOpts?.ttlClass, 'thinking-pending',
+    'BUG-18 Change 1: thinking now refreshes with ttlClass=thinking-pending');
+  assert.notEqual(call.workingOpts?.turnInFlight, true,
+    'thinking event does not mark the turn in-flight by itself');
+  console.log('  BUG-18 Change 1 ✓ thinking → forceWorking(ttlClass: thinking-pending)');
+}
+
+async function BUG_18_endToEndTurnInFlightSetAndCleared(): Promise<void> {
+  // Change 3: across a representative turn — task-started → tool-use →
+  // tool-result → assistant-text (turnComplete) — verify turnInFlight is
+  // marked on the right events and that the terminal turnComplete fires
+  // forceIdle (which clears the latch entirely in the real monitor).
+  const f = makeFakeBridgeDeps();
+  const claude = makeAgent('cl-bug18-2', { provider: 'claude', status: 'working' });
+  f.agents.set(claude.id, claude);
+  const bridge = new EventBridge(f.deps);
+
+  const taskStarted: TaskStartedEvent = {
+    type: 'task-started', uuid: 'ts', timestamp: '', agentId: claude.id,
+  };
+  const toolUse: ToolUseEvent = {
+    type: 'tool-use', uuid: 'tu', timestamp: '', agentId: claude.id,
+    toolUseId: 'X', toolName: 'Read', input: {},
+  };
+  const toolResult = {
+    type: 'tool-result' as const, uuid: 'tr', timestamp: '', agentId: claude.id,
+    toolUseId: 'X', content: 'ok', truncated: false, isError: false,
+  };
+  const midText = assistantText(claude.id, { text: 'thinking out loud' });
+  const finalText = assistantText(claude.id, {
+    text: 'done', turnComplete: true,
+  });
+
+  bridge.onChatEvents(batchFor(claude.id, [
+    taskStarted, toolUse, toolResult, midText, finalText,
+  ]));
+
+  const opts = (i: number) => f.statusForceCalls[i].workingOpts;
+  assert.equal(f.statusForceCalls.length, 5,
+    'one force call per event in the batch');
+
+  // task-started: turnInFlight=true, model-pending
+  assert.equal(f.statusForceCalls[0].source, 'task-started');
+  assert.equal(opts(0)?.turnInFlight, true,
+    'task-started marks the turn in-flight (Change 3)');
+  assert.equal(opts(0)?.ttlClass, 'model-pending');
+
+  // tool-use: turnInFlight=true, tool-pending, toolUseId pairing intact
+  assert.equal(f.statusForceCalls[1].source, 'tool-use');
+  assert.equal(opts(1)?.turnInFlight, true,
+    'tool-use marks the turn in-flight (Change 3)');
+  assert.equal(opts(1)?.ttlClass, 'tool-pending');
+  assert.equal(opts(1)?.toolUseId, 'X');
+
+  // tool-result: does NOT set turnInFlight (sticky-true in the real monitor
+  // handles preservation; the bridge omits the flag on tool-result).
+  assert.equal(f.statusForceCalls[2].source, 'tool-result');
+  assert.notEqual(opts(2)?.turnInFlight, true,
+    'tool-result does not redundantly set turnInFlight; monitor stickiness handles it');
+  assert.equal(opts(2)?.resolvedToolUseId, 'X');
+
+  // non-terminal assistant-text: turnInFlight=true, model-pending
+  assert.equal(f.statusForceCalls[3].source, 'assistant-text');
+  assert.equal(opts(3)?.turnInFlight, true,
+    'non-terminal assistant-text marks the turn in-flight (Change 3)');
+  assert.equal(opts(3)?.ttlClass, 'model-pending');
+
+  // assistant-text + turnComplete → forceIdle('turnComplete'); the real
+  // monitor's forceIdle overwrites the latch with idle, clearing
+  // turnInFlight (test verified in status-monitor.test.ts).
+  assert.equal(f.statusForceCalls[4].method, 'forceIdle');
+  assert.equal(f.statusForceCalls[4].source, 'turnComplete');
+  console.log('  BUG-18 Change 3 ✓ end-to-end turn: turnInFlight set on task-started/tool-use/assistant-text, cleared by turnComplete');
+}
+
+async function BUG_18_userTextDoesNotMarkTurnInFlight(): Promise<void> {
+  // Verify the bridge is selective: user-text is a refresh source but it
+  // does NOT begin a model turn (the next task-started / first assistant
+  // event does). Marking it would over-extend the latch on aborted turns.
+  const f = makeFakeBridgeDeps();
+  const claude = makeAgent('cl-bug18-3', { provider: 'claude', status: 'working' });
+  f.agents.set(claude.id, claude);
+  const bridge = new EventBridge(f.deps);
+
+  const userEv: UserTextEvent = {
+    type: 'user-text', uuid: 'u', timestamp: '', agentId: claude.id, text: 'go',
+  };
+  bridge.onChatEvents(batchFor(claude.id, [userEv]));
+
+  assert.equal(f.statusForceCalls.length, 1);
+  assert.equal(f.statusForceCalls[0].source, 'user-turn');
+  assert.notEqual(f.statusForceCalls[0].workingOpts?.turnInFlight, true,
+    'user-text does not begin an in-flight turn');
+  console.log('  BUG-18 Change 3 ✓ user-text omits turnInFlight (non-regression)');
+}
+
 async function main(): Promise<void> {
-  console.log('event-bridge.test: running BR-01..BR-20');
+  console.log('event-bridge.test: running BR-01..BR-20 + BUG-18');
   await BR_01_happyPath();
   await BR_02_crashViaRunnerExit();
   await BR_02b_runnerExitBypassesCooldown();
@@ -649,6 +921,13 @@ async function main(): Promise<void> {
   await onChatEvents_geminiToolUseStillRoutes();
   await onChatEvents_initialLoadSuppressesForceCalls();
   await onChatEvents_secondBatchIsNotInitialLoad();
+  await BR_11a_deliverDefersWhileUserTyping();
+  await BR_11b_drainRedefersWhileUserStillTyping();
+  await BR_11c_drainShipsOnceUserQuiet();
+  await BR_11d_idleSupervisorNoTypingShipsImmediately();
+  await BUG_18_thinkingForceWorkingUsesThinkingPending();
+  await BUG_18_endToEndTurnInFlightSetAndCleared();
+  await BUG_18_userTextDoesNotMarkTurnInFlight();
   console.log('event-bridge.test: all tests passed');
 }
 

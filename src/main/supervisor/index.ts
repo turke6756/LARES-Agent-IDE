@@ -231,6 +231,14 @@ export class AgentSupervisor extends EventEmitter {
   private inputQueues = new Map<string, Promise<void>>();
   private inputInFlight = new Set<string>();
 
+  // BUG-11: epoch-ms of the last user-initiated PTY write per agent. Bumped
+  // in `writeToAgent` (the only entrypoint for user-driven bytes — xterm
+  // keystrokes, paste, file-drop, query-injection). NOT bumped by
+  // `_doSendInput`, which writes through `runner.write` / `tmuxSendInput`
+  // directly. The event bridge reads this via `getLastUserPtyWriteAt` to
+  // defer auto-submitting events while the user is actively typing.
+  private lastUserPtyWriteAt = new Map<string, number>();
+
   constructor() {
     super();
     const appData = process.env.APPDATA || path.join(process.env.HOME || '', '.config');
@@ -275,6 +283,7 @@ export class AgentSupervisor extends EventEmitter {
         forceWaiting: (agentId, kind, excerpt) => this.monitor.forceWaiting(agentId, kind, excerpt),
         forceWorking: (agentId, opts) => this.monitor.forceWorking(agentId, opts),
       },
+      getLastUserPtyWriteAt: (id) => this.lastUserPtyWriteAt.get(id),
     };
     this.bridge = new EventBridge(bridgeDeps);
 
@@ -1023,11 +1032,6 @@ export class AgentSupervisor extends EventEmitter {
     const priorWinLaunch = getAgent(agent.id)?.status;
     updateAgentStatus(agent.id, 'working');
     this.emit('statusChanged', { agentId: agent.id, status: 'working', fromStatus: priorWinLaunch, source: 'launch' } satisfies StatusChangedEvent);
-    // BUG-09 §3.4 — seed a model-pending working latch immediately on launch so
-    // the launch-window race (the ce44c2db sighting) is closed before any chat
-    // event has had a chance to land. Without this, the first-turn API call's
-    // ~8 s of spinner-only PTY output would flip the agent back to idle.
-    this.monitor.forceWorking(agent.id, { source: 'launch-pending', ttlClass: 'model-pending' });
 
     if (codexSnapshot) {
       this.captureCodexSessionId(agent.id, codexSnapshot, agent.workingDirectory, codexLaunchStartedAt);
@@ -1279,9 +1283,6 @@ export class AgentSupervisor extends EventEmitter {
     const priorWslLaunch = getAgent(agent.id)?.status;
     updateAgentStatus(agent.id, 'working');
     this.emit('statusChanged', { agentId: agent.id, status: 'working', fromStatus: priorWslLaunch, source: 'launch' } satisfies StatusChangedEvent);
-    // BUG-09 §3.4 — seed a model-pending working latch immediately on launch.
-    // See launchWindowsAgent for the full rationale.
-    this.monitor.forceWorking(agent.id, { source: 'launch-pending', ttlClass: 'model-pending' });
 
     if (codexSnapshot) {
       this.captureCodexSessionId(agent.id, codexSnapshot, wslWorkDir, codexLaunchStartedAt);
@@ -1576,6 +1577,9 @@ export class AgentSupervisor extends EventEmitter {
     // BUG-09 §3.7 — drop the latch + hold-until entries so a 15-min
     // tool-pending latch can't survive into a future agent record reusing this id.
     this.monitor.forgetAgent(agentId);
+    // BUG-11: drop user-typing timestamp so a reused agent id doesn't
+    // inherit a stale "user is typing" gate.
+    this.lastUserPtyWriteAt.delete(agentId);
     dbDeleteAgent(agentId);
     this.emit('agentDeleted', { agentId });
   }
@@ -1649,6 +1653,15 @@ export class AgentSupervisor extends EventEmitter {
   }
 
   writeToAgent(agentId: string, data: string): void {
+    // BUG-11: every byte reaching this path is user-initiated (the
+    // `terminal:write` IPC handler is the sole caller, and its renderer-side
+    // origins are all user actions — xterm `onData` keystrokes, clipboard
+    // paste, file-path drop, the Query Agent dialog injecting a result).
+    // Stamping here lets the event bridge defer auto-submits while typing
+    // is active. `_doSendInput` goes through `runner.write`/`tmuxSendInput`
+    // directly and intentionally does NOT update this map.
+    if (data.length > 0) this.lastUserPtyWriteAt.set(agentId, Date.now());
+
     const winRunner = this.windowsRunners.get(agentId);
     if (winRunner) { winRunner.write(data); return; }
     const wslRunner = this.wslRunners.get(agentId);
@@ -1690,15 +1703,42 @@ export class AgentSupervisor extends EventEmitter {
     const ours: Promise<void> = previous
       .catch(() => undefined) // a prior failed send must not poison the queue
       .then(() => this._doSendInput(agentId, text, submit))
-      .then(() => {
-        // P2-03: if the agent was waiting on user input, the send just
-        // answered the prompt — clear the latch so status flips back to
-        // working immediately. Bridge filters the resulting waiting→working
-        // emission so the supervisor doesn't get a noise notification.
-        // Skip when submit:false — without an Enter the prompt is still
-        // unanswered, so the waiting latch must stay set.
-        if (submit) {
+      .then((delivered) => {
+        if (submit && delivered) {
+          // P2-03: if the agent was waiting on user input, the send just
+          // answered the prompt — clear the latch so status flips back to
+          // working immediately. Bridge filters the resulting waiting→working
+          // emission so the supervisor doesn't get a noise notification.
+          // Skip when submit:false — without an Enter the prompt is still
+          // unanswered, so the waiting latch must stay set.
+          //
+          // notifyUserInputDelivered must run FIRST: if the agent was in
+          // `waiting`, this clears the waiting latch and emits the specific
+          // waiting→working transition with source 'user-input'. Seeding the
+          // working latch before would no-op that path.
           this.bridge.notifyUserInputDelivered(agentId);
+          // BUG-09 §3.4 (corrected, see plans/bug-09-launch-seed-fix-plan.md):
+          // seed a working latch at the actual turn boundary — the moment
+          // Enter has been delivered to the PTY. The ce44c2db sighting was a
+          // false working→idle event during the ~8 s of spinner-only
+          // first-turn API output AFTER sendInput, not at launch. Seeding
+          // here covers that window without blocking the launch-poll flow
+          // (mcp-supervisor.js launch_agent's 60 s poll-for-idle) or the
+          // manual send_message_to_agent path. Gated on `delivered` so the
+          // WSL `!runner.isAlive` skip does not seed a phantom latch.
+          //
+          // BUG-18 Change 2 — seed with `tool-pending` (900 s) instead of
+          // `model-pending` (180 s). The first-turn API call has no early
+          // chat-event signal (Claude JSONL writes only at message
+          // completion; Codex's `task_started` lands after `sendInput`
+          // returns), so the seed is the sole source of truth during that
+          // window. 180 s was too tight for extended thinking (xhigh effort
+          // empirically gaps to 311 s in this workspace); 900 s gives the
+          // model room to think before any real refresh can land.
+          this.monitor.forceWorking(agentId, {
+            source: 'user-input-submitted',
+            ttlClass: 'tool-pending',
+          });
         }
       });
     this.inputQueues.set(agentId, ours);
@@ -1713,7 +1753,7 @@ export class AgentSupervisor extends EventEmitter {
     return ours;
   }
 
-  private async _doSendInput(agentId: string, text: string, submit: boolean = true): Promise<void> {
+  private async _doSendInput(agentId: string, text: string, submit: boolean = true): Promise<boolean> {
     // For WSL agents, dispatch by provider. All three providers enable the
     // kitty keyboard protocol on Linux, so a bare `\r` from `tmux send-keys
     // Enter` is dropped — submit must be the kitty CSI form `\x1b[13u`.
@@ -1729,14 +1769,14 @@ export class AgentSupervisor extends EventEmitter {
         // This prevents typing event payloads into a bare bash shell after Claude Code exits.
         if (!wslRunner.isAlive) {
           console.warn(`[sendInput] Skipping send to ${agent.title} — runner not alive`);
-          return;
+          return false;
         }
         const provider = agent.provider === 'claude' || agent.provider === 'codex' || agent.provider === 'gemini'
           ? agent.provider
           : 'unknown';
         await tmuxSendInput(agent.tmuxSessionName, text, provider, submit);
         this.emitSyntheticUserEcho(agent, text);
-        return;
+        return true;
       }
     }
     // For Windows agents, bracketed-paste the body into Claude Code,
@@ -1783,8 +1823,9 @@ export class AgentSupervisor extends EventEmitter {
       } else {
         winRunner.write(submit ? `${text}\r` : text);
       }
-      return;
+      return true;
     }
+    return false;
   }
 
 
