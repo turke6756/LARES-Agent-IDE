@@ -351,11 +351,11 @@ export function getAgent(id: string): Agent | null {
 }
 
 export function getAgentsByWorkspace(workspaceId: string): Agent[] {
-  return queryAll('SELECT * FROM agents WHERE workspace_id = ? ORDER BY created_at DESC', [workspaceId]).map(rowToAgent);
+  return queryAll('SELECT * FROM agents WHERE workspace_id = ? ORDER BY created_at ASC', [workspaceId]).map(rowToAgent);
 }
 
 export function getAllAgents(): Agent[] {
-  return queryAll('SELECT * FROM agents ORDER BY created_at DESC').map(rowToAgent);
+  return queryAll('SELECT * FROM agents ORDER BY created_at ASC').map(rowToAgent);
 }
 
 export function getSupervisorAgent(workspaceId: string): Agent | null {
@@ -532,6 +532,22 @@ export function deleteAgent(id: string): void {
   run('DELETE FROM file_activities WHERE agent_id = ?', [id]);
   run('DELETE FROM events WHERE agent_id = ?', [id]);
   run('DELETE FROM agents WHERE id = ?', [id]);
+}
+
+/**
+ * BUG-26 Layer 2: purge derived `file_activities` rows for an agent without
+ * deleting the agent record. Called from the supervisor's `'agent-rebound'`
+ * listener after `SessionLogDispatcher.rebindAgent`. The `file_activities`
+ * table is INSERT-only at the producer side and does not self-heal, so
+ * wrong rows inserted under the agent's id during the pre-binding window
+ * (`session.sessionId === ''` + cwd-fallback misattribution) would
+ * otherwise persist in every `Files touched:` event for the agent until
+ * the agent is deleted. By definition an agent that needed a rebind had
+ * at most pre-binding activity — any "real" pre-binding activity for
+ * that agent came from the same misattribution leak — so wiping is correct.
+ */
+export function deleteFileActivitiesForAgent(agentId: string): void {
+  run('DELETE FROM file_activities WHERE agent_id = ?', [agentId]);
 }
 
 export function checkAgentMdExists(workingDirectory: string, pathType: string): { found: boolean; fileName: string | null } {

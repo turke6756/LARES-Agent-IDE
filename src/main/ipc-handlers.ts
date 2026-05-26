@@ -14,7 +14,7 @@ import { getPassiveWslStatus, isTmuxAvailable, isClaudeAvailableInWsl } from './
 import { execFileSync } from 'child_process';
 import { detectPathType } from './path-utils';
 import { readFileContents, listDirectoryEntriesAsync } from './file-reader';
-import { writeFileContents, createFile, createDirectory, renameEntry, deleteEntry } from './file-writer';
+import { writeFileContents, createFile, createDirectory, renameEntry, moveEntry, deleteEntry } from './file-writer';
 import { subscribe as subscribeFsWatch } from './fs-watcher';
 import { scanPersonas, scaffoldPersona } from './persona-scanner';
 import { ensureJupyterServer, listKernelspecs } from './jupyter-server';
@@ -296,6 +296,11 @@ export function registerIpcHandlers(supervisor: AgentSupervisor, mainWindow: Bro
   ipcMain.handle('files:rename', async (_e, oldPath, rootDirectory, pathType, newName) => {
     const resolved = resolveMutationPathType(oldPath, rootDirectory, pathType);
     return await renameEntry(oldPath, rootDirectory, resolved, newName);
+  });
+
+  ipcMain.handle('files:move', async (_e, srcPath, rootDirectory, pathType, destDir) => {
+    const resolved = resolveMutationPathType(srcPath, rootDirectory, pathType);
+    return await moveEntry(srcPath, rootDirectory, resolved, destDir);
   });
 
   ipcMain.handle('files:delete', async (_e, entryPath, rootDirectory, pathType, recursive) => {

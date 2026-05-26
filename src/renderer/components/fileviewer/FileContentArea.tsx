@@ -22,6 +22,8 @@ export default function FileContentArea({ tabId, filePath, pathType }: Props) {
   const editState = useDashboardStore((state) => state.tabEditState[tabId]);
   const setDraftContent = useDashboardStore((state) => state.setDraftContent);
   const saveTab = useDashboardStore((state) => state.saveTab);
+  const reloadFromDisk = useDashboardStore((state) => state.reloadFromDisk);
+  const dismissExternalChange = useDashboardStore((state) => state.dismissExternalChange);
 
   // Media + geospatial binary types are fetched via media:// protocol — skip text file reading entirely
   const isMediaType =
@@ -74,9 +76,10 @@ export default function FileContentArea({ tabId, filePath, pathType }: Props) {
     isEditableFileType(filePath) &&
     !content.error
   ) {
-    return (
+    const editor = (
       <CodeMirrorEditor
-        key={tabId}
+        key={`${tabId}-${editState.reloadVersion ?? 0}`}
+        tabId={tabId}
         initialContent={editState.draftContent}
         language={fileType === 'markdown' ? 'markdown' : 'text'}
         saving={editState.saving}
@@ -84,6 +87,33 @@ export default function FileContentArea({ tabId, filePath, pathType }: Props) {
         onChange={(draft) => setDraftContent(tabId, draft)}
         onSave={() => { void saveTab(tabId); }}
       />
+    );
+    if (!editState.externalChange) return editor;
+    return (
+      <div className="h-full flex flex-col bg-surface-0">
+        <div className="shrink-0 px-3 py-2 bg-amber-900/30 border-b border-amber-700/50 text-[12px] font-sans text-amber-200 flex items-center justify-between gap-3">
+          <span>This file changed on disk{editState.dirty ? ' while you were editing' : ''}.</span>
+          <div className="flex items-center gap-2 shrink-0">
+            <button
+              onClick={() => reloadFromDisk(tabId)}
+              className="ui-btn text-[12px]"
+              title="Replace the editor contents with the version on disk"
+            >
+              Reload from disk
+            </button>
+            <button
+              onClick={() => dismissExternalChange(tabId)}
+              className="ui-btn text-[12px]"
+              title="Keep editing — saving will overwrite the disk version"
+            >
+              Keep my changes
+            </button>
+          </div>
+        </div>
+        <div className="flex-1 min-h-0">
+          {editor}
+        </div>
+      </div>
     );
   }
 
@@ -93,6 +123,7 @@ export default function FileContentArea({ tabId, filePath, pathType }: Props) {
 
   return (
     <FileContentRenderer
+      tabId={tabId}
       content={renderedContent}
       filePath={filePath}
       pathType={pathType}

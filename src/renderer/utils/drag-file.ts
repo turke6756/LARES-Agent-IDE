@@ -26,3 +26,21 @@ export function fileDragStart(e: React.DragEvent, filePath: string): void {
   e.dataTransfer.setData('text/plain', filePath);
   e.dataTransfer.effectAllowed = 'copy';
 }
+
+export const TREE_ENTRY_MIME = 'application/x-tree-entry';
+
+/**
+ * onDragStart handler for directory-tree rows. Sets both the tree-internal
+ * payload (used to move entries between folders) and the legacy file-path
+ * keys so the row can still be dragged into the terminal or chat input.
+ */
+export function treeEntryDragStart(
+  e: React.DragEvent,
+  filePath: string,
+  isDirectory: boolean,
+): void {
+  e.dataTransfer.setData(TREE_ENTRY_MIME, JSON.stringify({ path: filePath, isDirectory }));
+  e.dataTransfer.setData('application/x-file-path', filePath);
+  e.dataTransfer.setData('text/plain', filePath);
+  e.dataTransfer.effectAllowed = 'copyMove';
+}

@@ -97,13 +97,13 @@ export interface LaunchAgentInput {
   templateId?: string;
   systemPrompt?: string;
   persona?: string;
-  // BUG-08: when true on a codex launch, skip the post-launch
-  // session-id discovery (`captureCodexSessionId`) so the agent is not bound
-  // to any pre-existing rollout in this cwd. Codex still launches bare
-  // (`codex --dangerously-bypass-approvals-and-sandbox`) and mints its own
-  // fresh session on disk; the dashboard just doesn't try to alias the new
-  // agent record to a prior session. Default false / undefined preserves
-  // the original behavior. No-op for non-codex providers.
+  // Codex-only hint: launch without `codex resume` so the codex CLI mints a
+  // fresh conversation rather than inheriting a prior rollout in this
+  // workspace. The dashboard still discovers and binds the new session id
+  // (BUG-26: the pre-BUG-26 behavior also skipped discovery, which left
+  // resumeSessionId null and forced CodexRolloutReader to fall back to
+  // cwd-as-identity proxy — mis-attributing events under concurrent
+  // same-cwd launches). No-op for non-codex providers.
   freshSession?: boolean;
 }
 
@@ -415,6 +415,12 @@ export interface IpcApi {
       rootDirectory: string,
       pathType: PathType,
       newName: string
+    ) => Promise<FileMutationResult>;
+    move: (
+      srcPath: string,
+      rootDirectory: string,
+      pathType: PathType,
+      destDir: string
     ) => Promise<FileMutationResult>;
     deleteEntry: (
       entryPath: string,

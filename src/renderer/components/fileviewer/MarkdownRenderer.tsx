@@ -1,13 +1,15 @@
-import { useCallback, useMemo, useRef, useState } from 'react';
+import { useCallback, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { vscDarkPlus, vs } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import { useThemeStore } from '../../stores/theme-store';
 import CollapseButton from '../layout/CollapseButton';
+import { getTabScrollFraction, setTabScrollFraction } from './scrollMemory';
 
 interface Props {
   content: string;
+  tabId?: string;
 }
 
 interface MarkdownHeading {
@@ -63,7 +65,7 @@ function extractMarkdownHeadings(markdown: string): MarkdownHeading[] {
   return headings;
 }
 
-export default function MarkdownRenderer({ content }: Props) {
+export default function MarkdownRenderer({ content, tabId }: Props) {
   const theme = useThemeStore((s) => s.theme);
   const isLight = theme === 'light';
   const outline = useMemo(() => extractMarkdownHeadings(content), [content]);
@@ -76,6 +78,25 @@ export default function MarkdownRenderer({ content }: Props) {
     target?.scrollIntoView({ behavior: 'smooth', block: 'start' });
   }, []);
 
+  const handleScroll = useCallback(() => {
+    if (!tabId) return;
+    const el = scrollRef.current;
+    if (!el) return;
+    const max = el.scrollHeight - el.clientHeight;
+    if (max <= 0) return;
+    setTabScrollFraction(tabId, el.scrollTop / max);
+  }, [tabId]);
+
+  useLayoutEffect(() => {
+    if (!tabId) return;
+    const el = scrollRef.current;
+    if (!el) return;
+    const frac = getTabScrollFraction(tabId);
+    if (frac <= 0) return;
+    const max = el.scrollHeight - el.clientHeight;
+    if (max > 0) el.scrollTop = max * frac;
+  }, [tabId]);
+
   const nextHeadingId = () => {
     const id = outline[renderedHeadingIndex]?.id;
     renderedHeadingIndex += 1;
@@ -86,7 +107,7 @@ export default function MarkdownRenderer({ content }: Props) {
 
   return (
     <div className="h-full min-w-0 flex bg-surface-0">
-      <div ref={scrollRef} className="flex-1 min-w-0 overflow-auto p-6">
+      <div ref={scrollRef} onScroll={handleScroll} className="flex-1 min-w-0 overflow-auto p-6">
         <div className="max-w-3xl mx-auto prose-custom">
         <ReactMarkdown
           remarkPlugins={[remarkGfm]}

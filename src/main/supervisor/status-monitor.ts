@@ -8,6 +8,14 @@ import {
   WORKING_LATCH_MODEL_PENDING_MS,
   WORKING_LATCH_TOOL_PENDING_MS,
   WORKING_LATCH_THINKING_PENDING_MS,
+  WORKING_LATCH_MODEL_PENDING_UNSUPERVISED_MS,
+  WORKING_LATCH_TOOL_PENDING_UNSUPERVISED_MS,
+  WORKING_LATCH_THINKING_PENDING_UNSUPERVISED_MS,
+  SUPERVISOR_WORKING_LATCH_MS,
+  HOOK_SILENCE_WARN_MS,
+  START_HOOK_SILENCE_WARN_MS,
+  LAUNCH_SETTLE_TIMEOUT_MS,
+  LAUNCH_SETTLE_OVERRUN_GRACE_MS,
 } from '../../shared/constants';
 import { getActiveAgents, updateAgentStatus, addEvent } from '../database';
 import type { StatusChangedEvent } from './status-events';
@@ -59,6 +67,22 @@ function ttlForClass(c: WorkingLatchTtlClass): number {
   }
 }
 
+/** Unsupervised-agent variant of {@link ttlForClass}. Mirrors the same
+ *  class→ceiling mapping but with the snappy unsupervised constants. See
+ *  plans/tighten-inference-for-unsupervised-agents.md §2.3. */
+function ttlForClassUnsupervised(c: WorkingLatchTtlClass): number {
+  switch (c) {
+    case 'thinking-pending':
+      return WORKING_LATCH_THINKING_PENDING_UNSUPERVISED_MS;
+    case 'tool-pending':
+      return WORKING_LATCH_TOOL_PENDING_UNSUPERVISED_MS;
+    case 'model-pending':
+    case 'short':
+    default:
+      return WORKING_LATCH_MODEL_PENDING_UNSUPERVISED_MS;
+  }
+}
+
 interface IdleLatchEntry {
   state: 'idle';
   setAt: number;
@@ -94,6 +118,29 @@ export type TurnLatchEntry = IdleLatchEntry | WaitingLatchEntry | WorkingLatchEn
 const TERMINAL_STATUSES: ReadonlyArray<AgentStatus> = ['crashed', 'done'];
 const TRANSITIONAL_STATUSES: ReadonlyArray<AgentStatus> = ['launching', 'restarting'];
 
+/** BUG-23 — `'launch-settle'` (wallclock budget exhausted) and `'stop-hook'`
+ *  (authoritative end-of-turn signal arrived) are the ONLY sources allowed
+ *  to bypass the `TRANSITIONAL_STATUSES` guard for the `'launching' → 'idle'`
+ *  transition. Every other write path keeps the existing guard. The narrow
+ *  bypass exists because, post-BUG-23, the launch site writes `'launching'`
+ *  rather than `'working'`, and nothing else in the system can move a
+ *  supervised Claude worker out of `'launching'` (PTY inference is disabled
+ *  for that lane by Plan 1, and the regular `forceIdle` no-ops on
+ *  transitional states). Future contributors: copying the `force*` guard
+ *  pattern is correct; this surgical exception is a load-bearing decision —
+ *  keep `canForceTransition()` as the named locus so the bypass stays
+ *  visible. */
+export type PromoteFromLaunchingSource = 'launch-settle' | 'stop-hook' | 'other';
+function canForceTransition(
+  curr: AgentStatus,
+  target: AgentStatus,
+  source: PromoteFromLaunchingSource,
+): boolean {
+  if (curr !== 'launching') return false;
+  if (target !== 'idle') return false;
+  return source === 'launch-settle' || source === 'stop-hook';
+}
+
 export class StatusMonitor extends EventEmitter {
   private interval: ReturnType<typeof setInterval> | null = null;
   private checkAlive: (agent: Agent) => Promise<boolean>;
@@ -115,6 +162,38 @@ export class StatusMonitor extends EventEmitter {
   // signals, plus BUG-09's `working` variant). While set within TTL,
   // `inferStatus` honors the latched state. See plans/bug-09-fix-design.md §3.1.
   private turnLatch = new Map<string, TurnLatchEntry>();
+  // Class IV (plans/disable-inference-for-supervised-claude-workers.md §2.3 + §2.2)
+  // — last Stop-hook event timestamp per agent, used by the §2.2 watchdog to
+  // detect hook silence on supervised Claude workers. Writes go through
+  // `recordHookEventAt`, called by `AgentSupervisor.forceIdleFromHook`.
+  private lastHookEventAt = new Map<string, number>();
+  // Dedupes watchdog warnings so we don't re-warn every poll tick (every 1.5 s)
+  // once silence exceeds the threshold. Cleared on a real hook event and on
+  // any non-working status.
+  private lastWatchdogWarnAt = new Map<string, number>();
+  // Start-hook silence watchdog — separate map keyed only on
+  // `hook-start` source events so a Stop hook can't satisfy a missed
+  // UserPromptSubmit hook (the bug we're trying to detect is specifically
+  // a missing start hook).
+  private lastStartHookEventAt = new Map<string, number>();
+  // Dedupes start-hook silence warnings per input delivery — cleared when a
+  // new input is delivered (re-arms the watchdog for the new turn) and when
+  // any start-hook event fires.
+  private lastStartWatchdogWarnAt = new Map<string, number>();
+  // BUG-23 — wallclock stamp set when `runner.launch()` returns, read by
+  // `poll()` to fire the per-provider settle-timer promotion `launching → idle`.
+  // Cleared synchronously by `promoteFromLaunching` so a hook arriving inside
+  // the settle window prevents a duplicate `launch-settle` emission on the
+  // next poll tick. Also cleared in `forgetAgent` and on terminal-exit
+  // detection inside `poll()`.
+  private launchedAt = new Map<string, number>();
+  // Dedupe for the narrow overrun warning (settle timer itself misbehaving).
+  private lastLaunchOverrunWarnAt = new Map<string, number>();
+  // BUG-23 §watchdog reframe — wallclock stamp set when the supervisor delivers
+  // input to an agent (sendInput). The reframed Class IV watchdog uses this to
+  // detect a scaffold-broken supervised Claude worker: input went in, but no
+  // Stop hook ever came back. Stays set across subsequent inputs (last wins).
+  private lastInputDeliveredAt = new Map<string, number>();
   private now: () => number;
 
   constructor(
@@ -214,8 +293,20 @@ export class StatusMonitor extends EventEmitter {
    *  the previous binary "delete latch" behavior with a tagged `working`
    *  latch that pairs `tool-use` ↔ `tool-result` events by `toolUseId`. Always
    *  refreshes `refreshedAt`, including when the latch is already `working`
-   *  (closes C7). */
-  forceWorking(agentId: string, opts: ForceWorkingOpts): void {
+   *  (closes C7).
+   *
+   *  String-source overload — Class IV UserPromptSubmit hook path. Carries no
+   *  toolUseId / ttlClass; latch fields are filled with safe defaults. For
+   *  supervised agents (the sole consumer) inference is short-circuited at
+   *  `inferStatus`, so the latch TTL is bookkeeping rather than load-bearing. */
+  forceWorking(agentId: string, opts: ForceWorkingOpts): void;
+  forceWorking(agentId: string, source: string): void;
+  forceWorking(agentId: string, optsOrSource: ForceWorkingOpts | string): void {
+    if (typeof optsOrSource === 'string') {
+      this.forceWorkingFromHook(agentId, optsOrSource);
+      return;
+    }
+    const opts = optsOrSource;
     const agent = this.getAgentFn(agentId);
     if (!agent) return;
     if (TERMINAL_STATUSES.includes(agent.status)) return;
@@ -268,11 +359,138 @@ export class StatusMonitor extends EventEmitter {
     this.emit('statusChanged', payload);
   }
 
+  /** Class IV UserPromptSubmit-hook entry point. Mirrors `forceIdle`'s shape
+   *  but flips to `'working'`. Latch fields not carried by the hook (toolUseId,
+   *  ttlClass, turnInFlight) default to safe values; for supervised agents
+   *  `inferStatus` short-circuits before reading the TTL, so the latch is
+   *  bookkeeping for the watchdog rather than a TTL ceiling. */
+  private forceWorkingFromHook(agentId: string, source: string): void {
+    const agent = this.getAgentFn(agentId);
+    if (!agent) return;
+    if (TERMINAL_STATUSES.includes(agent.status)) return;
+    if (TRANSITIONAL_STATUSES.includes(agent.status)) return;
+
+    const now = this.now();
+    const prior = agent.status;
+    this.turnLatch.set(agentId, {
+      state: 'working',
+      setAt: now,
+      refreshedAt: now,
+      outstandingToolIds: new Set<string>(),
+      source,
+      ttlClass: 'tool-pending',
+      turnInFlight: true,
+    });
+    if (prior === 'working') return;
+
+    updateAgentStatus(agentId, 'working');
+    addEvent(agentId, 'status_change', JSON.stringify({ from: prior, to: 'working', source }));
+    const payload: StatusChangedEvent = {
+      agentId,
+      status: 'working',
+      fromStatus: prior,
+      source: 'monitor',
+    };
+    this.emit('statusChanged', payload);
+  }
+
   /** BUG-09 §3.7 — drop all per-agent state on delete/restart so a stale
-   *  `tool-pending` latch (up to 15 min) does not survive a runner crash. */
+   *  `tool-pending` latch (up to 15 min) does not survive a runner crash.
+   *  BUG-23 §cleanup — also drop the launch + input-delivered + overrun-warn
+   *  state so a restart re-stamps cleanly. */
   forgetAgent(agentId: string): void {
     this.turnLatch.delete(agentId);
     this.statusHoldUntil.delete(agentId);
+    this.lastHookEventAt.delete(agentId);
+    this.lastWatchdogWarnAt.delete(agentId);
+    this.launchedAt.delete(agentId);
+    this.lastLaunchOverrunWarnAt.delete(agentId);
+    this.lastInputDeliveredAt.delete(agentId);
+    this.lastStartHookEventAt.delete(agentId);
+    this.lastStartWatchdogWarnAt.delete(agentId);
+  }
+
+  /** Class IV §2.3 — called by `AgentSupervisor.forceIdleFromHook` and
+   *  `forceWorkingFromHook` whenever a hook POST lands. The §2.2 watchdog
+   *  reads this map; the start-hook watchdog uses the separate start-only
+   *  map populated by `recordStartHookEventAt`. */
+  recordHookEventAt(agentId: string, ts: number): void {
+    this.lastHookEventAt.set(agentId, ts);
+    // A real hook event resets the dedupe so a future silence period
+    // produces a fresh warning.
+    this.lastWatchdogWarnAt.delete(agentId);
+  }
+
+  /** Records the UserPromptSubmit-hook arrival timestamp on its own map so
+   *  the start-hook silence watchdog can detect the specific signature
+   *  (input went in, no start hook came back) without false-matching a
+   *  Stop-hook arrival. Called by `AgentSupervisor.forceWorkingFromHook`. */
+  recordStartHookEventAt(agentId: string, ts: number): void {
+    this.lastStartHookEventAt.set(agentId, ts);
+    this.lastStartWatchdogWarnAt.delete(agentId);
+  }
+
+  /** BUG-23 — called by `AgentSupervisor.launchWindowsAgent` /
+   *  `launchWslAgent` immediately after `runner.launch()` returns. Stamps the
+   *  wallclock so `poll()` can promote `'launching' → 'idle'` once the
+   *  per-provider settle window has elapsed. Naturally idempotent: a restart
+   *  overwrites the prior timestamp. */
+  recordLaunch(agentId: string, ts: number = this.now()): void {
+    this.launchedAt.set(agentId, ts);
+    this.lastLaunchOverrunWarnAt.delete(agentId);
+  }
+
+  /** BUG-23 — explicit clear, used by terminal-exit cleanup and tests. The
+   *  promotion path clears synchronously via `promoteFromLaunching` itself. */
+  clearLaunch(agentId: string): void {
+    this.launchedAt.delete(agentId);
+    this.lastLaunchOverrunWarnAt.delete(agentId);
+  }
+
+  /** BUG-23 §watchdog reframe — called by `AgentSupervisor.sendInput` after a
+   *  send resolves. Used by the reframed Class IV watchdog to detect a
+   *  scaffold-broken supervised Claude worker (input went in, no hook came
+   *  back). */
+  recordInputDelivered(agentId: string, ts: number = this.now()): void {
+    this.lastInputDeliveredAt.set(agentId, ts);
+    // Re-arm the start-hook silence watchdog for the new turn so a prior
+    // warning's dedupe doesn't suppress a fresh missed-start-hook warning.
+    this.lastStartWatchdogWarnAt.delete(agentId);
+  }
+
+  /** BUG-23 — the ONLY path allowed to bypass the `TRANSITIONAL_STATUSES`
+   *  guard for the `'launching' → 'idle'` transition. See
+   *  {@link canForceTransition} for the load-bearing decision; future
+   *  contributors must route any new `'launching' → 'idle'` write through
+   *  this helper rather than copy the bypass. Clears `launchedAt`
+   *  synchronously before emitting so the next poll tick's settle check
+   *  no-ops and we never double-emit a status change. */
+  promoteFromLaunching(agentId: string, source: PromoteFromLaunchingSource): boolean {
+    const agent = this.getAgentFn(agentId);
+    if (!agent) return false;
+    if (!canForceTransition(agent.status, 'idle', source)) return false;
+
+    // Clear the settle timer synchronously so a hook + timer firing in the
+    // same poll tick produces a single status change, not two.
+    this.launchedAt.delete(agentId);
+    this.lastLaunchOverrunWarnAt.delete(agentId);
+
+    // Arm an idle latch so post-promotion PTY noise doesn't immediately
+    // flip the agent back to working via inference. Mirrors `forceIdle`'s
+    // latch behavior for the supervised lane.
+    this.turnLatch.set(agentId, { state: 'idle', setAt: this.now() });
+
+    const prior = agent.status;
+    updateAgentStatus(agentId, 'idle');
+    addEvent(agentId, 'status_change', JSON.stringify({ from: prior, to: 'idle', source }));
+    const payload: StatusChangedEvent = {
+      agentId,
+      status: 'idle',
+      fromStatus: prior,
+      source: 'monitor',
+    };
+    this.emit('statusChanged', payload);
+    return true;
   }
 
   /** Test seam — used by status-monitor.test.ts to introspect the latch. */
@@ -280,10 +498,39 @@ export class StatusMonitor extends EventEmitter {
     return this.turnLatch.get(agentId);
   }
 
+  /** Test seam — last hook-event timestamp for an agent, or undefined. */
+  getLastHookEventAt(agentId: string): number | undefined {
+    return this.lastHookEventAt.get(agentId);
+  }
+
+  /** Test seam — last start-hook event timestamp for an agent. */
+  getLastStartHookEventAt(agentId: string): number | undefined {
+    return this.lastStartHookEventAt.get(agentId);
+  }
+
   private async poll(): Promise<void> {
     const agents = getActiveAgents();
     for (const agent of agents) {
       try {
+        // BUG-23 — settle-timer promotion. Runs before inference so we don't
+        // race the (no-op for `'launching'`) `inferStatus` short-circuit.
+        // Returns true if the agent was promoted on this tick; either way
+        // the per-tick work for this agent is done.
+        if (this.checkLaunchSettle(agent)) continue;
+
+        // Class IV §2.2 watchdog runs alongside inference (not inside it,
+        // because inferStatus short-circuits for supervised Claude workers).
+        // BUG-23 reframe: warn if a supervised Claude worker received input
+        // ≥ HOOK_SILENCE_WARN_MS ago and is currently idle but has never
+        // had a Stop-hook event recorded — that's the scaffold-broken
+        // signature (input went in, no hook came back). See
+        // checkHookSilenceWatchdog. Warn-only; no auto-fallback to
+        // inference.
+        this.checkHookSilenceWatchdog(agent);
+        // Class IV start-hook silence — paste-race fix watchdog (BUG-10).
+        // Fires on the much shorter START_HOOK_SILENCE_WARN_MS budget.
+        this.checkStartHookSilence(agent);
+
         const newStatus = await this.inferStatus(agent);
         if (newStatus && newStatus !== agent.status) {
           // BUG-09 §3.6 — re-read the agent record after inferStatus returns
@@ -324,6 +571,156 @@ export class StatusMonitor extends EventEmitter {
     }
   }
 
+  /** BUG-23 — per-provider settle-timer promotion of `'launching' → 'idle'`.
+   *  Runs at the top of each poll tick before inference. Returns true if the
+   *  per-tick handling for this agent is complete (agent was launching this
+   *  tick and either got promoted or just sat in the settle window — either
+   *  way, inferStatus would no-op on `'launching'`).
+   *
+   *  Also emits the narrow "settle-overrun" warning if a launching agent sits
+   *  past `LAUNCH_SETTLE_TIMEOUT_MS + LAUNCH_SETTLE_OVERRUN_GRACE_MS` without
+   *  being promoted — that means promoteFromLaunching itself failed (cleared
+   *  launchedAt but the DB write was lost, or similar) and is a different
+   *  failure mode from a quietly-broken hook scaffold. */
+  private checkLaunchSettle(agent: Agent): boolean {
+    if (agent.status !== 'launching') {
+      // Defensive: stale entry from a previous launching run. Clearing here
+      // is belt-and-suspenders — promoteFromLaunching + forgetAgent +
+      // clearLaunch all clear synchronously. Leave the map quiet rather than
+      // pay a delete on every tick.
+      return false;
+    }
+    const stamp = this.launchedAt.get(agent.id);
+    if (stamp === undefined) {
+      // The agent is in `'launching'` but we never received a recordLaunch.
+      // This is normal on app restart when reconnecting to a DB row that
+      // was created (default = 'launching') but the runner is no longer
+      // alive — inferStatus → checkAlive will handle the done/crashed
+      // detection on the next pass. Don't promote without a stamp.
+      return true;
+    }
+    const budget = LAUNCH_SETTLE_TIMEOUT_MS[agent.provider];
+    const elapsed = this.now() - stamp;
+    if (elapsed < budget) return true;
+
+    const overrun = elapsed - budget;
+    if (overrun >= LAUNCH_SETTLE_OVERRUN_GRACE_MS) {
+      // The timer should have fired by now. Warn (deduped) and still try to
+      // promote — if promoteFromLaunching fails again, the next overrun
+      // window will re-warn.
+      const lastWarn = this.lastLaunchOverrunWarnAt.get(agent.id) ?? 0;
+      if (this.now() - lastWarn >= LAUNCH_SETTLE_OVERRUN_GRACE_MS) {
+        console.warn(
+          `[bug-23] launch-settle overrun: agent ${agent.id} (${agent.provider}) ` +
+          `has been 'launching' for ${Math.round(elapsed / 1000)} s ` +
+          `(budget ${Math.round(budget / 1000)} s + grace ` +
+          `${Math.round(LAUNCH_SETTLE_OVERRUN_GRACE_MS / 1000)} s). ` +
+          `Settle timer itself may be misbehaving.`
+        );
+        this.lastLaunchOverrunWarnAt.set(agent.id, this.now());
+      }
+    }
+
+    this.promoteFromLaunching(agent.id, 'launch-settle');
+    return true;
+  }
+
+  /** Class IV §2.2 (BUG-23 reframe) — warn when a supervised worker has been
+   *  delivered input but no Stop hook has EVER fired for it. This is the
+   *  scaffold-broken signal (missing script, missing env, bad settings.json
+   *  / config.toml): input went in, no hook came back. Pre-BUG-23 the
+   *  watchdog watched `status === 'working'`, but with the launch swap +
+   *  settle timer those workers no longer sit in `'working'` for long
+   *  stretches — the symptom shifted from "stuck working" to "input
+   *  delivered, status went idle (via settle), and still no hook ever
+   *  arrived." Detecting the latter directly preserves the scaffold-broken
+   *  signal without false-positives on quietly-idle workers.
+   *
+   *  Scope broadened per plans/class-iv-worker-hook-scaffold.md §12.5 — now
+   *  fires for any supervised provider whose hook never fires. Codex has a
+   *  Stop-hook scaffold (§12.1); Gemini does not yet, so the watchdog will
+   *  warn for every supervised Gemini worker until §12.2 lands. That's the
+   *  desired behavior: a missing scaffold should be loud, not silent.
+   *
+   *  Dedupes via `lastWatchdogWarnAt`. */
+  private checkHookSilenceWatchdog(agent: Agent): void {
+    if (!agent.isSupervised) return;
+    if (agent.status !== 'idle') {
+      // Only warn from the idle state. Working / waiting / launching mean
+      // the system is reacting normally; clear dedupe so a later re-entry
+      // into idle with no hook re-warns.
+      this.lastWatchdogWarnAt.delete(agent.id);
+      return;
+    }
+    // No hooks ever recorded for this agent? That's the scaffold-broken
+    // signature. If a hook has ever fired, the scaffold works and the
+    // watchdog has nothing to say.
+    if (this.lastHookEventAt.has(agent.id)) {
+      this.lastWatchdogWarnAt.delete(agent.id);
+      return;
+    }
+    // No input has been delivered yet? Then "no hook recorded" is expected
+    // (hooks fire on turn-end, no turn has happened). Don't warn.
+    const inputAt = this.lastInputDeliveredAt.get(agent.id);
+    if (inputAt === undefined) return;
+
+    const now = this.now();
+    const silenceMs = now - inputAt;
+    if (silenceMs < HOOK_SILENCE_WARN_MS) return;
+
+    const lastWarn = this.lastWatchdogWarnAt.get(agent.id) ?? 0;
+    if (now - lastWarn < HOOK_SILENCE_WARN_MS) return;
+
+    const minutes = Math.round(silenceMs / 60_000);
+    console.warn(
+      `[class-iv] supervised ${agent.provider} worker ${agent.id} received input ` +
+      `${minutes} min ago and is idle, but no Stop-hook event has ever ` +
+      `been recorded — verify .dashboard/scripts/dashboard-status.mjs is ` +
+      `wired and AGENT_ID + DASHBOARD_PORT envs reach the worker.`
+    );
+    this.lastWatchdogWarnAt.set(agent.id, now);
+  }
+
+  /** Start-hook silence watchdog (BUG-10 paste-race fix). For supervised
+   *  workers, fires once per input delivery when:
+   *    - agent is idle (the lie we're detecting)
+   *    - input was delivered ≥ START_HOOK_SILENCE_WARN_MS ago
+   *    - no UserPromptSubmit hook landed since that input delivery
+   *  Warn-only; emits a `'start-hook-silence-watchdog'` status-change event
+   *  so a supervisor consumer can observe the false-idle window. */
+  private checkStartHookSilence(agent: Agent): void {
+    if (!agent.isSupervised) return;
+    if (agent.status !== 'idle') return;
+
+    const inputAt = this.lastInputDeliveredAt.get(agent.id);
+    if (inputAt === undefined) return;
+
+    const now = this.now();
+    if (now - inputAt < START_HOOK_SILENCE_WARN_MS) return;
+
+    const lastStartHook = this.lastStartHookEventAt.get(agent.id) ?? 0;
+    if (lastStartHook >= inputAt) return;
+
+    const lastWarn = this.lastStartWatchdogWarnAt.get(agent.id) ?? 0;
+    if (lastWarn >= inputAt) return;
+
+    const seconds = Math.round((now - inputAt) / 1000);
+    console.warn(
+      `[bug-10] supervised ${agent.provider} worker ${agent.id} received input ` +
+      `${seconds}s ago but no UserPromptSubmit hook has fired — dashboard ` +
+      `may be lying that the agent is idle (paste race). Verify the ` +
+      `UserPromptSubmit hook scaffold.`
+    );
+    this.lastStartWatchdogWarnAt.set(agent.id, now);
+    const payload: StatusChangedEvent = {
+      agentId: agent.id,
+      status: agent.status,
+      fromStatus: agent.status,
+      source: 'start-hook-silence-watchdog',
+    };
+    this.emit('statusChanged', payload);
+  }
+
   private async inferStatus(agent: Agent): Promise<AgentStatus | null> {
     if (agent.status === 'restarting' || agent.status === 'launching') {
       return null; // Don't override transitional states
@@ -333,6 +730,25 @@ export class StatusMonitor extends EventEmitter {
     if (!alive) {
       if (agent.lastExitCode === 0) return 'done';
       return 'crashed';
+    }
+
+    // Class IV promotion: supervised workers trust the Stop hook
+    // (POST /api/agents/:id/status → forceIdleFromHook) and
+    // notifyUserInputDelivered as the sole truth sources for working/idle.
+    // Inference is disabled for them — PTY heuristics, working-latch TTL,
+    // and pattern detection do not run. The alive check above still fires
+    // for done/crashed detection.
+    //
+    // Scope: isSupervised === true (any provider). Originally claude-only;
+    // broadened per plans/class-iv-worker-hook-scaffold.md §12.5 now that
+    // Codex also has a Stop-hook scaffold (§12.1). Gemini supervised workers
+    // also hit the skip — they don't have a scaffold yet, so their idle
+    // signal comes solely from chat-stream/turn-complete events. The user
+    // explicitly accepts that trade-off: PTY inference was masking missing-
+    // hook scaffolds and made hook reliability invisible. Unsupervised
+    // agents and the supervisor itself stay on inference.
+    if (agent.isSupervised) {
+      return null;
     }
 
     // Pipeline B latch — high-confidence chat-stream truth overrides PTY.
@@ -360,13 +776,40 @@ export class StatusMonitor extends EventEmitter {
         // the case where the last refresh was an `assistant-text` (stored as
         // `model-pending`) but the turn hasn't terminated — the model can
         // still spend minutes on the next thinking block.
-        let effectiveTtl = ttlForClass(latched.ttlClass);
-        if (hasOutstandingTools && effectiveTtl < WORKING_LATCH_TOOL_PENDING_MS) {
-          effectiveTtl = WORKING_LATCH_TOOL_PENDING_MS;
-        }
-        if (latched.turnInFlight && !hasOutstandingTools
-            && effectiveTtl < WORKING_LATCH_TOOL_PENDING_MS) {
-          effectiveTtl = WORKING_LATCH_TOOL_PENDING_MS;
+        // Supervisor short-circuit: the long worker-shaped TTLs exist to
+        // suppress false-idle events relayed to a supervisor (see
+        // SUPERVISOR_WORKING_LATCH_MS comment in constants.ts). For the
+        // supervisor itself, use a short ceiling so the /input gate and
+        // event-bridge queue gate release promptly when it stops typing.
+        // Skip the tool-pending floor and turnInFlight promotion — both
+        // exist for the same anti-spam reason that doesn't apply here.
+        let effectiveTtl: number;
+        if (agent.isSupervisor) {
+          effectiveTtl = SUPERVISOR_WORKING_LATCH_MS;
+        } else if (!agent.isSupervised) {
+          // Unsupervised non-supervisor agents: snappy TTLs. No supervisor
+          // consumes these flips, so BUG-09/13/18 amplification does not
+          // apply. The hasOutstandingTools floor is kept (raised to the
+          // unsupervised tool-pending value, not the supervised one) so a
+          // genuinely running tool still holds the latch past the model-
+          // pending ceiling. turnInFlight promotion intentionally skipped —
+          // its purpose is to suppress false idles seen by a supervisor
+          // (BUG-18 Change 3), and there is no supervisor here.
+          //
+          // See plans/tighten-inference-for-unsupervised-agents.md §2.2.
+          effectiveTtl = ttlForClassUnsupervised(latched.ttlClass);
+          if (hasOutstandingTools && effectiveTtl < WORKING_LATCH_TOOL_PENDING_UNSUPERVISED_MS) {
+            effectiveTtl = WORKING_LATCH_TOOL_PENDING_UNSUPERVISED_MS;
+          }
+        } else {
+          effectiveTtl = ttlForClass(latched.ttlClass);
+          if (hasOutstandingTools && effectiveTtl < WORKING_LATCH_TOOL_PENDING_MS) {
+            effectiveTtl = WORKING_LATCH_TOOL_PENDING_MS;
+          }
+          if (latched.turnInFlight && !hasOutstandingTools
+              && effectiveTtl < WORKING_LATCH_TOOL_PENDING_MS) {
+            effectiveTtl = WORKING_LATCH_TOOL_PENDING_MS;
+          }
         }
         if (age <= effectiveTtl) {
           // BUG-09 §3.1 (Codex round 3) — tiered PTY-pattern-detection vs

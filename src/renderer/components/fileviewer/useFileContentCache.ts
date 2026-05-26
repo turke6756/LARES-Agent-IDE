@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import type { FileContent, PathType } from '../../../shared/types';
+import type { FileContent, FsEvent, PathType } from '../../../shared/types';
 import { useDashboardStore } from '../../stores/dashboard-store';
 
 // Module-level cache: tabId -> FileContent
@@ -11,6 +11,16 @@ export function evictTabCache(tabId: string) {
 
 export function evictAllCache() {
   contentCache.clear();
+}
+
+function parentDirOf(filePath: string): string {
+  const idx = Math.max(filePath.lastIndexOf('/'), filePath.lastIndexOf('\\'));
+  if (idx <= 0) return filePath;
+  return filePath.substring(0, idx);
+}
+
+function normalizePath(p: string): string {
+  return p.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
 }
 
 export function useFileContentCache(tabId: string, filePath: string, pathType: PathType, skip = false) {
@@ -25,28 +35,73 @@ export function useFileContentCache(tabId: string, filePath: string, pathType: P
       return;
     }
 
-    // Check if cached content matches current filePath
+    let cancelled = false;
+
     const cached = contentCache.get(tabId);
     if (cached && cached.path === filePath) {
       setContent(cached);
       setLoading(false);
-      return;
+    } else {
+      setLoading(true);
+      window.api.files.readFile(filePath, pathType).then((result) => {
+        if (cancelled) return;
+        contentCache.set(tabId, result);
+        setContent(result);
+        setLoading(false);
+        if (pathType === 'wsl') {
+          void checkHealth();
+        }
+      });
     }
 
-    let cancelled = false;
-    setLoading(true);
+    // Watch the parent directory and react to changes to this file. Lets the
+    // viewer pick up external edits (e.g., an agent writing to the file)
+    // without requiring the tab to be closed and reopened.
+    const parentDir = parentDirOf(filePath);
+    const targetKey = normalizePath(filePath);
 
-    window.api.files.readFile(filePath, pathType).then((result) => {
+    const handleFsEvent = (event: FsEvent) => {
       if (cancelled) return;
-      contentCache.set(tabId, result);
-      setContent(result);
-      setLoading(false);
-      if (pathType === 'wsl') {
-        void checkHealth();
-      }
-    });
+      if (event.type === 'unlink') return;
+      if (normalizePath(event.path) !== targetKey) return;
 
-    return () => { cancelled = true; };
+      window.api.files.readFile(filePath, pathType).then((fresh) => {
+        if (cancelled) return;
+        if (fresh.error) return;
+
+        // Skip echoes: cache already matches, or this is the content we just saved.
+        const cachedNow = contentCache.get(tabId);
+        if (cachedNow && cachedNow.path === filePath && cachedNow.content === fresh.content) return;
+        const store = useDashboardStore.getState();
+        const editState = store.tabEditState[tabId];
+        if (editState && editState.originalContent === fresh.content && !editState.dirty) {
+          contentCache.set(tabId, fresh);
+          return;
+        }
+
+        contentCache.set(tabId, fresh);
+
+        if (editState && editState.mode === 'edit') {
+          // Don't trample the editor while the user has it open.
+          // Surface a banner so they can choose to reload or keep edits.
+          store.markExternalChange(tabId, fresh.content);
+        } else {
+          setContent(fresh);
+          if (editState) {
+            // View mode but a stale editState lingers from a prior edit session —
+            // bring originalContent in line with disk so renderedContent reflects it.
+            store.refreshOriginalContent(tabId, fresh.content);
+          }
+        }
+      });
+    };
+
+    const unsubscribe = window.api.files.watchDirectory(parentDir, pathType, handleFsEvent);
+
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
   }, [tabId, filePath, pathType, skip, checkHealth]);
 
   return { content, loading };

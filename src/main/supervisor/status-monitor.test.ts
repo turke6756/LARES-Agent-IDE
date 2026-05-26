@@ -19,6 +19,13 @@ import {
   WORKING_LATCH_MODEL_PENDING_MS,
   WORKING_LATCH_TOOL_PENDING_MS,
   WORKING_LATCH_THINKING_PENDING_MS,
+  WORKING_LATCH_MODEL_PENDING_UNSUPERVISED_MS,
+  WORKING_LATCH_TOOL_PENDING_UNSUPERVISED_MS,
+  WORKING_LATCH_THINKING_PENDING_UNSUPERVISED_MS,
+  SUPERVISOR_WORKING_LATCH_MS,
+  LAUNCH_SETTLE_TIMEOUT_MS,
+  LAUNCH_SETTLE_OVERRUN_GRACE_MS,
+  START_HOOK_SILENCE_WARN_MS,
 } from '../../shared/constants';
 import type { Agent } from '../../shared/types';
 import type { StatusChangedEvent } from './status-events';
@@ -30,6 +37,19 @@ interface TestCase {
 const tests: TestCase[] = [];
 function test(name: string, fn: () => Promise<void> | void): void {
   tests.push({ name, run: fn });
+}
+
+// Default worker fixture for inference-behavior tests. The shared `makeAgent`
+// from fake-bridge-deps defaults to provider:'claude' + isSupervised:true.
+// Post §12.5 the Class IV skip is gated on `isSupervised` (any provider), so
+// any supervised fixture would short-circuit inference. Existing tests are
+// about generic latch / TTL behavior and read more cleanly when run against
+// a fixture whose inference is NOT short-circuited — unsupervised codex is
+// the simplest such shape. Tests that specifically exercise the supervised
+// lanes (Class IV, watchdog, supervisor short-latch) import makeAgent
+// directly and set the supervision flags explicitly.
+function makeWorker(id: string, overrides: Partial<Agent> = {}): Agent {
+  return makeAgent(id, { provider: 'codex', isSupervised: false, ...overrides });
 }
 
 function makeMonitor(opts: {
@@ -72,7 +92,7 @@ test('BR-11: turnComplete → forceIdle fires even while statusHoldUntil is acti
   const fakes = makeStatusMonitorFakes();
   const restore = patchDatabaseModule(fakes);
   try {
-    const agent = makeAgent('w-1', { status: 'working' });
+    const agent = makeWorker('w-1', { status: 'working' });
     const monitor = makeMonitor({ fakes, agent });
 
     // Plant a hold 5s in the future to simulate a debounce window.
@@ -98,7 +118,7 @@ test('forceIdle no-ops on terminal status (crashed)', () => {
   const fakes = makeStatusMonitorFakes();
   const restore = patchDatabaseModule(fakes);
   try {
-    const agent = makeAgent('w-1', { status: 'crashed', lastExitCode: 1 });
+    const agent = makeWorker('w-1', { status: 'crashed', lastExitCode: 1 });
     const monitor = makeMonitor({ fakes, agent, alive: false });
 
     monitor.forceIdle(agent.id, 'turnComplete');
@@ -115,7 +135,7 @@ test('forceIdle no-ops on transitional status (launching)', () => {
   const fakes = makeStatusMonitorFakes();
   const restore = patchDatabaseModule(fakes);
   try {
-    const agent = makeAgent('w-1', { status: 'launching' });
+    const agent = makeWorker('w-1', { status: 'launching' });
     const monitor = makeMonitor({ fakes, agent });
 
     monitor.forceIdle(agent.id, 'turnComplete');
@@ -131,7 +151,7 @@ test('BR-16: idle latch holds against PTY burst — Codex incident in test form'
   const fakes = makeStatusMonitorFakes();
   const restore = patchDatabaseModule(fakes);
   try {
-    const agent = makeAgent('w-1', { status: 'working' });
+    const agent = makeWorker('w-1', { status: 'working' });
     const monitor = makeMonitor({ fakes, agent });
 
     // Establish the latch.
@@ -154,7 +174,7 @@ test('BR-16 corollary (BUG-09 inverted): forceWorking overwrites the prior latch
   const fakes = makeStatusMonitorFakes();
   const restore = patchDatabaseModule(fakes);
   try {
-    const agent = makeAgent('w-1', { status: 'working' });
+    const agent = makeWorker('w-1', { status: 'working' });
     const monitor = makeMonitor({ fakes, agent });
 
     monitor.forceIdle(agent.id, 'turnComplete');
@@ -186,7 +206,7 @@ test('BR-17: idle latch TTL expires; PTY truth resumes', async () => {
   const fakes = makeStatusMonitorFakes();
   const restore = patchDatabaseModule(fakes);
   try {
-    const agent = makeAgent('w-1', { status: 'working' });
+    const agent = makeWorker('w-1', { status: 'working' });
     const monitor = makeMonitor({ fakes, agent });
 
     monitor.forceIdle(agent.id, 'turnComplete');
@@ -209,7 +229,7 @@ test('BR-17 boundary: latch still active at exactly TTL ms', async () => {
   const fakes = makeStatusMonitorFakes();
   const restore = patchDatabaseModule(fakes);
   try {
-    const agent = makeAgent('w-1', { status: 'working' });
+    const agent = makeWorker('w-1', { status: 'working' });
     const monitor = makeMonitor({ fakes, agent });
 
     monitor.forceIdle(agent.id, 'turnComplete');
@@ -228,7 +248,7 @@ test('BR-18: waiting latch TTL expires; agent falls to PTY-inferred status', asy
   const fakes = makeStatusMonitorFakes();
   const restore = patchDatabaseModule(fakes);
   try {
-    const agent = makeAgent('w-1', { status: 'working' });
+    const agent = makeWorker('w-1', { status: 'working' });
     const monitor = makeMonitor({ fakes, agent });
 
     monitor.forceWaiting(agent.id, 'question', 'Are you sure?');
@@ -254,7 +274,7 @@ test('BR-18 boundary: waiting latch still active at exactly TTL ms', async () =>
   const fakes = makeStatusMonitorFakes();
   const restore = patchDatabaseModule(fakes);
   try {
-    const agent = makeAgent('w-1', { status: 'working' });
+    const agent = makeWorker('w-1', { status: 'working' });
     const monitor = makeMonitor({ fakes, agent });
 
     monitor.forceWaiting(agent.id, 'y-n', '(y/N)');
@@ -272,7 +292,7 @@ test('BR-14: PTY (y/N) prompt in ring tail → inferStatus returns waiting + arm
   const fakes = makeStatusMonitorFakes();
   const restore = patchDatabaseModule(fakes);
   try {
-    const agent = makeAgent('w-1', { status: 'working' });
+    const agent = makeWorker('w-1', { status: 'working' });
     const ringTails = new Map<string, string>();
     ringTails.set(agent.id, 'Do you want to proceed? (y/N) ');
     const monitor = makeMonitor({ fakes, agent, ringTails });
@@ -300,7 +320,7 @@ test('BR-14 guard: PTY pattern is NOT consulted while PTY is still streaming', a
   const fakes = makeStatusMonitorFakes();
   const restore = patchDatabaseModule(fakes);
   try {
-    const agent = makeAgent('w-1', { status: 'working' });
+    const agent = makeWorker('w-1', { status: 'working' });
     const ringTails = new Map<string, string>();
     ringTails.set(agent.id, 'Approve?');
     const monitor = makeMonitor({ fakes, agent, ringTails });
@@ -321,7 +341,7 @@ test('BUG-09 §3.1: forceWorking on already-working agent installs working latch
   const fakes = makeStatusMonitorFakes();
   const restore = patchDatabaseModule(fakes);
   try {
-    const agent = makeAgent('w-1', { status: 'working' });
+    const agent = makeWorker('w-1', { status: 'working' });
     const monitor = makeMonitor({ fakes, agent });
 
     // Seed a stale idle latch.
@@ -350,7 +370,7 @@ test('BUG-09: working latch holds through Coalescing gap (model-pending TTL)', a
   const fakes = makeStatusMonitorFakes();
   const restore = patchDatabaseModule(fakes);
   try {
-    const agent = makeAgent('w-1', { status: 'working' });
+    const agent = makeWorker('w-1', { status: 'working' });
     const monitor = makeMonitor({ fakes, agent });
 
     monitor.forceWorking(agent.id, { source: 'task-started', ttlClass: 'model-pending' });
@@ -369,10 +389,16 @@ test('BUG-09: working latch holds through Coalescing gap (model-pending TTL)', a
 });
 
 test('BUG-09: parallel tools — single tool-result keeps tool-pending TTL', async () => {
+  // §12.5 migration: makeWorker now defaults isSupervised:false (supervised
+  // workers all skip inference), so this test exercises the unsupervised
+  // latch lane. Latch math (refresh + outstanding tools) is provider-agnostic;
+  // we swap supervised TTL constants for their unsupervised variants and the
+  // semantic intent ("tool-pending TTL applies while a tool is outstanding")
+  // is preserved.
   const fakes = makeStatusMonitorFakes();
   const restore = patchDatabaseModule(fakes);
   try {
-    const agent = makeAgent('w-1', { status: 'working' });
+    const agent = makeWorker('w-1', { status: 'working' });
     const monitor = makeMonitor({ fakes, agent });
 
     monitor.forceWorking(agent.id, { source: 'tool-use', toolUseId: 'A', ttlClass: 'tool-pending' });
@@ -395,8 +421,8 @@ test('BUG-09: parallel tools — single tool-result keeps tool-pending TTL', asy
     assert.ok(after.outstandingToolIds.has('B'));
 
     // Beyond model-pending TTL but under tool-pending TTL → still working.
-    fakes.now.value += WORKING_LATCH_MODEL_PENDING_MS + 1_000;
-    fakes.lastOutputAt.set(agent.id, fakes.now.value - WORKING_LATCH_MODEL_PENDING_MS - 1_000);
+    fakes.now.value += WORKING_LATCH_MODEL_PENDING_UNSUPERVISED_MS + 1_000;
+    fakes.lastOutputAt.set(agent.id, fakes.now.value - WORKING_LATCH_MODEL_PENDING_UNSUPERVISED_MS - 1_000);
     const inferred = await inferStatus(monitor, agent);
     assert.equal(inferred, 'working',
       'tool-pending TTL applies while a tool remains outstanding');
@@ -417,7 +443,7 @@ test('BUG-18 Change 1: both tools resolve — latch still survives past model-pe
   const fakes = makeStatusMonitorFakes();
   const restore = patchDatabaseModule(fakes);
   try {
-    const agent = makeAgent('w-1', { status: 'working' });
+    const agent = makeWorker('w-1', { status: 'working' });
     const monitor = makeMonitor({ fakes, agent });
 
     monitor.forceWorking(agent.id, { source: 'tool-use', toolUseId: 'A', ttlClass: 'tool-pending' });
@@ -441,7 +467,8 @@ test('BUG-18 Change 1: both tools resolve — latch still survives past model-pe
 
     // Just past model-pending TTL: pre-Change-1 this would flip to idle.
     // Post-Change-1 the latch's tool-pending ceiling holds working.
-    fakes.now.value += WORKING_LATCH_MODEL_PENDING_MS + 1_000;
+    // (§12.5: unsupervised constants now — supervised lane skips inference.)
+    fakes.now.value += WORKING_LATCH_MODEL_PENDING_UNSUPERVISED_MS + 1_000;
     fakes.lastOutputAt.set(agent.id, fakes.now.value - WORKING_THRESHOLD_MS - 1_000);
     let inferred = await inferStatus(monitor, agent);
     assert.equal(inferred, 'working',
@@ -449,7 +476,7 @@ test('BUG-18 Change 1: both tools resolve — latch still survives past model-pe
 
     // Push past tool-pending TTL — latch must finally expire and PTY truth
     // takes over (stale PTY → idle).
-    fakes.now.value += WORKING_LATCH_TOOL_PENDING_MS;
+    fakes.now.value += WORKING_LATCH_TOOL_PENDING_UNSUPERVISED_MS;
     fakes.lastOutputAt.set(agent.id, fakes.now.value - WORKING_THRESHOLD_MS - 1_000);
     inferred = await inferStatus(monitor, agent);
     assert.equal(inferred, 'idle',
@@ -463,7 +490,7 @@ test('BUG-09 §3.1 / C7: forceWorking refreshes refreshedAt on an already-workin
   const fakes = makeStatusMonitorFakes();
   const restore = patchDatabaseModule(fakes);
   try {
-    const agent = makeAgent('w-1', { status: 'working' });
+    const agent = makeWorker('w-1', { status: 'working' });
     const monitor = makeMonitor({ fakes, agent });
 
     monitor.forceWorking(agent.id, { source: 'task-started', ttlClass: 'model-pending' });
@@ -490,7 +517,7 @@ test('BUG-09 §3.1 / C8: forceIdle overwrites a working latch (does not delete)'
   const fakes = makeStatusMonitorFakes();
   const restore = patchDatabaseModule(fakes);
   try {
-    const agent = makeAgent('w-1', { status: 'working' });
+    const agent = makeWorker('w-1', { status: 'working' });
     const monitor = makeMonitor({ fakes, agent });
 
     monitor.forceWorking(agent.id, { source: 'tool-use', toolUseId: 'A', ttlClass: 'tool-pending' });
@@ -515,7 +542,7 @@ test('BUG-09 §3.1 (Codex round 3): PTY (y/N) does NOT override tool-pending wor
   const fakes = makeStatusMonitorFakes();
   const restore = patchDatabaseModule(fakes);
   try {
-    const agent = makeAgent('w-1', { status: 'working' });
+    const agent = makeWorker('w-1', { status: 'working' });
     const ringTails = new Map<string, string>();
     // The tail still has a (y/N) line from a prior turn — but a tool is
     // genuinely outstanding, so pattern detection must not fire forceWaiting.
@@ -541,7 +568,7 @@ test('BUG-09 §3.1: PTY (y/N) DOES override model-pending working latch', async 
   const fakes = makeStatusMonitorFakes();
   const restore = patchDatabaseModule(fakes);
   try {
-    const agent = makeAgent('w-1', { status: 'working' });
+    const agent = makeWorker('w-1', { status: 'working' });
     const ringTails = new Map<string, string>();
     ringTails.set(agent.id, 'Do you want to proceed? (y/N) ');
     const monitor = makeMonitor({ fakes, agent, ringTails });
@@ -564,7 +591,7 @@ test('BUG-09 §3.6: poll/chat race — stale poll write skipped when force* move
   const fakes = makeStatusMonitorFakes();
   const restore = patchDatabaseModule(fakes);
   try {
-    const agent = makeAgent('w-1', { status: 'idle' });
+    const agent = makeWorker('w-1', { status: 'idle' });
     const monitor = makeMonitor({ fakes, agent });
 
     // Simulate a poll tick whose inferStatus is about to write `idle`
@@ -613,7 +640,7 @@ test('BUG-09 §3.7: forgetAgent drops latch + statusHoldUntil', () => {
   const fakes = makeStatusMonitorFakes();
   const restore = patchDatabaseModule(fakes);
   try {
-    const agent = makeAgent('w-1', { status: 'working' });
+    const agent = makeWorker('w-1', { status: 'working' });
     const monitor = makeMonitor({ fakes, agent });
 
     monitor.forceWorking(agent.id, { source: 'tool-use', toolUseId: 'A', ttlClass: 'tool-pending' });
@@ -636,7 +663,7 @@ test('BUG-09 §3.5: spinner-only redraws keep a working agent from downgrading',
   const fakes = makeStatusMonitorFakes();
   const restore = patchDatabaseModule(fakes);
   try {
-    const agent = makeAgent('w-1', { status: 'working' });
+    const agent = makeWorker('w-1', { status: 'working' });
     const monitor = makeMonitor({ fakes, agent });
 
     // Simulate the Coalescing window: meaningful burst stale (>8s ago),
@@ -658,7 +685,7 @@ test('BUG-09 §3.5: idle agent does NOT promote on raw-only PTY freshness', asyn
   const fakes = makeStatusMonitorFakes();
   const restore = patchDatabaseModule(fakes);
   try {
-    const agent = makeAgent('w-1', { status: 'idle' });
+    const agent = makeWorker('w-1', { status: 'idle' });
     const monitor = makeMonitor({ fakes, agent });
 
     // Meaningful stale, raw fresh — but the agent is currently idle.
@@ -679,7 +706,7 @@ test('BUG-09 §3.5: working → idle once BOTH PTY signals go stale', async () =
   const fakes = makeStatusMonitorFakes();
   const restore = patchDatabaseModule(fakes);
   try {
-    const agent = makeAgent('w-1', { status: 'working' });
+    const agent = makeWorker('w-1', { status: 'working' });
     const monitor = makeMonitor({ fakes, agent });
 
     fakes.now.value += 20_000;
@@ -698,7 +725,7 @@ test('latch invalidation: a second forceIdle/forceWaiting overwrites the prior l
   const fakes = makeStatusMonitorFakes();
   const restore = patchDatabaseModule(fakes);
   try {
-    const agent = makeAgent('w-1', { status: 'working' });
+    const agent = makeWorker('w-1', { status: 'working' });
     const monitor = makeMonitor({ fakes, agent });
 
     monitor.forceIdle(agent.id, 'turnComplete');
@@ -717,17 +744,19 @@ test('latch invalidation: a second forceIdle/forceWaiting overwrites the prior l
 
 // ── BUG-18 Changes 1, 2, 3 ───────────────────────────────────────────
 
-test('BUG-18 Change 1: thinking-pending latch survives past 180 s but expires at 900 s', async () => {
+test('BUG-18 Change 1: thinking-pending latch survives past model-pending but expires at thinking-pending ceiling', async () => {
   // The Claude xhigh-effort case from plans/status-flip-bug18-investigation-claude.md §1.
   // A `thinking` event refreshes the latch with ttlClass='thinking-pending'.
-  // The 2026-05-19 sighting was a 311 s thinking gap; under the old 180 s
-  // model-pending ceiling the latch would have expired and the supervisor
-  // would have paged false-idle. Post-Change-1 the latch holds working for
-  // up to the thinking-pending ceiling (900 s), then falls back to PTY.
+  // Pre-Change-1 the latch's effective TTL was always model-pending; Change 1
+  // makes ttlClass=thinking-pending hold past the model-pending ceiling.
+  // §12.5 migration: makeWorker now defaults isSupervised:false, so we
+  // exercise the unsupervised tier (thinking-pending=120 s, model-pending=30 s).
+  // Semantic intent ("thinking-pending class outlives model-pending TTL") is
+  // preserved.
   const fakes = makeStatusMonitorFakes();
   const restore = patchDatabaseModule(fakes);
   try {
-    const agent = makeAgent('w-1', { status: 'working' });
+    const agent = makeWorker('w-1', { status: 'working' });
     const monitor = makeMonitor({ fakes, agent });
 
     monitor.forceWorking(agent.id, { source: 'thinking', ttlClass: 'thinking-pending' });
@@ -735,35 +764,35 @@ test('BUG-18 Change 1: thinking-pending latch survives past 180 s but expires at
     assert.ok(latch && latch.state === 'working');
     assert.equal(latch.ttlClass, 'thinking-pending');
 
-    // Past model-pending TTL (180 s) but well inside thinking-pending (900 s).
-    // PTY also went stale so the only thing keeping the agent working is the
-    // ttlClass-driven ceiling.
-    fakes.now.value += 300_000; // 5 min
+    // Past model-pending TTL but well inside thinking-pending. PTY stale, so
+    // the only thing keeping the agent working is the ttlClass ceiling.
+    fakes.now.value += WORKING_LATCH_MODEL_PENDING_UNSUPERVISED_MS + 5_000;
     fakes.lastOutputAt.set(agent.id, fakes.now.value - WORKING_THRESHOLD_MS - 1_000);
     let inferred = await inferStatus(monitor, agent);
     assert.equal(inferred, 'working',
-      'thinking-pending holds working through a 5 min model-thinking gap');
+      'thinking-pending holds working through a gap longer than model-pending');
 
     // Push past the thinking-pending ceiling — latch must finally expire.
-    fakes.now.value += WORKING_LATCH_THINKING_PENDING_MS;
+    fakes.now.value += WORKING_LATCH_THINKING_PENDING_UNSUPERVISED_MS;
     fakes.lastOutputAt.set(agent.id, fakes.now.value - WORKING_THRESHOLD_MS - 1_000);
     inferred = await inferStatus(monitor, agent);
     assert.equal(inferred, 'idle',
-      'thinking-pending latch expires at the 900 s ceiling');
+      'thinking-pending latch expires at its ceiling');
   } finally {
     restore();
   }
 });
 
-test('BUG-18 Change 1: thinking-pending boundary — still working at exactly 900 s', async () => {
+test('BUG-18 Change 1: thinking-pending boundary — still working at exactly the thinking-pending ceiling', async () => {
+  // §12.5: see sibling test above. Unsupervised constants now.
   const fakes = makeStatusMonitorFakes();
   const restore = patchDatabaseModule(fakes);
   try {
-    const agent = makeAgent('w-1', { status: 'working' });
+    const agent = makeWorker('w-1', { status: 'working' });
     const monitor = makeMonitor({ fakes, agent });
 
     monitor.forceWorking(agent.id, { source: 'thinking', ttlClass: 'thinking-pending' });
-    fakes.now.value += WORKING_LATCH_THINKING_PENDING_MS;
+    fakes.now.value += WORKING_LATCH_THINKING_PENDING_UNSUPERVISED_MS;
     fakes.lastOutputAt.set(agent.id, fakes.now.value - WORKING_THRESHOLD_MS - 1_000);
 
     const inferred = await inferStatus(monitor, agent);
@@ -774,16 +803,17 @@ test('BUG-18 Change 1: thinking-pending boundary — still working at exactly 90
   }
 });
 
-test('BUG-18 Change 2: user-input-submitted seed (tool-pending) survives past 180 s with no chat events', async () => {
+test('BUG-18 Change 2: user-input-submitted seed (tool-pending) survives past model-pending with no chat events', async () => {
   // Mirrors the production seed at src/main/supervisor/index.ts after
   // sendInput delivery: forceWorking(agentId, { source:'user-input-submitted',
-  // ttlClass:'tool-pending' }). Before Change 2 this was model-pending (180 s),
-  // which was too tight for first-turn Claude xhigh extended thinking
-  // (empirical max 311 s in this workspace, p99 = 151 s).
+  // ttlClass:'tool-pending' }). Before Change 2 this was model-pending, too
+  // tight for first-turn extended thinking. §12.5 migration: unsupervised tier
+  // (tool-pending=120 s, model-pending=30 s); semantic ("tool-pending seed
+  // outlives model-pending TTL") preserved.
   const fakes = makeStatusMonitorFakes();
   const restore = patchDatabaseModule(fakes);
   try {
-    const agent = makeAgent('w-1', { status: 'working' });
+    const agent = makeWorker('w-1', { status: 'working' });
     const monitor = makeMonitor({ fakes, agent });
 
     monitor.forceWorking(agent.id, {
@@ -791,117 +821,26 @@ test('BUG-18 Change 2: user-input-submitted seed (tool-pending) survives past 18
       ttlClass: 'tool-pending',
     });
 
-    // Simulate the failure window: no chat events fire for 5 min and PTY is
-    // stale (xhigh "Wrangling…" spinner-only redraws fail the
-    // hasMeaningfulContent gate, see windows-runner.ts:221-238).
-    fakes.now.value += 300_000;
+    // Failure window: no chat events fire past model-pending, PTY stale.
+    fakes.now.value += WORKING_LATCH_MODEL_PENDING_UNSUPERVISED_MS + 30_000;
     fakes.lastOutputAt.set(agent.id, fakes.now.value - WORKING_THRESHOLD_MS - 1_000);
     fakes.lastRawOutputAt.set(agent.id, fakes.now.value - WORKING_THRESHOLD_MS - 1_000);
 
     const inferred = await inferStatus(monitor, agent);
     assert.equal(inferred, 'working',
-      'BUG-18 Change 2: 900 s seed holds through a 5 min first-turn thinking gap');
+      'BUG-18 Change 2: tool-pending seed holds through a model-pending-exceeding silent gap');
   } finally {
     restore();
   }
 });
 
-test('BUG-18 Change 3: turnInFlight latch survives tool_result + 200 s of silence', async () => {
-  // The Claude §2.1 mid-turn case: a tool resolves (outstandingToolIds → 0)
-  // and the model spends >180 s thinking before the next event. Pre-Change-3
-  // the latch's effective TTL would collapse to model-pending; with
-  // turnInFlight=true (set by event-bridge on the tool-use that started this
-  // turn), the latch holds tool-pending TTL throughout the thinking gap.
-  const fakes = makeStatusMonitorFakes();
-  const restore = patchDatabaseModule(fakes);
-  try {
-    const agent = makeAgent('w-1', { status: 'working' });
-    const monitor = makeMonitor({ fakes, agent });
-
-    // Tool-use marks the turn in-flight (mimics event-bridge.ts behavior).
-    monitor.forceWorking(agent.id, {
-      source: 'tool-use',
-      toolUseId: 'A',
-      ttlClass: 'tool-pending',
-      turnInFlight: true,
-    });
-    // The last assistant-text refresh stores model-pending (180 s) and keeps
-    // turnInFlight sticky-true. This is the critical window — without
-    // Change 3, the latch's effective TTL would now be model-pending.
-    monitor.forceWorking(agent.id, {
-      source: 'assistant-text',
-      ttlClass: 'model-pending',
-      turnInFlight: true,
-    });
-    // Tool resolves; no outstanding tools left, ttlClass downgrades to
-    // model-pending on the latest refresh.
-    monitor.forceWorking(agent.id, {
-      source: 'tool-result',
-      resolvedToolUseId: 'A',
-      ttlClass: 'model-pending',
-    });
-
-    const latch = monitor.getLatchSnapshot(agent.id);
-    assert.ok(latch && latch.state === 'working');
-    assert.equal(latch.outstandingToolIds.size, 0, 'no outstanding tools');
-    assert.equal(latch.ttlClass, 'model-pending',
-      'last refresh stored model-pending');
-    assert.equal(latch.turnInFlight, true,
-      'turnInFlight survives the tool-result refresh');
-
-    // 200 s of silence — well past model-pending (180 s) but well inside
-    // tool-pending (900 s). Stale PTY too so the only thing keeping the
-    // agent working is the turnInFlight override.
-    fakes.now.value += 200_000;
-    fakes.lastOutputAt.set(agent.id, fakes.now.value - WORKING_THRESHOLD_MS - 1_000);
-    fakes.lastRawOutputAt.set(agent.id, fakes.now.value - WORKING_THRESHOLD_MS - 1_000);
-
-    const inferred = await inferStatus(monitor, agent);
-    assert.equal(inferred, 'working',
-      'Change 3: turnInFlight overrides the stored model-pending TTL');
-  } finally {
-    restore();
-  }
-});
-
-test('BUG-18 Change 3: turnInFlight latch expires only on forceIdle(turnComplete)', async () => {
-  const fakes = makeStatusMonitorFakes();
-  const restore = patchDatabaseModule(fakes);
-  try {
-    const agent = makeAgent('w-1', { status: 'working' });
-    const monitor = makeMonitor({ fakes, agent });
-
-    monitor.forceWorking(agent.id, {
-      source: 'tool-use',
-      toolUseId: 'A',
-      ttlClass: 'tool-pending',
-      turnInFlight: true,
-    });
-    monitor.forceWorking(agent.id, {
-      source: 'tool-result',
-      resolvedToolUseId: 'A',
-      ttlClass: 'model-pending',
-    });
-
-    // 200 s of silence — still working because turnInFlight is true.
-    fakes.now.value += 200_000;
-    fakes.lastOutputAt.set(agent.id, fakes.now.value - WORKING_THRESHOLD_MS - 1_000);
-    fakes.lastRawOutputAt.set(agent.id, fakes.now.value - WORKING_THRESHOLD_MS - 1_000);
-    assert.equal(await inferStatus(monitor, agent), 'working',
-      'precondition: turnInFlight keeps working through silence');
-
-    // forceIdle('turnComplete') is the supervisor's truth-signal that the
-    // turn has terminated. It overwrites the latch to idle, which inherently
-    // clears turnInFlight.
-    monitor.forceIdle(agent.id, 'turnComplete');
-    const latch = monitor.getLatchSnapshot(agent.id);
-    assert.ok(latch && latch.state === 'idle',
-      'forceIdle overwrites the working latch with idle (turnInFlight gone)');
-    assert.equal(agent.status, 'idle');
-  } finally {
-    restore();
-  }
-});
+// Removed §12.5: two BUG-18 Change 3 tests that asserted turnInFlight
+// promotes the effective TTL to tool-pending past the model-pending
+// ceiling. That promotion only lives in the supervised-non-supervisor
+// branch of inferStatus (status-monitor.ts:689-692), which is no longer
+// reachable now that the Class IV skip returns null for any supervised
+// worker. The Change 3 latch-state recording (sticky turnInFlight, no
+// auto-clear on refresh) is still covered by the two tests below.
 
 test('BUG-18 Change 3: turnInFlight is sticky-true across refreshes that omit the flag', async () => {
   // The bridge sets turnInFlight=true on tool-use/task-started/non-terminal
@@ -911,7 +850,7 @@ test('BUG-18 Change 3: turnInFlight is sticky-true across refreshes that omit th
   const fakes = makeStatusMonitorFakes();
   const restore = patchDatabaseModule(fakes);
   try {
-    const agent = makeAgent('w-1', { status: 'working' });
+    const agent = makeWorker('w-1', { status: 'working' });
     const monitor = makeMonitor({ fakes, agent });
 
     monitor.forceWorking(agent.id, {
@@ -944,7 +883,7 @@ test('BUG-18 Change 3: turnInFlight stays false when never set (no impact on leg
   const fakes = makeStatusMonitorFakes();
   const restore = patchDatabaseModule(fakes);
   try {
-    const agent = makeAgent('w-1', { status: 'working' });
+    const agent = makeWorker('w-1', { status: 'working' });
     const monitor = makeMonitor({ fakes, agent });
 
     monitor.forceWorking(agent.id, {
@@ -964,6 +903,1216 @@ test('BUG-18 Change 3: turnInFlight stays false when never set (no impact on leg
     const inferred = await inferStatus(monitor, agent);
     assert.equal(inferred, 'idle',
       'without turnInFlight, model-pending still expires at 180 s as before');
+  } finally {
+    restore();
+  }
+});
+
+// Supervisor short-latch — the supervisor reads only its own status (via the
+// /input gate and event-bridge queue gate), so it bypasses the long
+// worker-shaped TTLs and uses SUPERVISOR_WORKING_LATCH_MS instead. The
+// turnInFlight ceiling and tool-pending floor are also skipped.
+test('supervisor short-latch: tool-pending TTL is ignored, latch expires at SUPERVISOR_WORKING_LATCH_MS', async () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeWorker('sup-1', { status: 'working', isSupervisor: true });
+    const monitor = makeMonitor({ fakes, agent });
+
+    // Same refresh shape a worker would get: tool-pending ttlClass, turnInFlight set.
+    monitor.forceWorking(agent.id, {
+      source: 'tool-use',
+      toolUseId: 'X',
+      ttlClass: 'tool-pending',
+      turnInFlight: true,
+    });
+
+    // Within the short latch window: still working.
+    fakes.now.value += SUPERVISOR_WORKING_LATCH_MS - 1_000;
+    fakes.lastOutputAt.set(agent.id, fakes.now.value - WORKING_THRESHOLD_MS - 1_000);
+    fakes.lastRawOutputAt.set(agent.id, fakes.now.value - WORKING_THRESHOLD_MS - 1_000);
+    let inferred = await inferStatus(monitor, agent);
+    assert.equal(inferred, 'working',
+      'within SUPERVISOR_WORKING_LATCH_MS, supervisor stays working');
+
+    // Past the short latch — for a worker, tool-pending (900s) and turnInFlight
+    // would both still hold this as `working`. For a supervisor it must flip.
+    fakes.now.value += 2_000; // total elapsed > SUPERVISOR_WORKING_LATCH_MS
+    fakes.lastOutputAt.set(agent.id, fakes.now.value - WORKING_THRESHOLD_MS - 1_000);
+    fakes.lastRawOutputAt.set(agent.id, fakes.now.value - WORKING_THRESHOLD_MS - 1_000);
+    inferred = await inferStatus(monitor, agent);
+    assert.equal(inferred, 'idle',
+      'past SUPERVISOR_WORKING_LATCH_MS with stale PTY, supervisor flips to idle ' +
+      'regardless of tool-pending/turnInFlight that would hold a worker for 15 min');
+  } finally {
+    restore();
+  }
+});
+
+test('supervisor short-latch: non-supervisor under identical state retains tool-pending ceiling (regression guard)', async () => {
+  // Mirror of the previous test with isSupervisor:false — proves the bypass
+  // is scoped and we haven't accidentally shortened the worker path.
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeWorker('w-1', { status: 'working', isSupervisor: false });
+    const monitor = makeMonitor({ fakes, agent });
+
+    monitor.forceWorking(agent.id, {
+      source: 'tool-use',
+      toolUseId: 'X',
+      ttlClass: 'tool-pending',
+      turnInFlight: true,
+    });
+
+    // Far past SUPERVISOR_WORKING_LATCH_MS, well within tool-pending TTL.
+    fakes.now.value += SUPERVISOR_WORKING_LATCH_MS + 60_000;
+    fakes.lastOutputAt.set(agent.id, fakes.now.value - WORKING_THRESHOLD_MS - 1_000);
+    fakes.lastRawOutputAt.set(agent.id, fakes.now.value - WORKING_THRESHOLD_MS - 1_000);
+    const inferred = await inferStatus(monitor, agent);
+    assert.equal(inferred, 'working',
+      'worker keeps tool-pending ceiling (900s) — supervisor bypass did not leak');
+  } finally {
+    restore();
+  }
+});
+
+// ── Tightened TTLs for unsupervised non-supervisor agents ───────────
+// See plans/tighten-inference-for-unsupervised-agents.md. The unsupervised
+// lane has no supervisor consumer reacting expensively to false-idle, so
+// the worker-shaped 180 s / 900 s ceilings are replaced with 30 s / 120 s.
+// `turnInFlight` promotion (BUG-18 Change 3) is intentionally dropped for
+// unsupervised — its purpose is supervisor protection.
+
+test('unsupervised: model-pending latch decays at 30 s, not 180 s', async () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeWorker('u-1', { status: 'working', isSupervised: false });
+    const monitor = makeMonitor({ fakes, agent });
+
+    monitor.forceWorking(agent.id, { source: 'task-started', ttlClass: 'model-pending' });
+
+    // Just past the unsupervised model-pending ceiling, well below the
+    // supervised one. PTY is stale on both signals so only the latch
+    // could be holding `working`.
+    fakes.now.value += WORKING_LATCH_MODEL_PENDING_UNSUPERVISED_MS + 1_000;
+    fakes.lastOutputAt.set(agent.id, fakes.now.value - WORKING_THRESHOLD_MS - 1_000);
+    fakes.lastRawOutputAt.set(agent.id, fakes.now.value - WORKING_THRESHOLD_MS - 1_000);
+
+    const inferred = await inferStatus(monitor, agent);
+    assert.equal(inferred, 'idle',
+      'unsupervised model-pending expires at 30 s (not the 180 s supervised ceiling)');
+  } finally {
+    restore();
+  }
+});
+
+test('unsupervised: model-pending boundary — still working just inside 30 s', async () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeWorker('u-1', { status: 'working', isSupervised: false });
+    const monitor = makeMonitor({ fakes, agent });
+
+    monitor.forceWorking(agent.id, { source: 'task-started', ttlClass: 'model-pending' });
+
+    // 1 s inside the ceiling. Spinner-only PTY stays stale on meaningful but
+    // raw byte path is fresh — so even if the latch held, PTY fallback would
+    // also vote working. To isolate the latch, stale both signals:
+    fakes.now.value += WORKING_LATCH_MODEL_PENDING_UNSUPERVISED_MS - 1_000;
+    fakes.lastOutputAt.set(agent.id, fakes.now.value - WORKING_THRESHOLD_MS - 1_000);
+    fakes.lastRawOutputAt.set(agent.id, fakes.now.value - WORKING_THRESHOLD_MS - 1_000);
+
+    const inferred = await inferStatus(monitor, agent);
+    assert.equal(inferred, 'working',
+      'inside the unsupervised model-pending window, latch still holds working');
+  } finally {
+    restore();
+  }
+});
+
+test('unsupervised: tool-pending latch decays at 120 s, not 900 s', async () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeWorker('u-1', { status: 'working', isSupervised: false });
+    const monitor = makeMonitor({ fakes, agent });
+
+    monitor.forceWorking(agent.id, { source: 'tool-use', toolUseId: 'A', ttlClass: 'tool-pending' });
+    // Resolve the tool so `hasOutstandingTools` is false; the stored
+    // ttlClass ('tool-pending') is what we're testing the ceiling for.
+    monitor.forceWorking(agent.id, {
+      source: 'tool-result',
+      resolvedToolUseId: 'A',
+      ttlClass: 'tool-pending',
+    });
+
+    fakes.now.value += WORKING_LATCH_TOOL_PENDING_UNSUPERVISED_MS + 1_000;
+    fakes.lastOutputAt.set(agent.id, fakes.now.value - WORKING_THRESHOLD_MS - 1_000);
+    fakes.lastRawOutputAt.set(agent.id, fakes.now.value - WORKING_THRESHOLD_MS - 1_000);
+
+    const inferred = await inferStatus(monitor, agent);
+    assert.equal(inferred, 'idle',
+      'unsupervised tool-pending expires at 120 s (not the 900 s supervised ceiling)');
+  } finally {
+    restore();
+  }
+});
+
+test('unsupervised: outstanding tool still floors at 120 s tool-pending', async () => {
+  // The hasOutstandingTools floor is kept for unsupervised — we just lowered
+  // its value. While a tool is genuinely outstanding, the latch holds past
+  // the 30 s model-pending ceiling up to the 120 s tool-pending ceiling.
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeWorker('u-1', { status: 'working', isSupervised: false });
+    const monitor = makeMonitor({ fakes, agent });
+
+    // Seed with model-pending then add an outstanding tool — outstanding
+    // tools must promote the effective TTL up to tool-pending regardless of
+    // the stored class.
+    monitor.forceWorking(agent.id, { source: 'task-started', ttlClass: 'model-pending' });
+    monitor.forceWorking(agent.id, { source: 'tool-use', toolUseId: 'X', ttlClass: 'model-pending' });
+
+    // 90 s elapsed: well past 30 s model-pending, under 120 s tool-pending.
+    fakes.now.value += 90_000;
+    fakes.lastOutputAt.set(agent.id, fakes.now.value - WORKING_THRESHOLD_MS - 1_000);
+    fakes.lastRawOutputAt.set(agent.id, fakes.now.value - WORKING_THRESHOLD_MS - 1_000);
+
+    const inferred = await inferStatus(monitor, agent);
+    assert.equal(inferred, 'working',
+      'outstanding tool floors the effective TTL at 120 s for unsupervised');
+  } finally {
+    restore();
+  }
+});
+
+test('unsupervised: thinking-pending latch decays at 120 s, not 900 s', async () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeWorker('u-1', { status: 'working', isSupervised: false });
+    const monitor = makeMonitor({ fakes, agent });
+
+    monitor.forceWorking(agent.id, { source: 'thinking', ttlClass: 'thinking-pending' });
+
+    fakes.now.value += WORKING_LATCH_THINKING_PENDING_UNSUPERVISED_MS + 1_000;
+    fakes.lastOutputAt.set(agent.id, fakes.now.value - WORKING_THRESHOLD_MS - 1_000);
+    fakes.lastRawOutputAt.set(agent.id, fakes.now.value - WORKING_THRESHOLD_MS - 1_000);
+
+    const inferred = await inferStatus(monitor, agent);
+    assert.equal(inferred, 'idle',
+      'unsupervised thinking-pending expires at 120 s (not the 900 s supervised ceiling)');
+  } finally {
+    restore();
+  }
+});
+
+test('unsupervised: turnInFlight does NOT promote the effective TTL', async () => {
+  // BUG-18 Change 3's turnInFlight promotion exists to suppress false-idle
+  // events that a supervisor would react to. For unsupervised agents there
+  // is no such consumer; the model-pending ceiling fires at 30 s even when
+  // turnInFlight is set.
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeWorker('u-1', { status: 'working', isSupervised: false });
+    const monitor = makeMonitor({ fakes, agent });
+
+    monitor.forceWorking(agent.id, {
+      source: 'assistant-text',
+      ttlClass: 'model-pending',
+      turnInFlight: true,
+    });
+    const latch = monitor.getLatchSnapshot(agent.id);
+    assert.ok(latch && latch.state === 'working');
+    assert.equal(latch.turnInFlight, true,
+      'turnInFlight is still recorded on the latch (write path unchanged)');
+
+    // 35 s elapsed — past the unsupervised model-pending ceiling. For a
+    // supervised agent, turnInFlight would promote to tool-pending (900 s)
+    // and hold working. For unsupervised, it must flip idle.
+    fakes.now.value += WORKING_LATCH_MODEL_PENDING_UNSUPERVISED_MS + 5_000;
+    fakes.lastOutputAt.set(agent.id, fakes.now.value - WORKING_THRESHOLD_MS - 1_000);
+    fakes.lastRawOutputAt.set(agent.id, fakes.now.value - WORKING_THRESHOLD_MS - 1_000);
+
+    const inferred = await inferStatus(monitor, agent);
+    assert.equal(inferred, 'idle',
+      'unsupervised lane skips the turnInFlight promotion (BUG-18 Change 3 is supervisor-targeted)');
+  } finally {
+    restore();
+  }
+});
+
+// Removed §12.5: "supervised Codex still uses 900 s tool-pending" and
+// "supervised Gemini still uses 900 s thinking-pending". Both are
+// directly contradicted by the broadened Class IV skip — any supervised
+// worker now bypasses inference entirely, so the supervised-tier TTL
+// branch (status-monitor.ts:684) is no longer reachable for non-supervisor
+// agents. The Class IV section below covers the new behavior.
+
+test('unsupervised non-regression: supervised Claude agent does NOT pick up unsupervised ceilings (Plan 1 short-circuits)', async () => {
+  // Originally written under Plan 2 to assert "supervised Claude retains
+  // the 180 s supervised ceiling." Re-classified once Plan 1 landed: a
+  // supervised Claude worker now hits the Class IV inference-skip at the
+  // top of inferStatus and returns null (the latch-driven status wins).
+  // The semantic intent is preserved — the unsupervised tightening still
+  // must not leak into the supervised-Claude lane — but the verification
+  // shape changed from "supervised TTL fires" to "no inference flip at all."
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeAgent('w-claude', {
+      status: 'working',
+      isSupervised: true,
+      provider: 'claude',
+    });
+    const monitor = makeMonitor({ fakes, agent });
+
+    monitor.forceWorking(agent.id, { source: 'task-started', ttlClass: 'model-pending' });
+
+    // Same setup as before — past unsupervised model-pending, inside the
+    // old supervised model-pending. With Plan 1 the lane is now skipped.
+    fakes.now.value += WORKING_LATCH_MODEL_PENDING_UNSUPERVISED_MS + 5_000;
+    fakes.lastOutputAt.set(agent.id, fakes.now.value - WORKING_THRESHOLD_MS - 1_000);
+    fakes.lastRawOutputAt.set(agent.id, fakes.now.value - WORKING_THRESHOLD_MS - 1_000);
+
+    const inferred = await inferStatus(monitor, agent);
+    assert.equal(inferred, null,
+      'supervised Claude bypasses inference entirely (Plan 1 §2.1) — ' +
+      'unsupervised tightening did not leak into this lane');
+  } finally {
+    restore();
+  }
+});
+
+// ── Class IV inference-skip for supervised workers ─────────────────
+// See plans/disable-inference-for-supervised-claude-workers.md +
+// plans/class-iv-worker-hook-scaffold.md §12.5 (broadening). inferStatus
+// returns null for `isSupervised` (any provider), letting the Stop-hook +
+// notifyUserInputDelivered latch state become the sole truth source. The
+// alive check above the short-circuit preserves done/crashed detection.
+// Unsupervised workers and the supervisor itself keep their existing
+// inference behavior. Gemini supervised workers also hit the skip even
+// though their hook scaffold isn't landed yet (§12.2) — that's the
+// intentional trade-off so missing scaffolds are visible, not masked.
+
+test('Class IV: supervised Claude worker — inferStatus returns null (short-circuit)', async () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeAgent('w-claude', {
+      status: 'working',
+      isSupervised: true,
+      provider: 'claude',
+    });
+    const monitor = makeMonitor({ fakes, agent });
+
+    // No latch armed, PTY stale on both signals — under the unsupervised or
+    // supervised codex/gemini lanes this would return 'idle'. With Plan 1
+    // the lane is skipped and inference returns null (latch wins).
+    fakes.lastOutputAt.set(agent.id, fakes.now.value - WORKING_THRESHOLD_MS - 1_000);
+    fakes.lastRawOutputAt.set(agent.id, fakes.now.value - WORKING_THRESHOLD_MS - 1_000);
+
+    const inferred = await inferStatus(monitor, agent);
+    assert.equal(inferred, null,
+      'supervised Claude bypasses inference — null signals "no change" to the poll loop');
+  } finally {
+    restore();
+  }
+});
+
+test('Class IV: supervised Claude worker — alive check still produces done on exit 0', async () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeAgent('w-claude', {
+      status: 'working',
+      isSupervised: true,
+      provider: 'claude',
+      lastExitCode: 0,
+    });
+    const monitor = makeMonitor({ fakes, agent, alive: false });
+
+    const inferred = await inferStatus(monitor, agent);
+    assert.equal(inferred, 'done',
+      'alive check runs above the Class IV short-circuit; done/crashed detection preserved');
+  } finally {
+    restore();
+  }
+});
+
+test('Class IV: supervised Claude worker — alive check still produces crashed on non-zero exit', async () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeAgent('w-claude', {
+      status: 'working',
+      isSupervised: true,
+      provider: 'claude',
+      lastExitCode: 137,
+    });
+    const monitor = makeMonitor({ fakes, agent, alive: false });
+
+    const inferred = await inferStatus(monitor, agent);
+    assert.equal(inferred, 'crashed',
+      'crashed detection preserved for supervised Claude (alive check above the short-circuit)');
+  } finally {
+    restore();
+  }
+});
+
+test('Class IV: supervised Codex worker — inference is now skipped (broadened §12.5)', async () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeAgent('w-codex', {
+      status: 'working',
+      isSupervised: true,
+      provider: 'codex',
+    });
+    const monitor = makeMonitor({ fakes, agent });
+
+    // Even with a working-latch armed and PTY signals stale (which would
+    // previously promote idle via inference), the Class IV skip now returns
+    // null — the Stop-hook is the sole idle-truth source for codex too.
+    monitor.forceWorking(agent.id, { source: 'tool-use', toolUseId: 'A', ttlClass: 'tool-pending' });
+    fakes.now.value += 60_000;
+    fakes.lastOutputAt.set(agent.id, fakes.now.value - WORKING_THRESHOLD_MS - 1_000);
+    fakes.lastRawOutputAt.set(agent.id, fakes.now.value - WORKING_THRESHOLD_MS - 1_000);
+
+    const inferred = await inferStatus(monitor, agent);
+    assert.equal(inferred, null,
+      'supervised Codex bypasses inference (Class IV gate broadened per §12.5)');
+  } finally {
+    restore();
+  }
+});
+
+test('Class IV: supervised Gemini worker — inference is now skipped (broadened §12.5)', async () => {
+  // Gemini has no hook scaffold yet (§12.2 follow-up), so a supervised
+  // Gemini worker has NO idle-truth source after this broadening except
+  // chat-stream/turn-complete events. The user explicitly accepts that —
+  // they want missing scaffolds visible. Test asserts the skip semantics,
+  // not the downstream consequence.
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeAgent('w-gemini', {
+      status: 'working',
+      isSupervised: true,
+      provider: 'gemini',
+    });
+    const monitor = makeMonitor({ fakes, agent });
+
+    monitor.forceWorking(agent.id, { source: 'thinking', ttlClass: 'thinking-pending' });
+    fakes.now.value += 300_000;
+    fakes.lastOutputAt.set(agent.id, fakes.now.value - WORKING_THRESHOLD_MS - 1_000);
+    fakes.lastRawOutputAt.set(agent.id, fakes.now.value - WORKING_THRESHOLD_MS - 1_000);
+
+    const inferred = await inferStatus(monitor, agent);
+    assert.equal(inferred, null,
+      'supervised Gemini bypasses inference (Class IV gate broadened per §12.5)');
+  } finally {
+    restore();
+  }
+});
+
+test('Class IV: unsupervised Claude agent — inference still runs (Plan 2 snappy lane)', async () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeAgent('u-claude', {
+      status: 'working',
+      isSupervised: false,
+      provider: 'claude',
+    });
+    const monitor = makeMonitor({ fakes, agent });
+
+    monitor.forceWorking(agent.id, { source: 'task-started', ttlClass: 'model-pending' });
+
+    // Past the unsupervised 30 s model-pending ceiling — must flip idle, not
+    // null. Confirms the Class IV gate is `isSupervised`, not just `provider`:
+    // unsupervised Claude agents still run inference.
+    fakes.now.value += WORKING_LATCH_MODEL_PENDING_UNSUPERVISED_MS + 1_000;
+    fakes.lastOutputAt.set(agent.id, fakes.now.value - WORKING_THRESHOLD_MS - 1_000);
+    fakes.lastRawOutputAt.set(agent.id, fakes.now.value - WORKING_THRESHOLD_MS - 1_000);
+
+    const inferred = await inferStatus(monitor, agent);
+    assert.equal(inferred, 'idle',
+      'unsupervised Claude hits the Plan 2 unsupervised lane, not the Class IV skip');
+  } finally {
+    restore();
+  }
+});
+
+test('Class IV: isSupervisor + provider Claude — still uses supervisor short-latch (not Class IV skip)', async () => {
+  // isSupervisor:true sets isSupervised:false in production, but the Class
+  // IV gate is `isSupervised` (any provider) so a hypothetical isSupervisor
+  // agent never reaches it regardless. This asserts the supervisor lane
+  // wins over Class IV when both could theoretically apply.
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeAgent('sup-claude', {
+      status: 'working',
+      isSupervised: false,
+      isSupervisor: true,
+      provider: 'claude',
+    });
+    const monitor = makeMonitor({ fakes, agent });
+
+    monitor.forceWorking(agent.id, {
+      source: 'tool-use',
+      toolUseId: 'X',
+      ttlClass: 'tool-pending',
+      turnInFlight: true,
+    });
+
+    // Past SUPERVISOR_WORKING_LATCH_MS — supervisor flips idle even though
+    // tool-pending + turnInFlight would hold a worker for 15 min.
+    fakes.now.value += SUPERVISOR_WORKING_LATCH_MS + 2_000;
+    fakes.lastOutputAt.set(agent.id, fakes.now.value - WORKING_THRESHOLD_MS - 1_000);
+    fakes.lastRawOutputAt.set(agent.id, fakes.now.value - WORKING_THRESHOLD_MS - 1_000);
+
+    const inferred = await inferStatus(monitor, agent);
+    assert.equal(inferred, 'idle',
+      'supervisor lane fires; Class IV skip does not apply (gate is isSupervised, not isSupervisor)');
+  } finally {
+    restore();
+  }
+});
+
+// ── Class IV §2.2 hook-silence watchdog (BUG-23 reframe) ────────────
+
+/** Capture console.warn calls for the duration of a watchdog test. Restored
+ *  in finally. Tests assert against the captured array. */
+function captureWarn(): { warnings: string[]; restore: () => void } {
+  const warnings: string[] = [];
+  const original = console.warn;
+  console.warn = (...args: unknown[]) => {
+    warnings.push(args.map(String).join(' '));
+  };
+  return {
+    warnings,
+    restore: () => {
+      console.warn = original;
+    },
+  };
+}
+
+/** Test seam — invoke the private watchdog directly. Mirrors the inferStatus
+ *  accessor pattern above. */
+function checkWatchdog(monitor: StatusMonitor, agent: Agent): void {
+  (monitor as any).checkHookSilenceWatchdog(agent);
+}
+
+test('watchdog: supervised Claude idle >15 min after input delivered with NO hook ever fires a warning', () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  const warn = captureWarn();
+  try {
+    const agent = makeAgent('w-claude', {
+      status: 'idle',
+      isSupervised: true,
+      provider: 'claude',
+    });
+    const monitor = makeMonitor({ fakes, agent });
+
+    // Input delivered 20 minutes ago; never any Stop-hook event.
+    monitor.recordInputDelivered(agent.id, fakes.now.value - 20 * 60 * 1000);
+
+    checkWatchdog(monitor, agent);
+
+    assert.equal(warn.warnings.length, 1,
+      'BUG-23 reframe: scaffold-broken signature (input in, no hook ever) fires once');
+    assert.match(warn.warnings[0], /\[class-iv\]/, 'warning is tagged for Class IV scaffold');
+    assert.match(warn.warnings[0], /w-claude/, 'warning identifies the agent');
+    assert.match(warn.warnings[0], /no Stop-hook event has ever been recorded/,
+      'warning explains the scaffold-broken signature directly');
+  } finally {
+    warn.restore();
+    restore();
+  }
+});
+
+test('watchdog: any prior hook recorded suppresses warning (scaffold works)', () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  const warn = captureWarn();
+  try {
+    const agent = makeAgent('w-claude', {
+      status: 'idle',
+      isSupervised: true,
+      provider: 'claude',
+    });
+    const monitor = makeMonitor({ fakes, agent });
+
+    monitor.recordInputDelivered(agent.id, fakes.now.value - 20 * 60 * 1000);
+    // Hook fired ever, even long ago — scaffold is proven working.
+    monitor.recordHookEventAt(agent.id, fakes.now.value - 16 * 60 * 1000);
+
+    checkWatchdog(monitor, agent);
+
+    assert.equal(warn.warnings.length, 0,
+      'any prior hook proves scaffold works — watchdog stays silent');
+  } finally {
+    warn.restore();
+    restore();
+  }
+});
+
+test('watchdog: no input delivered yet → no warning (hook absence is expected pre-input)', () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  const warn = captureWarn();
+  try {
+    const agent = makeAgent('w-claude', {
+      status: 'idle',
+      isSupervised: true,
+      provider: 'claude',
+      createdAt: new Date(fakes.now.value - 60 * 60 * 1000).toISOString(),
+    });
+    const monitor = makeMonitor({ fakes, agent });
+
+    // Agent has existed for an hour but never received input. No hook
+    // expected; no warning warranted.
+    checkWatchdog(monitor, agent);
+
+    assert.equal(warn.warnings.length, 0,
+      'no input delivered → hook absence is expected → no warning');
+  } finally {
+    warn.restore();
+    restore();
+  }
+});
+
+test('watchdog: dedupes repeated polls within the cooldown window', () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  const warn = captureWarn();
+  try {
+    const agent = makeAgent('w-claude', {
+      status: 'idle',
+      isSupervised: true,
+      provider: 'claude',
+    });
+    const monitor = makeMonitor({ fakes, agent });
+
+    monitor.recordInputDelivered(agent.id, fakes.now.value - 20 * 60 * 1000);
+
+    checkWatchdog(monitor, agent);
+    fakes.now.value += 1_000;
+    checkWatchdog(monitor, agent);
+    fakes.now.value += 1_000;
+    checkWatchdog(monitor, agent);
+
+    assert.equal(warn.warnings.length, 1,
+      'three checks inside the cooldown produce a single warning');
+  } finally {
+    warn.restore();
+    restore();
+  }
+});
+
+test('watchdog: supervised Codex idle >15 min with NO hook fires a warning (broadened §12.5)', () => {
+  // Codex now has a Stop-hook scaffold (§12.1) — the watchdog must catch a
+  // codex-side scaffold break (missing .codex/config.toml, missing env, etc.)
+  // the same way it catches a Claude-side break.
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  const warn = captureWarn();
+  try {
+    const agent = makeAgent('w-codex', {
+      status: 'idle',
+      isSupervised: true,
+      provider: 'codex',
+    });
+    const monitor = makeMonitor({ fakes, agent });
+    monitor.recordInputDelivered(agent.id, fakes.now.value - 20 * 60 * 1000);
+
+    checkWatchdog(monitor, agent);
+
+    assert.equal(warn.warnings.length, 1,
+      'supervised Codex now also has a Stop-hook scaffold — watchdog fires on silence');
+    assert.match(warn.warnings[0], /\[class-iv\]/, 'warning is tagged for Class IV scaffold');
+    assert.match(warn.warnings[0], /supervised codex worker/,
+      'warning attributes the silent-hook signal to codex specifically');
+    assert.match(warn.warnings[0], /w-codex/, 'warning identifies the agent');
+  } finally {
+    warn.restore();
+    restore();
+  }
+});
+
+test('watchdog: unsupervised Claude is NOT watched (out of scope)', () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  const warn = captureWarn();
+  try {
+    const agent = makeAgent('u-claude', {
+      status: 'idle',
+      isSupervised: false,
+      provider: 'claude',
+    });
+    const monitor = makeMonitor({ fakes, agent });
+    monitor.recordInputDelivered(agent.id, fakes.now.value - 20 * 60 * 1000);
+
+    checkWatchdog(monitor, agent);
+
+    assert.equal(warn.warnings.length, 0,
+      'unsupervised Claude has no hook scaffold — watchdog must not fire');
+  } finally {
+    warn.restore();
+    restore();
+  }
+});
+
+test('watchdog: status flipping out of idle clears the dedupe; back to idle re-arms', () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  const warn = captureWarn();
+  try {
+    const agent = makeAgent('w-claude', {
+      status: 'idle',
+      isSupervised: true,
+      provider: 'claude',
+    });
+    const monitor = makeMonitor({ fakes, agent });
+    monitor.recordInputDelivered(agent.id, fakes.now.value - 20 * 60 * 1000);
+
+    checkWatchdog(monitor, agent);
+    assert.equal(warn.warnings.length, 1, 'first warning fires');
+
+    // Status flips to working (the user manually intervened, or another
+    // input went in) — must clear dedupe.
+    agent.status = 'working';
+    checkWatchdog(monitor, agent);
+    assert.equal(warn.warnings.length, 1, 'no warning while working');
+
+    // Back to idle with still no hook ever fired.
+    agent.status = 'idle';
+    fakes.now.value += 1_000;
+    checkWatchdog(monitor, agent);
+    assert.equal(warn.warnings.length, 2,
+      'fresh idle re-entry with still no hook re-arms the warning');
+  } finally {
+    warn.restore();
+    restore();
+  }
+});
+
+test('watchdog: forgetAgent clears the hook-event + input-delivered + dedupe state', () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeAgent('w-claude', {
+      status: 'idle',
+      isSupervised: true,
+      provider: 'claude',
+    });
+    const monitor = makeMonitor({ fakes, agent });
+
+    monitor.recordHookEventAt(agent.id, fakes.now.value);
+    monitor.recordInputDelivered(agent.id, fakes.now.value);
+    assert.equal(monitor.getLastHookEventAt(agent.id), fakes.now.value);
+
+    monitor.forgetAgent(agent.id);
+    assert.equal(monitor.getLastHookEventAt(agent.id), undefined,
+      'forgetAgent drops the hook-event timestamp — no stale state across restarts');
+    // Re-arming a watchdog test after forgetAgent should produce no warning
+    // because lastInputDeliveredAt was cleared too.
+    const warn = captureWarn();
+    try {
+      fakes.now.value += 20 * 60 * 1000;
+      checkWatchdog(monitor, agent);
+      assert.equal(warn.warnings.length, 0,
+        'forgetAgent also clears lastInputDeliveredAt so no false warning fires');
+    } finally {
+      warn.restore();
+    }
+  } finally {
+    restore();
+  }
+});
+
+// ── BUG-23 launch settle timer + promoteFromLaunching ───────────────────
+
+/** Test seam — invoke the private poll() once. */
+async function pollOnce(monitor: StatusMonitor): Promise<void> {
+  await (monitor as any).poll();
+}
+
+test('BUG-23: supervised Claude in launching → idle at settle (no hook fires)', async () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeAgent('w-claude', {
+      status: 'launching',
+      isSupervised: true,
+      provider: 'claude',
+    });
+    const monitor = makeMonitor({ fakes, agent });
+    monitor.recordLaunch(agent.id);
+
+    // Just before the budget — no promotion yet.
+    fakes.now.value += LAUNCH_SETTLE_TIMEOUT_MS.claude - 1;
+    await pollOnce(monitor);
+    assert.equal(agent.status, 'launching', 'still launching just before budget');
+    assert.equal(fakes.emissions.length, 0, 'no emission before budget');
+
+    // Cross the budget threshold — should promote on the next tick.
+    fakes.now.value += 2;
+    await pollOnce(monitor);
+    assert.equal(agent.status, 'idle', 'promoted to idle after settle');
+    assert.equal(fakes.emissions.length, 1);
+    assert.equal(fakes.emissions[0].status, 'idle');
+    assert.equal(fakes.emissions[0].fromStatus, 'launching');
+    assert.equal(fakes.emissions[0].source, 'monitor');
+    // The audit row carries the source descriptor.
+    const audit = fakes.audit.find(r => r.type === 'status_change');
+    assert.ok(audit && audit.payload.includes('launch-settle'),
+      'status_change audit row records the launch-settle source');
+  } finally {
+    restore();
+  }
+});
+
+test('BUG-23: Stop hook arriving mid-settle promotes via hook path; settle no-ops next tick', async () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeAgent('w-claude', {
+      status: 'launching',
+      isSupervised: true,
+      provider: 'claude',
+    });
+    const monitor = makeMonitor({ fakes, agent });
+    monitor.recordLaunch(agent.id);
+
+    // Half-way through the settle window: hook fires.
+    fakes.now.value += Math.floor(LAUNCH_SETTLE_TIMEOUT_MS.claude / 2);
+    const ok = monitor.promoteFromLaunching(agent.id, 'stop-hook');
+    assert.equal(ok, true, 'hook promotion returns true');
+    assert.equal(agent.status, 'idle', 'hook drove the agent to idle inside settle');
+    const audit = fakes.audit.find(r => r.type === 'status_change');
+    assert.ok(audit && audit.payload.includes('stop-hook'),
+      'status_change audit row records the stop-hook source');
+    const emissionsBefore = fakes.emissions.length;
+
+    // Cross the budget. The settle check must NOT emit a second status_change.
+    fakes.now.value += LAUNCH_SETTLE_TIMEOUT_MS.claude;
+    await pollOnce(monitor);
+    assert.equal(fakes.emissions.length, emissionsBefore,
+      'launchedAt was cleared by promoteFromLaunching — settle timer no-ops');
+  } finally {
+    restore();
+  }
+});
+
+test('BUG-23: non-supervised codex promotes at codex settle (15s default)', async () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeAgent('w-codex', {
+      status: 'launching',
+      isSupervised: false,
+      provider: 'codex',
+    });
+    const monitor = makeMonitor({ fakes, agent });
+    monitor.recordLaunch(agent.id);
+
+    fakes.now.value += LAUNCH_SETTLE_TIMEOUT_MS.codex - 1;
+    await pollOnce(monitor);
+    assert.equal(agent.status, 'launching', 'still launching just before codex budget');
+
+    fakes.now.value += 2;
+    await pollOnce(monitor);
+    assert.equal(agent.status, 'idle', 'promoted at codex settle budget');
+    assert.equal(LAUNCH_SETTLE_TIMEOUT_MS.codex, 15_000,
+      'codex default budget matches spec');
+  } finally {
+    restore();
+  }
+});
+
+test('BUG-23: terminal exit during launch — clearLaunch wipes settle timer; no spurious promote on next tick', async () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    // Simulate "runner exited and the runner.on('exit') handler wrote crashed".
+    // getActiveAgents excludes crashed/done, but we directly exercise
+    // checkLaunchSettle's defensive behavior via clearLaunch.
+    const agent = makeAgent('w-claude', {
+      status: 'launching',
+      isSupervised: true,
+      provider: 'claude',
+    });
+    const monitor = makeMonitor({ fakes, agent });
+    monitor.recordLaunch(agent.id);
+
+    // Crash happens mid-launch.
+    agent.status = 'crashed';
+    monitor.clearLaunch(agent.id);
+
+    // Even if poll() were called against this agent, promotion must not fire
+    // — agent is no longer launching, and the stamp was cleared.
+    fakes.now.value += LAUNCH_SETTLE_TIMEOUT_MS.claude * 2;
+    await pollOnce(monitor);
+    assert.equal(agent.status, 'crashed', 'stays crashed; no promotion');
+    const promoteEmissions = fakes.emissions.filter(e => e.status === 'idle');
+    assert.equal(promoteEmissions.length, 0, 'no idle promotion emitted');
+  } finally {
+    restore();
+  }
+});
+
+test('BUG-23: forgetAgent clears launchedAt + lastLaunchOverrunWarnAt', async () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeAgent('w-claude', {
+      status: 'launching',
+      isSupervised: true,
+      provider: 'claude',
+    });
+    const monitor = makeMonitor({ fakes, agent });
+    monitor.recordLaunch(agent.id);
+
+    monitor.forgetAgent(agent.id);
+
+    // After forgetAgent, the agent has no stamp. promoteFromLaunching from a
+    // launch-settle source should still work as a logical promotion if the
+    // agent is in 'launching' state — but checkLaunchSettle skips entirely
+    // when no stamp is set (the "reconnect / no recordLaunch" lane), so no
+    // promotion fires.
+    fakes.now.value += LAUNCH_SETTLE_TIMEOUT_MS.claude * 3;
+    await pollOnce(monitor);
+    assert.equal(agent.status, 'launching',
+      'forgetAgent dropped the stamp → settle check no-ops on the launching agent');
+  } finally {
+    restore();
+  }
+});
+
+test('BUG-23: promoteFromLaunching refuses when not in launching status', () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeAgent('w-claude', {
+      status: 'working',
+      isSupervised: true,
+      provider: 'claude',
+    });
+    const monitor = makeMonitor({ fakes, agent });
+
+    const ok = monitor.promoteFromLaunching(agent.id, 'stop-hook');
+    assert.equal(ok, false, 'guard blocks bypass when not in launching');
+    assert.equal(agent.status, 'working', 'status unchanged');
+    assert.equal(fakes.emissions.length, 0, 'no emission');
+  } finally {
+    restore();
+  }
+});
+
+test('BUG-23: promoteFromLaunching with source="other" refuses (canForceTransition gate)', () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeAgent('w-claude', {
+      status: 'launching',
+      isSupervised: true,
+      provider: 'claude',
+    });
+    const monitor = makeMonitor({ fakes, agent });
+    monitor.recordLaunch(agent.id);
+
+    const ok = monitor.promoteFromLaunching(agent.id, 'other');
+    assert.equal(ok, false, 'only launch-settle and stop-hook bypass the guard');
+    assert.equal(agent.status, 'launching', 'status unchanged');
+  } finally {
+    restore();
+  }
+});
+
+test('BUG-23: settle-overrun grace fires the narrow timer-misbehaving warning', async () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  const warn = captureWarn();
+  try {
+    const agent = makeAgent('w-claude', {
+      status: 'launching',
+      isSupervised: true,
+      provider: 'claude',
+    });
+    const monitor = makeMonitor({ fakes, agent });
+    monitor.recordLaunch(agent.id);
+
+    // Force the agent past budget + grace. To trigger the warning rather
+    // than have promoteFromLaunching succeed and clear the stamp, we
+    // pre-empt promotion by flipping the in-memory agent record's status
+    // back to 'launching' right before poll (simulating a DB lag scenario).
+    // Simpler: just verify checkLaunchSettle path warns when overrun is
+    // present by calling it directly with a stamp deep in the past, then
+    // assert the warning shape.
+    fakes.now.value += LAUNCH_SETTLE_TIMEOUT_MS.claude + LAUNCH_SETTLE_OVERRUN_GRACE_MS + 100;
+    // Re-stamp launch into the past so the elapsed delta is meaningful.
+    // (recordLaunch defaults to now(); we need it stale.)
+    (monitor as any).launchedAt.set(agent.id, fakes.now.value - (LAUNCH_SETTLE_TIMEOUT_MS.claude + LAUNCH_SETTLE_OVERRUN_GRACE_MS + 100));
+    await pollOnce(monitor);
+
+    assert.equal(agent.status, 'idle',
+      'still promotes on the same tick (warning is belt-and-suspenders)');
+    assert.ok(warn.warnings.length >= 1,
+      'overrun warning emitted at least once');
+    assert.ok(warn.warnings.some(w => w.includes('launch-settle overrun')),
+      'narrow warning carries the bug-23 tag');
+  } finally {
+    warn.restore();
+    restore();
+  }
+});
+
+// ── Class IV UserPromptSubmit start-hook forceWorking + watchdog ──────
+
+function checkStartHookSilence(monitor: StatusMonitor, agent: Agent): void {
+  (monitor as any).checkStartHookSilence(agent);
+}
+
+test('forceWorking(source) string overload: idle → working flips status + arms working latch', () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeAgent('w-claude', { status: 'idle', isSupervised: true, provider: 'claude' });
+    const monitor = makeMonitor({ fakes, agent });
+
+    monitor.forceWorking(agent.id, 'hook-start');
+
+    assert.equal(fakes.updates.length, 1, 'status write happened');
+    assert.equal(fakes.updates[0].status, 'working');
+    assert.equal(fakes.emissions.length, 1);
+    assert.equal(fakes.emissions[0].status, 'working');
+    assert.equal(fakes.emissions[0].fromStatus, 'idle');
+    assert.equal(fakes.emissions[0].source, 'monitor');
+
+    const latch = monitor.getLatchSnapshot(agent.id);
+    assert.ok(latch && latch.state === 'working', 'working latch armed');
+  } finally {
+    restore();
+  }
+});
+
+test('forceWorking(source) string overload: no-op on terminal status', () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeAgent('w-claude', { status: 'crashed', isSupervised: true, provider: 'claude', lastExitCode: 1 });
+    const monitor = makeMonitor({ fakes, agent, alive: false });
+
+    monitor.forceWorking(agent.id, 'hook-start');
+
+    assert.equal(fakes.updates.length, 0, 'crashed → forceWorking(source) is a no-op');
+    assert.equal(fakes.emissions.length, 0);
+    assert.equal(monitor.getLatchSnapshot(agent.id), undefined);
+  } finally {
+    restore();
+  }
+});
+
+test('forceWorking(source) string overload: no-op on transitional status (launching)', () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeAgent('w-claude', { status: 'launching', isSupervised: true, provider: 'claude' });
+    const monitor = makeMonitor({ fakes, agent });
+
+    monitor.forceWorking(agent.id, 'hook-start');
+
+    assert.equal(fakes.updates.length, 0);
+    assert.equal(monitor.getLatchSnapshot(agent.id), undefined);
+  } finally {
+    restore();
+  }
+});
+
+test('start-hook watchdog: supervised idle, input delivered ≥3s ago, no start hook → warns once + emits status-change', () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  const warn = captureWarn();
+  try {
+    const agent = makeAgent('w-claude', { status: 'idle', isSupervised: true, provider: 'claude' });
+    const monitor = makeMonitor({ fakes, agent });
+
+    monitor.recordInputDelivered(agent.id, fakes.now.value - (START_HOOK_SILENCE_WARN_MS + 500));
+    checkStartHookSilence(monitor, agent);
+
+    assert.equal(warn.warnings.length, 1, 'fired exactly once');
+    assert.match(warn.warnings[0], /\[bug-10\]/, 'warning is tagged for the paste-race fix');
+    assert.match(warn.warnings[0], /UserPromptSubmit/);
+
+    const startEmissions = fakes.emissions.filter((e) => e.source === 'start-hook-silence-watchdog');
+    assert.equal(startEmissions.length, 1, 'one watchdog event emitted');
+    assert.equal(startEmissions[0].status, 'idle');
+  } finally {
+    warn.restore();
+    restore();
+  }
+});
+
+test('start-hook watchdog: dedupes per input delivery (no re-warn within the same turn)', () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  const warn = captureWarn();
+  try {
+    const agent = makeAgent('w-claude', { status: 'idle', isSupervised: true, provider: 'claude' });
+    const monitor = makeMonitor({ fakes, agent });
+
+    monitor.recordInputDelivered(agent.id, fakes.now.value - (START_HOOK_SILENCE_WARN_MS + 500));
+    checkStartHookSilence(monitor, agent);
+    fakes.now.value += 1_500;
+    checkStartHookSilence(monitor, agent);
+    fakes.now.value += 1_500;
+    checkStartHookSilence(monitor, agent);
+
+    assert.equal(warn.warnings.length, 1, 'one warning across multiple polls within the same turn');
+  } finally {
+    warn.restore();
+    restore();
+  }
+});
+
+test('start-hook watchdog: fresh input delivery re-arms after a prior warning', () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  const warn = captureWarn();
+  try {
+    const agent = makeAgent('w-claude', { status: 'idle', isSupervised: true, provider: 'claude' });
+    const monitor = makeMonitor({ fakes, agent });
+
+    monitor.recordInputDelivered(agent.id, fakes.now.value - (START_HOOK_SILENCE_WARN_MS + 500));
+    checkStartHookSilence(monitor, agent);
+    assert.equal(warn.warnings.length, 1, 'first warning fires');
+
+    fakes.now.value += 10_000;
+    monitor.recordInputDelivered(agent.id, fakes.now.value);
+    fakes.now.value += START_HOOK_SILENCE_WARN_MS + 500;
+    checkStartHookSilence(monitor, agent);
+    assert.equal(warn.warnings.length, 2, 'second input delivery re-arms the watchdog');
+  } finally {
+    warn.restore();
+    restore();
+  }
+});
+
+test('start-hook watchdog: start hook landing after input silences the warning', () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  const warn = captureWarn();
+  try {
+    const agent = makeAgent('w-claude', { status: 'idle', isSupervised: true, provider: 'claude' });
+    const monitor = makeMonitor({ fakes, agent });
+
+    const inputAt = fakes.now.value - (START_HOOK_SILENCE_WARN_MS + 500);
+    monitor.recordInputDelivered(agent.id, inputAt);
+    monitor.recordStartHookEventAt(agent.id, inputAt + 100);
+
+    checkStartHookSilence(monitor, agent);
+    assert.equal(warn.warnings.length, 0, 'a start-hook arrival silences the watchdog');
+  } finally {
+    warn.restore();
+    restore();
+  }
+});
+
+test('start-hook watchdog: prior Stop-hook does NOT satisfy a missed UserPromptSubmit', () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  const warn = captureWarn();
+  try {
+    const agent = makeAgent('w-claude', { status: 'idle', isSupervised: true, provider: 'claude' });
+    const monitor = makeMonitor({ fakes, agent });
+
+    monitor.recordInputDelivered(agent.id, fakes.now.value - (START_HOOK_SILENCE_WARN_MS + 500));
+    monitor.recordHookEventAt(agent.id, fakes.now.value);
+
+    checkStartHookSilence(monitor, agent);
+    assert.equal(warn.warnings.length, 1,
+      'a Stop-hook arrival cannot mask a missing UserPromptSubmit — the bug we are detecting');
+  } finally {
+    warn.restore();
+    restore();
+  }
+});
+
+test('start-hook watchdog: status !== idle → no warning', () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  const warn = captureWarn();
+  try {
+    const agent = makeAgent('w-claude', { status: 'working', isSupervised: true, provider: 'claude' });
+    const monitor = makeMonitor({ fakes, agent });
+
+    monitor.recordInputDelivered(agent.id, fakes.now.value - (START_HOOK_SILENCE_WARN_MS + 500));
+    checkStartHookSilence(monitor, agent);
+
+    assert.equal(warn.warnings.length, 0, 'no warning when the dashboard is not lying (status != idle)');
+  } finally {
+    warn.restore();
+    restore();
+  }
+});
+
+test('start-hook watchdog: under the threshold → no warning', () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  const warn = captureWarn();
+  try {
+    const agent = makeAgent('w-claude', { status: 'idle', isSupervised: true, provider: 'claude' });
+    const monitor = makeMonitor({ fakes, agent });
+
+    monitor.recordInputDelivered(agent.id, fakes.now.value - (START_HOOK_SILENCE_WARN_MS - 500));
+    checkStartHookSilence(monitor, agent);
+    assert.equal(warn.warnings.length, 0,
+      'inside the START_HOOK_SILENCE_WARN_MS budget — too early to warn');
+  } finally {
+    warn.restore();
+    restore();
+  }
+});
+
+test('start-hook watchdog: unsupervised agents are NOT watched', () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  const warn = captureWarn();
+  try {
+    const agent = makeAgent('u-claude', { status: 'idle', isSupervised: false, provider: 'claude' });
+    const monitor = makeMonitor({ fakes, agent });
+
+    monitor.recordInputDelivered(agent.id, fakes.now.value - (START_HOOK_SILENCE_WARN_MS + 500));
+    checkStartHookSilence(monitor, agent);
+    assert.equal(warn.warnings.length, 0,
+      'unsupervised agents do not run the supervised hook scaffold — out of scope');
+  } finally {
+    warn.restore();
+    restore();
+  }
+});
+
+test('start-hook watchdog: forgetAgent clears the start-hook + dedupe state', () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeAgent('w-claude', { status: 'idle', isSupervised: true, provider: 'claude' });
+    const monitor = makeMonitor({ fakes, agent });
+
+    monitor.recordStartHookEventAt(agent.id, fakes.now.value);
+    assert.equal(monitor.getLastStartHookEventAt(agent.id), fakes.now.value);
+
+    monitor.forgetAgent(agent.id);
+    assert.equal(monitor.getLastStartHookEventAt(agent.id), undefined,
+      'forgetAgent drops the start-hook timestamp');
   } finally {
     restore();
   }

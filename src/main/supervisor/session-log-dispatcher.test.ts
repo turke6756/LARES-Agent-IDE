@@ -360,6 +360,157 @@ test('BUG-07: pollNow(agentId) does NOT reset other agents\' gating timers', () 
   assert.equal(after2, futureGate, 'agent-2 gate must be untouched by a scoped pollNow');
 });
 
+test('BUG-26: rebindAgent clears the ring buffer for the agent', () => {
+  const { dispatcher, reader, emitted } = makeDispatcher();
+  // Seed the dispatcher with wrong-attribution events that came in under the
+  // pre-binding (sessionId="") code path.
+  reader.queue.push(
+    {
+      type: 'user-text',
+      uuid: 'wrong:u1',
+      timestamp: new Date().toISOString(),
+      agentId: 'agent-1',
+      text: 'wrong prompt',
+    } as SessionEvent,
+    {
+      type: 'assistant-text',
+      uuid: 'wrong:a1',
+      timestamp: new Date().toISOString(),
+      agentId: 'agent-1',
+      text: 'wrong reply',
+    } as SessionEvent,
+    {
+      type: 'assistant-text',
+      uuid: 'wrong:a2',
+      timestamp: new Date().toISOString(),
+      agentId: 'agent-1',
+      text: 'another wrong reply',
+    } as SessionEvent,
+  );
+  dispatcher.pollNow();
+  assert.equal(emitted.length, 1, 'initial wrong-attribution batch emitted');
+  assert.equal(dispatcher.getCachedEvents('agent-1').events.length, 3);
+
+  // Late binding fires: rebind drops the ring so the chat now reflects only
+  // events from the freshly-resolved (correct) rollout.
+  dispatcher.rebindAgent('agent-1');
+  assert.equal(
+    dispatcher.getCachedEvents('agent-1').events.length,
+    0,
+    'rebind must clear eventsByAgent so getCachedEvents returns no stale events'
+  );
+});
+
+test('BUG-26: rebindAgent resets emittedInitialBatch so the next batch is marked initialLoad', () => {
+  const { dispatcher, reader, emitted } = makeDispatcher();
+  // First batch — flagged initialLoad: true.
+  reader.queue.push({
+    type: 'assistant-text',
+    uuid: 'first:1',
+    timestamp: new Date().toISOString(),
+    agentId: 'agent-1',
+    text: 'pre-rebind reply',
+  } as SessionEvent);
+  dispatcher.pollNow();
+  assert.equal(emitted.length, 1);
+  assert.equal(emitted[0].initialLoad, true, 'pre-rebind first batch is initialLoad: true');
+
+  // Subsequent batches drop the flag.
+  reader.queue.push({
+    type: 'assistant-text',
+    uuid: 'second:1',
+    timestamp: new Date().toISOString(),
+    agentId: 'agent-1',
+    text: 'pre-rebind second batch',
+  } as SessionEvent);
+  (dispatcher as any).nextPollAt.clear();
+  dispatcher.pollNow();
+  assert.equal(emitted.length, 2);
+  assert.equal(emitted[1].initialLoad, undefined, 'second batch is not initialLoad');
+
+  // Rebind, then queue a new event — the next batch must be re-flagged
+  // initialLoad: true so the event-bridge skips stale-event latch updates.
+  dispatcher.rebindAgent('agent-1');
+  reader.queue.push({
+    type: 'assistant-text',
+    uuid: 'post-rebind:1',
+    timestamp: new Date().toISOString(),
+    agentId: 'agent-1',
+    text: 'correct reply',
+  } as SessionEvent);
+  (dispatcher as any).nextPollAt.clear();
+  dispatcher.pollNow();
+  assert.equal(emitted.length, 3);
+  assert.equal(
+    emitted[2].initialLoad,
+    true,
+    'post-rebind batch must be flagged initialLoad: true so event-bridge can suppress latches'
+  );
+});
+
+test('BUG-26: rebindAgent clears synthetic markers (so a stale marker can\'t eat the next real)', () => {
+  const { dispatcher, reader, emitted } = makeDispatcher();
+  // Park a synthetic marker as if we appended an echo before the rebind.
+  dispatcher.appendSyntheticUserText('agent-1', 'pre-rebind echo');
+  assert.equal(emitted.length, 1);
+  assert.ok(
+    (dispatcher as any).syntheticMarkers.get('agent-1')?.length >= 1,
+    'pre-condition: marker is registered'
+  );
+
+  // Rebind drops the marker; a fresh real user-text after the rebind must
+  // pass through (rather than being dropped as if it were the echo of a
+  // long-since-completed pre-bind send).
+  dispatcher.rebindAgent('agent-1');
+  const markers = (dispatcher as any).syntheticMarkers.get('agent-1');
+  assert.ok(!markers || markers.length === 0, 'rebind cleared synthetic markers');
+
+  reader.queue.push({
+    type: 'user-text',
+    uuid: 'post-rebind-real',
+    timestamp: new Date().toISOString(),
+    agentId: 'agent-1',
+    text: 'post-rebind echo',
+  } as SessionEvent);
+  dispatcher.pollNow();
+  assert.equal(
+    emitted.length,
+    2,
+    'post-rebind real user-text must NOT be consumed by a stale marker',
+  );
+});
+
+test('BUG-26: rebindAgent delegates to reader.invalidatePath(agentId)', () => {
+  // Belt-and-suspenders: rebind must also drop the reader's file-offset
+  // state so the reader can re-resolve to the newly-bound rollout from byte 0.
+  const reader = new FakeReader();
+  let invalidatedFor: string | null = null;
+  reader.invalidatePath = (id) => { invalidatedFor = id; };
+  const dispatcher = new SessionLogDispatcher(() => [
+    { agentId: 'agent-X', sessionId: '', workingDirectory: '/repo', provider: 'codex' as const },
+  ]);
+  dispatcher.register(reader);
+  dispatcher.rebindAgent('agent-X');
+  assert.equal(invalidatedFor, 'agent-X', 'rebindAgent must call reader.invalidatePath(agentId)');
+});
+
+test('BUG-26 Layer 2/3: rebindAgent emits "agent-rebound" exactly once with { agentId }', () => {
+  // Downstream consumers (ContextStatsMonitor + the file_activities DB
+  // table) don't subscribe to chat events — they need a discrete signal so
+  // the supervisor can purge their per-agent state on late binding.
+  const { dispatcher } = makeDispatcher();
+  const events: Array<{ agentId: string }> = [];
+  dispatcher.on('agent-rebound', (payload) => events.push(payload));
+
+  dispatcher.rebindAgent('agent-1');
+  assert.equal(events.length, 1, 'one emit per rebindAgent call');
+  assert.deepEqual(events[0], { agentId: 'agent-1' });
+
+  dispatcher.rebindAgent('agent-2');
+  assert.equal(events.length, 2, 'each rebind fires its own event');
+  assert.deepEqual(events[1], { agentId: 'agent-2' });
+});
+
 test('codex sessions with blank sessionId are still polled', () => {
   const reader = new FakeReader();
   const dispatcher = new SessionLogDispatcher(() => [

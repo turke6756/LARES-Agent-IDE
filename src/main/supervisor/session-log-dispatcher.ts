@@ -43,6 +43,16 @@ interface SyntheticMarker {
   timestamp: number;
 }
 
+/**
+ * Payload for the `'agent-rebound'` event the dispatcher emits at the end of
+ * `rebindAgent(agentId)`. Subscribers in the supervisor purge downstream
+ * caches (ContextStatsMonitor maps + `file_activities` DB rows) that the
+ * dispatcher itself doesn't own. BUG-26 Layer 2/3.
+ */
+export interface AgentReboundEvent {
+  agentId: string;
+}
+
 export class SessionLogDispatcher extends EventEmitter {
   private getActiveAgentSessions: () => AgentSession[];
   private readers = new Map<AgentProvider, ChatLogReader>();
@@ -67,6 +77,21 @@ export class SessionLogDispatcher extends EventEmitter {
   constructor(getActiveAgentSessions: () => AgentSession[]) {
     super();
     this.getActiveAgentSessions = getActiveAgentSessions;
+  }
+
+  // Typed event surface. Existing emits ('chat-events', 'usage', 'tool-use',
+  // 'tool-result') still resolve through the EventEmitter base; the overload
+  // here gives BUG-26 Layer 2/3's `'agent-rebound'` subscribers a typed
+  // payload instead of `any`.
+  on(event: 'agent-rebound', listener: (payload: AgentReboundEvent) => void): this;
+  on(event: string | symbol, listener: (...args: any[]) => void): this;
+  on(event: string | symbol, listener: (...args: any[]) => void): this {
+    return super.on(event, listener);
+  }
+  emit(event: 'agent-rebound', payload: AgentReboundEvent): boolean;
+  emit(event: string | symbol, ...args: any[]): boolean;
+  emit(event: string | symbol, ...args: any[]): boolean {
+    return super.emit(event, ...args);
   }
 
   register(reader: ChatLogReader): void {
@@ -211,6 +236,60 @@ export class SessionLogDispatcher extends EventEmitter {
 
   invalidatePath(agentId: string): void {
     for (const reader of this.readers.values()) reader.invalidatePath(agentId);
+  }
+
+  /**
+   * BUG-26 belt-and-suspenders: when an agent's `resumeSessionId` is
+   * (re)bound — at post-launch discovery or recovery time — drop every
+   * cached scrap of provisional state for that agent so a wrong rollout's
+   * events can't survive in the ring buffer. The reader's `invalidatePath`
+   * only clears file offsets; the dispatcher owns `eventsByAgent` and the
+   * dedupe / initial-batch bookkeeping that's just as load-bearing for
+   * "the agent's chat = the agent's session log."
+   *
+   * Resets:
+   *  - `eventsByAgent` and `truncatedByAgent` (the ring buffer that
+   *    `AgentChatService.getMessages` reads),
+   *  - `seenEventUuids` / `seenEventUuidOrder` (so the freshly-resolved
+   *    rollout's events aren't dropped as already-seen if they happen to
+   *    collide on uuid),
+   *  - `syntheticMarkers` (a stale marker from a wrongly-attributed PTY
+   *    echo could otherwise eat the next real user-text),
+   *  - `emittedInitialBatch` (so the next batch is marked `initialLoad:
+   *    true` for the event-bridge latch suppression).
+   *
+   * Then delegates to the reader to drop file-offset state.
+   *
+   * A short-lived race exists between `pollNow(agentId)` and `getCachedEvents`
+   * in `AgentChatService.getMessages` — a rebind here in between yields a
+   * brief empty chat. That's intentional: empty is strictly better than
+   * wrong, and rebind only fires at session-id-write time (rare).
+   */
+  rebindAgent(agentId: string): void {
+    this.eventsByAgent.delete(agentId);
+    this.truncatedByAgent.delete(agentId);
+    this.seenEventUuids.delete(agentId);
+    this.seenEventUuidOrder.delete(agentId);
+    this.syntheticMarkers.delete(agentId);
+    this.emittedInitialBatch.delete(agentId);
+    for (const reader of this.readers.values()) reader.invalidatePath(agentId);
+    // BUG-26 Layer 2/3: downstream caches (ContextStatsMonitor maps and the
+    // file_activities DB rows) accumulate under the pre-rebind misattributed
+    // agentId and don't self-heal — neither subscribes to chat events. The
+    // supervisor listens for this event to purge those derived surfaces.
+    this.emit('agent-rebound', { agentId } satisfies AgentReboundEvent);
+  }
+
+  /** Provider-agnostic check that the on-disk session log for a given session
+   *  id exists. Currently only the Claude reader implements `sessionFileExists`;
+   *  any other registered reader is asked via duck-typing, and a missing
+   *  implementation returns false (caller treats absent as "no resume"). */
+  sessionFileExists(provider: AgentProvider, workingDirectory: string, sessionId: string): boolean {
+    const reader = this.readers.get(provider) as
+      | (ChatLogReader & { sessionFileExists?(workingDirectory: string, sessionId: string): boolean })
+      | undefined;
+    if (!reader || typeof reader.sessionFileExists !== 'function') return false;
+    return reader.sessionFileExists(workingDirectory, sessionId);
   }
 
   getCachedEvents(agentId: string, sinceUuid?: string): { events: SessionEvent[]; truncated: boolean } {

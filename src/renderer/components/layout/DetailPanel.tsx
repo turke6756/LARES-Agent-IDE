@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback } from 'react';
+import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { useShallow } from 'zustand/react/shallow';
 import { useDashboardStore } from '../../stores/dashboard-store';
 import StatusBadge from '../agent/StatusBadge';
@@ -9,6 +9,7 @@ import QueryDialog from '../agent/QueryDialog';
 import CollapseButton from './CollapseButton';
 import type { AgentProvider, PathType, ContextStats } from '../../../shared/types';
 import { PROVIDER_META } from '../../../shared/constants';
+import { loadStaging, saveStaging } from '../../lib/prompt-staging';
 
 const TABS = [
   { label: 'Context', icon: '\u{1F4D6}' },
@@ -63,11 +64,43 @@ export default function DetailPanel({ width }: DetailPanelProps) {
   const [productsCount, setProductsCount] = useState(0);
   const [showMeta, setShowMeta] = useState(false);
   const [showQuery, setShowQuery] = useState(false);
+  const [showOverflow, setShowOverflow] = useState(false);
+  const [stagingOpen, setStagingOpen] = useState(false);
+  const [watchGlass, setWatchGlass] = useState(false);
+  const overflowRef = useRef<HTMLDivElement>(null);
   const collapsed = panelLayout.detailPanelCollapsed;
 
   const agent = agents.find((a) => a.id === selectedAgentId);
   const workspace = agent ? workspaces.find((w) => w.id === agent.workspaceId) : null;
   const pathType: PathType = workspace?.pathType || 'windows';
+
+  // Hydrate the prompt-staging open/closed toggle when the selected agent
+  // changes. Slot contents are loaded inside PromptStaging itself.
+  useEffect(() => {
+    if (!agent) return;
+    setStagingOpen(loadStaging(agent.id).open);
+  }, [agent?.id]);
+
+  const toggleStaging = useCallback(() => {
+    if (!agent) return;
+    setStagingOpen((prev) => {
+      const next = !prev;
+      const cur = loadStaging(agent.id);
+      saveStaging(agent.id, { ...cur, open: next });
+      return next;
+    });
+  }, [agent?.id]);
+
+  // Click-outside handler for the legacy-controls overflow menu.
+  useEffect(() => {
+    if (!showOverflow) return;
+    const onDocClick = (e: MouseEvent) => {
+      if (!overflowRef.current) return;
+      if (!overflowRef.current.contains(e.target as Node)) setShowOverflow(false);
+    };
+    document.addEventListener('mousedown', onDocClick);
+    return () => document.removeEventListener('mousedown', onDocClick);
+  }, [showOverflow]);
 
   // Fetch counts for tab badges — gated on visibility so a collapsed pane stops polling.
   useEffect(() => {
@@ -263,36 +296,88 @@ export default function DetailPanel({ width }: DetailPanelProps) {
       </div>
 
       {/* Controls */}
-      <div className="panel-header grid grid-cols-2 gap-2 p-3">
+      <div className="panel-header flex items-stretch gap-2 p-3">
         <button
-          onClick={() => setTerminalAgent(isAttached ? null : agent.id)}
-          className={`ui-btn px-2 py-2 text-[13px] font-bold ${
-            isAttached
-              ? 'ui-btn-success is-active'
-              : 'ui-btn-success'
-          }`}
+          onClick={toggleStaging}
+          className={`ui-btn ui-btn-primary flex-1 px-3 py-2 text-[13px] font-bold ${stagingOpen ? 'is-active' : ''}`}
+          aria-pressed={stagingOpen}
         >
-          {isAttached ? 'Detach Terminal' : 'Attach Terminal'}
+          Prompt Staging
         </button>
-        <button
-          onClick={() => setShowQuery(true)}
-          disabled={!agent.resumeSessionId}
-          className="ui-btn ui-btn-purple px-2 py-2 text-[13px] font-bold"
-        >
-          Query Agent
-        </button>
-        <button
-          onClick={() => window.api.agents.restart(agent.id)}
-          className="ui-btn ui-btn-warning px-2 py-2 text-[13px] font-bold"
-        >
-          Restart
-        </button>
-        <button
-          onClick={() => window.api.agents.stop(agent.id)}
-          className="ui-btn ui-btn-danger px-2 py-2 text-[13px] font-bold"
-        >
-          Stop
-        </button>
+        <div ref={overflowRef} className="relative">
+          <button
+            onClick={() => setShowOverflow((v) => !v)}
+            aria-label="More agent actions"
+            aria-haspopup="menu"
+            aria-expanded={showOverflow}
+            className="ui-btn ui-btn-ghost px-3 py-2 text-[15px] font-bold leading-none"
+          >
+            &#x22EF;
+          </button>
+          {showOverflow && (
+            <div
+              role="menu"
+              className="absolute right-0 mt-1 w-48 z-30 border border-gray-800 bg-surface-1 shadow-lg py-1"
+            >
+              <button
+                role="menuitem"
+                onClick={() => {
+                  setShowOverflow(false);
+                  setTerminalAgent(isAttached ? null : agent.id);
+                }}
+                className={`w-full text-left px-3 py-1.5 text-[13px] hover:bg-surface-2 ${
+                  isAttached ? 'text-accent-green' : 'text-accent-green/80'
+                }`}
+              >
+                {isAttached ? 'Detach Terminal' : 'Attach Terminal'}
+              </button>
+              <button
+                role="menuitem"
+                onClick={() => {
+                  setShowOverflow(false);
+                  setShowQuery(true);
+                }}
+                disabled={!agent.resumeSessionId}
+                className="w-full text-left px-3 py-1.5 text-[13px] text-accent-purple disabled:opacity-40 disabled:cursor-not-allowed hover:bg-surface-2"
+              >
+                Query Agent
+              </button>
+              <button
+                role="menuitem"
+                aria-pressed={watchGlass}
+                onClick={() => {
+                  setShowOverflow(false);
+                  setWatchGlass((v) => !v);
+                }}
+                className={`w-full text-left px-3 py-1.5 text-[13px] hover:bg-surface-2 ${
+                  watchGlass ? 'text-accent-blue' : 'text-accent-blue/80'
+                }`}
+              >
+                {watchGlass ? 'Hide Watch Glass' : 'Watch Glass'}
+              </button>
+              <button
+                role="menuitem"
+                onClick={() => {
+                  setShowOverflow(false);
+                  window.api.agents.restart(agent.id);
+                }}
+                className="w-full text-left px-3 py-1.5 text-[13px] text-accent-yellow hover:bg-surface-2"
+              >
+                Restart
+              </button>
+              <button
+                role="menuitem"
+                onClick={() => {
+                  setShowOverflow(false);
+                  window.api.agents.stop(agent.id);
+                }}
+                className="w-full text-left px-3 py-1.5 text-[13px] text-accent-red hover:bg-surface-2"
+              >
+                Stop
+              </button>
+            </div>
+          )}
+        </div>
       </div>
 
       {/* Tab strip */}
@@ -317,7 +402,15 @@ export default function DetailPanel({ width }: DetailPanelProps) {
       <div className="flex-1 overflow-hidden flex flex-col relative">
         {detailPane === 0 && <DetailPaneContext agentId={agent.id} pathType={pathType} />}
         {detailPane === 1 && <DetailPaneProducts agentId={agent.id} pathType={pathType} />}
-        {detailPane === 2 && <ChatPane agentId={agent.id} agentStatus={agent.status} agentName={agent.title} />}
+        {detailPane === 2 && (
+          <ChatPane
+            agentId={agent.id}
+            agentStatus={agent.status}
+            agentName={agent.title}
+            stagingOpen={stagingOpen}
+            watchGlass={watchGlass}
+          />
+        )}
       </div>
 
       {/* Query dialog */}

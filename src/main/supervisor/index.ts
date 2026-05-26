@@ -1,6 +1,7 @@
 import { EventEmitter } from 'events';
 import path from 'path';
 import fs from 'fs';
+import crypto from 'crypto';
 import { execFileSync, execFile, spawn } from 'child_process';
 import { v4 as uuidv4 } from 'uuid';
 import { Agent, AgentStatus, ContextStats, LaunchAgentInput, QueryResult, Team } from '../../shared/types';
@@ -9,11 +10,13 @@ import {
   SUPERVISOR_AGENT_NAME, SUPERVISOR_AGENT_MD, SUPERVISOR_MEMORY_MD,
   SUPERVISOR_CLAUDE_SETTINGS_JSON, SUPERVISOR_RUN_ORCHESTRATION_SKILL, SUPERVISOR_ORCHESTRATION_SPIKE_SKILL,
   SCRIPT_READ_AGENT_LOG, SCRIPT_LIST_AGENTS, SCRIPT_SEND_MESSAGE, SCRIPT_GET_CONTEXT_STATS,
+  WORKER_CLAUDE_MD, WORKER_CLAUDE_SETTINGS_JSON, WORKER_CODEX_CONFIG_TOML, WORKER_CODEX_CONFIG_TOML_V1,
+  DASHBOARD_STATUS_SCRIPT_MJS,
 } from '../../shared/constants';
 import { EventBridge, EventBridgeDeps } from './event-bridge';
 import { TeamMessageDeliveryEngine } from './team-delivery';
 import { WindowsRunner } from './windows-runner';
-import { WslRunner } from './wsl-runner';
+import { WslRunner, WslLaunchDiagnostics } from './wsl-runner';
 import { StatusMonitor } from './status-monitor';
 import type { StatusChangedEvent } from './status-events';
 import { ContextStatsMonitor, JsonlFileActivity } from './context-stats-monitor';
@@ -34,17 +37,87 @@ import {
   createAgent, getAgent, getActiveAgents, getAllAgents, getSupervisorAgent, getWorkspace, updateAgentStatus, updateAgentPid,
   updateAgentExitCode, incrementRestartCount, updateAgentLastOutput,
   updateAgentAttached, addEvent, deleteAgent as dbDeleteAgent,
-  updateAgentResumeSessionId, addFileActivity, getTeamMembership, getAgentTemplate
+  updateAgentResumeSessionId, addFileActivity, getTeamMembership, getAgentTemplate,
+  getFileActivities, deleteFileActivitiesForAgent,
 } from '../database';
 import { detectPathType, windowsToWslPath, uncToWslPath } from '../path-utils';
 import { getScriptPath } from './paths';
 import { tmuxListSessions, tmuxSendInput } from '../wsl-bridge';
 import { getWindowsSubmitSequence } from './send-input-encoders';
 
+// ── Scaffold versioning (plans/scaffold-version-migration.md) ──────────
+
+/** A managed scaffold-map entry. Per-file `version` is hand-bumped when the
+ *  bundled `content` changes; `previousHashes` maps old version numbers to
+ *  SHA-256 hex of the exact bundled content shipped at that version. Lets
+ *  writeScaffoldMap distinguish "user-modified file" from "known managed
+ *  v(n-1) file that just needs a silent upgrade." */
+export interface ScaffoldFile {
+  content: string;
+  executable?: boolean;
+  version: number;
+  previousHashes?: Record<number, string>;
+}
+
+/** Sidecar tracks the on-disk version of every managed scaffold file in a
+ *  workspace. Keyed by path relative to `.dashboard/`, no leading slash,
+ *  forward slashes always. */
+export const SCAFFOLD_SIDECAR_REL = '.dashboard/.scaffold-versions.json';
+export const SCAFFOLD_LOCK_REL = '.dashboard/.scaffold-versions.lock';
+const SCAFFOLD_LOCK_STALE_MS = 60_000;
+const SCAFFOLD_LOCK_POLL_MS = 100;
+const SCAFFOLD_LOCK_TIMEOUT_MS = 5_000;
+
+/** SHA-256 hex of the pre-DASHBOARD_HOST `dashboard-status.mjs` shipped in
+ *  every workspace scaffolded before the WSL-status fix landed. That script
+ *  hardcoded `http://127.0.0.1:${port}` and swallowed `catch {}` — the
+ *  WSL2 NAT-mode bug that motivates this migration. Used as the v1 entry
+ *  in the v2 script's previousHashes so old workspaces upgrade silently
+ *  instead of triggering a noisy `.bak.<ts>` backup. */
+export const DASHBOARD_STATUS_SCRIPT_V1_HASH = '56df727b34103b7f4f206095a06ff3c5979209c872658c67a6d69021f761381f';
+
+/** SHA-256 hex of the pre-UserPromptSubmit `dashboard-status.mjs` (the v2
+ *  content with DASHBOARD_HOST + pending-status.jsonl logging, but the
+ *  hard-coded `state: 'idle'` body). v3 reads state from argv[2] so a start
+ *  hook can post `'working'`. Used in the v3 script's previousHashes for
+ *  silent v2→v3 upgrade. */
+export const DASHBOARD_STATUS_SCRIPT_V2_HASH = 'a6e27a1330e7cd499ed5be2b7b3a68ea902e5305afc2506b21393ef63aa0627e';
+
+/** SHA-256 hex of the pre-UserPromptSubmit `.claude/settings.json` (Stop +
+ *  SubagentStop only). v2 adds the UserPromptSubmit hook entry. Used in the
+ *  v2 settings file's previousHashes for silent v1→v2 upgrade. */
+export const WORKER_CLAUDE_SETTINGS_JSON_V1_HASH = 'a0dc44c8e6c086219a15a1e6799d02cf8abe5f24f07acb8c7dc011e6e4216c46';
+
+export function sha256Hex(content: string | Buffer): string {
+  return crypto.createHash('sha256').update(content).digest('hex');
+}
+
+/** Strip the leading `.dashboard/` segment from a scaffold-map relPath so
+ *  the sidecar key is stable across map reshuffles. `\` is normalized to
+ *  `/` to keep Windows and WSL keys identical. */
+export function normalizeManagedKey(relPath: string): string {
+  let s = relPath.replace(/\\/g, '/');
+  if (s.startsWith('.dashboard/')) s = s.slice('.dashboard/'.length);
+  return s.replace(/^\/+/, '');
+}
+
+function timestampForFilename(): string {
+  const d = new Date();
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}` +
+         `-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}-${process.pid}`;
+}
+
 const BRACKETED_PASTE_START = '\x1b[200~';
 const BRACKETED_PASTE_END = '\x1b[201~';
 const WINDOWS_SEND_INPUT_ENTER_DELAY_MS = 80;
 const WINDOWS_CODEX_TYPING_DELAY_MS = 8;
+// Chars per PTY write in the codex/gemini Windows send loop. Was 1 (per-char).
+// Empirically, codex's paste-burst detector does not trip up to at least 512
+// chars per write so long as writes are separated by WINDOWS_CODEX_TYPING_DELAY_MS;
+// 64 is a conservative choice that gives a ~30× speedup on multi-KB sends
+// (e.g. GroupThink relays) while keeping a wide safety margin.
+const WINDOWS_CODEX_TYPING_CHUNK_SIZE = 64;
 
 // Win32 Input Mode CSI sequence for a VK_RETURN keypress (down + up).
 // Codex/gemini on Windows enable mode ?9001h and expect submit as a real
@@ -65,6 +138,10 @@ function getEffectiveWorkspaceRoot(agent: Agent): string {
   if (unixDashboardMatch) return unixDashboardMatch[1];
   const winDashboardMatch = agent.workingDirectory.match(/^(.+)\\\.dashboard\\supervisor\\?$/);
   if (winDashboardMatch) return winDashboardMatch[1];
+  const unixWorkerMatch = agent.workingDirectory.match(/^(.+)\/\.dashboard\/workers\/[^/]+\/?$/);
+  if (unixWorkerMatch) return unixWorkerMatch[1];
+  const winWorkerMatch = agent.workingDirectory.match(/^(.+)\\\.dashboard\\workers\\[^\\]+\\?$/);
+  if (winWorkerMatch) return winWorkerMatch[1];
   const unixMatch = agent.workingDirectory.match(/^(.+)\/\.claude\/agents\/[^/]+\/?$/);
   if (unixMatch) return unixMatch[1];
   const winMatch = agent.workingDirectory.match(/^(.+)\\\.claude\\agents\\[^\\]+\\?$/);
@@ -213,6 +290,21 @@ export class AgentSupervisor extends EventEmitter {
   private chatService: AgentChatService;
   private logsDir: string;
 
+  // Class IV — the actually-bound API server port, injected as DASHBOARD_PORT
+  // into supervised-worker process env so their Stop hook can POST to the
+  // right port (handles api-server.ts EADDRINUSE auto-increment).
+  // src/main/index.ts calls setApiServerPort after apiServer.start().
+  private apiServerPort: number = 24678;
+
+  // L-C — cached WSL→Windows-host gateway IP. WSL2's default NAT mode means
+  // 127.0.0.1 inside the distro is the distro's loopback, NOT the Windows
+  // host's, so a Class IV supervised-worker hook fired from WSL needs the
+  // Windows host's address to reach the dashboard ApiServer. Resolved once
+  // via `wsl.exe ip route show default` (same pattern used by
+  // ensureMcpConfig around lines 786-825) and reused across all subsequent
+  // WSL launches in this supervisor instance. Null until first resolve.
+  private wslGatewayIp: string | null = null;
+
   // Event bridge — supervisor notification, cooldown, queue, drain state lives here.
   private bridge: EventBridge;
 
@@ -284,6 +376,17 @@ export class AgentSupervisor extends EventEmitter {
         forceWorking: (agentId, opts) => this.monitor.forceWorking(agentId, opts),
       },
       getLastUserPtyWriteAt: (id) => this.lastUserPtyWriteAt.get(id),
+      // BUG-20: feed the bridge the clean assistant chat message + recent
+      // file activities so idle events render real prose instead of Claude
+      // Code TUI footer chrome, and surface what the agent just touched.
+      getLastAssistantMessage: async (id) => {
+        const messages = await this.chatService.getMessages(id, {
+          limit: 1,
+          role: 'assistant',
+        });
+        return messages[0]?.content;
+      },
+      getFileActivities: (id) => getFileActivities(id),
     };
     this.bridge = new EventBridge(bridgeDeps);
 
@@ -347,6 +450,27 @@ export class AgentSupervisor extends EventEmitter {
       if (dbActivity) {
         this.emit('fileActivity', dbActivity);
       }
+    });
+
+    // BUG-26 Layer 2 + 3: when chat-layer `rebindAgent` fires for an agent
+    // whose pre-binding events were misattributed under the cwd fallback,
+    // drop both downstream caches that derive from those events but don't
+    // subscribe to chat events directly. The dispatcher already cleared
+    // its own ring buffer; this listener owns the parts it doesn't reach:
+    //   - `ContextStatsMonitor` per-agent maps (`stats`, `seenUuids`,
+    //     `seenFiles`, `pendingShellActivity[agentId:*]`) so cached
+    //     context% / token-count snapshots stop showing the wrong
+    //     rollout's numbers between rebind and the agent's next usage tick.
+    //   - The `file_activities` DB table, which is INSERT-only at the
+    //     producer side and otherwise persists wrong-attribution rows
+    //     into every future `idle` event's `Files touched:` list.
+    // `fileActivitiesPurged` notifies the dashboard UI so any cached
+    // per-agent file-list view can clear (matches the behavior on agent
+    // deletion).
+    this.sessionLogReader.on('agent-rebound', ({ agentId }) => {
+      this.contextStatsMonitor.invalidateAgent(agentId);
+      deleteFileActivitiesForAgent(agentId);
+      this.emit('fileActivitiesPurged', agentId);
     });
 
     // Update registry whenever any status changes
@@ -471,6 +595,10 @@ export class AgentSupervisor extends EventEmitter {
     // written using the workspace root (workDir) first.
     //   - persona agents (legacy): .claude/agents/<name>/
     //   - supervisor (new layout per docs/PERSISTENT_AGENT_LAUNCH_CONTRACT.md): .dashboard/supervisor/
+    //   - supervised workers (class IV, plans/class-iv-worker-hook-scaffold.md):
+    //     .dashboard/workers/<provider>/ — shared cwd for N supervised workers,
+    //     by design. Read-only template; hook in settings.json fires on Stop.
+    //   - unsupervised user-launched agents: workDir (today's behavior, unchanged).
     let agentCwd = workDir;
     if (resolvedInput.persona) {
       agentCwd = pathType === 'windows'
@@ -480,6 +608,46 @@ export class AgentSupervisor extends EventEmitter {
       agentCwd = pathType === 'windows'
         ? path.join(workDir, '.dashboard', 'supervisor')
         : `${workDir}/.dashboard/supervisor`;
+    } else if (resolvedInput.isSupervised) {
+      agentCwd = pathType === 'windows'
+        ? path.join(workDir, '.dashboard', 'workers', provider)
+        : `${workDir}/.dashboard/workers/${provider}`;
+    }
+
+    // Path-injection guard for explicit `working_directory` from MCP
+    // `launch_agent` (the only caller-controlled input that flows into
+    // agentCwd). Internally-derived cwds — supervisor `.dashboard/supervisor/`,
+    // persona `.claude/agents/<name>/`, supervised `.dashboard/workers/<provider>/`
+    // — are all rooted at `workspace.path` and pass naturally; only a hostile
+    // or typo'd `working_directory` could escape the workspace via `..` or an
+    // unrelated absolute path.
+    {
+      const root = workspace.path;
+      const normalize = (p: string) => pathType === 'windows'
+        ? path.resolve(p).toLowerCase().replace(/[\\/]+$/, '')
+        : p.replace(/\/+$/, '');
+      const sep = pathType === 'windows' ? path.sep : '/';
+      const normRoot = normalize(root);
+      const normCwd = normalize(agentCwd);
+      if (normCwd !== normRoot && !normCwd.startsWith(normRoot + sep)) {
+        throw new Error(
+          `agentCwd '${agentCwd}' resolves outside workspace root '${root}'`,
+        );
+      }
+    }
+
+    // Ensure agentCwd exists before handing it to the runner. Without this,
+    // Windows `CreateProcess` with a non-existent cwd silently fails (pid:
+    // null, log stays 0 bytes); WSL's leading `cd '${dir}'` exits before the
+    // provider CLI runs. The claude case self-heals as a side effect of
+    // `ensureWorkerScaffold` writing files under `.dashboard/workers/claude/`,
+    // but codex/gemini have empty file maps and their per-provider dir would
+    // never be created. Provider-agnostic mkdir here closes the gap once for
+    // every cwd resolution branch (supervisor, persona, supervised, explicit).
+    if (pathType === 'windows') {
+      fs.mkdirSync(agentCwd, { recursive: true });
+    } else {
+      execFileSync('wsl.exe', ['bash', '-lc', `mkdir -p '${agentCwd}'`], { timeout: 5000 });
     }
 
     const agent = createAgent({
@@ -511,6 +679,10 @@ export class AgentSupervisor extends EventEmitter {
     // Auto-create .dashboard/supervisor/ scaffold if this is a supervisor launch
     if (resolvedInput.isSupervisor) {
       this.ensureSupervisorScaffold(workDir, pathType);
+    } else if (resolvedInput.isSupervised && !resolvedInput.persona) {
+      // Class IV (plans/class-iv-worker-hook-scaffold.md): supervised generic
+      // worker — scaffold the per-provider template + shared hook script.
+      this.ensureWorkerScaffold(workDir, provider, pathType);
     }
     // Write .mcp.json to workspace root and agent subdir (if persona or supervisor)
     if (resolvedInput.isSupervisor || resolvedInput.persona) {
@@ -552,62 +724,366 @@ export class AgentSupervisor extends EventEmitter {
     return getAgent(agent.id)!;
   }
 
-  /** Scaffold file map: relative path → content.
-   *  Scripts get +x on WSL. Layout per docs/PERSISTENT_AGENT_LAUNCH_CONTRACT.md. */
-  private static SUPERVISOR_FILES: Record<string, { content: string; executable?: boolean }> = {
-    [`.dashboard/supervisor/CLAUDE.md`]:                                              { content: SUPERVISOR_AGENT_MD },
-    [`.dashboard/supervisor/.claude/settings.json`]:                                  { content: SUPERVISOR_CLAUDE_SETTINGS_JSON },
-    [`.dashboard/supervisor/.claude/skills/run-orchestration/SKILL.md`]:              { content: SUPERVISOR_RUN_ORCHESTRATION_SKILL },
-    [`.dashboard/supervisor/.claude/skills/orchestration-spike/SKILL.md`]:            { content: SUPERVISOR_ORCHESTRATION_SPIKE_SKILL },
-    [`.dashboard/supervisor/memory/MEMORY.md`]:                                       { content: SUPERVISOR_MEMORY_MD },
-    [`.dashboard/supervisor/scripts/read-agent-log.sh`]:                              { content: SCRIPT_READ_AGENT_LOG, executable: true },
-    [`.dashboard/supervisor/scripts/list-agents.sh`]:                                 { content: SCRIPT_LIST_AGENTS, executable: true },
-    [`.dashboard/supervisor/scripts/send-message.sh`]:                                { content: SCRIPT_SEND_MESSAGE, executable: true },
-    [`.dashboard/supervisor/scripts/get-context-stats.sh`]:                           { content: SCRIPT_GET_CONTEXT_STATS, executable: true },
+  /** Scaffold file map: relative path → content + version.
+   *  Scripts get +x on WSL. Layout per docs/PERSISTENT_AGENT_LAUNCH_CONTRACT.md.
+   *  Versioning per plans/scaffold-version-migration.md — bumping a file's
+   *  `version` triggers managed-upgrade-on-launch in old workspaces. */
+  private static SUPERVISOR_FILES: Record<string, ScaffoldFile> = {
+    [`.dashboard/supervisor/CLAUDE.md`]:                                              { content: SUPERVISOR_AGENT_MD,                  version: 1 },
+    [`.dashboard/supervisor/.claude/settings.json`]:                                  { content: SUPERVISOR_CLAUDE_SETTINGS_JSON,      version: 1 },
+    [`.dashboard/supervisor/.claude/skills/run-orchestration/SKILL.md`]:              { content: SUPERVISOR_RUN_ORCHESTRATION_SKILL,   version: 1 },
+    [`.dashboard/supervisor/.claude/skills/orchestration-spike/SKILL.md`]:            { content: SUPERVISOR_ORCHESTRATION_SPIKE_SKILL, version: 1 },
+    [`.dashboard/supervisor/memory/MEMORY.md`]:                                       { content: SUPERVISOR_MEMORY_MD,                 version: 1 },
+    [`.dashboard/supervisor/scripts/read-agent-log.sh`]:                              { content: SCRIPT_READ_AGENT_LOG,                version: 1, executable: true },
+    [`.dashboard/supervisor/scripts/list-agents.sh`]:                                 { content: SCRIPT_LIST_AGENTS,                   version: 1, executable: true },
+    [`.dashboard/supervisor/scripts/send-message.sh`]:                                { content: SCRIPT_SEND_MESSAGE,                  version: 1, executable: true },
+    [`.dashboard/supervisor/scripts/get-context-stats.sh`]:                           { content: SCRIPT_GET_CONTEXT_STATS,             version: 1, executable: true },
   };
+
+  /** Class IV — workspace-shared hook script. Written on first supervised
+   *  worker launch of any provider; lives at .dashboard/scripts/ so a single
+   *  copy serves every per-provider worker template.
+   *
+   *  v2 added DASHBOARD_HOST support + pending-status.jsonl failure logging.
+   *  v3 reads `state` from argv[2] so the UserPromptSubmit hook can post
+   *  `'working'`. Both previous hashes are recorded for silent upgrade. */
+  private static WORKSPACE_SCRIPT_FILES: Record<string, ScaffoldFile> = {
+    [`.dashboard/scripts/dashboard-status.mjs`]: {
+      content: DASHBOARD_STATUS_SCRIPT_MJS,
+      version: 3,
+      executable: true,
+      previousHashes: {
+        1: DASHBOARD_STATUS_SCRIPT_V1_HASH,
+        2: DASHBOARD_STATUS_SCRIPT_V2_HASH,
+      },
+    },
+  };
+
+  /** Class IV — Claude worker template files. Shared cwd for N supervised
+   *  workers, by design (see plans/class-iv-worker-hook-scaffold.md §2). Read-only
+   *  by convention — nothing per-agent ever writes here.
+   *
+   *  settings.json v2 adds the UserPromptSubmit hook (paste-race fix). */
+  private static WORKER_FILES_CLAUDE: Record<string, ScaffoldFile> = {
+    [`.dashboard/workers/claude/CLAUDE.md`]:                       { content: WORKER_CLAUDE_MD,             version: 1 },
+    [`.dashboard/workers/claude/.claude/settings.json`]:           {
+      content: WORKER_CLAUDE_SETTINGS_JSON,
+      version: 2,
+      previousHashes: { 1: WORKER_CLAUDE_SETTINGS_JSON_V1_HASH },
+    },
+  };
+
+  /** Shared file-map writer used by both supervisor and worker scaffold paths.
+   *  Returns the number of files written or upgraded (managed upgrades count
+   *  as writes). Behavior per plans/scaffold-version-migration.md §Algorithm:
+   *
+   *  - Missing file → write bundled content, record version in sidecar.
+   *  - Sidecar says current version → skip.
+   *  - Disk content matches current bundled content (sidecar drift) → update
+   *    sidecar only, no write or backup.
+   *  - Disk content matches a known old managed hash → silent upgrade.
+   *  - Disk content differs and no hash matches → back up to `.bak.<ts>` then
+   *    overwrite (treat as user-modified — preserves the edit but takes the
+   *    file off the user's hands).
+   *  - Sidecar says future version (> bundled) → leave unchanged, warn.
+   *
+   *  Atomic per-file replacement (write-to-tmp + rename) on both platforms.
+   *  Workspace-scoped lock (`.dashboard/.scaffold-versions.lock`) serializes
+   *  concurrent ensureWorkerScaffold calls so two writers can't race the
+   *  sidecar read/modify/write. */
+  private writeScaffoldMap(
+    workDir: string,
+    files: Record<string, ScaffoldFile>,
+    pathType: string,
+  ): number {
+    const lockReleased = this.acquireScaffoldLock(workDir, pathType);
+    try {
+      const sidecar = this.readScaffoldSidecar(workDir, pathType);
+      let changed = 0;
+
+      for (const [relPath, file] of Object.entries(files)) {
+        const managedKey = normalizeManagedKey(relPath);
+        const bundledVersion = file.version;
+        const diskVersion = Number.isInteger(sidecar[managedKey]) ? sidecar[managedKey] : 0;
+
+        try {
+          if (!this.scaffoldFileExists(workDir, relPath, pathType)) {
+            this.atomicWriteScaffoldText(workDir, relPath, file.content, !!file.executable, pathType);
+            sidecar[managedKey] = bundledVersion;
+            changed++;
+            continue;
+          }
+
+          if (diskVersion === bundledVersion) {
+            continue;
+          }
+
+          if (diskVersion > bundledVersion) {
+            console.warn(`[supervisor] Scaffold file ${managedKey} has future version ${diskVersion}; leaving unchanged (bundled v${bundledVersion})`);
+            continue;
+          }
+
+          const diskContent = this.readScaffoldText(workDir, relPath, pathType);
+          if (diskContent === null) {
+            // File reported exists but unreadable — treat as missing and write.
+            this.atomicWriteScaffoldText(workDir, relPath, file.content, !!file.executable, pathType);
+            sidecar[managedKey] = bundledVersion;
+            changed++;
+            continue;
+          }
+          const diskHash = sha256Hex(diskContent);
+
+          // Sidecar drift safety: if the file content is already the current
+          // bundled content, just record the version and move on — no write,
+          // no backup. Covers "user deleted sidecar but didn't touch files."
+          if (diskHash === sha256Hex(file.content)) {
+            sidecar[managedKey] = bundledVersion;
+            changed++;
+            continue;
+          }
+
+          const knownOldHash = file.previousHashes?.[diskVersion] ?? file.previousHashes?.[1];
+          const matchesKnownManagedOld = !!knownOldHash && diskHash === knownOldHash;
+
+          if (matchesKnownManagedOld) {
+            this.atomicWriteScaffoldText(workDir, relPath, file.content, !!file.executable, pathType);
+            sidecar[managedKey] = bundledVersion;
+            console.log(`[supervisor] Scaffold file ${managedKey} upgraded ${diskVersion} → ${bundledVersion} (matched known managed hash)`);
+            changed++;
+            continue;
+          }
+
+          // User-modified (or unknown previous version we don't have a hash
+          // for). Back up before overwrite so the edit is recoverable.
+          const bakRel = `${relPath}.bak.${timestampForFilename()}`;
+          this.copyScaffoldForBackup(workDir, relPath, bakRel, pathType);
+          console.warn(
+            `[supervisor] Scaffold file ${managedKey} differed from known managed content; ` +
+            `backed up to ${bakRel} and upgraded to v${bundledVersion}`,
+          );
+          this.atomicWriteScaffoldText(workDir, relPath, file.content, !!file.executable, pathType);
+          sidecar[managedKey] = bundledVersion;
+          changed++;
+        } catch (err) {
+          console.error(`[supervisor] Failed to upgrade scaffold file ${relPath}:`, err);
+        }
+      }
+
+      if (changed > 0) {
+        try {
+          this.writeScaffoldSidecar(workDir, sidecar, pathType);
+        } catch (err) {
+          console.error(`[supervisor] Failed to persist scaffold sidecar:`, err);
+        }
+      }
+
+      return changed;
+    } finally {
+      lockReleased();
+    }
+  }
+
+  // ── Scaffold IO primitives ────────────────────────────────────────────
+
+  /** Resolve a workspace-relative path to its absolute form for the given
+   *  pathType. Windows uses path.join (handles backslashes); WSL/Linux uses
+   *  forward slashes throughout. */
+  private scaffoldFullPath(workDir: string, relPath: string, pathType: string): string {
+    if (pathType === 'wsl') return `${workDir}/${relPath}`;
+    return path.join(workDir, relPath);
+  }
+
+  private scaffoldFileExists(workDir: string, relPath: string, pathType: string): boolean {
+    const full = this.scaffoldFullPath(workDir, relPath, pathType);
+    if (pathType === 'wsl') {
+      try {
+        execFileSync('wsl.exe', ['bash', '-lc', `test -f '${full}'`], { timeout: 5000, stdio: 'ignore' });
+        return true;
+      } catch {
+        return false;
+      }
+    }
+    return fs.existsSync(full);
+  }
+
+  private readScaffoldText(workDir: string, relPath: string, pathType: string): string | null {
+    const full = this.scaffoldFullPath(workDir, relPath, pathType);
+    if (pathType === 'wsl') {
+      try {
+        const b64 = execFileSync('wsl.exe', ['bash', '-lc', `base64 -w0 '${full}'`], {
+          encoding: 'utf-8', timeout: 5000,
+        });
+        return Buffer.from(b64.trim(), 'base64').toString('utf-8');
+      } catch {
+        return null;
+      }
+    }
+    try {
+      return fs.readFileSync(full, 'utf-8');
+    } catch {
+      return null;
+    }
+  }
+
+  /** Write `content` atomically: write to `<target>.tmp.<pid>.<ts>`, then
+   *  rename over the target. `executable=true` adds chmod +x (WSL only —
+   *  Windows ignores +x). Creates parent dirs as needed. */
+  private atomicWriteScaffoldText(
+    workDir: string,
+    relPath: string,
+    content: string,
+    executable: boolean,
+    pathType: string,
+  ): void {
+    const full = this.scaffoldFullPath(workDir, relPath, pathType);
+    if (pathType === 'wsl') {
+      const dir = full.substring(0, full.lastIndexOf('/'));
+      const tmp = `${full}.tmp.${process.pid}.${Date.now()}`;
+      const b64 = Buffer.from(content, 'utf-8').toString('base64');
+      const chmod = executable ? ` && chmod +x '${tmp}'` : '';
+      const cmd = `mkdir -p '${dir}' && echo '${b64}' | base64 -d > '${tmp}'${chmod} && mv -f '${tmp}' '${full}'`;
+      execFileSync('wsl.exe', ['bash', '-lc', cmd], { timeout: 5000 });
+      return;
+    }
+    const dir = path.dirname(full);
+    fs.mkdirSync(dir, { recursive: true });
+    const tmp = `${full}.tmp.${process.pid}.${Date.now()}`;
+    fs.writeFileSync(tmp, content, 'utf-8');
+    try {
+      fs.renameSync(tmp, full);
+    } catch (err) {
+      // Windows can fail to rename over an open file. Fall back to copy + unlink.
+      try { fs.copyFileSync(tmp, full); } finally {
+        try { fs.rmSync(tmp, { force: true }); } catch { /* best effort */ }
+      }
+      if (err instanceof Error && (err as NodeJS.ErrnoException).code !== 'EEXIST' && (err as NodeJS.ErrnoException).code !== 'EPERM' && (err as NodeJS.ErrnoException).code !== 'EACCES') {
+        throw err;
+      }
+    }
+  }
+
+  private copyScaffoldForBackup(workDir: string, srcRel: string, dstRel: string, pathType: string): void {
+    const src = this.scaffoldFullPath(workDir, srcRel, pathType);
+    const dst = this.scaffoldFullPath(workDir, dstRel, pathType);
+    if (pathType === 'wsl') {
+      execFileSync('wsl.exe', ['bash', '-lc', `cp -p '${src}' '${dst}'`], { timeout: 5000 });
+      return;
+    }
+    fs.copyFileSync(src, dst);
+  }
+
+  /** Read the workspace sidecar. Missing file or unparseable JSON both yield
+   *  an empty record; corrupt content also logs a warning so users can see
+   *  the migration treated their sidecar as missing. */
+  private readScaffoldSidecar(workDir: string, pathType: string): Record<string, number> {
+    const raw = this.readScaffoldText(workDir, SCAFFOLD_SIDECAR_REL, pathType);
+    if (raw === null) return {};
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        const out: Record<string, number> = {};
+        for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+          if (typeof v === 'number' && Number.isInteger(v)) out[k] = v;
+        }
+        return out;
+      }
+      console.warn(`[supervisor] Scaffold sidecar at ${SCAFFOLD_SIDECAR_REL} is not an object; treating as empty`);
+      return {};
+    } catch {
+      console.warn(`[supervisor] Scaffold sidecar at ${SCAFFOLD_SIDECAR_REL} is unparseable JSON; treating as empty`);
+      return {};
+    }
+  }
+
+  private writeScaffoldSidecar(workDir: string, sidecar: Record<string, number>, pathType: string): void {
+    const sorted: Record<string, number> = {};
+    for (const key of Object.keys(sidecar).sort()) sorted[key] = sidecar[key];
+    const content = JSON.stringify(sorted, null, 2) + '\n';
+    this.atomicWriteScaffoldText(workDir, SCAFFOLD_SIDECAR_REL, content, false, pathType);
+  }
+
+  /** Acquire the workspace-scoped scaffold lock. Returns a release function
+   *  that callers MUST invoke in a finally. Falls back to a no-op release if
+   *  the lock can't be acquired within the timeout (worst case: two writers
+   *  race the sidecar — atomic writes still keep individual files intact). */
+  private acquireScaffoldLock(workDir: string, pathType: string): () => void {
+    const lockFull = this.scaffoldFullPath(workDir, SCAFFOLD_LOCK_REL, pathType);
+    const dashboardDir = this.scaffoldFullPath(workDir, '.dashboard', pathType);
+    const start = Date.now();
+
+    while (Date.now() - start < SCAFFOLD_LOCK_TIMEOUT_MS) {
+      if (this.tryAcquireScaffoldLock(dashboardDir, lockFull, pathType)) {
+        return () => this.releaseScaffoldLock(lockFull, pathType);
+      }
+      const ageMs = this.scaffoldLockAgeMs(lockFull, pathType);
+      if (ageMs !== null && ageMs > SCAFFOLD_LOCK_STALE_MS) {
+        console.warn(`[supervisor] Scaffold lock at ${lockFull} is stale (${Math.round(ageMs / 1000)}s); clearing`);
+        try { this.releaseScaffoldLock(lockFull, pathType); } catch { /* best effort */ }
+      }
+      const waitMs = SCAFFOLD_LOCK_POLL_MS + Math.floor(Math.random() * SCAFFOLD_LOCK_POLL_MS);
+      // Synchronous sleep — writeScaffoldMap is a sync method.
+      const wakeAt = Date.now() + waitMs;
+      while (Date.now() < wakeAt) { /* spin briefly */ }
+    }
+    console.warn(`[supervisor] Could not acquire scaffold lock at ${lockFull} within ${SCAFFOLD_LOCK_TIMEOUT_MS}ms; proceeding without lock`);
+    return () => { /* no-op */ };
+  }
+
+  private tryAcquireScaffoldLock(dashboardDir: string, lockFull: string, pathType: string): boolean {
+    if (pathType === 'wsl') {
+      try {
+        execFileSync('wsl.exe', ['bash', '-lc', `mkdir -p '${dashboardDir}' && mkdir '${lockFull}'`], {
+          timeout: 5000, stdio: 'ignore',
+        });
+        return true;
+      } catch {
+        return false;
+      }
+    }
+    try {
+      fs.mkdirSync(dashboardDir, { recursive: true });
+      fs.mkdirSync(lockFull);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private releaseScaffoldLock(lockFull: string, pathType: string): void {
+    if (pathType === 'wsl') {
+      try {
+        execFileSync('wsl.exe', ['bash', '-lc', `rmdir '${lockFull}'`], { timeout: 5000, stdio: 'ignore' });
+      } catch { /* best effort */ }
+      return;
+    }
+    try { fs.rmdirSync(lockFull); } catch { /* best effort */ }
+  }
+
+  private scaffoldLockAgeMs(lockFull: string, pathType: string): number | null {
+    if (pathType === 'wsl') {
+      try {
+        const out = execFileSync('wsl.exe', ['bash', '-lc', `stat -c %Y '${lockFull}'`], {
+          encoding: 'utf-8', timeout: 5000,
+        });
+        const epochS = Number.parseInt(out.trim(), 10);
+        if (!Number.isFinite(epochS)) return null;
+        return Date.now() - epochS * 1000;
+      } catch {
+        return null;
+      }
+    }
+    try {
+      const stat = fs.statSync(lockFull);
+      return Date.now() - stat.mtimeMs;
+    } catch {
+      return null;
+    }
+  }
 
   /** Create the full .dashboard/supervisor/ scaffold in a workspace.
    *  Only writes files that don't already exist — never overwrites user edits. */
   private ensureSupervisorScaffold(workDir: string, pathType: string): void {
-    const files = AgentSupervisor.SUPERVISOR_FILES;
-    let created = 0;
-
-    if (pathType === 'wsl') {
-      for (const [relPath, { content, executable }] of Object.entries(files)) {
-        try {
-          execFileSync('wsl.exe', ['bash', '-lc', `test -f '${workDir}/${relPath}'`], { timeout: 5000 });
-          // File exists, skip
-        } catch {
-          try {
-            const dir = relPath.substring(0, relPath.lastIndexOf('/'));
-            // Base64-encode to avoid shell escaping issues with $, backticks, etc.
-            const b64 = Buffer.from(content, 'utf-8').toString('base64');
-            let cmd = `mkdir -p '${workDir}/${dir}' && echo '${b64}' | base64 -d > '${workDir}/${relPath}'`;
-            if (executable) {
-              cmd += ` && chmod +x '${workDir}/${relPath}'`;
-            }
-            execFileSync('wsl.exe', ['bash', '-lc', cmd], { timeout: 5000 });
-            created++;
-          } catch (err) {
-            console.error(`[supervisor] Failed to create ${relPath} in WSL:`, err);
-          }
-        }
-      }
-    } else {
-      for (const [relPath, { content }] of Object.entries(files)) {
-        const fullPath = path.join(workDir, relPath);
-        if (fs.existsSync(fullPath)) continue;
-        try {
-          const dir = path.dirname(fullPath);
-          fs.mkdirSync(dir, { recursive: true });
-          fs.writeFileSync(fullPath, content, 'utf-8');
-          created++;
-        } catch (err) {
-          console.error(`[supervisor] Failed to create ${fullPath}:`, err);
-        }
-      }
-    }
-
+    const created = this.writeScaffoldMap(workDir, AgentSupervisor.SUPERVISOR_FILES, pathType);
     if (created > 0) {
       console.log(`[supervisor] Scaffolded ${created} files in ${workDir}/.dashboard/supervisor/`);
       addEvent('system', 'supervisor_scaffold_created', JSON.stringify({ workDir, filesCreated: created }));
@@ -616,9 +1092,76 @@ export class AgentSupervisor extends EventEmitter {
     }
   }
 
+  /** Class IV — create the .dashboard/workers/<provider>/ template plus the
+   *  shared .dashboard/scripts/dashboard-status.mjs on first supervised worker
+   *  launch. Idempotent: existing files are never overwritten. Gemini has no
+   *  hook scaffold yet — it gets the shared-script write but no provider-
+   *  specific config (tracked as follow-up in plan §12). */
+  private ensureWorkerScaffold(workDir: string, provider: string, pathType: string): void {
+    const scriptCreated = this.writeScaffoldMap(workDir, AgentSupervisor.WORKSPACE_SCRIPT_FILES, pathType);
+    let providerCreated = 0;
+    if (provider === 'claude') {
+      providerCreated = this.writeScaffoldMap(workDir, AgentSupervisor.WORKER_FILES_CLAUDE, pathType);
+    } else if (provider === 'codex') {
+      // Codex hooks have no ${CLAUDE_PROJECT_DIR} analog, so materialize the
+      // absolute script path at write time. The path is read by the runtime
+      // that actually executes the hook (Windows Node for windows agents, WSL
+      // Node for wsl agents) — pick the form that runtime can resolve. WSL
+      // Node cannot read `C:/...` style paths; `windowsToWslPath` converts
+      // drive-letter paths to /mnt/<lc>/..., UNC WSL paths (\\wsl.localhost\...)
+      // to /home/..., and leaves already-posix WSL paths unchanged.
+      const posixWorkspaceRoot = pathType === 'wsl'
+        ? windowsToWslPath(workDir)
+        : workDir.replace(/\\/g, '/');
+      const codexConfig = WORKER_CODEX_CONFIG_TOML.replace(
+        /\$\{WORKSPACE_ROOT\}/g,
+        posixWorkspaceRoot,
+      );
+      // v1 content with the same materialized workspace root, so a v1
+      // workspace's on-disk file hashes match and upgrades silently to v2.
+      const codexConfigV1 = WORKER_CODEX_CONFIG_TOML_V1.replace(
+        /\$\{WORKSPACE_ROOT\}/g,
+        posixWorkspaceRoot,
+      );
+      const codexFiles: Record<string, ScaffoldFile> = {
+        [`.dashboard/workers/codex/.codex/config.toml`]: {
+          content: codexConfig,
+          version: 2,
+          previousHashes: { 1: sha256Hex(codexConfigV1) },
+        },
+      };
+      providerCreated = this.writeScaffoldMap(workDir, codexFiles, pathType);
+    }
+    const total = scriptCreated + providerCreated;
+    if (total > 0) {
+      console.log(`[supervisor] Worker scaffold: ${total} files in ${workDir}/.dashboard/ (provider=${provider})`);
+      addEvent('system', 'worker_scaffold_created', JSON.stringify({ workDir, provider, filesCreated: total }));
+    }
+  }
+
   /** Write .mcp.json in the workspace so Claude Code auto-discovers the MCP server.
    *  This enables the supervisor agent to use native MCP tools (list_agents, send_message, etc.)
    *  instead of bash scripts. */
+  /** L-C — resolve the WSL→Windows-host gateway IP once and cache. Mirrors
+   *  the inline logic in ensureMcpConfig (`wsl.exe ip route show default`
+   *  → `default via X.X.X.X`). In WSL "mirrored" networking mode there is
+   *  no separate gateway and 127.0.0.1 works directly — the fallback below
+   *  covers that case. Returns '127.0.0.1' on any failure so a worker on
+   *  mirrored-mode WSL or a misconfigured distro keeps the prior behavior. */
+  private resolveWslGatewayIp(): string {
+    if (this.wslGatewayIp) return this.wslGatewayIp;
+    let ip = '127.0.0.1';
+    try {
+      const route = execFileSync('wsl.exe', ['ip', 'route', 'show', 'default'], {
+        encoding: 'utf-8', timeout: 5000,
+      });
+      const match = route.match(/default\s+via\s+(\d+\.\d+\.\d+\.\d+)/);
+      if (match) ip = match[1];
+    } catch { /* fall back to 127.0.0.1 */ }
+    this.wslGatewayIp = ip;
+    return ip;
+  }
+
   private ensureMcpConfig(workDir: string, pathType: string): void {
     const mcpScriptPath = getScriptPath('mcp-supervisor.js');
     const mcpConfig = {
@@ -906,16 +1449,22 @@ export class AgentSupervisor extends EventEmitter {
         });
         args.push('--mcp-config', mcpConfig);
         console.log(`[Windows] Supervisor MCP config injected via --mcp-config`);
+      }
 
-        // Workspace-root contract (see docs/PERSISTENT_AGENT_LAUNCH_CONTRACT.md):
-        //   --add-dir extends file scope to the workspace and surfaces workspace-shared skills.
-        //   --append-system-prompt tells the supervisor where the workspace is, since
-        //   --add-dir's value isn't otherwise visible to the agent's context.
+      // Workspace-root contract (see docs/PERSISTENT_AGENT_LAUNCH_CONTRACT.md):
+      //   --add-dir extends file scope to the workspace and surfaces workspace-shared skills.
+      //   --append-system-prompt tells the agent where the workspace is, since
+      //   --add-dir's value isn't otherwise visible to the agent's context.
+      // Applies to both supervisors and supervised workers (class IV): both cwd
+      // into a .dashboard/ subfolder, so neither would see the workspace
+      // naturally without these flags.
+      if ((agent.isSupervisor || agent.isSupervised) && isClaude) {
         const workspaceRoot = getEffectiveWorkspaceRoot(agent);
         const sysPrompt = `Workspace root: ${workspaceRoot}. cd there for project shell work. Use absolute paths for Read/Edit/Glob.`;
         args.push('--add-dir', workspaceRoot);
         args.push('--append-system-prompt', sysPrompt);
-        console.log(`[Windows] Supervisor --add-dir + --append-system-prompt: ${workspaceRoot}`);
+        const role = agent.isSupervisor ? 'Supervisor' : 'Worker';
+        console.log(`[Windows] ${role} --add-dir + --append-system-prompt: ${workspaceRoot}`);
       }
 
       // Add session ID on fresh launch (Claude only)
@@ -928,13 +1477,30 @@ export class AgentSupervisor extends EventEmitter {
       // when multiple agents share a workdir, --continue picks the most recent
       // session in cwd and silently cross-contaminates restarts. If the ID is
       // missing, treat as a hard error so the supervisor surfaces a 'crashed'.
+      //
+      // BUG-21 Option 1: validate the JSONL exists on disk before trusting
+      // `resumeSessionId`. See the WSL counterpart for the full rationale.
       if (resume && isClaude && !args.includes('--continue') && !args.includes('-c')) {
         const latest = getAgent(agent.id);
         if (!latest?.resumeSessionId) {
           throw new Error(`Cannot resume ${agent.title} (${agent.id}): no resumeSessionId on record`);
         }
-        args.push('--resume', latest.resumeSessionId);
-        console.log(`[Windows] Resuming ${agent.title} (${agent.id}) with session: ${latest.resumeSessionId}`);
+        const existsOnDisk = this.sessionLogReader.sessionFileExists(
+          'claude',
+          agent.workingDirectory,
+          latest.resumeSessionId,
+        );
+        if (existsOnDisk) {
+          args.push('--resume', latest.resumeSessionId);
+          console.log(`[Windows] Resuming ${agent.title} (${agent.id}) with session: ${latest.resumeSessionId}`);
+        } else {
+          const missingId = latest.resumeSessionId;
+          const newId = uuidv4();
+          updateAgentResumeSessionId(agent.id, newId);
+          this.sessionLogReader.invalidatePath(agent.id);
+          args.push('--session-id', newId);
+          console.warn(`[Windows] Resume session not found on disk for ${agent.id} (${missingId}); falling back to fresh launch with new session-id ${newId}`);
+        }
       }
 
       // Gemini resume: bare --resume picks the most recent session for this user.
@@ -981,6 +1547,8 @@ export class AgentSupervisor extends EventEmitter {
       updateAgentStatus(agent.id, status);
       addEvent(agent.id, status, JSON.stringify({ exitCode }));
       this.emit('statusChanged', { agentId: agent.id, status, fromStatus: prior, source: 'runner-exit' } satisfies StatusChangedEvent);
+      // BUG-23 — terminal exit invalidates any pending settle timer.
+      this.monitor.clearLaunch(agent.id);
 
       // Auto-restart
       const latest = getAgent(agent.id);
@@ -990,51 +1558,78 @@ export class AgentSupervisor extends EventEmitter {
     });
 
     // Use directSpawn when we have a multiline positional argument (prompt text)
-    // or when launching a supervisor (whose --append-system-prompt value contains
-    // spaces that cmd.exe argument parsing would shred). Without directSpawn,
-    // pty-host's cmd.exe wrap now quotes args with whitespace, but supervisor
-    // launches still prefer direct-spawn so the load-bearing system prompt never
-    // round-trips through cmd.exe parsing at all.
+    // or when launching a persistent agent (supervisor OR supervised worker —
+    // both pass an --append-system-prompt value with spaces at line 987 that
+    // cmd.exe argument parsing would shred). Without directSpawn, pty-host's
+    // cmd.exe wrap now quotes args with whitespace, but persistent-agent launches
+    // still prefer direct-spawn so the load-bearing system prompt never
+    // round-trips through cmd.exe parsing at all. (Matches the WSL path's
+    // `(isSupervisor || isSupervised)` gate at line 1234.)
     const hasPromptArg = !!agentMdPrompt && !resume && agent.provider === 'claude';
-    const supervisorDirectSpawn = !!agent.isSupervisor && agent.provider === 'claude' && !overrideArgs;
-    const needsDirectSpawn = hasPromptArg || supervisorDirectSpawn;
+    const persistentAgentDirectSpawn = !!(agent.isSupervisor || agent.isSupervised) && agent.provider === 'claude' && !overrideArgs;
+    const needsDirectSpawn = hasPromptArg || persistentAgentDirectSpawn;
     let launchCmd = cmd;
     if (needsDirectSpawn) {
       try {
         launchCmd = await findWindowsClaudePath(process.env as NodeJS.ProcessEnv);
-        console.log(`[Windows] Using direct spawn with: ${launchCmd} (hasPromptArg=${hasPromptArg}, supervisor=${agent.isSupervisor})`);
+        console.log(`[Windows] Using direct spawn with: ${launchCmd} (hasPromptArg=${hasPromptArg}, supervisor=${agent.isSupervisor}, supervised=${agent.isSupervised})`);
       } catch (err) {
         console.warn(`[Windows] Could not resolve claude.exe path, falling back to cmd.exe:`, err);
       }
     }
     const useDirectSpawn = needsDirectSpawn && launchCmd !== cmd;
 
-    // BUG-08: `freshSession` opts out of post-launch session-id discovery
-    // so the new agent isn't auto-bound to any pre-existing rollout in this cwd.
+    // BUG-26: every non-resume codex launch (including freshSession=true)
+    // runs post-launch discovery so the new agent record gets bound to the
+    // codex-minted session id via the race-resistant SQLite path
+    // (cwd + created_at + first_user_message_prefix). The pre-BUG-26
+    // freshSession opt-out left `resumeSessionId` null and forced
+    // CodexRolloutReader to fall back to cwd-as-identity proxy, which
+    // mis-attributed events under concurrent same-cwd launches.
     const codexSnapshot = shouldDiscoverCodexSession({ provider: agent.provider, resume, freshSession })
       ? await snapshotCodexSessions('windows')
       : null;
     const codexLaunchStartedAt = Date.now();
-    if (agent.provider === 'codex' && !resume && freshSession) {
-      console.log(`[Windows] freshSession=true — skipping codex session-id discovery for ${agent.title} (${agent.id})`);
-    }
 
     // BUG-13 Path A: disable Claude Code's next-prompt ghost-text suggestion
     // rendering. The grey suggestion bytes (a) flap PTY-fallback status
     // idle↔working and (b) leak verbatim into the supervisor event's `Last
     // output:` field. Documented disable knob:
     // https://code.claude.com/docs/en/interactive-mode
-    const extraEnv = agent.provider === 'claude'
-      ? { CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION: 'false' }
-      : undefined;
-    runner.launch(agent.workingDirectory, launchCmd, args, agent.logPath || '', useDirectSpawn, extraEnv);
+    //
+    // Class IV (plans/class-iv-worker-hook-scaffold.md): supervised workers
+    // also get AGENT_ID + DASHBOARD_PORT so the Stop hook can identify this
+    // agent and POST to the actually-bound dashboard port. Gated on
+    // isSupervised — unsupervised user-launched agents get no extra env.
+    const extraEnv: Record<string, string> = {};
+    if (agent.provider === 'claude') {
+      extraEnv.CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION = 'false';
+    }
+    if (agent.isSupervised) {
+      extraEnv.AGENT_ID = agent.id;
+      extraEnv.DASHBOARD_PORT = String(this.apiServerPort);
+    }
+    const extraEnvArg = Object.keys(extraEnv).length > 0 ? extraEnv : undefined;
+    runner.launch(agent.workingDirectory, launchCmd, args, agent.logPath || '', useDirectSpawn, extraEnvArg);
     updateAgentPid(agent.id, runner.pid);
+    // BUG-23 — write `'launching'` (was `'working'`) and stamp the settle
+    // timer. `StatusMonitor.poll()` will promote `'launching' → 'idle'` once
+    // `LAUNCH_SETTLE_TIMEOUT_MS[provider]` has elapsed, or a Stop hook
+    // arriving inside the window can short-circuit the wallclock via
+    // `forceIdleFromHook → promoteFromLaunching('stop-hook')`.
     const priorWinLaunch = getAgent(agent.id)?.status;
-    updateAgentStatus(agent.id, 'working');
-    this.emit('statusChanged', { agentId: agent.id, status: 'working', fromStatus: priorWinLaunch, source: 'launch' } satisfies StatusChangedEvent);
+    updateAgentStatus(agent.id, 'launching');
+    this.monitor.recordLaunch(agent.id);
+    this.emit('statusChanged', { agentId: agent.id, status: 'launching', fromStatus: priorWinLaunch, source: 'launch' } satisfies StatusChangedEvent);
 
     if (codexSnapshot) {
-      this.captureCodexSessionId(agent.id, codexSnapshot, agent.workingDirectory, codexLaunchStartedAt);
+      this.captureCodexSessionId(
+        agent.id,
+        codexSnapshot,
+        agent.workingDirectory,
+        codexLaunchStartedAt,
+        agentMdPrompt ?? ''
+      );
     }
   }
 
@@ -1056,7 +1651,11 @@ export class AgentSupervisor extends EventEmitter {
     });
     if (!result) return null;
     updateAgentResumeSessionId(agent.id, result.sessionId);
-    this.sessionLogReader.invalidatePath(agent.id);
+    // BUG-26: rebind drops any provisional/wrong events the reader may have
+    // emitted under the stale (empty) sessionId. invalidatePath alone only
+    // clears file offsets; the dispatcher ring buffer is the load-bearing
+    // surface `AgentChatService.getMessages` returns to the UI.
+    this.sessionLogReader.rebindAgent(agent.id);
     console.log(
       `[Codex] Recovered session id ${result.sessionId} for agent ${agent.id} via cwd-match (${result.path})`
     );
@@ -1080,22 +1679,47 @@ export class AgentSupervisor extends EventEmitter {
     });
   }
 
+  /**
+   * Public wrapper around resolveCodexResumeSessionId for the API layer.
+   * No-op for non-codex agents or codex agents that already have a sid.
+   * Called from chat-read endpoints so a Codex agent whose post-launch
+   * discovery race lost still gets its rollout reader bound on the first
+   * chat read. See BUG-28 in .dashboard/supervisor/memory/open-bugs.md.
+   */
+  public maybeRecoverCodexSid(agentId: string): void {
+    const agent = getAgent(agentId);
+    if (!agent || agent.provider !== 'codex') return;
+    if (agent.resumeSessionId) return;
+    this.resolveCodexResumeSessionId(agent);
+  }
+
   private captureCodexSessionId(
     agentId: string,
     before: Awaited<ReturnType<typeof snapshotCodexSessions>>,
     workingDirectory: string,
-    launchedAfterMs: number
+    launchedAfterMs: number,
+    // T1-C: per-launch tiebreaker matched against threads.first_user_message in
+    // ~/.codex/state_5.sqlite. Empty/undefined makes the SQL filter a no-op so
+    // we still benefit from cwd + created_at scoping on launch paths that
+    // don't yet know the launch prompt.
+    firstUserMessagePrefix?: string | null
   ): void {
     void discoverNewCodexSession(before, {
       workingDirectory,
       launchedAfterMs,
-      timeoutMs: 10_000,
+      firstUserMessagePrefix: firstUserMessagePrefix ?? '',
+      // Default timeout (DEFAULT_SQL_POLL_TIMEOUT_MS = 35 s) lives in
+      // session-id-discovery.ts. It's sized for codex's deferred threads-row
+      // INSERT (~25-26 s after launch); see the comment on that constant.
     }).then((result) => {
       if (!result) return;
       const latest = getAgent(agentId);
       if (!latest || latest.resumeSessionId) return; // null-guard: don't overwrite a later restart
       updateAgentResumeSessionId(agentId, result.sessionId);
-      this.sessionLogReader.invalidatePath(agentId);
+      // BUG-26: see recoverCodexResumeSessionId — drop any provisional ring
+      // events emitted while sessionId was empty so they can't survive into
+      // the chat the user/supervisor reads.
+      this.sessionLogReader.rebindAgent(agentId);
       console.log(`[Codex] Captured session id ${result.sessionId} for agent ${agentId}`);
     }).catch((err) => {
       console.warn(`[Codex] session-id discovery failed for ${agentId}:`, err);
@@ -1120,20 +1744,45 @@ export class AgentSupervisor extends EventEmitter {
     // idle↔working and (b) leak verbatim into the supervisor event's `Last
     // output:` field. Documented disable knob:
     // https://code.claude.com/docs/en/interactive-mode
-    // Use `env VAR=value cmd` so the prefix survives the later `exec ${command}`
-    // wrap (env consumes the assignment, then exec's ccode with that env).
+    // Use bash's native command-prefix assignment (`VAR=value cmd`) rather than
+    // `env VAR=value cmd` / `exec`: on WSL the user's `ccode`/`ccodex` are bash
+    // functions in .bashrc, and `env`/`exec` only do PATH lookups so they fail
+    // with "No such file or directory". The bash command-prefix is parsed by
+    // the shell, so the lookup goes through normal function/alias resolution.
+    //
+    // Class IV (plans/class-iv-worker-hook-scaffold.md): supervised workers
+    // also get AGENT_ID + DASHBOARD_PORT so the Stop hook can identify this
+    // agent and POST to the dashboard. Gated on agent.isSupervised.
+    //
+    // L-C (plans/windows-wsl-issues-review-2026-05-23.md §T1-B): WSL2 default
+    // NAT mode means 127.0.0.1 inside the distro is the distro's loopback,
+    // NOT the Windows host's. Inject DASHBOARD_HOST=<gateway-ip> here so the
+    // dashboard-status.mjs hook script reaches the actual ApiServer running
+    // on the Windows host. Windows path (launchWindowsAgent above) does NOT
+    // set DASHBOARD_HOST — the script's '127.0.0.1' fallback works there.
+    const wslEnvPrefix: string[] = [];
     if (isClaude) {
-      command = `env CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false ${command}`;
+      wslEnvPrefix.push('CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false');
+    }
+    if (agent.isSupervised) {
+      wslEnvPrefix.push(`AGENT_ID=${agent.id}`);
+      wslEnvPrefix.push(`DASHBOARD_PORT=${this.apiServerPort}`);
+      wslEnvPrefix.push(`DASHBOARD_HOST=${this.resolveWslGatewayIp()}`);
+    }
+    if (wslEnvPrefix.length > 0) {
+      command = `${wslEnvPrefix.join(' ')} ${command}`;
     }
 
-    // Supervisor workspace-root contract (see docs/PERSISTENT_AGENT_LAUNCH_CONTRACT.md).
+    // Persistent-agent workspace-root contract (see docs/PERSISTENT_AGENT_LAUNCH_CONTRACT.md).
     // Computed up here so it's available both for the bare-command case and for the
-    // wrap-with-prompt case below; sysPromptText is non-null iff this is a Claude supervisor.
+    // wrap-with-prompt case below. Fires for supervisors AND supervised workers
+    // (class IV): both cwd into a .dashboard/ subfolder, so neither would see
+    // the workspace naturally without --add-dir + --append-system-prompt.
     let sysPromptText: string | null = null;
-    let supervisorWorkspaceRoot: string | null = null;
-    if (agent.isSupervisor && isClaude && !overrideCommand) {
-      supervisorWorkspaceRoot = getEffectiveWorkspaceRoot(agent);
-      sysPromptText = `Workspace root: ${supervisorWorkspaceRoot}. cd there for project shell work. Use absolute paths for Read/Edit/Glob.`;
+    let persistentWorkspaceRoot: string | null = null;
+    if ((agent.isSupervisor || agent.isSupervised) && isClaude && !overrideCommand) {
+      persistentWorkspaceRoot = getEffectiveWorkspaceRoot(agent);
+      sysPromptText = `Workspace root: ${persistentWorkspaceRoot}. cd there for project shell work. Use absolute paths for Read/Edit/Glob.`;
     }
 
     if (!overrideCommand) {
@@ -1146,9 +1795,10 @@ export class AgentSupervisor extends EventEmitter {
       // Append --add-dir on the bare command. The --append-system-prompt flag and
       // its value can't go on the bare command — its quoted value would collide
       // with the outer wrap below — so it's handled inside the wrap via SYSPROMPT.
-      if (agent.isSupervisor && isClaude && supervisorWorkspaceRoot) {
-        command += ` --add-dir '${supervisorWorkspaceRoot}'`;
-        console.log(`[WSL] Supervisor --add-dir: ${supervisorWorkspaceRoot}`);
+      if ((agent.isSupervisor || agent.isSupervised) && isClaude && persistentWorkspaceRoot) {
+        command += ` --add-dir '${persistentWorkspaceRoot}'`;
+        const role = agent.isSupervisor ? 'Supervisor' : 'Worker';
+        console.log(`[WSL] ${role} --add-dir: ${persistentWorkspaceRoot}`);
       }
 
       // Add session ID on fresh launch (Claude only)
@@ -1161,13 +1811,33 @@ export class AgentSupervisor extends EventEmitter {
       // when multiple agents share a workdir, --continue picks the most recent
       // session in cwd and silently cross-contaminates restarts. If the ID is
       // missing, treat as a hard error so the supervisor surfaces a 'crashed'.
+      //
+      // BUG-21 Option 1: validate the JSONL exists on disk before trusting
+      // `resumeSessionId`. `launchAgent` pre-populates the column before the
+      // first launch proves Claude wrote the session file (index.ts:535-540);
+      // if Claude crashed before flushing the JSONL, every restart attempt
+      // would emit `--resume <uuid>` and hit "No conversation found" forever.
       if (resume && isClaude && !command.includes('--continue') && !command.includes('-c ')) {
         const latest = getAgent(agent.id);
         if (!latest?.resumeSessionId) {
           throw new Error(`Cannot resume ${agent.title} (${agent.id}): no resumeSessionId on record`);
         }
-        command += ` --resume ${latest.resumeSessionId}`;
-        console.log(`[WSL] Resuming ${agent.title} (${agent.id}) with session: ${latest.resumeSessionId}`);
+        const existsOnDisk = this.sessionLogReader.sessionFileExists(
+          'claude',
+          wslWorkDir,
+          latest.resumeSessionId,
+        );
+        if (existsOnDisk) {
+          command += ` --resume ${latest.resumeSessionId}`;
+          console.log(`[WSL] Resuming ${agent.title} (${agent.id}) with session: ${latest.resumeSessionId}`);
+        } else {
+          const missingId = latest.resumeSessionId;
+          const newId = uuidv4();
+          updateAgentResumeSessionId(agent.id, newId);
+          this.sessionLogReader.invalidatePath(agent.id);
+          command += ` --session-id ${newId}`;
+          console.warn(`[WSL] Resume session not found on disk for ${agent.id} (${missingId}); falling back to fresh launch with new session-id ${newId}`);
+        }
       }
 
       // Gemini resume: bare --resume picks the most recent session for this user.
@@ -1194,9 +1864,12 @@ export class AgentSupervisor extends EventEmitter {
       //   - agentMdPrompt (workspace agent.md content) → final positional argument
       //   - sysPromptText (supervisor workspace-root preamble) → --append-system-prompt flag value
       // via $(cat tmpfile) substitutions inside the wrap. Required because the outer
-      // exec ${command} "$PROMPT" word-splits the unquoted ${command} substitution
+      // ${command} "$PROMPT" word-splits the unquoted ${command} substitution
       // without re-interpreting embedded quote characters, so quoted values placed
       // directly in the bare command string would be broken into pieces.
+      // No `exec`: on WSL the command may be a bash function (`ccode`/`ccodex`),
+      // and `exec` only does PATH lookups so it would fail to resolve it. Cost
+      // is one extra shell process in the tree; not worth the breakage.
       if ((agentMdPrompt || sysPromptText) && !resume && isClaude) {
         const writeWslFile = (relName: string, content: string): string | null => {
           const file = `${wslWorkDir}/.claude/${relName}`;
@@ -1238,7 +1911,7 @@ export class AgentSupervisor extends EventEmitter {
 
         const exportPrefix = exports.length > 0 ? `${exports.join(' && ')} && ` : '';
         const flags = flagSuffix.length > 0 ? ` ${flagSuffix.join(' ')}` : '';
-        command = `cd '${wslWorkDir}' && ${exportPrefix}exec ${command}${flags}${promptArg}`;
+        command = `cd '${wslWorkDir}' && ${exportPrefix}${command}${flags}${promptArg}`;
         console.log(`[WSL] Wrapped command — sysprompt:${!!sysPromptText} agentMd:${!!agentMdPrompt}`);
       }
     }
@@ -1259,6 +1932,8 @@ export class AgentSupervisor extends EventEmitter {
       updateAgentStatus(agent.id, status);
       addEvent(agent.id, status, JSON.stringify({ exitCode }));
       this.emit('statusChanged', { agentId: agent.id, status, fromStatus: prior, source: 'runner-exit' } satisfies StatusChangedEvent);
+      // BUG-23 — terminal exit invalidates any pending settle timer.
+      this.monitor.clearLaunch(agent.id);
 
       const latest = getAgent(agent.id);
       if (latest && status === 'crashed' && latest.autoRestartEnabled) {
@@ -1269,23 +1944,82 @@ export class AgentSupervisor extends EventEmitter {
     console.log(`[WSL] Launching agent '${agent.tmuxSessionName}' in ${wslWorkDir}`);
     console.log(`[WSL] Command: ${command}`);
 
-    // BUG-08: `freshSession` opts out of post-launch session-id discovery
-    // so the new agent isn't auto-bound to any pre-existing rollout in this cwd.
+    // BUG-22 Step 1 diagnostic: assemble metadata so the runner can append one
+    // structured JSONL record per launch attempt to
+    // `<workspace>/.dashboard/launches.log`. Replaces the prior one-line
+    // plain-text write. Workspace-relative so the log travels with the failing
+    // workspace and is easy to inspect beside the scaffold.
+    const launchStartedAtIso = new Date().toISOString();
+    let launchesLogPath: string | null = null;
+    try {
+      const workspace = getWorkspace(agent.workspaceId);
+      if (workspace && workspace.path) {
+        launchesLogPath = path.join(workspace.path, '.dashboard', 'launches.log');
+      }
+    } catch { /* best-effort */ }
+    const diagnostics: WslLaunchDiagnostics = {
+      launchStartedAt: launchStartedAtIso,
+      launchesLogPath,
+      agentId: agent.id,
+      agentTitle: agent.title,
+      workspaceId: agent.workspaceId,
+      provider: agent.provider,
+      isSupervisor: !!agent.isSupervisor,
+      isSupervised: !!agent.isSupervised,
+      resume,
+      freshSession,
+    };
+
+    // BUG-22 Step 1 diagnostic: surface a distinct `tmux_new_session_failed`
+    // lifecycle event (audit row + supervisor notification) when the runner
+    // detects tmuxNewSession returning non-zero. Distinct from the
+    // crashed-status event that follows when `tmux attach` exits — that one
+    // looks like a generic worker crash; this one points at the upstream
+    // structural cause.
+    runner.on('tmuxNewSessionFailed', (failure: {
+      tmuxSessionName: string;
+      command: string;
+      tmuxExitCode: number | null;
+      tmuxStderr: string;
+      tmuxCommand: string;
+    }) => {
+      addEvent(agent.id, 'tmux_new_session_failed', JSON.stringify(failure));
+      void this.bridge.onTmuxNewSessionFailed({
+        agent,
+        tmuxSessionName: failure.tmuxSessionName,
+        command: failure.command,
+        tmuxExitCode: failure.tmuxExitCode,
+        tmuxStderr: failure.tmuxStderr,
+        tmuxCommand: failure.tmuxCommand,
+      });
+    });
+
+    // BUG-26: every non-resume codex launch (including freshSession=true)
+    // runs post-launch discovery so the new agent record gets bound to the
+    // codex-minted session id via the race-resistant SQLite path. See the
+    // longer rationale on the Windows path above.
     const codexSnapshot = shouldDiscoverCodexSession({ provider: agent.provider, resume, freshSession })
       ? await snapshotCodexSessions('wsl')
       : null;
     const codexLaunchStartedAt = Date.now();
-    if (agent.provider === 'codex' && !resume && freshSession) {
-      console.log(`[WSL] freshSession=true — skipping codex session-id discovery for ${agent.title} (${agent.id})`);
-    }
 
-    await runner.launch(wslWorkDir, command, nativeLogPath);
+    await runner.launch(wslWorkDir, command, nativeLogPath, diagnostics);
+    // BUG-23 — write `'launching'` (was `'working'`) and stamp the settle
+    // timer. See the Windows path above for the lifecycle description; the
+    // promotion mechanism is provider-neutral.
     const priorWslLaunch = getAgent(agent.id)?.status;
-    updateAgentStatus(agent.id, 'working');
-    this.emit('statusChanged', { agentId: agent.id, status: 'working', fromStatus: priorWslLaunch, source: 'launch' } satisfies StatusChangedEvent);
+    updateAgentStatus(agent.id, 'launching');
+    this.monitor.recordLaunch(agent.id);
+    this.emit('statusChanged', { agentId: agent.id, status: 'launching', fromStatus: priorWslLaunch, source: 'launch' } satisfies StatusChangedEvent);
 
     if (codexSnapshot) {
-      this.captureCodexSessionId(agent.id, codexSnapshot, wslWorkDir, codexLaunchStartedAt);
+      this.captureCodexSessionId(
+        agent.id,
+        codexSnapshot,
+        wslWorkDir,
+        codexLaunchStartedAt,
+        agentMdPrompt ?? ''
+      );
     }
   }
 
@@ -1652,6 +2386,52 @@ export class AgentSupervisor extends EventEmitter {
     return this.windowsRunners.has(agentId) || this.wslRunners.has(agentId);
   }
 
+  /** Class IV — called by src/main/index.ts after apiServer.start() so the
+   *  supervisor can inject the actually-bound port into supervised-worker env
+   *  (handles api-server.ts EADDRINUSE auto-increment). */
+  setApiServerPort(port: number): void {
+    this.apiServerPort = port;
+  }
+
+  /** Class IV — entry point for the POST /api/agents/:id/status hook endpoint.
+   *  Delegates to the private StatusMonitor's forceIdle. Kept as a thin public
+   *  shim so api-server.ts doesn't need a reference to the monitor itself.
+   *
+   *  Also stamps the StatusMonitor's `lastHookEventAt` map so the §2.2
+   *  hook-silence watchdog can detect a broken scaffold. See
+   *  plans/disable-inference-for-supervised-claude-workers.md §2.3.
+   *
+   *  BUG-23 §C-supplement — if the agent is currently in `'launching'`, the
+   *  regular `forceIdle` no-ops on the transitional guard and the wallclock
+   *  settle timer would eventually flip the agent. That's strictly worse
+   *  than honoring the hook itself: the hook signal carries authoritative
+   *  end-of-turn information that the wallclock can't reproduce. Route
+   *  through `promoteFromLaunching('stop-hook')`, the one surgical bypass,
+   *  so the hook's information is preserved and the agent doesn't sit
+   *  falsely-launching for the rest of the settle window. */
+  forceIdleFromHook(agentId: string, source: string): void {
+    this.monitor.recordHookEventAt(agentId, Date.now());
+    const agent = getAgent(agentId);
+    if (agent && agent.status === 'launching') {
+      this.monitor.promoteFromLaunching(agentId, 'stop-hook');
+      return;
+    }
+    this.monitor.forceIdle(agentId, source);
+  }
+
+  /** Class IV — entry point for the UserPromptSubmit hook arm of
+   *  POST /api/agents/:id/status (state='working'). Mirrors
+   *  `forceIdleFromHook` but flips the latch to working. The start-hook is
+   *  the supervised lane's sole authority for idle→working (paste-race fix:
+   *  optimistic seeds at `notifyUserInputDelivered` and the BUG-23 launching
+   *  flow stay disabled for supervised agents). */
+  forceWorkingFromHook(agentId: string, source: string): void {
+    const ts = Date.now();
+    this.monitor.recordHookEventAt(agentId, ts);
+    this.monitor.recordStartHookEventAt(agentId, ts);
+    this.monitor.forceWorking(agentId, source);
+  }
+
   writeToAgent(agentId: string, data: string): void {
     // BUG-11: every byte reaching this path is user-initiated (the
     // `terminal:write` IPC handler is the sole caller, and its renderer-side
@@ -1717,6 +2497,10 @@ export class AgentSupervisor extends EventEmitter {
           // waiting→working transition with source 'user-input'. Seeding the
           // working latch before would no-op that path.
           this.bridge.notifyUserInputDelivered(agentId);
+          // BUG-23 §watchdog reframe — record the delivered-input timestamp
+          // so the reframed Class IV watchdog can detect a scaffold-broken
+          // supervised Claude worker (input went in, no hook ever came back).
+          this.monitor.recordInputDelivered(agentId);
           // BUG-09 §3.4 (corrected, see plans/bug-09-launch-seed-fix-plan.md):
           // seed a working latch at the actual turn boundary — the moment
           // Enter has been delivered to the PTY. The ce44c2db sighting was a
@@ -1735,10 +2519,20 @@ export class AgentSupervisor extends EventEmitter {
           // window. 180 s was too tight for extended thinking (xhigh effort
           // empirically gaps to 311 s in this workspace); 900 s gives the
           // model room to think before any real refresh can land.
-          this.monitor.forceWorking(agentId, {
-            source: 'user-input-submitted',
-            ttlClass: 'tool-pending',
-          });
+          //
+          // Paste-race fix (start-hook): supervised workers' idle→working is
+          // owned exclusively by the UserPromptSubmit hook. This seed fires
+          // on every PTY write (including pastes that never get submitted),
+          // which is exactly the false-working signature the hook scaffold
+          // exists to close. Watchdog checkStartHookSilence catches the rare
+          // case where the hook never arrives.
+          const sentAgent = getAgent(agentId);
+          if (!sentAgent?.isSupervised) {
+            this.monitor.forceWorking(agentId, {
+              source: 'user-input-submitted',
+              ttlClass: 'tool-pending',
+            });
+          }
         }
       });
     this.inputQueues.set(agentId, ours);
@@ -1801,19 +2595,30 @@ export class AgentSupervisor extends EventEmitter {
         // TUI expects key events as CSI sequences with both KEY_DOWN and
         // KEY_UP. ConPTY auto-converts incoming bytes into a single KEY_DOWN
         // event, which is enough to render typed characters but not enough to
-        // trigger Enter (submit). Type chars at a slow rate so codex's
-        // paste-detect doesn't fire, then send a real VK_RETURN down+up pair.
-        // Embedded '\n' becomes Shift+Enter (newline-without-submit) so the
-        // final plain Enter still triggers submit instead of inserting another
-        // line in multi-line input mode.
+        // trigger Enter (submit). Send the body in chunks separated by
+        // WINDOWS_CODEX_TYPING_DELAY_MS so the cumulative write rate stays
+        // below codex's paste-burst threshold (which would otherwise route
+        // the input through codex's paste-confirm flow). Empirically codex
+        // tolerates writes up to 512 chars with this gap; we use
+        // WINDOWS_CODEX_TYPING_CHUNK_SIZE (currently 64) for safety margin.
+        // Even chunked, codex still collapses multi-line input to a
+        // "[Pasted Content N chars]" placeholder visually — that's expected.
+        // After the body, send a real VK_RETURN down+up pair to submit;
+        // embedded '\n' becomes Shift+Enter (newline-without-submit) so the
+        // final plain Enter still triggers submit instead of inserting
+        // another line in multi-line input mode.
         const normalized = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-        for (const ch of normalized) {
-          if (ch === '\n') {
-            winRunner.write(WIN32_KEY_SHIFT_ENTER_DOWN + WIN32_KEY_SHIFT_ENTER_UP);
-          } else {
-            winRunner.write(ch);
+        const lines = normalized.split('\n');
+        for (let i = 0; i < lines.length; i++) {
+          const line = lines[i];
+          for (let j = 0; j < line.length; j += WINDOWS_CODEX_TYPING_CHUNK_SIZE) {
+            winRunner.write(line.slice(j, j + WINDOWS_CODEX_TYPING_CHUNK_SIZE));
+            await new Promise((resolve) => setTimeout(resolve, WINDOWS_CODEX_TYPING_DELAY_MS));
           }
-          await new Promise((resolve) => setTimeout(resolve, WINDOWS_CODEX_TYPING_DELAY_MS));
+          if (i < lines.length - 1) {
+            winRunner.write(WIN32_KEY_SHIFT_ENTER_DOWN + WIN32_KEY_SHIFT_ENTER_UP);
+            await new Promise((resolve) => setTimeout(resolve, WINDOWS_CODEX_TYPING_DELAY_MS));
+          }
         }
         if (submit) {
           await new Promise((resolve) => setTimeout(resolve, WINDOWS_SEND_INPUT_ENTER_DELAY_MS));

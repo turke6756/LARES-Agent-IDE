@@ -3,7 +3,7 @@ import type { DirectoryEntry, PathType } from '../../../shared/types';
 import FileContextMenu from '../shared/FileContextMenu';
 import * as Icons from 'lucide-react';
 import FileIcon from './FileIcon';
-import { fileDragStart } from '../../utils/drag-file';
+import { treeEntryDragStart, TREE_ENTRY_MIME } from '../../utils/drag-file';
 import { applyFsEvent } from './applyFsEvent';
 import { useDashboardStore } from '../../stores/dashboard-store';
 import type { PromptName } from '../../hooks/useNamePrompt';
@@ -48,6 +48,7 @@ function DirectoryTreeNode({
   const [children, setChildren] = useState<DirectoryEntry[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
+  const [isDropTarget, setIsDropTarget] = useState(false);
   const clickTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const closeTabsForPath = useDashboardStore((state) => state.closeTabsForPath);
   const renameTabPath = useDashboardStore((state) => state.renameTabPath);
@@ -173,6 +174,63 @@ function DirectoryTreeNode({
     await onSiblingsChanged();
   }, [entry.name, entry.path, hasDirtyTabForPath, onSiblingsChanged, onTreeChanged, pathType, promptName, renameTabPath, workingDirectory]);
 
+  const handleDragOver = useCallback((e: React.DragEvent) => {
+    if (!entry.isDirectory) return;
+    if (!e.dataTransfer.types.includes(TREE_ENTRY_MIME)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    e.dataTransfer.dropEffect = 'move';
+    setIsDropTarget(true);
+  }, [entry.isDirectory]);
+
+  const handleDragLeave = useCallback(() => {
+    if (!entry.isDirectory) return;
+    setIsDropTarget(false);
+  }, [entry.isDirectory]);
+
+  const handleDrop = useCallback(async (e: React.DragEvent) => {
+    if (!entry.isDirectory) return;
+    if (!e.dataTransfer.types.includes(TREE_ENTRY_MIME)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDropTarget(false);
+    const raw = e.dataTransfer.getData(TREE_ENTRY_MIME);
+    if (!raw) return;
+    let payload: { path: string; isDirectory: boolean };
+    try {
+      payload = JSON.parse(raw);
+    } catch {
+      return;
+    }
+    if (!payload.path || payload.path === entry.path) return;
+    if (hasDirtyTabForPath(payload.path) &&
+        !window.confirm('That item has unsaved changes in an open tab. Move anyway?')) {
+      return;
+    }
+    const result = await window.api.files.move(payload.path, workingDirectory, pathType, entry.path);
+    if (!result.ok) {
+      window.alert(result.error);
+      return;
+    }
+    if (result.path) renameTabPath(payload.path, result.path);
+    onTreeChanged(parentPath(payload.path));
+    onTreeChanged(entry.path);
+    if (!expanded) {
+      setExpanded(true);
+      setLoading(true);
+      try {
+        const items = await loadChildren(entry.path);
+        setChildren(items);
+      } finally {
+        setLoading(false);
+      }
+    }
+    await onSiblingsChanged();
+  }, [
+    entry.isDirectory, entry.path, expanded, hasDirtyTabForPath, loadChildren,
+    onSiblingsChanged, onTreeChanged, pathType, renameTabPath, workingDirectory,
+  ]);
+
   const deleteCurrentEntry = useCallback(async () => {
     const confirmed = entry.isDirectory
       ? window.confirm(`Delete folder "${entry.name}" and everything inside it?`)
@@ -199,10 +257,13 @@ function DirectoryTreeNode({
         onClick={handleClick}
         onDoubleClick={handleDoubleClick}
         onContextMenu={handleContextMenu}
-        draggable={!entry.isDirectory}
-        onDragStart={(e) => { if (!entry.isDirectory) fileDragStart(e, entry.path); }}
+        draggable
+        onDragStart={(e) => treeEntryDragStart(e, entry.path, entry.isDirectory)}
+        onDragOver={handleDragOver}
+        onDragLeave={handleDragLeave}
+        onDrop={handleDrop}
         className={`w-full text-left flex items-center gap-1 py-[3px] px-2 text-[13px] font-sans transition-colors group ${
-          isActive ? 'tree-row-selected' : 'tree-row-hover text-fg-primary'
+          isActive ? 'tree-row-selected' : isDropTarget ? 'bg-accent-blue/15 text-fg-primary' : 'tree-row-hover text-fg-primary'
         }`}
         style={{ paddingLeft: `${depth * 12 + 8}px`, color: isActive ? undefined : 'var(--color-fg-primary)' }}
       >

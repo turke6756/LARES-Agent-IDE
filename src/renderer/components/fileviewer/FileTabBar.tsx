@@ -1,7 +1,8 @@
-import React, { useRef, useEffect } from 'react';
+import React, { useRef, useEffect, useState } from 'react';
 import type { FileTab } from '../../../shared/types';
 import { fileDragStart } from '../../utils/drag-file';
 import { useDashboardStore } from '../../stores/dashboard-store';
+import FileContextMenu from '../shared/FileContextMenu';
 
 interface Props {
   tabs: FileTab[];
@@ -29,6 +30,7 @@ function getDisplayLabel(tab: FileTab, allTabs: FileTab[]): string {
 export default function FileTabBar({ tabs, activeTabId, onSelectTab, onCloseTab }: Props) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const tabEditState = useDashboardStore((state) => state.tabEditState);
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; tab: FileTab } | null>(null);
 
   // Scroll active tab into view
   useEffect(() => {
@@ -63,6 +65,11 @@ export default function FileTabBar({ tabs, activeTabId, onSelectTab, onCloseTab 
               data-tab-id={tab.id}
               onClick={() => onSelectTab(tab.id)}
               onMouseDown={(e) => handleMouseDown(e, tab.id)}
+              onContextMenu={(e) => {
+                if (!tab.filePath) return;
+                e.preventDefault();
+                setContextMenu({ x: e.clientX, y: e.clientY, tab });
+              }}
               draggable={!!tab.filePath}
               onDragStart={(e) => { if (tab.filePath) fileDragStart(e, tab.filePath); }}
               className={`ui-tab shrink-0 max-w-[180px] group ${isActive ? 'ui-tab-active tab-active' : ''}`}
@@ -95,6 +102,17 @@ export default function FileTabBar({ tabs, activeTabId, onSelectTab, onCloseTab 
           );
         })}
       </div>
+      {contextMenu && (
+        <FileContextMenu
+          x={contextMenu.x}
+          y={contextMenu.y}
+          filePath={contextMenu.tab.filePath}
+          workingDirectory={contextMenu.tab.rootDirectory}
+          pathType={contextMenu.tab.pathType}
+          isDirectory={false}
+          onClose={() => setContextMenu(null)}
+        />
+      )}
     </div>
   );
 }

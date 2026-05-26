@@ -6,6 +6,14 @@ import { applyFsEvent } from './applyFsEvent';
 import FileContextMenu from '../shared/FileContextMenu';
 import { useNamePrompt } from '../../hooks/useNamePrompt';
 import { useDashboardStore } from '../../stores/dashboard-store';
+import { TREE_ENTRY_MIME } from '../../utils/drag-file';
+
+function parentPathOf(entryPath: string): string {
+  const slash = Math.max(entryPath.lastIndexOf('/'), entryPath.lastIndexOf('\\'));
+  if (slash === 0) return '/';
+  if (slash > 0) return entryPath.slice(0, slash);
+  return entryPath;
+}
 
 interface Props {
   rootPath: string;
@@ -19,9 +27,12 @@ export default function DirectoryTree({ rootPath, pathType, activeFilePath, onFi
   const [loading, setLoading] = useState(true);
   const [refreshTick, setRefreshTick] = useState(0);
   const [rootContextMenu, setRootContextMenu] = useState<{ x: number; y: number } | null>(null);
+  const [isRootDropTarget, setIsRootDropTarget] = useState(false);
   const cache = useRef(new Map<string, DirectoryEntry[]>());
   const { prompt: promptName, modal: namePromptModal } = useNamePrompt();
   const checkHealth = useDashboardStore((s) => s.checkHealth);
+  const renameTabPath = useDashboardStore((s) => s.renameTabPath);
+  const hasDirtyTabForPath = useDashboardStore((s) => s.hasDirtyTabForPath);
 
   const reloadRoot = useCallback(async () => {
     if (!rootPath) return;
@@ -77,6 +88,45 @@ export default function DirectoryTree({ rootPath, pathType, activeFilePath, onFi
     e.preventDefault();
     setRootContextMenu({ x: e.clientX, y: e.clientY });
   }, []);
+
+  const handleRootDragOver = useCallback((e: React.DragEvent) => {
+    if (!e.dataTransfer.types.includes(TREE_ENTRY_MIME)) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    setIsRootDropTarget(true);
+  }, []);
+
+  const handleRootDragLeave = useCallback((e: React.DragEvent) => {
+    if (e.currentTarget === e.target) setIsRootDropTarget(false);
+  }, []);
+
+  const handleRootDrop = useCallback(async (e: React.DragEvent) => {
+    if (!e.dataTransfer.types.includes(TREE_ENTRY_MIME)) return;
+    e.preventDefault();
+    setIsRootDropTarget(false);
+    const raw = e.dataTransfer.getData(TREE_ENTRY_MIME);
+    if (!raw) return;
+    let payload: { path: string; isDirectory: boolean };
+    try {
+      payload = JSON.parse(raw);
+    } catch {
+      return;
+    }
+    if (!payload.path) return;
+    if (hasDirtyTabForPath(payload.path) &&
+        !window.confirm('That item has unsaved changes in an open tab. Move anyway?')) {
+      return;
+    }
+    const result = await window.api.files.move(payload.path, rootPath, pathType, rootPath);
+    if (!result.ok) {
+      window.alert(result.error);
+      return;
+    }
+    if (result.path) renameTabPath(payload.path, result.path);
+    cache.current.delete(parentPathOf(payload.path));
+    cache.current.delete(rootPath);
+    await reloadRoot();
+  }, [hasDirtyTabForPath, pathType, reloadRoot, renameTabPath, rootPath]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -148,7 +198,15 @@ export default function DirectoryTree({ rootPath, pathType, activeFilePath, onFi
           <Icons.RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
         </button>
       </div>
-      <div key={refreshTick} className="flex-1 overflow-y-auto overflow-x-hidden py-1 scrollbar-thin">
+      <div
+        key={refreshTick}
+        className={`flex-1 overflow-y-auto overflow-x-hidden py-1 scrollbar-thin ${
+          isRootDropTarget ? 'ring-1 ring-inset ring-accent-blue/40' : ''
+        }`}
+        onDragOver={handleRootDragOver}
+        onDragLeave={handleRootDragLeave}
+        onDrop={handleRootDrop}
+      >
         {loading ? (
           <div className="px-3 py-4 text-[13px] text-gray-400 font-sans animate-pulse">Loading...</div>
         ) : rootEntries.length === 0 ? (

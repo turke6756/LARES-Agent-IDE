@@ -558,7 +558,8 @@ async function BR_13_endsWithQuestionTakesPriorityOverTurnComplete(): Promise<vo
 
 async function BR_15_notifyUserInputClearsLatchOnWaiting(): Promise<void> {
   const f = makeFakeBridgeDeps();
-  const worker = makeAgent('w-w1', { provider: 'claude', status: 'waiting' });
+  // Unsupervised so the paste-race-fix gate does not short-circuit.
+  const worker = makeAgent('w-w1', { provider: 'claude', status: 'waiting', isSupervised: false });
   f.agents.set(worker.id, worker);
   const bridge = new EventBridge(f.deps);
 
@@ -573,13 +574,28 @@ async function BR_15_notifyUserInputClearsLatchOnWaiting(): Promise<void> {
 
 async function BR_15_notifyUserInputNoopWhenNotWaiting(): Promise<void> {
   const f = makeFakeBridgeDeps();
-  const worker = makeAgent('w-w2', { provider: 'claude', status: 'working' });
+  const worker = makeAgent('w-w2', { provider: 'claude', status: 'working', isSupervised: false });
   f.agents.set(worker.id, worker);
   const bridge = new EventBridge(f.deps);
 
   bridge.notifyUserInputDelivered(worker.id);
   assert.equal(f.statusForceCalls.length, 0, 'BR-15: no-op when target is not waiting');
   console.log('  BR-15 ✓ notifyUserInputDelivered is a no-op outside waiting');
+}
+
+async function BR_15_notifyUserInputSkippedForSupervised(): Promise<void> {
+  // Paste-race fix (BUG-10): supervised workers' idle→working is owned
+  // exclusively by the UserPromptSubmit hook. notifyUserInputDelivered must
+  // NOT seed a working latch even when the agent is currently waiting.
+  const f = makeFakeBridgeDeps();
+  const worker = makeAgent('w-w3', { provider: 'claude', status: 'waiting', isSupervised: true });
+  f.agents.set(worker.id, worker);
+  const bridge = new EventBridge(f.deps);
+
+  bridge.notifyUserInputDelivered(worker.id);
+  assert.equal(f.statusForceCalls.length, 0,
+    'supervised + waiting: forceWorking must be skipped (start hook owns the transition)');
+  console.log('  BR-15 ✓ supervised → notifyUserInputDelivered is a no-op');
 }
 
 async function BR_20_waitingToWorkingIsSuppressed(): Promise<void> {
@@ -897,8 +913,125 @@ async function BUG_18_userTextDoesNotMarkTurnInFlight(): Promise<void> {
   console.log('  BUG-18 Change 3 ✓ user-text omits turnInFlight (non-regression)');
 }
 
+// ── BUG-22 Step 1: tmux_new_session_failed bridge wiring ───────────────
+
+async function BUG_22_tmuxFailureDeliversWithDistinctHeader(): Promise<void> {
+  // Supervised worker fails to launch under WSL. The runner emits
+  // `tmuxNewSessionFailed`; the supervisor wires it into the bridge's
+  // `onTmuxNewSessionFailed` method. The bridge must deliver the event to
+  // the supervisor with the distinct dashboard header, not folded into
+  // `Agent status changed`.
+  const f = makeFakeBridgeDeps();
+  const supervisor = makeAgent('sup-1', {
+    isSupervisor: true,
+    isSupervised: false,
+    status: 'idle',
+  });
+  const worker = makeAgent('w-1', { status: 'launching' });
+  f.agents.set(supervisor.id, supervisor);
+  f.agents.set(worker.id, worker);
+  const bridge = new EventBridge(f.deps);
+
+  await bridge.onTmuxNewSessionFailed({
+    agent: worker,
+    tmuxSessionName: 'cad__worker__w-1abcde',
+    command: "cd '/wd' && claude --foo",
+    tmuxExitCode: 1,
+    tmuxStderr: 'bash: syntax error',
+    tmuxCommand: "tmux new-session ...",
+  });
+
+  assert.equal(f.sendInputCalls.length, 1, 'BUG-22: failure event reaches supervisor exactly once');
+  const sent = f.sendInputCalls[0];
+  assert.equal(sent.agentId, supervisor.id);
+  assert.ok(
+    sent.text.startsWith('[DASHBOARD EVENT] WSL tmux session creation failed'),
+    `BUG-22: must use the distinct header; got: ${sent.text.slice(0, 80)}`,
+  );
+  assert.match(sent.text, /cad__worker__w-1abcde/);
+  assert.match(sent.text, /tmux exit code: 1/);
+  assert.match(sent.text, /bash: syntax error/);
+
+  // Audit row recorded so /events shows the failure independent of supervisor delivery state.
+  assert.equal(f.auditEvents.length, 1);
+  assert.equal(f.auditEvents[0].type, 'supervisor_event');
+  const audit = JSON.parse(f.auditEvents[0].payload);
+  assert.equal(audit.type, 'tmux_new_session_failed');
+  assert.equal(audit.agentId, worker.id);
+  console.log('  BUG-22 ✓ tmux_new_session_failed delivers to supervisor with distinct header');
+}
+
+async function BUG_22_tmuxFailureForSupervisorIsNoOpAtBridge(): Promise<void> {
+  // A supervisor's own launch failure has no parent supervisor to notify.
+  // The bridge must short-circuit cleanly (the addEvent audit + JSONL log
+  // are handled by other layers). This guards against accidentally trying
+  // to self-deliver, which would queue forever (the failing supervisor is
+  // the would-be recipient).
+  const f = makeFakeBridgeDeps();
+  const supervisor = makeAgent('sup-1', {
+    isSupervisor: true,
+    isSupervised: false,
+    status: 'launching',
+  });
+  f.agents.set(supervisor.id, supervisor);
+  const bridge = new EventBridge(f.deps);
+
+  await bridge.onTmuxNewSessionFailed({
+    agent: supervisor,
+    tmuxSessionName: 'cad__supervisor__sup-1',
+    command: 'claude',
+    tmuxExitCode: 1,
+    tmuxStderr: 'fail',
+    tmuxCommand: 'tmux',
+  });
+
+  assert.equal(f.sendInputCalls.length, 0, 'BUG-22: must not self-deliver a supervisor failure');
+  assert.equal(f.auditEvents.length, 0, 'BUG-22: bridge does not write an audit row for the no-recipient case');
+  console.log('  BUG-22 ✓ supervisor-side tmux failure is a no-op at the bridge');
+}
+
+async function BUG_22_tmuxFailureQueuesWhenSupervisorBusy(): Promise<void> {
+  // Same shape as BR-03 for status_change events: when the supervisor is
+  // working/launching, the failure event must queue and drain like any other
+  // event — not be silently dropped.
+  const f = makeFakeBridgeDeps();
+  const supervisor = makeAgent('sup-1', {
+    isSupervisor: true,
+    isSupervised: false,
+    status: 'working',
+  });
+  const worker = makeAgent('w-1', { status: 'launching' });
+  f.agents.set(supervisor.id, supervisor);
+  f.agents.set(worker.id, worker);
+  const bridge = new EventBridge(f.deps);
+
+  await bridge.onTmuxNewSessionFailed({
+    agent: worker,
+    tmuxSessionName: 'cad__worker__w-1abcde',
+    command: 'cmd',
+    tmuxExitCode: 1,
+    tmuxStderr: 'fail',
+    tmuxCommand: 'tmux',
+  });
+
+  assert.equal(f.sendInputCalls.length, 0, 'BUG-22: queued, not delivered while supervisor busy');
+  assert.equal(bridge.getQueueSnapshot().length, 1, 'BUG-22: event sitting in queue');
+
+  supervisor.status = 'idle';
+  await bridge.drainPendingFor(supervisor.id);
+
+  assert.equal(f.sendInputCalls.length, 1, 'BUG-22: drained once supervisor goes idle');
+  // Single-event drain uses buildEventPayload, so it retains the distinct
+  // header rather than the consolidated digest format.
+  assert.ok(
+    f.sendInputCalls[0].text.startsWith('[DASHBOARD EVENT] WSL tmux session creation failed'),
+    'BUG-22: drained payload keeps distinct header for single-event case',
+  );
+  console.log('  BUG-22 ✓ failure event queues + drains through normal path');
+}
+
 async function main(): Promise<void> {
-  console.log('event-bridge.test: running BR-01..BR-20 + BUG-18');
+  console.log('event-bridge.test: running BR-01..BR-20 + BUG-18 + BUG-22');
   await BR_01_happyPath();
   await BR_02_crashViaRunnerExit();
   await BR_02b_runnerExitBypassesCooldown();
@@ -914,6 +1047,7 @@ async function main(): Promise<void> {
   await BR_13_endsWithQuestionTakesPriorityOverTurnComplete();
   await BR_15_notifyUserInputClearsLatchOnWaiting();
   await BR_15_notifyUserInputNoopWhenNotWaiting();
+  await BR_15_notifyUserInputSkippedForSupervised();
   await BR_19_geminiTurnCompleteFiresForceIdle_postBug09();
   await BR_20_waitingToWorkingIsSuppressed();
   await onChatEvents_codexTurnComplete();
@@ -928,6 +1062,9 @@ async function main(): Promise<void> {
   await BUG_18_thinkingForceWorkingUsesThinkingPending();
   await BUG_18_endToEndTurnInFlightSetAndCleared();
   await BUG_18_userTextDoesNotMarkTurnInFlight();
+  await BUG_22_tmuxFailureDeliversWithDistinctHeader();
+  await BUG_22_tmuxFailureForSupervisorIsNoOpAtBridge();
+  await BUG_22_tmuxFailureQueuesWhenSupervisorBusy();
   console.log('event-bridge.test: all tests passed');
 }
 

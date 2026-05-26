@@ -276,19 +276,65 @@ export async function tmuxListSessions(): Promise<TmuxSession[]> {
   });
 }
 
-export async function tmuxNewSession(name: string, workDir: string, command: string): Promise<void> {
-  // Create session with the command as the pane process.
-  // When the command exits, the tmux pane/session closes automatically,
-  // which causes `tmux attach` in the PTY to exit → proper status update.
-  // Use bash -lic (login + interactive) to ensure .bashrc aliases/venv are loaded.
-  const escapedCmd = command.replace(/'/g, "'\\''");
-  const result = await wslExec(
-    `tmux new-session -d -s '${name}' -c '${workDir}' -- bash -lic '${escapedCmd}'`,
-    15000
-  );
-  if (result.exitCode !== 0) {
-    throw new Error(`Failed to create tmux session: ${result.stderr}`);
-  }
+export function buildTmuxNewSessionCommand(name: string, workDir: string, command: string): string {
+  // L-A / BUG-22: base64-envelope the command body so the outer shell layer
+  // never needs to escape single quotes, dollar signs, backticks, newlines,
+  // or embedded `$(...)` substitutions intended for the inner bash. The
+  // base64 alphabet (A-Za-z0-9+/=) contains no shell-special characters, so
+  // the outer wsl-bash sees an opaque payload — no quoting class to break.
+  // The outer `"$(...)"` substitution decodes once and feeds the result as a
+  // single argument to `bash -lic`, which is identical to the prior
+  // `bash -lic '<cmd>'` shape but immune to quoting drift in `command`.
+  //
+  // First-launch silent-exit fix: prepend `setsid` so the tmux server starts
+  // in its own session, fully detached from the calling wsl.exe process
+  // group. Without this, when wsl.exe exits after `tmux new-session -d`
+  // returns 0, claude's TUI startup (isatty / controlling-terminal probe)
+  // trips on the closing pgroup and exits silently — wasting a restart
+  // cycle on every first launch. setsid makes the tmux daemon its own
+  // session leader so claude's pane survives wsl.exe shutdown.
+  const b64 = Buffer.from(command, 'utf8').toString('base64');
+  return `setsid tmux new-session -d -s '${name}' -c '${workDir}' -- bash -lic "$(echo ${b64} | base64 -d)"`;
+}
+
+export interface TmuxNewSessionResult {
+  ok: boolean;
+  exitCode: number | null;
+  stdout: string;
+  stderr: string;
+  /** Fully-rendered outer `tmux new-session ...` command (base64-enveloped
+   *  payload) that was handed to wslExec — distinct from the inner shell
+   *  command passed in by the caller. Captured for diagnostic logging
+   *  (BUG-22 Step 1). */
+  tmuxCommand: string;
+}
+
+export async function tmuxNewSession(
+  name: string,
+  workDir: string,
+  command: string,
+  // Default `wslExec` is wired in production; tests inject a stub so the
+  // unit boundary doesn't have to spawn wsl.exe. The signature matches the
+  // overload `tmuxNewSession` calls today.
+  exec: (cmd: string, timeout: number) => Promise<WslExecResult> = wslExec,
+): Promise<TmuxNewSessionResult> {
+  // Create session with the command as the pane process. When the command
+  // exits, the tmux pane/session closes automatically, which causes
+  // `tmux attach` in the PTY to exit → proper status update. Use bash -lic
+  // (login + interactive) so .bashrc aliases / venv activation hooks fire.
+  //
+  // BUG-22 Step 1: return a structured result instead of throwing on non-zero
+  // exit. Normal tmux failures are data the caller needs for diagnostics, not
+  // exceptions to catch. wslExec already returns exitCode and never throws.
+  const tmuxCommand = buildTmuxNewSessionCommand(name, workDir, command);
+  const result = await exec(tmuxCommand, 15000);
+  return {
+    ok: result.exitCode === 0,
+    exitCode: result.exitCode,
+    stdout: result.stdout,
+    stderr: result.stderr,
+    tmuxCommand,
+  };
 }
 
 export async function tmuxSendKeys(name: string, text: string): Promise<void> {
@@ -425,6 +471,42 @@ export async function tmuxKillSession(name: string): Promise<void> {
 export async function isTmuxSessionAlive(name: string): Promise<boolean> {
   const result = await wslExec(`tmux has-session -t '${name}' 2>/dev/null && echo yes || echo no`);
   return result.stdout === 'yes';
+}
+
+/**
+ * Build the bash command the PTY runs to attach to a tmux session.
+ *
+ * Adds a `tmux has-session` poll-until-success guard before the attach so the
+ * first-launch race documented in `plans/bug-supervisor-wsl-launch-investigation.md`
+ * (Bug B, candidate 1) self-heals instead of crashing.
+ *
+ * The race: `tmuxNewSession` returns as soon as `tmux new-session -d` forks
+ * the pane process, not when the session is fully ready for clients. The
+ * subsequent `wsl.exe bash -lc 'tmux attach -t <name>'` can hit the server
+ * before the session registers and exit 1 with `can't find session: <name>`.
+ * That looks to the dashboard like an immediate `crashed (exitCode:1)`,
+ * which triggers `auto_restart`. The restart uses `resume=true`, which skips
+ * the supervisor/worker command wrap (index.ts:1421) — so the second attempt
+ * succeeds and pollutes the lifecycle history with a phantom crash + ~13s of
+ * recovery latency every cold WSL Claude launch.
+ *
+ * Poll cadence: up to 30 × 100ms = 3s. If the session genuinely never
+ * appears (e.g. the wrapped command died inside the pane before the
+ * dashboard ever attached, candidates 2 and 3 in the investigation file),
+ * the loop falls through and the bare `tmux attach` still runs — the dashboard
+ * sees the same `can't find session` exit-1 it sees today, just delayed by
+ * the poll budget. So this fix is strictly defensive: it can fix the race,
+ * never makes other failure modes worse.
+ *
+ * Builder is exported so the shape (poll guard present, session name quoted)
+ * can be asserted in a unit test without spawning wsl.exe.
+ */
+export function buildTmuxAttachCmd(name: string): string {
+  const attempts = Array.from({ length: 30 }, (_, i) => String(i + 1)).join(' ');
+  return (
+    `for i in ${attempts}; do tmux has-session -t '${name}' 2>/dev/null && break; sleep 0.1; done; ` +
+    `tmux attach -t '${name}'`
+  );
 }
 
 export async function tmuxCapturePane(name: string, lines = 50): Promise<string> {

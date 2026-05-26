@@ -1,10 +1,11 @@
 import React, { useEffect, useRef } from 'react';
 import { EditorState } from '@codemirror/state';
-import { EditorView, keymap, ViewUpdate } from '@codemirror/view';
+import { EditorView, keymap, ViewUpdate, drawSelection, highlightActiveLine } from '@codemirror/view';
 import { defaultKeymap, history, historyKeymap } from '@codemirror/commands';
 import { markdown } from '@codemirror/lang-markdown';
 import { oneDark } from '@codemirror/theme-one-dark';
 import { useThemeStore } from '../../stores/theme-store';
+import { getTabScrollFraction } from './scrollMemory';
 
 interface Props {
   initialContent: string;
@@ -13,6 +14,7 @@ interface Props {
   error?: string | null;
   onChange: (content: string) => void;
   onSave: () => void;
+  tabId?: string;
 }
 
 const editorTheme = EditorView.theme({
@@ -40,8 +42,20 @@ const editorTheme = EditorView.theme({
     color: 'var(--color-fg-muted)',
     borderRight: '1px solid var(--color-surface-3)',
   },
-  '.cm-activeLineGutter, .cm-activeLine': {
-    backgroundColor: 'rgba(255, 255, 255, 0.04)',
+  '.cm-activeLine': {
+    backgroundColor: 'rgba(102, 204, 255, 0.10)',
+  },
+  '.cm-activeLineGutter': {
+    backgroundColor: 'rgba(102, 204, 255, 0.10)',
+    color: 'var(--color-fg-primary)',
+  },
+  '.cm-cursor, .cm-dropCursor': {
+    borderLeftColor: '#66ccff',
+    borderLeftWidth: '2px',
+  },
+  '.cm-focused .cm-cursor': {
+    borderLeftColor: '#66ccff',
+    borderLeftWidth: '2px',
   },
 });
 
@@ -52,6 +66,7 @@ export default function CodeMirrorEditor({
   error,
   onChange,
   onSave,
+  tabId,
 }: Props) {
   const theme = useThemeStore((state) => state.theme);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -59,17 +74,21 @@ export default function CodeMirrorEditor({
   const onChangeRef = useRef(onChange);
   const onSaveRef = useRef(onSave);
   const initialContentRef = useRef(initialContent);
+  const tabIdRef = useRef(tabId);
 
   useEffect(() => {
     onChangeRef.current = onChange;
     onSaveRef.current = onSave;
-  }, [onChange, onSave]);
+    tabIdRef.current = tabId;
+  }, [onChange, onSave, tabId]);
 
   useEffect(() => {
     if (!containerRef.current) return;
 
     const extensions = [
       history(),
+      drawSelection(),
+      highlightActiveLine(),
       EditorView.lineWrapping,
       editorTheme,
       keymap.of([
@@ -107,6 +126,21 @@ export default function CodeMirrorEditor({
       parent: containerRef.current,
     });
     viewRef.current = view;
+
+    // Place the cursor where the user was viewing in the rendered view, so
+    // entering edit mode doesn't snap to the top of the file and the caret
+    // makes it obvious where typing will land.
+    const fraction = tabIdRef.current ? getTabScrollFraction(tabIdRef.current) : 0;
+    const totalLines = view.state.doc.lines;
+    const targetLine = fraction > 0
+      ? Math.max(1, Math.min(totalLines, Math.round(totalLines * fraction)))
+      : 1;
+    const lineInfo = view.state.doc.line(targetLine);
+    view.dispatch({
+      selection: { anchor: lineInfo.from },
+      effects: EditorView.scrollIntoView(lineInfo.from, { y: 'center' }),
+    });
+    view.focus();
 
     return () => {
       view.destroy();

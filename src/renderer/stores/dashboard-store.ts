@@ -73,6 +73,9 @@ interface TabEditState {
   dirty: boolean;
   saving: boolean;
   error: string | null;
+  externalChange?: boolean;
+  pendingDiskContent?: string;
+  reloadVersion?: number;
 }
 
 interface DashboardState {
@@ -149,6 +152,10 @@ interface DashboardState {
   setDraftContent: (tabId: string, content: string) => void;
   saveTab: (tabId: string) => Promise<boolean>;
   discardTabChanges: (tabId: string) => void;
+  markExternalChange: (tabId: string, freshContent: string) => void;
+  dismissExternalChange: (tabId: string) => void;
+  reloadFromDisk: (tabId: string) => void;
+  refreshOriginalContent: (tabId: string, freshContent: string) => void;
   closeTabsForPath: (path: string) => void;
   renameTabPath: (oldPath: string, newPath: string) => void;
   hasDirtyTabForPath: (path: string) => boolean;
@@ -438,6 +445,85 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
             dirty: false,
             saving: false,
             error: null,
+            externalChange: false,
+            pendingDiskContent: undefined,
+          },
+        },
+      };
+    });
+  },
+
+  markExternalChange: (tabId, freshContent) => {
+    set((state) => {
+      const existing = state.tabEditState[tabId];
+      if (!existing) return state;
+      if (existing.pendingDiskContent === freshContent && existing.externalChange) return state;
+      return {
+        tabEditState: {
+          ...state.tabEditState,
+          [tabId]: {
+            ...existing,
+            externalChange: true,
+            pendingDiskContent: freshContent,
+          },
+        },
+      };
+    });
+  },
+
+  dismissExternalChange: (tabId) => {
+    set((state) => {
+      const existing = state.tabEditState[tabId];
+      if (!existing) return state;
+      return {
+        tabEditState: {
+          ...state.tabEditState,
+          [tabId]: {
+            ...existing,
+            externalChange: false,
+            pendingDiskContent: undefined,
+          },
+        },
+      };
+    });
+  },
+
+  reloadFromDisk: (tabId) => {
+    set((state) => {
+      const existing = state.tabEditState[tabId];
+      if (!existing || existing.pendingDiskContent === undefined) return state;
+      const fresh = existing.pendingDiskContent;
+      return {
+        tabEditState: {
+          ...state.tabEditState,
+          [tabId]: {
+            ...existing,
+            draftContent: fresh,
+            originalContent: fresh,
+            dirty: false,
+            error: null,
+            externalChange: false,
+            pendingDiskContent: undefined,
+            reloadVersion: (existing.reloadVersion ?? 0) + 1,
+          },
+        },
+      };
+    });
+  },
+
+  refreshOriginalContent: (tabId, freshContent) => {
+    set((state) => {
+      const existing = state.tabEditState[tabId];
+      if (!existing) return state;
+      if (existing.dirty) return state;
+      if (existing.originalContent === freshContent) return state;
+      return {
+        tabEditState: {
+          ...state.tabEditState,
+          [tabId]: {
+            ...existing,
+            originalContent: freshContent,
+            draftContent: freshContent,
           },
         },
       };
@@ -665,7 +751,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
   forkAgent: async (id) => {
     try {
       const forked = await window.api.agents.fork(id);
-      set((state) => ({ agents: [forked, ...state.agents] }));
+      set((state) => ({ agents: [...state.agents, forked] }));
       get().updateWorkspaceHeat();
       return forked;
     } catch (err) {

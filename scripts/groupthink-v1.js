@@ -128,6 +128,75 @@ async function apiJson(base, method, apiPath, body) {
   return res.json;
 }
 
+// Send a terminal notification (groupthink.complete / groupthink.stalled) to the
+// supervisor with retry-on-409. The dashboard's /input gate rejects POSTs when
+// the target agent is in `working` state — see BUG-09 enforcement arm in
+// src/main/database.ts. The supervisor's protective working latch can hold for
+// minutes after it stops actually working, so a fire-and-forget POST is
+// fragile. We poll until idle/waiting (or timeout) before each attempt and
+// retry on transient 409s. On persistent failure we write a sentinel file so
+// the result isn't silently lost; the supervisor (or a human) can recover it.
+async function deliverToSupervisor(base, supervisorId, text, opts = {}) {
+  const maxAttempts = opts.maxAttempts ?? 12;
+  const intervalMs = opts.intervalMs ?? 5_000;
+  const startedAt = Date.now();
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      let supervisorStatus = null;
+      try {
+        const sup = await apiJson(base, 'GET', `/api/agents/${supervisorId}`);
+        supervisorStatus = sup && sup.status;
+      } catch (e) {
+        // GET failures don't disqualify the attempt — fall through to POST.
+        log('WARN', `Supervisor status fetch failed (attempt ${attempt}/${maxAttempts}): ${e.message}`);
+      }
+      if (supervisorStatus && !READY_STATUSES.has(supervisorStatus)) {
+        log('INFO', `Supervisor not ready (status=${supervisorStatus}); waiting ${intervalMs}ms ` +
+                    `(attempt ${attempt}/${maxAttempts})`);
+        await sleep(intervalMs);
+        continue;
+      }
+      await apiJson(base, 'POST', `/api/agents/${supervisorId}/input`, { text });
+      if (attempt > 1) {
+        log('INFO', `Supervisor delivery succeeded on attempt ${attempt}/${maxAttempts}`);
+      }
+      return { ok: true, attempts: attempt, elapsedMs: Date.now() - startedAt };
+    } catch (err) {
+      if (err && err.status === 409 && attempt < maxAttempts) {
+        log('WARN', `Supervisor /input rejected with 409 (attempt ${attempt}/${maxAttempts}); ` +
+                    `retrying in ${intervalMs}ms`);
+        await sleep(intervalMs);
+        continue;
+      }
+      // Non-409 error or out of attempts → write sentinel and surface failure.
+      const sentinelDir = path.join('plans', '.runs');
+      try { fs.mkdirSync(sentinelDir, { recursive: true }); } catch {}
+      const sentinelPath = path.join(
+        sentinelDir,
+        `groupthink-undelivered-${new Date().toISOString().replace(/[:.]/g, '-')}.json`,
+      );
+      const payload = {
+        supervisorId,
+        text,
+        attempts: attempt,
+        elapsedMs: Date.now() - startedAt,
+        lastError: { status: err && err.status, message: err && err.message },
+        capturedAt: new Date().toISOString(),
+      };
+      try {
+        fs.writeFileSync(sentinelPath, JSON.stringify(payload, null, 2));
+        log('ERROR', `Supervisor delivery failed after ${attempt} attempts. ` +
+                     `Sentinel written: ${sentinelPath}`);
+      } catch (writeErr) {
+        log('ERROR', `Supervisor delivery failed AND sentinel write failed: ${writeErr.message}`);
+      }
+      return { ok: false, attempts: attempt, elapsedMs: Date.now() - startedAt, sentinelPath };
+    }
+  }
+  return { ok: false, attempts: maxAttempts, elapsedMs: Date.now() - startedAt };
+}
+
 async function connectApi(host, ports) {
   let lastError = null;
   for (const port of ports) {
@@ -160,6 +229,23 @@ async function waitReady(base, agentId, label, timeoutMs = 300000) {
     await sleep(POLL_INTERVAL_MS);
   }
   throw new Error(`Timeout waiting for ${label} (${agentId})`);
+}
+
+async function waitReceiverReady(base, agentId, label, timeoutMs = 600000) {
+  // BUG-17b: the /input endpoint returns HTTP 409 when the receiver is still
+  // working/launching or has input-in-flight. Poll status until idle/waiting
+  // before relaying so a slow receiver produces a clean stall (exit 2 with
+  // resume_hint) instead of a 409 crash (exit 1, orphaned agents).
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const agent = await apiJson(base, 'GET', `/api/agents/${agentId}`);
+    if (agent.status === 'crashed' || agent.status === 'done') {
+      throw new Error(`${label} (${agentId}) exited with status=${agent.status} before accepting relay`);
+    }
+    if (READY_STATUSES.has(agent.status)) return agent;
+    await sleep(POLL_INTERVAL_MS);
+  }
+  throw new Error(`STALL: Timeout waiting for ${label} (${agentId}) to become ready for relay`);
 }
 
 async function readNextMessage(base, agentId) {
@@ -276,6 +362,7 @@ async function main() {
         title: `Lead Planner (GroupThink)`,
         roleDescription: "Lead planner in charge of making the final call. You will receive feedback from a reviewer.",
         provider: args.leadProvider || 'claude',
+        freshSession: true,
         systemPrompt: `You are the Lead Planner in a GroupThink deliberation.
 
 Topic: ${topic}
@@ -289,6 +376,7 @@ Termination contract: write the plan file to ${planPath} ONLY after the Reviewer
 Begin by producing your first draft of the plan as your next message.`
       });
       leadAgentId = lead.id;
+      await seedLastRelayedTsFromChat(base, lead.id, 'Lead');
   }
 
   if (reviewerAgentId) {
@@ -301,6 +389,7 @@ Begin by producing your first draft of the plan as your next message.`
         title: `Reviewer (GroupThink)`,
         roleDescription: "Reviewer agent providing feedback to the Lead Planner.",
         provider: args.reviewerProvider || 'codex',
+        freshSession: true,
         systemPrompt: `You are the Reviewer in a GroupThink deliberation.
 
 Topic: ${topic}
@@ -314,6 +403,7 @@ Approval contract: the Lead is instructed NOT to finalize the plan file until yo
 Wait for the Lead's first draft; your first message will be your response to it.`
       });
       reviewerAgentId = reviewer.id;
+      await seedLastRelayedTsFromChat(base, reviewer.id, 'Reviewer');
   }
 
   log('INFO', `Active Lead: ${lead.id}, Reviewer: ${reviewer.id}`);
@@ -339,6 +429,7 @@ Wait for the Lead's first draft; your first message will be your response to it.
             break;
         }
         log('INFO', `Relaying Lead -> Reviewer`);
+        await waitReceiverReady(base, reviewer.id, 'Reviewer', turnTimeoutMs);
         await apiJson(base, 'POST', `/api/agents/${reviewer.id}/input`, {
             text: `Feedback from Lead Planner:\n\n${leadMsg.content}\n\nWhat is your review?`
         });
@@ -348,6 +439,7 @@ Wait for the Lead's first draft; your first message will be your response to it.
         lastRelayedTs[reviewer.id] = revMsg.ts;
 
         log('INFO', `Relaying Reviewer -> Lead`);
+        await waitReceiverReady(base, lead.id, 'Lead', turnTimeoutMs);
         await apiJson(base, 'POST', `/api/agents/${lead.id}/input`, {
             text: `Reviewer Feedback:\n\n${revMsg.content}\n\nRespond to this feedback or finalize the plan.`
         });
@@ -365,7 +457,9 @@ Wait for the Lead's first draft; your first message will be your response to it.
       if (err.message.startsWith("STALL") || err.message.includes("Timeout")) {
           log('WARN', `GroupThink stalled: ${err.message}`);
           const event = {
-              reason: err.message.includes("Max turns") ? "turn_cap_reached" : "timeout",
+              reason: err.message.includes("Max turns") ? "turn_cap_reached"
+                    : err.message.includes("ready for relay") ? "receiver_not_ready"
+                    : "timeout",
               topic,
               turns: turn,
               planners: [
@@ -375,9 +469,11 @@ Wait for the Lead's first draft; your first message will be your response to it.
               planPath,
               resume_hint: `node scripts/groupthink-v1.js --workspaceId=${workspaceId} --supervisorId=${supervisorId} --resume-lead-id=${members.lead.id} --resume-reviewer-id=${members.reviewer.id} --topic="${topic}" --planPath="${planPath}" --turn-timeout-ms=${turnTimeoutMs}`
           };
-          await apiJson(base, 'POST', `/api/agents/${supervisorId}/input`, {
-              text: `[DASHBOARD EVENT] orchestration.groupthink.stalled\n${JSON.stringify(event, null, 2)}`
-          });
+          await deliverToSupervisor(
+            base,
+            supervisorId,
+            `[DASHBOARD EVENT] orchestration.groupthink.stalled\n${JSON.stringify(event, null, 2)}`,
+          );
           process.exit(2);
       }
       throw err;
@@ -394,14 +490,25 @@ Wait for the Lead's first draft; your first message will be your response to it.
       }
   }
 
-  await apiJson(base, 'POST', `/api/agents/${supervisorId}/input`, {
-      text: `[DASHBOARD EVENT] groupthink.complete: Plan produced at ${planPath}. Members: ${members.lead.sid}, ${members.reviewer.sid}`
-  });
+  const deliveryResult = await deliverToSupervisor(
+    base,
+    supervisorId,
+    `[DASHBOARD EVENT] groupthink.complete: Plan produced at ${planPath}. Members: ${members.lead.sid}, ${members.reviewer.sid}`,
+  );
+  if (!deliveryResult.ok) {
+    log('ERROR', `Supervisor never received groupthink.complete (sentinel: ${deliveryResult.sentinelPath}). ` +
+                 `Cleanup will proceed anyway so planners aren't orphaned.`);
+  }
 
   if (!args.keepAgents) {
-      await apiJson(base, 'DELETE', `/api/agents/${lead.id}`);
-      await apiJson(base, 'DELETE', `/api/agents/${reviewer.id}`);
-      log('INFO', "Agents cleaned up.");
+      try {
+        await apiJson(base, 'DELETE', `/api/agents/${lead.id}`);
+        await apiJson(base, 'DELETE', `/api/agents/${reviewer.id}`);
+        log('INFO', "Agents cleaned up.");
+      } catch (err) {
+        log('WARN', `Planner cleanup failed (lead=${lead.id} reviewer=${reviewer.id}): ${err.message}. ` +
+                    `Planners left alive; supervisor or user can clean up manually.`);
+      }
   }
 }
 

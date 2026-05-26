@@ -66,6 +66,34 @@ export class ContextStatsMonitor extends EventEmitter {
     this.reader.pollNow();
   }
 
+  /**
+   * BUG-26 Layer 3: drop every cached scrap of derived state for an agent
+   * whose chat-side session id was just (re)bound. Called from the
+   * supervisor's `'agent-rebound'` listener so the next `getStats(agentId)`
+   * returns `null` instead of last-writer-wins misattributed stats from a
+   * wrong rollout. Subsequent legitimate `usage` / `tool-use` / `tool-result`
+   * events repopulate.
+   *
+   * No `'statsChanged'` emission — the cleared state is the absence of
+   * stats, not a new stats snapshot, and the next legitimate `handleUsage`
+   * will fire `'statsChanged'` with real numbers.
+   *
+   * Also clears the per-agent `seenFiles` dedupe so a previously-emitted
+   * `(op, path)` will re-emit a `fileActivity` event when the freshly-bound
+   * rollout's tool-use lands — important after `deleteFileActivitiesForAgent`
+   * wipes the DB rows, since otherwise the dedupe set would prevent the
+   * re-insertion of the agent's own (now-correctly-attributed) activity.
+   */
+  invalidateAgent(agentId: string): void {
+    this.stats.delete(agentId);
+    this.seenUuids.delete(agentId);
+    this.seenFiles.delete(agentId);
+    const prefix = `${agentId}:`;
+    for (const key of this.pendingShellActivity.keys()) {
+      if (key.startsWith(prefix)) this.pendingShellActivity.delete(key);
+    }
+  }
+
   private handleUsage = (e: UsageEvent): void => {
     // Dedupe by event uuid — the reader already byte-offset tails, but
     // invalidatePath() + pollNow could theoretically replay.

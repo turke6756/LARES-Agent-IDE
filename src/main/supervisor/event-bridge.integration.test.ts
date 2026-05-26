@@ -47,7 +47,7 @@ import {
   SUPERVISOR_EVENT_COOLDOWN_MS,
   WORKING_THRESHOLD_MS,
 } from '../../shared/constants';
-import type { Agent, ContextStats } from '../../shared/types';
+import type { Agent, ContextStats, FileActivity } from '../../shared/types';
 import type { StatusChangedEvent } from './status-events';
 import type {
   AssistantTextEvent,
@@ -80,6 +80,10 @@ interface Harness {
   sendInputCalls: SendInputRecord[];
   audits: AuditRecord[];
   now: { value: number };
+  /** BUG-20: per-agent stubs for the chat-first preview + file-activities
+   *  bridge deps. Set via the maps; the harness's deps read from them. */
+  lastAssistantMessages: Map<string, string>;
+  fileActivities: Map<string, FileActivity[]>;
   /** Override the bridge's `getSupervisorForWorker` dep (MS-XX uses this to
    *  install post-migration `supervisorId`-based resolution). */
   setOwnerResolver(fn: ((worker: Agent) => Agent | null) | null): void;
@@ -103,6 +107,8 @@ function makeHarness(): Harness {
   const logs = new Map<string, string>();
   const sendInputCalls: SendInputRecord[] = [];
   const audits: AuditRecord[] = [];
+  const lastAssistantMessages = new Map<string, string>();
+  const fileActivities = new Map<string, FileActivity[]>();
   let ownerResolver: ((worker: Agent) => Agent | null) | null = null;
 
   const monitor = new StatusMonitor(
@@ -146,6 +152,15 @@ function makeHarness(): Harness {
       forceWaiting: (id, kind, excerpt) => monitor.forceWaiting(id, kind, excerpt),
       forceWorking: (id, source) => monitor.forceWorking(id, source),
     },
+    // BUG-11: integration tests don't exercise the user-typing gate; return
+    // undefined so every event flows through as before.
+    getLastUserPtyWriteAt: () => undefined,
+    // BUG-20: the chat / file-activities deps. Default to empty so existing
+    // integration scenarios (which set up real chat events via the dispatcher
+    // path, not the supervisor preview path) keep their original payload
+    // shape; the BUG-20 scenarios populate the maps explicitly.
+    getLastAssistantMessage: async (id) => lastAssistantMessages.get(id),
+    getFileActivities: (id) => fileActivities.get(id) ?? [],
   };
   const bridge = new EventBridge(bridgeDeps);
 
@@ -175,6 +190,8 @@ function makeHarness(): Harness {
     sendInputCalls,
     audits,
     now: fakes.now,
+    lastAssistantMessages,
+    fileActivities,
     setOwnerResolver: (fn) => { ownerResolver = fn; },
     emitDirect: (data) => { emitter.emit('statusChanged', data); },
     settle: () => new Promise<void>((r) => setImmediate(r)),
@@ -665,6 +682,116 @@ async function MS_05_mcpLaunchedWorkerWithExplicitSupervisorId(): Promise<void> 
   } finally { h.dispose(); }
 }
 
+// ── BUG-20: chat-first preview + filesTouched ───────────────────────
+
+async function single_idle_chatFirstPreview_BUG_20(): Promise<void> {
+  // BUG-20 acceptance: an idle Claude worker's event must surface the agent's
+  // clean last assistant message (via the bridge's `getLastAssistantMessage`
+  // dep) instead of the PTY-frame logTail that today reliably grabs Claude
+  // Code TUI footer chrome. Also asserts the "Files touched:" section renders
+  // when file-activity rows are present.
+  const h = makeHarness();
+  try {
+    const sup = makeSup('sup-bug20');
+    const worker = makeWorker('w-bug20', { provider: 'claude' });
+    h.agents.set(sup.id, sup);
+    h.agents.set(worker.id, worker);
+
+    // Simulate Claude Code's TUI footer in the PTY tail and the real
+    // assistant message in the chat dep.
+    h.logs.set(worker.id, [
+      'Opus 4.7 (1M context) | C:\\foo\\bar | Style: default',
+      '⏵⏵ bypass permissions on (shift+tab to cycle)',
+      'running stop hook · 6s · ↓325 tokens',
+    ].join('\n'));
+    h.lastAssistantMessages.set(
+      worker.id,
+      'Bug fixed and tests added. Want me to commit the changes?',
+    );
+    h.fileActivities.set(worker.id, [
+      {
+        id: 1,
+        agentId: worker.id,
+        filePath: 'src/main/supervisor/event-payload-builder.ts',
+        operation: 'write',
+        timestamp: '2026-05-21T12:00:00Z',
+      },
+      {
+        id: 2,
+        agentId: worker.id,
+        filePath: 'src/main/supervisor/event-bridge.ts',
+        operation: 'read',
+        timestamp: '2026-05-21T11:59:00Z',
+      },
+    ]);
+
+    h.bridge.onChatEvents(batchOf(worker.id, [
+      assistantText(worker.id, { turnComplete: true, text: 'done' }),
+    ]));
+    await h.settle();
+
+    assert.equal(h.sendInputCalls.length, 1, 'BUG-20: one delivery');
+    const payload = h.sendInputCalls[0].text;
+    assert.match(
+      payload,
+      /Bug fixed and tests added\. Want me to commit the changes\?/,
+      'BUG-20: clean assistant message rendered in Last output',
+    );
+    assert.equal(payload.indexOf('⏵⏵'), -1, 'BUG-20: TUI ribbon must not leak');
+    assert.equal(payload.indexOf('Opus 4.7'), -1, 'BUG-20: TUI status bar must not leak');
+    assert.match(payload, /Files touched:/, 'BUG-20: section header rendered');
+    assert.match(payload, /> src\/main\/supervisor\/event-payload-builder\.ts \(write\)/);
+    assert.match(payload, /> src\/main\/supervisor\/event-bridge\.ts \(read\)/);
+    console.log('  single/idle/bug-20 ✓ chat-first preview + filesTouched');
+  } finally { h.dispose(); }
+}
+
+async function single_idle_fallbackOnChatError_BUG_20(): Promise<void> {
+  // BUG-20 acceptance #5: when `getLastAssistantMessage` throws, the bridge
+  // must degrade to today's PTY-tail rather than crashing the delivery. Same
+  // for `getFileActivities` — its failure must omit the section without
+  // dropping the event.
+  const h = makeHarness();
+  try {
+    const sup = makeSup('sup-bug20-err');
+    const worker = makeWorker('w-bug20-err', { provider: 'claude' });
+    h.agents.set(sup.id, sup);
+    h.agents.set(worker.id, worker);
+
+    h.logs.set(worker.id, 'real PTY-tail content line');
+    // Install throwing implementations by swapping deps after construction —
+    // simpler: monkey-patch on the bridge's deps view. The harness exposes
+    // the maps; we install one-shot rejections via local closure swaps.
+    const bridgeAny = h.bridge as unknown as { deps: { getLastAssistantMessage: (id: string) => Promise<string | undefined>; getFileActivities: (id: string) => unknown[] } };
+    const origChat = bridgeAny.deps.getLastAssistantMessage;
+    const origFiles = bridgeAny.deps.getFileActivities;
+    bridgeAny.deps.getLastAssistantMessage = async () => {
+      throw new Error('chat boom');
+    };
+    bridgeAny.deps.getFileActivities = () => {
+      throw new Error('files boom');
+    };
+
+    try {
+      h.bridge.onChatEvents(batchOf(worker.id, [
+        assistantText(worker.id, { turnComplete: true }),
+      ]));
+      await h.settle();
+
+      assert.equal(h.sendInputCalls.length, 1, 'BUG-20: still delivered despite dep errors');
+      const payload = h.sendInputCalls[0].text;
+      assert.match(payload, /> real PTY-tail content line/,
+        'BUG-20: logTail fallback when chat dep throws');
+      assert.equal(payload.indexOf('Files touched:'), -1,
+        'BUG-20: section omitted when files dep throws');
+    } finally {
+      bridgeAny.deps.getLastAssistantMessage = origChat;
+      bridgeAny.deps.getFileActivities = origFiles;
+    }
+    console.log('  single/idle/bug-20 ✓ degrades gracefully on dep errors');
+  } finally { h.dispose(); }
+}
+
 // ── Runner ──────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
@@ -674,6 +801,8 @@ async function main(): Promise<void> {
   await single_contextThreshold();
   await single_waiting_question_BR_13_20();
   await single_waiting_ttyPattern_BR_14();
+  await single_idle_chatFirstPreview_BUG_20();
+  await single_idle_fallbackOnChatError_BUG_20();
 
   if (RUN_MS) {
     console.log('event-bridge.integration.test: MULTI_SUPERVISOR=1 — running MS-01..MS-05');

@@ -53,8 +53,11 @@ export interface CodexSessionMeta {
  *
  * Resolution strategy:
  *  1. If `session.sessionId` is set, scan all dated rollout dirs for that id.
- *  2. Otherwise (post-launch, before discovery resolves) use cwd-match: read first line
- *     (`session_meta`) of recent rollouts and pick newest whose `payload.cwd` matches
+ *  2. Otherwise (agent record not yet bound to a codex session id), emit no
+ *     events. BUG-26: cwd-match is not a sufficient agent-identity signal
+ *     under concurrent same-cwd launches; recovery of lost session ids is
+ *     owned by `SupervisorService.recoverCodexResumeSessionId` which logs
+ *     explicitly and persists the recovered id to the DB.
  *
  * Per-turn duplicate handling: Codex 0.128 emits user/assistant text via BOTH
  * `event_msg/{user_message,agent_message}` AND `response_item/message role=user/assistant`.
@@ -452,12 +455,19 @@ export class CodexRolloutReader implements ChatLogReader {
     let windowFromInfo: number | undefined;
 
     if (info && typeof info === 'object') {
-      const usage = info.total_token_usage || info.last_token_usage;
+      // `last_token_usage` is the most recent API call's usage. Since Codex
+      // re-sends the entire conversation each turn (see codex PR #1641), its
+      // `input_tokens` IS current context occupancy. `total_token_usage` is
+      // cumulative across all calls in the session and would blow past the
+      // window after a handful of turns even when actual context is fine.
+      const usage = info.last_token_usage || info.total_token_usage;
       if (usage && typeof usage === 'object') {
         inputTokens = numOr0(usage.input_tokens);
         outputTokens = numOr0(usage.output_tokens);
+        // cached_input_tokens is a subset of input_tokens (the cache-hit
+        // portion), not additional — don't double-count.
         cachedTokens = numOr0(usage.cached_input_tokens ?? usage.cached_tokens);
-        totalTokens = numOr0(usage.total_tokens) || (inputTokens + outputTokens + cachedTokens);
+        totalTokens = numOr0(usage.total_tokens) || (inputTokens + outputTokens);
       }
       if (typeof info.model_context_window === 'number') {
         windowFromInfo = info.model_context_window;
@@ -474,7 +484,7 @@ export class CodexRolloutReader implements ChatLogReader {
       inputTokens = flatInput;
       outputTokens = flatOutput;
       cachedTokens = flatCached;
-      totalTokens = flatTotal || (flatInput + flatOutput + flatCached);
+      totalTokens = flatTotal || (flatInput + flatOutput);
     }
 
     if (inputTokens === 0 && outputTokens === 0 && cachedTokens === 0 && totalTokens === 0) {
@@ -485,7 +495,7 @@ export class CodexRolloutReader implements ChatLogReader {
     const stashWindow = this.modelContextWindow.get(session.agentId);
     const contextWindowMax =
       stashWindow ?? windowFromInfo ?? getContextWindowForModel(model) ?? DEFAULT_CONTEXT_WINDOW_TOKENS;
-    const cumulativeContextTokens = totalTokens || (inputTokens + outputTokens + cachedTokens);
+    const cumulativeContextTokens = totalTokens || (inputTokens + outputTokens);
     const contextPercentage = Math.min(
       100,
       Math.round((cumulativeContextTokens / contextWindowMax) * 100)
@@ -520,21 +530,23 @@ export class CodexRolloutReader implements ChatLogReader {
       this.resolvedPaths.delete(session.agentId);
     }
 
+    // BUG-26: when sessionId is empty (agent record not yet bound to a codex
+    // session id) we MUST NOT pick a rollout by cwd. The previous fallback
+    // (findByCwd) had no agent-identity signal: under concurrent same-cwd
+    // launches it mis-attributed events between peer agents, and on single
+    // launches it could grab a stale prior-day rollout whose session_meta
+    // happened to share the cwd. Recovery for unbound agents now lives
+    // exclusively in the supervisor layer (recoverCodexResumeSessionId →
+    // findCodexSessionIdByCwd), which logs explicitly and writes back to the
+    // DB. Unbound readers emit zero events until binding succeeds.
+    if (!session.sessionId) return null;
+
     const baseDirs = this.candidateBaseDirs(session);
     if (baseDirs.length === 0) return null;
 
-    if (session.sessionId) {
-      // Primary: glob rollout-*-<sessionId>.jsonl across all date dirs so old
-      // agents can reload history long after launch.
-      const found = this.findBySessionId(baseDirs, session.sessionId);
-      if (found) {
-        this.resolvedPaths.set(session.agentId, found);
-        return found;
-      }
-    }
-
-    // Fallback: cwd-match — newest rollout whose session_meta.cwd matches workingDirectory
-    const found = this.findByCwd(baseDirs, RECENT_CWD_DISCOVERY_DAYS, session.workingDirectory);
+    // Primary: glob rollout-*-<sessionId>.jsonl across all date dirs so old
+    // agents can reload history long after launch.
+    const found = this.findBySessionId(baseDirs, session.sessionId);
     if (found) {
       this.resolvedPaths.set(session.agentId, found);
       return found;
@@ -573,24 +585,6 @@ export class CodexRolloutReader implements ChatLogReader {
       }
     }
     return best ? best.p : null;
-  }
-
-  private findByCwd(baseDirs: string[], daysBack: number, workingDirectory: string): string | null {
-    type Candidate = { p: string; mtime: number };
-    const candidates: Candidate[] = [];
-    for (const baseDir of baseDirs) {
-      for (const file of listRolloutsInBaseDir(baseDir, daysBack)) {
-        candidates.push({ p: file.path, mtime: file.mtimeMs });
-      }
-    }
-    candidates.sort((a, b) => b.mtime - a.mtime);
-
-    const target = normalizeCwd(workingDirectory);
-    for (const c of candidates) {
-      const meta = readCodexSessionMeta(c.p);
-      if (meta.cwd && normalizeCwd(meta.cwd) === target) return c.p;
-    }
-    return null;
   }
 
   private isNewerThanPinned(version: string): boolean {
@@ -654,10 +648,6 @@ function safeMtime(p: string): number | null {
   } catch {
     return null;
   }
-}
-
-function normalizeCwd(p: string): string {
-  return p.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
 }
 
 export function readCodexSessionMeta(jsonlPath: string): CodexSessionMeta {

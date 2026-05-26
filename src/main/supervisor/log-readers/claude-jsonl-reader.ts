@@ -59,6 +59,41 @@ export class ClaudeJsonlReader implements ChatLogReader {
     this.eofStreak.delete(agentId);
   }
 
+  /** Return true if a Claude session JSONL exists on disk for the given working
+   *  directory + session id. Mirrors the lookup strategy of `resolveJsonlPath`
+   *  but without caching — used by resume-launch validation in supervisor/index.ts
+   *  to fall back to a fresh launch when the recorded resumeSessionId points at
+   *  a file Claude never managed to write. */
+  sessionFileExists(workingDirectory: string, sessionId: string): boolean {
+    const slug = this.makeSlug(workingDirectory);
+    const fileName = `${sessionId}.jsonl`;
+
+    if (workingDirectory.startsWith('/') && this.wslProjectsUncDir) {
+      const jsonlPath = path.join(this.wslProjectsUncDir, slug, fileName);
+      if (fs.existsSync(jsonlPath)) return true;
+    }
+
+    if (this.windowsProjectsDir) {
+      const jsonlPath = path.join(this.windowsProjectsDir, slug, fileName);
+      if (fs.existsSync(jsonlPath)) return true;
+    }
+
+    const dirsToScan = [this.windowsProjectsDir, this.wslProjectsUncDir].filter(Boolean) as string[];
+    for (const baseDir of dirsToScan) {
+      try {
+        const dirs = fs.readdirSync(baseDir);
+        for (const dir of dirs) {
+          const candidatePath = path.join(baseDir, dir, fileName);
+          if (fs.existsSync(candidatePath)) return true;
+        }
+      } catch {
+        // can't read directory
+      }
+    }
+
+    return false;
+  }
+
   private forgetResolvedPath(agentId: string): void {
     if (this.resolvedPaths.has(agentId)) {
       this.resolvedPaths.delete(agentId);

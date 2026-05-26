@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, protocol, net, session } from 'electron';
+import { app, BrowserWindow, dialog, protocol, net, session, shell } from 'electron';
 import path from 'path';
 import { initDatabase } from './database';
 import { AgentSupervisor } from './supervisor';
@@ -109,6 +109,41 @@ function createWindow(): void {
     console.error(`Page failed to load (mainFrame=${isMainFrame}): ${code} ${desc} url=${url}`);
   });
 
+  // Externalize all link navigation. Without this, clicking an http(s) link
+  // inside a markdown view replaces the dashboard with the external page and
+  // there's no way back — closing the window to escape kills every agent.
+  const isInternalUrl = (url: string): boolean => {
+    if (url.startsWith('file://')) return true;
+    try {
+      const u = new URL(url);
+      const isLoopback = u.hostname === 'localhost' || u.hostname === '127.0.0.1';
+      if (!isLoopback) return false;
+      const port = Number(u.port);
+      // Vite dev server ports
+      if (port >= 5173 && port <= 5175) return true;
+      // Embedded Jupyter server ports
+      if (port >= JUPYTER_BASE_PORT && port <= JUPYTER_BASE_PORT + JUPYTER_PORT_RETRIES) return true;
+      return false;
+    } catch {
+      return false;
+    }
+  };
+
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (url.startsWith('http://') || url.startsWith('https://')) {
+      void shell.openExternal(url);
+    }
+    return { action: 'deny' };
+  });
+
+  mainWindow.webContents.on('will-navigate', (event, url) => {
+    if (isInternalUrl(url)) return;
+    event.preventDefault();
+    if (url.startsWith('http://') || url.startsWith('https://')) {
+      void shell.openExternal(url);
+    }
+  });
+
   if (!app.isPackaged) {
     mainWindow.webContents.openDevTools({ mode: 'detach' });
   }
@@ -208,6 +243,10 @@ app.whenReady().then(async () => {
     wsServer.start();
     apiServer = new ApiServer(supervisor);
     apiServer.start();
+    // Class IV (plans/class-iv-worker-hook-scaffold.md): tell the supervisor the
+    // port the API server actually bound to (handles EADDRINUSE auto-increment)
+    // so supervised workers' Stop hooks POST to the right place.
+    supervisor.setApiServerPort(apiServer.getPort());
     supervisor.reconcile();
     console.log('App ready');
   } catch (err: any) {

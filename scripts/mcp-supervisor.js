@@ -13,6 +13,7 @@
 
 const http = require('http');
 const fs = require('fs');
+const { decidePollAction } = require('./mcp-supervisor-poll');
 
 // The dashboard API host/port — passed via env vars or defaults.
 // Auto-detect WSL: if no explicit host is set and we're inside WSL2,
@@ -334,7 +335,7 @@ function getToolDefinitions() {
     },
     {
       name: 'launch_agent',
-      description: 'Launch a new worker agent in a workspace. Optionally use a template or persona for pre-configured identity/prompt. When `prompt` is provided, the dashboard writes it into the agent\'s input buffer and presses Enter to submit (provider-appropriate: CR for Claude on Windows / kitty-encoded Enter for Codex+Gemini and for WSL agents). Pass `submit: false` to leave the prompt in the buffer without submitting (useful when the caller wants to append more input via send_keys_to_agent before the agent processes the turn). For codex agents, pass `fresh_session: true` to skip post-launch session-id discovery so the new agent isn\'t auto-bound to any pre-existing rollout in this workspace — use this when launching a codex worker in a workspace that has had prior codex work and you want a clean context.',
+      description: 'Launch a new worker agent in a workspace. Optionally use a template or persona for pre-configured identity/prompt. When `prompt` is provided, the dashboard writes it into the agent\'s input buffer and presses Enter to submit (provider-appropriate: CR for Claude on Windows / kitty-encoded Enter for Codex+Gemini and for WSL agents). Pass `submit: false` to leave the prompt in the buffer without submitting (useful when the caller wants to append more input via send_keys_to_agent before the agent processes the turn). For codex agents, pass `fresh_session: true` to launch without `codex resume` so the codex CLI mints a fresh conversation rather than inheriting a prior rollout in this workspace — the dashboard still discovers and binds the new session id.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -351,7 +352,7 @@ function getToolDefinitions() {
           working_directory: { type: 'string', description: 'Working directory for the agent. Defaults to workspace root.' },
           auto_restart: { type: 'boolean', description: 'Auto-restart the agent on crash (default: true).' },
           supervised: { type: 'boolean', description: 'Whether the supervisor is notified on agent status changes (default: true for supervisor-launched workers — set false to opt out).' },
-          fresh_session: { type: 'boolean', description: 'Codex-only opt-out (default: false). When true, the dashboard skips the post-launch codex session-id discovery poll so the new agent record is not auto-bound to any pre-existing rollout in this workspace cwd. Use this when you want a clean codex context in a workspace that has had prior codex work. No-op for non-codex providers.' },
+          fresh_session: { type: 'boolean', description: 'Codex-only hint (default: false). When true, the agent launches without `codex resume` so the codex CLI mints a fresh conversation rather than inheriting any prior rollout in this workspace. The dashboard still discovers and binds the new session id. Use this when you want a clean context but parallel agents in the same workspace. No-op for non-codex providers.' },
         },
         required: ['workspace_id', 'title'],
       },
@@ -728,11 +729,18 @@ async function handleToolCall(name, args) {
           try {
             const current = await apiRequest('GET', `/api/agents/${agent.id}`);
             lastStatus = current.status;
-            if (current.status === 'idle' || current.status === 'waiting') {
-              ready = true;
-              break;
-            }
-            if (current.status === 'crashed' || current.status === 'done') break;
+            // T1-D / L-B: when a launch crashes and auto-restart is pending,
+            // keep polling — the relaunched worker reaches idle on a later
+            // cycle and the queued prompt fires. The decision tree is
+            // extracted so it can be unit-tested without the MCP shim.
+            const action = decidePollAction(
+              current.status,
+              !!current.autoRestartEnabled,
+              current.restartCount
+            );
+            if (action === 'ready') { ready = true; break; }
+            if (action === 'break') break;
+            // 'continue' falls through to the next poll iteration.
           } catch (err) {
             lastStatus = `error: ${err.message}`;
             break;

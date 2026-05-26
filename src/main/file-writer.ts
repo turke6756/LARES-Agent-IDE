@@ -97,6 +97,20 @@ function isSamePath(a: string, b: string, pathType: PathType): boolean {
   return normalizeWindowsPath(a).toLowerCase() === normalizeWindowsPath(b).toLowerCase();
 }
 
+function isStrictDescendant(targetPath: string, ancestorPath: string, pathType: PathType): boolean {
+  if (pathType === 'wsl') {
+    const target = normalizeWslPath(ensureWslPath(targetPath, 'wsl'));
+    const ancestor = normalizeWslPath(ensureWslPath(ancestorPath, 'wsl'));
+    if (target === ancestor) return false;
+    if (ancestor === '/') return target.startsWith('/');
+    return target.startsWith(`${ancestor}/`);
+  }
+  const target = normalizeWindowsPath(targetPath).toLowerCase();
+  const ancestor = normalizeWindowsPath(ancestorPath).toLowerCase();
+  if (target === ancestor) return false;
+  return target.startsWith(ancestor + path.win32.sep);
+}
+
 function assertNotRoot(targetPath: string, rootDirectory: string, pathType: PathType, operation: string): void {
   if (isSamePath(targetPath, rootDirectory, pathType)) {
     throw new Error(`Cannot ${operation} the working directory root`);
@@ -308,6 +322,63 @@ export async function renameEntry(
     return { ok: true, path: resolvedNew };
   } catch (err) {
     return errorResult(err, 'Failed to rename entry');
+  }
+}
+
+export async function moveEntry(
+  srcPath: string,
+  rootDirectory: string,
+  pathType: PathType,
+  destDir: string,
+): Promise<FileMutationResult> {
+  try {
+    assertInsideRoot(srcPath, rootDirectory, pathType);
+    assertInsideRoot(destDir, rootDirectory, pathType);
+    assertNotRoot(srcPath, rootDirectory, pathType, 'move');
+
+    if (isSamePath(srcPath, destDir, pathType)) {
+      throw new Error('Cannot move a folder into itself');
+    }
+    if (isStrictDescendant(destDir, srcPath, pathType)) {
+      throw new Error('Cannot move a folder into one of its own subfolders');
+    }
+
+    const srcParent = pathType === 'wsl'
+      ? path.posix.dirname(normalizeWslPath(ensureWslPath(srcPath, pathType)))
+      : path.dirname(normalizeWindowsPath(srcPath));
+    if (isSamePath(srcParent, destDir, pathType)) {
+      throw new Error('Item is already in that folder');
+    }
+
+    const srcName = pathType === 'wsl'
+      ? path.posix.basename(normalizeWslPath(ensureWslPath(srcPath, pathType)))
+      : path.basename(normalizeWindowsPath(srcPath));
+    const newPath = joinPath(destDir, srcName, pathType);
+    assertInsideRoot(newPath, rootDirectory, pathType);
+
+    if (pathType === 'wsl') {
+      const wslSrc = normalizeWslPath(ensureWslPath(srcPath, pathType));
+      const wslDestDir = normalizeWslPath(ensureWslPath(destDir, pathType));
+      const wslNew = normalizeWslPath(newPath);
+      if (!await wslPathExists(wslSrc)) throw new Error('Source does not exist');
+      if (!await wslIsDirectory(wslDestDir)) throw new Error('Destination folder does not exist');
+      if (await wslPathExists(wslNew)) throw new Error('A file or folder with that name already exists at the destination');
+      await runWsl(`mv -- ${shellQuote(wslSrc)} ${shellQuote(wslNew)}`);
+      return { ok: true, path: wslNew };
+    }
+
+    const resolvedSrc = normalizeWindowsPath(srcPath);
+    const resolvedDestDir = normalizeWindowsPath(destDir);
+    const resolvedNew = normalizeWindowsPath(newPath);
+    if (!fs.existsSync(resolvedSrc)) throw new Error('Source does not exist');
+    if (!fs.existsSync(resolvedDestDir) || !fs.statSync(resolvedDestDir).isDirectory()) {
+      throw new Error('Destination folder does not exist');
+    }
+    if (fs.existsSync(resolvedNew)) throw new Error('A file or folder with that name already exists at the destination');
+    fs.renameSync(resolvedSrc, resolvedNew);
+    return { ok: true, path: resolvedNew };
+  } catch (err) {
+    return errorResult(err, 'Failed to move entry');
   }
 }
 

@@ -72,6 +72,8 @@ const api: IpcApi = {
       ipcRenderer.invoke('files:mkdir', parentDir, rootDirectory, pathType, name),
     rename: (oldPath, rootDirectory, pathType, newName) =>
       ipcRenderer.invoke('files:rename', oldPath, rootDirectory, pathType, newName),
+    move: (srcPath, rootDirectory, pathType, destDir) =>
+      ipcRenderer.invoke('files:move', srcPath, rootDirectory, pathType, destDir),
     deleteEntry: (entryPath, rootDirectory, pathType, recursive) =>
       ipcRenderer.invoke('files:delete', entryPath, rootDirectory, pathType, recursive),
     watchDirectory: (dirPath, pathType, callback) => {

@@ -168,7 +168,7 @@ test('tool-result content is captured and tool_use_id roundtrips', () => {
   }
 });
 
-test('usage events read 0.128 nested shape (info.total_token_usage)', () => {
+test('usage events read 0.128 nested shape (info.last_token_usage)', () => {
   const reader = makeReader();
   const events = pollAll(reader);
   const usages = events.filter((e) => e.type === 'usage');
@@ -183,6 +183,75 @@ test('usage events read 0.128 nested shape (info.total_token_usage)', () => {
   assert.ok((realUsage.cachedTokens || 0) >= 0, 'cachedTokens populated from cached_input_tokens');
   assert.ok(realUsage.contextWindowMax > 0);
   assert.ok(realUsage.contextPercentage >= 0 && realUsage.contextPercentage <= 100);
+});
+
+test('usage reads last_token_usage (single call), not total_token_usage (cumulative)', () => {
+  // Real-shaped event from a long-running session: total_token_usage is
+  // cumulative across calls and far exceeds the window, while
+  // last_token_usage is the latest call's actual size and fits well within.
+  // Pre-fix behavior clamped to 100%; post-fix should reflect last call.
+  const sessionId = '66666666-7777-8888-9999-aaaaaaaaaaaa';
+  const tmpPath = path.join(os.tmpdir(), `codex-last-vs-total-${Date.now()}.jsonl`);
+  const lines = [
+    JSON.stringify({
+      timestamp: '2026-05-18T10:00:00.000Z',
+      type: 'session_meta',
+      payload: { id: sessionId, cwd: 'C:\\Users\\fixture', model_provider: 'openai', cli_version: '0.128.0' },
+    }),
+    JSON.stringify({
+      timestamp: '2026-05-18T10:00:01.000Z',
+      type: 'event_msg',
+      payload: { type: 'task_started', model_context_window: 258_400 },
+    }),
+    JSON.stringify({
+      timestamp: '2026-05-18T10:00:02.000Z',
+      type: 'event_msg',
+      payload: {
+        type: 'token_count',
+        info: {
+          // Cumulative across many calls — would show as 585% with the old code.
+          total_token_usage: {
+            input_tokens: 1_502_799,
+            cached_input_tokens: 1_361_024,
+            output_tokens: 10_070,
+            reasoning_output_tokens: 4_892,
+            total_tokens: 1_512_869,
+          },
+          // The most recent call — actual current context occupancy.
+          last_token_usage: {
+            input_tokens: 144_194,
+            cached_input_tokens: 142_208,
+            output_tokens: 3_752,
+            reasoning_output_tokens: 2_062,
+            total_tokens: 147_946,
+          },
+          model_context_window: 258_400,
+        },
+      },
+    }),
+  ];
+  fs.writeFileSync(tmpPath, lines.join('\n') + '\n');
+  try {
+    const reader = new (class extends CodexRolloutReader {
+      constructor() {
+        super();
+        (this as any).resolvedPaths.set('test-agent', tmpPath);
+      }
+    })();
+    const events = reader.pollSession(makeSession({ sessionId }));
+    const usage = events.find((e) => e.type === 'usage');
+    assert.ok(usage && usage.type === 'usage');
+    // Should reflect last_token_usage, not total_token_usage.
+    assert.equal(usage.inputTokens, 144_194);
+    assert.equal(usage.outputTokens, 3_752);
+    assert.equal(usage.totalTokens, 147_946);
+    assert.equal(usage.cumulativeContextTokens, 147_946);
+    assert.equal(usage.contextWindowMax, 258_400);
+    // 147946 / 258400 = 57.2% — emphatically not 100% (cumulative would be 585%).
+    assert.equal(usage.contextPercentage, 57);
+  } finally {
+    fs.unlinkSync(tmpPath);
+  }
 });
 
 test('thinking events: empty summaries are dropped, non-empty are emitted', () => {
@@ -664,6 +733,109 @@ test('P2-01: split-batch patch carries endsWithQuestion through to ring mutation
     assert.equal(patch.endsWithQuestion, true, 'patch carries endsWithQuestion=true');
   } finally {
     fs.unlinkSync(tmpPath);
+  }
+});
+
+// BUG-26 regressions: an unbound agent (session.sessionId === '') must NOT
+// resolve a rollout via cwd fallback. Pre-fix, two failure modes triggered:
+//   (1) concurrent same-cwd launches — newest mtime won for whichever rollout
+//       flushed session_meta first, so events from both files cross-mixed.
+//   (2) stale prior-day match — when today's rollout hadn't yet flushed
+//       session_meta, the cwd walker grabbed yesterday's same-cwd rollout.
+// Post-fix the reader returns 0 events; recovery is the supervisor's job.
+
+test('BUG-26: unbound agent (sessionId="") emits no events when two same-cwd rollouts exist', () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-bug26-concurrent-'));
+  const dayDir = path.join(tmpRoot, '2026', '05', '24');
+  fs.mkdirSync(dayDir, { recursive: true });
+  const peerId1 = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+  const peerId2 = 'bbbbbbbb-cccc-dddd-eeee-ffffffffffff';
+  const cwd = 'C:\\Users\\fixture\\sharedcwd';
+  for (const sid of [peerId1, peerId2]) {
+    const filePath = path.join(dayDir, `rollout-2026-05-24T10-00-00-${sid}.jsonl`);
+    fs.writeFileSync(filePath, [
+      JSON.stringify({
+        timestamp: '2026-05-24T10:00:00.000Z',
+        type: 'session_meta',
+        payload: { id: sid, cwd, model_provider: 'openai', cli_version: '0.128.0' },
+      }),
+      JSON.stringify({
+        timestamp: '2026-05-24T10:00:01.000Z',
+        type: 'event_msg',
+        payload: { type: 'user_message', message: `prompt for ${sid}` },
+      }),
+      JSON.stringify({
+        timestamp: '2026-05-24T10:00:02.000Z',
+        type: 'response_item',
+        payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: `reply from ${sid}` }] },
+      }),
+    ].join('\n') + '\n');
+  }
+  try {
+    const reader = new CodexRolloutReader();
+    (reader as any).windowsSessionsDir = tmpRoot;
+    (reader as any).wslSessionsUncDir = null;
+    // Pre-fix this would pick newest-mtime rollout by cwd and stream its
+    // events under the agentId. Post-fix: 0 events.
+    const events = reader.pollSession(makeSession({ sessionId: '', workingDirectory: cwd }));
+    assert.equal(
+      events.length,
+      0,
+      `unbound agent must emit 0 events; got ${events.length} (cwd fallback would mis-attribute)`
+    );
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('BUG-26: unbound agent (sessionId="") does NOT pick up a stale prior-day same-cwd rollout', () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-bug26-stale-'));
+  const priorDay = path.join(tmpRoot, '2026', '05', '23');
+  fs.mkdirSync(priorDay, { recursive: true });
+  const cwd = 'C:\\Users\\fixture\\sharedcwd';
+  const staleSid = 'cccccccc-dddd-eeee-ffff-000000000000';
+  // Yesterday's rollout — perfectly valid session_meta + cwd matches.
+  fs.writeFileSync(
+    path.join(priorDay, `rollout-2026-05-23T08-00-00-${staleSid}.jsonl`),
+    [
+      JSON.stringify({
+        timestamp: '2026-05-23T08:00:00.000Z',
+        type: 'session_meta',
+        payload: { id: staleSid, cwd, model_provider: 'openai', cli_version: '0.128.0' },
+      }),
+      JSON.stringify({
+        timestamp: '2026-05-23T08:00:01.000Z',
+        type: 'event_msg',
+        payload: { type: 'user_message', message: 'Name a primary color.' },
+      }),
+      JSON.stringify({
+        timestamp: '2026-05-23T08:00:02.000Z',
+        type: 'response_item',
+        payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Red.' }] },
+      }),
+    ].join('\n') + '\n'
+  );
+  // Today's rollout exists but its session_meta hasn't flushed yet — pre-fix
+  // the walker found today's file with cwd:null and walked back to yesterday.
+  const today = path.join(tmpRoot, '2026', '05', '24');
+  fs.mkdirSync(today, { recursive: true });
+  const todaySid = 'dddddddd-eeee-ffff-0000-111111111111';
+  fs.writeFileSync(
+    path.join(today, `rollout-2026-05-24T10-00-00-${todaySid}.jsonl`),
+    '' // empty — no session_meta yet
+  );
+  try {
+    const reader = new CodexRolloutReader();
+    (reader as any).windowsSessionsDir = tmpRoot;
+    (reader as any).wslSessionsUncDir = null;
+    const events = reader.pollSession(makeSession({ sessionId: '', workingDirectory: cwd }));
+    assert.equal(
+      events.length,
+      0,
+      'unbound agent must NOT inherit yesterday\'s same-cwd rollout (was the BUG-26 stale-prior-day failure)'
+    );
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
 });
 

@@ -1,4 +1,4 @@
-import type { Agent, ContextStats } from '../../../shared/types';
+import type { Agent, ContextStats, FileActivity } from '../../../shared/types';
 import type { EventBridgeDeps } from '../event-bridge';
 import type { ForceWorkingOpts, WaitingKind } from '../status-monitor';
 
@@ -95,6 +95,22 @@ export interface FakeBridgeDepsBundle {
   getNow(): number;
   /** Queue a single-shot error for the NEXT sendInput call. */
   setSendInputError(err: Error | null): void;
+  /** BUG-11: simulate a user PTY-write at the current fake clock. The bridge
+   *  reads this via `getLastUserPtyWriteAt` to decide whether to defer
+   *  auto-submitting events. Pass undefined to clear (no recent activity). */
+  setLastUserPtyWriteAt(agentId: string, t: number | undefined): void;
+  /** BUG-20: stub the chat-first preview source. The bridge calls this for
+   *  terminal-status events; returning `undefined` makes the payload builder
+   *  fall back to the PTY logTail. */
+  setLastAssistantMessage(agentId: string, text: string | undefined): void;
+  /** BUG-20: stub `getFileActivities`. Empty array → "Files touched:" is
+   *  omitted from the event payload. */
+  setFileActivities(agentId: string, files: FileActivity[]): void;
+  /** BUG-20: make the chat dep reject on next call (one-shot). Used to test
+   *  the bridge's degrade-to-logTail behavior on errors. */
+  setLastAssistantMessageError(err: Error | null): void;
+  /** BUG-20: make the file-activities dep throw on next call (one-shot). */
+  setFileActivitiesError(err: Error | null): void;
 }
 
 export function makeFakeBridgeDeps(): FakeBridgeDepsBundle {
@@ -107,6 +123,11 @@ export function makeFakeBridgeDeps(): FakeBridgeDepsBundle {
   const statusForceCalls: StatusForceCall[] = [];
   const scheduler = new FakeScheduler(() => now);
   let nextSendError: Error | null = null;
+  const lastUserPtyWriteAt = new Map<string, number>();
+  const lastAssistantMessages = new Map<string, string>();
+  const fileActivities = new Map<string, FileActivity[]>();
+  let nextChatError: Error | null = null;
+  let nextFilesError: Error | null = null;
 
   const deps: EventBridgeDeps = {
     getAgent: (id) => agents.get(id) ?? null,
@@ -148,6 +169,23 @@ export function makeFakeBridgeDeps(): FakeBridgeDepsBundle {
         });
       },
     },
+    getLastUserPtyWriteAt: (id) => lastUserPtyWriteAt.get(id),
+    getLastAssistantMessage: async (id) => {
+      if (nextChatError) {
+        const err = nextChatError;
+        nextChatError = null;
+        throw err;
+      }
+      return lastAssistantMessages.get(id);
+    },
+    getFileActivities: (id) => {
+      if (nextFilesError) {
+        const err = nextFilesError;
+        nextFilesError = null;
+        throw err;
+      }
+      return fileActivities.get(id) ?? [];
+    },
   };
 
   return {
@@ -162,6 +200,19 @@ export function makeFakeBridgeDeps(): FakeBridgeDepsBundle {
     setNow: (t) => { now = t; },
     getNow: () => now,
     setSendInputError: (err) => { nextSendError = err; },
+    setLastUserPtyWriteAt: (agentId, t) => {
+      if (t === undefined) lastUserPtyWriteAt.delete(agentId);
+      else lastUserPtyWriteAt.set(agentId, t);
+    },
+    setLastAssistantMessage: (agentId, text) => {
+      if (text === undefined) lastAssistantMessages.delete(agentId);
+      else lastAssistantMessages.set(agentId, text);
+    },
+    setFileActivities: (agentId, files) => {
+      fileActivities.set(agentId, files);
+    },
+    setLastAssistantMessageError: (err) => { nextChatError = err; },
+    setFileActivitiesError: (err) => { nextFilesError = err; },
   };
 }
 

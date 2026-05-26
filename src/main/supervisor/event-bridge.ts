@@ -1,4 +1,4 @@
-import type { Agent, AgentStatus, ContextStats } from '../../shared/types';
+import type { Agent, AgentStatus, ContextStats, FileActivity } from '../../shared/types';
 import type { ChatEventBatch } from '../../shared/session-events';
 import type { StatusChangedEvent } from './status-events';
 import type { ForceWorkingOpts, WaitingKind } from './status-monitor';
@@ -49,12 +49,32 @@ export interface EventBridgeDeps {
    *  Returns undefined when the agent has never received a user-PTY write.
    *  Used to defer event auto-submit while the user is actively typing. */
   getLastUserPtyWriteAt(agentId: string): number | undefined;
+  /** BUG-20: fetch the agent's most recent clean assistant chat message
+   *  (typically wrapping `AgentChatService.getMessages`). Returning
+   *  `undefined` (or throwing — the caller swallows errors) makes the bridge
+   *  fall back to the PTY-frame logTail preview. */
+  getLastAssistantMessage(agentId: string): Promise<string | undefined>;
+  /** BUG-20: fetch recent file activities for the agent — typically a thin
+   *  wrapper over `getFileActivities(agentId)`. Returning an empty array (or
+   *  throwing) makes the bridge omit the "Files touched:" section. */
+  getFileActivities(agentId: string): FileActivity[];
 }
 
 // P2-03: 'waiting' is a trigger status so the supervisor gets a notification
 // when an agent blocks on user input. The waiting → working transition (user
 // answered the prompt) is filtered below as noise.
 const TRIGGER_STATUSES: ReadonlyArray<AgentStatus> = ['idle', 'crashed', 'done', 'waiting'];
+
+// BUG-20: the chat-first preview + file-activity sections only make sense
+// for terminal statuses where the agent has just produced output. Skipped
+// for 'waiting' (that branch has its own kind/excerpt rendering).
+const TERMINAL_PREVIEW_STATUSES: ReadonlyArray<AgentStatus> = ['idle', 'done', 'crashed'];
+
+// BUG-20: cap how many file_activities rows we hand to the payload builder.
+// The builder applies its own visible cap (FILES_TOUCHED_MAX_ENTRIES); this
+// is just so a hot worker that touched hundreds of files doesn't drag the
+// whole list through the bridge for no reason.
+const FILE_ACTIVITY_FETCH_CAP = 20;
 
 export class EventBridge {
   private eventCooldowns = new Map<string, number>();
@@ -91,6 +111,18 @@ export class EventBridge {
 
       const logTail = await this.deps.getAgentLog(data.agentId, SUPERVISOR_EVENT_LOG_TAIL_LINES);
       const stats = this.deps.getContextStats(data.agentId);
+
+      // BUG-20: pre-fetch the clean assistant chat message + recent file
+      // activities for terminal statuses so the payload builder can render
+      // the real assistant prose (not Claude Code TUI footer chrome) and a
+      // "Files touched:" section. Failures degrade to today's PTY-tail.
+      let lastAssistantMessage: string | undefined;
+      let filesTouched: FileActivity[] | undefined;
+      if (TERMINAL_PREVIEW_STATUSES.includes(data.status)) {
+        lastAssistantMessage = await this.fetchLastAssistantMessage(data.agentId);
+        filesTouched = this.fetchFileActivities(data.agentId);
+      }
+
       const event: SupervisorEvent = {
         type: 'status_change',
         agentId: agent.id,
@@ -105,6 +137,11 @@ export class EventBridge {
         turnCount: stats?.turnCount,
         model: stats?.model,
         logTail,
+        lastAssistantMessage,
+        filesTouched: filesTouched?.map(f => ({
+          filePath: f.filePath,
+          operation: f.operation,
+        })),
         // P2-03: pass waiting metadata through to the payload builder when
         // present on the inbound event.
         waitingKind: data.waitingKind,
@@ -241,6 +278,52 @@ export class EventBridge {
       }
     } catch (err) {
       console.error('[event-bridge] Error in onChatEvents:', err);
+    }
+  }
+
+  /**
+   * BUG-22 Step 1 diagnostic: invoked from the WslRunner `tmuxNewSessionFailed`
+   * event path so the supervisor learns about the failure as a distinct event,
+   * separate from the generic `Agent status changed` crash that follows when
+   * `tmux attach` reports `can't find session`. Keeps the agent-side audit log
+   * intact via `addAuditEvent('supervisor_event', ...)`.
+   *
+   * Does not fake a worker status change — there's no transition to emit; the
+   * worker is still in `launching`. The event-bridge `deliver()` path is
+   * reused so the same queue / drain / user-typing guarantees apply.
+   */
+  async onTmuxNewSessionFailed(input: {
+    agent: Agent;
+    tmuxSessionName: string;
+    command: string;
+    tmuxExitCode: number | null;
+    tmuxStderr: string;
+    tmuxCommand: string;
+  }): Promise<void> {
+    try {
+      const { agent } = input;
+      // A failed supervisor launch has no parent to notify — the audit-event
+      // / JSONL paths still record the failure. Only deliver to a supervisor
+      // when the failing agent is a supervised worker.
+      if (agent.isSupervisor || !agent.isSupervised) return;
+      const supervisor = this.deps.getSupervisorForWorker(agent);
+      if (!supervisor || ['done', 'crashed'].includes(supervisor.status)) return;
+
+      const event: SupervisorEvent = {
+        type: 'tmux_new_session_failed',
+        agentId: agent.id,
+        agentTitle: agent.title,
+        workspaceId: agent.workspaceId,
+        tmuxSessionName: input.tmuxSessionName,
+        command: input.command,
+        tmuxExitCode: input.tmuxExitCode,
+        tmuxStderr: input.tmuxStderr,
+        tmuxCommand: input.tmuxCommand,
+      };
+
+      await this.deliver(supervisor, event);
+    } catch (err) {
+      console.error('[event-bridge] Error handling tmux_new_session_failed:', err);
     }
   }
 
@@ -405,10 +488,43 @@ export class EventBridge {
   notifyUserInputDelivered(agentId: string): void {
     const agent = this.deps.getAgent(agentId);
     if (!agent || agent.status !== 'waiting') return;
+    // Paste-race fix: supervised workers' idle→working transition is owned
+    // exclusively by the UserPromptSubmit hook. Optimistic seeds here (which
+    // fire on every PTY write, including pastes that were never submitted)
+    // would re-introduce the false-working bug the hook scaffold exists to
+    // close. The brief flicker between input send and hook arrival (50ms–3s)
+    // is intentional and truthful.
+    if (agent.isSupervised) return;
     this.deps.statusMonitor.forceWorking(agentId, {
       source: 'user-input',
       ttlClass: 'model-pending',
     });
+  }
+
+  /** BUG-20: safe wrapper around the chat dep. Errors degrade to undefined
+   *  so the payload builder falls back to the PTY-frame tail. */
+  private async fetchLastAssistantMessage(agentId: string): Promise<string | undefined> {
+    try {
+      const text = await this.deps.getLastAssistantMessage(agentId);
+      if (!text || !text.trim()) return undefined;
+      return text;
+    } catch (err) {
+      console.error('[event-bridge] getLastAssistantMessage failed; falling back to logTail:', err);
+      return undefined;
+    }
+  }
+
+  /** BUG-20: safe wrapper around the file-activities dep. Errors degrade to
+   *  undefined so the "Files touched:" section is omitted. */
+  private fetchFileActivities(agentId: string): FileActivity[] | undefined {
+    try {
+      const all = this.deps.getFileActivities(agentId);
+      if (!all || all.length === 0) return undefined;
+      return all.slice(0, FILE_ACTIVITY_FETCH_CAP);
+    } catch (err) {
+      console.error('[event-bridge] getFileActivities failed; omitting Files touched:', err);
+      return undefined;
+    }
   }
 
   /** Test seam: cancel any pending drain timer and run the drain logic now. */

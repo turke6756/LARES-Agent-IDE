@@ -4,16 +4,89 @@ import remarkGfm from 'remark-gfm';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { vscDarkPlus, vs } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import { useThemeStore } from '../../stores/theme-store';
+import { useDashboardStore } from '../../stores/dashboard-store';
 
-export default function AgentMarkdown({ content }: { content: string }) {
+// Match relative or absolute file paths with at least one separator and a file
+// extension. Examples that match:
+//   plans/notes-canvas-implementation.md
+//   src/main/database.ts
+//   ./docs/ORCHESTRATION_SPIKE.md
+//   C:\Users\foo\bar.txt
+//   /home/user/file.py
+// Trailing sentence punctuation (".", ",", ")", etc.) is naturally excluded
+// because [\w.\-] doesn't include them and the regex engine backtracks the
+// extension off the end.
+const FILE_PATH_RE = /((?:[A-Za-z]:[\\/]|\/|\.{1,2}[\\/]|~\/)?(?:[\w.\-]+[\\/])+[\w.\-]+\.[A-Za-z0-9]{1,8})/g;
+
+function renderTextWithPaths(
+  text: string,
+  onPathClick: (path: string) => void,
+  linkClass: string,
+): React.ReactNode {
+  const parts: React.ReactNode[] = [];
+  let lastIndex = 0;
+  let m: RegExpExecArray | null;
+  const re = new RegExp(FILE_PATH_RE.source, 'g');
+  while ((m = re.exec(text)) !== null) {
+    const path = m[1];
+    const start = m.index;
+    const end = start + path.length;
+    if (start > lastIndex) parts.push(text.slice(lastIndex, start));
+    parts.push(
+      <span
+        key={`${start}-${path}`}
+        role="link"
+        tabIndex={0}
+        onClick={(e) => {
+          e.stopPropagation();
+          onPathClick(path);
+        }}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') {
+            e.preventDefault();
+            onPathClick(path);
+          }
+        }}
+        className={`underline underline-offset-2 cursor-pointer hover:opacity-80 ${linkClass}`}
+        title={`Open ${path}`}
+      >
+        {path}
+      </span>,
+    );
+    lastIndex = end;
+  }
+  if (parts.length === 0) return text;
+  if (lastIndex < text.length) parts.push(text.slice(lastIndex));
+  return parts;
+}
+
+function transformStringChildren(
+  children: React.ReactNode,
+  onPathClick: ((path: string) => void) | null,
+  linkClass: string,
+): React.ReactNode {
+  if (!onPathClick) return children;
+  return React.Children.map(children, (child) => {
+    if (typeof child === 'string') {
+      return renderTextWithPaths(child, onPathClick, linkClass);
+    }
+    return child;
+  });
+}
+
+export default function AgentMarkdown({ content, agentId }: { content: string; agentId?: string }) {
   const isLight = useThemeStore((s) => s.theme) === 'light';
+  const openFileViewer = useDashboardStore((s) => s.openFileViewer);
+  const onPathClick = agentId ? (path: string) => openFileViewer(path, agentId) : null;
+  const linkClass = isLight ? 'text-[#0969da]' : 'text-[#79c0ff]';
+  const linkify = (children: React.ReactNode) => transformStringChildren(children, onPathClick, linkClass);
   return (
     <ReactMarkdown
       remarkPlugins={[remarkGfm]}
       components={{
         p: ({ children }) => (
           <p className={`mb-2 last:mb-0 text-[13px] leading-[1.6] ${isLight ? 'text-[#1f2328]' : 'text-gray-100'}`}>
-            {children}
+            {linkify(children)}
           </p>
         ),
         h1: ({ children }) => (
@@ -32,12 +105,12 @@ export default function AgentMarkdown({ content }: { content: string }) {
           <ol className="list-decimal pl-5 mb-2 space-y-0.5 text-[13px] leading-[1.55]">{children}</ol>
         ),
         li: ({ children }) => (
-          <li className={isLight ? 'text-[#1f2328]' : 'text-gray-100'}>{children}</li>
+          <li className={isLight ? 'text-[#1f2328]' : 'text-gray-100'}>{linkify(children)}</li>
         ),
         strong: ({ children }) => (
-          <strong className={`font-semibold ${isLight ? 'text-[#1f2328]' : 'text-white'}`}>{children}</strong>
+          <strong className={`font-semibold ${isLight ? 'text-[#1f2328]' : 'text-white'}`}>{linkify(children)}</strong>
         ),
-        em: ({ children }) => <em className="italic">{children}</em>,
+        em: ({ children }) => <em className="italic">{linkify(children)}</em>,
         a: ({ href, children }) => (
           <a
             href={href}
@@ -111,14 +184,14 @@ export default function AgentMarkdown({ content }: { content: string }) {
               isLight ? 'bg-[#f6f8fa] border border-[#d0d7de]' : 'bg-[#161b22] border border-gray-800'
             }`}
           >
-            {children}
+            {linkify(children)}
           </th>
         ),
         td: ({ children }) => (
           <td
             className={`px-2 py-1 ${isLight ? 'border border-[#d0d7de]' : 'border border-gray-800'}`}
           >
-            {children}
+            {linkify(children)}
           </td>
         ),
         hr: () => <hr className={isLight ? 'border-[#d0d7de] my-3' : 'border-gray-800 my-3'} />,

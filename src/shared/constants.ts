@@ -60,6 +60,73 @@ export const WORKING_LATCH_TOOL_PENDING_MS = 900_000; // 15 min
 // the silence is a tool or pure model thinking.
 export const WORKING_LATCH_THINKING_PENDING_MS = 900_000; // 15 min
 
+// Unsupervised-agent working-latch TTLs. The worker-shaped 180 s / 900 s
+// ceilings above exist to suppress false-idle events that a supervisor would
+// react expensively to (BUG-09 / BUG-13 / BUG-18). When an agent has no
+// supervisor (`!isSupervised && !isSupervisor`), no consumer pays that cost —
+// status drives the UI dot and team-delivery's idle hook, both of which
+// already guard against momentary flap (and unsupervised agents aren't put
+// in teams in practice). Use snappy ceilings so a genuinely idle
+// unsupervised agent flips quickly.
+//
+// See plans/tighten-inference-for-unsupervised-agents.md §1.
+export const WORKING_LATCH_MODEL_PENDING_UNSUPERVISED_MS = 30_000;      // 30 s
+export const WORKING_LATCH_TOOL_PENDING_UNSUPERVISED_MS = 120_000;      // 2 min
+export const WORKING_LATCH_THINKING_PENDING_UNSUPERVISED_MS = 120_000;  // 2 min — collapse with tool-pending
+
+// Supervisor-specific working latch. The 3–15 min worker latches above exist
+// to suppress false idle events that would otherwise be relayed to the
+// worker's supervisor (Coalescing pauses, tool windows, extended thinking).
+// The supervisor has no equivalent consumer — nobody is supervising the
+// supervisor — so its `status === 'working'` is read only by the /input gate
+// and event-bridge's queue gate, both of which want an accurate "is the
+// supervisor actively typing right now?" signal, not a pessimistic ceiling.
+// A short latch lets those gates release as soon as the supervisor goes
+// quiet, instead of waiting out the worker-shaped TTL.
+export const SUPERVISOR_WORKING_LATCH_MS = 5_000;
+
+// Class IV watchdog — see plans/disable-inference-for-supervised-claude-workers.md §2.2.
+// When a supervised Claude worker (which uses the Stop-hook → forceIdleFromHook
+// path instead of inference) has been in `working` for this long with no hook
+// event received, log a warning. Belt-and-suspenders for a broken hook
+// scaffold (missing script, missing env injection, settings.json corruption).
+// Warn-only; the dashboard does NOT auto-fall-back to inference, by design.
+export const HOOK_SILENCE_WARN_MS = 15 * 60 * 1000;  // 15 min
+
+// Start-hook silence watchdog — supervised workers must see a
+// UserPromptSubmit hook within this window after sendInput; otherwise the
+// dashboard would be silently lying that the agent is idle when the user's
+// paste never got submitted (BUG-10). Short threshold (3 s) because the
+// hook fires synchronously on submit and round-trips in well under 1 s
+// on a healthy scaffold. Warn-only.
+export const START_HOOK_SILENCE_WARN_MS = 3_000;
+
+// BUG-23 — per-provider cold-start settle window. After `runner.launch()`
+// returns, the agent is in `'launching'`; once wallclock since the launch
+// stamp exceeds this provider-specific budget, StatusMonitor.poll() promotes
+// it to `'idle'` (the supervisor launch-helper's poll-for-idle target).
+// Honors env overrides at module-load so we can ratchet without a rebuild
+// when a user reports keystroke-eating during boot.
+//   - AGENTDASH_LAUNCH_SETTLE_MS_CLAUDE
+//   - AGENTDASH_LAUNCH_SETTLE_MS_CODEX
+//   - AGENTDASH_LAUNCH_SETTLE_MS_GEMINI
+function _readSettleMs(envName: string, fallback: number): number {
+  const raw = process.env[envName];
+  if (!raw) return fallback;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || n <= 0) return fallback;
+  return n;
+}
+export const LAUNCH_SETTLE_TIMEOUT_MS: Record<AgentProvider, number> = {
+  claude: _readSettleMs('AGENTDASH_LAUNCH_SETTLE_MS_CLAUDE', 10_000),
+  codex:  _readSettleMs('AGENTDASH_LAUNCH_SETTLE_MS_CODEX',  25_000),
+  gemini: _readSettleMs('AGENTDASH_LAUNCH_SETTLE_MS_GEMINI', 10_000),
+};
+// Narrow watchdog: warn if a `launching` agent persists past
+// LAUNCH_SETTLE_TIMEOUT_MS[provider] + this grace, which means the settle
+// timer itself is misbehaving (clock skew, frozen poll, etc.).
+export const LAUNCH_SETTLE_OVERRUN_GRACE_MS = 5_000;
+
 /** Default CLI commands per provider and environment */
 export const PROVIDER_COMMANDS: Record<AgentProvider, { windows: string; wsl: string }> = {
   claude: { windows: 'claude --dangerously-skip-permissions --chrome', wsl: 'ccode --dangerously-skip-permissions --chrome' },
@@ -265,6 +332,218 @@ Add entries as you learn important things about the agents, project, or decision
  *  index is the only memory source for the supervisor session. */
 export const SUPERVISOR_CLAUDE_SETTINGS_JSON = `{
   "autoMemoryEnabled": false
+}
+`;
+
+/** Class IV worker scaffold — see plans/class-iv-worker-hook-scaffold.md.
+ *  Written to <workspace>/.dashboard/workers/claude/CLAUDE.md on first
+ *  supervised Claude worker launch. Shared cwd for N workers, read-only by
+ *  convention. The "no TTY prompts" rule is load-bearing: workers end their
+ *  turn with the question in plain text so the Stop hook → idle → supervisor
+ *  notification pipeline carries the question through. */
+export const WORKER_CLAUDE_MD = `# Worker Agent
+
+You are a generic worker agent launched by the dashboard supervisor.
+The supervisor is your only human-side interlocutor.
+
+## How to ask questions
+
+You do not have a human at your terminal. **Never invoke** \`AskUserQuestion\`,
+plan-mode approval prompts, \`(y/n)\` confirmations, or any other interactive
+blocking dialog. They will hang forever.
+
+Instead, end your turn with the question in plain text. Your turn-end fires a
+Stop hook that flips your dashboard status to \`idle\` and notifies your
+supervisor. The supervisor reads your final assistant message (via
+\`read_agent_chat\`) and routes the question to the human.
+
+Examples of good turn endings when you need input:
+
+> I've drafted the migration. Should I apply it to staging now, or do you want
+> to review the SQL first?
+
+> Two reasonable approaches: (a) extend the existing handler, (b) add a new
+> route. Which would you like?
+
+## You are supervised
+
+Your supervisor watches your status via \`[DASHBOARD EVENT]\` messages.
+When you go idle, the supervisor decides next steps. Trust that — end turns
+cleanly with decisions and questions surfaced in plain text. Don't keep the
+loop alive yourself; don't poll; don't loop on busy-work to avoid going idle.
+
+## Working directory and scope
+
+Your cwd is the worker template folder (\`.dashboard/workers/claude/\`), not
+the workspace. Workspace root is provided via \`--add-dir\` at launch and via
+the \`Workspace root:\` line in your initial system prompt. **Use absolute
+paths for Read / Edit / Glob / Bash.** Relative paths from your cwd will not
+find workspace files.
+
+## No memory, stateless across sessions
+
+There is no \`./memory/\` folder and no auto-memory. Do not write per-session
+state into your cwd — that folder is shared with every other worker of your
+provider, by design. Everything you need for your task is in your initial
+prompt and the workspace files you can read.
+`;
+
+/** Class IV worker hook config — written to
+ *  <workspace>/.dashboard/workers/claude/.claude/settings.json on first
+ *  supervised Claude worker launch. \${CLAUDE_PROJECT_DIR} is auto-expanded
+ *  by Claude Code at hook fire time (it points to the launch cwd, which is
+ *  the template folder — we walk up two levels to the workspace root where
+ *  .dashboard/scripts/dashboard-status.mjs lives).
+ *  Schema verified against https://code.claude.com/docs/en/hooks.md —
+ *  Stop / SubagentStop use the array-of-blocks shape and don't support
+ *  matchers (any matcher field is silently ignored). */
+export const WORKER_CLAUDE_SETTINGS_JSON = `{
+  "autoMemoryEnabled": false,
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \\"\${CLAUDE_PROJECT_DIR}/../../scripts/dashboard-status.mjs\\""
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \\"\${CLAUDE_PROJECT_DIR}/../../scripts/dashboard-status.mjs\\""
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \\"\${CLAUDE_PROJECT_DIR}/../../scripts/dashboard-status.mjs\\" working"
+          }
+        ]
+      }
+    ]
+  }
+}
+`;
+
+/** Class IV worker hook config (Codex) — written to
+ *  <workspace>/.dashboard/workers/codex/.codex/config.toml on first supervised
+ *  Codex worker launch. \${WORKSPACE_ROOT} is replaced at scaffold-write time
+ *  with the absolute workspace path; Codex has no analog of Claude's
+ *  \${CLAUDE_PROJECT_DIR}, so the path is materialized rather than expanded
+ *  at hook fire time. Schema per https://developers.openai.com/codex/hooks —
+ *  the Stop event fires on agent-turn-complete; Codex passes JSON via stdin
+ *  (session_id, cwd, hook_event_name, model, turn_id). Our dashboard-status.mjs
+ *  ignores stdin and reads AGENT_ID + DASHBOARD_PORT from process env (injected
+ *  by the supervisor on isSupervised launches in src/main/supervisor/index.ts),
+ *  so the single workspace-shared script serves Claude and Codex unchanged. */
+export const WORKER_CODEX_CONFIG_TOML = `# Class IV worker hook config — see plans/class-iv-worker-hook-scaffold.md §12.
+# Codex Stop hook fires when an agent turn completes. Our hook script reads
+# AGENT_ID + DASHBOARD_PORT from env (injected at supervised-worker launch)
+# and POSTs idle to the dashboard. \${WORKSPACE_ROOT} is materialized at
+# scaffold-write time — Codex has no \${CLAUDE_PROJECT_DIR} analog.
+
+[[hooks.Stop]]
+
+[[hooks.Stop.hooks]]
+type = "command"
+command = 'node "\${WORKSPACE_ROOT}/.dashboard/scripts/dashboard-status.mjs"'
+timeout = 30
+
+[[hooks.UserPromptSubmit]]
+
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command = 'node "\${WORKSPACE_ROOT}/.dashboard/scripts/dashboard-status.mjs" working'
+timeout = 30
+`;
+
+/** Pre-UserPromptSubmit Codex config — kept verbatim so a v1 workspace's
+ *  materialized config.toml can be hashed and silently upgraded to v2. The
+ *  workspace-root substitution happens at scaffold-write time; the hash
+ *  comparison is performed after substitution. */
+export const WORKER_CODEX_CONFIG_TOML_V1 = `# Class IV worker hook config — see plans/class-iv-worker-hook-scaffold.md §12.
+# Codex Stop hook fires when an agent turn completes. Our hook script reads
+# AGENT_ID + DASHBOARD_PORT from env (injected at supervised-worker launch)
+# and POSTs idle to the dashboard. \${WORKSPACE_ROOT} is materialized at
+# scaffold-write time — Codex has no \${CLAUDE_PROJECT_DIR} analog.
+
+[[hooks.Stop]]
+
+[[hooks.Stop.hooks]]
+type = "command"
+command = 'node "\${WORKSPACE_ROOT}/.dashboard/scripts/dashboard-status.mjs"'
+timeout = 30
+`;
+
+/** Class IV hook script — written to
+ *  <workspace>/.dashboard/scripts/dashboard-status.mjs on first supervised
+ *  worker launch. Reads AGENT_ID + DASHBOARD_PORT from the worker process env
+ *  (injected at launch by the supervisor). Fire-and-forget POST with a 1.5s
+ *  timeout so a slow / missing dashboard never blocks the user-visible hook.
+ *  If the POST fails, inference (classes I–III) still drives status — degraded
+ *  but not broken. */
+export const DASHBOARD_STATUS_SCRIPT_MJS = `#!/usr/bin/env node
+// Class IV worker hook script — see plans/class-iv-worker-hook-scaffold.md
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
+import fs from 'node:fs';
+
+const agentId = process.env.AGENT_ID;
+const port = process.env.DASHBOARD_PORT || '24678';
+const host = process.env.DASHBOARD_HOST || '127.0.0.1';
+if (!agentId) process.exit(0);
+
+const rawState = process.argv[2];
+const state = rawState === 'working' ? 'working' : 'idle';
+const source = state === 'working' ? 'hook-start' : 'hook-stop';
+const body = JSON.stringify({ state, source, ts: Date.now() });
+const url = \`http://\${host}:\${port}/api/agents/\${agentId}/status\`;
+// Claude exports CLAUDE_HOOK_EVENT_NAME (e.g. 'Stop', 'SubagentStop',
+// 'UserPromptSubmit'); Codex passes hook_event_name on stdin instead, so for
+// Codex we tag it as 'codex'.
+const hookEvent = process.env.CLAUDE_HOOK_EVENT_NAME || 'unknown';
+
+try {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), 1500);
+  await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body,
+    signal: ac.signal,
+  });
+  clearTimeout(timer);
+} catch (err) {
+  // L-C diagnosability: append an attempt record so a single grep over
+  // <workspace>/.dashboard/pending-status.jsonl shows every hook that failed
+  // to reach the dashboard. Stays best-effort — if even the appendFileSync
+  // fails (e.g. read-only fs) we still swallow so the user-visible hook
+  // never blocks. Inference fallback continues to drive status.
+  try {
+    const scriptDir = path.dirname(fileURLToPath(import.meta.url));
+    const logPath = path.resolve(scriptDir, '..', 'pending-status.jsonl');
+    const line = JSON.stringify({
+      ts: Date.now(),
+      agentId,
+      hookEvent,
+      host,
+      port,
+      url,
+      error: err instanceof Error ? err.message : String(err),
+    }) + '\\n';
+    fs.appendFileSync(logPath, line);
+  } catch {
+    // Last-resort swallow — inference fallback still drives status.
+  }
 }
 `;
 

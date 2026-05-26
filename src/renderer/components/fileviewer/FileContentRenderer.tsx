@@ -18,9 +18,10 @@ interface Props {
   filePath: string;
   pathType: PathType;
   error?: string;
+  tabId?: string;
 }
 
-export default function FileContentRenderer({ content, filePath, pathType, error }: Props) {
+export default function FileContentRenderer({ content, filePath, pathType, error, tabId }: Props) {
   if (error) {
     return (
       <div className="flex items-center justify-center h-full">
@@ -58,7 +59,7 @@ export default function FileContentRenderer({ content, filePath, pathType, error
   }
 
   if (fileType === 'markdown') {
-    return <MarkdownRenderer content={content} />;
+    return <MarkdownRenderer content={content} tabId={tabId} />;
   }
 
   if (fileType === 'csv') {

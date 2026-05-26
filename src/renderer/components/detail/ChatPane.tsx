@@ -9,13 +9,17 @@ import type { AgentStatus } from '../../../shared/types';
 import { useThemeStore } from '../../stores/theme-store';
 import AgentMarkdown from '../shared/AgentMarkdown';
 import ChatInputBar from './ChatInputBar';
+import PromptStaging from './PromptStaging';
 import ToolBlock from './chat/blocks/ToolBlock';
 import ContextUsageBar from './chat/ContextUsageBar';
+import WatchGlass from './WatchGlass';
 
 interface Props {
   agentId: string;
   agentStatus: AgentStatus;
   agentName?: string;
+  stagingOpen?: boolean;
+  watchGlass?: boolean;
 }
 
 type RenderItem =
@@ -138,7 +142,15 @@ const UserBubble = React.memo(function UserBubble({ text }: { text: string }) {
   );
 });
 
-const AssistantBubble = React.memo(function AssistantBubble({ text, agentName }: { text: string; agentName: string }) {
+const AssistantBubble = React.memo(function AssistantBubble({
+  text,
+  agentName,
+  agentId,
+}: {
+  text: string;
+  agentName: string;
+  agentId: string;
+}) {
   const isLight = useThemeStore((s) => s.theme) === 'light';
   return (
     <div className="flex flex-col items-start my-3 w-full">
@@ -151,7 +163,7 @@ const AssistantBubble = React.memo(function AssistantBubble({ text, agentName }:
         }`}
         style={{ width: '100%' }}
       >
-        <AgentMarkdown content={text} />
+        <AgentMarkdown content={text} agentId={agentId} />
       </div>
     </div>
   );
@@ -180,11 +192,54 @@ const SystemNote = React.memo(function SystemNote({ text }: { text: string }) {
   );
 });
 
-export default function ChatPane({ agentId, agentStatus, agentName }: Props) {
+function ChatItems({
+  items,
+  displayName,
+  agentId,
+}: {
+  items: RenderItem[];
+  displayName: string;
+  agentId: string;
+}) {
+  return (
+    <>
+      {items.map((item) => {
+        switch (item.kind) {
+          case 'user':
+            return <UserBubble key={item.uuid} text={item.text} />;
+          case 'assistant':
+            return <AssistantBubble key={item.uuid} text={item.text} agentName={displayName} agentId={agentId} />;
+          case 'thinking':
+            return <ThinkingNote key={item.uuid} text={item.text} />;
+          case 'tool':
+            return (
+              <ToolBlock
+                key={item.uuid}
+                toolUseId={item.toolUseId}
+                toolName={item.toolName}
+                input={item.input}
+                result={item.result}
+                agentId={agentId}
+              />
+            );
+          case 'system':
+            return <SystemNote key={item.uuid} text={item.text} />;
+        }
+      })}
+    </>
+  );
+}
+
+export default function ChatPane({ agentId, agentStatus, agentName, stagingOpen = false, watchGlass = false }: Props) {
   const isLight = useThemeStore((s) => s.theme) === 'light';
   const [events, setEvents] = useState<SessionEvent[]>([]);
   const [hydrated, setHydrated] = useState(false);
-  const scrollRef = useRef<HTMLDivElement>(null);
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+  const [scrollEl, setScrollEl] = useState<HTMLDivElement | null>(null);
+  const setScrollRef = useCallback((el: HTMLDivElement | null) => {
+    scrollRef.current = el;
+    setScrollEl(el);
+  }, []);
   const isNearBottomRef = useRef(true);
   const skipAnimateOnceRef = useRef(true);
 
@@ -244,46 +299,35 @@ export default function ChatPane({ agentId, agentStatus, agentName }: Props) {
 
   return (
     <div className={`flex-1 flex flex-col overflow-hidden ${isLight ? 'bg-[#f6f8fa]' : 'bg-[#0d1117]'}`}>
-      <div
-        ref={scrollRef}
-        onScroll={handleScroll}
-        className="flex-1 overflow-y-auto px-3 pt-2 pb-3"
-      >
-        {empty ? (
-          <div className={`h-full flex items-center justify-center px-6 ${isLight ? 'text-[#8b949e]' : 'text-gray-500'}`}>
-            <div className="text-center">
-              <div className="text-[13px] mb-1">No messages yet</div>
-              <div className="text-[11px]">Send a message below to start the conversation.</div>
+      <div className="flex-1 relative overflow-hidden">
+        <div
+          ref={setScrollRef}
+          onScroll={handleScroll}
+          className="absolute inset-0 overflow-y-auto px-3 pt-2 pb-3"
+        >
+          {empty ? (
+            <div className={`h-full flex items-center justify-center px-6 ${isLight ? 'text-[#8b949e]' : 'text-gray-500'}`}>
+              <div className="text-center">
+                <div className="text-[13px] mb-1">No messages yet</div>
+                <div className="text-[11px]">Send a message below to start the conversation.</div>
+              </div>
             </div>
-          </div>
-        ) : (
-          renderItems.map(item => {
-            switch (item.kind) {
-              case 'user':
-                return <UserBubble key={item.uuid} text={item.text} />;
-              case 'assistant':
-                return <AssistantBubble key={item.uuid} text={item.text} agentName={displayName} />;
-              case 'thinking':
-                return <ThinkingNote key={item.uuid} text={item.text} />;
-              case 'tool':
-                return (
-                  <ToolBlock
-                    key={item.uuid}
-                    toolUseId={item.toolUseId}
-                    toolName={item.toolName}
-                    input={item.input}
-                    result={item.result}
-                    agentId={agentId}
-                  />
-                );
-              case 'system':
-                return <SystemNote key={item.uuid} text={item.text} />;
-            }
-          })
+          ) : (
+            <ChatItems items={renderItems} displayName={displayName} agentId={agentId} />
+          )}
+        </div>
+        {watchGlass && !empty && (
+          <WatchGlass chatScrollEl={scrollEl} isLight={isLight}>
+            <ChatItems items={renderItems} displayName={displayName} agentId={agentId} />
+          </WatchGlass>
         )}
       </div>
       <ContextUsageBar agentId={agentId} events={events} />
-      <ChatInputBar agentId={agentId} agentStatus={agentStatus} />
+      {stagingOpen ? (
+        <PromptStaging agentId={agentId} agentStatus={agentStatus} />
+      ) : (
+        <ChatInputBar agentId={agentId} agentStatus={agentStatus} />
+      )}
     </div>
   );
 }

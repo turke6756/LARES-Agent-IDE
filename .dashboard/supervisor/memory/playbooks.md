@@ -113,3 +113,45 @@ Add an entry when you find yourself doing the same multi-step procedure twice. R
 3. If a matching gotcha exists in `groupthink-running-gotchas.md` (or other gotcha file), mark it `(FIXED YYYY-MM-DD)` or delete it.
 4. Update `MEMORY.md` highlights if the fix is notable.
 5. Tell the user the fix is ready to commit + (if applicable) requires a `npm run restart` to take effect.
+
+---
+
+## P-08: Plan + review-of-plan synthesis
+
+**When:** You're holding two paired documents — a **plan** (design doc, migration spec, proposal, RFC) and a **review of that plan** (agent output, GroupThink result, human reviewer, code-review comments on the doc). The user wants your interpretation: how damning is the review, what does it force, can we proceed.
+
+**This is a recurring two-document workflow.** Treat it as a named procedure, not ad-hoc analysis. The behavioral trigger is B-09.
+
+**Steps:**
+
+1. **Read both documents end-to-end.** Don't skim — the review references the plan by section and line. The most useful catches are mismatches between what the review claims and what the plan actually says.
+
+2. **Spot-verify the review's load-bearing claims.** Open the source files for any blocker-tier finding and confirm the review describes the code accurately. Reviews can be wrong about line refs (drift), wrong about behavior (misread), or right but already mitigated elsewhere in the plan. If a central claim doesn't survive verification, the review's weight shifts — say so.
+
+3. **Frame each finding by four plain-language questions** (per B-09):
+   - **Obviousness:** how obvious would this be if we shipped the plan as-is? First launch on a non-dev machine? First user edge case? Weeks-later mystery? Never surface?
+   - **Manifestation:** what concrete failure mode would the user/dev see — error on launch, silent stuck row, surprising overwrite, slow degradation?
+   - **Catchability:** does normal testing catch this, or does it need odd-edge-case conditions (two concurrent events, specific platform path) to trigger?
+   - **Severity tier:** 🔴 ship-blocker (wouldn't have worked / shipped broken) / 🟡 annoyance-blocker (user surprise, maintenance pain) / 🟢 polish (clarity, drift guards, label fixes).
+
+4. **Rank and compress.** Group findings by tier. Estimate doc-edit sizes (paragraph / sentence / one-line). Note which findings change the plan's architecture vs. which are pure doc cleanup.
+
+5. **Report to the user in this order:**
+   - **One-line verdict:** how damning overall ("two real catches, lots of polish" / "solid but one structural rethink needed" / "minor — keep going").
+   - **Ship-blockers in plain language**, each with a concrete failure prediction (not "would cause issues" — "would have failed at first non-dev launch with `script not found`").
+   - **Annoyance tier:** short list, one-line each.
+   - **Polish tier:** one sentence ("9 small clarifications and label tweaks").
+   - **Edit-size accounting** so the user knows the cost ("2 paragraph edits, ~10 sentence edits, ~8 one-liners — single agent, under an hour").
+   - **Recommendation:** keep going / pause / rethink — and the next concrete step.
+
+6. **Push back where you disagree.** A review is a proposal, not a verdict. If a recommendation has a subtle race, a missing option, or a better alternative, say so explicitly. The user is buying your judgment, not the reviewer's.
+
+**Output discipline:**
+- Lead with the abstraction (B-06). Severity framing leads; technical detail supports.
+- Concrete failure predictions beat generic severity adjectives.
+- Severity table (🔴 / 🟡 / 🟢) with one-line "what's in this tier" lands well when there are more than ~5 findings.
+- Useful framings the user has responded to: contractor-reviewing-plumbing-before-concrete; "would have surfaced as an embarrassing demo moment"; edit-size sizing.
+
+**Anti-pattern:** Relaying the review section-by-section. Even if every finding is real and well-stated, the user can't tell from a section-ordered relay whether the review was damning or pedantic. The reviewer wrote the review; you write the **interpretation**.
+
+**Source:** 2026-05-17 multi-supervisor migration review (`plans/multi-supervisor-migration-review.md` reviewing `docs/MULTI_SUPERVISOR_AND_ORCHESTRATION_MIGRATION.md`) — user explicitly formalized this as a recurring workflow after the synthesis landed well on the second pass.

@@ -2,8 +2,152 @@ import { spawn, ChildProcess } from 'child_process';
 import { EventEmitter } from 'events';
 import * as fs from 'fs';
 import path from 'path';
-import { tmuxNewSession, tmuxKillSession, isTmuxSessionAlive, tmuxCapturePane, wslExec } from '../wsl-bridge';
+import { tmuxNewSession, tmuxKillSession, isTmuxSessionAlive, tmuxCapturePane, wslExec, buildTmuxAttachCmd, TmuxNewSessionResult } from '../wsl-bridge';
 import { getScriptPath } from './paths';
+
+/** BUG-22 Step 1 diagnostic metadata passed from `launchWslAgent` so the
+ *  runner can append one complete JSONL record per launch attempt once the
+ *  attach result is known. */
+export interface WslLaunchDiagnostics {
+  launchStartedAt: string;
+  /** Workspace-relative `.dashboard/launches.log` path. When null, JSONL
+   *  appending is disabled (no workspace path available). */
+  launchesLogPath: string | null;
+  agentId: string;
+  agentTitle: string;
+  workspaceId: string;
+  provider: string;
+  isSupervisor: boolean;
+  isSupervised: boolean;
+  resume: boolean;
+  freshSession: boolean;
+}
+
+/** BUG-22 Step 1 diagnostic: the failure-header block prepended to the agent's
+ *  PTY log when `tmuxNewSession` returns `ok: false`. Pure builder so the
+ *  format can be unit-tested without spawning tmux. */
+export function buildTmuxFailureHeaderBlock(input: {
+  tmuxSessionName: string;
+  tmuxExitCode: number | null;
+  tmuxStderr: string;
+  command: string;
+  nowIso?: string;
+}): string {
+  const stamp = input.nowIso ?? new Date().toISOString();
+  const stderrText = input.tmuxStderr && input.tmuxStderr.length > 0
+    ? input.tmuxStderr
+    : '(empty)';
+  const exitCodeStr = input.tmuxExitCode != null
+    ? String(input.tmuxExitCode)
+    : '(unknown)';
+  return [
+    '===== WSL tmux session creation failed =====',
+    `timestamp: ${stamp}`,
+    `tmux session: ${input.tmuxSessionName}`,
+    `tmux exit code: ${exitCodeStr}`,
+    'stderr:',
+    stderrText,
+    '',
+    'command:',
+    input.command,
+    '============================================',
+    '',
+  ].join('\n');
+}
+
+/** BUG-22 Step 1 diagnostic: pure builder for the JSONL log record so the
+ *  exact serialization shape can be unit-tested without spawning a runner. */
+export function buildLaunchRecord(input: {
+  diagnostics: WslLaunchDiagnostics;
+  sessionName: string;
+  workDir: string;
+  command: string;
+  tmuxResult: TmuxNewSessionResult | null;
+  attachAttempted: boolean;
+  attachExitCode: number | null;
+  attachSignal: string | null;
+  outputTail: string;
+  nowIso?: string;
+}): WslLaunchAttemptLogRecord {
+  const tmux = input.tmuxResult;
+  return {
+    schema_version: 1,
+    timestamp: input.nowIso ?? new Date().toISOString(),
+    launch_started_at: input.diagnostics.launchStartedAt,
+    agent_id: input.diagnostics.agentId,
+    agent_title: input.diagnostics.agentTitle,
+    workspace_id: input.diagnostics.workspaceId,
+    provider: input.diagnostics.provider,
+    is_supervisor: input.diagnostics.isSupervisor,
+    is_supervised: input.diagnostics.isSupervised,
+    resume: input.diagnostics.resume,
+    fresh_session: input.diagnostics.freshSession,
+    work_dir: input.workDir,
+    tmux_session_name: input.sessionName,
+    command: input.command,
+    tmux_new_session: {
+      ok: tmux?.ok ?? false,
+      exit_code: tmux?.exitCode ?? null,
+      stderr: tmux?.stderr ?? '',
+      stdout: tmux?.stdout ?? '',
+      tmux_command: tmux?.tmuxCommand ?? '',
+    },
+    attach_result: {
+      attempted: input.attachAttempted,
+      exit_code: input.attachExitCode,
+      signal: input.attachSignal,
+      output_tail: input.outputTail,
+    },
+  };
+}
+
+/** BUG-22 Step 1 diagnostic: append one JSONL record to `launchesLogPath`.
+ *  Best-effort — file I/O failures are logged to `console.error` and swallowed
+ *  so the diagnostic path can never block or fail a launch. */
+export function appendLaunchRecord(
+  launchesLogPath: string,
+  record: WslLaunchAttemptLogRecord,
+): void {
+  try {
+    const dir = path.dirname(launchesLogPath);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.appendFileSync(launchesLogPath, JSON.stringify(record) + '\n');
+  } catch (err) {
+    console.error(`[WSL] failed to append launches.log at ${launchesLogPath}:`, err);
+  }
+}
+
+/** BUG-22 Step 1 diagnostic: shape of the JSONL record appended to
+ *  `<workspace>/.dashboard/launches.log` once per launch attempt. */
+export interface WslLaunchAttemptLogRecord {
+  schema_version: 1;
+  timestamp: string;
+  launch_started_at: string;
+  agent_id: string;
+  agent_title: string;
+  workspace_id: string;
+  provider: string;
+  is_supervisor: boolean;
+  is_supervised: boolean;
+  resume: boolean;
+  fresh_session: boolean;
+  work_dir: string;
+  tmux_session_name: string;
+  command: string;
+  tmux_new_session: {
+    ok: boolean;
+    exit_code: number | null;
+    stderr: string;
+    stdout: string;
+    tmux_command: string;
+  };
+  attach_result: {
+    attempted: boolean;
+    exit_code: number | null;
+    signal: string | null;
+    output_tail: string;
+  };
+}
 
 /**
  * Runs a Claude agent inside WSL via node-pty (through pty-host.js).
@@ -29,6 +173,15 @@ export class WslRunner extends EventEmitter {
   private _intentionalKill: boolean = false;
   private buffer: string = '';
   private logStream: fs.WriteStream | null = null;
+  // BUG-22 Step 1 diagnostic state — captured at launch and consumed once at
+  // the first attach exit (or pre-attach failure) to append exactly one JSONL
+  // record to `<workspace>/.dashboard/launches.log`.
+  private _diagnostics: WslLaunchDiagnostics | null = null;
+  private _launchWorkDir: string = '';
+  private _launchCommand: string = '';
+  private _tmuxResult: TmuxNewSessionResult | null = null;
+  private _attachAttempted: boolean = false;
+  private _launchRecordWritten: boolean = false;
   // P2-02: ring buffer sibling for PromptPatternDetector. WindowsRunner ships
   // one for chat-history use; the WSL path historically pulled tail bytes via
   // a `tmuxCapturePane` subprocess. We mirror the Windows shape so the
@@ -68,26 +221,127 @@ export class WslRunner extends EventEmitter {
    * Launch the agent. Spawns pty-host.js running `wsl.exe bash -lc "cd /dir && command"`
    * directly in a PTY, so terminal data flows from the start (just like WindowsRunner).
    * Also creates a tmux session for persistence/reconnect.
+   *
+   * BUG-22 Step 1: `diagnostics` is consumed once at the first attach exit (or
+   * pre-attach failure) to append a single JSONL record describing the launch
+   * attempt — the tmux-new-session result, the rendered command, and the
+   * attach result. Pass `null` to disable per-attempt JSONL logging.
    */
-  async launch(workDir: string, command: string, logPath: string): Promise<void> {
+  async launch(
+    workDir: string,
+    command: string,
+    logPath: string,
+    diagnostics: WslLaunchDiagnostics | null = null,
+  ): Promise<void> {
+    this._diagnostics = diagnostics;
+    this._launchWorkDir = workDir;
+    this._launchCommand = command;
+    this._tmuxResult = null;
+    this._attachAttempted = false;
+    this._launchRecordWritten = false;
+
     // Kill any stale tmux session with the same name (leftover from previous app run)
     if (await isTmuxSessionAlive(this.sessionName)) {
       console.log(`[WSL] Killing stale tmux session '${this.sessionName}'`);
       await tmuxKillSession(this.sessionName);
     }
 
-    // Create tmux session for persistence (agent survives dashboard restart)
-    // No tee needed — the PTY logStream captures output directly
-    try {
-      await tmuxNewSession(this.sessionName, workDir, command);
+    // Create tmux session for persistence (agent survives dashboard restart).
+    // BUG-22 Step 1: tmuxNewSession is now structured-result; non-zero exit is
+    // data, not an exception. Capture the result for the diagnostic JSONL and,
+    // on failure, prepend a clear failure block to the agent PTY log so the
+    // dashboard's terminal viewer surfaces it at a glance.
+    const tmuxResult = await tmuxNewSession(this.sessionName, workDir, command);
+    this._tmuxResult = tmuxResult;
+    if (tmuxResult.ok) {
       console.log(`[WSL] Created tmux session '${this.sessionName}'`);
-    } catch (err) {
-      console.error(`[WSL] Failed to create tmux session:`, err);
-      // Continue anyway — we'll run directly in PTY
+    } else {
+      console.error(
+        `[WSL:${this.sessionName}] tmux-new-session failed exit=${tmuxResult.exitCode}: ${tmuxResult.stderr}`,
+      );
+      const header = buildTmuxFailureHeaderBlock({
+        tmuxSessionName: this.sessionName,
+        tmuxExitCode: tmuxResult.exitCode,
+        tmuxStderr: tmuxResult.stderr,
+        command,
+      });
+      if (logPath) {
+        try {
+          const logDir = path.dirname(logPath);
+          if (!fs.existsSync(logDir)) fs.mkdirSync(logDir, { recursive: true });
+          fs.appendFileSync(logPath, header);
+        } catch (err) {
+          console.error(`[WSL:${this.sessionName}] failed to write tmux failure header:`, err);
+        }
+      }
+      // Also seed the in-memory ring so the terminal viewer surfaces the
+      // header even before the PTY attach starts producing data.
+      this.appendToRing(header);
+      // Surface the failure to the supervisor pipeline. Pre-attach we still
+      // proceed to spawn the PTY — `tmux attach` will fail with `can't find
+      // session` and exit 1, which carries normal crashed-status semantics.
+      this.emit('tmuxNewSessionFailed', {
+        tmuxSessionName: this.sessionName,
+        command,
+        tmuxExitCode: tmuxResult.exitCode,
+        tmuxStderr: tmuxResult.stderr,
+        tmuxCommand: tmuxResult.tmuxCommand,
+      });
     }
 
-    // Now spawn the PTY that attaches to the tmux session for live terminal output
+    // Spawn the PTY that attaches to the tmux session. The attach is what
+    // surfaces output to the dashboard; we always attempt it even on
+    // tmuxNewSession failure so the subsequent exit lands through the same
+    // runner-exit path the dashboard already handles.
     this.spawnPtyHost(workDir, command, logPath, false);
+  }
+
+  /** BUG-22 Step 1: append a string to the in-memory output ring buffer
+   *  without flipping any meaningful-content / activity flags. Used by the
+   *  tmux failure header so the terminal viewer can render it immediately. */
+  private appendToRing(text: string): void {
+    const newLines = text.split('\n');
+    if (this.outputRing.length > 0 && newLines.length > 0) {
+      this.outputRing[this.outputRing.length - 1] += newLines[0];
+      for (let i = 1; i < newLines.length; i++) {
+        this.outputRing.push(newLines[i]);
+      }
+    } else {
+      this.outputRing.push(...newLines);
+    }
+    this.outputRingBytes += text.length;
+    while (
+      this.outputRing.length > WslRunner.MAX_RING_LINES ||
+      this.outputRingBytes > WslRunner.MAX_RING_BYTES
+    ) {
+      const dropped = this.outputRing.shift();
+      if (dropped === undefined) break;
+      this.outputRingBytes -= dropped.length + 1;
+      if (this.outputRingBytes < 0) this.outputRingBytes = 0;
+    }
+  }
+
+  /** BUG-22 Step 1: append one JSONL record to the workspace's launches.log
+   *  describing the full launch attempt. Called exactly once per attempt; the
+   *  internal `_launchRecordWritten` guard prevents double-writes when both
+   *  the pty-host process exits and the inner PTY emits an `exit` message. */
+  private writeLaunchRecord(attachExitCode: number | null, attachSignal: string | null): void {
+    if (this._launchRecordWritten) return;
+    this._launchRecordWritten = true;
+    const diag = this._diagnostics;
+    if (!diag || !diag.launchesLogPath) return;
+    const record = buildLaunchRecord({
+      diagnostics: diag,
+      sessionName: this.sessionName,
+      workDir: this._launchWorkDir,
+      command: this._launchCommand,
+      tmuxResult: this._tmuxResult,
+      attachAttempted: this._attachAttempted,
+      attachExitCode,
+      attachSignal,
+      outputTail: this.getOutputRingTail(4096),
+    });
+    appendLaunchRecord(diag.launchesLogPath, record);
   }
 
   /**
@@ -146,20 +400,23 @@ export class WslRunner extends EventEmitter {
         this.logStream = null;
         this.persistScrollback();
         const reportedCode = this._intentionalKill ? 0 : ((code ?? 1) || 137);
+        // BUG-22 Step 1: append the JSONL diagnostic before emitting `exit`
+        // so consumers see the file already written. Idempotent — safe even
+        // when the inner PTY `exit` message already fired writeLaunchRecord.
+        this.writeLaunchRecord(reportedCode, null);
         this.emit('exit', reportedCode, null);
       }
       this.host = null;
     });
 
-    // Build the WSL command
-    let bashCmd: string;
-    if (reconnect) {
-      // Reconnect: attach to existing tmux session
-      bashCmd = `tmux attach -t '${this.sessionName}'`;
-    } else {
-      // Fresh launch: attach to the tmux session we just created
-      bashCmd = `tmux attach -t '${this.sessionName}'`;
-    }
+    // Build the WSL command. Both fresh-launch and reconnect attach to a tmux
+    // session by name; `buildTmuxAttachCmd` wraps the attach in a short
+    // `tmux has-session` poll so the cold-launch create→attach race documented
+    // in plans/bug-supervisor-wsl-launch-investigation.md doesn't surface as a
+    // phantom `crashed (exitCode:1) → auto_restart` cycle. Reconnect can use
+    // the same shape — if the session is already up (the common case), the
+    // poll exits on iteration 1.
+    const bashCmd = buildTmuxAttachCmd(this.sessionName);
 
     this.sendToHost({
       type: 'spawn',
@@ -168,6 +425,12 @@ export class WslRunner extends EventEmitter {
       cols: 120,
       rows: 40,
     });
+    // BUG-22 Step 1: record that the attach was attempted so the diagnostic
+    // JSONL distinguishes "attach exited with code N" from "attach never
+    // started" (e.g. pty-host failed to fork). The reconnect path also passes
+    // through here, but reconnects don't carry diagnostics so writeLaunchRecord
+    // is a no-op for them.
+    this._attachAttempted = true;
 
     this._alive = true;
     this._lastOutputTime = Date.now();
@@ -236,6 +499,11 @@ export class WslRunner extends EventEmitter {
         this.persistScrollback();
         {
           const reportedCode = this._intentionalKill ? 0 : ((msg.exitCode ?? 1) || 137);
+          // BUG-22 Step 1: append the JSONL diagnostic with the inner PTY's
+          // exit-code/signal pair before emitting `exit`. The pty-host process
+          // exit handler also calls writeLaunchRecord; idempotency guarantees
+          // exactly one record per launch.
+          this.writeLaunchRecord(reportedCode, msg.signal ?? null);
           this.emit('exit', reportedCode, msg.signal);
         }
         if (this.host && !this.host.killed) {

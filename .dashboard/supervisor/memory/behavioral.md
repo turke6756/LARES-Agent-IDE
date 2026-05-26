@@ -101,3 +101,98 @@ Add an entry when an interaction surfaces a behavior worth repeating (or worth N
 **Anti-pattern:** opening with "Substantive finding —" or "Investigation done —" with no agent name and no task recap. From the user's view, an unnamed result appears out of nowhere and they have to mentally scroll back to figure out who and why.
 
 **Source:** 2026-05-17 user feedback after the mcp-context-output-tools-investigation agent returned and the supervisor jumped straight into findings without naming the agent or recapping the task.
+
+---
+
+## B-09: Two related docs in scope — a plan and a review of that plan → run P-08 (synthesis), don't relay
+
+**Trigger:** You're holding (or about to produce) an interpretation of **two paired documents**: a plan/design/proposal AND a review/critique of it. Sources can be any combination — agent-produced review, GroupThink output, human reviewer, code-review comments on a doc. The user wants your read on what to do next.
+
+**Recognize this as its own recurring workflow.** It is *not* just "answer the user's question about the doc." Plan + review synthesis has a defined shape (see playbook **P-08**) and a defined failure mode (relaying the review's structure instead of compressing through a severity lens).
+
+**Action:** Execute P-08. Headline behaviors:
+
+- **Verify the review's load-bearing claims yourself** before reporting weight — line refs drift, reviewers can misread. A blocker that doesn't survive verification changes the whole picture.
+- **Frame each finding by severity + manifestation, not by the review's section order.** Four questions per finding: how obvious would the bug be if shipped, how would it manifest concretely, catchable in normal testing or needs odd edge conditions, severity tier (ship-blocker / annoyance / polish).
+- **Lead with the verdict.** "Two real catches, lots of polish" beats "the reviewer flagged 11 issues across 2 categories."
+- **Push back where you disagree.** The review is a proposal; you're the synthesizer. If a recommendation has a subtle race or a better alternative, say so.
+
+**Anti-pattern:** Paraphrasing the review section-by-section. The user can read the review themselves — your value is the severity judgment, the verification, and the recommendation.
+
+**Source:** 2026-05-17 user direction — "ultimately this is a fundamental workflow bringing together two pieces of documentation often a plan and a review to that plan, let's make sure this is formalized." Initial response on the multi-supervisor migration review came across as a wall of detail; the follow-up severity-ladder framing landed and the user asked it be lifted into a named workflow.
+
+---
+
+## B-10: Before relying on a `[DASHBOARD EVENT]` to know when an agent is done, confirm they're supervised — otherwise you must poll
+
+**Trigger:** You launched, inherited, or are about to send work to an agent and you're planning to wait for them to idle/finish.
+
+**Action:** Check the agent's `isSupervised` field via `list_agents`. Two cases:
+
+- **Supervised** (`isSupervised: true`, typically launched as Class IV under `.dashboard/workers/<provider>/`): the event-bridge will fire `[DASHBOARD EVENT]` to you on idle/done/crashed/waiting_for_input. You can wait passively.
+- **Not supervised** (`isSupervised: false`, working directory is workspace root or anywhere else): **no events will fire to you.** `event-bridge.ts:90` short-circuits and emits nothing. You must poll — either via `ScheduleWakeup` (re-fire the conversation on an interval) or by checking `list_agents` / `read_agent_chat` when the user pings or another event re-engages you. Don't wait passively — you'll be stranded indefinitely.
+
+**When you poll:** prefer `list_agents` (cheap, shows status field) over re-reading full chat. Once status flips to `idle`, then call `read_agent_chat(agent_id, role: 'assistant', limit: 1)` to grab the writeup. Cadence: every 2–3 minutes for short tasks; ScheduleWakeup ≥ 1200s for long-running ones (cache-window economics, see ScheduleWakeup tool docs).
+
+**Anti-pattern:** Sending a directive to an unsupervised agent and then telling the user "I'll surface their writeup when they idle." You won't — they'll never appear in your event stream, and the conversation will just sit silent until the user re-engages.
+
+**Related infra gap:** there's no `subscribe_to_agent(agent_id)` tool that lets the supervisor opt an arbitrary agent into the event stream after launch. That's the future improvement — extending the event-bridge gate from "supervised-only" to "supervised OR explicitly-subscribed" would close this blind spot for ad-hoc workers, inherited agents from prior sessions, and any agent the supervisor didn't launch themselves. Until then, polling is the only path.
+
+**Source:** 2026-05-21 — supervisor sent the WSL launcher agent (`6c0b29c4`, opened at the workspace root, not supervised) a follow-up diagnosis directive and told the user "waiting on their report." User correctly flagged that no event would ever arrive because the agent isn't supervised. Confirmed at `src/main/supervisor/event-bridge.ts:90` (`if (!agent || agent.isSupervisor || !agent.isSupervised) return;`).
+
+---
+
+## B-11: Open question handling — research first, triage by impact, escalate only the high-impact ones
+
+**Trigger:** You're holding one or more open questions / decision points before proceeding. Or you're about to present a list of "open questions" to the user.
+
+**Action — three-step pipeline before anything reaches the user:**
+
+1. **Research first.** Reach for WebSearch + WebFetch (or domain-specific tools) before treating a question as user-only. Look for community knowledge, official docs, GitHub discussions, changelogs, source-code reads. Worst case: nothing useful surfaces, ~30s spent. Common case: the question collapses — there's a known industry-standard answer, an official-guidance ruling, or a path that's been ruled out. **Reaching for research is cheap; bothering the user is not.**
+
+2. **Triage by impact.** For each remaining open question, rank:
+   - **Low** — cosmetic, fully reversible, internal trade-off the user can't meaningfully weigh in on (e.g., "which file to put a helper in," "5s vs 8s polling interval," "JSON vs YAML for an internal config").
+   - **Medium** — user-visible behavior, reversible with one config tweak or env var. Industry-standard answer exists.
+   - **High** — architectural commit, hard to reverse, broad blast radius, security/data/permissions implications, scope expansion, depends on user context you genuinely don't have.
+
+3. **For low/medium impact: take charge.** Pick the industry-standard or well-supported answer and surface what you decided in your next user-facing message. Don't escalate. This is the same posture as B-02 "default to acting" — asking when judgment doesn't need the user wastes their attention.
+
+**For high-impact questions only — escalate, in plain language:** Don't assume the user holds the technical context. Use the B-06 abstraction-first framing AND add practical-consequence framing for each path. Template:
+
+> **The call:** [decision point in one plain-language sentence — no jargon]
+> **What it changes:** [practical consequence per path — what the user will see / experience / lose / gain]
+> **My recommendation:** [pick + brief rationale]
+> **Why I'm asking instead of deciding:** [the genuinely user-only piece — context I can't reach, preference I can't infer, blast radius too big to absorb]
+
+**Anti-patterns:**
+- Dumping N open questions on the user when N-1 are low/medium-impact. Triage is your job.
+- Escalating without first checking if online research collapses the question.
+- Escalating with technical jargon ("OK to read codex's internal state_5.sqlite?") instead of practical framing ("OK to swap one file-discovery approach for another that's cleaner but ties us slightly to codex's internal storage?").
+- Burying the user-only piece — if you can't articulate why this specific question needs the user (vs. you), it doesn't.
+
+**Source:** 2026-05-23 — after the Windows+WSL investigation synthesis, supervisor surfaced five "open questions" to the user. User pushed back: four were within supervisor authority (low/medium impact with industry-standard answers); only one genuinely needed user judgment. User direction was explicit: "the open questions with big impacts that you should ask me and again when you do ask you need to explain it in simpler terms because I'm not steeped in all the technical aspects and you need to give me context for the scope or behavioral repercussions of making certain decisions." Same session also demonstrated the research-first principle: the codex session-id question was fully resolved via WebSearch + WebFetch (community Discussion #3827 + changelog + DeepWiki + live SQLite schema check) — discovering a much better solution (`state_5.sqlite` query) than the original "per-agent cwd" recommendation had supposed was the only option.
+
+---
+
+## B-12: External tool's internals are the blocker → spawn a research subagent on the GitHub repo, don't guess
+
+**Trigger:** You need to understand how a third-party CLI / provider / config file works at a level deeper than its public docs cover — e.g., what bytes a hash actually covers, what a config field means, why behavior differs between platforms, what an undocumented flag does, why a feature appears to silently no-op. Local artifacts (the config file, the running process, your codebase, error output) hint at the answer but don't conclusively explain it. The authoritative source is a public GitHub repo (or vendor docs / changelogs).
+
+**Action:** Spawn an `Agent` with `subagent_type: "general-purpose"`. Hand it: the GitHub repo, the specific source paths or symbol names worth reading (or the starting search query), and a tight scope ("under 400 words, GitHub permalinks where helpful, punch-list format"). The subagent runs WebSearch + WebFetch + source-code reads against the tool's actual codebase across many tool calls; you get back a single distilled finding. Multi-step research stays out of your main context window.
+
+**When this beats a direct WebSearch/WebFetch call:** the question requires reading multiple source files, cross-referencing PRs, or chasing a behavior chain. Direct WebSearch/WebFetch is right when the answer fits on one page (changelog, doc paragraph, single issue thread).
+
+**Good automatic triggers — go without asking:**
+- An external tool's behavior is the blocker on a user decision, and the user couldn't reasonably answer from their own knowledge either.
+- You're about to recommend a "robust" path that depends on reverse-engineering (hash algorithm, config schema, internal storage format). The repo answers it cheaper than a brittle reimplementation.
+- You're about to flag a platform difference ("Windows does X, WSL does Y") without a mechanism — find the mechanism before reporting.
+- A behavior contradicts what you'd expect from the docs. Almost always the source has the real story.
+
+**Don't:**
+- Spawn a subagent for a single-page answer — use WebSearch directly.
+- Spawn one without bounding the response — uncapped reports balloon your context.
+- Burn your own context grepping someone else's repo when a subagent does it isolated.
+
+**Anti-pattern:** Proposing a brittle workaround from local evidence ("we'd have to reverse-engineer the hash by experiment") when the authoritative source is a public GitHub repo two tool calls away. Or surfacing an "open question" about an external tool's internals to the user instead of researching it first (this is the B-11 research-first principle, narrowed to the GitHub-repo case).
+
+**Source:** 2026-05-25 codex hook trust investigation. User asked how to pre-trust a codex hook so the first-launch dialog stops blocking. Local artifacts showed `~/.codex/config.toml [hooks.state.<key>] trusted_hash = "sha256:..."` but the hash algorithm was unknown and Windows-vs-WSL behavior differed inexplicably. Spawned a general-purpose Agent against `openai/codex` with paths into `codex-rs/hooks/src/engine/discovery.rs` + `codex-rs/config/src/fingerprint.rs`; it returned in ~3 min with the canonicalization (TOML → sorted-key JSON → SHA-256), the platform-symmetry confirmation (no `cfg(windows)` in the trust gate, so the WSL "no prompt" is likely silent skip not legit trust), the trust-key format (`<config-path>:<event>:<group_idx>:<handler_idx>`), and the existence of `--dangerously-bypass-hook-trust` as a one-line escape hatch — all with GitHub permalinks. That answer collapsed the decision into a concrete recommendation (Option A flag vs Option B pre-seed) instead of a guess.

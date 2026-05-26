@@ -6,7 +6,8 @@ export type StatusChangeSource =
   | 'launch'
   | 'restart'
   | 'restart-failed'
-  | 'stop';
+  | 'stop'
+  | 'start-hook-silence-watchdog';
 
 /** Mirror of `StatusMonitor.WaitingKind`. Re-declared here to keep this leaf
  *  module free of importing the monitor (which pulls in the database). */

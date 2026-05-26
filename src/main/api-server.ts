@@ -153,6 +153,10 @@ export class ApiServer {
       const agentId = messagesMatch[1];
       const limit = parseInt(url.searchParams.get('limit') || '50', 10);
       const role = url.searchParams.get('role') as 'assistant' | 'user' | undefined;
+      // BUG-28: lazy-recover Codex resumeSessionId on chat-read so a discovery
+      // race-loss doesn't permanently blank the chat for callers (the dashboard
+      // UI, MCP read_agent_chat, groupthink relay loop).
+      this.supervisor.maybeRecoverCodexSid(agentId);
       const messages = await this.supervisor.getChatService().getMessages(agentId, { limit, role });
       return { agentId, limit, messages };
     }
@@ -296,6 +300,39 @@ export class ApiServer {
         resolvedFrom,
         ...(keyName !== undefined ? { key: keyName, count } : {}),
       };
+    }
+
+    // POST /api/agents/:id/status — class IV worker hook receive endpoint.
+    // The supervised-worker Stop hook (state='idle') and UserPromptSubmit
+    // hook (state='working') post here at turn boundaries.
+    // Body: { state: 'idle' | 'working', source: string, ts?: number }
+    // We flip the agent's StatusMonitor latch and the existing EventBridge →
+    // supervisor notification pipeline picks up the change. See
+    // plans/class-iv-worker-hook-scaffold.md.
+    const statusMatch = path.match(/^\/api\/agents\/([^/]+)\/status$/);
+    if (method === 'POST' && statusMatch) {
+      const agentId = statusMatch[1];
+      const agent = getAgent(agentId);
+      if (!agent) throw Object.assign(new Error('Agent not found'), { statusCode: 404 });
+
+      const body = await readBody(req);
+      const parsed = JSON.parse(body);
+      const state: unknown = parsed.state;
+      const source: unknown = parsed.source;
+
+      if (state !== 'idle' && state !== 'working') {
+        throw Object.assign(
+          new Error(`Unsupported state ${JSON.stringify(state)} — only 'idle' or 'working' accepted`),
+          { statusCode: 400 },
+        );
+      }
+      const sourceTag = typeof source === 'string' && source.length > 0 ? source : 'hook';
+      if (state === 'working') {
+        this.supervisor.forceWorkingFromHook(agentId, sourceTag);
+      } else {
+        this.supervisor.forceIdleFromHook(agentId, sourceTag);
+      }
+      return { ok: true, agentId, state, source: sourceTag };
     }
 
     // POST /api/agents — launch a new agent

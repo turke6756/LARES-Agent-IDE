@@ -5,7 +5,29 @@ import { loadDraft, saveDraft } from '../../lib/chat-drafts';
 
 const ACCEPTING_INPUT: AgentStatus[] = ['idle', 'waiting', 'done', 'crashed'];
 
-export default function ChatInputBar({ agentId, agentStatus }: { agentId: string; agentStatus: AgentStatus }) {
+export interface ChatInputBarProps {
+  agentId: string;
+  agentStatus: AgentStatus;
+  // Staging mode: when true, render a drag handle inside the pill so the user
+  // can drag the bar onto a note to swap, and skip the outer border so the bar
+  // can sit cleanly inside the staging stack.
+  showDragHandle?: boolean;
+  onBarDragStart?: (e: React.DragEvent) => void;
+  onBarDragEnd?: (e: React.DragEvent) => void;
+  // Bumped by the staging container after a swap so the bar re-reads its
+  // (now-changed) draft from localStorage without remounting (which would
+  // lose focus).
+  syncSignal?: number;
+}
+
+export default function ChatInputBar({
+  agentId,
+  agentStatus,
+  showDragHandle = false,
+  onBarDragStart,
+  onBarDragEnd,
+  syncSignal,
+}: ChatInputBarProps) {
   const isLight = useThemeStore((s) => s.theme) === 'light';
   const [input, setInput] = useState<string>(() => loadDraft(agentId));
   const [sending, setSending] = useState(false);
@@ -13,6 +35,7 @@ export default function ChatInputBar({ agentId, agentStatus }: { agentId: string
   const [sendError, setSendError] = useState<string | null>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const lastAgentIdRef = useRef(agentId);
+  const lastSyncSignalRef = useRef(syncSignal);
 
   // If the selected agent changes while this component stays mounted, swap to that agent's draft.
   useEffect(() => {
@@ -21,6 +44,23 @@ export default function ChatInputBar({ agentId, agentStatus }: { agentId: string
     setInput(loadDraft(agentId));
     setSendError(null);
   }, [agentId]);
+
+  // When the staging container performs a swap, it writes the new value to
+  // the draft and bumps syncSignal. Re-pull the draft and place the caret at
+  // the end so the user can keep typing immediately.
+  useEffect(() => {
+    if (syncSignal === undefined) return;
+    if (lastSyncSignalRef.current === syncSignal) return;
+    lastSyncSignalRef.current = syncSignal;
+    const next = loadDraft(agentId);
+    setInput(next);
+    requestAnimationFrame(() => {
+      const ta = inputRef.current;
+      if (!ta) return;
+      ta.focus();
+      ta.setSelectionRange(next.length, next.length);
+    });
+  }, [syncSignal, agentId]);
 
   // Async delivery failures (PTY closed mid-typing, runner removed, etc.)
   // arrive via this event channel because the IPC handler is fire-and-forget
@@ -135,7 +175,7 @@ export default function ChatInputBar({ agentId, agentStatus }: { agentId: string
 
   return (
     <div
-      className={`border-t px-3 py-2 ${
+      className={`${showDragHandle ? '' : 'border-t '}px-3 py-2 ${
         isLight ? 'border-[#d0d7de] bg-[#f6f8fa]' : 'border-gray-800/40 bg-surface-1/50'
       }`}
       onDragOver={handleDragOver}
@@ -153,6 +193,20 @@ export default function ChatInputBar({ agentId, agentStatus }: { agentId: string
                 : 'border-gray-800 bg-[#0d1117] focus-within:border-[var(--color-accent-blue)] focus-within:shadow-[0_0_0_3px_rgba(0,122,204,0.15)]'
         }`}
       >
+        {showDragHandle && (
+          <span
+            draggable
+            onDragStart={onBarDragStart}
+            onDragEnd={onBarDragEnd}
+            title="Drag onto a note to swap"
+            aria-label="Drag prompt onto a note to swap"
+            className={`shrink-0 self-center select-none cursor-grab active:cursor-grabbing text-[14px] leading-none px-1 ${
+              isLight ? 'text-[#8b949e] hover:text-[#1a1a1a]' : 'text-gray-500 hover:text-gray-200'
+            }`}
+          >
+            {'⋮⋮'}
+          </span>
+        )}
         <textarea
           ref={inputRef}
           value={input}

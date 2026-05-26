@@ -13,3 +13,14 @@ release/
 
 # Private documentation — not pushed to public repo
 docs/
+
+# Local-only working plans
+plans/
+
+# Automated backup files
+*.bak.*
+
+# Per-workspace runtime state (not part of repo template)
+.dashboard/.scaffold-versions.json
+.dashboard/workers/
+.dashboard/scripts/

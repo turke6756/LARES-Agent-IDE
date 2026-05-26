@@ -28,6 +28,12 @@ function timeAgo(dateStr: string | null): string {
   return `${Math.floor(diff / 86400_000)}D AGO`;
 }
 
+function formatSpawnTime(dateStr: string): string {
+  const d = new Date(dateStr + 'Z');
+  const pad = (n: number) => n.toString().padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
 const BORDER_COLORS: Record<string, string> = {
   working: 'border-l-accent-green',
   idle: 'border-l-accent-blue',
@@ -344,6 +350,9 @@ export default function AgentCard({ agent, onTeam }: { agent: Agent; onTeam?: (a
         <span className={isSelected ? 'text-accent-blue' : ''}>
             Active: {timeAgo(agent.lastOutputAt || agent.createdAt)}
         </span>
+      </div>
+      <div className="text-[11px] text-gray-500 mt-0.5">
+        Spawned: {formatSpawnTime(agent.createdAt)}
       </div>
 
       {/* Context menu */}

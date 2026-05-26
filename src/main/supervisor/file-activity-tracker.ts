@@ -1,4 +1,5 @@
 import { EventEmitter } from 'events';
+import os from 'os';
 import path from 'path';
 import { FileActivity, FileOperation } from '../../shared/types';
 import { addFileActivity } from '../database';
@@ -68,6 +69,18 @@ export class FileActivityTracker extends EventEmitter {
     // Skip paths that look like arguments or flags
     if (rawPath.startsWith('-')) return null;
     if (!isPlausibleFileActivityPath(rawPath)) return null;
+
+    // Claude Code's TUI renders home-rooted paths with `~`. Expand before
+    // any path.resolve(), otherwise on Windows `path.resolve(cwd, '~/foo')`
+    // produces `cwd\~\foo` — a phantom path that names no real file and
+    // misleads supervisors into launching cleanup tasks for non-existent
+    // strands.
+    if (rawPath === '~' || rawPath.startsWith('~/') || rawPath.startsWith('~\\')) {
+      const home = os.homedir();
+      if (!home) return null;
+      const rest = rawPath === '~' ? '' : rawPath.slice(2);
+      return path.join(home, rest);
+    }
 
     // If already absolute, use as-is
     if (path.isAbsolute(rawPath) || rawPath.startsWith('/')) {
