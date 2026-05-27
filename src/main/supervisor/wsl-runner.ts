@@ -158,6 +158,14 @@ export interface WslLaunchAttemptLogRecord {
   };
 }
 
+/** BUG-22 Step 3: test-injectable seams for `WslRunner`. Default to the
+ *  production implementations; unit tests pass stubs so they can drive the
+ *  silent-reconnect machinery without spawning wsl.exe or a pty-host. */
+export interface WslRunnerSeams {
+  isTmuxSessionAlive?: (name: string) => Promise<boolean>;
+  now?: () => number;
+}
+
 /**
  * Runs a Claude agent inside WSL via node-pty (through pty-host.js).
  *
@@ -169,6 +177,19 @@ export interface WslLaunchAttemptLogRecord {
 export class WslRunner extends EventEmitter {
   private host: ChildProcess | null = null;
   private sessionName: string;
+  // BUG-22 Step 3: injectable seams. Stored as instance fields so the
+  // production code path is identical to the test path (no branching on
+  // `this._seams` at call sites).
+  private readonly _isTmuxSessionAlive: (name: string) => Promise<boolean>;
+  private readonly _now: () => number;
+  // BUG-22 Step 3: rolling-window log of silent reconnect timestamps. Caps
+  // the silent-reconnect loop at MAX_PHANTOM_RECONNECTS_PER_MIN within any
+  // 60-second window so a reliably-failing attach can't spin forever; once
+  // the cap is exceeded the next phantom exit falls through to the normal
+  // crash path so the supervisor sees the failure.
+  private _phantomReconnectTimestamps: number[] = [];
+  private static readonly MAX_PHANTOM_RECONNECTS_PER_MIN = 3;
+  private static readonly PHANTOM_RECONNECT_WINDOW_MS = 60_000;
   private _lastOutputTime: number = 0;
   private _lastMeaningfulBurst: number = 0;
   private _recentOutputBytes: number = 0;
@@ -207,9 +228,11 @@ export class WslRunner extends EventEmitter {
   private static readonly MAX_RING_BYTES = 1_000_000;
   private _logPath: string | null = null;
 
-  constructor(sessionName: string) {
+  constructor(sessionName: string, seams: WslRunnerSeams = {}) {
     super();
     this.sessionName = sessionName;
+    this._isTmuxSessionAlive = seams.isTmuxSessionAlive ?? isTmuxSessionAlive;
+    this._now = seams.now ?? (() => Date.now());
   }
 
   /** BUG-09 §3.5 — see windows-runner.ts for full docstring. */
@@ -358,8 +381,12 @@ export class WslRunner extends EventEmitter {
   /** BUG-22 Step 1: append one JSONL record to the workspace's launches.log
    *  describing the full launch attempt. Called exactly once per attempt; the
    *  internal `_launchRecordWritten` guard prevents double-writes when both
-   *  the pty-host process exits and the inner PTY emits an `exit` message. */
-  private writeLaunchRecord(attachExitCode: number | null, attachSignal: string | null): void {
+   *  the pty-host process exits and the inner PTY emits an `exit` message.
+   *
+   *  Protected so unit tests can subclass `WslRunner` and assert that the
+   *  silent-reconnect path does NOT call this and the true-crash path does.
+   */
+  protected writeLaunchRecord(attachExitCode: number | null, attachSignal: string | null): void {
     if (this._launchRecordWritten) return;
     this._launchRecordWritten = true;
     const diag = this._diagnostics;
@@ -377,6 +404,110 @@ export class WslRunner extends EventEmitter {
       attachWaitMs: this._attachWaitMs,
     });
     appendLaunchRecord(diag.launchesLogPath, record);
+  }
+
+  /** BUG-22 Step 3: respawn the pty-host in reconnect mode after a phantom
+   *  exit. Extracted as a protected method so unit tests can subclass
+   *  `WslRunner` and spy on calls without spawning a real Node process. */
+  protected respawnForPhantomExit(): void {
+    this.spawnPtyHost('', '', this._logPath ?? '', true);
+  }
+
+  /** BUG-22 Step 3: shared handler for both the host-process exit and the
+   *  inner-PTY `exit` message. Branches between a silent reconnect (when
+   *  tmux is still alive and we're under the reconnect-loop cap) and the
+   *  real teardown-and-emit path.
+   *
+   *  The silent-reconnect path is what hides the phantom `wsl.exe tmux
+   *  attach` exits documented in BUG-22 — those exits leave the tmux session
+   *  fully alive but used to surface as `crashed → auto_restart`, bumping
+   *  `restart_count` and flashing "Restarts: 1" in the UI for what was
+   *  really a healthy launch. We now check the tmux side first and respawn
+   *  the attach with no exit emit / no JSONL diagnostic / no scrollback
+   *  flush, so the supervisor and UI see a single uninterrupted run.
+   *
+   *  When tmux is genuinely gone, or when the rolling-window reconnect cap
+   *  is exceeded, we fall through to the existing teardown path so a real
+   *  failure still surfaces.
+   */
+  private async _handleHostExit(
+    exitCode: number | null,
+    signal: NodeJS.Signals | string | null,
+    source: 'host' | 'inner-pty',
+  ): Promise<void> {
+    if (!this._alive) {
+      // Already torn down by a prior exit (e.g. inner-PTY exit handled first,
+      // host.on('exit') firing as the host process winds down afterward).
+      // Clear the host reference and bail.
+      this.host = null;
+      return;
+    }
+
+    if (!this._intentionalKill) {
+      const now = this._now();
+      const windowStart = now - WslRunner.PHANTOM_RECONNECT_WINDOW_MS;
+      this._phantomReconnectTimestamps = this._phantomReconnectTimestamps.filter(
+        (t) => t >= windowStart,
+      );
+
+      if (this._phantomReconnectTimestamps.length < WslRunner.MAX_PHANTOM_RECONNECTS_PER_MIN) {
+        let tmuxAlive = false;
+        try {
+          tmuxAlive = await this._isTmuxSessionAlive(this.sessionName);
+        } catch (err) {
+          console.warn(`[pty-host:${this.sessionName}] isTmuxSessionAlive threw, treating as dead:`, err);
+        }
+        if (tmuxAlive) {
+          console.log(
+            `[pty-host:${this.sessionName}] phantom exit (code ${exitCode}) but tmux alive — silently reconnecting`,
+          );
+          this._phantomReconnectTimestamps.push(now);
+
+          const oldHost = this.host;
+          this.host = null;
+          if (oldHost) {
+            // Detach the old host's exit listener so the kill below doesn't
+            // re-enter _handleHostExit and trigger an unwanted second reconnect.
+            // For the 'host' source we're inside that listener's callback —
+            // removing future invocations is still correct.
+            oldHost.removeAllListeners('exit');
+            if (source === 'inner-pty' && !oldHost.killed) {
+              // The inner PTY exited but the host script itself keeps
+              // running until it's told to die. Kill it so we don't leak.
+              oldHost.kill();
+            }
+          }
+          this.respawnForPhantomExit();
+          return;
+        }
+      } else {
+        console.warn(
+          `[pty-host:${this.sessionName}] phantom reconnect cap reached ` +
+          `(${WslRunner.MAX_PHANTOM_RECONNECTS_PER_MIN} within ${WslRunner.PHANTOM_RECONNECT_WINDOW_MS}ms) ` +
+          `— treating exit (code ${exitCode}) as a real crash`,
+        );
+      }
+    }
+
+    // True crash / intentional kill / cap-exceeded path. Real exit codes flow
+    // through unmangled — the prior `|| 137` coercion existed to disguise
+    // clean inner-PTY exits as SIGKILL so the dashboard wouldn't mark them
+    // `done`; now that the silent-reconnect path absorbs those phantom clean
+    // exits, real exit codes deserve their real values.
+    this._alive = false;
+    this.logStream?.end();
+    this.logStream = null;
+    this.persistScrollback();
+    const reportedCode = this._intentionalKill ? 0 : (exitCode ?? 1);
+    this.writeLaunchRecord(reportedCode, signal == null ? null : String(signal));
+    this.emit('exit', reportedCode, signal);
+
+    // Inner-PTY exit leaves the host script running on its own; clean it up.
+    // For source='host' the process already exited, so the kill is a no-op.
+    if (source === 'inner-pty' && this.host && !this.host.killed) {
+      this.host.kill();
+    }
+    this.host = null;
   }
 
   /**
@@ -429,19 +560,11 @@ export class WslRunner extends EventEmitter {
 
     this.host.on('exit', (code) => {
       console.log(`[pty-host:${this.sessionName}] exited with code ${code}`);
-      if (this._alive) {
-        this._alive = false;
-        this.logStream?.end();
-        this.logStream = null;
-        this.persistScrollback();
-        const reportedCode = this._intentionalKill ? 0 : ((code ?? 1) || 137);
-        // BUG-22 Step 1: append the JSONL diagnostic before emitting `exit`
-        // so consumers see the file already written. Idempotent — safe even
-        // when the inner PTY `exit` message already fired writeLaunchRecord.
-        this.writeLaunchRecord(reportedCode, null);
-        this.emit('exit', reportedCode, null);
-      }
-      this.host = null;
+      // BUG-22 Step 3: route through `_handleHostExit` so the host-process
+      // exit path shares the silent-reconnect check with the inner-PTY
+      // `exit` message path. The EventEmitter doesn't await the returned
+      // promise, which is fine — nothing further depends on its completion.
+      void this._handleHostExit(code, null, 'host');
     });
 
     // Build the WSL command. Both fresh-launch and reconnect attach to a tmux
@@ -528,23 +651,10 @@ export class WslRunner extends EventEmitter {
 
       case 'exit':
         console.log(`[pty-host:${this.sessionName}] PTY exited: code=${msg.exitCode} signal=${msg.signal}`);
-        this._alive = false;
-        this.logStream?.end();
-        this.logStream = null;
-        this.persistScrollback();
-        {
-          const reportedCode = this._intentionalKill ? 0 : ((msg.exitCode ?? 1) || 137);
-          // BUG-22 Step 1: append the JSONL diagnostic with the inner PTY's
-          // exit-code/signal pair before emitting `exit`. The pty-host process
-          // exit handler also calls writeLaunchRecord; idempotency guarantees
-          // exactly one record per launch.
-          this.writeLaunchRecord(reportedCode, msg.signal ?? null);
-          this.emit('exit', reportedCode, msg.signal);
-        }
-        if (this.host && !this.host.killed) {
-          this.host.kill();
-        }
-        this.host = null;
+        // BUG-22 Step 3: route through `_handleHostExit` so the inner-PTY
+        // exit path shares the silent-reconnect check with the host-process
+        // exit path. handleMessage stays synchronous — we don't await.
+        void this._handleHostExit(msg.exitCode ?? null, msg.signal ?? null, 'inner-pty');
         break;
 
       case 'ready':
