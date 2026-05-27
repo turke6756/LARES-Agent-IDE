@@ -244,6 +244,79 @@ test('BUG-22: success path JSONL marks tmux_new_session.ok=true and attach_exit=
   }
 });
 
+// ── BUG-22 Step 2: attach_wait_ms in the JSONL record ────────────────────
+
+test('BUG-22 Step 2: JSONL record carries attach_wait_ms when wait ran', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bug22-step2-'));
+  const launchesLog = path.join(dir, '.dashboard', 'launches.log');
+  try {
+    const record = buildLaunchRecord({
+      diagnostics: baseDiagnostics({ launchesLogPath: launchesLog }),
+      sessionName: 'cad__sup__abc',
+      workDir: '/home/u/proj',
+      command: "cd '/home/u/proj' && claude",
+      tmuxResult: successTmuxResult(),
+      attachAttempted: true,
+      attachExitCode: 0,
+      attachSignal: null,
+      outputTail: 'normal output',
+      attachWaitMs: 42,
+      nowIso: NOW_ISO,
+    });
+    appendLaunchRecord(launchesLog, record);
+
+    const parsed = JSON.parse(fs.readFileSync(launchesLog, 'utf8').trim());
+    assert.equal(parsed.attach_wait_ms, 42, 'attach_wait_ms must survive JSONL roundtrip');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('BUG-22 Step 2: attach_wait_ms is omitted from JSON when wait was skipped', () => {
+  // tmuxNewSession failure path: the wait isn't run, so the field is
+  // undefined. JSON.stringify drops undefined-valued keys, so the record
+  // should serialize without the field — consumers can treat its absence as
+  // "wait was skipped" without ambiguity.
+  const record = buildLaunchRecord({
+    diagnostics: baseDiagnostics(),
+    sessionName: 's',
+    workDir: '/wd',
+    command: 'cmd',
+    tmuxResult: failureTmuxResult(),
+    attachAttempted: true,
+    attachExitCode: 1,
+    attachSignal: null,
+    outputTail: '',
+    // attachWaitMs intentionally omitted
+    nowIso: NOW_ISO,
+  });
+  const serialized = JSON.stringify(record);
+  assert.ok(
+    !serialized.includes('attach_wait_ms'),
+    `attach_wait_ms must be absent from JSON when skipped; got: ${serialized}`,
+  );
+});
+
+test('BUG-22 Step 2: attach_wait_ms accepts 0 (first-poll success path)', () => {
+  // First-poll success is the common, healthy case — the field must round
+  // trip as the literal number 0, not be confused with undefined.
+  const record = buildLaunchRecord({
+    diagnostics: baseDiagnostics(),
+    sessionName: 's',
+    workDir: '/wd',
+    command: 'cmd',
+    tmuxResult: successTmuxResult(),
+    attachAttempted: true,
+    attachExitCode: 0,
+    attachSignal: null,
+    outputTail: '',
+    attachWaitMs: 0,
+    nowIso: NOW_ISO,
+  });
+  const parsed = JSON.parse(JSON.stringify(record));
+  assert.equal(parsed.attach_wait_ms, 0);
+});
+
 test('BUG-22: success path writes NO failure-header block (caller only writes on ok:false)', () => {
   // The header block builder itself is a pure formatter — it doesn't know
   // about success vs failure. The caller (WslRunner.launch) is responsible

@@ -2,7 +2,7 @@ import { spawn, ChildProcess } from 'child_process';
 import { EventEmitter } from 'events';
 import * as fs from 'fs';
 import path from 'path';
-import { tmuxNewSession, tmuxKillSession, isTmuxSessionAlive, tmuxCapturePane, wslExec, buildTmuxAttachCmd, TmuxNewSessionResult } from '../wsl-bridge';
+import { tmuxNewSession, tmuxKillSession, isTmuxSessionAlive, tmuxCapturePane, wslExec, buildTmuxAttachCmd, tmuxWaitForSession, TmuxNewSessionResult } from '../wsl-bridge';
 import { getScriptPath } from './paths';
 
 /** BUG-22 Step 1 diagnostic metadata passed from `launchWslAgent` so the
@@ -67,6 +67,10 @@ export function buildLaunchRecord(input: {
   attachExitCode: number | null;
   attachSignal: string | null;
   outputTail: string;
+  /** BUG-22 Step 2: milliseconds spent in `tmuxWaitForSession` between
+   *  `tmuxNewSession` returning ok and the PTY attach starting. Undefined
+   *  when the wait was skipped (e.g. tmuxNewSession failed pre-attach). */
+  attachWaitMs?: number;
   nowIso?: string;
 }): WslLaunchAttemptLogRecord {
   const tmux = input.tmuxResult;
@@ -92,6 +96,7 @@ export function buildLaunchRecord(input: {
       stdout: tmux?.stdout ?? '',
       tmux_command: tmux?.tmuxCommand ?? '',
     },
+    attach_wait_ms: input.attachWaitMs,
     attach_result: {
       attempted: input.attachAttempted,
       exit_code: input.attachExitCode,
@@ -141,6 +146,10 @@ export interface WslLaunchAttemptLogRecord {
     stdout: string;
     tmux_command: string;
   };
+  /** BUG-22 Step 2: ms spent in `tmuxWaitForSession` before attach. Lets us
+   *  watch the wait-time distribution post-ship to confirm the race fix
+   *  bounds latency on the success path. Omitted when the wait was skipped. */
+  attach_wait_ms?: number;
   attach_result: {
     attempted: boolean;
     exit_code: number | null;
@@ -181,6 +190,10 @@ export class WslRunner extends EventEmitter {
   private _launchCommand: string = '';
   private _tmuxResult: TmuxNewSessionResult | null = null;
   private _attachAttempted: boolean = false;
+  // BUG-22 Step 2: captured from `tmuxWaitForSession` so the JSONL record
+  // exposes wait-time post-ship. Undefined when the wait was skipped (tmux
+  // creation failed before we got there).
+  private _attachWaitMs: number | undefined = undefined;
   private _launchRecordWritten: boolean = false;
   // P2-02: ring buffer sibling for PromptPatternDetector. WindowsRunner ships
   // one for chat-history use; the WSL path historically pulled tail bytes via
@@ -238,6 +251,7 @@ export class WslRunner extends EventEmitter {
     this._launchCommand = command;
     this._tmuxResult = null;
     this._attachAttempted = false;
+    this._attachWaitMs = undefined;
     this._launchRecordWritten = false;
 
     // Kill any stale tmux session with the same name (leftover from previous app run)
@@ -287,6 +301,26 @@ export class WslRunner extends EventEmitter {
         tmuxStderr: tmuxResult.stderr,
         tmuxCommand: tmuxResult.tmuxCommand,
       });
+    }
+
+    // BUG-22 Step 2: between `tmuxNewSession` returning ok and the PTY attach,
+    // poll `tmux has-session` from Node until the session is enumerable. The
+    // Step 1 diagnostic showed `tmux new-session -d` can exit 0 a few ms
+    // before the server's session registry answers queries, so a small wait
+    // here eliminates the cold-launch race that surfaces as a phantom
+    // `can't find session` exit-1 → auto-restart cycle. On the success path
+    // (session already registered) this adds ~0–20ms; on timeout we log and
+    // proceed so the existing failure path still fires through the runner
+    // exit handler.
+    if (tmuxResult.ok) {
+      const wait = await tmuxWaitForSession(this.sessionName, 2000);
+      this._attachWaitMs = wait.waitedMs;
+      if (!wait.ok) {
+        console.warn(
+          `[WSL:${this.sessionName}] tmux session not enumerable after ${wait.waitedMs}ms ` +
+          `(lastError=${wait.lastError ?? 'none'}); attaching anyway`,
+        );
+      }
     }
 
     // Spawn the PTY that attaches to the tmux session. The attach is what
@@ -340,6 +374,7 @@ export class WslRunner extends EventEmitter {
       attachExitCode,
       attachSignal,
       outputTail: this.getOutputRingTail(4096),
+      attachWaitMs: this._attachWaitMs,
     });
     appendLaunchRecord(diag.launchesLogPath, record);
   }

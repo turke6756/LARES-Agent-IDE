@@ -14,6 +14,7 @@ import assert from 'node:assert/strict';
 import {
   buildTmuxNewSessionCommand,
   tmuxNewSession,
+  tmuxWaitForSession,
   WslExecResult,
 } from '../wsl-bridge';
 
@@ -85,6 +86,91 @@ test('BUG-22: non-zero exit with empty stderr still returns structured shape', a
   assert.equal(result.ok, false);
   assert.equal(result.exitCode, 137);
   assert.equal(result.stderr, '');
+});
+
+// ── BUG-22 Step 2: tmuxWaitForSession ─────────────────────────────────────
+
+test('BUG-22 Step 2: wait returns ok:true on first poll when session is already registered', async () => {
+  const calls: string[] = [];
+  const exec = async (cmd: string, _timeout: number): Promise<WslExecResult> => {
+    calls.push(cmd);
+    return { stdout: '', stderr: '', exitCode: 0 };
+  };
+  let nowVal = 1000;
+  const now = () => nowVal;
+  const sleeps: number[] = [];
+  const sleep = async (ms: number): Promise<void> => { sleeps.push(ms); nowVal += ms; };
+
+  const result = await tmuxWaitForSession('cad__sup__abc', 2000, exec, sleep, now);
+  assert.equal(result.ok, true);
+  assert.equal(result.waitedMs, 0, 'first-poll success must report ~0ms waited');
+  assert.equal(calls.length, 1, 'first-poll success must not retry');
+  assert.equal(sleeps.length, 0, 'first-poll success must not sleep');
+  assert.match(calls[0], /tmux has-session -t 'cad__sup__abc'/);
+});
+
+test('BUG-22 Step 2: wait returns ok:true once exec stub flips exit_code to 0', async () => {
+  // Simulate the race: first two polls return exit 1 (session not yet
+  // queryable), the third returns 0. The function must return ok:true with
+  // a waitedMs that reflects the two ~20ms intervals.
+  let pollCount = 0;
+  const exec = async (_cmd: string, _timeout: number): Promise<WslExecResult> => {
+    pollCount += 1;
+    if (pollCount < 3) {
+      return { stdout: '', stderr: `can't find session: cad__sup__abc`, exitCode: 1 };
+    }
+    return { stdout: '', stderr: '', exitCode: 0 };
+  };
+  let nowVal = 5000;
+  const now = () => nowVal;
+  const sleeps: number[] = [];
+  const sleep = async (ms: number): Promise<void> => { sleeps.push(ms); nowVal += ms; };
+
+  const result = await tmuxWaitForSession('cad__sup__abc', 2000, exec, sleep, now);
+  assert.equal(result.ok, true);
+  assert.equal(pollCount, 3, 'must poll until exit_code flips to 0');
+  assert.equal(sleeps.length, 2, 'two sleeps between three polls');
+  assert.deepEqual(sleeps, [20, 20], 'poll cadence should be ~20ms');
+  assert.equal(result.waitedMs, 40, 'waitedMs reflects elapsed sleeps');
+});
+
+test('BUG-22 Step 2: wait returns ok:false after timeout when session never registers', async () => {
+  let pollCount = 0;
+  const exec = async (_cmd: string, _timeout: number): Promise<WslExecResult> => {
+    pollCount += 1;
+    return { stdout: '', stderr: `can't find session: cad__sup__abc`, exitCode: 1 };
+  };
+  let nowVal = 0;
+  const now = () => nowVal;
+  const sleep = async (ms: number): Promise<void> => { nowVal += ms; };
+
+  const result = await tmuxWaitForSession('cad__sup__abc', 100, exec, sleep, now);
+  assert.equal(result.ok, false);
+  assert.ok(result.waitedMs >= 100, `waitedMs must be >= timeout; got ${result.waitedMs}`);
+  assert.ok(pollCount >= 2, `must poll at least twice before timing out; got ${pollCount}`);
+  assert.match(result.lastError ?? '', /can't find session/);
+});
+
+test('BUG-22 Step 2: wait never throws (stays on the structured-result contract)', async () => {
+  // wslExec itself never throws, but defend the wait function's signature so
+  // callers (WslRunner.launch) can rely on `{ok, waitedMs}` without try/catch.
+  const exec = async (_cmd: string, _timeout: number): Promise<WslExecResult> => {
+    return { stdout: '', stderr: 'wsl unavailable', exitCode: 1 };
+  };
+  let nowVal = 0;
+  const now = () => nowVal;
+  const sleep = async (ms: number): Promise<void> => { nowVal += ms; };
+
+  let threw: unknown = null;
+  let result: Awaited<ReturnType<typeof tmuxWaitForSession>> | null = null;
+  try {
+    result = await tmuxWaitForSession('s', 50, exec, sleep, now);
+  } catch (err) {
+    threw = err;
+  }
+  assert.equal(threw, null, 'wait must never throw');
+  assert.ok(result);
+  assert.equal(result!.ok, false);
 });
 
 (async () => {

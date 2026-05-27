@@ -337,6 +337,55 @@ export async function tmuxNewSession(
   };
 }
 
+export interface TmuxWaitForSessionResult {
+  ok: boolean;
+  waitedMs: number;
+  lastError?: string;
+}
+
+/**
+ * BUG-22 Step 2: poll `tmux has-session -t '<name>'` from the Node side until
+ * the session is enumerable or `timeoutMs` elapses. Runs between
+ * `tmuxNewSession` returning ok and the PTY attach so the cold-launch
+ * create→attach race can't surface as a phantom `can't find session` exit-1.
+ *
+ * The diagnostic from Step 1 confirmed `tmux new-session -d` can return 0 a
+ * few ms before the tmux server's session registry is queryable, even though
+ * the shell-side poll in `buildTmuxAttachCmd` lives inside the same `wsl.exe`
+ * invocation as the attach. Adding a Node-side wait gives us a clean
+ * latency-instrumented gate: success on first poll adds ~0–20ms, and the
+ * `waitedMs` value lands in the JSONL log so the wait-time distribution is
+ * observable after shipping.
+ *
+ * The function never throws — it returns `{ok:false}` on timeout so the
+ * caller can log a warning and still attempt the attach (preserving the
+ * existing failure path through the runner exit handler).
+ */
+export async function tmuxWaitForSession(
+  name: string,
+  timeoutMs: number,
+  exec: (cmd: string, timeout: number) => Promise<WslExecResult> = wslExec,
+  sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
+  now: () => number = () => Date.now(),
+): Promise<TmuxWaitForSessionResult> {
+  const start = now();
+  const checkCmd = `tmux has-session -t '${name}'`;
+  let lastError: string | undefined;
+  // First check is immediate — the common case is the session is already
+  // registered by the time we get here.
+  while (true) {
+    const result = await exec(checkCmd, 2000);
+    if (result.exitCode === 0) {
+      return { ok: true, waitedMs: now() - start };
+    }
+    lastError = result.stderr || `exit code ${result.exitCode}`;
+    if (now() - start >= timeoutMs) {
+      return { ok: false, waitedMs: now() - start, lastError };
+    }
+    await sleep(20);
+  }
+}
+
 export async function tmuxSendKeys(name: string, text: string): Promise<void> {
   // Chain literal-text send and Enter into a single wsl.exe invocation so they
   // either both happen or neither does. Splitting them across two wsl.exe
