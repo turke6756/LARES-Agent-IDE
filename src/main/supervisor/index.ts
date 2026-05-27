@@ -183,11 +183,30 @@ function buildCodexResumeArgs(baseArgs: string[], sessionId: string): string[] {
   return ['resume', ...args, sessionId];
 }
 
-function buildCodexResumeCommand(command: string, sessionId: string): string {
+/** Matches a bash command-prefix variable assignment like `AGENT_ID=value`.
+ *  Bash treats these as env-var assignments only when they appear *unquoted*
+ *  at the start of a simple command — single-quoting the whole token turns
+ *  it into a literal command name (`AGENT_ID=...: command not found`). */
+const SHELL_ENV_ASSIGNMENT_RE = /^[A-Za-z_][A-Za-z0-9_]*=/;
+
+/** Build the WSL bash command string for `codex resume <session-id>`.
+ *
+ *  The input `command` may have one or more leading bash command-prefix env
+ *  assignments (e.g. `AGENT_ID=… DASHBOARD_PORT=… DASHBOARD_HOST=… ccodex …`).
+ *  Those tokens MUST stay unquoted and at the front of the rendered string so
+ *  bash parses them as variable assignments for the codex invocation; we only
+ *  single-quote the codex executable and its args. The `resume` subcommand
+ *  and the session-id positional are inserted in the right place relative to
+ *  the codex executable (NOT in front of the env vars). */
+export function buildCodexResumeCommand(command: string, sessionId: string): string {
   const parts = command.split(/\s+/).filter(Boolean);
-  const cmd = parts[0] || 'codex';
-  const args = buildCodexResumeArgs(parts.slice(1), sessionId);
-  return [cmd, ...args].map(shellSingleQuote).join(' ');
+  let envEnd = 0;
+  while (envEnd < parts.length && SHELL_ENV_ASSIGNMENT_RE.test(parts[envEnd])) envEnd++;
+  const envPrefix = parts.slice(0, envEnd);
+  const cmd = parts[envEnd] || 'codex';
+  const args = buildCodexResumeArgs(parts.slice(envEnd + 1), sessionId);
+  const cmdAndArgs = [cmd, ...args].map(shellSingleQuote).join(' ');
+  return envPrefix.length > 0 ? `${envPrefix.join(' ')} ${cmdAndArgs}` : cmdAndArgs;
 }
 
 function parseQueryResponse(stdout: string): QueryResult {
