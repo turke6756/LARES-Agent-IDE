@@ -27,10 +27,15 @@ export class WindowsRunner extends EventEmitter {
   // In-memory ring buffer for instant log retrieval (avoids fs.createWriteStream flush delays).
   // BUG-15: bumped from 500 lines to 10000 / 1MB so the terminal viewer can paint a useful
   // scrollback snapshot on mount. Both caps apply — the tighter one wins.
+  // Scrollback-persistence bump: 10k/1MB truncated long supervisor sessions —
+  // the snapshot painted on a fresh mount (or after an app restart) showed only
+  // the tail. Raised to 50k lines / 8 MB to align with the renderer's 50k-line
+  // xterm scrollback (so the repaint isn't dropped) while keeping the on-mount
+  // paint cost bounded. Both caps apply — the tighter one wins.
   private outputRing: string[] = [];
   private outputRingBytes: number = 0;
-  private static readonly MAX_RING_LINES = 10000;
-  private static readonly MAX_RING_BYTES = 1_000_000;
+  private static readonly MAX_RING_LINES = 50000;
+  private static readonly MAX_RING_BYTES = 8_000_000;
   private _logPath: string | null = null;
   private _dataCount: number = 0;
   private _totalBytes: number = 0;

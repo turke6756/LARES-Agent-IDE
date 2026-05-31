@@ -61,7 +61,7 @@ export function registerIpcHandlers(supervisor: AgentSupervisor, mainWindow: Bro
       throw new Error(`Agent not found: ${agentId}`);
     }
     if (supervisor.isInputInFlight(agentId) || ['working', 'launching'].includes(agent.status)) {
-      const reportedStatus = supervisor.isInputInFlight(agentId) ? 'working' : agent.status;
+      const reportedStatus = supervisor.isInputInFlight(agentId) ? 'receiving' : agent.status;
       throw new Error(`Agent is "${reportedStatus}" — wait until it's idle before sending.`);
     }
     // Fire-and-forget: the Windows codex/gemini path types one char at a time
@@ -85,9 +85,19 @@ export function registerIpcHandlers(supervisor: AgentSupervisor, mainWindow: Bro
   ipcMain.handle('agent:get-context-stats', (_e, agentId) => supervisor.getContextStats(agentId));
 
   // Chat pane (session-log-reader)
-  ipcMain.handle('agent:get-chat-events', (_e, agentId, sinceUuid) =>
-    supervisor.getSessionLogReader().getCachedEvents(agentId, sinceUuid));
+  ipcMain.handle('agent:get-chat-events', (_e, agentId, sinceUuid) => {
+    // BUG-28: the HTTP `/messages` route lazy-recovers a lost Codex
+    // resumeSessionId, but the dashboard chat pane renders via this IPC path
+    // instead. Mirror the recovery here (and on chat-subscribe) so a codex
+    // agent whose post-launch discovery race lost still gets its rollout
+    // reader bound — otherwise the pane stays blank even though the rollout
+    // JSONL on disk has every assistant turn. No-op for non-codex agents and
+    // codex agents that already have a sid.
+    supervisor.maybeRecoverCodexSid(agentId);
+    return supervisor.getSessionLogReader().getCachedEvents(agentId, sinceUuid);
+  });
   ipcMain.handle('agent:chat-subscribe', (_e, agentId) => {
+    supervisor.maybeRecoverCodexSid(agentId); // BUG-28: see get-chat-events
     supervisor.getSessionLogReader().addChatSubscriber(agentId);
   });
   ipcMain.handle('agent:chat-unsubscribe', (_e, agentId) => {

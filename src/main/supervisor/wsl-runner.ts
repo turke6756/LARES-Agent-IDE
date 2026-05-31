@@ -222,10 +222,13 @@ export class WslRunner extends EventEmitter {
   // detector can poll the tail in-process without a per-tick exec.
   // BUG-15: also serves as the terminal viewer's scrollback source; bumped
   // from 500 lines to 10000 / 1MB so the snapshot is useful.
+  // Scrollback-persistence bump (mirrors WindowsRunner): 50k lines / 8 MB so a
+  // fresh mount / app restart restores the full session, aligned with the
+  // renderer's 50k-line xterm scrollback. Both caps apply — the tighter wins.
   private outputRing: string[] = [];
   private outputRingBytes: number = 0;
-  private static readonly MAX_RING_LINES = 10000;
-  private static readonly MAX_RING_BYTES = 1_000_000;
+  private static readonly MAX_RING_LINES = 50000;
+  private static readonly MAX_RING_BYTES = 8_000_000;
   private _logPath: string | null = null;
 
   constructor(sessionName: string, seams: WslRunnerSeams = {}) {

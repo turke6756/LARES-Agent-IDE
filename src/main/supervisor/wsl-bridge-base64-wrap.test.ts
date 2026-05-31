@@ -27,7 +27,7 @@ function extractBase64(rendered: string): string {
 
 test('L-A: rendered command has correct shape (tmux + envelope)', () => {
   const out = buildTmuxNewSessionCommand('worker-abc', '/home/turke/proj', 'echo hi');
-  assert.match(out, /^setsid tmux new-session -d -s 'worker-abc' -c '\/home\/turke\/proj' -- bash -lic "\$\(echo /);
+  assert.match(out, /^setsid tmux set-option -g history-limit \d+ \\; new-session -d -s 'worker-abc' -c '\/home\/turke\/proj' -- bash -lic "\$\(echo /);
   assert.match(out, /\| base64 -d\)"$/);
 });
 

@@ -74,7 +74,7 @@ test('BUG-22: tmuxCommand is populated even on failure (for post-mortem)', async
   assert.equal(result.ok, false);
   // The whole point of the diagnostic: tmuxCommand must be captured so
   // post-mortems can see the exact outer command the bridge handed to wsl.exe.
-  assert.match(result.tmuxCommand, /^setsid tmux new-session -d -s 's' -c '\/wd' -- bash -lic /);
+  assert.match(result.tmuxCommand, /^setsid tmux set-option -g history-limit \d+ \\; new-session -d -s 's' -c '\/wd' -- bash -lic /);
   assert.match(result.tmuxCommand, /\| base64 -d\)"$/);
 });
 

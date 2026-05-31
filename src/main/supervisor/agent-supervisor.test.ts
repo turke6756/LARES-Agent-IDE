@@ -1,18 +1,28 @@
-// Supervisor-level tests for the BUG-09 launch-seed fix
-// (plans/bug-09-launch-seed-fix-plan.md §4.2).
+// Supervisor-level tests for the sendInput status-seed contract.
 //
-// Covers six cases:
+// Originally written for the BUG-09 launch-seed fix
+// (plans/bug-09-launch-seed-fix-plan.md §4.2). Updated 2026-05-30 when the
+// optimistic `user-input-submitted` working seed was REMOVED entirely — a send
+// that merely *delivered* (WSL `_doSendInput` returns true even when the kitty
+// Enter was dropped) must no longer assert `working`. With the seed gone, the
+// only status side-effect of a send is the `waiting → working` flip that
+// `EventBridge.notifyUserInputDelivered` performs for a non-worker agent that
+// was blocked on input. See docs/AGENT_STATUS_LANES_AND_SUBMIT_RECOVERY.md §4.
+//
+// Covers:
 //   1. Windows launch — no `launch-pending` or `user-input-submitted` seed fires.
 //   2. WSL launch — no `launch-pending` or `user-input-submitted` seed fires.
-//   3. sendInput on an `idle` agent (submit=true) — order is
-//      [notifyUserInputDelivered, forceWorking:user-input-submitted].
-//   4. sendInput on a `waiting` agent (submit=true) — order is
-//      [notifyUserInputDelivered, forceWorking:user-input, forceWorking:user-input-submitted].
-//      The inner `forceWorking:user-input` comes from the real
-//      `EventBridge.notifyUserInputDelivered` at event-bridge.ts:351.
+//   3. sendInput on an `idle` non-worker agent (submit=true) — only
+//      [notifyUserInputDelivered]; no `user-input-submitted` seed.
+//   3c. sendInput on an `idle` plain WORKER (isWorker) — only
+//      [notifyUserInputDelivered]; worker status is hook-owned, no seed.
+//   4. sendInput on a `waiting` non-worker agent (submit=true) — only
+//      [notifyUserInputDelivered, forceWorking:user-input]. The inner
+//      `forceWorking:user-input` is the real EventBridge waiting→working flip;
+//      the `user-input-submitted` seed is gone.
 //   5. sendInput on an `idle` agent with submit=false — no calls.
 //   6. WSL runner with `isAlive === false` — `_doSendInput` returns false and
-//      no calls fire (the new `delivered` boolean guards the latch seed).
+//      no calls fire.
 //
 // Compile via the main tsconfig and run with:
 //   npm run build:main
@@ -43,6 +53,7 @@ function patchDb(agentsMap: Map<string, Agent>): () => void {
   const db = require('../database') as Record<string, unknown>;
   const keys = [
     'updateAgentStatus',
+    'updateAgentHookStatus',
     'updateAgentPid',
     'getAgent',
     'addEvent',
@@ -59,6 +70,17 @@ function patchDb(agentsMap: Map<string, Agent>): () => void {
   db.updateAgentStatus = (id: string, status: AgentStatus) => {
     const a = agentsMap.get(id);
     if (a) a.status = status;
+  };
+  db.updateAgentHookStatus = (
+    id: string,
+    hookStatus: NonNullable<Agent['hookStatus']>,
+    lastHookEventAt?: number,
+  ) => {
+    const a = agentsMap.get(id);
+    if (a) {
+      a.hookStatus = hookStatus;
+      if (lastHookEventAt !== undefined) a.lastHookEventAt = lastHookEventAt;
+    }
   };
   db.updateAgentPid = () => {};
   db.getAgent = (id: string) => agentsMap.get(id) ?? null;
@@ -218,7 +240,7 @@ test('Case 2: launchWslAgent fires neither launch-pending nor user-input-submitt
   }
 });
 
-test('Case 3: sendInput on unsupervised idle agent + submit=true seeds user-input-submitted after notifyUserInputDelivered', async () => {
+test('Case 3: sendInput on unsupervised idle agent + submit=true fires NO user-input-submitted seed', async () => {
   const agent = makeAgent('w-3', {
     provider: 'claude',
     status: 'idle',
@@ -229,16 +251,44 @@ test('Case 3: sendInput on unsupervised idle agent + submit=true seeds user-inpu
   const h = setup({ agent, injectRunner: 'windows', alive: true });
   try {
     await h.supervisor.sendInput(agent.id, 'hi', { submit: true });
+    // Seed removed (2026-05-30): a delivered send no longer asserts working.
+    // The idle agent isn't waiting, so notifyUserInputDelivered is a no-op flip.
     assert.deepStrictEqual(
       seedCalls(h.calls),
-      ['notifyUserInputDelivered', 'forceWorking:user-input-submitted'],
+      ['notifyUserInputDelivered'],
+    );
+    assert.ok(
+      !seedCalls(h.calls).includes('forceWorking:user-input-submitted'),
+      'the optimistic user-input-submitted seed must not fire for any lane',
     );
   } finally {
     h.cleanup();
   }
 });
 
-test('Case 4: sendInput on unsupervised waiting agent + submit=true fires user-input then user-input-submitted', async () => {
+test('Case 3c: sendInput on idle plain WORKER (isWorker) fires NO seed — status is hook-owned', async () => {
+  const agent = makeAgent('w-3c', {
+    provider: 'claude',
+    status: 'idle',
+    isSupervised: false,
+    isWorker: true,
+    command: 'claude',
+    workingDirectory: 'C:\\tmp',
+  });
+  const h = setup({ agent, injectRunner: 'windows', alive: true });
+  try {
+    await h.supervisor.sendInput(agent.id, 'hi', { submit: true });
+    assert.deepStrictEqual(
+      seedCalls(h.calls),
+      ['notifyUserInputDelivered'],
+      'plain workers derive working solely from the UserPromptSubmit hook',
+    );
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('Case 4: sendInput on unsupervised waiting agent + submit=true fires only the waiting→working flip', async () => {
   const agent = makeAgent('w-4', {
     provider: 'claude',
     status: 'waiting',
@@ -249,12 +299,14 @@ test('Case 4: sendInput on unsupervised waiting agent + submit=true fires user-i
   const h = setup({ agent, injectRunner: 'windows', alive: true });
   try {
     await h.supervisor.sendInput(agent.id, 'answer', { submit: true });
+    // `forceWorking:user-input` is the real EventBridge waiting→working flip
+    // (non-worker, was blocked on input). The `user-input-submitted` seed that
+    // used to trail it is gone.
     assert.deepStrictEqual(
       seedCalls(h.calls),
       [
         'notifyUserInputDelivered',
         'forceWorking:user-input',
-        'forceWorking:user-input-submitted',
       ],
     );
   } finally {
@@ -577,6 +629,51 @@ test('Case 9: WSL resume with present session file → emits --resume (no fallba
   } finally {
     db.updateAgentResumeSessionId = origUpdate;
     (WslRunner.prototype as { launch: unknown }).launch = setupStubLaunch;
+    h.cleanup();
+  }
+});
+
+// ── Hook-health dispatch (HOOK_SYSTEM_DESIGN.md §B) ───────────────────
+
+test('Hook: forceIdleFromHook stamps hook_status=healthy + last_hook_event_at', () => {
+  const agent = makeAgent('hh-1', {
+    provider: 'codex',
+    status: 'idle',
+    isSupervised: true,
+    command: 'codex',
+    workingDirectory: 'C:\\tmp',
+  });
+  const h = setup({ agent, injectRunner: 'windows', alive: true });
+  try {
+    assert.equal(agent.hookStatus ?? 'unknown', 'unknown', 'precondition: hook_status unknown');
+    h.supervisor.forceIdleFromHook(agent.id, 'hook-stop');
+    assert.equal(agent.hookStatus, 'healthy', 'a Stop hook proves the scaffold loaded → healthy');
+    assert.ok(typeof agent.lastHookEventAt === 'number' && agent.lastHookEventAt > 0, 'last_hook_event_at stamped');
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('Hook: recordHookSessionStart stamps healthy but does NOT change status', () => {
+  // A SessionStart hook on a still-launching worker must update hook health
+  // only. It must NOT promote launching→idle (that's the Stop hook's job).
+  const agent = makeAgent('hh-2', {
+    provider: 'codex',
+    status: 'launching',
+    isSupervised: true,
+    command: 'codex',
+    workingDirectory: 'C:\\tmp',
+  });
+  const h = setup({ agent, injectRunner: 'windows', alive: true });
+  try {
+    h.supervisor.recordHookSessionStart(agent.id, 'hook-session-start');
+    assert.equal(agent.status, 'launching', 'session-start must NOT change status');
+    assert.equal(agent.hookStatus, 'healthy', 'session-start proves the scaffold loaded → healthy');
+    assert.ok(
+      !seedCalls(h.calls).some((c) => c.startsWith('forceWorking:')),
+      `session-start must not flip the agent to working; got ${JSON.stringify(seedCalls(h.calls))}`,
+    );
+  } finally {
     h.cleanup();
   }
 });

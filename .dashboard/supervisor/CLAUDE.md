@@ -72,7 +72,7 @@ When the user asks you to coordinate multiple agents, choose one of two paths:
 
 Invoke a pre-built orchestration via the `run-orchestration` skill. The script drives the multi-agent workflow end-to-end — launching agents, relaying messages, gating turns, watching for the completion signal. You invoke, then monitor; the script handles the loop. Events arrive as `[DASHBOARD EVENT]` lines in your chat.
 
-- **When to use:** there is an orchestration that matches the task. **GroupThink** (the only one today) produces a planning markdown via cross-provider Lead+Reviewer deliberation. Future orchestrations will cover scoping, fork-and-execute, etc.
+- **When to use:** there is an orchestration that matches the task. **GroupThink** produces a planning markdown via cross-provider deliberation; **v2** is the current version and offers two modes — `--mode=serial` (default; Lead drafts, Reviewer is launched with that draft as kickoff, Lead writes plan — same shape as v1 with BUG-29 hardened) and `--mode=parallel` (3 rounds — both planners draft independently, cross-pollinate, synthesizer writes plan). v1 still ships for in-flight runs and existing `resume_hint` lines; prefer v2 for new runs. Future orchestrations will cover scoping, fork-and-execute, etc.
 - **How to discover:** read the catalog in the `run-orchestration` skill (lists available orchestrations and points at each one's manual under `scripts/<name>.md`).
 - **You do not edit the script body** — you invoke it with parameters and react to its events. Recovery on stall is also scripted: re-invoke with the resume flags from the stall event.
 
@@ -133,7 +133,7 @@ Agents can only message teammates they have a channel to. The dashboard enforces
 
 For multi-model deliberation between teammates, create a team with template `mesh` (all-to-all channels). Mix providers (Claude, Gemini, Codex) for diverse perspectives. Brief agents with the topic, let them debate through direct messages, then synthesize findings yourself when they converge or hit diminishing returns.
 
-Note: this is distinct from the **GroupThink orchestration** (`scripts/groupthink-v1.js`, run via the `run-orchestration` skill), which is a two-planner Lead+Reviewer pipeline that writes a final markdown plan. Use that when you want a structured planning artifact; use a `mesh` team when you want free-form N-agent deliberation.
+Note: this is distinct from the **GroupThink orchestration** (`scripts/groupthink-v2.js`, run via the `run-orchestration` skill), which scripts the deliberation end-to-end and writes a final markdown plan. v2's serial mode is a Lead+Reviewer relay; v2's parallel mode runs two planners independently across 3 rounds (draft → cross-pollinate → synthesize). Use GroupThink when you want a structured planning artifact; use a `mesh` team when you want free-form N-agent deliberation.
 
 ## Platform notes (Windows + PowerShell 5.1)
 

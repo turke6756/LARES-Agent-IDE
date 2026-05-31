@@ -101,6 +101,30 @@ export const HOOK_SILENCE_WARN_MS = 15 * 60 * 1000;  // 15 min
 // on a healthy scaffold. Warn-only.
 export const START_HOOK_SILENCE_WARN_MS = 3_000;
 
+// Launch-time hook canary (HOOK_SYSTEM_DESIGN.md §5.4 / B5). When a worker-lane
+// agent launches we expect a SessionStart hook (or the first UserPromptSubmit /
+// Stop hook) to reach the dashboard within this window. If none has arrived by
+// then AND hook_status is still 'unknown', the scaffold is broken — set
+// hook_status='broken' immediately rather than wait for the 15-min silence
+// watchdog. This does NOT change `status` and does NOT re-enable PTY inference;
+// broken is surfaced via hook_status only. 8 s comfortably covers a cold codex
+// boot's first SessionStart on a healthy scaffold (the POST round-trips in well
+// under 1 s once the hook fires).
+export const HOOK_CANARY_WINDOW_MS = 8_000;
+
+// BUG-10 reactive Enter-resend — when a hook-backed worker (claude/codex) has
+// been delivered input but no UserPromptSubmit hook has fired, the dashboard
+// now resends ONLY the submit keystroke (not the body, which is already in the
+// prompt buffer) to recover a dropped Enter. The submit hook fires
+// synchronously on a real submission and round-trips in well under 1 s, so a
+// silence this long is strong evidence the Enter was eaten by the paste race
+// (fixed ~80 ms body→Enter delay losing under load). Gated on the authoritative
+// hook signal — only safe now that the optimistic `user-input-submitted` working
+// seed is gone, so `idle` after input genuinely means "submit never took."
+export const START_HOOK_RESEND_AFTER_MS = 3_000;     // wait before the 1st resend
+export const START_HOOK_RESEND_INTERVAL_MS = 3_000;  // spacing between resends
+export const START_HOOK_RESEND_MAX_ATTEMPTS = 2;     // then give up and warn
+
 // BUG-23 — per-provider cold-start settle window. After `runner.launch()`
 // returns, the agent is in `'launching'`; once wallclock since the launch
 // stamp exceeds this provider-specific budget, StatusMonitor.poll() promotes
@@ -206,6 +230,16 @@ Keep responses brief — assess the event, take the necessary action via your MC
 **Tier 2 — Assisted:** Research complex technical questions, resolve conflicting approaches
 **Tier 3 — Escalate:** Architectural decisions, security, scope changes, ambiguous requirements
 
+## Online research
+
+You have **WebSearch** and **WebFetch** for direct lookups, and the **Agent** tool (\`subagent_type: "general-purpose"\`) for multi-step research into source repos, docs, changelogs, or community threads. Reach for them — proactively, before treating a question as user-only — when the answer lives outside this codebase: a third-party CLI's behavior, a config format you don't recognize, a vendor flag, a platform-specific quirk, an unfamiliar error string.
+
+**Direct WebSearch/WebFetch** when the answer fits on one page: a changelog entry, a doc paragraph, an issue thread.
+
+**Research subagent** (\`Agent\`, general-purpose) when the dig is multi-step: reading several source files, cross-referencing PRs, chasing a behavior chain ("what does this hash cover" → find the hash function → find its callers → find their inputs). Cap the response (e.g. "under 400 words, GitHub permalinks where helpful") so the answer stays compressed and doesn't bloat your context.
+
+**Triage** before escalating to the user — see behavioral.md B-11 (research-first / triage by impact) and B-12 (when to spawn a research subagent vs. direct lookup). Bothering the user is expensive; reaching for research is cheap.
+
 ## Multi-agent orchestration: two paths
 
 When the user asks you to coordinate multiple agents, choose one of two paths:
@@ -214,7 +248,7 @@ When the user asks you to coordinate multiple agents, choose one of two paths:
 
 Invoke a pre-built orchestration via the \`run-orchestration\` skill. The script drives the multi-agent workflow end-to-end — launching agents, relaying messages, gating turns, watching for the completion signal. You invoke, then monitor; the script handles the loop. Events arrive as \`[DASHBOARD EVENT]\` lines in your chat.
 
-- **When to use:** there is an orchestration that matches the task. **GroupThink** (the only one today) produces a planning markdown via cross-provider Lead+Reviewer deliberation. Future orchestrations will cover scoping, fork-and-execute, etc.
+- **When to use:** there is an orchestration that matches the task. **GroupThink** produces a planning markdown via cross-provider deliberation; **v2** is the current version and offers two modes — \`--mode=serial\` (default; Lead drafts, Reviewer is launched with that draft as kickoff, Lead writes plan — same shape as v1 with BUG-29 hardened) and \`--mode=parallel\` (3 rounds — both planners draft independently, cross-pollinate, synthesizer writes plan). v1 still ships for in-flight runs and existing \`resume_hint\` lines; prefer v2 for new runs. Future orchestrations will cover scoping, fork-and-execute, etc.
 - **How to discover:** read the catalog in the \`run-orchestration\` skill (lists available orchestrations and points at each one's manual under \`scripts/<name>.md\`).
 - **You do not edit the script body** — you invoke it with parameters and react to its events. Recovery on stall is also scripted: re-invoke with the resume flags from the stall event.
 
@@ -275,7 +309,7 @@ Agents can only message teammates they have a channel to. The dashboard enforces
 
 For multi-model deliberation between teammates, create a team with template \`mesh\` (all-to-all channels). Mix providers (Claude, Gemini, Codex) for diverse perspectives. Brief agents with the topic, let them debate through direct messages, then synthesize findings yourself when they converge or hit diminishing returns.
 
-Note: this is distinct from the **GroupThink orchestration** (\`scripts/groupthink-v1.js\`, run via the \`run-orchestration\` skill), which is a two-planner Lead+Reviewer pipeline that writes a final markdown plan. Use that when you want a structured planning artifact; use a \`mesh\` team when you want free-form N-agent deliberation.
+Note: this is distinct from the **GroupThink orchestration** (\`scripts/groupthink-v2.js\`, run via the \`run-orchestration\` skill), which scripts the deliberation end-to-end and writes a final markdown plan. v2's serial mode is a Lead+Reviewer relay; v2's parallel mode runs two planners independently across 3 rounds (draft → cross-pollinate → synthesize). Use GroupThink when you want a structured planning artifact; use a \`mesh\` team when you want free-form N-agent deliberation.
 
 ## Platform notes (Windows + PowerShell 5.1)
 
@@ -400,6 +434,57 @@ prompt and the workspace files you can read.
 export const WORKER_CLAUDE_SETTINGS_JSON = `{
   "autoMemoryEnabled": false,
   "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \\"\${CLAUDE_PROJECT_DIR}/../../scripts/dashboard-status.mjs\\" session-start"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \\"\${CLAUDE_PROJECT_DIR}/../../scripts/dashboard-status.mjs\\""
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \\"\${CLAUDE_PROJECT_DIR}/../../scripts/dashboard-status.mjs\\""
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \\"\${CLAUDE_PROJECT_DIR}/../../scripts/dashboard-status.mjs\\" working"
+          }
+        ]
+      }
+    ]
+  }
+}
+`;
+
+/** Pre-SessionStart Claude worker settings (v2) — kept verbatim so a v2
+ *  workspace's on-disk settings.json can be hashed and silently upgraded to v3
+ *  (which adds the SessionStart hook). Written verbatim by the scaffolder —
+ *  \${CLAUDE_PROJECT_DIR} stays literal — so the hash matches on-disk bytes. */
+export const WORKER_CLAUDE_SETTINGS_JSON_V2 = `{
+  "autoMemoryEnabled": false,
+  "hooks": {
     "Stop": [
       {
         "hooks": [
@@ -464,6 +549,39 @@ timeout = 30
 type = "command"
 command = 'node "\${WORKSPACE_ROOT}/.dashboard/scripts/dashboard-status.mjs" working'
 timeout = 30
+
+[[hooks.SessionStart]]
+
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = 'node "\${WORKSPACE_ROOT}/.dashboard/scripts/dashboard-status.mjs" session-start'
+timeout = 30
+`;
+
+/** Pre-SessionStart Codex worker config (v2) — kept verbatim so a v2
+ *  workspace's materialized config.toml can be hashed and silently upgraded to
+ *  v3 (which adds the SessionStart hook). The \${WORKSPACE_ROOT} substitution
+ *  and hash comparison both happen after the substitution at scaffold-write
+ *  time, mirroring the v1→v2 path. */
+export const WORKER_CODEX_CONFIG_TOML_V2 = `# Class IV worker hook config — see plans/class-iv-worker-hook-scaffold.md §12.
+# Codex Stop hook fires when an agent turn completes. Our hook script reads
+# AGENT_ID + DASHBOARD_PORT from env (injected at supervised-worker launch)
+# and POSTs idle to the dashboard. \${WORKSPACE_ROOT} is materialized at
+# scaffold-write time — Codex has no \${CLAUDE_PROJECT_DIR} analog.
+
+[[hooks.Stop]]
+
+[[hooks.Stop.hooks]]
+type = "command"
+command = 'node "\${WORKSPACE_ROOT}/.dashboard/scripts/dashboard-status.mjs"'
+timeout = 30
+
+[[hooks.UserPromptSubmit]]
+
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command = 'node "\${WORKSPACE_ROOT}/.dashboard/scripts/dashboard-status.mjs" working'
+timeout = 30
 `;
 
 /** Pre-UserPromptSubmit Codex config — kept verbatim so a v1 workspace's
@@ -492,6 +610,80 @@ timeout = 30
  *  If the POST fails, inference (classes I–III) still drives status — degraded
  *  but not broken. */
 export const DASHBOARD_STATUS_SCRIPT_MJS = `#!/usr/bin/env node
+// Class IV worker hook script — see plans/class-iv-worker-hook-scaffold.md
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
+import fs from 'node:fs';
+
+const agentId = process.env.AGENT_ID;
+const port = process.env.DASHBOARD_PORT || '24678';
+const host = process.env.DASHBOARD_HOST || '127.0.0.1';
+if (!agentId) process.exit(0);
+
+// argv[2] selects the lifecycle event:
+//   'session-start' → state 'active'  (SessionStart hook; canary proof the
+//                       hook scaffold loaded — must NOT flip working/idle)
+//   'working'       → state 'working' (UserPromptSubmit hook)
+//   (default)       → state 'idle'    (Stop / SubagentStop hook)
+const rawState = process.argv[2];
+let state, source;
+if (rawState === 'session-start') {
+  state = 'active';
+  source = 'hook-session-start';
+} else if (rawState === 'working') {
+  state = 'working';
+  source = 'hook-start';
+} else {
+  state = 'idle';
+  source = 'hook-stop';
+}
+const body = JSON.stringify({ state, source, ts: Date.now() });
+const url = \`http://\${host}:\${port}/api/agents/\${agentId}/status\`;
+// Claude exports CLAUDE_HOOK_EVENT_NAME (e.g. 'Stop', 'SubagentStop',
+// 'UserPromptSubmit'); Codex passes hook_event_name on stdin instead, so for
+// Codex we tag it as 'codex'.
+const hookEvent = process.env.CLAUDE_HOOK_EVENT_NAME || 'unknown';
+
+try {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), 1500);
+  await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body,
+    signal: ac.signal,
+  });
+  clearTimeout(timer);
+} catch (err) {
+  // L-C diagnosability: append an attempt record so a single grep over
+  // <workspace>/.dashboard/pending-status.jsonl shows every hook that failed
+  // to reach the dashboard. Stays best-effort — if even the appendFileSync
+  // fails (e.g. read-only fs) we still swallow so the user-visible hook
+  // never blocks. Inference fallback continues to drive status.
+  try {
+    const scriptDir = path.dirname(fileURLToPath(import.meta.url));
+    const logPath = path.resolve(scriptDir, '..', 'pending-status.jsonl');
+    const line = JSON.stringify({
+      ts: Date.now(),
+      agentId,
+      hookEvent,
+      host,
+      port,
+      url,
+      error: err instanceof Error ? err.message : String(err),
+    }) + '\\n';
+    fs.appendFileSync(logPath, line);
+  } catch {
+    // Last-resort swallow — inference fallback still drives status.
+  }
+}
+`;
+
+/** Pre-session-start hook script (v3) — kept verbatim so a v3 workspace's
+ *  on-disk dashboard-status.mjs can be hashed and silently upgraded to v4
+ *  (which adds the 'session-start' argv → state 'active' branch). Written
+ *  verbatim by the scaffolder, so the hash matches on-disk bytes. */
+export const DASHBOARD_STATUS_SCRIPT_MJS_V3 = `#!/usr/bin/env node
 // Class IV worker hook script — see plans/class-iv-worker-hook-scaffold.md
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
@@ -547,6 +739,65 @@ try {
 }
 `;
 
+/** Codex supervised-worker hook profile.
+ *
+ *  WHY THIS EXISTS (see plans/global-hook-rollout-and-submit-confirmation.md and
+ *  the 2026-05-29 investigation): Codex 0.134 does NOT read a worker-cwd
+ *  `.codex/config.toml` unless that exact cwd is a *trusted project*, and
+ *  `--dangerously-bypass-hook-trust` does not grant project trust. So the
+ *  per-worker `.dashboard/workers/codex/.codex/config.toml` we scaffold is, in
+ *  practice, never loaded — which is why codex `hook-start` events were 0 across
+ *  the entire DB. A `--profile <name>` file, by contrast, is layered onto the
+ *  user's base config as a User-layer (no project-trust gate), so it carries the
+ *  hooks unconditionally. Combined with `--dangerously-bypass-hook-trust` on the
+ *  launch (confirmed present in codex 0.134), the per-hook trust hash never has
+ *  to be computed or interactively re-approved.
+ *
+ *  Written to `<CODEX_HOME>/dashboard-worker.config.toml` by
+ *  `ensureCodexHookProfile()` and selected via `codex --profile dashboard-worker`.
+ *  `__SCRIPT__` is replaced at write time with the absolute path of the shared
+ *  dashboard-status.mjs (written alongside it in CODEX_HOME). The script reads
+ *  AGENT_ID/DASHBOARD_PORT/DASHBOARD_HOST from env (injected at supervised-worker
+ *  launch) and exits 0 when AGENT_ID is unset, so the profile is inert for any
+ *  non-dashboard codex session that happens to select it. */
+export const CODEX_WORKER_PROFILE_NAME = 'dashboard-worker';
+
+export const CODEX_WORKER_PROFILE_TOML = `# AgentDashboard supervised-codex hook profile.
+# Layered onto the user's base config via \`codex --profile ${CODEX_WORKER_PROFILE_NAME}\`.
+# The hook script reads AGENT_ID/DASHBOARD_PORT/DASHBOARD_HOST from env (injected
+# at supervised-worker launch) and POSTs status to the dashboard; it exits 0 when
+# AGENT_ID is unset, so it is a no-op outside dashboard-launched workers.
+
+# Codex hooks are on by default in current Codex, but the feature gate is cheap
+# insurance: if a user's base config (or an older Codex) leaves the feature off,
+# the [[hooks.*]] tables below parse fine yet NEVER fire. This MUST be a
+# top-level table (NOT nested under any [profiles.*]) and use the [features]
+# hooks key — the deprecated codex_hooks key is intentionally not used.
+[features]
+hooks = true
+
+[[hooks.Stop]]
+
+[[hooks.Stop.hooks]]
+type = "command"
+command = 'node "__SCRIPT__"'
+timeout = 30
+
+[[hooks.UserPromptSubmit]]
+
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command = 'node "__SCRIPT__" working'
+timeout = 30
+
+[[hooks.SessionStart]]
+
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = 'node "__SCRIPT__" session-start'
+timeout = 30
+`;
+
 /** Native skill — .dashboard/supervisor/.claude/skills/run-orchestration/SKILL.md
  *  Frontmatter description loads at session start; body loads on demand via Read. */
 export const SUPERVISOR_RUN_ORCHESTRATION_SKILL = `---
@@ -564,7 +815,8 @@ This is the generic playbook. The orchestration-specific details (parameters, ev
 
 | Name | Script | Manual | Purpose |
 |---|---|---|---|
-| \`groupthink-v1\` | \`scripts/groupthink-v1.js\` | \`scripts/groupthink-v1.md\` | Two-agent cross-provider deliberation producing a planning markdown |
+| \`groupthink-v2\` | \`scripts/groupthink-v2.js\` | _(see script header — \`scripts/groupthink-v2.md\` not yet written)_ | **Current.** Cross-provider deliberation with two modes: \`--mode=serial\` (default — Lead drafts, Reviewer launched with that draft as kickoff, Lead writes plan; same shape as v1 with BUG-29 hardened) or \`--mode=parallel\` (3 rounds — both planners draft independently, cross-pollinate, synthesizer writes plan). |
+| \`groupthink-v1\` | \`scripts/groupthink-v1.js\` | \`scripts/groupthink-v1.md\` | Superseded by v2; kept for in-flight runs and \`resume_hint\` recovery lines. Two-agent Lead+Reviewer relay producing a planning markdown. |
 
 When new orchestrations are added, they should appear in this table and ship with a \`scripts/<name>.md\` manual matching the structure of \`groupthink-v1.md\`.
 

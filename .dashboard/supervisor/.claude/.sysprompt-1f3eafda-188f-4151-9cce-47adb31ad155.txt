@@ -1,0 +1,1 @@
+Workspace root: C:\Users\turke\Projects\AgentDashboard. cd there for project shell work. Use absolute paths for Read/Edit/Glob.

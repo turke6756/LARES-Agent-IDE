@@ -86,6 +86,22 @@ interface CachedTerminal {
 // Module-level cache — survives re-renders, preserves scrollback
 const terminalCache = new Map<string, CachedTerminal>();
 
+// Auto-focus the terminal WITHOUT yanking focus away from a text field the
+// user is actively typing in (e.g. the chat bar). The terminal's mount/reattach
+// focus runs on setTimeout, so without this guard a pending timer can steal
+// focus from the chat textarea you just clicked into — keystrokes then vanish.
+// xterm's own helper textarea lives inside `container`, so re-focusing when the
+// terminal is already focused is still fine; we only bail for inputs elsewhere.
+function focusTerminalUnlessTypingElsewhere(terminal: Terminal, container: HTMLElement) {
+  const active = document.activeElement as HTMLElement | null;
+  if (active && !container.contains(active)) {
+    if (active.tagName === 'TEXTAREA' || active.tagName === 'INPUT' || active.isContentEditable) {
+      return;
+    }
+  }
+  terminal.focus();
+}
+
 interface TerminalPanelProps {
   height: number;
 }
@@ -143,7 +159,7 @@ export default function TerminalPanel({ height }: TerminalPanelProps) {
         } catch { /* ignore */ }
       };
       fitReattach();
-      setTimeout(() => { fitReattach(); cached!.terminal.focus(); }, 50);
+      setTimeout(() => { fitReattach(); focusTerminalUnlessTypingElsewhere(cached!.terminal, container); }, 50);
       setTimeout(fitReattach, 200);
 
       // Re-attach IPC if needed (unsub was cleaned up on detach)
@@ -165,7 +181,10 @@ export default function TerminalPanel({ height }: TerminalPanelProps) {
         fontWeight: currentTheme === 'light' ? '600' : 'normal',
         fontFamily: "'Cascadia Code', 'Consolas', monospace",
         cursorBlink: true,
-        scrollback: 5000,
+        // Generous scrollback so a long-lived agent (especially a supervisor
+        // you leave running for hours) keeps its full history in the panel
+        // rather than silently dropping the oldest lines.
+        scrollback: 50000,
         smoothScrollDuration: 150,
         scrollSensitivity: 3,
         fastScrollSensitivity: 8,
@@ -285,7 +304,7 @@ export default function TerminalPanel({ height }: TerminalPanelProps) {
           setTimeout(() => {
             fitAndSync();
             terminal.scrollToBottom();
-            terminal.focus();
+            focusTerminalUnlessTypingElsewhere(terminal, container);
           }, 50);
           setTimeout(fitAndSync, 200);
           setTimeout(fitAndSync, 500);
@@ -334,15 +353,18 @@ export default function TerminalPanel({ height }: TerminalPanelProps) {
 
       const entry = terminalCache.get(agentId);
       if (entry) {
-        // Clean up IPC listener
-        if (entry.unsub) {
-          entry.unsub();
-          entry.unsub = null;
-        }
-        // Detach from main process
-        window.api.terminal.detach(agentId);
-
-        // Detach from DOM but DON'T dispose — preserve scrollback
+        // Keep the IPC listener AND the main-process forwarding ALIVE while
+        // the terminal is off-screen. This is what makes scrollback "stay"
+        // when you switch to another workspace / agent and come back: the
+        // cached xterm keeps buffering live output the whole time you're away.
+        // Previously the cleanup ran unsub() + terminal.detach(), so every
+        // byte emitted while detached was dropped and the reattach branch only
+        // re-subscribed to NEW output — leaving a gap with no backfill. We
+        // deliberately leave entry.unsub in place (the reattach branch's
+        // `if (!cached.unsub)` guard then skips re-subscribing).
+        //
+        // Only detach from the DOM (so the element can move) — never dispose,
+        // never unsubscribe.
         if (entry.terminal.element?.parentElement === container) {
           container.removeChild(entry.terminal.element);
         }

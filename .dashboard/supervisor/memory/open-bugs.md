@@ -18,6 +18,60 @@ Format per bug:
 
 ---
 
+## BUG-30: Supervisor cannot discover its own workspace_id — every workspace-scoped MCP tool requires an ID the supervisor is never given
+
+- Component: sysprompt injection — `src/main/supervisor/index.ts:1597` (Windows) and `:1952` (WSL), both emit only `Workspace root: <path>`, never the ID. `list_agents` summary — `scripts/mcp-supervisor.js:596-609`, includes `workingDirectory` but drops `workspaceId` even though `a.workspaceId` is present in the API response. No `list_workspaces` tool exists in `mcp-supervisor.js`.
+- Severity: high — `launch_agent`, `list_templates`, `list_teams`, `create_team` all `require: ['workspace_id', ...]` (`mcp-supervisor.js:357,370,381,409,493`), but the supervisor is told only its workspace *path*, not its ID, and has no tool to resolve path→ID. Reported workaround was grepping `.dashboard/launches.log` after 4 wrong guesses ("Workspace not found"). Blocks every Path-2 launch/team flow until the ID is found by hand.
+- Status: open — reported 2026-05-29 by NEON_GIS workspace supervisor; root cause confirmed against code same day.
+- Fix sketches (any one helps; first two are cheapest and complementary):
+  1. **Inject the ID into the sysprompt.** At `index.ts:1597`/`:1952`, append `Workspace ID: <id>` next to the existing `Workspace root:` line. The launch path already has the agent's `workspaceId`. ~2 LOC each side.
+  2. **Add `workspaceId` to `list_agents` output.** At `mcp-supervisor.js:602`, add `workspaceId: a.workspaceId` to the summary object — the field is already in the API payload. One line. Lets a supervisor read its own ID off any agent row (including itself).
+  3. **Add a `list_workspaces` MCP tool** (id, name, path) backed by a `GET /api/workspaces` endpoint — most discoverable, slightly more work.
+  4. **Let `launch_agent` accept a `working_directory`/path and resolve path→id server-side** when `workspace_id` is omitted. `working_directory` is already an accepted arg (`mcp-supervisor.js:352`); resolution would happen in the launch handler.
+- Recommendation: ship (1)+(2) together — both trivial, cover sysprompt-read and list_agents-read paths. (3) is the clean long-term answer.
+
+---
+
+## BUG-31: Documented curl API fallback is unreachable from WSL — but the bind is fine; firewall/host-IP is the real cause
+
+- Component: docs (`SUPERVISOR_AGENT_MD` in `src/shared/constants.ts`, "Fallback" section) + Windows networking. NOT `src/main/api-server.ts` — it already binds `0.0.0.0:24678` (`api-server.ts:68,76`), so the server is listening on all interfaces.
+- Severity: medium — the documented WSL fallback (`http://127.0.0.1:24678`, or the resolv.conf gateway IP) is a dead end from inside WSL: `127.0.0.1` hits WSL's own loopback (connection refused), and the resolv.conf gateway (`10.255.255.254`) also failed for the reporter. Because the bind is already `0.0.0.0`, a rebind does NOT fix this — the inbound connection from WSL to the Windows host is almost certainly blocked by Windows Defender Firewall on port 24678, or the host IP differs under mirrored networking (where the correct address is the host's LAN IP / `$(hostname).local`, not the resolv.conf gateway).
+- Status: open — reported 2026-05-29; bind verified correct against code same day. MCP tools were unaffected (the reporter used them); only the curl fallback is broken.
+- Fix sketches:
+  1. **Add a Windows Firewall inbound allow rule for TCP 24678** at app first-run (or document the manual `netsh advfirewall firewall add rule` command).
+  2. **Fix the docs** to give the address that actually works from WSL — under mirrored networking that's `localhost`/`127.0.0.1` once the firewall allows it; under NAT it's the host's LAN IP, not the resolv.conf gateway. Add a one-liner the supervisor can run to discover the right host IP.
+  3. Lowest priority since MCP tools are the primary interface and they work — this only matters when MCP is down.
+
+---
+
+## BUG-32: No post-mortem log after a Codex crash — `read_agent_log` returns empty, so a crashed codex agent is undiagnosable
+
+- Component: PTY/log capture + crash cleanup path in `src/main/supervisor/` (log persistence on agent exit). Once codex crashes, its PTY/log is gone and `read_agent_log` returns empty.
+- Severity: medium — defeats crash triage, which is an explicit supervisor responsibility ("crashed: read the log to diagnose"). The supervisor's CLAUDE.md tells it to read the log on a crash event, but for codex crashes there's nothing left to read. Compounds with BUG-26's "all 3 vanished from list_agents" crash-cascade (see BUG-26 fresh evidence below) — the agents that most need a post-mortem are exactly the ones whose logs disappear.
+- Status: open — reported 2026-05-29 by NEON_GIS supervisor.
+- Fix sketch: on agent exit/crash, persist the last N lines (e.g. last 200) of the PTY buffer to a durable side file (e.g. `.dashboard/workers/<provider>/<agentId>.crash.log` or a DB column) before cleanup tears down the PTY. `read_agent_log` should fall back to that snapshot when the live PTY is gone. Pairs with BUG-20's framebuffer-tail logic.
+
+---
+
+## BUG-33: Codex TUI placeholder hints leak into captured logs as if they were real prompts
+
+- Component: log capture / `read_agent_log` rendering — codex's empty-input-box placeholder suggestions ("Run /review on my current changes", "Write tests for @filename") are surfaced in captured output as though they were real prompt content.
+- Severity: low — cosmetic but caused a brief misdiagnosis (reporter mistook the placeholder text for an actual prompt). Same family as BUG-20 (TUI chrome leaking into the event preview).
+- Status: open — reported 2026-05-29.
+- Fix sketch: filter codex's known placeholder-suggestion lines from captured PTY output (blocklist the fixed suggestion strings, or detect the empty-box placeholder styling). Brittle to codex version changes; low priority.
+
+---
+
+## BUG-29: New Codex/Gemini agents inherit prior agents' chat history despite `freshSession: true` — same-cwd discovery binds to days-or-weeks-old prior sessions
+
+- Component: `src/main/supervisor/log-readers/gemini-transcript-reader.ts:46-49` (cwd-match-newest with no time window) + `src/main/supervisor/session-id-discovery.ts:313-331` (codex discovery still runs on `freshSession=true` per BUG-26 trade-off, can bind to sessions older than the 2-day `RECENT_CWD_DISCOVERY_DAYS`).
+- Severity: high — silently contaminates every same-cwd Codex/Gemini agent in a workspace that has ever hosted a prior agent of the same provider. Confirmed across `groupthink-v1.js` runs and the dashboard's `GET /api/agents/:id/messages` endpoint. Distinct from BUG-26 (concurrent same-minute cross-binding) and BUG-28 (discovery never resolves) — this is the *stale-prior* sibling.
+- Status: open — reproduced four times 2026-05-26 in this workspace. Three failure modes: (1) Codex agent created `06:11:38Z` returned 5 chat messages from `2026-05-25T18:41Z` (an 11.5h-old prior GroupThink on an unrelated topic); (2) Codex agent created `06:26:47Z` after stashing all of yesterday's rollouts bound to `resumeSessionId: 019e5112-...` from `2026-05-22` (3 days, outside the documented 2-day window); (3) Gemini reviewer agent created `06:27:47Z` returned 8 chat messages from `2026-05-07` (19 days old, fits the docstring's "no window" admission). Claude+Claude is the only provider combo that launched clean in the same session; cause of immunity not investigated. Full repro, root-cause analysis, fix sketch, workaround, and file/line refs in `plans/bug-29-fresh-session-chat-inheritance.md`.
+- Gotcha ref: groupthink-running-gotchas.md (add entry — same-cwd cross-provider GroupThink is currently unreliable; use Claude+Claude or manually verify chat is clean after launch).
+- Fix sketch: two independent changes required. Fix 1 — gemini-transcript-reader: add mtime-vs-createdAt threshold check (refuse to bind to a JSONL with mtime older than `agent.createdAt - ε`). Fix 2 — codex discovery: tighten the SQLite path's tiebreaker to require the matched session's mtime within ε of launch; if no fresh session, leave `resumeSessionId` null and let BUG-28's lazy-recovery path (once fixed) handle re-binding when the new rollout appears. After both, `freshSession: true` once again means what the name implies; if it doesn't, the API field should be renamed.
+
+---
+
 ## BUG-28: Codex `resumeSessionId` stays `null` after a lost discovery race — chat-read endpoint never triggers lazy recovery, so `CodexRolloutReader` never tails the rollout file and the structured chat stays empty even though the rollout JSONL has every assistant turn
 
 - Component: `src/main/api-server.ts:150-158` (chat-messages endpoint) + `src/main/supervisor/index.ts:1647` (`resolveCodexResumeSessionId`, the existing lazy-recovery hook that this bug fails to invoke from the chat-read path).
@@ -39,7 +93,7 @@ Format per bug:
 - Why this is distinct from BUG-26: BUG-26 is about *cross-binding* under concurrent same-cwd codex launches (N agents, N-1 shift in chat attribution). BUG-28 is about *no binding at all* for a single codex agent whose discovery race lost. BUG-26's Path A fix (extending SQL `threads`-poll from 10 s → 35 s) would also reduce BUG-28's incidence — if discovery wins more often, the race is lost less often. But Path A doesn't *eliminate* BUG-28: codex can still flush late or the dashboard can be killed mid-window. Once the race is lost under any fix, the chat-read endpoint must still know how to self-heal. The two bugs are complementary, not duplicates.
 - Why it doesn't reliably surface in single-agent MCP launches: a manual `mcp__agent-dashboard__launch_agent` for one codex agent leaves the system uncontested — Codex usually flushes `session_meta` well within the 10-s window because there's no concurrent launch noise. GroupThink launches Lead + Reviewer back-to-back and immediately starts message relay, increasing the chance the race loses on the Reviewer specifically. Same code path, looser race-handling under load.
 - Affected workflows: every Codex agent whose discovery missed at launch, with consumers that read structured chat. Highest blast radius today: `scripts/groupthink-v1.js` with `--reviewerProvider=codex` (the default). Also affects the dashboard UI's chat pane for the same agent — it polls the same endpoint. The PTY view in the dashboard is unaffected because PTY rendering is byte-level streaming, independent of session-id resolution.
-- Workaround (manual, supervisor-side): when a Codex agent shows `resumeSessionId: null` and chat is empty but PTY has content, the supervisor can force recovery by triggering a sid-using op. Cheapest is `mcp__agent-dashboard__fork_agent({agent_id})` and immediately `stop_agent` the fork — the fork attempt reads the sid, fires `resolveCodexResumeSessionId`, rebinds the reader, and the pent-up chat events flow on the next dispatcher poll. Ugly but doesn't require code changes. For GroupThink runs, do this before the 10-min stall cap fires and the script's next poll will pick up the message naturally. **Important note:** this workaround is theoretical-but-untested as of 2026-05-25; the supervisor reading this should verify before relying on it in a live recovery.
+- Workaround (manual, supervisor-side): when a Codex agent shows `resumeSessionId: null` and chat is empty but PTY has content, the supervisor can force recovery by triggering a sid-using op. Cheapest is `mcp__agent-dashboard__fork_agent({agent_id})` and immediately `stop_agent` the fork — the fork attempt reads the sid, fires `resolveCodexResumeSessionId`, rebinds the reader, and the pent-up chat events flow on the next dispatcher poll. Ugly but doesn't require code changes. For GroupThink runs, do this before the 10-min stall cap fires and the script's next poll will pick up the message naturally. **Important note:** this workaround is theoretical-but-untested as of 2026-05-25; the supervisor reading this should verify before relying on it in a live recovery. **CORRECTION 2026-05-29: the fork lever is INVALID for codex — `fork_agent` returns "Fork is only supported for Claude agents."** Tested live during a GroupThink v2 parallel run (codex planner `f9743867`): chat returned `[]` while the rollout JSONL had the full turn; `get_context_stats` did not trigger recovery either; `fork_agent` was rejected. With no MCP-exposed sid-consuming op for codex, there is currently **no in-band recovery** for a codex chat-blackout. Practical salvage that worked: (1) locate the agent's rollout at `~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl` (newest mtime matching launch time), (2) extract the assistant turn directly from the JSONL, (3) relay it onward manually. This makes the BUG-28 *primary fix* (auto-recover sid on chat-read) more urgent — it is the only thing that would make codex chat self-heal, since none of the manual levers are reachable for codex.
 - Fix sketches:
   - **Primary — auto-recover sid on chat-read.** In `src/main/api-server.ts:150-158`, before `getChatService().getMessages(agentId, ...)`, add a single call: `this.supervisor.maybeRecoverCodexSid(agentId)`. Implement `maybeRecoverCodexSid(agentId: string): void` as a new public method on `AgentSupervisor` that: (a) looks up the agent, (b) returns early if `provider !== 'codex'`, (c) returns early if `resumeSessionId` is set, (d) calls the existing private `resolveCodexResumeSessionId(agent)`. Cost: ~6 production LOC + one regression test (launch codex without sid, write rollout file by hand into `~/.codex/sessions/`, hit messages endpoint, assert sid is populated and chat returns the assistant turn). No new public surface for the recovery logic itself — the new method just wraps and exposes the existing private one for the API layer. This is the smallest, cleanest fix and it makes every future GroupThink Codex-Reviewer self-heal on the script's first poll.
   - **Secondary — also recover on `getContextStats` and any other agent-read endpoint.** Same shape as primary, applied wherever the supervisor reads agent state via the API. Belt-and-suspenders: a UI tab that opens to the agent's stats view (no chat poll) would also trigger recovery. Optional, ships after primary if useful.
@@ -138,6 +192,10 @@ No `sessions/` line. No rollout path. No UUID anywhere in the first 30 KB of std
 - **Path A (chosen 2026-05-25):** Extend SQL `threads`-table poll timeout from 10s → 35s so the codex-deferred INSERT (lands ~25-26s after launch) is caught by the primary path. Pair with fail-loud-empty filesystem fallback (return null instead of misbinding when no usable prefix filter exists). Smallest delta, cost is ~25s slower codex launches.
 - **Path B (deferred):** Per-agent `CODEX_HOME` env at launch — each agent's `~/.codex/sessions/` namespace is unique, race eliminated by construction. Requires investigating BUG-25 trust-list interaction and codex auth-state cache transfer. Better structural fix; not yet characterized.
 - **Path C (dead):** Stdout-banner-parse — premise invalid per above. Do not pursue without re-verifying the banner format on a future codex version.
+
+### Fresh evidence 2026-05-29 (NEON_GIS) — plus a possible crash-cascade facet
+
+NEON_GIS supervisor launched 3 codex agents (trivial prompts) into the shared `.dashboard/workers/codex` cwd. Reproduced the core BUG-26 signature (two agents even shared the SAME session id `019e755a-edaa-7dd1-...`). **New facet not previously captured:** crash/cleanup appeared entangled — one agent crashed twice at launch (race), another crashed *after* going idle, and then **all 3 vanished from `list_agents`** as if a crash in one cascaded into sibling teardown. Worth investigating whether shared-cwd codex agents share any cleanup/lifecycle state that lets one crash evict the others. Also note `freshSession: true` mints a fresh conversation but does NOT isolate the directory, so rollout/session files still collide — consistent with the BUG-26 Path-B (per-agent `CODEX_HOME`) recommendation. The undiagnosable-after-crash half of this report is tracked separately as BUG-32.
 
 ---
 

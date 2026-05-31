@@ -13,7 +13,8 @@ This is the generic playbook. The orchestration-specific details (parameters, ev
 
 | Name | Script | Manual | Purpose |
 |---|---|---|---|
-| `groupthink-v1` | `scripts/groupthink-v1.js` | `scripts/groupthink-v1.md` | Two-agent cross-provider deliberation producing a planning markdown |
+| `groupthink-v2` | `scripts/groupthink-v2.js` | _(see script header — `scripts/groupthink-v2.md` not yet written)_ | **Current.** Cross-provider deliberation with two modes: `--mode=serial` (default — Lead drafts, Reviewer launched with that draft as kickoff, Lead writes plan; same shape as v1 with BUG-29 hardened) or `--mode=parallel` (3 rounds — both planners draft independently, cross-pollinate, synthesizer writes plan). |
+| `groupthink-v1` | `scripts/groupthink-v1.js` | `scripts/groupthink-v1.md` | Superseded by v2; kept for in-flight runs and `resume_hint` recovery lines. Two-agent Lead+Reviewer relay producing a planning markdown. |
 
 When new orchestrations are added, they should appear in this table and ship with a `scripts/<name>.md` manual matching the structure of `groupthink-v1.md`.
 

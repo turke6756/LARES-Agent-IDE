@@ -80,6 +80,11 @@ export function initDatabase(): void {
   // Migration: add is_supervised column (opt-in for supervisor event bridge)
   try { db.exec(`ALTER TABLE agents ADD COLUMN is_supervised INTEGER NOT NULL DEFAULT 0`); } catch { /* column already exists */ }
 
+  // Migration: add is_worker column (hook-based status lane — launches from
+  // .dashboard/workers/<provider>/, disables PTY + chat-event inference; does
+  // NOT notify a supervisor). Orthogonal to is_supervised; see Agent.isWorker.
+  try { db.exec(`ALTER TABLE agents ADD COLUMN is_worker INTEGER NOT NULL DEFAULT 0`); } catch { /* column already exists */ }
+
   db.exec(`
     CREATE TABLE IF NOT EXISTS events (
       id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -176,6 +181,7 @@ export function initDatabase(): void {
       auto_restart      INTEGER NOT NULL DEFAULT 1,
       is_supervisor     INTEGER NOT NULL DEFAULT 0,
       is_supervised     INTEGER NOT NULL DEFAULT 1,
+      is_worker         INTEGER NOT NULL DEFAULT 1,
       created_at        TEXT NOT NULL DEFAULT (datetime('now')),
       updated_at        TEXT NOT NULL DEFAULT (datetime('now'))
     )
@@ -184,13 +190,21 @@ export function initDatabase(): void {
   // Migration: add template_id and system_prompt to agents
   try { db.exec(`ALTER TABLE agents ADD COLUMN template_id TEXT`); } catch { /* exists */ }
   try { db.exec(`ALTER TABLE agents ADD COLUMN system_prompt TEXT`); } catch { /* exists */ }
+  // Migration: add hook-scaffold health columns (HOOK_SYSTEM_DESIGN.md §5.4).
+  // hook_status defaults to 'unknown' until the launch canary or a hook event
+  // resolves it; last_hook_event_at is the wall-clock ms of the last hook POST.
+  try { db.exec(`ALTER TABLE agents ADD COLUMN hook_status TEXT NOT NULL DEFAULT 'unknown'`); } catch { /* exists */ }
+  try { db.exec(`ALTER TABLE agents ADD COLUMN last_hook_event_at INTEGER`); } catch { /* exists */ }
+  // Migration: add is_worker to agent_templates (default 1 — worker is the
+  // default lane for user-launched claude/codex agents).
+  try { db.exec(`ALTER TABLE agent_templates ADD COLUMN is_worker INTEGER NOT NULL DEFAULT 1`); } catch { /* exists */ }
 
   // Seed built-in supervisor template if not present
   const existingSup = queryAll("SELECT id FROM agent_templates WHERE id = 'builtin-supervisor'");
   if (existingSup.length === 0) {
     db.prepare(
-      `INSERT INTO agent_templates (id, workspace_id, name, description, system_prompt, role_description, provider, is_supervisor, is_supervised, auto_restart)
-       VALUES (?, NULL, ?, ?, ?, ?, 'claude', 1, 0, 1)`
+      `INSERT INTO agent_templates (id, workspace_id, name, description, system_prompt, role_description, provider, is_supervisor, is_supervised, is_worker, auto_restart)
+       VALUES (?, NULL, ?, ?, ?, ?, 'claude', 1, 0, 0, 1)`
     ).run(
       'builtin-supervisor',
       'Supervisor',
@@ -257,10 +271,13 @@ function rowToAgent(row: any): Agent {
     provider: (row.provider || 'claude') as AgentProvider,
     isSupervisor: !!row.is_supervisor,
     isSupervised: !!row.is_supervised,
+    isWorker: !!row.is_worker,
     tmuxSessionName: row.tmux_session_name,
     autoRestartEnabled: !!row.auto_restart_enabled,
     resumeSessionId: row.resume_session_id,
     status: row.status as AgentStatus,
+    hookStatus: (row.hook_status || 'unknown') as Agent['hookStatus'],
+    lastHookEventAt: row.last_hook_event_at ?? undefined,
     isAttached: !!row.is_attached,
     restartCount: row.restart_count,
     lastExitCode: row.last_exit_code,
@@ -326,6 +343,7 @@ export function createAgent(data: {
   provider?: AgentProvider;
   isSupervisor?: boolean;
   isSupervised?: boolean;
+  isWorker?: boolean;
   tmuxSessionName: string | null;
   autoRestartEnabled: boolean;
   logPath: string;
@@ -336,10 +354,10 @@ export function createAgent(data: {
   const slug = slugify(data.title);
   run(
     `INSERT INTO agents (id, workspace_id, title, slug, role_description, working_directory,
-      command, provider, is_supervisor, is_supervised, tmux_session_name, auto_restart_enabled, log_path, template_id, system_prompt)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      command, provider, is_supervisor, is_supervised, is_worker, tmux_session_name, auto_restart_enabled, log_path, template_id, system_prompt)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [id, data.workspaceId, data.title, slug, data.roleDescription, data.workingDirectory,
-      data.command, data.provider || 'claude', data.isSupervisor ? 1 : 0, data.isSupervised ? 1 : 0, data.tmuxSessionName, data.autoRestartEnabled ? 1 : 0, data.logPath,
+      data.command, data.provider || 'claude', data.isSupervisor ? 1 : 0, data.isSupervised ? 1 : 0, data.isWorker ? 1 : 0, data.tmuxSessionName, data.autoRestartEnabled ? 1 : 0, data.logPath,
       data.templateId || null, data.systemPrompt || null]
   );
   return getAgent(id)!;
@@ -371,6 +389,27 @@ export function getActiveAgents(): Agent[] {
 
 export function updateAgentStatus(id: string, status: AgentStatus): void {
   run("UPDATE agents SET status = ?, updated_at = datetime('now') WHERE id = ?", [status, id]);
+}
+
+/** HOOK_SYSTEM_DESIGN.md §5.4 — set the hook-scaffold health field. When a hook
+ *  event arrives, callers pass `lastHookEventAt` to also stamp the timestamp;
+ *  the launch canary / B2 degrade path omit it (no event occurred). */
+export function updateAgentHookStatus(
+  id: string,
+  hookStatus: NonNullable<Agent['hookStatus']>,
+  lastHookEventAt?: number,
+): void {
+  if (lastHookEventAt !== undefined) {
+    run(
+      "UPDATE agents SET hook_status = ?, last_hook_event_at = ?, updated_at = datetime('now') WHERE id = ?",
+      [hookStatus, lastHookEventAt, id],
+    );
+  } else {
+    run(
+      "UPDATE agents SET hook_status = ?, updated_at = datetime('now') WHERE id = ?",
+      [hookStatus, id],
+    );
+  }
 }
 
 export function updateAgentPid(id: string, pid: number | null): void {
@@ -423,6 +462,7 @@ function rowToAgentTemplate(row: any): AgentTemplate {
     autoRestart: !!row.auto_restart,
     isSupervisor: !!row.is_supervisor,
     isSupervised: !!row.is_supervised,
+    isWorker: !!row.is_worker,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -431,11 +471,12 @@ function rowToAgentTemplate(row: any): AgentTemplate {
 export function createAgentTemplate(input: CreateAgentTemplateInput): AgentTemplate {
   const id = uuidv4();
   run(
-    `INSERT INTO agent_templates (id, workspace_id, name, description, system_prompt, role_description, provider, command, auto_restart, is_supervisor, is_supervised)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO agent_templates (id, workspace_id, name, description, system_prompt, role_description, provider, command, auto_restart, is_supervisor, is_supervised, is_worker)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [id, input.workspaceId || null, input.name, input.description || '', input.systemPrompt || null,
      input.roleDescription || '', input.provider || 'claude', input.command || null,
-     input.autoRestart !== false ? 1 : 0, input.isSupervisor ? 1 : 0, input.isSupervised !== false ? 1 : 0]
+     input.autoRestart !== false ? 1 : 0, input.isSupervisor ? 1 : 0, input.isSupervised !== false ? 1 : 0,
+     input.isWorker !== false ? 1 : 0]
   );
   return getAgentTemplate(id)!;
 }
@@ -468,6 +509,7 @@ export function updateAgentTemplate(id: string, updates: Partial<CreateAgentTemp
   if (updates.autoRestart !== undefined) { sets.push('auto_restart = ?'); params.push(updates.autoRestart ? 1 : 0); }
   if (updates.isSupervisor !== undefined) { sets.push('is_supervisor = ?'); params.push(updates.isSupervisor ? 1 : 0); }
   if (updates.isSupervised !== undefined) { sets.push('is_supervised = ?'); params.push(updates.isSupervised ? 1 : 0); }
+  if (updates.isWorker !== undefined) { sets.push('is_worker = ?'); params.push(updates.isWorker ? 1 : 0); }
   if (updates.workspaceId !== undefined) { sets.push('workspace_id = ?'); params.push(updates.workspaceId); }
 
   if (sets.length > 0) {

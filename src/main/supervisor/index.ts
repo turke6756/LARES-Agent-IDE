@@ -10,8 +10,10 @@ import {
   SUPERVISOR_AGENT_NAME, SUPERVISOR_AGENT_MD, SUPERVISOR_MEMORY_MD,
   SUPERVISOR_CLAUDE_SETTINGS_JSON, SUPERVISOR_RUN_ORCHESTRATION_SKILL, SUPERVISOR_ORCHESTRATION_SPIKE_SKILL,
   SCRIPT_READ_AGENT_LOG, SCRIPT_LIST_AGENTS, SCRIPT_SEND_MESSAGE, SCRIPT_GET_CONTEXT_STATS,
-  WORKER_CLAUDE_MD, WORKER_CLAUDE_SETTINGS_JSON, WORKER_CODEX_CONFIG_TOML, WORKER_CODEX_CONFIG_TOML_V1,
-  DASHBOARD_STATUS_SCRIPT_MJS,
+  WORKER_CLAUDE_MD, WORKER_CLAUDE_SETTINGS_JSON, WORKER_CLAUDE_SETTINGS_JSON_V2,
+  WORKER_CODEX_CONFIG_TOML, WORKER_CODEX_CONFIG_TOML_V1, WORKER_CODEX_CONFIG_TOML_V2,
+  DASHBOARD_STATUS_SCRIPT_MJS, DASHBOARD_STATUS_SCRIPT_MJS_V3,
+  CODEX_WORKER_PROFILE_NAME, CODEX_WORKER_PROFILE_TOML, HOOK_CANARY_WINDOW_MS,
 } from '../../shared/constants';
 import { EventBridge, EventBridgeDeps } from './event-bridge';
 import { TeamMessageDeliveryEngine } from './team-delivery';
@@ -38,11 +40,11 @@ import {
   updateAgentExitCode, incrementRestartCount, updateAgentLastOutput,
   updateAgentAttached, addEvent, deleteAgent as dbDeleteAgent,
   updateAgentResumeSessionId, addFileActivity, getTeamMembership, getAgentTemplate,
-  getFileActivities, deleteFileActivitiesForAgent,
+  getFileActivities, deleteFileActivitiesForAgent, updateAgentHookStatus,
 } from '../database';
-import { detectPathType, windowsToWslPath, uncToWslPath } from '../path-utils';
+import { detectPathType, windowsToWslPath, uncToWslPath, wslToWindowsPath } from '../path-utils';
 import { getScriptPath } from './paths';
-import { tmuxListSessions, tmuxSendInput } from '../wsl-bridge';
+import { tmuxListSessions, tmuxSendInput, tmuxSendSubmit } from '../wsl-bridge';
 import { getWindowsSubmitSequence } from './send-input-encoders';
 
 // ── Scaffold versioning (plans/scaffold-version-migration.md) ──────────
@@ -88,8 +90,66 @@ export const DASHBOARD_STATUS_SCRIPT_V2_HASH = 'a6e27a1330e7cd499ed5be2b7b3a68ea
  *  v2 settings file's previousHashes for silent v1→v2 upgrade. */
 export const WORKER_CLAUDE_SETTINGS_JSON_V1_HASH = 'a0dc44c8e6c086219a15a1e6799d02cf8abe5f24f07acb8c7dc011e6e4216c46';
 
+/** SHA-256 hex of the v1 `.dashboard/supervisor/CLAUDE.md` (pre-GroupThink-v2
+ *  references + pre-"Online research" section). v2 adds the v2 groupthink
+ *  references in two places and the new "Online research" section. Used in
+ *  the v2 file's previousHashes for silent v1→v2 upgrade. */
+export const SUPERVISOR_AGENT_MD_V1_HASH = '2a18afb8be96fd6aa8589a351979b30786a303649d4247983a6826fd53b2be4d';
+
+/** SHA-256 hex of the v1 `.dashboard/supervisor/.claude/skills/run-orchestration/SKILL.md`
+ *  (pre-GroupThink-v2 catalog row). v2 adds the `groupthink-v2` row alongside
+ *  the existing v1 row. Used in the v2 file's previousHashes for silent
+ *  v1→v2 upgrade. */
+export const SUPERVISOR_RUN_ORCHESTRATION_SKILL_V1_HASH = '90d7334faa42b08129a810db54c740796264143c5e10a4d2b469b7fb6040ab71';
+
 export function sha256Hex(content: string | Buffer): string {
   return crypto.createHash('sha256').update(content).digest('hex');
+}
+
+/** B2 (HOOK_SYSTEM_DESIGN.md §C) — ensure a worker-lane codex command carries
+ *  the dashboard hook profile + bypass flag so its turn-boundary hooks fire.
+ *
+ *  The pre-B2 code only instrumented the pristine framework-default command
+ *  (`command === defaultCmd`); a workspace-customized or caller-supplied codex
+ *  command ran hookless yet stayed worker-lane (PTY inference disabled) →
+ *  permanently blind. This broadens to ANY recognizably-codex command:
+ *  detect whether `--profile dashboard-worker` and
+ *  `--dangerously-bypass-hook-trust` are present and inject whichever is
+ *  missing immediately after the `codex` / `ccodex` launcher token (so the
+ *  flags bind to codex itself, ahead of any subcommand like `resume`),
+ *  preserving the rest of the command verbatim.
+ *
+ *  Returns `{ instrumented: false }` when the command can't be safely
+ *  instrumented — it isn't recognizably codex (no `codex`/`ccodex` token), or
+ *  it already pins a DIFFERENT `--profile` we must not clobber. The caller
+ *  marks the agent hook_status='degraded' and warns rather than launch a
+ *  worker-lane codex silently hookless. */
+export function instrumentCodexWorkerCommand(
+  command: string,
+): { command: string; instrumented: boolean } {
+  // Locate the codex launcher token (`codex` or `ccodex`) as a whole word,
+  // tolerating a path prefix (`/usr/bin/ccodex`) but not a substring match
+  // inside an unrelated token.
+  const tokenMatch = command.match(/(^|\s)((?:[^\s]*[/\\])?c?codex)(?=\s|$)/);
+  if (!tokenMatch) return { command, instrumented: false };
+
+  // A foreign `--profile X` (X !== dashboard-worker) means the command is
+  // pinned to another layered config we can't safely override — degrade.
+  const profileMatch = command.match(/--profile(?:\s+|=)(\S+)/);
+  const hasOurProfile = profileMatch?.[1] === CODEX_WORKER_PROFILE_NAME;
+  if (profileMatch && !hasOurProfile) return { command, instrumented: false };
+
+  const hasBypass = /--dangerously-bypass-hook-trust(?=\s|$)/.test(command);
+  if (hasOurProfile && hasBypass) return { command, instrumented: true };
+
+  const additions: string[] = [];
+  if (!hasOurProfile) additions.push(`--profile ${CODEX_WORKER_PROFILE_NAME}`);
+  if (!hasBypass) additions.push('--dangerously-bypass-hook-trust');
+
+  const tokenEnd = tokenMatch.index! + tokenMatch[1].length + tokenMatch[2].length;
+  const head = command.slice(0, tokenEnd);
+  const tail = command.slice(tokenEnd);
+  return { command: `${head} ${additions.join(' ')}${tail}`, instrumented: true };
 }
 
 /** Strip the leading `.dashboard/` segment from a scaffold-map relPath so
@@ -159,6 +219,28 @@ function formatBracketedPaste(text: string): string {
 
 function shellSingleQuote(value: string): string {
   return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+// Grace window before lazy cwd-match recovery is allowed to fire for a codex
+// agent with a null resumeSessionId. Must exceed the authoritative SQL
+// discovery timeout (DEFAULT_SQL_POLL_TIMEOUT_MS = 35 s in
+// session-id-discovery.ts) plus slack for the async DB write + dispatcher
+// pickup, so recovery never hijacks a still-resolving live launch (BUG-29).
+const CODEX_DISCOVERY_GRACE_MS = 45_000;
+
+/**
+ * Parse a SQLite `datetime('now')` timestamp ("YYYY-MM-DD HH:MM:SS", UTC, no
+ * zone marker) to epoch ms. `Date.parse` treats the bare space-form as LOCAL
+ * time, which would skew an age computation by the full timezone offset, so we
+ * normalize to ISO-UTC first. Falls through to plain `Date.parse` for any
+ * already-ISO value; returns null when unparseable.
+ */
+function parseSqliteUtcMs(s: string | null | undefined): number | null {
+  if (!s) return null;
+  const ms = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(s)
+    ? Date.parse(s.replace(' ', 'T') + 'Z')
+    : Date.parse(s);
+  return Number.isFinite(ms) ? ms : null;
 }
 
 function normalizeCodexArgs(args: string[]): string[] {
@@ -323,6 +405,9 @@ export class AgentSupervisor extends EventEmitter {
   // ensureMcpConfig around lines 786-825) and reused across all subsequent
   // WSL launches in this supervisor instance. Null until first resolve.
   private wslGatewayIp: string | null = null;
+  /** Per-runtime guard so the codex hook profile is (re)written at most once
+   *  per process per pathType — see ensureCodexHookProfile. */
+  private codexHookProfileEnsured = new Set<string>();
 
   // Event bridge — supervisor notification, cooldown, queue, drain state lives here.
   private bridge: EventBridge;
@@ -376,6 +461,9 @@ export class AgentSupervisor extends EventEmitter {
       // during Coalescing / spinner-only phases.
       (agentId) => this.getLastRawOutputTime(agentId),
     );
+
+    // BUG-10 — give the monitor a way to replay a dropped submit keystroke.
+    this.monitor.setResubmitHandler((agentId) => this.resubmitEnter(agentId));
 
     const bridgeDeps: EventBridgeDeps = {
       getAgent: (id) => getAgent(id),
@@ -571,6 +659,7 @@ export class AgentSupervisor extends EventEmitter {
           autoRestartEnabled: input.autoRestartEnabled ?? template.autoRestart,
           isSupervisor: input.isSupervisor ?? template.isSupervisor,
           isSupervised: input.isSupervised ?? template.isSupervised,
+          isWorker: input.isWorker ?? template.isWorker,
           systemPrompt: input.systemPrompt || template.systemPrompt || undefined,
         };
         console.log(`[supervisor] Resolved template "${template.name}" (${template.id}) for agent "${input.title}"`);
@@ -593,12 +682,40 @@ export class AgentSupervisor extends EventEmitter {
     }
     const provider = resolvedInput.provider || 'claude';
     const defaultCmd = PROVIDER_COMMANDS[provider][pathType];
+    // The "worker lane": hook-based status + .dashboard/workers/<provider>/ cwd +
+    // hook scaffold. A supervised worker is a worker that also notifies a
+    // supervisor, so isSupervised implies the lane; isWorker alone is the default
+    // for user-launched claude/codex agents (no supervisor notification).
+    const isWorkerLane = !!resolvedInput.isSupervised || !!resolvedInput.isWorker;
     // If the workspace's defaultCommand is one of the framework defaults
     // (Windows or WSL), respect the provider override. Otherwise the workspace
     // has a customized launch command and we use it verbatim.
     const isFrameworkDefault =
       workspace.defaultCommand === DEFAULT_COMMAND || workspace.defaultCommand === DEFAULT_COMMAND_WSL;
-    const command = resolvedInput.command || (isFrameworkDefault ? defaultCmd : workspace.defaultCommand);
+    let command = resolvedInput.command || (isFrameworkDefault ? defaultCmd : workspace.defaultCommand);
+    // Class IV codex hooks: codex never loads the worker-cwd .codex/config.toml
+    // (it's not a trusted project), so turn-boundary hooks must ride a
+    // `--profile` file in CODEX_HOME instead. `--dangerously-bypass-hook-trust`
+    // removes the per-hook trust gate so an automated launch never stalls on an
+    // interactive trust prompt. B2 (HOOK_SYSTEM_DESIGN.md §C): inject these
+    // flags into ANY worker-lane codex command (not just the pristine default);
+    // if the command can't be safely instrumented, remember to mark the agent
+    // hook_status='degraded' (set below, once the agent row exists).
+    let codexHookDegraded = false;
+    if (isWorkerLane && provider === 'codex') {
+      const instrumented = instrumentCodexWorkerCommand(command);
+      if (instrumented.instrumented) {
+        command = instrumented.command;
+      } else {
+        codexHookDegraded = true;
+        console.warn(
+          `[hook-b2] worker-lane codex command could not be safely instrumented ` +
+          `with --profile ${CODEX_WORKER_PROFILE_NAME} --dangerously-bypass-hook-trust ` +
+          `(command: ${JSON.stringify(command)}). Marking hook_status='degraded' — ` +
+          `this worker runs hookless and its status will be stale.`,
+        );
+      }
+    }
     const agentId = uuidv4().substring(0, 8);
     const logPath = path.join(this.logsDir, `${agentId}.log`);
 
@@ -614,10 +731,11 @@ export class AgentSupervisor extends EventEmitter {
     // written using the workspace root (workDir) first.
     //   - persona agents (legacy): .claude/agents/<name>/
     //   - supervisor (new layout per docs/PERSISTENT_AGENT_LAUNCH_CONTRACT.md): .dashboard/supervisor/
-    //   - supervised workers (class IV, plans/class-iv-worker-hook-scaffold.md):
-    //     .dashboard/workers/<provider>/ — shared cwd for N supervised workers,
-    //     by design. Read-only template; hook in settings.json fires on Stop.
-    //   - unsupervised user-launched agents: workDir (today's behavior, unchanged).
+    //   - worker agents (class IV, plans/class-iv-worker-hook-scaffold.md) —
+    //     supervised OR plain user-launched workers (isWorkerLane):
+    //     .dashboard/workers/<provider>/ — shared cwd for N workers, by design.
+    //     Read-only template; hook in settings.json fires on Stop.
+    //   - unsupervised, non-worker user-launched agents: workDir (legacy lane).
     let agentCwd = workDir;
     if (resolvedInput.persona) {
       agentCwd = pathType === 'windows'
@@ -627,7 +745,7 @@ export class AgentSupervisor extends EventEmitter {
       agentCwd = pathType === 'windows'
         ? path.join(workDir, '.dashboard', 'supervisor')
         : `${workDir}/.dashboard/supervisor`;
-    } else if (resolvedInput.isSupervised) {
+    } else if (isWorkerLane) {
       agentCwd = pathType === 'windows'
         ? path.join(workDir, '.dashboard', 'workers', provider)
         : `${workDir}/.dashboard/workers/${provider}`;
@@ -678,12 +796,26 @@ export class AgentSupervisor extends EventEmitter {
       provider,
       isSupervisor: resolvedInput.isSupervisor,
       isSupervised: resolvedInput.isSupervised,
+      isWorker: isWorkerLane,
       tmuxSessionName,
       autoRestartEnabled: resolvedInput.autoRestartEnabled ?? true,
       logPath,
       templateId: resolvedInput.templateId || null,
       systemPrompt: resolvedInput.systemPrompt || null,
     });
+
+    // B2 (HOOK_SYSTEM_DESIGN.md §C) — a worker-lane codex command we couldn't
+    // safely instrument runs hookless; surface that as hook_status='degraded'
+    // now that the agent row exists. The launch canary below will NOT override
+    // a degraded status (it only acts on 'unknown').
+    if (codexHookDegraded) {
+      updateAgentHookStatus(agent.id, 'degraded');
+    } else if (isWorkerLane) {
+      // Arm the launch-time hook canary: if no hook event reaches the dashboard
+      // within HOOK_CANARY_WINDOW_MS and hook_status is still 'unknown', the
+      // StatusMonitor flips it to 'broken'. See StatusMonitor.checkHookCanary.
+      this.monitor.recordHookCanary(agent.id);
+    }
 
     // Assign a session ID for resume/fork/query support (Claude only)
     let sessionId: string | undefined;
@@ -698,10 +830,14 @@ export class AgentSupervisor extends EventEmitter {
     // Auto-create .dashboard/supervisor/ scaffold if this is a supervisor launch
     if (resolvedInput.isSupervisor) {
       this.ensureSupervisorScaffold(workDir, pathType);
-    } else if (resolvedInput.isSupervised && !resolvedInput.persona) {
-      // Class IV (plans/class-iv-worker-hook-scaffold.md): supervised generic
-      // worker — scaffold the per-provider template + shared hook script.
+    } else if (isWorkerLane && !resolvedInput.persona) {
+      // Class IV (plans/class-iv-worker-hook-scaffold.md): worker agent
+      // (supervised or plain) — scaffold the per-provider template + shared
+      // hook script so turn-boundary status hooks fire.
       this.ensureWorkerScaffold(workDir, provider, pathType);
+      // Codex turn-boundary hooks ride a CODEX_HOME profile, not the worker-cwd
+      // config (see CODEX_WORKER_PROFILE_TOML). Ensure it exists for this runtime.
+      if (provider === 'codex') this.ensureCodexHookProfile(pathType);
     }
     // Write .mcp.json to workspace root and agent subdir (if persona or supervisor)
     if (resolvedInput.isSupervisor || resolvedInput.persona) {
@@ -748,9 +884,17 @@ export class AgentSupervisor extends EventEmitter {
    *  Versioning per plans/scaffold-version-migration.md — bumping a file's
    *  `version` triggers managed-upgrade-on-launch in old workspaces. */
   private static SUPERVISOR_FILES: Record<string, ScaffoldFile> = {
-    [`.dashboard/supervisor/CLAUDE.md`]:                                              { content: SUPERVISOR_AGENT_MD,                  version: 1 },
+    [`.dashboard/supervisor/CLAUDE.md`]:                                              {
+      content: SUPERVISOR_AGENT_MD,
+      version: 2,
+      previousHashes: { 1: SUPERVISOR_AGENT_MD_V1_HASH },
+    },
     [`.dashboard/supervisor/.claude/settings.json`]:                                  { content: SUPERVISOR_CLAUDE_SETTINGS_JSON,      version: 1 },
-    [`.dashboard/supervisor/.claude/skills/run-orchestration/SKILL.md`]:              { content: SUPERVISOR_RUN_ORCHESTRATION_SKILL,   version: 1 },
+    [`.dashboard/supervisor/.claude/skills/run-orchestration/SKILL.md`]:              {
+      content: SUPERVISOR_RUN_ORCHESTRATION_SKILL,
+      version: 2,
+      previousHashes: { 1: SUPERVISOR_RUN_ORCHESTRATION_SKILL_V1_HASH },
+    },
     [`.dashboard/supervisor/.claude/skills/orchestration-spike/SKILL.md`]:            { content: SUPERVISOR_ORCHESTRATION_SPIKE_SKILL, version: 1 },
     [`.dashboard/supervisor/memory/MEMORY.md`]:                                       { content: SUPERVISOR_MEMORY_MD,                 version: 1 },
     [`.dashboard/supervisor/scripts/read-agent-log.sh`]:                              { content: SCRIPT_READ_AGENT_LOG,                version: 1, executable: true },
@@ -765,15 +909,18 @@ export class AgentSupervisor extends EventEmitter {
    *
    *  v2 added DASHBOARD_HOST support + pending-status.jsonl failure logging.
    *  v3 reads `state` from argv[2] so the UserPromptSubmit hook can post
-   *  `'working'`. Both previous hashes are recorded for silent upgrade. */
+   *  `'working'`. v4 adds the `session-start` argv → state 'active' branch
+   *  (launch canary, HOOK_SYSTEM_DESIGN.md §A). All previous hashes are
+   *  recorded for silent upgrade. */
   private static WORKSPACE_SCRIPT_FILES: Record<string, ScaffoldFile> = {
     [`.dashboard/scripts/dashboard-status.mjs`]: {
       content: DASHBOARD_STATUS_SCRIPT_MJS,
-      version: 3,
+      version: 4,
       executable: true,
       previousHashes: {
         1: DASHBOARD_STATUS_SCRIPT_V1_HASH,
         2: DASHBOARD_STATUS_SCRIPT_V2_HASH,
+        3: sha256Hex(DASHBOARD_STATUS_SCRIPT_MJS_V3),
       },
     },
   };
@@ -782,13 +929,17 @@ export class AgentSupervisor extends EventEmitter {
    *  workers, by design (see plans/class-iv-worker-hook-scaffold.md §2). Read-only
    *  by convention — nothing per-agent ever writes here.
    *
-   *  settings.json v2 adds the UserPromptSubmit hook (paste-race fix). */
+   *  settings.json v2 adds the UserPromptSubmit hook (paste-race fix).
+   *  v3 adds the SessionStart hook (launch canary, HOOK_SYSTEM_DESIGN.md §A). */
   private static WORKER_FILES_CLAUDE: Record<string, ScaffoldFile> = {
     [`.dashboard/workers/claude/CLAUDE.md`]:                       { content: WORKER_CLAUDE_MD,             version: 1 },
     [`.dashboard/workers/claude/.claude/settings.json`]:           {
       content: WORKER_CLAUDE_SETTINGS_JSON,
-      version: 2,
-      previousHashes: { 1: WORKER_CLAUDE_SETTINGS_JSON_V1_HASH },
+      version: 3,
+      previousHashes: {
+        1: WORKER_CLAUDE_SETTINGS_JSON_V1_HASH,
+        2: sha256Hex(WORKER_CLAUDE_SETTINGS_JSON_V2),
+      },
     },
   };
 
@@ -1136,17 +1287,25 @@ export class AgentSupervisor extends EventEmitter {
         /\$\{WORKSPACE_ROOT\}/g,
         posixWorkspaceRoot,
       );
-      // v1 content with the same materialized workspace root, so a v1
-      // workspace's on-disk file hashes match and upgrades silently to v2.
+      // v1/v2 content with the same materialized workspace root, so an old
+      // workspace's on-disk file hashes match and upgrade silently. v1 = Stop
+      // only; v2 = Stop + UserPromptSubmit; v3 (current) adds SessionStart.
       const codexConfigV1 = WORKER_CODEX_CONFIG_TOML_V1.replace(
+        /\$\{WORKSPACE_ROOT\}/g,
+        posixWorkspaceRoot,
+      );
+      const codexConfigV2 = WORKER_CODEX_CONFIG_TOML_V2.replace(
         /\$\{WORKSPACE_ROOT\}/g,
         posixWorkspaceRoot,
       );
       const codexFiles: Record<string, ScaffoldFile> = {
         [`.dashboard/workers/codex/.codex/config.toml`]: {
           content: codexConfig,
-          version: 2,
-          previousHashes: { 1: sha256Hex(codexConfigV1) },
+          version: 3,
+          previousHashes: {
+            1: sha256Hex(codexConfigV1),
+            2: sha256Hex(codexConfigV2),
+          },
         },
       };
       providerCreated = this.writeScaffoldMap(workDir, codexFiles, pathType);
@@ -1155,6 +1314,55 @@ export class AgentSupervisor extends EventEmitter {
     if (total > 0) {
       console.log(`[supervisor] Worker scaffold: ${total} files in ${workDir}/.dashboard/ (provider=${provider})`);
       addEvent('system', 'worker_scaffold_created', JSON.stringify({ workDir, provider, filesCreated: total }));
+    }
+  }
+
+  /** Class IV — write the codex hook profile + shared status script into the
+   *  runtime's CODEX_HOME so `codex --profile dashboard-worker` loads turn-
+   *  boundary hooks. Unlike the worker-cwd config.toml (which codex only reads
+   *  for a trusted project), a profile file layers onto the base config
+   *  unconditionally. Written unconditionally (overwrite) on first use per
+   *  pathType per process so scaffold-version bumps propagate; the in-memory
+   *  guard avoids rewriting on every launch. Best-effort: a failure here just
+   *  means hooks don't fire and status falls back to inference. */
+  private ensureCodexHookProfile(pathType: string): void {
+    if (this.codexHookProfileEnsured.has(pathType)) return;
+    try {
+      const profileFile = `${CODEX_WORKER_PROFILE_NAME}.config.toml`;
+      if (pathType === 'windows') {
+        const codexHome = process.env.CODEX_HOME
+          || path.join(process.env.USERPROFILE || process.env.HOME || '', '.codex');
+        fs.mkdirSync(codexHome, { recursive: true });
+        const scriptPath = path.join(codexHome, 'dashboard-status.mjs');
+        fs.writeFileSync(scriptPath, DASHBOARD_STATUS_SCRIPT_MJS);
+        const profile = CODEX_WORKER_PROFILE_TOML.replace(/__SCRIPT__/g, scriptPath.replace(/\\/g, '/'));
+        fs.writeFileSync(path.join(codexHome, profileFile), profile);
+        console.log(`[supervisor] Codex hook profile written to ${codexHome}\\${profileFile}`);
+      } else {
+        // WSL: the distro has its own CODEX_HOME. Resolve it, then write both
+        // files via base64 to dodge bash quoting of the TOML/JS content.
+        const codexHome = execFileSync(
+          'wsl.exe',
+          ['bash', '-lc', 'printf %s "${CODEX_HOME:-$HOME/.codex}"'],
+          { encoding: 'utf-8', timeout: 5000 },
+        ).trim() || '$HOME/.codex';
+        const scriptPosix = `${codexHome}/dashboard-status.mjs`;
+        const profile = CODEX_WORKER_PROFILE_TOML.replace(/__SCRIPT__/g, scriptPosix);
+        const b64Script = Buffer.from(DASHBOARD_STATUS_SCRIPT_MJS, 'utf-8').toString('base64');
+        const b64Profile = Buffer.from(profile, 'utf-8').toString('base64');
+        execFileSync(
+          'wsl.exe',
+          ['bash', '-lc',
+            `mkdir -p "${codexHome}" `
+            + `&& printf %s '${b64Script}' | base64 -d > "${scriptPosix}" `
+            + `&& printf %s '${b64Profile}' | base64 -d > "${codexHome}/${profileFile}"`],
+          { timeout: 8000 },
+        );
+        console.log(`[supervisor] Codex hook profile written to ${codexHome}/${profileFile} (wsl)`);
+      }
+      this.codexHookProfileEnsured.add(pathType);
+    } catch (err) {
+      console.warn('[supervisor] ensureCodexHookProfile failed (codex hooks may not fire):', err);
     }
   }
 
@@ -1481,9 +1689,23 @@ export class AgentSupervisor extends EventEmitter {
         const workspaceRoot = getEffectiveWorkspaceRoot(agent);
         const sysPrompt = `Workspace root: ${workspaceRoot}. cd there for project shell work. Use absolute paths for Read/Edit/Glob.`;
         args.push('--add-dir', workspaceRoot);
-        args.push('--append-system-prompt', sysPrompt);
-        const role = agent.isSupervisor ? 'Supervisor' : 'Worker';
-        console.log(`[Windows] ${role} --add-dir + --append-system-prompt: ${workspaceRoot}`);
+        // CLI v2.1.156 regression: inline `--append-system-prompt "<string>"`
+        // makes claude exit immediately in INTERACTIVE mode. Write the prompt to
+        // a file and pass `--append-system-prompt-file <path>` instead, which
+        // still works interactively. (Mirrors the WSL path below.)
+        const sysFile = path.join(agent.workingDirectory, '.claude', `.sysprompt-${agent.id}.txt`);
+        try {
+          fs.mkdirSync(path.dirname(sysFile), { recursive: true });
+          fs.writeFileSync(sysFile, sysPrompt, 'utf-8');
+          args.push('--append-system-prompt-file', sysFile);
+          const role = agent.isSupervisor ? 'Supervisor' : 'Worker';
+          console.log(`[Windows] ${role} --add-dir + --append-system-prompt-file: ${workspaceRoot}`);
+        } catch (err) {
+          // File write failed — launch without the textual preamble rather than
+          // re-introduce the crashing inline flag. --add-dir already scopes the
+          // workspace; only the workspace-root sentence is lost.
+          console.warn(`[Windows] Failed to write sysprompt file ${sysFile}; launching without --append-system-prompt:`, err);
+        }
       }
 
       // Add session ID on fresh launch (Claude only)
@@ -1616,15 +1838,17 @@ export class AgentSupervisor extends EventEmitter {
     // output:` field. Documented disable knob:
     // https://code.claude.com/docs/en/interactive-mode
     //
-    // Class IV (plans/class-iv-worker-hook-scaffold.md): supervised workers
-    // also get AGENT_ID + DASHBOARD_PORT so the Stop hook can identify this
-    // agent and POST to the actually-bound dashboard port. Gated on
-    // isSupervised — unsupervised user-launched agents get no extra env.
+    // Class IV (plans/class-iv-worker-hook-scaffold.md): the full worker lane
+    // (isSupervised OR isWorker) gets AGENT_ID + DASHBOARD_PORT so the Stop hook
+    // can identify this agent and POST to the actually-bound dashboard port.
+    // Must match the launch-flag and PTY-disable gates (isWorkerLane): a plain
+    // worker loads the same hooks, and PTY inference is disabled for it, so
+    // without AGENT_ID the Stop hook no-ops and the agent stays stuck "working".
     const extraEnv: Record<string, string> = {};
     if (agent.provider === 'claude') {
       extraEnv.CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION = 'false';
     }
-    if (agent.isSupervised) {
+    if (agent.isSupervised || agent.isWorker) {
       extraEnv.AGENT_ID = agent.id;
       extraEnv.DASHBOARD_PORT = String(this.apiServerPort);
     }
@@ -1709,6 +1933,20 @@ export class AgentSupervisor extends EventEmitter {
     const agent = getAgent(agentId);
     if (!agent || agent.provider !== 'codex') return;
     if (agent.resumeSessionId) return;
+    // Do NOT pre-empt the authoritative post-launch SQL discovery
+    // (`discoverNewCodexSession`, DEFAULT_SQL_POLL_TIMEOUT_MS = 35 s). While
+    // that window is open a null `resumeSessionId` is expected, not a failure.
+    // `recoverCodexResumeSessionId` falls back to `findCodexSessionIdByCwd`,
+    // which is identity-blind (newest cwd-matching rollout — no created_at /
+    // first_user_message tiebreaker) — firing it inside the window binds a
+    // sibling or stale-prior rollout (BUG-29), and discovery's null-guard then
+    // locks the wrong sid in permanently. Only self-heal once discovery has
+    // had time to give up; genuine race-losses recover, live launches don't
+    // get hijacked. See BUG-28/BUG-29 in open-bugs.md.
+    const launchedAtMs = parseSqliteUtcMs(agent.createdAt);
+    if (launchedAtMs !== null && Date.now() - launchedAtMs < CODEX_DISCOVERY_GRACE_MS) {
+      return;
+    }
     this.resolveCodexResumeSessionId(agent);
   }
 
@@ -1769,9 +2007,12 @@ export class AgentSupervisor extends EventEmitter {
     // with "No such file or directory". The bash command-prefix is parsed by
     // the shell, so the lookup goes through normal function/alias resolution.
     //
-    // Class IV (plans/class-iv-worker-hook-scaffold.md): supervised workers
-    // also get AGENT_ID + DASHBOARD_PORT so the Stop hook can identify this
-    // agent and POST to the dashboard. Gated on agent.isSupervised.
+    // Class IV (plans/class-iv-worker-hook-scaffold.md): the full worker lane
+    // (isSupervised OR isWorker) gets AGENT_ID + DASHBOARD_PORT so the Stop hook
+    // can identify this agent and POST to the dashboard. Must match the
+    // launch-flag and PTY-disable gates — a plain worker loads the same hooks
+    // with PTY inference disabled, so without AGENT_ID the Stop hook no-ops and
+    // the agent stays stuck "working".
     //
     // L-C (plans/windows-wsl-issues-review-2026-05-23.md §T1-B): WSL2 default
     // NAT mode means 127.0.0.1 inside the distro is the distro's loopback,
@@ -1783,7 +2024,7 @@ export class AgentSupervisor extends EventEmitter {
     if (isClaude) {
       wslEnvPrefix.push('CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false');
     }
-    if (agent.isSupervised) {
+    if (agent.isSupervised || agent.isWorker) {
       wslEnvPrefix.push(`AGENT_ID=${agent.id}`);
       wslEnvPrefix.push(`DASHBOARD_PORT=${this.apiServerPort}`);
       wslEnvPrefix.push(`DASHBOARD_HOST=${this.resolveWslGatewayIp()}`);
@@ -1811,9 +2052,9 @@ export class AgentSupervisor extends EventEmitter {
         console.log(`[WSL] Supervisor MCP: relying on .mcp.json auto-discovery in ${wslWorkDir}`);
       }
 
-      // Append --add-dir on the bare command. The --append-system-prompt flag and
-      // its value can't go on the bare command — its quoted value would collide
-      // with the outer wrap below — so it's handled inside the wrap via SYSPROMPT.
+      // Append --add-dir on the bare command. The --append-system-prompt-file
+      // flag is added inside the wrap below, alongside the sysprompt file written
+      // there, so its single-quoted path stays intact through the outer wrap.
       if ((agent.isSupervisor || agent.isSupervised) && isClaude && persistentWorkspaceRoot) {
         command += ` --add-dir '${persistentWorkspaceRoot}'`;
         const role = agent.isSupervisor ? 'Supervisor' : 'Worker';
@@ -1881,7 +2122,7 @@ export class AgentSupervisor extends EventEmitter {
 
       // Wrap the command to load any of:
       //   - agentMdPrompt (workspace agent.md content) → final positional argument
-      //   - sysPromptText (supervisor workspace-root preamble) → --append-system-prompt flag value
+      //   - sysPromptText (supervisor workspace-root preamble) → --append-system-prompt-file path
       // via $(cat tmpfile) substitutions inside the wrap. Required because the outer
       // ${command} "$PROMPT" word-splits the unquoted ${command} substitution
       // without re-interpreting embedded quote characters, so quoted values placed
@@ -1911,8 +2152,11 @@ export class AgentSupervisor extends EventEmitter {
         if (sysPromptText) {
           const sysFile = writeWslFile(`.sysprompt-${agent.id}.txt`, sysPromptText);
           if (sysFile) {
-            exports.push(`SYSPROMPT="$(cat '${sysFile}')"`);
-            flagSuffix.push(`--append-system-prompt "$SYSPROMPT"`);
+            // CLI v2.1.156 regression: inline `--append-system-prompt "<string>"`
+            // makes claude exit immediately in INTERACTIVE mode. Pass the same
+            // file directly via `--append-system-prompt-file`, which works
+            // interactively and drops the SYSPROMPT shell-var round-trip.
+            flagSuffix.push(`--append-system-prompt-file '${sysFile}'`);
           }
         }
 
@@ -1973,7 +2217,15 @@ export class AgentSupervisor extends EventEmitter {
     try {
       const workspace = getWorkspace(agent.workspaceId);
       if (workspace && workspace.path) {
-        launchesLogPath = path.join(workspace.path, '.dashboard', 'launches.log');
+        // Node runs on Windows; a WSL workspace's `path` is the POSIX form
+        // (`/home/...`), which `path.join` would resolve drive-relative on the
+        // current Windows drive and `fs.appendFileSync` would ENOENT on. Convert
+        // to a Windows-accessible UNC (`\\wsl$\Ubuntu\home\...`) so the write
+        // lands at the corresponding `/home/.../launches.log` from inside WSL.
+        const winPath = detectPathType(workspace.path) === 'wsl'
+          ? wslToWindowsPath(workspace.path)
+          : workspace.path;
+        launchesLogPath = path.join(winPath, '.dashboard', 'launches.log');
       }
     } catch { /* best-effort */ }
     const diagnostics: WslLaunchDiagnostics = {
@@ -2104,6 +2356,11 @@ export class AgentSupervisor extends EventEmitter {
       workingDirectory: source.workingDirectory,
       command: source.command,
       provider: source.provider,
+      // Preserve the worker status lane so the fork (which inherits source's
+      // .dashboard/workers/<provider>/ cwd) keeps deriving status from hooks
+      // rather than reverting to PTY/chat-stream inference. Supervision is not
+      // inherited by a fork (existing behavior).
+      isWorker: source.isWorker,
       tmuxSessionName,
       autoRestartEnabled: source.autoRestartEnabled,
       logPath,
@@ -2429,13 +2686,36 @@ export class AgentSupervisor extends EventEmitter {
    *  so the hook's information is preserved and the agent doesn't sit
    *  falsely-launching for the rest of the settle window. */
   forceIdleFromHook(agentId: string, source: string): void {
-    this.monitor.recordHookEventAt(agentId, Date.now());
+    const now = Date.now();
+    this.monitor.recordHookEventAt(agentId, now);
+    this.stampHookHealthy(agentId, now);
     const agent = getAgent(agentId);
     if (agent && agent.status === 'launching') {
       this.monitor.promoteFromLaunching(agentId, 'stop-hook');
       return;
     }
     this.monitor.forceIdle(agentId, source);
+  }
+
+  /** HOOK_SYSTEM_DESIGN.md §5.4 / B5 — any hook event arriving (Stop,
+   *  UserPromptSubmit, or SessionStart, over any transport) is proof the
+   *  scaffold loaded. Stamp hook_status='healthy' + last_hook_event_at and
+   *  disarm the launch canary so it can never flip a working agent to
+   *  'broken'. Idempotent — re-stamping healthy is harmless. */
+  private stampHookHealthy(agentId: string, ts: number): void {
+    updateAgentHookStatus(agentId, 'healthy', ts);
+    this.monitor.clearHookCanary(agentId);
+  }
+
+  /** HOOK_SYSTEM_DESIGN.md §A — SessionStart hook (state='active',
+   *  source='hook-session-start'). This is the canary proof-of-load: it
+   *  updates hook health ONLY and MUST NOT change `status` (no
+   *  forceWorking/forceIdle/promoteFromLaunching). Entry point for the
+   *  state='active' arm of POST /api/agents/:id/status. */
+  recordHookSessionStart(agentId: string, _source: string): void {
+    const now = Date.now();
+    this.monitor.recordHookEventAt(agentId, now);
+    this.stampHookHealthy(agentId, now);
   }
 
   /** Class IV — entry point for the UserPromptSubmit hook arm of
@@ -2448,7 +2728,33 @@ export class AgentSupervisor extends EventEmitter {
     const ts = Date.now();
     this.monitor.recordHookEventAt(agentId, ts);
     this.monitor.recordStartHookEventAt(agentId, ts);
+    this.stampHookHealthy(agentId, ts);
     this.monitor.forceWorking(agentId, source);
+  }
+
+  /** BUG-10 — replay ONLY the submit keystroke (no body) to recover a dropped
+   *  Enter. Called by StatusMonitor.checkStartHookResend. Uses the same
+   *  per-platform submit mechanism as `_doSendInput` so the bytes are
+   *  known-good: WSL goes through `tmux send-keys -H <kitty enter>`; Windows
+   *  writes the provider's Win32/CR submit sequence to the ConPTY. Never
+   *  touches the input queue — this is a single keystroke, not a body send. */
+  resubmitEnter(agentId: string): void {
+    const agent = getAgent(agentId);
+    if (!agent) return;
+
+    const wslRunner = this.wslRunners.get(agentId);
+    if (wslRunner) {
+      if (!agent.tmuxSessionName || !wslRunner.isAlive) return;
+      void tmuxSendSubmit(agent.tmuxSessionName).catch((err) => {
+        console.warn(`[bug-10] tmuxSendSubmit failed for ${agent.title}:`, err);
+      });
+      return;
+    }
+
+    const winRunner = this.windowsRunners.get(agentId);
+    if (winRunner) {
+      winRunner.write(getWindowsSubmitSequence(agent.provider));
+    }
   }
 
   writeToAgent(agentId: string, data: string): void {
@@ -2520,38 +2826,20 @@ export class AgentSupervisor extends EventEmitter {
           // so the reframed Class IV watchdog can detect a scaffold-broken
           // supervised Claude worker (input went in, no hook ever came back).
           this.monitor.recordInputDelivered(agentId);
-          // BUG-09 §3.4 (corrected, see plans/bug-09-launch-seed-fix-plan.md):
-          // seed a working latch at the actual turn boundary — the moment
-          // Enter has been delivered to the PTY. The ce44c2db sighting was a
-          // false working→idle event during the ~8 s of spinner-only
-          // first-turn API output AFTER sendInput, not at launch. Seeding
-          // here covers that window without blocking the launch-poll flow
-          // (mcp-supervisor.js launch_agent's 60 s poll-for-idle) or the
-          // manual send_message_to_agent path. Gated on `delivered` so the
-          // WSL `!runner.isAlive` skip does not seed a phantom latch.
-          //
-          // BUG-18 Change 2 — seed with `tool-pending` (900 s) instead of
-          // `model-pending` (180 s). The first-turn API call has no early
-          // chat-event signal (Claude JSONL writes only at message
-          // completion; Codex's `task_started` lands after `sendInput`
-          // returns), so the seed is the sole source of truth during that
-          // window. 180 s was too tight for extended thinking (xhigh effort
-          // empirically gaps to 311 s in this workspace); 900 s gives the
-          // model room to think before any real refresh can land.
-          //
-          // Paste-race fix (start-hook): supervised workers' idle→working is
-          // owned exclusively by the UserPromptSubmit hook. This seed fires
-          // on every PTY write (including pastes that never get submitted),
-          // which is exactly the false-working signature the hook scaffold
-          // exists to close. Watchdog checkStartHookSilence catches the rare
-          // case where the hook never arrives.
-          const sentAgent = getAgent(agentId);
-          if (!sentAgent?.isSupervised) {
-            this.monitor.forceWorking(agentId, {
-              source: 'user-input-submitted',
-              ttlClass: 'tool-pending',
-            });
-          }
+          // No optimistic working-latch seed here. A send that *reports*
+          // delivery (WSL `_doSendInput` returns true unconditionally once
+          // send-keys are issued) does not prove the prompt was actually
+          // submitted — when the kitty-CSI Enter is dropped the prompt sits
+          // unentered, yet the old seed flipped status to `working` anyway.
+          // That false-working signature is exactly what the hook scaffold
+          // exists to avoid, so every lane now derives `working` from a real
+          // signal instead of a delivery guess:
+          //   - claude/codex workers (supervised or plain): UserPromptSubmit
+          //     hook → forceWorkingFromHook.
+          //   - gemini + non-worker unsupervised agents: chat-stream events /
+          //     PTY inference in status-monitor.
+          // The seed predated the worker-lane broadening and only ever masked
+          // missing-submit / missing-hook failures, so it is removed entirely.
         }
       });
     this.inputQueues.set(agentId, ours);

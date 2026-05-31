@@ -16,7 +16,13 @@ export type AgentStatus =
   | 'waiting'
   | 'done'
   | 'crashed'
-  | 'restarting';
+  | 'restarting'
+  // Projection-only, transient. Never persisted to the DB and never carried on
+  // a `statusChanged` event — the API/IPC read layer overlays it while a send
+  // is actively being typed into the agent's PTY (a message is arriving, e.g.
+  // from another agent). Self-clears the instant delivery finishes. See
+  // `ApiServer.withInputInFlight` and docs/AGENT_STATUS_LANES_AND_SUBMIT_RECOVERY.md §1.
+  | 'receiving';
 
 export interface Workspace {
   id: string;
@@ -41,10 +47,26 @@ export interface Agent {
   provider: AgentProvider;
   isSupervisor: boolean;
   isSupervised: boolean;
+  // Hook-based status lane (orthogonal to isSupervised). A worker launches from
+  // .dashboard/workers/<provider>/, gets the turn-boundary hook scaffold, and has
+  // PTY inference + chat-event status disabled — but unlike isSupervised it does
+  // NOT notify a supervisor. isSupervised implies the worker lane; isWorker alone
+  // is the default for user-launched claude/codex agents.
+  isWorker: boolean;
   tmuxSessionName: string | null;
   autoRestartEnabled: boolean;
   resumeSessionId: string | null;
   status: AgentStatus;
+  // Hook-scaffold health, orthogonal to `status` (HOOK_SYSTEM_DESIGN.md §5.4).
+  //   'unknown'  — no hook event seen yet (launch default)
+  //   'healthy'  — at least one hook event has reached the dashboard
+  //   'broken'   — launch canary expired with no hook event (scaffold absent/misconfigured)
+  //   'degraded' — a worker-lane codex command we couldn't safely instrument (B2)
+  // Surfaced for visibility only — a 'broken'/'degraded' status NEVER re-enables
+  // PTY inference for worker-lane agents.
+  hookStatus?: 'unknown' | 'healthy' | 'broken' | 'degraded';
+  // Wall-clock (ms) of the most recent hook event from this agent, any source.
+  lastHookEventAt?: number;
   isAttached: boolean;
   restartCount: number;
   lastExitCode: number | null;
@@ -94,6 +116,7 @@ export interface LaunchAgentInput {
   autoRestartEnabled?: boolean;
   isSupervisor?: boolean;
   isSupervised?: boolean;
+  isWorker?: boolean;
   templateId?: string;
   systemPrompt?: string;
   persona?: string;
@@ -126,6 +149,7 @@ export interface AgentTemplate {
   autoRestart: boolean;
   isSupervisor: boolean;
   isSupervised: boolean;
+  isWorker: boolean;
   createdAt: string;
   updatedAt: string;
 }
@@ -141,6 +165,7 @@ export interface CreateAgentTemplateInput {
   autoRestart?: boolean;
   isSupervisor?: boolean;
   isSupervised?: boolean;
+  isWorker?: boolean;
 }
 
 export interface QueryResult {

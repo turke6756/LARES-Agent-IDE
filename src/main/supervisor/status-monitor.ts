@@ -14,10 +14,14 @@ import {
   SUPERVISOR_WORKING_LATCH_MS,
   HOOK_SILENCE_WARN_MS,
   START_HOOK_SILENCE_WARN_MS,
+  START_HOOK_RESEND_AFTER_MS,
+  START_HOOK_RESEND_INTERVAL_MS,
+  START_HOOK_RESEND_MAX_ATTEMPTS,
   LAUNCH_SETTLE_TIMEOUT_MS,
   LAUNCH_SETTLE_OVERRUN_GRACE_MS,
+  HOOK_CANARY_WINDOW_MS,
 } from '../../shared/constants';
-import { getActiveAgents, updateAgentStatus, addEvent } from '../database';
+import { getActiveAgents, updateAgentStatus, updateAgentHookStatus, addEvent } from '../database';
 import type { StatusChangedEvent } from './status-events';
 import { PromptPatternDetector } from './prompt-pattern-detector';
 import { stripAnsi } from './strip-ansi';
@@ -180,6 +184,15 @@ export class StatusMonitor extends EventEmitter {
   // new input is delivered (re-arms the watchdog for the new turn) and when
   // any start-hook event fires.
   private lastStartWatchdogWarnAt = new Map<string, number>();
+  // BUG-10 reactive Enter-resend — per-input attempt counter and last-resend
+  // stamp. Both reset on a real start-hook event (submit took) and on a new
+  // input delivery (fresh turn). See checkStartHookResend.
+  private startHookResendCount = new Map<string, number>();
+  private lastStartHookResendAt = new Map<string, number>();
+  // BUG-10 — injected by AgentSupervisor: replays ONLY the submit keystroke
+  // (no body) to an agent whose prompt was delivered but never submitted.
+  // Left undefined in tests that don't exercise the resend path.
+  private resubmit?: (agentId: string) => void;
   // BUG-23 — wallclock stamp set when `runner.launch()` returns, read by
   // `poll()` to fire the per-provider settle-timer promotion `launching → idle`.
   // Cleared synchronously by `promoteFromLaunching` so a hook arriving inside
@@ -189,6 +202,13 @@ export class StatusMonitor extends EventEmitter {
   private launchedAt = new Map<string, number>();
   // Dedupe for the narrow overrun warning (settle timer itself misbehaving).
   private lastLaunchOverrunWarnAt = new Map<string, number>();
+  // HOOK_SYSTEM_DESIGN.md §5.4 / B5 — launch-time hook canary. Stamped (with
+  // the launch wallclock) by `recordHookCanary` when a worker-lane agent
+  // launches; cleared by `clearHookCanary` the instant any hook event arrives.
+  // While armed, `checkHookCanary` flips hook_status 'unknown' → 'broken' once
+  // HOOK_CANARY_WINDOW_MS elapses with no hook — proving the scaffold never
+  // loaded, without waiting for the 15-min silence watchdog.
+  private canaryArmedAt = new Map<string, number>();
   // BUG-23 §watchdog reframe — wallclock stamp set when the supervisor delivers
   // input to an agent (sendInput). The reframed Class IV watchdog uses this to
   // detect a scaffold-broken supervised Claude worker: input went in, but no
@@ -227,6 +247,13 @@ export class StatusMonitor extends EventEmitter {
       clearInterval(this.interval);
       this.interval = null;
     }
+  }
+
+  /** BUG-10 — register the submit-resend handler. AgentSupervisor injects a
+   *  closure that replays the per-platform submit keystroke to the agent's
+   *  PTY/tmux pane. Without it, checkStartHookResend degrades to warn-only. */
+  setResubmitHandler(fn: (agentId: string) => void): void {
+    this.resubmit = fn;
   }
 
   /** Pipeline B has high-confidence end-of-turn truth. Bypasses
@@ -408,6 +435,9 @@ export class StatusMonitor extends EventEmitter {
     this.lastInputDeliveredAt.delete(agentId);
     this.lastStartHookEventAt.delete(agentId);
     this.lastStartWatchdogWarnAt.delete(agentId);
+    this.startHookResendCount.delete(agentId);
+    this.lastStartHookResendAt.delete(agentId);
+    this.canaryArmedAt.delete(agentId);
   }
 
   /** Class IV §2.3 — called by `AgentSupervisor.forceIdleFromHook` and
@@ -428,6 +458,9 @@ export class StatusMonitor extends EventEmitter {
   recordStartHookEventAt(agentId: string, ts: number): void {
     this.lastStartHookEventAt.set(agentId, ts);
     this.lastStartWatchdogWarnAt.delete(agentId);
+    // The submit took — stand the Enter-resend recovery down for this turn.
+    this.startHookResendCount.delete(agentId);
+    this.lastStartHookResendAt.delete(agentId);
   }
 
   /** BUG-23 — called by `AgentSupervisor.launchWindowsAgent` /
@@ -447,6 +480,26 @@ export class StatusMonitor extends EventEmitter {
     this.lastLaunchOverrunWarnAt.delete(agentId);
   }
 
+  /** HOOK_SYSTEM_DESIGN.md §5.4 / B5 — arm the launch-time hook canary. Called
+   *  by `AgentSupervisor.launchAgent` for worker-lane agents right after the
+   *  agent row is created. Stamps the launch wallclock; `checkHookCanary`
+   *  reads it on each poll tick. Naturally idempotent — a relaunch re-arms. */
+  recordHookCanary(agentId: string, ts: number = this.now()): void {
+    this.canaryArmedAt.set(agentId, ts);
+  }
+
+  /** HOOK_SYSTEM_DESIGN.md §5.4 / B5 — disarm the canary. Called via
+   *  `AgentSupervisor.stampHookHealthy` the instant any hook event arrives, so
+   *  a healthy worker can never be flipped to 'broken'. */
+  clearHookCanary(agentId: string): void {
+    this.canaryArmedAt.delete(agentId);
+  }
+
+  /** Test seam — whether the launch canary is currently armed for an agent. */
+  isHookCanaryArmed(agentId: string): boolean {
+    return this.canaryArmedAt.has(agentId);
+  }
+
   /** BUG-23 §watchdog reframe — called by `AgentSupervisor.sendInput` after a
    *  send resolves. Used by the reframed Class IV watchdog to detect a
    *  scaffold-broken supervised Claude worker (input went in, no hook came
@@ -456,6 +509,9 @@ export class StatusMonitor extends EventEmitter {
     // Re-arm the start-hook silence watchdog for the new turn so a prior
     // warning's dedupe doesn't suppress a fresh missed-start-hook warning.
     this.lastStartWatchdogWarnAt.delete(agentId);
+    // Re-arm the Enter-resend recovery for the new turn.
+    this.startHookResendCount.delete(agentId);
+    this.lastStartHookResendAt.delete(agentId);
   }
 
   /** BUG-23 — the ONLY path allowed to bypass the `TRANSITIONAL_STATUSES`
@@ -530,6 +586,13 @@ export class StatusMonitor extends EventEmitter {
         // Class IV start-hook silence — paste-race fix watchdog (BUG-10).
         // Fires on the much shorter START_HOOK_SILENCE_WARN_MS budget.
         this.checkStartHookSilence(agent);
+        // BUG-10 reactive recovery — resend the dropped Enter (bounded) when
+        // the start-hook silence is the paste-race signature.
+        this.checkStartHookResend(agent);
+        // HOOK_SYSTEM_DESIGN.md §5.4 / B5 — launch-time hook canary. Flips
+        // hook_status 'unknown' → 'broken' once the launch window elapses with
+        // no hook event. Status itself is untouched; inference stays disabled.
+        this.checkHookCanary(agent);
 
         const newStatus = await this.inferStatus(agent);
         if (newStatus && newStatus !== agent.status) {
@@ -644,7 +707,7 @@ export class StatusMonitor extends EventEmitter {
    *
    *  Dedupes via `lastWatchdogWarnAt`. */
   private checkHookSilenceWatchdog(agent: Agent): void {
-    if (!agent.isSupervised) return;
+    if (!(agent.isSupervised || agent.isWorker)) return;
     if (agent.status !== 'idle') {
       // Only warn from the idle state. Working / waiting / launching mean
       // the system is reacting normally; clear dedupe so a later re-entry
@@ -681,6 +744,42 @@ export class StatusMonitor extends EventEmitter {
     this.lastWatchdogWarnAt.set(agent.id, now);
   }
 
+  /** HOOK_SYSTEM_DESIGN.md §5.4 / B5 — launch-time hook canary. When a
+   *  worker-lane agent launches, `recordHookCanary` arms a window; the first
+   *  hook event of any kind disarms it via `clearHookCanary`. If the window
+   *  elapses while still armed AND hook_status is still 'unknown', the scaffold
+   *  never loaded — flip hook_status to 'broken' (loud warning) so the UI/
+   *  supervisor can surface it immediately instead of waiting for the 15-min
+   *  silence watchdog.
+   *
+   *  Deliberately does NOT touch `status` and does NOT re-enable inference for
+   *  worker-lane agents — 'broken' is a health signal only. Fires at most once
+   *  per arm (disarms itself after flipping). A 'degraded' (B2) or already
+   *  'healthy' agent is left alone — we only act on 'unknown'. */
+  private checkHookCanary(agent: Agent): void {
+    const armedAt = this.canaryArmedAt.get(agent.id);
+    if (armedAt === undefined) return;
+
+    if (this.now() - armedAt < HOOK_CANARY_WINDOW_MS) return;
+
+    // Window elapsed. Disarm regardless of outcome so we evaluate exactly once.
+    this.canaryArmedAt.delete(agent.id);
+
+    // A hook event between arm and now would have cleared the canary already,
+    // so reaching here means none arrived. Only flip from the launch default;
+    // never clobber a 'degraded' (B2) or a racing 'healthy'.
+    if ((agent.hookStatus ?? 'unknown') !== 'unknown') return;
+
+    updateAgentHookStatus(agent.id, 'broken');
+    console.warn(
+      `[hook-canary] ${agent.provider} worker ${agent.id} produced no hook event ` +
+      `within ${Math.round(HOOK_CANARY_WINDOW_MS / 1000)} s of launch — hook scaffold ` +
+      `appears broken (missing/unloaded settings.json or config.toml, missing ` +
+      `AGENT_ID/DASHBOARD_PORT env, or an un-instrumented command). hook_status='broken'. ` +
+      `Worker-lane status stays hook-owned (PTY inference remains disabled).`,
+    );
+  }
+
   /** Start-hook silence watchdog (BUG-10 paste-race fix). For supervised
    *  workers, fires once per input delivery when:
    *    - agent is idle (the lie we're detecting)
@@ -689,7 +788,7 @@ export class StatusMonitor extends EventEmitter {
    *  Warn-only; emits a `'start-hook-silence-watchdog'` status-change event
    *  so a supervisor consumer can observe the false-idle window. */
   private checkStartHookSilence(agent: Agent): void {
-    if (!agent.isSupervised) return;
+    if (!(agent.isSupervised || agent.isWorker)) return;
     if (agent.status !== 'idle') return;
 
     const inputAt = this.lastInputDeliveredAt.get(agent.id);
@@ -721,6 +820,63 @@ export class StatusMonitor extends EventEmitter {
     this.emit('statusChanged', payload);
   }
 
+  /** BUG-10 reactive recovery — when the start-hook silence signature is
+   *  present (input delivered, agent still idle, no UserPromptSubmit hook
+   *  since), resend ONLY the submit keystroke to recover a dropped Enter.
+   *
+   *  Scoped to hook-backed providers (claude/codex workers): the resend's
+   *  stop condition is the authoritative UserPromptSubmit hook, which gemini
+   *  and non-worker agents don't emit, so for them "no hook" is not evidence
+   *  of a dropped Enter. Bounded to START_HOOK_RESEND_MAX_ATTEMPTS so a
+   *  genuinely-broken hook scaffold (no hook will ever come) degrades to the
+   *  warn-only checkStartHookSilence rather than resending forever.
+   *
+   *  Safety: the body is never re-sent (it already sits in the prompt buffer),
+   *  and the resend only fires from `idle` — once the real (or a resent) Enter
+   *  takes, the hook flips status to `working` and recordStartHookEventAt
+   *  stands this recovery down. */
+  private checkStartHookResend(agent: Agent): void {
+    if (!this.resubmit) return;
+    if (!(agent.isSupervised || agent.isWorker)) return;
+    // Hook-backed providers only — see method doc.
+    if (agent.provider !== 'claude' && agent.provider !== 'codex') return;
+    // `working` means the hook fired (submit took); only act from the idle lie.
+    if (agent.status !== 'idle') return;
+
+    const inputAt = this.lastInputDeliveredAt.get(agent.id);
+    if (inputAt === undefined) return;
+
+    // A UserPromptSubmit hook since the input → the submit took, nothing to do.
+    const lastStartHook = this.lastStartHookEventAt.get(agent.id) ?? 0;
+    if (lastStartHook >= inputAt) return;
+
+    const now = this.now();
+    // Give the genuine hook time to round-trip before assuming a drop.
+    if (now - inputAt < START_HOOK_RESEND_AFTER_MS) return;
+
+    const attempts = this.startHookResendCount.get(agent.id) ?? 0;
+    if (attempts >= START_HOOK_RESEND_MAX_ATTEMPTS) return;
+
+    // Space out retries (the first one is gated by RESEND_AFTER above).
+    const lastResend = this.lastStartHookResendAt.get(agent.id) ?? 0;
+    if (attempts > 0 && now - lastResend < START_HOOK_RESEND_INTERVAL_MS) return;
+
+    this.startHookResendCount.set(agent.id, attempts + 1);
+    this.lastStartHookResendAt.set(agent.id, now);
+    const seconds = Math.round((now - inputAt) / 1000);
+    console.warn(
+      `[bug-10] resending Enter to ${agent.provider} worker ${agent.id} ` +
+      `(attempt ${attempts + 1}/${START_HOOK_RESEND_MAX_ATTEMPTS}) — input ` +
+      `${seconds}s ago, still idle, no UserPromptSubmit hook (dropped-Enter ` +
+      `paste race).`
+    );
+    try {
+      this.resubmit(agent.id);
+    } catch (err) {
+      console.error(`[bug-10] resend Enter failed for ${agent.id}:`, err);
+    }
+  }
+
   private async inferStatus(agent: Agent): Promise<AgentStatus | null> {
     if (agent.status === 'restarting' || agent.status === 'launching') {
       return null; // Don't override transitional states
@@ -739,15 +895,18 @@ export class StatusMonitor extends EventEmitter {
     // and pattern detection do not run. The alive check above still fires
     // for done/crashed detection.
     //
-    // Scope: isSupervised === true (any provider). Originally claude-only;
-    // broadened per plans/class-iv-worker-hook-scaffold.md §12.5 now that
-    // Codex also has a Stop-hook scaffold (§12.1). Gemini supervised workers
-    // also hit the skip — they don't have a scaffold yet, so their idle
-    // signal comes solely from chat-stream/turn-complete events. The user
-    // explicitly accepts that trade-off: PTY inference was masking missing-
-    // hook scaffolds and made hook reliability invisible. Unsupervised
+    // Scope: the worker lane — isSupervised OR isWorker (any provider).
+    // Originally claude-only; broadened per plans/class-iv-worker-hook-scaffold.md
+    // §12.5 once Codex got a Stop-hook scaffold (§12.1), then broadened again to
+    // plain (unsupervised) workers — user-launched claude/codex agents now
+    // default to the worker lane and derive status from hooks alone. Gemini
+    // supervised workers also hit the skip — they have no scaffold yet, so their
+    // idle signal comes solely from chat-stream/turn-complete events (the
+    // chat-event gate in event-bridge keeps gemini on that lane). The user
+    // explicitly accepts that trade-off: PTY inference was masking missing-hook
+    // scaffolds and made hook reliability invisible. Non-worker unsupervised
     // agents and the supervisor itself stay on inference.
-    if (agent.isSupervised) {
+    if (agent.isSupervised || agent.isWorker) {
       return null;
     }
 

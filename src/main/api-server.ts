@@ -90,18 +90,23 @@ export class ApiServer {
   }
 
   /**
-   * Override status to 'working' while an input send is in flight.
-   * The status monitor cannot infer 'working' from typed-char echoes, so the
-   * DB still reads 'idle' for the duration of a slow per-char Win32 send.
-   * Without this override, callers would see 'idle' and think their send
-   * landed before any of it had been typed yet.
+   * Overlay the transient `receiving` status while an input send is in flight.
+   * The status monitor cannot infer activity from typed-char echoes, so the DB
+   * still reads `idle` for the duration of a slow per-char Win32 send. Without
+   * this overlay, callers (and other agents polling `list_agents`) would see
+   * `idle` and think their message landed before any of it had been typed.
+   *
+   * `receiving` — not `working` — because this reflects "a message is arriving
+   * at this agent," distinct from "the model is generating." It is never
+   * persisted and never rides a `statusChanged` event; it exists only on the
+   * read projection and clears the instant delivery finishes.
    */
   private withInputInFlight<T extends { id: string; status: string }>(agent: T): T {
     if (
       this.supervisor.isInputInFlight(agent.id) &&
       (agent.status === 'idle' || agent.status === 'waiting')
     ) {
-      return { ...agent, status: 'working' };
+      return { ...agent, status: 'receiving' };
     }
     return agent;
   }
@@ -195,7 +200,7 @@ export class ApiServer {
       // covers the window between enqueue and the agent's first response
       // burst, where the DB still reads 'idle' but typing is in progress.
       if (this.supervisor.isInputInFlight(agentId) || ['working', 'launching'].includes(agent.status)) {
-        const reportedStatus = this.supervisor.isInputInFlight(agentId) ? 'working' : agent.status;
+        const reportedStatus = this.supervisor.isInputInFlight(agentId) ? 'receiving' : agent.status;
         throw Object.assign(
           new Error(`Cannot send input to agent in "${reportedStatus}" state. Wait until it is idle or waiting.`),
           { statusCode: 409 }
@@ -303,12 +308,13 @@ export class ApiServer {
     }
 
     // POST /api/agents/:id/status — class IV worker hook receive endpoint.
-    // The supervised-worker Stop hook (state='idle') and UserPromptSubmit
-    // hook (state='working') post here at turn boundaries.
-    // Body: { state: 'idle' | 'working', source: string, ts?: number }
-    // We flip the agent's StatusMonitor latch and the existing EventBridge →
-    // supervisor notification pipeline picks up the change. See
-    // plans/class-iv-worker-hook-scaffold.md.
+    // The supervised-worker Stop hook (state='idle'), UserPromptSubmit hook
+    // (state='working'), and SessionStart hook (state='active') post here.
+    // Body: { state: 'idle' | 'working' | 'active', source: string, ts?: number }
+    // 'idle'/'working' flip the agent's StatusMonitor latch (the EventBridge →
+    // supervisor notification pipeline picks up the change); 'active' updates
+    // hook health only and never changes status. See
+    // plans/class-iv-worker-hook-scaffold.md and HOOK_SYSTEM_DESIGN.md §A.
     const statusMatch = path.match(/^\/api\/agents\/([^/]+)\/status$/);
     if (method === 'POST' && statusMatch) {
       const agentId = statusMatch[1];
@@ -320,14 +326,19 @@ export class ApiServer {
       const state: unknown = parsed.state;
       const source: unknown = parsed.source;
 
-      if (state !== 'idle' && state !== 'working') {
+      if (state !== 'idle' && state !== 'working' && state !== 'active') {
         throw Object.assign(
-          new Error(`Unsupported state ${JSON.stringify(state)} — only 'idle' or 'working' accepted`),
+          new Error(`Unsupported state ${JSON.stringify(state)} — only 'idle', 'working', or 'active' accepted`),
           { statusCode: 400 },
         );
       }
       const sourceTag = typeof source === 'string' && source.length > 0 ? source : 'hook';
-      if (state === 'working') {
+      if (state === 'active') {
+        // SessionStart hook (HOOK_SYSTEM_DESIGN.md §A). Proof the hook scaffold
+        // loaded — updates hook_status/last_hook_event_at only and MUST NOT
+        // change `status` (no working/idle flip).
+        this.supervisor.recordHookSessionStart(agentId, sourceTag);
+      } else if (state === 'working') {
         this.supervisor.forceWorkingFromHook(agentId, sourceTag);
       } else {
         this.supervisor.forceIdleFromHook(agentId, sourceTag);

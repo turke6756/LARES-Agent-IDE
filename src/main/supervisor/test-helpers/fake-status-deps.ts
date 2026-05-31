@@ -15,10 +15,18 @@ export interface StatusUpdate {
   status: AgentStatus;
 }
 
+export interface HookStatusUpdate {
+  agentId: string;
+  hookStatus: NonNullable<Agent['hookStatus']>;
+  lastHookEventAt?: number;
+}
+
 export interface StatusMonitorFakes {
   agents: Map<string, Agent>;
   /** Recorded calls to `updateAgentStatus` (in insertion order). */
   updates: StatusUpdate[];
+  /** Recorded calls to `updateAgentHookStatus` (in insertion order). */
+  hookUpdates: HookStatusUpdate[];
   /** Recorded `addEvent` audit rows. */
   audit: Array<{ agentId: string; type: string; payload: string }>;
   /** Recorded `statusChanged` emissions from the monitor. */
@@ -39,6 +47,7 @@ export function makeStatusMonitorFakes(): StatusMonitorFakes {
   return {
     agents: new Map(),
     updates: [],
+    hookUpdates: [],
     audit: [],
     emissions: [],
     lastOutputAt: new Map(),
@@ -59,11 +68,13 @@ export function patchDatabaseModule(fakes: StatusMonitorFakes): () => void {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const db = require('../../database') as {
     updateAgentStatus: (id: string, status: AgentStatus) => void;
+    updateAgentHookStatus: (id: string, hookStatus: NonNullable<Agent['hookStatus']>, lastHookEventAt?: number) => void;
     addEvent: (id: string, type: string, payload: string | null) => void;
     getActiveAgents: () => Agent[];
   };
 
   const origUpdate = db.updateAgentStatus;
+  const origHookUpdate = db.updateAgentHookStatus;
   const origAdd = db.addEvent;
   const origActive = db.getActiveAgents;
 
@@ -72,6 +83,14 @@ export function patchDatabaseModule(fakes: StatusMonitorFakes): () => void {
     const a = fakes.agents.get(id);
     if (a) a.status = status;
   };
+  db.updateAgentHookStatus = (id, hookStatus, lastHookEventAt) => {
+    fakes.hookUpdates.push({ agentId: id, hookStatus, lastHookEventAt });
+    const a = fakes.agents.get(id);
+    if (a) {
+      a.hookStatus = hookStatus;
+      if (lastHookEventAt !== undefined) a.lastHookEventAt = lastHookEventAt;
+    }
+  };
   db.addEvent = (id, type, payload) => {
     fakes.audit.push({ agentId: id, type, payload: payload ?? '' });
   };
@@ -79,6 +98,7 @@ export function patchDatabaseModule(fakes: StatusMonitorFakes): () => void {
 
   return () => {
     db.updateAgentStatus = origUpdate;
+    db.updateAgentHookStatus = origHookUpdate;
     db.addEvent = origAdd;
     db.getActiveAgents = origActive;
   };

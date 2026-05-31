@@ -4,6 +4,7 @@ import type { AgentStatus } from '../../../shared/types';
 const STATUS_CONFIG: Record<AgentStatus, { color: string; bg: string; pulse: boolean; label: string }> = {
   launching: { color: 'text-accent-yellow', bg: 'bg-accent-yellow', pulse: true, label: 'Starting' },
   working: { color: 'text-accent-green', bg: 'bg-accent-green', pulse: true, label: 'Working' },
+  receiving: { color: 'text-accent-purple', bg: 'bg-accent-purple', pulse: true, label: 'Receiving' },
   idle: { color: 'text-accent-blue', bg: 'bg-accent-blue', pulse: false, label: 'Idle' },
   waiting: { color: 'text-accent-orange', bg: 'bg-accent-orange', pulse: true, label: 'Waiting' },
   done: { color: 'text-gray-400', bg: 'bg-gray-500', pulse: false, label: 'Done' },

@@ -32,6 +32,7 @@ function useSwipe(onSwipe: () => void, direction: 'left' | 'right') {
 const SUPERVISOR_STATUS_COLORS: Record<AgentStatus, { dot: string; border: string; bg: string }> = {
   launching: { dot: 'bg-yellow-400', border: 'border-yellow-500/50', bg: 'hover:bg-yellow-500/10' },
   working:   { dot: 'bg-green-400 animate-pulse', border: 'border-green-500/50', bg: 'hover:bg-green-500/10' },
+  receiving: { dot: 'bg-purple-400 animate-pulse', border: 'border-purple-500/50', bg: 'hover:bg-purple-500/10' },
   idle:      { dot: 'bg-blue-400', border: 'border-blue-500/50', bg: 'hover:bg-blue-500/10' },
   waiting:   { dot: 'bg-orange-400 animate-pulse', border: 'border-orange-500/50', bg: 'hover:bg-orange-500/10' },
   done:      { dot: 'bg-gray-400', border: 'border-gray-500/50', bg: 'hover:bg-gray-500/10' },

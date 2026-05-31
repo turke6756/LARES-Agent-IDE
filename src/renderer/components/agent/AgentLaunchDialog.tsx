@@ -19,6 +19,9 @@ export default function AgentLaunchDialog({ workspace, onClose }: Props) {
   const [command, setCommand] = useState(PROVIDER_COMMANDS.claude[workspace.pathType]);
   const [autoRestart, setAutoRestart] = useState(true);
   const [supervised, setSupervised] = useState(false);
+  // Worker lane (hook-based status) — default ON. Only meaningful for
+  // claude/codex (gemini has no hook scaffold); rendered disabled for gemini.
+  const [worker, setWorker] = useState(true);
   const [launching, setLaunching] = useState(false);
   const [agentMd, setAgentMd] = useState<{ found: boolean; fileName: string | null } | null>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -61,6 +64,7 @@ export default function AgentLaunchDialog({ workspace, onClose }: Props) {
       if (template.command) setCommand(template.command);
       setAutoRestart(template.autoRestart);
       setSupervised(template.isSupervised);
+      setWorker(template.isWorker);
       if (!title.trim()) setTitle(template.name);
     } else if (selectedOption.startsWith('persona:')) {
       const personaName = selectedOption.slice('persona:'.length);
@@ -123,6 +127,9 @@ export default function AgentLaunchDialog({ workspace, onClose }: Props) {
         provider,
         autoRestartEnabled: autoRestart,
         isSupervised: supervised,
+        // Worker lane: hook-based status. Gemini has no hook scaffold, so it
+        // never joins the lane. Supervised implies worker.
+        isWorker: provider !== 'gemini' && (worker || supervised),
       };
 
       if (resolvedPersona) {
@@ -132,6 +139,10 @@ export default function AgentLaunchDialog({ workspace, onClose }: Props) {
       } else if (selectedOption.startsWith('persona:')) {
         launchInput.persona = selectedOption.slice('persona:'.length);
       }
+
+      // Persona agents run in their own .claude/agents/<name>/ cwd, not the
+      // shared worker folder — the worker lane does not apply to them.
+      if (launchInput.persona) launchInput.isWorker = false;
 
       await window.api.agents.launch(launchInput);
       await loadAgents(workspace.id);
@@ -163,6 +174,7 @@ export default function AgentLaunchDialog({ workspace, onClose }: Props) {
         command: command.trim() || null,
         autoRestart,
         isSupervised: supervised,
+        isWorker: worker,
       });
       setTemplates(prev => [...prev, newTemplate]);
       setSelectedOption(`template:${newTemplate.id}`);
@@ -394,9 +406,26 @@ export default function AgentLaunchDialog({ workspace, onClose }: Props) {
           <div className="flex items-center gap-2">
             <input
               type="checkbox"
+              id="worker"
+              checked={provider !== 'gemini' && (worker || supervised)}
+              disabled={provider === 'gemini' || supervised}
+              onChange={(e) => setWorker(e.target.checked)}
+              className="rounded"
+            />
+            <label htmlFor="worker" className="text-sm text-gray-400">
+              Worker (hook-based status)
+              {provider === 'gemini' && (
+                <span className="text-gray-600"> — unavailable for Gemini</span>
+              )}
+            </label>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <input
+              type="checkbox"
               id="supervised"
               checked={supervised}
-              onChange={(e) => setSupervised(e.target.checked)}
+              onChange={(e) => { setSupervised(e.target.checked); if (e.target.checked) setWorker(true); }}
               className="rounded"
             />
             <label htmlFor="supervised" className="text-sm text-gray-400">

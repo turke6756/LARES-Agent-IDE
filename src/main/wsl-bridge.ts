@@ -276,6 +276,15 @@ export async function tmuxListSessions(): Promise<TmuxSession[]> {
   });
 }
 
+/** Scrollback lines tmux retains per pane. tmux's built-in default is 2000,
+ *  which silently drops a long-running agent's output once it scrolls past
+ *  that — so a user who detaches from a `tmux attach` and returns later finds
+ *  the history truncated to the last 2000 lines (everything produced while
+ *  away is gone). We set a large limit so re-attaching a supervisor (or any
+ *  agent) shows the full session, not a lazy-loaded tail. ~100k lines costs
+ *  at most tens of MB per pane and is allocated lazily as lines are produced. */
+export const TMUX_HISTORY_LIMIT = 100000;
+
 export function buildTmuxNewSessionCommand(name: string, workDir: string, command: string): string {
   // L-A / BUG-22: base64-envelope the command body so the outer shell layer
   // never needs to escape single quotes, dollar signs, backticks, newlines,
@@ -293,8 +302,16 @@ export function buildTmuxNewSessionCommand(name: string, workDir: string, comman
   // trips on the closing pgroup and exits silently — wasting a restart
   // cycle on every first launch. setsid makes the tmux daemon its own
   // session leader so claude's pane survives wsl.exe shutdown.
+  //
+  // Scrollback persistence: `set-option -g history-limit` runs as a chained
+  // tmux command (`\;` — bash passes the literal `;` to tmux as its command
+  // separator) BEFORE `new-session`. history-limit is read when a pane's grid
+  // is created and is NOT applied retroactively, so it must be set on the
+  // global options first; the pane that `new-session` then creates inherits
+  // the larger buffer. Setting it globally is idempotent across launches and
+  // starts the server if none is running.
   const b64 = Buffer.from(command, 'utf8').toString('base64');
-  return `setsid tmux new-session -d -s '${name}' -c '${workDir}' -- bash -lic "$(echo ${b64} | base64 -d)"`;
+  return `setsid tmux set-option -g history-limit ${TMUX_HISTORY_LIMIT} \\; new-session -d -s '${name}' -c '${workDir}' -- bash -lic "$(echo ${b64} | base64 -d)"`;
 }
 
 export interface TmuxNewSessionResult {
@@ -510,6 +527,21 @@ export async function tmuxSendInput(
   const result = await wslExec(cmd, 8000);
   if (result.exitCode !== 0) {
     throw new Error(`tmux send-keys (${provider}) failed: ${result.stderr || 'unknown error'}`);
+  }
+}
+
+/**
+ * BUG-10 reactive resend — replay ONLY the submit keystroke into a tmux pane,
+ * with no body. Used by StatusMonitor's Enter-resend recovery when a prompt was
+ * delivered but the paste-race ate the trailing Enter. All known providers use
+ * the same kitty CSI submit byte (`\x1b[13u`) on Linux, so this is
+ * provider-agnostic; the body is already sitting in the agent's prompt buffer,
+ * so resending it would duplicate the text.
+ */
+export async function tmuxSendSubmit(name: string): Promise<void> {
+  const result = await wslExec(`tmux send-keys -t '${name}' -H ${TMUX_KITTY_ENTER_HEX}`, 8000);
+  if (result.exitCode !== 0) {
+    throw new Error(`tmux send-keys (submit) failed: ${result.stderr || 'unknown error'}`);
   }
 }
 

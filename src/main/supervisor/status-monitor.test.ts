@@ -26,6 +26,10 @@ import {
   LAUNCH_SETTLE_TIMEOUT_MS,
   LAUNCH_SETTLE_OVERRUN_GRACE_MS,
   START_HOOK_SILENCE_WARN_MS,
+  START_HOOK_RESEND_AFTER_MS,
+  START_HOOK_RESEND_INTERVAL_MS,
+  START_HOOK_RESEND_MAX_ATTEMPTS,
+  HOOK_CANARY_WINDOW_MS,
 } from '../../shared/constants';
 import type { Agent } from '../../shared/types';
 import type { StatusChangedEvent } from './status-events';
@@ -2113,6 +2117,271 @@ test('start-hook watchdog: forgetAgent clears the start-hook + dedupe state', ()
     monitor.forgetAgent(agent.id);
     assert.equal(monitor.getLastStartHookEventAt(agent.id), undefined,
       'forgetAgent drops the start-hook timestamp');
+  } finally {
+    restore();
+  }
+});
+
+// ── BUG-10 Enter-resend recovery (checkStartHookResend) ──────────────
+/** Test seam — invoke the private resend recovery directly. */
+function checkStartHookResend(monitor: StatusMonitor, agent: Agent): void {
+  (monitor as any).checkStartHookResend(agent);
+}
+
+/** Wire a recording resubmit handler; returns the array it pushes agent ids into. */
+function armResubmit(monitor: StatusMonitor): string[] {
+  const resends: string[] = [];
+  monitor.setResubmitHandler((id) => resends.push(id));
+  return resends;
+}
+
+test('resend: claude worker idle ≥3s after input with no start hook → resends Enter', () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  const warn = captureWarn();
+  try {
+    const agent = makeAgent('w-claude', { status: 'idle', isWorker: true, isSupervised: false, provider: 'claude' });
+    const monitor = makeMonitor({ fakes, agent });
+    const resends = armResubmit(monitor);
+
+    monitor.recordInputDelivered(agent.id, fakes.now.value - (START_HOOK_RESEND_AFTER_MS + 100));
+    checkStartHookResend(monitor, agent);
+
+    assert.deepEqual(resends, [agent.id], 'exactly one Enter resend fired');
+    assert.match(warn.warnings.join('\n'), /\[bug-10\] resending Enter/, 'logs the resend');
+  } finally {
+    warn.restore();
+    restore();
+  }
+});
+
+test('resend: no resend before START_HOOK_RESEND_AFTER_MS elapses', () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeAgent('w-claude', { status: 'idle', isWorker: true, isSupervised: false, provider: 'claude' });
+    const monitor = makeMonitor({ fakes, agent });
+    const resends = armResubmit(monitor);
+
+    monitor.recordInputDelivered(agent.id, fakes.now.value - (START_HOOK_RESEND_AFTER_MS - 500));
+    checkStartHookResend(monitor, agent);
+
+    assert.deepEqual(resends, [], 'genuine hook still has time to round-trip — no resend yet');
+  } finally {
+    restore();
+  }
+});
+
+test('resend: a UserPromptSubmit hook since the input cancels the resend', () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeAgent('w-claude', { status: 'idle', isWorker: true, isSupervised: false, provider: 'claude' });
+    const monitor = makeMonitor({ fakes, agent });
+    const resends = armResubmit(monitor);
+
+    const inputAt = fakes.now.value - (START_HOOK_RESEND_AFTER_MS + 100);
+    monitor.recordInputDelivered(agent.id, inputAt);
+    monitor.recordStartHookEventAt(agent.id, inputAt + 50); // submit took
+    checkStartHookResend(monitor, agent);
+
+    assert.deepEqual(resends, [], 'the start hook proves the submit landed — nothing to resend');
+  } finally {
+    restore();
+  }
+});
+
+test('resend: working status (hook already flipped it) → no resend', () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeAgent('w-claude', { status: 'working', isWorker: true, isSupervised: false, provider: 'claude' });
+    const monitor = makeMonitor({ fakes, agent });
+    const resends = armResubmit(monitor);
+
+    monitor.recordInputDelivered(agent.id, fakes.now.value - (START_HOOK_RESEND_AFTER_MS + 100));
+    checkStartHookResend(monitor, agent);
+
+    assert.deepEqual(resends, [], 'working means the submit took — never resend');
+  } finally {
+    restore();
+  }
+});
+
+test('resend: bounded at START_HOOK_RESEND_MAX_ATTEMPTS, spaced by the interval', () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  const warn = captureWarn();
+  try {
+    const agent = makeAgent('w-claude', { status: 'idle', isWorker: true, isSupervised: false, provider: 'claude' });
+    const monitor = makeMonitor({ fakes, agent });
+    const resends = armResubmit(monitor);
+
+    monitor.recordInputDelivered(agent.id, fakes.now.value - (START_HOOK_RESEND_AFTER_MS + 100));
+    // Hammer the watchdog every 1.5s well past the budget; only MAX attempts fire.
+    for (let i = 0; i < 10; i++) {
+      checkStartHookResend(monitor, agent);
+      fakes.now.value += START_HOOK_RESEND_INTERVAL_MS;
+    }
+
+    assert.equal(resends.length, START_HOOK_RESEND_MAX_ATTEMPTS,
+      `resends cap at ${START_HOOK_RESEND_MAX_ATTEMPTS} then defer to the warn-only watchdog`);
+  } finally {
+    warn.restore();
+    restore();
+  }
+});
+
+test('resend: a fresh input delivery re-arms the attempt budget', () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  const warn = captureWarn();
+  try {
+    const agent = makeAgent('w-claude', { status: 'idle', isWorker: true, isSupervised: false, provider: 'claude' });
+    const monitor = makeMonitor({ fakes, agent });
+    const resends = armResubmit(monitor);
+
+    // Exhaust the budget on turn 1.
+    monitor.recordInputDelivered(agent.id, fakes.now.value - (START_HOOK_RESEND_AFTER_MS + 100));
+    for (let i = 0; i < 10; i++) {
+      checkStartHookResend(monitor, agent);
+      fakes.now.value += START_HOOK_RESEND_INTERVAL_MS;
+    }
+    const afterTurn1 = resends.length;
+
+    // Turn 2: new input delivery resets the counter.
+    monitor.recordInputDelivered(agent.id, fakes.now.value - (START_HOOK_RESEND_AFTER_MS + 100));
+    checkStartHookResend(monitor, agent);
+
+    assert.equal(resends.length, afterTurn1 + 1, 'a new turn gets a fresh resend budget');
+  } finally {
+    warn.restore();
+    restore();
+  }
+});
+
+test('resend: gemini worker is NOT resent (no UserPromptSubmit hook to gate on)', () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeAgent('w-gemini', { status: 'idle', isWorker: true, isSupervised: false, provider: 'gemini' });
+    const monitor = makeMonitor({ fakes, agent });
+    const resends = armResubmit(monitor);
+
+    monitor.recordInputDelivered(agent.id, fakes.now.value - (START_HOOK_RESEND_AFTER_MS + 100));
+    checkStartHookResend(monitor, agent);
+
+    assert.deepEqual(resends, [], 'gemini has no start hook, so idle is not evidence of a dropped Enter');
+  } finally {
+    restore();
+  }
+});
+
+test('resend: non-worker unsupervised agent is NOT resent', () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeAgent('u-claude', { status: 'idle', isWorker: false, isSupervised: false, provider: 'claude' });
+    const monitor = makeMonitor({ fakes, agent });
+    const resends = armResubmit(monitor);
+
+    monitor.recordInputDelivered(agent.id, fakes.now.value - (START_HOOK_RESEND_AFTER_MS + 100));
+    checkStartHookResend(monitor, agent);
+
+    assert.deepEqual(resends, [], 'non-worker agents derive working from inference, not the hook');
+  } finally {
+    restore();
+  }
+});
+
+// ── Launch-time hook canary (HOOK_SYSTEM_DESIGN.md §5.4 / B5) ──────────
+
+// Drive a poll tick the same way the live loop does.
+function poll(monitor: StatusMonitor): Promise<void> {
+  return (monitor as any).poll();
+}
+
+test('canary: marks hook_status=broken after the window with no hook event', async () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeAgent('cw-1', { provider: 'codex', isSupervised: true, status: 'idle' });
+    const monitor = makeMonitor({ fakes, agent });
+    monitor.recordHookCanary(agent.id, fakes.now.value);
+
+    // Before the window elapses: poll must not flip anything.
+    await poll(monitor);
+    assert.equal(fakes.hookUpdates.length, 0, 'no hook-status write before the window elapses');
+    assert.ok(monitor.isHookCanaryArmed(agent.id), 'canary stays armed before the window');
+
+    // Window elapses with no hook → broken.
+    fakes.now.value += HOOK_CANARY_WINDOW_MS + 100;
+    await poll(monitor);
+
+    assert.equal(fakes.hookUpdates.length, 1, 'canary writes hook_status exactly once');
+    assert.equal(fakes.hookUpdates[0].agentId, agent.id);
+    assert.equal(fakes.hookUpdates[0].hookStatus, 'broken');
+    assert.ok(!monitor.isHookCanaryArmed(agent.id), 'canary disarms after firing');
+
+    // The canary must NOT touch `status` (no status write to anything else).
+    assert.ok(
+      !fakes.updates.some((u) => u.agentId === agent.id),
+      `canary must not change status; got updates ${JSON.stringify(fakes.updates)}`,
+    );
+
+    // A second poll must not re-fire.
+    await poll(monitor);
+    assert.equal(fakes.hookUpdates.length, 1, 'canary fires at most once per arm');
+  } finally {
+    restore();
+  }
+});
+
+test('canary: a hook event before the window disarms it → never marked broken', async () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeAgent('cw-2', { provider: 'codex', isSupervised: true, status: 'idle' });
+    const monitor = makeMonitor({ fakes, agent });
+    monitor.recordHookCanary(agent.id, fakes.now.value);
+
+    // A hook arrives inside the window — the supervisor's stampHookHealthy
+    // calls clearHookCanary (emulated directly here).
+    monitor.clearHookCanary(agent.id);
+    assert.ok(!monitor.isHookCanaryArmed(agent.id), 'canary disarmed by the hook');
+
+    // Window elapses; poll must NOT mark broken.
+    fakes.now.value += HOOK_CANARY_WINDOW_MS + 100;
+    await poll(monitor);
+    assert.equal(
+      fakes.hookUpdates.filter((h) => h.hookStatus === 'broken').length,
+      0,
+      'a healthy hook before the window must prevent a broken verdict',
+    );
+  } finally {
+    restore();
+  }
+});
+
+test('canary: does not clobber a degraded (B2) hook_status', async () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    // B2 marked this codex worker degraded at launch; the canary was never
+    // armed for it. Even if armed, the 'unknown'-only guard protects it.
+    const agent = makeAgent('cw-3', { provider: 'codex', isSupervised: true, status: 'idle', hookStatus: 'degraded' });
+    const monitor = makeMonitor({ fakes, agent });
+    monitor.recordHookCanary(agent.id, fakes.now.value);
+
+    fakes.now.value += HOOK_CANARY_WINDOW_MS + 100;
+    await poll(monitor);
+
+    assert.equal(
+      fakes.hookUpdates.filter((h) => h.hookStatus === 'broken').length,
+      0,
+      'canary must not overwrite a degraded status with broken',
+    );
+    assert.equal(agent.hookStatus, 'degraded', 'degraded status is preserved');
   } finally {
     restore();
   }

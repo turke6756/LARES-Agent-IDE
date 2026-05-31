@@ -254,6 +254,9 @@ export default function AgentCard({ agent, onTeam }: { agent: Agent; onTeam?: (a
              {agent.isSupervised && (
                 <span className="text-[11px] text-purple-400 bg-purple-500/15 px-1.5 py-0.5 font-semibold">Supervised</span>
              )}
+             {agent.isWorker && !agent.isSupervised && (
+                <span className="text-[11px] text-sky-400 bg-sky-500/15 px-1.5 py-0.5 font-semibold" title="Status derived from turn-boundary hooks">Worker</span>
+             )}
            </div>
            <h4 className={`font-semibold text-[13px] truncate ${isSelected ? 'text-accent-blue' : 'text-gray-200 group-hover:text-gray-100'}`}>
              {agent.title}

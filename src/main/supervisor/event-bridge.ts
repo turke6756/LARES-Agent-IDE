@@ -181,6 +181,17 @@ export class EventBridge {
         const agent = this.deps.getAgent(agentId);
         if (!agent) continue;
 
+        // Class IV — claude/codex workers (supervised OR plain) derive working/idle
+        // solely from their hook pipeline (UserPromptSubmit→working, Stop→idle); PTY
+        // inference is already disabled for the worker lane in
+        // status-monitor.inferStatus. The chat-event stream was a parallel status
+        // source that beat the start hook to the working transition (masking hook
+        // firing) and could mis-drive status, so disable it for any worker-lane agent
+        // that has a hook scaffold. Gemini has no hook scaffold yet, so gemini agents
+        // keep the chat-stream as their only working/idle signal and must NOT be
+        // skipped here.
+        if ((agent.isSupervised || agent.isWorker) && agent.provider !== 'gemini') continue;
+
         switch (event.type) {
           case 'assistant-text': {
             if (event.endsWithQuestion === true) {
@@ -488,13 +499,13 @@ export class EventBridge {
   notifyUserInputDelivered(agentId: string): void {
     const agent = this.deps.getAgent(agentId);
     if (!agent || agent.status !== 'waiting') return;
-    // Paste-race fix: supervised workers' idle→working transition is owned
+    // Paste-race fix: worker agents' idle→working transition is owned
     // exclusively by the UserPromptSubmit hook. Optimistic seeds here (which
     // fire on every PTY write, including pastes that were never submitted)
     // would re-introduce the false-working bug the hook scaffold exists to
     // close. The brief flicker between input send and hook arrival (50ms–3s)
-    // is intentional and truthful.
-    if (agent.isSupervised) return;
+    // is intentional and truthful. Applies to supervised and plain workers.
+    if (agent.isSupervised || agent.isWorker) return;
     this.deps.statusMonitor.forceWorking(agentId, {
       source: 'user-input',
       ttlClass: 'model-pending',
