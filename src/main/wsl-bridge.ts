@@ -422,6 +422,15 @@ function shellSingleQuoteEscape(s: string): string {
   return s.replace(/'/g, "'\\''");
 }
 
+/** P1 (plans/p1-hook-spool-multi-transport.md §3/§4) — single-quote a value
+ *  for a bash command line. Safe for any byte content: embedded single quotes
+ *  become the standard '\'' splice. Used for the DASHBOARD_SPOOL_PATH launch
+ *  env prefix (workspace paths can contain spaces) and for every tmux session
+ *  name in tmuxReadStatusOptions. */
+export function shQuote(value: string): string {
+  return `'${shellSingleQuoteEscape(value)}'`;
+}
+
 // Hex byte sequences for tmux `send-keys -H`.
 // Kitty keyboard protocol (CSI-u) — codex/gemini on Linux enable this and
 // expect Enter as `\x1b[13u`, Shift+Enter as `\x1b[13;2u`. Plain `\r` from
@@ -531,15 +540,33 @@ export async function tmuxSendInput(
 }
 
 /**
- * BUG-10 reactive resend — replay ONLY the submit keystroke into a tmux pane,
- * with no body. Used by StatusMonitor's Enter-resend recovery when a prompt was
- * delivered but the paste-race ate the trailing Enter. All known providers use
- * the same kitty CSI submit byte (`\x1b[13u`) on Linux, so this is
- * provider-agnostic; the body is already sitting in the agent's prompt buffer,
- * so resending it would duplicate the text.
+ * C2 (plans/global-hook-rollout-and-submit-confirmation.md §3.2) — pure builder
+ * for the submit-ONLY tmux command: a bare kitty-CSI Enter (`\x1b[13u`) with NO
+ * body and NO bracketed-paste wrapper. This is the byte sequence the
+ * synchronous confirm-and-retry re-presses on each retry.
+ *
+ * Critically distinct from `buildTmuxSendInputCmd(name,'','claude',true)`, which
+ * for Claude still wraps an empty bracketed-paste around the Enter — re-poking
+ * Claude's paste handler on every retry. The submit-only path emits the Enter
+ * alone. All three WSL providers enable kitty keyboard protocol, so the same
+ * `\x1b[13u` is the correct submit for each; the body already sits in the
+ * composer, so no re-paste is ever needed.
+ *
+ * Exported so the shape can be asserted without spawning wsl.exe.
+ */
+export function buildTmuxSubmitOnlyCmd(name: string): string {
+  return `tmux send-keys -t '${name}' -H ${TMUX_KITTY_ENTER_HEX}`;
+}
+
+/**
+ * BUG-10 reactive resend / C2 confirm-retry — replay ONLY the submit keystroke
+ * into a tmux pane, with no body. Used by StatusMonitor's Enter-resend recovery
+ * and the synchronous confirm-and-retry when a prompt was delivered but the
+ * paste-race ate the trailing Enter. The body is already sitting in the agent's
+ * prompt buffer, so resending it would duplicate the text.
  */
 export async function tmuxSendSubmit(name: string): Promise<void> {
-  const result = await wslExec(`tmux send-keys -t '${name}' -H ${TMUX_KITTY_ENTER_HEX}`, 8000);
+  const result = await wslExec(buildTmuxSubmitOnlyCmd(name), 8000);
   if (result.exitCode !== 0) {
     throw new Error(`tmux send-keys (submit) failed: ${result.stderr || 'unknown error'}`);
   }
@@ -588,6 +615,51 @@ export function buildTmuxAttachCmd(name: string): string {
     `for i in ${attempts}; do tmux has-session -t '${name}' 2>/dev/null && break; sleep 0.1; done; ` +
     `tmux attach -t '${name}'`
   );
+}
+
+/**
+ * P1 work item D (plans/p1-hook-spool-multi-transport.md §4) — read the
+ * `@agentdashboard-status` pane option for a batch of tmux sessions in ONE
+ * `wsl.exe` invocation. The v7 hook script writes its event record there
+ * (transport 3) so the dashboard can recover a hook event even when both the
+ * spool and HTTP were unreachable.
+ *
+ * The pane id is resolved explicitly per session (`display-message -p
+ * '#{pane_id}'`) rather than relying on session-scope option fallback; a
+ * session that no longer exists is skipped (`|| continue`). Every session
+ * name passes through {@link shQuote}, even though generated names look safe
+ * today. The `$(...)` substitution around `show-options` strips the trailing
+ * newline the stored option value carries (the script sets the whole spool
+ * LINE, newline included).
+ *
+ * Returns session → raw option value (empty string when unset — `-q` makes
+ * show-options print nothing for a missing option). The caller parses the
+ * JSON and routes through the central applier; this helper stays transport
+ * plumbing only.
+ */
+export async function tmuxReadStatusOptions(
+  sessionNames: string[],
+  exec: (cmd: string, timeout: number) => Promise<WslExecResult> = wslExec,
+): Promise<Map<string, string>> {
+  const values = new Map<string, string>();
+  if (sessionNames.length === 0) return values;
+
+  const quoted = sessionNames.map(shQuote).join(' ');
+  const script =
+    `for s in ${quoted}; do ` +
+    `p=$(tmux display-message -p -t "$s" '#{pane_id}' 2>/dev/null) || continue; ` +
+    `printf '%s\\t%s\\n' "$s" "$(tmux show-options -pqv -t "$p" @agentdashboard-status 2>/dev/null)"; ` +
+    `done`;
+  const result = await exec(script, 8000);
+  if (result.exitCode !== 0 && !result.stdout) return values;
+
+  for (const line of result.stdout.split('\n')) {
+    if (!line) continue;
+    const tab = line.indexOf('\t');
+    if (tab === -1) continue;
+    values.set(line.slice(0, tab), line.slice(tab + 1));
+  }
+  return values;
 }
 
 export async function tmuxCapturePane(name: string, lines = 50): Promise<string> {

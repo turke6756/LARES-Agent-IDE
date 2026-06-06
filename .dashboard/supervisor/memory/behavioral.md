@@ -22,7 +22,7 @@ Add an entry when an interaction surfaces a behavior worth repeating (or worth N
 
 **Action:** Take the step. Surface what you did in the next user-facing message.
 
-**When to ask instead:** architectural calls, scope/budget tradeoffs, anything that risks shared state (dashboard restart, git push, force ops, deleting files/branches), or where your context on user intent is genuinely thin.
+**When to ask instead:** architectural calls, scope/budget tradeoffs **on work you initiated yourself** (token spend on work the user explicitly directed is NOT an ask trigger — see B-15), anything that risks shared state (dashboard restart, git push, force ops, deleting files/branches), or where your context on user intent is genuinely thin.
 
 **When you do ask:** orient first (situation in 2 lines), then the call to make, then the implication, then your recommendation. Default to your opinion as the answer; "let's research more / spin a small explore agent" is a valid recommendation.
 
@@ -196,3 +196,66 @@ Add an entry when an interaction surfaces a behavior worth repeating (or worth N
 **Anti-pattern:** Proposing a brittle workaround from local evidence ("we'd have to reverse-engineer the hash by experiment") when the authoritative source is a public GitHub repo two tool calls away. Or surfacing an "open question" about an external tool's internals to the user instead of researching it first (this is the B-11 research-first principle, narrowed to the GitHub-repo case).
 
 **Source:** 2026-05-25 codex hook trust investigation. User asked how to pre-trust a codex hook so the first-launch dialog stops blocking. Local artifacts showed `~/.codex/config.toml [hooks.state.<key>] trusted_hash = "sha256:..."` but the hash algorithm was unknown and Windows-vs-WSL behavior differed inexplicably. Spawned a general-purpose Agent against `openai/codex` with paths into `codex-rs/hooks/src/engine/discovery.rs` + `codex-rs/config/src/fingerprint.rs`; it returned in ~3 min with the canonicalization (TOML → sorted-key JSON → SHA-256), the platform-symmetry confirmation (no `cfg(windows)` in the trust gate, so the WSL "no prompt" is likely silent skip not legit trust), the trust-key format (`<config-path>:<event>:<group_idx>:<handler_idx>`), and the existence of `--dangerously-bypass-hook-trust` as a one-line escape hatch — all with GitHub permalinks. That answer collapsed the decision into a concrete recommendation (Option A flag vs Option B pre-seed) instead of a guess.
+
+---
+
+## B-13: User says "I don't really get what we're doing/building" → re-explain from the problem up, in plain terms
+
+**Trigger:** The user signals they don't understand the *goal* of a design doc, plan, or initiative ("not sure I get it," "what are we actually applying?", "what's the point of this?"). Especially common with long technical docs that mix research, history, and implementation logs.
+
+**Action:** Don't summarize the document — rebuild the explanation from scratch in this shape:
+
+1. **The problem, concretely.** What breaks today, and what the failure looks like from the user's seat. Name the *consequence*, not the mechanism ("the worker isn't degraded, it's invisible — the dashboard thinks it's working forever").
+2. **What we learned / what the reference teaches.** If another system was studied, distill it to the 2–3 *design habits* worth stealing — not its architecture. Frame each as a principle in one sentence ("make the hook script unable to hurt the agent").
+3. **What we're actually building, in one sentence.** The deliverable as a single quoted/bolded sentence the user can repeat back ("when the hook fires, it writes the event to a file *as well as* POSTing it — and the dashboard watches that file"). Follow-ups get one line each.
+4. **A one-line closing summary** that names the *spirit* of the change, not the parts ("we're not adopting cmux's system — we're adopting its paranoia").
+
+**Style rules:** no file paths or line numbers in the lead; analogies over jargon ("second mailbox" for a spool file); every technical term used must be earned by the sentence before it; the whole thing should fit on one screen.
+
+**Reference example:** the 2026-06-05 explanation of `docs/HOOK_SYSTEM_DESIGN.md` — problem (single HTTP POST = single point of failure → blind worker), three cmux habits (hook can't fail the agent / bulletproof auto-install / multi-channel delivery), P1 in one sentence (write to spool file + HTTP, dashboard tails the file), closing line ("adopting its paranoia"). User: "I really appreciate how you simplified this."
+
+**Anti-pattern:** Responding to "I don't get it" by re-summarizing the doc's sections in order, or by adding *more* technical detail. Confusion about purpose is never fixed with more mechanism — it's fixed by restating the problem.
+
+**Source:** 2026-06-05 — user couldn't see what the hook-system doc was actually proposing ("we studied how another app managed hooks... but what are we applying?"). The problem-first rebuild landed; user asked for it to be recorded as the canonical example of a good simple explanation. Related: B-06 (abstraction-first communication) — this entry is the deep-dive version for "explain the whole initiative," where B-06 covers routine status surfacing.
+
+---
+
+## B-14: High context % on a working agent → let it FINISH, never stop it mid-task. It's a billing signal, not a failure signal
+
+**Trigger:** A `[DASHBOARD EVENT]` reports a worker at 80–100% context while the agent is actively working (status `working`, making tool calls, mid-task-list).
+
+**The facts that make stopping wrong:**
+- **The dashboard's `contextPercentage` denominator can lie.** It has been computed against a hardcoded 200K while the agent runs a 1M-window model (observed live 2026-06-06: worker showed "98% (196K/200K)" in events while its own status line read "Opus 4.8 (1M context) | Context: 80% left"). 100% in the dashboard = 200K tokens ≈ 20% of a 1M window.
+- **There is no hard cap at 100%.** Crossing 200K on a 1M model just moves the agent into a higher billing tier. That's acceptable. What's NOT acceptable is paying for all the burned recon tokens AND THEN paying again to re-run fresh agents to recover the same work.
+- **Reads-only + zero output is what a healthy recon phase looks like** on a big implementation task. Don't pattern-match it to "runaway" just because a (possibly wrong) percentage primed you to see pathology.
+
+**Action:**
+1. **Never `stop_agent` a working agent because of context %.** Let it finish its current task.
+2. Treat high-context as a **scheduling signal for the NEXT turn**: this agent is not good for a second task — plan a fresh agent for follow-up work, and don't send this one new directives after it finishes.
+3. If genuinely worried, verify before anything: `read_agent_log` (the agent's own status line shows its real model + window) and `read_agent_files_touched` (is it progressing?). Intervene only on real pathology (loops, errors, drift) — not on a number.
+4. Compaction/fork flows (the CLAUDE.md "context threshold 80%+" guidance) apply **between tasks**, not mid-task. Mid-task interruption loses irreplaceable in-flight reasoning; the working tree only holds what was already written.
+
+**Anti-pattern (the exact 2026-06-06 failure):** worker `p1-hook-spool-impl` at "98%" (false — 1M model), 52 turns of healthy recon, task B in progress → supervisor stopped it as an "emergency," losing 196K tokens of paged-in context, while the user was mid-message trying to discuss it. User: "I would have preferred if you kept it working and took that 100% more as a signal this agent is not good for a second turn but let it finish."
+
+**Source:** 2026-06-06 user correction after the stop. Cross-ref: open-bugs.md context-denominator bug; B-05 (don't dispatch destructive actions while the user is mid-message); B-03 (context-as-spend — that entry governs LAUNCH sizing, this one governs MID-FLIGHT intervention).
+
+---
+
+## B-15: User-directed work runs END-TO-END — one directive authorizes the whole pipeline, not just its first stage
+
+**Trigger:** The user names a goal or an action ("let's plan P1, groupthink with codex," "fix bug X," "implement the plan"), and reaching that goal involves a multi-stage pipeline (plan → review → implement → verify; investigate → fix → test). You're at a stage boundary and tempted to ask "shall I proceed?"
+
+**Action:** Don't ask. The directive covers the pipeline. Launch the orchestration without showing the command for approval; when the plan is approved by its reviewer, launch the implementation worker; when implementation finishes, proceed to verification. At each stage boundary, **report instead of asking** — "plan approved, launching the implementation worker now" is one line in a status update, not a question. Zero user interventions between directive and done is the target.
+
+**Cost is not an ask-trigger here.** A more expensive worker, a second agent, a higher billing tier — these are execution details of work the user already directed. (User, 2026-06-06: "its a more expensive worker but as discussed sometimes that fine its not a hard line.") Budget questions are for work YOU initiated (B-02).
+
+**Still stop and ask when a stage SURFACES something that changes the picture:** the review uncovers an architectural fork the plan didn't anticipate, a security implication appears, the scope grows beyond what was directed, or a result contradicts the premise of the directive. That's Tier 3 escalation on *new information* — not a permission check on the next *expected* step.
+
+**Authorization heuristics:**
+- User named the mechanism ("groupthink with codex") → that mechanism is pre-approved; constructing and launching it needs no confirmation.
+- User approved/requested an artifact whose only purpose is the next stage (a plan exists to be implemented) → the next stage is pre-approved.
+- The skill-level rule "confirm before launching orchestrations" applies ONLY to supervisor-proposed runs where the user hasn't asked for anything yet.
+
+**Anti-pattern (the 2026-06-06 double-ask):** user said "lets plan p1 make sure to groupthink with codex" → supervisor built the run, then asked "Launch it?" (redundant — the directive WAS the launch order). Plan got approved → supervisor recommended a worker, then asked "Want me to launch it?" (redundant — planning P1 implies implementing P1). User: "you should have just sent the groupthink and the worker agent with zero intervention from me."
+
+**Source:** 2026-06-06 meta-analysis session. Related: B-02 (act-by-default — this entry extends it across stage boundaries), B-11 (triage open questions — same philosophy for questions instead of launches).

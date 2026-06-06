@@ -1,11 +1,12 @@
-import { useCallback, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useMemo, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { vscDarkPlus, vs } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import { useThemeStore } from '../../stores/theme-store';
 import CollapseButton from '../layout/CollapseButton';
-import { getTabScrollFraction, setTabScrollFraction } from './scrollMemory';
+import { useTabScrollMemory } from './scrollMemory';
+import { useModifierPathOpen } from './openFileHelpers';
 
 interface Props {
   content: string;
@@ -78,24 +79,10 @@ export default function MarkdownRenderer({ content, tabId }: Props) {
     target?.scrollIntoView({ behavior: 'smooth', block: 'start' });
   }, []);
 
-  const handleScroll = useCallback(() => {
-    if (!tabId) return;
-    const el = scrollRef.current;
-    if (!el) return;
-    const max = el.scrollHeight - el.clientHeight;
-    if (max <= 0) return;
-    setTabScrollFraction(tabId, el.scrollTop / max);
-  }, [tabId]);
-
-  useLayoutEffect(() => {
-    if (!tabId) return;
-    const el = scrollRef.current;
-    if (!el) return;
-    const frac = getTabScrollFraction(tabId);
-    if (frac <= 0) return;
-    const max = el.scrollHeight - el.clientHeight;
-    if (max > 0) el.scrollTop = max * frac;
-  }, [tabId]);
+  const handleScroll = useTabScrollMemory(tabId, scrollRef);
+  // Ctrl/Cmd+click on a link href or inline-code path opens it in the file
+  // viewer; plain clicks keep their default behavior (no-op for the handler).
+  const handleModifierPathClick = useModifierPathOpen(tabId);
 
   const nextHeadingId = () => {
     const id = outline[renderedHeadingIndex]?.id;
@@ -138,7 +125,15 @@ export default function MarkdownRenderer({ content, tabId }: Props) {
               <p className="text-gray-300 mb-3 leading-relaxed text-sm">{children}</p>
             ),
             a: ({ href, children }) => (
-              <a href={href} className="text-accent-blue hover:text-accent-blue/80 underline underline-offset-2">
+              <a
+                href={href}
+                onClick={(e) => {
+                  // Modifier-click on a file-path-looking href opens it in
+                  // the viewer; otherwise fall through to default behavior.
+                  if (href) handleModifierPathClick(e, href);
+                }}
+                className="text-accent-blue hover:text-accent-blue/80 underline underline-offset-2"
+              >
                 {children}
               </a>
             ),
@@ -175,8 +170,12 @@ export default function MarkdownRenderer({ content, tabId }: Props) {
               const match = /language-(\w+)/.exec(className || '');
               const inline = !className;
               if (inline) {
+                const codeText = Array.isArray(children) ? children.join('') : String(children ?? '');
                 return (
-                  <code className={`px-1.5 py-0.5 rounded text-[13px] font-sans ${isLight ? 'bg-[#e5e7eb] text-[#ab3f11]' : 'bg-surface-2 text-accent-orange'}`}>
+                  <code
+                    onClick={(e) => handleModifierPathClick(e, codeText)}
+                    className={`px-1.5 py-0.5 rounded text-[13px] font-sans ${isLight ? 'bg-[#e5e7eb] text-[#ab3f11]' : 'bg-surface-2 text-accent-orange'}`}
+                  >
                     {children}
                   </code>
                 );

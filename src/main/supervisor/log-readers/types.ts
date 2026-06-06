@@ -74,49 +74,136 @@ export function truncateForChat(text: string): { content: string; truncated: boo
   return { content: sliced, truncated: true };
 }
 
+// ── Home-dir resolution (Windows host + WSL) ──────────────────────────
+//
+// WSL discovery used to run once per reader constructor and cache `null`
+// forever when it failed. A cold WSL VM at app startup (the boot can exceed
+// the 5 s `wsl.exe` timeout, and the `\\wsl.localhost` share isn't mounted
+// until the VM is up) therefore permanently disabled chat/log attach for
+// every WSL-workspace agent until an app restart. The resolver below is
+// shared across all readers, lazy, and self-healing: a failed attempt is
+// retried — throttled to once per `WSL_RESOLVE_RETRY_MS` so polls never
+// stack synchronous `wsl.exe` spawns on the Electron main process — the
+// next time any caller asks, so chat attaches as soon as WSL is reachable.
+
+export const WSL_RESOLVE_RETRY_MS = 30_000;
+
+/** Discover the Windows-visible UNC form of the WSL `$HOME` (e.g.
+ *  `\\wsl.localhost\Ubuntu\home\me`). Returns null when WSL is unavailable. */
+export type WslHomeDiscoverer = () => string | null;
+
+function defaultDiscoverWslUncHome(): string | null {
+  try {
+    // `wslpath -w` asks WSL itself for the UNC form, so the distro name and
+    // UNC host (`wsl.localhost` vs legacy `wsl$`) are no longer hardcoded.
+    // The `|| echo "##$HOME"` arm covers ancient WSL builds without wslpath:
+    // we then fall back to constructing the legacy hardcoded-Ubuntu UNC.
+    const out = execFileSync(
+      'wsl.exe',
+      ['bash', '-lc', 'wslpath -w "$HOME" 2>/dev/null || echo "##$HOME"'],
+      { encoding: 'utf-8', timeout: 5000, windowsHide: true },
+    ).trim();
+    if (out.startsWith('\\\\')) return out.replace(/[\\/]+$/, '');
+    if (out.startsWith('##') && out.length > 2) {
+      return `\\\\wsl.localhost\\Ubuntu${out.slice(2).replace(/\//g, '\\')}`;
+    }
+  } catch {
+    // WSL not available (or a cold boot exceeded the timeout) — retry later.
+  }
+  return null;
+}
+
+let discoverWslUncHome: WslHomeDiscoverer = defaultDiscoverWslUncHome;
+let wslUncHome: string | null = null;
+let wslHomeLastAttemptMs = 0;
+let wslHomeWarned = false;
+const wslSubdirCache = new Map<string, { dir: string | null; lastAttemptMs: number }>();
+
+/** Test hook: swap the `wsl.exe` discovery and reset all cached/throttle
+ *  state. Pass null to restore the default discoverer. */
+export function __setWslHomeDiscovererForTest(fn: WslHomeDiscoverer | null): void {
+  discoverWslUncHome = fn ?? defaultDiscoverWslUncHome;
+  wslUncHome = null;
+  wslHomeLastAttemptMs = 0;
+  wslHomeWarned = false;
+  wslSubdirCache.clear();
+}
+
+function resolveWslUncHome(): string | null {
+  if (wslUncHome) return wslUncHome;
+  const now = Date.now();
+  if (wslHomeLastAttemptMs && now - wslHomeLastAttemptMs < WSL_RESOLVE_RETRY_MS) return null;
+  wslHomeLastAttemptMs = now;
+  wslUncHome = discoverWslUncHome();
+  if (!wslUncHome && !wslHomeWarned) {
+    wslHomeWarned = true;
+    console.warn(
+      `[log-readers] WSL home discovery failed — retrying every ${WSL_RESOLVE_RETRY_MS / 1000}s until WSL is reachable`,
+    );
+  } else if (wslUncHome && wslHomeWarned) {
+    console.log(`[log-readers] WSL home discovered after earlier failure: ${wslUncHome}`);
+  }
+  return wslUncHome;
+}
+
+/**
+ * Lazily resolve `~/<subpath>` inside WSL as a Windows UNC dir
+ * (e.g. `.claude/projects` → `\\wsl.localhost\Ubuntu\home\me\.claude\projects`).
+ *
+ * Returns null while WSL (or the dir) is unavailable; later calls retry,
+ * throttled per subpath. A successful resolution is cached for the process
+ * lifetime.
+ */
+export function resolveWslHomeSubdir(subpath: string): string | null {
+  const cached = wslSubdirCache.get(subpath);
+  if (cached?.dir) return cached.dir;
+  const now = Date.now();
+  if (cached && now - cached.lastAttemptMs < WSL_RESOLVE_RETRY_MS) return null;
+  const entry = { dir: null as string | null, lastAttemptMs: now };
+  wslSubdirCache.set(subpath, entry);
+  const home = resolveWslUncHome();
+  if (home) {
+    const candidate = `${home}\\${subpath.split('/').filter(Boolean).join('\\')}`;
+    try {
+      if (fs.existsSync(candidate)) entry.dir = candidate;
+    } catch {
+      // unreachable share — retry on a later call
+    }
+  }
+  return entry.dir;
+}
+
+/** Resolve `~/<subpath>` under the Windows `USERPROFILE`. Null when missing
+ *  (cheap local check — callers may simply re-ask). */
+export function resolveWindowsHomeSubdir(subpath: string): string | null {
+  const userProfile = process.env.USERPROFILE || '';
+  if (!userProfile) return null;
+  const candidate = path.join(userProfile, ...subpath.split('/').filter(Boolean));
+  return fs.existsSync(candidate) ? candidate : null;
+}
+
 /**
  * Resolve a per-home subdirectory across both Windows host and WSL.
  *
- * Returns `{windowsDir, wslUncDir}` — either may be null if the dir doesn't exist
- * on that side. WSL home is discovered via `wsl.exe bash -lc 'echo $HOME'`.
+ * Returns `{windowsDir, wslUncDir}` — either may be null if the dir doesn't
+ * exist on that side. The WSL side delegates to the lazy/self-healing
+ * resolver above, so repeated calls are cheap and a transient WSL outage at
+ * one call site doesn't poison later ones.
  *
  * Example:
  *   resolveHomeSubdir('.codex/sessions')
  *     → { windowsDir: 'C:\\Users\\me\\.codex\\sessions',
  *         wslUncDir:  '\\\\wsl.localhost\\Ubuntu\\home\\me\\.codex\\sessions' }
  *
- * `subpath` is a forward-slash relative path under `~`. Both segments are joined
- * with the platform-appropriate separator.
+ * `subpath` is a forward-slash relative path under `~`. Both segments are
+ * joined with the platform-appropriate separator.
  */
 export function resolveHomeSubdir(subpath: string): {
   windowsDir: string | null;
   wslUncDir: string | null;
 } {
-  const segments = subpath.split('/').filter(Boolean);
-
-  let windowsDir: string | null = null;
-  const userProfile = process.env.USERPROFILE || '';
-  if (userProfile) {
-    const candidate = path.join(userProfile, ...segments);
-    if (fs.existsSync(candidate)) windowsDir = candidate;
-  }
-
-  let wslUncDir: string | null = null;
-  try {
-    const home = execFileSync('wsl.exe', ['bash', '-lc', 'echo $HOME'], {
-      encoding: 'utf-8',
-      timeout: 5000,
-      windowsHide: true,
-    }).trim();
-    if (home) {
-      const homeBackslashed = home.replace(/\//g, '\\');
-      const subBackslashed = segments.join('\\');
-      const candidate = `\\\\wsl.localhost\\Ubuntu${homeBackslashed}\\${subBackslashed}`;
-      if (fs.existsSync(candidate)) wslUncDir = candidate;
-    }
-  } catch {
-    // WSL not available
-  }
-
-  return { windowsDir, wslUncDir };
+  return {
+    windowsDir: resolveWindowsHomeSubdir(subpath),
+    wslUncDir: resolveWslHomeSubdir(subpath),
+  };
 }

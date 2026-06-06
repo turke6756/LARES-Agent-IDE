@@ -6,6 +6,7 @@ import DetailPanel from './components/layout/DetailPanel';
 import TerminalPanel from './components/terminal/TerminalPanel';
 import ResizeDivider from './components/layout/ResizeDivider';
 import { useResize } from './hooks/useResize';
+import { openExternalFileTab } from './components/fileviewer/openFileHelpers';
 
 // Error boundary to catch React render crashes and show the error instead of white screen
 class ErrorBoundary extends Component<{ children: ReactNode }, { error: Error | null }> {
@@ -75,11 +76,19 @@ function AppInner() {
       useDashboardStore.getState().addTeamMessage(message);
     });
 
+    // Agent-initiated "open this file for the user" (open_file_in_view MCP
+    // tool → main → file:open-tab). Lives here, not in FileViewerPanel,
+    // because the panel unmounts whenever the viewer is closed.
+    const unsubOpenFileTab = window.api.onOpenFileTab((payload) => {
+      openExternalFileTab(payload);
+    });
+
     return () => {
       unsubStatus();
       unsubContext();
       unsubTeam();
       unsubTeamMsg();
+      unsubOpenFileTab();
     };
   }, []);
 

@@ -163,24 +163,75 @@ test('BUG-20: falls back to logTail when lastAssistantMessage is empty/whitespac
   }
 });
 
-test('BUG-20: lastAssistantMessage truncated past 10 lines with ellipsis marker', () => {
-  const msg = Array.from({ length: 25 }, (_, i) => `line ${i + 1}`).join('\n');
+// ── Turn-end full output: working → idle carries the whole message ──────
+
+test('turn-end: working → idle renders the FULL message past 10 lines (no preview cap)', () => {
+  // The worker's closing ask lives at the END of its last message — the old
+  // head-truncation cut it off. working → idle must deliver everything.
+  const msg = Array.from({ length: 25 }, (_, i) => `line ${i + 1}`).join('\n')
+    + '\nShould I commit this, or do you want to review first?';
   const payload = buildEventPayload(baseStatusEvent({ lastAssistantMessage: msg }));
+  assert.match(payload, /> line 1\n/, 'first line kept');
+  assert.match(payload, /> line 25\n/, '25th line kept (beyond old 10-line cap)');
+  assert.match(
+    payload,
+    /> Should I commit this, or do you want to review first\?/,
+    'closing question survives',
+  );
+  assert.doesNotMatch(payload, /\n> …$/, 'no truncation marker on full render');
+});
+
+test('turn-end: safety ceiling truncates the MIDDLE, head and tail both survive', () => {
+  const head = 'HEADLINE: patch summary follows.';
+  const tail = 'FINAL ASK: apply to staging now or review the SQL first?';
+  const msg = head + '\n' + 'B'.repeat(20000) + '\n' + tail;
+  const payload = buildEventPayload(baseStatusEvent({ lastAssistantMessage: msg }));
+  assert.match(payload, /> HEADLINE: patch summary follows\./, 'head survives');
+  assert.match(
+    payload,
+    /> FINAL ASK: apply to staging now or review the SQL first\?/,
+    'tail (the ask) survives',
+  );
+  assert.match(payload, /chars omitted/, 'middle-omission marker present');
+  const block = payload.split('Last output:\n')[1] ?? '';
+  const bCount = (block.match(/B/g) ?? []).length;
+  assert.ok(bCount < 6000, `filler bounded by safety ceiling, got ${bCount}`);
+});
+
+test('non-turn-end: compact preview caps still apply (crashed keeps 10 lines)', () => {
+  const msg = Array.from({ length: 25 }, (_, i) => `line ${i + 1}`).join('\n');
+  const payload = buildEventPayload(baseStatusEvent({
+    toStatus: 'crashed',
+    lastAssistantMessage: msg,
+  }));
   assert.match(payload, /> line 1\n/, 'first line kept');
   assert.match(payload, /> line 10\n/, '10th line kept');
   assert.equal(payload.indexOf('> line 11'), -1, '11th line dropped');
   assert.match(payload, /\n> …/, 'truncation marker present');
 });
 
-test('BUG-20: lastAssistantMessage truncated past 800 chars', () => {
+test('non-turn-end: compact preview caps still apply (crashed keeps 800 chars)', () => {
   const msg = 'A'.repeat(2000); // single long line
-  const payload = buildEventPayload(baseStatusEvent({ lastAssistantMessage: msg }));
+  const payload = buildEventPayload(baseStatusEvent({
+    toStatus: 'crashed',
+    lastAssistantMessage: msg,
+  }));
   // body lines under "Last output:" should hold at most ~800 chars of As.
   const block = payload.split('Last output:\n')[1] ?? '';
   const aCount = (block.match(/A/g) ?? []).length;
-  assert.ok(aCount <= 800, `BUG-20: chars capped at 800, got ${aCount}`);
-  assert.ok(aCount >= 700, `BUG-20: capped near 800, not below; got ${aCount}`);
-  assert.match(payload, /> …/, 'BUG-20: truncation marker present');
+  assert.ok(aCount <= 800, `chars capped at 800, got ${aCount}`);
+  assert.ok(aCount >= 700, `capped near 800, not below; got ${aCount}`);
+  assert.match(payload, /> …/, 'truncation marker present');
+});
+
+test('non-turn-end: waiting → idle keeps the compact preview', () => {
+  const msg = Array.from({ length: 25 }, (_, i) => `line ${i + 1}`).join('\n');
+  const payload = buildEventPayload(baseStatusEvent({
+    fromStatus: 'waiting',
+    lastAssistantMessage: msg,
+  }));
+  assert.equal(payload.indexOf('> line 11'), -1, '11th line dropped for waiting → idle');
+  assert.match(payload, /\n> …/, 'truncation marker present');
 });
 
 test('BUG-20: filesTouched section renders one row per file', () => {

@@ -1,12 +1,44 @@
 import React, { useState, useCallback, useRef, useEffect } from 'react';
 import type { DirectoryEntry, PathType } from '../../../shared/types';
-import FileContextMenu from '../shared/FileContextMenu';
+import FileContextMenu, { type TreeSortMode } from '../shared/FileContextMenu';
 import * as Icons from 'lucide-react';
 import FileIcon from './FileIcon';
 import { treeEntryDragStart, TREE_ENTRY_MIME } from '../../utils/drag-file';
-import { applyFsEvent } from './applyFsEvent';
 import { useDashboardStore } from '../../stores/dashboard-store';
 import type { PromptName } from '../../hooks/useNamePrompt';
+
+/** Re-order a name-sorted listing for the tree's active sort mode.
+ *  Directories always stay grouped before files. */
+export function sortEntries(entries: DirectoryEntry[], mode: TreeSortMode): DirectoryEntry[] {
+  if (mode === 'name') return entries; // main process already sorts dirs-first, alpha
+  const sorted = [...entries];
+  sorted.sort((a, b) => {
+    if (a.isDirectory !== b.isDirectory) return a.isDirectory ? -1 : 1;
+    const aTime = (mode === 'modified' ? a.mtimeMs : a.birthtimeMs) ?? 0;
+    const bTime = (mode === 'modified' ? b.mtimeMs : b.birthtimeMs) ?? 0;
+    if (aTime !== bTime) return bTime - aTime; // newest first
+    return a.name.localeCompare(b.name, undefined, { sensitivity: 'base' });
+  });
+  return sorted;
+}
+
+function formatCompactTime(ms: number | undefined): string | null {
+  if (!ms) return null;
+  const diff = Date.now() - ms;
+  if (diff < 60_000) return 'now';
+  const mins = Math.floor(diff / 60_000);
+  if (mins < 60) return `${mins}m`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h`;
+  const days = Math.floor(hours / 24);
+  if (days < 365) return `${days}d`;
+  return `${Math.floor(days / 365)}y`;
+}
+
+/** Debounce window for re-listing a directory after fs watch events.
+ *  Events are already batched ~50ms in the main process; this coalesces
+ *  bursts (e.g. an agent writing many files) into a single re-list. */
+export const FS_RELIST_DEBOUNCE_MS = 150;
 
 interface Props {
   entry: DirectoryEntry;
@@ -14,6 +46,8 @@ interface Props {
   activeFilePath: string | null;
   pathType: PathType;
   workingDirectory: string;
+  sortMode: TreeSortMode;
+  onSortModeChange: (mode: TreeSortMode) => void;
   onFileSelect: (filePath: string) => void;
   loadChildren: (dirPath: string) => Promise<DirectoryEntry[]>;
   onTreeChanged: (dirPath: string) => void;
@@ -38,6 +72,8 @@ function DirectoryTreeNode({
   activeFilePath,
   pathType,
   workingDirectory,
+  sortMode,
+  onSortModeChange,
   onFileSelect,
   loadChildren,
   onTreeChanged,
@@ -59,12 +95,20 @@ function DirectoryTreeNode({
   const handleClick = useCallback(() => {
     if (entry.isDirectory) {
       // Directories: toggle immediately, no debounce
-      if (!expanded && children === null) {
-        setLoading(true);
-        loadChildren(entry.path).then((items) => {
-          setChildren(items);
-          setLoading(false);
-        });
+      if (!expanded) {
+        if (children === null) {
+          setLoading(true);
+          loadChildren(entry.path).then((items) => {
+            setChildren(items);
+            setLoading(false);
+          });
+        } else {
+          // Children can be stale: the watch subscription is only active
+          // while expanded, so anything created while collapsed was missed.
+          // Refresh in the background (old children stay visible meanwhile).
+          onTreeChanged(entry.path);
+          loadChildren(entry.path).then(setChildren);
+        }
       }
       setExpanded(!expanded);
       return;
@@ -80,7 +124,7 @@ function DirectoryTreeNode({
       clickTimer.current = null;
       onFileSelect(entry.path);
     }, 250);
-  }, [entry, expanded, children, onFileSelect, loadChildren]);
+  }, [entry, expanded, children, onFileSelect, loadChildren, onTreeChanged]);
 
   const handleDoubleClick = useCallback(() => {
     if (entry.isDirectory) return;
@@ -94,11 +138,26 @@ function DirectoryTreeNode({
   const childrenLoaded = children !== null;
   useEffect(() => {
     if (!entry.isDirectory || !expanded || !childrenLoaded) return;
-    const unsub = window.api.files.watchDirectory(entry.path, pathType, (event) => {
-      setChildren((prev) => (prev ? applyFsEvent(prev, event) : prev));
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let cancelled = false;
+    // Re-list on any watch event instead of patching entries in place: a
+    // fresh listing carries timestamps for new files and keeps the shared
+    // directory cache in DirectoryTree consistent with what is displayed.
+    const unsub = window.api.files.watchDirectory(entry.path, pathType, () => {
+      if (timer !== null) return;
+      timer = setTimeout(async () => {
+        timer = null;
+        onTreeChanged(entry.path); // invalidate cache before re-listing
+        const items = await loadChildren(entry.path);
+        if (!cancelled) setChildren(items);
+      }, FS_RELIST_DEBOUNCE_MS);
     });
-    return unsub;
-  }, [entry.isDirectory, entry.path, pathType, expanded, childrenLoaded]);
+    return () => {
+      cancelled = true;
+      if (timer !== null) clearTimeout(timer);
+      unsub();
+    };
+  }, [entry.isDirectory, entry.path, pathType, expanded, childrenLoaded, loadChildren, onTreeChanged]);
 
   const handleContextMenu = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
@@ -251,6 +310,9 @@ function DirectoryTreeNode({
 
   const ChevronIcon = expanded ? Icons.ChevronDown : Icons.ChevronRight;
 
+  const timeMs = sortMode === 'created' ? entry.birthtimeMs : entry.mtimeMs;
+  const timeLabel = formatCompactTime(timeMs);
+
   return (
     <div>
       <button
@@ -291,10 +353,19 @@ function DirectoryTreeNode({
         <span className="truncate">
           {entry.name}
         </span>
+        {timeLabel && (
+          <span
+            className="ml-auto shrink-0 pl-2 text-[10px] tabular-nums opacity-0 group-hover:opacity-100"
+            style={{ color: 'var(--color-fg-secondary)', opacity: sortMode !== 'name' ? 0.8 : undefined }}
+            title={new Date(timeMs!).toLocaleString()}
+          >
+            {timeLabel}
+          </span>
+        )}
       </button>
       {expanded && children && (
         <div className="border-l border-white/5 ml-[14px]">
-          {children.map((child) => (
+          {sortEntries(children, sortMode).map((child) => (
             <DirectoryTreeNode
               key={child.path}
               entry={child}
@@ -302,6 +373,8 @@ function DirectoryTreeNode({
               activeFilePath={activeFilePath}
               pathType={pathType}
               workingDirectory={workingDirectory}
+              sortMode={sortMode}
+              onSortModeChange={onSortModeChange}
               onFileSelect={onFileSelect}
               loadChildren={loadChildren}
               onTreeChanged={onTreeChanged}
@@ -328,6 +401,8 @@ function DirectoryTreeNode({
           onCreateFolder={createFolderInDirectory}
           onRename={renameCurrentEntry}
           onDelete={deleteCurrentEntry}
+          sortMode={sortMode}
+          onSortModeChange={onSortModeChange}
         />
       )}
     </div>

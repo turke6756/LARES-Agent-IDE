@@ -25,15 +25,24 @@ function parseWslDirectoryEntries(raw: string, wslPath: string): DirectoryEntry[
   const entries: DirectoryEntry[] = [];
   for (const line of raw.trim().split('\n')) {
     if (!line) continue;
-    const [type, sizeStr, name] = line.split('\t');
+    const parts = line.split('\t');
+    if (parts.length < 5) continue;
+    const [type, sizeStr, mtimeStr, ctimeStr] = parts;
+    const name = parts.slice(4).join('\t');
     if (!name) continue;
     const isDirectory = type === 'd';
     const entryPath = wslPath.endsWith('/') ? `${wslPath}${name}` : `${wslPath}/${name}`;
+    const mtimeMs = Math.round(parseFloat(mtimeStr) * 1000);
+    const ctimeMs = Math.round(parseFloat(ctimeStr) * 1000);
     entries.push({
       name,
       path: entryPath,
       isDirectory,
       size: parseInt(sizeStr, 10) || 0,
+      mtimeMs: Number.isFinite(mtimeMs) ? mtimeMs : undefined,
+      // find(1) cannot print birth time; status-change time equals creation
+      // time for freshly created files, which is what the UI sorts by.
+      birthtimeMs: Number.isFinite(ctimeMs) ? ctimeMs : undefined,
     });
   }
   return entries;
@@ -44,16 +53,23 @@ function listWindowsDirectoryEntries(dirPath: string): DirectoryEntry[] {
   const entries: DirectoryEntry[] = items.map((item) => {
     const fullPath = path.join(dirPath, item.name);
     let size = 0;
+    let mtimeMs: number | undefined;
+    let birthtimeMs: number | undefined;
     try {
+      const stat = fs.statSync(fullPath);
       if (!item.isDirectory()) {
-        size = fs.statSync(fullPath).size;
+        size = stat.size;
       }
+      mtimeMs = stat.mtimeMs;
+      birthtimeMs = stat.birthtimeMs;
     } catch { /* skip */ }
     return {
       name: item.name,
       path: fullPath,
       isDirectory: item.isDirectory(),
       size,
+      mtimeMs,
+      birthtimeMs,
     };
   });
   // Dirs first, then alpha
@@ -116,7 +132,7 @@ export async function listDirectoryEntriesAsync(dirPath: string, pathType: PathT
 
   const wslPath = sanitizePath(ensureWslPath(dirPath, pathType));
   const result = await wslExecCommand(
-    `find ${shellQuote(wslPath)} -maxdepth 1 -mindepth 1 -printf '%y\\t%s\\t%f\\n' 2>/dev/null | sort -t$'\\t' -k1,1r -k3,3f`,
+    `find ${shellQuote(wslPath)} -maxdepth 1 -mindepth 1 -printf '%y\\t%s\\t%T@\\t%C@\\t%f\\n' 2>/dev/null | sort -t$'\\t' -k1,1r -k5,5f`,
     { timeout: WSL_TIMEOUT, throwOnError: true, trimOutput: false }
   );
   return parseWslDirectoryEntries(result.stdout, wslPath);

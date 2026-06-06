@@ -3,14 +3,17 @@ import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { vscDarkPlus, vs } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import SymbolOutline from './SymbolOutline';
 import { useThemeStore } from '../../stores/theme-store';
+import { useTabScrollMemory } from './scrollMemory';
 
 interface Props {
   content: string;
   language: string;
+  tabId?: string;
 }
 
-export default function CodeRenderer({ content, language }: Props) {
+export default function CodeRenderer({ content, language, tabId }: Props) {
   const scrollRef = useRef<HTMLDivElement>(null);
+  const handleScroll = useTabScrollMemory(tabId, scrollRef);
   const theme = useThemeStore((s) => s.theme);
   const isLight = theme === 'light';
 
@@ -27,7 +30,7 @@ export default function CodeRenderer({ content, language }: Props) {
 
   return (
     <div className="flex h-full min-w-0">
-      <div className="flex-1 overflow-auto h-full scrollbar-thin" ref={scrollRef}>
+      <div className="flex-1 overflow-auto h-full scrollbar-thin" ref={scrollRef} onScroll={handleScroll}>
         <SyntaxHighlighter
           language={language}
           style={isLight ? vs : vscDarkPlus}

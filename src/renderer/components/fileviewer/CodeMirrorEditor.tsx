@@ -5,7 +5,7 @@ import { defaultKeymap, history, historyKeymap } from '@codemirror/commands';
 import { markdown } from '@codemirror/lang-markdown';
 import { oneDark } from '@codemirror/theme-one-dark';
 import { useThemeStore } from '../../stores/theme-store';
-import { getTabScrollFraction } from './scrollMemory';
+import { getTabScrollFraction, setTabScrollFraction } from './scrollMemory';
 
 interface Props {
   initialContent: string;
@@ -142,7 +142,32 @@ export default function CodeMirrorEditor({
     });
     view.focus();
 
+    // Keep the shared per-tab scroll memory in sync while editing, so
+    // switching tabs and coming back (in either edit or view mode) restores
+    // the same place. The scrollIntoView above gets the doc measured near the
+    // target; the rAF then snaps to the exact remembered fraction.
+    const scrollEl = view.scrollDOM;
+    const handleScroll = () => {
+      const tid = tabIdRef.current;
+      if (!tid) return;
+      const max = scrollEl.scrollHeight - scrollEl.clientHeight;
+      if (max <= 0) return;
+      setTabScrollFraction(tid, scrollEl.scrollTop / max);
+    };
+    let restoreFrame = 0;
+    if (fraction > 0) {
+      restoreFrame = requestAnimationFrame(() => {
+        const max = scrollEl.scrollHeight - scrollEl.clientHeight;
+        if (max > 0) scrollEl.scrollTop = max * fraction;
+        scrollEl.addEventListener('scroll', handleScroll);
+      });
+    } else {
+      scrollEl.addEventListener('scroll', handleScroll);
+    }
+
     return () => {
+      cancelAnimationFrame(restoreFrame);
+      scrollEl.removeEventListener('scroll', handleScroll);
       view.destroy();
       viewRef.current = null;
     };

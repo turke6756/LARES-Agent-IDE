@@ -198,32 +198,22 @@ test('Windows supervised Claude launch does NOT inject DASHBOARD_HOST (extraEnv 
 
 // ── dashboard-status.mjs failure-log behavior (T1-A) ──────────────────
 
-test('dashboard-status.mjs appends to pending-status.jsonl when fetch fails', async () => {
-  // Build a fake workspace tree:
-  //   <workspace>/.dashboard/scripts/dashboard-status.mjs   ← real script
-  //   <workspace>/.dashboard/pending-status.jsonl           ← written on failure
+test('dashboard-status.mjs (v7) spools to pending-status.jsonl when fetch fails', async () => {
+  // Build a fake workspace tree from the BUNDLED script constant (not the
+  // repo's on-disk scaffold copy, which lags until the workspace rescaffolds):
+  //   <workspace>/.dashboard/scripts/dashboard-status.mjs   ← v7 script
+  //   <workspace>/.dashboard/pending-status.jsonl           ← spool (always-write)
+  // No DASHBOARD_SPOOL_PATH in env → exercises the script-relative fallback.
   const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ad-status-fail-'));
   const scriptsDir = path.join(workspace, '.dashboard', 'scripts');
   fs.mkdirSync(scriptsDir, { recursive: true });
 
-  const repoScript = path.resolve(
-    __dirname, '..', '..', '..', '..', '..', '.dashboard', 'scripts', 'dashboard-status.mjs',
-  );
-  // tsc compiles this test into dist/main/main/supervisor/, so the repo
-  // root is five levels up from __dirname. Fall back to a search if the
-  // assumption changes — keeps the test from breaking on a directory move.
-  let srcPath = repoScript;
-  if (!fs.existsSync(srcPath)) {
-    let cur = __dirname;
-    for (let i = 0; i < 8; i++) {
-      const cand = path.join(cur, '.dashboard', 'scripts', 'dashboard-status.mjs');
-      if (fs.existsSync(cand)) { srcPath = cand; break; }
-      cur = path.dirname(cur);
-    }
-  }
-  assert.ok(fs.existsSync(srcPath), `could not locate dashboard-status.mjs (tried ${srcPath})`);
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { DASHBOARD_STATUS_SCRIPT_MJS } = require('../../shared/constants') as {
+    DASHBOARD_STATUS_SCRIPT_MJS: string;
+  };
   const destScript = path.join(scriptsDir, 'dashboard-status.mjs');
-  fs.copyFileSync(srcPath, destScript);
+  fs.writeFileSync(destScript, DASHBOARD_STATUS_SCRIPT_MJS, 'utf-8');
 
   const pendingLog = path.join(workspace, '.dashboard', 'pending-status.jsonl');
   assert.equal(fs.existsSync(pendingLog), false, 'precondition: pending-status.jsonl must not exist');
@@ -240,21 +230,21 @@ test('dashboard-status.mjs appends to pending-status.jsonl when fetch fails', as
     },
     encoding: 'utf-8',
     timeout: 10000,
+    stdio: ['ignore', 'pipe', 'pipe'], // closed stdin → no 300 ms stall
   });
   assert.equal(result.status, 0, `script must exit 0 even on failure; stderr=${result.stderr}`);
 
   try {
     assert.ok(fs.existsSync(pendingLog), `pending-status.jsonl must exist after failed POST (script stderr=${result.stderr})`);
     const lines = fs.readFileSync(pendingLog, 'utf-8').trim().split('\n').filter(Boolean);
-    assert.equal(lines.length, 1, `expected exactly one failure entry; got ${lines.length}`);
+    assert.equal(lines.length, 1, `expected exactly one spool record; got ${lines.length}`);
     const entry = JSON.parse(lines[0]);
+    assert.equal(entry.v, 1);
     assert.equal(entry.agentId, 'agent-failure-test');
-    assert.equal(entry.hookEvent, 'Stop');
-    assert.equal(entry.host, '127.0.0.1');
-    assert.equal(entry.port, '1');
+    assert.equal(entry.state, 'idle');
+    assert.equal(entry.source, 'hook-stop');
+    assert.equal(entry.hookEventName, 'Stop');
     assert.ok(typeof entry.ts === 'number' && entry.ts > 0, 'ts must be a positive number');
-    assert.ok(typeof entry.error === 'string' && entry.error.length > 0, 'error must be a non-empty string');
-    assert.match(entry.url, /^http:\/\/127\.0\.0\.1:1\/api\/agents\/agent-failure-test\/status$/);
   } finally {
     fs.rmSync(workspace, { recursive: true, force: true });
   }

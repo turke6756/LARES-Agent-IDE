@@ -132,7 +132,7 @@ const UserBubble = React.memo(function UserBubble({ text }: { text: string }) {
       <div
         className={`max-w-[88%] px-3 py-2 rounded-2xl rounded-tr-sm whitespace-pre-wrap break-words text-[13px] leading-[1.55] select-text cursor-text ${
           isLight
-            ? 'bg-[#007acc] text-white shadow-[0_1px_2px_rgba(0,0,0,0.08)]'
+            ? 'bg-[#d5e7fa] text-[#16395c] shadow-[0_1px_2px_rgba(72,60,38,0.10)]'
             : 'bg-[#1f6feb] text-white shadow-[0_1px_2px_rgba(0,0,0,0.3)]'
         }`}
       >
@@ -178,7 +178,7 @@ const ThinkingNote = React.memo(function ThinkingNote({ text }: { text: string }
       }`}
     >
       <span className="text-[10px] mt-[2px] select-none">✻</span>
-      <span className="whitespace-pre-wrap">{text}</span>
+      <span className="whitespace-pre-wrap break-words min-w-0">{text}</span>
     </div>
   );
 });
@@ -186,7 +186,7 @@ const ThinkingNote = React.memo(function ThinkingNote({ text }: { text: string }
 const SystemNote = React.memo(function SystemNote({ text }: { text: string }) {
   const isLight = useThemeStore((s) => s.theme) === 'light';
   return (
-    <div className={`my-1 text-[10px] font-mono whitespace-pre-wrap select-text cursor-text ${isLight ? 'text-[#8b949e]' : 'text-gray-600'}`}>
+    <div className={`my-1 text-[10px] font-mono whitespace-pre-wrap break-words select-text cursor-text ${isLight ? 'text-[#8b949e]' : 'text-gray-600'}`}>
       {text}
     </div>
   );
@@ -303,7 +303,7 @@ export default function ChatPane({ agentId, agentStatus, agentName, stagingOpen 
         <div
           ref={setScrollRef}
           onScroll={handleScroll}
-          className="absolute inset-0 overflow-y-auto px-3 pt-2 pb-3"
+          className="absolute inset-0 overflow-y-auto overflow-x-hidden px-3 pt-2 pb-3"
         >
           {empty ? (
             <div className={`h-full flex items-center justify-center px-6 ${isLight ? 'text-[#8b949e]' : 'text-gray-500'}`}>

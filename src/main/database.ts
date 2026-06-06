@@ -71,6 +71,19 @@ export function initDatabase(): void {
     )
   `);
 
+  // Migration: add sort_order column for manual workspace ordering (drag to
+  // reorder in the sidebar). Backfill NULLs in the legacy display order
+  // (last_opened_at DESC) so the migration doesn't visibly reshuffle the list.
+  try { db.exec(`ALTER TABLE workspaces ADD COLUMN sort_order INTEGER`); } catch { /* column already exists */ }
+  const unsorted = db.prepare(
+    `SELECT id FROM workspaces WHERE sort_order IS NULL ORDER BY last_opened_at DESC, created_at DESC`
+  ).all() as { id: string }[];
+  if (unsorted.length > 0) {
+    const maxRow = db.prepare(`SELECT COALESCE(MAX(sort_order), -1) AS max FROM workspaces`).get() as { max: number };
+    const setOrder = db.prepare(`UPDATE workspaces SET sort_order = ? WHERE id = ?`);
+    unsorted.forEach((row, i) => setOrder.run(maxRow.max + 1 + i, row.id));
+  }
+
   // Migration: add provider column to existing agents tables
   try { db.exec(`ALTER TABLE agents ADD COLUMN provider TEXT NOT NULL DEFAULT 'claude'`); } catch { /* column already exists */ }
 
@@ -195,6 +208,11 @@ export function initDatabase(): void {
   // resolves it; last_hook_event_at is the wall-clock ms of the last hook POST.
   try { db.exec(`ALTER TABLE agents ADD COLUMN hook_status TEXT NOT NULL DEFAULT 'unknown'`); } catch { /* exists */ }
   try { db.exec(`ALTER TABLE agents ADD COLUMN last_hook_event_at INTEGER`); } catch { /* exists */ }
+  // Migration: C1 synchronous-submit-confirmation failure surface
+  // (plans/global-hook-rollout-and-submit-confirmation.md §3.1). JSON blob
+  // `{message,ts}` or NULL; set when confirm-and-retry exhausts, cleared on a
+  // confirmed submit. Read projection only — never gates status.
+  try { db.exec(`ALTER TABLE agents ADD COLUMN last_send_error TEXT`); } catch { /* exists */ }
   // Migration: add is_worker to agent_templates (default 1 — worker is the
   // default lane for user-launched claude/codex agents).
   try { db.exec(`ALTER TABLE agent_templates ADD COLUMN is_worker INTEGER NOT NULL DEFAULT 1`); } catch { /* exists */ }
@@ -259,6 +277,19 @@ function rowToWorkspace(row: any): Workspace {
   };
 }
 
+/** C1 — decode the `last_send_error` JSON blob into the typed Agent field.
+ *  Tolerates legacy/garbage values by returning null (never throws on read). */
+function parseLastSendError(raw: unknown): Agent['lastSendError'] {
+  if (typeof raw !== 'string' || raw.length === 0) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed.message === 'string' && typeof parsed.ts === 'number') {
+      return { message: parsed.message, ts: parsed.ts };
+    }
+  } catch { /* fall through */ }
+  return null;
+}
+
 function rowToAgent(row: any): Agent {
   return {
     id: row.id,
@@ -278,6 +309,7 @@ function rowToAgent(row: any): Agent {
     status: row.status as AgentStatus,
     hookStatus: (row.hook_status || 'unknown') as Agent['hookStatus'],
     lastHookEventAt: row.last_hook_event_at ?? undefined,
+    lastSendError: parseLastSendError(row.last_send_error),
     isAttached: !!row.is_attached,
     restartCount: row.restart_count,
     lastExitCode: row.last_exit_code,
@@ -308,8 +340,8 @@ function run(sql: string, params: any[] = []): void {
 export function createWorkspace(input: CreateWorkspaceInput): Workspace {
   const id = uuidv4();
   run(
-    `INSERT INTO workspaces (id, title, path, path_type, description, default_command)
-     VALUES (?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO workspaces (id, title, path, path_type, description, default_command, sort_order)
+     VALUES (?, ?, ?, ?, ?, ?, (SELECT COALESCE(MAX(sort_order), -1) + 1 FROM workspaces))`,
     [id, input.title, input.path, input.pathType, input.description || '', input.defaultCommand || (input.pathType === 'wsl' ? DEFAULT_COMMAND_WSL : DEFAULT_COMMAND)]
   );
   return getWorkspace(id)!;
@@ -321,7 +353,20 @@ export function getWorkspace(id: string): Workspace | null {
 }
 
 export function getWorkspaces(): Workspace[] {
-  return queryAll('SELECT * FROM workspaces ORDER BY last_opened_at DESC, created_at DESC').map(rowToWorkspace);
+  // Manual order (drag to reorder in the sidebar); NULL sort_order sorts last
+  // as a safety net — initDatabase backfills it, so NULLs shouldn't persist.
+  return queryAll(
+    'SELECT * FROM workspaces ORDER BY (sort_order IS NULL), sort_order ASC, last_opened_at DESC, created_at DESC'
+  ).map(rowToWorkspace);
+}
+
+/** Persist a full manual ordering: ids[i] gets sort_order = i. */
+export function reorderWorkspaces(ids: string[]): void {
+  const setOrder = db.prepare(`UPDATE workspaces SET sort_order = ? WHERE id = ?`);
+  const tx = db.transaction((ordered: string[]) => {
+    ordered.forEach((id, i) => setOrder.run(i, id));
+  });
+  tx(ids);
 }
 
 export function deleteWorkspace(id: string): void {
@@ -410,6 +455,19 @@ export function updateAgentHookStatus(
       [hookStatus, id],
     );
   }
+}
+
+/** C1 — set or clear the synchronous-submit-confirmation failure surface.
+ *  Pass `null` to clear it (on a confirmed submit); pass `{message,ts}` when
+ *  confirm-and-retry exhausts. Mirrors the `updateAgentHookStatus` pattern. */
+export function updateAgentLastSendError(
+  id: string,
+  err: { message: string; ts: number } | null,
+): void {
+  run(
+    "UPDATE agents SET last_send_error = ?, updated_at = datetime('now') WHERE id = ?",
+    [err ? JSON.stringify(err) : null, id],
+  );
 }
 
 export function updateAgentPid(id: string, pid: number | null): void {

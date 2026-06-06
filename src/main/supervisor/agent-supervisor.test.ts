@@ -29,7 +29,7 @@
 //   node dist/main/main/supervisor/agent-supervisor.test.js
 
 import assert from 'node:assert/strict';
-import { AgentSupervisor } from './index';
+import { AgentSupervisor, SubmitNotConfirmedError } from './index';
 import { WindowsRunner } from './windows-runner';
 import { WslRunner } from './wsl-runner';
 import { makeAgent } from './test-helpers/fake-bridge-deps';
@@ -54,6 +54,7 @@ function patchDb(agentsMap: Map<string, Agent>): () => void {
   const keys = [
     'updateAgentStatus',
     'updateAgentHookStatus',
+    'updateAgentLastSendError',
     'updateAgentPid',
     'getAgent',
     'addEvent',
@@ -82,6 +83,13 @@ function patchDb(agentsMap: Map<string, Agent>): () => void {
       if (lastHookEventAt !== undefined) a.lastHookEventAt = lastHookEventAt;
     }
   };
+  db.updateAgentLastSendError = (
+    id: string,
+    err: { message: string; ts: number } | null,
+  ) => {
+    const a = agentsMap.get(id);
+    if (a) a.lastSendError = err;
+  };
   db.updateAgentPid = () => {};
   db.getAgent = (id: string) => agentsMap.get(id) ?? null;
   db.addEvent = () => {};
@@ -109,6 +117,11 @@ function setup(opts: {
   agent: Agent;
   injectRunner?: 'windows' | 'wsl' | 'none';
   alive?: boolean;
+  /** Stubbed result for the synchronous confirm-and-retry. Defaults to true
+   *  (confirmed) so seed-contract tests stay focused on the notify/forceWorking
+   *  side-effects; the real confirm mechanism is unit-tested in
+   *  status-monitor.test.ts. Set false to exercise the exhaustion/throw path. */
+  confirmResult?: boolean;
 }): Harness {
   const agentsMap = new Map<string, Agent>([[opts.agent.id, opts.agent]]);
   const restoreDb = patchDb(agentsMap);
@@ -161,9 +174,19 @@ function setup(opts: {
     // agent.status === 'waiting' (event-bridge.ts:351).
     realNotify(id);
   };
-  const monitor = (supervisor as unknown as { monitor: { forceWorking: (id: string, opts: { source: string }) => void } }).monitor;
+  const monitor = (supervisor as unknown as { monitor: {
+    forceWorking: (id: string, opts: { source: string }) => void;
+    confirmSubmission: (id: string, prior: number) => Promise<boolean>;
+  } }).monitor;
   monitor.forceWorking = (_id: string, fwOpts: { source: string }) => {
     calls.push(`forceWorking:${fwOpts.source}`);
+  };
+  // Stub the synchronous confirm-and-retry so seed-contract tests don't poll on
+  // the real wall-clock. Records the call so tests can assert whether the
+  // contract path engaged for a given provider/lane.
+  monitor.confirmSubmission = async (_id: string, _prior: number) => {
+    calls.push('confirmSubmission');
+    return opts.confirmResult !== false;
   };
 
   return {
@@ -393,9 +416,12 @@ test('Case 6: sendInput on dead WSL runner returns delivered=false and seeds no 
   });
   const h = setup({ agent, injectRunner: 'wsl', alive: false });
   try {
-    // sendInput resolves when _doSendInput resolves (regardless of delivered).
-    // The contract under test: no latch seed, regardless of submit=true.
-    await h.supervisor.sendInput(agent.id, 'hi', { submit: true });
+    // sendInput resolves when _doSendInput resolves (regardless of delivered),
+    // and threads the delivered boolean through the queue chain so callers
+    // that need delivery proof (sendInputConfirmed) can observe the failure.
+    // The contract under test: delivered=false + no latch seed.
+    const sendDelivered = await h.supervisor.sendInput(agent.id, 'hi', { submit: true });
+    assert.equal(sendDelivered, false, 'sendInput must resolve false when no runner accepted the bytes');
     assert.deepStrictEqual(seedCalls(h.calls), []);
 
     // Sanity: drive _doSendInput directly to assert the boolean contract.
@@ -633,9 +659,41 @@ test('Case 9: WSL resume with present session file → emits --resume (no fallba
   }
 });
 
-// ── Hook-health dispatch (HOOK_SYSTEM_DESIGN.md §B) ───────────────────
+// ── Hook-health dispatch (HOOK_SYSTEM_DESIGN.md §B), via the P1 central
+//    applier (plans/p1-hook-spool-multi-transport.md §2) ─────────────────
 
-test('Hook: forceIdleFromHook stamps hook_status=healthy + last_hook_event_at', () => {
+/** Build a fresh v7-shaped event record for the applier tests. */
+function hookEvent(
+  state: 'idle' | 'working' | 'active',
+  overrides: Partial<import('./index').ParsedHookEvent> = {},
+): import('./index').ParsedHookEvent {
+  const source = state === 'working' ? 'hook-start' : state === 'active' ? 'hook-session-start' : 'hook-stop';
+  const hookEventName = state === 'working' ? 'UserPromptSubmit' : state === 'active' ? 'SessionStart' : 'Stop';
+  return { v: 1, state, source, ts: Date.now(), hookEventName, ...overrides };
+}
+
+/** Capture the monitor's status-flip calls (forceIdle / string-overload
+ *  forceWorking) so dispatch + provenance can be asserted without driving
+ *  the full StatusMonitor write path. */
+function captureFlips(h: Harness): Array<{ flip: string; source: string }> {
+  const flips: Array<{ flip: string; source: string }> = [];
+  const monitor = (h.supervisor as unknown as {
+    monitor: {
+      forceIdle: (id: string, source: string) => void;
+      forceWorking: (id: string, optsOrSource: unknown) => void;
+    };
+  }).monitor;
+  monitor.forceIdle = (_id, source) => { flips.push({ flip: 'idle', source }); };
+  monitor.forceWorking = (_id, optsOrSource) => {
+    const source = typeof optsOrSource === 'string'
+      ? optsOrSource
+      : (optsOrSource as { source: string }).source;
+    flips.push({ flip: 'working', source });
+  };
+  return flips;
+}
+
+test('Hook: applied idle event stamps hook_status=healthy + last_hook_event_at', () => {
   const agent = makeAgent('hh-1', {
     provider: 'codex',
     status: 'idle',
@@ -646,7 +704,8 @@ test('Hook: forceIdleFromHook stamps hook_status=healthy + last_hook_event_at', 
   const h = setup({ agent, injectRunner: 'windows', alive: true });
   try {
     assert.equal(agent.hookStatus ?? 'unknown', 'unknown', 'precondition: hook_status unknown');
-    h.supervisor.forceIdleFromHook(agent.id, 'hook-stop');
+    const result = h.supervisor.applyHookStatusEvent(agent.id, hookEvent('idle'), 'http');
+    assert.equal(result, 'applied');
     assert.equal(agent.hookStatus, 'healthy', 'a Stop hook proves the scaffold loaded → healthy');
     assert.ok(typeof agent.lastHookEventAt === 'number' && agent.lastHookEventAt > 0, 'last_hook_event_at stamped');
   } finally {
@@ -654,7 +713,7 @@ test('Hook: forceIdleFromHook stamps hook_status=healthy + last_hook_event_at', 
   }
 });
 
-test('Hook: recordHookSessionStart stamps healthy but does NOT change status', () => {
+test('Hook: applied SessionStart (active) stamps healthy but does NOT change status', () => {
   // A SessionStart hook on a still-launching worker must update hook health
   // only. It must NOT promote launching→idle (that's the Stop hook's job).
   const agent = makeAgent('hh-2', {
@@ -666,13 +725,413 @@ test('Hook: recordHookSessionStart stamps healthy but does NOT change status', (
   });
   const h = setup({ agent, injectRunner: 'windows', alive: true });
   try {
-    h.supervisor.recordHookSessionStart(agent.id, 'hook-session-start');
+    const result = h.supervisor.applyHookStatusEvent(agent.id, hookEvent('active'), 'http');
+    assert.equal(result, 'applied');
     assert.equal(agent.status, 'launching', 'session-start must NOT change status');
     assert.equal(agent.hookStatus, 'healthy', 'session-start proves the scaffold loaded → healthy');
     assert.ok(
       !seedCalls(h.calls).some((c) => c.startsWith('forceWorking:')),
       `session-start must not flip the agent to working; got ${JSON.stringify(seedCalls(h.calls))}`,
     );
+  } finally {
+    h.cleanup();
+  }
+});
+
+// ── applyHookStatusEvent unit battery (P1 plan §5 E3) ──────────────────
+
+function monitorOf(h: Harness): {
+  getLastHookEventAt(id: string): number | undefined;
+  getLastStartHookEventAt(id: string): number | undefined;
+  recordHookCanary(id: string, ts?: number): void;
+  isHookCanaryArmed(id: string): boolean;
+} {
+  return (h.supervisor as unknown as { monitor: ReturnType<typeof monitorOf> }).monitor;
+}
+
+test('applyHookStatusEvent: validation rejections → invalid, no stamp, no flip', () => {
+  const agent = makeAgent('av-1', { provider: 'claude', status: 'idle', isWorker: true });
+  const h = setup({ agent, injectRunner: 'windows', alive: true });
+  const flips = captureFlips(h);
+  try {
+    // Mismatched self-reported agentId.
+    assert.equal(
+      h.supervisor.applyHookStatusEvent(agent.id, hookEvent('idle', { agentId: 'someone-else' }), 'http'),
+      'invalid');
+    // Non-finite ts.
+    assert.equal(
+      h.supervisor.applyHookStatusEvent(agent.id, hookEvent('idle', { ts: NaN }), 'http'),
+      'invalid');
+    // Unknown state.
+    assert.equal(
+      h.supervisor.applyHookStatusEvent(
+        agent.id, hookEvent('idle', { state: 'bogus' as 'idle' }), 'http'),
+      'invalid');
+    // Unknown agent.
+    assert.equal(
+      h.supervisor.applyHookStatusEvent('no-such-agent', hookEvent('idle'), 'http'),
+      'invalid');
+
+    assert.equal(monitorOf(h).getLastHookEventAt(agent.id), undefined, 'invalid events never stamp');
+    assert.equal(agent.hookStatus ?? 'unknown', 'unknown', 'invalid events never flip hook health');
+    assert.deepStrictEqual(flips, [], 'invalid events never dispatch a status flip');
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('applyHookStatusEvent: duplicate via a second transport does NOT advance hook-silence clocks (masking guard)', () => {
+  const agent = makeAgent('av-2', { provider: 'claude', status: 'idle', isWorker: true });
+  const h = setup({ agent, injectRunner: 'windows', alive: true });
+  const flips = captureFlips(h);
+  try {
+    const ev = hookEvent('working', { turnId: 't-1' });
+    assert.equal(h.supervisor.applyHookStatusEvent(agent.id, ev, 'http'), 'applied');
+    const stampedHook = monitorOf(h).getLastHookEventAt(agent.id);
+    const stampedStart = monitorOf(h).getLastStartHookEventAt(agent.id);
+    const stampedRow = agent.lastHookEventAt;
+    assert.ok(typeof stampedHook === 'number');
+    assert.ok(typeof stampedStart === 'number');
+    assert.equal(flips.length, 1);
+
+    // Same record arrives via the spool — identical key → duplicate, and the
+    // silence clocks must NOT refresh (a re-read must never become a fresh
+    // heartbeat that masks hook silence).
+    assert.equal(h.supervisor.applyHookStatusEvent(agent.id, { ...ev }, 'spool'), 'duplicate');
+    assert.equal(monitorOf(h).getLastHookEventAt(agent.id), stampedHook, 'lastHookEventAt unchanged on duplicate');
+    assert.equal(monitorOf(h).getLastStartHookEventAt(agent.id), stampedStart, 'lastStartHookEventAt unchanged on duplicate');
+    assert.equal(agent.lastHookEventAt, stampedRow, 'persisted last_hook_event_at unchanged on duplicate');
+    assert.equal(flips.length, 1, 'no second status flip on duplicate');
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('applyHookStatusEvent: duplicate with hook_status=unknown → healthy WITHOUT timestamp + canary disarm', () => {
+  const agent = makeAgent('av-3', { provider: 'claude', status: 'idle', isWorker: true });
+  const h = setup({ agent, injectRunner: 'windows', alive: true });
+  try {
+    const ev = hookEvent('idle', { turnId: 't-dup' });
+    assert.equal(h.supervisor.applyHookStatusEvent(agent.id, ev, 'http'), 'applied');
+    const stampedRow = agent.lastHookEventAt;
+
+    // Simulate the agent row losing its health verdict while the in-process
+    // dedupe registry still has the key (e.g. an external hook_status reset).
+    agent.hookStatus = 'unknown';
+    monitorOf(h).recordHookCanary(agent.id);
+
+    assert.equal(h.supervisor.applyHookStatusEvent(agent.id, { ...ev }, 'tmux-option'), 'duplicate');
+    assert.equal(agent.hookStatus, 'healthy',
+      'a duplicate is proof the scaffold loaded → healthy-when-unknown side effect');
+    assert.equal(agent.lastHookEventAt, stampedRow,
+      'healthy-when-unknown must NOT carry a timestamp (no heartbeat refresh)');
+    assert.equal(monitorOf(h).isHookCanaryArmed(agent.id), false, 'duplicate disarms the canary');
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('applyHookStatusEvent: applied events stamp with receivedAt (host clock), not event ts', () => {
+  const agent = makeAgent('av-4', { provider: 'claude', status: 'idle', isWorker: true });
+  const h = setup({ agent, injectRunner: 'windows', alive: true });
+  captureFlips(h);
+  try {
+    const skewedTs = Date.now() - 60_000; // event clock 1 min behind host
+    const before = Date.now();
+    assert.equal(
+      h.supervisor.applyHookStatusEvent(agent.id, hookEvent('working', { ts: skewedTs }), 'http'),
+      'applied');
+    const after = Date.now();
+    const stamped = monitorOf(h).getLastHookEventAt(agent.id)!;
+    assert.ok(stamped >= before && stamped <= after,
+      `stamp must be the applier's host clock (${before}..${after}); got ${stamped}`);
+    assert.notEqual(stamped, skewedTs, 'the event ts must never be the stamp');
+    const startStamped = monitorOf(h).getLastStartHookEventAt(agent.id)!;
+    assert.ok(startStamped >= before && startStamped <= after, 'start-hook stamp also uses receivedAt');
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('applyHookStatusEvent: ordering guard — older ts than an applied event → stale, no stamp advance', () => {
+  const agent = makeAgent('av-5', { provider: 'claude', status: 'idle', isWorker: true });
+  const h = setup({ agent, injectRunner: 'windows', alive: true });
+  const flips = captureFlips(h);
+  try {
+    const tNew = Date.now();
+    assert.equal(
+      h.supervisor.applyHookStatusEvent(agent.id, hookEvent('working', { ts: tNew, turnId: 'a' }), 'http'),
+      'applied');
+    const stamped = monitorOf(h).getLastHookEventAt(agent.id);
+
+    // A laggy spool read delivers an OLDER event (different key) — stale.
+    assert.equal(
+      h.supervisor.applyHookStatusEvent(agent.id, hookEvent('idle', { ts: tNew - 5_000, turnId: 'a' }), 'spool'),
+      'stale');
+    assert.equal(monitorOf(h).getLastHookEventAt(agent.id), stamped, 'stale events never advance the clocks');
+    assert.equal(flips.length, 1, 'stale events never flip status');
+
+    // Equal ts with a DIFFERENT key is allowed (arrival order).
+    assert.equal(
+      h.supervisor.applyHookStatusEvent(agent.id, hookEvent('idle', { ts: tNew, turnId: 'b' }), 'spool'),
+      'applied');
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('applyHookStatusEvent: transport→source mapping (http→original, spool→hook-spool, tmux→tmux-pane-option)', () => {
+  const agent = makeAgent('av-6', { provider: 'claude', status: 'idle', isWorker: true });
+  const h = setup({ agent, injectRunner: 'windows', alive: true });
+  const flips = captureFlips(h);
+  try {
+    const base = Date.now();
+    assert.equal(
+      h.supervisor.applyHookStatusEvent(agent.id, hookEvent('idle', { ts: base, turnId: '1' }), 'http'),
+      'applied');
+    assert.equal(
+      h.supervisor.applyHookStatusEvent(agent.id, hookEvent('idle', { ts: base + 1, turnId: '2' }), 'spool'),
+      'applied');
+    // ts well past the host-clock receivedAt the prior applies persisted to the
+    // agent row, so the tmux persisted-last-hook guard can't flake on ms timing.
+    assert.equal(
+      h.supervisor.applyHookStatusEvent(agent.id, hookEvent('idle', { ts: base + 60_000, turnId: '3' }), 'tmux-option'),
+      'applied');
+    assert.deepStrictEqual(flips.map((f) => f.source), [
+      'hook-stop',          // http keeps the ORIGINAL hook source (pre-P1 byte-identical)
+      'hook-spool',         // §5.1 source name for the spool channel
+      'tmux-pane-option',   // §5.1 source name for the tmux channel
+    ]);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('applyHookStatusEvent: legacy body bypasses dedupe/freshness/ordering', () => {
+  const agent = makeAgent('av-7', { provider: 'claude', status: 'idle', isWorker: true });
+  const h = setup({ agent, injectRunner: 'windows', alive: true });
+  const flips = captureFlips(h);
+  try {
+    const ev = hookEvent('idle', { legacy: true, turnId: undefined });
+    assert.equal(h.supervisor.applyHookStatusEvent(agent.id, ev, 'http'), 'applied');
+    // Identical legacy record again — NOT deduped (today's v≤6 behavior).
+    assert.equal(h.supervisor.applyHookStatusEvent(agent.id, { ...ev }, 'http'), 'applied');
+    assert.equal(flips.length, 2, 'legacy events always dispatch');
+  } finally {
+    h.cleanup();
+  }
+});
+
+// ── Tmux-option freshness gate (P1 plan §2 step 4a / §5 E3) ────────────
+
+test('tmux gate: restart-shaped failure — old option on a fresh process → stale, nothing stamped, canary stays armed', () => {
+  // Supervisor constructed fresh (empty dedupe/ordering maps — exactly the
+  // post-restart shape), agent live, persisted lastHookEventAt unset,
+  // hook_status unknown, canary armed. A valid-looking tmux-option event
+  // 11 min old must be rejected by the bounded-age gate.
+  const agent = makeAgent('tg-1', { provider: 'claude', status: 'idle', isWorker: true });
+  const h = setup({ agent, injectRunner: 'windows', alive: true });
+  const flips = captureFlips(h);
+  try {
+    monitorOf(h).recordHookCanary(agent.id);
+    const result = h.supervisor.applyHookStatusEvent(
+      agent.id, hookEvent('working', { ts: Date.now() - 11 * 60_000 }), 'tmux-option');
+    assert.equal(result, 'stale');
+    assert.deepStrictEqual(flips, [], 'status unflipped');
+    assert.equal(monitorOf(h).getLastHookEventAt(agent.id), undefined, 'lastHookEventAt unstamped');
+    assert.equal(agent.hookStatus ?? 'unknown', 'unknown', 'hook_status still unknown — stale proves nothing');
+    assert.equal(monitorOf(h).isHookCanaryArmed(agent.id), true, 'canary still armed');
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('tmux gate: persisted last-hook guard — option older than the agent row lastHookEventAt → stale', () => {
+  const T = Date.now() - 60_000; // last hook (persisted) 1 min ago
+  const agent = makeAgent('tg-2', {
+    provider: 'claude', status: 'idle', isWorker: true, lastHookEventAt: T,
+  });
+  const h = setup({ agent, injectRunner: 'windows', alive: true });
+  const flips = captureFlips(h);
+  try {
+    // Younger than the 10-min age bound but ≤ the persisted last hook → stale.
+    const result = h.supervisor.applyHookStatusEvent(
+      agent.id, hookEvent('idle', { ts: T - 5_000 }), 'tmux-option');
+    assert.equal(result, 'stale');
+    assert.deepStrictEqual(flips, []);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('tmux gate: current-launch guard — option predating the launch stamp → stale; newer → applied', () => {
+  const agent = makeAgent('tg-3', { provider: 'claude', status: 'idle', isWorker: true });
+  const h = setup({ agent, injectRunner: 'windows', alive: true });
+  const flips = captureFlips(h);
+  try {
+    const T = Date.now() - 30_000;
+    (h.supervisor as unknown as { launchStartedAt: Map<string, number> })
+      .launchStartedAt.set(agent.id, T);
+
+    // Clearly before the launch (beyond the 2 s skew tolerance) → stale.
+    assert.equal(
+      h.supervisor.applyHookStatusEvent(agent.id, hookEvent('idle', { ts: T - 5_000 }), 'tmux-option'),
+      'stale');
+    assert.deepStrictEqual(flips, []);
+
+    // After the launch, passing the other gates → applied.
+    assert.equal(
+      h.supervisor.applyHookStatusEvent(agent.id, hookEvent('idle', { ts: T + 5_000 }), 'tmux-option'),
+      'applied');
+    assert.deepStrictEqual(flips, [{ flip: 'idle', source: 'tmux-pane-option' }]);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('tmux gate: control — fresh option passing all three gates → applied with source tmux-pane-option', () => {
+  const agent = makeAgent('tg-4', { provider: 'claude', status: 'idle', isWorker: true });
+  const h = setup({ agent, injectRunner: 'windows', alive: true });
+  const flips = captureFlips(h);
+  try {
+    monitorOf(h).recordHookCanary(agent.id);
+    const result = h.supervisor.applyHookStatusEvent(
+      agent.id, hookEvent('idle', { ts: Date.now() }), 'tmux-option');
+    assert.equal(result, 'applied');
+    assert.deepStrictEqual(flips, [{ flip: 'idle', source: 'tmux-pane-option' }]);
+    assert.equal(agent.hookStatus, 'healthy');
+    assert.equal(monitorOf(h).isHookCanaryArmed(agent.id), false, 'applied event disarms the canary');
+  } finally {
+    h.cleanup();
+  }
+});
+
+// ── Submit confirmation contract (plan §1, C1, §SCOPE predicate) ───────
+
+test('usesSubmitConfirmation matrix: claude worker yes; broken no; codex needs observed start hook; gemini/non-worker no', () => {
+  const agent = makeAgent('uc-1', { provider: 'claude', isSupervised: true, status: 'idle' });
+  const h = setup({ agent, injectRunner: 'windows', alive: true });
+  try {
+    const sup = h.supervisor;
+    // Claude worker — contract (full throwing path).
+    assert.equal(sup.usesSubmitConfirmation(
+      makeAgent('c-ok', { provider: 'claude', isWorker: true })), true,
+      'claude worker uses the throwing contract');
+    // Claude with a broken scaffold — fall back, never throw on an agent that
+    // can't confirm.
+    assert.equal(sup.usesSubmitConfirmation(
+      makeAgent('c-broken', { provider: 'claude', isWorker: true, hookStatus: 'broken' })), false,
+      'claude with broken hook scaffold falls back (no throw)');
+    // Codex worker BEFORE any start hook observed — fall back (reactive resend).
+    const codex = makeAgent('cx-1', { provider: 'codex', isWorker: true });
+    assert.equal(sup.usesSubmitConfirmation(codex), false,
+      'codex without an observed start hook falls back to reactive resend');
+    // Codex worker AFTER its start hook fires for this launch — promote to contract.
+    const monitor = (sup as unknown as { monitor: { recordStartHookEventAt: (id: string, ts: number) => void } }).monitor;
+    monitor.recordStartHookEventAt(codex.id, 1234);
+    assert.equal(sup.usesSubmitConfirmation(codex), true,
+      'codex with an observed start hook uses the contract (Q6 self-test passed)');
+    // Gemini worker — no authoritative start marker → never contract (never throw).
+    assert.equal(sup.usesSubmitConfirmation(
+      makeAgent('g-1', { provider: 'gemini', isWorker: true })), false,
+      'gemini stays on the reactive/inference fallback — never throws');
+    // Non-worker claude — out of the worker lane entirely.
+    assert.equal(sup.usesSubmitConfirmation(
+      makeAgent('n-1', { provider: 'claude', isSupervised: false, isWorker: false })), false,
+      'non-worker agents do not use the submit-confirmation contract');
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('Case 10: confirm exhaustion on a contract claude worker throws + sets lastSendError; no notify', async () => {
+  const agent = makeAgent('cc-fail', {
+    provider: 'claude', status: 'idle', isWorker: true,
+    command: 'claude', workingDirectory: 'C:\\tmp',
+  });
+  const h = setup({ agent, injectRunner: 'windows', alive: true, confirmResult: false });
+  try {
+    await assert.rejects(
+      () => h.supervisor.sendInput(agent.id, 'hi', { submit: true }),
+      (err: unknown) => err instanceof SubmitNotConfirmedError && (err as SubmitNotConfirmedError).agentId === agent.id,
+      'exhausted confirm rejects with SubmitNotConfirmedError carrying the agent id',
+    );
+    assert.ok(h.calls.includes('confirmSubmission'), 'the contract path engaged');
+    assert.ok(agent.lastSendError && /Submit not confirmed/.test(agent.lastSendError.message),
+      `lastSendError persisted on exhaustion; got ${JSON.stringify(agent.lastSendError)}`);
+    assert.ok(typeof agent.lastSendError?.ts === 'number', 'lastSendError carries a ts');
+    assert.ok(!seedCalls(h.calls).includes('notifyUserInputDelivered'),
+      'a failed submit must not run the delivered-side-effects');
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('Case 11: confirmed submit on a contract claude worker clears a stale lastSendError', async () => {
+  const agent = makeAgent('cc-ok', {
+    provider: 'claude', status: 'idle', isWorker: true,
+    command: 'claude', workingDirectory: 'C:\\tmp',
+    lastSendError: { message: 'old failure', ts: 1 },
+  });
+  const h = setup({ agent, injectRunner: 'windows', alive: true, confirmResult: true });
+  try {
+    await h.supervisor.sendInput(agent.id, 'hi', { submit: true });
+    assert.ok(h.calls.includes('confirmSubmission'), 'the contract path engaged');
+    assert.equal(agent.lastSendError, null, 'a confirmed submit clears the stale lastSendError');
+    assert.ok(seedCalls(h.calls).includes('notifyUserInputDelivered'),
+      'a confirmed submit runs the delivered-side-effects');
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('Case 13 (FIX-3): recordInputDelivered is stamped BEFORE the synchronous confirm wait', async () => {
+  // `lastInputDeliveredAt` must be recorded the moment the body+Enter is
+  // written, NOT after `_doSendInput` resolves — `confirmSubmission` waits
+  // inside `_doSendInput` and the UserPromptSubmit hook lands DURING that
+  // wait, so a post-resolve stamp lands AFTER the observed hook timestamp and
+  // checkStartHookSilence reads a confirmed turn as a missed start hook.
+  const agent = makeAgent('cc-order', {
+    provider: 'claude', status: 'idle', isWorker: true,
+    command: 'claude', workingDirectory: 'C:\\tmp',
+  });
+  const h = setup({ agent, injectRunner: 'windows', alive: true, confirmResult: true });
+  const monitor = (h.supervisor as unknown as {
+    monitor: { recordInputDelivered: (id: string, ts?: number) => void };
+  }).monitor;
+  const realRecord = monitor.recordInputDelivered.bind(monitor);
+  monitor.recordInputDelivered = (id: string, ts?: number) => {
+    h.calls.push('recordInputDelivered');
+    realRecord(id, ts);
+  };
+  try {
+    await h.supervisor.sendInput(agent.id, 'hi', { submit: true });
+    const recordIdx = h.calls.indexOf('recordInputDelivered');
+    const confirmIdx = h.calls.indexOf('confirmSubmission');
+    assert.ok(recordIdx !== -1, `recordInputDelivered must fire; calls=${JSON.stringify(h.calls)}`);
+    assert.ok(confirmIdx !== -1, `the contract confirm path must engage; calls=${JSON.stringify(h.calls)}`);
+    assert.ok(
+      recordIdx < confirmIdx,
+      `lastInputDeliveredAt must be stamped before the confirm wait; calls=${JSON.stringify(h.calls)}`,
+    );
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('Case 12: gemini worker never enters the confirm path (no throw, normal delivery)', async () => {
+  const agent = makeAgent('g-worker', {
+    provider: 'gemini', status: 'idle', isWorker: true,
+    command: 'gemini', workingDirectory: 'C:\\tmp',
+  });
+  // confirmResult:false would throw IF the path engaged — it must NOT for gemini.
+  const h = setup({ agent, injectRunner: 'windows', alive: true, confirmResult: false });
+  try {
+    await h.supervisor.sendInput(agent.id, 'hi', { submit: true });
+    assert.ok(!h.calls.includes('confirmSubmission'),
+      'gemini must never reach the throwing confirm path');
+    assert.ok(seedCalls(h.calls).includes('notifyUserInputDelivered'),
+      'gemini delivery proceeds via the fallback lane');
   } finally {
     h.cleanup();
   }

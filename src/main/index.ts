@@ -1,5 +1,6 @@
-import { app, BrowserWindow, dialog, protocol, net, session, shell } from 'electron';
+import { app, BrowserWindow, dialog, protocol, net, session, shell, nativeTheme } from 'electron';
 import path from 'path';
+import { loadPersistedTheme } from './theme-persistence';
 import { initDatabase } from './database';
 import { AgentSupervisor } from './supervisor';
 import { registerIpcHandlers } from './ipc-handlers';
@@ -55,6 +56,9 @@ function createWindow(): void {
     ? path.join(process.resourcesPath, 'assets', 'icon.ico')
     : path.join(__dirname, '..', '..', '..', 'assets', 'icon.ico');
 
+  const theme = loadPersistedTheme();
+  nativeTheme.themeSource = theme;
+
   mainWindow = new BrowserWindow({
     width: 1400,
     height: 900,
@@ -63,7 +67,18 @@ function createWindow(): void {
     center: true,
     title: 'Agent Dashboard',
     icon: iconPath,
-    backgroundColor: '#0a0a0f',
+    // Hide the native title bar row ("Agent Dashboard") to reclaim vertical
+    // space. The min/max/close buttons float top-right via the overlay, and
+    // the menu bar (File / Edit / View / Help) becomes the top row.
+    titleBarStyle: 'hidden',
+    titleBarOverlay: {
+      color: theme === 'light' ? '#f7f5f0' : '#1e1e1e',
+      symbolColor: theme === 'light' ? '#1e1e1e' : '#f7f5f0',
+      height: 32,
+    },
+    // Match the renderer surface-0 per theme — avoids a dark flash when
+    // launching in light mode (and vice versa).
+    backgroundColor: theme === 'light' ? '#f7f5f0' : '#1e1e1e',
     webPreferences: {
       preload: path.join(__dirname, '..', 'preload', 'index.js'),
       nodeIntegration: false,

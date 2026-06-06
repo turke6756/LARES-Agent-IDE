@@ -369,7 +369,11 @@ async function BR_19_geminiTurnCompleteFiresForceIdle_postBug09(): Promise<void>
 
 async function onChatEvents_codexTurnComplete(): Promise<void> {
   const f = makeFakeBridgeDeps();
-  const codex = makeAgent('cx-1', { provider: 'codex', status: 'working' });
+  // Unsupervised: the chat stream is the working/idle source for this lane.
+  // Worker-lane (supervised/isWorker) claude/codex derive working/idle from
+  // hooks only (event-bridge.ts:193), so the chat-stream dispatch is exercised
+  // here on the lane that actually uses it.
+  const codex = makeAgent('cx-1', { provider: 'codex', status: 'working', isSupervised: false });
   f.agents.set(codex.id, codex);
   const bridge = new EventBridge(f.deps);
 
@@ -386,7 +390,9 @@ async function onChatEvents_codexTurnComplete(): Promise<void> {
 
 async function onChatEvents_dispatchTable(): Promise<void> {
   const f = makeFakeBridgeDeps();
-  const claude = makeAgent('cl-1', { provider: 'claude', status: 'working' });
+  // Unsupervised lane — see onChatEvents_codexTurnComplete. The event→force*
+  // dispatch table is bypassed for worker-lane claude/codex (hooks own status).
+  const claude = makeAgent('cl-1', { provider: 'claude', status: 'working', isSupervised: false });
   f.agents.set(claude.id, claude);
   const bridge = new EventBridge(f.deps);
 
@@ -487,7 +493,8 @@ async function onChatEvents_initialLoadSuppressesForceCalls(): Promise<void> {
 
 async function onChatEvents_secondBatchIsNotInitialLoad(): Promise<void> {
   const f = makeFakeBridgeDeps();
-  const claude = makeAgent('cl-il2', { provider: 'claude', status: 'idle' });
+  // Unsupervised lane — worker-lane claude/codex skip the chat-stream dispatch.
+  const claude = makeAgent('cl-il2', { provider: 'claude', status: 'idle', isSupervised: false });
   f.agents.set(claude.id, claude);
   const bridge = new EventBridge(f.deps);
 
@@ -642,6 +649,84 @@ async function BR_20_waitingToWorkingIsSuppressed(): Promise<void> {
   assert.equal(f.sendInputCalls.length, 1,
     'BR-20: waiting → working does NOT fire a notification (filtered)');
   console.log('  BR-20 ✓ waiting → working transition is filtered');
+}
+
+// ── launching → idle suppression ────────────────────────────────────────
+
+async function launchingToIdle_isSuppressed(): Promise<void> {
+  // launching → idle is launch-complete noise (agent booted, awaiting its
+  // first instruction) — the supervisor must NOT be notified. A later
+  // working → idle from the same agent is a real turn-end and must still
+  // deliver, proving the guard is transition-scoped, not status-scoped.
+  const f = makeFakeBridgeDeps();
+  const supervisor = makeAgent('sup-1', { isSupervisor: true, isSupervised: false, status: 'idle' });
+  const worker = makeAgent('w-l1', { status: 'launching' });
+  f.agents.set(supervisor.id, supervisor);
+  f.agents.set(worker.id, worker);
+  const bridge = new EventBridge(f.deps);
+
+  await bridge.onStatusChanged({
+    agentId: worker.id,
+    status: 'idle',
+    fromStatus: 'launching',
+    source: 'monitor',
+  });
+  assert.equal(f.sendInputCalls.length, 0,
+    'launching → idle must be suppressed (pure launch-complete noise)');
+  assert.equal(bridge.getQueueSnapshot().length, 0,
+    'launching → idle must not even be queued');
+
+  // The suppressed event must not have armed the per-agent cooldown either —
+  // a real working → idle shortly after launch still delivers.
+  worker.status = 'working';
+  await bridge.onStatusChanged({
+    agentId: worker.id,
+    status: 'idle',
+    fromStatus: 'working',
+    source: 'monitor',
+  });
+  assert.equal(f.sendInputCalls.length, 1,
+    'working → idle from the same agent still fires');
+  assert.ok(
+    f.sendInputCalls[0].text.includes('Status: working → idle'),
+    'delivered payload renders the working → idle transition',
+  );
+  console.log('  launching→idle ✓ suppressed; working→idle still fires');
+}
+
+async function launchingToOtherStatuses_stillFire(): Promise<void> {
+  // The guard is exactly (launching, idle) — launching → crashed (boot
+  // failure) and launching → waiting (trust prompt at startup) are real
+  // events the supervisor must hear about.
+  const f = makeFakeBridgeDeps();
+  const supervisor = makeAgent('sup-1', { isSupervisor: true, isSupervised: false, status: 'idle' });
+  const worker = makeAgent('w-l2', { status: 'launching', lastExitCode: 127 });
+  f.agents.set(supervisor.id, supervisor);
+  f.agents.set(worker.id, worker);
+  const bridge = new EventBridge(f.deps);
+
+  await bridge.onStatusChanged({
+    agentId: worker.id,
+    status: 'crashed',
+    fromStatus: 'launching',
+    source: 'runner-exit',
+  });
+  assert.equal(f.sendInputCalls.length, 1,
+    'launching → crashed still fires (boot failure is not noise)');
+
+  const worker2 = makeAgent('w-l3', { status: 'launching' });
+  f.agents.set(worker2.id, worker2);
+  await bridge.onStatusChanged({
+    agentId: worker2.id,
+    status: 'waiting',
+    fromStatus: 'launching',
+    source: 'monitor',
+    waitingKind: 'y-n',
+    waitingExcerpt: 'Trust this folder?',
+  });
+  assert.equal(f.sendInputCalls.length, 2,
+    'launching → waiting still fires (startup prompt needs the supervisor)');
+  console.log('  launching→idle ✓ guard is transition-exact (crashed/waiting from launching still fire)');
 }
 
 // ── BUG-11: user-typing deferral ────────────────────────────────────────
@@ -806,7 +891,9 @@ async function BUG_18_thinkingForceWorkingUsesThinkingPending(): Promise<void> {
   // tool-use/task-started/assistant-text do that — thinking is high-
   // cadence positive evidence but doesn't itself begin a turn).
   const f = makeFakeBridgeDeps();
-  const claude = makeAgent('cl-bug18-1', { provider: 'claude', status: 'working' });
+  // Unsupervised lane: worker-lane claude/codex derive working/idle from hooks,
+  // so the chat-stream dispatch under test is exercised on the unsupervised lane.
+  const claude = makeAgent('cl-bug18-1', { provider: 'claude', status: 'working', isSupervised: false });
   f.agents.set(claude.id, claude);
   const bridge = new EventBridge(f.deps);
 
@@ -830,7 +917,7 @@ async function BUG_18_endToEndTurnInFlightSetAndCleared(): Promise<void> {
   // marked on the right events and that the terminal turnComplete fires
   // forceIdle (which clears the latch entirely in the real monitor).
   const f = makeFakeBridgeDeps();
-  const claude = makeAgent('cl-bug18-2', { provider: 'claude', status: 'working' });
+  const claude = makeAgent('cl-bug18-2', { provider: 'claude', status: 'working', isSupervised: false });
   f.agents.set(claude.id, claude);
   const bridge = new EventBridge(f.deps);
 
@@ -897,7 +984,7 @@ async function BUG_18_userTextDoesNotMarkTurnInFlight(): Promise<void> {
   // does NOT begin a model turn (the next task-started / first assistant
   // event does). Marking it would over-extend the latch on aborted turns.
   const f = makeFakeBridgeDeps();
-  const claude = makeAgent('cl-bug18-3', { provider: 'claude', status: 'working' });
+  const claude = makeAgent('cl-bug18-3', { provider: 'claude', status: 'working', isSupervised: false });
   f.agents.set(claude.id, claude);
   const bridge = new EventBridge(f.deps);
 
@@ -1050,6 +1137,8 @@ async function main(): Promise<void> {
   await BR_15_notifyUserInputSkippedForSupervised();
   await BR_19_geminiTurnCompleteFiresForceIdle_postBug09();
   await BR_20_waitingToWorkingIsSuppressed();
+  await launchingToIdle_isSuppressed();
+  await launchingToOtherStatuses_stillFire();
   await onChatEvents_codexTurnComplete();
   await onChatEvents_dispatchTable();
   await onChatEvents_geminiToolUseStillRoutes();

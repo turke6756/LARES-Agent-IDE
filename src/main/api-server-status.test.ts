@@ -1,6 +1,9 @@
 // Tests for POST /api/agents/:id/status — Class IV worker hook endpoint.
-// Covers the v3 contract: idle ↔ forceIdleFromHook, working ↔
-// forceWorkingFromHook, anything else → HTTP 400.
+// P1 contract (plans/p1-hook-spool-multi-transport.md §2): every valid body is
+// normalized into a ParsedHookEvent and handed to
+// AgentSupervisor.applyHookStatusEvent(agentId, event, 'http'); v≤6 bodies
+// (no hookEventName meta) are flagged legacy with a synthesized host-clock ts;
+// anything else → HTTP 400.
 //
 // Compile via the main tsconfig and run with:
 //   npm run build:main
@@ -10,6 +13,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { ApiServer } from './api-server';
 import type { AgentSupervisor } from './supervisor';
+import type { ParsedHookEvent, HookTransport } from './supervisor';
 import { makeAgent } from './supervisor/test-helpers/fake-bridge-deps';
 import type { Agent } from '../shared/types';
 
@@ -67,18 +71,16 @@ async function callRoute(
 
 function makeApi(opts: { agent: Agent }): {
   api: ApiServer;
-  recorded: Array<{ method: string; agentId: string; source: string }>;
+  recorded: Array<{ agentId: string; event: ParsedHookEvent; transport: HookTransport }>;
   cleanup: () => void;
 } {
   const agents = new Map<string, Agent>([[opts.agent.id, opts.agent]]);
   const restoreDb = patchDb(agents);
-  const recorded: Array<{ method: string; agentId: string; source: string }> = [];
+  const recorded: Array<{ agentId: string; event: ParsedHookEvent; transport: HookTransport }> = [];
   const fakeSupervisor = {
-    forceIdleFromHook: (id: string, source: string) => {
-      recorded.push({ method: 'forceIdleFromHook', agentId: id, source });
-    },
-    forceWorkingFromHook: (id: string, source: string) => {
-      recorded.push({ method: 'forceWorkingFromHook', agentId: id, source });
+    applyHookStatusEvent: (id: string, event: ParsedHookEvent, transport: HookTransport) => {
+      recorded.push({ agentId: id, event, transport });
+      return 'applied';
     },
     isInputInFlight: () => false,
     getContextStats: () => null,
@@ -91,26 +93,32 @@ function makeApi(opts: { agent: Agent }): {
   };
 }
 
-test('POST /api/agents/:id/status with state="idle" calls forceIdleFromHook', async () => {
+test('POST /api/agents/:id/status with v6-style idle body → legacy event via applyHookStatusEvent', async () => {
   const agent = makeAgent('a-1');
   const h = makeApi({ agent });
   try {
     const res = await callRoute(h.api, 'POST', '/api/agents/a-1/status', {
       state: 'idle',
       source: 'hook-stop',
+      ts: 1234, // v6 sends ts but no hookEventName → still legacy
     });
     assert.equal(res.status, 200, `expected 200; got ${res.status} body=${JSON.stringify(res.body)}`);
-    assert.deepStrictEqual(h.recorded, [{
-      method: 'forceIdleFromHook',
-      agentId: 'a-1',
-      source: 'hook-stop',
-    }]);
+    assert.equal(h.recorded.length, 1);
+    const { agentId, event, transport } = h.recorded[0];
+    assert.equal(agentId, 'a-1');
+    assert.equal(transport, 'http');
+    assert.equal(event.state, 'idle');
+    assert.equal(event.source, 'hook-stop');
+    assert.equal(event.legacy, true, 'a body without hookEventName is legacy');
+    assert.equal(event.hookEventName, 'Stop', 'legacy synthesizes the argv-style event name');
+    assert.notEqual(event.ts, 1234, 'legacy synthesizes a host-clock ts, never trusts the body ts');
+    assert.equal(res.body.result, 'applied', 'the applier verdict rides on the response');
   } finally {
     h.cleanup();
   }
 });
 
-test('POST /api/agents/:id/status with state="working" calls forceWorkingFromHook', async () => {
+test('POST /api/agents/:id/status with state="working" dispatches a working event', async () => {
   const agent = makeAgent('a-2');
   const h = makeApi({ agent });
   try {
@@ -119,11 +127,39 @@ test('POST /api/agents/:id/status with state="working" calls forceWorkingFromHoo
       source: 'hook-start',
     });
     assert.equal(res.status, 200, `expected 200; got ${res.status} body=${JSON.stringify(res.body)}`);
-    assert.deepStrictEqual(h.recorded, [{
-      method: 'forceWorkingFromHook',
-      agentId: 'a-2',
-      source: 'hook-start',
-    }]);
+    assert.equal(h.recorded.length, 1);
+    assert.equal(h.recorded[0].event.state, 'working');
+    assert.equal(h.recorded[0].event.source, 'hook-start');
+    assert.equal(h.recorded[0].event.hookEventName, 'UserPromptSubmit');
+    assert.equal(h.recorded[0].event.legacy, true);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('POST /api/agents/:id/status with full v7 meta → non-legacy event, ts passed through', async () => {
+  const agent = makeAgent('a-7');
+  const h = makeApi({ agent });
+  try {
+    const res = await callRoute(h.api, 'POST', '/api/agents/a-7/status', {
+      v: 1,
+      agentId: 'a-7',
+      state: 'idle',
+      source: 'hook-stop',
+      ts: 1717171717171,
+      hookEventName: 'Stop',
+      turnId: 'turn-9',
+      sessionId: 'sess-3',
+    });
+    assert.equal(res.status, 200, `expected 200; got ${res.status} body=${JSON.stringify(res.body)}`);
+    assert.equal(h.recorded.length, 1);
+    const { event } = h.recorded[0];
+    assert.equal(event.legacy, false, 'a v7 body with hookEventName+ts is NOT legacy');
+    assert.equal(event.ts, 1717171717171, 'v7 ts is passed through verbatim (dedupe key clock)');
+    assert.equal(event.hookEventName, 'Stop');
+    assert.equal(event.turnId, 'turn-9');
+    assert.equal(event.sessionId, 'sess-3');
+    assert.equal(event.agentId, 'a-7');
   } finally {
     h.cleanup();
   }

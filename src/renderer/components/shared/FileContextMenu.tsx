@@ -1,6 +1,14 @@
 import React, { useRef, useEffect } from 'react';
 import type { PathType } from '../../../shared/types';
 
+export type TreeSortMode = 'name' | 'modified' | 'created';
+
+const SORT_OPTIONS: { mode: TreeSortMode; label: string }[] = [
+  { mode: 'name', label: 'Name' },
+  { mode: 'modified', label: 'Last Edited' },
+  { mode: 'created', label: 'Created' },
+];
+
 interface Props {
   x: number;
   y: number;
@@ -17,6 +25,8 @@ interface Props {
   onCreateNotebook?: () => void;
   onRename?: () => void;
   onDelete?: () => void;
+  sortMode?: TreeSortMode;
+  onSortModeChange?: (mode: TreeSortMode) => void;
 }
 
 function getRelativePath(filePath: string, workingDirectory: string): string {
@@ -31,6 +41,7 @@ function getRelativePath(filePath: string, workingDirectory: string): string {
 export default function FileContextMenu({
   x, y, filePath, workingDirectory, pathType, isDirectory, showRevealInTree, onClose, onRevealInTree,
   onCreateFile, onCreateMarkdownFile, onCreateFolder, onCreateNotebook, onRename, onDelete,
+  sortMode, onSortModeChange,
 }: Props) {
   const menuRef = useRef<HTMLDivElement>(null);
 
@@ -100,6 +111,24 @@ export default function FileContextMenu({
           <button onClick={() => runAction(onCreateFolder)} className="ui-menu-item">
             New Folder...
           </button>
+          <div className="ui-menu-divider" />
+        </>
+      )}
+      {isDirectory && sortMode && onSortModeChange && (
+        <>
+          <div className="ui-menu-header">
+            Sort Files By
+          </div>
+          {SORT_OPTIONS.map(({ mode, label }) => (
+            <button
+              key={mode}
+              onClick={() => runAction(() => onSortModeChange(mode))}
+              className="ui-menu-item"
+            >
+              <span className="inline-block w-3.5">{sortMode === mode ? '✓' : ''}</span>
+              {label}
+            </button>
+          ))}
           <div className="ui-menu-divider" />
         </>
       )}

@@ -194,6 +194,11 @@ function getToolDefinitions() {
       name: 'send_message_to_agent',
       description:
         'Send a message to an idle/waiting agent. Rejects if agent is working. ' +
+        'HANDSHAKE: by default this call blocks until the worker\'s turn provably STARTED ' +
+        '(UserPromptSubmit hook or a status flip to working) and the result says so explicitly. ' +
+        'If it returns HANDSHAKE FAILED, the worker is NOT working and will never emit an idle ' +
+        'event for this prompt — act on it in this turn (read_agent_log, send_keys_to_agent ' +
+        '{key:"enter"}, or relaunch); do NOT end your turn assuming the handoff worked. ' +
         'For interactive widgets (AskUserQuestion pickers, slash-command menus, arrow keys, Ctrl-C), ' +
         'use `send_keys_to_agent` instead — this tool\'s bracketed-paste wrapping deposits bytes into ' +
         'the input box as text, not as key events.',
@@ -202,6 +207,11 @@ function getToolDefinitions() {
         properties: {
           agent_id: { type: 'string', description: 'The agent ID.' },
           message: { type: 'string', description: 'Message to send as user input.' },
+          confirm: {
+            type: 'boolean',
+            description: 'Default true: block until the worker turn is confirmed started. '
+              + 'Pass false for legacy fire-and-forget delivery (no started-proof).',
+          },
         },
         required: ['agent_id', 'message'],
       },
@@ -390,6 +400,36 @@ function getToolDefinitions() {
           agent_id: { type: 'string', description: 'The agent ID to fork.' },
         },
         required: ['agent_id'],
+      },
+    },
+    {
+      name: 'open_file_in_view',
+      description:
+        "Open a file as a tab in the user's dashboard file viewer — markdown, code, CSV/TSV, " +
+        'images, PDFs, notebooks: anything the viewer renders. Use this to surface a document ' +
+        'or output to the human (e.g. a report you just wrote, a generated plot). The file ' +
+        'appears immediately as the active tab in their file view. Prefer an absolute path ' +
+        '(Windows "C:\\\\..." or WSL "/home/..."); a relative path is resolved against the ' +
+        'workspace root. If workspace_id is omitted, the workspace currently selected in the ' +
+        'dashboard UI is used.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          file_path: {
+            type: 'string',
+            description: 'Path to the file to open. Absolute preferred; relative paths resolve against the workspace root.',
+          },
+          path_type: {
+            type: 'string',
+            enum: ['windows', 'wsl'],
+            description: 'Filesystem namespace of the path. Usually inferable from the path shape — omit unless ambiguous.',
+          },
+          workspace_id: {
+            type: 'string',
+            description: 'Workspace whose file tree the tab belongs to. Defaults to the workspace currently selected in the dashboard UI.',
+          },
+        },
+        required: ['file_path'],
       },
     },
     // ── Team management tools ──────────────────────────────────────────
@@ -617,8 +657,57 @@ async function handleToolCall(name, args) {
     }
 
     case 'send_message_to_agent': {
-      await apiRequest('POST', `/api/agents/${args.agent_id}/input`, { text: args.message });
-      return { content: [{ type: 'text', text: `Message sent to agent ${args.agent_id}: "${args.message}"` }] };
+      // Handoff handshake (default): block until the worker's turn provably
+      // started. Without this, "Message sent" only means bytes were typed —
+      // a dropped Enter or dead agent left the supervisor believing a worker
+      // was working when it never started, with no event to ever wake it.
+      const confirm = args.confirm !== false;
+      if (!confirm) {
+        await apiRequest('POST', `/api/agents/${args.agent_id}/input`, { text: args.message });
+        return {
+          content: [{
+            type: 'text',
+            text: `Message sent to agent ${args.agent_id} (fire-and-forget — turn start NOT confirmed): "${args.message}"`,
+          }],
+        };
+      }
+      try {
+        const r = await apiRequest('POST', `/api/agents/${args.agent_id}/input`, {
+          text: args.message,
+          confirm: true,
+        });
+        if (r.confirmed) {
+          return {
+            content: [{
+              type: 'text',
+              text: `HANDSHAKE OK — message delivered to agent ${args.agent_id} and the worker turn `
+                + `is CONFIRMED started (proof: ${r.mode === 'hook' ? 'UserPromptSubmit hook' : 'status flipped to working'}). `
+                + `You will get a [DASHBOARD EVENT] when it goes idle.`,
+            }],
+          };
+        }
+        return {
+          content: [{
+            type: 'text',
+            text: `HANDSHAKE UNCONFIRMED — message delivered to agent ${args.agent_id} but no turn-start `
+              + `proof arrived in time (provider may lack an authoritative start signal, e.g. gemini). `
+              + `The worker MAY be fine, but verify before relying on it: read_agent_log to see the PTY; `
+              + `if the prompt sits unsubmitted, send_keys_to_agent {"agent_id":"${args.agent_id}","key":"enter"}.`,
+          }],
+        };
+      } catch (err) {
+        return {
+          content: [{
+            type: 'text',
+            text: `HANDSHAKE FAILED for agent ${args.agent_id}: ${err.message}\n`
+              + `The prompt was typed but the worker turn NEVER STARTED — it will never emit an idle `
+              + `event for this prompt, so do NOT end your turn assuming the handoff worked.\n`
+              + `Recover now: 1) read_agent_log {"agent_id":"${args.agent_id}"} to inspect the PTY; `
+              + `2) if the prompt sits unsubmitted, send_keys_to_agent {"agent_id":"${args.agent_id}","key":"enter"} `
+              + `and re-check; 3) if the agent is dead or hook-broken, stop_agent + launch_agent a replacement.`,
+          }],
+        };
+      }
     }
 
     case 'send_keys_to_agent': {
@@ -752,14 +841,32 @@ async function handleToolCall(name, args) {
           // BUG-01: submit defaults to true so the prompt is auto-pressed
           // (Enter is provider-appropriate: CR for Claude, kitty-encoded for
           // Codex/Gemini and WSL). Pass submit:false to type without submit.
+          // Handoff handshake: submitted prompts use confirm:true so this
+          // result reports whether the worker turn ACTUALLY started — not
+          // just that bytes were typed.
           const submit = args.submit !== false;
           try {
-            await apiRequest('POST', `/api/agents/${agent.id}/input`, { text: args.prompt, submit });
-            text += submit
-              ? `\nSent initial prompt: "${args.prompt.substring(0, 100)}..."`
-              : `\nTyped initial prompt without submitting (submit:false): "${args.prompt.substring(0, 100)}..."`;
+            const r = await apiRequest('POST', `/api/agents/${agent.id}/input`, {
+              text: args.prompt,
+              submit,
+              confirm: submit,
+            });
+            if (!submit) {
+              text += `\nTyped initial prompt without submitting (submit:false): "${args.prompt.substring(0, 100)}..."`;
+            } else if (r.confirmed) {
+              text += `\nHANDSHAKE OK — initial prompt sent and the worker turn is CONFIRMED started `
+                + `(proof: ${r.mode === 'hook' ? 'UserPromptSubmit hook' : 'status flipped to working'}): `
+                + `"${args.prompt.substring(0, 100)}..."`;
+            } else {
+              text += `\nHANDSHAKE UNCONFIRMED — initial prompt delivered but no turn-start proof arrived in time. `
+                + `Verify before relying on this worker: read_agent_log; if the prompt sits unsubmitted, `
+                + `send_keys_to_agent {"agent_id":"${agent.id}","key":"enter"}.`;
+            }
           } catch (err) {
-            text += `\nNote: Agent reached idle but POST /input failed: ${err.message}. Initial prompt NOT sent — retry with send_message_to_agent.`;
+            text += `\nHANDSHAKE FAILED — agent reached idle but the initial prompt did not start a turn: ${err.message}. `
+              + `The worker is NOT working and will never emit an idle event for this prompt. `
+              + `Recover now: read_agent_log; if the prompt sits unsubmitted, `
+              + `send_keys_to_agent {"agent_id":"${agent.id}","key":"enter"}; otherwise stop_agent + relaunch.`;
           }
         }
       }
@@ -804,6 +911,15 @@ async function handleToolCall(name, args) {
       return { content: [{ type: 'text', text: `Forked agent ${args.agent_id} → new agent "${newAgent.title}" (${newAgent.id})` }] };
     }
 
+
+    case 'open_file_in_view': {
+      const body = { filePath: args.file_path };
+      if (args.path_type) body.pathType = args.path_type;
+      if (args.workspace_id) body.workspaceId = args.workspace_id;
+      const result = await apiRequest('POST', '/api/files/open-tab', body);
+      const scope = result.workspaceId ? ` (workspace ${result.workspaceId})` : ' (active workspace)';
+      return { content: [{ type: 'text', text: `Opened in the user's file view: ${result.filePath}${scope}` }] };
+    }
 
     // ── Team management handlers ─────────────────────────────────────
     case 'create_team': {

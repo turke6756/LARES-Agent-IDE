@@ -6,6 +6,7 @@ const api: IpcApi = {
     list: () => ipcRenderer.invoke('workspace:list'),
     create: (input) => ipcRenderer.invoke('workspace:create', input),
     delete: (id) => ipcRenderer.invoke('workspace:delete', id),
+    reorder: (ids) => ipcRenderer.invoke('workspace:reorder', ids),
     openInVSCode: (id) => ipcRenderer.invoke('workspace:open-vscode', id),
   },
   agents: {
@@ -96,6 +97,7 @@ const api: IpcApi = {
     openFile: (filePath, pathType) => ipcRenderer.invoke('system:open-file', filePath, pathType),
     openFileInWorkspace: (filePath, workspaceDir, pathType) =>
       ipcRenderer.invoke('system:open-file-in-workspace', filePath, workspaceDir, pathType),
+    setTheme: (theme) => ipcRenderer.invoke('system:set-theme', theme),
   },
   teams: {
     create: (input) => ipcRenderer.invoke('team:create', input),
@@ -125,6 +127,11 @@ const api: IpcApi = {
   notebooks: {
     ensureServer: () => ipcRenderer.invoke('notebook:ensure-server'),
     listKernelspecs: () => ipcRenderer.invoke('notebook:list-kernelspecs'),
+  },
+  onOpenFileTab: (callback) => {
+    const listener = (_event: any, payload: any) => callback(payload);
+    ipcRenderer.on('file:open-tab', listener);
+    return () => ipcRenderer.removeListener('file:open-tab', listener);
   },
   onAgentStatusChanged: (callback) => {
     const listener = (_event: any, data: any) => callback(data);

@@ -10,6 +10,10 @@ import logoImg from '../../assets/logo.png';
 import { useNamePrompt } from '../../hooks/useNamePrompt';
 import { detectSyncFolder } from '../../../shared/sync-folder-detection';
 
+// Internal drag type for reordering workspace cards. Distinct from OS folder
+// drops (dataTransfer.files), which add a new workspace.
+const WS_DRAG_MIME = 'application/x-workspace-id';
+
 function InlineWorkspaceTree({ rootPath, pathType, workspaceId }: { rootPath: string; pathType: PathType; workspaceId: string }) {
   const [rootEntries, setRootEntries] = useState<DirectoryEntry[]>([]);
   const [loading, setLoading] = useState(true);
@@ -138,6 +142,7 @@ export default function Sidebar({ width }: SidebarProps) {
   const panelLayout = useDashboardStore((s) => s.panelLayout);
   const selectWorkspace = useDashboardStore((s) => s.selectWorkspace);
   const loadWorkspaces = useDashboardStore((s) => s.loadWorkspaces);
+  const moveWorkspace = useDashboardStore((s) => s.moveWorkspace);
   const deleteWorkspace = useDashboardStore((s) => s.deleteWorkspace);
   const togglePanelCollapsed = useDashboardStore((s) => s.togglePanelCollapsed);
   const resetLayout = useDashboardStore((s) => s.resetLayout);
@@ -148,6 +153,12 @@ export default function Sidebar({ width }: SidebarProps) {
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; wsId: string } | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
   const [expandedWorkspaces, setExpandedWorkspaces] = useState<Set<string>>(new Set());
+  const [dragWsId, setDragWsId] = useState<string | null>(null);
+  const [dropTarget, setDropTarget] = useState<string | 'end' | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
+  // Bumping this remounts every expanded InlineWorkspaceTree, dropping its
+  // directory cache so the tree re-lists from disk.
+  const [refreshTick, setRefreshTick] = useState(0);
   const menuRef = useRef<HTMLDivElement>(null);
   const collapsed = panelLayout.sidebarCollapsed;
   const wslState = health?.wslStatus?.state;
@@ -195,19 +206,47 @@ export default function Sidebar({ width }: SidebarProps) {
     return () => document.removeEventListener('mousedown', handleClick);
   }, [contextMenu]);
 
+  const handleRefresh = async () => {
+    setRefreshing(true);
+    setRefreshTick((t) => t + 1);
+    try {
+      // Floor the spin at ~400ms so the click visibly registers.
+      await Promise.all([loadWorkspaces(), new Promise((r) => setTimeout(r, 400))]);
+    } finally {
+      setRefreshing(false);
+    }
+  };
+
   const handleDragOver = (e: React.DragEvent) => {
     e.preventDefault();
+    if (e.dataTransfer.types.includes(WS_DRAG_MIME)) {
+      // Reordering a workspace card over empty space → drop at end of list.
+      // (Cards stopPropagation on their own dragover, so this only fires
+      // between/below the cards.)
+      e.dataTransfer.dropEffect = 'move';
+      setDropTarget('end');
+      return;
+    }
     e.dataTransfer.dropEffect = 'copy';
     setDragOver(true);
   };
 
   const handleDragLeave = () => {
     setDragOver(false);
+    setDropTarget(null);
   };
 
   const handleDrop = async (e: React.DragEvent) => {
     e.preventDefault();
     setDragOver(false);
+    setDropTarget(null);
+
+    const reorderId = e.dataTransfer.getData(WS_DRAG_MIME);
+    if (reorderId) {
+      setDragWsId(null);
+      void moveWorkspace(reorderId, null); // null → move to end
+      return;
+    }
 
     const files = e.dataTransfer.files;
     if (!files.length) return;
@@ -269,9 +308,9 @@ export default function Sidebar({ width }: SidebarProps) {
       className="panel-shell flex flex-col z-20"
       style={{ width }}
     >
-      {/* Header */}
-      <div className="panel-header p-3">
-        <div className="flex items-center justify-between">
+      {/* Header — fixed h-16 so it lines up with the main dashboard header */}
+      <div className="panel-header h-16 px-3 flex items-center shrink-0">
+        <div className="flex items-center justify-between w-full">
           <div className="flex items-center gap-2">
             <img src={logoImg} alt="Logo" className="h-10 object-contain" />
             <span className="text-[13px] font-medium dark:text-gray-300 text-gray-700">Agent Dashboard</span>
@@ -309,13 +348,23 @@ export default function Sidebar({ width }: SidebarProps) {
           <span className="ui-section-header">
             Workspaces
           </span>
-          <button
-            onClick={() => setShowCreate(true)}
-            className="ui-btn ui-btn-primary h-8 w-8 p-0"
-            title="Add Workspace"
-          >
-            <Icons.Plus className="w-5 h-5 stroke-[2.5]" />
-          </button>
+          <div className="flex items-center gap-1">
+            <button
+              onClick={() => void handleRefresh()}
+              disabled={refreshing}
+              className="ui-btn ui-btn-ghost h-8 w-8 p-0 disabled:opacity-50"
+              title="Refresh workspaces and re-scan file trees"
+            >
+              <Icons.RefreshCw className={`w-4 h-4 ${refreshing ? 'animate-spin' : ''}`} />
+            </button>
+            <button
+              onClick={() => setShowCreate(true)}
+              className="ui-btn ui-btn-primary h-8 w-8 p-0"
+              title="Add Workspace"
+            >
+              <Icons.Plus className="w-5 h-5 stroke-[2.5]" />
+            </button>
+          </div>
         </div>
 
         <div className="space-y-1">
@@ -325,8 +374,34 @@ export default function Sidebar({ width }: SidebarProps) {
             const isExpanded = expandedWorkspaces.has(ws.id);
 
             return (
-              <div key={ws.id}>
+              <div
+                key={ws.id}
+                className={dropTarget === ws.id ? 'border-t-2 border-accent-blue' : ''}
+              >
                 <button
+                  draggable
+                  onDragStart={(e) => {
+                    e.dataTransfer.setData(WS_DRAG_MIME, ws.id);
+                    e.dataTransfer.effectAllowed = 'move';
+                    setDragWsId(ws.id);
+                  }}
+                  onDragEnd={() => { setDragWsId(null); setDropTarget(null); }}
+                  onDragOver={(e) => {
+                    if (!e.dataTransfer.types.includes(WS_DRAG_MIME)) return;
+                    e.preventDefault();
+                    e.stopPropagation();
+                    e.dataTransfer.dropEffect = 'move';
+                    if (dragWsId !== ws.id) setDropTarget(ws.id);
+                  }}
+                  onDrop={(e) => {
+                    if (!e.dataTransfer.types.includes(WS_DRAG_MIME)) return;
+                    e.preventDefault();
+                    e.stopPropagation();
+                    const fromId = e.dataTransfer.getData(WS_DRAG_MIME);
+                    setDragWsId(null);
+                    setDropTarget(null);
+                    if (fromId && fromId !== ws.id) void moveWorkspace(fromId, ws.id);
+                  }}
                   onClick={() => selectWorkspace(ws.id)}
                   onDoubleClick={(e) => toggleWorkspace(ws.id, e)}
                   onContextMenu={(e) => handleContextMenu(e, ws.id)}
@@ -334,7 +409,7 @@ export default function Sidebar({ width }: SidebarProps) {
                     isSelected
                       ? 'border-l-accent-blue-bright tree-row-selected'
                       : 'border-l-transparent hover:bg-white/[0.04]'
-                  }`}
+                  } ${dragWsId === ws.id ? 'opacity-40' : ''}`}
                   style={!isSelected ? { color: 'var(--color-fg-primary)' } : undefined}
                 >
                   <div className="flex items-center gap-1 w-full mb-0.5">
@@ -370,11 +445,19 @@ export default function Sidebar({ width }: SidebarProps) {
                   </div>
                 </button>
                 {isExpanded && (
-                  <InlineWorkspaceTree rootPath={ws.path} pathType={ws.pathType} workspaceId={ws.id} />
+                  <InlineWorkspaceTree
+                    key={`${ws.id}:${refreshTick}`}
+                    rootPath={ws.path}
+                    pathType={ws.pathType}
+                    workspaceId={ws.id}
+                  />
                 )}
               </div>
             );
           })}
+          {dropTarget === 'end' && dragWsId && (
+            <div className="border-t-2 border-accent-blue mx-2" />
+          )}
         </div>
 
         {dragOver && (

@@ -1,8 +1,9 @@
-import { ipcMain, dialog, BrowserWindow } from 'electron';
+import { ipcMain, dialog, BrowserWindow, nativeTheme } from 'electron';
+import { persistTheme } from './theme-persistence';
 import type { PathType, FsEvent } from '../shared/types';
 import { AgentSupervisor } from './supervisor';
 import {
-  getWorkspaces, createWorkspace, deleteWorkspace, getWorkspace,
+  getWorkspaces, createWorkspace, deleteWorkspace, getWorkspace, reorderWorkspaces,
   getAgentsByWorkspace, getAllAgents, getAgent, getFileActivities, getWorkspaceAgentSummary,
   checkAgentMdExists, updateAgentSupervised,
   createTeam, getTeam, listTeams, updateTeamStatus, addTeamMember, removeTeamMember,
@@ -31,6 +32,7 @@ export function registerIpcHandlers(supervisor: AgentSupervisor, mainWindow: Bro
   ipcMain.handle('workspace:list', () => getWorkspaces());
   ipcMain.handle('workspace:create', (_e, input) => createWorkspace(input));
   ipcMain.handle('workspace:delete', (_e, id) => deleteWorkspace(id));
+  ipcMain.handle('workspace:reorder', (_e, ids: string[]) => reorderWorkspaces(ids));
 
   ipcMain.handle('workspace:open-vscode', (_e, id) => {
     const ws = getWorkspace(id);
@@ -374,6 +376,22 @@ export function registerIpcHandlers(supervisor: AgentSupervisor, mainWindow: Bro
     openFileInWorkspace(filePath, workspaceDir, pathType || detectPathType(filePath));
   });
 
+  // Keep native window chrome (title bar / menu bar) in sync with the
+  // renderer theme toggle, and persist so the next launch matches pre-paint.
+  ipcMain.handle('system:set-theme', (_e, theme: 'dark' | 'light') => {
+    if (theme !== 'dark' && theme !== 'light') return;
+    nativeTheme.themeSource = theme;
+    persistTheme(theme);
+    // Recolor the window-controls overlay (min/max/close) so the buttons
+    // stay visible against the new chrome color.
+    if (process.platform === 'win32' && !mainWindow.isDestroyed()) {
+      mainWindow.setTitleBarOverlay({
+        color: theme === 'light' ? '#f7f5f0' : '#1e1e1e',
+        symbolColor: theme === 'light' ? '#1e1e1e' : '#f7f5f0',
+      });
+    }
+  });
+
   // Forward supervisor status changes to renderer
   supervisor.on('statusChanged', (data) => {
     if (!mainWindow.isDestroyed()) {
@@ -413,6 +431,15 @@ export function registerIpcHandlers(supervisor: AgentSupervisor, mainWindow: Bro
   supervisor.on('teamMessageCreated', (message) => {
     if (!mainWindow.isDestroyed()) {
       mainWindow.webContents.send('team:message-created', message);
+    }
+  });
+
+  // Forward "open this file in the user's file view" requests
+  // (open_file_in_view MCP tool → POST /api/files/open-tab → here) to the
+  // renderer, which resolves defaults and calls the store's openTab().
+  supervisor.on('openFileInView', (payload) => {
+    if (!mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('file:open-tab', payload);
     }
   });
 }

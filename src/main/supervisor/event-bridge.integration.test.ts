@@ -260,11 +260,17 @@ function statsAt(agentId: string, pct: number, turn = 1): ContextStats {
 // scenario-specific fields. Cross-ref BR-IDs from §2.7.
 
 async function single_idle(): Promise<void> {
-  // Trigger: chat-stream `turnComplete:true` on a Codex worker → bridge
-  //          dispatches forceIdle → monitor emits statusChanged
-  //          (working → idle) → bridge delivers to supervisor.
-  // Covers the wiring path between BR-11 (latch) and BR-01 (delivery) that
+  // Trigger: the Stop hook on a Codex worker → `forceIdle` → monitor emits
+  //          statusChanged (working → idle) → bridge delivers to supervisor.
+  // Covers the wiring path between the latch (BR-11) and delivery (BR-01) that
   // the unit tests exercise independently.
+  //
+  // NOTE: a worker-lane (supervised/isWorker) claude/codex agent derives
+  // working/idle SOLELY from its hook pipeline now (event-bridge.ts:193 skips
+  // the chat-stream dispatch for that lane). The Stop hook is therefore the
+  // genuine idle source — driven here via `monitor.forceIdle('hook-stop')`, the
+  // exact call `AgentSupervisor.forceIdleFromHook` makes. (The old chat-stream
+  // `turnComplete` trigger no longer flips a worker to idle.)
   const h = makeHarness();
   try {
     const sup = makeSup('sup-int-1');
@@ -272,9 +278,7 @@ async function single_idle(): Promise<void> {
     h.agents.set(sup.id, sup);
     h.agents.set(worker.id, worker);
 
-    h.bridge.onChatEvents(batchOf(worker.id, [
-      assistantText(worker.id, { turnComplete: true }),
-    ]));
+    h.monitor.forceIdle(worker.id, 'hook-stop');
     await h.settle();
 
     assert.equal(worker.status, 'idle',
@@ -287,7 +291,7 @@ async function single_idle(): Promise<void> {
       'single/idle: dashboard-event header present');
     assert.match(payload, /working → idle/,
       'single/idle: from→to rendered');
-    console.log('  single/idle ✓ chat turnComplete → forceIdle → supervisor notified');
+    console.log('  single/idle ✓ Stop hook → forceIdle → supervisor notified');
   } finally { h.dispose(); }
 }
 
@@ -407,15 +411,24 @@ async function single_waiting_question_BR_13_20(): Promise<void> {
 }
 
 async function single_waiting_ttyPattern_BR_14(): Promise<void> {
-  // BR-14 end-to-end: real StatusMonitor.inferStatus runs the PromptPatternDetector
-  // against a synthetic PTY ring tail. On match it calls forceWaiting → status
-  // event → bridge delivers "[DASHBOARD EVENT] Agent waiting for input" with
-  // waitingKind:'y-n' (PromptKind for `(y/N)` patterns; the monitor maps this
-  // to the WaitingKind union directly).
+  // BR-14: real StatusMonitor.inferStatus runs the PromptPatternDetector against
+  // a synthetic PTY ring tail; on match it calls forceWaiting → status flips to
+  // waiting.
+  //
+  // Hook-owned-status redesign (status-monitor.ts:1033, event-bridge.ts:90):
+  // PTY-pattern inference runs ONLY for the non-worker lane (!isSupervised &&
+  // !isWorker) — the worker lane derives status from hooks alone — while the
+  // bridge relays a status change to a supervisor ONLY when the agent
+  // isSupervised. Those two conditions are now mutually exclusive, so the old
+  // "PTY pattern → supervisor notified" end-to-end path no longer exists. This
+  // test therefore exercises the surviving half: PromptPatternDetector →
+  // inferStatus → forceWaiting writes the agent to waiting, and asserts the
+  // change is NOT relayed (no supervisor delivery for an inference-lane agent).
   const h = makeHarness();
   try {
     const sup = makeSup('sup-int-5');
-    const worker = makeWorker('w-int-tty');
+    // Inference lane: unsupervised, non-worker — the only lane inferStatus runs.
+    const worker = makeWorker('w-int-tty', { isSupervised: false, isWorker: false });
     h.agents.set(sup.id, sup);
     h.agents.set(worker.id, worker);
 
@@ -424,11 +437,8 @@ async function single_waiting_ttyPattern_BR_14(): Promise<void> {
     h.ringTails.set(worker.id, 'About to overwrite file. Continue? (y/N) ');
     h.lastOutput.set(worker.id, h.now.value - 5_000);
 
-    // Drive a poll tick by reaching into the private inferStatus. The
-    // dispatcher in `poll()` then no-ops because inferStatus already wrote
-    // the status via forceWaiting (working → waiting), so the visible side
-    // effects are the forceWaiting call's own statusChanged emission and
-    // the resulting bridge delivery — exactly what we want to assert.
+    // Reach into the private inferStatus. It writes the status via forceWaiting
+    // (working → waiting) and returns the inferred status.
     const inferred = await (h.monitor as unknown as {
       inferStatus(a: Agent): Promise<string | null>;
     }).inferStatus(worker);
@@ -437,15 +447,9 @@ async function single_waiting_ttyPattern_BR_14(): Promise<void> {
 
     assert.equal(worker.status, 'waiting',
       'single/waiting-tty: agent record flipped to waiting via forceWaiting');
-    assert.equal(h.sendInputCalls.length, 1, 'single/waiting-tty: one delivery');
-    const payload = h.sendInputCalls[0].text;
-    assert.match(payload, /\[DASHBOARD EVENT\] Agent waiting for input/,
-      'single/waiting-tty: waiting dashboard header rendered');
-    assert.match(payload, /Waiting kind: y-n/,
-      'single/waiting-tty: PTY-pattern detector reported kind=y-n (BR-14)');
-    assert.match(payload, /\(y\/N\)/,
-      'single/waiting-tty: excerpt is the matched prompt');
-    console.log('  single/waiting-tty ✓ PTY (y/N) pattern → forceWaiting → supervisor notified (BR-14)');
+    assert.equal(h.sendInputCalls.length, 0,
+      'single/waiting-tty: inference-lane (unsupervised) status change is NOT relayed to a supervisor');
+    console.log('  single/waiting-tty ✓ PTY (y/N) pattern → forceWaiting writes waiting; not relayed (inference lane)');
   } finally { h.dispose(); }
 }
 
@@ -725,9 +729,11 @@ async function single_idle_chatFirstPreview_BUG_20(): Promise<void> {
       },
     ]);
 
-    h.bridge.onChatEvents(batchOf(worker.id, [
-      assistantText(worker.id, { turnComplete: true, text: 'done' }),
-    ]));
+    // Worker-lane idle now arrives via the Stop hook (forceIdle), not the
+    // chat stream (event-bridge.ts:193 skips chat dispatch for the worker lane).
+    // The delivery payload still draws on the chat-first preview + file-activity
+    // deps, so this asserts the same BUG-20 rendering on the current idle path.
+    h.monitor.forceIdle(worker.id, 'hook-stop');
     await h.settle();
 
     assert.equal(h.sendInputCalls.length, 1, 'BUG-20: one delivery');
@@ -773,9 +779,8 @@ async function single_idle_fallbackOnChatError_BUG_20(): Promise<void> {
     };
 
     try {
-      h.bridge.onChatEvents(batchOf(worker.id, [
-        assistantText(worker.id, { turnComplete: true }),
-      ]));
+      // Worker-lane idle via the Stop hook (see single_idle_chatFirstPreview).
+      h.monitor.forceIdle(worker.id, 'hook-stop');
       await h.settle();
 
       assert.equal(h.sendInputCalls.length, 1, 'BUG-20: still delivered despite dep errors');

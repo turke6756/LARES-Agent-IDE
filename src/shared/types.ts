@@ -67,6 +67,14 @@ export interface Agent {
   hookStatus?: 'unknown' | 'healthy' | 'broken' | 'degraded';
   // Wall-clock (ms) of the most recent hook event from this agent, any source.
   lastHookEventAt?: number;
+  // C1 (plans/global-hook-rollout-and-submit-confirmation.md §2.1/§3.1) — the
+  // last synchronous-submit-confirmation failure. Set when the send chokepoint's
+  // confirm-and-retry EXHAUSTS for a contract provider (a prompt was delivered
+  // but no turn ever started), cleared on the next confirmed submit. Surfaced on
+  // the status/GET-agents projection so fire-and-forget pollers (MCP/HTTP/
+  // GroupThink) can see a swallowed delivery failure instead of an agent that
+  // silently never goes `working`.
+  lastSendError?: { message: string; ts: number } | null;
   isAttached: boolean;
   restartCount: number;
   lastExitCode: number | null;
@@ -203,6 +211,11 @@ export interface DirectoryEntry {
   path: string;
   isDirectory: boolean;
   size: number;
+  /** Last-modified time, ms since epoch. Undefined when stat failed. */
+  mtimeMs?: number;
+  /** Creation time, ms since epoch. On WSL this is status-change time —
+   *  find(1) has no birth-time printf — which matches creation for new files. */
+  birthtimeMs?: number;
 }
 
 export type FsEvent =
@@ -230,6 +243,20 @@ export interface FileTab {
   agentId?: string;
   workspaceId?: string;    // scopes the tab to a workspace; unset for legacy/orphan tabs
   label: string;           // display name (filename or dirname/)
+}
+
+/**
+ * Payload of the `file:open-tab` IPC event (main → renderer). Produced by
+ * POST /api/files/open-tab (the `open_file_in_view` MCP tool) and consumed
+ * by the renderer, which resolves missing fields against the currently
+ * selected workspace and calls the dashboard store's openTab().
+ */
+export interface OpenFileTabRequest {
+  filePath: string;          // absolute, or relative to rootDirectory
+  pathType?: PathType;       // inferred from the path / workspace when unset
+  workspaceId?: string;      // defaults to the workspace selected in the UI
+  rootDirectory?: string;    // enriched by main when workspaceId resolves
+  agentId?: string;
 }
 
 // ── Team interfaces ─────────────────────────────────────────────────────
@@ -378,6 +405,7 @@ export interface IpcApi {
     list: () => Promise<Workspace[]>;
     create: (input: CreateWorkspaceInput) => Promise<Workspace>;
     delete: (id: string) => Promise<void>;
+    reorder: (ids: string[]) => Promise<void>;
     openInVSCode: (id: string) => Promise<void>;
   };
   agents: {
@@ -460,6 +488,7 @@ export interface IpcApi {
     healthCheck: () => Promise<HealthCheck>;
     openFile: (filePath: string, pathType: PathType) => Promise<void>;
     openFileInWorkspace: (filePath: string, workspaceDir: string, pathType: PathType) => Promise<void>;
+    setTheme: (theme: 'dark' | 'light') => Promise<void>;
   };
   teams: {
     create: (input: CreateTeamInput) => Promise<Team>;
@@ -491,6 +520,7 @@ export interface IpcApi {
     listKernelspecs: () => Promise<KernelspecsResponse>;
   };
   onAgentStatusChanged: (callback: (data: { agentId: string; status: AgentStatus; agent: Agent }) => void) => () => void;
+  onOpenFileTab: (callback: (payload: OpenFileTabRequest) => void) => () => void;
   onTeamUpdated: (callback: (team: Team) => void) => () => void;
   onTeamMessageCreated: (callback: (message: TeamMessage) => void) => () => void;
 }

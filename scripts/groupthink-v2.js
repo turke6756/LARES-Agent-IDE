@@ -346,6 +346,11 @@ async function launchAgentWithKickoff(base, opts) {
     roleDescription,
     provider,
     freshSession: true,
+    // Supervised: ride the worker lane (hook-driven status) and emit
+    // [DASHBOARD EVENT] status changes to the workspace supervisor — without
+    // this the event-bridge drops the agent's idle/done events and the
+    // supervisor never hears that a GroupThink member finished.
+    isSupervised: true,
   };
   if (isClaude) {
     launchBody.systemPrompt = kickoffPrompt;
@@ -641,7 +646,10 @@ async function main() {
   const workspaceId = args.workspaceId;
   const supervisorId = args.supervisorId;
   const topic = args.topic || 'Research and plan a feature.';
-  const planPath = args.planPath || 'plans/new-plan.md';
+  // Resolve to absolute: the path is embedded verbatim in agent prompts, and
+  // supervised agents run from the worker-lane cwd (.dashboard/workers/<p>/),
+  // not from this script's cwd — a relative path would land in the wrong dir.
+  const planPath = path.resolve(args.planPath || 'plans/new-plan.md');
   const leadProvider = args.leadProvider || 'claude';
   const reviewerProvider = args.reviewerProvider || 'codex';
   const turnTimeoutRaw = args['turn-timeout-ms'];

@@ -17,9 +17,14 @@ import {
   START_HOOK_RESEND_AFTER_MS,
   START_HOOK_RESEND_INTERVAL_MS,
   START_HOOK_RESEND_MAX_ATTEMPTS,
+  CONFIRM_WINDOW_FIRST_MS,
+  CONFIRM_WINDOW_RETRY_MS,
+  CONFIRM_POLL_MS,
+  MAX_SUBMIT_RETRIES,
   LAUNCH_SETTLE_TIMEOUT_MS,
   LAUNCH_SETTLE_OVERRUN_GRACE_MS,
   HOOK_CANARY_WINDOW_MS,
+  WORKER_STALL_WARN_MS,
 } from '../../shared/constants';
 import { getActiveAgents, updateAgentStatus, updateAgentHookStatus, addEvent } from '../database';
 import type { StatusChangedEvent } from './status-events';
@@ -214,7 +219,42 @@ export class StatusMonitor extends EventEmitter {
   // detect a scaffold-broken supervised Claude worker: input went in, but no
   // Stop hook ever came back. Stays set across subsequent inputs (last wins).
   private lastInputDeliveredAt = new Map<string, number>();
+  // Synchronous submit-confirmation in-flight marker (plan §coordination). While
+  // an agent id is in this set, `_doSendInput`'s confirm-and-retry owns the
+  // re-press for that turn, so the reactive `checkStartHookResend` /
+  // `checkStartHookSilence` pollers MUST stand down to avoid double-pressing or
+  // a spurious silence warning during a legitimate first-window+retry.
+  private confirmInFlight = new Set<string>();
+  // Injected by AgentSupervisor: the centralized contract-vs-fallback predicate
+  // (`usesSubmitConfirmation`). The reactive Enter-resend poller uses it to skip
+  // contract providers entirely — they go through the synchronous path, and the
+  // reactive path remains ONLY as the fallback for non-contract providers
+  // (Gemini / unconfirmable-Codex). Left undefined in tests that don't exercise
+  // the poller-coordination seam (then no agent is treated as contract).
+  private usesSubmitConfirmation?: (agent: Agent) => boolean;
+  // Stalled-worker watchdog — agents already warned for the CURRENT working
+  // stretch, so the event fires once per stretch instead of every poll tick.
+  // Cleared when the agent leaves `working`, when any signal goes fresh
+  // again, and in forgetAgent.
+  private workerStallWarned = new Set<string>();
+  // Injected by AgentSupervisor: delivers the worker_stalled supervisor event
+  // (EventBridge.onWorkerStalled). Left undefined in tests that don't
+  // exercise the stall seam (then the watchdog is warn-only via console).
+  private onWorkerStalled?: (agent: Agent, stalledForMs: number) => void;
+  // P1 §3 — single hook-transport drain callback (spool tailers + tmux
+  // option poll), injected by AgentSupervisor via setHookTransportPoller.
+  // Runs once per poll tick, before any per-agent work. Undefined in tests
+  // that don't exercise the transport seam.
+  private hookTransportPoller?: () => void;
   private now: () => number;
+  /** Injectable poll delay. Defaults to real `setTimeout`. Tests inject a
+   *  fake that advances the fake clock so {@link confirmSubmission} resolves
+   *  deterministically without real wall-clock waits. SEAM NOTE: this controls
+   *  only POLL/WINDOW timing — the confirmation COMPARISON
+   *  (`getLastStartHookEventAt > priorStartHookAt`) is Date.now-vs-Date.now
+   *  (hooks are recorded host-side with real `Date.now()`), independent of this
+   *  clock. See plan §2.4. */
+  private sleep: (ms: number) => Promise<void>;
 
   constructor(
     checkAlive: (agent: Agent) => Promise<boolean>,
@@ -227,6 +267,8 @@ export class StatusMonitor extends EventEmitter {
      *  have to thread a second function through. Production callers should
      *  always supply this. */
     getLastRawOutput?: (agentId: string) => number,
+    /** Optional injectable poll delay for {@link confirmSubmission}. */
+    sleep?: (ms: number) => Promise<void>,
   ) {
     super();
     this.checkAlive = checkAlive;
@@ -235,6 +277,21 @@ export class StatusMonitor extends EventEmitter {
     this.getAgentFn = getAgentFn;
     this.now = now;
     this.getOutputRingTail = getOutputRingTail;
+    this.sleep = sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
+  }
+
+  /** Inject the contract-vs-fallback predicate. AgentSupervisor wires its
+   *  `usesSubmitConfirmation` here so the reactive resend poller can skip
+   *  contract providers (the synchronous path owns their re-press). */
+  setSubmitConfirmationPredicate(fn: (agent: Agent) => boolean): void {
+    this.usesSubmitConfirmation = fn;
+  }
+
+  /** Inject the stalled-worker event sink. AgentSupervisor wires
+   *  EventBridge.onWorkerStalled here so checkWorkerStalled can notify the
+   *  workspace supervisor. */
+  setWorkerStalledHandler(fn: (agent: Agent, stalledForMs: number) => void): void {
+    this.onWorkerStalled = fn;
   }
 
   start(): void {
@@ -254,6 +311,17 @@ export class StatusMonitor extends EventEmitter {
    *  PTY/tmux pane. Without it, checkStartHookResend degrades to warn-only. */
   setResubmitHandler(fn: (agentId: string) => void): void {
     this.resubmit = fn;
+  }
+
+  /** P1 (plans/p1-hook-spool-multi-transport.md §3) — register the single
+   *  hook-transport poller. `poll()` invokes it EXACTLY ONCE at the very top
+   *  of each tick, before `getActiveAgents()` and therefore before any
+   *  per-agent watchdog/canary work, so a spool-delivered SessionStart
+   *  disarms the canary BEFORE the canary evaluates the same tick. The
+   *  supervisor registers one callback that drains all spool tailers and
+   *  (every 4th tick) fires the tmux pane-option poll. */
+  setHookTransportPoller(fn: () => void): void {
+    this.hookTransportPoller = fn;
   }
 
   /** Pipeline B has high-confidence end-of-turn truth. Bypasses
@@ -438,6 +506,8 @@ export class StatusMonitor extends EventEmitter {
     this.startHookResendCount.delete(agentId);
     this.lastStartHookResendAt.delete(agentId);
     this.canaryArmedAt.delete(agentId);
+    this.confirmInFlight.delete(agentId);
+    this.workerStallWarned.delete(agentId);
   }
 
   /** Class IV §2.3 — called by `AgentSupervisor.forceIdleFromHook` and
@@ -500,10 +570,13 @@ export class StatusMonitor extends EventEmitter {
     return this.canaryArmedAt.has(agentId);
   }
 
-  /** BUG-23 §watchdog reframe — called by `AgentSupervisor.sendInput` after a
-   *  send resolves. Used by the reframed Class IV watchdog to detect a
-   *  scaffold-broken supervised Claude worker (input went in, no hook came
-   *  back). */
+  /** BUG-23 §watchdog reframe — called by `AgentSupervisor._doSendInput` the
+   *  moment the body+Enter has been written, BEFORE the synchronous
+   *  confirm-and-retry wait (stamping after that wait would land the
+   *  timestamp PAST the observed UserPromptSubmit hook and trip a false
+   *  start-hook-silence warning — see the call-site comment). Used by the
+   *  reframed Class IV watchdog to detect a scaffold-broken supervised
+   *  Claude worker (input went in, no hook came back). */
   recordInputDelivered(agentId: string, ts: number = this.now()): void {
     this.lastInputDeliveredAt.set(agentId, ts);
     // Re-arm the start-hook silence watchdog for the new turn so a prior
@@ -564,7 +637,96 @@ export class StatusMonitor extends EventEmitter {
     return this.lastStartHookEventAt.get(agentId);
   }
 
+  /** Q6 launch-time self-test signal — has a UserPromptSubmit (`hook-start`)
+   *  event EVER fired for this agent since launch? Used by AgentSupervisor's
+   *  `usesSubmitConfirmation` to gate Codex onto the throwing contract only once
+   *  its start hook has provably fired (trusted+enabled for this launch). The
+   *  map is set by `recordStartHookEventAt` and cleared only by `forgetAgent`. */
+  hasObservedStartHook(agentId: string): boolean {
+    return this.lastStartHookEventAt.has(agentId);
+  }
+
+  /** Test seam — whether a synchronous confirm is in flight for an agent. */
+  isConfirmInFlight(agentId: string): boolean {
+    return this.confirmInFlight.has(agentId);
+  }
+
+  /** Synchronous submit confirmation (plan §1 part 1, §2.3, §2.4, Q4). Called by
+   *  `AgentSupervisor._doSendInput` AFTER the body + initial Enter were sent for
+   *  a contract provider. Confirms the submit actually started a turn by watching
+   *  for the UserPromptSubmit (`hook-start`) timestamp to advance past
+   *  `priorStartHookAt`; if the first window lapses unconfirmed, re-presses the
+   *  submit-only keystroke (via the injected `resubmit` handler — the C2
+   *  submit-only builder) up to MAX_SUBMIT_RETRIES times, polling after EACH
+   *  press including the last. Returns true on a confirmed turn start, false on
+   *  exhaustion (the caller surfaces `lastSendError` + throws).
+   *
+   *  `priorStartHookAt` MUST be captured by the caller BEFORE sending the body
+   *  (§2.3 pre-send baseline): a fast hook that POSTs before `sentAt` would
+   *  otherwise be missed and re-pressed after a real submit. It is a real
+   *  Date.now-based value (from `getLastStartHookEventAt`), so the `>` comparison
+   *  is host-clock-vs-host-clock regardless of the injectable poll clock.
+   *
+   *  While running, the agent is flagged `confirmInFlight` so the reactive
+   *  resend/silence pollers stand down (no double-press, no spurious warn). */
+  async confirmSubmission(agentId: string, priorStartHookAt: number): Promise<boolean> {
+    this.confirmInFlight.add(agentId);
+    try {
+      // First (widest) window — the initial body+Enter was already issued by
+      // the caller; just watch for the hook.
+      if (await this.pollForStartHook(agentId, priorStartHookAt, CONFIRM_WINDOW_FIRST_MS)) {
+        return true;
+      }
+      // Retry loop: submit-only re-press, then poll the (tighter) retry window.
+      // The final iteration is polled before the loop exits, so we never throw
+      // on an unconfirmed last press (§2.3).
+      for (let attempt = 1; attempt <= MAX_SUBMIT_RETRIES; attempt++) {
+        try {
+          this.resubmit?.(agentId);
+        } catch (err) {
+          console.error(`[confirm-submit] re-press failed for ${agentId}:`, err);
+        }
+        if (await this.pollForStartHook(agentId, priorStartHookAt, CONFIRM_WINDOW_RETRY_MS)) {
+          return true;
+        }
+      }
+      return false;
+    } finally {
+      this.confirmInFlight.delete(agentId);
+    }
+  }
+
+  /** Poll the start-hook timestamp for up to `windowMs`, returning true as soon
+   *  as it advances past `priorStartHookAt`. Checks immediately, then sleeps
+   *  CONFIRM_POLL_MS between checks. Window timing uses the injectable clock;
+   *  the comparison uses the Date.now-based recorded hook timestamp (see the
+   *  `sleep` field's SEAM NOTE). */
+  private async pollForStartHook(
+    agentId: string,
+    priorStartHookAt: number,
+    windowMs: number,
+  ): Promise<boolean> {
+    const deadline = this.now() + windowMs;
+    while (true) {
+      if ((this.lastStartHookEventAt.get(agentId) ?? 0) > priorStartHookAt) return true;
+      if (this.now() >= deadline) return false;
+      await this.sleep(CONFIRM_POLL_MS);
+    }
+  }
+
   private async poll(): Promise<void> {
+    // P1 §3 — drain the hook transports ONCE per tick (not once per agent),
+    // BEFORE any per-agent watchdog/canary work below: a spool-delivered
+    // SessionStart must disarm the canary before checkHookCanary evaluates
+    // this same tick. Synchronous by design for the spool; the tmux read is
+    // async and applies on completion (a tick of latency is fine for a
+    // 6 s-cadence backstop).
+    try {
+      this.hookTransportPoller?.();
+    } catch (err) {
+      console.warn('[status-monitor] hook transport poller failed this tick:', err);
+    }
+
     const agents = getActiveAgents();
     for (const agent of agents) {
       try {
@@ -593,6 +755,10 @@ export class StatusMonitor extends EventEmitter {
         // hook_status 'unknown' → 'broken' once the launch window elapses with
         // no hook event. Status itself is untouched; inference stays disabled.
         this.checkHookCanary(agent);
+        // Handoff handshake — stalled-worker watchdog. One-shot
+        // worker_stalled supervisor event when a worker sits `working` with
+        // zero PTY/hook/input signal for WORKER_STALL_WARN_MS.
+        this.checkWorkerStalled(agent);
 
         const newStatus = await this.inferStatus(agent);
         if (newStatus && newStatus !== agent.status) {
@@ -790,6 +956,9 @@ export class StatusMonitor extends EventEmitter {
   private checkStartHookSilence(agent: Agent): void {
     if (!(agent.isSupervised || agent.isWorker)) return;
     if (agent.status !== 'idle') return;
+    // A synchronous confirm is mid-flight — its first-window+retry budget is a
+    // legitimate not-yet-confirmed window; don't trip the silence warn.
+    if (this.confirmInFlight.has(agent.id)) return;
 
     const inputAt = this.lastInputDeliveredAt.get(agent.id);
     if (inputAt === undefined) return;
@@ -840,6 +1009,14 @@ export class StatusMonitor extends EventEmitter {
     if (!(agent.isSupervised || agent.isWorker)) return;
     // Hook-backed providers only — see method doc.
     if (agent.provider !== 'claude' && agent.provider !== 'codex') return;
+    // Coordination with the synchronous path (plan §coordination): contract
+    // providers re-press inside `_doSendInput`'s confirm-and-retry. The reactive
+    // poller remains ONLY the fallback for non-contract providers
+    // (unconfirmable-Codex). Skip if this agent uses the throwing contract, and
+    // skip while a confirm is mid-flight (belt-and-suspenders — the predicate
+    // already covers contract agents, this also guards the in-flight window).
+    if (this.confirmInFlight.has(agent.id)) return;
+    if (this.usesSubmitConfirmation?.(agent)) return;
     // `working` means the hook fired (submit took); only act from the idle lie.
     if (agent.status !== 'idle') return;
 
@@ -874,6 +1051,55 @@ export class StatusMonitor extends EventEmitter {
       this.resubmit(agent.id);
     } catch (err) {
       console.error(`[bug-10] resend Enter failed for ${agent.id}:`, err);
+    }
+  }
+
+  /** Handoff handshake — stalled-worker watchdog. A supervised/worker-lane
+   *  agent in `working` whose every signal (raw PTY output, hook events,
+   *  delivered input) is older than WORKER_STALL_WARN_MS is presumed stuck:
+   *  a live turn keeps the PTY streaming (token output or spinner redraws
+   *  advance lastRawOutputTime), and a worker that never finishes will never
+   *  emit the Stop hook the supervisor is waiting on. Fires the injected
+   *  worker_stalled sink ONCE per working stretch; re-arms when the agent
+   *  leaves `working` or any signal goes fresh again.
+   *
+   *  Workers only: non-worker agents have PTY inference active, which
+   *  already flips a silent agent to idle (and notifies via status_change).
+   */
+  private checkWorkerStalled(agent: Agent): void {
+    if (!(agent.isSupervised || agent.isWorker)) return;
+    if (agent.status !== 'working') {
+      this.workerStallWarned.delete(agent.id);
+      return;
+    }
+
+    const lastSignal = Math.max(
+      this.getLastRawOutput(agent.id),
+      this.lastHookEventAt.get(agent.id) ?? 0,
+      this.lastInputDeliveredAt.get(agent.id) ?? 0,
+    );
+    // No reference point at all (e.g. monitor restarted mid-turn and the
+    // runner has produced no output since) — don't guess.
+    if (lastSignal <= 0) return;
+
+    const stalledForMs = this.now() - lastSignal;
+    if (stalledForMs < WORKER_STALL_WARN_MS) {
+      // Signal is fresh again — re-arm for a future stall in this stretch.
+      this.workerStallWarned.delete(agent.id);
+      return;
+    }
+    if (this.workerStallWarned.has(agent.id)) return;
+    this.workerStallWarned.add(agent.id);
+
+    const mins = Math.round(stalledForMs / 60000);
+    console.warn(
+      `[stall-watchdog] ${agent.provider} worker ${agent.id} ("${agent.title}") has been ` +
+      `'working' with zero PTY/hook signal for ~${mins} min — presumed stalled.`
+    );
+    try {
+      this.onWorkerStalled?.(agent, stalledForMs);
+    } catch (err) {
+      console.error(`[stall-watchdog] worker_stalled sink failed for ${agent.id}:`, err);
     }
   }
 

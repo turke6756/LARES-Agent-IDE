@@ -160,6 +160,9 @@ export default function AgentMarkdown({ content, agentId }: { content: string; a
                   background: 'transparent',
                   fontSize: '12px',
                   lineHeight: '1.5',
+                  // Long lines scroll inside the code block, never the chat pane.
+                  overflowX: 'auto',
+                  maxWidth: '100%',
                 }}
               >
                 {String(children).replace(/\n$/, '')}

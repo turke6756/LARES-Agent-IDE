@@ -10,11 +10,12 @@ import type {
   UsageEvent,
   SystemInitEvent,
 } from '../../../shared/session-events';
-import { DEFAULT_CONTEXT_WINDOW_TOKENS, getContextWindowForModel } from '../../../shared/constants';
+import { DEFAULT_CONTEXT_WINDOW_TOKENS, CONTEXT_GAUGE_CAP_TOKENS, getContextWindowForModel } from '../../../shared/constants';
 import type { AgentProvider } from '../../../shared/types';
 import {
   flattenToolResultContent,
-  resolveHomeSubdir,
+  resolveWindowsHomeSubdir,
+  resolveWslHomeSubdir,
   truncateForChat,
   type ChatLogReader,
   type ChatLogReaderSession,
@@ -32,8 +33,13 @@ const EOF_STREAK_REREGISTER = 3;
 export class ClaudeJsonlReader implements ChatLogReader {
   readonly provider: AgentProvider = 'claude';
 
-  private windowsProjectsDir: string | null = null;
-  private wslProjectsUncDir: string | null = null;
+  // Base dirs resolve lazily and self-heal (see resolveWslHomeSubdir in
+  // types.ts): a failed WSL discovery at app startup must not permanently
+  // disable chat attach for WSL agents. Tri-state: `undefined` = not yet
+  // resolved (accessors keep retrying), `null` = pinned absent (tests),
+  // string = resolved (cached for the reader's lifetime).
+  private windowsProjectsDir: string | null | undefined = undefined;
+  private wslProjectsUncDir: string | null | undefined = undefined;
 
   private resolvedPaths = new Map<string, string>(); // agentId -> jsonlPath
   private fileOffsets = new Map<string, number>(); // jsonlPath -> byte offset
@@ -43,10 +49,18 @@ export class ClaudeJsonlReader implements ChatLogReader {
   private toolResultLocations = new Map<string, ToolResultLocation>(); // `${agentId}:${toolUseId}`
   private eofStreak = new Map<string, number>(); // agentId
 
-  constructor() {
-    const { windowsDir, wslUncDir } = resolveHomeSubdir('.claude/projects');
-    this.windowsProjectsDir = windowsDir;
-    this.wslProjectsUncDir = wslUncDir;
+  private getWindowsProjectsDir(): string | null {
+    if (this.windowsProjectsDir !== undefined) return this.windowsProjectsDir;
+    const dir = resolveWindowsHomeSubdir('.claude/projects');
+    if (dir) this.windowsProjectsDir = dir;
+    return dir;
+  }
+
+  private getWslProjectsDir(): string | null {
+    if (this.wslProjectsUncDir !== undefined) return this.wslProjectsUncDir;
+    const dir = resolveWslHomeSubdir('.claude/projects');
+    if (dir) this.wslProjectsUncDir = dir;
+    return dir;
   }
 
   invalidatePath(agentId: string): void {
@@ -68,17 +82,20 @@ export class ClaudeJsonlReader implements ChatLogReader {
     const slug = this.makeSlug(workingDirectory);
     const fileName = `${sessionId}.jsonl`;
 
-    if (workingDirectory.startsWith('/') && this.wslProjectsUncDir) {
-      const jsonlPath = path.join(this.wslProjectsUncDir, slug, fileName);
+    const wslDir = this.getWslProjectsDir();
+    const windowsDir = this.getWindowsProjectsDir();
+
+    if (workingDirectory.startsWith('/') && wslDir) {
+      const jsonlPath = path.join(wslDir, slug, fileName);
       if (fs.existsSync(jsonlPath)) return true;
     }
 
-    if (this.windowsProjectsDir) {
-      const jsonlPath = path.join(this.windowsProjectsDir, slug, fileName);
+    if (windowsDir) {
+      const jsonlPath = path.join(windowsDir, slug, fileName);
       if (fs.existsSync(jsonlPath)) return true;
     }
 
-    const dirsToScan = [this.windowsProjectsDir, this.wslProjectsUncDir].filter(Boolean) as string[];
+    const dirsToScan = [windowsDir, wslDir].filter(Boolean) as string[];
     for (const baseDir of dirsToScan) {
       try {
         const dirs = fs.readdirSync(baseDir);
@@ -356,7 +373,11 @@ export class ClaudeJsonlReader implements ChatLogReader {
 
       const usage = msg.usage;
       if (usage) {
-        const contextWindowMax = getContextWindowForModel(model) || DEFAULT_CONTEXT_WINDOW_TOKENS;
+        // Gauge policy: 100% = 200K even on 1M-window models.
+        const contextWindowMax = Math.min(
+          getContextWindowForModel(model) || DEFAULT_CONTEXT_WINDOW_TOKENS,
+          CONTEXT_GAUGE_CAP_TOKENS
+        );
         const inputTokens = usage.input_tokens || 0;
         const cacheCreationTokens = usage.cache_creation_input_tokens || 0;
         const cacheReadTokens = usage.cache_read_input_tokens || 0;
@@ -397,23 +418,26 @@ export class ClaudeJsonlReader implements ChatLogReader {
     const slug = this.makeSlug(workingDirectory);
     const fileName = `${sessionId}.jsonl`;
 
-    if (workingDirectory.startsWith('/') && this.wslProjectsUncDir) {
-      const jsonlPath = path.join(this.wslProjectsUncDir, slug, fileName);
+    const wslDir = this.getWslProjectsDir();
+    const windowsDir = this.getWindowsProjectsDir();
+
+    if (workingDirectory.startsWith('/') && wslDir) {
+      const jsonlPath = path.join(wslDir, slug, fileName);
       if (fs.existsSync(jsonlPath)) {
         this.resolvedPaths.set(session.agentId, jsonlPath);
         return jsonlPath;
       }
     }
 
-    if (this.windowsProjectsDir) {
-      const jsonlPath = path.join(this.windowsProjectsDir, slug, fileName);
+    if (windowsDir) {
+      const jsonlPath = path.join(windowsDir, slug, fileName);
       if (fs.existsSync(jsonlPath)) {
         this.resolvedPaths.set(session.agentId, jsonlPath);
         return jsonlPath;
       }
     }
 
-    const dirsToScan = [this.windowsProjectsDir, this.wslProjectsUncDir].filter(Boolean) as string[];
+    const dirsToScan = [windowsDir, wslDir].filter(Boolean) as string[];
     for (const baseDir of dirsToScan) {
       try {
         const dirs = fs.readdirSync(baseDir);

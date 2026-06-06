@@ -8,12 +8,17 @@ import { Agent, AgentStatus, ContextStats, LaunchAgentInput, QueryResult, Team }
 import {
   TMUX_SESSION_PREFIX, DEFAULT_COMMAND, DEFAULT_COMMAND_WSL, PROVIDER_COMMANDS,
   SUPERVISOR_AGENT_NAME, SUPERVISOR_AGENT_MD, SUPERVISOR_MEMORY_MD,
-  SUPERVISOR_CLAUDE_SETTINGS_JSON, SUPERVISOR_RUN_ORCHESTRATION_SKILL, SUPERVISOR_ORCHESTRATION_SPIKE_SKILL,
+  SUPERVISOR_CLAUDE_SETTINGS_JSON, SUPERVISOR_CLAUDE_SETTINGS_JSON_V1,
+  SUPERVISOR_RUN_ORCHESTRATION_SKILL, SUPERVISOR_ORCHESTRATION_SPIKE_SKILL,
   SCRIPT_READ_AGENT_LOG, SCRIPT_LIST_AGENTS, SCRIPT_SEND_MESSAGE, SCRIPT_GET_CONTEXT_STATS,
-  WORKER_CLAUDE_MD, WORKER_CLAUDE_SETTINGS_JSON, WORKER_CLAUDE_SETTINGS_JSON_V2,
+  WORKER_CLAUDE_MD, WORKER_CLAUDE_SETTINGS_JSON, WORKER_CLAUDE_SETTINGS_JSON_V2, WORKER_CLAUDE_SETTINGS_JSON_V3,
+  WORKER_CLAUDE_SETTINGS_JSON_V4,
   WORKER_CODEX_CONFIG_TOML, WORKER_CODEX_CONFIG_TOML_V1, WORKER_CODEX_CONFIG_TOML_V2,
-  DASHBOARD_STATUS_SCRIPT_MJS, DASHBOARD_STATUS_SCRIPT_MJS_V3,
+  DASHBOARD_STATUS_SCRIPT_MJS, DASHBOARD_STATUS_SCRIPT_MJS_V3, DASHBOARD_STATUS_SCRIPT_MJS_V4, DASHBOARD_STATUS_SCRIPT_MJS_V5,
+  DASHBOARD_STATUS_SCRIPT_MJS_V6,
   CODEX_WORKER_PROFILE_NAME, CODEX_WORKER_PROFILE_TOML, HOOK_CANARY_WINDOW_MS,
+  MAX_SUBMIT_RETRIES, HANDSHAKE_CONFIRM_WINDOW_MS, HANDSHAKE_CONFIRM_POLL_MS,
+  TMUX_OPTION_MAX_AGE_MS, TMUX_OPTION_LAUNCH_SKEW_MS, STATUS_POLL_INTERVAL_MS,
 } from '../../shared/constants';
 import { EventBridge, EventBridgeDeps } from './event-bridge';
 import { TeamMessageDeliveryEngine } from './team-delivery';
@@ -41,11 +46,209 @@ import {
   updateAgentAttached, addEvent, deleteAgent as dbDeleteAgent,
   updateAgentResumeSessionId, addFileActivity, getTeamMembership, getAgentTemplate,
   getFileActivities, deleteFileActivitiesForAgent, updateAgentHookStatus,
+  updateAgentLastSendError,
 } from '../database';
 import { detectPathType, windowsToWslPath, uncToWslPath, wslToWindowsPath } from '../path-utils';
 import { getScriptPath } from './paths';
-import { tmuxListSessions, tmuxSendInput, tmuxSendSubmit } from '../wsl-bridge';
+import { tmuxListSessions, tmuxSendInput, tmuxSendSubmit, tmuxReadStatusOptions, shQuote } from '../wsl-bridge';
 import { getWindowsSubmitSequence } from './send-input-encoders';
+import { HookSpoolTailer, resolveSpoolReadPath, canonicalSpoolKey } from './hook-spool-tailer';
+
+// ── Codex hook-trust seeding (B8; docs/HOOK_SYSTEM_DESIGN.md §8.5) ──────
+//
+// Codex gates every hook behind a per-hook trust check keyed by a content hash
+// of the hook command. When `ensureCodexHookProfile` rewrites the shared profile
+// it must seed that trust itself, or every app restart re-gates Codex workers at
+// the interactive trust-review panel (and `--dangerously-bypass-hook-trust` can
+// only run *already-trusted* hooks, never a newly-added one). The hash recipe
+// below was confirmed byte-for-byte against the values Codex 0.135 persisted when
+// a user pressed `t` (the three ground-truth hashes in §8.5).
+
+/** The verb each `[[hooks.<Event>]]` TOML table maps to in Codex's trust key
+ *  (lower-snake event id used in the `[hooks.state]` key). */
+const CODEX_HOOK_EVENT_IDS: Record<string, string> = {
+  Stop: 'stop',
+  UserPromptSubmit: 'user_prompt_submit',
+  SessionStart: 'session_start',
+};
+
+interface CodexProfileHook { event: string; command: string }
+
+/** Recursively sort object keys and drop null/undefined fields, so the result
+ *  serializes to the compact, key-sorted JSON Codex hashes. */
+function codexNormalizeForHash(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(codexNormalizeForHash);
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const k of Object.keys(value as Record<string, unknown>).sort()) {
+      const v = (value as Record<string, unknown>)[k];
+      if (v === null || v === undefined) continue;
+      out[k] = codexNormalizeForHash(v);
+    }
+    return out;
+  }
+  return value;
+}
+
+/** Compute Codex's `trusted_hash` for one hook command. The hashed identity is
+ *  `{ event_name, hooks: [{ type:'command', command, timeout, async:false }] }`
+ *  serialized as compact JSON with recursively-sorted keys. Verified against the
+ *  real persisted hashes (§8.5). `timeout` defaults to 30 — the value the
+ *  profile installs (Codex's own default would be 600). */
+export function codexHookTrustHash(eventName: string, command: string, timeout = 30): string {
+  const identity = {
+    event_name: eventName,
+    hooks: [{ type: 'command', command, timeout, async: false }],
+  };
+  const json = JSON.stringify(codexNormalizeForHash(identity));
+  return 'sha256:' + crypto.createHash('sha256').update(json, 'utf-8').digest('hex');
+}
+
+/** Parse the substituted profile TOML for the hooks it installs, in document
+ *  order, pairing each `[[hooks.<Event>.hooks]]` command with its event id.
+ *  Reads the ACTUAL command strings (post `__SCRIPT__` substitution) so the
+ *  seeded hashes can never drift from what Codex will hash at load time. */
+export function parseCodexProfileHooks(profileToml: string): CodexProfileHook[] {
+  const hooks: CodexProfileHook[] = [];
+  let currentEvent: string | null = null;
+  for (const raw of profileToml.split(/\r?\n/)) {
+    const line = raw.trim();
+    const hdr = line.match(/^\[\[hooks\.([A-Za-z]+)\]\]$/);
+    if (hdr) { currentEvent = CODEX_HOOK_EVENT_IDS[hdr[1]] ?? null; continue; }
+    const cmd = line.match(/^command\s*=\s*'(.*)'$/);
+    if (cmd && currentEvent) hooks.push({ event: currentEvent, command: cmd[1] });
+  }
+  return hooks;
+}
+
+/** Build the `[hooks.state]` section pre-trusting every hook the profile
+ *  installs, keyed exactly as Codex keys it: `<config-abs-path>:<event>:0:0`
+ *  (one hook block / one command each ⇒ position is always 0:0). Only
+ *  `trusted_hash` is written — that alone is what pressing `t` persists and is
+ *  sufficient for hooks to fire (§8.5). `configAbsPath` must match the on-disk
+ *  path form Codex sees: native backslashes on Windows, posix in WSL. */
+export function buildCodexHooksStateSection(configAbsPath: string, hooks: CodexProfileHook[]): string {
+  let out = '\n[hooks.state]\n';
+  for (const h of hooks) {
+    const hash = codexHookTrustHash(h.event, h.command);
+    out += `\n[hooks.state.'${configAbsPath}:${h.event}:0:0']\n`;
+    out += `trusted_hash = "${hash}"\n`;
+  }
+  return out;
+}
+
+/** A profile + seeded-trust write can be skipped iff the on-disk file already
+ *  has the identical hook body AND every trusted_hash we'd seed. That makes a
+ *  plain restart non-destructive (it never wipes a user's manual `t`) while
+ *  still re-seeding when the body changes (new/edited hook ⇒ new command hash)
+ *  or when trust is missing (a prior clobber wiped it). */
+export function codexProfileTrustIntact(
+  existing: string | null,
+  profileBody: string,
+  hooks: CodexProfileHook[],
+): boolean {
+  if (!existing) return false;
+  const existingBody = existing.split(/\n?\[hooks\.state\]/)[0];
+  if (existingBody.trimEnd() !== profileBody.trimEnd()) return false;
+  return hooks.every(h => existing.includes(codexHookTrustHash(h.event, h.command)));
+}
+
+// ── Provider directory trust (BUG-25 family) ────────────────────────────
+//
+// Both CLIs gate startup on a per-directory trust list in user-global config:
+//   - Codex: `~/.codex/config.toml` `[projects."<abs path>"] trust_level = "trusted"`.
+//     In an untrusted dir Codex either prints the "add ... as a trusted project"
+//     banner and skips project-local config (BUG-25), or — observed live in the
+//     UAP_Phenomina workspace, codex 0.136 — dies silently the moment the
+//     kickoff prompt arrives, with an empty log.
+//   - Claude: `~/.claude.json` `projects["<abs path>"].hasTrustDialogAccepted`.
+//     Untrusted dirs pop the interactive "Do you trust the files in this
+//     folder?" dialog, which a headless worker can never answer.
+// The dashboard knows every directory it launches agents into, so it seeds
+// these entries at launch time. Gemini runs `--yolo` and has no equivalent
+// gate today, so it is skipped.
+
+/** The path-key variants Codex may match a Windows trusted project by.
+ *  Codex 0.136 was observed rejecting a lowercase-only entry and accepting the
+ *  exact-case / `\\?\`-extended forms; older entries on real machines are
+ *  lowercase. Write all three so the trust survives codex version drift. */
+export function codexTrustPathVariants(dir: string, pathType: string): string[] {
+  if (pathType !== 'windows') return [dir.replace(/\/+$/, '') || dir];
+  const exact = dir.replace(/\//g, '\\').replace(/\\+$/, '');
+  return [...new Set([exact, exact.toLowerCase(), `\\\\?\\${exact}`])];
+}
+
+/** Append-only merge of `[projects.'<path>'] trust_level = "trusted"` blocks
+ *  into the user-global codex config. Never rewrites existing content — new
+ *  tables are appended at EOF, which is valid TOML regardless of what table
+ *  the file currently ends in. Returns the new file content, or null when
+ *  every path is already present (no write needed). */
+export function mergeCodexProjectTrust(existing: string | null, dirs: string[]): string | null {
+  const body = existing ?? '';
+  const present = new Set<string>();
+  // Literal (single-quoted) keys carry their bytes as-is; basic (double-quoted)
+  // keys may contain backslash escapes, so the alternation must let `\"` pass
+  // through the capture instead of terminating it.
+  const keyRe = /^\s*\[projects\.(?:'([^']+)'|"((?:[^"\\]|\\.)+)")\]\s*$/gm;
+  let m: RegExpExecArray | null;
+  while ((m = keyRe.exec(body)) !== null) {
+    if (m[1] !== undefined) {
+      // TOML literal string — byte-for-byte, no escapes.
+      present.add(m[1]);
+    } else {
+      // TOML basic string — unescape before comparing, or an existing
+      // escaped Windows key like [projects."C:\\Users\\x"] never matches the
+      // single-backslash dir string and the merge appends a SEMANTICALLY
+      // duplicate [projects.'C:\Users\x'] table, which makes the whole codex
+      // config invalid (codex stops loading config entirely). Minimum
+      // unescapes for path keys: `\\` → `\` and `\"` → `"`; other escapes
+      // (\t, \n, \uXXXX) can't appear in real directory keys and are left raw.
+      present.add(m[2].replace(/\\([\\"])/g, '$1'));
+    }
+  }
+  let appended = '';
+  for (const d of dirs) {
+    if (present.has(d) || d.includes("'")) continue;  // single quote can't appear in a TOML literal key
+    appended += `\n[projects.'${d}']\ntrust_level = "trusted"\n`;
+    present.add(d);
+  }
+  if (!appended) return null;
+  const sep = body.length > 0 && !body.endsWith('\n') ? '\n' : '';
+  return body + sep + appended;
+}
+
+/** Merge `hasTrustDialogAccepted: true` into `~/.claude.json` project entries.
+ *  Keys use Claude's observed on-disk form (forward slashes, exact case).
+ *  Preserves every other field in an existing entry; refuses to touch a file
+ *  it can't parse (never clobber the user's global Claude state). Returns the
+ *  new file content, or null when nothing needs writing. */
+export function mergeClaudeProjectTrust(existingJson: string | null, dirs: string[]): string | null {
+  let root: Record<string, unknown> = {};
+  if (existingJson && existingJson.trim().length > 0) {
+    try {
+      const parsed = JSON.parse(existingJson);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+      root = parsed as Record<string, unknown>;
+    } catch {
+      return null;
+    }
+  }
+  const projects = (root.projects && typeof root.projects === 'object' && !Array.isArray(root.projects))
+    ? root.projects as Record<string, Record<string, unknown>>
+    : {};
+  root.projects = projects;
+  let changed = false;
+  for (const dir of dirs) {
+    const entry = projects[dir];
+    if (entry && typeof entry === 'object' && (entry as Record<string, unknown>).hasTrustDialogAccepted === true) continue;
+    projects[dir] = {
+      ...(entry && typeof entry === 'object' ? entry : {}),
+      hasTrustDialogAccepted: true,
+    };
+    changed = true;
+  }
+  return changed ? JSON.stringify(root, null, 2) : null;
+}
 
 // ── Scaffold versioning (plans/scaffold-version-migration.md) ──────────
 
@@ -60,6 +263,55 @@ export interface ScaffoldFile {
   version: number;
   previousHashes?: Record<number, string>;
 }
+
+/** C1 — raised by `_doSendInput` when synchronous confirm-and-retry exhausts
+ *  for a contract provider: the body was delivered but no turn ever started
+ *  (every submit Enter was dropped). The chat-bar IPC path surfaces this via
+ *  `onSendInputError`; fire-and-forget callers read the persisted
+ *  `agent.lastSendError` instead. */
+export class SubmitNotConfirmedError extends Error {
+  readonly agentId: string;
+  constructor(message: string, agentId: string) {
+    super(message);
+    this.name = 'SubmitNotConfirmedError';
+    this.agentId = agentId;
+  }
+}
+
+// ── P1 multi-transport hook delivery (plans/p1-hook-spool-multi-transport.md §2) ──
+
+/** Which channel delivered a hook event to the central applier. */
+export type HookTransport = 'http' | 'spool' | 'tmux-option';
+
+/** One hook event record, normalized from any transport. The v7 hook script
+ *  writes the SAME record to the spool, the HTTP POST body, and the tmux pane
+ *  option, so the dedupe key `{ts, hookEventName, turnId}` is byte-identical
+ *  across channels. `legacy: true` marks a v≤6 HTTP body (no
+ *  hookEventName/turnId meta) — those bypass dedupe/freshness/ordering and get
+ *  exactly today's behavior. */
+export interface ParsedHookEvent {
+  v?: number;
+  /** Self-reported agent id (validated against the addressed agent when present). */
+  agentId?: string;
+  state: 'idle' | 'working' | 'active';
+  /** Original hook source: 'hook-stop' | 'hook-start' | 'hook-session-start'.
+   *  Kept for diagnostics; the source passed to the status flip is
+   *  transport-determined (see applyHookStatusEvent step 8). */
+  source?: string;
+  /** Script-side Date.now() — the dedupe/ordering clock. NEVER used for
+   *  stamping (the applier stamps with its own host-clock receivedAt). */
+  ts: number;
+  hookEventName?: string;
+  turnId?: string;
+  sessionId?: string;
+  /** v≤6 HTTP body — bypass dedupe/freshness/ordering (steps 3–5). */
+  legacy?: boolean;
+}
+
+export type HookApplyResult = 'applied' | 'duplicate' | 'stale' | 'invalid';
+
+/** LRU cap for the per-agent applied-event dedupe registry. */
+const APPLIED_HOOK_EVENTS_MAX = 200;
 
 /** Sidecar tracks the on-disk version of every managed scaffold file in a
  *  workspace. Keyed by path relative to `.dashboard/`, no leading slash,
@@ -408,6 +660,10 @@ export class AgentSupervisor extends EventEmitter {
   /** Per-runtime guard so the codex hook profile is (re)written at most once
    *  per process per pathType — see ensureCodexHookProfile. */
   private codexHookProfileEnsured = new Set<string>();
+  /** Directories already trust-seeded this app run, keyed by
+   *  `pathType|provider|dirs` — avoids re-reading user-global config on every
+   *  launch into an already-provisioned workspace. */
+  private providerTrustEnsured = new Set<string>();
 
   // Event bridge — supervisor notification, cooldown, queue, drain state lives here.
   private bridge: EventBridge;
@@ -424,7 +680,7 @@ export class AgentSupervisor extends EventEmitter {
   // 'working' while typing is in progress (the status monitor cannot infer
   // 'working' on its own here — typed-char echoes do not count as a
   // "meaningful burst", so it would otherwise read 'idle' the entire time).
-  private inputQueues = new Map<string, Promise<void>>();
+  private inputQueues = new Map<string, Promise<unknown>>();
   private inputInFlight = new Set<string>();
 
   // BUG-11: epoch-ms of the last user-initiated PTY write per agent. Bumped
@@ -434,6 +690,41 @@ export class AgentSupervisor extends EventEmitter {
   // directly. The event bridge reads this via `getLastUserPtyWriteAt` to
   // defer auto-submitting events while the user is actively typing.
   private lastUserPtyWriteAt = new Map<string, number>();
+
+  // ── P1 multi-transport hook state (plans/p1-hook-spool-multi-transport.md §2) ──
+  // Applied-event dedupe registry: agentId → insertion-ordered Set of
+  // `${ts}:${hookEventName}:${turnId}` keys, LRU-capped at
+  // APPLIED_HOOK_EVENTS_MAX per agent. ONLY applyHookStatusEvent touches it —
+  // no transport dedupes on its own.
+  private appliedHookEvents = new Map<string, Set<string>>();
+  // Ordering guard: highest event `ts` applied per agent. An event with an
+  // older ts than this is 'stale' (a laggy spool/tmux read must not flap a
+  // newer HTTP-applied state).
+  private lastAppliedHookTs = new Map<string, number>();
+  // §2 step 4a current-launch guard — wallclock stamped IMMEDIATELY BEFORE the
+  // actual runner launch (both lanes). A tmux-option event older than this
+  // launch (minus TMUX_OPTION_LAUNCH_SKEW_MS) belongs to a previous run of the
+  // pane and is rejected as 'stale'. Distinct from the monitor's BUG-23
+  // `launchedAt`, which is cleared on promotion and therefore not durable.
+  private launchStartedAt = new Map<string, number>();
+  // Rate limiter for invalid-event warnings (per agent, 60 s).
+  private lastInvalidHookWarnAt = new Map<string, number>();
+  // §3 — spool tailers, keyed by CANONICAL spool read path (the resolved
+  // Windows-side path the tailer actually opens — UNC form for WSL
+  // workspaces), NOT by workspace id: the same logical workspace reached via
+  // Windows and WSL path forms must never spawn two tailers on one file.
+  // Created on the first worker-lane launch resolving to that path, disposed
+  // when the last worker using it stops.
+  private spoolTailers = new Map<string, HookSpoolTailer>();
+  // spool key → agent ids currently using it (drives disposal).
+  private spoolUsers = new Map<string, Set<string>>();
+  // agent id → its spool key (reverse index for release on exit/delete).
+  private agentSpoolKey = new Map<string, string>();
+  // §4 — counts transport-poller invocations so the tmux pane-option poll
+  // runs every 4th tick (~6 s at the 1.5 s poll cadence).
+  private hookTransportTick = 0;
+  // §4 — guards against overlapping async tmux polls on slow wsl.exe.
+  private tmuxOptionPollInFlight = false;
 
   constructor() {
     super();
@@ -464,11 +755,27 @@ export class AgentSupervisor extends EventEmitter {
 
     // BUG-10 — give the monitor a way to replay a dropped submit keystroke.
     this.monitor.setResubmitHandler((agentId) => this.resubmitEnter(agentId));
+    // Submit-confirmation (plan §coordination) — centralize the contract-vs-
+    // fallback matrix in `usesSubmitConfirmation` and share it with the monitor
+    // so the reactive resend poller skips contract providers (the synchronous
+    // path owns their re-press; reactive stays the fallback for the rest).
+    this.monitor.setSubmitConfirmationPredicate((agent) => this.usesSubmitConfirmation(agent));
+    // Handoff handshake — route the stalled-worker watchdog to the workspace
+    // supervisor as a worker_stalled [DASHBOARD EVENT]. The bridge re-gates
+    // on isSupervised, so plain (unsupervised) workers stay console-only.
+    this.monitor.setWorkerStalledHandler((agent, stalledForMs) => {
+      void this.bridge.onWorkerStalled({ agent, stalledForMs });
+    });
+    // P1 §3 — single hook-transport poller: StatusMonitor.poll() invokes this
+    // exactly once at the top of every tick, before any per-agent
+    // watchdog/canary work. Drains all spool tailers synchronously and fires
+    // the (async) tmux pane-option poll every 4th tick.
+    this.monitor.setHookTransportPoller(() => this.pollHookTransports());
 
     const bridgeDeps: EventBridgeDeps = {
       getAgent: (id) => getAgent(id),
       getSupervisorForWorker: (worker) => getSupervisorAgent(worker.workspaceId),
-      sendInput: (supervisorId, text) => this.sendInput(supervisorId, text),
+      sendInput: async (supervisorId, text) => { await this.sendInput(supervisorId, text); },
       addAuditEvent: (agentId, type, payload) => { addEvent(agentId, type, payload); },
       getAgentLog: (agentId, lines) => this.getAgentLog(agentId, lines),
       getContextStats: (agentId) => this.contextStatsMonitor.getStats(agentId),
@@ -839,6 +1146,13 @@ export class AgentSupervisor extends EventEmitter {
       // config (see CODEX_WORKER_PROFILE_TOML). Ensure it exists for this runtime.
       if (provider === 'codex') this.ensureCodexHookProfile(pathType);
     }
+    // Pre-trust the workspace root + agent cwd in the provider's user-global
+    // config (every lane — worker, supervisor, persona, legacy root-cwd). A
+    // fresh workspace otherwise hits the CLI's directory-trust gate: Claude
+    // blocks on the interactive "Do you trust the files in this folder?"
+    // dialog; Codex skips its hook config (BUG-25) or dies silently at the
+    // first prompt (observed live, codex 0.136 at an untrusted workspace root).
+    this.ensureProviderDirTrust(workDir, agentCwd, provider, pathType);
     // Write .mcp.json to workspace root and agent subdir (if persona or supervisor)
     if (resolvedInput.isSupervisor || resolvedInput.persona) {
       this.ensureMcpConfig(workDir, pathType);
@@ -889,7 +1203,11 @@ export class AgentSupervisor extends EventEmitter {
       version: 2,
       previousHashes: { 1: SUPERVISOR_AGENT_MD_V1_HASH },
     },
-    [`.dashboard/supervisor/.claude/settings.json`]:                                  { content: SUPERVISOR_CLAUDE_SETTINGS_JSON,      version: 1 },
+    [`.dashboard/supervisor/.claude/settings.json`]:                                  {
+      content: SUPERVISOR_CLAUDE_SETTINGS_JSON,
+      version: 2,
+      previousHashes: { 1: sha256Hex(SUPERVISOR_CLAUDE_SETTINGS_JSON_V1) },
+    },
     [`.dashboard/supervisor/.claude/skills/run-orchestration/SKILL.md`]:              {
       content: SUPERVISOR_RUN_ORCHESTRATION_SKILL,
       version: 2,
@@ -910,17 +1228,26 @@ export class AgentSupervisor extends EventEmitter {
    *  v2 added DASHBOARD_HOST support + pending-status.jsonl failure logging.
    *  v3 reads `state` from argv[2] so the UserPromptSubmit hook can post
    *  `'working'`. v4 adds the `session-start` argv → state 'active' branch
-   *  (launch canary, HOOK_SYSTEM_DESIGN.md §A). All previous hashes are
-   *  recorded for silent upgrade. */
+   *  (launch canary, HOOK_SYSTEM_DESIGN.md §A). v5 raises the POST self-abort
+   *  1500ms → 2500ms so a slow hook POST isn't cancelled before the synchronous
+   *  submit-confirm window (plan §2.4). v6 ignores SubagentStop so a Task-tool
+   *  subagent finishing mid-turn can't flip the still-working main agent idle.
+   *  v7 (P1, plans/p1-hook-spool-multi-transport.md §1) reads stdin meta,
+   *  always-writes the spool (DASHBOARD_SPOOL_PATH env), and adds the tmux
+   *  pane-option transport — one record, three channels.
+   *  All previous hashes are recorded for silent upgrade. */
   private static WORKSPACE_SCRIPT_FILES: Record<string, ScaffoldFile> = {
     [`.dashboard/scripts/dashboard-status.mjs`]: {
       content: DASHBOARD_STATUS_SCRIPT_MJS,
-      version: 4,
+      version: 7,
       executable: true,
       previousHashes: {
         1: DASHBOARD_STATUS_SCRIPT_V1_HASH,
         2: DASHBOARD_STATUS_SCRIPT_V2_HASH,
         3: sha256Hex(DASHBOARD_STATUS_SCRIPT_MJS_V3),
+        4: sha256Hex(DASHBOARD_STATUS_SCRIPT_MJS_V4),
+        5: sha256Hex(DASHBOARD_STATUS_SCRIPT_MJS_V5),
+        6: sha256Hex(DASHBOARD_STATUS_SCRIPT_MJS_V6),
       },
     },
   };
@@ -930,15 +1257,21 @@ export class AgentSupervisor extends EventEmitter {
    *  by convention — nothing per-agent ever writes here.
    *
    *  settings.json v2 adds the UserPromptSubmit hook (paste-race fix).
-   *  v3 adds the SessionStart hook (launch canary, HOOK_SYSTEM_DESIGN.md §A). */
+   *  v3 adds the SessionStart hook (launch canary, HOOK_SYSTEM_DESIGN.md §A).
+   *  v4 drops the SubagentStop hook — it POSTed idle whenever a Task-tool
+   *  subagent finished while the main agent was still mid-turn.
+   *  v5 adds autoCompactEnabled: false — workers must not silently
+   *  auto-compact mid-task regardless of user-level Claude settings. */
   private static WORKER_FILES_CLAUDE: Record<string, ScaffoldFile> = {
     [`.dashboard/workers/claude/CLAUDE.md`]:                       { content: WORKER_CLAUDE_MD,             version: 1 },
     [`.dashboard/workers/claude/.claude/settings.json`]:           {
       content: WORKER_CLAUDE_SETTINGS_JSON,
-      version: 3,
+      version: 5,
       previousHashes: {
         1: WORKER_CLAUDE_SETTINGS_JSON_V1_HASH,
         2: sha256Hex(WORKER_CLAUDE_SETTINGS_JSON_V2),
+        3: sha256Hex(WORKER_CLAUDE_SETTINGS_JSON_V3),
+        4: sha256Hex(WORKER_CLAUDE_SETTINGS_JSON_V4),
       },
     },
   };
@@ -1321,10 +1654,17 @@ export class AgentSupervisor extends EventEmitter {
    *  runtime's CODEX_HOME so `codex --profile dashboard-worker` loads turn-
    *  boundary hooks. Unlike the worker-cwd config.toml (which codex only reads
    *  for a trusted project), a profile file layers onto the base config
-   *  unconditionally. Written unconditionally (overwrite) on first use per
-   *  pathType per process so scaffold-version bumps propagate; the in-memory
-   *  guard avoids rewriting on every launch. Best-effort: a failure here just
-   *  means hooks don't fire and status falls back to inference. */
+   *  unconditionally. The in-memory guard avoids re-touching it on every launch.
+   *
+   *  B8 (§8.5): the profile body alone is not enough — Codex gates each hook
+   *  behind a per-hook trust hash, so the writer SEEDS `[hooks.state]` with the
+   *  correct `trusted_hash` for every hook it installs (Stop / UserPromptSubmit /
+   *  SessionStart), pre-trusting them with zero user interaction. The write is
+   *  also NON-CLOBBERING: if the on-disk file already has the identical body and
+   *  all the trust hashes, it is left untouched — so a plain restart (and a
+   *  user's manual `t`) survive instead of being wiped every launch. Best-effort:
+   *  a failure here just means hooks don't fire and status falls back to
+   *  inference. */
   private ensureCodexHookProfile(pathType: string): void {
     if (this.codexHookProfileEnsured.has(pathType)) return;
     try {
@@ -1335,35 +1675,179 @@ export class AgentSupervisor extends EventEmitter {
         fs.mkdirSync(codexHome, { recursive: true });
         const scriptPath = path.join(codexHome, 'dashboard-status.mjs');
         fs.writeFileSync(scriptPath, DASHBOARD_STATUS_SCRIPT_MJS);
-        const profile = CODEX_WORKER_PROFILE_TOML.replace(/__SCRIPT__/g, scriptPath.replace(/\\/g, '/'));
-        fs.writeFileSync(path.join(codexHome, profileFile), profile);
-        console.log(`[supervisor] Codex hook profile written to ${codexHome}\\${profileFile}`);
+        // Command path uses forward slashes (matches the profile + the hashed
+        // command); the config-file key path Codex stores uses native backslashes.
+        const profileBody = CODEX_WORKER_PROFILE_TOML.replace(/__SCRIPT__/g, scriptPath.replace(/\\/g, '/'));
+        const profilePath = path.join(codexHome, profileFile);
+        const hooks = parseCodexProfileHooks(profileBody);
+        const existing = fs.existsSync(profilePath) ? fs.readFileSync(profilePath, 'utf-8') : null;
+        if (codexProfileTrustIntact(existing, profileBody, hooks)) {
+          console.log(`[supervisor] Codex hook profile trust intact, left untouched: ${profilePath}`);
+        } else {
+          const full = profileBody + buildCodexHooksStateSection(profilePath, hooks);
+          fs.writeFileSync(profilePath, full);
+          console.log(`[supervisor] Codex hook profile written + trust seeded: ${profilePath} (${hooks.length} hooks)`);
+        }
       } else {
-        // WSL: the distro has its own CODEX_HOME. Resolve it, then write both
-        // files via base64 to dodge bash quoting of the TOML/JS content.
-        const codexHome = execFileSync(
-          'wsl.exe',
-          ['bash', '-lc', 'printf %s "${CODEX_HOME:-$HOME/.codex}"'],
-          { encoding: 'utf-8', timeout: 5000 },
-        ).trim() || '$HOME/.codex';
-        const scriptPosix = `${codexHome}/dashboard-status.mjs`;
-        const profile = CODEX_WORKER_PROFILE_TOML.replace(/__SCRIPT__/g, scriptPosix);
-        const b64Script = Buffer.from(DASHBOARD_STATUS_SCRIPT_MJS, 'utf-8').toString('base64');
-        const b64Profile = Buffer.from(profile, 'utf-8').toString('base64');
-        execFileSync(
+        // WSL: the distro has its own CODEX_HOME. Resolve it AND read any
+        // existing profile in one round-trip so we can apply the same
+        // trust-intact / non-clobber guard as the Windows branch.
+        const DELIM = '===B8-CODEX-HOME-DELIM===';
+        const probe = execFileSync(
           'wsl.exe',
           ['bash', '-lc',
-            `mkdir -p "${codexHome}" `
-            + `&& printf %s '${b64Script}' | base64 -d > "${scriptPosix}" `
-            + `&& printf %s '${b64Profile}' | base64 -d > "${codexHome}/${profileFile}"`],
-          { timeout: 8000 },
+            `H="\${CODEX_HOME:-$HOME/.codex}"; printf %s "$H"; printf '%s' '${DELIM}'; `
+            + `cat "$H/${profileFile}" 2>/dev/null || true`],
+          { encoding: 'utf-8', timeout: 8000 },
         );
-        console.log(`[supervisor] Codex hook profile written to ${codexHome}/${profileFile} (wsl)`);
+        const di = probe.indexOf(DELIM);
+        const codexHome = (di >= 0 ? probe.slice(0, di) : probe).trim() || '$HOME/.codex';
+        const existing = di >= 0 ? probe.slice(di + DELIM.length) : '';
+        const scriptPosix = `${codexHome}/dashboard-status.mjs`;
+        const profilePath = `${codexHome}/${profileFile}`;
+        const profileBody = CODEX_WORKER_PROFILE_TOML.replace(/__SCRIPT__/g, scriptPosix);
+        const hooks = parseCodexProfileHooks(profileBody);
+        if (codexProfileTrustIntact(existing || null, profileBody, hooks)) {
+          // Profile already current + trusted: only (re)write the script, which
+          // carries no trust hash, so a content bump still propagates.
+          const b64Script = Buffer.from(DASHBOARD_STATUS_SCRIPT_MJS, 'utf-8').toString('base64');
+          execFileSync(
+            'wsl.exe',
+            ['bash', '-lc',
+              `mkdir -p "${codexHome}" && printf %s '${b64Script}' | base64 -d > "${scriptPosix}"`],
+            { timeout: 8000 },
+          );
+          console.log(`[supervisor] Codex hook profile trust intact, left untouched: ${profilePath} (wsl)`);
+        } else {
+          const full = profileBody + buildCodexHooksStateSection(profilePath, hooks);
+          const b64Script = Buffer.from(DASHBOARD_STATUS_SCRIPT_MJS, 'utf-8').toString('base64');
+          const b64Profile = Buffer.from(full, 'utf-8').toString('base64');
+          execFileSync(
+            'wsl.exe',
+            ['bash', '-lc',
+              `mkdir -p "${codexHome}" `
+              + `&& printf %s '${b64Script}' | base64 -d > "${scriptPosix}" `
+              + `&& printf %s '${b64Profile}' | base64 -d > "${profilePath}"`],
+            { timeout: 8000 },
+          );
+          console.log(`[supervisor] Codex hook profile written + trust seeded: ${profilePath} (wsl, ${hooks.length} hooks)`);
+        }
       }
       this.codexHookProfileEnsured.add(pathType);
     } catch (err) {
       console.warn('[supervisor] ensureCodexHookProfile failed (codex hooks may not fire):', err);
     }
+  }
+
+  /** Seed the provider's user-global directory-trust list for the workspace
+   *  root + the agent's cwd, so a fresh workspace's first launch never hits an
+   *  interactive trust gate (Claude) or a silent trust-kill / skipped hook
+   *  config (Codex — BUG-25 family). Idempotent and append/merge-only: existing
+   *  entries and unrelated config are never rewritten. Best-effort — a failure
+   *  here degrades to today's behavior (the CLI prompts or refuses). */
+  private ensureProviderDirTrust(workDir: string, agentCwd: string, provider: string, pathType: string): void {
+    if (provider !== 'claude' && provider !== 'codex') return;  // gemini --yolo has no trust gate today
+    const dirs = agentCwd && agentCwd !== workDir ? [workDir, agentCwd] : [workDir];
+    const cacheKey = `${pathType}|${provider}|${dirs.join('|')}`;
+    if (this.providerTrustEnsured.has(cacheKey)) return;
+    try {
+      if (provider === 'codex') {
+        this.ensureCodexProjectTrust(dirs, pathType);
+      } else {
+        this.ensureClaudeProjectTrust(dirs, pathType);
+      }
+      this.providerTrustEnsured.add(cacheKey);
+    } catch (err) {
+      console.warn(
+        `[supervisor] ensureProviderDirTrust failed — ${provider} may hit a trust prompt or die at launch in ${agentCwd}:`,
+        err,
+      );
+    }
+  }
+
+  private ensureCodexProjectTrust(dirs: string[], pathType: string): void {
+    if (pathType === 'windows') {
+      const codexHome = process.env.CODEX_HOME
+        || path.join(process.env.USERPROFILE || process.env.HOME || '', '.codex');
+      const configPath = path.join(codexHome, 'config.toml');
+      const variants = dirs.flatMap(d => codexTrustPathVariants(d, pathType));
+      const existing = fs.existsSync(configPath) ? fs.readFileSync(configPath, 'utf-8') : null;
+      const merged = mergeCodexProjectTrust(existing, variants);
+      if (merged === null) return;
+      fs.mkdirSync(codexHome, { recursive: true });
+      const tmp = `${configPath}.tmp-${process.pid}`;
+      fs.writeFileSync(tmp, merged);
+      fs.renameSync(tmp, configPath);
+      console.log(`[supervisor] Codex project trust seeded for ${dirs.join(', ')} in ${configPath}`);
+      return;
+    }
+    // WSL: the distro has its own CODEX_HOME / config.toml. Probe + read in
+    // one round-trip (mirrors ensureCodexHookProfile), merge here, write back
+    // via base64 (the config is small — a handful of trust/hook entries).
+    const DELIM = '===TRUST-CODEX-DELIM===';
+    const probe = execFileSync(
+      'wsl.exe',
+      ['bash', '-lc',
+        `H="\${CODEX_HOME:-$HOME/.codex}"; printf %s "$H"; printf '%s' '${DELIM}'; `
+        + `cat "$H/config.toml" 2>/dev/null || true`],
+      { encoding: 'utf-8', timeout: 8000 },
+    );
+    const di = probe.indexOf(DELIM);
+    const codexHome = (di >= 0 ? probe.slice(0, di) : probe).trim() || '$HOME/.codex';
+    const existing = di >= 0 ? probe.slice(di + DELIM.length) : '';
+    const merged = mergeCodexProjectTrust(existing || null, dirs.flatMap(d => codexTrustPathVariants(d, pathType)));
+    if (merged === null) return;
+    const b64 = Buffer.from(merged, 'utf-8').toString('base64');
+    execFileSync(
+      'wsl.exe',
+      ['bash', '-lc', `mkdir -p "${codexHome}" && printf %s '${b64}' | base64 -d > "${codexHome}/config.toml"`],
+      { timeout: 8000 },
+    );
+    console.log(`[supervisor] Codex project trust seeded for ${dirs.join(', ')} in ${codexHome}/config.toml (wsl)`);
+  }
+
+  private ensureClaudeProjectTrust(dirs: string[], pathType: string): void {
+    if (pathType === 'windows') {
+      // Claude keys ~/.claude.json projects by forward-slash exact-case paths.
+      const keys = dirs.map(d => d.replace(/\\/g, '/'));
+      const claudeJsonPath = path.join(process.env.USERPROFILE || process.env.HOME || '', '.claude.json');
+      const existing = fs.existsSync(claudeJsonPath) ? fs.readFileSync(claudeJsonPath, 'utf-8') : null;
+      const merged = mergeClaudeProjectTrust(existing, keys);
+      if (merged === null) return;
+      // Running Claude instances rewrite this file themselves; keep the
+      // read-modify-write window tight and the replacement atomic. We only
+      // get here when an entry is actually missing (first launch into a
+      // fresh workspace), so collisions are rare by construction.
+      const tmp = `${claudeJsonPath}.tmp-${process.pid}`;
+      fs.writeFileSync(tmp, merged);
+      fs.renameSync(tmp, claudeJsonPath);
+      console.log(`[supervisor] Claude folder trust seeded for ${keys.join(', ')} in ${claudeJsonPath}`);
+      return;
+    }
+    // WSL: ~/.claude.json lives in the distro and can be multi-MB (it carries
+    // per-project history), so it can't round-trip through argv as base64.
+    // Read with a raised maxBuffer; write by staging to a Windows temp file
+    // the distro reads back via /mnt/<drive>.
+    const existing = execFileSync(
+      'wsl.exe',
+      ['bash', '-lc', 'cat "$HOME/.claude.json" 2>/dev/null || true'],
+      { encoding: 'utf-8', timeout: 8000, maxBuffer: 64 * 1024 * 1024 },
+    );
+    const merged = mergeClaudeProjectTrust(existing.trim().length > 0 ? existing : null, dirs);
+    if (merged === null) return;
+    const stage = path.join(this.logsDir, `.claude-trust-stage-${process.pid}.json`);
+    fs.writeFileSync(stage, merged);
+    try {
+      const stageWsl = windowsToWslPath(stage);
+      execFileSync(
+        'wsl.exe',
+        ['bash', '-lc', `cat '${stageWsl}' > "$HOME/.claude.json"`],
+        { timeout: 8000 },
+      );
+    } finally {
+      try { fs.unlinkSync(stage); } catch { /* best effort */ }
+    }
+    console.log(`[supervisor] Claude folder trust seeded for ${dirs.join(', ')} in ~/.claude.json (wsl)`);
   }
 
   /** Write .mcp.json in the workspace so Claude Code auto-discovers the MCP server.
@@ -1790,6 +2274,8 @@ export class AgentSupervisor extends EventEmitter {
       this.emit('statusChanged', { agentId: agent.id, status, fromStatus: prior, source: 'runner-exit' } satisfies StatusChangedEvent);
       // BUG-23 — terminal exit invalidates any pending settle timer.
       this.monitor.clearLaunch(agent.id);
+      // P1 §3 — drop this worker's spool-tailer claim (a relaunch re-claims).
+      this.releaseSpoolTailer(agent.id);
 
       // Auto-restart
       const latest = getAgent(agent.id);
@@ -1851,8 +2337,19 @@ export class AgentSupervisor extends EventEmitter {
     if (agent.isSupervised || agent.isWorker) {
       extraEnv.AGENT_ID = agent.id;
       extraEnv.DASHBOARD_PORT = String(this.apiServerPort);
+      // P1 §3 — spool path for the v7 hook script's always-write transport.
+      // Env-provided (NOT script-dir-relative): the CODEX_HOME copy of the
+      // script would otherwise spool to ~/, invisible to the tailer.
+      extraEnv.DASHBOARD_SPOOL_PATH = path.join(
+        getEffectiveWorkspaceRoot(agent), '.dashboard', 'pending-status.jsonl');
+      // Tail the same file from the dashboard side.
+      this.ensureSpoolTailer(agent);
     }
     const extraEnvArg = Object.keys(extraEnv).length > 0 ? extraEnv : undefined;
+    // P1 §2 step 4a(iii) — current-launch stamp for the tmux-option freshness
+    // gate. Set IMMEDIATELY BEFORE the actual runner launch so no event this
+    // launch produces can predate the stamp.
+    this.launchStartedAt.set(agent.id, Date.now());
     runner.launch(agent.workingDirectory, launchCmd, args, agent.logPath || '', useDirectSpawn, extraEnvArg);
     updateAgentPid(agent.id, runner.pid);
     // BUG-23 — write `'launching'` (was `'working'`) and stamp the settle
@@ -2028,6 +2525,13 @@ export class AgentSupervisor extends EventEmitter {
       wslEnvPrefix.push(`AGENT_ID=${agent.id}`);
       wslEnvPrefix.push(`DASHBOARD_PORT=${this.apiServerPort}`);
       wslEnvPrefix.push(`DASHBOARD_HOST=${this.resolveWslGatewayIp()}`);
+      // P1 §3 — spool path (WSL-native form) for the v7 hook script's
+      // always-write transport. shQuote'd: workspace paths can contain
+      // spaces, and bash command-prefix assignments word-split otherwise.
+      wslEnvPrefix.push(
+        `DASHBOARD_SPOOL_PATH=${shQuote(`${getEffectiveWorkspaceRoot(agent)}/.dashboard/pending-status.jsonl`)}`);
+      // Tail the same file from the dashboard side (UNC form).
+      this.ensureSpoolTailer(agent);
     }
     if (wslEnvPrefix.length > 0) {
       command = `${wslEnvPrefix.join(' ')} ${command}`;
@@ -2197,6 +2701,8 @@ export class AgentSupervisor extends EventEmitter {
       this.emit('statusChanged', { agentId: agent.id, status, fromStatus: prior, source: 'runner-exit' } satisfies StatusChangedEvent);
       // BUG-23 — terminal exit invalidates any pending settle timer.
       this.monitor.clearLaunch(agent.id);
+      // P1 §3 — drop this worker's spool-tailer claim (a relaunch re-claims).
+      this.releaseSpoolTailer(agent.id);
 
       const latest = getAgent(agent.id);
       if (latest && status === 'crashed' && latest.autoRestartEnabled) {
@@ -2274,6 +2780,10 @@ export class AgentSupervisor extends EventEmitter {
       : null;
     const codexLaunchStartedAt = Date.now();
 
+    // P1 §2 step 4a(iii) — current-launch stamp for the tmux-option freshness
+    // gate. Set IMMEDIATELY BEFORE the actual runner launch so no event this
+    // launch produces can predate the stamp.
+    this.launchStartedAt.set(agent.id, Date.now());
     await runner.launch(wslWorkDir, command, nativeLogPath, diagnostics);
     // BUG-23 — write `'launching'` (was `'working'`) and stamp the settle
     // timer. See the Windows path above for the lifecycle description; the
@@ -2590,6 +3100,13 @@ export class AgentSupervisor extends EventEmitter {
     // BUG-11: drop user-typing timestamp so a reused agent id doesn't
     // inherit a stale "user is typing" gate.
     this.lastUserPtyWriteAt.delete(agentId);
+    // P1 — drop the multi-transport hook state so a reused agent id doesn't
+    // inherit a stale dedupe registry / ordering watermark / launch stamp.
+    this.appliedHookEvents.delete(agentId);
+    this.lastAppliedHookTs.delete(agentId);
+    this.launchStartedAt.delete(agentId);
+    this.lastInvalidHookWarnAt.delete(agentId);
+    this.releaseSpoolTailer(agentId);
     dbDeleteAgent(agentId);
     this.emit('agentDeleted', { agentId });
   }
@@ -2669,13 +3186,154 @@ export class AgentSupervisor extends EventEmitter {
     this.apiServerPort = port;
   }
 
-  /** Class IV — entry point for the POST /api/agents/:id/status hook endpoint.
-   *  Delegates to the private StatusMonitor's forceIdle. Kept as a thin public
-   *  shim so api-server.ts doesn't need a reference to the monitor itself.
+  /** P1 (plans/p1-hook-spool-multi-transport.md §2) — the ONE place where
+   *  hook-event validation, dedupe, freshness, ordering, ALL timestamp/health
+   *  stamping, and status dispatch happen. HTTP (api-server.ts), the spool
+   *  tailer, and the tmux pane-option poll all funnel here; nothing else
+   *  dedupes or stamps.
    *
-   *  Also stamps the StatusMonitor's `lastHookEventAt` map so the §2.2
-   *  hook-silence watchdog can detect a broken scaffold. See
-   *  plans/disable-inference-for-supervised-claude-workers.md §2.3.
+   *  Returns:
+   *    'applied'   — event flipped status / stamped health.
+   *    'duplicate' — key already applied this process (any transport). No
+   *                  timestamp advance; the ONLY side effect is the
+   *                  healthy-when-unknown promotion + canary disarm (a
+   *                  duplicate matched a key we applied, so it IS proof the
+   *                  scaffold loaded).
+   *    'stale'     — older than an applied event, or rejected by the
+   *                  tmux-option freshness gate. NO side effects at all (a
+   *                  stale option proves nothing about THIS launch).
+   *    'invalid'   — failed validation (rate-limited warn). */
+  applyHookStatusEvent(agentId: string, event: ParsedHookEvent, transport: HookTransport): HookApplyResult {
+    // 1. Single ownership of timestamps: receivedAt is captured ONCE, here,
+    //    host clock. Applied events stamp with it — never with the event's own
+    //    ts (preserves today's host-clock submit-confirmation comparison and
+    //    is immune to WSL clock skew).
+    const receivedAt = Date.now();
+
+    // 2. Validation.
+    const agent = getAgent(agentId);
+    if (!agent) return this.invalidHookEvent(agentId, transport, 'unknown agent');
+    if (event.agentId !== undefined && event.agentId !== agentId) {
+      return this.invalidHookEvent(agentId, transport, `agentId mismatch (event says ${event.agentId})`);
+    }
+    if (typeof event.ts !== 'number' || !Number.isFinite(event.ts)) {
+      return this.invalidHookEvent(agentId, transport, `non-finite ts ${JSON.stringify(event.ts)}`);
+    }
+    if (event.state !== 'idle' && event.state !== 'working' && event.state !== 'active') {
+      return this.invalidHookEvent(agentId, transport, `unknown state ${JSON.stringify(event.state)}`);
+    }
+    // hookEventName fallback: argv-style name derived from state, so records
+    // missing the field (defensive) still dedupe consistently.
+    const hookEventName = event.hookEventName
+      || (event.state === 'working' ? 'UserPromptSubmit' : event.state === 'active' ? 'SessionStart' : 'Stop');
+    if (hookEventName.length === 0) {
+      return this.invalidHookEvent(agentId, transport, 'empty hookEventName');
+    }
+
+    if (!event.legacy) {
+      // 3. Dedupe — key is byte-identical across transports by construction.
+      const key = `${event.ts}:${hookEventName}:${event.turnId ?? ''}`;
+      const seen = this.appliedHookEvents.get(agentId);
+      if (seen?.has(key)) {
+        // No timestamp advance — a re-read of an already-applied event must
+        // never become a fresh heartbeat that masks hook silence. The only
+        // side effect: a duplicate proves the scaffold loaded, so promote a
+        // still-'unknown' hook_status to healthy (WITHOUT a timestamp) and
+        // disarm the canary.
+        if ((agent.hookStatus ?? 'unknown') === 'unknown') {
+          updateAgentHookStatus(agentId, 'healthy');
+          this.monitor.clearHookCanary(agentId);
+        }
+        return 'duplicate';
+      }
+
+      // 4a. Tmux-option freshness gate — tmux-option ONLY. The pane option
+      //     survives tmux-side across dashboard restarts while the dedupe
+      //     registry and lastAppliedHookTs are in-memory and start empty, so
+      //     a tmux-option event must additionally pass ALL THREE gates. A
+      //     'stale' here gets NO side effects (unlike a duplicate): a stale
+      //     option proves nothing about this launch's scaffold.
+      if (transport === 'tmux-option') {
+        // (i) Bounded age vs the applier's host clock.
+        if (event.ts < receivedAt - TMUX_OPTION_MAX_AGE_MS) return 'stale';
+        // (ii) Persisted last-hook guard — read from the Agent ROW (survives
+        //      restarts; DB column from P0 §8.2), not the in-memory monitor
+        //      maps. NO skew tolerance here — this is what prevents an old
+        //      option from resurrecting after an HTTP/spool event already
+        //      landed in a previous process. Do not soften.
+        if (agent.lastHookEventAt !== undefined && event.ts <= agent.lastHookEventAt) return 'stale';
+        // (iii) Current-launch guard — events older than this launch belong
+        //       to a previous pane occupant. Small skew tolerance allowed on
+        //       THIS guard only.
+        const launchedAt = this.launchStartedAt.get(agentId);
+        if (launchedAt !== undefined && event.ts < launchedAt - TMUX_OPTION_LAUNCH_SKEW_MS) return 'stale';
+      }
+
+      // 5. Ordering guard — equal ts with a different key is allowed (applied
+      //    in arrival order); strictly-older is stale. Same no-timestamp-
+      //    advance rule as duplicates; no healthy side effect (the newer
+      //    applied event already stamped it).
+      const lastTs = this.lastAppliedHookTs.get(agentId);
+      if (lastTs !== undefined && event.ts < lastTs) return 'stale';
+
+      // 6. Record the key + advance the ordering watermark.
+      let set = seen;
+      if (!set) {
+        set = new Set<string>();
+        this.appliedHookEvents.set(agentId, set);
+      }
+      set.add(key);
+      while (set.size > APPLIED_HOOK_EVENTS_MAX) {
+        // Set preserves insertion order — evict the oldest.
+        const oldest = set.values().next().value as string;
+        set.delete(oldest);
+      }
+      this.lastAppliedHookTs.set(agentId, event.ts);
+    }
+
+    // 7. Stamp (applied events only), centrally, with receivedAt — the
+    //    low-level flip helpers below have no stamping rights.
+    this.monitor.recordHookEventAt(agentId, receivedAt);
+    if (event.state === 'working') this.monitor.recordStartHookEventAt(agentId, receivedAt);
+    updateAgentHookStatus(agentId, 'healthy', receivedAt);
+    this.monitor.clearHookCanary(agentId);
+
+    // 8. Dispatch. Provenance (design §5.1): the flip source is
+    //    transport-determined — HTTP keeps the original hook source
+    //    (byte-identical to pre-P1 behavior); spool → 'hook-spool';
+    //    tmux → 'tmux-pane-option'.
+    const flipSource = transport === 'spool'
+      ? 'hook-spool'
+      : transport === 'tmux-option'
+        ? 'tmux-pane-option'
+        : (event.source && event.source.length > 0
+            ? event.source
+            : event.state === 'working' ? 'hook-start' : event.state === 'active' ? 'hook-session-start' : 'hook-stop');
+
+    if (event.state === 'idle') {
+      this.forceIdleFromHook(agentId, flipSource);
+    } else if (event.state === 'working') {
+      this.forceWorkingFromHook(agentId, flipSource);
+    }
+    // state === 'active' (SessionStart): health/canary already handled in
+    // step 7; MUST NOT change status (HOOK_SYSTEM_DESIGN.md §A).
+    return 'applied';
+  }
+
+  /** Rate-limited (60 s/agent) warn helper for applyHookStatusEvent. */
+  private invalidHookEvent(agentId: string, transport: HookTransport, reason: string): 'invalid' {
+    const now = Date.now();
+    const lastWarn = this.lastInvalidHookWarnAt.get(agentId) ?? 0;
+    if (now - lastWarn >= 60_000) {
+      this.lastInvalidHookWarnAt.set(agentId, now);
+      console.warn(`[hook-apply] invalid hook event for ${agentId} via ${transport}: ${reason}`);
+    }
+    return 'invalid';
+  }
+
+  /** P1 — pure status-flip helper (demoted from public hook entry point; all
+   *  stamping moved into applyHookStatusEvent step 7, which is the only
+   *  caller).
    *
    *  BUG-23 §C-supplement — if the agent is currently in `'launching'`, the
    *  regular `forceIdle` no-ops on the transitional guard and the wallclock
@@ -2685,10 +3343,7 @@ export class AgentSupervisor extends EventEmitter {
    *  through `promoteFromLaunching('stop-hook')`, the one surgical bypass,
    *  so the hook's information is preserved and the agent doesn't sit
    *  falsely-launching for the rest of the settle window. */
-  forceIdleFromHook(agentId: string, source: string): void {
-    const now = Date.now();
-    this.monitor.recordHookEventAt(agentId, now);
-    this.stampHookHealthy(agentId, now);
+  private forceIdleFromHook(agentId: string, source: string): void {
     const agent = getAgent(agentId);
     if (agent && agent.status === 'launching') {
       this.monitor.promoteFromLaunching(agentId, 'stop-hook');
@@ -2697,43 +3352,171 @@ export class AgentSupervisor extends EventEmitter {
     this.monitor.forceIdle(agentId, source);
   }
 
-  /** HOOK_SYSTEM_DESIGN.md §5.4 / B5 — any hook event arriving (Stop,
-   *  UserPromptSubmit, or SessionStart, over any transport) is proof the
-   *  scaffold loaded. Stamp hook_status='healthy' + last_hook_event_at and
-   *  disarm the launch canary so it can never flip a working agent to
-   *  'broken'. Idempotent — re-stamping healthy is harmless. */
-  private stampHookHealthy(agentId: string, ts: number): void {
-    updateAgentHookStatus(agentId, 'healthy', ts);
-    this.monitor.clearHookCanary(agentId);
-  }
-
-  /** HOOK_SYSTEM_DESIGN.md §A — SessionStart hook (state='active',
-   *  source='hook-session-start'). This is the canary proof-of-load: it
-   *  updates hook health ONLY and MUST NOT change `status` (no
-   *  forceWorking/forceIdle/promoteFromLaunching). Entry point for the
-   *  state='active' arm of POST /api/agents/:id/status. */
-  recordHookSessionStart(agentId: string, _source: string): void {
-    const now = Date.now();
-    this.monitor.recordHookEventAt(agentId, now);
-    this.stampHookHealthy(agentId, now);
-  }
-
-  /** Class IV — entry point for the UserPromptSubmit hook arm of
-   *  POST /api/agents/:id/status (state='working'). Mirrors
-   *  `forceIdleFromHook` but flips the latch to working. The start-hook is
-   *  the supervised lane's sole authority for idle→working (paste-race fix:
-   *  optimistic seeds at `notifyUserInputDelivered` and the BUG-23 launching
-   *  flow stay disabled for supervised agents). */
-  forceWorkingFromHook(agentId: string, source: string): void {
-    const ts = Date.now();
-    this.monitor.recordHookEventAt(agentId, ts);
-    this.monitor.recordStartHookEventAt(agentId, ts);
-    this.stampHookHealthy(agentId, ts);
+  /** P1 — pure status-flip helper for the UserPromptSubmit arm (state
+   *  'working'). The start-hook is the supervised lane's sole authority for
+   *  idle→working (paste-race fix). Stamping lives in applyHookStatusEvent. */
+  private forceWorkingFromHook(agentId: string, source: string): void {
     this.monitor.forceWorking(agentId, source);
   }
 
+  // ── P1 §3/§4 — hook-transport polling (spool tailers + tmux options) ────
+
+  /** The single per-tick transport drain, registered with
+   *  `StatusMonitor.setHookTransportPoller`. Spool drains are synchronous —
+   *  they complete before the monitor's per-agent canary/watchdog checks run
+   *  this tick. The tmux pane-option poll (a `wsl.exe` round-trip) is async:
+   *  fired every 4th tick (~6 s), results applied on completion — a tick of
+   *  latency is fine for a backstop channel. */
+  private pollHookTransports(): void {
+    for (const tailer of this.spoolTailers.values()) {
+      tailer.drain(); // never throws
+    }
+    this.hookTransportTick++;
+    if (this.hookTransportTick % 4 === 0) {
+      void this.pollTmuxStatusOptions();
+    }
+  }
+
+  /** §3 — ensure a spool tailer exists for the workspace this worker-lane
+   *  agent spools into, keyed by the CANONICAL read path. Registers the agent
+   *  as a user of that tailer for disposal accounting. Best-effort: a path
+   *  that can't resolve (wsl.exe down) just means no spool channel this run. */
+  private ensureSpoolTailer(agent: Agent): void {
+    if (!(agent.isSupervised || agent.isWorker)) return;
+    let readPath: string;
+    try {
+      readPath = resolveSpoolReadPath(getEffectiveWorkspaceRoot(agent));
+    } catch (err) {
+      console.warn(`[hook-spool] could not resolve spool read path for ${agent.id}:`, err);
+      return;
+    }
+    const key = canonicalSpoolKey(readPath);
+    this.agentSpoolKey.set(agent.id, key);
+    let users = this.spoolUsers.get(key);
+    if (!users) {
+      users = new Set<string>();
+      this.spoolUsers.set(key, users);
+    }
+    users.add(agent.id);
+    if (!this.spoolTailers.has(key)) {
+      this.spoolTailers.set(key, new HookSpoolTailer(readPath, {
+        onRecord: (record) => this.applySpoolRecord(record),
+      }));
+      console.log(`[hook-spool] tailer started for ${readPath}`);
+    }
+  }
+
+  /** §3 — drop an agent's claim on its spool tailer; dispose the tailer when
+   *  the last worker using that spool stops. */
+  private releaseSpoolTailer(agentId: string): void {
+    const key = this.agentSpoolKey.get(agentId);
+    if (!key) return;
+    this.agentSpoolKey.delete(agentId);
+    const users = this.spoolUsers.get(key);
+    if (!users) return;
+    users.delete(agentId);
+    if (users.size === 0) {
+      this.spoolUsers.delete(key);
+      this.spoolTailers.delete(key);
+      console.log(`[hook-spool] tailer disposed (last worker stopped) for key ${key}`);
+    }
+  }
+
+  /** §3 — sink for spool records: resolve the agent (drop if unknown / no
+   *  live runner), then hand to the central applier. The tailer never
+   *  dedupes; applyHookStatusEvent owns dedupe/freshness/ordering. */
+  private applySpoolRecord(record: ParsedHookEvent): void {
+    const agentId = typeof record.agentId === 'string' ? record.agentId : '';
+    if (!agentId) return;
+    if (!getAgent(agentId)) return;       // unknown agent — drop silently
+    if (!this.hasRunner(agentId)) return; // no live runner — historical record
+    this.applyHookStatusEvent(agentId, record, 'spool');
+  }
+
+  /** §4 — tmux pane-option poll (third channel, WSL only). Reads
+   *  @agentdashboard-status for every worker-lane WSL agent whose last hook
+   *  event (any transport) is older than one poll tick; zero `wsl.exe` cost
+   *  when no such agent exists. Events pass to the central applier unchanged —
+   *  the §2 step-4a freshness gate lives there, not here, so any future
+   *  caller of the tmux transport inherits it. The option is never cleared;
+   *  dedupe + ordering + freshness + the no-timestamp-advance rule make
+   *  re-reads completely inert. */
+  private async pollTmuxStatusOptions(): Promise<void> {
+    if (this.tmuxOptionPollInFlight) return;
+
+    const now = Date.now();
+    const candidates: Array<{ agentId: string; session: string }> = [];
+    for (const [agentId, runner] of this.wslRunners) {
+      if (!runner.isAlive) continue;
+      const agent = getAgent(agentId);
+      if (!agent || !(agent.isSupervised || agent.isWorker)) continue;
+      if (!agent.tmuxSessionName) continue;
+      const lastHookAt = this.monitor.getLastHookEventAt(agentId);
+      // Skip agents with a fresh hook signal — the backstop is only for
+      // silence.
+      if (lastHookAt !== undefined && now - lastHookAt <= STATUS_POLL_INTERVAL_MS) continue;
+      candidates.push({ agentId, session: agent.tmuxSessionName });
+    }
+    if (candidates.length === 0) return;
+
+    this.tmuxOptionPollInFlight = true;
+    try {
+      const values = await tmuxReadStatusOptions(candidates.map((c) => c.session));
+      for (const { agentId, session } of candidates) {
+        const raw = (values.get(session) ?? '').trim();
+        if (!raw) continue;
+        let record: unknown;
+        try {
+          record = JSON.parse(raw);
+        } catch {
+          this.invalidHookEvent(agentId, 'tmux-option', 'malformed @agentdashboard-status JSON');
+          continue;
+        }
+        if (record === null || typeof record !== 'object') continue;
+        this.applyHookStatusEvent(agentId, record as ParsedHookEvent, 'tmux-option');
+      }
+    } catch (err) {
+      console.warn('[tmux-option] status-option poll failed (treated as no data):', err);
+    } finally {
+      this.tmuxOptionPollInFlight = false;
+    }
+  }
+
+  /** Contract-vs-fallback predicate (plan §SCOPE, Q6). Decides, per agent,
+   *  whether a submit goes through the THROWING synchronous confirm-and-retry
+   *  (true) or stays on the existing best-effort reactive Enter-resend (false).
+   *  Centralizes the provider-applicability matrix so the send path and the
+   *  reactive poller agree on exactly one set of agents.
+   *
+   *    - Claude worker (hooked) → true. Proven live; settings.json hooks just
+   *      run. A 'broken' canary verdict means the scaffold never loaded for this
+   *      launch, so we fall back rather than throw on an agent that can't ever
+   *      confirm.
+   *    - Codex worker → true ONLY once its UserPromptSubmit hook has provably
+   *      fired for THIS launch (`hasObservedStartHook`). Per §2.2 Codex gates
+   *      each hook behind per-command trust, and the bypass flag's existence in
+   *      the installed binary is unconfirmed (Q5) — so the bypass-in-effect is
+   *      necessary but not sufficient. We require the empirical self-test and
+   *      otherwise fall back to the reactive resend (never throw for Codex
+   *      pre-proof). Bootstraps safely: turn 1 uses the reactive fallback;
+   *      subsequent turns use the contract once the start hook is seen.
+   *    - Gemini, non-hook, bare-Windows-without-a-turn-start marker → false.
+   *      No authoritative start marker exists (§2.3/Q2/G5); never throw — they
+   *      stay on the reactive fallback / PTY inference. */
+  usesSubmitConfirmation(agent: Agent): boolean {
+    if (!(agent.isSupervised || agent.isWorker)) return false;
+    if (agent.provider === 'claude') {
+      return agent.hookStatus !== 'broken';
+    }
+    if (agent.provider === 'codex') {
+      return this.monitor.hasObservedStartHook(agent.id);
+    }
+    return false;
+  }
+
   /** BUG-10 — replay ONLY the submit keystroke (no body) to recover a dropped
-   *  Enter. Called by StatusMonitor.checkStartHookResend. Uses the same
+   *  Enter. Called by StatusMonitor.checkStartHookResend AND the synchronous
+   *  confirm-and-retry (the C2 submit-only re-press). Uses the same
    *  per-platform submit mechanism as `_doSendInput` so the bytes are
    *  known-good: WSL goes through `tmux send-keys -H <kitty enter>`; Windows
    *  writes the provider's Win32/CR submit sequence to the ConPTY. Never
@@ -2787,7 +3570,11 @@ export class AgentSupervisor extends EventEmitter {
   /**
    * Public entry point for sending input. Serializes per-agent: if a previous
    * send is still typing, this one waits its turn. Resolves once delivery
-   * completes (so internal callers can still `await` for ordering).
+   * completes (so internal callers can still `await` for ordering), with
+   * `_doSendInput`'s delivered boolean threaded through the queue chain —
+   * `false` means NO runner accepted the bytes (dead WSL runner, no runner),
+   * i.e. nothing was typed. Callers that need delivery proof (the handoff
+   * handshake) must check it; fire-and-forget callers can ignore it.
    *
    * Callers that want fire-and-forget semantics (i.e. the HTTP layer) should
    * not `await` the returned promise — it stays pending until typing is done.
@@ -2798,14 +3585,14 @@ export class AgentSupervisor extends EventEmitter {
    * agent's prompt buffer without pressing Enter (BUG-01: launch_agent's
    * `submit:false` flag).
    */
-  sendInput(agentId: string, text: string, opts: { submit?: boolean } = {}): Promise<void> {
+  sendInput(agentId: string, text: string, opts: { submit?: boolean } = {}): Promise<boolean> {
     if (!this.windowsRunners.get(agentId) && !this.wslRunners.get(agentId)) {
       return Promise.reject(new Error(`No runner for agent ${agentId}`));
     }
     const submit = opts.submit !== false;
     this.inputInFlight.add(agentId);
     const previous = this.inputQueues.get(agentId) || Promise.resolve();
-    const ours: Promise<void> = previous
+    const ours: Promise<boolean> = previous
       .catch(() => undefined) // a prior failed send must not poison the queue
       .then(() => this._doSendInput(agentId, text, submit))
       .then((delivered) => {
@@ -2822,10 +3609,11 @@ export class AgentSupervisor extends EventEmitter {
           // waiting→working transition with source 'user-input'. Seeding the
           // working latch before would no-op that path.
           this.bridge.notifyUserInputDelivered(agentId);
-          // BUG-23 §watchdog reframe — record the delivered-input timestamp
-          // so the reframed Class IV watchdog can detect a scaffold-broken
-          // supervised Claude worker (input went in, no hook ever came back).
-          this.monitor.recordInputDelivered(agentId);
+          // (The BUG-23 delivered-input timestamp is stamped inside
+          // `_doSendInput` the moment the body+Enter is written — BEFORE the
+          // synchronous confirm-and-retry wait — so it can never land after
+          // the observed UserPromptSubmit hook timestamp. See the comment
+          // there.)
           // No optimistic working-latch seed here. A send that *reports*
           // delivery (WSL `_doSendInput` returns true unconditionally once
           // send-keys are issued) does not prove the prompt was actually
@@ -2841,20 +3629,97 @@ export class AgentSupervisor extends EventEmitter {
           // The seed predated the worker-lane broadening and only ever masked
           // missing-submit / missing-hook failures, so it is removed entirely.
         }
+        return delivered;
       });
     this.inputQueues.set(agentId, ours);
     // Clear in-flight only when the chain has fully drained for this agent.
-    // If more sends queued behind us, they own the cleanup.
-    void ours.finally(() => {
-      if (this.inputQueues.get(agentId) === ours) {
-        this.inputQueues.delete(agentId);
-        this.inputInFlight.delete(agentId);
-      }
-    });
+    // If more sends queued behind us, they own the cleanup. The trailing
+    // `.catch` keeps this bookkeeping chain from surfacing as an unhandled
+    // rejection when a send rejects (e.g. a SubmitNotConfirmedError from the
+    // synchronous confirm-and-retry); the rejection is still delivered to the
+    // returned `ours` for the caller to observe/handle.
+    void ours
+      .finally(() => {
+        if (this.inputQueues.get(agentId) === ours) {
+          this.inputQueues.delete(agentId);
+          this.inputInFlight.delete(agentId);
+        }
+      })
+      .catch(() => undefined);
     return ours;
   }
 
+  /**
+   * Handoff handshake — confirmed delivery for supervisor → worker prompts
+   * (POST /input { confirm: true }; the MCP `send_message_to_agent` /
+   * `launch_agent` tools). Resolves only once there is PROOF the worker's
+   * turn started, so an orchestrating caller can treat success as "the worker
+   * is now working" instead of "bytes were typed somewhere".
+   *
+   * Proof, in order of authority:
+   *   1. 'hook'        — a UserPromptSubmit hook arrived after our pre-send
+   *                      baseline. For contract providers `sendInput`'s
+   *                      synchronous confirm-and-retry guarantees this before
+   *                      it resolves, so the first poll iteration hits.
+   *   2. 'status-poll' — the agent's status flipped to 'working' (gemini
+   *                      workers ride chat-stream events; non-workers ride
+   *                      PTY inference — neither emits hooks).
+   *   3. 'unconfirmed' — neither signal within HANDSHAKE_CONFIRM_WINDOW_MS.
+   *                      NOT proof of failure (a provider without hooks can
+   *                      start a turn invisibly) — the caller decides how
+   *                      loudly to react.
+   *
+   * Definitive failures REJECT instead: `SubmitNotConfirmedError` from the
+   * contract confirm-and-retry (re-pressed Enter, turn provably never
+   * started — a handoff_failed event is also emitted), eager no-runner
+   * errors from `sendInput`, and a `delivery-failed`-coded Error when
+   * `sendInput` resolves `delivered: false` (no runner accepted the bytes —
+   * e.g. the WSL dead-runner guard — so NOTHING was typed and there is no
+   * point polling for a turn start).
+   */
+  async sendInputConfirmed(
+    agentId: string,
+    text: string,
+  ): Promise<{ delivered: boolean; confirmed: boolean; mode: 'hook' | 'status-poll' | 'unconfirmed' }> {
+    const baselineStartHookAt = this.monitor.getLastStartHookEventAt(agentId) ?? 0;
+    const delivered = await this.sendInput(agentId, text);
+    if (!delivered) {
+      const err = new Error(
+        `Input delivery to agent ${agentId} failed — no runner accepted the ` +
+        `bytes (dead or missing runner); NO bytes were typed.`,
+      );
+      (err as Error & { code?: string }).code = 'delivery-failed';
+      throw err;
+    }
+
+    const deadline = Date.now() + HANDSHAKE_CONFIRM_WINDOW_MS;
+    for (;;) {
+      const startHookAt = this.monitor.getLastStartHookEventAt(agentId) ?? 0;
+      if (startHookAt > baselineStartHookAt) {
+        return { delivered: true, confirmed: true, mode: 'hook' };
+      }
+      const agent = getAgent(agentId);
+      if (agent?.status === 'working') {
+        return { delivered: true, confirmed: true, mode: 'status-poll' };
+      }
+      if (Date.now() >= deadline) {
+        return { delivered: true, confirmed: false, mode: 'unconfirmed' };
+      }
+      await new Promise((resolve) => setTimeout(resolve, HANDSHAKE_CONFIRM_POLL_MS));
+    }
+  }
+
   private async _doSendInput(agentId: string, text: string, submit: boolean = true): Promise<boolean> {
+    const agent = getAgent(agentId);
+    // §2.3 PRE-SEND BASELINE — capture the start-hook timestamp BEFORE sending
+    // the body+Enter. Confirmation later requires the hook to advance PAST this
+    // value, so a fast hook that POSTs before our send is recorded can't be
+    // mistaken for a stale prior hook (which would falsely time out and
+    // re-press after a real submit). This is a real Date.now-based value, so the
+    // comparison in `confirmSubmission` is host-clock-vs-host-clock.
+    const priorStartHookAt = this.monitor.getLastStartHookEventAt(agentId) ?? 0;
+    let delivered = false;
+
     // For WSL agents, dispatch by provider. All three providers enable the
     // kitty keyboard protocol on Linux, so a bare `\r` from `tmux send-keys
     // Enter` is dropped — submit must be the kitty CSI form `\x1b[13u`.
@@ -2864,7 +3729,6 @@ export class AgentSupervisor extends EventEmitter {
     // is the only submit event. See `tmuxSendInput` for the encoding.
     const wslRunner = this.wslRunners.get(agentId);
     if (wslRunner) {
-      const agent = getAgent(agentId);
       if (agent?.tmuxSessionName) {
         // Guard: don't send input if the runner reports the agent as dead.
         // This prevents typing event payloads into a bare bash shell after Claude Code exits.
@@ -2877,7 +3741,7 @@ export class AgentSupervisor extends EventEmitter {
           : 'unknown';
         await tmuxSendInput(agent.tmuxSessionName, text, provider, submit);
         this.emitSyntheticUserEcho(agent, text);
-        return true;
+        delivered = true;
       }
     }
     // For Windows agents, bracketed-paste the body into Claude Code,
@@ -2885,9 +3749,8 @@ export class AgentSupervisor extends EventEmitter {
     // one chunk leaves the message typed but unsubmitted in Claude Code v2.x's
     // prompt buffer — the trailing newline is absorbed as part of the paste,
     // so Enter must be delivered as its own input event.
-    const winRunner = this.windowsRunners.get(agentId);
+    const winRunner = delivered ? undefined : this.windowsRunners.get(agentId);
     if (winRunner) {
-      const agent = getAgent(agentId);
       if (agent?.provider === 'claude') {
         // Claude Code treats a raw text + Enter chunk as pasted text without a
         // submit, so wrap in bracketed-paste markers and deliver Enter as a
@@ -2935,9 +3798,64 @@ export class AgentSupervisor extends EventEmitter {
       } else {
         winRunner.write(submit ? `${text}\r` : text);
       }
-      return true;
+      delivered = true;
     }
-    return false;
+
+    if (!delivered) return false;
+
+    // BUG-23 §watchdog reframe — record the delivered-input timestamp so the
+    // reframed Class IV watchdog can detect a scaffold-broken supervised
+    // Claude worker (input went in, no hook ever came back).
+    //
+    // ORDERING IS LOAD-BEARING: this MUST be stamped here, the moment the
+    // body+Enter has actually been written, and BEFORE the synchronous
+    // confirm-and-retry block below. `confirmSubmission` can wait multiple
+    // seconds and the UserPromptSubmit hook lands DURING that wait — the old
+    // post-resolve stamp (in `sendInput`'s queue chain) therefore recorded
+    // `lastInputDeliveredAt` AFTER the observed hook timestamp, making
+    // `StatusMonitor.checkStartHookSilence` see `lastStartHookEventAt <
+    // lastInputDeliveredAt` and emit a false "input went in but no start hook
+    // came back" warning for a turn that was actually confirmed. Non-contract
+    // providers skip the confirm block entirely, so for them this is the same
+    // instant the old post-resolve stamp observed. Gated on `submit` exactly
+    // like the old call site (an unsubmitted body can't start a turn, so the
+    // start-hook watchdogs must not arm).
+    if (submit) this.monitor.recordInputDelivered(agentId);
+
+    // Synchronous confirm-and-retry (plan §1 part 1). For contract providers,
+    // the dashboard's send path — not the caller — owns the guarantee that the
+    // prompt actually submitted. Re-press the submit-only keystroke until the
+    // UserPromptSubmit hook proves a turn started; on exhaustion raise a real
+    // error and surface it via `lastSendError`. Non-contract providers
+    // (Gemini / unconfirmable-Codex / non-hook) skip this and stay on the
+    // reactive resend / PTY inference — never throw for them.
+    if (submit && agent && this.usesSubmitConfirmation(agent)) {
+      const confirmed = await this.monitor.confirmSubmission(agentId, priorStartHookAt);
+      if (!confirmed) {
+        const message =
+          `Submit not confirmed for ${agent.provider} agent ${agentId} after ` +
+          `${MAX_SUBMIT_RETRIES} re-press attempts — no UserPromptSubmit hook ` +
+          `fired (prompt delivered but turn never started).`;
+        updateAgentLastSendError(agentId, { message, ts: Date.now() });
+        console.error(`[confirm-submit] ${message}`);
+        // Handoff handshake — wake the workspace supervisor with a
+        // handoff_failed [DASHBOARD EVENT] regardless of how this send was
+        // initiated. Fire-and-forget callers (UI chat bar, /input without
+        // confirm, orchestration scripts) never observe the throw below, and
+        // a worker whose turn never started will never emit the Stop-hook
+        // idle event the supervisor is waiting on. The bridge gates on
+        // isSupervised, so this is a no-op for plain workers.
+        void this.bridge.onHandoffFailed({
+          agent,
+          attempts: MAX_SUBMIT_RETRIES,
+          message,
+        });
+        throw new SubmitNotConfirmedError(message, agentId);
+      }
+      // Confirmed turn start — clear any stale failure surface from a prior send.
+      if (agent.lastSendError) updateAgentLastSendError(agentId, null);
+    }
+    return true;
   }
 
 

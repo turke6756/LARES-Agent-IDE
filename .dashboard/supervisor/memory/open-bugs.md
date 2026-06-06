@@ -18,6 +18,15 @@ Format per bug:
 
 ---
 
+## BUG-34: Context stats use a hardcoded 200K window for 1M-context models — false "98% critical" alarms on healthy agents
+
+- Component: context accounting — `get_context_stats` / context-threshold `[DASHBOARD EVENT]`s compute `contextPercentage` against `contextWindowMax: 200000` even when the agent runs a 1M-window model (e.g. Opus 4.8 with extended context; the worker's own Claude Code status line showed "Opus 4.8 (1M context)" while the dashboard reported "98% (196K/200K)").
+- Severity: high — drove a real bad intervention 2026-06-06: supervisor stopped healthy worker `p1-hook-spool-impl` (63194e2b) mid-task at "98%" that was actually ~20% of the real window, losing 196K tokens of paged-in recon. Every 1M worker will trip the 80/90/95% event thresholds at one-fifth of its real usage, training supervisors on false alarms.
+- Status: open — observed live 2026-06-06; recovery was `fork_agent` (resume + fork-session restored full history).
+- Fix sketch: resolve `contextWindowMax` per-agent from the model actually in use rather than a constant — Claude Code exposes the model id in transcript/status; map known 1M models (or better, read the window from the provider's model metadata) and surface `contextWindowMax` honestly in `get_context_stats` and the threshold events. Until fixed, supervisors must sanity-check % against the agent's own status line before intervening (behavioral.md B-14).
+
+---
+
 ## BUG-30: Supervisor cannot discover its own workspace_id — every workspace-scoped MCP tool requires an ID the supervisor is never given
 
 - Component: sysprompt injection — `src/main/supervisor/index.ts:1597` (Windows) and `:1952` (WSL), both emit only `Workspace root: <path>`, never the ID. `list_agents` summary — `scripts/mcp-supervisor.js:596-609`, includes `workingDirectory` but drops `workspaceId` even though `a.workspaceId` is present in the API response. No `list_workspaces` tool exists in `mcp-supervisor.js`.
@@ -203,8 +212,8 @@ NEON_GIS supervisor launched 3 codex agents (trivial prompts) into the shared `.
 
 - Component: scaffold side — `src/main/supervisor/index.ts` `ensureWorkerScaffold(..., 'codex', ...)` writes the per-workspace hook config but doesn't register the workspace as trusted in the user's global codex config. Constant lives at `src/shared/constants.ts:430–442` (`WORKER_CODEX_CONFIG_TOML`).
 - Severity: high — every supervised codex worker silently runs WITHOUT its Stop hook. Class IV degrades to Class I–III (PTY inference), which for codex's `›`-with-placeholder idle repaint apparently doesn't promote. Net effect: codex workers answer correctly but sit in `working` forever, breaking `launch_agent`'s 60s poll-for-idle and rejecting `send_message_to_agent`.
-- Status: open — root cause confirmed 2026-05-22.
-- Surfaced: 2026-05-22. Smoke test in parallel: Claude side (`5b78e2ec`) passed cleanly (Stop hook fired, idle event arrived, 1 turn). Codex side (`a3255c65`) answered correctly in chat (`turnComplete: true` at 19:04:19 with the right product 391) but status remained `working` until manually force-idled via POST.
+- Status: **fixed in code 2026-06-04, pending live verify** — `launchAgent` now calls `ensureProviderDirTrust(workDir, agentCwd, provider, pathType)` (src/main/supervisor/index.ts) on every launch (all lanes, including legacy root-cwd like GroupThink), which append-merges `[projects.'<path>'] trust_level = "trusted"` into `~/.codex/config.toml` for the workspace root + agent cwd (Windows: exact-case, lowercase, AND `\\?\` variants — codex 0.136 rejected a lowercase-only entry, verified live in UAP_Phenomina 2026-06-04) and seeds `hasTrustDialogAccepted: true` into `~/.claude.json` projects for Claude (WSL branches included). Unit tests: src/main/supervisor/provider-dir-trust.test.ts. Verify by launching a codex worker in a brand-new workspace: no trust banner in the boot log + Stop hook fires; then delete this entry.
+- Surfaced: 2026-05-22. Smoke test in parallel: Claude side (`5b78e2ec`) passed cleanly (Stop hook fired, idle event arrived, 1 turn). Codex side (`a3255c65`) answered correctly in chat (`turnComplete: true` at 19:04:19 with the right product 391) but status remained `working` until manually force-idled via POST. Re-surfaced 2026-06-04 in fresh workspace UAP_Phenomina: codex at the (untrusted, non-git) workspace root died silently at kickoff; supervisor manually added trust entries to recover.
 - Smoking gun in the codex PTY log header:
   ```
   1. C:\Users\turke\Projects\AgentDashboard\.dashboard\workers\codex\.codex

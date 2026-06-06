@@ -111,7 +111,11 @@ export default function ChatInputBar({
 
   const handleDragOver = useCallback((e: React.DragEvent) => {
     const types = e.dataTransfer.types;
-    if (types.includes('application/x-file-path') || types.includes('text/plain')) {
+    if (
+      types.includes('application/x-agent-card') ||
+      types.includes('application/x-file-path') ||
+      types.includes('text/plain')
+    ) {
       e.preventDefault();
       e.dataTransfer.dropEffect = 'copy';
       if (!isDragOver) setIsDragOver(true);
@@ -127,13 +131,26 @@ export default function ChatInputBar({
   const handleDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault();
     setIsDragOver(false);
-    const path =
-      e.dataTransfer.getData('application/x-file-path') ||
-      e.dataTransfer.getData('text/plain');
-    if (!path) return;
 
-    // Format as @path — readable in prose and visually distinct.
-    const token = `@${path}`;
+    // Agent cards carry a dedicated payload (set in AgentCard.tsx). Insert an
+    // identity token so the receiving agent knows it's a dashboard agent.
+    let token: string;
+    const agentPayload = e.dataTransfer.getData('application/x-agent-card');
+    if (agentPayload) {
+      try {
+        const a = JSON.parse(agentPayload) as { id: string; title: string };
+        token = `[dashboard agent "${a.title}" #${a.id.substring(0, 6)}]`;
+      } catch {
+        token = `@${agentPayload}`;
+      }
+    } else {
+      const path =
+        e.dataTransfer.getData('application/x-file-path') ||
+        e.dataTransfer.getData('text/plain');
+      if (!path) return;
+      // Format as @path — readable in prose and visually distinct.
+      token = `@${path}`;
+    }
 
     const ta = inputRef.current;
     const prev = input;

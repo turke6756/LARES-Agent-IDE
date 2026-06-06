@@ -6,6 +6,7 @@ import AgentLaunchDialog from '../agent/AgentLaunchDialog';
 import FileViewerPanel from '../fileviewer/FileViewerPanel';
 import type { AgentStatus } from '../../../shared/types';
 import * as Icons from 'lucide-react';
+import vscodeIcon from '../../assets/material-icons/vscode.svg';
 
 function useSwipe(onSwipe: () => void, direction: 'left' | 'right') {
   const startRef = useRef<{ x: number; y: number } | null>(null);
@@ -93,17 +94,17 @@ export default function MainContent() {
 
   return (
     <div className="flex-1 flex flex-col min-w-0 overflow-hidden relative">
-      {/* Header */}
-      <div className="panel-header px-4 py-3 sticky top-0 z-10">
-        <div className="flex items-center justify-between">
-          <div>
+      {/* Header — fixed h-16 to match the sidebar header thickness */}
+      <div className="panel-header h-16 px-4 sticky top-0 z-10 flex items-center shrink-0">
+        <div className="flex items-center justify-between w-full">
+          <div className="min-w-0">
             <div className="flex items-baseline gap-2">
-              <h2 className="text-[14px] font-semibold text-gray-100">
+              <h2 className="text-[14px] font-semibold text-gray-100 truncate">
                 {workspace.title}
               </h2>
             </div>
 
-            <div className="flex items-center gap-3 mt-1">
+            <div className="flex items-center gap-3 mt-0.5">
               <span className="text-[11px] text-gray-500">
                 {workspace.path}
               </span>
@@ -128,7 +129,7 @@ export default function MainContent() {
                     selectAgent(supervisorAgent.id);
                     setTerminalAgent(supervisorAgent.id);
                   }}
-                  className={`flex items-center gap-3 px-4 py-2 transition-colors ${SUPERVISOR_STATUS_COLORS[supervisorAgent.status].bg}`}
+                  className={`flex items-center gap-3 px-3 py-1.5 transition-colors ${SUPERVISOR_STATUS_COLORS[supervisorAgent.status].bg}`}
                   title="Click to attach terminal"
                 >
                   <div className="flex flex-col items-start gap-0.5">
@@ -162,7 +163,7 @@ export default function MainContent() {
                     await window.api.agents.delete(supervisorAgent.id);
                     loadSupervisor(workspace.id);
                   }}
-                  className={`flex items-center justify-center w-12 py-3 transition-colors hover:bg-red-500/20 ${SUPERVISOR_STATUS_COLORS[supervisorAgent.status].bg}`}
+                  className={`flex items-center justify-center w-10 self-stretch transition-colors hover:bg-red-500/20 ${SUPERVISOR_STATUS_COLORS[supervisorAgent.status].bg}`}
                   title="Reset Supervisor (stops and clears session)"
                 >
                   <Icons.X className="w-4 h-4 text-gray-400 hover:text-red-400" />
@@ -176,10 +177,10 @@ export default function MainContent() {
                   setSupervisorLoading(false);
                 }}
                 disabled={supervisorLoading}
-                className="ui-btn ui-btn-purple hidden md:flex items-center gap-2 px-4 py-2"
+                className="ui-btn ui-btn-outline ui-btn-purple hidden md:flex items-center gap-2 px-3 py-1.5"
                 title="Launch Supervisor Agent"
               >
-                <span className="w-2 h-2 rounded-full bg-purple-400/40 border border-purple-400/60" />
+                <Icons.Bot className="w-4 h-4" />
                 <span className="text-[13px] font-semibold">
                   {supervisorLoading ? 'Launching...' : 'Supervisor'}
                 </span>
@@ -189,25 +190,27 @@ export default function MainContent() {
             <div className="flex gap-2">
               <button
                 onClick={() => showFileViewer()}
-                className={`ui-btn px-4 py-2 text-[13px] font-medium ${
-                  hasOpenTabs
-                    ? 'ui-btn-success'
-                    : 'ui-btn-ghost'
+                className={`ui-btn ui-btn-outline px-3 py-1.5 text-[13px] font-medium ${
+                  hasOpenTabs ? 'ui-btn-success' : ''
                 }`}
                 title={hasOpenTabs ? `Files (${workspaceTabCount} tabs open)` : 'Browse files'}
               >
+                <Icons.FileText className="w-4 h-4" />
                 Files{hasOpenTabs ? ` (${workspaceTabCount})` : ''}
               </button>
               <button
                 onClick={() => window.api.workspaces.openInVSCode(workspace.id)}
-                className="ui-btn px-4 py-2 text-[13px] font-medium"
+                className="ui-btn ui-btn-outline px-3 py-1.5 text-[13px] font-medium"
+                title="Open workspace in VS Code"
               >
+                <img src={vscodeIcon} alt="" className="w-4 h-4" />
                 Open VS Code
               </button>
               <button
                 onClick={() => setShowLaunch(true)}
-                className="ui-btn ui-btn-primary px-4 py-2 text-[13px] font-medium"
+                className="ui-btn ui-btn-primary px-3 py-1.5 text-[13px] font-medium"
               >
+                <Icons.Plus className="w-4 h-4" />
                 Launch Agent
               </button>
             </div>

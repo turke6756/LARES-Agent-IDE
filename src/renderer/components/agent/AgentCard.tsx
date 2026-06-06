@@ -44,7 +44,28 @@ const BORDER_COLORS: Record<string, string> = {
   done: 'border-l-gray-600',
 };
 
-export default function AgentCard({ agent, onTeam }: { agent: Agent; onTeam?: (agentId: string) => void }) {
+export default function AgentCard({
+  agent,
+  onTeam,
+  unread = false,
+  multiSelected = false,
+  selectionCount = 0,
+  onCardClick,
+  onDeleteSelected,
+}: {
+  agent: Agent;
+  onTeam?: (agentId: string) => void;
+  /** Finished (working→idle) and not yet viewed — renders a blue ring until clicked. */
+  unread?: boolean;
+  /** Part of the shift+click multi-selection — renders a purple ring. */
+  multiSelected?: boolean;
+  /** Size of the current multi-selection (for the context-menu label). */
+  selectionCount?: number;
+  /** Notifies the grid of clicks so it can clear unread / toggle selection. */
+  onCardClick?: (agentId: string, shiftKey: boolean) => void;
+  /** Deletes every agent in the current multi-selection. */
+  onDeleteSelected?: () => void;
+}) {
   // Each card subscribes only to its own agent's slice of contextStats —
   // a sibling agent's status update won't re-render this card.
   const isSelected = useDashboardStore((s) => s.selectedAgentId === agent.id);
@@ -57,6 +78,7 @@ export default function AgentCard({ agent, onTeam }: { agent: Agent; onTeam?: (a
   const queryAgent = useDashboardStore((s) => s.queryAgent);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
+  const [confirmDeleteSelected, setConfirmDeleteSelected] = useState(false);
   const [forking, setForking] = useState(false);
   const [dragOver, setDragOver] = useState(false);
   const [dragQuery, setDragQuery] = useState<{ sourceId: string } | null>(null);
@@ -130,6 +152,7 @@ export default function AgentCard({ agent, onTeam }: { agent: Agent; onTeam?: (a
   const handleContextMenu = (e: React.MouseEvent) => {
     e.preventDefault();
     e.stopPropagation();
+    setConfirmDeleteSelected(false);
     setContextMenu({ x: e.clientX, y: e.clientY });
   };
 
@@ -162,11 +185,10 @@ export default function AgentCard({ agent, onTeam }: { agent: Agent; onTeam?: (a
     const el = cardRef.current;
     if (!el) return;
 
-    if (agent.resumeSessionId) {
-      el.setAttribute('draggable', 'true');
-    } else {
-      el.removeAttribute('draggable');
-    }
+    // Always draggable: every card can be dropped into a chat input to
+    // mention the agent. The card-to-card query flow stays gated on
+    // resumeSessionId via the text/agentId key below.
+    el.setAttribute('draggable', 'true');
 
     const onDragStart = (e: DragEvent) => {
       const target = e.target as HTMLElement;
@@ -174,7 +196,18 @@ export default function AgentCard({ agent, onTeam }: { agent: Agent; onTeam?: (a
         e.preventDefault();
         return;
       }
-      e.dataTransfer?.setData('text/agentId', agent.id);
+      // Card-to-card inter-agent query payload (requires a resumable session).
+      if (agent.resumeSessionId) {
+        e.dataTransfer?.setData('text/agentId', agent.id);
+      }
+      // Chat-input payload — mirrors the file-drag convention in
+      // utils/drag-file.ts (dedicated MIME key + text/plain fallback).
+      const shortId = agent.id.substring(0, 6);
+      e.dataTransfer?.setData(
+        'application/x-agent-card',
+        JSON.stringify({ id: agent.id, title: agent.title, provider: agent.provider || 'claude' }),
+      );
+      e.dataTransfer?.setData('text/plain', `[dashboard agent "${agent.title}" #${shortId}]`);
       if (e.dataTransfer) e.dataTransfer.effectAllowed = 'copy';
     };
 
@@ -208,7 +241,7 @@ export default function AgentCard({ agent, onTeam }: { agent: Agent; onTeam?: (a
       el.removeEventListener('dragleave', onDragLeave);
       el.removeEventListener('drop', onDrop);
     };
-  }, [agent.id, agent.resumeSessionId]);
+  }, [agent.id, agent.resumeSessionId, agent.title, agent.provider]);
 
   const handleDragQuerySubmit = async () => {
     if (!dragQueryText.trim() || !dragQuery) return;
@@ -224,61 +257,69 @@ export default function AgentCard({ agent, onTeam }: { agent: Agent; onTeam?: (a
       layout
       initial={{ opacity: 0 }}
       animate={{ opacity: 1 }}
-      className={`ui-card relative p-3 cursor-pointer transition-colors group
+      whileHover={{ y: -3, transition: { duration: 0.15, ease: 'easeOut' } }}
+      className={`ui-card agent-card relative p-3 cursor-pointer group
         border-l-[3px] ${isSelected ? borderColor : 'border-l-transparent'}
-        ${isSelected ? 'bg-surface-2' : 'hover:bg-white/[0.03]'}
+        ${isSelected ? 'agent-card-selected' : 'hover:bg-white/[0.03]'}
         ${isTerminalActive ? 'bg-accent-blue/[0.06] border-l-accent-blue' : ''}
         ${agent.status === 'working' ? 'bg-accent-green/[0.03]' : ''}
         ${dragOver ? 'bg-accent-purple/[0.06] border-l-accent-purple' : ''}
+        ${multiSelected ? 'ring-2 ring-accent-purple' : unread ? 'ring-2 ring-accent-blue' : ''}
       `}
-      onClick={() => selectAgent(agent.id)}
+      onClick={(e) => {
+        onCardClick?.(agent.id, e.shiftKey);
+        if (e.shiftKey) return; // shift+click only toggles multi-selection
+        selectAgent(agent.id);
+      }}
       onDoubleClick={() => setTerminalAgent(agent.id)}
       onContextMenu={handleContextMenu}
     >
       {/* Header */}
-      <div className="flex items-start justify-between mb-2 relative z-10">
-        <div className="flex-1 min-w-0 pr-2">
-           <div className="flex items-center gap-2 mb-0.5">
-             <span className="text-[11px] text-gray-500 font-mono">#{agent.id.substring(0,6)}</span>
-             {(() => {
-               const meta = PROVIDER_META[agent.provider || 'claude'];
-               return (
-                 <span className={`text-[11px] font-semibold px-1.5 py-0.5 ${meta.bgClass} ${meta.textClass}`}>
-                   {meta.label}
-                 </span>
-               );
-             })()}
-             {agent.isAttached && (
-                <span className="text-[11px] text-accent-green font-semibold animate-pulse">LIVE</span>
+      <div className="mb-2 relative z-10">
+        {/* Row 1: id + role chips (left), status + delete (right) */}
+        <div className="flex items-center justify-between gap-2 mb-0.5">
+          <div className="flex items-center gap-2 min-w-0">
+            <span className="text-[11px] text-gray-500 font-mono shrink-0">#{agent.id.substring(0,6)}</span>
+            {agent.isSupervised && (
+               <span className="text-[11px] text-purple-400 bg-purple-500/15 px-1.5 py-0.5 font-semibold truncate">Supervised</span>
+            )}
+            {agent.isWorker && !agent.isSupervised && (
+               <span className="text-[11px] text-sky-400 bg-sky-500/15 px-1.5 py-0.5 font-semibold truncate" title="Status derived from turn-boundary hooks">Worker</span>
+            )}
+          </div>
+
+          <div className="flex items-center gap-2 shrink-0">
+             {forking && <span className="text-[11px] text-accent-purple animate-pulse font-semibold">FORKING...</span>}
+             {forkError && <span className="text-[11px] text-accent-red font-semibold">{forkError}</span>}
+             <StatusBadge status={agent.status} />
+
+             {!confirmDelete && (
+              <button
+                onClick={handleDelete}
+                className="ui-btn ui-btn-danger opacity-0 group-hover:opacity-100 min-h-0 px-1.5 py-1 text-gray-500 hover:text-accent-red"
+                title="Terminate Agent"
+              >
+                <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor">
+                  <path d="M1 1L9 9M9 1L1 9" strokeWidth="2" />
+                </svg>
+              </button>
              )}
-             {agent.isSupervised && (
-                <span className="text-[11px] text-purple-400 bg-purple-500/15 px-1.5 py-0.5 font-semibold">Supervised</span>
-             )}
-             {agent.isWorker && !agent.isSupervised && (
-                <span className="text-[11px] text-sky-400 bg-sky-500/15 px-1.5 py-0.5 font-semibold" title="Status derived from turn-boundary hooks">Worker</span>
-             )}
-           </div>
-           <h4 className={`font-semibold text-[13px] truncate ${isSelected ? 'text-accent-blue' : 'text-gray-200 group-hover:text-gray-100'}`}>
-             {agent.title}
-           </h4>
+          </div>
         </div>
 
-        <div className="flex items-center gap-2">
-           {forking && <span className="text-[11px] text-accent-purple animate-pulse font-semibold">FORKING...</span>}
-           {forkError && <span className="text-[11px] text-accent-red font-semibold">{forkError}</span>}
-           <StatusBadge status={agent.status} />
-
-           {!confirmDelete && (
-            <button
-              onClick={handleDelete}
-              className="ui-btn ui-btn-danger opacity-0 group-hover:opacity-100 min-h-0 px-1.5 py-1 text-gray-500 hover:text-accent-red"
-              title="Terminate Agent"
-            >
-              <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor">
-                <path d="M1 1L9 9M9 1L1 9" strokeWidth="2" />
-              </svg>
-            </button>
-           )}
+        {/* Row 2: provider + title — full card width so long titles don't truncate early */}
+        <div className="flex items-center gap-1.5 min-w-0">
+          {(() => {
+            const meta = PROVIDER_META[agent.provider || 'claude'];
+            return (
+              <span className={`text-[11px] font-semibold px-1.5 py-0.5 shrink-0 ${meta.bgClass} ${meta.textClass}`}>
+                {meta.label}
+              </span>
+            );
+          })()}
+          <h4 className={`font-semibold text-[13px] truncate ${isSelected ? 'text-accent-blue' : 'text-gray-200 group-hover:text-gray-100'}`} title={agent.title}>
+            {agent.title}
+          </h4>
         </div>
       </div>
 
@@ -311,8 +352,9 @@ export default function AgentCard({ agent, onTeam }: { agent: Agent; onTeam?: (a
         )}
       </div>
 
-      {/* Context Stats Bar */}
-      {(agent.provider || 'claude') === 'claude' && cs && (() => {
+      {/* Context Stats Bar — all providers emit usage events (claude jsonl,
+          codex rollout token_count, gemini transcript); render whenever stats exist. */}
+      {cs && (() => {
         const pct = cs.contextPercentage;
         const isWarning = pct > 60;
         const isCritical = pct > 85;
@@ -387,6 +429,27 @@ export default function AgentCard({ agent, onTeam }: { agent: Agent; onTeam?: (a
               className="ui-menu-item"
             >
               Create Team
+            </button>
+          )}
+          {multiSelected && onDeleteSelected && selectionCount > 0 && (
+            <button
+              onClick={(e) => {
+                // Don't bubble to the card's onClick — a plain card click
+                // clears the multi-selection, which would cancel the delete.
+                e.stopPropagation();
+                if (!confirmDeleteSelected) {
+                  setConfirmDeleteSelected(true);
+                  return;
+                }
+                setContextMenu(null);
+                setConfirmDeleteSelected(false);
+                onDeleteSelected();
+              }}
+              className="ui-menu-item text-accent-red"
+            >
+              {confirmDeleteSelected
+                ? `Confirm delete ${selectionCount} agent${selectionCount === 1 ? '' : 's'}`
+                : `Delete all selected (${selectionCount})`}
             </button>
           )}
         </div>

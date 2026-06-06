@@ -1,5 +1,11 @@
 @import "tailwindcss";
 
+/* Tailwind v4 defaults `dark:` to the OS prefers-color-scheme media query.
+   This app themes via a .dark/.light class on <html> (theme-store.ts), so
+   rebind the variant — otherwise `dark:` styles follow the OS and leak into
+   light mode (e.g. the washed-out sidebar wordmark on dark-mode Windows). */
+@custom-variant dark (&:where(.dark, .dark *));
+
 @theme {
   --color-surface-base: #181818;
   --color-surface-0: #1e1e1e;
@@ -210,6 +216,26 @@ select {
   background: transparent;
 }
 
+/* Outlined action button — visible border + raised surface so header
+   actions (Files, Open VS Code, Supervisor) read as clickable buttons. */
+.ui-btn-outline {
+  background: var(--color-surface-2);
+  border-color: var(--color-surface-3);
+}
+.ui-btn-outline:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.08);
+  border-color: rgba(255, 255, 255, 0.25);
+}
+.light .ui-btn-outline {
+  background: #ffffff;
+  border-color: #d6d0c2;
+  box-shadow: 0 1px 2px rgba(72, 60, 38, 0.08);
+}
+.light .ui-btn-outline:hover:not(:disabled) {
+  background: #fbfaf7;
+  border-color: #b9b29f;
+}
+
 .ui-btn-success {
   color: var(--color-accent-green);
 }
@@ -262,6 +288,48 @@ select {
 .ui-card {
   background: var(--color-surface-1);
   border: 1px solid var(--color-surface-3);
+  border-radius: 6px;
+}
+
+/* ── Agent card hover lift (both themes) ──
+   The vertical lift itself is driven by framer-motion (whileHover) on the
+   card; this class animates the shadow/border that sells the elevation. */
+.agent-card {
+  transition:
+    box-shadow 180ms ease,
+    border-color 180ms ease,
+    background-color 180ms ease,
+    color 180ms ease;
+}
+.agent-card:hover {
+  box-shadow:
+    0 2px 4px rgba(0, 0, 0, 0.3),
+    0 8px 20px rgba(0, 0, 0, 0.45);
+  border-color: rgba(255, 255, 255, 0.16);
+}
+.light .agent-card:hover {
+  box-shadow:
+    0 2px 4px rgba(72, 60, 38, 0.1),
+    0 10px 24px rgba(72, 60, 38, 0.18);
+  border-color: #d4cdbc;
+}
+
+/* ── Attached agent card — the agent the chat pane is currently on ──
+   Selected (chat-attached) cards get a lighter blue-washed surface and a
+   blue halo so the active card is obvious at a glance in either theme. */
+.ui-card.agent-card-selected {
+  background: rgba(96, 158, 232, 0.13);
+  border-color: rgba(96, 158, 232, 0.5);
+  box-shadow:
+    0 0 0 1px rgba(96, 158, 232, 0.3),
+    0 4px 14px rgba(0, 0, 0, 0.3);
+}
+.light .ui-card.agent-card-selected {
+  background: #e4eefb;
+  border-color: #a9c8e8;
+  box-shadow:
+    0 0 0 1px #bcd4ec,
+    var(--shadow-card);
 }
 
 /* ── Tab system (VS Code bottom-indicator) ── */
@@ -574,30 +642,40 @@ select {
   }
 }
 
-/* ── Light theme overrides ── */
+/* ── Light theme overrides: "paper" ──
+   Warm near-white surfaces with real luminance steps, ink text, soft
+   elevation shadows instead of border-everything, one dominant ink-blue
+   accent. Dark mode reads as VS Code; light mode reads as paper. */
 
 .light {
-  --color-surface-base: #e6e6e6;
-  --color-surface-0: #f0f0f0;
-  --color-surface-1: #f5f5f5;
+  /* Paper surface ladder — chrome → app bg → panel → card */
+  --color-surface-base: #edeae3;
+  --color-surface-0: #f7f5f0;
+  --color-surface-1: #fbfaf7;
   --color-surface-2: #ffffff;
-  --color-surface-3: #e0e0e0;
+  --color-surface-3: #e3ded3;
 
-  --color-accent-blue: #005e9e;
-  --color-accent-blue-bright: #0078d4;
-  --color-accent-blue-band: #d1e4f6;
+  /* One dominant ink-blue; status colors warm-leaning, chip-safe on white */
+  --color-accent-blue: #1462ad;
+  --color-accent-blue-bright: #1976d2;
+  --color-accent-blue-band: #dceafa;
   --color-accent-green: #2e7d32;
-  --color-accent-yellow: #f57f17;
-  --color-accent-orange: #e65100;
-  --color-accent-red: #c62828;
-  --color-accent-purple: #6a1b9a;
+  --color-accent-yellow: #a16207;
+  --color-accent-orange: #c2410c;
+  --color-accent-red: #bf3127;
+  --color-accent-purple: #6b21a8;
 
-  --color-fg-primary: #1a1a1a;
-  --color-fg-secondary: #57606a;
-  --color-fg-muted: #8a8f96;
+  /* Ink foregrounds (warm) */
+  --color-fg-primary: #211f1c;
+  --color-fg-secondary: #5f5a51;
+  --color-fg-muted: #8e887a;
   --color-fg-bright: #000000;
 
-  /* File-icon palette (darkened for white backgrounds) */
+  /* Elevation — warm-tinted soft shadows (paper depth, not borders) */
+  --shadow-card: 0 1px 2px rgba(72, 60, 38, 0.06), 0 2px 8px rgba(72, 60, 38, 0.08);
+  --shadow-menu: 0 1px 3px rgba(72, 60, 38, 0.10), 0 6px 18px rgba(72, 60, 38, 0.16);
+
+  /* File-icon palette (darkened for paper backgrounds) */
   --color-icon-folder: #c98e2b;
   --color-icon-ts: #1e5fa4;
   --color-icon-js: #b8a020;
@@ -615,11 +693,11 @@ select {
   --color-icon-package: #9a2a2a;
   --color-icon-default: #5a5a5a;
 
-  --notebook-subtle-border: #d8dee4;
-  --notebook-soft-bg: #f6f8fa;
-  --notebook-code-gutter-bg: #f6f8fa;
-  --notebook-active-line: rgba(0, 0, 0, 0.035);
-  --notebook-active-line-focused: rgba(0, 120, 212, 0.10);
+  --notebook-subtle-border: #e1dcd1;
+  --notebook-soft-bg: #f6f3ec;
+  --notebook-code-gutter-bg: #f6f3ec;
+  --notebook-active-line: rgba(72, 60, 38, 0.04);
+  --notebook-active-line-focused: rgba(20, 98, 173, 0.10);
   --notebook-syntax-keyword: #8b2bb9;
   --notebook-syntax-string: #2e7d32;
   --notebook-syntax-number: #a15c00;
@@ -631,6 +709,11 @@ select {
 
 .light .tree-row-selected {
   color: var(--color-fg-primary);
+}
+
+/* White-opacity hover is invisible on paper — use a clear warm ink wash */
+.light .tree-row-hover:hover {
+  background: rgba(72, 60, 38, 0.12);
 }
 
 .light body,
@@ -659,25 +742,27 @@ html.light body {
 }
 
 .light .ui-btn {
-  color: #424242;
+  color: #4a463e;
+  border-radius: 5px;
 }
 
 .light .ui-btn:hover:not(:disabled) {
-  background: rgba(0, 0, 0, 0.06);
-  color: #1a1a1a;
+  background: rgba(72, 60, 38, 0.07);
+  color: #211f1c;
 }
 
 .light .ui-btn:active:not(:disabled) {
-  background: rgba(0, 0, 0, 0.1);
+  background: rgba(72, 60, 38, 0.12);
 }
 
 .light .ui-btn-primary {
   color: white;
   background: var(--color-accent-blue);
+  box-shadow: 0 1px 2px rgba(20, 98, 173, 0.30);
 }
 
 .light .ui-btn-primary:hover:not(:disabled) {
-  background: #0b78c9;
+  background: #1976d2;
 }
 
 .light .ui-btn-success.is-active {
@@ -688,18 +773,30 @@ html.light body {
 .light .ui-textarea,
 .light .ui-select {
   background: white;
-  border-color: var(--color-surface-3);
-  color: #1a1a1a;
+  border-color: #ddd7c9;
+  border-radius: 6px;
+  color: #211f1c;
+}
+
+.light .ui-input:hover,
+.light .ui-textarea:hover,
+.light .ui-select:hover {
+  border-color: #c9c2b0;
 }
 
 .light .ui-card {
   background: white;
-  border-color: var(--color-surface-3);
+  border-color: #eae6dc;
+  border-radius: 6px;
+  box-shadow: var(--shadow-card);
 }
 
 .light .ui-menu {
   background: white;
-  border-color: var(--color-surface-3);
+  border-color: #e3ded3;
+  border-radius: 8px;
+  overflow: hidden;
+  box-shadow: var(--shadow-menu);
 }
 
 .light .ui-menu-item:hover {
@@ -708,103 +805,127 @@ html.light body {
 }
 
 .light .ui-tab {
-  color: #616161;
+  color: #6b6557;
 }
 
 .light .ui-tab:hover {
-  color: #1a1a1a;
+  color: #211f1c;
 }
 
 .light .ui-tab-active,
 .light .ui-tab-active:hover {
-  color: #1a1a1a;
+  color: #211f1c;
+}
+
+/* Popovers / floating panels get paper elevation too */
+.light .glass-panel {
+  background: white;
+  border: 1px solid var(--color-surface-3);
+  border-radius: 8px;
+  box-shadow: var(--shadow-menu);
+}
+
+/* Role-preview inset on agent cards: warm recessed paper */
+.light .log-surface {
+  border-radius: 6px;
 }
 
 /* ── Light mode: gray-scale text inversion ── */
 /* In dark mode gray-100/200/300 are light (readable on dark bg).
    In light mode they're near-white (invisible on light bg).
-   Remap to dark equivalents for readability. */
+   Remap to warm ink equivalents for the paper theme. */
 
-html.light .text-white { color: #1a1a1a; }
-html.light .text-gray-50 { color: #111827; }
-html.light .text-gray-100 { color: #1f2937; }
-html.light .text-gray-200 { color: #374151; }
-html.light .text-gray-300 { color: #4b5563; }
-html.light .text-gray-400 { color: #57606a; }
+html.light .text-white { color: #211f1c; }
+html.light .text-gray-50 { color: #1a1814; }
+html.light .text-gray-100 { color: #2a2722; }
+html.light .text-gray-200 { color: #3d3931; }
+html.light .text-gray-300 { color: #524d43; }
+html.light .text-gray-400 { color: #5f5a51; }
+html.light .text-gray-500 { color: #8a8475; }
+html.light .text-gray-600 { color: #6b6557; }
+html.light .text-sky-400 { color: #0369a1; }
+
+/* ── Light mode: long-form markdown reading contrast ──
+   Markdown body copy is gray-300/400; the global warm remaps are tuned for
+   UI chrome and read too faint over a full page of prose. Darken inside the
+   prose container only. */
+html.light .prose-custom .text-gray-300 { color: #33302a; }
+html.light .prose-custom .text-gray-400 { color: #45413a; }
 
 /* Hover variants */
-html.light .hover\:text-white:hover { color: #111827 !important; }
-html.light .hover\:text-gray-100:hover { color: #1f2937; }
-html.light .hover\:text-gray-200:hover { color: #374151; }
-html.light .hover\:text-gray-300:hover { color: #4b5563; }
-html.light .group:hover .group-hover\:text-white { color: #111827; }
-html.light .group:hover .group-hover\:text-gray-50 { color: #111827; }
-html.light .group:hover .group-hover\:text-gray-100 { color: #1f2937; }
-html.light .group:hover .group-hover\:text-gray-200 { color: #374151; }
+html.light .hover\:text-white:hover { color: #1a1814 !important; }
+html.light .hover\:text-gray-100:hover { color: #2a2722; }
+html.light .hover\:text-gray-200:hover { color: #3d3931; }
+html.light .hover\:text-gray-300:hover { color: #524d43; }
+html.light .group:hover .group-hover\:text-white { color: #1a1814; }
+html.light .group:hover .group-hover\:text-gray-50 { color: #1a1814; }
+html.light .group:hover .group-hover\:text-gray-100 { color: #2a2722; }
+html.light .group:hover .group-hover\:text-gray-200 { color: #3d3931; }
 
-/* ── Light mode: background inversions ── */
-html.light .bg-gray-700 { background-color: #e5e7eb; }
-html.light .bg-gray-800 { background-color: #d1d5db; }
-html.light .bg-gray-900 { background-color: #e5e7eb; }
+/* ── Light mode: background inversions (warm paper grays) ── */
+html.light .bg-gray-700 { background-color: #e8e4da; }
+html.light .bg-gray-800 { background-color: #dcd6c8; }
+html.light .bg-gray-900 { background-color: #e8e4da; }
 
 /* ── Light mode: border inversions ── */
-html.light .border-gray-700 { border-color: #d1d5db; }
-html.light .border-gray-800 { border-color: #e5e7eb; }
-html.light .border-gray-900 { border-color: #d1d5db; }
+html.light .border-gray-700 { border-color: #ddd7c9; }
+html.light .border-gray-800 { border-color: #e8e4da; }
+html.light .border-gray-900 { border-color: #ddd7c9; }
 
-/* ── Light mode: bg-white opacity → bg-black opacity ── */
-html.light .bg-white\/\[0\.04\] { background-color: rgba(0, 0, 0, 0.04); }
-html.light .bg-white\/\[0\.06\] { background-color: rgba(0, 0, 0, 0.05); }
-html.light .hover\:bg-white\/\[0\.04\]:hover { background-color: rgba(0, 0, 0, 0.04); }
-html.light .hover\:bg-white\/\[0\.06\]:hover { background-color: rgba(0, 0, 0, 0.05); }
+/* ── Light mode: bg-white opacity → warm ink opacity ── */
+html.light .bg-white\/\[0\.04\] { background-color: rgba(72, 60, 38, 0.04); }
+html.light .bg-white\/\[0\.06\] { background-color: rgba(72, 60, 38, 0.055); }
+html.light .hover\:bg-white\/\[0\.03\]:hover { background-color: rgba(72, 60, 38, 0.07); }
+html.light .hover\:bg-white\/\[0\.04\]:hover { background-color: rgba(72, 60, 38, 0.08); }
+html.light .hover\:bg-white\/\[0\.06\]:hover { background-color: rgba(72, 60, 38, 0.10); }
 
-/* ── Light mode: accent color tweaks for contrast on white ── */
+/* ── Light mode: accent color tweaks for contrast on paper ── */
 html.light .text-fuchsia-400 { color: #a21caf; }
 html.light .text-amber-400 { color: #b45309; }
 html.light .text-green-400 { color: #15803d; }
-html.light .text-blue-400 { color: #1d4ed8; }
+html.light .text-blue-400 { color: #1462ad; }
 html.light .text-yellow-400 { color: #a16207; }
 html.light .text-orange-400 { color: #c2410c; }
 html.light .text-red-400 { color: #b91c1c; }
-html.light .text-purple-400 { color: #7e22ce; }
-html.light .text-purple-400\/70 { color: rgba(126, 34, 206, 0.7); }
+html.light .text-purple-400 { color: #6b21a8; }
+html.light .text-purple-400\/70 { color: rgba(107, 33, 168, 0.7); }
 
 /* Force white text (e.g., on colored backgrounds). Not inverted in light mode. */
 .text-on-accent { color: #ffffff !important; }
 
 /* ── Light mode: section header ── */
-html.light .ui-section-header { color: #57606a; }
-html.light .ui-menu-header { color: #57606a; }
+html.light .ui-section-header { color: #6b6557; }
+html.light .ui-menu-header { color: #6b6557; }
 
-/* ArcGIS Style active tabs & selections */
+/* Active tabs & selections (paper ink-blue) */
 .light .bg-surface-2.border-accent-blue {
-  background-color: #ddeefe !important;
-  border-color: #005e9e !important;
-  color: #000000 !important;
+  background-color: var(--color-accent-blue-band) !important;
+  border-color: var(--color-accent-blue) !important;
+  color: #211f1c !important;
 }
 
 .light .bg-surface-2.border-b-accent-blue {
-  background-color: #005e9e !important;
-  border-bottom-color: #005e9e !important;
+  background-color: var(--color-accent-blue) !important;
+  border-bottom-color: var(--color-accent-blue) !important;
   color: #ffffff !important;
 }
 
 .light .bg-accent-blue\/10.text-accent-blue {
-  background-color: #d1e4f6 !important;
-  color: #005e9e !important;
+  background-color: var(--color-accent-blue-band) !important;
+  color: var(--color-accent-blue) !important;
   font-weight: 500;
 }
 
 html.light ::-webkit-scrollbar-track {
-  background: var(--color-surface-1);
+  background: transparent;
 }
 html.light ::-webkit-scrollbar-thumb {
-  background: #c1c1c1;
-  border: 1px solid var(--color-surface-3);
-  border-radius: 0;
+  background: #cdc7b9;
+  border: 2px solid var(--color-surface-0);
+  border-radius: 6px;
 }
 html.light ::-webkit-scrollbar-thumb:hover {
-  background: #a0a0a0;
+  background: #b3ac9c;
 }
 
 .light .grid-bg {
@@ -832,11 +953,6 @@ html.light ::-webkit-scrollbar-thumb:hover {
   border-color: var(--color-surface-3);
 }
 
-.light .glass-panel {
-  background: white;
-  border: 1px solid var(--color-surface-3);
-}
-
 .light .hud-border {
   border: 1px solid var(--color-surface-3);
 }
@@ -846,53 +962,46 @@ html.light ::-webkit-scrollbar-thumb:hover {
   display: none;
 }
 
-.light .font-mono {
-  -webkit-text-stroke: 0.2px currentColor;
-}
-
-.light .notebook-cell .font-mono,
-.light .notebook-cell .cm-scroller {
-  -webkit-text-stroke: 0;
-}
-
-/* ── Light mode: misc white-opacity inversions ── */
+/* ── Light mode: misc white-opacity inversions (warm ink) ── */
 .light .hover\:bg-white:hover {
-  background-color: rgba(0, 0, 0, 0.06) !important;
+  background-color: rgba(72, 60, 38, 0.10) !important;
 }
 .light .bg-white\/5,
-.light .bg-white\/10,
+.light .bg-white\/10 {
+  background-color: rgba(72, 60, 38, 0.06);
+}
 .light .hover\:bg-white\/5:hover,
 .light .hover\:bg-white\/10:hover {
-  background-color: rgba(0, 0, 0, 0.06);
+  background-color: rgba(72, 60, 38, 0.10);
 }
 .light .bg-white\/70 {
-  background-color: rgba(0, 0, 0, 0.04);
+  background-color: rgba(72, 60, 38, 0.04);
 }
 .light .text-white\/70 {
-  color: #424242;
+  color: #4a463e;
 }
 .light .border-white\/5,
 .light .border-white\/10 {
   border-color: var(--color-surface-3);
 }
 .light .bg-white\/\[0\.02\] {
-  background-color: rgba(0, 0, 0, 0.02);
+  background-color: rgba(72, 60, 38, 0.025);
 }
 .light .bg-black\/40 {
-  background-color: rgba(0, 0, 0, 0.05);
+  background-color: rgba(72, 60, 38, 0.05);
 }
 .light .bg-surface-0\/40 {
-  background-color: rgba(240, 240, 240, 0.6);
+  background-color: rgba(247, 245, 240, 0.6);
 }
 .light .bg-surface-0\/60 {
-  background-color: rgba(240, 240, 240, 0.8);
+  background-color: rgba(247, 245, 240, 0.8);
 }
 
-/* ── Log surface (dark bg even in light mode terminal) ── */
+/* ── Log surface (recessed paper in light, terminal-dark in dark) ── */
 
 .log-surface {
-  background: rgba(0, 0, 0, 0.05);
-  color: #1a1a2e;
+  background: rgba(72, 60, 38, 0.05);
+  color: #3d3931;
 }
 .dark .log-surface {
   background: rgba(0, 0, 0, 0.4);
@@ -923,13 +1032,17 @@ html.light ::-webkit-scrollbar-thumb:hover {
   box-shadow: none;
 }
 
+.light .shadow-soft {
+  box-shadow: var(--shadow-card);
+}
+
 /* ── Interactive hover (light mode) ── */
 
 .light .interactive:hover {
-  background-color: rgba(0, 0, 0, 0.04);
+  background-color: rgba(72, 60, 38, 0.09);
 }
 .light .interactive:active {
-  background-color: rgba(0, 0, 0, 0.08);
+  background-color: rgba(72, 60, 38, 0.14);
 }
 
 /* ── CSV / Spreadsheet grid ── */
@@ -941,7 +1054,7 @@ html.light ::-webkit-scrollbar-thumb:hover {
   background: var(--color-surface-0);
 }
 .light .csv-grid {
-  color: #1f2328;
+  color: #211f1c;
   background: #ffffff;
 }
 
@@ -954,9 +1067,9 @@ html.light ::-webkit-scrollbar-thumb:hover {
   height: 22px;
 }
 .light .csv-grid .csv-corner {
-  background: #f1f3f5;
-  border-right: 1px solid #d0d7de;
-  border-bottom: 1px solid #d0d7de;
+  background: #f4f1ea;
+  border-right: 1px solid #ddd8cc;
+  border-bottom: 1px solid #ddd8cc;
 }
 
 .csv-grid .csv-col-header {
@@ -973,10 +1086,10 @@ html.light ::-webkit-scrollbar-thumb:hover {
   letter-spacing: 0.02em;
 }
 .light .csv-grid .csv-col-header {
-  background: #f1f3f5;
+  background: #f4f1ea;
   color: #57606a;
-  border-right: 1px solid #d0d7de;
-  border-bottom: 1px solid #d0d7de;
+  border-right: 1px solid #ddd8cc;
+  border-bottom: 1px solid #ddd8cc;
 }
 
 .csv-grid .csv-row-header {
@@ -994,16 +1107,16 @@ html.light ::-webkit-scrollbar-thumb:hover {
   font-size: 11px;
 }
 .light .csv-grid .csv-row-header {
-  background: #f1f3f5;
+  background: #f4f1ea;
   color: #57606a;
-  border-right: 1px solid #d0d7de;
-  border-bottom: 1px solid #d0d7de;
+  border-right: 1px solid #ddd8cc;
+  border-bottom: 1px solid #ddd8cc;
 }
 .csv-grid .csv-header-row-num {
   background: #2b2b2b;
 }
 .light .csv-grid .csv-header-row-num {
-  background: #f1f3f5;
+  background: #f4f1ea;
 }
 
 .csv-grid .csv-cell {
@@ -1022,23 +1135,23 @@ html.light ::-webkit-scrollbar-thumb:hover {
 }
 .light .csv-grid .csv-cell {
   background: #ffffff;
-  border-right: 1px solid #eaeef2;
-  border-bottom: 1px solid #eaeef2;
+  border-right: 1px solid #f0ece3;
+  border-bottom: 1px solid #f0ece3;
 }
 
 .csv-grid tbody tr:hover .csv-cell {
   background: rgba(4, 57, 94, 0.35);
 }
 .light .csv-grid tbody tr:hover .csv-cell {
-  background: #e7f1fb;
+  background: #eaf2fb;
 }
 .csv-grid tbody tr:hover .csv-row-header {
   background: #3a3a3a;
   color: #ffffff;
 }
 .light .csv-grid tbody tr:hover .csv-row-header {
-  background: #e1e4e8;
-  color: #24292f;
+  background: #e6e1d5;
+  color: #211f1c;
 }
 
 .csv-grid .csv-cell-num {
@@ -1046,7 +1159,7 @@ html.light ::-webkit-scrollbar-thumb:hover {
   color: var(--color-accent-blue-bright);
 }
 .light .csv-grid .csv-cell-num {
-  color: #0550ae;
+  color: #1462ad;
 }
 
 .csv-grid .csv-header-cell {
@@ -1060,10 +1173,10 @@ html.light ::-webkit-scrollbar-thumb:hover {
   font-size: 12px;
 }
 .light .csv-grid .csv-header-cell {
-  background: #f6f8fa;
-  color: #1f2328;
-  border-right: 1px solid #d0d7de;
-  border-bottom: 1px solid #d0d7de;
+  background: #f6f3ec;
+  color: #211f1c;
+  border-right: 1px solid #ddd8cc;
+  border-bottom: 1px solid #ddd8cc;
 }
 
 .csv-grid-scroll {

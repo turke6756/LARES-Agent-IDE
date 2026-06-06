@@ -37,10 +37,57 @@ export function useFileContentCache(tabId: string, filePath: string, pathType: P
 
     let cancelled = false;
 
+    // Re-read the file from disk and, if it differs from the cache, swap the
+    // fresh content into both the cache and this hook's state. Shared by the
+    // fs-watcher handler and the on-mount revalidation pass below.
+    const revalidate = () => {
+      window.api.files.readFile(filePath, pathType).then((fresh) => {
+        if (cancelled) return;
+        if (fresh.error) return;
+
+        const cachedNow = contentCache.get(tabId);
+        if (cachedNow && cachedNow.path === filePath && cachedNow.content === fresh.content) {
+          // Cache already matches disk, but local state may lag behind the
+          // shared cache (e.g., another pass updated it first) — sync it so
+          // the renderer never displays older content than the cache holds.
+          setContent((prev) => (prev === cachedNow ? prev : cachedNow));
+          return;
+        }
+        const store = useDashboardStore.getState();
+        const editState = store.tabEditState[tabId];
+        if (editState && editState.originalContent === fresh.content && !editState.dirty) {
+          // Echo of the content we just saved from the editor.
+          contentCache.set(tabId, fresh);
+          return;
+        }
+
+        contentCache.set(tabId, fresh);
+
+        if (editState && editState.mode === 'edit') {
+          // Don't trample the editor while the user has it open.
+          // Surface a banner so they can choose to reload or keep edits.
+          store.markExternalChange(tabId, fresh.content);
+        } else {
+          setContent(fresh);
+          if (editState) {
+            // View mode but a stale editState lingers from a prior edit session —
+            // bring originalContent in line with disk so renderedContent reflects it.
+            store.refreshOriginalContent(tabId, fresh.content);
+          }
+        }
+      });
+    };
+
     const cached = contentCache.get(tabId);
     if (cached && cached.path === filePath) {
       setContent(cached);
       setLoading(false);
+      // The watcher below only covers changes that land while this hook is
+      // mounted. An edit that arrived while another tab was active (the
+      // content area is unmounted on tab switch) leaves the cache stale, so
+      // switching back must revalidate against disk — otherwise the tab
+      // shows old content until it's closed and reopened.
+      revalidate();
     } else {
       setLoading(true);
       window.api.files.readFile(filePath, pathType).then((result) => {
@@ -64,36 +111,7 @@ export function useFileContentCache(tabId: string, filePath: string, pathType: P
       if (cancelled) return;
       if (event.type === 'unlink') return;
       if (normalizePath(event.path) !== targetKey) return;
-
-      window.api.files.readFile(filePath, pathType).then((fresh) => {
-        if (cancelled) return;
-        if (fresh.error) return;
-
-        // Skip echoes: cache already matches, or this is the content we just saved.
-        const cachedNow = contentCache.get(tabId);
-        if (cachedNow && cachedNow.path === filePath && cachedNow.content === fresh.content) return;
-        const store = useDashboardStore.getState();
-        const editState = store.tabEditState[tabId];
-        if (editState && editState.originalContent === fresh.content && !editState.dirty) {
-          contentCache.set(tabId, fresh);
-          return;
-        }
-
-        contentCache.set(tabId, fresh);
-
-        if (editState && editState.mode === 'edit') {
-          // Don't trample the editor while the user has it open.
-          // Surface a banner so they can choose to reload or keep edits.
-          store.markExternalChange(tabId, fresh.content);
-        } else {
-          setContent(fresh);
-          if (editState) {
-            // View mode but a stale editState lingers from a prior edit session —
-            // bring originalContent in line with disk so renderedContent reflects it.
-            store.refreshOriginalContent(tabId, fresh.content);
-          }
-        }
-      });
+      revalidate();
     };
 
     const unsubscribe = window.api.files.watchDirectory(parentDir, pathType, handleFsEvent);

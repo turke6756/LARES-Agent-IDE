@@ -25,6 +25,14 @@ import { TeamMessageStatus } from '../shared/types';
 import { isKeyName, mapKeyToBytes, SUPPORTED_KEY_NAMES } from './supervisor/key-bytes';
 import crypto from 'crypto';
 
+/** Machine-readable failure classes the top-level error serializer is allowed
+ *  to expose in JSON bodies. Errors thrown inside routes can carry raw Node
+ *  errno strings on `.code` (ENOENT, EACCES, ECONNREFUSED, ...) — those are
+ *  internals and must NOT leak to clients as API codes, so the serializer
+ *  allowlists instead of forwarding any string. Add new dashboard API codes
+ *  here deliberately when a route starts setting them. */
+const API_ERROR_CODES = new Set<string>(['submit-not-confirmed', 'delivery-failed']);
+
 /**
  * Lightweight HTTP API server that exposes supervisor methods.
  * The MCP server script (scripts/mcp-supervisor.js) calls these endpoints
@@ -61,7 +69,16 @@ export class ApiServer {
       } catch (err: any) {
         const status = err.statusCode || 500;
         res.writeHead(status, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: err.message || 'Internal error' }));
+        // Include the machine-readable failure class when one was attached,
+        // but ONLY if it's a known dashboard API code (see API_ERROR_CODES) —
+        // an fs/network error escaping a route would otherwise leak its Node
+        // errno (e.g. ENOENT) to clients as if it were an API failure class.
+        // No unit-test seam exists for this inline serializer (no api-server
+        // test file in the suite); the allowlist contract lives here and in
+        // the API_ERROR_CODES doc comment.
+        const errBody: { error: string; code?: string } = { error: err.message || 'Internal error' };
+        if (typeof err.code === 'string' && API_ERROR_CODES.has(err.code)) errBody.code = err.code;
+        res.end(JSON.stringify(errBody));
       }
     });
 
@@ -180,17 +197,26 @@ export class ApiServer {
     }
 
     // POST /api/agents/:id/input — queue a message for delivery and return.
-    // Delivery is fire-and-forget: the Windows codex/gemini path types one
-    // character at a time at WINDOWS_CODEX_TYPING_DELAY_MS to dodge the
+    // Default delivery is fire-and-forget: the Windows codex/gemini path types
+    // one character at a time at WINDOWS_CODEX_TYPING_DELAY_MS to dodge the
     // paste-burst dialog, so multi-KB sends can take 30+ seconds. Holding
     // the HTTP request open that long invariably breaks callers' timeouts.
     // The supervisor serializes per-agent and surfaces `isInputInFlight` so
     // subsequent GETs see the agent as 'working' until typing finishes.
+    //
+    // Handoff handshake: pass `confirm: true` to instead BLOCK until the
+    // worker's turn provably started (UserPromptSubmit hook / status flip to
+    // 'working'), via `sendInputConfirmed`. Response carries `confirmed` +
+    // `mode` ('hook' | 'status-poll' | 'unconfirmed'). A definitive submit
+    // failure (confirm-and-retry exhausted) returns HTTP 502 with
+    // code 'submit-not-confirmed'. Used by the MCP supervisor's
+    // send_message_to_agent / launch_agent so a supervisor can't believe a
+    // handoff worked when the worker never started.
     const inputMatch = path.match(/^\/api\/agents\/([^/]+)\/input$/);
     if (method === 'POST' && inputMatch) {
       const agentId = inputMatch[1];
       const body = await readBody(req);
-      const { text, submit } = JSON.parse(body);
+      const { text, submit, confirm } = JSON.parse(body);
       if (!text) throw Object.assign(new Error('Missing "text" in request body'), { statusCode: 400 });
 
       const agent = getAgent(agentId);
@@ -205,6 +231,25 @@ export class ApiServer {
           new Error(`Cannot send input to agent in "${reportedStatus}" state. Wait until it is idle or waiting.`),
           { statusCode: 409 }
         );
+      }
+
+      // Confirmed (handshake) path. `submit: false` is incompatible — an
+      // unsubmitted prompt can't start a turn, so there is nothing to confirm.
+      if (confirm === true && submit !== false) {
+        try {
+          const result = await this.supervisor.sendInputConfirmed(agentId, text);
+          return { ok: true, agentId, submit: true, ...result };
+        } catch (err) {
+          const e = err as Error & { statusCode?: number; code?: string };
+          if (e.name === 'SubmitNotConfirmedError') {
+            e.statusCode = 502;
+            e.code = 'submit-not-confirmed';
+          } else if (e.statusCode === undefined) {
+            e.statusCode = 502;
+            e.code = 'delivery-failed';
+          }
+          throw e;
+        }
       }
 
       // `submit` (optional, default true): pass false to leave the text in
@@ -333,17 +378,31 @@ export class ApiServer {
         );
       }
       const sourceTag = typeof source === 'string' && source.length > 0 ? source : 'hook';
-      if (state === 'active') {
-        // SessionStart hook (HOOK_SYSTEM_DESIGN.md §A). Proof the hook scaffold
-        // loaded — updates hook_status/last_hook_event_at only and MUST NOT
-        // change `status` (no working/idle flip).
-        this.supervisor.recordHookSessionStart(agentId, sourceTag);
-      } else if (state === 'working') {
-        this.supervisor.forceWorkingFromHook(agentId, sourceTag);
-      } else {
-        this.supervisor.forceIdleFromHook(agentId, sourceTag);
-      }
-      return { ok: true, agentId, state, source: sourceTag };
+      // P1 (plans/p1-hook-spool-multi-transport.md §2) — parse optional v7
+      // meta and hand the event to the central applier
+      // (AgentSupervisor.applyHookStatusEvent), which owns validation, dedupe,
+      // freshness, ordering, stamping, and dispatch for every transport.
+      // Back-compat: a body without hookEventName/ts (v≤6 script) synthesizes
+      // ts = Date.now() + an argv-style event name and is flagged legacy →
+      // dedupe/freshness/ordering bypassed, exactly the pre-P1 behavior.
+      const hookEventName: unknown = parsed.hookEventName;
+      const ts: unknown = parsed.ts;
+      const legacy = !(typeof hookEventName === 'string' && hookEventName.length > 0
+        && typeof ts === 'number' && Number.isFinite(ts));
+      const event = {
+        agentId: typeof parsed.agentId === 'string' ? parsed.agentId : undefined,
+        state: state as 'idle' | 'working' | 'active',
+        source: sourceTag,
+        ts: legacy ? Date.now() : (ts as number),
+        hookEventName: legacy
+          ? (state === 'working' ? 'UserPromptSubmit' : state === 'active' ? 'SessionStart' : 'Stop')
+          : (hookEventName as string),
+        turnId: typeof parsed.turnId === 'string' ? parsed.turnId : undefined,
+        sessionId: typeof parsed.sessionId === 'string' ? parsed.sessionId : undefined,
+        legacy,
+      };
+      const result = this.supervisor.applyHookStatusEvent(agentId, event, 'http');
+      return { ok: true, agentId, state, source: sourceTag, result };
     }
 
     // POST /api/agents — launch a new agent
@@ -764,6 +823,44 @@ export class ApiServer {
       const notebookPath = url.searchParams.get('notebookPath');
       if (!notebookPath) throw Object.assign(new Error('Missing notebookPath query param'), { statusCode: 400 });
       return await kernelGetState(notebookPath);
+    }
+
+    // ── File-view routes ────────────────────────────────────────────────
+
+    // POST /api/files/open-tab — ask the renderer to open a file as a tab in
+    // the user's file viewer. Backs the `open_file_in_view` MCP tool so an
+    // agent can surface a doc/image/CSV/etc. to the human. Main only
+    // validates and enriches (workspace root + pathType when the workspace
+    // is known); the renderer resolves remaining defaults against the
+    // currently selected workspace and calls the store's openTab().
+    // Delivery rides the supervisor EventEmitter → ipc-handlers.ts forwards
+    // it to the renderer as `file:open-tab` (same pattern as teamUpdated).
+    if (method === 'POST' && path === '/api/files/open-tab') {
+      const body = await readBody(req);
+      const { filePath, pathType, workspaceId, agentId } = JSON.parse(body);
+      if (!filePath || typeof filePath !== 'string') {
+        throw Object.assign(new Error('Missing "filePath" in request body'), { statusCode: 400 });
+      }
+      if (pathType !== undefined && pathType !== 'windows' && pathType !== 'wsl') {
+        throw Object.assign(new Error('"pathType" must be "windows" or "wsl" when provided'), { statusCode: 400 });
+      }
+      const payload: Record<string, unknown> = { filePath };
+      if (pathType) payload.pathType = pathType;
+      if (agentId) {
+        const agent = getAgent(agentId);
+        if (!agent) throw Object.assign(new Error('Agent not found'), { statusCode: 404 });
+        payload.agentId = agentId;
+        if (!workspaceId) payload.workspaceId = agent.workspaceId;
+      }
+      if (workspaceId) payload.workspaceId = workspaceId;
+      if (payload.workspaceId) {
+        const workspace = getWorkspace(payload.workspaceId as string);
+        if (!workspace) throw Object.assign(new Error('Workspace not found'), { statusCode: 404 });
+        payload.rootDirectory = workspace.path;
+        if (!payload.pathType) payload.pathType = workspace.pathType;
+      }
+      this.supervisor.emit('openFileInView', payload);
+      return { ok: true, ...payload };
     }
 
     // ── Persona routes ──────────────────────────────────────────────────

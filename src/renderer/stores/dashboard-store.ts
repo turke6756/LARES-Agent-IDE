@@ -8,6 +8,11 @@ interface WorkspaceHeat {
   workingCount: number;
 }
 
+// Renderer-side extension of FileTab: `color` is an optional per-tab visual
+// marker chosen from the tab context menu. The shared FileTab type stays
+// untouched because color never crosses the IPC boundary.
+export type ColoredFileTab = FileTab & { color?: string };
+
 const DEFAULT_LAYOUT: PanelLayout = {
   sidebarWidth: 256,
   detailPanelWidth: 384,
@@ -105,13 +110,14 @@ interface DashboardState {
   resetLayout: () => void;
 
   // Tabbed file viewer
-  openTabs: FileTab[];
+  openTabs: ColoredFileTab[];
   activeTabId: string | null;
   fileViewerOpen: boolean;
   tabEditState: Record<string, TabEditState>;
 
   // Actions
   loadWorkspaces: () => Promise<void>;
+  moveWorkspace: (fromId: string, toId: string | null) => Promise<void>;
   deleteWorkspace: (id: string) => Promise<void>;
   loadAgents: (workspaceId: string) => Promise<void>;
   loadAllAgents: () => Promise<void>;
@@ -146,6 +152,8 @@ interface DashboardState {
   openDirectoryTab: (rootDirectory: string, pathType: PathType, workspaceId?: string) => void;
   closeTab: (tabId: string) => void;
   setActiveTab: (tabId: string) => void;
+  moveTab: (tabId: string, targetTabId: string) => void;
+  setTabColor: (tabId: string, color: string | null) => void;
   closeAllTabs: () => void;
   enterEditMode: (tabId: string, initialContent: string) => void;
   exitEditMode: (tabId: string) => void;
@@ -307,6 +315,30 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
   },
 
   setActiveTab: (tabId) => set({ activeTabId: tabId }),
+
+  // Reorder: move `tabId` to the position currently occupied by `targetTabId`.
+  // Operates on the full openTabs array; relative order within each
+  // workspace's visible subset follows automatically.
+  moveTab: (tabId, targetTabId) => {
+    if (tabId === targetTabId) return;
+    set((state) => {
+      const from = state.openTabs.findIndex((t) => t.id === tabId);
+      const to = state.openTabs.findIndex((t) => t.id === targetTabId);
+      if (from === -1 || to === -1) return state;
+      const openTabs = [...state.openTabs];
+      const [moved] = openTabs.splice(from, 1);
+      openTabs.splice(to, 0, moved);
+      return { openTabs };
+    });
+  },
+
+  setTabColor: (tabId, color) => {
+    set((state) => ({
+      openTabs: state.openTabs.map((t) =>
+        t.id === tabId ? { ...t, color: color ?? undefined } : t
+      ),
+    }));
+  },
 
   closeAllTabs: () => {
     for (const tab of get().openTabs) {
@@ -624,6 +656,26 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
   loadWorkspaces: async () => {
     const workspaces = await window.api.workspaces.list();
     set({ workspaces });
+  },
+
+  // Drag-reorder: move `fromId` to `toId`'s position (toId null = end of
+  // list). Optimistic — updates the array immediately, then persists.
+  moveWorkspace: async (fromId: string, toId: string | null) => {
+    const { workspaces } = get();
+    const fromIdx = workspaces.findIndex((w) => w.id === fromId);
+    if (fromIdx < 0 || fromId === toId) return;
+    const next = [...workspaces];
+    const [moved] = next.splice(fromIdx, 1);
+    const toIdx = toId === null ? next.length : next.findIndex((w) => w.id === toId);
+    if (toIdx < 0) return;
+    next.splice(toIdx, 0, moved);
+    set({ workspaces: next });
+    try {
+      await window.api.workspaces.reorder(next.map((w) => w.id));
+    } catch (err) {
+      console.error('Failed to persist workspace order:', err);
+      await get().loadWorkspaces();
+    }
   },
 
   deleteWorkspace: async (id: string) => {

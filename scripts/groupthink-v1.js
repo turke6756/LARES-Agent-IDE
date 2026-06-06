@@ -329,7 +329,10 @@ async function main() {
   const workspaceId = args.workspaceId;
   const supervisorId = args.supervisorId;
   const topic = args.topic || "Research and plan a feature.";
-  const planPath = args.planPath || "plans/new-plan.md";
+  // Resolve to absolute: the path is embedded verbatim in agent prompts, and
+  // supervised agents run from the worker-lane cwd (.dashboard/workers/<p>/),
+  // not from this script's cwd — a relative path would land in the wrong dir.
+  const planPath = path.resolve(args.planPath || "plans/new-plan.md");
   const turnTimeoutRaw = args['turn-timeout-ms'];
   const parsedTurnTimeout = turnTimeoutRaw === undefined ? NaN : Number(turnTimeoutRaw);
   const turnTimeoutMs = Number.isFinite(parsedTurnTimeout) && parsedTurnTimeout > 0
@@ -363,6 +366,10 @@ async function main() {
         roleDescription: "Lead planner in charge of making the final call. You will receive feedback from a reviewer.",
         provider: args.leadProvider || 'claude',
         freshSession: true,
+        // Supervised: ride the worker lane (hook-driven status) and emit
+        // [DASHBOARD EVENT] status changes to the workspace supervisor —
+        // without this the event-bridge drops the agent's idle/done events.
+        isSupervised: true,
         systemPrompt: `You are the Lead Planner in a GroupThink deliberation.
 
 Topic: ${topic}
@@ -390,6 +397,8 @@ Begin by producing your first draft of the plan as your next message.`
         roleDescription: "Reviewer agent providing feedback to the Lead Planner.",
         provider: args.reviewerProvider || 'codex',
         freshSession: true,
+        // Supervised — see Lead launch above.
+        isSupervised: true,
         systemPrompt: `You are the Reviewer in a GroupThink deliberation.
 
 Topic: ${topic}

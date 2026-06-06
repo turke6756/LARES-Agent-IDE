@@ -97,6 +97,13 @@ export class EventBridge {
       // wake the supervisor.
       if (data.fromStatus === 'waiting' && data.status === 'working') return;
 
+      // launching → idle is launch-complete noise: the agent finished booting
+      // and is simply ready for its first instruction — nothing happened that
+      // a supervisor needs to react to. Suppress it. All other idle arrivals
+      // (working → idle, waiting → idle, etc.) are real turn-end signals and
+      // still deliver.
+      if (data.fromStatus === 'launching' && data.status === 'idle') return;
+
       const supervisor = this.deps.getSupervisorForWorker(agent);
       if (!supervisor || ['done', 'crashed'].includes(supervisor.status)) return;
 
@@ -190,7 +197,20 @@ export class EventBridge {
         // that has a hook scaffold. Gemini has no hook scaffold yet, so gemini agents
         // keep the chat-stream as their only working/idle signal and must NOT be
         // skipped here.
-        if ((agent.isSupervised || agent.isWorker) && agent.provider !== 'gemini') continue;
+        //
+        // BR-13 fix: the skip is scoped to the working/idle axis ONLY. "Needs
+        // human input" (endsWithQuestion → forceWaiting) is a DIFFERENT axis the
+        // hook pipeline does not deliver yet (P2: Claude Notification / Codex
+        // PermissionRequest), so the chat stream stays its only source — route
+        // just that branch for worker-lane claude/codex, then skip the rest.
+        if ((agent.isSupervised || agent.isWorker) && agent.provider !== 'gemini') {
+          if ((event.type === 'assistant-text' || event.type === 'assistant-text-patch')
+              && event.endsWithQuestion === true) {
+            const excerpt = event.type === 'assistant-text' ? event.text.slice(-300) : '';
+            this.deps.statusMonitor.forceWaiting(agentId, 'question', excerpt);
+          }
+          continue;
+        }
 
         switch (event.type) {
           case 'assistant-text': {
@@ -335,6 +355,77 @@ export class EventBridge {
       await this.deliver(supervisor, event);
     } catch (err) {
       console.error('[event-bridge] Error handling tmux_new_session_failed:', err);
+    }
+  }
+
+  /**
+   * Handoff handshake — the synchronous confirm-and-retry in `_doSendInput`
+   * exhausted its re-press attempts without observing a UserPromptSubmit
+   * hook: the prompt was typed into the worker's PTY but the turn never
+   * started. Without this event a fire-and-forget caller (UI chat bar,
+   * background queue, orchestration scripts POSTing /input) leaves the
+   * supervisor waiting forever for a Stop-hook idle event that can never
+   * come. Reuses the standard deliver() queue/drain path.
+   */
+  async onHandoffFailed(input: {
+    agent: Agent;
+    attempts: number;
+    message: string;
+  }): Promise<void> {
+    try {
+      const { agent } = input;
+      if (agent.isSupervisor || !agent.isSupervised) return;
+      const supervisor = this.deps.getSupervisorForWorker(agent);
+      if (!supervisor || ['done', 'crashed'].includes(supervisor.status)) return;
+
+      const logTail = await this.deps.getAgentLog(agent.id, SUPERVISOR_EVENT_LOG_TAIL_LINES);
+      const event: SupervisorEvent = {
+        type: 'handoff_failed',
+        agentId: agent.id,
+        agentTitle: agent.title,
+        workspaceId: agent.workspaceId,
+        handoffAttempts: input.attempts,
+        failureMessage: input.message,
+        logTail,
+      };
+
+      await this.deliver(supervisor, event);
+    } catch (err) {
+      console.error('[event-bridge] Error handling handoff_failed:', err);
+    }
+  }
+
+  /**
+   * Stalled-worker watchdog (StatusMonitor.checkWorkerStalled) — a
+   * supervised worker has been `working` with zero signal (no raw PTY
+   * output, no hook event, no fresh input) for WORKER_STALL_WARN_MS. This is
+   * the supervisor's "this is taking forever" sense: a worker that never
+   * finishes emits no Stop hook and therefore no status event, ever.
+   * One-shot per working stretch (the monitor dedupes).
+   */
+  async onWorkerStalled(input: {
+    agent: Agent;
+    stalledForMs: number;
+  }): Promise<void> {
+    try {
+      const { agent } = input;
+      if (agent.isSupervisor || !agent.isSupervised) return;
+      const supervisor = this.deps.getSupervisorForWorker(agent);
+      if (!supervisor || ['done', 'crashed'].includes(supervisor.status)) return;
+
+      const logTail = await this.deps.getAgentLog(agent.id, SUPERVISOR_EVENT_LOG_TAIL_LINES);
+      const event: SupervisorEvent = {
+        type: 'worker_stalled',
+        agentId: agent.id,
+        agentTitle: agent.title,
+        workspaceId: agent.workspaceId,
+        stalledForMs: input.stalledForMs,
+        logTail,
+      };
+
+      await this.deliver(supervisor, event);
+    } catch (err) {
+      console.error('[event-bridge] Error handling worker_stalled:', err);
     }
   }
 

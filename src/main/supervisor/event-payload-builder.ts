@@ -6,6 +6,16 @@ import { stripAnsi } from './strip-ansi';
 // long turns from drowning the supervisor's event context.
 const CHAT_PREVIEW_MAX_LINES = 10;
 const CHAT_PREVIEW_MAX_CHARS = 800;
+// Turn-end events (working → idle) carry the worker's FULL last assistant
+// message instead of the 10-line/800-char preview: that message is the
+// worker's hand-off to the supervisor (workers are instructed to end turns
+// with their question/decision in plain text), and head-truncating it cut
+// off exactly the part the supervisor needed. The safety ceiling exists only
+// so a runaway essay can't flood the supervisor's prompt buffer; when it
+// trips, head AND tail are both preserved (the ask lives at the end).
+const CHAT_FULL_MAX_CHARS = 6000;
+const CHAT_FULL_HEAD_CHARS = 2500;
+const CHAT_FULL_TAIL_CHARS = 3000;
 const FILES_TOUCHED_MAX_ENTRIES = 10;
 const CONSOLIDATED_HINT_MAX_CHARS = 80;
 
@@ -17,7 +27,8 @@ const CONSOLIDATED_HINT_MAX_CHARS = 80;
 // `status_change` with `toStatus === 'waiting'` plus `waitingKind` /
 // `waitingExcerpt` per §2.3.3.
 export interface SupervisorEvent {
-  type: 'status_change' | 'context_threshold' | 'tmux_new_session_failed';
+  type: 'status_change' | 'context_threshold' | 'tmux_new_session_failed'
+    | 'handoff_failed' | 'worker_stalled';
   agentId: string;
   agentTitle: string;
   workspaceId: string;
@@ -57,6 +68,16 @@ export interface SupervisorEvent {
    *  approve / tty-pattern). */
   waitingKind?: 'question' | 'y-n' | 'enter' | 'choice' | 'approve' | 'tty-pattern';
   waitingExcerpt?: string;
+  /** Handoff handshake — `handoff_failed` fields. The synchronous
+   *  confirm-and-retry exhausted its re-press attempts without ever seeing a
+   *  UserPromptSubmit hook: the prompt was typed but the worker turn never
+   *  started. Delivered even for fire-and-forget send paths so the supervisor
+   *  is woken instead of waiting forever for a Stop hook that can't come. */
+  handoffAttempts?: number;
+  failureMessage?: string;
+  /** Stalled-worker watchdog — `worker_stalled` fields. How long the agent
+   *  has been in `working` with zero signal (no PTY output, no hook event). */
+  stalledForMs?: number;
 }
 
 function formatTokens(n: number): string {
@@ -105,6 +126,26 @@ function formatChatPreview(message: string | undefined): string {
   }
   const rendered = body.split('\n').map(l => `> ${l}`).join('\n');
   return '\nLast output:\n' + rendered + (truncated ? '\n> …' : '');
+}
+
+/** Turn-end (working → idle) rendering: the full last assistant message from
+ *  the parsed chat log, `> `-prefixed. Only past CHAT_FULL_MAX_CHARS does it
+ *  truncate, and then from the MIDDLE — the headline (head) and the worker's
+ *  closing question/ask (tail) both survive. Returns '' when there is no
+ *  usable content so the caller can fall back to the PTY tail. */
+function formatChatFull(message: string | undefined): string {
+  if (!message) return '';
+  const trimmed = message.replace(/\s+$/, '');
+  if (trimmed.length === 0) return '';
+  let body = trimmed;
+  if (body.length > CHAT_FULL_MAX_CHARS) {
+    const omitted = body.length - CHAT_FULL_HEAD_CHARS - CHAT_FULL_TAIL_CHARS;
+    body = body.slice(0, CHAT_FULL_HEAD_CHARS)
+      + `\n… [${omitted} chars omitted] …\n`
+      + body.slice(body.length - CHAT_FULL_TAIL_CHARS);
+  }
+  const rendered = body.split('\n').map(l => `> ${l}`).join('\n');
+  return '\nLast output:\n' + rendered;
 }
 
 /** BUG-20: render the "Files touched:" block. Section is omitted when the
@@ -175,7 +216,15 @@ export function buildEventPayload(event: SupervisorEvent): string {
     // BUG-20: prefer the clean chat-source preview when we have one; fall
     // back to the PTY-frame tail otherwise (early bootstrap / providers
     // without parsed chat / chat-service failure path).
-    const chatPreview = formatChatPreview(event.lastAssistantMessage);
+    //
+    // working → idle is the turn-end hand-off: render the worker's full last
+    // assistant message (it ends with the question/decision the supervisor
+    // must act on). Every other transition (done, crashed, waiting → idle)
+    // keeps the compact 10-line/800-char preview.
+    const isTurnEnd = event.fromStatus === 'working' && event.toStatus === 'idle';
+    const chatPreview = isTurnEnd
+      ? formatChatFull(event.lastAssistantMessage)
+      : formatChatPreview(event.lastAssistantMessage);
     const outputBlock = chatPreview || formatLogTail(event.logTail, 5);
 
     return [
@@ -218,7 +267,50 @@ export function buildEventPayload(event: SupervisorEvent): string {
     ].filter(Boolean).join('\n');
   }
 
-  return `[DASHBOARD EVENT] Unknown event type: ${(event as { type: string }).type}`;
+  if (event.type === 'handoff_failed') {
+    // Handoff handshake — the send path delivered the prompt but the worker
+    // turn never started (no UserPromptSubmit hook after every re-press).
+    // Distinct header + explicit "do not wait for a Stop hook" framing: the
+    // usual idle event will never arrive for this turn, so the supervisor
+    // must act now instead of sleeping.
+    return [
+      '[DASHBOARD EVENT] Worker handoff FAILED — prompt delivered but turn never started',
+      agentLine,
+      event.handoffAttempts != null
+        ? `Submit re-pressed ${event.handoffAttempts}x with no UserPromptSubmit hook.`
+        : '',
+      event.failureMessage ? `Detail: ${event.failureMessage}` : '',
+      'The worker is NOT working and will never emit a Stop-hook idle event for this prompt.',
+      'Recommended: read_agent_log to see the PTY; if the prompt sits unsubmitted, '
+        + 'send_keys_to_agent {key: "enter"}; if the agent is dead or hook-broken, relaunch it.',
+      formatLogTail(event.logTail, 5),
+    ].filter(Boolean).join('\n');
+  }
+
+  if (event.type === 'worker_stalled') {
+    const mins = event.stalledForMs != null
+      ? Math.round(event.stalledForMs / 60000)
+      : null;
+    return [
+      '[DASHBOARD EVENT] Worker appears stalled',
+      agentLine,
+      mins != null
+        ? `Status has been 'working' with zero signal (no PTY output, no hook event) for ~${mins} min.`
+        : `Status has been 'working' with zero signal (no PTY output, no hook event).`,
+      'A live turn keeps the PTY streaming, so this silence likely means a hung tool, a dead '
+        + 'process, or a submit that never took.',
+      'Recommended: read_agent_log to inspect; send_keys_to_agent {key: "enter"} if a prompt sits '
+        + 'unsubmitted; stop/relaunch if the process is dead.',
+      formatLogTail(event.logTail, 5),
+    ].filter(Boolean).join('\n');
+  }
+
+  // Defensive fallback — still name the sending agent so the supervisor can
+  // attribute even a malformed/unknown event to its source.
+  return [
+    `[DASHBOARD EVENT] Unknown event type: ${(event as { type: string }).type}`,
+    agentLine,
+  ].join('\n');
 }
 
 export function buildConsolidatedPayload(events: SupervisorEvent[]): string {
@@ -243,6 +335,11 @@ export function buildConsolidatedPayload(events: SupervisorEvent[]): string {
       lines.push(`- ${title}: context at ${event.contextPercentage}%`);
     } else if (event.type === 'tmux_new_session_failed') {
       lines.push(`- ${title}: WSL tmux session creation failed`);
+    } else if (event.type === 'handoff_failed') {
+      lines.push(`- ${title}: handoff FAILED — prompt delivered but turn never started`);
+    } else if (event.type === 'worker_stalled') {
+      const mins = event.stalledForMs != null ? Math.round(event.stalledForMs / 60000) : '?';
+      lines.push(`- ${title}: stalled — working ~${mins} min with zero output/hook signal`);
     }
   }
   lines.push('\nUse list_agents and read_agent_log to assess each agent.');

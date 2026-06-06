@@ -30,6 +30,9 @@ import {
   START_HOOK_RESEND_INTERVAL_MS,
   START_HOOK_RESEND_MAX_ATTEMPTS,
   HOOK_CANARY_WINDOW_MS,
+  CONFIRM_WINDOW_FIRST_MS,
+  CONFIRM_POLL_MS,
+  MAX_SUBMIT_RETRIES,
 } from '../../shared/constants';
 import type { Agent } from '../../shared/types';
 import type { StatusChangedEvent } from './status-events';
@@ -1716,7 +1719,7 @@ test('BUG-23: Stop hook arriving mid-settle promotes via hook path; settle no-op
   }
 });
 
-test('BUG-23: non-supervised codex promotes at codex settle (15s default)', async () => {
+test('BUG-23: non-supervised codex promotes at codex settle (25s default)', async () => {
   const fakes = makeStatusMonitorFakes();
   const restore = patchDatabaseModule(fakes);
   try {
@@ -1735,7 +1738,7 @@ test('BUG-23: non-supervised codex promotes at codex settle (15s default)', asyn
     fakes.now.value += 2;
     await pollOnce(monitor);
     assert.equal(agent.status, 'idle', 'promoted at codex settle budget');
-    assert.equal(LAUNCH_SETTLE_TIMEOUT_MS.codex, 15_000,
+    assert.equal(LAUNCH_SETTLE_TIMEOUT_MS.codex, 25_000,
       'codex default budget matches spec');
   } finally {
     restore();
@@ -2383,6 +2386,302 @@ test('canary: does not clobber a degraded (B2) hook_status', async () => {
     );
     assert.equal(agent.hookStatus, 'degraded', 'degraded status is preserved');
   } finally {
+    restore();
+  }
+});
+
+// ── Synchronous submit confirmation (plan §1 part 1, §2.3, §2.4, Q4) ─────
+//
+// confirmSubmission's POLL/WINDOW timing rides the injectable clock (advanced
+// by a fake `sleep`); the CONFIRMATION COMPARISON
+// (`getLastStartHookEventAt > priorStartHookAt`) is the Date.now-based recorded
+// hook ts vs the pre-send baseline. These tests drive the fake clock + fire the
+// start hook at chosen moments to exercise every branch.
+
+interface ConfirmCtx {
+  monitor: StatusMonitor;
+  presses: { count: number };
+  now: number;
+}
+
+/** Build a StatusMonitor wired for confirmSubmission tests: a fake `sleep`
+ *  advances the fake clock and runs `onSleep`; the resubmit handler counts
+ *  presses and runs `onPress`. */
+function makeConfirmMonitor(
+  fakes: ReturnType<typeof makeStatusMonitorFakes>,
+  agent: Agent,
+  opts: { onSleep?: (ctx: ConfirmCtx) => void; onPress?: (ctx: ConfirmCtx) => void } = {},
+): { monitor: StatusMonitor; presses: { count: number } } {
+  fakes.agents.set(agent.id, agent);
+  fakes.aliveOverride.set(agent.id, true);
+  const presses = { count: 0 };
+  const monitor = new StatusMonitor(
+    async () => true,
+    (id) => fakes.lastOutputAt.get(id) ?? 0,
+    (id) => fakes.agents.get(id) ?? null,
+    () => fakes.now.value,
+    () => '',
+    (id) => fakes.lastRawOutputAt.get(id) ?? 0,
+    async (ms: number) => {
+      fakes.now.value += ms;
+      opts.onSleep?.({ monitor, presses, now: fakes.now.value });
+    },
+  );
+  monitor.setResubmitHandler(() => {
+    presses.count++;
+    opts.onPress?.({ monitor, presses, now: fakes.now.value });
+  });
+  return { monitor, presses };
+}
+
+test('confirm (a): submit confirmed inside the first window — no re-press', async () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeAgent('cc-a', { provider: 'claude', isWorker: true, status: 'idle' });
+    let sleepCount = 0;
+    const { monitor, presses } = makeConfirmMonitor(fakes, agent, {
+      onSleep: ({ monitor: m, now }) => {
+        // Fire the start hook on the 2nd poll — well inside the 2000ms window.
+        if (++sleepCount === 2) m.recordStartHookEventAt(agent.id, now);
+      },
+    });
+
+    const confirmed = await monitor.confirmSubmission(agent.id, 0);
+    assert.equal(confirmed, true, 'hook arriving in the first window confirms');
+    assert.equal(presses.count, 0, 'no submit-only re-press when the first window confirms');
+    assert.equal(monitor.isConfirmInFlight(agent.id), false, 'confirm-in-flight cleared on resolve');
+  } finally {
+    restore();
+  }
+});
+
+test('confirm (b): submit confirmed on a retry window after a re-press', async () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeAgent('cc-b', { provider: 'claude', isWorker: true, status: 'idle' });
+    let firstPressDone = false;
+    const { monitor, presses } = makeConfirmMonitor(fakes, agent, {
+      onPress: () => { firstPressDone = true; },
+      onSleep: ({ monitor: m, now }) => {
+        // Only confirm once the first re-press has happened (i.e. in a retry
+        // window, never the first window).
+        if (firstPressDone) m.recordStartHookEventAt(agent.id, now);
+      },
+    });
+
+    const confirmed = await monitor.confirmSubmission(agent.id, 0);
+    assert.equal(confirmed, true, 'hook arriving after a re-press confirms');
+    assert.equal(presses.count, 1, 'exactly one re-press was needed');
+  } finally {
+    restore();
+  }
+});
+
+test('confirm (c): exhaustion → false after MAX_SUBMIT_RETRIES re-presses', async () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeAgent('cc-c', { provider: 'claude', isWorker: true, status: 'idle' });
+    const { monitor, presses } = makeConfirmMonitor(fakes, agent, {
+      // Hook never fires.
+    });
+
+    const confirmed = await monitor.confirmSubmission(agent.id, 0);
+    assert.equal(confirmed, false, 'no hook ever → exhausted → false');
+    assert.equal(presses.count, MAX_SUBMIT_RETRIES,
+      `exactly MAX_SUBMIT_RETRIES (${MAX_SUBMIT_RETRIES}) submit-only re-presses`);
+    assert.equal(monitor.isConfirmInFlight(agent.id), false, 'confirm-in-flight cleared even on exhaustion');
+  } finally {
+    restore();
+  }
+});
+
+test('confirm (d): pre-send baseline race — a stale prior hook does NOT falsely confirm', async () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeAgent('cc-d', { provider: 'claude', isWorker: true, status: 'idle' });
+    const { monitor, presses } = makeConfirmMonitor(fakes, agent);
+    // A hook from a PRIOR turn already exists at t=500. No NEW hook ever fires.
+    monitor.recordStartHookEventAt(agent.id, 500);
+    const prior = monitor.getLastStartHookEventAt(agent.id) ?? 0;
+    assert.equal(prior, 500, 'baseline captures the prior hook');
+
+    const confirmed = await monitor.confirmSubmission(agent.id, prior);
+    assert.equal(confirmed, false,
+      'a stale hook == baseline must not confirm (comparison is strict >, not >=)');
+    assert.equal(presses.count, MAX_SUBMIT_RETRIES, 'it retried rather than false-confirming on the stale hook');
+  } finally {
+    restore();
+  }
+});
+
+test('confirm (e): the final retry IS polled before giving up', async () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeAgent('cc-e', { provider: 'claude', isWorker: true, status: 'idle' });
+    const { monitor, presses } = makeConfirmMonitor(fakes, agent, {
+      onPress: ({ monitor: m, presses: p, now }) => {
+        // Fire the hook only on the LAST re-press. If the loop pressed-then-
+        // returned without polling the final press, this would never confirm.
+        if (p.count === MAX_SUBMIT_RETRIES) m.recordStartHookEventAt(agent.id, now + 1);
+      },
+    });
+
+    const confirmed = await monitor.confirmSubmission(agent.id, 0);
+    assert.equal(confirmed, true, 'a hook landing on the final retry window still confirms');
+    assert.equal(presses.count, MAX_SUBMIT_RETRIES, 'all retries used; the last one was polled');
+  } finally {
+    restore();
+  }
+});
+
+test('confirm coordination: reactive resend skips contract providers + in-flight agents', () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeAgent('cc-coord', { provider: 'codex', isWorker: true, status: 'idle' });
+    fakes.agents.set(agent.id, agent);
+    fakes.aliveOverride.set(agent.id, true);
+    let resends = 0;
+    const monitor = makeMonitor({ fakes, agent });
+    monitor.setResubmitHandler(() => { resends++; });
+
+    // Arm the reactive-resend signature: input delivered long ago, still idle,
+    // no start hook since.
+    monitor.recordInputDelivered(agent.id, fakes.now.value - START_HOOK_RESEND_AFTER_MS - 1_000);
+
+    // 1) Predicate says this agent is a contract provider → reactive path skips.
+    monitor.setSubmitConfirmationPredicate(() => true);
+    (monitor as any).checkStartHookResend(agent);
+    assert.equal(resends, 0, 'contract providers re-press via the synchronous path only');
+
+    // 2) Predicate false (fallback provider) but a confirm is in flight → still skip.
+    monitor.setSubmitConfirmationPredicate(() => false);
+    (monitor as any).confirmInFlight.add(agent.id);
+    (monitor as any).checkStartHookResend(agent);
+    assert.equal(resends, 0, 'no reactive re-press while a synchronous confirm is in flight');
+
+    // 3) Predicate false + not in flight → the reactive fallback fires.
+    (monitor as any).confirmInFlight.delete(agent.id);
+    (monitor as any).checkStartHookResend(agent);
+    assert.equal(resends, 1, 'non-contract provider falls back to the reactive resend');
+  } finally {
+    restore();
+  }
+});
+
+// ── P1 §3 — hook-transport poller tick ordering (plan §5 E4) ─────────────
+
+test('P1 tick ordering: transport poller runs BEFORE the canary — a spool SessionStart disarms it, no broken stamp that tick', async () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeAgent('tp-1', {
+      status: 'idle',
+      isWorker: true,
+      isSupervised: false,
+      provider: 'claude',
+      hookStatus: 'unknown',
+    });
+    const monitor = makeMonitor({ fakes, agent });
+    // Canary armed long enough ago that THIS tick would flip 'broken'.
+    monitor.recordHookCanary(agent.id, fakes.now.value - HOOK_CANARY_WINDOW_MS - 1_000);
+
+    // The poller simulates what the supervisor's spool drain does when the
+    // spool holds a SessionStart for this agent: stamp healthy + disarm.
+    // (The applier itself is unit-tested in agent-supervisor.test.ts; here
+    // the contract under test is the ORDERING — poller before per-agent
+    // canary evaluation in the same poll() tick.)
+    monitor.setHookTransportPoller(() => {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const db = require('../database') as { updateAgentHookStatus: (id: string, s: 'healthy', ts?: number) => void };
+      db.updateAgentHookStatus(agent.id, 'healthy', fakes.now.value);
+      monitor.clearHookCanary(agent.id);
+    });
+
+    await pollOnce(monitor);
+
+    assert.equal(agent.hookStatus, 'healthy', 'the spool SessionStart won the tick');
+    const brokenStamps = fakes.hookUpdates.filter((u) => u.hookStatus === 'broken');
+    assert.equal(brokenStamps.length, 0,
+      'the canary must NOT stamp broken on the same tick the transport delivered proof-of-load');
+    assert.equal(monitor.isHookCanaryArmed(agent.id), false, 'canary disarmed');
+  } finally {
+    restore();
+  }
+});
+
+test('P1 tick ordering CONTROL: without the transport poller the same tick flips broken (ordering is load-bearing)', async () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeAgent('tp-2', {
+      status: 'idle',
+      isWorker: true,
+      isSupervised: false,
+      provider: 'claude',
+      hookStatus: 'unknown',
+    });
+    const monitor = makeMonitor({ fakes, agent });
+    monitor.recordHookCanary(agent.id, fakes.now.value - HOOK_CANARY_WINDOW_MS - 1_000);
+
+    await pollOnce(monitor);
+
+    const brokenStamps = fakes.hookUpdates.filter((u) => u.hookStatus === 'broken');
+    assert.equal(brokenStamps.length, 1,
+      'control: an expired canary with NO transport delivery flips broken — proving the ordering test is meaningful');
+  } finally {
+    restore();
+  }
+});
+
+test('P1 tick ordering: the poller runs exactly ONCE per tick regardless of agent count', async () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const a1 = makeAgent('tp-n1', { status: 'idle', isWorker: true });
+    const a2 = makeAgent('tp-n2', { status: 'idle', isWorker: true });
+    const a3 = makeAgent('tp-n3', { status: 'idle', isWorker: true });
+    const monitor = makeMonitor({ fakes, agent: a1 });
+    for (const a of [a2, a3]) {
+      fakes.agents.set(a.id, a);
+      fakes.aliveOverride.set(a.id, true);
+      fakes.lastOutputAt.set(a.id, fakes.now.value);
+    }
+
+    let pollerRuns = 0;
+    monitor.setHookTransportPoller(() => { pollerRuns++; });
+
+    await pollOnce(monitor);
+    assert.equal(pollerRuns, 1, 'one tick, three agents → exactly one transport drain');
+    await pollOnce(monitor);
+    assert.equal(pollerRuns, 2, 'second tick → second drain');
+  } finally {
+    restore();
+  }
+});
+
+test('P1 tick ordering: a throwing transport poller never breaks the poll loop', async () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  const origWarn = console.warn;
+  console.warn = () => {};
+  try {
+    const agent = makeAgent('tp-err', { status: 'launching', isSupervised: true, provider: 'claude' });
+    const monitor = makeMonitor({ fakes, agent });
+    monitor.recordLaunch(agent.id);
+    monitor.setHookTransportPoller(() => { throw new Error('transport boom'); });
+
+    fakes.now.value += LAUNCH_SETTLE_TIMEOUT_MS.claude + 1;
+    await pollOnce(monitor);
+    assert.equal(agent.status, 'idle',
+      'per-agent work (settle promotion) still ran despite the poller throwing');
+  } finally {
+    console.warn = origWarn;
     restore();
   }
 });

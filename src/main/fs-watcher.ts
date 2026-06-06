@@ -117,8 +117,14 @@ function toUnc(wslDir: string, wslEntryPath: string): string {
   return path.join('\\\\wsl.localhost\\Ubuntu', wslEntryPath.replace(/\//g, '\\'));
 }
 
+interface PollEntryMeta {
+  isDirectory: boolean;
+  size: number;
+  mtimeMs?: number;
+}
+
 function startPollingWatcher(dirPath: string, pathType: PathType, key: string): () => void {
-  let previous = new Map<string, { isDirectory: boolean; size: number }>();
+  let previous = new Map<string, PollEntryMeta>();
   let timer: ReturnType<typeof setTimeout> | null = null;
   let closed = false;
   let inFlight = false;
@@ -135,10 +141,10 @@ function startPollingWatcher(dirPath: string, pathType: PathType, key: string): 
     }, delay);
   };
 
-  const loadCurrent = async (): Promise<Map<string, { isDirectory: boolean; size: number }>> => {
-    const current = new Map<string, { isDirectory: boolean; size: number }>();
+  const loadCurrent = async (): Promise<Map<string, PollEntryMeta>> => {
+    const current = new Map<string, PollEntryMeta>();
     for (const e of await listDirectoryEntriesAsync(dirPath, pathType)) {
-      current.set(e.path, { isDirectory: e.isDirectory, size: e.size });
+      current.set(e.path, { isDirectory: e.isDirectory, size: e.size, mtimeMs: e.mtimeMs });
     }
     return current;
   };
@@ -166,7 +172,7 @@ function startPollingWatcher(dirPath: string, pathType: PathType, key: string): 
         const prev = previous.get(p);
         if (!prev) {
           emit(key, { type: 'add', path: p, parentDir: dirPath, isDirectory: meta.isDirectory, size: meta.size });
-        } else if (!meta.isDirectory && prev.size !== meta.size) {
+        } else if (!meta.isDirectory && (prev.size !== meta.size || prev.mtimeMs !== meta.mtimeMs)) {
           emit(key, { type: 'change', path: p, parentDir: dirPath });
         }
       }

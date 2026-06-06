@@ -57,7 +57,7 @@ node scripts/<name>.js \
   [orchestration-specific flags]
 ```
 
-Confirm with the user before launching anything that will burn tokens — show the constructed command. Don't autonomously launch.
+**If the user directed this run** (named the orchestration, or gave a goal that clearly maps to one — e.g. "groupthink this with codex"), launch immediately and include the constructed command in your launch report — do NOT pause for approval; the directive was the authorization (behavioral.md B-15). Confirm before launching ONLY when the run is supervisor-proposed and the user hasn't asked for it.
 
 ### 5. Launch detached
 
@@ -117,7 +117,7 @@ Orchestrations and the agents they launch should not write to paths under `.clau
 
 ## Constraints
 
-- Run orchestrations only when the user asks. Don't autonomously launch them.
-- Confirm the constructed invocation with the user before launching, especially for non-trivial topics.
+- Run orchestrations in service of a user directive — either an explicit ask ("groupthink this") or a stage of a pipeline the user set in motion (behavioral.md B-15). Don't invent runs the user never asked for.
+- When the run is user-directed, launch without pausing for approval and report the invocation as you go. Confirm first only for supervisor-proposed runs.
 - Each orchestration's manual is the source of truth for its flags and events. If the manual disagrees with this skill, follow the manual.
 - After launch, return to idle. Don't poll the dashboard; let `[DASHBOARD EVENT]` messages drive your wake-ups.

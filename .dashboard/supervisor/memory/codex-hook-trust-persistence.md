@@ -77,6 +77,49 @@ for the profile path when writing `dashboard-worker.config.toml`. Candidate owne
 silent re-gate, because trust is keyed on that path. Add this to the §2.2 re-gate triggers list
 alongside the command-hash change.
 
+## UPDATE 2026-06-02 — CONFIRMED LIVE: the profile rewrite wipes trust every restart (bug B8)
+
+Live canary verify (HOOK_SYSTEM_DESIGN.md §8.3 step 1 / §8.4). Launched throwaway
+worker-lane codex `dd68c2f5` on the post-canary build. Result: `hook_status` → **broken**
+in the 8 s window, **zero** hook events, agent blocked at the Codex hook-trust review
+panel (`⚠ 4 hooks need review`). Two compounding faults, both now confirmed against
+running code + on-disk before/after:
+
+1. **`ensureCodexHookProfile()` unconditionally overwrites** `~/.codex/dashboard-worker.config.toml`
+   on the FIRST codex launch after each app restart (in-memory `codexHookProfileEnsured`
+   Set guard; dist `index.js:1230-1231` — plain `writeFileSync`, no merge, no hash-guard).
+   The P0 SessionStart/`[features]` additions changed the body AND the rewrite **dropped the
+   `[hooks.state]` `trusted_hash` block** the user had persisted with `t`. Verified: file went
+   from `{stop, user_prompt_submit}` *with* trusted_hash → new body with NO `[hooks.state]`.
+2. **`--dangerously-bypass-hook-trust` can't cover NEW hooks** — it runs only *already-enabled*
+   hooks for the invocation. The new SessionStart hooks are `Active 0 / Review 2`, so the bypass
+   skips them and Codex blocks the whole turn on the review panel → even previously-trusted
+   Stop/UserPromptSubmit don't fire. Adding SessionStart **regressed** codex workers.
+
+**This is the root cause of the user's recurring "codex keeps asking for hook permission after
+restart" complaint.** The canary works correctly (it catches this); the underlying delivery is
+the bug. Durable fix = SEED `[hooks.state]` (trusted_hash + `enabled = true`) for every hook the
+profile writer installs, AND stop clobbering any existing state (merge / hash-guard). Slot into P0.
+
+Verify tooling added: `scripts/hook-canary-verify.mjs <id>` — prints `hook_status` /
+`last_hook_event_at` columns (the SessionStart health ping writes NO event row, so the
+events-only `hook-evidence-by-agent.mjs` can't see it).
+
+## UPDATE 2026-06-03 — B8 FIXED in code (pending live-verify after restart)
+
+Worker `3d3cd123` implemented the durable B8 fix in `ensureCodexHookProfile()` (src/main/supervisor/index.ts):
+- **Seeds `[hooks.state]` trust** for every hook it installs (Stop / UserPromptSubmit / SessionStart), both Windows + WSL branches, computed at write time from the actual command strings (no hardcoded hashes).
+- **Non-clobbering:** skips the write when the on-disk body is identical AND all trust hashes are present → a plain restart no longer wipes trust, and a user's manual `t` survives.
+- 4 pure exported helpers: `codexHookTrustHash`, `parseCodexProfileHooks`, `buildCodexHooksStateSection`, `codexProfileTrustIntact`.
+
+**Verified hash recipe (reproduces all 3 §8.4 ground-truth hashes byte-for-byte):**
+`trusted_hash = "sha256:" + sha256(compactJSON(recursivelyKeySorted({ event_name, hooks:[{type:"command", command, timeout, async:false}] })))`
+— null fields dropped, keys recursively sorted, `timeout=30`, `event_name` lower-snake (`stop`/`user_prompt_submit`/`session_start`), `command` = exact installed string (forward-slash script path on Windows). This matches plan §2.2 Fix A. `npm run build:main` exit 0; `test:supervisor` green.
+
+**Still PENDING:** live-verify after an app restart — delete `[hooks.state]` from `~/.codex/dashboard-worker.config.toml`, restart, launch a fresh-session codex worker, confirm NO trust panel + `hook-canary-verify.mjs` shows healthy with zero manual `t`; then restart again and confirm the trust block survives (non-clobber). Full write-up in docs/HOOK_SYSTEM_DESIGN.md §8.5.
+
+Same session also shipped the **synchronous confirm-and-retry ("re-enter") mechanism** (worker `c9fbbb6b`, plan global-hook-rollout §1/§2.3/§2.4) — Claude-first throwing contract, Codex behind an empirical `hasObservedStartHook` self-test, Gemini/non-hook on reactive fallback; C1 surface = `Agent.lastSendError` via the status endpoint. Built clean, also pending the same restart for live-verify. Note: an untracked orphan test `wsl-runner-stderr.test` fails on a never-existing symbol `buildTmuxFailureLogLines` — pre-existing, not from this session.
+
 ## Action items flagged (not yet done)
 
 - Reconcile rollout doc `plans/global-hook-rollout-and-submit-confirmation.md` §2.2 with these confirmed facts (trust keying = per-workspace config path + command hash; bypass flag IS applied; custom-command fragility).

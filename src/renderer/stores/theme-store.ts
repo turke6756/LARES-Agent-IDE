@@ -28,6 +28,12 @@ function applyTheme(theme: Theme) {
     root.classList.add('dark');
     root.classList.remove('light');
   }
+  // Sync native window chrome (title bar / menu bar) and persist for the
+  // next launch's pre-paint background. Guarded: preload may not be ready
+  // when this runs at module load.
+  try {
+    window.api?.system?.setTheme?.(theme);
+  } catch { /* non-fatal — chrome stays on previous theme */ }
 }
 
 // Apply on load

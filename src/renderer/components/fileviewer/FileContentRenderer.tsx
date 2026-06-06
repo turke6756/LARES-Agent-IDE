@@ -63,7 +63,7 @@ export default function FileContentRenderer({ content, filePath, pathType, error
   }
 
   if (fileType === 'csv') {
-    return <CsvRenderer content={content} filePath={filePath} />;
+    return <CsvRenderer content={content} filePath={filePath} tabId={tabId} />;
   }
 
   if (fileType === 'geotiff') {
@@ -80,7 +80,7 @@ export default function FileContentRenderer({ content, filePath, pathType, error
 
   if (fileType === 'code') {
     const language = detectLanguage(filePath);
-    return <CodeRenderer content={content} language={language} />;
+    return <CodeRenderer content={content} language={language} tabId={tabId} />;
   }
 
   if (fileType === 'image') {
@@ -107,5 +107,5 @@ export default function FileContentRenderer({ content, filePath, pathType, error
     );
   }
 
-  return <PlainTextRenderer content={content} />;
+  return <PlainTextRenderer content={content} tabId={tabId} />;
 }

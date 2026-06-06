@@ -112,6 +112,22 @@ export const START_HOOK_SILENCE_WARN_MS = 3_000;
 // under 1 s once the hook fires).
 export const HOOK_CANARY_WINDOW_MS = 8_000;
 
+// P1 multi-transport hook delivery (plans/p1-hook-spool-multi-transport.md §2
+// step 4a) — tmux pane-option freshness gate. The @agentdashboard-status pane
+// option survives tmux-side across dashboard restarts while the in-process
+// dedupe/ordering registries start empty, so a tmux-option event must
+// additionally be younger than this bound (vs. the applier's host-clock
+// receivedAt) before it can flip status or stamp hook health. Exported so the
+// applier unit tests reference the same value.
+export const TMUX_OPTION_MAX_AGE_MS = 10 * 60_000;
+
+// Skew tolerance for the §2 step-4a CURRENT-LAUNCH guard ONLY (WSL and Windows
+// clocks normally agree, but the guard must not be fragile at the millisecond
+// boundary). The persisted last-hook guard deliberately has NO tolerance — it
+// is what prevents a previously delivered HTTP/spool event from being
+// resurrected after a dashboard restart.
+export const TMUX_OPTION_LAUNCH_SKEW_MS = 2_000;
+
 // BUG-10 reactive Enter-resend — when a hook-backed worker (claude/codex) has
 // been delivered input but no UserPromptSubmit hook has fired, the dashboard
 // now resends ONLY the submit keystroke (not the body, which is already in the
@@ -124,6 +140,59 @@ export const HOOK_CANARY_WINDOW_MS = 8_000;
 export const START_HOOK_RESEND_AFTER_MS = 3_000;     // wait before the 1st resend
 export const START_HOOK_RESEND_INTERVAL_MS = 3_000;  // spacing between resends
 export const START_HOOK_RESEND_MAX_ATTEMPTS = 2;     // then give up and warn
+
+// ── Worker handoff handshake ─────────────────────────────────────────────
+// POST /api/agents/:id/input with `confirm: true` (the MCP supervisor's
+// send_message_to_agent / launch_agent handshake) blocks until the worker's
+// turn provably started. For contract providers the UserPromptSubmit hook is
+// the proof (sendInput's synchronous confirm-and-retry already owns that);
+// for non-contract providers (gemini, codex-pre-proof) the server falls back
+// to observing the hook timestamp / a status flip to 'working' for this long
+// before reporting `confirmed: false`. Sized to outlast the reactive
+// Enter-resend schedule (3s first resend + 3s second + hook round-trip).
+export const HANDSHAKE_CONFIRM_WINDOW_MS = 15_000;
+export const HANDSHAKE_CONFIRM_POLL_MS = 250;
+
+// Stalled-worker watchdog — a supervised/worker-lane agent sitting in
+// `working` with ZERO signal (no raw PTY output, no hook event, no fresh
+// input) for this long is presumed stuck (dead turn, hung tool, dropped
+// submit that slipped past every other guard). Emits a one-shot
+// `worker_stalled` [DASHBOARD EVENT] so the supervisor gets the "this is
+// taking forever" sense it otherwise lacks — without it, a worker that never
+// finishes produces no Stop hook and therefore no event, ever. A genuinely
+// long turn does NOT trigger this: streaming output / TUI spinner redraws
+// keep the raw PTY timestamp fresh.
+export const WORKER_STALL_WARN_MS = 15 * 60 * 1000;  // 15 min
+
+// Synchronous submit confirmation (plans/global-hook-rollout-and-submit-confirmation.md
+// §2.3/§2.4, Q4). The send chokepoint (`AgentSupervisor._doSendInput`) confirms a
+// contract-provider submit actually started a turn by watching for the
+// UserPromptSubmit hook, re-pressing the submit-only keystroke until it does.
+//
+// Asymmetric windows: the FIRST window after the initial body+Enter is the
+// widest because every hook is a cold `node` spawn (no warm path) — node boot +
+// fetch round-trip. Subsequent retry windows are tighter because the body is
+// already in the composer and only the dropped Enter is being replayed.
+//   - CONFIRM_WINDOW_FIRST_MS  — wait after the initial submit before retry #1
+//   - CONFIRM_WINDOW_RETRY_MS  — wait after each submit-only re-press
+//   - CONFIRM_POLL_MS          — poll cadence for the start-hook timestamp
+//   - MAX_SUBMIT_RETRIES       — submit-only re-presses after the initial send
+//                                (the final retry IS polled before giving up)
+// INVARIANT: CONFIRM_WINDOW_FIRST_MS MUST cover the hook POST self-abort
+// (2500ms — `buildDashboardStatusScript(2500, ...)` below) PLUS a cold node
+// spawn budget of 1500ms, i.e. ≥ 4000ms. The 2500ms abort timer starts
+// INSIDE the spawned hook process, AFTER node boot — so a valid slow hook's
+// worst case as seen from the dashboard is `cold node spawn + 2500ms`, not
+// 2500ms flat. A first window that only beats the abort value by a few
+// hundred ms still hands a legitimately slow hook (e.g. a ~700ms+ cold spawn
+// on a busy box) a premature Enter re-press. (Enforced by a constants test
+// in handoff-handshake.test.ts asserting ≥ 2500 + 1500. Do NOT lower this
+// without also changing the hook script's self-abort — which requires a
+// scaffold version bump.)
+export const CONFIRM_WINDOW_FIRST_MS = 4_000;
+export const CONFIRM_WINDOW_RETRY_MS = 1_200;
+export const CONFIRM_POLL_MS = 100;
+export const MAX_SUBMIT_RETRIES = 3;
 
 // BUG-23 — per-provider cold-start settle window. After `runner.launch()`
 // returns, the agent is in `'launching'`; once wallclock since the launch
@@ -185,7 +254,7 @@ You have MCP tools provided by the AgentDashboard. Use these as your primary int
 - **list_agents** — List all agents with status, context usage, metadata
 - **read_agent_chat** — Read an agent's structured chat messages (args: agent_id, role?, limit?). **PREFER over \`read_agent_log\`** for assessing worker output — returns clean role/content/timestamp records without PTY escape noise. Typical use on an idle event: \`read_agent_chat(agent_id, role: 'assistant', limit: 1)\` grabs the agent's final assistant message (where "## Patch summary" sections land). 10–50× cheaper in tokens than the raw-log path.
 - **read_agent_log** — Read an agent's raw terminal output (args: agent_id, lines). Use only when you need PTY-level forensics (exact bytes in the terminal, test-runner stdout, error traces). Heavy with escape codes; fall back here when \`read_agent_chat\` is empty or insufficient.
-- **send_message_to_agent** — Send input to an idle/waiting agent (args: agent_id, message). Rejects if agent is working.
+- **send_message_to_agent** — Send input to an idle/waiting agent (args: agent_id, message). Rejects if agent is working. Blocks until the worker turn is confirmed started (see "Worker handoff handshake" below); read the HANDSHAKE result before ending your turn.
 - **send_keys_to_agent** — Send key events (args: agent_id, key | keys, count?). Use for interactive widgets (AskUserQuestion pickers, slash-command menus, arrow keys, Enter, Ctrl-C) where \`send_message_to_agent\`'s bracketed-paste wrapping would deposit bytes as text instead of as key events.
 - **get_context_stats** — Get token usage, context %, model, turns (args: agent_id)
 - **stop_agent** — Stop an agent (args: agent_id)
@@ -214,8 +283,18 @@ You receive \`[DASHBOARD EVENT]\` messages automatically when supervised agents 
 - **waiting_for_input**: When a supervised agent is waiting on user input (in-text question, terminal prompt, plan-mode approval), the dashboard sends \`[DASHBOARD EVENT] Agent waiting for input\` with a \`Waiting kind:\` and \`Excerpt:\` line. Read the agent log for context, decide a response, and reply with \`send_message_to_agent\` (text answers) or \`send_keys_to_agent\` (arrow-key pickers / Enter).
 - **crashed**: Read the log to diagnose. Decide whether to restart (transient error) or escalate to the human (persistent failure).
 - **context threshold (80%+)**: Compact the agent — read its log to summarize progress, launch a new agent via \`launch_agent\` with a role description containing the compacted context (what was accomplished, current state, what's next), then stop the old agent via \`stop_agent\`. This gives the work a fresh context window without losing continuity.
+- **handoff_failed**: A prompt you (or anyone) sent to a worker was typed but the turn NEVER started — the worker is idle with the prompt sitting unsubmitted or dead. It will never emit an idle event for that prompt, so act immediately: \`read_agent_log\`, then \`send_keys_to_agent {key: "enter"}\` if the prompt is visible in the input box, or stop + relaunch if the agent is dead.
+- **worker_stalled**: A worker has been \`working\` with zero output for a long stretch — presumed hung. Inspect the log and decide: nudge, wait, or stop + relaunch.
 
 Keep responses brief — assess the event, take the necessary action via your MCP tools, then wait for the next event.
+
+## Worker handoff handshake
+
+\`send_message_to_agent\` and \`launch_agent\`'s initial prompt BLOCK until the worker's turn provably started (UserPromptSubmit hook, or a status flip to working) and say so in their result. Read that result before ending your turn:
+
+- **HANDSHAKE OK** — the worker is genuinely working; you'll get an idle event when it finishes. Safe to end your turn.
+- **HANDSHAKE UNCONFIRMED** — delivered, but no start proof (some providers lack one). Verify with \`read_agent_log\` before relying on it.
+- **HANDSHAKE FAILED** — the turn never started and no idle event will ever come. Recover in THIS turn (re-press Enter via \`send_keys_to_agent\`, or relaunch); never end your turn assuming the handoff worked.
 
 ## Constraints
 
@@ -363,8 +442,19 @@ Add entries as you learn important things about the agents, project, or decision
 
 /** Supervisor settings — .dashboard/supervisor/.claude/settings.json
  *  Disables repo-wide auto-memory so the supervisor's manual ./memory/MEMORY.md
- *  index is the only memory source for the supervisor session. */
+ *  index is the only memory source for the supervisor session.
+ *  v2 adds autoCompactEnabled: false — long-running supervisor sessions must
+ *  not silently auto-compact; context management is the dashboard's job. */
 export const SUPERVISOR_CLAUDE_SETTINGS_JSON = `{
+  "autoMemoryEnabled": false,
+  "autoCompactEnabled": false
+}
+`;
+
+/** Pre-autoCompact supervisor settings (v1) — kept verbatim so a v1
+ *  workspace's on-disk settings.json can be hashed and silently upgraded to
+ *  v2 (which adds autoCompactEnabled: false). */
+export const SUPERVISOR_CLAUDE_SETTINGS_JSON_V1 = `{
   "autoMemoryEnabled": false
 }
 `;
@@ -429,9 +519,97 @@ prompt and the workspace files you can read.
  *  the template folder — we walk up two levels to the workspace root where
  *  .dashboard/scripts/dashboard-status.mjs lives).
  *  Schema verified against https://code.claude.com/docs/en/hooks.md —
- *  Stop / SubagentStop use the array-of-blocks shape and don't support
- *  matchers (any matcher field is silently ignored). */
+ *  Stop uses the array-of-blocks shape and doesn't support matchers (any
+ *  matcher field is silently ignored).
+ *  v4 removes the SubagentStop hook: it fires when a Task-tool subagent
+ *  finishes while the MAIN agent is still mid-turn, and its no-arg script
+ *  invocation POSTed `idle` — flipping a visibly-working agent's card to idle
+ *  (and pinging its supervisor) before the turn was done. Stop alone is the
+ *  correct turn boundary.
+ *  v5 adds autoCompactEnabled: false so workers never silently auto-compact
+ *  mid-task regardless of the machine's user-level Claude settings. */
 export const WORKER_CLAUDE_SETTINGS_JSON = `{
+  "autoMemoryEnabled": false,
+  "autoCompactEnabled": false,
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \\"\${CLAUDE_PROJECT_DIR}/../../scripts/dashboard-status.mjs\\" session-start"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \\"\${CLAUDE_PROJECT_DIR}/../../scripts/dashboard-status.mjs\\""
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \\"\${CLAUDE_PROJECT_DIR}/../../scripts/dashboard-status.mjs\\" working"
+          }
+        ]
+      }
+    ]
+  }
+}
+`;
+
+/** Pre-autoCompact Claude worker settings (v4) — kept verbatim so a v4
+ *  workspace's on-disk settings.json can be hashed and silently upgraded to
+ *  v5 (which adds autoCompactEnabled: false). */
+export const WORKER_CLAUDE_SETTINGS_JSON_V4 = `{
+  "autoMemoryEnabled": false,
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \\"\${CLAUDE_PROJECT_DIR}/../../scripts/dashboard-status.mjs\\" session-start"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \\"\${CLAUDE_PROJECT_DIR}/../../scripts/dashboard-status.mjs\\""
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \\"\${CLAUDE_PROJECT_DIR}/../../scripts/dashboard-status.mjs\\" working"
+          }
+        ]
+      }
+    ]
+  }
+}
+`;
+
+/** Pre-SubagentStop-removal Claude worker settings (v3) — kept verbatim so a
+ *  v3 workspace's on-disk settings.json can be hashed and silently upgraded to
+ *  v4 (which drops the idle-flipping SubagentStop hook). */
+export const WORKER_CLAUDE_SETTINGS_JSON_V3 = `{
   "autoMemoryEnabled": false,
   "hooks": {
     "SessionStart": [
@@ -609,7 +787,14 @@ timeout = 30
  *  timeout so a slow / missing dashboard never blocks the user-visible hook.
  *  If the POST fails, inference (classes I–III) still drives status — degraded
  *  but not broken. */
-export const DASHBOARD_STATUS_SCRIPT_MJS = `#!/usr/bin/env node
+/** FROZEN v≤6 worker hook script body, parameterized by the POST self-abort
+ *  timeout (ms) and the v6 SubagentStop guard. Versions v4/v5/v6 differ ONLY
+ *  in these two values, so a single builder keeps the frozen verbatim copies
+ *  (used for silent-upgrade hashing) byte-identical apart from them — no risk
+ *  of hand-copy drift breaking the hash. v7 diverges structurally and lives in
+ *  {@link buildDashboardStatusScript} below. */
+function buildDashboardStatusScriptV6(postAbortMs: number, ignoreSubagentStop = false): string {
+  return `#!/usr/bin/env node
 // Class IV worker hook script — see plans/class-iv-worker-hook-scaffold.md
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
@@ -619,12 +804,20 @@ const agentId = process.env.AGENT_ID;
 const port = process.env.DASHBOARD_PORT || '24678';
 const host = process.env.DASHBOARD_HOST || '127.0.0.1';
 if (!agentId) process.exit(0);
-
+${ignoreSubagentStop ? `
+// SubagentStop fires when a Task-tool subagent finishes while the MAIN agent
+// is still mid-turn — posting idle here would flip a working agent's card to
+// idle (and falsely ping its supervisor). Only Stop marks the turn boundary,
+// so bail before any POST. Belt-and-suspenders for settings.json versions
+// that still wire SubagentStop to this script (≤ v3). Claude-only: Codex has
+// no SubagentStop and doesn't export CLAUDE_HOOK_EVENT_NAME.
+if (process.env.CLAUDE_HOOK_EVENT_NAME === 'SubagentStop') process.exit(0);
+` : ''}
 // argv[2] selects the lifecycle event:
 //   'session-start' → state 'active'  (SessionStart hook; canary proof the
 //                       hook scaffold loaded — must NOT flip working/idle)
 //   'working'       → state 'working' (UserPromptSubmit hook)
-//   (default)       → state 'idle'    (Stop / SubagentStop hook)
+//   (default)       → state 'idle'    (${ignoreSubagentStop ? 'Stop hook' : 'Stop / SubagentStop hook'})
 const rawState = process.argv[2];
 let state, source;
 if (rawState === 'session-start') {
@@ -646,7 +839,10 @@ const hookEvent = process.env.CLAUDE_HOOK_EVENT_NAME || 'unknown';
 
 try {
   const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort(), 1500);
+  // Self-abort raised to ≥ CONFIRM_WINDOW_FIRST_MS (synchronous submit
+  // confirmation, plan §2.4) so a slow UserPromptSubmit POST isn't cancelled
+  // before the dashboard's first confirm window can observe it.
+  const timer = setTimeout(() => ac.abort(), ${postAbortMs});
   await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -678,6 +874,187 @@ try {
   }
 }
 `;
+}
+
+/** Live (v7) Class IV hook script — P1 multi-transport delivery
+ *  (HOOK_SYSTEM_DESIGN.md §5.3, plans/p1-hook-spool-multi-transport.md §1).
+ *
+ *  v7 contract:
+ *    - Step 0: read hook JSON from stdin (64 KB cap raced against a 300 ms
+ *      timeout with defensive listener-removal + destroy), resolve
+ *      hookEventName stdin → CLAUDE_HOOK_EVENT_NAME → argv, extended
+ *      SubagentStop bail (env OR stdin), then build ONE event record with a
+ *      single ts — all transports carry identical bytes so the dashboard's
+ *      dedupe key {agentId, ts, hookEventName, turnId} matches across channels.
+ *    - Transport 1 — spool: ALWAYS appended (not just on HTTP failure). Path
+ *      from DASHBOARD_SPOOL_PATH env; script-relative fallback only for old
+ *      workspaces launched without the env (the CODEX_HOME copy would
+ *      otherwise spool to ~/, invisible to the tailer).
+ *    - Transport 2 — HTTP POST (2.5 s self-abort, ≥ CONFIRM_WINDOW_FIRST_MS).
+ *    - Transport 3 — tmux pane option @agentdashboard-status via
+ *      `tmux set-option -p -t $TMUX_PANE` (WSL lanes; skipped when not under
+ *      tmux).
+ *    - Every step in its own try/catch; unconditional exit 0 — a hook script
+ *      failure must NEVER block or fail the user-visible hook.
+ *
+ *  Deliberately avoids JS template literals so the embedded script needs no
+ *  backtick/dollar escaping inside this TS template. */
+function buildDashboardStatusScript(): string {
+  return `#!/usr/bin/env node
+// Class IV worker hook script v7 — multi-transport delivery. See
+// docs/HOOK_SYSTEM_DESIGN.md §5.3 and plans/p1-hook-spool-multi-transport.md §1.
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
+import fs from 'node:fs';
+import { spawnSync } from 'node:child_process';
+
+// destroy() below can emit an ASYNC 'error' on some Node versions; an
+// unhandled 'error' event escapes every try/catch and would violate the
+// always-exit-0 contract, so attach a no-op handler BEFORE any read begins.
+try { process.stdin.on('error', () => {}); } catch { /* exotic stdin */ }
+
+async function main() {
+  const agentId = process.env.AGENT_ID;
+  const port = process.env.DASHBOARD_PORT || '24678';
+  const host = process.env.DASHBOARD_HOST || '127.0.0.1';
+  if (!agentId) return;
+
+  // ── Step 0: event construction (prework, not a transport) ─────────────
+  // Read stdin (both frameworks pass hook JSON there) with a 64 KB cap raced
+  // against a 300 ms timeout — the hook must never hang on a stdin that stays
+  // open. On timeout: remove listeners, pause, destroy (each best-effort) so
+  // the event loop drains and the process can exit.
+  let stdinMeta = {};
+  try {
+    const raw = await new Promise((resolve) => {
+      let buf = '';
+      let done = false;
+      let timer = null;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        if (timer) clearTimeout(timer);
+        try {
+          process.stdin.removeAllListeners('data');
+          process.stdin.removeAllListeners('end');
+          // Keep an 'error' no-op attached across the removal — destroy()'s
+          // async error must always have a listener.
+          process.stdin.removeAllListeners('error');
+          process.stdin.on('error', () => {});
+          process.stdin.pause();
+          process.stdin.destroy();
+        } catch { /* best-effort cleanup */ }
+        resolve(buf);
+      };
+      timer = setTimeout(finish, 300);
+      try {
+        process.stdin.on('data', (chunk) => {
+          buf += chunk.toString('utf8');
+          if (buf.length >= 65536) { buf = buf.slice(0, 65536); finish(); }
+        });
+        process.stdin.on('end', finish);
+      } catch { finish(); }
+    });
+    if (raw && raw.trim()) {
+      try { stdinMeta = JSON.parse(raw); } catch { /* tolerate invalid JSON */ }
+      if (stdinMeta === null || typeof stdinMeta !== 'object') stdinMeta = {};
+    }
+  } catch { /* stdin meta is best-effort */ }
+
+  // hookEventName: stdin → CLAUDE_HOOK_EVENT_NAME env → argv-derived.
+  const rawState = process.argv[2];
+  const argvEventName = rawState === 'working' ? 'UserPromptSubmit'
+    : rawState === 'session-start' ? 'SessionStart'
+    : 'Stop';
+  const stdinEventName = typeof stdinMeta.hook_event_name === 'string' ? stdinMeta.hook_event_name : '';
+  const hookEventName = stdinEventName || process.env.CLAUDE_HOOK_EVENT_NAME || argvEventName;
+
+  // SubagentStop guard (v6, extended to stdin): a Task-tool subagent finishing
+  // mid-turn must not flip the still-working main agent idle. Bail before any
+  // transport writes — nothing is spooled, posted, or set.
+  if (process.env.CLAUDE_HOOK_EVENT_NAME === 'SubagentStop' || stdinEventName === 'SubagentStop') return;
+
+  // argv[2] selects the lifecycle event:
+  //   'session-start' → state 'active'  (SessionStart hook; canary proof —
+  //                       must NOT flip working/idle)
+  //   'working'       → state 'working' (UserPromptSubmit hook)
+  //   (default)       → state 'idle'    (Stop hook)
+  let state, source;
+  if (rawState === 'session-start') { state = 'active'; source = 'hook-session-start'; }
+  else if (rawState === 'working') { state = 'working'; source = 'hook-start'; }
+  else { state = 'idle'; source = 'hook-stop'; }
+
+  // ONE record, ONE ts — identical bytes on every transport.
+  const record = { v: 1, agentId, state, source, ts: Date.now(), hookEventName };
+  if (typeof stdinMeta.turn_id === 'string' && stdinMeta.turn_id) record.turnId = stdinMeta.turn_id;
+  if (typeof stdinMeta.session_id === 'string' && stdinMeta.session_id) record.sessionId = stdinMeta.session_id;
+  const body = JSON.stringify(record);
+  const line = body + '\\n';
+
+  // ── Transport 1: spool (always-write) ──────────────────────────────────
+  try {
+    let spoolPath = process.env.DASHBOARD_SPOOL_PATH;
+    if (!spoolPath) {
+      // Fallback for old workspaces launched without the env. NOTE: for the
+      // CODEX_HOME copy of this script this resolves OUTSIDE the workspace —
+      // which is exactly why the env form is primary.
+      const scriptDir = path.dirname(fileURLToPath(import.meta.url));
+      spoolPath = path.resolve(scriptDir, '..', 'pending-status.jsonl');
+    }
+    fs.appendFileSync(spoolPath, line);
+  } catch { /* spool is best-effort; HTTP/tmux may still deliver */ }
+
+  // ── Transport 2: HTTP POST ─────────────────────────────────────────────
+  try {
+    const ac = new AbortController();
+    // Self-abort ≥ CONFIRM_WINDOW_FIRST_MS (synchronous submit confirmation)
+    // so a slow UserPromptSubmit POST isn't cancelled before the dashboard's
+    // first confirm window can observe it.
+    const timer = setTimeout(() => ac.abort(), 2500);
+    await fetch('http://' + host + ':' + port + '/api/agents/' + agentId + '/status', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body,
+      signal: ac.signal,
+    });
+    clearTimeout(timer);
+  } catch { /* HTTP is best-effort; the spool already has the event */ }
+
+  // ── Transport 3: tmux pane option (WSL lanes) ──────────────────────────
+  // Persist the record tmux-side so the dashboard's pane-option poll can
+  // recover it even when both spool and HTTP were unreachable. -p -t targets
+  // the pane named by TMUX_PANE explicitly (tmux sets it in every pane's
+  // env); skip silently when not under tmux or tmux isn't on PATH.
+  try {
+    if (process.env.TMUX && process.env.TMUX_PANE) {
+      spawnSync('tmux',
+        ['set-option', '-p', '-t', process.env.TMUX_PANE, '@agentdashboard-status', line],
+        { timeout: 1000, stdio: 'ignore' });
+    }
+  } catch { /* tmux option is best-effort */ }
+}
+
+try { await main(); } catch { /* nothing escapes — exit 0 below */ }
+process.exit(0);
+`;
+}
+
+export const DASHBOARD_STATUS_SCRIPT_MJS = buildDashboardStatusScript();
+
+/** v6 verbatim (POST self-abort 2500ms + SubagentStop guard) — frozen so a v6
+ *  workspace's on-disk dashboard-status.mjs can be hashed and silently
+ *  upgraded to v7. Exists only as the hash source for previousHashes[6]. */
+export const DASHBOARD_STATUS_SCRIPT_MJS_V6 = buildDashboardStatusScriptV6(2500, true);
+
+/** v5 verbatim (POST self-abort 2500ms, no SubagentStop guard) — kept so a v5
+ *  workspace's on-disk dashboard-status.mjs can be hashed and silently
+ *  upgraded to v6. Exists only as the hash source for previousHashes[5]. */
+export const DASHBOARD_STATUS_SCRIPT_MJS_V5 = buildDashboardStatusScriptV6(2500);
+
+/** v4 verbatim (POST self-abort 1500ms) — kept so a v4 workspace's on-disk
+ *  dashboard-status.mjs can be hashed and silently upgraded. Written by
+ *  no scaffolder; exists only as the hash source for previousHashes[4]. */
+export const DASHBOARD_STATUS_SCRIPT_MJS_V4 = buildDashboardStatusScriptV6(1500);
 
 /** Pre-session-start hook script (v3) — kept verbatim so a v3 workspace's
  *  on-disk dashboard-status.mjs can be hashed and silently upgraded to v4
@@ -1155,6 +1532,14 @@ export const MODEL_CONTEXT_WINDOWS: Record<string, number> = {
   'gemini-2.5-pro': EXTENDED_CONTEXT_WINDOW_TOKENS,
   'gemini-2.5-flash': EXTENDED_CONTEXT_WINDOW_TOKENS,
 };
+
+/**
+ * Gauge cap for context tracking: regardless of the model's true window
+ * (1M for [1m] Claude or Codex GPT models), the dashboard treats 200K as
+ * 100%. Applied at window-resolution time in the claude and codex readers;
+ * gemini keeps its real window.
+ */
+export const CONTEXT_GAUGE_CAP_TOKENS = 200_000;
 
 export function getContextWindowForModel(model: string): number {
   const lower = model.toLowerCase();

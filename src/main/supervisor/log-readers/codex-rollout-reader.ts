@@ -12,11 +12,13 @@ import type {
   UsageEvent,
   SystemInitEvent,
 } from '../../../shared/session-events';
-import { DEFAULT_CONTEXT_WINDOW_TOKENS, getContextWindowForModel } from '../../../shared/constants';
+import { DEFAULT_CONTEXT_WINDOW_TOKENS, CONTEXT_GAUGE_CAP_TOKENS, getContextWindowForModel } from '../../../shared/constants';
 import type { AgentProvider } from '../../../shared/types';
 import {
   flattenToolResultContent,
   resolveHomeSubdir,
+  resolveWindowsHomeSubdir,
+  resolveWslHomeSubdir,
   truncateForChat,
   type ChatLogReader,
   type ChatLogReaderSession,
@@ -68,8 +70,13 @@ export interface CodexSessionMeta {
 export class CodexRolloutReader implements ChatLogReader {
   readonly provider: AgentProvider = 'codex';
 
-  private windowsSessionsDir: string | null = null;
-  private wslSessionsUncDir: string | null = null;
+  // Base dirs resolve lazily and self-heal (see resolveWslHomeSubdir in
+  // types.ts): a failed WSL discovery at app startup must not permanently
+  // disable rollout attach for WSL agents. Tri-state: `undefined` = not yet
+  // resolved (accessors keep retrying), `null` = pinned absent (tests),
+  // string = resolved (cached for the reader's lifetime).
+  private windowsSessionsDir: string | null | undefined = undefined;
+  private wslSessionsUncDir: string | null | undefined = undefined;
 
   private resolvedPaths = new Map<string, string>(); // agentId -> jsonlPath
   private fileOffsets = new Map<string, number>(); // jsonlPath -> byte offset
@@ -86,10 +93,18 @@ export class CodexRolloutReader implements ChatLogReader {
   // when the events land in different polls (see §2.1.3 / D-05).
   private lastAssistantTextEvent = new Map<string, AssistantTextEvent>();
 
-  constructor() {
-    const { windowsDir, wslUncDir } = resolveHomeSubdir('.codex/sessions');
-    this.windowsSessionsDir = windowsDir;
-    this.wslSessionsUncDir = wslUncDir;
+  private getWindowsSessionsDir(): string | null {
+    if (this.windowsSessionsDir !== undefined) return this.windowsSessionsDir;
+    const dir = resolveWindowsHomeSubdir('.codex/sessions');
+    if (dir) this.windowsSessionsDir = dir;
+    return dir;
+  }
+
+  private getWslSessionsDir(): string | null {
+    if (this.wslSessionsUncDir !== undefined) return this.wslSessionsUncDir;
+    const dir = resolveWslHomeSubdir('.codex/sessions');
+    if (dir) this.wslSessionsUncDir = dir;
+    return dir;
   }
 
   invalidatePath(agentId: string): void {
@@ -493,8 +508,12 @@ export class CodexRolloutReader implements ChatLogReader {
 
     const model = this.currentModel.get(session.agentId) || 'codex/unknown';
     const stashWindow = this.modelContextWindow.get(session.agentId);
-    const contextWindowMax =
-      stashWindow ?? windowFromInfo ?? getContextWindowForModel(model) ?? DEFAULT_CONTEXT_WINDOW_TOKENS;
+    // Gauge policy: 100% = 200K even when the rollout reports a larger
+    // window (e.g. 258K/1M GPT models) — matches the claude reader.
+    const contextWindowMax = Math.min(
+      stashWindow ?? windowFromInfo ?? getContextWindowForModel(model) ?? DEFAULT_CONTEXT_WINDOW_TOKENS,
+      CONTEXT_GAUGE_CAP_TOKENS
+    );
     const cumulativeContextTokens = totalTokens || (inputTokens + outputTokens);
     const contextPercentage = Math.min(
       100,
@@ -560,13 +579,15 @@ export class CodexRolloutReader implements ChatLogReader {
     // Prefer the matching home first; fall back to the other if the agent's
     // working directory doesn't exist there.
     const wslFirst = session.workingDirectory.startsWith('/');
+    const wslDir = this.getWslSessionsDir();
+    const windowsDir = this.getWindowsSessionsDir();
     const dirs: string[] = [];
     if (wslFirst) {
-      if (this.wslSessionsUncDir) dirs.push(this.wslSessionsUncDir);
-      if (this.windowsSessionsDir) dirs.push(this.windowsSessionsDir);
+      if (wslDir) dirs.push(wslDir);
+      if (windowsDir) dirs.push(windowsDir);
     } else {
-      if (this.windowsSessionsDir) dirs.push(this.windowsSessionsDir);
-      if (this.wslSessionsUncDir) dirs.push(this.wslSessionsUncDir);
+      if (windowsDir) dirs.push(windowsDir);
+      if (wslDir) dirs.push(wslDir);
     }
     return dirs;
   }

@@ -2,6 +2,7 @@ import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { useShallow } from 'zustand/react/shallow';
 import { useDashboardStore } from '../../stores/dashboard-store';
 import StatusBadge from '../agent/StatusBadge';
+import AgentStrip from '../agent/AgentStrip';
 import DetailPaneContext from '../detail/DetailPaneContext';
 import DetailPaneProducts from '../detail/DetailPaneProducts';
 import ChatPane from '../detail/ChatPane';
@@ -151,14 +152,21 @@ export default function DetailPanel({ width }: DetailPanelProps) {
   if (!agent) {
     return (
       <div
-        className="panel-shell flex flex-col z-20"
+        className="panel-shell flex flex-col z-20 font-sans"
         style={{ width }}
       >
-        <div className="panel-header flex items-center justify-end p-1">
+        <div className="panel-header flex items-center justify-between p-3">
+          <h3 className="font-semibold text-[13px] text-gray-100">
+            Agents
+            {agents.length > 0 && <span className="ml-1.5 text-gray-500 font-normal">{agents.length}</span>}
+          </h3>
           <CollapseButton collapsed={false} direction="right" onClick={() => togglePanelCollapsed('detailPanelCollapsed')} />
         </div>
-        <div className="flex-1 flex items-center justify-center text-gray-300 font-sans text-sm p-4">
-          No agent selected
+        <div className="p-3 overflow-y-auto scrollbar-thin">
+          <AgentStrip defaultExpanded />
+        </div>
+        <div className="flex-1 flex items-center justify-center text-gray-500 text-[12px] p-4">
+          Select an agent to attach
         </div>
       </div>
     );
@@ -174,42 +182,47 @@ export default function DetailPanel({ width }: DetailPanelProps) {
     >
 
       {/* Agent info header */}
-      <div className="panel-header p-4 relative overflow-hidden">
-        <div className="flex items-center justify-between mb-3">
-          <h3 className="font-semibold text-[13px] truncate text-gray-100">{agent.title}</h3>
-          <div className="flex items-center gap-1">
+      <div className="panel-header p-3 relative overflow-hidden">
+        <div className="flex items-center justify-between mb-2">
+          <div className="flex items-center gap-0.5 min-w-0">
+            <h3 className="font-semibold text-[13px] truncate text-gray-100">{agent.title}</h3>
+            <button
+              onClick={() => setShowMeta(!showMeta)}
+              aria-pressed={showMeta}
+              aria-label={showMeta ? 'Hide agent details' : 'Show agent details'}
+              title={showMeta ? 'Hide agent details' : 'Show agent details'}
+              className={`ui-btn ui-btn-ghost min-h-0 shrink-0 px-1.5 py-0.5 text-[12px] ${
+                showMeta ? 'text-accent-blue' : 'text-gray-500'
+              }`}
+            >
+              &#x24D8;
+            </button>
+          </div>
+          <div className="flex items-center gap-1 shrink-0">
             <StatusBadge status={agent.status} />
             <CollapseButton collapsed={false} direction="right" onClick={() => togglePanelCollapsed('detailPanelCollapsed')} />
           </div>
         </div>
 
-        <div className="space-y-1 text-[13px] text-gray-400">
-          <div className="flex">
-            <span className="text-gray-500 w-16 shrink-0">Directory</span>
-            <span className="truncate text-gray-200">{agent.workingDirectory}</span>
-          </div>
-          <div className="flex">
-            <span className="text-gray-500 w-16 shrink-0">Command</span>
-            <span className="truncate text-gray-200">{agent.command}</span>
-          </div>
-          <div className="flex">
-             <span className="text-gray-500 w-16 shrink-0">Session</span>
-             <span className="truncate text-gray-200">{agent.tmuxSessionName || 'N/A'}</span>
-          </div>
-        </div>
-
-        {/* Collapsible Metadata */}
-        <button
-          onClick={() => setShowMeta(!showMeta)}
-          className="ui-btn ui-btn-ghost mt-3 w-full text-[13px]"
-        >
-          {showMeta ? 'Collapse Meta' : 'Expand Meta'}
-        </button>
+        {/* Compressed dashboard agents — same order as the grid, expandable */}
+        <AgentStrip />
 
         {showMeta && (
           <div className="mt-2 space-y-1 text-[13px] text-gray-400 bg-surface-0/40 border border-gray-800 p-2 font-sans">
             <div className="flex items-center justify-between border- dark:border-white/10 light:border-black/10 pb-1 mb-1">
                <span className="text-accent-blue">System Info</span>
+            </div>
+            <div className="flex">
+              <span className="text-gray-500 w-16 shrink-0">Directory</span>
+              <span className="truncate text-gray-200">{agent.workingDirectory}</span>
+            </div>
+            <div className="flex">
+              <span className="text-gray-500 w-16 shrink-0">Command</span>
+              <span className="truncate text-gray-200">{agent.command}</span>
+            </div>
+            <div className="flex">
+              <span className="text-gray-500 w-16 shrink-0">Session</span>
+              <span className="truncate text-gray-200">{agent.tmuxSessionName || 'N/A'}</span>
             </div>
             <div className="flex items-center">
               <span className="text-gray-400 w-16 shrink-0">ID</span>
@@ -304,6 +317,15 @@ export default function DetailPanel({ width }: DetailPanelProps) {
         >
           Prompt Staging
         </button>
+        <button
+          onClick={() => setWatchGlass((v) => !v)}
+          aria-pressed={watchGlass}
+          className={`ui-btn flex-1 px-3 py-2 text-[13px] font-bold ${
+            watchGlass ? 'bg-accent-blue/20 text-accent-blue' : 'ui-btn-ghost text-accent-blue/80'
+          }`}
+        >
+          Watch Glass
+        </button>
         <div ref={overflowRef} className="relative">
           <button
             onClick={() => setShowOverflow((v) => !v)}
@@ -341,19 +363,6 @@ export default function DetailPanel({ width }: DetailPanelProps) {
                 className="w-full text-left px-3 py-1.5 text-[13px] text-accent-purple disabled:opacity-40 disabled:cursor-not-allowed hover:bg-surface-2"
               >
                 Query Agent
-              </button>
-              <button
-                role="menuitem"
-                aria-pressed={watchGlass}
-                onClick={() => {
-                  setShowOverflow(false);
-                  setWatchGlass((v) => !v);
-                }}
-                className={`w-full text-left px-3 py-1.5 text-[13px] hover:bg-surface-2 ${
-                  watchGlass ? 'text-accent-blue' : 'text-accent-blue/80'
-                }`}
-              >
-                {watchGlass ? 'Hide Watch Glass' : 'Watch Glass'}
               </button>
               <button
                 role="menuitem"

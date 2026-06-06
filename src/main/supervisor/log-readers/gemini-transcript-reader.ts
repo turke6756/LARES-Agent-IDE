@@ -15,7 +15,8 @@ import { DEFAULT_CONTEXT_WINDOW_TOKENS, getContextWindowForModel } from '../../.
 import type { AgentProvider } from '../../../shared/types';
 import {
   flattenToolResultContent,
-  resolveHomeSubdir,
+  resolveWindowsHomeSubdir,
+  resolveWslHomeSubdir,
   truncateForChat,
   type ChatLogReader,
   type ChatLogReaderSession,
@@ -50,8 +51,13 @@ interface FullToolResultLocation {
 export class GeminiTranscriptReader implements ChatLogReader {
   readonly provider: AgentProvider = 'gemini';
 
-  private windowsTmpDir: string | null = null;
-  private wslTmpUncDir: string | null = null;
+  // Base dirs resolve lazily and self-heal (see resolveWslHomeSubdir in
+  // types.ts): a failed WSL discovery at app startup must not permanently
+  // disable transcript attach for WSL agents. Tri-state: `undefined` = not
+  // yet resolved (accessors keep retrying), `null` = pinned absent (tests),
+  // string = resolved (cached for the reader's lifetime).
+  private windowsTmpDir: string | null | undefined = undefined;
+  private wslTmpUncDir: string | null | undefined = undefined;
 
   private resolvedPaths = new Map<string, string>(); // agentId -> jsonlPath
   private fileOffsets = new Map<string, number>(); // jsonlPath -> byte offset
@@ -76,10 +82,18 @@ export class GeminiTranscriptReader implements ChatLogReader {
 
   private toolResultLocations = new Map<string, FullToolResultLocation>(); // `${agentId}:${callId}`
 
-  constructor() {
-    const { windowsDir, wslUncDir } = resolveHomeSubdir('.gemini/tmp');
-    this.windowsTmpDir = windowsDir;
-    this.wslTmpUncDir = wslUncDir;
+  private getWindowsTmpDir(): string | null {
+    if (this.windowsTmpDir !== undefined) return this.windowsTmpDir;
+    const dir = resolveWindowsHomeSubdir('.gemini/tmp');
+    if (dir) this.windowsTmpDir = dir;
+    return dir;
+  }
+
+  private getWslTmpDir(): string | null {
+    if (this.wslTmpUncDir !== undefined) return this.wslTmpUncDir;
+    const dir = resolveWslHomeSubdir('.gemini/tmp');
+    if (dir) this.wslTmpUncDir = dir;
+    return dir;
   }
 
   invalidatePath(agentId: string): void {
@@ -535,13 +549,15 @@ export class GeminiTranscriptReader implements ChatLogReader {
 
   private candidateBaseDirs(session: ChatLogReaderSession): string[] {
     const wslFirst = session.workingDirectory.startsWith('/');
+    const wslDir = this.getWslTmpDir();
+    const windowsDir = this.getWindowsTmpDir();
     const dirs: string[] = [];
     if (wslFirst) {
-      if (this.wslTmpUncDir) dirs.push(this.wslTmpUncDir);
-      if (this.windowsTmpDir) dirs.push(this.windowsTmpDir);
+      if (wslDir) dirs.push(wslDir);
+      if (windowsDir) dirs.push(windowsDir);
     } else {
-      if (this.windowsTmpDir) dirs.push(this.windowsTmpDir);
-      if (this.wslTmpUncDir) dirs.push(this.wslTmpUncDir);
+      if (windowsDir) dirs.push(windowsDir);
+      if (wslDir) dirs.push(wslDir);
     }
     return dirs;
   }

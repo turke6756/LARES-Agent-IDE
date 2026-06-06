@@ -24,3 +24,5 @@ plans/
 .dashboard/.scaffold-versions.json
 .dashboard/workers/
 .dashboard/scripts/
+.dashboard/pending-status.jsonl
+.dashboard/supervisor/.claude/.sysprompt-*.txt
