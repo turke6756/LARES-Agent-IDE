@@ -276,7 +276,8 @@ export default function Sidebar({ width }: SidebarProps) {
     const files = e.dataTransfer.files;
     if (!files.length) return;
 
-    const folderPath = (files[0] as any).path as string;
+    // Electron 41 removed File.path — resolve via the preload webUtils bridge.
+    const folderPath = window.api.files.getPathForFile(files[0]);
     if (!folderPath) return;
 
     const pathType = folderPath.startsWith('/') ? 'wsl' as const : 'windows' as const;

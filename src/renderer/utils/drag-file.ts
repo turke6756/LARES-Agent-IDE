@@ -44,3 +44,44 @@ export function treeEntryDragStart(
   e.dataTransfer.setData('text/plain', filePath);
   e.dataTransfer.effectAllowed = 'copyMove';
 }
+
+/**
+ * True when the drag originated from a directory-tree row inside the app.
+ * Check this BEFORE external-file handling: internal tree drags also carry
+ * legacy text/plain + file-path keys that could otherwise be misrouted.
+ */
+export function isInternalTreeDrag(dataTransfer: DataTransfer): boolean {
+  return dataTransfer.types.includes(TREE_ENTRY_MIME);
+}
+
+/** True when the drag carries OS files (e.g. from Windows Explorer) and is
+ *  not an internal tree drag. Plain-text and other drags don't qualify. */
+export function isExternalFileDrop(dataTransfer: DataTransfer): boolean {
+  return !dataTransfer.types.includes(TREE_ENTRY_MIME) && dataTransfer.types.includes('Files');
+}
+
+/**
+ * Early renderer-side detection of folder drops, which aren't supported.
+ * Best-effort via webkitGetAsEntry() — the main process re-checks every
+ * source with stat and is the source of truth. Must be called synchronously
+ * inside the drop handler (dataTransfer.items is neutered after an await).
+ */
+export function hasDroppedDirectory(dataTransfer: DataTransfer): boolean {
+  for (const item of Array.from(dataTransfer.items)) {
+    if (item.kind !== 'file') continue;
+    const entry = item.webkitGetAsEntry?.();
+    if (entry?.isDirectory) return true;
+  }
+  return false;
+}
+
+/**
+ * Resolve the native filesystem paths of dropped OS files via the preload
+ * webUtils bridge (Electron 41 removed File.path). Must be called
+ * synchronously inside the drop handler, before any await.
+ */
+export function getDroppedNativePaths(dataTransfer: DataTransfer): string[] {
+  return Array.from(dataTransfer.files)
+    .map((file) => window.api.files.getPathForFile(file))
+    .filter(Boolean);
+}

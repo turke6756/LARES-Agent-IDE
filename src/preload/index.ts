@@ -1,4 +1,4 @@
-import { contextBridge, ipcRenderer } from 'electron';
+import { contextBridge, ipcRenderer, webUtils } from 'electron';
 import type { IpcApi } from '../shared/types';
 
 const api: IpcApi = {
@@ -75,6 +75,13 @@ const api: IpcApi = {
       ipcRenderer.invoke('files:rename', oldPath, rootDirectory, pathType, newName),
     move: (srcPath, rootDirectory, pathType, destDir) =>
       ipcRenderer.invoke('files:move', srcPath, rootDirectory, pathType, destDir),
+    copy: (sourcePaths, rootDirectory, pathType, destDir) =>
+      ipcRenderer.invoke('files:copy', sourcePaths, rootDirectory, pathType, destDir),
+    // Synchronous, stays in the preload process — webUtils resolves the
+    // native path of a dropped File (Electron 41 removed File.path).
+    // Cast: the IpcApi contract uses a structural File stand-in because
+    // shared types compile without the DOM lib (tsconfig.main.json).
+    getPathForFile: (file) => webUtils.getPathForFile(file as Parameters<typeof webUtils.getPathForFile>[0]),
     deleteEntry: (entryPath, rootDirectory, pathType, recursive) =>
       ipcRenderer.invoke('files:delete', entryPath, rootDirectory, pathType, recursive),
     watchDirectory: (dirPath, pathType, callback) => {

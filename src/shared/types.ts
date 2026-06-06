@@ -235,6 +235,30 @@ export type FileMutationResult =
   | { ok: true; path?: string }
   | { ok: false; error: string };
 
+/**
+ * Result of `files:copy`. Distinguishes full success, validation failures
+ * (nothing copied — `failed` lists the offending sources), and partial
+ * failures (`copied` holds destination paths that did land).
+ */
+export type FileCopyResult =
+  | { ok: true; copied: string[] }
+  | {
+      ok: false;
+      error: string;
+      copied?: string[];
+      failed?: Array<{ sourcePath: string; error: string }>;
+    };
+
+/**
+ * Minimal structural stand-in for the DOM `File` type. Shared types also
+ * compile in the main process (tsconfig.main.json has no DOM lib), so the
+ * real `File` name is unavailable here. Real `File` objects from the
+ * renderer are structurally assignable.
+ */
+export interface RendererFile {
+  readonly name: string;
+}
+
 export interface FileTab {
   id: string;
   filePath: string;        // empty string for directory-only tabs
@@ -475,6 +499,15 @@ export interface IpcApi {
       pathType: PathType,
       destDir: string
     ) => Promise<FileMutationResult>;
+    copy: (
+      sourcePaths: string[],
+      rootDirectory: string,
+      pathType: PathType,
+      destDir: string
+    ) => Promise<FileCopyResult>;
+    /** Native filesystem path of a dropped OS file, via Electron webUtils
+     *  (Electron 41 removed the non-standard File.path). */
+    getPathForFile: (file: RendererFile) => string;
     deleteEntry: (
       entryPath: string,
       rootDirectory: string,

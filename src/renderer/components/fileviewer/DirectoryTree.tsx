@@ -5,7 +5,7 @@ import DirectoryTreeNode, { sortEntries, FS_RELIST_DEBOUNCE_MS } from './Directo
 import FileContextMenu, { type TreeSortMode } from '../shared/FileContextMenu';
 import { useNamePrompt } from '../../hooks/useNamePrompt';
 import { useDashboardStore } from '../../stores/dashboard-store';
-import { TREE_ENTRY_MIME } from '../../utils/drag-file';
+import { TREE_ENTRY_MIME, isInternalTreeDrag, isExternalFileDrop, hasDroppedDirectory, getDroppedNativePaths } from '../../utils/drag-file';
 
 function parentPathOf(entryPath: string): string {
   const slash = Math.max(entryPath.lastIndexOf('/'), entryPath.lastIndexOf('\\'));
@@ -90,10 +90,17 @@ export default function DirectoryTree({ rootPath, pathType, activeFilePath, onFi
   }, []);
 
   const handleRootDragOver = useCallback((e: React.DragEvent) => {
-    if (!e.dataTransfer.types.includes(TREE_ENTRY_MIME)) return;
-    e.preventDefault();
-    e.dataTransfer.dropEffect = 'move';
-    setIsRootDropTarget(true);
+    if (isInternalTreeDrag(e.dataTransfer)) {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      setIsRootDropTarget(true);
+      return;
+    }
+    if (isExternalFileDrop(e.dataTransfer)) {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'copy';
+      setIsRootDropTarget(true);
+    }
   }, []);
 
   const handleRootDragLeave = useCallback((e: React.DragEvent) => {
@@ -101,31 +108,49 @@ export default function DirectoryTree({ rootPath, pathType, activeFilePath, onFi
   }, []);
 
   const handleRootDrop = useCallback(async (e: React.DragEvent) => {
-    if (!e.dataTransfer.types.includes(TREE_ENTRY_MIME)) return;
-    e.preventDefault();
-    setIsRootDropTarget(false);
-    const raw = e.dataTransfer.getData(TREE_ENTRY_MIME);
-    if (!raw) return;
-    let payload: { path: string; isDirectory: boolean };
-    try {
-      payload = JSON.parse(raw);
-    } catch {
+    if (isInternalTreeDrag(e.dataTransfer)) {
+      e.preventDefault();
+      setIsRootDropTarget(false);
+      const raw = e.dataTransfer.getData(TREE_ENTRY_MIME);
+      if (!raw) return;
+      let payload: { path: string; isDirectory: boolean };
+      try {
+        payload = JSON.parse(raw);
+      } catch {
+        return;
+      }
+      if (!payload.path) return;
+      if (hasDirtyTabForPath(payload.path) &&
+          !window.confirm('That item has unsaved changes in an open tab. Move anyway?')) {
+        return;
+      }
+      const result = await window.api.files.move(payload.path, rootPath, pathType, rootPath);
+      if (!result.ok) {
+        window.alert(result.error);
+        return;
+      }
+      if (result.path) renameTabPath(payload.path, result.path);
+      cache.current.delete(parentPathOf(payload.path));
+      cache.current.delete(rootPath);
+      await reloadRoot();
       return;
     }
-    if (!payload.path) return;
-    if (hasDirtyTabForPath(payload.path) &&
-        !window.confirm('That item has unsaved changes in an open tab. Move anyway?')) {
-      return;
+    if (isExternalFileDrop(e.dataTransfer)) {
+      e.preventDefault();
+      setIsRootDropTarget(false);
+      // Renderer-side early check; the main process re-validates with stat.
+      if (hasDroppedDirectory(e.dataTransfer)) {
+        window.alert("Folder drops aren't supported yet — drop individual files");
+        return;
+      }
+      const sourcePaths = getDroppedNativePaths(e.dataTransfer);
+      if (sourcePaths.length === 0) return;
+      const result = await window.api.files.copy(sourcePaths, rootPath, pathType, rootPath);
+      if (!result.ok) window.alert(result.error);
+      if (result.ok || result.copied?.length) {
+        await reloadRoot();
+      }
     }
-    const result = await window.api.files.move(payload.path, rootPath, pathType, rootPath);
-    if (!result.ok) {
-      window.alert(result.error);
-      return;
-    }
-    if (result.path) renameTabPath(payload.path, result.path);
-    cache.current.delete(parentPathOf(payload.path));
-    cache.current.delete(rootPath);
-    await reloadRoot();
   }, [hasDirtyTabForPath, pathType, reloadRoot, renameTabPath, rootPath]);
 
   useEffect(() => {

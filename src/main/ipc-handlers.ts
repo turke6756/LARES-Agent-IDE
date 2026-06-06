@@ -15,7 +15,7 @@ import { getPassiveWslStatus, isTmuxAvailable, isClaudeAvailableInWsl } from './
 import { execFileSync } from 'child_process';
 import { detectPathType } from './path-utils';
 import { readFileContents, listDirectoryEntriesAsync } from './file-reader';
-import { writeFileContents, createFile, createDirectory, renameEntry, moveEntry, deleteEntry } from './file-writer';
+import { writeFileContents, createFile, createDirectory, renameEntry, moveEntry, copyFiles, deleteEntry } from './file-writer';
 import { subscribe as subscribeFsWatch } from './fs-watcher';
 import { scanPersonas, scaffoldPersona } from './persona-scanner';
 import { ensureJupyterServer, listKernelspecs } from './jupyter-server';
@@ -313,6 +313,13 @@ export function registerIpcHandlers(supervisor: AgentSupervisor, mainWindow: Bro
   ipcMain.handle('files:move', async (_e, srcPath, rootDirectory, pathType, destDir) => {
     const resolved = resolveMutationPathType(srcPath, rootDirectory, pathType);
     return await moveEntry(srcPath, rootDirectory, resolved, destDir);
+  });
+
+  ipcMain.handle('files:copy', async (_e, sourcePaths, rootDirectory, pathType, destDir) => {
+    // Sources are OS-native paths from Explorer drops; the destination
+    // decides the path type, not the sources.
+    const resolved = resolveMutationPathType(destDir, rootDirectory, pathType);
+    return await copyFiles(sourcePaths, rootDirectory, resolved, destDir);
   });
 
   ipcMain.handle('files:delete', async (_e, entryPath, rootDirectory, pathType, recursive) => {

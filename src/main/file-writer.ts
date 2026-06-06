@@ -1,6 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import type { FileMutationResult, PathType } from '../shared/types';
+import type { FileCopyResult, FileMutationResult, PathType } from '../shared/types';
 import { ensureWslPath } from './path-utils';
 import { wslExecCommand } from './wsl-bridge';
 
@@ -379,6 +379,122 @@ export async function moveEntry(
     return { ok: true, path: resolvedNew };
   } catch (err) {
     return errorResult(err, 'Failed to move entry');
+  }
+}
+
+/**
+ * Copy OS files (dropped from Explorer) into a directory inside the
+ * workspace. Single regular files only — directories, symlinks and other
+ * special files are rejected. All validation (existence, file type,
+ * collisions) runs before anything is copied; collisions always fail,
+ * nothing is ever overwritten.
+ *
+ * Source paths are Windows-native (Explorer drops). For WSL targets only
+ * drive-letter sources (C:\...) are supported — they are converted to
+ * /mnt/<drive>/... and copied WSL-side with `cp`.
+ */
+export async function copyFiles(
+  sourcePaths: string[],
+  rootDirectory: string,
+  pathType: PathType,
+  destDir: string,
+): Promise<FileCopyResult> {
+  try {
+    if (!Array.isArray(sourcePaths) || sourcePaths.length === 0) {
+      throw new Error('No files to copy');
+    }
+    assertInsideRoot(destDir, rootDirectory, pathType);
+
+    if (pathType === 'wsl') {
+      const wslDest = normalizeWslPath(ensureWslPath(destDir, pathType));
+      if (!await wslIsDirectory(wslDest)) throw new Error('Destination folder does not exist');
+    } else {
+      const resolvedDest = normalizeWindowsPath(destDir);
+      if (!fs.existsSync(resolvedDest) || !fs.statSync(resolvedDest).isDirectory()) {
+        throw new Error('Destination folder does not exist');
+      }
+    }
+
+    // Preflight every source before copying anything.
+    const problems: Array<{ sourcePath: string; error: string }> = [];
+    const seenNames = new Set<string>();
+    const jobs: Array<{ sourcePath: string; name: string; targetPath: string }> = [];
+    for (const sourcePath of sourcePaths) {
+      let st: fs.Stats;
+      try {
+        st = await fs.promises.lstat(sourcePath);
+      } catch {
+        problems.push({ sourcePath, error: 'Source does not exist' });
+        continue;
+      }
+      if (st.isDirectory()) {
+        problems.push({ sourcePath, error: "Folder drops aren't supported yet — drop individual files" });
+        continue;
+      }
+      if (!st.isFile()) {
+        problems.push({ sourcePath, error: 'Only regular files can be copied (symlinks are not supported)' });
+        continue;
+      }
+      if (pathType === 'wsl' && !/^[A-Za-z]:[\\/]/.test(sourcePath)) {
+        problems.push({ sourcePath, error: 'Only drive-letter sources (e.g. C:\\...) can be copied into a WSL workspace' });
+        continue;
+      }
+      const name = path.win32.basename(sourcePath);
+      const nameKey = name.toLowerCase();
+      if (seenNames.has(nameKey)) {
+        problems.push({ sourcePath, error: `Duplicate file name "${name}" in the same drop` });
+        continue;
+      }
+      seenNames.add(nameKey);
+      const targetPath = joinPath(destDir, name, pathType);
+      assertInsideRoot(targetPath, rootDirectory, pathType);
+      jobs.push({ sourcePath, name, targetPath });
+    }
+
+    // Collision preflight: never overwrite, fail before copying anything.
+    for (const job of jobs) {
+      const exists = pathType === 'wsl'
+        ? await wslPathExists(job.targetPath)
+        : fs.existsSync(normalizeWindowsPath(job.targetPath));
+      if (exists) {
+        problems.push({ sourcePath: job.sourcePath, error: `"${job.name}" already exists at the destination` });
+      }
+    }
+    if (problems.length > 0) {
+      const detail = problems.map((p) => `${path.win32.basename(p.sourcePath)}: ${p.error}`).join('\n');
+      return { ok: false, error: `Nothing was copied:\n${detail}`, failed: problems };
+    }
+
+    const copied: string[] = [];
+    const failed: Array<{ sourcePath: string; error: string }> = [];
+    for (const job of jobs) {
+      try {
+        if (pathType === 'wsl') {
+          const wslSrc = ensureWslPath(job.sourcePath, 'windows');
+          await runWsl(`cp -- ${shellQuote(wslSrc)} ${shellQuote(job.targetPath)}`);
+          copied.push(job.targetPath);
+        } else {
+          const resolvedTarget = normalizeWindowsPath(job.targetPath);
+          await fs.promises.copyFile(job.sourcePath, resolvedTarget, fs.constants.COPYFILE_EXCL);
+          copied.push(resolvedTarget);
+        }
+      } catch (err) {
+        failed.push({
+          sourcePath: job.sourcePath,
+          error: err instanceof Error ? err.message || 'Copy failed' : 'Copy failed',
+        });
+      }
+    }
+    if (failed.length > 0) {
+      const detail = failed.map((f) => `${path.win32.basename(f.sourcePath)}: ${f.error}`).join('\n');
+      return { ok: false, error: `Copied ${copied.length} of ${jobs.length} file(s):\n${detail}`, copied, failed };
+    }
+    return { ok: true, copied };
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message || 'Failed to copy files' : 'Failed to copy files',
+    };
   }
 }
 

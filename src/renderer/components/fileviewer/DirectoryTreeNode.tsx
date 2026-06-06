@@ -3,7 +3,7 @@ import type { DirectoryEntry, PathType } from '../../../shared/types';
 import FileContextMenu, { type TreeSortMode } from '../shared/FileContextMenu';
 import * as Icons from 'lucide-react';
 import FileIcon from './FileIcon';
-import { treeEntryDragStart, TREE_ENTRY_MIME } from '../../utils/drag-file';
+import { treeEntryDragStart, TREE_ENTRY_MIME, isInternalTreeDrag, isExternalFileDrop, hasDroppedDirectory, getDroppedNativePaths } from '../../utils/drag-file';
 import { useDashboardStore } from '../../stores/dashboard-store';
 import type { PromptName } from '../../hooks/useNamePrompt';
 
@@ -265,11 +265,19 @@ function DirectoryTreeNode({
 
   const handleDragOver = useCallback((e: React.DragEvent) => {
     if (!entry.isDirectory) return;
-    if (!e.dataTransfer.types.includes(TREE_ENTRY_MIME)) return;
-    e.preventDefault();
-    e.stopPropagation();
-    e.dataTransfer.dropEffect = 'move';
-    setIsDropTarget(true);
+    if (isInternalTreeDrag(e.dataTransfer)) {
+      e.preventDefault();
+      e.stopPropagation();
+      e.dataTransfer.dropEffect = 'move';
+      setIsDropTarget(true);
+      return;
+    }
+    if (isExternalFileDrop(e.dataTransfer)) {
+      e.preventDefault();
+      e.stopPropagation();
+      e.dataTransfer.dropEffect = 'copy';
+      setIsDropTarget(true);
+    }
   }, [entry.isDirectory]);
 
   const handleDragLeave = useCallback(() => {
@@ -279,45 +287,65 @@ function DirectoryTreeNode({
 
   const handleDrop = useCallback(async (e: React.DragEvent) => {
     if (!entry.isDirectory) return;
-    if (!e.dataTransfer.types.includes(TREE_ENTRY_MIME)) return;
-    e.preventDefault();
-    e.stopPropagation();
-    setIsDropTarget(false);
-    const raw = e.dataTransfer.getData(TREE_ENTRY_MIME);
-    if (!raw) return;
-    let payload: { path: string; isDirectory: boolean };
-    try {
-      payload = JSON.parse(raw);
-    } catch {
-      return;
-    }
-    if (!payload.path || payload.path === entry.path) return;
-    if (hasDirtyTabForPath(payload.path) &&
-        !window.confirm('That item has unsaved changes in an open tab. Move anyway?')) {
-      return;
-    }
-    const result = await window.api.files.move(payload.path, workingDirectory, pathType, entry.path);
-    if (!result.ok) {
-      window.alert(result.error);
-      return;
-    }
-    if (result.path) renameTabPath(payload.path, result.path);
-    onTreeChanged(parentPath(payload.path));
-    onTreeChanged(entry.path);
-    if (!expanded) {
-      setExpanded(true);
-      setLoading(true);
+    if (isInternalTreeDrag(e.dataTransfer)) {
+      e.preventDefault();
+      e.stopPropagation();
+      setIsDropTarget(false);
+      const raw = e.dataTransfer.getData(TREE_ENTRY_MIME);
+      if (!raw) return;
+      let payload: { path: string; isDirectory: boolean };
       try {
-        const items = await loadChildren(entry.path);
-        setChildren(items);
-      } finally {
-        setLoading(false);
+        payload = JSON.parse(raw);
+      } catch {
+        return;
+      }
+      if (!payload.path || payload.path === entry.path) return;
+      if (hasDirtyTabForPath(payload.path) &&
+          !window.confirm('That item has unsaved changes in an open tab. Move anyway?')) {
+        return;
+      }
+      const result = await window.api.files.move(payload.path, workingDirectory, pathType, entry.path);
+      if (!result.ok) {
+        window.alert(result.error);
+        return;
+      }
+      if (result.path) renameTabPath(payload.path, result.path);
+      onTreeChanged(parentPath(payload.path));
+      onTreeChanged(entry.path);
+      if (!expanded) {
+        setExpanded(true);
+        setLoading(true);
+        try {
+          const items = await loadChildren(entry.path);
+          setChildren(items);
+        } finally {
+          setLoading(false);
+        }
+      }
+      await onSiblingsChanged();
+      return;
+    }
+    if (isExternalFileDrop(e.dataTransfer)) {
+      e.preventDefault();
+      e.stopPropagation();
+      setIsDropTarget(false);
+      // Renderer-side early check; the main process re-validates with stat.
+      if (hasDroppedDirectory(e.dataTransfer)) {
+        window.alert("Folder drops aren't supported yet — drop individual files");
+        return;
+      }
+      const sourcePaths = getDroppedNativePaths(e.dataTransfer);
+      if (sourcePaths.length === 0) return;
+      const result = await window.api.files.copy(sourcePaths, workingDirectory, pathType, entry.path);
+      if (!result.ok) window.alert(result.error);
+      if (result.ok || result.copied?.length) {
+        setExpanded(true);
+        await reloadChildren();
       }
     }
-    await onSiblingsChanged();
   }, [
     entry.isDirectory, entry.path, expanded, hasDirtyTabForPath, loadChildren,
-    onSiblingsChanged, onTreeChanged, pathType, renameTabPath, setExpanded, workingDirectory,
+    onSiblingsChanged, onTreeChanged, pathType, reloadChildren, renameTabPath, setExpanded, workingDirectory,
   ]);
 
   const deleteCurrentEntry = useCallback(async () => {
