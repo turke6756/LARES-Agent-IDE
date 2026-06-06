@@ -53,6 +53,12 @@ interface Props {
   onTreeChanged: (dirPath: string) => void;
   onSiblingsChanged: () => void | Promise<void>;
   promptName: PromptName;
+  /** Controlled expansion: set of expanded directory paths owned by an
+   *  ancestor. When provided, expansion survives tree remounts (e.g. the
+   *  sidebar's refresh, which remounts via a key bump). Omit for the
+   *  default per-node local state. */
+  expandedPaths?: Set<string>;
+  onExpandedChange?: (dirPath: string, expanded: boolean) => void;
 }
 
 function parentPath(entryPath: string): string {
@@ -79,8 +85,17 @@ function DirectoryTreeNode({
   onTreeChanged,
   onSiblingsChanged,
   promptName,
+  expandedPaths,
+  onExpandedChange,
 }: Props) {
-  const [expanded, setExpanded] = useState(false);
+  const [localExpanded, setLocalExpanded] = useState(false);
+  // Controlled mode (expandedPaths provided) reads/writes the ancestor's set;
+  // uncontrolled mode falls back to per-node state.
+  const expanded = expandedPaths ? expandedPaths.has(entry.path) : localExpanded;
+  const setExpanded = useCallback((value: boolean) => {
+    if (expandedPaths && onExpandedChange) onExpandedChange(entry.path, value);
+    else setLocalExpanded(value);
+  }, [expandedPaths, onExpandedChange, entry.path]);
   const [children, setChildren] = useState<DirectoryEntry[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
@@ -124,7 +139,7 @@ function DirectoryTreeNode({
       clickTimer.current = null;
       onFileSelect(entry.path);
     }, 250);
-  }, [entry, expanded, children, onFileSelect, loadChildren, onTreeChanged]);
+  }, [entry, expanded, children, onFileSelect, loadChildren, onTreeChanged, setExpanded]);
 
   const handleDoubleClick = useCallback(() => {
     if (entry.isDirectory) return;
@@ -134,6 +149,21 @@ function DirectoryTreeNode({
     }
     window.api.system.openFileInWorkspace(entry.path, workingDirectory, pathType);
   }, [entry, workingDirectory, pathType]);
+
+  // Controlled mode: a node can mount already-expanded (e.g. right after the
+  // sidebar refresh remounts the tree). The click handler that normally loads
+  // children never ran, so fetch them here.
+  useEffect(() => {
+    if (!entry.isDirectory || !expanded || children !== null || loading) return;
+    let cancelled = false;
+    setLoading(true);
+    loadChildren(entry.path).then((items) => {
+      if (cancelled) return;
+      setChildren(items);
+      setLoading(false);
+    });
+    return () => { cancelled = true; };
+  }, [entry.isDirectory, entry.path, expanded, children, loading, loadChildren]);
 
   const childrenLoaded = children !== null;
   useEffect(() => {
@@ -191,7 +221,7 @@ function DirectoryTreeNode({
     setExpanded(true);
     await reloadChildren();
     if (result.path) onFileSelect(result.path);
-  }, [entry.isDirectory, entry.path, onFileSelect, pathType, promptName, reloadChildren, workingDirectory]);
+  }, [entry.isDirectory, entry.path, onFileSelect, pathType, promptName, reloadChildren, setExpanded, workingDirectory]);
 
   const createFolderInDirectory = useCallback(async () => {
     if (!entry.isDirectory) return;
@@ -206,7 +236,7 @@ function DirectoryTreeNode({
     }
     setExpanded(true);
     await reloadChildren();
-  }, [entry.isDirectory, entry.path, pathType, promptName, reloadChildren, workingDirectory]);
+  }, [entry.isDirectory, entry.path, pathType, promptName, reloadChildren, setExpanded, workingDirectory]);
 
   const renameCurrentEntry = useCallback(async () => {
     if (hasDirtyTabForPath(entry.path)) {
@@ -287,7 +317,7 @@ function DirectoryTreeNode({
     await onSiblingsChanged();
   }, [
     entry.isDirectory, entry.path, expanded, hasDirtyTabForPath, loadChildren,
-    onSiblingsChanged, onTreeChanged, pathType, renameTabPath, workingDirectory,
+    onSiblingsChanged, onTreeChanged, pathType, renameTabPath, setExpanded, workingDirectory,
   ]);
 
   const deleteCurrentEntry = useCallback(async () => {
@@ -380,6 +410,8 @@ function DirectoryTreeNode({
               onTreeChanged={onTreeChanged}
               onSiblingsChanged={reloadChildren}
               promptName={promptName}
+              expandedPaths={expandedPaths}
+              onExpandedChange={onExpandedChange}
             />
           ))}
         </div>

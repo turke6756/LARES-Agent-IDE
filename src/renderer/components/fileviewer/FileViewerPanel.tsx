@@ -134,11 +134,11 @@ export default function FileViewerPanel() {
 
   return (
     <div className="flex-1 flex flex-col min-w-0 overflow-hidden bg-surface-0" {...swipeToAgents}>
-      {/* Persistent Back Bar — always visible */}
-      <div className="flex items-center gap-3 px-4 py-2 border-b dark:border-white/10 light:border-black/10 bg-surface-1/60 backdrop-blur-md shrink-0">
+      {/* Persistent Back Bar — always visible. Also a window-drag surface. */}
+      <div className="flex items-center gap-3 px-4 py-2 border-b dark:border-white/10 light:border-black/10 bg-surface-1/60 backdrop-blur-md shrink-0 app-drag-region">
         <button
           onClick={hideFileViewer}
-          className="flex items-center gap-1.5 text-gray-400 hover:text-white transition-colors text-[13px] font-sans shrink-0 group"
+          className="app-no-drag flex items-center gap-1.5 text-gray-400 hover:text-white transition-colors text-[13px] font-sans shrink-0 group"
           title="Back to agents"
         >
           <ArrowLeft className="w-3.5 h-3.5 group-hover:-translate-x-0.5 transition-transform" />

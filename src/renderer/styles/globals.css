@@ -1185,3 +1185,14 @@ html.light ::-webkit-scrollbar-thumb:hover {
 .light .csv-grid-scroll {
   background: #ffffff;
 }
+
+/* Frameless-window drag regions. The native title bar is hidden
+   (titleBarStyle: 'hidden' in src/main/index.ts), so the top panel headers
+   double as the surface for moving the window. Interactive children must
+   opt out with .app-no-drag or their clicks are swallowed by the OS. */
+.app-drag-region {
+  -webkit-app-region: drag;
+}
+.app-no-drag {
+  -webkit-app-region: no-drag;
+}

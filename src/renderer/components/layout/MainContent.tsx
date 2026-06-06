@@ -94,8 +94,9 @@ export default function MainContent() {
 
   return (
     <div className="flex-1 flex flex-col min-w-0 overflow-hidden relative">
-      {/* Header — fixed h-16 to match the sidebar header thickness */}
-      <div className="panel-header h-16 px-4 sticky top-0 z-10 flex items-center shrink-0">
+      {/* Header — fixed h-16 to match the sidebar header thickness.
+          Doubles as a window-drag surface (the native title bar is hidden). */}
+      <div className="panel-header h-16 px-4 sticky top-0 z-10 flex items-center shrink-0 app-drag-region">
         <div className="flex items-center justify-between w-full">
           <div className="min-w-0">
             <div className="flex items-baseline gap-2">
@@ -120,7 +121,7 @@ export default function MainContent() {
             </div>
           </div>
 
-          <div className="flex items-center gap-4">
+          <div className="flex items-center gap-4 app-no-drag">
             {/* Supervisor Card */}
             {supervisorAgent && !['done', 'crashed'].includes(supervisorAgent.status) ? (
               <div className={`hidden md:flex items-center overflow-hidden border ${SUPERVISOR_STATUS_COLORS[supervisorAgent.status].border}`}>

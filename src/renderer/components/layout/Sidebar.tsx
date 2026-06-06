@@ -4,7 +4,8 @@ import { useThemeStore } from '../../stores/theme-store';
 import WorkspaceCreateDialog from '../workspace/WorkspaceCreateDialog';
 import CollapseButton from './CollapseButton';
 import * as Icons from 'lucide-react';
-import DirectoryTreeNode from '../fileviewer/DirectoryTreeNode';
+import DirectoryTreeNode, { sortEntries } from '../fileviewer/DirectoryTreeNode';
+import type { TreeSortMode } from '../shared/FileContextMenu';
 import type { DirectoryEntry, PathType } from '../../../shared/types';
 import logoImg from '../../assets/logo.png';
 import { useNamePrompt } from '../../hooks/useNamePrompt';
@@ -14,9 +15,17 @@ import { detectSyncFolder } from '../../../shared/sync-folder-detection';
 // drops (dataTransfer.files), which add a new workspace.
 const WS_DRAG_MIME = 'application/x-workspace-id';
 
-function InlineWorkspaceTree({ rootPath, pathType, workspaceId }: { rootPath: string; pathType: PathType; workspaceId: string }) {
+function InlineWorkspaceTree({ rootPath, pathType, workspaceId, expandedPaths, onExpandedChange }: {
+  rootPath: string;
+  pathType: PathType;
+  workspaceId: string;
+  /** Expansion state lives in Sidebar so it survives the refresh remount. */
+  expandedPaths: Set<string>;
+  onExpandedChange: (dirPath: string, expanded: boolean) => void;
+}) {
   const [rootEntries, setRootEntries] = useState<DirectoryEntry[]>([]);
   const [loading, setLoading] = useState(true);
+  const [sortMode, setSortMode] = useState<TreeSortMode>('name');
   const cache = useRef(new Map<string, DirectoryEntry[]>());
   const openTab = useDashboardStore((s) => s.openTab);
   const checkHealth = useDashboardStore((s) => s.checkHealth);
@@ -83,7 +92,7 @@ function InlineWorkspaceTree({ rootPath, pathType, workspaceId }: { rootPath: st
       ) : rootEntries.length === 0 ? (
         <div className="px-4 py-2 text-[13px] text-gray-300 font-sans">Empty directory</div>
       ) : (
-        rootEntries.map((entry) => (
+        sortEntries(rootEntries, sortMode).map((entry) => (
           <DirectoryTreeNode
             key={entry.path}
             entry={entry}
@@ -91,11 +100,15 @@ function InlineWorkspaceTree({ rootPath, pathType, workspaceId }: { rootPath: st
             activeFilePath={activeFilePath}
             pathType={pathType}
             workingDirectory={rootPath}
+            sortMode={sortMode}
+            onSortModeChange={setSortMode}
             onFileSelect={handleFileSelect}
             loadChildren={loadChildren}
             onTreeChanged={invalidateDir}
             onSiblingsChanged={reloadRoot}
             promptName={promptName}
+            expandedPaths={expandedPaths}
+            onExpandedChange={onExpandedChange}
           />
         ))
       )}
@@ -153,6 +166,9 @@ export default function Sidebar({ width }: SidebarProps) {
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; wsId: string } | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
   const [expandedWorkspaces, setExpandedWorkspaces] = useState<Set<string>>(new Set());
+  // Expanded folder paths inside the inline workspace trees. Held here (not
+  // in the tree nodes) so expansion survives the refreshTick remount below.
+  const [expandedTreePaths, setExpandedTreePaths] = useState<Set<string>>(new Set());
   const [dragWsId, setDragWsId] = useState<string | null>(null);
   const [dropTarget, setDropTarget] = useState<string | 'end' | null>(null);
   const [refreshing, setRefreshing] = useState(false);
@@ -182,6 +198,15 @@ export default function Sidebar({ width }: SidebarProps) {
         : wslState === 'no-distro'
           ? 'text-accent-orange'
           : 'text-accent-red';
+
+  const handleTreeExpandedChange = useCallback((dirPath: string, expanded: boolean) => {
+    setExpandedTreePaths((prev) => {
+      const next = new Set(prev);
+      if (expanded) next.add(dirPath);
+      else next.delete(dirPath);
+      return next;
+    });
+  }, []);
 
   const toggleWorkspace = (wsId: string, e?: React.MouseEvent) => {
     if (e) e.stopPropagation();
@@ -292,10 +317,12 @@ export default function Sidebar({ width }: SidebarProps) {
   if (collapsed) {
     return (
       <div
-        className="panel-shell flex flex-col items-center z-20 py-2"
+        className="panel-shell flex flex-col items-center z-20 py-2 app-drag-region"
         style={{ width }}
       >
-        <CollapseButton collapsed direction="left" onClick={() => togglePanelCollapsed('sidebarCollapsed')} />
+        <div className="app-no-drag">
+          <CollapseButton collapsed direction="left" onClick={() => togglePanelCollapsed('sidebarCollapsed')} />
+        </div>
         <div className="mt-2 text-[13px] font-sans text-accent-blue writing-mode-vertical" style={{ writingMode: 'vertical-rl' }}>
           Workspaces
         </div>
@@ -308,14 +335,15 @@ export default function Sidebar({ width }: SidebarProps) {
       className="panel-shell flex flex-col z-20"
       style={{ width }}
     >
-      {/* Header — fixed h-16 so it lines up with the main dashboard header */}
-      <div className="panel-header h-16 px-3 flex items-center shrink-0">
+      {/* Header — fixed h-16 so it lines up with the main dashboard header.
+          Doubles as a window-drag surface (the native title bar is hidden). */}
+      <div className="panel-header h-16 px-3 flex items-center shrink-0 app-drag-region">
         <div className="flex items-center justify-between w-full">
           <div className="flex items-center gap-2">
             <img src={logoImg} alt="Logo" className="h-10 object-contain" />
             <span className="text-[13px] font-medium dark:text-gray-300 text-gray-700">Agent Dashboard</span>
           </div>
-          <div className="flex items-center gap-1">
+          <div className="flex items-center gap-1 app-no-drag">
             <button
               onClick={resetLayout}
               className="ui-btn ui-btn-ghost min-h-0 px-2 py-1 text-[12px]"
@@ -450,6 +478,8 @@ export default function Sidebar({ width }: SidebarProps) {
                     rootPath={ws.path}
                     pathType={ws.pathType}
                     workspaceId={ws.id}
+                    expandedPaths={expandedTreePaths}
+                    onExpandedChange={handleTreeExpandedChange}
                   />
                 )}
               </div>

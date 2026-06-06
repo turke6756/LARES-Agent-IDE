@@ -13,6 +13,8 @@ export default function AgentGrid() {
   const [unreadIds, setUnreadIds] = useState<Set<string>>(new Set());
   // Shift+click multi-selection, also local.
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  // Two-step confirm for the bulk-action bar.
+  const [confirmBulk, setConfirmBulk] = useState(false);
   const prevStatusRef = useRef<Map<string, string>>(new Map());
 
   // Detect working→idle transitions and mark those agents unread.
@@ -79,11 +81,36 @@ export default function AgentGrid() {
   const handleDeleteSelected = useCallback(async () => {
     const ids = [...selectedIds];
     setSelectedIds(new Set());
+    setConfirmBulk(false);
     // Same store action the single-card delete button uses.
     for (const id of ids) {
       await deleteAgent(id);
     }
   }, [selectedIds, deleteAgent]);
+
+  // Reset the confirm step whenever the selection empties so a stale
+  // "confirm" can't apply to a new selection.
+  useEffect(() => {
+    if (selectedIds.size === 0) setConfirmBulk(false);
+  }, [selectedIds]);
+
+  // Keyboard: Delete removes the selection (with one confirm step), Escape
+  // clears it. Ignored while typing in an input or the embedded terminal.
+  useEffect(() => {
+    if (selectedIds.size === 0) return;
+    const onKey = (e: KeyboardEvent) => {
+      const t = e.target as HTMLElement | null;
+      if (t && t.closest('input, textarea, select, [contenteditable="true"]')) return;
+      if (e.key === 'Escape') {
+        setSelectedIds(new Set());
+      } else if (e.key === 'Delete') {
+        if (confirmBulk) void handleDeleteSelected();
+        else setConfirmBulk(true);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [selectedIds.size, confirmBulk, handleDeleteSelected]);
 
   if (agents.length === 0) {
     return (
@@ -114,6 +141,36 @@ export default function AgentGrid() {
           ))}
         </AnimatePresence>
       </div>
+      {/* Bulk-action bar — appears while a shift+click multi-selection is
+          active. Sticky inside the grid's scroll container. */}
+      {selectedIds.size > 0 && (
+        <div className="sticky bottom-3 z-20 mt-4 flex justify-center pointer-events-none">
+          <div className="ui-card pointer-events-auto flex items-center gap-3 px-4 py-2 shadow-lg ring-1 ring-accent-purple/40">
+            <span className="text-[13px] text-gray-300">
+              {selectedIds.size} agent{selectedIds.size === 1 ? '' : 's'} selected
+            </span>
+            <button
+              onClick={() => setSelectedIds(new Set())}
+              className="ui-btn ui-btn-ghost px-2 py-1 text-[12px]"
+              title="Clear selection (Esc)"
+            >
+              Clear
+            </button>
+            <button
+              onClick={() => {
+                if (confirmBulk) void handleDeleteSelected();
+                else setConfirmBulk(true);
+              }}
+              className="ui-btn ui-btn-danger px-3 py-1 text-[12px]"
+              title="Delete all selected agents (Del)"
+            >
+              {confirmBulk
+                ? `Confirm delete ${selectedIds.size}`
+                : 'Delete selected'}
+            </button>
+          </div>
+        </div>
+      )}
       {teamDialogAgentId && selectedWorkspaceId && (
         <TeamDialog
           workspaceId={selectedWorkspaceId}

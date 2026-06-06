@@ -191,6 +191,12 @@ export default function AgentCard({
     el.setAttribute('draggable', 'true');
 
     const onDragStart = (e: DragEvent) => {
+      // A shift-click with a few pixels of mouse travel must toggle the
+      // multi-selection, not start a card drag.
+      if (e.shiftKey) {
+        e.preventDefault();
+        return;
+      }
       const target = e.target as HTMLElement;
       if (target.closest('button, textarea, input, a')) {
         e.preventDefault();
@@ -266,9 +272,19 @@ export default function AgentCard({
         ${dragOver ? 'bg-accent-purple/[0.06] border-l-accent-purple' : ''}
         ${multiSelected ? 'ring-2 ring-accent-purple' : unread ? 'ring-2 ring-accent-blue' : ''}
       `}
+      onMouseDown={(e) => {
+        // Shift+click toggles multi-selection here, on mousedown: the card is
+        // draggable, and Chromium treats shift+mousedown on draggable content
+        // as a selection gesture, so the subsequent `click` never reliably
+        // fires. preventDefault also stops the text-selection sweep.
+        if (e.shiftKey && e.button === 0) {
+          e.preventDefault();
+          onCardClick?.(agent.id, true);
+        }
+      }}
       onClick={(e) => {
-        onCardClick?.(agent.id, e.shiftKey);
-        if (e.shiftKey) return; // shift+click only toggles multi-selection
+        if (e.shiftKey) return; // multi-selection handled on mousedown
+        onCardClick?.(agent.id, false);
         selectAgent(agent.id);
       }}
       onDoubleClick={() => setTerminalAgent(agent.id)}
