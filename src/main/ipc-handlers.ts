@@ -1,4 +1,5 @@
-import { ipcMain, dialog, BrowserWindow, nativeTheme } from 'electron';
+import { ipcMain, dialog, shell, BrowserWindow, nativeTheme } from 'electron';
+import * as fs from 'fs';
 import { persistTheme } from './theme-persistence';
 import type { PathType, FsEvent } from '../shared/types';
 import { AgentSupervisor } from './supervisor';
@@ -13,7 +14,7 @@ import {
 import { openInVSCode, openFileInVSCode, openFileInWorkspace } from './vscode-launcher';
 import { getPassiveWslStatus, isTmuxAvailable, isClaudeAvailableInWsl } from './wsl-bridge';
 import { execFileSync } from 'child_process';
-import { detectPathType } from './path-utils';
+import { detectPathType, ensureWindowsPath } from './path-utils';
 import { readFileContents, listDirectoryEntriesAsync } from './file-reader';
 import { writeFileContents, createFile, createDirectory, renameEntry, moveEntry, copyFiles, deleteEntry } from './file-writer';
 import { subscribe as subscribeFsWatch } from './fs-watcher';
@@ -325,6 +326,34 @@ export function registerIpcHandlers(supervisor: AgentSupervisor, mainWindow: Bro
   ipcMain.handle('files:delete', async (_e, entryPath, rootDirectory, pathType, recursive) => {
     const resolved = resolveMutationPathType(entryPath, rootDirectory, pathType);
     return await deleteEntry(entryPath, rootDirectory, resolved, !!recursive);
+  });
+
+  ipcMain.handle('files:reveal', async (_e, entryPath: string, pathType?: PathType) => {
+    // Resolve a Windows-native path: windows paths pass through, WSL paths
+    // become \\wsl$\... / \\wsl.localhost\... UNC paths Explorer can open.
+    let winPath: string;
+    try {
+      winPath = ensureWindowsPath(entryPath, pathType || detectPathType(entryPath));
+    } catch (err: any) {
+      return { ok: false, error: `Could not resolve a Windows path for "${entryPath}": ${err.message || err}` };
+    }
+    // Stat decides file vs. folder and catches stale tree entries before
+    // handing Explorer a dead path.
+    let isDirectory: boolean;
+    try {
+      isDirectory = (await fs.promises.stat(winPath)).isDirectory();
+    } catch {
+      return { ok: false, error: `Path no longer exists: ${winPath}` };
+    }
+    if (isDirectory) {
+      // Open the folder itself so the user can drag items in or out of it.
+      const error = await shell.openPath(winPath);
+      if (error) return { ok: false, error };
+    } else {
+      // Opens Explorer with the file selected.
+      shell.showItemInFolder(winPath);
+    }
+    return { ok: true };
   });
 
   // Live file watcher — one entry per subscription id, keyed across renderers.

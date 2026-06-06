@@ -514,6 +514,10 @@ export interface IpcApi {
       pathType: PathType,
       recursive: boolean
     ) => Promise<FileMutationResult>;
+    /** Show the entry in Windows Explorer: files open their parent folder
+     *  with the file selected, directories open as a folder window. Main
+     *  stats the path itself, so stale tree entries return a clear error. */
+    reveal: (entryPath: string, pathType: PathType) => Promise<FileMutationResult>;
     watchDirectory: (dirPath: string, pathType: PathType, callback: (event: FsEvent) => void) => () => void;
   };
   system: {

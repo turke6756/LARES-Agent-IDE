@@ -84,6 +84,8 @@ const api: IpcApi = {
     getPathForFile: (file) => webUtils.getPathForFile(file as Parameters<typeof webUtils.getPathForFile>[0]),
     deleteEntry: (entryPath, rootDirectory, pathType, recursive) =>
       ipcRenderer.invoke('files:delete', entryPath, rootDirectory, pathType, recursive),
+    reveal: (entryPath, pathType) =>
+      ipcRenderer.invoke('files:reveal', entryPath, pathType),
     watchDirectory: (dirPath, pathType, callback) => {
       const id = `sub-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
       const listener = (_event: any, msg: { id: string; events: any[] }) => {

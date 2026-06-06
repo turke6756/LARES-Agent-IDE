@@ -71,6 +71,12 @@ export default function FileContextMenu({
     onClose();
   };
 
+  const handleRevealInExplorer = async () => {
+    onClose();
+    const result = await window.api.files.reveal(filePath, pathType);
+    if (!result.ok) window.alert(result.error);
+  };
+
   const handleRevealInTree = () => {
     onRevealInTree?.();
     onClose();
@@ -149,6 +155,9 @@ export default function FileContextMenu({
       )}
       <button onClick={handleOpenInVSCode} className="ui-menu-item">
         Open in VS Code
+      </button>
+      <button onClick={handleRevealInExplorer} className="ui-menu-item">
+        Reveal in Explorer
       </button>
       {showRevealInTree && onRevealInTree && (
         <>
