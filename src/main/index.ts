@@ -6,6 +6,8 @@ import { AgentSupervisor } from './supervisor';
 import { registerIpcHandlers } from './ipc-handlers';
 import { WsServer } from './ws-server';
 import { ApiServer } from './api-server';
+import { OrchestrationService } from './orchestration/service';
+import { createDashboardClient } from './orchestration/dashboard-client';
 import { pathToFileURL } from 'url';
 import { wslToWindowsPath } from './path-utils';
 import { shutdownJupyterServer } from './jupyter-server';
@@ -31,6 +33,7 @@ let mainWindow: BrowserWindow | null = null;
 let supervisor: AgentSupervisor | null = null;
 let wsServer: WsServer | null = null;
 let apiServer: ApiServer | null = null;
+let orchestration: OrchestrationService | null = null;
 
 // Single-instance lock — prevent duplicate windows
 const gotTheLock = app.requestSingleInstanceLock();
@@ -256,12 +259,21 @@ app.whenReady().then(async () => {
     supervisor.start();
     wsServer = new WsServer(supervisor);
     wsServer.start();
-    apiServer = new ApiServer(supervisor);
+    // Construct the orchestration service in index.ts and inject it into
+    // ApiServer (keeps AgentSupervisor free of orchestration concerns). The
+    // deliver fn is the supervisor's in-process port of the script's
+    // 409-retry [DASHBOARD EVENT] relay.
+    orchestration = new OrchestrationService(
+      createDashboardClient(supervisor),
+      (supId, text) => supervisor!.deliverToSupervisor(supId, text),
+    );
+    apiServer = new ApiServer(supervisor, undefined, orchestration);
     apiServer.start();
     // Class IV (plans/class-iv-worker-hook-scaffold.md): tell the supervisor the
     // port the API server actually bound to (handles EADDRINUSE auto-increment)
     // so supervised workers' Stop hooks POST to the right place.
     supervisor.setApiServerPort(apiServer.getPort());
+    orchestration.start();                 // boot reconcile of orphaned runs
     supervisor.reconcile();
     console.log('App ready');
   } catch (err: any) {

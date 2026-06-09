@@ -323,13 +323,13 @@ You have **WebSearch** and **WebFetch** for direct lookups, and the **Agent** to
 
 When the user asks you to coordinate multiple agents, choose one of two paths:
 
-### Path 1 — Scripted orchestration (programmatic)
+### Path 1 — Dashboard-run orchestration (via the \`run_orchestration\` MCP tool)
 
-Invoke a pre-built orchestration via the \`run-orchestration\` skill. The script drives the multi-agent workflow end-to-end — launching agents, relaying messages, gating turns, watching for the completion signal. You invoke, then monitor; the script handles the loop. Events arrive as \`[DASHBOARD EVENT]\` lines in your chat.
+Invoke a pre-built orchestration via the \`run_orchestration\` MCP tool (see the run-orchestration skill). The orchestration runs **detached inside the dashboard** — launching agents, relaying messages, gating turns, watching for the completion signal. You launch no \`scripts/*.js\`: you call the tool, it returns a \`runId\` immediately, then you monitor. Events arrive as \`[DASHBOARD EVENT]\` lines in your chat.
 
-- **When to use:** there is an orchestration that matches the task. **GroupThink** produces a planning markdown via cross-provider deliberation; **v2** is the current version and offers two modes — \`--mode=serial\` (default; Lead drafts, Reviewer is launched with that draft as kickoff, Lead writes plan — same shape as v1 with BUG-29 hardened) and \`--mode=parallel\` (3 rounds — both planners draft independently, cross-pollinate, synthesizer writes plan). v1 still ships for in-flight runs and existing \`resume_hint\` lines; prefer v2 for new runs. Future orchestrations will cover scoping, fork-and-execute, etc.
-- **How to discover:** read the catalog in the \`run-orchestration\` skill (lists available orchestrations and points at each one's manual under \`scripts/<name>.md\`).
-- **You do not edit the script body** — you invoke it with parameters and react to its events. Recovery on stall is also scripted: re-invoke with the resume flags from the stall event.
+- **When to use:** there is an orchestration that matches the task. **GroupThink** produces a planning markdown via cross-provider deliberation and offers two modes — \`mode: 'serial'\` (default; Lead drafts, Reviewer is launched with that draft as kickoff, Lead writes plan) and \`mode: 'parallel'\` (3 rounds — both planners draft independently, cross-pollinate, synthesizer writes plan). Future orchestrations will cover scoping, fork-and-execute, etc.
+- **How to discover:** call \`list_orchestrations\` (or read the catalog in the run-orchestration skill). Start one with \`run_orchestration({name, workspace_id, supervisor_id, topic, plan_path, mode})\`; poll \`get_orchestration_run({run_id})\`; abort with \`abort_orchestration({run_id})\`.
+- **You drive it through the tool, not a script** — react to its \`[DASHBOARD EVENT]\` lines. Recovery on stall is a single call: \`run_orchestration({name:'groupthink', resume_run_id})\` from the stall event's resume hint. A legacy \`node scripts/groupthink-v2.js …\` hint can be replayed by passing the whole old line as \`legacy_command\`.
 
 ### Path 2 — Freeform supervision (you coordinate)
 
@@ -388,7 +388,7 @@ Agents can only message teammates they have a channel to. The dashboard enforces
 
 For multi-model deliberation between teammates, create a team with template \`mesh\` (all-to-all channels). Mix providers (Claude, Gemini, Codex) for diverse perspectives. Brief agents with the topic, let them debate through direct messages, then synthesize findings yourself when they converge or hit diminishing returns.
 
-Note: this is distinct from the **GroupThink orchestration** (\`scripts/groupthink-v2.js\`, run via the \`run-orchestration\` skill), which scripts the deliberation end-to-end and writes a final markdown plan. v2's serial mode is a Lead+Reviewer relay; v2's parallel mode runs two planners independently across 3 rounds (draft → cross-pollinate → synthesize). Use GroupThink when you want a structured planning artifact; use a \`mesh\` team when you want free-form N-agent deliberation.
+Note: this is distinct from the **GroupThink orchestration** (run via the \`run_orchestration\` MCP tool — see the run-orchestration skill), which drives the deliberation end-to-end inside the dashboard and writes a final markdown plan. Its serial mode is a Lead+Reviewer relay; its parallel mode runs two planners independently across 3 rounds (draft → cross-pollinate → synthesize). Use GroupThink when you want a structured planning artifact; use a \`mesh\` team when you want free-form N-agent deliberation.
 
 ## Platform notes (Windows + PowerShell 5.1)
 
@@ -1179,127 +1179,92 @@ timeout = 30
  *  Frontmatter description loads at session start; body loads on demand via Read. */
 export const SUPERVISOR_RUN_ORCHESTRATION_SKILL = `---
 name: run-orchestration
-description: Run an AgentDashboard orchestration — a multi-agent script-driven workflow such as planning committee, scoping, fork-and-execute, or GroupThink. Use when the user names an orchestration or describes a goal that maps to one. Don't autonomously launch.
+description: Run an AgentDashboard orchestration — a multi-agent dashboard-driven workflow such as planning committee, scoping, fork-and-execute, or GroupThink. Use when the user names an orchestration or describes a goal that maps to one. Don't autonomously launch.
 ---
 
 # Run Orchestration
 
-Use this skill when the user asks to run any AgentDashboard **orchestration** — a multi-agent script-driven workflow (planning committee, scoping, fork-and-execute, etc.).
+Use this skill when the user asks to run any AgentDashboard **orchestration** — a multi-agent workflow (planning committee, scoping, fork-and-execute, etc.) that the dashboard drives end-to-end.
 
-This is the generic playbook. The orchestration-specific details (parameters, events, recovery) live in each orchestration's own manual under \`scripts/<name>.md\`.
+Orchestrations now run **in-process inside the dashboard** and are controlled through MCP tools. You launch **no** \`scripts/*.js\` — you call \`run_orchestration\`, it returns a \`runId\` immediately, and the run proceeds detached. Progress flows back as \`[DASHBOARD EVENT]\` lines in your chat, plus a pull channel (\`get_orchestration_run\`).
+
+## MCP tools
+
+- **list_orchestrations** — Discover available orchestrations: name, modes, parameters, defaults.
+- **run_orchestration** — Start a run (detached). Returns \`{ runId }\` synchronously. Args: \`name\`, \`workspace_id\`, \`supervisor_id\`, plus orchestration params (\`topic\`, \`plan_path\`, \`mode\`, \`lead_provider\`, \`reviewer_provider\`, \`turn_timeout_ms\`). Resume with \`resume_run_id\` (preferred) or \`legacy_command\` (paste a whole old \`node scripts/groupthink-v2.js …\` line).
+- **get_orchestration_run** — Pull current status/progress for a \`run_id\` (status, turn/round, members, last error).
+- **abort_orchestration** — Abort a run by \`run_id\`; cleans up member agents and emits \`orchestration.groupthink.aborted\`.
 
 ## Available orchestrations
 
-| Name | Script | Manual | Purpose |
-|---|---|---|---|
-| \`groupthink-v2\` | \`scripts/groupthink-v2.js\` | _(see script header — \`scripts/groupthink-v2.md\` not yet written)_ | **Current.** Cross-provider deliberation with two modes: \`--mode=serial\` (default — Lead drafts, Reviewer launched with that draft as kickoff, Lead writes plan; same shape as v1 with BUG-29 hardened) or \`--mode=parallel\` (3 rounds — both planners draft independently, cross-pollinate, synthesizer writes plan). |
-| \`groupthink-v1\` | \`scripts/groupthink-v1.js\` | \`scripts/groupthink-v1.md\` | Superseded by v2; kept for in-flight runs and \`resume_hint\` recovery lines. Two-agent Lead+Reviewer relay producing a planning markdown. |
+| Name | How to run | Purpose |
+|---|---|---|
+| \`groupthink\` | \`run_orchestration({name:'groupthink', workspace_id, supervisor_id, topic, plan_path, mode})\` | Cross-provider deliberation that writes a worker-ready plan. \`mode:'serial'\` (default — Lead drafts, Reviewer launched with that draft as kickoff, Lead writes plan) or \`mode:'parallel'\` (3 rounds — both planners draft independently, cross-pollinate, synthesizer writes plan). |
 
-When new orchestrations are added, they should appear in this table and ship with a \`scripts/<name>.md\` manual matching the structure of \`groupthink-v1.md\`.
+**Legacy resume.** Older plans/\`.runs\` may carry a \`node scripts/groupthink-v2.js … --resume-lead-id=… --resume-reviewer-id=…\` resume_hint. Don't run that script — pass the whole line through \`run_orchestration({name:'groupthink', workspace_id, supervisor_id, legacy_command:"<the whole old line>"})\`. The dashboard parses it into structured resume params and runs the in-process runner. (\`scripts/groupthink-v2.js\` still exists only as a thin compat shim that forwards to this same tool.)
+
+Call \`list_orchestrations\` for the authoritative parameter list; new orchestrations appear there automatically.
 
 ## Workflow
 
 ### 1. Identify the orchestration
 
-The user will name one (e.g., "run a GroupThink on X") or describe a goal that maps to one. If unclear, ask. Don't guess — orchestrations launch real agents and burn real tokens.
+The user will name one (e.g., "run a GroupThink on X") or describe a goal that maps to one. If unclear, ask. Don't guess — orchestrations launch real agents and burn real tokens. Call \`list_orchestrations\` to confirm the name and its parameters.
 
-### 2. Read the orchestration's manual
+### 2. Discover IDs
 
-Open \`scripts/<name>.md\` and read the **When to use**, **Parameters**, **Events emitted**, and **Recovery contract** sections. Each manual is self-contained — every flag, every event, every exit code is documented there.
+Every run needs a \`workspace_id\` and a \`supervisor_id\`. You are the supervisor: use \`list_agents\` to find your own agent record (the supervisor for this workspace) and read its \`id\` (→ \`supervisor_id\`) and \`workspaceId\` (→ \`workspace_id\`). If exactly one active supervisor for the current workspace isn't identifiable, stop and report the ambiguity.
 
-### 3. Discover IDs
+### 3. Construct and confirm the call
 
-Every orchestration needs a \`workspaceId\` and a \`supervisorId\`. Find them via the dashboard API:
+Fill in required + useful optional params, e.g.:
 
-\`\`\`bash
-curl -s http://127.0.0.1:24678/api/agents | jq '.[] | select(.isSupervisor) | {id, workspaceId, title, status}'
+\`\`\`
+run_orchestration({
+  name: 'groupthink',
+  workspace_id: '<ws-id>',
+  supervisor_id: '<sup-id>',
+  topic: 'Plan the X migration',
+  plan_path: 'plans/x-migration.md',   // relative to workspace root
+  mode: 'serial',                       // or 'parallel'
+})
 \`\`\`
 
-Choose the API host this way:
+Confirm with the user before launching anything that will burn tokens — show the constructed call. Don't autonomously launch.
 
-- Prefer \`http://127.0.0.1:24678\`.
-- If that fails, try ports \`24679\`, \`24680\`, \`24681\`.
-- In WSL, use the Windows host IP from \`/etc/resolv.conf\` if \`127.0.0.1\` cannot connect.
+### 4. Launch (detached) and return to idle
 
-Identify the current supervisor by matching its \`workingDirectory\` to the current shell directory (typically \`.dashboard/supervisor\` for this workspace). Use that agent's \`id\` as \`supervisorId\` and its \`workspaceId\` as \`workspaceId\`.
+\`run_orchestration\` returns \`{ runId }\` in milliseconds; the run continues inside the dashboard. Tell the user the \`runId\`, then stop working. The orchestration drives itself and sends \`[DASHBOARD EVENT]\` messages to your input as it progresses.
 
-If exactly one active supervisor isn't found for the current workspace, stop and report the ambiguity.
+### 5. Watch for events
 
-### 4. Construct the invocation
+When a \`[DASHBOARD EVENT]\` arrives in your chat:
 
-Fill in the orchestration's required and useful optional flags. Most orchestrations take this shape:
+- **\`groupthink.complete\`**: the plan was written (path in the message). Acknowledge; no action unless the user asks.
+- **\`orchestration.groupthink.stalled\`**: the payload carries a \`resume_hint\`. Typically \`{tool:'run_orchestration', params:{resumeRunId}}\` — resume with \`run_orchestration({name:'groupthink', workspace_id, supervisor_id, resume_run_id:'<id>'})\`. Decide based on the payload (reason, turns/rounds elapsed, planner ids). When in doubt, escalate to the user.
+- **\`orchestration.groupthink.aborted\`**: the run was aborted (by you, or by a dashboard restart's boot-reconcile, which also emits a resume_hint). Diagnose via \`get_orchestration_run\`, then resume or escalate.
 
-\`\`\`bash
-node scripts/<name>.js \\
-  --workspaceId=<ws-id> \\
-  --supervisorId=<sup-id> \\
-  [orchestration-specific flags]
-\`\`\`
+You can also pull status anytime with \`get_orchestration_run({run_id})\` instead of waiting for an event.
 
-Confirm with the user before launching anything that will burn tokens — show the constructed command. Don't autonomously launch.
+### 6. Inspect agents during a run
 
-### 5. Launch detached
+Read what planners are saying mid-run without disturbing the run:
 
-Orchestrations run in the background. Launch the script and return to idle. The script will send \`[DASHBOARD EVENT]\` messages to your input as it progresses.
-
-In Bash / WSL / Git Bash:
-
-\`\`\`bash
-RUN_ID="$(date +%Y%m%d%H%M%S)-$$"
-LOG="plans/.runs/<name>-\${RUN_ID}.log"
-mkdir -p "plans/.runs"
-nohup node scripts/<name>.js [args...] > "$LOG" 2>&1 &
-\`\`\`
-
-In PowerShell or a Windows shell:
-
-> **Quoting gotcha (PowerShell 5.1):** \`Start-Process -ArgumentList @(...)\` and \`powershell -Command\` both silently strip the quotes around any array element containing spaces before \`CreateProcess\` sees them. A flag like \`--topic="A B C"\` arrives at \`node\` as just \`--topic=A\` with \`B\` and \`C\` as orphan positional tokens. **Prefer Bash via \`bash -lc\` — POSIX quoting survives intact.** Fallback: \`cmd /c\` with a single command-line string (cmd respects the quotes verbatim). Always verify the launch with \`(Get-CimInstance Win32_Process -Filter "Name='node.exe'").CommandLine\`.
-
-\`\`\`powershell
-# Preferred: shell out to Bash. POSIX quoting works.
-$RunId = "$(Get-Date -Format yyyyMMddHHmmss)-$PID"
-bash -lc "mkdir -p plans/.runs && nohup node scripts/<name>.js --workspaceId=<ws-id> --supervisorId=<sup-id> --topic='Multi-word topic survives intact' > plans/.runs/<name>-$RunId.log 2>&1 &"
-
-# Fallback: cmd /c with a single command-line string. cmd respects the quotes verbatim.
-$RunId = "$(Get-Date -Format yyyyMMddHHmmss)-$PID"
-$Log = "plans\\.runs\\<name>-$RunId.log"
-New-Item -ItemType Directory -Force "plans\\.runs" | Out-Null
-$Cmd = 'node scripts\\<name>.js --workspaceId=<ws-id> --supervisorId=<sup-id> --topic="Multi-word topic" > "' + $Log + '" 2>&1'
-Start-Process -WindowStyle Hidden cmd -ArgumentList @('/c', $Cmd)
-
-# DO NOT use: Start-Process -FilePath node -ArgumentList @(...).
-# PS 5.1 strips the quotes around any element containing spaces before CreateProcess.
-\`\`\`
-
-After launching, tell the user the run id and log path, then stop working. The orchestration drives itself.
-
-### 6. Watch for events
-
-Each orchestration documents the \`[DASHBOARD EVENT]\` strings it emits. When one arrives in your chat:
-
-- **Happy path events** (e.g. \`*.complete\`, \`*.turn_complete\`): acknowledge, no action needed unless the user asks.
-- **\`*.stalled\`**: read the manual's **Recovery contract** section. Typically you'll have three options — steer-and-resume, accept-partial, or abandon. Decide based on the payload (turns elapsed, last exchange, agent state). When in doubt, escalate to the user.
-- **\`*.aborted\`**: something went wrong. Read the orchestration's run log at the path printed at launch, diagnose, and either retry or escalate.
-
-### 7. Inspect agents during a run
-
-You can read what agents are saying mid-run without disturbing the orchestration:
-
-- \`read_agent_chat\` (preferred for orchestrations): structured turn-complete messages.
+- \`read_agent_chat\` (preferred): structured turn-complete messages.
 - \`read_agent_log\` (fallback): raw terminal output.
 
-Don't \`send_message_to_agent\` to a planner mid-run unless the orchestration is stalled — you'll race the script's relay loop.
+Don't \`send_message_to_agent\` to a planner mid-run unless the run is stalled — you'll race the dashboard's relay loop. To stop a run cleanly, use \`abort_orchestration\`.
 
 ## File-write convention
 
-Orchestrations and the agents they launch should not write to paths under \`.claude/\`. Claude Code's permission system gates edits there even with bypass-permissions on, hanging worker forks at an interactive dialog. Plan markdown, run logs, and any agent-edited files belong outside \`.claude/\` — typically under \`plans/\` or the workspace root.
+Orchestrations and the agents they launch should not write to paths under \`.claude/\`. Claude Code's permission system gates edits there even with bypass-permissions on, hanging worker forks at an interactive dialog. Plan markdown and any agent-edited files belong outside \`.claude/\` — typically under \`plans/\` or the workspace root.
 
 ## Constraints
 
 - Run orchestrations only when the user asks. Don't autonomously launch them.
-- Confirm the constructed invocation with the user before launching, especially for non-trivial topics.
-- Each orchestration's manual is the source of truth for its flags and events. If the manual disagrees with this skill, follow the manual.
-- After launch, return to idle. Don't poll the dashboard; let \`[DASHBOARD EVENT]\` messages drive your wake-ups.
+- Confirm the constructed call with the user before launching, especially for non-trivial topics.
+- \`list_orchestrations\` is the source of truth for each orchestration's parameters and defaults.
+- After launch, return to idle. Don't poll in a loop; let \`[DASHBOARD EVENT]\` messages drive your wake-ups (use \`get_orchestration_run\` for an on-demand status check).
 `;
 
 /** Native skill — .dashboard/supervisor/.claude/skills/orchestration-spike/SKILL.md */

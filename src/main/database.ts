@@ -4,6 +4,7 @@ import fs from 'fs';
 import { v4 as uuidv4 } from 'uuid';
 import { Agent, AgentProvider, AgentStatus, AgentTemplate, CreateAgentTemplateInput, CreateWorkspaceInput, CreateTeamInput, FileActivity, FileOperation, Team, TeamChannel, TeamMember, TeamMessage, TeamMessageStatus, TeamStatus, TeamTask, TeamTaskStatus, Workspace } from '../shared/types';
 import { DEFAULT_COMMAND, DEFAULT_COMMAND_WSL, SUPERVISOR_AGENT_MD } from '../shared/constants';
+import { OrchestrationEvent, OrchestrationRun } from './orchestration/types';
 
 let db: Database.Database;
 let dbPath: string;
@@ -176,6 +177,55 @@ export function initDatabase(): void {
       notes         TEXT,
       created_at    TEXT NOT NULL DEFAULT (datetime('now')),
       updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+  `);
+
+  // ── Orchestration tables ──────────────────────────────────────────────
+  // Dashboard-owned orchestration runs (e.g. groupthink). Persisted so runs
+  // survive a dashboard restart (boot reconcile marks orphans aborted) and so
+  // run history is a first-class observability surface.
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS orchestrations (
+      run_id            TEXT PRIMARY KEY,
+      name              TEXT NOT NULL,
+      mode              TEXT NOT NULL,
+      status            TEXT NOT NULL,
+      workspace_id      TEXT NOT NULL,
+      supervisor_id     TEXT NOT NULL,
+      topic             TEXT,
+      plan_path         TEXT,
+      lead_provider     TEXT,
+      reviewer_provider TEXT,
+      turn_timeout_ms   INTEGER,
+      lead_id           TEXT,
+      reviewer_id       TEXT,
+      turn              INTEGER,
+      round             INTEGER,
+      last_relayed_ts   TEXT,            -- JSON
+      started_at        TEXT,
+      updated_at        TEXT,
+      ended_at          TEXT,
+      error             TEXT
+    )
+  `);
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS orchestration_events (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      run_id      TEXT NOT NULL,
+      ts          TEXT NOT NULL,
+      kind        TEXT NOT NULL,
+      payload     TEXT                   -- JSON
+    )
+  `);
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS orchestration_members (
+      run_id      TEXT NOT NULL,
+      role        TEXT NOT NULL,         -- 'lead' | 'reviewer'
+      agent_id    TEXT NOT NULL,
+      PRIMARY KEY (run_id, role)
     )
   `);
 
@@ -1049,4 +1099,122 @@ export function updateTeamTask(taskId: string, updates: {
 export function getTeamTasks(teamId: string): TeamTask[] {
   return queryAll('SELECT * FROM team_tasks WHERE team_id = ? ORDER BY created_at ASC', [teamId])
     .map(rowToTeamTask);
+}
+
+// ── Orchestration operations ──────────────────────────────────────────────
+
+function rowToOrchestrationRun(row: any): OrchestrationRun {
+  let lastRelayedTs: Record<string, string> = {};
+  if (row.last_relayed_ts) {
+    try {
+      const parsed = JSON.parse(row.last_relayed_ts);
+      if (parsed && typeof parsed === 'object') lastRelayedTs = parsed;
+    } catch { /* tolerate garbage — start with empty highwater marks */ }
+  }
+  return {
+    runId: row.run_id,
+    name: row.name,
+    mode: row.mode,
+    status: row.status,
+    workspaceId: row.workspace_id,
+    supervisorId: row.supervisor_id,
+    topic: row.topic ?? '',
+    planPath: row.plan_path ?? '',
+    leadProvider: row.lead_provider ?? 'claude',
+    reviewerProvider: row.reviewer_provider ?? 'codex',
+    turnTimeoutMs: row.turn_timeout_ms ?? 600000,
+    leadId: row.lead_id ?? undefined,
+    reviewerId: row.reviewer_id ?? undefined,
+    turn: row.turn ?? undefined,
+    round: row.round ?? undefined,
+    lastRelayedTs,
+    startedAt: row.started_at,
+    updatedAt: row.updated_at,
+    endedAt: row.ended_at ?? undefined,
+    error: row.error ?? undefined,
+  };
+}
+
+/** Insert or update a run row (upsert keyed on run_id). */
+export function insertOrchestration(r: OrchestrationRun): void {
+  run(
+    `INSERT INTO orchestrations (
+       run_id, name, mode, status, workspace_id, supervisor_id, topic, plan_path,
+       lead_provider, reviewer_provider, turn_timeout_ms, lead_id, reviewer_id,
+       turn, round, last_relayed_ts, started_at, updated_at, ended_at, error
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(run_id) DO UPDATE SET
+       name = excluded.name, mode = excluded.mode, status = excluded.status,
+       workspace_id = excluded.workspace_id, supervisor_id = excluded.supervisor_id,
+       topic = excluded.topic, plan_path = excluded.plan_path,
+       lead_provider = excluded.lead_provider, reviewer_provider = excluded.reviewer_provider,
+       turn_timeout_ms = excluded.turn_timeout_ms, lead_id = excluded.lead_id,
+       reviewer_id = excluded.reviewer_id, turn = excluded.turn, round = excluded.round,
+       last_relayed_ts = excluded.last_relayed_ts, started_at = excluded.started_at,
+       updated_at = excluded.updated_at, ended_at = excluded.ended_at, error = excluded.error`,
+    [
+      r.runId, r.name, r.mode, r.status, r.workspaceId, r.supervisorId,
+      r.topic, r.planPath, r.leadProvider, r.reviewerProvider, r.turnTimeoutMs,
+      r.leadId ?? null, r.reviewerId ?? null, r.turn ?? null, r.round ?? null,
+      JSON.stringify(r.lastRelayedTs || {}), r.startedAt, r.updatedAt,
+      r.endedAt ?? null, r.error ?? null,
+    ]
+  );
+}
+
+/** Persist progress on an existing run (same upsert path as insert). */
+export function updateOrchestration(r: OrchestrationRun): void {
+  insertOrchestration(r);
+}
+
+export function getOrchestrationRun(runId: string): OrchestrationRun | null {
+  const row = queryOne('SELECT * FROM orchestrations WHERE run_id = ?', [runId]);
+  return row ? rowToOrchestrationRun(row) : null;
+}
+
+export function listOrchestrationRuns(): OrchestrationRun[] {
+  return queryAll('SELECT * FROM orchestrations ORDER BY started_at DESC').map(rowToOrchestrationRun);
+}
+
+export function insertOrchestrationEvent(evt: OrchestrationEvent): void {
+  run(
+    'INSERT INTO orchestration_events (run_id, ts, kind, payload) VALUES (?, ?, ?, ?)',
+    [evt.runId, evt.ts, evt.kind, evt.payload === undefined ? null : JSON.stringify(evt.payload)]
+  );
+}
+
+export function listOrchestrationEvents(runId: string): OrchestrationEvent[] {
+  return queryAll(
+    'SELECT * FROM orchestration_events WHERE run_id = ? ORDER BY id ASC',
+    [runId]
+  ).map((row: any) => ({
+    runId: row.run_id,
+    ts: row.ts,
+    kind: row.kind,
+    payload: row.payload ? JSON.parse(row.payload) : null,
+  }));
+}
+
+export function insertOrchestrationMember(runId: string, role: string, agentId: string): void {
+  run(
+    `INSERT INTO orchestration_members (run_id, role, agent_id) VALUES (?, ?, ?)
+     ON CONFLICT(run_id, role) DO UPDATE SET agent_id = excluded.agent_id`,
+    [runId, role, agentId]
+  );
+}
+
+/** Boot reconcile: any run still 'starting'/'running' belonged to a dashboard
+ *  process that died. Mark them aborted (error = reason) and return the rows as
+ *  they were BEFORE the update so the caller can emit resume hints. */
+export function markActiveRunsAborted(reason: string): OrchestrationRun[] {
+  const rows = queryAll(
+    "SELECT * FROM orchestrations WHERE status IN ('starting', 'running')"
+  ).map(rowToOrchestrationRun);
+  if (rows.length > 0) {
+    run(
+      "UPDATE orchestrations SET status = 'aborted', error = ?, ended_at = ?, updated_at = ? WHERE status IN ('starting', 'running')",
+      [reason, new Date().toISOString(), new Date().toISOString()]
+    );
+  }
+  return rows;
 }

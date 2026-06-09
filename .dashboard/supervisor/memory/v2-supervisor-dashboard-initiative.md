@@ -87,6 +87,15 @@ renderer that live-tails an execution can scrub a finished one — live=animatio
 after=replay. Needs no new data beyond the L1/L4 `plan_events` spine already on the
 near-term path.
 
+## UPDATE 2026-06-07 — phase-order audit approved
+
+GroupThink-audited ship order now lives at `plans/v2-migration-phase-order-audit.md`
+(workspace root; final, Reviewer-approved). It supersedes Part 0 §0.3 as the execution
+sequence: A ∥ A′ → B1a ∥ B2 → B1b trailing → C (C-1/C-2) → D → E. Its §5 lists
+worker-executable doc edits (D-01 UUID re-decision, P1-10a/P1-08a extractions, Part 0
+corrections) to apply BEFORE phase work starts. See MEMORY.md index entry for the
+headline catches.
+
 ## Bottom line for V2 planning
 
 This is a genuinely big lift: 7 workstreams, 5 layers, ~6 design docs, almost nothing

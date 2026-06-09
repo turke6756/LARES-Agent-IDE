@@ -23,6 +23,7 @@ import { scanPersonas, scaffoldPersona } from './persona-scanner';
 import { TEAM_MAX_MESSAGES_PER_5MIN, TEAM_MAX_ALTERNATIONS, TEAM_ALTERNATION_WINDOW_MS, TEAM_PAIR_COOLDOWN_MS } from '../shared/constants';
 import { TeamMessageStatus } from '../shared/types';
 import { isKeyName, mapKeyToBytes, SUPPORTED_KEY_NAMES } from './supervisor/key-bytes';
+import type { OrchestrationService } from './orchestration/service';
 import crypto from 'crypto';
 
 /** Machine-readable failure classes the top-level error serializer is allowed
@@ -43,7 +44,7 @@ export class ApiServer {
   private supervisor: AgentSupervisor;
   private port: number;
 
-  constructor(supervisor: AgentSupervisor, port = 24678) {
+  constructor(supervisor: AgentSupervisor, port = 24678, private orchestration?: OrchestrationService) {
     this.supervisor = supervisor;
     this.port = port;
   }
@@ -426,6 +427,45 @@ export class ApiServer {
       const newAgent = await this.supervisor.forkAgent(forkMatch[1]);
       return newAgent;
     }
+
+    // ── Orchestration routes ─────────────────────────────────────────────
+    // Dashboard-owned orchestration runs (groupthink). The MCP supervisor
+    // proxies list_orchestrations / run_orchestration / get_orchestration_run /
+    // abort_orchestration here. `/catalog` is matched BEFORE the `:runId` regex
+    // so the literal "catalog" isn't captured as a runId.
+
+    // GET /api/orchestrations/catalog — descriptors for the catalog
+    if (method === 'GET' && path === '/api/orchestrations/catalog') {
+      return { orchestrations: this.orchestration!.listCatalog() };
+    }
+
+    // GET /api/orchestrations[?status=…] — list runs
+    if (method === 'GET' && path === '/api/orchestrations') {
+      const status = url.searchParams.get('status');
+      return { runs: this.orchestration!.listRuns().filter(r => !status || r.status === status) };
+    }
+
+    // POST /api/orchestrations — start a run (detached; returns {runId})
+    if (method === 'POST' && path === '/api/orchestrations') {
+      const { name, params } = JSON.parse(await readBody(req));
+      if (!name || !params?.workspaceId || !params?.supervisorId) {
+        throw Object.assign(
+          new Error('name, params.workspaceId, params.supervisorId required'),
+          { statusCode: 400 },
+        );
+      }
+      return this.orchestration!.start_run({ name, ...params });
+    }
+
+    const orchOne = path.match(/^\/api\/orchestrations\/([^/]+)$/);
+    // GET /api/orchestrations/:runId — run status/progress
+    if (method === 'GET' && orchOne) {
+      const run = this.orchestration!.getRun(orchOne[1]);
+      if (!run) throw Object.assign(new Error('Run not found'), { statusCode: 404 });
+      return run;
+    }
+    // DELETE /api/orchestrations/:runId — abort + clean up members
+    if (method === 'DELETE' && orchOne) return this.orchestration!.abort(orchOne[1]);
 
     // ── Team routes ──────────────────────────────────────────────────────
 

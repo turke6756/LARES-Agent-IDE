@@ -270,7 +270,7 @@ export default function AgentCard({
         ${isTerminalActive ? 'bg-accent-blue/[0.06] border-l-accent-blue' : ''}
         ${agent.status === 'working' ? 'bg-accent-green/[0.03]' : ''}
         ${dragOver ? 'bg-accent-purple/[0.06] border-l-accent-purple' : ''}
-        ${multiSelected ? 'ring-2 ring-accent-purple' : unread ? 'ring-2 ring-accent-blue' : ''}
+        ${multiSelected ? 'agent-card-multiselected' : unread ? 'agent-card-unread' : ''}
       `}
       onMouseDown={(e) => {
         // Shift+click toggles multi-selection here, on mousedown: the card is

@@ -354,6 +354,18 @@ export const SUPERVISOR_AGENT_MD_V1_HASH = '2a18afb8be96fd6aa8589a351979b30786a3
  *  v1→v2 upgrade. */
 export const SUPERVISOR_RUN_ORCHESTRATION_SKILL_V1_HASH = '90d7334faa42b08129a810db54c740796264143c5e10a4d2b469b7fb6040ab71';
 
+/** SHA-256 hex of the v2 `.dashboard/supervisor/CLAUDE.md` (GroupThink-as-script
+ *  references). v3 rewrites the "Multi-agent orchestration" Path 1 to the
+ *  in-process `run_orchestration` MCP tool. Used in the v3 file's previousHashes
+ *  for silent v2→v3 upgrade. */
+export const SUPERVISOR_AGENT_MD_V2_HASH = '85993687d0bd2b17f94b95d8db45585ccbeca9477f0009151faa97bb8cb04723';
+
+/** SHA-256 hex of the v2 `.dashboard/supervisor/.claude/skills/run-orchestration/SKILL.md`
+ *  (script-launch playbook). v3 rewrites it MCP-first (run_orchestration /
+ *  get_orchestration_run / abort_orchestration; legacy_command resume). Used in
+ *  the v3 file's previousHashes for silent v2→v3 upgrade. */
+export const SUPERVISOR_RUN_ORCHESTRATION_SKILL_V2_HASH = 'a8f79058f73df5a3aa2e17a1d0f66f100086413083a7b911b99daad06200cd74';
+
 export function sha256Hex(content: string | Buffer): string {
   return crypto.createHash('sha256').update(content).digest('hex');
 }
@@ -1200,8 +1212,8 @@ export class AgentSupervisor extends EventEmitter {
   private static SUPERVISOR_FILES: Record<string, ScaffoldFile> = {
     [`.dashboard/supervisor/CLAUDE.md`]:                                              {
       content: SUPERVISOR_AGENT_MD,
-      version: 2,
-      previousHashes: { 1: SUPERVISOR_AGENT_MD_V1_HASH },
+      version: 3,
+      previousHashes: { 1: SUPERVISOR_AGENT_MD_V1_HASH, 2: SUPERVISOR_AGENT_MD_V2_HASH },
     },
     [`.dashboard/supervisor/.claude/settings.json`]:                                  {
       content: SUPERVISOR_CLAUDE_SETTINGS_JSON,
@@ -1210,8 +1222,8 @@ export class AgentSupervisor extends EventEmitter {
     },
     [`.dashboard/supervisor/.claude/skills/run-orchestration/SKILL.md`]:              {
       content: SUPERVISOR_RUN_ORCHESTRATION_SKILL,
-      version: 2,
-      previousHashes: { 1: SUPERVISOR_RUN_ORCHESTRATION_SKILL_V1_HASH },
+      version: 3,
+      previousHashes: { 1: SUPERVISOR_RUN_ORCHESTRATION_SKILL_V1_HASH, 2: SUPERVISOR_RUN_ORCHESTRATION_SKILL_V2_HASH },
     },
     [`.dashboard/supervisor/.claude/skills/orchestration-spike/SKILL.md`]:            { content: SUPERVISOR_ORCHESTRATION_SPIKE_SKILL, version: 1 },
     [`.dashboard/supervisor/memory/MEMORY.md`]:                                       { content: SUPERVISOR_MEMORY_MD,                 version: 1 },
@@ -3707,6 +3719,53 @@ export class AgentSupervisor extends EventEmitter {
       }
       await new Promise((resolve) => setTimeout(resolve, HANDSHAKE_CONFIRM_POLL_MS));
     }
+  }
+
+  /**
+   * Deliver a terminal [DASHBOARD EVENT] to a supervisor, retrying while it is
+   * busy. In-process port of groupthink-v2.js:270–329 (the orchestration runner
+   * used to do this over HTTP): poll the supervisor's status until idle/waiting,
+   * gate on `isInputInFlight` (the in-process equivalent of the HTTP 409 latch),
+   * then `sendInputConfirmed`. Retries on a busy supervisor or a
+   * `SubmitNotConfirmedError`/delivery failure up to `maxAttempts` times,
+   * `intervalMs` apart. There is no sentinel file — on persistent failure this
+   * resolves `{ ok: false }` and the OrchestrationService records a durable
+   * `delivery_failed` event instead.
+   */
+  async deliverToSupervisor(
+    supervisorId: string,
+    text: string,
+    opts: { maxAttempts?: number; intervalMs?: number } = {},
+  ): Promise<{ ok: boolean }> {
+    const READY = new Set<string>(['idle', 'waiting']);
+    const maxAttempts = opts.maxAttempts ?? 12;
+    const intervalMs = opts.intervalMs ?? 5_000;
+    const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const status = getAgent(supervisorId)?.status;
+      // Wait out a busy supervisor (or an in-flight send) before attempting a
+      // delivery — mirrors the script's READY_STATUSES + 409 gate.
+      if ((status && !READY.has(status)) || this.isInputInFlight(supervisorId)) {
+        if (attempt < maxAttempts) { await sleep(intervalMs); continue; }
+        return { ok: false };
+      }
+      try {
+        await this.sendInputConfirmed(supervisorId, text);
+        if (attempt > 1) {
+          console.log(`[orchestration] deliverToSupervisor succeeded on attempt ${attempt}/${maxAttempts}`);
+        }
+        return { ok: true };
+      } catch (err) {
+        if (attempt < maxAttempts) { await sleep(intervalMs); continue; }
+        console.warn(
+          `[orchestration] deliverToSupervisor failed after ${attempt} attempts: ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+        );
+        return { ok: false };
+      }
+    }
+    return { ok: false };
   }
 
   private async _doSendInput(agentId: string, text: string, submit: boolean = true): Promise<boolean> {

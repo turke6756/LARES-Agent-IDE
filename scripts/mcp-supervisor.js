@@ -368,6 +368,49 @@ function getToolDefinitions() {
       },
     },
     {
+      name: 'list_orchestrations',
+      description: 'List available dashboard-run orchestrations (e.g. groupthink) and their parameters. ' +
+        'Orchestrations now run INSIDE the dashboard — do not look for scripts/*.js.',
+      inputSchema: { type: 'object', properties: {} },
+    },
+    {
+      name: 'get_orchestration_run',
+      description: 'Get the status/progress of an orchestration run by runId.',
+      inputSchema: { type: 'object', properties: { run_id: { type: 'string' } }, required: ['run_id'] },
+    },
+    {
+      name: 'run_orchestration',
+      description: 'Start an orchestration. Returns immediately with a runId; the run executes ' +
+        'detached inside the dashboard and streams [DASHBOARD EVENT] messages back to you ' +
+        '(groupthink.complete / orchestration.groupthink.stalled / .aborted). ' +
+        'Resume a stalled run with params.resume_run_id. To re-run an OLD ' +
+        '`node scripts/groupthink-v2.js …` resume_hint, paste it as params.legacy_command.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          name:               { type: 'string', description: "Orchestration name, e.g. 'groupthink'." },
+          workspace_id:       { type: 'string', description: 'Workspace id (GET /api/agents to discover).' },
+          supervisor_id:      { type: 'string', description: 'Your own supervisor agent id.' },
+          mode:               { type: 'string', description: 'serial | parallel (groupthink).' },
+          topic:              { type: 'string', description: 'One-line deliberation topic.' },
+          plan_path:          { type: 'string', description: 'Output plan path relative to workspace root.' },
+          lead_provider:      { type: 'string', description: 'Default claude.' },
+          reviewer_provider:  { type: 'string', description: 'Default codex.' },
+          turn_timeout_ms:    { type: 'number', description: 'Per-turn stall timeout, default 600000.' },
+          resume_run_id:      { type: 'string', description: 'Resume a prior stalled run by its runId.' },
+          resume_lead_id:     { type: 'string', description: 'Legacy serial resume: lead agent id.' },
+          resume_reviewer_id: { type: 'string', description: 'Legacy serial resume: reviewer agent id.' },
+          legacy_command:     { type: 'string', description: 'A full old `node scripts/groupthink-v2.js …` command to translate + resume.' },
+        },
+        required: ['name', 'workspace_id', 'supervisor_id'],
+      },
+    },
+    {
+      name: 'abort_orchestration',
+      description: 'Abort a running orchestration and clean up its member agents.',
+      inputSchema: { type: 'object', properties: { run_id: { type: 'string' } }, required: ['run_id'] },
+    },
+    {
       name: 'create_persona',
       description: 'Create a new persistent agent persona directory under .claude/agents/. Creates the folder with CLAUDE.md and memory/MEMORY.md scaffolding.',
       inputSchema: {
@@ -871,6 +914,37 @@ async function handleToolCall(name, args) {
         }
       }
       return { content: [{ type: 'text', text }] };
+    }
+
+    case 'list_orchestrations': {
+      const r = await apiRequest('GET', '/api/orchestrations/catalog');
+      return { content: [{ type: 'text', text: JSON.stringify(r.orchestrations, null, 2) }] };
+    }
+
+    case 'get_orchestration_run': {
+      const r = await apiRequest('GET', `/api/orchestrations/${encodeURIComponent(args.run_id)}`);
+      return { content: [{ type: 'text', text: JSON.stringify(r, null, 2) }] };
+    }
+
+    case 'run_orchestration': {
+      const params = {
+        workspaceId: args.workspace_id, supervisorId: args.supervisor_id,
+        mode: args.mode, topic: args.topic, planPath: args.plan_path,
+        leadProvider: args.lead_provider, reviewerProvider: args.reviewer_provider,
+        turnTimeoutMs: args.turn_timeout_ms,
+        resumeRunId: args.resume_run_id, resumeLeadId: args.resume_lead_id,
+        resumeReviewerId: args.resume_reviewer_id, legacyCommand: args.legacy_command,
+      };
+      const r = await apiRequest('POST', '/api/orchestrations', { name: args.name, params });
+      return { content: [{ type: 'text', text:
+        `Orchestration '${args.name}' started detached. runId=${r.runId}. ` +
+        `You'll receive [DASHBOARD EVENT] messages as it progresses; ` +
+        `poll get_orchestration_run({run_id:"${r.runId}"}) for status.` }] };
+    }
+
+    case 'abort_orchestration': {
+      const r = await apiRequest('DELETE', `/api/orchestrations/${encodeURIComponent(args.run_id)}`);
+      return { content: [{ type: 'text', text: JSON.stringify(r) }] };
     }
 
     case 'create_persona': {

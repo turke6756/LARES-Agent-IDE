@@ -332,6 +332,20 @@ select {
     var(--shadow-card);
 }
 
+/* ── Multi-selection / unread halos ──
+   Outline, not Tailwind ring: rings are box-shadows, and the card's own
+   box-shadow rules (.agent-card:hover, .light .ui-card, .agent-card-selected)
+   win the specificity fight and erase them — most visibly while hovering the
+   card you just shift+clicked. Outline can't be stomped by any box-shadow. */
+.ui-card.agent-card-multiselected {
+  outline: 2px solid var(--color-accent-purple);
+  outline-offset: 1px;
+}
+.ui-card.agent-card-unread {
+  outline: 2px solid var(--color-accent-blue);
+  outline-offset: 1px;
+}
+
 /* ── Tab system (VS Code bottom-indicator) ── */
 
 .ui-tab {

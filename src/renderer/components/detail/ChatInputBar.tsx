@@ -36,6 +36,15 @@ export default function ChatInputBar({
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const lastAgentIdRef = useRef(agentId);
   const lastSyncSignalRef = useRef(syncSignal);
+  // The text of the most recent send, kept so an async delivery failure can
+  // restore it into the box (see onSendInputError below).
+  const lastSentRef = useRef<string>('');
+  // Mirror of `input` readable synchronously inside the (agentId-scoped)
+  // onSendInputError callback, which would otherwise close over a stale value.
+  const inputValueRef = useRef(input);
+  useEffect(() => {
+    inputValueRef.current = input;
+  }, [input]);
 
   // If the selected agent changes while this component stays mounted, swap to that agent's draft.
   useEffect(() => {
@@ -62,13 +71,26 @@ export default function ChatInputBar({
     });
   }, [syncSignal, agentId]);
 
-  // Async delivery failures (PTY closed mid-typing, runner removed, etc.)
-  // arrive via this event channel because the IPC handler is fire-and-forget
-  // for the multi-KB codex/gemini typing path. Synchronous failures (status
-  // gate, agent missing) come through the await rejection in handleSend.
+  // Async delivery failures (PTY closed mid-typing, runner removed, agent
+  // mid auto-compact, etc.) arrive via this event channel because the IPC
+  // handler is fire-and-forget for the multi-KB codex/gemini typing path
+  // (see ipc-handlers.ts: 'agent:send-input' resolves as soon as delivery is
+  // QUEUED). By the time the failure lands, handleSend has already cleared
+  // the box optimistically — so restore the typed text here, otherwise the
+  // user's message silently vanishes. Synchronous failures (status gate,
+  // agent missing) come through the await rejection in handleSend, which
+  // never clears the box in the first place.
   useEffect(() => {
     const unsubscribe = window.api.agents.onSendInputError(({ agentId: errAgent, error }) => {
       if (errAgent !== agentId) return;
+      // Only restore if the box is empty — don't clobber a fresh draft the
+      // user started typing after the (optimistically cleared) failed send.
+      const failed = lastSentRef.current;
+      if (failed && inputValueRef.current.trim().length === 0) {
+        inputValueRef.current = failed; // reflect immediately for back-to-back errors
+        setInput(failed);
+        saveDraft(agentId, failed);
+      }
       setSendError(error);
     });
     return unsubscribe;
@@ -89,6 +111,7 @@ export default function ChatInputBar({
 
     setSending(true);
     setSendError(null);
+    lastSentRef.current = text; // remembered so onSendInputError can restore it
     try {
       await window.api.agents.sendInput(agentId, text);
       updateInput('');

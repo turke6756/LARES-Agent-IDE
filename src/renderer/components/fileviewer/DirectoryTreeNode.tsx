@@ -152,9 +152,13 @@ function DirectoryTreeNode({
 
   // Controlled mode: a node can mount already-expanded (e.g. right after the
   // sidebar refresh remounts the tree). The click handler that normally loads
-  // children never ran, so fetch them here.
+  // children never ran, so fetch them here. `loading` must NOT be a dep (or
+  // guard): setLoading(true) below would re-fire the effect, whose cleanup
+  // cancels the in-flight load — leaving the node spinning forever with no
+  // children. Duplicate fetches can't happen: the remaining deps are stable
+  // while a load is in flight, and any re-fire cancels the old load first.
   useEffect(() => {
-    if (!entry.isDirectory || !expanded || children !== null || loading) return;
+    if (!entry.isDirectory || !expanded || children !== null) return;
     let cancelled = false;
     setLoading(true);
     loadChildren(entry.path).then((items) => {
@@ -163,7 +167,7 @@ function DirectoryTreeNode({
       setLoading(false);
     });
     return () => { cancelled = true; };
-  }, [entry.isDirectory, entry.path, expanded, children, loading, loadChildren]);
+  }, [entry.isDirectory, entry.path, expanded, children, loadChildren]);
 
   const childrenLoaded = children !== null;
   useEffect(() => {

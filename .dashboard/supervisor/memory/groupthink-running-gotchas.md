@@ -331,3 +331,118 @@ Two possible root causes — see BUG-09 for the investigation entry:
 events with skepticism within an active multi-agent task. Read the agent
 log before concluding "done"; if the agent is still emitting tool calls
 or thinking spinners, the idle is likely intermediate.
+
+## 13. The `&&`-chain + trailing `&` double-launch trap (supervisor-side)
+
+Observed 2026-06-08 launching a parallel GroupThink. The launch was written as
+one line: `RUN_ID=... && LOG=... && mkdir ... && TOPIC=... && nohup node ... &`
+followed by `echo "$RUN_ID"`. In bash, the trailing `&` backgrounds the **entire
+`&&` list**, so every variable assignment ran inside the backgrounded subshell
+and the foreground `echo` printed **empty** values. I read that as "launch
+failed" and re-ran — but the `node` script had in fact started. Result: **two
+identical runs racing**, both writing the same `--planPath`, both burning tokens.
+
+**Rule:** only the `node` invocation should be backgrounded. Put the setup
+(`RUN_ID`, `LOG`, `mkdir`, `TOPIC`) on their own statements/lines FIRST, then
+`nohup node ... &` alone, then `echo "PID=$!"`. An empty `RUN_ID` echo is NOT
+proof the launch failed — **verify with `Get-CimInstance Win32_Process -Filter
+"Name='node.exe'" | Where CommandLine -like '*<planPath>*'`** before relaunching.
+If you ever suspect a double-launch, that CommandLine query (match on the unique
+`--planPath`) lists every live run so you can kill the dupe by PID.
+
+## 14. Parallel mode reliably stalls on codex R1 turnComplete detection
+
+Observed 2026-06-08 (and previously on the 2026-05-29 audit run). In
+`--mode=parallel`, the script logs `Waiting for both R1 drafts...` then polls for
+each planner's `turnComplete`. With a **codex** peer, the codex R1 completion is
+not detected — the agent goes `idle` with a full, correct draft, but the script
+keeps waiting until the 10-min turn timeout fires `*.stalled`. Hit it on BOTH of
+today's runs and on 2026-05-29 (`Timeout waiting for Peer R1 (codex)`).
+
+Likely the same family as gotcha #5/#10 (codex session/chat indexing), surfacing
+in the parallel R1 barrier specifically.
+
+**Operational guidance:**
+- For a result you actually need delivered, prefer **`--mode=serial`** (the
+  BUG-29-hardened default) over parallel when the reviewer/peer is codex.
+- If parallel is already stalled but the agents have drafted: don't re-run.
+  **Salvage** — kill the stuck script(s), then hand one provider's draft to an
+  already-idle claude synthesizer (which holds its own R1 draft) via
+  `send_message_to_agent` and have it cross-pollinate + write the plan file.
+  That's how the 2026-06-08 `plans/orchestration-as-mcp-tool.md` was produced
+  after both parallel runs stalled.
+- Fixing exactly this detection fragility is part of the Option-3 plan
+  (`plans/orchestration-as-mcp-tool.md`): an in-process runner reading
+  ground-truth chat/status instead of an HTTP-poll heuristic.
+
+## 15. Parallel mode FALSE-stall at the R2→R3 boundary (plan still written)
+
+Observed 2026-06-08 on the B2 plans-data-layer run (`--mode=parallel`, Claude
+synthesizer + Codex peer). **Distinct from #14** — R1 completed cleanly here
+(`R1 complete. Synthesizer draft: 28257 chars; Peer draft: 18037 chars`), and the
+codex peer's kickoff went via `/input` (BUG-29 mitigation), so #14 didn't bite.
+
+The failure was at R3: the run log shows `R2 complete` and `--- Round 3 ---` and
+`STALL: Synthesizer completed R3 but no plan file...` **all at the same
+millisecond** (06:03:03). The runner mis-counted the synthesizer's *R2*
+turnComplete as its *R3* completion (lastRelayedTs seeding — note the launch-time
+`No prior turnComplete message ... lastRelayedTs unseeded` warnings), checked for
+the plan file instantly, found none, emitted `orchestration.groupthink.stalled`
+(`reason: no_plan_written`, `resume_hint: null`), and **exited** — all while the
+synthesizer was just *starting* its real R3 synthesis-and-write turn.
+
+**Key insight: the stall was a false alarm.** The runner had already delivered the
+R3 synthesis prompt, so the (now orphaned) synthesizer finished writing the plan
+to the canonical path on its own ~3 min later. The deliberation was never lost.
+
+**Operational guidance:**
+- On a parallel `no_plan_written` stall, **do NOT immediately re-run or salvage-
+  by-hand.** First check whether the synthesizer is *still actively working*:
+  `curl /api/agents/<synth-id>/log?lines=6` — a live spinner (`✻✽✶` animation +
+  braille title `⠂ <plan title>`) means it's mid-write. Wait for its
+  `working→idle` event (that event fires reliably; see #16) then check the file.
+- Only intervene (send a write instruction via `/input`, or reconstruct from its
+  in-context draft + write the file yourself) if it goes idle with no file.
+- Same Option-3 in-process-runner fix applies (ground-truth turn detection).
+
+## 16. Supervised Claude launched via `systemPrompt` shows `idle` while working
+
+**(FIXED 2026-06-08, uncommitted — pending `npm run restart`. Fix in
+`src/main/orchestration/groupthink-v2.ts` `launchAgentWithKickoff`: dropped the
+Claude `systemPrompt` special-case so EVERY provider goes launch → `waitReady` →
+`sendInput(kickoff)`. A submitted message arms the working latch; a launch-time
+systemPrompt does not. Tests flipped + green (6/6), `build:main` clean. Only the
+in-process app runner was changed; the deprecated `scripts/groupthink-v2.js` shim
+was left alone. NOTE: this is also why a normal `launch_agent({prompt})` never had
+the bug — that path already submits via `/input`; only GroupThink's runner used
+`systemPrompt`. Live-verify after restart: launch any GroupThink, confirm the
+Claude member's card shows `working` during its first turn.)**
+
+Observed 2026-06-08, same run. A GroupThink **Claude** member (launched
+`isSupervised:true` with its kickoff as `launchBody.systemPrompt`, per
+`launchAgentWithKickoff` — Claude alone takes this path; codex/gemini get `/input`)
+**runs its first turn while its card says `idle`.** Confirmed: live PTY spinner +
+`lastInputDeliveredAt: null` + status `idle`.
+
+**Root cause (3 facts combine):** (1) supervised/worker agents have PTY status
+inference OFF (`status-monitor.ts:840` returns null). (2) A worker's idle→working
+transition is owned **exclusively by the Claude `UserPromptSubmit` hook**
+(`event-bridge.ts:599` — `notifyUserInputDelivered` early-returns for
+`isSupervised||isWorker`; explicit comment). (3) A kickoff injected as a launch-
+time `systemPrompt` does **not** fire `UserPromptSubmit` (only `SessionStart`
+fires — confirmed: `lastHookEventAt` = boot ping, nothing after). So nothing ever
+emits the working signal. Codex/Gemini avoid it incidentally — they get a real
+`/input` submission.
+
+**Asymmetry of the bug:** only the **idle→working** signal is suppressed. The
+**working→idle** event (chat `turnComplete` → `forceIdle`) fires fine. So you CAN
+trust an idle event from such an agent; you CANNOT trust an idle *reading* mid-turn.
+
+**Operational guidance:**
+- Don't believe a GroupThink Claude member's `idle` card — confirm via PTY log
+  (spinner/title) before assuming it's done or before sending `/input` (a stale
+  reading may also wrongly show `working` and 409 your send).
+- Real fix is source-side (route supervised Claude kickoffs through `/input` after
+  `waitReady` like codex/gemini, OR fire the working latch on the systemPrompt-
+  launch path). This is concrete repro evidence for the V2 hook P1/P2 work
+  (`memory/hook-system-design-cmux-migration.md`).
