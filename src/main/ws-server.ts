@@ -3,8 +3,8 @@ import { AgentSupervisor } from './supervisor';
 import { getWorkspaces, getAgentsByWorkspace } from './database';
 import { detectPathType, windowsToWslPath, uncToWslPath } from './path-utils';
 import { Agent, AgentStatus } from '../shared/types';
+import { WS_PORT } from './control-ports';
 
-const WS_PORT = 4545;
 const PING_INTERVAL_MS = 30_000;
 
 interface ClientInfo {

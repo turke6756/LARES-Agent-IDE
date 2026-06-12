@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import type { AgentPersona, AgentProvider, AgentTemplate, Workspace } from '../../../shared/types';
 import { PROVIDER_COMMANDS, PROVIDER_META } from '../../../shared/constants';
 import { useDashboardStore } from '../../stores/dashboard-store';
+import { useBrowserSuspension } from '../browser/useBrowserSuspension';
 
 const PROVIDERS: AgentProvider[] = ['claude', 'gemini', 'codex'];
 
@@ -11,6 +12,8 @@ interface Props {
 }
 
 export default function AgentLaunchDialog({ workspace, onClose }: Props) {
+  // The browser WebContentsView paints above this dialog — hide it while open.
+  useBrowserSuspension();
   const { loadAgents, checkHealth } = useDashboardStore();
   const [title, setTitle] = useState('');
   const [roleDescription, setRoleDescription] = useState('');

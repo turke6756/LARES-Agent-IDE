@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { createPortal } from 'react-dom';
 import { useDashboardStore } from '../../stores/dashboard-store';
+import { useBrowserSuspension } from '../browser/useBrowserSuspension';
 import type { PathType } from '../../../shared/types';
 import { detectSyncFolder } from '../../../shared/sync-folder-detection';
 
@@ -11,6 +12,8 @@ function uncToLinuxPath(p: string): string | null {
 }
 
 export default function WorkspaceCreateDialog({ onClose }: { onClose: () => void }) {
+  // The browser WebContentsView paints above this dialog — hide it while open.
+  useBrowserSuspension();
   const { loadWorkspaces, selectWorkspace } = useDashboardStore();
   const [title, setTitle] = useState('');
   const [dirPath, setDirPath] = useState('');

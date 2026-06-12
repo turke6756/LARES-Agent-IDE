@@ -1,4 +1,10 @@
 import type { SessionEvent, ChatEventBatch } from './session-events';
+import type {
+  BrowserBounds,
+  BrowserCreateTabOptions,
+  BrowserOpenRequest,
+  BrowserTabState,
+} from './browser';
 
 export type PathType = 'windows' | 'wsl';
 export type AgentProvider = 'claude' | 'gemini' | 'codex';
@@ -557,6 +563,26 @@ export interface IpcApi {
   notebooks: {
     ensureServer: () => Promise<JupyterServerInfo>;
     listKernelspecs: () => Promise<KernelspecsResponse>;
+  };
+  /** WP1-A — embedded browser pane. FROZEN WP1 contract: payload shapes and
+   *  channel names live in src/shared/browser.ts; WP1-B consumes this
+   *  namespace. Changes require both workers + a plans-doc progress-log note. */
+  browser: {
+    createTab: (opts: BrowserCreateTabOptions) => Promise<{ tabId: string }>;
+    closeTab: (tabId: string) => Promise<void>;
+    navigate: (tabId: string, url: string) => Promise<void>;
+    goBack: (tabId: string) => Promise<void>;
+    goForward: (tabId: string) => Promise<void>;
+    reload: (tabId: string) => Promise<void>;
+    stop: (tabId: string) => Promise<void>;
+    /** null = hide all views. */
+    setActiveTab: (tabId: string | null) => Promise<void>;
+    /** DIP, window-content-relative. */
+    setBounds: (bounds: BrowserBounds) => Promise<void>;
+    /** Pane suspension so renderer overlays aren't painted over. */
+    setVisible: (visible: boolean) => Promise<void>;
+    onTabState: (callback: (state: BrowserTabState) => void) => () => void;
+    onOpenRequest: (callback: (request: BrowserOpenRequest) => void) => () => void;
   };
   onAgentStatusChanged: (callback: (data: { agentId: string; status: AgentStatus; agent: Agent }) => void) => () => void;
   onOpenFileTab: (callback: (payload: OpenFileTabRequest) => void) => () => void;

@@ -16,9 +16,10 @@ import { wslToWindowsPath } from './path-utils';
 import { shutdownJupyterServer } from './jupyter-server';
 import { disposeKernelClient } from './jupyter-kernel-client';
 import { closeAllWatchers as closeAllFsWatchers } from './fs-watcher';
-
-const JUPYTER_BASE_PORT = 18888;
-const JUPYTER_PORT_RETRIES = 50;
+import { JUPYTER_BASE_PORT, JUPYTER_PORT_RETRIES } from './control-ports';
+import { buildChromeUA } from './browser/browser-decisions';
+import { BrowserManager } from './browser/browser-manager';
+import { registerBrowserIpc } from './browser/browser-ipc';
 
 // Prevent EPIPE crashes when stdout/stderr pipe is closed (e.g. parent shell exits)
 process.stdout?.on?.('error', () => {});
@@ -32,11 +33,39 @@ app.commandLine.appendSwitch(
   'PrivateNetworkAccessSendPreflights,BlockInsecurePrivateNetworkRequests,LocalNetworkAccessChecks',
 );
 
+// G1 fail ladder round 2 (2026-06-11): Electron defaults
+// `navigator.webdriver === true`, which is the highest-signal automation tell
+// for Google's BotGuard sign-in check (slayzone 2026 Electron-migration notes:
+// their #1 fix). This global switch's ONLY effect is flipping that flag to
+// false — it removes the Blink AutomationControlled feature, attaches nothing,
+// exposes nothing, and weakens no mitigation (M1–M16 untouched). Must run
+// before app ready, like the disable-features switch above.
+app.commandLine.appendSwitch('disable-blink-features', 'AutomationControlled');
+
+// WP1-A task 2: present as Chrome-stable everywhere, set before ANY window or
+// session exists. Derived from the real engine version (buildChromeUA) so the
+// UA can never drift from the running Chromium — Google sign-in inside the
+// pane gates on the exact byte shape (Ferdium lesson; human gate G1).
+// G1 fail ladder (2026-06-11): this fallback alone did NOT pass the Google
+// sign-in gate — BrowserManager.hardenSession() now additionally sets the UA
+// per pane session (#47979 hedge), and round 2 flips to a version-stripped UA
+// on accounts.google.com via did-navigate (uaForUrl; Ferdium tactic). The
+// fallback stays as the baseline for everything else.
+app.userAgentFallback = buildChromeUA(process.versions.chrome);
+
 let mainWindow: BrowserWindow | null = null;
+// True only while `new BrowserWindow()` for the shell runs. The shell's
+// 'web-contents-created' event fires synchronously inside that constructor,
+// before `mainWindow` is assigned, so the `contents === mainWindow.webContents`
+// identity check can't recognize it yet. This flag lets the M4 guard exempt the
+// shell during its own construction (needed since the shell now runs
+// sandbox:false, which otherwise trips the insecure-contents log).
+let constructingShell = false;
 let supervisor: AgentSupervisor | null = null;
 let wsServer: WsServer | null = null;
 let apiServer: ApiServer | null = null;
 let orchestration: OrchestrationService | null = null;
+let browserManager: BrowserManager | null = null;
 
 // Single-instance lock — prevent duplicate windows
 const gotTheLock = app.requestSingleInstanceLock();
@@ -68,15 +97,21 @@ app.on('web-contents-created', (_e, contents) => {
   contents.setWindowOpenHandler(() => ({ action: 'deny' }));
   contents.on('will-attach-webview', (e) => e.preventDefault());
 
-  const isShell = mainWindow !== null && contents === mainWindow.webContents;
+  const isShell =
+    constructingShell || (mainWindow !== null && contents === mainWindow.webContents);
   if (isShell) return; // the shell legitimately carries the dashboard preload
 
   // getLastWebPreferences() is not in the TS types — deliberate cast (see the
   // anchors table in plans/embedded-browser-implementation-tasks.md).
   const wp = (contents as unknown as {
-    getLastWebPreferences?: () => Electron.WebPreferences;
+    getLastWebPreferences?: () => Electron.WebPreferences | null;
   }).getLastWebPreferences?.();
-  if (wp === undefined) {
+  // getLastWebPreferences() returns null (not just undefined) for contents
+  // whose prefs aren't available yet — e.g. during early construction. Use a
+  // loose null check so a null return can't fall through to the wp.* deref
+  // below (was `=== undefined`, which crashed with "Cannot read properties of
+  // null (reading 'nodeIntegration')" on those contents).
+  if (wp == null) {
     // Identity-tracking fallback: anything that is neither the shell nor a
     // manager-registered view (webcontents-guard seam) is unknown — loud-log.
     if (!checkManagedWebContents(contents)) {
@@ -128,6 +163,7 @@ function createWindow(): void {
   const theme = loadPersistedTheme();
   nativeTheme.themeSource = theme;
 
+  constructingShell = true;
   mainWindow = new BrowserWindow({
     width: 1400,
     height: 900,
@@ -152,6 +188,16 @@ function createWindow(): void {
       preload: path.join(__dirname, '..', 'preload', 'index.js'),
       nodeIntegration: false,
       contextIsolation: true,
+      // The shell is the one trusted preload-bearing context (see the
+      // security guard ~L97: "any non-shell view must be sandboxed"). Electron
+      // 20+ defaults renderers to sandbox:true, and a sandboxed preload can
+      // only require('electron') + node builtins — NOT local modules. The WP1
+      // browser pane made the preload import BROWSER_CHANNELS from
+      // ../shared/browser (a runtime require), which a sandboxed preload
+      // rejects, aborting before exposeInMainWorld('api') and leaving
+      // window.api undefined. Disable sandbox for the shell so the trusted
+      // preload can require shared modules; non-shell views stay sandboxed.
+      sandbox: false,
       // Required so the file:// renderer can iframe-embed the locally-spawned
       // Jupyter server at http://127.0.0.1:<port>. Without this, Chromium
       // rejects the cross-origin iframe load with ERR_BLOCKED_BY_RESPONSE
@@ -160,6 +206,7 @@ function createWindow(): void {
       allowRunningInsecureContent: true,
     },
   });
+  constructingShell = false;
 
   // Try Vite dev server first (check multiple ports), fall back to built files
   const builtFile = path.join(__dirname, '..', '..', 'renderer', 'index.html');
@@ -363,7 +410,14 @@ app.whenReady().then(async () => {
     // so supervised workers' Stop hooks POST to the right place. start()
     // resolves the bound port only once 'listening' fires (WP0.1), so this
     // can never observe a stale pre-retry port.
-    supervisor.setApiServerPort(await apiServer.start());
+    const apiPort = await apiServer.start();
+    supervisor.setApiServerPort(apiPort);
+    // WP1-A: embedded browser pane (M2/M3/M5/M6/M7/M9-rule live in the
+    // manager + browser-decisions). Constructed AFTER the awaited start() so
+    // the M2 loopback filter blocks the ACTUAL bound API port, surviving the
+    // EADDRINUSE auto-increment — never a hardcoded 24678.
+    browserManager = new BrowserManager(() => mainWindow, apiPort);
+    registerBrowserIpc(browserManager);
     orchestration.start();                 // boot reconcile of orphaned runs
     supervisor.reconcile();
     console.log('App ready');

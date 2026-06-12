@@ -1,5 +1,7 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron';
 import type { IpcApi } from '../shared/types';
+import { BROWSER_CHANNELS } from '../shared/browser';
+import type { BrowserOpenRequest, BrowserTabState } from '../shared/browser';
 
 const api: IpcApi = {
   workspaces: {
@@ -137,6 +139,29 @@ const api: IpcApi = {
   notebooks: {
     ensureServer: () => ipcRenderer.invoke('notebook:ensure-server'),
     listKernelspecs: () => ipcRenderer.invoke('notebook:list-kernelspecs'),
+  },
+  // WP1-A — embedded browser pane, frozen WP1 contract (src/shared/browser.ts).
+  browser: {
+    createTab: (opts) => ipcRenderer.invoke(BROWSER_CHANNELS.createTab, opts),
+    closeTab: (tabId) => ipcRenderer.invoke(BROWSER_CHANNELS.closeTab, tabId),
+    navigate: (tabId, url) => ipcRenderer.invoke(BROWSER_CHANNELS.navigate, tabId, url),
+    goBack: (tabId) => ipcRenderer.invoke(BROWSER_CHANNELS.goBack, tabId),
+    goForward: (tabId) => ipcRenderer.invoke(BROWSER_CHANNELS.goForward, tabId),
+    reload: (tabId) => ipcRenderer.invoke(BROWSER_CHANNELS.reload, tabId),
+    stop: (tabId) => ipcRenderer.invoke(BROWSER_CHANNELS.stop, tabId),
+    setActiveTab: (tabId) => ipcRenderer.invoke(BROWSER_CHANNELS.setActiveTab, tabId),
+    setBounds: (bounds) => ipcRenderer.invoke(BROWSER_CHANNELS.setBounds, bounds),
+    setVisible: (visible) => ipcRenderer.invoke(BROWSER_CHANNELS.setVisible, visible),
+    onTabState: (callback) => {
+      const listener = (_event: any, state: BrowserTabState) => callback(state);
+      ipcRenderer.on(BROWSER_CHANNELS.tabState, listener);
+      return () => ipcRenderer.removeListener(BROWSER_CHANNELS.tabState, listener);
+    },
+    onOpenRequest: (callback) => {
+      const listener = (_event: any, request: BrowserOpenRequest) => callback(request);
+      ipcRenderer.on(BROWSER_CHANNELS.openRequest, listener);
+      return () => ipcRenderer.removeListener(BROWSER_CHANNELS.openRequest, listener);
+    },
   },
   onOpenFileTab: (callback) => {
     const listener = (_event: any, payload: any) => callback(payload);

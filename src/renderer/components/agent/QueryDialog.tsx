@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import type { Agent, QueryResult } from '../../../shared/types';
 import { useDashboardStore } from '../../stores/dashboard-store';
+import { useBrowserSuspension } from '../browser/useBrowserSuspension';
 
 interface QueryDialogProps {
   sourceAgent: Agent;
@@ -8,6 +9,8 @@ interface QueryDialogProps {
 }
 
 export default function QueryDialog({ sourceAgent, onClose }: QueryDialogProps) {
+  // The browser WebContentsView paints above this dialog — hide it while open.
+  useBrowserSuspension();
   const { agents, queryAgent } = useDashboardStore();
   const [targetId, setTargetId] = useState('');
   const [question, setQuestion] = useState('');

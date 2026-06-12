@@ -4,6 +4,8 @@ import { useDashboardStore } from '../../stores/dashboard-store';
 import AgentGrid from '../agent/AgentGrid';
 import AgentLaunchDialog from '../agent/AgentLaunchDialog';
 import FileViewerPanel from '../fileviewer/FileViewerPanel';
+import BrowserPanel from '../browser/BrowserPanel';
+import { useBrowserStore, ensureBrowserBridge } from '../../stores/browser-store';
 import type { AgentStatus } from '../../../shared/types';
 import * as Icons from 'lucide-react';
 import vscodeIcon from '../../assets/material-icons/vscode.svg';
@@ -42,17 +44,20 @@ const SUPERVISOR_STATUS_COLORS: Record<AgentStatus, { dot: string; border: strin
 };
 
 export default function MainContent() {
-  const { workspaces, selectedWorkspaceId, supervisorAgent, fileViewerOpen, openTabs, contextStats } = useDashboardStore(
+  const { workspaces, selectedWorkspaceId, supervisorAgent, fileViewerOpen, browserOpen, openTabs, contextStats } = useDashboardStore(
     useShallow((s) => ({
       workspaces: s.workspaces,
       selectedWorkspaceId: s.selectedWorkspaceId,
       supervisorAgent: s.supervisorAgent,
       fileViewerOpen: s.fileViewerOpen,
+      browserOpen: s.browserOpen,
       openTabs: s.openTabs,
       contextStats: s.contextStats,
     })),
   );
   const showFileViewer = useDashboardStore((s) => s.showFileViewer);
+  const showBrowser = useDashboardStore((s) => s.showBrowser);
+  const browserPaneAttention = useBrowserStore((s) => s.paneAttention);
   const loadSupervisor = useDashboardStore((s) => s.loadSupervisor);
   const launchSupervisor = useDashboardStore((s) => s.launchSupervisor);
   const setTerminalAgent = useDashboardStore((s) => s.setTerminalAgent);
@@ -71,9 +76,20 @@ export default function MainContent() {
 
   const swipeToFiles = useSwipe(() => showFileViewer(), 'left');
 
-  // File viewer takes over the center panel
+  // Subscribe the browser store to main-process tab events. MainContent is
+  // always mounted, so agent-opened tabs raise attention even while the pane
+  // is closed. No dep array: ensureBrowserBridge is an idempotent no-op once
+  // subscribed, and retrying every render covers preload arriving late.
+  useEffect(() => {
+    ensureBrowserBridge();
+  });
+
+  // Center-mode dispatch — file viewer wins over the browser pane.
   if (fileViewerOpen) {
     return <FileViewerPanel />;
+  }
+  if (browserOpen) {
+    return <BrowserPanel />;
   }
 
   if (!workspace) {
@@ -198,6 +214,16 @@ export default function MainContent() {
               >
                 <Icons.FileText className="w-4 h-4" />
                 Files{hasOpenTabs ? ` (${workspaceTabCount})` : ''}
+              </button>
+              <button
+                onClick={() => showBrowser()}
+                className={`ui-btn ui-btn-outline px-3 py-1.5 text-[13px] font-medium ${
+                  browserPaneAttention ? 'ui-btn-warning animate-pulse' : ''
+                }`}
+                title={browserPaneAttention ? 'Browser — an agent opened a page for you' : 'Open browser pane'}
+              >
+                <Icons.Globe className="w-4 h-4" />
+                Browser
               </button>
               <button
                 onClick={() => window.api.workspaces.openInVSCode(workspace.id)}

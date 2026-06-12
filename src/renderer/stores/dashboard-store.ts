@@ -113,6 +113,9 @@ interface DashboardState {
   openTabs: ColoredFileTab[];
   activeTabId: string | null;
   fileViewerOpen: boolean;
+  // Browser pane center-mode flag (WP1-B). Precedence: file viewer wins —
+  // opening either pane closes the other.
+  browserOpen: boolean;
   tabEditState: Record<string, TabEditState>;
 
   // Actions
@@ -170,6 +173,8 @@ interface DashboardState {
   hideFileViewer: () => void;
   showFileViewer: () => void;
   toggleFileViewer: () => void;
+  showBrowser: () => void;
+  hideBrowser: () => void;
 
   // Backward-compat shims
   openFileViewer: (filePath: string, agentId: string) => void;
@@ -223,6 +228,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
   openTabs: [],
   activeTabId: null,
   fileViewerOpen: false,
+  browserOpen: false,
   tabEditState: {},
 
   openTab: (filePath, rootDirectory, pathType, agentId?, workspaceId?) => {
@@ -254,6 +260,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
       openTabs: [...state.openTabs, tab],
       activeTabId: tab.id,
       fileViewerOpen: true,
+      browserOpen: false,
     }));
   },
 
@@ -265,7 +272,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
     const tabsForRoot = openTabs.filter((t) => t.rootDirectory === rootDirectory);
     if (tabsForRoot.length > 0) {
       const currentActive = tabsForRoot.find((t) => t.id === activeTabId);
-      set({ activeTabId: currentActive?.id || tabsForRoot[0].id, fileViewerOpen: true });
+      set({ activeTabId: currentActive?.id || tabsForRoot[0].id, fileViewerOpen: true, browserOpen: false });
       return;
     }
 
@@ -285,6 +292,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
       openTabs: [...state.openTabs, tab],
       activeTabId: tab.id,
       fileViewerOpen: true,
+      browserOpen: false,
     }));
   },
 
@@ -624,6 +632,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
       const activeBelongs = wsTabs.some((t) => t.id === activeTabId);
       set({
         fileViewerOpen: true,
+        browserOpen: false,
         activeTabId: activeBelongs ? activeTabId : wsTabs[0].id,
       });
     } else {
@@ -641,6 +650,11 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
       get().showFileViewer();
     }
   },
+
+  // Browser pane (WP1-B) — mirrors show/hideFileViewer. Opening either center
+  // mode closes the other; the file viewer wins when both flags are set.
+  showBrowser: () => set({ browserOpen: true, fileViewerOpen: false }),
+  hideBrowser: () => set({ browserOpen: false }),
 
   // Backward-compat shim: openFileViewer calls openTab
   openFileViewer: (filePath, agentId) => {
