@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en"
+      data-plan-id="plan-2026-06-09-feature-flags"
+      data-plan-name="Feature-flag system"
+      data-run-state="drafting"
+      data-schema-version="2"
+      data-created-at="2026-06-09T16:00:00Z">
+<head>
+  <meta charset="utf-8">
+  <title>Feature-flag system</title>
+</head>
+<body>
+
+  <header data-role="plan-header">
+    <h1>Feature-flag system</h1>
+    <p>Add a feature-flag system: schema, evaluation engine, admin UI.</p>
+    <aside data-role="supervisor-attendance"></aside>
+  </header>
+
+  <nav data-role="tabs">
+    <button data-tab-target="framing" data-active="true">Framing</button>
+    <button data-tab-target="implementation">Plan</button>
+    <button data-tab-target="execution-log">Execution</button>
+  </nav>
+
+  <section data-tab="framing" data-active="true">
+    <section data-role="zone" data-zone="success-criteria">
+      <h3>Success criteria</h3>
+      <p>Flags evaluate in under a millisecond at p99 with no added network hop.</p>
+    </section>
+    <section data-role="zone" data-zone="scope">
+      <h3>Scope</h3>
+      <p>Schema, evaluation engine, admin UI. No A/B-test stats, no mobile SDKs.</p>
+    </section>
+    <section data-role="zone" data-zone="constraints">
+      <h3>Constraints</h3>
+      <p>No new external SaaS dependencies. Three engineers, six weeks.</p>
+    </section>
+    <section data-role="zone" data-zone="unknown">
+      <h3>Assumptions</h3>
+    </section>
+  </section>
+
+  <section data-tab="implementation" hidden>
+
+    <section data-role="phase" data-phase-id="p1">
+      <h2>Phase 1: Flag schema and storage</h2>
+      <p>Define the flag model and decide where flags live.</p>
+
+      <section data-role="zone" data-zone="phase-goal">
+        <h3>Phase goal</h3>
+        <p>A migrated <code>feature_flags</code> table with a typed accessor library.</p>
+      </section>
+
+      <section data-role="zone" data-zone="alternatives-considered">
+        <h3>Alternatives considered</h3>
+        <p>Config-file-in-repo was considered; rejected because support needs
+           runtime kill switches without a deploy.</p>
+      </section>
+
+      <section data-role="zone" data-zone="recommendations">
+        <h3>Recommendations</h3>
+        <article data-role="recommendation" data-rec-id="rec-cache-ttl"
+                 data-author="groupthink-claude" data-emitted-at="2026-06-09T17:30:00Z">
+          <h4>Use a 30-second poll with push-assisted invalidation</h4>
+          <p>Poll the flags table every 30 seconds as the baseline, and layer a
+             LISTEN/NOTIFY push channel on top so kill switches propagate in under a
+             second without making the push path load-bearing.</p>
+        </article>
+      </section>
+
+      <section data-role="zone" data-zone="open-questions">
+        <h3>Open questions</h3>
+        <article data-role="open-question" data-question-id="q1"
+                 data-status="open" data-resolved-by="">
+          <p>What cache invalidation latency is acceptable for kill switches?</p>
+        </article>
+      </section>
+
+      <article data-role="task" data-task-id="t1.1"
+               data-reversibility="high" data-blast-radius="low">
+        <h3>Create feature_flags migration</h3>
+        <p>Table with key, type, rules JSONB, default, lifecycle state, audit columns.</p>
+      </article>
+
+      <article data-role="task" data-task-id="t1.2"
+               data-reversibility="high" data-blast-radius="low">
+        <h3>Typed accessor library</h3>
+        <p>Generated types from the schema; read-through cache stub.</p>
+      </article>
+    </section>
+
+    <section data-role="phase" data-phase-id="p2">
+      <h2>Phase 2: Evaluation engine</h2>
+      <p>Deterministic bucketing and sub-millisecond evaluation.</p>
+
+      <section data-role="zone" data-zone="phase-goal">
+        <h3>Phase goal</h3>
+        <p>An <code>evaluate(flagKey, context)</code> library with local cache.</p>
+      </section>
+
+      <section data-role="zone" data-zone="alternatives-considered">
+        <h3>Alternatives considered</h3>
+      </section>
+
+      <section data-role="zone" data-zone="recommendations">
+        <h3>Recommendations</h3>
+      </section>
+
+      <section data-role="zone" data-zone="open-questions">
+        <h3>Open questions</h3>
+      </section>
+
+      <article data-role="task" data-task-id="t2.1"
+               data-reversibility="medium" data-blast-radius="medium">
+        <h3>Bucketing algorithm</h3>
+        <p>Hash of user ID + flag salt; property tests for distribution.</p>
+      </article>
+    </section>
+
+  </section>
+
+  <section data-tab="execution-log" hidden>
+    <ol data-role="execution-events"></ol>
+  </section>
+
+</body>
+</html>

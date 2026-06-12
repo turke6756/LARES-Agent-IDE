@@ -89,6 +89,11 @@ body {
   background: rgba(255, 255, 255, 0.06);
 }
 
+/* Space-bar hold: every tree row lights up as if hovered */
+.tree-row-shaded {
+  background: rgba(255, 255, 255, 0.06);
+}
+
 button,
 input,
 textarea,
@@ -727,6 +732,10 @@ select {
 
 /* White-opacity hover is invisible on paper — use a clear warm ink wash */
 .light .tree-row-hover:hover {
+  background: rgba(72, 60, 38, 0.12);
+}
+
+.light .tree-row-shaded {
   background: rgba(72, 60, 38, 0.12);
 }
 

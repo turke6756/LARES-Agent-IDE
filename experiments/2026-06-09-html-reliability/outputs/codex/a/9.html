@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html data-plan-id="plan-2026-06-09-feature-flags" data-plan-name="Feature Flag System Implementation Plan" data-run-state="drafting" data-schema-version="2" data-created-at="2026-06-09T09:00:00-07:00">
+<head>
+  <meta charset="utf-8">
+  <title>Feature Flag System Implementation Plan</title>
+</head>
+<body>
+  <header data-role="plan-header">
+    <h1>Feature Flag System Implementation Plan</h1>
+    <p>Plan a three-phase feature-flag system that supports dark launches, gradual rollouts, emergency kill switches, typed backend access, audited changes, and an authenticated admin experience within roughly six weeks for a team of three engineers.</p>
+    <aside data-role="supervisor-attendance"></aside>
+  </header>
+
+  <nav data-role="tabs">
+    <button data-tab-target="framing" data-active="true">Framing</button>
+    <button data-tab-target="implementation">Implementation</button>
+    <button data-tab-target="decisions">Decisions</button>
+    <button data-tab-target="risks">Risks</button>
+    <button data-tab-target="research">Research</button>
+    <button data-tab-target="experiments">Experiments</button>
+    <button data-tab-target="reviews">Reviews</button>
+    <button data-tab-target="execution-log">Execution Log</button>
+    <button data-tab-target="retrospective">Retrospective</button>
+  </nav>
+
+  <section data-tab="framing" data-active="true">
+    <section data-role="zone" data-zone="success-criteria">
+      <h3>Success Criteria</h3>
+      <ul>
+        <li>Engineering can merge and deploy code paths guarded by typed feature flags without exposing unfinished behavior by default.</li>
+        <li>Product can configure percentage and multivariate rollouts by environment, user, and organization without a deploy.</li>
+        <li>Support and admins can disable a misbehaving production feature within minutes through the existing authenticated product surface.</li>
+        <li>Backend request handling does not add a network hop for flag evaluation, and cached evaluations meet a p99 latency target under one millisecond.</li>
+        <li>Every flag change is persisted with actor, timestamp, before and after values, and target environment for auditability.</li>
+        <li>The first release includes SDK support for both backend languages in the monorepo and a JSON-over-HTTP endpoint for remaining consumers.</li>
+      </ul>
+    </section>
+
+    <section data-role="zone" data-zone="scope">
+      <h3>Scope</h3>
+      <p>In scope: persistent flag schema, migrations, seed data, audit history, typed accessor libraries, deterministic rollout evaluation, local in-memory caching, cache invalidation, telemetry sampling, backend SDKs, authenticated HTTP evaluation endpoint, and an admin UI for creating, editing, searching, previewing, and archiving flags.</p>
+      <p>Out of scope: full approval workflows, A/B-test statistics, scheduled rollout automation, mobile SDKs, external SaaS flag providers, and request-path evaluation that depends on a remote service call.</p>
+    </section>
+
+    <section data-role="zone" data-zone="constraints">
+      <h3>Constraints</h3>
+      <ul>
+        <li>No new external SaaS dependencies are allowed.</li>
+        <li>The evaluation path must not add a network hop to normal request handling.</li>
+        <li>All admin and API surfaces must sit behind the existing authentication middleware.</li>
+        <li>The plan assumes three engineers and approximately six calendar weeks.</li>
+        <li>Production edits require role-based access: only flag owners and admins may edit production values.</li>
+        <li>Audit history is required, but approval workflows are deliberately deferred.</li>
+      </ul>
+    </section>
+
+    <section data-role="zone" data-zone="assumptions">
+      <h3>Assumptions</h3>
+      <article data-role="assumption" data-assumption-id="a-primary-postgres-available" data-status="open" data-resolved-by="" data-invalidates-if="The product cannot add new tables to the primary Postgres database or cannot safely run migrations in the six-week window.">
+        <h4>Primary Postgres Can Store Flag State</h4>
+        <p>The product already has a reliable primary Postgres deployment, migration workflow, and operational backup story suitable for feature flag metadata and audit events.</p>
+      </article>
+      <article data-role="assumption" data-assumption-id="a-existing-authz-can-extend" data-status="open" data-resolved-by="" data-invalidates-if="The existing auth middleware cannot expose user roles, ownership, or admin status to the admin UI and flag APIs.">
+        <h4>Existing Authorization Can Express Flag Roles</h4>
+        <p>The current authorization model can be extended or reused to distinguish admins, flag owners, and read-only users without introducing a separate identity system.</p>
+      </article>
+      <article data-role="assumption" data-assumption-id="a-two-backend-languages-identifiable" data-status="open" data-resolved-by="" data-invalidates-if="The monorepo has more than two production backend languages that require first-class SDK support for launch.">
+        <h4>Backend SDK Targets Are Known</h4>
+        <p>The two backend languages in the monorepo have stable package patterns and test harnesses that allow SDK work to be delivered inside the same release plan.</p>
+      </article>
+    </section>
+  </section>
+
+  <section data-tab="implementation" hidden>
+    <section data-role="phase" data-phase-id="p1-schema-storage">
+      <h2>Phase 1: Flag Schema and Storage</h2>
+      <p>Build the durable source of truth for flags before any runtime behavior depends on them. This phase establishes the data model, audit trail, migrations, seed data, and typed access primitives needed by later phases.</p>
+
+      <section data-role="zone" data-zone="phase-goal">
+        <h3>Phase Goal</h3>
+        <p>Create a reliable, auditable feature flag storage layer in primary Postgres with a read-through cache and typed accessors that can represent boolean, percentage rollout, and multivariate flags across users, organizations, and environments.</p>
+      </section>
+
+      <section data-role="zone" data-zone="alternatives-considered">
+        <h3>Alternatives Considered</h3>
+        <p><strong>Config files in repository:</strong> simple review flow and versioning, but too slow for support kill switches and product-controlled rollouts because each change requires a deploy.</p>
+        <p><strong>External SaaS provider:</strong> mature functionality, but rejected because the constraints disallow new external SaaS dependencies.</p>
+        <p><strong>Primary Postgres with cache:</strong> selected because it supports authenticated admin writes, durable audit history, transactional migrations, and local cached reads without adding a request-path network hop.</p>
+      </section>
+
+      <section data-role="zone" data-zone="recommendations">
+        <h3>Recommendations</h3>
+        <p>Use a normalized Postgres-backed design with a compact JSONB rule document for targeting logic, explicit environment override rows, and an append-only audit table. Keep the storage model strict enough for validation while allowing rule shapes to evolve without a migration for every targeting enhancement.</p>
+      </section>
+
+      <section data-role="zone" data-zone="open-questions">
+        <h3>Open Questions</h3>
+        <article data-role="open-question" data-question-id="q-p1-owner-source" data-status="open" data-resolved-by="">
+          <h4>How Should Flag Ownership Be Sourced?</h4>
+          <p>Decide whether the owner field references individual users, teams, service ownership metadata, or a combination. This affects production edit authorization and search filters in the admin UI.</p>
+        </article>
+      </section>
+
+      <article data-role="task" data-task-id="t-p1-model-schema" data-reversibility="medium" data-blast-radius="medium">
+        <h3>Define the Flag Data Model</h3>
+        <p>Create the canonical schema for flag key, description, owner, type, lifecycle state, default value, salt, targeting rules, variants, environment overrides, timestamps, and actor metadata. Include validation rules for unique keys, valid variant weights, valid percentage ranges, and archived flag immutability expectations.</p>
+      </article>
+
+      <article data-role="task" data-task-id="t-p1-postgres-migrations" data-reversibility="medium" data-blast-radius="medium">
+        <h3>Add Postgres Migrations</h3>
+        <p>Add migrations for <code>feature_flags</code>, <code>feature_flag_environment_values</code>, and <code>feature_flag_audit_events</code>. Index lookups by key, environment, lifecycle state, owner, and updated timestamp. Ensure audit rows are append-only and include enough before and after data to reconstruct a change.</p>
+      </article>
+
+      <article data-role="task" data-task-id="t-p1-read-through-cache" data-reversibility="high" data-blast-radius="low">
+        <h3>Introduce the Read-Through Cache Contract</h3>
+        <p>Define the cache abstraction that later evaluation code will use: fetch all active flags for an environment, fetch a single flag by key, expose version or updated-at metadata, and tolerate stale reads within an explicitly documented window. The first implementation may be process-local with clear extension points for push or poll invalidation.</p>
+      </article>
+
+      <article data-role="task" data-task-id="t-p1-seed-data" data-reversibility="high" data-blast-radius="low">
+        <h3>Create Seed Flags and Fixtures</h3>
+        <p>Add representative seed data for a boolean kill switch, a ten-percent rollout, and a multivariate flag. Include staging and production values so migrations, accessors, evaluation tests, and the UI can share realistic fixtures.</p>
+      </article>
+
+      <article data-role="task" data-task-id="t-p1-typed-accessors" data-reversibility="medium" data-blast-radius="medium">
+        <h3>Build Typed Accessor Library</h3>
+        <p>Create typed accessors for loading, validating, and serializing flags in the backend language that owns persistence. Expose clear domain types for flag definitions, targeting rules, variants, environments, lifecycle states, and audit event creation.</p>
+      </article>
+
+      <article data-role="task" data-task-id="t-p1-audit-writes" data-reversibility="medium" data-blast-radius="medium">
+        <h3>Implement Audit Event Recording</h3>
+        <p>Wrap create, update, archive, and environment override changes so every mutation writes an audit event in the same transaction. Capture actor, reason if provided, request source, previous value, new value, and affected environment.</p>
+      </article>
+    </section>
+
+    <section data-role="phase" data-phase-id="p2-evaluation-engine">
+      <h2>Phase 2: Evaluation Engine</h2>
+      <p>Build the runtime path that turns stored flag definitions into deterministic variants. This phase prioritizes latency, determinism, cache correctness, telemetry, and SDK ergonomics.</p>
+
+      <section data-role="zone" data-zone="phase-goal">
+        <h3>Phase Goal</h3>
+        <p>Deliver a local evaluation library with deterministic bucketing, well-defined rule precedence, environment inheritance, sampled telemetry, backend SDKs for both monorepo languages, and a JSON-over-HTTP endpoint for consumers that cannot embed an SDK.</p>
+      </section>
+
+      <section data-role="zone" data-zone="alternatives-considered">
+        <h3>Alternatives Considered</h3>
+        <p><strong>Central sidecar-only evaluation:</strong> rejected for normal request handling because it risks adding a network hop, even if local to the host.</p>
+        <p><strong>Database lookup per evaluation:</strong> rejected because it cannot reliably meet the p99 target and couples request latency to database health.</p>
+        <p><strong>Embedded SDK with in-memory cache:</strong> selected for request-path evaluation because it keeps reads local, allows deterministic behavior across languages, and still supports an HTTP endpoint for non-critical or non-embedded consumers.</p>
+      </section>
+
+      <section data-role="zone" data-zone="recommendations">
+        <h3>Recommendations</h3>
+        <p>Implement one conformance-test suite shared by both SDKs. Treat the evaluator as pure logic over an immutable snapshot of flag definitions and context, then layer cache refresh, invalidation, and telemetry around it.</p>
+      </section>
+
+      <section data-role="zone" data-zone="open-questions">
+        <h3>Open Questions</h3>
+        <article data-role="open-question" data-question-id="q-p2-invalidation-mode" data-status="open" data-resolved-by="">
+          <h4>Should Cache Invalidation Start With Push or Poll?</h4>
+          <p>Choose whether the first release uses Postgres notifications, an internal pub-sub mechanism, periodic polling, or a hybrid. The decision should balance freshness, operational complexity, and compatibility with existing infrastructure.</p>
+        </article>
+      </section>
+
+      <article data-role="task" data-task-id="t-p2-evaluator-core" data-reversibility="medium" data-blast-radius="high">
+        <h3>Implement Core Evaluation Semantics</h3>
+        <p>Build <code>evaluate(flagKey, context) -&gt; variant</code> as a pure function over a flag snapshot. Define missing flag behavior, archived flag behavior, default fallback behavior, rule ordering, first-match semantics, and explicit handling for user ID, organization, and environment targeting.</p>
+      </article>
+
+      <article data-role="task" data-task-id="t-p2-deterministic-bucketing" data-reversibility="medium" data-blast-radius="high">
+        <h3>Add Deterministic Bucketing</h3>
+        <p>Use a stable hash of user ID plus flag salt to assign percentage rollout buckets. Ensure bucket assignments are stable across SDK languages, insensitive to process restarts, and validated by golden test vectors for boolean, percentage, and multivariate flags.</p>
+      </article>
+
+      <article data-role="task" data-task-id="t-p2-environment-inheritance" data-reversibility="medium" data-blast-radius="medium">
+        <h3>Implement Environment Inheritance</h3>
+        <p>Define production as the base environment and allow staging to inherit production defaults unless an explicit staging override exists. Make inheritance visible in returned evaluation metadata so the UI and logs can distinguish direct values from inherited values.</p>
+      </article>
+
+      <article data-role="task" data-task-id="t-p2-cache-refresh" data-reversibility="medium" data-blast-radius="high">
+        <h3>Build Local Snapshot Cache and Invalidation</h3>
+        <p>Load active flags into an immutable in-memory snapshot per process. Add polling or push invalidation, version checks, stale snapshot metrics, and a safe fallback policy if refresh fails. The request path should read only from the local snapshot.</p>
+      </article>
+
+      <article data-role="task" data-task-id="t-p2-sdks-http-endpoint" data-reversibility="medium" data-blast-radius="medium">
+        <h3>Ship Backend SDKs and HTTP Endpoint</h3>
+        <p>Expose idiomatic SDK functions for both backend languages, including typed helpers for booleans and variants. Add a JSON-over-HTTP endpoint for other consumers behind existing auth, with clear documentation that normal latency-sensitive request paths should prefer embedded SDK evaluation.</p>
+      </article>
+
+      <article data-role="task" data-task-id="t-p2-telemetry" data-reversibility="high" data-blast-radius="medium">
+        <h3>Emit Sampled Evaluation Telemetry</h3>
+        <p>Emit sampled events containing flag key, variant, environment, match reason, SDK language, service name, and non-sensitive context identifiers. Avoid logging raw targeting payloads that could contain personal data. Add counters for cache age, evaluation errors, and unknown flags.</p>
+      </article>
+    </section>
+
+    <section data-role="phase" data-phase-id="p3-admin-ui">
+      <h2>Phase 3: Admin UI</h2>
+      <p>Build the authenticated operational surface for product, engineering, and support. This phase turns the storage and evaluation foundations into controlled workflows for managing flags safely.</p>
+
+      <section data-role="zone" data-zone="phase-goal">
+        <h3>Phase Goal</h3>
+        <p>Deliver an authenticated dashboard where users can create, edit, search, preview, audit, and archive flags, with per-environment overrides and production edit restrictions for owners and admins.</p>
+      </section>
+
+      <section data-role="zone" data-zone="alternatives-considered">
+        <h3>Alternatives Considered</h3>
+        <p><strong>CLI-only management:</strong> useful for engineers but insufficient for product and support workflows.</p>
+        <p><strong>Admin UI generated directly from database forms:</strong> quick to build but too easy to bypass domain validation, preview behavior, and permission rules.</p>
+        <p><strong>Purpose-built dashboard:</strong> selected because it can present lifecycle state, environment inheritance, rollout previews, audit history, and role-based controls in one coherent workflow.</p>
+      </section>
+
+      <section data-role="zone" data-zone="recommendations">
+        <h3>Recommendations</h3>
+        <p>Use existing product layout, auth middleware, API patterns, and role primitives. Keep creation and editing forms schema-driven from the same validation rules used by backend persistence to reduce drift.</p>
+      </section>
+
+      <section data-role="zone" data-zone="open-questions">
+        <h3>Open Questions</h3>
+        <article data-role="open-question" data-question-id="q-p3-production-edit-copy" data-status="open" data-resolved-by="">
+          <h4>Should Production Edits Require a Reason Field?</h4>
+          <p>Audit history can store an optional reason, but the team should decide whether production changes require a reason to improve later incident review without creating a formal approval workflow.</p>
+        </article>
+      </section>
+
+      <article data-role="task" data-task-id="t-p3-dashboard-list" data-reversibility="high" data-blast-radius="low">
+        <h3>Build Flag Dashboard and Search</h3>
+        <p>Create a dashboard page listing flag key, description, owner, type, lifecycle state, updated timestamp, and environment summary. Add search and filters for key, owner, type, state, and environment so support can quickly find kill switches.</p>
+      </article>
+
+      <article data-role="task" data-task-id="t-p3-create-edit-forms" data-reversibility="medium" data-blast-radius="medium">
+        <h3>Create Flag Editor Workflows</h3>
+        <p>Implement create and edit screens for boolean, percentage rollout, and multivariate flags. Validate keys, defaults, targeting rules, variant weights, lifecycle state transitions, and environment overrides before submitting changes.</p>
+      </article>
+
+      <article data-role="task" data-task-id="t-p3-rollout-preview" data-reversibility="high" data-blast-radius="low">
+        <h3>Add Rollout Slider and Bucketing Preview</h3>
+        <p>Add a percentage rollout slider with live preview showing sample users, bucket boundaries, and expected inclusion changes before save. Use the same deterministic bucketing implementation or shared test vectors as the evaluation engine.</p>
+      </article>
+
+      <article data-role="task" data-task-id="t-p3-rbac" data-reversibility="medium" data-blast-radius="high">
+        <h3>Enforce Role-Based Access</h3>
+        <p>Apply existing auth middleware and authorization checks so all authenticated users can view permitted flag data, but only flag owners and admins can edit production values. Ensure server-side checks mirror UI affordances and are covered by tests.</p>
+      </article>
+
+      <article data-role="task" data-task-id="t-p3-audit-history-view" data-reversibility="high" data-blast-radius="low">
+        <h3>Expose Audit History</h3>
+        <p>Display audit events for each flag with actor, timestamp, environment, change type, before and after values, and reason if available. Keep the view readable for incident review and support handoff.</p>
+      </article>
+
+      <article data-role="task" data-task-id="t-p3-archive-flow" data-reversibility="high" data-blast-radius="medium">
+        <h3>Implement Archive Flow</h3>
+        <p>Add an archive action that removes flags from active editing and evaluation lists while preserving historical records. Require confirmation when archiving active production flags and write an audit event for the transition.</p>
+      </article>
+    </section>
+  </section>
+
+  <section data-tab="decisions" hidden>
+    <article data-role="decision" data-decision-id="d-storage-postgres-read-cache" data-decided-at="2026-06-09T09:00:00-07:00" data-decided-by="planner">
+      <h3>Use Primary Postgres With a Read-Through Cache for Flag Storage</h3>
+      <p>Flags should live in a new Postgres-backed storage model with a process-local read-through cache. This satisfies no-SaaS constraints, supports audited admin writes, allows support-driven emergency changes without deploys, and keeps request-path evaluation local once snapshots are loaded.</p>
+      <p data-role="rationale-against">A config-file-in-repo approach gives strong code review and simple history, but it fails the kill-switch and product rollout requirements because changes would depend on pull requests and deployments.</p>
+    </article>
+  </section>
+
+  <section data-tab="risks" hidden>
+    <article data-role="risk" data-risk-id="r-cache-staleness" data-status="open" data-resolved-by="">
+      <h3>Cache Staleness Could Delay Emergency Kill Switches</h3>
+      <p>If cache invalidation is too slow or unreliable, support may believe a feature is disabled while some processes continue serving the old snapshot. Mitigation: define a freshness SLO, expose cache age metrics, include manual refresh hooks, and test invalidation failure modes before launch.</p>
+    </article>
+    <article data-role="risk" data-risk-id="r-cross-language-inconsistency" data-status="open" data-resolved-by="">
+      <h3>SDKs Could Evaluate the Same Flag Differently</h3>
+      <p>Different hash implementations, JSON parsing behavior, or rule ordering bugs across backend languages could split traffic incorrectly. Mitigation: maintain shared golden test vectors and run conformance tests in both SDK packages.</p>
+    </article>
+    <article data-role="risk" data-risk-id="r-permission-misconfiguration" data-status="open" data-resolved-by="">
+      <h3>Production Edit Permissions Could Be Too Broad</h3>
+      <p>Incorrect role checks could let non-owners change production behavior. Mitigation: enforce authorization server-side, add explicit tests for owner, admin, and read-only users, and make audit history visible from the first release.</p>
+    </article>
+  </section>
+
+  <section data-tab="research" hidden>
+  </section>
+
+  <section data-tab="experiments" hidden>
+  </section>
+
+  <section data-tab="reviews" hidden>
+  </section>
+
+  <section data-tab="execution-log" hidden>
+    <ol data-role="execution-events"></ol>
+  </section>
+
+  <section data-tab="retrospective" hidden>
+    <section data-role="zone" data-zone="what-shipped">
+      <h3>What Shipped</h3>
+    </section>
+    <section data-role="zone" data-zone="deviations-from-plan">
+      <h3>Deviations From Plan</h3>
+    </section>
+    <section data-role="zone" data-zone="what-we-learned">
+      <h3>What We Learned</h3>
+    </section>
+    <section data-role="zone" data-zone="followup-plans">
+      <h3>Followup Plans</h3>
+    </section>
+  </section>
+</body>
+</html>

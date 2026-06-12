@@ -1,0 +1,673 @@
+<!DOCTYPE html>
+<html lang="en"
+      data-plan-id="plan-2026-06-09-feature-flags"
+      data-plan-name="Feature Flag System"
+      data-run-state="drafting"
+      data-schema-version="2"
+      data-created-at="2026-06-09T00:00:00Z">
+<head>
+  <meta charset="utf-8">
+  <title>Feature Flag System</title>
+  <link rel="stylesheet" href="../.dashboard/plan-styles/plan.css">
+</head>
+<body>
+
+  <header data-role="plan-header">
+    <h1>Feature Flag System</h1>
+    <p>Add a first-party feature-flag system so engineering can ship code dark, product can run gradual rollouts,
+       and support can kill misbehaving features without a deploy. Three phases over six weeks: flag schema and storage,
+       evaluation engine, and admin UI. No new external SaaS dependencies; evaluation must not add a network hop.</p>
+    <aside data-role="supervisor-attendance"></aside>
+  </header>
+
+  <nav data-role="tabs">
+    <button data-tab-target="framing" data-active="true">Framing</button>
+    <button data-tab-target="implementation">Plan</button>
+    <button data-tab-target="decisions">Decisions</button>
+    <button data-tab-target="risks">Risks</button>
+    <button data-tab-target="research">Research</button>
+    <button data-tab-target="experiments">Experiments</button>
+    <button data-tab-target="reviews">Reviews</button>
+    <button data-tab-target="execution-log">Execution</button>
+    <button data-tab-target="retrospective">Retrospective</button>
+  </nav>
+
+  <!-- ─── Framing tab ─── -->
+  <section data-tab="framing" data-active="true">
+
+    <section data-role="zone" data-zone="success-criteria">
+      <h3>Success criteria</h3>
+      <ul>
+        <li>Any engineer can create, target, and archive a flag without a deploy or database migration.</li>
+        <li><code>evaluate(flagKey, context)</code> returns the correct variant in under 1 ms at p99 under production load (no extra network hop).</li>
+        <li>Percentage rollouts produce deterministic bucketing: the same user always gets the same variant for a given flag.</li>
+        <li>A support engineer can disable any flag in production within 30 seconds via the admin UI without touching code.</li>
+        <li>Every flag change (create, edit, archive, override) appears in the audit history with actor, timestamp, and diff.</li>
+        <li>Role-based access prevents non-owner, non-admin users from editing production flag values.</li>
+        <li>Both backend languages in the monorepo have typed SDK access; all other callers can use the JSON-over-HTTP endpoint.</li>
+      </ul>
+    </section>
+
+    <section data-role="zone" data-zone="scope">
+      <h3>Scope</h3>
+      <h4>In scope</h4>
+      <ul>
+        <li>Flag model: key, description, owner, type (boolean / percentage rollout / multivariate), targeting rules (user ID, org, environment), default value, lifecycle state (active / archived).</li>
+        <li>Storage: new <code>feature_flags</code> table in the primary Postgres instance plus a read-through in-process cache.</li>
+        <li>Database migrations and seed data for a set of bootstrap flags.</li>
+        <li>Typed accessor library for both backend languages.</li>
+        <li>Audit history table logging all flag mutations.</li>
+        <li>Evaluation engine as an in-process library (not a sidecar) with local in-memory cache and push/poll invalidation.</li>
+        <li>JSON-over-HTTP evaluation endpoint for non-native callers, protected by existing auth middleware.</li>
+        <li>Sampled telemetry event emitted on every evaluation.</li>
+        <li>Admin dashboard: create, edit, search, archive flags; per-environment overrides; percentage-rollout slider with live bucketing preview; audit history view; role-based access control.</li>
+      </ul>
+      <h4>Out of scope</h4>
+      <ul>
+        <li>A/B-test statistical analysis.</li>
+        <li>Scheduled (time-based) rollouts.</li>
+        <li>Mobile SDKs.</li>
+        <li>Full approval/change-request workflow for flag edits.</li>
+        <li>Any new external SaaS (no LaunchDarkly, Split, Flagsmith, etc.).</li>
+      </ul>
+    </section>
+
+    <section data-role="zone" data-zone="constraints">
+      <h3>Constraints</h3>
+      <ul>
+        <li><strong>No new external SaaS.</strong> All components must run in the existing infrastructure.</li>
+        <li><strong>No extra network hop in the evaluation path.</strong> The evaluation library must be in-process; the HTTP endpoint is a secondary path for non-native callers only.</li>
+        <li><strong>Behind existing auth middleware.</strong> All API and UI routes must reuse the current auth layer; no new auth surface.</li>
+        <li><strong>Team size:</strong> three engineers, approximately six weeks.</li>
+        <li><strong>Evaluation latency:</strong> p99 under 1 ms including cache lookup.</li>
+        <li><strong>Audit history is required; approval workflow is not.</strong></li>
+      </ul>
+    </section>
+
+    <section data-role="zone" data-zone="assumptions">
+      <h3>Assumptions</h3>
+
+      <article data-role="assumption"
+               data-assumption-id="a1"
+               data-status="open"
+               data-resolved-by=""
+               data-invalidates-if="the monorepo uses more than two backend languages">
+        <p>The monorepo has exactly two backend languages that need native SDK support. A third would require an additional SDK implementation not currently scoped.</p>
+      </article>
+
+      <article data-role="assumption"
+               data-assumption-id="a2"
+               data-status="open"
+               data-resolved-by=""
+               data-invalidates-if="the primary Postgres instance cannot sustain the additional read load from flag polling">
+        <p>The primary Postgres instance has sufficient headroom to serve flag reads at the polling interval without degrading application query latency. A dedicated read replica is not required.</p>
+      </article>
+
+      <article data-role="assumption"
+               data-assumption-id="a3"
+               data-status="open"
+               data-resolved-by=""
+               data-invalidates-if="the existing auth middleware cannot express flag-owner vs admin roles">
+        <p>The existing auth middleware and role model can be extended to express the "flag owner" and "flag admin" roles needed for production edit gating, without a separate identity service change.</p>
+      </article>
+
+      <article data-role="assumption"
+               data-assumption-id="a4"
+               data-status="open"
+               data-resolved-by=""
+               data-invalidates-if="product requires cross-environment flag promotion workflows at launch">
+        <p>At launch, environment inheritance (staging defaults from production) is a read-time fallback, not a promotion workflow. Manual per-environment overrides in the UI are sufficient.</p>
+      </article>
+
+    </section>
+  </section>
+
+  <!-- ─── Implementation tab ─── -->
+  <section data-tab="implementation" hidden>
+
+    <!-- ═══ Phase 1 ═══ -->
+    <section data-role="phase" data-phase-id="p1">
+      <h2>Phase 1: Flag schema and storage (weeks 1–2)</h2>
+      <p>Establish the canonical data model, persistence layer, migration story, seed data, and typed accessor libraries.
+         All downstream phases depend on this foundation. Phase 1 ends when both backend SDKs can read flags from
+         Postgres through the cache and the audit log records every write.</p>
+
+      <section data-role="zone" data-zone="phase-goal">
+        <h3>Phase goal</h3>
+        <p>Deliver a stable, versioned flag schema in Postgres with a read-through in-process cache, a migration
+           and seed-data workflow, a typed accessor library for each backend language, and an append-only audit
+           history table. After Phase 1, engineers can define flags in the database and read them from application
+           code; the evaluation logic itself comes in Phase 2.</p>
+      </section>
+
+      <section data-role="zone" data-zone="alternatives-considered">
+        <h3>Alternatives considered</h3>
+        <p><strong>Config files in the repository.</strong> Flags as YAML/JSON committed to the repo avoids a new
+           database table and gives a natural audit trail via git. Rejected because it requires a deploy to change
+           any flag value, which defeats the core "kill without a deploy" requirement.</p>
+        <p><strong>Separate dedicated flags database.</strong> A second Postgres instance (or a Redis-primary model)
+           would isolate flag traffic. Rejected at this stage because it introduces a new infrastructure dependency,
+           adds operational complexity for a three-engineer team, and the primary Postgres has headroom (see assumption a2).
+           Can be revisited if load warrants it.</p>
+        <p><strong>Chosen approach: <code>feature_flags</code> table in primary Postgres + in-process read-through cache.</strong>
+           Keeps infrastructure minimal, leverages existing backup/monitoring/auth, and the in-process cache ensures
+           the evaluation path never hits the database on the hot path.</p>
+      </section>
+
+      <section data-role="zone" data-zone="recommendations">
+        <h3>Recommendations</h3>
+        <ul>
+          <li>Use ULID or UUID primary keys on <code>feature_flags</code> and <code>flag_audit_log</code> to avoid
+              exposing sequential IDs in the admin UI.</li>
+          <li>Store targeting rules as a JSONB column with a well-documented JSON Schema so the evaluation engine
+              can evolve rule types without table migrations.</li>
+          <li>Version the cache invalidation protocol from day one (a simple monotonic <code>updated_at</code> + polling
+              is sufficient; add push/WebSocket later in Phase 2).</li>
+          <li>Write the accessor library as a thin wrapper over the cache so Phase 2 can swap the backing store
+              without changing call sites.</li>
+        </ul>
+      </section>
+
+      <section data-role="zone" data-zone="open-questions">
+        <h3>Open questions</h3>
+
+        <article data-role="open-question"
+                 data-question-id="q1"
+                 data-status="open"
+                 data-resolved-by="">
+          <p>What is the expected maximum number of flags at steady state? This affects index design and whether
+             the entire flag table can be loaded into the in-process cache on startup.</p>
+        </article>
+
+        <article data-role="open-question"
+                 data-question-id="q2"
+                 data-status="open"
+                 data-resolved-by="">
+          <p>Does the audit log need to store the full before/after JSONB diff, or is a human-readable summary
+             sufficient? Full diff enables programmatic rollback; summary is cheaper to store and display.</p>
+        </article>
+
+      </section>
+
+      <article data-role="task"
+               data-task-id="t1.1"
+               data-reversibility="high"
+               data-blast-radius="low">
+        <h3>Define and migrate the <code>feature_flags</code> schema</h3>
+        <p>Write the migration creating the <code>feature_flags</code> table with columns: <code>id</code> (ULID),
+           <code>key</code> (unique, slug-format), <code>description</code>, <code>owner</code> (user or team slug),
+           <code>flag_type</code> (enum: <code>boolean</code> | <code>percentage</code> | <code>multivariate</code>),
+           <code>targeting_rules</code> (JSONB), <code>default_value</code> (JSONB), <code>state</code>
+           (enum: <code>active</code> | <code>archived</code>), <code>created_at</code>, <code>updated_at</code>.
+           Add a unique index on <code>key</code> and a partial index on <code>state = 'active'</code>.
+           Migration must be backward-compatible (no column drops).</p>
+      </article>
+
+      <article data-role="task"
+               data-task-id="t1.2"
+               data-reversibility="high"
+               data-blast-radius="low">
+        <h3>Create the <code>flag_audit_log</code> table and write trigger</h3>
+        <p>Add a <code>flag_audit_log</code> table: <code>id</code>, <code>flag_id</code> (FK), <code>actor</code>,
+           <code>action</code> (enum: <code>created</code> | <code>updated</code> | <code>archived</code>),
+           <code>before_snapshot</code> (JSONB), <code>after_snapshot</code> (JSONB), <code>created_at</code>.
+           Wire a Postgres trigger on INSERT/UPDATE/DELETE of <code>feature_flags</code> to append a row.
+           The trigger must capture the actor from a session-local variable set by the application before each write.</p>
+      </article>
+
+      <article data-role="task"
+               data-task-id="t1.3"
+               data-reversibility="high"
+               data-blast-radius="low">
+        <h3>Seed data and bootstrap flags</h3>
+        <p>Write a seed script (idempotent, safe to re-run) that inserts a small set of system flags used by the
+           platform itself (e.g., <code>admin_ui_enabled</code>, <code>evaluation_telemetry_enabled</code>).
+           Seed runs in CI and in local dev setup. Each seed flag documents its owner and default value in a
+           comment block.</p>
+      </article>
+
+      <article data-role="task"
+               data-task-id="t1.4"
+               data-reversibility="high"
+               data-blast-radius="low">
+        <h3>In-process read-through cache with polling invalidation</h3>
+        <p>Implement a cache module (shared by both language SDKs) that loads all active flags on first access
+           and refreshes on a configurable interval (default 10 s). The cache stores flags keyed by <code>flag_key</code>.
+           Expose a <code>forceRefresh()</code> method for tests and a hook for push invalidation to be wired
+           in Phase 2. Thread-safety is required; use a read-write lock or copy-on-write snapshot pattern.</p>
+      </article>
+
+      <article data-role="task"
+               data-task-id="t1.5"
+               data-reversibility="high"
+               data-blast-radius="low">
+        <h3>Typed accessor libraries for both backend languages</h3>
+        <p>Wrap the cache in a typed accessor for Language A and Language B. Each accessor exposes at minimum:
+           <code>getFlag(key): FlagDefinition | null</code> and <code>listActiveFlags(): FlagDefinition[]</code>.
+           Generate types from the JSONB schema so callers get autocomplete on flag type, targeting rule shape,
+           and allowed variant values. Ship unit tests covering cache miss, cache hit, and stale-cache-with-refresh.</p>
+      </article>
+
+    </section>
+
+    <!-- ═══ Phase 2 ═══ -->
+    <section data-role="phase" data-phase-id="p2">
+      <h2>Phase 2: Evaluation engine (weeks 3–4)</h2>
+      <p>Build the logic layer that answers <code>evaluate(flagKey, context) → variant</code>. This is entirely
+         in-process; no new service is introduced. The HTTP endpoint is a thin wrapper for non-native callers.
+         Phase 2 ends when both SDKs pass a shared evaluation test suite and telemetry events are flowing.</p>
+
+      <section data-role="zone" data-zone="phase-goal">
+        <h3>Phase goal</h3>
+        <p>Deliver a correct, fast, and deterministic evaluation engine embedded in the Phase 1 accessor library.
+           The engine must handle all three flag types, evaluate targeting rules in declared order, implement
+           deterministic hash-based bucketing for percentage rollouts, respect environment inheritance, and emit
+           a sampled telemetry event on every evaluation. A JSON-over-HTTP endpoint wraps the engine for
+           non-native callers. p99 evaluation latency (cache warm) must be under 1 ms.</p>
+      </section>
+
+      <section data-role="zone" data-zone="alternatives-considered">
+        <h3>Alternatives considered</h3>
+        <p><strong>Sidecar evaluation service.</strong> A separate process (e.g., a small Go binary) that all
+           application processes query over a Unix socket or loopback. Avoids duplicating evaluation logic across
+           languages. Rejected because it adds a mandatory network hop (even loopback) and a new process lifecycle
+           dependency, violating the constraint that evaluation must not add latency to the request path.</p>
+        <p><strong>Shared evaluation logic via gRPC in-process plugin.</strong> Compile the engine once and call
+           via gRPC-over-Unix-socket. Rejected for the same latency reason and added build complexity.</p>
+        <p><strong>Chosen: in-process library duplicated per language, sharing a test suite via a JSON fixture file.</strong>
+           Both language implementations are validated against the same golden-file test cases so behavioral
+           divergence is caught in CI. Implementation cost is two smaller libraries rather than one complex service.</p>
+      </section>
+
+      <section data-role="zone" data-zone="recommendations">
+        <h3>Recommendations</h3>
+        <ul>
+          <li>Use <code>murmurhash3(userId + ":" + flagSalt)</code> mod 100 for percentage bucketing. Document the
+              exact algorithm in a spec file so future SDKs (including the HTTP endpoint) can match it exactly.</li>
+          <li>Rule ordering: rules evaluate top-to-bottom; first match wins; default value is the fallback.
+              Store rule order as an integer <code>priority</code> field on each rule object in the JSONB array.</li>
+          <li>Environment inheritance: if no override exists for the current environment, fall back to the
+              <code>production</code> environment's rules. Make the fallback chain configurable but default to
+              production → default.</li>
+          <li>Telemetry: emit a structured event with fields <code>flag_key</code>, <code>variant</code>,
+              <code>context_hash</code> (not raw user ID), <code>rule_matched</code>, <code>latency_us</code>.
+              Sample at 10% by default; make the rate configurable via a system flag.</li>
+        </ul>
+      </section>
+
+      <section data-role="zone" data-zone="open-questions">
+        <h3>Open questions</h3>
+
+        <article data-role="open-question"
+                 data-question-id="q3"
+                 data-status="open"
+                 data-resolved-by="">
+          <p>What telemetry sink should evaluation events flow into — the existing event bus, a direct database
+             write, or a fire-and-forget HTTP POST to the internal analytics service? The choice affects
+             backpressure behavior when the sink is slow.</p>
+        </article>
+
+        <article data-role="open-question"
+                 data-question-id="q4"
+                 data-status="open"
+                 data-resolved-by="">
+          <p>Should the HTTP evaluation endpoint support batch evaluation (multiple flag keys per request)
+             to reduce round trips for non-native callers, or is single-flag evaluation sufficient at launch?</p>
+        </article>
+
+      </section>
+
+      <article data-role="task"
+               data-task-id="t2.1"
+               data-reversibility="high"
+               data-blast-radius="low">
+        <h3>Write the evaluation spec and golden-file test suite</h3>
+        <p>Before any code, write a language-agnostic spec document (Markdown + JSON fixture files) that defines:
+           boolean evaluation, percentage bucketing (with known input/output pairs for the chosen hash function),
+           rule ordering, multivariate selection, environment inheritance fallback, and default-value fallback.
+           Both language implementations will run against the same fixture files; CI fails if either diverges.</p>
+      </article>
+
+      <article data-role="task"
+               data-task-id="t2.2"
+               data-reversibility="high"
+               data-blast-radius="low">
+        <h3>Implement evaluation engine in Language A</h3>
+        <p>Build <code>evaluate(flagKey, context): variant</code> in Language A. Context shape: <code>{ userId, orgId, environment, customAttributes }</code>.
+           Engine reads from the Phase 1 cache (no Postgres calls on hot path). Passes all golden-file fixtures.
+           Includes benchmark test asserting p99 &lt; 1 ms on a warm cache with 1 000 active flags.</p>
+      </article>
+
+      <article data-role="task"
+               data-task-id="t2.3"
+               data-reversibility="high"
+               data-blast-radius="low">
+        <h3>Implement evaluation engine in Language B</h3>
+        <p>Mirror of t2.2 for Language B. Both implementations share the same golden-file fixtures.
+           A CI job runs both test suites on every pull request touching either implementation or the spec.</p>
+      </article>
+
+      <article data-role="task"
+               data-task-id="t2.4"
+               data-reversibility="high"
+               data-blast-radius="low">
+        <h3>Wire push-invalidation from the database to the in-process cache</h3>
+        <p>When any flag row is written, the application server that performed the write should notify all
+           in-process caches to refresh immediately (rather than waiting for the poll interval).
+           Implement via a lightweight in-process pub/sub or a Postgres LISTEN/NOTIFY channel.
+           Falls back gracefully to poll-interval refresh if the notification channel is unavailable.</p>
+      </article>
+
+      <article data-role="task"
+               data-task-id="t2.5"
+               data-reversibility="high"
+               data-blast-radius="low">
+        <h3>JSON-over-HTTP evaluation endpoint</h3>
+        <p>Add <code>POST /internal/flags/evaluate</code> and (optionally) <code>POST /internal/flags/evaluate-batch</code>
+           behind the existing auth middleware. Request body: <code>{ flagKey, context }</code>.
+           Response: <code>{ variant, ruleMatched, flagType }</code>. The handler calls the Language A engine
+           directly; no separate evaluation service. Document the endpoint in the internal API reference.</p>
+      </article>
+
+      <article data-role="task"
+               data-task-id="t2.6"
+               data-reversibility="high"
+               data-blast-radius="low">
+        <h3>Telemetry event emission</h3>
+        <p>In both language engines, after each evaluation, emit a sampled structured event to the agreed sink
+           (see open question q3). Event schema: <code>flag_key</code>, <code>variant</code>, <code>context_hash</code>,
+           <code>rule_matched</code>, <code>latency_us</code>, <code>environment</code>, <code>timestamp</code>.
+           Sampling rate is read from the <code>evaluation_telemetry_sample_rate</code> system flag so it can be
+           adjusted without a deploy. Emission must be non-blocking (fire-and-forget from the caller's perspective).</p>
+      </article>
+
+    </section>
+
+    <!-- ═══ Phase 3 ═══ -->
+    <section data-role="phase" data-phase-id="p3">
+      <h2>Phase 3: Admin UI (weeks 5–6)</h2>
+      <p>Build the dashboard page that product, support, and engineering use to manage flags day-to-day.
+         The UI is the operational surface; correctness of the evaluation engine is already established.
+         Phase 3 ends when all RBAC rules are enforced, the audit history view is live, and a support
+         engineer can disable a production flag without developer assistance.</p>
+
+      <section data-role="zone" data-zone="phase-goal">
+        <h3>Phase goal</h3>
+        <p>Deliver a dashboard (integrated into the existing admin application) that allows authorized users to
+           create, edit, search, and archive flags; set per-environment overrides; use a percentage-rollout slider
+           with live bucketing preview showing how many of a sample user set would receive each variant; view the
+           full audit history for any flag; and enforce role-based access so only flag owners and admins can
+           modify production values.</p>
+      </section>
+
+      <section data-role="zone" data-zone="alternatives-considered">
+        <h3>Alternatives considered</h3>
+        <p><strong>Separate standalone admin app.</strong> A dedicated single-page app with its own auth.
+           Rejected because it duplicates the existing admin application's auth and navigation shell, and adds
+           a new deployment unit for a three-engineer team already constrained on time.</p>
+        <p><strong>CLI-only management (no UI).</strong> Flags managed via a command-line tool; no dashboard.
+           Rejected because support engineers need a no-code path to disable a flag quickly, and product managers
+           need the rollout slider to set percentages without engineering involvement.</p>
+        <p><strong>Chosen: page within the existing admin application.</strong> Inherits auth, navigation, and
+           deployment; ships faster; lower ongoing maintenance surface.</p>
+      </section>
+
+      <section data-role="zone" data-zone="recommendations">
+        <h3>Recommendations</h3>
+        <ul>
+          <li>The percentage-rollout slider should show a live deterministic preview: given the current slider value,
+              display how many of a synthetic 1 000-user sample would receive each variant. This uses the same
+              bucketing hash as the engine so the preview is exact, not approximate.</li>
+          <li>Scope RBAC at the API layer, not just the UI layer. The backend must reject write requests from
+              non-owners/non-admins even if the UI hides the controls, so that API clients respect the same rules.</li>
+          <li>The audit history view should be paginated and filterable by actor, action, and date range.
+              Deep-link each audit entry to the flag detail page at the state it was in at that point in time
+              (read-only snapshot view).</li>
+          <li>Use optimistic UI updates on toggle/slider changes with a visible rollback if the server returns
+              an error, to keep the support "kill switch" flow snappy.</li>
+        </ul>
+      </section>
+
+      <section data-role="zone" data-zone="open-questions">
+        <h3>Open questions</h3>
+
+        <article data-role="open-question"
+                 data-question-id="q5"
+                 data-status="open"
+                 data-resolved-by="">
+          <p>Should the percentage-rollout slider show a preview based on a synthetic random sample or based on
+             actual user IDs from the database? The latter is more accurate but requires a user-count query and
+             raises privacy considerations for the audit log preview.</p>
+        </article>
+
+        <article data-role="open-question"
+                 data-question-id="q6"
+                 data-status="open"
+                 data-resolved-by="">
+          <p>Who can grant and revoke the "flag admin" role — only superadmins, or can team leads self-serve?
+             This determines how onerous the RBAC model is in practice and whether a separate admin-management UI
+             is needed at launch.</p>
+        </article>
+
+      </section>
+
+      <article data-role="task"
+               data-task-id="t3.1"
+               data-reversibility="high"
+               data-blast-radius="low">
+        <h3>Flag list and search page</h3>
+        <p>Add a <code>/admin/flags</code> route to the existing admin application. The page renders a searchable,
+           filterable table of all flags (key, type, state, owner, last-modified). Search is client-side for
+           up to ~500 flags; falls back to a debounced server query beyond that. Columns are sortable.
+           Archived flags are hidden by default behind a toggle. Each row links to the flag detail page.</p>
+      </article>
+
+      <article data-role="task"
+               data-task-id="t3.2"
+               data-reversibility="medium"
+               data-blast-radius="low">
+        <h3>Flag create and edit form with RBAC enforcement</h3>
+        <p>Build the create/edit form for a flag: fields for key (slug-validated, immutable after creation),
+           description, owner, type, default value, and targeting rules (dynamic rule builder for user ID list,
+           org list, and environment). On submit, the backend sets the session-local actor variable before
+           writing so the audit trigger records the correct user. The backend rejects edits to production values
+           from non-owners and non-admins with a 403 and a human-readable error. The UI disables the production
+           override fields and shows a tooltip explaining the restriction.</p>
+      </article>
+
+      <article data-role="task"
+               data-task-id="t3.3"
+               data-reversibility="medium"
+               data-blast-radius="medium">
+        <h3>Per-environment override panel and percentage-rollout slider</h3>
+        <p>On the flag detail page, add a per-environment section showing the effective rules for each environment
+           (production, staging, development). Each environment has an override toggle; enabling it reveals an
+           editor for that environment's rules. For percentage-rollout flags, render a slider (0–100%) with a live
+           bucketing preview panel that shows the variant distribution across a 1 000-user synthetic sample using
+           the same hash algorithm as the evaluation engine. Changes are saved per-environment and recorded in
+           the audit log.</p>
+      </article>
+
+      <article data-role="task"
+               data-task-id="t3.4"
+               data-reversibility="high"
+               data-blast-radius="low">
+        <h3>Audit history view</h3>
+        <p>Add an audit history tab on the flag detail page. Fetches from <code>GET /admin/flags/:key/audit</code>
+           (paginated, newest-first). Each entry shows: timestamp, actor, action, and a before/after diff rendered
+           as a two-column JSON diff. Filterable by actor and date range. Deep-links are shareable (query params
+           preserve filter state). Read-only; no actions available from this view.</p>
+      </article>
+
+      <article data-role="task"
+               data-task-id="t3.5"
+               data-reversibility="medium"
+               data-blast-radius="low">
+        <h3>Archive and kill-switch flow</h3>
+        <p>Add an "Archive flag" action (requires owner or admin role) that sets <code>state = 'archived'</code>
+           and records the audit entry. Archived flags are immediately excluded from the active cache on next
+           refresh (or on push-invalidation). Also add a prominent "Disable in production" shortcut button on
+           the flag detail page that sets the production override to the flag's off/false/0% variant in one
+           click, with a confirmation modal. This is the support kill-switch flow; it must complete in under
+           two UI interactions and under 30 seconds end-to-end.</p>
+      </article>
+
+    </section>
+
+  </section>
+
+  <!-- ─── Decisions tab ─── -->
+  <section data-tab="decisions" hidden>
+
+    <article data-role="decision"
+             data-decision-id="d1"
+             data-decided-at="2026-06-09T00:00:00Z"
+             data-decided-by="plan-author"
+             data-supersedes="">
+      <h3>Store flags in primary Postgres, not a config file or external service</h3>
+      <p>Config files in the repo require a deploy to change any value, which breaks the "kill without a deploy"
+         requirement. External SaaS (LaunchDarkly, Split) is explicitly prohibited. A dedicated second database
+         adds operational overhead. Primary Postgres with a read-through in-process cache satisfies all requirements
+         with minimal new infrastructure.</p>
+      <p data-role="rationale-against">
+        Config-in-repo provides a free git-based audit trail and is trivially reversible (revert the commit).
+        Postgres requires explicit audit infrastructure and a migration story. If the team later needs multi-region
+        low-latency flag reads, a separate store would have been the right foundation.
+      </p>
+    </article>
+
+    <article data-role="decision"
+             data-decision-id="d2"
+             data-decided-at="2026-06-09T00:00:00Z"
+             data-decided-by="plan-author"
+             data-supersedes="">
+      <h3>Evaluation engine as in-process library, not sidecar service</h3>
+      <p>The brief explicitly prohibits adding a network hop to the evaluation path. An in-process library
+         is the only architecture that satisfies this constraint. Both backend languages get their own
+         implementation validated against a shared golden-file test suite to prevent behavioral divergence.
+         The JSON-over-HTTP endpoint is a secondary path for non-native callers and is not on the hot path.</p>
+      <p data-role="rationale-against">
+        A sidecar service would centralize evaluation logic (one implementation instead of two) and make it
+        easier to update the algorithm without touching application code. The network latency cost (even
+        loopback) is the sole reason this was rejected; revisit if the monorepo acquires a third language.
+      </p>
+    </article>
+
+    <article data-role="decision"
+             data-decision-id="d3"
+             data-decided-at="2026-06-09T00:00:00Z"
+             data-decided-by="plan-author"
+             data-supersedes="">
+      <h3>Use murmurhash3(userId + ":" + flagSalt) mod 100 for percentage bucketing</h3>
+      <p>Deterministic bucketing requires a stable, fast, well-distributed hash. MurmurHash3 is non-cryptographic
+         (fast), has excellent distribution for short string keys, and has implementations in every major language.
+         Including a per-flag salt ensures that a user who falls in the bottom 10% of one flag does not
+         automatically fall in the bottom 10% of all flags (which would create correlated exposure across
+         experiments). The algorithm is documented in a spec file so any future SDK (including the HTTP endpoint)
+         produces identical bucketing.</p>
+      <p data-role="rationale-against">
+        FNV-1a or xxHash would also work. SHA-256 mod 100 is cryptographically stronger but ~10× slower and
+        overkill for feature-flag bucketing.
+      </p>
+    </article>
+
+  </section>
+
+  <!-- ─── Risks tab ─── -->
+  <section data-tab="risks" hidden>
+
+    <article data-role="risk"
+             data-risk-id="r1"
+             data-status="open"
+             data-resolved-by="">
+      <h3>Evaluation engine behavioral divergence between the two language implementations</h3>
+      <p>If Language A and Language B produce different results for the same input (e.g., different hash output,
+         different rule-ordering semantics), users will receive inconsistent variants depending on which service
+         handles their request. This is particularly dangerous for percentage rollouts where inconsistency breaks
+         the determinism guarantee.</p>
+      <p><strong>Mitigation:</strong> Golden-file test suite (task t2.1) shared between both implementations and
+         run in CI on every relevant PR. Any divergence is a CI failure. The spec document pins the exact hash
+         algorithm, inputs, and expected outputs for a set of known test vectors.</p>
+    </article>
+
+    <article data-role="risk"
+             data-risk-id="r2"
+             data-status="open"
+             data-resolved-by="">
+      <h3>Stale cache serves wrong variant during flag changes</h3>
+      <p>The in-process cache has a poll interval (default 10 s). During the window between a flag change and
+         cache refresh, different application instances may serve different variants. For a "kill switch" scenario,
+         up to 10 seconds of continued wrong behavior is acceptable but must be documented and understood.</p>
+      <p><strong>Mitigation:</strong> Push-invalidation via Postgres LISTEN/NOTIFY (task t2.4) reduces the window
+         to milliseconds for the instance that performed the write. Other instances still rely on polling, but the
+         poll interval is configurable and can be lowered for critical flags. The support kill-switch UI (task t3.5)
+         documents the expected propagation delay.</p>
+    </article>
+
+    <article data-role="risk"
+             data-risk-id="r3"
+             data-status="open"
+             data-resolved-by="">
+      <h3>Telemetry emission adds latency to the evaluation hot path</h3>
+      <p>If telemetry events are emitted synchronously on the evaluation path, slow sinks (database write,
+         HTTP POST) will inflate evaluation latency and potentially breach the &lt;1 ms p99 target.</p>
+      <p><strong>Mitigation:</strong> Task t2.6 explicitly requires non-blocking (fire-and-forget) emission.
+         The telemetry sink is chosen to support backpressure (see open question q3). A benchmark test in t2.2
+         validates that warm-cache evaluation including telemetry stays under 1 ms p99.</p>
+    </article>
+
+    <article data-role="risk"
+             data-risk-id="r4"
+             data-status="open"
+             data-resolved-by="">
+      <h3>RBAC bypass via direct API calls to the evaluation or write endpoints</h3>
+      <p>If role checks are only enforced in the UI layer, a user with a valid session token could call the
+         write API directly and modify production flags they do not own.</p>
+      <p><strong>Mitigation:</strong> Task t3.2 explicitly requires backend enforcement of RBAC (403 rejection
+         independent of UI state). Security review should include a test of direct API write calls from a
+         non-owner session.</p>
+    </article>
+
+  </section>
+
+  <!-- ─── Research tab ─── -->
+  <section data-tab="research" hidden>
+    <p>Findings from research agents land here, attached to the question they answer.</p>
+    <!-- Research findings appended here as agents produce them. -->
+  </section>
+
+  <!-- ─── Experiments tab ─── -->
+  <section data-tab="experiments" hidden>
+    <!-- Experiment results appended here. -->
+  </section>
+
+  <!-- ─── Reviews tab ─── -->
+  <section data-tab="reviews" hidden>
+    <!-- Reviews appended here. -->
+  </section>
+
+  <!-- ─── Execution log tab ─── -->
+  <section data-tab="execution-log" hidden>
+    <ol data-role="execution-events">
+      <!-- Executor appends entries here as it runs. -->
+    </ol>
+  </section>
+
+  <!-- ─── Retrospective tab ─── -->
+  <section data-tab="retrospective" hidden>
+    <section data-role="zone" data-zone="what-shipped">
+      <h3>What shipped</h3>
+    </section>
+    <section data-role="zone" data-zone="deviations-from-plan">
+      <h3>Deviations from plan</h3>
+    </section>
+    <section data-role="zone" data-zone="what-we-learned">
+      <h3>What we learned</h3>
+    </section>
+    <section data-role="zone" data-zone="followup-plans">
+      <h3>Follow-up plans</h3>
+    </section>
+  </section>
+
+</body>
+</html>

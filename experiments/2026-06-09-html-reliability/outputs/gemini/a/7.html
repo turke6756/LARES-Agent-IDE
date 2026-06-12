@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html data-plan-id="plan-2026-06-09-feature-flags" data-plan-name="Feature Flag System Plan" data-run-state="drafting" data-schema-version="2" data-created-at="2026-06-09T08:00:00Z">
+<head>
+  <meta charset="utf-8">
+  <title>Feature Flag System Plan</title>
+</head>
+<body>
+  <header data-role="plan-header">
+    <h1>Feature Flag System</h1>
+    <p>A full-stack feature-flag system enabling dark shipping, gradual rollouts, and kill switches, comprising a Postgres-backed schema, a sub-millisecond evaluation engine, and a secure internal Admin UI.</p>
+    <aside data-role="supervisor-attendance"></aside>
+  </header>
+
+  <nav data-role="tabs">
+    <button data-tab-target="framing" data-active="true">Framing</button>
+    <button data-tab-target="implementation">Implementation</button>
+    <button data-tab-target="decisions">Decisions</button>
+    <button data-tab-target="risks">Risks</button>
+    <button data-tab-target="research">Research</button>
+    <button data-tab-target="experiments">Experiments</button>
+    <button data-tab-target="reviews">Reviews</button>
+    <button data-tab-target="execution-log">Execution Log</button>
+    <button data-tab-target="retrospective">Retrospective</button>
+  </nav>
+
+  <section data-tab="framing" data-active="true">
+    <section data-role="zone" data-zone="success-criteria">
+      <h3>Success Criteria</h3>
+      <p>The feature flag evaluation engine must respond in under a millisecond at p99 without introducing any extra network hops to the core request handling path. The admin interface must allow product and support personnel to efficiently search, edit, and safely archive feature flags via role-based access controls. The system must natively support the two backend monorepo languages, plus JSON-over-HTTP fallback for other services.</p>
+    </section>
+    
+    <section data-role="zone" data-zone="scope">
+      <h3>Scope</h3>
+      <p>In scope: A robust Postgres schema mapping keys, rules, environments, and owners. An in-memory evaluation engine employing deterministic hashing for rollouts and caching. Two native backend SDKs and one JSON-over-HTTP endpoint. A telemetry sampler for evaluation events. A UI dashboard for flag CRUD operations, live bucketing previews, environment overrides, and audit log history tracking.</p>
+      <p>Out of scope: Advanced A/B testing analytics and stats, scheduled or time-based rollouts, mobile application SDKs, and full multi-stage approval workflows.</p>
+    </section>
+    
+    <section data-role="zone" data-zone="constraints">
+      <h3>Constraints</h3>
+      <p>We cannot introduce any new external SaaS dependencies. The flag evaluation process must add zero network hops. The admin dashboard must be deployed behind our existing authentication middleware. Delivery is strictly bounded to a three-engineer team across a six-week timeline.</p>
+    </section>
+    
+    <section data-role="zone" data-zone="assumptions">
+      <h3>Assumptions</h3>
+      <article data-role="assumption" data-assumption-id="a-db-capacity" data-status="open" data-resolved-by="" data-invalidates-if="Database CPU spikes above acceptable thresholds during deployment of the read-through cache due to cache stampedes.">
+        <p>The primary Postgres database can comfortably handle the read loads as long as our read-through cache operates effectively in normal states.</p>
+      </article>
+      <article data-role="assumption" data-assumption-id="a-language-coverage" data-status="open" data-resolved-by="" data-invalidates-if="Critical path microservices are migrated to a third language before rollout completes.">
+        <p>Providing native SDKs for the two primary monorepo languages covers all latency-sensitive core evaluation paths.</p>
+      </article>
+    </section>
+  </section>
+
+  <section data-tab="implementation" hidden>
+    <section data-role="phase" data-phase-id="p1-schema-storage">
+      <h2>Phase 1 — Flag Schema and Storage</h2>
+      <p>Design and implement the core feature flag data model, lifecycle schemas, and foundational data access layer.</p>
+      
+      <section data-role="zone" data-zone="phase-goal">
+        <h3>Phase Goal</h3>
+        <p>Establish a versioned, scalable Postgres schema to safely store flags, targeting rules, environments, and audit histories, supported by a typed accessor library and read-through caching.</p>
+      </section>
+      
+      <section data-role="zone" data-zone="alternatives-considered">
+        <h3>Alternatives Considered</h3>
+        <p>A config-file-in-repo pattern was evaluated but discarded. While highly auditable, it mandates a full CI/CD deployment to trigger a kill switch, which fails the requirement for rapid support intervention.</p>
+      </section>
+      
+      <section data-role="zone" data-zone="recommendations">
+        <h3>Recommendations</h3>
+        <p>Utilize a new `feature_flags` table in the primary Postgres instance. Model the targeting rules as a robust JSONB column to afford future flexibility if new targeting dimensions emerge. Use Postgres triggers or strict application-level wrappers to guarantee audit history consistency.</p>
+      </section>
+      
+      <section data-role="zone" data-zone="open-questions">
+        <h3>Open Questions</h3>
+        <article data-role="open-question" data-question-id="oq-p1-audit-volume" data-status="open" data-resolved-by="">
+          <p>Should we partition the audit history table immediately, or will standard indexing suffice for the expected volume of flag changes over the next two years?</p>
+        </article>
+      </section>
+
+      <article data-role="task" data-task-id="t1.1" data-reversibility="medium" data-blast-radius="high">
+        <h3>Design Data Model & Migrations</h3>
+        <p>Write and test database migrations for the new tables: `feature_flags`, `environments`, `flag_targeting_rules`, and `audit_log`.</p>
+      </article>
+      <article data-role="task" data-task-id="t1.2" data-reversibility="high" data-blast-radius="medium">
+        <h3>Build Typed Accessor Library</h3>
+        <p>Develop the data access logic for CRUD operations, ensuring strict typing for targeting configurations (user ID, org, environment).</p>
+      </article>
+      <article data-role="task" data-task-id="t1.3" data-reversibility="high" data-blast-radius="low">
+        <h3>Implement Read-Through Cache Layer</h3>
+        <p>Create a read-through cache mechanism over the accessor library to mitigate direct load on the Postgres database.</p>
+      </article>
+      <article data-role="task" data-task-id="t1.4" data-reversibility="high" data-blast-radius="low">
+        <h3>Implement Audit Logging</h3>
+        <p>Wire up hooks within the accessor library so that every state change or rule update inherently writes a record to the audit table.</p>
+      </article>
+    </section>
+
+    <section data-role="phase" data-phase-id="p2-eval-engine">
+      <h2>Phase 2 — Evaluation Engine</h2>
+      <p>Build the highly optimized, in-memory evaluation machinery for zero-network-hop feature flagging.</p>
+
+      <section data-role="zone" data-zone="phase-goal">
+        <h3>Phase Goal</h3>
+        <p>Deliver the two native backend SDKs and the JSON-over-HTTP fallback endpoint capable of reliably answering `evaluate(flagKey, context)` in &lt;1ms p99 via local caching and deterministic hashing.</p>
+      </section>
+
+      <section data-role="zone" data-zone="alternatives-considered">
+        <h3>Alternatives Considered</h3>
+        <p>Creating a standalone centralized evaluation microservice was firmly rejected. Any network hop inherently breaches the strict sub-millisecond p99 latency constraint mandated by the brief.</p>
+      </section>
+
+      <section data-role="zone" data-zone="recommendations">
+        <h3>Recommendations</h3>
+        <p>Employ MurmurHash3 for bucketing due to its speed and excellent uniform distribution properties. Implement environment inheritance such that staging configurations dynamically fall back to production values unless explicitly overridden.</p>
+      </section>
+
+      <section data-role="zone" data-zone="open-questions">
+        <h3>Open Questions</h3>
+        <article data-role="open-question" data-question-id="oq-p2-polling" data-status="open" data-resolved-by="">
+          <p>What is the optimal short-polling interval for the local cache invalidation story to balance database load against kill-switch responsiveness?</p>
+        </article>
+      </section>
+
+      <article data-role="task" data-task-id="t2.1" data-reversibility="medium" data-blast-radius="high">
+        <h3>Develop Deterministic Bucketing</h3>
+        <p>Implement the core hashing algorithm (hash of user ID + flag salt) and bucketing logic to handle reliable percentage-based rollouts.</p>
+      </article>
+      <article data-role="task" data-task-id="t2.2" data-reversibility="high" data-blast-radius="medium">
+        <h3>Build In-Memory Cache & Invalidation</h3>
+        <p>Develop the local cache module inside the evaluation library, including the polling mechanism for fetching updates from the central repository.</p>
+      </article>
+      <article data-role="task" data-task-id="t2.3" data-reversibility="high" data-blast-radius="medium">
+        <h3>Develop Primary Native SDK</h3>
+        <p>Package the evaluation rules engine and cache into an idiomatic library for the primary backend language.</p>
+      </article>
+      <article data-role="task" data-task-id="t2.4" data-reversibility="high" data-blast-radius="medium">
+        <h3>Develop Secondary Native SDK</h3>
+        <p>Replicate the evaluation engine architecture as an idiomatic library for the secondary backend language.</p>
+      </article>
+      <article data-role="task" data-task-id="t2.5" data-reversibility="high" data-blast-radius="low">
+        <h3>Implement HTTP Fallback Endpoint</h3>
+        <p>Wrap the evaluation engine inside a high-throughput JSON-over-HTTP sidecar/service to support miscellaneous internal clients.</p>
+      </article>
+      <article data-role="task" data-task-id="t2.6" data-reversibility="high" data-blast-radius="low">
+        <h3>Add Telemetry Sampling</h3>
+        <p>Introduce a non-blocking sampling emitter that logs evaluation outcomes asynchronously for future diagnostics and analysis.</p>
+      </article>
+    </section>
+
+    <section data-role="phase" data-phase-id="p3-admin-ui">
+      <h2>Phase 3 — Admin UI</h2>
+      <p>Construct the internal web dashboard to provide intuitive, secure management of flags and rollouts.</p>
+
+      <section data-role="zone" data-zone="phase-goal">
+        <h3>Phase Goal</h3>
+        <p>Deliver a role-secured web interface empowering non-engineers to manage flag lifecycles, configure complex targeting rules, and visualize percentage rollout distributions.</p>
+      </section>
+
+      <section data-role="zone" data-zone="alternatives-considered">
+        <h3>Alternatives Considered</h3>
+        <p>Managing flags purely via internal CLI tools was deemed insufficient as it imposes an engineering barrier on product and support teams needing to operate rapid kill switches.</p>
+      </section>
+
+      <section data-role="zone" data-zone="recommendations">
+        <h3>Recommendations</h3>
+        <p>Leverage the existing internal UI component library to build the dashboard quickly. Mount the entire UI application behind the current enterprise authentication proxy to fulfill the auth middleware constraint effortlessly.</p>
+      </section>
+
+      <section data-role="zone" data-zone="open-questions">
+        <h3>Open Questions</h3>
+        <article data-role="open-question" data-question-id="oq-p3-preview" data-status="open" data-resolved-by="">
+          <p>Should the live preview of the percentage rollout use randomly generated mock user IDs or allow manual input of specific IDs for debugging?</p>
+        </article>
+      </section>
+
+      <article data-role="task" data-task-id="t3.1" data-reversibility="high" data-blast-radius="medium">
+        <h3>Implement Management API</h3>
+        <p>Create the backing REST API endpoints that the Admin UI will consume to perform CRUD and audit log retrieval.</p>
+      </article>
+      <article data-role="task" data-task-id="t3.2" data-reversibility="low" data-blast-radius="high">
+        <h3>Enforce RBAC Policies</h3>
+        <p>Integrate role checks ensuring only explicitly assigned flag owners and global admins can modify production environment values.</p>
+      </article>
+      <article data-role="task" data-task-id="t3.3" data-reversibility="high" data-blast-radius="low">
+        <h3>Build Dashboard List View</h3>
+        <p>Develop the frontend view mapping all active and archived flags, complete with search and owner filtering.</p>
+      </article>
+      <article data-role="task" data-task-id="t3.4" data-reversibility="high" data-blast-radius="low">
+        <h3>Build Flag Detail & Rollout Slider</h3>
+        <p>Create the flag editing interface containing environment specific tabs and the interactive percentage rollout slider with bucketing preview.</p>
+      </article>
+      <article data-role="task" data-task-id="t3.5" data-reversibility="high" data-blast-radius="low">
+        <h3>Integrate Audit History UI</h3>
+        <p>Add a dedicated audit log panel within the flag detail page displaying all historical mutations and status changes.</p>
+      </article>
+    </section>
+  </section>
+
+  <section data-tab="decisions" hidden>
+    <article data-role="decision" data-decision-id="dec-db-cache" data-decided-at="2026-06-09T09:00:00Z" data-decided-by="Architecture Sync">
+      <p>We will construct our own Postgres-backed schema rather than integrating an external vendor tool to manage flag state.</p>
+      <p data-role="rationale-against">Integrating a SaaS solution violates the strict constraint against new external dependencies and introduces unacceptable risks to our p99 latency guarantees.</p>
+    </article>
+    <article data-role="decision" data-decision-id="dec-env-inherit" data-decided-at="2026-06-09T09:30:00Z" data-decided-by="Engineering Lead">
+      <p>We will handle environment overrides via inheritance, explicitly defaulting non-production environments to match production configurations unless deliberately overridden in the UI.</p>
+    </article>
+  </section>
+
+  <section data-tab="risks" hidden>
+    <article data-role="risk" data-risk-id="risk-cache-stale" data-status="open" data-resolved-by="">
+      <p>Local in-memory cache invalidation delays might lead to brief windows of inconsistent evaluation across clustered application nodes immediately following a kill-switch toggle.</p>
+    </article>
+    <article data-role="risk" data-risk-id="risk-hash-collision" data-status="open" data-resolved-by="">
+      <p>A poorly chosen flag salt strategy might cause hashing collisions, inadvertently bucketing the same users into experiments consistently instead of providing uniform pseudo-random distributions.</p>
+    </article>
+  </section>
+
+  <section data-tab="research" hidden>
+  </section>
+
+  <section data-tab="experiments" hidden>
+  </section>
+
+  <section data-tab="reviews" hidden>
+  </section>
+
+  <section data-tab="execution-log" hidden>
+    <ol data-role="execution-events"></ol>
+  </section>
+
+  <section data-tab="retrospective" hidden>
+    <section data-role="zone" data-zone="what-shipped">
+      <h3>What Shipped</h3>
+    </section>
+    <section data-role="zone" data-zone="deviations-from-plan">
+      <h3>Deviations from Plan</h3>
+    </section>
+    <section data-role="zone" data-zone="what-we-learned">
+      <h3>What We Learned</h3>
+    </section>
+    <section data-role="zone" data-zone="followup-plans">
+      <h3>Follow-up Plans</h3>
+    </section>
+  </section>
+</body>
+</html>

@@ -21,7 +21,9 @@ export default function WatchGlass({ chatScrollEl, isLight, children }: Props) {
   // State-backed ref: wheel effect must re-run once the lens div actually mounts,
   // which can happen on a later render than when chatScrollEl first arrives.
   const [lensEl, setLensEl] = useState<HTMLDivElement | null>(null);
-  const innerRef = useRef<HTMLDivElement>(null);
+  // Same state-backed-ref pattern as lensEl: the inner div mounts only after
+  // viewportH is measured, so a once-on-mount effect would miss it.
+  const [innerEl, setInnerEl] = useState<HTMLDivElement | null>(null);
   const [lensY, setLensY] = useState(0);
   const [zoom, setZoom] = useState(1.6);
   const [chatScrollTop, setChatScrollTop] = useState(0);
@@ -76,13 +78,12 @@ export default function WatchGlass({ chatScrollEl, isLight, children }: Props) {
 
   // Lens content reflows on zoom/content changes — measure its natural (unscaled) height.
   useEffect(() => {
-    const el = innerRef.current;
-    if (!el) return;
-    const ro = new ResizeObserver(() => setInnerLayoutH(el.offsetHeight));
-    ro.observe(el);
-    setInnerLayoutH(el.offsetHeight);
+    if (!innerEl) return;
+    const ro = new ResizeObserver(() => setInnerLayoutH(innerEl.offsetHeight));
+    ro.observe(innerEl);
+    setInnerLayoutH(innerEl.offsetHeight);
     return () => ro.disconnect();
-  }, []);
+  }, [innerEl]);
 
   const lensH = Math.max(MIN_LENS_HEIGHT, viewportH * LENS_HEIGHT_FRACTION);
 
@@ -199,7 +200,7 @@ export default function WatchGlass({ chatScrollEl, isLight, children }: Props) {
       }}
     >
       <div
-        ref={innerRef}
+        ref={setInnerEl}
         style={{
           position: 'absolute',
           top: 0,

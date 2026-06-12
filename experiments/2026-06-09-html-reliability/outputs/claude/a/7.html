@@ -1,0 +1,63 @@
+ table-driven test suite for every rule-type combination and conflict scenario, including at least five adversarial cases designed to expose priority-order bugs. Document the evaluation semantics in the SDK README as a normative specification so engineers can predict behaviour without reading the source.</p>
+  </article>
+
+  <article data-role="risk" data-risk-id="r3" data-status="open" data-resolved-by="">
+    <h3>Six-week timeline is tight; Phase 1 slippage compresses the most performance-sensitive phase</h3>
+    <p>Two weeks per phase is aggressive. Open questions oq1.1, oq2.1, and oq3.2 must be resolved before their respective phases begin — any delay carries forward. Phase 2 is the highest-risk phase technically (performance benchmark, cache coherence, two SDKs); it has no buffer if Phase 1 overruns. Phase 3 has the most visible surface area and the most stakeholder feedback risk.</p>
+    <p><strong>Mitigation:</strong> Resolve oq1.1 and oq2.1 in week 1 as explicit kickoff tasks. Designate t3.4 (bucketing preview) and t3.5 (audit history view) as stretchable scope — functional but less polished is acceptable at launch. Hold a weekly scope-review checkpoint with the engineering lead to catch slippage early rather than at week-5 integration.</p>
+  </article>
+</section>
+
+<!-- ═══════════════════════ RESEARCH ═══════════════════════ -->
+<section data-tab="research" hidden>
+  <h2 class="tab-heading">Research Findings</h2>
+</section>
+
+<!-- ═══════════════════════ EXPERIMENTS ═══════════════════════ -->
+<section data-tab="experiments" hidden>
+  <h2 class="tab-heading">Experiment Results</h2>
+</section>
+
+<!-- ═══════════════════════ REVIEWS ═══════════════════════ -->
+<section data-tab="reviews" hidden>
+  <h2 class="tab-heading">Reviews</h2>
+</section>
+
+<!-- ═══════════════════════ EXECUTION LOG ═══════════════════════ -->
+<section data-tab="execution-log" hidden>
+  <h2 class="tab-heading">Execution Log</h2>
+  <ol data-role="execution-events"></ol>
+</section>
+
+<!-- ═══════════════════════ RETROSPECTIVE ═══════════════════════ -->
+<section data-tab="retrospective" hidden>
+  <section data-role="zone" data-zone="what-shipped">
+    <h3>What Shipped</h3>
+  </section>
+  <section data-role="zone" data-zone="deviations-from-plan">
+    <h3>Deviations from Plan</h3>
+  </section>
+  <section data-role="zone" data-zone="what-we-learned">
+    <h3>What We Learned</h3>
+  </section>
+  <section data-role="zone" data-zone="followup-plans">
+    <h3>Followup Plans</h3>
+  </section>
+</section>
+
+<script>
+  const buttons = document.querySelectorAll('nav[data-role="tabs"] button');
+  const sections = document.querySelectorAll('section[data-tab]');
+  buttons.forEach(btn => {
+    btn.addEventListener('click', () => {
+      const target = btn.dataset.tabTarget;
+      buttons.forEach(b => delete b.dataset.active);
+      sections.forEach(s => { s.hidden = true; delete s.dataset.active; });
+      btn.dataset.active = 'true';
+      const sec = document.querySelector(`section[data-tab="${target}"]`);
+      if (sec) { sec.hidden = false; sec.dataset.active = 'true'; }
+    });
+  });
+</script>
+</body>
+</html>

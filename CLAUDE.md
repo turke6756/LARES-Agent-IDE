@@ -80,22 +80,19 @@ behalf. See `docs/ORCHESTRATION_SPIKE.md` for the run that surfaced this.
 
 ## Supervisor scaffold: local edits vs. app-wide changes
 
-A supervisor's files (`.dashboard/supervisor/CLAUDE.md`, `.dashboard/supervisor/.claude/skills/<name>/SKILL.md`, etc.) are **scaffolded once** by the dashboard the first time a workspace is opened that doesn't already have a `.dashboard/supervisor/` directory. The scaffold logic lives in `src/main/supervisor/index.ts` (`ensureSupervisorScaffold()`) and explicitly **never overwrites existing files** — it only writes ones that are missing.
+A supervisor's files (`.dashboard/supervisor/CLAUDE.md`, `.dashboard/supervisor/.claude/skills/<name>/SKILL.md`, etc.) are scaffolded by the dashboard when a workspace is opened. Since commit `54519bf` (2026-06-09) the scaffold is **version-managed with content-hash migration** (`ensureSupervisorScaffold()` + `writeScaffoldMap` in `src/main/supervisor/index.ts`): each managed file carries a `version` and a `previousHashes` list in the scaffold map. On every supervisor launch:
+
+- **Missing file** → written fresh from the constant.
+- **On-disk file whose hash matches a known previous version** (pristine, just outdated) → **silently upgraded** to the current constant.
+- **On-disk file whose hash matches no managed version** (locally edited) → **backed up to `.bak.<ts>` and overwritten** with the current constant.
 
 This means two different things depending on what you want:
 
-**1. Local-only tweak (one workspace).** Edit the file under `.dashboard/supervisor/` directly. The change sticks for this workspace and survives restarts, but it's lost if anyone wipes that folder, and **no other workspace gets it** — the next supervisor scaffolded anywhere else still gets the old content from the constants.
+**1. Local-only tweak (one workspace).** Edits to files under `.dashboard/supervisor/` are **no longer durable**: the next scaffold pass detects the unknown hash, backs the file up to `.bak.<ts>`, and overwrites it. If a local edit is worth keeping, fold it into the source constant (option 2) — or expect to recover it from the `.bak` file.
 
-**2. Change what every future supervisor gets (app-wide).** Edit the source constant in `src/shared/constants.ts` — `SUPERVISOR_AGENT_MD` (the CLAUDE.md), `SUPERVISOR_RUN_ORCHESTRATION_SKILL`, `SUPERVISOR_ORCHESTRATION_SPIKE_SKILL`, etc. Then **rebuild the main process** (`npm run build:main`) and restart Electron. From that point on, any workspace that gets a fresh supervisor scaffold receives the updated content.
+**2. Change what every supervisor gets (app-wide).** Edit the source constant in `src/shared/constants.ts` — `SUPERVISOR_AGENT_MD` (the CLAUDE.md), `SUPERVISOR_RUN_ORCHESTRATION_SKILL`, etc. — **bump that file's `version` in the scaffold map and append the prior content's hash to `previousHashes`**, then rebuild (`npm run build:main`) and restart Electron. Pristine workspaces upgrade silently at next supervisor launch; locally-edited ones get `.bak`'d + overwritten. The old "delete the folder / remove + re-add the workspace" dance is obsolete.
 
-**Verifying the app-wide change in a workspace that already has a supervisor:** because the scaffolder won't overwrite, you have to force a fresh scaffold. The reliable sequence is:
-
-1. Stop the supervisor running in that workspace (or close the dashboard).
-2. Delete the `.dashboard/supervisor/` folder (or just the specific files you want regenerated — `CLAUDE.md`, the relevant `SKILL.md`).
-3. Remove the workspace from the dashboard.
-4. Re-add the workspace. The dashboard rescaffolds from the current (rebuilt) constants.
-
-If you only edit the on-disk file without touching the constant, you've made a local-only change. If you only edit the constant without rebuilding + removing the stale folder, the running app keeps emitting the old content. Both steps matter.
+Multiple workstreams add sections to `SUPERVISOR_AGENT_MD`; each addition must use its own versioned sentinel marker + idempotent append (see `plans/v2-migration-phase-order-audit.md` §5.5), never a wholesale section rewrite.
 
 ## Notebook execution convention
 

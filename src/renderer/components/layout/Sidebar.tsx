@@ -5,7 +5,8 @@ import WorkspaceCreateDialog from '../workspace/WorkspaceCreateDialog';
 import CollapseButton from './CollapseButton';
 import * as Icons from 'lucide-react';
 import DirectoryTreeNode, { sortEntries } from '../fileviewer/DirectoryTreeNode';
-import type { TreeSortMode } from '../shared/FileContextMenu';
+import { SORT_OPTIONS, type TreeSortMode } from '../shared/FileContextMenu';
+import { useTreeHoverStore } from '../../stores/tree-hover-store';
 import type { DirectoryEntry, PathType } from '../../../shared/types';
 import logoImg from '../../assets/logo.png';
 import { useNamePrompt } from '../../hooks/useNamePrompt';
@@ -15,17 +16,19 @@ import { detectSyncFolder } from '../../../shared/sync-folder-detection';
 // drops (dataTransfer.files), which add a new workspace.
 const WS_DRAG_MIME = 'application/x-workspace-id';
 
-function InlineWorkspaceTree({ rootPath, pathType, workspaceId, expandedPaths, onExpandedChange }: {
+function InlineWorkspaceTree({ rootPath, pathType, workspaceId, expandedPaths, onExpandedChange, sortMode, onSortModeChange }: {
   rootPath: string;
   pathType: PathType;
   workspaceId: string;
   /** Expansion state lives in Sidebar so it survives the refresh remount. */
   expandedPaths: Set<string>;
   onExpandedChange: (dirPath: string, expanded: boolean) => void;
+  /** Sort mode lives in Sidebar so the workspace card's context menu can set it too. */
+  sortMode: TreeSortMode;
+  onSortModeChange: (mode: TreeSortMode) => void;
 }) {
   const [rootEntries, setRootEntries] = useState<DirectoryEntry[]>([]);
   const [loading, setLoading] = useState(true);
-  const [sortMode, setSortMode] = useState<TreeSortMode>('name');
   const cache = useRef(new Map<string, DirectoryEntry[]>());
   const openTab = useDashboardStore((s) => s.openTab);
   const checkHealth = useDashboardStore((s) => s.checkHealth);
@@ -101,7 +104,7 @@ function InlineWorkspaceTree({ rootPath, pathType, workspaceId, expandedPaths, o
             pathType={pathType}
             workingDirectory={rootPath}
             sortMode={sortMode}
-            onSortModeChange={setSortMode}
+            onSortModeChange={onSortModeChange}
             onFileSelect={handleFileSelect}
             loadChildren={loadChildren}
             onTreeChanged={invalidateDir}
@@ -109,6 +112,7 @@ function InlineWorkspaceTree({ rootPath, pathType, workspaceId, expandedPaths, o
             promptName={promptName}
             expandedPaths={expandedPaths}
             onExpandedChange={onExpandedChange}
+            hoverHotkeys
           />
         ))
       )}
@@ -169,6 +173,9 @@ export default function Sidebar({ width }: SidebarProps) {
   // Expanded folder paths inside the inline workspace trees. Held here (not
   // in the tree nodes) so expansion survives the refreshTick remount below.
   const [expandedTreePaths, setExpandedTreePaths] = useState<Set<string>>(new Set());
+  // Per-workspace tree sort mode — settable from the workspace card's
+  // context menu and from folder context menus inside the tree.
+  const [wsSortModes, setWsSortModes] = useState<Record<string, TreeSortMode>>({});
   const [dragWsId, setDragWsId] = useState<string | null>(null);
   const [dropTarget, setDropTarget] = useState<string | 'end' | null>(null);
   const [refreshing, setRefreshing] = useState(false);
@@ -207,6 +214,91 @@ export default function Sidebar({ width }: SidebarProps) {
       return next;
     });
   }, []);
+
+  const collapseWorkspaceTree = useCallback((rootPath: string) => {
+    const ws = workspaces.find((w) => w.path === rootPath);
+    if (ws) {
+      setExpandedWorkspaces((prev) => {
+        const next = new Set(prev);
+        next.delete(ws.id);
+        return next;
+      });
+    }
+    // Drop folder expansion under this root so the tree reopens collapsed.
+    setExpandedTreePaths((prev) => {
+      const next = new Set<string>();
+      for (const p of prev) {
+        if (p === rootPath || p.startsWith(rootPath + '\\') || p.startsWith(rootPath + '/')) continue;
+        next.add(p);
+      }
+      return next;
+    });
+  }, [workspaces]);
+
+  // Space-bar hotkeys for the inline workspace trees: tap toggles the
+  // hovered folder, double-tap collapses its whole workspace, hold shades
+  // every row and reveals heat-colored modification times.
+  useEffect(() => {
+    let holdTimer: ReturnType<typeof setTimeout> | null = null;
+    let holdActive = false;
+    let spaceDown = false;
+    let lastTapAt = 0;
+
+    const isEditable = (el: Element | null): boolean => {
+      if (!el) return false;
+      return el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT' ||
+        (el as HTMLElement).isContentEditable;
+    };
+
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.code !== 'Space') return;
+      if (!useTreeHoverStore.getState().hovered) return;
+      if (isEditable(document.activeElement)) return;
+      e.preventDefault(); // keep Space from scrolling / clicking the focused row
+      if (e.repeat || spaceDown) return;
+      spaceDown = true;
+      holdActive = false;
+      holdTimer = setTimeout(() => {
+        holdActive = true;
+        useTreeHoverStore.getState().setSpaceHold(true);
+      }, 300);
+    };
+
+    const onKeyUp = (e: KeyboardEvent) => {
+      if (e.code !== 'Space' || !spaceDown) return;
+      spaceDown = false;
+      if (holdTimer) {
+        clearTimeout(holdTimer);
+        holdTimer = null;
+      }
+      if (holdActive) {
+        // Releasing a hold just ends the reveal — it is not a tap.
+        holdActive = false;
+        useTreeHoverStore.getState().setSpaceHold(false);
+        return;
+      }
+      const hovered = useTreeHoverStore.getState().hovered;
+      if (!hovered) return;
+      e.preventDefault();
+      const now = Date.now();
+      if (now - lastTapAt < 350) {
+        lastTapAt = 0;
+        collapseWorkspaceTree(hovered.rootPath);
+        return;
+      }
+      lastTapAt = now;
+      if (hovered.isDirectory) hovered.toggleRef.current();
+    };
+
+    window.addEventListener('keydown', onKeyDown, true);
+    window.addEventListener('keyup', onKeyUp, true);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown, true);
+      window.removeEventListener('keyup', onKeyUp, true);
+      if (holdTimer) clearTimeout(holdTimer);
+      useTreeHoverStore.getState().setSpaceHold(false);
+    };
+  }, [collapseWorkspaceTree]);
 
   const toggleWorkspace = (wsId: string, e?: React.MouseEvent) => {
     if (e) e.stopPropagation();
@@ -364,6 +456,31 @@ export default function Sidebar({ width }: SidebarProps) {
         </div>
       </div>
 
+      {/* Workspaces section header — outside the scroll container so it
+          stays pinned while the list below scrolls. */}
+      <div className="flex items-center justify-between px-4 py-2 border-b border-surface-3 shrink-0">
+        <span className="ui-section-header">
+          Workspaces
+        </span>
+        <div className="flex items-center gap-1">
+          <button
+            onClick={() => void handleRefresh()}
+            disabled={refreshing}
+            className="ui-btn ui-btn-ghost h-8 w-8 p-0 disabled:opacity-50"
+            title="Refresh workspaces and re-scan file trees"
+          >
+            <Icons.RefreshCw className={`w-4 h-4 ${refreshing ? 'animate-spin' : ''}`} />
+          </button>
+          <button
+            onClick={() => setShowCreate(true)}
+            className="ui-btn ui-btn-primary h-8 w-8 p-0"
+            title="Add Workspace"
+          >
+            <Icons.Plus className="w-5 h-5 stroke-[2.5]" />
+          </button>
+        </div>
+      </div>
+
       {/* Workspaces */}
       <div
         className={`flex-1 overflow-y-auto p-2 transition-colors scrollbar-hide ${
@@ -373,29 +490,6 @@ export default function Sidebar({ width }: SidebarProps) {
         onDragLeave={handleDragLeave}
         onDrop={handleDrop}
       >
-        <div className="flex items-center justify-between px-2 py-2 mb-1 border-b border-surface-3">
-          <span className="ui-section-header">
-            Workspaces
-          </span>
-          <div className="flex items-center gap-1">
-            <button
-              onClick={() => void handleRefresh()}
-              disabled={refreshing}
-              className="ui-btn ui-btn-ghost h-8 w-8 p-0 disabled:opacity-50"
-              title="Refresh workspaces and re-scan file trees"
-            >
-              <Icons.RefreshCw className={`w-4 h-4 ${refreshing ? 'animate-spin' : ''}`} />
-            </button>
-            <button
-              onClick={() => setShowCreate(true)}
-              className="ui-btn ui-btn-primary h-8 w-8 p-0"
-              title="Add Workspace"
-            >
-              <Icons.Plus className="w-5 h-5 stroke-[2.5]" />
-            </button>
-          </div>
-        </div>
-
         <div className="space-y-1">
           {workspaces.map((ws) => {
             const heat = workspaceHeat[ws.id];
@@ -481,6 +575,8 @@ export default function Sidebar({ width }: SidebarProps) {
                     workspaceId={ws.id}
                     expandedPaths={expandedTreePaths}
                     onExpandedChange={handleTreeExpandedChange}
+                    sortMode={wsSortModes[ws.id] ?? 'name'}
+                    onSortModeChange={(mode) => setWsSortModes((prev) => ({ ...prev, [ws.id]: mode }))}
                   />
                 )}
               </div>
@@ -550,6 +646,25 @@ export default function Sidebar({ width }: SidebarProps) {
               >
                 Open VS Code
               </button>
+              <div className="ui-menu-divider" />
+              <div className="ui-menu-header">
+                Sort Files By
+              </div>
+              {SORT_OPTIONS.map(({ mode, label }) => (
+                <button
+                  key={mode}
+                  onClick={() => {
+                    setWsSortModes((prev) => ({ ...prev, [contextMenu.wsId]: mode }));
+                    setContextMenu(null);
+                  }}
+                  className="ui-menu-item"
+                >
+                  <span className="inline-block w-3.5">
+                    {(wsSortModes[contextMenu.wsId] ?? 'name') === mode ? '✓' : ''}
+                  </span>
+                  {label}
+                </button>
+              ))}
               <div className="ui-menu-divider" />
               <button
                 onClick={() => setConfirmDelete(contextMenu.wsId)}

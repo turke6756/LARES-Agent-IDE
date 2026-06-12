@@ -5,6 +5,7 @@ import * as Icons from 'lucide-react';
 import FileIcon from './FileIcon';
 import { treeEntryDragStart, TREE_ENTRY_MIME, isInternalTreeDrag, isExternalFileDrop, hasDroppedDirectory, getDroppedNativePaths } from '../../utils/drag-file';
 import { useDashboardStore } from '../../stores/dashboard-store';
+import { useTreeHoverStore, timeHeatColor } from '../../stores/tree-hover-store';
 import type { PromptName } from '../../hooks/useNamePrompt';
 
 /** Re-order a name-sorted listing for the tree's active sort mode.
@@ -59,6 +60,9 @@ interface Props {
    *  default per-node local state. */
   expandedPaths?: Set<string>;
   onExpandedChange?: (dirPath: string, expanded: boolean) => void;
+  /** Register rows with the tree-hover store so the sidebar's space-bar
+   *  hotkeys (tap to toggle, hold to reveal timestamps) can act on them. */
+  hoverHotkeys?: boolean;
 }
 
 function parentPath(entryPath: string): string {
@@ -87,6 +91,7 @@ function DirectoryTreeNode({
   promptName,
   expandedPaths,
   onExpandedChange,
+  hoverHotkeys,
 }: Props) {
   const [localExpanded, setLocalExpanded] = useState(false);
   // Controlled mode (expandedPaths provided) reads/writes the ancestor's set;
@@ -149,6 +154,32 @@ function DirectoryTreeNode({
     }
     window.api.system.openFileInWorkspace(entry.path, workingDirectory, pathType);
   }, [entry, workingDirectory, pathType]);
+
+  // --- Space-bar hover hotkeys (opt-in via hoverHotkeys, sidebar trees) ---
+  const spaceHold = useTreeHoverStore((s) => (hoverHotkeys ? s.spaceHold : false));
+  const setHovered = useTreeHoverStore((s) => s.setHovered);
+  const clearHovered = useTreeHoverStore((s) => s.clearHovered);
+  // Ref keeps the window-level key handler pointed at the latest toggle
+  // without re-registering the hover on every render.
+  const toggleRef = useRef<() => void>(() => {});
+  toggleRef.current = handleClick;
+
+  const handleMouseEnter = useCallback(() => {
+    if (!hoverHotkeys) return;
+    setHovered({ path: entry.path, isDirectory: entry.isDirectory, rootPath: workingDirectory, toggleRef });
+  }, [hoverHotkeys, setHovered, entry.path, entry.isDirectory, workingDirectory]);
+
+  const handleMouseLeave = useCallback(() => {
+    if (!hoverHotkeys) return;
+    clearHovered(entry.path);
+  }, [hoverHotkeys, clearHovered, entry.path]);
+
+  // A collapsed ancestor unmounts this row without a mouseleave — drop the
+  // stale registration so the hotkeys don't act on a ghost row.
+  useEffect(() => {
+    if (!hoverHotkeys) return;
+    return () => clearHovered(entry.path);
+  }, [hoverHotkeys, clearHovered, entry.path]);
 
   // Controlled mode: a node can mount already-expanded (e.g. right after the
   // sidebar refresh remounts the tree). The click handler that normally loads
@@ -372,7 +403,8 @@ function DirectoryTreeNode({
 
   const ChevronIcon = expanded ? Icons.ChevronDown : Icons.ChevronRight;
 
-  const timeMs = sortMode === 'created' ? entry.birthtimeMs : entry.mtimeMs;
+  // Hold-to-reveal always shows last-modified, regardless of sort mode.
+  const timeMs = spaceHold ? entry.mtimeMs : sortMode === 'created' ? entry.birthtimeMs : entry.mtimeMs;
   const timeLabel = formatCompactTime(timeMs);
 
   return (
@@ -381,6 +413,8 @@ function DirectoryTreeNode({
         onClick={handleClick}
         onDoubleClick={handleDoubleClick}
         onContextMenu={handleContextMenu}
+        onMouseEnter={handleMouseEnter}
+        onMouseLeave={handleMouseLeave}
         draggable
         onDragStart={(e) => treeEntryDragStart(e, entry.path, entry.isDirectory)}
         onDragOver={handleDragOver}
@@ -388,7 +422,7 @@ function DirectoryTreeNode({
         onDrop={handleDrop}
         className={`w-full text-left flex items-center gap-1 py-[3px] px-2 text-[13px] font-sans transition-colors group ${
           isActive ? 'tree-row-selected' : isDropTarget ? 'bg-accent-blue/15 text-fg-primary' : 'tree-row-hover text-fg-primary'
-        }`}
+        }${spaceHold && !isActive ? ' tree-row-shaded' : ''}`}
         style={{ paddingLeft: `${depth * 12 + 8}px`, color: isActive ? undefined : 'var(--color-fg-primary)' }}
       >
         {entry.isDirectory ? (
@@ -417,8 +451,14 @@ function DirectoryTreeNode({
         </span>
         {timeLabel && (
           <span
-            className="ml-auto shrink-0 pl-2 text-[10px] tabular-nums opacity-0 group-hover:opacity-100"
-            style={{ color: 'var(--color-fg-secondary)', opacity: sortMode !== 'name' ? 0.8 : undefined }}
+            className={`ml-auto shrink-0 pl-2 text-[10px] tabular-nums ${
+              spaceHold ? '' : 'opacity-0 group-hover:opacity-100'
+            }`}
+            style={
+              spaceHold
+                ? { color: timeHeatColor(timeMs, Date.now()), opacity: 1 }
+                : { color: 'var(--color-fg-secondary)', opacity: sortMode !== 'name' ? 0.8 : undefined }
+            }
             title={new Date(timeMs!).toLocaleString()}
           >
             {timeLabel}
@@ -444,6 +484,7 @@ function DirectoryTreeNode({
               promptName={promptName}
               expandedPaths={expandedPaths}
               onExpandedChange={onExpandedChange}
+              hoverHotkeys={hoverHotkeys}
             />
           ))}
         </div>

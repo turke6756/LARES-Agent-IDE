@@ -1,3 +1,4 @@
 {
-  "autoMemoryEnabled": false
+  "autoMemoryEnabled": false,
+  "autoCompactEnabled": false
 }

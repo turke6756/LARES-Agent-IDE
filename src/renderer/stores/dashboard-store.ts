@@ -727,7 +727,13 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
     }
   },
 
-  selectAgent: (id) => set({ selectedAgentId: id }),
+  selectAgent: (id) =>
+    set((state) => ({
+      selectedAgentId: id,
+      // Attaching to a (different) agent always lands on the Chat tab —
+      // never inherit the tab the previous agent's pane was left on.
+      detailPane: id && id !== state.selectedAgentId ? 2 : state.detailPane,
+    })),
 
   setTerminalAgent: (id) => set({ terminalAgentId: id }),
   

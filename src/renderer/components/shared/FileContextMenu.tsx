@@ -3,7 +3,7 @@ import type { PathType } from '../../../shared/types';
 
 export type TreeSortMode = 'name' | 'modified' | 'created';
 
-const SORT_OPTIONS: { mode: TreeSortMode; label: string }[] = [
+export const SORT_OPTIONS: { mode: TreeSortMode; label: string }[] = [
   { mode: 'name', label: 'Name' },
   { mode: 'modified', label: 'Last Edited' },
   { mode: 'created', label: 'Created' },

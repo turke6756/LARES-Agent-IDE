@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en"
+      data-plan-id="plan-2026-06-09-feature-flags"
+      data-plan-name="Feature Flag System Implementation"
+      data-run-state="drafting"
+      data-schema-version="2"
+      data-created-at="2026-06-09T09:00:00Z">
+<head>
+  <meta charset="utf-8">
+  <title>Feature Flag System Implementation</title>
+</head>
+<body>
+
+  <header data-role="plan-header">
+    <h1>Feature Flag System Implementation</h1>
+    <p>Implementation of a robust, low-latency feature flagging system to support dark launches, gradual rollouts, and emergency kill-switches without redeployment.</p>
+    <aside data-role="supervisor-attendance"></aside>
+  </header>
+
+  <nav data-role="tabs">
+    <button data-tab-target="framing" data-active="true">Framing</button>
+    <button data-tab-target="implementation">Implementation</button>
+    <button data-tab-target="decisions">Decisions</button>
+    <button data-tab-target="risks">Risks</button>
+    <button data-tab-target="research">Research</button>
+    <button data-tab-target="experiments">Experiments</button>
+    <button data-tab-target="reviews">Reviews</button>
+    <button data-tab-target="execution-log">Execution Log</button>
+    <button data-tab-target="retrospective">Retrospective</button>
+  </nav>
+
+  <section data-tab="framing" data-active="true">
+    <section data-role="zone" data-zone="success-criteria">
+      <h3>Success criteria</h3>
+      <ul>
+        <li>Flags can be toggled in production via UI with changes reflected in SDKs within 60 seconds.</li>
+        <li>Evaluation latency is under 1ms at p99 for local SDK calls.</li>
+        <li>Zero new external SaaS dependencies introduced for flag storage or evaluation.</li>
+        <li>Audit logs capture every change to flag configurations, including the actor and previous state.</li>
+        <li>Deterministic bucketing ensures a user consistently sees the same variant for a percentage rollout.</li>
+      </ul>
+    </section>
+
+    <section data-role="zone" data-zone="scope">
+      <h3>Scope</h3>
+      <p><strong>In Scope:</strong> Database schema and migrations, evaluation engine/SDKs, admin dashboard, audit history, and environment-based overrides.</p>
+      <p><strong>Out of Scope:</strong> A/B testing statistical analysis, scheduled automated rollouts, mobile-specific SDKs, and complex multi-stage approval workflows.</p>
+    </section>
+
+    <section data-role="zone" data-zone="constraints">
+      <h3>Constraints</h3>
+      <ul>
+        <li>Timeline: 6 weeks total for a team of 3 engineers.</li>
+        <li>Performance: Evaluation path must not add a network hop to critical request handling.</li>
+        <li>Security: Must integrate with existing authentication middleware; no bypasses allowed.</li>
+        <li>Infrastructure: Use existing Postgres and Redis (cache) instances; no new SaaS.</li>
+      </ul>
+    </section>
+
+    <section data-role="zone" data-zone="assumptions">
+      <h3>Assumptions</h3>
+      <article data-role="assumption"
+               data-assumption-id="a1"
+               data-status="open"
+               data-resolved-by=""
+               data-invalidates-if="existing Postgres/Redis capacity is insufficient for the additional flag traffic">
+        <p>Current primary Postgres and Redis instances have sufficient headroom to handle flag storage and polling/push traffic.</p>
+      </article>
+      <article data-role="assumption"
+               data-assumption-id="a2"
+               data-status="open"
+               data-resolved-by=""
+               data-invalidates-if="monorepo languages change significantly before SDK implementation">
+        <p>The SDKs only need to support the two primary backend languages currently in use in the monorepo.</p>
+      </article>
+    </section>
+  </section>
+
+  <section data-tab="implementation" hidden>
+    <section data-role="phase" data-phase-id="p1">
+      <h2>Phase 1: Flag Schema and Storage</h2>
+      <p>Establish the source of truth for feature flags and the underlying data structures.</p>
+
+      <section data-role="zone" data-zone="phase-goal">
+        <h3>Phase goal</h3>
+        <p>A fully versioned database schema and a typed accessor library to read/write flag configurations with audit trails.</p>
+      </section>
+
+      <section data-role="zone" data-zone="alternatives-considered">
+        <h3>Alternatives considered</h3>
+        <p>Config-file-in-repo: Rejected because it requires a full CI/CD deploy cycle to toggle flags, failing the "support can kill a feature without a deploy" requirement.</p>
+      </section>
+
+      <section data-role="zone" data-zone="recommendations">
+        <h3>Recommendations</h3>
+        <p>Use a JSONB column for targeting rules to allow flexibility without frequent schema migrations.</p>
+      </section>
+
+      <section data-role="zone" data-zone="open-questions">
+        <h3>Open questions</h3>
+        <article data-role="open-question"
+                 data-question-id="q1"
+                 data-status="open"
+                 data-resolved-by="">
+          <p>Should we use a soft-delete or a separate archive table for retired flags?</p>
+        </article>
+      </section>
+
+      <article data-role="task" data-task-id="t1.1" data-reversibility="high" data-blast-radius="low">
+        <h3>Design and execute Postgres migrations</h3>
+        <p>Create <code>feature_flags</code> and <code>flag_audit_log</code> tables. Include fields for key, type, targeting JSONB, and lifecycle state.</p>
+      </article>
+      <article data-role="task" data-task-id="t1.2" data-reversibility="medium" data-blast-radius="low">
+        <h3>Develop Internal Management SDK</h3>
+        <p>Build a typed library for the backend to perform CRUD operations on flags with mandatory audit logging.</p>
+      </article>
+      <article data-role="task" data-task-id="t1.3" data-reversibility="high" data-blast-radius="low">
+        <h3>Seed initial system flags</h3>
+        <p>Provide seed data for existing features to be wrapped in flags immediately upon rollout.</p>
+      </article>
+    </section>
+
+    <section data-role="phase" data-phase-id="p2">
+      <h2>Phase 2: Evaluation Engine</h2>
+      <p>Build the logic that determines which variant a user receives based on the current context.</p>
+
+      <section data-role="zone" data-zone="phase-goal">
+        <h3>Phase goal</h3>
+        <p>Highly performant SDKs and a sidecar service providing sub-millisecond flag evaluation with deterministic bucketing.</p>
+      </section>
+
+      <section data-role="zone" data-zone="alternatives-considered">
+        <h3>Alternatives considered</h3>
+        <p>Direct DB lookup on every evaluate call: Rejected due to latency and DB load concerns. In-memory caching with background polling is required.</p>
+      </section>
+
+      <section data-role="zone" data-zone="recommendations">
+        <h3>Recommendations</h3>
+        <p>Use MurmurHash3 for deterministic user bucketing to ensure uniform distribution and stability.</p>
+      </section>
+
+      <section data-role="zone" data-zone="open-questions">
+        <h3>Open questions</h3>
+        <article data-role="open-question"
+                 data-question-id="q2"
+                 data-status="open"
+                 data-resolved-by="">
+          <p>What sampling rate should we use for evaluation telemetry to avoid overloading the event bus?</p>
+        </article>
+      </section>
+
+      <article data-role="task" data-task-id="t2.1" data-reversibility="medium" data-blast-radius="medium">
+        <h3>Implement core evaluation logic</h3>
+        <p>Write the logic for rule matching, environment inheritance, and deterministic hash-based bucketing.</p>
+      </article>
+      <article data-role="task" data-task-id="t2.2" data-reversibility="high" data-blast-radius="low">
+        <h3>Build In-Memory Cache and Poller</h3>
+        <p>Implement a background thread in the SDKs that polls the DB/Redis and refreshes a local thread-safe map of flag configs.</p>
+      </article>
+      <article data-role="task" data-task-id="t2.3" data-reversibility="medium" data-blast-radius="low">
+        <h3>JSON-over-HTTP Sidecar</h3>
+        <p>Create a small Go or Node.js service that exposes an <code>/evaluate</code> endpoint for languages/services without a native SDK.</p>
+      </article>
+      <article data-role="task" data-task-id="t2.4" data-reversibility="high" data-blast-radius="low">
+        <h3>Telemetry Integration</h3>
+        <p>Add sampled event emission to the evaluation path to track variant distribution in production.</p>
+      </article>
+    </section>
+
+    <section data-role="phase" data-phase-id="p3">
+      <h2>Phase 3: Admin UI</h2>
+      <p>The interface for human interaction with the flag system.</p>
+
+      <section data-role="zone" data-zone="phase-goal">
+        <h3>Phase goal</h3>
+        <p>A self-service dashboard allowing non-engineers to manage flag rollouts safely across environments.</p>
+      </section>
+
+      <section data-role="zone" data-zone="alternatives-considered">
+        <h3>Alternatives considered</h3>
+        <p>Command-line tool only: Rejected as it doesn't meet the "Product can run rollouts" requirement.</p>
+      </section>
+
+      <section data-role="zone" data-zone="recommendations">
+        <h3>Recommendations</h3>
+        <p>Include a "Live Preview" in the rollout slider to show how many users are impacted in real-time based on recent traffic patterns.</p>
+      </section>
+
+      <section data-role="zone" data-zone="open-questions">
+        <h3>Open questions</h3>
+        <article data-role="open-question"
+                 data-question-id="q3"
+                 data-status="open"
+                 data-resolved-by="">
+          <p>Do we need a 'dry-run' mode for targeting rules before saving?</p>
+        </article>
+      </section>
+
+      <article data-role="task" data-task-id="t3.1" data-reversibility="high" data-blast-radius="low">
+        <h3>Build Flag List and Search View</h3>
+        <p>Standard CRUD interface for listing, filtering, and basic metadata editing of flags.</p>
+      </article>
+      <article data-role="task" data-task-id="t3.2" data-reversibility="medium" data-blast-radius="medium">
+        <h3>Environment Override and Rollout UI</h3>
+        <p>Implement the per-environment configuration view with percentage sliders and targeting rule builders.</p>
+      </article>
+      <article data-role="task" data-task-id="t3.3" data-reversibility="high" data-blast-radius="low">
+        <h3>Audit Log Viewer</h3>
+        <p>A searchable history view showing who changed what flag and when.</p>
+      </article>
+      <article data-role="task" data-task-id="t3.4" data-reversibility="high" data-blast-radius="low">
+        <h3>RBAC Integration</h3>
+        <p>Connect the UI to existing auth to restrict production edits to admins and flag owners.</p>
+      </article>
+    </section>
+  </section>
+
+  <section data-tab="decisions" hidden>
+    <article data-role="decision"
+             data-decision-id="d1"
+             data-decided-at="2026-06-09T10:00:00Z"
+             data-decided-by="architecture-lead">
+      <h3>Database-centric storage over Repo-based config</h3>
+      <p>Rationale: Requirements for real-time updates and non-engineering access mandate a dynamic storage layer. Postgres with a read-through cache provides the best balance of consistency and performance.</p>
+      <p data-role="rationale-against">Repo-based config is easier to version control and review but introduces unacceptable latency for emergency "kill-switch" scenarios.</p>
+    </article>
+  </section>
+
+  <section data-tab="risks" hidden>
+    <article data-role="risk"
+             data-risk-id="r1"
+             data-status="open"
+             data-resolved-by="">
+      <h3>Performance regression in evaluation path</h3>
+      <p>Mitigation: Strict load testing of SDK evaluation logic and mandatory p99 monitoring in production.</p>
+    </article>
+    <article data-role="risk"
+             data-risk-id="r2"
+             data-status="open"
+             data-resolved-by="">
+      <h3>Inconsistent state across nodes</h3>
+      <p>Mitigation: Implement a standard TTL for local caches and explore Redis Pub/Sub for immediate invalidation if polling proves too slow.</p>
+    </article>
+  </section>
+
+  <section data-tab="research" hidden></section>
+  <section data-tab="experiments" hidden></section>
+  <section data-tab="reviews" hidden></section>
+  <section data-tab="execution-log" hidden>
+    <ol data-role="execution-events"></ol>
+  </section>
+
+  <section data-tab="retrospective" hidden>
+    <section data-role="zone" data-zone="what-shipped">
+      <h3>What shipped</h3>
+    </section>
+    <section data-role="zone" data-zone="deviations-from-plan">
+      <h3>Deviations from plan</h3>
+    </section>
+    <section data-role="zone" data-zone="what-we-learned">
+      <h3>What we learned</h3>
+    </section>
+    <section data-role="zone" data-zone="followup-plans">
+      <h3>Follow-up plans</h3>
+    </section>
+  </section>
+
+</body>
+</html>

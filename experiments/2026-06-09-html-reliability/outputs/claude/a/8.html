@@ -1,0 +1,268 @@
+ `< 3000`. Return the matching rule's variant on first match; if no rule matches, return `flag.DefaultValue`. Handle archived flags by always returning the default and emitting a warning log. Write table-driven tests for: boolean on/off, percentage at exact threshold / one above / one below, multivariate rule priority ordering, no-match fallback, and archived-flag behaviour.</p>
+        <div class="task-badges"><span class="badge badge-green">blast-radius: low</span><span class="badge badge-green">reversibility: high</span></div>
+      </article>
+
+      <article data-role="task" data-task-id="t2.3" data-reversibility="high" data-blast-radius="low">
+        <h3>Build in-memory cache with push and poll invalidation</h3>
+        <p>Build a cache struct holding a full snapshot of all flags for the current environment in a concurrent map. On startup, load all flags from Redis (falling back to Postgres on Redis miss). Subscribe to Redis pub/sub channel <code>flags:invalidated</code> (published by the accessor library on every write) and update the affected entry immediately. As a reliability backstop, poll Redis for a full refresh every 60 seconds. Expose a <code>WarmingStatus() bool</code> method so the application health check can report not-ready during the initial load. Benchmark the warm read path to confirm &lt;1 ms p99 across 1 000 loaded flags in a tight loop; include the benchmark in CI so a regression blocks merging.</p>
+        <div class="task-badges"><span class="badge badge-green">blast-radius: low</span><span class="badge badge-green">reversibility: high</span></div>
+      </article>
+
+      <article data-role="task" data-task-id="t2.4" data-reversibility="high" data-blast-radius="low">
+        <h3>Create idiomatic SDK wrappers for Go and TypeScript</h3>
+        <p><strong>Go:</strong> A <code>flags.Client</code> struct with methods <code>Bool(ctx, key, defaultVal) bool</code>, <code>String(ctx, key, defaultVal) string</code>. Accepts a <code>flags.EvalContext</code> struct carrying <code>UserID</code>, <code>OrgID</code>, <code>Environment</code>. Internally wires to the in-memory cache from t2.3 via the <code>FlagReader</code> interface. <strong>TypeScript:</strong> A <code>FlagsClient</code> class with the same method signatures for Node.js server contexts only. Both SDKs must fail closed — unknown key returns the caller-supplied default and logs a structured warning, never throws. Add integration tests for each SDK against local Postgres and Redis using seed data from t1.6. Both SDKs must pass the shared test-vector file from t2.1 to guarantee bucketing parity.</p>
+        <div class="task-badges"><span class="badge badge-green">blast-radius: low</span><span class="badge badge-green">reversibility: high</span></div>
+      </article>
+
+      <article data-role="task" data-task-id="t2.5" data-reversibility="high" data-blast-radius="low">
+        <h3>Build JSON-over-HTTP evaluation endpoint</h3>
+        <p>Add route <code>POST /internal/flags/evaluate</code> behind the existing auth middleware. Request: <code>{"flagKey":"…","context":{"userId":"…","orgId":"…","environment":"…"}}</code>. Response: <code>{"variant":…,"flagType":"…","source":"cache|default"}</code>. The handler calls the Go SDK directly (in-process, no extra hop). Rate-limit at 5 000 req/s. Add a contract test asserting the response shape does not change without a version bump. Document the endpoint in the internal API catalogue.</p>
+        <div class="task-badges"><span class="badge badge-green">blast-radius: low</span><span class="badge badge-green">reversibility: high</span></div>
+      </article>
+
+      <article data-role="task" data-task-id="t2.6" data-reversibility="high" data-blast-radius="low">
+        <h3>Add sampled evaluation telemetry</h3>
+        <p>After each <code>evaluate()</code> call, with configurable probability (default 1%), emit a structured event containing <code>flagKey</code>, <code>environment</code>, <code>variant</code>, <code>hashedUserId</code> (FNV-1a of raw user ID for privacy), <code>orgId</code>, <code>evaluatedAtMs</code>, <code>ruleMatchedPriority</code> (or <code>"default"</code>). Write the event to the sink agreed in q2.2. Keep the hot path allocation-free for the 99% non-sampled case by pre-allocating the event struct and only populating it when the sampler fires. Include a test verifying the observed sample rate is within ±20% of the configured rate across 100 000 calls.</p>
+        <div class="task-badges"><span class="badge badge-green">blast-radius: low</span><span class="badge badge-green">reversibility: high</span></div>
+      </article>
+
+    </div>
+  </section>
+
+  <!-- ─── PHASE 3 ─── -->
+  <section data-role="phase" data-phase-id="p3">
+    <div class="phase-header">
+      <h2>Phase 3 — Admin UI</h2>
+      <p>Weeks 5–6 · Operator-facing dashboard enabling flag management without engineering intervention.</p>
+    </div>
+    <div class="phase-body">
+
+      <section data-role="zone" data-zone="phase-goal">
+        <h3>Phase Goal</h3>
+        <p>Deliver a fully functional admin dashboard integrated into the existing internal tools application. A product manager or support engineer with the appropriate role can create, target, adjust, and archive any flag without writing code or contacting engineering. Every change is captured in the audit history visible from the same UI. Role-based access is enforced server-side on all mutation endpoints.</p>
+      </section>
+
+      <section data-role="zone" data-zone="alternatives-considered">
+        <h3>Alternatives Considered</h3>
+        <h4>CLI-only admin interface</h4>
+        <p>Limiting flag management to the CLI helper from t1.6 and deferring the UI was considered to reduce Phase 3 scope. Rejected because support engineers — the primary kill-switch users — do not have terminal access to production, and product managers should not require engineering involvement for routine rollout adjustments.</p>
+        <h4>Generic low-code admin panel (self-hosted)</h4>
+        <p>Using a self-hosted generic admin tool to generate CRUD screens from the schema was considered to reduce frontend work. Rejected because: (a) it would be a new infrastructure dependency; (b) the percentage-rollout slider with live bucketing preview requires custom UI logic poorly suited to generic admin frameworks; (c) the existing internal tools application provides a component library and auth integration we can reuse at no extra cost.</p>
+      </section>
+
+      <section data-role="zone" data-zone="recommendations">
+        <h3>Recommendations</h3>
+        <ul>
+          <li>Build all flag UI pages within the existing internal tools React application — same component library, routing conventions, and auth context. No new app to deploy.</li>
+          <li>Enforce RBAC at the API layer (not only in the UI): flag mutation endpoints must check roles server-side so UI bypass is impossible.</li>
+          <li>Implement the rollout-slider bucketing preview client-side using the FNV-1a JS module (small, no external dependency) to give instant feedback without a round trip.</li>
+          <li>Audit history should be paginated, filterable by actor and date range, and deep-linkable by entry ID — the primary forensic tool during flag-related incidents.</li>
+        </ul>
+      </section>
+
+      <section data-role="zone" data-zone="open-questions">
+        <h3>Open Questions</h3>
+        <article data-role="open-question" data-question-id="q3.1" data-status="open" data-resolved-by="">
+          <h4>Who is the default owner for flags migrated from the existing config-file store?</h4>
+          <p>Flags migrated from the legacy config-file approach will not have a natural owner. Assigning them to the engineer running the migration script is misleading. Options: a shared "platform" service account, or requiring explicit owner assignment during the migration run. This affects RBAC for all day-one flags and must be decided before t3.6.</p>
+        </article>
+        <article data-role="open-question" data-question-id="q3.2" data-status="open" data-resolved-by="">
+          <h4>Should the admin UI support bulk archival of flags?</h4>
+          <p>Flags accumulate quickly and a bulk-archive action would reduce cleanup toil. However, bulk actions raise the blast radius if triggered accidentally. The alternative is single-flag archival only with a confirmation step. Needs a product decision before the archive UX is designed in t3.1.</p>
+        </article>
+      </section>
+
+      <article data-role="task" data-task-id="t3.1" data-reversibility="high" data-blast-radius="low">
+        <h3>Build flag list and search page</h3>
+        <p>Add a <code>/flags</code> route to the internal tools application. Render a table of all flags for the selected environment: key, description, type badge, lifecycle state, owner name, last-modified date. Include a text search box (client-side filter up to 500 flags; server-side beyond that), an environment switcher, and a lifecycle-state filter (active / archived / all). Each row links to the flag detail page. Include an empty state with a prominent "Create flag" CTA. The page must be keyboard-navigable, have screen-reader labels on all interactive elements, and load within 500 ms for up to 1 000 flags.</p>
+        <div class="task-badges"><span class="badge badge-green">blast-radius: low</span><span class="badge badge-green">reversibility: high</span></div>
+      </article>
+
+      <article data-role="task" data-task-id="t3.2" data-reversibility="medium" data-blast-radius="medium">
+        <h3>Implement flag create and edit form</h3>
+        <p>Build a form (following existing app modal or page patterns) with fields for: key (slugified, read-only after creation), description, owner (searchable user picker), flag type (radio), default value, and lifecycle state. For targeting rules, render a dynamic ordered list: rule type, value input, variant output, drag handle for reordering priority. Validate key uniqueness per environment on blur via a debounced API call. Restrict production-flag editing to admins and the flag's owner; show a tooltip for other roles. Wire form submission to <code>FlagWriter</code> API endpoints. Prevent the key field from being changed after creation — surface this clearly in the UI.</p>
+        <div class="task-badges"><span class="badge badge-yellow">blast-radius: medium</span><span class="badge badge-blue">reversibility: medium</span></div>
+      </article>
+
+      <article data-role="task" data-task-id="t3.3" data-reversibility="high" data-blast-radius="medium">
+        <h3>Add per-environment override controls</h3>
+        <p>On the flag detail page, render a tabbed or accordion view per environment. Each section shows active rules and default value for that environment. An "Override" button opens the rule editor scoped to that environment only. Visually distinguish inherited rules (grey, labelled "from production") from environment-specific overrides. When a user saves an override, write only to <code>flag_targeting_rules</code> rows for that environment; do not touch other environments. Provide a "Reset to inherited" action that deletes environment-specific rules. This action requires a confirmation dialog and is restricted to admins and owners.</p>
+        <div class="task-badges"><span class="badge badge-yellow">blast-radius: medium</span><span class="badge badge-blue">reversibility: medium</span></div>
+      </article>
+
+      <article data-role="task" data-task-id="t3.4" data-reversibility="high" data-blast-radius="low">
+        <h3>Build percentage rollout slider with live bucketing preview</h3>
+        <p>For percentage-type flags, replace the numeric input with a labelled range slider (0–100%). Below the slider, show a live preview: on drag, call the client-side FNV-1a bucketing function against 200 synthetic user IDs (drawn from a PRNG seeded by the flag's salt) and display the included vs. excluded count at the current threshold. Show a read-only "current production value" badge so the editor always sees the delta they are about to apply. Require a confirmation modal before saving if the delta exceeds 20 percentage points in a single edit.</p>
+        <div class="task-badges"><span class="badge badge-green">blast-radius: low</span><span class="badge badge-green">reversibility: high</span></div>
+      </article>
+
+      <article data-role="task" data-task-id="t3.5" data-reversibility="high" data-blast-radius="low">
+        <h3>Build audit history view</h3>
+        <p>Add an "Audit history" tab on the flag detail page rendering a paginated timeline from <code>flag_audit_log</code>. Each entry shows actor avatar, action verb (created / updated / archived), timestamp (relative with absolute on hover), and a colour-coded key-value diff of the before/after JSONB state. Support 20 entries per page with cursor-based pagination. Provide date-range and actor-name filters. Include a "Copy link" button that deep-links to a specific audit entry by ID — essential for post-mortems. The view is strictly read-only; no editing from this tab.</p>
+        <div class="task-badges"><span class="badge badge-green">blast-radius: low</span><span class="badge badge-green">reversibility: high</span></div>
+      </article>
+
+      <article data-role="task" data-task-id="t3.6" data-reversibility="medium" data-blast-radius="medium">
+        <h3>Implement and test role-based access control end-to-end</h3>
+        <p>Define three roles: <em>admin</em> (full access all flags all environments), <em>owner</em> (full access to own flags), <em>viewer</em> (read-only). Add server-side middleware on all flag mutation endpoints that checks the actor's role and the flag's owner field; return HTTP 403 with a structured error body on denial. In the UI, disable or hide edit controls for users without permission and show a contextual explanation. Write integration tests: owner editing own flag in production (allowed); viewer attempting any mutation (403); admin editing any flag (allowed); owner attempting to edit another owner's flag (403). Audit all flag API routes to confirm no endpoint is missing the role check before shipping Phase 3.</p>
+        <div class="task-badges"><span class="badge badge-yellow">blast-radius: medium</span><span class="badge badge-blue">reversibility: medium</span></div>
+      </article>
+
+    </div>
+  </section>
+
+</section>
+
+<!-- ═══════════════════════════════ DECISIONS ═══════════════════════════════ -->
+<section data-tab="decisions" hidden>
+
+  <article data-role="decision" data-decision-id="d1" data-decided-at="2026-06-09T00:00:00Z" data-decided-by="platform-engineering-lead">
+    <h3>Store flags in Postgres with Redis read-through cache, not in config files</h3>
+    <p class="decision-meta">Decided 2026-06-09 · platform-engineering-lead</p>
+    <p>We evaluated two storage approaches: (1) a <code>feature_flags</code> table in the primary Postgres database with a Redis read-through cache, and (2) YAML/JSON files committed to the monorepo and deployed with the application.</p>
+    <p>We chose Postgres + Redis because:</p>
+    <ul>
+      <li>Config files require a commit, CI pipeline, and deploy to change a flag — directly defeating the goal of killing a misbehaving feature without a deploy.</li>
+      <li>Runtime per-user and per-org targeting rules cannot be expressed in a static file without building a custom interpreter.</li>
+      <li>Postgres provides a natural home for the audit log with atomic transactional writes alongside flag mutations.</li>
+      <li>Redis is already in the stack and keeps read latency well inside the &lt;1 ms p99 budget.</li>
+    </ul>
+    <p data-role="rationale-against"><strong>Argument against:</strong> Config files have zero operational overhead, are automatically reviewed in pull requests, and require no running infrastructure for local development and CI. If the Postgres + Redis stack proves operationally expensive to maintain for a flags system, a hybrid (config files for local/CI, database for production) could be revisited in a follow-up iteration.</p>
+  </article>
+
+  <article data-role="decision" data-decision-id="d2" data-decided-at="2026-06-09T00:00:00Z" data-decided-by="platform-engineering-lead">
+    <h3>Evaluation engine runs in-process as a shared library, not as a sidecar service</h3>
+    <p class="decision-meta">Decided 2026-06-09 · platform-engineering-lead</p>
+    <p>We evaluated two deployment models: (1) an in-process library linked directly into each consuming application, and (2) a sidecar process per pod communicating over a local Unix socket.</p>
+    <p>We chose the in-process library because:</p>
+    <ul>
+      <li>The explicit constraint is zero additional network hops on the evaluation path. Even a Unix socket adds latency variance at p99 and complicates the deployment topology.</li>
+      <li>An in-process memory cache warmed at startup can serve evaluations in under 100 µs — well inside the 1 ms budget — with no IPC overhead.</li>
+      <li>A sidecar requires its own deployment artifact, health checks, resource limits, and runbook. That operational surface is disproportionate for a team of three.</li>
+    </ul>
+    <p data-role="rationale-against"><strong>Argument against:</strong> A sidecar isolates flag-store logic from application code and enables independent deployments of the evaluation engine without redeploying every consuming service. If the consuming service count grows beyond roughly 10, or if the evaluation logic becomes significantly more complex (ML-based targeting, remote experiments), a shared evaluation service would become the better trade-off and should be re-evaluated at that time.</p>
+  </article>
+
+  <article data-role="decision" data-decision-id="d3" data-decided-at="2026-06-09T00:00:00Z" data-decided-by="platform-engineering-lead">
+    <h3>Use FNV-1a (32-bit) hash modulo 10 000 for percentage bucketing</h3>
+    <p class="decision-meta">Decided 2026-06-09 · platform-engineering-lead</p>
+    <p>We chose FNV-1a (32-bit) over MurmurHash3, SHA-256-truncated, or simple integer modulo of the user ID. Reasons: FNV-1a is trivially implementable in both Go and TypeScript with no external library; it is fast enough to execute allocation-free on the hot evaluation path; and its avalanche properties are sufficient for the uniform-distribution requirement verified by property-based tests. Modulo 10 000 gives 0.01% granularity on rollout percentages — more than adequate for any realistic rollout. Per-flag salt ensures two flags at the same percentage do not always include the same users, preventing correlated exposure.</p>
+  </article>
+
+</section>
+
+<!-- ═══════════════════════════════ RISKS ═══════════════════════════════ -->
+<section data-tab="risks" hidden>
+
+  <article data-role="risk" data-risk-id="r1" data-status="open" data-resolved-by="">
+    <h3>Redis outage stalls flag-change propagation to running instances</h3>
+    <p><strong>Likelihood:</strong> Low–Medium. <strong>Impact:</strong> Medium — during a Redis outage, new flag writes are durable in Postgres but will not propagate to in-process caches until Redis recovers or instances restart. Old evaluations continue from the in-memory snapshot; a flag kill-switch activated during the outage will not take effect until recovery.</p>
+    <p><strong>Mitigations:</strong></p>
+    <ul>
+      <li>The 60-second poll fallback re-reads from Postgres (bypassing Redis) so the maximum staleness window during an outage is bounded by the poll interval.</li>
+      <li>Instrument a <code>flags.cache_source{source="postgres_fallback"}</code> metric that alerts on-call when the Redis path is unavailable.</li>
+      <li>Add a runbook section: during a prolonged Redis outage, a rolling restart of affected services will immediately re-warm caches from Postgres, picking up any flag changes made during the outage.</li>
+    </ul>
+  </article>
+
+  <article data-role="risk" data-risk-id="r2" data-status="open" data-resolved-by="">
+    <h3>Bucketing divergence between Go and TypeScript SDKs causes inconsistent user exposure</h3>
+    <p><strong>Likelihood:</strong> Medium — subtle integer-overflow or string-encoding differences between languages can produce different FNV-1a outputs for the same inputs without being caught in casual testing. <strong>Impact:</strong> High — a user bucketed "in" by one service and "out" by another experiences inconsistent feature behaviour within a single request path, which is difficult to diagnose and erodes trust in the system.</p>
+    <p><strong>Mitigations:</strong></p>
+    <ul>
+      <li>Canonical test-vector file (task t2.1): a JSON array of <code>{userId, salt, expectedBucket}</code> tuples generated by the Go reference. Both SDKs must pass all vectors in CI; a divergence blocks merging.</li>
+      <li>Cross-SDK integration test calling both implementations with identical inputs and asserting byte-identical outputs.</li>
+      <li>Code review of both FNV-1a implementations against the IETF reference spec before Phase 2 ships.</li>
+    </ul>
+  </article>
+
+  <article data-role="risk" data-risk-id="r3" data-status="open" data-resolved-by="">
+    <h3>Admin UI scope creep pushes Phase 3 past the six-week deadline</h3>
+    <p><strong>Likelihood:</strong> Medium — stakeholders typically expand requirements once they interact with a working flag UI (scheduled rollouts, analytics, approval workflows). <strong>Impact:</strong> Medium — a late Phase 3 means support and product teams cannot self-serve flag changes, reducing the value of Phases 1 and 2.</p>
+    <p><strong>Mitigations:</strong></p>
+    <ul>
+      <li>The out-of-scope list is documented in the framing tab and must be communicated to stakeholders at the Phase 3 kick-off meeting.</li>
+      <li>Weekly scope check-ins with the product owner during Phase 3 to surface and explicitly park new requests before they enter the sprint.</li>
+      <li>Any new request received during Phase 3 goes into a backlog item for a follow-up initiative, not into the current scope.</li>
+    </ul>
+  </article>
+
+  <article data-role="risk" data-risk-id="r4" data-status="open" data-resolved-by="">
+    <h3>PgBouncer configuration blocks Postgres NOTIFY, breaking push invalidation</h3>
+    <p><strong>Likelihood:</strong> Medium — PgBouncer in transaction-pooling mode (common in high-concurrency stacks) silently drops <code>LISTEN</code>/<code>NOTIFY</code> without error. <strong>Impact:</strong> Low–Medium — without push invalidation, flag changes propagate only via the 60-second TTL poll, introducing a staleness window that may be unacceptable for an emergency kill-switch use case.</p>
+    <p><strong>Mitigations:</strong></p>
+    <ul>
+      <li>Validate NOTIFY viability with the infrastructure team in Sprint 1 (assumption a4). Do not design the invalidation path assuming NOTIFY works until confirmed.</li>
+      <li>If PgBouncer blocks NOTIFY, open one dedicated long-lived Postgres connection (outside the pool) used solely for <code>LISTEN flags_changed</code>. Most stacks can afford one extra connection for this purpose.</li>
+      <li>If a dedicated connection is also infeasible, the 60-second TTL poll is the fallback. Document the staleness window in the operator runbook and evaluate whether it is acceptable for kill-switch scenarios.</li>
+    </ul>
+  </article>
+
+</section>
+
+<!-- ═══════════════════════════════ RESEARCH ═══════════════════════════════ -->
+<section data-tab="research" hidden>
+  <p class="empty-state">No research findings recorded yet. Findings will be added as open questions from the implementation phases are investigated.</p>
+</section>
+
+<!-- ═══════════════════════════════ EXPERIMENTS ═══════════════════════════════ -->
+<section data-tab="experiments" hidden>
+  <p class="empty-state">No experiment results recorded yet. Benchmark results from Phase 2 (evaluation latency, bucketing distribution) will be recorded here.</p>
+</section>
+
+<!-- ═══════════════════════════════ REVIEWS ═══════════════════════════════ -->
+<section data-tab="reviews" hidden>
+  <p class="empty-state">No reviews recorded yet. Design and code reviews will be tracked here as phases complete.</p>
+</section>
+
+<!-- ═══════════════════════════════ EXECUTION LOG ═══════════════════════════════ -->
+<section data-tab="execution-log" hidden>
+  <ol data-role="execution-events"></ol>
+</section>
+
+<!-- ═══════════════════════════════ RETROSPECTIVE ═══════════════════════════════ -->
+<section data-tab="retrospective" hidden>
+
+  <section data-role="zone" data-zone="what-shipped">
+    <h3>What Shipped</h3>
+  </section>
+
+  <section data-role="zone" data-zone="deviations-from-plan">
+    <h3>Deviations from Plan</h3>
+  </section>
+
+  <section data-role="zone" data-zone="what-we-learned">
+    <h3>What We Learned</h3>
+  </section>
+
+  <section data-role="zone" data-zone="followup-plans">
+    <h3>Follow-up Plans</h3>
+  </section>
+
+</section>
+
+<script>
+  (function () {
+    var buttons = document.querySelectorAll('[data-tab-target]');
+    var sections = document.querySelectorAll('[data-tab]');
+    buttons.forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        var target = btn.getAttribute('data-tab-target');
+        buttons.forEach(function (b) { b.removeAttribute('data-active'); });
+        sections.forEach(function (s) {
+          if (s.getAttribute('data-tab') === target) {
+            s.removeAttribute('hidden');
+            s.setAttribute('data-active', 'true');
+          } else {
+            s.setAttribute('hidden', '');
+            s.removeAttribute('data-active');
+          }
+        });
+        btn.setAttribute('data-active', 'true');
+      });
+    });
+  }());
+</script>
+
+</body>
+</html>
