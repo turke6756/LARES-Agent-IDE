@@ -39,7 +39,10 @@ import {
   findCodexSessionIdByCwd,
   ensureCodexResumeSessionId,
   shouldDiscoverCodexSession,
+  selectFreshCodexRollouts,
+  type DiscoveryResult,
 } from './session-id-discovery';
+import { listCodexRolloutFiles } from './log-readers/codex-rollout-reader';
 import { FileActivityTracker } from './file-activity-tracker';
 import {
   createAgent, getAgent, getActiveAgents, getAllAgents, getSupervisorAgent, getWorkspace, updateAgentStatus, updateAgentPid,
@@ -279,6 +282,12 @@ export class SubmitNotConfirmedError extends Error {
   }
 }
 
+// WP-P2 — how long a pending `initialUserPrompt` (LaunchAgentInput) stays
+// deliverable after launch. An agent that never reaches an input-accepting
+// status inside this window (stuck launch, crash loop) must not receive a
+// stale selection prompt minutes later.
+const INITIAL_USER_PROMPT_TTL_MS = 10 * 60_000;
+
 // ── P1 multi-transport hook delivery (plans/p1-hook-spool-multi-transport.md §2) ──
 
 /** Which channel delivered a hook event to the central applier. */
@@ -498,6 +507,14 @@ function shellSingleQuote(value: string): string {
 // session-id-discovery.ts) plus slack for the async DB write + dispatcher
 // pickup, so recovery never hijacks a still-resolving live launch (BUG-29).
 const CODEX_DISCOVERY_GRACE_MS = 45_000;
+
+// Stale-rollout hardening (sibling bug in
+// docs/BUG_claude-child-session-env-poisoning.md): when recovery finds no
+// rollout fresher than the agent's launch, it polls for one on this cadence
+// instead of binding a pre-existing (stale) rollout. Window sized for codex's
+// observed slow starts (interactive update prompt, ~1 s startup race).
+const CODEX_SID_RECOVERY_POLL_INTERVAL_MS = 2_000;
+const CODEX_SID_RECOVERY_POLL_WINDOW_MS = 60_000;
 
 /**
  * Parse a SQLite `datetime('now')` timestamp ("YYYY-MM-DD HH:MM:SS", UTC, no
@@ -738,6 +755,10 @@ export class AgentSupervisor extends EventEmitter {
   // pane and is rejected as 'stale'. Distinct from the monitor's BUG-23
   // `launchedAt`, which is cleared on promotion and therefore not durable.
   private launchStartedAt = new Map<string, number>();
+  // Stale-rollout hardening: agent ids with an active bounded poll waiting for
+  // a fresh-enough codex rollout (see startCodexSidRecoveryPoll). Guards
+  // against stacking concurrent polls when chat reads retrigger recovery.
+  private codexSidRecoveryPolls = new Set<string>();
   // Rate limiter for invalid-event warnings (per agent, 60 s).
   private lastInvalidHookWarnAt = new Map<string, number>();
   // §3 — spool tailers, keyed by CANONICAL spool read path (the resolved
@@ -756,6 +777,16 @@ export class AgentSupervisor extends EventEmitter {
   private hookTransportTick = 0;
   // §4 — guards against overlapping async tmux polls on slow wsl.exe.
   private tmuxOptionPollInFlight = false;
+
+  // WP-P2 (plans/selection-to-agent-primitive-plan.md §7) — pending initial
+  // USER prompts for freshly-launched agents, delivered exactly once on the
+  // FIRST persisted transition into an input-accepting status
+  // (idle|waiting|done) while a live runner exists. Deliberately separate
+  // from the launch-time positional-arg agentMdPrompt path (§1.6): the
+  // prompt must arrive as a clean user message on every provider, with zero
+  // risk of duplicating or reordering launch instructions. Entries expire
+  // after INITIAL_USER_PROMPT_TTL_MS and are cleared on agent stop/delete.
+  private pendingInitialPrompts = new Map<string, { text: string; expiresAt: number }>();
 
   constructor() {
     super();
@@ -856,6 +887,15 @@ export class AgentSupervisor extends EventEmitter {
       if (data && data.source && data.source !== 'monitor') {
         void this.bridge.onStatusChanged(data);
       }
+    });
+
+    // WP-P2 — every persisted status transition flows through a
+    // supervisor-level 'statusChanged' emission (monitor-sourced ones are
+    // re-emitted above; runner-exit / launch / restart / stop emit directly),
+    // so this listener is the single choke-point for delivering a pending
+    // initial user prompt on the first input-accepting transition.
+    this.on('statusChanged', (data: StatusChangedEvent | undefined) => {
+      if (data) this.maybeDeliverInitialUserPrompt(data.agentId, data.status);
     });
 
     // Typed session-event reader — single source of truth for JSONL tailing.
@@ -1242,6 +1282,18 @@ export class AgentSupervisor extends EventEmitter {
     // post-launch session-id discovery so the new agent isn't bound to any
     // pre-existing rollout in this cwd. No-op for non-codex providers.
     const freshSession = resolvedInput.freshSession === true;
+
+    // WP-P2 (selection→agent primitive, §1.6): a clean initial USER message,
+    // delivered post-launch on the first input-accepting status transition
+    // (see maybeDeliverInitialUserPrompt). Never merged into agentMdPrompt
+    // above — that positional-arg path mixes content into launch framing and
+    // is claude-only.
+    if (resolvedInput.initialUserPrompt) {
+      this.pendingInitialPrompts.set(agent.id, {
+        text: resolvedInput.initialUserPrompt,
+        expiresAt: Date.now() + INITIAL_USER_PROMPT_TTL_MS,
+      });
+    }
 
     if (pathType === 'windows') {
       await this.launchWindowsAgent(agent, false, agentMdPrompt, sessionId, undefined, freshSession);
@@ -2459,13 +2511,16 @@ export class AgentSupervisor extends EventEmitter {
    * Returns the recovered id, or null when no rollout matches.
    */
   private recoverCodexResumeSessionId(agent: Agent): string | null {
-    const home: 'windows' | 'wsl' =
-      detectPathType(agent.workingDirectory) === 'windows' ? 'windows' : 'wsl';
-    const result = findCodexSessionIdByCwd({
-      home,
-      workingDirectory: agent.workingDirectory,
-    });
-    if (!result) return null;
+    const result = this.scanForFreshCodexRollout(agent);
+    if (!result) {
+      // Stale-rollout hardening: codex may simply not have written its new
+      // rollout yet (interactive update prompt, ~1 s startup race — see
+      // docs/BUG_claude-child-session-env-poisoning.md sibling bug). Binding
+      // the newest PRE-EXISTING rollout attaches the agent to a dead chat, so
+      // bind nothing now and poll for a fresh-enough rollout instead.
+      this.startCodexSidRecoveryPoll(agent.id);
+      return null;
+    }
     updateAgentResumeSessionId(agent.id, result.sessionId);
     // BUG-26: rebind drops any provisional/wrong events the reader may have
     // emitted under the stale (empty) sessionId. invalidatePath alone only
@@ -2476,6 +2531,80 @@ export class AgentSupervisor extends EventEmitter {
       `[Codex] Recovered session id ${result.sessionId} for agent ${agent.id} via cwd-match (${result.path})`
     );
     return result.sessionId;
+  }
+
+  /**
+   * One cwd-match scan that only accepts rollouts whose session timestamp
+   * (UUIDv7 / filename) is at/after the agent's launch and that no other
+   * agent record already owns. Launch floor: this boot's launch stamp when
+   * present, else the DB `created_at` (covers resume-after-app-restart, where
+   * the agent's own older rollout is legitimately pre-boot but never predates
+   * the record's creation).
+   */
+  private scanForFreshCodexRollout(agent: Agent): DiscoveryResult | null {
+    const home: 'windows' | 'wsl' =
+      detectPathType(agent.workingDirectory) === 'windows' ? 'windows' : 'wsl';
+    const launchedAtMs =
+      this.launchStartedAt.get(agent.id) ?? parseSqliteUtcMs(agent.createdAt);
+    const ownedByOthers = new Set<string>();
+    for (const other of getAllAgents()) {
+      if (other.id !== agent.id && other.resumeSessionId) {
+        ownedByOthers.add(other.resumeSessionId);
+      }
+    }
+    return findCodexSessionIdByCwd({
+      home,
+      workingDirectory: agent.workingDirectory,
+      listFiles: (h) => selectFreshCodexRollouts(
+        listCodexRolloutFiles({ home: h, daysBack: 'all' }),
+        { launchedAtMs, excludeSessionIds: ownedByOthers }
+      ),
+    });
+  }
+
+  /**
+   * Bounded retry for the no-fresh-rollout-yet case: rescan every
+   * CODEX_SID_RECOVERY_POLL_INTERVAL_MS for up to
+   * CODEX_SID_RECOVERY_POLL_WINDOW_MS. On a hit, persist + rebind via the
+   * same path as recoverCodexResumeSessionId; on expiry, warn loudly and
+   * leave resumeSessionId unset (a later recovery pass, e.g. the next chat
+   * read, starts a new window). Timers are unref'd so they never hold the
+   * process open.
+   */
+  private startCodexSidRecoveryPoll(agentId: string): void {
+    if (this.codexSidRecoveryPolls.has(agentId)) return;
+    this.codexSidRecoveryPolls.add(agentId);
+    const deadline = Date.now() + CODEX_SID_RECOVERY_POLL_WINDOW_MS;
+    const tick = (): void => {
+      const latest = getAgent(agentId);
+      if (!latest || latest.provider !== 'codex' || latest.resumeSessionId) {
+        // Gone, or bound meanwhile (post-launch SQL discovery won the race).
+        this.codexSidRecoveryPolls.delete(agentId);
+        return;
+      }
+      const result = this.scanForFreshCodexRollout(latest);
+      if (result) {
+        this.codexSidRecoveryPolls.delete(agentId);
+        updateAgentResumeSessionId(agentId, result.sessionId);
+        this.sessionLogReader.rebindAgent(agentId);
+        console.log(
+          `[Codex] Recovered session id ${result.sessionId} for agent ${agentId} via fresh-rollout poll (${result.path})`
+        );
+        return;
+      }
+      if (Date.now() >= deadline) {
+        this.codexSidRecoveryPolls.delete(agentId);
+        console.warn(
+          `[Codex] sid recovery gave up for agent ${agentId}: no rollout newer than launch appeared within ` +
+          `${CODEX_SID_RECOVERY_POLL_WINDOW_MS / 1000}s — leaving resumeSessionId unset rather than binding a stale rollout`
+        );
+        return;
+      }
+      const t = setTimeout(tick, CODEX_SID_RECOVERY_POLL_INTERVAL_MS);
+      t.unref?.();
+    };
+    const t = setTimeout(tick, CODEX_SID_RECOVERY_POLL_INTERVAL_MS);
+    t.unref?.();
   }
 
   /**
@@ -3154,6 +3283,9 @@ export class AgentSupervisor extends EventEmitter {
     }
 
     this.fileTrackers.delete(agentId);
+    // WP-P2 — a stopped agent must never receive its pending initial prompt
+    // (clear BEFORE the 'done' emission below; 'done' is input-accepting).
+    this.pendingInitialPrompts.delete(agentId);
     const priorStop = getAgent(agentId)?.status;
     updateAgentStatus(agentId, 'done');
     updateAgentExitCode(agentId, 0);
@@ -3190,6 +3322,8 @@ export class AgentSupervisor extends EventEmitter {
     this.launchStartedAt.delete(agentId);
     this.lastInvalidHookWarnAt.delete(agentId);
     this.releaseSpoolTailer(agentId);
+    // WP-P2 — drop any undelivered initial prompt with the agent record.
+    this.pendingInitialPrompts.delete(agentId);
     dbDeleteAgent(agentId);
     this.emit('agentDeleted', { agentId });
   }
@@ -3260,6 +3394,33 @@ export class AgentSupervisor extends EventEmitter {
 
   hasRunner(agentId: string): boolean {
     return this.windowsRunners.has(agentId) || this.wslRunners.has(agentId);
+  }
+
+  /** WP-P2 (plans/selection-to-agent-primitive-plan.md §7) — deliver a
+   *  pending `initialUserPrompt` on the FIRST persisted transition into an
+   *  input-accepting status (idle|waiting|done) for an agent with a live
+   *  runner. Exactly-once by construction: the entry is deleted BEFORE the
+   *  async send, so a second accepting transition during delivery finds no
+   *  entry. Async delivery failures ride the existing
+   *  'agent:send-input-error' renderer flow via the 'sendInputError'
+   *  supervisor event (forwarded in ipc-handlers.ts). */
+  private maybeDeliverInitialUserPrompt(agentId: string, status: AgentStatus): void {
+    if (status !== 'idle' && status !== 'waiting' && status !== 'done') return;
+    const pending = this.pendingInitialPrompts.get(agentId);
+    if (!pending) return;
+    if (Date.now() > pending.expiresAt) {
+      this.pendingInitialPrompts.delete(agentId);
+      console.warn(`[initial-prompt] Pending initial prompt for ${agentId} expired undelivered`);
+      return;
+    }
+    // No live runner (e.g. a runner-exit 'done') — keep the entry; a restart
+    // inside the TTL window can still deliver it, and stop/delete clear it.
+    if (!this.hasRunner(agentId)) return;
+    this.pendingInitialPrompts.delete(agentId);
+    this.sendInput(agentId, pending.text).catch((err: Error) => {
+      console.error(`[initial-prompt] Delivery to ${agentId} failed:`, err);
+      this.emit('sendInputError', { agentId, error: err.message });
+    });
   }
 
   /** Class IV — called by src/main/index.ts after apiServer.start() so the

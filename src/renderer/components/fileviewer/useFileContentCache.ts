@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import type { FileContent, FsEvent, PathType } from '../../../shared/types';
 import { useDashboardStore } from '../../stores/dashboard-store';
+import { contentHash } from './markdownSplice';
 
 // Module-level cache: tabId -> FileContent
 const contentCache = new Map<string, FileContent>();
@@ -11,6 +12,76 @@ export function evictTabCache(tabId: string) {
 
 export function evictAllCache() {
   contentCache.clear();
+}
+
+// ── Write-generation token (WP1-A task 6, plan §5) ─────────────────────────
+// saveTab records the content it is about to write here *before* invoking
+// files:write; revalidate drops fs events whose fresh content matches a
+// recent write. This closes the echo race where the watcher fires before
+// saveTab's async originalContent update lands (the old equality check below
+// could observe stale state and surface a bogus external-change banner).
+//
+// The hash is the pure `contentHash` from markdownSplice — the app-wide
+// selection primitive reuses the same function for comment doc_hash, so the
+// two must never diverge.
+const RECENT_WRITE_TTL_MS = 10_000;
+const recentWrites = new Map<string, Array<{ hash: string; ts: number }>>();
+
+export function recordRecentWrite(tabId: string, content: string): void {
+  const now = Date.now();
+  const live = (recentWrites.get(tabId) ?? []).filter(
+    (e) => now - e.ts < RECENT_WRITE_TTL_MS,
+  );
+  live.push({ hash: contentHash(content), ts: now });
+  recentWrites.set(tabId, live);
+}
+
+export function isRecentWriteEcho(tabId: string, content: string): boolean {
+  const entries = recentWrites.get(tabId);
+  if (!entries) return false;
+  const now = Date.now();
+  const live = entries.filter((e) => now - e.ts < RECENT_WRITE_TTL_MS);
+  if (live.length === 0) {
+    recentWrites.delete(tabId);
+    return false;
+  }
+  recentWrites.set(tabId, live);
+  const hash = contentHash(content);
+  return live.some((e) => e.hash === hash);
+}
+
+// ── Fresh-content handler seam (WP1-A task 5, plan §5) ─────────────────────
+// An editor can register a per-tab handler that is consulted before the
+// default setContent/markExternalChange paths when revalidate sees changed
+// disk content. v1: the WYSIWYG editor returns 'conflict' when dirty (banner)
+// and 'fallback' when clean (content swap + baseline refresh); 'handled'
+// means the handler applied the change itself (Phase 3: ProseMirror
+// transaction) and only the cache should be updated.
+export type FreshContentVerdict = 'handled' | 'conflict' | 'fallback';
+export type FreshContentHandler = (freshContent: string) => FreshContentVerdict;
+
+const freshContentHandlers = new Map<string, FreshContentHandler>();
+
+export function registerFreshContentHandler(
+  tabId: string,
+  handler: FreshContentHandler,
+): () => void {
+  freshContentHandlers.set(tabId, handler);
+  return () => {
+    // A stale disposer (from a previous registration) must not remove a
+    // newer handler registered for the same tab.
+    if (freshContentHandlers.get(tabId) === handler) {
+      freshContentHandlers.delete(tabId);
+    }
+  };
+}
+
+export function consultFreshContentHandler(
+  tabId: string,
+  freshContent: string,
+): FreshContentVerdict | null {
+  const handler = freshContentHandlers.get(tabId);
+  return handler ? handler(freshContent) : null;
 }
 
 function parentDirOf(filePath: string): string {
@@ -53,6 +124,12 @@ export function useFileContentCache(tabId: string, filePath: string, pathType: P
           setContent((prev) => (prev === cachedNow ? prev : cachedNow));
           return;
         }
+        // Write-generation token: drop watcher echoes of our own saves before
+        // any state-based checks (originalContent may not be updated yet).
+        if (isRecentWriteEcho(tabId, fresh.content)) {
+          contentCache.set(tabId, fresh);
+          return;
+        }
         const store = useDashboardStore.getState();
         const editState = store.tabEditState[tabId];
         if (editState && editState.originalContent === fresh.content && !editState.dirty) {
@@ -63,7 +140,24 @@ export function useFileContentCache(tabId: string, filePath: string, pathType: P
 
         contentCache.set(tabId, fresh);
 
-        if (editState && editState.mode === 'edit') {
+        // A registered per-tab handler (the WYSIWYG editor) gets first say.
+        const verdict = consultFreshContentHandler(tabId, fresh.content);
+        if (verdict === 'handled') {
+          return;
+        }
+        if (verdict === 'conflict') {
+          store.markExternalChange(tabId, fresh.content);
+          return;
+        }
+        if (verdict === 'fallback') {
+          // Content swap + baseline refresh (refreshOriginalContent is a
+          // no-op if the tab went dirty between the handler call and here).
+          setContent(fresh);
+          store.refreshOriginalContent(tabId, fresh.content);
+          return;
+        }
+
+        if (editState && editState.mode !== 'view') {
           // Don't trample the editor while the user has it open.
           // Surface a banner so they can choose to reload or keep edits.
           store.markExternalChange(tabId, fresh.content);

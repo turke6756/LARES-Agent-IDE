@@ -9,7 +9,6 @@ import DirectoryTree from './DirectoryTree';
 import ResizeDivider from '../layout/ResizeDivider';
 import CollapseButton from '../layout/CollapseButton';
 import { evictTabCache } from './useFileContentCache';
-import { ArrowLeft } from 'lucide-react';
 
 function useSwipeRight(onSwipe: () => void) {
   const startRef = useRef<{ x: number; y: number } | null>(null);
@@ -96,7 +95,7 @@ export default function FileViewerPanel() {
     const handler = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
         const editState = displayedTabId ? tabEditState[displayedTabId] : null;
-        if (displayedTabId && editState?.mode === 'edit') {
+        if (displayedTabId && editState && editState.mode !== 'view') {
           e.preventDefault();
           void saveTab(displayedTabId);
         }
@@ -129,26 +128,10 @@ export default function FileViewerPanel() {
   // Only show file header + content for tabs that have a file (not directory-only tabs)
   const hasFile = !!effectiveTab.filePath;
 
-  // Extract directory name for display
-  const dirName = treeRoot.split('/').filter(Boolean).pop() || treeRoot;
-
   return (
     <div className="flex-1 flex flex-col min-w-0 overflow-hidden bg-surface-0" {...swipeToAgents}>
-      {/* Persistent Back Bar — always visible. Also a window-drag surface. */}
-      <div className="flex items-center gap-3 px-4 py-2 border-b dark:border-white/10 light:border-black/10 bg-surface-1/60 backdrop-blur-md shrink-0 app-drag-region">
-        <button
-          onClick={hideFileViewer}
-          className="app-no-drag flex items-center gap-1.5 text-gray-400 hover:text-white transition-colors text-[13px] font-sans shrink-0 group"
-          title="Back to agents"
-        >
-          <ArrowLeft className="w-3.5 h-3.5 group-hover:-translate-x-0.5 transition-transform" />
-          <span>Back</span>
-        </button>
-        <div className="h-4 w-px bg-accent-blue/20 shrink-0" />
-        <span className="text-[13px] font-sans text-gray-300 truncate">{dirName}</span>
-      </div>
-
-      {/* Tab Bar */}
+      {/* Tab Bar — sits directly under MainContent's fixed top bar; swipe right
+          on touch returns to the dashboard view. */}
       <FileTabBar
         tabs={visibleTabs}
         activeTabId={effectiveTab.id}

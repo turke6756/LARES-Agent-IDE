@@ -18,6 +18,7 @@ import {
   detectEol,
   getSpliceFallbackCount,
   onSpliceFallback,
+  contentHash,
   type SpliceBaseline,
 } from './markdownSplice';
 
@@ -516,5 +517,27 @@ describe('sniffWysiwygCompatibility', () => {
   it('parse failures are contained, not thrown', () => {
     const bogus = {} as unknown as string; // .replace explodes inside the pipeline
     expect(sniffWysiwygCompatibility(bogus, 10)).toEqual({ ok: false, reason: 'parse-failure' });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// contentHash (WP1-B task 8) — the shared identity hash for WP1-A's
+// write-generation token and the future selection-comment doc_hash.
+// ---------------------------------------------------------------------------
+
+describe('contentHash', () => {
+  it('is deterministic and a fixed-width lowercase hex string', () => {
+    const h = contentHash('# Title\r\n\r\nbody\r\n');
+    expect(h).toBe(contentHash('# Title\r\n\r\nbody\r\n'));
+    expect(h).toMatch(/^[0-9a-f]{14}$/);
+    expect(contentHash('')).toMatch(/^[0-9a-f]{14}$/);
+  });
+
+  it('is byte-identity: EOL flavor, whitespace, and case all matter', () => {
+    expect(contentHash('a\r\nb')).not.toBe(contentHash('a\nb'));
+    expect(contentHash('a b')).not.toBe(contentHash('a  b'));
+    expect(contentHash('Heading')).not.toBe(contentHash('heading'));
+    expect(contentHash('x')).not.toBe(contentHash('y'));
+    expect(contentHash('')).not.toBe(contentHash(' '));
   });
 });

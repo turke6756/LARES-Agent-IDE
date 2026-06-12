@@ -5,6 +5,7 @@ import * as Icons from 'lucide-react';
 import FileIcon from './FileIcon';
 import { useDashboardStore } from '../../stores/dashboard-store';
 import { useWysiwygBeta, setWysiwygBetaEnabled } from './wysiwygBeta';
+import type { TabMode } from './contentViewMode';
 
 interface Props {
   tabId: string;
@@ -21,18 +22,24 @@ export default function FileViewerHeader({ tabId, filePath, pathType, fileSize, 
   const fileType = detectFileType(filePath);
   const language = fileType === 'code' ? detectLanguage(filePath) : fileType;
   const editable = isEditableFileType(filePath);
-  const [enteringEdit, setEnteringEdit] = useState(false);
+  const isMarkdown = fileType === 'markdown';
+  const [switchingMode, setSwitchingMode] = useState(false);
   const editState = useDashboardStore((state) => state.tabEditState[tabId]);
-  const enterEditMode = useDashboardStore((state) => state.enterEditMode);
+  const enterSourceMode = useDashboardStore((state) => state.enterSourceMode);
+  const enterWysiwygMode = useDashboardStore((state) => state.enterWysiwygMode);
+  const enterViewMode = useDashboardStore((state) => state.enterViewMode);
   const exitEditMode = useDashboardStore((state) => state.exitEditMode);
   const discardTabChanges = useDashboardStore((state) => state.discardTabChanges);
   const saveTab = useDashboardStore((state) => state.saveTab);
   const checkHealth = useDashboardStore((state) => state.checkHealth);
-  const isEditing = editState?.mode === 'edit';
   const wysiwygBeta = useWysiwygBeta();
   const dirty = !!editState?.dirty;
   const saving = !!editState?.saving;
   const saveError = editState?.error;
+  // Mode shown as active. Markdown tabs without an edit session display the
+  // default (WYSIWYG when the beta flag is on) — FileContentArea creates the
+  // real tabEditState when the canvas mounts.
+  const mode: TabMode = editState?.mode ?? (isMarkdown && wysiwygBeta ? 'wysiwyg' : 'view');
 
   const handleOpenInVSCode = async () => {
     if (workingDirectory) {
@@ -45,30 +52,60 @@ export default function FileViewerHeader({ tabId, filePath, pathType, fileSize, 
     }
   };
 
-  const handleEdit = async () => {
-    if (!editable || enteringEdit) return;
-    setEnteringEdit(true);
-    try {
-      const result = await window.api.files.readFile(filePath, pathType);
-      if (result.error) {
-        window.alert(result.error);
-        return;
-      }
-      enterEditMode(tabId, result.content);
-    } finally {
-      if (pathType === 'wsl') {
-        void checkHealth();
-      }
-      setEnteringEdit(false);
+  const readFileFromDisk = async (): Promise<string | null> => {
+    const result = await window.api.files.readFile(filePath, pathType);
+    if (result.error) {
+      window.alert(result.error);
+      return null;
     }
+    return result.content;
   };
 
-  const handleView = () => {
-    if (dirty && !window.confirm('Discard unsaved changes?')) return;
-    if (dirty) {
-      discardTabChanges(tabId);
-    } else {
-      exitEditMode(tabId);
+  // Single mode-switch path for the three-state markdown control and the
+  // legacy Edit/View buttons on other editable types. A dirty draft survives
+  // only the wysiwyg → source direction (CodeMirror can show the spliced
+  // draft; the WYSIWYG editor only loads original on-disk bytes per the WP1
+  // props contract) — every other dirty switch asks before discarding.
+  const switchMode = async (target: TabMode) => {
+    if (switchingMode || mode === target) return;
+    if (!editable && target !== 'view') return;
+    const carriesDraft = dirty && mode === 'wysiwyg' && target === 'source';
+    if (dirty && !carriesDraft && !window.confirm('Discard unsaved changes?')) return;
+
+    if (target === 'view') {
+      if (dirty) {
+        discardTabChanges(tabId); // also sets mode 'view'
+      } else if (editState) {
+        exitEditMode(tabId);
+      } else {
+        // No edit session yet (markdown default-WYSIWYG tab) — pin the
+        // explicit view choice so it overrides the default.
+        setSwitchingMode(true);
+        try {
+          const content = await readFileFromDisk();
+          if (content !== null) enterViewMode(tabId, content);
+        } finally {
+          if (pathType === 'wsl') void checkHealth();
+          setSwitchingMode(false);
+        }
+      }
+      return;
+    }
+
+    if (dirty && !carriesDraft) discardTabChanges(tabId);
+    setSwitchingMode(true);
+    try {
+      const content = await readFileFromDisk();
+      if (content === null) return;
+      if (target === 'source') {
+        // enterSourceMode preserves a dirty draft (the wysiwyg → source carry).
+        enterSourceMode(tabId, content);
+      } else {
+        enterWysiwygMode(tabId, content);
+      }
+    } finally {
+      if (pathType === 'wsl') void checkHealth();
+      setSwitchingMode(false);
     }
   };
 
@@ -122,7 +159,7 @@ export default function FileViewerHeader({ tabId, filePath, pathType, fileSize, 
         <span className="text-[11px] text-accent-blue px-1.5 py-0.5 bg-accent-blue/10">
           {language}
         </span>
-        
+
         {fileSize > 0 && (
           <span className="text-[13px] font-sans text-gray-300 flex items-center gap-1">
             <Icons.Database className="w-3 h-3" />
@@ -130,48 +167,74 @@ export default function FileViewerHeader({ tabId, filePath, pathType, fileSize, 
           </span>
         )}
 
-        {fileType === 'markdown' && !isEditing && (
-          <button
-            onClick={() => setWysiwygBetaEnabled(!wysiwygBeta)}
-            className={`ui-btn text-[13px] ${wysiwygBeta ? 'text-accent-blue' : ''}`}
-            title="Phase 0 spike: render markdown in the Crepe WYSIWYG editor (view-only, nothing saves)"
-          >
-            <Icons.Sparkles className="w-3 h-3" />
-            WYSIWYG (beta)
-          </button>
+        {editable && isMarkdown && (
+          <div className="flex items-center gap-0.5" role="group" aria-label="Markdown mode">
+            <button
+              onClick={() => { void switchMode('view'); }}
+              className={`ui-btn text-[13px] ${mode === 'view' ? 'text-accent-blue' : ''}`}
+              title="Rendered preview (read-only)"
+            >
+              <Icons.Eye className="w-3 h-3" />
+              View
+            </button>
+            <button
+              onClick={() => { void switchMode('wysiwyg'); }}
+              disabled={switchingMode}
+              className={`ui-btn text-[13px] ${mode === 'wysiwyg' ? 'text-accent-blue' : ''}`}
+              title="Edit in the WYSIWYG canvas"
+            >
+              <Icons.Sparkles className="w-3 h-3" />
+              WYSIWYG
+            </button>
+            <button
+              onClick={() => { void switchMode('source'); }}
+              disabled={switchingMode}
+              className={`ui-btn text-[13px] ${mode === 'source' ? 'text-accent-blue' : ''}`}
+              title="Edit raw markdown source"
+            >
+              {switchingMode ? <Icons.Loader2 className="w-3 h-3 animate-spin" /> : <Icons.Code className="w-3 h-3" />}
+              Source
+            </button>
+            <button
+              onClick={() => setWysiwygBetaEnabled(!wysiwygBeta)}
+              className={`ui-btn text-[13px] ${wysiwygBeta ? 'text-accent-blue' : ''}`}
+              title={`Beta: open markdown files in the WYSIWYG canvas by default (currently ${wysiwygBeta ? 'on' : 'off'})`}
+            >
+              <Icons.Wand2 className="w-3 h-3" />
+            </button>
+          </div>
         )}
 
-        {editable && (
-          <>
-            {isEditing ? (
-              <>
-                <button
-                  onClick={handleView}
-                  className="ui-btn text-[13px]"
-                >
-                  <Icons.Eye className="w-3 h-3" />
-                  View
-                </button>
-                <button
-                  onClick={handleSave}
-                  disabled={!dirty || saving}
-                  className="ui-btn ui-btn-primary text-[13px]"
-                >
-                  {saving ? <Icons.Loader2 className="w-3 h-3 animate-spin" /> : <Icons.Save className="w-3 h-3" />}
-                  Save
-                </button>
-              </>
-            ) : (
-              <button
-                onClick={handleEdit}
-                disabled={enteringEdit}
-                className="ui-btn text-[13px]"
-              >
-                {enteringEdit ? <Icons.Loader2 className="w-3 h-3 animate-spin" /> : <Icons.Pencil className="w-3 h-3" />}
-                Edit
-              </button>
-            )}
-          </>
+        {editable && !isMarkdown && (
+          mode !== 'view' ? (
+            <button
+              onClick={() => { void switchMode('view'); }}
+              className="ui-btn text-[13px]"
+            >
+              <Icons.Eye className="w-3 h-3" />
+              View
+            </button>
+          ) : (
+            <button
+              onClick={() => { void switchMode('source'); }}
+              disabled={switchingMode}
+              className="ui-btn text-[13px]"
+            >
+              {switchingMode ? <Icons.Loader2 className="w-3 h-3 animate-spin" /> : <Icons.Pencil className="w-3 h-3" />}
+              Edit
+            </button>
+          )
+        )}
+
+        {editable && mode !== 'view' && (
+          <button
+            onClick={handleSave}
+            disabled={!dirty || saving}
+            className="ui-btn ui-btn-primary text-[13px]"
+          >
+            {saving ? <Icons.Loader2 className="w-3 h-3 animate-spin" /> : <Icons.Save className="w-3 h-3" />}
+            Save
+          </button>
         )}
 
         {saveError && (

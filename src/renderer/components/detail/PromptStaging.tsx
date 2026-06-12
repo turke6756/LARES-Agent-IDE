@@ -9,6 +9,7 @@ import {
   type NoteSlot,
 } from '../../lib/prompt-staging';
 import { loadDraft, saveDraft } from '../../lib/chat-drafts';
+import { onStagingExternalChange } from '../../lib/selection/staging-events';
 import ChatInputBar from './ChatInputBar';
 
 // Custom MIME used by the bar's drag handle so note rows can distinguish a
@@ -40,6 +41,16 @@ export default function PromptStaging({ agentId, agentStatus }: Props) {
   useEffect(() => {
     saveStaging(agentId, state);
   }, [agentId, state]);
+
+  // Re-read when something outside this component (selection-dispatch's
+  // busy-agent fallback) appends to our agent's staging in localStorage —
+  // otherwise the persist effect above would clobber the external note on
+  // our next state change. Safe to reload wholesale: every local edit is
+  // already persisted by that effect before any external write can land.
+  useEffect(
+    () => onStagingExternalChange(agentId, () => setState(loadStaging(agentId))),
+    [agentId],
+  );
 
   // Keep at least one note slot present so the "Add a note…" stub is always
   // visible as the affordance — there's no separate empty-state placeholder.

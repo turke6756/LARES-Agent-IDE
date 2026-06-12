@@ -1,5 +1,4 @@
 import React, { useEffect } from 'react';
-import { useDashboardStore } from '../../stores/dashboard-store';
 import { useBrowserStore, getBrowserApi, ensureBrowserBridge } from '../../stores/browser-store';
 import BrowserTabStrip from './BrowserTabStrip';
 import AddressBar from './AddressBar';
@@ -13,7 +12,6 @@ import * as Icons from 'lucide-react';
 // or model output (M9/WP2 rely on this).
 
 export default function BrowserPanel() {
-  const hideBrowser = useDashboardStore((s) => s.hideBrowser);
   const tabs = useBrowserStore((s) => s.tabs);
   const activeTabId = useBrowserStore((s) => s.activeTabId);
   const pendingOpenUrl = useBrowserStore((s) => s.pendingOpenUrl);
@@ -32,23 +30,6 @@ export default function BrowserPanel() {
 
   return (
     <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
-      <div className="panel-header h-16 px-4 sticky top-0 z-10 flex items-center shrink-0 app-drag-region">
-        <div className="flex items-center gap-3 w-full">
-          <button
-            onClick={() => hideBrowser()}
-            className="ui-btn ui-btn-ghost p-1.5 app-no-drag"
-            title="Back to agents"
-          >
-            <Icons.ArrowLeft className="w-4 h-4" />
-          </button>
-          <Icons.Globe className="w-4 h-4 text-gray-400" />
-          <h2 className="text-[14px] font-semibold text-gray-100">Browser</h2>
-          <span className="text-[11px] text-gray-500 truncate">
-            sign-ins persist in your partition; agent tabs are isolated
-          </span>
-        </div>
-      </div>
-
       {!apiPresent ? (
         <div className="flex-1 flex items-center justify-center text-gray-500">
           <div className="text-center max-w-md px-6">
@@ -97,6 +78,9 @@ export default function BrowserPanel() {
                   <Icons.Plus className="w-4 h-4" />
                   New tab
                 </button>
+                <div className="text-[11px] mt-3 text-gray-600">
+                  sign-ins persist in your partition; agent tabs are isolated
+                </div>
               </div>
             </div>
           ) : (

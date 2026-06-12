@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import type { Agent, Workspace, HealthCheck, FileActivity, QueryResult, ContextStats, PathType, FileTab, PanelLayout, Team, TeamMessage, CreateTeamInput } from '../../shared/types';
-import { evictTabCache } from '../components/fileviewer/useFileContentCache';
+import { evictTabCache, recordRecentWrite } from '../components/fileviewer/useFileContentCache';
 import { clearDraft } from '../lib/chat-drafts';
 
 interface WorkspaceHeat {
@@ -72,7 +72,9 @@ function resolveAgainstRoot(filePath: string, rootDirectory: string): string {
 }
 
 interface TabEditState {
-  mode: 'view' | 'edit';
+  // Three-mode model (plan §5): 'view' = rendered preview, 'wysiwyg' = the
+  // Milkdown canvas, 'source' = CodeMirror raw text (the old 'edit').
+  mode: 'view' | 'wysiwyg' | 'source';
   draftContent: string;
   originalContent: string;
   dirty: boolean;
@@ -158,7 +160,9 @@ interface DashboardState {
   moveTab: (tabId: string, targetTabId: string) => void;
   setTabColor: (tabId: string, color: string | null) => void;
   closeAllTabs: () => void;
-  enterEditMode: (tabId: string, initialContent: string) => void;
+  enterSourceMode: (tabId: string, initialContent: string) => void;
+  enterWysiwygMode: (tabId: string, initialContent: string) => void;
+  enterViewMode: (tabId: string, initialContent: string) => void;
   exitEditMode: (tabId: string) => void;
   setDraftContent: (tabId: string, content: string) => void;
   saveTab: (tabId: string) => Promise<boolean>;
@@ -175,6 +179,7 @@ interface DashboardState {
   toggleFileViewer: () => void;
   showBrowser: () => void;
   hideBrowser: () => void;
+  showDashboard: () => void;
 
   // Backward-compat shims
   openFileViewer: (filePath: string, agentId: string) => void;
@@ -355,14 +360,16 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
     set({ openTabs: [], activeTabId: null, fileViewerOpen: false, tabEditState: {} });
   },
 
-  enterEditMode: (tabId, initialContent) => {
+  enterSourceMode: (tabId, initialContent) => {
     set((state) => {
       const existing = state.tabEditState[tabId];
       if (existing?.dirty) {
+        // Preserve the dirty draft — this is also the wysiwyg → source carry
+        // (CodeMirror shows the spliced draft instead of the disk content).
         return {
           tabEditState: {
             ...state.tabEditState,
-            [tabId]: { ...existing, mode: 'edit', error: null },
+            [tabId]: { ...existing, mode: 'source', error: null },
           },
         };
       }
@@ -370,7 +377,73 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
         tabEditState: {
           ...state.tabEditState,
           [tabId]: {
-            mode: 'edit',
+            ...existing,
+            mode: 'source',
+            draftContent: initialContent,
+            originalContent: initialContent,
+            dirty: false,
+            saving: false,
+            error: null,
+          },
+        },
+      };
+    });
+  },
+
+  // Creates the edit session for the WYSIWYG canvas (plan §5: state is
+  // created on WYSIWYG mount by FileContentArea, never by the editor
+  // component itself, so saveTab always has state to act on). Callers must
+  // discard or carry a dirty draft before switching into this mode — the
+  // editor only loads original bytes, so a preserved stale draft would be
+  // invisible; if one is still present we keep it and only flip the mode,
+  // mirroring enterSourceMode.
+  enterWysiwygMode: (tabId, initialContent) => {
+    set((state) => {
+      const existing = state.tabEditState[tabId];
+      if (existing?.dirty) {
+        return {
+          tabEditState: {
+            ...state.tabEditState,
+            [tabId]: { ...existing, mode: 'wysiwyg', error: null },
+          },
+        };
+      }
+      return {
+        tabEditState: {
+          ...state.tabEditState,
+          [tabId]: {
+            ...existing,
+            mode: 'wysiwyg',
+            draftContent: initialContent,
+            originalContent: initialContent,
+            dirty: false,
+            saving: false,
+            error: null,
+          },
+        },
+      };
+    });
+  },
+
+  // Pins an explicit 'view' choice for tabs that have no edit session yet
+  // (markdown tabs default to WYSIWYG, so "View" must be representable in
+  // state). With an existing session this behaves like exitEditMode.
+  enterViewMode: (tabId, initialContent) => {
+    set((state) => {
+      const existing = state.tabEditState[tabId];
+      if (existing) {
+        return {
+          tabEditState: {
+            ...state.tabEditState,
+            [tabId]: { ...existing, mode: 'view', saving: false, error: null },
+          },
+        };
+      }
+      return {
+        tabEditState: {
+          ...state.tabEditState,
+          [tabId]: {
+            mode: 'view',
             draftContent: initialContent,
             originalContent: initialContent,
             dirty: false,
@@ -427,6 +500,10 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
       },
     }));
 
+    // Write-generation token (plan §5): record what we're about to write
+    // *before* the write so the fs-watcher revalidate can drop the echo even
+    // when it fires before the post-save state update below lands.
+    recordRecentWrite(tabId, draftToSave);
     const result = await window.api.files.writeFile(
       tab.filePath,
       tab.rootDirectory,
@@ -656,6 +733,9 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
   showBrowser: () => set({ browserOpen: true, fileViewerOpen: false }),
   hideBrowser: () => set({ browserOpen: false }),
 
+  // Return to the agent-card grid (WP-NAV). Tabs survive — only the view resets.
+  showDashboard: () => set({ fileViewerOpen: false, browserOpen: false }),
+
   // Backward-compat shim: openFileViewer calls openTab
   openFileViewer: (filePath, agentId) => {
     const agent = get().agents.find((a) => a.id === agentId);
@@ -718,7 +798,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
   },
 
   selectWorkspace: (id) => {
-    const { openTabs, activeTabId, fileViewerOpen, terminalPinned } = get();
+    const { openTabs, activeTabId, terminalPinned } = get();
     // Re-point the file viewer's active tab at something that belongs to the new workspace.
     // Without this, activeTabId can stay on a tab from the previous workspace, so the tree
     // root is wrong and visibleTabs filters out the current workspace's tabs.
@@ -726,14 +806,13 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
     const nextActiveTabId = activeBelongs
       ? activeTabId
       : openTabs.find((t) => t.workspaceId === id)?.id ?? null;
-    // If the new workspace has no tabs and the viewer was open, hide it — otherwise the
-    // panel would render blank.
-    const nextFileViewerOpen = fileViewerOpen && nextActiveTabId !== null;
+    // Entering a workspace always lands on the dashboard view (WP-NAV); tabs are
+    // preserved so the Files button restores them.
 
     if (!terminalPinned) {
-      set({ selectedWorkspaceId: id, selectedAgentId: null, terminalAgentId: null, activeTabId: nextActiveTabId, fileViewerOpen: nextFileViewerOpen });
+      set({ selectedWorkspaceId: id, selectedAgentId: null, terminalAgentId: null, activeTabId: nextActiveTabId, fileViewerOpen: false, browserOpen: false });
     } else {
-      set({ selectedWorkspaceId: id, selectedAgentId: null, activeTabId: nextActiveTabId, fileViewerOpen: nextFileViewerOpen });
+      set({ selectedWorkspaceId: id, selectedAgentId: null, activeTabId: nextActiveTabId, fileViewerOpen: false, browserOpen: false });
     }
     if (id) {
       get().loadAgents(id);

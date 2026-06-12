@@ -7,6 +7,7 @@ import { useThemeStore } from '../../stores/theme-store';
 import CollapseButton from '../layout/CollapseButton';
 import { useTabScrollMemory } from './scrollMemory';
 import { useModifierPathOpen } from './openFileHelpers';
+import SelectionSurface from '../selection/SelectionSurface';
 
 interface Props {
   content: string;
@@ -93,6 +94,7 @@ export default function MarkdownRenderer({ content, tabId }: Props) {
   const hasOutline = outline.length > 0;
 
   return (
+    <SelectionSurface tabId={tabId}>
     <div className="h-full min-w-0 flex bg-surface-0">
       <div ref={scrollRef} onScroll={handleScroll} className="flex-1 min-w-0 overflow-auto p-6">
         <div className="max-w-3xl mx-auto prose-custom">
@@ -234,5 +236,6 @@ export default function MarkdownRenderer({ content, tabId }: Props) {
         )
       )}
     </div>
+    </SelectionSurface>
   );
 }

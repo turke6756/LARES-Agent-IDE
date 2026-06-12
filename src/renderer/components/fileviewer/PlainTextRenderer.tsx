@@ -1,5 +1,6 @@
 import React, { useRef } from 'react';
 import { useTabScrollMemory } from './scrollMemory';
+import SelectionSurface from '../selection/SelectionSurface';
 
 interface Props {
   content: string;
@@ -13,6 +14,7 @@ export default function PlainTextRenderer({ content, tabId }: Props) {
   const gutterWidth = String(lines.length).length;
 
   return (
+    <SelectionSurface tabId={tabId}>
     <div ref={scrollRef} onScroll={handleScroll} className="overflow-auto h-full font-sans text-sm">
       <pre className="p-4">
         {lines.map((line, i) => (
@@ -28,5 +30,6 @@ export default function PlainTextRenderer({ content, tabId }: Props) {
         ))}
       </pre>
     </div>
+    </SelectionSurface>
   );
 }

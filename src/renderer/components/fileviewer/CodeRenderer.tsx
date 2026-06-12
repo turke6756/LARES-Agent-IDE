@@ -4,6 +4,7 @@ import { vscDarkPlus, vs } from 'react-syntax-highlighter/dist/esm/styles/prism'
 import SymbolOutline from './SymbolOutline';
 import { useThemeStore } from '../../stores/theme-store';
 import { useTabScrollMemory } from './scrollMemory';
+import SelectionSurface from '../selection/SelectionSurface';
 
 interface Props {
   content: string;
@@ -29,6 +30,7 @@ export default function CodeRenderer({ content, language, tabId }: Props) {
   };
 
   return (
+    <SelectionSurface tabId={tabId}>
     <div className="flex h-full min-w-0">
       <div className="flex-1 overflow-auto h-full scrollbar-thin" ref={scrollRef} onScroll={handleScroll}>
         <SyntaxHighlighter
@@ -56,8 +58,9 @@ export default function CodeRenderer({ content, language, tabId }: Props) {
       <SymbolOutline 
         content={content} 
         language={language} 
-        onSymbolClick={handleSymbolClick} 
+        onSymbolClick={handleSymbolClick}
       />
     </div>
+    </SelectionSurface>
   );
 }

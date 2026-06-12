@@ -142,6 +142,12 @@ export interface LaunchAgentInput {
   // cwd-as-identity proxy — mis-attributing events under concurrent
   // same-cwd launches). No-op for non-codex providers.
   freshSession?: boolean;
+  // WP-P2 (plans/selection-to-agent-primitive-plan.md §1.6/§7): optional first
+  // USER message, delivered by the supervisor exactly once when the agent
+  // first reaches an input-accepting status (idle|waiting|done). Deliberately
+  // separate from systemPrompt/agent.md launch framing — that positional-arg
+  // path must stay byte-identical whether or not this field is set.
+  initialUserPrompt?: string;
 }
 
 export interface AgentPersona {

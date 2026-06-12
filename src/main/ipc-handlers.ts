@@ -442,6 +442,14 @@ export function registerIpcHandlers(supervisor: AgentSupervisor, mainWindow: Bro
     }
   });
 
+  // WP-P2 — async initial-prompt delivery failures surface through the same
+  // renderer channel as chat-input send failures (see 'agent:send-input' above).
+  supervisor.on('sendInputError', (payload) => {
+    if (!mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('agent:send-input-error', payload);
+    }
+  });
+
   // Forward file activity events to renderer
   supervisor.on('fileActivity', (activity) => {
     if (!mainWindow.isDestroyed()) {

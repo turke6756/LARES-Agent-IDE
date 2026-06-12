@@ -57,6 +57,7 @@ export default function MainContent() {
   );
   const showFileViewer = useDashboardStore((s) => s.showFileViewer);
   const showBrowser = useDashboardStore((s) => s.showBrowser);
+  const showDashboard = useDashboardStore((s) => s.showDashboard);
   const browserPaneAttention = useBrowserStore((s) => s.paneAttention);
   const loadSupervisor = useDashboardStore((s) => s.loadSupervisor);
   const launchSupervisor = useDashboardStore((s) => s.launchSupervisor);
@@ -84,14 +85,6 @@ export default function MainContent() {
     ensureBrowserBridge();
   });
 
-  // Center-mode dispatch — file viewer wins over the browser pane.
-  if (fileViewerOpen) {
-    return <FileViewerPanel />;
-  }
-  if (browserOpen) {
-    return <BrowserPanel />;
-  }
-
   if (!workspace) {
     return (
       <div className="flex-1 flex items-center justify-center text-gray-500">
@@ -107,6 +100,8 @@ export default function MainContent() {
   const workspaceTabCount = openTabs.filter((t) => t.workspaceId === selectedWorkspaceId).length;
   const hasOpenTabs = workspaceTabCount > 0;
   const supStats = supervisorAgent ? contextStats[supervisorAgent.id] : null;
+  // Center-view dispatch — file viewer wins over the browser pane.
+  const dashboardActive = !fileViewerOpen && !browserOpen;
 
   return (
     <div className="flex-1 flex flex-col min-w-0 overflow-hidden relative">
@@ -206,9 +201,19 @@ export default function MainContent() {
 
             <div className="flex gap-2">
               <button
+                onClick={() => showDashboard()}
+                className={`ui-btn ui-btn-outline px-3 py-1.5 text-[13px] font-medium ${
+                  dashboardActive ? 'ui-btn-success is-active' : ''
+                }`}
+                title="Agent dashboard"
+              >
+                <Icons.LayoutGrid className="w-4 h-4" />
+                Dashboard
+              </button>
+              <button
                 onClick={() => showFileViewer()}
                 className={`ui-btn ui-btn-outline px-3 py-1.5 text-[13px] font-medium ${
-                  hasOpenTabs ? 'ui-btn-success' : ''
+                  fileViewerOpen ? 'ui-btn-success is-active' : hasOpenTabs ? 'ui-btn-success' : ''
                 }`}
                 title={hasOpenTabs ? `Files (${workspaceTabCount} tabs open)` : 'Browse files'}
               >
@@ -218,7 +223,7 @@ export default function MainContent() {
               <button
                 onClick={() => showBrowser()}
                 className={`ui-btn ui-btn-outline px-3 py-1.5 text-[13px] font-medium ${
-                  browserPaneAttention ? 'ui-btn-warning animate-pulse' : ''
+                  browserOpen && !fileViewerOpen ? 'ui-btn-success is-active' : browserPaneAttention ? 'ui-btn-warning animate-pulse' : ''
                 }`}
                 title={browserPaneAttention ? 'Browser — an agent opened a page for you' : 'Open browser pane'}
               >
@@ -245,13 +250,20 @@ export default function MainContent() {
         </div>
       </div>
 
-      {/* Agent Grid — swipe left to open file viewer */}
-      <div
-        className="flex-1 overflow-y-auto p-6 scrollbar-thin"
-        {...swipeToFiles}
-      >
-        <AgentGrid />
-      </div>
+      {/* Center view — header above stays fixed across all three. */}
+      {fileViewerOpen ? (
+        <FileViewerPanel />
+      ) : browserOpen ? (
+        <BrowserPanel />
+      ) : (
+        /* Agent Grid — swipe left to open file viewer */
+        <div
+          className="flex-1 overflow-y-auto p-6 scrollbar-thin"
+          {...swipeToFiles}
+        >
+          <AgentGrid />
+        </div>
+      )}
 
       {showLaunch && (
         <AgentLaunchDialog

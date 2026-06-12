@@ -7,6 +7,8 @@ import type {
 } from '../../../shared/session-events';
 import type { AgentStatus } from '../../../shared/types';
 import { useThemeStore } from '../../stores/theme-store';
+import { useDashboardStore } from '../../stores/dashboard-store';
+import { useSelectionActions } from '../../lib/selection/useSelectionActions';
 import AgentMarkdown from '../shared/AgentMarkdown';
 import ChatInputBar from './ChatInputBar';
 import PromptStaging from './PromptStaging';
@@ -243,6 +245,24 @@ export default function ChatPane({ agentId, agentStatus, agentName, stagingOpen 
   const isNearBottomRef = useRef(true);
   const skipAnimateOnceRef = useRef(true);
 
+  const displayName = agentName || 'Agent';
+  const selectedWorkspaceId = useDashboardStore((s) => s.selectedWorkspaceId);
+
+  // Select text → right-click → "Send to agent". One handler on the scroll
+  // container covers user bubbles, assistant markdown, thinking notes, and
+  // tool blocks. Right-click without a selection (and all left-click /
+  // drag-to-input behavior) falls through untouched.
+  const { menuElement } = useSelectionActions({
+    containerRef: scrollRef,
+    getContext: () => ({
+      targetType: 'chat-message',
+      workspaceId: selectedWorkspaceId ?? '',
+      sourceLabel: `agent chat with "${displayName}"`,
+      chat: { agentId, agentName: displayName },
+      capabilities: { comment: false },
+    }),
+  });
+
   // Hydrate + subscribe
   useEffect(() => {
     let mounted = true;
@@ -293,8 +313,6 @@ export default function ChatPane({ agentId, agentStatus, agentName, stagingOpen 
     }
   }, [renderItems]);
 
-  const displayName = agentName || 'Agent';
-
   const empty = hydrated && renderItems.length === 0;
 
   return (
@@ -322,6 +340,7 @@ export default function ChatPane({ agentId, agentStatus, agentName, stagingOpen 
           </WatchGlass>
         )}
       </div>
+      {menuElement}
       <ContextUsageBar agentId={agentId} events={events} />
       {stagingOpen ? (
         <PromptStaging agentId={agentId} agentStatus={agentStatus} />
