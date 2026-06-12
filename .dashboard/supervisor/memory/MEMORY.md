@@ -1,6 +1,8 @@
 # Supervisor Memory
 
-**⚡ START HERE after the 2026-06-09 /clear:** [handoff-2026-06-09-prep-wave-done.md](handoff-2026-06-09-prep-wave-done.md) — torch-pass from the prior session: prep wave done + folded, Phases A/A′ unblocked and awaiting human go, open items in order, mechanics notes.
+**⚡ START HERE (current, 2026-06-11):** [handoff-2026-06-11-embedded-browser-wp1.md](handoff-2026-06-11-embedded-browser-wp1.md) — **active workstream = embedded browser.** WP0 sealed (G0 passed), tree clean at `a73007d`, next action = launch WP1-A ∥ WP1-B per `plans/embedded-browser-implementation-tasks.md`, gate G1 = real Google sign-in in the first hour. Packet has launch-prompt ingredients, ops cautions, collision map vs. the canvas workstream.
+
+*(Older torch-pass, V2 migration context: [handoff-2026-06-09-prep-wave-done.md](handoff-2026-06-09-prep-wave-done.md) — V2 Phases A/A′ ready but PAUSED behind the feature workstreams.)*
 
 This file indexes the supervisor's persistent memory for this workspace.
 Add entries as you learn important things about the agents, project, or decisions made.
