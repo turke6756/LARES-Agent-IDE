@@ -8,7 +8,7 @@ import { resolveConfined } from './security/path-confinement';
 import { AgentSupervisor } from './supervisor';
 import { registerIpcHandlers } from './ipc-handlers';
 import { WsServer } from './ws-server';
-import { ApiServer } from './api-server';
+import { ApiServer, type BrowserToolProvider } from './api-server';
 import { OrchestrationService } from './orchestration/service';
 import { createDashboardClient } from './orchestration/dashboard-client';
 import { pathToFileURL } from 'url';
@@ -418,6 +418,14 @@ app.whenReady().then(async () => {
     // EADDRINUSE auto-increment — never a hardcoded 24678.
     browserManager = new BrowserManager(() => mainWindow, apiPort);
     registerBrowserIpc(browserManager);
+    // WP2-B ⇄ WP2-A seam: inject the Phase-2 browser-tool facade into the
+    // API server. Setter, not constructor param, because the manager is
+    // constructed AFTER the awaited apiServer.start() (its M2 filter needs
+    // the bound port). Accessed structurally so this compiles before WP2-A's
+    // `tools` facade lands on browser-manager; until then the optional read
+    // is undefined and every /api/browser/* route answers 503 by design.
+    const browserToolProvider = (browserManager as unknown as { tools?: BrowserToolProvider }).tools;
+    if (browserToolProvider) apiServer.setBrowserTools(browserToolProvider);
     orchestration.start();                 // boot reconcile of orphaned runs
     supervisor.reconcile();
     console.log('App ready');

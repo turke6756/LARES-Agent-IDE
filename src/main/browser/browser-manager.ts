@@ -6,7 +6,8 @@
 // popup deny), M7 (downloads denied), M9 (debugger attach rule).
 
 import { randomUUID } from 'crypto';
-import { session, WebContentsView } from 'electron';
+import path from 'path';
+import { app, session, WebContentsView } from 'electron';
 import type { BrowserWindow, Session, WebContents } from 'electron';
 import { setManagedWebContentsCheck } from '../security/webcontents-guard';
 import { WS_PORT, JUPYTER_BASE_PORT, JUPYTER_PORT_RETRIES } from '../control-ports';
@@ -19,6 +20,18 @@ import {
   uaForUrl,
   type ControlPorts,
 } from './browser-decisions';
+import { CdpDriver } from './cdp-driver';
+import { buildA11ySnapshot, RefRegistry } from './a11y-snapshot';
+import { ActionAudit, AUDIT_FILE_NAME, hashArgs } from './action-audit';
+import {
+  browserActionsEnabled,
+  browserToolsEnabled,
+  checkAction,
+  checkNavigation,
+  PolicyError,
+  wrapUntrusted,
+  type BrowserToolVerb,
+} from './browser-policy';
 import {
   BROWSER_CHANNELS,
   type BrowserBounds,
@@ -33,6 +46,37 @@ interface TabEntry {
   partition: BrowserPartition;
   /** Full Electron partition string ('persist:user' | 'persist:agent'). */
   partitionFull: string;
+  /** Phase 2: set for tabs created by agent tools so the UI can flash them. */
+  openedByAgent: boolean;
+}
+
+// ── WP2 frozen provider contract (WP2-B injects browserManager.tools into
+//    ApiServer and codes against these shapes structurally) ─────────────────
+
+export interface TabSnapshot {
+  tabId: string;
+  url: string;
+  partition: BrowserPartition;
+  /** Wrapped (untrusted-framed) a11y snapshot — present for agent-partition
+   *  opens only. ABSENT on forHuman opens: that path gives no readback (M9). */
+  pageSnapshot?: string;
+}
+
+export interface TabInfo {
+  tabId: string;
+  url: string;
+  title: string;
+  partition: BrowserPartition;
+  openedByAgent: boolean;
+}
+
+export interface BrowserToolProvider {
+  openUrl(url: string, opts: { forHuman?: boolean }): Promise<TabSnapshot>;
+  listTabs(): TabInfo[];
+  getPageText(tabId: string): Promise<string>;
+  readPage(tabId: string): Promise<string>;
+  screenshot(tabId: string): Promise<{ base64Png: string }>;
+  click(tabId: string, ref: number): Promise<string>;
 }
 
 const PARTITION_FULL: Record<BrowserPartition, string> = {
@@ -50,6 +94,13 @@ export class BrowserManager {
   private paneVisible = true;
   private lastBounds: BrowserBounds = { x: 0, y: 0, width: 0, height: 0 };
   private controlPorts: ControlPorts;
+  /** Lazily-attached CDP drivers, persist:agent tabs only (M9). */
+  private drivers = new Map<string, CdpDriver>();
+  /** Per-tab a11y ref bookkeeping (WP2-A; stale refs → typed error). */
+  private refRegistries = new Map<string, RefRegistry>();
+  /** M16 audit writer — lazy so app.getPath is only touched when a tool runs. */
+  private auditWriter: ActionAudit | null = null;
+  private toolsFacade: BrowserToolProvider | null = null;
 
   constructor(
     private getMainWindow: () => BrowserWindow | null,
@@ -124,7 +175,10 @@ export class BrowserManager {
 
   // ── Tab lifecycle ──────────────────────────────────────────────────────────
 
-  createTab(opts: BrowserCreateTabOptions): { tabId: string } {
+  createTab(
+    opts: BrowserCreateTabOptions,
+    internal?: { openedByAgent?: boolean },
+  ): { tabId: string } {
     const partitionFull = PARTITION_FULL[opts.partition];
     if (!partitionFull) throw new Error(`unknown partition: ${String(opts.partition)}`);
 
@@ -144,7 +198,13 @@ export class BrowserManager {
     });
 
     const tabId = randomUUID();
-    const tab: TabEntry = { id: tabId, view, partition: opts.partition, partitionFull };
+    const tab: TabEntry = {
+      id: tabId,
+      view,
+      partition: opts.partition,
+      partitionFull,
+      openedByAgent: internal?.openedByAgent === true,
+    };
     this.tabs.set(tabId, tab);
     this.wireViewEvents(tab);
 
@@ -166,6 +226,8 @@ export class BrowserManager {
     const tab = this.tabs.get(tabId);
     if (!tab) return;
     this.tabs.delete(tabId);
+    this.drivers.delete(tabId);
+    this.refRegistries.delete(tabId);
     if (this.activeTabId === tabId) this.activeTabId = null;
     this.getMainWindow()?.contentView.removeChildView(tab.view);
     tab.view.webContents.close();
@@ -259,6 +321,218 @@ export class BrowserManager {
     return dbg;
   }
 
+  // ── WP2-A: CDP driver accessor + agent tool facade ─────────────────────────
+  //
+  // Implements the frozen BrowserToolProvider contract (WP2-B injects
+  // `browserManager.tools` into ApiServer). Every entry point: M16 kill-switch
+  // → M11 checkNavigation (URL-bearing verbs) → M9/M10/M12 checkAction; every
+  // act-tier call and every denial writes an audit line (M16). All page-derived
+  // returns pass through wrapUntrusted (M12).
+
+  /** Lazily create/reuse the CDP driver for an agent tab. M9: construction
+   *  and every re-attach route through attachDebugger, which throws on
+   *  persist:user — there is no other path to CDP. */
+  private driver(tabId: string): CdpDriver {
+    const tab = this.mustGet(tabId);
+    let drv = this.drivers.get(tabId);
+    if (!drv) {
+      this.attachDebugger(tabId); // probe the M9 rule now, not on first command
+      drv = new CdpDriver(tab.view.webContents, () => this.attachDebugger(tabId));
+      this.drivers.set(tabId, drv);
+    }
+    return drv;
+  }
+
+  get tools(): BrowserToolProvider {
+    if (!this.toolsFacade) {
+      this.toolsFacade = {
+        openUrl: (url, opts) => this.toolOpenUrl(url, opts ?? {}),
+        listTabs: () => this.toolListTabs(),
+        getPageText: (tabId) => this.toolGetPageText(tabId),
+        readPage: (tabId) => this.toolReadPage(tabId),
+        screenshot: (tabId) => this.toolScreenshot(tabId),
+        click: (tabId, ref) => this.toolClick(tabId, ref),
+      };
+    }
+    return this.toolsFacade;
+  }
+
+  private get audit(): ActionAudit {
+    if (!this.auditWriter) {
+      this.auditWriter = new ActionAudit(() =>
+        path.join(app.getPath('userData'), AUDIT_FILE_NAME),
+      );
+    }
+    return this.auditWriter;
+  }
+
+  private auditRecord(
+    partition: string,
+    url: string,
+    verb: string,
+    args: unknown,
+    outcome: string,
+  ): void {
+    this.audit.record({ partition, url, verb, argsHash: hashArgs(args), outcome });
+  }
+
+  /** Kill-switch + checkAction gate shared by every tool verb. Denials are
+   *  audited (M16) and thrown as PolicyError (WP2-B maps name → 403). */
+  private gate(
+    verb: BrowserToolVerb,
+    partitionFull: string,
+    url: string | undefined,
+    args: unknown,
+  ): void {
+    if (!browserToolsEnabled(process.env)) {
+      this.auditRecord(partitionFull, url ?? '', verb, args, 'denied:tools-disabled');
+      throw new PolicyError(
+        'tools-disabled',
+        'browser tools are disabled by the kill-switch (AGENT_BROWSER_TOOLS_DISABLED=1)',
+      );
+    }
+    const decision = checkAction(verb, partitionFull, url, browserActionsEnabled(process.env));
+    if (!decision.allow) {
+      this.auditRecord(partitionFull, url ?? '', verb, args, `denied:${decision.code}`);
+      throw new PolicyError(decision.code, decision.reason);
+    }
+  }
+
+  private async toolOpenUrl(url: string, opts: { forHuman?: boolean }): Promise<TabSnapshot> {
+    const forHuman = opts.forHuman === true;
+    const verb: BrowserToolVerb = forHuman ? 'openUrlForHuman' : 'openUrl';
+    const partitionFull = forHuman ? 'persist:user' : 'persist:agent';
+    const args = { url, forHuman };
+
+    // M11 applies to EVERY navigation, forHuman handoffs included.
+    const nav = checkNavigation(url, { apiPort: this.controlPorts.apiPort });
+    if (!nav.allow) {
+      this.auditRecord(partitionFull, url, verb, args, `denied:${nav.code}`);
+      throw new PolicyError(nav.code, nav.reason);
+    }
+    this.gate(verb, partitionFull, url, args);
+
+    if (forHuman) {
+      // M9 openUrlForHumanAction: a visible persist:user tab, focused in the
+      // pane, URL rendered by the WP1-B address bar (shell chrome — model
+      // output can't spoof it). NEVER attaches CDP; returns no page content.
+      const { tabId } = this.createTab({ partition: 'user', url }, { openedByAgent: true });
+      this.setActiveTab(tabId);
+      this.auditRecord(partitionFull, url, verb, args, 'ok');
+      return { tabId, url, partition: 'user' };
+    }
+
+    // Agent-partition browse (only reachable with the M12 toggle on): the tab
+    // is created empty and navigated through the driver so the page-ready
+    // wait lives here, not in the proxy scripts.
+    const { tabId } = this.createTab({ partition: 'agent' }, { openedByAgent: true });
+    try {
+      await this.driver(tabId).navigateAndWait(url);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.auditRecord(partitionFull, url, verb, args, `error:${msg}`);
+      throw err;
+    }
+    this.auditRecord(partitionFull, url, verb, args, 'ok');
+    const snapshot = await this.snapshotTab(tabId);
+    return {
+      tabId,
+      url: this.mustGet(tabId).view.webContents.getURL(),
+      partition: 'agent',
+      pageSnapshot: wrapUntrusted(snapshot),
+    };
+  }
+
+  /** M9: lists persist:agent tabs ONLY — the human's tabs (URLs, titles) are
+   *  never enumerable by tools. */
+  private toolListTabs(): TabInfo[] {
+    this.gate('listTabs', 'persist:agent', undefined, {});
+    return [...this.tabs.values()]
+      .filter((t) => t.partition === 'agent')
+      .map((t) => ({
+        tabId: t.id,
+        url: t.view.webContents.getURL(),
+        title: t.view.webContents.getTitle(),
+        partition: t.partition,
+        openedByAgent: t.openedByAgent,
+      }));
+  }
+
+  private async toolGetPageText(tabId: string): Promise<string> {
+    const tab = this.mustGet(tabId);
+    this.gate('getPageText', tab.partitionFull, tab.view.webContents.getURL(), { tabId });
+    const text = await this.driver(tabId).getText();
+    return wrapUntrusted(text);
+  }
+
+  private async toolReadPage(tabId: string): Promise<string> {
+    const tab = this.mustGet(tabId);
+    this.gate('readPage', tab.partitionFull, tab.view.webContents.getURL(), { tabId });
+    const snapshot = await this.snapshotTab(tabId);
+    return (
+      'Accessibility snapshot. Interactable elements are marked [n] — pass n as `ref` to click.\n' +
+      wrapUntrusted(snapshot)
+    );
+  }
+
+  private async toolScreenshot(tabId: string): Promise<{ base64Png: string }> {
+    const tab = this.mustGet(tabId);
+    this.gate('screenshot', tab.partitionFull, tab.view.webContents.getURL(), { tabId });
+    return { base64Png: await this.driver(tabId).captureScreenshot() };
+  }
+
+  private async toolClick(tabId: string, ref: number): Promise<string> {
+    const tab = this.mustGet(tabId);
+    const url = tab.view.webContents.getURL();
+    const args = { tabId, ref };
+    this.gate('click', tab.partitionFull, url, args);
+
+    const registry = this.refRegistries.get(tabId);
+    if (!registry) {
+      throw new Error('no snapshot exists for this tab — call readPage first to get refs');
+    }
+    const backendNodeId = registry.resolve(ref); // StaleRefError / UnknownRefError
+    try {
+      await this.driver(tabId).click(backendNodeId);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.auditRecord(tab.partitionFull, url, 'click', args, `error:${msg}`);
+      throw err;
+    }
+    this.auditRecord(tab.partitionFull, url, 'click', args, 'ok');
+
+    // Plan §5c: every action returns a fresh snapshot. Let the page react
+    // (and any click-triggered navigation settle) before re-reading.
+    await this.settleAfterAction(tab.view.webContents);
+    const snapshot = await this.snapshotTab(tabId);
+    return wrapUntrusted(snapshot);
+  }
+
+  /** Fresh a11y snapshot; rolls the tab's ref generation (old refs go stale). */
+  private async snapshotTab(tabId: string): Promise<string> {
+    let registry = this.refRegistries.get(tabId);
+    if (!registry) {
+      registry = new RefRegistry();
+      this.refRegistries.set(tabId, registry);
+    }
+    const nodes = await this.driver(tabId).getFullAXTree();
+    return buildA11ySnapshot(nodes, registry);
+  }
+
+  private async settleAfterAction(wc: WebContents): Promise<void> {
+    await new Promise((r) => setTimeout(r, 200));
+    if (wc.isDestroyed() || !wc.isLoading()) return;
+    await new Promise<void>((resolve) => {
+      const done = (): void => {
+        clearTimeout(timer);
+        wc.off('did-stop-loading', done);
+        resolve();
+      };
+      const timer = setTimeout(done, 5_000);
+      wc.on('did-stop-loading', done);
+    });
+  }
+
   // ── Internals ──────────────────────────────────────────────────────────────
 
   private mustGet(tabId: string): TabEntry {
@@ -329,6 +603,8 @@ export class BrowserManager {
     wc.once('destroyed', () => {
       this.tabFavicons.delete(tab.id);
       this.tabs.delete(tab.id);
+      this.drivers.delete(tab.id);
+      this.refRegistries.delete(tab.id);
       if (this.activeTabId === tab.id) this.activeTabId = null;
     });
   }
@@ -347,6 +623,8 @@ export class BrowserManager {
       canGoBack: wc.navigationHistory.canGoBack(),
       canGoForward: wc.navigationHistory.canGoForward(),
       partition: tab.partition,
+      // Phase-1 shape kept intact: field absent (not false) for human tabs.
+      ...(tab.openedByAgent ? { openedByAgent: true } : {}),
     };
     win.webContents.send(BROWSER_CHANNELS.tabState, state);
   }

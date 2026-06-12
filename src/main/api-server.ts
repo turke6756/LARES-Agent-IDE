@@ -34,7 +34,34 @@ import crypto from 'crypto';
  *  internals and must NOT leak to clients as API codes, so the serializer
  *  allowlists instead of forwarding any string. Add new dashboard API codes
  *  here deliberately when a route starts setting them. */
-const API_ERROR_CODES = new Set<string>(['submit-not-confirmed', 'delivery-failed']);
+const API_ERROR_CODES = new Set<string>(['submit-not-confirmed', 'delivery-failed', 'browser-policy-denied']);
+
+/** WP2 frozen browser-tool provider contract (plans/embedded-browser-
+ *  implementation-tasks.md §WP2-B). WP2-A implements this as
+ *  `browserManager.tools`; this file only consumes it — never import from
+ *  src/main/browser/* here. The concrete TabSnapshot/TabInfo shapes are
+ *  WP2-A's; they're typed structurally loose (JSON-serializable `unknown`)
+ *  so WP2-A's implementation satisfies the interface without coupling.
+ *
+ *  Error contract: policy denials (M9/M10/M11/M12 act-tier gate, sensitive
+ *  origins, SSRF, actions-toggle-off) must arrive as errors whose
+ *  `name === 'PolicyError'` — the routes map exactly those to HTTP 403 with
+ *  the policy message intact. Everything else surfaces as 500. */
+export interface BrowserToolProvider {
+  /** forHuman → visible persist:user tab, never CDP (M9). Resolves once the
+   *  page is ready — the navigateAndWait lives server-side so MCP proxy
+   *  scripts stay dumb (M10 page-ready note). */
+  openUrl(url: string, opts: { forHuman?: boolean }): Promise<unknown>;
+  listTabs(): unknown[];
+  /** wrapUntrusted applied by the provider (M12). */
+  getPageText(tabId: string): Promise<string>;
+  /** a11y tree + numbered refs, wrapUntrusted applied (M12). */
+  readPage(tabId: string): Promise<string>;
+  screenshot(tabId: string): Promise<{ base64Png: string }>;
+  /** Act tier — throws PolicyError unless human-enabled; returns the fresh
+   *  post-click snapshot. */
+  click(tabId: string, ref: number): Promise<string>;
+}
 
 /**
  * Lightweight HTTP API server that exposes supervisor methods.
@@ -55,9 +82,44 @@ export class ApiServer {
     port = 24678,
     private orchestration?: OrchestrationService,
     private bindHost: string = '0.0.0.0',
+    private browserTools?: BrowserToolProvider,
   ) {
     this.supervisor = supervisor;
     this.port = port;
+  }
+
+  /** Late injection for the WP2 browser-tool provider. Production must use
+   *  this rather than the constructor param: BrowserManager is constructed
+   *  AFTER the awaited start() (its M2 loopback filter needs the actually-
+   *  bound port), so the provider can't exist when ApiServer is built.
+   *  Tests inject a fake via the constructor. Until one of the two happens,
+   *  every /api/browser/* route answers 503. */
+  setBrowserTools(provider: BrowserToolProvider): void {
+    this.browserTools = provider;
+  }
+
+  private requireBrowserTools(): BrowserToolProvider {
+    if (!this.browserTools) {
+      throw Object.assign(
+        new Error(
+          'Browser tools unavailable: this dashboard has no embedded-browser tool provider wired in '
+          + '(the browser pane is missing or predates Phase 2). The browser_* MCP tools cannot work here.',
+        ),
+        { statusCode: 503 },
+      );
+    }
+    return this.browserTools;
+  }
+
+  /** Map WP2-A policy denials (err.name === 'PolicyError') to HTTP 403 with
+   *  the policy message passed through so the agent reads WHY it was denied
+   *  (actions toggle off, sensitive origin, SSRF, …). Anything else rethrows
+   *  unchanged and falls into the generic 500 path. */
+  private static rethrowBrowserError(err: unknown): never {
+    if (err instanceof Error && err.name === 'PolicyError') {
+      throw Object.assign(err, { statusCode: 403, code: 'browser-policy-denied' });
+    }
+    throw err;
   }
 
   /** Resolves with the actually-bound port once listening — surviving the
@@ -1003,6 +1065,94 @@ export class ApiServer {
     if (method === 'DELETE' && templateDeleteMatch) {
       deleteAgentTemplate(templateDeleteMatch[1]);
       return { ok: true };
+    }
+
+    // ── Browser routes (Phase 2 WP2-B; spec M10 tool surface) ────────────
+    // Thin by design: validate → provider call → serialize. ALL browser
+    // policy (M9 partition discipline, M11 URL/SSRF allowlist, M12 act-tier
+    // gating) lives in WP2-A's provider behind the frozen contract — a
+    // PolicyError from it becomes a 403 carrying the policy message. These
+    // routes are bearer-token-gated like everything else by the admission
+    // preamble in start(); no provider injected → 503. The five-tool surface
+    // (open-url / tabs / text / page / screenshot / click) is the COMPLETE
+    // browser API — no raw-eval route may ever be added here (M10).
+
+    // POST /api/browser/open-url — { url, forHuman? }. forHuman opens a
+    // visible persist:user tab for the human (never CDP); resolves once the
+    // page is ready (the wait lives in the provider, not in proxy scripts).
+    if (method === 'POST' && path === '/api/browser/open-url') {
+      const tools = this.requireBrowserTools();
+      const { url: targetUrl, forHuman } = JSON.parse(await readBody(req));
+      if (!targetUrl || typeof targetUrl !== 'string') {
+        throw Object.assign(new Error('Missing "url" in request body'), { statusCode: 400 });
+      }
+      if (forHuman !== undefined && typeof forHuman !== 'boolean') {
+        throw Object.assign(new Error('"forHuman" must be a boolean when provided'), { statusCode: 400 });
+      }
+      try {
+        const snapshot = await tools.openUrl(targetUrl, { forHuman: forHuman === true });
+        return { ok: true, forHuman: forHuman === true, snapshot };
+      } catch (err) {
+        ApiServer.rethrowBrowserError(err);
+      }
+    }
+
+    // GET /api/browser/tabs — read tier
+    if (method === 'GET' && path === '/api/browser/tabs') {
+      const tools = this.requireBrowserTools();
+      try {
+        return { tabs: tools.listTabs() };
+      } catch (err) {
+        ApiServer.rethrowBrowserError(err);
+      }
+    }
+
+    // GET /api/browser/:tabId/text | /api/browser/:tabId/page — read tier
+    // (innerText vs a11y tree + refs; both wrapUntrusted'd by the provider).
+    const browserReadMatch = path.match(/^\/api\/browser\/([^/]+)\/(text|page)$/);
+    if (method === 'GET' && browserReadMatch) {
+      const tools = this.requireBrowserTools();
+      const tabId = browserReadMatch[1];
+      try {
+        if (browserReadMatch[2] === 'text') {
+          return { tabId, text: await tools.getPageText(tabId) };
+        }
+        return { tabId, page: await tools.readPage(tabId) };
+      } catch (err) {
+        ApiServer.rethrowBrowserError(err);
+      }
+    }
+
+    // POST /api/browser/:tabId/screenshot — read tier (base64 PNG)
+    const browserShotMatch = path.match(/^\/api\/browser\/([^/]+)\/screenshot$/);
+    if (method === 'POST' && browserShotMatch) {
+      const tools = this.requireBrowserTools();
+      const tabId = browserShotMatch[1];
+      try {
+        const { base64Png } = await tools.screenshot(tabId);
+        return { tabId, base64Png };
+      } catch (err) {
+        ApiServer.rethrowBrowserError(err);
+      }
+    }
+
+    // POST /api/browser/:tabId/click — { ref } — act tier (M12-gated)
+    const browserClickMatch = path.match(/^\/api\/browser\/([^/]+)\/click$/);
+    if (method === 'POST' && browserClickMatch) {
+      const tools = this.requireBrowserTools();
+      const tabId = browserClickMatch[1];
+      const { ref } = JSON.parse(await readBody(req));
+      if (typeof ref !== 'number' || !Number.isInteger(ref)) {
+        throw Object.assign(
+          new Error('"ref" must be an integer ref from the latest browser_read_page snapshot'),
+          { statusCode: 400 },
+        );
+      }
+      try {
+        return { tabId, snapshot: await tools.click(tabId, ref) };
+      } catch (err) {
+        ApiServer.rethrowBrowserError(err);
+      }
     }
 
     throw Object.assign(new Error(`Not found: ${method} ${path}`), { statusCode: 404 });

@@ -14,6 +14,10 @@
 const http = require('http');
 const fs = require('fs');
 const { decidePollAction } = require('./mcp-supervisor-poll');
+// WP2-B (M10): the browser tool surface — definitions + dispatch live in
+// their own module so they're unit-testable without this script's stdio/env
+// side effects. Five tools, no raw eval; see mcp-browser-tools.js.
+const { getBrowserToolDefinitions, handleBrowserToolCall } = require('./mcp-browser-tools');
 
 // The dashboard API host/port — passed via env vars or defaults.
 // Auto-detect WSL: if no explicit host is set and we're inside WSL2,
@@ -677,12 +681,19 @@ function getToolDefinitions() {
         required: ['notebook_path'],
       },
     },
+    // ── Embedded-browser tools (Phase 2, WP2-B; M10 surface) ───────────
+    ...getBrowserToolDefinitions(),
   ];
 }
 
 // ── Tool Call Handlers ──────────────────────────────────────────────────
 
 async function handleToolCall(name, args) {
+  // WP2-B: browser_* tools dispatch through mcp-browser-tools.js (returns
+  // null for non-browser names so the switch below keeps everything else).
+  const browserResult = await handleBrowserToolCall(name, args, apiRequest);
+  if (browserResult !== null) return browserResult;
+
   switch (name) {
     case 'list_agents': {
       const p = args.workspace_id

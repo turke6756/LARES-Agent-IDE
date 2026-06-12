@@ -367,6 +367,12 @@ export const SUPERVISOR_AGENT_MD_V2_HASH = '85993687d0bd2b17f94b95d8db45585ccbec
  *  the v3 file's previousHashes for silent v2→v3 upgrade. */
 export const SUPERVISOR_RUN_ORCHESTRATION_SKILL_V2_HASH = 'a8f79058f73df5a3aa2e17a1d0f66f100086413083a7b911b99daad06200cd74';
 
+/** SHA-256 hex of the v3 `.dashboard/supervisor/CLAUDE.md` (pre-browser-tools).
+ *  v4 appends the `<!-- section:browser-tools v1 -->` section (WP2-B, embedded
+ *  browser MCP tools + for-human-action pattern + untrusted-content rule).
+ *  Used in the v4 file's previousHashes for silent v3→v4 upgrade. */
+export const SUPERVISOR_AGENT_MD_V3_HASH = 'd5b3e5fc2cc2c652b793ca390f948ed055b285f013a09df45f16b01b90c49114';
+
 export function sha256Hex(content: string | Buffer): string {
   return crypto.createHash('sha256').update(content).digest('hex');
 }
@@ -1253,8 +1259,8 @@ export class AgentSupervisor extends EventEmitter {
   private static SUPERVISOR_FILES: Record<string, ScaffoldFile> = {
     [`.dashboard/supervisor/CLAUDE.md`]:                                              {
       content: SUPERVISOR_AGENT_MD,
-      version: 3,
-      previousHashes: { 1: SUPERVISOR_AGENT_MD_V1_HASH, 2: SUPERVISOR_AGENT_MD_V2_HASH },
+      version: 4,
+      previousHashes: { 1: SUPERVISOR_AGENT_MD_V1_HASH, 2: SUPERVISOR_AGENT_MD_V2_HASH, 3: SUPERVISOR_AGENT_MD_V3_HASH },
     },
     [`.dashboard/supervisor/.claude/settings.json`]:                                  {
       content: SUPERVISOR_CLAUDE_SETTINGS_JSON,
