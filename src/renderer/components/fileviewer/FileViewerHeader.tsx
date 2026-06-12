@@ -4,6 +4,7 @@ import { detectFileType, detectLanguage, formatFileSize, isEditableFileType } fr
 import * as Icons from 'lucide-react';
 import FileIcon from './FileIcon';
 import { useDashboardStore } from '../../stores/dashboard-store';
+import { useWysiwygBeta, setWysiwygBetaEnabled } from './wysiwygBeta';
 
 interface Props {
   tabId: string;
@@ -28,6 +29,7 @@ export default function FileViewerHeader({ tabId, filePath, pathType, fileSize, 
   const saveTab = useDashboardStore((state) => state.saveTab);
   const checkHealth = useDashboardStore((state) => state.checkHealth);
   const isEditing = editState?.mode === 'edit';
+  const wysiwygBeta = useWysiwygBeta();
   const dirty = !!editState?.dirty;
   const saving = !!editState?.saving;
   const saveError = editState?.error;
@@ -126,6 +128,17 @@ export default function FileViewerHeader({ tabId, filePath, pathType, fileSize, 
             <Icons.Database className="w-3 h-3" />
             {formatFileSize(fileSize)}
           </span>
+        )}
+
+        {fileType === 'markdown' && !isEditing && (
+          <button
+            onClick={() => setWysiwygBetaEnabled(!wysiwygBeta)}
+            className={`ui-btn text-[13px] ${wysiwygBeta ? 'text-accent-blue' : ''}`}
+            title="Phase 0 spike: render markdown in the Crepe WYSIWYG editor (view-only, nothing saves)"
+          >
+            <Icons.Sparkles className="w-3 h-3" />
+            WYSIWYG (beta)
+          </button>
         )}
 
         {editable && (

@@ -4,6 +4,9 @@ import { useFileContentCache } from './useFileContentCache';
 import { detectFileType, isEditableFileType } from './fileTypeUtils';
 import FileContentRenderer from './FileContentRenderer';
 import CodeMirrorEditor from './CodeMirrorEditor';
+import MilkdownEditor from './MilkdownEditor';
+import { useWysiwygBeta } from './wysiwygBeta';
+import { sniffWysiwygCompatibility } from './markdownSplice';
 import ImageRenderer from './ImageRenderer';
 import PdfRenderer from './PdfRenderer';
 import GeoTiffRenderer from './GeoTiffRenderer';
@@ -20,6 +23,7 @@ interface Props {
 export default function FileContentArea({ tabId, filePath, pathType }: Props) {
   const fileType = filePath ? detectFileType(filePath) : null;
   const editState = useDashboardStore((state) => state.tabEditState[tabId]);
+  const wysiwygBeta = useWysiwygBeta();
   const setDraftContent = useDashboardStore((state) => state.setDraftContent);
   const saveTab = useDashboardStore((state) => state.saveTab);
   const reloadFromDisk = useDashboardStore((state) => state.reloadFromDisk);
@@ -120,6 +124,19 @@ export default function FileContentArea({ tabId, filePath, pathType }: Props) {
   const renderedContent = editState && !editState.dirty && !content.error
     ? editState.originalContent
     : content.content;
+
+  // Phase 0 spike branch (WP0.3): "WYSIWYG (beta)" toggle swaps the markdown
+  // view branch to the Crepe editor. Temporary seam — WP1-A replaces this
+  // with the three-mode dispatch; sniffer routing already lives in
+  // markdownSplice so incompatible docs stay on the old renderer.
+  if (
+    wysiwygBeta &&
+    fileType === 'markdown' &&
+    !content.error &&
+    sniffWysiwygCompatibility(renderedContent, renderedContent.length, { filePath }).ok
+  ) {
+    return <MilkdownEditor key={`${tabId}:${filePath}`} content={renderedContent} />;
+  }
 
   return (
     <FileContentRenderer
