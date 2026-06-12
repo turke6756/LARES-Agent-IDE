@@ -41,6 +41,16 @@ function detectApiHost() {
 const API_HOST = detectApiHost();
 const API_BASE = `http://${API_HOST}:${API_PORT}`;
 
+// WP0.2 (M1, plans/embedded-browser-safety-deepdive.md): the dashboard API
+// requires a per-launch bearer token, injected by the supervisor as
+// AGENT_DASHBOARD_API_TOKEN. Fail closed at startup — without it every
+// call would 401 anyway, and a loud early exit beats silent tool failures.
+const API_TOKEN = process.env.AGENT_DASHBOARD_API_TOKEN;
+if (!API_TOKEN) {
+  console.error('[mcp-supervisor] FATAL: AGENT_DASHBOARD_API_TOKEN env var is required (set by the dashboard at launch)');
+  process.exit(1);
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────────
 
 function apiRequest(method, path, body) {
@@ -51,7 +61,10 @@ function apiRequest(method, path, body) {
       port: url.port,
       path: url.pathname + url.search,
       method,
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${API_TOKEN}`,
+      },
     };
 
     const req = http.request(opts, (res) => {

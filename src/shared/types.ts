@@ -526,6 +526,8 @@ export interface IpcApi {
     openFile: (filePath: string, pathType: PathType) => Promise<void>;
     openFileInWorkspace: (filePath: string, workspaceDir: string, pathType: PathType) => Promise<void>;
     setTheme: (theme: 'dark' | 'light') => Promise<void>;
+    /** WP0.2 (M1): per-launch bearer token for the dashboard HTTP API. */
+    getApiToken: () => Promise<string>;
   };
   teams: {
     create: (input: CreateTeamInput) => Promise<Team>;

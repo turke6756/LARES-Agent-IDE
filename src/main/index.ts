@@ -1,7 +1,10 @@
 import { app, BrowserWindow, dialog, protocol, net, session, shell, nativeTheme } from 'electron';
 import path from 'path';
 import { loadPersistedTheme } from './theme-persistence';
-import { initDatabase } from './database';
+import { initDatabase, getWorkspaces } from './database';
+import { validateAndRepairClaudeJson, validateAndRepairWslClaudeJson } from './claude-config-repair';
+import { checkManagedWebContents } from './security/webcontents-guard';
+import { resolveConfined } from './security/path-confinement';
 import { AgentSupervisor } from './supervisor';
 import { registerIpcHandlers } from './ipc-handlers';
 import { WsServer } from './ws-server';
@@ -49,10 +52,73 @@ app.on('second-instance', () => {
   }
 });
 
-// Register media protocol before app is ready
+// Register media protocol before app is ready.
+// WP0.3 / M8 (plans/embedded-browser-safety-deepdive.md): no `bypassCSP` —
+// media:// content must obey page CSPs like any other resource.
 protocol.registerSchemesAsPrivileged([
-  { scheme: 'media', privileges: { standard: true, secure: true, supportFetchAPI: true, bypassCSP: true, stream: true } }
+  { scheme: 'media', privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true } }
 ]);
+
+// ── M4 global web-contents invariant guard (WP0.3, safety spec §3 M4) ──────
+// Backstop, not policy: every webContents created in this process gets
+// deny-by-default popups + webview attach. The shell re-registers its own
+// setWindowOpenHandler in createWindow() (last registration wins) and stays
+// authoritative; WP1-A's per-view handlers will do the same for browser tabs.
+app.on('web-contents-created', (_e, contents) => {
+  contents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  contents.on('will-attach-webview', (e) => e.preventDefault());
+
+  const isShell = mainWindow !== null && contents === mainWindow.webContents;
+  if (isShell) return; // the shell legitimately carries the dashboard preload
+
+  // getLastWebPreferences() is not in the TS types — deliberate cast (see the
+  // anchors table in plans/embedded-browser-implementation-tasks.md).
+  const wp = (contents as unknown as {
+    getLastWebPreferences?: () => Electron.WebPreferences;
+  }).getLastWebPreferences?.();
+  if (wp === undefined) {
+    // Identity-tracking fallback: anything that is neither the shell nor a
+    // manager-registered view (webcontents-guard seam) is unknown — loud-log.
+    if (!checkManagedWebContents(contents)) {
+      console.error(
+        `[security] unknown web-contents created (type=${contents.getType()}, url=${contents.getURL() || '<none>'})`,
+      );
+    }
+    return;
+  }
+  // Belt-and-suspenders: any non-shell view must be sandboxed, node-free,
+  // and free of the dashboard preload. Log loudly on violation.
+  if (wp.nodeIntegration || wp.sandbox === false || wp.preload) {
+    console.error('[security] insecure web-contents created:', {
+      type: contents.getType(),
+      url: contents.getURL() || '<none>',
+      nodeIntegration: wp.nodeIntegration,
+      sandbox: wp.sandbox,
+      preload: wp.preload,
+    });
+  }
+});
+
+// WP0.3 / M8 — workspace roots (Windows form) admitting media:// requests.
+// WSL roots translate via wslpath (spawns wsl.exe for non-/mnt paths), so
+// cache per workspace path; workspace roots don't move within a launch.
+const wslRootWinCache = new Map<string, string>();
+function getWorkspaceRootsWin(): string[] {
+  const roots: string[] = [];
+  for (const ws of getWorkspaces()) {
+    if (ws.pathType === 'wsl') {
+      let win = wslRootWinCache.get(ws.path);
+      if (win === undefined) {
+        win = wslToWindowsPath(ws.path);
+        wslRootWinCache.set(ws.path, win);
+      }
+      roots.push(win);
+    } else {
+      roots.push(ws.path);
+    }
+  }
+  return roots;
+}
 
 function createWindow(): void {
   const iconPath = app.isPackaged
@@ -204,16 +270,33 @@ app.whenReady().then(async () => {
   });
 
   // Handle media:// protocol — URLs are media://file/<encodedPath>
-  protocol.handle('media', async (request) => {
+  //
+  // WP0.3 / M8 — SECURITY INVARIANTS, do not relax:
+  //  1. Registered on the DEFAULT SESSION ONLY. ProtocolRequest exposes no
+  //     sender frame, so per-request requester checks are impossible; session
+  //     scoping is the gate. Browser partitions ('persist:user',
+  //     'persist:agent') and the Phase-3 'surface' partition must NEVER get a
+  //     media handler — there the scheme simply fails to resolve (and M6's
+  //     scheme gates additionally deny media: navigations).
+  //  2. The decoded path is confined to the open workspace roots via
+  //     resolveConfined() (realpath: traversal and symlink escapes → 404).
+  session.defaultSession.protocol.handle('media', async (request) => {
     const urlObj = new URL(request.url);
     // Path is /<encodedFilePath>, strip leading slash and decode
     const decodedUrl = decodeURIComponent(urlObj.pathname.slice(1));
 
     let filePath = decodedUrl;
-    
+
     if (process.platform === 'win32' && filePath.startsWith('/')) {
       filePath = wslToWindowsPath(filePath);
     }
+
+    const confined = resolveConfined(filePath, getWorkspaceRootsWin());
+    if (confined === null) {
+      console.warn(`[security] media:// request outside workspace roots rejected: ${request.url}`);
+      return new Response('File not found', { status: 404 });
+    }
+    filePath = confined;
 
     try {
       const response = await net.fetch(pathToFileURL(filePath).toString());
@@ -253,6 +336,13 @@ app.whenReady().then(async () => {
     initDatabase();
     console.log('Database initialized');
 
+    // Validate + repair ~/.claude.json (Windows + WSL distro copies) BEFORE
+    // the supervisor exists, i.e. before anything can spawn claude.exe — the
+    // backstop for hard kills that bypass the shutdown drain. See
+    // plans/claude-json-corruption-mitigation-v2.md Task 3.
+    validateAndRepairClaudeJson();
+    validateAndRepairWslClaudeJson();
+
     supervisor = new AgentSupervisor();
     createWindow();
     registerIpcHandlers(supervisor, mainWindow!);
@@ -268,11 +358,12 @@ app.whenReady().then(async () => {
       (supId, text) => supervisor!.deliverToSupervisor(supId, text),
     );
     apiServer = new ApiServer(supervisor, undefined, orchestration);
-    apiServer.start();
     // Class IV (plans/class-iv-worker-hook-scaffold.md): tell the supervisor the
     // port the API server actually bound to (handles EADDRINUSE auto-increment)
-    // so supervised workers' Stop hooks POST to the right place.
-    supervisor.setApiServerPort(apiServer.getPort());
+    // so supervised workers' Stop hooks POST to the right place. start()
+    // resolves the bound port only once 'listening' fires (WP0.1), so this
+    // can never observe a stale pre-retry port.
+    supervisor.setApiServerPort(await apiServer.start());
     orchestration.start();                 // boot reconcile of orphaned runs
     supervisor.reconcile();
     console.log('App ready');
@@ -283,14 +374,38 @@ app.whenReady().then(async () => {
   }
 });
 
-app.on('window-all-closed', () => {
+// Graceful shutdown: drain Windows claude.exe agents (/exit) before the app
+// dies so their final ~/.claude.json flushes complete — see
+// plans/claude-json-corruption-mitigation-v2.md Task 5. Known limitation:
+// hard kills (`taskkill /F`, `concurrently -k` in `npm run dev`) bypass all
+// in-process handlers; the startup validate+repair (Task 3) is the backstop
+// for those paths.
+let shutdownStarted = false;
+let drainCompleted = false;
+async function shutdownApp(): Promise<void> {
+  if (shutdownStarted) return;
+  shutdownStarted = true;
+  // Stop monitors BEFORE draining: a live StatusMonitor poll tick can infer
+  // 'crashed' for a drained agent and auto-restart it mid-quit. (The
+  // handleAutoRestart shuttingDown guard is the belt; this is the braces.)
+  supervisor?.stop();
+  try { await supervisor?.drainForShutdown(); }
+  catch (err) { console.error('[shutdown] drain failed:', err); }
+  drainCompleted = true;
   apiServer?.stop();
   wsServer?.stop();
-  supervisor?.stop();
   disposeKernelClient();
   void shutdownJupyterServer();
   closeAllFsWatchers();
   app.quit();
+}
+
+app.on('window-all-closed', () => { void shutdownApp(); });
+app.on('before-quit', (e) => {
+  // Gate on drainCompleted (not shutdownStarted): a quit fired mid-drain is
+  // deferred until the drain finishes; shutdownApp's own reentrancy guard
+  // prevents a second drain.
+  if (!drainCompleted) { e.preventDefault(); void shutdownApp(); }
 });
 
 app.on('will-quit', () => {

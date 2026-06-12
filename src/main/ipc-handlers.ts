@@ -11,6 +11,7 @@ import {
   createChannel, removeChannel, getTeamMessages, getTeamTasks, createTeamTask, updateTeamTask,
   listAgentTemplates, createAgentTemplate, updateAgentTemplate, deleteAgentTemplate,
 } from './database';
+import { getApiToken } from './security/api-auth';
 import { openInVSCode, openFileInVSCode, openFileInWorkspace } from './vscode-launcher';
 import { getPassiveWslStatus, isTmuxAvailable, isClaudeAvailableInWsl } from './wsl-bridge';
 import { execFileSync } from 'child_process';
@@ -411,6 +412,11 @@ export function registerIpcHandlers(supervisor: AgentSupervisor, mainWindow: Bro
   ipcMain.handle('system:open-file-in-workspace', (_e, filePath, workspaceDir, pathType) => {
     openFileInWorkspace(filePath, workspaceDir, pathType || detectPathType(filePath));
   });
+
+  // WP0.2 (M1): the renderer's direct HTTP calls to the dashboard API
+  // (useNotebookActions.ts) need the per-launch bearer token. IPC is the
+  // distribution channel — the token never appears in any URL or page markup.
+  ipcMain.handle('system:get-api-token', () => getApiToken());
 
   // Keep native window chrome (title bar / menu bar) in sync with the
   // renderer theme toggle, and persist so the next launch matches pre-paint.

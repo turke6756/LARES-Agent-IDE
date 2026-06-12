@@ -1,5 +1,7 @@
 import http from 'http';
+import type { AddressInfo } from 'net';
 import { URL } from 'url';
+import { getApiToken, decideApiAccess } from './security/api-auth';
 import type { AgentSupervisor } from './supervisor';
 import {
   getAgent, getAllAgents, getAgentsByWorkspace, getWorkspace,
@@ -44,21 +46,51 @@ export class ApiServer {
   private supervisor: AgentSupervisor;
   private port: number;
 
-  constructor(supervisor: AgentSupervisor, port = 24678, private orchestration?: OrchestrationService) {
+  /** `bindHost` defaults to 0.0.0.0 deliberately (WP0.1 bind decision): WSL
+   *  agents reach the API via the Windows-host gateway IP, so a loopback-only
+   *  bind breaks them. The per-launch bearer token is the network gate, not
+   *  the bind scope. Tests pass '127.0.0.1' (+ port 0 for ephemeral binds). */
+  constructor(
+    supervisor: AgentSupervisor,
+    port = 24678,
+    private orchestration?: OrchestrationService,
+    private bindHost: string = '0.0.0.0',
+  ) {
     this.supervisor = supervisor;
     this.port = port;
   }
 
-  start(): void {
+  /** Resolves with the actually-bound port once listening — surviving the
+   *  EADDRINUSE auto-increment — so callers never read a stale pre-retry
+   *  port (the old getPort()/start() race). Rejects on non-recoverable
+   *  listen errors. */
+  start(): Promise<number> {
     this.server = http.createServer(async (req, res) => {
-      // CORS headers for local requests
-      res.setHeader('Access-Control-Allow-Origin', '*');
-      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
-      res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-
-      if (req.method === 'OPTIONS') {
+      // M1 + M8 admission gate (WP0.1, security spec §3) — runs BEFORE route():
+      // preflight short-circuit, origin allowlist (403), bearer token (401).
+      // Fail closed: no token, no service — the bind is 0.0.0.0 for WSL.
+      const origin = typeof req.headers.origin === 'string' ? req.headers.origin : undefined;
+      const decision = decideApiAccess(req.method || 'GET', origin, req.headers.authorization, getApiToken());
+      if (decision.kind !== 'forbidden-origin' && decision.corsOrigin !== undefined) {
+        // Per-origin echo, never `*`; never Access-Control-Allow-Credentials.
+        res.setHeader('Access-Control-Allow-Origin', decision.corsOrigin);
+        res.setHeader('Vary', 'Origin');
+        res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
+        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+      }
+      if (decision.kind === 'preflight') {
         res.writeHead(204);
         res.end();
+        return;
+      }
+      if (decision.kind === 'forbidden-origin') {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Origin not allowed' }));
+        return;
+      }
+      if (decision.kind === 'unauthorized') {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Missing or invalid API token (Authorization: Bearer <AGENT_DASHBOARD_API_TOKEN>)' }));
         return;
       }
 
@@ -83,21 +115,32 @@ export class ApiServer {
       }
     });
 
-    this.server.listen(this.port, '0.0.0.0', () => {
-      console.log(`[api-server] Listening on http://0.0.0.0:${this.port}`);
-    });
-
-    this.server.on('error', (err: any) => {
-      if (err.code === 'EADDRINUSE') {
-        console.warn(`[api-server] Port ${this.port} in use, trying ${this.port + 1}`);
-        this.port++;
-        this.server!.listen(this.port, '0.0.0.0');
-      } else {
-        console.error('[api-server] Error:', err);
-      }
+    const server = this.server;
+    return new Promise<number>((resolve, reject) => {
+      server.on('error', (err: any) => {
+        if (err.code === 'EADDRINUSE') {
+          console.warn(`[api-server] Port ${this.port} in use, trying ${this.port + 1}`);
+          this.port++;
+          server.listen(this.port, this.bindHost);
+        } else {
+          console.error('[api-server] Error:', err);
+          // No-op if already listening (runtime error after startup);
+          // before 'listening' it fails start() so boot surfaces the fault.
+          reject(err);
+        }
+      });
+      server.on('listening', () => {
+        // Read the kernel-assigned port (port: 0 ephemeral binds, EADDRINUSE
+        // increments) so getPort() can never return a stale pre-retry value.
+        this.port = (server.address() as AddressInfo).port;
+        console.log(`[api-server] Listening on http://${this.bindHost}:${this.port}`);
+        resolve(this.port);
+      });
+      server.listen(this.port, this.bindHost);
     });
   }
 
+  /** Only meaningful once start() has resolved. */
   getPort(): number {
     return this.port;
   }

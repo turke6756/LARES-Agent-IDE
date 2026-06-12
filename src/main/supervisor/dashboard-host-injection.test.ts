@@ -220,14 +220,20 @@ test('dashboard-status.mjs (v7) spools to pending-status.jsonl when fetch fails'
 
   // Run the script with a port that won't accept connections so fetch fails fast.
   // 1 is the always-rejected port assignment (privileged + unallocated).
+  // Strip DASHBOARD_SPOOL_PATH: when this suite runs inside a dashboard-
+  // supervised agent, process.env carries the LIVE workspace's spool path and
+  // the script would (correctly) append there instead of exercising the
+  // script-relative fallback this test asserts on.
+  const scriptEnv: NodeJS.ProcessEnv = {
+    ...process.env,
+    AGENT_ID: 'agent-failure-test',
+    DASHBOARD_PORT: '1',
+    DASHBOARD_HOST: '127.0.0.1',
+    CLAUDE_HOOK_EVENT_NAME: 'Stop',
+  };
+  delete scriptEnv.DASHBOARD_SPOOL_PATH;
   const result = spawnSync(process.execPath, [destScript], {
-    env: {
-      ...process.env,
-      AGENT_ID: 'agent-failure-test',
-      DASHBOARD_PORT: '1',
-      DASHBOARD_HOST: '127.0.0.1',
-      CLAUDE_HOOK_EVENT_NAME: 'Stop',
-    },
+    env: scriptEnv,
     encoding: 'utf-8',
     timeout: 10000,
     stdio: ['ignore', 'pipe', 'pipe'], // closed stdin → no 300 ms stall

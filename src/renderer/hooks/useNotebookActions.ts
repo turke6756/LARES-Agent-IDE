@@ -337,8 +337,25 @@ export function useNotebookActions(path: string, ynotebook: ISharedNotebook | nu
   };
 }
 
+// WP0.2 (M1): the dashboard API is bearer-token gated. Fetch the token once
+// over IPC and memoize the promise module-wide — every request through
+// fetchJson() below attaches it. On failure the promise is reset so a later
+// call can retry instead of caching a rejection forever.
+let apiTokenPromise: Promise<string> | null = null;
+function getApiToken(): Promise<string> {
+  if (!apiTokenPromise) {
+    apiTokenPromise = window.api.system.getApiToken().catch((err) => {
+      apiTokenPromise = null;
+      throw err;
+    });
+  }
+  return apiTokenPromise;
+}
+
 async function fetchJson<T>(input: RequestInfo | URL, init?: RequestInit): Promise<T> {
-  const response = await fetch(input, init);
+  const headers = new Headers(init?.headers);
+  headers.set('Authorization', `Bearer ${await getApiToken()}`);
+  const response = await fetch(input, { ...init, headers });
   const payload = await response.json().catch(() => null);
   if (!response.ok) {
     const message =

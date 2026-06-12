@@ -30,6 +30,13 @@ if (!AGENT_ID || !TEAM_ID) {
   process.exit(1);
 }
 
+// WP0.2 (M1): per-launch bearer token for the dashboard API. Fail closed.
+const API_TOKEN = process.env.AGENT_DASHBOARD_API_TOKEN;
+if (!API_TOKEN) {
+  console.error('[mcp-team] FATAL: AGENT_DASHBOARD_API_TOKEN env var is required (set by the dashboard at launch)');
+  process.exit(1);
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────────
 
 function apiRequest(method, path, body) {
@@ -40,7 +47,10 @@ function apiRequest(method, path, body) {
       port: url.port,
       path: url.pathname + url.search,
       method,
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${API_TOKEN}`,
+      },
     };
 
     const req = http.request(opts, (res) => {

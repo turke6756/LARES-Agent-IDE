@@ -100,6 +100,13 @@ function candidatePorts(args) {
   return ports.filter((port, index, all) => Number.isInteger(port) && port > 0 && all.indexOf(port) === index);
 }
 
+// WP0.2 (M1): per-launch bearer token for the dashboard API. Fail closed.
+const API_TOKEN = process.env.AGENT_DASHBOARD_API_TOKEN;
+if (!API_TOKEN) {
+  console.error('[orchestration-spike] FATAL: AGENT_DASHBOARD_API_TOKEN env var is required (set by the dashboard at launch)');
+  process.exit(1);
+}
+
 function requestJson(base, method, apiPath, body) {
   return new Promise((resolve, reject) => {
     const payload = body === undefined ? null : JSON.stringify(body);
@@ -109,10 +116,13 @@ function requestJson(base, method, apiPath, body) {
       path: apiPath,
       method,
       timeout: 60000,
-      headers: payload ? {
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(payload),
-      } : undefined,
+      headers: {
+        'Authorization': `Bearer ${API_TOKEN}`,
+        ...(payload ? {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(payload),
+        } : {}),
+      },
     }, (res) => {
       let text = '';
       res.setEncoding('utf8');

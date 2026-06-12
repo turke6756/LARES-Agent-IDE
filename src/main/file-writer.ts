@@ -3,6 +3,11 @@ import * as path from 'path';
 import type { FileCopyResult, FileMutationResult, PathType } from '../shared/types';
 import { ensureWslPath } from './path-utils';
 import { wslExecCommand } from './wsl-bridge';
+import {
+  normalizeWslPath,
+  normalizeWindowsPath,
+  assertInsideRoot,
+} from './security/path-confinement';
 
 const MAX_TEXT_WRITE_SIZE = 5 * 1024 * 1024;
 const WSL_TIMEOUT = 10000;
@@ -57,38 +62,10 @@ function shellQuote(p: string): string {
   return `'${sanitized.replace(/'/g, `'\\''`)}'`;
 }
 
-function normalizeWslPath(p: string): string {
-  const normalized = path.posix.normalize(p.replace(/\\/g, '/').replace(/\/+/g, '/'));
-  return normalized.length > 1 ? normalized.replace(/\/+$/, '') : normalized;
-}
-
-function normalizeWindowsPath(p: string): string {
-  return path.resolve(p);
-}
-
-function isWindowsPathInside(targetPath: string, rootDirectory: string): boolean {
-  const target = normalizeWindowsPath(targetPath);
-  const root = normalizeWindowsPath(rootDirectory);
-  const rel = path.relative(root, target);
-  return rel === '' || (!!rel && !rel.startsWith('..') && !path.isAbsolute(rel));
-}
-
-function isWslPathInside(targetPath: string, rootDirectory: string): boolean {
-  const target = normalizeWslPath(ensureWslPath(targetPath, 'wsl'));
-  const root = normalizeWslPath(ensureWslPath(rootDirectory, 'wsl'));
-  if (target === root) return true;
-  if (root === '/') return target.startsWith('/');
-  return target.startsWith(`${root}/`);
-}
-
-function assertInsideRoot(targetPath: string, rootDirectory: string, pathType: PathType): void {
-  const inside = pathType === 'wsl'
-    ? isWslPathInside(targetPath, rootDirectory)
-    : isWindowsPathInside(targetPath, rootDirectory);
-  if (!inside) {
-    throw new Error('Target path is outside the working directory');
-  }
-}
+// normalizeWslPath / normalizeWindowsPath / assertInsideRoot (and the
+// isInside predicates behind it) moved to security/path-confinement.ts in
+// WP0.3 so the media:// and surface protocol handlers share them. Behavior
+// is unchanged here.
 
 function isSamePath(a: string, b: string, pathType: PathType): boolean {
   if (pathType === 'wsl') {

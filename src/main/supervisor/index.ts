@@ -20,6 +20,7 @@ import {
   MAX_SUBMIT_RETRIES, HANDSHAKE_CONFIRM_WINDOW_MS, HANDSHAKE_CONFIRM_POLL_MS,
   TMUX_OPTION_MAX_AGE_MS, TMUX_OPTION_LAUNCH_SKEW_MS, STATUS_POLL_INTERVAL_MS,
 } from '../../shared/constants';
+import { getApiToken } from '../security/api-auth';
 import { EventBridge, EventBridgeDeps } from './event-bridge';
 import { TeamMessageDeliveryEngine } from './team-delivery';
 import { WindowsRunner } from './windows-runner';
@@ -677,6 +678,18 @@ export class AgentSupervisor extends EventEmitter {
    *  launch into an already-provisioned workspace. */
   private providerTrustEnsured = new Set<string>();
 
+  /** Gap between agent respawns in reconcile() so N claude.exe startup
+   *  write-bursts against the shared ~/.claude.json don't synchronize.
+   *  Env-overridable for tuning during verification without rebuild loops.
+   *  See plans/claude-json-corruption-mitigation-v2.md. */
+  private static readonly RECONCILE_STAGGER_MS =
+    Number(process.env.DASHBOARD_RECONCILE_STAGGER_MS ?? 2500);
+
+  /** Set by drainForShutdown(). Suppresses auto-restart and keeps drained
+   *  agents at their pre-quit status (not 'done') so reconcile() respawns
+   *  them with --continue at next startup. */
+  private shuttingDown = false;
+
   // Event bridge — supervisor notification, cooldown, queue, drain state lives here.
   private bridge: EventBridge;
 
@@ -919,6 +932,34 @@ export class AgentSupervisor extends EventEmitter {
     this.contextStatsMonitor.stop();
     this.sessionLogReader.stop();
     this.teamDeliveryEngine.stop();
+  }
+
+  /** Graceful pre-quit drain. Windows claude.exe processes share
+   *  ~/.claude.json and die mid-write under tree-kill; ask each to /exit
+   *  SEQUENTIALLY (parallel exits would herd their final config flushes —
+   *  the same race this drains). Non-claude providers get a plain kill():
+   *  they don't write ~/.claude.json and /exit into their TUIs is undefined.
+   *  WSL runners are only detached: their claude writes the distro's own
+   *  ~/.claude.json, and tmux sessions outlive Electron by design. */
+  async drainForShutdown(perAgentTimeoutMs = 4000, totalBudgetMs = 15000): Promise<void> {
+    this.shuttingDown = true;
+    const deadline = Date.now() + totalBudgetMs;
+    for (const [id, runner] of [...this.windowsRunners]) {
+      const provider = getAgent(id)?.provider;
+      const remaining = deadline - Date.now();
+      if (provider !== 'claude' || remaining <= 0) {
+        if (provider === 'claude') console.warn(`[shutdown] drain budget exhausted — hard-killing ${id}`);
+        runner.kill();
+        this.windowsRunners.delete(id);
+        continue;
+      }
+      const clean = await runner.gracefulExit(Math.min(perAgentTimeoutMs, remaining));
+      if (!clean) console.warn(`[shutdown] ${id} did not /exit within budget — killed`);
+      this.windowsRunners.delete(id);
+    }
+    for (const [, runner] of [...this.wslRunners]) {
+      runner.detachHost();
+    }
   }
 
   getContextStats(agentId: string): ContextStats | null {
@@ -1839,7 +1880,9 @@ export class AgentSupervisor extends EventEmitter {
     // WSL: ~/.claude.json lives in the distro and can be multi-MB (it carries
     // per-project history), so it can't round-trip through argv as base64.
     // Read with a raised maxBuffer; write by staging to a Windows temp file
-    // the distro reads back via /mnt/<drive>.
+    // the distro reads back via /mnt/<drive>, then stage-then-rename in-distro
+    // (`mv` within one filesystem is an atomic rename) so a concurrent claude
+    // reader never sees a half-written file.
     const existing = execFileSync(
       'wsl.exe',
       ['bash', '-lc', 'cat "$HOME/.claude.json" 2>/dev/null || true'],
@@ -1853,7 +1896,7 @@ export class AgentSupervisor extends EventEmitter {
       const stageWsl = windowsToWslPath(stage);
       execFileSync(
         'wsl.exe',
-        ['bash', '-lc', `cat '${stageWsl}' > "$HOME/.claude.json"`],
+        ['bash', '-lc', `cat '${stageWsl}' > "$HOME/.claude.json.tmp-$$" && mv "$HOME/.claude.json.tmp-$$" "$HOME/.claude.json"`],
         { timeout: 8000 },
       );
     } finally {
@@ -1893,7 +1936,10 @@ export class AgentSupervisor extends EventEmitter {
           command: 'node',
           args: [mcpScriptPath.replace(/\\/g, '/')],
           env: {
-            AGENT_DASHBOARD_API_PORT: '24678',
+            // Real bound port (EADDRINUSE can increment past 24678) + the
+            // per-launch bearer token — WP0.2; proxies fail closed without it.
+            AGENT_DASHBOARD_API_PORT: String(this.apiServerPort),
+            AGENT_DASHBOARD_API_TOKEN: getApiToken(),
           },
         },
       },
@@ -1936,8 +1982,9 @@ export class AgentSupervisor extends EventEmitter {
               command: 'node',
               args: [linuxScriptPath],
               env: {
-                AGENT_DASHBOARD_API_PORT: '24678',
+                AGENT_DASHBOARD_API_PORT: String(this.apiServerPort),
                 AGENT_DASHBOARD_API_HOST: windowsHostIp,
+                AGENT_DASHBOARD_API_TOKEN: getApiToken(),
               },
             },
           },
@@ -1999,8 +2046,9 @@ export class AgentSupervisor extends EventEmitter {
           env: {
             AGENT_ID: agentId,
             TEAM_ID: teamId,
-            AGENT_DASHBOARD_API_PORT: '24678',
+            AGENT_DASHBOARD_API_PORT: String(this.apiServerPort),
             AGENT_DASHBOARD_API_HOST: windowsHostIp,
+            AGENT_DASHBOARD_API_TOKEN: getApiToken(),
           },
         };
 
@@ -2028,7 +2076,8 @@ export class AgentSupervisor extends EventEmitter {
           env: {
             AGENT_ID: agentId,
             TEAM_ID: teamId,
-            AGENT_DASHBOARD_API_PORT: '24678',
+            AGENT_DASHBOARD_API_PORT: String(this.apiServerPort),
+            AGENT_DASHBOARD_API_TOKEN: getApiToken(),
           },
         };
 
@@ -2069,8 +2118,9 @@ export class AgentSupervisor extends EventEmitter {
             env: {
               AGENT_ID: agentId,
               TEAM_ID: teamId,
-              AGENT_DASHBOARD_API_PORT: '24678',
+              AGENT_DASHBOARD_API_PORT: String(this.apiServerPort),
               AGENT_DASHBOARD_API_HOST: windowsHostIp,
+              AGENT_DASHBOARD_API_TOKEN: getApiToken(),
             },
           },
         },
@@ -2085,7 +2135,8 @@ export class AgentSupervisor extends EventEmitter {
           env: {
             AGENT_ID: agentId,
             TEAM_ID: teamId,
-            AGENT_DASHBOARD_API_PORT: '24678',
+            AGENT_DASHBOARD_API_PORT: String(this.apiServerPort),
+            AGENT_DASHBOARD_API_TOKEN: getApiToken(),
           },
         },
       },
@@ -2166,7 +2217,10 @@ export class AgentSupervisor extends EventEmitter {
             'agent-dashboard': {
               command: 'node',
               args: [mcpScriptPath],
-              env: { AGENT_DASHBOARD_API_PORT: '24678' },
+              env: {
+                AGENT_DASHBOARD_API_PORT: String(this.apiServerPort),
+                AGENT_DASHBOARD_API_TOKEN: getApiToken(),
+              },
             },
           },
         });
@@ -2277,6 +2331,10 @@ export class AgentSupervisor extends EventEmitter {
     });
 
     runner.on('exit', (exitCode: number) => {
+      // Drain-time exits must NOT flip status to 'done'/'crashed' — keeping
+      // the agent 'working'/'idle' in the DB is what makes reconcile()
+      // respawn it with --continue at next startup.
+      if (this.shuttingDown) { this.windowsRunners.delete(agent.id); return; }
       updateAgentExitCode(agent.id, exitCode);
       this.windowsRunners.delete(agent.id);
       const status: AgentStatus = exitCode === 0 ? 'done' : 'crashed';
@@ -2704,6 +2762,9 @@ export class AgentSupervisor extends EventEmitter {
     });
 
     runner.on('exit', (exitCode: number) => {
+      // See the Windows runner-exit handler: shutdown-time exits keep the
+      // agent's pre-quit status so reconcile() picks it up next startup.
+      if (this.shuttingDown) { this.wslRunners.delete(agent.id); return; }
       updateAgentExitCode(agent.id, exitCode);
       this.wslRunners.delete(agent.id);
       const status: AgentStatus = exitCode === 0 ? 'done' : 'crashed';
@@ -2817,6 +2878,10 @@ export class AgentSupervisor extends EventEmitter {
   }
 
   private async handleAutoRestart(agent: Agent): Promise<void> {
+    // Single choke point for all three auto-restart triggers (both runner-exit
+    // handlers + the StatusMonitor statusChanged listener): never respawn an
+    // agent the shutdown drain just exited.
+    if (this.shuttingDown) return;
     if (agent.restartCount >= 5) {
       addEvent(agent.id, 'restart_limit_reached');
       return;
@@ -3782,10 +3847,11 @@ export class AgentSupervisor extends EventEmitter {
     // For WSL agents, dispatch by provider. All three providers enable the
     // kitty keyboard protocol on Linux, so a bare `\r` from `tmux send-keys
     // Enter` is dropped — submit must be the kitty CSI form `\x1b[13u`.
-    // claude additionally needs bracketed-paste wrapping so multi-line content
-    // renders without confusing the input handler; codex/gemini need each
-    // embedded `\n` encoded as Shift+Enter (`\x1b[13;2u`) so the final Enter
-    // is the only submit event. See `tmuxSendInput` for the encoding.
+    // The body is delivered as a tmux buffer paste (`load-buffer -` from
+    // stdin + `paste-buffer`) so large relays never hit tmux's or
+    // CreateProcess's command-length limits; claude's paste is additionally
+    // bracketed-paste-wrapped so multi-line content renders without
+    // submitting. See `tmuxSendInput` for the encoding.
     const wslRunner = this.wslRunners.get(agentId);
     if (wslRunner) {
       if (agent?.tmuxSessionName) {
@@ -4092,6 +4158,7 @@ export class AgentSupervisor extends EventEmitter {
         console.log(`Reconnecting agent: ${agent.title} (${agent.id}) sessionId=${agentForReconnect?.resumeSessionId || 'NONE'}`);
         try {
           const pathType = detectPathType(agent.workingDirectory);
+          const ws = getWorkspace(agent.workspaceId);
 
           // Refresh .mcp.json for supervisors and persona-backed agents.
           // launchAgent() runs ensureMcpConfig() on first launch, but reconcile
@@ -4100,13 +4167,26 @@ export class AgentSupervisor extends EventEmitter {
           // (e.g. release/win-unpacked/...) survive past a switch from packaged
           // to dev builds, and how new MCP tools fail to surface to existing
           // supervisors. Rewriting on every reconcile makes this self-healing.
-          if (agent.isSupervisor) {
-            const ws = getWorkspace(agent.workspaceId);
-            if (ws) {
-              this.ensureMcpConfig(ws.path, pathType);
-              if (agent.workingDirectory && agent.workingDirectory !== ws.path) {
-                this.ensureMcpConfig(agent.workingDirectory, pathType);
-              }
+          if (agent.isSupervisor && ws) {
+            this.ensureMcpConfig(ws.path, pathType);
+            if (agent.workingDirectory && agent.workingDirectory !== ws.path) {
+              this.ensureMcpConfig(agent.workingDirectory, pathType);
+            }
+          }
+
+          // Scaffold refresh on reconcile — same self-healing rationale as the
+          // ensureMcpConfig block above: launchAgent() scaffolds on creation, but
+          // reconcile bypasses launchAgent, so template version bumps never reach
+          // workspaces whose agents only ever respawn via app restart. Writes are
+          // version-gated and sidecar-short-circuited, so this is cheap when current.
+          // NOTE: do NOT add ensureProviderDirTrust here — it writes ~/.claude.json,
+          // which would add a dashboard writer inside the startup herd window.
+          if (ws) {
+            if (agent.isSupervisor) {
+              this.ensureSupervisorScaffold(ws.path, pathType);
+            } else if (agent.isWorker) {
+              this.ensureWorkerScaffold(ws.path, agent.provider, pathType);
+              if (agent.provider === 'codex') this.ensureCodexHookProfile(pathType);
             }
           }
 
@@ -4123,6 +4203,7 @@ export class AgentSupervisor extends EventEmitter {
           addEvent(agent.id, 'reconnect_failed', String(err));
           this.emit('statusChanged', { agentId: agent.id, status: 'crashed', fromStatus: priorReconnect, source: 'restart-failed' } satisfies StatusChangedEvent);
         }
+        await new Promise(r => setTimeout(r, AgentSupervisor.RECONCILE_STAGGER_MS));
       }
     }
 
