@@ -310,6 +310,31 @@ export class WindowsRunner extends EventEmitter {
     this.sendToHost({ type: 'resize', cols, rows });
   }
 
+  /** Ask claude.exe to exit cleanly so it finishes its final ~/.claude.json
+   *  write before the process dies. Resolves true on clean exit, false if we
+   *  had to fall back to kill(). Claude-provider runners only — /exit into a
+   *  codex/gemini TUI is undefined behavior. */
+  async gracefulExit(timeoutMs = 4000): Promise<boolean> {
+    if (!this._alive || !this.host) return true;
+    this._intentionalKill = true;
+    this.persistScrollback();
+    // Esc clears any half-typed input or open menu; the pauses keep the
+    // slash-command autocomplete from racing the keystrokes (same two-step
+    // shape as WslRunner's tmux graceful path, wsl-runner.ts:777-781).
+    this.write('\x1b');
+    await new Promise(r => setTimeout(r, 150));
+    this.write('/exit');
+    await new Promise(r => setTimeout(r, 150));
+    this.write('\r');
+    const exited = await new Promise<boolean>(resolve => {
+      const t = setTimeout(() => { this.removeListener('exit', onExit); resolve(false); }, timeoutMs);
+      const onExit = () => { clearTimeout(t); resolve(true); };
+      this.once('exit', onExit);
+    });
+    if (!exited) this.kill();
+    return exited;
+  }
+
   kill(): void {
     this._intentionalKill = true;
     this._alive = false;

@@ -762,6 +762,18 @@ export class WslRunner extends EventEmitter {
     this.sendToHost({ type: 'resize', cols, rows });
   }
 
+  /** Shutdown-time detach: drop the pty-host bridge WITHOUT touching tmux —
+   *  the session deliberately outlives Electron for live reattach on
+   *  reconcile. _intentionalKill must be set BEFORE the kill message or the
+   *  host's exit routes through the phantom-reconnect respawner
+   *  (_handleHostExit, wsl-runner.ts:436-484), which would spawn a brand-new
+   *  pty-host mid-quit. */
+  detachHost(): void {
+    this._intentionalKill = true;
+    this.persistScrollback();
+    this.sendToHost({ type: 'kill' });
+  }
+
   async kill(): Promise<void> {
     this._intentionalKill = true;
     this._alive = false;

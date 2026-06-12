@@ -432,14 +432,17 @@ export function shQuote(value: string): string {
 }
 
 // Hex byte sequences for tmux `send-keys -H`.
-// Kitty keyboard protocol (CSI-u) — codex/gemini on Linux enable this and
-// expect Enter as `\x1b[13u`, Shift+Enter as `\x1b[13;2u`. Plain `\r` from
-// `tmux send-keys Enter` is silently dropped in disambiguate mode.
+// Kitty keyboard protocol (CSI-u) — all three providers on Linux enable this
+// and expect Enter as `\x1b[13u`. Plain `\r` from `tmux send-keys Enter` is
+// silently dropped in disambiguate mode.
 export const TMUX_KITTY_ENTER_HEX = '1b 5b 31 33 75';            // \x1b[13u
-const TMUX_KITTY_SHIFT_ENTER_HEX = '1b 5b 31 33 3b 32 75'; // \x1b[13;2u
 // Bracketed paste markers — claude on Linux treats the wrapped body as pasted
-// content (renders multi-line correctly without entering paste-confirmation),
-// then accepts a separate kitty Enter to submit.
+// content (renders multi-line correctly without submitting). Sent explicitly
+// around claude's paste rather than via `paste-buffer -p`, because `-p` only
+// inserts the markers when the pane application has already requested
+// bracketed-paste mode — if claude hadn't enabled it yet (e.g. mid-startup),
+// an unwrapped multi-line body could partially submit. Verified empirically:
+// `-p` against a pane that never requested paste mode emits no markers.
 const TMUX_BP_START_HEX = '1b 5b 32 30 30 7e';             // \x1b[200~
 const TMUX_BP_END_HEX = '1b 5b 32 30 31 7e';               // \x1b[201~
 
@@ -450,69 +453,88 @@ const POST_BODY_SLEEP_SECONDS = '0.08';
 
 export type TmuxProvider = 'claude' | 'codex' | 'gemini' | 'unknown';
 
+/** Command + stdin payload produced by {@link buildTmuxSendInputCmd}. The
+ *  body travels on stdin (consumed by `tmux load-buffer -`), never inside
+ *  `cmd` itself, so the assembled command stays a constant ~150 bytes
+ *  regardless of payload size. The previous per-line `send-keys \; ...`
+ *  encoding grew with the payload and a full GroupThink draft (~14–20 KB)
+ *  overflowed both tmux's command-length limit and Windows CreateProcess's
+ *  ~32 KB argv cap, breaking the quoting so draft text ran as bash — see
+ *  plans/wsl-codex-relay-length-bug-2026-06-10.md. */
+export interface TmuxSendInputCommand {
+  cmd: string;
+  /** Newline-normalized body to pipe to `cmd`'s stdin; absent when the
+   *  command is submit-only (empty body). */
+  stdin?: string;
+}
+
 /**
- * Pure builder for the WSL `tmux send-keys` shell command. Exposed so the
+ * Pure builder for the WSL tmux input-relay command. Exposed so the
  * provider-specific encoding (and the submit/no-submit branches added for
  * BUG-01) can be unit-tested without spawning wsl.exe.
  *
- * Returns null when the provider is 'unknown' (which falls back to the legacy
- * tmuxSendKeys path that's already covered elsewhere).
+ * Returns null when there is nothing to send (empty body + submit:false) or
+ * when the provider is 'unknown' (which falls back to the legacy tmuxSendKeys
+ * path that's already covered elsewhere).
  */
 export function buildTmuxSendInputCmd(
   name: string,
   text: string,
   provider: TmuxProvider,
   submit: boolean
-): string | null {
+): TmuxSendInputCommand | null {
+  if (provider !== 'claude' && provider !== 'codex' && provider !== 'gemini') {
+    return null;
+  }
+
   const normalized = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  // Strip nested bracketed-paste markers so a hostile payload can't terminate
+  // claude's paste wrapper early (or fake one around codex's raw paste) and
+  // reach the agent's input handler as key events.
+  const body = normalized.replaceAll('\x1b[200~', '').replaceAll('\x1b[201~', '');
   const submitCmd = `tmux send-keys -t '${name}' -H ${TMUX_KITTY_ENTER_HEX}`;
 
-  if (provider === 'claude') {
-    // Strip nested bracketed-paste markers so a hostile payload can't escape
-    // the wrapper and reach claude's input handler outside paste mode.
-    const body = normalized.replaceAll('\x1b[200~', '').replaceAll('\x1b[201~', '');
-    const escaped = shellSingleQuoteEscape(body);
-    const bodyCmd =
-      `tmux send-keys -t '${name}' -H ${TMUX_BP_START_HEX} \\; ` +
-      `send-keys -t '${name}' -l '${escaped}' \\; ` +
-      `send-keys -t '${name}' -H ${TMUX_BP_END_HEX}`;
-    if (!submit) return bodyCmd;
-    return `${bodyCmd} && sleep ${POST_BODY_SLEEP_SECONDS} && ${submitCmd}`;
+  if (body.length === 0) {
+    return submit ? { cmd: submitCmd } : null;
   }
 
-  if (provider === 'codex' || provider === 'gemini') {
-    const lines = normalized.split('\n');
-    const parts: string[] = [];
-    for (let i = 0; i < lines.length; i++) {
-      if (lines[i].length > 0) {
-        parts.push(`send-keys -t '${name}' -l '${shellSingleQuoteEscape(lines[i])}'`);
-      }
-      if (i < lines.length - 1) {
-        parts.push(`send-keys -t '${name}' -H ${TMUX_KITTY_SHIFT_ENTER_HEX}`);
-      }
-    }
-    const bodyCmd = parts.length > 0 ? `tmux ${parts.join(' \\; ')}` : '';
-    if (!submit) return bodyCmd || null;
-    return bodyCmd
-      ? `${bodyCmd} && sleep ${POST_BODY_SLEEP_SECONDS} && ${submitCmd}`
-      : submitCmd;
-  }
-
-  return null;
+  // Deliver the body as a tmux buffer paste: `load-buffer -` fills a buffer
+  // from stdin and `paste-buffer -d` replays it into the pane (deleting the
+  // buffer afterwards). Per provider:
+  // - claude: explicit bracketed-paste markers around the paste (multi-line
+  //   content renders without submitting), with `-r` suppressing tmux's
+  //   default LF→CR translation — the pane receives the exact byte stream
+  //   (\x1b[200~ + body-with-LF + \x1b[201~) the old per-`send-keys -l`
+  //   wrapping produced. Markers are sent via `send-keys -H`, not
+  //   `paste-buffer -p`, because `-p` is conditional on the app having
+  //   requested paste mode (see TMUX_BP_START_HEX).
+  // - codex/gemini: raw paste with default LF→CR translation, verified live
+  //   on WSL (plans/wsl-codex-relay-length-bug-2026-06-10.md): a 20 KB /
+  //   312-line paste lands in codex's composer intact, with no premature
+  //   submit and no external-editor confirmation flow. (An earlier comment
+  //   here claimed bracketed paste opens codex's external-editor confirmation
+  //   flow on Linux; that did not reproduce — and is moot for a raw paste,
+  //   which sends no bracketed-paste markers.)
+  const bodyCmd = provider === 'claude'
+    ? `tmux send-keys -t '${name}' -H ${TMUX_BP_START_HEX} \\; ` +
+      `load-buffer - \\; paste-buffer -d -r -t '${name}' \\; ` +
+      `send-keys -t '${name}' -H ${TMUX_BP_END_HEX}`
+    : `tmux load-buffer - \\; paste-buffer -d -t '${name}'`;
+  if (!submit) return { cmd: bodyCmd, stdin: body };
+  return {
+    cmd: `${bodyCmd} && sleep ${POST_BODY_SLEEP_SECONDS} && ${submitCmd}`,
+    stdin: body,
+  };
 }
 
 /**
  * Send `text` to a WSL agent via tmux, then submit, using a provider-aware
- * encoding. All three providers enable kitty keyboard protocol on Linux at
- * startup; tmux's `send-keys Enter` (a bare `\r` byte) is dropped in that
- * mode, so submit must be sent as the kitty CSI key event `\x1b[13u`.
- *
- * - claude: bracketed-paste-wrap the body so multi-line content renders without
- *   triggering paste-confirmation, then submit.
- * - codex/gemini: type body line-by-line, encoding embedded `\n` as kitty
- *   Shift+Enter (`\x1b[13;2u`) so the final Enter is the only submit event.
- *   Bracketed paste opens codex's external-editor confirmation flow on Linux
- *   too (same regression as Windows), so don't wrap.
+ * encoding. The body is piped to `tmux load-buffer -` on stdin and pasted
+ * into the pane — length-safe for arbitrarily large relays (see
+ * {@link buildTmuxSendInputCmd}). All three providers enable kitty keyboard
+ * protocol on Linux at startup; tmux's `send-keys Enter` (a bare `\r` byte)
+ * is dropped in that mode, so submit must be sent as the kitty CSI key event
+ * `\x1b[13u`.
  *
  * `submit` defaults to true. Set it to false to leave the text in the agent's
  * prompt buffer without pressing Enter — used by launch_agent's `submit:false`
@@ -531,11 +553,11 @@ export async function tmuxSendInput(
     return;
   }
 
-  const cmd = buildTmuxSendInputCmd(name, text, provider, submit);
-  if (!cmd) return; // nothing to do (e.g. empty body + submit:false)
-  const result = await wslExec(cmd, 8000);
+  const input = buildTmuxSendInputCmd(name, text, provider, submit);
+  if (!input) return; // nothing to do (e.g. empty body + submit:false)
+  const result = await wslExecCommand(input.cmd, { timeout: 8000, input: input.stdin });
   if (result.exitCode !== 0) {
-    throw new Error(`tmux send-keys (${provider}) failed: ${result.stderr || 'unknown error'}`);
+    throw new Error(`tmux input relay (${provider}) failed: ${result.stderr || 'unknown error'}`);
   }
 }
 
@@ -545,10 +567,10 @@ export async function tmuxSendInput(
  * body and NO bracketed-paste wrapper. This is the byte sequence the
  * synchronous confirm-and-retry re-presses on each retry.
  *
- * Critically distinct from `buildTmuxSendInputCmd(name,'','claude',true)`, which
- * for Claude still wraps an empty bracketed-paste around the Enter — re-poking
- * Claude's paste handler on every retry. The submit-only path emits the Enter
- * alone. All three WSL providers enable kitty keyboard protocol, so the same
+ * `buildTmuxSendInputCmd(name,'',provider,true)` now produces this same bare
+ * Enter (the buffer-paste body is skipped entirely for an empty body), but
+ * this dedicated builder remains the canonical entrypoint for re-pressing
+ * submit. All three WSL providers enable kitty keyboard protocol, so the same
  * `\x1b[13u` is the correct submit for each; the body already sits in the
  * composer, so no re-paste is ever needed.
  *
