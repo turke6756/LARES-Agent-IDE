@@ -4,6 +4,7 @@ import * as fs from 'fs';
 import path from 'path';
 import { tmuxNewSession, tmuxKillSession, isTmuxSessionAlive, tmuxCapturePane, wslExec, buildTmuxAttachCmd, tmuxWaitForSession, TmuxNewSessionResult } from '../wsl-bridge';
 import { getScriptPath } from './paths';
+import { sanitizeClaudeChildEnv } from './env-sanitize';
 
 /** BUG-22 Step 1 diagnostic metadata passed from `launchWslAgent` so the
  *  runner can append one complete JSONL record per launch attempt once the
@@ -532,8 +533,10 @@ export class WslRunner extends EventEmitter {
 
     const ptyHostPath = getScriptPath('pty-host.js');
 
-    const env = { ...process.env };
-    delete env.CLAUDECODE;
+    // tmux mostly insulates WSL agents from the host env, but the pty-host /
+    // wsl.exe attach chain still inherits ours — strip the Claude child-session
+    // markers explicitly (docs/BUG_claude-child-session-env-poisoning.md).
+    const env = sanitizeClaudeChildEnv(process.env);
     delete env.ELECTRON_RUN_AS_NODE;
 
     this.host = spawn('node', [ptyHostPath], {

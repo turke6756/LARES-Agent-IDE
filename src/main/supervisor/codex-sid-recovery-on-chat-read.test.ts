@@ -144,18 +144,21 @@ test('maybeRecoverCodexSid: codex agent with null sid + matching rollout → sid
   // fixture rollout file instead of the real user's ~/.codex/sessions/.
   const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'bug28-home-'));
   const workspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bug28-cwd-'));
-  // Place the rollout under <fakeHome>/.codex/sessions/2026/05/02/.
+  // Place the rollout under <fakeHome>/.codex/sessions/2026/05/17/.
+  // Stale-rollout hardening: recovery now rejects rollouts whose session
+  // timestamp predates the agent's launch floor (makeAgent createdAt is
+  // 2026-05-16T00:00:00Z), so the fixture rollout must be dated AFTER it.
   const sessionsRoot = path.join(fakeHome, '.codex', 'sessions');
-  const dayDir = path.join(sessionsRoot, '2026', '05', '02');
+  const dayDir = path.join(sessionsRoot, '2026', '05', '17');
   fs.mkdirSync(dayDir, { recursive: true });
   const rolloutPath = path.join(
     dayDir,
-    `rollout-2026-05-02T12-00-00-${ROLLOUT_SID}.jsonl`
+    `rollout-2026-05-17T12-00-00-${ROLLOUT_SID}.jsonl`
   );
   fs.writeFileSync(
     rolloutPath,
     JSON.stringify({
-      timestamp: '2026-05-02T12:00:00.000Z',
+      timestamp: '2026-05-17T12:00:00.000Z',
       type: 'session_meta',
       payload: {
         id: ROLLOUT_SID,

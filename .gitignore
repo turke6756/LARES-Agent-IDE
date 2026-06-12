@@ -26,3 +26,4 @@ plans/
 .dashboard/scripts/
 .dashboard/pending-status.jsonl
 .dashboard/supervisor/.claude/.sysprompt-*.txt
+.dashboard/main-crash.log

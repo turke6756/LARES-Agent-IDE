@@ -1,5 +1,6 @@
-import { app, BrowserWindow, dialog, protocol, net, session, shell, nativeTheme } from 'electron';
+import { app, BrowserWindow, crashReporter, dialog, protocol, net, session, shell, nativeTheme } from 'electron';
 import path from 'path';
+import fs from 'fs';
 import { loadPersistedTheme } from './theme-persistence';
 import { initDatabase, getWorkspaces } from './database';
 import { validateAndRepairClaudeJson, validateAndRepairWslClaudeJson } from './claude-config-repair';
@@ -20,6 +21,61 @@ import { JUPYTER_BASE_PORT, JUPYTER_PORT_RETRIES } from './control-ports';
 import { buildChromeUA } from './browser/browser-decisions';
 import { BrowserManager } from './browser/browser-manager';
 import { registerBrowserIpc } from './browser/browser-ipc';
+import { stripClaudeChildEnvInPlace } from './supervisor/env-sanitize';
+
+// First executable statement of the main process, before any supervisor /
+// runner construction: strip Claude Code child-session markers inherited when
+// the app is launched from inside a claude terminal. Spawned claude.exe agents
+// would otherwise behave as nested child sessions and stop persisting their
+// transcripts (docs/BUG_claude-child-session-env-poisoning.md). The runners
+// re-sanitize their spawn envs too (defense in depth).
+const strippedClaudeEnvKeys = stripClaudeChildEnvInPlace(process.env);
+if (strippedClaudeEnvKeys.length > 0) {
+  console.warn(
+    `[startup] dashboard appears to have been launched from inside a Claude Code session — ` +
+    `sanitized spawn environment (removed: ${strippedClaudeEnvKeys.join(', ')})`
+  );
+}
+
+// Crash visibility (2026-06-12): the main process died abruptly twice with no
+// stack in the launch terminal, no Crashpad dump, and no WER entry — i.e. a
+// native-level kill (suspected ConPTY). Two layers so the next crash leaves an
+// artifact regardless of which side (native vs JS) it dies on.
+//
+// Layer 1: Crashpad minidumps for native crashes. Must be called before app
+// ready; without it Electron writes no dump at all for a main-process native
+// crash. Dumps land in %APPDATA%/agent-dashboard/Crashpad/reports.
+crashReporter.start({ uploadToServer: false });
+
+// Layer 2: JS-side last-gasp log. The terminal scrollback is the only place an
+// uncaught exception is visible today, and it vanishes when the window closes.
+// Append (never truncate) so a crash loop preserves history. Sync write — the
+// process is about to die, there is no later flush.
+const CRASH_LOG_PATH = path.join(app.getAppPath(), '.dashboard', 'main-crash.log');
+function logCrash(kind: string, err: unknown): void {
+  const detail = err instanceof Error ? (err.stack ?? err.message) : String(err);
+  try {
+    fs.mkdirSync(path.dirname(CRASH_LOG_PATH), { recursive: true });
+    fs.appendFileSync(
+      CRASH_LOG_PATH,
+      `\n[${new Date().toISOString()}] ${kind} (pid ${process.pid})\n${detail}\n`
+    );
+  } catch {
+    // Logging must never make the crash worse.
+  }
+  console.error(`[${kind}]`, detail);
+}
+process.on('uncaughtException', (err) => {
+  logCrash('uncaughtException', err);
+  // Mirror Node's default behavior: an uncaught exception leaves the process
+  // in an undefined state — exit rather than limp on with 20 live agents.
+  process.exit(1);
+});
+process.on('unhandledRejection', (reason) => {
+  // Log only — unhandled rejections are survivable and killing the process
+  // for one would turn a missing .catch() into a full dashboard outage.
+  logCrash('unhandledRejection', reason);
+});
 
 // Prevent EPIPE crashes when stdout/stderr pipe is closed (e.g. parent shell exits)
 process.stdout?.on?.('error', () => {});

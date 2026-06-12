@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { EventEmitter } from 'events';
 import { getScriptPath } from './paths';
+import { sanitizeClaudeChildEnv } from './env-sanitize';
 
 /**
  * Spawns Claude via a separate Node.js process that uses node-pty.
@@ -82,9 +83,10 @@ export class WindowsRunner extends EventEmitter {
     // merged in so callers can inject provider-specific vars (e.g. BUG-13
     // Path A sets CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false on Claude
     // launches). pty-host forwards its process.env into pty.spawn, so
-    // anything we set here reaches the PTY child.
-    const env = { ...process.env, ...(extraEnv || {}) };
-    delete env.CLAUDECODE;
+    // anything we set here reaches the PTY child. Sanitized AFTER the merge so
+    // child-session markers can't sneak back in via extraEnv
+    // (docs/BUG_claude-child-session-env-poisoning.md).
+    const env = sanitizeClaudeChildEnv({ ...process.env, ...(extraEnv || {}) });
     delete env.ELECTRON_RUN_AS_NODE;
 
     this.host = spawn('node', [ptyHostPath], {

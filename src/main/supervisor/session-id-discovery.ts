@@ -442,6 +442,75 @@ function readFirstUserMessage(jsonlPath: string): string | null {
   }
 }
 
+// ── Stale-rollout hardening (sibling bug in
+// docs/BUG_claude-child-session-env-poisoning.md) ────────────────────────────
+//
+// `findCodexSessionIdByCwd` takes the newest cwd-matching rollout. When codex
+// is slow to write its new rollout (interactive update prompt, startup race),
+// "newest" is a PRE-EXISTING rollout from an older session and the agent
+// attaches to a dead chat. The helpers below let recovery callers pre-filter
+// the candidate list (via the `listFiles` seam) so only rollouts whose session
+// timestamp is at/after the agent's launch — and not already owned by a
+// sibling agent — are ever considered.
+
+/** Filename timestamps are written in LOCAL time; allow this much slack for
+ *  second-granularity truncation and minor clock skew vs. the launch stamp. */
+const CODEX_ROLLOUT_LAUNCH_SLACK_MS = 2_000;
+
+/**
+ * Session creation timestamp of a rollout, in epoch ms, or null when neither
+ * encoding is parseable.
+ *
+ * Primary: the session id is a UUIDv7 whose first 48 bits are ms-since-epoch
+ * (unambiguous, timezone-free). Fallback: the `rollout-<ts>-<uuid>.jsonl`
+ * filename timestamp, parsed as LOCAL time (codex stamps it in local time —
+ * verified against live launches on 2026-06-12).
+ */
+export function codexRolloutSessionTimestampMs(
+  filename: string,
+  sessionId: string
+): number | null {
+  const hex = sessionId.replace(/-/g, '').toLowerCase();
+  if (/^[0-9a-f]{32}$/.test(hex) && hex[12] === '7') {
+    const ms = parseInt(hex.slice(0, 12), 16);
+    if (Number.isFinite(ms) && ms > 0) return ms;
+  }
+  const m = filename.match(/^rollout-(\d{4})-(\d{2})-(\d{2})T(\d{2})-(\d{2})-(\d{2})-/);
+  if (m) {
+    const ms = new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]).getTime();
+    if (Number.isFinite(ms)) return ms;
+  }
+  return null;
+}
+
+/**
+ * Pure candidate filter for stale-rollout-safe recovery:
+ *  - drops rollouts whose session id is already owned by another agent
+ *    (multiple codex agents share one cwd — never steal a sibling's rollout);
+ *  - when `launchedAtMs` is set, drops rollouts whose session timestamp
+ *    predates it (minus slack), INCLUDING rollouts whose timestamp cannot be
+ *    determined — an unverifiable candidate must never be bound under a
+ *    freshness requirement.
+ * `launchedAtMs: null` disables the freshness floor (legacy behavior).
+ */
+export function selectFreshCodexRollouts(
+  files: CodexRolloutFile[],
+  opts: {
+    launchedAtMs: number | null;
+    excludeSessionIds?: ReadonlySet<string>;
+    slackMs?: number;
+  }
+): CodexRolloutFile[] {
+  const slackMs = opts.slackMs ?? CODEX_ROLLOUT_LAUNCH_SLACK_MS;
+  return files.filter((file) => {
+    if (opts.excludeSessionIds?.has(file.sessionId)) return false;
+    if (opts.launchedAtMs == null) return true;
+    const ts = codexRolloutSessionTimestampMs(file.filename, file.sessionId);
+    if (ts === null) return false;
+    return ts >= opts.launchedAtMs - slackMs;
+  });
+}
+
 function normalizeCwd(p: string): string {
   return p.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
 }
