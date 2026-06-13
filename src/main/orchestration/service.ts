@@ -2,7 +2,7 @@ import path from 'path';
 import fs from 'fs';
 import { v4 as uuidv4 } from 'uuid';
 import { ORCHESTRATIONS } from './catalog';
-import { runSerial, runParallel } from './groupthink-v2';
+import { runSerial, runParallel, archiveStalePlan } from './groupthink-v2';
 import { parseLegacyGroupthinkCommand } from './groupthink-legacy';
 import {
   DashboardClient, RunOrchestrationRequest, OrchestrationRun,
@@ -105,6 +105,13 @@ export class OrchestrationService {
         startedAt: nowIso(),
         updatedAt: nowIso(),
       };
+      // T2: archive a stale plan at the same path BEFORE persisting the run. A
+      // failed archive throws here, refusing the start before any run row exists.
+      // Gated on all three resume signals — resumeLeadId/resumeReviewerId can be
+      // set via structured/legacy params even without resumeRunId.
+      if (!req.resumeRunId && !req.resumeLeadId && !req.resumeReviewerId) {
+        archiveStalePlan(run.planPath, run.runId);
+      }
     }
     insertOrchestration(run);            // upsert
     void this.execute(run, !!req.keepAgents);

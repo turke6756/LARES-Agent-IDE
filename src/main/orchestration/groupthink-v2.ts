@@ -17,6 +17,7 @@
 //     status-as-stall-reset logic.
 
 import fs from 'fs';
+import { createHash } from 'crypto';
 import { Agent, AgentProvider, LaunchAgentInput } from '../../shared/types';
 import { DashboardClient, OrchestrationRunContext } from './types';
 import {
@@ -30,6 +31,9 @@ const MAX_TURNS = 10;
 const POLL_INTERVAL_MS = 2000;
 const MIN_READY_POLLS = 3;
 const STATUS_CHECK_INTERVAL_MS = 10000;
+// T4 §2: grace window to let the synthesizer's plan-file Write flush land after
+// its R3 turn-complete chat event before declaring a no_plan_written stall.
+const PLAN_WRITE_GRACE_MS = 30000;
 
 /** Thrown when the run's AbortSignal fires mid-poll. The service swallows it
  *  (it checks controller.signal.aborted), so the name is for clarity only. */
@@ -46,6 +50,38 @@ function checkAborted(ctx: OrchestrationRunContext): void {
 }
 
 interface RelayMessage { content: string; ts: string; turnComplete?: boolean }
+
+// --- T1: composite highwater (ts + content hash) tie-break ---
+// A same-millisecond turn-complete is no longer dropped unconditionally: it is
+// dropped only if its content hash also matches the stored mark. The highwater
+// is packed into the existing lastRelayedTs JSON-map value as "<ts><sep><hash>".
+const HW_SEP = String.fromCharCode(1);   // U+0001 separator: cannot appear in ISO or agent#NNNN timestamps
+function hashContent(s: string): string {
+  return createHash('sha1').update(s).digest('hex').slice(0, 16);
+}
+function markRelayed(ctx: OrchestrationRunContext, agentId: string, msg: RelayMessage): void {
+  ctx.run.lastRelayedTs[agentId] = `${msg.ts}${HW_SEP}${hashContent(msg.content)}`;
+}
+function parseHighwater(raw?: string): { ts: string; hash?: string } | null {
+  if (!raw) return null;
+  const i = raw.indexOf(HW_SEP);
+  return i === -1 ? { ts: raw } : { ts: raw.slice(0, i), hash: raw.slice(i + 1) };
+}
+
+// --- T2: archive a stale pre-existing plan file before a fresh run starts ---
+// A leftover plan from an earlier run at the same path would otherwise trip the
+// fs.existsSync(planPath) gate after the lead's first turn and complete the run
+// on the OLD file with zero deliberation. Archiving (rename, non-destructive)
+// runs at start_run BEFORE the run row is persisted, so a failed archive can
+// refuse the start before any run exists to error later.
+export function archiveStalePlan(planPath: string, runId: string): string | null {
+  if (!planPath || !fs.existsSync(planPath)) return null;
+  const bak = `${planPath}.stale-${runId}-${Date.now()}.bak`;
+  try { fs.renameSync(planPath, bak); return bak; }
+  catch (e) {
+    throw new Error(`Refusing to start run ${runId}: stale plan at ${planPath} could not be archived (${e instanceof Error ? e.message : e}).`);
+  }
+}
 
 // --- Idle / ready helpers (groupthink-v2.js:170–201) ---
 
@@ -102,8 +138,14 @@ async function readNextMessage(
   const msgs = await client.getMessages(agentId, { limit: 1, role: 'assistant' });
   const msg = msgs?.[0];
   if (!msg || !msg.turnComplete) return null;
-  const hw = ctx.run.lastRelayedTs[agentId];
-  if (hw && msg.ts <= hw) return null;
+  const hw = parseHighwater(ctx.run.lastRelayedTs[agentId]);
+  if (hw) {
+    if (msg.ts < hw.ts) return null;
+    if (msg.ts === hw.ts) {
+      // legacy hash-less highwater → preserve old <= behavior; else tie-break on content
+      if (!hw.hash || hashContent(msg.content) === hw.hash) return null;
+    }
+  }
   return msg;
 }
 
@@ -116,7 +158,7 @@ async function seedLastRelayedTsFromChat(
   const msgs = await client.getMessages(agentId, { limit: 1, role: 'assistant' });
   const msg = msgs?.[0];
   if (msg && msg.turnComplete && msg.ts) {
-    ctx.run.lastRelayedTs[agentId] = msg.ts;
+    markRelayed(ctx, agentId, msg);
   }
 }
 
@@ -161,6 +203,22 @@ async function waitTurnComplete(
       throw new Error(`Timeout waiting for ${label} (${agentId}) to complete turn (agent.status=${status})`);
     }
 
+    await sleep(POLL_INTERVAL_MS);
+  }
+}
+
+/** T4 §2: poll planPath for a bounded grace window after the synthesizer's R3
+ *  turn-complete. The Write tool-call flush trails the turn-complete chat event
+ *  by a sub-second window, so an immediate existsSync check throws a false
+ *  no_plan_written stall while the deliverable lands moments later. Returns true
+ *  as soon as the file appears; false once the grace deadline passes. Abort stays
+ *  responsive via per-poll checkAborted. */
+async function waitForPlanFile(ctx: OrchestrationRunContext, planPath: string, graceMs: number): Promise<boolean> {
+  const deadline = Date.now() + graceMs;
+  for (;;) {
+    if (fs.existsSync(planPath)) return true;
+    if (Date.now() >= deadline) return false;
+    checkAborted(ctx);
     await sleep(POLL_INTERVAL_MS);
   }
 }
@@ -221,6 +279,10 @@ export async function runSerial(client: DashboardClient, ctx: OrchestrationRunCo
   const resumeLeadId = run.leadId;
   const resumeReviewerId = run.reviewerId;
 
+  // T2 defensive guard (covers direct-runner callers + the pressure tests):
+  // archive a stale plan only on a genuinely fresh run, never on resume.
+  if (!resumeLeadId && !resumeReviewerId) archiveStalePlan(planPath, run.runId);
+
   let lead: Agent;
   let reviewer: Agent | null = null;
   let firstLeadMsg: RelayMessage | null = null;
@@ -251,7 +313,7 @@ export async function runSerial(client: DashboardClient, ctx: OrchestrationRunCo
     // BUG-29 mitigation: wait for the Lead's first draft before launching the
     // Reviewer, then launch with that draft as the kickoff.
     firstLeadMsg = await waitTurnComplete(client, ctx, lead.id, 'Lead', turnTimeoutMs);
-    run.lastRelayedTs[lead.id] = firstLeadMsg.ts;
+    markRelayed(ctx, lead.id, firstLeadMsg);
     run.turn = 1;
     ctx.persist();
     ctx.emit('turn', { turn: 1 });
@@ -287,7 +349,7 @@ export async function runSerial(client: DashboardClient, ctx: OrchestrationRunCo
 
     // Reviewer -> Lead
     const revMsg = await waitTurnComplete(client, ctx, reviewer.id, 'Reviewer', turnTimeoutMs);
-    run.lastRelayedTs[reviewer.id] = revMsg.ts;
+    markRelayed(ctx, reviewer.id, revMsg);
     ctx.persist();
 
     if (fs.existsSync(planPath)) { planWritten = true; break; }
@@ -297,7 +359,7 @@ export async function runSerial(client: DashboardClient, ctx: OrchestrationRunCo
 
     // Lead -> Reviewer
     const leadMsg = await waitTurnComplete(client, ctx, lead.id, 'Lead', turnTimeoutMs);
-    run.lastRelayedTs[lead.id] = leadMsg.ts;
+    markRelayed(ctx, lead.id, leadMsg);
     ctx.persist();
 
     if (fs.existsSync(planPath)) { planWritten = true; break; }
@@ -315,6 +377,10 @@ export async function runSerial(client: DashboardClient, ctx: OrchestrationRunCo
 export async function runParallel(client: DashboardClient, ctx: OrchestrationRunContext): Promise<void> {
   const { run } = ctx;
   const { workspaceId, topic, planPath, leadProvider, reviewerProvider, turnTimeoutMs } = run;
+
+  // T2 defensive guard: parallel has no resume path, so always archive a stale
+  // pre-existing plan before R1 can trip the premature-write existsSync gate.
+  archiveStalePlan(planPath, run.runId);
 
   // R1: both launch with the same prompt; kick off in parallel. The synthesizer
   // is the lead-provider (writes the plan in R3); the peer is the reviewer side.
@@ -345,8 +411,8 @@ export async function runParallel(client: DashboardClient, ctx: OrchestrationRun
     waitTurnComplete(client, ctx, synthesizer.id, 'Synthesizer R1', turnTimeoutMs),
     waitTurnComplete(client, ctx, peer.id, 'Peer R1', turnTimeoutMs),
   ]);
-  run.lastRelayedTs[synthesizer.id] = synthR1.ts;
-  run.lastRelayedTs[peer.id] = peerR1.ts;
+  markRelayed(ctx, synthesizer.id, synthR1);
+  markRelayed(ctx, peer.id, peerR1);
   ctx.persist();
 
   // Premature-write check: if either agent wrote the plan in R1 treat it as
@@ -367,13 +433,16 @@ export async function runParallel(client: DashboardClient, ctx: OrchestrationRun
     })(),
   ]);
 
-  // Only the peer's R2 content is needed for R3; the synthesizer's R2 is already
-  // in its own context.
-  const [, peerR2] = await Promise.all([
+  // Only the peer's R2 content is fed into R3, but we must still capture AND mark
+  // the synthesizer's R2 highwater (T4 §1): discarding it left synth's mark pinned
+  // at synthR1, so R3's waitTurnComplete would return the stale R2 turn-complete as
+  // if it were R3 — R3's synthesis output never awaited, plan never written.
+  const [synthR2, peerR2] = await Promise.all([
     waitTurnComplete(client, ctx, synthesizer.id, 'Synthesizer R2', turnTimeoutMs),
     waitTurnComplete(client, ctx, peer.id, 'Peer R2', turnTimeoutMs),
   ]);
-  run.lastRelayedTs[peer.id] = peerR2.ts;
+  markRelayed(ctx, synthesizer.id, synthR2);
+  markRelayed(ctx, peer.id, peerR2);
   ctx.persist();
 
   if (fs.existsSync(planPath)) return;
@@ -386,10 +455,10 @@ export async function runParallel(client: DashboardClient, ctx: OrchestrationRun
   await client.sendInput(synthesizer.id, parallelSynthesisPrompt(peerR2.content, planPath));
 
   const synthR3 = await waitTurnComplete(client, ctx, synthesizer.id, 'Synthesizer R3', turnTimeoutMs);
-  run.lastRelayedTs[synthesizer.id] = synthR3.ts;
+  markRelayed(ctx, synthesizer.id, synthR3);
   ctx.persist();
 
-  if (!fs.existsSync(planPath)) {
-    throw new Error(`STALL: Synthesizer completed R3 but no plan file at ${planPath}.`);
+  if (!(await waitForPlanFile(ctx, planPath, PLAN_WRITE_GRACE_MS))) {
+    throw new Error(`STALL: Synthesizer completed R3 but no plan file at ${planPath} after ${PLAN_WRITE_GRACE_MS}ms grace.`);
   }
 }

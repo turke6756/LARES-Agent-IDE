@@ -3983,7 +3983,15 @@ export class AgentSupervisor extends EventEmitter {
         return { ok: false };
       }
       try {
-        await this.sendInputConfirmed(supervisorId, text);
+        const result = await this.sendInputConfirmed(supervisorId, text);
+        if (!result.confirmed) {
+          // H4: bytes delivered but no proof the supervisor's turn started —
+          // retryable; on exhaustion return ok:false so the OrchestrationService
+          // writes a durable delivery_failed row instead of silently losing the event.
+          if (attempt < maxAttempts) { await sleep(intervalMs); continue; }
+          console.warn(`[orchestration] deliverToSupervisor: unconfirmed (mode=${result.mode}) after ${attempt} attempts`);
+          return { ok: false };
+        }
         if (attempt > 1) {
           console.log(`[orchestration] deliverToSupervisor succeeded on attempt ${attempt}/${maxAttempts}`);
         }
