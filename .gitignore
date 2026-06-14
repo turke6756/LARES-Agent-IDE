@@ -27,3 +27,9 @@ plans/
 .dashboard/pending-status.jsonl
 .dashboard/supervisor/.claude/.sysprompt-*.txt
 .dashboard/main-crash.log
+
+# MCP config — generated per app launch, embeds a live API bearer token.
+# It's a build artifact (the app rewrites it on every supervisor launch), so it
+# must never be committed. The app regenerates it locally on each machine.
+.mcp.json
+**/.mcp.json
