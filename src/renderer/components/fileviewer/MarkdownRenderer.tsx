@@ -6,8 +6,9 @@ import { vscDarkPlus, vs } from 'react-syntax-highlighter/dist/esm/styles/prism'
 import { useThemeStore } from '../../stores/theme-store';
 import CollapseButton from '../layout/CollapseButton';
 import { useTabScrollMemory } from './scrollMemory';
-import { useModifierPathOpen } from './openFileHelpers';
+import { useModifierPathOpen, useModifierUrlOpen } from './openFileHelpers';
 import SelectionSurface from '../selection/SelectionSurface';
+import FileCommentGutter from '../selection/FileCommentGutter';
 
 interface Props {
   content: string;
@@ -84,6 +85,10 @@ export default function MarkdownRenderer({ content, tabId }: Props) {
   // Ctrl/Cmd+click on a link href or inline-code path opens it in the file
   // viewer; plain clicks keep their default behavior (no-op for the handler).
   const handleModifierPathClick = useModifierPathOpen(tabId);
+  // Ctrl/Cmd+click on an http(s) link opens it in the internal browser pane.
+  // Tried before the file-path handler (which rejects URLs anyway); plain
+  // clicks fall through to the shell's external-open behavior, unchanged.
+  const handleModifierUrlOpen = useModifierUrlOpen();
 
   const nextHeadingId = () => {
     const id = outline[renderedHeadingIndex]?.id;
@@ -94,9 +99,10 @@ export default function MarkdownRenderer({ content, tabId }: Props) {
   const hasOutline = outline.length > 0;
 
   return (
-    <SelectionSurface tabId={tabId}>
+    <SelectionSurface tabId={tabId} getDocText={() => content}>
     <div className="h-full min-w-0 flex bg-surface-0">
-      <div ref={scrollRef} onScroll={handleScroll} className="flex-1 min-w-0 overflow-auto p-6">
+      <div className="relative flex-1 min-w-0 h-full">
+      <div ref={scrollRef} onScroll={handleScroll} className="h-full min-w-0 overflow-auto p-6">
         <div className="max-w-3xl mx-auto prose-custom">
         <ReactMarkdown
           remarkPlugins={[remarkGfm]}
@@ -130,9 +136,12 @@ export default function MarkdownRenderer({ content, tabId }: Props) {
               <a
                 href={href}
                 onClick={(e) => {
-                  // Modifier-click on a file-path-looking href opens it in
-                  // the viewer; otherwise fall through to default behavior.
-                  if (href) handleModifierPathClick(e, href);
+                  // Modifier-click on an http(s) href opens it in the internal
+                  // browser pane; on a file-path-looking href opens it in the
+                  // viewer; otherwise fall through to default (external) behavior.
+                  if (!href) return;
+                  if (handleModifierUrlOpen(e, href)) return;
+                  handleModifierPathClick(e, href);
                 }}
                 className="text-accent-blue hover:text-accent-blue/80 underline underline-offset-2"
               >
@@ -204,6 +213,8 @@ export default function MarkdownRenderer({ content, tabId }: Props) {
           {content}
         </ReactMarkdown>
         </div>
+      </div>
+      <FileCommentGutter tabId={tabId} scrollRef={scrollRef} />
       </div>
       {hasOutline && (
         outlineCollapsed ? (

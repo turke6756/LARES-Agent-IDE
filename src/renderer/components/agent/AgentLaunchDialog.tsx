@@ -6,6 +6,16 @@ import { useBrowserSuspension } from '../browser/useBrowserSuspension';
 
 const PROVIDERS: AgentProvider[] = ['claude', 'gemini', 'codex'];
 
+// Single "Agent type" selector values. The first three are first-class role
+// lanes (app-managed cwd + scaffold under .dashboard/); personas are custom
+// agent types (.dashboard/agents/<name>/); templates are advanced DB presets;
+// ephemeral is the only no-lane / project-root / no-scaffold path.
+const TYPE_WORKER = 'role:worker';
+const TYPE_SUPERVISOR = 'role:supervisor';
+const TYPE_RESEARCHER = 'role:researcher';
+const TYPE_NEW_AGENT = '__new_agent__';
+const TYPE_EPHEMERAL = 'ephemeral';
+
 interface Props {
   workspace: Workspace;
   onClose: () => void;
@@ -21,42 +31,56 @@ export default function AgentLaunchDialog({ workspace, onClose }: Props) {
   const [provider, setProvider] = useState<AgentProvider>('claude');
   const [command, setCommand] = useState(PROVIDER_COMMANDS.claude[workspace.pathType]);
   const [autoRestart, setAutoRestart] = useState(true);
+  // Workers launch UNSUPERVISED by default; the user opts in via this checkbox.
   const [supervised, setSupervised] = useState(false);
-  // Worker lane (hook-based status) — default ON. Only meaningful for
-  // claude/codex (gemini has no hook scaffold); rendered disabled for gemini.
-  const [worker, setWorker] = useState(true);
   const [launching, setLaunching] = useState(false);
   const [agentMd, setAgentMd] = useState<{ found: boolean; fileName: string | null } | null>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Template + Persona state
+  // Templates + personas (custom agents)
   const [templates, setTemplates] = useState<AgentTemplate[]>([]);
   const [personas, setPersonas] = useState<AgentPersona[]>([]);
-  const [selectedOption, setSelectedOption] = useState<string>(''); // "persona:name" or "template:id"
+  // The single "Agent type" choice. Worker is the explicit default.
+  const [selectedType, setSelectedType] = useState<string>(TYPE_WORKER);
   const [savingTemplate, setSavingTemplate] = useState(false);
   const [saveTemplateName, setSaveTemplateName] = useState('');
   const [showSaveDialog, setShowSaveDialog] = useState(false);
 
-  // Create persona state
-  const [showCreatePersona, setShowCreatePersona] = useState(false);
-  const [newPersonaName, setNewPersonaName] = useState('');
-  const [creatingPersona, setCreatingPersona] = useState(false);
+  // ── Derived selection kind ──────────────────────────────────────────
+  const isSupervisorType = selectedType === TYPE_SUPERVISOR;
+  const isResearcherType = selectedType === TYPE_RESEARCHER;
+  const isWorkerType = selectedType === TYPE_WORKER;
+  const isNewAgent = selectedType === TYPE_NEW_AGENT;
+  const isPersona = selectedType.startsWith('persona:');
+  const isTemplate = selectedType.startsWith('template:');
+  const isEphemeral = selectedType === TYPE_EPHEMERAL;
+  // Supervisor + researcher are Claude-only app-managed lanes: the app owns
+  // their cwd, command, tools, and MCP, so provider/command/working-dir are
+  // hidden and provider is forced to claude.
+  const appManaged = isSupervisorType || isResearcherType;
+  const showProviderAndCommand = !appManaged;
+  // Working directory is only meaningful where the user actually controls the
+  // cwd: templates and the raw ephemeral session. Role lanes + personas derive
+  // their cwd from the workspace root in the backend.
+  const showWorkingDir = isTemplate || isEphemeral;
 
   // Load templates and personas on mount
   useEffect(() => {
     window.api.templates.list(workspace.id).then(setTemplates).catch(console.error);
     window.api.personas.list(workspace.path, workspace.pathType).then(list => {
-      // Filter out supervisor — it auto-launches
+      // Filter out supervisor — it's a role-lane option, not a custom agent.
       setPersonas(list.filter(p => !p.isSupervisor));
     }).catch(console.error);
   }, [workspace.id, workspace.path, workspace.pathType]);
 
-  // Apply template or persona when selected
+  // Apply template defaults / autofill title when the type changes.
   useEffect(() => {
-    if (!selectedOption) return;
-
-    if (selectedOption.startsWith('template:')) {
-      const templateId = selectedOption.slice('template:'.length);
+    if (isSupervisorType || isResearcherType) {
+      setProvider('claude');
+      return;
+    }
+    if (isTemplate) {
+      const templateId = selectedType.slice('template:'.length);
       const template = templates.find(t => t.id === templateId);
       if (!template) return;
       if (template.roleDescription) setRoleDescription(template.roleDescription);
@@ -66,21 +90,19 @@ export default function AgentLaunchDialog({ workspace, onClose }: Props) {
       }
       if (template.command) setCommand(template.command);
       setAutoRestart(template.autoRestart);
-      setSupervised(template.isSupervised);
-      setWorker(template.isWorker);
       if (!title.trim()) setTitle(template.name);
-    } else if (selectedOption.startsWith('persona:')) {
-      const personaName = selectedOption.slice('persona:'.length);
+    } else if (isPersona) {
+      const personaName = selectedType.slice('persona:'.length);
       if (!title.trim()) {
         const displayName = personaName.charAt(0).toUpperCase() + personaName.slice(1).replace(/[-_]/g, ' ');
         setTitle(displayName);
       }
     }
-  }, [selectedOption]);
+  }, [selectedType]);
 
-  // Update command when provider changes (only if no template selected or manual change)
+  // Update command when provider changes (only if not bound to a template).
   useEffect(() => {
-    if (!selectedOption.startsWith('template:')) {
+    if (!isTemplate) {
       setCommand(PROVIDER_COMMANDS[provider][workspace.pathType]);
     }
   }, [provider, workspace.pathType]);
@@ -102,50 +124,93 @@ export default function AgentLaunchDialog({ workspace, onClose }: Props) {
     return () => { if (debounceRef.current) clearTimeout(debounceRef.current); };
   }, [workingDirectory, workspace.pathType]);
 
+  // Persona name minted from the title for the "+ New agent…" path.
+  const newAgentSlug = title.trim().toLowerCase().replace(/[^a-z0-9_-]/g, '-');
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!title.trim()) return;
 
     setLaunching(true);
     try {
-      // If "New Template" is selected, scaffold the persona directory first
-      let resolvedPersona: string | undefined;
-      if (selectedOption === '__new_template__') {
-        const personaName = title.trim().toLowerCase().replace(/[^a-z0-9_-]/g, '-');
-        if (!personaName) {
-          setLaunching(false);
-          return;
-        }
-        const claudeMdContent = roleDescription.trim() || undefined;
-        await window.api.personas.create(workspace.path, workspace.pathType, personaName, claudeMdContent);
-        resolvedPersona = personaName;
-      }
-
-      const launchInput: any = {
+      const base: any = {
         workspaceId: workspace.id,
         title: title.trim(),
         roleDescription: roleDescription.trim(),
-        workingDirectory: workingDirectory.trim(),
-        command: command.trim(),
-        provider,
         autoRestartEnabled: autoRestart,
-        isSupervised: supervised,
-        // Worker lane: hook-based status. Gemini has no hook scaffold, so it
-        // never joins the lane. Supervised implies worker.
-        isWorker: provider !== 'gemini' && (worker || supervised),
       };
 
-      if (resolvedPersona) {
-        launchInput.persona = resolvedPersona;
-      } else if (selectedOption.startsWith('template:')) {
-        launchInput.templateId = selectedOption.slice('template:'.length);
-      } else if (selectedOption.startsWith('persona:')) {
-        launchInput.persona = selectedOption.slice('persona:'.length);
-      }
+      let launchInput: any;
 
-      // Persona agents run in their own .claude/agents/<name>/ cwd, not the
-      // shared worker folder — the worker lane does not apply to them.
-      if (launchInput.persona) launchInput.isWorker = false;
+      if (isSupervisorType) {
+        // Supervisor role-lane → .dashboard/supervisor/, ensureSupervisorScaffold.
+        // Multiple supervisors per workspace are allowed (backend no longer blocks).
+        launchInput = { ...base, provider: 'claude', isSupervisor: true, workingDirectory: workspace.path };
+      } else if (isResearcherType) {
+        // Researcher role-lane → .dashboard/researcher/, ensureResearcherScaffold.
+        // App-managed cwd/command/tools/browser-MCP; Claude-only (backend rejects
+        // non-claude). Supervised by default.
+        launchInput = {
+          ...base,
+          provider: 'claude',
+          workingDirectory: workspace.path,
+          isResearcher: true,
+          isSupervised: true,
+        };
+      } else if (isWorkerType) {
+        // Worker role-lane → .dashboard/workers/<provider>/, ensureWorkerScaffold.
+        // Hook-based status; gemini has no hook scaffold so it never joins the
+        // lane. Unsupervised by default — the user opts into supervision via the
+        // "Supervised" checkbox.
+        launchInput = {
+          ...base,
+          workingDirectory: workspace.path,
+          command: command.trim(),
+          provider,
+          isWorker: provider !== 'gemini',
+          isSupervised: supervised && provider !== 'gemini',
+        };
+      } else if (isNewAgent) {
+        // Mint a fresh persona under .dashboard/agents/<slug>/ then launch it.
+        if (!newAgentSlug) { setLaunching(false); return; }
+        await window.api.personas.create(
+          workspace.path, workspace.pathType, newAgentSlug, roleDescription.trim() || undefined,
+        );
+        launchInput = {
+          ...base,
+          workingDirectory: workspace.path,
+          command: command.trim(),
+          provider,
+          persona: newAgentSlug,
+        };
+      } else if (isPersona) {
+        // Existing custom agent → runs in its own .dashboard/agents/<name>/ cwd.
+        launchInput = {
+          ...base,
+          workingDirectory: workspace.path,
+          command: command.trim(),
+          provider,
+          persona: selectedType.slice('persona:'.length),
+        };
+      } else if (isTemplate) {
+        // Advanced DB template — keep its existing semantics.
+        launchInput = {
+          ...base,
+          workingDirectory: workingDirectory.trim() || workspace.path,
+          command: command.trim(),
+          provider,
+          templateId: selectedType.slice('template:'.length),
+        };
+      } else {
+        // Ephemeral (raw session): the ONLY no-lane path — legacy lane, cwd =
+        // project root, no persona, no scaffold, no hooks.
+        launchInput = {
+          ...base,
+          workingDirectory: workingDirectory.trim() || workspace.path,
+          command: command.trim(),
+          provider,
+        };
+      }
 
       await window.api.agents.launch(launchInput);
       await loadAgents(workspace.id);
@@ -176,11 +241,12 @@ export default function AgentLaunchDialog({ workspace, onClose }: Props) {
         provider,
         command: command.trim() || null,
         autoRestart,
-        isSupervised: supervised,
-        isWorker: worker,
+        // Persist worker/supervised intent from the selected role lane.
+        isSupervised: isWorkerType && supervised && provider !== 'gemini',
+        isWorker: isWorkerType && provider !== 'gemini',
       });
       setTemplates(prev => [...prev, newTemplate]);
-      setSelectedOption(`template:${newTemplate.id}`);
+      setSelectedType(`template:${newTemplate.id}`);
       setShowSaveDialog(false);
       setSaveTemplateName('');
     } catch (err) {
@@ -190,25 +256,6 @@ export default function AgentLaunchDialog({ workspace, onClose }: Props) {
     }
   };
 
-  const handleCreatePersona = async () => {
-    if (!newPersonaName.trim()) return;
-    setCreatingPersona(true);
-    try {
-      const persona = await window.api.personas.create(workspace.path, workspace.pathType, newPersonaName.trim());
-      setPersonas(prev => [...prev, persona]);
-      setSelectedOption(`persona:${persona.name}`);
-      setShowCreatePersona(false);
-      setNewPersonaName('');
-    } catch (err: any) {
-      console.error('Failed to create persona:', err);
-      alert(err.message || 'Failed to create persona');
-    } finally {
-      setCreatingPersona(false);
-    }
-  };
-
-  const hasOptions = templates.length > 0 || personas.length > 0;
-
   return (
     <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50" onClick={onClose}>
       <div
@@ -217,18 +264,20 @@ export default function AgentLaunchDialog({ workspace, onClose }: Props) {
       >
         <h3 className="text-[13px] font-semibold mb-3">Launch Agent</h3>
         <form onSubmit={handleSubmit} className="space-y-3">
-          {/* Combined persona + template selector */}
+          {/* Single "Agent type" selector — role lanes, custom agents, templates,
+              and the raw ephemeral session, all in one explicit choice. */}
           <div>
-            <label className="block text-[11px] text-gray-500 mb-1 uppercase tracking-wider">Persona / Template</label>
+            <label className="block text-[11px] text-gray-500 mb-1 uppercase tracking-wider">Agent type</label>
             <select
-              value={selectedOption}
-              onChange={(e) => setSelectedOption(e.target.value)}
+              value={selectedType}
+              onChange={(e) => setSelectedType(e.target.value)}
               className="ui-input text-sm w-full"
             >
-              <option value="">Ephemeral (no template)</option>
-              <option value="__new_template__">+ New Template...</option>
+              <option value={TYPE_WORKER}>Worker</option>
+              <option value={TYPE_SUPERVISOR}>Supervisor</option>
+              <option value={TYPE_RESEARCHER}>Researcher</option>
               {personas.length > 0 && (
-                <optgroup label="Personas">
+                <optgroup label="— your custom agents —">
                   {personas.map(p => (
                     <option key={`persona:${p.name}`} value={`persona:${p.name}`}>
                       {p.name}{p.hasMemory ? ' (has memory)' : ''}
@@ -236,8 +285,9 @@ export default function AgentLaunchDialog({ workspace, onClose }: Props) {
                   ))}
                 </optgroup>
               )}
+              <option value={TYPE_NEW_AGENT}>+ New agent…</option>
               {templates.length > 0 && (
-                <optgroup label="Templates">
+                <optgroup label="Templates (advanced)">
                   {templates.map(t => (
                     <option key={`template:${t.id}`} value={`template:${t.id}`}>
                       {t.name}{t.workspaceId ? '' : ' (global)'}{t.systemPrompt ? ' *' : ''}
@@ -245,61 +295,47 @@ export default function AgentLaunchDialog({ workspace, onClose }: Props) {
                   ))}
                 </optgroup>
               )}
+              <option value={TYPE_EPHEMERAL}>Ephemeral (raw session)</option>
             </select>
-            {selectedOption.startsWith('template:') && (() => {
-              const t = templates.find(x => x.id === selectedOption.slice('template:'.length));
+
+            {/* Per-type hint line */}
+            {isWorkerType && (
+              <div className="mt-1 text-[11px] text-gray-500">
+                Hook-based worker in .dashboard/workers/{provider}/ — unsupervised by default.
+              </div>
+            )}
+            {isSupervisorType && (
+              <div className="mt-1 text-[11px] text-gray-500">
+                Runs in .dashboard/supervisor/ with the supervisor scaffold (Claude only).
+              </div>
+            )}
+            {isResearcherType && (
+              <div className="mt-1 text-[11px] text-gray-500">
+                Browses + researches the web in an app-managed sandbox (Claude only; never edits code).
+              </div>
+            )}
+            {isPersona && (
+              <div className="mt-1 text-[11px] text-accent-blue">
+                Runs in .dashboard/agents/{selectedType.slice('persona:'.length)}/ with its own CLAUDE.md.
+              </div>
+            )}
+            {isNewAgent && (
+              <div className="mt-1 text-[11px] text-accent-blue">
+                Creates .dashboard/agents/{newAgentSlug || '<agent-title>'}/ — Role Description becomes its CLAUDE.md.
+              </div>
+            )}
+            {isTemplate && (() => {
+              const t = templates.find(x => x.id === selectedType.slice('template:'.length));
               return t?.systemPrompt ? (
                 <div className="mt-1 text-[11px] text-accent-blue">
                   Has system prompt ({t.systemPrompt.length} chars)
                 </div>
               ) : null;
             })()}
-            {selectedOption === '__new_template__' && (
-              <div className="mt-1 text-[11px] text-accent-blue">
-                Creates .claude/agents/{title.trim().toLowerCase().replace(/[^a-z0-9_-]/g, '-') || '<agent-title>'}/ — Role Description becomes its CLAUDE.md
+            {isEphemeral && (
+              <div className="mt-1 text-[11px] text-gray-500">
+                Raw session at the project root — no persona, no scaffold, no status hooks.
               </div>
-            )}
-            {selectedOption.startsWith('persona:') && (
-              <div className="mt-1 text-[11px] text-accent-blue">
-                Agent will run in .claude/agents/{selectedOption.slice('persona:'.length)}/ with its own CLAUDE.md
-              </div>
-            )}
-            {/* Create new persona inline */}
-            {showCreatePersona ? (
-              <div className="flex items-center gap-2 mt-2 p-2 bg-surface-2 rounded-lg border border-gray-700">
-                <input
-                  type="text"
-                  value={newPersonaName}
-                  onChange={(e) => setNewPersonaName(e.target.value.toLowerCase().replace(/[^a-z0-9_-]/g, ''))}
-                  placeholder="persona-name"
-                  className="ui-input flex-1 text-sm font-mono"
-                  onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); handleCreatePersona(); } }}
-                  autoFocus
-                />
-                <button
-                  type="button"
-                  onClick={handleCreatePersona}
-                  disabled={!newPersonaName.trim() || creatingPersona}
-                  className="ui-btn ui-btn-primary px-3 py-1.5 text-[13px]"
-                >
-                  {creatingPersona ? 'Creating...' : 'Create'}
-                </button>
-                <button
-                  type="button"
-                  onClick={() => { setShowCreatePersona(false); setNewPersonaName(''); }}
-                  className="ui-btn ui-btn-ghost px-2 py-1.5 text-[13px]"
-                >
-                  Cancel
-                </button>
-              </div>
-            ) : (
-              <button
-                type="button"
-                onClick={() => setShowCreatePersona(true)}
-                className="mt-1 text-[12px] text-gray-500 hover:text-accent-blue transition-colors"
-              >
-                + Create new persona...
-              </button>
             )}
           </div>
 
@@ -317,47 +353,51 @@ export default function AgentLaunchDialog({ workspace, onClose }: Props) {
 
           <div>
             <label className="block text-[11px] text-gray-500 mb-1 uppercase tracking-wider">
-              {selectedOption === '__new_template__' ? 'Role Description (becomes this agent\'s CLAUDE.md)' : 'Role Description'}
+              {isNewAgent ? 'Role Description (becomes this agent\'s CLAUDE.md)' : 'Role Description'}
             </label>
             <textarea
               value={roleDescription}
               onChange={(e) => setRoleDescription(e.target.value)}
               className="ui-textarea resize-none text-sm"
-              rows={selectedOption === '__new_template__' ? 4 : 2}
-              placeholder={selectedOption === '__new_template__' ? 'Define this agent\'s identity and behavior — this will be saved as CLAUDE.md' : 'What should this agent do?'}
+              rows={isNewAgent ? 4 : 2}
+              placeholder={isNewAgent ? 'Define this agent\'s identity and behavior — this will be saved as CLAUDE.md' : 'What should this agent do?'}
             />
           </div>
 
-          <div>
-            <label className="block text-[11px] text-gray-500 mb-1 uppercase tracking-wider">Working Directory</label>
-            <div className="flex gap-2">
-              <input
-                type="text"
-                value={workingDirectory}
-                onChange={(e) => setWorkingDirectory(e.target.value)}
-                className="ui-input flex-1 text-sm font-sans"
-              />
-              <button
-                type="button"
-                onClick={handlePickDir}
-                className="ui-btn ui-btn-ghost px-3 py-2 text-sm"
-              >
-                Browse
-              </button>
+          {showWorkingDir && (
+            <div>
+              <label className="block text-[11px] text-gray-500 mb-1 uppercase tracking-wider">Working Directory</label>
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  value={workingDirectory}
+                  onChange={(e) => setWorkingDirectory(e.target.value)}
+                  className="ui-input flex-1 text-sm font-sans"
+                />
+                <button
+                  type="button"
+                  onClick={handlePickDir}
+                  className="ui-btn ui-btn-ghost px-3 py-2 text-sm"
+                >
+                  Browse
+                </button>
+              </div>
+              {agentMd && agentMd.found && (
+                <div className="mt-1.5 inline-flex items-center gap-1 bg-green-500/15 text-green-400 text-[13px] px-2 py-0.5 rounded-full">
+                  <span className="w-1.5 h-1.5 bg-green-400 rounded-full" />
+                  {agentMd.fileName} found
+                </div>
+              )}
+              {agentMd && !agentMd.found && (
+                <div className="mt-1.5 text-[13px] text-gray-400">
+                  No agent.md
+                </div>
+              )}
             </div>
-            {agentMd && agentMd.found && (
-              <div className="mt-1.5 inline-flex items-center gap-1 bg-green-500/15 text-green-400 text-[13px] px-2 py-0.5 rounded-full">
-                <span className="w-1.5 h-1.5 bg-green-400 rounded-full" />
-                {agentMd.fileName} found
-              </div>
-            )}
-            {agentMd && !agentMd.found && (
-              <div className="mt-1.5 text-[13px] text-gray-400">
-                No agent.md
-              </div>
-            )}
-          </div>
+          )}
 
+          {showProviderAndCommand && (
+          <>
           {/* Provider selector */}
           <div>
             <label className="block text-[11px] text-gray-500 mb-1 uppercase tracking-wider">Provider</label>
@@ -381,6 +421,11 @@ export default function AgentLaunchDialog({ workspace, onClose }: Props) {
                 );
               })}
             </div>
+            {isWorkerType && provider === 'gemini' && (
+              <div className="mt-1 text-[11px] text-gray-600">
+                Gemini has no hook scaffold — it launches as a plain session, not a worker-lane agent.
+              </div>
+            )}
           </div>
 
           <div>
@@ -392,6 +437,23 @@ export default function AgentLaunchDialog({ workspace, onClose }: Props) {
               className="ui-input text-sm font-sans"
             />
           </div>
+          </>
+          )}
+
+          {isWorkerType && provider !== 'gemini' && (
+            <div className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                id="supervised"
+                checked={supervised}
+                onChange={(e) => setSupervised(e.target.checked)}
+                className="rounded"
+              />
+              <label htmlFor="supervised" className="text-sm text-gray-400">
+                Supervised (a supervisor watches status and routes questions)
+              </label>
+            </div>
+          )}
 
           <div className="flex items-center gap-2">
             <input
@@ -406,72 +468,45 @@ export default function AgentLaunchDialog({ workspace, onClose }: Props) {
             </label>
           </div>
 
-          <div className="flex items-center gap-2">
-            <input
-              type="checkbox"
-              id="worker"
-              checked={provider !== 'gemini' && (worker || supervised)}
-              disabled={provider === 'gemini' || supervised}
-              onChange={(e) => setWorker(e.target.checked)}
-              className="rounded"
-            />
-            <label htmlFor="worker" className="text-sm text-gray-400">
-              Worker (hook-based status)
-              {provider === 'gemini' && (
-                <span className="text-gray-600"> — unavailable for Gemini</span>
-              )}
-            </label>
-          </div>
-
-          <div className="flex items-center gap-2">
-            <input
-              type="checkbox"
-              id="supervised"
-              checked={supervised}
-              onChange={(e) => { setSupervised(e.target.checked); if (e.target.checked) setWorker(true); }}
-              className="rounded"
-            />
-            <label htmlFor="supervised" className="text-sm text-gray-400">
-              Supervised (auto-notify supervisor on status changes)
-            </label>
-          </div>
-
-          {/* Save as Template */}
-          {showSaveDialog ? (
-            <div className="flex items-center gap-2 p-2 bg-surface-2 rounded-lg border border-gray-700">
-              <input
-                type="text"
-                value={saveTemplateName}
-                onChange={(e) => setSaveTemplateName(e.target.value)}
-                placeholder="Template name..."
-                className="ui-input flex-1 text-sm"
-                onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); handleSaveTemplate(); } }}
-                autoFocus
-              />
+          {/* Save as Template (advanced) — captures the current provider/command/
+              role-description as a reusable DB preset. */}
+          {showProviderAndCommand && (
+            showSaveDialog ? (
+              <div className="flex items-center gap-2 p-2 bg-surface-2 rounded-lg border border-gray-700">
+                <input
+                  type="text"
+                  value={saveTemplateName}
+                  onChange={(e) => setSaveTemplateName(e.target.value)}
+                  placeholder="Template name..."
+                  className="ui-input flex-1 text-sm"
+                  onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); handleSaveTemplate(); } }}
+                  autoFocus
+                />
+                <button
+                  type="button"
+                  onClick={handleSaveTemplate}
+                  disabled={!saveTemplateName.trim() || savingTemplate}
+                  className="ui-btn ui-btn-primary px-3 py-1.5 text-[13px]"
+                >
+                  {savingTemplate ? 'Saving...' : 'Save'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setShowSaveDialog(false)}
+                  className="ui-btn ui-btn-ghost px-2 py-1.5 text-[13px]"
+                >
+                  Cancel
+                </button>
+              </div>
+            ) : (
               <button
                 type="button"
-                onClick={handleSaveTemplate}
-                disabled={!saveTemplateName.trim() || savingTemplate}
-                className="ui-btn ui-btn-primary px-3 py-1.5 text-[13px]"
+                onClick={() => setShowSaveDialog(true)}
+                className="text-[13px] text-gray-500 hover:text-accent-blue transition-colors"
               >
-                {savingTemplate ? 'Saving...' : 'Save'}
+                Save as template...
               </button>
-              <button
-                type="button"
-                onClick={() => setShowSaveDialog(false)}
-                className="ui-btn ui-btn-ghost px-2 py-1.5 text-[13px]"
-              >
-                Cancel
-              </button>
-            </div>
-          ) : (
-            <button
-              type="button"
-              onClick={() => setShowSaveDialog(true)}
-              className="text-[13px] text-gray-500 hover:text-accent-blue transition-colors"
-            >
-              Save as template...
-            </button>
+            )
           )}
 
           <div className="flex justify-end gap-2 pt-2">

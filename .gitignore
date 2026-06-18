@@ -28,6 +28,13 @@ plans/
 .dashboard/supervisor/.claude/.sysprompt-*.txt
 .dashboard/main-crash.log
 
+# >>> agentdashboard-research-store >>>
+# WP-G — research store: inbox/ holds raw, untrusted, web-derived artifacts and
+# must never be committed; cleared/ (reviewed) stays trackable. (Case A — no
+# blanket /.dashboard/* ignore is in effect, so a single inbox/ rule suffices.)
+/.dashboard/research/inbox/
+# <<< agentdashboard-research-store <<<
+
 # MCP config — generated per app launch, embeds a live API bearer token.
 # It's a build artifact (the app rewrites it on every supervisor launch), so it
 # must never be committed. The app regenerates it locally on each machine.

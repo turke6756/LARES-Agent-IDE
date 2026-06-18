@@ -6,7 +6,6 @@ import FileContentRenderer from './FileContentRenderer';
 import CodeMirrorEditor from './CodeMirrorEditor';
 import MilkdownEditor from './MilkdownEditor';
 import SelectionSurface from '../selection/SelectionSurface';
-import { useWysiwygBeta } from './wysiwygBeta';
 import { sniffWysiwygCompatibility } from './markdownSplice';
 import type { SniffReason, SniffResult } from './markdownSplice';
 import { resolveContentView } from './contentViewMode';
@@ -35,7 +34,6 @@ export default function FileContentArea({ tabId, filePath, pathType }: Props) {
   const fileType = filePath ? detectFileType(filePath) : null;
   const isMarkdown = fileType === 'markdown';
   const editState = useDashboardStore((state) => state.tabEditState[tabId]);
-  const wysiwygBeta = useWysiwygBeta();
   const setDraftContent = useDashboardStore((state) => state.setDraftContent);
   const saveTab = useDashboardStore((state) => state.saveTab);
   const reloadFromDisk = useDashboardStore((state) => state.reloadFromDisk);
@@ -50,7 +48,25 @@ export default function FileContentArea({ tabId, filePath, pathType }: Props) {
     fileType === 'geotiff' ||
     fileType === 'shapefile' ||
     fileType === 'geopackage';
-  const { content, loading } = useFileContentCache(tabId, filePath, pathType, isMediaType);
+  const { content: cachedContent, loading: cacheLoading } = useFileContentCache(
+    tabId,
+    filePath,
+    pathType,
+    isMediaType,
+  );
+
+  // useFileContentCache's state lives on this component instance, not on the
+  // tab, and FileContentArea is reused (no `key`) across tab switches. So right
+  // after a switch the hook momentarily returns the *previous* tab's bytes
+  // before its effect reloads for the new file — the new content carries the
+  // old path. Treat a path mismatch as "still loading" so nothing downstream
+  // (the sniff, the WYSIWYG-entry effect below, or the renderer) ever sees
+  // another tab's content. Without this guard, enterWysiwygMode() baked the
+  // stale bytes into the new tab's edit session permanently (originalContent is
+  // written once and never overwritten), which is why a second markdown tab
+  // opened in WYSIWYG showed the first tab's text.
+  const content = cachedContent && cachedContent.path === filePath ? cachedContent : null;
+  const loading = cacheLoading || (!isMediaType && !!filePath && content === null);
 
   // §6.3 exclusion sniffing at the dispatch. Sniff the edit-session baseline
   // when one exists (what the WYSIWYG editor would load), else the cached
@@ -72,7 +88,10 @@ export default function FileContentArea({ tabId, filePath, pathType }: Props) {
     isMarkdown,
     isEditable: filePath ? isEditableFileType(filePath) : false,
     mode: editState?.mode,
-    wysiwygIsDefault: wysiwygBeta,
+    // WYSIWYG is now the default surface for markdown (graduated out of beta):
+    // markdown tabs open in the editable canvas unless the user explicitly
+    // picks View or Source from the header.
+    wysiwygIsDefault: true,
     sniff,
   });
 

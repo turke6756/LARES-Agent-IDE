@@ -131,6 +131,10 @@ export default function FileTabBar({ tabs, activeTabId, onSelectTab, onCloseTab 
   const moveTab = useDashboardStore((state) => state.moveTab);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; tab: ColoredFileTab } | null>(null);
   const [draggedTabId, setDraggedTabId] = useState<string | null>(null);
+  // True when the in-progress drag has already reordered tabs in-strip — used
+  // by handleDragEnd to distinguish a reorder (no tear-off) from a drag-out
+  // onto empty desktop (detach). Reset at the end of every drag.
+  const reorderHappenedRef = useRef(false);
 
   // Scroll active tab into view
   useEffect(() => {
@@ -173,7 +177,49 @@ export default function FileTabBar({ tabs, activeTabId, onSelectTab, onCloseTab 
     const toIdx = tabs.findIndex((t) => t.id === tab.id);
     if (fromIdx === -1 || toIdx === -1) return;
     if ((fromIdx < toIdx && e.clientX > midpoint) || (fromIdx > toIdx && e.clientX < midpoint)) {
+      reorderHappenedRef.current = true;
       moveTab(draggedTabId, tab.id);
+    }
+  };
+
+  // Tear-off detection (detachable-file-tabs-plan §4 1.6). A drag that ends with
+  // no accepting drop target (dropEffect 'none') and was NOT a reorder, on a
+  // file tab, spawns a detached window at the cursor. Save-before-detach guards
+  // against losing an unsaved source-tab draft (the detached window seeds from
+  // disk). screenX/Y and dropEffect are read SYNCHRONOUSLY — the event is
+  // neutered after the first await.
+  const handleDragEnd = async (e: React.DragEvent, tab: ColoredFileTab) => {
+    const accepted = e.dataTransfer.dropEffect !== 'none';
+    const capturedX = e.screenX;
+    const capturedY = e.screenY;
+    setDraggedTabId(null);
+    const isReorder = reorderHappenedRef.current;
+    reorderHappenedRef.current = false;
+    if (accepted || isReorder || !tab.filePath) return;
+
+    const store = useDashboardStore.getState();
+    const workspaceId = tab.workspaceId ?? store.selectedWorkspaceId;
+    if (!workspaceId) return; // no workspace context → can't seed the detached window
+
+    // SAVE-BEFORE-DETACH: never lose a source-tab draft (Reviewer #1). On
+    // cancel/failure, abort the detach and keep the dirty tab in the strip.
+    const dirty = !!store.tabEditState[tab.id]?.dirty;
+    if (dirty) {
+      const saved = await store.saveTab(tab.id);
+      if (!saved) return;
+    }
+
+    const res = await window.api.tabs.detach({
+      filePath: tab.filePath,
+      rootDirectory: tab.rootDirectory,
+      pathType: tab.pathType,
+      workspaceId,
+      label: tab.label,
+      x: capturedX,
+      y: capturedY,
+    });
+    if (res.ok && !res.focusedExisting) {
+      useDashboardStore.getState().detachTab(tab.id); // remove from main strip
     }
   };
 
@@ -200,7 +246,7 @@ export default function FileTabBar({ tabs, activeTabId, onSelectTab, onCloseTab 
               }}
               draggable
               onDragStart={(e) => handleDragStart(e, tab)}
-              onDragEnd={() => setDraggedTabId(null)}
+              onDragEnd={(e) => handleDragEnd(e, tab)}
               onDragOver={(e) => handleDragOver(e, tab)}
               onDrop={(e) => {
                 if (draggedTabId) e.preventDefault();

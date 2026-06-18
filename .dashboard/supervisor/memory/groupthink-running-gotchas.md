@@ -3,6 +3,28 @@
 Compiled while running a GroupThink on the agent-lifecycle-hardening plan.
 Things that bit me; future-supervisor should know.
 
+## SERIAL relay can stall on the reviewer's first idle; a fresh nudge unsticks it (2026-06-17, run 113e1c11)
+Frozen-tab-model serial run. Codex reviewer's `[DASHBOARD EVENT]` "Last output" showed
+only a `/review` TUI artifact and `read_agent_chat`/`read_agent_log` came back EMPTY on
+first read — looked like a dead handoff. It wasn't: the reviewer HAD produced a full
+review (~06:35), but the orchestration relay loop did not pick up that idle and
+`updatedAt` froze for ~7 min. **Recovery that worked:** `send_message_to_agent` to the
+reviewer with the lead's draft pasted in + "reply as plain text, no slash command" →
+HANDSHAKE OK → fresh review at 06:40 → THIS idle the relay loop did pick up and relayed
+to the lead. So a fresh nudge generated the idle event the stuck loop needed.
+- Don't trust the event's "Last output" for Codex (it's the idle TUI line); read the
+  structured chat, and if empty, re-poll — Codex chat/log reads lag right after idle.
+- **Serial polite-loop risk:** near the end the lead may reply "v2 addresses everything —
+  approved? then I'll write" instead of writing the file. The orchestration relays that as
+  another round. With the lead climbing in context (this run: 84%→92%), that can saturate
+  it before it writes. I tried to break the loop with a direct "WRITE NOW" to the lead —
+  both attempts HANDSHAKE FAILED (lead was "working"), which was actually the signal the
+  orchestration was already driving the finalize correctly. It completed on its own. Lesson:
+  if the lead is "working", DON'T fight it; only intervene if it's idle AND the loop is
+  visibly spinning. Have the full draft in your own context as a fallback to write yourself.
+- Output folded into the parent roadmap as a pointer (not a 651-line paste): see
+  `plans/premium-browser-experience.md` Slices 10/11 → `plans/premium-browser-frozen-tab-model.md`.
+
 ## 1. `launch_agent`'s initial prompt sits un-submitted
 
 (FIXED 2026-05-17, commit f4e1a58 — see BUG-01. `launch_agent` now sends

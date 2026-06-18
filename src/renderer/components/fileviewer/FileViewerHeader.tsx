@@ -4,7 +4,6 @@ import { detectFileType, detectLanguage, formatFileSize, isEditableFileType } fr
 import * as Icons from 'lucide-react';
 import FileIcon from './FileIcon';
 import { useDashboardStore } from '../../stores/dashboard-store';
-import { useWysiwygBeta, setWysiwygBetaEnabled } from './wysiwygBeta';
 import type { TabMode } from './contentViewMode';
 
 interface Props {
@@ -32,14 +31,13 @@ export default function FileViewerHeader({ tabId, filePath, pathType, fileSize, 
   const discardTabChanges = useDashboardStore((state) => state.discardTabChanges);
   const saveTab = useDashboardStore((state) => state.saveTab);
   const checkHealth = useDashboardStore((state) => state.checkHealth);
-  const wysiwygBeta = useWysiwygBeta();
   const dirty = !!editState?.dirty;
   const saving = !!editState?.saving;
   const saveError = editState?.error;
   // Mode shown as active. Markdown tabs without an edit session display the
-  // default (WYSIWYG when the beta flag is on) — FileContentArea creates the
+  // default (WYSIWYG, now graduated out of beta) — FileContentArea creates the
   // real tabEditState when the canvas mounts.
-  const mode: TabMode = editState?.mode ?? (isMarkdown && wysiwygBeta ? 'wysiwyg' : 'view');
+  const mode: TabMode = editState?.mode ?? (isMarkdown ? 'wysiwyg' : 'view');
 
   const handleOpenInVSCode = async () => {
     if (workingDirectory) {
@@ -194,13 +192,6 @@ export default function FileViewerHeader({ tabId, filePath, pathType, fileSize, 
             >
               {switchingMode ? <Icons.Loader2 className="w-3 h-3 animate-spin" /> : <Icons.Code className="w-3 h-3" />}
               Source
-            </button>
-            <button
-              onClick={() => setWysiwygBetaEnabled(!wysiwygBeta)}
-              className={`ui-btn text-[13px] ${wysiwygBeta ? 'text-accent-blue' : ''}`}
-              title={`Beta: open markdown files in the WYSIWYG canvas by default (currently ${wysiwygBeta ? 'on' : 'off'})`}
-            >
-              <Icons.Wand2 className="w-3 h-3" />
             </button>
           </div>
         )}

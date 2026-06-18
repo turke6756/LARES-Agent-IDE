@@ -51,7 +51,7 @@ export interface BrowserToolProvider {
   /** forHuman → visible persist:user tab, never CDP (M9). Resolves once the
    *  page is ready — the navigateAndWait lives server-side so MCP proxy
    *  scripts stay dumb (M10 page-ready note). */
-  openUrl(url: string, opts: { forHuman?: boolean }): Promise<unknown>;
+  openUrl(url: string, opts: { forHuman?: boolean; workspaceId?: string | null }): Promise<unknown>;
   listTabs(): unknown[];
   /** wrapUntrusted applied by the provider (M12). */
   getPageText(tabId: string): Promise<string>;
@@ -61,6 +61,48 @@ export interface BrowserToolProvider {
   /** Act tier — throws PolicyError unless human-enabled; returns the fresh
    *  post-click snapshot. */
   click(tabId: string, ref: number): Promise<string>;
+  /** Act tier (WP-C parity). Each returns the fresh post-action snapshot
+   *  except closeTab (returns the updated agent tab list) and waitFor (a
+   *  server-side bounded poll result). NONE is an eval surface (M10). */
+  type(tabId: string, ref: number, text: string): Promise<string>;
+  pressKey(tabId: string, key: string): Promise<string>;
+  selectOption(tabId: string, ref: number, value: string): Promise<string>;
+  scroll(tabId: string, opts: { ref?: number; dy?: number }): Promise<string>;
+  goBack(tabId: string): Promise<string>;
+  goForward(tabId: string): Promise<string>;
+  reload(tabId: string): Promise<string>;
+  /** Read tier — bounded poll; returns { found, elapsedMs, snapshot? }. */
+  waitFor(tabId: string, input: { text: string; timeoutMs?: number }): Promise<unknown>;
+  /** Act tier — returns the updated agent tab list (no impossible snapshot). */
+  closeTab(tabId: string): Promise<unknown>;
+  /** §18 agent-initiated access request. INERT — writes a pending request for a
+   *  human to approve in trusted chrome; grants ZERO access. Returns
+   *  { requestId, status }.
+   *
+   *  IDENTITY (F5 accepted risk): `requestedBy` is supplied in the request BODY,
+   *  not stamped by this layer. The MCP proxy (scripts/mcp-browser-tools.js)
+   *  injects `requestedBy: AGENT_ID` from its per-agent launch env, so the agent
+   *  *model* cannot forge it via tool args. But the dashboard API token is a
+   *  single per-launch secret SHARED by every agent (security/api-auth.ts) — the
+   *  HTTP layer has NO per-connection agent identity, so a token-holding agent
+   *  that bypasses its proxy could set any `requestedBy`. Accepted because the
+   *  request grants no access (a human approves) and the blast radius is limited
+   *  to attribution spoofing / pending-cap griefing / cross-agent request-history
+   *  disclosure — not an M9 escalation. `requestedByTitle` IS resolved trust-side
+   *  from the agent registry (display only). If per-agent API tokens ever land,
+   *  derive `requestedBy`/`agentId` from the connection and ignore body/query. */
+  requestSiteAccess(input: {
+    hostname: string;
+    scheme?: string;
+    includeSubdomains?: boolean;
+    pathPrefix?: string;
+    reason?: string;
+    wantSignedIn?: boolean;
+    requestedBy: string;
+    requestedByTitle?: string;
+  }): unknown;
+  /** §18 outcome read — a single agent's own requests + statuses. */
+  listMyAccessRequests(agentId: string): unknown[];
 }
 
 /**
@@ -515,6 +557,13 @@ export class ApiServer {
     if (method === 'POST' && path === '/api/agents') {
       const body = await readBody(req);
       const input = JSON.parse(body);
+      // Researcher role-lane (browser-parity-and-capability-isolation §0):
+      // accept the snake_case `is_researcher` form (used by the launch_agent MCP
+      // tool / raw HTTP callers) and normalize it to the camelCase
+      // `isResearcher` LaunchAgentInput field the supervisor reads.
+      if (input && input.is_researcher !== undefined && input.isResearcher === undefined) {
+        input.isResearcher = input.is_researcher;
+      }
       const agent = await this.supervisor.launchAgent(input);
       return agent;
     }
@@ -838,6 +887,11 @@ export class ApiServer {
             provider: member.provider,
             autoRestartEnabled: true,
             isSupervised: true,
+            // WP-A.2 (F9): join the team BEFORE launch so the team `--mcp-config`
+            // is injected inline at launch (off-disk) instead of being merged
+            // into a token-bearing root `.mcp.json` after the agent is running.
+            teamId,
+            teamRole: member.role,
           });
 
           idMap.set(member.agentId, newAgent.id);
@@ -859,13 +913,11 @@ export class ApiServer {
       // Reactivate team and clear old members
       updateTeamStatus(teamId, 'active');
 
-      // Remove old members, add new ones
+      // Remove old members. New members were already added to the team inside
+      // launchAgent (via the `teamId` arg) so the inline team --mcp-config could
+      // be injected at launch (WP-A.2/F9) — do NOT re-add them here.
       for (const member of manifest.members) {
         try { removeTeamMember(teamId, member.agentId); } catch { /* may not exist */ }
-        const newId = idMap.get(member.agentId);
-        if (newId) {
-          addTeamMember(teamId, newId, member.role);
-        }
       }
 
       // Remove old channels, re-create with new IDs
@@ -893,14 +945,10 @@ export class ApiServer {
         });
       }
 
-      // Inject team MCP config for each new agent
-      for (const [_oldId, newId] of idMap) {
-        const agent = getAgent(newId);
-        if (agent) {
-          const pathType = agent.tmuxSessionName ? 'wsl' : 'windows';
-          this.supervisor.ensureTeamMcpConfig(newId, teamId, agent.workingDirectory, pathType);
-        }
-      }
+      // WP-A.2 (F9): team MCP config is injected inline at launch (the agents
+      // joined the team via launchAgent's `teamId` arg before they launched), so
+      // there is no post-launch root-`.mcp.json` merge to do here. Writing the
+      // bearer token to disk after the fact was the removed leak.
 
       const updated = getTeam(teamId);
       this.supervisor.emit('teamUpdated', updated);
@@ -1073,24 +1121,31 @@ export class ApiServer {
     // gating) lives in WP2-A's provider behind the frozen contract — a
     // PolicyError from it becomes a 403 carrying the policy message. These
     // routes are bearer-token-gated like everything else by the admission
-    // preamble in start(); no provider injected → 503. The five-tool surface
-    // (open-url / tabs / text / page / screenshot / click) is the COMPLETE
-    // browser API — no raw-eval route may ever be added here (M10).
+    // preamble in start(); no provider injected → 503. The browser API surface
+    // (open-url / tabs / text / page / screenshot / click / type / press-key /
+    // select-option / scroll / go-back / go-forward / reload / wait-for /
+    // close) is COMPLETE — no raw-eval / Runtime.evaluate route may ever be
+    // added here (M10).
 
     // POST /api/browser/open-url — { url, forHuman? }. forHuman opens a
     // visible persist:user tab for the human (never CDP); resolves once the
     // page is ready (the wait lives in the provider, not in proxy scripts).
     if (method === 'POST' && path === '/api/browser/open-url') {
       const tools = this.requireBrowserTools();
-      const { url: targetUrl, forHuman } = JSON.parse(await readBody(req));
+      const { url: targetUrl, forHuman, agentId } = JSON.parse(await readBody(req));
       if (!targetUrl || typeof targetUrl !== 'string') {
         throw Object.assign(new Error('Missing "url" in request body'), { statusCode: 400 });
       }
       if (forHuman !== undefined && typeof forHuman !== 'boolean') {
         throw Object.assign(new Error('"forHuman" must be a boolean when provided'), { statusCode: 400 });
       }
+      // Per-workspace isolation: stamp the tab with the calling agent's
+      // workspace so it lands in that workspace's browser strip rather than
+      // leaking into whichever workspace the human happens to be viewing.
+      const workspaceId =
+        typeof agentId === 'string' && agentId ? getAgent(agentId)?.workspaceId ?? null : null;
       try {
-        const snapshot = await tools.openUrl(targetUrl, { forHuman: forHuman === true });
+        const snapshot = await tools.openUrl(targetUrl, { forHuman: forHuman === true, workspaceId });
         return { ok: true, forHuman: forHuman === true, snapshot };
       } catch (err) {
         ApiServer.rethrowBrowserError(err);
@@ -1153,6 +1208,228 @@ export class ApiServer {
       } catch (err) {
         ApiServer.rethrowBrowserError(err);
       }
+    }
+
+    // POST /api/browser/:tabId/type — { ref, text } — act tier. Replaces the
+    // field's content by default (provider-side focus → select-all → insert).
+    const browserTypeMatch = path.match(/^\/api\/browser\/([^/]+)\/type$/);
+    if (method === 'POST' && browserTypeMatch) {
+      const tools = this.requireBrowserTools();
+      const tabId = browserTypeMatch[1];
+      const { ref, text } = JSON.parse(await readBody(req));
+      if (typeof ref !== 'number' || !Number.isInteger(ref)) {
+        throw Object.assign(
+          new Error('"ref" must be an integer ref from the latest browser_read_page snapshot'),
+          { statusCode: 400 },
+        );
+      }
+      if (typeof text !== 'string') {
+        throw Object.assign(new Error('"text" must be a string'), { statusCode: 400 });
+      }
+      try {
+        return { tabId, snapshot: await tools.type(tabId, ref, text) };
+      } catch (err) {
+        ApiServer.rethrowBrowserError(err);
+      }
+    }
+
+    // POST /api/browser/:tabId/press-key — { key } — act tier (focused element)
+    const browserPressKeyMatch = path.match(/^\/api\/browser\/([^/]+)\/press-key$/);
+    if (method === 'POST' && browserPressKeyMatch) {
+      const tools = this.requireBrowserTools();
+      const tabId = browserPressKeyMatch[1];
+      const { key } = JSON.parse(await readBody(req));
+      if (typeof key !== 'string' || key.length === 0) {
+        throw Object.assign(new Error('"key" must be a non-empty string'), { statusCode: 400 });
+      }
+      try {
+        return { tabId, snapshot: await tools.pressKey(tabId, key) };
+      } catch (err) {
+        ApiServer.rethrowBrowserError(err);
+      }
+    }
+
+    // POST /api/browser/:tabId/select-option — { ref, value } — act tier (ARIA)
+    const browserSelectMatch = path.match(/^\/api\/browser\/([^/]+)\/select-option$/);
+    if (method === 'POST' && browserSelectMatch) {
+      const tools = this.requireBrowserTools();
+      const tabId = browserSelectMatch[1];
+      const { ref, value } = JSON.parse(await readBody(req));
+      if (typeof ref !== 'number' || !Number.isInteger(ref)) {
+        throw Object.assign(
+          new Error('"ref" must be an integer ref from the latest browser_read_page snapshot'),
+          { statusCode: 400 },
+        );
+      }
+      if (typeof value !== 'string') {
+        throw Object.assign(new Error('"value" must be a string'), { statusCode: 400 });
+      }
+      try {
+        return { tabId, snapshot: await tools.selectOption(tabId, ref, value) };
+      } catch (err) {
+        ApiServer.rethrowBrowserError(err);
+      }
+    }
+
+    // POST /api/browser/:tabId/scroll — { ref? , dy? } — exactly one — act tier
+    const browserScrollMatch = path.match(/^\/api\/browser\/([^/]+)\/scroll$/);
+    if (method === 'POST' && browserScrollMatch) {
+      const tools = this.requireBrowserTools();
+      const tabId = browserScrollMatch[1];
+      const { ref, dy } = JSON.parse(await readBody(req));
+      const hasRef = ref !== undefined;
+      const hasDy = dy !== undefined;
+      if (hasRef === hasDy) {
+        throw Object.assign(
+          new Error('scroll requires exactly one of "ref" or "dy"'),
+          { statusCode: 400 },
+        );
+      }
+      if (hasRef && (typeof ref !== 'number' || !Number.isInteger(ref))) {
+        throw Object.assign(new Error('"ref" must be an integer'), { statusCode: 400 });
+      }
+      if (hasDy && typeof dy !== 'number') {
+        throw Object.assign(new Error('"dy" must be a number'), { statusCode: 400 });
+      }
+      try {
+        return { tabId, snapshot: await tools.scroll(tabId, hasRef ? { ref } : { dy }) };
+      } catch (err) {
+        ApiServer.rethrowBrowserError(err);
+      }
+    }
+
+    // POST /api/browser/:tabId/go-back — act tier (NAV_AWAY-exempt server-side)
+    const browserGoBackMatch = path.match(/^\/api\/browser\/([^/]+)\/go-back$/);
+    if (method === 'POST' && browserGoBackMatch) {
+      const tools = this.requireBrowserTools();
+      const tabId = browserGoBackMatch[1];
+      try {
+        return { tabId, snapshot: await tools.goBack(tabId) };
+      } catch (err) {
+        ApiServer.rethrowBrowserError(err);
+      }
+    }
+
+    // POST /api/browser/:tabId/go-forward — act tier (NAV_AWAY-exempt)
+    const browserGoForwardMatch = path.match(/^\/api\/browser\/([^/]+)\/go-forward$/);
+    if (method === 'POST' && browserGoForwardMatch) {
+      const tools = this.requireBrowserTools();
+      const tabId = browserGoForwardMatch[1];
+      try {
+        return { tabId, snapshot: await tools.goForward(tabId) };
+      } catch (err) {
+        ApiServer.rethrowBrowserError(err);
+      }
+    }
+
+    // POST /api/browser/:tabId/reload — act tier (stays denied on sensitive)
+    const browserReloadMatch = path.match(/^\/api\/browser\/([^/]+)\/reload$/);
+    if (method === 'POST' && browserReloadMatch) {
+      const tools = this.requireBrowserTools();
+      const tabId = browserReloadMatch[1];
+      try {
+        return { tabId, snapshot: await tools.reload(tabId) };
+      } catch (err) {
+        ApiServer.rethrowBrowserError(err);
+      }
+    }
+
+    // POST /api/browser/:tabId/wait-for — { text, timeoutMs? } — read tier,
+    // server-side bounded poll (≤30s clamp lives in the provider).
+    const browserWaitMatch = path.match(/^\/api\/browser\/([^/]+)\/wait-for$/);
+    if (method === 'POST' && browserWaitMatch) {
+      const tools = this.requireBrowserTools();
+      const tabId = browserWaitMatch[1];
+      const { text, timeoutMs } = JSON.parse(await readBody(req));
+      if (typeof text !== 'string' || text.length === 0) {
+        throw Object.assign(new Error('"text" must be a non-empty string'), { statusCode: 400 });
+      }
+      if (timeoutMs !== undefined && (typeof timeoutMs !== 'number' || !Number.isInteger(timeoutMs))) {
+        throw Object.assign(new Error('"timeoutMs" must be an integer when provided'), { statusCode: 400 });
+      }
+      try {
+        const result = (await tools.waitFor(
+          tabId,
+          { text, ...(timeoutMs !== undefined ? { timeoutMs } : {}) },
+        )) as Record<string, unknown>;
+        return { tabId, ...result };
+      } catch (err) {
+        ApiServer.rethrowBrowserError(err);
+      }
+    }
+
+    // POST /api/browser/:tabId/close — act tier; returns the updated tab list.
+    const browserCloseMatch = path.match(/^\/api\/browser\/([^/]+)\/close$/);
+    if (method === 'POST' && browserCloseMatch) {
+      const tools = this.requireBrowserTools();
+      const tabId = browserCloseMatch[1];
+      try {
+        const result = (await tools.closeTab(tabId)) as Record<string, unknown>;
+        return { tabId, ...result };
+      } catch (err) {
+        ApiServer.rethrowBrowserError(err);
+      }
+    }
+
+    // POST /api/browser/access/request — §18 agent-initiated access request.
+    // INERT: writes a pending request a human must approve; grants no access.
+    // Always permitted (independent of the act-tier toggle) since it's harmless.
+    // F5 accepted risk: `requestedBy` is read from the body — the shared
+    // per-launch API token gives this layer NO per-connection agent identity to
+    // derive it from. Spoofable across token-holding agents, but bounded to
+    // attribution/grief (no access granted). See requestSiteAccess() doc above.
+    if (method === 'POST' && path === '/api/browser/access/request') {
+      const tools = this.requireBrowserTools();
+      const parsed = JSON.parse(await readBody(req));
+      const { hostname, scheme, includeSubdomains, pathPrefix, reason, wantSignedIn, requestedBy } =
+        parsed;
+      if (!hostname || typeof hostname !== 'string') {
+        throw Object.assign(new Error('Missing "hostname" in request body'), { statusCode: 400 });
+      }
+      if (!requestedBy || typeof requestedBy !== 'string') {
+        throw Object.assign(new Error('Missing "requestedBy" (agent id) in request body'), {
+          statusCode: 400,
+        });
+      }
+      // Title resolved by trusted code from the agent registry (display only).
+      // Guarded: a missing registry row / uninitialized DB must not 500 — the
+      // request is still valid without a display title.
+      let requestedByTitle: string | undefined;
+      try {
+        requestedByTitle = getAgent(requestedBy)?.title;
+      } catch {
+        requestedByTitle = undefined;
+      }
+      try {
+        const result = tools.requestSiteAccess({
+          hostname,
+          scheme,
+          includeSubdomains,
+          pathPrefix,
+          reason,
+          wantSignedIn,
+          requestedBy,
+          requestedByTitle,
+        }) as Record<string, unknown>;
+        return { ok: true, ...result };
+      } catch (err) {
+        // Hostname-normalization / per-agent-cap rejections are the agent's to
+        // fix — surface the message as a 400, not a 500.
+        throw Object.assign(err as Error, { statusCode: 400 });
+      }
+    }
+
+    // GET /api/browser/access/my-requests?agentId=… — §18 outcome read.
+    // F5 accepted risk: `agentId` is a query param, not a trusted connection
+    // identity (no per-agent token), so a token-holding agent can read another
+    // agent's request history. Bounded disclosure; no access granted.
+    if (method === 'GET' && path === '/api/browser/access/my-requests') {
+      const tools = this.requireBrowserTools();
+      const agentId = url.searchParams.get('agentId') || '';
+      if (!agentId) {
+        throw Object.assign(new Error('Missing "agentId" query parameter'), { statusCode: 400 });
+      }
+      return { requests: tools.listMyAccessRequests(agentId) };
     }
 
     throw Object.assign(new Error(`Not found: ${method} ${path}`), { statusCode: 404 });

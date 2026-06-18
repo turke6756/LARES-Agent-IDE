@@ -35,7 +35,7 @@ function patchDb(agentsMap: Map<string, Agent>): () => void {
     'updateAgentStatus', 'updateAgentPid', 'getAgent', 'addEvent',
     'updateAgentLastOutput', 'updateAgentExitCode',
     'getActiveAgents', 'getAllAgents', 'getSupervisorAgent',
-    'addFileActivity', 'updateAgentResumeSessionId',
+    'addFileActivity', 'updateAgentResumeSessionId', 'getTeamMembership',
   ];
   const orig: Record<string, unknown> = {};
   for (const k of keys) orig[k] = db[k];
@@ -54,6 +54,8 @@ function patchDb(agentsMap: Map<string, Agent>): () => void {
   db.getSupervisorAgent = () => null;
   db.addFileActivity = () => null;
   db.updateAgentResumeSessionId = () => {};
+  // WP-A.2 — launch paths now read getTeamMembership for inline team MCP; no team here.
+  db.getTeamMembership = () => null;
 
   return () => { for (const k of keys) db[k] = orig[k]; };
 }
@@ -194,6 +196,140 @@ test('Windows supervised Claude launch does NOT inject DASHBOARD_HOST (extraEnv 
     (WindowsRunner.prototype as { launch: unknown }).launch = origWinLaunch;
     restoreDb();
   }
+});
+
+// ── WP-A.2 — per-lane --mcp-config / --strict-mcp-config launch arg-set ──
+//
+// NEW RULE (Step 4 follow-on): --strict-mcp-config fires IFF the agent's
+// role-lane ∈ {worker, researcher} (the containment lanes). The supervisor
+// keeps its inline dashboard --mcp-config but is NOT strict (so its globally
+// configured Gmail/Calendar/Drive/claude-in-chrome MCP servers survive). Legacy
+// gets no dashboard --mcp-config and is never strict.
+
+// Capture the rendered WSL command for an agent with the given lane-flags.
+async function captureWslLaunch(id: string, flags: Partial<Agent>): Promise<string> {
+  const agentsMap = new Map<string, Agent>();
+  const restoreDb = patchDb(agentsMap);
+  const captured: { command: string | null } = { command: null };
+  const origWslLaunch = (WslRunner.prototype as { launch: unknown }).launch;
+  (WslRunner.prototype as { launch: unknown }).launch = async function (
+    this: WslRunner, _workDir: string, command: string, _logPath: string,
+  ) {
+    captured.command = command;
+    (this as unknown as { _alive: boolean })._alive = true;
+  };
+  try {
+    const agent = makeAgent(id, {
+      provider: 'claude',
+      command: 'ccode --dangerously-skip-permissions',
+      workingDirectory: '/home/test/ws',
+      tmuxSessionName: `cad__${id}`,
+      ...flags,
+    });
+    agentsMap.set(agent.id, agent);
+    const supervisor = makeSupervisor();
+    await (supervisor as unknown as { launchWslAgent: (a: Agent) => Promise<void> })
+      .launchWslAgent(agent);
+    assert.ok(captured.command, 'WslRunner.launch must have been called');
+    return captured.command as string;
+  } finally {
+    (WslRunner.prototype as { launch: unknown }).launch = origWslLaunch;
+    restoreDb();
+  }
+}
+
+// Capture the rendered Windows args[] for an agent with the given lane-flags.
+async function captureWindowsLaunch(id: string, flags: Partial<Agent>): Promise<string[]> {
+  const agentsMap = new Map<string, Agent>();
+  const restoreDb = patchDb(agentsMap);
+  const captured: { args: string[] | null } = { args: null };
+  const origWinLaunch = (WindowsRunner.prototype as { launch: unknown }).launch;
+  (WindowsRunner.prototype as { launch: unknown }).launch = function (
+    this: WindowsRunner,
+    _workDir: string, _command: string, args: string[], _logPath: string,
+  ) {
+    captured.args = args;
+    (this as unknown as { _pid: number; _alive: boolean })._pid = 12345;
+    (this as unknown as { _pid: number; _alive: boolean })._alive = true;
+  };
+  try {
+    const agent = makeAgent(id, {
+      provider: 'claude',
+      command: 'claude --dangerously-skip-permissions',
+      workingDirectory: 'C:\\tmp\\ws',
+      ...flags,
+    });
+    agentsMap.set(agent.id, agent);
+    const supervisor = makeSupervisor();
+    await (supervisor as unknown as { launchWindowsAgent: (a: Agent) => Promise<void> })
+      .launchWindowsAgent(agent);
+    assert.ok(captured.args, 'WindowsRunner.launch must have been called with args');
+    return captured.args as string[];
+  } finally {
+    (WindowsRunner.prototype as { launch: unknown }).launch = origWinLaunch;
+    restoreDb();
+  }
+}
+
+// Lane flag-sets (mirror roleLaneOf precedence: supervisor > researcher > worker).
+const SUPERVISOR_FLAGS: Partial<Agent> = { isSupervisor: true, isSupervised: false, isWorker: false, isResearcher: false };
+const WORKER_FLAGS: Partial<Agent> = { isSupervisor: false, isSupervised: true, isWorker: false, isResearcher: false };
+const RESEARCHER_FLAGS: Partial<Agent> = { isSupervisor: false, isSupervised: false, isWorker: false, isResearcher: true };
+const LEGACY_FLAGS: Partial<Agent> = { isSupervisor: false, isSupervised: false, isWorker: false, isResearcher: false };
+
+// ── WSL path ─────────────────────────────────────────────────────────
+
+test('WSL supervisor lane: --mcp-config PRESENT, --strict-mcp-config ABSENT', async () => {
+  const cmd = await captureWslLaunch('wsl-lane-sup', SUPERVISOR_FLAGS);
+  assert.match(cmd, /--mcp-config '[^']*agent-dashboard/, `supervisor must get inline dashboard --mcp-config; got: ${cmd}`);
+  assert.ok(!/--strict-mcp-config/.test(cmd), `supervisor must NOT be strict (keeps global MCPs); got: ${cmd}`);
+});
+
+test('WSL worker lane: --mcp-config PRESENT and --strict-mcp-config PRESENT', async () => {
+  const cmd = await captureWslLaunch('wsl-lane-wrk', WORKER_FLAGS);
+  assert.match(cmd, /--mcp-config '[^']*agent-dashboard/, `worker must get inline dashboard --mcp-config; got: ${cmd}`);
+  assert.match(cmd, /--strict-mcp-config/, `worker must be strict (containment); got: ${cmd}`);
+});
+
+test('WSL researcher lane: --mcp-config PRESENT and --strict-mcp-config PRESENT', async () => {
+  const cmd = await captureWslLaunch('wsl-lane-res', RESEARCHER_FLAGS);
+  assert.match(cmd, /--mcp-config '[^']*agent-dashboard/, `researcher must get inline dashboard --mcp-config; got: ${cmd}`);
+  assert.match(cmd, /--strict-mcp-config/, `researcher must be strict (containment); got: ${cmd}`);
+});
+
+test('WSL legacy lane: no dashboard --mcp-config and no --strict-mcp-config', async () => {
+  const cmd = await captureWslLaunch('wsl-lane-leg', LEGACY_FLAGS);
+  assert.ok(!/agent-dashboard/.test(cmd), `legacy must NOT get the dashboard --mcp-config; got: ${cmd}`);
+  assert.ok(!/--strict-mcp-config/.test(cmd), `legacy must NOT be strict; got: ${cmd}`);
+});
+
+// ── Windows path ─────────────────────────────────────────────────────
+
+test('Windows supervisor lane: --mcp-config PRESENT, --strict-mcp-config ABSENT', async () => {
+  const args = await captureWindowsLaunch('win-lane-sup', SUPERVISOR_FLAGS);
+  assert.ok(args.includes('--mcp-config'), `supervisor must get --mcp-config; got: ${args.join(' ')}`);
+  assert.ok(args.some(a => a.includes('agent-dashboard')), `supervisor --mcp-config must be the dashboard one; got: ${args.join(' ')}`);
+  assert.ok(!args.includes('--strict-mcp-config'), `supervisor must NOT be strict; got: ${args.join(' ')}`);
+});
+
+test('Windows worker lane: --mcp-config PRESENT and --strict-mcp-config PRESENT', async () => {
+  const args = await captureWindowsLaunch('win-lane-wrk', WORKER_FLAGS);
+  assert.ok(args.includes('--mcp-config'), `worker must get --mcp-config; got: ${args.join(' ')}`);
+  assert.ok(args.some(a => a.includes('agent-dashboard')), `worker --mcp-config must be the dashboard one; got: ${args.join(' ')}`);
+  assert.ok(args.includes('--strict-mcp-config'), `worker must be strict; got: ${args.join(' ')}`);
+});
+
+test('Windows researcher lane: --mcp-config PRESENT and --strict-mcp-config PRESENT', async () => {
+  const args = await captureWindowsLaunch('win-lane-res', RESEARCHER_FLAGS);
+  assert.ok(args.includes('--mcp-config'), `researcher must get --mcp-config; got: ${args.join(' ')}`);
+  assert.ok(args.some(a => a.includes('agent-dashboard')), `researcher --mcp-config must be the dashboard one; got: ${args.join(' ')}`);
+  assert.ok(args.includes('--strict-mcp-config'), `researcher must be strict; got: ${args.join(' ')}`);
+});
+
+test('Windows legacy lane: no dashboard --mcp-config and no --strict-mcp-config', async () => {
+  const args = await captureWindowsLaunch('win-lane-leg', LEGACY_FLAGS);
+  assert.ok(!args.some(a => a.includes('agent-dashboard')), `legacy must NOT get the dashboard --mcp-config; got: ${args.join(' ')}`);
+  assert.ok(!args.includes('--strict-mcp-config'), `legacy must NOT be strict; got: ${args.join(' ')}`);
 });
 
 // ── dashboard-status.mjs failure-log behavior (T1-A) ──────────────────

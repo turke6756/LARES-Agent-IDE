@@ -12,7 +12,12 @@ import { WS_PORT, JUPYTER_BASE_PORT, JUPYTER_PORT_RETRIES } from '../control-por
 import { decideLoopbackBlock, mayAttachDebugger } from './browser-decisions';
 
 // Re-exported so the tool layer (and its tests) take the M9 predicate from
-// the policy module — one import surface, no drift.
+// the policy module — one import surface, no drift. NOTE: as of the
+// website-allowlist work (plans/website-allowlist-design.md §12-B/§14), the
+// MANAGER no longer calls mayAttachDebugger — attach is gated by the
+// manager-side isAgentDrivable helper. mayAttachDebugger is retained for its
+// existing unit tests / as the pure partition predicate; do not add new
+// callers.
 export { mayAttachDebugger };
 
 // ── Typed policy error (WP2-B maps name === 'PolicyError' → HTTP 403) ───────
@@ -25,6 +30,8 @@ export type PolicyErrorCode =
   | 'user-partition-denied' // M9: no tool may touch persist:user (except forHuman open)
   | 'partition-denied'      // tab is on no partition the tool layer recognizes
   | 'sensitive-origin-denied' // M12: auth/payment/mail/admin origins
+  | 'agent-allowlist-denied'  // website-allowlist §4: origin not on the agent allowlist
+  | 'signin-pending'          // website-allowlist §12-A: tab is in the sign-in quarantine
   | 'unknown-verb';
 
 export class PolicyError extends Error {
@@ -52,12 +59,21 @@ export function assertAllowed(decision: PolicyDecision): void {
 //
 // No raw eval tool exists, period. executeJavaScriptInIsolatedWorld is an
 // internal implementation detail of getText inside cdp-driver.ts and is never
-// exposed as a verb here.
+// exposed as a verb here. The WP-C parity verbs below (type, pressKey,
+// selectOption, scroll, goBack, goForward, reload, closeTab, waitFor) are all
+// built from CDP DOM/Input primitives or webContents navigation — NONE is an
+// eval/Runtime.evaluate surface; `evaluate`/`browser_eval` still fall through
+// to `unknown-verb`.
 
 /** Read tier: CDP reads, permitted on `persist:agent` tabs only (M9). */
-export const READ_VERBS = ['getPageText', 'readPage', 'screenshot', 'listTabs'] as const;
-/** Act tier: agent-partition navigation + click. Gated by the M12 toggle. */
-export const ACT_VERBS = ['openUrl', 'click'] as const;
+export const READ_VERBS = ['getPageText', 'readPage', 'screenshot', 'listTabs', 'waitFor'] as const;
+/** Act tier: agent-partition navigation + DOM interaction. Gated by the M12
+ *  toggle (and the sensitive-origin denylist, with the goBack/goForward
+ *  nav-away exemption below). */
+export const ACT_VERBS = [
+  'openUrl', 'click', 'type', 'pressKey', 'selectOption', 'scroll',
+  'goBack', 'goForward', 'reload', 'closeTab',
+] as const;
 
 export type BrowserReadVerb = (typeof READ_VERBS)[number];
 export type BrowserActVerb = (typeof ACT_VERBS)[number];
@@ -82,6 +98,42 @@ export function browserActionsEnabled(env: Record<string, string | undefined>): 
  *  tool, read tier included. Default enabled. */
 export function browserToolsEnabled(env: Record<string, string | undefined>): boolean {
   return !TRUTHY.has((env.AGENT_BROWSER_TOOLS_DISABLED ?? '').toLowerCase());
+}
+
+// ── Runtime actions toggle (M12 coarse) — dashboard UI flips this live ───────
+//
+// browserActionsEnabled(env) stays PURE (its tests, and the startup seed,
+// depend on that). This thin runtime layer sits on top: a single in-memory,
+// process-global flag the trusted-renderer chrome can flip without relaunching
+// with AGENT_BROWSER_ACTIONS=1. It is:
+//   - seeded once, lazily, from browserActionsEnabled(process.env) — so the env
+//     var still force-enables at launch — and otherwise defaults OFF;
+//   - NEVER persisted: each app launch re-seeds from the env, preserving the
+//     "human consciously enables each session" property (M12). The UI just
+//     turns the env var's one-time choice into a one-click runtime choice.
+// The gate in browser-manager.ts reads getRuntimeActionsEnabled() instead of
+// browserActionsEnabled(process.env) so a mid-session flip takes effect live.
+
+let runtimeActionsEnabled: boolean | null = null;
+
+/** Current runtime act-tier gate. Lazily seeds from process.env on first read
+ *  (AGENT_BROWSER_ACTIONS=1 → on; default off). */
+export function getRuntimeActionsEnabled(): boolean {
+  if (runtimeActionsEnabled === null) {
+    runtimeActionsEnabled = browserActionsEnabled(process.env);
+  }
+  return runtimeActionsEnabled;
+}
+
+/** Flip the runtime act-tier gate (dashboard chrome → IPC). Not persisted. */
+export function setRuntimeActionsEnabled(enabled: boolean): boolean {
+  runtimeActionsEnabled = enabled;
+  return runtimeActionsEnabled;
+}
+
+/** Test seam: drop the cached value so the next read re-seeds from process.env. */
+export function __resetRuntimeActionsEnabledForTests(): void {
+  runtimeActionsEnabled = null;
 }
 
 // ── M11: navigation allowlist (scheme + SSRF) ───────────────────────────────
@@ -215,6 +267,20 @@ export function isSensitiveOrigin(url: string): boolean {
   return SENSITIVE_PATH_PREFIXES.some((p) => path === p || path.startsWith(`${p}/`));
 }
 
+/** Act verbs that reduce exposure and so skip the sensitive-origin denial
+ *  (they navigate AWAY from the current page). Retains its back/forward-only
+ *  meaning for callers that need "navigated away" specifically; the
+ *  sensitive-origin escape in checkAction uses EXPOSURE_REDUCING_VERBS instead.
+ *  Exported so it is never flagged unused. */
+export const NAV_AWAY_VERBS = new Set<string>(['goBack', 'goForward']);
+
+/** Verbs that strictly REDUCE the agent's exposure on the current page and so
+ *  are always available even on a sensitive origin (website-allowlist §14 /
+ *  §6-of-review): goBack/goForward navigate away; closeTab destroys the tab
+ *  entirely. Used by checkAction's sensitive-origin skip so the agent can
+ *  always escape a stranded sensitive (or now-disallowed) page. */
+export const EXPOSURE_REDUCING_VERBS = new Set<string>(['goBack', 'goForward', 'closeTab']);
+
 // ── checkAction: the per-verb gate (M9 + M10 + M12) ─────────────────────────
 
 /**
@@ -275,7 +341,13 @@ export function checkAction(
           `a URL to the human.`,
       };
     }
-    if (url !== undefined && isSensitiveOrigin(url)) {
+    // Exposure-reducing exemption: goBack/goForward/closeTab REDUCE exposure,
+    // so they are not trapped on a sensitive origin (denying them would strand
+    // the agent on a sign-in/payment page). closeTab destroys the tab entirely
+    // (website-allowlist §14). reload stays denied (no escape value; avoids a
+    // reload-hammer loop). All of them remain actions-toggle + persist:agent
+    // gated above.
+    if (url !== undefined && !EXPOSURE_REDUCING_VERBS.has(verb) && isSensitiveOrigin(url)) {
       return {
         allow: false,
         code: 'sensitive-origin-denied',
@@ -287,6 +359,130 @@ export function checkAction(
   }
 
   return { allow: true };
+}
+
+// ── Website-access policy: ONE agent allowlist (plans/website-allowlist-simplification.md) ─
+//
+// PURE (no Electron / DB / I/O — the HARD RULE above). Compiled rules are
+// injected by the manager from the AccessPolicyCache (exactly as apiPort /
+// actionsEnabled are). The single agent allowlist gates agent visits +
+// tool-drive; enforcement is keyed SOLELY to the Agent Actions toggle (the
+// manager only consults checkAgentVisit when actions are enabled — ON ⇒
+// default-deny). There is no second "human hand-off" list and no per-list mode:
+// agent-initiated forHuman opens are OUTSIDE the allowlist entirely (scheme/SSRF
+// floor only, §2). The per-rule `allowSignedIn` flag feeds checkSignedInDrive (§14).
+
+/** A rule compiled from the DB into the shape this module matches against.
+ *  `hostname` is already normalized (lowercased, punycode, no trailing dot, no
+ *  wildcard) — both stored and runtime hostnames come from new URL().hostname,
+ *  so punycode is consistent. */
+export interface CompiledRule {
+  hostname: string;
+  includeSubdomains: boolean;
+  scheme: 'https' | 'http' | 'any';
+  pathPrefix?: string;
+  /** §13/§14: true iff this row opts into authenticated-drive. Optional so
+   *  visit-only contexts can omit it; treated as false when absent. */
+  allowSignedIn?: boolean;
+}
+
+/**
+ * Does `url` match this compiled rule? (website-allowlist §4)
+ *  - unparseable → false;
+ *  - scheme: 'any' allows only http/https (the scheme floor still applies);
+ *    otherwise exact u.protocol === rule.scheme + ':';
+ *  - hostname: trailing dot stripped; includeSubdomains → host === rule.hostname
+ *    || host.endsWith('.' + rule.hostname) (the '.' guard blocks evilgithub.com
+ *    / notgithub.com from matching github.com); else exact equality. IPv6 hosts
+ *    arrive bracketed ([::1]) and compare exactly.
+ *  - port: ignored in v1.
+ *  - pathPrefix: when set and !== '/', require pathname === prefix ||
+ *    pathname.startsWith(prefix + '/'), so /app does not match /apple.
+ */
+export function matchesRule(url: string, rule: CompiledRule): boolean {
+  let u: URL;
+  try {
+    u = new URL(url);
+  } catch {
+    return false;
+  }
+
+  // scheme
+  if (rule.scheme === 'any') {
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
+  } else if (u.protocol !== `${rule.scheme}:`) {
+    return false;
+  }
+
+  // hostname
+  const host = u.hostname.replace(/\.$/, '').toLowerCase();
+  const ruleHost = rule.hostname.toLowerCase();
+  if (rule.includeSubdomains) {
+    if (host !== ruleHost && !host.endsWith(`.${ruleHost}`)) return false;
+  } else if (host !== ruleHost) {
+    return false;
+  }
+
+  // pathPrefix
+  if (rule.pathPrefix !== undefined && rule.pathPrefix !== '' && rule.pathPrefix !== '/') {
+    const prefix = rule.pathPrefix;
+    const withSlash = prefix.endsWith('/') ? prefix : `${prefix}/`;
+    const path = u.pathname;
+    if (path !== prefix && !path.startsWith(withSlash)) return false;
+  }
+
+  return true;
+}
+
+/** First rule in `rules` that matches `url`, else undefined. */
+export function findMatchingRule(url: string, rules: CompiledRule[]): CompiledRule | undefined {
+  return rules.find((r) => matchesRule(url, r));
+}
+
+/** Suffix appended to agent-allowlist denials so the agent discovers the
+ *  request-and-approve path exactly when it hits the wall (§18.3). */
+export const REQUEST_ACCESS_HINT =
+  ' You may request access for the human to approve via browser_request_site_access.';
+
+/** §4: may the agent VISIT / drive this url? Deny-by-default unless an agent
+ *  allowlist rule matches. Enforcement is keyed to the Agent Actions toggle:
+ *  the manager calls this ONLY when actions are enabled (Agent Actions ON ⇒
+ *  allowlist enforced). When Agent Actions is OFF the agent cannot act in its
+ *  partition at all (checkAction denies first), so this is never reached. */
+export function checkAgentVisit(
+  url: string,
+  ctx: { rules: CompiledRule[] },
+): PolicyDecision {
+  if (findMatchingRule(url, ctx.rules)) return { allow: true };
+  return {
+    allow: false,
+    code: 'agent-allowlist-denied',
+    reason: `This origin is not on the agent allowlist.${REQUEST_ACCESS_HINT}`,
+  };
+}
+
+/**
+ * §14: may the agent DRIVE an authenticated session for this url? True iff an
+ * allowlist rule with allowSignedIn matches. The flag is a capability GRANT,
+ * not an enforcement toggle: a handed persist:user tab (Mechanism B) or a
+ * re-validated sign-in tab (Mechanism A) is drivable only while its committed
+ * origin is still an allow_signed_in row. Shared by both mechanisms (§12-A
+ * revalidation, §12-B isAgentDrivable + tab-hand-to-agent validation).
+ */
+export function checkSignedInDrive(
+  url: string,
+  ctx: { rules: CompiledRule[] },
+): PolicyDecision {
+  const match = findMatchingRule(
+    url,
+    ctx.rules.filter((r) => r.allowSignedIn === true),
+  );
+  if (match) return { allow: true };
+  return {
+    allow: false,
+    code: 'agent-allowlist-denied',
+    reason: 'This origin is not an "allow while signed in" agent allowlist rule.',
+  };
 }
 
 // ── M12: untrusted-content framing ──────────────────────────────────────────

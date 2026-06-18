@@ -1,8 +1,13 @@
-import React, { useEffect } from 'react';
-import { useBrowserStore, getBrowserApi, ensureBrowserBridge } from '../../stores/browser-store';
+import React, { useEffect, useMemo } from 'react';
+import { useBrowserStore, getBrowserApi, ensureBrowserBridge, selectVisibleTabs } from '../../stores/browser-store';
 import BrowserTabStrip from './BrowserTabStrip';
 import AddressBar from './AddressBar';
 import BrowserViewHost from './BrowserViewHost';
+import BookmarksBar from './BookmarksBar';
+import FindBar from './FindBar';
+import HistoryView from './HistoryView';
+import WebsiteAccessSettings from './WebsiteAccessSettings';
+import SigninHandoffBanner from './SigninHandoffBanner';
 import * as Icons from 'lucide-react';
 
 // Center-panel browser pane (WP1-B). All chrome (tab strip, address bar,
@@ -10,9 +15,23 @@ import * as Icons from 'lucide-react';
 // over renderer DOM, so chrome must never overlap the host div. The URL is
 // rendered here in shell chrome, which is what makes it unspoofable by page
 // or model output (M9/WP2 rely on this).
+//
+// WP1-TABS: the chrome is wrapped in .browser-chrome (token-backed, light+dark)
+// and reserves two insertion slots between the AddressBar and the host:
+//   • BOOKMARKS-BAR slot — WP3 (BookmarksBar, .bookmark-bar).
+//   • FIND-BAR slot      — WP5 (FindBar), a slim bar above the host.
+// Both are intentionally empty placeholders now.
 
 export default function BrowserPanel() {
-  const tabs = useBrowserStore((s) => s.tabs);
+  // Per-workspace isolation: only this workspace's tabs are visible here.
+  // (Subscribe to the raw inputs + memo so we don't return a fresh array on
+  // every unrelated store change.)
+  const allTabs = useBrowserStore((s) => s.tabs);
+  const selectedWorkspaceId = useBrowserStore((s) => s.selectedWorkspaceId);
+  const tabs = useMemo(
+    () => selectVisibleTabs({ tabs: allTabs, selectedWorkspaceId }),
+    [allTabs, selectedWorkspaceId],
+  );
   const activeTabId = useBrowserStore((s) => s.activeTabId);
   const pendingOpenUrl = useBrowserStore((s) => s.pendingOpenUrl);
   const acceptOpenRequest = useBrowserStore((s) => s.acceptOpenRequest);
@@ -29,15 +48,15 @@ export default function BrowserPanel() {
   }, [clearPaneAttention]);
 
   return (
-    <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
+    <div className="browser-chrome flex-1 flex flex-col min-w-0 overflow-hidden">
       {!apiPresent ? (
-        <div className="flex-1 flex items-center justify-center text-gray-500">
+        <div className="flex-1 flex items-center justify-center text-fg-muted">
           <div className="text-center max-w-md px-6">
-            <Icons.Globe className="w-8 h-8 mx-auto mb-3 text-gray-600" />
+            <Icons.Globe className="w-8 h-8 mx-auto mb-3 text-fg-muted" />
             <div className="text-[13px]">
               Browser backend not available — <code>window.api.browser</code> is missing.
             </div>
-            <div className="text-[11px] mt-2 text-gray-600">
+            <div className="text-[11px] mt-2 text-fg-muted">
               The main-process side (WP1-A) hasn't been built into this running app yet.
               Rebuild and restart once it lands.
             </div>
@@ -47,11 +66,25 @@ export default function BrowserPanel() {
         <>
           <BrowserTabStrip />
           <AddressBar tab={activeTab} />
+
+          {/* ── BOOKMARKS BAR (WP3 BookmarksBar) — between the address bar and
+              the host; self-gates on bookmarkBarVisible. ── */}
+          <BookmarksBar />
+
+          {/* ── FIND BAR (WP5 FindBar) — slim bar above the host (no paint-over
+              hazard); self-gates on findOpen. ── */}
+          <FindBar />
+
+          {/* ── SIGN-IN HAND-OFF banner (§15) — four-point consent, shown in the
+              chrome (NOT the pane-suspending overlay) while the visible
+              quarantined login tab is up. Self-gates on signinHandoff. ── */}
+          <SigninHandoffBanner />
+
           {pendingOpenUrl && (
-            <div className="flex items-center gap-2 px-3 py-1.5 border-b border-gray-700/50 bg-accent-orange/10 text-[12px] text-gray-200 shrink-0">
+            <div className="flex items-center gap-2 px-3 py-1.5 border-b border-browser-divider bg-accent-orange/10 text-[12px] text-fg-primary shrink-0">
               <Icons.ExternalLink className="w-3.5 h-3.5 text-accent-orange shrink-0" />
               <span className="truncate flex-1">
-                Page tried to open a new window: <span className="text-gray-400">{pendingOpenUrl}</span>
+                Page tried to open a new window: <span className="text-fg-secondary">{pendingOpenUrl}</span>
               </span>
               <button
                 onClick={() => void acceptOpenRequest()}
@@ -67,25 +100,32 @@ export default function BrowserPanel() {
               </button>
             </div>
           )}
-          {tabs.length === 0 ? (
-            <div className="flex-1 flex items-center justify-center text-gray-500">
-              <div className="text-center">
-                <div className="text-[13px] mb-3">No tabs open</div>
-                <button
-                  onClick={() => void createTab('user')}
-                  className="ui-btn ui-btn-primary px-3 py-1.5 text-[13px] font-medium"
-                >
-                  <Icons.Plus className="w-4 h-4" />
-                  New tab
-                </button>
-                <div className="text-[11px] mt-3 text-gray-600">
-                  sign-ins persist in your partition; agent tabs are isolated
+          {/* Host area is the positioning context for the HistoryView overlay,
+              which paints absolute inset-0 over the page region (and suspends
+              the WebContentsView via useBrowserSuspension) while open. */}
+          <div className="relative flex-1 flex flex-col min-h-0">
+            {tabs.length === 0 ? (
+              <div className="flex-1 flex items-center justify-center text-fg-muted">
+                <div className="text-center">
+                  <div className="text-[13px] mb-3">No tabs open</div>
+                  <button
+                    onClick={() => void createTab('user')}
+                    className="ui-btn ui-btn-primary px-3 py-1.5 text-[13px] font-medium"
+                  >
+                    <Icons.Plus className="w-4 h-4" />
+                    New tab
+                  </button>
+                  <div className="text-[11px] mt-3 text-fg-muted">
+                    sign-ins persist in your partition; agent tabs are isolated
+                  </div>
                 </div>
               </div>
-            </div>
-          ) : (
-            <BrowserViewHost />
-          )}
+            ) : (
+              <BrowserViewHost />
+            )}
+            <HistoryView />
+            <WebsiteAccessSettings />
+          </div>
         </>
       )}
     </div>

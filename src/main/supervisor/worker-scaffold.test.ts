@@ -50,6 +50,7 @@ function rmrf(dir: string): void {
 
 type SupervisorWithScaffold = {
   ensureWorkerScaffold: (workDir: string, provider: string, pathType: string) => void;
+  ensureSupervisorScaffold: (workDir: string, pathType: string) => void;
 };
 
 function makeSupervisor(): { supervisor: SupervisorWithScaffold; cleanup: () => void } {
@@ -217,6 +218,123 @@ test('Claude: scaffold writes .claude/settings.json verbatim (no path materializ
       !fs.existsSync(codexConfig),
       `claude scaffold should not create ${codexConfig}`,
     );
+  } finally {
+    cleanup();
+    rmrf(workDir);
+  }
+});
+
+test('Claude: scaffold seeds the shared behavioral.md worker memory', () => {
+  const workDir = mktmp('claude-worker-memory');
+  const { supervisor, cleanup } = makeSupervisor();
+  try {
+    supervisor.ensureWorkerScaffold(workDir, 'claude', 'windows');
+
+    const memPath = path.join(workDir, '.dashboard', 'workers', 'claude', 'behavioral.md');
+    assert.ok(fs.existsSync(memPath), `expected ${memPath}`);
+
+    const content = fs.readFileSync(memPath, 'utf-8');
+    assert.ok(
+      content.includes('# Worker Behavioral Memory'),
+      `behavioral.md should carry the seed header; got: ${content.slice(0, 120)}`,
+    );
+    // Behavioral-only contract must be stated so workers don't dump task state.
+    assert.ok(
+      content.includes('Behavioral, not project'),
+      'behavioral.md seed should state the behavioral-not-project rule',
+    );
+  } finally {
+    cleanup();
+    rmrf(workDir);
+  }
+});
+
+test('Claude: behavioral.md is never overwritten once a worker has edited it', () => {
+  const workDir = mktmp('claude-worker-memory-durable');
+  const { supervisor, cleanup } = makeSupervisor();
+  try {
+    // First launch seeds it.
+    supervisor.ensureWorkerScaffold(workDir, 'claude', 'windows');
+    const memPath = path.join(workDir, '.dashboard', 'workers', 'claude', 'behavioral.md');
+
+    // A worker appends a lesson — exactly the edit the scaffold must preserve.
+    const appended = '\n\n## WB-99: test-appended lesson — must survive relaunch\n';
+    fs.appendFileSync(memPath, appended, 'utf-8');
+
+    // Second launch (relaunch / another worker) must leave the edit untouched —
+    // unlike the version-managed CLAUDE.md, this file is seed-once.
+    supervisor.ensureWorkerScaffold(workDir, 'claude', 'windows');
+
+    const after = fs.readFileSync(memPath, 'utf-8');
+    assert.ok(
+      after.includes('WB-99: test-appended lesson'),
+      'worker-appended entry must survive a second scaffold pass',
+    );
+    // And no .bak file was spawned for it (managed-file overwrite signature).
+    const dir = path.dirname(memPath);
+    const baks = fs.readdirSync(dir).filter((f) => f.startsWith('behavioral.md.bak'));
+    assert.equal(baks.length, 0, `behavioral.md must not be backed up/overwritten; found: ${baks.join(', ')}`);
+  } finally {
+    cleanup();
+    rmrf(workDir);
+  }
+});
+
+test('Supervisor: scaffold seeds memory/MEMORY.md', () => {
+  const workDir = mktmp('supervisor-memory');
+  const { supervisor, cleanup } = makeSupervisor();
+  try {
+    supervisor.ensureSupervisorScaffold(workDir, 'windows');
+
+    const memPath = path.join(workDir, '.dashboard', 'supervisor', 'memory', 'MEMORY.md');
+    assert.ok(fs.existsSync(memPath), `expected ${memPath}`);
+
+    const content = fs.readFileSync(memPath, 'utf-8');
+    assert.ok(
+      content.includes('# Supervisor Memory'),
+      `MEMORY.md should carry the seed header; got: ${content.slice(0, 120)}`,
+    );
+  } finally {
+    cleanup();
+    rmrf(workDir);
+  }
+});
+
+test('Supervisor: MEMORY.md is seed-once — an edited copy survives relaunch byte-identical, no .bak', () => {
+  // Regression guard: MEMORY.md must NOT live in the version-managed
+  // SUPERVISOR_FILES map. If it did, a future SUPERVISOR_MEMORY_MD version
+  // bump would treat an edited MEMORY.md as "user-modified, unknown hash" and
+  // `.bak` + overwrite it, wiping accumulated supervisor memory. The seed-once
+  // contract (seedSupervisorMemoryIfAbsent) means a second scaffold pass never
+  // touches an existing file regardless of any notional version change.
+  const workDir = mktmp('supervisor-memory-durable');
+  const { supervisor, cleanup } = makeSupervisor();
+  try {
+    // First launch seeds it.
+    supervisor.ensureSupervisorScaffold(workDir, 'windows');
+    const memPath = path.join(workDir, '.dashboard', 'supervisor', 'memory', 'MEMORY.md');
+
+    // The supervisor (or human) curates memory across sessions — simulate an
+    // edit that the scaffold must preserve verbatim.
+    const edited = '# Supervisor Memory\n\n- [SM-99] curated note that must survive relaunch\n';
+    fs.writeFileSync(memPath, edited, 'utf-8');
+    const before = fs.readFileSync(memPath); // raw bytes
+
+    // Second launch (relaunch / re-open workspace). Even if SUPERVISOR_MEMORY_MD
+    // were bumped to a new version, MEMORY.md is no longer in the managed map,
+    // so this pass must leave the edit untouched.
+    supervisor.ensureSupervisorScaffold(workDir, 'windows');
+
+    const after = fs.readFileSync(memPath);
+    assert.ok(
+      before.equals(after),
+      `edited MEMORY.md must survive a second scaffold pass byte-identical; before=${before.length}B after=${after.length}B`,
+    );
+
+    // And no .bak file was spawned for it (the managed-file overwrite signature).
+    const dir = path.dirname(memPath);
+    const baks = fs.readdirSync(dir).filter((f) => f.startsWith('MEMORY.md.bak'));
+    assert.equal(baks.length, 0, `MEMORY.md must not be backed up/overwritten; found: ${baks.join(', ')}`);
   } finally {
     cleanup();
     rmrf(workDir);

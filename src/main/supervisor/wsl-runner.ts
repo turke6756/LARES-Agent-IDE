@@ -5,6 +5,7 @@ import path from 'path';
 import { tmuxNewSession, tmuxKillSession, isTmuxSessionAlive, tmuxCapturePane, wslExec, buildTmuxAttachCmd, tmuxWaitForSession, TmuxNewSessionResult } from '../wsl-bridge';
 import { getScriptPath } from './paths';
 import { sanitizeClaudeChildEnv } from './env-sanitize';
+import { redactMcpToken } from './mcp-config-builder';
 
 /** BUG-22 Step 1 diagnostic metadata passed from `launchWslAgent` so the
  *  runner can append one complete JSONL record per launch attempt once the
@@ -22,6 +23,10 @@ export interface WslLaunchDiagnostics {
   isSupervised: boolean;
   resume: boolean;
   freshSession: boolean;
+  /** D-4/F10 — when set, the runner redacts this secret (the API bearer token)
+   *  from the rendered command before persisting it to launches.log or writing
+   *  the tmux failure header. The live command used for tmux/PTY is unchanged. */
+  redactSecret?: string | null;
 }
 
 /** BUG-22 Step 1 diagnostic: the failure-header block prepended to the agent's
@@ -275,7 +280,14 @@ export class WslRunner extends EventEmitter {
   ): Promise<void> {
     this._diagnostics = diagnostics;
     this._launchWorkDir = workDir;
-    this._launchCommand = command;
+    // D-4/F10: store a REDACTED copy of the command for every serialization sink
+    // (launches.log JSONL via buildLaunchRecord, the tmux failure header, and the
+    // tmuxNewSessionFailed event/audit row). The real `command` local is used
+    // only for the live tmux create + PTY attach below and is never persisted.
+    const safeCommand = diagnostics?.redactSecret
+      ? redactMcpToken(command, diagnostics.redactSecret)
+      : command;
+    this._launchCommand = safeCommand;
     this._tmuxResult = null;
     this._attachAttempted = false;
     this._attachWaitMs = undefined;
@@ -304,7 +316,8 @@ export class WslRunner extends EventEmitter {
         tmuxSessionName: this.sessionName,
         tmuxExitCode: tmuxResult.exitCode,
         tmuxStderr: tmuxResult.stderr,
-        command,
+        // D-4/F10: redacted copy — this header is written to the PTY log + ring.
+        command: safeCommand,
       });
       if (logPath) {
         try {
@@ -323,7 +336,8 @@ export class WslRunner extends EventEmitter {
       // session` and exit 1, which carries normal crashed-status semantics.
       this.emit('tmuxNewSessionFailed', {
         tmuxSessionName: this.sessionName,
-        command,
+        // D-4/F10: redacted — index.ts forwards this to an audit row + bridge.
+        command: safeCommand,
         tmuxExitCode: tmuxResult.exitCode,
         tmuxStderr: tmuxResult.stderr,
         tmuxCommand: tmuxResult.tmuxCommand,
@@ -395,12 +409,26 @@ export class WslRunner extends EventEmitter {
     this._launchRecordWritten = true;
     const diag = this._diagnostics;
     if (!diag || !diag.launchesLogPath) return;
+    // D-4/F10: `command` is already the redacted copy (set in launch()), but the
+    // tmux result's `tmuxCommand` base64-envelopes the FULL command (token and
+    // all) and its stdout/stderr could echo it. Redact the whole tmux result
+    // before it is serialized into launches.log. `redactMcpToken` strips both
+    // the literal token and the `echo <b64> | base64 -d` envelope.
+    const secret = diag.redactSecret;
+    const safeTmuxResult = this._tmuxResult
+      ? {
+          ...this._tmuxResult,
+          tmuxCommand: redactMcpToken(this._tmuxResult.tmuxCommand, secret ?? ''),
+          stdout: secret ? redactMcpToken(this._tmuxResult.stdout, secret) : this._tmuxResult.stdout,
+          stderr: secret ? redactMcpToken(this._tmuxResult.stderr, secret) : this._tmuxResult.stderr,
+        }
+      : null;
     const record = buildLaunchRecord({
       diagnostics: diag,
       sessionName: this.sessionName,
       workDir: this._launchWorkDir,
       command: this._launchCommand,
-      tmuxResult: this._tmuxResult,
+      tmuxResult: safeTmuxResult,
       attachAttempted: this._attachAttempted,
       attachExitCode,
       attachSignal,

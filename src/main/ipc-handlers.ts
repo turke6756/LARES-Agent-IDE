@@ -1,7 +1,10 @@
 import { ipcMain, dialog, shell, BrowserWindow, nativeTheme } from 'electron';
+import type { WebContents } from 'electron';
 import * as fs from 'fs';
 import { persistTheme } from './theme-persistence';
-import type { PathType, FsEvent } from '../shared/types';
+import type { PathType, FsEvent, DetachRequest, DetachResult } from '../shared/types';
+import { TAB_CHANNELS } from '../shared/types';
+import { createDetachedWindow, canWrite, handleDetachedCloseReply, type DetachedWindowDeps } from './detached-windows';
 import { AgentSupervisor } from './supervisor';
 import {
   getWorkspaces, createWorkspace, deleteWorkspace, getWorkspace, reorderWorkspaces,
@@ -10,7 +13,11 @@ import {
   createTeam, getTeam, listTeams, updateTeamStatus, addTeamMember, removeTeamMember,
   createChannel, removeChannel, getTeamMessages, getTeamTasks, createTeamTask, updateTeamTask,
   listAgentTemplates, createAgentTemplate, updateAgentTemplate, deleteAgentTemplate,
+  createSelectionComment, getSelectionComment, listSelectionComments, updateSelectionComment,
+  deleteSelectionComment, resolveSelectionComment,
+  markSelectionCommentsQueued, markSelectionCommentsSent, markSelectionCommentsSendFailed,
 } from './database';
+import { sendSelectionComments } from './selection-comments-send';
 import { getApiToken } from './security/api-auth';
 import { openInVSCode, openFileInVSCode, openFileInWorkspace } from './vscode-launcher';
 import { getPassiveWslStatus, isTmuxAvailable, isClaudeAvailableInWsl } from './wsl-bridge';
@@ -29,7 +36,11 @@ function resolveMutationPathType(primaryPath: string, rootDirectory: string, pat
   return pathType === 'windows' || pathType === 'wsl' ? pathType : primaryType;
 }
 
-export function registerIpcHandlers(supervisor: AgentSupervisor, mainWindow: BrowserWindow): void {
+export function registerIpcHandlers(
+  supervisor: AgentSupervisor,
+  mainWindow: BrowserWindow,
+  detachedWindowDeps: DetachedWindowDeps,
+): void {
   // Workspace handlers
   ipcMain.handle('workspace:list', () => getWorkspaces());
   ipcMain.handle('workspace:create', (_e, input) => createWorkspace(input));
@@ -173,6 +184,44 @@ export function registerIpcHandlers(supervisor: AgentSupervisor, mainWindow: Bro
     return team;
   });
 
+  // Selection comment handlers (WP-P5-A) — CRUD next to the DB; `comments:send`
+  // runs the queued/sent/send_failed status machine in main (plan §1.8).
+  ipcMain.handle('comments:create', (_e, input) => createSelectionComment(input));
+  ipcMain.handle('comments:list', (_e, workspaceId, filePath) => listSelectionComments(workspaceId, filePath));
+  ipcMain.handle('comments:update', (_e, id, updates) => updateSelectionComment(id, updates));
+  ipcMain.handle('comments:delete', (_e, id) => deleteSelectionComment(id));
+  ipcMain.handle('comments:resolve', (_e, id) => resolveSelectionComment(id));
+  ipcMain.handle('comments:send', (_e, request) =>
+    sendSelectionComments(
+      {
+        getComment: getSelectionComment,
+        getAgent,
+        isInputInFlight: (agentId) => supervisor.isInputInFlight(agentId),
+        sendInput: (agentId, text) => supervisor.sendInput(agentId, text),
+        launchAgent: (input) => supervisor.launchAgent(input),
+        markQueued: markSelectionCommentsQueued,
+        markSent: markSelectionCommentsSent,
+        markSendFailed: markSelectionCommentsSendFailed,
+        // Async delivery failures share the chat-input error surface (the
+        // renderer chat input already renders these inline).
+        onAsyncSendError: (payload) => {
+          console.error(`[comments] Background send to ${payload.agentId} failed:`, payload.error);
+          if (!mainWindow.isDestroyed()) {
+            mainWindow.webContents.send('agent:send-input-error', payload);
+          }
+        },
+        onCommentsChanged: (commentIds) => {
+          if (!mainWindow.isDestroyed()) {
+            const comments = commentIds
+              .map((id) => getSelectionComment(id))
+              .filter((c): c is NonNullable<typeof c> => c !== null);
+            mainWindow.webContents.send('comments:changed', { comments });
+          }
+        },
+      },
+      request,
+    ));
+
   // Persona handlers
   ipcMain.handle('persona:list', (_e, workspacePath, pathType) => scanPersonas(workspacePath, pathType));
   ipcMain.handle('persona:create', (_e, workspacePath, pathType, name, customClaudeMd?) => scaffoldPersona(workspacePath, pathType, name, customClaudeMd));
@@ -278,6 +327,20 @@ export function registerIpcHandlers(supervisor: AgentSupervisor, mainWindow: Bro
     return await listKernelspecs();
   });
 
+  // Detachable file tabs (detachable-file-tabs-plan §4 1.4) — spawn a trusted,
+  // editable detached window that owns the dragged-out file.
+  ipcMain.handle(TAB_CHANNELS.detach, (_e, req: DetachRequest): DetachResult =>
+    createDetachedWindow(req, detachedWindowDeps));
+
+  // Phase 2 dirty-on-close: the detached renderer replies here with the user's
+  // decision after a close-query. 'save' arrives only after the renderer has
+  // persisted the buffer; main just closes (or keeps open on 'cancel').
+  ipcMain.handle(
+    TAB_CHANNELS.closeReply,
+    (_e, requestId: string, decision: 'save' | 'discard' | 'cancel') =>
+      handleDetachedCloseReply(requestId, decision),
+  );
+
   // File viewer handlers
   ipcMain.handle('files:read', async (_e, filePath, pathType) => {
     return await readFileContents(filePath, pathType || detectPathType(filePath));
@@ -292,7 +355,13 @@ export function registerIpcHandlers(supervisor: AgentSupervisor, mainWindow: Bro
     }
   });
 
-  ipcMain.handle('files:write', async (_e, filePath, rootDirectory, pathType, content) => {
+  ipcMain.handle('files:write', async (event, filePath, rootDirectory, pathType, content) => {
+    // Single-writer enforcement (detachable-file-tabs-plan §1 Claim 2): if the
+    // file is owned by a detached window, only that webContents may write it.
+    // The authoritative backstop behind the best-effort focus-existing UX.
+    if (!canWrite(filePath, event.sender.id)) {
+      return { ok: false, error: 'File is open in a detached window; edit it there.' };
+    }
     const resolved = resolveMutationPathType(filePath, rootDirectory, pathType);
     return await writeFileContents(filePath, rootDirectory, resolved, content);
   });
@@ -360,45 +429,62 @@ export function registerIpcHandlers(supervisor: AgentSupervisor, mainWindow: Bro
   // Live file watcher — one entry per subscription id, keyed across renderers.
   // Events are batched per-id with a short debounce so a 1000-file change produces
   // a handful of IPC messages instead of a thousand.
-  const activeFileWatches = new Map<string, () => void>();
+  //
+  // Per-sender routing (detachable-file-tabs-plan §4 1.4 / Reviewer #3): each
+  // entry remembers the subscribing webContents so a detached window receives
+  // its OWN fs-watch updates (the old code flushed only to mainWindow, so a
+  // detached renderer got none). A sender that is destroyed (window closed
+  // without an explicit watch-stop) is unsubscribed and dropped.
+  const activeFileWatches = new Map<string, { unsub: () => void; sender: WebContents }>();
   const FS_EVENT_BATCH_MS = 50;
   const pendingFsEvents = new Map<string, FsEvent[]>();
   let flushTimer: NodeJS.Timeout | null = null;
   const flushFsEvents = () => {
     flushTimer = null;
-    if (mainWindow.isDestroyed()) {
-      pendingFsEvents.clear();
-      return;
-    }
     for (const [id, events] of pendingFsEvents) {
-      if (events.length > 0) mainWindow.webContents.send('files:watch-event', { id, events });
+      const entry = activeFileWatches.get(id);
+      if (entry && !entry.sender.isDestroyed() && events.length > 0) {
+        entry.sender.send('files:watch-event', { id, events });
+      }
     }
     pendingFsEvents.clear();
   };
-  ipcMain.handle('files:watch-start', (_e, id: string, dirPath: string, pathType) => {
+  const stopWatch = (id: string) => {
+    const entry = activeFileWatches.get(id);
+    if (entry) {
+      try { entry.unsub(); } catch { /* ignore */ }
+      activeFileWatches.delete(id);
+    }
+    pendingFsEvents.delete(id);
+  };
+  ipcMain.handle('files:watch-start', (event, id: string, dirPath: string, pathType) => {
     if (activeFileWatches.has(id)) return;
+    const sender = event.sender;
     const resolved = pathType || detectPathType(dirPath);
-    const unsub = subscribeFsWatch(dirPath, resolved, (event) => {
-      if (mainWindow.isDestroyed()) return;
+    const unsub = subscribeFsWatch(dirPath, resolved, (fsEvent) => {
+      if (sender.isDestroyed()) return;
       let queue = pendingFsEvents.get(id);
       if (!queue) {
         queue = [];
         pendingFsEvents.set(id, queue);
       }
-      queue.push(event);
+      queue.push(fsEvent);
       if (flushTimer === null) flushTimer = setTimeout(flushFsEvents, FS_EVENT_BATCH_MS);
     });
-    activeFileWatches.set(id, unsub);
+    activeFileWatches.set(id, { unsub, sender });
+    // Covers a detached-window close that never sends watch-stop. Guarded so it
+    // won't double-unsub if watch-stop already replaced/removed this entry.
+    sender.once('destroyed', () => {
+      if (activeFileWatches.get(id)?.sender === sender) stopWatch(id);
+    });
   });
   ipcMain.handle('files:watch-stop', (_e, id: string) => {
-    const unsub = activeFileWatches.get(id);
-    if (unsub) { unsub(); activeFileWatches.delete(id); }
-    pendingFsEvents.delete(id);
+    stopWatch(id);
   });
   mainWindow.on('closed', () => {
     if (flushTimer !== null) { clearTimeout(flushTimer); flushTimer = null; }
     pendingFsEvents.clear();
-    for (const unsub of activeFileWatches.values()) {
+    for (const { unsub } of activeFileWatches.values()) {
       try { unsub(); } catch { /* ignore */ }
     }
     activeFileWatches.clear();

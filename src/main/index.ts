@@ -1,4 +1,4 @@
-import { app, BrowserWindow, crashReporter, dialog, protocol, net, session, shell, nativeTheme } from 'electron';
+import { app, BrowserWindow, crashReporter, dialog, protocol, net, session, nativeTheme } from 'electron';
 import path from 'path';
 import fs from 'fs';
 import { loadPersistedTheme } from './theme-persistence';
@@ -8,6 +8,7 @@ import { checkManagedWebContents } from './security/webcontents-guard';
 import { resolveConfined } from './security/path-confinement';
 import { AgentSupervisor } from './supervisor';
 import { registerIpcHandlers } from './ipc-handlers';
+import { installExternalNavHandlers, forceCloseAllDetached, type DetachedWindowDeps } from './detached-windows';
 import { WsServer } from './ws-server';
 import { ApiServer, type BrowserToolProvider } from './api-server';
 import { OrchestrationService } from './orchestration/service';
@@ -117,6 +118,19 @@ let mainWindow: BrowserWindow | null = null;
 // shell during its own construction (needed since the shell now runs
 // sandbox:false, which otherwise trips the insecure-contents log).
 let constructingShell = false;
+// Trusted preload-bearing contexts beyond the shell — detached file-tab
+// windows (detachable-file-tabs-plan §4 1.3). A detached BrowserWindow's
+// 'web-contents-created' fires synchronously inside its constructor (before any
+// post-construction add can run), so `constructingDetached` exempts it during
+// its own construction exactly like `constructingShell` does for the shell;
+// trustedContents then holds it after load (added BEFORE load, removed on close).
+const trustedContents = new Set<Electron.WebContents>();
+let constructingDetached = false;
+// Resolved Vite dev-server origin (e.g. http://localhost:5173) once discovered
+// in createWindow(), else null (packaged / no dev server → detached windows
+// loadFile the built index.html). Threaded into the detached-window deps so a
+// tear-off window loads from the same place the shell did.
+let devServerUrl: string | null = null;
 let supervisor: AgentSupervisor | null = null;
 let wsServer: WsServer | null = null;
 let apiServer: ApiServer | null = null;
@@ -154,8 +168,10 @@ app.on('web-contents-created', (_e, contents) => {
   contents.on('will-attach-webview', (e) => e.preventDefault());
 
   const isShell =
-    constructingShell || (mainWindow !== null && contents === mainWindow.webContents);
-  if (isShell) return; // the shell legitimately carries the dashboard preload
+    constructingShell || constructingDetached ||
+    (mainWindow !== null && contents === mainWindow.webContents) ||
+    trustedContents.has(contents);
+  if (isShell) return; // the shell / detached windows legitimately carry the dashboard preload
 
   // getLastWebPreferences() is not in the TS types — deliberate cast (see the
   // anchors table in plans/embedded-browser-implementation-tasks.md).
@@ -263,6 +279,9 @@ function createWindow(): void {
     },
   });
   constructingShell = false;
+  // The shell carries the dashboard preload — mark it trusted now that its
+  // webContents exists (the constructingShell flag covered its construction).
+  trustedContents.add(mainWindow.webContents);
 
   // Try Vite dev server first (check multiple ports), fall back to built files
   const builtFile = path.join(__dirname, '..', '..', 'renderer', 'index.html');
@@ -283,7 +302,8 @@ function createWindow(): void {
       for (const port of [5173, 5174, 5175]) {
         if (await tryPort(port)) {
           console.log(`Dev server found on port ${port}`);
-          mainWindow!.loadURL(`http://localhost:${port}`);
+          devServerUrl = `http://localhost:${port}`;
+          mainWindow!.loadURL(devServerUrl);
           return;
         }
       }
@@ -299,43 +319,17 @@ function createWindow(): void {
   // Externalize all link navigation. Without this, clicking an http(s) link
   // inside a markdown view replaces the dashboard with the external page and
   // there's no way back — closing the window to escape kills every agent.
-  const isInternalUrl = (url: string): boolean => {
-    if (url.startsWith('file://')) return true;
-    try {
-      const u = new URL(url);
-      const isLoopback = u.hostname === 'localhost' || u.hostname === '127.0.0.1';
-      if (!isLoopback) return false;
-      const port = Number(u.port);
-      // Vite dev server ports
-      if (port >= 5173 && port <= 5175) return true;
-      // Embedded Jupyter server ports
-      if (port >= JUPYTER_BASE_PORT && port <= JUPYTER_BASE_PORT + JUPYTER_PORT_RETRIES) return true;
-      return false;
-    } catch {
-      return false;
-    }
-  };
-
-  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    if (url.startsWith('http://') || url.startsWith('https://')) {
-      void shell.openExternal(url);
-    }
-    return { action: 'deny' };
-  });
-
-  mainWindow.webContents.on('will-navigate', (event, url) => {
-    if (isInternalUrl(url)) return;
-    event.preventDefault();
-    if (url.startsWith('http://') || url.startsWith('https://')) {
-      void shell.openExternal(url);
-    }
-  });
+  // Shared with detached windows (detachable-file-tabs-plan §4 1.3); the shell
+  // behavior is unchanged by the extraction.
+  installExternalNavHandlers(mainWindow);
 
   if (!app.isPackaged) {
     mainWindow.webContents.openDevTools({ mode: 'detach' });
   }
 
+  const shellContents = mainWindow.webContents;
   mainWindow.on('closed', () => {
+    trustedContents.delete(shellContents);
     mainWindow = null;
   });
 }
@@ -448,7 +442,18 @@ app.whenReady().then(async () => {
 
     supervisor = new AgentSupervisor();
     createWindow();
-    registerIpcHandlers(supervisor, mainWindow!);
+    // Detached-window deps (detachable-file-tabs-plan §4 1.3/1.4). devServerUrl
+    // and theme are read live via getters so a tear-off spawned long after
+    // startup loads from the right origin and matches the current theme.
+    const detachedWindowDeps: DetachedWindowDeps = {
+      get devServerUrl() { return devServerUrl; },
+      builtIndexHtml: path.join(__dirname, '..', '..', 'renderer', 'index.html'),
+      get theme() { return loadPersistedTheme(); },
+      trustedContents,
+      setConstructingDetached: (v: boolean) => { constructingDetached = v; },
+      getMainWindow: () => mainWindow,
+    };
+    registerIpcHandlers(supervisor, mainWindow!, detachedWindowDeps);
     supervisor.start();
     wsServer = new WsServer(supervisor);
     wsServer.start();
@@ -503,6 +508,9 @@ let drainCompleted = false;
 async function shutdownApp(): Promise<void> {
   if (shutdownStarted) return;
   shutdownStarted = true;
+  // Let any detached windows close without the dirty-on-close prompt so the
+  // 'close' intercept can't deadlock quit (detachable-file-tabs-plan §2.2).
+  forceCloseAllDetached();
   // Stop monitors BEFORE draining: a live StatusMonitor poll tick can infer
   // 'crashed' for a drained agent and auto-restart it mid-quit. (The
   // handleAutoRestart shuttingDown guard is the belt; this is the braces.)

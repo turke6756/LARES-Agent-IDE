@@ -18,6 +18,46 @@ Format per bug:
 
 ---
 
+## BUG-37: GroupThink serial `waitTurnComplete` false-stalls AND is un-resumable when the codex Reviewer finishes — same root cause as BUG-28 (codex chat-blackout), now in `groupthink-v2.ts`
+
+- Component: `src/main/orchestration/groupthink-v2.ts:169-203` (`waitTurnComplete`) + the BUG-28 codex-sid-discovery / chat-read pipeline (`src/main/api-server.ts:150-158`, `src/main/supervisor/index.ts` `resolveCodexResumeSessionId`).
+- Severity: high — silently breaks serial GroupThink whenever the codex Reviewer's discovery race is lost; the run stalls with `reason:timeout` despite a complete, high-quality review on disk, and the documented one-call resume re-stalls identically, so there is no in-band recovery.
+- Status: open — reproduced live 2026-06-17, runId `50a54895` (serial; Lead=claude `7078d8d3`, Reviewer=codex `8086b256`; topic = harden plans/detachable-file-tabs.md).
+- Mechanism: `waitTurnComplete` (correctly, per its docstring) treats the message stream's `turnComplete` flag as source of truth and consults `agent.status` only to reset the stall clock while `working`. When BUG-28 strikes (codex `resumeSessionId` stays null → `/api/agents/<id>/messages?role=assistant` returns `[]` even though the rollout JSONL holds the full turn), `readNextMessage` returns null for the entire window; the Reviewer's status flips `working→idle` (turn genuinely done) so the stall clock is never reset; at the 600s deadline the `status==='idle'` branch throws `"Timeout waiting for <label> (<id>) to complete turn (agent.status=idle)"`. We confirmed the review WAS complete: `read_agent_chat(8086b256, role:'assistant')` returned a `turnComplete:true` 7-point critique — but only AFTER the stall (sid bound late). **Resume re-enters the same `waitTurnComplete` against the still-blacked-out (or already-emitted, non-"new") chat and stalls identically** — verified: a second `run_orchestration({resume_run_id})` produced a byte-identical stall.
+- Reliable diagnostic signature: `orchestration.groupthink.stalled reason:"timeout" message:"...to complete turn (agent.status=idle)"` for a codex receiver that the dashboard event stream already showed flipping `working→idle`; `read_agent_chat` on that agent returns the full assistant turn (proving the work exists and the failure is read-path, not the model).
+- Recovery that worked (Path-2 manual brokering): read the codex Reviewer's critique via `read_agent_chat`, `send_message_to_agent` it to the (idle) Lead with "write the FINAL plan to <planPath>", let the Lead finish, THEN `abort_orchestration(runId)` to release members (abort AFTER the write — abort cleans up member agents and would kill the Lead mid-write). Deliberation value fully preserved.
+- Fix sketches:
+  1. **Land BUG-28's primary fix** (auto-recover codex sid on chat-read: `maybeRecoverCodexSid(agentId)` before `getMessages` in `api-server.ts:150-158`). That makes `readNextMessage`'s very next poll see the turn, eliminating both the false-stall and the un-resumability at the source. Highest leverage — fixes the family.
+  2. **Belt-and-suspenders in `waitTurnComplete`:** when `status==='idle'` at the deadline, before throwing, trigger a sid-recovery/chat-rebind for the agent and re-poll once; only stall if the chat is STILL empty. Prevents a single lost race from killing a 2-agent deliberation.
+  3. **Make resume robust to an already-completed turn:** on resume, if the awaited receiver is already `idle`/`done` and its last assistant turn post-dates the last relayed marker, treat that turn as the awaited completion instead of waiting for a fresh `working→idle` edge that will never come.
+- Related: BUG-28 (the underlying codex chat-blackout — this is the same root cause surfacing in the new in-dashboard orchestration path; the BUG-28 entry only covered the old `scripts/groupthink-v1.js`). Distinct from `groupthink-premature-stall-no-plan-written.md` (parallel-mode `no_plan_written`, a different early-check race).
+
+---
+
+## BUG-36: Site-access approval does not notify the requesting agent — agent silently downgrades to a worse tool, human's approval wasted
+
+- Component: the §18 request-and-approve allowlist flow — the approve IPC that upserts a `browser_access_requests` pending row into `browser_access_rules` (browser allowlist backend, `src/main/browser/`). No event is emitted to the requesting agent on approval.
+- Severity: medium — wastes the human's approval and degrades output quality; the agent has no way to learn the gate opened except to re-poll `browser_list_my_access_requests()` / retry navigation, which an agent that already decided "I'm blocked" won't do.
+- Status: open — observed live 2026-06-17. Researcher `59276984` (Guerneville-hotel task) hit the agent-browsing gate, filed a request, the human approved in the UI (worked), but the researcher got no signal and fell back to WebFetch (which returns only JS-rendered empty shells for booking engines). It recovered native browsing only by later self-discovery, after burning ~80% of its context. (Note: while the agent is `working`, `send_message_to_agent` rejects with HANDSHAKE FAILED, so the supervisor cannot push the news mid-turn either.)
+- Fix sketches:
+  1. **Push a dashboard-style event to the requesting agent on approval** (analogous to the `[DASHBOARD EVENT]` lines supervisors receive): "User approved `<origin>` — retry now." Hook at the approve IPC where the pending row → `browser_access_rules` upsert happens; resolve the requesting agent id from the request row.
+  2. Delivery flavor: inject a one-line system notice into the requesting agent's input buffer (provider-appropriate Enter), OR a structured harness-surfaced event the agent's loop reads.
+  3. Pairs with a worker-brief convention: when blocked, request access and KEEP the native-browser plan; do not pre-emptively fall back to WebFetch.
+
+---
+
+## BUG-35: Native browser tools cannot drive JS date-picker / calendar widgets via the accessibility-tree refs
+
+- Component: agent browser tooling — `browser_read_page` (a11y tree + numbered refs) + `browser_click(ref)` against React/JS booking-engine date pickers.
+- Severity: medium — blocks a plausible headline use case (driving real hotel/flight/booking flows that gate availability behind a calendar). The researcher could not get Dawn Ranch / Google Hotels calendars to COMMIT a selected date: refs went stale/misfired, the calendar reopened, the "WHEN" field stayed "Add dates."
+- Status: open — observed live 2026-06-17 (researcher `59276984`, then worked-around by v2 `96d4e462`). Workaround that succeeded: skip calendar clicks entirely and use date-in-URL query params (`?checkin=2026-06-27&checkout=2026-06-28`, Google Hotels date-scoped URLs, booking-engine URLs that accept date params) so the page loads already date-scoped.
+- Fix sketches:
+  1. Investigate why `browser_click(ref)` against these widgets doesn't register/commit (synthetic-event trust? ref staleness after the calendar re-renders? need a settle/re-read between clicks?).
+  2. Consider a higher-level helper for date inputs (set value + dispatch input/change events) or document the date-in-URL-params pattern as the supported approach in the researcher brief.
+  3. Lower urgency if booking-flow automation is not a target use case — but the date-in-URL workaround should be captured in researcher guidance regardless.
+
+---
+
 ## BUG-34: Context stats use a hardcoded 200K window for 1M-context models — false "98% critical" alarms on healthy agents
 
 - Component: context accounting — `get_context_stats` / context-threshold `[DASHBOARD EVENT]`s compute `contextPercentage` against `contextWindowMax: 200000` even when the agent runs a 1M-window model (e.g. Opus 4.8 with extended context; the worker's own Claude Code status line showed "Opus 4.8 (1M context)" while the dashboard reported "98% (196K/200K)").

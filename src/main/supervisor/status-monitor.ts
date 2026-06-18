@@ -873,7 +873,7 @@ export class StatusMonitor extends EventEmitter {
    *
    *  Dedupes via `lastWatchdogWarnAt`. */
   private checkHookSilenceWatchdog(agent: Agent): void {
-    if (!(agent.isSupervised || agent.isWorker)) return;
+    if (!(agent.isSupervised || agent.isWorker || agent.isResearcher)) return;
     if (agent.status !== 'idle') {
       // Only warn from the idle state. Working / waiting / launching mean
       // the system is reacting normally; clear dedupe so a later re-entry
@@ -954,7 +954,7 @@ export class StatusMonitor extends EventEmitter {
    *  Warn-only; emits a `'start-hook-silence-watchdog'` status-change event
    *  so a supervisor consumer can observe the false-idle window. */
   private checkStartHookSilence(agent: Agent): void {
-    if (!(agent.isSupervised || agent.isWorker)) return;
+    if (!(agent.isSupervised || agent.isWorker || agent.isResearcher)) return;
     if (agent.status !== 'idle') return;
     // A synchronous confirm is mid-flight — its first-window+retry budget is a
     // legitimate not-yet-confirmed window; don't trip the silence warn.
@@ -1006,7 +1006,7 @@ export class StatusMonitor extends EventEmitter {
    *  stands this recovery down. */
   private checkStartHookResend(agent: Agent): void {
     if (!this.resubmit) return;
-    if (!(agent.isSupervised || agent.isWorker)) return;
+    if (!(agent.isSupervised || agent.isWorker || agent.isResearcher)) return;
     // Hook-backed providers only — see method doc.
     if (agent.provider !== 'claude' && agent.provider !== 'codex') return;
     // Coordination with the synchronous path (plan §coordination): contract
@@ -1067,7 +1067,7 @@ export class StatusMonitor extends EventEmitter {
    *  already flips a silent agent to idle (and notifies via status_change).
    */
   private checkWorkerStalled(agent: Agent): void {
-    if (!(agent.isSupervised || agent.isWorker)) return;
+    if (!(agent.isSupervised || agent.isWorker || agent.isResearcher)) return;
     if (agent.status !== 'working') {
       this.workerStallWarned.delete(agent.id);
       return;
@@ -1132,7 +1132,11 @@ export class StatusMonitor extends EventEmitter {
     // explicitly accepts that trade-off: PTY inference was masking missing-hook
     // scaffolds and made hook reliability invisible. Non-worker unsupervised
     // agents and the supervisor itself stay on inference.
-    if (agent.isSupervised || agent.isWorker) {
+    //
+    // The researcher role-lane (browser-parity-and-capability-isolation §0) is
+    // its own lane but carries the identical Stop/SessionStart/UserPromptSubmit
+    // status hooks, so it is hook-owned too — disable PTY inference for it.
+    if (agent.isSupervised || agent.isWorker || agent.isResearcher) {
       return null;
     }
 

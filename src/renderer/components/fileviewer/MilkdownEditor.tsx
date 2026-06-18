@@ -31,8 +31,13 @@ import { editorViewCtx } from '@milkdown/kit/core';
 import { replaceAll } from '@milkdown/kit/utils';
 import type { EditorView } from '@milkdown/kit/prose/view';
 import '@milkdown/crepe/theme/common/style.css';
-import '@milkdown/crepe/theme/frame-dark.css';
+// Theme-aware palette (light + dark) keyed off the app's <html> theme class,
+// instead of the single prebuilt frame-dark theme that rendered black in light
+// mode. See milkdownTheme.css.
+import './milkdownTheme.css';
 import { useDashboardStore } from '../../stores/dashboard-store';
+import FileCommentGutter from '../selection/FileCommentGutter';
+import { getTabScrollFraction, setTabScrollFraction } from './scrollMemory';
 import {
   prepareSpliceBaseline,
   spliceMarkdown,
@@ -299,6 +304,20 @@ function MilkdownEditor({ tabId, filePath, content, registerFreshContentHandler 
     };
     container.addEventListener('keydown', onKeyDown);
 
+    // Per-tab scroll memory (shared with the source + view renderers via
+    // scrollMemory). The editor remounts on every tab switch (the key includes
+    // tabId), so without this the canvas snaps to the top each time you leave
+    // and return. Record on scroll; restore happens after create() lays the
+    // doc out (scrollHeight isn't final until then — see the create() chain).
+    const recordScroll = () => {
+      if (!tabId) return;
+      const max = container.scrollHeight - container.clientHeight;
+      if (max <= 0) return;
+      setTabScrollFraction(tabId, container.scrollTop / max);
+    };
+    container.addEventListener('scroll', recordScroll, { passive: true });
+    let restoreFrame = 0;
+
     // Editor handle registry (task 7).
     const handle: CanvasEditorHandle = {
       getMarkdown: () => crepe.getMarkdown(),
@@ -345,6 +364,16 @@ function MilkdownEditor({ tabId, filePath, content, registerFreshContentHandler 
         readyRef.current = true;
         // Content prop may have moved while create() was in flight.
         applyFreshContent(contentRef.current);
+        // Restore the remembered scroll position now that the doc is laid out.
+        // rAF lets layout settle so scrollHeight reflects the full document.
+        const fraction = tabId ? getTabScrollFraction(tabId) : 0;
+        if (fraction > 0) {
+          restoreFrame = requestAnimationFrame(() => {
+            if (disposed) return;
+            const max = container.scrollHeight - container.clientHeight;
+            if (max > 0) container.scrollTop = max * fraction;
+          });
+        }
         return crepe;
       })
       .catch((err: unknown) => {
@@ -359,6 +388,8 @@ function MilkdownEditor({ tabId, filePath, content, registerFreshContentHandler 
         applyFreshContentRef.current = null;
       }
       container.removeEventListener('keydown', onKeyDown);
+      container.removeEventListener('scroll', recordScroll);
+      cancelAnimationFrame(restoreFrame);
       if (tabId && editorHandles.get(tabId) === handle) editorHandles.delete(tabId);
       if (typeof unregister === 'function') unregister();
       if (crepeRef.current === crepe) crepeRef.current = null;
@@ -385,7 +416,14 @@ function MilkdownEditor({ tabId, filePath, content, registerFreshContentHandler 
     applyFreshContentRef.current?.(content);
   }, [content]);
 
-  return <div ref={containerRef} className="milkdown-editor h-full overflow-auto" />;
+  // The gutter overlays the scroll container as a sibling (WP-P5-B): Crepe
+  // owns every node inside containerRef, so React must not render into it.
+  return (
+    <div className="relative h-full">
+      <div ref={containerRef} className="milkdown-editor h-full overflow-auto" />
+      <FileCommentGutter tabId={tabId} scrollRef={containerRef} />
+    </div>
+  );
 }
 
 // memo-isolated: parent/store updates with unchanged props must never

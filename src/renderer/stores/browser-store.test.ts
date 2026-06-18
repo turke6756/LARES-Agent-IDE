@@ -30,6 +30,34 @@ function makeMockApi() {
     setVisible: vi.fn(),
     onTabState: vi.fn((_cb: (s: BrowserTabState) => void) => () => {}),
     onOpenRequest: vi.fn((_cb: (r: unknown) => void) => () => {}),
+
+    // ── Overhaul (WP3/4/5/7) additive plumbing — keep the mock in lockstep
+    //    with the BrowserApi shape ensureBrowserBridge subscribes to. ──
+    reorderTab: vi.fn(),
+    setTabPinned: vi.fn(),
+    reopenClosedTab: vi.fn(async () => null),
+    findInPage: vi.fn(),
+    stopFindInPage: vi.fn(),
+    setZoom: vi.fn(),
+    contextMenuRequest: vi.fn(),
+    bookmarkList: vi.fn(async () => []),
+    bookmarkAdd: vi.fn(async ({ title, url }: { title: string; url: string }) => ({
+      id: 'bm-1',
+      title,
+      url,
+      createdAt: 0,
+      sortOrder: 0,
+    })),
+    bookmarkRemove: vi.fn(),
+    bookmarkReorder: vi.fn(),
+    historyList: vi.fn(async () => []),
+    historyDelete: vi.fn(),
+    historyClear: vi.fn(),
+    onTabsSnapshot: vi.fn((_cb: (e: unknown) => void) => () => {}),
+    onShortcutCommand: vi.fn((_cb: (s: unknown, c: unknown) => void) => () => {}),
+    onFoundInPage: vi.fn((_cb: (r: unknown) => void) => () => {}),
+    onContextMenuCommand: vi.fn((_cb: (a: unknown, p: unknown) => void) => () => {}),
+    onBookmarksChanged: vi.fn((_cb: (b: unknown) => void) => () => {}),
   };
 }
 
@@ -97,7 +125,7 @@ describe('tab lifecycle', () => {
   it('createTab defaults to the user partition, adds and activates the tab', async () => {
     const id = await useBrowserStore.getState().createTab();
     expect(id).toBe('tab-1');
-    expect(api.createTab).toHaveBeenCalledWith({ partition: 'user', url: undefined });
+    expect(api.createTab).toHaveBeenCalledWith({ partition: 'user', url: undefined, workspaceId: null });
     const s = useBrowserStore.getState();
     expect(s.tabs).toHaveLength(1);
     expect(s.activeTabId).toBe('tab-1');
@@ -160,16 +188,18 @@ describe('tab lifecycle', () => {
 });
 
 describe('agent-attention flash (plan §4 UX)', () => {
-  it('an unknown agent-partition tab raises attention and opens the pane when the center is free', () => {
+  it('an unknown agent-partition tab raises attention and pulses the entry button WITHOUT auto-opening the pane', () => {
     useBrowserStore.getState().handleTabState(tabState({ tabId: 'agent-1', partition: 'agent' }));
     const s = useBrowserStore.getState();
     expect(s.tabs).toHaveLength(1);
     expect(s.attentionTabIds['agent-1']).toBe(true);
     expect(s.activeTabId).toBe('agent-1');
-    expect(useDashboardStore.getState().browserOpen).toBe(true);
+    // Agent activity must never yank the user to the browser — pulse only.
+    expect(s.paneAttention).toBe(true);
+    expect(useDashboardStore.getState().browserOpen).toBe(false);
   });
 
-  it('while the file viewer holds the center, it pulses the entry button instead (file viewer wins)', () => {
+  it('while the file viewer holds the center, it still pulses the entry button without opening (file viewer untouched)', () => {
     useDashboardStore.setState({ fileViewerOpen: true });
     useBrowserStore.getState().handleTabState(tabState({ tabId: 'agent-1', partition: 'agent' }));
     expect(useDashboardStore.getState().browserOpen).toBe(false);
@@ -208,7 +238,7 @@ describe('denied window.open requests', () => {
   it('acceptOpenRequest opens the URL in a new user-partition tab', async () => {
     useBrowserStore.getState().handleOpenRequest({ url: 'https://a.dev/' });
     await useBrowserStore.getState().acceptOpenRequest();
-    expect(api.createTab).toHaveBeenCalledWith({ partition: 'user', url: 'https://a.dev/' });
+    expect(api.createTab).toHaveBeenCalledWith({ partition: 'user', url: 'https://a.dev/', workspaceId: null });
     expect(useBrowserStore.getState().pendingOpenUrl).toBeNull();
   });
 

@@ -32,6 +32,12 @@ import {
   DASHBOARD_STATUS_SCRIPT_MJS,
   DASHBOARD_STATUS_SCRIPT_MJS_V4,
   DASHBOARD_STATUS_SCRIPT_MJS_V6,
+  RESEARCH_STORE_README_MD,
+  RESEARCHER_AGENT_MD,
+  RESEARCHER_CLAUDE_SETTINGS_JSON,
+  SUPERVISOR_AGENT_MD,
+  WORKER_CLAUDE_MD,
+  WORKER_CLAUDE_MD_V1,
 } from '../../shared/constants';
 
 interface TestCase {
@@ -151,6 +157,9 @@ function rmrf(dir: string): void {
 
 interface SupervisorTestSurface {
   ensureWorkerScaffold(workDir: string, provider: string, pathType: string): void;
+  ensureSupervisorScaffold(workDir: string, pathType: string): void;
+  ensureResearchStoreScaffold(workDir: string, pathType: string): void;
+  ensureResearcherScaffold(workDir: string, pathType: string): void;
 }
 
 function makeSupervisor(): { supervisor: SupervisorTestSurface; cleanup: () => void } {
@@ -469,6 +478,186 @@ test('6. concurrent ensureWorkerScaffold: parseable sidecar, complete v2 content
     assert.ok(backups.length <= 1, `expected at most one backup; got ${backups.length}: ${backups.join(', ')}`);
   } finally {
     restoreDb();
+    rmrf(workDir);
+  }
+});
+
+// ── WP-G research store + persona-pointer migration ──────────────────
+
+function researchPath(workDir: string, ...rel: string[]): string {
+  return path.join(workDir, '.dashboard', 'research', ...rel);
+}
+function countMatches(haystack: string, needle: string): number {
+  return haystack.split(needle).length - 1;
+}
+const RESEARCH_SECTION_MARKER = '<!-- section:research-store v1 -->';
+
+test('G3. research store: fresh workspace writes README + inbox/cleared gitkeeps; idempotent', () => {
+  const workDir = mktmp('research-store-fresh');
+  const { supervisor, cleanup } = makeSupervisor();
+  try {
+    supervisor.ensureResearchStoreScaffold(workDir, 'windows');
+
+    const readmePath = researchPath(workDir, 'README.md');
+    assert.ok(fs.existsSync(readmePath), 'README.md must exist');
+    assert.ok(fs.existsSync(researchPath(workDir, 'inbox', '.gitkeep')), 'inbox/.gitkeep must exist');
+    assert.ok(fs.existsSync(researchPath(workDir, 'cleared', '.gitkeep')), 'cleared/.gitkeep must exist');
+    assert.equal(fs.readFileSync(readmePath, 'utf-8'), RESEARCH_STORE_README_MD, 'README must be exact bundled content');
+
+    const sidecar = readSidecar(workDir);
+    assert.equal(sidecar['research/README.md'], 1, `sidecar must record README v1; got ${JSON.stringify(sidecar)}`);
+
+    // Second pass is a no-op: README unchanged, no backups.
+    const beforeMtime = fs.statSync(readmePath).mtimeMs;
+    supervisor.ensureResearchStoreScaffold(workDir, 'windows');
+    assert.equal(fs.statSync(readmePath).mtimeMs, beforeMtime, 'second pass must not rewrite README');
+    const backups = fs.readdirSync(researchPath(workDir)).filter((n) => n.startsWith('README.md.bak.'));
+    assert.equal(backups.length, 0, 'no backups expected on idempotent re-run');
+  } finally {
+    cleanup();
+    rmrf(workDir);
+  }
+});
+
+test('G3. research store: user-modified README is backed up + overwritten', () => {
+  const workDir = mktmp('research-store-usermod');
+  const { supervisor, cleanup } = makeSupervisor();
+  try {
+    const readmePath = researchPath(workDir, 'README.md');
+    fs.mkdirSync(path.dirname(readmePath), { recursive: true });
+    fs.writeFileSync(readmePath, '# my own README\n', 'utf-8');
+
+    supervisor.ensureResearchStoreScaffold(workDir, 'windows');
+
+    assert.equal(fs.readFileSync(readmePath, 'utf-8'), RESEARCH_STORE_README_MD, 'README must be upgraded to bundled content');
+    const backups = fs.readdirSync(researchPath(workDir)).filter((n) => n.startsWith('README.md.bak.'));
+    assert.equal(backups.length, 1, `expected one backup; got ${backups.join(', ')}`);
+    assert.equal(fs.readFileSync(researchPath(workDir, backups[0]), 'utf-8'), '# my own README\n', 'backup must hold the user content');
+  } finally {
+    cleanup();
+    rmrf(workDir);
+  }
+});
+
+// ── WP-B researcher persona scaffold ─────────────────────────────────
+
+function researcherPath(workDir: string, ...rel: string[]): string {
+  return path.join(workDir, '.dashboard', 'researcher', ...rel);
+}
+
+test('WP-B. researcher scaffold: fresh workspace writes persona CLAUDE.md + settings + guard + store; idempotent', () => {
+  const workDir = mktmp('researcher-fresh');
+  const { supervisor, cleanup } = makeSupervisor();
+  try {
+    supervisor.ensureResearcherScaffold(workDir, 'windows');
+
+    const mdPath = researcherPath(workDir, 'CLAUDE.md');
+    const settingsPath = researcherPath(workDir, '.claude', 'settings.json');
+    const guardPath = researcherPath(workDir, 'scripts', 'research-write-guard.mjs');
+    assert.ok(fs.existsSync(mdPath), 'researcher CLAUDE.md must exist');
+    assert.equal(fs.readFileSync(mdPath, 'utf-8'), RESEARCHER_AGENT_MD, 'researcher CLAUDE.md must be exact bundled content');
+    assert.equal(fs.readFileSync(settingsPath, 'utf-8'), RESEARCHER_CLAUDE_SETTINGS_JSON, 'researcher settings.json must be exact bundled content');
+    assert.ok(fs.existsSync(guardPath), 'research-write-guard.mjs must exist');
+
+    // The store is also ensured (ensureResearcherScaffold → ensureResearchStoreScaffold).
+    assert.ok(fs.existsSync(researchPath(workDir, 'README.md')), 'research store README must exist');
+    assert.ok(fs.existsSync(researchPath(workDir, 'inbox', '.gitkeep')), 'inbox/.gitkeep must exist');
+
+    // settings.json wires BOTH the status hooks AND the write-guard.
+    const settings = fs.readFileSync(settingsPath, 'utf-8');
+    assert.ok(settings.includes('"Stop"'), 'researcher settings must wire the Stop status hook');
+    assert.ok(settings.includes('"SessionStart"'), 'researcher settings must wire SessionStart');
+    assert.ok(settings.includes('"UserPromptSubmit"'), 'researcher settings must wire UserPromptSubmit');
+    assert.ok(settings.includes('"PreToolUse"'), 'researcher settings must keep the PreToolUse write-guard');
+    // Relative depth: status script is one level up (../scripts), write-guard is in-cwd (scripts/).
+    assert.ok(settings.includes('/../scripts/dashboard-status.mjs'), 'status hook path must walk one level up');
+    assert.ok(settings.includes('/scripts/research-write-guard.mjs'), 'write-guard path must be cwd-relative');
+
+    const sidecar = readSidecar(workDir);
+    assert.equal(sidecar['researcher/CLAUDE.md'], 1, `sidecar must record researcher CLAUDE.md v1; got ${JSON.stringify(sidecar)}`);
+    assert.equal(sidecar['researcher/.claude/settings.json'], 1, 'sidecar must record settings v1');
+
+    // Idempotent second pass — no rewrites, no backups.
+    const beforeMtime = fs.statSync(mdPath).mtimeMs;
+    supervisor.ensureResearcherScaffold(workDir, 'windows');
+    assert.equal(fs.statSync(mdPath).mtimeMs, beforeMtime, 'second pass must not rewrite researcher CLAUDE.md');
+    const backups = fs.readdirSync(researcherPath(workDir)).filter((n) => n.startsWith('CLAUDE.md.bak.'));
+    assert.equal(backups.length, 0, 'no backups expected on idempotent re-run');
+  } finally {
+    cleanup();
+    rmrf(workDir);
+  }
+});
+
+test('WP-B. researcher CLAUDE.md: user-modified persona is backed up + overwritten', () => {
+  const workDir = mktmp('researcher-usermod');
+  const { supervisor, cleanup } = makeSupervisor();
+  try {
+    const mdPath = researcherPath(workDir, 'CLAUDE.md');
+    fs.mkdirSync(path.dirname(mdPath), { recursive: true });
+    fs.writeFileSync(mdPath, '# my own researcher contract\n', 'utf-8');
+
+    supervisor.ensureResearcherScaffold(workDir, 'windows');
+
+    assert.equal(fs.readFileSync(mdPath, 'utf-8'), RESEARCHER_AGENT_MD, 'researcher CLAUDE.md must be upgraded to bundled content');
+    const backups = fs.readdirSync(researcherPath(workDir)).filter((n) => n.startsWith('CLAUDE.md.bak.'));
+    assert.equal(backups.length, 1, `expected one backup; got ${backups.join(', ')}`);
+    assert.equal(fs.readFileSync(researcherPath(workDir, backups[0]), 'utf-8'), '# my own researcher contract\n', 'backup must hold the user content');
+  } finally {
+    cleanup();
+    rmrf(workDir);
+  }
+});
+
+test('G5. worker CLAUDE.md: pristine v1 silently upgrades to v3 carrying the research-store pointer', () => {
+  const workDir = mktmp('worker-claudemd-v1');
+  const { supervisor, cleanup } = makeSupervisor();
+  try {
+    const mdPath = path.join(workDir, '.dashboard', 'workers', 'claude', 'CLAUDE.md');
+    fs.mkdirSync(path.dirname(mdPath), { recursive: true });
+    fs.writeFileSync(mdPath, WORKER_CLAUDE_MD_V1, 'utf-8');
+    fs.mkdirSync(path.dirname(sidecarPath(workDir)), { recursive: true });
+    fs.writeFileSync(
+      sidecarPath(workDir),
+      JSON.stringify({ 'workers/claude/CLAUDE.md': 1 }, null, 2) + '\n',
+      'utf-8',
+    );
+
+    supervisor.ensureWorkerScaffold(workDir, 'claude', 'windows');
+
+    const content = fs.readFileSync(mdPath, 'utf-8');
+    assert.equal(content, WORKER_CLAUDE_MD, 'v1 worker CLAUDE.md must silently upgrade to v3 bundled content');
+    assert.equal(countMatches(content, RESEARCH_SECTION_MARKER), 1, 'research-store section appears exactly once (not double-appended)');
+    const backups = fs.readdirSync(path.dirname(mdPath)).filter((n) => n.startsWith('CLAUDE.md.bak.'));
+    assert.equal(backups.length, 0, 'known-hash v1→v3 upgrade must NOT create a backup');
+    const sidecar = readSidecar(workDir);
+    assert.equal(sidecar['workers/claude/CLAUDE.md'], 3, `sidecar must record v3; got ${JSON.stringify(sidecar)}`);
+  } finally {
+    cleanup();
+    rmrf(workDir);
+  }
+});
+
+test('G5. supervisor CLAUDE.md: fresh scaffold carries the research-store pointer once; second pass is a no-op', () => {
+  const workDir = mktmp('sup-claudemd-fresh');
+  const { supervisor, cleanup } = makeSupervisor();
+  try {
+    supervisor.ensureSupervisorScaffold(workDir, 'windows');
+
+    const mdPath = path.join(workDir, '.dashboard', 'supervisor', 'CLAUDE.md');
+    const content = fs.readFileSync(mdPath, 'utf-8');
+    assert.equal(content, SUPERVISOR_AGENT_MD, 'supervisor CLAUDE.md must be exact bundled content');
+    assert.equal(countMatches(content, RESEARCH_SECTION_MARKER), 1, 'research-store section appears exactly once');
+    const sidecar = readSidecar(workDir);
+    assert.equal(sidecar['supervisor/CLAUDE.md'], 6, `sidecar must record v6; got ${JSON.stringify(sidecar)}`);
+
+    const beforeMtime = fs.statSync(mdPath).mtimeMs;
+    supervisor.ensureSupervisorScaffold(workDir, 'windows');
+    assert.equal(fs.statSync(mdPath).mtimeMs, beforeMtime, 'second pass must not rewrite CLAUDE.md');
+    const backups = fs.readdirSync(path.dirname(mdPath)).filter((n) => n.startsWith('CLAUDE.md.bak.'));
+    assert.equal(backups.length, 0, 'no backups expected on idempotent supervisor scaffold');
+  } finally {
+    cleanup();
     rmrf(workDir);
   }
 });

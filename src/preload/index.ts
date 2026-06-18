@@ -1,7 +1,18 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron';
-import type { IpcApi } from '../shared/types';
+import type { IpcApi, DetachRequest, DetachedClosedPayload } from '../shared/types';
+import { TAB_CHANNELS } from '../shared/types';
 import { BROWSER_CHANNELS } from '../shared/browser';
-import type { BrowserOpenRequest, BrowserTabState } from '../shared/browser';
+import type {
+  AccessRequestDecision,
+  AccessRuleInput,
+  Bookmark,
+  BrowserContextMenuParams,
+  BrowserFindResult,
+  BrowserOpenRequest,
+  BrowserShortcut,
+  BrowserTabSnapshotEntry,
+  BrowserTabState,
+} from '../shared/browser';
 
 const api: IpcApi = {
   workspaces: {
@@ -132,6 +143,20 @@ const api: IpcApi = {
     update: (id, updates) => ipcRenderer.invoke('template:update', id, updates),
     delete: (id) => ipcRenderer.invoke('template:delete', id),
   },
+  // WP-P5-A — persisted selection comments.
+  comments: {
+    create: (input) => ipcRenderer.invoke('comments:create', input),
+    list: (workspaceId, filePath) => ipcRenderer.invoke('comments:list', workspaceId, filePath),
+    update: (id, updates) => ipcRenderer.invoke('comments:update', id, updates),
+    delete: (id) => ipcRenderer.invoke('comments:delete', id),
+    resolve: (id) => ipcRenderer.invoke('comments:resolve', id),
+    send: (request) => ipcRenderer.invoke('comments:send', request),
+    onChanged: (callback) => {
+      const listener = (_event: any, payload: any) => callback(payload);
+      ipcRenderer.on('comments:changed', listener);
+      return () => ipcRenderer.removeListener('comments:changed', listener);
+    },
+  },
   personas: {
     list: (workspacePath, pathType) => ipcRenderer.invoke('persona:list', workspacePath, pathType),
     create: (workspacePath, pathType, name, customClaudeMd?) => ipcRenderer.invoke('persona:create', workspacePath, pathType, name, customClaudeMd),
@@ -152,6 +177,11 @@ const api: IpcApi = {
     setActiveTab: (tabId) => ipcRenderer.invoke(BROWSER_CHANNELS.setActiveTab, tabId),
     setBounds: (bounds) => ipcRenderer.invoke(BROWSER_CHANNELS.setBounds, bounds),
     setVisible: (visible) => ipcRenderer.invoke(BROWSER_CHANNELS.setVisible, visible),
+    setActiveWorkspace: (workspaceId) =>
+      ipcRenderer.invoke(BROWSER_CHANNELS.setActiveWorkspace, workspaceId),
+    getActionsEnabled: () => ipcRenderer.invoke(BROWSER_CHANNELS.getActionsEnabled),
+    setActionsEnabled: (enabled) =>
+      ipcRenderer.invoke(BROWSER_CHANNELS.setActionsEnabled, enabled),
     onTabState: (callback) => {
       const listener = (_event: any, state: BrowserTabState) => callback(state);
       ipcRenderer.on(BROWSER_CHANNELS.tabState, listener);
@@ -162,6 +192,105 @@ const api: IpcApi = {
       ipcRenderer.on(BROWSER_CHANNELS.openRequest, listener);
       return () => ipcRenderer.removeListener(BROWSER_CHANNELS.openRequest, listener);
     },
+    // ── Overhaul (WP0) — additive plumbing. Bookmarks/history are USER-PARTITION
+    //    ONLY by contract (main gates partition; renderer cannot bypass). ──────
+    reorderTab: (tabId, toOrder) =>
+      ipcRenderer.invoke(BROWSER_CHANNELS.reorderTab, tabId, toOrder),
+    setTabPinned: (tabId, pinned) =>
+      ipcRenderer.invoke(BROWSER_CHANNELS.setTabPinned, tabId, pinned),
+    reopenClosedTab: () => ipcRenderer.invoke(BROWSER_CHANNELS.reopenClosedTab),
+    findInPage: (tabId, text, opts) =>
+      ipcRenderer.invoke(BROWSER_CHANNELS.findInPage, tabId, text, opts),
+    stopFindInPage: (tabId) => ipcRenderer.invoke(BROWSER_CHANNELS.stopFindInPage, tabId),
+    setZoom: (tabId, zoomFactor) =>
+      ipcRenderer.invoke(BROWSER_CHANNELS.setZoom, tabId, zoomFactor),
+    contextMenuRequest: (tabId, params) =>
+      ipcRenderer.invoke(BROWSER_CHANNELS.contextMenuRequest, tabId, params),
+    bookmarkList: () => ipcRenderer.invoke(BROWSER_CHANNELS.bookmarkList),
+    bookmarkAdd: (input) => ipcRenderer.invoke(BROWSER_CHANNELS.bookmarkAdd, input),
+    bookmarkRemove: (id) => ipcRenderer.invoke(BROWSER_CHANNELS.bookmarkRemove, id),
+    bookmarkReorder: (orderedIds) =>
+      ipcRenderer.invoke(BROWSER_CHANNELS.bookmarkReorder, orderedIds),
+    historyList: (query) => ipcRenderer.invoke(BROWSER_CHANNELS.historyList, query),
+    historyDelete: (id) => ipcRenderer.invoke(BROWSER_CHANNELS.historyDelete, id),
+    historyClear: () => ipcRenderer.invoke(BROWSER_CHANNELS.historyClear),
+    onTabsSnapshot: (callback) => {
+      const listener = (_event: any, entries: BrowserTabSnapshotEntry[]) => callback(entries);
+      ipcRenderer.on(BROWSER_CHANNELS.tabsSnapshot, listener);
+      return () => ipcRenderer.removeListener(BROWSER_CHANNELS.tabsSnapshot, listener);
+    },
+    onShortcutCommand: (callback) => {
+      const listener = (_event: any, shortcut: BrowserShortcut, ctx: { tabId: string }) =>
+        callback(shortcut, ctx);
+      ipcRenderer.on(BROWSER_CHANNELS.shortcutCommand, listener);
+      return () => ipcRenderer.removeListener(BROWSER_CHANNELS.shortcutCommand, listener);
+    },
+    onFoundInPage: (callback) => {
+      const listener = (_event: any, result: BrowserFindResult) => callback(result);
+      ipcRenderer.on(BROWSER_CHANNELS.foundInPage, listener);
+      return () => ipcRenderer.removeListener(BROWSER_CHANNELS.foundInPage, listener);
+    },
+    onContextMenuCommand: (callback) => {
+      const listener = (_event: any, action: string, params: BrowserContextMenuParams) =>
+        callback(action, params);
+      ipcRenderer.on(BROWSER_CHANNELS.contextMenuCommand, listener);
+      return () => ipcRenderer.removeListener(BROWSER_CHANNELS.contextMenuCommand, listener);
+    },
+    onBookmarksChanged: (callback) => {
+      const listener = (_event: any, bookmarks: Bookmark[]) => callback(bookmarks);
+      ipcRenderer.on(BROWSER_CHANNELS.bookmarksChanged, listener);
+      return () => ipcRenderer.removeListener(BROWSER_CHANNELS.bookmarksChanged, listener);
+    },
+
+    // ── Website-access policy (plans/website-allowlist-simplification.md).
+    //    Trusted shell chrome only — never reachable from page/model output. ──
+    access: {
+      list: () => ipcRenderer.invoke(BROWSER_CHANNELS.accessRuleList),
+      add: (input: AccessRuleInput) => ipcRenderer.invoke(BROWSER_CHANNELS.accessRuleAdd, input),
+      update: (id: string, patch: Partial<AccessRuleInput> & { enabled?: boolean }) =>
+        ipcRenderer.invoke(BROWSER_CHANNELS.accessRuleUpdate, id, patch),
+      remove: (id: string) => ipcRenderer.invoke(BROWSER_CHANNELS.accessRuleRemove, id),
+      onChanged: (callback: () => void) => {
+        const listener = () => callback();
+        ipcRenderer.on(BROWSER_CHANNELS.accessChanged, listener);
+        return () => ipcRenderer.removeListener(BROWSER_CHANNELS.accessChanged, listener);
+      },
+      requestList: () => ipcRenderer.invoke(BROWSER_CHANNELS.accessRequestList),
+      requestDecide: (id: string, decision: AccessRequestDecision) =>
+        ipcRenderer.invoke(BROWSER_CHANNELS.accessRequestDecide, id, decision),
+      onRequestsChanged: (callback: () => void) => {
+        const listener = () => callback();
+        ipcRenderer.on(BROWSER_CHANNELS.accessRequestsChanged, listener);
+        return () => ipcRenderer.removeListener(BROWSER_CHANNELS.accessRequestsChanged, listener);
+      },
+      handoffSignin: (ruleId: string) =>
+        ipcRenderer.invoke(BROWSER_CHANNELS.accessHandoffSignin, ruleId),
+      handoffReady: (tabId: string) =>
+        ipcRenderer.invoke(BROWSER_CHANNELS.accessHandoffReady, tabId),
+      tabHandToAgent: (tabId: string) =>
+        ipcRenderer.invoke(BROWSER_CHANNELS.accessTabHandToAgent, tabId),
+      tabReturnToHuman: (tabId: string) =>
+        ipcRenderer.invoke(BROWSER_CHANNELS.accessTabReturnToHuman, tabId),
+      clearSiteSession: (ruleId: string) =>
+        ipcRenderer.invoke(BROWSER_CHANNELS.accessClearSiteSession, ruleId),
+    },
+  },
+  // Detachable (tear-off) file tabs — plans/detachable-file-tabs-plan.md §4.
+  tabs: {
+    detach: (req: DetachRequest) => ipcRenderer.invoke(TAB_CHANNELS.detach, req),
+    onDetachedClosed: (cb: (p: DetachedClosedPayload) => void) => {
+      const l = (_e: any, p: DetachedClosedPayload) => cb(p);
+      ipcRenderer.on(TAB_CHANNELS.closed, l);
+      return () => ipcRenderer.removeListener(TAB_CHANNELS.closed, l);
+    },
+    // Phase 2 dirty-on-close protocol — declared now, behavior wired in Phase 2.
+    onCloseQuery: (cb: (req: { requestId: string }) => void) => {
+      const l = (_e: any, req: { requestId: string }) => cb(req);
+      ipcRenderer.on(TAB_CHANNELS.closeQuery, l);
+      return () => ipcRenderer.removeListener(TAB_CHANNELS.closeQuery, l);
+    },
+    closeReply: (requestId: string, decision: 'save' | 'discard' | 'cancel') =>
+      ipcRenderer.invoke(TAB_CHANNELS.closeReply, requestId, decision),
   },
   onOpenFileTab: (callback) => {
     const listener = (_event: any, payload: any) => callback(payload);

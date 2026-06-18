@@ -29,6 +29,9 @@
 //   node dist/main/main/supervisor/agent-supervisor.test.js
 
 import assert from 'node:assert/strict';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import { AgentSupervisor, SubmitNotConfirmedError } from './index';
 import { WindowsRunner } from './windows-runner';
 import { WslRunner } from './wsl-runner';
@@ -64,6 +67,7 @@ function patchDb(agentsMap: Map<string, Agent>): () => void {
     'getAllAgents',
     'getSupervisorAgent',
     'addFileActivity',
+    'getTeamMembership',
   ];
   const orig: Record<string, unknown> = {};
   for (const k of keys) orig[k] = db[k];
@@ -99,6 +103,10 @@ function patchDb(agentsMap: Map<string, Agent>): () => void {
   db.getAllAgents = () => Array.from(agentsMap.values());
   db.getSupervisorAgent = () => null;
   db.addFileActivity = () => null;
+  // WP-A.2 — launchWindowsAgent/launchWslAgent now read getTeamMembership to
+  // decide whether to inject the team --mcp-config. Default to no team so these
+  // status-contract tests don't open the real (native) DB.
+  db.getTeamMembership = () => null;
 
   return () => {
     for (const k of keys) db[k] = orig[k];
@@ -1133,6 +1141,158 @@ test('Case 12: gemini worker never enters the confirm path (no throw, normal del
     assert.ok(seedCalls(h.calls).includes('notifyUserInputDelivered'),
       'gemini delivery proceeds via the fallback lane');
   } finally {
+    h.cleanup();
+  }
+});
+
+// ── Researcher role-lane launch arg-set (WP-B STEP 5) ────────────────
+// Inspect the exact flags the researcher launch builds: browser-only toolset,
+// --strict-mcp-config, --tools WITHOUT Bash/Edit/NotebookEdit, --disallowedTools
+// listing them, cwd = .dashboard/researcher, and --add-dir of the research store.
+
+test('Case R1: Windows researcher launch arg-set (toolset=browser, strict, --tools/--disallowedTools, store --add-dir)', async () => {
+  // Real temp workspace so the --append-system-prompt-file write succeeds and is
+  // assertable, and nothing pollutes a fixed path.
+  const wsRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cad-rsch-win-'));
+  const cwd = path.join(wsRoot, '.dashboard', 'researcher');
+  fs.mkdirSync(cwd, { recursive: true });
+  const agent = makeAgent('rsch-win', {
+    provider: 'claude',
+    isSupervisor: false,
+    isSupervised: false,
+    isWorker: false,
+    isResearcher: true,
+    command: 'claude --dangerously-skip-permissions --chrome',
+    workingDirectory: cwd,
+  });
+  const h = setup({ agent, injectRunner: 'none' });
+
+  const origWinLaunch = (WindowsRunner.prototype as { launch: unknown }).launch;
+  let capturedArgs: string[] = [];
+  (WindowsRunner.prototype as { launch: unknown }).launch = function (
+    this: WindowsRunner,
+    _workDir: string,
+    _cmd: string,
+    args: string[],
+  ) {
+    capturedArgs = args;
+    (this as unknown as { _pid: number; _alive: boolean })._pid = 1;
+    (this as unknown as { _pid: number; _alive: boolean })._alive = true;
+  };
+
+  try {
+    await (h.supervisor as unknown as { launchWindowsAgent: (a: Agent) => Promise<void> })
+      .launchWindowsAgent(agent);
+
+    const joined = capturedArgs.join(' ');
+
+    // Strict containment.
+    assert.ok(capturedArgs.includes('--strict-mcp-config'),
+      `researcher must launch --strict-mcp-config; got: ${joined}`);
+
+    // Browser-only dashboard toolset, in the inline --mcp-config JSON.
+    const mcpIdx = capturedArgs.indexOf('--mcp-config');
+    assert.ok(mcpIdx !== -1, 'researcher must get an inline --mcp-config');
+    assert.ok(/"DASHBOARD_MCP_TOOLSETS":"browser"/.test(capturedArgs[mcpIdx + 1]),
+      `researcher dashboard toolset must be browser-only; got: ${capturedArgs[mcpIdx + 1]}`);
+
+    // Native --tools allowlist — has the research/browse tools, NOT Bash/Edit/etc.
+    const toolsIdx = capturedArgs.indexOf('--tools');
+    assert.ok(toolsIdx !== -1, 'researcher must pass --tools');
+    const toolsVal = capturedArgs[toolsIdx + 1];
+    for (const t of ['WebSearch', 'WebFetch', 'Read', 'Grep', 'Glob', 'Task', 'Skill', 'Write', 'mcp__agent-dashboard__browser_*', 'mcp__claude-in-chrome__*']) {
+      assert.ok(toolsVal.split(',').includes(t), `--tools must offer ${t}; got: ${toolsVal}`);
+    }
+    for (const banned of ['Bash', 'Edit', 'MultiEdit', 'NotebookEdit']) {
+      assert.ok(!toolsVal.split(',').includes(banned), `--tools must NOT offer ${banned}; got: ${toolsVal}`);
+    }
+
+    // Model pin — researcher runs on Sonnet (worker/supervisor untouched).
+    const modelIdx = capturedArgs.indexOf('--model');
+    assert.ok(modelIdx !== -1, 'researcher must pass --model');
+    assert.equal(capturedArgs[modelIdx + 1], 'claude-sonnet-4-6',
+      `researcher --model must be claude-sonnet-4-6; got: ${capturedArgs[modelIdx + 1]}`);
+
+    // Belt-and-suspenders --disallowedTools.
+    const disIdx = capturedArgs.indexOf('--disallowedTools');
+    assert.ok(disIdx !== -1, 'researcher must pass --disallowedTools');
+    const disVal = capturedArgs[disIdx + 1].split(',');
+    for (const banned of ['Bash', 'Edit', 'MultiEdit', 'NotebookEdit']) {
+      assert.ok(disVal.includes(banned), `--disallowedTools must list ${banned}; got: ${disVal}`);
+    }
+
+    // --add-dir of the research store (NOT the workspace root).
+    const expectedStore = path.join(wsRoot, '.dashboard', 'research');
+    const addDirIdx = capturedArgs.indexOf('--add-dir');
+    assert.ok(addDirIdx !== -1, 'researcher must pass --add-dir');
+    assert.equal(capturedArgs[addDirIdx + 1], expectedStore,
+      `researcher --add-dir must target the research store; got: ${capturedArgs[addDirIdx + 1]}`);
+
+    // Workspace-root preamble file present.
+    assert.ok(capturedArgs.includes('--append-system-prompt-file'),
+      'researcher must get the workspace-root/untrusted-store preamble');
+
+    // cwd is the researcher persona folder.
+    assert.ok(/\.dashboard[\\/]researcher$/.test(agent.workingDirectory),
+      `researcher cwd must be .dashboard/researcher; got: ${agent.workingDirectory}`);
+  } finally {
+    (WindowsRunner.prototype as { launch: unknown }).launch = origWinLaunch;
+    h.cleanup();
+    try { fs.rmSync(wsRoot, { recursive: true, force: true }); } catch { /* best effort */ }
+  }
+});
+
+test('Case R2: WSL researcher launch command (toolset=browser, strict, --tools/--disallowedTools, store --add-dir)', async () => {
+  const agent = makeAgent('rsch-wsl', {
+    provider: 'claude',
+    isSupervisor: false,
+    isSupervised: false,
+    isWorker: false,
+    isResearcher: true,
+    command: 'ccode --dangerously-skip-permissions --chrome',
+    workingDirectory: '/home/test/.dashboard/researcher',
+    tmuxSessionName: 'agent-rsch-wsl',
+  });
+  const h = setup({ agent, injectRunner: 'none' });
+
+  const setupStubLaunch = (WslRunner.prototype as { launch: unknown }).launch;
+  const captured: string[] = [];
+  (WslRunner.prototype as { launch: unknown }).launch = async function (
+    this: WslRunner,
+    _workDir: string,
+    command: string,
+  ) {
+    captured.push(command);
+    (this as unknown as { _alive: boolean })._alive = true;
+  };
+
+  try {
+    await (h.supervisor as unknown as { launchWslAgent: (a: Agent) => Promise<void> })
+      .launchWslAgent(agent);
+
+    assert.equal(captured.length, 1, 'expected exactly one launch call');
+    const rendered = captured[0];
+
+    assert.ok(rendered.includes('--strict-mcp-config'),
+      `WSL researcher must be strict; got: ${rendered}`);
+    assert.ok(/"DASHBOARD_MCP_TOOLSETS":"browser"/.test(rendered),
+      `WSL researcher dashboard toolset must be browser-only; got: ${rendered}`);
+    assert.ok(rendered.includes("--tools 'WebSearch,WebFetch,Read,Grep,Glob,Task,Skill,Write,mcp__agent-dashboard__browser_*,mcp__claude-in-chrome__*'"),
+      `WSL researcher --tools must be the single-quoted allowlist (incl. claude-in-chrome fallback); got: ${rendered}`);
+    assert.ok(rendered.includes("--disallowedTools 'Bash,Edit,MultiEdit,NotebookEdit'"),
+      `WSL researcher --disallowedTools must list the dangerous built-ins; got: ${rendered}`);
+    assert.ok(rendered.includes('--model claude-sonnet-4-6'),
+      `WSL researcher must be pinned to Sonnet; got: ${rendered}`);
+    assert.ok(rendered.includes("--add-dir '/home/test/.dashboard/research'"),
+      `WSL researcher --add-dir must target the research store; got: ${rendered}`);
+    // Containment: the dangerous tools must not appear in the --tools allowlist.
+    const toolsMatch = rendered.match(/--tools '([^']*)'/);
+    assert.ok(toolsMatch, 'should find --tools value');
+    for (const banned of ['Bash', 'Edit', 'MultiEdit', 'NotebookEdit']) {
+      assert.ok(!toolsMatch![1].split(',').includes(banned), `--tools must not offer ${banned}`);
+    }
+  } finally {
+    (WslRunner.prototype as { launch: unknown }).launch = setupStubLaunch;
     h.cleanup();
   }
 });

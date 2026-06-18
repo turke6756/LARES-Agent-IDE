@@ -1,13 +1,30 @@
 import type { SessionEvent, ChatEventBatch } from './session-events';
 import type {
+  AccessHandoffResult,
+  AccessRequest,
+  AccessRequestDecision,
+  AccessRule,
+  AccessRuleInput,
+  Bookmark,
   BrowserBounds,
+  BrowserContextMenuParams,
   BrowserCreateTabOptions,
+  BrowserFindResult,
   BrowserOpenRequest,
+  BrowserShortcut,
+  BrowserTabSnapshotEntry,
   BrowserTabState,
+  HistoryEntry,
+  HistoryQuery,
 } from './browser';
 
 export type PathType = 'windows' | 'wsl';
 export type AgentProvider = 'claude' | 'gemini' | 'codex';
+
+// Hardcoded first-class app role-lanes. 'researcher' is a third lane alongside
+// 'supervisor' and 'worker' (browser-parity-and-capability-isolation §0); see
+// roleLaneOf() in src/main/supervisor/index.ts for the flag→lane mapping.
+export type AgentRoleLane = 'legacy' | 'supervisor' | 'worker' | 'researcher';
 
 // ── Team types ──────────────────────────────────────────────────────────
 export type TeamStatus = 'active' | 'paused' | 'disbanded';
@@ -59,6 +76,11 @@ export interface Agent {
   // NOT notify a supervisor. isSupervised implies the worker lane; isWorker alone
   // is the default for user-launched claude/codex agents.
   isWorker: boolean;
+  // Researcher role-lane (browser-parity-and-capability-isolation §0, D-1). A
+  // third first-class hardcoded app lane alongside supervisor/worker: scaffolded
+  // into .dashboard/researcher, browser MCP wired in, native dangerous tools
+  // (Bash/Edit/NotebookEdit) withheld. Mutually exclusive with the other lanes.
+  isResearcher: boolean;
   tmuxSessionName: string | null;
   autoRestartEnabled: boolean;
   resumeSessionId: string | null;
@@ -131,6 +153,9 @@ export interface LaunchAgentInput {
   isSupervisor?: boolean;
   isSupervised?: boolean;
   isWorker?: boolean;
+  // Researcher role-lane (browser-parity-and-capability-isolation §0, D-1).
+  // Claude-only (D-2); mutually exclusive with the other lane flags.
+  isResearcher?: boolean;
   templateId?: string;
   systemPrompt?: string;
   persona?: string;
@@ -148,6 +173,14 @@ export interface LaunchAgentInput {
   // separate from systemPrompt/agent.md launch framing — that positional-arg
   // path must stay byte-identical whether or not this field is set.
   initialUserPrompt?: string;
+  // WP-A.2 (browser-parity-and-capability-isolation F9): when launching an
+  // agent that should join a team immediately, pass the team id (+ optional
+  // role) so `launchAgent` records the membership BEFORE the per-launch MCP
+  // injection runs — the team `--mcp-config` is then injected inline at launch
+  // instead of being merged into a token-bearing root `.mcp.json` after the
+  // fact. Used by team resurrect.
+  teamId?: string;
+  teamRole?: string;
 }
 
 export interface AgentPersona {
@@ -294,6 +327,153 @@ export interface OpenFileTabRequest {
   rootDirectory?: string;    // enriched by main when workspaceId resolves
   agentId?: string;
 }
+
+// ── Detachable (tear-off) file tabs ─────────────────────────────────────
+// plans/detachable-file-tabs-plan.md §4. A DetachRequest is the renderer→main
+// payload when a file tab is dragged out of the strip onto empty desktop; main
+// spawns a trusted, editable detached BrowserWindow that owns the file.
+
+export interface DetachRequest {
+  filePath: string;
+  rootDirectory: string;
+  pathType: PathType;
+  workspaceId: string;
+  label: string;
+  x: number;   // screen coords (cursor at release)
+  y: number;
+}
+
+// main→shell when a detached window closes, so the shell can re-add the tab
+// from disk (the closing window saves/discards in-window before emitting this).
+export interface DetachedClosedPayload {
+  filePath: string;
+  rootDirectory: string;
+  pathType: PathType;
+  workspaceId: string;
+  label: string;
+}
+
+export interface DetachResult {
+  ok: boolean;
+  focusedExisting?: boolean;
+  error?: string;
+}
+
+export const TAB_CHANNELS = {
+  detach: 'tabs:detach',
+  closed: 'tab-sync:closed',
+  // Phase 2 dirty-on-close request/response:
+  closeQuery: 'tab-sync:close-query',       // main → detached renderer (with requestId)
+  closeReply: 'tab-sync:close-reply',       // detached renderer → main (invoke, returns decision)
+} as const;
+
+// ── Selection comments (WP-P5) ──────────────────────────────────────────
+// plans/selection-to-agent-primitive-plan.md §5 (schema) / §7 WP-P5-A.
+// Persisted file-target comments; chat/note targets keep the discriminator
+// but have no columns or implementation until a slice builds them.
+
+export type SelectionCommentTargetType = 'file' | 'chat-message' | 'note';
+
+// A row is either a comment (has a body, can be sent to an agent) or a plain
+// highlight (no body — just a persisted, painted marker over the quoted text).
+// Both share the anchor/reattach machinery; the kind only changes how the
+// gutter renders the row.
+export type SelectionCommentKind = 'comment' | 'highlight';
+
+export type SelectionCommentStatus =
+  | 'draft'
+  | 'queued'
+  | 'sent'
+  | 'send_failed'
+  | 'needs-review'
+  | 'resolved'
+  | 'orphaned';
+
+export interface SelectionComment {
+  id: string;
+  workspaceId: string;
+  targetType: SelectionCommentTargetType;
+  /** 'comment' (default) or 'highlight'. */
+  kind: SelectionCommentKind;
+  // File target columns (the only implemented target). Null for hypothetical
+  // future chat/note rows.
+  filePath: string | null;
+  pathType: PathType | null;
+  rootDirectory: string | null;
+  // Reattach anchors (plan §7 WP-P5-B does the reattach; rows just carry them).
+  docHash: string | null;
+  anchorStart: number | null;
+  anchorEnd: number | null;
+  lineStart: number | null;
+  lineEnd: number | null;
+  prefix: string | null;
+  suffix: string | null;
+  quotedText: string;
+  body: string;
+  status: SelectionCommentStatus;
+  sentToAgentId: string | null;
+  createdAt: string;
+  updatedAt: string;
+  sentAt: string | null;
+  resolvedAt: string | null;
+}
+
+export interface CreateSelectionCommentInput {
+  workspaceId: string;
+  /** Defaults to 'file' — the only target persisted in slice 2. */
+  targetType?: SelectionCommentTargetType;
+  /** Defaults to 'comment'. 'highlight' rows carry an empty body. */
+  kind?: SelectionCommentKind;
+  filePath: string;
+  pathType?: PathType;
+  rootDirectory?: string;
+  docHash?: string;
+  anchorStart?: number;
+  anchorEnd?: number;
+  lineStart?: number;
+  lineEnd?: number;
+  /** ~32 chars of context either side of the quote, for reattach. */
+  prefix?: string;
+  suffix?: string;
+  quotedText: string;
+  body: string;
+}
+
+export interface UpdateSelectionCommentInput {
+  body?: string;
+  quotedText?: string;
+  /** Reattach bookkeeping ('orphaned'/'needs-review') is set through here. */
+  status?: SelectionCommentStatus;
+  docHash?: string | null;
+  anchorStart?: number | null;
+  anchorEnd?: number | null;
+  lineStart?: number | null;
+  lineEnd?: number | null;
+  prefix?: string | null;
+  suffix?: string | null;
+}
+
+export type SelectionCommentSendTarget =
+  | { kind: 'new' }
+  | { kind: 'existing'; agentId: string };
+
+export interface SendSelectionCommentsRequest {
+  /** One or many comment ids; a multi-id send builds ONE numbered
+   *  [SELECTION COMMENT] prompt (plan §4). All ids must share a file. */
+  commentIds: string[];
+  target: SelectionCommentSendTarget;
+}
+
+/** Result of `comments:send`. `ok: true` means the rows went `queued` and
+ *  delivery is in flight in the main process (rows transition to
+ *  `sent`/`send_failed` there; listen on `comments.onChanged`). All
+ *  `ok: false` cases except 'launch-failed' are synchronous gates that left
+ *  the rows untouched (still `draft`). 'agent-busy' carries the built prompt
+ *  so the renderer can run the slice-1 prompt-staging fallback verbatim. */
+export type SendSelectionCommentsResult =
+  | { ok: true; agentId: string; launched: boolean }
+  | { ok: false; code: 'agent-busy'; error: string; prompt: string }
+  | { ok: false; code: 'agent-not-found' | 'comment-not-found' | 'invalid-request' | 'launch-failed'; error: string };
 
 // ── Team interfaces ─────────────────────────────────────────────────────
 
@@ -562,6 +742,18 @@ export interface IpcApi {
     update: (id: string, updates: Partial<CreateAgentTemplateInput>) => Promise<AgentTemplate>;
     delete: (id: string) => Promise<void>;
   };
+  /** WP-P5-A — persisted selection comments (file-target only). */
+  comments: {
+    create: (input: CreateSelectionCommentInput) => Promise<SelectionComment>;
+    list: (workspaceId: string, filePath: string) => Promise<SelectionComment[]>;
+    update: (id: string, updates: UpdateSelectionCommentInput) => Promise<SelectionComment | null>;
+    delete: (id: string) => Promise<void>;
+    resolve: (id: string) => Promise<SelectionComment | null>;
+    send: (request: SendSelectionCommentsRequest) => Promise<SendSelectionCommentsResult>;
+    /** Fired by main when async send transitions land (queued → sent /
+     *  send_failed). Payload carries the fresh rows. */
+    onChanged: (callback: (payload: { comments: SelectionComment[] }) => void) => () => void;
+  };
   personas: {
     list: (workspacePath: string, pathType: PathType) => Promise<AgentPersona[]>;
     create: (workspacePath: string, pathType: PathType, name: string, customClaudeMd?: string) => Promise<AgentPersona>;
@@ -587,8 +779,84 @@ export interface IpcApi {
     setBounds: (bounds: BrowserBounds) => Promise<void>;
     /** Pane suspension so renderer overlays aren't painted over. */
     setVisible: (visible: boolean) => Promise<void>;
+    /** Per-workspace isolation: tell main which workspace the human is viewing
+     *  so the tab strip / visibility / new-tab stamping scope to it. */
+    setActiveWorkspace: (workspaceId: string | null) => Promise<void>;
+    /** M12 coarse act-tier gate (dashboard-global runtime flag). Reads current
+     *  state; the setter echoes the resulting state. Not persisted. */
+    getActionsEnabled: () => Promise<boolean>;
+    setActionsEnabled: (enabled: boolean) => Promise<boolean>;
     onTabState: (callback: (state: BrowserTabState) => void) => () => void;
     onOpenRequest: (callback: (request: BrowserOpenRequest) => void) => () => void;
+
+    // ── Overhaul (WP0) — additive plumbing (frozen shapes in ./browser). ──────
+    // Tab management (WP7) — main authoritative for order/pin/closed-tab stack.
+    reorderTab: (tabId: string, toOrder: number) => Promise<void>;
+    setTabPinned: (tabId: string, pinned: boolean) => Promise<void>;
+    reopenClosedTab: () => Promise<{ tabId: string } | null>;
+    // Find-in-page + zoom (WP5).
+    findInPage: (
+      tabId: string,
+      text: string,
+      opts?: { forward?: boolean; findNext?: boolean },
+    ) => Promise<void>;
+    stopFindInPage: (tabId: string) => Promise<void>;
+    setZoom: (tabId: string, zoomFactor: number) => Promise<void>;
+    // Native context menu (WP6) — renderer forwards coords; main pops the menu.
+    contextMenuRequest: (tabId: string, params: BrowserContextMenuParams) => Promise<void>;
+    // Bookmarks (WP3) — USER-PARTITION ONLY.
+    bookmarkList: () => Promise<Bookmark[]>;
+    bookmarkAdd: (input: { title: string; url: string }) => Promise<Bookmark>;
+    bookmarkRemove: (id: string) => Promise<void>;
+    bookmarkReorder: (orderedIds: string[]) => Promise<void>;
+    // History (WP4) — USER-PARTITION ONLY.
+    historyList: (query?: HistoryQuery) => Promise<HistoryEntry[]>;
+    historyDelete: (id: string) => Promise<void>;
+    historyClear: () => Promise<void>;
+    // Event subscriptions (main → renderer); each returns an unsubscribe fn.
+    onTabsSnapshot: (callback: (entries: BrowserTabSnapshotEntry[]) => void) => () => void;
+    onShortcutCommand: (
+      callback: (shortcut: BrowserShortcut, ctx: { tabId: string }) => void,
+    ) => () => void;
+    onFoundInPage: (callback: (result: BrowserFindResult) => void) => () => void;
+    onContextMenuCommand: (
+      callback: (action: string, params: BrowserContextMenuParams) => void,
+    ) => () => void;
+    onBookmarksChanged: (callback: (bookmarks: Bookmark[]) => void) => () => void;
+
+    // ── Website-access policy (plans/website-allowlist-simplification.md) ──────
+    // ONE agent allowlist; enforcement keyed to the Agent Actions toggle (no
+    // per-list mode). Trusted shell chrome only. Mutations invalidate the
+    // main-side access cache and emit `accessChanged`; request decisions also
+    // emit `accessRequestsChanged`.
+    access: {
+      list: () => Promise<AccessRule[]>;
+      add: (input: AccessRuleInput) => Promise<AccessRule>;
+      update: (
+        id: string,
+        patch: Partial<AccessRuleInput> & { enabled?: boolean },
+      ) => Promise<AccessRule>;
+      remove: (id: string) => Promise<void>;
+      onChanged: (callback: () => void) => () => void;
+      // Agent-initiated requests (§18).
+      requestList: () => Promise<AccessRequest[]>;
+      requestDecide: (id: string, decision: AccessRequestDecision) => Promise<void>;
+      onRequestsChanged: (callback: () => void) => () => void;
+      // Authenticated-drive handoff IPCs (§14). Trusted-chrome only.
+      handoffSignin: (ruleId: string) => Promise<AccessHandoffResult>;
+      handoffReady: (tabId: string) => Promise<void>;
+      tabHandToAgent: (tabId: string) => Promise<void>;
+      tabReturnToHuman: (tabId: string) => Promise<void>;
+      clearSiteSession: (ruleId: string) => Promise<void>;
+    };
+  };
+  // Detachable (tear-off) file tabs — plans/detachable-file-tabs-plan.md §4.
+  tabs: {
+    detach: (req: DetachRequest) => Promise<DetachResult>;
+    onDetachedClosed: (callback: (payload: DetachedClosedPayload) => void) => () => void;
+    // Phase 2 dirty-on-close protocol — declared now, wired in Phase 2.
+    onCloseQuery: (callback: (req: { requestId: string }) => void) => () => void;
+    closeReply: (requestId: string, decision: 'save' | 'discard' | 'cancel') => Promise<void>;
   };
   onAgentStatusChanged: (callback: (data: { agentId: string; status: AgentStatus; agent: Agent }) => void) => () => void;
   onOpenFileTab: (callback: (payload: OpenFileTabRequest) => void) => () => void;

@@ -296,11 +296,19 @@ export default function AgentCard({
         <div className="flex items-center justify-between gap-2 mb-0.5">
           <div className="flex items-center gap-2 min-w-0">
             <span className="text-[11px] text-gray-500 font-mono shrink-0">#{agent.id.substring(0,6)}</span>
-            {agent.isSupervised && (
-               <span className="text-[11px] text-purple-400 bg-purple-500/15 px-1.5 py-0.5 font-semibold truncate">Supervised</span>
-            )}
-            {agent.isWorker && !agent.isSupervised && (
-               <span className="text-[11px] text-sky-400 bg-sky-500/15 px-1.5 py-0.5 font-semibold truncate" title="Status derived from turn-boundary hooks">Worker</span>
+            {/* Role chip — one of Supervisor / Researcher / Worker. Supervision
+                is orthogonal and rendered as its own badge below. */}
+            {agent.isSupervisor ? (
+               <span className="text-[11px] text-amber-400 bg-amber-500/15 px-1.5 py-0.5 font-semibold truncate" title="Supervisor — watches workers and routes questions to the human">Supervisor</span>
+            ) : agent.isResearcher ? (
+               <span className="text-[11px] text-teal-400 bg-teal-500/15 px-1.5 py-0.5 font-semibold truncate" title="Researcher — browses and researches the web in an app-managed sandbox; never edits code">Researcher</span>
+            ) : agent.isWorker ? (
+               <span className="text-[11px] text-sky-400 bg-sky-500/15 px-1.5 py-0.5 font-semibold truncate" title="Worker — status derived from turn-boundary hooks">Worker</span>
+            ) : null}
+            {/* Supervised badge — orthogonal to the role chip (a worker or
+                researcher may or may not be supervised). */}
+            {agent.isSupervised && !agent.isSupervisor && (
+               <span className="text-[11px] text-purple-400 bg-purple-500/15 px-1.5 py-0.5 font-semibold truncate" title="A supervisor watches this agent's status and routes its questions to the human">Supervised</span>
             )}
           </div>
 

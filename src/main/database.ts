@@ -2,7 +2,7 @@ import Database from 'better-sqlite3';
 import path from 'path';
 import fs from 'fs';
 import { v4 as uuidv4 } from 'uuid';
-import { Agent, AgentProvider, AgentStatus, AgentTemplate, CreateAgentTemplateInput, CreateWorkspaceInput, CreateTeamInput, FileActivity, FileOperation, Team, TeamChannel, TeamMember, TeamMessage, TeamMessageStatus, TeamStatus, TeamTask, TeamTaskStatus, Workspace } from '../shared/types';
+import { Agent, AgentProvider, AgentStatus, AgentTemplate, CreateAgentTemplateInput, CreateSelectionCommentInput, CreateWorkspaceInput, CreateTeamInput, FileActivity, FileOperation, SelectionComment, SelectionCommentStatus, Team, TeamChannel, TeamMember, TeamMessage, TeamMessageStatus, TeamStatus, TeamTask, TeamTaskStatus, UpdateSelectionCommentInput, Workspace } from '../shared/types';
 import { DEFAULT_COMMAND, DEFAULT_COMMAND_WSL, SUPERVISOR_AGENT_MD } from '../shared/constants';
 import { OrchestrationEvent, OrchestrationRun } from './orchestration/types';
 
@@ -98,6 +98,12 @@ export function initDatabase(): void {
   // .dashboard/workers/<provider>/, disables PTY + chat-event inference; does
   // NOT notify a supervisor). Orthogonal to is_supervised; see Agent.isWorker.
   try { db.exec(`ALTER TABLE agents ADD COLUMN is_worker INTEGER NOT NULL DEFAULT 0`); } catch { /* column already exists */ }
+
+  // Migration: add is_researcher column (browser-parity-and-capability-isolation
+  // §0, D-1) — the researcher role-lane: scaffolded into .dashboard/researcher,
+  // browser MCP only, native dangerous tools withheld. Mutually exclusive with
+  // the other lane flags; see Agent.isResearcher.
+  try { db.exec(`ALTER TABLE agents ADD COLUMN is_researcher INTEGER DEFAULT 0`); } catch { /* column already exists */ }
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS events (
@@ -229,6 +235,170 @@ export function initDatabase(): void {
     )
   `);
 
+  // ── Embedded-browser tables (overhaul WP3/WP4) ─────────────────────────
+  // Bookmarks + history persistence for the embedded browser. USER-PARTITION
+  // ONLY — the browser manager enforces the partition gate; these tables never
+  // receive agent-partition URLs (persistence half of the M9 discipline). The
+  // thin services live in src/main/browser/{bookmarks,history}-store.ts; they
+  // reach the singleton handle via getDb(). Times are epoch-ms integers
+  // (Date.now()), unlike the team/agent tables' datetime('now') text columns,
+  // because the renderer-facing Bookmark/HistoryEntry contracts use numbers.
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS browser_bookmarks (
+      id          TEXT PRIMARY KEY,
+      title       TEXT NOT NULL,
+      url         TEXT NOT NULL,
+      created_at  INTEGER NOT NULL,
+      sort_order  INTEGER NOT NULL
+    )
+  `);
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS browser_history (
+      id           TEXT PRIMARY KEY,
+      url          TEXT NOT NULL,
+      title        TEXT,
+      visited_at   INTEGER NOT NULL,
+      visit_count  INTEGER NOT NULL DEFAULT 1
+    )
+  `);
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_history_visited
+      ON browser_history(visited_at DESC)
+  `);
+
+  // ── Website-access policy tables (plans/website-allowlist-simplification.md) ─
+  // ONE human-curated agent allowlist for the embedded browser. Stored in the
+  // dashboard DB (userData, outside the workspace) so the agent's file tools can
+  // never reach them — a prompt-injected agent cannot widen its own allowlist.
+  // Enforcement is keyed SOLELY to the Agent Actions toggle (no per-list mode).
+  // The legacy two-valued `list` column is retained (NOT NULL) and pinned to
+  // 'agent' by the store; the browser_access_modes table is LEGACY and unused
+  // (no code reads it). Times are epoch-ms.
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS browser_access_rules (
+      id                 TEXT PRIMARY KEY,
+      list               TEXT NOT NULL CHECK (list IN ('agent','human')),
+      hostname           TEXT NOT NULL,              -- normalized via new URL().hostname
+      include_subdomains INTEGER NOT NULL DEFAULT 1,
+      scheme             TEXT NOT NULL DEFAULT 'https' CHECK (scheme IN ('https','http','any')),
+      path_prefix        TEXT,                       -- optional; starts with '/'; NULL = whole host
+      note               TEXT,
+      allow_signed_in    INTEGER NOT NULL DEFAULT 0, -- §13: per-row "allow while signed in" (List-A only)
+      enabled            INTEGER NOT NULL DEFAULT 1,
+      created_at         INTEGER NOT NULL
+    )
+  `);
+  // §13 additive migration for installs created before allow_signed_in existed
+  // (house try/catch ALTER idiom — no PRAGMA/version table; see siblings below).
+  try {
+    db.exec(`ALTER TABLE browser_access_rules ADD COLUMN allow_signed_in INTEGER NOT NULL DEFAULT 0`);
+  } catch { /* column already exists */ }
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_access_rules_list
+      ON browser_access_rules(list, enabled)
+  `);
+
+  // LEGACY (website-allowlist-simplification): the per-list off/enforce mode was
+  // removed — enforcement is now keyed solely to the Agent Actions toggle. The
+  // table is left in place for old installs but NO code reads or writes it.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS browser_access_modes (
+      list       TEXT PRIMARY KEY CHECK (list IN ('agent','human')),
+      mode       TEXT NOT NULL CHECK (mode IN ('off','enforce')),
+      updated_at INTEGER NOT NULL
+    )
+  `);
+
+  // §13: per-rule authenticated origins (for revocation breadth — origin-scoped
+  // storage cannot be wildcard-cleared, so the authenticated origins are tracked).
+  // Survives restart (the cookies do); rows deleted when the rule is deleted.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS browser_access_signed_in_origins (
+      rule_id TEXT NOT NULL,
+      origin  TEXT NOT NULL,
+      PRIMARY KEY (rule_id, origin)
+    )
+  `);
+
+  // §18.2: agent-initiated access requests. INERT — a pending request grants
+  // ZERO access; only a human approval creates a real browser_access_rules row.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS browser_access_requests (
+      id                 TEXT PRIMARY KEY,
+      list               TEXT NOT NULL DEFAULT 'agent' CHECK (list IN ('agent')),
+      hostname           TEXT NOT NULL,              -- normalized, server-side
+      include_subdomains INTEGER NOT NULL DEFAULT 1,
+      scheme             TEXT NOT NULL DEFAULT 'https' CHECK (scheme IN ('https','http','any')),
+      path_prefix        TEXT,
+      want_signed_in     INTEGER NOT NULL DEFAULT 0,
+      requested_by       TEXT NOT NULL,              -- agent id
+      requested_by_title TEXT,                       -- agent title at request time (display)
+      reason             TEXT,                       -- UNTRUSTED free text; render escaped
+      status             TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','denied')),
+      created_at         INTEGER NOT NULL,
+      decided_at         INTEGER
+    )
+  `);
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_access_requests_status
+      ON browser_access_requests(status, created_at)
+  `);
+
+  // ── Selection comments table ──────────────────────────────────────────
+  // WP-P5 — persisted file-target selection comments. Schema recorded in
+  // plans/selection-to-agent-primitive-plan.md §5; copied exactly. No generic
+  // target_id column by design; chat/note columns are added by ALTER TABLE if
+  // and when those targets are ever built. SQLite's updated_at default is
+  // insert-only — every update helper below maintains it explicitly.
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS selection_comments (
+      id TEXT PRIMARY KEY,
+      workspace_id TEXT NOT NULL,
+      target_type TEXT NOT NULL CHECK (target_type IN ('file','chat-message','note')),
+      -- file target columns (the only target implemented; chat/note columns are added by
+      -- ALTER TABLE if and when those targets are ever built — do not pre-create them)
+      file_path TEXT,
+      path_type TEXT,
+      root_directory TEXT,
+      doc_hash TEXT,
+      anchor_start INTEGER,
+      anchor_end INTEGER,
+      line_start INTEGER,
+      line_end INTEGER,
+      prefix TEXT,
+      suffix TEXT,
+      -- generic
+      quoted_text TEXT NOT NULL,
+      body TEXT NOT NULL,
+      status TEXT NOT NULL CHECK (status IN
+        ('draft','queued','sent','send_failed','needs-review','resolved','orphaned')),
+      sent_to_agent_id TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      sent_at TEXT,
+      resolved_at TEXT
+    )
+  `);
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_selcomments_ws_file
+      ON selection_comments (workspace_id, file_path, status)
+  `);
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_selcomments_agent
+      ON selection_comments (sent_to_agent_id)
+  `);
+
+  // Additive migration for installs predating the highlight feature (house
+  // try/catch ALTER idiom — see the browser_access_rules sibling above). A
+  // row is a comment unless explicitly a 'highlight'.
+  try {
+    db.exec(`ALTER TABLE selection_comments ADD COLUMN kind TEXT NOT NULL DEFAULT 'comment'`);
+  } catch { /* column already exists */ }
+
   // ── Agent templates table ────────────────────────────────────────────
 
   db.exec(`
@@ -353,6 +523,7 @@ function rowToAgent(row: any): Agent {
     isSupervisor: !!row.is_supervisor,
     isSupervised: !!row.is_supervised,
     isWorker: !!row.is_worker,
+    isResearcher: !!row.is_researcher,
     tmuxSessionName: row.tmux_session_name,
     autoRestartEnabled: !!row.auto_restart_enabled,
     resumeSessionId: row.resume_session_id,
@@ -372,6 +543,16 @@ function rowToAgent(row: any): Agent {
     lastOutputAt: row.last_output_at,
     lastAttachedAt: row.last_attached_at,
   };
+}
+
+/** Accessor for the process-wide better-sqlite3 handle. Used by sibling main
+ *  modules (e.g. the embedded-browser bookmarks/history stores) that own their
+ *  own prepared statements but must share the one initialized connection.
+ *  Throws if called before initDatabase() — a programming error, not a runtime
+ *  condition to handle. */
+export function getDb(): Database.Database {
+  if (!db) throw new Error('getDb() called before initDatabase()');
+  return db;
 }
 
 function queryAll(sql: string, params: any[] = []): any[] {
@@ -439,6 +620,7 @@ export function createAgent(data: {
   isSupervisor?: boolean;
   isSupervised?: boolean;
   isWorker?: boolean;
+  isResearcher?: boolean;
   tmuxSessionName: string | null;
   autoRestartEnabled: boolean;
   logPath: string;
@@ -449,10 +631,10 @@ export function createAgent(data: {
   const slug = slugify(data.title);
   run(
     `INSERT INTO agents (id, workspace_id, title, slug, role_description, working_directory,
-      command, provider, is_supervisor, is_supervised, is_worker, tmux_session_name, auto_restart_enabled, log_path, template_id, system_prompt)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      command, provider, is_supervisor, is_supervised, is_worker, is_researcher, tmux_session_name, auto_restart_enabled, log_path, template_id, system_prompt)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [id, data.workspaceId, data.title, slug, data.roleDescription, data.workingDirectory,
-      data.command, data.provider || 'claude', data.isSupervisor ? 1 : 0, data.isSupervised ? 1 : 0, data.isWorker ? 1 : 0, data.tmuxSessionName, data.autoRestartEnabled ? 1 : 0, data.logPath,
+      data.command, data.provider || 'claude', data.isSupervisor ? 1 : 0, data.isSupervised ? 1 : 0, data.isWorker ? 1 : 0, data.isResearcher ? 1 : 0, data.tmuxSessionName, data.autoRestartEnabled ? 1 : 0, data.logPath,
       data.templateId || null, data.systemPrompt || null]
   );
   return getAgent(id)!;
@@ -1099,6 +1281,141 @@ export function updateTeamTask(taskId: string, updates: {
 export function getTeamTasks(teamId: string): TeamTask[] {
   return queryAll('SELECT * FROM team_tasks WHERE team_id = ? ORDER BY created_at ASC', [teamId])
     .map(rowToTeamTask);
+}
+
+// ── Selection comment operations (WP-P5-A) ─────────────────────────────────
+// Every mutation helper maintains updated_at explicitly — the column default
+// only covers the insert (plan §5 note).
+
+function rowToSelectionComment(row: any): SelectionComment {
+  return {
+    id: row.id,
+    workspaceId: row.workspace_id,
+    targetType: row.target_type,
+    kind: row.kind ?? 'comment',
+    filePath: row.file_path ?? null,
+    pathType: row.path_type ?? null,
+    rootDirectory: row.root_directory ?? null,
+    docHash: row.doc_hash ?? null,
+    anchorStart: row.anchor_start ?? null,
+    anchorEnd: row.anchor_end ?? null,
+    lineStart: row.line_start ?? null,
+    lineEnd: row.line_end ?? null,
+    prefix: row.prefix ?? null,
+    suffix: row.suffix ?? null,
+    quotedText: row.quoted_text,
+    body: row.body,
+    status: row.status as SelectionCommentStatus,
+    sentToAgentId: row.sent_to_agent_id ?? null,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    sentAt: row.sent_at ?? null,
+    resolvedAt: row.resolved_at ?? null,
+  };
+}
+
+export function createSelectionComment(input: CreateSelectionCommentInput): SelectionComment {
+  const id = uuidv4();
+  run(
+    `INSERT INTO selection_comments (
+       id, workspace_id, target_type, kind, file_path, path_type, root_directory,
+       doc_hash, anchor_start, anchor_end, line_start, line_end, prefix, suffix,
+       quoted_text, body, status
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft')`,
+    [
+      id, input.workspaceId, input.targetType ?? 'file', input.kind ?? 'comment',
+      input.filePath,
+      input.pathType ?? null, input.rootDirectory ?? null, input.docHash ?? null,
+      input.anchorStart ?? null, input.anchorEnd ?? null,
+      input.lineStart ?? null, input.lineEnd ?? null,
+      input.prefix ?? null, input.suffix ?? null,
+      input.quotedText, input.body,
+    ]
+  );
+  return getSelectionComment(id)!;
+}
+
+export function getSelectionComment(id: string): SelectionComment | null {
+  const row = queryOne('SELECT * FROM selection_comments WHERE id = ?', [id]);
+  return row ? rowToSelectionComment(row) : null;
+}
+
+/** All comments for one file in one workspace, every status, oldest first
+ *  (gutter order). The renderer filters by status as needed. */
+export function listSelectionComments(workspaceId: string, filePath: string): SelectionComment[] {
+  return queryAll(
+    `SELECT * FROM selection_comments
+     WHERE workspace_id = ? AND file_path = ?
+     ORDER BY created_at ASC, id ASC`,
+    [workspaceId, filePath]
+  ).map(rowToSelectionComment);
+}
+
+export function updateSelectionComment(id: string, updates: UpdateSelectionCommentInput): SelectionComment | null {
+  const sets: string[] = [];
+  const params: any[] = [];
+
+  if (updates.body !== undefined) { sets.push('body = ?'); params.push(updates.body); }
+  if (updates.quotedText !== undefined) { sets.push('quoted_text = ?'); params.push(updates.quotedText); }
+  if (updates.status !== undefined) { sets.push('status = ?'); params.push(updates.status); }
+  if (updates.docHash !== undefined) { sets.push('doc_hash = ?'); params.push(updates.docHash); }
+  if (updates.anchorStart !== undefined) { sets.push('anchor_start = ?'); params.push(updates.anchorStart); }
+  if (updates.anchorEnd !== undefined) { sets.push('anchor_end = ?'); params.push(updates.anchorEnd); }
+  if (updates.lineStart !== undefined) { sets.push('line_start = ?'); params.push(updates.lineStart); }
+  if (updates.lineEnd !== undefined) { sets.push('line_end = ?'); params.push(updates.lineEnd); }
+  if (updates.prefix !== undefined) { sets.push('prefix = ?'); params.push(updates.prefix); }
+  if (updates.suffix !== undefined) { sets.push('suffix = ?'); params.push(updates.suffix); }
+
+  if (sets.length > 0) {
+    sets.push("updated_at = datetime('now')");
+    params.push(id);
+    run(`UPDATE selection_comments SET ${sets.join(', ')} WHERE id = ?`, params);
+  }
+  return getSelectionComment(id);
+}
+
+export function deleteSelectionComment(id: string): void {
+  run('DELETE FROM selection_comments WHERE id = ?', [id]);
+}
+
+export function resolveSelectionComment(id: string): SelectionComment | null {
+  run(
+    `UPDATE selection_comments
+     SET status = 'resolved', resolved_at = datetime('now'), updated_at = datetime('now')
+     WHERE id = ?`,
+    [id]
+  );
+  return getSelectionComment(id);
+}
+
+// `comments:send` status machine (plan §1.8: transitions written next to the
+// DB by the main process, not chased from the renderer).
+
+export function markSelectionCommentsQueued(ids: string[], agentId: string | null): void {
+  const stmt = db.prepare(
+    `UPDATE selection_comments
+     SET status = 'queued', sent_to_agent_id = ?, updated_at = datetime('now')
+     WHERE id = ?`
+  );
+  for (const id of ids) stmt.run(agentId, id);
+}
+
+export function markSelectionCommentsSent(ids: string[], agentId: string): void {
+  const stmt = db.prepare(
+    `UPDATE selection_comments
+     SET status = 'sent', sent_to_agent_id = ?, sent_at = datetime('now'), updated_at = datetime('now')
+     WHERE id = ?`
+  );
+  for (const id of ids) stmt.run(agentId, id);
+}
+
+export function markSelectionCommentsSendFailed(ids: string[]): void {
+  const stmt = db.prepare(
+    `UPDATE selection_comments
+     SET status = 'send_failed', updated_at = datetime('now')
+     WHERE id = ?`
+  );
+  for (const id of ids) stmt.run(id);
 }
 
 // ── Orchestration operations ──────────────────────────────────────────────

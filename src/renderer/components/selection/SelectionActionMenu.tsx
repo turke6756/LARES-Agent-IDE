@@ -5,8 +5,10 @@ import AgentPickerDropdown from './AgentPickerDropdown';
 
 // Portal-rendered context menu for an active text selection.
 // Style precedent: src/renderer/components/shared/FileContextMenu.tsx.
-// "Add comment…" renders only on surfaces with persistence capability
-// (none in slice 1 — see plan §1.1).
+// "Comment & send…" is the universal one-shot flow (WP-P5 user scope §1):
+// available on every surface, opens AddCommentPopover in send mode.
+// "Add comment…" (staged draft) renders only on surfaces with persistence
+// capability — file surfaces in slice 2.
 
 interface Props {
   x: number;
@@ -15,10 +17,12 @@ interface Props {
   onClose: () => void;
   onPickAgent: (target: SelectionAgentTarget) => void;
   onAddComment?: () => void;
+  onCommentAndSend?: () => void;
+  onHighlight?: () => void;
 }
 
 export default function SelectionActionMenu({
-  x, y, context, onClose, onPickAgent, onAddComment,
+  x, y, context, onClose, onPickAgent, onAddComment, onCommentAndSend, onHighlight,
 }: Props) {
   const menuRef = useRef<HTMLDivElement>(null);
   const [pickerOpen, setPickerOpen] = useState(false);
@@ -65,9 +69,31 @@ export default function SelectionActionMenu({
           onPick={onPickAgent}
         />
       )}
+      {onCommentAndSend && (
+        <button
+          onClick={() => {
+            onCommentAndSend();
+            onClose();
+          }}
+          className="ui-menu-item"
+        >
+          Comment &amp; send…
+        </button>
+      )}
       {context.capabilities.comment && onAddComment && (
         <button onClick={handleAddComment} className="ui-menu-item">
           Add comment…
+        </button>
+      )}
+      {context.capabilities.comment && onHighlight && (
+        <button
+          onClick={() => {
+            onHighlight();
+            onClose();
+          }}
+          className="ui-menu-item"
+        >
+          Highlight
         </button>
       )}
       <div className="ui-menu-divider" />

@@ -6,11 +6,85 @@ import { SUPERVISOR_AGENT_NAME } from '../shared/constants';
 
 const VALID_NAME = /^[a-z0-9_-]+$/;
 
+// Custom agent personas live under .dashboard/agents/<name>/ (relocated from the
+// legacy .claude/agents/ path, which the harness gates behind an interactive
+// edit-confirmation dialog even with bypass-permissions on — see CLAUDE.md
+// "avoid .claude/"). migratePersonas() below lifts any pre-existing legacy
+// personas into the new location on first scan.
+const LEGACY_REL = ['.claude', 'agents'];
+const PERSONAS_REL = ['.dashboard', 'agents'];
+
 /**
- * Scan .claude/agents/ for subdirectories containing CLAUDE.md.
- * Each is a persistent agent persona.
+ * One-time, idempotent migration: copy any persona that still lives under the
+ * legacy `.claude/agents/<name>/` into `.dashboard/agents/<name>/`. Existing
+ * `.dashboard/agents/` entries are never clobbered; the supervisor persona is
+ * skipped (it lives at `.dashboard/supervisor/`, not in the agents dir). Logs
+ * each persona it moves. Safe to call on every scan — once the copy exists it
+ * is a no-op.
+ */
+export function migratePersonas(workspacePath: string, pathType: PathType): void {
+  if (pathType === 'wsl') {
+    try {
+      const env = { ...process.env };
+      delete env.CLAUDECODE;
+      delete env.ELECTRON_RUN_AS_NODE;
+      // For each legacy persona dir with a CLAUDE.md, copy it into
+      // .dashboard/agents/ unless a same-named entry already exists there.
+      const script =
+        `legacy='${workspacePath}/.claude/agents'; dest='${workspacePath}/.dashboard/agents'; ` +
+        `[ -d "$legacy" ] || exit 0; mkdir -p "$dest"; ` +
+        `for d in "$legacy"/*/; do ` +
+        `[ -f "$d/CLAUDE.md" ] || continue; ` +
+        `name=$(basename "$d"); ` +
+        `[ "$name" = "${SUPERVISOR_AGENT_NAME}" ] && continue; ` +
+        `[ -e "$dest/$name" ] && continue; ` +
+        `cp -r "$d" "$dest/$name" && echo "$name"; ` +
+        `done 2>/dev/null || true`;
+      const { stdout } = require('child_process').execFileSync(
+        'wsl.exe',
+        ['bash', '-lc', script],
+        { encoding: 'utf-8', timeout: 15000, env },
+      ) as { stdout: string };
+      const moved = (stdout || '').trim().split('\n').filter(Boolean);
+      for (const name of moved) {
+        console.log(`[persona] Migrated legacy persona "${name}" → .dashboard/agents/${name}`);
+      }
+    } catch {
+      // Legacy dir absent or WSL unavailable — nothing to migrate.
+    }
+    return;
+  }
+
+  const legacyDir = path.join(workspacePath, ...LEGACY_REL);
+  if (!fs.existsSync(legacyDir)) return;
+  const destDir = path.join(workspacePath, ...PERSONAS_REL);
+  try {
+    const entries = fs.readdirSync(legacyDir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      if (entry.name === SUPERVISOR_AGENT_NAME) continue;
+      const src = path.join(legacyDir, entry.name);
+      if (!fs.existsSync(path.join(src, 'CLAUDE.md'))) continue;
+      const dst = path.join(destDir, entry.name);
+      if (fs.existsSync(dst)) continue; // don't clobber existing .dashboard/agents entry
+      fs.mkdirSync(destDir, { recursive: true });
+      fs.cpSync(src, dst, { recursive: true });
+      console.log(`[persona] Migrated legacy persona "${entry.name}" → .dashboard/agents/${entry.name}`);
+    }
+  } catch {
+    // Permission error or similar — leave legacy in place.
+  }
+}
+
+/**
+ * Scan .dashboard/agents/ for subdirectories containing CLAUDE.md.
+ * Each is a persistent agent persona (custom agent type).
  */
 export function scanPersonas(workspacePath: string, pathType: PathType): AgentPersona[] {
+  // Lift any legacy .claude/agents/ personas into .dashboard/agents/ first so
+  // existing custom agents keep showing up after the relocation.
+  migratePersonas(workspacePath, pathType);
+
   const personas: AgentPersona[] = [];
 
   if (pathType === 'wsl') {
@@ -20,12 +94,12 @@ export function scanPersonas(workspacePath: string, pathType: PathType): AgentPe
       delete env.ELECTRON_RUN_AS_NODE;
       const { stdout } = require('child_process').execFileSync(
         'wsl.exe',
-        ['bash', '-lc', `for d in '${workspacePath}'/.claude/agents/*/; do [ -f "$d/CLAUDE.md" ] && basename "$d"; done 2>/dev/null || true`],
+        ['bash', '-lc', `for d in '${workspacePath}'/.dashboard/agents/*/; do [ -f "$d/CLAUDE.md" ] && basename "$d"; done 2>/dev/null || true`],
         { encoding: 'utf-8', timeout: 10000, env }
       ) as { stdout: string };
       const names = (stdout || '').trim().split('\n').filter(Boolean);
       for (const name of names) {
-        const dir = `${workspacePath}/.claude/agents/${name}`;
+        const dir = `${workspacePath}/.dashboard/agents/${name}`;
         // Check if memory/MEMORY.md exists
         let hasMemory = false;
         try {
@@ -40,10 +114,10 @@ export function scanPersonas(workspacePath: string, pathType: PathType): AgentPe
         });
       }
     } catch {
-      // .claude/agents/ doesn't exist or WSL unavailable
+      // .dashboard/agents/ doesn't exist or WSL unavailable
     }
   } else {
-    const agentsDir = path.join(workspacePath, '.claude', 'agents');
+    const agentsDir = path.join(workspacePath, ...PERSONAS_REL);
     if (!fs.existsSync(agentsDir)) return personas;
 
     try {
@@ -69,7 +143,8 @@ export function scanPersonas(workspacePath: string, pathType: PathType): AgentPe
 }
 
 /**
- * Create a new persona directory with minimal scaffolding.
+ * Create a new persona directory with minimal scaffolding under
+ * .dashboard/agents/<name>/.
  */
 export function scaffoldPersona(workspacePath: string, pathType: PathType, name: string, customClaudeMd?: string): AgentPersona {
   if (!VALID_NAME.test(name)) {
@@ -85,7 +160,7 @@ export function scaffoldPersona(workspacePath: string, pathType: PathType, name:
   const memoryMd = `# Memory Index\n`;
 
   if (pathType === 'wsl') {
-    const dir = `${workspacePath}/.claude/agents/${name}`;
+    const dir = `${workspacePath}/.dashboard/agents/${name}`;
     const env = { ...process.env };
     delete env.CLAUDECODE;
     delete env.ELECTRON_RUN_AS_NODE;
@@ -102,7 +177,7 @@ export function scaffoldPersona(workspacePath: string, pathType: PathType, name:
 
     return { name, directory: dir, hasMemory: true, isSupervisor: false };
   } else {
-    const dir = path.join(workspacePath, '.claude', 'agents', name);
+    const dir = path.join(workspacePath, ...PERSONAS_REL, name);
     const memoryDir = path.join(dir, 'memory');
     fs.mkdirSync(memoryDir, { recursive: true });
     fs.writeFileSync(path.join(dir, 'CLAUDE.md'), claudeMd, 'utf-8');

@@ -31,6 +31,12 @@ export default function AgentPickerDropdown({ workspaceId, onPick }: Props) {
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
+      // Never steal keys from a text field (AddCommentPopover renders this
+      // picker beneath a live textarea).
+      const t = e.target as HTMLElement | null;
+      if (t && (t.tagName === 'TEXTAREA' || t.tagName === 'INPUT' || t.isContentEditable)) {
+        return;
+      }
       if (e.key === 'ArrowDown') {
         e.preventDefault();
         setHighlighted((h) => (h + 1) % rowCount);

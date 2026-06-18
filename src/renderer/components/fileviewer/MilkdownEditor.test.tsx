@@ -23,6 +23,12 @@ const storeMock = vi.hoisted(() => {
       calls.push({ kind: 'saveTab', tabId });
       return saveResult;
     },
+    // Read by the FileCommentGutter overlay (WP-P5-B) mounted next to the
+    // editor; empty tabs = the gutter renders nothing in these tests.
+    openTabs: [] as Array<{ id: string }>,
+    tabEditState: {} as Record<string, unknown>,
+    agents: [] as unknown[],
+    selectedWorkspaceId: null as string | null,
   };
   const useDashboardStore = (selector: (s: typeof state) => unknown) => selector(state);
   useDashboardStore.getState = () => state;

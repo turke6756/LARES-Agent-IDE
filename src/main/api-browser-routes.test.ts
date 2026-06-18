@@ -3,8 +3,9 @@
 // never the real browser manager — compiled-node tests can't construct
 // Electron objects). Covers: 401 without token (M1 admission applies to the
 // browser routes), 503 when no provider is wired, PolicyError → 403 with the
-// policy message, happy-path serialization for all six routes, and the
-// setBrowserTools late-injection seam used by production wiring.
+// policy message, happy-path serialization for every route (including the WP-C
+// parity verbs), and the setBrowserTools late-injection seam used by
+// production wiring.
 //
 // Compile via the existing main tsconfig and run with:
 //   npm run build:main
@@ -67,8 +68,58 @@ function makeFakeTools(overrides: Partial<BrowserToolProvider> = {}): BrowserToo
       calls.push(['click', tabId, ref]);
       return '<<untrusted>>[1] button "OK" (clicked)<</untrusted>>';
     },
+    type: async (tabId: string, ref: number, text: string) => {
+      calls.push(['type', tabId, ref, text]);
+      return '<<untrusted>>[1] textbox value="typed"<</untrusted>>';
+    },
+    pressKey: async (tabId: string, key: string) => {
+      calls.push(['pressKey', tabId, key]);
+      return '<<untrusted>>[1] form (submitted)<</untrusted>>';
+    },
+    selectOption: async (tabId: string, ref: number, value: string) => {
+      calls.push(['selectOption', tabId, ref, value]);
+      return '<<untrusted>>[1] combobox value="chosen"<</untrusted>>';
+    },
+    scroll: async (tabId: string, opts: { ref?: number; dy?: number }) => {
+      calls.push(['scroll', tabId, opts]);
+      return '<<untrusted>>[1] heading "Lower"<</untrusted>>';
+    },
+    goBack: async (tabId: string) => {
+      calls.push(['goBack', tabId]);
+      return '<<untrusted>>[1] heading "Prev page"<</untrusted>>';
+    },
+    goForward: async (tabId: string) => {
+      calls.push(['goForward', tabId]);
+      return '<<untrusted>>[1] heading "Next page"<</untrusted>>';
+    },
+    reload: async (tabId: string) => {
+      calls.push(['reload', tabId]);
+      return '<<untrusted>>[1] heading "Reloaded"<</untrusted>>';
+    },
+    waitFor: async (tabId: string, input: { text: string; timeoutMs?: number }) => {
+      calls.push(['waitFor', tabId, input]);
+      return { found: true, elapsedMs: 12, snapshot: '<<untrusted>>[1] heading "Ready"<</untrusted>>' };
+    },
+    closeTab: async (tabId: string) => {
+      calls.push(['closeTab', tabId]);
+      return { closed: true, tabs: [{ tabId: 'tab-2', url: 'https://example.com', partition: 'agent' }] };
+    },
+    requestSiteAccess: (input) => {
+      calls.push(['requestSiteAccess', input]);
+      return { requestId: 'req-1', status: 'pending' };
+    },
+    listMyAccessRequests: (agentId: string) => {
+      calls.push(['listMyAccessRequests', agentId]);
+      return [{ id: 'req-1', hostname: input_host_for(agentId), status: 'pending', requestedBy: agentId }];
+    },
     ...overrides,
   };
+}
+
+/** Tiny helper so the fake's my-requests payload varies by agent id (keeps the
+ *  route test honest that the id is threaded through). */
+function input_host_for(agentId: string): string {
+  return `${agentId}.example.com`;
 }
 
 // ── HTTP helpers (api-auth.test.ts pattern + request bodies) ────────────────
@@ -213,7 +264,7 @@ test('POST open-url: forHuman flag forwarded, snapshot serialized', () => {
     assert.equal(body.ok, true);
     assert.equal(body.forHuman, true);
     assert.equal(body.snapshot.partition, 'user');
-    assert.deepEqual(tools.calls[0], ['openUrl', 'https://accounts.google.com/consent', { forHuman: true }]);
+    assert.deepEqual(tools.calls[0], ['openUrl', 'https://accounts.google.com/consent', { forHuman: true, workspaceId: null }]);
   });
 });
 
@@ -222,7 +273,7 @@ test('POST open-url without forHuman → forHuman: false reaches the provider', 
   return withServer(tools, async (port) => {
     const res = await request(port, 'POST', '/api/browser/open-url', AUTH, { url: 'https://example.com' });
     assert.equal(res.status, 200);
-    assert.deepEqual(tools.calls[0], ['openUrl', 'https://example.com', { forHuman: false }]);
+    assert.deepEqual(tools.calls[0], ['openUrl', 'https://example.com', { forHuman: false, workspaceId: null }]);
   });
 });
 
@@ -268,6 +319,202 @@ test('open-url without url → 400; click with non-integer ref → 400', () => {
     assert.equal((await request(port, 'POST', '/api/browser/tab-1/click', AUTH, { ref: 'one' })).status, 400);
     assert.equal((await request(port, 'POST', '/api/browser/tab-1/click', AUTH, { ref: 1.5 })).status, 400);
     assert.equal(tools.calls.length, 0); // validation rejects before the provider
+  });
+});
+
+// ── WP-C parity routes: happy paths ─────────────────────────────────────────
+
+test('POST type: ref + text forwarded, snapshot returned', () => {
+  const tools = makeFakeTools();
+  return withServer(tools, async (port) => {
+    const res = await request(port, 'POST', '/api/browser/tab-1/type', AUTH, { ref: 2, text: 'hello' });
+    assert.equal(res.status, 200);
+    assert.match(JSON.parse(res.body).snapshot, /typed/);
+    assert.deepEqual(tools.calls[0], ['type', 'tab-1', 2, 'hello']);
+  });
+});
+
+test('POST press-key: key forwarded, snapshot returned', () => {
+  const tools = makeFakeTools();
+  return withServer(tools, async (port) => {
+    const res = await request(port, 'POST', '/api/browser/tab-1/press-key', AUTH, { key: 'Enter' });
+    assert.equal(res.status, 200);
+    assert.match(JSON.parse(res.body).snapshot, /submitted/);
+    assert.deepEqual(tools.calls[0], ['pressKey', 'tab-1', 'Enter']);
+  });
+});
+
+test('POST select-option: ref + value forwarded, snapshot returned', () => {
+  const tools = makeFakeTools();
+  return withServer(tools, async (port) => {
+    const res = await request(port, 'POST', '/api/browser/tab-1/select-option', AUTH, { ref: 5, value: 'CA' });
+    assert.equal(res.status, 200);
+    assert.match(JSON.parse(res.body).snapshot, /chosen/);
+    assert.deepEqual(tools.calls[0], ['selectOption', 'tab-1', 5, 'CA']);
+  });
+});
+
+test('POST scroll: ref-only and dy-only each forward exactly one, snapshot returned', () => {
+  const tools = makeFakeTools();
+  return withServer(tools, async (port) => {
+    const byRef = await request(port, 'POST', '/api/browser/tab-1/scroll', AUTH, { ref: 3 });
+    assert.equal(byRef.status, 200);
+    assert.match(JSON.parse(byRef.body).snapshot, /Lower/);
+    assert.deepEqual(tools.calls[0], ['scroll', 'tab-1', { ref: 3 }]);
+
+    const byDy = await request(port, 'POST', '/api/browser/tab-1/scroll', AUTH, { dy: 600 });
+    assert.equal(byDy.status, 200);
+    assert.deepEqual(tools.calls[1], ['scroll', 'tab-1', { dy: 600 }]);
+  });
+});
+
+test('POST go-back / go-forward / reload return a fresh snapshot', () => {
+  const tools = makeFakeTools();
+  return withServer(tools, async (port) => {
+    const back = await request(port, 'POST', '/api/browser/tab-1/go-back', AUTH);
+    assert.equal(back.status, 200);
+    assert.match(JSON.parse(back.body).snapshot, /Prev page/);
+
+    const fwd = await request(port, 'POST', '/api/browser/tab-1/go-forward', AUTH);
+    assert.equal(fwd.status, 200);
+    assert.match(JSON.parse(fwd.body).snapshot, /Next page/);
+
+    const rel = await request(port, 'POST', '/api/browser/tab-1/reload', AUTH);
+    assert.equal(rel.status, 200);
+    assert.match(JSON.parse(rel.body).snapshot, /Reloaded/);
+
+    assert.deepEqual(tools.calls, [['goBack', 'tab-1'], ['goForward', 'tab-1'], ['reload', 'tab-1']]);
+  });
+});
+
+test('POST wait-for: text + timeoutMs forwarded; result spread into the body', () => {
+  const tools = makeFakeTools();
+  return withServer(tools, async (port) => {
+    const res = await request(port, 'POST', '/api/browser/tab-1/wait-for', AUTH, { text: 'Ready', timeoutMs: 8000 });
+    assert.equal(res.status, 200);
+    const body = JSON.parse(res.body);
+    assert.equal(body.tabId, 'tab-1');
+    assert.equal(body.found, true);
+    assert.equal(body.elapsedMs, 12);
+    assert.match(body.snapshot, /Ready/);
+    assert.deepEqual(tools.calls[0], ['waitFor', 'tab-1', { text: 'Ready', timeoutMs: 8000 }]);
+  });
+});
+
+test('POST close: returns the updated agent tab list (no snapshot)', () => {
+  const tools = makeFakeTools();
+  return withServer(tools, async (port) => {
+    const res = await request(port, 'POST', '/api/browser/tab-1/close', AUTH);
+    assert.equal(res.status, 200);
+    const body = JSON.parse(res.body);
+    assert.equal(body.tabId, 'tab-1');
+    assert.equal(body.closed, true);
+    assert.equal(body.tabs[0].tabId, 'tab-2');
+    assert.deepEqual(tools.calls[0], ['closeTab', 'tab-1']);
+  });
+});
+
+// ── WP-C parity routes: validation + a PolicyError → 403 ─────────────────────
+
+test('WP-C validation: malformed bodies → 400 before the provider is called', () => {
+  const tools = makeFakeTools();
+  return withServer(tools, async (port) => {
+    // type without text
+    assert.equal((await request(port, 'POST', '/api/browser/t/type', AUTH, { ref: 1 })).status, 400);
+    // type with non-integer ref
+    assert.equal((await request(port, 'POST', '/api/browser/t/type', AUTH, { ref: 1.5, text: 'x' })).status, 400);
+    // press-key without key
+    assert.equal((await request(port, 'POST', '/api/browser/t/press-key', AUTH, {})).status, 400);
+    // select-option without value
+    assert.equal((await request(port, 'POST', '/api/browser/t/select-option', AUTH, { ref: 1 })).status, 400);
+    // scroll with neither ref nor dy
+    assert.equal((await request(port, 'POST', '/api/browser/t/scroll', AUTH, {})).status, 400);
+    // scroll with BOTH ref and dy
+    assert.equal((await request(port, 'POST', '/api/browser/t/scroll', AUTH, { ref: 1, dy: 5 })).status, 400);
+    // wait-for without text
+    assert.equal((await request(port, 'POST', '/api/browser/t/wait-for', AUTH, {})).status, 400);
+    assert.equal(tools.calls.length, 0);
+  });
+});
+
+test('WP-C: provider PolicyError on type (actions off) → 403 with the message', () =>
+  withServer(
+    makeFakeTools({
+      type: async () => { throw new FakePolicyError('browser actions are disabled (M12 default).'); },
+    }),
+    async (port) => {
+      const res = await request(port, 'POST', '/api/browser/tab-1/type', AUTH, { ref: 1, text: 'x' });
+      assert.equal(res.status, 403);
+      const body = JSON.parse(res.body);
+      assert.match(body.error, /actions are disabled/);
+      assert.equal(body.code, 'browser-policy-denied');
+    },
+  ));
+
+// ── §18 agent-initiated access-request routes ───────────────────────────────
+
+test('POST access/request: forwards fields + stamped agent id, returns { requestId, status }', () => {
+  const tools = makeFakeTools();
+  return withServer(tools, async (port) => {
+    const res = await request(port, 'POST', '/api/browser/access/request', AUTH, {
+      hostname: 'docs.example.com',
+      reason: 'read the API docs',
+      scheme: 'https',
+      wantSignedIn: true,
+      requestedBy: 'agent-7',
+    });
+    assert.equal(res.status, 200);
+    const body = JSON.parse(res.body);
+    assert.equal(body.ok, true);
+    assert.equal(body.requestId, 'req-1');
+    assert.equal(body.status, 'pending');
+    const [verb, input] = tools.calls[0] as [string, Record<string, unknown>];
+    assert.equal(verb, 'requestSiteAccess');
+    assert.equal(input.hostname, 'docs.example.com');
+    assert.equal(input.requestedBy, 'agent-7');
+    assert.equal(input.wantSignedIn, true);
+  });
+});
+
+test('POST access/request: missing hostname or requestedBy → 400, provider never called', () => {
+  const tools = makeFakeTools();
+  return withServer(tools, async (port) => {
+    assert.equal(
+      (await request(port, 'POST', '/api/browser/access/request', AUTH, { requestedBy: 'a' })).status,
+      400,
+    );
+    assert.equal(
+      (await request(port, 'POST', '/api/browser/access/request', AUTH, { hostname: 'x.com', reason: 'y' })).status,
+      400,
+    );
+    assert.equal(tools.calls.length, 0);
+  });
+});
+
+test('POST access/request: a store rejection (bad hostname / cap) surfaces as 400', () =>
+  withServer(
+    makeFakeTools({
+      requestSiteAccess: () => { throw new Error('hostname contains a wildcard'); },
+    }),
+    async (port) => {
+      const res = await request(port, 'POST', '/api/browser/access/request', AUTH, {
+        hostname: '*.evil.com', reason: 'nope', requestedBy: 'a',
+      });
+      assert.equal(res.status, 400);
+      assert.match(JSON.parse(res.body).error, /wildcard/);
+    },
+  ));
+
+test('GET access/my-requests: requires agentId, threads it to the provider', () => {
+  const tools = makeFakeTools();
+  return withServer(tools, async (port) => {
+    assert.equal((await request(port, 'GET', '/api/browser/access/my-requests', AUTH)).status, 400);
+
+    const res = await request(port, 'GET', '/api/browser/access/my-requests?agentId=agent-7', AUTH);
+    assert.equal(res.status, 200);
+    const body = JSON.parse(res.body);
+    assert.equal(body.requests[0].requestedBy, 'agent-7');
+    assert.deepEqual(tools.calls[0], ['listMyAccessRequests', 'agent-7']);
   });
 });
 

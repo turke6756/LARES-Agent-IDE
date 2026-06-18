@@ -229,6 +229,7 @@ export function makeAgent(id: string, overrides: Partial<Agent> = {}): Agent {
     isSupervisor: false,
     isSupervised: true,
     isWorker: false,
+    isResearcher: false,
     tmuxSessionName: null,
     autoRestartEnabled: false,
     resumeSessionId: null,

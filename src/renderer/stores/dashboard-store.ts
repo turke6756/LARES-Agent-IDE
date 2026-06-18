@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import type { Agent, Workspace, HealthCheck, FileActivity, QueryResult, ContextStats, PathType, FileTab, PanelLayout, Team, TeamMessage, CreateTeamInput } from '../../shared/types';
+import type { Agent, Workspace, HealthCheck, FileActivity, QueryResult, ContextStats, PathType, FileTab, PanelLayout, Team, TeamMessage, CreateTeamInput, DetachedClosedPayload } from '../../shared/types';
 import { evictTabCache, recordRecentWrite } from '../components/fileviewer/useFileContentCache';
 import { clearDraft } from '../lib/chat-drafts';
 
@@ -156,6 +156,9 @@ interface DashboardState {
   openTab: (filePath: string, rootDirectory: string, pathType: PathType, agentId?: string, workspaceId?: string) => void;
   openDirectoryTab: (rootDirectory: string, pathType: PathType, workspaceId?: string) => void;
   closeTab: (tabId: string) => void;
+  // Detachable file tabs (detachable-file-tabs-plan §4 1.7).
+  detachTab: (tabId: string) => void;
+  seedDetachedTab: (meta: DetachedClosedPayload) => void;
   setActiveTab: (tabId: string) => void;
   moveTab: (tabId: string, targetTabId: string) => void;
   setTabColor: (tabId: string, color: string | null) => void;
@@ -326,6 +329,62 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
       };
     });
   },
+
+  // Remove a tab that has just been torn off into a detached window. Mirrors
+  // closeTab's neighbor-activation but with NO dirty prompt — the draft was
+  // already saved by the FileTabBar save-before-detach step (plan §1.6), and
+  // the detached window now owns the file. Evicts the content cache too.
+  detachTab: (tabId) => {
+    evictTabCache(tabId);
+    set((state) => {
+      const idx = state.openTabs.findIndex((t) => t.id === tabId);
+      if (idx === -1) return state;
+      const newTabs = state.openTabs.filter((t) => t.id !== tabId);
+      const { [tabId]: _closedEditState, ...tabEditState } = state.tabEditState;
+      let newActive = state.activeTabId;
+      if (state.activeTabId === tabId) {
+        if (newTabs.length === 0) {
+          newActive = null;
+        } else if (idx < newTabs.length) {
+          newActive = newTabs[idx].id;
+        } else {
+          newActive = newTabs[newTabs.length - 1].id;
+        }
+      }
+      return {
+        openTabs: newTabs,
+        activeTabId: newActive,
+        fileViewerOpen: newTabs.length > 0,
+        tabEditState,
+      };
+    });
+  },
+
+  // Atomic seed for a detached renderer (plan §1.7 / Reviewer #7). A fresh
+  // renderer starts with selectedWorkspaceId:null and FileViewerPanel filters
+  // tabs by the selected workspace, while selectWorkspace() sets
+  // fileViewerOpen:false — so the workspace, the single tab, and the open flags
+  // must land in ONE update. Deliberately does NOT call selectWorkspace().
+  seedDetachedTab: (meta) => set(() => {
+    const tab: ColoredFileTab = {
+      // Stable id derived from the file path — the detached window holds exactly
+      // one tab for its lifetime, so the id never needs to churn.
+      id: `detached:${meta.filePath}`,
+      filePath: meta.filePath,
+      rootDirectory: meta.rootDirectory,
+      pathType: meta.pathType,
+      workspaceId: meta.workspaceId,
+      label: meta.label,
+    };
+    return {
+      selectedWorkspaceId: meta.workspaceId,
+      openTabs: [tab],
+      activeTabId: tab.id,
+      fileViewerOpen: true,
+      browserOpen: false,
+      tabEditState: {},
+    };
+  }),
 
   setActiveTab: (tabId) => set({ activeTabId: tabId }),
 

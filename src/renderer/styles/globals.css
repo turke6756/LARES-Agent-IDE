@@ -1219,3 +1219,167 @@ html.light ::-webkit-scrollbar-thumb:hover {
 .app-no-drag {
   -webkit-app-region: no-drag;
 }
+
+/* ── Embedded browser ──
+   Theme foundation (WP1-THEME) for the embedded-browser overhaul. The old
+   chrome hardcoded gray and accent utilities and never responded to light
+   mode; these browser-scoped tokens + component classes fix that.
+
+   Dark defaults derive from the surface ladder (--color-surface-1/2/3) so the
+   chrome reads as VS Code. Light values are Chrome-light tuned (tab strip
+   #f1f3f4, active tab/toolbar #ffffff, dividers #dadce0) and harmonized with
+   the existing "paper" .light palette. No selector here targets WebContentsView
+   page content — these style shell chrome only. */
+
+@theme {
+  /* Browser chrome — dark (surface-derived) */
+  --color-browser-chrome: var(--color-surface-1);    /* tab strip / chrome bg */
+  --color-browser-chrome-2: var(--color-surface-2);  /* address field bg */
+  --color-tab-active-bg: var(--color-surface-2);      /* active tab = content lift */
+  --color-tab-inactive-fg: var(--color-fg-secondary);
+  --color-tab-hover-bg: rgba(255, 255, 255, 0.06);
+  --color-tab-border: var(--color-surface-3);
+  --color-browser-divider: var(--color-surface-3);
+  --color-bookmark-bar-bg: var(--color-surface-0);
+}
+
+.light {
+  /* Browser chrome — Chrome-light tuned, harmonized with the paper palette */
+  --color-browser-chrome: #f1f3f4;     /* tab strip */
+  --color-browser-chrome-2: #ffffff;   /* address field / toolbar */
+  --color-tab-active-bg: #ffffff;       /* active tab */
+  --color-tab-inactive-fg: #5f5a51;     /* matches .light --color-fg-secondary */
+  --color-tab-hover-bg: rgba(60, 64, 67, 0.08);
+  --color-tab-border: #dadce0;
+  --color-browser-divider: #dadce0;
+  --color-bookmark-bar-bg: #ffffff;
+}
+
+/* Outer browser shell: stacks toolbar → bookmark bar → host. */
+.browser-chrome {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--color-browser-chrome);
+  color: var(--color-fg-primary);
+}
+
+/* Toolbar row that holds the address bar + nav buttons. */
+.browser-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  background: var(--color-browser-chrome);
+  border-bottom: 1px solid var(--color-browser-divider);
+}
+
+/* Arc/Chrome-style tab: top-corner rounding, inactive sits flush in the strip. */
+.browser-tab {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  /* Hold a sane floor and DON'T shrink: with many agent tabs the strip must
+     scroll (it has overflow-x-auto) rather than squeeze each pill below its
+     content width — squeezing pushes the shrink-0 close button past the pill's
+     right edge, where it paints under the next DOM-sibling tab and becomes
+     unclickable ("superimposed over other tabs"). */
+  flex: 0 0 auto;
+  min-width: 132px;
+  max-width: 220px;
+  height: 32px;
+  padding: 0 8px 0 10px;
+  border-radius: 8px 8px 0 0;
+  color: var(--color-tab-inactive-fg);
+  background: transparent;
+  border: 1px solid transparent;
+  border-bottom: none;
+  cursor: default;
+  user-select: none;
+  transition: background 120ms ease, color 120ms ease;
+}
+
+/* Pinned tabs render favicon-only (no label/close) — let them stay compact
+   rather than reserve the full min-width. */
+.browser-tab-pinned {
+  min-width: 0;
+  max-width: 40px;
+  padding: 0 8px;
+}
+
+.browser-tab:hover {
+  background: var(--color-tab-hover-bg);
+  color: var(--color-fg-primary);
+}
+
+/* The tab you're interacting with (and therefore its close button) must paint
+   above its neighbors so the X stays clickable even if pills abut. */
+.browser-tab:hover,
+.browser-tab.browser-tab-active {
+  z-index: 2;
+}
+
+/* Active tab lifts out of the strip: matched bg, hairline border, soft elevation. */
+.browser-tab-active,
+.browser-tab.browser-tab-active:hover {
+  background: var(--color-tab-active-bg);
+  color: var(--color-fg-primary);
+  border-color: var(--color-tab-border);
+  border-bottom: none;
+  box-shadow: 0 -1px 3px rgba(0, 0, 0, 0.18);
+}
+
+.light .browser-tab-active,
+.light .browser-tab.browser-tab-active:hover {
+  box-shadow: 0 -1px 2px rgba(60, 64, 67, 0.10), 0 1px 2px rgba(60, 64, 67, 0.08);
+}
+
+/* Partition accent: a colored top edge on the active tab so agent vs user
+   tabs stay legible after the restyle. Works via data-partition or class. */
+.browser-tab-active::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 6px;
+  right: 6px;
+  height: 2px;
+  border-radius: 2px;
+  background: transparent;
+}
+
+.browser-tab-active[data-partition="agent"]::before,
+.browser-tab-active.is-agent::before {
+  background: var(--color-accent-orange);
+}
+
+.browser-tab-active[data-partition="user"]::before,
+.browser-tab-active.is-user::before {
+  background: var(--color-accent-blue);
+}
+
+/* Bookmarks bar strip below the toolbar. */
+.bookmark-bar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  min-height: 30px;
+  overflow-x: auto;
+  background: var(--color-bookmark-bar-bg);
+  border-bottom: 1px solid var(--color-browser-divider);
+}
+
+/* New Tab page surface (renderer DOM, not a navigated URL — see M6). */
+.browser-ntp {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-start;
+  min-height: 0;
+  flex: 1 1 auto;
+  padding: 12vh 16px 16px;
+  background: var(--color-surface-0);
+  color: var(--color-fg-primary);
+  overflow-y: auto;
+}

@@ -1,6 +1,19 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { useBrowserStore, normalizeAddressInput, type BrowserTabState } from '../../stores/browser-store';
 import * as Icons from 'lucide-react';
+import StarMenu from './StarMenu';
+import ZoomControl from './ZoomControl';
+import AgentActionsToggle from './AgentActionsToggle';
+
+// WP1-TABS: token-backed address bar (.browser-toolbar) so it works in light
+// mode. Anti-spoof invariant (M9/WP2): the URL is rendered ONLY from the active
+// tab's committed state in this shell chrome — never from page or model output,
+// and never from tab.title. Do not change that.
+//
+// Reserved insertion slots for later WPs (left empty/present on purpose):
+//   • STAR slot  — left of the URL field; WP3 (StarMenu) renders here, gated to
+//     user-partition tabs.
+//   • ZOOM slot  — right side, after the partition badge; WP5 (ZoomControl).
 
 interface Props {
   tab: BrowserTabState | null;
@@ -13,14 +26,36 @@ export default function AddressBar({ tab }: Props) {
   const goForward = useBrowserStore((s) => s.goForward);
   const reload = useBrowserStore((s) => s.reload);
   const stop = useBrowserStore((s) => s.stop);
+  const openHistory = useBrowserStore((s) => s.openHistory);
+  const toggleBookmarkBar = useBrowserStore((s) => s.toggleBookmarkBar);
+  const focusAddressTick = useBrowserStore((s) => s.focusAddressTick);
+  const openAccessView = useBrowserStore((s) => s.openAccessView);
+  const pendingRequestCount = useBrowserStore(
+    (s) => s.accessRequests.filter((r) => r.status === 'pending').length,
+  );
 
   const [value, setValue] = useState(tab?.url ?? '');
   const [editing, setEditing] = useState(false);
+  const inputRef = useRef<HTMLInputElement | null>(null);
+  const prevFocusTick = useRef(focusAddressTick);
 
   // Track the active tab's URL while the user isn't typing.
   useEffect(() => {
     if (!editing) setValue(tab?.url ?? '');
   }, [tab?.tabId, tab?.url, editing]);
+
+  // Ctrl+L (the main-side 'focus-address' shortcut) bumps focusAddressTick →
+  // focus + select the URL field. Guard the initial value so mount never steals
+  // focus from elsewhere.
+  useEffect(() => {
+    if (focusAddressTick === prevFocusTick.current) return;
+    prevFocusTick.current = focusAddressTick;
+    const el = inputRef.current;
+    if (el) {
+      el.focus();
+      el.select();
+    }
+  }, [focusAddressTick]);
 
   const submit = () => {
     const input = value.trim();
@@ -36,7 +71,7 @@ export default function AddressBar({ tab }: Props) {
   };
 
   return (
-    <div className="flex items-center gap-1 px-2 py-1.5 border-b border-gray-700/50 shrink-0">
+    <div className="browser-toolbar shrink-0">
       <button
         onClick={() => tab && goBack(tab.tabId)}
         disabled={!tab?.canGoBack}
@@ -71,7 +106,13 @@ export default function AddressBar({ tab }: Props) {
           <Icons.RotateCw className="w-4 h-4" />
         </button>
       )}
+
+      {/* ── STAR (WP3 StarMenu) — left of the URL field; self-gates to
+          user-partition tabs (renders null otherwise). ── */}
+      <StarMenu />
+
       <input
+        ref={inputRef}
         type="text"
         value={value}
         spellCheck={false}
@@ -95,7 +136,7 @@ export default function AddressBar({ tab }: Props) {
             e.currentTarget.blur();
           }
         }}
-        className="flex-1 min-w-0 bg-gray-800/60 border border-gray-700/60 px-3 py-1.5 text-[12px] text-gray-200 placeholder-gray-600 focus:outline-none focus:border-accent-blue/60"
+        className="flex-1 min-w-0 bg-browser-chrome-2 border border-tab-border px-3 py-1.5 text-[12px] text-fg-primary placeholder-fg-muted focus:outline-none focus:border-accent-blue/60"
       />
       {tab && (
         <span
@@ -113,6 +154,48 @@ export default function AddressBar({ tab }: Props) {
           {tab.partition}
         </span>
       )}
+
+      {/* ── ZOOM (WP5 ZoomControl) — after the partition badge; self-gates
+          (renders null on the NTP / when there's no tab). ── */}
+      <ZoomControl />
+
+      <button
+        onClick={() => toggleBookmarkBar()}
+        className="ui-btn ui-btn-ghost p-1.5 shrink-0"
+        title="Toggle bookmarks bar"
+      >
+        <Icons.BookMarked className="w-4 h-4" />
+      </button>
+      <button
+        onClick={() => openHistory()}
+        className="ui-btn ui-btn-ghost p-1.5 shrink-0"
+        title="History (Ctrl+H)"
+      >
+        <Icons.History className="w-4 h-4" />
+      </button>
+
+      {/* ── ACCESS — opens the website-access policy overlay (single agent
+          allowlist + pending agent requests). Trusted shell chrome only.
+          Badge = pending agent requests awaiting human approval. ── */}
+      <button
+        onClick={() => openAccessView()}
+        className="ui-btn ui-btn-ghost relative flex items-center gap-1.5 px-1.5 py-1 shrink-0"
+        title="Website access — agent allowlist & pending agent requests"
+      >
+        <Icons.ShieldCheck className="w-4 h-4 text-fg-secondary" />
+        <span className="text-[10px] font-semibold uppercase tracking-wide text-fg-secondary hidden md:inline">
+          Access
+        </span>
+        {pendingRequestCount > 0 && (
+          <span className="absolute -top-0.5 -right-0.5 inline-flex items-center justify-center min-w-[15px] h-[15px] px-1 rounded-full text-[9px] font-bold bg-accent-orange text-white">
+            {pendingRequestCount}
+          </span>
+        )}
+      </button>
+
+      {/* ── AGENT ACTIONS (M12 coarse gate) — flips the dashboard-global runtime
+          act-tier toggle; unobtrusive, rightmost in the chrome toolbar. ── */}
+      <AgentActionsToggle />
     </div>
   );
 }

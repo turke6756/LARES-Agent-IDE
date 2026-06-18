@@ -7,6 +7,7 @@ import TerminalPanel from './components/terminal/TerminalPanel';
 import ResizeDivider from './components/layout/ResizeDivider';
 import { useResize } from './hooks/useResize';
 import { openExternalFileTab } from './components/fileviewer/openFileHelpers';
+import DetachedFileView from './components/fileviewer/DetachedFileView';
 
 // Error boundary to catch React render crashes and show the error instead of white screen
 class ErrorBoundary extends Component<{ children: ReactNode }, { error: Error | null }> {
@@ -83,12 +84,21 @@ function AppInner() {
       openExternalFileTab(payload);
     });
 
+    // A detached (tear-off) window closed → re-add the file as a tab in the
+    // shell strip from disk (detachable-file-tabs-plan §4 1.9). The closing
+    // window saves/discards in-window before emitting `closed`, so the disk
+    // content is authoritative.
+    const unsubDetachedClosed = window.api.tabs.onDetachedClosed((p) => {
+      openExternalFileTab(p);
+    });
+
     return () => {
       unsubStatus();
       unsubContext();
       unsubTeam();
       unsubTeamMsg();
       unsubOpenFileTab();
+      unsubDetachedClosed();
     };
   }, []);
 
@@ -185,6 +195,18 @@ function AppInner() {
 }
 
 export default function App() {
+  // Detached (tear-off) file-tab window: same renderer bundle, but a minimal
+  // single-file viewer instead of the full dashboard shell (detachable-file-
+  // tabs-plan §4 1.8). Branch on the `?detached=1` query main encodes at launch.
+  const params = new URLSearchParams(window.location.search);
+  if (params.get('detached')) {
+    return (
+      <ErrorBoundary>
+        <DetachedFileView params={params} />
+      </ErrorBoundary>
+    );
+  }
+
   return (
     <ErrorBoundary>
       <AppInner />
