@@ -231,6 +231,13 @@ export interface AccessRule {
   allowSignedIn: boolean;
   enabled: boolean;
   createdAt: number;
+  /** Slice-4 (premium browser): the workspace whose agent partition this rule
+   *  governs. A rule authorizes ONLY agents in its workspace (plus, for
+   *  back-compat, NULL = legacy default applying to every workspace). Stamped
+   *  trust-side from the human's selected workspace on a manual add, or inherited
+   *  from the request's workspace on an approval — never from agent tool args.
+   *  Additive/optional — absent/null = the legacy default. */
+  workspaceId?: string | null;
 }
 
 export interface AccessRuleInput {
@@ -241,6 +248,9 @@ export interface AccessRuleInput {
   note?: string;
   /** Optional; defaults false. */
   allowSignedIn?: boolean;
+  /** Slice-4: the workspace to scope this rule to. Set trust-side (the manager
+   *  stamps the human's selected workspace); the renderer never sends it. */
+  workspaceId?: string | null;
 }
 
 /** §18: an agent-initiated access request awaiting human approval. Inert —
@@ -266,6 +276,12 @@ export interface AccessRequest {
   status: AccessRequestStatus;
   createdAt: number;
   decidedAt?: number;
+  /** Slice-4 (premium browser): the workspace of the agent that filed this
+   *  request, resolved trust-side from the agent registry (never the agent's tool
+   *  args). On approval the created rule inherits this, so a request approved for
+   *  workspace A authorizes ONLY workspace A's agent. Additive/optional —
+   *  absent/null = the legacy default. */
+  workspaceId?: string | null;
 }
 
 /** Input for the agent tool browser_request_site_access (§18.3). */

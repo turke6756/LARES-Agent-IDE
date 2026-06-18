@@ -660,6 +660,15 @@ export const useBrowserStore = create<BrowserStoreState>((set, get) => ({
         : s.tabs.find((t) => (t.workspaceId ?? null) === workspaceId)?.tabId ?? null;
       return { selectedWorkspaceId: workspaceId, activeTabId };
     });
+    // Slice-4: the agent allowlist + pending-request inbox are workspace-scoped
+    // on the main side (filtered by the workspace we just selected via
+    // setActiveWorkspace). Reload them so the settings overlay's list/add/decide
+    // — and the hand-off gating + entry-button badge that read these slices —
+    // reflect the NEW workspace's rules, not the previous one's. A bare
+    // setActiveWorkspace re-scopes main but emits no accessChanged event, so
+    // without this the slices would stay stale across a switch.
+    void get().loadAccessRules();
+    void get().loadAccessRequests();
   },
 
   navigate: (tabId, rawInput) => {

@@ -110,6 +110,8 @@ export interface BrowserToolProvider {
     wantSignedIn?: boolean;
     requestedBy: string;
     requestedByTitle?: string;
+    /** Slice-4: requesting agent's workspace, resolved trust-side here. */
+    workspaceId?: string | null;
   }): unknown;
   /** §18 outcome read — a single agent's own requests + statuses. */
   listMyAccessRequests(agentId: string): unknown[];
@@ -1412,11 +1414,19 @@ export class ApiServer {
       // Title resolved by trusted code from the agent registry (display only).
       // Guarded: a missing registry row / uninitialized DB must not 500 — the
       // request is still valid without a display title.
+      // Slice-4: the agent's workspace is resolved here from the same registry
+      // row (trust-side, never the agent's tool args), so the rule created on
+      // approval is scoped to that workspace — a request approved for workspace A
+      // authorizes ONLY workspace A's agent.
       let requestedByTitle: string | undefined;
+      let requestWorkspaceId: string | null = null;
       try {
-        requestedByTitle = getAgent(requestedBy)?.title;
+        const requestingAgent = getAgent(requestedBy);
+        requestedByTitle = requestingAgent?.title;
+        requestWorkspaceId = requestingAgent?.workspaceId ?? null;
       } catch {
         requestedByTitle = undefined;
+        requestWorkspaceId = null;
       }
       try {
         const result = tools.requestSiteAccess({
@@ -1428,6 +1438,7 @@ export class ApiServer {
           wantSignedIn,
           requestedBy,
           requestedByTitle,
+          workspaceId: requestWorkspaceId,
         }) as Record<string, unknown>;
         return { ok: true, ...result };
       } catch (err) {

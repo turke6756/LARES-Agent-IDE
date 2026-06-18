@@ -347,6 +347,22 @@ export function initDatabase(): void {
       ON browser_access_requests(status, created_at)
   `);
 
+  // Slice-4 (premium browser — workspace-scoped agent partitions): nullable
+  // workspace_id on each access table so rules / requests / signed-in origins are
+  // scoped to the workspace whose agent partition they govern. NULL = legacy
+  // default (back-compat): a NULL-workspace row applies to every workspace, so
+  // installs created before this column keep working unchanged. Guarded
+  // try/catch ALTER (the house idiom — see the allow_signed_in sibling above).
+  try {
+    db.exec(`ALTER TABLE browser_access_rules ADD COLUMN workspace_id TEXT`);
+  } catch { /* column already exists */ }
+  try {
+    db.exec(`ALTER TABLE browser_access_requests ADD COLUMN workspace_id TEXT`);
+  } catch { /* column already exists */ }
+  try {
+    db.exec(`ALTER TABLE browser_access_signed_in_origins ADD COLUMN workspace_id TEXT`);
+  } catch { /* column already exists */ }
+
   // ── Selection comments table ──────────────────────────────────────────
   // WP-P5 — persisted file-target selection comments. Schema recorded in
   // plans/selection-to-agent-primitive-plan.md §5; copied exactly. No generic

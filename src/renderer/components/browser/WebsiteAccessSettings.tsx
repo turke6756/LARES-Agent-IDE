@@ -464,8 +464,10 @@ function WebsiteAccessSettingsInner() {
             </span>
           </button>
           <p className="text-[11px] text-fg-muted">
-            The only origins the agent may visit and drive while Agent Actions is on — everything
-            else is denied. Each row can also allow the agent to drive your signed-in session.
+            The only origins agents <span className="font-medium text-fg-secondary">in this
+            workspace</span> may visit and drive while Agent Actions is on — everything else is
+            denied, and these rules never apply to agents in another workspace. Each row can also
+            allow the agent to drive your signed-in session.
           </p>
 
           {listExpanded && (

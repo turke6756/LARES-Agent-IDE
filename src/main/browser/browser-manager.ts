@@ -73,6 +73,7 @@ import {
   listRequestsByAgent,
   listRules,
   listSignedInOrigins,
+  rowAppliesToWorkspace,
   updateRule,
   upsertSignedInOrigin,
   type InsertRequestInput,
@@ -181,8 +182,16 @@ interface TabEntry {
   id: string;
   view: WebContentsView;
   partition: BrowserPartition;
-  /** Full Electron partition string ('persist:user' | 'persist:agent'). */
+  /** CANONICAL policy partition string ('persist:user' | 'persist:agent') —
+   *  what checkAction() / audit records compare against. NOT the Electron session
+   *  partition (that is workspace-scoped — see sessionPartition). */
   partitionFull: string;
+  /** Slice-4: the workspace-scoped Electron *session* partition this tab's
+   *  WebContentsView actually lives on — 'persist:user' (shared) for human tabs,
+   *  'persist:agent:<workspaceId>' for agent tabs. This is the cookie/storage
+   *  isolation boundary. Optional only so the test harness's fabricated tabs
+   *  (which do not call createTab) may omit it. */
+  sessionPartition?: string;
   /** Per-workspace isolation: the workspace this tab belongs to. Stamped at
    *  createTab time (the human's current workspace for UI-/main-initiated tabs;
    *  the agent's workspace for openUrl tabs). The renderer shows a tab only when
@@ -299,15 +308,64 @@ export interface BrowserToolProvider {
   requestSiteAccess(input: AccessRequestInput & {
     requestedBy: string;
     requestedByTitle?: string;
+    /** Slice-4: the requesting agent's workspace, resolved trust-side by the API
+     *  layer from the agent registry (never the agent's tool args). The created
+     *  rule on approval inherits it, so a request approved for workspace A
+     *  authorizes ONLY workspace A's agent. */
+    workspaceId?: string | null;
   }): { requestId: string; status: AccessRequest['status'] };
   /** §18 — a single agent's own requests + statuses. */
   listMyAccessRequests(agentId: string): AccessRequest[];
 }
 
+/** Canonical POLICY partition strings. These are the values checkAction() /
+ *  audit records compare against — they MUST stay exactly 'persist:user' /
+ *  'persist:agent' (the pure policy module string-matches them). The per-tab
+ *  Electron *session* partition is workspace-scoped separately (Slice-4) via
+ *  agentPartitionForWorkspace(); only that diverges per workspace, never the
+ *  policy string. */
 const PARTITION_FULL: Record<BrowserPartition, string> = {
   user: 'persist:user',
   agent: 'persist:agent',
 };
+
+/** Slice-4: per-workspace access-cache map key for the NULL (legacy default)
+ *  workspace. Real workspace ids are keyed as `ws:${id}`, so this sentinel can
+ *  never collide with a real id — even one literally named "null". */
+const NULL_WS_CACHE_KEY = 'null-ws';
+
+/**
+ * Slice-4 (premium browser — workspace-scoped agent partitions): derive the
+ * Electron *session* partition for an agent tab in a given workspace. The agent
+ * session is per-workspace — `persist:agent:<workspaceId>` (fallback
+ * `persist:agent:default` for null) — so an agent's cookies / localStorage /
+ * signed-in sessions in workspace A live in a different Electron session than in
+ * workspace B and are invisible across the boundary. The human's own
+ * `persist:user` browsing is shared and untouched (handled by partitionFor).
+ *
+ * PURE + exported so the unit tests can assert isolation (A ≠ B, null → default)
+ * without a live Chromium. The workspace id is sanitized to a partition-safe
+ * token (Electron persists each partition to its own on-disk directory) while
+ * preserving distinctness: the raw id is appended after a stable hash-free
+ * lowercasing of safe chars, and any unsafe run collapses to '_' — but two
+ * different ids can never collide because the FULL raw id (URI-encoded) is what
+ * is used; see below.
+ */
+export function agentPartitionForWorkspace(workspaceId: string | null | undefined): string {
+  if (workspaceId == null || workspaceId === '') return 'persist:agent:default';
+  // encodeURIComponent keeps every distinct id distinct (no lossy collapse) and
+  // yields only partition/path-safe characters except for '%', which is itself
+  // safe in a partition name. This makes the partition string a 1:1 function of
+  // the workspace id.
+  return `persist:agent:${encodeURIComponent(workspaceId)}`;
+}
+
+/** Slice-4: full Electron session partition for a (policy partition, workspace).
+ *  The human partition is shared across workspaces; the agent partition is
+ *  per-workspace. */
+function partitionFor(partition: BrowserPartition, workspaceId: string | null | undefined): string {
+  return partition === 'user' ? 'persist:user' : agentPartitionForWorkspace(workspaceId);
+}
 
 /** ARIA roles a select_option target may expose as a choosable option. Native
  *  <select> popups are OS-rendered and absent from the AX tree, so they never
@@ -356,9 +414,16 @@ export class BrowserManager {
    *  via a plain sync read — never a Promise. Cleared by invalidateAccessCache(),
    *  called by every access mutation. Enforcement is keyed to the Agent Actions
    *  toggle (no per-list mode dimension). */
-  private accessCache: {
-    agentRules: CompiledRule[];
-  } | null = null;
+  // Slice-4: the access cache is keyed PER WORKSPACE — the agent allowlist is
+  // workspace-scoped, so a tab in workspace A is gated against A's rules only.
+  // The key is the workspace id, or DEFAULT_WS_CACHE_KEY for the null (legacy
+  // default) workspace. Every access mutation clears the whole map.
+  private accessCache = new Map<string, { agentRules: CompiledRule[] }>();
+  /** Slice-4: Electron session partitions already hardened (hardenSession is
+   *  idempotent but the underlying webRequest handlers should be installed once).
+   *  persist:user is hardened up-front; each workspace's agent session is
+   *  hardened lazily on first createTab. */
+  private hardenedSessions = new Set<string>();
 
   constructor(
     private getMainWindow: () => BrowserWindow | null,
@@ -373,11 +438,11 @@ export class BrowserManager {
       jupyterRetries: JUPYTER_PORT_RETRIES,
     };
 
-    // Harden both pane partitions up-front (M2 + M5 + M7), before any view
-    // can exist on them.
-    for (const partition of Object.values(PARTITION_FULL)) {
-      this.hardenSession(session.fromPartition(partition));
-    }
+    // Harden the human partition up-front (M2 + M5 + M7), before any view can
+    // exist on it. Slice-4: the agent partition is now per-workspace
+    // (persist:agent:<workspaceId>), so each workspace's agent session is
+    // hardened lazily on its first createTab via ensureSessionHardened().
+    this.ensureSessionHardened('persist:user');
 
     // M4 hookup: register into WP0's webcontents-guard seam so the global
     // invariant guard recognizes pane views as deliberately managed.
@@ -431,6 +496,15 @@ export class BrowserManager {
     });
   }
 
+  /** Slice-4: harden an Electron session partition exactly once. Called for
+   *  persist:user at construction and for each workspace's agent partition
+   *  (persist:agent:<workspaceId>) on its first createTab. */
+  private ensureSessionHardened(partitionFull: string): void {
+    if (this.hardenedSessions.has(partitionFull)) return;
+    this.hardenSession(session.fromPartition(partitionFull));
+    this.hardenedSessions.add(partitionFull);
+  }
+
   // ── Tab lifecycle ──────────────────────────────────────────────────────────
 
   createTab(
@@ -446,18 +520,31 @@ export class BrowserManager {
     const partitionFull = PARTITION_FULL[opts.partition];
     if (!partitionFull) throw new Error(`unknown partition: ${String(opts.partition)}`);
 
+    // Per-workspace isolation: an explicit workspaceId (renderer-initiated tab
+    // for the human's selected workspace, or agent openUrl for the agent's
+    // workspace) wins; otherwise stamp the workspace main currently tracks.
+    const workspaceId = opts.workspaceId !== undefined ? opts.workspaceId : this.currentWorkspaceId;
+    // Slice-4: the Electron *session* partition is workspace-scoped for agent
+    // tabs (persist:agent:<workspaceId>); the human partition is shared. This is
+    // the boundary that makes an agent's signed-in cookies in workspace A
+    // invisible in workspace B. `partitionFull` stays the canonical policy string.
+    const sessionPartition = partitionFor(opts.partition, workspaceId);
+
     // loadURL bypasses will-navigate, so the M6 gate must run here too.
     if (opts.url !== undefined) {
       const nav = decideNavigation(opts.url, opts.partition);
       if (!nav.allow) throw new Error(`navigation denied: ${nav.reason}`);
     }
 
+    // Harden the (possibly brand-new, per-workspace) agent session before any
+    // content can load on it.
+    this.ensureSessionHardened(sessionPartition);
     const view = new WebContentsView({
       webPreferences: {
         // M3: every field explicit from the pure builder — a pane view must
         // never inherit the shell's webSecurity:false / preload.
         ...buildBrowserWebPreferences(opts.partition),
-        session: session.fromPartition(partitionFull),
+        session: session.fromPartition(sessionPartition),
       },
     });
 
@@ -467,10 +554,8 @@ export class BrowserManager {
       view,
       partition: opts.partition,
       partitionFull,
-      // Per-workspace isolation: an explicit workspaceId (renderer-initiated tab
-      // for the human's selected workspace, or agent openUrl for the agent's
-      // workspace) wins; otherwise stamp the workspace main currently tracks.
-      workspaceId: opts.workspaceId !== undefined ? opts.workspaceId : this.currentWorkspaceId,
+      sessionPartition,
+      workspaceId,
       openedByAgent: internal?.openedByAgent === true,
       // Slice-2: stamp agent identity + raise the authoritative attention flag
       // ONCE for agent-tool opens. Main does not loop/re-pulse — the renderer
@@ -638,15 +723,20 @@ export class BrowserManager {
   // ── Website-access policy: synchronously-readable cache + drive predicate ──
   // (plans/website-allowlist-design.md §5/§12/§14)
 
-  /** Load (and memoize) the compiled agent allowlist rules. SYNCHRONOUS — the
-   *  will-navigate/will-redirect chokepoints cannot await. better-sqlite3 is
-   *  fully synchronous, so this is a plain sync read on first access and on the
-   *  next access after invalidateAccessCache(). Only ENABLED rules are compiled
-   *  (a disabled rule grants nothing). */
-  private getAccessCache(): {
+  /** Load (and memoize) the compiled agent allowlist rules FOR ONE WORKSPACE.
+   *  SYNCHRONOUS — the will-navigate/will-redirect chokepoints cannot await.
+   *  better-sqlite3 is fully synchronous, so this is a plain sync read on first
+   *  access (per workspace) and on the next access after invalidateAccessCache().
+   *  Only ENABLED rules that apply to `workspaceId` are compiled — Slice-4: a
+   *  rule scoped to another workspace grants nothing here; a NULL-workspace
+   *  (legacy default) rule applies to every workspace (see rowAppliesToWorkspace).
+   *  A disabled rule grants nothing either way. */
+  private getAccessCache(workspaceId: string | null | undefined): {
     agentRules: CompiledRule[];
   } {
-    if (!this.accessCache) {
+    const key = workspaceId == null ? NULL_WS_CACHE_KEY : `ws:${workspaceId}`;
+    let cached = this.accessCache.get(key);
+    if (!cached) {
       const compile = (rule: AccessRule): CompiledRule => ({
         hostname: rule.hostname,
         includeSubdomains: rule.includeSubdomains,
@@ -654,23 +744,27 @@ export class BrowserManager {
         pathPrefix: rule.pathPrefix,
         allowSignedIn: rule.allowSignedIn,
       });
-      this.accessCache = {
-        agentRules: listRules().filter((r) => r.enabled).map(compile),
+      cached = {
+        agentRules: listRules()
+          .filter((r) => r.enabled && rowAppliesToWorkspace(r.workspaceId, workspaceId))
+          .map(compile),
       };
+      this.accessCache.set(key, cached);
     }
-    return this.accessCache;
+    return cached;
   }
 
-  /** Agent allowlist context for checkAgentVisit / checkSignedInDrive. */
-  private agentCtx(): { rules: CompiledRule[] } {
-    return { rules: this.getAccessCache().agentRules };
+  /** Agent allowlist context for checkAgentVisit / checkSignedInDrive, scoped to
+   *  the tab's / request's workspace (Slice-4). */
+  private agentCtx(workspaceId: string | null | undefined): { rules: CompiledRule[] } {
+    return { rules: this.getAccessCache(workspaceId).agentRules };
   }
 
-  /** Drop the memoized access cache; the next gate/chokepoint re-reads the DB.
-   *  Called by every access mutation (rule add/update/remove, request decision)
-   *  via the IPC layer (§6). */
+  /** Drop the memoized access cache (all workspaces); the next gate/chokepoint
+   *  re-reads the DB. Called by every access mutation (rule add/update/remove,
+   *  request decision) via the IPC layer (§6). */
   invalidateAccessCache(): void {
-    this.accessCache = null;
+    this.accessCache.clear();
   }
 
   // ── Website-access policy: IPC pass-throughs (§6/§14/§18) ──────────────────
@@ -680,12 +774,22 @@ export class BrowserManager {
   // accessRequestsChanged. These methods are reachable ONLY from trusted chrome
   // (browser-ipc.ts registers them); never from agent tools or page content.
 
+  /** Slice-4: the trusted-chrome rule list is scoped to the human's SELECTED
+   *  workspace — its own rules plus the legacy NULL-workspace defaults. So the
+   *  "shared by every agent in this workspace" copy is true by construction, and
+   *  another workspace's rules never appear in this workspace's settings. */
   accessRuleList(): AccessRule[] {
-    return listRules();
+    return listRules().filter((r) => rowAppliesToWorkspace(r.workspaceId, this.currentWorkspaceId));
   }
 
   accessRuleAdd(input: AccessRuleInput): AccessRule {
-    const rule = insertRule(input);
+    // Slice-4: a manual add is stamped with the human's selected workspace (the
+    // renderer never sends workspaceId — trust-side scoping). An explicit
+    // input.workspaceId (internal callers) still wins.
+    const rule = insertRule({
+      ...input,
+      workspaceId: input.workspaceId !== undefined ? input.workspaceId : this.currentWorkspaceId,
+    });
     this.invalidateAccessCache();
     this.emitAccessChanged();
     return rule;
@@ -707,15 +811,17 @@ export class BrowserManager {
     // + origin storage) before the row — and its tracked known-origins rows —
     // are gone, so clearAgentSiteData can still resolve the union of origins.
     const rule = getRule(id);
-    if (rule) void this.clearAgentSiteData(rule);
+    if (rule) void this.clearAgentSiteData(rule, rule.workspaceId ?? null);
     deleteRule(id);
     this.invalidateAccessCache();
     this.revokeNonDrivableHandedTabs();
     this.emitAccessChanged();
   }
 
+  /** Slice-4: scoped to the human's selected workspace (its requests + legacy
+   *  NULL-workspace defaults), mirroring accessRuleList. */
   accessRequestList(): AccessRequest[] {
-    return listRequests();
+    return listRequests().filter((r) => rowAppliesToWorkspace(r.workspaceId, this.currentWorkspaceId));
   }
 
   accessRequestDecide(id: string, decision: AccessRequestDecision): void {
@@ -752,7 +858,10 @@ export class BrowserManager {
     }
     const scheme = rule.scheme === 'any' ? 'https' : rule.scheme;
     const url = `${scheme}://${rule.hostname}${rule.pathPrefix ?? ''}`;
-    const { tabId } = this.createTab({ partition: 'agent', url });
+    // Slice-4: open the quarantined sign-in tab in the RULE's workspace, so the
+    // credentials the human enters land in that workspace's agent session
+    // (persist:agent:<workspaceId>) — the same session clearAgentSiteData clears.
+    const { tabId } = this.createTab({ partition: 'agent', url, workspaceId: rule.workspaceId ?? null });
     const tab = this.mustGet(tabId);
     tab.signinPending = true;
     tab.signinRuleId = ruleId;
@@ -771,14 +880,14 @@ export class BrowserManager {
     if (!tab.signinPending) return; // not quarantined — nothing to release
     const wc = tab.view.webContents;
     const url = wc.isDestroyed() ? '' : wc.getURL();
-    if (!checkSignedInDrive(url, this.agentCtx()).allow) {
+    if (!checkSignedInDrive(url, this.agentCtx(tab.workspaceId)).allow) {
       throw new Error(
         `access-handoff-ready: tab ${tabId} committed URL is not an allow_signed_in origin`,
       );
     }
     if (tab.signinRuleId) {
       try {
-        upsertSignedInOrigin(tab.signinRuleId, new URL(url).origin);
+        upsertSignedInOrigin(tab.signinRuleId, new URL(url).origin, tab.workspaceId);
       } catch {
         /* unparseable — already guarded by checkSignedInDrive, defensive only */
       }
@@ -796,7 +905,7 @@ export class BrowserManager {
     const tab = this.mustGet(tabId);
     const wc = tab.view.webContents;
     const url = wc.isDestroyed() ? '' : wc.getURL();
-    if (!checkSignedInDrive(url, this.agentCtx()).allow) {
+    if (!checkSignedInDrive(url, this.agentCtx(tab.workspaceId)).allow) {
       throw new Error(
         `tab-hand-to-agent: tab ${tabId} is not on an allow_signed_in origin`,
       );
@@ -816,7 +925,7 @@ export class BrowserManager {
    *  for a rule's origins without deleting the rule. */
   async accessClearSiteSession(ruleId: string): Promise<void> {
     const rule = getRule(ruleId);
-    if (rule) await this.clearAgentSiteData(rule);
+    if (rule) await this.clearAgentSiteData(rule, rule.workspaceId ?? null);
   }
 
   /** §14 — REQUIRED revocation breadth. Clear agent-partition site data for the
@@ -825,8 +934,16 @@ export class BrowserManager {
    *  http→http://host; any→BOTH). Origin storage is cleared per-origin;
    *  cookies are cleared separately because Electron scopes cookies by domain,
    *  not origin. Named "clear agent site session/data," not "cookies." */
-  private async clearAgentSiteData(target: AccessRule | { url: string }): Promise<void> {
-    const ses = session.fromPartition('persist:agent');
+  private async clearAgentSiteData(
+    target: AccessRule | { url: string },
+    workspaceId: string | null | undefined,
+  ): Promise<void> {
+    // Slice-4: clear ONLY the target workspace's agent session
+    // (persist:agent:<workspaceId>). Clearing the global partition would either
+    // wipe nothing (agent data now lives per-workspace) or, pre-fix, wipe every
+    // workspace's data — both wrong. A rule's workspace is the one whose handed-
+    // off credentials it governs.
+    const ses = session.fromPartition(agentPartitionForWorkspace(workspaceId));
     const origins = new Set<string>();
     let hostname: string | undefined;
 
@@ -897,14 +1014,19 @@ export class BrowserManager {
     if (tab.partition === 'agent') return true;
     if (!tab.handedToAgent) return false;
     const url = tab.view.webContents.isDestroyed() ? '' : tab.view.webContents.getURL();
-    return checkSignedInDrive(url, this.agentCtx()).allow;
+    return checkSignedInDrive(url, this.agentCtx(tab.workspaceId)).allow;
   }
 
   /** Outcome tag for a successful verb: 'ok:authenticated' when the committed
    *  origin is an allow_signed_in List-A rule (§14 — authenticated access is
    *  logged), else 'ok'. */
-  private authedOutcome(url: string | undefined): 'ok' | 'ok:authenticated' {
-    return typeof url === 'string' && /^https?:/i.test(url) && checkSignedInDrive(url, this.agentCtx()).allow
+  private authedOutcome(
+    url: string | undefined,
+    workspaceId: string | null | undefined,
+  ): 'ok' | 'ok:authenticated' {
+    return typeof url === 'string' &&
+      /^https?:/i.test(url) &&
+      checkSignedInDrive(url, this.agentCtx(workspaceId)).allow
       ? 'ok:authenticated'
       : 'ok';
   }
@@ -914,7 +1036,7 @@ export class BrowserManager {
    *  blanket read auditing). */
   private auditAuthedRead(tab: TabEntry, verb: string, args: unknown): void {
     const url = tab.view.webContents.isDestroyed() ? '' : tab.view.webContents.getURL();
-    if (this.authedOutcome(url) === 'ok:authenticated') {
+    if (this.authedOutcome(url, tab.workspaceId) === 'ok:authenticated') {
       this.auditRecord(tab.partitionFull, url, verb, args, 'ok:authenticated', { tab });
     }
   }
@@ -925,7 +1047,7 @@ export class BrowserManager {
    *  target that is still an allow_signed_in origin. */
   private autoRevokeIfOffOrigin(tab: TabEntry, url: string): void {
     if (!tab.handedToAgent) return;
-    if (checkSignedInDrive(url, this.agentCtx()).allow) return;
+    if (checkSignedInDrive(url, this.agentCtx(tab.workspaceId)).allow) return;
     this.detachAndClearHanded(tab);
     console.warn(`[browser] Mechanism-B auto-revoke (tab ${tab.id}): navigated off allow_signed_in origin`);
   }
@@ -1011,7 +1133,11 @@ export class BrowserManager {
    *  throws on '*'/unparseable hostnames or 'too-many-pending'. Emits
    *  accessRequestsChanged so the approval UI refreshes. Grants ZERO access. */
   private toolRequestSiteAccess(
-    input: AccessRequestInput & { requestedBy: string; requestedByTitle?: string },
+    input: AccessRequestInput & {
+      requestedBy: string;
+      requestedByTitle?: string;
+      workspaceId?: string | null;
+    },
   ): { requestId: string; status: AccessRequest['status'] } {
     const request = insertRequest({
       hostname: input.hostname,
@@ -1022,6 +1148,9 @@ export class BrowserManager {
       wantSignedIn: input.wantSignedIn,
       requestedBy: input.requestedBy,
       requestedByTitle: input.requestedByTitle,
+      // Slice-4: stamp the requesting agent's workspace (trust-side, from the API
+      // layer) so the rule created on approval is scoped to that workspace.
+      workspaceId: input.workspaceId ?? null,
     });
     this.emitAccessRequestsChanged();
     return { requestId: request.id, status: request.status };
@@ -1159,7 +1288,7 @@ export class BrowserManager {
       /^https?:/i.test(url) &&
       !EXPOSURE_REDUCING_VERBS.has(verb)
     ) {
-      const visit = checkAgentVisit(url, this.agentCtx());
+      const visit = checkAgentVisit(url, this.agentCtx(tab.workspaceId));
       if (!visit.allow) {
         this.auditRecord(partitionFull, url, verb, args, `denied:${visit.code}`, { tab });
         throw new PolicyError(visit.code, visit.reason);
@@ -1211,7 +1340,7 @@ export class BrowserManager {
     // the agent branch here implies actions are ON (gate() denied otherwise via
     // checkAction), so the allowlist is enforced: deny-by-default.
     if (!forHuman) {
-      const av = checkAgentVisit(url, this.agentCtx());
+      const av = checkAgentVisit(url, this.agentCtx(workspaceId));
       if (!av.allow) {
         this.auditRecord(partitionFull, url, verb, args, `denied:${av.code}`, openCtx);
         throw new PolicyError(av.code, av.reason);
@@ -1311,7 +1440,7 @@ export class BrowserManager {
       this.auditRecord(tab.partitionFull, url, 'click', args, `error:${msg}`, { tab });
       throw err;
     }
-    this.auditRecord(tab.partitionFull, url, 'click', args, this.authedOutcome(url), { tab });
+    this.auditRecord(tab.partitionFull, url, 'click', args, this.authedOutcome(url, tab.workspaceId), { tab });
 
     // Plan §5c: every action returns a fresh snapshot.
     return this.snapshotAfterAction(tabId, tab.view.webContents);
@@ -1343,7 +1472,7 @@ export class BrowserManager {
       this.auditRecord(tab.partitionFull, url, 'type', args, `error:${msg}`, { tab });
       throw err;
     }
-    this.auditRecord(tab.partitionFull, url, 'type', args, this.authedOutcome(url), { tab });
+    this.auditRecord(tab.partitionFull, url, 'type', args, this.authedOutcome(url, tab.workspaceId), { tab });
     return this.snapshotAfterAction(tabId, tab.view.webContents);
   }
 
@@ -1365,7 +1494,7 @@ export class BrowserManager {
       this.auditRecord(tab.partitionFull, url, 'pressKey', args, `error:${msg}`, { tab });
       throw err;
     }
-    this.auditRecord(tab.partitionFull, url, 'pressKey', args, this.authedOutcome(url), { tab });
+    this.auditRecord(tab.partitionFull, url, 'pressKey', args, this.authedOutcome(url, tab.workspaceId), { tab });
     return this.snapshotAfterAction(tabId, tab.view.webContents);
   }
 
@@ -1397,7 +1526,7 @@ export class BrowserManager {
       this.auditRecord(tab.partitionFull, url, 'scroll', args, `error:${msg}`, { tab });
       throw err;
     }
-    this.auditRecord(tab.partitionFull, url, 'scroll', args, this.authedOutcome(url), { tab });
+    this.auditRecord(tab.partitionFull, url, 'scroll', args, this.authedOutcome(url, tab.workspaceId), { tab });
     return this.snapshotAfterAction(tabId, tab.view.webContents);
   }
 
@@ -1450,7 +1579,7 @@ export class BrowserManager {
       this.auditRecord(tab.partitionFull, url, 'selectOption', args, `error:${msg}`, { tab });
       throw err;
     }
-    this.auditRecord(tab.partitionFull, url, 'selectOption', args, this.authedOutcome(url), { tab });
+    this.auditRecord(tab.partitionFull, url, 'selectOption', args, this.authedOutcome(url, tab.workspaceId), { tab });
     return this.snapshotAfterAction(tabId, tab.view.webContents);
   }
 
@@ -1468,7 +1597,7 @@ export class BrowserManager {
       this.auditRecord(tab.partitionFull, url, 'goBack', args, `error:${msg}`, { tab });
       throw err;
     }
-    this.auditRecord(tab.partitionFull, url, 'goBack', args, this.authedOutcome(url), { tab });
+    this.auditRecord(tab.partitionFull, url, 'goBack', args, this.authedOutcome(url, tab.workspaceId), { tab });
     return this.snapshotAfterAction(tabId, tab.view.webContents);
   }
 
@@ -1485,7 +1614,7 @@ export class BrowserManager {
       this.auditRecord(tab.partitionFull, url, 'goForward', args, `error:${msg}`, { tab });
       throw err;
     }
-    this.auditRecord(tab.partitionFull, url, 'goForward', args, this.authedOutcome(url), { tab });
+    this.auditRecord(tab.partitionFull, url, 'goForward', args, this.authedOutcome(url, tab.workspaceId), { tab });
     return this.snapshotAfterAction(tabId, tab.view.webContents);
   }
 
@@ -1502,7 +1631,7 @@ export class BrowserManager {
       this.auditRecord(tab.partitionFull, url, 'reload', args, `error:${msg}`, { tab });
       throw err;
     }
-    this.auditRecord(tab.partitionFull, url, 'reload', args, this.authedOutcome(url), { tab });
+    this.auditRecord(tab.partitionFull, url, 'reload', args, this.authedOutcome(url, tab.workspaceId), { tab });
     return this.snapshotAfterAction(tabId, tab.view.webContents);
   }
 
@@ -1546,7 +1675,7 @@ export class BrowserManager {
       throw new Error(`closeTab refused: tab ${tabId} is not an agent-partition tab`);
     }
     this.closeTab(tabId); // the existing manager method
-    this.auditRecord(tab.partitionFull, url, 'closeTab', args, this.authedOutcome(url), { tab });
+    this.auditRecord(tab.partitionFull, url, 'closeTab', args, this.authedOutcome(url, tab.workspaceId), { tab });
     return { closed: true, tabs: this.toolListTabs() };
   }
 

@@ -79,6 +79,7 @@ function makeMockApi() {
     onFoundInPage: vi.fn(() => () => {}),
     onContextMenuCommand: vi.fn(() => () => {}),
     onBookmarksChanged: vi.fn(() => () => {}),
+    setActiveWorkspace: vi.fn(),
     access: makeAccessMock(),
   };
 }
@@ -339,6 +340,22 @@ describe('Mechanism-A sign-in hand-off', () => {
     useBrowserStore.getState().cancelSigninHandoff();
     expect(api.closeTab).toHaveBeenCalledWith('tab-signin');
     expect(useBrowserStore.getState().signinHandoff).toBeNull();
+  });
+});
+
+describe('Slice-4: per-workspace access scoping', () => {
+  it('handleWorkspaceChange re-scopes main and reloads the workspace-scoped allowlist + request inbox', async () => {
+    // Main filters accessRuleList / accessRequestList by the selected workspace,
+    // but a bare workspace switch emits no accessChanged event — so the store
+    // must (a) tell main the new workspace and (b) reload both slices itself,
+    // else the overlay's list/add/decide would act on the previous workspace.
+    api.access.list.mockClear();
+    api.access.requestList.mockClear();
+    useBrowserStore.getState().handleWorkspaceChange('ws-2');
+    expect(useBrowserStore.getState().selectedWorkspaceId).toBe('ws-2');
+    expect(api.setActiveWorkspace).toHaveBeenCalledWith('ws-2');
+    expect(api.access.list).toHaveBeenCalled();
+    expect(api.access.requestList).toHaveBeenCalled();
   });
 });
 

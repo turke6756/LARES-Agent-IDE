@@ -86,6 +86,7 @@ function rowToRule(row: any): AccessRule {
     allowSignedIn: row.allow_signed_in === 1,
     enabled: row.enabled === 1,
     createdAt: row.created_at,
+    workspaceId: row.workspace_id ?? null,
   };
 }
 
@@ -103,7 +104,24 @@ function rowToRequest(row: any): AccessRequest {
     status: row.status,
     createdAt: row.created_at,
     decidedAt: row.decided_at ?? undefined,
+    workspaceId: row.workspace_id ?? null,
   };
+}
+
+// ── Slice-4: workspace scoping ───────────────────────────────────────────────
+
+/**
+ * Does a workspace-scoped access row (rule / request) apply to `workspaceId`?
+ * A NULL row is the legacy default — it applies to EVERY workspace (back-compat
+ * for installs created before the column existed). A non-null row applies only to
+ * its own workspace. Shared by the manager's per-workspace rule cache, the UI
+ * rule/request lists, and the tests so all three scope identically.
+ */
+export function rowAppliesToWorkspace(
+  rowWorkspaceId: string | null | undefined,
+  workspaceId: string | null | undefined,
+): boolean {
+  return rowWorkspaceId == null || rowWorkspaceId === (workspaceId ?? null);
 }
 
 // ── Rules CRUD ───────────────────────────────────────────────────────────────
@@ -124,12 +142,13 @@ export function insertRule(input: AccessRuleInput): AccessRule {
   const hostname = normalizeHostname(input.hostname, input.scheme);
   const pathPrefix = normalizePathPrefix(input.pathPrefix);
   const allowSignedIn = input.allowSignedIn === true;
+  const workspaceId = input.workspaceId ?? null;
   const id = uuidv4();
   const createdAt = Date.now();
   db.prepare(
     `INSERT INTO browser_access_rules
-      (id, list, hostname, include_subdomains, scheme, path_prefix, note, allow_signed_in, enabled, created_at)
-     VALUES (?, 'agent', ?, ?, ?, ?, ?, ?, 1, ?)`,
+      (id, list, hostname, include_subdomains, scheme, path_prefix, note, allow_signed_in, enabled, created_at, workspace_id)
+     VALUES (?, 'agent', ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
   ).run(
     id,
     hostname,
@@ -139,6 +158,7 @@ export function insertRule(input: AccessRuleInput): AccessRule {
     input.note ?? null,
     allowSignedIn ? 1 : 0,
     createdAt,
+    workspaceId,
   );
   return {
     id,
@@ -150,6 +170,7 @@ export function insertRule(input: AccessRuleInput): AccessRule {
     allowSignedIn,
     enabled: true,
     createdAt,
+    workspaceId,
   };
 }
 
@@ -207,6 +228,9 @@ export function updateRule(
     allowSignedIn,
     enabled,
     createdAt: existing.createdAt,
+    // Slice-4: workspace scope is immutable here — a rule never migrates
+    // workspaces via an edit (the UPDATE above leaves workspace_id untouched).
+    workspaceId: existing.workspaceId ?? null,
   };
 }
 
@@ -232,26 +256,35 @@ export function listSignedInOrigins(ruleId: string): string[] {
   ).map((r) => r.origin);
 }
 
-/** Record an authenticated origin for a rule (idempotent). */
-export function upsertSignedInOrigin(ruleId: string, origin: string): void {
+/** Record an authenticated origin for a rule (idempotent). Slice-4: the origin
+ *  is transitively workspace-scoped by its rule_id (a rule belongs to one
+ *  workspace), but workspace_id is stored too for symmetry / direct queries. */
+export function upsertSignedInOrigin(
+  ruleId: string,
+  origin: string,
+  workspaceId: string | null = null,
+): void {
   getDb()
     .prepare(
-      `INSERT INTO browser_access_signed_in_origins (rule_id, origin) VALUES (?, ?)
+      `INSERT INTO browser_access_signed_in_origins (rule_id, origin, workspace_id) VALUES (?, ?, ?)
        ON CONFLICT(rule_id, origin) DO NOTHING`,
     )
-    .run(ruleId, origin);
+    .run(ruleId, origin, workspaceId);
 }
 
 // ── Agent-initiated requests (§18) ───────────────────────────────────────────
 
-/** Canonical dedup key for a pending request: list+host+scheme+subdomains+path. */
+/** Canonical dedup key for a pending request: workspace+host+scheme+subdomains+path.
+ *  Slice-4: the workspace is part of the key so the same origin requested by
+ *  agents in two different workspaces yields two distinct pending requests. */
 function requestKey(r: {
   hostname: string;
   scheme: string;
   includeSubdomains: boolean;
   pathPrefix?: string;
+  workspaceId?: string | null;
 }): string {
-  return `${r.hostname}|${r.scheme}|${r.includeSubdomains ? 1 : 0}|${r.pathPrefix ?? ''}`;
+  return `${r.workspaceId ?? ''}|${r.hostname}|${r.scheme}|${r.includeSubdomains ? 1 : 0}|${r.pathPrefix ?? ''}`;
 }
 
 export interface InsertRequestInput {
@@ -263,6 +296,9 @@ export interface InsertRequestInput {
   wantSignedIn?: boolean;
   requestedBy: string;
   requestedByTitle?: string;
+  /** Slice-4: the workspace of the requesting agent, resolved trust-side (the
+   *  API layer reads it from the agent registry — never the agent's tool args). */
+  workspaceId?: string | null;
 }
 
 /**
@@ -280,6 +316,7 @@ export function insertRequest(
   const pathPrefix = normalizePathPrefix(input.pathPrefix);
   const includeSubdomains = input.includeSubdomains !== false; // default true
   const wantSignedIn = input.wantSignedIn === true;
+  const workspaceId = input.workspaceId ?? null;
   // F6 (DoS/UX hardening, not XSS): clamp the agent-supplied reason so it can't
   // flood/garble the human approval surface. The pending cap bounds count, not
   // size. Stored as opaque data; UI renders it as auto-escaped React text.
@@ -291,7 +328,7 @@ export function insertRequest(
     .prepare("SELECT * FROM browser_access_requests WHERE status = 'pending'")
     .all()
     .map(rowToRequest);
-  const key = requestKey({ hostname, scheme, includeSubdomains, pathPrefix });
+  const key = requestKey({ hostname, scheme, includeSubdomains, pathPrefix, workspaceId });
   const dup = pending.find((p) => requestKey(p) === key);
   if (dup) return dup;
 
@@ -309,8 +346,8 @@ export function insertRequest(
   db.prepare(
     `INSERT INTO browser_access_requests
       (id, list, hostname, include_subdomains, scheme, path_prefix, want_signed_in,
-       requested_by, requested_by_title, reason, status, created_at, decided_at)
-     VALUES (?, 'agent', ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, NULL)`,
+       requested_by, requested_by_title, reason, status, created_at, decided_at, workspace_id)
+     VALUES (?, 'agent', ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, NULL, ?)`,
   ).run(
     id,
     hostname,
@@ -322,6 +359,7 @@ export function insertRequest(
     input.requestedByTitle ?? null,
     reason ?? null,
     createdAt,
+    workspaceId,
   );
   return {
     id,
@@ -335,6 +373,7 @@ export function insertRequest(
     reason,
     status: 'pending',
     createdAt,
+    workspaceId,
   };
 }
 
@@ -396,6 +435,9 @@ export function decideRequest(
         pathPrefix: request.pathPrefix,
         note: request.reason ? `Requested by ${request.requestedByTitle ?? request.requestedBy}` : undefined,
         allowSignedIn: decision === 'approve_signed_in',
+        // Slice-4: the created rule inherits the request's workspace, so a
+        // request approved for workspace A authorizes ONLY workspace A's agent.
+        workspaceId: request.workspaceId ?? null,
       });
     }
 

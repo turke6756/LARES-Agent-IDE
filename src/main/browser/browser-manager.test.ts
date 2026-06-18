@@ -212,13 +212,17 @@ function makeManager(): MgrHarness {
 interface FakeTab {
   id: string; partition: 'agent' | 'user'; partitionFull: string;
   openedByAgent: boolean; signinPending?: boolean; handedToAgent?: boolean;
+  // Slice-4: the workspace a fabricated tab belongs to. Undefined → the null /
+  // legacy-default workspace (what setCache's default key targets), so existing
+  // workspace-agnostic tests keep working unchanged.
+  workspaceId?: string | null;
   view: { webContents: FakeWC };
 }
 
 let tabSeq = 0;
 function injectTab(
   mgr: MgrHarness['mgr'],
-  opts: { partition: 'agent' | 'user'; url: string; title?: string; signinPending?: boolean; handedToAgent?: boolean },
+  opts: { partition: 'agent' | 'user'; url: string; title?: string; signinPending?: boolean; handedToAgent?: boolean; workspaceId?: string | null },
 ): FakeTab {
   const id = `tab-${++tabSeq}`;
   const tab: FakeTab = {
@@ -228,6 +232,7 @@ function injectTab(
     openedByAgent: false,
     signinPending: opts.signinPending,
     handedToAgent: opts.handedToAgent,
+    workspaceId: opts.workspaceId,
     view: { webContents: fakeWC(opts.url, opts.title) },
   };
   const internals = mgr as unknown as { tabs: Map<string, unknown>; tabOrder: string[] };
@@ -236,11 +241,21 @@ function injectTab(
   return tab;
 }
 
-/** Set the manager's synchronously-readable access cache directly (no DB).
- *  Single agent allowlist — enforcement is keyed to the Agent Actions toggle
- *  (set via policy.setRuntimeActionsEnabled in the tests), not a mode dimension. */
-function setCache(mgr: MgrHarness['mgr'], agentRules: unknown[]): void {
-  (mgr as unknown as { accessCache: unknown }).accessCache = { agentRules };
+/** Slice-4 access-cache Map key for a workspace — MUST mirror getAccessCache's
+ *  keying (null/undefined → the NULL_WS_CACHE_KEY sentinel 'null-ws', a real id
+ *  → `ws:${id}`). Kept in sync by hand because the constant is module-private. */
+function wsCacheKey(workspaceId?: string | null): string {
+  return workspaceId == null ? 'null-ws' : `ws:${workspaceId}`;
+}
+
+/** Seed the manager's synchronously-readable per-workspace access cache directly
+ *  (no DB) for a given workspace. Single agent allowlist — enforcement is keyed
+ *  to the Agent Actions toggle (set via policy.setRuntimeActionsEnabled in the
+ *  tests), not a mode dimension. Defaults to the null/legacy-default workspace,
+ *  which is what injectTab's fabricated tabs (no workspaceId) resolve to. */
+function setCache(mgr: MgrHarness['mgr'], agentRules: unknown[], workspaceId?: string | null): void {
+  const map = (mgr as unknown as { accessCache: Map<string, unknown> }).accessCache;
+  map.set(wsCacheKey(workspaceId), { agentRules });
 }
 
 /** Reach a private method for direct unit exercise. */
@@ -604,6 +619,104 @@ test('approve_signed_in creates an allow_signed_in rule; deny creates no rule', 
   const before = mgr.accessRuleList().length;
   mgr.accessRequestDecide(dnReq.id, 'deny');
   assert.equal(mgr.accessRuleList().length, before, 'deny creates no rule');
+});
+
+// ── Slice-4: workspace-scoped agent partitions & access state ────────────────
+// The trust claim is that an agent's signed-in sessions and access rules are
+// STRICTLY per-workspace: signed-in/handed-off in workspace A is NOT usable by
+// agents in B (DECIDED 2026-06-17, Edward). The three required proofs:
+//   (a) the agent SESSION partition (the cookie/storage isolation boundary) is
+//       per-workspace, so A's cookies live in a different Electron session than
+//       B's and are invisible across the boundary;
+//   (b) a rule approved in A does NOT authorize B's agent (deny-by-default);
+//   (c) legacy NULL-workspace rows still apply as the back-compat default.
+
+test('Slice-4(a): the agent SESSION partition is per-workspace — A and B never share one (cookie/storage isolation boundary)', () => {
+  const a = BM.agentPartitionForWorkspace('ws-A-uuid');
+  const b = BM.agentPartitionForWorkspace('ws-B-uuid');
+  // Distinct workspaces → distinct Electron session partitions. Because cookies /
+  // localStorage / signed-in sessions live on the session named by this string,
+  // A's signed-in cookies are physically unreachable from a B tab and vice-versa.
+  assert.notEqual(a, b, 'distinct workspaces resolve to distinct agent session partitions');
+  assert.match(a, /^persist:agent:/);
+  assert.match(b, /^persist:agent:/);
+  // An agent partition never collides with the human's shared partition.
+  assert.notEqual(a, 'persist:user');
+  assert.notEqual(b, 'persist:user');
+  // null / undefined / '' → the legacy-default agent partition (back-compat),
+  // still distinct from any real (uuid) workspace partition.
+  assert.equal(BM.agentPartitionForWorkspace(null), 'persist:agent:default');
+  assert.equal(BM.agentPartitionForWorkspace(undefined), 'persist:agent:default');
+  assert.equal(BM.agentPartitionForWorkspace(''), 'persist:agent:default');
+  assert.notEqual(a, BM.agentPartitionForWorkspace(null), 'a real workspace never shares the null-default partition');
+});
+
+test('Slice-4(b): a rule approved in workspace A does NOT authorize an agent in workspace B', () => {
+  const { mgr } = makeManager();
+  const checkAgentVisit = policy.checkAgentVisit;
+  const agentCtx = priv<{ rules: CompiledRule[] }>(mgr, 'agentCtx');
+  const host = 'scoped-approve.example';
+  const target = `https://${host}/`;
+  const A = 'wsb-A-uuid';
+  const B = 'wsb-B-uuid';
+
+  // An agent in workspace A files a request — the workspace is resolved trust-side
+  // by the API layer (passed here directly, never from the agent's tool args).
+  mgr.tools.requestSiteAccess({ hostname: host, reason: 'docs', requestedBy: 'agent-A', workspaceId: A });
+  const req = store.listRequests().find((r) => r.hostname === host && r.status === 'pending');
+  assert.ok(req, 'the pending request exists');
+  assert.equal(req!.workspaceId, A, "the request carries the requesting agent's workspace");
+
+  // A human approves → the created rule INHERITS workspace A.
+  mgr.accessRequestDecide(req!.id, 'approve');
+  mgr.invalidateAccessCache();
+  const rule = store.listRules().find((r) => r.hostname === host);
+  assert.ok(rule, 'the approval created a rule');
+  assert.equal(rule!.workspaceId, A, 'the approved rule is scoped to the requesting workspace');
+
+  // So A's agent is authorized, but B's agent is denied-by-default.
+  assert.equal(checkAgentVisit(target, agentCtx(A)).allow, true, 'workspace A is authorized by its own rule');
+  assert.equal(checkAgentVisit(target, agentCtx(B)).allow, false, "workspace B is NOT authorized by A's rule");
+  mgr.invalidateAccessCache();
+});
+
+test('Slice-4(c): a legacy NULL-workspace rule applies as the default — authorizes every workspace', () => {
+  const { mgr } = makeManager();
+  const checkAgentVisit = policy.checkAgentVisit;
+  const agentCtx = priv<{ rules: CompiledRule[] }>(mgr, 'agentCtx');
+  const host = 'legacy-null.example';
+  const target = `https://${host}/`;
+
+  // A rule with an explicit null workspace — exactly what a pre-Slice-4 row
+  // deserializes to (workspace_id IS NULL). It must keep working unchanged.
+  store.insertRule({ hostname: host, scheme: 'https', includeSubdomains: true, allowSignedIn: false, workspaceId: null });
+  mgr.invalidateAccessCache();
+
+  // It authorizes agents in ANY workspace (the back-compat default) and the
+  // null/default workspace itself.
+  assert.equal(checkAgentVisit(target, agentCtx('any-workspace-uuid')).allow, true, 'null-workspace rule applies to an arbitrary workspace');
+  assert.equal(checkAgentVisit(target, agentCtx(null)).allow, true, 'and to the null/default workspace');
+  mgr.invalidateAccessCache();
+});
+
+test('Slice-4: accessRuleList scopes to the selected workspace (own rules + legacy null defaults, never another workspace)', () => {
+  const { mgr } = makeManager();
+  store.insertRule({ hostname: 'only-a.example', scheme: 'https', includeSubdomains: false, allowSignedIn: false, workspaceId: 'wsd-A' });
+  store.insertRule({ hostname: 'only-b.example', scheme: 'https', includeSubdomains: false, allowSignedIn: false, workspaceId: 'wsd-B' });
+  store.insertRule({ hostname: 'legacy-default.example', scheme: 'https', includeSubdomains: false, allowSignedIn: false, workspaceId: null });
+
+  mgr.setActiveWorkspace('wsd-A');
+  const inA = mgr.accessRuleList().map((r) => r.hostname);
+  assert.ok(inA.includes('only-a.example'), 'A sees its own rule');
+  assert.ok(inA.includes('legacy-default.example'), 'A sees the legacy null-workspace default');
+  assert.ok(!inA.includes('only-b.example'), "A does NOT see workspace B's rule");
+
+  mgr.setActiveWorkspace('wsd-B');
+  const inB = mgr.accessRuleList().map((r) => r.hostname);
+  assert.ok(inB.includes('only-b.example'), 'B sees its own rule');
+  assert.ok(inB.includes('legacy-default.example'), 'B sees the legacy null-workspace default');
+  assert.ok(!inB.includes('only-a.example'), "B does NOT see workspace A's rule");
+  mgr.setActiveWorkspace(null);
 });
 
 // ── Slice-1: connection security + trusted error state ───────────────────────

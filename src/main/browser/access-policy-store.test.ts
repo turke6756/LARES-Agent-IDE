@@ -230,6 +230,35 @@ test('decideRequest is idempotent-safe: deciding an already-decided request thro
   assert.throws(() => store.decideRequest(req.id, 'approve'), /already denied/);
 });
 
+// ── Slice-4: workspace scoping ───────────────────────────────────────
+
+test('Slice-4: insertRule stores workspaceId; a null-workspace rule applies to every workspace, a scoped one only to its own', () => {
+  const scoped = store.insertRule({ hostname: 'scoped-ws.com', scheme: 'https', includeSubdomains: true, allowSignedIn: false, workspaceId: 'ws-1' });
+  const legacy = store.insertRule({ hostname: 'legacy-ws.com', scheme: 'https', includeSubdomains: true, allowSignedIn: false, workspaceId: null });
+  assert.equal(store.getRule(scoped.id)?.workspaceId, 'ws-1');
+  assert.equal(store.getRule(legacy.id)?.workspaceId, null);
+  // A scoped row applies ONLY to its workspace; a null row is the legacy default.
+  assert.equal(store.rowAppliesToWorkspace('ws-1', 'ws-1'), true);
+  assert.equal(store.rowAppliesToWorkspace('ws-1', 'ws-2'), false);
+  assert.equal(store.rowAppliesToWorkspace(null, 'ws-2'), true, 'null = legacy default applies everywhere');
+  assert.equal(store.rowAppliesToWorkspace(null, null), true);
+});
+
+test('Slice-4: decideRequest approve → the created rule inherits the request workspace (A-approval never authorizes B)', () => {
+  const req = store.insertRequest({ ...REQ, hostname: 'inherit-ws.com', requestedBy: 'agent-ws', workspaceId: 'ws-A' });
+  assert.equal(req.workspaceId, 'ws-A', 'request carries the trust-side workspace');
+  const result = store.decideRequest(req.id, 'approve');
+  assert.ok(result.createdRule);
+  assert.equal(result.createdRule!.workspaceId, 'ws-A', 'the rule is scoped to the requesting workspace');
+  assert.equal(store.rowAppliesToWorkspace(result.createdRule!.workspaceId, 'ws-B'), false, 'so it does NOT authorize workspace B');
+});
+
+test('Slice-4: same origin requested from two workspaces yields two distinct pending requests (workspace is part of the dedup key)', () => {
+  const a = store.insertRequest({ ...REQ, hostname: 'twows.com', requestedBy: 'agent-2ws', workspaceId: 'ws-X' });
+  const b = store.insertRequest({ ...REQ, hostname: 'twows.com', requestedBy: 'agent-2ws', workspaceId: 'ws-Y' });
+  assert.notEqual(b.id, a.id, 'different workspaces → not deduped into one request');
+});
+
 // ── Run ──────────────────────────────────────────────────────────────
 
 (async () => {
