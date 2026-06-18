@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
   useBrowserStore,
   agentSignedInRuleForUrl,
@@ -71,6 +71,152 @@ function TabIcon({ tab }: { tab: OrderedTab['tab'] }) {
         </span>
       )}
     </span>
+  );
+}
+
+// ── Slice-5 tab right-click context menu (accessible, viewport-clamped) ───────
+// The menu is renderer chrome that can overflow into the host region, so it is
+// rendered while the pane is suspended (see overlayOpen below). This component
+// owns the a11y + positioning correctness the audit flagged:
+//   • coordinates are clamped to the viewport so the menu never renders
+//     partially off-screen (e.g. right-click near the bottom/right edge),
+//   • Esc dismisses it, focus is trapped, and Arrow/Home/End move between items,
+//   • role="menu"/"menuitem" expose it to assistive tech.
+function TabContextMenu({
+  x,
+  y,
+  handed,
+  canHand,
+  onReturn,
+  onHandoff,
+  onClose,
+}: {
+  x: number;
+  y: number;
+  handed: boolean;
+  canHand: boolean;
+  onReturn: () => void;
+  onHandoff: () => void;
+  onClose: () => void;
+}) {
+  const menuRef = useRef<HTMLDivElement | null>(null);
+  // Start at the raw cursor point, then clamp once the real size is known.
+  const [pos, setPos] = useState<{ left: number; top: number }>({ left: x, top: y });
+
+  // Clamp to the viewport after layout (size is unknown until mounted).
+  useLayoutEffect(() => {
+    const el = menuRef.current;
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+    const margin = 4;
+    const maxLeft = Math.max(margin, window.innerWidth - rect.width - margin);
+    const maxTop = Math.max(margin, window.innerHeight - rect.height - margin);
+    const left = Math.min(Math.max(margin, x), maxLeft);
+    const top = Math.min(Math.max(margin, y), maxTop);
+    setPos((prev) => (prev.left === left && prev.top === top ? prev : { left, top }));
+  }, [x, y]);
+
+  // Focus management: move focus into the menu on open, trap it, and wire
+  // Esc / Arrow / Home / End. The listener lives on the container so it catches
+  // bubbling key events from the focused menuitem; the container is itself
+  // focusable (tabIndex -1) so Esc still works when every item is disabled.
+  useEffect(() => {
+    const el = menuRef.current;
+    if (!el) return;
+    const itemsOf = () =>
+      Array.from(el.querySelectorAll<HTMLElement>('[role="menuitem"]:not([disabled])'));
+    (itemsOf()[0] ?? el).focus();
+
+    const onKeyDown = (e: KeyboardEvent) => {
+      const items = itemsOf();
+      const len = items.length;
+      const idx = items.indexOf(document.activeElement as HTMLElement);
+      switch (e.key) {
+        case 'Escape':
+          e.preventDefault();
+          onClose();
+          break;
+        case 'ArrowDown':
+          if (!len) break;
+          e.preventDefault();
+          items[(idx + 1 + len) % len]?.focus();
+          break;
+        case 'ArrowUp':
+          if (!len) break;
+          e.preventDefault();
+          items[(idx - 1 + len) % len]?.focus();
+          break;
+        case 'Home':
+          if (!len) break;
+          e.preventDefault();
+          items[0]?.focus();
+          break;
+        case 'End':
+          if (!len) break;
+          e.preventDefault();
+          items[len - 1]?.focus();
+          break;
+        case 'Tab':
+          // Trap focus within the menu so the popover stays self-contained.
+          if (!len) break;
+          e.preventDefault();
+          items[e.shiftKey ? (idx - 1 + len) % len : (idx + 1) % len]?.focus();
+          break;
+      }
+    };
+    el.addEventListener('keydown', onKeyDown);
+    return () => el.removeEventListener('keydown', onKeyDown);
+  }, [onClose]);
+
+  return (
+    <>
+      <div
+        className="fixed inset-0 z-50"
+        onClick={onClose}
+        onContextMenu={(e) => {
+          e.preventDefault();
+          onClose();
+        }}
+      />
+      <div
+        ref={menuRef}
+        role="menu"
+        aria-label="Tab actions"
+        tabIndex={-1}
+        className="fixed z-50 min-w-[220px] rounded-md border border-[var(--color-browser-divider)] bg-[var(--color-surface-0)] shadow-lg py-1 text-[12px] focus:outline-none"
+        style={{ left: pos.left, top: pos.top }}
+      >
+        {handed ? (
+          <button
+            role="menuitem"
+            onClick={onReturn}
+            className="w-full text-left px-3 py-1.5 flex items-center gap-2 text-fg-primary hover:bg-[var(--color-tab-hover-bg)] focus:bg-[var(--color-tab-hover-bg)] focus:outline-none"
+          >
+            <Icons.Undo2 className="w-3.5 h-3.5 shrink-0" />
+            Return tab to me
+          </button>
+        ) : (
+          <button
+            role="menuitem"
+            onClick={onHandoff}
+            disabled={!canHand}
+            className={`w-full text-left px-3 py-1.5 flex items-center gap-2 focus:outline-none ${
+              canHand
+                ? 'text-fg-primary hover:bg-[var(--color-tab-hover-bg)] focus:bg-[var(--color-tab-hover-bg)]'
+                : 'text-fg-muted cursor-not-allowed'
+            }`}
+            title={
+              canHand
+                ? 'Let the agent drive this signed-in tab'
+                : 'Only available on your tabs whose site is an "allow signed in" agent rule'
+            }
+          >
+            <Icons.Bot className="w-3.5 h-3.5 shrink-0" />
+            Hand this tab to the agent
+          </button>
+        )}
+      </div>
+    </>
   );
 }
 
@@ -433,44 +579,18 @@ export default function BrowserTabStrip() {
 
       {/* ── Tab right-click context menu (hand-off / return) ─────────────────── */}
       {menu && menuTab && (
-        <>
-          <div className="fixed inset-0 z-50" onClick={() => setMenu(null)} onContextMenu={(e) => { e.preventDefault(); setMenu(null); }} />
-          <div
-            className="fixed z-50 min-w-[220px] rounded-md border border-[var(--color-browser-divider)] bg-[var(--color-surface-0)] shadow-lg py-1 text-[12px]"
-            style={{ left: menu.x, top: menu.y }}
-          >
-            {handedTabIds[menu.tabId] ? (
-              <button
-                onClick={() => {
-                  void tabReturnToHuman(menu.tabId);
-                  setMenu(null);
-                }}
-                className="w-full text-left px-3 py-1.5 flex items-center gap-2 text-fg-primary hover:bg-[var(--color-tab-hover-bg)]"
-              >
-                <Icons.Undo2 className="w-3.5 h-3.5 shrink-0" />
-                Return tab to me
-              </button>
-            ) : (
-              <button
-                onClick={beginHandoff}
-                disabled={!canHand}
-                className={`w-full text-left px-3 py-1.5 flex items-center gap-2 ${
-                  canHand
-                    ? 'text-fg-primary hover:bg-[var(--color-tab-hover-bg)]'
-                    : 'text-fg-muted cursor-not-allowed'
-                }`}
-                title={
-                  canHand
-                    ? 'Let the agent drive this signed-in tab'
-                    : 'Only available on your tabs whose site is an "allow signed in" agent rule'
-                }
-              >
-                <Icons.Bot className="w-3.5 h-3.5 shrink-0" />
-                Hand this tab to the agent
-              </button>
-            )}
-          </div>
-        </>
+        <TabContextMenu
+          x={menu.x}
+          y={menu.y}
+          handed={Boolean(handedTabIds[menu.tabId])}
+          canHand={canHand}
+          onReturn={() => {
+            void tabReturnToHuman(menu.tabId);
+            setMenu(null);
+          }}
+          onHandoff={beginHandoff}
+          onClose={() => setMenu(null)}
+        />
       )}
 
       {/* ── Hand-off confirm dialog (names the origin) ───────────────────────── */}

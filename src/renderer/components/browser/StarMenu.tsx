@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import * as Icons from 'lucide-react';
 import { useBrowserStore, type Bookmark } from '../../stores/browser-store';
+import { suspendBrowserPane, resumeBrowserPane } from './useBrowserSuspension';
 
 // ── Star / bookmark menu (WP3-BM-UI) ─────────────────────────────────────────
 // Lives in the AddressBar's reserved STAR slot. Rendered ONLY for user-partition
@@ -61,6 +62,18 @@ export default function StarMenu() {
     };
     document.addEventListener('mousedown', onDocClick);
     return () => document.removeEventListener('mousedown', onDocClick);
+  }, [open]);
+
+  // Cross-cutting rule #3: the open popover can overlap the WebContentsView
+  // (it renders below the address bar, into the host region), and a native
+  // view always paints ABOVE renderer DOM — so suspend the pane while it is
+  // open and restore on close. Ref-counted, so it composes with any other
+  // overlay that is also up (history/access modals): the pane reappears only
+  // when the LAST overlay closes.
+  useEffect(() => {
+    if (!open) return;
+    suspendBrowserPane();
+    return () => resumeBrowserPane();
   }, [open]);
 
   if (!bookmarkable || !activeTab) return null;

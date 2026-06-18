@@ -36,7 +36,20 @@ export function suspendBrowserPane(): void {
 }
 
 export function resumeBrowserPane(): void {
-  if (suspendCount === 0) return;
+  if (suspendCount === 0) {
+    // Dev-only assertion: a resume with no matching suspend means the
+    // suspend/resume calls are unbalanced (the count would go negative).
+    // Surfacing it in dev catches overlays that resume twice or never
+    // suspended, which would prematurely re-show the pane under a sibling
+    // overlay. In production we still no-op defensively.
+    if (process.env.NODE_ENV !== 'production') {
+      console.error(
+        'resumeBrowserPane() called while suspendCount is already 0 — ' +
+          'unbalanced suspend/resume (pane visibility ref-count underflow).',
+      );
+    }
+    return;
+  }
   suspendCount -= 1;
   if (suspendCount === 0) {
     try {
@@ -56,4 +69,21 @@ export function useBrowserSuspension(): void {
     suspendBrowserPane();
     return () => resumeBrowserPane();
   }, []);
+}
+
+// ── Test-only introspection ──────────────────────────────────────────────────
+// Renderer tests assert that nested overlays restore pane visibility EXACTLY
+// once — i.e. the ref-count climbs while overlays stack and returns to 0 only
+// when the last one unmounts. These accessors are not part of the runtime API;
+// they exist so a test can observe the otherwise-private counter without
+// reaching into module internals or stubbing the IPC bridge.
+
+/** Test-only: current suspend ref-count. */
+export function __getSuspendCount(): number {
+  return suspendCount;
+}
+
+/** Test-only: reset the ref-count so each suite starts from a known balance. */
+export function __resetSuspendCount(): void {
+  suspendCount = 0;
 }
