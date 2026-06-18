@@ -1158,14 +1158,18 @@ export class ApiServer {
       // from the registry. The agent model cannot forge these via tool args; they
       // attribute the tab ("Opened by <title>") and raise the attention flash.
       const agent = typeof agentId === 'string' && agentId ? getAgent(agentId) : undefined;
-      const workspaceId = agent?.workspaceId ?? null;
+      const openOpts: Parameters<BrowserToolProvider['openUrl']>[1] = {
+        forHuman: forHuman === true,
+        workspaceId: agent?.workspaceId ?? null,
+      };
+      // Only stamp identity when a real agent resolved from the registry —
+      // never emit undefined-valued keys, and never forge from body args.
+      if (agent) {
+        openOpts.agentId = agentId;
+        openOpts.agentTitle = agent.title;
+      }
       try {
-        const snapshot = await tools.openUrl(targetUrl, {
-          forHuman: forHuman === true,
-          workspaceId,
-          agentId: agent ? agentId : undefined,
-          agentTitle: agent?.title,
-        });
+        const snapshot = await tools.openUrl(targetUrl, openOpts);
         return { ok: true, forHuman: forHuman === true, snapshot };
       } catch (err) {
         ApiServer.rethrowBrowserError(err);

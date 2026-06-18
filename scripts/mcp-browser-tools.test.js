@@ -3,6 +3,12 @@
 // Pure node: no Electron, no stdio MCP loop, no env token required.
 
 const assert = require('assert');
+// Slice-2 stamps the calling agent id (from the AGENT_ID env the dashboard sets
+// on the MCP process) onto act/access bodies. The module captures AGENT_ID at
+// require-time, so pin it BEFORE the require for a deterministic body shape —
+// otherwise the assertions vary with whatever env the runner inherits.
+process.env.AGENT_ID = 'agent-under-test';
+const AGENT_ID = process.env.AGENT_ID;
 const {
   getBrowserToolDefinitions,
   imageContentFromBase64Png,
@@ -132,7 +138,7 @@ test('browser_open_url forwards url + forHuman and reports the human-handoff mod
     { url: 'https://accounts.google.com/x', for_human_action: true },
     api,
   );
-  assert.deepStrictEqual(api.calls[0].body, { url: 'https://accounts.google.com/x', forHuman: true });
+  assert.deepStrictEqual(api.calls[0].body, { url: 'https://accounts.google.com/x', forHuman: true, agentId: AGENT_ID });
   assert.strictEqual(result.content[0].type, 'text');
   assert.match(result.content[0].text, /HUMAN's browser partition/);
   assert.match(result.content[0].text, /"tabId": "t1"/);
@@ -143,7 +149,7 @@ test('browser_open_url without the flag omits forHuman from the body (server def
     'POST /api/browser/open-url': { ok: true, forHuman: false, snapshot: { tabId: 't2' } },
   });
   const result = await handleBrowserToolCall('browser_open_url', { url: 'https://example.com' }, api);
-  assert.deepStrictEqual(api.calls[0].body, { url: 'https://example.com' });
+  assert.deepStrictEqual(api.calls[0].body, { url: 'https://example.com', agentId: AGENT_ID });
   assert.match(result.content[0].text, /agent partition/);
 });
 
