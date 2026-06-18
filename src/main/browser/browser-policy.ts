@@ -34,6 +34,95 @@ export type PolicyErrorCode =
   | 'signin-pending'          // website-allowlist §12-A: tab is in the sign-in quarantine
   | 'unknown-verb';
 
+/** Slice-3: the subset of policy codes that represent a DENIAL the human can be
+ *  shown copy + a remediation for. Alias of PolicyErrorCode so DENIAL_COPY is
+ *  exhaustively keyed (the compiler flags any new code that forgets its copy). */
+export type DenialCode = PolicyErrorCode;
+
+/** Slice-3: a renderer remediation hint. 'none' = nothing actionable; the other
+ *  two map to a concrete trusted-chrome affordance (open the website-access
+ *  settings overlay pre-filled with the host, or flip the Agent Actions gate). */
+export type DenialRemediation = 'none' | 'open-access-settings' | 'enable-actions';
+
+export interface DenialCopyEntry {
+  /** Short toast/row headline. */
+  title: string;
+  /** One-sentence human explanation. */
+  body: string;
+  /** Which remediation CTA the toast + denied drawer row should offer. */
+  action: DenialRemediation;
+}
+
+/**
+ * Slice-3 single source of truth: human copy + remediation for every policy
+ * denial code. Reused by the denial toast and the Activity/Audit drawer (the
+ * renderer imports this module — it is PURE, no Electron — and looks the entry
+ * up from the `denied:<code>` audit outcome). Exhaustive by construction:
+ * `Record<DenialCode, …>` makes the compiler reject any unmapped code.
+ */
+export const DENIAL_COPY: Record<DenialCode, DenialCopyEntry> = {
+  'sensitive-origin-denied': {
+    title: 'Action blocked on a sensitive site',
+    body: 'This looks like a sign-in, payment, mail, or admin page, so agent actions are blocked here. Hand the page to yourself to continue.',
+    action: 'open-access-settings',
+  },
+  'agent-allowlist-denied': {
+    title: 'Site not on the agent allowlist',
+    body: 'The agent may only visit or drive sites you have approved. Add this site to the allowlist to let the agent continue.',
+    action: 'open-access-settings',
+  },
+  'actions-disabled': {
+    title: 'Agent browser actions are off',
+    body: 'The agent tried to act in the browser, but agent actions are currently disabled. Enable them to allow it.',
+    action: 'enable-actions',
+  },
+  'scheme-denied': {
+    title: 'Address blocked',
+    body: 'Only http and https addresses are allowed for browser tools. Other schemes (file:, chrome:, data:, …) are blocked.',
+    action: 'none',
+  },
+  'ssrf-denied': {
+    title: 'Internal address blocked',
+    body: 'This address points at a loopback control port or a link-local / cloud-metadata host, which browser tools can never reach.',
+    action: 'none',
+  },
+  'signin-pending': {
+    title: 'Tab is in the sign-in quarantine',
+    body: 'You are signing in on this tab, so all agent tools are blocked against it until you hand it over.',
+    action: 'none',
+  },
+  'user-partition-denied': {
+    title: 'Your tab is off-limits to the agent',
+    body: 'Agent tools can never read or drive your own signed-in browser session. The agent must open its own tab instead.',
+    action: 'none',
+  },
+  'partition-denied': {
+    title: 'Action not allowed on this tab',
+    body: 'This tab is not on a partition the agent tools can operate on.',
+    action: 'none',
+  },
+  'tools-disabled': {
+    title: 'Browser tools are disabled',
+    body: 'Every agent browser tool is turned off by the kill-switch (AGENT_BROWSER_TOOLS_DISABLED=1).',
+    action: 'none',
+  },
+  'unknown-verb': {
+    title: 'Unknown browser action',
+    body: 'The agent requested a browser action that does not exist.',
+    action: 'none',
+  },
+};
+
+/** Slice-3: extract the `<code>` from a `denied:<code>` audit outcome and look
+ *  up its copy, or null when the outcome is not a known denial. Pure + shared so
+ *  both the toast and the drawer derive copy identically. */
+export function denialCopyForOutcome(outcome: string): { code: DenialCode; copy: DenialCopyEntry } | null {
+  if (!outcome.startsWith('denied:')) return null;
+  const code = outcome.slice('denied:'.length) as DenialCode;
+  const copy = DENIAL_COPY[code];
+  return copy ? { code, copy } : null;
+}
+
 export class PolicyError extends Error {
   constructor(
     readonly code: PolicyErrorCode,

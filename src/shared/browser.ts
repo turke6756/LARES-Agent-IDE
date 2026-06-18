@@ -178,6 +178,27 @@ export interface HistoryQuery {
   offset?: number;
 }
 
+/** Slice-3 (premium browser): one row of the action-audit feed surfaced to the
+ *  trusted-chrome Activity/Audit drawer + denial toasts. Mirrors the durable
+ *  JSONL `AuditEntry` (src/main/browser/action-audit.ts) MINUS argsHash, which
+ *  never crosses to the renderer. `outcome` is the same tagged string the JSONL
+ *  carries: 'ok' | 'ok:authenticated' | 'denied:<DenialCode>' | 'error:<msg>'.
+ *  Additive contract — emitted on the auditEvent push + returned by auditRecent. */
+export interface BrowserAuditEntry {
+  /** ISO-8601 timestamp (parse for the relative "x ago" label). */
+  ts: string;
+  verb: string;
+  /** Full Electron partition string ('persist:user' | 'persist:agent' | ''). */
+  partition: string;
+  url: string;
+  outcome: string;
+  /** Present where resolvable (per-workspace isolation + Slice-2 identity). */
+  workspaceId?: string | null;
+  tabId?: string;
+  agentId?: string;
+  agentTitle?: string;
+}
+
 /** Pushed main → renderer when a page's window.open / target=_blank popup is
  *  denied (M6) — the UI may offer "open as new tab" instead. */
 export interface BrowserOpenRequest {
@@ -282,6 +303,16 @@ export const BROWSER_CHANNELS = {
   tabState: 'browser:tab-state',
   /** main → renderer event channel (BrowserOpenRequest payload) */
   openRequest: 'browser:open-request',
+
+  // ── Slice-3: denial toasts + live Activity/Audit drawer ────────────────────
+  // The M16 action-audit feed surfaced to trusted chrome. auditRecent primes the
+  // drawer on mount; auditEvent pushes every fresh record (the manager forwards
+  // ActionAudit.record()'s in-process tap). Both carry BrowserAuditEntry (never
+  // argsHash). Trusted-chrome only — the agent never sees these.
+  /** (limit?: number) → BrowserAuditEntry[] (tail of the JSONL, oldest→newest) */
+  auditRecent: 'browser:audit-recent',
+  /** event main→renderer (BrowserAuditEntry) — one fresh audit record */
+  auditEvent: 'browser:audit-event',
 
   // ── M12 coarse act-tier gate (runtime toggle) ──────────────────────────────
   // Dashboard chrome flips the global "agent browser actions" runtime flag so

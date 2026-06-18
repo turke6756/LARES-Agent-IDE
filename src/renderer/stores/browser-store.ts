@@ -6,7 +6,11 @@ import type {
   AccessRequestDecision,
   AccessRule,
   AccessRuleInput,
+  BrowserAuditEntry,
 } from '../../shared/browser';
+// Slice-3: the PURE policy module (no Electron) is the single source of truth for
+// denial copy/remediation — shared by the toast + drawer + this store's dedupe.
+import { denialCopyForOutcome, type DenialCode } from '../../main/browser/browser-policy';
 
 // Re-export the frozen website-access shapes so renderer components import them
 // from one place (the store) rather than reaching into src/shared directly.
@@ -16,6 +20,7 @@ export type {
   AccessRequestDecision,
   AccessRule,
   AccessRuleInput,
+  BrowserAuditEntry,
 };
 
 // ── Frozen WP1-A IPC contract, renderer-local mirror ─────────────────────────
@@ -204,6 +209,10 @@ export interface BrowserApi {
   onContextMenuCommand(cb: (action: string, params: BrowserContextMenuParams) => void): () => void;
   onBookmarksChanged(cb: (bookmarks: Bookmark[]) => void): () => void;
 
+  // ── Slice-3: denial toasts + live Activity/Audit drawer (trusted chrome). ──
+  auditRecent(limit?: number): Promise<BrowserAuditEntry[]>;
+  onAuditEvent(cb: (entry: BrowserAuditEntry) => void): () => void;
+
   // ── Website-access policy (plans/website-allowlist-design.md). Trusted shell
   //    chrome only — the renderer reaches the frozen window.api.browser.access
   //    surface (src/preload). add/update re-normalize the hostname server-side
@@ -235,6 +244,50 @@ export function selectVisibleTabs(state: {
 }): BrowserTabState[] {
   return state.tabs.filter((t) => (t.workspaceId ?? null) === state.selectedWorkspaceId);
 }
+
+/** Slice-3: best-effort hostname from an audit row's url for the drawer's "host"
+ *  column, the "This host" filter, and the toast dedupe key. Empty string for a
+ *  non-parseable / empty url (NTP, about:blank) so callers compare safely. */
+export function auditHost(url: string): string {
+  if (!url) return '';
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return '';
+  }
+}
+
+/** Slice-3: audit rows scoped to the workspace the human is viewing — mirrors
+ *  selectVisibleTabs exactly (a row with no workspaceId matches the "no workspace
+ *  selected" state). The drawer, unread-denial badge, and toast all derive from
+ *  this so they never leak another workspace's agent activity. */
+export function selectVisibleAuditEvents(state: {
+  auditEvents: BrowserAuditEntry[];
+  selectedWorkspaceId: string | null;
+}): BrowserAuditEntry[] {
+  return state.auditEvents.filter(
+    (e) => (e.workspaceId ?? null) === state.selectedWorkspaceId,
+  );
+}
+
+/** Slice-3: a live denial toast. `key` is the host+code dedupe key; `id` is
+ *  unique per surfaced toast (so re-surfacing after the 10s window gets a fresh
+ *  timer + DOM node). */
+export interface DenialToast {
+  id: string;
+  key: string;
+  code: DenialCode;
+  title: string;
+  body: string;
+  action: 'none' | 'open-access-settings' | 'enable-actions';
+  host: string;
+  /** epoch ms the toast was surfaced — drives both the 6s auto-dismiss and the
+   *  10s dedupe window. */
+  shownAt: number;
+}
+
+const AUDIT_RING_CAP = 200;
+const TOAST_DEDUPE_MS = 10_000;
 
 export function getBrowserApi(): BrowserApi | null {
   if (typeof window === 'undefined') return null;
@@ -414,6 +467,27 @@ interface BrowserStoreState {
   handleShortcutCommand: (shortcut: BrowserShortcut, ctx: { tabId: string }) => void;
   handleContextMenuCommand: (action: string, params: BrowserContextMenuParams) => void;
 
+  // ── Slice-3: denial toasts + live Activity/Audit drawer ────────────────────
+  // The M16 action-audit feed surfaced to trusted chrome. `auditEvents` is a raw
+  // ring buffer (cap 200) across workspaces; components filter to the selected
+  // workspace via selectVisibleAuditEvents (mirrors selectVisibleTabs). The
+  // unread-denial badge counts denials seen since the drawer was last opened;
+  // opening the drawer resets it. `denialToasts` are surfaced on each denied
+  // event for the active workspace, deduped by host+code within 10s.
+  auditEvents: BrowserAuditEntry[];
+  auditDrawerOpen: boolean;
+  /** Newest-first denials surfaced since the drawer was last opened, for the
+   *  AddressBar "Activity" badge. Reset by openAuditDrawer(). */
+  auditUnreadDenials: number;
+  denialToasts: DenialToast[];
+  /** Prime the drawer with the JSONL tail (oldest→newest); called on bridge init. */
+  loadRecentAudit: () => Promise<void>;
+  /** Ring-buffer push + denial toast/unread bookkeeping (wired to onAuditEvent). */
+  handleAuditEvent: (entry: BrowserAuditEntry) => void;
+  openAuditDrawer: () => void;
+  closeAuditDrawer: () => void;
+  dismissDenialToast: (id: string) => void;
+
   // ── Website-access policy (plans/website-allowlist-simplification.md) ───────
   // Full-pane overlay (modeled on HistoryView) + the single agent allowlist,
   // the agent-request inbox (pending-approval box), and the authenticated-drive
@@ -485,6 +559,12 @@ export const useBrowserStore = create<BrowserStoreState>((set, get) => ({
   groupCollapsed: { agent: true, user: false },
   openGroupId: null,
   focusAddressTick: 0,
+
+  // Slice-3 — denial toasts + Activity/Audit drawer initial state.
+  auditEvents: [],
+  auditDrawerOpen: false,
+  auditUnreadDenials: 0,
+  denialToasts: [],
 
   // Website-access policy initial state (single agent allowlist).
   accessViewOpen: false,
@@ -945,6 +1025,65 @@ export const useBrowserStore = create<BrowserStoreState>((set, get) => ({
     }
   },
 
+  // ── Slice-3: denial toasts + live Activity/Audit drawer ────────────────────
+  loadRecentAudit: async () => {
+    const api = getBrowserApi();
+    if (!api?.auditRecent) return;
+    try {
+      const entries = await api.auditRecent(AUDIT_RING_CAP);
+      // getRecent returns oldest→newest; the ring buffer keeps that order and the
+      // drawer renders newest-first by reversing at render time.
+      set({ auditEvents: Array.isArray(entries) ? entries.slice(-AUDIT_RING_CAP) : [] });
+    } catch (err) {
+      console.error('[browser] auditRecent failed:', err);
+    }
+  },
+
+  handleAuditEvent: (entry) => {
+    if (!entry || typeof entry.ts !== 'string') return;
+    set((s) => {
+      const auditEvents = [...s.auditEvents, entry].slice(-AUDIT_RING_CAP);
+
+      // Toast + unread bookkeeping fire ONLY for denials in the workspace the
+      // human is currently viewing (per-workspace isolation — mirrors
+      // selectVisibleAuditEvents). A denial in another workspace still lands in
+      // the ring buffer (so its drawer shows it on switch) but never interrupts.
+      const denial = denialCopyForOutcome(entry.outcome);
+      const inWorkspace = (entry.workspaceId ?? null) === s.selectedWorkspaceId;
+      if (!denial || !inWorkspace) return { auditEvents };
+
+      const host = auditHost(entry.url);
+      const key = `${host}|${denial.code}`;
+      const shownAt = Date.now();
+      // Dedupe identical host+code within 10s: refresh the existing toast in
+      // place (no duplicate node, no reset stampede) instead of stacking.
+      const fresh = s.denialToasts.filter((t) => shownAt - t.shownAt < TOAST_DEDUPE_MS);
+      if (fresh.some((t) => t.key === key)) {
+        return { auditEvents, auditUnreadDenials: s.auditUnreadDenials + 1 };
+      }
+      const toast: DenialToast = {
+        id: `${key}@${shownAt}`,
+        key,
+        code: denial.code,
+        title: denial.copy.title,
+        body: denial.copy.body,
+        action: denial.copy.action,
+        host,
+        shownAt,
+      };
+      return {
+        auditEvents,
+        auditUnreadDenials: s.auditUnreadDenials + 1,
+        denialToasts: [...fresh, toast],
+      };
+    });
+  },
+
+  openAuditDrawer: () => set({ auditDrawerOpen: true, auditUnreadDenials: 0 }),
+  closeAuditDrawer: () => set({ auditDrawerOpen: false }),
+  dismissDenialToast: (id) =>
+    set((s) => ({ denialToasts: s.denialToasts.filter((t) => t.id !== id) })),
+
   // ── Website-access policy ──────────────────────────────────────────────────
   openAccessView: () => set({ accessViewOpen: true }),
   closeAccessView: () => set({ accessViewOpen: false }),
@@ -1150,6 +1289,14 @@ export function ensureBrowserBridge(): boolean {
   api.onContextMenuCommand((action, params) =>
     useBrowserStore.getState().handleContextMenuCommand(action, params),
   );
+
+  // ── Slice-3: denial toasts + live Activity/Audit drawer. Guarded so older /
+  //    stubbed preload shapes without the audit channels don't crash the bridge.
+  //    Prime the drawer with the JSONL tail, then stream fresh records. ─────────
+  if (api.onAuditEvent) {
+    api.onAuditEvent((entry) => useBrowserStore.getState().handleAuditEvent(entry));
+    void useBrowserStore.getState().loadRecentAudit();
+  }
 
   // ── Per-workspace isolation ────────────────────────────────────────────────
   // Track the dashboard's selected workspace so the strip/pane scope to it and

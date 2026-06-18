@@ -8,6 +8,8 @@ import FindBar from './FindBar';
 import HistoryView from './HistoryView';
 import WebsiteAccessSettings from './WebsiteAccessSettings';
 import SigninHandoffBanner from './SigninHandoffBanner';
+import ActivityDrawer from './ActivityDrawer';
+import DenialToast from './DenialToast';
 import * as Icons from 'lucide-react';
 
 // Center-panel browser pane (WP1-B). All chrome (tab strip, address bar,
@@ -48,7 +50,7 @@ export default function BrowserPanel() {
   }, [clearPaneAttention]);
 
   return (
-    <div className="browser-chrome flex-1 flex flex-col min-w-0 overflow-hidden">
+    <div className="browser-chrome relative flex-1 flex flex-col min-w-0 overflow-hidden">
       {!apiPresent ? (
         <div className="flex-1 flex items-center justify-center text-fg-muted">
           <div className="text-center max-w-md px-6">
@@ -125,7 +127,16 @@ export default function BrowserPanel() {
             )}
             <HistoryView />
             <WebsiteAccessSettings />
+            {/* Slice-3: live Activity/Audit drawer — right slide-over that
+                suspends the WebContentsView for its lifetime. Self-gates on
+                auditDrawerOpen. */}
+            <ActivityDrawer />
           </div>
+
+          {/* Slice-3: denial toasts — pinned to the top-right chrome zone (above
+              the host), so they DON'T need to suspend the pane. Self-gates on an
+              empty toast stack. */}
+          <DenialToast />
         </>
       )}
     </div>

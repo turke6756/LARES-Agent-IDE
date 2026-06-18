@@ -102,6 +102,14 @@ export function registerBrowserIpc(manager: BrowserManager): void {
   ipcMain.handle(BROWSER_CHANNELS.historyDelete, (_e, id: string) => manager.historyDelete(id));
   ipcMain.handle(BROWSER_CHANNELS.historyClear, () => manager.historyClear());
 
+  // ── Slice-3: denial toasts + live Activity/Audit drawer ────────────────────
+  // TRUSTED CHROME ONLY. auditRecent primes the drawer with the JSONL tail; the
+  // matching auditEvent push (BROWSER_CHANNELS.auditEvent) is a main → renderer
+  // send emitted by the manager's ActionAudit tap and is NOT registered here.
+  ipcMain.handle(BROWSER_CHANNELS.auditRecent, (_e, limit?: number) =>
+    manager.getRecentAudit(typeof limit === 'number' ? limit : undefined),
+  );
+
   // ── Website-access policy (plans/website-allowlist-simplification.md) ───────
   // TRUSTED CHROME ONLY. ONE agent allowlist; enforcement keyed to the Agent
   // Actions toggle (no per-list mode). Rule mutations and request decisions

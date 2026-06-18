@@ -6,6 +6,7 @@ import type {
   AccessRequestDecision,
   AccessRuleInput,
   Bookmark,
+  BrowserAuditEntry,
   BrowserContextMenuParams,
   BrowserFindResult,
   BrowserOpenRequest,
@@ -240,6 +241,13 @@ const api: IpcApi = {
       const listener = (_event: any, bookmarks: Bookmark[]) => callback(bookmarks);
       ipcRenderer.on(BROWSER_CHANNELS.bookmarksChanged, listener);
       return () => ipcRenderer.removeListener(BROWSER_CHANNELS.bookmarksChanged, listener);
+    },
+    // ── Slice-3: denial toasts + live Activity/Audit drawer. TRUSTED CHROME. ───
+    auditRecent: (limit) => ipcRenderer.invoke(BROWSER_CHANNELS.auditRecent, limit),
+    onAuditEvent: (callback) => {
+      const listener = (_event: any, entry: BrowserAuditEntry) => callback(entry);
+      ipcRenderer.on(BROWSER_CHANNELS.auditEvent, listener);
+      return () => ipcRenderer.removeListener(BROWSER_CHANNELS.auditEvent, listener);
     },
 
     // ── Website-access policy (plans/website-allowlist-simplification.md).

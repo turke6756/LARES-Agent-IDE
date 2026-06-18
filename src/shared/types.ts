@@ -6,6 +6,7 @@ import type {
   AccessRule,
   AccessRuleInput,
   Bookmark,
+  BrowserAuditEntry,
   BrowserBounds,
   BrowserContextMenuParams,
   BrowserCreateTabOptions,
@@ -823,6 +824,12 @@ export interface IpcApi {
       callback: (action: string, params: BrowserContextMenuParams) => void,
     ) => () => void;
     onBookmarksChanged: (callback: (bookmarks: Bookmark[]) => void) => () => void;
+
+    // ── Slice-3: denial toasts + live Activity/Audit drawer. TRUSTED CHROME. ───
+    // auditRecent primes the drawer with the JSONL tail; onAuditEvent pushes
+    // every fresh record. Both carry BrowserAuditEntry (never argsHash).
+    auditRecent: (limit?: number) => Promise<BrowserAuditEntry[]>;
+    onAuditEvent: (callback: (entry: BrowserAuditEntry) => void) => () => void;
 
     // ── Website-access policy (plans/website-allowlist-simplification.md) ──────
     // ONE agent allowlist; enforcement keyed to the Agent Actions toggle (no

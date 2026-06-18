@@ -33,6 +33,10 @@ export default function AddressBar({ tab }: Props) {
   const pendingRequestCount = useBrowserStore(
     (s) => s.accessRequests.filter((r) => r.status === 'pending').length,
   );
+  // Slice-3: Activity drawer entry + unread-denial badge (mirror of the Access
+  // pending-request badge above).
+  const openAuditDrawer = useBrowserStore((s) => s.openAuditDrawer);
+  const unreadDenials = useBrowserStore((s) => s.auditUnreadDenials);
 
   const [value, setValue] = useState(tab?.url ?? '');
   const [editing, setEditing] = useState(false);
@@ -179,6 +183,25 @@ export default function AddressBar({ tab }: Props) {
         title="History (Ctrl+H)"
       >
         <Icons.History className="w-4 h-4" />
+      </button>
+
+      {/* ── ACTIVITY (Slice-3) — opens the live Activity/Audit drawer (the M16
+          action-audit feed). Badge = unread denials since the drawer was last
+          opened. Mirror of the Access badge pattern. ── */}
+      <button
+        onClick={() => openAuditDrawer()}
+        className="ui-btn ui-btn-ghost relative flex items-center gap-1.5 px-1.5 py-1 shrink-0"
+        title="Activity — recent agent browser actions & denials"
+      >
+        <Icons.ScrollText className="w-4 h-4 text-fg-secondary" />
+        <span className="text-[10px] font-semibold uppercase tracking-wide text-fg-secondary hidden md:inline">
+          Activity
+        </span>
+        {unreadDenials > 0 && (
+          <span className="absolute -top-0.5 -right-0.5 inline-flex items-center justify-center min-w-[15px] h-[15px] px-1 rounded-full text-[9px] font-bold bg-accent-red text-white">
+            {unreadDenials > 99 ? '99+' : unreadDenials}
+          </span>
+        )}
       </button>
 
       {/* ── ACCESS — opens the website-access policy overlay (single agent

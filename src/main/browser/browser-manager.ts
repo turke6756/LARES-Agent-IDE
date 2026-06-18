@@ -22,7 +22,7 @@ import {
 import { CdpDriver, KEYBOARD_DROPDOWN_GUIDANCE } from './cdp-driver';
 import { resolveKey, SUPPORTED_BROWSER_KEYS } from './key-map';
 import { buildA11ySnapshot, RefRegistry } from './a11y-snapshot';
-import { ActionAudit, AUDIT_FILE_NAME, hashArgs } from './action-audit';
+import { ActionAudit, AUDIT_FILE_NAME, hashArgs, type AuditEntry } from './action-audit';
 import {
   assertAllowed,
   browserToolsEnabled,
@@ -46,6 +46,7 @@ import {
   type AccessRule,
   type AccessRuleInput,
   type Bookmark,
+  type BrowserAuditEntry,
   type BrowserBounds,
   type BrowserContextMenuParams,
   type BrowserCreateTabOptions,
@@ -914,7 +915,7 @@ export class BrowserManager {
   private auditAuthedRead(tab: TabEntry, verb: string, args: unknown): void {
     const url = tab.view.webContents.isDestroyed() ? '' : tab.view.webContents.getURL();
     if (this.authedOutcome(url) === 'ok:authenticated') {
-      this.auditRecord(tab.partitionFull, url, verb, args, 'ok:authenticated');
+      this.auditRecord(tab.partitionFull, url, verb, args, 'ok:authenticated', { tab });
     }
   }
 
@@ -1028,21 +1029,73 @@ export class BrowserManager {
 
   private get audit(): ActionAudit {
     if (!this.auditWriter) {
-      this.auditWriter = new ActionAudit(() =>
-        path.join(app.getPath('userData'), AUDIT_FILE_NAME),
+      this.auditWriter = new ActionAudit(
+        () => path.join(app.getPath('userData'), AUDIT_FILE_NAME),
+        // Slice-3: forward every recorded entry to the renderer's Activity drawer
+        // + denial toasts on the auditEvent push channel.
+        (entry) => this.forwardAudit(entry),
       );
     }
     return this.auditWriter;
   }
 
+  /**
+   * Slice-3: record an audit entry, enriching it with workspace/tab/agent
+   * identity where available. `ctx.tab` supplies tabId + (as a fallback)
+   * workspaceId + the Slice-2 openedByAgentId/Title; explicit ctx fields win
+   * (the openUrl path knows its agent/workspace before a tab exists). Every
+   * existing 5-arg call site keeps working — ctx is optional and additive.
+   */
   private auditRecord(
     partition: string,
     url: string,
     verb: string,
     args: unknown,
     outcome: string,
+    ctx?: { tab?: TabEntry; workspaceId?: string | null; agentId?: string; agentTitle?: string },
   ): void {
-    this.audit.record({ partition, url, verb, argsHash: hashArgs(args), outcome });
+    const tab = ctx?.tab;
+    const workspaceId = ctx?.workspaceId ?? tab?.workspaceId ?? undefined;
+    const agentId = ctx?.agentId ?? tab?.openedByAgentId;
+    const agentTitle = ctx?.agentTitle ?? tab?.openedByAgentTitle;
+    this.audit.record({
+      partition,
+      url,
+      verb,
+      argsHash: hashArgs(args),
+      outcome,
+      ...(tab ? { tabId: tab.id } : {}),
+      ...(workspaceId != null ? { workspaceId } : {}),
+      ...(agentId ? { agentId } : {}),
+      ...(agentTitle ? { agentTitle } : {}),
+    });
+  }
+
+  /** Slice-3: map a durable AuditEntry → the renderer-facing BrowserAuditEntry
+   *  (drops argsHash; argsHash never crosses to the renderer). */
+  private toBrowserAuditEntry(entry: AuditEntry): BrowserAuditEntry {
+    return {
+      ts: entry.ts,
+      verb: entry.verb,
+      partition: entry.partition,
+      url: entry.url,
+      outcome: entry.outcome,
+      ...(entry.workspaceId !== undefined ? { workspaceId: entry.workspaceId } : {}),
+      ...(entry.tabId !== undefined ? { tabId: entry.tabId } : {}),
+      ...(entry.agentId !== undefined ? { agentId: entry.agentId } : {}),
+      ...(entry.agentTitle !== undefined ? { agentTitle: entry.agentTitle } : {}),
+    };
+  }
+
+  /** Slice-3: forward a fresh audit record to the renderer (guarded send). */
+  private forwardAudit(entry: AuditEntry): void {
+    this.send(BROWSER_CHANNELS.auditEvent, this.toBrowserAuditEntry(entry));
+  }
+
+  /** Slice-3: tail of the action-audit feed for the Activity drawer's first
+   *  paint (invoke channel auditRecent). Trusted-chrome only. */
+  getRecentAudit(limit = 200): BrowserAuditEntry[] {
+    return this.audit.getRecent(limit).map((e) => this.toBrowserAuditEntry(e));
   }
 
   /** Kill-switch + checkAction gate shared by every tool verb. Denials are
@@ -1055,7 +1108,7 @@ export class BrowserManager {
     tab?: TabEntry,
   ): void {
     if (!browserToolsEnabled(process.env)) {
-      this.auditRecord(partitionFull, url ?? '', verb, args, 'denied:tools-disabled');
+      this.auditRecord(partitionFull, url ?? '', verb, args, 'denied:tools-disabled', { tab });
       throw new PolicyError(
         'tools-disabled',
         'browser tools are disabled by the kill-switch (AGENT_BROWSER_TOOLS_DISABLED=1)',
@@ -1067,7 +1120,7 @@ export class BrowserManager {
     // in-progress credential entry. Only trusted-chrome closeTab (the manager
     // method, not tool-gated) may remove it.
     if (tab?.signinPending) {
-      this.auditRecord(partitionFull, url ?? '', verb, args, 'denied:signin-pending');
+      this.auditRecord(partitionFull, url ?? '', verb, args, 'denied:signin-pending', { tab });
       throw new PolicyError(
         'signin-pending',
         `tab ${tab.id} is in the sign-in quarantine — agent tools are denied until the human hands it over.`,
@@ -1083,7 +1136,7 @@ export class BrowserManager {
     const effectivePartition = tab && this.isAgentDrivable(tab) ? 'persist:agent' : partitionFull;
     const decision = checkAction(verb, effectivePartition, url, getRuntimeActionsEnabled());
     if (!decision.allow) {
-      this.auditRecord(partitionFull, url ?? '', verb, args, `denied:${decision.code}`);
+      this.auditRecord(partitionFull, url ?? '', verb, args, `denied:${decision.code}`, { tab });
       throw new PolicyError(decision.code, decision.reason);
     }
 
@@ -1108,7 +1161,7 @@ export class BrowserManager {
     ) {
       const visit = checkAgentVisit(url, this.agentCtx());
       if (!visit.allow) {
-        this.auditRecord(partitionFull, url, verb, args, `denied:${visit.code}`);
+        this.auditRecord(partitionFull, url, verb, args, `denied:${visit.code}`, { tab });
         throw new PolicyError(visit.code, visit.reason);
       }
     }
@@ -1139,11 +1192,14 @@ export class BrowserManager {
     const verb: BrowserToolVerb = forHuman ? 'openUrlForHuman' : 'openUrl';
     const partitionFull = forHuman ? 'persist:user' : 'persist:agent';
     const args = { url, forHuman };
+    // Slice-3: no tab exists yet on the open path, so carry the resolved
+    // workspace/agent identity explicitly into pre-creation audit records.
+    const openCtx = { workspaceId, agentId: opts.agentId, agentTitle: opts.agentTitle };
 
     // M11 applies to EVERY navigation, forHuman handoffs included.
     const nav = checkNavigation(url, { apiPort: this.controlPorts.apiPort });
     if (!nav.allow) {
-      this.auditRecord(partitionFull, url, verb, args, `denied:${nav.code}`);
+      this.auditRecord(partitionFull, url, verb, args, `denied:${nav.code}`, openCtx);
       throw new PolicyError(nav.code, nav.reason);
     }
     this.gate(verb, partitionFull, url, args);
@@ -1157,7 +1213,7 @@ export class BrowserManager {
     if (!forHuman) {
       const av = checkAgentVisit(url, this.agentCtx());
       if (!av.allow) {
-        this.auditRecord(partitionFull, url, verb, args, `denied:${av.code}`);
+        this.auditRecord(partitionFull, url, verb, args, `denied:${av.code}`, openCtx);
         throw new PolicyError(av.code, av.reason);
       }
     }
@@ -1168,7 +1224,7 @@ export class BrowserManager {
       // output can't spoof it). NEVER attaches CDP; returns no page content.
       const { tabId } = this.createTab({ partition: 'user', url, workspaceId }, agentIdentity);
       this.setActiveTab(tabId);
-      this.auditRecord(partitionFull, url, verb, args, 'ok');
+      this.auditRecord(partitionFull, url, verb, args, 'ok', { tab: this.tabs.get(tabId), ...openCtx });
       return { tabId, url, partition: 'user' };
     }
 
@@ -1180,10 +1236,10 @@ export class BrowserManager {
       await this.driver(tabId).navigateAndWait(url);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      this.auditRecord(partitionFull, url, verb, args, `error:${msg}`);
+      this.auditRecord(partitionFull, url, verb, args, `error:${msg}`, { tab: this.tabs.get(tabId), ...openCtx });
       throw err;
     }
-    this.auditRecord(partitionFull, url, verb, args, 'ok');
+    this.auditRecord(partitionFull, url, verb, args, 'ok', { tab: this.tabs.get(tabId), ...openCtx });
     const snapshot = await this.snapshotTab(tabId);
     return {
       tabId,
@@ -1252,10 +1308,10 @@ export class BrowserManager {
       await this.driver(tabId).click(backendNodeId);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      this.auditRecord(tab.partitionFull, url, 'click', args, `error:${msg}`);
+      this.auditRecord(tab.partitionFull, url, 'click', args, `error:${msg}`, { tab });
       throw err;
     }
-    this.auditRecord(tab.partitionFull, url, 'click', args, this.authedOutcome(url));
+    this.auditRecord(tab.partitionFull, url, 'click', args, this.authedOutcome(url), { tab });
 
     // Plan §5c: every action returns a fresh snapshot.
     return this.snapshotAfterAction(tabId, tab.view.webContents);
@@ -1284,10 +1340,10 @@ export class BrowserManager {
       await this.driver(tabId).typeText(backendNodeId, text, { replace: true });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      this.auditRecord(tab.partitionFull, url, 'type', args, `error:${msg}`);
+      this.auditRecord(tab.partitionFull, url, 'type', args, `error:${msg}`, { tab });
       throw err;
     }
-    this.auditRecord(tab.partitionFull, url, 'type', args, this.authedOutcome(url));
+    this.auditRecord(tab.partitionFull, url, 'type', args, this.authedOutcome(url), { tab });
     return this.snapshotAfterAction(tabId, tab.view.webContents);
   }
 
@@ -1306,10 +1362,10 @@ export class BrowserManager {
       await this.driver(tabId).pressKey(k);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      this.auditRecord(tab.partitionFull, url, 'pressKey', args, `error:${msg}`);
+      this.auditRecord(tab.partitionFull, url, 'pressKey', args, `error:${msg}`, { tab });
       throw err;
     }
-    this.auditRecord(tab.partitionFull, url, 'pressKey', args, this.authedOutcome(url));
+    this.auditRecord(tab.partitionFull, url, 'pressKey', args, this.authedOutcome(url), { tab });
     return this.snapshotAfterAction(tabId, tab.view.webContents);
   }
 
@@ -1338,10 +1394,10 @@ export class BrowserManager {
       else await this.driver(tabId).scrollByDelta(opts.dy!);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      this.auditRecord(tab.partitionFull, url, 'scroll', args, `error:${msg}`);
+      this.auditRecord(tab.partitionFull, url, 'scroll', args, `error:${msg}`, { tab });
       throw err;
     }
-    this.auditRecord(tab.partitionFull, url, 'scroll', args, this.authedOutcome(url));
+    this.auditRecord(tab.partitionFull, url, 'scroll', args, this.authedOutcome(url), { tab });
     return this.snapshotAfterAction(tabId, tab.view.webContents);
   }
 
@@ -1391,10 +1447,10 @@ export class BrowserManager {
       await driver.click(found.backendDOMNodeId!);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      this.auditRecord(tab.partitionFull, url, 'selectOption', args, `error:${msg}`);
+      this.auditRecord(tab.partitionFull, url, 'selectOption', args, `error:${msg}`, { tab });
       throw err;
     }
-    this.auditRecord(tab.partitionFull, url, 'selectOption', args, this.authedOutcome(url));
+    this.auditRecord(tab.partitionFull, url, 'selectOption', args, this.authedOutcome(url), { tab });
     return this.snapshotAfterAction(tabId, tab.view.webContents);
   }
 
@@ -1409,10 +1465,10 @@ export class BrowserManager {
       tab.view.webContents.navigationHistory.goBack();
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      this.auditRecord(tab.partitionFull, url, 'goBack', args, `error:${msg}`);
+      this.auditRecord(tab.partitionFull, url, 'goBack', args, `error:${msg}`, { tab });
       throw err;
     }
-    this.auditRecord(tab.partitionFull, url, 'goBack', args, this.authedOutcome(url));
+    this.auditRecord(tab.partitionFull, url, 'goBack', args, this.authedOutcome(url), { tab });
     return this.snapshotAfterAction(tabId, tab.view.webContents);
   }
 
@@ -1426,10 +1482,10 @@ export class BrowserManager {
       tab.view.webContents.navigationHistory.goForward();
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      this.auditRecord(tab.partitionFull, url, 'goForward', args, `error:${msg}`);
+      this.auditRecord(tab.partitionFull, url, 'goForward', args, `error:${msg}`, { tab });
       throw err;
     }
-    this.auditRecord(tab.partitionFull, url, 'goForward', args, this.authedOutcome(url));
+    this.auditRecord(tab.partitionFull, url, 'goForward', args, this.authedOutcome(url), { tab });
     return this.snapshotAfterAction(tabId, tab.view.webContents);
   }
 
@@ -1443,10 +1499,10 @@ export class BrowserManager {
       tab.view.webContents.reload();
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      this.auditRecord(tab.partitionFull, url, 'reload', args, `error:${msg}`);
+      this.auditRecord(tab.partitionFull, url, 'reload', args, `error:${msg}`, { tab });
       throw err;
     }
-    this.auditRecord(tab.partitionFull, url, 'reload', args, this.authedOutcome(url));
+    this.auditRecord(tab.partitionFull, url, 'reload', args, this.authedOutcome(url), { tab });
     return this.snapshotAfterAction(tabId, tab.view.webContents);
   }
 
@@ -1490,7 +1546,7 @@ export class BrowserManager {
       throw new Error(`closeTab refused: tab ${tabId} is not an agent-partition tab`);
     }
     this.closeTab(tabId); // the existing manager method
-    this.auditRecord(tab.partitionFull, url, 'closeTab', args, this.authedOutcome(url));
+    this.auditRecord(tab.partitionFull, url, 'closeTab', args, this.authedOutcome(url), { tab });
     return { closed: true, tabs: this.toolListTabs() };
   }
 
