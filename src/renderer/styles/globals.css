@@ -448,6 +448,50 @@ select {
   animation: ui-spin 0.6s linear infinite;
 }
 
+/* ── Browser pane: indeterminate load bar (Slice-1) ──────────────────────────
+   A 2px top bar shown while the active tab is loading. Electron exposes no real
+   load percentage, so this is indeterminate (a segment sliding across a tinted
+   track). The accent colour is set per-partition via --browser-progress-color
+   (blue for the user partition, orange for agent). Honours reduced-motion. */
+@keyframes browser-progress-indeterminate {
+  0%   { left: -40%; width: 40%; }
+  50%  { left: 25%;  width: 50%; }
+  100% { left: 100%; width: 40%; }
+}
+
+.browser-progress {
+  position: relative;
+  height: 2px;
+  width: 100%;
+  flex-shrink: 0;
+  overflow: hidden;
+  background: color-mix(
+    in srgb,
+    var(--browser-progress-color, var(--color-accent-blue)) 18%,
+    transparent
+  );
+}
+
+.browser-progress::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -40%;
+  width: 40%;
+  background: var(--browser-progress-color, var(--color-accent-blue));
+  animation: browser-progress-indeterminate 1.1s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .browser-progress::before {
+    animation: none;
+    left: 0;
+    width: 100%;
+    opacity: 0.6;
+  }
+}
+
 @keyframes notebook-ring-pulse {
   0% { transform: scale(1); opacity: 0.7; }
   50% { transform: scale(1.45); opacity: 1; }

@@ -66,6 +66,18 @@ export interface BrowserTabState {
    *  credentials; ALL agent tools are denied against it). The chrome shows the
    *  four-point sign-in banner + a "Hand to agent" action. Missing = false. */
   signinPending?: boolean;
+  /** Slice-1 (premium browser): connection-security indicator derived from the
+   *  COMMITTED URL scheme — `'secure'` (https), `'insecure'` (http), `'internal'`
+   *  (NTP / empty / about:blank / non-http). Drives the address-bar lock glyph.
+   *  Additive/optional — renderer treats missing as `'internal'`. */
+  secureState?: 'secure' | 'insecure' | 'internal';
+  /** Slice-1: the last main-frame load failure or renderer crash, for the
+   *  trusted-chrome error panel. NEVER carries page content — only the Electron
+   *  error code, its description, and the validated URL (all shell-side strings).
+   *  Set on did-fail-load / render-process-gone; cleared (null) on the next
+   *  did-start-loading / successful did-navigate. Additive/optional —
+   *  null/absent = no error. */
+  lastError?: { code: string; description: string; url: string } | null;
 }
 
 // ── Overhaul (WP0) shared shapes ─────────────────────────────────────────────

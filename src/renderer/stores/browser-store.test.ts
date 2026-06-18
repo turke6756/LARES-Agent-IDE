@@ -187,6 +187,39 @@ describe('tab lifecycle', () => {
   });
 });
 
+describe('Slice-1: secureState + lastError snapshot mapping', () => {
+  it('maps secureState and lastError onto the tab shape', async () => {
+    const a = (await useBrowserStore.getState().createTab())!;
+    useBrowserStore.getState().handleTabState(
+      tabState({
+        tabId: a,
+        secureState: 'insecure',
+        lastError: { code: '-105', description: 'ERR_NAME_NOT_RESOLVED', url: 'http://x.dev/' },
+      }),
+    );
+    const tab = useBrowserStore.getState().tabs[0];
+    expect(tab.secureState).toBe('insecure');
+    expect(tab.lastError).toEqual({ code: '-105', description: 'ERR_NAME_NOT_RESOLVED', url: 'http://x.dev/' });
+    // The error payload carries ONLY shell strings — never page content.
+    expect(Object.keys(tab.lastError!).sort()).toEqual(['code', 'description', 'url']);
+  });
+
+  it('a subsequent state with lastError: null clears a prior error (reload/select path)', async () => {
+    const a = (await useBrowserStore.getState().createTab())!;
+    useBrowserStore.getState().handleTabState(
+      tabState({ tabId: a, lastError: { code: 'crashed', description: 'gone', url: 'https://x.dev/' } }),
+    );
+    expect(useBrowserStore.getState().tabs[0].lastError).not.toBeNull();
+    // Main always re-sends lastError (null when clear) so the merge clears it.
+    useBrowserStore.getState().handleTabState(
+      tabState({ tabId: a, secureState: 'secure', lastError: null }),
+    );
+    const tab = useBrowserStore.getState().tabs[0];
+    expect(tab.lastError).toBeNull();
+    expect(tab.secureState).toBe('secure');
+  });
+});
+
 describe('agent-attention flash (plan §4 UX)', () => {
   it('an unknown agent-partition tab raises attention and pulses the entry button WITHOUT auto-opening the pane', () => {
     useBrowserStore.getState().handleTabState(tabState({ tabId: 'agent-1', partition: 'agent' }));

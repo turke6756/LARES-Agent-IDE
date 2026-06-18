@@ -606,6 +606,102 @@ test('approve_signed_in creates an allow_signed_in rule; deny creates no rule', 
   assert.equal(mgr.accessRuleList().length, before, 'deny creates no rule');
 });
 
+// ── Slice-1: connection security + trusted error state ───────────────────────
+
+/** Wire a fresh tab's real view events so we can emit did-fail-load /
+ *  did-navigate / did-start-loading against it and observe lastError. */
+function wireTab(mgr: MgrHarness['mgr'], url: string): FakeTab {
+  const tab = injectTab(mgr, { partition: 'user', url });
+  priv<void>(mgr, 'wireViewEvents')(tab);
+  return tab;
+}
+
+function errOf(tab: FakeTab): { code: string; description: string; url: string } | null | undefined {
+  return (tab as unknown as { lastError?: { code: string; description: string; url: string } | null }).lastError;
+}
+
+test('secureStateForUrl reflects the scheme (https → secure, http → insecure, else internal)', () => {
+  assert.equal(BM.secureStateForUrl('https://example.com/'), 'secure');
+  assert.equal(BM.secureStateForUrl('http://example.com/'), 'insecure');
+  assert.equal(BM.secureStateForUrl('about:blank'), 'internal');
+  assert.equal(BM.secureStateForUrl(''), 'internal');
+  assert.equal(BM.secureStateForUrl(undefined), 'internal');
+  assert.equal(BM.secureStateForUrl('not a url'), 'internal');
+});
+
+test('did-fail-load sets lastError with ONLY code/description/url (no page content) and pushes', () => {
+  const { mgr, sent } = makeManager();
+  const tab = wireTab(mgr, 'https://broken.example/');
+  sent.length = 0;
+  tab.view.webContents.emit(
+    'did-fail-load', {}, -105, 'ERR_NAME_NOT_RESOLVED', 'https://broken.example/', true,
+  );
+  const err = errOf(tab);
+  assert.ok(err, 'lastError set');
+  assert.deepEqual(Object.keys(err!).sort(), ['code', 'description', 'url'], 'no fields beyond code/description/url');
+  assert.equal(err!.code, '-105');
+  assert.equal(err!.description, 'ERR_NAME_NOT_RESOLVED', 'description is the Electron error string, never page content');
+  assert.equal(err!.url, 'https://broken.example/');
+  const msg = sent.find((s) => s.channel === CH.tabState);
+  assert.ok(msg, 'tabState pushed on failure');
+  const payload = msg!.payload as { lastError?: { code: string } | null };
+  assert.equal(payload.lastError?.code, '-105', 'failure surfaced to the renderer');
+});
+
+test('did-fail-load IGNORES errorCode -3 (ABORTED) and subframe failures', () => {
+  const { mgr } = makeManager();
+  const tab = wireTab(mgr, 'https://ok.example/');
+  tab.view.webContents.emit('did-fail-load', {}, -3, 'ERR_ABORTED', 'https://ok.example/', true);
+  assert.equal(errOf(tab) ?? null, null, 'ABORTED is not a real failure');
+  tab.view.webContents.emit('did-fail-load', {}, -105, 'ERR_NAME_NOT_RESOLVED', 'https://sub.example/x', false);
+  assert.equal(errOf(tab) ?? null, null, 'subframe failure does not blank the tab');
+});
+
+test('render-process-gone sets a crash lastError (description = reason, no page content)', () => {
+  const { mgr } = makeManager();
+  const tab = wireTab(mgr, 'https://crash.example/');
+  tab.view.webContents.emit('render-process-gone', {}, { reason: 'crashed' });
+  const err = errOf(tab);
+  assert.ok(err);
+  assert.equal(err!.code, 'crashed');
+  assert.equal(err!.description, 'crashed');
+});
+
+test('did-start-loading and a successful did-navigate CLEAR lastError', () => {
+  const { mgr } = makeManager();
+  const tab = wireTab(mgr, 'https://recover.example/');
+  tab.view.webContents.emit('did-fail-load', {}, -105, 'ERR_NAME_NOT_RESOLVED', 'https://recover.example/', true);
+  assert.ok(errOf(tab), 'error set first');
+  tab.view.webContents.emit('did-start-loading');
+  assert.equal(errOf(tab) ?? null, null, 'load start clears the error (Retry path)');
+
+  // And a committed navigation also clears it.
+  tab.view.webContents.emit('did-fail-load', {}, -105, 'ERR_NAME_NOT_RESOLVED', 'https://recover.example/', true);
+  assert.ok(errOf(tab), 'error set again');
+  tab.view.webContents.setURL('https://recover.example/page');
+  tab.view.webContents.emit('did-navigate', {}, 'https://recover.example/page');
+  assert.equal(errOf(tab) ?? null, null, 'successful navigation clears the error');
+});
+
+test('sendTabState always carries secureState (from the live URL) and lastError (null when clear)', () => {
+  const { mgr, sent } = makeManager();
+  const tab = injectTab(mgr, { partition: 'user', url: 'https://secure.example/' });
+  sent.length = 0;
+  priv<void>(mgr, 'sendTabState')(tab);
+  const clean = sent.find((s) => s.channel === CH.tabState)!.payload as {
+    secureState?: string; lastError?: unknown;
+  };
+  assert.equal(clean.secureState, 'secure', 'https → secure');
+  assert.equal(clean.lastError, null, 'lastError null (not absent) so the renderer merge clears it');
+
+  // An http tab reads as insecure.
+  tab.view.webContents.setURL('http://plain.example/');
+  sent.length = 0;
+  priv<void>(mgr, 'sendTabState')(tab);
+  const insecure = sent.find((s) => s.channel === CH.tabState)!.payload as { secureState?: string };
+  assert.equal(insecure.secureState, 'insecure', 'http → insecure');
+});
+
 // ── Run ──────────────────────────────────────────────────────────────────────
 
 (async () => {

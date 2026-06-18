@@ -94,7 +94,9 @@ export default function AddressBar({ tab }: Props) {
           className="ui-btn ui-btn-ghost p-1.5"
           title="Stop loading"
         >
-          <Icons.X className="w-4 h-4" />
+          {/* Slice-1: spinner in the reload slot while the page loads (click to
+              stop). Electron has no load percentage, so this is indeterminate. */}
+          <Icons.Loader2 className="w-4 h-4 animate-spin text-accent-blue" />
         </button>
       ) : (
         <button
@@ -110,6 +112,11 @@ export default function AddressBar({ tab }: Props) {
       {/* ── STAR (WP3 StarMenu) — left of the URL field; self-gates to
           user-partition tabs (renders null otherwise). ── */}
       <StarMenu />
+
+      {/* ── SECURITY GLYPH (Slice-1) — connection-security indicator from the
+          committed URL scheme, left of the URL input. Lock = https, ShieldAlert
+          = http, Globe = internal/NTP. aria-label + tooltip for a11y. ── */}
+      {tab && <SecurityGlyph secureState={tab.secureState} />}
 
       <input
         ref={inputRef}
@@ -197,5 +204,30 @@ export default function AddressBar({ tab }: Props) {
           act-tier toggle; unobtrusive, rightmost in the chrome toolbar. ── */}
       <AgentActionsToggle />
     </div>
+  );
+}
+
+// ── Slice-1 connection-security glyph ────────────────────────────────────────
+// Purely reflects the committed URL's scheme (main computes secureState off the
+// scheme — never page content). 'internal' (NTP/empty) is the safe default for
+// a missing value.
+function SecurityGlyph({ secureState }: { secureState?: 'secure' | 'insecure' | 'internal' }) {
+  const state = secureState ?? 'internal';
+  const config =
+    state === 'secure'
+      ? { Icon: Icons.Lock, label: 'Secure connection (HTTPS)', className: 'text-accent-green' }
+      : state === 'insecure'
+        ? { Icon: Icons.ShieldAlert, label: 'Not secure (HTTP)', className: 'text-accent-orange' }
+        : { Icon: Icons.Globe, label: 'Internal page', className: 'text-fg-muted' };
+  const { Icon, label, className } = config;
+  return (
+    <span
+      role="img"
+      aria-label={label}
+      title={label}
+      className={`shrink-0 flex items-center justify-center px-1 ${className}`}
+    >
+      <Icon className="w-3.5 h-3.5" />
+    </span>
   );
 }

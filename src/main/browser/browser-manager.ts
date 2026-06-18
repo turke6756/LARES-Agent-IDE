@@ -90,6 +90,24 @@ function clamp(value: number, lo: number, hi: number): number {
 }
 
 /**
+ * Slice-1 (premium browser) connection-security indicator from a committed URL.
+ * `https:` → 'secure', `http:` → 'insecure', and everything else (NTP, empty,
+ * about:blank, non-http internal pages, unparseable) → 'internal'. PURE +
+ * exported so the unit tests can assert scheme→state without a live view.
+ */
+export function secureStateForUrl(url: string | undefined): 'secure' | 'insecure' | 'internal' {
+  if (!url) return 'internal';
+  try {
+    const protocol = new URL(url).protocol;
+    if (protocol === 'https:') return 'secure';
+    if (protocol === 'http:') return 'insecure';
+    return 'internal';
+  } catch {
+    return 'internal';
+  }
+}
+
+/**
  * Structural shape of the subset of `Electron.Input` that `mapChord` reads.
  * Kept local + minimal so the helper is unit-testable under plain node
  * (no Electron runtime needed) — `Electron.Input` is structurally assignable.
@@ -187,6 +205,19 @@ interface TabEntry {
    *  tab-hand-to-agent gesture; cleared on return/close/off-origin auto-revoke.
    *  Never set by the agent or page content. */
   handedToAgent?: boolean;
+  /** Slice-1 (premium browser): connection-security indicator computed on
+   *  did-navigate from the committed URL scheme. Surfaced via sendTabState
+   *  (also recomputed there from the live URL, so it is never stale). */
+  secureState?: 'secure' | 'insecure' | 'internal';
+  /** Slice-1: last main-frame load failure / renderer crash for the trusted
+   *  error panel. NEVER page content — Electron error code/description + the
+   *  validated URL only. Set on did-fail-load / render-process-gone; cleared
+   *  on did-start-loading / successful did-navigate. */
+  lastError?: { code: string; description: string; url: string } | null;
+  /** Slice-1: transient renderer-unresponsive flag. LOCAL, not persisted, not
+   *  on the wire contract — tracked so unresponsive/responsive can push fresh
+   *  tab state to the chrome. */
+  unresponsive?: boolean;
 }
 
 // ── WP2 frozen provider contract (WP2-B injects browserManager.tools into
@@ -1519,6 +1550,20 @@ export class BrowserManager {
       this.autoRevokeIfOffOrigin(tab, url);
     });
 
+    // ── Slice-1 (premium browser) — clear any prior load error BEFORE the push
+    //    listeners below run, so the pushed state already reflects the cleared
+    //    error (no error panel outliving a fresh load / successful commit). These
+    //    are registered ahead of `push` on purpose: same-event listeners fire in
+    //    registration order. did-navigate also refreshes secureState; sendTabState
+    //    recomputes it from the live URL too, so order can never strand it. ──
+    wc.on('did-start-loading', () => {
+      tab.lastError = null;
+    });
+    wc.on('did-navigate', (_e, url) => {
+      tab.secureState = secureStateForUrl(url);
+      tab.lastError = null;
+    });
+
     // Tab-state push (frozen contract: onTabState).
     const push = () => this.sendTabState(tab);
     wc.on('did-start-loading', push);
@@ -1528,6 +1573,41 @@ export class BrowserManager {
     wc.on('page-title-updated', push);
     wc.on('page-favicon-updated', (_e, favicons) => {
       this.tabFavicons.set(tab.id, favicons[0]);
+      push();
+    });
+
+    // ── Slice-1 — trusted error / crash / unresponsive states ────────────────
+    // We record ONLY shell-side strings (Electron error code, its description,
+    // the validated URL); NEVER page content — the error panel is trusted chrome.
+    // No load percentage is fabricated: the UI drives its progress bar off the
+    // existing `loading` boolean (Electron exposes no real percentage).
+    wc.on('did-fail-load', (_e, errorCode, errorDescription, validatedURL, isMainFrame) => {
+      // Subframe failures don't blank the tab — only main-frame loads matter.
+      if (isMainFrame === false) return;
+      // errorCode -3 is ERR_ABORTED — the normal "navigated away / stopped"
+      // signal, not a real failure.
+      if (errorCode === -3) return;
+      tab.lastError = {
+        code: String(errorCode),
+        description: errorDescription || 'The page could not be loaded.',
+        url: validatedURL || '',
+      };
+      push();
+    });
+    wc.on('render-process-gone', (_e, details) => {
+      tab.lastError = {
+        code: 'crashed',
+        description: (details && details.reason) || 'render process gone',
+        url: wc.isDestroyed() ? '' : wc.getURL(),
+      };
+      push();
+    });
+    wc.on('unresponsive', () => {
+      tab.unresponsive = true;
+      push();
+    });
+    wc.on('responsive', () => {
+      tab.unresponsive = false;
       push();
     });
 
@@ -1737,6 +1817,14 @@ export class BrowserManager {
       // Overhaul (WP5): surface the live zoom factor so the UI indicator
       // reflects setZoom and Ctrl +/−/0.
       zoomFactor: wc.getZoomFactor(),
+      // Slice-1 (premium browser): connection-security glyph state. Recomputed
+      // from the LIVE committed URL here so it is always fresh regardless of
+      // which event triggered this push.
+      secureState: secureStateForUrl(wc.getURL()),
+      // Slice-1: the trusted-error-panel state. ALWAYS sent (null when clear) so
+      // the renderer's snapshot merge clears a stale error — never the additive
+      // "field absent" idiom, which would let an old error linger.
+      lastError: tab.lastError ?? null,
       // Phase-1 shape kept intact: field absent (not false) for human tabs.
       ...(tab.openedByAgent ? { openedByAgent: true } : {}),
       // §12-B (F4): make the renderer's "Agent driving" badge authoritative —

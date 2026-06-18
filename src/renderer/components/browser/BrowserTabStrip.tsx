@@ -37,6 +37,43 @@ import * as Icons from 'lucide-react';
 
 interface HoverState extends TabHoverCardProps {}
 
+// ── Slice-1 tab favicon (real favicon + glyph fallback + loading overlay) ─────
+// User tabs show the real favicon when present, falling back to a Globe glyph
+// when it is absent OR fails to load (onError). Agent tabs keep the orange Bot
+// identity glyph (partition legibility wins over the favicon). While the tab is
+// loading, a small spinner overlays the icon (rather than replacing it).
+function TabIcon({ tab }: { tab: OrderedTab['tab'] }) {
+  const [imgFailed, setImgFailed] = useState(false);
+  // A new page may carry a working favicon — reset the failed flag when the
+  // favicon URL changes so a prior 404 doesn't permanently pin the fallback.
+  useEffect(() => setImgFailed(false), [tab.favicon]);
+
+  const base =
+    tab.partition === 'agent' ? (
+      <Icons.Bot className="w-3.5 h-3.5 text-accent-orange" />
+    ) : tab.favicon && !imgFailed ? (
+      <img
+        src={tab.favicon}
+        alt=""
+        className="w-3.5 h-3.5"
+        onError={() => setImgFailed(true)}
+      />
+    ) : (
+      <Icons.Globe className="w-3.5 h-3.5 text-fg-muted" />
+    );
+
+  return (
+    <span className="relative inline-flex items-center justify-center w-3.5 h-3.5 shrink-0">
+      {base}
+      {tab.loading && (
+        <span className="absolute inset-0 flex items-center justify-center rounded-sm bg-browser-chrome/70">
+          <Icons.Loader2 className="w-2.5 h-2.5 animate-spin text-fg-muted" />
+        </span>
+      )}
+    </span>
+  );
+}
+
 export default function BrowserTabStrip() {
   const tabs = useBrowserStore((s) => s.tabs);
   const selectedWorkspaceId = useBrowserStore((s) => s.selectedWorkspaceId);
@@ -175,13 +212,6 @@ export default function BrowserTabStrip() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [overlayOpen, openGroupId, draggingId]);
 
-  const tabIcon = (tab: OrderedTab['tab']): React.ReactNode => {
-    if (tab.loading) return <Icons.Loader2 className="w-3.5 h-3.5 shrink-0 animate-spin text-fg-muted" />;
-    if (tab.partition === 'agent') return <Icons.Bot className="w-3.5 h-3.5 shrink-0 text-accent-orange" />;
-    if (tab.favicon) return <img src={tab.favicon} alt="" className="w-3.5 h-3.5 shrink-0" />;
-    return <Icons.Globe className="w-3.5 h-3.5 shrink-0 text-fg-muted" />;
-  };
-
   const tabCard = (tab: OrderedTab['tab']): Omit<TabHoverCardProps, 'x' | 'y'> => {
     const handed = Boolean(handedTabIds[tab.tabId]);
     const status = tab.loading
@@ -192,7 +222,7 @@ export default function BrowserTabStrip() {
           ? { icon: <Icons.Bot className="w-3 h-3" />, text: 'Agent tab', className: 'text-accent-orange' }
           : null;
     return {
-      icon: tabIcon(tab),
+      icon: <TabIcon tab={tab} />,
       title: tabLabel(tab),
       subtitle: tab.url ? prettyHost(tab.url) : null,
       status,
@@ -239,7 +269,7 @@ export default function BrowserTabStrip() {
           draggingId === tab.tabId ? 'opacity-50' : ''
         }`}
       >
-        {tabIcon(tab)}
+        <TabIcon tab={tab} />
 
         {/* Pinned tabs render compact: favicon only, no title/close. */}
         {!pinned && <span className="truncate min-w-0">{tabLabel(tab)}</span>}

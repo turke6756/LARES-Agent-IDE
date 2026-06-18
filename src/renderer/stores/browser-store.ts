@@ -56,6 +56,14 @@ export interface BrowserTabState {
   /** Website-allowlist §12-A (F4): main pushes the authoritative sign-in
    *  quarantine flag. Additive/optional — missing = false. */
   signinPending?: boolean;
+  /** Slice-1 (premium browser): connection-security indicator from the committed
+   *  URL scheme — 'secure' (https) / 'insecure' (http) / 'internal' (NTP/empty).
+   *  Drives the address-bar lock glyph. Additive/optional — missing = internal. */
+  secureState?: 'secure' | 'insecure' | 'internal';
+  /** Slice-1: last main-frame load failure / renderer crash for the trusted-chrome
+   *  error panel. NEVER page content — only code/description/url shell strings.
+   *  Cleared (null) on the next load start / successful navigation. Additive. */
+  lastError?: { code: string; description: string; url: string } | null;
 }
 
 export interface BrowserBounds {
