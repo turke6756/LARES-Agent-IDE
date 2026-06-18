@@ -95,10 +95,33 @@ import {
   suggest as omniboxSuggestRanked,
   type OmniboxOpenTab,
 } from './omnibox-suggest';
+import {
+  loadSession,
+  replaceSession,
+  pushClosedTab,
+  popClosedTab,
+  peekNewestClosedAt,
+  type SessionTabRow,
+} from './session-store';
 
 /** Clamp helper for zoom factor (and any other bounded numeric). */
 function clamp(value: number, lo: number, hi: number): number {
   return Math.min(hi, Math.max(lo, value));
+}
+
+// ── Slice 10/11: session-restore + frozen/discarded tab model constants ───────
+const DISCARD_SWEEP_MS = 60_000; // idle-sweep interval
+/** Default idle threshold before a hidden user tab is discarded. MUTABLE
+ *  module-level value (the §11 setter writes it; each sweep reads it). null =
+ *  Never (idle discard disabled; the hard live-view cap still applies). */
+let DISCARD_IDLE_MS: number | null = 30 * 60_000;
+const MAX_LIVE_USER_VIEWS = 12; // hard live-view cap (LRU discard beyond this)
+const SCROLL_CAPTURE_TIMEOUT_MS = 150; // fail-open bound for scroll capture (§8)
+const SESSION_WRITE_DEBOUNCE_MS = 500; // debounced persistence after tab churn
+
+/** Test/back-compat reader for the mutable idle threshold. */
+export function __getDiscardIdleMsForTests(): number | null {
+  return DISCARD_IDLE_MS;
 }
 
 /**
@@ -248,6 +271,29 @@ interface TabEntry {
    *  the renderer flashes briefly and clears its own attention on select. */
   needsHumanAttention?: boolean;
   lastAttentionAt?: number;
+  /** Slice 10/11: wall-clock ms this live view was created (createTab /
+   *  hydrateFrozenTab). The idle-sweep LRU falls back to this when the tab has
+   *  never been the active tab (no lastActiveAt entry). */
+  createdAt?: number;
+}
+
+/** Slice 10/11: a snapshot-backed tab with NO WebContentsView — either restored
+ *  on startup (origin 'restored') or idle/cap-discarded (origin 'discarded').
+ *  USER PARTITION ONLY by construction. Its id also lives in tabOrder/pinnedTabs
+ *  so the strip renders it inline with live tabs. */
+interface FrozenTab {
+  id: string;
+  url: string;
+  title: string;
+  favicon?: string;
+  partition: 'user';
+  workspaceId: string | null;
+  pinned: boolean;
+  sortOrder: number;
+  groupId: string | null;
+  scrollY?: number;
+  /** 'restored' (startup) vs 'discarded' (idle/cap sweep) → drives `discarded`. */
+  origin: 'restored' | 'discarded';
 }
 
 // ── WP2 frozen provider contract (WP2-B injects browserManager.tools into
@@ -412,9 +458,28 @@ export class BrowserManager {
   private tabOrder: string[] = [];
   /** Pinned tabIds (cluster to the left of unpinned in the strip). */
   private pinnedTabs = new Set<string>();
-  /** LIFO of recently-closed user-initiated tabs for Ctrl+Shift+T. In-memory
-   *  only (never persisted — no agent URL touches disk). Partition preserved. */
-  private closedTabStack: Array<{ url: string; partition: BrowserPartition; title: string }> = [];
+  /** LIFO of recently-closed AGENT-partition tabs for Ctrl+Shift+T. In-memory
+   *  only (never persisted — no agent URL touches disk). USER closes go to the
+   *  persistent SQLite reopen stack instead (session-store); `pushedAt` lets the
+   *  reopen merge pick whichever side was closed more recently (Slice 10). */
+  private closedTabStack: Array<{ url: string; partition: BrowserPartition; title: string; pushedAt: number }> = [];
+
+  // ── Slice 10/11: frozen/discarded tab model + session persistence ───────────
+  /** Snapshot-backed tabs with NO WebContentsView (restored-on-startup or
+   *  idle-discarded). USER PARTITION ONLY. Their ids also live in
+   *  tabOrder/pinnedTabs; they are NEVER in `this.tabs`. */
+  private frozenTabs = new Map<string, FrozenTab>();
+  /** Last wall-clock ms a live tab was the active tab (idle sweep + LRU cap). */
+  private lastActiveAt = new Map<string, number>();
+  /** Best-effort last-known scrollY per live user tab (eventually consistent §8). */
+  private lastScrollY = new Map<string, number>();
+  /** Ids being deliberately discarded — the `destroyed` handler must NOT tear
+   *  down their frozen metadata (Fix A). */
+  private discardingTabs = new Set<string>();
+  /** Idempotency latch: sessionRestore re-materializes the persisted tabs once. */
+  private sessionRestored = false;
+  private sessionWriteTimer: ReturnType<typeof setTimeout> | null = null;
+  private discardSweepTimer: ReturnType<typeof setInterval> | null = null;
 
   // ── Website-access policy (plans/website-allowlist-simplification.md §5) ────
   /** Synchronously-readable memo of the compiled agent allowlist rules. MUST be
@@ -467,6 +532,9 @@ export class BrowserManager {
       bookmarks: listBookmarks(),
       history: searchHistoryRanked(query, 30),
     }));
+
+    // Slice-11: start the idle-discard + hard-cap sweep (USER tabs only).
+    this.startDiscardSweep();
   }
 
   /** Slice-6: snapshot of the OPEN USER tabs for the omnibox (switch-to-tab
@@ -612,8 +680,10 @@ export class BrowserManager {
       openedByAgentTitle: internal?.openedByAgentTitle,
       needsHumanAttention: internal?.openedByAgent === true ? true : undefined,
       lastAttentionAt: internal?.openedByAgent === true ? Date.now() : undefined,
+      createdAt: Date.now(),
     };
     this.tabs.set(tabId, tab);
+    this.lastActiveAt.set(tabId, tab.createdAt ?? Date.now());
     this.tabOrder.push(tabId); // new tabs append (unpinned → right cluster)
     this.wireViewEvents(tab);
 
@@ -629,30 +699,72 @@ export class BrowserManager {
     }
     this.sendTabState(tab);
     this.emitTabsSnapshot(); // membership changed
+    if (opts.partition === 'user') this.schedulePersist(); // Slice-10 session
     return { tabId };
   }
 
   closeTab(tabId: string): void {
+    // Slice-10: closing a FROZEN tab (restored/discarded, never hydrated) — there
+    // is no live view to tear down. Push its snapshot onto the persistent (USER)
+    // reopen stack and drop it from the order.
+    const frozen = this.frozenTabs.get(tabId);
+    if (frozen) {
+      this.frozenTabs.delete(tabId);
+      this.forgetTabOrder(tabId);
+      pushClosedTab({
+        workspaceId: frozen.workspaceId,
+        url: frozen.url,
+        title: frozen.title,
+        favicon: frozen.favicon,
+        groupId: frozen.groupId,
+        closedAt: Date.now(),
+      });
+      this.emitTabsSnapshot();
+      this.schedulePersist();
+      return;
+    }
     const tab = this.tabs.get(tabId);
     if (!tab) return;
-    // Push to the reopen stack BEFORE closing (partition preserved so an agent
-    // tab reopens as agent, never promoted). Skip empty / about:blank tabs —
+    // Push to the reopen stack BEFORE closing. Skip empty / about:blank tabs —
     // there is nothing useful to reopen.
     const wc = tab.view.webContents;
     if (!wc.isDestroyed()) {
       const url = wc.getURL();
       if (url && url !== 'about:blank') {
-        this.closedTabStack.push({ url, partition: tab.partition, title: wc.getTitle() });
+        if (this.isPersistableUserTab(tab) && decideNavigation(url, 'user').allow) {
+          // Slice-10: a USER close goes to the PERSISTENT SQLite reopen stack so
+          // Ctrl+Shift+T survives a restart. Agent URLs never touch disk.
+          pushClosedTab({
+            workspaceId: tab.workspaceId,
+            url,
+            title: wc.getTitle(),
+            favicon: this.tabFavicons.get(tab.id),
+            groupId: null,
+            closedAt: Date.now(),
+          });
+        } else {
+          // AGENT (and signin/handed quarantine) close → in-memory LIFO only
+          // (partition preserved so an agent tab reopens as agent, never promoted).
+          this.closedTabStack.push({
+            url,
+            partition: tab.partition,
+            title: wc.getTitle(),
+            pushedAt: Date.now(),
+          });
+        }
       }
     }
     this.tabs.delete(tabId);
     this.drivers.delete(tabId);
     this.refRegistries.delete(tabId);
+    this.lastActiveAt.delete(tabId);
+    this.lastScrollY.delete(tabId);
     this.forgetTabOrder(tabId);
     if (this.activeTabId === tabId) this.activeTabId = null;
     this.getMainWindow()?.contentView.removeChildView(tab.view);
     wc.close();
     this.emitTabsSnapshot(); // membership changed
+    this.schedulePersist();
   }
 
   navigate(tabId: string, url: string): void {
@@ -682,10 +794,16 @@ export class BrowserManager {
   // ── Layout / visibility (driven by WP1-B's BrowserViewHost) ───────────────
 
   setActiveTab(tabId: string | null): void {
-    if (tabId !== null && !this.tabs.has(tabId)) throw new Error(`unknown tab: ${tabId}`);
+    if (tabId !== null && !this.tabs.has(tabId)) {
+      // Slice-10/11: first activation of a frozen (restored/discarded) tab lazily
+      // materializes its WebContentsView + navigates to the stored URL.
+      if (this.frozenTabs.has(tabId)) this.hydrateFrozenTab(tabId);
+      else throw new Error(`unknown tab: ${tabId}`);
+    }
     this.activeTabId = tabId;
     const active = tabId === null ? null : this.tabs.get(tabId)!;
     if (active) {
+      this.lastActiveAt.set(active.id, Date.now()); // idle-sweep / LRU recency
       const win = this.getMainWindow();
       // Re-adding an existing child raises it to the top of the view stack.
       win?.contentView.addChildView(active.view);
@@ -693,6 +811,7 @@ export class BrowserManager {
     }
     this.applyVisibility();
     this.emitTabsSnapshot(); // active changed
+    this.schedulePersist();
   }
 
   setBounds(bounds: BrowserBounds): void {
@@ -1842,6 +1961,8 @@ export class BrowserManager {
     wc.on('did-navigate', (_e, url) => {
       tab.secureState = secureStateForUrl(url);
       tab.lastError = null;
+      // Slice-10: a committed USER navigation changes the persisted snapshot.
+      if (tab.partition === 'user') this.schedulePersist();
     });
 
     // Tab-state push (frozen contract: onTabState).
@@ -2002,10 +2123,19 @@ export class BrowserManager {
 
     wc.once('destroyed', () => {
       wc.removeListener('before-input-event', beforeInput); // leak guard
+      // Slice-11 (Fix A): a DELIBERATE discard tears down the live view but keeps
+      // the tab in tabOrder/pinnedTabs as a frozen snapshot. discardTab already
+      // moved that bookkeeping, so do NOT forget its order or clear active here.
+      if (this.discardingTabs.has(tab.id)) {
+        this.discardingTabs.delete(tab.id);
+        return;
+      }
       this.tabFavicons.delete(tab.id);
       this.tabs.delete(tab.id);
       this.drivers.delete(tab.id);
       this.refRegistries.delete(tab.id);
+      this.lastActiveAt.delete(tab.id);
+      this.lastScrollY.delete(tab.id);
       this.forgetTabOrder(tab.id);
       if (this.activeTabId === tab.id) this.activeTabId = null;
       this.emitTabsSnapshot();
@@ -2249,10 +2379,19 @@ export class BrowserManager {
   /** Live tabIds in display order, pinned clustered left (relative order
    *  within each cluster preserved). Stale ids are dropped defensively. */
   private orderedTabIds(): string[] {
-    const live = this.tabOrder.filter((id) => this.tabs.has(id));
+    // Slice-10/11: a frozen tab's id stays in tabOrder/pinnedTabs (it renders in
+    // the strip inline with live tabs), so accept both live and frozen ids.
+    const live = this.tabOrder.filter((id) => this.tabs.has(id) || this.frozenTabs.has(id));
     const pinned = live.filter((id) => this.pinnedTabs.has(id));
     const rest = live.filter((id) => !this.pinnedTabs.has(id));
     return [...pinned, ...rest];
+  }
+
+  /** The workspace a (live or frozen) tab belongs to. */
+  private workspaceOf(id: string): string | null {
+    const tab = this.tabs.get(id);
+    if (tab) return tab.workspaceId;
+    return this.frozenTabs.get(id)?.workspaceId ?? null;
   }
 
   /** Per-workspace isolation: ordered tabIds belonging to the current
@@ -2260,7 +2399,7 @@ export class BrowserManager {
    *  ever crosses into another workspace's tabs. */
   private currentWorkspaceTabIds(): string[] {
     return this.orderedTabIds().filter(
-      (id) => this.tabs.get(id)?.workspaceId === this.currentWorkspaceId,
+      (id) => this.workspaceOf(id) === this.currentWorkspaceId,
     );
   }
 
@@ -2277,7 +2416,7 @@ export class BrowserManager {
   }
 
   reorderTab(tabId: string, toOrder: number): void {
-    if (!this.tabs.has(tabId)) return;
+    if (!this.tabs.has(tabId) && !this.frozenTabs.has(tabId)) return;
     const order = this.orderedTabIds();
     const from = order.indexOf(tabId);
     if (from === -1) return;
@@ -2288,21 +2427,363 @@ export class BrowserManager {
     // emitTabsSnapshot re-clusters pinned-left, so a drop across the pinned/
     // unpinned boundary is clamped back into the correct cluster.
     this.emitTabsSnapshot();
+    this.schedulePersist(); // Slice-10: order is part of the persisted session
   }
 
   setTabPinned(tabId: string, pinned: boolean): void {
-    if (!this.tabs.has(tabId)) return;
+    // Slice-10/11: pin/unpin works on a frozen tab too (its id is in tabOrder).
+    if (!this.tabs.has(tabId) && !this.frozenTabs.has(tabId)) return;
     if (pinned) this.pinnedTabs.add(tabId);
     else this.pinnedTabs.delete(tabId);
+    const frozen = this.frozenTabs.get(tabId);
+    if (frozen) frozen.pinned = pinned;
     this.emitTabsSnapshot();
+    this.schedulePersist();
   }
 
   reopenClosedTab(): { tabId: string } | null {
+    // Slice-10: two reopen stacks — the PERSISTENT SQLite stack (USER closes,
+    // scoped to the current workspace) and the in-memory LIFO (AGENT closes).
+    // Pop whichever side was closed more recently so Ctrl+Shift+T is intuitive
+    // regardless of partition. createTab re-enters the M6 gate + emits snapshots.
+    const ws = this.currentWorkspaceId;
+    const userNewest = peekNewestClosedAt(ws);
+    const agentTop = this.closedTabStack[this.closedTabStack.length - 1];
+    const useUser =
+      userNewest !== null && (agentTop === undefined || userNewest >= agentTop.pushedAt);
+    if (useUser) {
+      const row = popClosedTab(ws);
+      if (row) return this.createTab({ partition: 'user', url: row.url, workspaceId: row.workspaceId });
+    }
     const entry = this.closedTabStack.pop();
-    if (!entry) return null;
-    // Partition preserved — an agent tab reopens as agent (no promotion).
-    // createTab re-enters the M6 gate and emits the snapshot.
-    return this.createTab({ partition: entry.partition, url: entry.url });
+    if (entry) {
+      // Partition preserved — an agent tab reopens as agent (no promotion).
+      return this.createTab({ partition: entry.partition, url: entry.url });
+    }
+    // Agent stack empty; fall back to the user stack (covers the userNewest-null
+    // race where a USER close landed between the peek and here).
+    const row = popClosedTab(ws);
+    if (row) return this.createTab({ partition: 'user', url: row.url, workspaceId: row.workspaceId });
+    return null;
+  }
+
+  // ── Slice 10/11 — session restore + frozen/discarded tab model ─────────────
+
+  /** True for a PLAIN user tab whose URL/favicon may be persisted or moved to a
+   *  frozen snapshot. Agent / signin-quarantine / handed tabs are NEVER
+   *  persisted or discarded (cross-cutting rule #1). */
+  private isPersistableUserTab(tab: TabEntry): boolean {
+    return (
+      tab.partition === 'user' &&
+      !tab.openedByAgent &&
+      !tab.signinPending &&
+      !tab.handedToAgent
+    );
+  }
+
+  /** Debounced (~500ms) session persistence. Coalesces a burst of
+   *  create/close/navigate/reorder/pin churn into one replaceSession write. */
+  private schedulePersist(): void {
+    if (this.sessionWriteTimer) return; // a write is already pending — coalesce
+    this.sessionWriteTimer = setTimeout(() => {
+      this.sessionWriteTimer = null;
+      try {
+        this.persistSession();
+      } catch (err) {
+        console.error('browser.persistSession failed:', err);
+      }
+    }, SESSION_WRITE_DEBOUNCE_MS);
+    if (typeof this.sessionWriteTimer.unref === 'function') this.sessionWriteTimer.unref();
+  }
+
+  /** Snapshot the live USER tabs + the frozen tabs (in display order) and rewrite
+   *  the persisted session. USER PARTITION ONLY — agent/signin/handed tabs and
+   *  their URLs/favicons never reach SQLite. */
+  private persistSession(): void {
+    const rows: SessionTabRow[] = [];
+    let order = 0;
+    for (const id of this.orderedTabIds()) {
+      const frozen = this.frozenTabs.get(id);
+      if (frozen) {
+        rows.push({
+          tabId: frozen.id,
+          workspaceId: frozen.workspaceId,
+          url: frozen.url,
+          title: frozen.title,
+          favicon: frozen.favicon,
+          pinned: frozen.pinned,
+          sortOrder: order++,
+          groupId: frozen.groupId,
+          active: false, // a frozen tab is never the live active tab
+          scrollY: frozen.scrollY,
+        });
+        continue;
+      }
+      const tab = this.tabs.get(id);
+      if (!tab || !this.isPersistableUserTab(tab)) continue;
+      const wc = tab.view.webContents;
+      if (wc.isDestroyed()) continue;
+      const url = wc.getURL();
+      if (!url || url === 'about:blank') continue;
+      if (!decideNavigation(url, 'user').allow) continue; // defense in depth
+      rows.push({
+        tabId: tab.id,
+        workspaceId: tab.workspaceId,
+        url,
+        title: wc.getTitle(),
+        favicon: this.tabFavicons.get(tab.id),
+        pinned: this.pinnedTabs.has(tab.id),
+        sortOrder: order++,
+        groupId: null,
+        active: tab.id === this.activeTabId,
+        scrollY: this.lastScrollY.get(tab.id),
+      });
+    }
+    replaceSession(rows);
+  }
+
+  /** Build the renderer-facing state for a frozen (snapshot-backed) tab. No live
+   *  WebContents exists — url/title/favicon come straight from the snapshot. */
+  private frozenTabState(frozen: FrozenTab): BrowserTabState {
+    return {
+      tabId: frozen.id,
+      url: frozen.url,
+      title: frozen.title,
+      favicon: frozen.favicon,
+      loading: false,
+      canGoBack: false,
+      canGoForward: false,
+      partition: 'user',
+      workspaceId: frozen.workspaceId,
+      secureState: secureStateForUrl(frozen.url),
+      lastError: null,
+      frozen: true,
+      // origin 'discarded' → the memory-saver MoonStar treatment; 'restored' is
+      // a plain frozen tab (renderer dims both, marks discarded distinctly).
+      ...(frozen.origin === 'discarded' ? { discarded: true } : {}),
+    };
+  }
+
+  /** Push the frozen tab's state so the renderer can dim/mark it. */
+  private sendFrozenTabState(frozen: FrozenTab): void {
+    this.send(BROWSER_CHANNELS.tabState, this.frozenTabState(frozen));
+  }
+
+  /** Slice-10: re-materialize the prior USER-PARTITION session as FROZEN tabs
+   *  (no WebContentsView until first activation). Idempotent — gated on the
+   *  sessionRestored latch so a second pull returns []. Returns the frozen states
+   *  the renderer renders (it filters them to the selected workspace). */
+  restoreSession(): BrowserTabState[] {
+    if (this.sessionRestored) return [];
+    this.sessionRestored = true;
+    const states: BrowserTabState[] = [];
+    for (const row of loadSession()) {
+      // Defense in depth: never restore an empty / non-http(s) / denied URL.
+      if (!row.url || row.url === 'about:blank') continue;
+      if (!decideNavigation(row.url, 'user').allow) continue;
+      const frozen: FrozenTab = {
+        id: row.tabId,
+        url: row.url,
+        title: row.title,
+        favicon: row.favicon,
+        partition: 'user',
+        workspaceId: row.workspaceId,
+        pinned: row.pinned,
+        sortOrder: row.sortOrder,
+        groupId: row.groupId,
+        scrollY: row.scrollY,
+        origin: 'restored',
+      };
+      this.frozenTabs.set(frozen.id, frozen);
+      this.tabOrder.push(frozen.id); // joins the order (orderedTabIds accepts frozen)
+      if (frozen.pinned) this.pinnedTabs.add(frozen.id);
+      states.push(this.frozenTabState(frozen));
+    }
+    this.emitTabsSnapshot();
+    return states;
+  }
+
+  /** Slice-10/11: lazily materialize a frozen tab's live view on first
+   *  activation and navigate to the stored URL. Keeps the tab's id/order/pin —
+   *  only the missing WebContentsView is created. Best-effort scroll restore. */
+  private hydrateFrozenTab(tabId: string): void {
+    const frozen = this.frozenTabs.get(tabId);
+    if (!frozen) return;
+    this.frozenTabs.delete(tabId);
+
+    const sessionPartition = partitionFor('user', frozen.workspaceId);
+    this.ensureSessionHardened(sessionPartition);
+    const view = new WebContentsView({
+      webPreferences: {
+        ...buildBrowserWebPreferences('user'),
+        session: session.fromPartition(sessionPartition),
+      },
+    });
+    const now = Date.now();
+    const tab: TabEntry = {
+      id: tabId,
+      view,
+      partition: 'user',
+      partitionFull: PARTITION_FULL.user,
+      sessionPartition,
+      workspaceId: frozen.workspaceId,
+      openedByAgent: false,
+      createdAt: now,
+    };
+    this.tabs.set(tabId, tab);
+    this.lastActiveAt.set(tabId, now);
+    this.wireViewEvents(tab);
+
+    const win = this.getMainWindow();
+    if (win) {
+      win.contentView.addChildView(view);
+      view.setBounds(this.lastBounds);
+      view.setVisible(false); // setActiveTab raises + shows it after hydration
+    }
+
+    // Restore scroll once the page has loaded (best-effort; never blocks).
+    if (frozen.scrollY && frozen.scrollY > 0) {
+      const targetY = frozen.scrollY;
+      view.webContents.once('did-finish-load', () => this.restoreScroll(tab, targetY));
+    }
+    void view.webContents.loadURL(frozen.url);
+    this.sendTabState(tab);
+  }
+
+  /** Best-effort scroll restore via page-context JS (trusted-chrome initiated,
+   *  not an agent action). Fail-open — a refused/failed eval is ignored. */
+  private restoreScroll(tab: TabEntry, y: number): void {
+    const wc = tab.view.webContents;
+    if (wc.isDestroyed() || typeof wc.executeJavaScript !== 'function') return;
+    wc.executeJavaScript(`window.scrollTo(0, ${Math.trunc(y)});`, true).catch(() => {});
+  }
+
+  /** Best-effort capture of the live scrollY into lastScrollY, bounded by
+   *  SCROLL_CAPTURE_TIMEOUT_MS so a hung renderer never stalls a sweep (§8). */
+  private async captureScrollY(tab: TabEntry): Promise<void> {
+    const wc = tab.view.webContents;
+    if (wc.isDestroyed() || typeof wc.executeJavaScript !== 'function') return;
+    try {
+      const y = await Promise.race([
+        wc.executeJavaScript('window.scrollY', true) as Promise<number>,
+        new Promise<number>((_, reject) =>
+          setTimeout(() => reject(new Error('scroll-capture-timeout')), SCROLL_CAPTURE_TIMEOUT_MS),
+        ),
+      ]);
+      if (typeof y === 'number' && y >= 0) this.lastScrollY.set(tab.id, y);
+    } catch {
+      /* fail-open: keep whatever lastScrollY we already had */
+    }
+  }
+
+  /** Slice-11: discard a live USER tab — tear down its WebContentsView but keep
+   *  a FrozenTab snapshot (origin 'discarded') in its place. Never the active
+   *  tab; never an agent / signin / handed tab. */
+  discardTab(tabId: string): void {
+    if (tabId === this.activeTabId) return; // never discard the active tab
+    const tab = this.tabs.get(tabId);
+    if (!tab || !this.isPersistableUserTab(tab)) return;
+    const wc = tab.view.webContents;
+    if (wc.isDestroyed()) return;
+    const url = wc.getURL();
+    if (!url || url === 'about:blank') return;
+    if (!decideNavigation(url, 'user').allow) return;
+
+    const frozen: FrozenTab = {
+      id: tab.id,
+      url,
+      title: wc.getTitle(),
+      favicon: this.tabFavicons.get(tab.id),
+      partition: 'user',
+      workspaceId: tab.workspaceId,
+      pinned: this.pinnedTabs.has(tab.id),
+      sortOrder: this.orderedTabIds().indexOf(tab.id),
+      groupId: null,
+      scrollY: this.lastScrollY.get(tab.id),
+      origin: 'discarded',
+    };
+    // Mark BEFORE close so the `destroyed` handler skips order/active teardown.
+    this.discardingTabs.add(tab.id);
+    this.frozenTabs.set(tab.id, frozen);
+    this.tabs.delete(tab.id);
+    this.drivers.delete(tab.id);
+    this.refRegistries.delete(tab.id);
+    this.tabFavicons.delete(tab.id);
+    this.lastActiveAt.delete(tab.id);
+    this.lastScrollY.delete(tab.id);
+    this.getMainWindow()?.contentView.removeChildView(tab.view);
+    wc.close(); // → destroyed handler (guarded by discardingTabs)
+
+    this.sendFrozenTabState(frozen);
+    this.emitTabsSnapshot();
+    this.schedulePersist();
+  }
+
+  /** Slice-11 setter (browserDiscardThreshold IPC): idle-discard threshold in ms,
+   *  or null = Never (idle discard off; the hard live-view cap still applies). */
+  setDiscardThreshold(ms: number | null): void {
+    DISCARD_IDLE_MS = ms === null ? null : Math.max(0, Math.trunc(ms));
+  }
+
+  /** Slice-11: start the ~60s idle-discard + hard-cap memory sweep (USER tabs). */
+  private startDiscardSweep(): void {
+    if (this.discardSweepTimer) return;
+    this.discardSweepTimer = setInterval(() => {
+      void this.runDiscardSweep();
+    }, DISCARD_SWEEP_MS);
+    if (typeof this.discardSweepTimer.unref === 'function') this.discardSweepTimer.unref();
+  }
+
+  /** A live USER tab eligible for the idle/cap sweep. EXEMPT: the active tab,
+   *  pinned tabs, agent-partition / agent-opened tabs, and signin/handed tabs. */
+  private isDiscardEligible(tab: TabEntry): boolean {
+    if (tab.partition !== 'user') return false;
+    if (tab.id === this.activeTabId) return false;
+    if (this.pinnedTabs.has(tab.id)) return false;
+    return this.isPersistableUserTab(tab);
+  }
+
+  /** One sweep pass: throttle hidden views, idle-discard past the threshold, then
+   *  enforce the hard live-view cap by discarding the least-recently-active. */
+  private async runDiscardSweep(): Promise<void> {
+    const now = Date.now();
+    // Enable Chromium background throttling on every hidden USER view (the active
+    // tab stays unthrottled so it remains responsive).
+    for (const tab of this.tabs.values()) {
+      if (tab.partition !== 'user') continue;
+      const wc = tab.view.webContents;
+      if (wc.isDestroyed() || typeof wc.setBackgroundThrottling !== 'function') continue;
+      wc.setBackgroundThrottling(tab.id !== this.activeTabId);
+    }
+
+    // 1) Idle-threshold discard (skipped entirely when the threshold is Never).
+    if (DISCARD_IDLE_MS !== null) {
+      const threshold = DISCARD_IDLE_MS;
+      const idle = [...this.tabs.values()].filter((t) => {
+        if (!this.isDiscardEligible(t)) return false;
+        const since = this.lastActiveAt.get(t.id) ?? t.createdAt ?? now;
+        return now - since >= threshold;
+      });
+      for (const tab of idle) {
+        await this.captureScrollY(tab);
+        this.discardTab(tab.id);
+      }
+    }
+
+    // 2) Hard live-view cap — discard LRU eligible views beyond the cap.
+    const liveEligible = [...this.tabs.values()].filter((t) => this.isDiscardEligible(t));
+    if (liveEligible.length > MAX_LIVE_USER_VIEWS) {
+      liveEligible.sort(
+        (a, b) =>
+          (this.lastActiveAt.get(a.id) ?? a.createdAt ?? 0) -
+          (this.lastActiveAt.get(b.id) ?? b.createdAt ?? 0),
+      );
+      const overflow = liveEligible.length - MAX_LIVE_USER_VIEWS;
+      for (let i = 0; i < overflow; i++) {
+        await this.captureScrollY(liveEligible[i]);
+        this.discardTab(liveEligible[i].id);
+      }
+    }
   }
 
   getTabsSnapshot(): BrowserTabSnapshotEntry[] {
@@ -2312,7 +2793,8 @@ export class BrowserManager {
       tabId: id,
       order: index,
       pinned: this.pinnedTabs.has(id),
-      partition: this.tabs.get(id)!.partition,
+      // Frozen tabs are USER-partition by construction (never in this.tabs).
+      partition: this.tabs.get(id)?.partition ?? 'user',
     }));
   }
 }

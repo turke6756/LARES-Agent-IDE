@@ -388,6 +388,12 @@ export default function BrowserTabStrip() {
     const isAgent = tab.partition === 'agent';
     const attention = Boolean(attentionTabIds[tab.tabId]);
     const handed = Boolean(handedTabIds[tab.tabId]);
+    // Slice 10/11: a frozen tab has NO live view yet — its favicon/title come
+    // from a persisted snapshot, so it renders dimmed. A discarded tab (idle/cap
+    // memory sweep) gets the same dimming PLUS a MoonStar "suspended" glyph.
+    // Clicking either activates the tab → main lazily hydrates/reloads it.
+    const frozen = Boolean(tab.frozen);
+    const discarded = Boolean(tab.discarded);
     return (
       <div
         key={tab.tabId}
@@ -418,10 +424,24 @@ export default function BrowserTabStrip() {
         className={`group browser-tab text-[12px] cursor-pointer ${pinned ? 'browser-tab-pinned' : ''} ${
           active ? 'browser-tab-active' : ''
         } ${attention ? 'browser-tab-attention' : ''} ${
-          draggingId === tab.tabId ? 'opacity-50' : ''
+          draggingId === tab.tabId ? 'opacity-50' : (frozen || discarded) ? 'opacity-60' : ''
         }`}
+        data-frozen={frozen || undefined}
+        data-discarded={discarded || undefined}
       >
         <TabIcon tab={tab} />
+
+        {/* Discarded tabs (idle/cap memory sweep) carry a MoonStar suspended
+            glyph; restored-but-not-yet-discarded frozen tabs just dim. */}
+        {discarded && (
+          <span
+            className="shrink-0 inline-flex items-center text-fg-muted"
+            title="Suspended to save memory"
+            aria-label="Suspended to save memory"
+          >
+            <Icons.MoonStar className="w-3 h-3" />
+          </span>
+        )}
 
         {/* Pinned tabs render compact: favicon only, no title/close. */}
         {!pinned && <span className="truncate min-w-0">{tabLabel(tab)}</span>}

@@ -66,6 +66,14 @@ export function registerBrowserIpc(manager: BrowserManager): void {
   );
   ipcMain.handle(BROWSER_CHANNELS.reopenClosedTab, () => manager.reopenClosedTab());
 
+  // Slice 10/11 — session restore + idle-discard threshold. sessionRestore is a
+  // PULL the renderer issues once (idempotent; second call → []). The threshold
+  // setter writes the mutable idle-discard bound (null = Never).
+  ipcMain.handle(BROWSER_CHANNELS.sessionRestore, () => manager.restoreSession());
+  ipcMain.handle(BROWSER_CHANNELS.browserDiscardThreshold, (_e, ms: number | null) =>
+    manager.setDiscardThreshold(ms),
+  );
+
   // Find-in-page + zoom (WP5) — native WebContents APIs only.
   ipcMain.handle(
     BROWSER_CHANNELS.findInPage,

@@ -158,6 +158,9 @@ interface FakeWC {
   setWindowOpenHandler(): void;
   setUserAgent(): void;
   setURL(url: string): void;
+  // Slice-11 sweep seams (idle/cap discard): throttle hidden views + read scroll.
+  setBackgroundThrottling(throttle: boolean): void;
+  executeJavaScript(code: string, userGesture?: boolean): Promise<unknown>;
 }
 
 function fakeWC(url: string, title = 'T'): FakeWC {
@@ -191,6 +194,8 @@ function fakeWC(url: string, title = 'T'): FakeWC {
     setWindowOpenHandler() {},
     setUserAgent() {},
     setURL(next) { currentUrl = next; },
+    setBackgroundThrottling() {},
+    executeJavaScript: async () => 0,
   };
   return wc;
 }
@@ -880,6 +885,208 @@ test('Slice-8: agent-partition navigations are NEVER recorded in history (M9)', 
   const urls = mgr.historyList().map((e) => e.url);
   assert.ok(urls.includes('https://slice8-user.example/page'), 'user-partition visit recorded');
   assert.ok(!urls.some((u) => u.includes('slice8-agent.example')), 'agent-partition visit must never appear');
+});
+
+// ── Slice 10/11: frozen/discarded tab model + session restore ────────────────
+// Trust/behaviour proofs the plan requires (main side):
+//   - discardTab keeps a frozen snapshot in place and EXEMPTS the active tab,
+//     pinned tabs, and agent / signin / handed tabs;
+//   - the `destroyed` handler skips order/active teardown for a deliberate discard;
+//   - the idle sweep discards an idle USER tab (and spares a recently-active one);
+//   - restoreSession rebuilds USER tabs LAZILY (frozen, no live view) and is
+//     idempotent (the latch returns [] on a second pull);
+//   - persistSession never writes agent / signin / handed tabs (cross-cutting #1);
+//   - a USER close lands on the PERSISTENT reopen stack and reopenClosedTab pops it.
+
+type SessionStoreModule = typeof import('./session-store');
+function sessionStore(): SessionStoreModule {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  return require('./session-store') as SessionStoreModule;
+}
+
+interface BMInternals {
+  tabs: Map<string, unknown>;
+  frozenTabs: Map<string, { id: string; origin: string; pinned: boolean }>;
+  tabOrder: string[];
+  pinnedTabs: Set<string>;
+  lastActiveAt: Map<string, number>;
+  discardingTabs: Set<string>;
+  activeTabId: string | null;
+}
+function internals(mgr: MgrHarness['mgr']): BMInternals {
+  return mgr as unknown as BMInternals;
+}
+
+test('Slice-11: discardTab keeps a frozen snapshot in place (tab leaves tabs, stays in order) and pushes discarded state', () => {
+  const { mgr, sent } = makeManager();
+  const tab = injectTab(mgr, { partition: 'user', url: 'https://discard.example/page', title: 'Page' });
+  priv<void>(mgr, 'wireViewEvents')(tab);
+  const ix = internals(mgr);
+  sent.length = 0;
+
+  mgr.discardTab(tab.id);
+
+  assert.equal(ix.tabs.has(tab.id), false, 'live view removed from tabs');
+  assert.ok(ix.frozenTabs.has(tab.id), 'a frozen snapshot replaced it');
+  assert.equal(ix.frozenTabs.get(tab.id)!.origin, 'discarded', 'origin marks the memory sweep');
+  assert.ok(ix.tabOrder.includes(tab.id), 'id stays in tabOrder (renders inline)');
+  const msg = sent.find((s) => s.channel === CH.tabState);
+  const payload = msg!.payload as { frozen?: boolean; discarded?: boolean };
+  assert.equal(payload.frozen, true, 'renderer told the tab is frozen');
+  assert.equal(payload.discarded, true, 'and that it was memory-discarded');
+
+  // The destroyed handler must NOT forget a deliberately-discarded tab's order.
+  tab.view.webContents.emit('destroyed');
+  assert.ok(ix.tabOrder.includes(tab.id), 'destroyed handler skipped forgetTabOrder for a discard');
+  assert.ok(ix.frozenTabs.has(tab.id), 'frozen snapshot survived the destroyed event');
+  assert.equal(ix.discardingTabs.has(tab.id), false, 'discard latch cleared');
+});
+
+test('Slice-11: discardTab guards the active tab and refuses agent / signin / handed tabs', () => {
+  const { mgr } = makeManager();
+  const ix = internals(mgr);
+
+  // Active tab — never discarded (discardTab's hard guard).
+  const active = injectTab(mgr, { partition: 'user', url: 'https://active.example/', workspaceId: null });
+  ix.activeTabId = active.id;
+  mgr.discardTab(active.id);
+  assert.ok(ix.tabs.has(active.id), 'the active tab is never discarded');
+  ix.activeTabId = null;
+
+  // Agent / signin / handed tabs — never frozen (cross-cutting rule #1).
+  const agent = injectTab(mgr, { partition: 'agent', url: 'https://agent.example/', workspaceId: null });
+  const signin = injectTab(mgr, { partition: 'user', url: 'https://signin.example/', signinPending: true, workspaceId: null });
+  const handed = injectTab(mgr, { partition: 'user', url: 'https://handed.example/', handedToAgent: true, workspaceId: null });
+  for (const t of [agent, signin, handed]) {
+    mgr.discardTab(t.id);
+    assert.ok(ix.tabs.has(t.id), `${t.id} is exempt from discard`);
+    assert.equal(ix.frozenTabs.has(t.id), false, `${t.id} was never frozen`);
+  }
+});
+
+test('Slice-11: the sweep EXEMPTS pinned / agent / signin / handed tabs even when idle', async () => {
+  const { mgr } = makeManager();
+  const ix = internals(mgr);
+  const old = Date.now() - 60 * 60_000; // an hour idle — well past the threshold
+  const pinned = injectTab(mgr, { partition: 'user', url: 'https://pinned.example/', workspaceId: null });
+  ix.pinnedTabs.add(pinned.id);
+  const agent = injectTab(mgr, { partition: 'agent', url: 'https://agent2.example/', workspaceId: null });
+  const signin = injectTab(mgr, { partition: 'user', url: 'https://signin2.example/', signinPending: true, workspaceId: null });
+  const handed = injectTab(mgr, { partition: 'user', url: 'https://handed2.example/', handedToAgent: true, workspaceId: null });
+  for (const t of [pinned, agent, signin, handed]) {
+    priv<void>(mgr, 'wireViewEvents')(t);
+    ix.lastActiveAt.set(t.id, old);
+  }
+
+  await priv<Promise<void>>(mgr, 'runDiscardSweep')();
+
+  for (const t of [pinned, agent, signin, handed]) {
+    assert.ok(ix.tabs.has(t.id), `${t.id} survives the idle sweep`);
+    assert.equal(ix.frozenTabs.has(t.id), false, `${t.id} was never frozen`);
+  }
+});
+
+test('Slice-11: the idle sweep discards an idle USER tab and spares a recently-active one', async () => {
+  const { mgr } = makeManager();
+  const ix = internals(mgr);
+  const idle = injectTab(mgr, { partition: 'user', url: 'https://idle.example/' });
+  const fresh = injectTab(mgr, { partition: 'user', url: 'https://fresh.example/' });
+  priv<void>(mgr, 'wireViewEvents')(idle);
+  priv<void>(mgr, 'wireViewEvents')(fresh);
+  const now = Date.now();
+  ix.lastActiveAt.set(idle.id, now - 31 * 60_000); // past the 30-min default
+  ix.lastActiveAt.set(fresh.id, now); // just used
+
+  await priv<Promise<void>>(mgr, 'runDiscardSweep')();
+
+  assert.ok(ix.frozenTabs.has(idle.id), 'the idle tab was discarded');
+  assert.equal(ix.tabs.has(idle.id), false, 'its live view is gone');
+  assert.ok(ix.tabs.has(fresh.id), 'the recently-active tab is spared');
+  assert.equal(ix.frozenTabs.has(fresh.id), false, 'and was not frozen');
+});
+
+test('Slice-11: setDiscardThreshold(null) = Never disables idle discard (cap still applies)', async () => {
+  const { mgr } = makeManager();
+  const ix = internals(mgr);
+  mgr.setDiscardThreshold(null);
+  const tab = injectTab(mgr, { partition: 'user', url: 'https://never.example/' });
+  priv<void>(mgr, 'wireViewEvents')(tab);
+  ix.lastActiveAt.set(tab.id, Date.now() - 5 * 60 * 60_000); // 5h idle
+
+  await priv<Promise<void>>(mgr, 'runDiscardSweep')();
+
+  assert.ok(ix.tabs.has(tab.id), 'Never threshold means no idle discard');
+  assert.equal(ix.frozenTabs.has(tab.id), false, 'tab stayed live');
+  mgr.setDiscardThreshold(30 * 60_000); // restore the default for later tests
+});
+
+test('Slice-10: restoreSession rebuilds USER tabs LAZILY (frozen, no live view) and is idempotent', () => {
+  const { mgr } = makeManager();
+  const ss = sessionStore();
+  ss.clearSession();
+  ss.replaceSession([
+    { tabId: 'r1', workspaceId: null, url: 'https://r1.example/', title: 'R1', pinned: false, sortOrder: 0, groupId: null, active: false },
+    { tabId: 'r2', workspaceId: null, url: 'https://r2.example/', title: 'R2', pinned: true, sortOrder: 1, groupId: null, active: false, scrollY: 240 },
+  ]);
+  const ix = internals(mgr);
+
+  const states = mgr.restoreSession();
+
+  assert.equal(states.length, 2, 'both persisted tabs were restored');
+  assert.ok(states.every((s) => s.frozen === true), 'restored tabs are frozen');
+  assert.equal(ix.frozenTabs.size, 2, 'frozen snapshots created');
+  assert.equal(ix.tabs.size, 0, 'NO live WebContentsView yet (lazy)');
+  assert.ok(ix.tabOrder.includes('r1') && ix.tabOrder.includes('r2'), 'ids joined the order');
+  assert.ok(ix.pinnedTabs.has('r2'), 'a pinned row restored pinned');
+
+  assert.deepEqual(mgr.restoreSession(), [], 'idempotent — a second pull restores nothing');
+  ss.clearSession();
+});
+
+test('Slice-10: persistSession writes USER tabs only — agent / signin / handed never reach SQLite', () => {
+  const { mgr } = makeManager();
+  const ss = sessionStore();
+  ss.clearSession();
+  const user = injectTab(mgr, { partition: 'user', url: 'https://persist-user.example/', title: 'U', workspaceId: null });
+  priv<void>(mgr, 'wireViewEvents')(user);
+  injectTab(mgr, { partition: 'agent', url: 'https://persist-agent.example/secret', workspaceId: null });
+  injectTab(mgr, { partition: 'user', url: 'https://persist-signin.example/', signinPending: true, workspaceId: null });
+  injectTab(mgr, { partition: 'user', url: 'https://persist-handed.example/', handedToAgent: true, workspaceId: null });
+
+  priv<void>(mgr, 'persistSession')();
+
+  const urls = ss.loadSession().map((r) => r.url);
+  assert.deepEqual(urls, ['https://persist-user.example/'], 'only the plain user tab persisted');
+  assert.ok(!urls.some((u) => u.includes('agent') || u.includes('signin') || u.includes('handed')),
+    'agent / signin / handed URLs never reach disk');
+  ss.clearSession();
+});
+
+test('Slice-10: a USER close lands on the PERSISTENT reopen stack and reopenClosedTab pops it (survives restart)', () => {
+  const { mgr } = makeManager();
+  const ss = sessionStore();
+  ss.clearSession();
+  const tab = injectTab(mgr, { partition: 'user', url: 'https://reopen.example/page', title: 'Reopen', workspaceId: null });
+  priv<void>(mgr, 'wireViewEvents')(tab);
+
+  mgr.closeTab(tab.id);
+  assert.notEqual(ss.peekNewestClosedAt(null), null, 'the user close persisted to the SQLite reopen stack');
+
+  // Reopen consults the persistent stack. Stub createTab so no real view is built.
+  const calls: Array<{ partition: string; url: string }> = [];
+  (mgr as unknown as { createTab(opts: { partition: string; url: string }): { tabId: string } }).createTab = (opts) => {
+    calls.push(opts);
+    return { tabId: 'reopened' };
+  };
+
+  const result = mgr.reopenClosedTab();
+
+  assert.deepEqual(result, { tabId: 'reopened' }, 'reopenClosedTab returned the new tab id');
+  assert.equal(calls.length, 1, 'createTab was invoked once from the persistent stack');
+  assert.equal(calls[0].partition, 'user', 'reopened as a user tab');
+  assert.equal(calls[0].url, 'https://reopen.example/page', 'with the persisted URL');
+  assert.equal(ss.peekNewestClosedAt(null), null, 'popClosedTab emptied the stack');
+  ss.clearSession();
 });
 
 // ── Run ──────────────────────────────────────────────────────────────────────

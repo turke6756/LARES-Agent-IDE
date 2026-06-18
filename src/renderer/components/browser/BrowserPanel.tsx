@@ -40,6 +40,10 @@ export default function BrowserPanel() {
   const dismissOpenRequest = useBrowserStore((s) => s.dismissOpenRequest);
   const createTab = useBrowserStore((s) => s.createTab);
   const clearPaneAttention = useBrowserStore((s) => s.clearPaneAttention);
+  // Slice 10/11: a dismissible "Restored N tabs" note shown on first paint after
+  // a session restore (only while restoredCount > 0).
+  const restoredCount = useBrowserStore((s) => s.restoredCount);
+  const dismissRestoredNote = useBrowserStore((s) => s.dismissRestoredNote);
 
   const apiPresent = getBrowserApi() !== null;
   const activeTab = tabs.find((t) => t.tabId === activeTabId) ?? null;
@@ -81,6 +85,25 @@ export default function BrowserPanel() {
               chrome (NOT the pane-suspending overlay) while the visible
               quarantined login tab is up. Self-gates on signinHandoff. ── */}
           <SigninHandoffBanner />
+
+          {/* ── Slice 10/11: "Restored N tabs" note — dismissible, first paint
+              only. Restored tabs are frozen snapshots until activated. ── */}
+          {restoredCount > 0 && (
+            <div className="flex items-center gap-2 px-3 py-1.5 border-b border-browser-divider bg-accent-blue/10 text-[12px] text-fg-primary shrink-0">
+              <Icons.History className="w-3.5 h-3.5 text-accent-blue shrink-0" />
+              <span className="truncate flex-1">
+                Restored {restoredCount} {restoredCount === 1 ? 'tab' : 'tabs'} from your last
+                session — click one to load it.
+              </span>
+              <button
+                onClick={() => dismissRestoredNote()}
+                className="ui-btn ui-btn-ghost px-2 py-0.5 text-[11px] shrink-0"
+                title="Dismiss"
+              >
+                Dismiss
+              </button>
+            </div>
+          )}
 
           {pendingOpenUrl && (
             <div className="flex items-center gap-2 px-3 py-1.5 border-b border-browser-divider bg-accent-orange/10 text-[12px] text-fg-primary shrink-0">

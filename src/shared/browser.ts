@@ -93,6 +93,14 @@ export interface BrowserTabState {
    *  push. Additive/optional — missing = no attention. */
   needsHumanAttention?: boolean;
   lastAttentionAt?: number;
+  /** Slice 10/11: this tab has NO live WebContentsView — its url/title/favicon
+   *  come from a persisted snapshot. True for a restored-on-startup tab not yet
+   *  activated, OR an idle-discarded tab. Additive/optional — missing = live. */
+  frozen?: boolean;
+  /** Slice 11: this frozen tab was discarded by the idle/cap memory sweep (vs
+   *  restored on startup). Implies frozen. Renderer adds the MoonStar "suspended
+   *  to save memory" treatment. Additive/optional — missing = not memory-discarded. */
+  discarded?: boolean;
 }
 
 // ── Overhaul (WP0) shared shapes ─────────────────────────────────────────────
@@ -358,6 +366,18 @@ export const BROWSER_CHANNELS = {
   tabState: 'browser:tab-state',
   /** main → renderer event channel (BrowserOpenRequest payload) */
   openRequest: 'browser:open-request',
+
+  // ── Slice 10/11: session restore + frozen/discarded tab model ──────────────
+  // sessionRestore is a PULL the renderer issues from ensureBrowserBridge (after
+  // syncing the active workspace) — main re-materializes the prior USER-PARTITION
+  // tabs as FROZEN snapshots (no WebContentsView until first activation) and emits
+  // the authoritative tab-order snapshot. Agent / signin / handed tabs are never
+  // persisted or restored (cross-cutting rule #1).
+  /** () → BrowserTabState[] (frozen:true states; idempotent — second call → []) */
+  sessionRestore: 'browser:session-restore',
+  /** (ms: number | null) → void — Slice-11 idle-discard threshold (null = Never;
+   *  disables idle discard but keeps the hard live-view cap). Slice-11-UI wiring. */
+  browserDiscardThreshold: 'browser:discard-threshold',
 
   // ── Slice-3: denial toasts + live Activity/Audit drawer ────────────────────
   // The M16 action-audit feed surfaced to trusted chrome. auditRecent primes the

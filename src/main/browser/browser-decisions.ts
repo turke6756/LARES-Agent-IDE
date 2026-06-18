@@ -112,6 +112,9 @@ export interface BrowserViewWebPreferences {
   allowRunningInsecureContent: boolean;
   webviewTag: boolean;
   preload: string | undefined;
+  /** Slice-11: leave Chromium's default hidden-view throttling ON so discarded
+   *  / background user tabs burn no CPU while not the active view. */
+  backgroundThrottling: boolean;
 }
 
 /**
@@ -134,6 +137,9 @@ export function buildBrowserWebPreferences(kind: BrowserViewKind): BrowserViewWe
     allowRunningInsecureContent: false,
     webviewTag: false,
     preload: undefined,                 // never the dashboard preload
+    // Slice-11: explicit (Chromium's default) — hidden background views are
+    // throttled so an idle/discarded user tab consumes no CPU while not active.
+    backgroundThrottling: true,
   };
 }
 

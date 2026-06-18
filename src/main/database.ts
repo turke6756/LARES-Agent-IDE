@@ -297,6 +297,47 @@ export function initDatabase(): void {
       ON browser_history(url)
   `);
 
+  // ── Slice 10/11: session restore + frozen/discarded tab model ──────────────
+  // browser_session persists the OPEN user-partition tabs (live + frozen) so a
+  // restart re-materializes them as frozen snapshots (lazy WebContentsView on
+  // first activation). browser_closed_tabs is the persistent reopen stack
+  // (Ctrl+Shift+T), capped 25 per workspace, FIFO. USER-PARTITION ONLY — the
+  // `partition` CHECK pins each row to 'user' so an agent row is a hard DB error,
+  // defense-in-depth atop the manager-side gate (cross-cutting rule #1). The thin
+  // service lives in src/main/browser/session-store.ts (getDb()). Times epoch-ms.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS browser_session (
+      tab_id       TEXT PRIMARY KEY,
+      workspace_id TEXT,                                   -- nullable; matches tab.workspaceId
+      url          TEXT NOT NULL,
+      title        TEXT NOT NULL DEFAULT '',
+      favicon      TEXT,
+      partition    TEXT NOT NULL DEFAULT 'user' CHECK (partition IN ('user')),  -- USER ONLY
+      pinned       INTEGER NOT NULL DEFAULT 0,
+      sort_order   INTEGER NOT NULL,                       -- dense display order AFTER pinned-left normalization
+      group_id     TEXT,                                   -- DB-reserved passthrough (composes w/ tab-groups track)
+      active       INTEGER NOT NULL DEFAULT 0,             -- writer-enforced <=1 (the activeTabId's row); restore hint
+      scroll_y     INTEGER,                                -- nullable best-effort scroll restore
+      updated_at   INTEGER NOT NULL
+    )
+  `);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS browser_closed_tabs (
+      id           TEXT PRIMARY KEY,                       -- uuid of this closed-tab record
+      workspace_id TEXT,
+      url          TEXT NOT NULL,
+      title        TEXT NOT NULL DEFAULT '',
+      favicon      TEXT,
+      partition    TEXT NOT NULL DEFAULT 'user' CHECK (partition IN ('user')),  -- USER ONLY
+      group_id     TEXT,
+      closed_at    INTEGER NOT NULL
+    )
+  `);
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_closed_tabs_ws
+      ON browser_closed_tabs(workspace_id, closed_at DESC)
+  `);
+
   // ── Website-access policy tables (plans/website-allowlist-simplification.md) ─
   // ONE human-curated agent allowlist for the embedded browser. Stored in the
   // dashboard DB (userData, outside the workspace) so the agent's file tools can

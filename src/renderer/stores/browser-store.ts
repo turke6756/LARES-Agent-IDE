@@ -85,6 +85,15 @@ export interface BrowserTabState {
    *  attention event from an unrelated tab-state push. Additive/optional. */
   needsHumanAttention?: boolean;
   lastAttentionAt?: number;
+  /** Slice 10/11: this tab has NO live WebContentsView — its url/title/favicon
+   *  come from a persisted snapshot. True for a restored-on-startup tab not yet
+   *  activated, OR an idle-discarded tab. Activating it lazily hydrates in main.
+   *  Additive/optional — missing = live. */
+  frozen?: boolean;
+  /** Slice 11: this frozen tab was discarded by the idle/cap memory sweep (vs
+   *  restored on startup). Implies frozen. Drives the MoonStar "suspended to
+   *  save memory" treatment. Additive/optional — missing = not memory-discarded. */
+  discarded?: boolean;
 }
 
 export interface BrowserBounds {
@@ -209,6 +218,14 @@ export interface BrowserApi {
   reorderTab(tabId: string, toOrder: number): unknown;
   setTabPinned(tabId: string, pinned: boolean): unknown;
   reopenClosedTab(): Promise<{ tabId: string } | null>;
+  /** Slice 10/11: re-materialize the prior USER-PARTITION tabs as FROZEN
+   *  snapshots (no live view until first activation). Idempotent — a second
+   *  call returns []. Issued once from ensureBrowserBridge after the workspace
+   *  is synced. */
+  sessionRestore(): Promise<BrowserTabState[]>;
+  /** Slice 11: idle-discard threshold in ms; null = "Never" (keeps the hard
+   *  live-view cap but disables time-based discard). */
+  setDiscardThreshold(ms: number | null): unknown;
   findInPage(tabId: string, text: string, opts?: { forward?: boolean; findNext?: boolean }): unknown;
   stopFindInPage(tabId: string): unknown;
   setZoom(tabId: string, zoomFactor: number): unknown;
@@ -508,6 +525,18 @@ interface BrowserStoreState {
   setTabPinned: (tabId: string, pinned: boolean) => void;
   reopenClosedTab: () => Promise<void>;
 
+  // ── Slice 10/11: session restore + frozen/discarded tab model ──────────────
+  // restoreSession PULLs the prior USER tabs back as FROZEN snapshots (no live
+  // view until activated) and seeds them into the strip; restoredCount drives a
+  // dismissible "Restored N tabs" note in the panel (0 = no note / dismissed).
+  // discardThresholdMs mirrors the idle-discard setting (null = "Never"); the
+  // settings control flips it through setDiscardThreshold.
+  restoredCount: number;
+  discardThresholdMs: number | null;
+  restoreSession: () => Promise<void>;
+  dismissRestoredNote: () => void;
+  setDiscardThreshold: (ms: number | null) => void;
+
   // ── Tab groups (renderer-derived UI state; see components/browser/tab-groups.ts) ──
   // Collapse/expand is pure UI — grouping is derived from `partition`, so no
   // IPC change. Agent tabs start collapsed (the pile-up we're taming); the
@@ -623,6 +652,11 @@ export const useBrowserStore = create<BrowserStoreState>((set, get) => ({
   groupCollapsed: { agent: true, user: false },
   openGroupId: null,
   focusAddressTick: 0,
+
+  // Slice 10/11 — session restore + idle-discard threshold. 30 min is the
+  // displayed default for the discard setting (mirror — main is authoritative).
+  restoredCount: 0,
+  discardThresholdMs: 30 * 60 * 1000,
 
   // Slice-3 — denial toasts + Activity/Audit drawer initial state.
   auditEvents: [],
@@ -1098,6 +1132,43 @@ export const useBrowserStore = create<BrowserStoreState>((set, get) => ({
     }
   },
 
+  // ── Slice 10/11: session restore + idle-discard threshold ──────────────────
+  // PULL the prior USER tabs back as FROZEN snapshots and seed the strip. Merge
+  // (don't blunt-replace) so an onTabState push that raced us isn't clobbered:
+  // known tabs keep their slot with the snapshot fields layered on, unknown ones
+  // append in restore order. restoredCount (>0) lights the dismissible note.
+  restoreSession: async () => {
+    const api = getBrowserApi();
+    if (!api?.sessionRestore) return;
+    try {
+      const restored = await api.sessionRestore();
+      if (!Array.isArray(restored) || restored.length === 0) return;
+      set((s) => {
+        const byId = new Map(s.tabs.map((t) => [t.tabId, t]));
+        for (const r of restored) {
+          const prev = byId.get(r.tabId);
+          byId.set(r.tabId, prev ? { ...prev, ...r } : r);
+        }
+        return { tabs: [...byId.values()], restoredCount: restored.length };
+      });
+    } catch (err) {
+      console.error('browser.sessionRestore failed:', err);
+    }
+  },
+
+  dismissRestoredNote: () => set({ restoredCount: 0 }),
+
+  setDiscardThreshold: (ms) => {
+    // Optimistic local mirror so the settings control reflects the choice; main
+    // is authoritative for the actual sweep timing.
+    set({ discardThresholdMs: ms });
+    try {
+      getBrowserApi()?.setDiscardThreshold(ms);
+    } catch (err) {
+      console.error('browser.setDiscardThreshold failed:', err);
+    }
+  },
+
   // ── Tab groups (UI-only; no main round-trip) ───────────────────────────────
   toggleGroupCollapsed: (id) =>
     set((s) => {
@@ -1469,6 +1540,15 @@ export function ensureBrowserBridge(): boolean {
 
   // Prime the bookmarks slice (subsequent edits arrive via onBookmarksChanged).
   void useBrowserStore.getState().loadBookmarks();
+
+  // ── Slice 10/11: session restore ───────────────────────────────────────────
+  // PULL the prior USER tabs back as frozen snapshots AFTER the workspace is
+  // synced above (main scopes restore to the active workspace). Idempotent on
+  // the main side, so a re-entrant bridge start can't double-restore. Guarded so
+  // older/stubbed preload shapes without the channel don't crash the bridge.
+  if (api.sessionRestore) {
+    void useBrowserStore.getState().restoreSession();
+  }
 
   // ── Website-access policy — subscribe + prime. Guarded so older/stubbed
   //    preload shapes without the access namespace don't crash the bridge. The

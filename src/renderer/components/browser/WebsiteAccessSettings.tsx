@@ -367,6 +367,61 @@ function RequestRow({ request }: { request: AccessRequest }) {
   );
 }
 
+// ── Slice 11: idle-discard threshold (memory) ─────────────────────────────────
+// How long a background user tab may sit idle before its live WebContentsView is
+// discarded (frozen to a snapshot) to save memory. "Never" disables time-based
+// discard but keeps the hard live-view cap. Wired straight to setDiscardThreshold
+// (minutes → ms, "Never" → null).
+const DISCARD_OPTIONS: { label: string; ms: number | null }[] = [
+  { label: '15 min', ms: 15 * 60 * 1000 },
+  { label: '30 min', ms: 30 * 60 * 1000 },
+  { label: '60 min', ms: 60 * 60 * 1000 },
+  { label: 'Never', ms: null },
+];
+
+function DiscardThresholdSetting() {
+  const discardThresholdMs = useBrowserStore((s) => s.discardThresholdMs);
+  const setDiscardThreshold = useBrowserStore((s) => s.setDiscardThreshold);
+
+  return (
+    <section className="flex flex-col gap-2">
+      <div className="flex items-center gap-2">
+        <Icons.MoonStar className="w-4 h-4 text-fg-secondary" />
+        <h2 className="text-[13px] font-semibold text-fg-primary">Suspend idle tabs</h2>
+      </div>
+      <p className="text-[11px] text-fg-muted">
+        Background tabs left idle this long are suspended to save memory — their content
+        reloads the next time you click them. “Never” keeps tabs live (a hard cap still applies).
+      </p>
+      <div
+        role="radiogroup"
+        aria-label="Suspend idle tabs after"
+        className="flex flex-wrap items-center gap-1.5"
+      >
+        {DISCARD_OPTIONS.map((opt) => {
+          const selected = discardThresholdMs === opt.ms;
+          return (
+            <button
+              key={opt.label}
+              type="button"
+              role="radio"
+              aria-checked={selected}
+              onClick={() => setDiscardThreshold(opt.ms)}
+              className={`px-2.5 py-1 text-[11px] rounded border transition-colors ${
+                selected
+                  ? 'border-accent-blue bg-accent-blue/15 text-fg-primary font-medium'
+                  : 'border-tab-border text-fg-secondary hover:bg-[var(--color-tab-hover-bg)]'
+              }`}
+            >
+              {opt.label}
+            </button>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
 function WebsiteAccessSettingsInner() {
   useBrowserSuspension();
 
@@ -483,6 +538,9 @@ function WebsiteAccessSettingsInner() {
             </div>
           )}
         </section>
+
+        {/* ── (3) Memory — idle-tab suspend threshold (Slice 11). ── */}
+        <DiscardThresholdSetting />
       </div>
     </div>
   );

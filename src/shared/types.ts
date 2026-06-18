@@ -797,6 +797,10 @@ export interface IpcApi {
     reorderTab: (tabId: string, toOrder: number) => Promise<void>;
     setTabPinned: (tabId: string, pinned: boolean) => Promise<void>;
     reopenClosedTab: () => Promise<{ tabId: string } | null>;
+    // Slice 10/11 — session restore (PULL, idempotent → [] on a second call) +
+    // idle-discard threshold setter (ms, or null = Never).
+    sessionRestore: () => Promise<BrowserTabState[]>;
+    setDiscardThreshold: (ms: number | null) => Promise<void>;
     // Find-in-page + zoom (WP5).
     findInPage: (
       tabId: string,

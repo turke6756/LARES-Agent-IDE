@@ -200,6 +200,10 @@ const api: IpcApi = {
     setTabPinned: (tabId, pinned) =>
       ipcRenderer.invoke(BROWSER_CHANNELS.setTabPinned, tabId, pinned),
     reopenClosedTab: () => ipcRenderer.invoke(BROWSER_CHANNELS.reopenClosedTab),
+    // Slice 10/11 — session restore (PULL, idempotent) + idle-discard threshold.
+    sessionRestore: () => ipcRenderer.invoke(BROWSER_CHANNELS.sessionRestore),
+    setDiscardThreshold: (ms) =>
+      ipcRenderer.invoke(BROWSER_CHANNELS.browserDiscardThreshold, ms),
     findInPage: (tabId, text, opts) =>
       ipcRenderer.invoke(BROWSER_CHANNELS.findInPage, tabId, text, opts),
     stopFindInPage: (tabId) => ipcRenderer.invoke(BROWSER_CHANNELS.stopFindInPage, tabId),

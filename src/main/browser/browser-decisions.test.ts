@@ -93,11 +93,14 @@ test('buildBrowserWebPreferences: every M3 field, per kind', () => {
     // No preload for any kind today; WP3-A adds the surface preload as the
     // only exception. user/agent must stay preload-free forever.
     assert.equal(wp.preload, undefined, `${kind}: preload`);
+    // Slice-11: hidden background views stay throttled (Chromium default) so an
+    // idle/discarded user tab burns no CPU while not the active view.
+    assert.equal(wp.backgroundThrottling, true, `${kind}: backgroundThrottling`);
     // Exactly the M3 field set — a typo'd extra key would silently no-op.
     assert.deepEqual(
       Object.keys(wp).sort(),
       [
-        'allowRunningInsecureContent', 'contextIsolation', 'nodeIntegration',
+        'allowRunningInsecureContent', 'backgroundThrottling', 'contextIsolation', 'nodeIntegration',
         'nodeIntegrationInSubFrames', 'preload', 'sandbox', 'webSecurity', 'webviewTag',
       ],
       `${kind}: exact key set`,

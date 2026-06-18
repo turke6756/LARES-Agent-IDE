@@ -36,6 +36,8 @@ function makeMockApi() {
     reorderTab: vi.fn(),
     setTabPinned: vi.fn(),
     reopenClosedTab: vi.fn(async () => null),
+    sessionRestore: vi.fn(async (): Promise<BrowserTabState[]> => []),
+    setDiscardThreshold: vi.fn(),
     findInPage: vi.fn(),
     stopFindInPage: vi.fn(),
     setZoom: vi.fn(),
@@ -100,6 +102,8 @@ beforeEach(() => {
     attentionTabIds: {},
     paneAttention: false,
     pendingOpenUrl: null,
+    restoredCount: 0,
+    discardThresholdMs: 30 * 60 * 1000,
   });
   useDashboardStore.setState({
     browserOpen: false,
@@ -384,6 +388,70 @@ describe('BrowserApi facade calls', () => {
     expect(api.goForward).toHaveBeenCalledWith(a);
     expect(api.reload).toHaveBeenCalledWith(a);
     expect(api.stop).toHaveBeenCalledWith(a);
+  });
+});
+
+describe('Slice 10/11: session restore + frozen/discarded model', () => {
+  it('restoreSession seeds frozen snapshots and sets restoredCount', async () => {
+    api.sessionRestore.mockResolvedValueOnce([
+      tabState({ tabId: 'r1', frozen: true, partition: 'user' }),
+      tabState({ tabId: 'r2', frozen: true, discarded: true, partition: 'user' }),
+    ]);
+    await useBrowserStore.getState().restoreSession();
+    const s = useBrowserStore.getState();
+    expect(s.tabs.map((t) => t.tabId)).toEqual(['r1', 'r2']);
+    expect(s.tabs.every((t) => t.frozen)).toBe(true);
+    // Restored tabs are user-partition only (agent tabs are never persisted —
+    // a main-side guarantee; the renderer just renders what it's handed).
+    expect(s.tabs.every((t) => t.partition === 'user')).toBe(true);
+    expect(s.restoredCount).toBe(2);
+  });
+
+  it('restoreSession merges onto a known tab instead of duplicating it', async () => {
+    const a = (await useBrowserStore.getState().createTab())!;
+    api.sessionRestore.mockResolvedValueOnce([
+      tabState({ tabId: a, frozen: true, title: 'Snapshot' }),
+    ]);
+    await useBrowserStore.getState().restoreSession();
+    const s = useBrowserStore.getState();
+    expect(s.tabs).toHaveLength(1);
+    expect(s.tabs[0].frozen).toBe(true);
+    expect(s.tabs[0].title).toBe('Snapshot');
+  });
+
+  it('an empty restore leaves the note dark (restoredCount stays 0)', async () => {
+    api.sessionRestore.mockResolvedValueOnce([]);
+    await useBrowserStore.getState().restoreSession();
+    expect(useBrowserStore.getState().restoredCount).toBe(0);
+  });
+
+  it('dismissRestoredNote clears the count', () => {
+    useBrowserStore.setState({ restoredCount: 3 });
+    useBrowserStore.getState().dismissRestoredNote();
+    expect(useBrowserStore.getState().restoredCount).toBe(0);
+  });
+
+  it('a frozen tab activates through the existing select path (lazy hydration in main)', async () => {
+    api.sessionRestore.mockResolvedValueOnce([tabState({ tabId: 'r1', frozen: true })]);
+    await useBrowserStore.getState().restoreSession();
+    useBrowserStore.getState().selectTab('r1');
+    expect(useBrowserStore.getState().activeTabId).toBe('r1');
+  });
+
+  it('setDiscardThreshold forwards ms / null and mirrors the selection', () => {
+    useBrowserStore.getState().setDiscardThreshold(15 * 60 * 1000);
+    expect(api.setDiscardThreshold).toHaveBeenLastCalledWith(900_000);
+    expect(useBrowserStore.getState().discardThresholdMs).toBe(900_000);
+
+    useBrowserStore.getState().setDiscardThreshold(null);
+    expect(api.setDiscardThreshold).toHaveBeenLastCalledWith(null);
+    expect(useBrowserStore.getState().discardThresholdMs).toBeNull();
+  });
+
+  it('the bridge issues a session restore once the API is present', () => {
+    api.sessionRestore.mockResolvedValueOnce([]);
+    expect(ensureBrowserBridge()).toBe(true);
+    expect(api.sessionRestore).toHaveBeenCalledTimes(1);
   });
 });
 
