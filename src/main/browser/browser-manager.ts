@@ -218,6 +218,16 @@ interface TabEntry {
    *  on the wire contract — tracked so unresponsive/responsive can push fresh
    *  tab state to the chrome. */
   unresponsive?: boolean;
+  /** Slice-2: agent identity, stamped once at createTab from the trusted API
+   *  layer (resolved from the agent registry — never the agent's tool args).
+   *  Surfaced via sendTabState for the "Opened by <title>" tooltip + attribution. */
+  openedByAgentId?: string;
+  openedByAgentTitle?: string;
+  /** Slice-2: authoritative attention model. Set ONCE when an agent opens/raises
+   *  this tab (with a fresh `lastAttentionAt` stamp). Main never loops/re-pulses;
+   *  the renderer flashes briefly and clears its own attention on select. */
+  needsHumanAttention?: boolean;
+  lastAttentionAt?: number;
 }
 
 // ── WP2 frozen provider contract (WP2-B injects browserManager.tools into
@@ -256,7 +266,18 @@ export interface WaitForResult {
 }
 
 export interface BrowserToolProvider {
-  openUrl(url: string, opts: { forHuman?: boolean; workspaceId?: string | null }): Promise<TabSnapshot>;
+  openUrl(
+    url: string,
+    opts: {
+      forHuman?: boolean;
+      workspaceId?: string | null;
+      /** Slice-2: identity of the calling agent, resolved by the trusted API
+       *  layer from the agent registry (never the agent's own tool args).
+       *  Stamped onto the tab for the "Opened by <title>" tooltip + attention. */
+      agentId?: string;
+      agentTitle?: string;
+    },
+  ): Promise<TabSnapshot>;
   listTabs(): TabInfo[];
   getPageText(tabId: string): Promise<string>;
   readPage(tabId: string): Promise<string>;
@@ -413,7 +434,13 @@ export class BrowserManager {
 
   createTab(
     opts: BrowserCreateTabOptions,
-    internal?: { openedByAgent?: boolean },
+    internal?: {
+      openedByAgent?: boolean;
+      /** Slice-2: trusted agent identity (resolved by the API layer from the
+       *  agent registry). Present only on agent-tool opens. */
+      openedByAgentId?: string;
+      openedByAgentTitle?: string;
+    },
   ): { tabId: string } {
     const partitionFull = PARTITION_FULL[opts.partition];
     if (!partitionFull) throw new Error(`unknown partition: ${String(opts.partition)}`);
@@ -444,6 +471,13 @@ export class BrowserManager {
       // workspace) wins; otherwise stamp the workspace main currently tracks.
       workspaceId: opts.workspaceId !== undefined ? opts.workspaceId : this.currentWorkspaceId,
       openedByAgent: internal?.openedByAgent === true,
+      // Slice-2: stamp agent identity + raise the authoritative attention flag
+      // ONCE for agent-tool opens. Main does not loop/re-pulse — the renderer
+      // flashes briefly and clears its local attention on select.
+      openedByAgentId: internal?.openedByAgentId,
+      openedByAgentTitle: internal?.openedByAgentTitle,
+      needsHumanAttention: internal?.openedByAgent === true ? true : undefined,
+      lastAttentionAt: internal?.openedByAgent === true ? Date.now() : undefined,
     };
     this.tabs.set(tabId, tab);
     this.tabOrder.push(tabId); // new tabs append (unpinned → right cluster)
@@ -948,7 +982,8 @@ export class BrowserManager {
     if (!this.toolsFacade) {
       this.toolsFacade = {
         openUrl: (url, opts) => this.toolOpenUrl(url, opts ?? {}),
-        // (opts carries workspaceId resolved by the API layer from the agent.)
+        // (opts carries workspaceId + agent id/title resolved by the API layer
+        //  from the agent — never the agent's own tool args.)
         listTabs: () => this.toolListTabs(),
         getPageText: (tabId) => this.toolGetPageText(tabId),
         readPage: (tabId) => this.toolReadPage(tabId),
@@ -1081,9 +1116,21 @@ export class BrowserManager {
 
   private async toolOpenUrl(
     url: string,
-    opts: { forHuman?: boolean; workspaceId?: string | null },
+    opts: {
+      forHuman?: boolean;
+      workspaceId?: string | null;
+      agentId?: string;
+      agentTitle?: string;
+    },
   ): Promise<TabSnapshot> {
     const forHuman = opts.forHuman === true;
+    // Slice-2: trusted agent identity threaded from the API layer → stamped on
+    // the created tab for the "Opened by <title>" tooltip + attention attribution.
+    const agentIdentity = {
+      openedByAgent: true,
+      openedByAgentId: opts.agentId,
+      openedByAgentTitle: opts.agentTitle,
+    };
     // Per-workspace isolation: stamp the agent's workspace (resolved by the API
     // layer from the calling agent) so the tab lands in the right workspace's
     // strip rather than leaking into whichever workspace the human is viewing.
@@ -1119,7 +1166,7 @@ export class BrowserManager {
       // M9 openUrlForHumanAction: a visible persist:user tab, focused in the
       // pane, URL rendered by the WP1-B address bar (shell chrome — model
       // output can't spoof it). NEVER attaches CDP; returns no page content.
-      const { tabId } = this.createTab({ partition: 'user', url, workspaceId }, { openedByAgent: true });
+      const { tabId } = this.createTab({ partition: 'user', url, workspaceId }, agentIdentity);
       this.setActiveTab(tabId);
       this.auditRecord(partitionFull, url, verb, args, 'ok');
       return { tabId, url, partition: 'user' };
@@ -1128,7 +1175,7 @@ export class BrowserManager {
     // Agent-partition browse (only reachable with the M12 toggle on): the tab
     // is created empty and navigated through the driver so the page-ready
     // wait lives here, not in the proxy scripts.
-    const { tabId } = this.createTab({ partition: 'agent', workspaceId }, { openedByAgent: true });
+    const { tabId } = this.createTab({ partition: 'agent', workspaceId }, agentIdentity);
     try {
       await this.driver(tabId).navigateAndWait(url);
     } catch (err) {
@@ -1827,6 +1874,13 @@ export class BrowserManager {
       lastError: tab.lastError ?? null,
       // Phase-1 shape kept intact: field absent (not false) for human tabs.
       ...(tab.openedByAgent ? { openedByAgent: true } : {}),
+      // Slice-2: agent identity + authoritative attention. Additive idiom (field
+      // absent, not falsy) — main sets these ONCE at open; it never re-pulses, so
+      // lastAttentionAt is a stable marker the renderer keys a one-shot flash off.
+      ...(tab.openedByAgentId ? { openedByAgentId: tab.openedByAgentId } : {}),
+      ...(tab.openedByAgentTitle ? { openedByAgentTitle: tab.openedByAgentTitle } : {}),
+      ...(tab.needsHumanAttention ? { needsHumanAttention: true } : {}),
+      ...(tab.lastAttentionAt ? { lastAttentionAt: tab.lastAttentionAt } : {}),
       // §12-B (F4): make the renderer's "Agent driving" badge authoritative —
       // push the live handed/quarantine flags (additive idiom: field absent,
       // not false, so the renderer treats missing as false).

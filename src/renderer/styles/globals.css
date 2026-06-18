@@ -492,6 +492,35 @@ select {
   }
 }
 
+/* ── Browser pane: agent-attention flash (Slice-2) ───────────────────────────
+   Replaces the old permanent `animate-pulse` on agent-opened tabs. A brief,
+   SELF-STOPPING flash (a finite ring pulse) so attention reads as an event, not
+   a forever-throb. The renderer applies `.browser-tab-attention` while the tab
+   is in the local attention set (cleared on select); the finite iteration count
+   means the flash also settles on its own even if the human never clicks. */
+@keyframes browser-tab-attention-flash {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--color-accent-orange) 0%, transparent);
+  }
+  35% {
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--color-accent-orange) 70%, transparent);
+  }
+}
+
+.browser-tab-attention {
+  animation: browser-tab-attention-flash 0.9s ease-in-out 3;
+  /* Hold the highlight ring after the flash settles, so an unselected
+     attention tab stays subtly marked without animating forever. */
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--color-accent-orange) 55%, transparent);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .browser-tab-attention {
+    animation: none;
+  }
+}
+
 @keyframes notebook-ring-pulse {
   0% { transform: scale(1); opacity: 0.7; }
   50% { transform: scale(1.45); opacity: 1; }

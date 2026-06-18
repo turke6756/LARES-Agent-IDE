@@ -51,7 +51,17 @@ export interface BrowserToolProvider {
   /** forHuman → visible persist:user tab, never CDP (M9). Resolves once the
    *  page is ready — the navigateAndWait lives server-side so MCP proxy
    *  scripts stay dumb (M10 page-ready note). */
-  openUrl(url: string, opts: { forHuman?: boolean; workspaceId?: string | null }): Promise<unknown>;
+  openUrl(
+    url: string,
+    opts: {
+      forHuman?: boolean;
+      workspaceId?: string | null;
+      /** Slice-2: agent identity resolved trust-side from the agent registry
+       *  (display only — stamped on the tab, never read back to the agent). */
+      agentId?: string;
+      agentTitle?: string;
+    },
+  ): Promise<unknown>;
   listTabs(): unknown[];
   /** wrapUntrusted applied by the provider (M12). */
   getPageText(tabId: string): Promise<string>;
@@ -1142,10 +1152,18 @@ export class ApiServer {
       // Per-workspace isolation: stamp the tab with the calling agent's
       // workspace so it lands in that workspace's browser strip rather than
       // leaking into whichever workspace the human happens to be viewing.
-      const workspaceId =
-        typeof agentId === 'string' && agentId ? getAgent(agentId)?.workspaceId ?? null : null;
+      // Slice-2: resolve the calling agent's workspace + display title trust-side
+      // from the registry. The agent model cannot forge these via tool args; they
+      // attribute the tab ("Opened by <title>") and raise the attention flash.
+      const agent = typeof agentId === 'string' && agentId ? getAgent(agentId) : undefined;
+      const workspaceId = agent?.workspaceId ?? null;
       try {
-        const snapshot = await tools.openUrl(targetUrl, { forHuman: forHuman === true, workspaceId });
+        const snapshot = await tools.openUrl(targetUrl, {
+          forHuman: forHuman === true,
+          workspaceId,
+          agentId: agent ? agentId : undefined,
+          agentTitle: agent?.title,
+        });
         return { ok: true, forHuman: forHuman === true, snapshot };
       } catch (err) {
         ApiServer.rethrowBrowserError(err);

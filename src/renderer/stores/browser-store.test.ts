@@ -88,6 +88,7 @@ beforeEach(() => {
   useBrowserStore.setState({
     tabs: [],
     activeTabId: null,
+    selectedWorkspaceId: null,
     attentionTabIds: {},
     paneAttention: false,
     pendingOpenUrl: null,
@@ -257,6 +258,69 @@ describe('agent-attention flash (plan §4 UX)', () => {
     useBrowserStore.getState().handleTabState(tabState({ tabId: a }));
     expect(useBrowserStore.getState().attentionTabIds[a]).toBeUndefined();
     expect(useBrowserStore.getState().paneAttention).toBe(false);
+  });
+});
+
+describe('Slice-2: authoritative agent identity + attention model', () => {
+  // A realistic main payload for an agent-opened tab: agent identity stamped by
+  // the trusted API layer + the authoritative attention flag with a stamp.
+  const agentTab = (id: string, over: Partial<BrowserTabState> = {}): BrowserTabState =>
+    tabState({
+      tabId: id,
+      partition: 'agent',
+      openedByAgent: true,
+      openedByAgentId: 'agent-7',
+      openedByAgentTitle: 'Research bot',
+      needsHumanAttention: true,
+      lastAttentionAt: 1000,
+      ...over,
+    });
+
+  it('(a) an agent-opened tab carries the opening agent id + title', () => {
+    useBrowserStore.getState().handleTabState(agentTab('t1'));
+    const tab = useBrowserStore.getState().tabs.find((t) => t.tabId === 't1');
+    expect(tab?.openedByAgentId).toBe('agent-7');
+    expect(tab?.openedByAgentTitle).toBe('Research bot');
+  });
+
+  it('(b) selecting an attention tab clears attention for THAT tab only', () => {
+    useBrowserStore.getState().handleTabState(agentTab('t1', { lastAttentionAt: 1000 }));
+    useBrowserStore.getState().handleTabState(agentTab('t2', { lastAttentionAt: 2000 }));
+    expect(useBrowserStore.getState().attentionTabIds['t1']).toBe(true);
+    expect(useBrowserStore.getState().attentionTabIds['t2']).toBe(true);
+
+    useBrowserStore.getState().selectTab('t1');
+
+    const s = useBrowserStore.getState();
+    expect(s.attentionTabIds['t1']).toBeUndefined();
+    expect(s.attentionTabIds['t2']).toBe(true); // the other tab keeps its flash
+  });
+
+  it('(c) cross-workspace attention pulses the pane entry WITHOUT activating a hidden tab', () => {
+    // Human is viewing ws-A with the pane closed; an agent raises a tab in ws-B.
+    useBrowserStore.setState({ selectedWorkspaceId: 'ws-A', activeTabId: null });
+    useDashboardStore.setState({ browserOpen: false });
+
+    useBrowserStore.getState().handleTabState(agentTab('t-bg', { workspaceId: 'ws-B' }));
+
+    const s = useBrowserStore.getState();
+    expect(s.attentionTabIds['t-bg']).toBe(true);
+    expect(s.paneAttention).toBe(true);
+    // The hidden cross-workspace tab must NOT become active (would blank the pane).
+    expect(s.activeTabId).toBeNull();
+  });
+
+  it('a steady-state push (same lastAttentionAt) after select does not re-flash — main sets attention once', () => {
+    useBrowserStore.getState().handleTabState(agentTab('t1', { lastAttentionAt: 1000 }));
+    useBrowserStore.getState().selectTab('t1');
+    expect(useBrowserStore.getState().attentionTabIds['t1']).toBeUndefined();
+
+    // A later tab-state push (title/loading change) carries the SAME stamp →
+    // the renderer must not re-raise attention on the now-seen tab.
+    useBrowserStore
+      .getState()
+      .handleTabState(agentTab('t1', { lastAttentionAt: 1000, title: 'New title' }));
+    expect(useBrowserStore.getState().attentionTabIds['t1']).toBeUndefined();
   });
 });
 

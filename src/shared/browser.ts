@@ -78,6 +78,21 @@ export interface BrowserTabState {
    *  did-start-loading / successful did-navigate. Additive/optional —
    *  null/absent = no error. */
   lastError?: { code: string; description: string; url: string } | null;
+  /** Slice-2 (premium browser): identity of the agent that opened this tab. Set
+   *  once at createTab time from the trusted API layer (resolved from the agent
+   *  registry — never the agent's own tool args). Drives the "Opened by <title>"
+   *  tab tooltip + audit attribution (Slice 3). Additive/optional — absent for
+   *  human-opened tabs. */
+  openedByAgentId?: string;
+  openedByAgentTitle?: string;
+  /** Slice-2: authoritative attention model. SET once (with a fresh
+   *  `lastAttentionAt` stamp) when an agent opens/raises this tab; the renderer
+   *  flashes the tab briefly and clears its local attention on select. Main does
+   *  NOT loop or re-pulse — `lastAttentionAt` only advances on a new open/raise,
+   *  so the renderer can tell a fresh attention event from an unrelated tab-state
+   *  push. Additive/optional — missing = no attention. */
+  needsHumanAttention?: boolean;
+  lastAttentionAt?: number;
 }
 
 // ── Overhaul (WP0) shared shapes ─────────────────────────────────────────────

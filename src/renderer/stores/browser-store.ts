@@ -64,6 +64,18 @@ export interface BrowserTabState {
    *  error panel. NEVER page content — only code/description/url shell strings.
    *  Cleared (null) on the next load start / successful navigation. Additive. */
   lastError?: { code: string; description: string; url: string } | null;
+  /** Slice-2 (premium browser): identity of the agent that opened this tab —
+   *  drives the "Opened by <title>" tab tooltip. Additive/optional — absent for
+   *  human-opened tabs. */
+  openedByAgentId?: string;
+  openedByAgentTitle?: string;
+  /** Slice-2: authoritative attention model. Main SETS this once (with a fresh
+   *  `lastAttentionAt`) when an agent opens/raises the tab; the renderer flashes
+   *  the tab briefly and clears its LOCAL attention on select. `lastAttentionAt`
+   *  only advances on a new open/raise, so the store distinguishes a fresh
+   *  attention event from an unrelated tab-state push. Additive/optional. */
+  needsHumanAttention?: boolean;
+  lastAttentionAt?: number;
 }
 
 export interface BrowserBounds {
@@ -599,14 +611,24 @@ export const useBrowserStore = create<BrowserStoreState>((set, get) => ({
         ? s.tabs.map((t) => (t.tabId === incoming.tabId ? { ...t, ...incoming } : t))
         : [...s.tabs, incoming];
 
-      // Agent-attention flash (plan §4 UX): a tab we didn't create locally on
-      // the agent partition, or the Phase-2 openedByAgent flag turning on.
-      const agentArrival =
+      // Agent-attention flash (Slice-2 authoritative model): a tab we didn't
+      // create locally on the agent partition, the Phase-2 openedByAgent flag
+      // turning on, OR main re-raising attention on a KNOWN tab (a fresh
+      // `lastAttentionAt` stamp on `needsHumanAttention`). Keying the re-raise off
+      // the advancing timestamp — not the steady `needsHumanAttention` bit — means
+      // an unrelated tab-state push (loading/title) after the human has selected
+      // the tab never re-flashes it: main sets attention ONCE, the renderer clears
+      // its local mark on select, and the same stamp is ignored thereafter.
+      const attentionRaised =
         (!known && (incoming.partition === 'agent' || Boolean(incoming.openedByAgent))) ||
-        (Boolean(incoming.openedByAgent) && !prev?.openedByAgent);
+        (Boolean(incoming.openedByAgent) && !prev?.openedByAgent) ||
+        (known &&
+          Boolean(incoming.needsHumanAttention) &&
+          incoming.lastAttentionAt !== undefined &&
+          incoming.lastAttentionAt !== prev?.lastAttentionAt);
 
       let { attentionTabIds, paneAttention, activeTabId } = s;
-      if (agentArrival) {
+      if (attentionRaised) {
         attentionTabIds = { ...attentionTabIds, [incoming.tabId]: true };
         const dash = useDashboardStore.getState();
         // Agent browser activity must NEVER auto-open or switch the view — that

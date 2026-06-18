@@ -214,13 +214,19 @@ export default function BrowserTabStrip() {
 
   const tabCard = (tab: OrderedTab['tab']): Omit<TabHoverCardProps, 'x' | 'y'> => {
     const handed = Boolean(handedTabIds[tab.tabId]);
+    // Slice-2: surface the opening agent's identity as the tab's tooltip line
+    // ("Opened by <agentTitle>"). Applies to a forHuman open too (partition
+    // 'user' but agent-attributed), so it is checked before the partition fallback.
+    const openedBy = tab.openedByAgentTitle;
     const status = tab.loading
       ? { icon: <Icons.Loader2 className="w-3 h-3 animate-spin" />, text: 'Loading…' }
       : handed
         ? { icon: <Icons.Bot className="w-3 h-3" />, text: 'Agent driving this tab', className: 'text-accent-orange' }
-        : tab.partition === 'agent'
-          ? { icon: <Icons.Bot className="w-3 h-3" />, text: 'Agent tab', className: 'text-accent-orange' }
-          : null;
+        : openedBy
+          ? { icon: <Icons.Bot className="w-3 h-3" />, text: `Opened by ${openedBy}`, className: 'text-accent-orange' }
+          : tab.partition === 'agent'
+            ? { icon: <Icons.Bot className="w-3 h-3" />, text: 'Agent tab', className: 'text-accent-orange' }
+            : null;
     return {
       icon: <TabIcon tab={tab} />,
       title: tabLabel(tab),
@@ -265,7 +271,7 @@ export default function BrowserTabStrip() {
         data-partition={tab.partition}
         className={`group browser-tab text-[12px] cursor-pointer ${pinned ? 'browser-tab-pinned' : ''} ${
           active ? 'browser-tab-active' : ''
-        } ${attention ? 'animate-pulse ring-1 ring-accent-orange' : ''} ${
+        } ${attention ? 'browser-tab-attention' : ''} ${
           draggingId === tab.tabId ? 'opacity-50' : ''
         }`}
       >
