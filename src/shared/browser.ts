@@ -189,6 +189,9 @@ export interface HistoryEntry {
   title: string;
   visitedAt: number;
   visitCount: number;
+  /** Slice-8: cached page favicon URL (user-partition only). Null/absent for
+   *  legacy rows recorded before the column existed. */
+  favicon?: string | null;
 }
 
 /** Query options for historyList. */
@@ -430,6 +433,9 @@ export const BROWSER_CHANNELS = {
   historyDelete: 'browser:history-delete',
   /** () */
   historyClear: 'browser:history-clear',
+  /** Slice-8: (limit?) → HistoryEntry[] — most-visited user sites
+   *  (visit_count DESC, visited_at DESC). Consumed by the NTP (Slice-9). */
+  historyTopSites: 'browser:history-top-sites',
 
   // ── Website-access policy (plans/website-allowlist-simplification.md) ────────
   // ONE agent allowlist. Enforcement is keyed SOLELY to the Agent Actions toggle

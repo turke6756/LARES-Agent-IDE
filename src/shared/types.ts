@@ -820,6 +820,8 @@ export interface IpcApi {
     historyList: (query?: HistoryQuery) => Promise<HistoryEntry[]>;
     historyDelete: (id: string) => Promise<void>;
     historyClear: () => Promise<void>;
+    /** Slice-8: most-visited user sites (consumed by the NTP in Slice-9). */
+    historyTopSites: (limit?: number) => Promise<HistoryEntry[]>;
     // Event subscriptions (main → renderer); each returns an unsubscribe fn.
     onTabsSnapshot: (callback: (entries: BrowserTabSnapshotEntry[]) => void) => () => void;
     onShortcutCommand: (

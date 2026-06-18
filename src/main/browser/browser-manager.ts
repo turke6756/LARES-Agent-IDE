@@ -87,6 +87,7 @@ import {
   listHistory,
   recordVisit,
   searchHistoryRanked,
+  topSites,
 } from './history-store';
 import { buildContextMenuTemplate } from './context-menu';
 import {
@@ -1852,6 +1853,9 @@ export class BrowserManager {
     wc.on('page-title-updated', push);
     wc.on('page-favicon-updated', (_e, favicons) => {
       this.tabFavicons.set(tab.id, favicons[0]);
+      // Slice-8: favicons usually resolve after did-navigate, so persist the
+      // freshly-cached icon onto the existing user-partition history row.
+      this.recordVisitIfUser(tab, wc.getURL());
       push();
     });
 
@@ -2014,7 +2018,9 @@ export class BrowserManager {
     if (tab.partition !== 'user') return;
     if (!url || url === 'about:blank') return;
     if (!decideNavigation(url, 'user').allow) return;
-    recordVisit(url, tab.view.webContents.getTitle());
+    // Slice-8: persist the latest cached favicon alongside the visit (COALESCE
+    // in the store keeps a prior favicon when this event carries none).
+    recordVisit(url, tab.view.webContents.getTitle(), this.tabFavicons.get(tab.id) ?? null);
   }
 
   /** Route a mapped shortcut. Structural chords act in main; UI-reaction chords
@@ -2230,6 +2236,12 @@ export class BrowserManager {
 
   historyClear(): void {
     clearHistory();
+  }
+
+  /** Slice-8: most-visited user sites for the NTP top-sites grid (Slice-9).
+   *  USER-PARTITION ONLY by construction (agent visits are never recorded). */
+  historyTopSites(limit?: number): HistoryEntry[] {
+    return topSites(limit ?? 8);
   }
 
   // ── WP7 — tab management (main authoritative for order/pin/closed stack) ──

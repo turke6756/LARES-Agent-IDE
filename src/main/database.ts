@@ -275,6 +275,27 @@ export function initDatabase(): void {
     CREATE INDEX IF NOT EXISTS idx_history_visited
       ON browser_history(visited_at DESC)
   `);
+  // Slice-8 (premium browser) — history upgrade. Cache the visited page's
+  // favicon (USER-PARTITION ONLY by construction; agent navigations never reach
+  // this table) via the house guarded-ALTER idiom (legacy rows read NULL).
+  try { db.exec(`ALTER TABLE browser_history ADD COLUMN favicon TEXT`); } catch { /* column already exists */ }
+  // Top-sites (visit_count DESC, visited_at DESC) drives the NTP (Slice-9) and
+  // the omnibox frequency rank; index the leading frequency key.
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_history_visit_count
+      ON browser_history(visit_count DESC, visited_at DESC)
+  `);
+  // Title/URL search (listHistory + omnibox LIKE) — substring LIKE can't use a
+  // plain B-tree, so back it with a small case-insensitive FTS-free index pair
+  // that at least covers ordered prefix scans and keeps the planner honest.
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_history_title
+      ON browser_history(title)
+  `);
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_history_url
+      ON browser_history(url)
+  `);
 
   // ── Website-access policy tables (plans/website-allowlist-simplification.md) ─
   // ONE human-curated agent allowlist for the embedded browser. Stored in the

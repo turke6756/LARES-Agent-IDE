@@ -218,6 +218,7 @@ const api: IpcApi = {
     historyList: (query) => ipcRenderer.invoke(BROWSER_CHANNELS.historyList, query),
     historyDelete: (id) => ipcRenderer.invoke(BROWSER_CHANNELS.historyDelete, id),
     historyClear: () => ipcRenderer.invoke(BROWSER_CHANNELS.historyClear),
+    historyTopSites: (limit) => ipcRenderer.invoke(BROWSER_CHANNELS.historyTopSites, limit),
     onTabsSnapshot: (callback) => {
       const listener = (_event: any, entries: BrowserTabSnapshotEntry[]) => callback(entries);
       ipcRenderer.on(BROWSER_CHANNELS.tabsSnapshot, listener);

@@ -862,6 +862,26 @@ test('Slice-7: editing a bookmark title preserves its id and sort order', () => 
   assert.equal(persisted!.sortOrder, first.sortOrder, 'persisted sort order unchanged');
 });
 
+// ── Slice-8: history M9 persistence boundary ──────────────────────────────────
+
+test('Slice-8: agent-partition navigations are NEVER recorded in history (M9)', () => {
+  const { mgr } = makeManager();
+  // Wire the real nav handlers on a user tab and an agent tab, then drive each
+  // to an otherwise-allowable https URL. Only the USER visit may reach history —
+  // the agent URL must never be persisted (cross-cutting rule #1).
+  const userTab = injectTab(mgr, { partition: 'user', url: 'https://slice8-user.example/page', title: 'User Page' });
+  priv<void>(mgr, 'wireViewEvents')(userTab);
+  const agentTab = injectTab(mgr, { partition: 'agent', url: 'https://slice8-agent.example/secret', title: 'Agent Secret' });
+  priv<void>(mgr, 'wireViewEvents')(agentTab);
+
+  userTab.view.webContents.emit('did-navigate', {}, 'https://slice8-user.example/page');
+  agentTab.view.webContents.emit('did-navigate', {}, 'https://slice8-agent.example/secret');
+
+  const urls = mgr.historyList().map((e) => e.url);
+  assert.ok(urls.includes('https://slice8-user.example/page'), 'user-partition visit recorded');
+  assert.ok(!urls.some((u) => u.includes('slice8-agent.example')), 'agent-partition visit must never appear');
+});
+
 // ── Run ──────────────────────────────────────────────────────────────────────
 
 (async () => {

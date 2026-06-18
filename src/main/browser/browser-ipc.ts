@@ -112,6 +112,9 @@ export function registerBrowserIpc(manager: BrowserManager): void {
   );
   ipcMain.handle(BROWSER_CHANNELS.historyDelete, (_e, id: string) => manager.historyDelete(id));
   ipcMain.handle(BROWSER_CHANNELS.historyClear, () => manager.historyClear());
+  ipcMain.handle(BROWSER_CHANNELS.historyTopSites, (_e, limit?: number) =>
+    manager.historyTopSites(limit),
+  );
 
   // ── Slice-3: denial toasts + live Activity/Audit drawer ────────────────────
   // TRUSTED CHROME ONLY. auditRecent primes the drawer with the JSONL tail; the

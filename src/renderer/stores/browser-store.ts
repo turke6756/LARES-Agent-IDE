@@ -173,6 +173,8 @@ export interface HistoryEntry {
   title: string;
   visitedAt: number;
   visitCount: number;
+  /** Slice-8: cached favicon URL (null/absent for legacy rows). */
+  favicon?: string | null;
 }
 
 export interface HistoryQuery {
@@ -224,6 +226,8 @@ export interface BrowserApi {
   historyList(query?: HistoryQuery): Promise<HistoryEntry[]>;
   historyDelete(id: string): unknown;
   historyClear(): unknown;
+  /** Slice-8: most-visited user sites (consumed by the NTP in Slice-9). */
+  historyTopSites(limit?: number): Promise<HistoryEntry[]>;
   onTabsSnapshot(cb: (entries: BrowserTabSnapshotEntry[]) => void): () => void;
   onShortcutCommand(cb: (shortcut: BrowserShortcut, ctx: { tabId: string }) => void): () => void;
   onFoundInPage(cb: (result: BrowserFindResult) => void): () => void;
@@ -470,7 +474,8 @@ interface BrowserStoreState {
   historyViewOpen: boolean;
   openHistory: () => void;
   closeHistory: () => void;
-  fetchHistory: (query?: string) => Promise<HistoryEntry[]>;
+  /** Slice-8: paginated fetch — pass {query, limit, offset} for infinite scroll. */
+  fetchHistory: (opts?: { query?: string; limit?: number; offset?: number }) => Promise<HistoryEntry[]>;
   deleteHistory: (id: string) => void;
   clearHistory: () => void;
 
@@ -932,11 +937,15 @@ export const useBrowserStore = create<BrowserStoreState>((set, get) => ({
   openHistory: () => set({ historyViewOpen: true }),
   closeHistory: () => set({ historyViewOpen: false }),
 
-  fetchHistory: async (query) => {
+  fetchHistory: async (opts) => {
     const api = getBrowserApi();
     if (!api) return [];
     try {
-      const rows = await api.historyList(query ? { query } : undefined);
+      const q: HistoryQuery = {};
+      if (opts?.query) q.query = opts.query;
+      if (opts?.limit !== undefined) q.limit = opts.limit;
+      if (opts?.offset !== undefined) q.offset = opts.offset;
+      const rows = await api.historyList(Object.keys(q).length ? q : undefined);
       return Array.isArray(rows) ? rows : [];
     } catch (err) {
       console.error('browser.historyList failed:', err);

@@ -20,6 +20,7 @@ function rowToHistoryEntry(row: any): HistoryEntry {
     title: row.title ?? '',
     visitedAt: row.visited_at,
     visitCount: row.visit_count,
+    favicon: row.favicon ?? null,
   };
 }
 
@@ -27,20 +28,22 @@ function rowToHistoryEntry(row: any): HistoryEntry {
  *  visit_count, refresh visited_at, and update the title (titles can change
  *  between visits / resolve after navigation). Otherwise insert a new row with
  *  visit_count = 1. */
-export function recordVisit(url: string, title: string): void {
+export function recordVisit(url: string, title: string, favicon?: string | null): void {
   const db = getDb();
   const now = Date.now();
   const existing = db
     .prepare('SELECT id FROM browser_history WHERE url = ?')
     .get(url) as { id: string } | undefined;
   if (existing) {
+    // Keep a known favicon when this visit has none (COALESCE keeps the old one
+    // rather than blanking it on a favicon-less navigation event).
     db.prepare(
-      'UPDATE browser_history SET visit_count = visit_count + 1, visited_at = ?, title = ? WHERE id = ?'
-    ).run(now, title, existing.id);
+      'UPDATE browser_history SET visit_count = visit_count + 1, visited_at = ?, title = ?, favicon = COALESCE(?, favicon) WHERE id = ?'
+    ).run(now, title, favicon ?? null, existing.id);
   } else {
     db.prepare(
-      'INSERT INTO browser_history (id, url, title, visited_at, visit_count) VALUES (?, ?, ?, ?, 1)'
-    ).run(uuidv4(), url, title, now);
+      'INSERT INTO browser_history (id, url, title, visited_at, visit_count, favicon) VALUES (?, ?, ?, ?, 1, ?)'
+    ).run(uuidv4(), url, title, now, favicon ?? null);
   }
 }
 
@@ -81,6 +84,19 @@ export function searchHistoryRanked(query: string, limit = 30): HistoryEntry[] {
       'SELECT * FROM browser_history WHERE title LIKE ? OR url LIKE ? ORDER BY visit_count DESC, visited_at DESC LIMIT ?',
     )
     .all(like, like, limit)
+    .map(rowToHistoryEntry);
+}
+
+/** Slice-8 (premium browser): the most-visited user-partition sites, ordered by
+ *  FREQUENCY (visit_count DESC) then RECENCY (visited_at DESC). Consumed by the
+ *  NTP top-sites grid (Slice-9). USER-PARTITION ONLY by construction — agent
+ *  navigations are never written to this table. */
+export function topSites(limit = 8): HistoryEntry[] {
+  return getDb()
+    .prepare(
+      'SELECT * FROM browser_history ORDER BY visit_count DESC, visited_at DESC LIMIT ?',
+    )
+    .all(limit)
     .map(rowToHistoryEntry);
 }
 
