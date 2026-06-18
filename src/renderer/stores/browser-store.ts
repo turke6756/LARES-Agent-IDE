@@ -7,7 +7,9 @@ import type {
   AccessRule,
   AccessRuleInput,
   BrowserAuditEntry,
+  OmniboxSuggestion,
 } from '../../shared/browser';
+import { resolveBrowserInput } from '../../shared/browser-input';
 // Slice-3: the PURE policy module (no Electron) is the single source of truth for
 // denial copy/remediation — shared by the toast + drawer + this store's dedupe.
 import { denialCopyForOutcome, type DenialCode } from '../../main/browser/browser-policy';
@@ -21,7 +23,9 @@ export type {
   AccessRule,
   AccessRuleInput,
   BrowserAuditEntry,
+  OmniboxSuggestion,
 };
+export { resolveBrowserInput };
 
 // ── Frozen WP1-A IPC contract, renderer-local mirror ─────────────────────────
 // `window.api` is typed as IpcApi in src/shared/types.ts; WP1-A extends it with
@@ -199,6 +203,8 @@ export interface BrowserApi {
   bookmarkAdd(input: { title: string; url: string }): Promise<Bookmark>;
   bookmarkRemove(id: string): unknown;
   bookmarkReorder(orderedIds: string[]): unknown;
+  /** Slice-6: ranked omnibox suggestions (USER-PARTITION only). */
+  omniboxSuggest(query: string): Promise<OmniboxSuggestion[]>;
   /** USER-PARTITION ONLY. */
   historyList(query?: HistoryQuery): Promise<HistoryEntry[]>;
   historyDelete(id: string): unknown;
@@ -308,6 +314,16 @@ export function normalizeAddressInput(raw: string): string | null {
   return `https://${input}`;
 }
 
+// Slice-6: turn a main-side navigation rejection into a short inline message for
+// the address bar. Main throws `navigation denied: <reason>` (M6 scheme/SSRF
+// gate); the IPC wraps it, so we tease the reason back out when present.
+export function navErrorMessage(err: unknown): string {
+  const raw = err instanceof Error ? err.message : String(err);
+  const m = raw.match(/navigation denied:\s*(.+?)\s*$/i);
+  if (m) return `Can't open this address — ${m[1]}`;
+  return "Can't open this address.";
+}
+
 // ── Website-access rule matching (pure — advisory UI gating only) ────────────
 // Mirrors the §4 matchesRule semantics so the tab-strip "Hand to agent" item
 // can grey itself out when the committed origin is NOT an allow-signed-in agent
@@ -355,6 +371,13 @@ export function agentSignedInRuleForUrl(url: string, rules: AccessRule[]): Acces
 // Find-in-page debounce — module-level so closeFind() can cancel a pending run.
 const FIND_DEBOUNCE_MS = 180;
 let findDebounceTimer: number | null = null;
+
+// Slice-6 omnibox debounce (~80ms). Module-level so clearOmnibox can cancel a
+// pending fetch, and so a stale in-flight response can be discarded: each fetch
+// bumps a token and only the latest applies (keystrokes can outpace the round-trip).
+const OMNIBOX_DEBOUNCE_MS = 80;
+let omniboxDebounceTimer: number | null = null;
+let omniboxRequestToken = 0;
 
 function openRequestUrl(req: BrowserOpenRequest): string | null {
   if (typeof req === 'string') return req || null;
@@ -437,6 +460,19 @@ interface BrowserStoreState {
   openFind: () => void;
   closeFind: () => void;
   runFind: (text: string, opts?: { forward?: boolean; findNext?: boolean }) => void;
+
+  // ── Slice-6: omnibox suggestions ───────────────────────────────────────────
+  // The AddressBar dropdown reads these. `omniboxActiveIndex` of -1 means "no row
+  // highlighted" — Enter then resolves the raw typed input. fetchOmnibox is
+  // debounced (~80ms) and discards stale responses. `navError` surfaces a
+  // navigation rejection inline in the bar (set by navigate(); cleared on edit).
+  omniboxResults: OmniboxSuggestion[];
+  omniboxActiveIndex: number;
+  navError: string | null;
+  fetchOmnibox: (query: string) => void;
+  clearOmnibox: () => void;
+  setOmniboxActiveIndex: (index: number) => void;
+  clearNavError: () => void;
 
   // Zoom — zoomFactor echoes back via the existing onTabState payload.
   setZoom: (tabId: string, factor: number) => void;
@@ -555,6 +591,9 @@ export const useBrowserStore = create<BrowserStoreState>((set, get) => ({
   historyViewOpen: false,
   findOpen: false,
   findState: { activeMatchOrdinal: 0, matches: 0 },
+  omniboxResults: [],
+  omniboxActiveIndex: -1,
+  navError: null,
   snapshot: [],
   groupCollapsed: { agent: true, user: false },
   openGroupId: null,
@@ -672,13 +711,29 @@ export const useBrowserStore = create<BrowserStoreState>((set, get) => ({
   },
 
   navigate: (tabId, rawInput) => {
-    const url = normalizeAddressInput(rawInput);
-    if (!url) return;
+    // Slice-6: resolve through the SHARED resolver (url-vs-search + default
+    // scheme), the same one the AddressBar/NTP use — no duplicated normalization.
+    const resolved = resolveBrowserInput(rawInput);
+    if (!resolved.display) return; // empty input
+    const url = resolved.url;
+    get().clearNavError();
+    let result: unknown;
     try {
-      getBrowserApi()?.navigate(tabId, url);
+      result = getBrowserApi()?.navigate(tabId, url);
     } catch (err) {
-      console.error('browser.navigate failed:', err);
+      set({ navError: navErrorMessage(err) });
       return;
+    }
+    // The IPC is an invoke() promise; a main-side M6 denial rejects it. Surface
+    // that inline (Slice-6) rather than only console.error, and undo the
+    // optimistic loading state since navigation never started.
+    if (result && typeof (result as Promise<unknown>).then === 'function') {
+      void (result as Promise<unknown>).catch((err) => {
+        set((s) => ({
+          navError: navErrorMessage(err),
+          tabs: s.tabs.map((t) => (t.tabId === tabId ? { ...t, loading: false } : t)),
+        }));
+      });
     }
     // Optimistic; onTabState is the source of truth and will correct us.
     set((s) => ({
@@ -916,6 +971,54 @@ export const useBrowserStore = create<BrowserStoreState>((set, get) => ({
       }
     }, FIND_DEBOUNCE_MS) as unknown as number;
   },
+
+  // ── Slice-6: omnibox suggestions ───────────────────────────────────────────
+  fetchOmnibox: (query) => {
+    if (omniboxDebounceTimer !== null) clearTimeout(omniboxDebounceTimer);
+    const q = query.trim();
+    if (!q) {
+      get().clearOmnibox();
+      return;
+    }
+    const token = ++omniboxRequestToken;
+    omniboxDebounceTimer = (typeof window !== 'undefined' ? window.setTimeout : setTimeout)(
+      () => {
+        omniboxDebounceTimer = null;
+        const api = getBrowserApi();
+        if (!api?.omniboxSuggest) return;
+        void api
+          .omniboxSuggest(q)
+          .then((results) => {
+            // Discard a stale response: a newer keystroke already superseded it.
+            if (token !== omniboxRequestToken) return;
+            set({
+              omniboxResults: Array.isArray(results) ? results : [],
+              // Reset the highlight to "raw input" on every fresh result set so a
+              // stale index never points past the new list.
+              omniboxActiveIndex: -1,
+            });
+          })
+          .catch((err) => {
+            console.error('browser.omniboxSuggest failed:', err);
+          });
+      },
+      OMNIBOX_DEBOUNCE_MS,
+    ) as unknown as number;
+  },
+
+  clearOmnibox: () => {
+    if (omniboxDebounceTimer !== null) {
+      clearTimeout(omniboxDebounceTimer);
+      omniboxDebounceTimer = null;
+    }
+    // Invalidate any in-flight response so it can't repopulate after close.
+    omniboxRequestToken++;
+    set({ omniboxResults: [], omniboxActiveIndex: -1 });
+  },
+
+  setOmniboxActiveIndex: (index) => set({ omniboxActiveIndex: index }),
+
+  clearNavError: () => set((s) => (s.navError === null ? s : { navError: null })),
 
   // ── Zoom (zoomFactor arrives back via onTabState — no extra plumbing) ──────
   setZoom: (tabId, factor) => {

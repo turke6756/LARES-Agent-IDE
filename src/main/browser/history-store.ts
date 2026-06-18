@@ -67,6 +67,23 @@ export function listHistory(q: { query?: string; limit?: number; offset?: number
     .map(rowToHistoryEntry);
 }
 
+/** Slice-6 (omnibox): history rows matching `query` (title OR url LIKE),
+ *  ranked by FREQUENCY (visit_count DESC) then RECENCY (visited_at DESC) — the
+ *  ordering the omnibox suggester wants, distinct from listHistory's pure
+ *  newest-first. An empty query returns nothing (the omnibox only queries when
+ *  the user has typed something). USER-PARTITION ONLY by construction. */
+export function searchHistoryRanked(query: string, limit = 30): HistoryEntry[] {
+  const q = query.trim();
+  if (!q) return [];
+  const like = `%${q}%`;
+  return getDb()
+    .prepare(
+      'SELECT * FROM browser_history WHERE title LIKE ? OR url LIKE ? ORDER BY visit_count DESC, visited_at DESC LIMIT ?',
+    )
+    .all(like, like, limit)
+    .map(rowToHistoryEntry);
+}
+
 export function deleteHistory(id: string): void {
   getDb().prepare('DELETE FROM browser_history WHERE id = ?').run(id);
 }

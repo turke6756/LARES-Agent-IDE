@@ -3,7 +3,7 @@ import * as Icons from 'lucide-react';
 import {
   useBrowserStore,
   getBrowserApi,
-  normalizeAddressInput,
+  resolveBrowserInput,
   type Bookmark,
   type HistoryEntry,
 } from '../../stores/browser-store';
@@ -25,24 +25,6 @@ import {
 interface Props {
   /** Wired by the host to store.navigate(activeTabId, url). */
   onNavigate: (url: string) => void;
-}
-
-/**
- * Decide what a submitted query means. URL-shaped input reuses the shared
- * normalizeAddressInput (the same normalizer the address bar uses); anything
- * else becomes a web search. Either way the result is an http(s) URL that the
- * caller hands to store.navigate, where the M6 gate has final say.
- */
-function resolveTarget(raw: string): string | null {
-  const input = raw.trim();
-  if (!input) return null;
-  const looksLikeUrl =
-    /^[a-z][a-z0-9+.-]*:\/\//i.test(input) || // explicit scheme
-    input.startsWith('//') || // protocol-relative
-    /^localhost([:/]|$)/i.test(input) ||
-    (!/\s/.test(input) && /\.[a-z]{2,}/i.test(input)); // host.tld, no spaces
-  if (looksLikeUrl) return normalizeAddressInput(input);
-  return `https://www.google.com/search?q=${encodeURIComponent(input)}`;
 }
 
 function hostLabel(url: string): string {
@@ -93,9 +75,11 @@ export default function NewTabPage({ onNavigate }: Props) {
   }, []);
 
   const submit = () => {
-    const target = resolveTarget(query);
-    if (!target) return;
-    onNavigate(target);
+    // Shared resolver (Slice-6): URL-shaped input → http(s) URL, free text →
+    // web search. The M6 gate downstream of onNavigate has final say.
+    const resolved = resolveBrowserInput(query);
+    if (!resolved.display) return;
+    onNavigate(resolved.url);
     setQuery('');
   };
 
@@ -108,7 +92,7 @@ export default function NewTabPage({ onNavigate }: Props) {
           <span className="text-[15px] font-semibold tracking-wide">New Tab</span>
         </div>
 
-        {/* Search / URL box — reuses normalizeAddressInput via resolveTarget. */}
+        {/* Search / URL box — uses the shared resolveBrowserInput resolver. */}
         <form
           className="w-full max-w-xl"
           onSubmit={(e) => {

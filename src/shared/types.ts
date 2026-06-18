@@ -17,6 +17,7 @@ import type {
   BrowserTabState,
   HistoryEntry,
   HistoryQuery,
+  OmniboxSuggestion,
 } from './browser';
 
 export type PathType = 'windows' | 'wsl';
@@ -810,6 +811,8 @@ export interface IpcApi {
     bookmarkAdd: (input: { title: string; url: string }) => Promise<Bookmark>;
     bookmarkRemove: (id: string) => Promise<void>;
     bookmarkReorder: (orderedIds: string[]) => Promise<void>;
+    // Omnibox suggestions (Slice-6) — TRUSTED CHROME ONLY, USER-PARTITION sources.
+    omniboxSuggest: (query: string) => Promise<OmniboxSuggestion[]>;
     // History (WP4) — USER-PARTITION ONLY.
     historyList: (query?: HistoryQuery) => Promise<HistoryEntry[]>;
     historyDelete: (id: string) => Promise<void>;

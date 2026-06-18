@@ -56,6 +56,7 @@ import {
   type BrowserTabState,
   type HistoryEntry,
   type HistoryQuery,
+  type OmniboxSuggestion,
 } from '../../shared/browser';
 import {
   deleteBookmark,
@@ -83,8 +84,14 @@ import {
   deleteHistory,
   listHistory,
   recordVisit,
+  searchHistoryRanked,
 } from './history-store';
 import { buildContextMenuTemplate } from './context-menu';
+import {
+  configureOmniboxSources,
+  suggest as omniboxSuggestRanked,
+  type OmniboxOpenTab,
+} from './omnibox-suggest';
 
 /** Clamp helper for zoom factor (and any other bounded numeric). */
 function clamp(value: number, lo: number, hi: number): number {
@@ -447,6 +454,44 @@ export class BrowserManager {
     // M4 hookup: register into WP0's webcontents-guard seam so the global
     // invariant guard recognizes pane views as deliberately managed.
     setManagedWebContentsCheck((wc) => this.isManaged(wc));
+
+    // Slice-6 omnibox: wire the suggester's USER-PARTITION sources. The provider
+    // feeds ONLY user tabs (the suggester independently drops non-user tabs too,
+    // defense-in-depth) plus the persisted user-partition bookmark/history
+    // stores. The history source uses an indexed LIKE ranked by frequency.
+    configureOmniboxSources((query) => ({
+      openTabs: this.omniboxOpenTabs(),
+      bookmarks: listBookmarks(),
+      history: searchHistoryRanked(query, 30),
+    }));
+  }
+
+  /** Slice-6: snapshot of the OPEN USER tabs for the omnibox (switch-to-tab
+   *  source). Agent tabs are excluded here — their URLs must never reach the
+   *  trusted-chrome omnibox (cross-cutting rule #1). The suggester then scopes
+   *  these to the requested workspace and re-checks the partition. */
+  private omniboxOpenTabs(): OmniboxOpenTab[] {
+    const out: OmniboxOpenTab[] = [];
+    for (const tab of this.tabs.values()) {
+      if (tab.partition !== 'user') continue;
+      const url = tab.view.webContents.getURL();
+      if (!url) continue;
+      out.push({
+        tabId: tab.id,
+        url,
+        title: tab.view.webContents.getTitle(),
+        partition: 'user',
+        workspaceId: tab.workspaceId,
+      });
+    }
+    return out;
+  }
+
+  /** Slice-6: ranked omnibox suggestions for the human's CURRENT workspace.
+   *  Trusted-chrome only — never callable from agent tools. */
+  omniboxSuggest(query: string): OmniboxSuggestion[] {
+    if (typeof query !== 'string') return [];
+    return omniboxSuggestRanked(query, this.currentWorkspaceId);
   }
 
   /** M2 + M5 + M7 + Chrome presentation (G1 fail ladder), per partition session. */

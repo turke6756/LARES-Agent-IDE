@@ -178,6 +178,22 @@ export interface HistoryQuery {
   offset?: number;
 }
 
+/** Slice-6 (premium browser): one ranked omnibox suggestion row. Computed in
+ *  main by `suggest()` (src/main/browser/omnibox-suggest.ts) over USER-PARTITION
+ *  sources ONLY — open visible user tabs, bookmarks, history — plus the trailing
+ *  search + direct-URL fallback. Agent-partition URLs are NEVER surfaced here.
+ *  `display` is the scheme-stripped completion string (drives inline completion);
+ *  `url` is the full target handed to navigate/createTab (the M6 gate has final
+ *  say); `score` is the rank key (higher = first). Additive contract — returned
+ *  by the omniboxSuggest invoke channel. */
+export interface OmniboxSuggestion {
+  kind: 'tab' | 'bookmark' | 'history' | 'search' | 'url';
+  title: string;
+  url: string;
+  display: string;
+  score: number;
+}
+
 /** Slice-3 (premium browser): one row of the action-audit feed surfaced to the
  *  trusted-chrome Activity/Audit drawer + denial toasts. Mirrors the durable
  *  JSONL `AuditEntry` (src/main/browser/action-audit.ts) MINUS argsHash, which
@@ -376,6 +392,13 @@ export const BROWSER_CHANNELS = {
   bookmarkReorder: 'browser:bookmark-reorder',
   /** event main→renderer (Bookmark[]) */
   bookmarksChanged: 'browser:bookmarks-changed',
+
+  // ── Slice-6: real omnibox (shared resolver + suggestions) ──────────────────
+  // TRUSTED CHROME ONLY. Ranked + de-duped suggestions over USER-PARTITION
+  // sources (open visible user tabs, bookmarks, history) + the trailing
+  // search/direct-URL fallback. Agent-partition URLs are never surfaced.
+  /** (query: string) → OmniboxSuggestion[] (ranked, capped) */
+  omniboxSuggest: 'browser:omnibox-suggest',
 
   // History — USER-PARTITION ONLY (agent navigations never recorded/listed).
   /** ({query?,limit?,offset?}) → HistoryEntry[] */

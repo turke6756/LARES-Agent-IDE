@@ -212,6 +212,7 @@ const api: IpcApi = {
     bookmarkRemove: (id) => ipcRenderer.invoke(BROWSER_CHANNELS.bookmarkRemove, id),
     bookmarkReorder: (orderedIds) =>
       ipcRenderer.invoke(BROWSER_CHANNELS.bookmarkReorder, orderedIds),
+    omniboxSuggest: (query) => ipcRenderer.invoke(BROWSER_CHANNELS.omniboxSuggest, query),
     historyList: (query) => ipcRenderer.invoke(BROWSER_CHANNELS.historyList, query),
     historyDelete: (id) => ipcRenderer.invoke(BROWSER_CHANNELS.historyDelete, id),
     historyClear: () => ipcRenderer.invoke(BROWSER_CHANNELS.historyClear),

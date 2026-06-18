@@ -95,6 +95,12 @@ export function registerBrowserIpc(manager: BrowserManager): void {
     manager.bookmarkReorder(orderedIds),
   );
 
+  // Omnibox suggestions (Slice-6) — TRUSTED CHROME ONLY. USER-PARTITION ranked
+  // + de-duped suggestions; agent URLs are never surfaced (manager-side guard).
+  ipcMain.handle(BROWSER_CHANNELS.omniboxSuggest, (_e, query: string) =>
+    manager.omniboxSuggest(query),
+  );
+
   // History (WP4) — USER-PARTITION ONLY.
   ipcMain.handle(BROWSER_CHANNELS.historyList, (_e, query?: HistoryQuery) =>
     manager.historyList(query),
