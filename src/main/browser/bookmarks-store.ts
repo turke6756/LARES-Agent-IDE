@@ -12,7 +12,7 @@
 
 import { v4 as uuidv4 } from 'uuid';
 import { getDb } from '../database';
-import { Bookmark } from '../../shared/browser';
+import { Bookmark, BookmarkPatch } from '../../shared/browser';
 
 function rowToBookmark(row: any): Bookmark {
   return {
@@ -21,6 +21,10 @@ function rowToBookmark(row: any): Bookmark {
     url: row.url,
     createdAt: row.created_at,
     sortOrder: row.sort_order,
+    // Slice-7 additive columns (NULL on legacy rows → undefined/null).
+    favicon: row.favicon ?? undefined,
+    folder: row.folder ?? null,
+    updatedAt: row.updated_at ?? undefined,
   };
 }
 
@@ -33,8 +37,15 @@ export function listBookmarks(): Bookmark[] {
 }
 
 /** Insert a bookmark at the end of the list. Generates the id, stamps
- *  created_at = Date.now(), and assigns sort_order = max(existing) + 1. */
-export function insertBookmark(input: { title: string; url: string }): Bookmark {
+ *  created_at = updated_at = Date.now(), and assigns sort_order = max(existing) + 1.
+ *  Slice-7: optionally records the active USER tab's favicon and a one-level
+ *  folder (the manager supplies the favicon; it never persists an agent one). */
+export function insertBookmark(input: {
+  title: string;
+  url: string;
+  favicon?: string;
+  folder?: string | null;
+}): Bookmark {
   const db = getDb();
   const id = uuidv4();
   const createdAt = Date.now();
@@ -42,10 +53,38 @@ export function insertBookmark(input: { title: string; url: string }): Bookmark 
     .prepare('SELECT COALESCE(MAX(sort_order), -1) AS max FROM browser_bookmarks')
     .get() as { max: number };
   const sortOrder = max + 1;
+  const favicon = input.favicon ?? null;
+  const folder = input.folder ?? null;
   db.prepare(
-    'INSERT INTO browser_bookmarks (id, title, url, created_at, sort_order) VALUES (?, ?, ?, ?, ?)'
-  ).run(id, input.title, input.url, createdAt, sortOrder);
-  return { id, title: input.title, url: input.url, createdAt, sortOrder };
+    'INSERT INTO browser_bookmarks (id, title, url, created_at, sort_order, favicon, folder, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+  ).run(id, input.title, input.url, createdAt, sortOrder, favicon, folder, createdAt);
+  return {
+    id,
+    title: input.title,
+    url: input.url,
+    createdAt,
+    sortOrder,
+    favicon: input.favicon,
+    folder,
+    updatedAt: createdAt,
+  };
+}
+
+/** Slice-7: edit a bookmark's title / favicon / folder. PRESERVES id, url, and
+ *  sort_order — only the patched fields (plus updated_at) change. Throws if the
+ *  id is unknown. Returns the post-edit row. */
+export function updateBookmark(id: string, patch: BookmarkPatch): Bookmark {
+  const db = getDb();
+  const row = db.prepare('SELECT * FROM browser_bookmarks WHERE id = ?').get(id) as any;
+  if (!row) throw new Error(`bookmark not found: ${id}`);
+  const title = patch.title !== undefined ? patch.title : row.title;
+  const favicon = patch.favicon !== undefined ? patch.favicon : (row.favicon ?? null);
+  const folder = patch.folder !== undefined ? patch.folder : (row.folder ?? null);
+  const updatedAt = Date.now();
+  db.prepare(
+    'UPDATE browser_bookmarks SET title = ?, favicon = ?, folder = ?, updated_at = ? WHERE id = ?'
+  ).run(title, favicon ?? null, folder ?? null, updatedAt, id);
+  return rowToBookmark({ ...row, title, favicon, folder, updated_at: updatedAt });
 }
 
 export function deleteBookmark(id: string): void {

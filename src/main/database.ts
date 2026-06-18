@@ -253,6 +253,14 @@ export function initDatabase(): void {
       sort_order  INTEGER NOT NULL
     )
   `);
+  // Slice-7 (premium browser) — bookmarks become a real manager: cache the
+  // active USER tab's favicon at add time, support ONE level of folders, and
+  // track an edit timestamp. Additive nullable columns via the house guarded
+  // ALTER idiom (try/catch = idempotent; legacy rows read NULL = top-level,
+  // no favicon, never edited).
+  try { db.exec(`ALTER TABLE browser_bookmarks ADD COLUMN favicon TEXT`); } catch { /* column already exists */ }
+  try { db.exec(`ALTER TABLE browser_bookmarks ADD COLUMN folder TEXT`); } catch { /* column already exists */ }
+  try { db.exec(`ALTER TABLE browser_bookmarks ADD COLUMN updated_at INTEGER`); } catch { /* column already exists */ }
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS browser_history (

@@ -6,6 +6,7 @@ import type {
   AccessRule,
   AccessRuleInput,
   Bookmark,
+  BookmarkPatch,
   BrowserAuditEntry,
   BrowserBounds,
   BrowserContextMenuParams,
@@ -810,6 +811,8 @@ export interface IpcApi {
     bookmarkList: () => Promise<Bookmark[]>;
     bookmarkAdd: (input: { title: string; url: string }) => Promise<Bookmark>;
     bookmarkRemove: (id: string) => Promise<void>;
+    // Slice-7 — edit title/favicon/folder; preserves id + sort order.
+    bookmarkUpdate: (id: string, patch: BookmarkPatch) => Promise<Bookmark>;
     bookmarkReorder: (orderedIds: string[]) => Promise<void>;
     // Omnibox suggestions (Slice-6) — TRUSTED CHROME ONLY, USER-PARTITION sources.
     omniboxSuggest: (query: string) => Promise<OmniboxSuggestion[]>;

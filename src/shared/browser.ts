@@ -159,6 +159,26 @@ export interface Bookmark {
   url: string;
   createdAt: number;
   sortOrder: number;
+  /** Slice-7 (premium browser): cached favicon URL of the active USER tab at
+   *  add time. NEVER an agent-partition favicon (cross-cutting rule #1 —
+   *  bookmarkAdd rejects agent tabs and only records a user tab's favicon).
+   *  Additive/optional — absent on legacy rows. */
+  favicon?: string;
+  /** Slice-7: ONE-level folder name this bookmark lives in. null/absent =
+   *  top-level (rendered directly on the bookmarks bar). Additive/optional. */
+  folder?: string | null;
+  /** Slice-7: epoch-ms of the last updateBookmark edit; absent on legacy rows
+   *  never edited. id + sortOrder are preserved across edits. */
+  updatedAt?: number;
+}
+
+/** Slice-7: additive patch for bookmarkUpdate. id + url + sortOrder are NOT
+ *  patchable — an edit preserves a bookmark's identity and bar position. Only
+ *  the display title, the cached favicon, and the (one-level) folder move. */
+export interface BookmarkPatch {
+  title?: string;
+  favicon?: string | null;
+  folder?: string | null;
 }
 
 /** A persisted history visit. USER-PARTITION ONLY — agent navigations are
@@ -388,6 +408,9 @@ export const BROWSER_CHANNELS = {
   bookmarkAdd: 'browser:bookmark-add',
   /** (id) */
   bookmarkRemove: 'browser:bookmark-remove',
+  /** Slice-7: (id, patch: BookmarkPatch) → Bookmark — edit title/favicon/folder.
+   *  Preserves id + sort order. USER-PARTITION ONLY by contract. */
+  bookmarkUpdate: 'browser:bookmark-update',
   /** (orderedIds[]) */
   bookmarkReorder: 'browser:bookmark-reorder',
   /** event main→renderer (Bookmark[]) */

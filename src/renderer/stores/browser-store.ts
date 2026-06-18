@@ -151,6 +151,19 @@ export interface Bookmark {
   url: string;
   createdAt: number;
   sortOrder: number;
+  /** Slice-7: cached favicon URL captured at add time (user tab only). */
+  favicon?: string;
+  /** Slice-7: one-level folder name; null/absent = top-level bar chip. */
+  folder?: string | null;
+  /** Slice-7: epoch-ms of the last edit; absent if never edited. */
+  updatedAt?: number;
+}
+
+/** Slice-7: patch for an in-place bookmark edit (preserves id + sort order). */
+export interface BookmarkPatch {
+  title?: string;
+  favicon?: string | null;
+  folder?: string | null;
 }
 
 /** USER-PARTITION ONLY (agent navigations never recorded/listed). */
@@ -202,6 +215,8 @@ export interface BrowserApi {
   bookmarkList(): Promise<Bookmark[]>;
   bookmarkAdd(input: { title: string; url: string }): Promise<Bookmark>;
   bookmarkRemove(id: string): unknown;
+  /** Slice-7: edit title/favicon/folder; preserves id + sort order. */
+  bookmarkUpdate(id: string, patch: BookmarkPatch): Promise<Bookmark>;
   bookmarkReorder(orderedIds: string[]): unknown;
   /** Slice-6: ranked omnibox suggestions (USER-PARTITION only). */
   omniboxSuggest(query: string): Promise<OmniboxSuggestion[]>;
@@ -441,8 +456,13 @@ interface BrowserStoreState {
   /** StarMenu watches this; the 'bookmark' shortcut bumps it to pop the editor. */
   bookmarkTick: number;
   loadBookmarks: () => Promise<void>;
-  addBookmark: (input: { title: string; url: string }) => Promise<void>;
+  /** Resolves to the created bookmark (or undefined on failure) so callers can
+   *  chain a follow-up edit — e.g. undo re-adds then restores the folder. */
+  addBookmark: (input: { title: string; url: string }) => Promise<Bookmark | undefined>;
   removeBookmark: (id: string) => void;
+  /** Slice-7: edit a bookmark in place (title/favicon/folder); id + sort order
+   *  are preserved. The onBookmarksChanged event refreshes the slice. */
+  updateBookmark: (id: string, patch: BookmarkPatch) => Promise<void>;
   reorderBookmark: (orderedIds: string[]) => void;
   toggleBookmarkBar: () => void;
 
@@ -867,13 +887,16 @@ export const useBrowserStore = create<BrowserStoreState>((set, get) => ({
 
   addBookmark: async ({ title, url }) => {
     const api = getBrowserApi();
-    if (!api) return;
+    if (!api) return undefined;
     try {
       // onBookmarksChanged is the source of truth and will refresh the slice;
-      // the manager validates the scheme (defense-in-depth) and stores it.
-      await api.bookmarkAdd({ title, url });
+      // the manager validates the scheme (defense-in-depth) + rejects agent
+      // URLs and stores the active user tab's favicon. Returning the created
+      // bookmark lets undo restore its folder via a follow-up updateBookmark.
+      return await api.bookmarkAdd({ title, url });
     } catch (err) {
       console.error('browser.bookmarkAdd failed:', err);
+      return undefined;
     }
   },
 
@@ -882,6 +905,16 @@ export const useBrowserStore = create<BrowserStoreState>((set, get) => ({
       getBrowserApi()?.bookmarkRemove(id);
     } catch (err) {
       console.error('browser.bookmarkRemove failed:', err);
+    }
+  },
+
+  updateBookmark: async (id, patch) => {
+    const api = getBrowserApi();
+    if (!api) return;
+    try {
+      await api.bookmarkUpdate(id, patch);
+    } catch (err) {
+      console.error('browser.bookmarkUpdate failed:', err);
     }
   },
 

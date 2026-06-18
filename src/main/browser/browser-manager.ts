@@ -46,6 +46,7 @@ import {
   type AccessRule,
   type AccessRuleInput,
   type Bookmark,
+  type BookmarkPatch,
   type BrowserAuditEntry,
   type BrowserBounds,
   type BrowserContextMenuParams,
@@ -63,6 +64,7 @@ import {
   insertBookmark,
   listBookmarks,
   reorderBookmarks,
+  updateBookmark,
 } from './bookmarks-store';
 import {
   decideRequest,
@@ -2173,7 +2175,31 @@ export class BrowserManager {
     if (!decideNavigation(input.url, 'user').allow) {
       throw new Error(`bookmark rejected: ${input.url} is not an allowed http/https URL`);
     }
-    const bookmark = insertBookmark(input);
+    // Slice-7 — USER-PARTITION ONLY (cross-cutting rule #1). Resolve the open
+    // tab(s) whose live committed URL is the one being bookmarked. If the URL is
+    // open ONLY in an agent-partition tab, REJECT here — even if the renderer
+    // (or a compromised one) calls this IPC directly. A user tab match wins and
+    // contributes its favicon; a URL open in no tab (e.g. from history) is fine.
+    const matches = [...this.tabs.values()].filter(
+      (t) => t.view.webContents.getURL() === input.url,
+    );
+    const userMatch = matches.find((t) => t.partition === 'user');
+    if (!userMatch && matches.some((t) => t.partition === 'agent')) {
+      throw new Error('bookmark rejected: agent-partition URLs are never bookmarkable');
+    }
+    // Persist the active USER tab's favicon (never an agent favicon).
+    const favicon = userMatch ? this.tabFavicons.get(userMatch.id) : undefined;
+    const bookmark = insertBookmark({ title: input.title, url: input.url, favicon });
+    this.emitBookmarksChanged();
+    return bookmark;
+  }
+
+  /** Slice-7: edit a bookmark's title/favicon/folder. Preserves id + sort order
+   *  (bookmarks-store never touches them). USER-PARTITION ONLY by contract — the
+   *  edited row was created through bookmarkAdd, which already rejected agent
+   *  URLs; the patch carries no URL, so no origin can be smuggled in. */
+  bookmarkUpdate(id: string, patch: BookmarkPatch): Bookmark {
+    const bookmark = updateBookmark(id, patch);
     this.emitBookmarksChanged();
     return bookmark;
   }

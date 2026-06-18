@@ -11,6 +11,7 @@ import {
   BROWSER_CHANNELS,
   type AccessRequestDecision,
   type AccessRuleInput,
+  type BookmarkPatch,
   type BrowserBounds,
   type BrowserContextMenuParams,
   type BrowserCreateTabOptions,
@@ -91,6 +92,10 @@ export function registerBrowserIpc(manager: BrowserManager): void {
     manager.bookmarkAdd(input),
   );
   ipcMain.handle(BROWSER_CHANNELS.bookmarkRemove, (_e, id: string) => manager.bookmarkRemove(id));
+  // Slice-7 — edit title/favicon/folder; preserves id + sort order.
+  ipcMain.handle(BROWSER_CHANNELS.bookmarkUpdate, (_e, id: string, patch: BookmarkPatch) =>
+    manager.bookmarkUpdate(id, patch),
+  );
   ipcMain.handle(BROWSER_CHANNELS.bookmarkReorder, (_e, orderedIds: string[]) =>
     manager.bookmarkReorder(orderedIds),
   );

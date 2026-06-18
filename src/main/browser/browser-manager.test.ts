@@ -815,6 +815,53 @@ test('sendTabState always carries secureState (from the live URL) and lastError 
   assert.equal(insecure.secureState, 'insecure', 'http → insecure');
 });
 
+// ── Slice-7: bookmarks as a real manager (USER-PARTITION ONLY) ───────────────
+// The two trust/behaviour proofs the plan requires: an agent-partition URL is
+// never bookmarkable (cross-cutting rule #1, enforced in main even on a direct
+// IPC call), and an in-place title edit preserves the row's id + sort order.
+
+test('Slice-7: bookmarking a URL open ONLY in an agent tab is REJECTED in main', () => {
+  const { mgr } = makeManager();
+  const url = 'https://agent-only.slice7.example/secret';
+  // The URL is live in an agent-partition tab and NO user tab. Even a direct
+  // IPC call (compromised renderer) must not persist an agent-partition URL.
+  injectTab(mgr, { partition: 'agent', url });
+  assert.throws(
+    () => mgr.bookmarkAdd({ title: 'nope', url }),
+    /agent-partition URLs are never bookmarkable/,
+    'agent-partition URL is refused in main',
+  );
+  assert.equal(
+    mgr.bookmarkList().some((b) => b.url === url),
+    false,
+    'nothing was persisted for the agent URL',
+  );
+});
+
+test('Slice-7: editing a bookmark title preserves its id and sort order', () => {
+  const { mgr } = makeManager();
+  // No tab carries these URLs, so bookmarkAdd persists them (no favicon) with
+  // ascending sort_order in creation order.
+  const first = mgr.bookmarkAdd({ title: 'First', url: 'https://first.slice7.example/' });
+  const second = mgr.bookmarkAdd({ title: 'Second', url: 'https://second.slice7.example/' });
+
+  const edited = mgr.bookmarkUpdate(first.id, { title: 'First (renamed)' });
+
+  assert.equal(edited.id, first.id, 'id preserved across the edit');
+  assert.equal(edited.sortOrder, first.sortOrder, 'sort order preserved across the edit');
+  assert.equal(edited.title, 'First (renamed)', 'title updated');
+  assert.equal(edited.url, first.url, 'url is never touched by a title edit');
+
+  // The persisted ordering is unchanged: first still precedes second.
+  const list = mgr.bookmarkList();
+  const ids = list.map((b) => b.id);
+  assert.ok(ids.indexOf(first.id) < ids.indexOf(second.id), 'first still sorts before second');
+  const persisted = list.find((b) => b.id === first.id);
+  assert.ok(persisted, 'the edited bookmark is still present');
+  assert.equal(persisted!.title, 'First (renamed)', 'the rename persisted');
+  assert.equal(persisted!.sortOrder, first.sortOrder, 'persisted sort order unchanged');
+});
+
 // ── Run ──────────────────────────────────────────────────────────────────────
 
 (async () => {
