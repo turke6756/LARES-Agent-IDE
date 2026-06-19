@@ -22,6 +22,7 @@ import {
   TMUX_OPTION_MAX_AGE_MS, TMUX_OPTION_LAUNCH_SKEW_MS, STATUS_POLL_INTERVAL_MS,
   RESEARCH_STORE_README_MD, RESEARCH_WRITE_GUARD_MJS, RESEARCHER_CLAUDE_SETTINGS_JSON,
   RESEARCHER_AGENT_MD,
+  PERSONA_CREATE_PERSONA_SKILL, PERSONA_READ_COMMENTS_SKILL, SCRIPT_READ_COMMENTS_PY,
 } from '../../shared/constants';
 import {
   writeScaffoldMap as writeSharedScaffoldMap,
@@ -39,6 +40,7 @@ import {
 // ../scaffold-writer (D1 extraction); re-export them so import sites are unchanged.
 export { SCAFFOLD_SIDECAR_REL, SCAFFOLD_LOCK_REL, sha256Hex, normalizeManagedKey };
 export type { ScaffoldFile };
+import { ensurePersonaScaffold, applyPersonaLaneToLaunchInput } from '../persona-scanner';
 
 import { getApiToken } from '../security/api-auth';
 import { EventBridge, EventBridgeDeps } from './event-bridge';
@@ -1144,6 +1146,22 @@ export class AgentSupervisor extends EventEmitter {
     // second supervisor no longer throws. getSupervisorAgent() still returns the
     // first/primary one for callers that need a single representative.
 
+    let workDir = resolvedInput.workingDirectory || workspace.path;
+    const pathType = detectPathType(workDir);
+    // Convert UNC WSL paths (\\wsl.localhost\...) to Linux paths (/home/...)
+    if (pathType === 'wsl' && workDir.startsWith('\\\\')) {
+      workDir = uncToWslPath(workDir);
+    }
+
+    // #18 — a persona may declare exactly one native lane in persona.json. Stamp
+    // it onto the lane flags (and force provider=claude for researcher) BEFORE the
+    // researcher guard + provider/command derivation, so a researcher-persona gets
+    // the same claude-only validation and command normalization a native
+    // researcher gets. Conflicts throw; matching flags are a no-op.
+    if (resolvedInput.persona) {
+      applyPersonaLaneToLaunchInput(resolvedInput, workDir, pathType);
+    }
+
     // Researcher role-lane guards (browser-parity-and-capability-isolation §0).
     if (resolvedInput.isResearcher) {
       // D-2: researcher is Claude-only v1 — its native tool boundary
@@ -1159,12 +1177,6 @@ export class AgentSupervisor extends EventEmitter {
       // there is no single-researcher cap. Each launch is an independent agent.
     }
 
-    let workDir = resolvedInput.workingDirectory || workspace.path;
-    const pathType = detectPathType(workDir);
-    // Convert UNC WSL paths (\\wsl.localhost\...) to Linux paths (/home/...)
-    if (pathType === 'wsl' && workDir.startsWith('\\\\')) {
-      workDir = uncToWslPath(workDir);
-    }
     const provider = resolvedInput.provider || 'claude';
     const defaultCmd = PROVIDER_COMMANDS[provider][pathType];
     // The "worker lane": hook-based status + .dashboard/workers/<provider>/ cwd +
@@ -1347,8 +1359,19 @@ export class AgentSupervisor extends EventEmitter {
 
     addEvent(agent.id, 'launched');
 
-    // Auto-create .dashboard/supervisor/ scaffold if this is a supervisor launch
-    if (resolvedInput.isSupervisor) {
+    // Auto-create the right scaffold for this launch. Persona FIRST: a persona
+    // gets the shared workspace scripts (so its mandatory status hooks can reach
+    // .dashboard/scripts/dashboard-status.mjs) + its own version-migrated kit, and
+    // never triggers a native-lane scaffold — even when it ALSO declares a native
+    // lane flag (the lane only governs MCP/tool injection, not the cwd/scaffold).
+    if (resolvedInput.persona) {
+      // Mandatory status hooks need .dashboard/scripts/dashboard-status.mjs (two-up
+      // target) + read-comments.py — write the shared workspace scripts even if no
+      // worker/supervisor ever launched here. Then refresh the persona's own kit
+      // (upgrade reaches existing personas incl. mr-job-hunt-agent).
+      this.writeScaffoldMap(workDir, AgentSupervisor.WORKSPACE_SCRIPT_FILES, pathType);
+      ensurePersonaScaffold(workDir, pathType, resolvedInput.persona);
+    } else if (resolvedInput.isSupervisor) {
       this.ensureSupervisorScaffold(workDir, pathType);
     } else if (isResearcher) {
       // Researcher role-lane (STEP 5): scaffold .dashboard/researcher/ (persona
@@ -1356,7 +1379,7 @@ export class AgentSupervisor extends EventEmitter {
       // AND the trust-tiered research store (ensureResearcherScaffold calls
       // ensureResearchStoreScaffold). Idempotent + version-migrated.
       this.ensureResearcherScaffold(workDir, pathType);
-    } else if (isWorkerLane && !resolvedInput.persona) {
+    } else if (isWorkerLane) {
       // Class IV (plans/class-iv-worker-hook-scaffold.md): worker agent
       // (supervised or plain) — scaffold the per-provider template + shared
       // hook script so turn-boundary status hooks fire.
@@ -1445,6 +1468,10 @@ export class AgentSupervisor extends EventEmitter {
       previousHashes: { 1: SUPERVISOR_RUN_ORCHESTRATION_SKILL_V1_HASH, 2: SUPERVISOR_RUN_ORCHESTRATION_SKILL_V2_HASH },
     },
     [`.dashboard/supervisor/.claude/skills/orchestration-spike/SKILL.md`]:            { content: SUPERVISOR_ORCHESTRATION_SPIKE_SKILL, version: 1 },
+    // Persona kit (§1.4) — the two default skills ship into every native lane too
+    // so the supervisor/researcher/worker can guide persona creation + read comments.
+    [`.dashboard/supervisor/.claude/skills/create-persona/SKILL.md`]:                 { content: PERSONA_CREATE_PERSONA_SKILL, version: 1 },
+    [`.dashboard/supervisor/.claude/skills/read-comments/SKILL.md`]:                  { content: PERSONA_READ_COMMENTS_SKILL, version: 1 },
     // NOTE: .dashboard/supervisor/memory/MEMORY.md is deliberately NOT managed
     // here — it is seeded once via seedSupervisorMemoryIfAbsent (seed-once
     // contract, parallels worker behavioral.md). Keeping it in this map would
@@ -1485,6 +1512,12 @@ export class AgentSupervisor extends EventEmitter {
         6: sha256Hex(DASHBOARD_STATUS_SCRIPT_MJS_V6),
       },
     },
+    // Persona kit (§1.4) — one shared copy of the read-comments helper script.
+    // The read-comments skill references the absolute
+    // <workspace-root>/.dashboard/scripts/read-comments.py, so no per-lane copy
+    // is needed. Written alongside dashboard-status.mjs on any workspace-script
+    // scaffold pass (incl. the persona-launch branch in launchAgent).
+    [`.dashboard/scripts/read-comments.py`]: { content: SCRIPT_READ_COMMENTS_PY, version: 1, executable: true },
   };
 
   /** Class IV — Claude worker template files. Shared cwd for N supervised
@@ -1513,6 +1546,9 @@ export class AgentSupervisor extends EventEmitter {
         4: sha256Hex(WORKER_CLAUDE_SETTINGS_JSON_V4),
       },
     },
+    // Persona kit (§1.4) — default skills for the Claude worker lane.
+    [`.dashboard/workers/claude/.claude/skills/create-persona/SKILL.md`]: { content: PERSONA_CREATE_PERSONA_SKILL, version: 1 },
+    [`.dashboard/workers/claude/.claude/skills/read-comments/SKILL.md`]:  { content: PERSONA_READ_COMMENTS_SKILL, version: 1 },
   };
 
   /** WP-G — Research store skeleton (plans/groupthink/browser-parity-and-research-store.md).
@@ -1536,6 +1572,9 @@ export class AgentSupervisor extends EventEmitter {
     [`.dashboard/researcher/CLAUDE.md`]:                         { content: RESEARCHER_AGENT_MD, version: 2, previousHashes: { 1: RESEARCHER_AGENT_MD_V1_HASH } },
     [`.dashboard/researcher/.claude/settings.json`]:             { content: RESEARCHER_CLAUDE_SETTINGS_JSON, version: 1 },
     [`.dashboard/researcher/scripts/research-write-guard.mjs`]:  { content: RESEARCH_WRITE_GUARD_MJS, version: 2, previousHashes: { 1: RESEARCH_WRITE_GUARD_MJS_V1_HASH }, executable: true },
+    // Persona kit (§1.4) — default skills for the researcher lane.
+    [`.dashboard/researcher/.claude/skills/create-persona/SKILL.md`]: { content: PERSONA_CREATE_PERSONA_SKILL, version: 1 },
+    [`.dashboard/researcher/.claude/skills/read-comments/SKILL.md`]:  { content: PERSONA_READ_COMMENTS_SKILL, version: 1 },
   };
 
   /** Delegates to the shared free-function writer in ../scaffold-writer (D1

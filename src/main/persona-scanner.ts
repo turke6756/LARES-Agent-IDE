@@ -1,10 +1,131 @@
 import fs from 'fs';
 import path from 'path';
 import { execFileSync } from 'child_process';
-import type { AgentPersona, PathType } from '../shared/types';
+import type { AgentPersona, PathType, PersonaLane } from '../shared/types';
 import { SUPERVISOR_AGENT_NAME } from '../shared/constants';
+import {
+  writeScaffoldMap, scaffoldFileExists, atomicWriteScaffoldText,
+  readScaffoldText, type ScaffoldFile,
+} from './scaffold-writer';
+import {
+  WORKER_CLAUDE_SETTINGS_JSON, PERSONA_CREATE_PERSONA_SKILL,
+  PERSONA_READ_COMMENTS_SKILL, PERSONA_AGENT_MD_TEMPLATE,
+} from '../shared/constants';
 
 const VALID_NAME = /^[a-z0-9_-]+$/;
+
+// ── Persona lane sidecar (#18 / D3, D7) ──────────────────────────────
+// A persona may declare exactly ONE native lane in
+// .dashboard/agents/<name>/persona.json {"lane":"worker"}. The sidecar is
+// NEVER a member of any managed scaffold map (writeScaffoldMap can't touch it)
+// and is written only when absent, so a lane choice survives every kit upgrade.
+const VALID_PERSONA_LANES = new Set<PersonaLane>(['supervisor', 'researcher', 'worker']);
+
+export function parsePersonaLane(value: unknown): PersonaLane | undefined {
+  return (typeof value === 'string' && VALID_PERSONA_LANES.has(value as PersonaLane))
+    ? value as PersonaLane : undefined;
+}
+
+function personaJsonRel(name: string): string { return `.dashboard/agents/${name}/persona.json`; }
+
+/** Read .dashboard/agents/<name>/persona.json; invalid/malformed → undefined. */
+export function readPersonaLane(workspacePath: string, pathType: PathType, name: string): PersonaLane | undefined {
+  const raw = readScaffoldText(workspacePath, personaJsonRel(name), pathType);
+  if (raw === null) return undefined;
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object') return parsePersonaLane((parsed as any).lane);
+  } catch {
+    console.warn(`[persona] persona.json for "${name}" is unparseable JSON; treating as no lane`);
+  }
+  return undefined;
+}
+
+/** Write persona.json ONLY when absent (never overwrites the user's lane choice). */
+function writePersonaJsonIfAbsent(workspacePath: string, pathType: PathType, name: string, lane: PersonaLane): void {
+  const rel = personaJsonRel(name);
+  if (scaffoldFileExists(workspacePath, rel, pathType)) return;
+  atomicWriteScaffoldText(workspacePath, rel, JSON.stringify({ lane }, null, 2) + '\n', false, pathType);
+}
+
+function displayNameFor(name: string): string {
+  return name.charAt(0).toUpperCase() + name.slice(1).replace(/[-_]/g, ' ');
+}
+
+/** Render PERSONA_AGENT_MD_TEMPLATE deterministically: substitute the display
+ *  name and embed the role description as the identity body (or a stub when
+ *  absent). split/join avoids the `$`-replacement pitfalls of String.replace. */
+function buildPersonaClaudeMd(displayName: string, roleDescription?: string): string {
+  const roleBody = (roleDescription && roleDescription.trim())
+    ? roleDescription.trim()
+    : `<!-- Define this agent's identity and behavior here. -->`;
+  return PERSONA_AGENT_MD_TEMPLATE
+    .split('${displayName}').join(displayName)
+    .split('${roleBody}').join(roleBody);
+}
+
+/** The managed (version-migrated) per-persona kit — OPERATIONAL PLUMBING ONLY.
+ *  CLAUDE.md is intentionally NOT here (seed-once, user-owned — see D4). */
+function buildPersonaManagedFiles(name: string): Record<string, ScaffoldFile> {
+  const base = `.dashboard/agents/${name}`;
+  return {
+    [`${base}/.claude/settings.json`]:                  { content: WORKER_CLAUDE_SETTINGS_JSON, version: 1 },
+    [`${base}/.claude/skills/create-persona/SKILL.md`]: { content: PERSONA_CREATE_PERSONA_SKILL, version: 1 },
+    [`${base}/.claude/skills/read-comments/SKILL.md`]:  { content: PERSONA_READ_COMMENTS_SKILL, version: 1 },
+  };
+}
+
+/** Seed-once writer for an identity/owned file (CLAUDE.md, MEMORY.md): write the
+ *  given content ONLY when the file is absent; never overwrite an existing one. */
+function seedFileIfAbsent(workspacePath: string, pathType: PathType, rel: string, content: string): void {
+  if (scaffoldFileExists(workspacePath, rel, pathType)) return;
+  atomicWriteScaffoldText(workspacePath, rel, content, false, pathType);
+}
+
+/** Upgrade-on-launch: refresh ONLY the managed operational kit (settings.json +
+ *  skills; idempotent, version-migrated). Identity files are seed-once: CLAUDE.md
+ *  and MEMORY.md are written only if absent and never touched again. Never writes
+ *  persona.json. */
+export function ensurePersonaScaffold(workspacePath: string, pathType: PathType, name: string): void {
+  if (!VALID_NAME.test(name) || name === SUPERVISOR_AGENT_NAME) return;
+  // Operational plumbing — managed/upgraded (the dashboard ensures every persona
+  // has working hooks + the default skills).
+  writeScaffoldMap(workspacePath, buildPersonaManagedFiles(name), pathType, { logPrefix: '[persona]' });
+  // Identity — seed-once. A persona created by scaffoldPersona already has both;
+  // a hand-written legacy persona (mr-job-hunt-agent) keeps its own CLAUDE.md.
+  const base = `.dashboard/agents/${name}`;
+  seedFileIfAbsent(workspacePath, pathType, `${base}/CLAUDE.md`, buildPersonaClaudeMd(displayNameFor(name)));
+  seedFileIfAbsent(workspacePath, pathType, `${base}/memory/MEMORY.md`, `# Memory Index\n`);
+}
+
+// ── Launch-input lane mapping (#18 / D6) ─────────────────────────────
+
+function laneFromFlags(i: { isSupervisor?: boolean; isResearcher?: boolean; isWorker?: boolean; isSupervised?: boolean }): PersonaLane | undefined {
+  if (i.isSupervisor) return 'supervisor';
+  if (i.isResearcher) return 'researcher';
+  if (i.isWorker || i.isSupervised) return 'worker';
+  return undefined;
+}
+
+/** Mutate the launch input in place: stamp the persona's declared lane onto the
+ *  existing lane flags. Throws on a genuine conflict; no-op when flags already
+ *  match or when there is no declared lane. */
+export function applyPersonaLaneToLaunchInput(
+  input: { persona?: string; isSupervisor?: boolean; isResearcher?: boolean; isWorker?: boolean; isSupervised?: boolean; provider?: string },
+  workspacePath: string, pathType: PathType,
+): void {
+  if (!input.persona) return;
+  const declared = readPersonaLane(workspacePath, pathType, input.persona);
+  if (!declared) return;
+  const existing = laneFromFlags(input);
+  if (existing && existing !== declared) {
+    throw new Error(`Persona "${input.persona}" declares lane "${declared}" but the launch requested "${existing}".`);
+  }
+  if (existing === declared) return;
+  if (declared === 'supervisor') input.isSupervisor = true;
+  else if (declared === 'researcher') { input.isResearcher = true; input.isSupervised = true; input.provider = 'claude'; }
+  else if (declared === 'worker') input.isWorker = true;
+}
 
 // Custom agent personas live under .dashboard/agents/<name>/ (relocated from the
 // legacy .claude/agents/ path, which the harness gates behind an interactive
@@ -111,6 +232,7 @@ export function scanPersonas(workspacePath: string, pathType: PathType): AgentPe
           directory: dir,
           hasMemory,
           isSupervisor: name === SUPERVISOR_AGENT_NAME,
+          lane: readPersonaLane(workspacePath, pathType, name),
         });
       }
     } catch {
@@ -132,6 +254,7 @@ export function scanPersonas(workspacePath: string, pathType: PathType): AgentPe
           directory: path.join(agentsDir, entry.name),
           hasMemory: fs.existsSync(memoryPath),
           isSupervisor: entry.name === SUPERVISOR_AGENT_NAME,
+          lane: readPersonaLane(workspacePath, pathType, entry.name),
         });
       }
     } catch {
@@ -143,46 +266,38 @@ export function scanPersonas(workspacePath: string, pathType: PathType): AgentPe
 }
 
 /**
- * Create a new persona directory with minimal scaffolding under
- * .dashboard/agents/<name>/.
+ * Create a new persona under .dashboard/agents/<name>/. Writes the managed
+ * operational kit (settings.json + default skills) through the shared
+ * version-migrated scaffold writer, seed-once identity files (CLAUDE.md with the
+ * user's role body, memory/MEMORY.md), and — if a lane is declared — the
+ * write-if-absent persona.json lane sidecar (D3/D4/D7).
  */
-export function scaffoldPersona(workspacePath: string, pathType: PathType, name: string, customClaudeMd?: string): AgentPersona {
+export function scaffoldPersona(
+  workspacePath: string, pathType: PathType, name: string,
+  roleDescription?: string, lane?: PersonaLane,
+): AgentPersona {
   if (!VALID_NAME.test(name)) {
     throw new Error(`Invalid persona name "${name}". Only lowercase letters, numbers, hyphens, and underscores allowed.`);
   }
-
   if (name === SUPERVISOR_AGENT_NAME) {
     throw new Error(`Cannot create persona named "${SUPERVISOR_AGENT_NAME}" — reserved for supervisor.`);
   }
-
-  const displayName = name.charAt(0).toUpperCase() + name.slice(1).replace(/[-_]/g, ' ');
-  const claudeMd = customClaudeMd || `# ${displayName} Agent\n\n<!-- Define this agent's identity and behavior here. -->\n`;
-  const memoryMd = `# Memory Index\n`;
-
-  if (pathType === 'wsl') {
-    const dir = `${workspacePath}/.dashboard/agents/${name}`;
-    const env = { ...process.env };
-    delete env.CLAUDECODE;
-    delete env.ELECTRON_RUN_AS_NODE;
-
-    const claudeB64 = Buffer.from(claudeMd, 'utf-8').toString('base64');
-    const memoryB64 = Buffer.from(memoryMd, 'utf-8').toString('base64');
-    const cmd = [
-      `mkdir -p '${dir}/memory'`,
-      `echo '${claudeB64}' | base64 -d > '${dir}/CLAUDE.md'`,
-      `echo '${memoryB64}' | base64 -d > '${dir}/memory/MEMORY.md'`,
-    ].join(' && ');
-
-    execFileSync('wsl.exe', ['bash', '-lc', cmd], { timeout: 10000, env });
-
-    return { name, directory: dir, hasMemory: true, isSupervisor: false };
-  } else {
-    const dir = path.join(workspacePath, ...PERSONAS_REL, name);
-    const memoryDir = path.join(dir, 'memory');
-    fs.mkdirSync(memoryDir, { recursive: true });
-    fs.writeFileSync(path.join(dir, 'CLAUDE.md'), claudeMd, 'utf-8');
-    fs.writeFileSync(path.join(memoryDir, 'MEMORY.md'), memoryMd, 'utf-8');
-
-    return { name, directory: dir, hasMemory: true, isSupervisor: false };
+  // D7 — reject an invalid non-empty lane at create time (don't silently drop).
+  if (lane !== undefined && !VALID_PERSONA_LANES.has(lane)) {
+    throw new Error(`Invalid persona lane "${lane}". Must be one of supervisor | researcher | worker, or omitted.`);
   }
+
+  const base = `.dashboard/agents/${name}`;
+  // Operational plumbing — managed (atomic + version-migrated + locked).
+  writeScaffoldMap(workspacePath, buildPersonaManagedFiles(name), pathType, { logPrefix: '[persona]' });
+  // Identity — seed-once. At create the dir is fresh, so CLAUDE.md is written here
+  // with the user's role body; it is never overwritten on any later launch.
+  seedFileIfAbsent(workspacePath, pathType, `${base}/CLAUDE.md`, buildPersonaClaudeMd(displayNameFor(name), roleDescription));
+  seedFileIfAbsent(workspacePath, pathType, `${base}/memory/MEMORY.md`, `# Memory Index\n`);
+  if (lane) writePersonaJsonIfAbsent(workspacePath, pathType, name, lane);
+
+  const dir = pathType === 'wsl'
+    ? `${workspacePath}/.dashboard/agents/${name}`
+    : path.join(workspacePath, ...PERSONAS_REL, name);
+  return { name, directory: dir, hasMemory: true, isSupervisor: false, lane: readPersonaLane(workspacePath, pathType, name) };
 }

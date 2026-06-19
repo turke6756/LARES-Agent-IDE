@@ -165,7 +165,7 @@ const api: IpcApi = {
   },
   personas: {
     list: (workspacePath, pathType) => ipcRenderer.invoke('persona:list', workspacePath, pathType),
-    create: (workspacePath, pathType, name, customClaudeMd?) => ipcRenderer.invoke('persona:create', workspacePath, pathType, name, customClaudeMd),
+    create: (workspacePath, pathType, name, roleDescription?, lane?) => ipcRenderer.invoke('persona:create', workspacePath, pathType, name, roleDescription, lane),
   },
   notebooks: {
     ensureServer: () => ipcRenderer.invoke('notebook:ensure-server'),

@@ -2099,3 +2099,392 @@ export const RESEARCHER_CLAUDE_SETTINGS_JSON = `{
   }
 }
 `;
+
+// ── Persona kit (LOCKED DESIGN — plans/persona-productization-impl.md §1.4) ──
+// The two default SKILL.md and the shared read-comments.py, lifted VERBATIM from
+// .dashboard/staging/ into bundled constants so the persona scaffolder can ship
+// them into every persona's kit (skills) + the shared scripts dir.
+
+export const PERSONA_CREATE_PERSONA_SKILL = `---
+name: create-persona
+description: Help the user design and set up a NEW AgentDashboard persona (a reusable custom agent). Use when the user says things like "create a new agent", "make me a persona", "set up a new dashboard agent", "I want an agent that does X", or asks how personas/agent tools/the .dashboard folder structure work. Walks the user through choosing the agent's purpose and tools, then constructs the persona folder so it's launchable from the dashboard's Launch Agent dropdown.
+---
+
+# Create a Persona
+
+A **persona** is a reusable custom agent in the AgentDashboard: a folder with its own
+identity, memory, status hooks, and skills. Once it exists, it shows up in the **Launch
+Agent** dropdown under "— your custom agents —" and can be launched into its own context
+any time. This skill helps you design one *with* the user and set it up correctly.
+
+Your job is to be a **guide**, not just a scaffolder: most users don't know what tools an
+agent can have or how the \`.dashboard\` folder is laid out. Explain the choices, recommend
+sensible defaults, then build it.
+
+## Where personas live
+
+\`\`\`
+<workspace>/.dashboard/
+  ├── supervisor/        ← reserved lane (built-in, do not treat as a custom persona)
+  ├── researcher/        ← reserved lane (built-in)
+  ├── workers/           ← reserved lane (built-in)
+  ├── scripts/           ← shared helper scripts (dashboard-status.mjs, read-comments.py)
+  └── agents/
+        └── <name>/      ← ★ CUSTOM PERSONAS GO HERE (this is what the dropdown discovers)
+\`\`\`
+
+The Launch dropdown's scanner reads **\`.dashboard/agents/<name>/\`** and lists any folder
+with a root \`CLAUDE.md\`. The three reserved lanes live one level up and are NOT custom
+personas — never put a custom persona directly under \`.dashboard/\`; it won't be discovered.
+
+## Two flavors of persona — decide this first
+
+The single most important design question: **does this agent need to drive the dashboard
+itself** (launch/stop/message other agents), or just do its own work?
+
+- **Plain persona** — does its own work with native tools (Bash, file edits, web). Examples:
+  a note-taker, a doc reviewer, a code-writer. **Dropdown-launchable, works out of the box.**
+  This is most personas. Pick this unless the user explicitly needs orchestration.
+- **Orchestration persona** — needs the \`agent-dashboard\` MCP tools (\`launch_agent\`,
+  \`stop_agent\`, \`send_message_to_agent\`, \`list_agents\`, …) to coordinate OTHER agents.
+  These tools authenticate against the dashboard API with a token that **only exists while
+  the app is running and rotates on every restart**. A persona gets that live token **only
+  when launched on a privileged lane** (inline \`--mcp-config\` injection) — NOT from a file.
+  See "Granting orchestration tools" below; this kind of persona can't just be dropdown-launched.
+
+## The persona folder anatomy
+
+A complete persona has these files. The dashboard's native "+ New agent" flow produces them;
+if building/customizing by hand, this is the target:
+
+\`\`\`
+.dashboard/agents/<name>/
+  ├── CLAUDE.md                     identity + behavior contract (seeded from the exemplar
+  │                                 persona; this is the agent's "who am I")
+  ├── memory/MEMORY.md              persistent memory index across runs
+  └── .claude/
+        ├── settings.json           status hooks (REQUIRED — see below)
+        └── skills/                 shipped skills (create-persona, read-comments, …)
+\`\`\`
+
+- **Status hooks are the one mandatory tool-related thing.** Every dashboard agent reports
+  its state (idle / working / done) via SessionStart / UserPromptSubmit / Stop hooks in
+  \`.claude/settings.json\` that call the shared \`dashboard-status.mjs\`. Without them the
+  dashboard can't track the agent. At depth \`.dashboard/agents/<name>/\` the hook path is
+  \`\${CLAUDE_PROJECT_DIR}/../../scripts/dashboard-status.mjs\` (**two** levels up — \`../../\`,
+  not \`../\`).
+- **No \`.mcp.json\` by default.** A custom persona is born with hooks + identity + memory +
+  skills, and native tools (Bash/files/web). It does NOT get a \`.mcp.json\`. (A baked
+  \`.mcp.json\` would make orchestration tools *appear* but fail to authenticate — see below.)
+
+## The tools you can grant — inform the user, let them pick
+
+Walk the user through what the agent could do. Recommend the smallest grant that fits.
+
+| Capability | How it's granted | Notes |
+|---|---|---|
+| **Bash + file tools** (Read/Write/Edit/Grep/Glob) | native — always on | every persona has these |
+| **Web** — WebSearch / WebFetch | native | research / lookup personas |
+| **Default skills** — \`create-persona\`, \`read-comments\` | shipped into every persona | all personas |
+| **Browser** — \`browser_*\` MCP | researcher-lane tooling | scraping / web-driving personas |
+| **Orchestration** — \`launch_agent\`, \`stop_agent\`, \`send_message_to_agent\`, \`list_agents\`, \`get_context_stats\`, teams | **privileged lane launch only** (live token via inline \`--mcp-config\`) | coordinator personas; see below |
+
+## Granting orchestration tools (the important caveat)
+
+Do **not** try to grant orchestration tools by dropping an \`agent-dashboard\` server into a
+folder \`.mcp.json\`. It will not work reliably:
+
+- The dashboard's API token is minted fresh at app start and **rotates on every restart**;
+  it is never persisted to disk. A token you copy into a \`.mcp.json\` is stale the moment
+  the app restarts.
+- A persona launched from the dropdown runs on the unprivileged **legacy lane**, which gets
+  **no token injected**. The MCP server still *loads* (so the tools appear in the list), but
+  every call fails with \`Missing or invalid API token\` (a 401). Visible ≠ usable.
+
+The only mechanism that hands a persona a **live** token is a **privileged lane launch**,
+where the dashboard injects \`--mcp-config\` with the current token at launch time. In
+practice that means launching the persona with a lane flag (\`isSupervisor: true\` together
+with \`persona: <name>\`) via the dashboard API — not the plain dropdown. So:
+
+- **If the user wants a coordinator persona,** tell them it must be launched on a privileged
+  lane to get working tools, and that the plain dropdown launch will give it tools that
+  *look* present but 401. (If the dashboard later supports a per-persona lane declaration,
+  prefer that — it makes orchestration personas dropdown-launchable with a live token.)
+- **If the user just wants the agent to do its own work,** a plain persona is simpler and
+  fully dropdown-launchable. Steer here unless coordination is genuinely required.
+
+## How to create the persona
+
+**Preferred — the dashboard's native "+ New agent" flow.** Open the Launch Agent dialog →
+"+ New agent…", give the name + role. It scaffolds \`.dashboard/agents/<name>/\` with CLAUDE.md
+(from the exemplar), memory, status hooks, and the default skills. Confirm the anatomy above.
+
+**Manual / customization fallback.** To hand-build or tweak:
+
+1. **Gather requirements:** a short **name/slug** (lowercase-hyphen), the **purpose** (one or
+   two sentences → CLAUDE.md identity), and whether it needs **orchestration** (→ privileged
+   lane) or just native tools (→ plain dropdown persona).
+2. **Create the folder** \`.dashboard/agents/<name>/\` and write CLAUDE.md (start from the
+   exemplar persona, replace identity/role), \`memory/MEMORY.md\` (a "# Memory Index" stub),
+   \`.claude/settings.json\` (status hooks with \`../../scripts/dashboard-status.mjs\`), and copy
+   the default skills into \`.claude/skills/\`. Do NOT add a \`.mcp.json\`.
+3. **Don't hand-edit a dashboard-managed \`CLAUDE.md\` later** — the app may overwrite it on
+   upgrade. For durable per-persona tweaks use a sibling **\`CLAUDE.local.md\`** (auto-loaded,
+   never overwritten).
+
+## Verify it works
+
+1. Open the Launch dropdown — the persona appears under "— your custom agents —". (If not,
+   reopen the dialog or restart the app; the scanner caches the list.)
+2. Launch it; confirm it self-identifies from its CLAUDE.md.
+3. Confirm the dashboard shows its status changing (idle → working → done) — proof the hooks
+   fired.
+4. For an orchestration persona, confirm it was launched on a privileged lane, then have it
+   actually CALL a read-only tool (e.g. \`list_agents\`) and confirm it returns data, not a 401.
+
+## Gotchas
+
+- **Location:** custom personas MUST be under \`.dashboard/agents/<name>/\`. Reserved-lane
+  names (\`supervisor\`, \`researcher\`, \`workers\`) are off limits.
+- **Hook depth:** \`../../scripts/\` at \`.dashboard/agents/<name>/\`. One \`../\` too few and the
+  status hooks silently fail.
+- **Orchestration tokens rotate:** never bake an API token into a \`.mcp.json\`. Tools granted
+  that way appear but 401. Use a privileged lane launch for a live token.
+- **No nested \`.dashboard/\`:** launching a discovered persona writes nothing into its own
+  cwd. A \`.dashboard/\` appearing *inside* a persona folder is leftover junk — safe to delete.
+`;
+
+export const PERSONA_READ_COMMENTS_SKILL = `---
+name: read-comments
+description: Read the markdown-editor comments a user attached to a document. Use whenever the user refers to "the comments I made", "my comments/notes/annotations in this doc", "feedback I left", or asks you to address review notes on a file — given a file path but no inline comment text. The comments live in the AgentDashboard database, not in the file itself.
+---
+
+# Read Comments
+
+The dashboard's markdown editor lets a user select text and attach a comment. The
+normal flow is right-click → **send to agent**, but the comment data is persisted
+the moment it's made — so you can read it from a file path alone, whether or not
+the user ever right-clicked.
+
+**Comments are NOT stored in the markdown file** (no inline text, no sidecar file).
+They live in a global SQLite database keyed by file path:
+
+- Windows: \`%APPDATA%\\AgentDashboard\\dashboard.db\`
+- Linux/Mac: \`~/.config/AgentDashboard/dashboard.db\`
+
+table \`selection_comments\` → one row per comment, with the file path, line range,
+the \`quoted_text\` the user highlighted, and the \`body\` (their note).
+
+So when a user says *"look at the comments I made in this doc"* and gives you a
+path, do **not** open the \`.md\` file looking for comments — run the helper.
+
+## How to read comments
+
+A helper script ships at the workspace-shared scripts dir:
+
+\`\`\`
+<workspace-root>/.dashboard/scripts/read-comments.py
+\`\`\`
+
+Run it with the file path (use the absolute path to the document):
+
+\`\`\`bash
+python "<workspace-root>/.dashboard/scripts/read-comments.py" "<absolute-path-to-the.md>"
+\`\`\`
+
+It prints every comment with its line range, the quoted text, and the user's note,
+sorted by line number. Example output:
+
+\`\`\`
+3 comment(s) for C:\\...\\Intro_Draft_v2.md:
+
+[1] line 5  (draft/comment)
+    > Resolving this heterogeneity, rather than characterizing a mean condition
+    -- not sure what this means -- clarify what we're contrasting against
+
+[2] lines 12-14  (draft/comment)
+    > ...
+    -- tighten this paragraph
+\`\`\`
+
+### Options
+
+- \`--has "<path>"\` — exits 0 if the file has comments, 1 if not (no output). Use
+  this to silently check before deciding whether comments are relevant.
+- \`--all\` — include \`resolved\`/\`orphaned\` comments (default shows only active ones).
+- \`--json\` — machine-readable output (full schema) when you need to process the
+  comments programmatically rather than just read them.
+
+## Workflow
+
+1. Get the document's absolute path (the user usually gives it, or it's the file
+   under discussion).
+2. Run \`read-comments.py "<path>"\`.
+3. Read the comments and act on them — they are the user's review notes. Each
+   comment's \`quoted_text\` tells you exactly which span it refers to; the \`body\`
+   is the instruction. Address them in the file, then report what you changed.
+
+## Notes
+
+- The \`status\` field: \`draft\` = made but not yet sent, \`sent\` = already handed to
+  an agent, \`resolved\` = done. By default the script hides resolved/orphaned.
+- The DB is **global** — one database serves every workspace. Path matching is by
+  the file path stored at comment time; the script normalizes slashes/case and
+  falls back to filename match if the exact path isn't found (it warns when it does).
+- If you got here via the editor's "send to agent" flow, the comment text is
+  already in your prompt — you don't need this skill. Use it when you have only a
+  path and need to fetch the notes yourself.
+- Read-only: the script never writes to the DB. Resolving a comment is done by the
+  user in the editor, not by you.
+`;
+
+export const SCRIPT_READ_COMMENTS_PY = `#!/usr/bin/env python3
+"""Read markdown-editor comments for a file from the AgentDashboard database.
+
+The dashboard stores selection comments in a global SQLite DB, keyed by file
+path -- NOT in the markdown file itself, and NOT in a sidecar next to it. Given
+a path, this prints every comment attached to it (line range, the quoted text
+the user highlighted, and their note).
+
+Usage:
+    python read-comments.py "<path-to-file>"
+    python read-comments.py "<path-to-file>" --all      # include resolved/orphaned
+    python read-comments.py --has "<path-to-file>"      # exit 0 if comments exist, else 1 (no output)
+    python read-comments.py --json "<path-to-file>"     # machine-readable
+
+Path matching is forgiving: it normalizes slashes and case, and falls back to
+matching by filename if the exact path isn't found (with a warning).
+
+The DB is global (shared across every workspace):
+    %APPDATA%\\\\AgentDashboard\\\\dashboard.db   (Windows)
+    ~/.config/AgentDashboard/dashboard.db     (Linux/Mac)
+"""
+import argparse
+import json
+import os
+import sqlite3
+import sys
+
+# Windows consoles default to cp1252 and choke on non-latin output; force UTF-8.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+
+def db_path():
+    appdata = os.environ.get("APPDATA") or os.path.expanduser("~/.config")
+    return os.path.join(appdata, "AgentDashboard", "dashboard.db")
+
+
+def norm(p):
+    return os.path.normcase(p.replace("\\\\", "/").rstrip("/")) if p else ""
+
+
+def find_rows(con, target, include_resolved):
+    cur = con.cursor()
+    rows = cur.execute("SELECT * FROM selection_comments WHERE file_path IS NOT NULL").fetchall()
+    nt = norm(target)
+    base = os.path.basename(nt)
+    exact = [r for r in rows if norm(r["file_path"]) == nt]
+    matched = exact or [r for r in rows if os.path.basename(norm(r["file_path"])) == base]
+    if not include_resolved:
+        matched = [r for r in matched if r["status"] not in ("resolved", "orphaned")]
+    matched.sort(key=lambda r: ((r["line_start"] is None), r["line_start"] or 0, r["created_at"] or ""))
+    return matched, bool(exact)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Read AgentDashboard markdown-editor comments for a file.")
+    ap.add_argument("file")
+    ap.add_argument("--all", action="store_true", help="include resolved/orphaned comments")
+    ap.add_argument("--has", action="store_true", help="exit 0 if comments exist, 1 otherwise (no output)")
+    ap.add_argument("--json", action="store_true", help="emit JSON")
+    args = ap.parse_args()
+
+    path = db_path()
+    if not os.path.exists(path):
+        print(f"No dashboard DB at {path}", file=sys.stderr)
+        sys.exit(2)
+
+    con = sqlite3.connect(path)
+    con.row_factory = sqlite3.Row
+    rows, exact = find_rows(con, args.file, args.all)
+
+    if args.has:
+        sys.exit(0 if rows else 1)
+
+    if args.json:
+        print(json.dumps([dict(r) for r in rows], indent=2))
+        return
+
+    if not rows:
+        print(f"No comments found for: {args.file}")
+        return
+
+    if not exact:
+        print("(matched by filename, not exact path -- verify it's the right file)\\n")
+    print(f"{len(rows)} comment(s) for {args.file}:\\n")
+    for i, r in enumerate(rows, 1):
+        loc = f"line {r['line_start']}" if r["line_start"] else "no line anchor"
+        if r["line_end"] and r["line_end"] != r["line_start"]:
+            loc = f"lines {r['line_start']}-{r['line_end']}"
+        print(f"[{i}] {loc}  ({r['status']}/{r['kind']})")
+        if r["quoted_text"]:
+            q = r["quoted_text"].strip().replace("\\n", "\\n    > ")
+            print(f"    > {q}")
+        if r["body"]:
+            print(f"    -- {r['body'].strip()}")
+        print()
+
+
+if __name__ == "__main__":
+    main()
+`;
+
+// Generic per-persona CLAUDE.md exemplar (D4 — seed-once, user-owned). Modeled on
+// SUPERVISOR_AGENT_MD's reusable structure (identity header, role line, memory
+// pointer, status-hook awareness, behavioral norms) with the supervisor-specific
+// orchestration content removed. Carries two literal substitution points,
+// \${displayName} and \${roleBody}, rendered by persona-scanner.buildPersonaClaudeMd()
+// — they are NOT interpolated at definition time.
+export const PERSONA_AGENT_MD_TEMPLATE = `# \${displayName} Agent
+
+\${roleBody}
+
+## Working directory & scope
+
+You live in \`.dashboard/agents/<your-name>/\`. Your shell commands run from there by
+default — useful for editing your own identity, memory, or skills, but not for
+project work. Your workspace root is provided in your system prompt as
+\`Workspace root: <abs-path>\`. For any project-level shell command (\`git status\`,
+\`npm test\`, \`ls\`, …) **cd to that path first** (or use a tool's path flag). For
+Read / Edit / Glob, pass absolute paths — those tools do not follow a bash \`cd\`
+within a turn.
+
+## Memory
+
+Check \`./memory/MEMORY.md\` at session start for context from prior runs, and save
+durable observations there. It persists across every relaunch — it is yours to
+curate and is never overwritten by the dashboard.
+
+## Status & the dashboard
+
+The dashboard tracks you via status hooks wired in \`./.claude/settings.json\`
+(SessionStart / UserPromptSubmit / Stop → the shared \`dashboard-status.mjs\`). They
+fire automatically; you don't invoke them. When you finish a turn you go idle and
+the dashboard notices — so end turns cleanly, surface questions or decisions in
+plain text, and don't loop on busy-work just to stay alive.
+
+## Skills
+
+Skills shipped into \`./.claude/skills/\` are auto-loaded (you're launched with cwd
+here). \`create-persona\` helps you design new dashboard agents; \`read-comments\`
+fetches the markdown-editor comments a user attached to a document.
+
+## Behavioral norms
+
+- Do the work you were asked to do; keep responses focused and action-oriented.
+- When a decision is genuinely the user's to make, ask it in plain text and end
+  your turn rather than guessing.
+- Prefer the smallest change that solves the problem; match the surrounding code
+  and conventions.
+`;

@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import type { AgentPersona, AgentProvider, AgentTemplate, Workspace } from '../../../shared/types';
+import type { AgentPersona, AgentProvider, AgentTemplate, PersonaLane, Workspace } from '../../../shared/types';
 import { PROVIDER_COMMANDS, PROVIDER_META } from '../../../shared/constants';
 import { useDashboardStore } from '../../stores/dashboard-store';
 import { useBrowserSuspension } from '../browser/useBrowserSuspension';
@@ -42,6 +42,10 @@ export default function AgentLaunchDialog({ workspace, onClose }: Props) {
   const [personas, setPersonas] = useState<AgentPersona[]>([]);
   // The single "Agent type" choice. Worker is the explicit default.
   const [selectedType, setSelectedType] = useState<string>(TYPE_WORKER);
+  // #18 — optional privilege lane for a NEW persona. '' = none (native tools
+  // only). Backend reads the declared lane from persona.json at launch (D6); the
+  // renderer never spreads lane flags into launchInput.
+  const [newPersonaLane, setNewPersonaLane] = useState<PersonaLane | ''>('');
   const [savingTemplate, setSavingTemplate] = useState(false);
   const [saveTemplateName, setSaveTemplateName] = useState('');
   const [showSaveDialog, setShowSaveDialog] = useState(false);
@@ -106,6 +110,15 @@ export default function AgentLaunchDialog({ workspace, onClose }: Props) {
       setCommand(PROVIDER_COMMANDS[provider][workspace.pathType]);
     }
   }, [provider, workspace.pathType]);
+
+  // #18 — a researcher-lane persona is Claude-only (the backend forces
+  // provider=claude and would otherwise throw at launch). Force it here so the
+  // UI never offers a doomed combo.
+  useEffect(() => {
+    if (isNewAgent && newPersonaLane === 'researcher' && provider !== 'claude') {
+      setProvider('claude');
+    }
+  }, [isNewAgent, newPersonaLane, provider]);
 
   useEffect(() => {
     if (debounceRef.current) clearTimeout(debounceRef.current);
@@ -175,6 +188,7 @@ export default function AgentLaunchDialog({ workspace, onClose }: Props) {
         if (!newAgentSlug) { setLaunching(false); return; }
         await window.api.personas.create(
           workspace.path, workspace.pathType, newAgentSlug, roleDescription.trim() || undefined,
+          newPersonaLane || undefined,
         );
         launchInput = {
           ...base,
@@ -280,7 +294,7 @@ export default function AgentLaunchDialog({ workspace, onClose }: Props) {
                 <optgroup label="— your custom agents —">
                   {personas.map(p => (
                     <option key={`persona:${p.name}`} value={`persona:${p.name}`}>
-                      {p.name}{p.hasMemory ? ' (has memory)' : ''}
+                      {p.name}{p.lane ? ` (${p.lane})` : ''}{p.hasMemory ? ' (has memory)' : ''}
                     </option>
                   ))}
                 </optgroup>
@@ -363,6 +377,29 @@ export default function AgentLaunchDialog({ workspace, onClose }: Props) {
               placeholder={isNewAgent ? 'Define this agent\'s identity and behavior — this will be saved as CLAUDE.md' : 'What should this agent do?'}
             />
           </div>
+
+          {/* #18 — optional privilege lane for a NEW persona. Backend reads the
+              declared lane from persona.json at launch (D6); we only persist the
+              choice here, never spread lane flags into launchInput. */}
+          {isNewAgent && (
+            <div>
+              <label className="block text-[11px] text-gray-500 mb-1 uppercase tracking-wider">Privilege Lane</label>
+              <select
+                value={newPersonaLane}
+                onChange={(e) => setNewPersonaLane(e.target.value as PersonaLane | '')}
+                className="ui-input text-sm"
+              >
+                <option value="">None</option>
+                <option value="worker">Worker</option>
+                <option value="researcher">Researcher</option>
+                <option value="supervisor">Supervisor</option>
+              </select>
+              <div className="mt-1 text-[11px] text-gray-500">
+                Grants this persona the dashboard tools of one native lane. None = native tools only.
+                {newPersonaLane === 'researcher' && ' Researcher is Claude-only — provider forced to Claude.'}
+              </div>
+            </div>
+          )}
 
           {showWorkingDir && (
             <div>

@@ -194,11 +194,16 @@ export interface LaunchAgentInput {
   teamRole?: string;
 }
 
+/** A declarable persona lane — every value of AgentRoleLane except 'legacy'
+ *  (a declared lane can never be the no-lane default). #18 / D7. */
+export type PersonaLane = Exclude<AgentRoleLane, 'legacy'>; // 'supervisor' | 'worker' | 'researcher'
+
 export interface AgentPersona {
   name: string;          // subdirectory name, e.g. "researcher"
   directory: string;     // full path to the persona directory
   hasMemory: boolean;    // whether memory/MEMORY.md exists
   isSupervisor: boolean; // true if name matches SUPERVISOR_AGENT_NAME
+  lane?: PersonaLane;    // declared in .dashboard/agents/<name>/persona.json (#18)
 }
 
 export interface AgentTemplate {
@@ -767,7 +772,7 @@ export interface IpcApi {
   };
   personas: {
     list: (workspacePath: string, pathType: PathType) => Promise<AgentPersona[]>;
-    create: (workspacePath: string, pathType: PathType, name: string, customClaudeMd?: string) => Promise<AgentPersona>;
+    create: (workspacePath: string, pathType: PathType, name: string, roleDescription?: string, lane?: PersonaLane) => Promise<AgentPersona>;
   };
   notebooks: {
     ensureServer: () => Promise<JupyterServerInfo>;

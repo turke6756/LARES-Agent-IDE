@@ -1082,11 +1082,16 @@ export class ApiServer {
     // POST /api/personas — create persona
     if (method === 'POST' && path === '/api/personas') {
       const body = await readBody(req);
-      const { workspaceId, name, claudeMd } = JSON.parse(body);
+      const { workspaceId, name, claudeMd, roleDescription, lane } = JSON.parse(body);
       if (!workspaceId || !name) throw Object.assign(new Error('Missing workspaceId or name'), { statusCode: 400 });
       const workspace = getWorkspace(workspaceId);
       if (!workspace) throw Object.assign(new Error('Workspace not found'), { statusCode: 404 });
-      return scaffoldPersona(workspace.path, workspace.pathType, name, claudeMd);
+      // scaffoldPersona throws on an invalid lane → surface as 400.
+      try {
+        return scaffoldPersona(workspace.path, workspace.pathType, name, roleDescription ?? claudeMd, lane);
+      } catch (e) {
+        throw Object.assign(e as Error, { statusCode: (e as any).statusCode ?? 400 });
+      }
     }
 
     // ── Template routes ────────────────────────────────────────────────

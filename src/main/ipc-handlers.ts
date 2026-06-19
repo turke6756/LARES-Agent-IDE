@@ -224,7 +224,7 @@ export function registerIpcHandlers(
 
   // Persona handlers
   ipcMain.handle('persona:list', (_e, workspacePath, pathType) => scanPersonas(workspacePath, pathType));
-  ipcMain.handle('persona:create', (_e, workspacePath, pathType, name, customClaudeMd?) => scaffoldPersona(workspacePath, pathType, name, customClaudeMd));
+  ipcMain.handle('persona:create', (_e, workspacePath, pathType, name, roleDescription?, lane?) => scaffoldPersona(workspacePath, pathType, name, roleDescription, lane));
 
   // Template handlers
   ipcMain.handle('template:list', (_e, workspaceId) => listAgentTemplates(workspaceId));
