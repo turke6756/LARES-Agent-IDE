@@ -32,8 +32,12 @@ import {
   checkSignedInDrive,
   EXPOSURE_REDUCING_VERBS,
   getRuntimeActionsEnabled,
+  getAgentActionsState,
+  setAgentActionsState,
   PolicyError,
   wrapUntrusted,
+  type AgentActionsCommand,
+  type AgentActionsState,
   type BrowserToolVerb,
   type CompiledRule,
 } from './browser-policy';
@@ -55,9 +59,11 @@ import {
   type BrowserShortcut,
   type BrowserTabSnapshotEntry,
   type BrowserTabState,
+  type HandedTabInfo,
   type HistoryEntry,
   type HistoryQuery,
   type OmniboxSuggestion,
+  type SharedAgentSessions,
 } from '../../shared/browser';
 import {
   deleteBookmark,
@@ -75,8 +81,10 @@ import {
   listRequests,
   listRequestsByAgent,
   listRules,
+  listSharedSignedInOrigins,
   listSignedInOrigins,
   rowAppliesToWorkspace,
+  touchSignedInOrigin,
   updateRule,
   upsertSignedInOrigin,
   type InsertRequestInput,
@@ -480,6 +488,10 @@ export class BrowserManager {
   private sessionRestored = false;
   private sessionWriteTimer: ReturnType<typeof setTimeout> | null = null;
   private discardSweepTimer: ReturnType<typeof setInterval> | null = null;
+  /** Slice 12: fires when a time-boxed arming window elapses, so the renderer
+   *  sees the auto-flip to `disabled` even with no IPC traffic. Cleared/rescheduled
+   *  on every setAgentActionsState. */
+  private actionsExpiryTimer: ReturnType<typeof setTimeout> | null = null;
 
   // ── Website-access policy (plans/website-allowlist-simplification.md §5) ────
   /** Synchronously-readable memo of the compiled agent allowlist rules. MUST be
@@ -1009,6 +1021,42 @@ export class BrowserManager {
     this.send(BROWSER_CHANNELS.accessRequestsChanged, undefined);
   }
 
+  // ── Slice 12: armed-state agent-actions gate ───────────────────────────────
+
+  /** Full runtime armed state (post-expiry). Reading also applies a lazy expiry
+   *  flip in the policy module; we (re)sync the timer so the renderer is told. */
+  getAgentActionsState(): AgentActionsState {
+    const state = getAgentActionsState();
+    this.scheduleActionsExpiry(state);
+    return state;
+  }
+
+  /** Apply a popover command (Enable 15 min / until restart / Disable now),
+   *  (re)arm the expiry timer, broadcast the new state, and echo it back. */
+  setAgentActionsState(cmd: AgentActionsCommand): AgentActionsState {
+    const state = setAgentActionsState(cmd);
+    this.scheduleActionsExpiry(state);
+    this.send(BROWSER_CHANNELS.actionsStateChanged, state);
+    return state;
+  }
+
+  /** (Re)schedule the single auto-expiry timer. When a finite armed window is
+   *  active, fire just after it elapses to push the disabled state to the
+   *  renderer; otherwise clear any pending timer (disabled / until-restart). */
+  private scheduleActionsExpiry(state: AgentActionsState): void {
+    if (this.actionsExpiryTimer) {
+      clearTimeout(this.actionsExpiryTimer);
+      this.actionsExpiryTimer = null;
+    }
+    if (state.mode !== 'armed' || state.armedUntil === null) return;
+    const delay = Math.max(0, state.armedUntil - Date.now()) + 50;
+    this.actionsExpiryTimer = setTimeout(() => {
+      this.actionsExpiryTimer = null;
+      // Reading applies the lazy expiry flip; broadcast whatever it resolves to.
+      this.send(BROWSER_CHANNELS.actionsStateChanged, getAgentActionsState());
+    }, delay);
+  }
+
   // ── Five trusted-chrome-only authenticated-drive IPCs (§12/§14) ────────────
 
   /** Mechanism A, §12-A step 1: open a VISIBLE, quarantined agent-partition
@@ -1054,7 +1102,13 @@ export class BrowserManager {
     }
     if (tab.signinRuleId) {
       try {
-        upsertSignedInOrigin(tab.signinRuleId, new URL(url).origin, tab.workspaceId);
+        // Slice 12: stamp the session age — a successful hand-off-ready commit is
+        // both the most-recent sign-in AND a verification of the live session.
+        const now = Date.now();
+        upsertSignedInOrigin(tab.signinRuleId, new URL(url).origin, tab.workspaceId, {
+          signedInAt: now,
+          verifiedAt: now,
+        });
       } catch {
         /* unparseable — already guarded by checkSignedInDrive, defensive only */
       }
@@ -1062,6 +1116,8 @@ export class BrowserManager {
     tab.signinPending = false;
     tab.signinRuleId = undefined;
     this.sendTabState(tab);
+    // Slice 12: the session center's list just changed (a new/refreshed origin).
+    this.send(BROWSER_CHANNELS.accessChanged, undefined);
   }
 
   /** Mechanism B, §12-B: hand the human's live signed-in tab to the agent.
@@ -1093,6 +1149,30 @@ export class BrowserManager {
   async accessClearSiteSession(ruleId: string): Promise<void> {
     const rule = getRule(ruleId);
     if (rule) await this.clearAgentSiteData(rule, rule.workspaceId ?? null);
+    // Slice 12: clearing a session drops it from the "Sessions shared with
+    // agents" center — refresh the trusted chrome.
+    this.send(BROWSER_CHANNELS.accessChanged, undefined);
+  }
+
+  /** Slice 12 (handoff/session center): the "Sessions shared with agents"
+   *  snapshot for the active workspace — the live handed tabs (Mechanism B, still
+   *  drivable) plus the persisted signed-in agent origins (Mechanism A, with
+   *  session-age + stale flags). Trusted-chrome only; never reaches an agent. */
+  getSharedSessions(): SharedAgentSessions {
+    const ws = this.currentWorkspaceId;
+    const handedTabs: HandedTabInfo[] = [];
+    for (const tab of this.tabs.values()) {
+      if (!tab.handedToAgent) continue;
+      if ((tab.workspaceId ?? null) !== (ws ?? null)) continue;
+      const wc = tab.view.webContents;
+      handedTabs.push({
+        tabId: tab.id,
+        url: wc.isDestroyed() ? '' : wc.getURL(),
+        title: wc.isDestroyed() ? '' : wc.getTitle(),
+        workspaceId: tab.workspaceId ?? null,
+      });
+    }
+    return { handedTabs, signedInOrigins: listSharedSignedInOrigins(ws ?? null) };
   }
 
   /** §14 — REQUIRED revocation breadth. Clear agent-partition site data for the
@@ -1217,6 +1297,15 @@ export class BrowserManager {
     if (checkSignedInDrive(url, this.agentCtx(tab.workspaceId)).allow) return;
     this.detachAndClearHanded(tab);
     console.warn(`[browser] Mechanism-B auto-revoke (tab ${tab.id}): navigated off allow_signed_in origin`);
+    // Slice 12: surface the auto-revoke as a small trusted notification — the
+    // human handed this tab over and it just lost its driver out from under them.
+    let hostname = '';
+    try {
+      hostname = new URL(url).hostname;
+    } catch {
+      /* unparseable target — leave hostname empty */
+    }
+    this.send(BROWSER_CHANNELS.agentDrivingRevoked, { tabId: tab.id, url: url ?? '', hostname });
   }
 
   /** §12-B revocation (F3): after an access-rule mutation, drop the handoff on
@@ -1365,6 +1454,18 @@ export class BrowserManager {
       ...(agentId ? { agentId } : {}),
       ...(agentTitle ? { agentTitle } : {}),
     });
+
+    // Slice 12: every authenticated agent drive (read OR act — both funnel
+    // through here with the 'ok:authenticated' outcome) refreshes the origin's
+    // last_used_at so the session center can show "last used Nh ago". Best-effort
+    // and display-only — never gates access. Guarded against an unparseable URL.
+    if (outcome === 'ok:authenticated' && typeof url === 'string' && url) {
+      try {
+        touchSignedInOrigin(new URL(url).origin, workspaceId ?? null, Date.now());
+      } catch {
+        /* unparseable URL — nothing to touch */
+      }
+    }
   }
 
   /** Slice-3: map a durable AuditEntry → the renderer-facing BrowserAuditEntry

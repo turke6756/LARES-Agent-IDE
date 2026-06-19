@@ -6,8 +6,14 @@ import type {
   AccessRequestDecision,
   AccessRule,
   AccessRuleInput,
+  AgentActionsCommand,
+  AgentActionsState,
+  AgentDrivingRevoked,
   BrowserAuditEntry,
+  HandedTabInfo,
   OmniboxSuggestion,
+  SharedAgentSessions,
+  SignedInOrigin,
 } from '../../shared/browser';
 import { resolveBrowserInput } from '../../shared/browser-input';
 // Slice-3: the PURE policy module (no Electron) is the single source of truth for
@@ -22,8 +28,14 @@ export type {
   AccessRequestDecision,
   AccessRule,
   AccessRuleInput,
+  AgentActionsCommand,
+  AgentActionsState,
+  AgentDrivingRevoked,
   BrowserAuditEntry,
+  HandedTabInfo,
   OmniboxSuggestion,
+  SharedAgentSessions,
+  SignedInOrigin,
 };
 export { resolveBrowserInput };
 
@@ -211,6 +223,10 @@ export interface BrowserApi {
   /** M12 coarse act-tier gate (dashboard-global runtime flag). Not persisted. */
   getActionsEnabled(): Promise<boolean>;
   setActionsEnabled(enabled: boolean): Promise<boolean>;
+  /** Slice 12: armed-state agent-actions gate. */
+  getActionsState?(): Promise<AgentActionsState>;
+  setActionsState?(cmd: AgentActionsCommand): Promise<AgentActionsState>;
+  onActionsStateChanged?(cb: (state: AgentActionsState) => void): () => void;
   onTabState(cb: (state: BrowserTabState) => void): () => void;
   onOpenRequest(cb: (req: BrowserOpenRequest) => void): () => void;
 
@@ -254,6 +270,11 @@ export interface BrowserApi {
   // ── Slice-3: denial toasts + live Activity/Audit drawer (trusted chrome). ──
   auditRecent(limit?: number): Promise<BrowserAuditEntry[]>;
   onAuditEvent(cb: (entry: BrowserAuditEntry) => void): () => void;
+
+  // ── Slice 12: handoff / session center. Optional + guarded so older/stubbed
+  //    preload shapes without these channels don't crash the bridge. ───────────
+  getSharedSessions?(): Promise<SharedAgentSessions>;
+  onAgentDrivingRevoked?(cb: (payload: AgentDrivingRevoked) => void): () => void;
 
   // ── Website-access policy (plans/website-allowlist-design.md). Trusted shell
   //    chrome only — the renderer reaches the frozen window.api.browser.access
@@ -443,6 +464,10 @@ interface BrowserStoreState {
    *  runtime flag; loaded on mount, flipped by the chrome toggle. Not persisted
    *  — each app launch re-seeds from AGENT_BROWSER_ACTIONS (default OFF). */
   actionsEnabled: boolean;
+  /** Slice 12: full armed state mirror (disabled | armed + armedUntil +
+   *  lastChangedAt). `actionsEnabled` above is kept as a derived convenience
+   *  (mode === 'armed'). Loaded on mount, pushed live on flip OR auto-expiry. */
+  actionsState: AgentActionsState;
 
   createTab: (partition?: BrowserPartition, url?: string) => Promise<string | null>;
   closeTab: (tabId: string) => void;
@@ -459,6 +484,11 @@ interface BrowserStoreState {
 
   loadActionsEnabled: () => Promise<void>;
   setActionsEnabled: (enabled: boolean) => Promise<void>;
+  /** Slice 12: load + command the armed state; applyActionsState is the
+   *  onActionsStateChanged handler (flip + auto-expiry push). */
+  loadActionsState: () => Promise<void>;
+  setAgentActionsState: (cmd: AgentActionsCommand) => Promise<void>;
+  applyActionsState: (state: AgentActionsState) => void;
 
   handleTabState: (state: BrowserTabState) => void;
   handleOpenRequest: (req: BrowserOpenRequest) => void;
@@ -627,6 +657,25 @@ interface BrowserStoreState {
   tabHandToAgent: (tabId: string) => Promise<boolean>;
   tabReturnToHuman: (tabId: string) => Promise<void>;
   clearSiteSession: (ruleId: string) => Promise<void>;
+
+  // ── Slice 12: handoff / session center ─────────────────────────────────────
+  /** Live handed tabs + persisted signed-in origins (with session-age + stale
+   *  flags) for the "Sessions shared with agents" settings section. Loaded on
+   *  demand (overlay open) and refreshed on the access-changed / driving-revoked
+   *  events; empty shape until first load. */
+  sharedSessions: SharedAgentSessions;
+  loadSharedSessions: () => Promise<void>;
+  /** Off-origin auto-revoke notices surfaced as transient toasts (newest last).
+   *  handleAgentDrivingRevoked ALSO drops the "Agent driving" chip for the tab
+   *  — main has already detached the driver; this mirrors it locally so the
+   *  badge can't outlive the capability. */
+  drivingRevoked: AgentDrivingRevoked[];
+  handleAgentDrivingRevoked: (payload: AgentDrivingRevoked) => void;
+  dismissDrivingRevoked: (tabId: string) => void;
+  /** Transient success banner shown right after a sign-in hand-off completes
+   *  (the agent now drives the signed-in session). null = idle. */
+  signinHandoffDone: { hostname: string } | null;
+  dismissSigninHandoffDone: () => void;
 }
 
 export const useBrowserStore = create<BrowserStoreState>((set, get) => ({
@@ -637,6 +686,7 @@ export const useBrowserStore = create<BrowserStoreState>((set, get) => ({
   paneAttention: false,
   pendingOpenUrl: null,
   actionsEnabled: false,
+  actionsState: { mode: 'disabled', armedUntil: null, lastChangedAt: 0 },
 
   // Overhaul feature-slice initial state.
   bookmarks: [],
@@ -671,6 +721,11 @@ export const useBrowserStore = create<BrowserStoreState>((set, get) => ({
   handedTabIds: {},
   signinHandoff: null,
   signinHandoffError: null,
+
+  // Slice 12 — handoff / session center.
+  sharedSessions: { handedTabs: [], signedInOrigins: [] },
+  drivingRevoked: [],
+  signinHandoffDone: null,
 
   createTab: async (partition = 'user', url?) => {
     const api = getBrowserApi();
@@ -882,18 +937,62 @@ export const useBrowserStore = create<BrowserStoreState>((set, get) => ({
   },
 
   setActionsEnabled: async (enabled) => {
+    // Back-compat boolean flip → armed-until-restart / disabled command.
+    await get().setAgentActionsState(
+      enabled ? { mode: 'armed', durationMs: null } : { mode: 'disabled' },
+    );
+  },
+
+  // ── Slice 12: armed-state agent-actions gate ───────────────────────────────
+  loadActionsState: async () => {
+    const api = getBrowserApi();
+    if (!api?.getActionsState) {
+      // Older preload: fall back to the boolean gate.
+      void get().loadActionsEnabled();
+      return;
+    }
+    try {
+      get().applyActionsState(await api.getActionsState());
+    } catch (err) {
+      console.error('browser.getActionsState failed:', err);
+    }
+  },
+
+  setAgentActionsState: async (cmd) => {
     const api = getBrowserApi();
     if (!api) return;
-    // Optimistic; reconcile to the main-process echo (authoritative).
-    set({ actionsEnabled: enabled });
-    try {
-      const result = await api.setActionsEnabled(enabled);
-      set({ actionsEnabled: Boolean(result) });
-    } catch (err) {
-      console.error('browser.setActionsEnabled failed:', err);
-      // Re-sync from main on failure so the UI never lies about the gate.
-      void get().loadActionsEnabled();
+    if (!api.setActionsState) {
+      // Older preload: degrade to the boolean setter.
+      const enabled = cmd.mode === 'armed';
+      set({ actionsEnabled: enabled });
+      try {
+        set({ actionsEnabled: Boolean(await api.setActionsEnabled(enabled)) });
+      } catch (err) {
+        console.error('browser.setActionsEnabled failed:', err);
+        void get().loadActionsEnabled();
+      }
+      return;
     }
+    // Optimistic local apply; reconcile to the main-process echo (authoritative).
+    const optimistic: AgentActionsState =
+      cmd.mode === 'disabled'
+        ? { mode: 'disabled', armedUntil: null, lastChangedAt: Date.now() }
+        : {
+            mode: 'armed',
+            armedUntil: cmd.durationMs === null ? null : Date.now() + cmd.durationMs,
+            lastChangedAt: Date.now(),
+          };
+    get().applyActionsState(optimistic);
+    try {
+      get().applyActionsState(await api.setActionsState(cmd));
+    } catch (err) {
+      console.error('browser.setActionsState failed:', err);
+      void get().loadActionsState();
+    }
+  },
+
+  applyActionsState: (state) => {
+    set({ actionsState: state, actionsEnabled: state.mode === 'armed' });
   },
 
   handleOpenRequest: (req) => {
@@ -1424,7 +1523,15 @@ export const useBrowserStore = create<BrowserStoreState>((set, get) => ({
     if (!api || !handoff) return;
     try {
       await api.access.handoffReady(handoff.tabId);
-      set({ signinHandoff: null, signinHandoffError: null });
+      // Clear the consent banner and flash a transient success state (the agent
+      // now drives the signed-in session). Refresh the session center too so a
+      // newly committed origin shows up immediately.
+      set({
+        signinHandoff: null,
+        signinHandoffError: null,
+        signinHandoffDone: { hostname: handoff.hostname },
+      });
+      void get().loadSharedSessions();
     } catch (err) {
       console.error('browser.access.handoffReady failed:', err);
       set({
@@ -1479,10 +1586,55 @@ export const useBrowserStore = create<BrowserStoreState>((set, get) => ({
     if (!api) return;
     try {
       await api.access.clearSiteSession(ruleId);
+      // The cleared session changes the "Sessions shared with agents" picture —
+      // refresh it so the row's age/stale state reflects the wipe.
+      void get().loadSharedSessions();
     } catch (err) {
       console.error('browser.access.clearSiteSession failed:', err);
     }
   },
+
+  // ── Slice 12: handoff / session center ─────────────────────────────────────
+  loadSharedSessions: async () => {
+    const api = getBrowserApi();
+    if (!api?.getSharedSessions) return;
+    try {
+      const sessions = await api.getSharedSessions();
+      set({
+        sharedSessions: {
+          handedTabs: Array.isArray(sessions?.handedTabs) ? sessions.handedTabs : [],
+          signedInOrigins: Array.isArray(sessions?.signedInOrigins)
+            ? sessions.signedInOrigins
+            : [],
+        },
+      });
+    } catch (err) {
+      console.error('browser.getSharedSessions failed:', err);
+    }
+  },
+
+  handleAgentDrivingRevoked: (payload) => {
+    if (!payload || typeof payload.tabId !== 'string') return;
+    set((s) => {
+      // Drop the "Agent driving" chip — main has already detached the driver on
+      // the off-origin navigation; this mirrors it so the badge can't linger.
+      const { [payload.tabId]: _gone, ...handedTabIds } = s.handedTabIds;
+      // Surface a transient toast; dedupe by tab so a noisy redirect chain that
+      // fires repeatedly doesn't stack identical notices.
+      const drivingRevoked = [
+        ...s.drivingRevoked.filter((r) => r.tabId !== payload.tabId),
+        payload,
+      ];
+      return { handedTabIds, drivingRevoked };
+    });
+    // Keep the session center fresh if it's open.
+    void get().loadSharedSessions();
+  },
+
+  dismissDrivingRevoked: (tabId) =>
+    set((s) => ({ drivingRevoked: s.drivingRevoked.filter((r) => r.tabId !== tabId) })),
+
+  dismissSigninHandoffDone: () => set({ signinHandoffDone: null }),
 }));
 
 // ── Event bridge ─────────────────────────────────────────────────────────────
@@ -1523,6 +1675,15 @@ export function ensureBrowserBridge(): boolean {
     void useBrowserStore.getState().loadRecentAudit();
   }
 
+  // ── Slice 12: armed-state agent-actions gate. Stream flips + auto-expiry, then
+  //    prime the current state. Guarded for older preload shapes. ───────────────
+  if (api.onActionsStateChanged) {
+    api.onActionsStateChanged((state) =>
+      useBrowserStore.getState().applyActionsState(state),
+    );
+  }
+  void useBrowserStore.getState().loadActionsState();
+
   // ── Per-workspace isolation ────────────────────────────────────────────────
   // Track the dashboard's selected workspace so the strip/pane scope to it and
   // main re-scopes its snapshot/visibility/new-tab stamping. Sync once now (the
@@ -1558,6 +1719,9 @@ export function ensureBrowserBridge(): boolean {
   if (api.access) {
     api.access.onChanged(() => {
       void useBrowserStore.getState().loadAccessRules();
+      // Rule mutations (disable signed-in, remove, ...) change the session
+      // center — keep it in sync alongside the rules.
+      void useBrowserStore.getState().loadSharedSessions();
     });
     api.access.onRequestsChanged(() => {
       void useBrowserStore.getState().loadAccessRequests();
@@ -1565,6 +1729,15 @@ export function ensureBrowserBridge(): boolean {
     const s = useBrowserStore.getState();
     void s.loadAccessRules();
     void s.loadAccessRequests();
+  }
+
+  // ── Slice 12: handoff / session center. Stream the off-origin auto-revoke
+  //    notification (drops the driving chip + raises a transient toast). Guarded
+  //    so older/stubbed preload shapes without the channel don't crash. ─────────
+  if (api.onAgentDrivingRevoked) {
+    api.onAgentDrivingRevoked((payload) =>
+      useBrowserStore.getState().handleAgentDrivingRevoked(payload),
+    );
   }
   return true;
 }

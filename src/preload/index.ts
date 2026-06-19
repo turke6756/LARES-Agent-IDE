@@ -5,6 +5,9 @@ import { BROWSER_CHANNELS } from '../shared/browser';
 import type {
   AccessRequestDecision,
   AccessRuleInput,
+  AgentActionsCommand,
+  AgentActionsState,
+  AgentDrivingRevoked,
   Bookmark,
   BrowserAuditEntry,
   BrowserContextMenuParams,
@@ -183,6 +186,16 @@ const api: IpcApi = {
     getActionsEnabled: () => ipcRenderer.invoke(BROWSER_CHANNELS.getActionsEnabled),
     setActionsEnabled: (enabled) =>
       ipcRenderer.invoke(BROWSER_CHANNELS.setActionsEnabled, enabled),
+    // Slice 12: armed-state agent-actions gate.
+    getActionsState: (): Promise<AgentActionsState> =>
+      ipcRenderer.invoke(BROWSER_CHANNELS.getActionsState),
+    setActionsState: (cmd: AgentActionsCommand): Promise<AgentActionsState> =>
+      ipcRenderer.invoke(BROWSER_CHANNELS.setActionsState, cmd),
+    onActionsStateChanged: (callback: (state: AgentActionsState) => void) => {
+      const listener = (_event: any, state: AgentActionsState) => callback(state);
+      ipcRenderer.on(BROWSER_CHANNELS.actionsStateChanged, listener);
+      return () => ipcRenderer.removeListener(BROWSER_CHANNELS.actionsStateChanged, listener);
+    },
     onTabState: (callback) => {
       const listener = (_event: any, state: BrowserTabState) => callback(state);
       ipcRenderer.on(BROWSER_CHANNELS.tabState, listener);
@@ -256,6 +269,16 @@ const api: IpcApi = {
       const listener = (_event: any, entry: BrowserAuditEntry) => callback(entry);
       ipcRenderer.on(BROWSER_CHANNELS.auditEvent, listener);
       return () => ipcRenderer.removeListener(BROWSER_CHANNELS.auditEvent, listener);
+    },
+
+    // ── Slice 12: handoff / session center. Live handed tabs + persisted
+    //    signed-in origins (with session-age + stale flags); plus the off-origin
+    //    auto-revoke notification. Trusted chrome only. ──────────────────────────
+    getSharedSessions: () => ipcRenderer.invoke(BROWSER_CHANNELS.getSharedSessions),
+    onAgentDrivingRevoked: (callback) => {
+      const listener = (_event: any, payload: AgentDrivingRevoked) => callback(payload);
+      ipcRenderer.on(BROWSER_CHANNELS.agentDrivingRevoked, listener);
+      return () => ipcRenderer.removeListener(BROWSER_CHANNELS.agentDrivingRevoked, listener);
     },
 
     // ── Website-access policy (plans/website-allowlist-simplification.md).

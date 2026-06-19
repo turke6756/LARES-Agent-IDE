@@ -17,6 +17,9 @@ import {
   checkSignedInDrive,
   findMatchingRule,
   getRuntimeActionsEnabled,
+  getAgentActionsState,
+  setAgentActionsState,
+  DENIAL_COPY,
   isSensitiveOrigin,
   matchesRule,
   mayAttachDebugger,
@@ -365,6 +368,103 @@ test('runtime actions toggle: setRuntimeActionsEnabled flips live and echoes the
     assert.equal(getRuntimeActionsEnabled(), true, 'flip ON visible to the gate');
     assert.equal(setRuntimeActionsEnabled(false), false);
     assert.equal(getRuntimeActionsEnabled(), false, 'flip OFF visible to the gate');
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_BROWSER_ACTIONS;
+    else process.env.AGENT_BROWSER_ACTIONS = prev;
+    __resetRuntimeActionsEnabledForTests();
+  }
+});
+
+// ── Slice 12: armed-state agent-actions gate ─────────────────────────────────
+
+test('armed state: AGENT_BROWSER_ACTIONS=1 seeds "armed until restart"', () => {
+  const prev = process.env.AGENT_BROWSER_ACTIONS;
+  process.env.AGENT_BROWSER_ACTIONS = '1';
+  __resetRuntimeActionsEnabledForTests();
+  try {
+    const s = getAgentActionsState(1_000);
+    assert.equal(s.mode, 'armed', 'env seed → armed');
+    assert.equal(s.armedUntil, null, 'until restart (no expiry)');
+    assert.equal(getRuntimeActionsEnabled(1_000), true);
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_BROWSER_ACTIONS;
+    else process.env.AGENT_BROWSER_ACTIONS = prev;
+    __resetRuntimeActionsEnabledForTests();
+  }
+});
+
+test('armed state: default is disabled when AGENT_BROWSER_ACTIONS unset', () => {
+  const prev = process.env.AGENT_BROWSER_ACTIONS;
+  delete process.env.AGENT_BROWSER_ACTIONS;
+  __resetRuntimeActionsEnabledForTests();
+  try {
+    assert.equal(getAgentActionsState(1_000).mode, 'disabled');
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_BROWSER_ACTIONS;
+    else process.env.AGENT_BROWSER_ACTIONS = prev;
+    __resetRuntimeActionsEnabledForTests();
+  }
+});
+
+test('armed state: time-boxed arming auto-flips OFF at expiry', () => {
+  const prev = process.env.AGENT_BROWSER_ACTIONS;
+  delete process.env.AGENT_BROWSER_ACTIONS;
+  __resetRuntimeActionsEnabledForTests();
+  try {
+    const t0 = 100_000;
+    const armed = setAgentActionsState({ mode: 'armed', durationMs: 15 * 60 * 1000 }, t0);
+    assert.equal(armed.mode, 'armed');
+    assert.equal(armed.armedUntil, t0 + 15 * 60 * 1000, 'armedUntil = now + duration');
+    // Just before expiry: still armed.
+    assert.equal(getRuntimeActionsEnabled(armed.armedUntil! - 1), true, 'armed before expiry');
+    assert.equal(getAgentActionsState(armed.armedUntil! - 1).mode, 'armed');
+    // At/after expiry: auto-flipped to disabled.
+    const after = getAgentActionsState(armed.armedUntil!);
+    assert.equal(after.mode, 'disabled', 'expiry auto-flips off');
+    assert.equal(after.armedUntil, null);
+    assert.equal(getRuntimeActionsEnabled(armed.armedUntil! + 1), false, 'gate is off after expiry');
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_BROWSER_ACTIONS;
+    else process.env.AGENT_BROWSER_ACTIONS = prev;
+    __resetRuntimeActionsEnabledForTests();
+  }
+});
+
+test('armed state: "Disable now" + "until restart" commands set the expected state', () => {
+  const prev = process.env.AGENT_BROWSER_ACTIONS;
+  delete process.env.AGENT_BROWSER_ACTIONS;
+  __resetRuntimeActionsEnabledForTests();
+  try {
+    const t0 = 5_000;
+    const untilRestart = setAgentActionsState({ mode: 'armed', durationMs: null }, t0);
+    assert.equal(untilRestart.mode, 'armed');
+    assert.equal(untilRestart.armedUntil, null, 'null duration = until restart (never expires)');
+    assert.equal(getRuntimeActionsEnabled(t0 + 10 ** 9), true, 'never auto-expires');
+    const off = setAgentActionsState({ mode: 'disabled' }, t0 + 1);
+    assert.equal(off.mode, 'disabled');
+    assert.equal(off.lastChangedAt, t0 + 1, 'lastChangedAt stamps the disable');
+    assert.equal(getRuntimeActionsEnabled(t0 + 2), false);
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_BROWSER_ACTIONS;
+    else process.env.AGENT_BROWSER_ACTIONS = prev;
+    __resetRuntimeActionsEnabledForTests();
+  }
+});
+
+test('denied act-tier error references the UI control (Agent actions button), not just the env var', () => {
+  const prev = process.env.AGENT_BROWSER_ACTIONS;
+  delete process.env.AGENT_BROWSER_ACTIONS;
+  __resetRuntimeActionsEnabledForTests();
+  try {
+    // actionsEnabled=false → an act verb is denied with code actions-disabled.
+    const denied = checkAction('click', 'persist:agent', 'https://example.com/', false);
+    assert.ok(!denied.allow, 'act denied when disabled');
+    assert.equal(denied.code, 'actions-disabled');
+    assert.match(denied.reason!, /Agent actions button/i, 'reason names the UI control');
+    // DENIAL_COPY (shared by toast + drawer) also references the bot icon control.
+    const copy = DENIAL_COPY['actions-disabled'];
+    assert.match(copy.body, /bot icon|Agent actions/i, 'copy references the UI control');
+    assert.equal(copy.action, 'enable-actions', 'remediation points at the actions gate');
   } finally {
     if (prev === undefined) delete process.env.AGENT_BROWSER_ACTIONS;
     else process.env.AGENT_BROWSER_ACTIONS = prev;

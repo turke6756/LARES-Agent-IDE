@@ -266,6 +266,14 @@ export default function BrowserTabStrip() {
     return () => resumeBrowserPane();
   }, [overlayOpen]);
 
+  // Slice 12: a persistent toolbar "Agent driving" chip for the ACTIVE handed
+  // tab — visible without hovering the tab itself (the per-tab badge can scroll
+  // out of view in a crowded strip), with a one-click Return affordance.
+  const activeHandedTab =
+    activeTabId && handedTabIds[activeTabId]
+      ? tabs.find((t) => t.tabId === activeTabId) ?? null
+      : null;
+
   const menuTab = menu ? tabs.find((t) => t.tabId === menu.tabId) ?? null : null;
   const canHand =
     !!menuTab &&
@@ -574,6 +582,25 @@ export default function BrowserTabStrip() {
         >
           <Icons.RotateCcw className="w-4 h-4" />
         </button>
+
+        {/* Persistent "Agent driving" chip for the active handed tab. */}
+        {activeHandedTab && (
+          <div
+            className="ml-auto mr-1 shrink-0 self-center inline-flex items-center gap-1.5 pl-2 pr-1 py-0.5 rounded-full bg-accent-orange/15 text-accent-orange"
+            title="The agent is driving this signed-in tab."
+          >
+            <Icons.Bot className="w-3 h-3 shrink-0" />
+            <span className="text-[10px] font-bold uppercase tracking-wide">Agent driving</span>
+            <button
+              onClick={() => void tabReturnToHuman(activeHandedTab.tabId)}
+              className="ui-btn ui-btn-ghost px-1.5 py-0.5 text-[10px] font-semibold rounded-full hover:text-accent-red"
+              title="Stop the agent driving this tab and take it back"
+            >
+              <Icons.Undo2 className="w-3 h-3" />
+              Return
+            </button>
+          </div>
+        )}
       </div>
 
       {/* ── Rich hover card (human-readable; replaces title=URL) ─────────────── */}

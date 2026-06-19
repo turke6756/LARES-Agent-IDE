@@ -19,7 +19,12 @@ import type {
   AccessRequestStatus,
   AccessRule,
   AccessRuleInput,
+  SignedInOrigin,
 } from '../../shared/browser';
+
+/** Slice 12: a signed-in origin is "stale" (re-sign-in suggested) when its most
+ *  recent activity is older than this. Tunable; deliberately generous. */
+export const SIGNED_IN_STALE_MS = 14 * 24 * 60 * 60 * 1000; // 14 days
 
 /** Default per-agent pending-request cap (§18.1). */
 export const DEFAULT_PENDING_REQUEST_CAP = 20;
@@ -258,18 +263,102 @@ export function listSignedInOrigins(ruleId: string): string[] {
 
 /** Record an authenticated origin for a rule (idempotent). Slice-4: the origin
  *  is transitively workspace-scoped by its rule_id (a rule belongs to one
- *  workspace), but workspace_id is stored too for symmetry / direct queries. */
+ *  workspace), but workspace_id is stored too for symmetry / direct queries.
+ *  Slice 12: an optional session-age stamp — `signedInAt`/`verifiedAt` from the
+ *  handoff-ready commit. They overwrite the prior values when provided (a fresh
+ *  hand-off IS the most-recent commit + a verification); null/omitted leaves the
+ *  stored value untouched (the legacy two-arg callers/tests stay unchanged). */
 export function upsertSignedInOrigin(
   ruleId: string,
   origin: string,
   workspaceId: string | null = null,
+  opts: { signedInAt?: number | null; verifiedAt?: number | null } = {},
+): void {
+  const signedInAt = opts.signedInAt ?? null;
+  const verifiedAt = opts.verifiedAt ?? null;
+  getDb()
+    .prepare(
+      `INSERT INTO browser_access_signed_in_origins
+         (rule_id, origin, workspace_id, signed_in_at, last_used_at, verified_at)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(rule_id, origin) DO UPDATE SET
+         signed_in_at = COALESCE(excluded.signed_in_at, signed_in_at),
+         verified_at  = COALESCE(excluded.verified_at, verified_at)`,
+    )
+    .run(ruleId, origin, workspaceId, signedInAt, signedInAt, verifiedAt);
+}
+
+/** Slice 12: stamp last_used_at for every tracked signed-in origin matching an
+ *  origin within a workspace (a row is workspace-scoped via its rule). Called on
+ *  each authenticated agent drive so the session center can show "last used Nh
+ *  ago". Display-only; never gates access. Matches the workspace by equality with
+ *  NULL-aware `IS` so a legacy null-workspace row is touched under the null
+ *  workspace. No-op when nothing matches. */
+export function touchSignedInOrigin(
+  origin: string,
+  workspaceId: string | null,
+  usedAt: number,
 ): void {
   getDb()
     .prepare(
-      `INSERT INTO browser_access_signed_in_origins (rule_id, origin, workspace_id) VALUES (?, ?, ?)
-       ON CONFLICT(rule_id, origin) DO NOTHING`,
+      `UPDATE browser_access_signed_in_origins
+         SET last_used_at = ?
+       WHERE origin = ? AND workspace_id IS ?`,
     )
-    .run(ruleId, origin, workspaceId);
+    .run(usedAt, origin, workspaceId);
+}
+
+/** Slice 12: the "Sessions shared with agents" snapshot — every tracked
+ *  signed-in origin (joined to its rule for hostname + current allowSignedIn)
+ *  that applies to `workspaceId` (own rows + legacy null-workspace defaults). A
+ *  session is `stale` when its rule no longer grants authenticated-drive OR its
+ *  most-recent activity (used / verified / signed-in) is older than
+ *  SIGNED_IN_STALE_MS — the UI then offers a re-sign-in chip. */
+export function listSharedSignedInOrigins(
+  workspaceId: string | null,
+  now: number = Date.now(),
+): SignedInOrigin[] {
+  const rows = getDb()
+    .prepare(
+      `SELECT s.rule_id, s.origin, s.signed_in_at, s.last_used_at, s.verified_at,
+              r.hostname, r.allow_signed_in, r.workspace_id AS rule_workspace_id
+         FROM browser_access_signed_in_origins s
+         JOIN browser_access_rules r ON r.id = s.rule_id
+        ORDER BY s.last_used_at DESC, s.signed_in_at DESC`,
+    )
+    .all() as Array<{
+    rule_id: string;
+    origin: string;
+    signed_in_at: number | null;
+    last_used_at: number | null;
+    verified_at: number | null;
+    hostname: string;
+    allow_signed_in: number;
+    rule_workspace_id: string | null;
+  }>;
+
+  return rows
+    .filter((row) => rowAppliesToWorkspace(row.rule_workspace_id, workspaceId))
+    .map((row) => {
+      const allowSignedIn = row.allow_signed_in === 1;
+      const lastActivity = Math.max(
+        row.last_used_at ?? 0,
+        row.signed_in_at ?? 0,
+        row.verified_at ?? 0,
+      );
+      const aged = lastActivity > 0 && now - lastActivity > SIGNED_IN_STALE_MS;
+      return {
+        ruleId: row.rule_id,
+        hostname: row.hostname,
+        origin: row.origin,
+        workspaceId: row.rule_workspace_id ?? null,
+        allowSignedIn,
+        signedInAt: row.signed_in_at ?? null,
+        lastUsedAt: row.last_used_at ?? null,
+        verifiedAt: row.verified_at ?? null,
+        stale: !allowSignedIn || aged,
+      };
+    });
 }
 
 // ── Agent-initiated requests (§18) ───────────────────────────────────────────

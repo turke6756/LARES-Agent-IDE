@@ -6,8 +6,25 @@ import {
   type AccessRequestDecision,
   type AccessRule,
   type AccessRuleInput,
+  type HandedTabInfo,
+  type SignedInOrigin,
 } from '../../stores/browser-store';
 import { useBrowserSuspension } from './useBrowserSuspension';
+
+// ── Relative "x ago" label (trusted-chrome only; epoch ms in, short label out).
+// Used by the session center ("signed in 3d ago · last used 2h ago") and the
+// pending-approval rows (request age). null/undefined → "unknown".
+function relTime(ms: number | null | undefined): string {
+  if (ms === null || ms === undefined) return 'unknown';
+  const diff = Date.now() - ms;
+  if (diff < 60_000) return 'just now';
+  const min = Math.floor(diff / 60_000);
+  if (min < 60) return `${min}m ago`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return `${hr}h ago`;
+  const day = Math.floor(hr / 24);
+  return `${day}d ago`;
+}
 
 // ── Website-access settings (plans/website-allowlist-simplification.md §6) ─────
 // Full-pane overlay (modeled on HistoryView) for the SIMPLIFIED, single-list
@@ -314,6 +331,8 @@ function RequestRow({ request }: { request: AccessRequest }) {
             <span className="font-semibold">{request.requestedByTitle || 'An agent'}</span>{' '}
             <span className="text-fg-muted">({request.requestedBy})</span> requested access to:
           </div>
+          {/* Request age — how long this has been waiting on a human. */}
+          <div className="text-[10px] text-fg-muted">requested {relTime(request.createdAt)}</div>
           {/* Canonical rule — computed by trusted code, not the agent's raw string. */}
           <div className="text-[12px] font-mono text-fg-secondary mt-0.5">{ruleDescriptor(request)}</div>
           {request.wantSignedIn && (
@@ -422,6 +441,175 @@ function DiscardThresholdSetting() {
   );
 }
 
+// ── Slice 12: "Sessions shared with agents" (handoff / session center) ────────
+// A read-out of what the agent can currently use on the human's behalf:
+//   • live HANDED tabs (Mechanism B) — the agent is driving a real signed-in
+//     tab right now; one-click "Return tab" revokes it;
+//   • persisted SIGNED-IN origins (Mechanism A) — authenticated sessions stored
+//     for the agent, each with "signed in <age> · last used <age>" and per-row
+//     "Clear site session" (confirmed) + "Disable signed-in access".
+// A stale/expired origin surfaces an amber "Session may have expired —
+// re-sign-in" chip wired to the same beginSigninHandoff() flow used elsewhere.
+
+function HandedTabRow({ tab }: { tab: HandedTabInfo }) {
+  const tabReturnToHuman = useBrowserStore((s) => s.tabReturnToHuman);
+  let host = tab.url;
+  try {
+    host = new URL(tab.url).host || tab.url;
+  } catch {
+    /* keep raw */
+  }
+  return (
+    <div className="rounded-md border border-accent-orange/40 bg-accent-orange/5 px-3 py-2 flex items-center gap-3">
+      <Icons.Bot className="w-4 h-4 text-accent-orange shrink-0" />
+      <div className="flex-1 min-w-0">
+        <div className="text-[12px] text-fg-primary truncate">{tab.title || host}</div>
+        <div className="text-[10px] text-fg-muted font-mono truncate">{host}</div>
+      </div>
+      <span className="shrink-0 inline-flex items-center gap-0.5 px-1 py-0.5 rounded text-[9px] font-bold uppercase tracking-wide bg-accent-orange/15 text-accent-orange">
+        <Icons.Bot className="w-2.5 h-2.5" />
+        Agent driving
+      </span>
+      <button
+        onClick={() => void tabReturnToHuman(tab.tabId)}
+        className="ui-btn ui-btn-outline px-2 py-1 text-[11px] shrink-0"
+        title="Stop the agent driving this tab and take it back"
+      >
+        <Icons.Undo2 className="w-3.5 h-3.5" />
+        Return tab
+      </button>
+    </div>
+  );
+}
+
+function SignedInOriginRow({ origin }: { origin: SignedInOrigin }) {
+  const accessRules = useBrowserStore((s) => s.accessRules);
+  const clearSiteSession = useBrowserStore((s) => s.clearSiteSession);
+  const updateAccessRule = useBrowserStore((s) => s.updateAccessRule);
+  const beginSigninHandoff = useBrowserStore((s) => s.beginSigninHandoff);
+
+  // Asymmetric confirmation (mirror of the allowSignedIn ON→OFF flow): the
+  // destructive clear requires an explicit confirm, cancel is the easy path.
+  const [confirmingClear, setConfirmingClear] = useState(false);
+
+  const reSignIn = () => {
+    // Reuse the persisted rule when present so the hand-off carries its real
+    // identity; fall back to a minimal shape (id + hostname are all the flow
+    // needs) if the rule list hasn't loaded the row yet.
+    const rule =
+      accessRules.find((r) => r.id === origin.ruleId) ??
+      ({ id: origin.ruleId, hostname: origin.hostname } as AccessRule);
+    void beginSigninHandoff(rule);
+  };
+
+  return (
+    <div className="rounded-md border border-[var(--color-browser-divider)] bg-[var(--color-surface-0)] px-3 py-2 flex flex-col gap-2">
+      <div className="flex items-center gap-3">
+        <Icons.KeyRound className="w-4 h-4 text-accent-orange shrink-0" />
+        <div className="flex-1 min-w-0">
+          <div className="text-[12px] font-mono text-fg-primary truncate">{origin.hostname}</div>
+          <div className="text-[10px] text-fg-muted">
+            signed in {relTime(origin.signedInAt)} · last used {relTime(origin.lastUsedAt)}
+          </div>
+        </div>
+        {origin.stale && (
+          <button
+            onClick={reSignIn}
+            className="shrink-0 inline-flex items-center gap-1 px-2 py-1 rounded text-[10px] font-semibold border border-accent-orange/60 bg-accent-orange/10 text-accent-orange hover:bg-accent-orange/20"
+            title="This stored session looks stale — sign in again to refresh it"
+          >
+            <Icons.AlertTriangle className="w-3 h-3" />
+            Session may have expired — re-sign-in
+          </button>
+        )}
+      </div>
+
+      <div className="flex items-center gap-2 pl-7">
+        <button
+          onClick={() => void updateAccessRule(origin.ruleId, { allowSignedIn: false })}
+          className="ui-btn ui-btn-outline px-2 py-1 text-[11px]"
+          title="Stop the agent from using a signed-in session here (the rule stays, visit-only)"
+        >
+          <Icons.ShieldOff className="w-3.5 h-3.5" />
+          Disable signed-in access
+        </button>
+        <button
+          onClick={() => setConfirmingClear(true)}
+          className="ui-btn ui-btn-ghost px-2 py-1 text-[11px] hover:text-accent-red"
+          title="Wipe the agent's stored session for this site"
+        >
+          <Icons.Trash2 className="w-3.5 h-3.5" />
+          Clear site session
+        </button>
+      </div>
+
+      {confirmingClear && (
+        <div className="ml-7 rounded-md border border-accent-red/40 bg-accent-red/10 p-2.5 flex flex-col gap-2">
+          <div className="text-[11px] text-fg-primary">
+            Clear the agent's stored session for{' '}
+            <span className="font-mono">{origin.hostname}</span>? The agent will be signed out and
+            you'll need to sign in again to re-share it.
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => {
+                setConfirmingClear(false);
+                void clearSiteSession(origin.ruleId);
+              }}
+              className="ui-btn px-2 py-1 text-[11px] font-semibold bg-accent-red text-white border border-accent-red hover:bg-accent-red/90"
+            >
+              Clear session
+            </button>
+            <button
+              onClick={() => setConfirmingClear(false)}
+              className="ui-btn ui-btn-ghost px-2 py-1 text-[11px]"
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SessionsSharedSection() {
+  const sharedSessions = useBrowserStore((s) => s.sharedSessions);
+  const { handedTabs, signedInOrigins } = sharedSessions;
+  const total = handedTabs.length + signedInOrigins.length;
+
+  return (
+    <section className="flex flex-col gap-2">
+      <div className="flex items-center gap-2">
+        <Icons.Share2 className="w-4 h-4 text-accent-orange" />
+        <h2 className="text-[13px] font-semibold text-fg-primary">Sessions shared with agents</h2>
+        <span className="inline-flex items-center justify-center min-w-[18px] h-[18px] px-1 rounded-full text-[10px] font-bold bg-tab-border text-fg-secondary">
+          {total}
+        </span>
+      </div>
+      <p className="text-[11px] text-fg-muted">
+        Tabs an agent is driving right now, and the signed-in sessions stored for agents in this
+        workspace. Return a tab, clear a stored session, or revoke signed-in access at any time.
+      </p>
+
+      {total === 0 ? (
+        <div className="text-[11px] text-fg-muted px-1 py-2">
+          No tabs handed to an agent and no signed-in sessions shared.
+        </div>
+      ) : (
+        <div className="flex flex-col gap-2">
+          {handedTabs.map((tab) => (
+            <HandedTabRow key={tab.tabId} tab={tab} />
+          ))}
+          {signedInOrigins.map((origin) => (
+            <SignedInOriginRow key={origin.ruleId} origin={origin} />
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
 function WebsiteAccessSettingsInner() {
   useBrowserSuspension();
 
@@ -430,6 +618,7 @@ function WebsiteAccessSettingsInner() {
   const accessRequests = useBrowserStore((s) => s.accessRequests);
   const loadAccessRules = useBrowserStore((s) => s.loadAccessRules);
   const loadAccessRequests = useBrowserStore((s) => s.loadAccessRequests);
+  const loadSharedSessions = useBrowserStore((s) => s.loadSharedSessions);
 
   // The allowlist itself is collapsed by default so pending approvals (above)
   // are always visible without scrolling past a long list (§6).
@@ -439,7 +628,8 @@ function WebsiteAccessSettingsInner() {
   useEffect(() => {
     void loadAccessRules();
     void loadAccessRequests();
-  }, [loadAccessRules, loadAccessRequests]);
+    void loadSharedSessions();
+  }, [loadAccessRules, loadAccessRequests, loadSharedSessions]);
 
   // Close on Esc.
   useEffect(() => {
@@ -539,7 +729,11 @@ function WebsiteAccessSettingsInner() {
           )}
         </section>
 
-        {/* ── (3) Memory — idle-tab suspend threshold (Slice 11). ── */}
+        {/* ── (3) Sessions shared with agents — handed tabs + signed-in origins
+                 (Slice 12). ── */}
+        <SessionsSharedSection />
+
+        {/* ── (4) Memory — idle-tab suspend threshold (Slice 11). ── */}
         <DiscardThresholdSetting />
       </div>
     </div>

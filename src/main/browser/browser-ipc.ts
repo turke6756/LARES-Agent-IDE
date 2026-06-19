@@ -10,6 +10,7 @@ import { getRuntimeActionsEnabled, setRuntimeActionsEnabled } from './browser-po
 import {
   BROWSER_CHANNELS,
   type AccessRequestDecision,
+  type AgentActionsCommand,
   type AccessRuleInput,
   type BookmarkPatch,
   type BrowserBounds,
@@ -50,6 +51,14 @@ export function registerBrowserIpc(manager: BrowserManager): void {
   ipcMain.handle(BROWSER_CHANNELS.getActionsEnabled, () => getRuntimeActionsEnabled());
   ipcMain.handle(BROWSER_CHANNELS.setActionsEnabled, (_e, enabled: boolean) =>
     setRuntimeActionsEnabled(Boolean(enabled)),
+  );
+
+  // ── Slice 12: armed-state agent-actions gate ───────────────────────────────
+  // Richer state than the boolean above: disabled | armed + armedUntil +
+  // lastChangedAt. The manager owns the auto-expiry timer + the change broadcast.
+  ipcMain.handle(BROWSER_CHANNELS.getActionsState, () => manager.getAgentActionsState());
+  ipcMain.handle(BROWSER_CHANNELS.setActionsState, (_e, cmd: AgentActionsCommand) =>
+    manager.setAgentActionsState(cmd),
   );
 
   // ── Overhaul (WP0) invoke channels → manager methods ───────────────────────
@@ -174,4 +183,9 @@ export function registerBrowserIpc(manager: BrowserManager): void {
   ipcMain.handle(BROWSER_CHANNELS.accessClearSiteSession, (_e, ruleId: string) =>
     manager.accessClearSiteSession(ruleId),
   );
+
+  // Slice 12 (handoff / session center): the "Sessions shared with agents"
+  // snapshot — live handed tabs + persisted signed-in origins. Trusted chrome
+  // only; the agentDrivingRevoked event is pushed from the manager directly.
+  ipcMain.handle(BROWSER_CHANNELS.getSharedSessions, () => manager.getSharedSessions());
 }

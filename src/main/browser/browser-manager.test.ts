@@ -124,7 +124,7 @@ function fakeSession(): unknown {
 const electronMock = {
   app: { getPath: () => os.tmpdir() },
   Menu: { buildFromTemplate: () => ({ popup() {} }) },
-  session: { fromPartition: () => fakeSession() },
+  session: { fromPartition: (_partition?: string) => fakeSession() },
   WebContentsView: class {},
 };
 
@@ -722,6 +722,73 @@ test('Slice-4: accessRuleList scopes to the selected workspace (own rules + lega
   assert.ok(inB.includes('legacy-default.example'), 'B sees the legacy null-workspace default');
   assert.ok(!inB.includes('only-a.example'), "B does NOT see workspace A's rule");
   mgr.setActiveWorkspace(null);
+});
+
+// ── Slice 12 (Required-#4): clear-site-session is workspace-scoped ────────────
+// Clearing a site session must wipe ONLY the rule's own workspace-scoped agent
+// session partition (persist:agent:<workspaceId>) — another workspace's agent
+// partition is never touched (mirrors the Slice-4 partition-isolation claim,
+// applied to the destructive clear path).
+
+test('Required-#4: accessClearSiteSession clears ONLY the rule\'s workspace agent partition (other workspaces untouched)', async () => {
+  // Track per-partition fake sessions so we can observe WHICH partition's storage
+  // is cleared. fromPartition is otherwise non-memoizing (a fresh fake per call),
+  // so we install a memoizing tracker for the duration of this test and restore
+  // it afterward.
+  const sessions = new Map<string, ReturnType<typeof fakeSession>>();
+  const cleared = new Map<string, unknown[]>();
+  const orig = electronMock.session.fromPartition;
+  electronMock.session.fromPartition = (partition = '') => {
+    let s = sessions.get(partition);
+    if (!s) {
+      const calls: unknown[] = [];
+      const base = fakeSession() as Record<string, unknown>;
+      base.clearStorageData = async (opts: unknown) => {
+        calls.push(opts);
+      };
+      s = base;
+      sessions.set(partition, s);
+      cleared.set(partition, calls);
+    }
+    return s;
+  };
+
+  try {
+    const { mgr } = makeManager();
+    const A = 'ws4-A-uuid';
+    const B = 'ws4-B-uuid';
+    const host = 'mail.req4.example';
+    // A rule scoped to workspace A — its origins (https://mail.req4.example) live
+    // in A's agent session partition.
+    const rule = store.insertRule({
+      hostname: host, scheme: 'https', includeSubdomains: false, allowSignedIn: true, workspaceId: A,
+    });
+    mgr.invalidateAccessCache();
+
+    await mgr.accessClearSiteSession(rule.id);
+
+    const aPartition = BM.agentPartitionForWorkspace(A);
+    const bPartition = BM.agentPartitionForWorkspace(B);
+
+    // A's agent partition was cleared, scoped to the rule's origin.
+    const aCalls = cleared.get(aPartition) ?? [];
+    assert.ok(aCalls.length >= 1, "the rule's own workspace agent partition was cleared");
+    assert.ok(
+      aCalls.some((c) => (c as { origin?: string }).origin === `https://${host}`),
+      'the clear targeted the origin governed by the rule',
+    );
+
+    // Workspace B's agent partition is never fetched, let alone cleared.
+    assert.equal(cleared.has(bPartition), false, "another workspace's agent partition is untouched");
+    assert.notEqual(aPartition, bPartition, 'A and B resolve to distinct agent partitions');
+
+    // The human partition is never a clear target either.
+    assert.equal((cleared.get('persist:user') ?? []).length, 0, 'the shared human partition is untouched');
+
+    mgr.invalidateAccessCache();
+  } finally {
+    electronMock.session.fromPartition = orig;
+  }
 });
 
 // ── Slice-1: connection security + trusted error state ───────────────────────

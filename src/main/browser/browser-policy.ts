@@ -10,6 +10,9 @@
 
 import { WS_PORT, JUPYTER_BASE_PORT, JUPYTER_PORT_RETRIES } from '../control-ports';
 import { decideLoopbackBlock, mayAttachDebugger } from './browser-decisions';
+import type { AgentActionsCommand, AgentActionsMode, AgentActionsState } from '../../shared/browser';
+
+export type { AgentActionsCommand, AgentActionsMode, AgentActionsState };
 
 // Re-exported so the tool layer (and its tests) take the M9 predicate from
 // the policy module — one import surface, no drift. NOTE: as of the
@@ -73,7 +76,10 @@ export const DENIAL_COPY: Record<DenialCode, DenialCopyEntry> = {
   },
   'actions-disabled': {
     title: 'Agent browser actions are off',
-    body: 'The agent tried to act in the browser, but agent actions are currently disabled. Enable them to allow it.',
+    body:
+      'The agent tried to act in the browser, but agent actions are disabled. ' +
+      'Use the Agent actions button (the bot icon) in the browser toolbar to arm ' +
+      'them — for 15 minutes or until restart.',
     action: 'enable-actions',
   },
   'scheme-denied': {
@@ -189,40 +195,90 @@ export function browserToolsEnabled(env: Record<string, string | undefined>): bo
   return !TRUTHY.has((env.AGENT_BROWSER_TOOLS_DISABLED ?? '').toLowerCase());
 }
 
-// ── Runtime actions toggle (M12 coarse) — dashboard UI flips this live ───────
+// ── Runtime actions gate (M12 coarse, Slice 12 armed-state) ──────────────────
 //
 // browserActionsEnabled(env) stays PURE (its tests, and the startup seed,
-// depend on that). This thin runtime layer sits on top: a single in-memory,
-// process-global flag the trusted-renderer chrome can flip without relaunching
-// with AGENT_BROWSER_ACTIONS=1. It is:
-//   - seeded once, lazily, from browserActionsEnabled(process.env) — so the env
-//     var still force-enables at launch — and otherwise defaults OFF;
+// depend on that). This runtime layer sits on top: a single in-memory,
+// process-global ARMED state the trusted-renderer chrome flips without
+// relaunching with AGENT_BROWSER_ACTIONS=1. Slice 12 replaces the coarse
+// boolean with a time-boxed arming model:
+//   - state is `disabled` or `armed`; armed carries an optional `armedUntil`
+//     (epoch ms; null = "until restart") and a `lastChangedAt` stamp;
+//   - reads auto-flip an expired arming back to `disabled` (the expiry is lazy:
+//     evaluated on every read, so no timer is required in the pure module — the
+//     manager schedules a UI refresh separately);
+//   - seeded once, lazily: AGENT_BROWSER_ACTIONS=1 seeds "armed until restart",
+//     otherwise `disabled`;
 //   - NEVER persisted: each app launch re-seeds from the env, preserving the
-//     "human consciously enables each session" property (M12). The UI just
-//     turns the env var's one-time choice into a one-click runtime choice.
-// The gate in browser-manager.ts reads getRuntimeActionsEnabled() instead of
-// browserActionsEnabled(process.env) so a mid-session flip takes effect live.
+//     "human consciously enables each session" property (M12).
+// The gate in browser-manager.ts reads getRuntimeActionsEnabled() (which applies
+// the expiry) so a mid-session flip or expiry takes effect live.
 
-let runtimeActionsEnabled: boolean | null = null;
+let actionsState: AgentActionsState | null = null;
 
-/** Current runtime act-tier gate. Lazily seeds from process.env on first read
- *  (AGENT_BROWSER_ACTIONS=1 → on; default off). */
-export function getRuntimeActionsEnabled(): boolean {
-  if (runtimeActionsEnabled === null) {
-    runtimeActionsEnabled = browserActionsEnabled(process.env);
-  }
-  return runtimeActionsEnabled;
+function seedActionsState(now: number): AgentActionsState {
+  // AGENT_BROWSER_ACTIONS=1 → armed until restart; otherwise disabled.
+  const armed = browserActionsEnabled(process.env);
+  return {
+    mode: armed ? 'armed' : 'disabled',
+    armedUntil: null,
+    lastChangedAt: now,
+  };
 }
 
-/** Flip the runtime act-tier gate (dashboard chrome → IPC). Not persisted. */
+/** Internal: resolve the live state, applying lazy expiry. Mutates the cached
+ *  state when an armed window has elapsed so the flip is observed exactly once. */
+function resolveActionsState(now: number): AgentActionsState {
+  if (actionsState === null) actionsState = seedActionsState(now);
+  if (
+    actionsState.mode === 'armed' &&
+    actionsState.armedUntil !== null &&
+    now >= actionsState.armedUntil
+  ) {
+    actionsState = { mode: 'disabled', armedUntil: null, lastChangedAt: actionsState.armedUntil };
+  }
+  return actionsState;
+}
+
+/** Full runtime armed state (post-expiry). Returns a copy so callers can't
+ *  mutate the cache. */
+export function getAgentActionsState(now: number = Date.now()): AgentActionsState {
+  return { ...resolveActionsState(now) };
+}
+
+/** Apply a popover command; returns the resulting state (a copy). */
+export function setAgentActionsState(
+  cmd: AgentActionsCommand,
+  now: number = Date.now(),
+): AgentActionsState {
+  if (cmd.mode === 'disabled') {
+    actionsState = { mode: 'disabled', armedUntil: null, lastChangedAt: now };
+  } else {
+    actionsState = {
+      mode: 'armed',
+      armedUntil: cmd.durationMs === null ? null : now + cmd.durationMs,
+      lastChangedAt: now,
+    };
+  }
+  return { ...actionsState };
+}
+
+/** Current runtime act-tier gate as a boolean (armed & unexpired). The manager
+ *  passes this to checkAction. Lazily seeds from process.env on first read. */
+export function getRuntimeActionsEnabled(now: number = Date.now()): boolean {
+  return resolveActionsState(now).mode === 'armed';
+}
+
+/** Back-compat boolean setter (true → armed until restart, false → disabled).
+ *  Retained for callers/tests that don't need the time-boxed forms. */
 export function setRuntimeActionsEnabled(enabled: boolean): boolean {
-  runtimeActionsEnabled = enabled;
-  return runtimeActionsEnabled;
+  setAgentActionsState(enabled ? { mode: 'armed', durationMs: null } : { mode: 'disabled' });
+  return enabled;
 }
 
 /** Test seam: drop the cached value so the next read re-seeds from process.env. */
 export function __resetRuntimeActionsEnabledForTests(): void {
-  runtimeActionsEnabled = null;
+  actionsState = null;
 }
 
 // ── M11: navigation allowlist (scheme + SSRF) ───────────────────────────────
@@ -425,9 +481,10 @@ export function checkAction(
         code: 'actions-disabled',
         reason:
           `browser actions are disabled (M12 default). Agent-driven '${verb}' requires the ` +
-          `human to enable browser actions by launching the dashboard with ` +
-          `AGENT_BROWSER_ACTIONS=1. openUrl with forHuman:true remains available to hand ` +
-          `a URL to the human.`,
+          `human to arm browser actions from the Agent actions button (bot icon) in the ` +
+          `browser toolbar — "Enable for 15 min" or "Enable until restart" (AGENT_BROWSER_ACTIONS=1 ` +
+          `seeds armed-until-restart at launch). openUrl with forHuman:true remains available to ` +
+          `hand a URL to the human.`,
       };
     }
     // Exposure-reducing exemption: goBack/goForward/closeTab REDUCE exposure,

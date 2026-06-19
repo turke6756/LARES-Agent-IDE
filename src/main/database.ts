@@ -433,6 +433,21 @@ export function initDatabase(): void {
     db.exec(`ALTER TABLE browser_access_signed_in_origins ADD COLUMN workspace_id TEXT`);
   } catch { /* column already exists */ }
 
+  // Slice 12 (handoff/session center): per signed-in origin session-age fields.
+  // signed_in_at = first/most-recent successful handoff-ready commit; last_used_at
+  // = last time an agent drove the authenticated origin; verified_at = optional
+  // last explicit re-verification. All nullable (legacy rows null). Guarded
+  // try/catch ALTER (house idiom).
+  try {
+    db.exec(`ALTER TABLE browser_access_signed_in_origins ADD COLUMN signed_in_at INTEGER`);
+  } catch { /* column already exists */ }
+  try {
+    db.exec(`ALTER TABLE browser_access_signed_in_origins ADD COLUMN last_used_at INTEGER`);
+  } catch { /* column already exists */ }
+  try {
+    db.exec(`ALTER TABLE browser_access_signed_in_origins ADD COLUMN verified_at INTEGER`);
+  } catch { /* column already exists */ }
+
   // ── Selection comments table ──────────────────────────────────────────
   // WP-P5 — persisted file-target selection comments. Schema recorded in
   // plans/selection-to-agent-primitive-plan.md §5; copied exactly. No generic

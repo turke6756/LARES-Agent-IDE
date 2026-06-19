@@ -347,6 +347,75 @@ export interface AccessHandoffResult {
   tabId: string;
 }
 
+// ── Slice 12: handoff / session center ───────────────────────────────────────
+
+/** A persisted authenticated origin shared with an agent (§13 row + session-age
+ *  fields). Timestamps are epoch ms; null = unknown (legacy row / not yet set). */
+export interface SignedInOrigin {
+  ruleId: string;
+  hostname: string;
+  origin: string;
+  workspaceId: string | null;
+  /** Whether the governing rule still grants authenticated-drive. */
+  allowSignedIn: boolean;
+  /** First/most-recent successful handoff-ready commit. */
+  signedInAt: number | null;
+  /** Last time an agent drove the authenticated origin. */
+  lastUsedAt: number | null;
+  /** Optional explicit re-verification timestamp. */
+  verifiedAt: number | null;
+  /** Heuristic: the session may have expired (stale by age or the rule no longer
+   *  grants authenticated-drive) → the UI offers a re-sign-in chip. */
+  stale: boolean;
+}
+
+/** A live tab currently handed to / drivable by an agent (Mechanism B), for the
+ *  "Sessions shared with agents" center. Runtime only (never persisted). */
+export interface HandedTabInfo {
+  tabId: string;
+  url: string;
+  title: string;
+  workspaceId: string | null;
+}
+
+/** The trusted-chrome "Sessions shared with agents" snapshot: live handed tabs
+ *  plus the persisted signed-in agent origins. */
+export interface SharedAgentSessions {
+  handedTabs: HandedTabInfo[];
+  signedInOrigins: SignedInOrigin[];
+}
+
+/** Event payload: a handed tab was auto-revoked because it navigated off its
+ *  allow_signed_in origin (§12-B). Drives the small trusted notification. */
+export interface AgentDrivingRevoked {
+  tabId: string;
+  /** The off-origin URL it navigated to (best-effort; '' if unavailable). */
+  url: string;
+  hostname: string;
+}
+
+// ── Slice 12: armed-state agent-actions gate ─────────────────────────────────
+// The coarse M12 on/off toggle becomes a time-boxed ARMED state. `disabled` =
+// act-tier verbs blocked; `armed` = allowed until `armedUntil` (epoch ms; null =
+// until restart). `lastChangedAt` stamps the last transition (incl. auto-expiry).
+// The authoritative state lives in browser-policy.ts; this is its wire shape.
+
+export type AgentActionsMode = 'disabled' | 'armed';
+
+export interface AgentActionsState {
+  mode: AgentActionsMode;
+  /** epoch ms when arming expires; null = armed until restart (or disabled). */
+  armedUntil: number | null;
+  /** epoch ms of the last state change (incl. an auto-expiry flip). */
+  lastChangedAt: number;
+}
+
+/** A popover command to change the armed state. `durationMs` null = until
+ *  restart; a number = arm for that many ms from now. */
+export type AgentActionsCommand =
+  | { mode: 'disabled' }
+  | { mode: 'armed'; durationMs: number | null };
+
 /** IPC channel names — single source so preload and main can't drift. */
 export const BROWSER_CHANNELS = {
   createTab: 'browser:create-tab',
@@ -393,10 +462,17 @@ export const BROWSER_CHANNELS = {
   // Dashboard chrome flips the global "agent browser actions" runtime flag so
   // the human can enable act-tier verbs without relaunching with
   // AGENT_BROWSER_ACTIONS=1. Read-tier tools are unaffected. Not persisted.
-  /** () → boolean — current runtime act-tier gate */
+  /** () → boolean — current runtime act-tier gate (armed & unexpired) */
   getActionsEnabled: 'browser:get-actions-enabled',
   /** (enabled: boolean) → boolean — flip the gate; echoes the resulting state */
   setActionsEnabled: 'browser:set-actions-enabled',
+  // ── Slice 12: armed-state agent-actions gate ───────────────────────────────
+  /** () → AgentActionsState — full armed state (post-expiry) */
+  getActionsState: 'browser:get-actions-state',
+  /** (cmd: AgentActionsCommand) → AgentActionsState — apply a popover command */
+  setActionsState: 'browser:set-actions-state',
+  /** event main→renderer (AgentActionsState) — pushed on flip OR auto-expiry */
+  actionsStateChanged: 'browser:actions-state-changed',
 
   // ── Overhaul (WP0) channels ────────────────────────────────────────────────
   // Pure plumbing. Invoke unless marked `event` (main → renderer push).
@@ -494,4 +570,12 @@ export const BROWSER_CHANNELS = {
   accessTabReturnToHuman: 'browser:tab-return-to-human',
   /** (ruleId) → void — per-row "Clear agent session" → clearAgentSiteData (§14). */
   accessClearSiteSession: 'browser:access-clear-site-session',
+
+  // ── Slice 12: handoff / session center ─────────────────────────────────────
+  /** () → SharedAgentSessions — live handed tabs + persisted signed-in origins
+   *  (with session-age + stale flags) for the "Sessions shared with agents" UI. */
+  getSharedSessions: 'browser:get-shared-sessions',
+  /** event main→renderer (AgentDrivingRevoked) — a handed tab navigated off its
+   *  allow_signed_in origin and was auto-revoked; drives a trusted notification. */
+  agentDrivingRevoked: 'browser:agent-driving-revoked',
 } as const;

@@ -5,6 +5,9 @@ import type {
   AccessRequestDecision,
   AccessRule,
   AccessRuleInput,
+  AgentActionsCommand,
+  AgentActionsState,
+  AgentDrivingRevoked,
   Bookmark,
   BookmarkPatch,
   BrowserAuditEntry,
@@ -19,6 +22,7 @@ import type {
   HistoryEntry,
   HistoryQuery,
   OmniboxSuggestion,
+  SharedAgentSessions,
 } from './browser';
 
 export type PathType = 'windows' | 'wsl';
@@ -789,6 +793,13 @@ export interface IpcApi {
      *  state; the setter echoes the resulting state. Not persisted. */
     getActionsEnabled: () => Promise<boolean>;
     setActionsEnabled: (enabled: boolean) => Promise<boolean>;
+    /** Slice 12: armed-state agent-actions gate (disabled | armed + armedUntil +
+     *  lastChangedAt). getActionsState reads, setActionsState applies a popover
+     *  command and echoes the resulting state, onActionsStateChanged streams flips
+     *  AND auto-expiry. Not persisted. */
+    getActionsState: () => Promise<AgentActionsState>;
+    setActionsState: (cmd: AgentActionsCommand) => Promise<AgentActionsState>;
+    onActionsStateChanged: (callback: (state: AgentActionsState) => void) => () => void;
     onTabState: (callback: (state: BrowserTabState) => void) => () => void;
     onOpenRequest: (callback: (request: BrowserOpenRequest) => void) => () => void;
 
@@ -842,6 +853,13 @@ export interface IpcApi {
     // every fresh record. Both carry BrowserAuditEntry (never argsHash).
     auditRecent: (limit?: number) => Promise<BrowserAuditEntry[]>;
     onAuditEvent: (callback: (entry: BrowserAuditEntry) => void) => () => void;
+
+    // ── Slice 12: handoff / session center. getSharedSessions returns the live
+    //    handed tabs + persisted signed-in origins (with session-age + stale
+    //    flags) for the "Sessions shared with agents" UI; onAgentDrivingRevoked
+    //    streams the off-origin auto-revoke notification. Trusted chrome only. ───
+    getSharedSessions: () => Promise<SharedAgentSessions>;
+    onAgentDrivingRevoked: (callback: (payload: AgentDrivingRevoked) => void) => () => void;
 
     // ── Website-access policy (plans/website-allowlist-simplification.md) ──────
     // ONE agent allowlist; enforcement keyed to the Agent Actions toggle (no
