@@ -23,6 +23,23 @@ import {
   RESEARCH_STORE_README_MD, RESEARCH_WRITE_GUARD_MJS, RESEARCHER_CLAUDE_SETTINGS_JSON,
   RESEARCHER_AGENT_MD,
 } from '../../shared/constants';
+import {
+  writeScaffoldMap as writeSharedScaffoldMap,
+  scaffoldFileExists,
+  atomicWriteScaffoldText,
+  type ScaffoldFile,
+  SCAFFOLD_SIDECAR_REL,
+  SCAFFOLD_LOCK_REL,
+  sha256Hex,
+  normalizeManagedKey,
+} from '../scaffold-writer';
+
+// Back-compat re-export shim: scaffold-version-migration.test.ts (and any other
+// caller) imports these from './index'. The definitions now live in
+// ../scaffold-writer (D1 extraction); re-export them so import sites are unchanged.
+export { SCAFFOLD_SIDECAR_REL, SCAFFOLD_LOCK_REL, sha256Hex, normalizeManagedKey };
+export type { ScaffoldFile };
+
 import { getApiToken } from '../security/api-auth';
 import { EventBridge, EventBridgeDeps } from './event-bridge';
 import { TeamMessageDeliveryEngine } from './team-delivery';
@@ -272,18 +289,6 @@ export function mergeClaudeProjectTrust(existingJson: string | null, dirs: strin
 
 // ── Scaffold versioning (plans/scaffold-version-migration.md) ──────────
 
-/** A managed scaffold-map entry. Per-file `version` is hand-bumped when the
- *  bundled `content` changes; `previousHashes` maps old version numbers to
- *  SHA-256 hex of the exact bundled content shipped at that version. Lets
- *  writeScaffoldMap distinguish "user-modified file" from "known managed
- *  v(n-1) file that just needs a silent upgrade." */
-export interface ScaffoldFile {
-  content: string;
-  executable?: boolean;
-  version: number;
-  previousHashes?: Record<number, string>;
-}
-
 /** C1 — raised by `_doSendInput` when synchronous confirm-and-retry exhausts
  *  for a contract provider: the body was delivered but no turn ever started
  *  (every submit Enter was dropped). The chat-bar IPC path surfaces this via
@@ -338,15 +343,6 @@ export type HookApplyResult = 'applied' | 'duplicate' | 'stale' | 'invalid';
 
 /** LRU cap for the per-agent applied-event dedupe registry. */
 const APPLIED_HOOK_EVENTS_MAX = 200;
-
-/** Sidecar tracks the on-disk version of every managed scaffold file in a
- *  workspace. Keyed by path relative to `.dashboard/`, no leading slash,
- *  forward slashes always. */
-export const SCAFFOLD_SIDECAR_REL = '.dashboard/.scaffold-versions.json';
-export const SCAFFOLD_LOCK_REL = '.dashboard/.scaffold-versions.lock';
-const SCAFFOLD_LOCK_STALE_MS = 60_000;
-const SCAFFOLD_LOCK_POLL_MS = 100;
-const SCAFFOLD_LOCK_TIMEOUT_MS = 5_000;
 
 /** SHA-256 hex of the pre-DASHBOARD_HOST `dashboard-status.mjs` shipped in
  *  every workspace scaffolded before the WSL-status fix landed. That script
@@ -433,10 +429,6 @@ export const RESEARCH_WRITE_GUARD_MJS_V1_HASH = '3fcfb8db52ae51a1c5c846b10a914fc
  *  the v2 file's previousHashes for silent v1→v2 upgrade of pristine workspaces. */
 export const RESEARCHER_AGENT_MD_V1_HASH = '085571f86cc203f07572e25c846631a957b5d6dbd400aa1bf5d6acc09a52739b';
 
-export function sha256Hex(content: string | Buffer): string {
-  return crypto.createHash('sha256').update(content).digest('hex');
-}
-
 /** Map an agent's role flags to its first-class app role-lane
  *  (browser-parity-and-capability-isolation §0, D-1). The single source of
  *  truth the new switch points (toolset grant, cwd, scaffold, MCP injection)
@@ -501,22 +493,6 @@ export function instrumentCodexWorkerCommand(
   const head = command.slice(0, tokenEnd);
   const tail = command.slice(tokenEnd);
   return { command: `${head} ${additions.join(' ')}${tail}`, instrumented: true };
-}
-
-/** Strip the leading `.dashboard/` segment from a scaffold-map relPath so
- *  the sidecar key is stable across map reshuffles. `\` is normalized to
- *  `/` to keep Windows and WSL keys identical. */
-export function normalizeManagedKey(relPath: string): string {
-  let s = relPath.replace(/\\/g, '/');
-  if (s.startsWith('.dashboard/')) s = s.slice('.dashboard/'.length);
-  return s.replace(/^\/+/, '');
-}
-
-function timestampForFilename(): string {
-  const d = new Date();
-  const pad = (n: number) => String(n).padStart(2, '0');
-  return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}` +
-         `-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}-${process.pid}`;
 }
 
 const BRACKETED_PASTE_START = '\x1b[200~';
@@ -1562,311 +1538,16 @@ export class AgentSupervisor extends EventEmitter {
     [`.dashboard/researcher/scripts/research-write-guard.mjs`]:  { content: RESEARCH_WRITE_GUARD_MJS, version: 2, previousHashes: { 1: RESEARCH_WRITE_GUARD_MJS_V1_HASH }, executable: true },
   };
 
-  /** Shared file-map writer used by both supervisor and worker scaffold paths.
-   *  Returns the number of files written or upgraded (managed upgrades count
-   *  as writes). Behavior per plans/scaffold-version-migration.md §Algorithm:
-   *
-   *  - Missing file → write bundled content, record version in sidecar.
-   *  - Sidecar says current version → skip.
-   *  - Disk content matches current bundled content (sidecar drift) → update
-   *    sidecar only, no write or backup.
-   *  - Disk content matches a known old managed hash → silent upgrade.
-   *  - Disk content differs and no hash matches → back up to `.bak.<ts>` then
-   *    overwrite (treat as user-modified — preserves the edit but takes the
-   *    file off the user's hands).
-   *  - Sidecar says future version (> bundled) → leave unchanged, warn.
-   *
-   *  Atomic per-file replacement (write-to-tmp + rename) on both platforms.
-   *  Workspace-scoped lock (`.dashboard/.scaffold-versions.lock`) serializes
-   *  concurrent ensureWorkerScaffold calls so two writers can't race the
-   *  sidecar read/modify/write. */
+  /** Delegates to the shared free-function writer in ../scaffold-writer (D1
+   *  extraction). The class API + every call site is unchanged; the supervisor
+   *  just tags its log output `[supervisor]`. See scaffold-writer.ts for the
+   *  full version-migration algorithm. */
   private writeScaffoldMap(
     workDir: string,
     files: Record<string, ScaffoldFile>,
     pathType: string,
   ): number {
-    const lockReleased = this.acquireScaffoldLock(workDir, pathType);
-    try {
-      const sidecar = this.readScaffoldSidecar(workDir, pathType);
-      let changed = 0;
-
-      for (const [relPath, file] of Object.entries(files)) {
-        const managedKey = normalizeManagedKey(relPath);
-        const bundledVersion = file.version;
-        const diskVersion = Number.isInteger(sidecar[managedKey]) ? sidecar[managedKey] : 0;
-
-        try {
-          if (!this.scaffoldFileExists(workDir, relPath, pathType)) {
-            this.atomicWriteScaffoldText(workDir, relPath, file.content, !!file.executable, pathType);
-            sidecar[managedKey] = bundledVersion;
-            changed++;
-            continue;
-          }
-
-          if (diskVersion === bundledVersion) {
-            continue;
-          }
-
-          if (diskVersion > bundledVersion) {
-            console.warn(`[supervisor] Scaffold file ${managedKey} has future version ${diskVersion}; leaving unchanged (bundled v${bundledVersion})`);
-            continue;
-          }
-
-          const diskContent = this.readScaffoldText(workDir, relPath, pathType);
-          if (diskContent === null) {
-            // File reported exists but unreadable — treat as missing and write.
-            this.atomicWriteScaffoldText(workDir, relPath, file.content, !!file.executable, pathType);
-            sidecar[managedKey] = bundledVersion;
-            changed++;
-            continue;
-          }
-          const diskHash = sha256Hex(diskContent);
-
-          // Sidecar drift safety: if the file content is already the current
-          // bundled content, just record the version and move on — no write,
-          // no backup. Covers "user deleted sidecar but didn't touch files."
-          if (diskHash === sha256Hex(file.content)) {
-            sidecar[managedKey] = bundledVersion;
-            changed++;
-            continue;
-          }
-
-          const knownOldHash = file.previousHashes?.[diskVersion] ?? file.previousHashes?.[1];
-          const matchesKnownManagedOld = !!knownOldHash && diskHash === knownOldHash;
-
-          if (matchesKnownManagedOld) {
-            this.atomicWriteScaffoldText(workDir, relPath, file.content, !!file.executable, pathType);
-            sidecar[managedKey] = bundledVersion;
-            console.log(`[supervisor] Scaffold file ${managedKey} upgraded ${diskVersion} → ${bundledVersion} (matched known managed hash)`);
-            changed++;
-            continue;
-          }
-
-          // User-modified (or unknown previous version we don't have a hash
-          // for). Back up before overwrite so the edit is recoverable.
-          const bakRel = `${relPath}.bak.${timestampForFilename()}`;
-          this.copyScaffoldForBackup(workDir, relPath, bakRel, pathType);
-          console.warn(
-            `[supervisor] Scaffold file ${managedKey} differed from known managed content; ` +
-            `backed up to ${bakRel} and upgraded to v${bundledVersion}`,
-          );
-          this.atomicWriteScaffoldText(workDir, relPath, file.content, !!file.executable, pathType);
-          sidecar[managedKey] = bundledVersion;
-          changed++;
-        } catch (err) {
-          console.error(`[supervisor] Failed to upgrade scaffold file ${relPath}:`, err);
-        }
-      }
-
-      if (changed > 0) {
-        try {
-          this.writeScaffoldSidecar(workDir, sidecar, pathType);
-        } catch (err) {
-          console.error(`[supervisor] Failed to persist scaffold sidecar:`, err);
-        }
-      }
-
-      return changed;
-    } finally {
-      lockReleased();
-    }
-  }
-
-  // ── Scaffold IO primitives ────────────────────────────────────────────
-
-  /** Resolve a workspace-relative path to its absolute form for the given
-   *  pathType. Windows uses path.join (handles backslashes); WSL/Linux uses
-   *  forward slashes throughout. */
-  private scaffoldFullPath(workDir: string, relPath: string, pathType: string): string {
-    if (pathType === 'wsl') return `${workDir}/${relPath}`;
-    return path.join(workDir, relPath);
-  }
-
-  private scaffoldFileExists(workDir: string, relPath: string, pathType: string): boolean {
-    const full = this.scaffoldFullPath(workDir, relPath, pathType);
-    if (pathType === 'wsl') {
-      try {
-        execFileSync('wsl.exe', ['bash', '-lc', `test -f '${full}'`], { timeout: 5000, stdio: 'ignore' });
-        return true;
-      } catch {
-        return false;
-      }
-    }
-    return fs.existsSync(full);
-  }
-
-  private readScaffoldText(workDir: string, relPath: string, pathType: string): string | null {
-    const full = this.scaffoldFullPath(workDir, relPath, pathType);
-    if (pathType === 'wsl') {
-      try {
-        const b64 = execFileSync('wsl.exe', ['bash', '-lc', `base64 -w0 '${full}'`], {
-          encoding: 'utf-8', timeout: 5000,
-        });
-        return Buffer.from(b64.trim(), 'base64').toString('utf-8');
-      } catch {
-        return null;
-      }
-    }
-    try {
-      return fs.readFileSync(full, 'utf-8');
-    } catch {
-      return null;
-    }
-  }
-
-  /** Write `content` atomically: write to `<target>.tmp.<pid>.<ts>`, then
-   *  rename over the target. `executable=true` adds chmod +x (WSL only —
-   *  Windows ignores +x). Creates parent dirs as needed. */
-  private atomicWriteScaffoldText(
-    workDir: string,
-    relPath: string,
-    content: string,
-    executable: boolean,
-    pathType: string,
-  ): void {
-    const full = this.scaffoldFullPath(workDir, relPath, pathType);
-    if (pathType === 'wsl') {
-      const dir = full.substring(0, full.lastIndexOf('/'));
-      const tmp = `${full}.tmp.${process.pid}.${Date.now()}`;
-      const b64 = Buffer.from(content, 'utf-8').toString('base64');
-      const chmod = executable ? ` && chmod +x '${tmp}'` : '';
-      const cmd = `mkdir -p '${dir}' && echo '${b64}' | base64 -d > '${tmp}'${chmod} && mv -f '${tmp}' '${full}'`;
-      execFileSync('wsl.exe', ['bash', '-lc', cmd], { timeout: 5000 });
-      return;
-    }
-    const dir = path.dirname(full);
-    fs.mkdirSync(dir, { recursive: true });
-    const tmp = `${full}.tmp.${process.pid}.${Date.now()}`;
-    fs.writeFileSync(tmp, content, 'utf-8');
-    try {
-      fs.renameSync(tmp, full);
-    } catch (err) {
-      // Windows can fail to rename over an open file. Fall back to copy + unlink.
-      try { fs.copyFileSync(tmp, full); } finally {
-        try { fs.rmSync(tmp, { force: true }); } catch { /* best effort */ }
-      }
-      if (err instanceof Error && (err as NodeJS.ErrnoException).code !== 'EEXIST' && (err as NodeJS.ErrnoException).code !== 'EPERM' && (err as NodeJS.ErrnoException).code !== 'EACCES') {
-        throw err;
-      }
-    }
-  }
-
-  private copyScaffoldForBackup(workDir: string, srcRel: string, dstRel: string, pathType: string): void {
-    const src = this.scaffoldFullPath(workDir, srcRel, pathType);
-    const dst = this.scaffoldFullPath(workDir, dstRel, pathType);
-    if (pathType === 'wsl') {
-      execFileSync('wsl.exe', ['bash', '-lc', `cp -p '${src}' '${dst}'`], { timeout: 5000 });
-      return;
-    }
-    fs.copyFileSync(src, dst);
-  }
-
-  /** Read the workspace sidecar. Missing file or unparseable JSON both yield
-   *  an empty record; corrupt content also logs a warning so users can see
-   *  the migration treated their sidecar as missing. */
-  private readScaffoldSidecar(workDir: string, pathType: string): Record<string, number> {
-    const raw = this.readScaffoldText(workDir, SCAFFOLD_SIDECAR_REL, pathType);
-    if (raw === null) return {};
-    try {
-      const parsed = JSON.parse(raw);
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-        const out: Record<string, number> = {};
-        for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
-          if (typeof v === 'number' && Number.isInteger(v)) out[k] = v;
-        }
-        return out;
-      }
-      console.warn(`[supervisor] Scaffold sidecar at ${SCAFFOLD_SIDECAR_REL} is not an object; treating as empty`);
-      return {};
-    } catch {
-      console.warn(`[supervisor] Scaffold sidecar at ${SCAFFOLD_SIDECAR_REL} is unparseable JSON; treating as empty`);
-      return {};
-    }
-  }
-
-  private writeScaffoldSidecar(workDir: string, sidecar: Record<string, number>, pathType: string): void {
-    const sorted: Record<string, number> = {};
-    for (const key of Object.keys(sidecar).sort()) sorted[key] = sidecar[key];
-    const content = JSON.stringify(sorted, null, 2) + '\n';
-    this.atomicWriteScaffoldText(workDir, SCAFFOLD_SIDECAR_REL, content, false, pathType);
-  }
-
-  /** Acquire the workspace-scoped scaffold lock. Returns a release function
-   *  that callers MUST invoke in a finally. Falls back to a no-op release if
-   *  the lock can't be acquired within the timeout (worst case: two writers
-   *  race the sidecar — atomic writes still keep individual files intact). */
-  private acquireScaffoldLock(workDir: string, pathType: string): () => void {
-    const lockFull = this.scaffoldFullPath(workDir, SCAFFOLD_LOCK_REL, pathType);
-    const dashboardDir = this.scaffoldFullPath(workDir, '.dashboard', pathType);
-    const start = Date.now();
-
-    while (Date.now() - start < SCAFFOLD_LOCK_TIMEOUT_MS) {
-      if (this.tryAcquireScaffoldLock(dashboardDir, lockFull, pathType)) {
-        return () => this.releaseScaffoldLock(lockFull, pathType);
-      }
-      const ageMs = this.scaffoldLockAgeMs(lockFull, pathType);
-      if (ageMs !== null && ageMs > SCAFFOLD_LOCK_STALE_MS) {
-        console.warn(`[supervisor] Scaffold lock at ${lockFull} is stale (${Math.round(ageMs / 1000)}s); clearing`);
-        try { this.releaseScaffoldLock(lockFull, pathType); } catch { /* best effort */ }
-      }
-      const waitMs = SCAFFOLD_LOCK_POLL_MS + Math.floor(Math.random() * SCAFFOLD_LOCK_POLL_MS);
-      // Synchronous sleep — writeScaffoldMap is a sync method.
-      const wakeAt = Date.now() + waitMs;
-      while (Date.now() < wakeAt) { /* spin briefly */ }
-    }
-    console.warn(`[supervisor] Could not acquire scaffold lock at ${lockFull} within ${SCAFFOLD_LOCK_TIMEOUT_MS}ms; proceeding without lock`);
-    return () => { /* no-op */ };
-  }
-
-  private tryAcquireScaffoldLock(dashboardDir: string, lockFull: string, pathType: string): boolean {
-    if (pathType === 'wsl') {
-      try {
-        execFileSync('wsl.exe', ['bash', '-lc', `mkdir -p '${dashboardDir}' && mkdir '${lockFull}'`], {
-          timeout: 5000, stdio: 'ignore',
-        });
-        return true;
-      } catch {
-        return false;
-      }
-    }
-    try {
-      fs.mkdirSync(dashboardDir, { recursive: true });
-      fs.mkdirSync(lockFull);
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  private releaseScaffoldLock(lockFull: string, pathType: string): void {
-    if (pathType === 'wsl') {
-      try {
-        execFileSync('wsl.exe', ['bash', '-lc', `rmdir '${lockFull}'`], { timeout: 5000, stdio: 'ignore' });
-      } catch { /* best effort */ }
-      return;
-    }
-    try { fs.rmdirSync(lockFull); } catch { /* best effort */ }
-  }
-
-  private scaffoldLockAgeMs(lockFull: string, pathType: string): number | null {
-    if (pathType === 'wsl') {
-      try {
-        const out = execFileSync('wsl.exe', ['bash', '-lc', `stat -c %Y '${lockFull}'`], {
-          encoding: 'utf-8', timeout: 5000,
-        });
-        const epochS = Number.parseInt(out.trim(), 10);
-        if (!Number.isFinite(epochS)) return null;
-        return Date.now() - epochS * 1000;
-      } catch {
-        return null;
-      }
-    }
-    try {
-      const stat = fs.statSync(lockFull);
-      return Date.now() - stat.mtimeMs;
-    } catch {
-      return null;
-    }
+    return writeSharedScaffoldMap(workDir, files, pathType, { logPrefix: '[supervisor]' });
   }
 
   /** Create the full .dashboard/supervisor/ scaffold in a workspace.
@@ -1980,8 +1661,8 @@ export class AgentSupervisor extends EventEmitter {
    *  Returns 1 if it wrote the seed, 0 if the file already existed. */
   private seedWorkerMemoryIfAbsent(workDir: string, pathType: string): number {
     const relPath = `.dashboard/workers/claude/behavioral.md`;
-    if (this.scaffoldFileExists(workDir, relPath, pathType)) return 0;
-    this.atomicWriteScaffoldText(workDir, relPath, WORKER_BEHAVIORAL_MD, false, pathType);
+    if (scaffoldFileExists(workDir, relPath, pathType)) return 0;
+    atomicWriteScaffoldText(workDir, relPath, WORKER_BEHAVIORAL_MD, false, pathType);
     return 1;
   }
 
@@ -1998,8 +1679,8 @@ export class AgentSupervisor extends EventEmitter {
    *  Returns 1 if it wrote the seed, 0 if the file already existed. */
   private seedSupervisorMemoryIfAbsent(workDir: string, pathType: string): number {
     const relPath = `.dashboard/supervisor/memory/MEMORY.md`;
-    if (this.scaffoldFileExists(workDir, relPath, pathType)) return 0;
-    this.atomicWriteScaffoldText(workDir, relPath, SUPERVISOR_MEMORY_MD, false, pathType);
+    if (scaffoldFileExists(workDir, relPath, pathType)) return 0;
+    atomicWriteScaffoldText(workDir, relPath, SUPERVISOR_MEMORY_MD, false, pathType);
     return 1;
   }
 
