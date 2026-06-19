@@ -416,6 +416,57 @@ export type AgentActionsCommand =
   | { mode: 'disabled' }
   | { mode: 'armed'; durationMs: number | null };
 
+// ── Slice 13: user-only downloads with a premium shelf ───────────────────────
+// Decision gate APPROVED+EXTENDED (2026-06-17, Edward): agents MAY download but
+// ONLY from allowlisted origins (reuse the Slice-4 per-workspace agent access
+// rules); agent downloads from non-approved origins are DENIED + audited. User
+// downloads require a trusted-chrome confirmation (never auto-allowed). ALL
+// downloads are audited, saved into an app-managed dir, with filenames
+// normalized + path-traversal blocked. The shelf (DownloadsShelf.tsx) consumes
+// these shapes; main is authoritative.
+
+export type BrowserDownloadState = 'in-progress' | 'completed' | 'failed' | 'cancelled';
+
+/** A persisted download record (one row of browser_downloads). Both agent and
+ *  user downloads are recorded; the manager enforced the decision gate before a
+ *  record was ever created (a denied agent download produces NO record — only an
+ *  audit row). */
+export interface BrowserDownload {
+  id: string;
+  url: string;
+  /** Normalized basename actually written (no separators / traversal). */
+  filename: string;
+  /** Absolute path inside the app-managed downloads dir. */
+  savePath: string;
+  partition: BrowserPartition;
+  /** Originating tab's workspace (per-workspace isolation). null = unscoped. */
+  workspaceId: string | null;
+  /** new URL(url).origin, or '' if unparseable. */
+  origin: string;
+  bytesReceived: number;
+  /** 0 = unknown (server sent no content-length). */
+  totalBytes: number;
+  state: BrowserDownloadState;
+  startedAt: number;
+  /** Set once the download leaves 'in-progress'; null while in flight. */
+  endedAt: number | null;
+}
+
+/** Pushed main → renderer (downloadPrompt) when a USER-partition download is
+ *  blocked pending a trusted-chrome confirmation. The renderer shows a confirm
+ *  affordance and calls downloadConfirm(id) to proceed (or simply ignores it to
+ *  decline). NEVER emitted for agent downloads (those are allowlist-gated, not
+ *  human-confirmed). */
+export interface BrowserDownloadPrompt {
+  /** One-shot token identifying this pending confirmation. */
+  id: string;
+  url: string;
+  /** Normalized filename that WOULD be written on confirm. */
+  filename: string;
+  origin: string;
+  workspaceId: string | null;
+}
+
 /** IPC channel names — single source so preload and main can't drift. */
 export const BROWSER_CHANNELS = {
   createTab: 'browser:create-tab',
@@ -578,4 +629,34 @@ export const BROWSER_CHANNELS = {
   /** event main→renderer (AgentDrivingRevoked) — a handed tab navigated off its
    *  allow_signed_in origin and was auto-revoked; drives a trusted notification. */
   agentDrivingRevoked: 'browser:agent-driving-revoked',
+
+  // ── Slice 13: user-only downloads with a premium shelf ─────────────────────
+  // Lifecycle events (main → renderer) each carry the full BrowserDownload
+  // record so the shelf can render without a follow-up fetch. downloadPrompt is
+  // the trusted-chrome confirm request for a USER download (BrowserDownloadPrompt
+  // payload). The invoke channels are trusted-chrome only.
+  /** event main→renderer (BrowserDownload) — a download began writing */
+  downloadStarted: 'browser:download-started',
+  /** event main→renderer (BrowserDownload) — byte progress for an in-flight download */
+  downloadProgress: 'browser:download-progress',
+  /** event main→renderer (BrowserDownload) — a download completed successfully */
+  downloadDone: 'browser:download-done',
+  /** event main→renderer (BrowserDownload) — a download failed or was cancelled */
+  downloadFailed: 'browser:download-failed',
+  /** event main→renderer (BrowserDownloadPrompt) — a USER download is blocked
+   *  awaiting trusted-chrome confirmation (never auto-allowed) */
+  downloadPrompt: 'browser:download-prompt',
+  /** () → BrowserDownload[] — newest-first list for the shelf's first paint */
+  downloadList: 'browser:download-list',
+  /** (id) → boolean — open the saved file via the OS (shell.openPath) */
+  downloadOpenFile: 'browser:download-open-file',
+  /** (id) → void — reveal the saved file in the OS file manager */
+  downloadShowInFolder: 'browser:download-show-in-folder',
+  /** (id) → void — re-initiate a failed/cancelled download (re-runs the gate) */
+  downloadRetry: 'browser:download-retry',
+  /** (id) → void — remove a record from the shelf (does not delete the file) */
+  downloadRemove: 'browser:download-remove',
+  /** (id) → void — confirm a pending USER download (downloadPrompt token); the
+   *  human approved, so main re-initiates and allows the write. */
+  downloadConfirm: 'browser:download-confirm',
 } as const;

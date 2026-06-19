@@ -96,7 +96,7 @@ test('with selectionText: copy + search-selection present', () => {
   assert.ok(got.includes('search-selection'));
 });
 
-// ── Always-present navigation + no download item (M7) ────────────────────────
+// ── Always-present navigation ────────────────────────────────────────────────
 
 test('navigation items always present; back/forward reflect capability flags', () => {
   const tmpl = buildContextMenuTemplate(
@@ -109,16 +109,40 @@ test('navigation items always present; back/forward reflect capability flags', (
   assert.ok(byId.has('reload'));
 });
 
-test('never offers a Save/Download item (M7) on either partition', () => {
-  for (const partition of ['user', 'agent'] as const) {
-    const tmpl = buildContextMenuTemplate(
-      params({ linkURL: 'https://x.test/a', srcURL: 'https://x.test/img.png', selectionText: 'sel' }),
-      { partition },
-    );
-    const labels = tmpl.map((t) => (typeof t.label === 'string' ? t.label.toLowerCase() : ''));
-    assert.ok(!labels.some((l) => l.includes('save') || l.includes('download')),
-      `${partition} template must not offer save/download`);
-  }
+// ── Slice 13: Save link/image as… — USER partition only ──────────────────────
+
+test('user partition: save-link-as present when a linkURL exists', () => {
+  const tmpl = buildContextMenuTemplate(
+    params({ linkURL: 'https://x.test/a.zip' }),
+    { partition: 'user' },
+  );
+  assert.ok(ids(tmpl).includes('save-link-as'), 'user template offers Save Link As…');
+});
+
+test('user partition: save-image-as present for an image srcURL', () => {
+  const tmpl = buildContextMenuTemplate(
+    params({ srcURL: 'https://x.test/img.png', mediaType: 'image' }),
+    { partition: 'user' },
+  );
+  assert.ok(ids(tmpl).includes('save-image-as'), 'user template offers Save Image As…');
+});
+
+test('user partition: NO save-image-as for a non-image srcURL', () => {
+  const tmpl = buildContextMenuTemplate(
+    params({ srcURL: 'https://x.test/clip.mp4', mediaType: 'video' }),
+    { partition: 'user' },
+  );
+  assert.ok(!ids(tmpl).includes('save-image-as'), 'only images get Save Image As…');
+});
+
+test('agent partition: NO save link/image item (downloads are allowlist-gated, never human-confirmed)', () => {
+  const tmpl = buildContextMenuTemplate(
+    params({ linkURL: 'https://x.test/a.zip', srcURL: 'https://x.test/img.png', mediaType: 'image' }),
+    { partition: 'agent' },
+  );
+  const got = ids(tmpl);
+  assert.ok(!got.includes('save-link-as'), 'agent template must not offer Save Link As…');
+  assert.ok(!got.includes('save-image-as'), 'agent template must not offer Save Image As…');
 });
 
 // ── Runner ───────────────────────────────────────────────────────────────────

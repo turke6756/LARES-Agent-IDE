@@ -188,4 +188,20 @@ export function registerBrowserIpc(manager: BrowserManager): void {
   // snapshot — live handed tabs + persisted signed-in origins. Trusted chrome
   // only; the agentDrivingRevoked event is pushed from the manager directly.
   ipcMain.handle(BROWSER_CHANNELS.getSharedSessions, () => manager.getSharedSessions());
+
+  // Slice 13 (user-only downloads): the lifecycle events (downloadStarted/
+  // Progress/Done/Failed) and the downloadPrompt confirm request are pushed
+  // main → renderer from the manager directly. These invokes are the
+  // trusted-chrome control surface for the shelf. downloadConfirm approves a
+  // pending USER download (downloadPrompt token); the rest manage records.
+  ipcMain.handle(BROWSER_CHANNELS.downloadList, () => manager.listDownloads());
+  ipcMain.handle(BROWSER_CHANNELS.downloadConfirm, (_e, id: string) => manager.confirmDownload(id));
+  ipcMain.handle(BROWSER_CHANNELS.downloadOpenFile, (_e, id: string) => manager.openDownloadFile(id));
+  ipcMain.handle(BROWSER_CHANNELS.downloadShowInFolder, (_e, id: string) =>
+    manager.showDownloadInFolder(id),
+  );
+  ipcMain.handle(BROWSER_CHANNELS.downloadRetry, (_e, id: string) => manager.retryDownload(id));
+  ipcMain.handle(BROWSER_CHANNELS.downloadRemove, (_e, id: string) =>
+    manager.removeDownloadRecord(id),
+  );
 }

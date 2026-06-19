@@ -118,6 +118,8 @@ function fakeSession(): unknown {
     setDevicePermissionHandler() {},
     cookies: { get: async () => [], remove: async () => {} },
     clearStorageData: async () => {},
+    // Slice 13: confirmDownload / retryDownload re-initiate via the session.
+    downloadURL() {},
   };
 }
 
@@ -1154,6 +1156,171 @@ test('Slice-10: a USER close lands on the PERSISTENT reopen stack and reopenClos
   assert.equal(calls[0].url, 'https://reopen.example/page', 'with the persisted URL');
   assert.equal(ss.peekNewestClosedAt(null), null, 'popClosedTab emptied the stack');
   ss.clearSession();
+});
+
+// ── Slice 13: user-only downloads — decision gate + will-download handler ─────
+// Exercises the security-critical seam: the agent allowlist gate (allow/deny +
+// NO record on deny), the M12 sensitive-origin denial even for an allowlisted
+// origin, and the user confirm flow (prompt → confirm → one-shot allow). The
+// pure filename/path chokepoint is covered separately in downloads.test.ts.
+
+interface FakeDownloadItem {
+  getURL(): string; getFilename(): string;
+  getTotalBytes(): number; getReceivedBytes(): number;
+  setSavePath(p: string): void; readonly savePath: string | null;
+  cancel(): void; readonly cancelled: boolean;
+  on(ev: string, fn: (...a: unknown[]) => void): void;
+  once(ev: string, fn: (...a: unknown[]) => void): void;
+}
+function fakeDownloadItem(url: string, filename: string): FakeDownloadItem {
+  let savePath: string | null = null;
+  let cancelled = false;
+  return {
+    getURL: () => url,
+    getFilename: () => filename,
+    getTotalBytes: () => 1234,
+    getReceivedBytes: () => 0,
+    setSavePath(p) { savePath = p; },
+    get savePath() { return savePath; },
+    cancel() { cancelled = true; },
+    get cancelled() { return cancelled; },
+    on() {},
+    once() {},
+  };
+}
+interface CapturedAudit { partition: string; url: string; verb: string; outcome: string; }
+/** Swap the stub audit writer for a capturing one; returns the records array. */
+function captureAudit(mgr: MgrHarness['mgr']): CapturedAudit[] {
+  const records: CapturedAudit[] = [];
+  (mgr as unknown as { auditWriter: { record(e: CapturedAudit): void } }).auditWriter = {
+    record: (e) => records.push(e),
+  };
+  return records;
+}
+const fakeDlEvent = (): { preventDefault(): void; prevented: boolean } => {
+  let prevented = false;
+  return { preventDefault() { prevented = true; }, get prevented() { return prevented; } };
+};
+
+test('Slice-13 gate: agent download from an ALLOWLISTED origin → allow', () => {
+  const { mgr } = makeManager();
+  setCache(mgr, [compiled({ hostname: 'files.example', includeSubdomains: true })]);
+  const d = priv<{ action: string; code?: string }>(mgr, 'decideDownload')('agent', 'https://files.example/a.zip', null);
+  assert.equal(d.action, 'allow');
+});
+
+test('Slice-13 gate: agent download from a NON-allowlisted origin → deny (agent-allowlist-denied)', () => {
+  const { mgr } = makeManager();
+  setCache(mgr, [compiled({ hostname: 'files.example', includeSubdomains: true })]);
+  const d = priv<{ action: string; code?: string }>(mgr, 'decideDownload')('agent', 'https://evil.example/x.zip', null);
+  assert.equal(d.action, 'deny');
+  assert.equal(d.code, 'agent-allowlist-denied');
+});
+
+test('Slice-13 gate: M12 — agent download from a SENSITIVE origin denied even if allowlisted', () => {
+  const { mgr } = makeManager();
+  setCache(mgr, [compiled({ hostname: 'accounts.google.com', includeSubdomains: true })]);
+  const d = priv<{ action: string; code?: string }>(mgr, 'decideDownload')('agent', 'https://accounts.google.com/export', null);
+  assert.equal(d.action, 'deny');
+  assert.equal(d.code, 'sensitive-origin-denied');
+});
+
+test('Slice-13 gate: a USER download is never auto-allowed → confirm', () => {
+  const { mgr } = makeManager();
+  setCache(mgr, []);
+  const d = priv<{ action: string }>(mgr, 'decideDownload')('user', 'https://anything.example/a.pdf', null);
+  assert.equal(d.action, 'confirm');
+});
+
+test('Slice-13: an allowlisted agent download is confined, recorded, audited, emits downloadStarted', () => {
+  const { mgr, sent } = makeManager();
+  const records = captureAudit(mgr);
+  setCache(mgr, [compiled({ hostname: 'files.example', includeSubdomains: true })]);
+  const tab = injectTab(mgr, { partition: 'agent', url: 'https://files.example/', workspaceId: null });
+  const item = fakeDownloadItem('https://files.example/report.zip', 'report.zip');
+  const event = fakeDlEvent();
+  priv<void>(mgr, 'handleWillDownload')(event, item, tab.view.webContents);
+
+  assert.equal(event.prevented, false, 'an allowed download is NOT prevented');
+  assert.ok(item.savePath && item.savePath.endsWith('report.zip'), 'save path set inside the app dir');
+  assert.equal(sent.filter((s) => s.channel === CH.downloadStarted).length, 1, 'downloadStarted emitted once');
+  assert.ok(records.some((r) => r.outcome === 'ok:download'), 'the accept is audited');
+  assert.ok(mgr.listDownloads().some((r) => r.url === 'https://files.example/report.zip'), 'a db record was inserted');
+});
+
+test('Slice-13: a denied agent download is prevented + audited and creates NO db record', () => {
+  const { mgr, sent } = makeManager();
+  const records = captureAudit(mgr);
+  setCache(mgr, [compiled({ hostname: 'files.example', includeSubdomains: true })]);
+  const tab = injectTab(mgr, { partition: 'agent', url: 'https://files.example/', workspaceId: null });
+  const item = fakeDownloadItem('https://evil.example/malware.exe', 'malware.exe');
+  const event = fakeDlEvent();
+  priv<void>(mgr, 'handleWillDownload')(event, item, tab.view.webContents);
+
+  assert.equal(event.prevented, true, 'the denied download is prevented');
+  assert.equal(item.savePath, null, 'no save path on deny');
+  assert.equal(sent.filter((s) => s.channel === CH.downloadStarted).length, 0, 'no downloadStarted on deny');
+  assert.ok(records.some((r) => r.outcome === 'denied:agent-allowlist-denied'), 'the deny is audited');
+  assert.ok(!mgr.listDownloads().some((r) => r.url.includes('evil.example')), 'NO db record on deny');
+});
+
+test('Slice-13: a USER download is prevented + prompts (normalized filename) and writes nothing pre-confirm', () => {
+  const { mgr, sent } = makeManager();
+  captureAudit(mgr);
+  setCache(mgr, []);
+  const tab = injectTab(mgr, { partition: 'user', url: 'https://site.example/', workspaceId: null });
+  // A traversal-y suggested name must be normalized in the prompt the human sees.
+  const item = fakeDownloadItem('https://site.example/get?f=1', '../../etc/passwd');
+  const event = fakeDlEvent();
+  priv<void>(mgr, 'handleWillDownload')(event, item, tab.view.webContents);
+
+  assert.equal(event.prevented, true, 'the user download is cancelled pending confirmation');
+  assert.equal(item.savePath, null, 'nothing written before confirm');
+  const prompts = sent.filter((s) => s.channel === CH.downloadPrompt);
+  assert.equal(prompts.length, 1, 'exactly one downloadPrompt');
+  const prompt = prompts[0].payload as { id: string; filename: string; url: string };
+  assert.equal(prompt.filename, 'passwd', 'the prompt filename is normalized (no traversal)');
+  assert.ok(prompt.id, 'the prompt carries a confirm token');
+  assert.equal(sent.filter((s) => s.channel === CH.downloadStarted).length, 0, 'no write surfaced as started');
+});
+
+test('Slice-13: confirmDownload re-initiates and the one-shot approval allows the re-fired download', () => {
+  const { mgr, sent } = makeManager();
+  captureAudit(mgr);
+  setCache(mgr, []);
+  const tab = injectTab(mgr, { partition: 'user', url: 'https://docs.example/', workspaceId: null });
+  const item = fakeDownloadItem('https://docs.example/file.pdf', 'file.pdf');
+  priv<void>(mgr, 'handleWillDownload')(fakeDlEvent(), item, tab.view.webContents);
+  const prompt = sent.find((s) => s.channel === CH.downloadPrompt)?.payload as { id: string };
+  assert.ok(prompt?.id, 'a confirm token was issued');
+
+  mgr.confirmDownload(prompt.id);
+  const approved = (mgr as unknown as { approvedDownloadUrls: Map<string, unknown> }).approvedDownloadUrls;
+  assert.ok(approved.has('https://docs.example/file.pdf'), 'the url is approved for the re-fired download');
+
+  // The re-fired will-download (no owning tab — fired by session.downloadURL) is
+  // allowed through purely on the one-shot approval.
+  const item2 = fakeDownloadItem('https://docs.example/file.pdf', 'file.pdf');
+  const event2 = fakeDlEvent();
+  priv<void>(mgr, 'handleWillDownload')(event2, item2, undefined);
+
+  assert.equal(event2.prevented, false, 'the approved re-download is NOT prevented');
+  assert.ok(item2.savePath && item2.savePath.endsWith('file.pdf'), 'the confirmed file is written');
+  assert.equal(approved.has('https://docs.example/file.pdf'), false, 'the approval is one-shot (consumed)');
+  assert.equal(sent.filter((s) => s.channel === CH.downloadStarted).length, 1, 'downloadStarted only after confirm');
+});
+
+test('Slice-13: a download from an UNKNOWN source (no owning tab) is denied with no record', () => {
+  const { mgr, sent } = makeManager();
+  const records = captureAudit(mgr);
+  setCache(mgr, []);
+  const item = fakeDownloadItem('https://orphan.example/x.bin', 'x.bin');
+  const event = fakeDlEvent();
+  priv<void>(mgr, 'handleWillDownload')(event, item, undefined);
+
+  assert.equal(event.prevented, true, 'an orphan download is prevented');
+  assert.ok(records.some((r) => r.outcome === 'denied:unknown-source'), 'audited as unknown-source');
+  assert.ok(!mgr.listDownloads().some((r) => r.url.includes('orphan.example')), 'no record for an orphan download');
 });
 
 // ── Run ──────────────────────────────────────────────────────────────────────

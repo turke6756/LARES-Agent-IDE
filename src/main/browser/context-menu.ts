@@ -11,7 +11,11 @@
 //   'open-link-new-tab' · 'copy-link' · 'search-selection' · 'bookmark-page'
 //
 // Security shape (mirrors the WP6 plan):
-//   - NO Save/Download item (M7 — downloads are denied).
+//   - Save link/image as… only on the USER partition (Slice 13 — user-only
+//     downloads; the manager re-fires it through will-download which requires a
+//     trusted-chrome confirmation. Agent tabs get NO save item: their downloads
+//     are allowlist-gated and never human-confirmed, so a context-menu save
+//     would be a dead affordance).
 //   - NO Inspect/DevTools on the agent partition (M9 — openDevTools would
 //     detach a debugger on a persist:agent path; inspect is user-only).
 //   - "Bookmark this page" only on the user partition (bookmarks are
@@ -37,6 +41,17 @@ export function buildContextMenuTemplate(
     template.push({ id: 'open-link-new-tab', label: 'Open Link in New Tab' });
     // renderer-side action → contextMenuCommand (writes to clipboard)
     template.push({ id: 'copy-link', label: 'Copy Link Address' });
+    // Slice 13: USER partition only — main-side, re-fired through the download
+    // gate (→ trusted-chrome confirmation). Omitted on agent tabs.
+    if (ctx.partition === 'user') {
+      template.push({ id: 'save-link-as', label: 'Save Link As…' });
+    }
+  }
+
+  // ── Image save (USER PARTITION ONLY) — Slice 13 ─────────────────────────
+  if (ctx.partition === 'user' && params.srcURL && params.mediaType === 'image') {
+    template.push({ type: 'separator' });
+    template.push({ id: 'save-image-as', label: 'Save Image As…' });
   }
 
   // ── Selection items (only when text is selected) ────────────────────────
@@ -59,8 +74,6 @@ export function buildContextMenuTemplate(
     template.push({ type: 'separator' });
     template.push({ id: 'inspect', label: 'Inspect' });
   }
-
-  // NOTE: deliberately NO Save / Download item (M7).
 
   return template;
 }

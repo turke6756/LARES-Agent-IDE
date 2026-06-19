@@ -14,6 +14,8 @@ import type {
   BrowserBounds,
   BrowserContextMenuParams,
   BrowserCreateTabOptions,
+  BrowserDownload,
+  BrowserDownloadPrompt,
   BrowserFindResult,
   BrowserOpenRequest,
   BrowserShortcut,
@@ -860,6 +862,37 @@ export interface IpcApi {
     //    streams the off-origin auto-revoke notification. Trusted chrome only. ───
     getSharedSessions: () => Promise<SharedAgentSessions>;
     onAgentDrivingRevoked: (callback: (payload: AgentDrivingRevoked) => void) => () => void;
+
+    // ── Slice 13: user-only downloads with a premium shelf. Trusted chrome only.
+    //    The decision gate runs in main: agent downloads are allowlist-gated
+    //    (denied → no record, only an audit row); USER downloads are blocked
+    //    until downloadConfirm(promptId) is called for an onDownloadPrompt token.
+    //    Lifecycle events each carry the full BrowserDownload record so the shelf
+    //    renders without a follow-up fetch. ────────────────────────────────────
+    /** Newest-first records for the shelf's first paint. */
+    downloadList: () => Promise<BrowserDownload[]>;
+    /** Approve a pending USER download (an onDownloadPrompt token); main
+     *  re-initiates and allows the write. */
+    downloadConfirm: (id: string) => Promise<void>;
+    /** Open the saved file via the OS; resolves false if unknown / OS error. */
+    downloadOpenFile: (id: string) => Promise<boolean>;
+    /** Reveal the saved file in the OS file manager. */
+    downloadShowInFolder: (id: string) => Promise<void>;
+    /** Re-initiate a failed/cancelled download (re-runs the decision gate). */
+    downloadRetry: (id: string) => Promise<void>;
+    /** Remove a record from the shelf (does NOT delete the saved file). */
+    downloadRemove: (id: string) => Promise<void>;
+    /** A download began writing (already confined + recorded). */
+    onDownloadStarted: (callback: (rec: BrowserDownload) => void) => () => void;
+    /** Byte progress for an in-flight download. */
+    onDownloadProgress: (callback: (rec: BrowserDownload) => void) => () => void;
+    /** A download completed successfully. */
+    onDownloadDone: (callback: (rec: BrowserDownload) => void) => () => void;
+    /** A download failed or was cancelled. */
+    onDownloadFailed: (callback: (rec: BrowserDownload) => void) => () => void;
+    /** A USER download is blocked awaiting trusted-chrome confirmation
+     *  (downloadConfirm). NEVER fired for agent downloads. */
+    onDownloadPrompt: (callback: (prompt: BrowserDownloadPrompt) => void) => () => void;
 
     // ── Website-access policy (plans/website-allowlist-simplification.md) ──────
     // ONE agent allowlist; enforcement keyed to the Agent Actions toggle (no

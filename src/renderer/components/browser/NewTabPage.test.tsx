@@ -3,7 +3,12 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import NewTabPage from './NewTabPage';
-import { useBrowserStore, type Bookmark, type HistoryEntry } from '../../stores/browser-store';
+import {
+  useBrowserStore,
+  type Bookmark,
+  type BrowserDownload,
+  type HistoryEntry,
+} from '../../stores/browser-store';
 
 // Slice-9 acceptance (New-tab command center):
 //   REQUIRED (a) clean empty state renders with NO backend methods available —
@@ -53,7 +58,7 @@ function setInputValue(el: HTMLInputElement, value: string) {
 
 beforeEach(() => {
   // Reset the shared omnibox slice so a prior test's state can't bleed in.
-  useBrowserStore.setState({ omniboxResults: [], omniboxActiveIndex: -1, tabs: [], selectedWorkspaceId: null });
+  useBrowserStore.setState({ omniboxResults: [], omniboxActiveIndex: -1, tabs: [], selectedWorkspaceId: null, downloads: [] });
   container = document.createElement('div');
   document.body.appendChild(container);
 });
@@ -162,5 +167,54 @@ describe('NewTabPage — all opens route through the M6 gate (Slice 9, REQUIRED 
     expect(option).toBeTruthy();
     click(option!);
     expect(onNavigate).toHaveBeenCalledWith('https://news.example/');
+  });
+});
+
+describe('NewTabPage — recent downloads slot (Slice 13)', () => {
+  function dl(over: Partial<BrowserDownload> & { id: string }): BrowserDownload {
+    return {
+      url: 'https://files.example/x',
+      filename: 'x',
+      savePath: '/dl/x',
+      partition: 'user',
+      workspaceId: null,
+      origin: 'https://files.example',
+      bytesReceived: 1,
+      totalBytes: 1,
+      state: 'completed',
+      startedAt: 1,
+      endedAt: 2,
+      ...over,
+    };
+  }
+
+  it('lists the most recent COMPLETED downloads and clicking opens the file', async () => {
+    const downloadOpenFile = vi.fn();
+    (window as unknown as { api: unknown }).api = { browser: { downloadOpenFile } };
+    useBrowserStore.setState({
+      downloads: [
+        dl({ id: 'd1', filename: 'report.pdf', state: 'completed' }),
+        dl({ id: 'd2', filename: 'pending.zip', state: 'in-progress', endedAt: null }),
+      ],
+    });
+
+    render(() => {});
+    await flush();
+
+    // Completed file shown; an in-progress one is NOT in the recent-completed list.
+    expect(container.textContent).toContain('report.pdf');
+    expect(container.textContent).not.toContain('pending.zip');
+    expect(container.textContent).not.toContain('Downloads will appear here.');
+
+    const fileBtn = buttonByText('report.pdf');
+    expect(fileBtn).toBeTruthy();
+    click(fileBtn!);
+    expect(downloadOpenFile).toHaveBeenCalledWith('d1');
+  });
+
+  it('falls back to the empty copy when there are no completed downloads', async () => {
+    render(() => {});
+    await flush();
+    expect(container.textContent).toContain('Downloads will appear here.');
   });
 });

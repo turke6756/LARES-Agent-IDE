@@ -41,6 +41,7 @@ interface Props {
 
 const TOP_SITES_LIMIT = 8;
 const RECENT_BOOKMARKS_LIMIT = 8;
+const RECENT_DOWNLOADS_LIMIT = 4;
 const OMNIBOX_DEBOUNCE_MS = 80;
 
 const KIND_ICON: Record<OmniboxSuggestion['kind'], keyof typeof Icons> = {
@@ -242,6 +243,17 @@ export default function NewTabPage({ onNavigate }: Props) {
   const recentBookmarks = useMemo(
     () => [...bookmarks.items].sort((a, b) => b.createdAt - a.createdAt).slice(0, RECENT_BOOKMARKS_LIMIT),
     [bookmarks.items],
+  );
+
+  // ── Recent downloads (Slice 13) ────────────────────────────────────────────
+  // Read straight from the store's download slice (the bridge seeds + upserts
+  // it). Show only the most recent COMPLETED files, capped small. Clicking a row
+  // opens the saved file via the shell (store.openDownloadFile).
+  const downloads = useBrowserStore((s) => s.downloads);
+  const openDownloadFile = useBrowserStore((s) => s.openDownloadFile);
+  const recentDownloads = useMemo(
+    () => downloads.filter((d) => d.state === 'completed').slice(0, RECENT_DOWNLOADS_LIMIT),
+    [downloads],
   );
 
   // ── Omnibox handlers ───────────────────────────────────────────────────────
@@ -524,14 +536,30 @@ export default function NewTabPage({ onNavigate }: Props) {
           )}
         </section>
 
-        {/* Recent downloads — RESERVED slot. Slice 13 populates this; for now it
-            is an empty placeholder (no downloads backend is built here). */}
+        {/* Recent downloads (Slice 13) — most recent COMPLETED files from the
+            store's download slice. Clicking opens the saved file via the shell. */}
         <section className="w-full">
           <SectionLabel>Recent downloads</SectionLabel>
-          <div className="flex items-center gap-2 text-[11px] text-[var(--color-fg-secondary)] px-1">
-            <Icons.Download className="w-3.5 h-3.5 opacity-50 shrink-0" />
-            <span>Downloads will appear here.</span>
-          </div>
+          {recentDownloads.length === 0 ? (
+            <div className="flex items-center gap-2 text-[11px] text-[var(--color-fg-secondary)] px-1">
+              <Icons.Download className="w-3.5 h-3.5 opacity-50 shrink-0" />
+              <span>Downloads will appear here.</span>
+            </div>
+          ) : (
+            <div className="flex flex-wrap gap-2">
+              {recentDownloads.map((d) => (
+                <button
+                  key={d.id}
+                  onClick={() => openDownloadFile(d.id)}
+                  title={`Open ${d.filename}\n${d.origin}`}
+                  className="flex items-center gap-1.5 pl-1.5 pr-2.5 py-1 rounded-full text-[11px] bg-[var(--color-browser-chrome-2)] border border-[var(--color-browser-divider)] text-[var(--color-fg-primary)] hover:border-accent-blue/60 transition-colors max-w-[220px]"
+                >
+                  <Icons.FileText className="w-3.5 h-3.5 shrink-0 text-[var(--color-fg-secondary)]" />
+                  <span className="truncate">{d.filename}</span>
+                </button>
+              ))}
+            </div>
+          )}
         </section>
       </div>
     </div>

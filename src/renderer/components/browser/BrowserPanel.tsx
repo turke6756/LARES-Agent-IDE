@@ -10,6 +10,7 @@ import WebsiteAccessSettings from './WebsiteAccessSettings';
 import SigninHandoffBanner from './SigninHandoffBanner';
 import ActivityDrawer from './ActivityDrawer';
 import DenialToast from './DenialToast';
+import DownloadsShelf from './DownloadsShelf';
 import * as Icons from 'lucide-react';
 
 // Center-panel browser pane (WP1-B). All chrome (tab strip, address bar,
@@ -155,6 +156,13 @@ export default function BrowserPanel() {
                 auditDrawerOpen. */}
             <ActivityDrawer />
           </div>
+
+          {/* ── Slice 13: downloads shelf — a chrome-zone strip BELOW the host
+              (a flex sibling outside the WebContentsView bounds, so it never
+              overlaps the live page → no pane suspension needed, mirroring the
+              DenialToast occlusion rule). Self-gates: hidden when there are no
+              records and no pending confirm. ── */}
+          <DownloadsShelf />
 
           {/* Slice-3: denial toasts — pinned to the top-right chrome zone (above
               the host), so they DON'T need to suspend the pane. Self-gates on an

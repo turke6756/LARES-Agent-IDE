@@ -10,6 +10,9 @@ import type {
   AgentActionsState,
   AgentDrivingRevoked,
   BrowserAuditEntry,
+  BrowserDownload,
+  BrowserDownloadPrompt,
+  BrowserDownloadState,
   HandedTabInfo,
   OmniboxSuggestion,
   SharedAgentSessions,
@@ -32,6 +35,9 @@ export type {
   AgentActionsState,
   AgentDrivingRevoked,
   BrowserAuditEntry,
+  BrowserDownload,
+  BrowserDownloadPrompt,
+  BrowserDownloadState,
   HandedTabInfo,
   OmniboxSuggestion,
   SharedAgentSessions,
@@ -275,6 +281,23 @@ export interface BrowserApi {
   //    preload shapes without these channels don't crash the bridge. ───────────
   getSharedSessions?(): Promise<SharedAgentSessions>;
   onAgentDrivingRevoked?(cb: (payload: AgentDrivingRevoked) => void): () => void;
+
+  // ── Slice 13: user-only downloads (the shelf). Trusted-chrome only. The five
+  //    lifecycle/prompt events each return an unsubscribe fn; the invokes manage
+  //    records + the user-download confirmation. Optional + guarded so older /
+  //    stubbed preload shapes without these channels don't crash the bridge. ───
+  downloadList?(): Promise<BrowserDownload[]>;
+  /** `id` is the one-shot prompt token from onDownloadPrompt — NOT a record id. */
+  downloadConfirm?(id: string): Promise<void>;
+  downloadOpenFile?(id: string): Promise<boolean>;
+  downloadShowInFolder?(id: string): Promise<void>;
+  downloadRetry?(id: string): Promise<void>;
+  downloadRemove?(id: string): Promise<void>;
+  onDownloadStarted?(cb: (rec: BrowserDownload) => void): () => void;
+  onDownloadProgress?(cb: (rec: BrowserDownload) => void): () => void;
+  onDownloadDone?(cb: (rec: BrowserDownload) => void): () => void;
+  onDownloadFailed?(cb: (rec: BrowserDownload) => void): () => void;
+  onDownloadPrompt?(cb: (prompt: BrowserDownloadPrompt) => void): () => void;
 
   // ── Website-access policy (plans/website-allowlist-design.md). Trusted shell
   //    chrome only — the renderer reaches the frozen window.api.browser.access
@@ -676,6 +699,35 @@ interface BrowserStoreState {
    *  (the agent now drives the signed-in session). null = idle. */
   signinHandoffDone: { hostname: string } | null;
   dismissSigninHandoffDone: () => void;
+
+  // ── Slice 13: user-only downloads (the shelf) ──────────────────────────────
+  // `downloads` is the newest-first record list (seeded from downloadList() on
+  // bridge init, then upserted keyed by BrowserDownload.id from the five
+  // lifecycle events). `pendingDownloadPrompt` holds the one-shot USER-download
+  // confirm token (fed by onDownloadPrompt) — confirmDownload passes its `id`
+  // straight to downloadConfirm. `downloadsShelfCollapsed` collapses the shelf
+  // to a slim summary bar (the shelf hides entirely when there's nothing to
+  // show). Main is authoritative for every record + the decision gate.
+  downloads: BrowserDownload[];
+  pendingDownloadPrompt: BrowserDownloadPrompt | null;
+  downloadsShelfCollapsed: boolean;
+  /** Seed the shelf from the newest-first list (called on bridge init). */
+  loadDownloads: () => Promise<void>;
+  /** Upsert a lifecycle record keyed by id (started → front; progress/done/failed
+   *  → patch in place). Wired to all four lifecycle events. */
+  handleDownloadEvent: (rec: BrowserDownload) => void;
+  /** Stash the USER-download confirm prompt (onDownloadPrompt). */
+  handleDownloadPrompt: (prompt: BrowserDownloadPrompt) => void;
+  /** Human approved → pass the prompt token to downloadConfirm + clear the slot. */
+  confirmDownload: () => void;
+  /** Decline a pending USER download — clear the slot locally (main treats an
+   *  un-confirmed prompt as declined; nothing is written). */
+  dismissDownloadPrompt: () => void;
+  openDownloadFile: (id: string) => void;
+  showDownloadInFolder: (id: string) => void;
+  retryDownload: (id: string) => void;
+  removeDownload: (id: string) => void;
+  toggleDownloadsShelf: () => void;
 }
 
 export const useBrowserStore = create<BrowserStoreState>((set, get) => ({
@@ -726,6 +778,11 @@ export const useBrowserStore = create<BrowserStoreState>((set, get) => ({
   sharedSessions: { handedTabs: [], signedInOrigins: [] },
   drivingRevoked: [],
   signinHandoffDone: null,
+
+  // Slice 13 — user-only downloads (the shelf).
+  downloads: [],
+  pendingDownloadPrompt: null,
+  downloadsShelfCollapsed: false,
 
   createTab: async (partition = 'user', url?) => {
     const api = getBrowserApi();
@@ -1635,6 +1692,90 @@ export const useBrowserStore = create<BrowserStoreState>((set, get) => ({
     set((s) => ({ drivingRevoked: s.drivingRevoked.filter((r) => r.tabId !== tabId) })),
 
   dismissSigninHandoffDone: () => set({ signinHandoffDone: null }),
+
+  // ── Slice 13: user-only downloads (the shelf) ──────────────────────────────
+  loadDownloads: async () => {
+    const api = getBrowserApi();
+    if (!api?.downloadList) return;
+    try {
+      const rows = await api.downloadList();
+      set({ downloads: Array.isArray(rows) ? rows : [] });
+    } catch (err) {
+      console.error('browser.downloadList failed:', err);
+    }
+  },
+
+  handleDownloadEvent: (rec) => {
+    if (!rec || typeof rec.id !== 'string') return;
+    set((s) => {
+      const idx = s.downloads.findIndex((d) => d.id === rec.id);
+      if (idx === -1) {
+        // A record we haven't seen (a fresh start, or a progress/done that raced
+        // ahead of its start) → front, preserving newest-first ordering.
+        return { downloads: [rec, ...s.downloads] };
+      }
+      const downloads = s.downloads.slice();
+      downloads[idx] = { ...downloads[idx], ...rec };
+      return { downloads };
+    });
+  },
+
+  handleDownloadPrompt: (prompt) => {
+    if (!prompt || typeof prompt.id !== 'string') return;
+    set({ pendingDownloadPrompt: prompt, downloadsShelfCollapsed: false });
+  },
+
+  confirmDownload: () => {
+    const prompt = get().pendingDownloadPrompt;
+    if (!prompt) return;
+    // One-shot token — clear the slot before calling so a double-click can't
+    // re-confirm; main re-initiates + allows the write.
+    set({ pendingDownloadPrompt: null });
+    try {
+      void getBrowserApi()?.downloadConfirm?.(prompt.id);
+    } catch (err) {
+      console.error('browser.downloadConfirm failed:', err);
+    }
+  },
+
+  dismissDownloadPrompt: () => set({ pendingDownloadPrompt: null }),
+
+  openDownloadFile: (id) => {
+    try {
+      void getBrowserApi()?.downloadOpenFile?.(id);
+    } catch (err) {
+      console.error('browser.downloadOpenFile failed:', err);
+    }
+  },
+
+  showDownloadInFolder: (id) => {
+    try {
+      void getBrowserApi()?.downloadShowInFolder?.(id);
+    } catch (err) {
+      console.error('browser.downloadShowInFolder failed:', err);
+    }
+  },
+
+  retryDownload: (id) => {
+    try {
+      void getBrowserApi()?.downloadRetry?.(id);
+    } catch (err) {
+      console.error('browser.downloadRetry failed:', err);
+    }
+  },
+
+  removeDownload: (id) => {
+    // Optimistic — drop the record locally (file is kept); main also forgets it.
+    set((s) => ({ downloads: s.downloads.filter((d) => d.id !== id) }));
+    try {
+      void getBrowserApi()?.downloadRemove?.(id);
+    } catch (err) {
+      console.error('browser.downloadRemove failed:', err);
+    }
+  },
+
+  toggleDownloadsShelf: () =>
+    set((s) => ({ downloadsShelfCollapsed: !s.downloadsShelfCollapsed })),
 }));
 
 // ── Event bridge ─────────────────────────────────────────────────────────────
@@ -1738,6 +1879,24 @@ export function ensureBrowserBridge(): boolean {
     api.onAgentDrivingRevoked((payload) =>
       useBrowserStore.getState().handleAgentDrivingRevoked(payload),
     );
+  }
+
+  // ── Slice 13: user-only downloads (the shelf). Subscribe to the five
+  //    lifecycle/prompt pushes, then seed the shelf from the newest-first list.
+  //    Each lifecycle event carries the FULL record, so the upsert needs no
+  //    follow-up fetch. Guarded so older/stubbed preload shapes without these
+  //    channels don't crash the bridge. ────────────────────────────────────────
+  if (api.onDownloadStarted) {
+    const onEvt = (rec: BrowserDownload) =>
+      useBrowserStore.getState().handleDownloadEvent(rec);
+    api.onDownloadStarted(onEvt);
+    api.onDownloadProgress?.(onEvt);
+    api.onDownloadDone?.(onEvt);
+    api.onDownloadFailed?.(onEvt);
+    api.onDownloadPrompt?.((prompt) =>
+      useBrowserStore.getState().handleDownloadPrompt(prompt),
+    );
+    void useBrowserStore.getState().loadDownloads();
   }
   return true;
 }

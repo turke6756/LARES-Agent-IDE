@@ -11,6 +11,8 @@ import type {
   Bookmark,
   BrowserAuditEntry,
   BrowserContextMenuParams,
+  BrowserDownload,
+  BrowserDownloadPrompt,
   BrowserFindResult,
   BrowserOpenRequest,
   BrowserShortcut,
@@ -279,6 +281,40 @@ const api: IpcApi = {
       const listener = (_event: any, payload: AgentDrivingRevoked) => callback(payload);
       ipcRenderer.on(BROWSER_CHANNELS.agentDrivingRevoked, listener);
       return () => ipcRenderer.removeListener(BROWSER_CHANNELS.agentDrivingRevoked, listener);
+    },
+
+    // ── Slice 13: user-only downloads. Lifecycle events + the confirm prompt
+    //    are main → renderer pushes; the invokes manage records + confirm. ─────
+    downloadList: () => ipcRenderer.invoke(BROWSER_CHANNELS.downloadList),
+    downloadConfirm: (id) => ipcRenderer.invoke(BROWSER_CHANNELS.downloadConfirm, id),
+    downloadOpenFile: (id) => ipcRenderer.invoke(BROWSER_CHANNELS.downloadOpenFile, id),
+    downloadShowInFolder: (id) => ipcRenderer.invoke(BROWSER_CHANNELS.downloadShowInFolder, id),
+    downloadRetry: (id) => ipcRenderer.invoke(BROWSER_CHANNELS.downloadRetry, id),
+    downloadRemove: (id) => ipcRenderer.invoke(BROWSER_CHANNELS.downloadRemove, id),
+    onDownloadStarted: (callback) => {
+      const listener = (_event: any, rec: BrowserDownload) => callback(rec);
+      ipcRenderer.on(BROWSER_CHANNELS.downloadStarted, listener);
+      return () => ipcRenderer.removeListener(BROWSER_CHANNELS.downloadStarted, listener);
+    },
+    onDownloadProgress: (callback) => {
+      const listener = (_event: any, rec: BrowserDownload) => callback(rec);
+      ipcRenderer.on(BROWSER_CHANNELS.downloadProgress, listener);
+      return () => ipcRenderer.removeListener(BROWSER_CHANNELS.downloadProgress, listener);
+    },
+    onDownloadDone: (callback) => {
+      const listener = (_event: any, rec: BrowserDownload) => callback(rec);
+      ipcRenderer.on(BROWSER_CHANNELS.downloadDone, listener);
+      return () => ipcRenderer.removeListener(BROWSER_CHANNELS.downloadDone, listener);
+    },
+    onDownloadFailed: (callback) => {
+      const listener = (_event: any, rec: BrowserDownload) => callback(rec);
+      ipcRenderer.on(BROWSER_CHANNELS.downloadFailed, listener);
+      return () => ipcRenderer.removeListener(BROWSER_CHANNELS.downloadFailed, listener);
+    },
+    onDownloadPrompt: (callback) => {
+      const listener = (_event: any, prompt: BrowserDownloadPrompt) => callback(prompt);
+      ipcRenderer.on(BROWSER_CHANNELS.downloadPrompt, listener);
+      return () => ipcRenderer.removeListener(BROWSER_CHANNELS.downloadPrompt, listener);
     },
 
     // ── Website-access policy (plans/website-allowlist-simplification.md).

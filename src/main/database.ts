@@ -338,6 +338,37 @@ export function initDatabase(): void {
       ON browser_closed_tabs(workspace_id, closed_at DESC)
   `);
 
+  // ── Slice 13: user-only downloads (app-managed download pipeline) ──────────
+  // Every download (agent + user) is recorded here with its normalized filename,
+  // app-managed save path, originating partition/workspace, byte progress, and
+  // lifecycle state. The browser MANAGER enforces the decision gate (agent
+  // downloads only from allowlisted origins; user downloads only after a
+  // trusted-chrome confirmation) and normalizes filenames / blocks path
+  // traversal before writing; this table just persists the resulting records.
+  // The thin service is src/main/browser/downloads-store.ts (getDb()). The
+  // `partition` CHECK pins each row to the two known partitions, and the
+  // `state` CHECK to the four lifecycle states. Times are epoch-ms.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS browser_downloads (
+      id             TEXT PRIMARY KEY,
+      url            TEXT NOT NULL,
+      filename       TEXT NOT NULL,                  -- normalized basename (no separators / traversal)
+      save_path      TEXT NOT NULL,                  -- absolute path inside the app-managed downloads dir
+      partition      TEXT NOT NULL CHECK (partition IN ('user','agent')),
+      workspace_id   TEXT,                           -- nullable; matches the originating tab's workspaceId
+      origin         TEXT NOT NULL DEFAULT '',       -- new URL(url).origin, '' if unparseable
+      bytes_received INTEGER NOT NULL DEFAULT 0,
+      total_bytes    INTEGER NOT NULL DEFAULT 0,     -- 0 = unknown (server sent no content-length)
+      state          TEXT NOT NULL CHECK (state IN ('in-progress','completed','failed','cancelled')),
+      started_at     INTEGER NOT NULL,
+      ended_at       INTEGER                         -- set when state leaves 'in-progress'
+    )
+  `);
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_downloads_started
+      ON browser_downloads(started_at DESC)
+  `);
+
   // ── Website-access policy tables (plans/website-allowlist-simplification.md) ─
   // ONE human-curated agent allowlist for the embedded browser. Stored in the
   // dashboard DB (userData, outside the workspace) so the agent's file tools can

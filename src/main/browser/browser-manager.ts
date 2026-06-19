@@ -7,8 +7,9 @@
 
 import { randomUUID } from 'crypto';
 import path from 'path';
-import { app, Menu, session, WebContentsView } from 'electron';
-import type { BrowserWindow, Session, WebContents } from 'electron';
+import { app, Menu, session, shell, WebContentsView } from 'electron';
+import type { BrowserWindow, DownloadItem, Event as ElectronEvent, Session, WebContents } from 'electron';
+import { existsSync, mkdirSync } from 'fs';
 import { setManagedWebContentsCheck } from '../security/webcontents-guard';
 import { WS_PORT, JUPYTER_BASE_PORT, JUPYTER_PORT_RETRIES } from '../control-ports';
 import {
@@ -31,6 +32,7 @@ import {
   checkNavigation,
   checkSignedInDrive,
   EXPOSURE_REDUCING_VERBS,
+  isSensitiveOrigin,
   getRuntimeActionsEnabled,
   getAgentActionsState,
   setAgentActionsState,
@@ -55,6 +57,9 @@ import {
   type BrowserBounds,
   type BrowserContextMenuParams,
   type BrowserCreateTabOptions,
+  type BrowserDownload,
+  type BrowserDownloadPrompt,
+  type BrowserDownloadState,
   type BrowserPartition,
   type BrowserShortcut,
   type BrowserTabSnapshotEntry,
@@ -111,6 +116,16 @@ import {
   peekNewestClosedAt,
   type SessionTabRow,
 } from './session-store';
+import {
+  getDownload,
+  insertDownload,
+  isPathWithinDir,
+  listDownloads,
+  normalizeDownloadFilename,
+  removeDownload,
+  setDownloadState,
+  updateDownloadProgress,
+} from './downloads-store';
 
 /** Clamp helper for zoom factor (and any other bounded numeric). */
 function clamp(value: number, lo: number, hi: number): number {
@@ -512,6 +527,19 @@ export class BrowserManager {
    *  hardened lazily on first createTab. */
   private hardenedSessions = new Set<string>();
 
+  // ── Slice 13: user-only downloads (decision gate + app-managed dir) ──────────
+  /** USER-partition downloads blocked awaiting a trusted-chrome confirmation,
+   *  keyed by the one-shot prompt token. confirmDownload(token) re-initiates the
+   *  download via session.downloadURL and registers it in approvedDownloadUrls so
+   *  the re-fired will-download is allowed through (never auto-allowed). */
+  private pendingDownloadConfirms = new Map<
+    string,
+    { url: string; filename: string; origin: string; workspaceId: string | null; sessionPartition: string }
+  >();
+  /** Human-approved USER downloads keyed by URL — set by confirmDownload just
+   *  before re-initiating, consumed (one-shot) by the re-fired will-download. */
+  private approvedDownloadUrls = new Map<string, { workspaceId: string | null }>();
+
   constructor(
     private getMainWindow: () => BrowserWindow | null,
     apiPort: number,
@@ -615,12 +643,14 @@ export class BrowserManager {
     ses.setPermissionCheckHandler(() => false);
     ses.setDevicePermissionHandler(() => false);
 
-    // M7: downloads denied on BOTH partitions day-one. Spec M7 would allow
-    // confine+confirm on persist:user, but no native-confirm UX exists until
-    // WP3 — this is a deliberate tightening, tracked in the plans doc's open
-    // items ("user downloads disabled entirely until further notice").
-    ses.on('will-download', (event) => {
-      event.preventDefault();
+    // Slice 13 (supersedes the day-one M7 deny-all): downloads are now gated by
+    // the decision gate — agent downloads only from allowlisted (non-sensitive)
+    // origins; user downloads only after a trusted-chrome confirmation; ALL
+    // accepted downloads are confined to the app-managed dir with a normalized,
+    // traversal-proof filename. The session-level listener fires for every pane
+    // on this partition, so handleWillDownload resolves the originating tab.
+    ses.on('will-download', (event, item, webContents) => {
+      this.handleWillDownload(event, item, webContents);
     });
   }
 
@@ -1495,6 +1525,272 @@ export class BrowserManager {
     return this.audit.getRecent(limit).map((e) => this.toBrowserAuditEntry(e));
   }
 
+  // ── Slice 13: user-only downloads ───────────────────────────────────────────
+
+  /** App-managed downloads directory (created on demand). Every accepted
+   *  download is confined here; nothing is ever written to the OS default
+   *  Downloads folder. */
+  private downloadsDir(): string {
+    const dir = path.join(app.getPath('userData'), 'browser-downloads');
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    return dir;
+  }
+
+  /** new URL(url).origin or '' (matches BrowserDownload.origin's contract). */
+  private safeOrigin(url: string): string {
+    try {
+      return new URL(url).origin;
+    } catch {
+      return '';
+    }
+  }
+
+  /** Resolve the owning pane for a webContents the session handed us. */
+  private tabForWebContents(wc: WebContents | null | undefined): TabEntry | undefined {
+    if (!wc) return undefined;
+    for (const tab of this.tabs.values()) {
+      const tw = tab.view.webContents;
+      if (tw === wc) return tab;
+      try {
+        if (!tw.isDestroyed() && tw.id === wc.id) return tab;
+      } catch {
+        /* destroyed mid-iteration — skip */
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * The download decision gate (Slice 13), separated as a PURE-ish predicate so
+   * it is unit-testable through the manager fakes without a real DownloadItem:
+   *   - agent partition: allowed ONLY from an allowlisted, non-sensitive origin
+   *     (M12 sensitive-origin discipline still applies — a sign-in/payment page
+   *     download is denied even if the origin is allowlisted). Otherwise DENY.
+   *   - user partition: never auto-allowed → 'confirm' (trusted-chrome gate).
+   */
+  private decideDownload(
+    partition: BrowserPartition,
+    url: string,
+    workspaceId: string | null | undefined,
+  ): { action: 'allow' | 'confirm' | 'deny'; code?: string } {
+    if (partition === 'agent') {
+      if (isSensitiveOrigin(url)) return { action: 'deny', code: 'sensitive-origin-denied' };
+      const visit = checkAgentVisit(url, this.agentCtx(workspaceId));
+      return visit.allow ? { action: 'allow' } : { action: 'deny', code: visit.code };
+    }
+    return { action: 'confirm' };
+  }
+
+  /** Pick a non-colliding basename inside `dir` (append " (n)" before the ext).
+   *  The input is already normalized; this only avoids clobbering an existing
+   *  file. Bounded scan — falls back to a uuid-suffixed name if exhausted. */
+  private uniqueDownloadName(dir: string, filename: string): string {
+    if (!existsSync(path.join(dir, filename))) return filename;
+    const dot = filename.lastIndexOf('.');
+    const stem = dot > 0 ? filename.slice(0, dot) : filename;
+    const ext = dot > 0 ? filename.slice(dot) : '';
+    for (let i = 1; i < 1000; i++) {
+      const candidate = `${stem} (${i})${ext}`;
+      if (!existsSync(path.join(dir, candidate))) return candidate;
+    }
+    return `${stem}-${randomUUID()}${ext}`;
+  }
+
+  /** Session-level will-download handler (wired once per partition in
+   *  hardenSession). Resolves the originating tab, runs the decision gate, and
+   *  either confines+records the accept, emits a confirm prompt (user), or
+   *  prevents+audits the deny (NO db record on a deny). */
+  private handleWillDownload(
+    event: ElectronEvent,
+    item: DownloadItem,
+    webContents: WebContents | null | undefined,
+  ): void {
+    const url = item.getURL();
+    const origin = this.safeOrigin(url);
+
+    // Re-initiated, human-approved USER download (downloadConfirm) → allow once.
+    const approved = this.approvedDownloadUrls.get(url);
+    if (approved) {
+      this.approvedDownloadUrls.delete(url);
+      this.beginDownload(item, {
+        url,
+        origin,
+        partition: 'user',
+        partitionFull: 'persist:user',
+        workspaceId: approved.workspaceId,
+      });
+      return;
+    }
+
+    const tab = this.tabForWebContents(webContents);
+    if (!tab) {
+      // No owning pane and not a pre-approved re-init → deny (defense in depth).
+      event.preventDefault();
+      this.auditRecord('unknown', url, 'download', { url }, 'denied:unknown-source');
+      return;
+    }
+
+    const decision = this.decideDownload(tab.partition, url, tab.workspaceId);
+
+    if (decision.action === 'deny') {
+      // DENY → preventDefault + audit ONLY. No db record is ever created.
+      event.preventDefault();
+      this.auditRecord(tab.partitionFull, url, 'download', { url }, `denied:${decision.code}`, { tab });
+      return;
+    }
+
+    if (decision.action === 'confirm') {
+      // USER download: cancel this attempt and surface a trusted-chrome confirm.
+      event.preventDefault();
+      const id = randomUUID();
+      const filename = normalizeDownloadFilename(item.getFilename());
+      this.pendingDownloadConfirms.set(id, {
+        url,
+        filename,
+        origin,
+        workspaceId: tab.workspaceId ?? null,
+        sessionPartition: tab.sessionPartition ?? 'persist:user',
+      });
+      this.auditRecord(tab.partitionFull, url, 'download', { url }, 'pending:user-confirm', { tab });
+      const prompt: BrowserDownloadPrompt = {
+        id,
+        url,
+        filename,
+        origin,
+        workspaceId: tab.workspaceId ?? null,
+      };
+      this.send(BROWSER_CHANNELS.downloadPrompt, prompt);
+      return;
+    }
+
+    // ALLOW (agent, allowlisted non-sensitive origin).
+    this.beginDownload(
+      item,
+      {
+        url,
+        origin,
+        partition: tab.partition,
+        partitionFull: tab.partitionFull,
+        workspaceId: tab.workspaceId ?? null,
+      },
+      tab,
+    );
+  }
+
+  /** Confine an accepted download to the app dir, record it, wire its lifecycle
+   *  to the store + renderer events. Shared by the agent-allow and user-confirm
+   *  paths. */
+  private beginDownload(
+    item: DownloadItem,
+    meta: {
+      url: string;
+      origin: string;
+      partition: BrowserPartition;
+      partitionFull: string;
+      workspaceId: string | null;
+    },
+    tab?: TabEntry,
+  ): void {
+    const dir = this.downloadsDir();
+    const filename = this.uniqueDownloadName(dir, normalizeDownloadFilename(item.getFilename()));
+    const savePath = path.join(dir, filename);
+    // Belt-and-braces atop normalizeDownloadFilename — a save path must never
+    // escape the app-managed dir.
+    if (!isPathWithinDir(savePath, dir)) {
+      item.cancel();
+      this.auditRecord(meta.partitionFull, meta.url, 'download', { url: meta.url }, 'denied:path-traversal', { tab });
+      return;
+    }
+    item.setSavePath(savePath);
+
+    const id = randomUUID();
+    const rec = insertDownload({
+      id,
+      url: meta.url,
+      filename,
+      savePath,
+      partition: meta.partition,
+      workspaceId: meta.workspaceId,
+      origin: meta.origin,
+      totalBytes: item.getTotalBytes(),
+      startedAt: Date.now(),
+    });
+    this.auditRecord(meta.partitionFull, meta.url, 'download', { url: meta.url, filename }, 'ok:download', { tab });
+    this.send(BROWSER_CHANNELS.downloadStarted, rec);
+
+    item.on('updated', () => {
+      const updated = updateDownloadProgress(id, item.getReceivedBytes(), item.getTotalBytes());
+      if (updated) this.send(BROWSER_CHANNELS.downloadProgress, updated);
+    });
+    item.once('done', (_e, state) => {
+      const finalState: BrowserDownloadState =
+        state === 'completed' ? 'completed' : state === 'cancelled' ? 'cancelled' : 'failed';
+      const done = setDownloadState(id, finalState, Date.now());
+      if (done) {
+        this.send(
+          finalState === 'completed' ? BROWSER_CHANNELS.downloadDone : BROWSER_CHANNELS.downloadFailed,
+          done,
+        );
+      }
+    });
+  }
+
+  /** Trusted-chrome confirm of a pending USER download (downloadConfirm token).
+   *  Re-initiates the download on its session; the re-fired will-download is
+   *  allowed through via approvedDownloadUrls. No-op on an unknown/expired token. */
+  confirmDownload(id: string): void {
+    const pending = this.pendingDownloadConfirms.get(id);
+    if (!pending) return;
+    this.pendingDownloadConfirms.delete(id);
+    this.approvedDownloadUrls.set(pending.url, { workspaceId: pending.workspaceId });
+    this.auditRecord('persist:user', pending.url, 'download', { url: pending.url }, 'ok:user-confirmed');
+    try {
+      session.fromPartition(pending.sessionPartition).downloadURL(pending.url);
+    } catch (err) {
+      this.approvedDownloadUrls.delete(pending.url);
+      console.warn(`[browser] downloadConfirm re-initiate failed: ${String(err)}`);
+    }
+  }
+
+  /** Shelf first-paint list (newest first). Trusted-chrome only. */
+  listDownloads(): BrowserDownload[] {
+    return listDownloads();
+  }
+
+  /** Open a completed download via the OS. Returns false if the record is
+   *  unknown or the OS reported an error. Trusted-chrome only. */
+  async openDownloadFile(id: string): Promise<boolean> {
+    const rec = getDownload(id);
+    if (!rec) return false;
+    const err = await shell.openPath(rec.savePath);
+    return err === '';
+  }
+
+  /** Reveal a download in the OS file manager. Trusted-chrome only. */
+  showDownloadInFolder(id: string): void {
+    const rec = getDownload(id);
+    if (rec) shell.showItemInFolder(rec.savePath);
+  }
+
+  /** Re-initiate a failed/cancelled download — re-runs the decision gate by
+   *  re-firing will-download on the original session. Trusted-chrome only. */
+  retryDownload(id: string): void {
+    const rec = getDownload(id);
+    if (!rec) return;
+    const sessionPartition = partitionFor(rec.partition, rec.workspaceId);
+    try {
+      session.fromPartition(sessionPartition).downloadURL(rec.url);
+    } catch (err) {
+      console.warn(`[browser] downloadRetry failed: ${String(err)}`);
+    }
+  }
+
+  /** Remove a download record from the shelf (does NOT delete the saved file).
+   *  Trusted-chrome only. */
+  removeDownloadRecord(id: string): void {
+    removeDownload(id);
+  }
+
   /** Kill-switch + checkAction gate shared by every tool verb. Denials are
    *  audited (M16) and thrown as PolicyError (WP2-B maps name → 403). */
   private gate(
@@ -2193,6 +2489,18 @@ export class BrowserManager {
           case 'bookmark-page':
             item.click = () => {
               this.send(BROWSER_CHANNELS.contextMenuCommand, { action: item.id, params });
+            };
+            break;
+          // Slice 13: Save link/image as… — USER partition only (builder omits
+          // these on agent tabs). downloadURL re-enters will-download on the
+          // user session → the decision gate raises a trusted-chrome confirm
+          // (never auto-allowed). Belt-and-braces partition check.
+          case 'save-link-as':
+          case 'save-image-as':
+            item.click = () => {
+              if (tab.partition !== 'user') return;
+              const target = item.id === 'save-image-as' ? params.srcURL : params.linkURL;
+              if (target) wc.downloadURL(target);
             };
             break;
           // M9: DevTools only on the user partition — openDevTools detaches a
