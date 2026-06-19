@@ -2221,6 +2221,10 @@ export class AgentSupervisor extends EventEmitter {
         const sysFile = path.join(agent.workingDirectory, '.claude', `.sysprompt-${agent.id}.txt`);
         try {
           fs.mkdirSync(path.dirname(sysFile), { recursive: true });
+          // Reap dead agents' sysprompt files before writing our own so the count
+          // stays bounded by live agents per lane (#3 self-healing sweep). This is
+          // the Windows launch path, so the dir is always a native path.
+          this.sweepStaleSyspromptFiles(path.dirname(sysFile), 'windows');
           fs.writeFileSync(sysFile, sysPrompt, 'utf-8');
           args.push('--append-system-prompt-file', sysFile);
           const role = agent.isSupervisor ? 'Supervisor' : agent.isResearcher ? 'Researcher' : 'Worker';
@@ -2495,6 +2499,49 @@ export class AgentSupervisor extends EventEmitter {
         { launchedAtMs, excludeSessionIds: ownedByOthers }
       ),
     });
+  }
+
+  /**
+   * #3 (sysprompt-cleanup) — remove orphaned `.sysprompt-<id>.txt` files from a
+   * lane `.claude` dir: any whose agent id is no longer live (status ∈
+   * done/crashed/stopped, or unknown to the supervisor). Called right before each
+   * launch writes its own sysprompt file, so the per-lane count stays bounded by
+   * the number of concurrently-live agents instead of growing forever (the CLI
+   * v2.1.156 `--append-system-prompt-file` workaround leaves these behind and
+   * nothing else reaps them).
+   *
+   * Multiple agents share a lane dir (e.g. .dashboard/workers/claude/.claude), so
+   * the live-set guard is mandatory — never blind-delete every match. Best-effort:
+   * a sweep failure (FS error, WSL unavailable) is swallowed and must never block
+   * a launch.
+   */
+  private sweepStaleSyspromptFiles(claudeDir: string, pathType: string): void {
+    const DEAD = new Set<string>(['done', 'crashed', 'stopped']);
+    const liveIds = new Set(
+      getAllAgents().filter(a => !DEAD.has(a.status)).map(a => a.id),
+    );
+    const isOrphan = (fname: string): boolean => {
+      const m = /^\.sysprompt-(.+)\.txt$/.exec(fname);
+      return !!m && !liveIds.has(m[1]);
+    };
+    try {
+      if (pathType === 'wsl') {
+        // List then delete orphans via one bash call (forward-slash WSL path).
+        const out = execFileSync('wsl.exe', ['bash', '-lc',
+          `ls -1 '${claudeDir}'/.sysprompt-*.txt 2>/dev/null || true`],
+          { encoding: 'utf-8', timeout: 10000 });
+        const orphans = out.split('\n').map(s => s.trim()).filter(Boolean)
+          .filter(p => isOrphan(p.split('/').pop() || ''));
+        if (orphans.length) {
+          const quoted = orphans.map(p => `'${p}'`).join(' ');
+          execFileSync('wsl.exe', ['bash', '-lc', `rm -f ${quoted}`], { timeout: 10000 });
+        }
+      } else {
+        for (const f of fs.readdirSync(claudeDir)) {
+          if (isOrphan(f)) { try { fs.unlinkSync(path.join(claudeDir, f)); } catch { /* ignore */ } }
+        }
+      }
+    } catch { /* sweep is best-effort; a failure must never block a launch */ }
   }
 
   /**
@@ -2849,6 +2896,10 @@ export class AgentSupervisor extends EventEmitter {
         let promptArg = '';
 
         if (sysPromptText) {
+          // Reap dead agents' sysprompt files from the lane .claude dir before
+          // writing our own (#3 self-healing sweep). writeWslFile targets
+          // `${wslWorkDir}/.claude/<name>`, so that dir is the sweep target.
+          this.sweepStaleSyspromptFiles(`${wslWorkDir}/.claude`, 'wsl');
           const sysFile = writeWslFile(`.sysprompt-${agent.id}.txt`, sysPromptText);
           if (sysFile) {
             // CLI v2.1.156 regression: inline `--append-system-prompt "<string>"`
