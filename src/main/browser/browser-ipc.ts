@@ -16,6 +16,7 @@ import {
   type BrowserBounds,
   type BrowserContextMenuParams,
   type BrowserCreateTabOptions,
+  type BrowserFindOptions,
   type HistoryQuery,
 } from '../../shared/browser';
 
@@ -92,8 +93,21 @@ export function registerBrowserIpc(manager: BrowserManager): void {
   ipcMain.handle(BROWSER_CHANNELS.stopFindInPage, (_e, tabId: string) =>
     manager.stopFindInPage(tabId),
   );
+  // Slice 15: stateful find — per-tab query/state, immediate next/prev, restore.
+  ipcMain.handle(
+    BROWSER_CHANNELS.find,
+    (_e, tabId: string, query: string, opts?: BrowserFindOptions) =>
+      manager.find(tabId, query, opts),
+  );
+  ipcMain.handle(BROWSER_CHANNELS.findNext, (_e, tabId: string) => manager.findNext(tabId));
+  ipcMain.handle(BROWSER_CHANNELS.findPrev, (_e, tabId: string) => manager.findPrev(tabId));
+  ipcMain.handle(BROWSER_CHANNELS.stopFind, (_e, tabId: string) => manager.stopFind(tabId));
   ipcMain.handle(BROWSER_CHANNELS.setZoom, (_e, tabId: string, zoomFactor: number) =>
     manager.setZoom(tabId, zoomFactor),
+  );
+  // Slice 15: reset zoom to 100% AND clear the persisted per-origin row (USER).
+  ipcMain.handle(BROWSER_CHANNELS.resetZoomForOrigin, (_e, tabId: string) =>
+    manager.resetZoomForOrigin(tabId),
   );
 
   // Native context menu (WP6) — renderer forwards coords; main pops the menu.

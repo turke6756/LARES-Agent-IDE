@@ -16,6 +16,7 @@ import type {
   BrowserCreateTabOptions,
   BrowserDownload,
   BrowserDownloadPrompt,
+  BrowserFindOptions,
   BrowserFindResult,
   BrowserOpenRequest,
   BrowserShortcut,
@@ -822,7 +823,18 @@ export interface IpcApi {
       opts?: { forward?: boolean; findNext?: boolean },
     ) => Promise<void>;
     stopFindInPage: (tabId: string) => Promise<void>;
+    // Slice 15: stateful find — per-tab query/state, immediate next/prev, restore
+    // on tab switch. `find` starts/updates the search (stores query+opts);
+    // findNext/findPrev step using the stored query with no debounce; stopFind
+    // clears the stored query + the native highlight for the (active) tab.
+    find: (tabId: string, query: string, opts?: BrowserFindOptions) => Promise<void>;
+    findNext: (tabId: string) => Promise<void>;
+    findPrev: (tabId: string) => Promise<void>;
+    stopFind: (tabId: string) => Promise<void>;
     setZoom: (tabId: string, zoomFactor: number) => Promise<void>;
+    // Slice 15: reset zoom to 100% AND clear the persisted per-origin row (USER
+    // tabs) so the origin reverts to default on future visits.
+    resetZoomForOrigin: (tabId: string) => Promise<void>;
     // Native context menu (WP6) — renderer forwards coords; main pops the menu.
     contextMenuRequest: (tabId: string, params: BrowserContextMenuParams) => Promise<void>;
     // Bookmarks (WP3) — USER-PARTITION ONLY.

@@ -147,6 +147,10 @@ interface FakeDebugger { isAttached(): boolean; attach(): void; detach(): void; 
 interface FakeWC {
   getURL(): string; getTitle(): string; isDestroyed(): boolean;
   isLoading(): boolean; getZoomFactor(): number;
+  // Slice 15 seams: per-site zoom apply (did-navigate) + find-in-page state.
+  setZoomFactor(z: number): void;
+  findInPage(text: string, options?: Record<string, unknown>): void;
+  stopFindInPage(action?: string): void;
   navigationHistory: { canGoBack(): boolean; canGoForward(): boolean };
   debugger: FakeDebugger;
   close(): void;
@@ -182,6 +186,11 @@ function fakeWC(url: string, title = 'T'): FakeWC {
     isDestroyed: () => false,
     isLoading: () => false,
     getZoomFactor: () => 1,
+    // Slice 15 seams — inert here (no per-site zoom / find assertions in this
+    // suite; the applyPersistedZoom did-navigate path just needs them callable).
+    setZoomFactor() {},
+    findInPage() {},
+    stopFindInPage() {},
     navigationHistory: { canGoBack: () => false, canGoForward: () => false },
     debugger: dbg,
     close() {},

@@ -144,6 +144,12 @@ export interface BrowserFindResult {
   finalUpdate: boolean;
 }
 
+/** Slice 15: find-in-page options. Electron 41's findInPage only honors
+ *  `matchCase`, so the FindBar surfaces ONLY a case-sensitive toggle. */
+export interface BrowserFindOptions {
+  matchCase?: boolean;
+}
+
 export interface BrowserContextMenuParams {
   tabId: string;
   /** view-relative DIP */
@@ -252,7 +258,19 @@ export interface BrowserApi {
   setDiscardThreshold(ms: number | null): unknown;
   findInPage(tabId: string, text: string, opts?: { forward?: boolean; findNext?: boolean }): unknown;
   stopFindInPage(tabId: string): unknown;
+  /** Slice 15: stateful find — main stores the query+opts PER TAB, so findNext/
+   *  findPrev reuse them immediately (no debounce) and a tab switch re-runs the
+   *  active query (its highlight + count self-restore). An empty `find` query
+   *  clears that tab's find. */
+  find(tabId: string, query: string, opts?: BrowserFindOptions): unknown;
+  findNext(tabId: string): unknown;
+  findPrev(tabId: string): unknown;
+  /** Clears the stored query + native highlight for THIS tab only. */
+  stopFind(tabId: string): unknown;
   setZoom(tabId: string, zoomFactor: number): unknown;
+  /** Slice 15: reset zoom to 100% AND clear the persisted per-origin row (USER
+   *  tab), so the origin reverts to default on future visits. */
+  resetZoomForOrigin(tabId: string): unknown;
   contextMenuRequest(tabId: string, params: BrowserContextMenuParams): unknown;
   /** USER-PARTITION ONLY. */
   bookmarkList(): Promise<Bookmark[]>;
@@ -568,12 +586,28 @@ interface BrowserStoreState {
   enterReadingMode: (tabId: string) => Promise<void>;
   closeReadingMode: () => void;
 
-  // Find-in-page (counts only ever cross the wire — never page text).
+  // Find-in-page (Slice 15 — stateful, per-tab). Counts only ever cross the
+  // wire (never page text). Main is authoritative for the stored query per tab;
+  // these mirrors let the FindBar restore its input on tab switch and reflect
+  // the per-tab counter (which also self-restores via the onFoundInPage event
+  // that main re-fires for the active tab on every switch).
   findOpen: boolean;
-  findState: { activeMatchOrdinal: number; matches: number };
+  /** Per-tab query (drives the input value; restores on tab switch). */
+  findQueries: Record<string, string>;
+  /** Per-tab case-sensitive toggle (mirrors main's stored options per tab). */
+  findMatchCase: Record<string, boolean>;
+  /** Per-tab "{activeMatchOrdinal} of {matches}" counts from onFoundInPage. */
+  findStates: Record<string, { activeMatchOrdinal: number; matches: number }>;
   openFind: () => void;
   closeFind: () => void;
-  runFind: (text: string, opts?: { forward?: boolean; findNext?: boolean }) => void;
+  /** Fresh search for the active tab: mirror the query, then (debounced) issue
+   *  api.find with the tab's matchCase. Empty query clears the tab's find. */
+  runFind: (query: string) => void;
+  /** Immediate next/prev using the active tab's main-stored query (no debounce). */
+  findNext: () => void;
+  findPrev: () => void;
+  /** Toggle case-sensitivity for the active tab + re-issue its query immediately. */
+  setFindMatchCase: (matchCase: boolean) => void;
 
   // ── Slice-6: omnibox suggestions ───────────────────────────────────────────
   // The AddressBar dropdown reads these. `omniboxActiveIndex` of -1 means "no row
@@ -590,6 +624,8 @@ interface BrowserStoreState {
 
   // Zoom — zoomFactor echoes back via the existing onTabState payload.
   setZoom: (tabId: string, factor: number) => void;
+  /** Slice 15: reset to 100% + clear the persisted per-origin row (USER tab). */
+  resetZoom: (tabId: string) => void;
 
   // Main-authoritative tab order/pin snapshot + intents.
   snapshot: BrowserTabSnapshotEntry[];
@@ -767,7 +803,9 @@ export const useBrowserStore = create<BrowserStoreState>((set, get) => ({
   readerArticle: null,
   readerLoading: false,
   findOpen: false,
-  findState: { activeMatchOrdinal: 0, matches: 0 },
+  findQueries: {},
+  findMatchCase: {},
+  findStates: {},
   omniboxResults: [],
   omniboxActiveIndex: -1,
   navError: null,
@@ -1202,7 +1240,7 @@ export const useBrowserStore = create<BrowserStoreState>((set, get) => ({
 
   closeReadingMode: () => set({ readerArticle: null, readerLoading: false }),
 
-  // ── Find-in-page ───────────────────────────────────────────────────────────
+  // ── Find-in-page (Slice 15 — stateful, per-tab) ─────────────────────────────
   openFind: () => set({ findOpen: true }),
 
   closeFind: () => {
@@ -1211,40 +1249,92 @@ export const useBrowserStore = create<BrowserStoreState>((set, get) => ({
       clearTimeout(findDebounceTimer);
       findDebounceTimer = null;
     }
+    // stopFind clears the stored query + native highlight for the ACTIVE tab
+    // only (other tabs keep their stored query and re-highlight when switched
+    // back). Mirror that locally so reopening on this tab starts clean.
     if (activeTabId) {
       try {
-        getBrowserApi()?.stopFindInPage(activeTabId);
+        getBrowserApi()?.stopFind(activeTabId);
       } catch (err) {
-        console.error('browser.stopFindInPage failed:', err);
+        console.error('browser.stopFind failed:', err);
       }
     }
-    set({ findOpen: false, findState: { activeMatchOrdinal: 0, matches: 0 } });
+    set((s) => {
+      if (!activeTabId) return { findOpen: false };
+      const { [activeTabId]: _q, ...findQueries } = s.findQueries;
+      const { [activeTabId]: _c, ...findStates } = s.findStates;
+      return { findOpen: false, findQueries, findStates };
+    });
   },
 
-  runFind: (text, opts) => {
-    if (findDebounceTimer !== null) clearTimeout(findDebounceTimer);
+  runFind: (query) => {
     const { activeTabId } = get();
     if (!activeTabId) return;
-    const trimmed = text;
-    // An empty query clears the highlight rather than searching for "".
-    if (!trimmed) {
+    const matchCase = get().findMatchCase[activeTabId] ?? false;
+    // Mirror the query immediately so the input reflects it and a tab switch
+    // restores it (independent of the debounced native search below).
+    set((s) => ({ findQueries: { ...s.findQueries, [activeTabId]: query } }));
+    if (findDebounceTimer !== null) clearTimeout(findDebounceTimer);
+    // An empty query clears this tab's find immediately (no debounce). Main
+    // treats find('') as "clear the stored query + highlight".
+    if (!query) {
       findDebounceTimer = null;
+      set((s) => ({
+        findStates: { ...s.findStates, [activeTabId]: { activeMatchOrdinal: 0, matches: 0 } },
+      }));
       try {
-        getBrowserApi()?.stopFindInPage(activeTabId);
+        getBrowserApi()?.find(activeTabId, '', { matchCase });
       } catch (err) {
-        console.error('browser.stopFindInPage failed:', err);
+        console.error('browser.find failed:', err);
       }
-      set({ findState: { activeMatchOrdinal: 0, matches: 0 } });
       return;
     }
     findDebounceTimer = (typeof window !== 'undefined' ? window.setTimeout : setTimeout)(() => {
       findDebounceTimer = null;
       try {
-        getBrowserApi()?.findInPage(activeTabId, trimmed, opts);
+        getBrowserApi()?.find(activeTabId, query, { matchCase });
       } catch (err) {
-        console.error('browser.findInPage failed:', err);
+        console.error('browser.find failed:', err);
       }
     }, FIND_DEBOUNCE_MS) as unknown as number;
+  },
+
+  findNext: () => {
+    const { activeTabId } = get();
+    if (!activeTabId) return;
+    try {
+      getBrowserApi()?.findNext(activeTabId);
+    } catch (err) {
+      console.error('browser.findNext failed:', err);
+    }
+  },
+
+  findPrev: () => {
+    const { activeTabId } = get();
+    if (!activeTabId) return;
+    try {
+      getBrowserApi()?.findPrev(activeTabId);
+    } catch (err) {
+      console.error('browser.findPrev failed:', err);
+    }
+  },
+
+  setFindMatchCase: (matchCase) => {
+    const { activeTabId } = get();
+    if (!activeTabId) return;
+    set((s) => ({ findMatchCase: { ...s.findMatchCase, [activeTabId]: matchCase } }));
+    // Re-issue immediately (a deliberate toggle, not keystroke spam) so the case
+    // change takes effect now. Cancel any pending debounced typing first.
+    if (findDebounceTimer !== null) {
+      clearTimeout(findDebounceTimer);
+      findDebounceTimer = null;
+    }
+    const query = get().findQueries[activeTabId] ?? '';
+    try {
+      getBrowserApi()?.find(activeTabId, query, { matchCase });
+    } catch (err) {
+      console.error('browser.find failed:', err);
+    }
   },
 
   // ── Slice-6: omnibox suggestions ───────────────────────────────────────────
@@ -1301,6 +1391,14 @@ export const useBrowserStore = create<BrowserStoreState>((set, get) => ({
       getBrowserApi()?.setZoom(tabId, factor);
     } catch (err) {
       console.error('browser.setZoom failed:', err);
+    }
+  },
+
+  resetZoom: (tabId) => {
+    try {
+      getBrowserApi()?.resetZoomForOrigin(tabId);
+    } catch (err) {
+      console.error('browser.resetZoomForOrigin failed:', err);
     }
   },
 
@@ -1386,15 +1484,18 @@ export const useBrowserStore = create<BrowserStoreState>((set, get) => ({
   handleTabsSnapshot: (entries) => set({ snapshot: Array.isArray(entries) ? entries : [] }),
 
   handleFoundInPage: (result) => {
-    // Only the active tab's counts matter to the FindBar; ignore stragglers.
-    const { activeTabId } = get();
-    if (result.tabId !== activeTabId) return;
-    set({
-      findState: {
-        activeMatchOrdinal: result.activeMatchOrdinal,
-        matches: result.matches,
+    if (!result || typeof result.tabId !== 'string') return;
+    // Key by tab: main re-fires the active tab's query on every tab switch, so
+    // storing per-tab counts lets the FindBar counter self-restore on switch.
+    set((s) => ({
+      findStates: {
+        ...s.findStates,
+        [result.tabId]: {
+          activeMatchOrdinal: result.activeMatchOrdinal,
+          matches: result.matches,
+        },
       },
-    });
+    }));
   },
 
   handleShortcutCommand: (shortcut) => {

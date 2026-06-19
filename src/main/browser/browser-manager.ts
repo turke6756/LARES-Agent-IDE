@@ -60,6 +60,7 @@ import {
   type BrowserDownload,
   type BrowserDownloadPrompt,
   type BrowserDownloadState,
+  type BrowserFindOptions,
   type BrowserPartition,
   type BrowserShortcut,
   type BrowserTabSnapshotEntry,
@@ -128,10 +129,30 @@ import {
   setDownloadState,
   updateDownloadProgress,
 } from './downloads-store';
+import {
+  getZoom as getStoredZoom,
+  setZoom as setStoredZoom,
+  clearZoom as clearStoredZoom,
+} from './zoom-store';
 
 /** Clamp helper for zoom factor (and any other bounded numeric). */
 function clamp(value: number, lo: number, hi: number): number {
   return Math.min(hi, Math.max(lo, value));
+}
+
+/** Slice 15: the persist key for per-site zoom — the http(s) origin of a
+ *  committed URL, or null for anything that should NOT carry a saved zoom (NTP,
+ *  about:blank, non-http schemes, unparseable). PURE so the manager never
+ *  fabricates a 'null'-origin row. */
+function zoomOriginOf(url: string | undefined): string | null {
+  if (!url) return null;
+  try {
+    const u = new URL(url);
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
+    return u.origin;
+  } catch {
+    return null;
+  }
 }
 
 // ── Slice 10/11: session-restore + frozen/discarded tab model constants ───────
@@ -300,6 +321,12 @@ interface TabEntry {
    *  hydrateFrozenTab). The idle-sweep LRU falls back to this when the tab has
    *  never been the active tab (no lastActiveAt entry). */
   createdAt?: number;
+  /** Slice 15: per-tab find-in-page state. `query` + `matchCase` are the latest
+   *  search this tab is running (so findNext/findPrev reuse them immediately and
+   *  a tab switch can re-run the query); `activeMatchOrdinal`/`total` mirror the
+   *  last native found-in-page result for restore. Absent = no active find.
+   *  RUNTIME ONLY — never persisted (find is ephemeral, not session state). */
+  findState?: { query: string; matchCase: boolean; activeMatchOrdinal: number; total: number };
 }
 
 /** Slice 10/11: a snapshot-backed tab with NO WebContentsView — either restored
@@ -852,6 +879,10 @@ export class BrowserManager {
       // Re-adding an existing child raises it to the top of the view stack.
       win?.contentView.addChildView(active.view);
       active.view.setBounds(this.lastBounds);
+      // Slice 15: restore this tab's find — re-run the stored query so its native
+      // highlight + counter come back exactly where the FindBar left them. The
+      // foundInPage event re-fires, refreshing the renderer's counter.
+      this.restoreFind(active);
     }
     this.applyVisibility();
     this.emitTabsSnapshot(); // active changed
@@ -2362,6 +2393,11 @@ export class BrowserManager {
       tab.lastError = null;
       // Slice-10: a committed USER navigation changes the persisted snapshot.
       if (tab.partition === 'user') this.schedulePersist();
+      // Slice 15: apply the persisted per-origin zoom for USER tabs (fallback
+      // 100%). Runs BEFORE the `push` listener below (same-event, registration
+      // order), so the tab-state pushed for this navigation already carries the
+      // restored zoomFactor. Agent zoom stays per-tab — never read/applied here.
+      if (tab.partition === 'user') this.applyPersistedZoom(tab, url);
     });
 
     // Tab-state push (frozen contract: onTabState).
@@ -2427,7 +2463,13 @@ export class BrowserManager {
     });
 
     // ── Overhaul (WP5) — find-in-page progress (counts only, never page text) ─
+    // Slice 15: also stamp the per-tab find state so a tab switch can restore the
+    // counter (and findNext/findPrev have a fresh ordinal to step from).
     wc.on('found-in-page', (_e, result) => {
+      if (tab.findState) {
+        tab.findState.activeMatchOrdinal = result.activeMatchOrdinal;
+        tab.findState.total = result.matches;
+      }
       this.send(BROWSER_CHANNELS.foundInPage, {
         tabId: tab.id,
         activeMatchOrdinal: result.activeMatchOrdinal,
@@ -2598,7 +2640,9 @@ export class BrowserManager {
         break;
       }
       case 'zoom-reset':
-        if (this.tabs.has(tabId)) this.setZoom(tabId, 1);
+        // Slice 15: reset clears the persisted origin row (→ 100% on future
+        // visits), not just the live factor.
+        if (this.tabs.has(tabId)) this.resetZoomForOrigin(tabId);
         break;
       // UI-reaction chords — the renderer focuses the address bar, opens the
       // find bar / history view, or triggers the star menu.
@@ -2683,25 +2727,122 @@ export class BrowserManager {
   }
 
   // WP5 — find-in-page (native WebContents.findInPage; counts via foundInPage).
-  findInPage(tabId: string, text: string, opts?: { forward?: boolean; findNext?: boolean }): void {
-    const wc = this.mustGet(tabId).view.webContents;
-    // Electron throws on an empty query — treat empty as "clear".
-    if (!text) {
+  // Slice 15 layers a per-tab find state on top: `find` starts a fresh search and
+  // remembers the query+opts; `findNext`/`findPrev` reuse the stored query so
+  // they step IMMEDIATELY (no debounce wait); a tab switch re-runs the query
+  // (restoreFind); `stopFind` clears the stored query + the active tab's highlight.
+
+  /** Slice 15: start (or update) the active find for a tab. Stores the latest
+   *  query+options so subsequent next/prev reuse them with no debounce. Empty
+   *  query clears find for the tab. */
+  find(tabId: string, query: string, opts?: BrowserFindOptions): void {
+    const tab = this.mustGet(tabId);
+    const wc = tab.view.webContents;
+    if (!query) {
+      // Electron throws on an empty query — treat empty as "clear this tab".
+      tab.findState = undefined;
       wc.stopFindInPage('clearSelection');
       return;
     }
-    wc.findInPage(text, opts);
+    const matchCase = !!opts?.matchCase;
+    tab.findState = { query, matchCase, activeMatchOrdinal: 0, total: 0 };
+    // Fresh search (findNext omitted/false): Electron moves to the first match.
+    wc.findInPage(query, { matchCase });
   }
 
+  /** Slice 15: advance to the next match using the tab's stored query+opts. */
+  findNext(tabId: string): void {
+    this.stepFind(tabId, true);
+  }
+
+  /** Slice 15: go to the previous match using the tab's stored query+opts. */
+  findPrev(tabId: string): void {
+    this.stepFind(tabId, false);
+  }
+
+  /** Step next/prev off the stored query IMMEDIATELY — the renderer's debounce
+   *  applies only to live-typing `find`; next/prev always use the latest query. */
+  private stepFind(tabId: string, forward: boolean): void {
+    const tab = this.mustGet(tabId);
+    const st = tab.findState;
+    if (!st || !st.query) return; // nothing to step through
+    tab.view.webContents.findInPage(st.query, {
+      forward,
+      findNext: true,
+      matchCase: st.matchCase,
+    });
+  }
+
+  /** Slice 15: re-run a tab's stored query on (re)activation so its native
+   *  highlight + counter are restored. No-op when the tab has no active find. */
+  private restoreFind(tab: TabEntry): void {
+    const st = tab.findState;
+    if (!st || !st.query) return;
+    const wc = tab.view.webContents;
+    if (wc.isDestroyed()) return;
+    wc.findInPage(st.query, { matchCase: st.matchCase });
+  }
+
+  /** Slice 15: close find for a tab — clear the stored query and the native
+   *  highlight. The renderer calls this for the ACTIVE tab only, so other tabs
+   *  keep their stored query and re-highlight when switched back. */
+  stopFind(tabId: string): void {
+    const tab = this.mustGet(tabId);
+    tab.findState = undefined;
+    tab.view.webContents.stopFindInPage('clearSelection');
+  }
+
+  /** Legacy WP5 find entry (kept for back-compat with the pre-Slice-15 chrome).
+   *  Routes through the stateful API so old + new callers never desync. */
+  findInPage(tabId: string, text: string, opts?: { forward?: boolean; findNext?: boolean }): void {
+    if (opts?.findNext) {
+      if (opts.forward === false) this.findPrev(tabId);
+      else this.findNext(tabId);
+      return;
+    }
+    this.find(tabId, text, {});
+  }
+
+  /** Legacy WP5 stop (kept for back-compat). */
   stopFindInPage(tabId: string): void {
-    this.mustGet(tabId).view.webContents.stopFindInPage('clearSelection');
+    this.stopFind(tabId);
   }
 
   // WP5 — zoom (native WebContents.setZoomFactor; clamped to a sane range).
+  // Slice 15: a USER tab's zoom is persisted by origin (per-site zoom); agent
+  // zoom stays per-tab and is NEVER written.
   setZoom(tabId: string, zoomFactor: number): void {
     const tab = this.mustGet(tabId);
-    tab.view.webContents.setZoomFactor(clamp(zoomFactor, 0.25, 5));
+    const clamped = clamp(zoomFactor, 0.25, 5);
+    tab.view.webContents.setZoomFactor(clamped);
+    if (tab.partition === 'user') {
+      const origin = zoomOriginOf(tab.view.webContents.getURL());
+      if (origin) setStoredZoom(origin, clamped);
+    }
     this.sendTabState(tab); // push the new zoomFactor to the UI indicator
+  }
+
+  /** Slice 15: reset a tab to 100% AND clear its persisted origin row so the
+   *  origin reverts to default on future visits ("Reset"). Agent tabs just snap
+   *  back to 100% (nothing persisted to clear). */
+  resetZoomForOrigin(tabId: string): void {
+    const tab = this.mustGet(tabId);
+    tab.view.webContents.setZoomFactor(1);
+    if (tab.partition === 'user') {
+      const origin = zoomOriginOf(tab.view.webContents.getURL());
+      if (origin) clearStoredZoom(origin);
+    }
+    this.sendTabState(tab);
+  }
+
+  /** Slice 15: apply the persisted per-origin zoom for a USER tab on committed
+   *  navigation (fallback 100% when no row). Does NOT persist — read-only path. */
+  private applyPersistedZoom(tab: TabEntry, url: string): void {
+    const wc = tab.view.webContents;
+    if (wc.isDestroyed()) return;
+    const origin = zoomOriginOf(url);
+    const stored = origin ? getStoredZoom(origin) : undefined;
+    wc.setZoomFactor(stored !== undefined ? clamp(stored, 0.25, 5) : 1);
   }
 
   // ── Slice 14: reading mode ─────────────────────────────────────────────────

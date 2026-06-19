@@ -222,8 +222,16 @@ const api: IpcApi = {
     findInPage: (tabId, text, opts) =>
       ipcRenderer.invoke(BROWSER_CHANNELS.findInPage, tabId, text, opts),
     stopFindInPage: (tabId) => ipcRenderer.invoke(BROWSER_CHANNELS.stopFindInPage, tabId),
+    // Slice 15: stateful find — per-tab query/state, immediate next/prev, restore.
+    find: (tabId, query, opts) => ipcRenderer.invoke(BROWSER_CHANNELS.find, tabId, query, opts),
+    findNext: (tabId) => ipcRenderer.invoke(BROWSER_CHANNELS.findNext, tabId),
+    findPrev: (tabId) => ipcRenderer.invoke(BROWSER_CHANNELS.findPrev, tabId),
+    stopFind: (tabId) => ipcRenderer.invoke(BROWSER_CHANNELS.stopFind, tabId),
     setZoom: (tabId, zoomFactor) =>
       ipcRenderer.invoke(BROWSER_CHANNELS.setZoom, tabId, zoomFactor),
+    // Slice 15: reset zoom to 100% + clear the persisted per-origin row (USER).
+    resetZoomForOrigin: (tabId) =>
+      ipcRenderer.invoke(BROWSER_CHANNELS.resetZoomForOrigin, tabId),
     contextMenuRequest: (tabId, params) =>
       ipcRenderer.invoke(BROWSER_CHANNELS.contextMenuRequest, tabId, params),
     bookmarkList: () => ipcRenderer.invoke(BROWSER_CHANNELS.bookmarkList),

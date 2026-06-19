@@ -118,12 +118,26 @@ export interface BrowserTabSnapshotEntry {
 }
 
 /** Counts-only find-in-page progress (foundInPage event). Never carries page
- *  text — only ordinals/totals (security: no page content crosses the wire). */
+ *  text — only ordinals/totals (security: no page content crosses the wire).
+ *  `matches` IS the total match count the FindBar counter renders as "N of M"
+ *  (activeMatchOrdinal of matches). `finalUpdate` distinguishes the settled
+ *  result from intermediate progress pulses. */
 export interface BrowserFindResult {
   tabId: string;
   activeMatchOrdinal: number;
   matches: number;
   finalUpdate: boolean;
+}
+
+/** Slice 15: find-in-page options (renderer toggles). Electron 41's
+ *  WebContents.findInPage only honors `matchCase` — there is no native
+ *  whole-word/diacritics option — so this is intentionally minimal: the
+ *  case-sensitive toggle is the only one that affects matching. The manager
+ *  stores the latest query+options per tab so findNext/findPrev reuse them
+ *  immediately (no debounce) and a tab switch can re-run the active query. */
+export interface BrowserFindOptions {
+  /** Case-sensitive matching (Electron `matchCase`). Default false. */
+  matchCase?: boolean;
 }
 
 /** Native context-menu request payload (renderer → main via contextMenuRequest).
@@ -554,14 +568,37 @@ export const BROWSER_CHANNELS = {
   reopenClosedTab: 'browser:reopen-closed-tab',
   /** event main→renderer (BrowserShortcut, {tabId}) — UI-reaction chords */
   shortcutCommand: 'browser:shortcut-command',
-  /** (tabId, text, {forward,findNext}) */
+  /** (tabId, text, {forward,findNext}) — legacy WP5 find (kept for back-compat;
+   *  Slice 15 prefers find/findNext/findPrev/stopFind below). */
   findInPage: 'browser:find-in-page',
-  /** (tabId) */
+  /** (tabId) — legacy WP5 stop (kept for back-compat). */
   stopFindInPage: 'browser:stop-find-in-page',
-  /** event main→renderer (BrowserFindResult) — counts only, never page text */
+  /** event main→renderer (BrowserFindResult) — counts only, never page text.
+   *  `matches` is the total; renderer renders "activeMatchOrdinal of matches". */
   foundInPage: 'browser:found-in-page',
-  /** (tabId, zoomFactor) */
+
+  // ── Slice 15: find-in-page upgrades (per-tab query/state + restore) ─────────
+  // The manager stores the latest query+options PER TAB; findNext/findPrev reuse
+  // the stored query IMMEDIATELY (no debounce), and a tab switch re-runs the
+  // active query so its highlight + count are restored. stopFind clears the
+  // native highlight for the ACTIVE tab only (other tabs keep their stored query
+  // and re-highlight when switched back).
+  /** (tabId, query: string, opts?: BrowserFindOptions) — fresh search; stores
+   *  the query+opts for this tab and emits foundInPage as results settle. */
+  find: 'browser:find',
+  /** (tabId) — advance to the next match using this tab's stored query+opts. */
+  findNext: 'browser:find-next',
+  /** (tabId) — go to the previous match using this tab's stored query+opts. */
+  findPrev: 'browser:find-prev',
+  /** (tabId) — clear the stored query and the native highlight for this tab. */
+  stopFind: 'browser:stop-find',
+
+  /** (tabId, zoomFactor) — set the active zoom; for a USER tab this also persists
+   *  the factor by origin (per-site zoom). Agent zoom stays per-tab (not saved). */
   setZoom: 'browser:set-zoom',
+  /** (tabId) — Slice 15: reset zoom to 100% AND clear the persisted origin row
+   *  for a USER tab (so the origin reverts to default on future visits). */
+  resetZoomForOrigin: 'browser:reset-zoom-for-origin',
   /** (tabId, params) — renderer asks main to popup the native context menu */
   contextMenuRequest: 'browser:context-menu-request',
   /** event main→renderer (action, params) — renderer-side context-menu actions */

@@ -369,6 +369,21 @@ export function initDatabase(): void {
       ON browser_downloads(started_at DESC)
   `);
 
+  // ── Slice 15: per-site zoom (USER PARTITION ONLY) ──────────────────────────
+  // Persisted zoom keyed by origin (new URL(url).origin) for the user partition.
+  // Applied on committed navigation of a user tab (fallback 100% when no row).
+  // Agent zoom stays per-tab and is NEVER persisted (cross-cutting rule #1) — the
+  // manager only ever writes a user tab's origin here. The thin service is
+  // src/main/browser/zoom-store.ts (getDb()). zoom_factor is the raw multiplier
+  // (1 = 100%); updated_at is epoch-ms.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS browser_zoom (
+      origin       TEXT PRIMARY KEY,        -- new URL(url).origin (http/https user tabs only)
+      zoom_factor  REAL NOT NULL,           -- raw multiplier (1 = 100%)
+      updated_at   INTEGER NOT NULL
+    )
+  `);
+
   // ── Website-access policy tables (plans/website-allowlist-simplification.md) ─
   // ONE human-curated agent allowlist for the embedded browser. Stored in the
   // dashboard DB (userData, outside the workspace) so the agent's file tools can
