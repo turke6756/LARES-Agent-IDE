@@ -204,4 +204,12 @@ export function registerBrowserIpc(manager: BrowserManager): void {
   ipcMain.handle(BROWSER_CHANNELS.downloadRemove, (_e, id: string) =>
     manager.removeDownloadRecord(id),
   );
+
+  // ── Slice 14: reading mode ─────────────────────────────────────────────────
+  // TRUSTED CHROME ONLY. Extract + sanitize the live article of an http(s) USER
+  // tab in main. The manager self-gates to user/http(s) tabs and never routes
+  // this through agent tools or the CDP attach path.
+  ipcMain.handle(BROWSER_CHANNELS.enterReadingMode, (_e, tabId: string) =>
+    manager.enterReadingMode(tabId),
+  );
 }

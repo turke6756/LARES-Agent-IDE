@@ -6,6 +6,7 @@ import BrowserViewHost from './BrowserViewHost';
 import BookmarksBar from './BookmarksBar';
 import FindBar from './FindBar';
 import HistoryView from './HistoryView';
+import ReadingModeView from './ReadingModeView';
 import WebsiteAccessSettings from './WebsiteAccessSettings';
 import SigninHandoffBanner from './SigninHandoffBanner';
 import ActivityDrawer from './ActivityDrawer';
@@ -150,6 +151,10 @@ export default function BrowserPanel() {
               <BrowserViewHost />
             )}
             <HistoryView />
+            {/* Slice 14: reader overlay — paints absolute inset-0 over the page
+                region and suspends the WebContentsView (useBrowserSuspension)
+                for its lifetime. Self-gates on readerArticle. */}
+            <ReadingModeView />
             <WebsiteAccessSettings />
             {/* Slice-3: live Activity/Audit drawer — right slide-over that
                 suspends the WebContentsView for its lifetime. Self-gates on

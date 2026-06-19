@@ -15,6 +15,7 @@ import type {
   BrowserDownloadState,
   HandedTabInfo,
   OmniboxSuggestion,
+  ReaderArticle,
   SharedAgentSessions,
   SignedInOrigin,
 } from '../../shared/browser';
@@ -40,6 +41,7 @@ export type {
   BrowserDownloadState,
   HandedTabInfo,
   OmniboxSuggestion,
+  ReaderArticle,
   SharedAgentSessions,
   SignedInOrigin,
 };
@@ -267,6 +269,10 @@ export interface BrowserApi {
   historyClear(): unknown;
   /** Slice-8: most-visited user sites (consumed by the NTP in Slice-9). */
   historyTopSites(limit?: number): Promise<HistoryEntry[]>;
+  /** Slice 14: extract + sanitize the live article HTML of an http(s) USER tab
+   *  in main. REJECTS agent / non-user / non-http(s) tabs (the reader action
+   *  self-gates to http(s) user tabs to avoid those rejections). */
+  enterReadingMode(tabId: string): Promise<ReaderArticle>;
   onTabsSnapshot(cb: (entries: BrowserTabSnapshotEntry[]) => void): () => void;
   onShortcutCommand(cb: (shortcut: BrowserShortcut, ctx: { tabId: string }) => void): () => void;
   onFoundInPage(cb: (result: BrowserFindResult) => void): () => void;
@@ -549,6 +555,19 @@ interface BrowserStoreState {
   deleteHistory: (id: string) => void;
   clearHistory: () => void;
 
+  // ── Slice 14: reading mode ─────────────────────────────────────────────────
+  // The reader overlay is open iff `readerArticle` is non-null. enterReadingMode
+  // calls into main (extract + sanitize), stores the ReaderArticle, and opens the
+  // overlay; a rejection (ineligible tab, extraction failure) is swallowed so an
+  // ineligible click is a graceful no-op. The overlay occludes the host, so it
+  // suspends the WebContentsView for its lifetime (useBrowserSuspension).
+  readerArticle: ReaderArticle | null;
+  /** True while enterReadingMode is awaiting main (drives a spinner / disables
+   *  re-entry). */
+  readerLoading: boolean;
+  enterReadingMode: (tabId: string) => Promise<void>;
+  closeReadingMode: () => void;
+
   // Find-in-page (counts only ever cross the wire — never page text).
   findOpen: boolean;
   findState: { activeMatchOrdinal: number; matches: number };
@@ -745,6 +764,8 @@ export const useBrowserStore = create<BrowserStoreState>((set, get) => ({
   bookmarkBarVisible: true,
   bookmarkTick: 0,
   historyViewOpen: false,
+  readerArticle: null,
+  readerLoading: false,
   findOpen: false,
   findState: { activeMatchOrdinal: 0, matches: 0 },
   omniboxResults: [],
@@ -1158,6 +1179,28 @@ export const useBrowserStore = create<BrowserStoreState>((set, get) => ({
       console.error('browser.historyClear failed:', err);
     }
   },
+
+  // ── Reading mode (Slice 14) ─────────────────────────────────────────────────
+  enterReadingMode: async (tabId) => {
+    const api = getBrowserApi();
+    if (!api) return;
+    // Don't re-enter while a request is in flight or the overlay is already up.
+    if (get().readerLoading || get().readerArticle) return;
+    set({ readerLoading: true });
+    try {
+      const article = await api.enterReadingMode(tabId);
+      set({ readerArticle: article, readerLoading: false });
+    } catch (err) {
+      // Main rejects ineligible tabs (agent / non-user / non-http(s)). The
+      // toolbar action already self-gates to http(s) user tabs, so a rejection
+      // here means extraction failed — swallow it (graceful no-op, overlay
+      // stays closed) rather than surfacing a crash.
+      console.error('browser.enterReadingMode failed:', err);
+      set({ readerArticle: null, readerLoading: false });
+    }
+  },
+
+  closeReadingMode: () => set({ readerArticle: null, readerLoading: false }),
 
   // ── Find-in-page ───────────────────────────────────────────────────────────
   openFind: () => set({ findOpen: true }),

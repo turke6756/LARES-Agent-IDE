@@ -291,6 +291,9 @@ const api: IpcApi = {
     downloadShowInFolder: (id) => ipcRenderer.invoke(BROWSER_CHANNELS.downloadShowInFolder, id),
     downloadRetry: (id) => ipcRenderer.invoke(BROWSER_CHANNELS.downloadRetry, id),
     downloadRemove: (id) => ipcRenderer.invoke(BROWSER_CHANNELS.downloadRemove, id),
+    // ── Slice 14: reading mode. Trusted chrome only; main self-gates to http(s)
+    //    USER tabs and sanitizes the article HTML before it returns. ───────────
+    enterReadingMode: (tabId) => ipcRenderer.invoke(BROWSER_CHANNELS.enterReadingMode, tabId),
     onDownloadStarted: (callback) => {
       const listener = (_event: any, rec: BrowserDownload) => callback(rec);
       ipcRenderer.on(BROWSER_CHANNELS.downloadStarted, listener);

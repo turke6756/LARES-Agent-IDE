@@ -467,6 +467,22 @@ export interface BrowserDownloadPrompt {
   workspaceId: string | null;
 }
 
+/** Slice 14 — Reading mode. The result of extracting + SANITIZING a user tab's
+ *  article content in main. `html` is DOMPurify-sanitized (no scripts, no on*
+ *  handlers, no javascript: URLs) but is still UNTRUSTED content — the renderer
+ *  reader overlay injects it into its own DOM and must never re-grant it script
+ *  capability. Produced only for http(s) USER tabs; never exposed to agent tools. */
+export interface ReaderArticle {
+  /** Best-effort article title (og:title → document.title → first h1). */
+  title: string;
+  /** Best-effort author/byline, or null when none was found. */
+  byline: string | null;
+  /** Sanitized article HTML, safe to render in the trusted reader overlay. */
+  html: string;
+  /** Visible character count of the sanitized text — drives reading-time. */
+  textLength: number;
+}
+
 /** IPC channel names — single source so preload and main can't drift. */
 export const BROWSER_CHANNELS = {
   createTab: 'browser:create-tab',
@@ -659,4 +675,10 @@ export const BROWSER_CHANNELS = {
   /** (id) → void — confirm a pending USER download (downloadPrompt token); the
    *  human approved, so main re-initiates and allows the write. */
   downloadConfirm: 'browser:download-confirm',
+
+  // ── Slice 14: reading mode ─────────────────────────────────────────────────
+  /** (tabId) → ReaderArticle — TRUSTED CHROME ONLY. Extract + sanitize the live
+   *  article HTML of an http(s) USER tab in main. Rejects agent / non-user /
+   *  non-http(s) tabs; never reachable from agent tools or page content. */
+  enterReadingMode: 'browser:enter-reading-mode',
 } as const;

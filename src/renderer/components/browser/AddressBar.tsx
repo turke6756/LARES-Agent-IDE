@@ -316,6 +316,11 @@ export default function AddressBar({ tab }: Props) {
           (renders null on the NTP / when there's no tab). ── */}
       <ZoomControl />
 
+      {/* ── READER (Slice 14) — enters the reader overlay; self-gates to
+          http(s) USER tabs (renders null otherwise), mirroring main's gating
+          contract so an ineligible tab never triggers a rejection. ── */}
+      <ReaderToolbarButton />
+
       <button
         onClick={() => toggleBookmarkBar()}
         className="ui-btn ui-btn-ghost p-1.5 shrink-0"
@@ -373,6 +378,45 @@ export default function AddressBar({ tab }: Props) {
           act-tier toggle; unobtrusive, rightmost in the chrome toolbar. ── */}
       <AgentActionsToggle />
     </div>
+  );
+}
+
+// ── Slice 14 reader toolbar button ───────────────────────────────────────────
+// Self-gates to http(s) USER tabs (mirrors ZoomControl's self-gate and main's
+// gating contract: enterReadingMode REJECTS agent / non-user / non-http(s)
+// tabs). On click it asks the store to extract+sanitize the article in main and
+// open the reader overlay; the store swallows a rejection, so an edge-case click
+// is a graceful no-op rather than a crash.
+function ReaderToolbarButton() {
+  const activeTabId = useBrowserStore((s) => s.activeTabId);
+  const tabs = useBrowserStore((s) => s.tabs);
+  const enterReadingMode = useBrowserStore((s) => s.enterReadingMode);
+  const readerLoading = useBrowserStore((s) => s.readerLoading);
+
+  const activeTab = tabs.find((t) => t.tabId === activeTabId) ?? null;
+
+  // Visible only for an http(s) USER tab with a live view. The New Tab page, a
+  // frozen/discarded snapshot, an agent tab, and non-http(s) schemes are all
+  // ineligible (and would be rejected by main).
+  if (!activeTab) return null;
+  if (activeTab.partition !== 'user') return null;
+  if (activeTab.isNewTab || activeTab.frozen) return null;
+  if (!/^https?:\/\//i.test(activeTab.url ?? '')) return null;
+
+  return (
+    <button
+      onClick={() => void enterReadingMode(activeTab.tabId)}
+      disabled={readerLoading}
+      className="ui-btn ui-btn-ghost p-1.5 shrink-0 disabled:opacity-40"
+      title="Reading mode"
+      aria-label="Reading mode"
+    >
+      {readerLoading ? (
+        <Icons.Loader2 className="w-4 h-4 animate-spin text-accent-blue" />
+      ) : (
+        <Icons.BookOpen className="w-4 h-4" />
+      )}
+    </button>
   );
 }
 

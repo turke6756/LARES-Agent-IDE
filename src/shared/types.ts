@@ -24,6 +24,7 @@ import type {
   HistoryEntry,
   HistoryQuery,
   OmniboxSuggestion,
+  ReaderArticle,
   SharedAgentSessions,
 } from './browser';
 
@@ -882,6 +883,12 @@ export interface IpcApi {
     downloadRetry: (id: string) => Promise<void>;
     /** Remove a record from the shelf (does NOT delete the saved file). */
     downloadRemove: (id: string) => Promise<void>;
+
+    // ── Slice 14: reading mode. Trusted chrome only. Extract + sanitize the live
+    //    article of an http(s) USER tab in main; rejects agent / non-user /
+    //    non-http(s) tabs. The returned `html` is DOMPurify-sanitized (no scripts,
+    //    no on* handlers, no javascript: URLs) but is still untrusted content. ───
+    enterReadingMode: (tabId: string) => Promise<ReaderArticle>;
     /** A download began writing (already confined + recorded). */
     onDownloadStarted: (callback: (rec: BrowserDownload) => void) => () => void;
     /** Byte progress for an in-flight download. */

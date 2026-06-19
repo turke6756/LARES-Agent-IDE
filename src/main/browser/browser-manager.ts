@@ -68,6 +68,7 @@ import {
   type HistoryEntry,
   type HistoryQuery,
   type OmniboxSuggestion,
+  type ReaderArticle,
   type SharedAgentSessions,
 } from '../../shared/browser';
 import {
@@ -103,6 +104,7 @@ import {
   topSites,
 } from './history-store';
 import { buildContextMenuTemplate } from './context-menu';
+import { extractReaderArticle } from './reader-extract';
 import {
   configureOmniboxSources,
   suggest as omniboxSuggestRanked,
@@ -2700,6 +2702,38 @@ export class BrowserManager {
     const tab = this.mustGet(tabId);
     tab.view.webContents.setZoomFactor(clamp(zoomFactor, 0.25, 5));
     this.sendTabState(tab); // push the new zoomFactor to the UI indicator
+  }
+
+  // ── Slice 14: reading mode ─────────────────────────────────────────────────
+  // TRUSTED CHROME ONLY. Deliberately a plain manager method (like setZoom), NOT
+  // a member of the `tools` BrowserToolProvider facade — agents have no verb that
+  // reaches this, and there is no policy READ_VERB for it. Self-gated to http(s)
+  // USER tabs (mirrors ZoomControl / bookmarks / history user-only features): an
+  // agent-partition or non-http(s) tab is rejected outright, so extraction is
+  // never reachable from agent-driven state. We read the live page HTML through
+  // the trusted main-side WebContents.executeJavaScript path (the same primitive
+  // the scroll restore uses) — NOT through any agent-reachable CDP read — then
+  // hand it to the pure extract+sanitize routine. We do NOT attach/leave a
+  // debugger on the tab, so the agent CDP attach discipline is untouched.
+  async enterReadingMode(tabId: string): Promise<ReaderArticle> {
+    const tab = this.mustGet(tabId);
+    if (tab.partition !== 'user') {
+      throw new Error('reading mode is available only for user tabs');
+    }
+    const wc = tab.view.webContents;
+    const url = wc.getURL();
+    if (secureStateForUrl(url) === 'internal') {
+      throw new Error('reading mode is available only for http(s) pages');
+    }
+    if (wc.isDestroyed() || typeof wc.executeJavaScript !== 'function') {
+      throw new Error('cannot read this tab');
+    }
+    // Trusted main-side live-HTML read (untrusted RESULT — sanitized below).
+    const rawHtml = (await wc.executeJavaScript(
+      'document.documentElement.outerHTML',
+      true,
+    )) as string;
+    return extractReaderArticle(typeof rawHtml === 'string' ? rawHtml : '', url);
   }
 
   // WP6 — native context menu is popped directly in the `context-menu` event
