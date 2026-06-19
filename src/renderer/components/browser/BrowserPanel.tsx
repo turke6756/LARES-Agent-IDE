@@ -41,6 +41,7 @@ export default function BrowserPanel() {
   const acceptOpenRequest = useBrowserStore((s) => s.acceptOpenRequest);
   const dismissOpenRequest = useBrowserStore((s) => s.dismissOpenRequest);
   const createTab = useBrowserStore((s) => s.createTab);
+  const selectTab = useBrowserStore((s) => s.selectTab);
   const clearPaneAttention = useBrowserStore((s) => s.clearPaneAttention);
   // Slice 10/11: a dismissible "Restored N tabs" note shown on first paint after
   // a session restore (only while restoredCount > 0).
@@ -55,8 +56,27 @@ export default function BrowserPanel() {
     clearPaneAttention();
   }, [clearPaneAttention]);
 
+  // Ctrl/Cmd+1..9 → jump to the Nth visible tab (9 = last, Chrome semantics).
+  // Renderer-scoped: this fires when focus is in the browser CHROME (address
+  // bar / NTP / buttons). When the WebContentsView page itself is focused the
+  // main process owns key chords (before-input-event); new-tab (Ctrl+T) and
+  // close-tab (Ctrl+W) are mapped there. Tabs are matched in store order.
+  const onChromeKeyDown = (e: React.KeyboardEvent) => {
+    if (!(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey) return;
+    if (e.key < '1' || e.key > '9') return;
+    const n = Number(e.key);
+    const target = n === 9 ? tabs[tabs.length - 1] : tabs[n - 1];
+    if (target) {
+      e.preventDefault();
+      selectTab(target.tabId);
+    }
+  };
+
   return (
-    <div className="browser-chrome relative flex-1 flex flex-col min-w-0 overflow-hidden">
+    <div
+      className="browser-chrome relative flex-1 flex flex-col min-w-0 overflow-hidden"
+      onKeyDown={onChromeKeyDown}
+    >
       {!apiPresent ? (
         <div className="flex-1 flex items-center justify-center text-fg-muted">
           <div className="text-center max-w-md px-6">

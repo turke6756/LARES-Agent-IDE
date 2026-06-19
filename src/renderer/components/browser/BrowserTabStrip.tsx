@@ -13,6 +13,7 @@ import {
 import TabGroupChip from './TabGroupChip';
 import TabGroupDropdown from './TabGroupDropdown';
 import TabHoverCard, { type TabHoverCardProps } from './TabHoverCard';
+import { clampToViewport } from './popover-position';
 import * as Icons from 'lucide-react';
 
 // User-partition vs agent-partition tabs are visually distinct (M9 partition
@@ -101,19 +102,24 @@ function TabContextMenu({
 }) {
   const menuRef = useRef<HTMLDivElement | null>(null);
   // Start at the raw cursor point, then clamp once the real size is known.
-  const [pos, setPos] = useState<{ left: number; top: number }>({ left: x, top: y });
+  const [pos, setPos] = useState<{ left: number; top: number; origin: string }>({
+    left: x,
+    top: y,
+    origin: 'top left',
+  });
 
-  // Clamp to the viewport after layout (size is unknown until mounted).
+  // Clamp to the viewport after layout (size is unknown until mounted) via the
+  // shared collision-aware helper, so the menu never renders partly off-screen.
   useLayoutEffect(() => {
     const el = menuRef.current;
     if (!el) return;
     const rect = el.getBoundingClientRect();
-    const margin = 4;
-    const maxLeft = Math.max(margin, window.innerWidth - rect.width - margin);
-    const maxTop = Math.max(margin, window.innerHeight - rect.height - margin);
-    const left = Math.min(Math.max(margin, x), maxLeft);
-    const top = Math.min(Math.max(margin, y), maxTop);
-    setPos((prev) => (prev.left === left && prev.top === top ? prev : { left, top }));
+    const next = clampToViewport({ x, y }, { width: rect.width, height: rect.height });
+    setPos((prev) =>
+      prev.left === next.left && prev.top === next.top && prev.origin === next.origin
+        ? prev
+        : { left: next.left, top: next.top, origin: next.origin },
+    );
   }, [x, y]);
 
   // Focus management: move focus into the menu on open, trap it, and wire
@@ -183,8 +189,8 @@ function TabContextMenu({
         role="menu"
         aria-label="Tab actions"
         tabIndex={-1}
-        className="fixed z-50 min-w-[220px] rounded-md border border-[var(--color-browser-divider)] bg-[var(--color-surface-0)] shadow-lg py-1 text-[12px] focus:outline-none"
-        style={{ left: pos.left, top: pos.top }}
+        className="browser-popover browser-popover-anim fixed z-50 min-w-[220px] py-1 text-[12px] focus:outline-none"
+        style={{ left: pos.left, top: pos.top, ['--browser-popover-origin' as string]: pos.origin }}
       >
         {handed ? (
           <button
@@ -246,6 +252,34 @@ export default function BrowserTabStrip() {
   const tabReturnToHuman = useBrowserStore((s) => s.tabReturnToHuman);
 
   const [draggingId, setDraggingId] = useState<string | null>(null);
+  // Slice 16 motion: a tab being closed animates (width+opacity collapse) before
+  // the store actually removes it. We hold the id, paint `.browser-tab-closing`,
+  // then call closeTab after the animation. Reduced-motion users skip the delay.
+  const [closingId, setClosingId] = useState<string | null>(null);
+  const closeTimer = useRef<number | null>(null);
+  const prefersReducedMotion = () =>
+    typeof window !== 'undefined' &&
+    typeof window.matchMedia === 'function' &&
+    window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const requestClose = (tabId: string) => {
+    if (prefersReducedMotion()) {
+      closeTab(tabId);
+      return;
+    }
+    setClosingId(tabId);
+    if (closeTimer.current !== null) clearTimeout(closeTimer.current);
+    closeTimer.current = window.setTimeout(() => {
+      closeTab(tabId);
+      setClosingId(null);
+      closeTimer.current = null;
+    }, 130);
+  };
+  useEffect(
+    () => () => {
+      if (closeTimer.current !== null) clearTimeout(closeTimer.current);
+    },
+    [],
+  );
   // Tab right-click context menu (renderer chrome) + the hand-off confirm dialog.
   const [menu, setMenu] = useState<{ tabId: string; x: number; y: number } | null>(null);
   const [confirmHandoff, setConfirmHandoff] = useState<{ tabId: string; origin: string } | null>(null);
@@ -402,9 +436,16 @@ export default function BrowserTabStrip() {
     // Clicking either activates the tab → main lazily hydrates/reloads it.
     const frozen = Boolean(tab.frozen);
     const discarded = Boolean(tab.discarded);
+    const closing = closingId === tab.tabId;
+    // Full-title tooltip for a11y/quick-ID (the rich TabHoverCard still shows on
+    // hover-intent; this native title is the accessible-name fallback).
+    const fullTitle = tab.url ? `${tabLabel(tab)} — ${tab.url}` : tabLabel(tab);
     return (
       <div
         key={tab.tabId}
+        role="tab"
+        aria-selected={active}
+        title={fullTitle}
         draggable={draggable}
         onDragStart={() => setDraggingId(tab.tabId)}
         onDragEnd={() => setDraggingId(null)}
@@ -419,7 +460,7 @@ export default function BrowserTabStrip() {
         onAuxClick={(e) => {
           if (e.button === 1) {
             e.preventDefault();
-            closeTab(tab.tabId);
+            requestClose(tab.tabId);
           }
         }}
         onContextMenu={(e) => {
@@ -432,6 +473,8 @@ export default function BrowserTabStrip() {
         className={`group browser-tab text-[12px] cursor-pointer ${pinned ? 'browser-tab-pinned' : ''} ${
           active ? 'browser-tab-active' : ''
         } ${attention ? 'browser-tab-attention' : ''} ${
+          closing ? 'browser-tab-closing' : !pinned ? 'browser-tab-opening' : ''
+        } ${
           draggingId === tab.tabId ? 'opacity-50' : (frozen || discarded) ? 'opacity-60' : ''
         }`}
         data-frozen={frozen || undefined}
@@ -483,7 +526,7 @@ export default function BrowserTabStrip() {
           <button
             onClick={(e) => {
               e.stopPropagation();
-              closeTab(tab.tabId);
+              requestClose(tab.tabId);
             }}
             className="shrink-0 p-0.5 opacity-0 group-hover:opacity-100 hover:text-accent-red"
             title="Close tab"
@@ -497,7 +540,11 @@ export default function BrowserTabStrip() {
 
   return (
     <>
-      <div className="flex items-center gap-0.5 px-2 pt-1.5 bg-browser-chrome border-b border-browser-divider overflow-x-auto scrollbar-thin shrink-0">
+      <div
+        role="tablist"
+        aria-label="Browser tabs"
+        className="flex items-center gap-0.5 px-2 pt-1.5 bg-browser-chrome border-b border-browser-divider overflow-x-auto scrollbar-thin shrink-0"
+      >
         {/* Pinned cluster (always plain, ungrouped, leftmost). */}
         {grouped.pinned.map(renderTab)}
 

@@ -185,7 +185,7 @@ function ActivityDrawerInner() {
           so the backdrop paints over the (now-hidden) host region. */}
       <div className="absolute inset-0 z-40 bg-black/20" onClick={closeAuditDrawer} />
       <div
-        className="absolute inset-y-0 right-0 z-50 w-[420px] max-w-full flex flex-col bg-[var(--color-surface-0)] text-fg-primary border-l border-[var(--color-browser-divider)] shadow-xl"
+        className="browser-drawer-anim absolute inset-y-0 right-0 z-50 w-[420px] max-w-full flex flex-col bg-[var(--color-surface-0)] text-fg-primary border-l border-[var(--color-browser-divider)] shadow-xl"
         role="dialog"
         aria-label="Browser activity"
       >

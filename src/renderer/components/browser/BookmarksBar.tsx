@@ -486,7 +486,7 @@ function EditPopover({
       <div
         role="dialog"
         aria-label="Edit bookmark"
-        className="absolute left-1 top-full mt-1 z-50 w-72 rounded-md p-3 flex flex-col gap-2 bg-[var(--color-browser-chrome-2)] border border-[var(--color-browser-divider)] shadow-lg"
+        className="browser-popover browser-popover-anim absolute left-1 top-full mt-1 z-50 w-72 p-3 flex flex-col gap-2"
       >
         <div className="text-[11px] font-semibold text-fg-primary">Edit bookmark</div>
         <label className="text-[10px] uppercase tracking-wide text-fg-muted">Name</label>

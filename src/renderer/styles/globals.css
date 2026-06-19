@@ -1456,3 +1456,182 @@ html.light ::-webkit-scrollbar-thumb:hover {
   color: var(--color-fg-primary);
   overflow-y: auto;
 }
+
+/* ════════════════════════════════════════════════════════════════════════════
+   Slice 16 — Visual system, motion & accessibility pass
+   ──────────────────────────────────────────────────────────────────────────
+   Motion tokens + semantic browser-chrome surfaces (.browser-chip / .browser-row
+   / .browser-popover) consolidating ad-hoc bg-[var(--color-browser-chrome-2)]
+   usages, plus the motion layer (tab open/close, overlay slide+fade, popover
+   scale+fade). ALL animation is gated behind
+   `@media (prefers-reduced-motion: no-preference)` — reduced-motion users get
+   the final state with no transition. None of these selectors touch
+   WebContentsView page content; they style shell chrome / renderer overlays.
+   ════════════════════════════════════════════════════════════════════════════ */
+
+:root {
+  /* Motion tokens — durations + shared easings for browser chrome/overlays. */
+  --browser-motion-fast: 120ms;
+  --browser-motion-base: 180ms;
+  --browser-motion-slow: 240ms;
+  --browser-ease-standard: cubic-bezier(0.2, 0, 0, 1);
+  --browser-ease-emphasized: cubic-bezier(0.2, 0, 0, 1.15);
+
+  /* Normalized chrome metrics so toolbar/tab/bookmark heights, icon hit areas
+     and focus rings stay consistent across browser components. */
+  --browser-icon-hit: 28px;
+  --browser-focus-ring: var(--color-accent-blue);
+}
+
+/* Icon-sized hit target (nav buttons, tab close, toggles): a normalized square
+   so every clickable glyph in the chrome shares one hit area + radius. */
+.browser-icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--browser-icon-hit);
+  height: var(--browser-icon-hit);
+  min-height: var(--browser-icon-hit);
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--color-fg-secondary);
+  transition: background-color var(--browser-motion-fast) var(--browser-ease-standard),
+              color var(--browser-motion-fast) var(--browser-ease-standard);
+}
+.browser-icon-btn:hover:not(:disabled) {
+  background: var(--color-tab-hover-bg);
+  color: var(--color-fg-primary);
+}
+.browser-icon-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* Unified focus ring for browser chrome controls. */
+.browser-chip:focus-visible,
+.browser-row:focus-visible,
+.browser-icon-btn:focus-visible,
+.browser-tab:focus-visible {
+  outline: 2px solid var(--browser-focus-ring);
+  outline-offset: -1px;
+}
+
+/* Chip: a compact pill on the chrome surface (zoom %, NTP shortcuts, toggle
+   pills, badges). Consolidates ad-hoc bg-[var(--color-browser-chrome-2)] pills. */
+.browser-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  background: var(--color-browser-chrome-2);
+  border: 1px solid var(--color-browser-divider);
+  color: var(--color-fg-primary);
+}
+
+/* Row: a full-width list row (history / bookmarks / downloads / access entries).
+   Hover wash reuses the chrome-2 surface so rows read as one family. */
+.browser-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--color-fg-primary);
+  transition: background-color var(--browser-motion-fast) var(--browser-ease-standard);
+}
+.browser-row:hover {
+  background: var(--color-browser-chrome-2);
+}
+
+/* Popover: floating panel surface shared by StarMenu / omnibox suggestions /
+   context-menu. Token-backed bg + divider + elevation, light/dark aware. */
+.browser-popover {
+  background: var(--color-browser-chrome-2);
+  border: 1px solid var(--color-browser-divider);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35), 0 2px 6px rgba(0, 0, 0, 0.25);
+  color: var(--color-fg-primary);
+}
+.light .browser-popover {
+  box-shadow: var(--shadow-menu);
+}
+
+/* Loading skeleton shimmer block (NTP / history / bookmarks). The base block is
+   a static tinted rectangle; the sweep is added only under no-preference below. */
+.browser-skeleton {
+  position: relative;
+  overflow: hidden;
+  border-radius: 6px;
+  background: var(--color-browser-chrome-2);
+}
+
+/* ── Motion layer — gated: reduced-motion users get NO animation ──────────── */
+@media (prefers-reduced-motion: no-preference) {
+  /* Tab open: width (max-width) + opacity grow-in. */
+  @keyframes browser-tab-open {
+    from { opacity: 0; max-width: 0; transform: translateY(-2px); }
+    to   { opacity: 1; max-width: 220px; transform: none; }
+  }
+  .browser-tab-opening {
+    animation: browser-tab-open var(--browser-motion-base) var(--browser-ease-standard);
+  }
+  /* Tab close: width + opacity collapse-out (applied just before unmount). */
+  @keyframes browser-tab-close {
+    from { opacity: 1; max-width: 220px; }
+    to   { opacity: 0; max-width: 0; padding-left: 0; padding-right: 0; }
+  }
+  .browser-tab-closing {
+    animation: browser-tab-close var(--browser-motion-fast) var(--browser-ease-standard) forwards;
+    pointer-events: none;
+  }
+
+  /* Inset overlay (history / access / reader): slide-up + fade. */
+  @keyframes browser-overlay-in {
+    from { opacity: 0; transform: translateY(8px); }
+    to   { opacity: 1; transform: none; }
+  }
+  .browser-overlay-anim {
+    animation: browser-overlay-in var(--browser-motion-base) var(--browser-ease-standard);
+  }
+
+  /* Right slide-over drawer (activity/audit): slide-in from the right + fade. */
+  @keyframes browser-drawer-in {
+    from { opacity: 0; transform: translateX(16px); }
+    to   { opacity: 1; transform: none; }
+  }
+  .browser-drawer-anim {
+    animation: browser-drawer-in var(--browser-motion-base) var(--browser-ease-standard);
+  }
+
+  /* Popover (StarMenu / omnibox / context-menu): scale + fade from its origin. */
+  @keyframes browser-popover-in {
+    from { opacity: 0; transform: scale(0.97); }
+    to   { opacity: 1; transform: none; }
+  }
+  .browser-popover-anim {
+    animation: browser-popover-in var(--browser-motion-fast) var(--browser-ease-standard);
+    transform-origin: var(--browser-popover-origin, top center);
+  }
+
+  /* Skeleton shimmer sweep. */
+  @keyframes browser-skeleton-sweep {
+    100% { transform: translateX(100%); }
+  }
+  .browser-skeleton::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    transform: translateX(-100%);
+    background: linear-gradient(
+      90deg,
+      transparent,
+      color-mix(in srgb, var(--color-fg-primary) 8%, transparent),
+      transparent
+    );
+    animation: browser-skeleton-sweep 1.3s ease-in-out infinite;
+  }
+}

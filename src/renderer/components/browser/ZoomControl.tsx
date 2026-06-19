@@ -57,7 +57,7 @@ function ZoomMenu({
       <div
         role="menu"
         aria-label="Zoom level"
-        className="fixed z-50 w-[140px] rounded-md border border-[var(--color-browser-divider)] bg-[var(--color-surface-0)] shadow-xl py-1 text-[12px]"
+        className="browser-popover browser-popover-anim fixed z-50 w-[140px] py-1 text-[12px]"
         style={{ left: x, top: y + 4 }}
       >
         {PRESETS.map((p) => {

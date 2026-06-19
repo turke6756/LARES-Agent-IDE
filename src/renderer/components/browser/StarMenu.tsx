@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import * as Icons from 'lucide-react';
 import { useBrowserStore, type Bookmark } from '../../stores/browser-store';
 import { suspendBrowserPane, resumeBrowserPane } from './useBrowserSuspension';
+import { useAnchoredPlacement } from './popover-position';
 
 // ── Star / bookmark menu (WP3-BM-UI · Slice-7 manager) ───────────────────────
 // Lives in the AddressBar's reserved STAR slot. Rendered ONLY for user-partition
@@ -47,6 +48,8 @@ export default function StarMenu() {
   const [undo, setUndo] = useState<Bookmark | null>(null);
   const undoTimer = useRef<number | null>(null);
   const popoverRef = useRef<HTMLDivElement | null>(null);
+  const starBtnRef = useRef<HTMLButtonElement | null>(null);
+  const editorRef = useRef<HTMLDivElement | null>(null);
   const prevTick = useRef(bookmarkTick);
 
   // Only user-partition tabs with a committed http(s) URL can be bookmarked.
@@ -120,6 +123,11 @@ export default function StarMenu() {
   // Clean up the undo timer on unmount.
   useEffect(() => clearUndoTimer, []);
 
+  // Collision-aware placement for the editor popover: anchored under the star,
+  // flips above / clamps horizontally near the viewport edge via the shared
+  // helper (the star sits in the toolbar where the popover could overflow).
+  const placement = useAnchoredPlacement(starBtnRef, editorRef, { align: 'start', gap: 6 }, [open]);
+
   if (!bookmarkable || !activeTab) return null;
 
   const onStarClick = () => {
@@ -179,6 +187,7 @@ export default function StarMenu() {
   return (
     <div className="relative shrink-0" ref={popoverRef}>
       <button
+        ref={starBtnRef}
         onClick={onStarClick}
         className="ui-btn ui-btn-ghost p-1.5"
         title={isBookmarked ? 'Edit bookmark' : 'Bookmark this page'}
@@ -192,8 +201,15 @@ export default function StarMenu() {
 
       {open && (
         <div
-          className="absolute z-50 top-full mt-1 left-0 w-72 rounded-md p-3 flex flex-col gap-2 bg-[var(--color-browser-chrome-2)] border border-[var(--color-browser-divider)] shadow-lg"
+          ref={editorRef}
+          className="browser-popover browser-popover-anim fixed z-50 w-72 p-3 flex flex-col gap-2"
           role="dialog"
+          style={{
+            left: placement?.left ?? 0,
+            top: placement?.top ?? 0,
+            visibility: placement ? 'visible' : 'hidden',
+            ['--browser-popover-origin' as string]: placement?.origin ?? 'top left',
+          }}
         >
           <div className="text-[11px] font-semibold text-fg-primary">
             {isBookmarked ? 'Edit bookmark' : 'Bookmark'}
@@ -257,7 +273,7 @@ export default function StarMenu() {
 
       {undo && (
         <div
-          className="absolute z-50 top-full mt-1 left-0 w-72 rounded-md px-3 py-2 flex items-center justify-between gap-2 bg-[var(--color-browser-chrome-2)] border border-[var(--color-browser-divider)] shadow-lg"
+          className="browser-popover browser-popover-anim absolute z-50 top-full mt-1 left-0 w-72 px-3 py-2 flex items-center justify-between gap-2"
           role="status"
         >
           <span className="text-[11px] text-fg-secondary truncate">

@@ -161,7 +161,7 @@ function ReadingModeViewInner() {
 
   return (
     <div
-      className="absolute inset-0 z-40 flex flex-col"
+      className="browser-overlay-anim absolute inset-0 z-40 flex flex-col"
       style={{ backgroundColor: palette.bg, color: palette.fg }}
       data-reader-theme={theme}
     >

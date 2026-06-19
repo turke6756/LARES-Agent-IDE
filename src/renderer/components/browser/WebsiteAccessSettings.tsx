@@ -646,7 +646,7 @@ function WebsiteAccessSettingsInner() {
   );
 
   return (
-    <div className="absolute inset-0 z-40 flex flex-col bg-[var(--color-surface-0)] text-fg-primary">
+    <div className="browser-overlay-anim absolute inset-0 z-40 flex flex-col bg-[var(--color-surface-0)] text-fg-primary">
       {/* Header */}
       <div className="flex items-center gap-3 px-4 py-3 border-b border-[var(--color-browser-divider)] shrink-0">
         <div className="flex items-center gap-2 text-fg-primary">

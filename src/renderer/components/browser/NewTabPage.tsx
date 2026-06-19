@@ -176,8 +176,8 @@ function TopSitesSkeleton() {
     <div className="grid grid-cols-4 sm:grid-cols-8 gap-3" aria-hidden="true">
       {Array.from({ length: TOP_SITES_LIMIT }).map((_, i) => (
         <div key={i} className="flex flex-col items-center gap-1.5">
-          <span className="w-11 h-11 rounded-full bg-[var(--color-browser-chrome-2)] animate-pulse" />
-          <span className="h-2.5 w-12 rounded bg-[var(--color-browser-chrome-2)] animate-pulse" />
+          <span className="browser-skeleton w-11 h-11 rounded-full" />
+          <span className="browser-skeleton h-2.5 w-12" />
         </div>
       ))}
     </div>
@@ -188,7 +188,7 @@ function BookmarksSkeleton() {
   return (
     <div className="flex flex-wrap gap-2" aria-hidden="true">
       {Array.from({ length: 5 }).map((_, i) => (
-        <span key={i} className="h-7 w-28 rounded-full bg-[var(--color-browser-chrome-2)] animate-pulse" />
+        <span key={i} className="browser-skeleton h-7 w-28 rounded-full" />
       ))}
     </div>
   );
@@ -361,7 +361,7 @@ export default function NewTabPage({ onNavigate }: Props) {
               id="ntp-omnibox-listbox"
               role="listbox"
               aria-label="Address suggestions"
-              className="absolute left-0 right-0 top-full mt-1 z-20 max-h-80 overflow-y-auto rounded-xl bg-[var(--color-browser-chrome-2)] border border-[var(--color-browser-divider)] shadow-lg py-1"
+              className="browser-popover browser-popover-anim absolute left-0 right-0 top-full mt-1 z-20 max-h-80 overflow-y-auto py-1"
             >
               {omniboxResults.map((row, i) => {
                 const Icon = Icons[KIND_ICON[row.kind]] as React.ComponentType<{ className?: string }>;

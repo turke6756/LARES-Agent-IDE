@@ -3,7 +3,8 @@
 // module (unit-tested); this file only applies it to real sessions/views.
 // Mitigations wired here: M2 (loopback filter), M3 (hardened webPreferences),
 // M4 (managed-contents seam), M5 (permission deny-all), M6 (nav gates +
-// popup deny), M7 (downloads denied), M9 (debugger attach rule).
+// popup deny), M7 (downloads gated: user-confirm / agent-allowlist),
+// M9 (debugger attach rule).
 
 import { randomUUID } from 'crypto';
 import path from 'path';

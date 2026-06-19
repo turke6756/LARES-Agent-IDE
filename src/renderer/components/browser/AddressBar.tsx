@@ -471,12 +471,29 @@ function OmniboxDropdown({
 }) {
   // Overlaps the native view → must suspend it while open.
   useBrowserSuspension();
+  // Collision-aware vertical flip: the dropdown is width-pinned to the input
+  // (left-0/right-0), so it can't overflow horizontally, but near the bottom of
+  // a short window it should open UPWARD instead of clipping. Measure once and
+  // flip when there isn't room below and there's more room above.
+  const listRef = useRef<HTMLUListElement | null>(null);
+  const [placeAbove, setPlaceAbove] = useState(false);
+  useLayoutEffect(() => {
+    const el = listRef.current;
+    if (!el || typeof window === 'undefined') return;
+    const rect = el.getBoundingClientRect();
+    const spaceBelow = window.innerHeight - rect.top;
+    const spaceAbove = rect.top - rect.height - 8;
+    setPlaceAbove(rect.height + 8 > spaceBelow && spaceAbove > spaceBelow);
+  }, [results.length]);
   return (
     <ul
+      ref={listRef}
       id={LISTBOX_ID}
       role="listbox"
       aria-label="Address suggestions"
-      className="absolute left-0 right-0 top-full mt-1 z-20 max-h-80 overflow-y-auto bg-browser-chrome-2 border border-tab-border shadow-lg py-1"
+      className={`browser-popover browser-popover-anim absolute left-0 right-0 z-20 max-h-80 overflow-y-auto py-1 ${
+        placeAbove ? 'bottom-full mb-1' : 'top-full mt-1'
+      }`}
     >
       {results.map((row, i) => {
         const Icon = Icons[KIND_ICON[row.kind]] as React.ComponentType<{ className?: string }>;

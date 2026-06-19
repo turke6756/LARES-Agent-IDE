@@ -84,10 +84,10 @@ function SkeletonRows() {
     <div className="flex flex-col gap-1 px-4 py-2" aria-hidden="true">
       {Array.from({ length: 8 }).map((_, i) => (
         <div key={i} className="flex items-center gap-3 px-2 py-1.5">
-          <span className="w-6 h-6 rounded-sm bg-[var(--color-browser-chrome-2)] animate-pulse shrink-0" />
+          <span className="browser-skeleton w-6 h-6 rounded-sm shrink-0" />
           <div className="flex-1 flex flex-col gap-1">
-            <span className="h-3 w-1/3 rounded bg-[var(--color-browser-chrome-2)] animate-pulse" />
-            <span className="h-2.5 w-1/2 rounded bg-[var(--color-browser-chrome-2)] animate-pulse" />
+            <span className="browser-skeleton h-3 w-1/3" />
+            <span className="browser-skeleton h-2.5 w-1/2" />
           </div>
         </div>
       ))}
@@ -262,7 +262,7 @@ function HistoryViewInner() {
   const showInitialSkeleton = loading && entries.length === 0;
 
   return (
-    <div className="absolute inset-0 z-40 flex flex-col bg-[var(--color-surface-0)] text-fg-primary">
+    <div className="browser-overlay-anim absolute inset-0 z-40 flex flex-col bg-[var(--color-surface-0)] text-fg-primary">
       {/* Header: title + search + bulk/clear actions + close. */}
       <div className="flex items-center gap-3 px-4 py-3 border-b border-[var(--color-browser-divider)] shrink-0">
         <div className="flex items-center gap-2 text-fg-primary">
@@ -346,8 +346,8 @@ function HistoryViewInner() {
                           ev.preventDefault();
                           setMenu({ entry: e, x: ev.clientX, y: ev.clientY });
                         }}
-                        className={`group flex items-center gap-3 px-2 py-1.5 rounded transition-colors ${
-                          isSelected ? 'bg-[var(--color-tab-hover-bg)]' : 'hover:bg-[var(--color-tab-hover-bg)]'
+                        className={`group browser-row ${
+                          isSelected ? 'bg-[var(--color-tab-hover-bg)]' : ''
                         }`}
                       >
                         <input
@@ -401,7 +401,7 @@ function HistoryViewInner() {
       {menu && (
         <div
           role="menu"
-          className="fixed z-50 min-w-[180px] rounded-md border border-[var(--color-browser-divider)] bg-[var(--color-browser-chrome-1)] shadow-lg py-1 text-[12px]"
+          className="browser-popover browser-popover-anim fixed z-50 min-w-[180px] py-1 text-[12px]"
           style={{
             left: Math.min(menu.x, window.innerWidth - 200),
             top: Math.min(menu.y, window.innerHeight - 120),

@@ -81,7 +81,7 @@ function DownloadRow({ d }: { d: BrowserDownload }) {
   return (
     <div
       data-testid="download-row"
-      className="flex items-center gap-2.5 px-3 py-2 rounded-lg bg-[var(--color-browser-chrome-2)] border border-[var(--color-browser-divider)] min-w-0"
+      className="browser-chip w-full min-w-0 gap-2.5 px-3 py-2"
     >
       <StateIcon className={`w-4 h-4 shrink-0 ${STATE_TINT[d.state]}`} />
       <div className="flex-1 min-w-0 flex flex-col">
