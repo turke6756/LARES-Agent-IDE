@@ -67,10 +67,16 @@ export function laneUsesStrictMcp(lane: AgentRoleLane): boolean {
  *  AgentSupervisor.launchWindowsAgent so the boolean is unit-testable without
  *  spawning claude.exe / opening the DB. */
 export interface DirectSpawnParams {
-  isSupervisor?: boolean;
-  isSupervised?: boolean;
-  isWorker?: boolean;
-  isResearcher?: boolean;
+  /** The agent's resolved role-lane — the result of `roleLaneOf(agent)`. The
+   *  direct-spawn decision keys off the lane (not the raw isSupervisor/…
+   *  booleans) so it stays in lockstep with the MCP-injection condition, which is
+   *  also `lane !== 'legacy'`. Keying off the booleans is what crash-looped the
+   *  privilege-lane persona: it was injected on the lane (roleLaneOf →
+   *  'supervisor' via privilegeLane) but cmd.exe-wrapped on the booleans
+   *  (isSupervisor/isSupervised/isWorker/isResearcher all false), so the wrap's
+   *  quoteForCmd() doubled every `"` in the inline JSON. Lane-keying covers
+   *  privilegeLane:'supervisor' for free (roleLaneOf maps it to 'supervisor'). */
+  lane: AgentRoleLane;
   /** Agent provider ('claude' | 'codex' | …). Only claude agents direct-spawn. */
   provider: string;
   /** True when a multiline positional prompt arg is present
@@ -87,18 +93,19 @@ export interface DirectSpawnParams {
  *  Two reasons to direct-spawn:
  *   1. `hasPromptArg` — a multiline positional prompt would be shredded by
  *      cmd.exe argument parsing.
- *   2. Persistent-lane agent (supervisor / supervised / **worker** / researcher)
+ *   2. Any non-legacy claude lane (supervisor / worker / researcher — and any
+ *      privilege-lane persona, which roleLaneOf folds into the supervisor lane)
  *      — these pass a load-bearing `--append-system-prompt` AND an inline
  *      `--mcp-config <JSON>`. Under the cmd.exe wrap, pty-host quoteForCmd()
  *      doubles every `"` in the JSON, so it no longer starts with `{` and
  *      claude.exe mistakes it for a missing file path ("MCP config file not
- *      found"). The worker lane was previously omitted here, breaking
- *      unsupervised worker launches on Windows; it is included now to match the
- *      `(isSupervised || isWorker || isResearcher)` lane grouping used
- *      elsewhere in the launch path (and the WSL gate). */
+ *      found"). The predicate is `lane !== 'legacy'` — deliberately the SAME
+ *      predicate that gates the inline-MCP injection (index.ts), so the two can
+ *      never diverge (the divergence that crash-looped the privilege-lane
+ *      persona: injected but not direct-spawned). */
 export function shouldDirectSpawn(p: DirectSpawnParams): boolean {
   const persistentAgent =
-    !!(p.isSupervisor || p.isSupervised || p.isWorker || p.isResearcher) &&
+    p.lane !== 'legacy' &&
     p.provider === 'claude' &&
     !p.overrideArgs;
   return p.hasPromptArg || persistentAgent;
@@ -128,10 +135,17 @@ export const RESEARCHER_ALLOWED_TOOLS: readonly string[] = [
   'Task',
   'Skill',
   'Write',
+  // PRIMARY browser: the embedded agent-dashboard browser_* pane, always wired
+  // in via the injected `browser` MCP toolset. This is the researcher's default
+  // and the ONLY browser used to test/verify the embedded browser itself.
   'mcp__agent-dashboard__browser_*',
-  // claude-in-chrome MCP — additive FALLBACK browser. The embedded
-  // agent-dashboard browser_* pane stays primary; claude-in-chrome survives
-  // strict mode via the inline --mcp-config injected in index.ts.
+  // claude-in-chrome MCP — de-emphasized LAST-RESORT FALLBACK, granted to the
+  // RESEARCHER lane ONLY (this --tools list is researcher-specific; no other
+  // lane grants cic). The server is activated by the `--chrome` flag the
+  // researcher branch appends in index.ts and survives the researcher's
+  // --strict-mcp-config (CLI-flag injection, not config-file discovery). The
+  // lane doc (RESEARCHER_AGENT_MD) steers the researcher away from reaching for
+  // it unless native browser_* genuinely cannot accomplish the task.
   'mcp__claude-in-chrome__*',
 ];
 
@@ -229,15 +243,17 @@ export function redactMcpToken(s: string, token: string): string {
     /(AGENT_DASHBOARD_API_TOKEN=)[^\s'"]+/g,
     `$1${PLACEHOLDER}`,
   );
-  // WSL tmux envelope: `echo <base64-payload> | base64 -d` embeds the ENTIRE
-  // agent command (incl. the inline --mcp-config token) as base64, so the
-  // literal-token pass above cannot see it. Strip the payload outright — the
-  // plaintext (already-redacted) command is preserved in a sibling field, so no
-  // diagnostic value is lost and the token can't be base64-decoded back out of
-  // a serialized tmux command (e.g. launches.log `tmux_command`).
+  // WSL tmux envelope: `echo <base64> | base64 -d` (inner payload) OR the new
+  // outer `printf %s <base64> | base64 -d | bash` quote-free boundary wrapper
+  // both embed the ENTIRE agent command (incl. the inline --mcp-config token) as
+  // base64, so the literal-token pass above cannot see it. Strip the payload
+  // outright — the plaintext (already-redacted) command is preserved in a
+  // sibling field, so no diagnostic value is lost and the token can't be
+  // base64-decoded back out of a serialized tmux command (e.g. launches.log
+  // `tmux_command`).
   out = out.replace(
-    /echo\s+[A-Za-z0-9+/=]+\s*\|\s*base64\s+-d/g,
-    `echo ${PLACEHOLDER}_BASE64 | base64 -d`,
+    /(?:echo|printf %s)\s+[A-Za-z0-9+/=]+\s*\|\s*base64\s+-d/g,
+    `printf %s ${PLACEHOLDER}_BASE64 | base64 -d`,
   );
   return out;
 }

@@ -74,8 +74,13 @@ test('BUG-22: tmuxCommand is populated even on failure (for post-mortem)', async
   assert.equal(result.ok, false);
   // The whole point of the diagnostic: tmuxCommand must be captured so
   // post-mortems can see the exact outer command the bridge handed to wsl.exe.
-  assert.match(result.tmuxCommand, /^setsid tmux set-option -g history-limit \d+ \\; new-session -d -s 's' -c '\/wd' -- bash -lic /);
-  assert.match(result.tmuxCommand, /\| base64 -d\)"$/);
+  // The outer command is now the quote-free `printf %s <b64> | base64 -d | bash`
+  // envelope; decode it to assert the underlying tmux new-session shape.
+  const m = result.tmuxCommand.match(/^printf %s ([A-Za-z0-9+/=]+) \| base64 -d \| bash$/);
+  assert.ok(m, `tmuxCommand must be the base64 envelope: ${result.tmuxCommand}`);
+  const tmuxScript = Buffer.from(m[1], 'base64').toString('utf8');
+  assert.match(tmuxScript, /^setsid tmux set-option -g history-limit \d+ \\; new-session -d -s 's' -c '\/wd' -- bash -lic /);
+  assert.match(tmuxScript, /\| base64 -d\)"$/);
 });
 
 test('BUG-22: non-zero exit with empty stderr still returns structured shape', async () => {

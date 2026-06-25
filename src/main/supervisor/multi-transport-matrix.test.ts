@@ -315,6 +315,234 @@ test('restart-shaped: empty registries + live WSL agent + OLD tmux option → re
   }
 });
 
+// ── Hook-driven `waiting` across transports (plans/hook-driven-waiting-status.md
+//    Test plan → multi-transport-matrix.test.ts) ─────────────────────────
+//
+// A Notification-hook `waiting` event must apply IDENTICALLY whether it
+// arrives over http, spool, or tmux-option: each dispatches
+// monitor.forceWaiting(agentId, 'notification', excerpt), flips the worker to
+// 'waiting', stamps hook health, and records a single status_change whose
+// source is the waiting kind ('notification'). And a STALE tmux-option / spool
+// `waiting` must be rejected by the existing freshness/dedupe gates with NO
+// side effects.
+
+interface WaitingEnv {
+  supervisor: AgentSupervisor;
+  agent: Agent;
+  audit: AuditRow[];
+  cleanup: () => void;
+}
+
+/** Minimal db-patched supervisor + a single working worker, with no launch:
+ *  applyHookStatusEvent is exercised directly. Mirrors the runCell setup but
+ *  trimmed to what the waiting-apply path needs. */
+function makeWaitingEnv(): WaitingEnv {
+  const agentsMap = new Map<string, Agent>();
+  const audit: AuditRow[] = [];
+  const restoreDb = patchDb(agentsMap, audit);
+  const agent = makeAgent('w-1', {
+    provider: 'claude', isWorker: true, isSupervised: false, status: 'working',
+    workingDirectory: '/home/u/proj/.dashboard/workers/claude',
+  });
+  agentsMap.set(agent.id, agent);
+  const supervisor = makeSupervisor();
+  return {
+    supervisor, agent, audit,
+    cleanup: () => { restoreDb(); },
+  };
+}
+
+function waitingEvent(agentId: string, ts: number, excerpt: string): ParsedHookEvent {
+  return {
+    agentId,
+    state: 'waiting',
+    source: 'hook-notification',
+    ts,
+    hookEventName: 'Notification',
+    turnId: `wait-${ts}`,
+    waitingExcerpt: excerpt,
+    notificationType: 'permission_prompt',
+  } as ParsedHookEvent;
+}
+
+function waitingChanges(audit: AuditRow[]): Array<{ from: string; to: string; source: string }> {
+  return statusChanges(audit).filter((c) => c.to === 'waiting');
+}
+
+test('waiting applied identically via http / spool / tmux-option → same forceWaiting outcome', () => {
+  // The three production transports. Each is its own fresh env so dedupe /
+  // ordering watermarks start empty and the apply is independent.
+  const transports: Array<'http' | 'spool' | 'tmux-option'> = ['http', 'spool', 'tmux-option'];
+  for (const transport of transports) {
+    const { supervisor, agent, audit, cleanup } = makeWaitingEnv();
+    try {
+      // ts is "now": within TMUX_OPTION_MAX_AGE_MS, ahead of an unset
+      // lastHookEventAt, and (no launch stamp) past the launch-skew guard — so
+      // the tmux-option cell clears all three freshness gates too.
+      const ev = waitingEvent(agent.id, Date.now(), 'Bash tool requires permission');
+      const result = (supervisor as unknown as {
+        applyHookStatusEvent: (id: string, e: ParsedHookEvent, t: 'http' | 'spool' | 'tmux-option') => string;
+      }).applyHookStatusEvent(agent.id, ev, transport);
+
+      assert.equal(result, 'applied', `${transport}: a fresh waiting event must apply`);
+      assert.equal(agent.status, 'waiting', `${transport}: worker must flip to waiting`);
+      assert.equal(agent.hookStatus, 'healthy', `${transport}: a waiting event is a healthy hook heartbeat`);
+
+      // forceWaiting tags the status_change with the waiting KIND ('notification'),
+      // not the wire transport — identical across all three transports.
+      const flips = waitingChanges(audit);
+      assert.equal(flips.length, 1, `${transport}: exactly one waiting status_change; got ${JSON.stringify(statusChanges(audit))}`);
+      assert.equal(flips[0].from, 'working', `${transport}: flip is from working`);
+      assert.equal(flips[0].source, 'notification', `${transport}: waiting kind is 'notification' regardless of transport`);
+
+      // The excerpt rides through to the monitor latch unchanged.
+      const latch = (supervisor as unknown as {
+        monitor: { turnLatch: Map<string, { waitingExcerpt?: string; waitingKind?: string; state?: string }> };
+      }).monitor;
+      const entry = latch.turnLatch.get(agent.id);
+      assert.ok(entry && entry.state === 'waiting', `${transport}: monitor latch records the waiting state`);
+      assert.equal(entry!.waitingKind, 'notification', `${transport}: latch carries the notification kind`);
+      assert.equal(entry!.waitingExcerpt, 'Bash tool requires permission', `${transport}: latch carries the excerpt`);
+    } finally {
+      cleanup();
+    }
+  }
+});
+
+// idle-vs-waiting fix (plans/idle-vs-waiting-notification-fix.md Test matrix) —
+// a non-blocking Notification (notification_type 'idle_prompt': the ~60s idle
+// reminder) must NOT flip the card to 'waiting' on ANY transport. The shapes
+// below are the REAL per-transport wire shapes, not pre-normalized events:
+//   - HTTP carries `waitingExcerpt` (api-server.ts maps raw `excerpt` →
+//     `waitingExcerpt`, raw `notificationType` → `notificationType`).
+//   - spool & tmux-option JSON.parse the raw record straight through, so they
+//     carry the raw `excerpt` field and `notificationType` but NEVER
+//     `waitingExcerpt`. The discriminator keys ONLY on `notificationType`, which
+//     is why the spool/tmux rows (no waitingExcerpt) are still correctly
+//     suppressed — that asymmetry is the point.
+
+/** HTTP-shaped event: mirrors the api-server.ts status-endpoint mapping
+ *  (excerpt → waitingExcerpt, notificationType → notificationType). */
+function httpIdlePromptEvent(agentId: string, ts: number): ParsedHookEvent {
+  return {
+    agentId,
+    state: 'waiting',
+    source: 'hook-notification',
+    ts,
+    hookEventName: 'Notification',
+    turnId: `idle-${ts}`,
+    waitingExcerpt: 'Claude is waiting for your input',
+    notificationType: 'idle_prompt',
+  } as ParsedHookEvent;
+}
+
+/** spool/tmux-shaped event: the JSON.parse of the raw record. Note the RAW
+ *  `excerpt` field name and the absence of `waitingExcerpt`. */
+function rawIdlePromptRecord(agentId: string, ts: number): ParsedHookEvent {
+  return {
+    v: 1,
+    agentId,
+    state: 'waiting',
+    source: 'hook-notification',
+    ts,
+    hookEventName: 'Notification',
+    turnId: `idle-${ts}`,
+    excerpt: 'Claude is waiting for your input',
+    notificationType: 'idle_prompt',
+  } as unknown as ParsedHookEvent;
+}
+
+test('idle_prompt Notification suppressed on http / spool / tmux-option → no forceWaiting (discriminator keys only on notificationType)', () => {
+  const cases: Array<{ transport: 'http' | 'spool' | 'tmux-option'; ev: (id: string, ts: number) => ParsedHookEvent }> = [
+    { transport: 'http', ev: httpIdlePromptEvent },
+    { transport: 'spool', ev: rawIdlePromptRecord },
+    { transport: 'tmux-option', ev: rawIdlePromptRecord },
+  ];
+  for (const { transport, ev } of cases) {
+    const { supervisor, agent, audit, cleanup } = makeWaitingEnv();
+    try {
+      // Confirm the wire asymmetry the test is built on.
+      const wire = ev(agent.id, Date.now());
+      if (transport === 'http') {
+        assert.equal((wire as { waitingExcerpt?: string }).waitingExcerpt, 'Claude is waiting for your input',
+          'http carries waitingExcerpt');
+      } else {
+        assert.equal((wire as { waitingExcerpt?: string }).waitingExcerpt, undefined,
+          `${transport} carries NO waitingExcerpt — only the raw excerpt field`);
+        assert.equal((wire as unknown as { excerpt?: string }).excerpt, 'Claude is waiting for your input',
+          `${transport} carries the raw excerpt field`);
+      }
+
+      const result = (supervisor as unknown as {
+        applyHookStatusEvent: (id: string, e: ParsedHookEvent, t: 'http' | 'spool' | 'tmux-option') => string;
+      }).applyHookStatusEvent(agent.id, wire, transport);
+
+      assert.equal(result, 'applied', `${transport}: the idle reminder is still ACCEPTED (a heartbeat)`);
+      assert.equal(agent.status, 'working', `${transport}: an idle_prompt must NOT flip the worker to waiting`);
+      assert.deepStrictEqual(waitingChanges(audit), [], `${transport}: no waiting status_change from an idle_prompt`);
+      // Step-7 liveness still ran (only the dashboard-side flip is suppressed).
+      assert.equal(agent.hookStatus, 'healthy', `${transport}: idle reminder still stamps hook health (heartbeat)`);
+    } finally {
+      cleanup();
+    }
+  }
+});
+
+test('STALE tmux-option / spool waiting → rejected by freshness & ordering gates, no flip, no stamp', () => {
+  // (a) tmux-option: an option that survived a dashboard restart is 11 minutes
+  //     old → tripped by the bounded-age gate (TMUX_OPTION_MAX_AGE_MS = 10min).
+  {
+    const { supervisor, agent, audit, cleanup } = makeWaitingEnv();
+    try {
+      const stale = waitingEvent(agent.id, Date.now() - 11 * 60_000, 'old wait');
+      const result = (supervisor as unknown as {
+        applyHookStatusEvent: (id: string, e: ParsedHookEvent, t: 'http' | 'spool' | 'tmux-option') => string;
+      }).applyHookStatusEvent(agent.id, stale, 'tmux-option');
+
+      assert.equal(result, 'stale', 'an 11-minute-old tmux-option waiting must be rejected');
+      assert.equal(agent.status, 'working', 'a stale tmux-option waiting must NOT flip status');
+      assert.equal(agent.hookStatus ?? 'unknown', 'unknown', 'a stale tmux-option waiting must NOT stamp hook health');
+      assert.equal(agent.lastHookEventAt, undefined, 'a stale tmux-option waiting must NOT stamp lastHookEventAt');
+      assert.deepStrictEqual(waitingChanges(audit), [], 'no waiting status_change from a stale option');
+    } finally {
+      cleanup();
+    }
+  }
+
+  // (b) spool: a newer event already advanced the ordering watermark, so an
+  //     older spool waiting is rejected by the ordering guard (step 5) — same
+  //     no-side-effect contract as tmux staleness.
+  {
+    const { supervisor, agent, audit, cleanup } = makeWaitingEnv();
+    try {
+      const now = Date.now();
+      // A fresh working event lands first and advances lastAppliedHookTs.
+      const ahead = (supervisor as unknown as {
+        applyHookStatusEvent: (id: string, e: ParsedHookEvent, t: 'http' | 'spool' | 'tmux-option') => string;
+      }).applyHookStatusEvent(agent.id, {
+        agentId: agent.id, state: 'working', source: 'hook-start', ts: now,
+        hookEventName: 'UserPromptSubmit', turnId: 'turn-ahead',
+      } as ParsedHookEvent, 'spool');
+      assert.equal(ahead, 'applied', 'the newer working event applies and advances the watermark');
+      assert.equal(agent.status, 'working');
+
+      const auditBefore = audit.length;
+      // A spool waiting whose ts is strictly older than the watermark → stale.
+      const stale = waitingEvent(agent.id, now - 5_000, 'late-arriving wait');
+      const result = (supervisor as unknown as {
+        applyHookStatusEvent: (id: string, e: ParsedHookEvent, t: 'http' | 'spool' | 'tmux-option') => string;
+      }).applyHookStatusEvent(agent.id, stale, 'spool');
+
+      assert.equal(result, 'stale', 'a spool waiting older than the ordering watermark must be rejected');
+      assert.equal(agent.status, 'working', 'a stale spool waiting must NOT flip status to waiting');
+      assert.deepStrictEqual(waitingChanges(audit), [], 'no waiting status_change from a stale spool event');
+      assert.equal(audit.length, auditBefore, 'a stale spool waiting emits no audit rows');
+    } finally {
+      cleanup();
+    }
+  }
+});
+
 // ── tmuxReadStatusOptions command shape (plan §4, injected exec) ────────
 
 test('tmuxReadStatusOptions: one wsl.exe invocation, shQuoted names, explicit pane resolution, tab-parsed values', async () => {
@@ -340,13 +568,21 @@ test('tmuxReadStatusOptions: one wsl.exe invocation, shQuoted names, explicit pa
 
   assert.equal(commands.length, 1, 'all sessions ride ONE wsl.exe invocation');
   const cmd = commands[0];
-  assert.ok(cmd.includes("'cad__one'"), `session names must be shQuoted; got: ${cmd}`);
-  assert.ok(cmd.includes("'cad__we'\\''rd'"), `embedded single quotes must be spliced; got: ${cmd}`);
-  assert.ok(/display-message -p -t "\$s" '#\{pane_id\}'/.test(cmd),
-    `pane id must be resolved explicitly per session; got: ${cmd}`);
-  assert.ok(/show-options -pqv -t "\$p" @agentdashboard-status/.test(cmd),
-    `option read must target the resolved PANE, -q for missing-option silence; got: ${cmd}`);
-  assert.ok(cmd.includes('|| continue'), `a vanished session must be skipped, not fail the batch; got: ${cmd}`);
+  // §1: the status-poll script is now wrapped by wslBashEnvelope so the inner
+  // double quotes never cross the wsl.exe argv boundary. Assert the quote-free
+  // envelope, then decode it and run the shape assertions against the original
+  // `for s in … done` script.
+  assert.ok(!/["']/.test(cmd), `enveloped command carries no quote class; got: ${cmd}`);
+  const m = cmd.match(/^printf %s ([A-Za-z0-9+/=]+) \| base64 -d \| bash$/);
+  assert.ok(m, `command must be the base64 envelope; got: ${cmd}`);
+  const script = Buffer.from(m![1], 'base64').toString('utf8');
+  assert.ok(script.includes("'cad__one'"), `session names must be shQuoted; got: ${script}`);
+  assert.ok(script.includes("'cad__we'\\''rd'"), `embedded single quotes must be spliced; got: ${script}`);
+  assert.ok(/display-message -p -t "\$s" '#\{pane_id\}'/.test(script),
+    `pane id must be resolved explicitly per session; got: ${script}`);
+  assert.ok(/show-options -pqv -t "\$p" @agentdashboard-status/.test(script),
+    `option read must target the resolved PANE, -q for missing-option silence; got: ${script}`);
+  assert.ok(script.includes('|| continue'), `a vanished session must be skipped, not fail the batch; got: ${script}`);
 
   assert.equal(values.get('cad__one'), '{"v":1,"state":"idle"}');
   assert.equal(values.get("cad__we'rd"), '', 'unset option → empty string');

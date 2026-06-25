@@ -31,6 +31,7 @@ import {
 } from './mcp-config-builder';
 import { WslRunner, buildLaunchRecord, appendLaunchRecord } from './wsl-runner';
 import type { WslLaunchDiagnostics } from './wsl-runner';
+import { buildTmuxNewSessionCommand } from '../wsl-bridge';
 
 interface TestCase { name: string; run(): Promise<void> | void; }
 const tests: TestCase[] = [];
@@ -95,9 +96,10 @@ test('RESEARCHER_ALLOWED_TOOLS: research/browse set, NO Bash/Edit/NotebookEdit',
   assert.ok(RESEARCHER_ALLOWED_TOOLS.includes('Skill'));
   assert.ok(RESEARCHER_ALLOWED_TOOLS.includes('Write'));
   assert.ok(RESEARCHER_ALLOWED_TOOLS.includes('mcp__agent-dashboard__browser_*'));
-  // claude-in-chrome is the additive fallback browser (alongside the embedded
-  // agent-dashboard browser_* pane).
-  assert.ok(RESEARCHER_ALLOWED_TOOLS.includes('mcp__claude-in-chrome__*'));
+  // claude-in-chrome is the researcher's de-emphasized fallback browser —
+  // granted to the researcher lane ONLY (no other lane lists it).
+  assert.ok(RESEARCHER_ALLOWED_TOOLS.includes('mcp__claude-in-chrome__*'),
+    'claude-in-chrome must be in the researcher --tools allowlist (fallback browser)');
   // The dangerous built-ins must NOT be in the offered set.
   for (const banned of ['Bash', 'Edit', 'MultiEdit', 'NotebookEdit']) {
     assert.ok(!RESEARCHER_ALLOWED_TOOLS.includes(banned), `--tools must not offer ${banned}`);
@@ -120,37 +122,50 @@ test('researcher --tools value is a clean comma list (no spaces — single arg)'
 // inline --mcp-config JSON that the cmd.exe wrap corrupts into a bogus file
 // path ("MCP config file not found"). The worker lane MUST direct-spawn.
 
-test('shouldDirectSpawn: a plain claude WORKER direct-spawns (regression — was the omitted lane)', () => {
+test('shouldDirectSpawn: a plain claude WORKER lane direct-spawns (regression — was the omitted lane)', () => {
   assert.equal(shouldDirectSpawn({
-    isWorker: true, provider: 'claude', hasPromptArg: false,
+    lane: 'worker', provider: 'claude', hasPromptArg: false,
   }), true, 'unsupervised claude worker must bypass the cmd.exe wrap');
 });
 
-test('shouldDirectSpawn: supervisor / supervised / researcher claude lanes still direct-spawn', () => {
-  for (const lane of ['isSupervisor', 'isSupervised', 'isResearcher'] as const) {
-    assert.equal(shouldDirectSpawn({ [lane]: true, provider: 'claude', hasPromptArg: false }), true,
-      `${lane} must still direct-spawn`);
+test('shouldDirectSpawn: supervisor / researcher claude lanes still direct-spawn', () => {
+  for (const lane of ['supervisor', 'researcher'] as const) {
+    assert.equal(shouldDirectSpawn({ lane, provider: 'claude', hasPromptArg: false }), true,
+      `${lane} lane must still direct-spawn`);
   }
 });
 
-test('shouldDirectSpawn: a plain LEGACY claude agent (no lane, no prompt) does NOT direct-spawn', () => {
-  assert.equal(shouldDirectSpawn({ provider: 'claude', hasPromptArg: false }), false,
+// REGRESSION (privilege-lane crash-loop): a persona with isSupervisor:false +
+// privilegeLane:'supervisor' resolves to the SUPERVISOR lane via roleLaneOf, so
+// it is injected with an inline --mcp-config <JSON>. The gate must therefore
+// direct-spawn it — keying off the lane (not the four booleans, which are all
+// false for such a persona) is what closes the gap: the cmd.exe wrap would
+// otherwise double every `"` in the JSON → "MCP config file not found" → the
+// 5×-restart crash-loop. (roleLaneOf(privilegeLane:'supervisor') === 'supervisor'
+// is asserted in role-lane.test.ts; here we prove the supervisor lane spawns.)
+test('shouldDirectSpawn: a privilegeLane supervisor persona (lane=supervisor) direct-spawns', () => {
+  assert.equal(shouldDirectSpawn({ lane: 'supervisor', provider: 'claude', hasPromptArg: false }), true,
+    'a privilege-lane supervisor persona is injected with inline --mcp-config and MUST direct-spawn');
+});
+
+test('shouldDirectSpawn: a plain LEGACY claude agent (legacy lane, no prompt) does NOT direct-spawn', () => {
+  assert.equal(shouldDirectSpawn({ lane: 'legacy', provider: 'claude', hasPromptArg: false }), false,
     'legacy claude with no prompt keeps the cmd.exe path');
 });
 
 test('shouldDirectSpawn: overrideArgs suppresses persistent-lane spawn (matches !overrideArgs)', () => {
   assert.equal(shouldDirectSpawn({
-    isWorker: true, provider: 'claude', hasPromptArg: false, overrideArgs: true,
+    lane: 'worker', provider: 'claude', hasPromptArg: false, overrideArgs: true,
   }), false, 'explicit override args suppress the persistent-lane direct-spawn');
 });
 
 test('shouldDirectSpawn: a multiline prompt arg forces direct-spawn even for a legacy agent', () => {
-  assert.equal(shouldDirectSpawn({ provider: 'claude', hasPromptArg: true }), true,
+  assert.equal(shouldDirectSpawn({ lane: 'legacy', provider: 'claude', hasPromptArg: true }), true,
     'a positional prompt would be shredded by cmd.exe — must direct-spawn');
 });
 
 test('shouldDirectSpawn: a non-claude worker (e.g. codex) does NOT direct-spawn on the lane alone', () => {
-  assert.equal(shouldDirectSpawn({ isWorker: true, provider: 'codex', hasPromptArg: false }), false,
+  assert.equal(shouldDirectSpawn({ lane: 'worker', provider: 'codex', hasPromptArg: false }), false,
     'only claude agents take the persistent-lane direct-spawn path');
 });
 
@@ -247,6 +262,31 @@ test('redactMcpToken: strips the base64 tmux envelope so the token is not recove
     let decoded = '';
     try { decoded = Buffer.from(blob, 'base64').toString('utf8'); } catch { /* not b64 */ }
     assert.ok(!decoded.includes(FAKE_TOKEN), `a surviving base64 blob decoded back to the token: ${blob}`);
+  }
+});
+
+test('redactMcpToken no-recover: a token rendered via buildTmuxNewSessionCommand leaves no decodable envelope', () => {
+  // §1: the rendered command is now the quote-free outer envelope
+  // `printf %s <OUTER_B64> | base64 -d | bash`, where OUTER_B64 double-decodes
+  // back to the token-bearing inner command. The updated redactor must match the
+  // `printf %s` form and strip the whole blob so nothing decodes back out.
+  const inner = `CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false claude --mcp-config '{"mcpServers":{"agent-dashboard":{"env":{"AGENT_DASHBOARD_API_TOKEN":"${FAKE_TOKEN}"}}}}'`;
+  const rendered = buildTmuxNewSessionCommand('s', '/h', inner);
+  const redacted = redactMcpToken(rendered, FAKE_TOKEN);
+  // (a) the literal token is absent.
+  assert.ok(!redacted.includes(FAKE_TOKEN), 'literal token must be absent');
+  // (b) no decodable base64 envelope remains: the placeholder
+  // `***REDACTED***_BASE64` is not pure base64, so this pattern must NOT match.
+  assert.ok(!/printf %s [A-Za-z0-9+/=]+ \| base64 -d/.test(redacted),
+    `no decodable base64 envelope may remain in the redacted command; got: ${redacted}`);
+  // And no surviving long base64 blob decodes back to the token (two layers).
+  for (const blob of (redacted.match(/[A-Za-z0-9+/=]{40,}/g) || [])) {
+    let once = '';
+    try { once = Buffer.from(blob, 'base64').toString('utf8'); } catch { /* not b64 */ }
+    let twice = '';
+    try { twice = Buffer.from(once, 'base64').toString('utf8'); } catch { /* not b64 */ }
+    assert.ok(!once.includes(FAKE_TOKEN) && !twice.includes(FAKE_TOKEN),
+      `a surviving base64 blob decoded back to the token: ${blob}`);
   }
 });
 

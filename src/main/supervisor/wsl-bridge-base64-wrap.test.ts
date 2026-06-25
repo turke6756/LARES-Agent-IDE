@@ -17,31 +17,49 @@ interface TestCase { name: string; run(): void; }
 const tests: TestCase[] = [];
 function test(name: string, fn: () => void): void { tests.push({ name, run: fn }); }
 
-function extractBase64(rendered: string): string {
-  // Expected shape: tmux ... -- bash -lic "$(echo <BASE64> | base64 -d)"
-  // Allow zero-length base64 for the empty-payload case.
-  const m = rendered.match(/"\$\(echo\s+([A-Za-z0-9+/=]*)\s*\|\s*base64\s+-d\)"\s*$/);
-  assert.ok(m, `rendered command must end with the base64 envelope: ${rendered}`);
-  return m[1];
+function extractInnerPayload(rendered: string): string {
+  // Two-layer peel. New outer shape (quote-free wsl.exe boundary envelope):
+  //   printf %s <OUTER_B64> | base64 -d | bash
+  // decoding OUTER_B64 yields the tmux script, which itself ends with the inner
+  //   -- bash -lic "$(echo <INNER_B64> | base64 -d)"
+  // Allow zero-length inner base64 for the empty-payload case.
+  const m = rendered.match(/^printf %s ([A-Za-z0-9+/=]+) \| base64 -d \| bash$/);
+  assert.ok(m, `outer command must be the piped base64 envelope: ${rendered}`);
+  const tmuxScript = Buffer.from(m[1], 'base64').toString('utf8');
+  const inner = tmuxScript.match(/"\$\(echo\s+([A-Za-z0-9+/=]*)\s*\|\s*base64\s+-d\)"\s*$/);
+  assert.ok(inner, `decoded tmux script must end with the inner envelope: ${tmuxScript}`);
+  return inner[1];
 }
 
-test('L-A: rendered command has correct shape (tmux + envelope)', () => {
-  const out = buildTmuxNewSessionCommand('worker-abc', '/home/turke/proj', 'echo hi');
-  assert.match(out, /^setsid tmux set-option -g history-limit \d+ \\; new-session -d -s 'worker-abc' -c '\/home\/turke\/proj' -- bash -lic "\$\(echo /);
-  assert.match(out, /\| base64 -d\)"$/);
+test('outer command crosses the wsl.exe boundary with NO quote of any class', () => {
+  const out = buildTmuxNewSessionCommand('s', '/wd', `claude --mcp-config '{"a":1}'`);
+  assert.ok(!/["']/.test(out), `no single OR double quote may cross the boundary: ${out}`);
+  assert.match(out, /^printf %s [A-Za-z0-9+/=]+ \| base64 -d \| bash$/);
+});
+
+test('decoded tmux script has the expected new-session shape', () => {
+  const out = buildTmuxNewSessionCommand('NAME', '/DIR', 'echo hi');
+  const tmuxScript = Buffer.from(out.match(/^printf %s ([A-Za-z0-9+/=]+) /)![1], 'base64').toString('utf8');
+  assert.match(tmuxScript, /^setsid tmux set-option -g history-limit \d+ \\; new-session -d -s 'NAME' -c '\/DIR' -- bash -lic /);
+});
+
+test('single-quote in workDir is shQuote-escaped, not broken', () => {
+  const out = buildTmuxNewSessionCommand('s', "/wd/it's", 'echo hi');
+  const tmuxScript = Buffer.from(out.match(/^printf %s ([A-Za-z0-9+/=]+) /)![1], 'base64').toString('utf8');
+  assert.match(tmuxScript, /-c '\/wd\/it'\\''s'/);
 });
 
 test('L-A: payload with single quote round-trips intact', () => {
   const payload = "echo 'hello world'";
   const rendered = buildTmuxNewSessionCommand('s', '/wd', payload);
-  const decoded = Buffer.from(extractBase64(rendered), 'base64').toString('utf8');
+  const decoded = Buffer.from(extractInnerPayload(rendered), 'base64').toString('utf8');
   assert.equal(decoded, payload);
 });
 
 test('L-A: payload with double quote round-trips intact', () => {
   const payload = 'echo "hello"';
   const rendered = buildTmuxNewSessionCommand('s', '/wd', payload);
-  assert.equal(Buffer.from(extractBase64(rendered), 'base64').toString('utf8'), payload);
+  assert.equal(Buffer.from(extractInnerPayload(rendered), 'base64').toString('utf8'), payload);
 });
 
 test('L-A: payload with $, backtick, backslash, newline, $(cat ...) round-trips intact', () => {
@@ -55,13 +73,13 @@ test('L-A: payload with $, backtick, backslash, newline, $(cat ...) round-trips 
     "echo $$",
   ].join('\n');
   const rendered = buildTmuxNewSessionCommand('s', '/wd', payload);
-  const decoded = Buffer.from(extractBase64(rendered), 'base64').toString('utf8');
+  const decoded = Buffer.from(extractInnerPayload(rendered), 'base64').toString('utf8');
   assert.equal(decoded, payload, 'every byte must round-trip — no quoting class to break');
 });
 
 test('L-A: empty payload round-trips to empty string (no garbage in envelope)', () => {
   const rendered = buildTmuxNewSessionCommand('s', '/wd', '');
-  const decoded = Buffer.from(extractBase64(rendered), 'base64').toString('utf8');
+  const decoded = Buffer.from(extractInnerPayload(rendered), 'base64').toString('utf8');
   assert.equal(decoded, '');
 });
 
@@ -71,7 +89,7 @@ test('L-A: base64 alphabet contains no shell-special chars (outer shell safety)'
   // A-Z, a-z, 0-9, +, /, = — no spaces, no quotes, no $, no \.
   const tricky = "'\"$\\`\n\t$(echo hi)";
   const rendered = buildTmuxNewSessionCommand('s', '/wd', tricky);
-  const b64 = extractBase64(rendered);
+  const b64 = extractInnerPayload(rendered);
   assert.match(b64, /^[A-Za-z0-9+/=]+$/, `base64 body must be shell-safe: ${b64}`);
 });
 

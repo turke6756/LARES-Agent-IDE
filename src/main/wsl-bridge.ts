@@ -1,3 +1,12 @@
+// RULE (Node→wsl.exe argv boundary): wsl.exe strips/mangles double quotes when
+// it reconstructs the command line it hands to the Linux side. Any NEW or
+// CHANGED `bash -lc` script in this file that contains a `"` MUST be wrapped in
+// `wslBashEnvelope` (it base64s the whole script so only [A-Za-z0-9+/=], spaces
+// and `|` cross the boundary — no quote class to mangle), and every interpolated
+// session name / workspace path / file path MUST go through `shQuote` first
+// (single-quote-only is not enough — a literal `'` in a path still corrupts a
+// hand-written `'${path}'`). Pre-existing single-quote-only callers are immune
+// to the quote-strip symptom and are intentionally left untouched.
 import { execFile, spawn, ChildProcess } from 'child_process';
 import { promisify } from 'util';
 import type { WslStatus, WslDistroStatus } from '../shared/types';
@@ -285,6 +294,28 @@ export async function tmuxListSessions(): Promise<TmuxSession[]> {
  *  at most tens of MB per pane and is allocated lazily as lines are produced. */
 export const TMUX_HISTORY_LIMIT = 100000;
 
+/** CHOKE POINT for the Node→wsl.exe argv boundary. wsl.exe strips/mangles
+ *  double quotes when it reconstructs the command line, so ANY bash script
+ *  containing `"` (incl. `"$(...)"`, `"$VAR"`) corrupts when passed as
+ *  `wsl.exe bash -lc <script>`: inner $-expansion is lost, the decoded command
+ *  word-splits, and only the first token runs. Base64 the whole script and
+ *  decode it through a pipe to bash — the string handed to wsl.exe then
+ *  contains ONLY [A-Za-z0-9+/=], spaces and `|`: no quote class to mangle.
+ *  Every inner quote is parsed by a Linux-side bash the quotes never crossed a
+ *  boundary to reach. `printf %s` (not echo) avoids echo flag/newline
+ *  ambiguity; base64 has no `%`.
+ *
+ *  RULE (scoped to NEW or CHANGED WSL bash scripts): a script that contains a
+ *  `"` MUST be wrapped here, and any session name / workspace path / file path
+ *  interpolated into it MUST go through shQuote first (single-quote-only is not
+ *  enough — a literal `'` in a path still corrupts a hand-written '${path}').
+ *  Pre-existing single-quote-only callers are immune to the quote-strip symptom
+ *  and are intentionally left untouched by this parity fix. */
+export function wslBashEnvelope(script: string): string {
+  const b64 = Buffer.from(script, 'utf8').toString('base64');
+  return `printf %s ${b64} | base64 -d | bash`;
+}
+
 export function buildTmuxNewSessionCommand(name: string, workDir: string, command: string): string {
   // L-A / BUG-22: base64-envelope the command body so the outer shell layer
   // never needs to escape single quotes, dollar signs, backticks, newlines,
@@ -311,7 +342,15 @@ export function buildTmuxNewSessionCommand(name: string, workDir: string, comman
   // the larger buffer. Setting it globally is idempotent across launches and
   // starts the server if none is running.
   const b64 = Buffer.from(command, 'utf8').toString('base64');
-  return `setsid tmux set-option -g history-limit ${TMUX_HISTORY_LIMIT} \\; new-session -d -s '${name}' -c '${workDir}' -- bash -lic "$(echo ${b64} | base64 -d)"`;
+  const tmuxScript =
+    `setsid tmux set-option -g history-limit ${TMUX_HISTORY_LIMIT} \\; ` +
+    `new-session -d -s ${shQuote(name)} -c ${shQuote(workDir)} -- bash -lic "$(echo ${b64} | base64 -d)"`;
+  // BUG-WSLQUOTE: the inner `"$(...)"` double quotes do NOT survive the
+  // Node→wsl.exe argv translation. Wrapping the whole tmuxScript in
+  // wslBashEnvelope makes those inner quotes opaque base64 — parsed by the
+  // final `bash` in the pipe, never crossing the boundary. name/workDir are
+  // shQuote'd so a literal `'` in a workspace path can't break the inner script.
+  return wslBashEnvelope(tmuxScript);
 }
 
 export interface TmuxNewSessionResult {
@@ -672,7 +711,7 @@ export async function tmuxReadStatusOptions(
     `p=$(tmux display-message -p -t "$s" '#{pane_id}' 2>/dev/null) || continue; ` +
     `printf '%s\\t%s\\n' "$s" "$(tmux show-options -pqv -t "$p" @agentdashboard-status 2>/dev/null)"; ` +
     `done`;
-  const result = await exec(script, 8000);
+  const result = await exec(wslBashEnvelope(script), 8000);
   if (result.exitCode !== 0 && !result.stdout) return values;
 
   for (const line of result.stdout.split('\n')) {
