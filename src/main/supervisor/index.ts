@@ -621,6 +621,32 @@ function buildCodexResumeArgs(baseArgs: string[], sessionId: string): string[] {
  *  it into a literal command name (`AGENT_ID=...: command not found`). */
 const SHELL_ENV_ASSIGNMENT_RE = /^[A-Za-z_][A-Za-z0-9_]*=/;
 
+/** Split a bash command line into tokens, keeping single-quoted spans intact
+ *  AND honoring backslash escapes outside single quotes. A naive
+ *  `command.split(/\s+/)` shreds a quoted env value containing a space —
+ *  e.g. DASHBOARD_SPOOL_PATH='/path with spaces/.dashboard/pending-status.jsonl'
+ *  (index.ts:2994). A naive single-quote toggle ALSO breaks on shellSingleQuote's
+ *  splice form `'it'\''s dir'`: the `\'` after the closing quote would wrongly
+ *  re-open a quoted span. Consuming `\<char>` outside single quotes fixes that.
+ *
+ *  NOT a general bash parser — scoped to env-prefix assignments + single-quoted
+ *  values only (see the WSL Codex resume command shape). Double quotes, `$(...)`,
+ *  variable expansion, and comments are out of scope by design. */
+function tokenizeShell(s: string): string[] {
+  const out: string[] = [];
+  let cur = '';
+  let inSingle = false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (!inSingle && c === '\\' && i + 1 < s.length) { cur += c + s[++i]; continue; }
+    if (c === "'") { inSingle = !inSingle; cur += c; continue; }
+    if (/\s/.test(c) && !inSingle) { if (cur) { out.push(cur); cur = ''; } continue; }
+    cur += c;
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+
 /** Build the WSL bash command string for `codex resume <session-id>`.
  *
  *  The input `command` may have one or more leading bash command-prefix env
@@ -631,7 +657,7 @@ const SHELL_ENV_ASSIGNMENT_RE = /^[A-Za-z_][A-Za-z0-9_]*=/;
  *  and the session-id positional are inserted in the right place relative to
  *  the codex executable (NOT in front of the env vars). */
 export function buildCodexResumeCommand(command: string, sessionId: string): string {
-  const parts = command.split(/\s+/).filter(Boolean);
+  const parts = tokenizeShell(command);
   let envEnd = 0;
   while (envEnd < parts.length && SHELL_ENV_ASSIGNMENT_RE.test(parts[envEnd])) envEnd++;
   const envPrefix = parts.slice(0, envEnd);

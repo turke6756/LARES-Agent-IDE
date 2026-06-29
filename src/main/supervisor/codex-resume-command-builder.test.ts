@@ -132,6 +132,56 @@ test('an arg that looks like `--flag=value` is NOT mistaken for an env assignmen
   assert.match(out, /'--some-flag=value'/, `--flag=value must be single-quoted as a normal arg; got: ${out}`);
 });
 
+// ── §3c: single-quote / backslash-aware tokenizer ────────────────────
+//
+// `buildCodexResumeCommand` tokenizes via `tokenizeShell`, which is
+// DELIBERATELY NOT a general bash parser. It handles exactly two constructs
+// the generated WSL Codex command uses: leading env-prefix assignments and
+// single-quoted values (including shellSingleQuote's `'\''` splice form).
+// Double quotes, `$(...)`, variable expansion, and comments are out of scope
+// by design. The cases below pin that scope so nobody "upgrades" the tokenizer
+// into a general shell parser.
+
+test('§3c: env value with a SPACE (single-quoted) survives intact, unquoted at front', () => {
+  // A naive command.split(/\s+/) would shred this env value on its internal
+  // space, producing a broken `…spaces/.dashboard…` second token.
+  const envTok = `DASHBOARD_SPOOL_PATH='/path with spaces/.dashboard/pending-status.jsonl'`;
+  const out = buildCodexResumeCommand(`${envTok} ccodex --dangerously-bypass-approvals-and-sandbox`, SID);
+  assert.equal(
+    out,
+    `${envTok} 'ccodex' 'resume' '--dangerously-bypass-approvals-and-sandbox' '${SID}'`,
+    `quoted env value with a space must stay one unquoted prefix token; got: ${out}`,
+  );
+});
+
+test('§3c: env value with BOTH a space and an apostrophe (shellSingleQuote splice form) survives intact', () => {
+  // shellSingleQuote('/home/it\'s dir/…') renders the splice form
+  // `'/home/it'\''s dir/…'`. A naive single-quote toggle mis-reads the `\'`
+  // after the closing quote as re-opening a quoted span, then splits on the
+  // following space — shredding the value AND swallowing ccodex/args into the
+  // wrong token. The backslash-aware consume fixes both.
+  const spliceVal = `'/home/it'\\''s dir/.dashboard/pending-status.jsonl'`;
+  const envTok = `DASHBOARD_SPOOL_PATH=${spliceVal}`;
+  const out = buildCodexResumeCommand(`${envTok} ccodex --dangerously-bypass-approvals-and-sandbox`, SID);
+  assert.equal(
+    out,
+    `${envTok} 'ccodex' 'resume' '--dangerously-bypass-approvals-and-sandbox' '${SID}'`,
+    `splice-form env value must survive tokenizeShell intact; got: ${out}`,
+  );
+  // And `resume` must still land immediately after ccodex, not floating in the
+  // (now space-containing) env prefix.
+  assert.ok(!/'resume'\s+DASHBOARD_/.test(out), `'resume' must not precede the env prefix; got: ${out}`);
+});
+
+test('§3c (scope pin): double quotes are NOT special — tokenizer is not a general bash parser', () => {
+  // A double-quoted span with a space is split (double quotes are out of
+  // scope). Asserting this documents the intentional non-generality: callers
+  // must never feed double-quoted constructs through this builder.
+  const out = buildCodexResumeCommand('ccodex --foo="a b"', SID);
+  assert.match(out, /'--foo="a'/, `--foo="a should split at the space (double quotes not honored); got: ${out}`);
+  assert.match(out, /'b"'/, `the dangling b" must be its own single-quoted token; got: ${out}`);
+});
+
 // ── Runner ───────────────────────────────────────────────────────────
 (async () => {
   let passed = 0;
