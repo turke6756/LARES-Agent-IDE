@@ -18,6 +18,7 @@ import {
   buildLaunchRecord,
   buildTmuxFailureHeaderBlock,
   WslLaunchDiagnostics,
+  WslRunner,
 } from './wsl-runner';
 
 interface TestCase { name: string; run(): void; }
@@ -339,6 +340,122 @@ test('BUG-22: success path writes NO failure-header block (caller only writes on
     blockFromFailure.startsWith('===== WSL tmux session creation failed ====='),
     'header builder always produces the failure banner — caller MUST gate',
   );
+});
+
+// ── §2: instant-empty-exit → crashed guard ──────────────────────────────
+//
+// These drive `_handleHostExit` directly through a small subclass (mirroring
+// wsl-runner-phantom-reconnect.test.ts) with `isTmuxSessionAlive` forced to
+// false so we always land on the true-crash path where the new guard lives.
+// The guard remaps a clean exit (code 0) inside the LAUNCH_SETTLE_MS window to
+// a non-zero code IFF diagnostics are present and the output ring holds no
+// printable output after ANSI/control stripping.
+
+class GuardTestRunner extends WslRunner {
+  writeLaunchRecordCalls: Array<{ exitCode: number | null; signal: string | null }> = [];
+  // Avoid spawning a real Node pty-host in the (unreachable here) reconnect path.
+  protected respawnForPhantomExit(): void { /* no-op in tests */ }
+  // Capture instead of touching the filesystem; the assertions read the emitted
+  // exit code, but this also lets us confirm the record carries the mutated code.
+  protected writeLaunchRecord(exitCode: number | null, signal: string | null): void {
+    this.writeLaunchRecordCalls.push({ exitCode, signal });
+  }
+}
+
+function makeGuardRunner(opts: {
+  now: () => number;
+  launchStartTime: number;
+  diagnostics: WslLaunchDiagnostics | null;
+  ring?: string;
+  intentionalKill?: boolean;
+}): { runner: GuardTestRunner; exits: Array<{ code: number; signal: string | null }> } {
+  const runner = new GuardTestRunner('cad__test__guard', {
+    isTmuxSessionAlive: async () => false, // force the true-crash path
+    now: opts.now,
+  });
+  (runner as any)._alive = true;
+  (runner as any)._logPath = '/tmp/fake.log';
+  (runner as any)._diagnostics = opts.diagnostics;
+  (runner as any)._launchStartTime = opts.launchStartTime;
+  if (opts.intentionalKill) (runner as any)._intentionalKill = true;
+  if (opts.ring) (runner as any).appendToRing(opts.ring);
+  const exits: Array<{ code: number; signal: string | null }> = [];
+  runner.on('exit', (code: number, signal: string | null) => exits.push({ code, signal }));
+  return { runner, exits };
+}
+
+const SETTLE_BASE = 1_000_000;
+
+test('§2: clean exit < settle window with ANSI/control-only ring → reports non-zero', async () => {
+  let now = SETTLE_BASE;
+  const { runner, exits } = makeGuardRunner({
+    now: () => now,
+    launchStartTime: SETTLE_BASE,
+    diagnostics: baseDiagnostics(),
+    ring: '\x1b[2J\x1b[H\x07', // clear-screen + cursor-home + BEL — no printable chars
+  });
+  now = SETTLE_BASE + 500; // 500ms < LAUNCH_SETTLE_MS (2000)
+  await (runner as any)._handleHostExit(0, null, 'inner-pty');
+  assert.equal(exits.length, 1, 'exactly one exit event must fire');
+  assert.equal(exits[0].code, 1, 'instant empty exit must be remapped to non-zero (1)');
+  assert.equal(runner.writeLaunchRecordCalls[0].exitCode, 1, 'JSONL record carries the mutated code');
+});
+
+test('§2: clean exit < settle window WITH printable output → reports 0 (real done)', async () => {
+  let now = SETTLE_BASE;
+  const { runner, exits } = makeGuardRunner({
+    now: () => now,
+    launchStartTime: SETTLE_BASE,
+    diagnostics: baseDiagnostics(),
+    ring: '\x1b[2JWelcome to Claude\n', // ANSI prefix but real printable text
+  });
+  now = SETTLE_BASE + 500;
+  await (runner as any)._handleHostExit(0, null, 'inner-pty');
+  assert.equal(exits.length, 1);
+  assert.equal(exits[0].code, 0, 'printable output means a real exit — code must stay 0');
+});
+
+test('§2: clean exit AFTER the settle window → reports 0 even with no printable output', async () => {
+  let now = SETTLE_BASE;
+  const { runner, exits } = makeGuardRunner({
+    now: () => now,
+    launchStartTime: SETTLE_BASE,
+    diagnostics: baseDiagnostics(),
+    ring: '\x1b[2J\x1b[H\x07',
+  });
+  now = SETTLE_BASE + 2500; // 2500ms > LAUNCH_SETTLE_MS — outside the window
+  await (runner as any)._handleHostExit(0, null, 'inner-pty');
+  assert.equal(exits.length, 1);
+  assert.equal(exits[0].code, 0, 'a clean exit past the settle window is a legitimate done');
+});
+
+test('§2: intentional kill (graceful /exit) → reports 0, guard skipped', async () => {
+  let now = SETTLE_BASE;
+  const { runner, exits } = makeGuardRunner({
+    now: () => now,
+    launchStartTime: SETTLE_BASE,
+    diagnostics: baseDiagnostics(),
+    ring: '\x1b[2J\x1b[H\x07',
+    intentionalKill: true,
+  });
+  now = SETTLE_BASE + 500;
+  await (runner as any)._handleHostExit(0, null, 'inner-pty');
+  assert.equal(exits.length, 1);
+  assert.equal(exits[0].code, 0, 'intentional kill always reports clean 0 — never remapped');
+});
+
+test('§2: non-diagnostic launch (_diagnostics == null) → behavior unchanged (clean → 0)', async () => {
+  let now = SETTLE_BASE;
+  const { runner, exits } = makeGuardRunner({
+    now: () => now,
+    launchStartTime: SETTLE_BASE,
+    diagnostics: null,
+    ring: '\x1b[2J\x1b[H\x07',
+  });
+  now = SETTLE_BASE + 500;
+  await (runner as any)._handleHostExit(0, null, 'inner-pty');
+  assert.equal(exits.length, 1);
+  assert.equal(exits[0].code, 0, 'without diagnostics the guard must not fire');
 });
 
 (async () => {

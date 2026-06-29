@@ -6,6 +6,7 @@ import { tmuxNewSession, tmuxKillSession, isTmuxSessionAlive, tmuxCapturePane, w
 import { getScriptPath } from './paths';
 import { sanitizeClaudeChildEnv } from './env-sanitize';
 import { redactMcpToken } from './mcp-config-builder';
+import { stripAnsi } from './strip-ansi';
 
 /** BUG-22 Step 1 diagnostic metadata passed from `launchWslAgent` so the
  *  runner can append one complete JSONL record per launch attempt once the
@@ -207,6 +208,11 @@ export class WslRunner extends EventEmitter {
   private _pid: number | null = null;
   private _alive: boolean = false;
   private _intentionalKill: boolean = false;
+  // §2: monotonic clock (via the injectable `_now` seam) captured at the start
+  // of `launch()`. The instant-empty-exit guard in `_handleHostExit` compares
+  // against it to decide whether a clean exit happened inside the settle window.
+  private _launchStartTime = 0;
+  private static readonly LAUNCH_SETTLE_MS = 2000;
   private buffer: string = '';
   private logStream: fs.WriteStream | null = null;
   // BUG-22 Step 1 diagnostic state — captured at launch and consumed once at
@@ -279,6 +285,7 @@ export class WslRunner extends EventEmitter {
     diagnostics: WslLaunchDiagnostics | null = null,
   ): Promise<void> {
     this._diagnostics = diagnostics;
+    this._launchStartTime = this._now();
     this._launchWorkDir = workDir;
     // D-4/F10: store a REDACTED copy of the command for every serialization sink
     // (launches.log JSONL via buildLaunchRecord, the tmux failure header, and the
@@ -530,7 +537,24 @@ export class WslRunner extends EventEmitter {
     this.logStream?.end();
     this.logStream = null;
     this.persistScrollback();
-    const reportedCode = this._intentionalKill ? 0 : (exitCode ?? 1);
+    let reportedCode = this._intentionalKill ? 0 : (exitCode ?? 1);
+    // §2: Reaching here means the upstream phantom-reconnect path already
+    // declined to reconnect — tmux is not alive OR the reconnect cap was
+    // exceeded. A diagnostic launch (fresh OR resume/restart — any launch
+    // carrying diagnostics) that exits clean inside the settle window with no
+    // printable output is a corrupted/failed launch, not a real `done`. Force
+    // non-zero so index.ts maps it to `crashed` and the auto-restart /
+    // diagnostic path fires instead of a false green.
+    if (
+      !this._intentionalKill &&
+      reportedCode === 0 &&
+      this._diagnostics != null &&
+      this._now() - this._launchStartTime < WslRunner.LAUNCH_SETTLE_MS &&
+      !this.hasPrintableOutput(this.getOutputRingTail(2048))
+    ) {
+      console.warn(`[WSL:${this.sessionName}] instant empty exit (code 0, <${WslRunner.LAUNCH_SETTLE_MS}ms, no printable output) — treating as launch failure`);
+      reportedCode = 1;
+    }
     this.writeLaunchRecord(reportedCode, signal == null ? null : String(signal));
     this.emit('exit', reportedCode, signal);
 
@@ -713,6 +737,14 @@ export class WslRunner extends EventEmitter {
     // newline; real output either spans a newline or comfortably exceeds the
     // per-event floor. The 200-byte rolling-burst gate above is preserved.
     return data.includes('\n') || trimmed.length >= 64;
+  }
+
+  /** §2: True when `text` contains any printable character after ANSI/control
+   *  stripping. Distinct from hasMeaningfulContent (which gates on newline /
+   *  64-byte burst) — the launch guard must treat a control-only TUI flicker
+   *  as NO output. */
+  private hasPrintableOutput(text: string): boolean {
+    return stripAnsi(text).trim().length > 0;
   }
 
   async isStillAlive(): Promise<boolean> {
