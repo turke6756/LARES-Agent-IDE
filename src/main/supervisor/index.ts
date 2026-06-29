@@ -3069,6 +3069,15 @@ export class AgentSupervisor extends EventEmitter {
     // gate. Set IMMEDIATELY BEFORE the actual runner launch so no event this
     // launch produces can predate the stamp.
     this.launchStartedAt.set(agent.id, Date.now());
+    // §3a — WSL fresh-launch guard. The WSL launch path renders `command` as a
+    // shell STRING, so a stray `resume` subcommand sneaking into a fresh
+    // (non-resume) codex launch would silently attach to the wrong session.
+    // Tokenize with the same single-quote/backslash-aware splitter the resume
+    // builder uses. (Windows is args-array based — structurally immune — so no
+    // guard there; if one is ever wanted it must use `args.includes('resume')`.)
+    if (agent.provider === 'codex' && !resume && tokenizeShell(command).includes('resume')) {
+      throw new Error(`Codex fresh launch for ${agent.id} unexpectedly contains a 'resume' subcommand`);
+    }
     await runner.launch(wslWorkDir, command, nativeLogPath, diagnostics);
     // BUG-23 — write `'launching'` (was `'working'`) and stamp the settle
     // timer. See the Windows path above for the lifecycle description; the
