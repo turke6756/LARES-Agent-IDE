@@ -1,5 +1,6 @@
 import path from 'path';
 import fs from 'fs';
+import { EventEmitter } from 'events';
 import { v4 as uuidv4 } from 'uuid';
 import { ORCHESTRATIONS } from './catalog';
 import { runSerial, runParallel, archiveStalePlan } from './groupthink-v2';
@@ -24,7 +25,7 @@ function httpErr(statusCode: number, message: string): Error & { statusCode: num
   return Object.assign(new Error(message), { statusCode });
 }
 
-export class OrchestrationService {
+export class OrchestrationService extends EventEmitter {
   private controllers = new Map<string, AbortController>();
   private runners: { serial: OrchestrationRunner; parallel: OrchestrationRunner };
 
@@ -35,7 +36,27 @@ export class OrchestrationService {
     // boot-reconcile) is unit-testable without the real relay loop.
     runners?: { serial: OrchestrationRunner; parallel: OrchestrationRunner },
   ) {
+    super();
     this.runners = runners ?? { serial: runSerial, parallel: runParallel };
+  }
+
+  /** Supervisor ids that currently own an active (starting/running)
+   *  deliberation. Drives the renderer's owner-container pulse so the border
+   *  keeps animating through the idle gaps BETWEEN deliberation turns — when
+   *  both planners are momentarily idle but the run is still alive. */
+  activeSupervisorIds(): string[] {
+    const ids = new Set<string>();
+    for (const run of listOrchestrationRuns()) {
+      if (run.status === 'starting' || run.status === 'running') ids.add(run.supervisorId);
+    }
+    return [...ids];
+  }
+
+  /** Re-broadcast the active-supervisor set after any run-status transition.
+   *  Listeners (index.ts → renderer) treat the payload as authoritative, so an
+   *  occasional redundant emit is harmless. */
+  private emitActiveChanged(): void {
+    this.emit('activeRunsChanged', this.activeSupervisorIds());
   }
 
   /** Boot reconcile: any row still 'starting'/'running' belonged to a previous
@@ -57,6 +78,8 @@ export class OrchestrationService {
           resume_hint: { tool: 'run_orchestration', name: 'groupthink', params: { resumeRunId: run.runId } },
         }, null, 2));
     }
+    // Boot reconcile may have flipped orphaned runs out of the active set.
+    this.emitActiveChanged();
   }
 
   stop(): void { for (const c of this.controllers.values()) c.abort(); }
@@ -124,6 +147,7 @@ export class OrchestrationService {
     this.controllers.get(runId)?.abort();
     run.status = 'aborted'; run.endedAt = nowIso(); run.updatedAt = nowIso();
     updateOrchestration(run);
+    this.emitActiveChanged();
     insertOrchestrationEvent({ runId, ts: nowIso(), kind: 'aborted', payload: {} });
     void this.cleanupMembers(run);
     void this.relay(runId, run.supervisorId,
@@ -136,6 +160,7 @@ export class OrchestrationService {
     const controller = new AbortController();
     this.controllers.set(run.runId, controller);
     run.status = 'running'; run.updatedAt = nowIso(); updateOrchestration(run);
+    this.emitActiveChanged();              // now active → start the owner pulse
     const ctx: OrchestrationRunContext = {
       run,
       signal: controller.signal,
@@ -183,6 +208,10 @@ export class OrchestrationService {
         `[DASHBOARD EVENT] orchestration.groupthink.stalled\n${JSON.stringify(event, null, 2)}`);
     } finally {
       this.controllers.delete(run.runId);
+      // Terminal status (complete / stalled / error / aborted) is persisted by
+      // now in every branch above — drop this run from the active set so the
+      // owner pulse stops.
+      this.emitActiveChanged();
     }
   }
 
