@@ -1,9 +1,9 @@
-import { app, BrowserWindow, crashReporter, dialog, protocol, net, session, nativeTheme } from 'electron';
+import { app, BrowserWindow, crashReporter, dialog, protocol, net, session, nativeTheme, ipcMain } from 'electron';
 import path from 'path';
 import fs from 'fs';
 import { loadPersistedTheme } from './theme-persistence';
 import { initDatabase, getWorkspaces } from './database';
-import { validateAndRepairClaudeJson, validateAndRepairWslClaudeJson } from './claude-config-repair';
+import { validateAndRepairClaudeJson, validateAndRepairWslClaudeJson, startClaudeJsonRuntimeWatcher, stopClaudeJsonRuntimeWatcher } from './claude-config-repair';
 import { checkManagedWebContents } from './security/webcontents-guard';
 import { resolveConfined } from './security/path-confinement';
 import { AgentSupervisor } from './supervisor';
@@ -249,7 +249,9 @@ function createWindow(): void {
     // the menu bar (File / Edit / View / Help) becomes the top row.
     titleBarStyle: 'hidden',
     titleBarOverlay: {
-      color: theme === 'light' ? '#f7f5f0' : '#1e1e1e',
+      // surface-base, so the native caption buttons sit on the same shade as
+      // the renderer title bar (TopBar uses .panel-header = surface-base).
+      color: theme === 'light' ? '#edeae3' : '#181818',
       symbolColor: theme === 'light' ? '#1e1e1e' : '#f7f5f0',
       height: 32,
     },
@@ -455,6 +457,12 @@ app.whenReady().then(async () => {
     };
     registerIpcHandlers(supervisor, mainWindow!, detachedWindowDeps);
     supervisor.start();
+    // Runtime ~/.claude.json repair watcher. MUST be armed here — BEFORE
+    // orchestration.start() / supervisor.reconcile() can respawn the claude
+    // herd that manufactures the corruption this heals. Non-blocking +
+    // reentrant; reuses the same pure repair + read-stability gate as the
+    // startup backstop. See plans/claude-json-corruption-v3-runtime-repair-IMPL.md.
+    startClaudeJsonRuntimeWatcher();
     wsServer = new WsServer(supervisor);
     wsServer.start();
     // Construct the orchestration service in index.ts and inject it into
@@ -465,6 +473,18 @@ app.whenReady().then(async () => {
       createDashboardClient(supervisor),
       (supId, text) => supervisor!.deliverToSupervisor(supId, text),
     );
+    // Push the active-deliberation supervisor set to the renderer on every
+    // run-status transition. This keeps the owner-container border pulsing
+    // through the idle gaps between groupthink turns (when both planners are
+    // momentarily idle but the run is still alive), independent of per-agent
+    // status flips. The renderer seeds its initial state via the IPC handle
+    // below — the broadcast only fires on change.
+    orchestration.on('activeRunsChanged', (supervisorIds: string[]) => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('orchestration:active-changed', supervisorIds);
+      }
+    });
+    ipcMain.handle('orchestration:list-active', () => orchestration?.activeSupervisorIds() ?? []);
     apiServer = new ApiServer(supervisor, undefined, orchestration);
     // Class IV (plans/class-iv-worker-hook-scaffold.md): tell the supervisor the
     // port the API server actually bound to (handles EADDRINUSE auto-increment)
@@ -522,6 +542,7 @@ async function shutdownApp(): Promise<void> {
   wsServer?.stop();
   disposeKernelClient();
   void shutdownJupyterServer();
+  stopClaudeJsonRuntimeWatcher();
   closeAllFsWatchers();
   app.quit();
 }

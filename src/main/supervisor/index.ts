@@ -4,25 +4,26 @@ import fs from 'fs';
 import crypto from 'crypto';
 import { execFileSync, execFile, spawn } from 'child_process';
 import { v4 as uuidv4 } from 'uuid';
-import { Agent, AgentRoleLane, AgentStatus, ContextStats, LaunchAgentInput, QueryResult, Team } from '../../shared/types';
+import { Agent, AgentProvider, AgentRoleLane, AgentStatus, ContextStats, LaunchAgentInput, QueryResult, Team } from '../../shared/types';
 import {
-  TMUX_SESSION_PREFIX, DEFAULT_COMMAND, DEFAULT_COMMAND_WSL, PROVIDER_COMMANDS,
+  TMUX_SESSION_PREFIX, PROVIDER_COMMANDS,
   SUPERVISOR_AGENT_NAME, SUPERVISOR_AGENT_MD, SUPERVISOR_MEMORY_MD,
-  SUPERVISOR_CLAUDE_SETTINGS_JSON, SUPERVISOR_CLAUDE_SETTINGS_JSON_V1,
+  SUPERVISOR_CLAUDE_SETTINGS_JSON, SUPERVISOR_CLAUDE_SETTINGS_JSON_V1, SUPERVISOR_CLAUDE_SETTINGS_JSON_V2,
   SUPERVISOR_RUN_ORCHESTRATION_SKILL, SUPERVISOR_ORCHESTRATION_SPIKE_SKILL,
   SCRIPT_READ_AGENT_LOG, SCRIPT_LIST_AGENTS, SCRIPT_SEND_MESSAGE, SCRIPT_GET_CONTEXT_STATS,
   WORKER_CLAUDE_MD, WORKER_CLAUDE_MD_V1, WORKER_BEHAVIORAL_MD,
   WORKER_CLAUDE_SETTINGS_JSON, WORKER_CLAUDE_SETTINGS_JSON_V2, WORKER_CLAUDE_SETTINGS_JSON_V3,
-  WORKER_CLAUDE_SETTINGS_JSON_V4,
+  WORKER_CLAUDE_SETTINGS_JSON_V4, WORKER_CLAUDE_SETTINGS_JSON_V5,
   WORKER_CODEX_CONFIG_TOML, WORKER_CODEX_CONFIG_TOML_V1, WORKER_CODEX_CONFIG_TOML_V2,
   DASHBOARD_STATUS_SCRIPT_MJS, DASHBOARD_STATUS_SCRIPT_MJS_V3, DASHBOARD_STATUS_SCRIPT_MJS_V4, DASHBOARD_STATUS_SCRIPT_MJS_V5,
-  DASHBOARD_STATUS_SCRIPT_MJS_V6,
+  DASHBOARD_STATUS_SCRIPT_MJS_V6, DASHBOARD_STATUS_SCRIPT_V7_HASH, DASHBOARD_STATUS_SCRIPT_V8_HASH,
   CODEX_WORKER_PROFILE_NAME, CODEX_WORKER_PROFILE_TOML, HOOK_CANARY_WINDOW_MS,
   MAX_SUBMIT_RETRIES, HANDSHAKE_CONFIRM_WINDOW_MS, HANDSHAKE_CONFIRM_POLL_MS,
   TMUX_OPTION_MAX_AGE_MS, TMUX_OPTION_LAUNCH_SKEW_MS, STATUS_POLL_INTERVAL_MS,
   RESEARCH_STORE_README_MD, RESEARCH_WRITE_GUARD_MJS, RESEARCHER_CLAUDE_SETTINGS_JSON,
   RESEARCHER_AGENT_MD,
   PERSONA_CREATE_PERSONA_SKILL, PERSONA_READ_COMMENTS_SKILL, SCRIPT_READ_COMMENTS_PY,
+  PERSONA_CREATE_PERSONA_SKILL_V1,
 } from '../../shared/constants';
 import {
   writeScaffoldMap as writeSharedScaffoldMap,
@@ -34,6 +35,8 @@ import {
   sha256Hex,
   normalizeManagedKey,
 } from '../scaffold-writer';
+import { resolveLaunchCommand } from './launch-command';
+import { isNonBlockingNotificationType } from '../../shared/notification-classify';
 
 // Back-compat re-export shim: scaffold-version-migration.test.ts (and any other
 // caller) imports these from './index'. The definitions now live in
@@ -52,6 +55,8 @@ import type { StatusChangedEvent } from './status-events';
 import { ContextStatsMonitor, JsonlFileActivity } from './context-stats-monitor';
 import { SessionLogReader } from './session-log-reader';
 import { ClaudeJsonlReader } from './log-readers/claude-jsonl-reader';
+import { parseSqliteUtcMs } from './sqlite-time';
+import { decideClearRotation, type ClearRotationTrigger } from './claude-clear-rotation';
 import { CodexRolloutReader } from './log-readers/codex-rollout-reader';
 import { GeminiTranscriptReader } from './log-readers/gemini-transcript-reader';
 import { AgentChatService } from './agent-chat-service';
@@ -67,7 +72,7 @@ import {
 import { listCodexRolloutFiles } from './log-readers/codex-rollout-reader';
 import { FileActivityTracker } from './file-activity-tracker';
 import {
-  createAgent, getAgent, getActiveAgents, getAllAgents, getSupervisorAgent, getWorkspace, updateAgentStatus, updateAgentPid,
+  createAgent, getAgent, getActiveAgents, getAllAgents, getSupervisorAgent, getOwnerForWorker, getWorkspace, updateAgentStatus, updateAgentPid,
   updateAgentExitCode, incrementRestartCount, updateAgentLastOutput,
   updateAgentAttached, addEvent, deleteAgent as dbDeleteAgent,
   updateAgentResumeSessionId, addFileActivity, getTeamMembership, addTeamMember, getAgentTemplate,
@@ -326,11 +331,17 @@ export interface ParsedHookEvent {
   v?: number;
   /** Self-reported agent id (validated against the addressed agent when present). */
   agentId?: string;
-  state: 'idle' | 'working' | 'active';
+  state: 'idle' | 'working' | 'active' | 'waiting';
   /** Original hook source: 'hook-stop' | 'hook-start' | 'hook-session-start'.
    *  Kept for diagnostics; the source passed to the status flip is
    *  transport-determined (see applyHookStatusEvent step 8). */
   source?: string;
+  /** Notification-hook excerpt (the `message` field) for a `state:'waiting'`
+   *  event — CR/LF-stripped + capped script-side; threaded to forceWaiting. */
+  waitingExcerpt?: string;
+  /** Notification `notification_type` (e.g. permission_prompt / idle_prompt /
+   *  elicitation_*) for diagnostics on a `state:'waiting'` event. */
+  notificationType?: string;
   /** Script-side Date.now() — the dedupe/ordering clock. NEVER used for
    *  stamping (the applier stamps with its own host-clock receivedAt). */
   ts: number;
@@ -342,6 +353,36 @@ export interface ParsedHookEvent {
 }
 
 export type HookApplyResult = 'applied' | 'duplicate' | 'stale' | 'invalid';
+
+/** Pure scan of a hook-spool tail for the newest UserPromptSubmit session id
+ *  belonging to ONE agent id. Used by reconcile rediscovery (app restart) to
+ *  recover an agent-bound /clear candidate without any cwd/slug/newest-file
+ *  heuristic. Parses newest-to-oldest; tolerates a partial first line (the tail
+ *  read may slice mid-record) and foreign/malformed lines by skipping them.
+ *  `minTs` bounds matches to records at/after the agent's launch (minus a small
+ *  skew) so a previous pane occupant's records are ignored. */
+export function parseLatestClaudeHookSessionFromSpool(
+  content: string,
+  agentId: string,
+  minTs: number
+): string | null {
+  const lines = content.split('\n');
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i].trim();
+    if (!line) continue;
+    let rec: any;
+    try { rec = JSON.parse(line); } catch { continue; }
+    if (!rec || typeof rec !== 'object') continue;
+    if (rec.agentId !== agentId) continue;
+    if (rec.hookEventName !== 'UserPromptSubmit') continue;
+    if (rec.state !== 'working') continue;
+    if (typeof rec.sessionId !== 'string' || rec.sessionId.length === 0) continue;
+    if (typeof rec.ts !== 'number' || !Number.isFinite(rec.ts)) continue;
+    if (rec.ts < minTs) continue;
+    return rec.sessionId;
+  }
+  return null;
+}
 
 /** LRU cap for the per-agent applied-event dedupe registry. */
 const APPLIED_HOOK_EVENTS_MAX = 200;
@@ -411,11 +452,34 @@ export const SUPERVISOR_AGENT_MD_V4_HASH = '054a7eae68adb143cf4cfd95ddc3545adc5e
  *  for silent v5→v6 upgrade. */
 export const SUPERVISOR_AGENT_MD_V5_HASH = 'f19c98da539530851ff61585093d8f756d129d0b21b470f910f29c2e0726de32';
 
+/** SHA-256 hex of the v6 `.dashboard/supervisor/CLAUDE.md` (researcher-lane slim).
+ *  v7 clarifies `## Online research` to the canonical research division of labor:
+ *  quick single-page lookups stay inline (any agent, including the supervisor);
+ *  deep / multi-source research reports OR native web browsing route to the
+ *  researcher lane. In-place clarification of the existing section (no new
+ *  sentinel block). Used in the v7 file's previousHashes for silent v6→v7 upgrade. */
+export const SUPERVISOR_AGENT_MD_V6_HASH = 'dd3e741f414df3102007edadd521d9c2b04d91ec75ae1e76a29ecde0104a5485';
+
+/** SHA-256 hex of the v7 `.dashboard/supervisor/CLAUDE.md` (pre-transient-
+ *  subscription docs). v8 appends the one-turn cross-agent subscription clause
+ *  to the `send_message_to_agent` tool bullet (in-place bullet append, no new
+ *  sentinel block). Used in the v8 file's previousHashes for silent v7→v8
+ *  upgrade of pristine workspaces. */
+export const SUPERVISOR_AGENT_MD_V7_HASH = '39942ff81d12aca671b54e26d8503e00ed2c2ee6fe84f51f6d13dace82c98222';
+
 /** SHA-256 hex of the v2 `.dashboard/workers/claude/CLAUDE.md` (pre-research-store;
  *  the shared-behavioral-memory section but no research-store pointer). v3
  *  appends the `<!-- section:research-store v1 -->` section (WP-G). Used in the
  *  v3 file's previousHashes for silent v2→v3 upgrade. */
 export const WORKER_CLAUDE_MD_V2_HASH = '4c567327db31586de7b85ff4e37cae8d9726552cc5a1405197ccac1c2513bc02';
+
+/** SHA-256 hex of the v3 `.dashboard/workers/claude/CLAUDE.md` (research-store
+ *  pointer). v4 appends the `<!-- section:online-research v1 -->` section: a
+ *  worker does quick single-page WebSearch/WebFetch lookups inline but cannot
+ *  launch agents, so deep / multi-source research reports or native web browsing
+ *  are surfaced to the supervisor for the researcher lane. Used in the v4 file's
+ *  previousHashes for silent v3→v4 upgrade. */
+export const WORKER_CLAUDE_MD_V3_HASH = '3e8e36537c3428e2a032090a34658f41a0668b0e3d83653df662b7f87ceb9064';
 
 /** SHA-256 hex of the v1 `.dashboard/researcher/scripts/research-write-guard.mjs`
  *  (allow-by-default for paths outside .dashboard/research/). v2 inverts that to
@@ -431,6 +495,24 @@ export const RESEARCH_WRITE_GUARD_MJS_V1_HASH = '3fcfb8db52ae51a1c5c846b10a914fc
  *  the v2 file's previousHashes for silent v1→v2 upgrade of pristine workspaces. */
 export const RESEARCHER_AGENT_MD_V1_HASH = '085571f86cc203f07572e25c846631a957b5d6dbd400aa1bf5d6acc09a52739b';
 
+/** SHA-256 hex of the v2 `.dashboard/researcher/CLAUDE.md` — the version that
+ *  framed `mcp__claude-in-chrome__*` as a browser "backup" behind the native
+ *  `browser_*` tools (`<!-- section:browser-tools v1 -->`). v3 rewrites that
+ *  section (`<!-- section:browser-tools v2 -->`) and HOISTS a native-first
+ *  directive to the top of the doc: claude-in-chrome stays available to the
+ *  researcher lane ONLY, but as a de-emphasized last-resort fallback — native
+ *  `browser_*` (the dashboard MCP) is primary and the sole browser for
+ *  embedded-browser testing. cic is removed from every OTHER lane. Used in the
+ *  v3 file's previousHashes for silent v2→v3 upgrade of pristine workspaces. */
+export const RESEARCHER_AGENT_MD_V2_HASH = '47e91371f37252e3f0eb4a0c341b1ec54833e0bfa5adf1b556139a5a31ce632e';
+
+/** SHA-256 hex of the v3 `.dashboard/researcher/CLAUDE.md` (native-first hoist +
+ *  `<!-- section:browser-tools v2 -->`). v4 adds a `## What this lane is for`
+ *  framing near the top: this lane is for deep / multi-source research reports
+ *  and native web browsing only — quick single-page lookups belong to the
+ *  calling agent. Used in the v4 file's previousHashes for silent v3→v4 upgrade. */
+export const RESEARCHER_AGENT_MD_V3_HASH = '00c35328b92d340d62cb939076f6558238d6a64097dfd4fe0843f0bb96947271';
+
 /** Map an agent's role flags to its first-class app role-lane
  *  (browser-parity-and-capability-isolation §0, D-1). The single source of
  *  truth the new switch points (toolset grant, cwd, scaffold, MCP injection)
@@ -443,12 +525,32 @@ export function roleLaneOf(a: {
   isResearcher?: boolean;
   isSupervised?: boolean;
   isWorker?: boolean;
+  privilegeLane?: 'supervisor';
   persona?: string;
 }): AgentRoleLane {
   if (a.isSupervisor) return 'supervisor';
+  // #19 — a persona on the 'supervisor' privilege lane is granted the
+  // supervisor-tier MCP toolset WITHOUT being the structural supervisor
+  // (isSupervisor stays false, so it renders as its own card). Checked AFTER the
+  // real isSupervisor (a true supervisor still wins) but BEFORE researcher/worker
+  // so an elevated persona resolves to the supervisor toolset grant. This is the
+  // single place the capability lane re-enters the toolset/MCP path.
+  if (a.privilegeLane === 'supervisor') return 'supervisor';
   if (a.isResearcher) return 'researcher';
   if (a.isSupervised || a.isWorker) return 'worker';
   return 'legacy';
+}
+
+/** Bug 2 / Edit 2.6 — a codex-provider agent that was launched with the
+ *  dashboard hook profile (`wantsCodexHooks`, persisted at createAgent time).
+ *  A *pure* codex persona is `roleLaneOf === 'legacy'`, so the runner's
+ *  `roleLaneOf(agent) !== 'legacy'` env gate would skip it — leaving it with no
+ *  AGENT_ID so the codex hook script bails at `if (!agentId) return;`. This
+ *  predicate is the escape that lets a hook-instrumented codex persona ALSO
+ *  receive AGENT_ID / DASHBOARD_PORT / DASHBOARD_SPOOL_PATH + the spool tailer.
+ *  Re-derivable purely from the persisted row, so launch and reconcile agree. */
+export function isCodexHookPersona(a: { provider?: AgentProvider; wantsCodexHooks?: boolean }): boolean {
+  return a.provider === 'codex' && !!a.wantsCodexHooks;
 }
 
 /** B2 (HOOK_SYSTEM_DESIGN.md §C) — ensure a worker-lane codex command carries
@@ -577,21 +679,6 @@ const CODEX_DISCOVERY_GRACE_MS = 45_000;
 // observed slow starts (interactive update prompt, ~1 s startup race).
 const CODEX_SID_RECOVERY_POLL_INTERVAL_MS = 2_000;
 const CODEX_SID_RECOVERY_POLL_WINDOW_MS = 60_000;
-
-/**
- * Parse a SQLite `datetime('now')` timestamp ("YYYY-MM-DD HH:MM:SS", UTC, no
- * zone marker) to epoch ms. `Date.parse` treats the bare space-form as LOCAL
- * time, which would skew an age computation by the full timezone offset, so we
- * normalize to ISO-UTC first. Falls through to plain `Date.parse` for any
- * already-ISO value; returns null when unparseable.
- */
-function parseSqliteUtcMs(s: string | null | undefined): number | null {
-  if (!s) return null;
-  const ms = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(s)
-    ? Date.parse(s.replace(' ', 'T') + 'Z')
-    : Date.parse(s);
-  return Number.isFinite(ms) ? ms : null;
-}
 
 function normalizeCodexArgs(args: string[]): string[] {
   const out: string[] = [];
@@ -880,6 +967,13 @@ export class AgentSupervisor extends EventEmitter {
   // after INITIAL_USER_PROMPT_TTL_MS and are cleared on agent stop/delete.
   private pendingInitialPrompts = new Map<string, { text: string; expiresAt: number }>();
 
+  // /clear context-bar rotation — per-agent pending hook-bound candidate
+  // session ids. Set when a Claude UserPromptSubmit hook delivers a (possibly
+  // new) session id for an agent; consulted again when that agent's tailed
+  // file goes stale (the EOF retry). Keyed by agentId so a candidate can NEVER
+  // be applied to a cwd sibling. Deleted on successful rotation.
+  private pendingClaudeClearCandidates = new Map<string, string>();
+
   constructor() {
     super();
     const appData = process.env.APPDATA || path.join(process.env.HOME || '', '.config');
@@ -928,7 +1022,7 @@ export class AgentSupervisor extends EventEmitter {
 
     const bridgeDeps: EventBridgeDeps = {
       getAgent: (id) => getAgent(id),
-      getSupervisorForWorker: (worker) => getSupervisorAgent(worker.workspaceId),
+      getOwnerForWorker: (worker) => getOwnerForWorker(worker),
       sendInput: async (supervisorId, text) => { await this.sendInput(supervisorId, text); },
       addAuditEvent: (agentId, type, payload) => { addEvent(agentId, type, payload); },
       getAgentLog: (agentId, lines) => this.getAgentLog(agentId, lines),
@@ -1048,6 +1142,22 @@ export class AgentSupervisor extends EventEmitter {
       this.contextStatsMonitor.invalidateAgent(agentId);
       deleteFileActivitiesForAgent(agentId);
       this.emit('fileActivitiesPurged', agentId);
+    });
+
+    // /clear rotation: when a Claude agent's tailed .jsonl goes quiet (EOF
+    // streak), check whether the user ran /clear — which rotates Claude to a
+    // brand-new session file the DB resumeSessionId doesn't know about — and
+    // repoint the agent at the successor so the context bar self-heals.
+    this.sessionLogReader.on('session-stale', (signal) => {
+      // EOF/stale is only a RETRY of a previously hook-bound candidate, never
+      // the identity source. If no candidate was bound for this agent, this is
+      // a safe no-op (e.g. an idle agent that never /clear'd).
+      const candidate = this.pendingClaudeClearCandidates.get(signal.agentId);
+      this.maybeRotateClaudeSession(signal.agentId, {
+        kind: 'stale',
+        staleSessionId: signal.staleSessionId,
+        candidateSessionId: candidate,
+      });
     });
 
     // Update registry whenever any status changes
@@ -1214,21 +1324,65 @@ export class AgentSupervisor extends EventEmitter {
     // nor the worker hook scaffold (Step 5 wires its own cwd/scaffold).
     const isResearcher = !!resolvedInput.isResearcher;
     const isWorkerLane = !isResearcher && (!!resolvedInput.isSupervised || !!resolvedInput.isWorker);
-    // If the workspace's defaultCommand is one of the framework defaults
-    // (Windows or WSL), respect the provider override. Otherwise the workspace
-    // has a customized launch command and we use it verbatim.
-    const isFrameworkDefault =
-      workspace.defaultCommand === DEFAULT_COMMAND || workspace.defaultCommand === DEFAULT_COMMAND_WSL;
-    let command = resolvedInput.command || (isFrameworkDefault ? defaultCmd : workspace.defaultCommand);
+    // Codex turn-boundary hooks must reach BOTH native worker-lane codex agents
+    // AND codex-provider personas. The persona scaffold branch below is mutually
+    // exclusive with the worker branch, so a codex persona otherwise skips both
+    // the --profile instrumentation and the CODEX_HOME profile write — running
+    // hookless (no dashboard status), or worse: --profile injected with no file.
+    const wantsCodexHooks = provider === 'codex' && (isWorkerLane || !!resolvedInput.persona);
+    // Resolve the launch command, reconciling explicit input, the workspace's
+    // stored default command, and the requested provider. resolveLaunchCommand:
+    //  (1) treats a pristine framework default (incl. a legacy ` --chrome`
+    //      variant) as overridable so a codex/gemini launch uses the correct
+    //      provider binary instead of the stored claude command, and
+    //  (2) guards against silently launching a non-claude provider via a
+    //      claude/ccode binary even for a custom workspace command.
+    const { command: resolvedCommand, providerOverride } = resolveLaunchCommand({
+      inputCommand: resolvedInput.command,
+      workspaceDefaultCommand: workspace.defaultCommand,
+      provider,
+      pathType,
+    });
+    if (providerOverride) {
+      console.warn(
+        `[launch] provider '${provider}' would have launched via a claude/ccode ` +
+        `command (${JSON.stringify(providerOverride.from)}); overriding to the ` +
+        `provider-correct command (${JSON.stringify(providerOverride.to)}).`,
+      );
+    }
+    let command = resolvedCommand;
     // Researcher launch command (Gate-0 default): do NOT inherit a workspace's
     // customized defaultCommand verbatim. The researcher MUST launch from the
-    // canonical claude base (`claude --dangerously-skip-permissions --chrome` /
-    // the WSL `ccode` form) so its lane injection (browser MCP + --strict, plus
-    // the --tools/--disallowedTools native boundary + store --add-dir added in
-    // launchWindowsAgent/launchWslAgent) sits on a known base with bypass +
-    // --chrome present. Provider is claude-only (guarded above).
+    // canonical claude base (`claude --dangerously-skip-permissions` / the WSL
+    // `ccode` form) so its lane injection (browser MCP + --strict, plus the
+    // --tools/--disallowedTools native boundary + store --add-dir added in
+    // launchWindowsAgent/launchWslAgent) sits on a known base with bypass
+    // present. The native browser_* tools arrive via the injected dashboard MCP
+    // toolset (the lane's PRIMARY browser, always wired in). We then append
+    // `--chrome` so the bundled `mcp__claude-in-chrome__*` server is ALSO
+    // available — but ONLY to the researcher lane, as a de-emphasized last-
+    // resort fallback (the doc steers it away from cic unless native genuinely
+    // can't do the job). `--chrome` is a CLI-flag server injection, so it
+    // survives the researcher's --strict-mcp-config (which only suppresses
+    // config-FILE MCP discovery); the lane's --tools/--disallowedTools boundary
+    // still gates which cic verbs are offered. Every OTHER lane launches from a
+    // base WITHOUT --chrome (stripped from PROVIDER_COMMANDS), so cic is not
+    // theirs. Provider is claude-only (guarded above).
     if (isResearcher) {
-      command = defaultCmd;
+      command = `${defaultCmd} --chrome`;
+    } else if (command) {
+      // cic is RESEARCHER-ONLY. The bundled `mcp__claude-in-chrome__*` server is
+      // activated solely by the `--chrome` flag (it is NOT in the user's global
+      // ~/.claude.json mcpServers, so there is no config-inheritance path to
+      // close — even for the non-strict supervisor/legacy lanes). Framework
+      // defaults no longer carry `--chrome`, but a workspace's STORED custom
+      // defaultCommand (or a pre-strip legacy row, since the old default DID
+      // include it) is used verbatim for non-researcher lanes and would carry
+      // `--chrome` straight through — re-activating cic for worker/supervisor/
+      // legacy/persona. Strip any standalone `--chrome` token here so cic is
+      // genuinely unavailable to every NON-researcher lane regardless of the
+      // stored command. (No-op for codex/gemini commands, which never carry it.)
+      command = command.replace(/\s+--chrome\b/g, '');
     }
     // Class IV codex hooks: codex never loads the worker-cwd .codex/config.toml
     // (it's not a trusted project), so turn-boundary hooks must ride a
@@ -1239,17 +1393,17 @@ export class AgentSupervisor extends EventEmitter {
     // if the command can't be safely instrumented, remember to mark the agent
     // hook_status='degraded' (set below, once the agent row exists).
     let codexHookDegraded = false;
-    if (isWorkerLane && provider === 'codex') {
+    if (wantsCodexHooks) {
       const instrumented = instrumentCodexWorkerCommand(command);
       if (instrumented.instrumented) {
         command = instrumented.command;
       } else {
         codexHookDegraded = true;
         console.warn(
-          `[hook-b2] worker-lane codex command could not be safely instrumented ` +
+          `[hook-b2] hook-instrumented codex command could not be safely instrumented ` +
           `with --profile ${CODEX_WORKER_PROFILE_NAME} --dangerously-bypass-hook-trust ` +
           `(command: ${JSON.stringify(command)}). Marking hook_status='degraded' — ` +
-          `this worker runs hookless and its status will be stale.`,
+          `this agent runs hookless and its status will be stale.`,
         );
       }
     }
@@ -1332,6 +1486,25 @@ export class AgentSupervisor extends EventEmitter {
       execFileSync('wsl.exe', ['bash', '-lc', `mkdir -p '${agentCwd}'`], { timeout: 5000 });
     }
 
+    // Agent-ownership primitive: persist the launcher → child edge. The id is set by a
+    // TRUSTED dashboard path (see §4.3), never read back from a caller-supplied field on
+    // a path that shouldn't be authoritative. Validate it references a live,
+    // same-workspace, non-terminal agent; otherwise drop the edge (warn, never throw) so
+    // a bad id never blocks a launch — the child then routes by isSupervised.
+    let ownerAgentId: string | null = null;
+    if (resolvedInput.ownerAgentId) {
+      const candidate = getAgent(resolvedInput.ownerAgentId);
+      if (!candidate) {
+        console.warn(`[ownership] dropping owner edge: ${resolvedInput.ownerAgentId} not found`);
+      } else if (candidate.workspaceId !== resolvedInput.workspaceId) {
+        console.warn(`[ownership] dropping owner edge: ${resolvedInput.ownerAgentId} in different workspace`);
+      } else if (['done', 'crashed'].includes(candidate.status)) {
+        console.warn(`[ownership] dropping owner edge: ${resolvedInput.ownerAgentId} is terminal (${candidate.status})`);
+      } else {
+        ownerAgentId = candidate.id;
+      }
+    }
+
     const agent = createAgent({
       workspaceId: resolvedInput.workspaceId,
       title: resolvedInput.title,
@@ -1343,6 +1516,23 @@ export class AgentSupervisor extends EventEmitter {
       isSupervised: resolvedInput.isSupervised,
       isWorker: isWorkerLane,
       isResearcher,
+      // Agent-ownership primitive: the validated launcher → child edge (§4.1).
+      ownerAgentId,
+      // notifyOwner mute: thread the launch input through (default true). The
+      // edge stays owned regardless; only owner-directed notification is gated.
+      notifyOwner: resolvedInput.notifyOwner,
+      // #19 — persist the persona privilege lane so the supervisor-tier toolset
+      // grant (via roleLaneOf at the MCP-injection sites, which read the stored
+      // record) survives relaunch. Does NOT set isSupervisor, so the persona
+      // still renders as its own card and keeps its .dashboard/agents/<name> cwd.
+      privilegeLane: resolvedInput.privilegeLane,
+      // Bug 2 / Edit 2.6 — persist the codex-hook decision so the runner env gate
+      // (roleLaneOf(agent) !== 'legacy' || isCodexHookPersona(agent)) is
+      // re-derivable from the STORED row on launch AND on reconcile/respawn,
+      // where the transient resolvedInput is gone. A pure codex persona is
+      // roleLaneOf==='legacy', so without this it would launch with no AGENT_ID
+      // and the codex hook script bails at `if (!agentId) return;`.
+      wantsCodexHooks,
       tmuxSessionName,
       autoRestartEnabled: resolvedInput.autoRestartEnabled ?? true,
       logPath,
@@ -1366,7 +1556,7 @@ export class AgentSupervisor extends EventEmitter {
     // a degraded status (it only acts on 'unknown').
     if (codexHookDegraded) {
       updateAgentHookStatus(agent.id, 'degraded');
-    } else if (isWorkerLane || isResearcher) {
+    } else if (isWorkerLane || isResearcher || wantsCodexHooks) {
       // Arm the launch-time hook canary: if no hook event reaches the dashboard
       // within HOOK_CANARY_WINDOW_MS and hook_status is still 'unknown', the
       // StatusMonitor flips it to 'broken'. See StatusMonitor.checkHookCanary.
@@ -1385,6 +1575,21 @@ export class AgentSupervisor extends EventEmitter {
 
     addEvent(agent.id, 'launched');
 
+    // Invariant: ANY launch lane refreshes the shared workspace hook script
+    // BEFORE the lane-specific scaffold runs. Every lane's settings.json status
+    // hook points at the single shared .dashboard/scripts/dashboard-status.mjs
+    // (supervisor `../scripts/`, worker `../../scripts/`, persona/researcher
+    // likewise), but only the persona and worker lanes used to write it — so a
+    // supervisor- or researcher-only workspace kept whatever (possibly stale)
+    // version the last worker/persona left, degrading hook-driven status + the
+    // sessionId/`/clear` rotation until a worker happened to launch. This one
+    // unconditional version-migrated refresh makes every lane self-heal. The
+    // per-lane calls below remain a harmless no-op skip on the second pass
+    // (sidecar == bundled version → writeScaffoldMap's `diskVersion ===
+    // bundledVersion` branch returns early), so this neither double-writes nor
+    // fights the per-lane scaffolding.
+    this.ensureWorkspaceScripts(workDir, pathType);
+
     // Auto-create the right scaffold for this launch. Persona FIRST: a persona
     // gets the shared workspace scripts (so its mandatory status hooks can reach
     // .dashboard/scripts/dashboard-status.mjs) + its own version-migrated kit, and
@@ -1397,6 +1602,11 @@ export class AgentSupervisor extends EventEmitter {
       // (upgrade reaches existing personas incl. mr-job-hunt-agent).
       this.writeScaffoldMap(workDir, AgentSupervisor.WORKSPACE_SCRIPT_FILES, pathType);
       ensurePersonaScaffold(workDir, pathType, resolvedInput.persona);
+      // Codex personas: the instrumented command carries --profile, but the worker
+      // branch (which normally writes the CODEX_HOME profile) is skipped for
+      // personas. Ensure the profile file exists so --profile resolves. Idempotent
+      // (once-per-process-per-pathType guarded).
+      if (provider === 'codex') this.ensureCodexHookProfile(pathType);
     } else if (resolvedInput.isSupervisor) {
       this.ensureSupervisorScaffold(workDir, pathType);
     } else if (isResearcher) {
@@ -1480,13 +1690,13 @@ export class AgentSupervisor extends EventEmitter {
   private static SUPERVISOR_FILES: Record<string, ScaffoldFile> = {
     [`.dashboard/supervisor/CLAUDE.md`]:                                              {
       content: SUPERVISOR_AGENT_MD,
-      version: 6,
-      previousHashes: { 1: SUPERVISOR_AGENT_MD_V1_HASH, 2: SUPERVISOR_AGENT_MD_V2_HASH, 3: SUPERVISOR_AGENT_MD_V3_HASH, 4: SUPERVISOR_AGENT_MD_V4_HASH, 5: SUPERVISOR_AGENT_MD_V5_HASH },
+      version: 8,
+      previousHashes: { 1: SUPERVISOR_AGENT_MD_V1_HASH, 2: SUPERVISOR_AGENT_MD_V2_HASH, 3: SUPERVISOR_AGENT_MD_V3_HASH, 4: SUPERVISOR_AGENT_MD_V4_HASH, 5: SUPERVISOR_AGENT_MD_V5_HASH, 6: SUPERVISOR_AGENT_MD_V6_HASH, 7: SUPERVISOR_AGENT_MD_V7_HASH },
     },
     [`.dashboard/supervisor/.claude/settings.json`]:                                  {
       content: SUPERVISOR_CLAUDE_SETTINGS_JSON,
-      version: 2,
-      previousHashes: { 1: sha256Hex(SUPERVISOR_CLAUDE_SETTINGS_JSON_V1) },
+      version: 3,
+      previousHashes: { 1: sha256Hex(SUPERVISOR_CLAUDE_SETTINGS_JSON_V1), 2: sha256Hex(SUPERVISOR_CLAUDE_SETTINGS_JSON_V2) },
     },
     [`.dashboard/supervisor/.claude/skills/run-orchestration/SKILL.md`]:              {
       content: SUPERVISOR_RUN_ORCHESTRATION_SKILL,
@@ -1496,7 +1706,7 @@ export class AgentSupervisor extends EventEmitter {
     [`.dashboard/supervisor/.claude/skills/orchestration-spike/SKILL.md`]:            { content: SUPERVISOR_ORCHESTRATION_SPIKE_SKILL, version: 1 },
     // Persona kit (§1.4) — the two default skills ship into every native lane too
     // so the supervisor/researcher/worker can guide persona creation + read comments.
-    [`.dashboard/supervisor/.claude/skills/create-persona/SKILL.md`]:                 { content: PERSONA_CREATE_PERSONA_SKILL, version: 1 },
+    [`.dashboard/supervisor/.claude/skills/create-persona/SKILL.md`]:                 { content: PERSONA_CREATE_PERSONA_SKILL, version: 2, previousHashes: { 1: sha256Hex(PERSONA_CREATE_PERSONA_SKILL_V1) } },
     [`.dashboard/supervisor/.claude/skills/read-comments/SKILL.md`]:                  { content: PERSONA_READ_COMMENTS_SKILL, version: 1 },
     // NOTE: .dashboard/supervisor/memory/MEMORY.md is deliberately NOT managed
     // here — it is seeded once via seedSupervisorMemoryIfAbsent (seed-once
@@ -1523,11 +1733,16 @@ export class AgentSupervisor extends EventEmitter {
    *  v7 (P1, plans/p1-hook-spool-multi-transport.md §1) reads stdin meta,
    *  always-writes the spool (DASHBOARD_SPOOL_PATH env), and adds the tmux
    *  pane-option transport — one record, three channels.
+   *  v8 (plans/hook-driven-waiting-status.md §3) adds the **blocking**
+   *  Notification → waiting hook branch + the excerpt/notificationType record fields.
+   *  v9 (plans/idle-vs-waiting-notification-fix.md) bails on non-blocking
+   *  Notification types (idle_prompt et al.) so the ~60s idle reminder no longer
+   *  flips the card to waiting.
    *  All previous hashes are recorded for silent upgrade. */
   private static WORKSPACE_SCRIPT_FILES: Record<string, ScaffoldFile> = {
     [`.dashboard/scripts/dashboard-status.mjs`]: {
       content: DASHBOARD_STATUS_SCRIPT_MJS,
-      version: 7,
+      version: 9,
       executable: true,
       previousHashes: {
         1: DASHBOARD_STATUS_SCRIPT_V1_HASH,
@@ -1536,6 +1751,8 @@ export class AgentSupervisor extends EventEmitter {
         4: sha256Hex(DASHBOARD_STATUS_SCRIPT_MJS_V4),
         5: sha256Hex(DASHBOARD_STATUS_SCRIPT_MJS_V5),
         6: sha256Hex(DASHBOARD_STATUS_SCRIPT_MJS_V6),
+        7: DASHBOARD_STATUS_SCRIPT_V7_HASH,
+        8: DASHBOARD_STATUS_SCRIPT_V8_HASH,
       },
     },
     // Persona kit (§1.4) — one shared copy of the read-comments helper script.
@@ -1555,25 +1772,28 @@ export class AgentSupervisor extends EventEmitter {
    *  v4 drops the SubagentStop hook — it POSTed idle whenever a Task-tool
    *  subagent finished while the main agent was still mid-turn.
    *  v5 adds autoCompactEnabled: false — workers must not silently
-   *  auto-compact mid-task regardless of user-level Claude settings. */
+   *  auto-compact mid-task regardless of user-level Claude settings.
+   *  v6 adds the Notification hook (Notification → waiting) so a worker that
+   *  blocks on input flips to `waiting` (plans/hook-driven-waiting-status.md §4). */
   private static WORKER_FILES_CLAUDE: Record<string, ScaffoldFile> = {
     [`.dashboard/workers/claude/CLAUDE.md`]:                       {
       content: WORKER_CLAUDE_MD,
-      version: 3, // v2 adds the memory section; v3 (WP-G) adds the research-store pointer
-      previousHashes: { 1: sha256Hex(WORKER_CLAUDE_MD_V1), 2: WORKER_CLAUDE_MD_V2_HASH },
+      version: 4, // v2 adds the memory section; v3 (WP-G) adds the research-store pointer; v4 adds the online-research division of labor
+      previousHashes: { 1: sha256Hex(WORKER_CLAUDE_MD_V1), 2: WORKER_CLAUDE_MD_V2_HASH, 3: WORKER_CLAUDE_MD_V3_HASH },
     },
     [`.dashboard/workers/claude/.claude/settings.json`]:           {
       content: WORKER_CLAUDE_SETTINGS_JSON,
-      version: 5,
+      version: 6,
       previousHashes: {
         1: WORKER_CLAUDE_SETTINGS_JSON_V1_HASH,
         2: sha256Hex(WORKER_CLAUDE_SETTINGS_JSON_V2),
         3: sha256Hex(WORKER_CLAUDE_SETTINGS_JSON_V3),
         4: sha256Hex(WORKER_CLAUDE_SETTINGS_JSON_V4),
+        5: sha256Hex(WORKER_CLAUDE_SETTINGS_JSON_V5),
       },
     },
     // Persona kit (§1.4) — default skills for the Claude worker lane.
-    [`.dashboard/workers/claude/.claude/skills/create-persona/SKILL.md`]: { content: PERSONA_CREATE_PERSONA_SKILL, version: 1 },
+    [`.dashboard/workers/claude/.claude/skills/create-persona/SKILL.md`]: { content: PERSONA_CREATE_PERSONA_SKILL, version: 2, previousHashes: { 1: sha256Hex(PERSONA_CREATE_PERSONA_SKILL_V1) } },
     [`.dashboard/workers/claude/.claude/skills/read-comments/SKILL.md`]:  { content: PERSONA_READ_COMMENTS_SKILL, version: 1 },
   };
 
@@ -1595,7 +1815,7 @@ export class AgentSupervisor extends EventEmitter {
    *  turn-boundary status hooks. CLAUDE.md is the generic base persona contract
    *  (RESEARCHER_AGENT_MD) — managed/version-migrated like the supervisor's. */
   private static RESEARCHER_FILES: Record<string, ScaffoldFile> = {
-    [`.dashboard/researcher/CLAUDE.md`]:                         { content: RESEARCHER_AGENT_MD, version: 2, previousHashes: { 1: RESEARCHER_AGENT_MD_V1_HASH } },
+    [`.dashboard/researcher/CLAUDE.md`]:                         { content: RESEARCHER_AGENT_MD, version: 4, previousHashes: { 1: RESEARCHER_AGENT_MD_V1_HASH, 2: RESEARCHER_AGENT_MD_V2_HASH, 3: RESEARCHER_AGENT_MD_V3_HASH } },
     [`.dashboard/researcher/.claude/settings.json`]:             { content: RESEARCHER_CLAUDE_SETTINGS_JSON, version: 1 },
     [`.dashboard/researcher/scripts/research-write-guard.mjs`]:  { content: RESEARCH_WRITE_GUARD_MJS, version: 2, previousHashes: { 1: RESEARCH_WRITE_GUARD_MJS_V1_HASH }, executable: true },
     // Persona kit (§1.4) — default skills for the researcher lane.
@@ -1632,6 +1852,16 @@ export class AgentSupervisor extends EventEmitter {
     } else {
       console.log(`[supervisor] Scaffold already exists in ${workDir}`);
     }
+  }
+
+  /** Lane-agnostic refresh of the shared workspace hook scripts
+   *  (WORKSPACE_SCRIPT_FILES — .dashboard/scripts/dashboard-status.mjs +
+   *  read-comments.py). Called unconditionally at launch BEFORE the lane
+   *  dispatch so every lane (supervisor, researcher, worker, persona) self-heals
+   *  a stale or missing shared script via the standard version-migration engine.
+   *  Idempotent: a workspace already at the bundled version is a no-op skip. */
+  private ensureWorkspaceScripts(workDir: string, pathType: string): void {
+    this.writeScaffoldMap(workDir, AgentSupervisor.WORKSPACE_SCRIPT_FILES, pathType);
   }
 
   /** Class IV — create the .dashboard/workers/<provider>/ template plus the
@@ -2222,8 +2452,11 @@ export class AgentSupervisor extends EventEmitter {
       //   --add-dir's value isn't otherwise visible to the agent's context.
       // Applies to both supervisors and supervised workers (class IV): both cwd
       // into a .dashboard/ subfolder, so neither would see the workspace
-      // naturally without these flags.
-      if ((agent.isSupervisor || agent.isSupervised || agent.isResearcher) && isClaude) {
+      // naturally without these flags. A privilegeLane:'supervisor' persona
+      // resolves to the supervisor lane (roleLaneOf) but is none of the three
+      // booleans, so it is included explicitly — otherwise it would launch
+      // without workspace file-scope and without the "Workspace root:" preamble.
+      if ((agent.isSupervisor || agent.isSupervised || agent.isResearcher || agent.privilegeLane === 'supervisor') && isClaude) {
         const workspaceRoot = getEffectiveWorkspaceRoot(agent);
         // The researcher cwds into .dashboard/researcher/, so the research store
         // must be added to its file scope explicitly (item 4); its preamble names
@@ -2368,15 +2601,14 @@ export class AgentSupervisor extends EventEmitter {
     // round-trips through cmd.exe parsing at all. (Matches the WSL path's
     // `(isSupervisor || isSupervised)` gate at line 1234.)
     const hasPromptArg = !!agentMdPrompt && !resume && agent.provider === 'claude';
-    // shouldDirectSpawn folds in the worker lane (isWorker) alongside
-    // supervisor/supervised/researcher: a plain worker also gets an inline
+    // shouldDirectSpawn keys off the resolved role-lane (roleLaneOf), NOT the raw
+    // lane booleans, so it stays in lockstep with the inline-MCP injection above
+    // (also `lane !== 'legacy'`). ANY non-legacy claude lane gets an inline
     // --mcp-config JSON that the cmd.exe wrap would corrupt into a bogus file
-    // path. (Matches the WSL path's lane gate + the isWorker lane-grouping below.)
+    // path — including a privilegeLane:'supervisor' persona that is none of the
+    // four booleans yet resolves to the supervisor lane (the crash-loop regressor).
     const needsDirectSpawn = shouldDirectSpawn({
-      isSupervisor: agent.isSupervisor,
-      isSupervised: agent.isSupervised,
-      isWorker: agent.isWorker,
-      isResearcher: agent.isResearcher,
+      lane: roleLaneOf(agent),
       provider: agent.provider,
       hasPromptArg,
       overrideArgs: !!overrideArgs,
@@ -2420,7 +2652,10 @@ export class AgentSupervisor extends EventEmitter {
     if (agent.provider === 'claude') {
       extraEnv.CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION = 'false';
     }
-    if (agent.isSupervised || agent.isWorker || agent.isResearcher) {
+    // Codex personas are roleLaneOf==='legacy' but ARE hook-instrumented (Bug 2,
+    // Edits 2.1–2.5), so they need AGENT_ID/DASHBOARD_PORT/DASHBOARD_SPOOL_PATH +
+    // the spool tailer or their codex hook script bails at `if (!agentId) return;`.
+    if (roleLaneOf(agent) !== 'legacy' || isCodexHookPersona(agent)) {
       extraEnv.AGENT_ID = agent.id;
       extraEnv.DASHBOARD_PORT = String(this.apiServerPort);
       // P1 §3 — spool path for the v7 hook script's always-write transport.
@@ -2430,6 +2665,26 @@ export class AgentSupervisor extends EventEmitter {
         getEffectiveWorkspaceRoot(agent), '.dashboard', 'pending-status.jsonl');
       // Tail the same file from the dashboard side.
       this.ensureSpoolTailer(agent);
+    }
+    // PHASE 0 (agent-ownership) — propagate the dashboard API credential into the
+    // agent's OWN process env so its Bash tool / child subprocesses inherit it.
+    // The bearer token is otherwise injected ONLY into the MCP sidecar's env
+    // (the inline --mcp-config JSON), which is scoped to the `node mcp-dashboard.js`
+    // subprocess — so any script the agent runs from Bash that POSTs the dashboard
+    // HTTP API got 401 "Missing or invalid API token". Gated on the SAME predicate
+    // that injects the dashboard --mcp-config token (roleLaneOf !== 'legacy'): an
+    // agent's subprocesses inherit the agent's dashboard credential level BY
+    // DESIGN — external/untrusted materials are quarantined separately in a later
+    // phase. AGENT_DASHBOARD_SELF_ID is a forward-looking hook for the upcoming
+    // ownership primitive (a script forwards it as the owner id); no owner-column
+    // or event-delivery logic is built here. Single source of truth for the gate:
+    // roleLaneOf(agent) !== 'legacy', the same lane decision the MCP injection and
+    // shouldDirectSpawn key off (mcp-config-builder.ts), so it can never diverge.
+    if (agent.provider === 'claude' && roleLaneOf(agent) !== 'legacy') {
+      extraEnv.AGENT_DASHBOARD_API_TOKEN = getApiToken();
+      extraEnv.AGENT_DASHBOARD_API_PORT = String(this.apiServerPort);
+      extraEnv.AGENT_DASHBOARD_API_HOST = '127.0.0.1';
+      extraEnv.AGENT_DASHBOARD_SELF_ID = agent.id;
     }
     // AGENT_BROWSER_ACTIONS — INTENTIONALLY NOT SET in the researcher child env.
     // browser-parity §0.1 (WP-D gap): BrowserManager.gate() reads
@@ -2660,6 +2915,71 @@ export class AgentSupervisor extends EventEmitter {
     this.resolveCodexResumeSessionId(agent);
   }
 
+  /** Claude /clear analogue of the codex capture path. Given an
+   *  ALREADY-agent-bound candidate session id (from the hook, an EOF/stale
+   *  retry of that hook candidate, or app-restart spool rediscovery of it),
+   *  validate it as a signed `/clear` successor and, if it checks out, adopt it
+   *  and rebind so the context bar + chat reset. The candidate is NEVER
+   *  discovered by cwd/slug scan, so this can't cross-bind a cwd sibling's
+   *  successor (BUG-26 invariant). Silent no-op for non-claude, missing/
+   *  same-session/unvalidated candidates. Returns true if a rotation occurred. */
+  private maybeRotateClaudeSession(agentId: string, trigger: ClearRotationTrigger): boolean {
+    const agent = getAgent(agentId);
+    if (!agent) return false;
+    const successor = decideClearRotation({
+      agent,
+      trigger,
+      validateSuccessor: (wd, cur, cand, started) =>
+        this.sessionLogReader.validateClearSuccessor('claude', wd, cur, cand, started),
+    });
+    if (!successor) return false;
+
+    updateAgentResumeSessionId(agentId, successor);
+    this.pendingClaudeClearCandidates.delete(agentId);
+    // Drops the dead pre-clear file's offsets + the ring buffer + context
+    // stats (via 'agent-rebound'); the next 1s tick resolves the new file and
+    // the first usage event repopulates the bar small.
+    this.sessionLogReader.rebindAgent(agentId);
+    addEvent(agentId, 'clear_session_rotated', successor);
+    console.log(`[Claude] Adopted /clear successor session ${successor} for agent ${agentId}`);
+    return true;
+  }
+
+  /** Reconcile-time rediscovery of a Claude agent's hook-bound /clear candidate
+   *  from the DURABLE spool. Reads the tail of the workspace's
+   *  pending-status.jsonl and returns the newest UserPromptSubmit session id
+   *  recorded for THIS agent id since (just before) its launch — NEVER a
+   *  cwd/slug, mtime, or newest-file choice. The subsequent
+   *  validateClearSuccessor still proves it is a signed /clear successor.
+   *  Returns null when the spool is missing/unreadable or has no match. */
+  private findLatestClaudeHookSessionFromSpool(agent: Agent): string | null {
+    let readPath: string;
+    try {
+      readPath = resolveSpoolReadPath(getEffectiveWorkspaceRoot(agent));
+    } catch {
+      return null;
+    }
+    let content: string;
+    try {
+      const size = fs.statSync(readPath).size;
+      const readBytes = Math.min(size, 4 * 1024 * 1024);
+      const start = size - readBytes;
+      const fd = fs.openSync(readPath, 'r');
+      try {
+        const buf = Buffer.alloc(readBytes);
+        const got = fs.readSync(fd, buf, 0, readBytes, start);
+        content = buf.toString('utf-8', 0, got);
+      } finally {
+        fs.closeSync(fd);
+      }
+    } catch {
+      return null;
+    }
+    const launchMs = parseSqliteUtcMs(agent.createdAt);
+    const minTs = launchMs === null ? -Infinity : launchMs - TMUX_OPTION_LAUNCH_SKEW_MS;
+    return parseLatestClaudeHookSessionFromSpool(content, agent.id, minTs);
+  }
+
   private captureCodexSessionId(
     agentId: string,
     before: Awaited<ReturnType<typeof snapshotCodexSessions>>,
@@ -2734,7 +3054,10 @@ export class AgentSupervisor extends EventEmitter {
     if (isClaude) {
       wslEnvPrefix.push('CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false');
     }
-    if (agent.isSupervised || agent.isWorker || agent.isResearcher) {
+    // Codex personas are roleLaneOf==='legacy' but ARE hook-instrumented (Bug 2,
+    // Edits 2.1–2.5), so they need AGENT_ID/DASHBOARD_PORT/DASHBOARD_SPOOL_PATH +
+    // the spool tailer or their codex hook script bails at `if (!agentId) return;`.
+    if (roleLaneOf(agent) !== 'legacy' || isCodexHookPersona(agent)) {
       wslEnvPrefix.push(`AGENT_ID=${agent.id}`);
       wslEnvPrefix.push(`DASHBOARD_PORT=${this.apiServerPort}`);
       wslEnvPrefix.push(`DASHBOARD_HOST=${this.resolveWslGatewayIp()}`);
@@ -2745,6 +3068,28 @@ export class AgentSupervisor extends EventEmitter {
         `DASHBOARD_SPOOL_PATH=${shQuote(`${getEffectiveWorkspaceRoot(agent)}/.dashboard/pending-status.jsonl`)}`);
       // Tail the same file from the dashboard side (UNC form).
       this.ensureSpoolTailer(agent);
+    }
+    // PHASE 0 (agent-ownership) — propagate the dashboard API credential into the
+    // agent's OWN process env (mirrors the Windows path above) so its Bash tool /
+    // child subprocesses inherit it. The bearer token otherwise reaches only the
+    // MCP sidecar (inline --mcp-config), so a Bash script POSTing the dashboard
+    // HTTP API got 401. Set via bash command-prefix (the SAME mechanism as the
+    // sibling AGENT_ID/DASHBOARD_PORT/DASHBOARD_HOST vars above) — these are
+    // assigned directly in the tmux command line, so they need no WSLENV declaration
+    // (WSLENV only matters when crossing the Windows process env into WSL, as the
+    // query path does at index.ts:~3380). For WSL the host is the WSL→Windows-host
+    // gateway IP (resolveWslGatewayIp), matching the dashboard MCP config's
+    // AGENT_DASHBOARD_API_HOST. The token is shQuote'd and is scrubbed from every
+    // serialization sink by redactMcpToken (its env-prefix branch). Gated on the
+    // SAME predicate as the MCP-token injection (roleLaneOf !== 'legacy') so the
+    // two can never diverge. SELF_ID is the forward-looking ownership hook (owner
+    // id forwarded by a later script); no ownership logic is built here. An agent's
+    // subprocesses inherit the agent's dashboard credential level BY DESIGN.
+    if (isClaude && roleLaneOf(agent) !== 'legacy') {
+      wslEnvPrefix.push(`AGENT_DASHBOARD_API_TOKEN=${shQuote(getApiToken())}`);
+      wslEnvPrefix.push(`AGENT_DASHBOARD_API_PORT=${this.apiServerPort}`);
+      wslEnvPrefix.push(`AGENT_DASHBOARD_API_HOST=${this.resolveWslGatewayIp()}`);
+      wslEnvPrefix.push(`AGENT_DASHBOARD_SELF_ID=${agent.id}`);
     }
     if (wslEnvPrefix.length > 0) {
       command = `${wslEnvPrefix.join(' ')} ${command}`;
@@ -2761,7 +3106,11 @@ export class AgentSupervisor extends EventEmitter {
     // research store for the researcher (its cwd is .dashboard/researcher/, so
     // the store must be added explicitly — item 4).
     let wslAddDir: string | null = null;
-    if ((agent.isSupervisor || agent.isSupervised) && isClaude && !overrideCommand) {
+    // A privilegeLane:'supervisor' persona resolves to the supervisor lane
+    // (roleLaneOf) but is neither isSupervisor nor isSupervised, so it is included
+    // explicitly here — otherwise it loses workspace file-scope + the preamble
+    // (mirrors the Windows add-dir gate).
+    if ((agent.isSupervisor || agent.isSupervised || agent.privilegeLane === 'supervisor') && isClaude && !overrideCommand) {
       persistentWorkspaceRoot = getEffectiveWorkspaceRoot(agent);
       wslAddDir = persistentWorkspaceRoot;
       sysPromptText = `Workspace root: ${persistentWorkspaceRoot}. cd there for project shell work. Use absolute paths for Read/Edit/Glob.`;
@@ -2827,7 +3176,7 @@ export class AgentSupervisor extends EventEmitter {
       // there, so its single-quoted path stays intact through the outer wrap.
       // Supervisor/worker add the workspace root; the researcher adds the
       // research store (wslAddDir resolved above).
-      if ((agent.isSupervisor || agent.isSupervised || agent.isResearcher) && isClaude && wslAddDir) {
+      if ((agent.isSupervisor || agent.isSupervised || agent.isResearcher || agent.privilegeLane === 'supervisor') && isClaude && wslAddDir) {
         command += ` --add-dir '${wslAddDir}'`;
         const role = agent.isSupervisor ? 'Supervisor' : agent.isResearcher ? 'Researcher' : 'Worker';
         console.log(`[WSL] ${role} --add-dir: ${wslAddDir}`);
@@ -3174,6 +3523,18 @@ export class AgentSupervisor extends EventEmitter {
       // that dropped isResearcher would silently regain Bash/Edit and lose
       // --strict-mcp-config.
       isResearcher: source.isResearcher,
+      // #19 — preserve the persona privilege lane so a forked elevated persona
+      // keeps its supervisor-tier MCP toolset (forkLane = roleLaneOf(newAgent)
+      // below rebuilds the bypassed lane-aware injection from this field).
+      privilegeLane: source.privilegeLane,
+      // Ownership is inherited by a fork (the fork continues the source's work, so its
+      // lifecycle events route to the same launcher). Distinct from supervision, which is
+      // NOT inherited (see the isWorker/supervision note above). If the inherited owner is
+      // dead by fork time, getOwnerForWorker's terminal-owner backstop handles it at delivery.
+      ownerAgentId: source.ownerAgentId,
+      // notifyOwner is inherited by a fork alongside ownerAgentId: a fork
+      // continues the source's work, so a muted source yields a muted fork.
+      notifyOwner: source.notifyOwner,
       tmuxSessionName,
       autoRestartEnabled: source.autoRestartEnabled,
       logPath,
@@ -3578,13 +3939,13 @@ export class AgentSupervisor extends EventEmitter {
     if (typeof event.ts !== 'number' || !Number.isFinite(event.ts)) {
       return this.invalidHookEvent(agentId, transport, `non-finite ts ${JSON.stringify(event.ts)}`);
     }
-    if (event.state !== 'idle' && event.state !== 'working' && event.state !== 'active') {
-      return this.invalidHookEvent(agentId, transport, `unknown state ${JSON.stringify(event.state)}`);
+    if (event.state !== 'idle' && event.state !== 'working' && event.state !== 'active' && event.state !== 'waiting') {
+      return this.invalidHookEvent(agentId, transport, `unknown state ${JSON.stringify(event.state)} (expected idle/working/active/waiting)`);
     }
     // hookEventName fallback: argv-style name derived from state, so records
     // missing the field (defensive) still dedupe consistently.
     const hookEventName = event.hookEventName
-      || (event.state === 'working' ? 'UserPromptSubmit' : event.state === 'active' ? 'SessionStart' : 'Stop');
+      || (event.state === 'working' ? 'UserPromptSubmit' : event.state === 'active' ? 'SessionStart' : event.state === 'waiting' ? 'Notification' : 'Stop');
     if (hookEventName.length === 0) {
       return this.invalidHookEvent(agentId, transport, 'empty hookEventName');
     }
@@ -3673,9 +4034,42 @@ export class AgentSupervisor extends EventEmitter {
       this.forceIdleFromHook(agentId, flipSource);
     } else if (event.state === 'working') {
       this.forceWorkingFromHook(agentId, flipSource);
+    } else if (event.state === 'waiting') {
+      // idle-vs-waiting fix: steps 1-7 above already stamped liveness (hook health +
+      // canary) for this event; an idle reminder / informational notification proves
+      // the agent is alive but must NOT flip the card to 'waiting'. Suppress the known
+      // non-blocking types; unknown/missing notificationType → waiting (conservative).
+      if (!isNonBlockingNotificationType(event.notificationType)) {
+        this.monitor.forceWaiting(agentId, 'notification', event.waitingExcerpt ?? '');
+      }
     }
     // state === 'active' (SessionStart): health/canary already handled in
     // step 7; MUST NOT change status (HOOK_SYSTEM_DESIGN.md §A).
+
+    // 9. /clear context-bar rotation (BUG-26-safe). The UserPromptSubmit hook
+    //    carries BOTH the dashboard agentId (which routed this event to THIS
+    //    agent) and Claude's CURRENT session_id. A /clear rotates Claude to a
+    //    new session file the DB resumeSessionId doesn't know about, freezing
+    //    the bar; the hook's session_id is the only candidate we ever validate.
+    //    Binding the candidate to this agentId is what makes rotation safe
+    //    under shared cwds — a cwd sibling's successor is never adopted. For an
+    //    ORDINARY prompt the candidate equals the current session (or isn't a
+    //    signed /clear root), so validateClearSuccessor rejects it: inert.
+    //    Only on the 'applied' path: a duplicate (same event via a second
+    //    transport) already triggered this on the first transport's apply.
+    if (
+      agent.provider === 'claude' &&
+      hookEventName === 'UserPromptSubmit' &&
+      event.state === 'working' &&
+      typeof event.sessionId === 'string' &&
+      event.sessionId.length > 0
+    ) {
+      this.pendingClaudeClearCandidates.set(agentId, event.sessionId);
+      this.maybeRotateClaudeSession(agentId, {
+        kind: 'hook',
+        candidateSessionId: event.sessionId,
+      });
+    }
     return 'applied';
   }
 
@@ -3741,7 +4135,10 @@ export class AgentSupervisor extends EventEmitter {
    *  as a user of that tailer for disposal accounting. Best-effort: a path
    *  that can't resolve (wsl.exe down) just means no spool channel this run. */
   private ensureSpoolTailer(agent: Agent): void {
-    if (!(agent.isSupervised || agent.isWorker || agent.isResearcher)) return;
+    // Mirror the runner env gate (Bug 2 / Edit 2.6): a hook-instrumented codex
+    // persona is roleLaneOf==='legacy' but DOES spool, so it must get a tailer or
+    // the events it writes to DASHBOARD_SPOOL_PATH would never be drained.
+    if (!(roleLaneOf(agent) !== 'legacy' || isCodexHookPersona(agent))) return;
     let readPath: string;
     try {
       readPath = resolveSpoolReadPath(getEffectiveWorkspaceRoot(agent));
@@ -3808,7 +4205,7 @@ export class AgentSupervisor extends EventEmitter {
     for (const [agentId, runner] of this.wslRunners) {
       if (!runner.isAlive) continue;
       const agent = getAgent(agentId);
-      if (!agent || !(agent.isSupervised || agent.isWorker || agent.isResearcher)) continue;
+      if (!agent || !(roleLaneOf(agent) !== 'legacy')) continue;
       if (!agent.tmuxSessionName) continue;
       const lastHookAt = this.monitor.getLastHookEventAt(agentId);
       // Skip agents with a fresh hook signal — the backstop is only for
@@ -3863,7 +4260,7 @@ export class AgentSupervisor extends EventEmitter {
    *      No authoritative start marker exists (§2.3/Q2/G5); never throw — they
    *      stay on the reactive fallback / PTY inference. */
   usesSubmitConfirmation(agent: Agent): boolean {
-    if (!(agent.isSupervised || agent.isWorker || agent.isResearcher)) return false;
+    if (!(roleLaneOf(agent) !== 'legacy')) return false;
     if (agent.provider === 'claude') {
       return agent.hookStatus !== 'broken';
     }
@@ -3924,6 +4321,17 @@ export class AgentSupervisor extends EventEmitter {
    */
   isInputInFlight(agentId: string): boolean {
     return this.inputInFlight.has(agentId);
+  }
+
+  /** Transient one-turn cross-agent subscription — registry lives in the
+   *  EventBridge (single source of truth for the privilege/owner/liveness
+   *  gate). The API layer calls this after a body-derived eligibility check. */
+  registerTransientTurnSubscription(input: { targetAgentId: string; subscriberAgentId: string; ttlMs?: number }): { registered: boolean; reason?: string } {
+    return this.bridge.registerTransientTurnSubscription(input);
+  }
+
+  cancelTransientTurnSubscriptionsForPair(targetAgentId: string, subscriberAgentId: string): void {
+    this.bridge.cancelTransientTurnSubscriptionsForPair(targetAgentId, subscriberAgentId);
   }
 
   /**
@@ -4475,14 +4883,43 @@ export class AgentSupervisor extends EventEmitter {
               this.ensureResearcherScaffold(ws.path, pathType);
             } else if (agent.isWorker) {
               this.ensureWorkerScaffold(ws.path, agent.provider, pathType);
-              if (agent.provider === 'codex') this.ensureCodexHookProfile(pathType);
+            }
+          }
+
+          // Codex catch-all — INTENTIONALLY OUTSIDE the `if (ws)` guard above: the shared
+          // CODEX_HOME profile is workspace-INDEPENDENT (global to the codex runtime), so
+          // it must be ensured even when getWorkspace() returns null for this agent. Do
+          // not move this inside the ws guard — that silently re-breaks codex personas in
+          // any workspace that fails to resolve. The write is process-global and
+          // idempotent (codexHookProfileEnsured Set, ~line 879), and binds no agent — only
+          // commands that already carry --profile use it. So a blanket "any codex agent"
+          // call is presence-only with zero behavioral spillover, including codex personas,
+          // which match none of the lane branches above.
+          if (agent.provider === 'codex') this.ensureCodexHookProfile(pathType);
+
+          // Decision 2: an agent /clear'd before shutdown still has the dead
+          // pre-clear session in the DB. Repoint to the post-clear successor
+          // now so --resume targets the live session and the bar loads correct.
+          // The candidate is rediscovered from the DURABLE hook spool — the
+          // newest UserPromptSubmit record for THIS agent id (not a cwd/slug or
+          // newest-file scan), then validated as a signed /clear root. Safe
+          // pre-launch: rebindAgent only clears caches (reader isn't polling
+          // this agent yet).
+          let agentForLaunch = agent;
+          if (agent.provider === 'claude' && agent.resumeSessionId) {
+            const rediscovered = this.findLatestClaudeHookSessionFromSpool(agent);
+            if (rediscovered && this.maybeRotateClaudeSession(agent.id, {
+              kind: 'rediscovery',
+              candidateSessionId: rediscovered,
+            })) {
+              agentForLaunch = getAgent(agent.id) ?? agent;
             }
           }
 
           if (pathType === 'windows') {
-            await this.launchWindowsAgent(agent, true);
+            await this.launchWindowsAgent(agentForLaunch, true);
           } else {
-            await this.launchWslAgent(agent, true);
+            await this.launchWslAgent(agentForLaunch, true);
           }
           addEvent(agent.id, 'reconnected');
         } catch (err) {

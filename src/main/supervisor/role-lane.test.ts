@@ -22,6 +22,8 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import type { Agent, AgentRoleLane } from '../../shared/types';
+// Pure, Electron-free + DB-free — safe to import statically (no require.cache dance).
+import { toolsetsForLane } from './mcp-config-builder';
 
 interface TestCase { name: string; run(): Promise<void> | void; }
 const tests: TestCase[] = [];
@@ -101,11 +103,14 @@ type DbModule = {
 type IndexModule = {
   roleLaneOf(a: {
     isSupervisor?: boolean; isResearcher?: boolean;
-    isSupervised?: boolean; isWorker?: boolean; persona?: string;
+    isSupervised?: boolean; isWorker?: boolean;
+    privilegeLane?: 'supervisor'; persona?: string;
   }): AgentRoleLane;
+  isCodexHookPersona(a: { provider?: string; wantsCodexHooks?: boolean }): boolean;
 };
 let dbm: DbModule;
 let roleLaneOf: IndexModule['roleLaneOf'];
+let isCodexHookPersona: IndexModule['isCodexHookPersona'];
 
 // ── roleLaneOf ───────────────────────────────────────────────────────
 
@@ -131,6 +136,21 @@ test('roleLaneOf: worker and supervised both map to the worker lane', () => {
 test('roleLaneOf: no lane flags (incl. a bare persona) falls back to legacy', () => {
   assert.equal(roleLaneOf({}), 'legacy');
   assert.equal(roleLaneOf({ persona: 'some-persona' }), 'legacy');
+});
+
+test('roleLaneOf: privilegeLane grants the supervisor lane without isSupervisor (#19)', () => {
+  // A persona on the supervisor privilege lane: NOT the structural supervisor
+  // (isSupervisor false → renders as its own card), but resolves to the
+  // supervisor role-lane so it receives the supervisor-tier MCP toolset.
+  assert.equal(roleLaneOf({ privilegeLane: 'supervisor' }), 'supervisor');
+  assert.equal(
+    toolsetsForLane(roleLaneOf({ privilegeLane: 'supervisor' })),
+    'orchestration,teams,comms,observability,browser-present',
+    'elevated persona must receive the supervisor MCP grant',
+  );
+  // A real isSupervisor still wins, and privilegeLane sits above researcher/worker.
+  assert.equal(roleLaneOf({ isSupervisor: true, privilegeLane: 'supervisor' }), 'supervisor');
+  assert.equal(roleLaneOf({ privilegeLane: 'supervisor', isResearcher: true, isWorker: true }), 'supervisor');
 });
 
 // ── isResearcher DB round-trip ───────────────────────────────────────
@@ -178,6 +198,67 @@ test('createAgent: omitting isResearcher defaults to false (column default 0)', 
   assert.equal(fetched!.isResearcher, false, 'is_researcher should rehydrate as false when unset');
 });
 
+// ── Bug 2 / Edit 2.6 — isCodexHookPersona helper ─────────────────────
+
+test('isCodexHookPersona: true only for a codex agent with wantsCodexHooks set', () => {
+  assert.equal(isCodexHookPersona({ provider: 'codex', wantsCodexHooks: true }), true,
+    'codex + wantsCodexHooks → the runner env gate escape applies');
+  assert.equal(isCodexHookPersona({ provider: 'codex', wantsCodexHooks: false }), false,
+    'codex without the persisted flag → no escape (stays legacy)');
+  assert.equal(isCodexHookPersona({ provider: 'codex' }), false,
+    'codex with undefined flag → false');
+  assert.equal(isCodexHookPersona({ provider: 'claude', wantsCodexHooks: true }), false,
+    'claude never qualifies, even if the flag were somehow set');
+  assert.equal(isCodexHookPersona({}), false, 'empty → false');
+});
+
+// ── Bug 2 / Edit 2.6 — wantsCodexHooks DB round-trip ─────────────────
+
+test('createAgent: wantsCodexHooks=true round-trips through getAgent as a boolean', () => {
+  const agent = dbm.createAgent({
+    workspaceId: 'ws-codex-hooks',
+    title: 'Codex persona round-trip',
+    roleDescription: '',
+    workingDirectory: '/tmp/codex-persona',
+    command: 'codex --profile dashboard-worker --dangerously-bypass-hook-trust',
+    provider: 'codex',
+    wantsCodexHooks: true,
+    tmuxSessionName: null,
+    autoRestartEnabled: false,
+    logPath: '/tmp/codex-persona.log',
+  });
+  assert.equal(agent.wantsCodexHooks, true, 'createAgent return value should carry wantsCodexHooks=true');
+
+  const fetched = dbm.getAgent(agent.id);
+  assert.ok(fetched, 'agent should be retrievable');
+  assert.equal(fetched!.wantsCodexHooks, true, 'wants_codex_hooks must rehydrate as true');
+  // The persisted row is enough to re-derive the runner env gate on reconcile.
+  assert.equal(isCodexHookPersona(fetched!), true,
+    'a rehydrated codex persona row must satisfy the env-gate escape');
+});
+
+test('createAgent: omitting wantsCodexHooks defaults to false (column default 0)', () => {
+  const agent = dbm.createAgent({
+    workspaceId: 'ws-codex-default',
+    title: 'Codex default',
+    roleDescription: '',
+    workingDirectory: '/tmp/codex-default',
+    command: 'codex',
+    provider: 'codex',
+    // wantsCodexHooks intentionally omitted
+    tmuxSessionName: null,
+    autoRestartEnabled: false,
+    logPath: '/tmp/codex-default.log',
+  });
+  assert.equal(agent.wantsCodexHooks, false, 'absent wantsCodexHooks should default to false');
+
+  const fetched = dbm.getAgent(agent.id);
+  assert.ok(fetched);
+  assert.equal(fetched!.wantsCodexHooks, false, 'wants_codex_hooks should rehydrate as false when unset');
+  assert.equal(isCodexHookPersona(fetched!), false,
+    'a codex row without the flag must NOT satisfy the env-gate escape');
+});
+
 // ── Runner ───────────────────────────────────────────────────────────
 (async () => {
   // Keep initDatabase's mkdir off the real APPDATA profile.
@@ -203,6 +284,7 @@ test('createAgent: omitting isResearcher defaults to false (column default 0)', 
   dbm = require('../database') as DbModule;
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   roleLaneOf = (require('./index') as IndexModule).roleLaneOf;
+  isCodexHookPersona = (require('./index') as IndexModule).isCodexHookPersona;
   dbm.initDatabase();
 
   let passed = 0;

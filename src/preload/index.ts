@@ -18,6 +18,8 @@ import type {
   BrowserShortcut,
   BrowserTabSnapshotEntry,
   BrowserTabState,
+  SigninPendingOpened,
+  SigninResolved,
 } from '../shared/browser';
 
 const api: IpcApi = {
@@ -80,6 +82,9 @@ const api: IpcApi = {
       ipcRenderer.on('terminal:data', listener);
       return () => ipcRenderer.removeListener('terminal:data', listener);
     },
+  },
+  contextOverhead: {
+    scan: (req) => ipcRenderer.invoke('context-overhead:scan', req),
   },
   files: {
     readFile: (filePath, pathType) => ipcRenderer.invoke('files:read', filePath, pathType),
@@ -166,6 +171,7 @@ const api: IpcApi = {
   personas: {
     list: (workspacePath, pathType) => ipcRenderer.invoke('persona:list', workspacePath, pathType),
     create: (workspacePath, pathType, name, roleDescription?, lane?) => ipcRenderer.invoke('persona:create', workspacePath, pathType, name, roleDescription, lane),
+    setLane: (workspacePath, pathType, name, lane) => ipcRenderer.invoke('persona:setLane', workspacePath, pathType, name, lane),
   },
   notebooks: {
     ensureServer: () => ipcRenderer.invoke('notebook:ensure-server'),
@@ -359,6 +365,33 @@ const api: IpcApi = {
         ipcRenderer.invoke(BROWSER_CHANNELS.accessTabReturnToHuman, tabId),
       clearSiteSession: (ruleId: string) =>
         ipcRenderer.invoke(BROWSER_CHANNELS.accessClearSiteSession, ruleId),
+      // WI-E "Import my session": copy the human's persist:user cookies for the
+      // rule's origin into the agent partition. HUMAN-CHROME-ONLY (never agent).
+      importUserSession: (ruleId: string) =>
+        ipcRenderer.invoke(BROWSER_CHANNELS.accessImportUserSession, ruleId),
+
+      // ── Signed-in tabs (WI-5): JIT sign-in banner events + cancel + WI-8 config.
+      //    The *-opened / *-resolved channels are main→renderer pushes that drive
+      //    the JIT banner; signinPendingCancel is the banner's "Cancel" invoke. ──
+      onSigninPendingOpened: (callback: (payload: SigninPendingOpened) => void) => {
+        const listener = (_e: any, payload: SigninPendingOpened) => callback(payload);
+        ipcRenderer.on(BROWSER_CHANNELS.signinPendingOpened, listener);
+        return () => ipcRenderer.removeListener(BROWSER_CHANNELS.signinPendingOpened, listener);
+      },
+      onSigninResolved: (callback: (payload: SigninResolved) => void) => {
+        const listener = (_e: any, payload: SigninResolved) => callback(payload);
+        ipcRenderer.on(BROWSER_CHANNELS.signinResolved, listener);
+        return () => ipcRenderer.removeListener(BROWSER_CHANNELS.signinResolved, listener);
+      },
+      signinPendingCancel: (tabId: string) =>
+        ipcRenderer.invoke(BROWSER_CHANNELS.signinPendingCancel, tabId),
+      getSigninHoldTimeoutMs: () => ipcRenderer.invoke(BROWSER_CHANNELS.getSigninHoldTimeoutMs),
+      setSigninHoldTimeoutMs: (ms: number) =>
+        ipcRenderer.invoke(BROWSER_CHANNELS.setSigninHoldTimeoutMs, ms),
+      setSigninUnattended: (workspaceId: string | null, unattended: boolean) =>
+        ipcRenderer.invoke(BROWSER_CHANNELS.setSigninUnattended, workspaceId, unattended),
+      isSigninUnattended: (workspaceId: string | null) =>
+        ipcRenderer.invoke(BROWSER_CHANNELS.isSigninUnattended, workspaceId),
     },
   },
   // Detachable (tear-off) file tabs — plans/detachable-file-tabs-plan.md §4.
@@ -397,6 +430,12 @@ const api: IpcApi = {
     const listener = (_event: any, message: any) => callback(message);
     ipcRenderer.on('team:message-created', listener);
     return () => ipcRenderer.removeListener('team:message-created', listener);
+  },
+  listActiveOrchestrations: () => ipcRenderer.invoke('orchestration:list-active'),
+  onOrchestrationActiveChanged: (callback) => {
+    const listener = (_event: any, supervisorIds: string[]) => callback(supervisorIds);
+    ipcRenderer.on('orchestration:active-changed', listener);
+    return () => ipcRenderer.removeListener('orchestration:active-changed', listener);
   },
 };
 

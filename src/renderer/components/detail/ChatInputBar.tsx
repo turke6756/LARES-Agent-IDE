@@ -1,7 +1,16 @@
-import React, { useState, useRef, useCallback, useEffect } from 'react';
-import type { AgentStatus } from '../../../shared/types';
+import React, { useState, useRef, useCallback, useEffect, useMemo } from 'react';
+import type { Agent, AgentStatus } from '../../../shared/types';
 import { useThemeStore } from '../../stores/theme-store';
+import { useDashboardStore } from '../../stores/dashboard-store';
 import { loadDraft, saveDraft } from '../../lib/chat-drafts';
+import {
+  formatAgentToken,
+  detectMention,
+  filterAgents,
+  type MentionContext,
+} from '../../lib/agent-mention';
+import { getCaretCoordinates } from '../../lib/textarea-caret';
+import AtMentionDropdown from './AtMentionDropdown';
 
 const ACCEPTING_INPUT: AgentStatus[] = ['idle', 'waiting', 'done', 'crashed'];
 
@@ -34,6 +43,31 @@ export default function ChatInputBar({
   const [isDragOver, setIsDragOver] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  // Positioned ancestor for the absolutely-positioned mention dropdown; caret
+  // coordinates are expressed relative to this wrapper (Slice D wire-up).
+  const wrapperRef = useRef<HTMLDivElement>(null);
+
+  // ── "@"-mention autocomplete (Slice B) ──────────────────────────────────
+  // Candidate source is the agents in the currently-selected workspace — the
+  // same filter AgentPickerDropdown uses. Self is INCLUDED. No "visible agents"
+  // selector exists; if one is added later, swap the source here only.
+  const selectedWorkspaceId = useDashboardStore((s) => s.selectedWorkspaceId);
+  const allAgents = useDashboardStore((s) => s.agents);
+  const wsAgents = useMemo(
+    () => allAgents.filter((a) => a.workspaceId === selectedWorkspaceId),
+    [allAgents, selectedWorkspaceId],
+  );
+  const [mention, setMention] = useState<MentionContext | null>(null);
+  const [highlighted, setHighlighted] = useState(0);
+  const candidates = useMemo(
+    () => (mention ? filterAgents(wsAgents, mention.query).slice(0, 8) : []),
+    [mention, wsAgents],
+  );
+  // Clamp the highlight whenever the candidate list changes so
+  // candidates[highlighted] can never be undefined after filtering narrows it.
+  useEffect(() => {
+    setHighlighted(0);
+  }, [candidates]);
   const lastAgentIdRef = useRef(agentId);
   const lastSyncSignalRef = useRef(syncSignal);
   // The text of the most recent send, kept so an async delivery failure can
@@ -102,6 +136,35 @@ export default function ChatInputBar({
     if (sendError) setSendError(null);
   }, [agentId, sendError]);
 
+  // Re-run "@"-mention detection from the live caret. Called on input changes
+  // AND on caret moves (keyup / click / select) so the menu opens/closes as the
+  // caret crosses a mention. `mention` stays non-null even when `candidates` is
+  // empty — that drives the no-match row; it clears only on detection-fail.
+  const recomputeMention = useCallback((value: string, caret: number | null) => {
+    const next = caret == null ? null : detectMention(value, caret);
+    // Keep the SAME object reference when the detected mention is unchanged.
+    // Caret syncs fire on every keyup/click/select — including while arrowing
+    // through the dropdown — and a fresh object each time would churn the
+    // `candidates` memo and re-trigger the highlight-clamp effect, wiping the
+    // arrow selection. Only hand back a new object when query/atIndex move.
+    setMention((prev) => {
+      if (next == null) return prev == null ? prev : null;
+      if (prev && prev.query === next.query && prev.atIndex === next.atIndex) return prev;
+      return next;
+    });
+  }, []);
+
+  const handleInputChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    updateInput(e.target.value);
+    recomputeMention(e.target.value, e.target.selectionStart);
+  }, [updateInput, recomputeMention]);
+
+  const handleCaretSync = useCallback(() => {
+    const ta = inputRef.current;
+    if (!ta) return;
+    recomputeMention(ta.value, ta.selectionStart);
+  }, [recomputeMention]);
+
   const canSend = ACCEPTING_INPUT.includes(agentStatus) && input.trim().length > 0 && !sending;
   const isDisabled = !ACCEPTING_INPUT.includes(agentStatus);
 
@@ -125,12 +188,93 @@ export default function ChatInputBar({
     }
   }, [agentId, input, canSend, updateInput]);
 
+  // Replace the in-progress "@…" run with the agent's full token + a trailing
+  // space, then drop the caret just past it. atIndex marks where the '@' began;
+  // the caret marks where the typed query ended.
+  const selectMention = useCallback((agent: Agent) => {
+    if (!mention) return;
+    const token = formatAgentToken(agent);
+    const ta = inputRef.current;
+    const caret = ta?.selectionStart ?? input.length;
+    const before = input.slice(0, mention.atIndex);
+    const after = input.slice(caret);
+    const insert = token + ' ';
+    const next = before + insert + after;
+    updateInput(next);
+    setMention(null);
+    requestAnimationFrame(() => {
+      const pos = (before + insert).length;
+      ta?.focus();
+      ta?.setSelectionRange(pos, pos);
+    });
+  }, [mention, input, updateInput]);
+
   const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
+    // Intercept BEFORE the Enter-sends branch: while the dropdown is open it
+    // owns Enter/Tab/Arrow keys so we neither send nor move the caret.
+    if (mention) {
+      if (e.key === 'Escape') { e.preventDefault(); setMention(null); return; }
+      if (candidates.length === 0) {
+        // No-match row visible: swallow nav + commit keys.
+        if (e.key === 'Enter' || e.key === 'Tab' || e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+          e.preventDefault();
+          return;
+        }
+      } else {
+        if (e.key === 'ArrowDown') {
+          e.preventDefault();
+          setHighlighted((h) => (h + 1) % candidates.length);
+          return;
+        }
+        if (e.key === 'ArrowUp') {
+          e.preventDefault();
+          setHighlighted((h) => (h - 1 + candidates.length) % candidates.length);
+          return;
+        }
+        if (e.key === 'Enter' || e.key === 'Tab') {
+          e.preventDefault();
+          selectMention(candidates[highlighted]);
+          return;
+        }
+      }
+    }
+    // Reached only when mention === null (dropdown closed): normal send.
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       handleSend();
     }
-  }, [handleSend]);
+  }, [mention, candidates, highlighted, selectMention, handleSend]);
+
+  // Close the dropdown on blur, but defer one tick so a row's onMouseDown
+  // (which keeps focus via preventDefault — Slice C) commits the pick first.
+  const handleBlur = useCallback(() => {
+    setTimeout(() => setMention(null), 0);
+  }, []);
+
+  // Caret coordinates for the dropdown anchor, from the LIVE selectionStart so
+  // the menu follows the typed query and wraps with it. Expressed relative to
+  // the wrapper (the dropdown's positioned ancestor): caret point + textarea
+  // bounding rect − wrapper rect. The dropdown opens upward from here. On
+  // NaN / throw, return null so the dropdown falls back to the corner anchor.
+  const mentionPosition = useMemo<{ left: number; top: number } | null>(() => {
+    if (!mention) return null;
+    const ta = inputRef.current;
+    const wrap = wrapperRef.current;
+    if (!ta || !wrap) return null;
+    try {
+      const caret = ta.selectionStart ?? input.length;
+      const coords = getCaretCoordinates(ta, caret);
+      if (!coords || Number.isNaN(coords.top) || Number.isNaN(coords.left)) return null;
+      const taRect = ta.getBoundingClientRect();
+      const wrapRect = wrap.getBoundingClientRect();
+      const left = taRect.left + coords.left - wrapRect.left;
+      const top = taRect.top + coords.top - wrapRect.top;
+      if (Number.isNaN(left) || Number.isNaN(top)) return null;
+      return { left, top };
+    } catch {
+      return null;
+    }
+  }, [mention, input]);
 
   const handleDragOver = useCallback((e: React.DragEvent) => {
     const types = e.dataTransfer.types;
@@ -162,7 +306,8 @@ export default function ChatInputBar({
     if (agentPayload) {
       try {
         const a = JSON.parse(agentPayload) as { id: string; title: string };
-        token = `[dashboard agent "${a.title}" #${a.id.substring(0, 6)}]`;
+        // Shared full-id token — same format as the "@"-mention path.
+        token = formatAgentToken(a);
       } catch {
         token = `@${agentPayload}`;
       }
@@ -215,7 +360,8 @@ export default function ChatInputBar({
 
   return (
     <div
-      className={`${showDragHandle ? '' : 'border-t '}px-3 py-2 ${
+      ref={wrapperRef}
+      className={`relative ${showDragHandle ? '' : 'border-t '}px-3 py-2 ${
         isLight ? 'border-[#d0d7de] bg-[#f6f8fa]' : 'border-gray-800/40 bg-surface-1/50'
       }`}
       onDragOver={handleDragOver}
@@ -250,8 +396,12 @@ export default function ChatInputBar({
         <textarea
           ref={inputRef}
           value={input}
-          onChange={(e) => updateInput(e.target.value)}
+          onChange={handleInputChange}
           onKeyDown={handleKeyDown}
+          onKeyUp={handleCaretSync}
+          onClick={handleCaretSync}
+          onSelect={handleCaretSync}
+          onBlur={handleBlur}
           disabled={isDisabled}
           placeholder={statusHint}
           rows={1}
@@ -268,6 +418,16 @@ export default function ChatInputBar({
           {sending ? '…' : 'Send'}
         </button>
       </div>
+      {mention && (
+        <AtMentionDropdown
+          candidates={candidates}
+          query={mention.query}
+          highlighted={highlighted}
+          onPick={selectMention}
+          onHover={setHighlighted}
+          position={mentionPosition}
+        />
+      )}
       {sendError ? (
         <div className="flex items-start gap-1.5 mt-1.5 px-2">
           <span className="inline-block w-1.5 h-1.5 mt-1.5 rounded-full bg-[var(--color-accent-red)] shrink-0" />

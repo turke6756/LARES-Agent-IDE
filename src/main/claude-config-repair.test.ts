@@ -7,9 +7,13 @@
 //   node dist/main/main/claude-config-repair.test.js
 
 import assert from 'node:assert/strict';
-import { repairClaudeJsonContent } from './claude-config-repair';
+import {
+  repairClaudeJsonContent,
+  runtimeRepairStep,
+  type RuntimeRepairIO,
+} from './claude-config-repair';
 
-interface TestCase { name: string; run(): void; }
+interface TestCase { name: string; run(): void | Promise<void>; }
 const tests: TestCase[] = [];
 function test(name: string, fn: () => void): void {
   tests.push({ name, run: fn });
@@ -128,13 +132,117 @@ test('only invalid backups → unrepairable', () => {
   assert.equal(result.content, undefined);
 });
 
+// ── runtime repair watcher (v3) ──────────────────────────────────────────────
+
+const NOW = 1_000_000;
+const CFG = { cooldownMs: 10_000, gateMs: 500 };
+
+function fakeIO(reads: (string | null)[], backups: string[] = [], now = NOW) {
+  let i = 0, readsCount = 0;
+  const writes: { corruptedText: string; content: string; stamp: number }[] = [];
+  const io: RuntimeRepairIO = {
+    read: async () => { readsCount++; return reads[Math.min(i++, reads.length - 1)]; },
+    sleep: async () => {},
+    loadBackups: () => backups,
+    applyRepair: (corruptedText, content, stamp) => writes.push({ corruptedText, content, stamp }),
+    now: () => now,
+  };
+  return { io, writes, readsCount: () => readsCount };
+}
+
+test('runtime: healthy file → healthy, no write', async () => {
+  const { io, writes } = fakeIO(['{"a":1}']);
+  assert.equal(await runtimeRepairStep(io, { inFlight: false, lastRepairAt: 0 }, CFG), 'healthy');
+  assert.equal(writes.length, 0);
+});
+
+test('runtime: stable+invalid with backup → repaired, one canonical write (V1)', async () => {
+  const { io, writes } = fakeIO([SPLICE_CORRUPTED, SPLICE_CORRUPTED, SPLICE_CORRUPTED], [SPLICE_BACKUP]);
+  const state = { inFlight: false, lastRepairAt: 0 };
+  assert.equal(await runtimeRepairStep(io, state, CFG), 'repaired');
+  assert.equal(writes.length, 1);
+  const parsed = JSON.parse(writes[0].content);
+  assert.equal(writes[0].content, JSON.stringify(parsed), 'write must be canonical');
+  assert.equal(writes[0].corruptedText, SPLICE_CORRUPTED,
+    'stash must be the exact gated bytes, not a fresh re-read');
+  assert.equal(writes[0].stamp, NOW, 'single clock read drives stash + lastRepairAt');
+  assert.equal(state.inFlight, false, 'reentrancy lock released');
+  assert.equal(state.lastRepairAt, NOW, 'cooldown stamp set');
+});
+
+test('runtime: trailing-garbage with no backup → repaired (truncated)', async () => {
+  const good = '{"a":1,"b":2}';
+  const corrupted = good + ']]]garbage';
+  const { io, writes } = fakeIO([corrupted, corrupted, corrupted], []);
+  assert.equal(await runtimeRepairStep(io, { inFlight: false, lastRepairAt: 0 }, CFG), 'repaired');
+  assert.deepEqual(JSON.parse(writes[0].content), JSON.parse(good));
+});
+
+test('runtime: churning file → churning, NO write (V2)', async () => {
+  const { io, writes } = fakeIO(['{"x":1,"tengu_', '{"x":2,"tengu_aa', '{"x":3,"tengu_bbb']);
+  assert.equal(await runtimeRepairStep(io, { inFlight: false, lastRepairAt: 0 }, CFG), 'churning');
+  assert.equal(writes.length, 0, 'must not write while the herd is mid-flush');
+});
+
+test('runtime: external writer heals during gate → healed-externally, no write', async () => {
+  const { io, writes } = fakeIO(['{"a":1,"bad', '{"a":1,"good":true}']);
+  assert.equal(await runtimeRepairStep(io, { inFlight: false, lastRepairAt: 0 }, CFG), 'healed-externally');
+  assert.equal(writes.length, 0);
+});
+
+test('runtime: heals on third read after one churn step → healed-externally', async () => {
+  const { io, writes } = fakeIO(['{"a":1,"bad', '{"a":1,"diff', '{"a":1,"ok":1}']);
+  assert.equal(await runtimeRepairStep(io, { inFlight: false, lastRepairAt: 0 }, CFG), 'healed-externally');
+  assert.equal(writes.length, 0);
+});
+
+// FINAL compare-before-write: file turns VALID between stable read and replace.
+test('runtime: final reread valid → healed-externally, NO write', async () => {
+  const { io, writes } = fakeIO([SPLICE_CORRUPTED, SPLICE_CORRUPTED, '{"healed":true}'], [SPLICE_BACKUP]);
+  assert.equal(await runtimeRepairStep(io, { inFlight: false, lastRepairAt: 0 }, CFG), 'healed-externally');
+  assert.equal(writes.length, 0, 'must not clobber a writer that just produced valid JSON');
+});
+
+// FINAL compare-before-write: file changes to a DIFFERENT invalid value.
+test('runtime: final reread changed-invalid → churning, NO write', async () => {
+  const { io, writes } = fakeIO([SPLICE_CORRUPTED, SPLICE_CORRUPTED, SPLICE_CORRUPTED + 'X'], [SPLICE_BACKUP]);
+  assert.equal(await runtimeRepairStep(io, { inFlight: false, lastRepairAt: 0 }, CFG), 'churning');
+  assert.equal(writes.length, 0, 'must not write bytes that changed after repair was computed');
+});
+
+test('runtime: cooldown active → cooldown, file never read', async () => {
+  const { io, writes, readsCount } = fakeIO(['{"broken'], [], 1_005_000);
+  assert.equal(await runtimeRepairStep(io, { inFlight: false, lastRepairAt: 1_000_000 }, CFG), 'cooldown');
+  assert.equal(readsCount(), 0);
+  assert.equal(writes.length, 0);
+});
+
+test('runtime: reentrancy guard → inflight, no I/O', async () => {
+  const { io, writes, readsCount } = fakeIO(['{"broken']);
+  assert.equal(await runtimeRepairStep(io, { inFlight: true, lastRepairAt: 0 }, CFG), 'inflight');
+  assert.equal(readsCount(), 0);
+  assert.equal(writes.length, 0);
+});
+
+test('runtime: stable+invalid but no valid backup → unrepairable, no write', async () => {
+  const c = '{"a":2,"newkey":["new1","ne,"zzz":{"q":1}}';
+  const { io, writes } = fakeIO([c, c, c], []);
+  assert.equal(await runtimeRepairStep(io, { inFlight: false, lastRepairAt: 0 }, CFG), 'unrepairable');
+  assert.equal(writes.length, 0);
+});
+
+test('runtime: missing file → missing', async () => {
+  const { io } = fakeIO([null]);
+  assert.equal(await runtimeRepairStep(io, { inFlight: false, lastRepairAt: 0 }, CFG), 'missing');
+});
+
 // ── Run ─────────────────────────────────────────────────────────────────────
 
-(() => {
+(async () => {
   let failed = 0;
   for (const t of tests) {
     try {
-      t.run();
+      await t.run();
       console.log(`  ✓ ${t.name}`);
     } catch (err) {
       failed++;

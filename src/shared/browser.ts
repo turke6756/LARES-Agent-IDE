@@ -299,6 +299,16 @@ export interface AccessRule {
    *  from the request's workspace on an approval — never from agent tool args.
    *  Additive/optional — absent/null = the legacy default. */
   workspaceId?: string | null;
+  /** Signed-in-tabs (on-demand user sign-in): epoch-ms the human acknowledged the
+   *  4-point sharing consent when this rule became `allow_signed_in`. Stamped
+   *  trust-side at toggle-on / approval (WI-5). null/absent = not yet acknowledged
+   *  (legacy `allow_signed_in` rows created before consent gating). Additive. */
+  consentAckedAt?: number | null;
+  /** Signed-in-tabs: optional per-rule login-wall tuning patterns (glob or plain
+   *  substring, NOT arbitrary regex) that EXTEND the default warm-expiry heuristic
+   *  for false-positive-prone SSO/board origins. Empty/absent = defaults only.
+   *  Stored as a JSON array. Additive. */
+  loginUrlPatterns?: string[];
 }
 
 export interface AccessRuleInput {
@@ -312,6 +322,12 @@ export interface AccessRuleInput {
   /** Slice-4: the workspace to scope this rule to. Set trust-side (the manager
    *  stamps the human's selected workspace); the renderer never sends it. */
   workspaceId?: string | null;
+  /** Signed-in-tabs: epoch-ms the 4-point sharing consent was acknowledged (set
+   *  trust-side when an origin opts into `allow_signed_in`). Additive. */
+  consentAckedAt?: number | null;
+  /** Signed-in-tabs: per-rule login-wall tuning patterns (glob/substring). The
+   *  store JSON-encodes these; an empty/absent array means defaults only. */
+  loginUrlPatterns?: string[];
 }
 
 /** §18: an agent-initiated access request awaiting human approval. Inert —
@@ -361,10 +377,73 @@ export interface AccessHandoffResult {
   tabId: string;
 }
 
+// ── Signed-in tabs (on-demand user sign-in for research agents) ──────────────
+// The third lifecycle state for an `allow_signed_in` origin. `pending_signin` /
+// `signin_unavailable` are NORMAL structured results — NOT a PolicyError / 403:
+// researchers must treat `pending_signin` as "wait, a human is signing in", and
+// `signin_unavailable` as "blocked, degrade", never as access-denied. WI-4
+// threads this union through BrowserToolProvider / api-server / mcp-browser-tools.
+
+/** The signin-required envelope returned (in place of page content / a snapshot)
+ *  by `browser_open_url` and every page-producing verb against a pending/expired
+ *  `allow_signed_in` origin. `ok:false` is intentional but it is NOT a denial. */
+export interface SigninPendingResult {
+  ok: false;
+  status: 'pending_signin' | 'signin_unavailable';
+  /** new URL(url).origin of the triggering navigation. */
+  origin: string;
+  /** Stable per-(workspace,origin) request id the agent polls on; present for
+   *  the `pending_signin` case. */
+  requestId?: string;
+  message: string;
+}
+
+/** One entry of the `signin_pending` array returned by
+ *  `browser_list_my_access_requests` — the workspace-scoped rollup of the
+ *  runtime SigninSession registry in WIRE vocabulary. The registry's internal
+ *  `'pending' | 'ready' | 'unavailable'` states map to
+ *  `'pending_signin' | 'ready' | 'signin_unavailable'` here; the researcher
+ *  polls `state` for these exact values, so the mapping is part of the contract.
+ *  `request_id` = `${workspaceId ?? ''}|${origin}` (the same id on the envelope);
+ *  `since` is the epoch-ms the sign-in tab was surfaced. */
+export interface SigninPendingEntry {
+  origin: string;
+  state: 'pending_signin' | 'ready' | 'signin_unavailable';
+  request_id: string;
+  since: number;
+}
+
+/** Manager `openUrl` (toolOpenUrl) result union: a normal tab snapshot on the
+ *  drive path, or the signin envelope when the origin needs a human sign-in. */
+export type OpenUrlResultUnion =
+  | { tabId: string; url: string; partition: BrowserPartition; pageSnapshot?: string }
+  | SigninPendingResult;
+
+/** Event payload (main→renderer, browser:signin-pending-opened): a quarantined
+ *  JIT sign-in tab was surfaced because an agent navigated to an `allow_signed_in`
+ *  origin with no live session. The banner names the origin + waiting agent. */
+export interface SigninPendingOpened {
+  workspaceId: string | null;
+  origin: string;
+  tabId: string;
+  reason: string;
+}
+
+/** Event payload (main→renderer, browser:signin-resolved): a pending sign-in was
+ *  resolved — `'ready'` (human completed → banner clears, pollers proceed) or
+ *  `'signin_unavailable'` (timeout / cancel / unattended → degrade to block-stub). */
+export interface SigninResolved {
+  origin: string;
+  state: 'ready' | 'signin_unavailable';
+}
+
 // ── Slice 12: handoff / session center ───────────────────────────────────────
 
-/** A persisted authenticated origin shared with an agent (§13 row + session-age
- *  fields). Timestamps are epoch ms; null = unknown (legacy row / not yet set). */
+/** An entry in the allowlist-driven "Sessions shared with agents" center. Either
+ *  a persisted authenticated origin (§13 row + session-age fields) OR an enabled
+ *  `allow_signed_in` rule that has no session row yet (`state: 'never'`), so the
+ *  human can proactively sign in before any agent hits the site. Timestamps are
+ *  epoch ms; null/absent = unknown (legacy row / never signed in). */
 export interface SignedInOrigin {
   ruleId: string;
   hostname: string;
@@ -372,12 +451,25 @@ export interface SignedInOrigin {
   workspaceId: string | null;
   /** Whether the governing rule still grants authenticated-drive. */
   allowSignedIn: boolean;
-  /** First/most-recent successful handoff-ready commit. */
-  signedInAt: number | null;
-  /** Last time an agent drove the authenticated origin. */
-  lastUsedAt: number | null;
+  /** Proactive-signin (2026-06-29): the row's sign-in lifecycle for the UI —
+   *  `'signed_in'` (active session, not stale), `'expired'` (session row exists
+   *  but is stale / hit a login wall — offer re-sign-in), `'never'` (an enabled
+   *  `allow_signed_in` rule with no session row yet — offer a primary "Sign in").
+   *  Derived from `sessionState` + the staleness heuristic; the renderer falls
+   *  back to `stale` when absent (legacy payloads). */
+  state: 'signed_in' | 'expired' | 'never';
+  /** First/most-recent successful handoff-ready commit. Absent for `never`. */
+  signedInAt?: number | null;
+  /** Last time an agent drove the authenticated origin. Absent for `never`. */
+  lastUsedAt?: number | null;
   /** Optional explicit re-verification timestamp. */
   verifiedAt: number | null;
+  /** Signed-in-tabs (on-demand user sign-in): the durable session lifecycle for
+   *  this origin. `'active'` = a live confirmed session (drive normally);
+   *  `'expired'` = a login-wall redirect / explicit expiry was detected, so the
+   *  next agent nav re-enters the sign-in flow (the row + durable consent are
+   *  preserved). Legacy rows default to `'active'`. */
+  sessionState: 'active' | 'expired';
   /** Heuristic: the session may have expired (stale by age or the rule no longer
    *  grants authenticated-drive) → the UI offers a re-sign-in chip. */
   stale: boolean;
@@ -674,6 +766,40 @@ export const BROWSER_CHANNELS = {
   accessTabReturnToHuman: 'browser:tab-return-to-human',
   /** (ruleId) → void — per-row "Clear agent session" → clearAgentSiteData (§14). */
   accessClearSiteSession: 'browser:access-clear-site-session',
+  /** (ruleId) → { imported, origin } — WI-E "Import my session": copy the human's
+   *  persist:user cookies for the rule's origin into the workspace agent
+   *  partition. HUMAN-CHROME-ONLY; never an agent-facing MCP verb. */
+  accessImportUserSession: 'browser:access:import-user-session',
+
+  // ── Signed-in tabs (on-demand user sign-in for research agents) ─────────────
+  // The JIT sign-in lifecycle events + the cancel control path (WI-2/WI-3). The
+  // *-opened / *-resolved channels are main→renderer pushes that drive the JIT
+  // banner; *-cancel is a trusted-chrome invoke (the banner's "Cancel" button).
+  /** event main→renderer (SigninPendingOpened) — a quarantined JIT sign-in tab
+   *  was surfaced; the banner names the origin + waiting agent. */
+  signinPendingOpened: 'browser:signin-pending-opened',
+  /** event main→renderer (SigninResolved) — the pending sign-in resolved
+   *  (ready | signin_unavailable); the banner clears. */
+  signinResolved: 'browser:signin-resolved',
+  /** (tabId) → void — Cancel the in-progress sign-in: mark the session
+   *  unavailable, close the quarantined tab, emit resolved. Does NOT clear the
+   *  rule's durable consent (consent_acked_at stays). Trusted-chrome only. */
+  signinPendingCancel: 'browser:signin-pending-cancel',
+
+  // ── Signed-in tabs (WI-8): JIT sign-in config (timeout + unattended flag) ───
+  // Trusted-chrome only. The hold timeout drives the WI-3 degrade timer; the
+  // per-workspace unattended flag makes ensureSignedInOrPend skip the tab and
+  // return `unavailable` immediately (overnight JSI runs).
+  /** () → number — the current sign-in hold timeout in ms (default 300000). */
+  getSigninHoldTimeoutMs: 'browser:get-signin-hold-timeout',
+  /** (ms: number) → void — set the hold timeout; a 0/negative value is rejected
+   *  by the manager (the prior value stands). */
+  setSigninHoldTimeoutMs: 'browser:set-signin-hold-timeout',
+  /** (workspaceId: string | null, unattended: boolean) → void — flip the
+   *  per-workspace unattended flag ('' key = legacy/null workspace). */
+  setSigninUnattended: 'browser:set-signin-unattended',
+  /** (workspaceId: string | null) → boolean — read the per-workspace flag. */
+  isSigninUnattended: 'browser:is-signin-unattended',
 
   // ── Slice 12: handoff / session center ─────────────────────────────────────
   /** () → SharedAgentSessions — live handed tabs + persisted signed-in origins

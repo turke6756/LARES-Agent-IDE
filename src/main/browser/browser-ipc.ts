@@ -197,6 +197,36 @@ export function registerBrowserIpc(manager: BrowserManager): void {
   ipcMain.handle(BROWSER_CHANNELS.accessClearSiteSession, (_e, ruleId: string) =>
     manager.accessClearSiteSession(ruleId),
   );
+  // WI-E "Import my session": HUMAN-CHROME-ONLY (renderer). Never an agent verb —
+  // copies the human's persist:user cookies into the workspace agent partition.
+  ipcMain.handle(BROWSER_CHANNELS.accessImportUserSession, (_e, ruleId: string) =>
+    manager.importUserSessionForRule(ruleId),
+  );
+
+  // Signed-in tabs (WI-3): Cancel an in-progress JIT sign-in (the banner's
+  // "Cancel"). Marks the session unavailable + closes the quarantined tab;
+  // durable consent is preserved. The *-opened/*-resolved events are pushed
+  // main → renderer from the manager directly.
+  ipcMain.handle(BROWSER_CHANNELS.signinPendingCancel, (_e, tabId: string) =>
+    manager.accessSigninPendingCancel(tabId),
+  );
+
+  // Signed-in tabs (WI-8): JIT sign-in config — the hold-timeout round-trip and
+  // the per-workspace unattended flag. Trusted-chrome only (the settings UI).
+  ipcMain.handle(BROWSER_CHANNELS.getSigninHoldTimeoutMs, () =>
+    manager.getSigninHoldTimeoutMs(),
+  );
+  ipcMain.handle(BROWSER_CHANNELS.setSigninHoldTimeoutMs, (_e, ms: number) =>
+    manager.setSigninHoldTimeoutMs(ms),
+  );
+  ipcMain.handle(
+    BROWSER_CHANNELS.setSigninUnattended,
+    (_e, workspaceId: string | null, unattended: boolean) =>
+      manager.setSigninUnattended(workspaceId, unattended),
+  );
+  ipcMain.handle(BROWSER_CHANNELS.isSigninUnattended, (_e, workspaceId: string | null) =>
+    manager.isSigninUnattended(workspaceId),
+  );
 
   // Slice 12 (handoff / session center): the "Sessions shared with agents"
   // snapshot — live handed tabs + persisted signed-in origins. Trusted chrome

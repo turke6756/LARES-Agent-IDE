@@ -16,6 +16,7 @@ import http from 'http';
 import { ApiServer, BrowserToolProvider } from './api-server';
 import { getApiToken } from './security/api-auth';
 import type { AgentSupervisor } from './supervisor';
+import type { SigninPendingResult } from '../shared/browser';
 
 interface TestCase { name: string; run(): Promise<void> | void; }
 const tests: TestCase[] = [];
@@ -112,9 +113,29 @@ function makeFakeTools(overrides: Partial<BrowserToolProvider> = {}): BrowserToo
       calls.push(['listMyAccessRequests', agentId]);
       return [{ id: 'req-1', hostname: input_host_for(agentId), status: 'pending', requestedBy: agentId }];
     },
+    listSigninPending: (workspaceId: string | null) => {
+      calls.push(['listSigninPending', workspaceId]);
+      return [];
+    },
     ...overrides,
   };
 }
+
+// WI-4: the two signin envelopes the manager hands back in place of content /
+// a snapshot. Wire strings are frozen ('pending_signin' | 'signin_unavailable').
+const PENDING_ENVELOPE: SigninPendingResult = {
+  ok: false,
+  status: 'pending_signin',
+  origin: 'https://news.example.com',
+  requestId: 'ws-1|https://news.example.com',
+  message: 'Human sign-in required and in progress; poll browser_list_my_access_requests and retry.',
+};
+const UNAVAILABLE_ENVELOPE: SigninPendingResult = {
+  ok: false,
+  status: 'signin_unavailable',
+  origin: 'https://news.example.com',
+  message: 'Sign-in not completed; treat as blocked.',
+};
 
 /** Tiny helper so the fake's my-requests payload varies by agent id (keeps the
  *  route test honest that the id is threaded through). */
@@ -517,6 +538,96 @@ test('GET access/my-requests: requires agentId, threads it to the provider', () 
     assert.deepEqual(tools.calls[0], ['listMyAccessRequests', 'agent-7']);
   });
 });
+
+// ── §4 WI-4: signed-in tabs — pending/unavailable envelopes pass through ─────
+// The signin envelope is a NORMAL structured result (ok:false), NOT a denial:
+// every page-producing/action verb forwards it whole as a 200 JSON body, and
+// open-url returns it instead of a 403. The list route carries the
+// workspace-scoped signin_pending rollup alongside requests.
+
+/** The 12 page-producing/action verbs that may resolve to the signin envelope,
+ *  with the route + a minimal valid body + the fake override for each. */
+const SIGNIN_VERBS: Array<{
+  name: string;
+  method: string;
+  path: string;
+  body?: unknown;
+  override: (env: SigninPendingResult) => Partial<BrowserToolProvider>;
+}> = [
+  { name: 'getPageText', method: 'GET', path: '/api/browser/tab-1/text', override: (e) => ({ getPageText: async () => e }) },
+  { name: 'readPage', method: 'GET', path: '/api/browser/tab-1/page', override: (e) => ({ readPage: async () => e }) },
+  { name: 'screenshot', method: 'POST', path: '/api/browser/tab-1/screenshot', override: (e) => ({ screenshot: async () => e }) },
+  { name: 'click', method: 'POST', path: '/api/browser/tab-1/click', body: { ref: 1 }, override: (e) => ({ click: async () => e }) },
+  { name: 'type', method: 'POST', path: '/api/browser/tab-1/type', body: { ref: 1, text: 'x' }, override: (e) => ({ type: async () => e }) },
+  { name: 'pressKey', method: 'POST', path: '/api/browser/tab-1/press-key', body: { key: 'Enter' }, override: (e) => ({ pressKey: async () => e }) },
+  { name: 'selectOption', method: 'POST', path: '/api/browser/tab-1/select-option', body: { ref: 1, value: 'x' }, override: (e) => ({ selectOption: async () => e }) },
+  { name: 'scroll', method: 'POST', path: '/api/browser/tab-1/scroll', body: { dy: 10 }, override: (e) => ({ scroll: async () => e }) },
+  { name: 'goBack', method: 'POST', path: '/api/browser/tab-1/go-back', override: (e) => ({ goBack: async () => e }) },
+  { name: 'goForward', method: 'POST', path: '/api/browser/tab-1/go-forward', override: (e) => ({ goForward: async () => e }) },
+  { name: 'reload', method: 'POST', path: '/api/browser/tab-1/reload', override: (e) => ({ reload: async () => e }) },
+  { name: 'waitFor', method: 'POST', path: '/api/browser/tab-1/wait-for', body: { text: 'x' }, override: (e) => ({ waitFor: async () => e }) },
+];
+
+for (const verb of SIGNIN_VERBS) {
+  test(`WI-4: ${verb.name} returns the pending_signin envelope (200, not content, not 403)`, () =>
+    withServer(makeFakeTools(verb.override(PENDING_ENVELOPE)), async (port) => {
+      const res = await request(port, verb.method, verb.path, AUTH, verb.body);
+      assert.equal(res.status, 200, `${verb.name} should be 200, got ${res.status}`);
+      const body = JSON.parse(res.body);
+      assert.equal(body.ok, false);
+      assert.equal(body.status, 'pending_signin');
+      assert.equal(body.origin, 'https://news.example.com');
+      assert.equal(body.requestId, 'ws-1|https://news.example.com');
+      // It must NOT be wrapped as content (no snapshot/text/page/base64Png key).
+      assert.equal(body.snapshot, undefined);
+      assert.equal(body.text, undefined);
+      assert.equal(body.page, undefined);
+      assert.equal(body.base64Png, undefined);
+    }));
+}
+
+test('WI-4: open-url returns the signin envelope as a normal 200, never a 403', () =>
+  withServer(makeFakeTools({ openUrl: async () => PENDING_ENVELOPE }), async (port) => {
+    const res = await request(port, 'POST', '/api/browser/open-url', AUTH, { url: 'https://news.example.com' });
+    assert.equal(res.status, 200);
+    const body = JSON.parse(res.body);
+    assert.equal(body.ok, false);
+    assert.equal(body.status, 'pending_signin');
+    assert.equal(body.origin, 'https://news.example.com');
+    // Not the normal snapshot envelope.
+    assert.equal(body.snapshot, undefined);
+  }));
+
+test('WI-4: signinUnattended → open-url returns signin_unavailable (degrade, not 403)', () =>
+  withServer(makeFakeTools({ openUrl: async () => UNAVAILABLE_ENVELOPE }), async (port) => {
+    const res = await request(port, 'POST', '/api/browser/open-url', AUTH, { url: 'https://news.example.com' });
+    assert.equal(res.status, 200);
+    const body = JSON.parse(res.body);
+    assert.equal(body.ok, false);
+    assert.equal(body.status, 'signin_unavailable');
+    assert.equal(body.requestId, undefined); // unavailable carries no poll id
+  }));
+
+test('WI-4: my-requests returns { requests, signin_pending }, workspace-scoped', () =>
+  withServer(
+    makeFakeTools({
+      listSigninPending: (workspaceId) => [{
+        origin: 'https://news.example.com',
+        state: 'pending_signin',
+        request_id: `${workspaceId ?? ''}|https://news.example.com`,
+        since: 1000,
+      }],
+    }),
+    async (port) => {
+      const res = await request(port, 'GET', '/api/browser/access/my-requests?agentId=agent-7', AUTH);
+      assert.equal(res.status, 200);
+      const body = JSON.parse(res.body);
+      assert.equal(body.requests[0].requestedBy, 'agent-7');
+      assert.equal(body.signin_pending.length, 1);
+      assert.equal(body.signin_pending[0].state, 'pending_signin');
+      assert.equal(body.signin_pending[0].origin, 'https://news.example.com');
+    },
+  ));
 
 // ── Run ────────────────────────────────────────────────────────────────────
 

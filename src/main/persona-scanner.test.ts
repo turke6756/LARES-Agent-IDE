@@ -28,7 +28,15 @@ import * as path from 'node:path';
 import {
   scanPersonas, scaffoldPersona, migratePersonas,
   ensurePersonaScaffold, readPersonaLane, applyPersonaLaneToLaunchInput,
+  setPersonaLane,
 } from './persona-scanner';
+import {
+  SUPERVISOR_PERSONA_CLAUDE_SETTINGS_JSON,
+  SUPERVISOR_CLAUDE_SETTINGS_JSON,
+  WORKER_CLAUDE_SETTINGS_JSON,
+  WORKER_CLAUDE_SETTINGS_JSON_V5,
+} from '../shared/constants';
+import { sha256Hex } from './scaffold-writer';
 
 interface TestCase { name: string; run(): void; }
 const tests: TestCase[] = [];
@@ -117,6 +125,120 @@ test('persona.json (lane sidecar) is preserved byte-for-byte across kit upgrades
   assert.equal(readPersonaLane(ws, 'windows', 'orchestra'), 'supervisor');
 });
 
+// ── lane-aware settings.json variant (hook-driven waiting status) ────
+
+test('a supervisor-lane persona gets SUPERVISOR_PERSONA settings (double-`..` path + Notification hook)', () => {
+  const ws = freshWorkspace();
+  scaffoldPersona(ws, 'windows', 'orchestrator', undefined, 'supervisor');
+  const settings = agentFile(ws, 'orchestrator', '.claude', 'settings.json');
+  const body = fs.readFileSync(settings, 'utf-8');
+  // Byte-identical to the supervisor-persona constant (double-dotdot ../../scripts).
+  assert.equal(body, SUPERVISOR_PERSONA_CLAUDE_SETTINGS_JSON,
+    'supervisor-lane persona settings == SUPERVISOR_PERSONA_CLAUDE_SETTINGS_JSON');
+  // It carries the Notification → waiting hook on the persona-depth (../../scripts) path.
+  assert.ok(body.includes('"Notification"'), 'supervisor-lane persona has a Notification hook');
+  assert.ok(body.includes('../../scripts/dashboard-status.mjs'), 'persona depth: double-`..` script path');
+  assert.ok(body.includes('dashboard-status.mjs\\" waiting') || body.includes('dashboard-status.mjs" waiting'),
+    'Notification hook invokes the script with the waiting arg');
+  // It must NOT be the supervisor's single-`..` ../scripts variant (silent no-op
+  // footgun: a persona at .dashboard/agents/<name>/ needs ../../scripts).
+  assert.notEqual(body, SUPERVISOR_CLAUDE_SETTINGS_JSON,
+    'persona must NOT receive the supervisor single-`..` settings variant');
+});
+
+test('a non-lane persona gets the WORKER settings variant (now also carrying the Notification hook)', () => {
+  const ws = freshWorkspace();
+  scaffoldPersona(ws, 'windows', 'plainworker'); // no lane
+  const settings = agentFile(ws, 'plainworker', '.claude', 'settings.json');
+  const body = fs.readFileSync(settings, 'utf-8');
+  assert.equal(body, WORKER_CLAUDE_SETTINGS_JSON,
+    'non-lane persona settings == WORKER_CLAUDE_SETTINGS_JSON');
+  // The worker variant must NOT be the supervisor's single-`..` settings.
+  assert.notEqual(body, SUPERVISOR_CLAUDE_SETTINGS_JSON,
+    'non-lane persona must NOT get the supervisor single-`..` variant');
+  // The worker variant gained the Notification hook in this feature.
+  assert.ok(body.includes('"Notification"'), 'worker variant now carries the Notification hook');
+  assert.ok(body.includes('../../scripts/dashboard-status.mjs'), 'worker variant uses the double-`..` path');
+});
+
+test('worker/researcher-lane personas get the WORKER settings variant (not the supervisor one)', () => {
+  const ws = freshWorkspace();
+  scaffoldPersona(ws, 'windows', 'w-lane', undefined, 'worker');
+  scaffoldPersona(ws, 'windows', 'r-lane', undefined, 'researcher');
+  for (const name of ['w-lane', 'r-lane']) {
+    const body = fs.readFileSync(agentFile(ws, name, '.claude', 'settings.json'), 'utf-8');
+    assert.equal(body, WORKER_CLAUDE_SETTINGS_JSON, `${name} gets the worker settings variant`);
+  }
+});
+
+test('persona settings.json is managed at version 2 with previousHashes[1] = pre-Notification worker hash', () => {
+  const ws = freshWorkspace();
+  scaffoldPersona(ws, 'windows', 'versioned', undefined, 'supervisor');
+  // The managed sidecar records the on-disk version: bumped 1 → 2 because the
+  // worker body gained the Notification hook.
+  const sc = readSidecar(ws);
+  assert.equal(sc['agents/versioned/.claude/settings.json'], 2,
+    'persona settings.json is managed at version 2');
+  // The previousHashes[1] anchor is the pre-Notification (v5) worker body hash, so
+  // a pre-Notification on-disk persona upgrades silently. Assert the anchor const
+  // exists and differs from the now-current content hashes.
+  const v5Hash = sha256Hex(WORKER_CLAUDE_SETTINGS_JSON_V5);
+  assert.notEqual(v5Hash, sha256Hex(WORKER_CLAUDE_SETTINGS_JSON),
+    'pre-Notification (v5) hash differs from the current worker body');
+  assert.notEqual(v5Hash, sha256Hex(SUPERVISOR_PERSONA_CLAUDE_SETTINGS_JSON),
+    'pre-Notification (v5) hash differs from the supervisor-persona body');
+});
+
+test('a persona with the pre-Notification worker settings on disk upgrades SILENTLY (no .bak)', () => {
+  const ws = freshWorkspace();
+  // Pre-create a supervisor-lane persona dir holding the OLD (pre-Notification,
+  // v5) worker settings — the exact bytes previousHashes[1] anchors.
+  fs.mkdirSync(agentFile(ws, 'legacy-sup', '.claude'), { recursive: true });
+  fs.writeFileSync(agentFile(ws, 'legacy-sup', 'persona.json'), '{ "lane": "supervisor" }\n', 'utf-8');
+  const settings = agentFile(ws, 'legacy-sup', '.claude', 'settings.json');
+  fs.writeFileSync(settings, WORKER_CLAUDE_SETTINGS_JSON_V5, 'utf-8');
+
+  ensurePersonaScaffold(ws, 'windows', 'legacy-sup');
+
+  // Content silently upgraded to the supervisor-persona variant.
+  assert.equal(fs.readFileSync(settings, 'utf-8'), SUPERVISOR_PERSONA_CLAUDE_SETTINGS_JSON,
+    'pre-Notification settings upgraded to the supervisor-persona variant');
+  // NO .bak written — the old bytes matched previousHashes[1], so it was a known
+  // outdated managed file, not a user edit.
+  const claudeEntries = fs.readdirSync(agentFile(ws, 'legacy-sup', '.claude'));
+  assert.ok(!claudeEntries.some(e => e.includes('.bak')),
+    'no .bak written when the on-disk hash matches previousHashes[1]');
+  assert.equal(readSidecar(ws)['agents/legacy-sup/.claude/settings.json'], 2,
+    'sidecar advanced to version 2 after the silent upgrade');
+});
+
+test('a non-lane persona with the pre-Notification worker settings upgrades SILENTLY to the worker variant', () => {
+  const ws = freshWorkspace();
+  fs.mkdirSync(agentFile(ws, 'legacy-wrk', '.claude'), { recursive: true });
+  // Seed CLAUDE.md so the persona is discoverable; no persona.json → no lane.
+  fs.writeFileSync(agentFile(ws, 'legacy-wrk', 'CLAUDE.md'), '# Legacy Wrk\n', 'utf-8');
+  const settings = agentFile(ws, 'legacy-wrk', '.claude', 'settings.json');
+  fs.writeFileSync(settings, WORKER_CLAUDE_SETTINGS_JSON_V5, 'utf-8');
+
+  ensurePersonaScaffold(ws, 'windows', 'legacy-wrk');
+
+  assert.equal(fs.readFileSync(settings, 'utf-8'), WORKER_CLAUDE_SETTINGS_JSON,
+    'no-lane persona upgrades to the worker (Notification-bearing) variant');
+  const claudeEntries = fs.readdirSync(agentFile(ws, 'legacy-wrk', '.claude'));
+  assert.ok(!claudeEntries.some(e => e.includes('.bak')), 'no .bak written for the silent worker upgrade');
+});
+
+test('applyPersonaLaneToLaunchInput still sets privilegeLane=supervisor and NOT isSupervisor for a supervisor-lane persona', () => {
+  const ws = freshWorkspace();
+  scaffoldPersona(ws, 'windows', 'priv-sup', undefined, 'supervisor');
+  const input: any = { persona: 'priv-sup' };
+  applyPersonaLaneToLaunchInput(input, ws, 'windows');
+  assert.equal(input.privilegeLane, 'supervisor',
+    'supervisor-lane persona carries the supervisor privilege lane');
+  assert.ok(!input.isSupervisor,
+    'supervisor-lane persona must NOT become the structural supervisor (#19 invariant)');
+});
+
 // ── seed-once identity (D4, MEMORY) ──────────────────────────────────
 
 test('ensurePersonaScaffold leaves a hand-written CLAUDE.md byte-unchanged (D4 seed-once)', () => {
@@ -167,9 +289,13 @@ test('applyPersonaLaneToLaunchInput maps each declared lane onto launch flags', 
   scaffoldPersona(ws, 'windows', 'p-res', undefined, 'researcher');
   scaffoldPersona(ws, 'windows', 'p-wrk', undefined, 'worker');
 
+  // #19 — the supervisor PRIVILEGE lane must NOT become the structural
+  // supervisor (isSupervisor stays falsy so the persona renders as its own
+  // card); it sets privilegeLane to carry the supervisor-tier toolset grant.
   const sup: any = { persona: 'p-sup' };
   applyPersonaLaneToLaunchInput(sup, ws, 'windows');
-  assert.equal(sup.isSupervisor, true);
+  assert.equal(sup.privilegeLane, 'supervisor');
+  assert.ok(!sup.isSupervisor, 'supervisor-lane persona must not set isSupervisor');
 
   const res: any = { persona: 'p-res', provider: 'codex' };
   applyPersonaLaneToLaunchInput(res, ws, 'windows');
@@ -257,6 +383,58 @@ test('scanPersonas implicitly migrates legacy personas', () => {
   const names = scanPersonas(ws, 'windows').map(p => p.name);
   assert.deepEqual(names, ['auto-migrated']);
   assert.ok(fs.existsSync(path.join(ws, '.dashboard', 'agents', 'auto-migrated', 'CLAUDE.md')));
+});
+
+// ── setPersonaLane: overwrite-capable lane editing for an EXISTING persona ──
+
+test('setPersonaLane writes a lane for a persona that had none', () => {
+  const ws = freshWorkspace();
+  scaffoldPersona(ws, 'windows', 'editme'); // no lane
+  assert.equal(readPersonaLane(ws, 'windows', 'editme'), undefined);
+  setPersonaLane(ws, 'windows', 'editme', 'worker');
+  const pj = agentFile(ws, 'editme', 'persona.json');
+  assert.ok(fs.existsSync(pj), 'persona.json written');
+  assert.deepEqual(JSON.parse(fs.readFileSync(pj, 'utf-8')), { lane: 'worker' });
+  assert.equal(readPersonaLane(ws, 'windows', 'editme'), 'worker');
+});
+
+test('setPersonaLane OVERWRITES an existing lane (unlike write-if-absent)', () => {
+  const ws = freshWorkspace();
+  scaffoldPersona(ws, 'windows', 'switcher', undefined, 'worker');
+  assert.equal(readPersonaLane(ws, 'windows', 'switcher'), 'worker');
+  setPersonaLane(ws, 'windows', 'switcher', 'supervisor');
+  assert.equal(readPersonaLane(ws, 'windows', 'switcher'), 'supervisor');
+  assert.deepEqual(
+    JSON.parse(fs.readFileSync(agentFile(ws, 'switcher', 'persona.json'), 'utf-8')),
+    { lane: 'supervisor' },
+  );
+});
+
+test('setPersonaLane(..., null) deletes persona.json (revert to legacy)', () => {
+  const ws = freshWorkspace();
+  scaffoldPersona(ws, 'windows', 'reverter', undefined, 'researcher');
+  const pj = agentFile(ws, 'reverter', 'persona.json');
+  assert.ok(fs.existsSync(pj), 'persona.json exists before revert');
+  setPersonaLane(ws, 'windows', 'reverter', null);
+  assert.ok(!fs.existsSync(pj), 'persona.json removed after null');
+  assert.equal(readPersonaLane(ws, 'windows', 'reverter'), undefined);
+  // Idempotent: null on a persona with no sidecar is a no-op (must not throw).
+  setPersonaLane(ws, 'windows', 'reverter', null);
+});
+
+test('setPersonaLane rejects an invalid lane', () => {
+  const ws = freshWorkspace();
+  scaffoldPersona(ws, 'windows', 'badlane');
+  assert.throws(() => setPersonaLane(ws, 'windows', 'badlane', 'bogus' as any),
+    /Invalid persona lane/);
+});
+
+test('setPersonaLane rejects an invalid name and the reserved supervisor name', () => {
+  const ws = freshWorkspace();
+  assert.throws(() => setPersonaLane(ws, 'windows', 'Bad Name', 'worker'),
+    /Invalid persona name/);
+  assert.throws(() => setPersonaLane(ws, 'windows', 'supervisor', 'worker'),
+    /reserved for supervisor/);
 });
 
 // ── Runner ───────────────────────────────────────────────────────────

@@ -259,6 +259,72 @@ test('Slice-4: same origin requested from two workspaces yields two distinct pen
   assert.notEqual(b.id, a.id, 'different workspaces → not deduped into one request');
 });
 
+// ── Signed-in tabs (WI-1): session lifecycle + per-rule consent / patterns ───
+
+test('WI-1: getSignedInOriginState — undefined when no row; active after upsert', () => {
+  const rule = store.insertRule({ hostname: 'wi1-state.com', scheme: 'https', includeSubdomains: true, allowSignedIn: true });
+  const origin = 'https://wi1-state.com';
+  assert.equal(store.getSignedInOriginState(rule.id, origin), undefined, 'no row → undefined (first-ever)');
+  store.upsertSignedInOrigin(rule.id, origin, null, { signedInAt: 1000, verifiedAt: 1000 });
+  assert.equal(store.getSignedInOriginState(rule.id, origin), 'active', 'an upsert records a live session');
+});
+
+test('WI-1: expireSignedInOrigin flips to expired WITHOUT deleting the row (durable consent preserved)', () => {
+  const rule = store.insertRule({ hostname: 'wi1-expire.com', scheme: 'https', includeSubdomains: true, allowSignedIn: true });
+  const origin = 'https://wi1-expire.com';
+  store.upsertSignedInOrigin(rule.id, origin);
+  store.expireSignedInOrigin(rule.id, origin, 2000);
+  assert.equal(store.getSignedInOriginState(rule.id, origin), 'expired', 'login-wall detection marks the session expired');
+  // The row survives (durable consent is the rule, but the origin tracking row stays).
+  assert.deepEqual(store.listSignedInOrigins(rule.id), [origin], 'the origin row is preserved, not deleted');
+});
+
+test('WI-1: re-upsert after expiry RESTORES active (re-sign-in is a refresh, not a re-grant)', () => {
+  const rule = store.insertRule({ hostname: 'wi1-restore.com', scheme: 'https', includeSubdomains: true, allowSignedIn: true });
+  const origin = 'https://wi1-restore.com';
+  store.upsertSignedInOrigin(rule.id, origin);
+  store.expireSignedInOrigin(rule.id, origin);
+  assert.equal(store.getSignedInOriginState(rule.id, origin), 'expired');
+  store.upsertSignedInOrigin(rule.id, origin, null, { signedInAt: 3000, verifiedAt: 3000 });
+  assert.equal(store.getSignedInOriginState(rule.id, origin), 'active', 'a fresh sign-in clears the expiry');
+});
+
+test('WI-1: expireSignedInOrigin is a no-op when no row exists (never-signed-in origin)', () => {
+  const rule = store.insertRule({ hostname: 'wi1-noop.com', scheme: 'https', includeSubdomains: true, allowSignedIn: true });
+  assert.doesNotThrow(() => store.expireSignedInOrigin(rule.id, 'https://wi1-noop.com'));
+  assert.equal(store.getSignedInOriginState(rule.id, 'https://wi1-noop.com'), undefined, 'still no row');
+});
+
+test('WI-1: listSharedSignedInOrigins reports sessionState + marks an expired session stale', () => {
+  const rule = store.insertRule({ hostname: 'wi1-shared.com', scheme: 'https', includeSubdomains: true, allowSignedIn: true });
+  const origin = 'https://wi1-shared.com';
+  store.upsertSignedInOrigin(rule.id, origin, null, { signedInAt: Date.now(), verifiedAt: Date.now() });
+  let row = store.listSharedSignedInOrigins(null).find((s) => s.origin === origin)!;
+  assert.ok(row, 'an active origin is listed');
+  assert.equal(row.sessionState, 'active');
+  assert.equal(row.stale, false, 'a fresh active session is not stale');
+  store.expireSignedInOrigin(rule.id, origin);
+  row = store.listSharedSignedInOrigins(null).find((s) => s.origin === origin)!;
+  assert.equal(row.sessionState, 'expired');
+  assert.equal(row.stale, true, 'an expired session is surfaced as stale (offer re-sign-in)');
+});
+
+test('WI-1: consent_acked_at + login_url_patterns round-trip through insert/get/update', () => {
+  const rule = store.insertRule({
+    hostname: 'wi1-consent.com', scheme: 'https', includeSubdomains: true, allowSignedIn: true,
+    consentAckedAt: 12345, loginUrlPatterns: ['*/candidate/*', 'auth-gate'],
+  });
+  assert.equal(rule.consentAckedAt, 12345, 'consent stamp returned from insert');
+  assert.deepEqual(rule.loginUrlPatterns, ['*/candidate/*', 'auth-gate'], 'patterns returned from insert');
+  const fetched = store.getRule(rule.id)!;
+  assert.equal(fetched.consentAckedAt, 12345, 'consent persisted');
+  assert.deepEqual(fetched.loginUrlPatterns, ['*/candidate/*', 'auth-gate'], 'patterns persisted (JSON column)');
+  // An empty patterns array collapses to undefined (defaults-only) on read.
+  const cleared = store.updateRule(rule.id, { loginUrlPatterns: [] });
+  assert.equal(cleared.loginUrlPatterns, undefined, 'empty patterns → undefined (defaults only)');
+  assert.equal(store.getRule(rule.id)?.consentAckedAt, 12345, 'consent untouched by an unrelated patch');
+});
+
 // ── Run ──────────────────────────────────────────────────────────────
 
 (async () => {

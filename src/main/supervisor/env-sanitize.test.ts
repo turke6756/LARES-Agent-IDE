@@ -36,6 +36,13 @@ function makePoisonedEnv(): Record<string, string | undefined> {
     USERPROFILE: 'C:\\Users\\fixture',
     AGENT_ID: 'agent-123',
     DASHBOARD_PORT: '4040',
+    // PHASE 0 (agent-ownership): the dashboard API credential injected into the
+    // agent process env must SURVIVE sanitization so the agent's Bash children
+    // inherit it (env-sanitize is a denylist, not an allowlist).
+    AGENT_DASHBOARD_API_TOKEN: 'tok-abc',
+    AGENT_DASHBOARD_API_PORT: '4040',
+    AGENT_DASHBOARD_API_HOST: '127.0.0.1',
+    AGENT_DASHBOARD_SELF_ID: 'agent-123',
   };
 }
 
@@ -69,6 +76,14 @@ test('sanitizeClaudeChildEnv preserves every innocent key, including CLAUDE_CODE
   assert.equal(out.DASHBOARD_PORT, '4040');
   const expectedKeys = Object.keys(input).filter((k) => !POISON_KEYS.includes(k));
   assert.deepEqual(Object.keys(out).sort(), expectedKeys.sort(), 'no extra removals, no additions');
+});
+
+test('sanitizeClaudeChildEnv preserves the PHASE 0 AGENT_DASHBOARD_* credential keys', () => {
+  const out = sanitizeClaudeChildEnv(makePoisonedEnv());
+  assert.equal(out.AGENT_DASHBOARD_API_TOKEN, 'tok-abc', 'token must survive sanitization');
+  assert.equal(out.AGENT_DASHBOARD_API_PORT, '4040');
+  assert.equal(out.AGENT_DASHBOARD_API_HOST, '127.0.0.1');
+  assert.equal(out.AGENT_DASHBOARD_SELF_ID, 'agent-123');
 });
 
 test('sanitizeClaudeChildEnv is pure — the input object is not mutated', () => {

@@ -113,7 +113,7 @@ function makeBridge(agents: Record<string, Agent>, supervisor: Agent | null): Br
   const delivered: Array<{ supervisorId: string; text: string }> = [];
   const deps: EventBridgeDeps = {
     getAgent: (id: string) => agents[id] ?? null,
-    getSupervisorForWorker: () => supervisor,
+    getOwnerForWorker: () => supervisor,
     sendInput: async (supervisorId: string, text: string) => { delivered.push({ supervisorId, text }); },
     addAuditEvent: () => {},
     getAgentLog: async () => 'log tail line',

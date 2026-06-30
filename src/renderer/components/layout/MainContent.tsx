@@ -6,7 +6,6 @@ import AgentLaunchDialog from '../agent/AgentLaunchDialog';
 import FileViewerPanel from '../fileviewer/FileViewerPanel';
 import BrowserPanel from '../browser/BrowserPanel';
 import { useBrowserStore, ensureBrowserBridge } from '../../stores/browser-store';
-import type { AgentStatus } from '../../../shared/types';
 import * as Icons from 'lucide-react';
 import vscodeIcon from '../../assets/material-icons/vscode.svg';
 
@@ -32,48 +31,23 @@ function useSwipe(onSwipe: () => void, direction: 'left' | 'right') {
   return { onPointerDown, onPointerUp };
 }
 
-const SUPERVISOR_STATUS_COLORS: Record<AgentStatus, { dot: string; border: string; bg: string }> = {
-  launching: { dot: 'bg-yellow-400', border: 'border-yellow-500/50', bg: 'hover:bg-yellow-500/10' },
-  working:   { dot: 'bg-green-400 animate-pulse', border: 'border-green-500/50', bg: 'hover:bg-green-500/10' },
-  receiving: { dot: 'bg-purple-400 animate-pulse', border: 'border-purple-500/50', bg: 'hover:bg-purple-500/10' },
-  idle:      { dot: 'bg-blue-400', border: 'border-blue-500/50', bg: 'hover:bg-blue-500/10' },
-  waiting:   { dot: 'bg-orange-400 animate-pulse', border: 'border-orange-500/50', bg: 'hover:bg-orange-500/10' },
-  done:      { dot: 'bg-gray-400', border: 'border-gray-500/50', bg: 'hover:bg-gray-500/10' },
-  crashed:   { dot: 'bg-red-400', border: 'border-red-500/50', bg: 'hover:bg-red-500/10' },
-  restarting:{ dot: 'bg-yellow-400 animate-pulse', border: 'border-yellow-500/50', bg: 'hover:bg-yellow-500/10' },
-};
-
 export default function MainContent() {
-  const { workspaces, selectedWorkspaceId, supervisorAgent, fileViewerOpen, browserOpen, openTabs, contextStats } = useDashboardStore(
+  const { workspaces, selectedWorkspaceId, fileViewerOpen, browserOpen, openTabs } = useDashboardStore(
     useShallow((s) => ({
       workspaces: s.workspaces,
       selectedWorkspaceId: s.selectedWorkspaceId,
-      supervisorAgent: s.supervisorAgent,
       fileViewerOpen: s.fileViewerOpen,
       browserOpen: s.browserOpen,
       openTabs: s.openTabs,
-      contextStats: s.contextStats,
     })),
   );
   const showFileViewer = useDashboardStore((s) => s.showFileViewer);
   const showBrowser = useDashboardStore((s) => s.showBrowser);
   const showDashboard = useDashboardStore((s) => s.showDashboard);
   const browserPaneAttention = useBrowserStore((s) => s.paneAttention);
-  const loadSupervisor = useDashboardStore((s) => s.loadSupervisor);
-  const launchSupervisor = useDashboardStore((s) => s.launchSupervisor);
-  const setTerminalAgent = useDashboardStore((s) => s.setTerminalAgent);
-  const selectAgent = useDashboardStore((s) => s.selectAgent);
   const [showLaunch, setShowLaunch] = useState(false);
-  const [supervisorLoading, setSupervisorLoading] = useState(false);
 
   const workspace = workspaces.find((w) => w.id === selectedWorkspaceId);
-
-  // Load supervisor status when workspace changes
-  useEffect(() => {
-    if (workspace) {
-      loadSupervisor(workspace.id);
-    }
-  }, [workspace?.id, loadSupervisor]);
 
   const swipeToFiles = useSwipe(() => showFileViewer(), 'left');
 
@@ -99,7 +73,6 @@ export default function MainContent() {
 
   const workspaceTabCount = openTabs.filter((t) => t.workspaceId === selectedWorkspaceId).length;
   const hasOpenTabs = workspaceTabCount > 0;
-  const supStats = supervisorAgent ? contextStats[supervisorAgent.id] : null;
   // Center-view dispatch — file viewer wins over the browser pane.
   const dashboardActive = !fileViewerOpen && !browserOpen;
 
@@ -133,72 +106,10 @@ export default function MainContent() {
           </div>
 
           <div className="flex items-center gap-4 app-no-drag">
-            {/* Supervisor Card */}
-            {supervisorAgent && !['done', 'crashed'].includes(supervisorAgent.status) ? (
-              <div className={`hidden md:flex items-center overflow-hidden border ${SUPERVISOR_STATUS_COLORS[supervisorAgent.status].border}`}>
-                <button
-                  onClick={() => {
-                    selectAgent(supervisorAgent.id);
-                    setTerminalAgent(supervisorAgent.id);
-                  }}
-                  className={`flex items-center gap-3 px-3 py-1.5 transition-colors ${SUPERVISOR_STATUS_COLORS[supervisorAgent.status].bg}`}
-                  title="Click to attach terminal"
-                >
-                  <div className="flex flex-col items-start gap-0.5">
-                    <div className="flex items-center gap-2">
-                      <span className={`w-2 h-2 rounded-full ${SUPERVISOR_STATUS_COLORS[supervisorAgent.status].dot}`} />
-                      <span className="text-[13px] font-semibold text-gray-100">Supervisor</span>
-                    </div>
-                    <span className="text-[11px] text-gray-400 ml-[16px] capitalize">{supervisorAgent.status}</span>
-                  </div>
-
-                  {supStats && (
-                    <div className="flex flex-col items-end gap-0.5 ml-3">
-                      <span className="text-[11px] font-sans text-gray-400">
-                        {Math.round(supStats.contextPercentage)}% ctx
-                      </span>
-                      <div className="w-20 h-1 bg-gray-700 rounded-full overflow-hidden">
-                        <div
-                          className={`h-full rounded-full ${
-                            supStats.contextPercentage > 80 ? 'bg-red-400' :
-                            supStats.contextPercentage > 50 ? 'bg-yellow-400' : 'bg-accent-green'
-                          }`}
-                          style={{ width: `${Math.min(supStats.contextPercentage, 100)}%` }}
-                        />
-                      </div>
-                    </div>
-                  )}
-                </button>
-                <div className={`w-px self-stretch ${SUPERVISOR_STATUS_COLORS[supervisorAgent.status].bg} opacity-40`} />
-                <button
-                  onClick={async () => {
-                    await window.api.agents.delete(supervisorAgent.id);
-                    loadSupervisor(workspace.id);
-                  }}
-                  className={`flex items-center justify-center w-10 self-stretch transition-colors hover:bg-red-500/20 ${SUPERVISOR_STATUS_COLORS[supervisorAgent.status].bg}`}
-                  title="Reset Supervisor (stops and clears session)"
-                >
-                  <Icons.X className="w-4 h-4 text-gray-400 hover:text-red-400" />
-                </button>
-              </div>
-            ) : (
-              <button
-                onClick={async () => {
-                  setSupervisorLoading(true);
-                  await launchSupervisor(workspace.id);
-                  setSupervisorLoading(false);
-                }}
-                disabled={supervisorLoading}
-                className="ui-btn ui-btn-outline ui-btn-purple hidden md:flex items-center gap-2 px-3 py-1.5"
-                title="Launch Supervisor Agent"
-              >
-                <Icons.Bot className="w-4 h-4" />
-                <span className="text-[13px] font-semibold">
-                  {supervisorLoading ? 'Launching...' : 'Supervisor'}
-                </span>
-              </button>
-            )}
-
+            {/* No workspace-supervisor singleton: a supervisor is just one of
+                the agent types in the Launch Agent dialog, launchable as many
+                times as wanted. Each renders as its own grid card with its
+                launched agents nested beneath (buildAgentForest). */}
             <div className="flex gap-2">
               <button
                 onClick={() => showDashboard()}

@@ -25,7 +25,8 @@ plans/
 .dashboard/workers/
 .dashboard/scripts/
 .dashboard/pending-status.jsonl
-.dashboard/supervisor/.claude/.sysprompt-*.txt
+.dashboard/*/.claude/.sysprompt-*.txt
+.dashboard/*/.claude/scheduled_tasks.lock
 .dashboard/main-crash.log
 
 # >>> agentdashboard-research-store >>>

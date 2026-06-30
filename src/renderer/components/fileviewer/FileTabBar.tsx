@@ -1,4 +1,5 @@
 import React, { useRef, useEffect, useState } from 'react';
+import { BarChart3 } from 'lucide-react';
 import type { FileTab } from '../../../shared/types';
 import { fileDragStart } from '../../utils/drag-file';
 import { useDashboardStore, type ColoredFileTab } from '../../stores/dashboard-store';
@@ -129,6 +130,7 @@ export default function FileTabBar({ tabs, activeTabId, onSelectTab, onCloseTab 
   const scrollRef = useRef<HTMLDivElement>(null);
   const tabEditState = useDashboardStore((state) => state.tabEditState);
   const moveTab = useDashboardStore((state) => state.moveTab);
+  const openToolTab = useDashboardStore((state) => state.openToolTab);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; tab: ColoredFileTab } | null>(null);
   const [draggedTabId, setDraggedTabId] = useState<string | null>(null);
   // True when the in-progress drag has already reordered tabs in-strip — used
@@ -233,7 +235,8 @@ export default function FileTabBar({ tabs, activeTabId, onSelectTab, onCloseTab 
           const isActive = tab.id === activeTabId;
           const isDragging = tab.id === draggedTabId;
           const displayLabel = getDisplayLabel(tab, tabs);
-          const dirty = !!tabEditState[tab.id]?.dirty;
+          const isTool = tab.kind === 'tool';
+          const dirty = !isTool && !!tabEditState[tab.id]?.dirty;
           return (
             <div
               key={tab.id}
@@ -258,7 +261,8 @@ export default function FileTabBar({ tabs, activeTabId, onSelectTab, onCloseTab 
                 opacity: isDragging ? 0.5 : undefined,
               }}
             >
-              <span className="text-[13px] truncate select-none">
+              <span className="text-[13px] truncate select-none flex items-center gap-1">
+                {isTool && <BarChart3 size={12} className="shrink-0 text-accent-blue-bright" />}
                 {displayLabel}
               </span>
               {dirty && (
@@ -286,6 +290,15 @@ export default function FileTabBar({ tabs, activeTabId, onSelectTab, onCloseTab 
           );
         })}
       </div>
+      {/* Files-header entry point for the Context-Overhead Analyzer tool tab
+          (reviewer-approved; no top-level nav item). */}
+      <button
+        onClick={() => openToolTab('context-overhead', 'Context Overhead')}
+        className="shrink-0 flex items-center px-2 hover:bg-white/10 text-gray-400 hover:text-gray-200 border-l dark:border-white/10 light:border-black/10"
+        title="Context Overhead Analyzer"
+      >
+        <BarChart3 size={14} />
+      </button>
       {contextMenu && (
         <TabContextMenu
           x={contextMenu.x}

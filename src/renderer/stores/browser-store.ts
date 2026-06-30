@@ -18,6 +18,8 @@ import type {
   ReaderArticle,
   SharedAgentSessions,
   SignedInOrigin,
+  SigninPendingOpened,
+  SigninResolved,
 } from '../../shared/browser';
 import { resolveBrowserInput } from '../../shared/browser-input';
 // Slice-3: the PURE policy module (no Electron) is the single source of truth for
@@ -44,6 +46,8 @@ export type {
   ReaderArticle,
   SharedAgentSessions,
   SignedInOrigin,
+  SigninPendingOpened,
+  SigninResolved,
 };
 export { resolveBrowserInput };
 
@@ -341,6 +345,19 @@ export interface BrowserApi {
     tabHandToAgent(tabId: string): Promise<void>;
     tabReturnToHuman(tabId: string): Promise<void>;
     clearSiteSession(ruleId: string): Promise<void>;
+    // WI-E "Import my session" — optional + guarded so older/stubbed preload
+    // shapes (and existing access test mocks) without the channel don't crash.
+    importUserSession?(ruleId: string): Promise<{ imported: number; origin: string }>;
+    // ── Signed-in tabs (WI-5): JIT sign-in banner events + cancel + WI-8 config.
+    //    Optional + guarded so older/stubbed preload shapes without these
+    //    channels (and the existing access test mocks) don't crash the bridge. ──
+    onSigninPendingOpened?(cb: (payload: SigninPendingOpened) => void): () => void;
+    onSigninResolved?(cb: (payload: SigninResolved) => void): () => void;
+    signinPendingCancel?(tabId: string): Promise<void>;
+    getSigninHoldTimeoutMs?(): Promise<number>;
+    setSigninHoldTimeoutMs?(ms: number): Promise<void>;
+    setSigninUnattended?(workspaceId: string | null, unattended: boolean): Promise<void>;
+    isSigninUnattended?(workspaceId: string | null): Promise<boolean>;
   };
 }
 
@@ -704,6 +721,25 @@ interface BrowserStoreState {
   /** Surfaced in the banner when "Hand to agent" is refused (tab wandered off
    *  the allow-signed-in origin — §12-A step 4). */
   signinHandoffError: string | null;
+  /** Signed-in tabs (WI-5): the JIT sign-in banner. Set when main pushes
+   *  browser:signin-pending-opened — an agent navigated to an `allow_signed_in`
+   *  origin with no live session and a quarantined login tab was surfaced.
+   *  Cleared on browser:signin-resolved or when the human clicks "Done signing
+   *  in" / "Cancel". DISTINCT from `signinHandoff` (the Mechanism-B manual
+   *  hand-off): this one is agent-initiated and is a reminder, not a consent
+   *  gate. null = idle. */
+  signinPending: {
+    origin: string;
+    tabId: string;
+    workspaceId: string | null;
+    reason: string;
+  } | null;
+  /** WI-8: the configured JIT sign-in hold timeout (ms), mirrored for the
+   *  settings control — main is authoritative (default 300000). */
+  signinHoldTimeoutMs: number;
+  /** WI-8: whether the current workspace is flagged unattended (overnight runs
+   *  skip the sign-in tab and degrade to `signin_unavailable` immediately). */
+  signinUnattended: boolean;
   /** Tabs the human handed to the agent (Mechanism B). Runtime-only mirror —
    *  the frozen tab-state contract carries no handedToAgent flag, so the badge
    *  + "Return tab to me" item track it here, set on tabHandToAgent and cleared
@@ -732,9 +768,40 @@ interface BrowserStoreState {
   completeSigninHandoff: () => Promise<void>;
   /** Abandon the sign-in: close the quarantined tab + clear banner state. */
   cancelSigninHandoff: () => void;
+
+  // ── Signed-in tabs (WI-5): JIT sign-in banner + consent gating + WI-8 config ─
+  /** main pushed browser:signin-pending-opened — raise the JIT banner. */
+  handleSigninPendingOpened: (payload: SigninPendingOpened) => void;
+  /** main pushed browser:signin-resolved — clear the JIT banner for that origin. */
+  handleSigninResolved: (payload: SigninResolved) => void;
+  /** "Done signing in" → access-handoff-ready (clears quarantine, upserts the
+   *  origin ACTIVE, resolves the session ready). Clears the banner. */
+  completeSigninPending: () => Promise<void>;
+  /** "Cancel" → signin-pending-cancel (marks unavailable, closes the tab). The
+   *  rule's durable consent_acked_at is preserved. Clears the banner. */
+  cancelSigninPending: () => Promise<void>;
+  /** Toggle-on consent gate: stamp the 4-point consent + persist allow_signed_in
+   *  in one update (consentAckedAt = now). The component shows the dialog first. */
+  grantSignedInConsent: (ruleId: string) => Promise<void>;
+  /** Approval consent gate: decide approve_signed_in, then stamp consent_acked_at
+   *  on the freshly created rule (the server creates it without a consent stamp). */
+  approveSignedInWithConsent: (request: AccessRequest) => Promise<void>;
+  /** WI-8: load the JIT sign-in config (hold timeout + the workspace's
+   *  unattended flag) into the mirrored state. */
+  loadSigninConfig: () => Promise<void>;
+  /** WI-8: set the hold timeout (ms). Ignores 0/negative (mirrors the manager). */
+  setSigninHoldTimeoutMs: (ms: number) => Promise<void>;
+  /** WI-8: flip the current workspace's unattended flag. */
+  setSigninUnattended: (unattended: boolean) => Promise<void>;
+
   tabHandToAgent: (tabId: string) => Promise<boolean>;
   tabReturnToHuman: (tabId: string) => Promise<void>;
   clearSiteSession: (ruleId: string) => Promise<void>;
+  /** WI-E "Import my session": copy the human's persist:user cookies for the
+   *  rule's origin into the agent partition, then refresh the session center.
+   *  Returns the import result so the row can show the `imported:0` fallback
+   *  notice. HUMAN-CHROME-ONLY. */
+  importUserSession: (ruleId: string) => Promise<{ imported: number; origin: string }>;
 
   // ── Slice 12: handoff / session center ─────────────────────────────────────
   /** Live handed tabs + persisted signed-in origins (with session-age + stale
@@ -832,6 +899,12 @@ export const useBrowserStore = create<BrowserStoreState>((set, get) => ({
   handedTabIds: {},
   signinHandoff: null,
   signinHandoffError: null,
+
+  // Signed-in tabs (WI-5/WI-8) — JIT banner + config mirror. 5 min default
+  // matches the manager's DEFAULT_SIGNIN_HOLD_TIMEOUT_MS (main is authoritative).
+  signinPending: null,
+  signinHoldTimeoutMs: 5 * 60 * 1000,
+  signinUnattended: false,
 
   // Slice 12 — handoff / session center.
   sharedSessions: { handedTabs: [], signedInOrigins: [] },
@@ -1711,8 +1784,16 @@ export const useBrowserStore = create<BrowserStoreState>((set, get) => ({
     if (!result?.tabId) return;
     // Close the overlay so the pane resumes and the visible quarantined login
     // tab is shown; the four-point consent banner takes over in the chrome.
+    // WI-D: focus the new handoff tab in the human's pane. This is HUMAN-initiated
+    // (the human clicked "Sign in"), so it is exactly the case the anti-yank guard
+    // in handleTabState should NOT block — we set activeTabId directly here rather
+    // than via selectTab() because selectTab() no-ops when the tab isn't yet in
+    // `tabs` (the tabState event may arrive after this). Setting activeTabId now
+    // also disarms handleTabState's `activeTabId === null` auto-adopt, so the
+    // arriving agent-partition tab fills in details without re-raising attention.
     set({
       accessViewOpen: false,
+      activeTabId: result.tabId,
       signinHandoff: { tabId: result.tabId, ruleId: rule.id, hostname: rule.hostname },
       signinHandoffError: null,
     });
@@ -1751,6 +1832,136 @@ export const useBrowserStore = create<BrowserStoreState>((set, get) => ({
       get().closeTab(handoff.tabId);
     }
     set({ signinHandoff: null, signinHandoffError: null });
+  },
+
+  // ── Signed-in tabs (WI-5): JIT sign-in banner + consent gating + config ─────
+  handleSigninPendingOpened: (payload) => {
+    if (!payload || typeof payload.tabId !== 'string' || typeof payload.origin !== 'string') {
+      return;
+    }
+    set({
+      signinPending: {
+        origin: payload.origin,
+        tabId: payload.tabId,
+        workspaceId: payload.workspaceId ?? null,
+        reason: typeof payload.reason === 'string' ? payload.reason : '',
+      },
+    });
+  },
+
+  handleSigninResolved: (payload) => {
+    if (!payload || typeof payload.origin !== 'string') return;
+    // Clear the banner only if it names the resolved origin (a stale resolved for
+    // some other origin must not dismiss a live prompt).
+    set((s) =>
+      s.signinPending && s.signinPending.origin === payload.origin
+        ? { signinPending: null }
+        : {},
+    );
+  },
+
+  completeSigninPending: async () => {
+    const api = getBrowserApi();
+    const pending = get().signinPending;
+    if (!api || !pending) return;
+    // "Done signing in" reuses access-handoff-ready: it re-validates the committed
+    // URL, clears the quarantine, upserts the origin ACTIVE, and resolves the
+    // session ready. main also emits signin-resolved, but clear locally now for a
+    // snappy banner dismissal.
+    set({ signinPending: null });
+    try {
+      await api.access.handoffReady(pending.tabId);
+      void get().loadSharedSessions();
+    } catch (err) {
+      console.error('browser.access.handoffReady (JIT) failed:', err);
+    }
+  },
+
+  cancelSigninPending: async () => {
+    const api = getBrowserApi();
+    const pending = get().signinPending;
+    if (!pending) return;
+    set({ signinPending: null });
+    try {
+      await api?.access.signinPendingCancel?.(pending.tabId);
+    } catch (err) {
+      console.error('browser.access.signinPendingCancel failed:', err);
+    }
+  },
+
+  grantSignedInConsent: async (ruleId) => {
+    // The component has shown + collected the 4-point consent; persist the
+    // capability AND stamp the durable consent record in a single update.
+    await get().updateAccessRule(ruleId, { allowSignedIn: true, consentAckedAt: Date.now() });
+  },
+
+  approveSignedInWithConsent: async (request) => {
+    const api = getBrowserApi();
+    if (!api) return;
+    try {
+      // The server creates an allow_signed_in rule from the request's normalized
+      // fields but leaves consent_acked_at null. Stamp it afterward so the
+      // approval path carries the same durable consent as toggle-on.
+      await api.access.requestDecide(request.id, 'approve_signed_in');
+      const consentAckedAt = Date.now();
+      const rows = await api.access.list();
+      // Match the freshly created rule by its canonical shape (allow_signed_in +
+      // not-yet-consented + same normalized origin). Stamp consent on it.
+      const created = rows.find(
+        (r) =>
+          r.allowSignedIn &&
+          (r.consentAckedAt === null || r.consentAckedAt === undefined) &&
+          r.hostname === request.hostname &&
+          r.scheme === request.scheme &&
+          r.includeSubdomains === request.includeSubdomains &&
+          (r.pathPrefix ?? undefined) === (request.pathPrefix ?? undefined),
+      );
+      if (created) {
+        await api.access.update(created.id, { consentAckedAt });
+      }
+      void get().loadAccessRequests();
+      void get().loadAccessRules();
+    } catch (err) {
+      console.error('browser.access approveSignedInWithConsent failed:', err);
+    }
+  },
+
+  loadSigninConfig: async () => {
+    const api = getBrowserApi();
+    if (!api?.access?.getSigninHoldTimeoutMs) return;
+    try {
+      const ms = await api.access.getSigninHoldTimeoutMs();
+      const workspaceId = get().selectedWorkspaceId;
+      const unattended = (await api.access.isSigninUnattended?.(workspaceId)) ?? false;
+      set({
+        signinHoldTimeoutMs: typeof ms === 'number' && ms > 0 ? ms : get().signinHoldTimeoutMs,
+        signinUnattended: unattended === true,
+      });
+    } catch (err) {
+      console.error('browser.access.getSigninHoldTimeoutMs failed:', err);
+    }
+  },
+
+  setSigninHoldTimeoutMs: async (ms) => {
+    if (!(typeof ms === 'number' && Number.isFinite(ms) && ms > 0)) return;
+    const api = getBrowserApi();
+    set({ signinHoldTimeoutMs: Math.trunc(ms) });
+    try {
+      await api?.access.setSigninHoldTimeoutMs?.(Math.trunc(ms));
+    } catch (err) {
+      console.error('browser.access.setSigninHoldTimeoutMs failed:', err);
+    }
+  },
+
+  setSigninUnattended: async (unattended) => {
+    const api = getBrowserApi();
+    const workspaceId = get().selectedWorkspaceId;
+    set({ signinUnattended: unattended === true });
+    try {
+      await api?.access.setSigninUnattended?.(workspaceId, unattended === true);
+    } catch (err) {
+      console.error('browser.access.setSigninUnattended failed:', err);
+    }
   },
 
   tabHandToAgent: async (tabId) => {
@@ -1792,6 +2003,22 @@ export const useBrowserStore = create<BrowserStoreState>((set, get) => ({
       void get().loadSharedSessions();
     } catch (err) {
       console.error('browser.access.clearSiteSession failed:', err);
+    }
+  },
+
+  importUserSession: async (ruleId) => {
+    const api = getBrowserApi();
+    if (!api?.access?.importUserSession) return { imported: 0, origin: '' };
+    try {
+      const result = await api.access.importUserSession(ruleId);
+      // On a successful copy the origin flips to signed_in — refresh the center
+      // so the row reflects it. (On imported:0 nothing changed, but a refresh is
+      // harmless and keeps the row's state honest.)
+      void get().loadSharedSessions();
+      return result ?? { imported: 0, origin: '' };
+    } catch (err) {
+      console.error('browser.access.importUserSession failed:', err);
+      return { imported: 0, origin: '' };
     }
   },
 
@@ -2011,9 +2238,20 @@ export function ensureBrowserBridge(): boolean {
     api.access.onRequestsChanged(() => {
       void useBrowserStore.getState().loadAccessRequests();
     });
+    // ── Signed-in tabs (WI-5): JIT sign-in banner events. Guarded so the
+    //    existing access mocks / older preload shapes without these channels
+    //    don't crash the bridge. ─────────────────────────────────────────────
+    api.access.onSigninPendingOpened?.((payload) =>
+      useBrowserStore.getState().handleSigninPendingOpened(payload),
+    );
+    api.access.onSigninResolved?.((payload) =>
+      useBrowserStore.getState().handleSigninResolved(payload),
+    );
     const s = useBrowserStore.getState();
     void s.loadAccessRules();
     void s.loadAccessRequests();
+    // WI-8: prime the JIT sign-in config mirror (hold timeout + unattended flag).
+    void s.loadSigninConfig();
   }
 
   // ── Slice 12: handoff / session center. Stream the off-origin auto-revoke

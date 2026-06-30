@@ -205,6 +205,16 @@ async function handleOrchestrationToolCall(name, args, apiRequest) {
       // launched by the supervisor should bump it on idle/done/crashed so it
       // can react without polling. Caller can pass supervised:false to opt out.
       input.isSupervised = args.supervised !== undefined ? args.supervised : true;
+      // Agent-ownership primitive (§4.3): stamp the launcher → child edge from
+      // AGENT_DASHBOARD_SELF_ID. This env is set by the dashboard at launch
+      // (index.ts launchWindowsAgent/launchWslAgent) — it is dashboard-derived,
+      // NOT caller-supplied, so it is the trusted calling-agent identity. The
+      // dashboard re-validates it (§4.1: exists + same workspace + non-terminal)
+      // before persisting, degrading to null (today's structural-supervisor
+      // routing) when absent or invalid.
+      if (process.env.AGENT_DASHBOARD_SELF_ID) {
+        input.owner_agent_id = process.env.AGENT_DASHBOARD_SELF_ID;
+      }
       const agent = await apiRequest('POST', '/api/agents', input);
       let text = `Launched agent "${agent.title}" (${agent.id}) in workspace ${agent.workspaceId}`;
       if (args.template_id) text += `\nTemplate: ${args.template_id}`;

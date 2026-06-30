@@ -5,8 +5,9 @@
 //   node dist/main/main/supervisor/session-log-dispatcher.test.js
 
 import assert from 'node:assert/strict';
-import { SessionLogDispatcher } from './session-log-dispatcher';
+import { SessionLogDispatcher, type SessionStaleEvent } from './session-log-dispatcher';
 import type { ChatLogReader, ChatLogReaderSession } from './log-readers/types';
+import type { AgentProvider } from '../../shared/types';
 import type {
   SessionEvent,
   UserTextEvent,
@@ -534,6 +535,85 @@ test('codex sessions with blank sessionId are still polled', () => {
   dispatcher.pollNow();
   assert.equal(emitted.length, 1, 'blank-session codex agent should still poll');
   assert.equal(emitted[0].events[0].uuid, 'a:blank-session');
+});
+
+// ── /clear-rotation: session-pinned stale-drain + successor validate ──
+
+// Reader exposing a one-shot session-pinned stale drain and an optional
+// validateClearSuccessor delegate. The stale records carry the session-pinned
+// shape (agentId + staleSessionId + workingDirectory + observedAt) so the
+// dispatcher can re-emit them verbatim as `'session-stale'`.
+class StaleReader implements ChatLogReader {
+  readonly provider: AgentProvider;
+  private staleQueue: SessionStaleEvent[][];
+  constructor(provider: AgentProvider, staleQueue: SessionStaleEvent[][] = []) {
+    this.provider = provider;
+    this.staleQueue = staleQueue;
+  }
+  pollSession(_session: ChatLogReaderSession): SessionEvent[] { return []; }
+  invalidatePath(_agentId: string): void {}
+  drainStaleSignals(): SessionStaleEvent[] {
+    return this.staleQueue.length ? this.staleQueue.shift()! : [];
+  }
+  validateClearSuccessor?(
+    _wd: string, _cur: string, _cand: string, _started?: string
+  ): boolean;
+}
+
+// A reader with no /clear-rotation methods at all.
+class PlainReader implements ChatLogReader {
+  readonly provider: AgentProvider;
+  constructor(provider: AgentProvider) { this.provider = provider; }
+  pollSession(_session: ChatLogReaderSession): SessionEvent[] { return []; }
+  invalidatePath(_agentId: string): void {}
+}
+
+function staleSignal(agentId: string, staleSessionId: string): SessionStaleEvent {
+  return { agentId, staleSessionId, workingDirectory: 'C:\\repo', observedAt: 1_700_000_000_000 };
+}
+
+test('20: pollNow drains a reader\'s session-pinned stale signals and emits session-stale once', () => {
+  // Returns one record once, then [] — the dispatcher must re-emit the FULL
+  // session-pinned payload (not a bare { agentId }) exactly once.
+  const sig = staleSignal('a1', 'sess-a1');
+  const reader = new StaleReader('claude', [[sig]]);
+  const dispatcher = new SessionLogDispatcher(() => []);
+  dispatcher.register(reader);
+
+  const staleEmitted: SessionStaleEvent[] = [];
+  dispatcher.on('session-stale', (p) => staleEmitted.push(p));
+
+  dispatcher.pollNow();
+  dispatcher.pollNow(); // second drain returns [] → no further emit
+
+  assert.deepEqual(staleEmitted, [sig]);
+});
+
+test('21: validateClearSuccessor delegates to the claude reader, false when method absent', () => {
+  // Reader implements the method → its boolean is returned, and it receives
+  // (workingDirectory, currentSessionId, candidateSessionId, startedAt) — the
+  // provider arg is stripped by the dispatcher.
+  const reader = new StaleReader('claude');
+  const seen: string[] = [];
+  reader.validateClearSuccessor = (wd, cur, cand, started) => {
+    seen.push(wd, cur, cand, started ?? '<none>');
+    return cand === 'good';
+  };
+  const dispatcher = new SessionLogDispatcher(() => []);
+  dispatcher.register(reader);
+  assert.equal(dispatcher.validateClearSuccessor('claude', 'C:\\repo', 'cur', 'good', 'T0'), true);
+  assert.deepEqual(seen, ['C:\\repo', 'cur', 'good', 'T0']);
+  // Same reader, a candidate it rejects → false.
+  assert.equal(dispatcher.validateClearSuccessor('claude', 'C:\\repo', 'cur', 'bad', 'T0'), false);
+
+  // Registered reader lacks the method → false (never throws).
+  const plainDispatcher = new SessionLogDispatcher(() => []);
+  plainDispatcher.register(new PlainReader('claude'));
+  assert.equal(plainDispatcher.validateClearSuccessor('claude', 'C:\\repo', 'cur', 'good'), false);
+
+  // No reader registered for the provider at all → false.
+  const emptyDispatcher = new SessionLogDispatcher(() => []);
+  assert.equal(emptyDispatcher.validateClearSuccessor('claude', 'C:\\repo', 'cur', 'good'), false);
 });
 
 // ── Runner ───────────────────────────────────────────────────────────

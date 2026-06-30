@@ -161,7 +161,10 @@ interface FakeWC {
   once(event: string, fn: (...a: unknown[]) => void): FakeWC;
   removeListener(event: string, fn: (...a: unknown[]) => void): FakeWC;
   emit(event: string, ...args: unknown[]): void;
-  setWindowOpenHandler(): void;
+  setWindowOpenHandler(fn: (details: { url: string }) => unknown): void;
+  /** Last handler registered via setWindowOpenHandler — lets popup-policy tests
+   *  invoke it directly and assert the allow/deny decision. */
+  windowOpenHandler?: (details: { url: string }) => unknown;
   setUserAgent(): void;
   setURL(url: string): void;
   // Slice-11 sweep seams (idle/cap discard): throttle hidden views + read scroll.
@@ -202,7 +205,7 @@ function fakeWC(url: string, title = 'T'): FakeWC {
       return wc;
     },
     emit(event, ...args) { for (const fn of listeners.get(event) ?? []) fn(...args); },
-    setWindowOpenHandler() {},
+    setWindowOpenHandler(fn) { wc.windowOpenHandler = fn; },
     setUserAgent() {},
     setURL(next) { currentUrl = next; },
     setBackgroundThrottling() {},
@@ -218,6 +221,7 @@ function makeManager(): MgrHarness {
   const win = {
     webContents: { isDestroyed: () => false, send: (channel: string, payload: unknown) => { sent.push({ channel, payload }); } },
     contentView: { addChildView() {}, removeChildView() {} },
+    getBackgroundColor: () => '#1e1e1e',
   };
   const mgr = new BM.BrowserManager(() => win as never, 0);
   // Stub the audit writer so a denial path never touches the filesystem.
@@ -232,7 +236,7 @@ interface FakeTab {
   // legacy-default workspace (what setCache's default key targets), so existing
   // workspace-agnostic tests keep working unchanged.
   workspaceId?: string | null;
-  view: { webContents: FakeWC };
+  view: { webContents: FakeWC; setBounds?(): void; setVisible?(): void };
 }
 
 let tabSeq = 0;
@@ -249,7 +253,9 @@ function injectTab(
     signinPending: opts.signinPending,
     handedToAgent: opts.handedToAgent,
     workspaceId: opts.workspaceId,
-    view: { webContents: fakeWC(opts.url, opts.title) },
+    // setBounds/setVisible are inert seams: setActiveTab + applyVisibility call
+    // them when a close re-selects a replacement view (close-active repaint path).
+    view: { webContents: fakeWC(opts.url, opts.title), setBounds() {}, setVisible() {} },
   };
   const internals = mgr as unknown as { tabs: Map<string, unknown>; tabOrder: string[] };
   internals.tabs.set(id, tab);
@@ -816,6 +822,50 @@ function errOf(tab: FakeTab): { code: string; description: string; url: string }
   return (tab as unknown as { lastError?: { code: string; description: string; url: string } | null }).lastError;
 }
 
+// ── Popup policy: USER tabs allow real OAuth popups; AGENT tabs stay gated ────
+
+test('USER-tab window.open() popup is ALLOWED (OAuth opener channel preserved)', () => {
+  const { mgr, sent } = makeManager();
+  const tab = injectTab(mgr, { partition: 'user', url: 'https://app.example/' });
+  priv<void>(mgr, 'wireViewEvents')(tab);
+  const handler = tab.view.webContents.windowOpenHandler!;
+  assert.ok(handler, 'setWindowOpenHandler registered');
+  const res = handler({ url: 'https://accounts.google.com/o/oauth2/auth' }) as { action: string };
+  assert.equal(res.action, 'allow', 'human-driven popup opens natively so window.opener survives');
+  assert.equal(
+    sent.filter((s) => s.channel === CH.openRequest).length, 0,
+    'no "page tried to open a new window" confirmation surfaced for an allowed user popup',
+  );
+});
+
+test('about:blank popup from a USER tab is allowed (open-then-navigate OAuth flows)', () => {
+  const { mgr } = makeManager();
+  const tab = injectTab(mgr, { partition: 'user', url: 'https://app.example/' });
+  priv<void>(mgr, 'wireViewEvents')(tab);
+  const res = tab.view.webContents.windowOpenHandler!({ url: 'about:blank' }) as { action: string };
+  assert.equal(res.action, 'allow');
+});
+
+test('AGENT-tab popups stay DENIED and surface an open-request (no unattended OS window)', () => {
+  const { mgr, sent } = makeManager();
+  const tab = injectTab(mgr, { partition: 'agent', url: 'https://app.example/' });
+  priv<void>(mgr, 'wireViewEvents')(tab);
+  sent.length = 0;
+  const res = tab.view.webContents.windowOpenHandler!({ url: 'https://accounts.google.com/' }) as { action: string };
+  assert.equal(res.action, 'deny', 'automation never spawns a native popup');
+  const req = sent.find((s) => s.channel === CH.openRequest);
+  assert.ok(req, 'denied agent popup is surfaced to the renderer for open-as-tab');
+  assert.equal((req!.payload as { url: string }).url, 'https://accounts.google.com/');
+});
+
+test('non-http(s) popup scheme from a USER tab is denied (only OAuth-shaped schemes auto-open)', () => {
+  const { mgr } = makeManager();
+  const tab = injectTab(mgr, { partition: 'user', url: 'https://app.example/' });
+  priv<void>(mgr, 'wireViewEvents')(tab);
+  const res = tab.view.webContents.windowOpenHandler!({ url: 'mailto:foo@example.com' }) as { action: string };
+  assert.equal(res.action, 'deny');
+});
+
 test('secureStateForUrl reflects the scheme (https → secure, http → insecure, else internal)', () => {
   assert.equal(BM.secureStateForUrl('https://example.com/'), 'secure');
   assert.equal(BM.secureStateForUrl('http://example.com/'), 'insecure');
@@ -1167,6 +1217,67 @@ test('Slice-10: a USER close lands on the PERSISTENT reopen stack and reopenClos
   ss.clearSession();
 });
 
+// ── Close-active repaint: closing the ACTIVE tab must re-select a replacement ──
+// (or clear the pane) so the destroyed WebContentsView's last frame never lingers
+// as a "dead tab". Also guards the in-mem agent LIFO reopen push + tab removal.
+
+interface ClosedStackEntry { url: string; partition: 'agent' | 'user'; title: string; }
+function agentReopenStack(mgr: MgrHarness['mgr']): ClosedStackEntry[] {
+  return (mgr as unknown as { closedTabStack: ClosedStackEntry[] }).closedTabStack;
+}
+
+test('closing the ACTIVE agent tab re-selects the right neighbour, removes the tab, and pushes the in-mem LIFO reopen entry', () => {
+  const { mgr } = makeManager();
+  const ix = internals(mgr);
+  const a = injectTab(mgr, { partition: 'agent', url: 'https://a.example/', title: 'A', workspaceId: null });
+  const b = injectTab(mgr, { partition: 'agent', url: 'https://b.example/', title: 'B', workspaceId: null });
+  const c = injectTab(mgr, { partition: 'agent', url: 'https://c.example/', title: 'C', workspaceId: null });
+  ix.activeTabId = b.id; // the middle tab is active
+
+  mgr.closeTab(b.id);
+
+  // Tab + order teardown.
+  assert.equal(ix.tabs.has(b.id), false, 'closed tab removed from the live tab map');
+  assert.equal(ix.tabOrder.includes(b.id), false, 'closed tab removed from the order');
+  assert.equal(ix.frozenTabs.has(b.id), false, 'a real close never leaves a frozen snapshot');
+  // Active re-selection: the right neighbour (c) shifts into the freed slot.
+  assert.equal(ix.activeTabId, c.id, 'active re-selected the right neighbour — pane repaints, no dead tab');
+  // Agent close → in-mem LIFO reopen stack (partition preserved, never disk).
+  const stack = agentReopenStack(mgr);
+  assert.equal(stack.length, 1, 'one in-mem reopen entry pushed');
+  assert.equal(stack[stack.length - 1].url, 'https://b.example/', 'with the closed agent URL');
+  assert.equal(stack[stack.length - 1].partition, 'agent', 'partition preserved so it reopens as agent');
+  // Sibling tabs untouched.
+  assert.ok(ix.tabs.has(a.id) && ix.tabs.has(c.id), 'sibling tabs survive the close');
+});
+
+test('closing the ACTIVE rightmost tab falls back to the left neighbour; closing the last tab clears the pane', () => {
+  const { mgr } = makeManager();
+  const ix = internals(mgr);
+  const a = injectTab(mgr, { partition: 'agent', url: 'https://a.example/', title: 'A', workspaceId: null });
+  const b = injectTab(mgr, { partition: 'agent', url: 'https://b.example/', title: 'B', workspaceId: null });
+  ix.activeTabId = b.id; // rightmost is active
+
+  mgr.closeTab(b.id);
+  assert.equal(ix.activeTabId, a.id, 'rightmost close falls back to the left neighbour');
+
+  mgr.closeTab(a.id);
+  assert.equal(ix.activeTabId, null, 'closing the last tab clears the active id (pane cleared)');
+  assert.equal(ix.tabs.size, 0, 'no live tabs remain');
+});
+
+test('closing a NON-active tab leaves the active id untouched', () => {
+  const { mgr } = makeManager();
+  const ix = internals(mgr);
+  const a = injectTab(mgr, { partition: 'agent', url: 'https://a.example/', title: 'A', workspaceId: null });
+  const b = injectTab(mgr, { partition: 'agent', url: 'https://b.example/', title: 'B', workspaceId: null });
+  ix.activeTabId = a.id; // active is NOT the tab being closed
+
+  mgr.closeTab(b.id);
+  assert.equal(ix.activeTabId, a.id, 'active id unchanged when a background tab is closed');
+  assert.equal(ix.tabs.has(b.id), false, 'the background tab is still removed');
+});
+
 // ── Slice 13: user-only downloads — decision gate + will-download handler ─────
 // Exercises the security-critical seam: the agent allowlist gate (allow/deny +
 // NO record on deny), the M12 sensitive-origin denial even for an allowlisted
@@ -1330,6 +1441,415 @@ test('Slice-13: a download from an UNKNOWN source (no owning tab) is denied with
   assert.equal(event.prevented, true, 'an orphan download is prevented');
   assert.ok(records.some((r) => r.outcome === 'denied:unknown-source'), 'audited as unknown-source');
   assert.ok(!mgr.listDownloads().some((r) => r.url.includes('orphan.example')), 'no record for an orphan download');
+});
+
+// ── Signed-in tabs WI-2(c): looksLikeLoginWall (pure heuristic) ──────────────
+
+test('WI-2(c) looksLikeLoginWall: same-origin login PATHS match; ordinary pages do not', () => {
+  const rule = { hostname: 'site.example' };
+  for (const p of ['/login', '/signin', '/sign-in', '/sso', '/auth', '/oauth', '/sso/start', '/auth/callback']) {
+    assert.equal(BM.looksLikeLoginWall(`https://site.example${p}`, rule), true, `${p} is a login wall`);
+  }
+  for (const p of ['/feed', '/authors/jane', '/loginhelp', '/search?q=login', '/']) {
+    assert.equal(BM.looksLikeLoginWall(`https://site.example${p}`, rule), false, `${p} is NOT a login wall (no false positive)`);
+  }
+});
+
+test('WI-2(c) looksLikeLoginWall: a CROSS-ORIGIN redirect to a known auth host matches', () => {
+  const rule = { hostname: 'site.example' };
+  assert.equal(BM.looksLikeLoginWall('https://accounts.google.com/o/oauth2/v2/auth', rule), true);
+  assert.equal(BM.looksLikeLoginWall('https://login.microsoftonline.com/common/oauth2', rule), true);
+  assert.equal(BM.looksLikeLoginWall('https://corp.okta.com/app/x', rule), true);
+  assert.equal(BM.looksLikeLoginWall('https://idp.example.org/saml', rule), true);
+  // A normal cross-origin page (not an auth host) is NOT a wall.
+  assert.equal(BM.looksLikeLoginWall('https://cdn.othersite.com/asset.js', rule), false);
+});
+
+test('WI-2(c) looksLikeLoginWall: per-rule login_url_patterns (glob + substring) extend the defaults', () => {
+  const rule = { hostname: 'board.example', loginUrlPatterns: ['*/candidate/*', 'auth-gate'] };
+  assert.equal(BM.looksLikeLoginWall('https://board.example/candidate/portal', rule), true, 'glob honored');
+  assert.equal(BM.looksLikeLoginWall('https://board.example/x/auth-gate', rule), true, 'substring honored');
+  assert.equal(BM.looksLikeLoginWall('https://board.example/jobs/123', rule), false, 'a normal page still passes');
+  // Non-http(s) is never a wall.
+  assert.equal(BM.looksLikeLoginWall('about:blank', rule), false);
+  assert.equal(BM.looksLikeLoginWall('not a url', rule), false);
+});
+
+// ── Signed-in tabs WI-2(b): classifyOriginState transitions (DB-backed) ──────
+
+test('WI-2(b) classifyOriginState: a non-credentialed origin is always ready (unchanged path)', () => {
+  const { mgr } = makeManager();
+  mgr.invalidateAccessCache();
+  // No allow_signed_in rule → not our concern; the ordinary allow/deny path owns it.
+  assert.equal(mgr.classifyOriginState(null, 'https://uncredentialed.example/page'), 'ready');
+});
+
+test('WI-2(b) classifyOriginState: allow_signed_in origin with NO session row → needs_signin', () => {
+  const { mgr } = makeManager();
+  store.insertRule({ hostname: 'cls-norow.example', scheme: 'https', includeSubdomains: true, allowSignedIn: true, workspaceId: null });
+  mgr.invalidateAccessCache();
+  assert.equal(mgr.classifyOriginState(null, 'https://cls-norow.example/feed'), 'needs_signin', 'cold path: first-ever nav pends');
+});
+
+test('WI-2(b) classifyOriginState: active session on a normal page → ready', () => {
+  const { mgr } = makeManager();
+  const rule = store.insertRule({ hostname: 'cls-active.example', scheme: 'https', includeSubdomains: true, allowSignedIn: true, workspaceId: null });
+  mgr.invalidateAccessCache();
+  store.upsertSignedInOrigin(rule.id, 'https://cls-active.example', null, { signedInAt: Date.now(), verifiedAt: Date.now() });
+  assert.equal(mgr.classifyOriginState(null, 'https://cls-active.example/feed'), 'ready', 'a live session drives normally');
+});
+
+test('WI-2(b) classifyOriginState: active session that COMMITS to a same-origin login wall → flips expired → needs_signin', () => {
+  const { mgr } = makeManager();
+  const rule = store.insertRule({ hostname: 'cls-expire.example', scheme: 'https', includeSubdomains: true, allowSignedIn: true, workspaceId: null });
+  mgr.invalidateAccessCache();
+  const origin = 'https://cls-expire.example';
+  store.upsertSignedInOrigin(rule.id, origin, null, { signedInAt: Date.now(), verifiedAt: Date.now() });
+  assert.equal(store.getSignedInOriginState(rule.id, origin), 'active', 'starts active');
+  // committedUrl looks like a login wall → expiry detected.
+  assert.equal(mgr.classifyOriginState(null, origin, 'https://cls-expire.example/login'), 'needs_signin');
+  assert.equal(store.getSignedInOriginState(rule.id, origin), 'expired', 'the row was flipped expired (durable consent preserved)');
+  // A subsequent classify (no committed url) still pends — the row is expired.
+  assert.equal(mgr.classifyOriginState(null, origin), 'needs_signin', 'expired row re-enters the sign-in flow');
+});
+
+test('WI-2(b) classifyOriginState: active session whose nav redirects CROSS-ORIGIN to an auth host → expired (the bug-fix case)', () => {
+  const { mgr } = makeManager();
+  const rule = store.insertRule({ hostname: 'cls-xorigin.example', scheme: 'https', includeSubdomains: true, allowSignedIn: true, workspaceId: null });
+  mgr.invalidateAccessCache();
+  const origin = 'https://cls-xorigin.example';
+  store.upsertSignedInOrigin(rule.id, origin, null, { signedInAt: Date.now(), verifiedAt: Date.now() });
+  // The committed URL is a DIFFERENT origin (accounts.google.com) — the rule must
+  // still be resolved from the credentialed origin so the expiry is detected.
+  assert.equal(mgr.classifyOriginState(null, origin, 'https://accounts.google.com/o/oauth2/v2/auth'), 'needs_signin');
+  assert.equal(store.getSignedInOriginState(rule.id, origin), 'expired', 'cross-origin auth-host redirect detected as expiry');
+});
+
+// ── Proactive-signin (2026-06-29): getSharedSessions is allowlist-driven ──────
+// Every enabled allow_signed_in rule appears with a state (signed_in / expired /
+// never), not only origins that already have a session row. The shared sql.js DB
+// persists across tests, so each assertion FILTERS by its own rule id rather than
+// assuming a row count.
+
+test('getSharedSessions: an enabled allow_signed_in rule with NO session row appears as state "never"', () => {
+  const { mgr } = makeManager();
+  const rule = store.insertRule({ hostname: 'never.proactive.example', scheme: 'https', includeSubdomains: true, allowSignedIn: true, workspaceId: null });
+  mgr.invalidateAccessCache();
+  const entry = mgr.getSharedSessions().signedInOrigins.find((o) => o.ruleId === rule.id);
+  assert.ok(entry, 'the allowlisted-but-never-signed-in rule is surfaced');
+  assert.equal(entry!.state, 'never');
+  assert.equal(entry!.hostname, 'never.proactive.example', 'carries hostname for the handoff flow');
+  assert.equal(entry!.signedInAt ?? null, null, 'no sign-in age for a never entry');
+});
+
+test('getSharedSessions: an active session row appears as state "signed_in"', () => {
+  const { mgr } = makeManager();
+  const rule = store.insertRule({ hostname: 'active.proactive.example', scheme: 'https', includeSubdomains: true, allowSignedIn: true, workspaceId: null });
+  mgr.invalidateAccessCache();
+  store.upsertSignedInOrigin(rule.id, 'https://active.proactive.example', null, { signedInAt: Date.now(), verifiedAt: Date.now() });
+  const entry = mgr.getSharedSessions().signedInOrigins.find((o) => o.ruleId === rule.id);
+  assert.ok(entry, 'the signed-in origin is surfaced');
+  assert.equal(entry!.state, 'signed_in');
+  // No synthetic "never" duplicate for a rule that already has a row.
+  assert.equal(
+    mgr.getSharedSessions().signedInOrigins.filter((o) => o.ruleId === rule.id).length,
+    1,
+    'exactly one entry — the row, not a never duplicate',
+  );
+});
+
+test('getSharedSessions: an expired session row appears as state "expired"', () => {
+  const { mgr } = makeManager();
+  const rule = store.insertRule({ hostname: 'expired.proactive.example', scheme: 'https', includeSubdomains: true, allowSignedIn: true, workspaceId: null });
+  mgr.invalidateAccessCache();
+  const origin = 'https://expired.proactive.example';
+  store.upsertSignedInOrigin(rule.id, origin, null, { signedInAt: Date.now(), verifiedAt: Date.now() });
+  store.expireSignedInOrigin(rule.id, origin, Date.now());
+  const entry = mgr.getSharedSessions().signedInOrigins.find((o) => o.ruleId === rule.id);
+  assert.ok(entry, 'the expired origin is surfaced');
+  assert.equal(entry!.state, 'expired');
+});
+
+test('getSharedSessions: a rule WITHOUT allow_signed_in never appears; handedTabs are untouched', () => {
+  const { mgr } = makeManager();
+  const plain = store.insertRule({ hostname: 'plainvisit.proactive.example', scheme: 'https', includeSubdomains: true, allowSignedIn: false, workspaceId: null });
+  mgr.invalidateAccessCache();
+  const snap = mgr.getSharedSessions();
+  assert.equal(snap.signedInOrigins.some((o) => o.ruleId === plain.id), false, 'a visit-only rule is not a shared session');
+  assert.deepEqual(snap.handedTabs, [], 'no handed tabs were fabricated');
+});
+
+// ── WI-E (Import my session): copy persist:user cookies → agent partition ─────
+// importUserSessionForRule unions the origin + domain cookie queries, de-dups by
+// (name, domain, path), replays each into the rule's WORKSPACE agent partition,
+// and upserts the origin row only when at least one cookie copied. The pure
+// cookie→set mapping helper is unit-tested separately (no live session needed).
+
+test('WI-E importUserSessionForRule: unions + de-dups persist:user cookies, copies into the workspace agent partition, upserts on imported>0', async () => {
+  // Both the url-scoped and domain-scoped queries return the SAME two cookies, so
+  // the (name,domain,path) de-dup must collapse 4 raw hits → 2 unique copies.
+  const userCookies = [
+    { name: 'sid', value: 'abc', domain: 'imp.example', path: '/', secure: true, httpOnly: true, hostOnly: true, session: false, expirationDate: 9999999999, sameSite: 'no_restriction' },
+    { name: 'pref', value: 'x', domain: '.imp.example', path: '/', secure: true, httpOnly: false, hostOnly: false, session: true, sameSite: 'lax' },
+  ];
+  const setInto = new Map<string, unknown[]>();
+  const orig = electronMock.session.fromPartition;
+  electronMock.session.fromPartition = (partition = '') => {
+    const base = fakeSession() as Record<string, unknown>;
+    if (partition === 'persist:user') {
+      base.cookies = { get: async () => userCookies.slice(), set: async () => {} };
+    } else {
+      const calls = setInto.get(partition) ?? [];
+      setInto.set(partition, calls);
+      base.cookies = { get: async () => [], set: async (d: unknown) => { calls.push(d); } };
+    }
+    return base;
+  };
+  try {
+    const { mgr, sent } = makeManager();
+    const rule = store.insertRule({ hostname: 'imp.example', scheme: 'https', includeSubdomains: true, allowSignedIn: true, workspaceId: 'ws-imp' });
+    mgr.invalidateAccessCache();
+    const before = sent.length;
+    const result = await mgr.importUserSessionForRule(rule.id);
+
+    assert.equal(result.imported, 2, '4 raw hits de-duped to 2 unique cookies');
+    assert.equal(result.origin, 'https://imp.example');
+    const agentPartition = BM.agentPartitionForWorkspace('ws-imp');
+    assert.equal((setInto.get(agentPartition) ?? []).length, 2, 'both cookies replayed into the RULE workspace agent partition');
+    assert.equal(setInto.has('persist:user'), false, 'never writes back into the human partition');
+    assert.equal(store.getSignedInOriginState(rule.id, 'https://imp.example'), 'active', 'origin row upserted active on imported>0');
+    assert.ok(sent.slice(before).some((m) => m.channel === CH.accessChanged), 'accessChanged emitted so the session center refreshes');
+  } finally {
+    electronMock.session.fromPartition = orig;
+  }
+});
+
+test('WI-E importUserSessionForRule: no saved login → imported 0, NO upsert, NO accessChanged (degrades to Sign-in fallback)', async () => {
+  const orig = electronMock.session.fromPartition;
+  electronMock.session.fromPartition = (_partition = '') => {
+    const base = fakeSession() as Record<string, unknown>;
+    base.cookies = { get: async () => [], set: async () => {} };
+    return base;
+  };
+  try {
+    const { mgr, sent } = makeManager();
+    const rule = store.insertRule({ hostname: 'noimp.example', scheme: 'https', includeSubdomains: true, allowSignedIn: true, workspaceId: null });
+    mgr.invalidateAccessCache();
+    const before = sent.length;
+    const result = await mgr.importUserSessionForRule(rule.id);
+    assert.equal(result.imported, 0);
+    assert.equal(store.getSignedInOriginState(rule.id, 'https://noimp.example'), undefined, 'no row upserted when nothing copied');
+    assert.equal(sent.slice(before).some((m) => m.channel === CH.accessChanged), false, 'no accessChanged when imported===0');
+  } finally {
+    electronMock.session.fromPartition = orig;
+  }
+});
+
+test('WI-E importUserSessionForRule: refuses a rule that is not allow_signed_in (mirrors accessHandoffSignin)', async () => {
+  const { mgr } = makeManager();
+  const rule = store.insertRule({ hostname: 'visitonly.imp.example', scheme: 'https', includeSubdomains: true, allowSignedIn: false, workspaceId: null });
+  mgr.invalidateAccessCache();
+  await assert.rejects(() => mgr.importUserSessionForRule(rule.id), /not allow_signed_in/);
+  await assert.rejects(() => mgr.importUserSessionForRule('no-such-rule'), /unknown rule/);
+});
+
+test('WI-E cookieToSetDetails: host-only vs leading-dot domain url + domain + expiry reconstruction', () => {
+  // Host-only secure cookie → https url on the bare host, NO domain field, expiry kept.
+  const hostOnly = BM.cookieToSetDetails(
+    { name: 'sid', value: 'a', domain: 'h.example', path: '/app', secure: true, httpOnly: true, hostOnly: true, session: false, expirationDate: 123, sameSite: 'no_restriction' } as never,
+    'h.example',
+  );
+  assert.equal(hostOnly.url, 'https://h.example/app');
+  assert.equal(hostOnly.domain, undefined, 'host-only cookie carries no domain (else Electron promotes it to a domain cookie)');
+  assert.equal(hostOnly.expirationDate, 123);
+
+  // Leading-dot domain cookie, insecure + session → http url on the apex host,
+  // keeps its dotted domain, no expirationDate.
+  const domainCookie = BM.cookieToSetDetails(
+    { name: 'pref', value: 'b', domain: '.h.example', path: '/', secure: false, httpOnly: false, hostOnly: false, session: true, sameSite: 'lax' } as never,
+    'h.example',
+  );
+  assert.equal(domainCookie.url, 'http://h.example/', 'insecure cookie → http url');
+  assert.equal(domainCookie.domain, '.h.example', 'domain cookie keeps its leading-dot domain');
+  assert.equal(domainCookie.expirationDate, undefined, 'session cookie carries no expirationDate');
+});
+
+// ── Signed-in tabs WI-2(d): SigninSession concurrency de-dup ──────────────────
+
+/** signinKey(workspaceId, origin) — mirrors the module-private key builder so a
+ *  test can read the registry entry directly. */
+function sessKey(workspaceId: string | null, origin: string): string {
+  return `${workspaceId ?? ''}|${origin}`;
+}
+
+test('WI-2(d) ensureSignedInOrPend: 4 concurrent navs to one origin open EXACTLY ONE sign-in tab; the others join as pending', () => {
+  const { mgr, sent } = makeManager();
+  const rule = store.insertRule({ hostname: 'dedup.example', scheme: 'https', includeSubdomains: true, allowSignedIn: true, workspaceId: null });
+  mgr.invalidateAccessCache();
+  // Stub the JIT tab opener (a real one would construct a live WebContentsView):
+  // fabricate a quarantined agent tab and count the opens.
+  let opens = 0;
+  (mgr as unknown as Record<string, unknown>).openSigninHandoffTab = (
+    _rule: unknown, _ws: unknown, target: string | undefined,
+  ): string => {
+    opens += 1;
+    const t = injectTab(mgr, { partition: 'agent', url: target ?? 'https://dedup.example/', signinPending: true });
+    return t.id;
+  };
+
+  const origin = 'https://dedup.example';
+  const target = 'https://dedup.example/feed';
+  const outcomes = Array.from({ length: 4 }, () =>
+    mgr.ensureSignedInOrPend(null, origin, rule.id, undefined, target),
+  );
+
+  assert.equal(opens, 1, 'exactly ONE sign-in tab opened across 4 concurrent navs');
+  assert.deepEqual(outcomes, ['pending', 'pending', 'pending', 'pending'], 'every caller is told to wait');
+  const session = (mgr as unknown as { signinSessions: Map<string, { waiters: number; state: string }> })
+    .signinSessions.get(sessKey(null, origin));
+  assert.ok(session, 'one registry session exists for the (workspace, origin)');
+  assert.equal(session!.state, 'pending');
+  assert.equal(session!.waiters, 4, 'all four navs joined the single session (de-dup telemetry)');
+  assert.equal(
+    sent.filter((s) => s.channel === CH.signinPendingOpened).length, 1,
+    'browser:signin-pending-opened fired exactly once',
+  );
+});
+
+test('WI-2(d) ensureSignedInOrPend: a ready session short-circuits to ready (no tab)', () => {
+  const { mgr } = makeManager();
+  const rule = store.insertRule({ hostname: 'dedup-ready.example', scheme: 'https', includeSubdomains: true, allowSignedIn: true, workspaceId: null });
+  mgr.invalidateAccessCache();
+  const origin = 'https://dedup-ready.example';
+  // An already-active session → classifyOriginState returns ready before any tab.
+  store.upsertSignedInOrigin(rule.id, origin, null, { signedInAt: Date.now(), verifiedAt: Date.now() });
+  let opens = 0;
+  (mgr as unknown as Record<string, unknown>).openSigninHandoffTab = (): string => { opens += 1; return 'x'; };
+  assert.equal(mgr.ensureSignedInOrPend(null, origin, rule.id, undefined, `${origin}/feed`), 'ready');
+  assert.equal(opens, 0, 'no sign-in tab opened for a live session');
+});
+
+// ── Signed-in tabs WI-8: unattended short-circuit + hold-timeout config ───────
+
+test('WI-8 ensureSignedInOrPend: an unattended workspace degrades to unavailable WITHOUT opening a tab', () => {
+  const { mgr, sent } = makeManager();
+  const rule = store.insertRule({ hostname: 'unattended.example', scheme: 'https', includeSubdomains: true, allowSignedIn: true, workspaceId: 'ws-night' });
+  mgr.invalidateAccessCache();
+  const origin = 'https://unattended.example';
+  let opens = 0;
+  (mgr as unknown as Record<string, unknown>).openSigninHandoffTab = (): string => { opens += 1; return 'x'; };
+
+  // Default (attended) would pend + open a tab; flag the workspace unattended.
+  mgr.setSigninUnattended('ws-night', true);
+  assert.equal(mgr.isSigninUnattended('ws-night'), true);
+  assert.equal(
+    mgr.ensureSignedInOrPend('ws-night', origin, rule.id, undefined, `${origin}/feed`),
+    'unavailable',
+    'an overnight/unattended run degrades immediately instead of hanging on a human',
+  );
+  assert.equal(opens, 0, 'no quarantined sign-in tab opened for an unattended workspace');
+  assert.equal(
+    sent.filter((s) => s.channel === CH.signinPendingOpened).length, 0,
+    'no signin-pending-opened event fired for the unattended degrade',
+  );
+
+  // Clearing the flag restores the attended (pending + tab) behavior.
+  mgr.setSigninUnattended('ws-night', false);
+  assert.equal(mgr.isSigninUnattended('ws-night'), false);
+  assert.equal(mgr.ensureSignedInOrPend('ws-night', origin, rule.id, undefined, `${origin}/feed`), 'pending');
+  assert.equal(opens, 1, 'with the flag cleared, a sign-in tab is opened again');
+});
+
+test('WI-8 signinHoldTimeoutMs: configurable with a sane floor (rejects 0/negative)', () => {
+  const { mgr } = makeManager();
+  assert.equal(mgr.getSigninHoldTimeoutMs(), 300_000, 'defaults to 5 min');
+  mgr.setSigninHoldTimeoutMs(60_000);
+  assert.equal(mgr.getSigninHoldTimeoutMs(), 60_000);
+  mgr.setSigninHoldTimeoutMs(0);
+  assert.equal(mgr.getSigninHoldTimeoutMs(), 60_000, 'a 0 is rejected (no busy-degrade)');
+  mgr.setSigninHoldTimeoutMs(-5);
+  assert.equal(mgr.getSigninHoldTimeoutMs(), 60_000, 'a negative is rejected');
+});
+
+test('WI-4 listSigninPending: maps registry states to wire vocabulary, workspace-scoped', () => {
+  const { mgr } = makeManager();
+  const sessions = (mgr as unknown as { signinSessions: Map<string, unknown> }).signinSessions;
+  const mk = (workspaceId: string | null, origin: string, state: string) => ({
+    ruleId: 'r', workspaceId, origin, targetUrl: origin, tabId: 't',
+    state, openedAt: 1000, reason: '', waiters: 1,
+  });
+  sessions.set(sessKey('ws-a', 'https://p.example'), mk('ws-a', 'https://p.example', 'pending'));
+  sessions.set(sessKey('ws-a', 'https://r.example'), mk('ws-a', 'https://r.example', 'ready'));
+  sessions.set(sessKey('ws-a', 'https://u.example'), mk('ws-a', 'https://u.example', 'unavailable'));
+  sessions.set(sessKey('ws-b', 'https://other.example'), mk('ws-b', 'https://other.example', 'pending'));
+
+  const out = mgr.listSigninPending('ws-a');
+  assert.equal(out.length, 3, 'only ws-a sessions, not ws-b');
+  const byOrigin = Object.fromEntries(out.map((e) => [e.origin, e]));
+  assert.equal(byOrigin['https://p.example'].state, 'pending_signin');
+  assert.equal(byOrigin['https://r.example'].state, 'ready');
+  assert.equal(byOrigin['https://u.example'].state, 'signin_unavailable');
+  assert.equal(byOrigin['https://p.example'].request_id, 'ws-a|https://p.example');
+  assert.equal(byOrigin['https://p.example'].since, 1000);
+});
+
+// ── Signed-in tabs WI-3: completion upserts an ACTIVE session + resolves ──────
+
+test('WI-3 accessHandoffReady: completion upserts the origin ACTIVE, clears quarantine, resolves the session ready', () => {
+  const { mgr, sent } = makeManager();
+  const rule = store.insertRule({ hostname: 'complete.example', scheme: 'https', includeSubdomains: true, allowSignedIn: true, workspaceId: null });
+  mgr.invalidateAccessCache();
+  const origin = 'https://complete.example';
+  assert.equal(store.getSignedInOriginState(rule.id, origin), undefined, 'no session before completion');
+
+  // A quarantined sign-in tab committed on the allow_signed_in origin, plus a
+  // pending registry session pointing at it (as ensureSignedInOrPend would leave it).
+  const tab = injectTab(mgr, { partition: 'agent', url: `${origin}/dashboard`, signinPending: true });
+  (tab as unknown as { signinRuleId?: string }).signinRuleId = rule.id;
+  const key = sessKey(null, origin);
+  (mgr as unknown as { signinSessions: Map<string, unknown> }).signinSessions.set(key, {
+    ruleId: rule.id, workspaceId: null, origin, targetUrl: `${origin}/dashboard`,
+    tabId: tab.id, state: 'pending', openedAt: 0, reason: '', waiters: 2,
+  });
+
+  sent.length = 0;
+  mgr.accessHandoffReady(tab.id);
+
+  assert.equal(store.getSignedInOriginState(rule.id, origin), 'active', 'the session is upserted active on completion');
+  assert.equal(tab.signinPending, false, 'quarantine cleared (the tab becomes agent-visible/drivable)');
+  const session = (mgr as unknown as { signinSessions: Map<string, { state: string }> }).signinSessions.get(key);
+  assert.equal(session!.state, 'ready', 'the registry session flips ready so pollers proceed');
+  const resolved = sent.find((s) => s.channel === CH.signinResolved);
+  assert.ok(resolved, 'browser:signin-resolved emitted');
+  assert.equal((resolved!.payload as { state: string }).state, 'ready');
+});
+
+test('WI-3 accessSigninPendingCancel: closes the quarantined tab + resolves unavailable, but PRESERVES durable consent', () => {
+  const { mgr, sent } = makeManager();
+  const rule = store.insertRule({
+    hostname: 'cancel.example', scheme: 'https', includeSubdomains: true, allowSignedIn: true,
+    workspaceId: null, consentAckedAt: 999,
+  });
+  mgr.invalidateAccessCache();
+  const origin = 'https://cancel.example';
+  const tab = injectTab(mgr, { partition: 'agent', url: `${origin}/login`, signinPending: true });
+  const key = sessKey(null, origin);
+  (mgr as unknown as { signinSessions: Map<string, unknown> }).signinSessions.set(key, {
+    ruleId: rule.id, workspaceId: null, origin, targetUrl: `${origin}/feed`,
+    tabId: tab.id, state: 'pending', openedAt: 0, reason: '', waiters: 1,
+  });
+  const internals = mgr as unknown as { tabs: Map<string, unknown> };
+
+  sent.length = 0;
+  mgr.accessSigninPendingCancel(tab.id);
+
+  assert.equal(internals.tabs.has(tab.id), false, 'the quarantined sign-in tab is closed');
+  const session = (mgr as unknown as { signinSessions: Map<string, { state: string }> }).signinSessions.get(key);
+  assert.equal(session!.state, 'unavailable', 'the session degrades to unavailable');
+  const resolved = sent.find((s) => s.channel === CH.signinResolved);
+  assert.equal((resolved!.payload as { state: string }).state, 'signin_unavailable', 'banner clears via resolved(unavailable)');
+  // Durable consent is NOT cleared — the origin can re-trigger a later sign-in.
+  assert.equal(store.getRule(rule.id)?.consentAckedAt, 999, 'consent_acked_at is preserved across cancel');
 });
 
 // ── Run ──────────────────────────────────────────────────────────────────────

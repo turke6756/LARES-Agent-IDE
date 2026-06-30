@@ -11,7 +11,7 @@ export type StatusChangeSource =
 
 /** Mirror of `StatusMonitor.WaitingKind`. Re-declared here to keep this leaf
  *  module free of importing the monitor (which pulls in the database). */
-export type WaitingKindTag = 'question' | 'y-n' | 'enter' | 'choice' | 'approve' | 'tty-pattern';
+export type WaitingKindTag = 'question' | 'y-n' | 'enter' | 'choice' | 'approve' | 'tty-pattern' | 'notification';
 
 export interface StatusChangedEvent {
   agentId: string;

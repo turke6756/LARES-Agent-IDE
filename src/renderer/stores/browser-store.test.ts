@@ -336,6 +336,48 @@ describe('Slice-2: authoritative agent identity + attention model', () => {
   });
 });
 
+// ── Proactive-signin PHASE 2 WI-D: beginSigninHandoff focuses the handoff tab ─
+describe('WI-D: beginSigninHandoff focuses the new sign-in tab in the human pane', () => {
+  const rule = { id: 'r-handoff', hostname: 'mail.example' } as never;
+
+  // Augment the mock with just the access verb beginSigninHandoff needs. Scoped
+  // here (not in makeMockApi) so the event-bridge tests still see no api.access
+  // and skip the access subscription block.
+  beforeEach(() => {
+    (api as unknown as { access: unknown }).access = {
+      handoffSignin: vi.fn(async (_ruleId: string) => ({ tabId: 'handoff-tab' })),
+    };
+  });
+
+  it('sets activeTabId to the handoff tab (human-initiated — the anti-yank guard must NOT block it)', async () => {
+    // The pane is on no tab (the access overlay was open over it).
+    expect(useBrowserStore.getState().activeTabId).toBeNull();
+    await useBrowserStore.getState().beginSigninHandoff(rule);
+    const s = useBrowserStore.getState();
+    expect(s.activeTabId).toBe('handoff-tab');
+    expect(s.signinHandoff?.tabId).toBe('handoff-tab');
+    expect(s.accessViewOpen).toBe(false);
+  });
+
+  it('still focuses the handoff tab even when another tab is already active (overlay was over it)', async () => {
+    useBrowserStore.setState({ activeTabId: 'some-other-tab' });
+    await useBrowserStore.getState().beginSigninHandoff(rule);
+    expect(useBrowserStore.getState().activeTabId).toBe('handoff-tab');
+  });
+
+  it('a LATER agent-partition tabState for the handoff tab fills details without re-yanking focus', async () => {
+    await useBrowserStore.getState().beginSigninHandoff(rule);
+    // The tabState event arrives after selection: handleTabState's anti-yank
+    // guard (activeTabId === null) is disarmed, so focus stays put and details fill.
+    useBrowserStore
+      .getState()
+      .handleTabState(tabState({ tabId: 'handoff-tab', partition: 'agent', title: 'Sign in' }));
+    const s = useBrowserStore.getState();
+    expect(s.activeTabId).toBe('handoff-tab');
+    expect(s.tabs.find((t) => t.tabId === 'handoff-tab')?.title).toBe('Sign in');
+  });
+});
+
 describe('denied window.open requests', () => {
   it('accepts both the object and bare-string payload forms', () => {
     useBrowserStore.getState().handleOpenRequest({ url: 'https://a.dev/' });

@@ -20,6 +20,7 @@ import {
   type ChatLogReader,
   type ChatLogReaderSession,
 } from './types';
+import { parseSqliteUtcMs } from '../sqlite-time';
 
 interface ToolResultLocation {
   jsonlPath: string;
@@ -29,6 +30,27 @@ interface ToolResultLocation {
 }
 
 const EOF_STREAK_REREGISTER = 3;
+const STALE_SIGNAL_REEMIT_MS = 30_000;
+const CLEAR_SUCCESSOR_HEAD_LINES = 8;
+
+/** A session-pinned stale signal: a Claude agent's tailed `.jsonl` went quiet
+ *  (EOF streak). The signal carries the session id that WAS being tailed so the
+ *  rotation handler can reject a retry whose target session no longer matches
+ *  the agent's current `resumeSessionId` (e.g. a stale EOF racing after the row
+ *  already rotated). EOF/stale is only a retry trigger, NEVER the identity
+ *  source — the successor candidate comes from the hook-bound session id. */
+export interface ClaudeStaleSignal {
+  agentId: string;
+  staleSessionId: string;
+  workingDirectory: string;
+  observedAt: number;
+}
+
+/** Canonical `~/.claude/projects/<slug>` directory name for a working
+ *  directory. Exported so the rotation guard can group agents by slug dir. */
+export function makeClaudeProjectSlug(workingDirectory: string): string {
+  return workingDirectory.replace(/[/\\:_.]/g, '-');
+}
 
 export class ClaudeJsonlReader implements ChatLogReader {
   readonly provider: AgentProvider = 'claude';
@@ -48,6 +70,8 @@ export class ClaudeJsonlReader implements ChatLogReader {
   private emittedSystemInit = new Set<string>(); // agentId
   private toolResultLocations = new Map<string, ToolResultLocation>(); // `${agentId}:${toolUseId}`
   private eofStreak = new Map<string, number>(); // agentId
+  private pendingStale = new Map<string, ClaudeStaleSignal>(); // agentId — drained by dispatcher
+  private lastStaleEmitAt = new Map<string, number>(); // agentId -> last emit ms (throttle)
 
   private getWindowsProjectsDir(): string | null {
     if (this.windowsProjectsDir !== undefined) return this.windowsProjectsDir;
@@ -71,6 +95,155 @@ export class ClaudeJsonlReader implements ChatLogReader {
       this.partialLines.delete(cached);
     }
     this.eofStreak.delete(agentId);
+    this.pendingStale.delete(agentId);
+    this.lastStaleEmitAt.delete(agentId);
+  }
+
+  /** Throttled accumulation of a /clear-rotation stale signal. The dispatcher
+   *  drains `pendingStale` once per tick. Throttle bounds re-scan cost when a
+   *  file stays quiet (idle agent that did NOT /clear). The signal is pinned to
+   *  the session id that was being tailed so a stale retry can't rotate an
+   *  agent whose row has since moved on to a different session. */
+  private recordStaleSignal(session: ChatLogReaderSession): void {
+    const now = Date.now();
+    const last = this.lastStaleEmitAt.get(session.agentId) || 0;
+    if (now - last < STALE_SIGNAL_REEMIT_MS) return;
+    this.lastStaleEmitAt.set(session.agentId, now);
+    this.pendingStale.set(session.agentId, {
+      agentId: session.agentId,
+      staleSessionId: session.sessionId,
+      workingDirectory: session.workingDirectory,
+      observedAt: now,
+    });
+  }
+
+  /** Drain the session-pinned stale signals accumulated since the last drain.
+   *  The dispatcher re-emits these as `'session-stale'`. */
+  drainStaleSignals(): ClaudeStaleSignal[] {
+    if (this.pendingStale.size === 0) return [];
+    const out = [...this.pendingStale.values()];
+    this.pendingStale.clear();
+    return out;
+  }
+
+  /** Locate the on-disk `.jsonl` for a working dir + session id WITHOUT
+   *  touching the resolved-path cache. Mirrors `resolveJsonlPath`'s lookup
+   *  order. Returns the full path or null. */
+  private locateSessionFile(workingDirectory: string, sessionId: string): string | null {
+    const slug = this.makeSlug(workingDirectory);
+    const fileName = `${sessionId}.jsonl`;
+    const wslDir = this.getWslProjectsDir();
+    const windowsDir = this.getWindowsProjectsDir();
+
+    if (workingDirectory.startsWith('/') && wslDir) {
+      const p = path.join(wslDir, slug, fileName);
+      if (fs.existsSync(p)) return p;
+    }
+    if (windowsDir) {
+      const p = path.join(windowsDir, slug, fileName);
+      if (fs.existsSync(p)) return p;
+    }
+    for (const baseDir of [windowsDir, wslDir].filter(Boolean) as string[]) {
+      try {
+        for (const dir of fs.readdirSync(baseDir)) {
+          const p = path.join(baseDir, dir, fileName);
+          if (fs.existsSync(p)) return p;
+        }
+      } catch {
+        // can't read directory
+      }
+    }
+    return null;
+  }
+
+  /** Validate that an ALREADY-agent-bound candidate session id is a genuine
+   *  `/clear` successor of `currentSessionId`. The candidate is supplied by the
+   *  hook (which carries both the dashboard agentId and Claude's new
+   *  session_id), so this method NEVER scans the directory to *discover* a
+   *  successor — cwd is only a filesystem scope to validate one specific
+   *  candidate. That is what makes rotation BUG-26-safe under shared cwds: a
+   *  cwd sibling's successor can never be adopted because it was never bound to
+   *  this agent.
+   *
+   *  Accept iff ALL hold:
+   *   - candidate id differs from the current id,
+   *   - `<currentDir>/<candidate>.jsonl` exists (same Claude project dir as the
+   *     current session file — a same-named file in another slug dir is NOT
+   *     reachable, so cross-slug collisions are rejected),
+   *   - candidate mtime is newer than the current file's mtime,
+   *   - candidate mtime is not older than `startedAt` (when parseable),
+   *   - candidate head carries the `/clear` signature bound to its own id.
+   *  Bounded work: two stats + one 8 KB head read. */
+  validateClearSuccessor(
+    workingDirectory: string,
+    currentSessionId: string,
+    candidateSessionId: string,
+    startedAt?: string
+  ): boolean {
+    if (!candidateSessionId || candidateSessionId === currentSessionId) return false;
+
+    const currentPath = this.locateSessionFile(workingDirectory, currentSessionId);
+    if (!currentPath) return false;
+    let currentMtimeMs: number;
+    try { currentMtimeMs = fs.statSync(currentPath).mtimeMs; } catch { return false; }
+
+    // Build the candidate path in the SAME directory as the current file; do
+    // NOT scan other slug directories for candidate adoption.
+    const candidatePath = path.join(path.dirname(currentPath), `${candidateSessionId}.jsonl`);
+    let candidateMtimeMs: number;
+    try { candidateMtimeMs = fs.statSync(candidatePath).mtimeMs; } catch { return false; }
+
+    if (candidateMtimeMs <= currentMtimeMs) return false;
+    const startedAtMs = parseSqliteUtcMs(startedAt);
+    if (startedAtMs !== null && candidateMtimeMs < startedAtMs) return false;
+    if (!this.hasClearSignature(candidatePath, candidateSessionId)) return false;
+    return true;
+  }
+
+  /** True if the first CLEAR_SUCCESSOR_HEAD_LINES lines of a `.jsonl` carry the
+   *  fresh `/clear` signature, bound to the candidate file's own session id:
+   *   - a self-rooted entry (`parentUuid === null`, `sessionId === candidate`),
+   *   - a `user` entry (`sessionId === candidate`) whose content contains
+   *     `<command-name>/clear</command-name>`.
+   *  Binding every checked line to the candidate sessionId excludes
+   *  concatenated/foreign heads. Restricting to the head excludes conversation
+   *  text that merely mentions "/clear" deep in the file. Requiring the command
+   *  marker excludes forks / `--fork-session` / `--resume`-elsewhere roots.
+   *  We deliberately do NOT pin `type === 'mode'` on line 1 — that is the
+   *  element most likely to drift across Claude Code versions, and a silent
+   *  hard-fail there would read as "the fix stopped working." */
+  private hasClearSignature(jsonlPath: string, candidateSessionId: string): boolean {
+    let head: string;
+    try {
+      const fd = fs.openSync(jsonlPath, 'r');
+      try {
+        const buf = Buffer.alloc(8192);
+        const bytes = fs.readSync(fd, buf, 0, 8192, 0);
+        head = buf.toString('utf-8', 0, bytes);
+      } finally { fs.closeSync(fd); }
+    } catch { return false; }
+
+    const lines = head.split('\n').slice(0, CLEAR_SUCCESSOR_HEAD_LINES);
+    let sawFreshRoot = false;
+    let sawClearCommand = false;
+    for (const line of lines) {
+      const t = line.trim();
+      if (!t) continue;
+      let entry: any;
+      try { entry = JSON.parse(t); } catch { continue; }
+      if (entry.sessionId !== candidateSessionId) continue; // bind to this file's own id
+      if (entry.parentUuid === null) sawFreshRoot = true;
+      if (entry.type === 'user') {
+        const raw = entry.message?.content ?? entry.content;
+        const text = typeof raw === 'string'
+          ? raw
+          : Array.isArray(raw)
+            ? raw.map((b: any) => (typeof b?.text === 'string' ? b.text : '')).join(' ')
+            : '';
+        if (text.includes('<command-name>/clear</command-name>')) sawClearCommand = true;
+      }
+    }
+    return sawFreshRoot && sawClearCommand;
   }
 
   /** Return true if a Claude session JSONL exists on disk for the given working
@@ -158,12 +331,29 @@ export class ClaudeJsonlReader implements ChatLogReader {
     if (fileSize <= lastOffset) {
       const streak = (this.eofStreak.get(session.agentId) || 0) + 1;
       this.eofStreak.set(session.agentId, streak);
-      if (streak >= EOF_STREAK_REREGISTER && session.subscribed) {
-        this.forgetResolvedPath(session.agentId);
+      if (streak >= EOF_STREAK_REREGISTER) {
+        // /clear-rotation signal — throttled internally; fires for subscribed
+        // AND unsubscribed agents (Decision 1: the context bar is list-level).
+        this.recordStaleSignal(session);
+        if (session.subscribed) {
+          // Existing subscribed-only same-session re-resolution. NOTE:
+          // forgetResolvedPath() also deletes the eofStreak entry, so this
+          // branch naturally re-arms and re-enters every EOF_STREAK_REREGISTER
+          // polls (unchanged behavior).
+          this.forgetResolvedPath(session.agentId);
+        } else {
+          // Unsubscribed: re-arm the streak explicitly so this branch re-enters
+          // on the same cadence (the stale emit itself is time-throttled).
+          this.eofStreak.set(session.agentId, 0);
+        }
       }
       return [];
     }
     this.eofStreak.delete(session.agentId);
+    // File advanced — any pending stale signal is moot, and a future quiet
+    // episode should be free to re-signal promptly.
+    this.pendingStale.delete(session.agentId);
+    this.lastStaleEmitAt.delete(session.agentId);
 
     const fd = fs.openSync(jsonlPath, 'r');
     let readStart: number;
@@ -457,6 +647,6 @@ export class ClaudeJsonlReader implements ChatLogReader {
   }
 
   private makeSlug(workingDirectory: string): string {
-    return workingDirectory.replace(/[/\\:_.]/g, '-');
+    return makeClaudeProjectSlug(workingDirectory);
   }
 }

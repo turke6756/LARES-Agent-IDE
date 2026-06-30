@@ -37,9 +37,15 @@ function rmrf(dir: string): void {
   try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
 }
 
-function record(state: 'idle' | 'working' | 'active', ts: number, extra: Partial<ParsedHookEvent> = {}): string {
-  const source = state === 'working' ? 'hook-start' : state === 'active' ? 'hook-session-start' : 'hook-stop';
-  const hookEventName = state === 'working' ? 'UserPromptSubmit' : state === 'active' ? 'SessionStart' : 'Stop';
+function record(state: 'idle' | 'working' | 'active' | 'waiting', ts: number, extra: Partial<ParsedHookEvent> = {}): string {
+  const source = state === 'working' ? 'hook-start'
+    : state === 'active' ? 'hook-session-start'
+    : state === 'waiting' ? 'hook-notification'
+    : 'hook-stop';
+  const hookEventName = state === 'working' ? 'UserPromptSubmit'
+    : state === 'active' ? 'SessionStart'
+    : state === 'waiting' ? 'Notification'
+    : 'Stop';
   return JSON.stringify({ v: 1, agentId: 'ag-1', state, source, ts, hookEventName, ...extra }) + '\n';
 }
 
@@ -167,6 +173,41 @@ test('startup lookback: 64 KB window, partial first line discarded, old/active f
     tailer.drain();
     assert.equal(received.length, 2, 'fresh post-startup active record applies normally');
     assert.equal(received[1].turnId, 'live-active');
+  } finally {
+    restore();
+    rmrf(dir);
+  }
+});
+
+test('startup lookback: stale historical waiting is suppressed (joins active); fresh post-launch waiting applies', () => {
+  const dir = mktmp('lookback-waiting');
+  const { warns, restore } = captureWarns();
+  try {
+    const NOW = Date.now();
+    // Build > 64 KB of old history so the tailer seeks mid-line on startup.
+    let history = '';
+    const oldTs = NOW - 60 * 60_000; // 1 h old
+    while (history.length <= SPOOL_LOOKBACK_BYTES + 4096) {
+      history += record('idle', oldTs, { turnId: 'old-old-old-old' });
+    }
+    // Tail records inside the lookback window:
+    history += record('waiting', NOW - 1_000, { turnId: 'fresh-waiting', waitingExcerpt: 'old wait' }); // fresh-ts but historical Notification → must be suppressed (launch/turn-specific)
+    history += record('idle', NOW - 1_000, { turnId: 'fresh-idle' });  // fresh idle → applied (proves the window IS being read)
+
+    const { spool, tailer, received } = makeTailer({ dir, preexisting: history, now: () => NOW });
+    tailer.drain();
+    assert.equal(received.length, 1, `a historical 'waiting' in the lookback window must be suppressed like 'active'; got ${JSON.stringify(received.map(r => r.turnId))}`);
+    assert.equal(received[0].turnId, 'fresh-idle');
+    assert.ok(!received.some((r) => r.state === 'waiting'), 'no historical waiting may leak through startup lookback');
+    assert.deepStrictEqual(warns, [], 'the discarded first partial line must not produce a malformed warn');
+
+    // A 'waiting' record appended AFTER startup is live → applies.
+    fs.appendFileSync(spool, record('waiting', NOW, { turnId: 'live-waiting', waitingExcerpt: 'need input' }));
+    tailer.drain();
+    assert.equal(received.length, 2, 'a fresh post-startup waiting record applies normally');
+    assert.equal(received[1].turnId, 'live-waiting');
+    assert.equal(received[1].state, 'waiting');
+    assert.equal(received[1].waitingExcerpt, 'need input');
   } finally {
     restore();
     rmrf(dir);

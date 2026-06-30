@@ -2,6 +2,8 @@ import React, { useState, useEffect, useRef } from 'react';
 import { motion } from 'framer-motion';
 import type { Agent } from '../../../shared/types';
 import StatusBadge from './StatusBadge';
+import { formatAgentToken } from '../../lib/agent-mention';
+import { RoleChips, ContextStatsBar } from './agent-card-bits';
 import { PROVIDER_META } from '../../../shared/constants';
 import { useDashboardStore } from '../../stores/dashboard-store';
 
@@ -11,12 +13,6 @@ function getDisplayDirectory(agent: Agent): string {
     ? dir.replace(/\/\.claude\/agents\/[^/]+$/, '')
     : dir;
   return stripped.split('/').filter(Boolean).pop() || stripped;
-}
-
-function formatTokenCount(n: number): string {
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
-  return String(n);
 }
 
 function timeAgo(dateStr: string | null): string {
@@ -207,13 +203,14 @@ export default function AgentCard({
         e.dataTransfer?.setData('text/agentId', agent.id);
       }
       // Chat-input payload — mirrors the file-drag convention in
-      // utils/drag-file.ts (dedicated MIME key + text/plain fallback).
-      const shortId = agent.id.substring(0, 6);
+      // utils/drag-file.ts (dedicated MIME key + text/plain fallback). The
+      // text/plain fallback uses the shared full-id token (formatAgentToken) so
+      // the drag and "@"-mention paths emit exactly one format.
       e.dataTransfer?.setData(
         'application/x-agent-card',
         JSON.stringify({ id: agent.id, title: agent.title, provider: agent.provider || 'claude' }),
       );
-      e.dataTransfer?.setData('text/plain', `[dashboard agent "${agent.title}" #${shortId}]`);
+      e.dataTransfer?.setData('text/plain', formatAgentToken(agent));
       if (e.dataTransfer) e.dataTransfer.effectAllowed = 'copy';
     };
 
@@ -296,20 +293,8 @@ export default function AgentCard({
         <div className="flex items-center justify-between gap-2 mb-0.5">
           <div className="flex items-center gap-2 min-w-0">
             <span className="text-[11px] text-gray-500 font-mono shrink-0">#{agent.id.substring(0,6)}</span>
-            {/* Role chip — one of Supervisor / Researcher / Worker. Supervision
-                is orthogonal and rendered as its own badge below. */}
-            {agent.isSupervisor ? (
-               <span className="text-[11px] text-amber-400 bg-amber-500/15 px-1.5 py-0.5 font-semibold truncate" title="Supervisor — watches workers and routes questions to the human">Supervisor</span>
-            ) : agent.isResearcher ? (
-               <span className="text-[11px] text-teal-400 bg-teal-500/15 px-1.5 py-0.5 font-semibold truncate" title="Researcher — browses and researches the web in an app-managed sandbox; never edits code">Researcher</span>
-            ) : agent.isWorker ? (
-               <span className="text-[11px] text-sky-400 bg-sky-500/15 px-1.5 py-0.5 font-semibold truncate" title="Worker — status derived from turn-boundary hooks">Worker</span>
-            ) : null}
-            {/* Supervised badge — orthogonal to the role chip (a worker or
-                researcher may or may not be supervised). */}
-            {agent.isSupervised && !agent.isSupervisor && (
-               <span className="text-[11px] text-purple-400 bg-purple-500/15 px-1.5 py-0.5 font-semibold truncate" title="A supervisor watches this agent's status and routes its questions to the human">Supervised</span>
-            )}
+            {/* Role / supervised / elevated chips — shared with OwnerContainerBar. */}
+            <RoleChips agent={agent} />
           </div>
 
           <div className="flex items-center gap-2 shrink-0">
@@ -378,33 +363,7 @@ export default function AgentCard({
 
       {/* Context Stats Bar — all providers emit usage events (claude jsonl,
           codex rollout token_count, gemini transcript); render whenever stats exist. */}
-      {cs && (() => {
-        const pct = cs.contextPercentage;
-        const isWarning = pct > 60;
-        const isCritical = pct > 85;
-        const barColor = isCritical ? 'bg-accent-red' : isWarning ? 'bg-accent-orange' : 'bg-accent-blue';
-        const textColor = isCritical ? 'text-accent-red' : isWarning ? 'text-accent-orange' : 'text-accent-blue';
-        return (
-          <div className="mb-2">
-            <div className="flex items-center justify-between text-[11px] text-gray-400 mb-1">
-              <span className={`${textColor} ${isCritical ? 'font-bold' : 'font-medium'}`}>
-                {isCritical ? '!! ' : ''}Ctx {formatTokenCount(cs.totalContextTokens)}/{formatTokenCount(cs.contextWindowMax)}
-              </span>
-              <span>Turns: {cs.turnCount} Out: {formatTokenCount(cs.totalOutputTokens)}</span>
-            </div>
-            <div className="relative w-full h-[4px] bg-surface-3 overflow-hidden">
-              <div
-                className={`h-full ${barColor} transition-all duration-500 ease-out`}
-                style={{ width: `${pct}%` }}
-              />
-            </div>
-            <div className="flex items-center justify-between mt-0.5">
-              <span className="text-[11px] text-gray-500 truncate">{cs.model.replace('claude-', '').replace(/-\d{8}$/, '')}</span>
-              <span className={`text-[11px] ${textColor} font-semibold`}>{pct}%</span>
-            </div>
-          </div>
-        );
-      })()}
+      {cs && <ContextStatsBar cs={cs} />}
 
       {/* Footer Meta */}
       <div className="flex items-center justify-between text-[11px] text-gray-500">

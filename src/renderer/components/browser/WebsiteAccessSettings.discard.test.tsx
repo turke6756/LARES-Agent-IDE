@@ -32,10 +32,19 @@ function render() {
   });
 }
 
-function clickOption(label: string) {
-  const btn = Array.from(container.querySelectorAll<HTMLButtonElement>('button[role="radio"]')).find(
-    (b) => (b.textContent ?? '').trim() === label,
+// Scope to the idle-discard radiogroup specifically — the settings pane now also
+// renders the WI-8 "Sign-in hold timeout" radiogroup, so a pane-wide role="radio"
+// query would mix the two controls' options together.
+function discardRadios(): HTMLButtonElement[] {
+  const group = container.querySelector(
+    '[role="radiogroup"][aria-label="Suspend idle tabs after"]',
   );
+  if (!group) throw new Error('idle-discard radiogroup not found');
+  return Array.from(group.querySelectorAll<HTMLButtonElement>('button[role="radio"]'));
+}
+
+function clickOption(label: string) {
+  const btn = discardRadios().find((b) => (b.textContent ?? '').trim() === label);
   if (!btn) throw new Error(`discard option not found: ${label}`);
   act(() => {
     btn.dispatchEvent(new MouseEvent('click', { bubbles: true }));
@@ -63,9 +72,7 @@ afterEach(() => {
 describe('idle-discard threshold control', () => {
   it('renders the four options with the current selection checked', () => {
     render();
-    const radios = Array.from(
-      container.querySelectorAll<HTMLButtonElement>('button[role="radio"]'),
-    );
+    const radios = discardRadios();
     expect(radios.map((r) => r.textContent?.trim())).toEqual(['15 min', '30 min', '60 min', 'Never']);
     const checked = radios.find((r) => r.getAttribute('aria-checked') === 'true');
     expect(checked?.textContent?.trim()).toBe('30 min'); // default mirror

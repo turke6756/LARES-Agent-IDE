@@ -213,12 +213,13 @@ export class HookSpoolTailer {
     const ev = record as ParsedHookEvent;
 
     // Startup-lookback gates: a record that already existed at init time is
-    // historical. Apply only fresh ones, and NEVER 'active' — a historical
-    // SessionStart proving an OLD launch loaded hooks must not stamp the
-    // CURRENT launch healthy. Fresh records read during normal tailing apply
-    // normally (including 'active').
+    // historical. Apply only fresh ones, and NEVER 'active' or 'waiting' — a
+    // historical SessionStart proving an OLD launch loaded hooks must not stamp
+    // the CURRENT launch healthy, and a stale replayed Notification 'waiting'
+    // (launch/turn-specific, like the canary) must not resurrect an old wait at
+    // startup. Fresh records read during normal tailing apply normally.
     if (lineEndOffset <= this.lookbackEndOffset) {
-      if (ev.state === 'active') return;
+      if (ev.state === 'active' || ev.state === 'waiting') return;
       if (typeof ev.ts !== 'number' || ev.ts < this.now() - SPOOL_LOOKBACK_MAX_AGE_MS) return;
     }
 

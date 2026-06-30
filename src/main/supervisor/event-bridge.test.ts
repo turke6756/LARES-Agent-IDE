@@ -17,6 +17,9 @@ import {
 import {
   SUPERVISOR_EVENT_COOLDOWN_MS,
   SUPERVISOR_USER_TYPING_QUIESCENT_MS,
+  TRANSIENT_SUB_TTL_MS,
+  TRANSIENT_SUB_PENDING_START_TIMEOUT_MS,
+  TRANSIENT_SUB_MAX_PER_TARGET,
 } from '../../shared/constants';
 import type { ContextStats } from '../../shared/types';
 import type {
@@ -328,6 +331,43 @@ async function BR_10_multiSupervisorIsolation(): Promise<void> {
   console.log('  BR-10 ✓ multi-supervisor workspace isolation');
 }
 
+async function BR_QUEUE_recipientScoped(): Promise<void> {
+  // Increment 0 regression: two independently-busy supervisors must NOT share
+  // one queue/drain handle. Each owns a distinct worker in its own workspace;
+  // a status event for each must land in its own recipient queue only, and
+  // draining one must not touch the other.
+  const f = makeFakeBridgeDeps();
+  const supA = makeAgent('sup-A', { workspaceId: 'ws-A', isSupervisor: true, isSupervised: false, status: 'working' });
+  const supB = makeAgent('sup-B', { workspaceId: 'ws-B', isSupervisor: true, isSupervised: false, status: 'working' });
+  const workerA = makeAgent('wkA', { workspaceId: 'ws-A', status: 'working', title: 'Worker A' });
+  const workerB = makeAgent('wkB', { workspaceId: 'ws-B', status: 'working', title: 'Worker B' });
+  f.agents.set(supA.id, supA);
+  f.agents.set(supB.id, supB);
+  f.agents.set(workerA.id, workerA);
+  f.agents.set(workerB.id, workerB);
+  const bridge = new EventBridge(f.deps);
+
+  await bridge.onStatusChanged({ agentId: workerA.id, status: 'idle', fromStatus: 'working', source: 'monitor' });
+  await bridge.onStatusChanged({ agentId: workerB.id, status: 'idle', fromStatus: 'working', source: 'monitor' });
+
+  assert.equal(f.sendInputCalls.length, 0, 'BR_QUEUE: nothing sent while both supervisors busy');
+  assert.equal(bridge.getQueueSnapshot(supA.id).length, 1, 'BR_QUEUE: supA queue holds exactly one event');
+  assert.equal(bridge.getQueueSnapshot(supB.id).length, 1, 'BR_QUEUE: supB queue holds exactly one event');
+  assert.equal(bridge.getQueueSnapshot(supA.id)[0].agentId, workerA.id, 'BR_QUEUE: supA queue holds only its own worker event');
+  assert.equal(bridge.getQueueSnapshot(supB.id)[0].agentId, workerB.id, 'BR_QUEUE: supB queue holds only its own worker event');
+
+  // Flip supA idle and drain it; supB's queue must be untouched.
+  supA.status = 'idle';
+  await bridge.drainPendingFor(supA.id);
+
+  assert.equal(f.sendInputCalls.length, 1, 'BR_QUEUE: supA drained exactly its event');
+  assert.equal(f.sendInputCalls[0].agentId, supA.id);
+  assert.ok(f.sendInputCalls[0].text.includes('Worker A'), 'BR_QUEUE: supA payload mentions Worker A');
+  assert.equal(bridge.getQueueSnapshot(supA.id).length, 0, 'BR_QUEUE: supA queue emptied after drain');
+  assert.equal(bridge.getQueueSnapshot(supB.id).length, 1, 'BR_QUEUE: supB queue untouched by supA drain');
+  console.log('  BR_QUEUE ✓ recipient-scoped queue + drain isolation');
+}
+
 // ── M2A: onChatEvents dispatch table (BR-19 + supporting coverage) ──
 
 function batchFor(agentId: string, events: ChatEventBatch['events']): ChatEventBatch {
@@ -522,7 +562,11 @@ async function onChatEvents_secondBatchIsNotInitialLoad(): Promise<void> {
 
 // ── M3: P2-03 waiting_for_input wiring (BR-13, BR-15, BR-20) ────────
 
-async function BR_13_endsWithQuestionFiresForceWaiting(): Promise<void> {
+async function BR_13_endsWithQuestionNoLongerFiresWaitingForHookWorker(): Promise<void> {
+  // New rule: `waiting` means a real Notification hook ONLY. A hook-backed
+  // worker (claude/codex) that ends its turn with a question is just a normal
+  // turn end — the Stop hook drives it to idle and the chat-stream writes no
+  // status. So no force* call fires here at all.
   const f = makeFakeBridgeDeps();
   const worker = makeAgent('w-q1', { provider: 'claude', status: 'working' });
   f.agents.set(worker.id, worker);
@@ -536,20 +580,17 @@ async function BR_13_endsWithQuestionFiresForceWaiting(): Promise<void> {
     }),
   ]));
 
-  assert.equal(f.statusForceCalls.length, 1, 'BR-13: one force call');
-  assert.equal(f.statusForceCalls[0].method, 'forceWaiting');
-  assert.equal(f.statusForceCalls[0].agentId, worker.id);
-  assert.equal(f.statusForceCalls[0].kind, 'question');
-  // Excerpt is text.slice(-300); for a short text that's the whole body.
-  assert.equal(f.statusForceCalls[0].excerpt, 'Long preamble. Did that resolve it?');
-  console.log('  BR-13 ✓ endsWithQuestion=true → forceWaiting(question, tail)');
+  assert.equal(f.statusForceCalls.length, 0,
+    'BR-13: endsWithQuestion fires no force* for a hook-backed worker (status is hook-owned)');
+  console.log('  BR-13 ✓ endsWithQuestion no longer maps to waiting (hook-owned worker)');
 }
 
-async function BR_13_endsWithQuestionTakesPriorityOverTurnComplete(): Promise<void> {
-  // Branch order check: endsWithQuestion=true must short-circuit ahead of the
-  // turnComplete=true → forceIdle branch.
+async function BR_13_geminiEndsWithQuestionGoesIdleNotWaiting(): Promise<void> {
+  // Gemini has no hook scaffold, so it stays on the chat-stream — but even
+  // there, endsWithQuestion must NOT produce waiting. A completed turn goes
+  // idle; `waiting` is unreachable without a Notification hook.
   const f = makeFakeBridgeDeps();
-  const worker = makeAgent('w-q2', { provider: 'codex', status: 'working' });
+  const worker = makeAgent('w-q2', { provider: 'gemini', status: 'working' });
   f.agents.set(worker.id, worker);
   const bridge = new EventBridge(f.deps);
 
@@ -558,9 +599,9 @@ async function BR_13_endsWithQuestionTakesPriorityOverTurnComplete(): Promise<vo
   ]));
 
   assert.equal(f.statusForceCalls.length, 1);
-  assert.equal(f.statusForceCalls[0].method, 'forceWaiting',
-    'BR-13: endsWithQuestion wins over turnComplete');
-  console.log('  BR-13 ✓ endsWithQuestion priority over turnComplete');
+  assert.equal(f.statusForceCalls[0].method, 'forceIdle',
+    'BR-13: gemini endsWithQuestion+turnComplete → idle, never waiting');
+  console.log('  BR-13 ✓ gemini endsWithQuestion → idle (never waiting)');
 }
 
 async function BR_15_notifyUserInputClearsLatchOnWaiting(): Promise<void> {
@@ -619,7 +660,7 @@ async function BR_20_waitingToWorkingIsSuppressed(): Promise<void> {
     status: 'waiting',
     fromStatus: 'working',
     source: 'monitor',
-    waitingKind: 'question',
+    waitingKind: 'notification',
     waitingExcerpt: 'Are you sure?',
   });
   assert.equal(f.sendInputCalls.length, 1, 'BR-20: waiting transition fires');
@@ -628,7 +669,7 @@ async function BR_20_waitingToWorkingIsSuppressed(): Promise<void> {
     'BR-20: waiting payload renders the dedicated header',
   );
   assert.ok(
-    f.sendInputCalls[0].text.includes('Waiting kind: question'),
+    f.sendInputCalls[0].text.includes('Waiting kind: notification'),
     'BR-20: waiting kind line present',
   );
   assert.ok(
@@ -1117,8 +1158,586 @@ async function BUG_22_tmuxFailureQueuesWhenSupervisorBusy(): Promise<void> {
   console.log('  BUG-22 ✓ failure event queues + drains through normal path');
 }
 
+async function OWN_ownedNonSupervisedDeliversToOwner(): Promise<void> {
+  // Agent-ownership primitive regression: an owned worker with isSupervised:false
+  // is DROPPED under the old `!isSupervised` gate. The owner edge must route its
+  // idle event directly to the launcher (a non-supervisor persona), with no
+  // structural supervisor involved at all.
+  const f = makeFakeBridgeDeps();
+  const owner = makeAgent('owner-1', { isSupervisor: false, isSupervised: false, status: 'idle' });
+  const worker = makeAgent('w-1', {
+    isSupervised: false,
+    isWorker: true,
+    status: 'working',
+    ownerAgentId: owner.id,
+  });
+  f.agents.set(owner.id, owner);
+  f.agents.set(worker.id, worker);
+  f.logs.set(worker.id, 'tail\n');
+  const bridge = new EventBridge(f.deps);
+
+  await bridge.onStatusChanged({
+    agentId: worker.id,
+    status: 'idle',
+    fromStatus: 'working',
+    source: 'monitor',
+  });
+
+  assert.equal(f.sendInputCalls.length, 1, 'OWN: owned non-supervised worker event delivers');
+  assert.equal(f.sendInputCalls[0].agentId, owner.id, 'OWN: delivers to the OWNER, not a supervisor');
+  console.log('  OWN ✓ owned isSupervised:false worker delivers to its owner');
+}
+
+async function OWN_terminalOwnerFallsBackToStructural(): Promise<void> {
+  // When the explicit owner is terminal, the resolver backstops to the
+  // structural workspace supervisor (operational visibility, not fanout).
+  const f = makeFakeBridgeDeps();
+  const supervisor = makeAgent('sup-1', { isSupervisor: true, isSupervised: false, status: 'idle' });
+  const owner = makeAgent('owner-1', { isSupervisor: false, isSupervised: false, status: 'done' });
+  const worker = makeAgent('w-1', { isSupervised: false, isWorker: true, status: 'working', ownerAgentId: owner.id });
+  f.agents.set(supervisor.id, supervisor);
+  f.agents.set(owner.id, owner);
+  f.agents.set(worker.id, worker);
+  f.logs.set(worker.id, 'tail\n');
+  const bridge = new EventBridge(f.deps);
+
+  await bridge.onStatusChanged({
+    agentId: worker.id,
+    status: 'idle',
+    fromStatus: 'working',
+    source: 'monitor',
+  });
+
+  assert.equal(f.sendInputCalls.length, 1, 'OWN: terminal-owner event still delivers (backstop)');
+  assert.equal(f.sendInputCalls[0].agentId, supervisor.id, 'OWN: terminal owner falls back to structural supervisor');
+  console.log('  OWN ✓ terminal owner falls back to structural supervisor');
+}
+
+async function OWN_busyOwnerQueuesDoesNotFallBack(): Promise<void> {
+  // A busy (working) owner must QUEUE the event and drain when it frees — it
+  // must NOT fall back to the structural supervisor. Falling back on a merely
+  // busy owner would be the bug the spec explicitly guards against.
+  const f = makeFakeBridgeDeps();
+  const supervisor = makeAgent('sup-1', { isSupervisor: true, isSupervised: false, status: 'idle' });
+  const owner = makeAgent('owner-1', { isSupervisor: false, isSupervised: false, status: 'working' });
+  const worker = makeAgent('w-1', { isSupervised: false, isWorker: true, status: 'working', ownerAgentId: owner.id });
+  f.agents.set(supervisor.id, supervisor);
+  f.agents.set(owner.id, owner);
+  f.agents.set(worker.id, worker);
+  f.logs.set(worker.id, 'tail\n');
+  const bridge = new EventBridge(f.deps);
+
+  await bridge.onStatusChanged({
+    agentId: worker.id,
+    status: 'idle',
+    fromStatus: 'working',
+    source: 'monitor',
+  });
+
+  assert.equal(f.sendInputCalls.length, 0, 'OWN: busy owner queues, does not deliver yet');
+  assert.equal(bridge.getQueueSnapshot().length, 1, 'OWN: event sits in queue for the busy owner');
+
+  owner.status = 'idle';
+  await bridge.drainPendingFor(owner.id);
+  assert.equal(f.sendInputCalls.length, 1, 'OWN: drains to the owner once it frees');
+  assert.equal(f.sendInputCalls[0].agentId, owner.id, 'OWN: drained to the OWNER (never the structural supervisor)');
+  console.log('  OWN ✓ busy owner queues + drains, never falls back');
+}
+
+// ── notifyOwner mute — decouple ownership from notification ──────────────────
+
+async function MUTE_ownedMutedLiveOwnerDropped(): Promise<void> {
+  // (a) An owned worker with notifyOwner:false whose explicit owner is LIVE:
+  // the resolved recipient IS the owner → the mute fires → the event is dropped
+  // entirely (not delivered, not even queued). Ownership is unchanged; only
+  // notification is suppressed.
+  const f = makeFakeBridgeDeps();
+  const owner = makeAgent('owner-1', { isSupervisor: false, isSupervised: false, status: 'idle' });
+  const worker = makeAgent('w-1', {
+    isSupervised: false,
+    isWorker: true,
+    status: 'working',
+    ownerAgentId: owner.id,
+    notifyOwner: false,
+  });
+  f.agents.set(owner.id, owner);
+  f.agents.set(worker.id, worker);
+  f.logs.set(worker.id, 'tail\n');
+  const bridge = new EventBridge(f.deps);
+
+  await bridge.onStatusChanged({
+    agentId: worker.id,
+    status: 'idle',
+    fromStatus: 'working',
+    source: 'monitor',
+  });
+
+  assert.equal(f.sendInputCalls.length, 0, 'MUTE: muted worker with live owner delivers nothing');
+  assert.equal(bridge.getQueueSnapshot().length, 0, 'MUTE: muted event is not even queued');
+  console.log('  MUTE ✓ owned + notifyOwner:false + live owner → event dropped');
+}
+
+async function MUTE_defaultNotifyStillDelivers(): Promise<void> {
+  // (b) The default (notifyOwner undefined ⇒ true) preserves ALL prior
+  // behavior: the owner still receives the event. Asserted via a sibling worker
+  // that is identical except for the (absent) mute flag.
+  const f = makeFakeBridgeDeps();
+  const owner = makeAgent('owner-1', { isSupervisor: false, isSupervised: false, status: 'idle' });
+  const worker = makeAgent('w-1', {
+    isSupervised: false,
+    isWorker: true,
+    status: 'working',
+    ownerAgentId: owner.id,
+    // notifyOwner omitted → defaults to notify.
+  });
+  f.agents.set(owner.id, owner);
+  f.agents.set(worker.id, worker);
+  f.logs.set(worker.id, 'tail\n');
+  const bridge = new EventBridge(f.deps);
+
+  await bridge.onStatusChanged({
+    agentId: worker.id,
+    status: 'idle',
+    fromStatus: 'working',
+    source: 'monitor',
+  });
+
+  assert.equal(f.sendInputCalls.length, 1, 'MUTE: default-notify worker still delivers');
+  assert.equal(f.sendInputCalls[0].agentId, owner.id, 'MUTE: default delivers to the owner (unchanged)');
+  console.log('  MUTE ✓ default notifyOwner (undefined/true) → delivered to owner');
+}
+
+async function MUTE_terminalOwnerBackstopNotMuted(): Promise<void> {
+  // (c) SUBTLETY: the mute fires ONLY when the recipient IS the explicit owner.
+  // Here the muted worker's owner is terminal, so getOwnerForWorker falls back
+  // to the structural supervisor — which is NOT the owner → NOT muted → the
+  // backstop STILL delivers. A muted researcher whose owner dies still surfaces
+  // its crash to the structural supervisor (safety net preserved).
+  const f = makeFakeBridgeDeps();
+  const supervisor = makeAgent('sup-1', { isSupervisor: true, isSupervised: false, status: 'idle' });
+  const owner = makeAgent('owner-1', { isSupervisor: false, isSupervised: false, status: 'done' });
+  const worker = makeAgent('w-1', {
+    isSupervised: false,
+    isWorker: true,
+    status: 'working',
+    ownerAgentId: owner.id,
+    notifyOwner: false,
+  });
+  f.agents.set(supervisor.id, supervisor);
+  f.agents.set(owner.id, owner);
+  f.agents.set(worker.id, worker);
+  f.logs.set(worker.id, 'tail\n');
+  const bridge = new EventBridge(f.deps);
+
+  await bridge.onStatusChanged({
+    agentId: worker.id,
+    status: 'crashed',
+    fromStatus: 'working',
+    source: 'runner-exit',
+  });
+
+  assert.equal(f.sendInputCalls.length, 1, 'MUTE: muted worker with terminal owner STILL reaches the backstop');
+  assert.equal(
+    f.sendInputCalls[0].agentId,
+    supervisor.id,
+    'MUTE: backstop recipient is the structural supervisor, not the (muted) owner',
+  );
+  console.log('  MUTE ✓ muted worker + terminal owner → structural backstop still delivers');
+}
+
+// ── Transient one-turn cross-agent subscription (Increment 1) ──────────
+//
+// Ordinary subscribers use privilegeLane:'supervisor' (NOT isSupervisor:true)
+// so the fake owner resolution does not treat them as the structural backstop.
+// isSupervisor:true is used only for supervisor-TARGET cases.
+
+function bypassCooldown(f: ReturnType<typeof makeFakeBridgeDeps>): void {
+  f.setNow(f.getNow() + SUPERVISOR_EVENT_COOLDOWN_MS + 1);
+}
+function countTo(f: ReturnType<typeof makeFakeBridgeDeps>, agentId: string): number {
+  return f.sendInputCalls.filter(c => c.agentId === agentId).length;
+}
+
+async function TS01_fanOutAndConsume(): Promise<void> {
+  const f = makeFakeBridgeDeps();
+  const owner = makeAgent('owner-1', { isSupervisor: false, isSupervised: false, status: 'idle' });
+  const subscriber = makeAgent('sub-1', { privilegeLane: 'supervisor', isSupervised: false, status: 'idle' });
+  const worker = makeAgent('w-1', { isSupervised: false, isWorker: true, status: 'working', ownerAgentId: owner.id, title: 'Worker One' });
+  f.agents.set(owner.id, owner);
+  f.agents.set(subscriber.id, subscriber);
+  f.agents.set(worker.id, worker);
+  f.logs.set(worker.id, 'tail\n');
+  const bridge = new EventBridge(f.deps);
+
+  const reg = bridge.registerTransientTurnSubscription({ targetAgentId: worker.id, subscriberAgentId: subscriber.id });
+  assert.equal(reg.registered, true, 'TS01: registration succeeds');
+
+  await bridge.onStatusChanged({ agentId: worker.id, status: 'working', fromStatus: 'idle', source: 'monitor' });
+  assert.equal(f.sendInputCalls.length, 0, 'TS01: working promotes but delivers nothing');
+
+  await bridge.onStatusChanged({ agentId: worker.id, status: 'idle', fromStatus: 'working', source: 'monitor' });
+  assert.equal(f.sendInputCalls.length, 2, 'TS01: idle fans out to owner + subscriber');
+  const ownerCall = f.sendInputCalls.find(c => c.agentId === owner.id);
+  const subCall = f.sendInputCalls.find(c => c.agentId === subscriber.id);
+  assert.ok(ownerCall, 'TS01: owner delivered');
+  assert.ok(subCall, 'TS01: subscriber delivered');
+  assert.ok(ownerCall!.text.includes('[DASHBOARD EVENT] Agent status changed'), 'TS01: owner gets the lifecycle header');
+  assert.ok(subCall!.text.includes('Reply to your message'), 'TS01: subscriber payload framed as a reply');
+
+  // Second idle: subscription consumed → owner only.
+  bypassCooldown(f);
+  await bridge.onStatusChanged({ agentId: worker.id, status: 'idle', fromStatus: 'working', source: 'monitor' });
+  assert.equal(f.sendInputCalls.length, 3, 'TS01: second idle reaches owner only');
+  assert.equal(f.sendInputCalls[2].agentId, owner.id, 'TS01: third delivery is the owner');
+  console.log('  TS01 ✓ fan-out to owner + subscriber, then consume on terminal');
+}
+
+async function TS02_waitingCap(): Promise<void> {
+  const f = makeFakeBridgeDeps();
+  const owner = makeAgent('owner-1', { isSupervisor: false, isSupervised: false, status: 'idle' });
+  const subscriber = makeAgent('sub-1', { privilegeLane: 'supervisor', isSupervised: false, status: 'idle' });
+  const worker = makeAgent('w-1', { isSupervised: false, isWorker: true, status: 'working', ownerAgentId: owner.id });
+  f.agents.set(owner.id, owner);
+  f.agents.set(subscriber.id, subscriber);
+  f.agents.set(worker.id, worker);
+  f.logs.set(worker.id, 'tail\n');
+  const bridge = new EventBridge(f.deps);
+
+  bridge.registerTransientTurnSubscription({ targetAgentId: worker.id, subscriberAgentId: subscriber.id });
+  await bridge.onStatusChanged({ agentId: worker.id, status: 'working', fromStatus: 'idle', source: 'monitor' });
+
+  await bridge.onStatusChanged({ agentId: worker.id, status: 'waiting', fromStatus: 'working', source: 'monitor', waitingKind: 'notification', waitingExcerpt: 'pick one' });
+  assert.equal(countTo(f, subscriber.id), 1, 'TS02: first waiting delivered to subscriber');
+  assert.equal(countTo(f, owner.id), 1, 'TS02: first waiting delivered to owner');
+
+  bypassCooldown(f);
+  await bridge.onStatusChanged({ agentId: worker.id, status: 'waiting', fromStatus: 'working', source: 'monitor', waitingKind: 'notification', waitingExcerpt: 'again' });
+  assert.equal(countTo(f, subscriber.id), 1, 'TS02: second waiting is capped for the subscriber');
+  assert.equal(countTo(f, owner.id), 2, 'TS02: owner still gets the second waiting');
+
+  bypassCooldown(f);
+  await bridge.onStatusChanged({ agentId: worker.id, status: 'idle', fromStatus: 'working', source: 'monitor' });
+  assert.equal(countTo(f, subscriber.id), 2, 'TS02: later idle delivers to the (still-armed) subscriber');
+
+  // Consumed now — another idle reaches owner only.
+  bypassCooldown(f);
+  await bridge.onStatusChanged({ agentId: worker.id, status: 'idle', fromStatus: 'working', source: 'monitor' });
+  assert.equal(countTo(f, subscriber.id), 2, 'TS02: subscription consumed by the idle');
+  console.log('  TS02 ✓ waiting capped at one per subscription; idle consumes');
+}
+
+async function TS03_crashConsumes(): Promise<void> {
+  const f = makeFakeBridgeDeps();
+  const subscriber = makeAgent('sub-1', { privilegeLane: 'supervisor', isSupervised: false, status: 'idle' });
+  const worker = makeAgent('w-1', { isSupervised: false, isWorker: true, status: 'working', lastExitCode: 1 });
+  f.agents.set(subscriber.id, subscriber);
+  f.agents.set(worker.id, worker);
+  f.logs.set(worker.id, 'tail\n');
+  const bridge = new EventBridge(f.deps);
+
+  bridge.registerTransientTurnSubscription({ targetAgentId: worker.id, subscriberAgentId: subscriber.id });
+  await bridge.onStatusChanged({ agentId: worker.id, status: 'working', fromStatus: 'idle', source: 'monitor' });
+
+  await bridge.onStatusChanged({ agentId: worker.id, status: 'crashed', fromStatus: 'working', source: 'runner-exit' });
+  assert.equal(countTo(f, subscriber.id), 1, 'TS03: crash delivered to subscriber');
+
+  // Pruned: a follow-up idle does not reach the subscriber.
+  worker.status = 'working';
+  bypassCooldown(f);
+  await bridge.onStatusChanged({ agentId: worker.id, status: 'idle', fromStatus: 'working', source: 'monitor' });
+  assert.equal(countTo(f, subscriber.id), 1, 'TS03: subscription pruned by crash');
+  console.log('  TS03 ✓ crash consumes + prunes the subscription');
+}
+
+async function TS04_workerStalledNonConsuming(): Promise<void> {
+  const f = makeFakeBridgeDeps();
+  const subscriber = makeAgent('sub-1', { privilegeLane: 'supervisor', isSupervised: false, status: 'idle' });
+  const worker = makeAgent('w-1', { isSupervised: false, isWorker: true, status: 'working' });
+  f.agents.set(subscriber.id, subscriber);
+  f.agents.set(worker.id, worker);
+  f.logs.set(worker.id, 'tail\n');
+  const bridge = new EventBridge(f.deps);
+
+  bridge.registerTransientTurnSubscription({ targetAgentId: worker.id, subscriberAgentId: subscriber.id });
+  await bridge.onStatusChanged({ agentId: worker.id, status: 'working', fromStatus: 'idle', source: 'monitor' });
+
+  await bridge.onWorkerStalled({ agent: worker, stalledForMs: 600_000 });
+  assert.equal(countTo(f, subscriber.id), 1, 'TS04: worker_stalled delivered to subscriber');
+
+  await bridge.onStatusChanged({ agentId: worker.id, status: 'idle', fromStatus: 'working', source: 'monitor' });
+  assert.equal(countTo(f, subscriber.id), 2, 'TS04: later idle still delivers (stalled did not consume)');
+
+  bypassCooldown(f);
+  await bridge.onStatusChanged({ agentId: worker.id, status: 'idle', fromStatus: 'working', source: 'monitor' });
+  assert.equal(countTo(f, subscriber.id), 2, 'TS04: idle consumed the subscription');
+  console.log('  TS04 ✓ worker_stalled is non-consuming; idle consumes');
+}
+
+async function TS05_supervisorTargetCarveOut(): Promise<void> {
+  // Part A: supervisor target with a subscriber → subscriber only, no backstop.
+  const f = makeFakeBridgeDeps();
+  const supTarget = makeAgent('supT', { isSupervisor: true, isSupervised: false, status: 'working', title: 'Sup Target' });
+  const subscriber = makeAgent('sub-1', { privilegeLane: 'supervisor', isSupervised: false, status: 'idle' });
+  f.agents.set(supTarget.id, supTarget);
+  f.agents.set(subscriber.id, subscriber);
+  f.logs.set(supTarget.id, 'tail\n');
+  const bridge = new EventBridge(f.deps);
+
+  const reg = bridge.registerTransientTurnSubscription({ targetAgentId: supTarget.id, subscriberAgentId: subscriber.id });
+  assert.equal(reg.registered, true, 'TS05: supervisor target subscription registers');
+  await bridge.onStatusChanged({ agentId: supTarget.id, status: 'working', fromStatus: 'idle', source: 'monitor' });
+  await bridge.onStatusChanged({ agentId: supTarget.id, status: 'idle', fromStatus: 'working', source: 'monitor' });
+  assert.equal(f.sendInputCalls.length, 1, 'TS05: supervisor target emits exactly to the subscriber');
+  assert.equal(f.sendInputCalls[0].agentId, subscriber.id, 'TS05: not to any structural backstop');
+
+  // Part B (regression): supervisor target, no subscriber → dropped entirely.
+  const g = makeFakeBridgeDeps();
+  const supT2 = makeAgent('supT2', { isSupervisor: true, isSupervised: false, status: 'working' });
+  g.agents.set(supT2.id, supT2);
+  const bridge2 = new EventBridge(g.deps);
+  await bridge2.onStatusChanged({ agentId: supT2.id, status: 'idle', fromStatus: 'working', source: 'monitor' });
+  assert.equal(g.sendInputCalls.length, 0, 'TS05: supervisor target with no subscriber drops the status');
+  assert.equal(bridge2.getQueueSnapshot().length, 0, 'TS05: nothing queued for the dropped supervisor status');
+  console.log('  TS05 ✓ supervisor-target carve-out (subscriber-only; drop when none)');
+}
+
+async function TS06_ownerDedupAtRegister(): Promise<void> {
+  const f = makeFakeBridgeDeps();
+  // The owner is itself privileged so the dedup check (which runs AFTER the
+  // privilege gate) is the one that fires.
+  const owner = makeAgent('owner-1', { privilegeLane: 'supervisor', isSupervisor: false, isSupervised: false, status: 'idle' });
+  const worker = makeAgent('w-1', { isSupervised: false, isWorker: true, status: 'working', ownerAgentId: owner.id });
+  f.agents.set(owner.id, owner);
+  f.agents.set(worker.id, worker);
+  f.logs.set(worker.id, 'tail\n');
+  const bridge = new EventBridge(f.deps);
+
+  const reg = bridge.registerTransientTurnSubscription({ targetAgentId: worker.id, subscriberAgentId: owner.id });
+  assert.equal(reg.registered, false, 'TS06: owner-as-subscriber is not registered');
+  assert.equal(reg.reason, 'is-owner', 'TS06: reason is is-owner');
+
+  await bridge.onStatusChanged({ agentId: worker.id, status: 'idle', fromStatus: 'working', source: 'monitor' });
+  assert.equal(countTo(f, owner.id), 1, 'TS06: owner gets exactly one (owner-path) delivery');
+  console.log('  TS06 ✓ owner dedup at register');
+}
+
+async function TS07_privilegeGate(): Promise<void> {
+  const f = makeFakeBridgeDeps();
+  const plain = makeAgent('plain-1', { isSupervisor: false, isSupervised: false, status: 'idle' });
+  const worker = makeAgent('w-1', { isSupervised: false, isWorker: true, status: 'working' });
+  f.agents.set(plain.id, plain);
+  f.agents.set(worker.id, worker);
+  const bridge = new EventBridge(f.deps);
+
+  const reg = bridge.registerTransientTurnSubscription({ targetAgentId: worker.id, subscriberAgentId: plain.id });
+  assert.equal(reg.registered, false, 'TS07: non-privileged subscriber rejected');
+  assert.equal(reg.reason, 'not-privileged', 'TS07: reason is not-privileged');
+  console.log('  TS07 ✓ privilege gate blocks non-privileged subscribers');
+}
+
+async function TS08_startWatchdogPrunes(): Promise<void> {
+  const f = makeFakeBridgeDeps();
+  const subscriber = makeAgent('sub-1', { privilegeLane: 'supervisor', isSupervised: false, status: 'idle' });
+  const worker = makeAgent('w-1', { isSupervised: false, isWorker: true, status: 'idle' });
+  f.agents.set(subscriber.id, subscriber);
+  f.agents.set(worker.id, worker);
+  f.logs.set(worker.id, 'tail\n');
+  const bridge = new EventBridge(f.deps);
+
+  bridge.registerTransientTurnSubscription({ targetAgentId: worker.id, subscriberAgentId: subscriber.id });
+  // Never promote (no 'working'); fire the start-watchdog.
+  const fired = f.scheduler.runDue(f.getNow() + TRANSIENT_SUB_PENDING_START_TIMEOUT_MS);
+  assert.ok(fired >= 1, 'TS08: the start-watchdog fired');
+
+  // A subsequent unrelated idle must not reach the pruned (never-armed) sub.
+  await bridge.onStatusChanged({ agentId: worker.id, status: 'idle', fromStatus: 'working', source: 'monitor' });
+  assert.equal(countTo(f, subscriber.id), 0, 'TS08: pruned pending-start sub receives nothing');
+  console.log('  TS08 ✓ start-watchdog prunes a never-started subscription');
+}
+
+async function TS09_ttlNotice(): Promise<void> {
+  const f = makeFakeBridgeDeps();
+  const subscriber = makeAgent('sub-1', { privilegeLane: 'supervisor', isSupervised: false, status: 'idle', title: 'Subby' });
+  const worker = makeAgent('w-1', { isSupervised: false, isWorker: true, status: 'working', title: 'Hung Worker' });
+  f.agents.set(subscriber.id, subscriber);
+  f.agents.set(worker.id, worker);
+  f.logs.set(worker.id, 'tail\n');
+  const bridge = new EventBridge(f.deps);
+
+  bridge.registerTransientTurnSubscription({ targetAgentId: worker.id, subscriberAgentId: subscriber.id });
+  await bridge.onStatusChanged({ agentId: worker.id, status: 'working', fromStatus: 'idle', source: 'monitor' });
+
+  // Never terminate; fire the TTL backstop.
+  f.scheduler.runDue(f.getNow() + TRANSIENT_SUB_TTL_MS);
+  await flushMicrotasks();
+
+  assert.equal(countTo(f, subscriber.id), 1, 'TS09: TTL notice delivered to subscriber');
+  const text = f.sendInputCalls.find(c => c.agentId === subscriber.id)!.text;
+  assert.ok(/one-turn subscription to "Hung Worker"/.test(text), 'TS09: names the target');
+  assert.ok(/expired/.test(text), 'TS09: says expired');
+  assert.ok(!/still busy/i.test(text), 'TS09: does NOT claim the target is still busy');
+
+  // Pruned: a later (post-hang) idle does not deliver again.
+  worker.status = 'working';
+  bypassCooldown(f);
+  await bridge.onStatusChanged({ agentId: worker.id, status: 'idle', fromStatus: 'working', source: 'monitor' });
+  assert.equal(countTo(f, subscriber.id), 1, 'TS09: subscription pruned after TTL');
+  console.log('  TS09 ✓ TTL backstop notice (no "still busy" claim) + prune');
+}
+
+async function TS10_refreshNotStack(): Promise<void> {
+  const f = makeFakeBridgeDeps();
+  const subscriber = makeAgent('sub-1', { privilegeLane: 'supervisor', isSupervised: false, status: 'idle' });
+  const worker = makeAgent('w-1', { isSupervised: false, isWorker: true, status: 'working' });
+  f.agents.set(subscriber.id, subscriber);
+  f.agents.set(worker.id, worker);
+  const bridge = new EventBridge(f.deps);
+
+  const r1 = bridge.registerTransientTurnSubscription({ targetAgentId: worker.id, subscriberAgentId: subscriber.id });
+  assert.equal(r1.registered, true);
+  assert.equal(f.scheduler.pendingCount(), 2, 'TS10: first register schedules ttl + watchdog');
+
+  const r2 = bridge.registerTransientTurnSubscription({ targetAgentId: worker.id, subscriberAgentId: subscriber.id });
+  assert.equal(r2.registered, true, 'TS10: refresh succeeds');
+  assert.equal(f.scheduler.pendingCount(), 2, 'TS10: refresh resets timers (no stacking → still 2)');
+
+  // Only ONE subscription exists: a single idle delivers exactly once.
+  await bridge.onStatusChanged({ agentId: worker.id, status: 'working', fromStatus: 'idle', source: 'monitor' });
+  await bridge.onStatusChanged({ agentId: worker.id, status: 'idle', fromStatus: 'working', source: 'monitor' });
+  assert.equal(countTo(f, subscriber.id), 1, 'TS10: refreshed pair delivers exactly once');
+  console.log('  TS10 ✓ re-register refreshes (never stacks)');
+}
+
+async function TS11_perTargetCap(): Promise<void> {
+  const f = makeFakeBridgeDeps();
+  const worker = makeAgent('w-1', { isSupervised: false, isWorker: true, status: 'working' });
+  f.agents.set(worker.id, worker);
+  const bridge = new EventBridge(f.deps);
+
+  for (let i = 0; i < TRANSIENT_SUB_MAX_PER_TARGET; i++) {
+    const sub = makeAgent(`sub-${i}`, { privilegeLane: 'supervisor', isSupervised: false, status: 'idle' });
+    f.agents.set(sub.id, sub);
+    const r = bridge.registerTransientTurnSubscription({ targetAgentId: worker.id, subscriberAgentId: sub.id });
+    assert.equal(r.registered, true, `TS11: subscriber ${i} within cap registers`);
+  }
+  const overflow = makeAgent('sub-overflow', { privilegeLane: 'supervisor', isSupervised: false, status: 'idle' });
+  f.agents.set(overflow.id, overflow);
+  const r = bridge.registerTransientTurnSubscription({ targetAgentId: worker.id, subscriberAgentId: overflow.id });
+  assert.equal(r.registered, false, 'TS11: the (MAX+1)th subscriber is rejected');
+  assert.equal(r.reason, 'target-cap', 'TS11: reason is target-cap');
+  console.log('  TS11 ✓ per-target subscriber cap');
+}
+
+async function TS12_forgetAgentBothDirections(): Promise<void> {
+  // Forget the TARGET → list dropped + timers cancelled.
+  const f = makeFakeBridgeDeps();
+  const subscriber = makeAgent('sub-1', { privilegeLane: 'supervisor', isSupervised: false, status: 'idle' });
+  const worker = makeAgent('w-1', { isSupervised: false, isWorker: true, status: 'working' });
+  f.agents.set(subscriber.id, subscriber);
+  f.agents.set(worker.id, worker);
+  const bridge = new EventBridge(f.deps);
+
+  bridge.registerTransientTurnSubscription({ targetAgentId: worker.id, subscriberAgentId: subscriber.id });
+  assert.equal(f.scheduler.pendingCount(), 2, 'TS12: timers scheduled');
+  bridge.forgetAgent(worker.id);
+  assert.equal(f.scheduler.pendingCount(), 0, 'TS12: forgetting the target cancels its subscription timers');
+
+  // Forget the SUBSCRIBER → stripped from the target's list.
+  const g = makeFakeBridgeDeps();
+  const sub2 = makeAgent('sub-2', { privilegeLane: 'supervisor', isSupervised: false, status: 'idle' });
+  const wk2 = makeAgent('w-2', { isSupervised: false, isWorker: true, status: 'working' });
+  g.agents.set(sub2.id, sub2);
+  g.agents.set(wk2.id, wk2);
+  g.logs.set(wk2.id, 'tail\n');
+  const bridge2 = new EventBridge(g.deps);
+  bridge2.registerTransientTurnSubscription({ targetAgentId: wk2.id, subscriberAgentId: sub2.id });
+  await bridge2.onStatusChanged({ agentId: wk2.id, status: 'working', fromStatus: 'idle', source: 'monitor' });
+  bridge2.forgetAgent(sub2.id);
+  assert.equal(g.scheduler.pendingCount(), 0, 'TS12: forgetting the subscriber cancels its timers');
+  await bridge2.onStatusChanged({ agentId: wk2.id, status: 'idle', fromStatus: 'working', source: 'monitor' });
+  assert.equal(countTo(g, sub2.id), 0, 'TS12: forgotten subscriber receives nothing');
+  console.log('  TS12 ✓ forgetAgent cleans up both target and subscriber roles');
+}
+
+async function TS13_contextStatsSupervisorGuard(): Promise<void> {
+  const f = makeFakeBridgeDeps();
+  const supTarget = makeAgent('supT', { workspaceId: 'ws-A', isSupervisor: true, isSupervised: false, status: 'idle' });
+  f.agents.set(supTarget.id, supTarget);
+  const bridge = new EventBridge(f.deps);
+
+  bridge.onContextStatsChanged(statsAt(supTarget.id, 80, 1));
+  await flushMicrotasks();
+  assert.equal(f.sendInputCalls.length, 0, 'TS13: supervisor context-threshold delivers nothing');
+  assert.equal(bridge.getQueueSnapshot().length, 0, 'TS13: nothing queued');
+
+  // A worker in another workspace still crosses thresholds normally — proves
+  // the supervisor early-return did not corrupt lastContextThreshold state.
+  const supB = makeAgent('supB', { workspaceId: 'ws-B', isSupervisor: true, isSupervised: false, status: 'idle' });
+  const worker = makeAgent('w-1', { workspaceId: 'ws-B', isSupervised: true, status: 'working' });
+  f.agents.set(supB.id, supB);
+  f.agents.set(worker.id, worker);
+  bridge.onContextStatsChanged(statsAt(worker.id, 80, 1));
+  await flushMicrotasks();
+  assert.equal(f.sendInputCalls.length, 1, 'TS13: worker threshold still delivers (no state corruption)');
+  assert.equal(f.sendInputCalls[0].agentId, supB.id);
+  console.log('  TS13 ✓ onContextStatsChanged keeps the supervisor early-return');
+}
+
+async function TS14_recipientScopedQueueUnderFanOut(): Promise<void> {
+  const f = makeFakeBridgeDeps();
+  const owner = makeAgent('owner-1', { isSupervisor: false, isSupervised: false, status: 'working' });
+  const subscriber = makeAgent('sub-1', { privilegeLane: 'supervisor', isSupervised: false, status: 'idle' });
+  const worker = makeAgent('w-1', { isSupervised: false, isWorker: true, status: 'working', ownerAgentId: owner.id, title: 'Worker One' });
+  f.agents.set(owner.id, owner);
+  f.agents.set(subscriber.id, subscriber);
+  f.agents.set(worker.id, worker);
+  f.logs.set(worker.id, 'tail\n');
+  const bridge = new EventBridge(f.deps);
+
+  bridge.registerTransientTurnSubscription({ targetAgentId: worker.id, subscriberAgentId: subscriber.id });
+  await bridge.onStatusChanged({ agentId: worker.id, status: 'working', fromStatus: 'idle', source: 'monitor' });
+  await bridge.onStatusChanged({ agentId: worker.id, status: 'idle', fromStatus: 'working', source: 'monitor' });
+
+  // Owner busy → queued for owner; subscriber idle → immediate deliver.
+  assert.equal(f.sendInputCalls.length, 1, 'TS14: one immediate send (to the idle subscriber)');
+  assert.equal(f.sendInputCalls[0].agentId, subscriber.id);
+  assert.ok(f.sendInputCalls[0].text.includes('Reply to your message'), 'TS14: subscriber payload framed as a reply');
+  assert.equal(bridge.getQueueSnapshot(owner.id).length, 1, 'TS14: owner event queued in the owner-scoped queue');
+  assert.equal(bridge.getQueueSnapshot(subscriber.id).length, 0, 'TS14: subscriber was delivered, not queued');
+  console.log('  TS14 ✓ recipient-scoped queue holds the busy owner while subscriber delivers');
+}
+
+async function TS_consolidatedReplyDigest(): Promise<void> {
+  // Review-resolution §3(b): a drained consolidated batch containing a
+  // viaSubscription status event renders the "(reply to you)" digest line.
+  const f = makeFakeBridgeDeps();
+  const subscriber = makeAgent('sub-1', { privilegeLane: 'supervisor', isSupervised: false, status: 'working' });
+  const worker = makeAgent('w-1', { isSupervised: false, isWorker: true, status: 'working', title: 'Worker One' });
+  f.agents.set(subscriber.id, subscriber);
+  f.agents.set(worker.id, worker);
+  f.logs.set(worker.id, 'tail\n');
+  const bridge = new EventBridge(f.deps);
+
+  bridge.registerTransientTurnSubscription({ targetAgentId: worker.id, subscriberAgentId: subscriber.id });
+  await bridge.onStatusChanged({ agentId: worker.id, status: 'working', fromStatus: 'idle', source: 'monitor' });
+
+  // Subscriber busy → both events queue. worker_stalled (non-consuming) then
+  // idle (status_change, viaSubscription) → 2 queued events → consolidated.
+  await bridge.onWorkerStalled({ agent: worker, stalledForMs: 600_000 });
+  await bridge.onStatusChanged({ agentId: worker.id, status: 'idle', fromStatus: 'working', source: 'monitor' });
+  assert.equal(bridge.getQueueSnapshot(subscriber.id).length, 2, 'TS_consolidated: two events queued for the busy subscriber');
+
+  subscriber.status = 'idle';
+  await bridge.drainPendingFor(subscriber.id);
+  assert.equal(f.sendInputCalls.length, 1, 'TS_consolidated: one consolidated send');
+  const text = f.sendInputCalls[0].text;
+  assert.ok(text.includes('events occurred'), 'TS_consolidated: consolidated header present');
+  assert.ok(text.includes('(reply to you)'), 'TS_consolidated: status digest line carries the reply tag');
+  console.log('  TS_consolidated ✓ consolidated digest tags viaSubscription status as reply');
+}
+
 async function main(): Promise<void> {
-  console.log('event-bridge.test: running BR-01..BR-20 + BUG-18 + BUG-22');
+  console.log('event-bridge.test: running BR-01..BR-20 + BUG-18 + BUG-22 + TS-subscriptions');
   await BR_01_happyPath();
   await BR_02_crashViaRunnerExit();
   await BR_02b_runnerExitBypassesCooldown();
@@ -1130,8 +1749,9 @@ async function main(): Promise<void> {
   await BR_08_consolidatedMixesKinds();
   await BR_09_sendInputRejects();
   await BR_10_multiSupervisorIsolation();
-  await BR_13_endsWithQuestionFiresForceWaiting();
-  await BR_13_endsWithQuestionTakesPriorityOverTurnComplete();
+  await BR_QUEUE_recipientScoped();
+  await BR_13_endsWithQuestionNoLongerFiresWaitingForHookWorker();
+  await BR_13_geminiEndsWithQuestionGoesIdleNotWaiting();
   await BR_15_notifyUserInputClearsLatchOnWaiting();
   await BR_15_notifyUserInputNoopWhenNotWaiting();
   await BR_15_notifyUserInputSkippedForSupervised();
@@ -1154,6 +1774,27 @@ async function main(): Promise<void> {
   await BUG_22_tmuxFailureDeliversWithDistinctHeader();
   await BUG_22_tmuxFailureForSupervisorIsNoOpAtBridge();
   await BUG_22_tmuxFailureQueuesWhenSupervisorBusy();
+  await OWN_ownedNonSupervisedDeliversToOwner();
+  await OWN_terminalOwnerFallsBackToStructural();
+  await OWN_busyOwnerQueuesDoesNotFallBack();
+  await MUTE_ownedMutedLiveOwnerDropped();
+  await MUTE_defaultNotifyStillDelivers();
+  await MUTE_terminalOwnerBackstopNotMuted();
+  await TS01_fanOutAndConsume();
+  await TS02_waitingCap();
+  await TS03_crashConsumes();
+  await TS04_workerStalledNonConsuming();
+  await TS05_supervisorTargetCarveOut();
+  await TS06_ownerDedupAtRegister();
+  await TS07_privilegeGate();
+  await TS08_startWatchdogPrunes();
+  await TS09_ttlNotice();
+  await TS10_refreshNotStack();
+  await TS11_perTargetCap();
+  await TS12_forgetAgentBothDirections();
+  await TS13_contextStatsSupervisorGuard();
+  await TS14_recipientScopedQueueUnderFanOut();
+  await TS_consolidatedReplyDigest();
   console.log('event-bridge.test: all tests passed');
 }
 

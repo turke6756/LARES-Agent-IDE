@@ -6,7 +6,7 @@ import { vscDarkPlus, vs } from 'react-syntax-highlighter/dist/esm/styles/prism'
 import { useThemeStore } from '../../stores/theme-store';
 import CollapseButton from '../layout/CollapseButton';
 import { useTabScrollMemory } from './scrollMemory';
-import { useModifierPathOpen, useModifierUrlOpen } from './openFileHelpers';
+import { useModifierPathOpen, useUrlOpen } from './openFileHelpers';
 import SelectionSurface from '../selection/SelectionSurface';
 import FileCommentGutter from '../selection/FileCommentGutter';
 
@@ -72,7 +72,7 @@ export default function MarkdownRenderer({ content, tabId }: Props) {
   const theme = useThemeStore((s) => s.theme);
   const isLight = theme === 'light';
   const outline = useMemo(() => extractMarkdownHeadings(content), [content]);
-  const [outlineCollapsed, setOutlineCollapsed] = useState(false);
+  const [outlineCollapsed, setOutlineCollapsed] = useState(true);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   let renderedHeadingIndex = 0;
 
@@ -85,10 +85,10 @@ export default function MarkdownRenderer({ content, tabId }: Props) {
   // Ctrl/Cmd+click on a link href or inline-code path opens it in the file
   // viewer; plain clicks keep their default behavior (no-op for the handler).
   const handleModifierPathClick = useModifierPathOpen(tabId);
-  // Ctrl/Cmd+click on an http(s) link opens it in the internal browser pane.
-  // Tried before the file-path handler (which rejects URLs anyway); plain
-  // clicks fall through to the shell's external-open behavior, unchanged.
-  const handleModifierUrlOpen = useModifierUrlOpen();
+  // A click on an http(s) link opens it in the internal browser pane. Tried
+  // before the file-path handler (which rejects URLs anyway); non-http hrefs
+  // fall through to file-path handling, then the shell's default behavior.
+  const handleUrlOpen = useUrlOpen();
 
   const nextHeadingId = () => {
     const id = outline[renderedHeadingIndex]?.id;
@@ -136,11 +136,11 @@ export default function MarkdownRenderer({ content, tabId }: Props) {
               <a
                 href={href}
                 onClick={(e) => {
-                  // Modifier-click on an http(s) href opens it in the internal
-                  // browser pane; on a file-path-looking href opens it in the
-                  // viewer; otherwise fall through to default (external) behavior.
+                  // A click on an http(s) href opens it in the internal browser
+                  // pane; Ctrl/Cmd+click on a file-path-looking href opens it in
+                  // the viewer; otherwise fall through to default behavior.
                   if (!href) return;
-                  if (handleModifierUrlOpen(e, href)) return;
+                  if (handleUrlOpen(e, href)) return;
                   handleModifierPathClick(e, href);
                 }}
                 className="text-accent-blue hover:text-accent-blue/80 underline underline-offset-2"

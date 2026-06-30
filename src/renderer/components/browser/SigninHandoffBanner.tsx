@@ -51,20 +51,80 @@ function HandoffSuccess({ hostname }: { hostname: string }) {
   );
 }
 
+// ── Signed-in tabs (WI-5): JIT sign-in reminder banner ───────────────────────
+//
+// Surfaced when an AGENT navigated to an `allow_signed_in` origin with no live
+// session and main pushed browser:signin-pending-opened (a quarantined login tab
+// was opened). Unlike the Mechanism-B consent banner above, this is an
+// in-context REMINDER, not a second consent gate — the human already consented
+// once at toggle-on. It names the origin + the waiting agent, and offers:
+//   • "Done signing in" → access-handoff-ready (clears quarantine, the agent
+//     proceeds on the shared session),
+//   • "Cancel" → signin-pending-cancel (the agent degrades to a block-stub; the
+//     rule's durable consent is preserved).
+// It clears on browser:signin-resolved (also covers timeout / unattended).
+function JitSigninBanner({ origin }: { origin: string }) {
+  const complete = useBrowserStore((s) => s.completeSigninPending);
+  const cancel = useBrowserStore((s) => s.cancelSigninPending);
+
+  return (
+    <div className="border-b border-accent-blue/40 bg-accent-blue/10 px-3 py-2.5 text-[12px] text-fg-primary shrink-0 flex flex-col gap-2">
+      <div className="flex items-center gap-2">
+        <Icons.UserCheck className="w-4 h-4 text-accent-blue shrink-0" />
+        <span className="font-semibold">
+          An agent is waiting to use <span className="font-mono">{origin}</span> — sign in to
+          continue
+        </span>
+      </div>
+      <div className="text-[11px] text-fg-muted pl-6">
+        A login tab is open for this site. Sign in there, then click “Done signing in” to let the
+        waiting agent continue on your session.
+      </div>
+      <div className="flex items-center gap-2 pl-6">
+        <button
+          onClick={() => void complete()}
+          className="ui-btn px-3 py-1 text-[11px] font-semibold bg-accent-blue text-white border border-accent-blue hover:bg-accent-blue/90"
+        >
+          <Icons.Check className="w-3.5 h-3.5" />
+          Done signing in
+        </button>
+        <button
+          onClick={() => void cancel()}
+          className="ui-btn ui-btn-ghost px-3 py-1 text-[11px]"
+        >
+          Cancel
+        </button>
+      </div>
+    </div>
+  );
+}
+
 export default function SigninHandoffBanner() {
   const handoff = useBrowserStore((s) => s.signinHandoff);
   const error = useBrowserStore((s) => s.signinHandoffError);
   const done = useBrowserStore((s) => s.signinHandoffDone);
   const complete = useBrowserStore((s) => s.completeSigninHandoff);
   const cancel = useBrowserStore((s) => s.cancelSigninHandoff);
+  const signinPending = useBrowserStore((s) => s.signinPending);
+
+  // The JIT reminder banner is independent of the Mechanism-B consent flow; it
+  // can coexist with the success flash, so render it alongside.
+  const jit = signinPending ? <JitSigninBanner origin={signinPending.origin} /> : null;
 
   // The success flash only shows once the consent banner is gone.
   if (!handoff) {
-    return done ? <HandoffSuccess hostname={done.hostname} /> : null;
+    return (
+      <>
+        {jit}
+        {done ? <HandoffSuccess hostname={done.hostname} /> : null}
+      </>
+    );
   }
 
   return (
-    <div className="border-b border-accent-orange/40 bg-accent-orange/10 px-3 py-2.5 text-[12px] text-fg-primary shrink-0 flex flex-col gap-2">
+    <>
+      {jit}
+      <div className="border-b border-accent-orange/40 bg-accent-orange/10 px-3 py-2.5 text-[12px] text-fg-primary shrink-0 flex flex-col gap-2">
       <div className="flex items-center gap-2">
         <Icons.KeyRound className="w-4 h-4 text-accent-orange shrink-0" />
         <span className="font-semibold">
@@ -107,6 +167,7 @@ export default function SigninHandoffBanner() {
           Cancel hand-off
         </button>
       </div>
-    </div>
+      </div>
+    </>
   );
 }

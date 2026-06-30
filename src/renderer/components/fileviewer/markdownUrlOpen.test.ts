@@ -3,23 +3,20 @@
  * (plans/markdown-url-open-in-internal-browser.md).
  *
  * Tests the React-free core `handleMarkdownUrlClick` + the `isHttpUrl`
- * predicate. The thin `useModifierUrlOpen` hook just wires this core to the
+ * predicate. The thin `useUrlOpen` hook just wires this core to the
  * browser/dashboard stores, so the behavior worth pinning lives here:
- *  - modifier + http(s) → opens internal (prevents default, returns true)
- *  - plain click        → unchanged (returns false, no open, no preventDefault)
- *  - non-http href      → falls through (returns false) to file-path handling
+ *  - plain click + http(s) → opens internal (prevents default, returns true)
+ *  - non-http href         → falls through (returns false) to file-path handling
  */
 import { describe, expect, it, vi } from 'vitest';
 import { handleMarkdownUrlClick, isHttpUrl } from './openFileHelpers';
 
 type ClickEvent = Parameters<typeof handleMarkdownUrlClick>[0];
 
-function fakeEvent(mods: { ctrlKey?: boolean; metaKey?: boolean } = {}) {
+function fakeEvent() {
   const preventDefault = vi.fn();
   const stopPropagation = vi.fn();
   const e: ClickEvent = {
-    ctrlKey: mods.ctrlKey ?? false,
-    metaKey: mods.metaKey ?? false,
     preventDefault,
     stopPropagation,
   };
@@ -44,33 +41,22 @@ describe('isHttpUrl', () => {
 });
 
 describe('handleMarkdownUrlClick', () => {
-  it('modifier + http(s) → opens internal, prevents default, returns true', () => {
-    for (const mod of [{ ctrlKey: true }, { metaKey: true }]) {
-      const open = vi.fn();
-      const { e, preventDefault, stopPropagation } = fakeEvent(mod);
-      const handled = handleMarkdownUrlClick(e, ' https://hotels.example/book?dates=1-3 ', open);
-      expect(handled).toBe(true);
-      // Trimmed before opening so a stray-space href still navigates cleanly.
-      expect(open).toHaveBeenCalledWith('https://hotels.example/book?dates=1-3');
-      // preventDefault is what stops the shell externalizing the link instead.
-      expect(preventDefault).toHaveBeenCalledTimes(1);
-      expect(stopPropagation).toHaveBeenCalledTimes(1);
-    }
-  });
-
-  it('plain click on an http link → unchanged: no open, no preventDefault, false', () => {
+  it('plain click + http(s) → opens internal, prevents default, returns true', () => {
     const open = vi.fn();
-    const { e, preventDefault } = fakeEvent(); // no modifiers
-    const handled = handleMarkdownUrlClick(e, 'https://example.com', open);
-    expect(handled).toBe(false);
-    expect(open).not.toHaveBeenCalled();
-    expect(preventDefault).not.toHaveBeenCalled();
+    const { e, preventDefault, stopPropagation } = fakeEvent();
+    const handled = handleMarkdownUrlClick(e, ' https://hotels.example/book?dates=1-3 ', open);
+    expect(handled).toBe(true);
+    // Trimmed before opening so a stray-space href still navigates cleanly.
+    expect(open).toHaveBeenCalledWith('https://hotels.example/book?dates=1-3');
+    // preventDefault is what stops the shell externalizing the link instead.
+    expect(preventDefault).toHaveBeenCalledTimes(1);
+    expect(stopPropagation).toHaveBeenCalledTimes(1);
   });
 
-  it('modifier + non-http href → falls through (false), leaves it for file-path handling', () => {
+  it('non-http href → falls through (false), leaves it for file-path handling', () => {
     for (const href of ['./docs/foo.md', 'src/main/index.ts', 'mailto:a@b.com', 'file:///x']) {
       const open = vi.fn();
-      const { e, preventDefault } = fakeEvent({ ctrlKey: true });
+      const { e, preventDefault } = fakeEvent();
       const handled = handleMarkdownUrlClick(e, href, open);
       expect(handled).toBe(false);
       expect(open).not.toHaveBeenCalled();
@@ -80,7 +66,7 @@ describe('handleMarkdownUrlClick', () => {
 
   it('missing href → false, no open', () => {
     const open = vi.fn();
-    const { e } = fakeEvent({ ctrlKey: true });
+    const { e } = fakeEvent();
     expect(handleMarkdownUrlClick(e, undefined, open)).toBe(false);
     expect(open).not.toHaveBeenCalled();
   });

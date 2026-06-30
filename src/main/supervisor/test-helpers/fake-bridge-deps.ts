@@ -131,10 +131,22 @@ export function makeFakeBridgeDeps(): FakeBridgeDepsBundle {
 
   const deps: EventBridgeDeps = {
     getAgent: (id) => agents.get(id) ?? null,
-    getSupervisorForWorker: (worker) => {
-      for (const a of agents.values()) {
-        if (a.isSupervisor && a.workspaceId === worker.workspaceId) return a;
+    // Mirrors database.getOwnerForWorker: explicit live owner → owner;
+    // terminal/missing owner → structural-supervisor backstop; no owner edge
+    // but supervised → structural supervisor (legacy); otherwise null.
+    getOwnerForWorker: (worker) => {
+      const structuralSupervisor = (): Agent | null => {
+        for (const a of agents.values()) {
+          if (a.isSupervisor && a.workspaceId === worker.workspaceId) return a;
+        }
+        return null;
+      };
+      if (worker.ownerAgentId) {
+        const owner = agents.get(worker.ownerAgentId) ?? null;
+        if (owner && !['done', 'crashed'].includes(owner.status)) return owner;
+        return structuralSupervisor();
       }
+      if (worker.isSupervised) return structuralSupervisor();
       return null;
     },
     sendInput: async (agentId, text) => {
@@ -245,6 +257,7 @@ export function makeAgent(id: string, overrides: Partial<Agent> = {}): Agent {
     updatedAt: '2026-05-16T00:00:00Z',
     lastOutputAt: null,
     lastAttachedAt: null,
+    ownerAgentId: null,
     ...overrides,
   };
 }

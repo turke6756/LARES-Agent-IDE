@@ -16,6 +16,8 @@ import { AgentSupervisor } from './index';
 import { WindowsRunner } from './windows-runner';
 import { WslRunner } from './wsl-runner';
 import { makeAgent } from './test-helpers/fake-bridge-deps';
+import { redactMcpToken } from './mcp-config-builder';
+import { getApiToken } from '../security/api-auth';
 import type { Agent, AgentStatus } from '../../shared/types';
 
 interface TestCase {
@@ -330,6 +332,130 @@ test('Windows legacy lane: no dashboard --mcp-config and no --strict-mcp-config'
   const args = await captureWindowsLaunch('win-lane-leg', LEGACY_FLAGS);
   assert.ok(!args.some(a => a.includes('agent-dashboard')), `legacy must NOT get the dashboard --mcp-config; got: ${args.join(' ')}`);
   assert.ok(!args.includes('--strict-mcp-config'), `legacy must NOT be strict; got: ${args.join(' ')}`);
+});
+
+// ── PHASE 0 (agent-ownership) — dashboard API credential in the agent's OWN
+// process env so its Bash tool / child subprocesses inherit it ─────────────
+//
+// The bearer token was previously injected ONLY into the MCP sidecar's env
+// (inline --mcp-config), so a script the agent ran from Bash that POSTed the
+// dashboard HTTP API got 401. These tests pin the fix on BOTH spawn paths and
+// pin the gate to the SAME predicate as the MCP-token injection
+// (roleLaneOf !== 'legacy'), so the two can never diverge.
+//
+// NOTE ON WSLENV: the WSL agent env is set via bash command-prefix
+// (VAR=value ... claude) directly in the tmux command line — the same mechanism
+// as the sibling AGENT_ID/DASHBOARD_PORT/DASHBOARD_HOST vars — so it needs no
+// WSLENV declaration (WSLENV only matters when crossing the Windows process env
+// into WSL, which the query path does, not this launch path). The tests below
+// therefore assert the command-prefix carries the vars.
+
+// Capture the extraEnv handed to WindowsRunner.launch for the given lane-flags.
+async function captureWindowsExtraEnv(
+  id: string, flags: Partial<Agent>,
+): Promise<Record<string, string>> {
+  const agentsMap = new Map<string, Agent>();
+  const restoreDb = patchDb(agentsMap);
+  const captured: { extraEnv: Record<string, string> | undefined | null } = { extraEnv: null };
+  const origWinLaunch = (WindowsRunner.prototype as { launch: unknown }).launch;
+  (WindowsRunner.prototype as { launch: unknown }).launch = function (
+    this: WindowsRunner,
+    _workDir: string, _command: string, _args: string[], _logPath: string,
+    _directSpawn?: boolean, extraEnv?: Record<string, string>,
+  ) {
+    captured.extraEnv = extraEnv ?? undefined;
+    (this as unknown as { _pid: number; _alive: boolean })._pid = 12345;
+    (this as unknown as { _pid: number; _alive: boolean })._alive = true;
+  };
+  try {
+    const agent = makeAgent(id, {
+      provider: 'claude',
+      command: 'claude --dangerously-skip-permissions',
+      workingDirectory: 'C:\\tmp\\ws',
+      ...flags,
+    });
+    agentsMap.set(agent.id, agent);
+    const supervisor = makeSupervisor();
+    await (supervisor as unknown as { launchWindowsAgent: (a: Agent) => Promise<void> })
+      .launchWindowsAgent(agent);
+    return (captured.extraEnv ?? {}) as Record<string, string>;
+  } finally {
+    (WindowsRunner.prototype as { launch: unknown }).launch = origWinLaunch;
+    restoreDb();
+  }
+}
+
+// ── Windows path: extraEnv carries the credential for every non-legacy lane ──
+for (const [laneName, flags] of [
+  ['supervisor', SUPERVISOR_FLAGS],
+  ['worker', WORKER_FLAGS],
+  ['researcher', RESEARCHER_FLAGS],
+] as [string, Partial<Agent>][]) {
+  test(`PHASE 0 Windows ${laneName} lane: AGENT_DASHBOARD_* injected into agent process env`, async () => {
+    const env = await captureWindowsExtraEnv(`win-own-${laneName}`, flags);
+    assert.equal(
+      env.AGENT_DASHBOARD_API_TOKEN, getApiToken(),
+      `${laneName} must inherit the live API token; got: ${JSON.stringify(env)}`,
+    );
+    assert.match(env.AGENT_DASHBOARD_API_PORT ?? '', /^\d+$/, `${laneName} must get a numeric API port`);
+    assert.equal(env.AGENT_DASHBOARD_API_HOST, '127.0.0.1', `${laneName} Windows host must be loopback`);
+    assert.equal(
+      env.AGENT_DASHBOARD_SELF_ID, `win-own-${laneName}`,
+      `${laneName} must get its own id as SELF_ID; got: ${JSON.stringify(env)}`,
+    );
+  });
+}
+
+test('PHASE 0 Windows legacy lane: AGENT_DASHBOARD_* NOT injected (matches no-MCP-token gate)', async () => {
+  const env = await captureWindowsExtraEnv('win-own-legacy', LEGACY_FLAGS);
+  for (const key of [
+    'AGENT_DASHBOARD_API_TOKEN', 'AGENT_DASHBOARD_API_PORT',
+    'AGENT_DASHBOARD_API_HOST', 'AGENT_DASHBOARD_SELF_ID',
+  ]) {
+    assert.ok(!(key in env), `legacy must NOT inject ${key}; got: ${JSON.stringify(env)}`);
+  }
+});
+
+// ── WSL path: bash command-prefix carries the credential for every non-legacy lane ──
+for (const [laneName, flags] of [
+  ['supervisor', SUPERVISOR_FLAGS],
+  ['worker', WORKER_FLAGS],
+  ['researcher', RESEARCHER_FLAGS],
+] as [string, Partial<Agent>][]) {
+  test(`PHASE 0 WSL ${laneName} lane: AGENT_DASHBOARD_* injected into bash command-prefix`, async () => {
+    const cmd = await captureWslLaunch(`wsl-own-${laneName}`, flags);
+    assert.match(
+      cmd, /AGENT_DASHBOARD_API_TOKEN=/,
+      `${laneName} must inject AGENT_DASHBOARD_API_TOKEN=; got: ${cmd}`,
+    );
+    assert.ok(
+      cmd.includes(getApiToken()),
+      `${laneName} command-prefix must carry the live token value; got: ${cmd}`,
+    );
+    assert.match(cmd, /AGENT_DASHBOARD_API_PORT=\d+/, `${laneName} must inject AGENT_DASHBOARD_API_PORT=`);
+    assert.match(
+      cmd, /AGENT_DASHBOARD_API_HOST=10\.0\.0\.42/,
+      `${laneName} WSL host must be the resolved gateway IP; got: ${cmd}`,
+    );
+    assert.match(
+      cmd, new RegExp(`AGENT_DASHBOARD_SELF_ID=wsl-own-${laneName}`),
+      `${laneName} must inject its own id as SELF_ID; got: ${cmd}`,
+    );
+  });
+}
+
+test('PHASE 0 WSL legacy lane: AGENT_DASHBOARD_* NOT injected (matches no-MCP-token gate)', async () => {
+  const cmd = await captureWslLaunch('wsl-own-legacy', LEGACY_FLAGS);
+  assert.ok(!/AGENT_DASHBOARD_API_TOKEN=/.test(cmd), `legacy must NOT inject API token; got: ${cmd}`);
+  assert.ok(!/AGENT_DASHBOARD_SELF_ID=/.test(cmd), `legacy must NOT inject SELF_ID; got: ${cmd}`);
+});
+
+test('PHASE 0 WSL: the injected token is scrubbed by redactMcpToken before any log sink', async () => {
+  const cmd = await captureWslLaunch('wsl-own-redact', WORKER_FLAGS);
+  const token = getApiToken();
+  assert.ok(cmd.includes(token), 'precondition: live command must contain the raw token');
+  const redacted = redactMcpToken(cmd, token);
+  assert.ok(!redacted.includes(token), `redacted command must not leak the token; got: ${redacted}`);
 });
 
 // ── dashboard-status.mjs failure-log behavior (T1-A) ──────────────────

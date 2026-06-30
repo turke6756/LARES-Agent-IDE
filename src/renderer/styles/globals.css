@@ -337,6 +337,27 @@ select {
     var(--shadow-card);
 }
 
+/* ── Attached supervisor bar — the owner-container the chat pane is on ──
+   The subtle default fill made "which bar am I attached to?" easy to miss, so a
+   clicked/attached bar gets a much stronger blue wash, a bright thick left rail,
+   and a blue glow — unmistakable at a glance vs. an unselected bar. */
+.owner-bar-selected {
+  background: rgba(96, 158, 232, 0.3);
+  border-color: rgba(96, 158, 232, 0.75);
+  box-shadow:
+    inset 4px 0 0 0 var(--color-accent-blue),
+    0 0 0 1px rgba(96, 158, 232, 0.6),
+    0 4px 18px rgba(96, 158, 232, 0.22);
+}
+.light .owner-bar-selected {
+  background: #d8e8fb;
+  border-color: #8fb8e6;
+  box-shadow:
+    inset 4px 0 0 0 var(--color-accent-blue),
+    0 0 0 1px #a9c8e8,
+    0 4px 14px rgba(96, 158, 232, 0.25);
+}
+
 /* ── Multi-selection / unread halos ──
    Outline, not Tailwind ring: rings are box-shadows, and the card's own
    box-shadow rules (.agent-card:hover, .light .ui-card, .agent-card-selected)
@@ -518,6 +539,39 @@ select {
 @media (prefers-reduced-motion: reduce) {
   .browser-tab-attention {
     animation: none;
+  }
+}
+
+/* ── Agent grid: owner-container active-border pulse ─────────────────────────
+   An owner-container bar (a supervisor and the agents it owns) pulses its border
+   when ≥1 owned agent — at any nesting depth — is actively working. This makes a
+   busy cohort visible even while the bar is collapsed (the default) and the
+   owner itself is idle. Green to match StatusBadge's "working" accent; an inset
+   ring so it reads as the band's own glow rather than a detached halo. */
+@keyframes owner-active-border-pulse {
+  0%,
+  100% {
+    box-shadow:
+      0 0 0 0 color-mix(in srgb, var(--color-accent-green) 0%, transparent),
+      inset 0 0 0 1px color-mix(in srgb, var(--color-accent-green) 30%, transparent);
+  }
+  50% {
+    box-shadow:
+      0 0 6px 1px color-mix(in srgb, var(--color-accent-green) 45%, transparent),
+      inset 0 0 0 1px color-mix(in srgb, var(--color-accent-green) 65%, transparent);
+  }
+}
+
+.owner-active-pulse {
+  animation: owner-active-border-pulse 1.6s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  /* No throb — hold a static green ring so the "someone's working" signal still
+     reads for motion-sensitive users. */
+  .owner-active-pulse {
+    animation: none;
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--color-accent-green) 55%, transparent);
   }
 }
 
@@ -1291,6 +1345,23 @@ html.light ::-webkit-scrollbar-thumb:hover {
 }
 .app-no-drag {
   -webkit-app-region: no-drag;
+}
+
+/* ── App title bar (spanning top chrome for the frameless window) ──
+   The window is titleBarStyle:'hidden' + titleBarOverlay, so the native
+   min/max/close buttons float top-right in a band of --titlebar-height. This
+   bar fills the rest of that band as the drag surface + app-menu home. The
+   env(titlebar-area-*) insets keep our content clear of the native caption
+   buttons: padding-left absorbs the left inset (0 on Windows, traffic-light
+   width on macOS); padding-right equals the caption-button cluster width
+   (window width − draggable width). */
+:root {
+  --titlebar-height: 32px;
+}
+.titlebar {
+  height: var(--titlebar-height);
+  padding-left: env(titlebar-area-x, 0px);
+  padding-right: calc(100% - env(titlebar-area-x, 0px) - env(titlebar-area-width, 100%));
 }
 
 /* ── Embedded browser ──

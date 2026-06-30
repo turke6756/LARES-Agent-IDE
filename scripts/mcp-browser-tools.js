@@ -343,6 +343,19 @@ function imageContentFromBase64Png(base64Png) {
   return { type: 'image', data: base64Png, mimeType: 'image/png' };
 }
 
+/** WI-4 (signed-in tabs): when an API response is the signin envelope
+ *  (`{ ok:false, status:'pending_signin' | 'signin_unavailable', … }`), return
+ *  an MCP text block that JSON-prints the WHOLE envelope so the researcher reads
+ *  `status` / `origin` / `requestId` / `message` and decides wait vs degrade.
+ *  This is a NORMAL result, not an error — do NOT raise isError. Returns null
+ *  when `r` is not an envelope (the caller formats the normal content). */
+function signinEnvelopeResult(r) {
+  if (r && typeof r === 'object' && r.ok === false) {
+    return { content: [{ type: 'text', text: JSON.stringify(r, null, 2) }] };
+  }
+  return null;
+}
+
 /**
  * Dispatch a browser_* tool call against the dashboard API.
  * Returns an MCP result object, or null when `name` is not a browser tool
@@ -361,6 +374,8 @@ async function handleBrowserToolCall(name, args, apiRequest) {
       // workspace's browser strip, not whichever one the human is viewing).
       if (AGENT_ID) body.agentId = AGENT_ID;
       const r = await apiRequest('POST', '/api/browser/open-url', body);
+      const env = signinEnvelopeResult(r);
+      if (env) return env;
       const mode = r.forHuman
         ? 'opened in the HUMAN\'s browser partition for them to act on (no readback — tell the human what to do there)'
         : 'opened in your agent partition';
@@ -374,37 +389,37 @@ async function handleBrowserToolCall(name, args, apiRequest) {
 
     case 'browser_get_page_text': {
       const r = await apiRequest('GET', `/api/browser/${encodeURIComponent(args.tab_id)}/text`);
-      return { content: [{ type: 'text', text: r.text || '(empty page)' }] };
+      return signinEnvelopeResult(r) || { content: [{ type: 'text', text: r.text || '(empty page)' }] };
     }
 
     case 'browser_read_page': {
       const r = await apiRequest('GET', `/api/browser/${encodeURIComponent(args.tab_id)}/page`);
-      return { content: [{ type: 'text', text: r.page || '(empty page)' }] };
+      return signinEnvelopeResult(r) || { content: [{ type: 'text', text: r.page || '(empty page)' }] };
     }
 
     case 'browser_screenshot': {
       const r = await apiRequest('POST', `/api/browser/${encodeURIComponent(args.tab_id)}/screenshot`);
-      return { content: [imageContentFromBase64Png(r.base64Png)] };
+      return signinEnvelopeResult(r) || { content: [imageContentFromBase64Png(r.base64Png)] };
     }
 
     case 'browser_click': {
       const r = await apiRequest('POST', `/api/browser/${encodeURIComponent(args.tab_id)}/click`, { ref: args.ref });
-      return { content: [{ type: 'text', text: r.snapshot || '(no snapshot returned)' }] };
+      return signinEnvelopeResult(r) || { content: [{ type: 'text', text: r.snapshot || '(no snapshot returned)' }] };
     }
 
     case 'browser_type': {
       const r = await apiRequest('POST', `/api/browser/${encodeURIComponent(args.tab_id)}/type`, { ref: args.ref, text: args.text });
-      return { content: [{ type: 'text', text: r.snapshot || '(no snapshot returned)' }] };
+      return signinEnvelopeResult(r) || { content: [{ type: 'text', text: r.snapshot || '(no snapshot returned)' }] };
     }
 
     case 'browser_press_key': {
       const r = await apiRequest('POST', `/api/browser/${encodeURIComponent(args.tab_id)}/press-key`, { key: args.key });
-      return { content: [{ type: 'text', text: r.snapshot || '(no snapshot returned)' }] };
+      return signinEnvelopeResult(r) || { content: [{ type: 'text', text: r.snapshot || '(no snapshot returned)' }] };
     }
 
     case 'browser_select_option': {
       const r = await apiRequest('POST', `/api/browser/${encodeURIComponent(args.tab_id)}/select-option`, { ref: args.ref, value: args.value });
-      return { content: [{ type: 'text', text: r.snapshot || '(no snapshot returned)' }] };
+      return signinEnvelopeResult(r) || { content: [{ type: 'text', text: r.snapshot || '(no snapshot returned)' }] };
     }
 
     case 'browser_scroll': {
@@ -412,28 +427,30 @@ async function handleBrowserToolCall(name, args, apiRequest) {
       if (args.ref !== undefined) body.ref = args.ref;
       if (args.dy !== undefined) body.dy = args.dy;
       const r = await apiRequest('POST', `/api/browser/${encodeURIComponent(args.tab_id)}/scroll`, body);
-      return { content: [{ type: 'text', text: r.snapshot || '(no snapshot returned)' }] };
+      return signinEnvelopeResult(r) || { content: [{ type: 'text', text: r.snapshot || '(no snapshot returned)' }] };
     }
 
     case 'browser_go_back': {
       const r = await apiRequest('POST', `/api/browser/${encodeURIComponent(args.tab_id)}/go-back`);
-      return { content: [{ type: 'text', text: r.snapshot || '(no snapshot returned)' }] };
+      return signinEnvelopeResult(r) || { content: [{ type: 'text', text: r.snapshot || '(no snapshot returned)' }] };
     }
 
     case 'browser_go_forward': {
       const r = await apiRequest('POST', `/api/browser/${encodeURIComponent(args.tab_id)}/go-forward`);
-      return { content: [{ type: 'text', text: r.snapshot || '(no snapshot returned)' }] };
+      return signinEnvelopeResult(r) || { content: [{ type: 'text', text: r.snapshot || '(no snapshot returned)' }] };
     }
 
     case 'browser_reload': {
       const r = await apiRequest('POST', `/api/browser/${encodeURIComponent(args.tab_id)}/reload`);
-      return { content: [{ type: 'text', text: r.snapshot || '(no snapshot returned)' }] };
+      return signinEnvelopeResult(r) || { content: [{ type: 'text', text: r.snapshot || '(no snapshot returned)' }] };
     }
 
     case 'browser_wait_for': {
       const body = { text: args.text };
       if (args.timeout_ms !== undefined) body.timeoutMs = args.timeout_ms;
       const r = await apiRequest('POST', `/api/browser/${encodeURIComponent(args.tab_id)}/wait-for`, body);
+      const env = signinEnvelopeResult(r);
+      if (env) return env;
       const head = r.found
         ? `Found "${args.text}" after ${r.elapsedMs}ms.`
         : `Did not find "${args.text}" within the timeout (${r.elapsedMs}ms).`;
@@ -475,11 +492,15 @@ async function handleBrowserToolCall(name, args, apiRequest) {
 
     case 'browser_list_my_access_requests': {
       const r = await apiRequest('GET', `/api/browser/access/my-requests?agentId=${encodeURIComponent(AGENT_ID)}`);
-      const requests = r.requests || [];
-      const text = requests.length
-        ? JSON.stringify(requests, null, 2)
-        : 'You have no website-access requests on file.';
-      return { content: [{ type: 'text', text }] };
+      // WI-4: print the WHOLE payload — `{ requests, signin_pending }` — even when
+      // `requests` is empty, so the researcher can poll the workspace-scoped
+      // `signin_pending[]` rollup (each `{ origin, state, request_id, since }`)
+      // for a sign-in it is waiting on, not just its filed access requests.
+      const payload = {
+        requests: r.requests || [],
+        signin_pending: r.signin_pending || [],
+      };
+      return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] };
     }
 
     default:

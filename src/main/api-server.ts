@@ -24,6 +24,7 @@ import {
 import { scanPersonas, scaffoldPersona } from './persona-scanner';
 import { TEAM_MAX_MESSAGES_PER_5MIN, TEAM_MAX_ALTERNATIONS, TEAM_ALTERNATION_WINDOW_MS, TEAM_PAIR_COOLDOWN_MS } from '../shared/constants';
 import { TeamMessageStatus } from '../shared/types';
+import type { SigninPendingResult, SigninPendingEntry } from '../shared/browser';
 import { isKeyName, mapKeyToBytes, SUPPORTED_KEY_NAMES } from './supervisor/key-bytes';
 import type { OrchestrationService } from './orchestration/service';
 import crypto from 'crypto';
@@ -63,25 +64,32 @@ export interface BrowserToolProvider {
     },
   ): Promise<unknown>;
   listTabs(): unknown[];
+  // WI-4 (signed-in tabs): every page-producing / action verb may now resolve to
+  // the `SigninPendingResult` envelope (`{ ok:false, status:'pending_signin' |
+  // 'signin_unavailable', … }`) INSTEAD of content / acting, when the tab's
+  // committed origin needs a human sign-in. This is a NORMAL structured result,
+  // NOT a PolicyError — the routes pass it straight through (no 403). The shim
+  // JSON-prints the whole envelope; the researcher polls on it.
   /** wrapUntrusted applied by the provider (M12). */
-  getPageText(tabId: string): Promise<string>;
+  getPageText(tabId: string): Promise<string | SigninPendingResult>;
   /** a11y tree + numbered refs, wrapUntrusted applied (M12). */
-  readPage(tabId: string): Promise<string>;
-  screenshot(tabId: string): Promise<{ base64Png: string }>;
+  readPage(tabId: string): Promise<string | SigninPendingResult>;
+  screenshot(tabId: string): Promise<{ base64Png: string } | SigninPendingResult>;
   /** Act tier — throws PolicyError unless human-enabled; returns the fresh
    *  post-click snapshot. */
-  click(tabId: string, ref: number): Promise<string>;
+  click(tabId: string, ref: number): Promise<string | SigninPendingResult>;
   /** Act tier (WP-C parity). Each returns the fresh post-action snapshot
    *  except closeTab (returns the updated agent tab list) and waitFor (a
    *  server-side bounded poll result). NONE is an eval surface (M10). */
-  type(tabId: string, ref: number, text: string): Promise<string>;
-  pressKey(tabId: string, key: string): Promise<string>;
-  selectOption(tabId: string, ref: number, value: string): Promise<string>;
-  scroll(tabId: string, opts: { ref?: number; dy?: number }): Promise<string>;
-  goBack(tabId: string): Promise<string>;
-  goForward(tabId: string): Promise<string>;
-  reload(tabId: string): Promise<string>;
-  /** Read tier — bounded poll; returns { found, elapsedMs, snapshot? }. */
+  type(tabId: string, ref: number, text: string): Promise<string | SigninPendingResult>;
+  pressKey(tabId: string, key: string): Promise<string | SigninPendingResult>;
+  selectOption(tabId: string, ref: number, value: string): Promise<string | SigninPendingResult>;
+  scroll(tabId: string, opts: { ref?: number; dy?: number }): Promise<string | SigninPendingResult>;
+  goBack(tabId: string): Promise<string | SigninPendingResult>;
+  goForward(tabId: string): Promise<string | SigninPendingResult>;
+  reload(tabId: string): Promise<string | SigninPendingResult>;
+  /** Read tier — bounded poll; returns { found, elapsedMs, snapshot? } or the
+   *  signin envelope. */
   waitFor(tabId: string, input: { text: string; timeoutMs?: number }): Promise<unknown>;
   /** Act tier — returns the updated agent tab list (no impossible snapshot). */
   closeTab(tabId: string): Promise<unknown>;
@@ -115,6 +123,10 @@ export interface BrowserToolProvider {
   }): unknown;
   /** §18 outcome read — a single agent's own requests + statuses. */
   listMyAccessRequests(agentId: string): unknown[];
+  /** WI-4 — the workspace-scoped `signin_pending` rollup that rides alongside
+   *  `requests` in the browser_list_my_access_requests payload. workspaceId is
+   *  resolved trust-side (agentId → workspace) by this layer. */
+  listSigninPending(workspaceId: string | null): SigninPendingEntry[];
 }
 
 /**
@@ -174,6 +186,17 @@ export class ApiServer {
       throw Object.assign(err, { statusCode: 403, code: 'browser-policy-denied' });
     }
     throw err;
+  }
+
+  /** WI-4 (signed-in tabs): a page-producing/action verb may resolve to the
+   *  `SigninPendingResult` envelope (`{ ok:false, status:'pending_signin' |
+   *  'signin_unavailable', … }`) when the tab's committed origin needs a human
+   *  sign-in. This is a NORMAL structured result — NOT a PolicyError/403 — so the
+   *  routes detect it here and forward the WHOLE envelope as the JSON body
+   *  instead of treating it as content. The MCP shim JSON-prints it; the
+   *  researcher polls on `status`. */
+  private static isSigninEnvelope(r: unknown): r is SigninPendingResult {
+    return !!r && typeof r === 'object' && 'ok' in r && (r as { ok: unknown }).ok === false;
   }
 
   /** Resolves with the actually-bound port once listening — surviving the
@@ -376,7 +399,8 @@ export class ApiServer {
     if (method === 'POST' && inputMatch) {
       const agentId = inputMatch[1];
       const body = await readBody(req);
-      const { text, submit, confirm } = JSON.parse(body);
+      const { text, submit, confirm, senderAgentId, sender_agent_id } = JSON.parse(body);
+      const senderId: string | undefined = senderAgentId ?? sender_agent_id;
       if (!text) throw Object.assign(new Error('Missing "text" in request body'), { statusCode: 400 });
 
       const agent = getAgent(agentId);
@@ -393,13 +417,32 @@ export class ApiServer {
         );
       }
 
+      // Transient one-turn subscription: a submitted cross-agent send auto-
+      // subscribes the sender to ONE turn outcome of the target. Sits AFTER the
+      // 409 gate (a busy-target throw exits before this → never registers) and
+      // BEFORE delivery. All eligibility (privilege, liveness, self-check, owner
+      // dedup, per-target cap) is enforced inside the registry; this layer does
+      // only body-derived gating (submitted + a present sender id).
+      let transientSubscription: { registered: boolean; reason?: string } = { registered: false };
+      const wantsSub = submit !== false && typeof senderId === 'string' && senderId.length > 0;
+      if (wantsSub) {
+        transientSubscription = this.supervisor.registerTransientTurnSubscription({
+          targetAgentId: agentId, subscriberAgentId: senderId!,
+        });
+      }
+
       // Confirmed (handshake) path. `submit: false` is incompatible — an
       // unsubmitted prompt can't start a turn, so there is nothing to confirm.
       if (confirm === true && submit !== false) {
         try {
           const result = await this.supervisor.sendInputConfirmed(agentId, text);
-          return { ok: true, agentId, submit: true, ...result };
+          return { ok: true, agentId, submit: true, ...result, transientSubscription };
         } catch (err) {
+          // A delivery/confirm throw means no turn will start — drop the
+          // just-registered subscription so it can't consume an unrelated idle.
+          if (transientSubscription.registered && senderId) {
+            this.supervisor.cancelTransientTurnSubscriptionsForPair(agentId, senderId);
+          }
           const e = err as Error & { statusCode?: number; code?: string };
           if (e.name === 'SubmitNotConfirmedError') {
             e.statusCode = 502;
@@ -422,7 +465,7 @@ export class ApiServer {
       this.supervisor.sendInput(agentId, text, opts).catch((err) => {
         console.error(`[api] Background input delivery to ${agentId} failed:`, err);
       });
-      return { ok: true, agentId, queued: true, submit: submit !== false, message: 'Input queued' };
+      return { ok: true, agentId, queued: true, submit: submit !== false, message: 'Input queued', transientSubscription };
     }
 
     // POST /api/agents/:id/keys — write keystroke bytes to the agent's PTY.
@@ -515,7 +558,9 @@ export class ApiServer {
     // POST /api/agents/:id/status — class IV worker hook receive endpoint.
     // The supervised-worker Stop hook (state='idle'), UserPromptSubmit hook
     // (state='working'), and SessionStart hook (state='active') post here.
-    // Body: { state: 'idle' | 'working' | 'active', source: string, ts?: number }
+    // The Notification hook (state='waiting') posts here too — it carries an
+    // optional excerpt + notificationType and drives the waiting latch.
+    // Body: { state: 'idle' | 'working' | 'active' | 'waiting', source: string, ts?: number }
     // 'idle'/'working' flip the agent's StatusMonitor latch (the EventBridge →
     // supervisor notification pipeline picks up the change); 'active' updates
     // hook health only and never changes status. See
@@ -531,9 +576,9 @@ export class ApiServer {
       const state: unknown = parsed.state;
       const source: unknown = parsed.source;
 
-      if (state !== 'idle' && state !== 'working' && state !== 'active') {
+      if (state !== 'idle' && state !== 'working' && state !== 'active' && state !== 'waiting') {
         throw Object.assign(
-          new Error(`Unsupported state ${JSON.stringify(state)} — only 'idle', 'working', or 'active' accepted`),
+          new Error(`Unsupported state ${JSON.stringify(state)} — only 'idle', 'working', 'active', or 'waiting' accepted`),
           { statusCode: 400 },
         );
       }
@@ -551,14 +596,16 @@ export class ApiServer {
         && typeof ts === 'number' && Number.isFinite(ts));
       const event = {
         agentId: typeof parsed.agentId === 'string' ? parsed.agentId : undefined,
-        state: state as 'idle' | 'working' | 'active',
+        state: state as 'idle' | 'working' | 'active' | 'waiting',
         source: sourceTag,
         ts: legacy ? Date.now() : (ts as number),
         hookEventName: legacy
-          ? (state === 'working' ? 'UserPromptSubmit' : state === 'active' ? 'SessionStart' : 'Stop')
+          ? (state === 'working' ? 'UserPromptSubmit' : state === 'active' ? 'SessionStart' : state === 'waiting' ? 'Notification' : 'Stop')
           : (hookEventName as string),
         turnId: typeof parsed.turnId === 'string' ? parsed.turnId : undefined,
         sessionId: typeof parsed.sessionId === 'string' ? parsed.sessionId : undefined,
+        waitingExcerpt: typeof parsed.excerpt === 'string' ? parsed.excerpt : undefined,
+        notificationType: typeof parsed.notificationType === 'string' ? parsed.notificationType : undefined,
         legacy,
       };
       const result = this.supervisor.applyHookStatusEvent(agentId, event, 'http');
@@ -575,6 +622,18 @@ export class ApiServer {
       // `isResearcher` LaunchAgentInput field the supervisor reads.
       if (input && input.is_researcher !== undefined && input.isResearcher === undefined) {
         input.isResearcher = input.is_researcher;
+      }
+      // Agent-ownership primitive (§4.2): normalize the snake_case owner edge for the
+      // script-on-behalf path (the launch_agent MCP handler forwards its trusted
+      // AGENT_DASHBOARD_SELF_ID as owner_agent_id). launchAgent re-validates it (§4.1)
+      // before persisting, so an untrusted/foreign id is dropped, never trusted blindly.
+      if (input && input.owner_agent_id !== undefined && input.ownerAgentId === undefined) {
+        input.ownerAgentId = input.owner_agent_id;
+      }
+      // notifyOwner mute: normalize the snake_case form, mirroring owner_agent_id
+      // above. undefined/true = notify (default); false = mute owner-directed events.
+      if (input && input.notify_owner !== undefined && input.notifyOwner === undefined) {
+        input.notifyOwner = input.notify_owner;
       }
       const agent = await this.supervisor.launchAgent(input);
       return agent;
@@ -1175,6 +1234,9 @@ export class ApiServer {
       }
       try {
         const snapshot = await tools.openUrl(targetUrl, openOpts);
+        // WI-4: a signin envelope is a normal structured result, NOT a 403 —
+        // forward it whole so the agent sees `pending_signin`/`signin_unavailable`.
+        if (ApiServer.isSigninEnvelope(snapshot)) return snapshot;
         return { ok: true, forHuman: forHuman === true, snapshot };
       } catch (err) {
         ApiServer.rethrowBrowserError(err);
@@ -1199,9 +1261,13 @@ export class ApiServer {
       const tabId = browserReadMatch[1];
       try {
         if (browserReadMatch[2] === 'text') {
-          return { tabId, text: await tools.getPageText(tabId) };
+          const r = await tools.getPageText(tabId);
+          if (ApiServer.isSigninEnvelope(r)) return r;
+          return { tabId, text: r };
         }
-        return { tabId, page: await tools.readPage(tabId) };
+        const r = await tools.readPage(tabId);
+        if (ApiServer.isSigninEnvelope(r)) return r;
+        return { tabId, page: r };
       } catch (err) {
         ApiServer.rethrowBrowserError(err);
       }
@@ -1213,8 +1279,9 @@ export class ApiServer {
       const tools = this.requireBrowserTools();
       const tabId = browserShotMatch[1];
       try {
-        const { base64Png } = await tools.screenshot(tabId);
-        return { tabId, base64Png };
+        const r = await tools.screenshot(tabId);
+        if (ApiServer.isSigninEnvelope(r)) return r;
+        return { tabId, base64Png: r.base64Png };
       } catch (err) {
         ApiServer.rethrowBrowserError(err);
       }
@@ -1233,7 +1300,9 @@ export class ApiServer {
         );
       }
       try {
-        return { tabId, snapshot: await tools.click(tabId, ref) };
+        const r = await tools.click(tabId, ref);
+        if (ApiServer.isSigninEnvelope(r)) return r;
+        return { tabId, snapshot: r };
       } catch (err) {
         ApiServer.rethrowBrowserError(err);
       }
@@ -1256,7 +1325,9 @@ export class ApiServer {
         throw Object.assign(new Error('"text" must be a string'), { statusCode: 400 });
       }
       try {
-        return { tabId, snapshot: await tools.type(tabId, ref, text) };
+        const r = await tools.type(tabId, ref, text);
+        if (ApiServer.isSigninEnvelope(r)) return r;
+        return { tabId, snapshot: r };
       } catch (err) {
         ApiServer.rethrowBrowserError(err);
       }
@@ -1272,7 +1343,9 @@ export class ApiServer {
         throw Object.assign(new Error('"key" must be a non-empty string'), { statusCode: 400 });
       }
       try {
-        return { tabId, snapshot: await tools.pressKey(tabId, key) };
+        const r = await tools.pressKey(tabId, key);
+        if (ApiServer.isSigninEnvelope(r)) return r;
+        return { tabId, snapshot: r };
       } catch (err) {
         ApiServer.rethrowBrowserError(err);
       }
@@ -1294,7 +1367,9 @@ export class ApiServer {
         throw Object.assign(new Error('"value" must be a string'), { statusCode: 400 });
       }
       try {
-        return { tabId, snapshot: await tools.selectOption(tabId, ref, value) };
+        const r = await tools.selectOption(tabId, ref, value);
+        if (ApiServer.isSigninEnvelope(r)) return r;
+        return { tabId, snapshot: r };
       } catch (err) {
         ApiServer.rethrowBrowserError(err);
       }
@@ -1321,7 +1396,9 @@ export class ApiServer {
         throw Object.assign(new Error('"dy" must be a number'), { statusCode: 400 });
       }
       try {
-        return { tabId, snapshot: await tools.scroll(tabId, hasRef ? { ref } : { dy }) };
+        const r = await tools.scroll(tabId, hasRef ? { ref } : { dy });
+        if (ApiServer.isSigninEnvelope(r)) return r;
+        return { tabId, snapshot: r };
       } catch (err) {
         ApiServer.rethrowBrowserError(err);
       }
@@ -1333,7 +1410,9 @@ export class ApiServer {
       const tools = this.requireBrowserTools();
       const tabId = browserGoBackMatch[1];
       try {
-        return { tabId, snapshot: await tools.goBack(tabId) };
+        const r = await tools.goBack(tabId);
+        if (ApiServer.isSigninEnvelope(r)) return r;
+        return { tabId, snapshot: r };
       } catch (err) {
         ApiServer.rethrowBrowserError(err);
       }
@@ -1345,7 +1424,9 @@ export class ApiServer {
       const tools = this.requireBrowserTools();
       const tabId = browserGoForwardMatch[1];
       try {
-        return { tabId, snapshot: await tools.goForward(tabId) };
+        const r = await tools.goForward(tabId);
+        if (ApiServer.isSigninEnvelope(r)) return r;
+        return { tabId, snapshot: r };
       } catch (err) {
         ApiServer.rethrowBrowserError(err);
       }
@@ -1357,7 +1438,9 @@ export class ApiServer {
       const tools = this.requireBrowserTools();
       const tabId = browserReloadMatch[1];
       try {
-        return { tabId, snapshot: await tools.reload(tabId) };
+        const r = await tools.reload(tabId);
+        if (ApiServer.isSigninEnvelope(r)) return r;
+        return { tabId, snapshot: r };
       } catch (err) {
         ApiServer.rethrowBrowserError(err);
       }
@@ -1377,11 +1460,12 @@ export class ApiServer {
         throw Object.assign(new Error('"timeoutMs" must be an integer when provided'), { statusCode: 400 });
       }
       try {
-        const result = (await tools.waitFor(
+        const result = await tools.waitFor(
           tabId,
           { text, ...(timeoutMs !== undefined ? { timeoutMs } : {}) },
-        )) as Record<string, unknown>;
-        return { tabId, ...result };
+        );
+        if (ApiServer.isSigninEnvelope(result)) return result;
+        return { tabId, ...(result as Record<string, unknown>) };
       } catch (err) {
         ApiServer.rethrowBrowserError(err);
       }
@@ -1467,7 +1551,20 @@ export class ApiServer {
       if (!agentId) {
         throw Object.assign(new Error('Missing "agentId" query parameter'), { statusCode: 400 });
       }
-      return { requests: tools.listMyAccessRequests(agentId) };
+      // WI-4: resolve the agent's workspace trust-side (same as open-url) so the
+      // signin_pending rollup is scoped to that workspace's runtime SigninSession
+      // registry. A missing registry row / uninitialized DB must not 500 — fall
+      // back to the unscoped (null) workspace.
+      let workspaceId: string | null = null;
+      try {
+        workspaceId = getAgent(agentId)?.workspaceId ?? null;
+      } catch {
+        workspaceId = null;
+      }
+      return {
+        requests: tools.listMyAccessRequests(agentId),
+        signin_pending: tools.listSigninPending(workspaceId),
+      };
     }
 
     throw Object.assign(new Error(`Not found: ${method} ${path}`), { statusCode: 404 });

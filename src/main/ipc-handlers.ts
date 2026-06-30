@@ -2,7 +2,7 @@ import { ipcMain, dialog, shell, BrowserWindow, nativeTheme } from 'electron';
 import type { WebContents } from 'electron';
 import * as fs from 'fs';
 import { persistTheme } from './theme-persistence';
-import type { PathType, FsEvent, DetachRequest, DetachResult } from '../shared/types';
+import type { PathType, FsEvent, DetachRequest, DetachResult, ScanOverheadRequest, ScanOverheadResult } from '../shared/types';
 import { TAB_CHANNELS } from '../shared/types';
 import { createDetachedWindow, canWrite, handleDetachedCloseReply, type DetachedWindowDeps } from './detached-windows';
 import { AgentSupervisor } from './supervisor';
@@ -26,8 +26,9 @@ import { detectPathType, ensureWindowsPath } from './path-utils';
 import { readFileContents, listDirectoryEntriesAsync } from './file-reader';
 import { writeFileContents, createFile, createDirectory, renameEntry, moveEntry, copyFiles, deleteEntry } from './file-writer';
 import { subscribe as subscribeFsWatch } from './fs-watcher';
-import { scanPersonas, scaffoldPersona } from './persona-scanner';
+import { scanPersonas, scaffoldPersona, setPersonaLane } from './persona-scanner';
 import { ensureJupyterServer, listKernelspecs } from './jupyter-server';
+import { runOverheadScan } from './context-overhead/ipc-deps';
 
 function resolveMutationPathType(primaryPath: string, rootDirectory: string, pathType?: PathType): PathType {
   const primaryType = detectPathType(primaryPath);
@@ -225,6 +226,7 @@ export function registerIpcHandlers(
   // Persona handlers
   ipcMain.handle('persona:list', (_e, workspacePath, pathType) => scanPersonas(workspacePath, pathType));
   ipcMain.handle('persona:create', (_e, workspacePath, pathType, name, roleDescription?, lane?) => scaffoldPersona(workspacePath, pathType, name, roleDescription, lane));
+  ipcMain.handle('persona:setLane', (_e, workspacePath, pathType, name, lane) => setPersonaLane(workspacePath, pathType, name, lane));
 
   // Template handlers
   ipcMain.handle('template:list', (_e, workspaceId) => listAgentTemplates(workspaceId));
@@ -340,6 +342,17 @@ export function registerIpcHandlers(
     (_e, requestId: string, decision: 'save' | 'discard' | 'cancel') =>
       handleDetachedCloseReply(requestId, decision),
   );
+
+  // Context-Overhead Analyzer — trusted main-process scan (plan §2.5). Always
+  // returns the ScanOverheadResult discriminated union (R1).
+  ipcMain.handle('context-overhead:scan', async (_e, req: ScanOverheadRequest): Promise<ScanOverheadResult> => {
+    try {
+      const model = runOverheadScan(req.workspaceId);
+      return { ok: true, model };
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+  });
 
   // File viewer handlers
   ipcMain.handle('files:read', async (_e, filePath, pathType) => {
@@ -514,7 +527,8 @@ export function registerIpcHandlers(
     // stay visible against the new chrome color.
     if (process.platform === 'win32' && !mainWindow.isDestroyed()) {
       mainWindow.setTitleBarOverlay({
-        color: theme === 'light' ? '#f7f5f0' : '#1e1e1e',
+        // surface-base — match the renderer TopBar shade (see createWindow).
+        color: theme === 'light' ? '#edeae3' : '#181818',
         symbolColor: theme === 'light' ? '#1e1e1e' : '#f7f5f0',
       });
     }

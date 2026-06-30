@@ -1,3 +1,10 @@
+// Sender identity for transient one-turn subscriptions is launch-env only,
+// never model-settable (mirrors mcp-team.js / mcp-browser-tools.js). When the
+// dashboard launches an MCP proc it stamps process.env.AGENT_ID with the
+// owning agent's id; we forward it as sender_agent_id so a submitted message
+// auto-subscribes the sender to the target's next turn outcome.
+const AGENT_ID = process.env.AGENT_ID || '';
+
 function getCommsToolDefinitions() {
   return [
     {
@@ -11,7 +18,10 @@ function getCommsToolDefinitions() {
         '{key:"enter"}, or relaunch); do NOT end your turn assuming the handoff worked. ' +
         'For interactive widgets (AskUserQuestion pickers, slash-command menus, arrow keys, Ctrl-C), ' +
         'use `send_keys_to_agent` instead — this tool\'s bracketed-paste wrapping deposits bytes into ' +
-        'the input box as text, not as key events.',
+        'the input box as text, not as key events. ' +
+        'When the send is accepted and submitted, you are auto-subscribed to ONE turn of the target\'s ' +
+        'outcome: you will get a [DASHBOARD EVENT] when it next goes idle/done/crashed (or a TTL expiry ' +
+        'notice), then the subscription is gone. A rejected (busy/409) send does not subscribe.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -38,7 +48,10 @@ async function handleCommsToolCall(name, args, apiRequest) {
       // was working when it never started, with no event to ever wake it.
       const confirm = args.confirm !== false;
       if (!confirm) {
-        await apiRequest('POST', `/api/agents/${args.agent_id}/input`, { text: args.message });
+        await apiRequest('POST', `/api/agents/${args.agent_id}/input`, {
+          text: args.message,
+          ...(AGENT_ID ? { sender_agent_id: AGENT_ID } : {}),
+        });
         return {
           content: [{
             type: 'text',
@@ -50,14 +63,18 @@ async function handleCommsToolCall(name, args, apiRequest) {
         const r = await apiRequest('POST', `/api/agents/${args.agent_id}/input`, {
           text: args.message,
           confirm: true,
+          ...(AGENT_ID ? { sender_agent_id: AGENT_ID } : {}),
         });
         if (r.confirmed) {
+          const subscribed = r.transientSubscription && r.transientSubscription.registered === true;
           return {
             content: [{
               type: 'text',
               text: `HANDSHAKE OK — message delivered to agent ${args.agent_id} and the worker turn `
                 + `is CONFIRMED started (proof: ${r.mode === 'hook' ? 'UserPromptSubmit hook' : 'status flipped to working'}). `
-                + `You will get a [DASHBOARD EVENT] when it goes idle.`,
+                + (subscribed
+                  ? `You will get a [DASHBOARD EVENT] when it finishes this turn, then the one-turn subscription expires.`
+                  : `You will get a [DASHBOARD EVENT] when it goes idle.`),
             }],
           };
         }

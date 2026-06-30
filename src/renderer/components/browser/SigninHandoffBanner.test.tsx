@@ -29,6 +29,11 @@ function buttonByText(text: string): HTMLButtonElement | null {
   ) as HTMLButtonElement | null;
 }
 
+function click(btn: HTMLElement | null) {
+  if (!btn) throw new Error('button not found');
+  act(() => btn.dispatchEvent(new MouseEvent('click', { bubbles: true })));
+}
+
 beforeEach(() => {
   container = document.createElement('div');
   document.body.appendChild(container);
@@ -37,6 +42,7 @@ beforeEach(() => {
     signinHandoff: null,
     signinHandoffError: null,
     signinHandoffDone: null,
+    signinPending: null,
   });
 });
 
@@ -76,5 +82,113 @@ describe('SigninHandoffBanner (Slice 12 — Mechanism A consent banner)', () => 
   it('renders nothing when fully idle', () => {
     render();
     expect(container.textContent).toBe('');
+  });
+});
+
+// ── WI-5: JIT sign-in reminder banner ─────────────────────────────────────────
+// Distinct from the Mechanism-B consent banner above: this one is agent-initiated
+// (main pushed browser:signin-pending-opened because an agent hit an
+// allow_signed_in origin with no live session) and is a REMINDER, not a second
+// consent gate. It names the origin, offers "Done signing in" (→ access-handoff-
+// ready) and "Cancel" (→ signin-pending-cancel), and clears on signin-resolved.
+describe('SigninHandoffBanner — WI-5 JIT sign-in reminder banner', () => {
+  const readyCalls: string[] = [];
+  const cancelCalls: string[] = [];
+
+  const pending = {
+    origin: 'https://boards.example',
+    tabId: 't9',
+    workspaceId: null,
+    reason: 'warm_session_expired',
+  };
+
+  // Flush the async store actions the buttons fire (void complete()/cancel()).
+  async function flush() {
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 0));
+    });
+  }
+
+  beforeEach(() => {
+    readyCalls.length = 0;
+    cancelCalls.length = 0;
+    (window as unknown as { api: unknown }).api = {
+      browser: {
+        getSharedSessions: async () => ({ handedTabs: [], signedInOrigins: [] }),
+        access: {
+          handoffReady: async (tabId: string) => {
+            readyCalls.push(tabId);
+          },
+          signinPendingCancel: async (tabId: string) => {
+            cancelCalls.push(tabId);
+          },
+        },
+      },
+    };
+  });
+
+  afterEach(() => {
+    delete (window as unknown as { api?: unknown }).api;
+  });
+
+  it('appears on signin-pending-opened, names the origin, and offers the two actions', () => {
+    act(() =>
+      useBrowserStore.getState().handleSigninPendingOpened(pending),
+    );
+    render();
+
+    expect(container.textContent).toContain('An agent is waiting');
+    // The origin renders as plain escaped text (never markup / a link).
+    expect(container.textContent).toContain('boards.example');
+    expect(buttonByText('Done signing in')).not.toBeNull();
+    expect(buttonByText('Cancel')).not.toBeNull();
+    // The Mechanism-B "Cancel hand-off" affordance is NOT this banner.
+    expect(buttonByText('Cancel hand-off')).toBeNull();
+  });
+
+  it('"Done signing in" fires access-handoff-ready for the tab and clears the banner', async () => {
+    useBrowserStore.setState({ signinPending: pending });
+    render();
+
+    click(buttonByText('Done signing in'));
+    await flush();
+    expect(readyCalls).toEqual(['t9']);
+    expect(useBrowserStore.getState().signinPending).toBeNull();
+  });
+
+  it('"Cancel" fires signin-pending-cancel for the tab and clears the banner', async () => {
+    useBrowserStore.setState({ signinPending: pending });
+    render();
+
+    click(buttonByText('Cancel'));
+    await flush();
+    expect(cancelCalls).toEqual(['t9']);
+    expect(useBrowserStore.getState().signinPending).toBeNull();
+  });
+
+  it('clears when main pushes signin-resolved for the named origin', () => {
+    useBrowserStore.setState({ signinPending: pending });
+    render();
+    expect(container.textContent).toContain('An agent is waiting');
+
+    act(() =>
+      useBrowserStore
+        .getState()
+        .handleSigninResolved({ origin: 'https://boards.example', state: 'ready' }),
+    );
+    expect(container.textContent).not.toContain('An agent is waiting');
+  });
+
+  it('a signin-resolved for a DIFFERENT origin leaves a live prompt up', () => {
+    useBrowserStore.setState({ signinPending: pending });
+    render();
+
+    act(() =>
+      useBrowserStore
+        .getState()
+        .handleSigninResolved({ origin: 'https://other.example', state: 'ready' }),
+    );
+    expect(container.textContent).toContain('An agent is waiting');
+    expect(container.textContent).toContain('boards.example');
   });
 });

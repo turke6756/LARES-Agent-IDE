@@ -130,20 +130,24 @@ export function isHttpUrl(text: string): boolean {
 }
 
 /**
- * Pure decision for a click on a markdown link: on Ctrl/Cmd+click over an
+ * Pure decision for a click on a markdown link: on ANY left-click over an
  * http(s) href, prevent the default navigation (which would otherwise be
  * externalized to the OS browser by the shell's will-navigate handler — see
  * installExternalNavHandlers), open the URL in the internal browser pane via
- * `openInternal`, and return true. Plain clicks and non-http hrefs return false
- * and are left untouched (callers fall through to file-path handling, then to
- * the default external-open behavior). Kept React-free so it's unit-testable.
+ * `openInternal`, and return true. Non-http hrefs (file paths, mailto:, …)
+ * return false and are left untouched (callers fall through to file-path
+ * handling, then to the default external-open behavior). Kept React-free so
+ * it's unit-testable.
+ *
+ * Note: this fires for every plain left-click — the modifier requirement was
+ * dropped so a single click on a web link in a rendered doc lands in the
+ * dashboard's own browser, not the OS browser.
  */
 export function handleMarkdownUrlClick(
-  e: Pick<MouseEvent, 'ctrlKey' | 'metaKey' | 'preventDefault' | 'stopPropagation'>,
+  e: Pick<MouseEvent, 'preventDefault' | 'stopPropagation'>,
   href: string | undefined,
   openInternal: (url: string) => void,
 ): boolean {
-  if (!e.ctrlKey && !e.metaKey) return false;
   if (!href || !isHttpUrl(href)) return false;
   e.preventDefault();
   e.stopPropagation();
@@ -153,14 +157,12 @@ export function handleMarkdownUrlClick(
 
 /**
  * Hook for the markdown renderer: returns a click handler that opens an http(s)
- * link in the internal browser pane on Ctrl/Cmd+click (new user-partition tab +
- * switch the center view to the browser), returning true; plain/non-http clicks
- * return false. Mirrors the Ctrl/Cmd+click gesture `useModifierPathOpen` uses to
- * open file paths in the viewer — one rule across the surface: modifier-click
- * opens it inside the dashboard. (To make EVERY click open internally instead,
- * drop the `ctrlKey/metaKey` guard in `handleMarkdownUrlClick`.)
+ * link in the internal browser pane on a plain left-click (new user-partition
+ * tab + switch the center view to the browser), returning true; non-http clicks
+ * return false so the caller can fall through to file-path handling. One rule
+ * across the surface: clicking a web link opens it inside the dashboard.
  */
-export function useModifierUrlOpen() {
+export function useUrlOpen() {
   return useCallback(
     (e: MouseEvent, href: string | undefined): boolean =>
       handleMarkdownUrlClick(e, href, (url) => {

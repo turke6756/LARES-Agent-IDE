@@ -8,7 +8,6 @@ import DirectoryTreeNode, { sortEntries } from '../fileviewer/DirectoryTreeNode'
 import { SORT_OPTIONS, type TreeSortMode } from '../shared/FileContextMenu';
 import { useTreeHoverStore } from '../../stores/tree-hover-store';
 import type { DirectoryEntry, PathType } from '../../../shared/types';
-import logoImg from '../../assets/logo.png';
 import { useNamePrompt } from '../../hooks/useNamePrompt';
 import { detectSyncFolder } from '../../../shared/sync-folder-detection';
 
@@ -162,9 +161,7 @@ export default function Sidebar({ width }: SidebarProps) {
   const moveWorkspace = useDashboardStore((s) => s.moveWorkspace);
   const deleteWorkspace = useDashboardStore((s) => s.deleteWorkspace);
   const togglePanelCollapsed = useDashboardStore((s) => s.togglePanelCollapsed);
-  const resetLayout = useDashboardStore((s) => s.resetLayout);
   const checkHealth = useDashboardStore((s) => s.checkHealth);
-  const { theme, toggleTheme } = useThemeStore();
   const [showCreate, setShowCreate] = useState(false);
   const [dragOver, setDragOver] = useState(false);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; wsId: string } | null>(null);
@@ -323,6 +320,14 @@ export default function Sidebar({ width }: SidebarProps) {
     return () => document.removeEventListener('mousedown', handleClick);
   }, [contextMenu]);
 
+  // The TopBar's File → "New Workspace…" menu item fires this event (the
+  // create dialog's open state lives here, not in the title bar).
+  useEffect(() => {
+    const open = () => setShowCreate(true);
+    window.addEventListener('dashboard:new-workspace', open);
+    return () => window.removeEventListener('dashboard:new-workspace', open);
+  }, []);
+
   const handleRefresh = async () => {
     setRefreshing(true);
     setRefreshTick((t) => t + 1);
@@ -428,40 +433,12 @@ export default function Sidebar({ width }: SidebarProps) {
       className="panel-shell flex flex-col z-20"
       style={{ width }}
     >
-      {/* Header — fixed h-16 so it lines up with the main dashboard header.
-          Doubles as a window-drag surface (the native title bar is hidden). */}
-      <div className="panel-header h-16 px-3 flex items-center shrink-0 app-drag-region">
-        <div className="flex items-center justify-between w-full">
-          <div className="flex items-center gap-2">
-            <img src={logoImg} alt="Logo" className="h-10 object-contain" />
-            <span className="text-[13px] font-medium dark:text-gray-300 text-gray-700">Agent Dashboard</span>
-          </div>
-          <div className="flex items-center gap-1 app-no-drag">
-            <button
-              onClick={resetLayout}
-              className="ui-btn ui-btn-ghost min-h-0 px-2 py-1 text-[12px]"
-              title="Reset all panel sizes to defaults"
-            >
-              Reset
-            </button>
-            <button
-              onClick={toggleTheme}
-              className="ui-btn ui-btn-ghost min-h-0 px-2 py-1 text-[12px]"
-              title={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
-            >
-              {theme === 'dark' ? 'Light' : 'Dark'}
-            </button>
-            <CollapseButton collapsed={false} direction="left" onClick={() => togglePanelCollapsed('sidebarCollapsed')} />
-          </div>
-        </div>
-      </div>
-
-      {/* Workspaces section header — outside the scroll container so it
-          stays pinned while the list below scrolls. */}
-      <div className="flex items-center justify-between px-4 py-2 border-b border-surface-3 shrink-0">
-        <span className="ui-section-header">
-          Workspaces
-        </span>
+      {/* Header — h-16 to align with the main + detail panel headers beneath
+          the spanning title bar. The brand mark + theme/reset moved up into the
+          TopBar, so this row is now just the Workspaces section label + actions
+          (pinned outside the scroll container below). */}
+      <div className="panel-header h-16 px-4 flex items-center justify-between shrink-0">
+        <span className="ui-section-header">Workspaces</span>
         <div className="flex items-center gap-1">
           <button
             onClick={() => void handleRefresh()}
@@ -478,6 +455,7 @@ export default function Sidebar({ width }: SidebarProps) {
           >
             <Icons.Plus className="w-5 h-5 stroke-[2.5]" />
           </button>
+          <CollapseButton collapsed={false} direction="left" onClick={() => togglePanelCollapsed('sidebarCollapsed')} />
         </div>
       </div>
 

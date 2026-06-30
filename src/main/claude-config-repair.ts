@@ -278,3 +278,166 @@ export function validateAndRepairWslClaudeJson(): void {
     console.error('[config-repair] WSL repair attempt failed (startup continues):', err);
   }
 }
+
+// ── Runtime repair watcher (v3) ──────────────────────────────────────────────
+// validateAndRepairClaudeJson() above runs ONCE at startup (sync, BLOCKING
+// sleepSync gate, pre-supervisor) — it cannot be re-driven on a timer without
+// freezing the main loop, and it structurally cannot heal corruption the
+// reconcile() herd manufactures ~1 min into the SAME session. This section adds
+// an app-lifetime, reentrant variant with a NON-BLOCKING wait/gate (the rare
+// repair disk I/O — backup reads, stash, atomic write — remains SYNC and
+// bounded, running only after stable-invalid detection). Reuses the same pure
+// repairClaudeJsonContent() + readValidBackups(). See
+// plans/claude-json-corruption-v3-runtime-repair-IMPL.md.
+
+/** Env-validated integer ms — rejects NaN / below-min so a bad override can't
+ *  feed 0/NaN into setInterval. */
+function envMs(name: string, fallback: number, min: number): number {
+  const n = Number(process.env[name]);
+  return Number.isFinite(n) && n >= min ? n : fallback;
+}
+
+const RUNTIME_POLL_MS = envMs('DASHBOARD_CLAUDE_REPAIR_POLL_MS', 30_000, 5_000);
+const RUNTIME_FSWATCH_DEBOUNCE_MS = 2_000;   // fixed
+const RUNTIME_REPAIR_COOLDOWN_MS = 10_000;   // fixed (≥ claude's observed multi-second write window)
+const RUNTIME_STABILITY_GATE_MS = 500;       // fixed (matches the proven startup gate)
+
+export type RuntimeStepOutcome =
+  | 'inflight' | 'cooldown' | 'missing' | 'healthy'
+  | 'healed-externally' | 'churning' | 'unrepairable' | 'repaired';
+
+export interface RuntimeRepairState { inFlight: boolean; lastRepairAt: number; }
+export interface RuntimeRepairConfig { cooldownMs: number; gateMs: number; }
+
+/** Injected I/O so the gate/cooldown/reentrancy logic is unit-testable without
+ *  a real ~/.claude.json. read() returns null when the file is missing/unreadable. */
+export interface RuntimeRepairIO {
+  read(): Promise<string | null>;
+  sleep(ms: number): Promise<void>;
+  loadBackups(): string[];
+  /** stash the EXACT bytes passed as corruptedText, then atomic-write content */
+  applyRepair(corruptedText: string, content: string, stamp: number): void;
+  now(): number;
+}
+
+/** One reentrant validate+repair pass. Non-blocking wait/gate; all side effects
+ *  go through `io`. Returns a discriminated outcome for tests. */
+export async function runtimeRepairStep(
+  io: RuntimeRepairIO,
+  state: RuntimeRepairState,
+  cfg: RuntimeRepairConfig,
+): Promise<RuntimeStepOutcome> {
+  if (state.inFlight) return 'inflight';                                   // poll vs fs.watch overlap
+  if (io.now() - state.lastRepairAt < cfg.cooldownMs) return 'cooldown';   // post-repair backoff
+  state.inFlight = true;
+  try {
+    const text = await io.read();
+    if (text === null) return 'missing';
+    if (tryParse(text)) return 'healthy';            // common path: no write, no log
+
+    // Non-blocking read-stability gate.
+    await io.sleep(cfg.gateMs);
+    let reread = await io.read();
+    if (reread === null) return 'missing';
+    if (tryParse(reread)) return 'healed-externally';
+    if (reread !== text) {
+      await io.sleep(cfg.gateMs);                     // bytes moved → a writer is mid-flush; one more settle
+      const third = await io.read();
+      if (third === null) return 'missing';
+      if (tryParse(third)) return 'healed-externally';
+      if (third !== reread) return 'churning';        // still being written → skip, try next tick
+      reread = third;
+    }
+
+    // `reread` is invalid and was byte-stable across the last gate interval.
+    const result = repairClaudeJsonContent(reread, io.loadBackups());
+    if (result.action === 'valid') return 'healthy';  // re-parse coincidence
+    if (result.action === 'unrepairable' || result.content === undefined) {
+      console.error(`[config-repair] runtime: ~/.claude.json corrupted and UNREPAIRABLE: ${result.detail ?? 'no detail'}`);
+      return 'unrepairable';
+    }
+
+    // FINAL compare-before-write gate — closes the TOCTOU window between the
+    // stable read and the replace. Re-read immediately; only overwrite if the
+    // bytes are STILL the exact invalid `reread` we computed the repair from.
+    // If a writer resumed (now valid, or changed), stand down.
+    const latest = await io.read();
+    if (latest === null) return 'missing';
+    if (tryParse(latest)) return 'healed-externally';
+    if (latest !== reread) return 'churning';
+
+    const stamp = io.now();
+    io.applyRepair(latest, result.content, stamp);   // stash + write the EXACT gated bytes
+    state.lastRepairAt = stamp;
+    console.log(`[config-repair] runtime: ~/.claude.json repaired (${result.action}): ${result.detail ?? ''}`);
+    return 'repaired';
+  } finally {
+    state.inFlight = false;
+  }
+}
+
+let runtimeWatcher: {
+  poll: NodeJS.Timeout;
+  fsw?: fs.FSWatcher;
+  timers: { debounce?: NodeJS.Timeout };
+  state: RuntimeRepairState;
+} | null = null;
+
+/** Start the app-lifetime runtime repair watcher (Windows-first scope). The
+ *  poll is the GUARANTEED backstop (heals any corruption within one interval);
+ *  a PARENT-DIRECTORY fs.watch is the ~2 s accelerator (survives atomic
+ *  replace / delete / recreate of the file, unlike a direct file watch).
+ *  Idempotent. MUST be called before supervisor.reconcile() can respawn the
+ *  herd. */
+export function startClaudeJsonRuntimeWatcher(): void {
+  if (process.platform !== 'win32') return;   // WSL is restore-only; Windows is the failure site
+  if (runtimeWatcher) return;
+  const home = process.env.USERPROFILE || process.env.HOME || '';
+  const claudeJsonPath = path.join(home, '.claude.json');
+  const backupsDir = path.join(home, '.claude', 'backups');
+  const state: RuntimeRepairState = { inFlight: false, lastRepairAt: 0 };
+  const io: RuntimeRepairIO = {
+    read: () => fs.promises.readFile(claudeJsonPath, 'utf-8').catch(() => null),
+    sleep: (ms) => new Promise(r => setTimeout(r, ms)),
+    loadBackups: () => readValidBackups(backupsDir),
+    applyRepair: (corruptedText, content, stamp) => {
+      fs.mkdirSync(backupsDir, { recursive: true });
+      const stash = path.join(backupsDir, `.claude.json.corrupted.dashboard.${stamp}`);
+      try { fs.writeFileSync(stash, corruptedText, 'utf-8'); } catch { /* best effort stash */ }
+      const tmp = `${claudeJsonPath}.tmp-${process.pid}`;
+      fs.writeFileSync(tmp, content, 'utf-8');
+      fs.renameSync(tmp, claudeJsonPath);            // atomic replace
+    },
+    now: () => Date.now(),
+  };
+  const cfg: RuntimeRepairConfig = { cooldownMs: RUNTIME_REPAIR_COOLDOWN_MS, gateMs: RUNTIME_STABILITY_GATE_MS };
+  const timers: { debounce?: NodeJS.Timeout } = {};
+  const run = () => void runtimeRepairStep(io, state, cfg)
+    .catch(err => console.error('[config-repair] runtime step failed:', err));
+
+  const poll = setInterval(run, RUNTIME_POLL_MS);
+
+  // Parent-directory watch, filtered to .claude.json. Survives the file being
+  // atomically replaced / deleted / recreated, which a direct file watch does
+  // not on Windows. Poll remains the guaranteed correctness backstop.
+  let fsw: fs.FSWatcher | undefined;
+  try {
+    fsw = fs.watch(home, (_event, filename) => {
+      if (filename?.toString() !== '.claude.json') return;   // null/Buffer-safe; ignore other home churn
+      if (timers.debounce) clearTimeout(timers.debounce);
+      timers.debounce = setTimeout(run, RUNTIME_FSWATCH_DEBOUNCE_MS);
+    });
+    fsw.on('error', () => { /* lost the dir watch — poll backstop continues */ });
+  } catch { /* fs.watch unsupported — poll-only */ }
+
+  runtimeWatcher = { poll, fsw, timers, state };
+  run(); // immediate kick: catch corruption between startup repair and watcher start
+}
+
+export function stopClaudeJsonRuntimeWatcher(): void {
+  if (!runtimeWatcher) return;
+  clearInterval(runtimeWatcher.poll);
+  if (runtimeWatcher.timers.debounce) clearTimeout(runtimeWatcher.timers.debounce);
+  try { runtimeWatcher.fsw?.close(); } catch { /* ignore */ }
+  runtimeWatcher = null;
+}

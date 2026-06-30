@@ -44,6 +44,20 @@ test('exactly the 17 browser tools (15 M10 + 2 §18 access-request), in the brow
   assert.ok(!names.some((n) => /eval/i.test(n)), 'M10: no raw eval tool, ever');
 });
 
+test('WI-E: the human-only "Import my session" capability is NEVER exposed as an agent verb', () => {
+  // importUserSessionForRule copies the human's persist:user cookies into the
+  // agent partition — a HUMAN-CHROME-ONLY action reachable via IPC + the renderer
+  // only. If it ever leaked into the agent-facing MCP surface, an agent could
+  // read/copy the human's private session. Guard the whole tool surface (names +
+  // schemas + descriptions) against any import / persist:user reference.
+  for (const def of getBrowserToolDefinitions()) {
+    assert.ok(!/import[-_ ]?(user[-_ ]?)?session/i.test(def.name), `${def.name} must not expose session import`);
+    const blob = JSON.stringify(def);
+    assert.ok(!/persist:user/i.test(blob), `${def.name} must not reference the human persist:user partition`);
+    assert.ok(!/import-user-session/i.test(blob), `${def.name} must not reference the import-user-session channel`);
+  }
+});
+
 test('every definition has a description and an object inputSchema with required[]', () => {
   for (const def of getBrowserToolDefinitions()) {
     assert.ok(def.description && def.description.length > 50, `${def.name} description too thin`);
@@ -309,10 +323,80 @@ test('browser_list_my_access_requests GETs the agent-scoped route and serializes
   assert.match(r.content[0].text, /"status": "approved"/);
 });
 
-test('browser_list_my_access_requests reports an empty list cleanly', async () => {
-  const api = async () => ({ requests: [] });
+test('browser_list_my_access_requests prints the whole {requests, signin_pending} object even when requests is empty', async () => {
+  // WI-4: the researcher polls signin_pending[] here, so the shim must print the
+  // full payload even with zero filed access requests (no more terse message).
+  const api = async () => ({
+    requests: [],
+    signin_pending: [
+      { origin: 'https://news.example.com', state: 'pending_signin', request_id: 'ws-1|https://news.example.com', since: 1000 },
+    ],
+  });
   const r = await handleBrowserToolCall('browser_list_my_access_requests', {}, api);
-  assert.match(r.content[0].text, /no website-access requests/i);
+  const parsed = JSON.parse(r.content[0].text);
+  assert.deepStrictEqual(parsed.requests, []);
+  assert.strictEqual(parsed.signin_pending.length, 1);
+  assert.strictEqual(parsed.signin_pending[0].state, 'pending_signin');
+});
+
+// ── §4 WI-4: signin envelope pass-through in the shim ────────────────────────
+// Every page-producing/action verb JSON-prints the WHOLE envelope (a normal
+// text block, NOT an error) when the API hands back { ok:false, status:… }.
+
+const PENDING_ENVELOPE = {
+  ok: false,
+  status: 'pending_signin',
+  origin: 'https://news.example.com',
+  requestId: 'ws-1|https://news.example.com',
+  message: 'Human sign-in required and in progress; poll browser_list_my_access_requests and retry.',
+};
+
+/** name → [tool, args, route key] for each verb that may surface the envelope. */
+const SIGNIN_VERBS = [
+  ['browser_get_page_text', { tab_id: 't1' }, 'GET /api/browser/t1/text'],
+  ['browser_read_page', { tab_id: 't1' }, 'GET /api/browser/t1/page'],
+  ['browser_screenshot', { tab_id: 't1' }, 'POST /api/browser/t1/screenshot'],
+  ['browser_click', { tab_id: 't1', ref: 1 }, 'POST /api/browser/t1/click'],
+  ['browser_type', { tab_id: 't1', ref: 1, text: 'x' }, 'POST /api/browser/t1/type'],
+  ['browser_press_key', { tab_id: 't1', key: 'Enter' }, 'POST /api/browser/t1/press-key'],
+  ['browser_select_option', { tab_id: 't1', ref: 1, value: 'x' }, 'POST /api/browser/t1/select-option'],
+  ['browser_scroll', { tab_id: 't1', dy: 10 }, 'POST /api/browser/t1/scroll'],
+  ['browser_go_back', { tab_id: 't1' }, 'POST /api/browser/t1/go-back'],
+  ['browser_go_forward', { tab_id: 't1' }, 'POST /api/browser/t1/go-forward'],
+  ['browser_reload', { tab_id: 't1' }, 'POST /api/browser/t1/reload'],
+  ['browser_wait_for', { tab_id: 't1', text: 'x' }, 'POST /api/browser/t1/wait-for'],
+];
+
+for (const [tool, args, key] of SIGNIN_VERBS) {
+  test(`${tool} JSON-prints the signin envelope (text block, not content, not image)`, async () => {
+    const api = fakeApi({ [key]: PENDING_ENVELOPE });
+    const r = await handleBrowserToolCall(tool, args, api);
+    assert.strictEqual(r.content.length, 1);
+    assert.strictEqual(r.content[0].type, 'text', `${tool} must be a text block (no image)`);
+    const parsed = JSON.parse(r.content[0].text);
+    assert.strictEqual(parsed.ok, false);
+    assert.strictEqual(parsed.status, 'pending_signin');
+    assert.strictEqual(parsed.origin, 'https://news.example.com');
+    assert.strictEqual(parsed.requestId, 'ws-1|https://news.example.com');
+  });
+}
+
+test('browser_open_url JSON-prints the signin envelope instead of the page-loaded message', async () => {
+  const api = fakeApi({ 'POST /api/browser/open-url': PENDING_ENVELOPE });
+  const r = await handleBrowserToolCall('browser_open_url', { url: 'https://news.example.com' }, api);
+  assert.strictEqual(r.content[0].type, 'text');
+  const parsed = JSON.parse(r.content[0].text);
+  assert.strictEqual(parsed.status, 'pending_signin');
+  assert.ok(!/Page loaded/.test(r.content[0].text), 'must not claim the page loaded');
+});
+
+test('browser_open_url JSON-prints signin_unavailable (degrade) too', async () => {
+  const api = fakeApi({
+    'POST /api/browser/open-url': { ok: false, status: 'signin_unavailable', origin: 'https://news.example.com', message: 'Sign-in not completed; treat as blocked.' },
+  });
+  const r = await handleBrowserToolCall('browser_open_url', { url: 'https://news.example.com' }, api);
+  const parsed = JSON.parse(r.content[0].text);
+  assert.strictEqual(parsed.status, 'signin_unavailable');
 });
 
 // ── Wiring into mcp-dashboard.js (static check for the browser toolset) ─────

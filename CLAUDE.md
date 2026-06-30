@@ -2,6 +2,26 @@
 
 Workspace-centric Claude Agent Dashboard built with Electron + React.
 
+## Architectural invariant: agents deliberately share a working directory
+
+Many agents run from the **same** working directory by design: every supervisor
+in a workspace lives in `.dashboard/supervisor/`, and every Claude worker lives
+in `.dashboard/workers/claude/`. The Claude project slug
+(`makeClaudeProjectSlug()` in `src/main/supervisor/log-readers/claude-jsonl-reader.ts`)
+is derived **purely from the working directory**, so it is **NOT unique per
+agent** — many concurrent agents map to one slug.
+
+**Consequence for any code that maps a session `.jsonl` (or any cwd-derived
+key) back to a specific agent: you cannot assume one-agent-per-cwd.** Disambiguate
+with a per-agent signal instead — the agent whose own session file just went
+EOF/stale, an explicit prior-session→successor-session link, process identity,
+or tight per-agent timing — never "there is exactly one agent in this folder."
+
+Cautionary example: the `/clear` context-bar reset (`decideClearRotation()` in
+`src/main/supervisor/claude-clear-rotation.ts`) guards on *single active claude
+agent per slug*; because this app shares cwds, that guard silently no-ops and
+the bar never resets. Don't reintroduce slug-uniqueness assumptions.
+
 ## Launching the App
 
 ### Restarting (default for agents)

@@ -53,6 +53,20 @@ export interface AgentReboundEvent {
   agentId: string;
 }
 
+/** Payload for `'session-stale'` — a Claude agent's tailed `.jsonl` went quiet
+ *  (EOF streak). The supervisor uses this only as a RETRY trigger for a
+ *  previously hook-bound /clear candidate; it is never the identity source.
+ *  `staleSessionId` pins the signal to the session that was being tailed so the
+ *  handler can drop a stale retry whose target no longer matches the agent's
+ *  current `resumeSessionId` (e.g. an EOF racing in after the row already
+ *  rotated). `workingDirectory` / `observedAt` are diagnostic. */
+export interface SessionStaleEvent {
+  agentId: string;
+  staleSessionId: string;
+  workingDirectory: string;
+  observedAt: number;
+}
+
 export class SessionLogDispatcher extends EventEmitter {
   private getActiveAgentSessions: () => AgentSession[];
   private readers = new Map<AgentProvider, ChatLogReader>();
@@ -84,11 +98,13 @@ export class SessionLogDispatcher extends EventEmitter {
   // here gives BUG-26 Layer 2/3's `'agent-rebound'` subscribers a typed
   // payload instead of `any`.
   on(event: 'agent-rebound', listener: (payload: AgentReboundEvent) => void): this;
+  on(event: 'session-stale', listener: (payload: SessionStaleEvent) => void): this;
   on(event: string | symbol, listener: (...args: any[]) => void): this;
   on(event: string | symbol, listener: (...args: any[]) => void): this {
     return super.on(event, listener);
   }
   emit(event: 'agent-rebound', payload: AgentReboundEvent): boolean;
+  emit(event: 'session-stale', payload: SessionStaleEvent): boolean;
   emit(event: string | symbol, ...args: any[]): boolean;
   emit(event: string | symbol, ...args: any[]): boolean {
     return super.emit(event, ...args);
@@ -131,6 +147,7 @@ export class SessionLogDispatcher extends EventEmitter {
         : UNSUBSCRIBED_POLL_MS;
       this.nextPollAt.set(session.agentId, now + rate);
     }
+    this.drainStaleSignals();
   }
 
   addChatSubscriber(agentId: string): void {
@@ -292,6 +309,41 @@ export class SessionLogDispatcher extends EventEmitter {
     return reader.sessionFileExists(workingDirectory, sessionId);
   }
 
+  /** Drain each reader's session-pinned stale signals and re-emit them as
+   *  `'session-stale'`. Called at the end of every tick / pollNow so rotation
+   *  handling runs on a clean stack (NOT re-entrantly inside pollSession). */
+  private drainStaleSignals(): void {
+    for (const reader of this.readers.values()) {
+      const r = reader as ChatLogReader & { drainStaleSignals?(): SessionStaleEvent[] };
+      if (typeof r.drainStaleSignals !== 'function') continue;
+      for (const signal of r.drainStaleSignals()) {
+        this.emit('session-stale', signal satisfies SessionStaleEvent);
+      }
+    }
+  }
+
+  /** Provider-agnostic validation that an already-agent-bound candidate session
+   *  id is a genuine `/clear` successor (Claude reader only today). Returns
+   *  false when the provider has no reader or no `validateClearSuccessor`. */
+  validateClearSuccessor(
+    provider: AgentProvider,
+    workingDirectory: string,
+    currentSessionId: string,
+    candidateSessionId: string,
+    startedAt?: string
+  ): boolean {
+    const reader = this.readers.get(provider) as
+      | (ChatLogReader & { validateClearSuccessor?(
+          workingDirectory: string,
+          currentSessionId: string,
+          candidateSessionId: string,
+          startedAt?: string
+        ): boolean })
+      | undefined;
+    if (!reader || typeof reader.validateClearSuccessor !== 'function') return false;
+    return reader.validateClearSuccessor(workingDirectory, currentSessionId, candidateSessionId, startedAt);
+  }
+
   getCachedEvents(agentId: string, sinceUuid?: string): { events: SessionEvent[]; truncated: boolean } {
     const all = this.eventsByAgent.get(agentId) || [];
     const truncated = this.truncatedByAgent.get(agentId) || false;
@@ -326,6 +378,7 @@ export class SessionLogDispatcher extends EventEmitter {
       const rate = this.subscribers.has(session.agentId) ? SUBSCRIBED_POLL_MS : UNSUBSCRIBED_POLL_MS;
       this.nextPollAt.set(session.agentId, now + rate);
     }
+    this.drainStaleSignals();
   }
 
   private pollOne(session: AgentSession): void {

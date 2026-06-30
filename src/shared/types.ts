@@ -27,6 +27,8 @@ import type {
   OmniboxSuggestion,
   ReaderArticle,
   SharedAgentSessions,
+  SigninPendingOpened,
+  SigninResolved,
 } from './browser';
 
 export type PathType = 'windows' | 'wsl';
@@ -92,6 +94,23 @@ export interface Agent {
   // into .dashboard/researcher, browser MCP wired in, native dangerous tools
   // (Bash/Edit/NotebookEdit) withheld. Mutually exclusive with the other lanes.
   isResearcher: boolean;
+  // Persona privilege lane (#19 supervisor-tools-for-personas). A persona that
+  // declares the 'supervisor' lane is NOT the structural workspace supervisor:
+  // isSupervisor stays false so it renders as its own card under
+  // .dashboard/agents/<name>/. This field ONLY grants the supervisor-tier MCP
+  // toolset, via roleLaneOf (which prefers it). Persisted so the grant survives
+  // relaunch (the MCP-injection sites read the persisted record, not the launch
+  // input). Only 'supervisor' exists — researcher/worker already render as cards
+  // through their own flags, so they need no privilege-lane decoupling.
+  privilegeLane?: 'supervisor';
+  // Bug 2 / Edit 2.6 — codex-persona hook parity. True when this agent was
+  // launched with the dashboard codex hook profile (provider==='codex' AND
+  // worker-lane OR a persona). Persisted so the runner's hook-env gate
+  // (roleLaneOf(agent) !== 'legacy' || isCodexHookPersona(agent)) is
+  // re-derivable from the stored row on reconcile/respawn — a *pure* codex
+  // persona is roleLaneOf==='legacy', so without this flag it would relaunch
+  // hookless (no AGENT_ID → the codex hook script bails at `if (!agentId)`).
+  wantsCodexHooks?: boolean;
   tmuxSessionName: string | null;
   autoRestartEnabled: boolean;
   resumeSessionId: string | null;
@@ -125,6 +144,18 @@ export interface Agent {
   updatedAt: string;
   lastOutputAt: string | null;
   lastAttachedAt: string | null;
+  // Agent-ownership primitive: the launcher of this child agent. The child's
+  // lifecycle events resolve to this owner (via getOwnerForWorker) before
+  // falling back to the structural workspace supervisor. NULL for
+  // dashboard-internal / unowned launches.
+  ownerAgentId: string | null;
+  // notifyOwner mute: DECOUPLES ownership from lifecycle-event subscription.
+  // undefined/true = owner-directed lifecycle events are delivered (default,
+  // preserves all prior behavior); false = the agent stays OWNED (ownerAgentId
+  // intact, grouping + investigation authority preserved) but its owner-directed
+  // events are SUPPRESSED at the EventBridge choke point. The terminal-owner
+  // structural backstop is NOT muted — see EventBridge.recipientFor.
+  notifyOwner?: boolean;
 }
 
 export interface AgentEvent {
@@ -167,6 +198,21 @@ export interface LaunchAgentInput {
   // Researcher role-lane (browser-parity-and-capability-isolation §0, D-1).
   // Claude-only (D-2); mutually exclusive with the other lane flags.
   isResearcher?: boolean;
+  // Persona privilege lane (#19). Set by applyPersonaLaneToLaunchInput when a
+  // persona declares the 'supervisor' lane: grants the supervisor MCP toolset
+  // WITHOUT the structural supervisor role (isSupervisor stays false). Persisted
+  // onto the agent record so the grant survives relaunch.
+  privilegeLane?: 'supervisor';
+  // Agent-ownership primitive: the launcher of this child. Set only by a TRUSTED
+  // dashboard path (MCP authenticated caller identity / the §4.1-validated
+  // AGENT_DASHBOARD_SELF_ID forwarded over POST /api/agents), never by a blindly
+  // trusted caller field. launchAgent re-validates it (exists + same workspace +
+  // non-terminal) and drops the edge with a warning if invalid (never throws).
+  ownerAgentId?: string;
+  // notifyOwner mute (default true). When false, the launched agent stays owned
+  // but its owner-directed lifecycle events are suppressed. Threaded through
+  // launchAgent → createAgent and inherited by forkAgent from its source.
+  notifyOwner?: boolean;
   templateId?: string;
   systemPrompt?: string;
   persona?: string;
@@ -322,12 +368,14 @@ export interface RendererFile {
 
 export interface FileTab {
   id: string;
-  filePath: string;        // empty string for directory-only tabs
-  rootDirectory: string;   // tree root (agent workingDirectory or workspace path)
+  filePath: string;        // empty string for directory-only AND tool tabs
+  rootDirectory: string;   // tree root (agent workingDirectory or workspace path); empty for tool tabs
   pathType: PathType;
   agentId?: string;
   workspaceId?: string;    // scopes the tab to a workspace; unset for legacy/orphan tabs
   label: string;           // display name (filename or dirname/)
+  kind?: 'file' | 'directory' | 'tool';  // default 'file' when undefined
+  toolId?: string;         // set when kind==='tool' (e.g. 'context-overhead')
 }
 
 /**
@@ -728,6 +776,9 @@ export interface IpcApi {
     reveal: (entryPath: string, pathType: PathType) => Promise<FileMutationResult>;
     watchDirectory: (dirPath: string, pathType: PathType, callback: (event: FsEvent) => void) => () => void;
   };
+  contextOverhead: {
+    scan: (req: ScanOverheadRequest) => Promise<ScanOverheadResult>;
+  };
   system: {
     pickDirectory: (startInWsl?: boolean) => Promise<string | null>;
     healthCheck: () => Promise<HealthCheck>;
@@ -773,6 +824,7 @@ export interface IpcApi {
   personas: {
     list: (workspacePath: string, pathType: PathType) => Promise<AgentPersona[]>;
     create: (workspacePath: string, pathType: PathType, name: string, roleDescription?: string, lane?: PersonaLane) => Promise<AgentPersona>;
+    setLane: (workspacePath: string, pathType: PathType, name: string, lane: PersonaLane | null) => Promise<void>;
   };
   notebooks: {
     ensureServer: () => Promise<JupyterServerInfo>;
@@ -942,6 +994,19 @@ export interface IpcApi {
       tabHandToAgent: (tabId: string) => Promise<void>;
       tabReturnToHuman: (tabId: string) => Promise<void>;
       clearSiteSession: (ruleId: string) => Promise<void>;
+      // WI-E "Import my session": copy the human's persist:user cookies for the
+      // rule's origin into the workspace agent partition. HUMAN-CHROME-ONLY.
+      importUserSession: (ruleId: string) => Promise<{ imported: number; origin: string }>;
+      // ── Signed-in tabs (WI-5): JIT sign-in banner events + cancel + WI-8
+      //    config. The *-opened / *-resolved channels are main→renderer pushes
+      //    that drive the JIT banner; the rest are trusted-chrome invokes. ──────
+      onSigninPendingOpened: (callback: (payload: SigninPendingOpened) => void) => () => void;
+      onSigninResolved: (callback: (payload: SigninResolved) => void) => () => void;
+      signinPendingCancel: (tabId: string) => Promise<void>;
+      getSigninHoldTimeoutMs: () => Promise<number>;
+      setSigninHoldTimeoutMs: (ms: number) => Promise<void>;
+      setSigninUnattended: (workspaceId: string | null, unattended: boolean) => Promise<void>;
+      isSigninUnattended: (workspaceId: string | null) => Promise<boolean>;
     };
   };
   // Detachable (tear-off) file tabs — plans/detachable-file-tabs-plan.md §4.
@@ -956,7 +1021,130 @@ export interface IpcApi {
   onOpenFileTab: (callback: (payload: OpenFileTabRequest) => void) => () => void;
   onTeamUpdated: (callback: (team: Team) => void) => () => void;
   onTeamMessageCreated: (callback: (message: TeamMessage) => void) => () => void;
+  // Supervisor ids that currently own an active (starting/running) orchestration
+  // deliberation (e.g. groupthink). The owner-container border keeps pulsing for
+  // these supervisors even while their planner agents are idle between turns.
+  listActiveOrchestrations: () => Promise<string[]>;
+  onOrchestrationActiveChanged: (callback: (supervisorIds: string[]) => void) => () => void;
 }
+
+// ───────────────────────── Context-Overhead Analyzer ─────────────────────────
+// Produced by the trusted main-process OverheadService (src/main/context-overhead/).
+// The React panel is a PURE CONSUMER of OverheadModel (preserves the Option-C seam:
+// a future browser-pane render reuses this same projection unchanged).
+
+export type TokenCountMethod =
+  | 'anthropic-count-tokens'   // exact; Phase 3, only when a client is injected
+  | 'tiktoken-approx'          // js-tiktoken cl100k_base (Phase-1 default)
+  | 'chars-heuristic';         // ceil(chars/3.5) fallback when encoder unavailable
+
+export interface TokenEstimate {
+  tokens: number;
+  bytes: number;
+  chars: number;
+  method: TokenCountMethod;
+  approximate: boolean;        // true unless method === 'anthropic-count-tokens'
+}
+
+export type OverheadSourceKind =
+  | 'agent-claude' | 'inherited-claude' | 'claude-local' | 'user-claude'
+  | 'managed-policy' | 'rules' | 'memory' | 'behavioral'
+  | 'settings-hooks' | 'skill' | 'import' | 'mcp-tool-schema'
+  | 'system-baseline' | 'unknown';
+
+// NOTE (R3): naming is unified on `managed` (matches the legitimacy report's
+// "managed policy" terminology). R1's `enterprise` term is retired — do NOT use it.
+export type InheritanceScope =
+  | 'agent' | 'workspace-ancestor' | 'parent-ancestor'
+  | 'user' | 'managed' | 'additional-dir' | 'unknown';
+
+export interface OverheadSource {
+  id: string;                  // stable: `${dedupeKey}#${kind}`
+  kind: OverheadSourceKind;
+  label: string;
+  resolvedPath: string | null; // absolute; null for synthetic (MCP server total, baseline)
+  dedupeKey: string;           // resolvedPath ?? synthetic key — drives de-dup + memo
+  sourceScope: InheritanceScope;
+  openable: boolean;           // DERIVED: resolvedPath != null && a viewable file kind
+  exists: boolean;
+  inherited: boolean;          // pulled via walk-up, not the agent's own dir
+  estimate: TokenEstimate;
+  children?: OverheadSource[]; // @import subgraph nested under the importing source
+  warnings?: string[];
+}
+
+export interface InheritanceFrame {
+  dir: string;                 // absolute ancestor directory
+  scope: InheritanceScope;
+  distanceFromAgentCwd: number;// 0 = agent dir; ancestors POSITIVE; user = -1, managed = -2 (R4)
+  included: boolean;           // found AND actually inherited (false if shadowed/gated-out)
+  sources: OverheadSource[];   // CLAUDE.md / CLAUDE.local.md / .claude/CLAUDE.md / rules / imports here
+}
+
+export type McpSchemaSource =
+  | 'dashboard-module'         // static get*ToolDefinitions() in scripts/
+  | 'config-named-only'        // named in ~/.claude.json; schema NOT sourced
+  | 'plugin-manifest' | 'live-server' | 'unknown';
+
+export interface McpToolOverhead {
+  name: string;
+  descriptionTokens: number;   // estimate of name + '\n' + description
+  inputSchemaTokens: number;   // estimate of JSON.stringify(inputSchema)
+  estimate: TokenEstimate;     // total serialized {name,description,input_schema}
+  schemaSource: McpSchemaSource;
+}
+
+export interface McpServerOverhead {
+  id: string;
+  displayName: string;
+  source: 'dashboard-injected' | 'user-global' | 'plugin' | 'unknown';
+  configPath: string | null;   // click target when present (D-2); openability is DERIVED from this (R6)
+  grantedToAgent: boolean;
+  excludedByStrictMode: boolean;// true ⇒ counted 0 for this agent (strict lane)
+  schemaSourced: boolean;      // false ⇒ named-but-not-measured (warning)
+  total: TokenEstimate;        // 0-valued estimate when excludedByStrictMode
+  tools: McpToolOverhead[];
+  warnings: string[];
+}
+// (R6) McpServerOverhead intentionally has NO `openable` field — the renderer
+// derives clickability as `configPath != null` so the two can never drift.
+
+export interface AgentContextOverhead {
+  id: string;
+  name: string;
+  kind: 'builtin-supervisor' | 'builtin-researcher' | 'builtin-worker' | 'persona';
+  lane: AgentRoleLane;         // reuse existing shared type; drives strict-mode
+  workingDir: string;
+  pathType: PathType;
+  sidecarPath?: string;
+  inheritanceChain: InheritanceFrame[];  // nearest→root, then user, then managed
+  mcpServers: McpServerOverhead[];
+  flatSources: OverheadSource[];         // denormalized for chart stacking
+  total: TokenEstimate;                  // agent-variable overhead (EXCLUDES systemBaseline & strict-excluded MCP)
+  exactness: 'exact' | 'mixed' | 'estimated';
+  warnings: string[];
+}
+
+export interface OverheadModel {
+  workspaceId: string;
+  workspaceRoot: string;
+  pathType: PathType;
+  generatedAt: string;         // ISO; stamped by the IPC/caller layer, NOT the pure service
+  estimatorMethod: TokenCountMethod;
+  systemBaseline?: TokenEstimate;        // OPTIONAL/synthetic; shown separately, never per-agent
+  agents: AgentContextOverhead[];
+  globalWarnings: string[];
+}
+
+export interface ScanOverheadRequest {
+  workspaceId: string;
+  countTokens?: boolean;       // Phase-3 opt-in for exact path; ignored until implemented
+}
+
+// (R1) Typed, discriminated IPC result. Used CONSISTENTLY by handler + preload + panel.
+export type ScanOverheadResult =
+  | { ok: true; model: OverheadModel }
+  | { ok: false; error: string };
 
 declare global {
   interface Window {

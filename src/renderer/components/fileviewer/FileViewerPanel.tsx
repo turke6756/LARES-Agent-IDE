@@ -6,6 +6,8 @@ import FileViewerHeader from './FileViewerHeader';
 import FileContentArea from './FileContentArea';
 import FileTabBar from './FileTabBar';
 import DirectoryTree from './DirectoryTree';
+import ContextOverheadPanel from '../context-overhead/ContextOverheadPanel';
+import { detectFileType } from './fileTypeUtils';
 import ResizeDivider from '../layout/ResizeDivider';
 import CollapseButton from '../layout/CollapseButton';
 import { evictTabCache } from './useFileContentCache';
@@ -81,6 +83,22 @@ export default function FileViewerPanel() {
 
   const treeCollapsed = panelLayout.directoryTreeCollapsed;
 
+  // Markdown opens in a focused reading layout: collapse the directory tree the
+  // first time each markdown tab becomes active. Tracked per-tab so a later
+  // manual expand sticks (we never re-collapse a tab we've already handled).
+  const autoCollapsedTabs = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    const id = effectiveTab?.id;
+    const fp = effectiveTab?.filePath;
+    if (!id || !fp) return;
+    if (autoCollapsedTabs.current.has(id)) return;
+    autoCollapsedTabs.current.add(id);
+    if (detectFileType(fp) !== 'markdown') return;
+    if (!useDashboardStore.getState().panelLayout.directoryTreeCollapsed) {
+      togglePanelCollapsed('directoryTreeCollapsed');
+    }
+  }, [effectiveTab?.id, effectiveTab?.filePath, togglePanelCollapsed]);
+
   // Keyboard shortcuts — close the tab currently displayed in this workspace's viewer
   const displayedTabId = effectiveTab?.id;
   const handleCloseTab = useCallback((tabId: string) => {
@@ -125,8 +143,12 @@ export default function FileViewerPanel() {
 
   if (!effectiveTab) return null;
 
-  // Only show file header + content for tabs that have a file (not directory-only tabs)
-  const hasFile = !!effectiveTab.filePath;
+  // Tool tabs (e.g. Context-Overhead Analyzer) own their full content region:
+  // no file header, no directory tree, no FileContentArea (which would fire a
+  // disk read of the tool tab's empty filePath via useFileContentCache).
+  const isTool = effectiveTab.kind === 'tool';
+  // Only show file header + content for tabs that have a file (not directory-only/tool tabs)
+  const hasFile = !!effectiveTab.filePath && !isTool;
 
   return (
     <div className="flex-1 flex flex-col min-w-0 overflow-hidden bg-surface-0" {...swipeToAgents}>
@@ -152,8 +174,9 @@ export default function FileViewerPanel() {
       )}
 
       <div className="flex-1 flex min-h-0">
-        {/* Directory Tree Sidebar */}
-        {treeCollapsed ? (
+        {/* Directory Tree Sidebar — hidden for tool tabs (R7: no treeRoot from
+            a tool tab's empty rootDirectory) */}
+        {!isTool && (treeCollapsed ? (
           <div className="shrink-0 bg-surface-0/40 border-r dark:border-white/10 light:border-black/10 flex flex-col items-center py-2" style={{ width: 32 }}>
             <CollapseButton collapsed direction="left" onClick={() => togglePanelCollapsed('directoryTreeCollapsed')} />
             <div className="mt-2 text-[13px] font-sans text-gray-400" style={{ writingMode: 'vertical-rl' }}>
@@ -179,11 +202,17 @@ export default function FileViewerPanel() {
               onMouseDown={treeResize.handleMouseDown}
             />
           </>
-        )}
+        ))}
 
         {/* File Content */}
         <div className="flex-1 min-w-0 overflow-hidden">
-          {hasFile ? (
+          {isTool ? (
+            effectiveTab.toolId === 'context-overhead' ? (
+              <ContextOverheadPanel />
+            ) : (
+              <div className="flex items-center justify-center h-full text-gray-400 text-sm">Unknown tool</div>
+            )
+          ) : hasFile ? (
             <FileContentArea
               tabId={effectiveTab.id}
               filePath={effectiveTab.filePath}

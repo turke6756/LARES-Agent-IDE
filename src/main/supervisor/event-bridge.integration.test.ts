@@ -84,7 +84,7 @@ interface Harness {
    *  bridge deps. Set via the maps; the harness's deps read from them. */
   lastAssistantMessages: Map<string, string>;
   fileActivities: Map<string, FileActivity[]>;
-  /** Override the bridge's `getSupervisorForWorker` dep (MS-XX uses this to
+  /** Override the bridge's `getOwnerForWorker` dep (MS-XX uses this to
    *  install post-migration `supervisorId`-based resolution). */
   setOwnerResolver(fn: ((worker: Agent) => Agent | null) | null): void;
   /** Mirror of `AgentSupervisor.this.emit('statusChanged', …)` for direct
@@ -121,18 +121,30 @@ function makeHarness(): Harness {
 
   const bridgeDeps: EventBridgeDeps = {
     getAgent: (id) => fakes.agents.get(id) ?? null,
-    // Production default mirrors `getSupervisorAgent(workspaceId)`: newest
-    // supervisor in worker's workspace. MS-XX tests overwrite this with a
-    // `worker.supervisorId`-based resolver via `setOwnerResolver`.
-    getSupervisorForWorker: (worker) => {
+    // Production default mirrors `database.getOwnerForWorker`: explicit live
+    // owner → owner; terminal/missing owner → newest structural supervisor in
+    // the worker's workspace; no owner edge but supervised → structural
+    // supervisor (legacy); otherwise null (unowned + unsupervised → drop). MS-XX
+    // tests overwrite this with a `worker.supervisorId`-based resolver via
+    // `setOwnerResolver`.
+    getOwnerForWorker: (worker) => {
       if (ownerResolver) return ownerResolver(worker);
-      const candidates: Agent[] = [];
-      for (const a of fakes.agents.values()) {
-        if (a.isSupervisor && a.workspaceId === worker.workspaceId) candidates.push(a);
+      const structuralSupervisor = (): Agent | null => {
+        const candidates: Agent[] = [];
+        for (const a of fakes.agents.values()) {
+          if (a.isSupervisor && a.workspaceId === worker.workspaceId) candidates.push(a);
+        }
+        if (candidates.length === 0) return null;
+        candidates.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+        return candidates[0];
+      };
+      if (worker.ownerAgentId) {
+        const owner = fakes.agents.get(worker.ownerAgentId) ?? null;
+        if (owner && !['done', 'crashed'].includes(owner.status)) return owner;
+        return structuralSupervisor();
       }
-      if (candidates.length === 0) return null;
-      candidates.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
-      return candidates[0];
+      if (worker.isSupervised) return structuralSupervisor();
+      return null;
     },
     sendInput: async (agentId, text) => {
       sendInputCalls.push({ agentId, text });
@@ -368,11 +380,13 @@ async function single_contextThreshold(): Promise<void> {
   } finally { h.dispose(); }
 }
 
-async function single_waiting_question_BR_13_20(): Promise<void> {
-  // BR-13 + BR-20 end-to-end: an assistant-text with endsWithQuestion=true
-  // routes through bridge → StatusMonitor.forceWaiting → monitor emits
-  // statusChanged with waitingKind+waitingExcerpt → bridge filters/delivers
-  // the "Agent waiting for input" payload.
+async function single_waiting_notification_BR_13_20(): Promise<void> {
+  // BR-13 + BR-20 end-to-end (hook-owned redesign): `waiting` now comes ONLY
+  // from a real Notification hook → StatusMonitor.forceWaiting('notification').
+  // It still routes monitor → statusChanged (waitingKind+waitingExcerpt) →
+  // bridge delivers the "Agent waiting for input" payload. Ending a turn with a
+  // question is no longer a waiting trigger — it's a normal turn end (→ idle via
+  // the Stop hook), and the chat-stream writes no status for a hook-backed worker.
   const h = makeHarness();
   try {
     const sup = makeSup('sup-int-4');
@@ -380,6 +394,8 @@ async function single_waiting_question_BR_13_20(): Promise<void> {
     h.agents.set(sup.id, sup);
     h.agents.set(worker.id, worker);
 
+    // Sanity: ending a turn with a question fires NO status write for a
+    // hook-backed worker (the chat-stream is skipped; the Stop hook owns idle).
     h.bridge.onChatEvents(batchOf(worker.id, [
       assistantText(worker.id, {
         text: 'Long preamble explaining the situation. Did that resolve it?',
@@ -388,68 +404,65 @@ async function single_waiting_question_BR_13_20(): Promise<void> {
       }),
     ]));
     await h.settle();
+    assert.equal(worker.status, 'working',
+      'single/waiting-notif: endsWithQuestion did NOT flip status (hook-owned)');
+    assert.equal(h.sendInputCalls.length, 0,
+      'single/waiting-notif: endsWithQuestion delivered nothing');
+
+    // The Notification hook lands (AskUserQuestion / permission prompt) — the
+    // sole path to `waiting`.
+    h.monitor.forceWaiting(worker.id, 'notification', 'Allow write to /etc/hosts?');
+    await h.settle();
 
     assert.equal(worker.status, 'waiting',
-      'single/waiting-q: agent record flipped to waiting');
-    assert.equal(h.sendInputCalls.length, 1, 'single/waiting-q: one delivery');
+      'single/waiting-notif: Notification flipped the agent to waiting');
+    assert.equal(h.sendInputCalls.length, 1, 'single/waiting-notif: one delivery');
     const payload = h.sendInputCalls[0].text;
     assert.match(payload, /\[DASHBOARD EVENT\] Agent waiting for input/,
-      'single/waiting-q: waiting dashboard header rendered');
-    assert.match(payload, /Waiting kind: question/,
-      'single/waiting-q: kind=question (BR-13)');
-    assert.match(payload, /Did that resolve it\?/,
-      'single/waiting-q: excerpt is the tail of the assistant text');
+      'single/waiting-notif: waiting dashboard header rendered');
+    assert.match(payload, /Waiting kind: notification/,
+      'single/waiting-notif: kind=notification (BR-13)');
+    assert.match(payload, /Allow write to \/etc\/hosts\?/,
+      'single/waiting-notif: excerpt is the notification message');
 
     // BR-20 (negative side): waiting → working transition is suppressed.
     h.now.value += SUPERVISOR_EVENT_COOLDOWN_MS + 100;
     h.monitor.forceWorking(worker.id, { source: 'user-input', ttlClass: 'model-pending' });
     await h.settle();
     assert.equal(h.sendInputCalls.length, 1,
-      'single/waiting-q: waiting → working did NOT fire a notification (BR-20)');
-    console.log('  single/waiting-q ✓ endsWithQuestion → forceWaiting → supervisor notified (BR-13, BR-20)');
+      'single/waiting-notif: waiting → working did NOT fire a notification (BR-20)');
+    console.log('  single/waiting-notif ✓ Notification → forceWaiting → supervisor notified; endsWithQuestion is a no-op (BR-13, BR-20)');
   } finally { h.dispose(); }
 }
 
-async function single_waiting_ttyPattern_BR_14(): Promise<void> {
-  // BR-14: real StatusMonitor.inferStatus runs the PromptPatternDetector against
-  // a synthetic PTY ring tail; on match it calls forceWaiting → status flips to
-  // waiting.
-  //
-  // Hook-owned-status redesign (status-monitor.ts:1033, event-bridge.ts:90):
-  // PTY-pattern inference runs ONLY for the non-worker lane (!isSupervised &&
-  // !isWorker) — the worker lane derives status from hooks alone — while the
-  // bridge relays a status change to a supervisor ONLY when the agent
-  // isSupervised. Those two conditions are now mutually exclusive, so the old
-  // "PTY pattern → supervisor notified" end-to-end path no longer exists. This
-  // test therefore exercises the surviving half: PromptPatternDetector →
-  // inferStatus → forceWaiting writes the agent to waiting, and asserts the
-  // change is NOT relayed (no supervisor delivery for an inference-lane agent).
+async function single_inferStatus_noPtyPattern_BR_14(): Promise<void> {
+  // Hook-owned redesign: PTY prompt-pattern detection was removed entirely.
+  // inferStatus no longer inspects the ring tail and never manufactures a
+  // `waiting` from a `(y/N)`-shaped line. For any alive agent it is a no-op
+  // (returns null); `waiting` is reachable ONLY via the Notification hook.
   const h = makeHarness();
   try {
-    const sup = makeSup('sup-int-5');
-    // Inference lane: unsupervised, non-worker — the only lane inferStatus runs.
+    // Former inference lane: unsupervised, non-worker — the lane that used to
+    // run pattern detection.
     const worker = makeWorker('w-int-tty', { isSupervised: false, isWorker: false });
-    h.agents.set(sup.id, sup);
     h.agents.set(worker.id, worker);
 
-    // PTY tail looks like a (y/N) prompt. Backdate lastOutput so the
-    // 2s "PTY quiet" gate is satisfied.
+    // A (y/N) prompt in the ring tail must NOT flip the agent to waiting.
     h.ringTails.set(worker.id, 'About to overwrite file. Continue? (y/N) ');
     h.lastOutput.set(worker.id, h.now.value - 5_000);
 
-    // Reach into the private inferStatus. It writes the status via forceWaiting
-    // (working → waiting) and returns the inferred status.
     const inferred = await (h.monitor as unknown as {
       inferStatus(a: Agent): Promise<string | null>;
     }).inferStatus(worker);
-    assert.equal(inferred, 'waiting', 'single/waiting-tty: inferStatus returned waiting');
     await h.settle();
 
-    assert.equal(worker.status, 'waiting',
-      'single/waiting-tty: agent record flipped to waiting via forceWaiting');
+    assert.equal(inferred, null,
+      'single/no-pty-pattern: inferStatus is a no-op for an alive agent (no PTY waiting)');
+    assert.equal(worker.status, 'working',
+      'single/no-pty-pattern: status unchanged — PTY pattern no longer writes waiting');
     assert.equal(h.sendInputCalls.length, 0,
-      'single/waiting-tty: inference-lane (unsupervised) status change is NOT relayed to a supervisor');
-    console.log('  single/waiting-tty ✓ PTY (y/N) pattern → forceWaiting writes waiting; not relayed (inference lane)');
+      'single/no-pty-pattern: nothing relayed');
+    console.log('  single/no-pty-pattern ✓ PTY (y/N) pattern no longer produces waiting (detection removed)');
   } finally { h.dispose(); }
 }
 
@@ -460,7 +473,7 @@ async function single_waiting_ttyPattern_BR_14(): Promise<void> {
 //
 // Each MS-XX targets one or two seams from docs/SUPERVISOR_ROUTING_SEAMS.md
 // and FAILS against today's bridge wiring (the harness defaults the
-// `getSupervisorForWorker` dep to the production "workspace's newest"
+// `getOwnerForWorker` dep to the production "workspace's newest"
 // behavior, mirroring HEAD).
 //
 // Two MS-XX (MS-02, MS-04) test the bridge's internal queue state in
@@ -484,7 +497,7 @@ async function MS_01_workerEventRoutesToOwningSupervisor(): Promise<void> {
   // via `worker.supervisorId`; an idle event must reach A and NOT B.
   // Seams exercised: #3 (owner-lookup wiring), #4 (status_change owner call).
   //
-  // Pre-migration failure: the harness default `getSupervisorForWorker`
+  // Pre-migration failure: the harness default `getOwnerForWorker`
   // mirrors `getSupervisorAgent(workspaceId)` (newest-by-workspace), so the
   // event routes to supB (newer), not the worker's actual owner supA. This
   // is the bug migration ticket P1-04 fixes by rewiring the dep to
@@ -804,8 +817,8 @@ async function main(): Promise<void> {
   await single_idle();
   await single_crash_BR_02b();
   await single_contextThreshold();
-  await single_waiting_question_BR_13_20();
-  await single_waiting_ttyPattern_BR_14();
+  await single_waiting_notification_BR_13_20();
+  await single_inferStatus_noPtyPattern_BR_14();
   await single_idle_chatFirstPreview_BUG_20();
   await single_idle_fallbackOnChatError_BUG_20();
 

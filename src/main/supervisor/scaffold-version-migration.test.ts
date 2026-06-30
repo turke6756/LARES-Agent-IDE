@@ -32,6 +32,7 @@ import {
   DASHBOARD_STATUS_SCRIPT_MJS,
   DASHBOARD_STATUS_SCRIPT_MJS_V4,
   DASHBOARD_STATUS_SCRIPT_MJS_V6,
+  DASHBOARD_STATUS_SCRIPT_V8_HASH,
   RESEARCH_STORE_README_MD,
   RESEARCHER_AGENT_MD,
   RESEARCHER_CLAUDE_SETTINGS_JSON,
@@ -160,6 +161,11 @@ interface SupervisorTestSurface {
   ensureSupervisorScaffold(workDir: string, pathType: string): void;
   ensureResearchStoreScaffold(workDir: string, pathType: string): void;
   ensureResearcherScaffold(workDir: string, pathType: string): void;
+  // Lane-agnostic shared-script refresh run unconditionally at launch (Option B):
+  // every lane — incl. supervisor & researcher, which used to skip it — calls
+  // this BEFORE its lane-specific scaffold, so a stale shared dashboard-status.mjs
+  // self-heals regardless of which lane launches.
+  ensureWorkspaceScripts(workDir: string, pathType: string): void;
 }
 
 function makeSupervisor(): { supervisor: SupervisorTestSurface; cleanup: () => void } {
@@ -234,7 +240,7 @@ test('2b. v2 script + sidecar v2: silent upgrade by known v2 hash → v6', () =>
     assert.equal(listBackups(workDir).length, 0, 'known v2-hash upgrade must NOT create a backup');
 
     const sidecar = readSidecar(workDir);
-    assert.equal(sidecar['scripts/dashboard-status.mjs'], 7, `sidecar must record v6; got: ${JSON.stringify(sidecar)}`);
+    assert.equal(sidecar['scripts/dashboard-status.mjs'], 9, `sidecar must record v6; got: ${JSON.stringify(sidecar)}`);
   } finally {
     cleanup();
     rmrf(workDir);
@@ -261,7 +267,89 @@ test('2d. v6 script + sidecar v6: silent upgrade by known v6 hash → v7 (P1 pla
     assert.equal(listBackups(workDir).length, 0, 'known v6-hash upgrade must NOT create a backup');
 
     const sidecar = readSidecar(workDir);
-    assert.equal(sidecar['scripts/dashboard-status.mjs'], 7, `sidecar must record v7; got: ${JSON.stringify(sidecar)}`);
+    assert.equal(sidecar['scripts/dashboard-status.mjs'], 9, `sidecar must record v7; got: ${JSON.stringify(sidecar)}`);
+  } finally {
+    cleanup();
+    rmrf(workDir);
+  }
+});
+
+/** Reconstruct the v8 dashboard-status.mjs body by removing the v9 idle-vs-waiting
+ *  bail block from the current (v9) bundled script. The block's exact text isn't
+ *  frozen as a content constant (only its parent v8 hash is), so we derive it and
+ *  assert the reconstruction hashes to DASHBOARD_STATUS_SCRIPT_V8_HASH — which both
+ *  validates the frozen hash literal and yields a faithful v8 on-disk fixture. */
+function reconstructV8Script(): string {
+  const v8 = DASHBOARD_STATUS_SCRIPT_MJS.replace(
+    /  \/\/ idle-vs-waiting fix[\s\S]*?if \(isNonBlocking\) return;\n  \}\n\n/,
+    '',
+  );
+  assert.notEqual(v8, DASHBOARD_STATUS_SCRIPT_MJS, 'the v9 bail block must be present in the live script to remove');
+  return v8;
+}
+
+test('2e. v8 script + sidecar v8: silent upgrade by frozen v8 hash → v9 (idle-vs-waiting fix)', () => {
+  const workDir = mktmp('scaffold-known-v8');
+  const { supervisor, cleanup } = makeSupervisor();
+  try {
+    const v8Script = reconstructV8Script();
+    // The reconstruction MUST match the frozen v8 hash, or the v8→v9 silent
+    // upgrade migration is broken.
+    assert.equal(sha256Hex(v8Script), DASHBOARD_STATUS_SCRIPT_V8_HASH,
+      'reconstructed v8 script must hash to DASHBOARD_STATUS_SCRIPT_V8_HASH (frozen literal)');
+
+    fs.mkdirSync(path.dirname(scriptPath(workDir)), { recursive: true });
+    fs.writeFileSync(scriptPath(workDir), v8Script, 'utf-8');
+    fs.mkdirSync(path.dirname(sidecarPath(workDir)), { recursive: true });
+    fs.writeFileSync(
+      sidecarPath(workDir),
+      JSON.stringify({ 'scripts/dashboard-status.mjs': 8 }, null, 2) + '\n',
+      'utf-8',
+    );
+
+    supervisor.ensureWorkerScaffold(workDir, 'claude', 'windows');
+
+    const content = fs.readFileSync(scriptPath(workDir), 'utf-8');
+    assert.equal(content, DASHBOARD_STATUS_SCRIPT_MJS, 'v8 script must silently upgrade to exact v9 bundled content');
+    assert.equal(listBackups(workDir).length, 0, 'known v8-hash upgrade must NOT create a backup');
+
+    const sidecar = readSidecar(workDir);
+    assert.equal(sidecar['scripts/dashboard-status.mjs'], 9, `sidecar must record v9; got: ${JSON.stringify(sidecar)}`);
+  } finally {
+    cleanup();
+    rmrf(workDir);
+  }
+});
+
+test('2f. locally-edited (unknown-hash) v8-ish script → backed up + overwritten with v9', () => {
+  const workDir = mktmp('scaffold-edited-v8');
+  const { supervisor, cleanup } = makeSupervisor();
+  try {
+    const edited = reconstructV8Script() + '\n// LOCAL EDIT — must be backed up, not silently clobbered\n';
+    fs.mkdirSync(path.dirname(scriptPath(workDir)), { recursive: true });
+    fs.writeFileSync(scriptPath(workDir), edited, 'utf-8');
+    fs.mkdirSync(path.dirname(sidecarPath(workDir)), { recursive: true });
+    fs.writeFileSync(
+      sidecarPath(workDir),
+      JSON.stringify({ 'scripts/dashboard-status.mjs': 8 }, null, 2) + '\n',
+      'utf-8',
+    );
+
+    supervisor.ensureWorkerScaffold(workDir, 'claude', 'windows');
+
+    const content = fs.readFileSync(scriptPath(workDir), 'utf-8');
+    assert.equal(content, DASHBOARD_STATUS_SCRIPT_MJS, 'edited script must be overwritten with v9 bundled content');
+
+    const backups = listBackups(workDir);
+    assert.equal(backups.length, 1, `expected exactly one .bak.<ts> file; got: ${backups.join(', ')}`);
+    const backupContent = fs.readFileSync(
+      path.join(workDir, '.dashboard', 'scripts', backups[0]),
+      'utf-8',
+    );
+    assert.equal(backupContent, edited, 'backup must contain the locally-edited content verbatim');
+
+    const sidecar = readSidecar(workDir);
+    assert.equal(sidecar['scripts/dashboard-status.mjs'], 9, `sidecar must record v9; got: ${JSON.stringify(sidecar)}`);
   } finally {
     cleanup();
     rmrf(workDir);
@@ -288,7 +376,7 @@ test('2c. v4 script + sidecar v4: silent upgrade by known v4 hash → v6', () =>
     assert.equal(listBackups(workDir).length, 0, 'known v4-hash upgrade must NOT create a backup');
 
     const sidecar = readSidecar(workDir);
-    assert.equal(sidecar['scripts/dashboard-status.mjs'], 7, `sidecar must record v6; got: ${JSON.stringify(sidecar)}`);
+    assert.equal(sidecar['scripts/dashboard-status.mjs'], 9, `sidecar must record v6; got: ${JSON.stringify(sidecar)}`);
   } finally {
     cleanup();
     rmrf(workDir);
@@ -309,7 +397,7 @@ test('1. fresh workspace: writes v6 script and sidecar with version 6', () => {
     assert.equal(content, DASHBOARD_STATUS_SCRIPT_MJS, 'script must be exact v6 bundled content');
 
     const sidecar = readSidecar(workDir);
-    assert.equal(sidecar['scripts/dashboard-status.mjs'], 7, `sidecar must record v6 for the script; got: ${JSON.stringify(sidecar)}`);
+    assert.equal(sidecar['scripts/dashboard-status.mjs'], 9, `sidecar must record v6 for the script; got: ${JSON.stringify(sidecar)}`);
     assert.equal(listBackups(workDir).length, 0, 'no .bak files expected on fresh scaffold');
   } finally {
     cleanup();
@@ -332,7 +420,7 @@ test('2. v1 script + no sidecar: silent upgrade by known-hash match', () => {
     assert.equal(listBackups(workDir).length, 0, 'known-hash upgrade must NOT create a backup');
 
     const sidecar = readSidecar(workDir);
-    assert.equal(sidecar['scripts/dashboard-status.mjs'], 7, `sidecar must record v6; got: ${JSON.stringify(sidecar)}`);
+    assert.equal(sidecar['scripts/dashboard-status.mjs'], 9, `sidecar must record v6; got: ${JSON.stringify(sidecar)}`);
   } finally {
     cleanup();
     rmrf(workDir);
@@ -361,7 +449,7 @@ test('3. v1-ish but user-modified script + no sidecar: backup + overwrite', () =
     assert.equal(backupContent, userEdited, 'backup must contain the user-edited content verbatim');
 
     const sidecar = readSidecar(workDir);
-    assert.equal(sidecar['scripts/dashboard-status.mjs'], 7, `sidecar must record v6; got: ${JSON.stringify(sidecar)}`);
+    assert.equal(sidecar['scripts/dashboard-status.mjs'], 9, `sidecar must record v6; got: ${JSON.stringify(sidecar)}`);
   } finally {
     cleanup();
     rmrf(workDir);
@@ -397,7 +485,7 @@ test('4. workspace already at v5: script not rewritten, no backup, sidecar still
     assert.equal(listBackups(workDir).length, 0, 'no .bak files expected on no-op script scaffold');
 
     const sidecar = readSidecar(workDir);
-    assert.equal(sidecar['scripts/dashboard-status.mjs'], 7, `sidecar must still record v6 for the script; got: ${JSON.stringify(sidecar)}`);
+    assert.equal(sidecar['scripts/dashboard-status.mjs'], 9, `sidecar must still record v6 for the script; got: ${JSON.stringify(sidecar)}`);
   } finally {
     cleanup();
     rmrf(workDir);
@@ -422,7 +510,7 @@ test('5. corrupt sidecar + v1 script: warn, treat as empty, upgrade + valid side
     assert.equal(content, DASHBOARD_STATUS_SCRIPT_MJS, 'corrupt sidecar must not block upgrade');
 
     const sidecar = readSidecar(workDir);
-    assert.equal(sidecar['scripts/dashboard-status.mjs'], 7, `sidecar must be valid JSON with v6; got: ${JSON.stringify(sidecar)}`);
+    assert.equal(sidecar['scripts/dashboard-status.mjs'], 9, `sidecar must be valid JSON with v6; got: ${JSON.stringify(sidecar)}`);
 
     const sawWarning = warnings.some((w) => /sidecar/i.test(w) && /unparseable|not an object/i.test(w));
     assert.ok(sawWarning, `expected a sidecar warning to be logged; got: ${warnings.join('\n')}`);
@@ -464,8 +552,8 @@ test('6. concurrent ensureWorkerScaffold: parseable sidecar, complete v2 content
     // Sidecar exists and parses cleanly.
     const sidecar = readSidecar(workDir);
     assert.equal(
-      sidecar['scripts/dashboard-status.mjs'], 7,
-      `sidecar should be at v5 after concurrent run; got: ${JSON.stringify(sidecar)}`,
+      sidecar['scripts/dashboard-status.mjs'], 9,
+      `sidecar should be at v9 after concurrent run; got: ${JSON.stringify(sidecar)}`,
     );
 
     // Final on-disk script is the FULL v5 content (not a torn write).
@@ -478,6 +566,119 @@ test('6. concurrent ensureWorkerScaffold: parseable sidecar, complete v2 content
     assert.ok(backups.length <= 1, `expected at most one backup; got ${backups.length}: ${backups.join(', ')}`);
   } finally {
     restoreDb();
+    rmrf(workDir);
+  }
+});
+
+// ── Option B: supervisor/researcher launches now refresh the shared script ──
+//
+// The fix hoists ensureWorkspaceScripts(workDir, pathType) ahead of the lane
+// dispatch in launchAgent, so the supervisor & researcher lanes — which scaffold
+// only their own kit (ensureSupervisorScaffold / ensureResearcherScaffold) and
+// never wrote WORKSPACE_SCRIPT_FILES — now self-heal the shared
+// .dashboard/scripts/dashboard-status.mjs they depend on. These exercise that
+// seam directly (mirroring how the worker-lane tests above call
+// ensureWorkerScaffold) across the full migration matrix.
+
+test('B1. supervisor-launch refresh, MISSING shared script → written at v9', () => {
+  const workDir = mktmp('opt-b-missing');
+  const { supervisor, cleanup } = makeSupervisor();
+  try {
+    // Pre-seed a supervisor kit WITHOUT the shared script (the pre-fix state of a
+    // supervisor-only workspace), then confirm ensureSupervisorScaffold alone
+    // does NOT create it — the gap this fix closes.
+    supervisor.ensureSupervisorScaffold(workDir, 'windows');
+    assert.equal(fs.existsSync(scriptPath(workDir)), false,
+      'precondition: a bare supervisor scaffold must NOT write the shared script');
+
+    // The hoisted launch step now refreshes it.
+    supervisor.ensureWorkspaceScripts(workDir, 'windows');
+
+    assert.ok(fs.existsSync(scriptPath(workDir)), 'shared script must exist after the launch-step refresh');
+    assert.equal(fs.readFileSync(scriptPath(workDir), 'utf-8'), DASHBOARD_STATUS_SCRIPT_MJS,
+      'shared script must be the exact v9 bundled content');
+    assert.equal(readSidecar(workDir)['scripts/dashboard-status.mjs'], 9, 'sidecar must record v9');
+    assert.equal(listBackups(workDir).length, 0, 'no .bak on a fresh write');
+  } finally {
+    cleanup();
+    rmrf(workDir);
+  }
+});
+
+test('B2. supervisor-launch refresh, STALE known-managed-hash (v6) → silent upgrade, no .bak', () => {
+  const workDir = mktmp('opt-b-stale');
+  const { supervisor, cleanup } = makeSupervisor();
+  try {
+    fs.mkdirSync(path.dirname(scriptPath(workDir)), { recursive: true });
+    fs.writeFileSync(scriptPath(workDir), DASHBOARD_STATUS_SCRIPT_MJS_V6, 'utf-8');
+    fs.mkdirSync(path.dirname(sidecarPath(workDir)), { recursive: true });
+    fs.writeFileSync(
+      sidecarPath(workDir),
+      JSON.stringify({ 'scripts/dashboard-status.mjs': 6 }, null, 2) + '\n',
+      'utf-8',
+    );
+
+    supervisor.ensureWorkspaceScripts(workDir, 'windows');
+
+    assert.equal(fs.readFileSync(scriptPath(workDir), 'utf-8'), DASHBOARD_STATUS_SCRIPT_MJS,
+      'a v6 (pre-session_id) script must silently upgrade to v9 on a supervisor-launch refresh');
+    assert.equal(listBackups(workDir).length, 0, 'known-hash upgrade must NOT create a backup');
+    assert.equal(readSidecar(workDir)['scripts/dashboard-status.mjs'], 9, 'sidecar must record v9');
+  } finally {
+    cleanup();
+    rmrf(workDir);
+  }
+});
+
+test('B3. supervisor-launch refresh, CURRENT script (sidecar v9) → no-op, mtime preserved', async () => {
+  const workDir = mktmp('opt-b-current');
+  const { supervisor, cleanup } = makeSupervisor();
+  try {
+    fs.mkdirSync(path.dirname(scriptPath(workDir)), { recursive: true });
+    fs.writeFileSync(scriptPath(workDir), DASHBOARD_STATUS_SCRIPT_MJS, 'utf-8');
+    fs.mkdirSync(path.dirname(sidecarPath(workDir)), { recursive: true });
+    fs.writeFileSync(
+      sidecarPath(workDir),
+      JSON.stringify({ 'scripts/dashboard-status.mjs': 9 }, null, 2) + '\n',
+      'utf-8',
+    );
+
+    const beforeMtime = fs.statSync(scriptPath(workDir)).mtimeMs;
+    await new Promise<void>((resolve) => setTimeout(resolve, 25));
+
+    supervisor.ensureWorkspaceScripts(workDir, 'windows');
+
+    assert.equal(fs.statSync(scriptPath(workDir)).mtimeMs, beforeMtime,
+      'a current shared script must NOT be rewritten — the redundant per-lane pass is a no-op skip');
+    assert.equal(listBackups(workDir).length, 0, 'no .bak on a no-op refresh');
+  } finally {
+    cleanup();
+    rmrf(workDir);
+  }
+});
+
+test('B4. supervisor-launch refresh, LOCALLY-EDITED unknown-hash script → .bak + overwrite', () => {
+  const workDir = mktmp('opt-b-edited');
+  const { supervisor, cleanup } = makeSupervisor();
+  try {
+    fs.mkdirSync(path.dirname(scriptPath(workDir)), { recursive: true });
+    const edited = DASHBOARD_STATUS_SCRIPT_MJS + '\n// LOCAL EDIT — must be backed up, not silently clobbered\n';
+    fs.writeFileSync(scriptPath(workDir), edited, 'utf-8');
+
+    supervisor.ensureWorkspaceScripts(workDir, 'windows');
+
+    assert.equal(fs.readFileSync(scriptPath(workDir), 'utf-8'), DASHBOARD_STATUS_SCRIPT_MJS,
+      'edited shared script must be overwritten with v9 bundled content');
+    const backups = listBackups(workDir);
+    assert.equal(backups.length, 1, `expected exactly one .bak.<ts>; got: ${backups.join(', ')}`);
+    assert.equal(
+      fs.readFileSync(path.join(workDir, '.dashboard', 'scripts', backups[0]), 'utf-8'),
+      edited,
+      'backup must hold the locally-edited content verbatim',
+    );
+    assert.equal(readSidecar(workDir)['scripts/dashboard-status.mjs'], 9, 'sidecar must record v9');
+  } finally {
+    cleanup();
     rmrf(workDir);
   }
 });
@@ -574,7 +775,7 @@ test('WP-B. researcher scaffold: fresh workspace writes persona CLAUDE.md + sett
     assert.ok(settings.includes('/scripts/research-write-guard.mjs'), 'write-guard path must be cwd-relative');
 
     const sidecar = readSidecar(workDir);
-    assert.equal(sidecar['researcher/CLAUDE.md'], 1, `sidecar must record researcher CLAUDE.md v1; got ${JSON.stringify(sidecar)}`);
+    assert.equal(sidecar['researcher/CLAUDE.md'], 4, `sidecar must record researcher CLAUDE.md v4; got ${JSON.stringify(sidecar)}`);
     assert.equal(sidecar['researcher/.claude/settings.json'], 1, 'sidecar must record settings v1');
 
     // Idempotent second pass — no rewrites, no backups.
@@ -609,7 +810,7 @@ test('WP-B. researcher CLAUDE.md: user-modified persona is backed up + overwritt
   }
 });
 
-test('G5. worker CLAUDE.md: pristine v1 silently upgrades to v3 carrying the research-store pointer', () => {
+test('G5. worker CLAUDE.md: pristine v1 silently upgrades to v4 carrying the research-store pointer', () => {
   const workDir = mktmp('worker-claudemd-v1');
   const { supervisor, cleanup } = makeSupervisor();
   try {
@@ -626,12 +827,12 @@ test('G5. worker CLAUDE.md: pristine v1 silently upgrades to v3 carrying the res
     supervisor.ensureWorkerScaffold(workDir, 'claude', 'windows');
 
     const content = fs.readFileSync(mdPath, 'utf-8');
-    assert.equal(content, WORKER_CLAUDE_MD, 'v1 worker CLAUDE.md must silently upgrade to v3 bundled content');
+    assert.equal(content, WORKER_CLAUDE_MD, 'v1 worker CLAUDE.md must silently upgrade to v4 bundled content');
     assert.equal(countMatches(content, RESEARCH_SECTION_MARKER), 1, 'research-store section appears exactly once (not double-appended)');
     const backups = fs.readdirSync(path.dirname(mdPath)).filter((n) => n.startsWith('CLAUDE.md.bak.'));
-    assert.equal(backups.length, 0, 'known-hash v1→v3 upgrade must NOT create a backup');
+    assert.equal(backups.length, 0, 'known-hash v1→v4 upgrade must NOT create a backup');
     const sidecar = readSidecar(workDir);
-    assert.equal(sidecar['workers/claude/CLAUDE.md'], 3, `sidecar must record v3; got ${JSON.stringify(sidecar)}`);
+    assert.equal(sidecar['workers/claude/CLAUDE.md'], 4, `sidecar must record v4; got ${JSON.stringify(sidecar)}`);
   } finally {
     cleanup();
     rmrf(workDir);
@@ -649,7 +850,7 @@ test('G5. supervisor CLAUDE.md: fresh scaffold carries the research-store pointe
     assert.equal(content, SUPERVISOR_AGENT_MD, 'supervisor CLAUDE.md must be exact bundled content');
     assert.equal(countMatches(content, RESEARCH_SECTION_MARKER), 1, 'research-store section appears exactly once');
     const sidecar = readSidecar(workDir);
-    assert.equal(sidecar['supervisor/CLAUDE.md'], 6, `sidecar must record v6; got ${JSON.stringify(sidecar)}`);
+    assert.equal(sidecar['supervisor/CLAUDE.md'], 8, `sidecar must record v8; got ${JSON.stringify(sidecar)}`);
 
     const beforeMtime = fs.statSync(mdPath).mtimeMs;
     supervisor.ensureSupervisorScaffold(workDir, 'windows');

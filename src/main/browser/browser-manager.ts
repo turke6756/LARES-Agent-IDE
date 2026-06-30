@@ -9,7 +9,7 @@
 import { randomUUID } from 'crypto';
 import path from 'path';
 import { app, Menu, session, shell, WebContentsView } from 'electron';
-import type { BrowserWindow, DownloadItem, Event as ElectronEvent, Session, WebContents } from 'electron';
+import type { BrowserWindow, Cookie, CookiesSetDetails, DownloadItem, Event as ElectronEvent, Session, WebContents } from 'electron';
 import { existsSync, mkdirSync } from 'fs';
 import { setManagedWebContentsCheck } from '../security/webcontents-guard';
 import { WS_PORT, JUPYTER_BASE_PORT, JUPYTER_PORT_RETRIES } from '../control-ports';
@@ -32,6 +32,7 @@ import {
   checkAgentVisit,
   checkNavigation,
   checkSignedInDrive,
+  matchesRule,
   EXPOSURE_REDUCING_VERBS,
   isSensitiveOrigin,
   getRuntimeActionsEnabled,
@@ -72,6 +73,10 @@ import {
   type OmniboxSuggestion,
   type ReaderArticle,
   type SharedAgentSessions,
+  type SigninPendingResult,
+  type SigninPendingEntry,
+  type SigninPendingOpened,
+  type SigninResolved,
 } from '../../shared/browser';
 import {
   deleteBookmark,
@@ -89,12 +94,14 @@ import {
   listRequests,
   listRequestsByAgent,
   listRules,
-  listSharedSignedInOrigins,
+  listSharedSignedInEntries,
   listSignedInOrigins,
   rowAppliesToWorkspace,
   touchSignedInOrigin,
   updateRule,
   upsertSignedInOrigin,
+  getSignedInOriginState,
+  expireSignedInOrigin,
   type InsertRequestInput,
 } from './access-policy-store';
 import {
@@ -396,20 +403,23 @@ export interface BrowserToolProvider {
       agentId?: string;
       agentTitle?: string;
     },
-  ): Promise<TabSnapshot>;
+  ): Promise<OpenUrlResult>;
   listTabs(): TabInfo[];
-  getPageText(tabId: string): Promise<string>;
-  readPage(tabId: string): Promise<string>;
-  screenshot(tabId: string): Promise<{ base64Png: string }>;
-  click(tabId: string, ref: number): Promise<string>;
-  type(tabId: string, ref: number, text: string): Promise<string>;
-  pressKey(tabId: string, key: string): Promise<string>;
-  selectOption(tabId: string, ref: number, value: string): Promise<string>;
-  scroll(tabId: string, opts: { ref?: number; dy?: number }): Promise<string>;
-  goBack(tabId: string): Promise<string>;
-  goForward(tabId: string): Promise<string>;
-  reload(tabId: string): Promise<string>;
-  waitFor(tabId: string, input: { text: string; timeoutMs?: number }): Promise<WaitForResult>;
+  // WI-4: every page-producing / action verb now returns the union with the
+  // `pending_signin` / `signin_unavailable` envelope (SigninPendingResult) when
+  // the tab's committed origin needs a human sign-in — NOT content, NOT a throw.
+  getPageText(tabId: string): Promise<string | SigninPendingResult>;
+  readPage(tabId: string): Promise<string | SigninPendingResult>;
+  screenshot(tabId: string): Promise<{ base64Png: string } | SigninPendingResult>;
+  click(tabId: string, ref: number): Promise<string | SigninPendingResult>;
+  type(tabId: string, ref: number, text: string): Promise<string | SigninPendingResult>;
+  pressKey(tabId: string, key: string): Promise<string | SigninPendingResult>;
+  selectOption(tabId: string, ref: number, value: string): Promise<string | SigninPendingResult>;
+  scroll(tabId: string, opts: { ref?: number; dy?: number }): Promise<string | SigninPendingResult>;
+  goBack(tabId: string): Promise<string | SigninPendingResult>;
+  goForward(tabId: string): Promise<string | SigninPendingResult>;
+  reload(tabId: string): Promise<string | SigninPendingResult>;
+  waitFor(tabId: string, input: { text: string; timeoutMs?: number }): Promise<WaitForResult | SigninPendingResult>;
   closeTab(tabId: string): Promise<CloseTabResult>;
   /** §18 — agent-initiated access request. Inert: writes a pending request for a
    *  human to approve; grants zero access. requestedBy/Title are stamped by the
@@ -425,6 +435,123 @@ export interface BrowserToolProvider {
   }): { requestId: string; status: AccessRequest['status'] };
   /** §18 — a single agent's own requests + statuses. */
   listMyAccessRequests(agentId: string): AccessRequest[];
+  /** WI-4 — the workspace-scoped `signin_pending` rollup for the
+   *  `browser_list_my_access_requests` payload. workspaceId is resolved
+   *  trust-side (agentId → workspace) by the API layer. */
+  listSigninPending(workspaceId: string | null): SigninPendingEntry[];
+}
+
+// ── Signed-in tabs (on-demand user sign-in for research agents) ──────────────
+// WI-2/WI-3 types + the pure warm-expiry heuristic. The registry guarantees ONE
+// quarantined sign-in tab per (workspace, origin) even under concurrent agent
+// navs, and carries `ruleId` so completion can upsert the signed-in-origin row.
+
+/** A live, per-(workspace, origin) sign-in handoff in flight. RUNTIME-ONLY (it
+ *  is recreated by the next nav after a restart). `state` advances
+ *  pending → ready (human completed) | unavailable (timeout/cancel/unattended).
+ *  `waiters` counts the agent navs that joined this session (de-dup telemetry). */
+interface SigninSession {
+  ruleId: string;
+  workspaceId: string | null;
+  origin: string;
+  targetUrl: string;
+  tabId: string;
+  state: 'pending' | 'ready' | 'unavailable';
+  openedAt: number;
+  reason: string;
+  waiters: number;
+}
+
+/** WI-2: result union of toolOpenUrl / the provider openUrl — a normal snapshot
+ *  on the drive path, or the signin envelope when the origin needs a human. */
+export type OpenUrlResult = TabSnapshot | SigninPendingResult;
+
+/** Default per-session hold timeout (WI-3). 5 min per the resolved product
+ *  decision; WI-8 will formalize this as configurable `signinHoldTimeoutMs`. */
+const DEFAULT_SIGNIN_HOLD_TIMEOUT_MS = 300_000;
+
+/** WI-2(c): default warm-expiry login PATHS (same-origin). Segment-matched
+ *  (=== path or path startsWith `${p}/`) so `/auth` never matches `/authors`. */
+const DEFAULT_LOGIN_PATHS = ['/login', '/signin', '/sign-in', '/sso', '/auth', '/oauth'];
+
+/** WI-2: per-(workspace, origin) registry key. */
+function signinKey(workspaceId: string | null | undefined, origin: string): string {
+  return `${workspaceId ?? ''}|${origin}`;
+}
+
+/** WI-2(c): is `host` a known third-party auth/SSO host? (cross-origin redirect
+ *  to one of these is the strongest expiry signal). */
+function isAuthHost(host: string): boolean {
+  return (
+    host === 'accounts.google.com' ||
+    host === 'login.microsoftonline.com' ||
+    host.endsWith('.okta.com') ||
+    host.startsWith('idp.')
+  );
+}
+
+/** WI-2(c): does the committed URL `path` sit on a default login path? */
+function onLoginPath(path: string): boolean {
+  const p = path.toLowerCase();
+  return DEFAULT_LOGIN_PATHS.some((lp) => p === lp || p.startsWith(`${lp}/`));
+}
+
+/** WI-2(c): match a per-rule `login_url_patterns` entry against a full URL —
+ *  glob (when it contains `*`) or plain case-insensitive substring, NEVER
+ *  arbitrary regex (the UI validates; this is the conservative interpreter). A
+ *  glob escapes every regex special, then `*` → `.*`, anchored full-match. */
+function matchLoginPattern(url: string, pattern: string): boolean {
+  if (!pattern) return false;
+  const hay = url.toLowerCase();
+  const pat = pattern.toLowerCase();
+  if (!pat.includes('*')) return hay.includes(pat);
+  const escaped = pat.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
+  try {
+    return new RegExp(`^${escaped}$`).test(hay);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * WI-2(c): the PURE warm-expiry heuristic — does this committed URL look like a
+ * login wall for an origin governed by `rule`? Conservative by design (default-on
+ * for every allow_signed_in origin, so false positives must be rare):
+ *  - per-rule `loginUrlPatterns` (glob/substring) fire first (the tuning escape
+ *    hatch for SSO boards);
+ *  - a CROSS-ORIGIN redirect to a known auth host (accounts.google.com, Okta,
+ *    idp.*, …) fires;
+ *  - a default login PATH on the SAME origin as the rule fires;
+ *  - a normal in-origin page never matches.
+ * Exported PURE so the unit tests assert it without a live view.
+ */
+export function looksLikeLoginWall(
+  url: string,
+  rule?: { hostname?: string; loginUrlPatterns?: string[] },
+): boolean {
+  let u: URL;
+  try {
+    u = new URL(url);
+  } catch {
+    return false;
+  }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
+  const host = u.hostname.replace(/\.$/, '').toLowerCase();
+  const ruleHost = rule?.hostname ? rule.hostname.replace(/\.$/, '').toLowerCase() : undefined;
+
+  // Per-rule tuning patterns first (extend/override the defaults).
+  for (const pat of rule?.loginUrlPatterns ?? []) {
+    if (matchLoginPattern(url, pat)) return true;
+  }
+
+  // Cross-origin redirect to a third-party auth host.
+  if (isAuthHost(host) && host !== ruleHost) return true;
+
+  // Default login path on the SAME origin (when we know the rule host; if we
+  // don't, fall back to host-agnostic login-path detection — conservative).
+  if (onLoginPath(u.pathname) && (!ruleHost || host === ruleHost)) return true;
+
+  return false;
 }
 
 /** Canonical POLICY partition strings. These are the values checkAction() /
@@ -476,6 +603,52 @@ function partitionFor(partition: BrowserPartition, workspaceId: string | null | 
   return partition === 'user' ? 'persist:user' : agentPartitionForWorkspace(workspaceId);
 }
 
+/** WI-E (Import my session): reconstruct a valid `url` for `cookies.set()` from a
+ *  cookie read out of one Electron session. set() requires a url the cookie's
+ *  domain/path is valid for and rejects a Secure cookie on an http url. A
+ *  leading-dot (domain) cookie → use the apex host (strip the dot); a host-only
+ *  cookie → use its own bare domain. Scheme is https when the cookie is Secure
+ *  (so the replay never trips the http-secure rejection). PURE + exported so the
+ *  cookie→set mapping can be unit-tested without a live Chromium session. */
+export function cookieSetUrl(
+  cookie: { domain?: string; path?: string; secure?: boolean },
+  fallbackHost: string,
+): string {
+  const rawDomain = cookie.domain && cookie.domain.length > 0 ? cookie.domain : fallbackHost;
+  const host = rawDomain.startsWith('.') ? rawDomain.slice(1) : rawDomain;
+  const scheme = cookie.secure ? 'https' : 'http';
+  const path = cookie.path && cookie.path.length > 0 ? cookie.path : '/';
+  return `${scheme}://${host}${path}`;
+}
+
+/** WI-E: map an Electron Cookie read from `persist:user` into the
+ *  `CookiesSetDetails` that replays it into an agent partition, preserving
+ *  name/value/path/secure/httpOnly/sameSite and (for non-session cookies)
+ *  expirationDate. A host-only cookie must NOT carry a `domain` (else Electron
+ *  promotes it to a domain cookie spanning subdomains); a domain cookie passes
+ *  its leading-dot domain through so it stays valid for subdomains. PURE +
+ *  exported for unit tests. */
+export function cookieToSetDetails(cookie: Cookie, fallbackHost: string): CookiesSetDetails {
+  const details: CookiesSetDetails = {
+    url: cookieSetUrl(cookie, fallbackHost),
+    name: cookie.name,
+    value: cookie.value,
+    path: cookie.path,
+    secure: cookie.secure,
+    httpOnly: cookie.httpOnly,
+    sameSite: cookie.sameSite,
+  };
+  // Only domain (leading-dot) cookies get an explicit domain; host-only cookies
+  // (cookie.hostOnly) omit it so the replay stays host-only.
+  if (!cookie.hostOnly && cookie.domain) {
+    details.domain = cookie.domain;
+  }
+  if (!cookie.session && typeof cookie.expirationDate === 'number') {
+    details.expirationDate = cookie.expirationDate;
+  }
+  return details;
+}
+
 /** ARIA roles a select_option target may expose as a choosable option. Native
  *  <select> popups are OS-rendered and absent from the AX tree, so they never
  *  match — toolSelectOption throws a readable native-<select> error instead. */
@@ -516,6 +689,13 @@ export class BrowserManager {
    *  persistent SQLite reopen stack instead (session-store); `pushedAt` lets the
    *  reopen merge pick whichever side was closed more recently (Slice 10). */
   private closedTabStack: Array<{ url: string; partition: BrowserPartition; title: string; pushedAt: number }> = [];
+  /** Live OAuth/sign-in popups: native child windows we deliberately allowed
+   *  from a USER tab via setWindowOpenHandler (see wireViewEvents). Tracked so
+   *  the M4 managed-contents guard recognizes them (no "unknown web-contents"
+   *  loud-log) and so their UA-per-URL override can be wired. Entries are
+   *  removed when the popup's webContents is destroyed. AGENT popups are never
+   *  allowed, so this set only ever holds persist:user windows. */
+  private popupContents = new Set<WebContents>();
 
   // ── Slice 10/11: frozen/discarded tab model + session persistence ───────────
   /** Snapshot-backed tabs with NO WebContentsView (restored-on-startup or
@@ -537,6 +717,21 @@ export class BrowserManager {
    *  sees the auto-flip to `disabled` even with no IPC traffic. Cleared/rescheduled
    *  on every setAgentActionsState. */
   private actionsExpiryTimer: ReturnType<typeof setTimeout> | null = null;
+
+  // ── Signed-in tabs (on-demand user sign-in for research agents) ─────────────
+  /** WI-2: per-(workspace, origin) sign-in handoffs in flight. The de-dup
+   *  singleton — concurrent agent navs to one origin join ONE session / ONE tab.
+   *  RUNTIME-ONLY (the next nav recreates it after a restart). */
+  private signinSessions = new Map<string, SigninSession>();
+  /** WI-3: per-session hold timers (degrade to `unavailable` at timeout). */
+  private signinTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /** WI-3/WI-8: hold timeout before a pending sign-in degrades. Configurable
+   *  browser setting (default 300_000 / 5 min); set via setSigninHoldTimeoutMs. */
+  private signinHoldTimeoutMs = DEFAULT_SIGNIN_HOLD_TIMEOUT_MS;
+  /** WI-8: per-workspace unattended flag (keyed by workspaceId, '' = null/legacy
+   *  default). Absent/false = attended; true = ensureSignedInOrPend degrades
+   *  straight to `unavailable` without opening a sign-in tab. */
+  private signinUnattended = new Map<string, boolean>();
 
   // ── Website-access policy (plans/website-allowlist-simplification.md §5) ────
   /** Synchronously-readable memo of the compiled agent allowlist rules. MUST be
@@ -797,6 +992,12 @@ export class BrowserManager {
     }
     const tab = this.tabs.get(tabId);
     if (!tab) return;
+    // Was this the tab currently painting the pane? If so we must re-select a
+    // replacement after teardown, otherwise the destroyed view's last frame
+    // lingers as a "dead tab". Compute the replacement BEFORE any teardown so
+    // the neighbour index is still correct.
+    const wasActive = this.activeTabId === tabId;
+    const replacement = wasActive ? this.pickReplacementTab(tabId) : null;
     // Push to the reopen stack BEFORE closing. Skip empty / about:blank tabs —
     // there is nothing useful to reopen.
     const wc = tab.view.webContents;
@@ -832,11 +1033,39 @@ export class BrowserManager {
     this.lastActiveAt.delete(tabId);
     this.lastScrollY.delete(tabId);
     this.forgetTabOrder(tabId);
-    if (this.activeTabId === tabId) this.activeTabId = null;
+    if (wasActive) this.activeTabId = null;
     this.getMainWindow()?.contentView.removeChildView(tab.view);
-    wc.close();
-    this.emitTabsSnapshot(); // membership changed
-    this.schedulePersist();
+    // Genuinely destroy the WebContents. waitForBeforeUnload:false → a page's
+    // beforeunload / will-prevent-unload handler can neither cancel nor stall the
+    // teardown, so the WebContentsView is always reaped (no lingering dead tab).
+    if (!wc.isDestroyed()) wc.close({ waitForBeforeUnload: false });
+    if (wasActive) {
+      // Re-attach + repaint a replacement (or clear the pane when none remain)
+      // so the destroyed view's last frame never lingers. setActiveTab raises the
+      // next view, sets its bounds, runs applyVisibility, and emits the snapshot
+      // + schedules a persist — covering the membership change too.
+      this.setActiveTab(replacement);
+    } else {
+      this.emitTabsSnapshot(); // membership changed
+      this.schedulePersist();
+    }
+  }
+
+  /** Choose which tab becomes active after the currently-active `closedId` is
+   *  closed: the next tab to the RIGHT in the same workspace's display order,
+   *  falling back to the LEFT neighbour, or null when the workspace has no other
+   *  tab (the pane then clears). Mirrors standard browser tab-close selection.
+   *  Must be called BEFORE `closedId` is removed from the tab maps/order. */
+  private pickReplacementTab(closedId: string): string | null {
+    const ws = this.workspaceOf(closedId);
+    const order = this.orderedTabIds().filter((id) => this.workspaceOf(id) === ws);
+    const idx = order.indexOf(closedId);
+    if (idx === -1) return null;
+    const remaining = order.filter((id) => id !== closedId);
+    if (remaining.length === 0) return null;
+    // The tab that shifts into `idx` is the right neighbour; clamp to the last
+    // remaining tab when the closed tab was rightmost (→ left neighbour).
+    return remaining[Math.min(idx, remaining.length - 1)];
   }
 
   navigate(tabId: string, url: string): void {
@@ -933,6 +1162,8 @@ export class BrowserManager {
     for (const tab of this.tabs.values()) {
       if (tab.view.webContents === wc) return true;
     }
+    // OAuth/sign-in popups we deliberately allowed from a USER tab are managed.
+    if (this.popupContents.has(wc)) return true;
     return false;
   }
 
@@ -1135,18 +1366,45 @@ export class BrowserManager {
     if (!rule.allowSignedIn) {
       throw new Error(`access-handoff-signin: rule ${ruleId} is not allow_signed_in`);
     }
+    // Manual "Sign in for agent" (no triggering url) → open the rule's origin.
+    const tabId = this.openSigninHandoffTab(rule, rule.workspaceId ?? null, undefined, 'Manual sign-in for agent.');
+    return { tabId };
+  }
+
+  /** WI-2(e): the shared JIT sign-in tab opener. Refactored out of the (manual)
+   *  accessHandoffSignin so the lazy nav gate (ensureSignedInOrPend) can reuse it.
+   *  It preserves EVERY safety property of the original: signinPending +
+   *  signinRuleId quarantine, the rule's workspace partition (M9 — credentials
+   *  land only in persist:agent:<workspaceId>), the tab-state send, and focus.
+   *  The one upgrade (reviewer #5): it opens the *triggering* `targetUrl` when
+   *  that URL passes the nav floor AND still matches the rule — so the human
+   *  reaches the real login/SSO flow — falling back to the rule's bare origin
+   *  otherwise. Returns the new quarantined tab's id. */
+  private openSigninHandoffTab(
+    rule: AccessRule,
+    workspaceId: string | null,
+    targetUrl: string | undefined,
+    _reason: string,
+  ): string {
     const scheme = rule.scheme === 'any' ? 'https' : rule.scheme;
-    const url = `${scheme}://${rule.hostname}${rule.pathPrefix ?? ''}`;
+    const fallback = `${scheme}://${rule.hostname}${rule.pathPrefix ?? ''}`;
+    let url = fallback;
+    if (targetUrl) {
+      // Only open the original target when it is BOTH navigable (M11 floor) and
+      // still on the rule's origin — never let a triggering url widen the open.
+      const nav = checkNavigation(targetUrl, { apiPort: this.controlPorts.apiPort });
+      if (nav.allow && matchesRule(targetUrl, rule)) url = targetUrl;
+    }
     // Slice-4: open the quarantined sign-in tab in the RULE's workspace, so the
     // credentials the human enters land in that workspace's agent session
     // (persist:agent:<workspaceId>) — the same session clearAgentSiteData clears.
-    const { tabId } = this.createTab({ partition: 'agent', url, workspaceId: rule.workspaceId ?? null });
+    const { tabId } = this.createTab({ partition: 'agent', url, workspaceId: workspaceId ?? null });
     const tab = this.mustGet(tabId);
     tab.signinPending = true;
-    tab.signinRuleId = ruleId;
+    tab.signinRuleId = rule.id;
     this.setActiveTab(tabId);
     this.sendTabState(tab);
-    return { tabId };
+    return tabId;
   }
 
   /** Mechanism A, §12-A step 4: the human finished signing in. Revalidate the
@@ -1178,10 +1436,391 @@ export class BrowserManager {
       }
     }
     tab.signinPending = false;
+    const releasedRuleId = tab.signinRuleId;
     tab.signinRuleId = undefined;
     this.sendTabState(tab);
+    // WI-3: completion — mark the matching SigninSession ready so any pollers /
+    // the JIT banner see it, and ensure the session's TRIGGERING origin is
+    // upserted active (the upsert above used the committed origin, which usually
+    // equals it, but a redirect-finished sign-in may differ). Emits
+    // browser:signin-resolved {state:'ready'}.
+    this.resolveSigninSessionForTab(tabId, 'ready', releasedRuleId);
     // Slice 12: the session center's list just changed (a new/refreshed origin).
     this.send(BROWSER_CHANNELS.accessChanged, undefined);
+  }
+
+  /** WI-E (Import my session) — Option A, the most-proactive path. Copy the
+   *  human's already-signed-in cookies for the rule's origin out of the SHARED
+   *  human partition (`persist:user`) into the rule's workspace agent partition
+   *  (`persist:agent:<workspaceId>`), so every agent inherits the session with no
+   *  agent-tab sign-in.
+   *
+   *  SECURITY (hard, M9): this is HUMAN-CHROME-ONLY — reachable via IPC + the
+   *  renderer only, NEVER an agent-facing MCP verb. The copy is one-way
+   *  user→agent and a point-in-time SNAPSHOT; agents still cannot see or drive
+   *  `persist:user`. On `imported === 0` we do NOT upsert (no row) so the UI
+   *  degrades to the Mechanism-B in-agent-tab sign-in fallback. */
+  async importUserSessionForRule(ruleId: string): Promise<{ imported: number; origin: string }> {
+    const rule = getRule(ruleId);
+    if (!rule) {
+      throw new Error(`import-user-session: unknown rule ${ruleId}`);
+    }
+    if (!rule.allowSignedIn) {
+      throw new Error(`import-user-session: rule ${ruleId} is not allow_signed_in`);
+    }
+    const scheme = rule.scheme === 'any' ? 'https' : rule.scheme;
+    const origin = `${scheme}://${rule.hostname}`;
+    const userSes = session.fromPartition('persist:user');
+    const agentSes = session.fromPartition(agentPartitionForWorkspace(rule.workspaceId));
+    // Union of origin-scoped + domain-scoped cookies: `url` captures the host-only
+    // + apex set for the origin; `domain` captures `.host` domain cookies and any
+    // path the origin query missed. De-dup by (name, domain, path).
+    const byOrigin = await userSes.cookies.get({ url: origin });
+    const byDomain = await userSes.cookies.get({ domain: rule.hostname });
+    const seen = new Set<string>();
+    const cookies: Cookie[] = [];
+    for (const c of [...byOrigin, ...byDomain]) {
+      const key = `${c.name} ${c.domain ?? ''} ${c.path ?? ''}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      cookies.push(c);
+    }
+    let imported = 0;
+    for (const c of cookies) {
+      try {
+        // One rejected cookie (expired, malformed) must not abort the batch.
+        await agentSes.cookies.set(cookieToSetDetails(c, rule.hostname));
+        imported++;
+      } catch {
+        /* skip this cookie, keep importing the rest */
+      }
+    }
+    if (imported > 0) {
+      const now = Date.now();
+      upsertSignedInOrigin(ruleId, origin, rule.workspaceId ?? null, {
+        signedInAt: now,
+        verifiedAt: now,
+      });
+      // The session center's list just changed (the origin flips to signed_in).
+      this.send(BROWSER_CHANNELS.accessChanged, undefined);
+    }
+    return { imported, origin };
+  }
+
+  // ── Signed-in tabs (on-demand user sign-in) — registry, gate, lifecycle ─────
+
+  /** WI-2: resolve the `allow_signed_in` AccessRule (full, with id) governing
+   *  `url` for a workspace — the enabled, workspace-applicable, signed-in rule
+   *  whose pattern matches. undefined when the origin is non-credentialed (its
+   *  normal allow/deny path is unchanged). Legacy NULL-workspace rules apply to
+   *  every workspace (rowAppliesToWorkspace). */
+  private resolveSignedInRule(
+    url: string,
+    workspaceId: string | null | undefined,
+  ): AccessRule | undefined {
+    return listRules().find(
+      (r) =>
+        r.enabled &&
+        r.allowSignedIn &&
+        rowAppliesToWorkspace(r.workspaceId, workspaceId) &&
+        matchesRule(url, r),
+    );
+  }
+
+  /** WI-2(b): is the agent clear to drive this origin, or must a human sign in
+   *  first? Resolves the governing allow_signed_in rule (non-credentialed →
+   *  always `ready`); no active session row → `needs_signin`; an ACTIVE row whose
+   *  `committedUrl` looks like a login wall is flipped to `expired` (durable
+   *  consent preserved) and returns `needs_signin`. `originOrUrl` may be a full
+   *  URL or a bare origin — the canonical origin is derived for the row key.
+   *  PUBLIC: WI-4 read-verb guards reuse it. */
+  classifyOriginState(
+    workspaceId: string | null,
+    originOrUrl: string,
+    committedUrl?: string,
+  ): 'ready' | 'needs_signin' {
+    // Resolve the governing rule from the CREDENTIALED origin (`originOrUrl`), not
+    // the committed URL — a warm-expiry redirect commonly lands cross-origin (e.g.
+    // accounts.google.com), which would resolve no rule and mask the expiry. The
+    // committed URL is used ONLY as the login-wall probe below.
+    const rule = this.resolveSignedInRule(originOrUrl, workspaceId);
+    if (!rule) return 'ready';
+    let origin: string;
+    try {
+      origin = new URL(originOrUrl).origin;
+    } catch {
+      return 'ready';
+    }
+    if (getSignedInOriginState(rule.id, origin) !== 'active') return 'needs_signin';
+    if (committedUrl && looksLikeLoginWall(committedUrl, rule)) {
+      expireSignedInOrigin(rule.id, origin, Date.now());
+      return 'needs_signin';
+    }
+    return 'ready';
+  }
+
+  /** WI-2(c): instance wrapper over the pure `looksLikeLoginWall` (kept so tests
+   *  / WI-4 can call it off the manager too). */
+  looksLikeLoginWall(url: string, rule?: { hostname?: string; loginUrlPatterns?: string[] }): boolean {
+    return looksLikeLoginWall(url, rule);
+  }
+
+  /** WI-2(d): the navigation chokepoint. For an allow_signed_in origin that needs
+   *  a human sign-in, ensure EXACTLY ONE quarantined sign-in tab exists (de-dup
+   *  across concurrent agent navs) and report the agent's state:
+   *   - `ready`     — a live session; proceed/drive as normal;
+   *   - `pending`   — a sign-in tab is up (this call or a sibling's); the agent
+   *                   waits + polls; NO second tab is opened;
+   *   - `unavailable` — a prior hold timed out / was cancelled (degrade to the
+   *                   block-stub; we do not reopen within the same session).
+   *  `targetUrl` is the triggering agent URL (opened in the JIT tab). PUBLIC:
+   *  WI-4 threads this through the provider/API layer. */
+  ensureSignedInOrPend(
+    workspaceId: string | null,
+    origin: string,
+    ruleId: string,
+    requestingTabId: string | undefined,
+    targetUrl?: string,
+  ): 'ready' | 'pending' | 'unavailable' {
+    if (this.classifyOriginState(workspaceId, targetUrl ?? origin) === 'ready') return 'ready';
+
+    const key = signinKey(workspaceId, origin);
+    const existing = this.signinSessions.get(key);
+    if (existing) {
+      if (existing.state === 'ready') return 'ready';
+      if (existing.state === 'pending') {
+        // Join the in-flight session — NO second tab (concurrency de-dup).
+        existing.waiters += 1;
+        return 'pending';
+      }
+      // 'unavailable' — a prior hold ended; stay degraded (no reopen this run).
+      // WI-8 will add a re-arm window so a later attended retry can re-trigger.
+      return 'unavailable';
+    }
+
+    // WI-8: an unattended run (overnight JSI) has no human to sign in — skip
+    // opening a tab and degrade immediately so the agent observes
+    // signin_unavailable and falls back to the block-stub instead of hanging.
+    if (this.isSigninUnattended(workspaceId)) return 'unavailable';
+
+    const rule = getRule(ruleId);
+    if (!rule || !rule.allowSignedIn) return 'unavailable'; // defensive — gate misfire
+    const reason =
+      'Site allows user sign-in; no live session. A sign-in tab has been surfaced to the human.';
+    const tabId = this.openSigninHandoffTab(rule, workspaceId, targetUrl, reason);
+    const session: SigninSession = {
+      ruleId,
+      workspaceId,
+      origin,
+      targetUrl: targetUrl ?? origin,
+      tabId,
+      state: 'pending',
+      openedAt: Date.now(),
+      reason,
+      waiters: 1,
+    };
+    this.signinSessions.set(key, session);
+    this.armSigninTimeout(key);
+    const opened: SigninPendingOpened = { workspaceId, origin, tabId, reason };
+    this.send(BROWSER_CHANNELS.signinPendingOpened, opened);
+    return 'pending';
+  }
+
+  /** WI-2/WI-4: build the structured signin envelope for an open/read verb. NOT a
+   *  PolicyError — a normal result the researcher treats as wait/degrade. */
+  signinResultFor(
+    outcome: 'pending' | 'unavailable',
+    origin: string,
+    workspaceId: string | null,
+  ): SigninPendingResult {
+    if (outcome === 'pending') {
+      return {
+        ok: false,
+        status: 'pending_signin',
+        origin,
+        requestId: signinKey(workspaceId, origin),
+        message:
+          'Human sign-in required and in progress; poll browser_list_my_access_requests and retry.',
+      };
+    }
+    return {
+      ok: false,
+      status: 'signin_unavailable',
+      origin,
+      message: 'Sign-in not completed; treat as blocked.',
+    };
+  }
+
+  /** WI-4: read/act-verb BACKSTOP guard. Called after the gate (so the
+   *  quarantine / allowlist / actions checks stay in force) and before a verb
+   *  returns content or acts: if the agent tab's COMMITTED origin is an
+   *  `allow_signed_in` origin that needs a human sign-in (no live session, or a
+   *  login-wall expiry just detected), ensure a quarantined sign-in tab exists
+   *  and return the structured signin envelope to hand back INSTEAD of
+   *  logged-out content / instead of acting. `null` ⇒ the verb proceeds.
+   *  WI-2(g) (in-call expiry on open_url) is the FIRST line; this is the backstop
+   *  for a tab that expired mid-session or was opened before the rule existed. */
+  private signinGuard(tab: TabEntry): SigninPendingResult | null {
+    // Human / handed tabs are never agent-driven; only agent tabs can pend.
+    if (tab.partition !== 'agent') return null;
+    const committed = tab.view.webContents.getURL();
+    let origin: string;
+    try {
+      origin = new URL(committed).origin;
+    } catch {
+      return null;
+    }
+    const rule = this.resolveSignedInRule(committed, tab.workspaceId);
+    if (!rule) return null;
+    // committedUrl doubles as the login-wall probe (flips an active row expired).
+    if (this.classifyOriginState(tab.workspaceId, committed, committed) !== 'needs_signin') {
+      return null;
+    }
+    const outcome = this.ensureSignedInOrPend(tab.workspaceId, origin, rule.id, tab.id, committed);
+    if (outcome === 'ready') return null; // a sibling completed in the meantime
+    return this.signinResultFor(outcome, origin, tab.workspaceId);
+  }
+
+  /** WI-4: the workspace-scoped `signin_pending` rollup for the
+   *  `browser_list_my_access_requests` payload. Iterates the runtime
+   *  SigninSession registry filtered to `workspaceId` and maps the internal
+   *  state vocabulary to the WIRE vocabulary the researcher polls on
+   *  (pending→pending_signin, ready→ready, unavailable→signin_unavailable). */
+  listSigninPending(workspaceId: string | null): SigninPendingEntry[] {
+    const out: SigninPendingEntry[] = [];
+    for (const s of this.signinSessions.values()) {
+      if ((s.workspaceId ?? null) !== (workspaceId ?? null)) continue;
+      out.push({
+        origin: s.origin,
+        state:
+          s.state === 'pending'
+            ? 'pending_signin'
+            : s.state === 'ready'
+              ? 'ready'
+              : 'signin_unavailable',
+        request_id: signinKey(s.workspaceId, s.origin),
+        since: s.openedAt,
+      });
+    }
+    return out;
+  }
+
+  /** WI-8: set the per-session sign-in hold timeout (the WI-3 degrade timer).
+   *  Configurable browser setting (default 300_000 / 5 min); the renderer
+   *  settings UI drives this. Clamped to a sane floor so a 0 can't busy-degrade. */
+  setSigninHoldTimeoutMs(ms: number): void {
+    if (typeof ms === 'number' && Number.isFinite(ms) && ms > 0) {
+      this.signinHoldTimeoutMs = Math.trunc(ms);
+    }
+  }
+
+  /** WI-8: read the configured hold timeout (for the settings UI round-trip). */
+  getSigninHoldTimeoutMs(): number {
+    return this.signinHoldTimeoutMs;
+  }
+
+  /** WI-8: per-workspace unattended flag (default false). When true,
+   *  `ensureSignedInOrPend` skips opening a sign-in tab and degrades to
+   *  `unavailable` immediately — set by the JSI supervisor for overnight runs so
+   *  a research run never blocks waiting on a human who isn't there. */
+  setSigninUnattended(workspaceId: string | null, unattended: boolean): void {
+    const key = workspaceId ?? '';
+    if (unattended) this.signinUnattended.set(key, true);
+    else this.signinUnattended.delete(key);
+  }
+
+  /** WI-8: is the given workspace flagged unattended? */
+  isSigninUnattended(workspaceId: string | null | undefined): boolean {
+    return this.signinUnattended.get(workspaceId ?? '') === true;
+  }
+
+  /** WI-3: (re)arm the per-session hold timer. On elapse with no completion the
+   *  session degrades to `unavailable`, the quarantined tab is closed, and
+   *  browser:signin-resolved fires. `unref` so a pending hold never keeps the
+   *  process (or a test runner) alive. */
+  private armSigninTimeout(key: string): void {
+    this.clearSigninTimeout(key);
+    const timer = setTimeout(() => {
+      this.signinTimers.delete(key);
+      this.degradeSignin(key);
+    }, this.signinHoldTimeoutMs);
+    if (typeof (timer as { unref?: () => void }).unref === 'function') {
+      (timer as { unref: () => void }).unref();
+    }
+    this.signinTimers.set(key, timer);
+  }
+
+  private clearSigninTimeout(key: string): void {
+    const t = this.signinTimers.get(key);
+    if (t) {
+      clearTimeout(t);
+      this.signinTimers.delete(key);
+    }
+  }
+
+  /** WI-3: degrade a still-pending session to `unavailable` (timeout or cancel):
+   *  close the quarantined tab and emit browser:signin-resolved. Does NOT clear
+   *  durable consent (consent_acked_at on the rule stays). No-op once the session
+   *  has already resolved (ready/unavailable). */
+  private degradeSignin(key: string): void {
+    const session = this.signinSessions.get(key);
+    if (!session || session.state !== 'pending') return;
+    session.state = 'unavailable';
+    this.clearSigninTimeout(key);
+    const tab = this.tabs.get(session.tabId);
+    if (tab?.signinPending) this.closeTab(session.tabId);
+    const resolved: SigninResolved = { origin: session.origin, state: 'signin_unavailable' };
+    this.send(BROWSER_CHANNELS.signinResolved, resolved);
+  }
+
+  /** WI-3: completion path helper — find the SigninSession owning `tabId`, set
+   *  its state, clear its timer, (for ready) upsert the triggering origin active,
+   *  and emit browser:signin-resolved. Tolerant of a manual handoff with no
+   *  registry session (then it's a no-op event-wise). */
+  private resolveSigninSessionForTab(
+    tabId: string,
+    state: 'ready' | 'unavailable',
+    ruleIdHint?: string,
+  ): void {
+    for (const [key, s] of this.signinSessions) {
+      if (s.tabId !== tabId) continue;
+      s.state = state;
+      this.clearSigninTimeout(key);
+      if (state === 'ready') {
+        // Ensure the origin the agent will RETRY (the session's triggering
+        // origin) is marked active, even if the committed-origin upsert differed.
+        try {
+          const now = Date.now();
+          upsertSignedInOrigin(s.ruleId, s.origin, s.workspaceId, { signedInAt: now, verifiedAt: now });
+        } catch {
+          /* defensive — origin already validated on the handoff-ready path */
+        }
+      }
+      const resolved: SigninResolved = {
+        origin: s.origin,
+        state: state === 'ready' ? 'ready' : 'signin_unavailable',
+      };
+      this.send(BROWSER_CHANNELS.signinResolved, resolved);
+      return;
+    }
+    void ruleIdHint; // only used to document intent; lookup is by tabId
+  }
+
+  /** WI-3: Cancel the in-progress sign-in (browser:signin-pending-cancel). Marks
+   *  the session unavailable, closes the quarantined tab, emits resolved — and
+   *  PRESERVES durable consent (the rule's consent_acked_at is untouched, so the
+   *  origin can re-trigger later). Trusted-chrome only. Keyed by the quarantined
+   *  tabId (the banner carries it from signin-pending-opened). */
+  accessSigninPendingCancel(tabId: string): void {
+    for (const [key, s] of this.signinSessions) {
+      if (s.tabId === tabId) {
+        this.degradeSignin(key);
+        return;
+      }
+    }
+    // No registry session (e.g. a manual signin tab) — best-effort close.
+    const tab = this.tabs.get(tabId);
+    if (tab?.signinPending) this.closeTab(tabId);
   }
 
   /** Mechanism B, §12-B: hand the human's live signed-in tab to the agent.
@@ -1236,7 +1875,10 @@ export class BrowserManager {
         workspaceId: tab.workspaceId ?? null,
       });
     }
-    return { handedTabs, signedInOrigins: listSharedSignedInOrigins(ws ?? null) };
+    // Proactive-signin (2026-06-29): allowlist-driven — every enabled
+    // allow_signed_in rule appears (signed_in / expired / never), not only
+    // origins with an existing session row. handedTabs are unchanged.
+    return { handedTabs, signedInOrigins: listSharedSignedInEntries(ws ?? null) };
   }
 
   /** §14 — REQUIRED revocation breadth. Clear agent-partition site data for the
@@ -1443,6 +2085,7 @@ export class BrowserManager {
         closeTab: (tabId) => this.toolCloseTab(tabId),
         requestSiteAccess: (input) => this.toolRequestSiteAccess(input),
         listMyAccessRequests: (agentId) => listRequestsByAgent(agentId),
+        listSigninPending: (workspaceId) => this.listSigninPending(workspaceId),
       };
     }
     return this.toolsFacade;
@@ -1902,7 +2545,7 @@ export class BrowserManager {
       agentId?: string;
       agentTitle?: string;
     },
-  ): Promise<TabSnapshot> {
+  ): Promise<OpenUrlResult> {
     const forHuman = opts.forHuman === true;
     // Slice-2: trusted agent identity threaded from the API layer → stamped on
     // the created tab for the "Opened by <title>" tooltip + attention attribution.
@@ -1945,6 +2588,28 @@ export class BrowserManager {
       }
     }
 
+    // WI-2(f): cold/expired signed-in gate — for an allow_signed_in target, PEND
+    // a human sign-in BEFORE navigating the agent's own tab (so it never lands on
+    // a logged-out page). `pending`/`unavailable` return the structured signin
+    // envelope (NOT a PolicyError) from this same browser_open_url call.
+    const signinRule = !forHuman ? this.resolveSignedInRule(url, workspaceId) : undefined;
+    let signinOrigin: string | undefined;
+    if (signinRule) {
+      try {
+        signinOrigin = new URL(url).origin;
+      } catch {
+        signinOrigin = undefined;
+      }
+      if (signinOrigin) {
+        const outcome = this.ensureSignedInOrPend(workspaceId, signinOrigin, signinRule.id, undefined, url);
+        if (outcome !== 'ready') {
+          const result = this.signinResultFor(outcome, signinOrigin, workspaceId);
+          this.auditRecord(partitionFull, url, verb, args, `ok:${result.status}`, openCtx);
+          return result;
+        }
+      }
+    }
+
     if (forHuman) {
       // M9 openUrlForHumanAction: a visible persist:user tab, focused in the
       // pane, URL rendered by the WP1-B address bar (shell chrome — model
@@ -1966,6 +2631,27 @@ export class BrowserManager {
       this.auditRecord(partitionFull, url, verb, args, `error:${msg}`, { tab: this.tabs.get(tabId), ...openCtx });
       throw err;
     }
+    // WI-2(g): post-commit / in-call expiry. An ACTIVE session that just landed
+    // on a login wall would otherwise return logged-out content in THIS first
+    // response. Re-classify against the committed URL BEFORE the snapshot; on
+    // needs_signin the row was flipped expired (inside classifyOriginState) — pend
+    // a sign-in tab, close this logged-out tab, and return pending_signin from the
+    // same call. Read-verb guards (WI-4) are the backstop, not the first line.
+    if (signinRule && signinOrigin) {
+      const committed = this.mustGet(tabId).view.webContents.getURL();
+      if (this.classifyOriginState(workspaceId, signinOrigin, committed) === 'needs_signin') {
+        const outcome = this.ensureSignedInOrPend(workspaceId, signinOrigin, signinRule.id, tabId, url);
+        if (outcome !== 'ready') {
+          // The agent's own tab is on a logged-out wall — close it; the separate
+          // quarantined sign-in tab (opened by ensureSignedInOrPend) takes over.
+          this.closeTab(tabId);
+          const result = this.signinResultFor(outcome, signinOrigin, workspaceId);
+          this.auditRecord(partitionFull, url, verb, args, `ok:${result.status}`, openCtx);
+          return result;
+        }
+      }
+    }
+
     this.auditRecord(partitionFull, url, verb, args, 'ok', { tab: this.tabs.get(tabId), ...openCtx });
     const snapshot = await this.snapshotTab(tabId);
     return {
@@ -1993,17 +2679,21 @@ export class BrowserManager {
       }));
   }
 
-  private async toolGetPageText(tabId: string): Promise<string> {
+  private async toolGetPageText(tabId: string): Promise<string | SigninPendingResult> {
     const tab = this.mustGet(tabId);
     this.gate('getPageText', tab.partitionFull, tab.view.webContents.getURL(), { tabId }, tab);
+    const signin = this.signinGuard(tab);
+    if (signin) return signin;
     const text = await this.driver(tabId).getText();
     this.auditAuthedRead(tab, 'getPageText', { tabId });
     return wrapUntrusted(text);
   }
 
-  private async toolReadPage(tabId: string): Promise<string> {
+  private async toolReadPage(tabId: string): Promise<string | SigninPendingResult> {
     const tab = this.mustGet(tabId);
     this.gate('readPage', tab.partitionFull, tab.view.webContents.getURL(), { tabId }, tab);
+    const signin = this.signinGuard(tab);
+    if (signin) return signin;
     const snapshot = await this.snapshotTab(tabId);
     this.auditAuthedRead(tab, 'readPage', { tabId });
     return (
@@ -2012,19 +2702,23 @@ export class BrowserManager {
     );
   }
 
-  private async toolScreenshot(tabId: string): Promise<{ base64Png: string }> {
+  private async toolScreenshot(tabId: string): Promise<{ base64Png: string } | SigninPendingResult> {
     const tab = this.mustGet(tabId);
     this.gate('screenshot', tab.partitionFull, tab.view.webContents.getURL(), { tabId }, tab);
+    const signin = this.signinGuard(tab);
+    if (signin) return signin;
     const result = { base64Png: await this.driver(tabId).captureScreenshot() };
     this.auditAuthedRead(tab, 'screenshot', { tabId });
     return result;
   }
 
-  private async toolClick(tabId: string, ref: number): Promise<string> {
+  private async toolClick(tabId: string, ref: number): Promise<string | SigninPendingResult> {
     const tab = this.mustGet(tabId);
     const url = tab.view.webContents.getURL();
     const args = { tabId, ref };
     this.gate('click', tab.partitionFull, url, args, tab);
+    const signin = this.signinGuard(tab);
+    if (signin) return signin;
 
     const registry = this.refRegistries.get(tabId);
     if (!registry) {
@@ -2052,11 +2746,13 @@ export class BrowserManager {
   }
 
   /** type() REPLACES the field by default (focus → Ctrl+A → insertText). */
-  private async toolType(tabId: string, ref: number, text: string): Promise<string> {
+  private async toolType(tabId: string, ref: number, text: string): Promise<string | SigninPendingResult> {
     const tab = this.mustGet(tabId);
     const url = tab.view.webContents.getURL();
     const args = { tabId, ref };
     this.gate('type', tab.partitionFull, url, args, tab);
+    const signin = this.signinGuard(tab);
+    if (signin) return signin;
 
     const registry = this.refRegistries.get(tabId);
     if (!registry) {
@@ -2075,11 +2771,13 @@ export class BrowserManager {
   }
 
   /** press_key acts on the focused element (no ref). */
-  private async toolPressKey(tabId: string, key: string): Promise<string> {
+  private async toolPressKey(tabId: string, key: string): Promise<string | SigninPendingResult> {
     const tab = this.mustGet(tabId);
     const url = tab.view.webContents.getURL();
     const args = { tabId, key };
     this.gate('pressKey', tab.partitionFull, url, args, tab);
+    const signin = this.signinGuard(tab);
+    if (signin) return signin;
 
     const k = resolveKey(key);
     if (!k) {
@@ -2097,11 +2795,13 @@ export class BrowserManager {
   }
 
   /** scroll: exactly one of { ref, dy } (the route enforces 400; this is DiD). */
-  private async toolScroll(tabId: string, opts: { ref?: number; dy?: number }): Promise<string> {
+  private async toolScroll(tabId: string, opts: { ref?: number; dy?: number }): Promise<string | SigninPendingResult> {
     const tab = this.mustGet(tabId);
     const url = tab.view.webContents.getURL();
     const args = { tabId, ...opts };
     this.gate('scroll', tab.partitionFull, url, args, tab);
+    const signin = this.signinGuard(tab);
+    if (signin) return signin;
 
     const hasRef = opts.ref !== undefined;
     const hasDy = opts.dy !== undefined;
@@ -2131,11 +2831,13 @@ export class BrowserManager {
   /** select_option: ARIA-only. Opens the control, then clicks the matching
    *  ARIA option; a native <select> (no DOM option to click) gets a readable
    *  error pointing at press_key. NEVER Runtime.evaluate (M10). */
-  private async toolSelectOption(tabId: string, ref: number, value: string): Promise<string> {
+  private async toolSelectOption(tabId: string, ref: number, value: string): Promise<string | SigninPendingResult> {
     const tab = this.mustGet(tabId);
     const url = tab.view.webContents.getURL();
     const args = { tabId, ref, value };
     this.gate('selectOption', tab.partitionFull, url, args, tab);
+    const signin = this.signinGuard(tab);
+    if (signin) return signin;
 
     const registry = this.refRegistries.get(tabId);
     if (!registry) {
@@ -2183,11 +2885,13 @@ export class BrowserManager {
 
   /** go_back: act-tier, but NAV_AWAY-exempt from the sensitive-origin denial
    *  (see browser-policy). Separate from the un-gated UI goBack above. */
-  private async toolGoBack(tabId: string): Promise<string> {
+  private async toolGoBack(tabId: string): Promise<string | SigninPendingResult> {
     const tab = this.mustGet(tabId);
     const url = tab.view.webContents.getURL();
     const args = { tabId };
     this.gate('goBack', tab.partitionFull, url, args, tab);
+    const signin = this.signinGuard(tab);
+    if (signin) return signin;
     try {
       tab.view.webContents.navigationHistory.goBack();
     } catch (err) {
@@ -2200,11 +2904,13 @@ export class BrowserManager {
   }
 
   /** go_forward: act-tier, NAV_AWAY-exempt. */
-  private async toolGoForward(tabId: string): Promise<string> {
+  private async toolGoForward(tabId: string): Promise<string | SigninPendingResult> {
     const tab = this.mustGet(tabId);
     const url = tab.view.webContents.getURL();
     const args = { tabId };
     this.gate('goForward', tab.partitionFull, url, args, tab);
+    const signin = this.signinGuard(tab);
+    if (signin) return signin;
     try {
       tab.view.webContents.navigationHistory.goForward();
     } catch (err) {
@@ -2217,11 +2923,13 @@ export class BrowserManager {
   }
 
   /** reload: act-tier; stays denied on sensitive origins (no nav-away exempt). */
-  private async toolReload(tabId: string): Promise<string> {
+  private async toolReload(tabId: string): Promise<string | SigninPendingResult> {
     const tab = this.mustGet(tabId);
     const url = tab.view.webContents.getURL();
     const args = { tabId };
     this.gate('reload', tab.partitionFull, url, args, tab);
+    const signin = this.signinGuard(tab);
+    if (signin) return signin;
     try {
       tab.view.webContents.reload();
     } catch (err) {
@@ -2238,9 +2946,11 @@ export class BrowserManager {
   private async toolWaitFor(
     tabId: string,
     input: { text: string; timeoutMs?: number },
-  ): Promise<WaitForResult> {
+  ): Promise<WaitForResult | SigninPendingResult> {
     const tab = this.mustGet(tabId);
     this.gate('waitFor', tab.partitionFull, tab.view.webContents.getURL(), { tabId, ...input }, tab);
+    const signin = this.signinGuard(tab);
+    if (signin) return signin;
     const budget = Math.min(Math.max(input.timeoutMs ?? 5_000, 0), 30_000);
     const start = Date.now();
     const wc = tab.view.webContents;
@@ -2352,14 +3062,62 @@ export class BrowserManager {
       // accepted residual risk for the M9 relaxation.
     });
 
-    // M6: popups denied; the denied URL is surfaced to the renderer so the
-    // UI can offer open-as-new-tab (which re-enters the M6 gate).
+    // Popups. AGENT tabs: denied — the URL is surfaced to the renderer so the
+    // UI can offer open-as-new-tab (which re-enters the M6 gate); automation
+    // must never spawn an unattended OS window.
+    //
+    // USER tabs: real `window.open()` popups are ALLOWED as native child
+    // windows. This is required for human-driven OAuth ("Sign in with Google"
+    // and friends): the originating page keeps the handle window.open() returns
+    // and exchanges the result with the popup via window.opener.postMessage.
+    // Denying the popup (or re-opening the URL as a fresh tab) severs that
+    // opener channel, so the login can never complete — which is exactly the
+    // failure being fixed. Allowing keeps the opener link intact and removes the
+    // "Page tried to open a new window" confirmation for the human.
+    //
+    // The popup runs on the SAME persist:user session as its opener (Electron
+    // inherits it for window.open children), so every session-level guard the
+    // tab has — M2 loopback block, M5 permission deny-all, M7 download gating,
+    // the Chrome UA — already applies. Only http(s)/about:blank are auto-allowed
+    // (about:blank covers flows that open a blank popup then navigate it via
+    // JS); any other scheme falls through to the deny+surface path above.
     wc.setWindowOpenHandler(({ url }) => {
+      const allowPopup =
+        tab.partition === 'user' &&
+        (url.startsWith('http://') || url.startsWith('https://') || url === 'about:blank');
+      if (allowPopup) {
+        const win = this.getMainWindow();
+        return {
+          action: 'allow',
+          overrideBrowserWindowOptions: {
+            width: 520,
+            height: 650,
+            title: 'Sign in',
+            autoHideMenuBar: true,
+            backgroundColor: win?.getBackgroundColor() ?? '#ffffff',
+          },
+        };
+      }
       this.getMainWindow()?.webContents.send(BROWSER_CHANNELS.openRequest, {
         tabId: tab.id,
         url,
       });
       return { action: 'deny' };
+    });
+
+    // Configure each allowed USER popup: register it as a managed web-contents
+    // (so the M4 guard doesn't loud-log it as unknown) and keep the per-URL UA
+    // override the parent view uses (version-stripped Chrome UA on
+    // accounts.google.com — the G1 BotGuard fix), since the popup is the actual
+    // accounts.google.com surface.
+    wc.on('did-create-window', (popupWin, { url }) => {
+      const pwc = popupWin.webContents;
+      this.popupContents.add(pwc);
+      pwc.setUserAgent(uaForUrl(url, process.versions.chrome));
+      pwc.on('did-navigate', (_e, navUrl) => {
+        if (!pwc.isDestroyed()) pwc.setUserAgent(uaForUrl(navUrl, process.versions.chrome));
+      });
+      pwc.once('destroyed', () => this.popupContents.delete(pwc));
     });
 
     // G1 fail ladder round 2 (Ferdium tactic, their PR #2360): flip this

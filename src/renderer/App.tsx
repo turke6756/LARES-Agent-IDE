@@ -1,6 +1,7 @@
 import React, { useEffect, Component, ErrorInfo, ReactNode } from 'react';
 import { useDashboardStore } from './stores/dashboard-store';
 import Sidebar from './components/layout/Sidebar';
+import TopBar from './components/layout/TopBar';
 import MainContent from './components/layout/MainContent';
 import DetailPanel from './components/layout/DetailPanel';
 import TerminalPanel from './components/terminal/TerminalPanel';
@@ -77,6 +78,18 @@ function AppInner() {
       useDashboardStore.getState().addTeamMessage(message);
     });
 
+    // Active orchestration deliberations (groupthink). Seed the current set on
+    // mount — the broadcast below only fires on change, so a renderer that
+    // mounts mid-deliberation would otherwise miss the pulse — then keep it in
+    // sync. Drives the owner-container border pulse through the idle gaps
+    // between deliberation turns.
+    window.api.listActiveOrchestrations()
+      .then((ids) => useDashboardStore.getState().setDeliberatingSupervisorIds(ids))
+      .catch(() => { /* best effort — next broadcast will populate it */ });
+    const unsubDeliberation = window.api.onOrchestrationActiveChanged((ids) => {
+      useDashboardStore.getState().setDeliberatingSupervisorIds(ids);
+    });
+
     // Agent-initiated "open this file for the user" (open_file_in_view MCP
     // tool → main → file:open-tab). Lives here, not in FileViewerPanel,
     // because the panel unmounts whenever the viewer is closed.
@@ -97,6 +110,7 @@ function AppInner() {
       unsubContext();
       unsubTeam();
       unsubTeamMsg();
+      unsubDeliberation();
       unsubOpenFileTab();
       unsubDetachedClosed();
     };
@@ -145,50 +159,57 @@ function AppInner() {
   const detailCollapsed = panelLayout.detailPanelCollapsed;
 
   return (
-    <div className="flex h-screen bg-surface-0 text-gray-100 grid-bg relative overflow-hidden">
+    <div className="flex flex-col h-screen bg-surface-0 text-gray-100 grid-bg relative overflow-hidden">
       <div className="scanlines pointer-events-none" />
 
-      {/* Sidebar */}
-      <Sidebar width={sidebarCollapsed ? 40 : sidebarResize.size} />
+      {/* Spanning top chrome — the "one unit" tier above the three panels.
+          Hosts window drag, app menus, and the native min/max/close overlay. */}
+      <TopBar />
 
-      {/* Sidebar resize divider */}
-      {!sidebarCollapsed && (
-        <ResizeDivider
-          direction="horizontal"
-          isResizing={sidebarResize.isResizing}
-          onMouseDown={sidebarResize.handleMouseDown}
-        />
-      )}
+      {/* Three-panel row */}
+      <div className="flex flex-1 min-h-0 min-w-0 relative">
+        {/* Sidebar */}
+        <Sidebar width={sidebarCollapsed ? 40 : sidebarResize.size} />
 
-      {/* Center + Detail */}
-      <div className="flex flex-1 min-w-0 min-h-0 z-10">
-        {/* Main content column (with terminal below) */}
-        <div className="flex flex-col flex-1 min-w-0 min-h-0">
-          <MainContent />
-
-          {/* Terminal resize divider (above terminal) — hidden when collapsed */}
-          {terminalAgentId !== null && !panelLayout.terminalCollapsed && (
-            <ResizeDivider
-              direction="vertical"
-              isResizing={terminalResize.isResizing}
-              onMouseDown={terminalResize.handleMouseDown}
-            />
-          )}
-
-          <TerminalPanel height={terminalResize.size} />
-        </div>
-
-        {/* Detail resize divider */}
-        {!detailCollapsed && (
+        {/* Sidebar resize divider */}
+        {!sidebarCollapsed && (
           <ResizeDivider
             direction="horizontal"
-            isResizing={detailResize.isResizing}
-            onMouseDown={detailResize.handleMouseDown}
+            isResizing={sidebarResize.isResizing}
+            onMouseDown={sidebarResize.handleMouseDown}
           />
         )}
 
-        {/* Detail panel — full height, independent of terminal */}
-        <DetailPanel width={detailCollapsed ? 40 : detailResize.size} />
+        {/* Center + Detail */}
+        <div className="flex flex-1 min-w-0 min-h-0 z-10">
+          {/* Main content column (with terminal below) */}
+          <div className="flex flex-col flex-1 min-w-0 min-h-0">
+            <MainContent />
+
+            {/* Terminal resize divider (above terminal) — hidden when collapsed */}
+            {terminalAgentId !== null && !panelLayout.terminalCollapsed && (
+              <ResizeDivider
+                direction="vertical"
+                isResizing={terminalResize.isResizing}
+                onMouseDown={terminalResize.handleMouseDown}
+              />
+            )}
+
+            <TerminalPanel height={terminalResize.size} />
+          </div>
+
+          {/* Detail resize divider */}
+          {!detailCollapsed && (
+            <ResizeDivider
+              direction="horizontal"
+              isResizing={detailResize.isResizing}
+              onMouseDown={detailResize.handleMouseDown}
+            />
+          )}
+
+          {/* Detail panel — full height, independent of terminal */}
+          <DetailPanel width={detailCollapsed ? 40 : detailResize.size} />
+        </div>
       </div>
     </div>
   );

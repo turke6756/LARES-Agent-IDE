@@ -1,0 +1,157 @@
+// @vitest-environment jsdom
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import React, { act } from 'react';
+import { createRoot, type Root } from 'react-dom/client';
+import ChatInputBar from './ChatInputBar';
+import { useDashboardStore } from '../../stores/dashboard-store';
+import { formatAgentToken } from '../../lib/agent-mention';
+import type { Agent } from '../../../shared/types';
+
+// Component test via the createRoot-on-jsdom probe pattern (React Testing
+// Library is intentionally NOT a dependency of this repo — see
+// useOwnerExpand.test.tsx). Imports AtMentionDropdown + textarea-caret (W2's
+// modules), so this file runs at integration time once those exist.
+
+const WS = 'ws-1';
+
+function mkAgent(id: string, title: string): Agent {
+  return {
+    id,
+    workspaceId: WS,
+    title,
+    status: 'idle',
+  } as Agent;
+}
+
+const RESEARCHER = mkAgent('id-researcher-001', 'Researcher');
+const SUPERVISOR = mkAgent('id-supervisor-002', 'Supervisor');
+
+let container: HTMLDivElement;
+let root: Root;
+let sendInput: ReturnType<typeof vi.fn>;
+
+function render(agentId = 'me', status: Agent['status'] = 'idle') {
+  act(() => {
+    root = createRoot(container);
+    root.render(<ChatInputBar agentId={agentId} agentStatus={status} />);
+  });
+}
+
+function textarea(): HTMLTextAreaElement {
+  const ta = container.querySelector('textarea');
+  if (!ta) throw new Error('textarea not found');
+  return ta;
+}
+
+// Drive the controlled textarea: set value via the native setter, place the
+// caret, and dispatch a bubbling input event so React's onChange fires.
+function type(text: string, caret = text.length) {
+  const ta = textarea();
+  const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')!.set!;
+  act(() => {
+    setter.call(ta, text);
+    ta.selectionStart = ta.selectionEnd = caret;
+    ta.dispatchEvent(new Event('input', { bubbles: true }));
+  });
+}
+
+function key(k: string) {
+  const ta = textarea();
+  act(() => {
+    ta.dispatchEvent(new KeyboardEvent('keydown', { key: k, bubbles: true, cancelable: true }));
+  });
+}
+
+// keydown + keyup as a real keypress does. The keyup matters: it fires the
+// caret-sync handler, which must NOT reset the arrow-driven highlight.
+function press(k: string) {
+  const ta = textarea();
+  act(() => {
+    ta.dispatchEvent(new KeyboardEvent('keydown', { key: k, bubbles: true, cancelable: true }));
+    ta.dispatchEvent(new KeyboardEvent('keyup', { key: k, bubbles: true, cancelable: true }));
+  });
+}
+
+beforeEach(() => {
+  localStorage.clear();
+  sendInput = vi.fn().mockResolvedValue(undefined);
+  (window as unknown as { api: unknown }).api = {
+    agents: {
+      sendInput,
+      onSendInputError: vi.fn(() => () => {}),
+    },
+  };
+  useDashboardStore.setState({
+    agents: [RESEARCHER, SUPERVISOR],
+    selectedWorkspaceId: WS,
+  });
+  container = document.createElement('div');
+  document.body.appendChild(container);
+});
+
+afterEach(() => {
+  act(() => root?.unmount());
+  container.remove();
+  localStorage.clear();
+  vi.restoreAllMocks();
+});
+
+describe('ChatInputBar "@"-mention', () => {
+  it('opens the dropdown listing workspace agents when "@" is typed', () => {
+    render();
+    type('@');
+    expect(document.body.textContent).toContain('Researcher');
+    expect(document.body.textContent).toContain('Supervisor');
+  });
+
+  it('ArrowDown + Enter inserts the highlighted agent\'s FULL token + trailing space', () => {
+    render();
+    type('@'); // both candidates; highlight clamps to 0 (Researcher)
+    key('ArrowDown'); // → highlight 1 (Supervisor)
+    key('Enter'); // pick Supervisor
+    expect(textarea().value).toBe(`${formatAgentToken(SUPERVISOR)} `);
+    expect(sendInput).not.toHaveBeenCalled();
+  });
+
+  it('keeps the arrow-driven highlight after keyup (caret-sync must not reset it)', () => {
+    render();
+    type('@'); // both candidates; highlight clamps to 0 (Researcher)
+    press('ArrowDown'); // keydown→1, then keyup fires caret-sync
+    key('Enter'); // must still pick Supervisor (index 1), not the reset-to-0 Researcher
+    expect(textarea().value).toBe(`${formatAgentToken(SUPERVISOR)} `);
+  });
+
+  it('Enter narrows-then-picks: a matching query inserts that token and does NOT send', () => {
+    render();
+    type('@res'); // matches Researcher only
+    key('Enter');
+    expect(textarea().value).toBe(`${formatAgentToken(RESEARCHER)} `);
+    expect(sendInput).not.toHaveBeenCalled();
+  });
+
+  it('Enter with NO dropdown open sends the token-bearing text verbatim', () => {
+    render();
+    const text = `ping ${formatAgentToken(RESEARCHER)}`;
+    type(text); // caret after ']' → no active mention
+    key('Enter');
+    expect(sendInput).toHaveBeenCalledTimes(1);
+    expect(sendInput).toHaveBeenCalledWith('me', text);
+  });
+
+  it('a non-matching query keeps the dropdown open and swallows Enter (no send, no insert)', () => {
+    render();
+    type('@zzz'); // no candidate matches
+    key('Enter');
+    expect(sendInput).not.toHaveBeenCalled();
+    expect(textarea().value).toBe('@zzz');
+  });
+
+  it('Escape closes the dropdown so Enter sends again', () => {
+    render();
+    type('@res');
+    key('Escape');
+    key('Enter');
+    expect(sendInput).toHaveBeenCalledTimes(1);
+    expect(sendInput).toHaveBeenCalledWith('me', '@res');
+  });
+});

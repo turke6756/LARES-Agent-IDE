@@ -78,6 +78,32 @@ function normalizePathPrefix(pathPrefix: string | undefined | null): string | un
   return pathPrefix;
 }
 
+// ── Signed-in tabs (WI-1): login_url_patterns JSON (de)serialization ──────────
+
+/** Parse the stored `login_url_patterns` JSON column into a string[]. Defensive:
+ *  NULL / '' / malformed JSON / a non-array all collapse to undefined, and any
+ *  non-string array entries are dropped — the column is trusted-chrome-authored,
+ *  but a corrupt row must never throw inside a hot rule-resolution path. */
+function parseLoginUrlPatterns(raw: unknown): string[] | undefined {
+  if (typeof raw !== 'string' || raw.length === 0) return undefined;
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return undefined;
+    const out = parsed.filter((p): p is string => typeof p === 'string' && p.length > 0);
+    return out.length > 0 ? out : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Encode an optional patterns array for the column. Empty/absent → NULL (so the
+ *  default-heuristic path reads as "no per-rule tuning"). */
+function encodeLoginUrlPatterns(patterns: string[] | undefined | null): string | null {
+  if (!patterns || patterns.length === 0) return null;
+  const clean = patterns.filter((p) => typeof p === 'string' && p.length > 0);
+  return clean.length > 0 ? JSON.stringify(clean) : null;
+}
+
 // ── Row mappers ──────────────────────────────────────────────────────────────
 
 function rowToRule(row: any): AccessRule {
@@ -92,6 +118,9 @@ function rowToRule(row: any): AccessRule {
     enabled: row.enabled === 1,
     createdAt: row.created_at,
     workspaceId: row.workspace_id ?? null,
+    // Signed-in tabs (WI-1): additive, NULL-tolerant for legacy rows.
+    consentAckedAt: row.consent_acked_at ?? null,
+    loginUrlPatterns: parseLoginUrlPatterns(row.login_url_patterns),
   };
 }
 
@@ -148,12 +177,17 @@ export function insertRule(input: AccessRuleInput): AccessRule {
   const pathPrefix = normalizePathPrefix(input.pathPrefix);
   const allowSignedIn = input.allowSignedIn === true;
   const workspaceId = input.workspaceId ?? null;
+  // Signed-in tabs (WI-1): consent + login-wall tuning. consentAckedAt is stamped
+  // trust-side at toggle-on/approval (WI-5); it is meaningful only for an
+  // allow_signed_in rule, but we store whatever the trusted caller passed.
+  const consentAckedAt = input.consentAckedAt ?? null;
+  const loginUrlPatterns = encodeLoginUrlPatterns(input.loginUrlPatterns);
   const id = uuidv4();
   const createdAt = Date.now();
   db.prepare(
     `INSERT INTO browser_access_rules
-      (id, list, hostname, include_subdomains, scheme, path_prefix, note, allow_signed_in, enabled, created_at, workspace_id)
-     VALUES (?, 'agent', ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
+      (id, list, hostname, include_subdomains, scheme, path_prefix, note, allow_signed_in, enabled, created_at, workspace_id, consent_acked_at, login_url_patterns)
+     VALUES (?, 'agent', ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)`,
   ).run(
     id,
     hostname,
@@ -164,6 +198,8 @@ export function insertRule(input: AccessRuleInput): AccessRule {
     allowSignedIn ? 1 : 0,
     createdAt,
     workspaceId,
+    consentAckedAt,
+    loginUrlPatterns,
   );
   return {
     id,
@@ -176,6 +212,8 @@ export function insertRule(input: AccessRuleInput): AccessRule {
     enabled: true,
     createdAt,
     workspaceId,
+    consentAckedAt,
+    loginUrlPatterns: parseLoginUrlPatterns(loginUrlPatterns),
   };
 }
 
@@ -204,12 +242,20 @@ export function updateRule(
   const allowSignedIn =
     patch.allowSignedIn !== undefined ? patch.allowSignedIn : existing.allowSignedIn;
   const enabled = patch.enabled !== undefined ? patch.enabled : existing.enabled;
+  // Signed-in tabs (WI-1): consent + login-wall tuning are patchable. consentAckedAt
+  // is stamped when the toggle/approval grants signed-in capability (WI-5).
+  const consentAckedAt =
+    patch.consentAckedAt !== undefined ? patch.consentAckedAt : (existing.consentAckedAt ?? null);
+  const loginUrlPatterns =
+    patch.loginUrlPatterns !== undefined ? patch.loginUrlPatterns : existing.loginUrlPatterns;
+  const loginUrlPatternsCol = encodeLoginUrlPatterns(loginUrlPatterns);
 
   getDb()
     .prepare(
       `UPDATE browser_access_rules
          SET hostname = ?, include_subdomains = ?, scheme = ?, path_prefix = ?,
-             note = ?, allow_signed_in = ?, enabled = ?
+             note = ?, allow_signed_in = ?, enabled = ?,
+             consent_acked_at = ?, login_url_patterns = ?
        WHERE id = ?`,
     )
     .run(
@@ -220,6 +266,8 @@ export function updateRule(
       note ?? null,
       allowSignedIn ? 1 : 0,
       enabled ? 1 : 0,
+      consentAckedAt,
+      loginUrlPatternsCol,
       id,
     );
 
@@ -236,6 +284,8 @@ export function updateRule(
     // Slice-4: workspace scope is immutable here — a rule never migrates
     // workspaces via an edit (the UPDATE above leaves workspace_id untouched).
     workspaceId: existing.workspaceId ?? null,
+    consentAckedAt,
+    loginUrlPatterns: parseLoginUrlPatterns(loginUrlPatternsCol),
   };
 }
 
@@ -276,16 +326,57 @@ export function upsertSignedInOrigin(
 ): void {
   const signedInAt = opts.signedInAt ?? null;
   const verifiedAt = opts.verifiedAt ?? null;
+  // Signed-in tabs (WI-1): an upsert IS a (re-)confirmed live session — stamp
+  // session_state='active' and clear any prior expiry, so a re-sign-in after a
+  // login-wall expiry restores the durable session.
   getDb()
     .prepare(
       `INSERT INTO browser_access_signed_in_origins
-         (rule_id, origin, workspace_id, signed_in_at, last_used_at, verified_at)
-       VALUES (?, ?, ?, ?, ?, ?)
+         (rule_id, origin, workspace_id, signed_in_at, last_used_at, verified_at, session_state, expired_at)
+       VALUES (?, ?, ?, ?, ?, ?, 'active', NULL)
        ON CONFLICT(rule_id, origin) DO UPDATE SET
-         signed_in_at = COALESCE(excluded.signed_in_at, signed_in_at),
-         verified_at  = COALESCE(excluded.verified_at, verified_at)`,
+         signed_in_at  = COALESCE(excluded.signed_in_at, signed_in_at),
+         verified_at   = COALESCE(excluded.verified_at, verified_at),
+         session_state = 'active',
+         expired_at    = NULL`,
     )
     .run(ruleId, origin, workspaceId, signedInAt, signedInAt, verifiedAt);
+}
+
+/** Signed-in tabs (WI-1): the durable session state for a tracked (rule, origin),
+ *  or undefined when no row exists (first-ever / never signed in). This is the
+ *  authoritative cold/warm classifier input — `classifyOriginState` reads it.
+ *  Keyed on (rule_id, origin), so it is workspace-agnostic by construction (a
+ *  rule belongs to exactly one workspace, incl. the legacy NULL default). */
+export function getSignedInOriginState(
+  ruleId: string,
+  origin: string,
+): 'active' | 'expired' | undefined {
+  const row = getDb()
+    .prepare(
+      'SELECT session_state FROM browser_access_signed_in_origins WHERE rule_id = ? AND origin = ?',
+    )
+    .get(ruleId, origin) as { session_state?: string } | undefined;
+  if (!row) return undefined;
+  return row.session_state === 'expired' ? 'expired' : 'active';
+}
+
+/** Signed-in tabs (WI-1): mark a tracked origin's session expired (login-wall
+ *  redirect / 401 detected) WITHOUT deleting the row — the durable consent + the
+ *  rule survive, so re-sign-in is a refresh, not a re-grant. No-op when no row
+ *  exists (an active session was never recorded). */
+export function expireSignedInOrigin(
+  ruleId: string,
+  origin: string,
+  expiredAt: number = Date.now(),
+): void {
+  getDb()
+    .prepare(
+      `UPDATE browser_access_signed_in_origins
+         SET session_state = 'expired', expired_at = ?
+       WHERE rule_id = ? AND origin = ?`,
+    )
+    .run(expiredAt, ruleId, origin);
 }
 
 /** Slice 12: stamp last_used_at for every tracked signed-in origin matching an
@@ -321,6 +412,7 @@ export function listSharedSignedInOrigins(
   const rows = getDb()
     .prepare(
       `SELECT s.rule_id, s.origin, s.signed_in_at, s.last_used_at, s.verified_at,
+              s.session_state,
               r.hostname, r.allow_signed_in, r.workspace_id AS rule_workspace_id
          FROM browser_access_signed_in_origins s
          JOIN browser_access_rules r ON r.id = s.rule_id
@@ -332,6 +424,7 @@ export function listSharedSignedInOrigins(
     signed_in_at: number | null;
     last_used_at: number | null;
     verified_at: number | null;
+    session_state: string | null;
     hostname: string;
     allow_signed_in: number;
     rule_workspace_id: string | null;
@@ -341,24 +434,73 @@ export function listSharedSignedInOrigins(
     .filter((row) => rowAppliesToWorkspace(row.rule_workspace_id, workspaceId))
     .map((row) => {
       const allowSignedIn = row.allow_signed_in === 1;
+      const sessionState: 'active' | 'expired' = row.session_state === 'expired' ? 'expired' : 'active';
       const lastActivity = Math.max(
         row.last_used_at ?? 0,
         row.signed_in_at ?? 0,
         row.verified_at ?? 0,
       );
       const aged = lastActivity > 0 && now - lastActivity > SIGNED_IN_STALE_MS;
+      // Signed-in tabs (WI-1): an expired session is also stale (offer re-sign-in).
+      const stale = !allowSignedIn || aged || sessionState === 'expired';
       return {
         ruleId: row.rule_id,
         hostname: row.hostname,
         origin: row.origin,
         workspaceId: row.rule_workspace_id ?? null,
         allowSignedIn,
+        // Proactive-signin (2026-06-29): a session row is `signed_in` unless it
+        // looks stale/expired, in which case the UI offers re-sign-in. `never` is
+        // produced only by listSharedSignedInEntries (rules with no row).
+        state: stale ? 'expired' : 'signed_in',
         signedInAt: row.signed_in_at ?? null,
         lastUsedAt: row.last_used_at ?? null,
         verifiedAt: row.verified_at ?? null,
-        stale: !allowSignedIn || aged,
+        sessionState,
+        stale,
       };
     });
+}
+
+/** Proactive-signin (2026-06-29): the ALLOWLIST-DRIVEN "Sessions shared with
+ *  agents" snapshot. Merges the persisted session rows (listSharedSignedInOrigins)
+ *  with EVERY enabled `allow_signed_in` rule applicable to `workspaceId`, so a
+ *  site that is allowlisted-for-signed-in but never signed into yet still appears
+ *  as a `never` entry the human can proactively sign in to. A rule that already
+ *  has a session row keeps that row (no synthetic `never` duplicate); a rule with
+ *  no row gets a synthetic `never` entry carrying its ruleId + hostname (all the
+ *  beginSigninHandoff flow needs). */
+export function listSharedSignedInEntries(
+  workspaceId: string | null,
+  now: number = Date.now(),
+): SignedInOrigin[] {
+  const rows = listSharedSignedInOrigins(workspaceId, now);
+  const haveRow = new Set(rows.map((r) => r.ruleId));
+  const neverEntries: SignedInOrigin[] = listRules()
+    .filter(
+      (r) =>
+        r.enabled &&
+        r.allowSignedIn &&
+        rowAppliesToWorkspace(r.workspaceId, workspaceId) &&
+        !haveRow.has(r.id),
+    )
+    .map((r) => {
+      const scheme = r.scheme === 'any' ? 'https' : r.scheme;
+      return {
+        ruleId: r.id,
+        hostname: r.hostname,
+        origin: `${scheme}://${r.hostname}`,
+        workspaceId: r.workspaceId ?? null,
+        allowSignedIn: true,
+        state: 'never' as const,
+        signedInAt: null,
+        lastUsedAt: null,
+        verifiedAt: null,
+        sessionState: 'active' as const,
+        stale: false,
+      };
+    });
+  return [...rows, ...neverEntries];
 }
 
 // ── Agent-initiated requests (§18) ───────────────────────────────────────────

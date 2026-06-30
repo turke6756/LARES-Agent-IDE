@@ -5,10 +5,12 @@ import type { AgentPersona, PathType, PersonaLane } from '../shared/types';
 import { SUPERVISOR_AGENT_NAME } from '../shared/constants';
 import {
   writeScaffoldMap, scaffoldFileExists, atomicWriteScaffoldText,
-  readScaffoldText, type ScaffoldFile,
+  readScaffoldText, sha256Hex, type ScaffoldFile,
 } from './scaffold-writer';
 import {
-  WORKER_CLAUDE_SETTINGS_JSON, PERSONA_CREATE_PERSONA_SKILL,
+  WORKER_CLAUDE_SETTINGS_JSON, WORKER_CLAUDE_SETTINGS_JSON_V5,
+  SUPERVISOR_PERSONA_CLAUDE_SETTINGS_JSON,
+  PERSONA_CREATE_PERSONA_SKILL, PERSONA_CREATE_PERSONA_SKILL_V1,
   PERSONA_READ_COMMENTS_SKILL, PERSONA_AGENT_MD_TEMPLATE,
 } from '../shared/constants';
 
@@ -48,6 +50,48 @@ function writePersonaJsonIfAbsent(workspacePath: string, pathType: PathType, nam
   atomicWriteScaffoldText(workspacePath, rel, JSON.stringify({ lane }, null, 2) + '\n', false, pathType);
 }
 
+/** Delete .dashboard/agents/<name>/persona.json if it exists (path-type aware).
+ *  Used by setPersonaLane to revert a persona to the legacy (no-lane) path. */
+function deletePersonaJson(workspacePath: string, pathType: PathType, name: string): void {
+  const rel = personaJsonRel(name);
+  if (!scaffoldFileExists(workspacePath, rel, pathType)) return;
+  if (pathType === 'wsl') {
+    try {
+      execFileSync('wsl.exe', ['bash', '-lc', `rm -f '${workspacePath}/${rel}'`], { timeout: 5000, stdio: 'ignore' });
+    } catch { /* best effort */ }
+    return;
+  }
+  try { fs.rmSync(path.join(workspacePath, rel), { force: true }); } catch { /* best effort */ }
+}
+
+/**
+ * Overwrite-capable lane writer for an EXISTING persona (#18 launch-dialog lane
+ * editing). Unlike writePersonaJsonIfAbsent, this REPLACES whatever lane the
+ * persona currently declares:
+ *  - `lane` = a valid PersonaLane → write { lane } (overwrites any prior value).
+ *  - `lane` = null → DELETE persona.json (revert to legacy / no declared lane).
+ * Validates the lane against VALID_PERSONA_LANES and name-guards exactly like
+ * scaffoldPersona (reject invalid name + the reserved supervisor name).
+ */
+export function setPersonaLane(
+  workspacePath: string, pathType: PathType, name: string, lane: PersonaLane | null,
+): void {
+  if (!VALID_NAME.test(name)) {
+    throw new Error(`Invalid persona name "${name}". Only lowercase letters, numbers, hyphens, and underscores allowed.`);
+  }
+  if (name === SUPERVISOR_AGENT_NAME) {
+    throw new Error(`Cannot set a lane on persona "${SUPERVISOR_AGENT_NAME}" — reserved for supervisor.`);
+  }
+  if (lane === null) {
+    deletePersonaJson(workspacePath, pathType, name);
+    return;
+  }
+  if (!VALID_PERSONA_LANES.has(lane)) {
+    throw new Error(`Invalid persona lane "${lane}". Must be one of supervisor | researcher | worker, or null.`);
+  }
+  atomicWriteScaffoldText(workspacePath, personaJsonRel(name), JSON.stringify({ lane }, null, 2) + '\n', false, pathType);
+}
+
 function displayNameFor(name: string): string {
   return name.charAt(0).toUpperCase() + name.slice(1).replace(/[-_]/g, ' ');
 }
@@ -65,12 +109,23 @@ function buildPersonaClaudeMd(displayName: string, roleDescription?: string): st
 }
 
 /** The managed (version-migrated) per-persona kit — OPERATIONAL PLUMBING ONLY.
- *  CLAUDE.md is intentionally NOT here (seed-once, user-owned — see D4). */
-function buildPersonaManagedFiles(name: string): Record<string, ScaffoldFile> {
+ *  CLAUDE.md is intentionally NOT here (seed-once, user-owned — see D4).
+ *
+ *  `lane` selects the persona's .claude/settings.json variant: a 'supervisor'-lane
+ *  persona inherits the supervisor hook scaffold (double-`..` script path) so its
+ *  Notification → waiting hook fires; every other persona gets the worker variant
+ *  (which also gained the Notification hook). Both are version 2: version 1 → 2
+ *  because the worker body gained the Notification hook, and previousHashes[1] is
+ *  the pre-Notification worker hash (WORKER_CLAUDE_SETTINGS_JSON_V5) so an existing
+ *  persona carrying the old worker settings on disk upgrades silently (no `.bak`). */
+function buildPersonaManagedFiles(name: string, lane?: PersonaLane): Record<string, ScaffoldFile> {
   const base = `.dashboard/agents/${name}`;
+  const settingsContent = lane === 'supervisor'
+    ? SUPERVISOR_PERSONA_CLAUDE_SETTINGS_JSON
+    : WORKER_CLAUDE_SETTINGS_JSON;
   return {
-    [`${base}/.claude/settings.json`]:                  { content: WORKER_CLAUDE_SETTINGS_JSON, version: 1 },
-    [`${base}/.claude/skills/create-persona/SKILL.md`]: { content: PERSONA_CREATE_PERSONA_SKILL, version: 1 },
+    [`${base}/.claude/settings.json`]:                  { content: settingsContent, version: 2, previousHashes: { 1: sha256Hex(WORKER_CLAUDE_SETTINGS_JSON_V5) } },
+    [`${base}/.claude/skills/create-persona/SKILL.md`]: { content: PERSONA_CREATE_PERSONA_SKILL, version: 2, previousHashes: { 1: sha256Hex(PERSONA_CREATE_PERSONA_SKILL_V1) } },
     [`${base}/.claude/skills/read-comments/SKILL.md`]:  { content: PERSONA_READ_COMMENTS_SKILL, version: 1 },
   };
 }
@@ -89,8 +144,10 @@ function seedFileIfAbsent(workspacePath: string, pathType: PathType, rel: string
 export function ensurePersonaScaffold(workspacePath: string, pathType: PathType, name: string): void {
   if (!VALID_NAME.test(name) || name === SUPERVISOR_AGENT_NAME) return;
   // Operational plumbing — managed/upgraded (the dashboard ensures every persona
-  // has working hooks + the default skills).
-  writeScaffoldMap(workspacePath, buildPersonaManagedFiles(name), pathType, { logPrefix: '[persona]' });
+  // has working hooks + the default skills). Lane selects the settings.json
+  // variant so a supervisor-privilege persona inherits the hook scaffold.
+  const lane = readPersonaLane(workspacePath, pathType, name);
+  writeScaffoldMap(workspacePath, buildPersonaManagedFiles(name, lane), pathType, { logPrefix: '[persona]' });
   // Identity — seed-once. A persona created by scaffoldPersona already has both;
   // a hand-written legacy persona (mr-job-hunt-agent) keeps its own CLAUDE.md.
   const base = `.dashboard/agents/${name}`;
@@ -111,7 +168,7 @@ function laneFromFlags(i: { isSupervisor?: boolean; isResearcher?: boolean; isWo
  *  existing lane flags. Throws on a genuine conflict; no-op when flags already
  *  match or when there is no declared lane. */
 export function applyPersonaLaneToLaunchInput(
-  input: { persona?: string; isSupervisor?: boolean; isResearcher?: boolean; isWorker?: boolean; isSupervised?: boolean; provider?: string },
+  input: { persona?: string; isSupervisor?: boolean; isResearcher?: boolean; isWorker?: boolean; isSupervised?: boolean; privilegeLane?: 'supervisor'; provider?: string },
   workspacePath: string, pathType: PathType,
 ): void {
   if (!input.persona) return;
@@ -122,7 +179,15 @@ export function applyPersonaLaneToLaunchInput(
     throw new Error(`Persona "${input.persona}" declares lane "${declared}" but the launch requested "${existing}".`);
   }
   if (existing === declared) return;
-  if (declared === 'supervisor') input.isSupervisor = true;
+  // #19 — the 'supervisor' PRIVILEGE lane is NOT the structural supervisor UI
+  // role. Granting isSupervisor here conflated the two: the renderer hides every
+  // isSupervisor agent from the worker grid and keeps a single supervisor slot
+  // (already owned by the workspace's .dashboard/supervisor), so a supervisor-
+  // lane persona got no card. Set privilegeLane instead — the persona renders as
+  // its own card (isSupervisor stays false) and roleLaneOf still grants it the
+  // supervisor-tier MCP toolset. researcher/worker already render as cards, so
+  // they keep their existing flag mapping.
+  if (declared === 'supervisor') input.privilegeLane = 'supervisor';
   else if (declared === 'researcher') { input.isResearcher = true; input.isSupervised = true; input.provider = 'claude'; }
   else if (declared === 'worker') input.isWorker = true;
 }
@@ -288,8 +353,10 @@ export function scaffoldPersona(
   }
 
   const base = `.dashboard/agents/${name}`;
-  // Operational plumbing — managed (atomic + version-migrated + locked).
-  writeScaffoldMap(workspacePath, buildPersonaManagedFiles(name), pathType, { logPrefix: '[persona]' });
+  // Operational plumbing — managed (atomic + version-migrated + locked). The
+  // declared lane selects the settings.json variant (supervisor-privilege persona
+  // inherits the hook scaffold; everything else gets the worker variant).
+  writeScaffoldMap(workspacePath, buildPersonaManagedFiles(name, lane), pathType, { logPrefix: '[persona]' });
   // Identity — seed-once. At create the dir is fresh, so CLAUDE.md is written here
   // with the user's role body; it is never overwritten on any later launch.
   seedFileIfAbsent(workspacePath, pathType, `${base}/CLAUDE.md`, buildPersonaClaudeMd(displayNameFor(name), roleDescription));

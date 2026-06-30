@@ -1331,6 +1331,10 @@ export const folderIcons: FolderTheme[] = [
         folderNames: ['.claude'],
       },
       {
+        name: 'folder-dashboard',
+        folderNames: ['.dashboard'],
+      },
+      {
         name: 'folder-cursor',
         folderNames: ['.cursor'],
         light: true,

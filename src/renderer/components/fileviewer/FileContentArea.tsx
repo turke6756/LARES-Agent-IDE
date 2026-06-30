@@ -88,10 +88,10 @@ export default function FileContentArea({ tabId, filePath, pathType }: Props) {
     isMarkdown,
     isEditable: filePath ? isEditableFileType(filePath) : false,
     mode: editState?.mode,
-    // WYSIWYG is now the default surface for markdown (graduated out of beta):
-    // markdown tabs open in the editable canvas unless the user explicitly
-    // picks View or Source from the header.
-    wysiwygIsDefault: true,
+    // Markdown tabs open in the rendered View (read-only preview) by default;
+    // the user clicks "Edit" (WYSIWYG) or "Source" from the header to start
+    // editing.
+    wysiwygIsDefault: false,
     sniff,
   });
 

@@ -85,6 +85,20 @@ export function initDatabase(): void {
     unsorted.forEach((row, i) => setOrder.run(maxRow.max + 1 + i, row.id));
   }
 
+  // Migration: normalize legacy framework-default commands that still carry a
+  // standalone `--chrome` token. Earlier builds seeded
+  // `workspaces.default_command` with the legacy framework default
+  // (`claude --dangerously-skip-permissions --chrome`, or the WSL `ccode`
+  // variant); the framework default has since dropped `--chrome`
+  // (DEFAULT_COMMAND / DEFAULT_COMMAND_WSL), and the stale rows cause downstream
+  // launch bugs. Rewrite ONLY rows that ARE the legacy framework default modulo
+  // a standalone `--chrome` token down to the current framework default —
+  // genuinely custom commands that merely happen to contain `--chrome` are left
+  // untouched. Idempotent (an already-normalized row has no `--chrome` to strip,
+  // so it matches nothing) and wrapped in try/catch like the sibling migrations
+  // so a failure never blocks DB init.
+  try { normalizeLegacyChromeDefaultCommands(db); } catch { /* best-effort; never block init */ }
+
   // Migration: add provider column to existing agents tables
   try { db.exec(`ALTER TABLE agents ADD COLUMN provider TEXT NOT NULL DEFAULT 'claude'`); } catch { /* column already exists */ }
 
@@ -104,6 +118,32 @@ export function initDatabase(): void {
   // browser MCP only, native dangerous tools withheld. Mutually exclusive with
   // the other lane flags; see Agent.isResearcher.
   try { db.exec(`ALTER TABLE agents ADD COLUMN is_researcher INTEGER DEFAULT 0`); } catch { /* column already exists */ }
+
+  // Migration: add privilege_lane column (#19 supervisor-tools-for-personas) — a
+  // persona declaring the 'supervisor' privilege lane is granted the supervisor
+  // MCP toolset WITHOUT becoming the structural supervisor (is_supervisor stays
+  // 0, so it renders as its own card). NULL/absent → no elevated grant. Read at
+  // the MCP-injection sites via roleLaneOf; see Agent.privilegeLane.
+  try { db.exec(`ALTER TABLE agents ADD COLUMN privilege_lane TEXT`); } catch { /* column already exists */ }
+
+  // Migration: add wants_codex_hooks column (Bug 2 / Edit 2.6 — codex-persona
+  // hook parity). Persists the launch-time decision (provider==='codex' AND
+  // worker-lane OR persona) so the runner's hook-env gate
+  // (roleLaneOf(agent) !== 'legacy' || isCodexHookPersona(agent)) is
+  // re-derivable from the STORED row on reconcile/respawn — when the transient
+  // launch input is gone. Defaults to 0 so every pre-existing row is unaffected.
+  try { db.exec(`ALTER TABLE agents ADD COLUMN wants_codex_hooks INTEGER NOT NULL DEFAULT 0`); } catch { /* column already exists */ }
+
+  // Agent-ownership primitive: the launcher (owner) of a child agent, so the
+  // child's lifecycle events resolve to its launcher — not just the structural
+  // workspace supervisor. NULL for dashboard-internal / unowned launches.
+  try { db.exec(`ALTER TABLE agents ADD COLUMN owner_agent_id TEXT`); } catch { /* exists */ }
+
+  // notifyOwner mute: decouples ownership from lifecycle-event subscription. An
+  // owned agent with notify_owner = 0 stays owned (owner_agent_id intact) but its
+  // owner-directed events are suppressed at the EventBridge choke point. Defaults
+  // to 1 (notify) so every pre-existing row preserves today's behavior.
+  try { db.exec(`ALTER TABLE agents ADD COLUMN notify_owner INTEGER DEFAULT 1`); } catch { /* exists */ }
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS events (
@@ -494,6 +534,38 @@ export function initDatabase(): void {
     db.exec(`ALTER TABLE browser_access_signed_in_origins ADD COLUMN verified_at INTEGER`);
   } catch { /* column already exists */ }
 
+  // Signed-in tabs (on-demand user sign-in for research agents — WI-1): the
+  // durable session lifecycle for a tracked origin. `session_state='active'` (the
+  // default) = a live confirmed session; a login-wall redirect / explicit expiry
+  // flips it to `'expired'` (the row + durable consent are PRESERVED so consent is
+  // never lost), and a re-sign-in upserts it back to `'active'`. `expired_at` is
+  // the optional epoch-ms of the last expiry flip (NULL while active). Both are
+  // ALTER-only (added even to fresh tables — the CREATE above omits them), guarded
+  // try/catch ALTER (house idiom — see the signed_in_at sibling above). The NOT
+  // NULL DEFAULT 'active' backfills every legacy row as a live session.
+  try {
+    db.exec(
+      `ALTER TABLE browser_access_signed_in_origins ADD COLUMN session_state TEXT NOT NULL DEFAULT 'active' CHECK (session_state IN ('active','expired'))`,
+    );
+  } catch { /* column already exists */ }
+  try {
+    db.exec(`ALTER TABLE browser_access_signed_in_origins ADD COLUMN expired_at INTEGER`);
+  } catch { /* column already exists */ }
+
+  // Signed-in tabs (WI-1): per-rule consent + login-wall tuning on the access
+  // rules. `consent_acked_at` = epoch-ms the human acknowledged the 4-point
+  // sharing consent when the origin became `allow_signed_in` (NULL = not yet
+  // acknowledged / legacy row). `login_url_patterns` = optional JSON array of
+  // glob/substring patterns that EXTEND the default warm-expiry heuristic for
+  // false-positive-prone SSO/board origins (NULL/'[]' = defaults only). ALTER-only,
+  // guarded (house idiom — see the workspace_id sibling above).
+  try {
+    db.exec(`ALTER TABLE browser_access_rules ADD COLUMN consent_acked_at INTEGER`);
+  } catch { /* column already exists */ }
+  try {
+    db.exec(`ALTER TABLE browser_access_rules ADD COLUMN login_url_patterns TEXT`);
+  } catch { /* column already exists */ }
+
   // ── Selection comments table ──────────────────────────────────────────
   // WP-P5 — persisted file-target selection comments. Schema recorded in
   // plans/selection-to-agent-primitive-plan.md §5; copied exactly. No generic
@@ -671,6 +743,9 @@ function rowToAgent(row: any): Agent {
     isSupervised: !!row.is_supervised,
     isWorker: !!row.is_worker,
     isResearcher: !!row.is_researcher,
+    privilegeLane: row.privilege_lane === 'supervisor' ? 'supervisor' : undefined,
+    // Bug 2 / Edit 2.6 — codex-persona hook parity. 1 → true, 0/NULL → false.
+    wantsCodexHooks: !!row.wants_codex_hooks,
     tmuxSessionName: row.tmux_session_name,
     autoRestartEnabled: !!row.auto_restart_enabled,
     resumeSessionId: row.resume_session_id,
@@ -689,6 +764,9 @@ function rowToAgent(row: any): Agent {
     updatedAt: row.updated_at,
     lastOutputAt: row.last_output_at,
     lastAttachedAt: row.last_attached_at,
+    ownerAgentId: row.owner_agent_id || null,
+    // notifyOwner mute: 1 → true, 0 → false, NULL/absent → true (default-notify).
+    notifyOwner: row.notify_owner === 0 ? false : true,
   };
 }
 
@@ -700,6 +778,43 @@ function rowToAgent(row: any): Agent {
 export function getDb(): Database.Database {
   if (!db) throw new Error('getDb() called before initDatabase()');
   return db;
+}
+
+/**
+ * Data-hygiene migration: rewrite stored `workspaces.default_command` values
+ * that are the legacy framework default *modulo a standalone `--chrome` token*
+ * down to the matching current framework default (DEFAULT_COMMAND /
+ * DEFAULT_COMMAND_WSL).
+ *
+ * A `default_command` qualifies ONLY if removing its standalone `--chrome`
+ * token(s) yields exactly a framework default — e.g.
+ * `claude --dangerously-skip-permissions --chrome` → DEFAULT_COMMAND, or
+ * `ccode --dangerously-skip-permissions --chrome` → DEFAULT_COMMAND_WSL. A
+ * genuinely-custom command that merely contains `--chrome`
+ * (e.g. `claude --dangerously-skip-permissions --chrome --foo`) does NOT
+ * reduce to a framework default and is left untouched.
+ *
+ * Idempotent: a row already equal to a framework default has no standalone
+ * `--chrome` token, so the strip is a no-op and the row is skipped. Exported so
+ * the migration can be unit-tested against an isolated DB handle.
+ */
+export function normalizeLegacyChromeDefaultCommands(database: Database.Database): void {
+  const rows = database
+    .prepare(`SELECT id, default_command FROM workspaces`)
+    .all() as { id: string; default_command: string | null }[];
+  const update = database.prepare(
+    `UPDATE workspaces SET default_command = ? WHERE id = ?`
+  );
+  for (const row of rows) {
+    const cmd = row.default_command ?? '';
+    // Drop standalone `--chrome` word tokens; collapse the surrounding
+    // whitespace so the result can be compared verbatim to a framework default.
+    const stripped = cmd.split(/\s+/).filter((tok) => tok !== '--chrome').join(' ').trim();
+    if (stripped === cmd) continue; // no standalone `--chrome` token present
+    if (stripped === DEFAULT_COMMAND || stripped === DEFAULT_COMMAND_WSL) {
+      update.run(stripped, row.id);
+    }
+  }
 }
 
 function queryAll(sql: string, params: any[] = []): any[] {
@@ -768,21 +883,28 @@ export function createAgent(data: {
   isSupervised?: boolean;
   isWorker?: boolean;
   isResearcher?: boolean;
+  privilegeLane?: 'supervisor';
+  // Bug 2 / Edit 2.6 — persist the codex-hook decision so the runner env gate is
+  // re-derivable from the stored row on reconcile. Defaults to false when absent.
+  wantsCodexHooks?: boolean;
   tmuxSessionName: string | null;
   autoRestartEnabled: boolean;
   logPath: string;
   templateId?: string | null;
   systemPrompt?: string | null;
+  ownerAgentId?: string | null;
+  // notifyOwner mute (default true). undefined/true → notify_owner = 1; false → 0.
+  notifyOwner?: boolean;
 }): Agent {
   const id = uuidv4();
   const slug = slugify(data.title);
   run(
     `INSERT INTO agents (id, workspace_id, title, slug, role_description, working_directory,
-      command, provider, is_supervisor, is_supervised, is_worker, is_researcher, tmux_session_name, auto_restart_enabled, log_path, template_id, system_prompt)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      command, provider, is_supervisor, is_supervised, is_worker, is_researcher, privilege_lane, wants_codex_hooks, tmux_session_name, auto_restart_enabled, log_path, template_id, system_prompt, owner_agent_id, notify_owner)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [id, data.workspaceId, data.title, slug, data.roleDescription, data.workingDirectory,
-      data.command, data.provider || 'claude', data.isSupervisor ? 1 : 0, data.isSupervised ? 1 : 0, data.isWorker ? 1 : 0, data.isResearcher ? 1 : 0, data.tmuxSessionName, data.autoRestartEnabled ? 1 : 0, data.logPath,
-      data.templateId || null, data.systemPrompt || null]
+      data.command, data.provider || 'claude', data.isSupervisor ? 1 : 0, data.isSupervised ? 1 : 0, data.isWorker ? 1 : 0, data.isResearcher ? 1 : 0, data.privilegeLane === 'supervisor' ? 'supervisor' : null, data.wantsCodexHooks ? 1 : 0, data.tmuxSessionName, data.autoRestartEnabled ? 1 : 0, data.logPath,
+      data.templateId || null, data.systemPrompt || null, data.ownerAgentId || null, data.notifyOwner === false ? 0 : 1]
   );
   return getAgent(id)!;
 }
@@ -803,6 +925,27 @@ export function getAllAgents(): Agent[] {
 export function getSupervisorAgent(workspaceId: string): Agent | null {
   const row = queryOne('SELECT * FROM agents WHERE workspace_id = ? AND is_supervisor = 1 ORDER BY created_at DESC LIMIT 1', [workspaceId]);
   return row ? rowToAgent(row) : null;
+}
+
+/**
+ * Resolve the agent that should RECEIVE `worker`'s lifecycle events.
+ * Returns a recipient that is NOT necessarily the owner:
+ *  1. Explicit owner edge (the launcher), if alive  → the owner.
+ *  2. Terminal/missing explicit owner               → structural supervisor backstop.
+ *  3. No owner edge but supervised                  → structural supervisor (legacy).
+ *  4. Otherwise                                     → null (unowned + unsupervised → drop).
+ * The backstop (2) is an operational visibility fallback only: it is NOT fanout
+ * and NOT a retry. Busy/compacted owners are NEVER routed here — they queue in
+ * EventBridge.deliver(); only a missing or terminal owner falls back.
+ */
+export function getOwnerForWorker(worker: Agent): Agent | null {
+  if (worker.ownerAgentId) {
+    const owner = getAgent(worker.ownerAgentId);
+    if (owner && !['done', 'crashed'].includes(owner.status)) return owner;
+    return getSupervisorAgent(worker.workspaceId); // terminal/missing-owner backstop (may be null)
+  }
+  if (worker.isSupervised) return getSupervisorAgent(worker.workspaceId);
+  return null;
 }
 
 export function getActiveAgents(): Agent[] {

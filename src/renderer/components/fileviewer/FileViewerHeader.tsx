@@ -35,9 +35,9 @@ export default function FileViewerHeader({ tabId, filePath, pathType, fileSize, 
   const saving = !!editState?.saving;
   const saveError = editState?.error;
   // Mode shown as active. Markdown tabs without an edit session display the
-  // default (WYSIWYG, now graduated out of beta) — FileContentArea creates the
-  // real tabEditState when the canvas mounts.
-  const mode: TabMode = editState?.mode ?? (isMarkdown ? 'wysiwyg' : 'view');
+  // default rendered View; the user picks Edit (WYSIWYG) or Source to start
+  // editing, which is when FileContentArea creates the real tabEditState.
+  const mode: TabMode = editState?.mode ?? 'view';
 
   const handleOpenInVSCode = async () => {
     if (workingDirectory) {
@@ -111,9 +111,22 @@ export default function FileViewerHeader({ tabId, filePath, pathType, fileSize, 
     void saveTab(tabId);
   };
 
-  // Build breadcrumb paths
-  const breadcrumbs = segments.map((seg, i) => {
-    const path = '/' + segments.slice(0, i + 1).join('/');
+  // Build breadcrumb paths. The absolute prefix up to the workspace folder is
+  // noise — show only the segments *after* the workspace root, keeping the full
+  // path for navigation. Falls back to the full path when the file isn't under
+  // the known workspace directory.
+  const wdSegments = (workingDirectory ?? '')
+    .replace(/\\/g, '/')
+    .split('/')
+    .filter(Boolean);
+  const underWorkspace =
+    wdSegments.length > 0 &&
+    segments.length > wdSegments.length &&
+    segments.slice(0, wdSegments.length).join('/').toLowerCase() ===
+      wdSegments.join('/').toLowerCase();
+  const relStart = underWorkspace ? wdSegments.length : 0;
+  const breadcrumbs = segments.slice(relStart).map((seg, i) => {
+    const path = '/' + segments.slice(0, relStart + i + 1).join('/');
     return { label: seg, path };
   });
 
@@ -181,8 +194,8 @@ export default function FileViewerHeader({ tabId, filePath, pathType, fileSize, 
               className={`ui-btn text-[13px] ${mode === 'wysiwyg' ? 'text-accent-blue' : ''}`}
               title="Edit in the WYSIWYG canvas"
             >
-              <Icons.Sparkles className="w-3 h-3" />
-              WYSIWYG
+              <Icons.PenLine className="w-3 h-3" />
+              Edit
             </button>
             <button
               onClick={() => { void switchMode('source'); }}

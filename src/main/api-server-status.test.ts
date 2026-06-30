@@ -165,6 +165,72 @@ test('POST /api/agents/:id/status with full v7 meta → non-legacy event, ts pas
   }
 });
 
+test('POST /api/agents/:id/status with full waiting body → applied, excerpt + notificationType threaded', async () => {
+  const agent = makeAgent('a-w');
+  const h = makeApi({ agent });
+  try {
+    const res = await callRoute(h.api, 'POST', '/api/agents/a-w/status', {
+      state: 'waiting',
+      source: 'hook-notification',
+      ts: 1717171717999,
+      hookEventName: 'Notification',
+      excerpt: 'pick one',
+      notificationType: 'permission_prompt',
+    });
+    assert.equal(res.status, 200, `expected 200; got ${res.status} body=${JSON.stringify(res.body)}`);
+    assert.equal(h.recorded.length, 1);
+    const { event } = h.recorded[0];
+    assert.equal(event.state, 'waiting');
+    assert.equal(event.source, 'hook-notification');
+    assert.equal(event.legacy, false, 'a waiting body with hookEventName+ts is NOT legacy');
+    assert.equal(event.ts, 1717171717999, 'waiting ts is passed through verbatim');
+    assert.equal(event.hookEventName, 'Notification');
+    assert.equal((event as any).waitingExcerpt, 'pick one', 'the excerpt rides onto the event as waitingExcerpt');
+    assert.equal((event as any).notificationType, 'permission_prompt', 'notificationType is threaded onto the event');
+    assert.equal(res.body.result, 'applied', 'the applier verdict rides on the response');
+    assert.equal(res.body.state, 'waiting');
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('POST /api/agents/:id/status with legacy waiting body (no ts/hookEventName) synthesizes hookEventName="Notification"', async () => {
+  const agent = makeAgent('a-wl');
+  const h = makeApi({ agent });
+  try {
+    const res = await callRoute(h.api, 'POST', '/api/agents/a-wl/status', {
+      state: 'waiting',
+      source: 'hook-notification',
+      excerpt: 'needs human input',
+    });
+    assert.equal(res.status, 200, `expected 200; got ${res.status} body=${JSON.stringify(res.body)}`);
+    assert.equal(h.recorded.length, 1);
+    const { event } = h.recorded[0];
+    assert.equal(event.state, 'waiting');
+    assert.equal(event.legacy, true, 'a waiting body without hookEventName/ts is legacy');
+    assert.equal(event.hookEventName, 'Notification', 'legacy waiting synthesizes the Notification event name');
+    assert.equal((event as any).waitingExcerpt, 'needs human input', 'the excerpt is still threaded on the legacy path');
+    assert.equal(res.body.result, 'applied');
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('POST /api/agents/:id/status with state="banana" returns 400 and dispatches nothing', async () => {
+  const agent = makeAgent('a-b');
+  const h = makeApi({ agent });
+  try {
+    const res = await callRoute(h.api, 'POST', '/api/agents/a-b/status', {
+      state: 'banana',
+      source: 'whatever',
+    });
+    assert.equal(res.status, 400, `expected 400; got ${res.status}`);
+    assert.equal(h.recorded.length, 0, 'no supervisor dispatch on a genuinely-unknown state');
+  } finally {
+    h.cleanup();
+  }
+});
+
 test('POST /api/agents/:id/status with state="bogus" returns 400 and dispatches nothing', async () => {
   const agent = makeAgent('a-3');
   const h = makeApi({ agent });
@@ -193,6 +259,124 @@ test('POST /api/agents/:id/status with unknown agent returns 404', async () => {
   } finally {
     h.cleanup();
   }
+});
+
+// ── POST /input transient-subscription wiring (tests 15–20 + unconfirmed) ──
+
+interface InputApiCalls {
+  register: Array<{ targetAgentId: string; subscriberAgentId: string; ttlMs?: number }>;
+  cancel: Array<{ targetAgentId: string; subscriberAgentId: string }>;
+  sendInput: Array<{ agentId: string; text: string }>;
+  sendInputConfirmed: Array<{ agentId: string; text: string }>;
+}
+
+function makeInputApi(opts: {
+  agent: Agent;
+  registerResult?: { registered: boolean; reason?: string };
+  confirmedResult?: { delivered: boolean; confirmed: boolean; mode: string };
+  confirmedThrows?: Error;
+  inputInFlight?: boolean;
+}): { api: ApiServer; calls: InputApiCalls; cleanup: () => void } {
+  const agents = new Map<string, Agent>([[opts.agent.id, opts.agent]]);
+  const restoreDb = patchDb(agents);
+  const calls: InputApiCalls = { register: [], cancel: [], sendInput: [], sendInputConfirmed: [] };
+  const fakeSupervisor = {
+    isInputInFlight: () => opts.inputInFlight ?? false,
+    registerTransientTurnSubscription: (input: { targetAgentId: string; subscriberAgentId: string; ttlMs?: number }) => {
+      calls.register.push(input);
+      return opts.registerResult ?? { registered: true };
+    },
+    cancelTransientTurnSubscriptionsForPair: (targetAgentId: string, subscriberAgentId: string) => {
+      calls.cancel.push({ targetAgentId, subscriberAgentId });
+    },
+    sendInputConfirmed: async (agentId: string, text: string) => {
+      calls.sendInputConfirmed.push({ agentId, text });
+      if (opts.confirmedThrows) throw opts.confirmedThrows;
+      return opts.confirmedResult ?? { delivered: true, confirmed: true, mode: 'hook' };
+    },
+    sendInput: async (agentId: string, text: string) => { calls.sendInput.push({ agentId, text }); },
+    getContextStats: () => null,
+  } as unknown as AgentSupervisor;
+  const api = new ApiServer(fakeSupervisor, 24678);
+  return { api, calls, cleanup: () => { restoreDb(); } };
+}
+
+test('15. confirmed send with sender_agent_id → transientSubscription registered, registry called once', async () => {
+  const h = makeInputApi({ agent: makeAgent('a-1', { status: 'idle' }) });
+  try {
+    const res = await callRoute(h.api, 'POST', '/api/agents/a-1/input', { text: 'hi', confirm: true, sender_agent_id: 'sup-x' });
+    assert.equal(res.status, 200, `expected 200; got ${res.status} body=${JSON.stringify(res.body)}`);
+    assert.equal(res.body.transientSubscription.registered, true, 'response surfaces registered:true');
+    assert.equal(h.calls.register.length, 1, 'registry called exactly once');
+    assert.deepEqual(h.calls.register[0], { targetAgentId: 'a-1', subscriberAgentId: 'sup-x' });
+  } finally { h.cleanup(); }
+});
+
+test('16. 409 (target working) send → throws 409, registry NEVER called', async () => {
+  const h = makeInputApi({ agent: makeAgent('a-1', { status: 'working' }) });
+  try {
+    const res = await callRoute(h.api, 'POST', '/api/agents/a-1/input', { text: 'hi', confirm: true, sender_agent_id: 'sup-x' });
+    assert.equal(res.status, 409, `expected 409; got ${res.status}`);
+    assert.equal(h.calls.register.length, 0, 'no registration on a 409-gated send');
+  } finally { h.cleanup(); }
+});
+
+test('17. SubmitNotConfirmedError → 502 and cancelTransientTurnSubscriptionsForPair called once', async () => {
+  const err = Object.assign(new Error('never started'), { name: 'SubmitNotConfirmedError' });
+  const h = makeInputApi({ agent: makeAgent('a-1', { status: 'idle' }), confirmedThrows: err });
+  try {
+    const res = await callRoute(h.api, 'POST', '/api/agents/a-1/input', { text: 'hi', confirm: true, sender_agent_id: 'sup-x' });
+    assert.equal(res.status, 502, `expected 502; got ${res.status}`);
+    assert.equal(h.calls.register.length, 1, 'subscription was registered before the throw');
+    assert.equal(h.calls.cancel.length, 1, 'subscription cancelled on the throw');
+    assert.deepEqual(h.calls.cancel[0], { targetAgentId: 'a-1', subscriberAgentId: 'sup-x' });
+  } finally { h.cleanup(); }
+});
+
+test('18. submit:false body → registry not called; transientSubscription.registered false', async () => {
+  const h = makeInputApi({ agent: makeAgent('a-1', { status: 'idle' }) });
+  try {
+    const res = await callRoute(h.api, 'POST', '/api/agents/a-1/input', { text: 'hi', submit: false, sender_agent_id: 'sup-x' });
+    assert.equal(res.status, 200, `expected 200; got ${res.status} body=${JSON.stringify(res.body)}`);
+    assert.equal(h.calls.register.length, 0, 'submit:false does not subscribe');
+    assert.equal(res.body.transientSubscription.registered, false);
+  } finally { h.cleanup(); }
+});
+
+test('19. no sender_agent_id → registry not called', async () => {
+  const h = makeInputApi({ agent: makeAgent('a-1', { status: 'idle' }) });
+  try {
+    const res = await callRoute(h.api, 'POST', '/api/agents/a-1/input', { text: 'hi', confirm: true });
+    assert.equal(res.status, 200, `expected 200; got ${res.status} body=${JSON.stringify(res.body)}`);
+    assert.equal(h.calls.register.length, 0, 'no sender id → no subscription');
+    assert.equal(res.body.transientSubscription.registered, false);
+  } finally { h.cleanup(); }
+});
+
+test('20. registry returns not-privileged → response surfaces it verbatim (pass-through)', async () => {
+  const h = makeInputApi({ agent: makeAgent('a-1', { status: 'idle' }), registerResult: { registered: false, reason: 'not-privileged' } });
+  try {
+    const res = await callRoute(h.api, 'POST', '/api/agents/a-1/input', { text: 'hi', confirm: true, sender_agent_id: 'plain' });
+    assert.equal(res.status, 200, `expected 200; got ${res.status} body=${JSON.stringify(res.body)}`);
+    assert.equal(h.calls.register.length, 1, 'registry consulted (gate lives there)');
+    assert.equal(res.body.transientSubscription.registered, false);
+    assert.equal(res.body.transientSubscription.reason, 'not-privileged');
+  } finally { h.cleanup(); }
+});
+
+test('17b. unconfirmed RESULT (not a throw) returns normally and KEEPS the subscription', async () => {
+  const h = makeInputApi({
+    agent: makeAgent('a-1', { status: 'idle' }),
+    confirmedResult: { delivered: true, confirmed: false, mode: 'unconfirmed' },
+  });
+  try {
+    const res = await callRoute(h.api, 'POST', '/api/agents/a-1/input', { text: 'hi', confirm: true, sender_agent_id: 'sup-x' });
+    assert.equal(res.status, 200, `expected 200; got ${res.status} body=${JSON.stringify(res.body)}`);
+    assert.equal(res.body.confirmed, false, 'result is unconfirmed');
+    assert.equal(res.body.transientSubscription.registered, true, 'subscription kept on an unconfirmed result');
+    assert.equal(h.calls.cancel.length, 0, 'unconfirmed result does NOT cancel (start-watchdog handles it)');
+    assert.equal(h.calls.register.length, 1);
+  } finally { h.cleanup(); }
 });
 
 // ── Runner ───────────────────────────────────────────────────────────

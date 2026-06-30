@@ -90,6 +90,7 @@ function makeAgent(over: Partial<Agent> = {}): Agent {
     updatedAt: '2026-06-12 00:00:00',
     lastOutputAt: null,
     lastAttachedAt: null,
+    ownerAgentId: null,
     ...over,
   };
 }

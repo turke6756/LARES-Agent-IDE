@@ -88,7 +88,6 @@ interface TabEditState {
 interface DashboardState {
   workspaces: Workspace[];
   agents: Agent[];
-  supervisorAgent: Agent | null;
   selectedWorkspaceId: string | null;
   selectedAgentId: string | null;
   terminalAgentId: string | null;
@@ -100,6 +99,11 @@ interface DashboardState {
   fileActivities: FileActivity[];
   workspaceHeat: Record<string, WorkspaceHeat>;
   contextStats: Record<string, ContextStats>;
+  // Supervisor ids that currently own an active orchestration deliberation
+  // (e.g. groupthink). Synced from the main process; OR'd into the owner-
+  // container pulse so the border keeps animating through the idle gaps
+  // between deliberation turns, not just on per-agent status flips.
+  deliberatingSupervisorIds: string[];
 
   // Teams
   teams: Team[];
@@ -139,10 +143,9 @@ interface DashboardState {
   addFileActivity: (activity: FileActivity) => void;
   updateWorkspaceHeat: () => void;
   updateContextStats: (stats: ContextStats) => void;
+  setDeliberatingSupervisorIds: (ids: string[]) => void;
   forkAgent: (id: string) => Promise<Agent | null>;
   queryAgent: (targetAgentId: string, question: string, sourceAgentId?: string) => Promise<QueryResult | null>;
-  loadSupervisor: (workspaceId: string) => Promise<void>;
-  launchSupervisor: (workspaceId: string) => Promise<Agent | null>;
 
   // Team actions
   loadTeams: (workspaceId: string) => Promise<void>;
@@ -155,6 +158,7 @@ interface DashboardState {
   // Tab actions
   openTab: (filePath: string, rootDirectory: string, pathType: PathType, agentId?: string, workspaceId?: string) => void;
   openDirectoryTab: (rootDirectory: string, pathType: PathType, workspaceId?: string) => void;
+  openToolTab: (toolId: string, label: string, workspaceId?: string) => void;
   closeTab: (tabId: string) => void;
   // Detachable file tabs (detachable-file-tabs-plan §4 1.7).
   detachTab: (tabId: string) => void;
@@ -192,7 +196,6 @@ interface DashboardState {
 export const useDashboardStore = create<DashboardState>((set, get) => ({
   workspaces: [],
   agents: [],
-  supervisorAgent: null,
   selectedWorkspaceId: null,
   selectedAgentId: null,
   terminalAgentId: null,
@@ -204,6 +207,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
   fileActivities: [],
   workspaceHeat: {},
   contextStats: {},
+  deliberatingSupervisorIds: [],
   teams: [],
   teamMessages: {},
 
@@ -295,6 +299,38 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
       pathType,
       workspaceId: ws,
       label,
+    };
+    set((state) => ({
+      openTabs: [...state.openTabs, tab],
+      activeTabId: tab.id,
+      fileViewerOpen: true,
+      browserOpen: false,
+    }));
+  },
+
+  // A non-file "tool" tab (e.g. the Context-Overhead Analyzer) living inside the
+  // Files view. One per (workspace, toolId): re-focuses if already open. Empty
+  // filePath/rootDirectory so the file header + directory tree never render
+  // (FileViewerPanel gates on kind==='tool').
+  openToolTab: (toolId, label, workspaceId?) => {
+    const { openTabs, selectedWorkspaceId } = get();
+    const ws = workspaceId ?? selectedWorkspaceId ?? undefined;
+    const existing = openTabs.find(
+      (t) => t.kind === 'tool' && t.toolId === toolId && t.workspaceId === ws,
+    );
+    if (existing) {
+      set({ activeTabId: existing.id, fileViewerOpen: true, browserOpen: false });
+      return;
+    }
+    const tab: FileTab = {
+      id: nextTabId(),
+      filePath: '',
+      rootDirectory: '',
+      pathType: 'windows',
+      workspaceId: ws,
+      label,
+      kind: 'tool',
+      toolId,
     };
     set((state) => ({
       openTabs: [...state.openTabs, tab],
@@ -842,16 +878,18 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
   },
 
   loadAgents: async (workspaceId: string) => {
-    const allAgents = await window.api.agents.list(workspaceId);
-    const agents = allAgents.filter((a) => !a.isSupervisor);
-    const supervisorAgent = allAgents.find((a) => a.isSupervisor) || null;
-    set({ agents, supervisorAgent });
+    // Supervisors (structural isSupervisor, and privilege-lane personas) now
+    // stay in `agents` so each renders as its own grid card; their launched
+    // workers nest beneath them via ownerAgentId (buildAgentForest). No more
+    // header-singleton collapse.
+    const agents = await window.api.agents.list(workspaceId);
+    set({ agents });
     get().updateWorkspaceHeat();
   },
 
   loadAllAgents: async () => {
-    const allAgents = await window.api.agents.listAll();
-    const agents = allAgents.filter((a) => !a.isSupervisor);
+    // All-workspaces view: same as loadAgents — supervisors are real cards now.
+    const agents = await window.api.agents.listAll();
     set({ agents });
     get().updateWorkspaceHeat();
   },
@@ -894,25 +932,22 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
   updateAgent: (agent) => {
     const { selectedWorkspaceId } = get();
     if (agent.workspaceId !== selectedWorkspaceId) return;
-    if (agent.isSupervisor) {
-      set({ supervisorAgent: agent });
-    } else {
-      set((state) => {
-        const exists = state.agents.some((a) => a.id === agent.id);
-        return {
-          agents: exists
-            ? state.agents.map((a) => (a.id === agent.id ? agent : a))
-            : [...state.agents, agent],
-        };
-      });
-    }
+    // Supervisors are ordinary cards now — upsert them into `agents` like any
+    // other agent (no special supervisorAgent branch).
+    set((state) => {
+      const exists = state.agents.some((a) => a.id === agent.id);
+      return {
+        agents: exists
+          ? state.agents.map((a) => (a.id === agent.id ? agent : a))
+          : [...state.agents, agent],
+      };
+    });
   },
 
   removeAgent: (id) => {
     clearDraft(id);
     set((state) => ({
       agents: state.agents.filter((a) => a.id !== id),
-      supervisorAgent: state.supervisorAgent?.id === id ? null : state.supervisorAgent,
       selectedAgentId: state.selectedAgentId === id ? null : state.selectedAgentId,
       terminalAgentId: state.terminalAgentId === id ? null : state.terminalAgentId,
     }));
@@ -979,54 +1014,23 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
     }
   },
 
-  loadSupervisor: async (workspaceId: string) => {
-    try {
-      const sup = await window.api.agents.getSupervisor(workspaceId);
-      set({ supervisorAgent: sup });
-    } catch (err) {
-      console.error('Failed to load supervisor:', err);
-    }
-  },
-
-  launchSupervisor: async (workspaceId: string) => {
-    const workspace = get().workspaces.find((w) => w.id === workspaceId);
-    // If one already exists and is alive, just select it
-    const existing = get().supervisorAgent;
-    if (existing && !['done', 'crashed'].includes(existing.status)) {
-      get().selectAgent(existing.id);
-      get().setTerminalAgent(existing.id);
-      return existing;
-    }
-
-    try {
-      const agent = await window.api.agents.launch({
-        workspaceId,
-        title: 'Supervisor',
-        roleDescription: 'Autonomous supervisor agent — coordinates workers, approves continuations, manages context.',
-        isSupervisor: true,
-        provider: 'claude',
-        autoRestartEnabled: true,
-      });
-      set({ supervisorAgent: agent });
-      if (workspace?.pathType === 'wsl') {
-        await get().checkHealth();
-      }
-      return agent;
-    } catch (err) {
-      console.error('Failed to launch supervisor:', err);
-      // Refresh in case it was already running but our state was stale
-      await get().loadSupervisor(workspaceId);
-      if (workspace?.pathType === 'wsl') {
-        await get().checkHealth();
-      }
-      return null;
-    }
-  },
-
   updateContextStats: (stats: ContextStats) => {
     set((state) => ({
       contextStats: { ...state.contextStats, [stats.agentId]: stats },
     }));
+  },
+
+  // Replace the active-deliberation set wholesale — the main-process payload is
+  // authoritative. Skip the state write when the set is unchanged so subscribed
+  // components don't re-render on redundant broadcasts.
+  setDeliberatingSupervisorIds: (ids: string[]) => {
+    set((state) => {
+      const prev = state.deliberatingSupervisorIds;
+      if (prev.length === ids.length && prev.every((id) => ids.includes(id))) {
+        return {};
+      }
+      return { deliberatingSupervisorIds: ids };
+    });
   },
 
   // ── Team actions ───────────────────────────────────────────────────────

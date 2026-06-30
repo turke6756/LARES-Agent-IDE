@@ -62,6 +62,174 @@ function ruleDescriptor(r: {
   return `${scheme}://${host}${path}`;
 }
 
+// ── Signed-in capability: the 4-point consent gate (WI-5) ─────────────────────
+// EVERY path that grants `allow_signed_in` (the per-row toggle AND the
+// access-request "Approve + allow signed in") routes through this dialog FIRST,
+// so the durable `consent_acked_at` stamp can never be created without the human
+// acknowledging what sharing a signed-in session means. It is a one-time gate
+// (consent is durable on the rule) — the JIT banner shown later is a reminder,
+// not a re-consent. `label` names the origin the capability applies to.
+function SignedInConsentDialog({
+  label,
+  onAcknowledge,
+  onCancel,
+}: {
+  label: string;
+  onAcknowledge: () => void;
+  onCancel: () => void;
+}) {
+  return (
+    <div className="ml-8 rounded-md border border-accent-orange/50 bg-accent-orange/10 p-3 flex flex-col gap-2">
+      <div className="flex items-center gap-2">
+        <Icons.KeyRound className="w-4 h-4 text-accent-orange shrink-0" />
+        <div className="text-[12px] font-semibold text-fg-primary">
+          Allow agents to use a signed-in session on{' '}
+          <span className="font-mono">{label}</span>?
+        </div>
+      </div>
+      <ul className="list-disc pl-6 space-y-0.5 text-[11px] text-fg-secondary">
+        <li>This session is shared by every agent in this workspace.</li>
+        <li>It persists across app restarts.</li>
+        <li>It stays durable until you sign out of the site or clear the session.</li>
+        <li>This is the agent browser — not your private/personal browser.</li>
+        <li>
+          Turning this on will <strong>copy your current login for this site</strong> from your own
+          browser into the agents' shared session (cookie-based — sites that store login outside
+          cookies, e.g. Google SSO, may still need the Sign-in path).
+        </li>
+      </ul>
+      <div className="flex items-center gap-2">
+        <button
+          onClick={onAcknowledge}
+          className="ui-btn px-3 py-1 text-[11px] font-semibold bg-accent-orange text-white border border-accent-orange hover:bg-accent-orange/90"
+        >
+          <Icons.Check className="w-3.5 h-3.5" />
+          I understand — allow signed-in
+        </button>
+        <button onClick={onCancel} className="ui-btn ui-btn-ghost px-3 py-1 text-[11px]">
+          Cancel
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// Login-URL patterns are GLOB or plain SUBSTRING only — never arbitrary regex
+// (plans/SignedInTabs_Implementation.md WI-2(c)/WI-5). Reject any line carrying a
+// regex metacharacter so a typo'd pattern can't silently become a catch-all (or
+// a ReDoS) on the main-side warm-expiry heuristic. `*`/`?` are allowed as glob
+// wildcards. Returns an error string for the first bad line, or null if all OK.
+const REGEX_METACHARS = /[\\^$+|()[\]{}]/;
+export function validateLoginUrlPatterns(lines: string[]): string | null {
+  for (const raw of lines) {
+    const p = raw.trim();
+    if (!p) continue;
+    if (p.length > 200) return `Pattern "${p.slice(0, 24)}…" is too long.`;
+    if (REGEX_METACHARS.test(p)) {
+      return `"${p}" looks like a regular expression — use a glob (*) or a plain substring instead.`;
+    }
+  }
+  return null;
+}
+
+/** Split a textarea value into trimmed, non-empty pattern lines. */
+export function parseLoginUrlPatterns(text: string): string[] {
+  return text
+    .split('\n')
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0);
+}
+
+// ── Per-rule login-URL patterns editor (WI-5) ─────────────────────────────────
+// An optional, collapsed-by-default textarea (one glob/substring per line) that
+// tunes the main-side warm-expiry heuristic for false-positive-prone SSO / job
+// boards. The default heuristic runs everywhere; these only EXTEND it. The UI
+// validates aggressively (no arbitrary regex) before persisting.
+function LoginUrlPatternsEditor({ rule }: { rule: AccessRule }) {
+  const updateAccessRule = useBrowserStore((s) => s.updateAccessRule);
+  const [open, setOpen] = useState(false);
+  const [text, setText] = useState(() => (rule.loginUrlPatterns ?? []).join('\n'));
+  const [error, setError] = useState<string | null>(null);
+  const [saved, setSaved] = useState(false);
+
+  const count = rule.loginUrlPatterns?.length ?? 0;
+
+  const save = () => {
+    const patterns = parseLoginUrlPatterns(text);
+    const err = validateLoginUrlPatterns(patterns);
+    if (err) {
+      setError(err);
+      setSaved(false);
+      return;
+    }
+    setError(null);
+    setSaved(true);
+    void updateAccessRule(rule.id, { loginUrlPatterns: patterns });
+  };
+
+  return (
+    <div className="pl-8 flex flex-col gap-1.5">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+        className="flex items-center gap-1.5 text-left text-[11px] text-fg-secondary hover:text-fg-primary"
+        title="Tune which URLs count as a login wall for this site"
+      >
+        {open ? (
+          <Icons.ChevronDown className="w-3.5 h-3.5" />
+        ) : (
+          <Icons.ChevronRight className="w-3.5 h-3.5" />
+        )}
+        Login-URL patterns
+        {count > 0 && (
+          <span className="inline-flex items-center justify-center min-w-[16px] h-[16px] px-1 rounded-full text-[9px] font-bold bg-tab-border text-fg-secondary">
+            {count}
+          </span>
+        )}
+      </button>
+      {open && (
+        <div className="flex flex-col gap-1.5">
+          <div className="text-[10px] text-fg-muted">
+            One glob or substring per line (e.g. <span className="font-mono">*/candidate/*</span> or{' '}
+            <span className="font-mono">/sso</span>). Wildcards <span className="font-mono">*</span>{' '}
+            and <span className="font-mono">?</span> are allowed — regular expressions are not.
+          </div>
+          <textarea
+            value={text}
+            spellCheck={false}
+            rows={3}
+            onChange={(e) => {
+              setText(e.target.value);
+              setError(null);
+              setSaved(false);
+            }}
+            placeholder={'*/login*\n/sso'}
+            className="w-full bg-[var(--color-surface-0)] border border-tab-border px-2 py-1.5 text-[11px] font-mono text-fg-primary placeholder-fg-muted focus:outline-none focus:border-accent-blue/60 resize-y"
+          />
+          {error && (
+            <div className="flex items-center gap-1.5 text-[11px] text-accent-red">
+              <Icons.AlertCircle className="w-3.5 h-3.5 shrink-0" />
+              <span>{error}</span>
+            </div>
+          )}
+          <div className="flex items-center gap-2">
+            <button onClick={save} className="ui-btn ui-btn-outline px-2 py-1 text-[11px]">
+              Save patterns
+            </button>
+            {saved && !error && (
+              <span className="inline-flex items-center gap-1 text-[10px] text-accent-green">
+                <Icons.Check className="w-3 h-3" />
+                Saved
+              </span>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── Add-rule form ─────────────────────────────────────────────────────────────
 function AddRuleForm() {
   const addAccessRule = useBrowserStore((s) => s.addAccessRule);
@@ -189,8 +357,12 @@ function RuleRow({ rule }: { rule: AccessRule }) {
   const removeAccessRule = useBrowserStore((s) => s.removeAccessRule);
   const beginSigninHandoff = useBrowserStore((s) => s.beginSigninHandoff);
   const clearSiteSession = useBrowserStore((s) => s.clearSiteSession);
+  const grantSignedInConsent = useBrowserStore((s) => s.grantSignedInConsent);
+  const importUserSession = useBrowserStore((s) => s.importUserSession);
 
   const [confirmingOff, setConfirmingOff] = useState(false);
+  // WI-5: turning the capability ON routes through the 4-point consent first.
+  const [consenting, setConsenting] = useState(false);
 
   const toggleSignedIn = () => {
     if (rule.allowSignedIn) {
@@ -198,7 +370,9 @@ function RuleRow({ rule }: { rule: AccessRule }) {
       // (no silent auto-clear — §15/Q5).
       setConfirmingOff(true);
     } else {
-      void updateAccessRule(rule.id, { allowSignedIn: true });
+      // Turning ON must not persist `allow_signed_in` until the human
+      // acknowledges the 4-point consent (which stamps consent_acked_at).
+      setConsenting(true);
     }
   };
 
@@ -284,6 +458,27 @@ function RuleRow({ rule }: { rule: AccessRule }) {
         )}
       </div>
 
+      {/* WI-5: the 4-point consent gate, shown before the capability persists. */}
+      {consenting && (
+        <SignedInConsentDialog
+          label={ruleDescriptor(rule)}
+          onAcknowledge={() => {
+            setConsenting(false);
+            void (async () => {
+              await grantSignedInConsent(rule.id);
+              // WI-E: the user's mental model is "toggling it on pulled my
+              // credentials" — auto-attempt the import once consent is granted +
+              // allowSignedIn persisted. Best-effort; never blocks the toggle.
+              void importUserSession(rule.id);
+            })();
+          }}
+          onCancel={() => setConsenting(false)}
+        />
+      )}
+
+      {/* WI-5: per-rule login-URL patterns — only meaningful once signed-in is on. */}
+      {rule.allowSignedIn && <LoginUrlPatternsEditor rule={rule} />}
+
       {confirmingOff && (
         <div className="ml-8 rounded-md border border-accent-orange/40 bg-accent-orange/10 p-2.5 flex flex-col gap-2">
           <div className="text-[11px] text-fg-primary">
@@ -319,7 +514,13 @@ function RuleRow({ rule }: { rule: AccessRule }) {
 // ── A single agent request row (§18.4) ────────────────────────────────────────
 function RequestRow({ request }: { request: AccessRequest }) {
   const decideAccessRequest = useBrowserStore((s) => s.decideAccessRequest);
+  const approveSignedInWithConsent = useBrowserStore((s) => s.approveSignedInWithConsent);
   const decide = (decision: AccessRequestDecision) => void decideAccessRequest(request.id, decision);
+
+  // WI-5: "Approve + allow signed in" must route through the SAME 4-point consent
+  // as the toggle — approving an agent request can't mint signed-in capability
+  // without it. The plain "Approve (visit)" / "Deny" paths are unchanged.
+  const [consenting, setConsenting] = useState(false);
 
   return (
     <div className="rounded-md border border-accent-orange/50 bg-accent-orange/10 px-3 py-2.5 flex flex-col gap-2">
@@ -366,7 +567,7 @@ function RequestRow({ request }: { request: AccessRequest }) {
           Approve (visit)
         </button>
         <button
-          onClick={() => decide('approve_signed_in')}
+          onClick={() => setConsenting(true)}
           className="ui-btn px-2.5 py-1 text-[11px] font-semibold bg-accent-orange text-white border border-accent-orange hover:bg-accent-orange/90"
           title="Create the rule AND allow the agent to drive a signed-in session — you still sign in / hand off separately"
         >
@@ -382,6 +583,17 @@ function RequestRow({ request }: { request: AccessRequest }) {
           Deny
         </button>
       </div>
+
+      {consenting && (
+        <SignedInConsentDialog
+          label={ruleDescriptor(request)}
+          onAcknowledge={() => {
+            setConsenting(false);
+            void approveSignedInWithConsent(request);
+          }}
+          onCancel={() => setConsenting(false)}
+        />
+      )}
     </div>
   );
 }
@@ -487,12 +699,23 @@ function SignedInOriginRow({ origin }: { origin: SignedInOrigin }) {
   const clearSiteSession = useBrowserStore((s) => s.clearSiteSession);
   const updateAccessRule = useBrowserStore((s) => s.updateAccessRule);
   const beginSigninHandoff = useBrowserStore((s) => s.beginSigninHandoff);
+  const importUserSession = useBrowserStore((s) => s.importUserSession);
 
   // Asymmetric confirmation (mirror of the allowSignedIn ON→OFF flow): the
   // destructive clear requires an explicit confirm, cancel is the easy path.
   const [confirmingClear, setConfirmingClear] = useState(false);
+  // WI-E: the quiet "no saved login found" notice shown after an import that
+  // copied zero cookies (the row stays never/expired and falls back to Sign in).
+  const [importNotice, setImportNotice] = useState(false);
 
-  const reSignIn = () => {
+  // Proactive-signin (2026-06-29): three lifecycle states. Fall back to the
+  // legacy `stale` flag when an older payload omits `state` so this row stays
+  // correct against a not-yet-upgraded main process.
+  const rowState: 'signed_in' | 'expired' | 'never' =
+    origin.state ?? (origin.stale ? 'expired' : 'signed_in');
+  const neverSignedIn = rowState === 'never';
+
+  const signIn = () => {
     // Reuse the persisted rule when present so the hand-off carries its real
     // identity; fall back to a minimal shape (id + hostname are all the flow
     // needs) if the rule list hasn't loaded the row yet.
@@ -502,19 +725,56 @@ function SignedInOriginRow({ origin }: { origin: SignedInOrigin }) {
     void beginSigninHandoff(rule);
   };
 
+  // WI-E "Import my session": copy the human's existing login for this site from
+  // their own browser (persist:user) into the agents' shared session. On a
+  // zero-cookie result the row stays as-is and we surface the Sign-in fallback.
+  const importSession = async () => {
+    setImportNotice(false);
+    const result = await importUserSession(origin.ruleId);
+    if (result.imported === 0) setImportNotice(true);
+  };
+
   return (
     <div className="rounded-md border border-[var(--color-browser-divider)] bg-[var(--color-surface-0)] px-3 py-2 flex flex-col gap-2">
       <div className="flex items-center gap-3">
-        <Icons.KeyRound className="w-4 h-4 text-accent-orange shrink-0" />
+        <Icons.KeyRound
+          className={`w-4 h-4 shrink-0 ${rowState === 'signed_in' ? 'text-accent-green' : 'text-accent-orange'}`}
+        />
         <div className="flex-1 min-w-0">
           <div className="text-[12px] font-mono text-fg-primary truncate">{origin.hostname}</div>
-          <div className="text-[10px] text-fg-muted">
-            signed in {relTime(origin.signedInAt)} · last used {relTime(origin.lastUsedAt)}
+          <div
+            className={`text-[10px] ${rowState === 'signed_in' ? 'text-accent-green' : 'text-fg-muted'}`}
+          >
+            {neverSignedIn ? (
+              'Not signed in'
+            ) : (
+              <>signed in {relTime(origin.signedInAt)} · last used {relTime(origin.lastUsedAt)}</>
+            )}
           </div>
         </div>
-        {origin.stale && (
+        {(neverSignedIn || rowState === 'expired') && (
           <button
-            onClick={reSignIn}
+            onClick={() => void importSession()}
+            className="shrink-0 inline-flex items-center gap-1 px-2.5 py-1 rounded text-[11px] font-semibold border border-accent-orange bg-accent-orange/15 text-accent-orange hover:bg-accent-orange/25"
+            title="Copy your current login for this site from your own browser into the agents' shared session (a point-in-time snapshot)"
+          >
+            <Icons.Download className="w-3.5 h-3.5" />
+            Import my session
+          </button>
+        )}
+        {neverSignedIn && (
+          <button
+            onClick={signIn}
+            className="shrink-0 inline-flex items-center gap-1 px-2.5 py-1 rounded text-[11px] font-semibold border border-accent-orange/60 bg-accent-orange/10 text-accent-orange hover:bg-accent-orange/20"
+            title="Open a tab to sign in once — every agent in this workspace inherits the session"
+          >
+            <Icons.LogIn className="w-3.5 h-3.5" />
+            Sign in
+          </button>
+        )}
+        {rowState === 'expired' && (
+          <button
+            onClick={signIn}
             className="shrink-0 inline-flex items-center gap-1 px-2 py-1 rounded text-[10px] font-semibold border border-accent-orange/60 bg-accent-orange/10 text-accent-orange hover:bg-accent-orange/20"
             title="This stored session looks stale — sign in again to refresh it"
           >
@@ -523,6 +783,13 @@ function SignedInOriginRow({ origin }: { origin: SignedInOrigin }) {
           </button>
         )}
       </div>
+
+      {importNotice && (
+        <div className="ml-7 text-[10px] text-fg-muted">
+          No saved login found in your browser for this site — click Sign in to log in inside an
+          agent tab.
+        </div>
+      )}
 
       <div className="flex items-center gap-2 pl-7">
         <button
@@ -533,14 +800,16 @@ function SignedInOriginRow({ origin }: { origin: SignedInOrigin }) {
           <Icons.ShieldOff className="w-3.5 h-3.5" />
           Disable signed-in access
         </button>
-        <button
-          onClick={() => setConfirmingClear(true)}
-          className="ui-btn ui-btn-ghost px-2 py-1 text-[11px] hover:text-accent-red"
-          title="Wipe the agent's stored session for this site"
-        >
-          <Icons.Trash2 className="w-3.5 h-3.5" />
-          Clear site session
-        </button>
+        {!neverSignedIn && (
+          <button
+            onClick={() => setConfirmingClear(true)}
+            className="ui-btn ui-btn-ghost px-2 py-1 text-[11px] hover:text-accent-red"
+            title="Wipe the agent's stored session for this site"
+          >
+            <Icons.Trash2 className="w-3.5 h-3.5" />
+            Clear site session
+          </button>
+        )}
       </div>
 
       {confirmingClear && (
@@ -602,10 +871,80 @@ function SessionsSharedSection() {
             <HandedTabRow key={tab.tabId} tab={tab} />
           ))}
           {signedInOrigins.map((origin) => (
-            <SignedInOriginRow key={origin.ruleId} origin={origin} />
+            <SignedInOriginRow key={`${origin.ruleId}:${origin.origin}`} origin={origin} />
           ))}
         </div>
       )}
+    </section>
+  );
+}
+
+// ── Signed-in sign-in config (WI-8) ───────────────────────────────────────────
+// The JIT sign-in hold timeout (how long a quarantined login tab waits for the
+// human before the agent degrades to a block-stub) + the per-workspace
+// "unattended" flag (overnight runs skip the tab and degrade immediately). Both
+// round-trip through the manager (authoritative); these mirror its state.
+const HOLD_TIMEOUT_OPTIONS: { label: string; ms: number }[] = [
+  { label: '1 min', ms: 60 * 1000 },
+  { label: '3 min', ms: 3 * 60 * 1000 },
+  { label: '5 min', ms: 5 * 60 * 1000 },
+  { label: '10 min', ms: 10 * 60 * 1000 },
+];
+
+function SigninConfigSetting() {
+  const holdMs = useBrowserStore((s) => s.signinHoldTimeoutMs);
+  const unattended = useBrowserStore((s) => s.signinUnattended);
+  const setHold = useBrowserStore((s) => s.setSigninHoldTimeoutMs);
+  const setUnattended = useBrowserStore((s) => s.setSigninUnattended);
+
+  return (
+    <section className="flex flex-col gap-2">
+      <div className="flex items-center gap-2">
+        <Icons.UserCheck className="w-4 h-4 text-fg-secondary" />
+        <h2 className="text-[13px] font-semibold text-fg-primary">Agent sign-in</h2>
+      </div>
+      <p className="text-[11px] text-fg-muted">
+        When an agent hits a site that needs you signed in, a login tab opens and the agent waits.
+        If you don’t finish within this window, the agent treats the site as blocked and moves on.
+      </p>
+      <div
+        role="radiogroup"
+        aria-label="Sign-in hold timeout"
+        className="flex flex-wrap items-center gap-1.5"
+      >
+        {HOLD_TIMEOUT_OPTIONS.map((opt) => {
+          const selected = holdMs === opt.ms;
+          return (
+            <button
+              key={opt.label}
+              type="button"
+              role="radio"
+              aria-checked={selected}
+              onClick={() => void setHold(opt.ms)}
+              className={`px-2.5 py-1 text-[11px] rounded border transition-colors ${
+                selected
+                  ? 'border-accent-blue bg-accent-blue/15 text-fg-primary font-medium'
+                  : 'border-tab-border text-fg-secondary hover:bg-[var(--color-tab-hover-bg)]'
+              }`}
+            >
+              {opt.label}
+            </button>
+          );
+        })}
+      </div>
+      <label className="flex items-start gap-2 text-[11px] text-fg-secondary cursor-pointer mt-1">
+        <input
+          type="checkbox"
+          checked={unattended}
+          onChange={(e) => void setUnattended(e.target.checked)}
+          className="mt-0.5"
+        />
+        <span>
+          <span className="font-medium text-fg-primary">Unattended runs</span> — don’t open a login
+          tab; sites needing sign-in are treated as blocked immediately. Use this for overnight runs
+          when no one is here to sign in.
+        </span>
+      </label>
     </section>
   );
 }
@@ -619,17 +958,33 @@ function WebsiteAccessSettingsInner() {
   const loadAccessRules = useBrowserStore((s) => s.loadAccessRules);
   const loadAccessRequests = useBrowserStore((s) => s.loadAccessRequests);
   const loadSharedSessions = useBrowserStore((s) => s.loadSharedSessions);
+  const loadSigninConfig = useBrowserStore((s) => s.loadSigninConfig);
 
   // The allowlist itself is collapsed by default so pending approvals (above)
   // are always visible without scrolling past a long list (§6).
   const [listExpanded, setListExpanded] = useState(false);
+
+  // Proactive-signin (2026-06-29) WI-C: case-insensitive substring filter over
+  // the allowlist rows (hostname / path-prefix / note). Empty = show all.
+  const [ruleSearch, setRuleSearch] = useState('');
+  const filteredRules = useMemo(() => {
+    const q = ruleSearch.trim().toLowerCase();
+    if (!q) return accessRules;
+    return accessRules.filter(
+      (r) =>
+        r.hostname.toLowerCase().includes(q) ||
+        (r.pathPrefix ?? '').toLowerCase().includes(q) ||
+        (r.note ?? '').toLowerCase().includes(q),
+    );
+  }, [accessRules, ruleSearch]);
 
   // Refresh on open (the bridge also keeps these live via the change events).
   useEffect(() => {
     void loadAccessRules();
     void loadAccessRequests();
     void loadSharedSessions();
-  }, [loadAccessRules, loadAccessRequests, loadSharedSessions]);
+    void loadSigninConfig();
+  }, [loadAccessRules, loadAccessRequests, loadSharedSessions, loadSigninConfig]);
 
   // Close on Esc.
   useEffect(() => {
@@ -718,11 +1073,29 @@ function WebsiteAccessSettingsInner() {
           {listExpanded && (
             <div className="flex flex-col gap-2">
               <AddRuleForm />
+              {/* WI-C: filter the rows by hostname / path / note. */}
+              {accessRules.length > 0 && (
+                <div className="relative">
+                  <Icons.Search className="pointer-events-none absolute left-2 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-fg-muted" />
+                  <input
+                    type="text"
+                    value={ruleSearch}
+                    onChange={(e) => setRuleSearch(e.target.value)}
+                    aria-label="Search allowlist"
+                    placeholder="Search sites…"
+                    className="w-full rounded-md border border-[var(--color-browser-divider)] bg-[var(--color-surface-0)] pl-7 pr-2 py-1 text-[12px] text-fg-primary placeholder:text-fg-muted focus:outline-none focus:border-accent-orange/60"
+                  />
+                </div>
+              )}
               <div className="flex flex-col gap-2 max-h-[55vh] overflow-y-auto pr-1">
                 {accessRules.length === 0 ? (
                   <div className="text-[11px] text-fg-muted px-1 py-2">No allowlist rules yet.</div>
+                ) : filteredRules.length === 0 ? (
+                  <div className="text-[11px] text-fg-muted px-1 py-2">
+                    No rules match “{ruleSearch.trim()}”.
+                  </div>
                 ) : (
-                  accessRules.map((rule) => <RuleRow key={rule.id} rule={rule} />)
+                  filteredRules.map((rule) => <RuleRow key={rule.id} rule={rule} />)
                 )}
               </div>
             </div>
@@ -733,7 +1106,10 @@ function WebsiteAccessSettingsInner() {
                  (Slice 12). ── */}
         <SessionsSharedSection />
 
-        {/* ── (4) Memory — idle-tab suspend threshold (Slice 11). ── */}
+        {/* ── (4) Agent sign-in — JIT hold timeout + unattended flag (WI-8). ── */}
+        <SigninConfigSetting />
+
+        {/* ── (5) Memory — idle-tab suspend threshold (Slice 11). ── */}
         <DiscardThresholdSetting />
       </div>
     </div>

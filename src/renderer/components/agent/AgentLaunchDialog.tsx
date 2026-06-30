@@ -16,6 +16,10 @@ const TYPE_RESEARCHER = 'role:researcher';
 const TYPE_NEW_AGENT = '__new_agent__';
 const TYPE_EPHEMERAL = 'ephemeral';
 
+// Sentinel "Supervised by" option: spawn a brand-new supervisor on launch and
+// own this agent under it. Distinct from '' (Unsupervised) and a real agent id.
+const SUPERVISOR_NEW = '__new_supervisor__';
+
 interface Props {
   workspace: Workspace;
   onClose: () => void;
@@ -24,15 +28,18 @@ interface Props {
 export default function AgentLaunchDialog({ workspace, onClose }: Props) {
   // The browser WebContentsView paints above this dialog — hide it while open.
   useBrowserSuspension();
-  const { loadAgents, checkHealth } = useDashboardStore();
+  const { loadAgents, checkHealth, agents } = useDashboardStore();
   const [title, setTitle] = useState('');
   const [roleDescription, setRoleDescription] = useState('');
   const [workingDirectory, setWorkingDirectory] = useState(workspace.path);
   const [provider, setProvider] = useState<AgentProvider>('claude');
   const [command, setCommand] = useState(PROVIDER_COMMANDS.claude[workspace.pathType]);
   const [autoRestart, setAutoRestart] = useState(true);
-  // Workers launch UNSUPERVISED by default; the user opts in via this checkbox.
-  const [supervised, setSupervised] = useState(false);
+  // Both workers and researchers launch UNSUPERVISED by default. `null` = no
+  // supervisor (unsupervised). A real agent id = that supervisor watches/owns
+  // this agent (becomes its ownerAgentId edge). SUPERVISOR_NEW = spawn a fresh
+  // supervisor first, then use its id as the owner.
+  const [supervisorId, setSupervisorId] = useState<string | null>(null);
   const [launching, setLaunching] = useState(false);
   const [agentMd, setAgentMd] = useState<{ found: boolean; fileName: string | null } | null>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -46,6 +53,11 @@ export default function AgentLaunchDialog({ workspace, onClose }: Props) {
   // only). Backend reads the declared lane from persona.json at launch (D6); the
   // renderer never spreads lane flags into launchInput.
   const [newPersonaLane, setNewPersonaLane] = useState<PersonaLane | ''>('');
+  // #18 (existing-persona path) — the privilege lane chosen for an EXISTING
+  // persona, initialized from its declared persona.json lane when selected. On
+  // Launch, if this differs from the persona's current lane we persist it via
+  // personas.setLane BEFORE the launch call so the backend stamps the new lane.
+  const [existingPersonaLane, setExistingPersonaLane] = useState<PersonaLane | ''>('');
   const [savingTemplate, setSavingTemplate] = useState(false);
   const [saveTemplateName, setSaveTemplateName] = useState('');
   const [showSaveDialog, setShowSaveDialog] = useState(false);
@@ -68,6 +80,16 @@ export default function AgentLaunchDialog({ workspace, onClose }: Props) {
   // their cwd from the workspace root in the backend.
   const showWorkingDir = isTemplate || isEphemeral;
 
+  // Candidate supervisors for the "Supervised by" dropdown: any live
+  // supervisor (role lane or supervisor privilege lane) in this workspace.
+  // Terminal agents (done/crashed) can't own/watch, so they're excluded.
+  const availableSupervisors = agents.filter(
+    (a) => (a.isSupervisor || a.privilegeLane === 'supervisor') && !['done', 'crashed'].includes(a.status),
+  );
+  // The "Supervised by" dropdown applies to the two supervisable lanes: workers
+  // (non-gemini — gemini has no hook scaffold) and researchers.
+  const showSupervisorPicker = (isWorkerType && provider !== 'gemini') || isResearcherType;
+
   // Load templates and personas on mount
   useEffect(() => {
     window.api.templates.list(workspace.id).then(setTemplates).catch(console.error);
@@ -79,6 +101,9 @@ export default function AgentLaunchDialog({ workspace, onClose }: Props) {
 
   // Apply template defaults / autofill title when the type changes.
   useEffect(() => {
+    // A supervisor choice is type-scoped — clear it so a stale pick can't leak
+    // across agent types (default for every type is unsupervised).
+    setSupervisorId(null);
     if (isSupervisorType || isResearcherType) {
       setProvider('claude');
       return;
@@ -104,6 +129,18 @@ export default function AgentLaunchDialog({ workspace, onClose }: Props) {
     }
   }, [selectedType]);
 
+  // #18 — when an EXISTING persona is selected, seed the Privilege Lane select
+  // from that persona's currently declared lane (persona.json). Depends on
+  // `personas` too so the value lands correctly even if the list resolves after
+  // the type was already chosen.
+  useEffect(() => {
+    if (isPersona) {
+      const personaName = selectedType.slice('persona:'.length);
+      const persona = personas.find(p => p.name === personaName);
+      setExistingPersonaLane(persona?.lane ?? '');
+    }
+  }, [selectedType, personas]);
+
   // Update command when provider changes (only if not bound to a template).
   useEffect(() => {
     if (!isTemplate) {
@@ -118,7 +155,10 @@ export default function AgentLaunchDialog({ workspace, onClose }: Props) {
     if (isNewAgent && newPersonaLane === 'researcher' && provider !== 'claude') {
       setProvider('claude');
     }
-  }, [isNewAgent, newPersonaLane, provider]);
+    if (isPersona && existingPersonaLane === 'researcher' && provider !== 'claude') {
+      setProvider('claude');
+    }
+  }, [isNewAgent, isPersona, newPersonaLane, existingPersonaLane, provider]);
 
   useEffect(() => {
     if (debounceRef.current) clearTimeout(debounceRef.current);
@@ -155,6 +195,24 @@ export default function AgentLaunchDialog({ workspace, onClose }: Props) {
 
       let launchInput: any;
 
+      // Resolve the effective owner/supervisor for supervisable lanes. `null`
+      // means unsupervised. SUPERVISOR_NEW spawns a fresh supervisor first and
+      // returns its real id (launch() resolves to the created Agent), so the
+      // owner edge always points at a persisted supervisor.
+      const resolveOwnerId = async (): Promise<string | null> => {
+        if (supervisorId === SUPERVISOR_NEW) {
+          const created = await window.api.agents.launch({
+            workspaceId: workspace.id,
+            title: `${title.trim()} — supervisor`,
+            provider: 'claude',
+            isSupervisor: true,
+            workingDirectory: workspace.path,
+          });
+          return created.id;
+        }
+        return supervisorId; // existing supervisor id, or null (unsupervised)
+      };
+
       if (isSupervisorType) {
         // Supervisor role-lane → .dashboard/supervisor/, ensureSupervisorScaffold.
         // Multiple supervisors per workspace are allowed (backend no longer blocks).
@@ -162,26 +220,32 @@ export default function AgentLaunchDialog({ workspace, onClose }: Props) {
       } else if (isResearcherType) {
         // Researcher role-lane → .dashboard/researcher/, ensureResearcherScaffold.
         // App-managed cwd/command/tools/browser-MCP; Claude-only (backend rejects
-        // non-claude). Supervised by default.
+        // non-claude). UNSUPERVISED by default — the user opts in via the
+        // "Supervised by" dropdown, which also sets the owner edge.
+        const ownerId = await resolveOwnerId();
         launchInput = {
           ...base,
           provider: 'claude',
           workingDirectory: workspace.path,
           isResearcher: true,
-          isSupervised: true,
+          isSupervised: ownerId != null,
+          ownerAgentId: ownerId ?? undefined,
         };
       } else if (isWorkerType) {
         // Worker role-lane → .dashboard/workers/<provider>/, ensureWorkerScaffold.
         // Hook-based status; gemini has no hook scaffold so it never joins the
-        // lane. Unsupervised by default — the user opts into supervision via the
-        // "Supervised" checkbox.
+        // lane (and can't be supervised). Unsupervised by default — the user
+        // opts into supervision via the "Supervised by" dropdown, which also
+        // sets the owner edge.
+        const ownerId = provider !== 'gemini' ? await resolveOwnerId() : null;
         launchInput = {
           ...base,
           workingDirectory: workspace.path,
           command: command.trim(),
           provider,
           isWorker: provider !== 'gemini',
-          isSupervised: supervised && provider !== 'gemini',
+          isSupervised: ownerId != null && provider !== 'gemini',
+          ownerAgentId: ownerId ?? undefined,
         };
       } else if (isNewAgent) {
         // Mint a fresh persona under .dashboard/agents/<slug>/ then launch it.
@@ -199,12 +263,22 @@ export default function AgentLaunchDialog({ workspace, onClose }: Props) {
         };
       } else if (isPersona) {
         // Existing custom agent → runs in its own .dashboard/agents/<name>/ cwd.
+        const personaName = selectedType.slice('persona:'.length);
+        // If the user changed the privilege lane, persist it to persona.json
+        // BEFORE launch so the backend reads the new lane and injects live-token
+        // MCP (D6). '' ⇒ null removes the declared lane (revert to legacy).
+        const currentLane = personas.find(p => p.name === personaName)?.lane ?? '';
+        if (existingPersonaLane !== currentLane) {
+          await window.api.personas.setLane(
+            workspace.path, workspace.pathType, personaName, existingPersonaLane || null,
+          );
+        }
         launchInput = {
           ...base,
           workingDirectory: workspace.path,
           command: command.trim(),
           provider,
-          persona: selectedType.slice('persona:'.length),
+          persona: personaName,
         };
       } else if (isTemplate) {
         // Advanced DB template — keep its existing semantics.
@@ -256,7 +330,7 @@ export default function AgentLaunchDialog({ workspace, onClose }: Props) {
         command: command.trim() || null,
         autoRestart,
         // Persist worker/supervised intent from the selected role lane.
-        isSupervised: isWorkerType && supervised && provider !== 'gemini',
+        isSupervised: isWorkerType && supervisorId !== null && provider !== 'gemini',
         isWorker: isWorkerType && provider !== 'gemini',
       });
       setTemplates(prev => [...prev, newTemplate]);
@@ -378,15 +452,21 @@ export default function AgentLaunchDialog({ workspace, onClose }: Props) {
             />
           </div>
 
-          {/* #18 — optional privilege lane for a NEW persona. Backend reads the
-              declared lane from persona.json at launch (D6); we only persist the
-              choice here, never spread lane flags into launchInput. */}
-          {isNewAgent && (
+          {/* #18 — optional privilege lane for a NEW persona OR an EXISTING one.
+              Backend reads the declared lane from persona.json at launch (D6).
+              New-agent path: persisted by personas.create. Existing-persona path:
+              persisted by personas.setLane in handleSubmit before launch when the
+              chosen lane differs from the persona's current lane. We never spread
+              lane flags into launchInput. */}
+          {(isNewAgent || isPersona) && (
             <div>
               <label className="block text-[11px] text-gray-500 mb-1 uppercase tracking-wider">Privilege Lane</label>
               <select
-                value={newPersonaLane}
-                onChange={(e) => setNewPersonaLane(e.target.value as PersonaLane | '')}
+                value={isPersona ? existingPersonaLane : newPersonaLane}
+                onChange={(e) => {
+                  const v = e.target.value as PersonaLane | '';
+                  if (isPersona) setExistingPersonaLane(v); else setNewPersonaLane(v);
+                }}
                 className="ui-input text-sm"
               >
                 <option value="">None</option>
@@ -396,7 +476,8 @@ export default function AgentLaunchDialog({ workspace, onClose }: Props) {
               </select>
               <div className="mt-1 text-[11px] text-gray-500">
                 Grants this persona the dashboard tools of one native lane. None = native tools only.
-                {newPersonaLane === 'researcher' && ' Researcher is Claude-only — provider forced to Claude.'}
+                {(isPersona ? existingPersonaLane : newPersonaLane) === 'researcher' && ' Researcher is Claude-only — provider forced to Claude.'}
+                {isPersona && ' Saved to this agent on Launch.'}
               </div>
             </div>
           )}
@@ -477,18 +558,27 @@ export default function AgentLaunchDialog({ workspace, onClose }: Props) {
           </>
           )}
 
-          {isWorkerType && provider !== 'gemini' && (
-            <div className="flex items-center gap-2">
-              <input
-                type="checkbox"
-                id="supervised"
-                checked={supervised}
-                onChange={(e) => setSupervised(e.target.checked)}
-                className="rounded"
-              />
-              <label htmlFor="supervised" className="text-sm text-gray-400">
-                Supervised (a supervisor watches status and routes questions)
-              </label>
+          {showSupervisorPicker && (
+            <div>
+              <label className="block text-[11px] text-gray-500 mb-1 uppercase tracking-wider">Supervised by</label>
+              <select
+                value={supervisorId ?? ''}
+                onChange={(e) => setSupervisorId(e.target.value === '' ? null : e.target.value)}
+                className="ui-input text-sm w-full"
+              >
+                <option value="">Unsupervised</option>
+                {availableSupervisors.map((a) => (
+                  <option key={a.id} value={a.id}>{a.title}</option>
+                ))}
+                <option value={SUPERVISOR_NEW}>➕ Spawn new supervisor</option>
+              </select>
+              <div className="mt-1 text-[11px] text-gray-500">
+                {supervisorId === null
+                  ? 'Runs on its own — no supervisor watches status or routes questions.'
+                  : supervisorId === SUPERVISOR_NEW
+                    ? 'A fresh supervisor is spawned and made this agent’s owner.'
+                    : 'The chosen supervisor watches status, routes questions, and owns this agent.'}
+              </div>
             </div>
           )}
 

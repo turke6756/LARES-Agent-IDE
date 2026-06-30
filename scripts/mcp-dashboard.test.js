@@ -56,11 +56,13 @@ test('browser-only toolset exposes only browser_* and launch_agent is unknown wi
     'browser_get_page_text',
     'browser_go_back',
     'browser_go_forward',
+    'browser_list_my_access_requests',
     'browser_list_tabs',
     'browser_open_url',
     'browser_press_key',
     'browser_read_page',
     'browser_reload',
+    'browser_request_site_access',
     'browser_screenshot',
     'browser_scroll',
     'browser_select_option',
@@ -111,6 +113,79 @@ test('notebooks,comms,observability exposes exactly those toolsets, not orchestr
     isError: true,
   });
   assert.strictEqual(api.calls.length, 0);
+});
+
+// ── Transient one-turn subscription: sender_agent_id wiring (tests 21–25) ──
+
+function capturingApi(returnVal) {
+  const calls = [];
+  const fn = async (method, route, body) => { calls.push({ method, route, body }); return returnVal; };
+  fn.calls = calls;
+  return fn;
+}
+
+const OK_SUBSCRIBED = { confirmed: true, mode: 'hook', transientSubscription: { registered: true } };
+
+test('21. confirmed send_message_to_agent forwards sender_agent_id = AGENT_ID', async () => {
+  const prev = process.env.AGENT_ID;
+  process.env.AGENT_ID = 'agent-123';
+  try {
+    const proxy = loadProxy('comms');
+    const api = capturingApi(OK_SUBSCRIBED);
+    await proxy.handleToolCall('send_message_to_agent', { agent_id: 't-1', message: 'hi' }, api);
+    assert.strictEqual(api.calls.length, 1);
+    assert.strictEqual(api.calls[0].body.sender_agent_id, 'agent-123', 'confirmed POST body carries sender_agent_id');
+    assert.strictEqual(api.calls[0].body.confirm, true);
+  } finally { if (prev === undefined) delete process.env.AGENT_ID; else process.env.AGENT_ID = prev; }
+});
+
+test('22. fire-and-forget send_message_to_agent forwards sender_agent_id', async () => {
+  const prev = process.env.AGENT_ID;
+  process.env.AGENT_ID = 'agent-456';
+  try {
+    const proxy = loadProxy('comms');
+    const api = capturingApi({});
+    await proxy.handleToolCall('send_message_to_agent', { agent_id: 't-1', message: 'hi', confirm: false }, api);
+    assert.strictEqual(api.calls.length, 1);
+    assert.strictEqual(api.calls[0].body.sender_agent_id, 'agent-456', 'fire-and-forget POST body carries sender_agent_id');
+  } finally { if (prev === undefined) delete process.env.AGENT_ID; else process.env.AGENT_ID = prev; }
+});
+
+test('23. AGENT_ID unset/empty → POST body omits sender_agent_id (no empty key)', async () => {
+  const prev = process.env.AGENT_ID;
+  delete process.env.AGENT_ID;
+  try {
+    const proxy = loadProxy('comms');
+    const api = capturingApi(OK_SUBSCRIBED);
+    await proxy.handleToolCall('send_message_to_agent', { agent_id: 't-1', message: 'hi' }, api);
+    assert.strictEqual(api.calls.length, 1);
+    assert.ok(!('sender_agent_id' in api.calls[0].body), 'no sender_agent_id key when AGENT_ID is empty');
+  } finally { if (prev === undefined) delete process.env.AGENT_ID; else process.env.AGENT_ID = prev; }
+});
+
+test('24. tool schema does NOT expose sender_agent_id/senderAgentId', async () => {
+  clearProxyModules();
+  const comms = require('./mcp-tools-comms');
+  const props = comms.getCommsToolDefinitions()[0].inputSchema.properties;
+  assert.ok(!('sender_agent_id' in props), 'schema must not expose sender_agent_id');
+  assert.ok(!('senderAgentId' in props), 'schema must not expose senderAgentId');
+});
+
+test('25. HANDSHAKE-OK text mentions the one-turn subscription only when registered', async () => {
+  const prev = process.env.AGENT_ID;
+  process.env.AGENT_ID = 'agent-789';
+  try {
+    const proxy = loadProxy('comms');
+
+    const subscribedApi = capturingApi(OK_SUBSCRIBED);
+    const r1 = await proxy.handleToolCall('send_message_to_agent', { agent_id: 't-1', message: 'hi' }, subscribedApi);
+    assert.ok(/one-turn subscription/.test(r1.content[0].text), 'registered → mentions one-turn subscription');
+
+    const plainApi = capturingApi({ confirmed: true, mode: 'hook' });
+    const r2 = await proxy.handleToolCall('send_message_to_agent', { agent_id: 't-1', message: 'hi' }, plainApi);
+    assert.ok(!/one-turn subscription/.test(r2.content[0].text), 'no transientSubscription → no subscription mention');
+    assert.ok(/goes idle/.test(r2.content[0].text), 'falls back to the plain idle-event line');
+  } finally { if (prev === undefined) delete process.env.AGENT_ID; else process.env.AGENT_ID = prev; }
 });
 
 (async () => {

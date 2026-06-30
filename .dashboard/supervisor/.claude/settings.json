@@ -1,4 +1,46 @@
 {
   "autoMemoryEnabled": false,
-  "autoCompactEnabled": false
+  "autoCompactEnabled": false,
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PROJECT_DIR}/../scripts/dashboard-status.mjs\" session-start"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PROJECT_DIR}/../scripts/dashboard-status.mjs\""
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PROJECT_DIR}/../scripts/dashboard-status.mjs\" working"
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PROJECT_DIR}/../scripts/dashboard-status.mjs\" waiting"
+          }
+        ]
+      }
+    ]
+  }
 }

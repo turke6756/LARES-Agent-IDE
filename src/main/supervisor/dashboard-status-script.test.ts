@@ -17,7 +17,12 @@ import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
-import { DASHBOARD_STATUS_SCRIPT_MJS } from '../../shared/constants';
+import {
+  DASHBOARD_STATUS_SCRIPT_MJS,
+  DASHBOARD_STATUS_SCRIPT_MJS_V6,
+  DASHBOARD_STATUS_SCRIPT_MJS_V3,
+} from '../../shared/constants';
+import { NON_BLOCKING_NOTIFICATION_TYPES } from '../../shared/notification-classify';
 
 interface TestCase { name: string; run(): Promise<void> | void; }
 const tests: TestCase[] = [];
@@ -372,6 +377,264 @@ test('(h) stdin emits error after the timeout fired → script still exits 0', a
   } finally {
     ws.cleanup();
   }
+});
+
+test('(w1) waiting argv + Notification stdin → state=waiting, source=hook-notification, excerpt + notificationType', async () => {
+  const ws = makeWorkspace();
+  const server = await startMockServer();
+  const spool = path.join(ws.dir, 'spool.jsonl');
+  try {
+    const res = await runScript(ws, {
+      argv: ['waiting'],
+      env: {
+        AGENT_ID: 'ag-w1', DASHBOARD_PORT: String(server.port), DASHBOARD_HOST: '127.0.0.1',
+        DASHBOARD_SPOOL_PATH: spool, CLAUDE_HOOK_EVENT_NAME: undefined,
+        TMUX: undefined, TMUX_PANE: undefined,
+      },
+      stdinBody: JSON.stringify({
+        hook_event_name: 'Notification',
+        notification_type: 'permission_prompt',
+        message: 'Bash tool requires permission',
+      }),
+    });
+    assert.equal(res.status, 0, `exit 0; stderr=${res.stderr}`);
+    assert.equal(server.received.length, 1, 'HTTP POST delivered');
+    const posted = JSON.parse(server.received[0].body);
+    const spooled = readSpool(spool);
+    assert.equal(spooled.length, 1);
+    assert.deepStrictEqual(spooled[0], posted, 'spool record === POST body (same ts)');
+    assert.equal(posted.state, 'waiting');
+    assert.equal(posted.source, 'hook-notification');
+    assert.equal(posted.hookEventName, 'Notification');
+    assert.equal(posted.excerpt, 'Bash tool requires permission');
+    assert.equal(posted.notificationType, 'permission_prompt');
+    assert.match(server.received[0].url, /^\/api\/agents\/ag-w1\/status$/);
+  } finally {
+    await server.close();
+    ws.cleanup();
+  }
+});
+
+test('(w2) blocking permission prompt: multiline message → CR/LF collapsed to spaces and capped at 300 chars', async () => {
+  const ws = makeWorkspace();
+  const spool = path.join(ws.dir, 'spool.jsonl');
+  try {
+    // Build a message with embedded CR/LF AND a length well over the 300-char cap.
+    const longTail = 'x'.repeat(500);
+    const message = `line one\r\nline two\n\n\rline three ${longTail}`;
+    const res = await runScript(ws, {
+      argv: ['waiting'],
+      env: {
+        AGENT_ID: 'ag-w2', DASHBOARD_PORT: '1', DASHBOARD_HOST: '127.0.0.1',
+        DASHBOARD_SPOOL_PATH: spool, CLAUDE_HOOK_EVENT_NAME: undefined,
+        TMUX: undefined, TMUX_PANE: undefined,
+      },
+      stdinBody: JSON.stringify({
+        hook_event_name: 'Notification',
+        notification_type: 'permission_prompt',
+        message,
+      }),
+    });
+    assert.equal(res.status, 0, `exit 0; stderr=${res.stderr}`);
+    const records = readSpool(spool);
+    assert.equal(records.length, 1);
+    const excerpt = records[0].excerpt as string;
+    assert.equal(typeof excerpt, 'string');
+    // No raw CR or LF survive — they are collapsed to spaces.
+    assert.ok(!/[\r\n]/.test(excerpt), `excerpt must contain no CR/LF; got ${JSON.stringify(excerpt)}`);
+    // Capped at 300 chars.
+    assert.equal(excerpt.length, 300, `excerpt capped at 300; got ${excerpt.length}`);
+    // The collapsed prefix is preserved (runs of CR/LF → a single space).
+    assert.ok(excerpt.startsWith('line one line two line three '),
+      `collapsed prefix preserved; got ${JSON.stringify(excerpt.slice(0, 40))}`);
+    assert.equal(records[0].state, 'waiting');
+    assert.equal(records[0].notificationType, 'permission_prompt');
+  } finally {
+    ws.cleanup();
+  }
+});
+
+test('(w3) SubagentStop bails BEFORE any waiting record, even with argv "waiting"', async () => {
+  const ws = makeWorkspace();
+  const server = await startMockServer();
+  const spool = path.join(ws.dir, 'spool.jsonl');
+  try {
+    const res = await runScript(ws, {
+      argv: ['waiting'],
+      env: {
+        AGENT_ID: 'ag-w3', DASHBOARD_PORT: String(server.port), DASHBOARD_HOST: '127.0.0.1',
+        DASHBOARD_SPOOL_PATH: spool, CLAUDE_HOOK_EVENT_NAME: undefined,
+        TMUX: undefined, TMUX_PANE: undefined,
+      },
+      stdinBody: JSON.stringify({
+        hook_event_name: 'SubagentStop',
+        notification_type: 'permission_prompt',
+        message: 'should never be recorded',
+      }),
+    });
+    assert.equal(res.status, 0, `exit 0; stderr=${res.stderr}`);
+    assert.equal(fs.existsSync(spool), false, 'SubagentStop must never spool a waiting record');
+    assert.equal(server.received.length, 0, 'SubagentStop must never POST a waiting record');
+  } finally {
+    await server.close();
+    ws.cleanup();
+  }
+});
+
+test('(w6) idle_prompt Notification (argv "waiting") → nothing written, agent stays idle', async () => {
+  const ws = makeWorkspace();
+  const server = await startMockServer();
+  const spool = path.join(ws.dir, 'spool.jsonl');
+  try {
+    const res = await runScript(ws, {
+      argv: ['waiting'],
+      env: {
+        AGENT_ID: 'ag-w6', DASHBOARD_PORT: String(server.port), DASHBOARD_HOST: '127.0.0.1',
+        DASHBOARD_SPOOL_PATH: spool, CLAUDE_HOOK_EVENT_NAME: undefined,
+        TMUX: undefined, TMUX_PANE: undefined,
+      },
+      stdinBody: JSON.stringify({
+        hook_event_name: 'Notification',
+        notification_type: 'idle_prompt',
+        message: 'Claude is waiting for your input',
+      }),
+    });
+    assert.equal(res.status, 0, `exit 0; stderr=${res.stderr}`);
+    assert.equal(fs.existsSync(spool), false, 'idle_prompt must never spool a waiting record');
+    assert.equal(server.received.length, 0, 'idle_prompt must never POST a waiting record');
+  } finally {
+    await server.close();
+    ws.cleanup();
+  }
+});
+
+test('(w7) no notification_type + message "waiting for your input" → nothing written (regex fallback)', async () => {
+  const ws = makeWorkspace();
+  const server = await startMockServer();
+  const spool = path.join(ws.dir, 'spool.jsonl');
+  try {
+    const res = await runScript(ws, {
+      argv: ['waiting'],
+      env: {
+        AGENT_ID: 'ag-w7', DASHBOARD_PORT: String(server.port), DASHBOARD_HOST: '127.0.0.1',
+        DASHBOARD_SPOOL_PATH: spool, CLAUDE_HOOK_EVENT_NAME: undefined,
+        TMUX: undefined, TMUX_PANE: undefined,
+      },
+      stdinBody: JSON.stringify({
+        hook_event_name: 'Notification',
+        // no notification_type (legacy CLI) → message-regex fallback applies.
+        message: 'Claude is waiting for your input',
+      }),
+    });
+    assert.equal(res.status, 0, `exit 0; stderr=${res.stderr}`);
+    assert.equal(fs.existsSync(spool), false, 'legacy idle reminder must never spool');
+    assert.equal(server.received.length, 0, 'legacy idle reminder must never POST');
+  } finally {
+    await server.close();
+    ws.cleanup();
+  }
+});
+
+test('(w8) no notification_type + unrelated message → record STILL written (fallback must not over-suppress)', async () => {
+  const ws = makeWorkspace();
+  const server = await startMockServer();
+  const spool = path.join(ws.dir, 'spool.jsonl');
+  try {
+    const res = await runScript(ws, {
+      argv: ['waiting'],
+      env: {
+        AGENT_ID: 'ag-w8', DASHBOARD_PORT: String(server.port), DASHBOARD_HOST: '127.0.0.1',
+        DASHBOARD_SPOOL_PATH: spool, CLAUDE_HOOK_EVENT_NAME: undefined,
+        TMUX: undefined, TMUX_PANE: undefined,
+      },
+      stdinBody: JSON.stringify({
+        hook_event_name: 'Notification',
+        // no notification_type, and the message is NOT the idle reminder →
+        // conservative default: still a waiting record.
+        message: 'Bash tool requires permission',
+      }),
+    });
+    assert.equal(res.status, 0, `exit 0; stderr=${res.stderr}`);
+    assert.equal(server.received.length, 1, 'unknown blocking notification still POSTs');
+    const records = readSpool(spool);
+    assert.equal(records.length, 1, 'unknown blocking notification still spools');
+    assert.equal(records[0].state, 'waiting');
+    assert.equal(records[0].excerpt, 'Bash tool requires permission');
+  } finally {
+    await server.close();
+    ws.cleanup();
+  }
+});
+
+test('(w9) drift: every NON_BLOCKING_NOTIFICATION_TYPES literal + the fallback regex appear in the script source', () => {
+  for (const t of NON_BLOCKING_NOTIFICATION_TYPES) {
+    assert.ok(DASHBOARD_STATUS_SCRIPT_MJS.includes(`'${t}'`),
+      `script source must inline the non-blocking type literal '${t}' (drift between ` +
+      `notification-classify.ts and buildDashboardStatusScript)`);
+  }
+  assert.ok(/waiting for your input/.test(DASHBOARD_STATUS_SCRIPT_MJS),
+    'script source must contain the message-regex fallback text "waiting for your input"');
+});
+
+test('(w4) unknown/absent argv still defaults to idle (no waiting leakage)', async () => {
+  const ws = makeWorkspace();
+  const spool = path.join(ws.dir, 'spool.jsonl');
+  try {
+    // Unknown argv token.
+    const res = await runScript(ws, {
+      argv: ['bananas'],
+      env: {
+        AGENT_ID: 'ag-w4', DASHBOARD_PORT: '1', DASHBOARD_HOST: '127.0.0.1',
+        DASHBOARD_SPOOL_PATH: spool, CLAUDE_HOOK_EVENT_NAME: undefined,
+        TMUX: undefined, TMUX_PANE: undefined,
+      },
+    });
+    assert.equal(res.status, 0, `exit 0; stderr=${res.stderr}`);
+    const records = readSpool(spool);
+    assert.equal(records.length, 1);
+    assert.equal(records[0].state, 'idle', 'unknown argv defaults to idle');
+    assert.equal(records[0].source, 'hook-stop');
+    assert.equal(records[0].hookEventName, 'Stop');
+    assert.equal(records[0].excerpt, undefined, 'no excerpt for a non-waiting record');
+    assert.equal(records[0].notificationType, undefined, 'no notificationType for a non-waiting record');
+
+    // Absent argv (default Stop) also lands idle.
+    const spool2 = path.join(ws.dir, 'spool2.jsonl');
+    const res2 = await runScript(ws, {
+      env: {
+        AGENT_ID: 'ag-w4b', DASHBOARD_PORT: '1', DASHBOARD_HOST: '127.0.0.1',
+        DASHBOARD_SPOOL_PATH: spool2, CLAUDE_HOOK_EVENT_NAME: undefined,
+        TMUX: undefined, TMUX_PANE: undefined,
+      },
+    });
+    assert.equal(res2.status, 0, `exit 0; stderr=${res2.stderr}`);
+    const records2 = readSpool(spool2);
+    assert.equal(records2.length, 1);
+    assert.equal(records2[0].state, 'idle', 'absent argv defaults to idle');
+    assert.equal(records2[0].source, 'hook-stop');
+  } finally {
+    ws.cleanup();
+  }
+});
+
+test('(w5) frozen V6 builder output AND the V3 literal carry NO waiting branch', () => {
+  for (const [label, src] of [
+    ['V6', DASHBOARD_STATUS_SCRIPT_MJS_V6],
+    ['V3', DASHBOARD_STATUS_SCRIPT_MJS_V3],
+  ] as Array<[string, string]>) {
+    assert.equal(typeof src, 'string', `${label} is a string`);
+    assert.ok(src.length > 0, `${label} is non-empty`);
+    assert.ok(!/hook-notification/.test(src),
+      `frozen ${label} must NOT contain the waiting source 'hook-notification'`);
+    assert.ok(!/rawState === 'waiting'/.test(src),
+      `frozen ${label} must NOT contain the rawState waiting branch`);
+    assert.ok(!/notification_type/.test(src),
+      `frozen ${label} must NOT reference notification_type`);
+  }
+  // Sanity: the LIVE script DOES carry the waiting branch (guards against a
+  // copy-paste regression that froze the wrong source).
+  assert.ok(/hook-notification/.test(DASHBOARD_STATUS_SCRIPT_MJS),
+    'live script must contain the waiting branch');
 });
 
 // ── Runner ───────────────────────────────────────────────────────────

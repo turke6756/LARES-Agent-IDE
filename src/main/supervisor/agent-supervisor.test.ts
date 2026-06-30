@@ -453,7 +453,7 @@ test('Case 7: launchWslAgent renders command without `env`/`exec` (works with ba
     provider: 'claude',
     isSupervisor: false,
     isSupervised: true, // triggers the sysPromptText wrap path (line 1318)
-    command: 'ccode --dangerously-skip-permissions --chrome',
+    command: 'ccode --dangerously-skip-permissions',
     workingDirectory: '/home/test/.dashboard/workers/claude',
     tmuxSessionName: 'agent-w-7',
   });
@@ -930,6 +930,149 @@ test('applyHookStatusEvent: legacy body bypasses dedupe/freshness/ordering', () 
   }
 });
 
+// ── Notification → waiting hook (plans/hook-driven-waiting-status.md §2,
+//    Step 8 dispatch) ────────────────────────────────────────────────────
+
+/** Build a v8-shaped `waiting` event (state:'waiting', source 'hook-notification',
+ *  hookEventName 'Notification'). Kept separate from `hookEvent` because the
+ *  latter's `state` param is the pre-waiting union. */
+function waitingHookEvent(
+  overrides: Partial<import('./index').ParsedHookEvent> = {},
+): import('./index').ParsedHookEvent {
+  return {
+    v: 1,
+    state: 'waiting',
+    source: 'hook-notification',
+    ts: Date.now(),
+    hookEventName: 'Notification',
+    ...overrides,
+  };
+}
+
+/** Capture monitor.forceWaiting(agentId, kind, excerpt) calls without driving
+ *  the real StatusMonitor waiting-latch write. */
+function captureWaiting(h: Harness): Array<{ id: string; kind: string; excerpt: string }> {
+  const waits: Array<{ id: string; kind: string; excerpt: string }> = [];
+  const monitor = (h.supervisor as unknown as {
+    monitor: { forceWaiting: (id: string, kind: string, excerpt: string) => void };
+  }).monitor;
+  monitor.forceWaiting = (id, kind, excerpt) => { waits.push({ id, kind, excerpt }); };
+  return waits;
+}
+
+test('applyHookStatusEvent: a waiting event is ACCEPTED (not invalid)', () => {
+  const agent = makeAgent('wt-1', { provider: 'claude', status: 'working', isWorker: true });
+  const h = setup({ agent, injectRunner: 'windows', alive: true });
+  captureWaiting(h);
+  try {
+    assert.equal(
+      h.supervisor.applyHookStatusEvent(
+        agent.id, waitingHookEvent({ waitingExcerpt: 'Bash tool requires permission' }), 'http'),
+      'applied',
+      'a state:waiting Notification event must be accepted, not rejected as unknown state');
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('applyHookStatusEvent: waiting dispatches forceWaiting(agentId, "notification", excerpt); no start-hook stamp; step-7 health runs', () => {
+  // step-7 (health/canary/heartbeat) MUST run for a waiting event — it's a
+  // valid hook heartbeat proving the scaffold loaded — but recordStartHookEventAt
+  // must NOT (a wait is not a turn-start, must not satisfy the submit-confirm
+  // comparison).
+  const agent = makeAgent('wt-2', { provider: 'claude', status: 'working', isWorker: true });
+  const h = setup({ agent, injectRunner: 'windows', alive: true });
+  const waits = captureWaiting(h);
+
+  // Arm the canary + spy on recordStartHookEventAt so we can assert it's NOT
+  // advanced by a waiting event.
+  const monitor = (h.supervisor as unknown as {
+    monitor: { recordStartHookEventAt: (id: string, ts: number) => void };
+  }).monitor;
+  const startBefore = monitorOf(h).getLastStartHookEventAt(agent.id);
+  let startHookStamped = false;
+  const realStart = monitor.recordStartHookEventAt.bind(monitor);
+  monitor.recordStartHookEventAt = (id: string, ts: number) => {
+    startHookStamped = true;
+    realStart(id, ts);
+  };
+
+  try {
+    agent.hookStatus = 'unknown';
+    monitorOf(h).recordHookCanary(agent.id);
+    assert.equal(monitorOf(h).isHookCanaryArmed(agent.id), true, 'precondition: canary armed');
+
+    const result = h.supervisor.applyHookStatusEvent(
+      agent.id,
+      waitingHookEvent({ waitingExcerpt: 'Choose an option', notificationType: 'permission_prompt' }),
+      'http');
+    assert.equal(result, 'applied');
+
+    // Dispatch: forceWaiting with the 'notification' kind and the threaded excerpt.
+    assert.deepStrictEqual(waits, [{ id: agent.id, kind: 'notification', excerpt: 'Choose an option' }],
+      'a blocking waiting (permission_prompt) must dispatch monitor.forceWaiting(agentId, "notification", excerpt)');
+
+    // recordStartHookEventAt NOT called for waiting (gated to state==='working').
+    assert.equal(startHookStamped, false, 'a waiting event must NOT stamp the start-hook clock');
+    assert.equal(monitorOf(h).getLastStartHookEventAt(agent.id), startBefore,
+      'start-hook clock unchanged by a waiting event');
+
+    // step-7 health side effects DID run (waiting is a healthy heartbeat).
+    assert.equal(agent.hookStatus, 'healthy', 'waiting promotes hook_status to healthy (scaffold loaded)');
+    assert.ok(typeof agent.lastHookEventAt === 'number' && agent.lastHookEventAt > 0,
+      'waiting stamps last_hook_event_at (heartbeat)');
+    assert.equal(monitorOf(h).isHookCanaryArmed(agent.id), false, 'waiting clears the hook canary');
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('applyHookStatusEvent: waiting with no excerpt → forceWaiting excerpt defaults to empty string', () => {
+  const agent = makeAgent('wt-3', { provider: 'claude', status: 'working', isWorker: true });
+  const h = setup({ agent, injectRunner: 'windows', alive: true });
+  const waits = captureWaiting(h);
+  try {
+    assert.equal(
+      h.supervisor.applyHookStatusEvent(agent.id, waitingHookEvent(), 'http'),
+      'applied');
+    assert.deepStrictEqual(waits, [{ id: agent.id, kind: 'notification', excerpt: '' }],
+      'a waiting event without an excerpt passes "" (event.waitingExcerpt ?? "")');
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('applyHookStatusEvent: idle_prompt waiting → forceWaiting NOT called, but step-7 health stamp + canary clear DID run', () => {
+  // idle-vs-waiting fix: an idle reminder (notification_type 'idle_prompt') is a
+  // valid liveness heartbeat (steps 1-7 run: health → healthy, canary cleared,
+  // last_hook_event_at stamped) but MUST NOT flip the card to 'waiting'.
+  const agent = makeAgent('wt-idle', { provider: 'claude', status: 'idle', isWorker: true });
+  const h = setup({ agent, injectRunner: 'windows', alive: true });
+  const waits = captureWaiting(h);
+  try {
+    agent.hookStatus = 'unknown';
+    monitorOf(h).recordHookCanary(agent.id);
+    assert.equal(monitorOf(h).isHookCanaryArmed(agent.id), true, 'precondition: canary armed');
+
+    const result = h.supervisor.applyHookStatusEvent(
+      agent.id,
+      waitingHookEvent({ waitingExcerpt: 'Claude is waiting for your input', notificationType: 'idle_prompt' }),
+      'http');
+    assert.equal(result, 'applied', 'the idle reminder is still ACCEPTED as a heartbeat');
+
+    // The load-bearing assertion: no waiting flip.
+    assert.deepStrictEqual(waits, [], 'idle_prompt must NOT dispatch forceWaiting');
+
+    // But step-7 liveness side effects DID run.
+    assert.equal(agent.hookStatus, 'healthy', 'idle reminder still promotes hook_status to healthy');
+    assert.ok(typeof agent.lastHookEventAt === 'number' && agent.lastHookEventAt > 0,
+      'idle reminder still stamps last_hook_event_at (heartbeat)');
+    assert.equal(monitorOf(h).isHookCanaryArmed(agent.id), false, 'idle reminder still clears the hook canary');
+  } finally {
+    h.cleanup();
+  }
+});
+
 // ── Tmux-option freshness gate (P1 plan §2 step 4a / §5 E3) ────────────
 
 test('tmux gate: restart-shaped failure — old option on a fresh process → stale, nothing stamped, canary stays armed', () => {
@@ -1162,7 +1305,7 @@ test('Case R1: Windows researcher launch arg-set (toolset=browser, strict, --too
     isSupervised: false,
     isWorker: false,
     isResearcher: true,
-    command: 'claude --dangerously-skip-permissions --chrome',
+    command: 'claude --dangerously-skip-permissions',
     workingDirectory: cwd,
   });
   const h = setup({ agent, injectRunner: 'none' });
@@ -1203,6 +1346,10 @@ test('Case R1: Windows researcher launch arg-set (toolset=browser, strict, --too
     for (const t of ['WebSearch', 'WebFetch', 'Read', 'Grep', 'Glob', 'Task', 'Skill', 'Write', 'mcp__agent-dashboard__browser_*', 'mcp__claude-in-chrome__*']) {
       assert.ok(toolsVal.split(',').includes(t), `--tools must offer ${t}; got: ${toolsVal}`);
     }
+    // claude-in-chrome is the researcher's de-emphasized fallback browser —
+    // granted to THIS lane only (and never to any other lane).
+    assert.ok(toolsVal.split(',').includes('mcp__claude-in-chrome__*'),
+      `--tools must offer claude-in-chrome (researcher fallback browser); got: ${toolsVal}`);
     for (const banned of ['Bash', 'Edit', 'MultiEdit', 'NotebookEdit']) {
       assert.ok(!toolsVal.split(',').includes(banned), `--tools must NOT offer ${banned}; got: ${toolsVal}`);
     }
@@ -1249,7 +1396,7 @@ test('Case R2: WSL researcher launch command (toolset=browser, strict, --tools/-
     isSupervised: false,
     isWorker: false,
     isResearcher: true,
-    command: 'ccode --dangerously-skip-permissions --chrome',
+    command: 'ccode --dangerously-skip-permissions',
     workingDirectory: '/home/test/.dashboard/researcher',
     tmuxSessionName: 'agent-rsch-wsl',
   });
@@ -1278,7 +1425,7 @@ test('Case R2: WSL researcher launch command (toolset=browser, strict, --tools/-
     assert.ok(/"DASHBOARD_MCP_TOOLSETS":"browser"/.test(rendered),
       `WSL researcher dashboard toolset must be browser-only; got: ${rendered}`);
     assert.ok(rendered.includes("--tools 'WebSearch,WebFetch,Read,Grep,Glob,Task,Skill,Write,mcp__agent-dashboard__browser_*,mcp__claude-in-chrome__*'"),
-      `WSL researcher --tools must be the single-quoted allowlist (incl. claude-in-chrome fallback); got: ${rendered}`);
+      `WSL researcher --tools must be the single-quoted allowlist (browser_* primary + claude-in-chrome fallback); got: ${rendered}`);
     assert.ok(rendered.includes("--disallowedTools 'Bash,Edit,MultiEdit,NotebookEdit'"),
       `WSL researcher --disallowedTools must list the dangerous built-ins; got: ${rendered}`);
     assert.ok(rendered.includes('--model claude-sonnet-4-6'),
@@ -1293,6 +1440,221 @@ test('Case R2: WSL researcher launch command (toolset=browser, strict, --tools/-
     }
   } finally {
     (WslRunner.prototype as { launch: unknown }).launch = setupStubLaunch;
+    h.cleanup();
+  }
+});
+
+// ── Env/spool gate: roleLaneOf !== 'legacy' (plans/hook-driven-waiting-status.md
+//    Step 5) ──────────────────────────────────────────────────────────────
+// The five env/spool gates moved from `isSupervised || isWorker || isResearcher`
+// to `roleLaneOf(agent) !== 'legacy'`, so a real supervisor (isSupervisor:true)
+// AND a supervisor-privilege persona (privilegeLane:'supervisor', isSupervisor
+// false) now BOTH receive AGENT_ID + DASHBOARD_PORT + DASHBOARD_SPOOL_PATH +
+// a spool tailer + usesSubmitConfirmation===true.
+//
+// Bug 2 / Edit 2.6 broadened the env/spool gate further to
+// `roleLaneOf(agent) !== 'legacy' || isCodexHookPersona(agent)`: a legacy
+// CLAUDE persona (no role flags, no lane) still gets NONE (it falls back to PTY
+// status inference), but a hook-instrumented CODEX persona — provider:'codex'
+// with wantsCodexHooks persisted — DOES now get the env + spool tailer even
+// though it is roleLaneOf==='legacy', or its codex hook script would bail at
+// `if (!agentId) return;`.
+
+/** Drive launchWindowsAgent and capture the extraEnv (6th launch arg) the
+ *  gate injects, plus whether ensureSpoolTailer registered this agent. Stubs
+ *  ensureSpoolTailer to a recorder so the real (fs-touching) tailer never spins
+ *  up — the gate predicate it shares with the env block is what we observe. */
+async function launchAndCaptureEnv(h: Harness, agent: Agent): Promise<{
+  extraEnv: Record<string, string> | undefined;
+  spoolTailerAgents: string[];
+}> {
+  const spoolTailerAgents: string[] = [];
+  (h.supervisor as unknown as { ensureSpoolTailer: (a: Agent) => void }).ensureSpoolTailer =
+    (a: Agent) => { spoolTailerAgents.push(a.id); };
+
+  const origWinLaunch = (WindowsRunner.prototype as { launch: unknown }).launch;
+  let capturedEnv: Record<string, string> | undefined;
+  (WindowsRunner.prototype as { launch: unknown }).launch = function (
+    this: WindowsRunner,
+    _workDir: string,
+    _cmd: string,
+    _args: string[],
+    _logPath: string,
+    _directSpawn?: boolean,
+    extraEnv?: Record<string, string>,
+  ) {
+    capturedEnv = extraEnv;
+    (this as unknown as { _pid: number; _alive: boolean })._pid = 1;
+    (this as unknown as { _pid: number; _alive: boolean })._alive = true;
+  };
+  try {
+    await (h.supervisor as unknown as { launchWindowsAgent: (a: Agent) => Promise<void> })
+      .launchWindowsAgent(agent);
+  } finally {
+    (WindowsRunner.prototype as { launch: unknown }).launch = origWinLaunch;
+  }
+  return { extraEnv: capturedEnv, spoolTailerAgents };
+}
+
+test('Env-gate: a supervisor launch (isSupervisor:true) receives AGENT_ID/DASHBOARD_PORT/DASHBOARD_SPOOL_PATH + spool tailer + submit-confirm', async () => {
+  const agent = makeAgent('eg-sup', {
+    provider: 'claude',
+    isSupervisor: true,
+    isSupervised: false,
+    isWorker: false,
+    isResearcher: false,
+    command: 'claude --dangerously-skip-permissions',
+    workingDirectory: 'C:\\tmp\\.dashboard\\supervisor',
+  });
+  const h = setup({ agent, injectRunner: 'none' });
+  try {
+    const { extraEnv, spoolTailerAgents } = await launchAndCaptureEnv(h, agent);
+    assert.ok(extraEnv, 'supervisor launch must inject extraEnv');
+    assert.equal(extraEnv!.AGENT_ID, agent.id, 'supervisor must receive AGENT_ID');
+    assert.equal(extraEnv!.DASHBOARD_PORT, String((h.supervisor as unknown as { apiServerPort: number }).apiServerPort),
+      'supervisor must receive DASHBOARD_PORT');
+    assert.ok(typeof extraEnv!.DASHBOARD_SPOOL_PATH === 'string' && extraEnv!.DASHBOARD_SPOOL_PATH.length > 0,
+      'supervisor must receive DASHBOARD_SPOOL_PATH');
+    assert.ok(spoolTailerAgents.includes(agent.id), 'supervisor must register a spool tailer');
+    assert.equal(h.supervisor.usesSubmitConfirmation(agent), true,
+      'supervisor (claude, non-legacy lane) uses the submit-confirmation contract');
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('Env-gate: a supervisor-privilege persona (privilegeLane:"supervisor", isSupervisor:false) ALSO passes the gate', async () => {
+  const agent = makeAgent('eg-persona', {
+    provider: 'claude',
+    isSupervisor: false,
+    isSupervised: false,
+    isWorker: false,
+    isResearcher: false,
+    privilegeLane: 'supervisor',
+    command: 'claude --dangerously-skip-permissions',
+    workingDirectory: 'C:\\tmp\\.dashboard\\agents\\orchestrator',
+  });
+  const h = setup({ agent, injectRunner: 'none' });
+  try {
+    const { extraEnv, spoolTailerAgents } = await launchAndCaptureEnv(h, agent);
+    assert.ok(extraEnv, 'supervisor-privilege persona must inject extraEnv');
+    assert.equal(extraEnv!.AGENT_ID, agent.id, 'persona must receive AGENT_ID');
+    assert.equal(extraEnv!.DASHBOARD_PORT, String((h.supervisor as unknown as { apiServerPort: number }).apiServerPort),
+      'persona must receive DASHBOARD_PORT');
+    assert.ok(typeof extraEnv!.DASHBOARD_SPOOL_PATH === 'string' && extraEnv!.DASHBOARD_SPOOL_PATH.length > 0,
+      'persona must receive DASHBOARD_SPOOL_PATH');
+    assert.ok(spoolTailerAgents.includes(agent.id), 'persona must register a spool tailer');
+    assert.equal(h.supervisor.usesSubmitConfirmation(agent), true,
+      'a privilegeLane:supervisor persona is non-legacy → uses the submit-confirmation contract');
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('Env-gate: a legacy CLAUDE persona (no role flags, no lane) receives NONE of the env/spool/submit-confirm', async () => {
+  const agent = makeAgent('eg-legacy', {
+    provider: 'claude',
+    isSupervisor: false,
+    isSupervised: false,
+    isWorker: false,
+    isResearcher: false,
+    // no privilegeLane → roleLaneOf === 'legacy'; claude → isCodexHookPersona false
+    command: 'claude --dangerously-skip-permissions',
+    workingDirectory: 'C:\\tmp\\.dashboard\\agents\\plain',
+  });
+  const h = setup({ agent, injectRunner: 'none' });
+  try {
+    const { extraEnv, spoolTailerAgents } = await launchAndCaptureEnv(h, agent);
+    // A legacy claude agent still gets the ghost-text disable env var, but NONE
+    // of the hook-lane keys. Edit 2.6's escape is codex-only, so a claude persona
+    // is unaffected and stays on PTY status inference.
+    if (extraEnv) {
+      assert.equal(extraEnv.AGENT_ID, undefined, 'legacy claude persona must NOT receive AGENT_ID');
+      assert.equal(extraEnv.DASHBOARD_PORT, undefined, 'legacy claude persona must NOT receive DASHBOARD_PORT');
+      assert.equal(extraEnv.DASHBOARD_SPOOL_PATH, undefined, 'legacy claude persona must NOT receive DASHBOARD_SPOOL_PATH');
+    }
+    assert.ok(!spoolTailerAgents.includes(agent.id), 'legacy claude persona must NOT register a spool tailer');
+    assert.equal(h.supervisor.usesSubmitConfirmation(agent), false,
+      'a legacy-lane claude persona never uses the submit-confirmation contract');
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('Env-gate (Bug 2 / Edit 2.6): a PURE codex persona (no lane, wantsCodexHooks) DOES receive AGENT_ID + spool tailer', async () => {
+  const agent = makeAgent('eg-codex-persona', {
+    provider: 'codex',
+    isSupervisor: false,
+    isSupervised: false,
+    isWorker: false,
+    isResearcher: false,
+    // roleLaneOf === 'legacy' (no lane flags), but the persisted hook flag flips
+    // isCodexHookPersona → true so the env gate's Edit-2.6 escape applies.
+    wantsCodexHooks: true,
+    command: 'codex --profile dashboard-worker --dangerously-bypass-hook-trust',
+    workingDirectory: 'C:\\tmp\\.dashboard\\agents\\codex-persona',
+  });
+  const h = setup({ agent, injectRunner: 'none' });
+  try {
+    const { extraEnv, spoolTailerAgents } = await launchAndCaptureEnv(h, agent);
+    assert.ok(extraEnv, 'codex persona launch must inject extraEnv');
+    assert.equal(extraEnv!.AGENT_ID, agent.id,
+      'pure codex persona must receive AGENT_ID (else the hook script bails at !agentId)');
+    assert.equal(extraEnv!.DASHBOARD_PORT, String((h.supervisor as unknown as { apiServerPort: number }).apiServerPort),
+      'pure codex persona must receive DASHBOARD_PORT');
+    assert.ok(typeof extraEnv!.DASHBOARD_SPOOL_PATH === 'string' && extraEnv!.DASHBOARD_SPOOL_PATH.length > 0,
+      'pure codex persona must receive DASHBOARD_SPOOL_PATH');
+    assert.ok(spoolTailerAgents.includes(agent.id), 'pure codex persona must register a spool tailer');
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('Env-gate (Bug 2 / Edit 2.6): a WORKER-LANE codex persona also receives AGENT_ID + spool tailer', async () => {
+  const agent = makeAgent('eg-codex-worker-persona', {
+    provider: 'codex',
+    isSupervisor: false,
+    isSupervised: false,
+    isWorker: true, // worker lane → roleLaneOf non-legacy; passes via the existing arm
+    isResearcher: false,
+    wantsCodexHooks: true,
+    command: 'codex --profile dashboard-worker --dangerously-bypass-hook-trust',
+    workingDirectory: 'C:\\tmp\\.dashboard\\workers\\codex',
+  });
+  const h = setup({ agent, injectRunner: 'none' });
+  try {
+    const { extraEnv, spoolTailerAgents } = await launchAndCaptureEnv(h, agent);
+    assert.ok(extraEnv, 'worker-lane codex persona launch must inject extraEnv');
+    assert.equal(extraEnv!.AGENT_ID, agent.id, 'worker-lane codex persona must receive AGENT_ID');
+    assert.ok(spoolTailerAgents.includes(agent.id), 'worker-lane codex persona must register a spool tailer');
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('Env-gate (Bug 2 / Edit 2.6): a codex agent WITHOUT wantsCodexHooks and no lane gets NONE (flag — not provider — gates it)', async () => {
+  const agent = makeAgent('eg-codex-bare', {
+    provider: 'codex',
+    isSupervisor: false,
+    isSupervised: false,
+    isWorker: false,
+    isResearcher: false,
+    // wantsCodexHooks omitted → false → isCodexHookPersona false → still legacy.
+    command: 'codex',
+    workingDirectory: 'C:\\tmp\\.dashboard\\agents\\codex-bare',
+  });
+  const h = setup({ agent, injectRunner: 'none' });
+  try {
+    const { extraEnv, spoolTailerAgents } = await launchAndCaptureEnv(h, agent);
+    if (extraEnv) {
+      assert.equal(extraEnv.AGENT_ID, undefined,
+        'a codex agent without the persisted hook flag must NOT receive AGENT_ID');
+      assert.equal(extraEnv.DASHBOARD_SPOOL_PATH, undefined,
+        'a codex agent without the persisted hook flag must NOT receive DASHBOARD_SPOOL_PATH');
+    }
+    assert.ok(!spoolTailerAgents.includes(agent.id),
+      'a codex agent without the persisted hook flag must NOT register a spool tailer');
+  } finally {
     h.cleanup();
   }
 });

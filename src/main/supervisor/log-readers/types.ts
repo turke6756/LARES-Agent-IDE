@@ -20,6 +20,25 @@ export interface ChatLogReader {
   pollSession(session: ChatLogReaderSession): SessionEvent[];
   /** Drop cached path/offsets for an agent. Called when resumeSessionId changes. */
   invalidatePath(agentId: string): void;
+  /** Drain the session-pinned stale signals accumulated since the last call;
+   *  the dispatcher re-emits these as `'session-stale'`. Optional — only the
+   *  Claude reader implements /clear-rotation detection. */
+  drainStaleSignals?(): Array<{
+    agentId: string;
+    staleSessionId: string;
+    workingDirectory: string;
+    observedAt: number;
+  }>;
+  /** Validate that an already-agent-bound candidate session id is a genuine
+   *  `/clear` successor of `currentSessionId` within `workingDirectory`. Does
+   *  NOT discover a successor by scanning — the candidate must be supplied (it
+   *  comes from the hook). Optional — Claude only. */
+  validateClearSuccessor?(
+    workingDirectory: string,
+    currentSessionId: string,
+    candidateSessionId: string,
+    startedAt?: string
+  ): boolean;
   /** Re-read the full content of a previously-truncated tool_result. Returns null if the reader doesn't track this agent or tool result. */
   getFullToolResult?(agentId: string, toolUseId: string): Promise<string | null>;
 }

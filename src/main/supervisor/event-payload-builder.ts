@@ -28,7 +28,7 @@ const CONSOLIDATED_HINT_MAX_CHARS = 80;
 // `waitingExcerpt` per §2.3.3.
 export interface SupervisorEvent {
   type: 'status_change' | 'context_threshold' | 'tmux_new_session_failed'
-    | 'handoff_failed' | 'worker_stalled';
+    | 'handoff_failed' | 'worker_stalled' | 'transient_subscription_expired';
   agentId: string;
   agentTitle: string;
   workspaceId: string;
@@ -65,8 +65,10 @@ export interface SupervisorEvent {
   filesTouched?: Array<{ filePath: string; operation: FileOperation }>;
   /** P2-03: populated when `toStatus === 'waiting'`. Kind is shared with the
    *  StatusMonitor's `WaitingKind` union (question / y-n / enter / choice /
-   *  approve / tty-pattern). */
-  waitingKind?: 'question' | 'y-n' | 'enter' | 'choice' | 'approve' | 'tty-pattern';
+   *  approve / tty-pattern / notification). `notification` is the hook-driven
+   *  wait sourced from the Claude Notification hook (e.g. AskUserQuestion /
+   *  permission prompt). */
+  waitingKind?: 'question' | 'y-n' | 'enter' | 'choice' | 'approve' | 'tty-pattern' | 'notification';
   waitingExcerpt?: string;
   /** Handoff handshake — `handoff_failed` fields. The synchronous
    *  confirm-and-retry exhausted its re-press attempts without ever seeing a
@@ -78,6 +80,10 @@ export interface SupervisorEvent {
   /** Stalled-worker watchdog — `worker_stalled` fields. How long the agent
    *  has been in `working` with zero signal (no PTY output, no hook event). */
   stalledForMs?: number;
+  /** Transient subscription — set on a status event delivered to a transient
+   *  subscriber so the render frames it as a reply to *their* message, not an
+   *  owned agent's lifecycle event. */
+  viaSubscription?: boolean;
 }
 
 function formatTokens(n: number): string {
@@ -186,6 +192,14 @@ export function buildEventPayload(event: SupervisorEvent): string {
   const agentLine = `Agent: "${event.agentTitle}" (${event.agentId.slice(0, 8)})`;
 
   if (event.type === 'status_change') {
+    // Transient-subscription framing: when this status event is delivered to a
+    // transient subscriber (viaSubscription), the header reads as a reply to
+    // *their* message rather than an owned agent's lifecycle event. We do NOT
+    // assert "still busy" — the TTL handler renders that separately.
+    const header = event.viaSubscription
+      ? `[DASHBOARD EVENT] Reply to your message to "${event.agentTitle}" — its turn ended (one-turn subscription now expired)`
+      : '[DASHBOARD EVENT] Agent status changed';
+
     // P2-03: dedicated "waiting for input" rendering when an agent flips to
     // 'waiting'. We hand the supervisor the kind + excerpt so it can decide
     // how to reply (send_message_to_agent for text, send_keys_to_agent for
@@ -198,7 +212,8 @@ export function buildEventPayload(event: SupervisorEvent): string {
         ? `Excerpt: ${JSON.stringify(event.waitingExcerpt)}`
         : '';
       return [
-        '[DASHBOARD EVENT] Agent waiting for input',
+        '[DASHBOARD EVENT] Agent waiting for input'
+          + (event.viaSubscription ? ' (reply to your message; subscription still open)' : ''),
         agentLine,
         kindLine,
         excerptLine,
@@ -228,7 +243,7 @@ export function buildEventPayload(event: SupervisorEvent): string {
     const outputBlock = chatPreview || formatLogTail(event.logTail, 5);
 
     return [
-      '[DASHBOARD EVENT] Agent status changed',
+      header,
       agentLine,
       statusLine + exitLine,
       formatContext(event),
@@ -305,6 +320,16 @@ export function buildEventPayload(event: SupervisorEvent): string {
     ].filter(Boolean).join('\n');
   }
 
+  if (event.type === 'transient_subscription_expired') {
+    // Wording avoids asserting the target is "still busy" — at TTL fire we do
+    // not read live status, only that no terminal event closed the window.
+    return [
+      `[DASHBOARD EVENT] Your one-turn subscription to "${event.agentTitle}" (${event.agentId.slice(0, 8)}) expired`,
+      'No terminal event was delivered before the subscription window closed.',
+      'Re-check it (read_agent_chat / read_agent_log) or re-message to open a fresh one-turn subscription.',
+    ].join('\n');
+  }
+
   // Defensive fallback — still name the sending agent so the supervisor can
   // attribute even a malformed/unknown event to its source.
   return [
@@ -329,7 +354,8 @@ export function buildConsolidatedPayload(events: SupervisorEvent[]): string {
         // line alone for the common cases.
         const hint = consolidatedHint(event.lastAssistantMessage);
         const suffix = hint ? ` — "${hint}"` : '';
-        lines.push(`- ${title}: ${event.fromStatus} → ${event.toStatus}${suffix}`);
+        const replyTag = event.viaSubscription ? ' (reply to you)' : '';
+        lines.push(`- ${title}: ${event.fromStatus} → ${event.toStatus}${replyTag}${suffix}`);
       }
     } else if (event.type === 'context_threshold') {
       lines.push(`- ${title}: context at ${event.contextPercentage}%`);
@@ -340,6 +366,8 @@ export function buildConsolidatedPayload(events: SupervisorEvent[]): string {
     } else if (event.type === 'worker_stalled') {
       const mins = event.stalledForMs != null ? Math.round(event.stalledForMs / 60000) : '?';
       lines.push(`- ${title}: stalled — working ~${mins} min with zero output/hook signal`);
+    } else if (event.type === 'transient_subscription_expired') {
+      lines.push(`- ${title}: one-turn subscription expired`);
     }
   }
   lines.push('\nUse list_agents and read_agent_log to assess each agent.');

@@ -2,16 +2,6 @@ import { EventEmitter } from 'events';
 import { Agent, AgentStatus } from '../../shared/types';
 import {
   STATUS_POLL_INTERVAL_MS,
-  WORKING_THRESHOLD_MS,
-  IDLE_LATCH_TIMEOUT_MS,
-  WAITING_LATCH_TIMEOUT_MS,
-  WORKING_LATCH_MODEL_PENDING_MS,
-  WORKING_LATCH_TOOL_PENDING_MS,
-  WORKING_LATCH_THINKING_PENDING_MS,
-  WORKING_LATCH_MODEL_PENDING_UNSUPERVISED_MS,
-  WORKING_LATCH_TOOL_PENDING_UNSUPERVISED_MS,
-  WORKING_LATCH_THINKING_PENDING_UNSUPERVISED_MS,
-  SUPERVISOR_WORKING_LATCH_MS,
   HOOK_SILENCE_WARN_MS,
   START_HOOK_SILENCE_WARN_MS,
   START_HOOK_RESEND_AFTER_MS,
@@ -28,10 +18,8 @@ import {
 } from '../../shared/constants';
 import { getActiveAgents, updateAgentStatus, updateAgentHookStatus, addEvent } from '../database';
 import type { StatusChangedEvent } from './status-events';
-import { PromptPatternDetector } from './prompt-pattern-detector';
-import { stripAnsi } from './strip-ansi';
 
-export type WaitingKind = 'question' | 'y-n' | 'enter' | 'choice' | 'approve' | 'tty-pattern';
+export type WaitingKind = 'question' | 'y-n' | 'enter' | 'choice' | 'approve' | 'tty-pattern' | 'notification';
 
 // BUG-18 Change 1 — added `thinking-pending` (900 s ceiling) for Claude
 // extended-thinking and equivalent provider phases where no chat event
@@ -55,41 +43,6 @@ export interface ForceWorkingOpts {
    *  the tool-pending ceiling so a `tool_result → next assistant thinking
    *  gap` (Claude writeup §2.1) can survive past the model-pending floor. */
   turnInFlight?: boolean;
-}
-
-const PTY_QUIET_FOR_PATTERN_MS = 2_000;
-
-/** BUG-18 Change 1 — map the stored {@link WorkingLatchTtlClass} onto its
- *  TTL ceiling (ms). `'short'` falls back to `model-pending` so the union
- *  member (declared but currently unused) doesn't widen the window
- *  accidentally. */
-function ttlForClass(c: WorkingLatchTtlClass): number {
-  switch (c) {
-    case 'thinking-pending':
-      return WORKING_LATCH_THINKING_PENDING_MS;
-    case 'tool-pending':
-      return WORKING_LATCH_TOOL_PENDING_MS;
-    case 'model-pending':
-    case 'short':
-    default:
-      return WORKING_LATCH_MODEL_PENDING_MS;
-  }
-}
-
-/** Unsupervised-agent variant of {@link ttlForClass}. Mirrors the same
- *  class→ceiling mapping but with the snappy unsupervised constants. See
- *  plans/tighten-inference-for-unsupervised-agents.md §2.3. */
-function ttlForClassUnsupervised(c: WorkingLatchTtlClass): number {
-  switch (c) {
-    case 'thinking-pending':
-      return WORKING_LATCH_THINKING_PENDING_UNSUPERVISED_MS;
-    case 'tool-pending':
-      return WORKING_LATCH_TOOL_PENDING_UNSUPERVISED_MS;
-    case 'model-pending':
-    case 'short':
-    default:
-      return WORKING_LATCH_MODEL_PENDING_UNSUPERVISED_MS;
-  }
 }
 
 interface IdleLatchEntry {
@@ -1114,164 +1067,16 @@ export class StatusMonitor extends EventEmitter {
       return 'crashed';
     }
 
-    // Class IV promotion: supervised workers trust the Stop hook
-    // (POST /api/agents/:id/status → forceIdleFromHook) and
-    // notifyUserInputDelivered as the sole truth sources for working/idle.
-    // Inference is disabled for them — PTY heuristics, working-latch TTL,
-    // and pattern detection do not run. The alive check above still fires
-    // for done/crashed detection.
-    //
-    // Scope: the worker lane — isSupervised OR isWorker (any provider).
-    // Originally claude-only; broadened per plans/class-iv-worker-hook-scaffold.md
-    // §12.5 once Codex got a Stop-hook scaffold (§12.1), then broadened again to
-    // plain (unsupervised) workers — user-launched claude/codex agents now
-    // default to the worker lane and derive status from hooks alone. Gemini
-    // supervised workers also hit the skip — they have no scaffold yet, so their
-    // idle signal comes solely from chat-stream/turn-complete events (the
-    // chat-event gate in event-bridge keeps gemini on that lane). The user
-    // explicitly accepts that trade-off: PTY inference was masking missing-hook
-    // scaffolds and made hook reliability invisible. Non-worker unsupervised
-    // agents and the supervisor itself stay on inference.
-    //
-    // The researcher role-lane (browser-parity-and-capability-isolation §0) is
-    // its own lane but carries the identical Stop/SessionStart/UserPromptSubmit
-    // status hooks, so it is hook-owned too — disable PTY inference for it.
-    if (agent.isSupervised || agent.isWorker || agent.isResearcher) {
-      return null;
-    }
-
-    // Pipeline B latch — high-confidence chat-stream truth overrides PTY.
-    // PTY bursts cannot promote a latched-idle agent back to 'working' until
-    // the TTL expires or an explicit forceWorking clears it.
-    const latched = this.turnLatch.get(agent.id);
-    if (latched) {
-      if (latched.state === 'working') {
-        const age = this.now() - latched.refreshedAt;
-        const hasOutstandingTools = latched.outstandingToolIds.size > 0;
-        // BUG-18 Change 1 — `latched.ttlClass` is the source-of-truth for the
-        // TTL window. The previous code derived TTL solely from
-        // `outstandingToolIds.size`, which made `ttlClass` dead-stored data and
-        // gave the wrong answer when a `tool-result` resolved the last tool but
-        // the model then thought for >180 s before the next event (the Claude
-        // §2.1 case — 3 of 25 instances in 50 recent JSONLs cleared 180 s).
-        //
-        // `tool-pending` is still forced as a floor whenever a tool is genuinely
-        // outstanding so a shorter stored class (e.g. `model-pending`) doesn't
-        // shrink the window while a tool is live.
-        //
-        // BUG-18 Change 3 — while `turnInFlight === true` AND no tools are
-        // outstanding (post-`tool_result` thinking gap), bump the effective
-        // TTL to `tool-pending` regardless of the stored class. This covers
-        // the case where the last refresh was an `assistant-text` (stored as
-        // `model-pending`) but the turn hasn't terminated — the model can
-        // still spend minutes on the next thinking block.
-        // Supervisor short-circuit: the long worker-shaped TTLs exist to
-        // suppress false-idle events relayed to a supervisor (see
-        // SUPERVISOR_WORKING_LATCH_MS comment in constants.ts). For the
-        // supervisor itself, use a short ceiling so the /input gate and
-        // event-bridge queue gate release promptly when it stops typing.
-        // Skip the tool-pending floor and turnInFlight promotion — both
-        // exist for the same anti-spam reason that doesn't apply here.
-        let effectiveTtl: number;
-        if (agent.isSupervisor) {
-          effectiveTtl = SUPERVISOR_WORKING_LATCH_MS;
-        } else if (!agent.isSupervised) {
-          // Unsupervised non-supervisor agents: snappy TTLs. No supervisor
-          // consumes these flips, so BUG-09/13/18 amplification does not
-          // apply. The hasOutstandingTools floor is kept (raised to the
-          // unsupervised tool-pending value, not the supervised one) so a
-          // genuinely running tool still holds the latch past the model-
-          // pending ceiling. turnInFlight promotion intentionally skipped —
-          // its purpose is to suppress false idles seen by a supervisor
-          // (BUG-18 Change 3), and there is no supervisor here.
-          //
-          // See plans/tighten-inference-for-unsupervised-agents.md §2.2.
-          effectiveTtl = ttlForClassUnsupervised(latched.ttlClass);
-          if (hasOutstandingTools && effectiveTtl < WORKING_LATCH_TOOL_PENDING_UNSUPERVISED_MS) {
-            effectiveTtl = WORKING_LATCH_TOOL_PENDING_UNSUPERVISED_MS;
-          }
-        } else {
-          effectiveTtl = ttlForClass(latched.ttlClass);
-          if (hasOutstandingTools && effectiveTtl < WORKING_LATCH_TOOL_PENDING_MS) {
-            effectiveTtl = WORKING_LATCH_TOOL_PENDING_MS;
-          }
-          if (latched.turnInFlight && !hasOutstandingTools
-              && effectiveTtl < WORKING_LATCH_TOOL_PENDING_MS) {
-            effectiveTtl = WORKING_LATCH_TOOL_PENDING_MS;
-          }
-        }
-        if (age <= effectiveTtl) {
-          // BUG-09 §3.1 (Codex round 3) — tiered PTY-pattern-detection vs
-          // latched working:
-          //   tool-pending: skip pattern detection. A silently-running tool
-          //     can leave a `(y/N)`-shaped line in the ring tail from an
-          //     earlier turn; pattern detection would spuriously fire
-          //     `forceWaiting` and overwrite the genuine tool-pending latch.
-          //   model-pending: run pattern detection first; real waiting prompts
-          //     still beat the generic latched-working state.
-          if (hasOutstandingTools) return 'working';
-
-          const lastOutputForPattern = this.getLastMeaningfulBurst(agent.id);
-          const elapsedForPattern = this.now() - lastOutputForPattern;
-          if (elapsedForPattern > PTY_QUIET_FOR_PATTERN_MS) {
-            const tail = this.getOutputRingTail(agent.id);
-            if (tail) {
-              const stripped = stripAnsi(tail);
-              const hit = PromptPatternDetector.match(stripped);
-              if (hit) {
-                this.forceWaiting(agent.id, hit.kind as WaitingKind, hit.excerpt);
-                return 'waiting';
-              }
-            }
-          }
-          return 'working';
-        }
-        this.turnLatch.delete(agent.id);
-        // fall through to PTY fallback
-      } else {
-        const age = this.now() - latched.setAt;
-        const ttl = latched.state === 'waiting' ? WAITING_LATCH_TIMEOUT_MS : IDLE_LATCH_TIMEOUT_MS;
-        if (age <= ttl) return latched.state;
-        this.turnLatch.delete(agent.id);
-        // fall through to PTY fallback
-      }
-    }
-
-    const lastMeaningful = this.getLastMeaningfulBurst(agent.id);
-    const lastRaw = this.getLastRawOutput(agent.id);
-    const elapsedMeaningful = this.now() - lastMeaningful;
-    const elapsedRaw = this.now() - lastRaw;
-
-    // P2-02: PTY prompt-pattern detection. Only runs once the meaningful
-    // signal has been quiet for ≥2s so a still-streaming agent isn't
-    // classified as waiting mid-burst. On match, arm the waiting latch (which
-    // `forceWaiting` does for us) and return 'waiting' for this tick.
-    if (elapsedMeaningful > PTY_QUIET_FOR_PATTERN_MS) {
-      const tail = this.getOutputRingTail(agent.id);
-      if (tail) {
-        const stripped = stripAnsi(tail);
-        const hit = PromptPatternDetector.match(stripped);
-        if (hit) {
-          // Map the detector's narrow kind to WaitingKind directly — both
-          // unions share the same string literals for tty patterns.
-          this.forceWaiting(agent.id, hit.kind as WaitingKind, hit.excerpt);
-          return 'waiting';
-        }
-      }
-    }
-
-    // BUG-09 §3.5 — dual PTY signal logic:
-    //   - Promote `idle → working` only when the meaningful-burst signal is
-    //     fresh (current rule, preserved).
-    //   - Keep an already-working agent alive while the raw PTY signal is
-    //     fresh, even if meaningful is stale. This is how spinner-only TUI
-    //     phases (`Coalescing…`, `Reading…`) avoid the false-idle flip:
-    //     spinner glyph redraws advance `lastRawOutputTime` but rarely
-    //     accumulate to the 200-byte/3 s gate that promotes meaningful.
-    if (elapsedMeaningful < WORKING_THRESHOLD_MS) return 'working';
-    if (agent.status === 'working' && elapsedRaw < WORKING_THRESHOLD_MS) {
-      return 'working';
-    }
-    return 'idle';
+    // Status is hook-owned for EVERY agent. working/idle/waiting come from the
+    // hook pipeline (UserPromptSubmit→working, Stop→idle, Notification→waiting
+    // via applyHookStatusEvent) and, for hookless providers (gemini), from the
+    // chat-stream's turnComplete in event-bridge. PTY heuristics — the
+    // working-latch TTL read, raw/meaningful burst inference, and the
+    // PromptPatternDetector → `waiting` fallback — were removed: they raced the
+    // hooks and manufactured false working/idle and a `waiting` state that
+    // didn't correspond to a real TUI prompt. `inferStatus` now only resolves
+    // liveness (done/crashed, handled by the `!alive` branch above); for a live
+    // agent it is a deliberate no-op so the last hook / chat-stream write stands.
+    return null;
   }
 }
