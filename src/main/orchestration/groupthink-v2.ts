@@ -19,7 +19,9 @@
 import fs from 'fs';
 import { createHash } from 'crypto';
 import { Agent, AgentProvider, LaunchAgentInput } from '../../shared/types';
-import { DashboardClient, OrchestrationRunContext } from './types';
+import {
+  DashboardClient, OrchestrationRunContext, SendInputConfirmedResult, SubmitRecoveryPolicy,
+} from './types';
 import {
   serialLeadPrompt, serialReviewerKickoff,
   parallelR1Prompt, parallelR2Prompt, parallelSynthesisPrompt,
@@ -34,6 +36,35 @@ const STATUS_CHECK_INTERVAL_MS = 10000;
 // T4 §2: grace window to let the synthesizer's plan-file Write flush land after
 // its R3 turn-complete chat event before declaring a no_plan_written stall.
 const PLAN_WRITE_GRACE_MS = 30000;
+
+// --- Dropped-submit recovery (handshake robustness) — EXPERIMENT variants ---
+// When a worker send returns UNCONFIRMED (no hook + no working flip — the codex
+// turn-1 kickoff signature, where usesSubmitConfirmation is false so the dashboard
+// never re-pressed), the V1/V2 variants recover a dropped Enter by re-pressing the
+// submit-only keystroke while the agent is still demonstrably idle, then re-check.
+// Bounded + evidence-gated so a turn that actually started is never re-pressed into.
+// These are the production defaults from plans/groupthink-handshake-fix.md §4a; the
+// pressure harness overrides them per-run (run.submitRecoveryWindow) so the
+// real-time F-F delay sweep runs in milliseconds.
+const SUBMIT_RESEND_ATTEMPTS = 3;
+const SUBMIT_RESEND_RECHECK_MS = 10_000;  // watch window after each re-press
+const SUBMIT_RESEND_POLL_MS = 1_000;
+// Relaunch budget for a kickoff whose submit is unrecoverable. 2 = one fresh
+// relaunch after the first member fails. Relays do NOT relaunch.
+const KICKOFF_LAUNCH_ATTEMPTS = 2;
+
+interface RecoveryWindow { attempts: number; recheckMs: number; pollMs: number; }
+function recoveryWindow(ctx: OrchestrationRunContext): RecoveryWindow {
+  const w = ctx.run.submitRecoveryWindow;
+  return {
+    attempts: w?.attempts ?? SUBMIT_RESEND_ATTEMPTS,
+    recheckMs: w?.recheckMs ?? SUBMIT_RESEND_RECHECK_MS,
+    pollMs: w?.pollMs ?? SUBMIT_RESEND_POLL_MS,
+  };
+}
+function recoveryPolicy(ctx: OrchestrationRunContext): SubmitRecoveryPolicy {
+  return ctx.run.submitRecoveryPolicy ?? 'raw';
+}
 
 /** Thrown when the run's AbortSignal fires mid-poll. The service swallows it
  *  (it checks controller.signal.aborted), so the name is for clarity only. */
@@ -223,6 +254,92 @@ async function waitForPlanFile(ctx: OrchestrationRunContext, planPath: string, g
   }
 }
 
+// --- Dropped-submit recovery helpers (EXPERIMENT: V1/V2) ---
+
+/** Has the receiver demonstrably moved past `baselineTs` since our send — a turn
+ *  started, output began streaming, or the agent died? Any of these means STOP
+ *  re-pressing Enter: a re-press into an active/started turn would inject a stray
+ *  empty submit. A status flip (working/crashed/done) OR ANY assistant message
+ *  newer than baseline (even a not-yet-complete turn) counts. Only a still-idle
+ *  agent with no new assistant activity is treated as a genuine dropped Enter.
+ *  This is the gate that makes throwing on exhaustion safe: it catches codex's
+ *  status lag via the message stream before confirmedSend ever gives up. */
+async function submitTookEffect(
+  client: DashboardClient, agentId: string, baselineTs: string,
+): Promise<boolean> {
+  const status = client.getAgent(agentId)?.status;
+  if (status === 'working' || status === 'crashed' || status === 'done') return true;
+  const msgs = await client.getMessages(agentId, { limit: 1, role: 'assistant' });
+  const m = msgs?.[0];
+  return !!(m && m.ts > baselineTs);
+}
+
+/** Robust worker send (V1/V2). Goes through the confirmed handshake; on an
+ *  UNCONFIRMED result it recovers a dropped Enter by re-pressing the submit-only
+ *  keystroke while the agent is still idle. RESOLVES once the turn is confirmed
+ *  or evidence shows it started. On EXHAUSTION the behavior is policy-dependent:
+ *    - 'recover-throw'       → throw a `STALL:`-prefixed delivery error (fast,
+ *      explicit, → service maps to 'stalled' + resume hint).
+ *    - 'recover-fallthrough' → emit the failure event and RETURN, letting the
+ *      caller's waitTurnComplete backstop ride it out (a slow-but-healthy turn
+ *      surfaces there; a truly dead prompt burns to turnTimeoutMs).
+ *  Hard failures (send threw — delivery-failed / SubmitNotConfirmedError) are
+ *  re-raised untouched under BOTH policies so the kickoff caller can relaunch. */
+async function confirmedSend(
+  client: DashboardClient, ctx: OrchestrationRunContext,
+  agentId: string, label: string, text: string,
+): Promise<void> {
+  const policy = recoveryPolicy(ctx);
+  const win = recoveryWindow(ctx);
+  // Baseline = the agent's last RELAYED turn ts (seeded pre-kickoff, or set after
+  // the previous relay). Any assistant ts beyond it means a new turn started.
+  const baselineTs = parseHighwater(ctx.run.lastRelayedTs[agentId])?.ts ?? '';
+
+  let res: SendInputConfirmedResult;
+  try {
+    res = await client.sendInputConfirmed(agentId, text);
+  } catch (err) {
+    ctx.emit('delivery_failed', { agentId, label, reason: 'send-threw', error: err instanceof Error ? err.message : String(err) });
+    throw err;   // hard failure — re-raise untouched (kickoff relaunches)
+  }
+  if (res.confirmed) return;   // hook / status-poll proof — turn started
+
+  // UNCONFIRMED — the dropped-submit window. Re-press Enter, but only while the
+  // agent is still idle with no new turn; bail the moment the submit took effect.
+  for (let attempt = 1; attempt <= win.attempts; attempt++) {
+    checkAborted(ctx);
+    if (await submitTookEffect(client, agentId, baselineTs)) return;
+    console.warn(`[groupthink] ${label} (${agentId}) submit unconfirmed — re-pressing Enter (${attempt}/${win.attempts})`);
+    client.resubmitEnter(agentId);
+    const deadline = Date.now() + win.recheckMs;
+    while (Date.now() < deadline) {
+      checkAborted(ctx);
+      await sleep(win.pollMs);
+      if (await submitTookEffect(client, agentId, baselineTs)) return;
+    }
+  }
+  // Re-press exhausted, still no evidence the turn started.
+  ctx.emit('delivery_failed', { agentId, label, reason: 'submit-unconfirmed-after-resend', attempts: win.attempts });
+  if (policy === 'recover-throw') {
+    throw new Error(`STALL: ${label} input delivery unconfirmed after ${win.attempts} re-press attempts (prompt typed but no turn started)`);
+  }
+  // 'recover-fallthrough' — let waitTurnComplete be the backstop.
+}
+
+/** Single send entry point used by the relay loop. V0 ('raw') keeps the exact
+ *  legacy behavior (client.sendInput, no handshake); V1/V2 route through
+ *  confirmedSend. Default policy is 'raw' so nothing changes unless a run opts in. */
+async function sendWorker(
+  client: DashboardClient, ctx: OrchestrationRunContext,
+  agentId: string, label: string, text: string,
+): Promise<void> {
+  if (recoveryPolicy(ctx) === 'raw') {
+    await client.sendInput(agentId, text);
+    return;
+  }
+  await confirmedSend(client, ctx, agentId, label, text);
+}
+
 // --- Agent launch with kickoff (groupthink-v2.js:339–372) ---
 //
 // Every provider gets its kickoff the SAME way: launch (NO systemPrompt), then
@@ -242,6 +359,11 @@ interface LaunchOpts {
   roleDescription: string;
   provider: string;
   kickoffPrompt: string;
+  // Agent-ownership primitive: the supervisor that owns this GroupThink member.
+  // Stamped uniformly as run.supervisorId across serial AND parallel modes so
+  // the lead/reviewer (or both parallel planners) nest as siblings under their
+  // supervisor's owner-container. launchAgent re-validates the edge.
+  ownerAgentId?: string;
 }
 
 async function launchAgentWithKickoff(
@@ -256,18 +378,51 @@ async function launchAgentWithKickoff(
     provider: provider as AgentProvider,
     freshSession: true,
     isSupervised: true,
+    ownerAgentId: opts.ownerAgentId,
   };
 
-  const agent = await client.launchAgent(launchInput);
+  // V0 ('raw') — legacy path verbatim: launch, waitReady, submit kickoff via
+  // sendInput, seed AFTER the send. Reproduces the dropped-kickoff bug.
+  if (recoveryPolicy(ctx) === 'raw') {
+    const agent = await client.launchAgent(launchInput);
+    // All providers get the kickoff as a SUBMITTED message (not a launch-time
+    // systemPrompt). A submitted message arms the worker working-status latch;
+    // a systemPrompt would not, leaving a supervised card stuck on `idle`.
+    await waitReady(client, ctx, agent.id, title);
+    await client.sendInput(agent.id, kickoffPrompt);
+    await seedLastRelayedTsFromChat(client, ctx, agent.id, title);
+    return agent;
+  }
 
-  // All providers get the kickoff as a SUBMITTED message (not a launch-time
-  // systemPrompt). A submitted message arms the worker working-status latch;
-  // a systemPrompt would not, leaving a supervised card stuck on `idle`.
-  await waitReady(client, ctx, agent.id, title);
-  await client.sendInput(agent.id, kickoffPrompt);
-
-  await seedLastRelayedTsFromChat(client, ctx, agent.id, title);
-  return agent;
+  // V1/V2 — kickoff goes through the CONFIRMED handshake with runner-level
+  // dropped-Enter recovery + one relaunch. A kickoff whose submit is
+  // unrecoverable (hard failure OR — under 'recover-throw' — re-press exhausted
+  // with no evidence) tears the member down and launches a fresh one once.
+  // confirmedSend throws on both of those; we relaunch while budget remains, then
+  // re-raise on the final attempt. The highwater is seeded from the PRE-kickoff
+  // snapshot BEFORE the send (BUG-06) so a turn-complete that lands DURING
+  // confirmedSend's wait is still relayed by the caller's waitTurnComplete rather
+  // than mistaken for an old turn (seeding after would pin the mark on the real
+  // kickoff answer → a new stall).
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= KICKOFF_LAUNCH_ATTEMPTS; attempt++) {
+    const last = attempt === KICKOFF_LAUNCH_ATTEMPTS;
+    const agent = await client.launchAgent(launchInput);
+    await waitReady(client, ctx, agent.id, title);
+    await seedLastRelayedTsFromChat(client, ctx, agent.id, title);
+    try {
+      await confirmedSend(client, ctx, agent.id, title, kickoffPrompt);
+      return agent;   // confirmed, evidence the turn started, or fall-through
+    } catch (err) {
+      lastErr = err;
+      console.warn(`[groupthink] kickoff to ${title} failed (attempt ${attempt}/${KICKOFF_LAUNCH_ATTEMPTS}): ${err instanceof Error ? err.message : String(err)}`);
+      await client.stopAgent(agent.id).catch(() => {});
+      if (last) throw err;   // out of relaunch budget — propagate (→ stalled)
+      // else loop: relaunch a fresh member for the kickoff
+    }
+  }
+  // Unreachable (last attempt always returns or throws); satisfies the checker.
+  throw new Error(`Kickoff to ${title} exhausted ${KICKOFF_LAUNCH_ATTEMPTS} attempts${lastErr ? `: ${lastErr instanceof Error ? lastErr.message : String(lastErr)}` : ''}`);
 }
 
 // --- Mode: Serial (groupthink-v2.js:448–547) ---
@@ -299,6 +454,7 @@ export async function runSerial(client: DashboardClient, ctx: OrchestrationRunCo
       roleDescription: 'Lead planner in charge of making the final call. You will receive feedback from a reviewer.',
       provider: leadProvider,
       kickoffPrompt: serialLeadPrompt(topic, planPath),
+      ownerAgentId: run.supervisorId,
     });
     run.leadId = lead.id;
     ctx.persist();
@@ -329,6 +485,7 @@ export async function runSerial(client: DashboardClient, ctx: OrchestrationRunCo
       roleDescription: 'Reviewer agent providing feedback to the Lead Planner.',
       provider: reviewerProvider,
       kickoffPrompt: serialReviewerKickoff(topic, firstLeadMsg.content),
+      ownerAgentId: run.supervisorId,
     });
     run.reviewerId = reviewer.id;
     ctx.persist();
@@ -354,7 +511,7 @@ export async function runSerial(client: DashboardClient, ctx: OrchestrationRunCo
 
     if (fs.existsSync(planPath)) { planWritten = true; break; }
     await waitReceiverReady(client, ctx, lead.id, 'Lead', turnTimeoutMs);
-    await client.sendInput(lead.id,
+    await sendWorker(client, ctx, lead.id, 'Lead',
       `Reviewer Feedback:\n\n${revMsg.content}\n\nRespond to this feedback or finalize the plan.`);
 
     // Lead -> Reviewer
@@ -364,7 +521,7 @@ export async function runSerial(client: DashboardClient, ctx: OrchestrationRunCo
 
     if (fs.existsSync(planPath)) { planWritten = true; break; }
     await waitReceiverReady(client, ctx, reviewer.id, 'Reviewer', turnTimeoutMs);
-    await client.sendInput(reviewer.id,
+    await sendWorker(client, ctx, reviewer.id, 'Reviewer',
       `Feedback from Lead Planner:\n\n${leadMsg.content}\n\nWhat is your review?`);
   }
 
@@ -392,6 +549,7 @@ export async function runParallel(client: DashboardClient, ctx: OrchestrationRun
       roleDescription: 'Independent planner; will synthesize the final plan in R3.',
       provider: leadProvider,
       kickoffPrompt: r1Prompt,
+      ownerAgentId: run.supervisorId,
     }),
     launchAgentWithKickoff(client, ctx, {
       workspaceId,
@@ -399,6 +557,7 @@ export async function runParallel(client: DashboardClient, ctx: OrchestrationRun
       roleDescription: 'Independent planner contributing a cross-provider perspective.',
       provider: reviewerProvider,
       kickoffPrompt: r1Prompt,
+      ownerAgentId: run.supervisorId,
     }),
   ]);
   run.leadId = synthesizer.id;     // synthesizer maps to the 'lead' member slot
@@ -425,11 +584,11 @@ export async function runParallel(client: DashboardClient, ctx: OrchestrationRun
   await Promise.all([
     (async () => {
       await waitReceiverReady(client, ctx, synthesizer.id, 'Synthesizer', turnTimeoutMs);
-      await client.sendInput(synthesizer.id, parallelR2Prompt(peerR1.content));
+      await sendWorker(client, ctx, synthesizer.id, 'Synthesizer', parallelR2Prompt(peerR1.content));
     })(),
     (async () => {
       await waitReceiverReady(client, ctx, peer.id, 'Peer', turnTimeoutMs);
-      await client.sendInput(peer.id, parallelR2Prompt(synthR1.content));
+      await sendWorker(client, ctx, peer.id, 'Peer', parallelR2Prompt(synthR1.content));
     })(),
   ]);
 
@@ -452,7 +611,7 @@ export async function runParallel(client: DashboardClient, ctx: OrchestrationRun
   run.round = 3;
   ctx.emit('round', { round: 3 });
   await waitReceiverReady(client, ctx, synthesizer.id, 'Synthesizer', turnTimeoutMs);
-  await client.sendInput(synthesizer.id, parallelSynthesisPrompt(peerR2.content, planPath));
+  await sendWorker(client, ctx, synthesizer.id, 'Synthesizer', parallelSynthesisPrompt(peerR2.content, planPath));
 
   const synthR3 = await waitTurnComplete(client, ctx, synthesizer.id, 'Synthesizer R3', turnTimeoutMs);
   markRelayed(ctx, synthesizer.id, synthR3);

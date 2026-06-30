@@ -14,6 +14,11 @@ export function createDashboardClient(supervisor: AgentSupervisor): DashboardCli
     // {content, ts, turnComplete}, which is exactly what the relay loop reads.
     getMessages: (id, opts) => supervisor.getChatService().getMessages(id, opts),
     sendInput: async (id, text) => { await supervisor.sendInput(id, text); },
+    // Confirmed handoff send + submit-only re-press — both already exist as
+    // public AgentSupervisor methods (sendInputConfirmed index.ts:4408,
+    // resubmitEnter index.ts:4241). V1/V2 dropped-submit recovery uses these.
+    sendInputConfirmed: (id, text) => supervisor.sendInputConfirmed(id, text),
+    resubmitEnter: (id) => supervisor.resubmitEnter(id),
     isInputInFlight: (id) => supervisor.isInputInFlight(id),
     // The standalone script cleaned up via DELETE /api/agents/:id → stopAgent
     // (mark done + kill process, keep DB record). Mirror that here.

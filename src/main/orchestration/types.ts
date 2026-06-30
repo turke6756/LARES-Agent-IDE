@@ -37,6 +37,25 @@ export interface RunOrchestrationRequest {
   legacyCommand?: string;            // a full `node scripts/groupthink-v2.js …` string
 }
 
+/** Result of the confirmed handoff send (mirrors AgentSupervisor.sendInputConfirmed). */
+export type SendInputConfirmedResult = {
+  delivered: boolean;
+  confirmed: boolean;
+  mode: 'hook' | 'status-poll' | 'unconfirmed';
+};
+
+/** Dropped-submit recovery variant the runner applies to worker sends.
+ *  - 'raw'                 : current/baseline behavior — client.sendInput, no
+ *                            handshake, no recovery (reproduces the kickoff bug).
+ *  - 'recover-fallthrough' : confirmed handshake + evidence-gated re-press; on
+ *                            exhaustion DO NOT throw — fall through to the
+ *                            waitTurnComplete backstop. Kickoff may relaunch.
+ *  - 'recover-throw'       : same recovery, but THROW a STALL: delivery error on
+ *                            relay exhaustion (the plan's chosen terminal). Kickoff
+ *                            relaunch.
+ *  EXPERIMENT field: default 'raw' so nothing else changes. */
+export type SubmitRecoveryPolicy = 'raw' | 'recover-fallthrough' | 'recover-throw';
+
 /** Live + persisted run record (one row in `orchestrations`). */
 export interface OrchestrationRun {
   runId: string;
@@ -59,6 +78,13 @@ export interface OrchestrationRun {
   updatedAt: string;
   endedAt?: string;
   error?: string;
+  // --- EXPERIMENT (exp/gt-handshake-pressure) ---
+  /** Which dropped-submit recovery variant the runner applies. Default 'raw'. */
+  submitRecoveryPolicy?: SubmitRecoveryPolicy;
+  /** Optional recovery-window tuning. The pressure harness scales these down so
+   *  the real-time F-F delay sweep runs in milliseconds rather than tens of
+   *  seconds; production leaves it undefined → the plan's constants apply. */
+  submitRecoveryWindow?: { attempts?: number; recheckMs?: number; pollMs?: number; handshakeMs?: number };
 }
 
 export interface OrchestrationEvent {
@@ -77,6 +103,16 @@ export interface DashboardClient {
   getMessages(id: string, opts: { limit: number; role?: 'assistant' | 'user' }):
     Promise<Array<{ content: string; ts: string; turnComplete?: boolean }>>;
   sendInput(id: string, text: string): Promise<void>;
+  /** Confirmed handoff send (→ supervisor.sendInputConfirmed). Resolves with
+   *  turn-start proof: mode 'hook'|'status-poll' ⇒ confirmed:true; 'unconfirmed'
+   *  ⇒ confirmed:false (no proof within the handshake window — NOT failure).
+   *  REJECTS on hard failure (SubmitNotConfirmedError, or a `delivery-failed`-
+   *  coded Error). V1/V2 use this instead of raw sendInput so a dropped submit
+   *  is detected and recovered rather than silently STALLed. */
+  sendInputConfirmed(id: string, text: string): Promise<SendInputConfirmedResult>;
+  /** Re-press ONLY the submit keystroke (→ supervisor.resubmitEnter) to recover
+   *  a dropped Enter. No body, never queued — a single keystroke. */
+  resubmitEnter(id: string): void;
   isInputInFlight(id: string): boolean;
   // Source-reality reconciliation: the standalone script cleaned members up via
   // `DELETE /api/agents/:id`, which maps to `AgentSupervisor.stopAgent` (marks

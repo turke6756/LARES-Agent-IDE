@@ -28,7 +28,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { runSerial, runParallel } from './groupthink-v2';
 import { Agent } from '../../shared/types';
-import { DashboardClient, OrchestrationRun, OrchestrationRunContext } from './types';
+import { DashboardClient, OrchestrationRun, OrchestrationRunContext, SubmitRecoveryPolicy } from './types';
 
 // ── Clamp setTimeout so 2000ms polls fire in ≤2ms ────────────────────
 const realSetTimeout = global.setTimeout;
@@ -52,6 +52,11 @@ interface FakeAgent {
   getCalls: number;     // getMessages calls since the last arm
   revealAt: number;     // reveal the pending turn on the Nth getMessages call
   sendCount: number;
+  // HEALTHY-but-slow model (F-F): the Enter landed and the turn genuinely
+  // started, but it only becomes OBSERVABLE once real wall-clock passes this
+  // absolute Date.now() value. null when not in slow mode. getMessages reveals it
+  // by real time (not by getCalls), so the recovery windows race REAL elapsed.
+  slowArmAt: number | null;
 }
 
 interface FakeState {
@@ -67,6 +72,23 @@ interface FakeConfig {
   onTurn?: (a: FakeAgent, state: FakeState) => void;   // hook on each revealed turn
   onSend?: (a: FakeAgent, text: string, state: FakeState) => void;  // hook on each sendInput
   tsFor?: (a: FakeAgent, counter: number) => string;   // override turn timestamps
+  // --- Dropped-submit fault knobs (EXPERIMENT) ---
+  /** Simulate a dropped Enter: the body is delivered but no turn arms. Honored by
+   *  BOTH paths — raw sendInput (V0: bug reproduces) and sendInputConfirmed
+   *  (V1/V2: returns {confirmed:false, mode:'unconfirmed'}, recovery decides). */
+  dropSubmit?: (a: FakeAgent, text: string) => boolean;
+  /** Simulate a hard delivery failure (no runner accepted the bytes). */
+  throwSend?: (a: FakeAgent, text: string) => Error | null;
+  /** Model a re-press that ALSO fails to submit (a dead prompt): resubmitEnter
+   *  records the event but does NOT arm the turn. F-B / F-E. */
+  deadResubmit?: (a: FakeAgent) => boolean;
+  /** HEALTHY-but-slow (F-F): the Enter landed; the turn arms after the returned
+   *  real-ms delay D. null ⇒ this send is not slow. */
+  slowArm?: (a: FakeAgent, text: string) => number | null;
+  /** Fake handshake watch window (models the dashboard's HANDSHAKE_CONFIRM_WINDOW_MS):
+   *  a slow turn that surfaces within this real-ms window is caught inside
+   *  sendInputConfirmed → confirmed, no re-press. Default 0. */
+  handshakeMs?: number;
 }
 
 let agentSeq = 0;
@@ -84,6 +106,7 @@ function makeFake(cfg: FakeConfig = {}): { client: DashboardClient; state: FakeS
       turnComplete: true,
     };
     a.pending = false;
+    a.slowArmAt = null;
     state.events.push(`turn:${a.id}#${a.counter}`);
     cfg.onTurn?.(a, state);
   };
@@ -94,6 +117,7 @@ function makeFake(cfg: FakeConfig = {}): { client: DashboardClient; state: FakeS
       const a: FakeAgent = {
         id, title: input.title || id, provider: String(input.provider),
         status: 'idle', latest: null, counter: 0, pending: false, getCalls: 0, revealAt: 1, sendCount: 0,
+        slowArmAt: null,
       };
       state.agents.set(id, a);
       state.launchInputs.push(input);
@@ -105,7 +129,15 @@ function makeFake(cfg: FakeConfig = {}): { client: DashboardClient; state: FakeS
       const a = state.agents.get(id);
       if (!a) return [];
       a.getCalls++;
-      if (!cfg.frozen && a.pending && a.getCalls >= a.revealAt) reveal(a);
+      if (!cfg.frozen) {
+        if (a.slowArmAt != null) {
+          // HEALTHY-but-slow: reveal strictly by REAL elapsed wall-clock so the
+          // recovery windows race actual time, not poll count.
+          if (Date.now() >= a.slowArmAt) reveal(a);
+        } else if (a.pending && a.getCalls >= a.revealAt) {
+          reveal(a);
+        }
+      }
       return a.latest ? [{ ...a.latest }] : [];
     },
     sendInput: async (id, text) => {
@@ -113,12 +145,56 @@ function makeFake(cfg: FakeConfig = {}): { client: DashboardClient; state: FakeS
       if (!a) throw new Error(`sendInput to unknown agent ${id}`);
       a.sendCount++;
       state.sendInputCalls.push({ id, text });
+      const rawErr = cfg.throwSend?.(a, text);
+      if (rawErr) throw rawErr;   // V0 has no relaunch — a hard failure crashes the run
+      // RAW path (V0 / default policy). A dropped Enter arms NOTHING — there is no
+      // recovery, so the next waitTurnComplete polls to turnTimeoutMs: the
+      // reproduced codex-kickoff bug.
+      if (cfg.dropSubmit?.(a, text)) { cfg.onSend?.(a, text, state); return; }
       // First send is the kickoff, immediately followed by the highwater seed
       // read (getCall #1) → reveal on #2. Later sends are relay feedback with
       // no intervening seed → reveal on the first poll (#1).
       const isKickoff = a.sendCount === 1;
       arm(a, isKickoff ? 2 : 1);
       cfg.onSend?.(a, text, state);
+    },
+    // --- Confirmed-handshake seam (V1/V2) ---
+    sendInputConfirmed: async (id, text) => {
+      const a = state.agents.get(id);
+      if (!a) throw new Error(`sendInputConfirmed to unknown agent ${id}`);
+      a.sendCount++;
+      state.sendInputCalls.push({ id, text });
+      const e = cfg.throwSend?.(a, text);
+      if (e) throw e;                                   // F-C: hard delivery failure
+      const d = cfg.slowArm?.(a, text) ?? null;
+      if (d != null) {
+        // HEALTHY-but-slow (F-F): the Enter landed; the turn arms after D real ms.
+        a.pending = true;
+        a.slowArmAt = Date.now() + d;
+        const hsDeadline = Date.now() + (cfg.handshakeMs ?? 0);
+        while (Date.now() < hsDeadline) {
+          if (Date.now() >= a.slowArmAt) { reveal(a); return { delivered: true, confirmed: true, mode: 'status-poll' as const }; }
+          await realSleep(1);
+        }
+        return { delivered: true, confirmed: false, mode: 'unconfirmed' as const };
+      }
+      if (cfg.dropSubmit?.(a, text)) {
+        // Dropped Enter: prompt typed but unsubmitted — NO turn armed.
+        return { delivered: true, confirmed: false, mode: 'unconfirmed' as const };
+      }
+      // Seed read already happened pre-send (§4c) → reveal on the first poll.
+      arm(a, 1);
+      cfg.onSend?.(a, text, state);
+      return { delivered: true, confirmed: true, mode: 'hook' as const };
+    },
+    resubmitEnter: (id) => {
+      const a = state.agents.get(id);
+      if (!a) return;
+      state.events.push(`resubmit:${id}`);
+      if (a.slowArmAt != null) return;          // HEALTHY-slow: turn already scheduled — a spurious no-op re-press
+      if (cfg.deadResubmit?.(a)) return;        // dead prompt: the re-press also fails to submit
+      // The re-press lands: arm the turn the dropped Enter failed to start.
+      if (!a.pending) arm(a, 1);
     },
     isInputInFlight: (id) => (cfg.inFlight ? cfg.inFlight(id) : false),
     stopAgent: async () => {},
@@ -428,6 +504,244 @@ test('INVARIANT-T7 serial: aborting mid-wait rejects with AbortError well before
 
   await rejectsMatching(p, /Orchestration run aborted/);
   assert.ok(Date.now() - started < 2000, 'abort took effect promptly');
+});
+
+// ═════════════════════════════════════════════════════════════════════
+// HANDSHAKE-FIX VARIANT MATRIX (experiment exp/gt-handshake-pressure)
+//
+// Races three dropped-submit recovery variants against the F-A..F-G fault
+// matrix. Variants (run.submitRecoveryPolicy):
+//   V0 'raw'                — baseline; client.sendInput, no handshake/recovery.
+//   V1 'recover-fallthrough'— confirmed handshake + evidence-gated re-press; on
+//                             exhaustion fall through to waitTurnComplete.
+//   V2 'recover-throw'      — same, but THROW STALL on relay exhaustion.
+//
+// All windows are scaled to milliseconds (real wall-clock) so the F-F delay sweep
+// races the recovery window in real time while turnTimeoutMs stays small. Crossover
+// FF_CROSSOVER_MS ≈ handshake(30) + attempts(3)×recheck(40) = 150ms.
+// ═════════════════════════════════════════════════════════════════════
+
+const WINDOW = { attempts: 3, recheckMs: 40, pollMs: 5 };
+const HANDSHAKE_MS = 30;
+const FF_CROSSOVER_MS = HANDSHAKE_MS + WINDOW.attempts * WINDOW.recheckMs;   // ≈150ms
+const TURN_TIMEOUT_MS = 600;   // real ms; fast-stall (~150ms) ≪ this ≪ slow-stall
+
+const VARIANTS: SubmitRecoveryPolicy[] = ['raw', 'recover-fallthrough', 'recover-throw'];
+const VLABEL: Record<string, string> = { 'raw': 'V0', 'recover-fallthrough': 'V1', 'recover-throw': 'V2' };
+const FAULTS = ['F-A', 'F-B', 'F-C', 'F-D', 'F-E', 'F-G'] as const;
+
+/** End a recovering serial run: the lead's 2nd turn writes the plan. */
+function planTerminator(run: OrchestrationRun) {
+  return (a: FakeAgent) => {
+    if (a.title.startsWith('Lead') && a.counter === 2) {
+      try { fs.writeFileSync(run.planPath, 'plan'); } catch { /* ignore */ }
+    }
+  };
+}
+
+function faultCfg(fault: string, run: OrchestrationRun, D = 0): FakeConfig {
+  const onTurn = planTerminator(run);
+  switch (fault) {
+    case 'F-A': {   // kickoff dropped-Enter, recovers on first re-press
+      const dropped = new Set<string>();
+      return { onTurn, dropSubmit: (a) => {
+        if (a.title.startsWith('Reviewer') && !dropped.has(a.id)) { dropped.add(a.id); return true; }
+        return false;
+      } };
+    }
+    case 'F-B':     // kickoff dropped-Enter, never recovers (dead re-press)
+      return { onTurn,
+        dropSubmit: (a) => a.title.startsWith('Reviewer'),
+        deadResubmit: (a) => a.title.startsWith('Reviewer') };
+    case 'F-C': {   // hard delivery failure on kickoff (first reviewer instance only)
+      let fails = 0;
+      return { onTurn, throwSend: (a) => {
+        if (a.title.startsWith('Reviewer') && fails < 1) {
+          fails++;
+          return Object.assign(new Error('Input delivery failed — no runner accepted the bytes'), { code: 'delivery-failed' });
+        }
+        return null;
+      } };
+    }
+    case 'F-D': {   // relay dropped-Enter, recovers on re-press
+      let dropped = false;
+      return { onTurn, dropSubmit: (a, text) => {
+        if (a.title.startsWith('Lead') && /Reviewer Feedback/.test(text) && !dropped) { dropped = true; return true; }
+        return false;
+      } };
+    }
+    case 'F-E':     // relay dropped-Enter, never recovers
+      return { onTurn,
+        dropSubmit: (a, text) => a.title.startsWith('Lead') && /Reviewer Feedback/.test(text),
+        deadResubmit: (a) => a.title.startsWith('Lead') };
+    case 'F-F': {   // HEALTHY-but-slow codex kickoff: Enter landed, turn arms after D real ms
+      const slowed = new Set<string>();
+      return { onTurn, handshakeMs: HANDSHAKE_MS, slowArm: (a) => {
+        if (a.title.startsWith('Reviewer') && !slowed.has(a.id)) { slowed.add(a.id); return D; }
+        return null;
+      } };
+    }
+    case 'F-G':     // claude happy path (confirmed instantly)
+    default:
+      return { onTurn };
+  }
+}
+
+interface CaseResult {
+  variant: SubmitRecoveryPolicy; fault: string; D: number;
+  outcome: string; elapsedMs: number; resubmits: number; reviewerLaunches: number;
+  threw: boolean; msg: string;
+}
+
+function classify(r: { fault: string; threw: boolean; msg: string; reviewerLaunches: number }): string {
+  if (!r.threw) {
+    if (r.fault === 'F-F') return r.reviewerLaunches > 1 ? 'relaunched' : 'rode-out';
+    return r.reviewerLaunches > 1 ? 'relaunched' : 'recovered';
+  }
+  if (/STALL: .*input delivery unconfirmed/.test(r.msg)) return r.fault === 'F-F' ? 'FALSE-STALL' : 'fast-stall';
+  if (/Timeout/.test(r.msg)) return 'slow-stall';
+  if (/delivery-failed|no runner/.test(r.msg)) return 'crash(delivery)';
+  return 'error';
+}
+
+async function runCase(variant: SubmitRecoveryPolicy, fault: string, D = 0): Promise<CaseResult> {
+  const run = makeRun({
+    leadProvider: 'claude', reviewerProvider: 'codex', turnTimeoutMs: TURN_TIMEOUT_MS,
+    submitRecoveryPolicy: variant,
+    submitRecoveryWindow: { attempts: WINDOW.attempts, recheckMs: WINDOW.recheckMs, pollMs: WINDOW.pollMs },
+  });
+  const cfg = faultCfg(fault, run, D);
+  const { client, state } = makeFake(cfg);
+  const { ctx } = makeCtx(run);
+  const start = Date.now();
+  let threw = false, msg = '';
+  try { await runSerial(client, ctx); } catch (err: any) { threw = true; msg = err?.message || String(err); }
+  const elapsedMs = Date.now() - start;
+  rm(run.planPath);
+  const resubmits = state.events.filter((e) => e.startsWith('resubmit:')).length;
+  const reviewerLaunches = state.launchInputs.filter((i) => /Reviewer/.test(i.title)).length;
+  const outcome = classify({ fault, threw, msg, reviewerLaunches });
+  return { variant, fault, D, outcome, elapsedMs, resubmits, reviewerLaunches, threw, msg };
+}
+
+// ── PROBE-V0: pin the reproduced bug (codex turn-1 dropped Enter → timeout stall) ──
+test('PROBE-V0: a raw codex kickoff with a dropped Enter STALLs on the turn-timeout with no recovery', async () => {
+  const r = await runCase('raw', 'F-A');
+  assert.equal(r.outcome, 'slow-stall', 'V0 has no recovery — the dropped kickoff polls to the turn-timeout');
+  assert.match(r.msg, /Timeout/, 'classifies as a timeout stall');
+  assert.equal(r.resubmits, 0, 'V0 never re-presses Enter');
+  assert.ok(r.elapsedMs >= TURN_TIMEOUT_MS, `slow-stall burned the full turn-timeout (${r.elapsedMs}ms ≥ ${TURN_TIMEOUT_MS}ms)`);
+});
+
+// ── INVARIANT-K1: V1 AND V2 recover a dropped codex KICKOFF in place (Q1) ──
+test('INVARIANT-K1: V1 & V2 recover a dropped codex kickoff (F-A) in place via a re-press, no relaunch', async () => {
+  for (const v of ['recover-fallthrough', 'recover-throw'] as SubmitRecoveryPolicy[]) {
+    const r = await runCase(v, 'F-A');
+    assert.equal(r.outcome, 'recovered', `${VLABEL[v]} recovered F-A (got ${r.outcome}: ${r.msg})`);
+    assert.ok(r.resubmits >= 1, `${VLABEL[v]} re-pressed Enter to recover`);
+    assert.equal(r.reviewerLaunches, 1, `${VLABEL[v]} recovered in place — no relaunch`);
+  }
+});
+
+// ── INVARIANT-K1b: V1 AND V2 recover a dropped RELAY (F-D) in place (Q1) ──
+test('INVARIANT-K1b: V1 & V2 recover a dropped relay (F-D) in place via a re-press', async () => {
+  for (const v of ['recover-fallthrough', 'recover-throw'] as SubmitRecoveryPolicy[]) {
+    const r = await runCase(v, 'F-D');
+    assert.equal(r.outcome, 'recovered', `${VLABEL[v]} recovered F-D (got ${r.outcome}: ${r.msg})`);
+    assert.ok(r.resubmits >= 1, `${VLABEL[v]} re-pressed Enter to recover the relay`);
+  }
+});
+
+// ── INVARIANT-K2: a hard delivery-failed kickoff (F-C) relaunches & recovers ──
+test('INVARIANT-K2: V1 & V2 relaunch a fresh member after a hard delivery-failed kickoff (F-C) and recover', async () => {
+  for (const v of ['recover-fallthrough', 'recover-throw'] as SubmitRecoveryPolicy[]) {
+    const r = await runCase(v, 'F-C');
+    assert.equal(r.outcome, 'relaunched', `${VLABEL[v]} relaunched on F-C (got ${r.outcome}: ${r.msg})`);
+    assert.equal(r.reviewerLaunches, 2, `${VLABEL[v]} relaunched the reviewer exactly once`);
+  }
+  // V0 has no relaunch — the hard failure crashes the run.
+  const v0 = await runCase('raw', 'F-C');
+  assert.equal(v0.outcome, 'crash(delivery)', 'V0 crashes on a hard delivery failure (no relaunch path)');
+});
+
+// ── INVARIANT-K3: dead prompt (F-E) — V2 fails FAST, V1 rides to the timeout;
+//    both reach a 'stalled' end-state (Q3) ──
+test('INVARIANT-K3: dead relay (F-E) — V2 STALLs fast, V1 slow-stalls; both map to stalled', async () => {
+  const v1 = await runCase('recover-fallthrough', 'F-E');
+  const v2 = await runCase('recover-throw', 'F-E');
+  assert.equal(v2.outcome, 'fast-stall', `V2 threw a fast STALL (got ${v2.outcome})`);
+  assert.match(v2.msg, /STALL: .*input delivery unconfirmed/, 'V2 throws the explicit delivery STALL');
+  assert.equal(v1.outcome, 'slow-stall', `V1 rode to the turn-timeout (got ${v1.outcome})`);
+  assert.match(v1.msg, /Timeout/, 'V1 falls through to the waitTurnComplete timeout');
+  // Both end-states map to 'stalled' under service.ts (STALL prefix / Timeout substring).
+  assert.ok(/STALL/.test(v2.msg) || /Timeout/.test(v2.msg), 'V2 → stalled');
+  assert.ok(/STALL/.test(v1.msg) || /Timeout/.test(v1.msg), 'V1 → stalled');
+  // V2 is dramatically faster to the same resumable end-state.
+  assert.ok(v2.elapsedMs < v1.elapsedMs, `V2 (${v2.elapsedMs}ms) fails faster than V1 (${v1.elapsedMs}ms)`);
+  assert.ok(v2.elapsedMs < TURN_TIMEOUT_MS, `V2 fast-stall ≪ turnTimeoutMs (${v2.elapsedMs}ms < ${TURN_TIMEOUT_MS}ms)`);
+});
+
+// ── PROBE-F-F-crossover: the regression probe (Q2). Past the crossover, V2's
+//    fast-throw FALSE-STALLs a HEALTHY-but-slow codex turn that V1 rides out. ──
+test('PROBE-F-F: past the recovery window, V2 FALSE-STALLs a healthy-slow codex turn that V1 rides out', async () => {
+  const D = FF_CROSSOVER_MS + 250;   // comfortably past the crossover, still < turnTimeoutMs
+  const v1 = await runCase('recover-fallthrough', 'F-F', D);
+  const v2 = await runCase('recover-throw', 'F-F', D);
+  assert.equal(v1.outcome, 'rode-out', `V1 rode out the slow-but-healthy turn (got ${v1.outcome}: ${v1.msg})`);
+  assert.equal(v2.outcome, 'FALSE-STALL', `V2 false-stalled the healthy turn (got ${v2.outcome}: ${v2.msg})`);
+  assert.match(v2.msg, /STALL: .*input delivery unconfirmed/, 'V2 throws the delivery STALL on a turn that was actually healthy');
+});
+
+// ── INVARIANT-F-F-gate: within the handshake window, evidence-gating fires ZERO
+//    stray re-presses into a promptly-observable healthy turn — in BOTH variants. ──
+test('INVARIANT-F-F-gate: a healthy turn observable within the handshake window draws no re-press (both variants)', async () => {
+  const D = 10;   // < HANDSHAKE_MS → caught inside sendInputConfirmed, before any re-press
+  for (const v of ['recover-fallthrough', 'recover-throw'] as SubmitRecoveryPolicy[]) {
+    const r = await runCase(v, 'F-F', D);
+    assert.equal(r.resubmits, 0, `${VLABEL[v]} fired no stray re-press into a promptly-observable healthy turn`);
+    assert.ok(r.outcome === 'rode-out' || r.outcome === 'recovered', `${VLABEL[v]} completed (got ${r.outcome})`);
+  }
+});
+
+// ── INVARIANT-F-G-clean: a confirmed (happy-path) run never re-presses Enter ──
+test('INVARIANT-F-G-clean: a clean confirmed run (F-G) never re-presses Enter, any variant', async () => {
+  for (const v of VARIANTS) {
+    const r = await runCase(v, 'F-G');
+    assert.equal(r.resubmits, 0, `${VLABEL[v]} happy path fired no re-press`);
+    assert.equal(r.outcome, 'recovered', `${VLABEL[v]} completed cleanly (got ${r.outcome})`);
+  }
+});
+
+// ── Matrix table printer (informational — feeds the RESULTS writeup) ──
+test('MATRIX: print the variant×fault table and the F-F delay sweep', async () => {
+  const rows: CaseResult[] = [];
+  for (const v of VARIANTS) for (const f of FAULTS) rows.push(await runCase(v, f));
+  // F-F at a representative past-crossover delay for the main table.
+  const ffD = FF_CROSSOVER_MS + 250;
+  for (const v of VARIANTS) rows.push(await runCase(v, 'F-F', ffD));
+
+  const cell = (r: CaseResult) => `${r.outcome}/${r.elapsedMs}ms/rp${r.resubmits}${r.reviewerLaunches > 1 ? `/L${r.reviewerLaunches}` : ''}`;
+  const faultCols = [...FAULTS, 'F-F'];
+  console.log('\n=== VARIANT × FAULT MATRIX  (outcome / elapsed / re-presses [/ launches if relaunched]) ===');
+  console.log(`F-F shown at D=${ffD}ms (crossover≈${FF_CROSSOVER_MS}ms, turnTimeout=${TURN_TIMEOUT_MS}ms)`);
+  const header = ['variant'.padEnd(8), ...faultCols.map((f) => f.padEnd(26))].join(' | ');
+  console.log(header);
+  for (const v of VARIANTS) {
+    const byFault: Record<string, CaseResult> = {};
+    for (const r of rows.filter((x) => x.variant === v)) byFault[r.fault] = byFault[r.fault] && r.fault === 'F-F' ? byFault[r.fault] : r;
+    const line = [VLABEL[v].padEnd(8), ...faultCols.map((f) => cell(byFault[f]).padEnd(26))].join(' | ');
+    console.log(line);
+  }
+
+  console.log('\n=== F-F DELAY SWEEP  (HEALTHY-but-slow codex kickoff; crossover≈' + FF_CROSSOVER_MS + 'ms) ===');
+  console.log(['D(ms)'.padEnd(8), 'V1 (recover-fallthrough)'.padEnd(34), 'V2 (recover-throw)'.padEnd(34)].join(' | '));
+  for (const D of [10, 60, 100, FF_CROSSOVER_MS + 250, FF_CROSSOVER_MS + 450]) {
+    const v1 = await runCase('recover-fallthrough', 'F-F', D);
+    const v2 = await runCase('recover-throw', 'F-F', D);
+    const fmt = (r: CaseResult) => `${r.outcome} (rp${r.resubmits}, ${r.elapsedMs}ms${r.reviewerLaunches > 1 ? `, L${r.reviewerLaunches}` : ''})`;
+    console.log([String(D).padEnd(8), fmt(v1).padEnd(34), fmt(v2).padEnd(34)].join(' | '));
+  }
+  console.log('');
 });
 
 // ── Runner ───────────────────────────────────────────────────────────

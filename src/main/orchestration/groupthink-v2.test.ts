@@ -119,6 +119,18 @@ function makeFake(cfg: FakeConfig = {}): { client: DashboardClient; state: FakeS
       const isKickoff = a.sendCount === 1;
       arm(a, isKickoff ? 2 : 1);
     },
+    // These tests run the default 'raw' policy, so the runner never calls the
+    // confirmed-handshake seams — present only so the widened DashboardClient
+    // interface compiles.
+    sendInputConfirmed: async (id, text) => {
+      const a = state.agents.get(id);
+      if (!a) throw new Error(`sendInputConfirmed to unknown agent ${id}`);
+      a.sendCount++;
+      state.sendInputCalls.push({ id, text });
+      arm(a, 1);
+      return { delivered: true, confirmed: true, mode: 'hook' as const };
+    },
+    resubmitEnter: () => {},
     isInputInFlight: (id) => (cfg.inFlight ? cfg.inFlight(id) : false),
     stopAgent: async () => {},
   };
@@ -201,6 +213,14 @@ test('serial: reviewer launches only after lead turn-1; claude AND codex via sen
     assert.equal(state.launchInputs.length, 2, 'lead + reviewer launched');
     assert.match(state.launchInputs[0].title, /Lead/, 'lead launched first');
     assert.match(state.launchInputs[1].title, /Reviewer/, 'reviewer launched second');
+
+    // Owner-edge stamping (owner-as-container §3.1): every launch input carries
+    // ownerAgentId === run.supervisorId, so lead + reviewer nest as siblings
+    // under the supervisor's container.
+    for (const input of state.launchInputs) {
+      assert.equal(input.ownerAgentId, run.supervisorId,
+        `launch input ${input.title} stamped with the supervisor as owner`);
+    }
 
     // BUG-29 ordering: reviewer launch event comes AFTER the lead's first turn.
     const leadId = state.launchInputs[0] && Array.from(state.agents.values()).find((a) => a.title.startsWith('Lead'))!.id;
@@ -302,6 +322,15 @@ test('parallel: rounds run R1→R2→R3 and synthesizer writes the plan', async 
     const peer = Array.from(state.agents.values()).find((a) => a.title.startsWith('Planner'))!;
     assert.ok(synth && peer, 'both planners launched');
     assert.equal(synth.counter, 3, 'synthesizer ran 3 turns (R1, R2, R3)');
+
+    // Owner-edge stamping (owner-as-container §3.1): in parallel mode both
+    // planners launch concurrently, so neither can own the other — the
+    // supervisor is the uniform owner stamped on every launch input.
+    assert.equal(state.launchInputs.length, 2, 'two planners launched');
+    for (const input of state.launchInputs) {
+      assert.equal(input.ownerAgentId, run.supervisorId,
+        `launch input ${input.title} stamped with the supervisor as owner`);
+    }
 
     // Both planners (claude synth + codex peer) kicked off via sendInput, no
     // systemPrompt at launch.
