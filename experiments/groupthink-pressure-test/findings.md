@@ -87,3 +87,54 @@ template below verbatim. See `PROTOCOL.md` §6 for rules.
 - **Hardening implication:** PROTOCOL §7 backlog items 1, 2, 4 are closed (fixes
   pinned by INVARIANTs). Item 3 (T3 working-status unbounded wait) remains an open
   PROBE — out of scope for this pass.
+
+## 2026-06-30 — PROBE-V0 + F-A..F-G variant matrix — codex turn-1 dropped-kickoff repro; V1/V2 recovery raced
+
+- **Agent:** worker (continuing exp/gt-handshake-pressure, commit 62e2568 → follow-on)
+- **Tier:** 1
+- **Classification:** new-failure-mode (codex turn-1 dropped-kickoff STALL) +
+  recipe-validated (V1 `recover-fallthrough`, V2 `recover-throw` both recover the
+  bug) + recipe-failed (V2 FALSE-STALLs healthy-slow codex past the recovery window)
+- **Catalog row:** F-next proposed — "codex turn-1 kickoff dropped Enter →
+  unsubmitted → turnTimeout STALL, no re-press (usesSubmitConfirmation false on
+  turn-1)". Variant faults F-A..F-G are recovery-policy probes, not catalog rows.
+- **Expected:** (V0) raw codex kickoff with a dropped Enter polls to turnTimeoutMs
+  with zero re-presses — the bug from `plans/groupthink-handshake-fix.md`. (V1/V2)
+  the confirmed handshake + evidence-gated re-press recovers F-A/F-D in place; the
+  disputed terminal policy (throw vs fall-through) only diverges on
+  unrecoverable-unconfirmed and on healthy-but-slow turns.
+- **Observed:**
+  - **PROBE-V0** reproduces deterministically: `raw` + F-A ⇒ `slow-stall`,
+    `/Timeout/`, `rp0`, elapsed ≥ turnTimeoutMs. New-failure-mode pinned.
+  - **Q1 (F-A/F-D):** V1 & V2 both `recovered`, `rp1`, no relaunch — identical.
+    Recovery machinery, not terminal policy, fixes the bug. (INVARIANT-K1/K1b)
+  - **Q2 (F-F):** crossover D = recovery window = handshake + attempts×recheck
+    (≈150 ms scaled; **≈32 s production**, real-elapsed sweep via `GT_FF_REALTIME=1`).
+    Below it both ride out; above it **only V2 FALSE-STALLs** (then relaunches L2
+    into the same slow condition, ~64 s). V1 rides out at every D (5/20/40/60 s).
+    Evidence-gating fires zero re-presses only when the turn is *observable* within
+    the handshake window (INVARIANT-F-F-gate, INVARIANT-F-G-clean); for an
+    in-flight-but-unobservable healthy turn both variants fire bounded *harmless*
+    (no-op) re-presses — the gate does not stop V2's eventual throw.
+  - **Q3 (F-B/F-E):** V2 `fast-stall` (~32–45 s prod) ≪ V1 `slow-stall` (full
+    turnTimeoutMs, default 600 s); both route to the same resumable `stalled` +
+    resume-hint end-state via service.ts STALL/Timeout matching. (INVARIANT-K3)
+  - **F-C** hard delivery-failure: V1/V2 `relaunched` (L2) + recover; V0
+    `crash(delivery)` (no relaunch path). (INVARIANT-K2)
+- **Evidence:** build `npm run build:main` clean. Tallies: `groupthink-pressure`
+  **16/16** (default) / **17/17** (`GT_FF_REALTIME=1`), `groupthink-v2` **6/6**,
+  `orchestration-service` **6/6**. Real-time sweep table (production window,
+  crossover≈32 s): D=5 s→V1/V2 rode-out; 20 s→V1/V2 rode-out; 40 s→V1 rode-out /
+  V2 FALSE-STALL (64.1 s, L2); 60 s→V1 rode-out / V2 FALSE-STALL (64.1 s, L2).
+  Full writeup: `experiments/groupthink-pressure-test/RESULTS-handshake-variants-2026-06-30.md`.
+- **Hardening implication:** recommend **V1 (`recover-fallthrough`)** as the
+  default fix for the codex-kickoff bug. The shared recovery machinery is the real
+  fix; the terminal policy is the only disagreement, and the F-F crossover (~32 s)
+  overlaps normal codex turn-1 silent-think time, so V2's FALSE-STALL is a live
+  regression hazard, not a rare tail. V1 never converts a healthy run into a
+  failure; its only cost is a bounded delay to the same resumable state on an
+  already-dead prompt. This **weakens** the plan's §"Why throw on exhaustion"
+  decision (line 399) — the accepted residual FALSE-STALL risk is too close to
+  real behavior to be a safe default. If V2's fast-fail is wanted, widen
+  `SUBMIT_RESEND_RECHECK_MS` past p99 codex think-time first (needs live data), or
+  adopt the hybrid: V1 fall-through + an immediate `delivery_failed` diagnostic.

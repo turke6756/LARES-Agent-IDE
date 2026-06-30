@@ -539,7 +539,7 @@ function planTerminator(run: OrchestrationRun) {
   };
 }
 
-function faultCfg(fault: string, run: OrchestrationRun, D = 0): FakeConfig {
+function faultCfg(fault: string, run: OrchestrationRun, D = 0, handshakeMs = HANDSHAKE_MS): FakeConfig {
   const onTurn = planTerminator(run);
   switch (fault) {
     case 'F-A': {   // kickoff dropped-Enter, recovers on first re-press
@@ -576,7 +576,7 @@ function faultCfg(fault: string, run: OrchestrationRun, D = 0): FakeConfig {
         deadResubmit: (a) => a.title.startsWith('Lead') };
     case 'F-F': {   // HEALTHY-but-slow codex kickoff: Enter landed, turn arms after D real ms
       const slowed = new Set<string>();
-      return { onTurn, handshakeMs: HANDSHAKE_MS, slowArm: (a) => {
+      return { onTurn, handshakeMs, slowArm: (a) => {
         if (a.title.startsWith('Reviewer') && !slowed.has(a.id)) { slowed.add(a.id); return D; }
         return null;
       } };
@@ -604,13 +604,15 @@ function classify(r: { fault: string; threw: boolean; msg: string; reviewerLaunc
   return 'error';
 }
 
-async function runCase(variant: SubmitRecoveryPolicy, fault: string, D = 0): Promise<CaseResult> {
+interface CaseOpts { window?: { attempts: number; recheckMs: number; pollMs: number }; turnTimeoutMs?: number; handshakeMs?: number; }
+async function runCase(variant: SubmitRecoveryPolicy, fault: string, D = 0, opts: CaseOpts = {}): Promise<CaseResult> {
+  const win = opts.window ?? WINDOW;
   const run = makeRun({
-    leadProvider: 'claude', reviewerProvider: 'codex', turnTimeoutMs: TURN_TIMEOUT_MS,
+    leadProvider: 'claude', reviewerProvider: 'codex', turnTimeoutMs: opts.turnTimeoutMs ?? TURN_TIMEOUT_MS,
     submitRecoveryPolicy: variant,
-    submitRecoveryWindow: { attempts: WINDOW.attempts, recheckMs: WINDOW.recheckMs, pollMs: WINDOW.pollMs },
+    submitRecoveryWindow: { attempts: win.attempts, recheckMs: win.recheckMs, pollMs: win.pollMs },
   });
-  const cfg = faultCfg(fault, run, D);
+  const cfg = faultCfg(fault, run, D, opts.handshakeMs ?? HANDSHAKE_MS);
   const { client, state } = makeFake(cfg);
   const { ctx } = makeCtx(run);
   const start = Date.now();
@@ -743,6 +745,50 @@ test('MATRIX: print the variant×fault table and the F-F delay sweep', async () 
   }
   console.log('');
 });
+
+// ── F-F REAL-TIME SWEEP (opt-in: GT_FF_REALTIME=1) ────────────────────
+// The matrix above scales the recovery window to milliseconds so the suite stays
+// fast (~2s). This opt-in case instead uses the PRODUCTION recovery window from
+// plans/groupthink-handshake-fix.md (3 re-press attempts × 10s recheck ⇒ ≈32s of
+// genuine re-press watching) and sweeps the HEALTHY-but-slow codex delay D across
+// 5s / 20s / 40s / 60s in REAL wall-clock — the literal protocol the experiment
+// asks for. It answers Q2 against real constants: the crossover at which V2's
+// fast-throw begins FALSE-STALLing a healthy-slow turn that V1 rides out is the
+// re-press window (~32s), so D≤20s rides out under both variants and D≥40s
+// false-stalls only under V2. Gated because the 4 real-second waits make it a
+// ~4-minute run; the fast scaled matrix is the regression gate.
+const PROD_WINDOW = { attempts: 3, recheckMs: 10_000, pollMs: 1_000 };   // plan §4a defaults
+const PROD_HANDSHAKE_MS = 2_000;     // realistic confirm-watch; immaterial since every D ≫ it
+const PROD_TURN_TIMEOUT_MS = 600_000;
+const PROD_CROSSOVER_MS = PROD_HANDSHAKE_MS + PROD_WINDOW.attempts * PROD_WINDOW.recheckMs;  // ≈32s
+
+if (process.env.GT_FF_REALTIME === '1') {
+  test('PROBE-F-F-realtime: production-window F-F sweep at 5s/20s/40s/60s real elapsed', async () => {
+    const opts: CaseOpts = { window: PROD_WINDOW, turnTimeoutMs: PROD_TURN_TIMEOUT_MS, handshakeMs: PROD_HANDSHAKE_MS };
+    const Ds = [5_000, 20_000, 40_000, 60_000];
+    console.log('\n=== F-F REAL-TIME SWEEP  (production recovery window: 3×10s re-press ⇒ crossover≈' + Math.round(PROD_CROSSOVER_MS / 1000) + 's) ===');
+    console.log(['D'.padEnd(6), 'V1 (recover-fallthrough)'.padEnd(40), 'V2 (recover-throw)'.padEnd(40)].join(' | '));
+    const fmt = (r: CaseResult) => `${r.outcome} (rp${r.resubmits}, ${(r.elapsedMs / 1000).toFixed(1)}s${r.reviewerLaunches > 1 ? `, L${r.reviewerLaunches}` : ''})`;
+    const sweep: Array<{ D: number; v1: CaseResult; v2: CaseResult }> = [];
+    for (const D of Ds) {
+      const v1 = await runCase('recover-fallthrough', 'F-F', D, opts);
+      const v2 = await runCase('recover-throw', 'F-F', D, opts);
+      sweep.push({ D, v1, v2 });
+      console.log([`${D / 1000}s`.padEnd(6), fmt(v1).padEnd(40), fmt(v2).padEnd(40)].join(' | '));
+    }
+    console.log('');
+    // Invariants the sweep must hold: below the window both ride out; above it
+    // only V2 false-stalls (V1 always rides out a genuinely-healthy turn).
+    for (const { D, v1, v2 } of sweep) {
+      assert.equal(v1.outcome, 'rode-out', `V1 must ride out a healthy-slow turn at D=${D}ms (got ${v1.outcome})`);
+      if (D <= PROD_CROSSOVER_MS) {
+        assert.equal(v2.outcome, 'rode-out', `V2 should also ride out within the recovery window at D=${D}ms (got ${v2.outcome})`);
+      } else {
+        assert.equal(v2.outcome, 'FALSE-STALL', `V2 should FALSE-STALL past the recovery window at D=${D}ms (got ${v2.outcome})`);
+      }
+    }
+  });
+}
 
 // ── Runner ───────────────────────────────────────────────────────────
 (async () => {
