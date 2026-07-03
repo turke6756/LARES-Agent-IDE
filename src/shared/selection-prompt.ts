@@ -26,16 +26,34 @@ export interface QuotedPromptSource {
   // Human line for the prompt, e.g. the file path or `agent chat with "Builder"`.
   sourceLabel: string;
   file?: { filePath: string; lineStart?: number; lineEnd?: number };
+  // Set when the quoted text was selected from a PRIOR (out-of-context) chat
+  // session so the Source: line can attribute the quote to that specific
+  // session. `generation` is a display label that may repeat across a `/clear`;
+  // `sessionId` is the real disambiguator (shortened in the rendered line).
+  priorSession?: { generation: number; sessionId: string };
 }
 
 const HEADER = '[SELECTION COMMENT]';
+
+// Short, human-scannable slice of a session id for the Source: line — mirrors
+// the divider caption in ChatPane so provenance reads consistently.
+function shortSessionId(sessionId: string): string {
+  return sessionId.length > 8 ? sessionId.slice(0, 8) : sessionId;
+}
 
 function sourceLine(ctx: QuotedPromptSource): string {
   // File surfaces pass the bare path as sourceLabel; the format shows
   // `Source: file C:\...\doc.md`. Chat/note surfaces bake their own phrasing
   // into sourceLabel (`agent chat with "Builder"`, `note "ideas.md"`).
   if (ctx.targetType === 'file') return `Source: file ${ctx.sourceLabel}`;
-  return `Source: ${ctx.sourceLabel}`;
+  const base = `Source: ${ctx.sourceLabel}`;
+  // A quote lifted from a prior session gets an explicit out-of-context tag so
+  // the receiving (live) agent knows it is not quoting its current transcript.
+  if (ctx.priorSession) {
+    const { generation, sessionId } = ctx.priorSession;
+    return `${base} — PREVIOUS SESSION (gen ${generation}, session ${shortSessionId(sessionId)}, not in current context)`;
+  }
+  return base;
 }
 
 function linesLine(ctx: QuotedPromptSource): string | null {

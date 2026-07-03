@@ -12,6 +12,10 @@ export interface SelectionContext {
   file?: { filePath: string; lineStart?: number; lineEnd?: number };
   chat?: { agentId: string; agentName: string };
   note?: { notePath: string };
+  // Present when the selection was made inside a PRIOR (out-of-context) chat
+  // session; carried through to buildQuotedPrompt so the Source: line names the
+  // originating session. `sessionId` disambiguates same-generation /clear siblings.
+  priorSession?: { generation: number; sessionId: string };
   // Persist/comment available on this surface (no surface sets it in slice 1).
   capabilities: { comment: boolean };
 }

@@ -89,6 +89,22 @@ describe('buildQuotedPrompt', () => {
     expect(out).not.toContain('Lines:');
   });
 
+  it('tags a prior-session chat quote with an out-of-context Source: suffix', () => {
+    const out = buildQuotedPrompt(
+      { ...chatCtx, priorSession: { generation: 2, sessionId: 'abcdef1234567890' } },
+      [{ quote: 'old context' }],
+    );
+    expect(out).toContain(
+      'Source: agent chat with "Builder" — PREVIOUS SESSION (gen 2, session abcdef12, not in current context)',
+    );
+  });
+
+  it('does not add the prior-session suffix when priorSession is absent', () => {
+    const out = buildQuotedPrompt(chatCtx, [{ quote: 'live text' }]);
+    expect(out).toContain('Source: agent chat with "Builder"');
+    expect(out).not.toContain('PREVIOUS SESSION');
+  });
+
   it('uses the note sourceLabel verbatim', () => {
     const out = buildQuotedPrompt(
       { targetType: 'note', sourceLabel: 'note "ideas.md"' },
