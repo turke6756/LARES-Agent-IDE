@@ -57,6 +57,10 @@ interface FakeAgent {
   // absolute Date.now() value. null when not in slow mode. getMessages reveals it
   // by real time (not by getCalls), so the recovery windows race REAL elapsed.
   slowArmAt: number | null;
+  // WP1/BUG-37 chat-blackout: true once recoverChatBinding(id) has rebound the
+  // reader. The chatBlackout predicate may consult this to model a RECOVERABLE
+  // blackout (clears on rebind) vs a PERMANENT one (ignores it).
+  chatBound: boolean;
 }
 
 interface FakeState {
@@ -89,6 +93,13 @@ interface FakeConfig {
    *  a slow turn that surfaces within this real-ms window is caught inside
    *  sendInputConfirmed → confirmed, no re-press. Default 0. */
   handshakeMs?: number;
+  /** WP1/BUG-37 chat-blackout fault: while this returns true for an agent, its
+   *  getMessages returns [] even though the turn may be complete on disk (the
+   *  codex lost-discovery-race signature). A RECOVERABLE blackout returns
+   *  `!a.chatBound` so waitTurnComplete's deadline recoverChatBinding clears it; a
+   *  PERMANENT one ignores chatBound so recovery reveals nothing and the run
+   *  still times out. */
+  chatBlackout?: (a: FakeAgent) => boolean;
 }
 
 let agentSeq = 0;
@@ -117,7 +128,7 @@ function makeFake(cfg: FakeConfig = {}): { client: DashboardClient; state: FakeS
       const a: FakeAgent = {
         id, title: input.title || id, provider: String(input.provider),
         status: 'idle', latest: null, counter: 0, pending: false, getCalls: 0, revealAt: 1, sendCount: 0,
-        slowArmAt: null,
+        slowArmAt: null, chatBound: false,
       };
       state.agents.set(id, a);
       state.launchInputs.push(input);
@@ -138,6 +149,10 @@ function makeFake(cfg: FakeConfig = {}): { client: DashboardClient; state: FakeS
           reveal(a);
         }
       }
+      // WP1/BUG-37: the turn may be complete on disk (a.latest set) yet invisible
+      // until the codex sid is rebound. Gate AFTER reveal so "completed on disk"
+      // and "readable" are decoupled — exactly the blackout the runner recovers.
+      if (cfg.chatBlackout?.(a)) return [];
       return a.latest ? [{ ...a.latest }] : [];
     },
     sendInput: async (id, text) => {
@@ -196,6 +211,12 @@ function makeFake(cfg: FakeConfig = {}): { client: DashboardClient; state: FakeS
       // The re-press lands: arm the turn the dropped Enter failed to start.
       if (!a.pending) arm(a, 1);
     },
+    recoverChatBinding: (id) => {
+      const a = state.agents.get(id);
+      if (!a) return;
+      state.events.push(`recover:${id}`);
+      a.chatBound = true;   // clears a RECOVERABLE blackout; permanent ones ignore it
+    },
     isInputInFlight: (id) => (cfg.inFlight ? cfg.inFlight(id) : false),
     stopAgent: async () => {},
   };
@@ -229,6 +250,10 @@ function makeRun(overrides: Partial<OrchestrationRun> = {}): OrchestrationRun {
     leadProvider: 'claude',
     reviewerProvider: 'codex',
     turnTimeoutMs: 600000,
+    // WP1/BUG-37: scale the deadline chat-binding re-poll window to ms (same role
+    // as submitRecoveryWindow) so the many stall-to-timeout probes here don't each
+    // pay the production RECOVERY_REPOLL_MS (15s real). Individual cases override.
+    recoveryRepollMs: 50,
     lastRelayedTs: {},
     startedAt: '2026-01-01T00:00:00.000Z',
     updatedAt: '2026-01-01T00:00:00.000Z',
@@ -504,6 +529,77 @@ test('INVARIANT-T7 serial: aborting mid-wait rejects with AbortError well before
 
   await rejectsMatching(p, /Orchestration run aborted/);
   assert.ok(Date.now() - started < 2000, 'abort took effect promptly');
+});
+
+// ═════════════════════════════════════════════════════════════════════
+// WP1 (BUG-37) — the codex chat-blackout belt-and-suspenders. When the codex
+// Reviewer is idle at the stall deadline with a blacked-out chat (lost discovery
+// race: turn complete on disk, reader never sid-bound), waitTurnComplete fires a
+// one-shot recoverChatBinding + bounded re-poll before conceding the timeout.
+//   K4-a  RECOVERABLE blackout → the run rides through, exactly one recovery.
+//   K4-b  PERMANENT blackout   → still times out, tagged post-recovery, one recovery.
+//   K4-c  no blackout          → recovery is never invoked (happy path untouched).
+// ═════════════════════════════════════════════════════════════════════
+
+const recoveries = (state: FakeState) => state.events.filter((e) => e.startsWith('recover:'));
+
+test('INVARIANT-K4-a serial: a blacked-out Reviewer whose turn is on disk is recovered at the deadline and the run completes (exactly one recovery)', async () => {
+  const run = makeRun({ turnTimeoutMs: 150, recoveryRepollMs: 300 });
+  const { client, state } = makeFake({
+    // RECOVERABLE: the Reviewer's chat is blank until recoverChatBinding rebinds it.
+    chatBlackout: (a) => a.title.startsWith('Reviewer') && !a.chatBound,
+    // Complete the run: the lead's turn-2 (its response to the recovered review)
+    // writes the plan file.
+    onTurn: (a) => {
+      if (a.title.startsWith('Lead') && a.counter === 2) fs.writeFileSync(run.planPath, 'plan after recovered review');
+    },
+  });
+  const { ctx } = makeCtx(run);
+
+  try {
+    await runSerial(client, ctx);   // resolves — the blackout was recovered, not stalled
+    const reviewer = byTitle(state, 'Reviewer');
+    assert.deepEqual(recoveries(state), [`recover:${reviewer.id}`],
+      'exactly one recoverChatBinding, for the blacked-out Reviewer');
+    assert.ok(state.sendInputCalls.some((c) => /Reviewer Feedback/.test(c.text)),
+      'the recovered review WAS relayed back to the Lead');
+  } finally {
+    rm(run.planPath);
+  }
+});
+
+test('INVARIANT-K4-b serial: a PERMANENT Reviewer blackout still times out — tagged post-recovery re-poll empty, exactly one recovery', async () => {
+  const run = makeRun({ turnTimeoutMs: 150, recoveryRepollMs: 120 });
+  const { client, state } = makeFake({
+    // PERMANENT: recovery rebinds but the chat stays blank regardless.
+    chatBlackout: (a) => a.title.startsWith('Reviewer'),
+  });
+  const { ctx } = makeCtx(run);
+
+  try {
+    const msg = await rejectsMatching(runSerial(client, ctx), /post-recovery re-poll empty/);
+    assert.match(msg, /agent\.status=idle/, 'stall still reports the idle-at-deadline status');
+    const reviewer = byTitle(state, 'Reviewer');
+    assert.deepEqual(recoveries(state), [`recover:${reviewer.id}`],
+      'recovery attempted exactly once even for a permanent blackout');
+  } finally {
+    rm(run.planPath);
+  }
+});
+
+test('INVARIANT-K4-c serial: a healthy run never invokes chat-binding recovery (happy path unchanged)', async () => {
+  const run = makeRun({ turnTimeoutMs: 150 });
+  const { client, state } = makeFake({
+    onTurn: (a) => { if (a.title.startsWith('Lead') && a.counter === 2) fs.writeFileSync(run.planPath, 'plan'); },
+  });
+  const { ctx } = makeCtx(run);
+
+  try {
+    await runSerial(client, ctx);
+    assert.deepEqual(recoveries(state), [], 'no recoverChatBinding on a run that never blacks out');
+  } finally {
+    rm(run.planPath);
+  }
 });
 
 // ═════════════════════════════════════════════════════════════════════

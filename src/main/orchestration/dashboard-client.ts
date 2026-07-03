@@ -25,6 +25,11 @@ export function createDashboardClient(supervisor: AgentSupervisor): DashboardCli
       supervisor.maybeRecoverCodexSid(id);
       return supervisor.getChatService().getMessages(id, opts);
     },
+    // WP1/BUG-37: the explicit one-shot recovery waitTurnComplete fires at the
+    // stall deadline. Same self-gating supervisor hook as getMessages' inline
+    // call — kept as its own seam so the runner's intent (force a rebind before
+    // conceding a timeout) is legible and test fakes can fault-inject it.
+    recoverChatBinding: (id) => { supervisor.maybeRecoverCodexSid(id); },
     sendInput: async (id, text) => { await supervisor.sendInput(id, text); },
     // Confirmed handoff send + submit-only re-press — both already exist as
     // public AgentSupervisor methods (sendInputConfirmed index.ts:4408,

@@ -131,6 +131,7 @@ function makeFake(cfg: FakeConfig = {}): { client: DashboardClient; state: FakeS
       return { delivered: true, confirmed: true, mode: 'hook' as const };
     },
     resubmitEnter: () => {},
+    recoverChatBinding: () => {},
     isInputInFlight: (id) => (cfg.inFlight ? cfg.inFlight(id) : false),
     stopAgent: async () => {},
   };

@@ -85,6 +85,11 @@ export interface OrchestrationRun {
    *  the real-time F-F delay sweep runs in milliseconds rather than tens of
    *  seconds; production leaves it undefined → the plan's constants apply. */
   submitRecoveryWindow?: { attempts?: number; recheckMs?: number; pollMs?: number; handshakeMs?: number };
+  /** WP1/BUG-37: bounded re-poll window after the deadline chat-binding recovery.
+   *  Same test-scaling role as submitRecoveryWindow — the pressure harness shrinks
+   *  it so the permanent-blackout probe throws in milliseconds; production leaves
+   *  it undefined → RECOVERY_REPOLL_MS (15s) applies. */
+  recoveryRepollMs?: number;
 }
 
 export interface OrchestrationEvent {
@@ -102,6 +107,12 @@ export interface DashboardClient {
   getAgent(id: string): Agent | null;
   getMessages(id: string, opts: { limit: number; role?: 'assistant' | 'user' }):
     Promise<Array<{ content: string; ts: string; turnComplete?: boolean }>>;
+  /** WP1/BUG-37: force a codex chat-binding recovery (→ supervisor.maybeRecoverCodexSid).
+   *  waitTurnComplete calls this once at the stall deadline before conceding a
+   *  timeout, so a lost discovery race that blacked out the chat can rebind and
+   *  reveal a completed-but-unread turn. Self-gates in the supervisor (no-op for
+   *  non-codex / already-bound / inside the discovery grace); safe to call always. */
+  recoverChatBinding(id: string): void;
   sendInput(id: string, text: string): Promise<void>;
   /** Confirmed handoff send (→ supervisor.sendInputConfirmed). Resolves with
    *  turn-start proof: mode 'hook'|'status-poll' ⇒ confirmed:true; 'unconfirmed'

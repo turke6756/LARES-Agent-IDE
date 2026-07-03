@@ -49,6 +49,12 @@ const PLAN_WRITE_GRACE_MS = 30000;
 const SUBMIT_RESEND_ATTEMPTS = 3;
 const SUBMIT_RESEND_RECHECK_MS = 10_000;  // watch window after each re-press
 const SUBMIT_RESEND_POLL_MS = 1_000;
+// WP1/BUG-37: after a forced chat-binding recovery at the stall deadline, re-poll
+// for this bounded window before conceding the timeout. Chat rebind / ring
+// repopulation is seconds (dispatcher ticks are ~1s) — do NOT extend this to a
+// full status-check cycle; the goal is to catch a completed-but-blacked-out turn,
+// not to wait out a genuinely slow one.
+const RECOVERY_REPOLL_MS = 15_000;
 // Relaunch budget for a kickoff whose submit is unrecoverable. 2 = one fresh
 // relaunch after the first member fails. Relays do NOT relaunch.
 const KICKOFF_LAUNCH_ATTEMPTS = 2;
@@ -63,7 +69,12 @@ function recoveryWindow(ctx: OrchestrationRunContext): RecoveryWindow {
   };
 }
 function recoveryPolicy(ctx: OrchestrationRunContext): SubmitRecoveryPolicy {
-  return ctx.run.submitRecoveryPolicy ?? 'raw';
+  // Production default (2026-07-01): 'recover-fallthrough' — confirmed handshake +
+  // evidence-gated dropped-Enter recovery, falling through to waitTurnComplete on
+  // exhaustion (never a fast throw; see plans/groupthink-handshake-fix-readiness-review.md).
+  // 'raw' (bug-repro baseline) and 'recover-throw' (negative control) are set
+  // explicitly only by the pressure harness; they are never request-driven.
+  return ctx.run.submitRecoveryPolicy ?? 'recover-fallthrough';
 }
 
 /** Thrown when the run's AbortSignal fires mid-poll. The service swallows it
@@ -203,6 +214,7 @@ async function waitTurnComplete(
 ): Promise<RelayMessage> {
   let stallDeadline = Date.now() + timeoutMs;
   let lastStatusCheck = 0;
+  let recoveryAttempted = false;   // WP1: exactly one recovery cycle per invocation
   for (;;) {
     checkAborted(ctx);
     const msg = await readNextMessage(client, ctx, agentId);
@@ -228,6 +240,42 @@ async function waitTurnComplete(
       }
       if (status === 'working') {
         stallDeadline = lastStatusCheck + timeoutMs;
+        await sleep(POLL_INTERVAL_MS);
+        continue;
+      }
+      // status is idle/waiting at the deadline — the BUG-37 chat-blackout
+      // signature: the codex turn completed on disk but the reader was never
+      // sid-bound, so readNextMessage saw nothing and the working→idle edge that
+      // would have reset the stall clock already passed. Before conceding, force
+      // ONE chat-binding recovery and re-poll for a bounded window. Exactly one
+      // recovery cycle per waitTurnComplete invocation (guarded by
+      // recoveryAttempted) so a permanent blackout still times out promptly.
+      if (!recoveryAttempted) {
+        recoveryAttempted = true;
+        client.recoverChatBinding(agentId);
+        const repollDeadline = Date.now() + (ctx.run.recoveryRepollMs ?? RECOVERY_REPOLL_MS);
+        for (;;) {
+          checkAborted(ctx);
+          const recovered = await readNextMessage(client, ctx, agentId);
+          if (recovered) return recovered;
+          const s = client.getAgent(agentId)?.status;
+          if (s === 'crashed' || s === 'done') {
+            throw new Error(`${label} (${agentId}) exited with status=${s} before completing turn`);
+          }
+          if (s === 'working') {
+            // Status caught up during recovery — the turn is genuinely still
+            // running. Reset the clock and rejoin the main loop.
+            stallDeadline = Date.now() + timeoutMs;
+            lastStatusCheck = Date.now();
+            break;
+          }
+          if (Date.now() >= repollDeadline) {
+            // Still empty after recovery — a real stall, not a blackout. Tag the
+            // message so post-fix stalls are distinguishable from pre-fix ones.
+            throw new Error(`Timeout waiting for ${label} (${agentId}) to complete turn (agent.status=${s}, post-recovery re-poll empty)`);
+          }
+          await sleep(POLL_INTERVAL_MS);
+        }
         await sleep(POLL_INTERVAL_MS);
         continue;
       }
@@ -328,7 +376,8 @@ async function confirmedSend(
 
 /** Single send entry point used by the relay loop. V0 ('raw') keeps the exact
  *  legacy behavior (client.sendInput, no handshake); V1/V2 route through
- *  confirmedSend. Default policy is 'raw' so nothing changes unless a run opts in. */
+ *  confirmedSend. Production default is 'recover-fallthrough' (V1), so real runs
+ *  take the confirmed-handshake path; only the pressure harness opts into 'raw'. */
 async function sendWorker(
   client: DashboardClient, ctx: OrchestrationRunContext,
   agentId: string, label: string, text: string,

@@ -62,6 +62,7 @@ function makeClient(overrides: Partial<DashboardClient> = {}): DashboardClient {
     sendInput: async () => {},
     sendInputConfirmed: async () => ({ delivered: true, confirmed: true, mode: 'hook' as const }),
     resubmitEnter: () => {},
+    recoverChatBinding: () => {},
     isInputInFlight: () => false,
     stopAgent: async () => {},
     ...overrides,
