@@ -67,6 +67,7 @@ import {
   ensureCodexResumeSessionId,
   shouldDiscoverCodexSession,
   selectFreshCodexRollouts,
+  DEFAULT_SQL_POLL_TIMEOUT_MS,
   type DiscoveryResult,
 } from './session-id-discovery';
 import { listCodexRolloutFiles } from './log-readers/codex-rollout-reader';
@@ -667,10 +668,14 @@ function shellSingleQuote(value: string): string {
 
 // Grace window before lazy cwd-match recovery is allowed to fire for a codex
 // agent with a null resumeSessionId. Must exceed the authoritative SQL
-// discovery timeout (DEFAULT_SQL_POLL_TIMEOUT_MS = 35 s in
-// session-id-discovery.ts) plus slack for the async DB write + dispatcher
-// pickup, so recovery never hijacks a still-resolving live launch (BUG-29).
-const CODEX_DISCOVERY_GRACE_MS = 45_000;
+// discovery timeout (DEFAULT_SQL_POLL_TIMEOUT_MS) plus slack for the async DB
+// write + dispatcher pickup, so recovery never hijacks a still-resolving live
+// launch (BUG-29). WP4 anti-drift: derived from the SQL timeout so the two
+// can't silently diverge — the invariant is grace > discovery window, and the
+// +10s margin encodes that slack. If the SQL timeout is ever raised, this
+// grace follows automatically; identity-blind recovery must never pre-empt
+// live discovery.
+const CODEX_DISCOVERY_GRACE_MS = DEFAULT_SQL_POLL_TIMEOUT_MS + 10_000;
 
 // Stale-rollout hardening (sibling bug in
 // docs/BUG_claude-child-session-env-poisoning.md): when recovery finds no

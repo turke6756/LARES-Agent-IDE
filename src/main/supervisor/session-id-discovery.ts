@@ -29,7 +29,7 @@ import {
 // race-prone code path BUG-26 exploited. 35 s gives margin for jitter without
 // being absurd. Per-call `timeoutMs` overrides still win (tests use 400-700
 // ms; recovery sites pass their own short windows).
-const DEFAULT_SQL_POLL_TIMEOUT_MS = 35_000;
+export const DEFAULT_SQL_POLL_TIMEOUT_MS = 35_000;
 
 export interface RecoverCodexSessionOptions {
   workingDirectory: string;
