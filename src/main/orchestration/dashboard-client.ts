@@ -10,9 +10,21 @@ export function createDashboardClient(supervisor: AgentSupervisor): DashboardCli
     launchAgent: (input) => supervisor.launchAgent(input),
     getAgent: (id) => getAgent(id),
     // getChatService().getMessages(id, {limit, role}) is the same call the
-    // messages route uses (api-server.ts:182); its ChatMessage shape includes
+    // messages route uses (api-server.ts:519); its ChatMessage shape includes
     // {content, ts, turnComplete}, which is exactly what the relay loop reads.
-    getMessages: (id, opts) => supervisor.getChatService().getMessages(id, opts),
+    // BUG-28/BUG-37: fire the same lazy codex-sid recovery hook the HTTP
+    // (api-server.ts:518) and IPC (ipc-handlers.ts:115,119) chat-read paths have,
+    // UNCONDITIONALLY before the read. The orchestrator's 2s poll loop is a
+    // first-class chat-read path and must not be the ONLY one that bypasses
+    // recovery — otherwise a codex discovery race-loss blanks GroupThink's chat
+    // forever (BUG-37 false-stall). maybeRecoverCodexSid self-gates on provider,
+    // an already-bound sid, and the 45s discovery grace, so this is a no-op for
+    // non-codex agents and inside the live-discovery window; the call cost at 2s
+    // poll cadence matches the UI chat pane's existing behavior.
+    getMessages: (id, opts) => {
+      supervisor.maybeRecoverCodexSid(id);
+      return supervisor.getChatService().getMessages(id, opts);
+    },
     sendInput: async (id, text) => { await supervisor.sendInput(id, text); },
     // Confirmed handoff send + submit-only re-press — both already exist as
     // public AgentSupervisor methods (sendInputConfirmed index.ts:4408,
