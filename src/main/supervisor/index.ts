@@ -1674,10 +1674,19 @@ export class AgentSupervisor extends EventEmitter {
       });
     }
 
+    // WP3 (codex-groupthink-reliability-hardening): the first-user-message
+    // prefix threaded into codex session discovery. Explicit field wins;
+    // otherwise the initialUserPrompt (the text actually submitted as the
+    // first user message on the launch_agent lane, above) outranks
+    // agentMdPrompt — which for codex is NOT the submitted first message.
+    // Empty string makes the discovery SQL prefix filter a no-op.
+    const firstUserMessagePrefix =
+      resolvedInput.firstUserMessagePrefix ?? resolvedInput.initialUserPrompt ?? agentMdPrompt ?? '';
+
     if (pathType === 'windows') {
-      await this.launchWindowsAgent(agent, false, agentMdPrompt, sessionId, undefined, freshSession);
+      await this.launchWindowsAgent(agent, false, agentMdPrompt, sessionId, undefined, freshSession, firstUserMessagePrefix);
     } else {
-      await this.launchWslAgent(agent, false, agentMdPrompt, undefined, sessionId, freshSession);
+      await this.launchWslAgent(agent, false, agentMdPrompt, undefined, sessionId, freshSession, firstUserMessagePrefix);
     }
 
     return getAgent(agent.id)!;
@@ -2383,7 +2392,7 @@ export class AgentSupervisor extends EventEmitter {
     return tracker;
   }
 
-  private async launchWindowsAgent(agent: Agent, resume = false, agentMdPrompt?: string | null, sessionId?: string, overrideArgs?: string[], freshSession = false): Promise<void> {
+  private async launchWindowsAgent(agent: Agent, resume = false, agentMdPrompt?: string | null, sessionId?: string, overrideArgs?: string[], freshSession = false, firstUserMessagePrefix?: string | null): Promise<void> {
     const runner = new WindowsRunner();
     this.windowsRunners.set(agent.id, runner);
 
@@ -2716,7 +2725,9 @@ export class AgentSupervisor extends EventEmitter {
         codexSnapshot,
         agent.workingDirectory,
         codexLaunchStartedAt,
-        agentMdPrompt ?? ''
+        // WP3: prefer the launcher-supplied first-user-message prefix; fall
+        // back to agentMdPrompt for launch paths that don't thread one.
+        firstUserMessagePrefix ?? agentMdPrompt ?? ''
       );
     }
   }
@@ -3013,7 +3024,7 @@ export class AgentSupervisor extends EventEmitter {
     });
   }
 
-  private async launchWslAgent(agent: Agent, resume = false, agentMdPrompt?: string | null, overrideCommand?: string, sessionId?: string, freshSession = false): Promise<void> {
+  private async launchWslAgent(agent: Agent, resume = false, agentMdPrompt?: string | null, overrideCommand?: string, sessionId?: string, freshSession = false, firstUserMessagePrefix?: string | null): Promise<void> {
     if (!agent.tmuxSessionName) throw new Error('No tmux session name');
 
     const runner = new WslRunner(agent.tmuxSessionName);
@@ -3442,7 +3453,9 @@ export class AgentSupervisor extends EventEmitter {
         codexSnapshot,
         wslWorkDir,
         codexLaunchStartedAt,
-        agentMdPrompt ?? ''
+        // WP3: prefer the launcher-supplied first-user-message prefix; fall
+        // back to agentMdPrompt for launch paths that don't thread one.
+        firstUserMessagePrefix ?? agentMdPrompt ?? ''
       );
     }
   }

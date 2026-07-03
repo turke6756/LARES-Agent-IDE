@@ -257,10 +257,17 @@ function queryStateSqlite(opts: {
     // BUG-26 risk 3: fetch up to 2 rows (instead of LIMIT 1) so we can detect
     // ambiguity (concurrent same-cwd+prefix launches) and decline binding
     // rather than silently picking the older row.
+    // WP3: match the prompt prefix with a literal starts-with — NOT a LIKE
+    // pattern. Topic text is user-influenced; `%`/`_` in a topic must not be
+    // interpreted as SQL wildcards and loosen the match (which could bind a
+    // lookalike concurrent session). `substr(first_user_message, 1, length(?))
+    // = ?` is exact prefix equality; the prefix is bound TWICE (once for the
+    // length, once for the comparison), so this query now binds FOUR params:
+    // cwdLike, afterSec, prefixForLength, prefixForEquality.
     const stmt = db.prepare(
       "SELECT id, rollout_path, cwd, cli_version FROM threads " +
       "WHERE LOWER(REPLACE(cwd, '\\', '/')) LIKE '%' || ? || '%' " +
-      "AND created_at >= ? AND first_user_message LIKE ? || '%' " +
+      "AND created_at >= ? AND substr(first_user_message, 1, length(?)) = ? " +
       "ORDER BY created_at ASC LIMIT 2"
     );
     const stmtAny = stmt as unknown as { all?(...params: unknown[]): unknown[]; get(...params: unknown[]): unknown };
@@ -269,6 +276,7 @@ function queryStateSqlite(opts: {
       rows = stmtAny.all(
         opts.workingDirectoryNormalized,
         opts.launchedAfterSeconds,
+        opts.firstUserMessagePrefix,
         opts.firstUserMessagePrefix
       ) as Array<{ id?: string; rollout_path?: string; cwd?: string; cli_version?: string | null }>;
     } else {
@@ -276,6 +284,7 @@ function queryStateSqlite(opts: {
       const single = stmtAny.get(
         opts.workingDirectoryNormalized,
         opts.launchedAfterSeconds,
+        opts.firstUserMessagePrefix,
         opts.firstUserMessagePrefix
       ) as { id?: string; rollout_path?: string; cwd?: string; cli_version?: string | null } | undefined;
       rows = single ? [single] : [];

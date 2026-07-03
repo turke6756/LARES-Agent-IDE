@@ -424,6 +424,18 @@ interface LaunchOpts {
   ownerAgentId?: string;
 }
 
+// WP3 (codex-groupthink-reliability-hardening): the codex session-discovery
+// prefix derived from the kickoff prompt. CRLF is normalized to LF (guards
+// against line-ending divergence between what we paste and what codex records
+// in threads.first_user_message) and the prefix is capped at 512 chars — long
+// enough to reach past a shared `Topic:` header into run-specific material so
+// two concurrent same-cwd same-role runs on different topics get distinct
+// prefixes. NO leading trim and NO first-line truncation: the stored first
+// user message is the verbatim submitted text, so the prefix must be too.
+function kickoffPrefix(s: string): string {
+  return s.replace(/\r\n/g, '\n').slice(0, 512);
+}
+
 async function launchAgentWithKickoff(
   client: DashboardClient, ctx: OrchestrationRunContext, opts: LaunchOpts,
 ): Promise<Agent> {
@@ -437,6 +449,10 @@ async function launchAgentWithKickoff(
     freshSession: true,
     isSupervised: true,
     ownerAgentId: opts.ownerAgentId,
+    // WP3: bind codex session discovery to this run's kickoff, so a
+    // concurrent same-cwd codex session on a different topic/role can't be
+    // mis-bound. Harmless for non-codex providers (ignored downstream).
+    firstUserMessagePrefix: kickoffPrefix(kickoffPrompt),
   };
 
   // V0 ('raw') — legacy path verbatim: launch, waitReady, submit kickoff via

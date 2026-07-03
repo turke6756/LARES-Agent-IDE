@@ -18,6 +18,13 @@ import {
   type CodexStateDbOpener,
 } from './session-id-discovery';
 import type { CodexRolloutFile, CodexSessionHome } from './log-readers/codex-rollout-reader';
+import { serialLeadPrompt, serialReviewerKickoff } from '../orchestration/groupthink-v2-prompts';
+
+// WP3: mirror groupthink-v2's kickoffPrefix so these tests lock the exact
+// template↔discovery contract (CRLF→LF, cap 512, no trim/first-line cut).
+function kickoffPrefix(s: string): string {
+  return s.replace(/\r\n/g, '\n').slice(0, 512);
+}
 
 interface TestCase {
   name: string;
@@ -342,12 +349,17 @@ function makeFakeDb(rows: FakeThreadRow[], opts: {
           get(...params: unknown[]) {
             if (opts.capture) opts.capture.push({ sql, params });
             // Mimic the production query semantics on the in-memory rows.
-            const [cwdLike, afterSec, msgPrefix] = params as [string, number, string];
+            // WP3: the prompt prefix is now bound TWICE (substr length + equality),
+            // so the query passes FOUR params. Both prefix binds are identical.
+            const [cwdLike, afterSec, prefixForLength, prefixForEquality] =
+              params as [string, number, string, string];
             const norm = (s: string) => s.replace(/\\/g, '/').toLowerCase();
+            // substr(first_user_message, 1, length(prefix)) = prefix is exact
+            // starts-with — no wildcard interpretation of the prefix.
             const candidates = rows
               .filter((r) => norm(r.cwd).includes(cwdLike))
               .filter((r) => r.created_at >= afterSec)
-              .filter((r) => r.first_user_message.startsWith(msgPrefix))
+              .filter((r) => r.first_user_message.substr(0, prefixForLength.length) === prefixForEquality)
               .sort((a, b) => a.created_at - b.created_at);
             if (!candidates.length) return undefined;
             const r = candidates[0];
@@ -556,12 +568,14 @@ function makeMultiRowDb(rows: FakeThreadRow[]): CodexStateDbOpener {
           } : undefined;
         },
         all(...params: unknown[]): unknown[] {
-          const [cwdLike, afterSec, msgPrefix] = params as [string, number, string];
+          // WP3: FOUR params — prefix bound twice (substr length + equality).
+          const [cwdLike, afterSec, prefixForLength, prefixForEquality] =
+            params as [string, number, string, string];
           const norm = (s: string) => s.replace(/\\/g, '/').toLowerCase();
           return rows
             .filter((r) => norm(r.cwd).includes(cwdLike))
             .filter((r) => r.created_at >= afterSec)
-            .filter((r) => r.first_user_message.startsWith(msgPrefix))
+            .filter((r) => r.first_user_message.substr(0, prefixForLength.length) === prefixForEquality)
             .sort((a, b) => a.created_at - b.created_at)
             .slice(0, 2)
             .map((r) => ({
@@ -886,6 +900,114 @@ test('BUG-26: filesystem fallback with NO prefix supplied falls back to cwd-only
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+// ===== WP3: firstUserMessagePrefix threading + wildcard-safe prefix match =====
+
+test('WP3(a): real serialLeadPrompt / serialReviewerKickoff outputs bind their own rows (template↔discovery lock)', async () => {
+  // Two concurrent codex sessions in the SAME cwd within the SAME launch
+  // window — a GroupThink Lead and Reviewer. Their first user messages are the
+  // verbatim kickoff prompts. Discovery, handed each role's kickoffPrefix,
+  // must bind that role's row and no other. A template edit that changes these
+  // prompt shapes breaks THIS test, not live discovery.
+  const topic = 'Should we adopt WASM for the plugin sandbox?';
+  const leadMsg = serialLeadPrompt(topic, 'C:\\ws\\plans\\wasm.md');
+  const reviewerMsg = serialReviewerKickoff(topic, 'Draft: use WASM with wasmtime.');
+  const rows: FakeThreadRow[] = [
+    { id: 'sid-lead', rollout_path: '/lead.jsonl', cwd: 'C:\\Users\\fixture',
+      created_at: 1_000_000, first_user_message: leadMsg },
+    { id: 'sid-reviewer', rollout_path: '/reviewer.jsonl', cwd: 'C:\\Users\\fixture',
+      created_at: 1_000_001, first_user_message: reviewerMsg },
+  ];
+  const { opener } = makeFakeDb(rows);
+  const lead = await discoverNewCodexSession(snapshot('windows'), {
+    workingDirectory: 'C:\\Users\\fixture',
+    launchedAfterMs: 999_999 * 1000,
+    firstUserMessagePrefix: kickoffPrefix(leadMsg),
+    openSqliteDb: opener,
+    timeoutMs: 400,
+    warn: () => {},
+  });
+  assert.ok(lead, 'lead prefix must bind');
+  assert.equal(lead.sessionId, 'sid-lead', 'lead kickoff prefix must select the lead row');
+
+  const reviewer = await discoverNewCodexSession(snapshot('windows'), {
+    workingDirectory: 'C:\\Users\\fixture',
+    launchedAfterMs: 999_999 * 1000,
+    firstUserMessagePrefix: kickoffPrefix(reviewerMsg),
+    openSqliteDb: opener,
+    timeoutMs: 400,
+    warn: () => {},
+  });
+  assert.ok(reviewer, 'reviewer prefix must bind');
+  assert.equal(reviewer.sessionId, 'sid-reviewer', 'reviewer kickoff prefix must select the reviewer row');
+});
+
+test('WP3(b): two same-cwd same-window rows with distinct role prefixes each bind correctly', async () => {
+  const rows: FakeThreadRow[] = [
+    { id: 'sid-role-A', rollout_path: '/a.jsonl', cwd: 'C:\\Users\\fixture',
+      created_at: 1_000_000, first_user_message: 'You are the Lead Planner. Topic: alpha' },
+    { id: 'sid-role-B', rollout_path: '/b.jsonl', cwd: 'C:\\Users\\fixture',
+      created_at: 1_000_000, first_user_message: 'You are the Reviewer. Topic: alpha' },
+  ];
+  const { opener } = makeFakeDb(rows);
+  const a = await discoverNewCodexSession(snapshot('windows'), {
+    workingDirectory: 'C:\\Users\\fixture',
+    launchedAfterMs: 999_999 * 1000,
+    firstUserMessagePrefix: 'You are the Lead Planner.',
+    openSqliteDb: opener,
+    timeoutMs: 400,
+    warn: () => {},
+  });
+  assert.equal(a?.sessionId, 'sid-role-A');
+  const b = await discoverNewCodexSession(snapshot('windows'), {
+    workingDirectory: 'C:\\Users\\fixture',
+    launchedAfterMs: 999_999 * 1000,
+    firstUserMessagePrefix: 'You are the Reviewer.',
+    openSqliteDb: opener,
+    timeoutMs: 400,
+    warn: () => {},
+  });
+  assert.equal(b?.sessionId, 'sid-role-B');
+});
+
+test('WP3(c): literal %/_ prefix matches only true starts-with rows (no wildcard loosening) + SQL uses substr, not LIKE, + FOUR params', async () => {
+  const captured: FakeQuery[] = [];
+  const rows: FakeThreadRow[] = [
+    // Literal match for the prefix "50%_d".
+    { id: 'sid-literal', rollout_path: '/lit.jsonl', cwd: 'C:\\Users\\fixture',
+      created_at: 1_000_000, first_user_message: '50%_done: ship the thing' },
+    // A lookalike that ONLY a LIKE interpretation (`%`→any run, `_`→any single
+    // char) of "50%_d%" would match — literal starts-with must reject it.
+    { id: 'sid-lookalike', rollout_path: '/look.jsonl', cwd: 'C:\\Users\\fixture',
+      created_at: 1_000_001, first_user_message: '50XYdone: something else' },
+  ];
+  const { opener } = makeFakeDb(rows, { capture: captured });
+  const result = await discoverNewCodexSession(snapshot('windows'), {
+    workingDirectory: 'C:\\Users\\fixture',
+    launchedAfterMs: 999_999 * 1000,
+    firstUserMessagePrefix: '50%_d',
+    openSqliteDb: opener,
+    timeoutMs: 400,
+    warn: () => {},
+  });
+  assert.ok(result, 'literal-prefix row must bind');
+  assert.equal(result.sessionId, 'sid-literal', 'only the literal starts-with row may match; a wildcard reading would also grab sid-lookalike');
+
+  // The wildcard-safety guarantee lives in the SQL text: the fake stub can be
+  // made to match either way, so pin the predicate itself.
+  assert.ok(captured.length >= 1, 'a query must have been issued');
+  const sql = captured[0].sql;
+  assert.ok(/substr\(first_user_message, 1, length\(\?\)\) = \?/.test(sql),
+    `query must use substr-equality prefix match; got: ${sql}`);
+  assert.ok(!/first_user_message LIKE/.test(sql),
+    `query must NOT use a LIKE prefix on first_user_message; got: ${sql}`);
+
+  // WP3 Reviewer note: the prefix is bound TWICE → FOUR params total.
+  const params = captured[0].params;
+  assert.equal(params.length, 4, `query must bind exactly four params (cwdLike, afterSec, prefixForLength, prefixForEquality); got ${params.length}`);
+  assert.equal(params[2], '50%_d', 'param 3 is the prefix (for length())');
+  assert.equal(params[3], '50%_d', 'param 4 is the prefix (for equality) — same value, bound twice');
 });
 
 (async () => {

@@ -230,6 +230,12 @@ export interface LaunchAgentInput {
   // separate from systemPrompt/agent.md launch framing — that positional-arg
   // path must stay byte-identical whether or not this field is set.
   initialUserPrompt?: string;
+  // WP3 (codex-groupthink-reliability-hardening): per-launch codex
+  // session-discovery tiebreaker, matched against `threads.first_user_message`
+  // in ~/.codex/state_5.sqlite. Explicit prefix of the first user message the
+  // launcher will submit; lets discovery bind the right rollout when several
+  // concurrent same-cwd codex sessions exist. Ignored for non-codex providers.
+  firstUserMessagePrefix?: string;
   // WP-A.2 (browser-parity-and-capability-isolation F9): when launching an
   // agent that should join a team immediately, pass the team id (+ optional
   // role) so `launchAgent` records the membership BEFORE the per-launch MCP
