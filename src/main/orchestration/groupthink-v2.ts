@@ -193,7 +193,16 @@ async function readNextMessage(
 
 /** BUG-06: seed the highwater mark from the latest assistant message so the
  *  first wait blocks on genuinely new content rather than re-relaying a
- *  pre-existing turnComplete (matters on resume + after BUG-29 launch). */
+ *  pre-existing turnComplete (matters after a fresh/BUG-29 launch).
+ *
+ *  WP2/BUG-37 CAUTION: do NOT call this on resume when a USABLE persisted
+ *  highwater already exists. On resume the persisted mark IS the truth; re-seeding
+ *  from chat marks the newest turnComplete as already-relayed — and if a Reviewer
+ *  turn completed DURING the stall, that turn is precisely the newest one, so
+ *  re-seeding swallows it and waitTurnComplete then waits forever for a
+ *  working→idle edge that already passed (BUG-37's un-resumability). Resume seeds
+ *  only when the mark is absent/corrupt; agents with a usable mark stay protected
+ *  by the mark itself, so the BUG-06/BUG-29 stale-content guard still holds. */
 async function seedLastRelayedTsFromChat(
   client: DashboardClient, ctx: OrchestrationRunContext, agentId: string, _label: string,
 ): Promise<void> {
@@ -495,7 +504,13 @@ export async function runSerial(client: DashboardClient, ctx: OrchestrationRunCo
     const existing = client.getAgent(resumeLeadId);
     if (!existing) throw new Error(`Resume lead ${resumeLeadId} not found`);
     lead = existing;
-    await seedLastRelayedTsFromChat(client, ctx, lead.id, 'Lead');
+    // WP2/BUG-37: seed ONLY when there is no usable persisted highwater. A usable
+    // mark (non-empty ts; legacy hashless marks count, blank/separator-only
+    // corruption does not) is the resume truth — re-seeding from chat would pin
+    // the newest turn as already-relayed and re-stall.
+    if (!parseHighwater(run.lastRelayedTs[lead.id])?.ts) {
+      await seedLastRelayedTsFromChat(client, ctx, lead.id, 'Lead');
+    }
   } else {
     lead = await launchAgentWithKickoff(client, ctx, {
       workspaceId,
@@ -513,7 +528,13 @@ export async function runSerial(client: DashboardClient, ctx: OrchestrationRunCo
     const existing = client.getAgent(resumeReviewerId);
     if (!existing) throw new Error(`Resume reviewer ${resumeReviewerId} not found`);
     reviewer = existing;
-    await seedLastRelayedTsFromChat(client, ctx, reviewer.id, 'Reviewer');
+    // WP2/BUG-37: seed only when no usable persisted highwater exists (see the Lead
+    // resume above). A Reviewer turn that completed during the stall has ts newer
+    // than the persisted mark, so the first readNextMessage returns it — the
+    // un-resumability is fixed with no idle special-casing.
+    if (!parseHighwater(run.lastRelayedTs[reviewer.id])?.ts) {
+      await seedLastRelayedTsFromChat(client, ctx, reviewer.id, 'Reviewer');
+    }
   } else {
     // BUG-29 mitigation: wait for the Lead's first draft before launching the
     // Reviewer, then launch with that draft as the kickoff.

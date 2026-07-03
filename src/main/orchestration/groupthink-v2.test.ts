@@ -159,6 +159,9 @@ function makeRun(overrides: Partial<OrchestrationRun> = {}): OrchestrationRun {
     leadProvider: 'claude',
     reviewerProvider: 'codex',
     turnTimeoutMs: 600000,
+    // WP1/BUG-37: scale the deadline chat-binding re-poll to ms so idle-timeout
+    // tests don't each pay the production RECOVERY_REPOLL_MS (15s real).
+    recoveryRepollMs: 30,
     lastRelayedTs: {},
     startedAt: '2026-01-01T00:00:00.000Z',
     updatedAt: '2026-01-01T00:00:00.000Z',
@@ -279,6 +282,131 @@ test('serial resume: a pre-existing reviewer turnComplete is NOT re-relayed (BUG
   assert.ok(!state.sendInputCalls.some((c) => /STALE reviewer feedback/.test(c.text)),
     'stale reviewer turn was not replayed to the lead');
   assert.equal(state.sendInputCalls.length, 0, 'no relay happened at all');
+});
+
+// ── WP2 (BUG-37): resume keeps a usable persisted highwater; seed only when absent ──
+// On resume, re-seeding the highwater from chat marks the newest turnComplete as
+// already-relayed. A Reviewer turn that completed DURING the stall IS that newest
+// turn, so an unconditional re-seed swallows it and the run re-stalls forever
+// (BUG-37's un-resumability). WP2 guards each resume seed on a parsed, USABLE mark
+// (non-empty ts): a usable mark is the resume truth; only a missing/corrupt mark
+// re-seeds (preserving the BUG-06/BUG-29 stale-content guard for those agents).
+const HW_SEP = String.fromCharCode(1);
+const composite = (ts: string, hash = 'abcdef0123456789') => `${ts}${HW_SEP}${hash}`;
+
+test('WP2-a serial resume: a Reviewer turn that completed during the stall is relayed once and the run completes', async () => {
+  const run = makeRun({
+    turnTimeoutMs: 150, leadId: 'lead-r', reviewerId: 'rev-r',
+    // Persisted pre-stall highwater for both members — USABLE composite marks.
+    lastRelayedTs: { 'lead-r': composite('lead-r#0000'), 'rev-r': composite('rev-r#0002') },
+  });
+  const { client, state } = makeFake({
+    seedAgents: [
+      { id: 'lead-r', title: 'Lead (resumed)', provider: 'claude',
+        latest: { content: 'old lead draft', ts: 'lead-r#0000', turnComplete: true } },
+      { id: 'rev-r', title: 'Reviewer (resumed)', provider: 'codex',
+        // Completed DURING the stall: ts newer than the persisted mark, visible now.
+        latest: { content: 'DURING-STALL review', ts: 'rev-r#0005', turnComplete: true } },
+    ],
+    // The Lead's response to the relayed review writes the plan and ends the run.
+    onTurn: (a) => { if (a.title.startsWith('Lead') && a.counter === 1) fs.writeFileSync(run.planPath, 'final plan'); },
+  });
+  const { ctx } = makeCtx(run);
+
+  try {
+    await runSerial(client, ctx);   // resolves — the during-stall turn was NOT swallowed by a re-seed
+    assert.equal(state.sendInputCalls.filter((c) => /DURING-STALL review/.test(c.text)).length, 1,
+      'the during-stall review was relayed to the Lead exactly once');
+    assert.ok(fs.existsSync(run.planPath), 'run reached plan completion');
+  } finally {
+    rm(run.planPath);
+  }
+});
+
+test('WP2-b serial resume: a Reviewer turn already relayed pre-stall is NOT re-relayed', async () => {
+  const run = makeRun({
+    turnTimeoutMs: 150, leadId: 'lead-r', reviewerId: 'rev-r',
+    // Reviewer mark is NEWER than its visible turn → the turn is already accounted for.
+    lastRelayedTs: { 'lead-r': composite('lead-r#0000'), 'rev-r': composite('rev-r#0009') },
+  });
+  const { client, state } = makeFake({
+    seedAgents: [
+      { id: 'lead-r', title: 'Lead (resumed)', provider: 'claude',
+        latest: { content: 'old lead', ts: 'lead-r#0000', turnComplete: true } },
+      { id: 'rev-r', title: 'Reviewer (resumed)', provider: 'codex',
+        latest: { content: 'already-relayed review', ts: 'rev-r#0005', turnComplete: true } },
+    ],
+  });
+  const { ctx } = makeCtx(run);
+
+  await rejectsMatching(runSerial(client, ctx), /Timeout/);
+  assert.ok(!state.sendInputCalls.some((c) => /already-relayed review/.test(c.text)),
+    'the already-relayed reviewer turn was not re-relayed');
+});
+
+test('WP2-c serial fresh launch: seeding path unchanged (run launches both members and completes)', async () => {
+  const run = makeRun();
+  const { client, state } = makeFake({
+    onTurn: (a) => { if (a.title.startsWith('Lead') && a.counter === 2) fs.writeFileSync(run.planPath, 'plan'); },
+  });
+  const { ctx } = makeCtx(run);
+
+  try {
+    await runSerial(client, ctx);
+    assert.equal(state.launchInputs.length, 2, 'fresh launch: lead + reviewer launched (no resume shortcut)');
+    assert.ok(fs.existsSync(run.planPath), 'fresh run completed');
+  } finally {
+    rm(run.planPath);
+  }
+});
+
+test('WP2-d serial resume: a legacy hashless highwater is usable — the during-stall turn is still relayed (no re-seed)', async () => {
+  const run = makeRun({
+    turnTimeoutMs: 150, leadId: 'lead-r', reviewerId: 'rev-r',
+    // HASHLESS marks (ts only, no HW_SEP) — the legacy format. Must count as usable.
+    lastRelayedTs: { 'lead-r': 'lead-r#0000', 'rev-r': 'rev-r#0002' },
+  });
+  const { client, state } = makeFake({
+    seedAgents: [
+      { id: 'lead-r', title: 'Lead (resumed)', provider: 'claude',
+        latest: { content: 'old lead draft', ts: 'lead-r#0000', turnComplete: true } },
+      { id: 'rev-r', title: 'Reviewer (resumed)', provider: 'codex',
+        latest: { content: 'DURING-STALL review', ts: 'rev-r#0005', turnComplete: true } },
+    ],
+    onTurn: (a) => { if (a.title.startsWith('Lead') && a.counter === 1) fs.writeFileSync(run.planPath, 'final plan'); },
+  });
+  const { ctx } = makeCtx(run);
+
+  try {
+    await runSerial(client, ctx);   // hashless mark was treated as usable → no re-seed swallowed the turn
+    assert.equal(state.sendInputCalls.filter((c) => /DURING-STALL review/.test(c.text)).length, 1,
+      'during-stall review relayed once despite the hashless (separator-free) mark');
+  } finally {
+    rm(run.planPath);
+  }
+});
+
+test('WP2-e serial resume: a separator-only (corrupt) mark is NOT usable — seeding still occurs and guards the pre-existing turn', async () => {
+  const run = makeRun({
+    turnTimeoutMs: 150, leadId: 'lead-r', reviewerId: 'rev-r',
+    // Reviewer mark is separator-only (blank ts) — corruption, NOT usable → re-seed.
+    lastRelayedTs: { 'lead-r': composite('lead-r#0000'), 'rev-r': `${HW_SEP}deadbeef` },
+  });
+  const { client, state } = makeFake({
+    seedAgents: [
+      { id: 'lead-r', title: 'Lead (resumed)', provider: 'claude',
+        latest: { content: 'old lead', ts: 'lead-r#0000', turnComplete: true } },
+      { id: 'rev-r', title: 'Reviewer (resumed)', provider: 'codex',
+        latest: { content: 'pre-existing review', ts: 'rev-r#0005', turnComplete: true } },
+    ],
+  });
+  const { ctx } = makeCtx(run);
+
+  // Seeding re-marks rev-r#0005 as relayed → no NEW turn → times out, and the
+  // pre-existing turn is NOT relayed (BUG-06 protection preserved for corrupt marks).
+  await rejectsMatching(runSerial(client, ctx), /Timeout/);
+  assert.ok(!state.sendInputCalls.some((c) => /pre-existing review/.test(c.text)),
+    'seeding on a corrupt mark still guards the pre-existing turn from replay');
 });
 
 // ── Serial: receiver-ready gate respects isInputInFlight ─────────────
