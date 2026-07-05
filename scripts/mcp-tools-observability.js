@@ -56,6 +56,10 @@ function getObservabilityToolDefinitions() {
             type: 'boolean',
             description: 'When true, dedup by (filePath, operation) and add a `count` field. Matches how the dashboard tab groups rows. Default false.',
           },
+          current_only: {
+            type: 'boolean',
+            description: 'When true, return only the agent\'s CURRENT session. Default false returns files touched across ALL retained sessions (a continued agent keeps prior-session activity), which is usually what you want for "has this agent ever touched X?".',
+          },
         },
         required: ['agent_id'],
       },
@@ -72,14 +76,73 @@ function getObservabilityToolDefinitions() {
       },
     },
     {
-      name: 'list_teams',
-      description: 'List all teams in a workspace.',
+      name: 'get_usage_limits',
+      description:
+        'Get the Claude subscription rate-limit reading (5-hour + 7-day windows: used %, reset countdown). ACCOUNT-WIDE — shared across every session and workspace, NOT per-worker. Takes no arguments. May be stale or absent (available:false, reason:"no_reading_yet") until an agent makes an API call.',
+      inputSchema: {
+        type: 'object',
+        properties: {},
+      },
+    },
+    {
+      name: 'get_my_context',
+      description:
+        'Re-orient after a reset, /clear, restart, or revival. Returns your workspace id + title, your ' +
+        'own supervisorId (when you are a supervisor — validated from your injected identity), your ' +
+        'workspace supervisor (id, title, provider, status), and agent counts (total / live / supervised, ' +
+        'plus owned: how many agents YOU launched are live vs terminal — pull the list via list_my_agents). ' +
+        'Takes NO arguments — the dashboard scopes it to YOUR workspace from your injected identity. Call ' +
+        'this FIRST on any revival, before trusting a wake hint, then self-orient via list_agents.',
+      inputSchema: {
+        type: 'object',
+        properties: {},
+      },
+    },
+    {
+      name: 'list_my_agents',
+      description:
+        'List the agents YOU launched (your owner edge), newest first — live agents by default; set ' +
+        'include_terminal to add recently finished/crashed ones (the graveyard window). Takes NO agent id: ' +
+        'the dashboard derives the owner from YOUR injected identity, so you can never read another ' +
+        "supervisor's fleet. Pull this fresh whenever you need your workers' state — never rely on a " +
+        'snapshot of it written into a prompt or handoff note.',
       inputSchema: {
         type: 'object',
         properties: {
-          workspace_id: { type: 'string', description: 'The workspace ID.' },
+          include_terminal: {
+            type: 'boolean',
+            description: 'Include done/crashed owned agents (default false: live only).',
+          },
+          limit: { type: 'number', description: 'Max agents returned, newest first.' },
         },
-        required: ['workspace_id'],
+      },
+    },
+    {
+      name: 'save_continuation_brick',
+      description:
+        'Save your continuation handoff note (the "brick") when the dashboard asks you to prepare for a ' +
+        'session reset. Write ≤6KB of PLAIN TEXT: current phase, directional next steps, agents to launch ' +
+        '(kind / roughly how many / which phases), pointers (file paths, plan ids, owned-agent ids + what ' +
+        'each was mid-way on), and watch-outs. Use POINTERS, never snapshots — your successor pulls live ' +
+        'state via get_my_context / list_my_agents. Takes ONLY the note: the dashboard derives the author ' +
+        'from your injected identity. Over 6144 bytes is REJECTED (never truncated) — trim prose to ' +
+        'pointers and retry.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          note: { type: 'string', description: 'The handoff note (plain text, ≤6144 bytes UTF-8).' },
+        },
+        required: ['note'],
+      },
+    },
+    {
+      name: 'list_teams',
+      description: 'List all teams in a workspace. Omit workspace_id to use your own workspace (auto-scoped from your identity).',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          workspace_id: { type: 'string', description: 'Optional: the workspace ID. Defaults to your own workspace.' },
+        },
       },
     },
     {
@@ -95,13 +158,12 @@ function getObservabilityToolDefinitions() {
     },
     {
       name: 'list_templates',
-      description: 'List available agent templates for a workspace. Returns global and workspace-scoped templates.',
+      description: 'List available agent templates for a workspace. Returns global and workspace-scoped templates. Omit workspace_id to use your own workspace (auto-scoped from your identity).',
       inputSchema: {
         type: 'object',
         properties: {
-          workspace_id: { type: 'string', description: 'The workspace ID.' },
+          workspace_id: { type: 'string', description: 'Optional: the workspace ID. Defaults to your own workspace.' },
         },
-        required: ['workspace_id'],
       },
     },
     {
@@ -182,6 +244,7 @@ async function handleObservabilityToolCall(name, args, apiRequest) {
       const q = [];
       if (args.operation) q.push(`operation=${args.operation}`);
       if (args.limit) q.push(`limit=${args.limit}`);
+      if (args.current_only) q.push('current_only=true');
       if (q.length) p += '?' + q.join('&');
       const result = await apiRequest('GET', p);
       let rows = result.activities || [];
@@ -203,8 +266,49 @@ async function handleObservabilityToolCall(name, args, apiRequest) {
       return { content: [{ type: 'text', text: JSON.stringify(result.stats || { message: 'No context stats available yet' }, null, 2) }] };
     }
 
+    case 'get_usage_limits': {
+      // Return the canonical endpoint result verbatim — it already carries
+      // `available`, `account_wide`, and `source`; re-wrapping could mask an
+      // available:false shape.
+      const result = await apiRequest('GET', '/api/usage-limits');
+      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+    }
+
+    case 'get_my_context': {
+      // Inc 1 (B3): no args — the server scopes to the caller's workspace from
+      // the forwarded X-Workspace-Id header.
+      const ctx = await apiRequest('GET', '/api/supervisor/context');
+      return { content: [{ type: 'text', text: JSON.stringify(ctx, null, 2) }] };
+    }
+
+    case 'list_my_agents': {
+      // Inc 3 (3.2): no agent_id — the server derives the owner from the
+      // forwarded X-Supervisor-Id header (explicit owner params are rejected
+      // server-side with 400). Pull-only surface: never write the result into
+      // a brick or prompt artifact.
+      const q = [];
+      if (args.include_terminal) q.push('includeTerminal=true');
+      if (args.limit) q.push(`limit=${encodeURIComponent(args.limit)}`);
+      const p = '/api/supervisor/owned-agents' + (q.length ? '?' + q.join('&') : '');
+      const result = await apiRequest('GET', p);
+      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+    }
+
+    case 'save_continuation_brick': {
+      // Inc 4 (4.5): note only — no workspace_id/agent_id args; the server
+      // binds the author from the forwarded X-Supervisor-Id header (apiRequest
+      // spreads CALLER_HEADERS on every call).
+      const result = await apiRequest('POST', '/api/supervisor/continuation-brick', { note: args.note });
+      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+    }
+
     case 'list_teams': {
-      const teams = await apiRequest('GET', `/api/teams?workspaceId=${encodeURIComponent(args.workspace_id)}`);
+      // Inc 1 (B4): omit workspaceId when absent so the server self-scopes from
+      // the caller's identity header.
+      const p = args.workspace_id
+        ? `/api/teams?workspaceId=${encodeURIComponent(args.workspace_id)}`
+        : '/api/teams';
+      const teams = await apiRequest('GET', p);
       const summary = teams.map(t => ({
         id: t.id,
         name: t.name,
@@ -221,7 +325,10 @@ async function handleObservabilityToolCall(name, args, apiRequest) {
     }
 
     case 'list_templates': {
-      const templates = await apiRequest('GET', `/api/templates?workspaceId=${encodeURIComponent(args.workspace_id)}`);
+      // Inc 1 (B4): omit workspaceId when absent so the server self-scopes from
+      // the caller's identity header (both templates and personas endpoints).
+      const wq = args.workspace_id ? `?workspaceId=${encodeURIComponent(args.workspace_id)}` : '';
+      const templates = await apiRequest('GET', `/api/templates${wq}`);
       const templateSummary = templates.map(t => ({
         type: 'template',
         id: t.id,
@@ -234,7 +341,7 @@ async function handleObservabilityToolCall(name, args, apiRequest) {
       // Also fetch personas
       let personaSummary = [];
       try {
-        const personas = await apiRequest('GET', `/api/personas?workspaceId=${encodeURIComponent(args.workspace_id)}`);
+        const personas = await apiRequest('GET', `/api/personas${wq}`);
         personaSummary = personas.filter(p => !p.isSupervisor).map(p => ({
           type: 'persona',
           name: p.name,

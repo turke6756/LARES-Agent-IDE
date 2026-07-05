@@ -21,11 +21,21 @@ interface Props {
   onHighlight?: () => void;
 }
 
+// Keep the menu fully on-screen: clamp its top-left into the viewport and let
+// it scroll internally if it (with the picker expanded) is taller than the
+// space below. Rough width/height budgets — the exact box is measured by the
+// browser; these just stop it spawning off the right/bottom edge.
+const MENU_WIDTH = 300;
+const MENU_MARGIN = 8;
+
 export default function SelectionActionMenu({
   x, y, context, onClose, onPickAgent, onAddComment, onCommentAndSend, onHighlight,
 }: Props) {
   const menuRef = useRef<HTMLDivElement>(null);
   const [pickerOpen, setPickerOpen] = useState(false);
+
+  const left = Math.max(MENU_MARGIN, Math.min(x, window.innerWidth - MENU_WIDTH - MENU_MARGIN));
+  const top = Math.max(MENU_MARGIN, Math.min(y, window.innerHeight - MENU_MARGIN * 2));
 
   useEffect(() => {
     const handler = (e: MouseEvent) => {
@@ -50,8 +60,8 @@ export default function SelectionActionMenu({
   return createPortal(
     <div
       ref={menuRef}
-      className="ui-menu fixed z-50"
-      style={{ left: x, top: y }}
+      className="ui-menu fixed z-50 overflow-y-auto"
+      style={{ left, top, maxHeight: `calc(100vh - ${MENU_MARGIN * 2}px)` }}
       // Keep the user's text selection alive: a default mousedown inside the
       // menu would collapse the document selection before the action runs.
       onMouseDown={(e) => e.preventDefault()}
@@ -67,6 +77,7 @@ export default function SelectionActionMenu({
         <AgentPickerDropdown
           workspaceId={context.workspaceId}
           onPick={onPickAgent}
+          currentAgentId={context.chat?.agentId}
         />
       )}
       {onCommentAndSend && (

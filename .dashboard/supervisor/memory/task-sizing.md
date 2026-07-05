@@ -63,6 +63,16 @@ The pre-launch question is always: **does this task fit comfortably in this prov
 
 ---
 
+## Worker-ready plan with multiple work packages (WP1 → WP2 → …, each with code + tests + gate)
+
+- **Agent:** 1 worker **per WP**, chained: worker A does WP1 → returns green + patch summary → worker B gets WP2 + A's summary as inherited state. Do NOT hand the whole plan to one worker just because the plan's execution contract says "one worker, sequential" — that contract is the author's preference, not a context estimate, and a "hand off at 75–80%" clause in a plan means the author *expects* overflow.
+- **Budget rule of thumb (2026-07-05 calibration, 200K window):** plan ingestion + anchor verification + subsystem paging ≈ 30–40% before the first edit; one substantive WP (multi-file edits + incremental tests + build gate) ≈ 50–60% on top. So **one WP ≈ one comfortable window; two WPs ≈ 1.5 windows — always overflow.**
+- **Brief structure when chaining:** each worker's brief carries (a) the plan path, (b) locked design decisions, (c) predecessor's patch summary verbatim, (d) its ONE WP's task list, (e) the gate. WP boundaries are natural checkpoints — green tests + written summary — so the successor never inherits an unbuilt edit.
+- **If you deliberately give one worker 2 WPs anyway:** make the boundary check structural ("post the WP1 patch summary before touching WP2; if ≥ 70% at the boundary, stop there") and treat the first 80% threshold event as a forecast, not a surprise.
+- **Example:** continuation-handoff run 2026-07-05 — WP1+WP2 to one worker: 90% by end of WP1, Esc-interrupt mid-WP2, stuck-latch fight (BUG-40), unbuilt trailing edit; successor finished the remainder at 62%. Full detail: behavioral.md B-23.
+
+---
+
 ## Anything you can't size with confidence
 
 - **Default action:** ask the user, with orientation per B-06.

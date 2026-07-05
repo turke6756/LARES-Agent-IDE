@@ -135,6 +135,10 @@ export interface Agent {
   lastSendError?: { message: string; ts: number } | null;
   isAttached: boolean;
   restartCount: number;
+  /** Inc 4: continuation handoff generation — bumped only by the atomic
+   *  continuation-relaunch transaction; crash restarts use restartCount.
+   *  Optional so partial Agent fixtures stay valid; absent ⇒ 0. */
+  continuationGeneration?: number;
   lastExitCode: number | null;
   pid: number | null;
   logPath: string | null;
@@ -174,7 +178,57 @@ export interface FileActivity {
   filePath: string;
   operation: FileOperation;
   timestamp: string;
+  /** Context-brick Phase 4 — the session/generation this activity was stamped
+   *  under, so the UI can partition current vs prior session. `sessionId` is the
+   *  true partition key (a `/clear` can mint a same-generation sibling);
+   *  `generation` is a display label only. `sessionId` is null for legacy rows
+   *  written before the migration. */
+  generation: number;
+  sessionId: string | null;
 }
+
+/** Context-brick Phase 1 — one row per (dashboard agent, session) in the
+ *  durable session lineage. One dashboard agent id spans many sessions across
+ *  continuations and `/clear` rotations; this table is the durable map from an
+ *  agent id to its ordered generations→session ids.
+ *
+ *  Keyed UNIQUE(dashboardAgentId, sessionId) — NOT generation. `generation` is
+ *  an ordering HINT that may legitimately REPEAT (a `/clear` rotation mints a
+ *  new session WITHOUT bumping the generation), so it is never a partition or
+ *  identity key. Order lineage by `startedAt` then row `id`; partition current
+ *  vs prior by `sessionId`. `workingDirectory` exists ONLY to recompute the
+ *  JSONL slug — never an identity key (many agents share one cwd/slug). */
+export interface AgentSessionRow {
+  id: number;
+  dashboardAgentId: string;
+  generation: number;
+  sessionId: string;
+  workingDirectory: string;
+  provider: AgentProvider;
+  startedAt: string;
+  endedAt: string | null;
+  /** best-effort: 1 present, 0 pruned, NULL unknown (backfilled rows). */
+  jsonlPresent: number | null;
+}
+
+/** Context-brick Phase 2 — the result of reading a *prior* session's structured
+ *  chat from disk (read-only, explicitly out of the current context window).
+ *  Never thrown: a pruned/missing JSONL degrades to `unavailable`, and the head
+ *  of the lineage (no earlier session) degrades to `atHead`. Identity is stamped
+ *  per-SESSION (`sessionId`) — `generation` is only an informational label that
+ *  may repeat across a `/clear`, so it is never used to disambiguate. */
+export type PriorSessionChat =
+  | {
+      sessionRowId: number;
+      sessionId: string;
+      generation: number;
+      startedAt: string;
+      endedAt: string | null;
+      outOfContext: true;
+      events: SessionEvent[];
+    }
+  | { sessionRowId: number; sessionId: string; unavailable: true }
+  | { atHead: true };
 
 export interface CreateWorkspaceInput {
   title: string;
@@ -686,6 +740,50 @@ export interface ContextStats {
   lastUpdatedAt: string;
 }
 
+// ── Claude subscription usage-limits (account-wide) ──────────────────────
+// Captured passively from the Claude Code statusLine blob's `rate_limits`
+// (five_hour / seven_day windows, each independently absent). See
+// plans/usage-limits-mcp-and-ui.md.
+
+/** Raw record written by the statusline script to
+ *  `<ws>/.dashboard/usage/latest.json` — observed windows only, no derived
+ *  fields. `resets_at` is stored exactly as received from the harness. */
+export interface UsageLimitsRawRecord {
+  schema: 1;
+  source: 'claude_statusline';
+  captured_at: number; // ms
+  session_id: string | null;
+  agent_id: string | null;
+  claude_project_dir: string | null;
+  five_hour?: { used_percentage: number; resets_at: number };
+  seven_day?: { used_percentage: number; resets_at: number };
+}
+
+/** Per-window derived reading (IPC/API only — never persisted). */
+export interface UsageWindowReading {
+  used_percentage: number;
+  resets_at: number;      // as received (may be seconds)
+  resets_at_ms: number;   // normalized to ms
+  resets_in_seconds: number;
+  captured_at: number;
+  age_seconds: number;
+  stale: boolean;
+}
+
+/** Account-wide usage reading returned by the watcher / API / MCP tool. */
+export interface UsageLimitsReading {
+  available: boolean;
+  account_wide: true;
+  source?: 'claude_statusline';
+  reason?: 'no_reading_yet';
+  captured_at?: number;
+  age_seconds?: number;
+  stale?: boolean;
+  session_id?: string | null;
+  five_hour?: UsageWindowReading | null;
+  seven_day?: UsageWindowReading | null;
+}
+
 export interface IpcApi {
   workspaces: {
     list: () => Promise<Workspace[]>;
@@ -704,7 +802,7 @@ export interface IpcApi {
     getRingBuffer: (id: string) => Promise<string>;
     delete: (id: string) => Promise<void>;
     checkAgentMd: (workingDirectory: string, pathType: PathType) => Promise<{ found: boolean; fileName: string | null }>;
-    getFileActivities: (agentId: string, operation?: FileOperation) => Promise<FileActivity[]>;
+    getFileActivities: (agentId: string, operation?: FileOperation, currentOnly?: boolean) => Promise<FileActivity[]>;
     onFileActivity: (callback: (activity: FileActivity) => void) => () => void;
     getContextStats: (agentId: string) => Promise<ContextStats | null>;
     onContextStatsChanged: (callback: (stats: ContextStats) => void) => () => void;
@@ -713,6 +811,11 @@ export interface IpcApi {
     chatUnsubscribe: (agentId: string) => Promise<void>;
     getFullToolResult: (agentId: string, toolUseId: string) => Promise<string | null>;
     onChatEvents: (callback: (batch: ChatEventBatch) => void) => () => void;
+    // Context-brick Phase 2 — durable, read-only prior-session chat. `getAgentSessions`
+    // returns the cheap DB lineage (no JSONL read); `getPriorSessionChat` reads one
+    // prior session's `.jsonl` from disk on demand (lazy walk-back by lineage row id).
+    getAgentSessions: (agentId: string) => Promise<AgentSessionRow[]>;
+    getPriorSessionChat: (agentId: string, sessionRowId: number) => Promise<PriorSessionChat>;
     fork: (id: string) => Promise<Agent>;
     query: (targetAgentId: string, question: string, sourceAgentId?: string) => Promise<QueryResult>;
     sendInput: (agentId: string, text: string) => Promise<void>;
@@ -726,6 +829,10 @@ export interface IpcApi {
     write: (agentId: string, data: string) => Promise<void>;
     resize: (agentId: string, cols: number, rows: number) => Promise<void>;
     onData: (callback: (agentId: string, data: string) => void) => () => void;
+    // BUG-38: fired when a same-id PTY swap (continuation, manual restart,
+    // auto-restart) replaces the runner. The renderer disposes the retired
+    // xterm and re-attaches to the fresh PTY. Returns an unsubscribe fn.
+    onRebound: (callback: (agentId: string) => void) => () => void;
   };
   files: {
     readFile: (filePath: string, pathType: PathType) => Promise<FileContent>;
@@ -1023,7 +1130,14 @@ export interface IpcApi {
     onCloseQuery: (callback: (req: { requestId: string }) => void) => () => void;
     closeReply: (requestId: string, decision: 'save' | 'discard' | 'cancel') => Promise<void>;
   };
+  /** Account-wide Claude subscription usage limits (singleton, not per-agent).
+   *  See plans/usage-limits-mcp-and-ui.md. */
+  usage: {
+    getLimits: () => Promise<UsageLimitsReading>;
+    onLimitsChanged: (callback: (reading: UsageLimitsReading) => void) => () => void;
+  };
   onAgentStatusChanged: (callback: (data: { agentId: string; status: AgentStatus; agent: Agent }) => void) => () => void;
+  onAgentDeleted: (callback: (data: { agentId: string }) => void) => () => void;
   onOpenFileTab: (callback: (payload: OpenFileTabRequest) => void) => () => void;
   onTeamUpdated: (callback: (team: Team) => void) => () => void;
   onTeamMessageCreated: (callback: (message: TeamMessage) => void) => () => void;

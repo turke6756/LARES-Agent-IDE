@@ -309,6 +309,26 @@ export class SessionLogDispatcher extends EventEmitter {
     return reader.sessionFileExists(workingDirectory, sessionId);
   }
 
+  /** Context-brick Phase 2 — one-shot PURE read of a prior session's structured
+   *  chat from disk (Claude reader only today). Does NOT subscribe, does NOT
+   *  feed the live `eventsByAgent` ring, and does NOT advance any offset — a
+   *  rebind already wiped the live ring, so the prior session lives only on
+   *  disk. Returns `null` when the provider has no one-shot reader or the JSONL
+   *  is missing/pruned; `[]` for a located-but-empty session. */
+  readPriorSessionEvents(
+    provider: AgentProvider,
+    workingDirectory: string,
+    sessionId: string,
+  ): SessionEvent[] | null {
+    const reader = this.readers.get(provider) as
+      | (ChatLogReader & {
+          readSessionEventsOnce?(workingDirectory: string, sessionId: string): SessionEvent[] | null;
+        })
+      | undefined;
+    if (!reader || typeof reader.readSessionEventsOnce !== 'function') return null;
+    return reader.readSessionEventsOnce(workingDirectory, sessionId);
+  }
+
   /** Drain each reader's session-pinned stale signals and re-emit them as
    *  `'session-stale'`. Called at the end of every tick / pollNow so rotation
    *  handling runs on a clean stack (NOT re-entrantly inside pollSession). */

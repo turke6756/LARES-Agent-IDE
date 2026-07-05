@@ -200,6 +200,78 @@ export class ClaudeJsonlReader implements ChatLogReader {
     return true;
   }
 
+  /** Context-brick Phase 2 — one-shot PURE read of a *prior* session's
+   *  structured chat straight from disk. A continuation/`/clear` rebind wiped
+   *  the live in-memory ring (`SessionLogDispatcher.rebindAgent`), so a prior
+   *  session survives only as its `<sessionId>.jsonl` on disk (readers never
+   *  unlink). This reads the whole file once and returns its `SessionEvent[]`.
+   *
+   *  It is deliberately side-effect free with respect to the live tail:
+   *   - does NOT touch `fileOffsets` / `partialLines` (never calls pollSession),
+   *   - does NOT subscribe or emit,
+   *   - parses under an EPHEMERAL scope id so the per-agent dedup maps
+   *     (`seenEntryUuids` / `emittedSystemInit` / `toolResultLocations`) of any
+   *     LIVE agent sharing this cwd/slug are never touched, and the scope rows
+   *     are cleared afterward so no residue leaks.
+   *
+   *  Returns `null` when the JSONL cannot be located or read (pruned/missing) so
+   *  the caller can degrade to "previous session unavailable"; returns `[]` for a
+   *  located-but-empty session. */
+  readSessionEventsOnce(workingDirectory: string, sessionId: string): SessionEvent[] | null {
+    const jsonlPath = this.locateSessionFile(workingDirectory, sessionId);
+    if (!jsonlPath) return null;
+
+    let raw: string;
+    try {
+      raw = fs.readFileSync(jsonlPath, 'utf-8');
+    } catch {
+      return null;
+    }
+
+    // Ephemeral parse scope: parseEntry keys its dedup maps on session.agentId.
+    // A synthetic per-read id keeps this fully isolated from any live agent that
+    // shares this cwd/slug (shared-cwd invariant), and is cleared in `finally`.
+    const scopeId = `__prior-session__:${sessionId}`;
+    const session: ChatLogReaderSession = {
+      agentId: scopeId,
+      sessionId,
+      workingDirectory,
+      provider: this.provider,
+      subscribed: false,
+    };
+
+    const out: SessionEvent[] = [];
+    try {
+      let cursor = 0;
+      for (const line of raw.split('\n')) {
+        const lineBytes = Buffer.byteLength(line, 'utf-8');
+        const lineStartOffset = cursor;
+        const lineEndOffset = cursor + lineBytes;
+        cursor = lineEndOffset + 1; // +1 for the split-consumed '\n'
+
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+
+        let entry: any;
+        try {
+          entry = JSON.parse(trimmed);
+        } catch {
+          continue;
+        }
+
+        this.parseEntry(session, jsonlPath, entry, lineStartOffset, lineEndOffset, out);
+      }
+    } finally {
+      this.seenEntryUuids.delete(scopeId);
+      this.emittedSystemInit.delete(scopeId);
+      const prefix = `${scopeId}:`;
+      for (const key of this.toolResultLocations.keys()) {
+        if (key.startsWith(prefix)) this.toolResultLocations.delete(key);
+      }
+    }
+    return out;
+  }
+
   /** True if the first CLEAR_SUCCESSOR_HEAD_LINES lines of a `.jsonl` carry the
    *  fresh `/clear` signature, bound to the candidate file's own session id:
    *   - a self-rooted entry (`parentUuid === null`, `sessionId === candidate`),

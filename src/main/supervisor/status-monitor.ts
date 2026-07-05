@@ -337,6 +337,16 @@ export class StatusMonitor extends EventEmitter {
     this.emit('statusChanged', payload);
   }
 
+  /** Context-brick Inc 5A — expose the waiting-latch kind for
+   *  `isAwaitingHuman`. Reads the private `waitingKind` field; returns it
+   *  ONLY while the latch state is 'waiting' (an idle/working latch, or no
+   *  latch, yields null even if a stale waiting entry was overwritten). */
+  getWaitingKind(agentId: string): WaitingKind | null {
+    const latch = this.turnLatch.get(agentId);
+    if (!latch || latch.state !== 'waiting') return null;
+    return latch.waitingKind;
+  }
+
   /** BUG-09 §3.1 — Explicit "turn continues" signal from Pipeline B. Replaces
    *  the previous binary "delete latch" behavior with a tagged `working`
    *  latch that pairs `tool-use` ↔ `tool-result` events by `toolUseId`. Always
@@ -751,6 +761,10 @@ export class StatusMonitor extends EventEmitter {
         // Ignore individual agent check failures
       }
     }
+
+    // Context-brick Inc 5B — the lifecycle watcher's tick seam. Emitted at the
+    // END of each poll so subscribers observe post-inference statuses.
+    this.emit('tick');
   }
 
   /** BUG-23 — per-provider settle-timer promotion of `'launching' → 'idle'`.

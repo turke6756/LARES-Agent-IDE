@@ -16,6 +16,10 @@ interface Props {
 interface GroupedActivity {
   activity: FileActivity;
   count: number;
+  // True when this row belongs to a PRIOR session (session_id != the agent's
+  // live session). Drives the shared out-of-context dim + "previous session"
+  // badge so retained history reads as history, not live context.
+  prior: boolean;
 }
 
 function timeAgo(timestamp: string): string {
@@ -55,20 +59,29 @@ function operationBadge(op: string): { label: string; className: string } {
   }
 }
 
-// Group activities by file, keeping the most recent per file + op and counting duplicates.
-// Activities arrive newest-first, so the first row encountered per key is the most recent.
-function groupByFile(activities: FileActivity[]): GroupedActivity[] {
+// Group activities by file, keeping the most recent per file + op and counting
+// duplicates. Activities arrive newest-first, so the first row encountered per
+// key is the most recent. The key folds in session_id AND generation so a prior
+// read and a current read of the SAME file stay distinct rows rather than
+// collapsing — the whole point of retaining prior-session activity. Rows whose
+// session differs from `liveSessionId` are marked `prior` (legacy NULL-session
+// rows are treated as current so a one-time migration doesn't dim everything).
+// Current rows sort above prior ones, recency preserved within each band.
+export function groupByFile(activities: FileActivity[], liveSessionId: string | null): GroupedActivity[] {
   const seen = new Map<string, GroupedActivity>();
   for (const a of activities) {
-    const key = `${a.filePath}:${a.operation}`;
+    const key = `${a.filePath}:${a.operation}:${a.sessionId ?? ''}:${a.generation}`;
     const existing = seen.get(key);
     if (existing) {
       existing.count += 1;
     } else {
-      seen.set(key, { activity: a, count: 1 });
+      const prior = a.sessionId != null && a.sessionId !== liveSessionId;
+      seen.set(key, { activity: a, count: 1, prior });
     }
   }
-  return Array.from(seen.values());
+  const groups = Array.from(seen.values());
+  // Stable partition: current band first, prior band after.
+  return [...groups.filter((g) => !g.prior), ...groups.filter((g) => g.prior)];
 }
 
 export default function FileActivityList({ activities, pathType, agentId, title, embedded }: Props) {
@@ -83,7 +96,10 @@ export default function FileActivityList({ activities, pathType, agentId, title,
   );
   const clickTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; filePath: string } | null>(null);
-  const grouped = useMemo(() => groupByFile(activities), [activities]);
+  // The agent's live session is its current resume session id; any activity
+  // stamped under a different session is prior (out-of-context) history.
+  const liveSessionId = agent?.resumeSessionId ?? null;
+  const grouped = useMemo(() => groupByFile(activities, liveSessionId), [activities, liveSessionId]);
 
   const workingDirectory = agent?.workingDirectory || '';
   const resolvedPathType = workspace?.pathType || pathType || 'wsl';
@@ -155,7 +171,7 @@ export default function FileActivityList({ activities, pathType, agentId, title,
           {title}
         </div>
       )}
-      {grouped.map(({ activity, count }) => {
+      {grouped.map(({ activity, count, prior }) => {
         const badge = operationBadge(activity.operation);
         return (
           <button
@@ -165,7 +181,9 @@ export default function FileActivityList({ activities, pathType, agentId, title,
             onContextMenu={(e) => handleContextMenu(e, activity.filePath)}
             draggable
             onDragStart={(e) => fileDragStart(e, activity.filePath)}
-            className="w-full text-left px-4 py-2 hover:bg-surface-2 transition-colors flex items-start gap-2 group"
+            className={`w-full text-left px-4 py-2 hover:bg-surface-2 transition-colors flex items-start gap-2 group${
+              prior ? ' oo-content' : ''
+            }`}
           >
             <span className="text-gray-300 text-sm mt-0.5 shrink-0">
               {activity.operation === 'read' ? '📖' : activity.operation === 'create' ? '📝' : '✏️'}
@@ -183,6 +201,14 @@ export default function FileActivityList({ activities, pathType, agentId, title,
                 <span className={`text-[11px] px-1.5 py-0.5 shrink-0 ${badge.className}`}>
                   {badge.label}
                 </span>
+                {prior && (
+                  <span
+                    className="oo-badge shrink-0"
+                    title={`Touched in a previous session (gen ${activity.generation}) — not in the current context`}
+                  >
+                    previous session
+                  </span>
+                )}
               </div>
               <div className="text-[13px] text-gray-400 truncate">{dirPath(activity.filePath)}</div>
             </div>

@@ -1706,3 +1706,121 @@ html.light ::-webkit-scrollbar-thumb:hover {
     animation: browser-skeleton-sweep 1.3s ease-in-out infinite;
   }
 }
+
+/* ── Chat: staged-comment highlight ──────────────────────────────────────────
+   Painted via the CSS Custom Highlight API over the exact range a user staged a
+   comment on (ChatPane's decorations effect registers the ranges under this
+   name). A soft blue wash so the quoted text reads as "annotated" without
+   obscuring it; the accompanying blue dot is a positioned overlay element. */
+::highlight(chat-staged-comment) {
+  background-color: color-mix(in srgb, var(--color-accent-blue, #1f6feb) 22%, transparent);
+}
+
+/* ── Out-of-context / previous-session visual language ────────────────────────
+   Context-brick cross-cutting tokens. A prior session's artifacts (chat bubbles,
+   later: file activities + tab headers, Phase 4) are durable but explicitly OUT
+   of the current context window: muted + desaturated content, a labeled divider
+   carrying SESSION identity (never generation alone — generations repeat across
+   `/clear`), and a small consistent badge. Tokens resolve per theme so the
+   muted text stays legible in BOTH light and dark. Reuse these — do not
+   re-invent per-component greys. */
+:root {
+  --oo-fg: #8b93a1;                                                  /* label / badge text */
+  --oo-line: color-mix(in srgb, #8b93a1 30%, transparent);          /* divider rules / accent border */
+  --oo-badge-bg: color-mix(in srgb, #8b93a1 18%, transparent);      /* "previous session" pill */
+  --oo-badge-border: color-mix(in srgb, #8b93a1 34%, transparent);
+  --oo-content-bg: color-mix(in srgb, #8b93a1 8%, transparent);     /* inset archived panel */
+  --oo-content-opacity: 0.9;                                         /* near-full: legibility first */
+  --oo-content-saturate: 0.9;                                       /* light desaturation of past content */
+}
+.light {
+  --oo-fg: #6b675c;
+  --oo-line: color-mix(in srgb, #6b675c 28%, transparent);
+  --oo-badge-bg: color-mix(in srgb, #6b675c 13%, transparent);
+  --oo-badge-border: color-mix(in srgb, #6b675c 26%, transparent);
+  --oo-content-bg: color-mix(in srgb, #6b675c 6%, transparent);
+  --oo-content-opacity: 0.92;
+  --oo-content-saturate: 0.92;
+}
+
+/* Wrapper for a block of out-of-context content (one prior-session's messages).
+   "Archived" reads from an inset background panel + a left accent border, not
+   from dimming — so the text itself stays near-full opacity and legible in
+   both themes. */
+.oo-content {
+  opacity: var(--oo-content-opacity);
+  filter: saturate(var(--oo-content-saturate));
+  background: var(--oo-content-bg);
+  border-left: 3px solid var(--oo-line);
+  border-radius: 6px;
+  padding: 4px 10px;
+  margin: 2px 0;
+}
+
+/* Labeled session divider: a centered caption flanked by hairlines. */
+.oo-divider {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 16px 2px 6px;
+  color: var(--oo-fg);
+  font-size: 10px;
+  line-height: 1.4;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  user-select: none;
+}
+.oo-divider::before,
+.oo-divider::after {
+  content: "";
+  flex: 1 1 auto;
+  height: 1px;
+  background: var(--oo-line);
+}
+.oo-divider__label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Small "previous session" pill used in dividers / (Phase 4) tab headers. */
+.oo-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 6px;
+  border-radius: 9999px;
+  background: var(--oo-badge-bg);
+  border: 1px solid var(--oo-badge-border);
+  color: var(--oo-fg);
+  font-size: 9px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+/* "Load previous session" affordance at the top of the thread. */
+.oo-load-btn {
+  display: block;
+  width: 100%;
+  margin: 4px 0 2px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  background: transparent;
+  border: 1px dashed var(--oo-line);
+  color: var(--oo-fg);
+  font-size: 11px;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+  transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease;
+}
+.oo-load-btn:hover:not(:disabled) {
+  background: var(--oo-badge-bg);
+  color: var(--color-fg-primary);
+}
+.oo-load-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}

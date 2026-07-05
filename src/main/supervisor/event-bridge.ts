@@ -352,6 +352,14 @@ export class EventBridge {
       // still deliver.
       if (data.fromStatus === 'launching' && data.status === 'idle') return;
 
+      // idle → done is clean-shutdown noise: the worker already emitted its
+      // turn-end idle event (the actionable hand-off), and its process has now
+      // simply exited cleanly (exit code 0 → 'done'). The supervisor has
+      // nothing to react to on the exit itself, so this second event is pure
+      // noise. A non-clean exit is 'crashed', not 'done', and still delivers;
+      // any other → done transition (e.g. working → done) also still delivers.
+      if (data.fromStatus === 'idle' && data.status === 'done') return;
+
       // Crashes / completions bypass the per-agent 10s cooldown (D-06): a
       // runner exit isn't a flicker, and silently dropping the second of two
       // close-together exits would lose a real failure. All other sources

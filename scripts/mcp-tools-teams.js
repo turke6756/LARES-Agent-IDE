@@ -6,14 +6,14 @@ function getTeamsToolDefinitions() {
       inputSchema: {
         type: 'object',
         properties: {
-          workspace_id: { type: 'string', description: 'The workspace ID.' },
+          workspace_id: { type: 'string', description: 'Optional: the workspace ID. Defaults to your own workspace (auto-scoped from your identity).' },
           name: { type: 'string', description: 'Team name.' },
           description: { type: 'string', description: 'Team purpose/description.' },
           template: { type: 'string', enum: ['mesh', 'pipeline', 'custom'], description: 'Channel template: mesh (all-to-all), pipeline (linear chain A→B→C), custom (define channels explicitly).' },
           members: { type: 'array', items: { type: 'object', properties: { agentId: { type: 'string' }, role: { type: 'string' } }, required: ['agentId'] }, description: 'Agent IDs to enroll as members.' },
           channels: { type: 'array', items: { type: 'object', properties: { from: { type: 'string' }, to: { type: 'string' }, label: { type: 'string' } }, required: ['from', 'to'] }, description: 'Explicit channels (for custom template or additions to template).' },
         },
-        required: ['workspace_id', 'name', 'members'],
+        required: ['name', 'members'],
       },
     },
     {
@@ -95,14 +95,17 @@ function getTeamsToolDefinitions() {
 async function handleTeamsToolCall(name, args, apiRequest) {
   switch (name) {
     case 'create_team': {
-      const team = await apiRequest('POST', '/api/teams', {
-        workspaceId: args.workspace_id,
+      // Inc 1 (B4): omit workspaceId when absent so the server self-scopes from
+      // the caller's identity header.
+      const createBody = {
         name: args.name,
         description: args.description || '',
         template: args.template || 'custom',
         members: args.members,
         channels: args.channels,
-      });
+      };
+      if (args.workspace_id) createBody.workspaceId = args.workspace_id;
+      const team = await apiRequest('POST', '/api/teams', createBody);
       const memberList = (team.members || []).map(m => `  - "${m.title || m.agentId}" (${m.agentId.slice(0, 8)}) [${m.role}]`).join('\n');
       const channelCount = (team.channels || []).length;
       return { content: [{ type: 'text', text: `Team "${team.name}" created (${team.id})\nTemplate: ${team.template || 'custom'}\nMembers:\n${memberList}\nChannels: ${channelCount}` }] };

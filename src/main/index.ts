@@ -7,6 +7,7 @@ import { validateAndRepairClaudeJson, validateAndRepairWslClaudeJson, startClaud
 import { checkManagedWebContents } from './security/webcontents-guard';
 import { resolveConfined } from './security/path-confinement';
 import { AgentSupervisor } from './supervisor';
+import { startContinuationWatcher } from './supervisor/continuation-watcher-wiring';
 import { registerIpcHandlers } from './ipc-handlers';
 import { installExternalNavHandlers, forceCloseAllDetached, type DetachedWindowDeps } from './detached-windows';
 import { WsServer } from './ws-server';
@@ -493,6 +494,14 @@ app.whenReady().then(async () => {
     // can never observe a stale pre-retry port.
     const apiPort = await apiServer.start();
     supervisor.setApiServerPort(apiPort);
+    // Context-brick Inc 5A — replace the relaunch route's conservative
+    // awaiting-human stub with the real predicate (question-waiting latch OR
+    // idle + ends-with-question cache).
+    const supervisorForWatcher = supervisor;
+    apiServer.isAwaitingHuman = (agentId) => supervisorForWatcher.isAwaitingHuman(agentId);
+    // Inc 5B — lifecycle watcher: rides the StatusMonitor poll tick and calls
+    // the authenticated continuation routes over the loopback API.
+    startContinuationWatcher(supervisorForWatcher, apiPort);
     // WP1-A: embedded browser pane (M2/M3/M5/M6/M7/M9-rule live in the
     // manager + browser-decisions). Constructed AFTER the awaited start() so
     // the M2 loopback filter blocks the ACTUAL bound API port, surviving the

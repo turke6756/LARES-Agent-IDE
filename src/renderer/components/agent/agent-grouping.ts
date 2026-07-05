@@ -61,6 +61,20 @@ export function collectSubtreeIds(node: AgentTreeNode): string[] {
   return ids;
 }
 
+// Flatten every agent OWNED by this node — children, grandchildren, … — into a
+// single depth-first, owner-first list. Excludes the node's own agent (unlike
+// collectSubtreeIds). Used by the detail-pane strip's per-supervisor dropdown,
+// which lists the workers/researchers under a supervisor as one flat menu
+// regardless of how deep the ownership nests.
+export function collectDescendantAgents(node: AgentTreeNode): Agent[] {
+  const out: Agent[] = [];
+  for (const child of node.children) {
+    out.push(child.agent);
+    out.push(...collectDescendantAgents(child));
+  }
+  return out;
+}
+
 // A node renders as an owner-container (full-width band) iff it owns ≥1 agent.
 // Deliberately NOT keyed on `agent.isSupervisor`: a childless supervisor must
 // degrade to a plain card, and an owned non-supervisor (e.g. a script-launched

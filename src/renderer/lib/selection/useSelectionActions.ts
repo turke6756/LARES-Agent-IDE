@@ -227,6 +227,7 @@ export function useSelectionActions({
           quotedText: popover.context.quotedText,
           workspaceId: popover.context.workspaceId,
           mode: popover.mode,
+          currentAgentId: popover.context.chat?.agentId,
           onClose: closePopover,
           onSaveDraft: handleSaveDraft,
           onSend: handleOneShotSend,

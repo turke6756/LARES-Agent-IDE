@@ -20,6 +20,8 @@ interface Props {
   quotedText: string;
   workspaceId: string;
   mode: 'draft' | 'send';
+  /** Agent the user is working in (chat surface) — default picker target. */
+  currentAgentId?: string;
   onClose: () => void;
   onSaveDraft?: (body: string) => void;
   onSend?: (target: SelectionAgentTarget, body: string) => void;
@@ -28,7 +30,7 @@ interface Props {
 const POPOVER_WIDTH = 340;
 
 export default function AddCommentPopover({
-  x, y, quotedText, workspaceId, mode, onClose, onSaveDraft, onSend,
+  x, y, quotedText, workspaceId, mode, currentAgentId, onClose, onSaveDraft, onSend,
 }: Props) {
   const popoverRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -81,8 +83,8 @@ export default function AddCommentPopover({
   return createPortal(
     <div
       ref={popoverRef}
-      className="ui-menu fixed z-50 p-2"
-      style={{ left, top, width: POPOVER_WIDTH }}
+      className="ui-menu fixed z-50 p-2 overflow-y-auto"
+      style={{ left, top, width: POPOVER_WIDTH, maxHeight: 'calc(100vh - 16px)' }}
     >
       <div className="ui-menu-header">
         {mode === 'draft' ? 'Add comment' : 'Comment & send'}
@@ -95,13 +97,16 @@ export default function AddCommentPopover({
         value={body}
         onChange={(e) => setBody(e.target.value)}
         onKeyDown={(e) => {
-          if ((e.ctrlKey || e.metaKey) && e.key === 'Enter' && mode === 'draft') {
+          // Draft mode is the quick-capture path (stage a comment, type the
+          // next): plain Enter submits, Shift+Enter inserts a newline. Ctrl/Cmd
+          // +Enter also submits for muscle-memory parity.
+          if (e.key === 'Enter' && mode === 'draft' && (!e.shiftKey || e.ctrlKey || e.metaKey)) {
             e.preventDefault();
             submitDraft();
           }
         }}
         rows={3}
-        placeholder={mode === 'draft' ? 'Comment for this selection…' : 'Comment to send with the quote…'}
+        placeholder={mode === 'draft' ? 'Comment, then Enter to stage (Shift+Enter for newline)…' : 'Comment to send with the quote…'}
         className="w-full resize-y rounded bg-surface-2 border border-white/10 px-2 py-1.5 text-[13px] text-gray-200 outline-none focus:border-accent-blue/60"
       />
       {mode === 'draft' ? (
@@ -113,7 +118,7 @@ export default function AddCommentPopover({
             className="ui-btn text-[12px]"
             disabled={!canSubmit}
             onClick={submitDraft}
-            title="Save as a draft comment on this file (Ctrl+Enter)"
+            title="Save this comment (Enter)"
           >
             Save comment
           </button>
@@ -128,7 +133,11 @@ export default function AddCommentPopover({
             Send to agent&nbsp;▸
           </button>
           {pickerOpen && canSubmit && (
-            <AgentPickerDropdown workspaceId={workspaceId} onPick={submitSend} />
+            <AgentPickerDropdown
+              workspaceId={workspaceId}
+              onPick={submitSend}
+              currentAgentId={currentAgentId}
+            />
           )}
         </div>
       )}

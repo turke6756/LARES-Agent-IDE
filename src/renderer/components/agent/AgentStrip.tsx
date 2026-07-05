@@ -1,6 +1,13 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { useDashboardStore } from '../../stores/dashboard-store';
 import type { Agent, AgentProvider, AgentStatus } from '../../../shared/types';
+import {
+  buildAgentForest,
+  isOwnerContainer,
+  collectDescendantAgents,
+  type AgentTreeNode,
+} from './agent-grouping';
 
 // Mirrors StatusBadge's STATUS_CONFIG dot colors so the strip and the
 // full-size cards never disagree about what a status looks like.
@@ -86,10 +93,129 @@ function MiniAgentCard({
 }
 
 /**
- * Compressed, horizontally scrolling view of the dashboard agents for the
- * detail panel. Same store order as AgentGrid: first grid card = leftmost.
- * Expandable into a 2-column wrapped grid for quick agent switching without
- * leaving file view.
+ * A supervisor (owner-container) in the strip: its own mini card plus a caret
+ * that opens a dropdown listing every worker/researcher it owns (flattened to
+ * any depth). The caret is a sibling — MiniAgentCard is a <button>, so the
+ * dropdown toggle can't nest inside it. The dropdown is portalled to <body> and
+ * fixed-positioned so it escapes the strip's `overflow` clipping.
+ */
+function SupervisorCard({
+  node,
+  expanded,
+  onSelect,
+}: {
+  node: AgentTreeNode;
+  expanded: boolean;
+  onSelect: (agentId: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [pos, setPos] = useState<{ top: number; left: number; width: number } | null>(null);
+  const caretRef = useRef<HTMLButtonElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
+
+  const owned = collectDescendantAgents(node);
+
+  // Anchor the dropdown under the caret. Right-align its edge with the caret so
+  // it never spills off the right of the narrow detail panel; clamp to the
+  // viewport left edge just in case.
+  const reposition = () => {
+    const el = caretRef.current;
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    const width = 224; // w-56
+    setPos({ top: r.bottom + 4, left: Math.max(8, r.right - width), width });
+  };
+
+  useLayoutEffect(() => {
+    if (!open) return;
+    reposition();
+    const onScrollOrResize = () => reposition();
+    window.addEventListener('resize', onScrollOrResize);
+    // Capture-phase scroll: any ancestor scrolling should keep the panel pinned.
+    window.addEventListener('scroll', onScrollOrResize, true);
+    return () => {
+      window.removeEventListener('resize', onScrollOrResize);
+      window.removeEventListener('scroll', onScrollOrResize, true);
+    };
+  }, [open]);
+
+  // Close on outside click / Escape.
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => {
+      const t = e.target as Node;
+      if (panelRef.current?.contains(t) || caretRef.current?.contains(t)) return;
+      setOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setOpen(false);
+    };
+    document.addEventListener('mousedown', onDown);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onDown);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [open]);
+
+  const handleChildSelect = (agentId: string) => {
+    setOpen(false);
+    onSelect(agentId);
+  };
+
+  return (
+    <div className={`relative flex items-stretch ${expanded ? 'w-full' : 'w-[108px] shrink-0'}`}>
+      <div className="min-w-0 flex-1">
+        <MiniAgentCard agent={node.agent} expanded onSelect={onSelect} />
+      </div>
+      <button
+        ref={caretRef}
+        onClick={(e) => {
+          e.stopPropagation();
+          setOpen((v) => !v);
+        }}
+        aria-expanded={open}
+        aria-haspopup="menu"
+        title={`${owned.length} owned agent${owned.length === 1 ? '' : 's'}`}
+        className={`shrink-0 flex flex-col items-center justify-center px-1 border border-l-0 border-surface-3 text-[9px] transition-colors ${
+          open ? 'bg-accent-blue/20 text-accent-blue' : 'text-gray-400 hover:text-gray-100 hover:bg-surface-3/60'
+        }`}
+      >
+        <span className="text-[9px] leading-none tabular-nums">{owned.length}</span>
+        <span className={`leading-none transition-transform duration-150 ${open ? 'rotate-180' : ''}`}>▾</span>
+      </button>
+
+      {open && pos &&
+        createPortal(
+          <div
+            ref={panelRef}
+            role="menu"
+            className="fixed z-50 max-h-[50vh] overflow-y-auto scrollbar-thin border border-surface-3 bg-surface-1 shadow-lg p-1 flex flex-col gap-1"
+            style={{ top: pos.top, left: pos.left, width: pos.width }}
+          >
+            <div className="px-1 py-0.5 text-[10px] uppercase tracking-wide text-gray-500 truncate">
+              Under {node.agent.title}
+            </div>
+            {owned.length === 0 ? (
+              <div className="px-1 py-1 text-[11px] text-gray-500 italic">No owned agents</div>
+            ) : (
+              owned.map((child) => (
+                <MiniAgentCard key={child.id} agent={child} expanded onSelect={handleChildSelect} />
+              ))
+            )}
+          </div>,
+          document.body,
+        )}
+    </div>
+  );
+}
+
+/**
+ * Compressed view of the dashboard agents for the detail panel. Supervisors
+ * (owner-containers) are listed FIRST — each as a card with a dropdown caret
+ * that reveals the workers/researchers it owns — then lone workers/researchers
+ * follow. Expandable from a horizontally-scrolling row into a 2-column grid for
+ * quick agent switching without leaving the file view.
  */
 export default function AgentStrip({ defaultExpanded = false }: { defaultExpanded?: boolean }) {
   const agents = useDashboardStore((s) => s.agents);
@@ -98,7 +224,17 @@ export default function AgentStrip({ defaultExpanded = false }: { defaultExpande
   const [expanded, setExpanded] = useState(defaultExpanded);
   const scrollRef = useRef<HTMLDivElement>(null);
 
+  // Bucket the flat list into an owner→children forest, then split supervisors
+  // (owner-containers) from lone agents so the strip can render supervisors
+  // first with their per-supervisor dropdowns.
+  const forest = React.useMemo(() => buildAgentForest(agents), [agents]);
+  const supervisors = React.useMemo(() => forest.filter(isOwnerContainer), [forest]);
+  const loners = React.useMemo(() => forest.filter((n) => !isOwnerContainer(n)), [forest]);
+
   // Keep the selected agent's card in view when selection changes elsewhere.
+  // Only top-level cards carry `data-agent-id` in the strip; a worker selected
+  // from inside a dropdown lives under its supervisor and simply won't scroll —
+  // acceptable, the supervisor card is already visible.
   useEffect(() => {
     if (expanded || !selectedAgentId || !scrollRef.current) return;
     const el = scrollRef.current.querySelector(`[data-agent-id="${CSS.escape(selectedAgentId)}"]`);
@@ -115,19 +251,26 @@ export default function AgentStrip({ defaultExpanded = false }: { defaultExpande
     return <div className="text-[12px] text-gray-500 italic py-1">No agents running</div>;
   }
 
+  const cards = (
+    <>
+      {supervisors.map((node) => (
+        <SupervisorCard key={node.agent.id} node={node} expanded={expanded} onSelect={handleSelect} />
+      ))}
+      {loners.map((node) => (
+        <MiniAgentCard key={node.agent.id} agent={node.agent} expanded={expanded} onSelect={handleSelect} />
+      ))}
+    </>
+  );
+
   return (
     <div className="flex items-start gap-1 min-w-0">
       {expanded ? (
         <div className="flex-1 grid grid-cols-2 gap-1.5 max-h-[40vh] overflow-y-auto scrollbar-thin min-w-0">
-          {agents.map((agent) => (
-            <MiniAgentCard key={agent.id} agent={agent} expanded onSelect={handleSelect} />
-          ))}
+          {cards}
         </div>
       ) : (
         <div ref={scrollRef} className="flex-1 flex gap-1.5 overflow-x-auto scrollbar-thin pb-0.5 min-w-0">
-          {agents.map((agent) => (
-            <MiniAgentCard key={agent.id} agent={agent} expanded={false} onSelect={handleSelect} />
-          ))}
+          {cards}
         </div>
       )}
       <button

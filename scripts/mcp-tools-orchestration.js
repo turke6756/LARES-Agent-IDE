@@ -8,7 +8,7 @@ function getOrchestrationToolDefinitions() {
       inputSchema: {
         type: 'object',
         properties: {
-          workspace_id: { type: 'string', description: 'The workspace ID.' },
+          workspace_id: { type: 'string', description: 'Optional: the workspace ID. Defaults to your own workspace (auto-scoped from your identity).' },
           title: { type: 'string', description: 'Title for the agent.' },
           role_description: { type: 'string', description: 'Optional role description.' },
           prompt: { type: 'string', description: 'Optional initial prompt to send after launch. By default the dashboard auto-submits with a provider-appropriate Enter — set `submit: false` to suppress.' },
@@ -24,7 +24,7 @@ function getOrchestrationToolDefinitions() {
           is_researcher: { type: 'boolean', description: 'Launch the workspace RESEARCHER role-lane (default: false). The researcher browses + researches the web and writes findings into .dashboard/research/inbox/, but cannot run Bash, edit code, run notebooks, or launch agents. Claude-only (non-claude is rejected). When true, the app manages cwd/command/tools and the browser MCP — `provider`, `command`, `template_id`, and `persona` are ignored.' },
           fresh_session: { type: 'boolean', description: 'Codex-only hint (default: false). When true, the agent launches without `codex resume` so the codex CLI mints a fresh conversation rather than inheriting any prior rollout in this workspace. The dashboard still discovers and binds the new session id. Use this when you want a clean context but parallel agents in the same workspace. No-op for non-codex providers.' },
         },
-        required: ['workspace_id', 'title'],
+        required: ['title'],
       },
     },
     {
@@ -55,11 +55,11 @@ function getOrchestrationToolDefinitions() {
       inputSchema: {
         type: 'object',
         properties: {
-          workspace_id: { type: 'string', description: 'The workspace ID.' },
+          workspace_id: { type: 'string', description: 'Optional: the workspace ID. Defaults to your own workspace (auto-scoped from your identity).' },
           name: { type: 'string', description: 'Persona name (lowercase, hyphens, underscores only). Becomes the directory name under .claude/agents/.' },
           claude_md: { type: 'string', description: 'Content for the persona CLAUDE.md file. Defines the agent identity and behavior.' },
         },
-        required: ['workspace_id', 'name'],
+        required: ['name'],
       },
     },
     {
@@ -179,10 +179,12 @@ async function handleOrchestrationToolCall(name, args, apiRequest) {
   switch (name) {
     case 'launch_agent': {
       const input = {
-        workspaceId: args.workspace_id,
         title: args.title,
         roleDescription: args.role_description || '',
       };
+      // Inc 1 (B4): omit workspaceId when absent so the server self-scopes from
+      // the caller's identity header. Present → forwarded (server 403s a mismatch).
+      if (args.workspace_id) input.workspaceId = args.workspace_id;
       if (args.template_id) input.templateId = args.template_id;
       if (args.persona) input.persona = args.persona;
       if (args.system_prompt) input.systemPrompt = args.system_prompt;
@@ -299,7 +301,10 @@ async function handleOrchestrationToolCall(name, args, apiRequest) {
     }
 
     case 'create_persona': {
-      const body = { workspaceId: args.workspace_id, name: args.name };
+      // Inc 1 (B4): omit workspaceId when absent so the server self-scopes from
+      // the caller's identity header.
+      const body = { name: args.name };
+      if (args.workspace_id) body.workspaceId = args.workspace_id;
       if (args.claude_md) body.claudeMd = args.claude_md;
       const persona = await apiRequest('POST', '/api/personas', body);
       return { content: [{ type: 'text', text: `Persona "${persona.name}" created at ${persona.directory}\nHas memory: ${persona.hasMemory}\nYou can now launch an agent with persona: "${persona.name}"` }] };

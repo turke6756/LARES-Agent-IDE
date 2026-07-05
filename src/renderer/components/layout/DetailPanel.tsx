@@ -3,6 +3,7 @@ import { useShallow } from 'zustand/react/shallow';
 import { useDashboardStore } from '../../stores/dashboard-store';
 import StatusBadge from '../agent/StatusBadge';
 import AgentStrip from '../agent/AgentStrip';
+import { UsageGauge } from '../agent/agent-card-bits';
 import DetailPaneContext from '../detail/DetailPaneContext';
 import DetailPaneProducts from '../detail/DetailPaneProducts';
 import ChatPane from '../detail/ChatPane';
@@ -61,6 +62,7 @@ export default function DetailPanel({ width }: DetailPanelProps) {
   const setTerminalAgent = useDashboardStore((s) => s.setTerminalAgent);
   const setDetailPane = useDashboardStore((s) => s.setDetailPane);
   const togglePanelCollapsed = useDashboardStore((s) => s.togglePanelCollapsed);
+  const usageLimits = useDashboardStore((s) => s.usageLimits);
   const [contextCount, setContextCount] = useState(0);
   const [productsCount, setProductsCount] = useState(0);
   const [showMeta, setShowMeta] = useState(false);
@@ -199,6 +201,7 @@ export default function DetailPanel({ width }: DetailPanelProps) {
             </button>
           </div>
           <div className="flex items-center gap-1 shrink-0">
+            <UsageGauge usage={usageLimits} />
             <StatusBadge status={agent.status} />
             <CollapseButton collapsed={false} direction="right" onClick={() => togglePanelCollapsed('detailPanelCollapsed')} />
           </div>

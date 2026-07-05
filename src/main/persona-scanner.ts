@@ -8,8 +8,8 @@ import {
   readScaffoldText, sha256Hex, type ScaffoldFile,
 } from './scaffold-writer';
 import {
-  WORKER_CLAUDE_SETTINGS_JSON, WORKER_CLAUDE_SETTINGS_JSON_V5,
-  SUPERVISOR_PERSONA_CLAUDE_SETTINGS_JSON,
+  WORKER_CLAUDE_SETTINGS_JSON, WORKER_CLAUDE_SETTINGS_JSON_V5, WORKER_CLAUDE_SETTINGS_JSON_V6,
+  SUPERVISOR_PERSONA_CLAUDE_SETTINGS_JSON, SUPERVISOR_PERSONA_CLAUDE_SETTINGS_JSON_V1,
   PERSONA_CREATE_PERSONA_SKILL, PERSONA_CREATE_PERSONA_SKILL_V1,
   PERSONA_READ_COMMENTS_SKILL, PERSONA_AGENT_MD_TEMPLATE,
 } from '../shared/constants';
@@ -123,8 +123,16 @@ function buildPersonaManagedFiles(name: string, lane?: PersonaLane): Record<stri
   const settingsContent = lane === 'supervisor'
     ? SUPERVISOR_PERSONA_CLAUDE_SETTINGS_JSON
     : WORKER_CLAUDE_SETTINGS_JSON;
+  // v2 → v3 adds the statusLine → dashboard-statusline.mjs usage-capture block.
+  // previousHashes[2] is lane-specific because the v2 body differed by lane:
+  // a supervisor-lane persona carried SUPERVISOR_PERSONA_CLAUDE_SETTINGS_JSON_V1,
+  // a worker-lane persona carried WORKER_CLAUDE_SETTINGS_JSON_V6. previousHashes[1]
+  // stays the pre-Notification worker hash for both (unchanged from v2).
+  const settingsPrevHashes: Record<number, string> = lane === 'supervisor'
+    ? { 1: sha256Hex(WORKER_CLAUDE_SETTINGS_JSON_V5), 2: sha256Hex(SUPERVISOR_PERSONA_CLAUDE_SETTINGS_JSON_V1) }
+    : { 1: sha256Hex(WORKER_CLAUDE_SETTINGS_JSON_V5), 2: sha256Hex(WORKER_CLAUDE_SETTINGS_JSON_V6) };
   return {
-    [`${base}/.claude/settings.json`]:                  { content: settingsContent, version: 2, previousHashes: { 1: sha256Hex(WORKER_CLAUDE_SETTINGS_JSON_V5) } },
+    [`${base}/.claude/settings.json`]:                  { content: settingsContent, version: 3, previousHashes: settingsPrevHashes },
     [`${base}/.claude/skills/create-persona/SKILL.md`]: { content: PERSONA_CREATE_PERSONA_SKILL, version: 2, previousHashes: { 1: sha256Hex(PERSONA_CREATE_PERSONA_SKILL_V1) } },
     [`${base}/.claude/skills/read-comments/SKILL.md`]:  { content: PERSONA_READ_COMMENTS_SKILL, version: 1 },
   };

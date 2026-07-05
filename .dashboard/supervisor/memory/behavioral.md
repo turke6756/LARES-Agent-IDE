@@ -400,3 +400,21 @@ You diagnose, delegate, and verify. You do not type into source files or run the
 **Anti-pattern (the exact 2026-06-17 miss):** the JobHunt-workspace Supervisor (`f4199df6`) queried me about the researcher role-lane; I wrote a complete, source-cited brief — but only into my own chat, delivering it to no one. The asking agent stayed idle, empty-handed. User: "you crafted a response but you did not actually respond to the agent that asked you the question do you see that." Fix was a single `send_message_to_agent(f4199df6, <the brief>)` → HANDSHAKE OK, its turn started.
 
 **Source:** 2026-06-17 cross-supervisor researcher-lane briefing. Related: B-21 (full UUID required for `send_message_to_agent`), B-10 (only supervised agents emit events TO you — but you can send TO any agent by id), B-08 (name + recap framing still applies to the human-facing status note).
+
+---
+
+## B-23: Multi-WP implementation plan → scope ONE work package per worker; a plan's "one worker, sequential" contract is not a sizing estimate
+
+**Trigger:** You're about to launch a worker on a worker-ready plan containing multiple work packages (WP1 → WP2 → …), each with its own code + tests + gate. The plan says "one worker, sequential" and even includes a "hand off at 75–80% context" clause.
+
+**The misjudgment to avoid:** treating the plan's execution contract as evidence the work FITS one context window. A handoff clause in a plan is the *author admitting it probably doesn't fit* — it budgets for overflow, it doesn't prevent it. Each WP with real edits + incremental tests + a build gate burns far more context than it reads as: plan ingestion + anchors + code paging cost ~30–40% before the first WP's edits even land.
+
+**Action:**
+1. **Default: one WP per worker.** Launch worker A on WP1 only; when it returns green with a summary, launch worker B on WP2 with A's summary as inherited state. The handoff then happens at a *designed checkpoint* (green gate + written summary) instead of an *emergency* (interrupt at 90%, stuck status latch, unbuilt trailing edit).
+2. If you do give one worker multiple WPs, make the brief's gate **structural, not advisory**: "after each WP's gate passes, post the patch summary for that WP *before* starting the next; if context ≥ 70% at a WP boundary, STOP there." A boundary check the worker performs is worth more than a percentage it's supposed to notice mid-edit.
+3. Watch the first threshold event as a *forecast*: if the worker crosses 80% before finishing its first WP, the remaining WPs are already off this agent's plate — plan the successor immediately rather than hoping.
+4. This is the LAUNCH-time complement to B-14: B-14 says never kill a working agent over a percentage; B-23 says size the brief so you're never tempted to.
+
+**Anti-pattern (the exact 2026-07-05 case):** continuation-handoff plan (WP1 graceful kill + WP2 pre-stage, "one worker, sequential WP1→WP2, hand off at 75–80%") given whole to worker `51a57eba`. WP1 alone consumed ~90% (80% at 61 turns mid-WP1; 90% at 94 turns just starting WP2). Supervisor had to Esc-interrupt mid-WP2, fight a stuck `working` latch (BUG-40) to deliver the stop order, and inherited an unbuilt trailing edit. Successor `bf4e6007` finished WP2 + full gate in 62% — i.e. the task was ~1.5 windows, knowable at scoping time. The interrupt scramble was pure avoidable cost; a WP1-only brief would have produced the same two workers with a clean handoff.
+
+**Source:** 2026-07-05 continuation-handoff run; user correction: "you may have misjudged the amount of work to give to one agent … scope work packages to the context of a single agent a little better." Related: B-14 (mid-flight — let it finish), B-03 (context-as-spend), task-sizing.md § "Worker-ready plan with multiple work packages".

@@ -47,6 +47,11 @@ function patchDb(agentsMap: Map<string, Agent>, audit: AuditRow[]): () => void {
     'getActiveAgents', 'getAllAgents', 'getSupervisorAgent', 'addFileActivity',
     'updateAgentResumeSessionId', 'getWorkspace', 'createAgent',
     'getTeamMembership', 'getAgentTemplate', 'deleteFileActivitiesForAgent',
+    'pruneFileActivitiesToRecentSessions',
+    // Phase 1 lineage capture: maybeRotateClaudeSession now closes the outgoing
+    // session and inserts the successor row. The Map-backed store has no real DB,
+    // so stub these to no-ops (the pure/db suites cover their SQL).
+    'closeAgentSession', 'insertAgentSession',
   ];
   const orig: Record<string, unknown> = {};
   for (const k of keys) orig[k] = db[k];
@@ -77,6 +82,9 @@ function patchDb(agentsMap: Map<string, Agent>, audit: AuditRow[]): () => void {
   db.getTeamMembership = () => null;
   db.getAgentTemplate = () => null;
   db.deleteFileActivitiesForAgent = () => {};
+  db.pruneFileActivitiesToRecentSessions = () => ({ prunedRows: 0, prunedSessions: 0 });
+  db.closeAgentSession = () => {};
+  db.insertAgentSession = () => {};
 
   return () => { for (const k of keys) db[k] = orig[k]; };
 }

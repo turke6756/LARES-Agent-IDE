@@ -40,7 +40,7 @@ const api: IpcApi = {
     getRingBuffer: (id) => ipcRenderer.invoke('agent:get-ring-buffer', id),
     delete: (id) => ipcRenderer.invoke('agent:delete', id),
     checkAgentMd: (workingDirectory, pathType) => ipcRenderer.invoke('agent:check-agent-md', workingDirectory, pathType),
-    getFileActivities: (agentId, operation) => ipcRenderer.invoke('agent:get-file-activities', agentId, operation),
+    getFileActivities: (agentId, operation, currentOnly) => ipcRenderer.invoke('agent:get-file-activities', agentId, operation, currentOnly),
     fork: (id) => ipcRenderer.invoke('agent:fork', id),
     query: (targetAgentId, question, sourceAgentId) => ipcRenderer.invoke('agent:query', targetAgentId, question, sourceAgentId),
     sendInput: (agentId, text) => ipcRenderer.invoke('agent:send-input', agentId, text),
@@ -66,10 +66,20 @@ const api: IpcApi = {
     chatSubscribe: (agentId) => ipcRenderer.invoke('agent:chat-subscribe', agentId),
     chatUnsubscribe: (agentId) => ipcRenderer.invoke('agent:chat-unsubscribe', agentId),
     getFullToolResult: (agentId, toolUseId) => ipcRenderer.invoke('agent:chat-tool-result-full', agentId, toolUseId),
+    getAgentSessions: (agentId) => ipcRenderer.invoke('agent:get-agent-sessions', agentId),
+    getPriorSessionChat: (agentId, sessionRowId) => ipcRenderer.invoke('agent:get-prior-session-chat', agentId, sessionRowId),
     onChatEvents: (callback) => {
       const listener = (_event: any, batch: any) => callback(batch);
       ipcRenderer.on('agent:chat-events', listener);
       return () => ipcRenderer.removeListener('agent:chat-events', listener);
+    },
+  },
+  usage: {
+    getLimits: () => ipcRenderer.invoke('usage:get-limits'),
+    onLimitsChanged: (callback) => {
+      const listener = (_event: any, reading: any) => callback(reading);
+      ipcRenderer.on('usage:limits-changed', listener);
+      return () => ipcRenderer.removeListener('usage:limits-changed', listener);
     },
   },
   terminal: {
@@ -81,6 +91,14 @@ const api: IpcApi = {
       const listener = (_event: any, agentId: string, data: string) => callback(agentId, data);
       ipcRenderer.on('terminal:data', listener);
       return () => ipcRenderer.removeListener('terminal:data', listener);
+    },
+    // BUG-38: same-id PTY swap notice. Main fires this after a successful
+    // continuation / restart relaunch so the renderer can dispose the retired
+    // xterm and re-attach to the fresh PTY.
+    onRebound: (callback) => {
+      const listener = (_event: any, agentId: string) => callback(agentId);
+      ipcRenderer.on('terminal:rebound', listener);
+      return () => ipcRenderer.removeListener('terminal:rebound', listener);
     },
   },
   contextOverhead: {
@@ -420,6 +438,11 @@ const api: IpcApi = {
     const listener = (_event: any, data: any) => callback(data);
     ipcRenderer.on('agent:status-changed', listener);
     return () => ipcRenderer.removeListener('agent:status-changed', listener);
+  },
+  onAgentDeleted: (callback) => {
+    const listener = (_event: any, data: { agentId: string }) => callback(data);
+    ipcRenderer.on('agent:deleted', listener);
+    return () => ipcRenderer.removeListener('agent:deleted', listener);
   },
   onTeamUpdated: (callback) => {
     const listener = (_event: any, team: any) => callback(team);

@@ -25,6 +25,7 @@ import {
   DASHBOARD_STATUS_SCRIPT_V1_HASH,
   DASHBOARD_STATUS_SCRIPT_V2_HASH,
   SCAFFOLD_SIDECAR_REL,
+  SUPERVISOR_AGENT_MD_V8_HASH,
   normalizeManagedKey,
   sha256Hex,
 } from './index';
@@ -39,6 +40,8 @@ import {
   SUPERVISOR_AGENT_MD,
   WORKER_CLAUDE_MD,
   WORKER_CLAUDE_MD_V1,
+  WORKER_CLAUDE_SETTINGS_JSON,
+  WORKER_CLAUDE_SETTINGS_JSON_V6,
 } from '../../shared/constants';
 
 interface TestCase {
@@ -773,10 +776,13 @@ test('WP-B. researcher scaffold: fresh workspace writes persona CLAUDE.md + sett
     // Relative depth: status script is one level up (../scripts), write-guard is in-cwd (scripts/).
     assert.ok(settings.includes('/../scripts/dashboard-status.mjs'), 'status hook path must walk one level up');
     assert.ok(settings.includes('/scripts/research-write-guard.mjs'), 'write-guard path must be cwd-relative');
+    // v2 (plans/usage-limits-mcp-and-ui.md §1.4) adds the statusLine usage-capture block.
+    assert.ok(settings.includes('"statusLine"'), 'researcher settings must wire the statusLine block');
+    assert.ok(settings.includes('dashboard-statusline.mjs'), 'statusLine must point at dashboard-statusline.mjs');
 
     const sidecar = readSidecar(workDir);
     assert.equal(sidecar['researcher/CLAUDE.md'], 4, `sidecar must record researcher CLAUDE.md v4; got ${JSON.stringify(sidecar)}`);
-    assert.equal(sidecar['researcher/.claude/settings.json'], 1, 'sidecar must record settings v1');
+    assert.equal(sidecar['researcher/.claude/settings.json'], 2, 'sidecar must record settings v2 (statusLine added)');
 
     // Idempotent second pass — no rewrites, no backups.
     const beforeMtime = fs.statSync(mdPath).mtimeMs;
@@ -850,13 +856,179 @@ test('G5. supervisor CLAUDE.md: fresh scaffold carries the research-store pointe
     assert.equal(content, SUPERVISOR_AGENT_MD, 'supervisor CLAUDE.md must be exact bundled content');
     assert.equal(countMatches(content, RESEARCH_SECTION_MARKER), 1, 'research-store section appears exactly once');
     const sidecar = readSidecar(workDir);
-    assert.equal(sidecar['supervisor/CLAUDE.md'], 8, `sidecar must record v8; got ${JSON.stringify(sidecar)}`);
+    assert.equal(sidecar['supervisor/CLAUDE.md'], 9, `sidecar must record v9; got ${JSON.stringify(sidecar)}`);
 
     const beforeMtime = fs.statSync(mdPath).mtimeMs;
     supervisor.ensureSupervisorScaffold(workDir, 'windows');
     assert.equal(fs.statSync(mdPath).mtimeMs, beforeMtime, 'second pass must not rewrite CLAUDE.md');
     const backups = fs.readdirSync(path.dirname(mdPath)).filter((n) => n.startsWith('CLAUDE.md.bak.'));
     assert.equal(backups.length, 0, 'no backups expected on idempotent supervisor scaffold');
+  } finally {
+    cleanup();
+    rmrf(workDir);
+  }
+});
+
+// ── Usage-limits statusLine: worker settings.json v6 → v7 migration ──────
+//
+// plans/usage-limits-mcp-and-ui.md §1.4 — the worker .claude/settings.json gains
+// a `statusLine` block (v6 → v7). A pristine v6 file must silently upgrade; a
+// locally-edited one must be .bak'd + overwritten.
+
+function workerSettingsPath(workDir: string): string {
+  return path.join(workDir, '.dashboard', 'workers', 'claude', '.claude', 'settings.json');
+}
+function listSettingsBackups(workDir: string): string[] {
+  const dir = path.join(workDir, '.dashboard', 'workers', 'claude', '.claude');
+  if (!fs.existsSync(dir)) return [];
+  return fs.readdirSync(dir).filter((name) => name.startsWith('settings.json.bak.'));
+}
+
+test('UL-1. worker settings.json v6 (pristine) silently upgrades to v7 (statusLine added)', () => {
+  const workDir = mktmp('worker-settings-v6');
+  const { supervisor, cleanup } = makeSupervisor();
+  try {
+    const p = workerSettingsPath(workDir);
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, WORKER_CLAUDE_SETTINGS_JSON_V6, 'utf-8');
+    fs.mkdirSync(path.dirname(sidecarPath(workDir)), { recursive: true });
+    fs.writeFileSync(
+      sidecarPath(workDir),
+      JSON.stringify({ 'workers/claude/.claude/settings.json': 6 }, null, 2) + '\n',
+      'utf-8',
+    );
+
+    supervisor.ensureWorkerScaffold(workDir, 'claude', 'windows');
+
+    const content = fs.readFileSync(p, 'utf-8');
+    assert.equal(content, WORKER_CLAUDE_SETTINGS_JSON, 'v6 settings must silently upgrade to exact v7 bundled content');
+    assert.ok(content.includes('"statusLine"'), 'upgraded settings must carry the statusLine block');
+    assert.ok(content.includes('dashboard-statusline.mjs'), 'statusLine must point at dashboard-statusline.mjs');
+    assert.equal(listSettingsBackups(workDir).length, 0, 'known v6-hash upgrade must NOT create a backup');
+    assert.equal(readSidecar(workDir)['workers/claude/.claude/settings.json'], 7, 'sidecar must record v7');
+  } finally {
+    cleanup();
+    rmrf(workDir);
+  }
+});
+
+test('UL-2. worker settings.json locally-edited (unknown hash) → .bak + overwrite with v7', () => {
+  const workDir = mktmp('worker-settings-edited');
+  const { supervisor, cleanup } = makeSupervisor();
+  try {
+    const p = workerSettingsPath(workDir);
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    const edited = WORKER_CLAUDE_SETTINGS_JSON_V6.replace('"autoMemoryEnabled": false', '"autoMemoryEnabled": true');
+    fs.writeFileSync(p, edited, 'utf-8');
+    fs.mkdirSync(path.dirname(sidecarPath(workDir)), { recursive: true });
+    fs.writeFileSync(
+      sidecarPath(workDir),
+      JSON.stringify({ 'workers/claude/.claude/settings.json': 6 }, null, 2) + '\n',
+      'utf-8',
+    );
+
+    supervisor.ensureWorkerScaffold(workDir, 'claude', 'windows');
+
+    assert.equal(fs.readFileSync(p, 'utf-8'), WORKER_CLAUDE_SETTINGS_JSON, 'edited settings must be overwritten with v7 bundled content');
+    const backups = listSettingsBackups(workDir);
+    assert.equal(backups.length, 1, `expected exactly one settings .bak.<ts>; got: ${backups.join(', ')}`);
+    assert.equal(
+      fs.readFileSync(path.join(workDir, '.dashboard', 'workers', 'claude', '.claude', backups[0]), 'utf-8'),
+      edited,
+      'backup must hold the locally-edited content verbatim',
+    );
+    assert.equal(readSidecar(workDir)['workers/claude/.claude/settings.json'], 7, 'sidecar must record v7');
+  } finally {
+    cleanup();
+    rmrf(workDir);
+  }
+});
+
+// ── Context-brick Inc 1 (D3/D4): supervisor CLAUDE.md v8 → v9 migration ──
+//
+// v9 appends the `<!-- reorientation-note-v1 -->` sentinel block (D1/D2) AND
+// the `get_usage_limits` tool bullet (usage-limits workstream — landed on this
+// surface without its own bump, so v9 carries both). A pristine v8 file must
+// silently upgrade; a locally-edited one must be .bak'd + overwritten.
+
+const REORIENTATION_MARKER = '<!-- reorientation-note-v1 -->';
+
+/** The v8 supervisor CLAUDE.md, reconstructed by removing exactly the two v9
+ *  additions from the current bundled constant. The precondition test below
+ *  pins this reconstruction to the shipped SUPERVISOR_AGENT_MD_V8_HASH — if
+ *  either addition stops being a clean append, the hash check fails loudly. */
+const SUPERVISOR_AGENT_MD_V8 = SUPERVISOR_AGENT_MD
+  .replace(/\n<!-- reorientation-note-v1 -->[\s\S]*?<!-- \/reorientation-note-v1 -->\n/, '')
+  .replace(/\n- \*\*get_usage_limits\*\*[^\n]*\n/, '\n');
+
+test('CB-0. precondition: reconstructed v8 supervisor CLAUDE.md hashes to the shipped constant', () => {
+  const hash = sha256Hex(SUPERVISOR_AGENT_MD_V8);
+  assert.equal(
+    hash,
+    SUPERVISOR_AGENT_MD_V8_HASH,
+    `Reconstructed v8 hash (${hash}) does not match SUPERVISOR_AGENT_MD_V8_HASH ` +
+    `(${SUPERVISOR_AGENT_MD_V8_HASH}). Old workspaces' pristine v8 CLAUDE.md ` +
+    `would be .bak'd instead of silently upgraded.`,
+  );
+});
+
+test('CB-1. supervisor CLAUDE.md: pristine v8 silently upgrades to v9 carrying the reorientation sentinel once', () => {
+  const workDir = mktmp('sup-claudemd-v8');
+  const { supervisor, cleanup } = makeSupervisor();
+  try {
+    const mdPath = path.join(workDir, '.dashboard', 'supervisor', 'CLAUDE.md');
+    fs.mkdirSync(path.dirname(mdPath), { recursive: true });
+    fs.writeFileSync(mdPath, SUPERVISOR_AGENT_MD_V8, 'utf-8');
+    fs.mkdirSync(path.dirname(sidecarPath(workDir)), { recursive: true });
+    fs.writeFileSync(
+      sidecarPath(workDir),
+      JSON.stringify({ 'supervisor/CLAUDE.md': 8 }, null, 2) + '\n',
+      'utf-8',
+    );
+
+    supervisor.ensureSupervisorScaffold(workDir, 'windows');
+
+    const content = fs.readFileSync(mdPath, 'utf-8');
+    assert.equal(content, SUPERVISOR_AGENT_MD, 'v8 supervisor CLAUDE.md must silently upgrade to v9 bundled content');
+    assert.equal(countMatches(content, REORIENTATION_MARKER), 1, 'reorientation sentinel appears exactly once (not double-appended)');
+    assert.ok(content.includes('## Re-Orientation on Revival'), 'upgraded CLAUDE.md must carry the re-orientation section');
+    assert.ok(content.includes('**get_my_context**'), 'upgraded CLAUDE.md must carry the get_my_context tool bullet');
+    const backups = fs.readdirSync(path.dirname(mdPath)).filter((n) => n.startsWith('CLAUDE.md.bak.'));
+    assert.equal(backups.length, 0, 'known-hash v8→v9 upgrade must NOT create a backup');
+    const sidecar = readSidecar(workDir);
+    assert.equal(sidecar['supervisor/CLAUDE.md'], 9, `sidecar must record v9; got ${JSON.stringify(sidecar)}`);
+  } finally {
+    cleanup();
+    rmrf(workDir);
+  }
+});
+
+test('CB-2. supervisor CLAUDE.md: locally-edited v8 (unknown hash) → .bak + overwrite with v9', () => {
+  const workDir = mktmp('sup-claudemd-v8-edited');
+  const { supervisor, cleanup } = makeSupervisor();
+  try {
+    const mdPath = path.join(workDir, '.dashboard', 'supervisor', 'CLAUDE.md');
+    fs.mkdirSync(path.dirname(mdPath), { recursive: true });
+    const edited = SUPERVISOR_AGENT_MD_V8 + '\n## My local notes\n';
+    fs.writeFileSync(mdPath, edited, 'utf-8');
+    fs.mkdirSync(path.dirname(sidecarPath(workDir)), { recursive: true });
+    fs.writeFileSync(
+      sidecarPath(workDir),
+      JSON.stringify({ 'supervisor/CLAUDE.md': 8 }, null, 2) + '\n',
+      'utf-8',
+    );
+
+    supervisor.ensureSupervisorScaffold(workDir, 'windows');
+
+    assert.equal(fs.readFileSync(mdPath, 'utf-8'), SUPERVISOR_AGENT_MD, 'edited CLAUDE.md must be overwritten with v9 bundled content');
+    const backups = fs.readdirSync(path.dirname(mdPath)).filter((n) => n.startsWith('CLAUDE.md.bak.'));
+    assert.equal(backups.length, 1, `expected exactly one CLAUDE.md .bak.<ts>; got: ${backups.join(', ')}`);
+    assert.equal(
+      fs.readFileSync(path.join(path.dirname(mdPath), backups[0]), 'utf-8'),
+      edited,
+      'backup must hold the locally-edited content verbatim',
+    );
+    assert.equal(readSidecar(workDir)['supervisor/CLAUDE.md'], 9, 'sidecar must record v9');
   } finally {
     cleanup();
     rmrf(workDir);

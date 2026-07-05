@@ -4,7 +4,7 @@ import { URL } from 'url';
 import { getApiToken, decideApiAccess } from './security/api-auth';
 import type { AgentSupervisor } from './supervisor';
 import {
-  getAgent, getAllAgents, getAgentsByWorkspace, getWorkspace,
+  getAgent, getAllAgents, getAgentsByWorkspace, getAgentsByOwner, getWorkspace, getSupervisorAgent,
   getFileActivities,
   createTeam, getTeam, listTeams, updateTeamStatus, saveTeamManifest, getTeamManifest,
   addTeamMember, removeTeamMember, getTeamMembers,
@@ -12,6 +12,9 @@ import {
   createTeamMessage, getTeamMessages, getRecentMessageCount, getRecentPairMessages,
   createTeamTask, updateTeamTask, getTeamTasks,
   listAgentTemplates, createAgentTemplate, updateAgentTemplate, deleteAgentTemplate, getAgentTemplate,
+  createContinuationHandoffAttempt, getOpenContinuationAttempt, getLatestContinuationAttempt,
+  getContinuationAttempt, getContinuationEscapeBudget, closeContinuationHandoffAttempt, insertContinuationBrick,
+  getLatestBrickForAttempt, hasRunningOrchestrationForSupervisor,
 } from './database';
 import {
   executeCell as kernelExecuteCell,
@@ -22,8 +25,9 @@ import {
   getKernelState as kernelGetState,
 } from './jupyter-kernel-client';
 import { scanPersonas, scaffoldPersona } from './persona-scanner';
-import { TEAM_MAX_MESSAGES_PER_5MIN, TEAM_MAX_ALTERNATIONS, TEAM_ALTERNATION_WINDOW_MS, TEAM_PAIR_COOLDOWN_MS } from '../shared/constants';
+import { TEAM_MAX_MESSAGES_PER_5MIN, TEAM_MAX_ALTERNATIONS, TEAM_ALTERNATION_WINDOW_MS, TEAM_PAIR_COOLDOWN_MS, CONTINUATION_BRICK_MAX_BYTES, CONTINUATION_ESCAPE_MAX_ATTEMPTS, CONTINUATION_ESCAPE_MAX_ALIVE_MS } from '../shared/constants';
 import { TeamMessageStatus } from '../shared/types';
+import type { Agent } from '../shared/types';
 import type { SigninPendingResult, SigninPendingEntry } from '../shared/browser';
 import { isKeyName, mapKeyToBytes, SUPPORTED_KEY_NAMES } from './supervisor/key-bytes';
 import type { OrchestrationService } from './orchestration/service';
@@ -35,7 +39,49 @@ import crypto from 'crypto';
  *  internals and must NOT leak to clients as API codes, so the serializer
  *  allowlists instead of forwarding any string. Add new dashboard API codes
  *  here deliberately when a route starts setting them. */
-const API_ERROR_CODES = new Set<string>(['submit-not-confirmed', 'delivery-failed', 'browser-policy-denied']);
+const API_ERROR_CODES = new Set<string>([
+  'submit-not-confirmed', 'delivery-failed', 'browser-policy-denied',
+  // Context-brick Inc 1 identity layer — resolveIdentity / resolveWorkspaceScope
+  // attach these to their 403s. Without the allowlist entry the serializer would
+  // strip `err.code`, so a caller could not machine-distinguish an unknown-workspace
+  // assertion from a scope mismatch.
+  'unknown-workspace', 'workspace-scope-mismatch',
+  // Context-brick Inc 2 (≡ P1-10a) — resolveIdentity's X-Supervisor-Id
+  // validation attaches these to its 403s.
+  'unknown-supervisor', 'supervisor-workspace-mismatch', 'not-a-supervisor',
+  // Context-brick Inc 4 (4.4) — continuation attempt/brick/relaunch gates.
+  'continuation-open-attempt-exists', 'continuation-no-open-attempt',
+  'continuation-note-too-large', 'continuation-attempt-not-committed',
+  'continuation-no-tool-brick', 'continuation-owned-busy',
+  'continuation-input-in-flight', 'continuation-awaiting-human',
+  'continuation-orchestration-running',
+  // Context-brick Inc 5 (5B) — the note-less empty-memo escape's gates. The
+  // escape is gated on the durable EFFORT BUDGET (aborts / alive-time), NOT a
+  // context percentage, so the not-yet-authorized code is budget-not-exhausted.
+  'continuation-attempt-not-open', 'continuation-budget-not-exhausted',
+  'continuation-escape-has-brick',
+  // BUG-39 (WP1) — self-busy gate: the target agent's OWN turn must be complete
+  // before its PTY is killed (belt to the watcher's advisory post-note grace).
+  'continuation-self-busy',
+]);
+
+/** Context-brick Inc 1 — the identity an inbound request asserts via headers,
+ *  resolved once per request between the admission gate and route(). This is an
+ *  ATTRIBUTION layer on TOP of the Bearer-token admission (decideApiAccess), not
+ *  a first line of defense. Backward-compat is load-bearing: a caller sending no
+ *  `X-Workspace-Id` header resolves to `asserted:false` with nulls and rides the
+ *  exact pre-brick code path. Inc 2 (≡ P1-10a): when `X-Supervisor-Id` is present
+ *  it is validated (exists + in-workspace + is_supervisor, else 403) and the
+ *  asserted caller lands in `supervisor`, overriding the best-effort
+ *  getSupervisorAgent LIMIT-1 fallback (which survives for callers that assert
+ *  only a workspace). */
+interface IdentityContext {
+  workspaceId: string | null;
+  supervisor: Agent | null;
+  asserted: boolean;
+  projectId: string | null;
+  supervisorId: string | null;
+}
 
 /** WP2 frozen browser-tool provider contract (plans/embedded-browser-
  *  implementation-tasks.md §WP2-B). WP2-A implements this as
@@ -139,6 +185,14 @@ export class ApiServer {
   private supervisor: AgentSupervisor;
   private port: number;
 
+  /** Context-brick Inc 4 (4.4) — injectable awaiting-human predicate for the
+   *  continuation-relaunch gate. Conservative stub: defaults to false so the
+   *  gate never blocks on it until Inc 5 wires the real endsWithQuestion
+   *  cache (supervisor.lastEndsWithQuestion). TODO(Inc 5): inject the real
+   *  predicate; the fail-safe direction there is keep-alive (return true when
+   *  the latest turn ended with a question). Tests may override directly. */
+  public isAwaitingHuman: (agentId: string) => boolean = () => false;
+
   /** `bindHost` defaults to 0.0.0.0 deliberately (WP0.1 bind decision): WSL
    *  agents reach the API via the Windows-host gateway IP, so a loopback-only
    *  bind breaks them. The per-launch bearer token is the network gate, not
@@ -215,7 +269,9 @@ export class ApiServer {
         res.setHeader('Access-Control-Allow-Origin', decision.corsOrigin);
         res.setHeader('Vary', 'Origin');
         res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
-        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+        // Context-brick Inc 1 (A5) — allow the identity attribution headers so the
+        // renderer preflight does not silently block a header-carrying request.
+        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Workspace-Id, X-Supervisor-Id, X-Project-Id');
       }
       if (decision.kind === 'preflight') {
         res.writeHead(204);
@@ -234,8 +290,12 @@ export class ApiServer {
       }
 
       try {
+        // Context-brick Inc 1 (A1) — resolve asserted identity between the
+        // admission gate and route(). Inside the try so a 403 (unknown workspace)
+        // maps to HTTP via the err.statusCode catch below.
+        const identity = this.resolveIdentity(req);
         const url = new URL(req.url || '/', `http://localhost:${this.port}`);
-        const result = await this.route(req.method || 'GET', url, req);
+        const result = await this.route(req.method || 'GET', url, req, identity);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(result));
       } catch (err: any) {
@@ -311,12 +371,104 @@ export class ApiServer {
     return agent;
   }
 
-  private async route(method: string, url: URL, req: http.IncomingMessage): Promise<any> {
+  /** Context-brick Inc 1 (A1) — resolve the caller's asserted identity from the
+   *  request headers. Runs BETWEEN the admission gate and route(), inside the
+   *  try/catch so a thrown 403 maps to HTTP via the existing err.statusCode idiom.
+   *
+   *  Backward-compat contract (load-bearing): no `X-Workspace-Id` header →
+   *  `asserted:false` + all nulls → today's exact code path, byte-identical. A
+   *  present `X-Workspace-Id` naming an unknown workspace → 403 (attribution can't
+   *  proceed against a phantom scope). Inc 2 (≡ P1-10a) validates the supervisor
+   *  rail — see the inline comment below. A supervisor assertion REQUIRES a
+   *  workspace assertion: the launch-env injection guarantees SUPERVISOR_ID is
+   *  always accompanied by WORKSPACE_ID, so an X-Supervisor-Id arriving without
+   *  X-Workspace-Id has no scope to validate against and rides the non-asserted
+   *  early return (ignored, never trusted). NOTE (Gap 2, Inc 2): `X-Self-Id` is
+   *  deliberately NOT read here — it is reserved for the ownership path
+   *  (owner_agent_id stamping in the launch body); resolveIdentity must never
+   *  read it. */
+  private resolveIdentity(req: http.IncomingMessage): IdentityContext {
+    const h = req.headers;
+    const hdr = (name: string): string | null => {
+      const v = h[name];
+      return typeof v === 'string' && v.length > 0 ? v : null;
+    };
+    const workspaceId = hdr('x-workspace-id');
+    if (workspaceId === null) {
+      // Header absent → non-asserted. Every existing UI/IPC/curl caller lands here.
+      return { workspaceId: null, supervisor: null, asserted: false, projectId: null, supervisorId: null };
+    }
+    const workspace = getWorkspace(workspaceId);
+    if (!workspace) {
+      throw Object.assign(
+        new Error(`Unknown workspace asserted in X-Workspace-Id: ${workspaceId}`),
+        { statusCode: 403, code: 'unknown-workspace' },
+      );
+    }
+    // Inc 2 (2.2, ≡ P1-10a) — the supervisor rail. Header absent → best-effort
+    // LIMIT-1 fallback (today's non-asserted supervisor attribution, unchanged).
+    // Header present → validate (exists + in the asserted workspace +
+    // is_supervisor, else 403) and let the asserted caller OVERRIDE the
+    // fallback: in a multi-supervisor workspace LIMIT-1 would misattribute
+    // every older supervisor's calls to the newest one.
+    const supervisorId = hdr('x-supervisor-id');
+    let supervisor: Agent | null;
+    if (supervisorId === null) {
+      supervisor = getSupervisorAgent(workspaceId);
+    } else {
+      const caller = getAgent(supervisorId);
+      if (!caller) {
+        throw Object.assign(
+          new Error(`Unknown agent asserted in X-Supervisor-Id: ${supervisorId}`),
+          { statusCode: 403, code: 'unknown-supervisor' },
+        );
+      }
+      if (caller.workspaceId !== workspaceId) {
+        throw Object.assign(
+          new Error(`X-Supervisor-Id '${supervisorId}' is not an agent of workspace '${workspaceId}'`),
+          { statusCode: 403, code: 'supervisor-workspace-mismatch' },
+        );
+      }
+      if (!caller.isSupervisor) {
+        throw Object.assign(
+          new Error(`X-Supervisor-Id '${supervisorId}' is not a supervisor agent`),
+          { statusCode: 403, code: 'not-a-supervisor' },
+        );
+      }
+      supervisor = caller;
+    }
+    return {
+      workspaceId,
+      supervisor,
+      asserted: true,
+      projectId: hdr('x-project-id'),
+      supervisorId,
+    };
+  }
+
+  /** Context-brick Inc 1 (A2) — reconcile an asserted identity with an explicit
+   *  `workspaceId` query/body value. Matrix:
+   *    - not asserted            → return the caller-supplied value (today's behavior)
+   *    - asserted + no explicit  → the asserted workspace (self-scope)
+   *    - asserted + matching     → that workspace
+   *    - asserted + mismatched   → 403 (a supervisor may not reach across workspaces) */
+  private resolveWorkspaceScope(identity: IdentityContext, explicit: string | null): string | null {
+    if (!identity.asserted) return explicit;
+    if (explicit === null || explicit === '') return identity.workspaceId;
+    if (explicit === identity.workspaceId) return explicit;
+    throw Object.assign(
+      new Error(`workspaceId '${explicit}' does not match asserted X-Workspace-Id '${identity.workspaceId}'`),
+      { statusCode: 403, code: 'workspace-scope-mismatch' },
+    );
+  }
+
+  private async route(method: string, url: URL, req: http.IncomingMessage, identity: IdentityContext): Promise<any> {
     const path = url.pathname;
 
     // GET /api/agents — list all agents
     if (method === 'GET' && path === '/api/agents') {
-      const workspaceId = url.searchParams.get('workspaceId');
+      // Inc 1 (A3): header-scoped when asserted, else today's optional ?workspaceId.
+      const workspaceId = this.resolveWorkspaceScope(identity, url.searchParams.get('workspaceId'));
       const agents = workspaceId ? getAgentsByWorkspace(workspaceId) : getAllAgents();
       // Enrich with context stats
       return agents.map(a => this.withInputInFlight({
@@ -352,6 +504,13 @@ export class ApiServer {
       return { agentId: ctxMatch[1], stats };
     }
 
+    // GET /api/usage-limits — account-wide Claude subscription usage reading.
+    // Canonical contract: always returns a UsageLimitsReading (with `available`
+    // and `account_wide: true`). Consumed verbatim by the MCP get_usage_limits tool.
+    if (method === 'GET' && path === '/api/usage-limits') {
+      return this.supervisor.getUsageLimits();
+    }
+
     // GET /api/agents/:id/messages — read structured agent chat
     const messagesMatch = path.match(/^\/api\/agents\/([^/]+)\/messages$/);
     if (method === 'GET' && messagesMatch) {
@@ -375,7 +534,10 @@ export class ApiServer {
       const op = url.searchParams.get('operation');
       const operation = op === 'read' || op === 'write' || op === 'create' ? op : undefined;
       const limit = parseInt(url.searchParams.get('limit') || '200', 10);
-      const activities = getFileActivities(agentId, operation).slice(0, limit);
+      // Default returns ALL retained sessions ("has any prior session touched
+      // X?"); current_only=true narrows to the agent's live session.
+      const currentOnly = url.searchParams.get('current_only') === 'true';
+      const activities = getFileActivities(agentId, operation, currentOnly).slice(0, limit);
       return { agentId, operation: operation || null, activities };
     }
 
@@ -635,6 +797,11 @@ export class ApiServer {
       if (input && input.notify_owner !== undefined && input.notifyOwner === undefined) {
         input.notifyOwner = input.notify_owner;
       }
+      // Inc 1 (B4 server side): self-scope launches. Asserted caller + no
+      // workspaceId → fill from header; matching → ok; mismatch → 403. No header
+      // + no workspaceId → unchanged (launchAgent enforces as before).
+      const scopedWorkspaceId = this.resolveWorkspaceScope(identity, (input?.workspaceId as string) ?? null);
+      if (scopedWorkspaceId) input.workspaceId = scopedWorkspaceId;
       const agent = await this.supervisor.launchAgent(input);
       return agent;
     }
@@ -692,12 +859,372 @@ export class ApiServer {
     // DELETE /api/orchestrations/:runId — abort + clean up members
     if (method === 'DELETE' && orchOne) return this.orchestration!.abort(orchOne[1]);
 
+    // GET /api/supervisor/context — Inc 1 (A4): the self-orientation summary a
+    // supervisor pulls (get_my_context) on revival. Workspace comes from the
+    // asserted X-Workspace-Id header or an explicit ?workspaceId=. No scope at all
+    // → 400; unknown workspace → 404.
+    //
+    // Inc 2 (2.3, ≡ P1-10a): when the caller asserts X-Supervisor-Id,
+    // `supervisor` is the header-validated caller itself (resolveIdentity
+    // overrode the LIMIT-1 fallback) and `supervisorId` echoes its id. Without
+    // the header, `supervisor` stays the best-effort getSupervisorAgent
+    // (ORDER BY created_at DESC LIMIT 1) read — which may misattribute in a
+    // multi-supervisor workspace — and `supervisorId` is null.
+    if (method === 'GET' && path === '/api/supervisor/context') {
+      const workspaceId = this.resolveWorkspaceScope(identity, url.searchParams.get('workspaceId'));
+      if (!workspaceId) {
+        throw Object.assign(
+          new Error('workspaceId required (send X-Workspace-Id header or ?workspaceId=)'),
+          { statusCode: 400 },
+        );
+      }
+      const workspace = getWorkspace(workspaceId);
+      if (!workspace) throw Object.assign(new Error('Workspace not found'), { statusCode: 404 });
+      // identity.supervisor is set whenever the workspace was asserted (validated
+      // caller, or LIMIT-1 fallback); the explicit-?workspaceId= path (no header)
+      // keeps the LIMIT-1 read.
+      const supervisor = identity.supervisor ?? getSupervisorAgent(workspaceId);
+      const agents = getAgentsByWorkspace(workspaceId);
+      // Inc 3 (3.3): owned-agent COUNTS only — the full list stays
+      // list_my_agents's job (GET /api/supervisor/owned-agents). Attribution
+      // follows the same `supervisor` as the rest of this response (asserted
+      // caller when X-Supervisor-Id was sent, else the LIMIT-1 best-effort).
+      const ownedRows = supervisor ? getAgentsByOwner(supervisor.id, { includeTerminal: true }) : [];
+      const counts = {
+        total: agents.length,
+        // "live" = not in a terminal status. Mirrors getWorkspaceAgentSummary's
+        // active filter (done/crashed are the terminal states).
+        live: agents.filter(a => a.status !== 'done' && a.status !== 'crashed').length,
+        supervised: agents.filter(a => a.isSupervised).length,
+        owned: {
+          live: ownedRows.filter(a => a.status !== 'done' && a.status !== 'crashed').length,
+          terminal: ownedRows.filter(a => a.status === 'done' || a.status === 'crashed').length,
+        },
+      };
+      return {
+        workspaceId,
+        workspaceTitle: workspace.title,
+        // Inc 2 (2.3): the asserted caller's own id when X-Supervisor-Id was
+        // present (validated in resolveIdentity); null for header-less callers.
+        supervisorId: identity.supervisorId,
+        supervisor: supervisor
+          ? { id: supervisor.id, title: supervisor.title, provider: supervisor.provider, status: supervisor.status }
+          : null,
+        counts,
+      };
+    }
+
+    // GET /api/supervisor/owned-agents — Inc 3 (3.2): the calling supervisor's
+    // own launched agents (owner edge), newest first. Live set by default;
+    // ?includeTerminal=true adds done/crashed rows (the graveyard window).
+    // The owner comes EXCLUSIVELY from the validated X-Supervisor-Id
+    // (resolveIdentity): an explicit agent-id/owner param is rejected with 400
+    // so a caller can never name another supervisor's fleet, and a missing
+    // assertion is 400 — the LIMIT-1 fallback never substitutes here (it may
+    // misattribute in a multi-supervisor workspace). Pull-only surface: this
+    // data is never snapshotted into a brick/prompt artifact.
+    if (method === 'GET' && path === '/api/supervisor/owned-agents') {
+      const ownerParams = ['agentId', 'agent_id', 'ownerAgentId', 'owner_agent_id', 'owner', 'supervisorId', 'supervisor_id']
+        .filter(p => url.searchParams.has(p));
+      if (ownerParams.length > 0) {
+        throw Object.assign(
+          new Error(`owner is derived from X-Supervisor-Id; remove query param(s): ${ownerParams.join(', ')}`),
+          { statusCode: 400 },
+        );
+      }
+      if (!identity.supervisorId || !identity.supervisor) {
+        throw Object.assign(
+          new Error('supervisor identity required (send X-Supervisor-Id header)'),
+          { statusCode: 400 },
+        );
+      }
+      const includeTerminal = url.searchParams.get('includeTerminal') === 'true';
+      let owned = getAgentsByOwner(identity.supervisor.id, { includeTerminal });
+      const limit = parseInt(url.searchParams.get('limit') || '0', 10);
+      if (limit > 0) owned = owned.slice(0, limit);
+      return {
+        ownerId: identity.supervisor.id,
+        includeTerminal,
+        agents: owned.map(a => this.withInputInFlight({
+          ...a,
+          contextStats: this.supervisor.getContextStats(a.id),
+        })),
+      };
+    }
+
+    // ── Context-brick Inc 4 (4.4) — continuation attempt / brick / relaunch ──
+
+    // POST /api/agents/:id/continuation-attempt — mint a handoff attempt.
+    // Server allocates successorGen (= agent gen + 1); the attempt OWNS it.
+    // One open attempt per agent (409 on a second).
+    const contAttemptMatch = path.match(/^\/api\/agents\/([^/]+)\/continuation-attempt$/);
+    if (method === 'POST' && contAttemptMatch) {
+      const agentId = contAttemptMatch[1];
+      const agent = getAgent(agentId);
+      if (!agent) throw Object.assign(new Error('Agent not found'), { statusCode: 404 });
+      const body = await readBody(req);
+      const input = body ? JSON.parse(body) : {};
+      const open = getOpenContinuationAttempt(agentId);
+      if (open) {
+        throw Object.assign(
+          new Error(`agent already has an open continuation attempt (${open.id})`),
+          { statusCode: 409, code: 'continuation-open-attempt-exists' },
+        );
+      }
+      const attempt = createContinuationHandoffAttempt(agentId, {
+        reason: typeof input.reason === 'string' ? input.reason : undefined,
+        thresholdContextPct: typeof input.thresholdContextPct === 'number' ? input.thresholdContextPct : undefined,
+      });
+      return { attemptId: attempt.id, successorGen: attempt.generation };
+    }
+
+    // POST /api/supervisor/continuation-brick { note } — author is derived
+    // EXCLUSIVELY from the validated X-Supervisor-Id (resolveIdentity already
+    // rejected an out-of-workspace / non-supervisor assertion with 403). Any
+    // body-supplied agent id is rejected so a caller can never write another
+    // agent's brick. Reject-never-truncate on the byte cap.
+    if (method === 'POST' && path === '/api/supervisor/continuation-brick') {
+      const body = await readBody(req);
+      const input = body ? JSON.parse(body) : {};
+      const bodyAgentKeys = ['agent_id', 'agentId', 'dashboard_agent_id', 'dashboardAgentId']
+        .filter(k => k in input);
+      if (bodyAgentKeys.length > 0) {
+        throw Object.assign(
+          new Error(`author is derived from X-Supervisor-Id; remove body field(s): ${bodyAgentKeys.join(', ')}`),
+          { statusCode: 400 },
+        );
+      }
+      if (!identity.supervisorId || !identity.supervisor) {
+        throw Object.assign(
+          new Error('supervisor identity required (send X-Supervisor-Id header)'),
+          { statusCode: 400 },
+        );
+      }
+      const note = input.note;
+      if (typeof note !== 'string' || note.trim().length === 0) {
+        throw Object.assign(new Error('note (non-empty string) required'), { statusCode: 400 });
+      }
+      const attempt = getOpenContinuationAttempt(identity.supervisor.id);
+      if (!attempt) {
+        throw Object.assign(
+          new Error('no open continuation attempt for this supervisor — the watcher opens one before requesting the note'),
+          { statusCode: 409, code: 'continuation-no-open-attempt' },
+        );
+      }
+      const bytes = Buffer.byteLength(note, 'utf8');
+      if (bytes > CONTINUATION_BRICK_MAX_BYTES) {
+        throw Object.assign(
+          new Error(`note is ${bytes} bytes; max is ${CONTINUATION_BRICK_MAX_BYTES}. Trim prose to pointers (file paths, plan ids, owned-agent ids) and resend — the note is never silently truncated.`),
+          { statusCode: 413, code: 'continuation-note-too-large' },
+        );
+      }
+      const id = insertContinuationBrick({
+        agentId: identity.supervisor.id,
+        handoffAttemptId: attempt.id,
+        generation: attempt.generation,
+        note,
+        noteSource: 'tool',
+      });
+      closeContinuationHandoffAttempt(attempt.id, 'committed');
+      return { id };
+    }
+
+    // GET /api/supervisor/continuation-brick?agentId=&attemptId=&source=tool
+    // — the watcher's commit-observation read (poll the DB row, not the tool
+    // response).
+    if (method === 'GET' && path === '/api/supervisor/continuation-brick') {
+      const agentId = url.searchParams.get('agentId');
+      const attemptId = url.searchParams.get('attemptId');
+      if (!agentId || !attemptId) {
+        throw Object.assign(new Error('agentId and attemptId query params required'), { statusCode: 400 });
+      }
+      const source = url.searchParams.get('source');
+      if (source && source !== 'tool' && source !== 'scrape') {
+        throw Object.assign(new Error("source must be 'tool' or 'scrape'"), { statusCode: 400 });
+      }
+      const brick = getLatestBrickForAttempt(agentId, attemptId, source ? { source: source as 'tool' | 'scrape' } : undefined);
+      return { agentId, attemptId, brick };
+    }
+
+    // POST /api/agents/:id/continuation-relaunch — the ONLY kill path. Every
+    // gate re-checks server-side against fresh reads (the watcher's local view
+    // is advisory); any fail → 409/425 with NO kill. Kill authorization is
+    // exactly one thing: a note_source='tool' brick for the CURRENT committed
+    // attempt written after the attempt opened.
+    const contRelaunchMatch = path.match(/^\/api\/agents\/([^/]+)\/continuation-relaunch$/);
+    if (method === 'POST' && contRelaunchMatch) {
+      const agentId = contRelaunchMatch[1];
+      const agent = getAgent(agentId);
+      if (!agent) throw Object.assign(new Error('Agent not found'), { statusCode: 404 });
+      const body = await readBody(req);
+      const input = body ? JSON.parse(body) : {};
+
+      // Phase 5B (Option B) — note-less empty-memo escape. Explicit caller
+      // opt-in; valid ONLY when the attempt is still OPEN (no note ever
+      // committed), no tool brick exists, and the durable EFFORT BUDGET is
+      // exhausted (enough aborted attempts OR the cycle alive past the cap).
+      // NO context-percentage anywhere: 100% context is a cost metric, not a
+      // cliff. This second authorization path is gated server-side like the
+      // first so an idle supervisor that never authors a note is eventually
+      // freed rather than left alive+expensive forever.
+      const emptyMemoEscape = input.emptyMemoEscape === true;
+      const expectedGen = (agent.continuationGeneration ?? 0) + 1;
+      let attempt: ReturnType<typeof getContinuationAttempt>;
+      let brickRow: ReturnType<typeof getLatestBrickForAttempt> = null;
+      if (!emptyMemoEscape) {
+        // Gate 1 — a committed attempt at the current successor generation.
+        attempt = typeof input.attemptId === 'string'
+          ? getContinuationAttempt(input.attemptId)
+          : getLatestContinuationAttempt(agentId, 'committed');
+        if (!attempt || attempt.dashboardAgentId !== agentId
+            || attempt.status !== 'committed' || attempt.generation !== expectedGen) {
+          throw Object.assign(
+            new Error('no committed continuation attempt at the current generation for this agent'),
+            { statusCode: 409, code: 'continuation-attempt-not-committed' },
+          );
+        }
+
+        // Gate 2 — kill authorization: a tool-sourced brick for THIS attempt,
+        // written after the attempt opened. A scrape never authorizes.
+        brickRow = getLatestBrickForAttempt(agentId, attempt.id, { source: 'tool' });
+        if (!brickRow || !(brickRow.writtenAt > attempt.startedAt)) {
+          throw Object.assign(
+            new Error('no tool-authored brick committed for this attempt — relaunch is not authorized'),
+            { statusCode: 425, code: 'continuation-no-tool-brick' },
+          );
+        }
+      } else {
+        // Gate 1e — an OPEN attempt at the current successor generation.
+        attempt = typeof input.attemptId === 'string'
+          ? getContinuationAttempt(input.attemptId)
+          : getOpenContinuationAttempt(agentId);
+        if (!attempt || attempt.dashboardAgentId !== agentId
+            || attempt.status !== 'open' || attempt.generation !== expectedGen) {
+          throw Object.assign(
+            new Error('empty-memo escape requires an open continuation attempt at the current generation'),
+            { statusCode: 409, code: 'continuation-attempt-not-open' },
+          );
+        }
+        // Gate 2e-a — the escape is for the NO-note case only; with a tool
+        // brick present the normal (authorized) path must be used instead.
+        const toolBrick = getLatestBrickForAttempt(agentId, attempt.id, { source: 'tool' });
+        if (toolBrick && toolBrick.writtenAt > attempt.startedAt) {
+          throw Object.assign(
+            new Error('a tool-authored brick exists for this attempt — use the normal relaunch path'),
+            { statusCode: 409, code: 'continuation-escape-has-brick' },
+          );
+        }
+        // Gate 2e-b — the durable effort budget must be exhausted (Phase 5B).
+        // Scoped to this successor generation's attempts since the last relaunch:
+        // escape iff abortedCount ≥ MAX OR the cycle has been alive past the cap.
+        // No context-percentage. Timestamps are UTC 'YYYY-MM-DD HH:MM:SS.fff';
+        // convert to epoch ms as UTC for the alive-time clock.
+        const budget = getContinuationEscapeBudget(agentId, expectedGen);
+        const firstMs = budget.firstAttemptStartedAt !== null
+          ? Date.parse(budget.firstAttemptStartedAt.replace(' ', 'T') + 'Z')
+          : null;
+        const aliveExhausted = firstMs !== null && (Date.now() - firstMs) >= CONTINUATION_ESCAPE_MAX_ALIVE_MS;
+        const budgetExhausted = budget.abortedCount >= CONTINUATION_ESCAPE_MAX_ATTEMPTS || aliveExhausted;
+        if (!budgetExhausted) {
+          throw Object.assign(
+            new Error(`empty-memo escape requires the effort budget exhausted (aborts ${budget.abortedCount}/${CONTINUATION_ESCAPE_MAX_ATTEMPTS}, alive ${firstMs !== null ? Math.round((Date.now() - firstMs) / 1000) : 0}s/${Math.round(CONTINUATION_ESCAPE_MAX_ALIVE_MS / 1000)}s) — abort-don't-kill until then`),
+            { statusCode: 425, code: 'continuation-budget-not-exhausted' },
+          );
+        }
+      }
+
+      // Gate 2s (BUG-39 WP1) — self busy: re-check the TARGET agent's OWN raw DB
+      // status against a fresh read. The watcher's post-note grace loop is
+      // advisory (like every other gate); a mid-turn author must never be
+      // relaunched out from under its closing message / transcript tail /
+      // in-flight session-subagent. 'waiting' is deliberately ABSENT — the
+      // awaiting-human gate (Gate 5) owns that case, and a waiting author must
+      // not double-block the committedReady retry path.
+      const selfBusyBlocklist = new Set(['working', 'launching', 'restarting']);
+      const selfStatus = getAgent(agentId)?.status;
+      if (selfStatus && selfBusyBlocklist.has(selfStatus)) {
+        throw Object.assign(
+          new Error(`target agent's own turn is not complete (status ${selfStatus})`),
+          { statusCode: 409, code: 'continuation-self-busy' },
+        );
+      }
+
+      // Gate 3 — owned-agent busy-blocklist (Inc 5 §5B): raw DB statuses
+      // launching|working|waiting|restarting block; crashed is non-blocking
+      // (its ids ride the attempt reason for triage); 'receiving' never
+      // appears in a raw row (projection-only) so it is not in this set.
+      const owned = getAgentsByOwner(agentId, { includeTerminal: false });
+      const busyBlocklist = new Set(['launching', 'working', 'waiting', 'restarting']);
+      const busy = owned.filter(a => busyBlocklist.has(a.status));
+      if (busy.length > 0) {
+        throw Object.assign(
+          new Error(`owned agents busy: ${busy.map(a => `${a.id}(${a.status})`).join(', ')}`),
+          { statusCode: 409, code: 'continuation-owned-busy' },
+        );
+      }
+
+      // Gate 4 — explicit in-flight guard, separately from the status set:
+      // catches a mid-delivery PTY for every owned agent AND :id itself (a
+      // supervisor mid-'receiving' must not be relaunched out from under an
+      // in-flight delivery).
+      const inFlight = [...owned.map(a => a.id), agentId]
+        .filter(id => this.supervisor.isInputInFlight(id));
+      if (inFlight.length > 0) {
+        throw Object.assign(
+          new Error(`input delivery in flight for: ${inFlight.join(', ')}`),
+          { statusCode: 425, code: 'continuation-input-in-flight' },
+        );
+      }
+
+      // Gate 5 — awaiting-human (injectable predicate; conservative stub
+      // defaults to false until Inc 5 wires the endsWithQuestion cache).
+      if (this.isAwaitingHuman(agentId)) {
+        throw Object.assign(
+          new Error('agent is awaiting a human answer — keep-alive'),
+          { statusCode: 409, code: 'continuation-awaiting-human' },
+        );
+      }
+
+      // Gate 6 — no live orchestration owned by :id ('starting'|'running';
+      // stalled/aborted are ended-but-resumable and do not block).
+      if (hasRunningOrchestrationForSupervisor(agentId)) {
+        throw Object.assign(
+          new Error('an orchestration owned by this supervisor is starting/running'),
+          { statusCode: 409, code: 'continuation-orchestration-running' },
+        );
+      }
+
+      // Escape mode ships a synthetic "none" Block C plus a Block A advisory
+      // (rides `reason`) telling the successor to self-orient from tools.
+      const brick = brickRow
+        ? {
+            handoffAttemptId: attempt.id,
+            noteId: brickRow.id,
+            reason: attempt.reason ?? undefined,
+            note: brickRow.note,
+            workspaceId: agent.workspaceId,
+          }
+        : {
+            handoffAttemptId: attempt.id,
+            noteId: 'none',
+            reason: `${attempt.reason ?? 'effort budget exhausted'} — no note captured; self-orient fully via get_my_context/list_my_agents`,
+            note: 'none',
+            workspaceId: agent.workspaceId,
+          };
+      await this.supervisor.continuationRelaunch(agentId, brick);
+      return { agentId, attemptId: attempt.id, generation: attempt.generation, noteId: brick.noteId };
+    }
+
     // ── Team routes ──────────────────────────────────────────────────────
 
     // POST /api/teams — create team
     if (method === 'POST' && path === '/api/teams') {
       const body = await readBody(req);
       const input = JSON.parse(body);
+      // Inc 1 (B4 server side): asserted caller may omit workspaceId (filled from
+      // header); an explicit mismatch → 403.
+      const scopedTeamWs = this.resolveWorkspaceScope(identity, input.workspaceId ?? null);
+      if (scopedTeamWs) input.workspaceId = scopedTeamWs;
       if (!input.workspaceId || !input.name || !input.members?.length) {
         throw Object.assign(new Error('Missing workspaceId, name, or members'), { statusCode: 400 });
       }
@@ -708,7 +1235,9 @@ export class ApiServer {
 
     // GET /api/teams?workspaceId=... — list teams
     if (method === 'GET' && path === '/api/teams') {
-      const workspaceId = url.searchParams.get('workspaceId');
+      // Inc 1 (A3): asserted + no ?workspaceId is a DELIBERATE relaxation from the
+      // old 400 to header-scoped (RECORDED AS INTENDED — do not restore the 400).
+      const workspaceId = this.resolveWorkspaceScope(identity, url.searchParams.get('workspaceId'));
       if (!workspaceId) throw Object.assign(new Error('Missing workspaceId'), { statusCode: 400 });
       return listTeams(workspaceId);
     }
@@ -1131,7 +1660,9 @@ export class ApiServer {
 
     // GET /api/personas?workspaceId=... — list personas
     if (method === 'GET' && path === '/api/personas') {
-      const workspaceId = url.searchParams.get('workspaceId');
+      // Inc 1 (A3): asserted + no ?workspaceId relaxes from 400 to header-scoped
+      // (RECORDED AS INTENDED — mirrors the teams relaxation).
+      const workspaceId = this.resolveWorkspaceScope(identity, url.searchParams.get('workspaceId'));
       if (!workspaceId) throw Object.assign(new Error('Missing workspaceId'), { statusCode: 400 });
       const workspace = getWorkspace(workspaceId);
       if (!workspace) throw Object.assign(new Error('Workspace not found'), { statusCode: 404 });
@@ -1141,7 +1672,10 @@ export class ApiServer {
     // POST /api/personas — create persona
     if (method === 'POST' && path === '/api/personas') {
       const body = await readBody(req);
-      const { workspaceId, name, claudeMd, roleDescription, lane } = JSON.parse(body);
+      const { workspaceId: bodyWorkspaceId, name, claudeMd, roleDescription, lane } = JSON.parse(body);
+      // Inc 1 (B4 server side): asserted caller may omit workspaceId (filled from
+      // header); an explicit mismatch → 403.
+      const workspaceId = this.resolveWorkspaceScope(identity, bodyWorkspaceId ?? null);
       if (!workspaceId || !name) throw Object.assign(new Error('Missing workspaceId or name'), { statusCode: 400 });
       const workspace = getWorkspace(workspaceId);
       if (!workspace) throw Object.assign(new Error('Workspace not found'), { statusCode: 404 });
@@ -1157,7 +1691,8 @@ export class ApiServer {
 
     // GET /api/templates?workspaceId=... — list templates
     if (method === 'GET' && path === '/api/templates') {
-      const workspaceId = url.searchParams.get('workspaceId') || undefined;
+      // Inc 1 (A3): header-scoped when asserted, else today's optional filter.
+      const workspaceId = this.resolveWorkspaceScope(identity, url.searchParams.get('workspaceId')) || undefined;
       return listAgentTemplates(workspaceId);
     }
 

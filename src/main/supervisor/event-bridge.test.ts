@@ -770,6 +770,45 @@ async function launchingToOtherStatuses_stillFire(): Promise<void> {
   console.log('  launching→idle ✓ guard is transition-exact (crashed/waiting from launching still fire)');
 }
 
+async function idleToDone_isSuppressed(): Promise<void> {
+  // idle → done is clean-shutdown noise: the worker already emitted its
+  // turn-end idle event, and its process has now simply exited cleanly
+  // (exit code 0 → 'done'). The supervisor must NOT be notified. A
+  // working → done from a different worker still fires, proving the guard is
+  // transition-scoped (idle → done), not status-scoped (→ done).
+  const f = makeFakeBridgeDeps();
+  const supervisor = makeAgent('sup-1', { isSupervisor: true, isSupervised: false, status: 'idle' });
+  const worker = makeAgent('w-d1', { status: 'idle' });
+  f.agents.set(supervisor.id, supervisor);
+  f.agents.set(worker.id, worker);
+  const bridge = new EventBridge(f.deps);
+
+  await bridge.onStatusChanged({
+    agentId: worker.id,
+    status: 'done',
+    fromStatus: 'idle',
+    source: 'monitor',
+  });
+  assert.equal(f.sendInputCalls.length, 0,
+    'idle → done must be suppressed (pure clean-shutdown noise)');
+  assert.equal(bridge.getQueueSnapshot().length, 0,
+    'idle → done must not even be queued');
+
+  // The guard is exactly (idle, done). working → done (a worker that exits
+  // cleanly mid-turn) is still a real event the supervisor must hear about.
+  const worker2 = makeAgent('w-d2', { status: 'working' });
+  f.agents.set(worker2.id, worker2);
+  await bridge.onStatusChanged({
+    agentId: worker2.id,
+    status: 'done',
+    fromStatus: 'working',
+    source: 'runner-exit',
+  });
+  assert.equal(f.sendInputCalls.length, 1,
+    'working → done still fires (guard is transition-exact)');
+  console.log('  idle→done ✓ suppressed; working→done still fires');
+}
+
 // ── BUG-11: user-typing deferral ────────────────────────────────────────
 
 async function BR_11a_deliverDefersWhileUserTyping(): Promise<void> {
@@ -1759,6 +1798,7 @@ async function main(): Promise<void> {
   await BR_20_waitingToWorkingIsSuppressed();
   await launchingToIdle_isSuppressed();
   await launchingToOtherStatuses_stillFire();
+  await idleToDone_isSuppressed();
   await onChatEvents_codexTurnComplete();
   await onChatEvents_dispatchTable();
   await onChatEvents_geminiToolUseStillRoutes();

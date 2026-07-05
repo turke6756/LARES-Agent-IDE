@@ -6,6 +6,7 @@ import {
   defaultOwnerExpanded,
   isActiveStatus,
   hasActiveDescendant,
+  collectDescendantAgents,
   type AgentTreeNode,
 } from './agent-grouping';
 import type { AgentStatus } from '../../../shared/types';
@@ -110,6 +111,29 @@ describe('defaultOwnerExpanded', () => {
     expect(defaultOwnerExpanded(1)).toBe(false);
     expect(defaultOwnerExpanded(6)).toBe(false);
     expect(defaultOwnerExpanded(50)).toBe(false);
+  });
+});
+
+describe('collectDescendantAgents', () => {
+  it('is empty for a childless node (excludes the node itself)', () => {
+    const forest = buildAgentForest([mk('solo')]);
+    expect(collectDescendantAgents(forest[0])).toEqual([]);
+  });
+
+  it('lists direct children in input order, excluding the owner', () => {
+    const forest = buildAgentForest([mk('p'), mk('c1', 'p'), mk('c2', 'p')]);
+    expect(collectDescendantAgents(forest[0]).map((a) => a.id)).toEqual(['c1', 'c2']);
+  });
+
+  it('flattens grandchildren depth-first, owner-first', () => {
+    // sup → res(owner) → wrk, plus a direct worker under sup.
+    const forest = buildAgentForest([
+      mk('sup'),
+      mk('res', 'sup'),
+      mk('wrk', 'res'),
+      mk('direct', 'sup'),
+    ]);
+    expect(collectDescendantAgents(forest[0]).map((a) => a.id)).toEqual(['res', 'wrk', 'direct']);
   });
 });
 

@@ -34,6 +34,28 @@ function detectApiHost() {
 const API_HOST = detectApiHost();
 const API_BASE = `http://${API_HOST}:${API_PORT}`;
 
+// Context-brick Inc 1 (B1) — generic identity-header forwarding. The dashboard
+// injects per-agent identity into the launch env as `AGENT_DASHBOARD_<PART>_ID`
+// (SELF_ID, SUPERVISOR_ID, WORKSPACE_ID, …). Scan for that shape and turn each
+// into an `X-<Part>-Id` request header, so every dashboard API call carries the
+// caller's asserted identity (the server attributes/self-scopes from it).
+// Generic from day one: a new `AGENT_DASHBOARD_FOO_ID` env costs zero shim work.
+// `_API_TOKEN` / `_API_PORT` / `_HOST` do not end in `_ID`, so they never match.
+const CALLER_HEADERS = (() => {
+  const headers = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (!value) continue;
+    const m = /^AGENT_DASHBOARD_(.+)_ID$/.exec(key);
+    if (!m) continue;
+    const headerName = 'X-' + m[1]
+      .split('_')
+      .map((part) => part.charAt(0).toUpperCase() + part.slice(1).toLowerCase())
+      .join('-') + '-Id';
+    headers[headerName] = value;
+  }
+  return headers;
+})();
+
 function requireApiToken() {
   const token = process.env.AGENT_DASHBOARD_API_TOKEN;
   if (!token) {
@@ -55,6 +77,9 @@ function createApiRequest(apiToken) {
         headers: {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${apiToken}`,
+          // Inc 1 (B2): forward asserted identity on every call. One spread
+          // covers all ~37 call sites across the mcp-tools-*.js modules.
+          ...CALLER_HEADERS,
         },
       };
 
@@ -269,4 +294,5 @@ module.exports = {
   getGrantedToolsetNames,
   getGrantedModules,
   createApiRequest,
+  CALLER_HEADERS,
 };

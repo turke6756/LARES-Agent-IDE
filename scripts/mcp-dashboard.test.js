@@ -91,9 +91,12 @@ test('notebooks,comms,observability exposes exactly those toolsets, not orchestr
     'execute_range',
     'get_context_stats',
     'get_kernel_state',
+    'get_my_context',
     'get_team',
+    'get_usage_limits',
     'interrupt_kernel',
     'list_agents',
+    'list_my_agents',
     'list_teams',
     'list_templates',
     'open_file_in_view',
@@ -101,6 +104,7 @@ test('notebooks,comms,observability exposes exactly those toolsets, not orchestr
     'read_agent_files_touched',
     'read_agent_log',
     'restart_kernel',
+    'save_continuation_brick',
     'send_message_to_agent',
   ].sort());
   assert.ok(!names.includes('launch_agent'));
@@ -113,6 +117,38 @@ test('notebooks,comms,observability exposes exactly those toolsets, not orchestr
     isError: true,
   });
   assert.strictEqual(api.calls.length, 0);
+});
+
+// ── get_usage_limits: returns the /api/usage-limits result verbatim ──
+
+test('get_usage_limits (happy path) returns the endpoint reading verbatim', async () => {
+  const proxy = loadProxy('observability');
+  const reading = {
+    available: true,
+    account_wide: true,
+    source: 'claude_statusline',
+    captured_at: 1000,
+    age_seconds: 5,
+    stale: false,
+    five_hour: { used_percentage: 42, resets_at: 1234, resets_at_ms: 1234000, resets_in_seconds: 60, captured_at: 1000, age_seconds: 5, stale: false },
+    seven_day: null,
+  };
+  const api = capturingApi(reading);
+  const result = await proxy.handleToolCall('get_usage_limits', {}, api);
+  assert.strictEqual(api.calls.length, 1);
+  assert.strictEqual(api.calls[0].method, 'GET');
+  assert.strictEqual(api.calls[0].route, '/api/usage-limits');
+  assert.deepStrictEqual(JSON.parse(result.content[0].text), reading);
+});
+
+test('get_usage_limits (no_reading_yet) returns the available:false shape verbatim', async () => {
+  const proxy = loadProxy('observability');
+  const reading = { available: false, account_wide: true, reason: 'no_reading_yet' };
+  const api = capturingApi(reading);
+  const result = await proxy.handleToolCall('get_usage_limits', {}, api);
+  assert.strictEqual(api.calls.length, 1);
+  assert.strictEqual(api.calls[0].route, '/api/usage-limits');
+  assert.deepStrictEqual(JSON.parse(result.content[0].text), reading);
 });
 
 // ── Transient one-turn subscription: sender_agent_id wiring (tests 21–25) ──
@@ -186,6 +222,119 @@ test('25. HANDSHAKE-OK text mentions the one-turn subscription only when registe
     assert.ok(!/one-turn subscription/.test(r2.content[0].text), 'no transientSubscription → no subscription mention');
     assert.ok(/goes idle/.test(r2.content[0].text), 'falls back to the plain idle-event line');
   } finally { if (prev === undefined) delete process.env.AGENT_ID; else process.env.AGENT_ID = prev; }
+});
+
+// ── Context-brick Inc 1 (B1/B2): CALLER_HEADERS env → header mapping ────────
+//
+// CALLER_HEADERS is built once at module scope from AGENT_DASHBOARD_<PART>_ID
+// env vars. The agent running these tests may itself carry AGENT_DASHBOARD_*
+// identity env, so the helper strips ALL of it first, sets exactly the fixture
+// set, reloads the proxy, and restores the original env afterwards.
+
+function withCallerEnv(vars, fn) {
+  const saved = {};
+  for (const key of Object.keys(process.env)) {
+    if (key.startsWith('AGENT_DASHBOARD_')) {
+      saved[key] = process.env[key];
+      delete process.env[key];
+    }
+  }
+  for (const [k, v] of Object.entries(vars)) process.env[k] = v;
+  const restore = () => {
+    for (const key of Object.keys(process.env)) {
+      if (key.startsWith('AGENT_DASHBOARD_')) delete process.env[key];
+    }
+    for (const [k, v] of Object.entries(saved)) process.env[k] = v;
+  };
+  return (async () => fn())().finally(restore);
+}
+
+test('26. CALLER_HEADERS maps AGENT_DASHBOARD_*_ID env to X-*-Id headers; _API_TOKEN/_API_PORT excluded', () =>
+  withCallerEnv({
+    AGENT_DASHBOARD_SELF_ID: 'agent-1',
+    AGENT_DASHBOARD_SUPERVISOR_ID: 'sup-1',
+    AGENT_DASHBOARD_WORKSPACE_ID: 'ws-1',
+    AGENT_DASHBOARD_PROJECT_ID: 'proj-1',
+    AGENT_DASHBOARD_FOO_BAR_ID: 'fb-1', // generic multi-part: zero shim work for future ids
+    AGENT_DASHBOARD_API_TOKEN: 'secret', // must NOT become a header
+    AGENT_DASHBOARD_API_PORT: '12345',   // must NOT become a header
+    AGENT_DASHBOARD_API_HOST: '127.0.0.1',
+  }, () => {
+    const proxy = loadProxy('observability');
+    assert.deepStrictEqual(proxy.CALLER_HEADERS, {
+      'X-Self-Id': 'agent-1',
+      'X-Supervisor-Id': 'sup-1',
+      'X-Workspace-Id': 'ws-1',
+      'X-Project-Id': 'proj-1',
+      'X-Foo-Bar-Id': 'fb-1',
+    });
+  }));
+
+test('27. CALLER_HEADERS empty when no identity env is set (header-unset shim is harmless)', () =>
+  withCallerEnv({ AGENT_DASHBOARD_API_HOST: '127.0.0.1' }, () => {
+    const proxy = loadProxy('observability');
+    assert.deepStrictEqual(proxy.CALLER_HEADERS, {});
+  }));
+
+test('28. createApiRequest forwards CALLER_HEADERS + Authorization on the wire', async () => {
+  const httpMod = require('http');
+  const received = [];
+  const server = httpMod.createServer((req, res) => {
+    received.push(req.headers);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true }));
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const port = server.address().port;
+  try {
+    await withCallerEnv({
+      AGENT_DASHBOARD_WORKSPACE_ID: 'ws-wire',
+      AGENT_DASHBOARD_SELF_ID: 'self-wire',
+      AGENT_DASHBOARD_API_PORT: String(port),
+      AGENT_DASHBOARD_API_HOST: '127.0.0.1',
+    }, async () => {
+      const proxy = loadProxy('observability');
+      const apiRequest = proxy.createApiRequest('tok-wire');
+      const result = await apiRequest('GET', '/api/anything');
+      assert.deepStrictEqual(result, { ok: true });
+      assert.strictEqual(received.length, 1);
+      assert.strictEqual(received[0]['x-workspace-id'], 'ws-wire');
+      assert.strictEqual(received[0]['x-self-id'], 'self-wire');
+      assert.strictEqual(received[0]['authorization'], 'Bearer tok-wire');
+    });
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+// ── Context-brick Inc 3 (3.2): list_my_agents shim wiring ───────────────────
+
+test('29. list_my_agents (no args) GETs /api/supervisor/owned-agents with no query params', async () => {
+  const proxy = loadProxy('observability');
+  const payload = { ownerId: 'sup-1', includeTerminal: false, agents: [] };
+  const api = capturingApi(payload);
+  const result = await proxy.handleToolCall('list_my_agents', {}, api);
+  assert.strictEqual(api.calls.length, 1);
+  assert.strictEqual(api.calls[0].method, 'GET');
+  assert.strictEqual(api.calls[0].route, '/api/supervisor/owned-agents');
+  assert.deepStrictEqual(JSON.parse(result.content[0].text), payload);
+});
+
+test('30. list_my_agents forwards include_terminal + limit as query params', async () => {
+  const proxy = loadProxy('observability');
+  const api = capturingApi({ ownerId: 'sup-1', includeTerminal: true, agents: [] });
+  await proxy.handleToolCall('list_my_agents', { include_terminal: true, limit: 5 }, api);
+  assert.strictEqual(api.calls.length, 1);
+  assert.strictEqual(api.calls[0].route, '/api/supervisor/owned-agents?includeTerminal=true&limit=5');
+});
+
+test('31. list_my_agents schema exposes NO agent/owner id arg (owner is identity-derived)', () => {
+  clearProxyModules();
+  const observability = require('./mcp-tools-observability');
+  const def = observability.getObservabilityToolDefinitions().find((d) => d.name === 'list_my_agents');
+  assert.ok(def, 'list_my_agents definition registered');
+  assert.deepStrictEqual(Object.keys(def.inputSchema.properties).sort(), ['include_terminal', 'limit']);
+  assert.ok(!('required' in def.inputSchema) || def.inputSchema.required.length === 0, 'no required args');
 });
 
 (async () => {

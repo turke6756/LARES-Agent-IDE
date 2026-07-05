@@ -732,6 +732,8 @@ async function single_idle_chatFirstPreview_BUG_20(): Promise<void> {
         filePath: 'src/main/supervisor/event-payload-builder.ts',
         operation: 'write',
         timestamp: '2026-05-21T12:00:00Z',
+        generation: 0,
+        sessionId: null,
       },
       {
         id: 2,
@@ -739,6 +741,8 @@ async function single_idle_chatFirstPreview_BUG_20(): Promise<void> {
         filePath: 'src/main/supervisor/event-bridge.ts',
         operation: 'read',
         timestamp: '2026-05-21T11:59:00Z',
+        generation: 0,
+        sessionId: null,
       },
     ]);
 

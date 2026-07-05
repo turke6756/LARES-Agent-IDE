@@ -134,6 +134,10 @@ export default function AgentMarkdown({ content, agentId }: { content: string; a
           const match = /language-(\w+)/.exec(className || '');
           const inline = !className;
           if (inline) {
+            // Linkify file paths inside inline code too — agents overwhelmingly
+            // wrap paths in backticks (`src/main/foo.ts`), so without this the
+            // path-link feature almost never fires. Fenced code blocks (below)
+            // are intentionally left untouched.
             return (
               <code
                 className={`px-1 py-[1px] rounded text-[12px] font-mono ${
@@ -141,7 +145,7 @@ export default function AgentMarkdown({ content, agentId }: { content: string; a
                 }`}
                 {...props}
               >
-                {children}
+                {linkify(children)}
               </code>
             );
           }

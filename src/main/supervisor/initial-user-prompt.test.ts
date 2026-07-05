@@ -68,6 +68,8 @@ function patchDb(agentsMap: Map<string, Agent>, workspace: Workspace): () => voi
     'getTeamMembership',
     'updateAgentResumeSessionId',
     'deleteAgent',
+    'insertAgentSession',
+    'closeAgentSession',
   ];
   const orig: Record<string, unknown> = {};
   for (const k of keys) orig[k] = db[k];
@@ -125,6 +127,10 @@ function patchDb(agentsMap: Map<string, Agent>, workspace: Workspace): () => voi
   db.getTeamMembership = () => null;
   db.updateAgentResumeSessionId = () => {};
   db.deleteAgent = (id: string) => { agentsMap.delete(id); };
+  // Phase 1 lineage recording touched by the launchAgent / rebind paths; stub
+  // so the real fns don't hit the uninitialized module-level db handle.
+  db.insertAgentSession = () => {};
+  db.closeAgentSession = () => {};
 
   return () => {
     for (const k of keys) db[k] = orig[k];

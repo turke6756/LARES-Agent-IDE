@@ -57,18 +57,45 @@ function AppInner() {
   useEffect(() => {
     loadWorkspaces();
     checkHealth();
+    useDashboardStore.getState().loadAgentStatuses().catch(() => {
+      /* best effort — subsequent status events repopulate the index */
+    });
 
-    const unsubStatus = window.api.onAgentStatusChanged(({ agentId, status, agent }) => {
-      if (agent) {
-        const store = useDashboardStore.getState();
-        store.updateAgent(agent);
-        store.updateWorkspaceHeat();
-      }
+    const unsubStatus = window.api.onAgentStatusChanged(({ agent }) => {
+      if (!agent) return;
+      const store = useDashboardStore.getState();
+      // Unguarded: keeps background-workspace heat/waiting live.
+      store.updateAgentStatusSnapshot(agent);
+      // Scoped upsert (selected workspace only) — existing behavior, unchanged.
+      store.updateAgent(agent);
+    });
+
+    const unsubAgentDeleted = window.api.onAgentDeleted(({ agentId }) => {
+      // removeAgent now clears both the scoped `agents` array and the index.
+      useDashboardStore.getState().removeAgent(agentId);
     });
 
     const unsubContext = window.api.agents.onContextStatsChanged((stats) => {
       useDashboardStore.getState().updateContextStats(stats);
     });
+
+    // Account-wide Claude subscription usage limits (singleton). Seed the
+    // current reading on mount, then keep it in sync — the broadcast only fires
+    // on change, so a fresh renderer would otherwise show nothing until the next
+    // capture.
+    const pollUsageLimits = () =>
+      window.api.usage.getLimits()
+        .then((r) => useDashboardStore.getState().updateUsageLimits(r))
+        .catch(() => { /* best effort — next broadcast will populate it */ });
+    pollUsageLimits();
+    const unsubUsage = window.api.usage.onLimitsChanged((r) =>
+      useDashboardStore.getState().updateUsageLimits(r));
+    // The broadcast only fires when a NEW capture merges (an agent taking a
+    // turn). Between captures `age_seconds`/`stale` are frozen at emit time, so
+    // an idle dashboard's freshness cue goes silent. Re-poll on an interval —
+    // getLimits() recomputes age/stale against Date.now() on the main side — so
+    // the gauge keeps ticking (and flips to stale/dimmed) even when nothing runs.
+    const usagePoll = window.setInterval(pollUsageLimits, 30_000);
 
     const unsubTeam = window.api.onTeamUpdated((team) => {
       useDashboardStore.getState().updateTeam(team);
@@ -107,7 +134,10 @@ function AppInner() {
 
     return () => {
       unsubStatus();
+      unsubAgentDeleted();
       unsubContext();
+      unsubUsage();
+      window.clearInterval(usagePoll);
       unsubTeam();
       unsubTeamMsg();
       unsubDeliberation();

@@ -2,14 +2,14 @@ import { ipcMain, dialog, shell, BrowserWindow, nativeTheme } from 'electron';
 import type { WebContents } from 'electron';
 import * as fs from 'fs';
 import { persistTheme } from './theme-persistence';
-import type { PathType, FsEvent, DetachRequest, DetachResult, ScanOverheadRequest, ScanOverheadResult } from '../shared/types';
+import type { PathType, FsEvent, DetachRequest, DetachResult, ScanOverheadRequest, ScanOverheadResult, PriorSessionChat } from '../shared/types';
 import { TAB_CHANNELS } from '../shared/types';
 import { createDetachedWindow, canWrite, handleDetachedCloseReply, type DetachedWindowDeps } from './detached-windows';
 import { AgentSupervisor } from './supervisor';
 import {
   getWorkspaces, createWorkspace, deleteWorkspace, getWorkspace, reorderWorkspaces,
   getAgentsByWorkspace, getAllAgents, getAgent, getFileActivities, getWorkspaceAgentSummary,
-  checkAgentMdExists, updateAgentSupervised,
+  checkAgentMdExists, updateAgentSupervised, getAgentSessions,
   createTeam, getTeam, listTeams, updateTeamStatus, addTeamMember, removeTeamMember,
   createChannel, removeChannel, getTeamMessages, getTeamTasks, createTeamTask, updateTeamTask,
   listAgentTemplates, createAgentTemplate, updateAgentTemplate, deleteAgentTemplate,
@@ -62,7 +62,7 @@ export function registerIpcHandlers(
   ipcMain.handle('agent:get-log', (_e, id, lines) => supervisor.getAgentLog(id, lines));
   ipcMain.handle('agent:get-ring-buffer', (_e, id) => supervisor.getAgentRingBuffer(id));
   ipcMain.handle('agent:get', (_e, id) => getAgent(id));
-  ipcMain.handle('agent:get-file-activities', (_e, agentId, operation) => getFileActivities(agentId, operation));
+  ipcMain.handle('agent:get-file-activities', (_e, agentId, operation, currentOnly) => getFileActivities(agentId, operation, currentOnly));
   ipcMain.handle('agent:delete', (_e, id) => supervisor.deleteAgent(id));
   ipcMain.handle('agent:fork', (_e, id) => supervisor.forkAgent(id));
   ipcMain.handle('agent:query', (_e, targetAgentId, question, sourceAgentId) => supervisor.queryAgent(targetAgentId, question, sourceAgentId));
@@ -100,6 +100,9 @@ export function registerIpcHandlers(
   ipcMain.handle('agent:get-supervisor', (_e, workspaceId) => supervisor.getSupervisorAgent(workspaceId));
   ipcMain.handle('agent:get-context-stats', (_e, agentId) => supervisor.getContextStats(agentId));
 
+  // Account-wide Claude subscription usage limits (singleton, not per-agent).
+  ipcMain.handle('usage:get-limits', () => supervisor.getUsageLimits());
+
   // Chat pane (session-log-reader)
   ipcMain.handle('agent:get-chat-events', (_e, agentId, sinceUuid) => {
     // BUG-28: the HTTP `/messages` route lazy-recovers a lost Codex
@@ -121,6 +124,36 @@ export function registerIpcHandlers(
   });
   ipcMain.handle('agent:chat-tool-result-full', (_e, agentId, toolUseId) =>
     supervisor.getSessionLogReader().getFullToolResult(agentId, toolUseId));
+
+  // Context-brick Phase 2 — durable, read-only prior-session chat.
+  // `get-agent-sessions` returns the cheap DB lineage (no JSONL read) so the
+  // pane knows whether a prior session exists and which lineage row id to walk
+  // back to next. `get-prior-session-chat` reads exactly ONE session's `.jsonl`
+  // from disk on demand and NEVER throws: a pruned/missing file degrades to
+  // `unavailable`, and a row id with no earlier session degrades to `atHead`.
+  ipcMain.handle('agent:get-agent-sessions', (_e, agentId) => getAgentSessions(agentId));
+  ipcMain.handle('agent:get-prior-session-chat', (_e, agentId, sessionRowId): PriorSessionChat => {
+    // Look up the requested lineage row (Phase 1). Keyed on dashboard_agent_id,
+    // so a shared-cwd sibling's session can never be returned for this agent.
+    const row = getAgentSessions(agentId).find((r) => r.id === sessionRowId);
+    if (!row) return { atHead: true };
+    const events = supervisor
+      .getSessionLogReader()
+      .readPriorSessionEvents(row.provider, row.workingDirectory, row.sessionId);
+    if (events === null) {
+      // JSONL pruned/missing — degrade, never throw.
+      return { sessionRowId: row.id, sessionId: row.sessionId, unavailable: true };
+    }
+    return {
+      sessionRowId: row.id,
+      sessionId: row.sessionId,
+      generation: row.generation,
+      startedAt: row.startedAt,
+      endedAt: row.endedAt,
+      outOfContext: true,
+      events,
+    };
+  });
   ipcMain.handle('agent:update-supervised', (_e, id, supervised) => {
     updateAgentSupervised(id, supervised);
     return getAgent(id);
@@ -238,6 +271,36 @@ export function registerIpcHandlers(
   // Map<agentId, listenerFunction>
   const activeListeners = new Map<string, (data: string) => void>();
   const attachedAgents = new Set<string>(); // Keep for backward compatibility/quick checks
+
+  // BUG-38 — terminal attachment service. A same-id PTY swap (continuation,
+  // manual restart, auto-restart) kills the old runner and spawns a new one
+  // under the same dashboard agent id, but nothing tears down the live attach:
+  // TerminalPanel keeps its cached xterm bound to the retired (dead) bridge and
+  // takes no new output until a full app restart. The supervisor fires the swap
+  // but must NOT reach into these listener maps (that would require importing
+  // the supervisor into this module or exporting the maps — either creates a
+  // cycle). Instead we inject this callback; the supervisor calls it by handle.
+  //
+  // rebound() mirrors terminal:detach's listener teardown, then clears the
+  // attach short-circuit state (so the renderer's re-invoked terminal:attach is
+  // NOT no-op'd) and tells the renderer to rebuild onto the fresh PTY. The map
+  // deletes are idempotent, so a double-notify is safe.
+  const terminalAttach = {
+    rebound(agentId: string): void {
+      const listener = activeListeners.get(agentId);
+      if (listener) {
+        // The old runner is already gone; removeAgentListener targets the new
+        // runner (a no-op there) — harmless, and mirrors terminal:detach.
+        supervisor.removeAgentListener(agentId, listener);
+        activeListeners.delete(agentId);
+      }
+      attachedAgents.delete(agentId);
+      if (!mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('terminal:rebound', agentId);
+      }
+    },
+  };
+  supervisor.setTerminalReboundNotifier(terminalAttach.rebound);
 
   ipcMain.handle('terminal:attach', (_e, agentId) => {
     if (activeListeners.has(agentId)) return { ok: true }; // already attached
@@ -542,6 +605,16 @@ export function registerIpcHandlers(
     }
   });
 
+  // Forward agent deletions so the cross-workspace status map (sidebar waiting
+  // outline / heat) drops the entry. deleteAgent emits `agentDeleted`, NOT a
+  // `statusChanged`, so without this a background-workspace agent that was
+  // `waiting` at delete time would strand its red outline forever.
+  supervisor.on('agentDeleted', ({ agentId }: { agentId: string }) => {
+    if (!mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('agent:deleted', { agentId });
+    }
+  });
+
   // WP-P2 — async initial-prompt delivery failures surface through the same
   // renderer channel as chat-input send failures (see 'agent:send-input' above).
   supervisor.on('sendInputError', (payload) => {
@@ -561,6 +634,13 @@ export function registerIpcHandlers(
   supervisor.on('contextStatsChanged', (stats) => {
     if (!mainWindow.isDestroyed()) {
       mainWindow.webContents.send('agent:context-stats-changed', stats);
+    }
+  });
+
+  // Forward account-wide usage-limits changes to renderer
+  supervisor.on('usageLimitsChanged', (reading) => {
+    if (!mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('usage:limits-changed', reading);
     }
   });
 

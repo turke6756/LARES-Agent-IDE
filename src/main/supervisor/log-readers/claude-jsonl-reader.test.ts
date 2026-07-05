@@ -391,6 +391,71 @@ test('tz: SQLite-form startedAt does not reject a successor created just after l
   assert.equal(reader.validateClearSuccessor(ROTATION_WORKDIR, 'cur', 'clearA', startedAtSqlite), true);
 });
 
+// ── Phase 2: one-shot prior-session disk reader ──────────────────────
+//
+// readSessionEventsOnce is a PURE read: it must parse a prior session's JSONL
+// straight from disk WITHOUT touching the per-agent dedup maps of any live
+// agent that shares the same cwd/slug, and WITHOUT advancing tail offsets.
+
+test('P2: readSessionEventsOnce parses a prior session from disk (located by slug)', () => {
+  const root = makeProjectsRoot();
+  const sid = 'prior-sess-1';
+  writeSlugFile(root, sid, [
+    { type: 'system', uuid: 's-0', timestamp: '2026-07-01T10:00:00.000Z', model: 'claude-opus' },
+    { type: 'user', uuid: 'u-1', timestamp: '2026-07-01T10:00:01.000Z', message: { content: 'hello from the past' } },
+    {
+      type: 'assistant', uuid: 'a-1', timestamp: '2026-07-01T10:00:02.000Z',
+      message: { model: 'claude-opus', stop_reason: 'end_turn', content: [{ type: 'text', text: 'a prior reply' }] },
+    },
+  ], BASE_MS);
+  const reader = makeRotationReader(root);
+
+  const events = reader.readSessionEventsOnce(ROTATION_WORKDIR, sid);
+  assert.ok(events, 'located + parsed');
+  const kinds = events!.map(e => e.type);
+  assert.ok(kinds.includes('user-text'), 'has the user turn');
+  assert.ok(kinds.includes('assistant-text'), 'has the assistant turn');
+  const user = events!.find(e => e.type === 'user-text') as any;
+  assert.equal(user.text, 'hello from the past');
+});
+
+test('P2: readSessionEventsOnce returns null for a missing/pruned session', () => {
+  const root = makeProjectsRoot();
+  const reader = makeRotationReader(root);
+  assert.equal(reader.readSessionEventsOnce(ROTATION_WORKDIR, 'never-written'), null);
+});
+
+test('P2: readSessionEventsOnce leaves NO residue in per-agent dedup maps (shared-cwd purity)', () => {
+  const root = makeProjectsRoot();
+  const sid = 'prior-sess-2';
+  writeSlugFile(root, sid, [
+    { type: 'system', uuid: 's-1', timestamp: '2026-07-01T10:00:00.000Z', model: 'claude-opus' },
+    { type: 'user', uuid: 'u-9', timestamp: '2026-07-01T10:00:01.000Z', message: { content: 'past turn' } },
+  ], BASE_MS);
+  const reader = makeRotationReader(root);
+
+  const before = (reader as any).seenEntryUuids.size;
+  const beforeInit = (reader as any).emittedSystemInit.size;
+  reader.readSessionEventsOnce(ROTATION_WORKDIR, sid);
+  // The ephemeral parse scope must be cleaned up: no live agent's dedup state
+  // (seenEntryUuids / emittedSystemInit) is left behind.
+  assert.equal((reader as any).seenEntryUuids.size, before, 'seenEntryUuids left clean');
+  assert.equal((reader as any).emittedSystemInit.size, beforeInit, 'emittedSystemInit left clean');
+});
+
+test('P2: readSessionEventsOnce does not advance tail offsets (no subscription/offset cache)', () => {
+  const root = makeProjectsRoot();
+  const sid = 'prior-sess-3';
+  writeSlugFile(root, sid, [
+    { type: 'user', uuid: 'u-3', timestamp: '2026-07-01T10:00:01.000Z', message: { content: 'x' } },
+  ], BASE_MS);
+  const reader = makeRotationReader(root);
+
+  reader.readSessionEventsOnce(ROTATION_WORKDIR, sid);
+  assert.equal((reader as any).fileOffsets.size, 0, 'no fileOffsets written');
+  assert.equal((reader as any).partialLines.size, 0, 'no partialLines written');
+});
+
 // ── Runner ───────────────────────────────────────────────────────────
 
 (async () => {

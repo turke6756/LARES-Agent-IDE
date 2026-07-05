@@ -15,7 +15,7 @@ import assert from 'node:assert/strict';
 
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const dbModule = require('../database') as {
-  getFileActivities: (agentId: string, op?: string) => unknown[];
+  getFileActivities: (agentId: string, op?: string, currentOnly?: boolean) => unknown[];
 };
 
 interface FakeRow {
@@ -24,17 +24,23 @@ interface FakeRow {
   filePath: string;
   operation: 'read' | 'write' | 'create';
   timestamp: string;
+  generation: number;
+  sessionId: string | null;
+  // Test-only: which session the fake treats as "live" for current_only.
+  _live?: boolean;
 }
 
 let fakeRows: FakeRow[] = [];
-const dbCalls: Array<{ agentId: string; op: string | undefined }> = [];
+const dbCalls: Array<{ agentId: string; op: string | undefined; currentOnly: boolean | undefined }> = [];
 
 const origGetFileActivities = dbModule.getFileActivities;
-dbModule.getFileActivities = (agentId: string, op?: string) => {
-  dbCalls.push({ agentId, op });
-  // Mirror the real SQL: filter by agent_id (always) and operation (if provided).
+dbModule.getFileActivities = (agentId: string, op?: string, currentOnly?: boolean) => {
+  dbCalls.push({ agentId, op, currentOnly });
+  // Mirror the real SQL: filter by agent_id (always), operation (if provided),
+  // and — when currentOnly — the rows flagged as the live session.
   let rows = fakeRows.filter((r) => r.agentId === agentId);
   if (op) rows = rows.filter((r) => r.operation === op);
+  if (currentOnly) rows = rows.filter((r) => r._live);
   return rows;
 };
 
@@ -60,6 +66,8 @@ function makeRow(over: Partial<FakeRow>): FakeRow {
     filePath: 'C:\\repo\\file.ts',
     operation: 'read',
     timestamp: '2026-05-17 12:00:00',
+    generation: 0,
+    sessionId: null,
     ...over,
   };
 }
@@ -83,7 +91,7 @@ test('returns all operations when no filter is supplied', async () => {
   assert.deepEqual(ops, ['create', 'read', 'write']);
   // Verify getFileActivities was called without an operation argument so the
   // unfiltered SQL path is exercised (not just JS-side filtering).
-  assert.deepEqual(dbCalls, [{ agentId: 'agent-x', op: undefined }]);
+  assert.deepEqual(dbCalls, [{ agentId: 'agent-x', op: undefined, currentOnly: false }]);
 });
 
 test('operation=read narrows to reads only', async () => {
@@ -98,7 +106,7 @@ test('operation=read narrows to reads only', async () => {
   assert.equal(result.operation, 'read');
   assert.equal(result.activities.length, 2);
   assert.ok(result.activities.every((a) => a.operation === 'read'));
-  assert.deepEqual(dbCalls, [{ agentId: 'agent-x', op: 'read' }]);
+  assert.deepEqual(dbCalls, [{ agentId: 'agent-x', op: 'read', currentOnly: false }]);
 });
 
 test('operation=write narrows to writes only', async () => {
@@ -138,7 +146,7 @@ test('bogus operation value is rejected, falls back to no-filter (no SQL injecti
   assert.equal(result.operation, null);
   assert.equal(result.activities.length, 2);
   // Crucially, the bogus string is never passed to the DB layer.
-  assert.deepEqual(dbCalls, [{ agentId: 'agent-x', op: undefined }]);
+  assert.deepEqual(dbCalls, [{ agentId: 'agent-x', op: undefined, currentOnly: false }]);
 });
 
 test('non-existent agent returns an empty activities array (not null, not 404)', async () => {
@@ -157,18 +165,42 @@ test('payload row shape matches the writeup example', async () => {
     filePath: 'C:\\Users\\turke\\Projects\\AgentDashboard\\plans\\agent-lifecycle-hardening-plan.md',
     operation: 'write',
     timestamp: '2026-05-17 22:41:25',
+    generation: 2,
+    sessionId: 'sess-live',
   }];
 
   const result = await get('/api/agents/be04c8ed-721a-43db-90e2-d64f792dc125/file-activities');
   assert.equal(result.activities.length, 1);
   const row = result.activities[0];
-  // Exact key set — no snake_case leakage, no surprise fields.
-  assert.deepEqual(Object.keys(row).sort(), ['agentId', 'filePath', 'id', 'operation', 'timestamp']);
+  // Exact key set — no snake_case leakage, no surprise fields. Phase 4 adds
+  // generation + sessionId (the per-session partition the tabs render on).
+  assert.deepEqual(Object.keys(row).sort(), ['agentId', 'filePath', 'generation', 'id', 'operation', 'sessionId', 'timestamp']);
   assert.equal(row.id, 1507);
   assert.equal(row.agentId, 'be04c8ed-721a-43db-90e2-d64f792dc125');
   assert.equal(row.filePath, 'C:\\Users\\turke\\Projects\\AgentDashboard\\plans\\agent-lifecycle-hardening-plan.md');
   assert.equal(row.operation, 'write');
   assert.equal(row.timestamp, '2026-05-17 22:41:25');
+  assert.equal(row.generation, 2);
+  assert.equal(row.sessionId, 'sess-live');
+});
+
+test('current_only=true narrows to the agent\'s live session; default returns all sessions', async () => {
+  fakeRows = [
+    makeRow({ id: 1, filePath: 'C:\\repo\\live.ts', operation: 'read', sessionId: 'sess-live', generation: 1, _live: true }),
+    makeRow({ id: 2, filePath: 'C:\\repo\\prior.ts', operation: 'read', sessionId: 'sess-old', generation: 0 }),
+  ];
+  resetCalls();
+
+  const all = await get('/api/agents/agent-x/file-activities');
+  assert.equal(all.activities.length, 2, 'default returns prior + current sessions');
+
+  const current = await get('/api/agents/agent-x/file-activities?current_only=true');
+  assert.equal(current.activities.length, 1, 'current_only drops the prior session');
+  assert.equal(current.activities[0].filePath, 'C:\\repo\\live.ts');
+  assert.deepEqual(dbCalls, [
+    { agentId: 'agent-x', op: undefined, currentOnly: false },
+    { agentId: 'agent-x', op: undefined, currentOnly: true },
+  ]);
 });
 
 test('limit param trims the result array', async () => {

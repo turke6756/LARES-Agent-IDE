@@ -1,5 +1,5 @@
 import React from 'react';
-import type { Agent, ContextStats } from '../../../shared/types';
+import type { Agent, ContextStats, UsageLimitsReading, UsageWindowReading } from '../../../shared/types';
 
 // Shared, presentational subexpressions lifted out of AgentCard so the
 // horizontal OwnerContainerBar can reuse them verbatim instead of duplicating
@@ -61,6 +61,54 @@ export function ContextStatsBar({ cs, className = 'mb-2' }: { cs: ContextStats; 
         <span className="text-[11px] text-gray-500 truncate">{cs.model.replace('claude-', '').replace(/-\d{8}$/, '')}</span>
         <span className={`text-[11px] ${textColor} font-semibold`}>{pct}%</span>
       </div>
+    </div>
+  );
+}
+
+/** Format a reset countdown (seconds) as `Nh Mm` / `Mm` / `<1m`. */
+function formatResetIn(seconds: number): string {
+  const s = Math.max(0, Math.floor(seconds));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m`;
+  return '<1m';
+}
+
+/** One compact usage window micro-bar (5h / 7d). Colors mirror ContextStatsBar
+ *  (>60 orange, >85 red). A stale window is dimmed and titled with its age. */
+function UsageWindowRow({ label, w }: { label: string; w: UsageWindowReading }) {
+  const pct = Math.round(w.used_percentage);
+  const isWarning = pct > 60;
+  const isCritical = pct > 85;
+  const barColor = isCritical ? 'bg-accent-red' : isWarning ? 'bg-accent-orange' : 'bg-accent-blue';
+  const textColor = isCritical ? 'text-accent-red' : isWarning ? 'text-accent-orange' : 'text-accent-blue';
+  const title = w.stale
+    ? `${label} usage ${pct}% — stale (captured ${Math.round(w.age_seconds)}s ago)`
+    : `${label} usage ${pct}% — resets in ${formatResetIn(w.resets_in_seconds)}`;
+  return (
+    <div className={`flex items-center gap-1 ${w.stale ? 'opacity-60' : ''}`} title={title}>
+      <span className="text-[10px] text-gray-500 w-4 shrink-0">{label}</span>
+      <div className="relative w-10 h-[3px] bg-surface-3 overflow-hidden">
+        <div className={`h-full ${barColor} transition-all duration-500 ease-out`} style={{ width: `${Math.min(100, pct)}%` }} />
+      </div>
+      <span className={`text-[10px] ${textColor} font-semibold w-7 shrink-0 text-right`}>{pct}%</span>
+    </div>
+  );
+}
+
+/** Account-wide Claude subscription usage gauge (5h + 7d windows). Renders only
+ *  the windows that are known (absent = hidden, never a 0% bar); renders nothing
+ *  when no reading is available. See plans/usage-limits-mcp-and-ui.md. */
+export function UsageGauge({ usage }: { usage: UsageLimitsReading | null }) {
+  if (!usage?.available) return null;
+  const fh = usage.five_hour;
+  const sd = usage.seven_day;
+  if (!fh && !sd) return null;
+  return (
+    <div className="flex flex-col gap-0.5 shrink-0" title="Claude subscription usage (account-wide)">
+      {fh ? <UsageWindowRow label="5h" w={fh} /> : null}
+      {sd ? <UsageWindowRow label="7d" w={sd} /> : null}
     </div>
   );
 }

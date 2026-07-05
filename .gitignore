@@ -25,6 +25,7 @@ plans/
 .dashboard/workers/
 .dashboard/scripts/
 .dashboard/pending-status.jsonl
+.dashboard/usage/
 .dashboard/*/.claude/.sysprompt-*.txt
 .dashboard/*/.claude/scheduled_tasks.lock
 .dashboard/main-crash.log

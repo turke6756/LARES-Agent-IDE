@@ -2,7 +2,7 @@ import Database from 'better-sqlite3';
 import path from 'path';
 import fs from 'fs';
 import { v4 as uuidv4 } from 'uuid';
-import { Agent, AgentProvider, AgentStatus, AgentTemplate, CreateAgentTemplateInput, CreateSelectionCommentInput, CreateWorkspaceInput, CreateTeamInput, FileActivity, FileOperation, SelectionComment, SelectionCommentStatus, Team, TeamChannel, TeamMember, TeamMessage, TeamMessageStatus, TeamStatus, TeamTask, TeamTaskStatus, UpdateSelectionCommentInput, Workspace } from '../shared/types';
+import { Agent, AgentProvider, AgentSessionRow, AgentStatus, AgentTemplate, CreateAgentTemplateInput, CreateSelectionCommentInput, CreateWorkspaceInput, CreateTeamInput, FileActivity, FileOperation, SelectionComment, SelectionCommentStatus, Team, TeamChannel, TeamMember, TeamMessage, TeamMessageStatus, TeamStatus, TeamTask, TeamTaskStatus, UpdateSelectionCommentInput, Workspace } from '../shared/types';
 import { DEFAULT_COMMAND, DEFAULT_COMMAND_WSL, SUPERVISOR_AGENT_MD } from '../shared/constants';
 import { OrchestrationEvent, OrchestrationRun } from './orchestration/types';
 
@@ -144,6 +144,88 @@ export function initDatabase(): void {
   // owner-directed events are suppressed at the EventBridge choke point. Defaults
   // to 1 (notify) so every pre-existing row preserves today's behavior.
   try { db.exec(`ALTER TABLE agents ADD COLUMN notify_owner INTEGER DEFAULT 1`); } catch { /* exists */ }
+
+  // Context-brick Inc 4 (4.3) — continuation generation. Dedicated column:
+  // restart_count keeps meaning crash restarts; this counts continuation
+  // handoffs. Bumped ONLY via the attempt's successorGen inside the atomic
+  // relaunch transaction (commitContinuationRelaunch), never ad-hoc.
+  try { db.exec(`ALTER TABLE agents ADD COLUMN continuation_generation INTEGER NOT NULL DEFAULT 0`); } catch { /* exists */ }
+
+  // Context-brick Phase 4 — stamp each file activity with the session (and
+  // generation) it happened under, so continuations retain prior-session
+  // activity instead of wiping it, and the UI can partition current vs prior.
+  // `session_id` is the true partition key (a `/clear` can mint a same-generation
+  // sibling); `generation` is a display label. Additive; legacy rows keep
+  // generation 0 / session_id NULL.
+  try { db.exec(`ALTER TABLE file_activities ADD COLUMN generation INTEGER NOT NULL DEFAULT 0`); } catch { /* exists */ }
+  try { db.exec(`ALTER TABLE file_activities ADD COLUMN session_id TEXT`); } catch { /* exists */ }
+
+  // Context-brick Inc 4 (4.3) — server-minted handoff attempts. The attempt
+  // OWNS the successor generation (allocated at open = agent gen + 1); the
+  // brick and the agent row both COPY it, never independently computed. At
+  // most one 'open' attempt per agent (enforced in the create helper).
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS continuation_handoff_attempts (
+      id                     TEXT PRIMARY KEY,
+      dashboard_agent_id     TEXT NOT NULL,
+      generation             INTEGER NOT NULL,
+      started_at             TEXT NOT NULL,
+      closed_at              TEXT,
+      status                 TEXT NOT NULL DEFAULT 'open',
+      reason                 TEXT,
+      threshold_context_pct  INTEGER
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_continuation_attempts_agent_status
+           ON continuation_handoff_attempts (dashboard_agent_id, status)`);
+
+  // Context-brick Inc 4 (4.3) — append-only brick rows. Soft supersede only
+  // (superseded_at); NO hard delete, NO cascade FK — the graveyard must
+  // survive agent deletion.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS continuation_bricks (
+      id                  TEXT PRIMARY KEY,
+      dashboard_agent_id  TEXT NOT NULL,
+      handoff_attempt_id  TEXT NOT NULL,
+      generation          INTEGER NOT NULL,
+      note                TEXT NOT NULL,
+      note_source         TEXT NOT NULL,
+      byte_len            INTEGER NOT NULL,
+      written_at          TEXT NOT NULL,
+      superseded_at       TEXT
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_continuation_bricks_agent_written
+           ON continuation_bricks (dashboard_agent_id, written_at DESC)`);
+
+  // Context-brick Phase 1 (D1) — durable session lineage. One dashboard agent
+  // id spans many sessions across continuations and `/clear` rotations. This is
+  // the durable map agent id → ordered generations→session ids that survives
+  // the mutable single-column agents.resume_session_id being overwritten on
+  // every transition.
+  //
+  // Keyed UNIQUE(dashboard_agent_id, session_id) — NOT generation. `generation`
+  // is an ordering HINT that may REPEAT (a `/clear` mints a new session WITHOUT
+  // bumping the generation), so it can never be a unique/partition key. Order
+  // by started_at + row id; partition current vs prior by session_id.
+  // working_directory is stored ONLY to recompute the JSONL slug — many agents
+  // share one cwd/slug by design, so it is NEVER an identity key.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS agent_sessions (
+      id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+      dashboard_agent_id TEXT NOT NULL,
+      generation         INTEGER NOT NULL,   -- ordering HINT ONLY; may repeat (/clear)
+      session_id         TEXT NOT NULL,
+      working_directory  TEXT NOT NULL,      -- to recompute the JSONL slug; NEVER an identity key
+      provider           TEXT NOT NULL,
+      started_at         TEXT NOT NULL DEFAULT (datetime('now')),
+      ended_at           TEXT,               -- set when superseded by the next session
+      jsonl_present      INTEGER DEFAULT 1,  -- best-effort; provider may prune
+      UNIQUE(dashboard_agent_id, session_id) -- D1: session_id, NOT generation
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_agent_sessions_agent
+           ON agent_sessions(dashboard_agent_id, started_at, id)`);
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS events (
@@ -696,6 +778,17 @@ export function initDatabase(): void {
   } catch (err) {
     console.warn('[database] aggregate file_activities purge failed:', err);
   }
+
+  // Context-brick Phase 1 — one-time, best-effort lineage backfill from the
+  // append-only events trail. Per-agent guarded (skips agents already carrying
+  // rows) + ON CONFLICT DO NOTHING, so it is idempotent across boots and never
+  // fights the live gen-0/transition inserts. Wrapped so a malformed payload
+  // can never crash DB init.
+  try {
+    backfillAgentSessionsFromEvents();
+  } catch (err) {
+    console.warn('[database] agent_sessions backfill failed:', err);
+  }
 }
 
 function slugify(text: string): string {
@@ -755,6 +848,8 @@ function rowToAgent(row: any): Agent {
     lastSendError: parseLastSendError(row.last_send_error),
     isAttached: !!row.is_attached,
     restartCount: row.restart_count,
+    // Inc 4: continuation handoff generation (distinct from restart_count).
+    continuationGeneration: row.continuation_generation ?? 0,
     lastExitCode: row.last_exit_code,
     pid: row.pid,
     logPath: row.log_path,
@@ -954,6 +1049,19 @@ export function getActiveAgents(): Agent[] {
   ).map(rowToAgent);
 }
 
+/** Context-brick Inc 3 (3.1) — the agents a given agent LAUNCHED (its owner
+ *  edge, `owner_agent_id`, stamped from SELF_ID at launch — read-only here).
+ *  Default is the live set (terminal statuses excluded, same done/crashed set
+ *  as getActiveAgents); `includeTerminal` adds the finished/crashed rows — the
+ *  graveyard window a revived supervisor pulls to see what it was running.
+ *  Newest first. */
+export function getAgentsByOwner(ownerAgentId: string, opts?: { includeTerminal?: boolean }): Agent[] {
+  const sql = opts?.includeTerminal
+    ? 'SELECT * FROM agents WHERE owner_agent_id = ? ORDER BY created_at DESC'
+    : "SELECT * FROM agents WHERE owner_agent_id = ? AND status NOT IN ('done', 'crashed') ORDER BY created_at DESC";
+  return queryAll(sql, [ownerAgentId]).map(rowToAgent);
+}
+
 export function updateAgentStatus(id: string, status: AgentStatus): void {
   run("UPDATE agents SET status = ?, updated_at = datetime('now') WHERE id = ?", [status, id]);
 }
@@ -1021,6 +1129,453 @@ export function updateAgentResumeSessionId(id: string, sessionId: string): void 
 
 export function updateAgentSupervised(id: string, supervised: boolean): void {
   run("UPDATE agents SET is_supervised = ?, updated_at = datetime('now') WHERE id = ?", [supervised ? 1 : 0, id]);
+}
+
+// ── Context-brick Inc 4 (4.3) — continuation attempts + bricks ─────────────
+
+export type ContinuationAttemptStatus = 'open' | 'committed' | 'aborted' | 'relaunched';
+
+export interface ContinuationHandoffAttempt {
+  id: string;
+  dashboardAgentId: string;
+  /** The successor generation this attempt owns (agent gen + 1 at open). */
+  generation: number;
+  startedAt: string;
+  closedAt: string | null;
+  status: ContinuationAttemptStatus;
+  reason: string | null;
+  thresholdContextPct: number | null;
+}
+
+export interface ContinuationBrickRow {
+  id: string;
+  dashboardAgentId: string;
+  handoffAttemptId: string;
+  generation: number;
+  note: string;
+  noteSource: 'tool' | 'scrape';
+  byteLen: number;
+  writtenAt: string;
+  supersededAt: string | null;
+}
+
+function rowToContinuationAttempt(row: any): ContinuationHandoffAttempt {
+  return {
+    id: row.id,
+    dashboardAgentId: row.dashboard_agent_id,
+    generation: row.generation,
+    startedAt: row.started_at,
+    closedAt: row.closed_at ?? null,
+    status: row.status as ContinuationAttemptStatus,
+    reason: row.reason ?? null,
+    thresholdContextPct: row.threshold_context_pct ?? null,
+  };
+}
+
+function rowToContinuationBrick(row: any): ContinuationBrickRow {
+  return {
+    id: row.id,
+    dashboardAgentId: row.dashboard_agent_id,
+    handoffAttemptId: row.handoff_attempt_id,
+    generation: row.generation,
+    note: row.note,
+    noteSource: row.note_source as 'tool' | 'scrape',
+    byteLen: row.byte_len,
+    writtenAt: row.written_at,
+    supersededAt: row.superseded_at ?? null,
+  };
+}
+
+/** Millisecond-resolution timestamp so `written_at > attempt.started_at`
+ *  comparisons don't collapse inside `datetime('now')`'s 1-second grain. */
+const NOW_MS_SQL = `strftime('%Y-%m-%d %H:%M:%f','now')`;
+
+export function setContinuationGeneration(agentId: string, gen: number): void {
+  run("UPDATE agents SET continuation_generation = ?, updated_at = datetime('now') WHERE id = ?", [gen, agentId]);
+}
+
+/** Mint a handoff attempt, allocating successorGen = agent gen + 1. The
+ *  attempt OWNS that generation. Throws if the agent is missing or already
+ *  has an open attempt (one-open-max). */
+export function createContinuationHandoffAttempt(
+  agentId: string,
+  opts?: { reason?: string; thresholdContextPct?: number },
+): ContinuationHandoffAttempt {
+  const tx = db.transaction(() => {
+    const agentRow = queryOne('SELECT continuation_generation FROM agents WHERE id = ?', [agentId]);
+    if (!agentRow) throw new Error(`createContinuationHandoffAttempt: no agent ${agentId}`);
+    const open = queryOne(
+      "SELECT id FROM continuation_handoff_attempts WHERE dashboard_agent_id = ? AND status = 'open'",
+      [agentId],
+    );
+    if (open) throw new Error(`createContinuationHandoffAttempt: agent ${agentId} already has open attempt ${open.id}`);
+    const id = uuidv4();
+    const successorGen = (agentRow.continuation_generation ?? 0) + 1;
+    run(
+      `INSERT INTO continuation_handoff_attempts (id, dashboard_agent_id, generation, started_at, status, reason, threshold_context_pct)
+       VALUES (?, ?, ?, ${NOW_MS_SQL}, 'open', ?, ?)`,
+      [id, agentId, successorGen, opts?.reason ?? null, opts?.thresholdContextPct ?? null],
+    );
+    return id;
+  });
+  const id = tx();
+  return getContinuationAttempt(id)!;
+}
+
+export function getContinuationAttempt(id: string): ContinuationHandoffAttempt | null {
+  const row = queryOne('SELECT * FROM continuation_handoff_attempts WHERE id = ?', [id]);
+  return row ? rowToContinuationAttempt(row) : null;
+}
+
+/** Latest attempt for an agent, optionally filtered by status (newest by
+ *  started_at). Used by the relaunch route's server-side re-check. */
+export function getLatestContinuationAttempt(
+  agentId: string,
+  status?: ContinuationAttemptStatus,
+): ContinuationHandoffAttempt | null {
+  const row = status
+    ? queryOne(
+        'SELECT * FROM continuation_handoff_attempts WHERE dashboard_agent_id = ? AND status = ? ORDER BY started_at DESC LIMIT 1',
+        [agentId, status],
+      )
+    : queryOne(
+        'SELECT * FROM continuation_handoff_attempts WHERE dashboard_agent_id = ? ORDER BY started_at DESC LIMIT 1',
+        [agentId],
+      );
+  return row ? rowToContinuationAttempt(row) : null;
+}
+
+/** Inc 4 (4.4) relaunch gate — is any orchestration owned by this supervisor
+ *  live? Only 'starting'|'running' block; 'stalled'/'aborted' are ended-but-
+ *  resumable and deliberately non-blocking (revisit if a live-but-not-running
+ *  RunStatus is ever added). */
+export function hasRunningOrchestrationForSupervisor(supervisorId: string): boolean {
+  return !!queryOne(
+    "SELECT run_id FROM orchestrations WHERE supervisor_id = ? AND status IN ('starting','running') LIMIT 1",
+    [supervisorId],
+  );
+}
+
+/** Phase 5B (Option B) — the durable EFFORT BUDGET that authorizes a note-less
+ *  "escape" relaunch (replacing the deleted context-% hard ceiling). Scoped to
+ *  the CURRENT successor cycle: only attempts for this agent at
+ *  `successorGeneration` that were created AFTER the most recent 'relaunched'
+ *  attempt count, so a prior generation's failures can never pre-exhaust a fresh
+ *  cycle.
+ *   - `abortedCount` = those attempts closed 'aborted'.
+ *   - `firstAttemptStartedAt` = min(started_at) across ALL such attempts,
+ *     INCLUDING the current still-open one — so the alive-time clock starts at
+ *     the first attempt and can trip before any abort is recorded.
+ *  Timestamps are the millisecond-resolution UTC strings written via NOW_MS_SQL
+ *  ('YYYY-MM-DD HH:MM:SS.fff'); the caller converts to epoch ms as UTC. */
+export function getContinuationEscapeBudget(
+  agentId: string,
+  successorGeneration: number,
+): { abortedCount: number; firstAttemptStartedAt: string | null } {
+  // High-water mark: the most recent 'relaunched' attempt's start. Attempts
+  // at/before it belong to a prior, already-resolved cycle. Empty string when
+  // the agent has never relaunched (every current-gen attempt then qualifies).
+  const lastRelaunch = queryOne(
+    "SELECT started_at FROM continuation_handoff_attempts WHERE dashboard_agent_id = ? AND status = 'relaunched' ORDER BY started_at DESC LIMIT 1",
+    [agentId],
+  );
+  const since: string = (lastRelaunch?.started_at as string) ?? '';
+  const row = queryOne(
+    `SELECT SUM(CASE WHEN status = 'aborted' THEN 1 ELSE 0 END) AS aborted_count,
+            MIN(started_at) AS first_started_at
+       FROM continuation_handoff_attempts
+      WHERE dashboard_agent_id = ? AND generation = ? AND started_at > ?`,
+    [agentId, successorGeneration, since],
+  );
+  return {
+    abortedCount: (row?.aborted_count as number) ?? 0,
+    firstAttemptStartedAt: (row?.first_started_at as string | null) ?? null,
+  };
+}
+
+export function getOpenContinuationAttempt(agentId: string): ContinuationHandoffAttempt | null {
+  const row = queryOne(
+    "SELECT * FROM continuation_handoff_attempts WHERE dashboard_agent_id = ? AND status = 'open'",
+    [agentId],
+  );
+  return row ? rowToContinuationAttempt(row) : null;
+}
+
+export function closeContinuationHandoffAttempt(id: string, status: ContinuationAttemptStatus): void {
+  run(
+    `UPDATE continuation_handoff_attempts SET status = ?, closed_at = ${NOW_MS_SQL} WHERE id = ?`,
+    [status, id],
+  );
+}
+
+/** Append a brick row (append-only) and soft-supersede the agent's prior
+ *  current brick in the same transaction. Returns the new brick id (noteId). */
+export function insertContinuationBrick(input: {
+  agentId: string;
+  handoffAttemptId: string;
+  generation: number;
+  note: string;
+  noteSource: 'tool' | 'scrape';
+}): string {
+  const id = uuidv4();
+  const byteLen = Buffer.byteLength(input.note, 'utf8');
+  const tx = db.transaction(() => {
+    run(
+      `UPDATE continuation_bricks SET superseded_at = ${NOW_MS_SQL}
+       WHERE dashboard_agent_id = ? AND superseded_at IS NULL`,
+      [input.agentId],
+    );
+    run(
+      `INSERT INTO continuation_bricks (id, dashboard_agent_id, handoff_attempt_id, generation, note, note_source, byte_len, written_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ${NOW_MS_SQL})`,
+      [id, input.agentId, input.handoffAttemptId, input.generation, input.note, input.noteSource, byteLen],
+    );
+  });
+  tx();
+  return id;
+}
+
+/** Gate authority read: latest brick for a specific attempt, optionally
+ *  filtered by note_source ('tool' is the only kill-authorizing source). */
+export function getLatestBrickForAttempt(
+  agentId: string,
+  attemptId: string,
+  opts?: { source?: 'tool' | 'scrape' },
+): ContinuationBrickRow | null {
+  const row = opts?.source
+    ? queryOne(
+        `SELECT * FROM continuation_bricks
+         WHERE dashboard_agent_id = ? AND handoff_attempt_id = ? AND note_source = ?
+         ORDER BY written_at DESC LIMIT 1`,
+        [agentId, attemptId, opts.source],
+      )
+    : queryOne(
+        `SELECT * FROM continuation_bricks
+         WHERE dashboard_agent_id = ? AND handoff_attempt_id = ?
+         ORDER BY written_at DESC LIMIT 1`,
+        [agentId, attemptId],
+      );
+  return row ? rowToContinuationBrick(row) : null;
+}
+
+/** Builder-gate fallback: the agent's current (non-superseded) brick. */
+export function getCurrentBrick(agentId: string): ContinuationBrickRow | null {
+  const row = queryOne(
+    `SELECT * FROM continuation_bricks
+     WHERE dashboard_agent_id = ? AND superseded_at IS NULL
+     ORDER BY written_at DESC LIMIT 1`,
+    [agentId],
+  );
+  return row ? rowToContinuationBrick(row) : null;
+}
+
+/** Context-brick Inc 4 (4.1 step 3) — the atomic relaunch transaction:
+ *  new session id + generation bump (to the attempt's successorGen) +
+ *  attempt close ('relaunched'), all-or-nothing. This is the ONLY place the
+ *  agent's continuation_generation advances. */
+export function commitContinuationRelaunch(
+  agentId: string,
+  newSessionId: string,
+  successorGen: number,
+  attemptId: string,
+): void {
+  const tx = db.transaction(() => {
+    // Phase 1 — capture the session transition BEFORE resume_session_id is
+    // overwritten (it still holds the OUTGOING id here). Close the outgoing
+    // session and append the successor at the attempt's successorGen. Lineage
+    // keys on session_id, so the successor is always a distinct row even if a
+    // future `/clear` reuses this generation.
+    const row = queryOne(
+      'SELECT resume_session_id, working_directory, provider FROM agents WHERE id = ?',
+      [agentId],
+    );
+    if (row) {
+      const outgoing = row.resume_session_id as string | null;
+      if (outgoing) closeAgentSession(agentId, outgoing);
+      insertAgentSession(
+        agentId,
+        successorGen,
+        newSessionId,
+        row.working_directory as string,
+        (row.provider || 'claude') as string,
+      );
+    }
+    updateAgentResumeSessionId(agentId, newSessionId);
+    setContinuationGeneration(agentId, successorGen);
+    closeContinuationHandoffAttempt(attemptId, 'relaunched');
+  });
+  tx();
+}
+
+// ── Context-brick Phase 1: durable session lineage helpers ─────────────────
+
+function rowToAgentSession(row: any): AgentSessionRow {
+  return {
+    id: row.id,
+    dashboardAgentId: row.dashboard_agent_id,
+    generation: row.generation,
+    sessionId: row.session_id,
+    workingDirectory: row.working_directory,
+    provider: (row.provider || 'claude') as AgentSessionRow['provider'],
+    startedAt: row.started_at,
+    endedAt: row.ended_at ?? null,
+    jsonlPresent: row.jsonl_present ?? null,
+  };
+}
+
+/** Record a session in the durable lineage. Idempotent: keyed on
+ *  (dashboard_agent_id, session_id), a re-observed session (e.g. a plain
+ *  restart resuming the same id) is a no-op rather than a duplicate row.
+ *  `generation` is an ordering hint only — NEVER used to dedup. */
+export function insertAgentSession(
+  agentId: string,
+  generation: number,
+  sessionId: string,
+  workingDirectory: string,
+  provider: string,
+): void {
+  run(
+    `INSERT INTO agent_sessions
+       (dashboard_agent_id, generation, session_id, working_directory, provider)
+     VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(dashboard_agent_id, session_id) DO NOTHING`,
+    [agentId, generation, sessionId, workingDirectory, provider],
+  );
+}
+
+/** Mark a session superseded — set ended_at now, only for a still-open row of
+ *  this agent+session. Idempotent (a second close leaves ended_at unchanged). */
+export function closeAgentSession(agentId: string, sessionId: string): void {
+  run(
+    `UPDATE agent_sessions SET ended_at = datetime('now')
+     WHERE dashboard_agent_id = ? AND session_id = ? AND ended_at IS NULL`,
+    [agentId, sessionId],
+  );
+}
+
+/** The full ordered lineage for an agent. Ordered by started_at then row id —
+ *  NEVER by generation (generations repeat across `/clear`). */
+export function getAgentSessions(agentId: string): AgentSessionRow[] {
+  return queryAll(
+    `SELECT * FROM agent_sessions WHERE dashboard_agent_id = ?
+     ORDER BY started_at, id`,
+    [agentId],
+  ).map(rowToAgentSession);
+}
+
+/** The session immediately preceding a given lineage row, walking back by row
+ *  id / started_at — NEVER by generation. Returns null at the head of the
+ *  lineage (gen-0, or the oldest backfilled row). */
+export function getPriorSession(
+  agentId: string,
+  beforeSessionRowId: number,
+): AgentSessionRow | null {
+  const anchor = queryOne(
+    `SELECT started_at, id FROM agent_sessions WHERE id = ? AND dashboard_agent_id = ?`,
+    [beforeSessionRowId, agentId],
+  );
+  if (!anchor) return null;
+  // Strictly-earlier by (started_at, id) — the composite ordering key the
+  // lineage index is built on, so two same-generation `/clear` siblings still
+  // resolve to a deterministic predecessor.
+  const row = queryOne(
+    `SELECT * FROM agent_sessions
+     WHERE dashboard_agent_id = ?
+       AND (started_at < ? OR (started_at = ? AND id < ?))
+     ORDER BY started_at DESC, id DESC
+     LIMIT 1`,
+    [agentId, anchor.started_at, anchor.started_at, anchor.id],
+  );
+  return row ? rowToAgentSession(row) : null;
+}
+
+/** Phase 1 one-time backfill — reconstruct lineage from the append-only events
+ *  trail (`continuation` records the session switched TO + its generation;
+ *  `clear_session_rotated` records a `/clear` successor id at the same
+ *  generation). Per-agent guarded and ON CONFLICT-safe so it never duplicates
+ *  or fights live inserts.
+ *
+ *  Rows are stamped with started_at = the SOURCE EVENT's timestamp (not
+ *  datetime('now')) because backfilled autoincrement ids are minted after any
+ *  live rows, so correct ordering must rely on started_at. jsonl_present is
+ *  NULL (unknown — the provider may have pruned old files). gen-0 originals are
+ *  unrecoverable (events record the session switched TO, never FROM) — the gap
+ *  is accepted. */
+export function backfillAgentSessionsFromEvents(): void {
+  // Candidate agents: those carrying at least one lineage-bearing event.
+  const agents = queryAll(
+    `SELECT DISTINCT agent_id FROM events
+     WHERE event_type IN ('continuation', 'clear_session_rotated')`,
+  ) as { agent_id: string }[];
+
+  const insertBackfill = db.prepare(
+    `INSERT INTO agent_sessions
+       (dashboard_agent_id, generation, session_id, working_directory, provider, started_at, ended_at, jsonl_present)
+     VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
+     ON CONFLICT(dashboard_agent_id, session_id) DO NOTHING`,
+  );
+
+  for (const { agent_id: agentId } of agents) {
+    // Per-agent idempotency guard: skip any agent that already has lineage
+    // rows (live gen-0/transition inserts, or a prior backfill pass).
+    const existing = queryOne(
+      `SELECT COUNT(*) AS n FROM agent_sessions WHERE dashboard_agent_id = ?`,
+      [agentId],
+    );
+    if (existing && existing.n > 0) continue;
+
+    // Need cwd/provider to stamp the row; skip if the agent record is gone
+    // (best-effort — lineage of a deleted agent isn't reconstructable).
+    const agentRow = queryOne(
+      `SELECT working_directory, provider FROM agents WHERE id = ?`,
+      [agentId],
+    );
+    if (!agentRow) continue;
+
+    const events = queryAll(
+      `SELECT event_type, payload, created_at FROM events
+       WHERE agent_id = ? AND event_type IN ('continuation', 'clear_session_rotated')
+       ORDER BY created_at, id`,
+      [agentId],
+    ) as { event_type: string; payload: string | null; created_at: string }[];
+
+    // Build the ordered (sessionId, generation, startedAt) chain.
+    const chain: { sessionId: string; generation: number; startedAt: string }[] = [];
+    let runningGen = 0; // ordering hint; /clear leaves it unchanged
+    for (const ev of events) {
+      let sessionId: string | null = null;
+      if (ev.event_type === 'continuation') {
+        try {
+          const parsed = JSON.parse(ev.payload || '{}');
+          sessionId = typeof parsed.newSession === 'string' ? parsed.newSession : null;
+          if (typeof parsed.generation === 'number') runningGen = parsed.generation;
+        } catch { /* malformed payload — skip this event */ }
+      } else {
+        // clear_session_rotated: payload IS the successor session id string.
+        sessionId = ev.payload && ev.payload.length > 0 ? ev.payload : null;
+        // /clear does NOT bump the generation — reuse runningGen.
+      }
+      if (sessionId) chain.push({ sessionId, generation: runningGen, startedAt: ev.created_at });
+    }
+
+    // Each session is superseded by the next in the chain; the last stays open.
+    const tx = db.transaction(() => {
+      for (let i = 0; i < chain.length; i++) {
+        const cur = chain[i];
+        const endedAt = i + 1 < chain.length ? chain[i + 1].startedAt : null;
+        insertBackfill.run(
+          agentId,
+          cur.generation,
+          cur.sessionId,
+          agentRow.working_directory,
+          agentRow.provider || 'claude',
+          cur.startedAt,
+          endedAt,
+        );
+      }
+    });
+    tx();
+  }
 }
 
 export function addEvent(agentId: string, eventType: string, payload?: string): void {
@@ -1112,22 +1667,39 @@ function rowToFileActivity(row: any): FileActivity {
     filePath: row.file_path,
     operation: row.operation as FileOperation,
     timestamp: row.timestamp,
+    generation: row.generation ?? 0,
+    sessionId: row.session_id ?? null,
   };
 }
 
 export function addFileActivity(agentId: string, filePath: string, operation: FileOperation): FileActivity | null {
-  // Dedup: skip if same (agent, file, operation) within last 5 seconds
+  // Stamp with the agent's CURRENT session + generation so a continuation's new
+  // session inserts distinct rows instead of colliding with the prior session's.
+  // resume_session_id is the live session id; continuation_generation is the
+  // display label. Both read at the single insert chokepoint.
+  const stamp = queryOne(
+    'SELECT continuation_generation, resume_session_id FROM agents WHERE id = ?',
+    [agentId]
+  );
+  const generation: number = stamp?.continuation_generation ?? 0;
+  const sessionId: string | null = stamp?.resume_session_id ?? null;
+
+  // Dedup: skip if the same (agent, file, operation) landed within the last 5
+  // seconds UNDER THE SAME session + generation. Matching the session too means
+  // a rebind mid-window doesn't dedup the new session's activity against the old
+  // one. `session_id IS ?` is NULL-aware equality (legacy NULL rows dedup too).
   const recent = queryOne(
     `SELECT id FROM file_activities
      WHERE agent_id = ? AND file_path = ? AND operation = ?
+     AND generation = ? AND session_id IS ?
      AND timestamp > datetime('now', '-5 seconds')`,
-    [agentId, filePath, operation]
+    [agentId, filePath, operation, generation, sessionId]
   );
   if (recent) return null;
 
   run(
-    'INSERT INTO file_activities (agent_id, file_path, operation) VALUES (?, ?, ?)',
-    [agentId, filePath, operation]
+    'INSERT INTO file_activities (agent_id, file_path, operation, generation, session_id) VALUES (?, ?, ?, ?, ?)',
+    [agentId, filePath, operation, generation, sessionId]
   );
 
   const row = queryOne(
@@ -1137,17 +1709,71 @@ export function addFileActivity(agentId: string, filePath: string, operation: Fi
   return row ? rowToFileActivity(row) : null;
 }
 
-export function getFileActivities(agentId: string, operation?: FileOperation): FileActivity[] {
+// `currentOnly` filters to the agent's live session (`resume_session_id`) — the
+// dashboard tabs pass it via `current_only`; the default returns ALL retained
+// sessions so "has any prior session touched X?" callers (MCP/HTTP) still work.
+export function getFileActivities(agentId: string, operation?: FileOperation, currentOnly?: boolean): FileActivity[] {
+  const clauses = ['agent_id = ?'];
+  const params: unknown[] = [agentId];
   if (operation) {
-    return queryAll(
-      'SELECT * FROM file_activities WHERE agent_id = ? AND operation = ? ORDER BY timestamp DESC',
-      [agentId, operation]
-    ).map(rowToFileActivity);
+    clauses.push('operation = ?');
+    params.push(operation);
+  }
+  if (currentOnly) {
+    // Live session = the agent's current resume_session_id. A subquery keeps it
+    // atomic; NULL-safe `IS` so a null live session matches only null rows.
+    clauses.push('session_id IS (SELECT resume_session_id FROM agents WHERE id = ?)');
+    params.push(agentId);
   }
   return queryAll(
-    'SELECT * FROM file_activities WHERE agent_id = ? ORDER BY timestamp DESC',
-    [agentId]
+    `SELECT * FROM file_activities WHERE ${clauses.join(' AND ')} ORDER BY timestamp DESC`,
+    params
   ).map(rowToFileActivity);
+}
+
+/**
+ * Context-brick Phase 4 retention cap. Instead of the old universal purge on
+ * rebind, keep only the `keepSessions` most-recently-active sessions' activity
+ * for an agent and delete the rest, so `file_activities` stays bounded across
+ * many rotations. Sessions are ranked by their most recent activity timestamp;
+ * a NULL session_id (legacy rows) counts as its own bucket. Returns what was
+ * pruned so the caller can log it (no silent truncation).
+ */
+export function pruneFileActivitiesToRecentSessions(
+  agentId: string,
+  keepSessions: number
+): { prunedRows: number; prunedSessions: number } {
+  // Rank sessions by recency (NULL bucketed via a sentinel key). COALESCE the
+  // key so the NULL session collapses to one group rather than per-row.
+  const sessions = queryAll(
+    `SELECT COALESCE(session_id, ' null') AS skey, MAX(timestamp) AS last_ts
+       FROM file_activities WHERE agent_id = ?
+       GROUP BY skey ORDER BY last_ts DESC`,
+    [agentId]
+  ) as { skey: string; last_ts: string }[];
+
+  if (sessions.length <= keepSessions) return { prunedRows: 0, prunedSessions: 0 };
+
+  const drop = sessions.slice(keepSessions); // oldest beyond the cap
+  let prunedRows = 0;
+  for (const s of drop) {
+    if (s.skey === ' null') {
+      const before = queryOne(
+        `SELECT COUNT(*) AS n FROM file_activities WHERE agent_id = ? AND session_id IS NULL`,
+        [agentId]
+      );
+      run(`DELETE FROM file_activities WHERE agent_id = ? AND session_id IS NULL`, [agentId]);
+      prunedRows += (before?.n as number) ?? 0;
+    } else {
+      const before = queryOne(
+        `SELECT COUNT(*) AS n FROM file_activities WHERE agent_id = ? AND session_id = ?`,
+        [agentId, s.skey]
+      );
+      run(`DELETE FROM file_activities WHERE agent_id = ? AND session_id = ?`, [agentId, s.skey]);
+      prunedRows += (before?.n as number) ?? 0;
+    }
+  }
+  return { prunedRows, prunedSessions: drop.length };
 }
 
 export function deleteAgent(id: string): void {

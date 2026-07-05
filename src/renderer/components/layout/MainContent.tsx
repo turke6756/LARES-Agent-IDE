@@ -1,4 +1,4 @@
-import React, { useState, useRef, useCallback, useEffect } from 'react';
+import React, { useState, useRef, useCallback, useEffect, useLayoutEffect } from 'react';
 import { useShallow } from 'zustand/react/shallow';
 import { useDashboardStore } from '../../stores/dashboard-store';
 import AgentGrid from '../agent/AgentGrid';
@@ -59,6 +59,43 @@ export default function MainContent() {
     ensureBrowserBridge();
   });
 
+  // Header toolbar responsive collapse. The five action buttons (Dashboard,
+  // Files, Browser, Open VS Code, Launch Agent) keep their labels while there
+  // is room, then drop to icon-only when the header gets too narrow — instead
+  // of squishing (clipped text) or bleeding past the header bounds. We measure
+  // the button group's full labelled width once (captured only while expanded,
+  // so it survives the collapse) and compare it against the available header
+  // width, reserving a slice for the workspace title. Hysteresis on the way
+  // back out avoids oscillation right at the breakpoint.
+  const headerRowRef = useRef<HTMLDivElement>(null);
+  const toolbarRef = useRef<HTMLDivElement>(null);
+  const fullToolbarWidth = useRef(0);
+  const [toolbarCompact, setToolbarCompact] = useState(false);
+
+  useLayoutEffect(() => {
+    const row = headerRowRef.current;
+    const toolbar = toolbarRef.current;
+    if (!row || !toolbar) return;
+
+    const TITLE_MIN = 140; // px kept for the workspace title/path column
+    const HYSTERESIS = 32; // px slack before re-expanding, prevents flip-flop
+
+    const measure = () => {
+      if (!toolbarCompact) fullToolbarWidth.current = toolbar.scrollWidth;
+      const needed = fullToolbarWidth.current + TITLE_MIN;
+      const avail = row.clientWidth;
+      setToolbarCompact((prev) => {
+        if (!prev) return avail < needed;
+        return avail < needed + HYSTERESIS; // stay compact until clearly roomy
+      });
+    };
+
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(row);
+    return () => ro.disconnect();
+  }, [toolbarCompact, selectedWorkspaceId]);
+
   if (!workspace) {
     return (
       <div className="flex-1 flex items-center justify-center text-gray-500">
@@ -81,7 +118,7 @@ export default function MainContent() {
       {/* Header — fixed h-16 to match the sidebar header thickness.
           Doubles as a window-drag surface (the native title bar is hidden). */}
       <div className="panel-header h-16 px-4 sticky top-0 z-10 flex items-center shrink-0 app-drag-region">
-        <div className="flex items-center justify-between w-full">
+        <div ref={headerRowRef} className="flex items-center justify-between w-full gap-3 min-w-0">
           <div className="min-w-0">
             <div className="flex items-baseline gap-2">
               <h2 className="text-[14px] font-semibold text-gray-100 truncate">
@@ -105,56 +142,57 @@ export default function MainContent() {
             </div>
           </div>
 
-          <div className="flex items-center gap-4 app-no-drag">
+          <div className="flex items-center gap-4 app-no-drag shrink-0">
             {/* No workspace-supervisor singleton: a supervisor is just one of
                 the agent types in the Launch Agent dialog, launchable as many
                 times as wanted. Each renders as its own grid card with its
                 launched agents nested beneath (buildAgentForest). */}
-            <div className="flex gap-2">
+            <div ref={toolbarRef} className="flex gap-2">
               <button
                 onClick={() => showDashboard()}
-                className={`ui-btn ui-btn-outline px-3 py-1.5 text-[13px] font-medium ${
+                className={`ui-btn ui-btn-outline shrink-0 whitespace-nowrap px-3 py-1.5 text-[13px] font-medium ${
                   dashboardActive ? 'ui-btn-success is-active' : ''
                 }`}
                 title="Agent dashboard"
               >
-                <Icons.LayoutGrid className="w-4 h-4" />
-                Dashboard
+                <Icons.LayoutGrid className="w-4 h-4 shrink-0" />
+                {!toolbarCompact && 'Dashboard'}
               </button>
               <button
                 onClick={() => showFileViewer()}
-                className={`ui-btn ui-btn-outline px-3 py-1.5 text-[13px] font-medium ${
+                className={`ui-btn ui-btn-outline shrink-0 whitespace-nowrap px-3 py-1.5 text-[13px] font-medium ${
                   fileViewerOpen ? 'ui-btn-success is-active' : hasOpenTabs ? 'ui-btn-success' : ''
                 }`}
                 title={hasOpenTabs ? `Files (${workspaceTabCount} tabs open)` : 'Browse files'}
               >
-                <Icons.FileText className="w-4 h-4" />
-                Files{hasOpenTabs ? ` (${workspaceTabCount})` : ''}
+                <Icons.FileText className="w-4 h-4 shrink-0" />
+                {toolbarCompact ? (hasOpenTabs ? workspaceTabCount : '') : `Files${hasOpenTabs ? ` (${workspaceTabCount})` : ''}`}
               </button>
               <button
                 onClick={() => showBrowser()}
-                className={`ui-btn ui-btn-outline px-3 py-1.5 text-[13px] font-medium ${
+                className={`ui-btn ui-btn-outline shrink-0 whitespace-nowrap px-3 py-1.5 text-[13px] font-medium ${
                   browserOpen && !fileViewerOpen ? 'ui-btn-success is-active' : browserPaneAttention ? 'ui-btn-warning animate-pulse' : ''
                 }`}
                 title={browserPaneAttention ? 'Browser — an agent opened a page for you' : 'Open browser pane'}
               >
-                <Icons.Globe className="w-4 h-4" />
-                Browser
+                <Icons.Globe className="w-4 h-4 shrink-0" />
+                {!toolbarCompact && 'Browser'}
               </button>
               <button
                 onClick={() => window.api.workspaces.openInVSCode(workspace.id)}
-                className="ui-btn ui-btn-outline px-3 py-1.5 text-[13px] font-medium"
+                className="ui-btn ui-btn-outline shrink-0 whitespace-nowrap px-3 py-1.5 text-[13px] font-medium"
                 title="Open workspace in VS Code"
               >
-                <img src={vscodeIcon} alt="" className="w-4 h-4" />
-                Open VS Code
+                <img src={vscodeIcon} alt="" className="w-4 h-4 shrink-0" />
+                {!toolbarCompact && 'Open VS Code'}
               </button>
               <button
                 onClick={() => setShowLaunch(true)}
-                className="ui-btn ui-btn-primary px-3 py-1.5 text-[13px] font-medium"
+                className="ui-btn ui-btn-primary shrink-0 whitespace-nowrap px-3 py-1.5 text-[13px] font-medium"
+                title="Launch Agent"
               >
-                <Icons.Plus className="w-4 h-4" />
-                Launch Agent
+                <Icons.Plus className="w-4 h-4 shrink-0" />
+                {!toolbarCompact && 'Launch Agent'}
               </button>
             </div>
           </div>

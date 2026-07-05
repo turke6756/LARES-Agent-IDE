@@ -120,11 +120,15 @@ function InlineWorkspaceTree({ rootPath, pathType, workspaceId, expandedPaths, o
   );
 }
 
-function HeatDot({ activeCount, workingCount }: { activeCount: number; workingCount: number }) {
+function HeatDot({ activeCount, workingCount, waitingCount }: { activeCount: number; workingCount: number; waitingCount: number }) {
   let colorClass = 'bg-gray-700';
   let pulse = false;
 
-  if (activeCount === 0) {
+  if (waitingCount > 0) {
+    // Waiting on a human is the top-priority signal — solid red, no pulse.
+    colorClass = 'bg-accent-red';
+    pulse = false;
+  } else if (activeCount === 0) {
     colorClass = 'bg-gray-700';
   } else if (workingCount === 0) {
     colorClass = 'bg-accent-blue';
@@ -471,6 +475,7 @@ export default function Sidebar({ width }: SidebarProps) {
         <div className="space-y-1">
           {workspaces.map((ws) => {
             const heat = workspaceHeat[ws.id];
+            const hasWaiting = (heat?.waitingCount ?? 0) > 0;
             const isSelected = selectedWorkspaceId === ws.id;
             const isExpanded = expandedWorkspaces.has(ws.id);
 
@@ -506,7 +511,10 @@ export default function Sidebar({ width }: SidebarProps) {
                   onClick={() => selectWorkspace(ws.id)}
                   onDoubleClick={(e) => toggleWorkspace(ws.id, e)}
                   onContextMenu={(e) => handleContextMenu(e, ws.id)}
+                  title={hasWaiting ? `${heat!.waitingCount} agent${heat!.waitingCount === 1 ? '' : 's'} waiting` : undefined}
                   className={`w-full text-left px-3 py-2 group transition-colors flex flex-col border-l-2 ${
+                    hasWaiting ? 'outline outline-2 outline-accent-red outline-offset-[-2px] rounded-[2px]' : ''
+                  } ${
                     isSelected
                       ? 'border-l-accent-blue-bright tree-row-selected'
                       : 'border-l-transparent hover:bg-white/[0.04]'
@@ -532,7 +540,7 @@ export default function Sidebar({ width }: SidebarProps) {
                         ⚠
                       </span>
                     )}
-                    {heat && <HeatDot activeCount={heat.activeCount} workingCount={heat.workingCount} />}
+                    {heat && <HeatDot activeCount={heat.activeCount} workingCount={heat.workingCount} waitingCount={heat.waitingCount} />}
                   </div>
 
                   <div

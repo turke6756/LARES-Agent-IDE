@@ -125,6 +125,9 @@ export default function TerminalPanel({ height }: TerminalPanelProps) {
   const [scrollLocked, setScrollLocked] = useState(false);
   const [isAtBottom, setIsAtBottom] = useState(true);
   const [isDragOver, setIsDragOver] = useState(false);
+  // BUG-38 — bumped when a same-id PTY swap rebinds the terminal, forcing the
+  // mount effect to re-run into its create-new branch on the fresh bridge.
+  const [reboundNonce, setReboundNonce] = useState(0);
 
   const isOpen = terminalAgentId !== null;
   const isNub = panelLayout.terminalCollapsed && isOpen;
@@ -373,6 +376,28 @@ export default function TerminalPanel({ height }: TerminalPanelProps) {
       xtermRef.current = null;
       fitAddonRef.current = null;
     };
+  }, [terminalAgentId, reboundNonce]);
+
+  // BUG-38 — same-id PTY swap (continuation, manual restart, auto-restart):
+  // main killed the old runner and spawned a new one under the same agent id,
+  // so the cached xterm is bound to a dead bridge. Dispose the cached terminal
+  // (dropping its stale IPC subscription) so the mount effect rebuilds onto the
+  // fresh PTY and re-pulls the new session's ring buffer. Other agents rebuild
+  // lazily the next time they're opened — the cache is already cleared for them.
+  useEffect(() => {
+    const unsub = window.api.terminal.onRebound((reboundAgentId: string) => {
+      const entry = terminalCache.get(reboundAgentId);
+      if (entry) {
+        entry.unsub?.();
+        entry.terminal.dispose();
+        terminalCache.delete(reboundAgentId);
+      }
+      // Only force a re-mount for the terminal currently on screen.
+      if (reboundAgentId === terminalAgentId) {
+        setReboundNonce((n) => n + 1);
+      }
+    });
+    return unsub;
   }, [terminalAgentId]);
 
   // Sync scrollOnUserInput option without re-creating terminal

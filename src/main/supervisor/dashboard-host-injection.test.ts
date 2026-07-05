@@ -38,6 +38,7 @@ function patchDb(agentsMap: Map<string, Agent>): () => void {
     'updateAgentLastOutput', 'updateAgentExitCode',
     'getActiveAgents', 'getAllAgents', 'getSupervisorAgent',
     'addFileActivity', 'updateAgentResumeSessionId', 'getTeamMembership',
+    'getCurrentBrick',
   ];
   const orig: Record<string, unknown> = {};
   for (const k of keys) orig[k] = db[k];
@@ -58,6 +59,9 @@ function patchDb(agentsMap: Map<string, Agent>): () => void {
   db.updateAgentResumeSessionId = () => {};
   // WP-A.2 — launch paths now read getTeamMembership for inline team MCP; no team here.
   db.getTeamMembership = () => null;
+  // Context-brick Inc 4 (4.2) — every fresh launch consults the brick gate's
+  // DB fallback; no continuation state in these fixtures.
+  db.getCurrentBrick = () => null;
 
   return () => { for (const k of keys) db[k] = orig[k]; };
 }
@@ -448,6 +452,92 @@ test('PHASE 0 WSL legacy lane: AGENT_DASHBOARD_* NOT injected (matches no-MCP-to
   const cmd = await captureWslLaunch('wsl-own-legacy', LEGACY_FLAGS);
   assert.ok(!/AGENT_DASHBOARD_API_TOKEN=/.test(cmd), `legacy must NOT inject API token; got: ${cmd}`);
   assert.ok(!/AGENT_DASHBOARD_SELF_ID=/.test(cmd), `legacy must NOT inject SELF_ID; got: ${cmd}`);
+});
+
+// ── Context-brick Inc 2 (2.1, ≡ P1-10a) — AGENT_DASHBOARD_SUPERVISOR_ID rides
+// the SAME two parent-env sites as WORKSPACE_ID/SELF_ID, but behind an INNER
+// agent.isSupervisor guard (D-16): workers/researchers must NOT carry another
+// agent's supervisor assertion. The shim's generic CALLER_HEADERS scan forwards
+// it as X-Supervisor-Id — no shim change, so these tests pin the env sites. ──
+
+test('Inc 2 Windows supervisor lane: AGENT_DASHBOARD_SUPERVISOR_ID = own agent id', async () => {
+  const env = await captureWindowsExtraEnv('win-sup-id', SUPERVISOR_FLAGS);
+  assert.equal(
+    env.AGENT_DASHBOARD_SUPERVISOR_ID, 'win-sup-id',
+    `supervisor must carry its own id as SUPERVISOR_ID; got: ${JSON.stringify(env)}`,
+  );
+});
+
+for (const [laneName, flags] of [
+  ['worker', WORKER_FLAGS],
+  ['researcher', RESEARCHER_FLAGS],
+  ['legacy', LEGACY_FLAGS],
+] as [string, Partial<Agent>][]) {
+  test(`Inc 2 Windows ${laneName} lane: AGENT_DASHBOARD_SUPERVISOR_ID NOT injected (D-16)`, async () => {
+    const env = await captureWindowsExtraEnv(`win-nosup-${laneName}`, flags);
+    assert.ok(
+      !('AGENT_DASHBOARD_SUPERVISOR_ID' in env),
+      `${laneName} must NOT carry SUPERVISOR_ID; got: ${JSON.stringify(env)}`,
+    );
+  });
+}
+
+test('Inc 2 WSL supervisor lane: command-prefix carries AGENT_DASHBOARD_SUPERVISOR_ID = own id', async () => {
+  const cmd = await captureWslLaunch('wsl-sup-id', SUPERVISOR_FLAGS);
+  assert.match(
+    cmd, /AGENT_DASHBOARD_SUPERVISOR_ID=wsl-sup-id/,
+    `supervisor must inject its own id as SUPERVISOR_ID; got: ${cmd}`,
+  );
+});
+
+for (const [laneName, flags] of [
+  ['worker', WORKER_FLAGS],
+  ['researcher', RESEARCHER_FLAGS],
+  ['legacy', LEGACY_FLAGS],
+] as [string, Partial<Agent>][]) {
+  test(`Inc 2 WSL ${laneName} lane: AGENT_DASHBOARD_SUPERVISOR_ID NOT injected (D-16)`, async () => {
+    const cmd = await captureWslLaunch(`wsl-nosup-${laneName}`, flags);
+    assert.ok(
+      !/AGENT_DASHBOARD_SUPERVISOR_ID=/.test(cmd),
+      `${laneName} must NOT inject SUPERVISOR_ID; got: ${cmd}`,
+    );
+  });
+}
+
+test('Inc 2 D-16: two supervisors launched by ONE AgentSupervisor each keep their OWN id', async () => {
+  const agentsMap = new Map<string, Agent>();
+  const restoreDb = patchDb(agentsMap);
+  const capturedEnvs: Record<string, string>[] = [];
+  const origWinLaunch = (WindowsRunner.prototype as { launch: unknown }).launch;
+  (WindowsRunner.prototype as { launch: unknown }).launch = function (
+    this: WindowsRunner,
+    _workDir: string, _command: string, _args: string[], _logPath: string,
+    _directSpawn?: boolean, extraEnv?: Record<string, string>,
+  ) {
+    capturedEnvs.push(extraEnv ?? {});
+    (this as unknown as { _pid: number; _alive: boolean })._pid = 12345;
+    (this as unknown as { _pid: number; _alive: boolean })._alive = true;
+  };
+  try {
+    const supervisor = makeSupervisor();
+    for (const id of ['sup-alpha', 'sup-beta']) {
+      const agent = makeAgent(id, {
+        provider: 'claude',
+        command: 'claude --dangerously-skip-permissions',
+        workingDirectory: 'C:\\tmp\\ws',
+        ...SUPERVISOR_FLAGS,
+      });
+      agentsMap.set(agent.id, agent);
+      await (supervisor as unknown as { launchWindowsAgent: (a: Agent) => Promise<void> })
+        .launchWindowsAgent(agent);
+    }
+    assert.equal(capturedEnvs.length, 2, 'both launches must reach the runner');
+    assert.equal(capturedEnvs[0].AGENT_DASHBOARD_SUPERVISOR_ID, 'sup-alpha');
+    assert.equal(capturedEnvs[1].AGENT_DASHBOARD_SUPERVISOR_ID, 'sup-beta');
+  } finally {
+    (WindowsRunner.prototype as { launch: unknown }).launch = origWinLaunch;
+    restoreDb();
+  }
 });
 
 test('PHASE 0 WSL: the injected token is scrubbed by redactMcpToken before any log sink', async () => {

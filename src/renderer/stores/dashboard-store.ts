@@ -1,11 +1,17 @@
 import { create } from 'zustand';
-import type { Agent, Workspace, HealthCheck, FileActivity, QueryResult, ContextStats, PathType, FileTab, PanelLayout, Team, TeamMessage, CreateTeamInput, DetachedClosedPayload } from '../../shared/types';
+import type { Agent, AgentStatus, Workspace, HealthCheck, FileActivity, QueryResult, ContextStats, UsageLimitsReading, PathType, FileTab, PanelLayout, Team, TeamMessage, CreateTeamInput, DetachedClosedPayload } from '../../shared/types';
 import { evictTabCache, recordRecentWrite } from '../components/fileviewer/useFileContentCache';
 import { clearDraft } from '../lib/chat-drafts';
 
 interface WorkspaceHeat {
   activeCount: number;
   workingCount: number;
+  waitingCount: number;
+}
+
+interface AgentStatusSnapshot {
+  workspaceId: string;
+  status: AgentStatus;
 }
 
 // Renderer-side extension of FileTab: `color` is an optional per-tab visual
@@ -98,7 +104,16 @@ interface DashboardState {
   detailPane: 0 | 1 | 2;
   fileActivities: FileActivity[];
   workspaceHeat: Record<string, WorkspaceHeat>;
+  // Cross-workspace agent status index (agentId → {workspaceId, status}).
+  // Unlike the workspace-scoped `agents` array this sees ALL workspaces: it is
+  // seeded once at startup, updated on every statusChanged with no workspace
+  // guard, merged on selected-workspace loads/forks, and pruned on
+  // agent/workspace deletion. `workspaceHeat` is derived from it.
+  agentStatuses: Record<string, AgentStatusSnapshot>;
   contextStats: Record<string, ContextStats>;
+  // Account-wide Claude subscription usage-limits reading (singleton, NOT a
+  // per-agent map — the data is shared across every session/workspace).
+  usageLimits: UsageLimitsReading | null;
   // Supervisor ids that currently own an active orchestration deliberation
   // (e.g. groupthink). Synced from the main process; OR'd into the owner-
   // container pulse so the border keeps animating through the idle gaps
@@ -142,7 +157,12 @@ interface DashboardState {
   setFileActivities: (activities: FileActivity[]) => void;
   addFileActivity: (activity: FileActivity) => void;
   updateWorkspaceHeat: () => void;
+  loadAgentStatuses: () => Promise<void>;
+  seedAgentStatuses: (agents: Agent[]) => void;
+  updateAgentStatusSnapshot: (agent: Agent) => void;
+  removeAgentStatusesForWorkspace: (workspaceId: string) => void;
   updateContextStats: (stats: ContextStats) => void;
+  updateUsageLimits: (reading: UsageLimitsReading) => void;
   setDeliberatingSupervisorIds: (ids: string[]) => void;
   forkAgent: (id: string) => Promise<Agent | null>;
   queryAgent: (targetAgentId: string, question: string, sourceAgentId?: string) => Promise<QueryResult | null>;
@@ -206,7 +226,9 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
   detailPane: 2,
   fileActivities: [],
   workspaceHeat: {},
+  agentStatuses: {},
   contextStats: {},
+  usageLimits: null,
   deliberatingSupervisorIds: [],
   teams: [],
   teamMessages: {},
@@ -874,7 +896,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
       set({ selectedWorkspaceId: null, agents: [], selectedAgentId: null, terminalAgentId: null });
     }
     await get().loadWorkspaces();
-    get().updateWorkspaceHeat();
+    get().removeAgentStatusesForWorkspace(id);
   },
 
   loadAgents: async (workspaceId: string) => {
@@ -883,7 +905,15 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
     // workers nest beneath them via ownerAgentId (buildAgentForest). No more
     // header-singleton collapse.
     const agents = await window.api.agents.list(workspaceId);
-    set({ agents });
+    set((state) => {
+      const next: Record<string, AgentStatusSnapshot> = {};
+      // Keep every other workspace's entries; replace this workspace's slice.
+      for (const [id, snap] of Object.entries(state.agentStatuses)) {
+        if (snap.workspaceId !== workspaceId) next[id] = snap;
+      }
+      for (const a of agents) next[a.id] = { workspaceId: a.workspaceId, status: a.status };
+      return { agents, agentStatuses: next };
+    });
     get().updateWorkspaceHeat();
   },
 
@@ -946,11 +976,16 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
 
   removeAgent: (id) => {
     clearDraft(id);
-    set((state) => ({
-      agents: state.agents.filter((a) => a.id !== id),
-      selectedAgentId: state.selectedAgentId === id ? null : state.selectedAgentId,
-      terminalAgentId: state.terminalAgentId === id ? null : state.terminalAgentId,
-    }));
+    set((state) => {
+      const { [id]: _dropped, ...agentStatuses } = state.agentStatuses;
+      return {
+        agents: state.agents.filter((a) => a.id !== id),
+        agentStatuses,
+        selectedAgentId: state.selectedAgentId === id ? null : state.selectedAgentId,
+        terminalAgentId: state.terminalAgentId === id ? null : state.terminalAgentId,
+      };
+    });
+    get().updateWorkspaceHeat();
   },
 
   deleteAgent: async (id) => {
@@ -996,7 +1031,13 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
   forkAgent: async (id) => {
     try {
       const forked = await window.api.agents.fork(id);
-      set((state) => ({ agents: [...state.agents, forked] }));
+      set((state) => ({
+        agents: [...state.agents, forked],
+        agentStatuses: {
+          ...state.agentStatuses,
+          [forked.id]: { workspaceId: forked.workspaceId, status: forked.status },
+        },
+      }));
       get().updateWorkspaceHeat();
       return forked;
     } catch (err) {
@@ -1018,6 +1059,10 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
     set((state) => ({
       contextStats: { ...state.contextStats, [stats.agentId]: stats },
     }));
+  },
+
+  updateUsageLimits: (reading: UsageLimitsReading) => {
+    set({ usageLimits: reading });
   },
 
   // Replace the active-deliberation set wholesale — the main-process payload is
@@ -1102,18 +1147,53 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
   },
 
   updateWorkspaceHeat: () => {
-    const agents = get().agents;
+    const statuses = get().agentStatuses;
     const heat: Record<string, WorkspaceHeat> = {};
-    for (const agent of agents) {
-      if (agent.status === 'done' || agent.status === 'crashed') continue;
-      if (!heat[agent.workspaceId]) {
-        heat[agent.workspaceId] = { activeCount: 0, workingCount: 0 };
+    for (const { workspaceId, status } of Object.values(statuses)) {
+      if (status === 'done' || status === 'crashed') continue;
+      if (!heat[workspaceId]) {
+        heat[workspaceId] = { activeCount: 0, workingCount: 0, waitingCount: 0 };
       }
-      heat[agent.workspaceId].activeCount++;
-      if (agent.status === 'working') {
-        heat[agent.workspaceId].workingCount++;
-      }
+      heat[workspaceId].activeCount++;
+      if (status === 'working') heat[workspaceId].workingCount++;
+      if (status === 'waiting') heat[workspaceId].waitingCount++;
     }
     set({ workspaceHeat: heat });
+  },
+
+  loadAgentStatuses: async () => {
+    const agents = await window.api.agents.listAll();
+    get().seedAgentStatuses(agents);
+  },
+
+  // Wholesale replace of the index (startup / global reseed).
+  seedAgentStatuses: (agents) => {
+    const map: Record<string, AgentStatusSnapshot> = {};
+    for (const a of agents) map[a.id] = { workspaceId: a.workspaceId, status: a.status };
+    set({ agentStatuses: map });
+    get().updateWorkspaceHeat();
+  },
+
+  // Unguarded upsert — the critical background-workspace path. Reading
+  // agent.status is safe (see plan header "Verified safety note").
+  updateAgentStatusSnapshot: (agent) => {
+    set((state) => ({
+      agentStatuses: {
+        ...state.agentStatuses,
+        [agent.id]: { workspaceId: agent.workspaceId, status: agent.status },
+      },
+    }));
+    get().updateWorkspaceHeat();
+  },
+
+  removeAgentStatusesForWorkspace: (workspaceId) => {
+    set((state) => {
+      const kept = Object.entries(state.agentStatuses).filter(
+        ([, v]) => v.workspaceId !== workspaceId,
+      );
+      if (kept.length === Object.keys(state.agentStatuses).length) return {};
+      return { agentStatuses: Object.fromEntries(kept) };
+    });
+    get().updateWorkspaceHeat();
   },
 }));

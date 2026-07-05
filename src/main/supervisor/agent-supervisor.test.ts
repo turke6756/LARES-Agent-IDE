@@ -68,6 +68,7 @@ function patchDb(agentsMap: Map<string, Agent>): () => void {
     'getSupervisorAgent',
     'addFileActivity',
     'getTeamMembership',
+    'getCurrentBrick',
   ];
   const orig: Record<string, unknown> = {};
   for (const k of keys) orig[k] = db[k];
@@ -107,6 +108,9 @@ function patchDb(agentsMap: Map<string, Agent>): () => void {
   // decide whether to inject the team --mcp-config. Default to no team so these
   // status-contract tests don't open the real (native) DB.
   db.getTeamMembership = () => null;
+  // Context-brick Inc 4 (4.2) — every fresh launch consults the brick gate's
+  // DB fallback; no continuation state in these fixtures.
+  db.getCurrentBrick = () => null;
 
   return () => {
     for (const k of keys) db[k] = orig[k];

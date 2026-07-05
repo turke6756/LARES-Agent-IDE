@@ -42,5 +42,10 @@
         ]
       }
     ]
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "node \"${CLAUDE_PROJECT_DIR}/../scripts/dashboard-statusline.mjs\"",
+    "padding": 0
   }
 }
