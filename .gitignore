@@ -11,8 +11,13 @@ release/
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
 
-# Private documentation — not pushed to public repo
-docs/
+# Private documentation — internal design/bug notes live under docs/internal/
+# (ignored); docs/ root is public (curated launch docs). Anchored so it only
+# ignores the internal subtree, never the public docs.
+/docs/internal/
+
+# Raw pressure-test dumps — kept locally, not shipped to the public repo.
+experiments/
 
 # Local-only working plans
 plans/
@@ -29,6 +34,12 @@ plans/
 .dashboard/*/.claude/.sysprompt-*.txt
 .dashboard/*/.claude/scheduled_tasks.lock
 .dashboard/main-crash.log
+
+# Internal agent state that must not ship in the public scaffold (anchored/specific)
+/.dashboard/*/memory/
+/.dashboard/cdp-trace.*.jsonl
+/.dashboard/staging/
+/.dashboard/*/.claude/settings.local.json
 
 # >>> agentdashboard-research-store >>>
 # WP-G — research store: inbox/ holds raw, untrusted, web-derived artifacts and
