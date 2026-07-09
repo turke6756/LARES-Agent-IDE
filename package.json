@@ -1,7 +1,7 @@
 {
-  "name": "agent-dashboard",
+  "name": "lares-app",
   "version": "0.1.0",
-  "description": "Workspace-centric Claude Agent Dashboard",
+  "description": "An agent-native workspace for orchestrating AI agents across terminals, files, browsers, documents, and notebooks.",
   "main": "dist/main/main/index.js",
   "scripts": {
     "dev": "npm run build:main && concurrently -k -n vite,electron \"npm run dev:renderer\" \"node -e \\\"setTimeout(()=>process.exit(),3000)\\\" && npm run start\"",
@@ -18,8 +18,8 @@
     "dist": "npm run build && npm run rebuild && npx electron-builder --config.npmRebuild=false"
   },
   "build": {
-    "appId": "com.agentdashboard.app",
-    "productName": "AgentDashboard",
+    "appId": "com.lares.app",
+    "productName": "Lares",
     "directories": {
       "output": "release"
     },
@@ -52,9 +52,22 @@
   "overrides": {
     "@codemirror/search": "6.5.11"
   },
-  "keywords": [],
-  "author": "",
-  "license": "MIT",
+  "keywords": [
+    "ai-agents",
+    "agent-orchestration",
+    "multi-agent",
+    "agentic",
+    "ai-workspace",
+    "llm",
+    "claude-code",
+    "mcp",
+    "electron",
+    "developer-tools",
+    "browser-automation",
+    "notebooks"
+  ],
+  "author": "Edward Turk",
+  "license": "Apache-2.0",
   "dependencies": {
     "@codemirror/autocomplete": "6.18.7",
     "@codemirror/commands": "6.5.0",

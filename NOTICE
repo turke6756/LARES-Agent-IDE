@@ -1,0 +1,17 @@
+Lares
+Copyright 2026 Edward Turk
+
+This product includes software developed by Edward Turk and the Lares
+contributors, licensed under the Apache License, Version 2.0 (see LICENSE).
+
+--------------------------------------------------------------------------------
+Third-party attributions
+--------------------------------------------------------------------------------
+
+This product bundles the Material Extensions icon set
+(src/renderer/assets/material-icons/), Copyright (c) 2025 Material Extensions,
+licensed under the MIT License. The full license text ships alongside the icons
+at src/renderer/assets/material-icons/LICENSE.
+
+Other third-party dependencies are declared in package.json and their licenses
+are distributed with their respective packages under node_modules/.

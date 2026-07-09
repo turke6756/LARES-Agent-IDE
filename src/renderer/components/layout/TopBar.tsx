@@ -26,9 +26,9 @@ function AboutModal({ onClose }: { onClose: () => void }) {
     >
       <div className="ui-card p-6 max-w-sm text-center" onClick={(e) => e.stopPropagation()}>
         <img src={logoImg} alt="" className="h-12 w-12 mx-auto mb-3 object-contain" />
-        <h2 className="text-[15px] font-semibold text-gray-100 mb-1">Agent Dashboard</h2>
+        <h2 className="text-[15px] font-semibold text-gray-100 mb-1">Lares</h2>
         <p className="text-[12px] text-gray-500 mb-4">
-          Workspace-centric Claude agent orchestration.
+          Watch, direct, and collaborate with teams of AI agents — in one workspace.
         </p>
         <button onClick={onClose} className="ui-btn ui-btn-primary px-4 py-1.5 text-[13px]">
           Close
@@ -76,7 +76,7 @@ export default function TopBar() {
       { label: '', divider: true },
       { label: 'Reload UI', onClick: () => window.location.reload() },
     ],
-    Help: [{ label: 'About Agent Dashboard', onClick: () => setShowAbout(true) }],
+    Help: [{ label: 'About Lares', onClick: () => setShowAbout(true) }],
   };
 
   const handleItem = (item: MenuItem) => {
@@ -125,7 +125,7 @@ export default function TopBar() {
       {/* Center — active workspace (also a drag handle) */}
       <div className="flex-1 flex justify-center min-w-0 px-3">
         <span className="truncate text-gray-500">
-          {workspace ? workspace.title : 'Agent Dashboard'}
+          {workspace ? workspace.title : 'Lares'}
         </span>
       </div>
 
