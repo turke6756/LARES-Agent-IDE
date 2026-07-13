@@ -53,8 +53,10 @@ export interface MemorySnapshot {
 }
 
 /** Machine-readable admission failure classes. Surfaced to the calling
- *  agent/orchestrator at the API/MCP layer (see api-server API_ERROR_CODES). */
-export type AdmissionCode = 'memory-critical' | 'memory-capacity';
+ *  agent/orchestrator at the API/MCP layer (see api-server API_ERROR_CODES).
+ *  `memory-budget` (full-D5, Wave 4) is the per-agent budget refusal — same
+ *  family as the global `memory-critical`/`memory-capacity` codes. */
+export type AdmissionCode = 'memory-critical' | 'memory-capacity' | 'memory-budget';
 
 export interface AdmissionDecision {
   allowed: boolean;
