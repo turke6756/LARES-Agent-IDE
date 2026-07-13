@@ -1,0 +1,312 @@
+// Memory watchdog sampler + admission engine (incident-2026-07-11 §5 D5-lite).
+//
+// Samples system commit every 15 s off the hot path, maintains a hysteretic
+// pressure band (Warn 75/70, Critical 88/80) plus a 5-min growth-rate Critical
+// trip, tracks Electron process/agent/view counts, and answers admission checks
+// for new agent launches and new agent tabs. Enforcement is split exactly as the
+// plan requires:
+//   • Static caps (max live agents, max Electron processes) are fail-CLOSED —
+//     enforced from local state even when the sampler is down.
+//   • Commit-threshold rules (Critical refusal, auto-reload suppression) are
+//     fail-OPEN — suspended when the sampler fails; the meter shows "unknown".
+//
+// Every dependency is injected (clock, commit reader, counts, logger, snapshot
+// sink) so the whole state machine is unit-testable with no timers or electron.
+
+import {
+  DEFAULT_WATCHDOG_CONFIG,
+  type AdmissionDecision,
+  type CommitReading,
+  type MemorySnapshot,
+  type PressureLevel,
+  type WatchdogConfig,
+} from './types';
+
+export interface MemorySamplerDeps {
+  /** Platform commit reader; null ⇒ sampler failure this tick. */
+  readCommit: () => CommitReading | null;
+  /** Registered live (non-terminal) agent count — local state, no telemetry. */
+  getLiveAgentCount: () => number;
+  /** Live agent tabs/views count. */
+  getAgentViewCount: () => number;
+  /** Electron process count (app.getAppMetrics().length) — local, no syscall. */
+  getElectronProcessCount: () => number;
+  /** Approximate app-owned memory in bytes (sum of getAppMetrics working sets). */
+  getAppMemoryBytes: () => number;
+  /** Monotonic-ish clock (ms). Injected so tests drive time deterministically. */
+  now: () => number;
+  /** Called on every computed snapshot (renderer push). Optional. */
+  onSnapshot?: (snapshot: MemorySnapshot) => void;
+  /** Log sink (level transitions + one-shot sampler-failure line). */
+  log?: (msg: string) => void;
+  config?: Partial<WatchdogConfig>;
+}
+
+interface SlopeSample {
+  t: number;
+  chargeBytes: number;
+  limitBytes: number;
+}
+
+export class MemorySampler {
+  private readonly cfg: WatchdogConfig;
+  private readonly deps: MemorySamplerDeps;
+
+  private level: PressureLevel = 'normal';
+  private commitKnown = false;
+  private samplerFailureLogged = false;
+  private history: SlopeSample[] = [];
+  private lastSnapshot: MemorySnapshot | null = null;
+  private timer: ReturnType<typeof setInterval> | null = null;
+
+  constructor(deps: MemorySamplerDeps) {
+    this.deps = deps;
+    this.cfg = { ...DEFAULT_WATCHDOG_CONFIG, ...(deps.config ?? {}) };
+  }
+
+  /** Begin the 15 s sampling loop. Takes one immediate sample so the first
+   *  snapshot exists before the first interval elapses. Idempotent. */
+  start(): void {
+    if (this.timer) return;
+    this.sample();
+    this.timer = setInterval(() => this.sample(), this.cfg.sampleIntervalMs);
+    // Don't keep the event loop alive on account of the watchdog.
+    (this.timer as unknown as { unref?: () => void }).unref?.();
+  }
+
+  stop(): void {
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = null;
+    }
+  }
+
+  /** Take one sample and recompute the snapshot. Exposed (not just the timer) so
+   *  tests can step deterministically. */
+  sample(): MemorySnapshot {
+    const now = this.deps.now();
+    const reading = this.deps.readCommit();
+
+    let commitPercent: number | null = null;
+    let projectedMinutes: number | null = null;
+
+    if (reading) {
+      // Sampler recovered (or is healthy) — reset the one-shot failure latch.
+      if (!this.commitKnown && this.samplerFailureLogged) {
+        this.log(`[watchdog] commit sampler recovered (source=${reading.source})`);
+      }
+      this.commitKnown = true;
+      this.samplerFailureLogged = false;
+
+      commitPercent =
+        reading.commitLimitBytes > 0
+          ? (reading.commitChargeBytes / reading.commitLimitBytes) * 100
+          : 0;
+
+      this.pushHistory({ t: now, chargeBytes: reading.commitChargeBytes, limitBytes: reading.commitLimitBytes });
+      projectedMinutes = this.projectMinutesToLimit(now, reading);
+
+      const projTrips =
+        projectedMinutes !== null && projectedMinutes < this.cfg.projectionCriticalMinutes;
+      this.transition(this.computeLevel(commitPercent, projTrips), commitPercent, projectedMinutes);
+    } else {
+      // Sampler failure: commit rules suspend (fail-open); static caps stay
+      // enforced elsewhere. Meter shows "unknown". Log exactly once per episode.
+      this.commitKnown = false;
+      this.history = [];
+      if (!this.samplerFailureLogged) {
+        this.log('[watchdog] commit sampler unavailable — commit-threshold enforcement suspended; static caps still enforced; meter=unknown');
+        this.samplerFailureLogged = true;
+      }
+    }
+
+    const snapshot: MemorySnapshot = {
+      level: this.commitKnown ? this.level : 'normal',
+      commitKnown: this.commitKnown,
+      commitPercent: this.commitKnown ? round1(commitPercent ?? 0) : null,
+      commitLimitBytes: reading ? reading.commitLimitBytes : null,
+      commitChargeBytes: reading ? reading.commitChargeBytes : null,
+      appProcessCount: safeCount(this.deps.getElectronProcessCount),
+      appMemoryBytes: safeCount(this.deps.getAppMemoryBytes),
+      liveAgentCount: safeCount(this.deps.getLiveAgentCount),
+      agentViewCount: safeCount(this.deps.getAgentViewCount),
+      projectedMinutesToLimit: projectedMinutes === null ? null : round1(projectedMinutes),
+      staticCapsOnly: !this.commitKnown,
+      at: now,
+    };
+    this.lastSnapshot = snapshot;
+    try {
+      this.deps.onSnapshot?.(snapshot);
+    } catch {
+      // A renderer-push failure must never break sampling.
+    }
+    return snapshot;
+  }
+
+  /** Last computed snapshot (for D1's pressure gate + the meter). */
+  getSnapshot(): MemorySnapshot | null {
+    return this.lastSnapshot;
+  }
+
+  /** Current hysteretic band. `normal` when the commit sampler is down. */
+  getLevel(): PressureLevel {
+    return this.commitKnown ? this.level : 'normal';
+  }
+
+  /** True only when commit is KNOWN and we are in the Critical band. This is the
+   *  commit-based rule D1 consults — fail-open when the sampler is down (unknown
+   *  ⇒ false ⇒ auto-reload permitted). */
+  isCriticalPressure(): boolean {
+    return this.commitKnown && this.level === 'critical';
+  }
+
+  /** D1: suppress the automatic shell reload under Critical commit pressure. */
+  shouldSuppressAutoReload(): boolean {
+    return this.isCriticalPressure();
+  }
+
+  /** Admission gate for a new agent launch. */
+  canLaunchAgent(): AdmissionDecision {
+    const cap = this.staticCapDenial('agent-launch');
+    if (cap) return cap;
+    return this.commitDenial() ?? { allowed: true };
+  }
+
+  /** Admission gate for a new agent tab/view. */
+  canOpenAgentTab(): AdmissionDecision {
+    const cap = this.staticCapDenial('agent-tab');
+    if (cap) return cap;
+    return this.commitDenial() ?? { allowed: true };
+  }
+
+  // ── internals ──────────────────────────────────────────────────────────────
+
+  /** Fail-CLOSED static caps — evaluated from local counts, no telemetry, so
+   *  they hold even when the commit sampler is down. */
+  private staticCapDenial(kind: 'agent-launch' | 'agent-tab'): AdmissionDecision | null {
+    const procs = safeCount(this.deps.getElectronProcessCount);
+    if (procs >= this.cfg.maxElectronProcesses) {
+      return {
+        allowed: false,
+        code: 'memory-capacity',
+        reason:
+          `Electron process count ${procs} is at/above the static cap ` +
+          `${this.cfg.maxElectronProcesses}; refusing new ${kind === 'agent-launch' ? 'agent launch' : 'agent tab'}.`,
+      };
+    }
+    if (kind === 'agent-launch') {
+      const agents = safeCount(this.deps.getLiveAgentCount);
+      if (agents >= this.cfg.maxLiveAgents) {
+        return {
+          allowed: false,
+          code: 'memory-capacity',
+          reason: `Live agent count ${agents} is at/above the static cap ${this.cfg.maxLiveAgents}; refusing new agent launch.`,
+        };
+      }
+    }
+    return null;
+  }
+
+  /** Fail-OPEN commit rule — only denies when commit is KNOWN and Critical. */
+  private commitDenial(): AdmissionDecision | null {
+    if (!this.commitKnown) return null; // fail-open: commit rules suspended
+    if (this.level !== 'critical') return null;
+    const pct = this.lastSnapshot?.commitPercent ?? null;
+    return {
+      allowed: false,
+      code: 'memory-critical',
+      reason:
+        `System memory is under Critical commit pressure` +
+        (pct !== null ? ` (${pct}% of commit limit)` : '') +
+        `; refusing new agents/tabs until pressure clears. Wait and retry, or reap idle agents.`,
+    };
+  }
+
+  /** Hysteretic band selection. `projTrips` is the growth-rate Critical trip. */
+  private computeLevel(pct: number, projTrips: boolean): PressureLevel {
+    const cfg = this.cfg;
+    const criticalTrip = pct >= cfg.criticalOnPercent || projTrips;
+    const criticalHold = pct >= cfg.criticalClearPercent || projTrips;
+    const warnTrip = pct >= cfg.warnOnPercent;
+    const warnHold = pct >= cfg.warnClearPercent;
+
+    switch (this.level) {
+      case 'critical':
+        if (criticalHold) return 'critical';
+        return warnHold ? 'warn' : 'normal';
+      case 'warn':
+        if (criticalTrip) return 'critical';
+        return warnHold ? 'warn' : 'normal';
+      case 'normal':
+      default:
+        if (criticalTrip) return 'critical';
+        return warnTrip ? 'warn' : 'normal';
+    }
+  }
+
+  private transition(next: PressureLevel, pct: number, projMin: number | null): void {
+    if (next === this.level) return;
+    const proj = projMin === null ? '' : `, projTToLimit=${round1(projMin)}min`;
+    this.log(`[watchdog] pressure ${this.level} → ${next} (commit=${round1(pct)}%${proj})`);
+    this.level = next;
+  }
+
+  private pushHistory(s: SlopeSample): void {
+    this.history.push(s);
+    const cutoff = s.t - this.cfg.slopeWindowMs;
+    while (this.history.length > 0 && this.history[0].t < cutoff) this.history.shift();
+  }
+
+  /** Least-squares slope of commit charge over the rolling window; project the
+   *  time until charge reaches the limit. null when the window is too short or
+   *  the slope is flat/negative (no imminent exhaustion). */
+  private projectMinutesToLimit(now: number, reading: CommitReading): number | null {
+    if (this.history.length < 2) return null;
+    const span = now - this.history[0].t;
+    if (span < this.cfg.slopeMinSpanMs) return null;
+
+    const n = this.history.length;
+    let sumT = 0;
+    let sumC = 0;
+    let sumTT = 0;
+    let sumTC = 0;
+    const t0 = this.history[0].t;
+    for (const s of this.history) {
+      const x = s.t - t0;
+      sumT += x;
+      sumC += s.chargeBytes;
+      sumTT += x * x;
+      sumTC += x * s.chargeBytes;
+    }
+    const denom = n * sumTT - sumT * sumT;
+    if (denom === 0) return null;
+    const slopeBytesPerMs = (n * sumTC - sumT * sumC) / denom;
+    if (slopeBytesPerMs <= 0) return null; // flat or shrinking → no projection
+
+    const headroom = reading.commitLimitBytes - reading.commitChargeBytes;
+    if (headroom <= 0) return 0;
+    return headroom / slopeBytesPerMs / 60_000;
+  }
+
+  private log(msg: string): void {
+    try {
+      (this.deps.log ?? ((m: string) => console.warn(m)))(msg);
+    } catch {
+      /* logging must never throw into the sampler */
+    }
+  }
+}
+
+function round1(n: number): number {
+  return Math.round(n * 10) / 10;
+}
+
+/** A count provider must never throw into the sampler; treat a throw as 0. */
+function safeCount(fn: () => number): number {
+  try {
+    const v = fn();
+    return Number.isFinite(v) ? v : 0;
+  } catch {
+    return 0;
+  }
+}
