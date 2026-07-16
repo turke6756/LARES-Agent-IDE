@@ -12,7 +12,7 @@
 
 <p align="center">An agent-native workspace for orchestrating AI agents across terminals, files, browsers, documents, and notebooks.</p>
 
-<p align="center"><em>Formerly AgentDashboard.</em></p>
+<p align="center"><strong>Built on terminal-agent harnesses, not provider SDKs</strong> — drop in Claude Code, Codex,<br />or any agent that speaks MCP and hooks, and put them on the same problem together.</p>
 
 <p align="center">
   <img src="docs/images/hero.png" width="900"
@@ -39,14 +39,40 @@
 
 ## What & why
 
-Lares is an agent-native workspace: it launches agentic-CLI agents into a
-workspace and keeps every one of them **visible, addressable, and
-interruptible**. The thesis is visibility-first — agents are never headless and
-never a black box. You watch each agent's live status and context budget, attach
-to its chat, inspect the tool calls it makes and the files it reads versus
-writes, and step in at any point. Code is one tool among many: the same shell
-also drives real terminals, an embedded browser, documents, and notebooks, so
-non-code work is a first-class citizen rather than an afterthought.
+**Lares is built on terminal-agent harnesses, not provider SDKs.** Agents run as
+real CLIs in real terminals, so any harness that speaks MCP and can fire hooks
+drops straight in — no vendor SDK, no integration to wait on, no lock-in. That
+neutrality is the point: it's what lets Claude Code and Codex work the same
+problem and converge on a shared answer, which has turned out to be the most
+powerful thing the app does.
+
+It exists because of three frustrations:
+
+- **My agents kept getting lost.** They were scattered across too many terminals
+  in too many VS Code windows, and finding the one that needed me meant hunting
+  through all of them. Every agent should be on one rail, status visible at a
+  glance.
+- **I wanted Claude Code and Codex to talk to each other.** I liked working with
+  both, and there was no way to put them on the same problem together.
+- **Agents stalled.** They asked too many questions and paused too often, and
+  more often than not they already knew the right next step and simply didn't
+  take it. So Lares has a supervisor whose job is to orchestrate agents and keep
+  them working — one that knows what's left in an agent's context window and
+  where you are against your usage limits.
+
+The thesis is visibility-first: agents are never headless and never a black box.
+Agents can still spawn their own native task subagents, and those stay internal
+to the harness — what's different is the top level. The supervisor launches and
+monitors **full agent harnesses from more than one provider**, reads their chat
+logs, and messages them directly. You watch each agent's live status and context
+budget, attach to its chat, inspect the tool calls it makes and the files it
+reads versus writes, and step in at any point.
+
+Code is one tool among many. The same workspace edits Markdown in a real editor
+(Milkdown) with native spellcheck, takes comments anchored to a selection in
+documents and PDFs, browses the web, and views PDFs, images, and CSVs inline —
+so drafting a document is something you do here rather than somewhere else.
+Non-code work is a first-class citizen, not an afterthought.
 
 ## Core features
 
@@ -57,17 +83,23 @@ non-code work is a first-class citizen rather than an afterthought.
   host the agents. A supervisor dispatches worker and researcher waves, and
   two providers can run a cross-provider **groupthink** deliberation
   (Claude ↔ Codex) that converges on a shared answer.
-- **Plan** — A planning surface captures structured plans with a server-witnessed
-  provenance trail of which agent actually read and edited each section.
-- **Browse** — An embedded browser with an access-policy store and an action
-  audit log lets agents navigate and act on the web while you keep a record of
-  what they did.
+- **Plan** — An HTML planning surface captures structured plans with a
+  server-witnessed provenance trail of which agent actually read and edited each
+  section.
+- **Browse** — Agents navigate real web pages in an embedded browser, and Lares
+  closes their tabs once they're finished with them. You control exactly which
+  sites an agent may visit, and can optionally hand it your signed-in session for
+  a site you choose. An action audit log keeps a record of what they did.
 - **Documents & notebooks** — Jupyter notebooks run with live outputs; Markdown
   documents (Milkdown/Crepe) carry agent-visible comments, and Word, PDF, and
   figure/GIS formats (GeoTIFF, Leaflet, KaTeX) render inline.
-- **Context & usage intelligence** — Built-in telemetry (context overhead,
-  context optimizer, skill analytics, agent knowledge) surfaces where context
-  and tokens go, over an MCP tool surface and SQLite persistence.
+- **Context & usage intelligence** — Lares is context-aware. A supervisor nearing
+  its context window hands off automatically: it writes a continuation note and
+  relaunches into a fresh session with its work intact. Supervisors are notified
+  when a worker's context runs hot, and can see where you stand against your
+  subscription's usage limits (5-hour and 7-day windows). Built-in telemetry
+  surfaces where context and tokens go — flagging MCP toolsets that were granted
+  but never used, and dead guidance lines worth cutting from `CLAUDE.md`.
 
 <table>
 <tr>
@@ -149,17 +181,26 @@ examples:
 
 ## Providers
 
-Lares has no provider SDK and no lock-in — it's built on the capabilities any
-terminal-agent harness exposes. Claude Code is the reference harness we develop
-and test against today, and Codex is wired in for cross-provider "groupthink"
-deliberation. Any equivalent terminal agent can be dropped into the terminals;
-broader harness support is a roadmap item, not a current guarantee.
+As above: no provider SDK, no lock-in. Lares only needs what a terminal-agent
+harness already exposes, which comes down to two things:
+
+- **MCP** — how agents reach the workspace. The dashboard's tools (launch and
+  message agents, read chats, read plans, drive the browser, query context and
+  usage) are served over MCP, so a harness that speaks MCP can use them.
+- **Hooks** — how the workspace sees the agent. Lares scaffolds lifecycle hooks
+  (session start, prompt submit, notification, stop) that report each agent's
+  status back to the dashboard. Hooks are what make an agent's state visible
+  rather than guessed at.
+
+A harness with both drops in and works. Claude Code is the reference we develop
+and test against, and Codex is wired in for cross-provider groupthink; those two
+are the tested surface today.
 
 | Provider | Status |
 |---|---|
 | **Claude Code** | Primary, tested. |
 | **Codex** | Used for cross-provider groupthink. |
-| **Core** | Provider-neutral by design; additional harnesses welcome / roadmap. |
+| **Core** | Provider-neutral by design; any MCP + hooks harness should work. Additional harnesses welcome. |
 
 <p align="center">
   <img src="docs/images/dark-theme.png" width="900"
@@ -193,10 +234,13 @@ threat model.
 
 ## Roadmap
 
-- Broader terminal-agent / harness support beyond the tested Claude-Code-first surface.
+- First-class, tested and documented support for more terminal-agent harnesses.
+  Any harness with MCP and hooks should already work; Claude Code and Codex are
+  simply the two we've verified.
 - Packaged, signed builds and auto-update (today: install from source).
 - macOS and Linux support (today: Windows + WSL).
-- More worked examples and workflow templates.
+- More worked examples and workflow templates, building on the ones in
+  [`examples/`](examples/) today.
 
 ## Contributing & License
 
