@@ -1,0 +1,219 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>pdf.js paint diagnostic</title></head>
+<body><canvas id="surface"></canvas><script type="module">
+const params = new URLSearchParams(location.search);
+
+let drawArgCounts = new Map([[0, 2], [1, 2], [2, 6], [3, 0]]);
+let drawPointCounts = new Map([[0, 1], [1, 1], [2, 3], [3, 0]]);
+
+function analyzePath(data) {
+  const values = data?.[0];
+  let commands = 0;
+  let points = 0;
+  if (!values?.length) return { commands, points, values: 0 };
+  for (let i = 0; i < values.length;) {
+    const drawOp = values[i++];
+    const argCount = drawArgCounts.get(drawOp);
+    if (argCount === undefined) throw new Error(`Unknown DrawOPS value ${drawOp}`);
+    commands += 1;
+    points += drawPointCounts.get(drawOp) ?? 0;
+    i += argCount;
+  }
+  return { commands, points, values: values.length };
+}
+
+function summarizeOperatorList(operatorList, OPS) {
+  const names = Object.fromEntries(Object.entries(OPS).map(([name, id]) => [id, name]));
+  const counts = {};
+  const paths = { operators: 0, commands: 0, points: 0, byPaint: {}, largest: [] };
+  const pathology = {
+    setGState: 0,
+    softMaskGStates: 0,
+    beginGroup: 0,
+    softMaskGroups: 0,
+    shadingFill: 0,
+    patternColorOps: 0,
+    paintFormXObjectBegin: 0,
+  };
+
+  for (let i = 0; i < operatorList.fnArray.length; i += 1) {
+    const id = operatorList.fnArray[i];
+    const name = names[id] ?? `op-${id}`;
+    const args = operatorList.argsArray[i];
+    counts[name] = (counts[name] ?? 0) + 1;
+    if (id === OPS.constructPath) {
+      const paint = names[args[0]] ?? `op-${args[0]}`;
+      const metrics = analyzePath(args[1]);
+      paths.operators += 1;
+      paths.commands += metrics.commands;
+      paths.points += metrics.points;
+      const bucket = paths.byPaint[paint] ??= { operators: 0, commands: 0, points: 0 };
+      bucket.operators += 1;
+      bucket.commands += metrics.commands;
+      bucket.points += metrics.points;
+      paths.largest.push({ index: i, paint, ...metrics });
+    }
+    if (id === OPS.setGState) {
+      pathology.setGState += 1;
+      const entries = Array.isArray(args?.[0]) ? args[0] : [];
+      if (entries.some((entry) => entry?.[0] === 'SMask' && entry?.[1] !== false)) {
+        pathology.softMaskGStates += 1;
+      }
+    }
+    if (id === OPS.beginGroup) {
+      pathology.beginGroup += 1;
+      if (args?.[0]?.smask) pathology.softMaskGroups += 1;
+    }
+    if (id === OPS.shadingFill) pathology.shadingFill += 1;
+    if (id === OPS.setFillColorN || id === OPS.setStrokeColorN) pathology.patternColorOps += 1;
+    if (id === OPS.paintFormXObjectBegin) pathology.paintFormXObjectBegin += 1;
+  }
+  paths.largest.sort((a, b) => b.points - a.points);
+  paths.largest = paths.largest.slice(0, 20);
+  return {
+    totalOperators: operatorList.fnArray.length,
+    counts: Object.fromEntries(Object.entries(counts).sort((a, b) => b[1] - a[1])),
+    paths,
+    pathology,
+    names,
+  };
+}
+
+function summarizeTimings(records, pathPhaseRecords, operatorList, analysis) {
+  const byOperator = {};
+  for (const { id, ms } of records) {
+    const name = analysis.names[id] ?? `op-${id}`;
+    const bucket = byOperator[name] ??= { calls: 0, ms: 0 };
+    bucket.calls += 1;
+    bucket.ms += ms;
+  }
+  for (const value of Object.values(byOperator)) value.ms = Math.round(value.ms * 10) / 10;
+  const topOperators = records
+    .map(({ id, index, ms, paintId, pathValues }) => {
+      const name = analysis.names[id] ?? `op-${id}`;
+      const isTopLevelMatch = operatorList.fnArray[index] === id;
+      const paint = paintId !== undefined
+        ? (analysis.names[paintId] ?? `op-${paintId}`)
+        : null;
+      const path = pathValues ? analyzePath([pathValues]) : null;
+      return { index, name, topLevel: isTopLevelMatch, paint, ms: Math.round(ms * 10) / 10, ...path };
+    })
+    .sort((a, b) => b.ms - a.ms)
+    .slice(0, 30);
+  return {
+    dispatchMs: Math.round(records.reduce((sum, item) => sum + item.ms, 0) * 10) / 10,
+    pathPhases: Object.fromEntries(Object.entries(pathPhaseRecords.reduce((totals, item) => {
+      totals[item.phase] = (totals[item.phase] ?? 0) + item.ms;
+      return totals;
+    }, {})).map(([phase, ms]) => [phase, Math.round(ms * 10) / 10])),
+    byOperator: Object.fromEntries(Object.entries(byOperator).sort((a, b) => b[1].ms - a[1].ms)),
+    topOperators,
+  };
+}
+
+globalThis.runPdfDiagnostic = async function runPdfDiagnostic() {
+  const moduleUrl = params.get('module');
+  const workerUrl = params.get('worker');
+  const pdfUrl = params.get('pdf');
+  const scales = params.get('scales').split(',').map(Number);
+  const documentOptions = JSON.parse(params.get('options') || '{}');
+  const skipConstructPaths = params.get('skipConstructPaths') === 'true';
+  const label = params.get('label') || 'pdfjs';
+  // pdf.js 6.1 targets browsers newer than Electron 41's Chromium and assumes
+  // Math.sumPrecise. Polyfill only in this throwaway harness so we can measure
+  // its renderer on the same engine; this is not a claim of drop-in support.
+  Math.sumPrecise ??= (values) => [...values].reduce((sum, value) => sum + value, 0);
+  const pdfjs = await import(moduleUrl);
+  if (Number.parseInt(pdfjs.version, 10) >= 6) {
+    drawArgCounts = new Map([[0, 2], [1, 2], [2, 6], [3, 4], [4, 0]]);
+    drawPointCounts = new Map([[0, 1], [1, 1], [2, 3], [3, 2], [4, 0]]);
+  }
+  pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
+  const results = [];
+  let canonicalAnalysis = null;
+
+  for (const scale of scales) {
+    const loadingStarted = performance.now();
+    const loadingTask = pdfjs.getDocument({ url: pdfUrl, ...documentOptions });
+    const pdfDocument = await loadingTask.promise;
+    const page = await pdfDocument.getPage(3);
+    const operatorStarted = performance.now();
+    const operatorList = await page.getOperatorList();
+    const operatorListMs = performance.now() - operatorStarted;
+    const analysis = summarizeOperatorList(operatorList, pdfjs.OPS);
+    canonicalAnalysis ??= analysis;
+
+    const viewport = page.getViewport({ scale });
+    const canvas = document.getElementById('surface');
+    canvas.width = Math.ceil(viewport.width);
+    canvas.height = Math.ceil(viewport.height);
+    const context = canvas.getContext('2d', { alpha: false });
+    const records = [];
+    const pathPhaseRecords = [];
+    globalThis.__pdfDiagSkipOp = skipConstructPaths
+      ? (_index, id) => id === pdfjs.OPS.constructPath
+      : null;
+    globalThis.__pdfDiagRecordPathPhase = (index, phase, ms) => pathPhaseRecords.push({ index, phase, ms });
+    globalThis.__pdfDiagBeforeOp = (_index, id, args) => id === pdfjs.OPS.constructPath ? {
+      paintId: args?.[0],
+      pathValues: args?.[1]?.[0],
+    } : null;
+    globalThis.__pdfDiagRecordOp = (index, id, ms, metadata) => records.push({
+      index,
+      id,
+      ms,
+      paintId: metadata?.paintId,
+      pathValues: metadata?.pathValues ?? null,
+    });
+
+    let maxEventLoopGapMs = 0;
+    let lastTick = performance.now();
+    const ticker = setInterval(() => {
+      const now = performance.now();
+      maxEventLoopGapMs = Math.max(maxEventLoopGapMs, now - lastTick - 10);
+      lastTick = now;
+    }, 10);
+    const paintStarted = performance.now();
+    await page.render({ canvasContext: context, viewport }).promise;
+    const paintMs = performance.now() - paintStarted;
+    // Allow the interval delayed by the final synchronous operator to run.
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    clearInterval(ticker);
+    delete globalThis.__pdfDiagSkipOp;
+    delete globalThis.__pdfDiagRecordPathPhase;
+    delete globalThis.__pdfDiagBeforeOp;
+    delete globalThis.__pdfDiagRecordOp;
+
+    const timings = summarizeTimings(records, pathPhaseRecords, operatorList, analysis);
+    results.push({
+      scale,
+      width: canvas.width,
+      height: canvas.height,
+      pixels: canvas.width * canvas.height,
+      loadingAndPageMs: Math.round((operatorStarted - loadingStarted) * 10) / 10,
+      operatorListMs: Math.round(operatorListMs * 10) / 10,
+      paintMs: Math.round(paintMs * 10) / 10,
+      maxEventLoopGapMs: Math.round(maxEventLoopGapMs * 10) / 10,
+      ...timings,
+    });
+    if (typeof pdfDocument.destroy === 'function') await pdfDocument.destroy();
+    else if (typeof loadingTask.destroy === 'function') await loadingTask.destroy();
+    canvas.width = canvas.height = 1;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return {
+    label,
+    pdfjsVersion: pdfjs.version,
+    userAgent: navigator.userAgent,
+    capabilities: {
+      offscreenCanvasGlobal: typeof OffscreenCanvas !== 'undefined',
+      workerGlobal: typeof Worker !== 'undefined',
+    },
+    documentOptions,
+    skipConstructPaths,
+    analysis: canonicalAnalysis,
+    renders: results,
+  };
+};
+</script></body></html>

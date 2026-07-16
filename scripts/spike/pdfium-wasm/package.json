@@ -1,0 +1,13 @@
+{
+  "name": "pdfium-wasm-spike",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Throwaway Phase 0 spike: PDFium-WASM raster candidate (Candidate A). Isolated deps so the shared root package.json/lock is never touched.",
+  "type": "module",
+  "dependencies": {
+    "@hyzyla/pdfium": "2.1.13"
+  },
+  "devDependencies": {
+    "vite": "^7.3.1"
+  }
+}
