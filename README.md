@@ -10,6 +10,11 @@
 
 <p align="center"><em>Formerly AgentDashboard.</em></p>
 
+<p align="center">
+  <img src="docs/images/hero.png" width="900"
+       alt="The Lares dashboard: a rail of live agent cards showing each agent's status and context budget, with one agent's chat attached in the right-hand pane." />
+</p>
+
 ---
 
 ## Status
@@ -60,7 +65,28 @@ non-code work is a first-class citizen rather than an afterthought.
   context optimizer, skill analytics, agent knowledge) surfaces where context
   and tokens go, over an MCP tool surface and SQLite persistence.
 
-<!-- DEMO: wired post-capture per D8 -->
+<table>
+<tr>
+<td width="50%" valign="top">
+<a href="docs/images/terminal-attach.png"><img src="docs/images/terminal-attach.png" alt="An agent's raw terminal opened beneath the agent cards, showing its live tmux session." /></a>
+<sub><strong>Attach a terminal.</strong> Double-click any agent card to drop into the real terminal it runs in.</sub>
+</td>
+<td width="50%" valign="top">
+<a href="docs/images/agent-outputs.png"><img src="docs/images/agent-outputs.png" alt="The Outputs pane listing files an agent created and modified, each with a full path and timestamp." /></a>
+<sub><strong>See what it touched.</strong> The Outputs pane lists every file each agent created and modified.</sub>
+</td>
+</tr>
+<tr>
+<td width="50%" valign="top">
+<a href="docs/images/planning-surface.png"><img src="docs/images/planning-surface.png" alt="The planning surface rendering a structured plan document alongside an agent's chat." /></a>
+<sub><strong>Plan in the open.</strong> Plans render as documents, with a provenance trail of which agent read and edited each section.</sub>
+</td>
+<td width="50%" valign="top">
+<a href="docs/images/markdown-editing.png"><img src="docs/images/markdown-editing.png" alt="A Markdown document in edit mode with an inline comment box open, addressed to an agent." /></a>
+<sub><strong>Comment for agents.</strong> Edit Markdown inline and leave comments your agents can read.</sub>
+</td>
+</tr>
+</table>
 
 ## Quick start
 
@@ -131,6 +157,13 @@ broader harness support is a roadmap item, not a current guarantee.
 | **Codex** | Used for cross-provider groupthink. |
 | **Core** | Provider-neutral by design; additional harnesses welcome / roadmap. |
 
+<p align="center">
+  <img src="docs/images/dark-theme.png" width="900"
+       alt="Dark theme: a cross-provider groupthink in progress, with a Claude synthesizer card and a Codex planner card deliberating side by side." />
+</p>
+
+<p align="center"><sub>A cross-provider groupthink mid-flight — a Claude synthesizer and a Codex planner deliberating side by side (dark theme).</sub></p>
+
 ## Architecture & Security
 
 **Architecture.** Lares is an Electron + React desktop app. The main process runs
@@ -146,6 +179,13 @@ path confinement, an untrusted-inbox convention for research); others do not yet
 (terminal commands are not sandboxed or gated). Read [SECURITY.md](SECURITY.md)
 before running it, and see [docs/security.md](docs/security.md) for the longer
 threat model.
+
+<p align="center">
+  <img src="docs/images/browser-allowlist.png" width="900"
+       alt="The embedded browser with the agent allowlist panel open, listing the origins agents may visit and per-origin toggles for whether agents may use a signed-in session." />
+</p>
+
+<p align="center"><sub>The embedded browser's agent allowlist: the only origins agents may drive in a workspace, and whether each may use your signed-in session.</sub></p>
 
 ## Roadmap
 
