@@ -1,4 +1,8 @@
 <p align="center">
+  <img src="assets/brand/agent-workspace-icon-animated.svg" alt="Lares icon — an animated agent workspace mark" width="150" />
+</p>
+
+<p align="center">
   <img src="assets/brand/lares-lockup.svg" alt="Lares" width="360" />
 </p>
 
