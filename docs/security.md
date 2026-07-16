@@ -52,6 +52,38 @@ incomplete:
 - **The visibility surface itself.** Attaching to an agent's chat, inspecting its
   files-read-versus-written, and reading the action audit are your primary
   defenses: you can *see* what an agent is doing and stop it.
+- **PDF viewer navigation + document policy.** The PDF viewer surface loads only
+  the exact confined `media://file/<encoded>` URL Lares constructed; any other
+  `media://` path and every `file:`/`javascript:`/`data:`/`blob:`/`chrome:`/
+  `chrome-extension:`/`about:` navigation is denied, popups are denied, and an
+  external `http(s)` link is routed through the existing browser navigation
+  policy only after an explicit user gesture — never via unrestricted
+  `shell.openExternal`. These decisions are pure and tested in
+  `src/main/pdf/pdf-security.ts` (`pdf-security.test.ts`).
+
+## PDF rendering — added native-parser attack surface
+
+The fast PDF viewer renders pages with **PDFium** (compiled to WASM), pinned as
+`@hyzyla/pdfium@2.1.13` (MIT wrapper over the BSD-3-Clause PDFium core; recorded
+in `PDFIUM_ARTIFACT` in `src/main/pdf/pdf-security.ts`). A native document parser
+processing untrusted PDF bytes is a **real, non-trivial attack surface** —
+malformed files have historically triggered memory-safety bugs in PDF engines.
+
+This is **mitigated, not eliminated**, by:
+
+- running the parser in the **sandboxed renderer/worker** with **no Node access**;
+- sourcing bytes only through the **confined `media://` transport** (realpath
+  workspace confinement, `src/main/media-protocol.ts`);
+- a **document-byte ceiling** (512 MiB) plus malformed-size rejection that bound
+  denial-of-service pressure before bytes reach the parser
+  (`isDocumentSizeAllowed` / `assertPdfDocumentSize`, and `pdf-bytes.ts`);
+- **pinned-artifact supply-chain hygiene**: the dependency version, licenses,
+  source, and a checksum field are recorded so the exact WASM bytes are
+  auditable and upgrades are visible. The checksum is a placeholder until the
+  artifact is vendored and pinned — the loader must verify real bytes against it.
+
+Treat an opened PDF like any other untrusted input: the sandbox contains a parser
+crash, but a determined exploit against PDFium itself is not fully prevented.
 
 ## Boundaries that do NOT exist yet
 
