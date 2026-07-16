@@ -1,0 +1,7 @@
+{
+  "_note": "BYTE offsets (lines 1-2 contain multi-byte —,…,→ so byte≠char). Newlines at bytes 692,1452,2199; each *End is the byte AFTER a \\n.",
+  "firstLineEnd": 693,
+  "midOfSecondLine": 1065,
+  "secondLineEnd": 1453,
+  "totalBytes": 2200
+}
