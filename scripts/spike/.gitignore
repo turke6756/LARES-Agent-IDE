@@ -1,0 +1,11 @@
+# Throwaway Phase 0 spike output — never committed. Owns its own ignore so the
+# shared root .gitignore (dirty from other workstreams) is left untouched.
+**/node_modules/
+**/dist/
+**/results/
+*.log
+package-lock.json
+
+# Chromium user-data dirs created by the spike runners. These hold Local Storage,
+# network state, and an os_crypt key — machine-bound browser state, never source.
+**/.profile/

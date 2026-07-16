@@ -19,8 +19,9 @@ release/
 # Raw pressure-test dumps — kept locally, not shipped to the public repo.
 experiments/
 
-# Local-only working plans
-plans/
+# Local-only working plans (repo-root dir only — anchored so it does NOT also
+# ignore source under src/main/plans/, which is real committable code).
+/plans/
 
 # Automated backup files
 *.bak.*
@@ -39,6 +40,8 @@ plans/
 /.dashboard/*/memory/
 /.dashboard/cdp-trace.*.jsonl
 /.dashboard/staging/
+/.dashboard/*/staging/
+/.dashboard/*/plan-surface-eval-handoff.md
 /.dashboard/*/.claude/settings.local.json
 
 # >>> agentdashboard-research-store >>>
@@ -53,3 +56,13 @@ plans/
 # must never be committed. The app regenerates it locally on each machine.
 .mcp.json
 **/.mcp.json
+
+# Machine-local launchers — these hardcode an absolute developer path, so they
+# are useless to anyone else cloning the repo. Keep your own copy locally.
+/AgentDashboard.bat
+/launch.vbs
+
+# Local scratch — throwaway files from spikes and manual pokes.
+/hello.py
+/proposed
+/spike-hello-world.md
