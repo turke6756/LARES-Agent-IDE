@@ -179,6 +179,16 @@ examples:
 - [notebook-cleanup](examples/notebook-cleanup/) — repair and validate a notebook.
 - [code-review](examples/code-review/) — a multi-agent review pass.
 
+Cross-provider groupthink also ships as a real orchestration script.
+[`scripts/groupthink-v1.js`](scripts/groupthink-v1.js) drives an entire two-agent
+deliberation through the dashboard's local HTTP API — launching the lead and the
+reviewer, relaying messages between them with framing prose, gating each turn on
+the other agent being ready, and polling the run to completion. It drives a
+running Lares instance rather than working standalone, and it doubles as a
+reference for writing your own orchestration scripts. The same loop now also runs
+in-process behind the `run_orchestration` MCP tool, which is the path new work
+should take.
+
 ## Providers
 
 As above: no provider SDK, no lock-in. Lares only needs what a terminal-agent
@@ -239,8 +249,9 @@ threat model.
   simply the two we've verified.
 - Packaged, signed builds and auto-update (today: install from source).
 - macOS and Linux support (today: Windows + WSL).
-- More worked examples and workflow templates, building on the ones in
-  [`examples/`](examples/) today.
+- More worked examples and workflow templates, building on
+  [`examples/`](examples/) and the scripted orchestration in
+  [`scripts/groupthink-v1.js`](scripts/groupthink-v1.js) today.
 
 ## Contributing & License
 
