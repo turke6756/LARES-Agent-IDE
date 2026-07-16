@@ -1,7 +1,12 @@
 import { create } from 'zustand';
-import type { Agent, AgentStatus, Workspace, HealthCheck, FileActivity, QueryResult, ContextStats, UsageLimitsReading, PathType, FileTab, PanelLayout, Team, TeamMessage, CreateTeamInput, DetachedClosedPayload } from '../../shared/types';
+import type { Agent, AgentStatus, Workspace, HealthCheck, FileActivity, QueryResult, ContextStats, UsageLimitsReading, PathType, FileTab, PanelLayout, Team, TeamMessage, CreateTeamInput, DetachedClosedPayload, DetachableView } from '../../shared/types';
 import { evictTabCache, recordRecentWrite } from '../components/fileviewer/useFileContentCache';
 import { clearDraft } from '../lib/chat-drafts';
+import {
+  nextTransferSet,
+  reconcileTransferSet,
+  type TransferStatusSignal,
+} from '../components/agent/continuation-transfer';
 
 interface WorkspaceHeat {
   activeCount: number;
@@ -14,10 +19,22 @@ interface AgentStatusSnapshot {
   status: AgentStatus;
 }
 
+// WP4 — a transient request to scroll/highlight a source span when a tab opens or
+// re-activates. Pure renderer UI state (like `color`, below): it never crosses the
+// IPC boundary, so it lives on the renderer extension, not the shared FileTab.
+// `nonce` makes a repeat click on an already-open tab re-fire the scroll effect.
+export interface TabFocusRange {
+  lineStart: number;
+  lineEnd: number;
+  mode?: 'source';
+  reason?: string;
+  nonce: number;
+}
+
 // Renderer-side extension of FileTab: `color` is an optional per-tab visual
 // marker chosen from the tab context menu. The shared FileTab type stays
 // untouched because color never crosses the IPC boundary.
-export type ColoredFileTab = FileTab & { color?: string };
+export type ColoredFileTab = FileTab & { color?: string; focusRange?: TabFocusRange };
 
 const DEFAULT_LAYOUT: PanelLayout = {
   sidebarWidth: 256,
@@ -91,6 +108,20 @@ interface TabEditState {
   reloadVersion?: number;
 }
 
+// Per-workspace snapshot of "what the user was looking at" (view-state
+// persistence). Captured on leaving a workspace and restored on return, so a
+// workspace comes back exactly as it was left — attached agent chat, terminal,
+// open file/browser view, and detail pane — instead of resetting to the
+// dashboard grid. In-memory only; not persisted across app restarts.
+interface WorkspaceViewState {
+  selectedAgentId: string | null;
+  terminalAgentId: string | null;
+  activeTabId: string | null;
+  fileViewerOpen: boolean;
+  browserOpen: boolean;
+  detailPane: 0 | 1 | 2;
+}
+
 interface DashboardState {
   workspaces: Workspace[];
   agents: Agent[];
@@ -98,6 +129,9 @@ interface DashboardState {
   selectedAgentId: string | null;
   terminalAgentId: string | null;
   terminalPinned: boolean;
+  // Per-workspace view-state snapshots (keyed by workspace id). See
+  // WorkspaceViewState + selectWorkspace for the snapshot/restore contract.
+  workspaceViewState: Record<string, WorkspaceViewState>;
   health: HealthCheck | null;
   healthChecking: boolean;
   loading: boolean;
@@ -119,6 +153,12 @@ interface DashboardState {
   // container pulse so the border keeps animating through the idle gaps
   // between deliberation turns, not just on per-agent status flips.
   deliberatingSupervisorIds: string[];
+  // Agent ids currently mid context-brick continuation transfer — the gold
+  // "snake" border. Set on a 'restarting'+continuation status event, cleared on
+  // that agent's next status change (successor launches/works, or crashes on a
+  // failed swap), and reconciled against full agent-list refreshes so a dropped
+  // end-event can't strand the border (see continuation-transfer.ts).
+  continuationTransferIds: Set<string>;
 
   // Teams
   teams: Team[];
@@ -128,6 +168,7 @@ interface DashboardState {
   panelLayout: PanelLayout;
   setPanelSize: (key: keyof PanelLayout, value: number) => void;
   togglePanelCollapsed: (key: keyof PanelLayout) => void;
+  toggleSidePanels: () => void;
   resetLayout: () => void;
 
   // Tabbed file viewer
@@ -164,6 +205,7 @@ interface DashboardState {
   updateContextStats: (stats: ContextStats) => void;
   updateUsageLimits: (reading: UsageLimitsReading) => void;
   setDeliberatingSupervisorIds: (ids: string[]) => void;
+  applyTransferSignal: (sig: TransferStatusSignal) => void;
   forkAgent: (id: string) => Promise<Agent | null>;
   queryAgent: (targetAgentId: string, question: string, sourceAgentId?: string) => Promise<QueryResult | null>;
 
@@ -176,9 +218,10 @@ interface DashboardState {
   addTeamMessage: (message: TeamMessage) => void;
 
   // Tab actions
-  openTab: (filePath: string, rootDirectory: string, pathType: PathType, agentId?: string, workspaceId?: string) => void;
+  openTab: (filePath: string, rootDirectory: string, pathType: PathType, agentId?: string, workspaceId?: string, focusRange?: TabFocusRange) => void;
   openDirectoryTab: (rootDirectory: string, pathType: PathType, workspaceId?: string) => void;
-  openToolTab: (toolId: string, label: string, workspaceId?: string) => void;
+  openToolTab: (toolId: string, label: string, opts?: { workspaceId?: string; params?: Record<string, string> }) => void;
+  openPlanTab: (planId: string, label: string, workspaceId?: string) => void;
   closeTab: (tabId: string) => void;
   // Detachable file tabs (detachable-file-tabs-plan §4 1.7).
   detachTab: (tabId: string) => void;
@@ -208,6 +251,14 @@ interface DashboardState {
   hideBrowser: () => void;
   showDashboard: () => void;
 
+  // Detachable (tear-off) top-level views. `detachedViews` holds the views
+  // currently torn off into their own OS windows; their toolbar buttons render
+  // as hollowed-out ghosts and are non-activatable until the external window
+  // closes. Mirrors the file-tab detach registry (main owns the windows).
+  detachedViews: DetachableView[];
+  markViewDetached: (view: DetachableView) => void;
+  undetachView: (view: DetachableView) => void;
+
   // Backward-compat shims
   openFileViewer: (filePath: string, agentId: string) => void;
   closeFileViewer: () => void;
@@ -220,6 +271,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
   selectedAgentId: null,
   terminalAgentId: null,
   terminalPinned: false,
+  workspaceViewState: {},
   health: null,
   healthChecking: false,
   loading: false,
@@ -230,6 +282,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
   contextStats: {},
   usageLimits: null,
   deliberatingSupervisorIds: [],
+  continuationTransferIds: new Set(),
   teams: [],
   teamMessages: {},
 
@@ -252,6 +305,21 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
     });
   },
 
+  toggleSidePanels: () => {
+    set((state) => {
+      const collapsed = !(
+        state.panelLayout.sidebarCollapsed && state.panelLayout.detailPanelCollapsed
+      );
+      const layout = {
+        ...state.panelLayout,
+        sidebarCollapsed: collapsed,
+        detailPanelCollapsed: collapsed,
+      };
+      saveLayout(layout);
+      return { panelLayout: layout };
+    });
+  },
+
   resetLayout: () => {
     const layout = { ...DEFAULT_LAYOUT };
     saveLayout(layout);
@@ -265,7 +333,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
   browserOpen: false,
   tabEditState: {},
 
-  openTab: (filePath, rootDirectory, pathType, agentId?, workspaceId?) => {
+  openTab: (filePath, rootDirectory, pathType, agentId?, workspaceId?, focusRange?) => {
     const { openTabs, selectedWorkspaceId } = get();
     const ws = workspaceId ?? selectedWorkspaceId ?? undefined;
     // Check if tab already exists for this file+root combo
@@ -273,7 +341,18 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
       (t) => t.filePath === filePath && t.rootDirectory === rootDirectory
     );
     if (existing) {
-      set({ activeTabId: existing.id });
+      // WP4: a repeat click carrying a fresh focusRange re-scrolls/re-highlights the
+      // already-open tab (nonce forces the CodeMirror effect to re-run).
+      if (focusRange) {
+        set((state) => ({
+          activeTabId: existing.id,
+          fileViewerOpen: true,
+          browserOpen: false,
+          openTabs: state.openTabs.map((t) => (t.id === existing.id ? { ...t, focusRange } : t)),
+        }));
+      } else {
+        set({ activeTabId: existing.id });
+      }
       return;
     }
 
@@ -281,7 +360,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
     const segments = normalized.split('/').filter(Boolean);
     const label = segments[segments.length - 1] || filePath;
 
-    const tab: FileTab = {
+    const tab: ColoredFileTab = {
       id: nextTabId(),
       filePath,
       rootDirectory,
@@ -289,6 +368,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
       agentId,
       workspaceId: ws,
       label,
+      focusRange,
     };
     set((state) => ({
       openTabs: [...state.openTabs, tab],
@@ -331,14 +411,22 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
   },
 
   // A non-file "tool" tab (e.g. the Context-Overhead Analyzer) living inside the
-  // Files view. One per (workspace, toolId): re-focuses if already open. Empty
-  // filePath/rootDirectory so the file header + directory tree never render
-  // (FileViewerPanel gates on kind==='tool').
-  openToolTab: (toolId, label, workspaceId?) => {
+  // Files view. Deduped by (workspace, toolId, params): re-focuses if already
+  // open. `params` (base plan §3.5) lets per-agent tools open one tab per agent
+  // instead of collapsing into a single shared tab. Empty filePath/rootDirectory
+  // so the file header + directory tree never render (FileViewerPanel gates on
+  // kind==='tool').
+  openToolTab: (toolId, label, opts) => {
     const { openTabs, selectedWorkspaceId } = get();
-    const ws = workspaceId ?? selectedWorkspaceId ?? undefined;
+    const ws = opts?.workspaceId ?? selectedWorkspaceId ?? undefined;
+    const params = opts?.params;
+    const paramsKey = JSON.stringify(params ?? {});
     const existing = openTabs.find(
-      (t) => t.kind === 'tool' && t.toolId === toolId && t.workspaceId === ws,
+      (t) =>
+        t.kind === 'tool' &&
+        t.toolId === toolId &&
+        t.workspaceId === ws &&
+        JSON.stringify(t.params ?? {}) === paramsKey,
     );
     if (existing) {
       set({ activeTabId: existing.id, fileViewerOpen: true, browserOpen: false });
@@ -353,6 +441,43 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
       label,
       kind: 'tool',
       toolId,
+      ...(params ? { params } : {}),
+    };
+    set((state) => ({
+      openTabs: [...state.openTabs, tab],
+      activeTabId: tab.id,
+      fileViewerOpen: true,
+      browserOpen: false,
+    }));
+  },
+
+  // A plan surface tab (kind==='plan'). Like tool tabs it owns its full content
+  // region — empty filePath/rootDirectory so no file header/tree renders — but
+  // is deduped by (workspace, planId) so opening the same plan re-focuses its
+  // existing tab. The content is a sandboxed WebContentsView driven by the main
+  // process; PlanSurfaceContainer streams the pane bounds and the provenance rail.
+  openPlanTab: (planId, label, workspaceId) => {
+    // A detached Plans view owns the single plan pane (main-process WebContentsView).
+    // Opening a plan tab in the main window would fight the detached window over
+    // that one pane, so it's inert here until the detached window closes — mirrors
+    // showFileViewer's detach guard.
+    if (get().detachedViews.includes('plans')) return;
+    const { openTabs, selectedWorkspaceId } = get();
+    const ws = workspaceId ?? selectedWorkspaceId ?? undefined;
+    const existing = openTabs.find((t) => t.kind === 'plan' && t.planId === planId && t.workspaceId === ws);
+    if (existing) {
+      set({ activeTabId: existing.id, fileViewerOpen: true, browserOpen: false });
+      return;
+    }
+    const tab: FileTab = {
+      id: nextTabId(),
+      filePath: '',
+      rootDirectory: '',
+      pathType: 'windows',
+      workspaceId: ws,
+      label,
+      kind: 'plan',
+      planId,
     };
     set((state) => ({
       openTabs: [...state.openTabs, tab],
@@ -820,6 +945,9 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
 
   // Show file viewer — restore existing tabs for the current workspace, or open its directory
   showFileViewer: () => {
+    // A detached Files view is non-activatable in the main window (view-detach
+    // §5) — no-op so the ghost button + swipe gesture stay inert.
+    if (get().detachedViews.includes('files')) return;
     const { openTabs, activeTabId, selectedWorkspaceId, workspaces } = get();
     const wsTabs = openTabs.filter((t) => t.workspaceId === selectedWorkspaceId);
     if (wsTabs.length > 0) {
@@ -851,7 +979,23 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
   hideBrowser: () => set({ browserOpen: false }),
 
   // Return to the agent-card grid (WP-NAV). Tabs survive — only the view resets.
-  showDashboard: () => set({ fileViewerOpen: false, browserOpen: false }),
+  // A detached Dashboard cannot be reactivated in the main window — no-op so the
+  // ghost button stays inert (MainContent renders a placeholder instead).
+  showDashboard: () => {
+    if (get().detachedViews.includes('dashboard')) return;
+    set({ fileViewerOpen: false, browserOpen: false });
+  },
+
+  // Detachable views registry (renderer mirror of main's view-window registry).
+  detachedViews: [],
+  markViewDetached: (view) =>
+    set((state) =>
+      state.detachedViews.includes(view)
+        ? state
+        : { detachedViews: [...state.detachedViews, view] },
+    ),
+  undetachView: (view) =>
+    set((state) => ({ detachedViews: state.detachedViews.filter((v) => v !== view) })),
 
   // Backward-compat shim: openFileViewer calls openTab
   openFileViewer: (filePath, agentId) => {
@@ -859,7 +1003,15 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
     if (!agent) return;
     const workspace = get().workspaces.find((w) => w.id === agent.workspaceId);
     const pathType = workspace?.pathType || 'wsl';
-    get().openTab(resolveAgainstRoot(filePath, agent.workingDirectory), agent.workingDirectory, pathType, agentId, agent.workspaceId);
+    // Paths mentioned in chat are normally workspace-relative (for example
+    // `plans/foo.md` or `src/main/index.ts`). Supervisors and managed workers
+    // run from scaffold directories under `.dashboard`, so resolving those
+    // references against the agent cwd incorrectly produces paths such as
+    // `.dashboard/supervisor/plans/foo.md`. Use the workspace root when it is
+    // available; retain the agent cwd as a compatibility fallback for agents
+    // whose workspace record has not hydrated yet.
+    const rootDirectory = workspace?.path || agent.workingDirectory;
+    get().openTab(resolveAgainstRoot(filePath, rootDirectory), rootDirectory, pathType, agentId, agent.workspaceId);
   },
 
   closeFileViewer: () => get().closeAllTabs(),
@@ -912,7 +1064,12 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
         if (snap.workspaceId !== workspaceId) next[id] = snap;
       }
       for (const a of agents) next[a.id] = { workspaceId: a.workspaceId, status: a.status };
-      return { agents, agentStatuses: next };
+      // Missed-event safety: drop the gold transfer flag from any agent this
+      // refresh shows is no longer 'restarting' (or has vanished).
+      const transfers = reconcileTransferSet(state.continuationTransferIds, agents);
+      return transfers === state.continuationTransferIds
+        ? { agents, agentStatuses: next }
+        : { agents, agentStatuses: next, continuationTransferIds: transfers };
     });
     get().updateWorkspaceHeat();
   },
@@ -920,30 +1077,127 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
   loadAllAgents: async () => {
     // All-workspaces view: same as loadAgents — supervisors are real cards now.
     const agents = await window.api.agents.listAll();
-    set({ agents });
+    set((state) => {
+      const transfers = reconcileTransferSet(state.continuationTransferIds, agents);
+      return transfers === state.continuationTransferIds
+        ? { agents }
+        : { agents, continuationTransferIds: transfers };
+    });
     get().updateWorkspaceHeat();
   },
 
+  // Switch workspaces with per-workspace view-state persistence: snapshot the
+  // OUTGOING workspace's view (attached agent chat, terminal, open file/browser
+  // view, active tab, detail pane) then restore the INCOMING workspace's
+  // snapshot — so a workspace comes back exactly as it was left. A never-before-
+  // visited workspace falls back to the dashboard grid (today's defaults). The
+  // remembered agent is restored optimistically and reconciled once loadAgents
+  // returns (it may have been stopped/removed while the user was away).
   selectWorkspace: (id) => {
-    const { openTabs, activeTabId, terminalPinned } = get();
-    // Re-point the file viewer's active tab at something that belongs to the new workspace.
-    // Without this, activeTabId can stay on a tab from the previous workspace, so the tree
-    // root is wrong and visibleTabs filters out the current workspace's tabs.
-    const activeBelongs = openTabs.find((t) => t.id === activeTabId)?.workspaceId === id;
-    const nextActiveTabId = activeBelongs
-      ? activeTabId
-      : openTabs.find((t) => t.workspaceId === id)?.id ?? null;
-    // Entering a workspace always lands on the dashboard view (WP-NAV); tabs are
-    // preserved so the Files button restores them.
+    const state = get();
+    const outgoing = state.selectedWorkspaceId;
+    const { openTabs, terminalPinned } = state;
 
-    if (!terminalPinned) {
-      set({ selectedWorkspaceId: id, selectedAgentId: null, terminalAgentId: null, activeTabId: nextActiveTabId, fileViewerOpen: false, browserOpen: false });
-    } else {
-      set({ selectedWorkspaceId: id, selectedAgentId: null, activeTabId: nextActiveTabId, fileViewerOpen: false, browserOpen: false });
+    // Re-selecting the current workspace is a no-op for the view — just refresh
+    // its agents/teams. (Snapshotting-then-restoring here would round-trip the
+    // live view through a stale snapshot.)
+    if (id === outgoing) {
+      if (id) {
+        get().loadAgents(id);
+        get().loadTeams(id);
+      }
+      return;
     }
+
+    // 1. Snapshot what the user was looking at in the outgoing workspace.
+    const workspaceViewState = { ...state.workspaceViewState };
+    if (outgoing) {
+      workspaceViewState[outgoing] = {
+        selectedAgentId: state.selectedAgentId,
+        terminalAgentId: state.terminalAgentId,
+        activeTabId: state.activeTabId,
+        fileViewerOpen: state.fileViewerOpen,
+        browserOpen: state.browserOpen,
+        detailPane: state.detailPane,
+      };
+    }
+
+    // 2. Compute the incoming view — restore the snapshot if we have one, else
+    // fall back to the dashboard grid.
+    const snap = id ? workspaceViewState[id] : undefined;
+    // Re-point the file viewer's active tab at something that belongs to the new
+    // workspace, so the tree root is right and visibleTabs isn't filtered empty.
+    const fallbackTabId = openTabs.find((t) => t.workspaceId === id)?.id ?? null;
+
+    let nextSelectedAgentId: string | null;
+    let nextTerminalAgentId: string | null;
+    let nextActiveTabId: string | null;
+    let nextFileViewerOpen: boolean;
+    let nextBrowserOpen: boolean;
+    let nextDetailPane: 0 | 1 | 2;
+
+    if (snap) {
+      nextSelectedAgentId = snap.selectedAgentId;
+      nextTerminalAgentId = snap.terminalAgentId;
+      nextFileViewerOpen = snap.fileViewerOpen;
+      nextBrowserOpen = snap.browserOpen;
+      nextDetailPane = snap.detailPane;
+      // The remembered tab may have been closed while away; validate it still
+      // exists and belongs to this workspace, else re-point to any of its tabs.
+      const tabOk = openTabs.some((t) => t.id === snap.activeTabId && t.workspaceId === id);
+      nextActiveTabId = tabOk ? snap.activeTabId : fallbackTabId;
+    } else {
+      // Fresh workspace: land on the dashboard grid.
+      nextSelectedAgentId = null;
+      nextTerminalAgentId = null;
+      nextFileViewerOpen = false;
+      nextBrowserOpen = false;
+      nextDetailPane = state.detailPane;
+      nextActiveTabId = fallbackTabId;
+    }
+
+    // A pinned terminal stays attached across workspace switches regardless of
+    // either workspace's snapshot — that's the whole point of pinning.
+    if (terminalPinned) {
+      nextTerminalAgentId = state.terminalAgentId;
+    }
+
+    set({
+      selectedWorkspaceId: id,
+      selectedAgentId: nextSelectedAgentId,
+      terminalAgentId: nextTerminalAgentId,
+      activeTabId: nextActiveTabId,
+      fileViewerOpen: nextFileViewerOpen,
+      browserOpen: nextBrowserOpen,
+      detailPane: nextDetailPane,
+      workspaceViewState,
+    });
+
     if (id) {
-      get().loadAgents(id);
-      get().loadTeams(id);
+      const targetId = id;
+      // loadAgents refreshes `agents` async; once it returns, drop any restored
+      // selection/terminal whose agent no longer exists (stopped/removed while
+      // away). Guard on the workspace still being current so a fast A→B→A switch
+      // doesn't let a stale reconcile clobber the newer view.
+      get()
+        .loadAgents(targetId)
+        .then(() => {
+          if (get().selectedWorkspaceId !== targetId) return;
+          const cur = get();
+          const patch: Partial<DashboardState> = {};
+          if (cur.selectedAgentId && !cur.agents.some((a) => a.id === cur.selectedAgentId)) {
+            patch.selectedAgentId = null;
+          }
+          if (
+            !cur.terminalPinned &&
+            cur.terminalAgentId &&
+            !cur.agents.some((a) => a.id === cur.terminalAgentId)
+          ) {
+            patch.terminalAgentId = null;
+          }
+          if (Object.keys(patch).length > 0) set(patch);
+        });
+      get().loadTeams(targetId);
     }
   },
 
@@ -1075,6 +1329,16 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
         return {};
       }
       return { deliberatingSupervisorIds: ids };
+    });
+  },
+
+  // Fold one statusChanged signal into the continuation-transfer set (gold
+  // border). The reducer returns the same Set reference on a no-op so we skip
+  // the state write — only cards whose `.has(id)` boolean flips re-render.
+  applyTransferSignal: (sig: TransferStatusSignal) => {
+    set((state) => {
+      const next = nextTransferSet(state.continuationTransferIds, sig);
+      return next === state.continuationTransferIds ? {} : { continuationTransferIds: next };
     });
   },
 

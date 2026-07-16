@@ -125,6 +125,22 @@ export function archiveStalePlan(planPath: string, runId: string): string | null
   }
 }
 
+// --- WP6: done-detection (whole-file existsSync → section-anchor changed) ---
+// The legacy deliverable is a fresh plan FILE appearing at planPath; a
+// planning-surface run instead edits ONE section of an EXISTING surface (the
+// file was written up front by create_plan), so existsSync(planPath) is already
+// true at turn 1 and would complete the run with zero deliberation. For a
+// rail-carrying run we ask the DB (via the client's plan_section_changes lookup,
+// WP4) whether the dispatched section's byte-exact content hash has moved since
+// the run started; rail-less runs keep the exact fresh-file semantics.
+function planDeliverableReady(client: DashboardClient, ctx: OrchestrationRunContext): boolean {
+  const { run } = ctx;
+  if (run.planId && run.sectionAnchor) {
+    return client.sectionChangedSince(run.planId, run.sectionAnchor, run.startedAt);
+  }
+  return fs.existsSync(run.planPath);
+}
+
 // --- Idle / ready helpers (groupthink-v2.js:170–201) ---
 
 /** Triple-confirm idle/waiting loop — guards against a status that flickers
@@ -295,16 +311,21 @@ async function waitTurnComplete(
   }
 }
 
-/** T4 §2: poll planPath for a bounded grace window after the synthesizer's R3
- *  turn-complete. The Write tool-call flush trails the turn-complete chat event
- *  by a sub-second window, so an immediate existsSync check throws a false
- *  no_plan_written stall while the deliverable lands moments later. Returns true
- *  as soon as the file appears; false once the grace deadline passes. Abort stays
- *  responsive via per-poll checkAborted. */
-async function waitForPlanFile(ctx: OrchestrationRunContext, planPath: string, graceMs: number): Promise<boolean> {
+/** T4 §2: poll for the deliverable over a bounded grace window after the
+ *  synthesizer's R3 turn-complete. The write flush (native Edit or fresh-file
+ *  Write) trails the turn-complete chat event by a sub-second window, so an
+ *  immediate check throws a false no_plan_written stall while the deliverable
+ *  lands moments later. Returns true as soon as the deliverable is observed
+ *  (WP6: a fresh file for legacy runs, OR the dispatched section's content-hash
+ *  change for a plan-rail run — the change row lands only after the watcher
+ *  reparses, so this grace window also spans that async gap); false once the
+ *  grace deadline passes. Abort stays responsive via per-poll checkAborted. */
+async function waitForDeliverable(
+  client: DashboardClient, ctx: OrchestrationRunContext, graceMs: number,
+): Promise<boolean> {
   const deadline = Date.now() + graceMs;
   for (;;) {
-    if (fs.existsSync(planPath)) return true;
+    if (planDeliverableReady(client, ctx)) return true;
     if (Date.now() >= deadline) return false;
     checkAborted(ctx);
     await sleep(POLL_INTERVAL_MS);
@@ -449,6 +470,14 @@ async function launchAgentWithKickoff(
     freshSession: true,
     isSupervised: true,
     ownerAgentId: opts.ownerAgentId,
+    // WP6 planning-surface rail: stamp the run's plan_id/section onto EVERY
+    // launched member (lead, reviewer, both parallel planners). The supervisor
+    // launch rail (WP1) injects these into AGENT_DASHBOARD_PLAN_ID /
+    // _PLAN_SECTION at BOTH env sites (native extraEnv + WSL wslEnvPrefix) so a
+    // member's read/edit breadcrumbs and Stop-composed plan_events attribute to
+    // the right plan + dispatched section. Undefined for rail-less runs.
+    planId: ctx.run.planId,
+    planSection: ctx.run.sectionAnchor,
     // WP3: bind codex session discovery to this run's kickoff, so a
     // concurrent same-cwd codex session on a different topic/role can't be
     // mis-bound. Harmless for non-codex providers (ignored downstream).
@@ -502,7 +531,7 @@ async function launchAgentWithKickoff(
 // --- Mode: Serial (groupthink-v2.js:448–547) ---
 export async function runSerial(client: DashboardClient, ctx: OrchestrationRunContext): Promise<void> {
   const { run } = ctx;
-  const { workspaceId, topic, planPath, leadProvider, reviewerProvider, turnTimeoutMs } = run;
+  const { workspaceId, topic, planPath, sectionAnchor, leadProvider, reviewerProvider, turnTimeoutMs } = run;
   // Resume is signalled by leadId/reviewerId already being set at entry (DB
   // rehydrate or structured resume-id params).
   const resumeLeadId = run.leadId;
@@ -510,7 +539,9 @@ export async function runSerial(client: DashboardClient, ctx: OrchestrationRunCo
 
   // T2 defensive guard (covers direct-runner callers + the pressure tests):
   // archive a stale plan only on a genuinely fresh run, never on resume.
-  if (!resumeLeadId && !resumeReviewerId) archiveStalePlan(planPath, run.runId);
+  // WP6: never archive a plan-rail surface — it is the EXISTING create_plan
+  // artifact this run edits into, not a leftover to clear.
+  if (!resumeLeadId && !resumeReviewerId && !run.planId) archiveStalePlan(planPath, run.runId);
 
   let lead: Agent;
   let reviewer: Agent | null = null;
@@ -533,7 +564,7 @@ export async function runSerial(client: DashboardClient, ctx: OrchestrationRunCo
       title: 'Lead Planner (GroupThink)',
       roleDescription: 'Lead planner in charge of making the final call. You will receive feedback from a reviewer.',
       provider: leadProvider,
-      kickoffPrompt: serialLeadPrompt(topic, planPath),
+      kickoffPrompt: serialLeadPrompt(topic, planPath, sectionAnchor, run.planId),
       ownerAgentId: run.supervisorId,
     });
     run.leadId = lead.id;
@@ -560,8 +591,8 @@ export async function runSerial(client: DashboardClient, ctx: OrchestrationRunCo
     ctx.persist();
     ctx.emit('turn', { turn: 1 });
 
-    if (fs.existsSync(planPath)) {
-      // Plan written after Lead turn 1 — terminate before launching Reviewer.
+    if (planDeliverableReady(client, ctx)) {
+      // Deliverable landed after Lead turn 1 — terminate before launching Reviewer.
       return;
     }
 
@@ -570,7 +601,7 @@ export async function runSerial(client: DashboardClient, ctx: OrchestrationRunCo
       title: 'Reviewer (GroupThink)',
       roleDescription: 'Reviewer agent providing feedback to the Lead Planner.',
       provider: reviewerProvider,
-      kickoffPrompt: serialReviewerKickoff(topic, firstLeadMsg.content),
+      kickoffPrompt: serialReviewerKickoff(topic, firstLeadMsg.content, sectionAnchor, run.planId),
       ownerAgentId: run.supervisorId,
     });
     run.reviewerId = reviewer.id;
@@ -595,7 +626,7 @@ export async function runSerial(client: DashboardClient, ctx: OrchestrationRunCo
     markRelayed(ctx, reviewer.id, revMsg);
     ctx.persist();
 
-    if (fs.existsSync(planPath)) { planWritten = true; break; }
+    if (planDeliverableReady(client, ctx)) { planWritten = true; break; }
     await waitReceiverReady(client, ctx, lead.id, 'Lead', turnTimeoutMs);
     await sendWorker(client, ctx, lead.id, 'Lead',
       `Reviewer Feedback:\n\n${revMsg.content}\n\nRespond to this feedback or finalize the plan.`);
@@ -605,7 +636,7 @@ export async function runSerial(client: DashboardClient, ctx: OrchestrationRunCo
     markRelayed(ctx, lead.id, leadMsg);
     ctx.persist();
 
-    if (fs.existsSync(planPath)) { planWritten = true; break; }
+    if (planDeliverableReady(client, ctx)) { planWritten = true; break; }
     await waitReceiverReady(client, ctx, reviewer.id, 'Reviewer', turnTimeoutMs);
     await sendWorker(client, ctx, reviewer.id, 'Reviewer',
       `Feedback from Lead Planner:\n\n${leadMsg.content}\n\nWhat is your review?`);
@@ -619,15 +650,16 @@ export async function runSerial(client: DashboardClient, ctx: OrchestrationRunCo
 // --- Mode: Parallel (groupthink-v2.js:550–640) ---
 export async function runParallel(client: DashboardClient, ctx: OrchestrationRunContext): Promise<void> {
   const { run } = ctx;
-  const { workspaceId, topic, planPath, leadProvider, reviewerProvider, turnTimeoutMs } = run;
+  const { workspaceId, topic, planPath, sectionAnchor, leadProvider, reviewerProvider, turnTimeoutMs } = run;
 
   // T2 defensive guard: parallel has no resume path, so always archive a stale
   // pre-existing plan before R1 can trip the premature-write existsSync gate.
-  archiveStalePlan(planPath, run.runId);
+  // WP6: except for a plan-rail run, whose surface legitimately pre-exists.
+  if (!run.planId) archiveStalePlan(planPath, run.runId);
 
   // R1: both launch with the same prompt; kick off in parallel. The synthesizer
   // is the lead-provider (writes the plan in R3); the peer is the reviewer side.
-  const r1Prompt = parallelR1Prompt(topic);
+  const r1Prompt = parallelR1Prompt(topic, sectionAnchor, run.planId);
   const [synthesizer, peer] = await Promise.all([
     launchAgentWithKickoff(client, ctx, {
       workspaceId,
@@ -662,7 +694,7 @@ export async function runParallel(client: DashboardClient, ctx: OrchestrationRun
 
   // Premature-write check: if either agent wrote the plan in R1 treat it as
   // accidental termination rather than clobber it with later rounds.
-  if (fs.existsSync(planPath)) return;
+  if (planDeliverableReady(client, ctx)) return;
 
   // R2: each sees the other's R1 and reacts (parallel).
   run.round = 2;
@@ -670,11 +702,11 @@ export async function runParallel(client: DashboardClient, ctx: OrchestrationRun
   await Promise.all([
     (async () => {
       await waitReceiverReady(client, ctx, synthesizer.id, 'Synthesizer', turnTimeoutMs);
-      await sendWorker(client, ctx, synthesizer.id, 'Synthesizer', parallelR2Prompt(peerR1.content));
+      await sendWorker(client, ctx, synthesizer.id, 'Synthesizer', parallelR2Prompt(peerR1.content, sectionAnchor, run.planId));
     })(),
     (async () => {
       await waitReceiverReady(client, ctx, peer.id, 'Peer', turnTimeoutMs);
-      await sendWorker(client, ctx, peer.id, 'Peer', parallelR2Prompt(synthR1.content));
+      await sendWorker(client, ctx, peer.id, 'Peer', parallelR2Prompt(synthR1.content, sectionAnchor, run.planId));
     })(),
   ]);
 
@@ -690,20 +722,23 @@ export async function runParallel(client: DashboardClient, ctx: OrchestrationRun
   markRelayed(ctx, peer.id, peerR2);
   ctx.persist();
 
-  if (fs.existsSync(planPath)) return;
+  if (planDeliverableReady(client, ctx)) return;
 
   // R3: synthesizer-only. Hand it the peer's R2 with synthesis + write-plan
   // instructions; wait for the plan file or its turnComplete.
   run.round = 3;
   ctx.emit('round', { round: 3 });
   await waitReceiverReady(client, ctx, synthesizer.id, 'Synthesizer', turnTimeoutMs);
-  await sendWorker(client, ctx, synthesizer.id, 'Synthesizer', parallelSynthesisPrompt(peerR2.content, planPath));
+  await sendWorker(client, ctx, synthesizer.id, 'Synthesizer', parallelSynthesisPrompt(peerR2.content, planPath, sectionAnchor, run.planId));
 
   const synthR3 = await waitTurnComplete(client, ctx, synthesizer.id, 'Synthesizer R3', turnTimeoutMs);
   markRelayed(ctx, synthesizer.id, synthR3);
   ctx.persist();
 
-  if (!(await waitForPlanFile(ctx, planPath, PLAN_WRITE_GRACE_MS))) {
-    throw new Error(`STALL: Synthesizer completed R3 but no plan file at ${planPath} after ${PLAN_WRITE_GRACE_MS}ms grace.`);
+  if (!(await waitForDeliverable(client, ctx, PLAN_WRITE_GRACE_MS))) {
+    const what = run.planId && sectionAnchor
+      ? `no content change in section ${sectionAnchor} of plan ${run.planId}`
+      : `no plan file at ${planPath}`;
+    throw new Error(`STALL: Synthesizer completed R3 but ${what} after ${PLAN_WRITE_GRACE_MS}ms grace.`);
   }
 }

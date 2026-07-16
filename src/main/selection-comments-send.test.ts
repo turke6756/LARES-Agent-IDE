@@ -53,11 +53,26 @@ function makeComment(over: Partial<SelectionComment> = {}): SelectionComment {
     body: 'fact check this',
     status: 'draft',
     sentToAgentId: null,
+    anchorType: 'text',
+    pdfAnchor: null,
     createdAt: '2026-06-12 00:00:00',
     updatedAt: '2026-06-12 00:00:00',
     sentAt: null,
     resolvedAt: null,
     ...over,
+  };
+}
+
+// A PDF comment fixture: physical page + one paint rect.
+function pdfAnchor(pageIndex: number, pageLabel?: string, coordinateOnly = false): SelectionComment['pdfAnchor'] {
+  const start = { itemIndex: 0, charOffset: 0 };
+  const end = coordinateOnly ? { itemIndex: 0, charOffset: 0 } : { itemIndex: 1, charOffset: 4 };
+  return {
+    version: 1,
+    fingerprint: 'fp-1',
+    prefix: 'pre',
+    suffix: 'suf',
+    pages: [{ pageIndex, pageLabel, start, end, rects: [{ x: 0.1, y: 0.2, width: 0.3, height: 0.05 }] }],
   };
 }
 
@@ -377,6 +392,78 @@ test('multi-id send delivers exactly one sendInput call', async () => {
   await flushMicrotasks();
   assert.equal(h.sendInputCalls.length, 1, 'one [SELECTION COMMENT] message, not one per comment');
   assert.deepEqual(h.sentCalls, [{ ids: ['c-1', 'c-2'], agentId: 'agent-1' }]);
+});
+
+// ── PDF page context (plan Part 1.8) ─────────────────────────────────
+
+test('single-page PDF send carries a header Page line (one-based)', async () => {
+  const h = setup({
+    comments: [makeComment({ body: '', anchorType: 'pdf', pdfAnchor: pdfAnchor(2), quotedText: 'photosynthetic yield' })],
+    agents: [makeAgent({ status: 'working' })],
+  });
+  const result = await sendSelectionComments(h.deps, { commentIds: ['c-1'], target: EXISTING });
+  const busy = result as { prompt: string };
+  assert.equal(
+    busy.prompt,
+    '[SELECTION COMMENT]\nSource: file C:\\repo\\doc.md\nPage: 3\n\n> photosynthetic yield',
+  );
+});
+
+test('multi-page PDF send carries per-quote Anchor lines from each row', async () => {
+  const h = setup({
+    comments: [
+      makeComment({ id: 'c-1', anchorType: 'pdf', pdfAnchor: pdfAnchor(2), quotedText: 'first', body: 'a' }),
+      makeComment({ id: 'c-2', anchorType: 'pdf', pdfAnchor: pdfAnchor(6), quotedText: 'second', body: 'b' }),
+    ],
+    agents: [makeAgent({ status: 'working' })],
+  });
+  const result = await sendSelectionComments(h.deps, { commentIds: ['c-1', 'c-2'], target: EXISTING });
+  const busy = result as { prompt: string };
+  assert.equal(
+    busy.prompt,
+    '[SELECTION COMMENT]\n' +
+    'Source: file C:\\repo\\doc.md\n' +
+    '\n' +
+    '1) > first\n' +
+    '   Anchor: page 3\n' +
+    '   Comment: a\n' +
+    '\n' +
+    '2) > second\n' +
+    '   Anchor: page 7\n' +
+    '   Comment: b',
+  );
+});
+
+test('page label flows into the prompt when it differs from the number', async () => {
+  const h = setup({
+    comments: [makeComment({ body: '', anchorType: 'pdf', pdfAnchor: pdfAnchor(3, 'iv'), quotedText: 'front matter' })],
+    agents: [makeAgent({ status: 'working' })],
+  });
+  const busy = await sendSelectionComments(h.deps, { commentIds: ['c-1'], target: EXISTING }) as { prompt: string };
+  assert.match(busy.prompt, /Page: 4 \(labeled "iv"\)/);
+});
+
+test('coordinate-only PDF send emits the region marker + Region line', async () => {
+  const h = setup({
+    comments: [makeComment({
+      anchorType: 'pdf',
+      pdfAnchor: pdfAnchor(2, undefined, true),
+      quotedText: '[Area on PDF page 3]',
+      body: 'what is this figure?',
+    })],
+    agents: [makeAgent({ status: 'working' })],
+  });
+  const busy = await sendSelectionComments(h.deps, { commentIds: ['c-1'], target: EXISTING }) as { prompt: string };
+  assert.equal(
+    busy.prompt,
+    '[SELECTION COMMENT]\n' +
+    'Source: file C:\\repo\\doc.md\n' +
+    'Page: 3\n' +
+    '\n' +
+    '1) [Area on PDF page 3]\n' +
+    '   Region: x=0.100 y=0.200 w=0.300 h=0.050 (normalized, unrotated)\n' +
+    '   Comment: what is this figure?',
+  );
 });
 
 // ── Runner ───────────────────────────────────────────────────────────

@@ -105,6 +105,9 @@ type DbAgent = {
   isSupervised: boolean;
   ownerAgentId: string | null;
   notifyOwner?: boolean;
+  continuationEnabled?: boolean;
+  planId?: string | null;
+  planSection?: string | null;
 };
 type CreateAgentData = {
   workspaceId: string;
@@ -119,6 +122,8 @@ type CreateAgentData = {
   logPath: string;
   ownerAgentId?: string | null;
   notifyOwner?: boolean;
+  planId?: string | null;
+  planSection?: string | null;
 };
 type DbModule = {
   initDatabase(): void;
@@ -128,9 +133,22 @@ type DbModule = {
   getSupervisorAgent(workspaceId: string): DbAgent | null;
   getOwnerForWorker(worker: DbAgent): DbAgent | null;
   updateAgentStatus(id: string, status: string): void;
+  setContinuationEnabled(agentId: string, enabled: boolean): void;
   deleteAgent(id: string): void;
+  // GT-C ownership + trail plumbing.
+  getLiveRailAgentForPlan(planId: string, exemptAgentIds?: string[]): DbAgent | null;
+  getActiveRailWriterCount(planId: string): number;
+  getTurnSectionChanges(planId: string, sinceIso: string, untilIso: string): Array<{ sectionAnchor: string }>;
+  recordPlanSectionChange(input: { planId: string; sectionAnchor: string; blockAnchor?: string | null; contentHash: string; changedAt?: string }): string;
+  insertOrchestration(r: unknown): void;
 };
 let dbm: DbModule;
+
+// GT-C §O.2 — the shared ownership guard (real DB behind it, via the sql.js stand-in).
+type OwnershipModule = {
+  assertPlanRailFree(planId: string, opts?: { exemptRunId?: string; exemptAgentIds?: string[] }): void;
+};
+let ownership: OwnershipModule;
 
 let wsCounter = 0;
 function insertWorkspace(defaultCommand: string): string {
@@ -265,6 +283,22 @@ test('createAgent / rowToAgent round-trips notifyOwner: true explicitly', () => 
   assert.equal(dbm.getAgent(a.id)!.notifyOwner, true);
 });
 
+// ── continuationEnabled toggle round-trips (Edward 2026-07-05) ────────────────
+
+test('additive migration defaults continuationEnabled to true for a fresh row', () => {
+  const a = makeAgentRow();
+  assert.equal(a.continuationEnabled, true, 'default 1 → enabled (opt-in-by-default preserved)');
+  assert.equal(dbm.getAgent(a.id)!.continuationEnabled, true);
+});
+
+test('setContinuationEnabled(false) then (true) survives the DB round-trip', () => {
+  const a = makeAgentRow();
+  dbm.setContinuationEnabled(a.id, false);
+  assert.equal(dbm.getAgent(a.id)!.continuationEnabled, false, 'false persists');
+  dbm.setContinuationEnabled(a.id, true);
+  assert.equal(dbm.getAgent(a.id)!.continuationEnabled, true, 're-enable persists');
+});
+
 test('getOwnerForWorker (i) live owner → owner', () => {
   const ws = 'ws-resolver-i';
   const sup = makeAgentRow({ workspaceId: ws, isSupervisor: true });
@@ -333,6 +367,120 @@ test('owner_agent_id migration is idempotent — re-running ALTER does not throw
   assert.doesNotThrow(() => dbm.initDatabase());
 });
 
+// ── Planning surface WP1: plan-rail freeze at launch ─────────────────────────
+
+test('WP1: createAgent / rowToAgent freezes planId + planSection at launch', () => {
+  const a = makeAgentRow({ planId: 'plan-xyz', planSection: 'sec_abc123' });
+  assert.equal(a.planId, 'plan-xyz');
+  assert.equal(a.planSection, 'sec_abc123');
+  const reread = dbm.getAgent(a.id)!;
+  assert.equal(reread.planId, 'plan-xyz', 'plan_id survives the DB round-trip (frozen)');
+  assert.equal(reread.planSection, 'sec_abc123', 'plan_section survives the DB round-trip (frozen)');
+});
+
+test('WP1: createAgent defaults planId + planSection to null when omitted (unbound launch)', () => {
+  const a = makeAgentRow();
+  assert.equal(a.planId, null);
+  assert.equal(a.planSection, null);
+  const reread = dbm.getAgent(a.id)!;
+  assert.equal(reread.planId, null);
+  assert.equal(reread.planSection, null);
+});
+
+test('WP1: guarded agents plan-rail ALTERs are idempotent — re-running initDatabase does not throw', () => {
+  // The plan_id / plan_section columns now exist; re-running exercises the
+  // try/catch around each ADD COLUMN (SQLite has no ADD COLUMN IF NOT EXISTS).
+  assert.doesNotThrow(() => dbm.initDatabase());
+  // And a fresh agent still round-trips its rail after the second migration pass.
+  const a = makeAgentRow({ planId: 'plan-2' });
+  assert.equal(dbm.getAgent(a.id)!.planId, 'plan-2');
+});
+
+// ── GT-C: getLiveRailAgentForPlan (amended ownership §4.4) ───────────────────
+
+test('getLiveRailAgentForPlan — idle plan-bound agent does NOT reserve (amended §4.4) → null', () => {
+  const a = makeAgentRow({ planId: 'plan-idle' });
+  dbm.updateAgentStatus(a.id, 'idle');
+  assert.equal(dbm.getLiveRailAgentForPlan('plan-idle'), null,
+    'the Lares idle-seed pattern stays legal — idle never reserves');
+});
+
+test('getLiveRailAgentForPlan — working / launching plan-bound agents reserve', () => {
+  const w = makeAgentRow({ planId: 'plan-work' });
+  dbm.updateAgentStatus(w.id, 'working');
+  assert.equal(dbm.getLiveRailAgentForPlan('plan-work')!.id, w.id);
+  const l = makeAgentRow({ planId: 'plan-launch' }); // createAgent defaults to 'launching'
+  assert.equal(dbm.getLiveRailAgentForPlan('plan-launch')!.id, l.id);
+});
+
+test('getLiveRailAgentForPlan — honors exemptAgentIds', () => {
+  const w = makeAgentRow({ planId: 'plan-ex' });
+  dbm.updateAgentStatus(w.id, 'working');
+  assert.equal(dbm.getLiveRailAgentForPlan('plan-ex', [w.id]), null, 'the exempt agent is not a reservation');
+});
+
+test('getLiveRailAgentForPlan — all terminal (done/crashed) → null', () => {
+  const w = makeAgentRow({ planId: 'plan-term' });
+  dbm.updateAgentStatus(w.id, 'done');
+  assert.equal(dbm.getLiveRailAgentForPlan('plan-term'), null);
+});
+
+test('getActiveRailWriterCount — counts only working|launching', () => {
+  const p = 'plan-count';
+  const a = makeAgentRow({ planId: p }); dbm.updateAgentStatus(a.id, 'working');
+  makeAgentRow({ planId: p }); // launching (default)
+  const c = makeAgentRow({ planId: p }); dbm.updateAgentStatus(c.id, 'idle');   // not counted
+  const d = makeAgentRow({ planId: p }); dbm.updateAgentStatus(d.id, 'done');   // not counted
+  assert.equal(dbm.getActiveRailWriterCount(p), 2, 'idle + terminal are excluded');
+});
+
+test('getTurnSectionChanges — omits a sec_exectr change row (attribution safety)', () => {
+  const p = 'plan-chg';
+  const t0 = '2026-07-05T00:00:00.000Z', t1 = '2026-07-05T23:59:59.000Z';
+  dbm.recordPlanSectionChange({ planId: p, sectionAnchor: 'sec_summry', contentHash: 'h1', changedAt: '2026-07-05T01:00:00.000Z' });
+  dbm.recordPlanSectionChange({ planId: p, sectionAnchor: 'sec_exectr', contentHash: 'h2', changedAt: '2026-07-05T02:00:00.000Z' });
+  const anchors = dbm.getTurnSectionChanges(p, t0, t1).map((r) => r.sectionAnchor);
+  assert.ok(anchors.includes('sec_summry'), 'a genuine agent change is present');
+  assert.ok(!anchors.includes('sec_exectr'), 'a system trail write is never counted as an agent effect');
+});
+
+// ── GT-C §O.5: assertPlanRailFree (amended — idle → no 409) ───────────────────
+
+function fakeRun(over: Record<string, unknown>): unknown {
+  return {
+    runId: 'run-x', name: 'groupthink', mode: 'serial', status: 'running',
+    workspaceId: 'ws', supervisorId: 'sup', topic: 't', planPath: 'p',
+    leadProvider: 'claude', reviewerProvider: 'codex', turnTimeoutMs: 1000,
+    lastRelayedTs: {}, startedAt: '2026-07-05T00:00:00.000Z', updatedAt: '2026-07-05T00:00:00.000Z',
+    ...over,
+  };
+}
+const is409 = (e: unknown): boolean => (e as { statusCode?: number }).statusCode === 409;
+
+test('assertPlanRailFree — a free plan does not throw', () => {
+  assert.doesNotThrow(() => ownership.assertPlanRailFree('plan-free'));
+});
+
+test('assertPlanRailFree — idle plan-bound agent does NOT 409 (amended §4.4)', () => {
+  const a = makeAgentRow({ planId: 'plan-idle-guard' });
+  dbm.updateAgentStatus(a.id, 'idle');
+  assert.doesNotThrow(() => ownership.assertPlanRailFree('plan-idle-guard'),
+    'an idle kept worker must not block a subsequent dispatch');
+});
+
+test('assertPlanRailFree — an actively-working plan-bound agent 409s; exempt clears it', () => {
+  const a = makeAgentRow({ planId: 'plan-busy' });
+  dbm.updateAgentStatus(a.id, 'working');
+  assert.throws(() => ownership.assertPlanRailFree('plan-busy'), is409);
+  assert.doesNotThrow(() => ownership.assertPlanRailFree('plan-busy', { exemptAgentIds: [a.id] }));
+});
+
+test('assertPlanRailFree — an active run 409s; exemptRunId clears it', () => {
+  dbm.insertOrchestration(fakeRun({ runId: 'run-active', status: 'running', planId: 'plan-run' }));
+  assert.throws(() => ownership.assertPlanRailFree('plan-run'), is409);
+  assert.doesNotThrow(() => ownership.assertPlanRailFree('plan-run', { exemptRunId: 'run-active' }));
+});
+
 // ── Runner ─────────────────────────────────────────────────────────────────────
 (async () => {
   // Keep initDatabase's mkdir off the real APPDATA profile.
@@ -357,6 +505,10 @@ test('owner_agent_id migration is idempotent — re-running ALTER does not throw
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   dbm = require('./database') as DbModule;
   dbm.initDatabase();
+  // The shared ownership guard reads the SAME cached database module + the
+  // (unconfigured) trailMaterializer singleton → isMaterializing false.
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  ownership = require('./orchestration/plan-ownership') as OwnershipModule;
 
   let passed = 0;
   let failed = 0;

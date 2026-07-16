@@ -8,6 +8,7 @@ import {
   collectDescendantAgents,
   type AgentTreeNode,
 } from './agent-grouping';
+import { applyHorizontalWheelScroll } from '../../lib/horizontal-wheel';
 
 // Mirrors StatusBadge's STATUS_CONFIG dot colors so the strip and the
 // full-size cards never disagree about what a status looks like.
@@ -53,6 +54,8 @@ function MiniAgentCard({
   // Subscribe only to this agent's slices — sibling updates don't re-render.
   const isSelected = useDashboardStore((s) => s.selectedAgentId === agent.id);
   const pct = useDashboardStore((s) => s.contextStats[agent.id]?.contextPercentage ?? null);
+  // Gold "snake" border while this agent is mid context-brick continuation transfer.
+  const transferring = useDashboardStore((s) => s.continuationTransferIds.has(agent.id));
 
   const dot = DOT_COLORS[agent.status] || DOT_COLORS.done;
   const tint = PROVIDER_TINT[agent.provider || 'claude'] || PROVIDER_TINT.claude;
@@ -65,6 +68,8 @@ function MiniAgentCard({
       onClick={() => onSelect(agent.id)}
       title={`${agent.title} — ${agent.status}${pct !== null ? ` — ctx ${pct}%` : ''}`}
       className={`shrink-0 text-left px-1.5 py-1 border border-surface-3 border-l-2 transition-colors ${
+        transferring ? 'agent-transfer-glow' : ''
+      } ${
         expanded ? 'w-full' : 'w-[88px]'
       } ${
         isSelected
@@ -269,7 +274,11 @@ export default function AgentStrip({ defaultExpanded = false }: { defaultExpande
           {cards}
         </div>
       ) : (
-        <div ref={scrollRef} className="flex-1 flex gap-1.5 overflow-x-auto scrollbar-thin pb-0.5 min-w-0">
+        <div
+          ref={scrollRef}
+          onWheel={(e) => applyHorizontalWheelScroll(e.currentTarget, e)}
+          className="flex-1 flex gap-1.5 overflow-x-auto scrollbar-thin pb-0.5 min-w-0"
+        >
           {cards}
         </div>
       )}

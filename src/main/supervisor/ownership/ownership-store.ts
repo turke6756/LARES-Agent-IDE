@@ -228,6 +228,21 @@ export class OwnershipStore {
     return this.jobHandles.has(agentId);
   }
 
+  /** WAVE-4 SEAM (full-D5 attribution): read-only live PID set for an agent whose
+   *  named Job Object we still hold a handle to (same-instance only). Returns null
+   *  when there is no live handle (prior-epoch / native-off rows → the caller uses
+   *  the verified tree walk instead). Never kills; never opens by name. */
+  getLiveJobPids(agentId: string): number[] | null {
+    const job = this.jobHandles.get(agentId);
+    if (!job || !this.deps.native.supported) return null;
+    try {
+      return this.deps.native.listJobPids(job);
+    } catch (e) {
+      this.deps.log(`[ownership] getLiveJobPids(${agentId}) failed: ${String(e)}`);
+      return null;
+    }
+  }
+
   // ── termination ───────────────────────────────────────────────────────────────
 
   /**

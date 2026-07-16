@@ -13,6 +13,7 @@ import {
   ensureCodexResumeSessionId,
   findCodexSessionIdByCwd,
   shouldDiscoverCodexSession,
+  decideCodexHookBind,
   type CodexSessionSnapshot,
   type CodexStateDb,
   type CodexStateDbOpener,
@@ -1008,6 +1009,88 @@ test('WP3(c): literal %/_ prefix matches only true starts-with rows (no wildcard
   assert.equal(params.length, 4, `query must bind exactly four params (cwdLike, afterSec, prefixForLength, prefixForEquality); got ${params.length}`);
   assert.equal(params[2], '50%_d', 'param 3 is the prefix (for length())');
   assert.equal(params[3], '50%_d', 'param 4 is the prefix (for equality) — same value, bound twice');
+});
+
+// ===== Layer A: decideCodexHookBind (SessionStart-hook bind decision) =====
+
+const CODEX_AGENT = { provider: 'codex', resumeSessionId: null as string | null };
+
+test('decideCodexHookBind: happy path — unbound codex agent binds the reported sid', () => {
+  const d = decideCodexHookBind({ agent: { ...CODEX_AGENT }, sessionId: SESSION_ID });
+  assert.equal(d.action, 'bind');
+  if (d.action === 'bind') assert.equal(d.sessionId, SESSION_ID);
+});
+
+test('decideCodexHookBind: trims surrounding whitespace on the bound sid', () => {
+  const d = decideCodexHookBind({ agent: { ...CODEX_AGENT }, sessionId: `  ${SESSION_ID}\n` });
+  assert.equal(d.action, 'bind');
+  if (d.action === 'bind') assert.equal(d.sessionId, SESSION_ID);
+});
+
+test('decideCodexHookBind: unknown agent → ignore (unknown-agent)', () => {
+  for (const agent of [null, undefined]) {
+    const d = decideCodexHookBind({ agent, sessionId: SESSION_ID });
+    assert.equal(d.action, 'ignore');
+    if (d.action === 'ignore') assert.equal(d.reason, 'unknown-agent');
+  }
+});
+
+test('decideCodexHookBind: non-codex provider → ignore (non-codex)', () => {
+  for (const provider of ['claude', 'gemini']) {
+    const d = decideCodexHookBind({ agent: { provider, resumeSessionId: null }, sessionId: SESSION_ID });
+    assert.equal(d.action, 'ignore');
+    if (d.action === 'ignore') assert.equal(d.reason, 'non-codex');
+  }
+});
+
+test('decideCodexHookBind: empty/whitespace/absent sid → ignore (empty-session-id)', () => {
+  for (const sessionId of ['', '   ', null, undefined]) {
+    const d = decideCodexHookBind({ agent: { ...CODEX_AGENT }, sessionId });
+    assert.equal(d.action, 'ignore');
+    if (d.action === 'ignore') assert.equal(d.reason, 'empty-session-id');
+  }
+});
+
+test('decideCodexHookBind: NULL-GUARD ordering — already-bound agent never overwrites, even with a different sid', () => {
+  // Mirrors captureCodexSessionId: a set resumeSessionId is authoritative (a
+  // later restart/resume may own it), so a differing hook report is ignored,
+  // NOT applied. This is the ordering that keeps BUG-29 closed.
+  const bound = decideCodexHookBind({
+    agent: { provider: 'codex', resumeSessionId: OTHER_ID },
+    sessionId: SESSION_ID,
+  });
+  assert.equal(bound.action, 'ignore');
+  if (bound.action === 'ignore') assert.equal(bound.reason, 'already-bound');
+
+  // Idempotent case: same sid re-reported is also a no-op ignore.
+  const same = decideCodexHookBind({
+    agent: { provider: 'codex', resumeSessionId: SESSION_ID },
+    sessionId: SESSION_ID,
+  });
+  assert.equal(same.action, 'ignore');
+  if (same.action === 'ignore') assert.equal(same.reason, 'already-bound');
+});
+
+test('decideCodexHookBind: sibling-theft protection — sid owned by another agent → ignore (session-owned-by-sibling)', () => {
+  const d = decideCodexHookBind({
+    agent: { ...CODEX_AGENT },
+    sessionId: SESSION_ID,
+    sessionOwnedByOther: true,
+  });
+  assert.equal(d.action, 'ignore');
+  if (d.action === 'ignore') assert.equal(d.reason, 'session-owned-by-sibling');
+});
+
+test('decideCodexHookBind: ordering — null-guard is checked BEFORE sibling-ownership', () => {
+  // An already-bound agent whose incoming sid is also sibling-owned must report
+  // 'already-bound' (the earlier guard), proving the guard order is stable.
+  const d = decideCodexHookBind({
+    agent: { provider: 'codex', resumeSessionId: OTHER_ID },
+    sessionId: SESSION_ID,
+    sessionOwnedByOther: true,
+  });
+  assert.equal(d.action, 'ignore');
+  if (d.action === 'ignore') assert.equal(d.reason, 'already-bound');
 });
 
 (async () => {

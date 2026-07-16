@@ -6,6 +6,7 @@ import type {
   AccessRequestDecision,
   AccessRule,
   AccessRuleInput,
+  AccessSiteStatus,
   AgentActionsCommand,
   AgentActionsState,
   AgentDrivingRevoked,
@@ -14,12 +15,15 @@ import type {
   BrowserDownloadPrompt,
   BrowserDownloadState,
   HandedTabInfo,
+  ImportUserSessionResult,
   OmniboxSuggestion,
   ReaderArticle,
   SharedAgentSessions,
   SignedInOrigin,
+  SigninHandoffReadyResult,
   SigninPendingOpened,
   SigninResolved,
+  SigninSetupVerification,
 } from '../../shared/browser';
 import { resolveBrowserInput } from '../../shared/browser-input';
 // Slice-3: the PURE policy module (no Electron) is the single source of truth for
@@ -34,6 +38,7 @@ export type {
   AccessRequestDecision,
   AccessRule,
   AccessRuleInput,
+  AccessSiteStatus,
   AgentActionsCommand,
   AgentActionsState,
   AgentDrivingRevoked,
@@ -336,24 +341,35 @@ export interface BrowserApi {
     add(input: AccessRuleInput): Promise<AccessRule>;
     update(id: string, patch: Partial<AccessRuleInput> & { enabled?: boolean }): Promise<AccessRule>;
     remove(id: string): Promise<void>;
+    // Phase 3 (§D line 264): read-only per-rule visit + login status for the
+    // current workspace. Optional + guarded so older/stubbed preload shapes (and
+    // the existing browser-access.test mock) without the channel don't crash.
+    siteStatus?(): Promise<AccessSiteStatus[]>;
     onChanged(cb: () => void): () => void;
     requestList(): Promise<AccessRequest[]>;
     requestDecide(id: string, decision: AccessRequestDecision): Promise<void>;
     onRequestsChanged(cb: () => void): () => void;
     handoffSignin(ruleId: string): Promise<AccessHandoffResult>;
-    handoffReady(tabId: string): Promise<void>;
+    // Phase 2 (§D line 247): completion returns how it was verified ('probed' vs
+    // 'confirmed') so the banner can be honest. Older mocks may still resolve void.
+    handoffReady(tabId: string): Promise<SigninHandoffReadyResult | void>;
     tabHandToAgent(tabId: string): Promise<void>;
     tabReturnToHuman(tabId: string): Promise<void>;
     clearSiteSession(ruleId: string): Promise<void>;
     // WI-E "Import my session" — optional + guarded so older/stubbed preload
     // shapes (and existing access test mocks) without the channel don't crash.
-    importUserSession?(ruleId: string): Promise<{ imported: number; origin: string }>;
+    // Phase 2 (§D line 245): returns candidateCookiesCopied (a setup first step),
+    // NOT an imported=>signed-in count.
+    importUserSession?(ruleId: string): Promise<ImportUserSessionResult>;
     // ── Signed-in tabs (WI-5): JIT sign-in banner events + cancel + WI-8 config.
     //    Optional + guarded so older/stubbed preload shapes without these
     //    channels (and the existing access test mocks) don't crash the bridge. ──
     onSigninPendingOpened?(cb: (payload: SigninPendingOpened) => void): () => void;
     onSigninResolved?(cb: (payload: SigninResolved) => void): () => void;
     signinPendingCancel?(tabId: string): Promise<void>;
+    // Phase 4 item 4: explicit human re-arm of a run-scoped signin_unavailable
+    // latch for one (workspace, origin). Optional + guarded like its siblings.
+    signinReArm?(workspaceId: string | null, origin: string): Promise<boolean>;
     getSigninHoldTimeoutMs?(): Promise<number>;
     setSigninHoldTimeoutMs?(ms: number): Promise<void>;
     setSigninUnattended?(workspaceId: string | null, unattended: boolean): Promise<void>;
@@ -712,6 +728,10 @@ interface BrowserStoreState {
   // onBookmarksChanged).
   accessViewOpen: boolean;
   accessRules: AccessRule[];
+  /** Phase 3 (§D line 264): per-rule visit + login status for the SELECTED
+   *  workspace, sourced from the workspace-exact login grant (never a bare row).
+   *  Keyed to accessRules by ruleId; empty until first load. */
+  siteStatus: AccessSiteStatus[];
   accessRequests: AccessRequest[];
   /** Mechanism-A sign-in handoff in flight (§12-A/§15). While set, a visible
    *  quarantined agent-partition login tab is open and the four-point consent
@@ -750,6 +770,9 @@ interface BrowserStoreState {
   openAccessView: () => void;
   closeAccessView: () => void;
   loadAccessRules: () => Promise<void>;
+  /** Phase 3 (§D line 264): refresh the per-rule visit + login status for the
+   *  selected workspace. Guarded — a no-op when the preload lacks the channel. */
+  loadSiteStatus: () => Promise<void>;
   /** Throws on a server-side rejection (`*`/unparseable hostname) — the add
    *  form awaits and surfaces the message. */
   addAccessRule: (input: AccessRuleInput) => Promise<AccessRule>;
@@ -764,6 +787,10 @@ interface BrowserStoreState {
   /** Mechanism-A: open the quarantined visible login tab and raise the consent
    *  banner; closes the overlay so the tab is visible. */
   beginSigninHandoff: (rule: AccessRule) => Promise<void>;
+  /** Phase 4 item 4: explicit human re-arm of a run-scoped signin_unavailable
+   *  latch for a rule's origin, so the next agent nav can reopen a setup tab.
+   *  Returns true when a latch was cleared. Safe no-op when unsupported/absent. */
+  reArmSignin: (rule: AccessRule) => Promise<boolean>;
   /** Mechanism-A: the human finished typing → revalidate + clear quarantine. */
   completeSigninHandoff: () => Promise<void>;
   /** Abandon the sign-in: close the quarantined tab + clear banner state. */
@@ -784,8 +811,10 @@ interface BrowserStoreState {
    *  in one update (consentAckedAt = now). The component shows the dialog first. */
   grantSignedInConsent: (ruleId: string) => Promise<void>;
   /** Approval consent gate: decide approve_signed_in, then stamp consent_acked_at
-   *  on the freshly created rule (the server creates it without a consent stamp). */
-  approveSignedInWithConsent: (request: AccessRequest) => Promise<void>;
+   *  on the freshly created rule (the server creates it without a consent stamp).
+   *  Phase 3 (§D line 261): returns the created rule (or null) so the caller can
+   *  chain immediate setup (beginSigninHandoff) after approval. */
+  approveSignedInWithConsent: (request: AccessRequest) => Promise<AccessRule | null>;
   /** WI-8: load the JIT sign-in config (hold timeout + the workspace's
    *  unattended flag) into the mirrored state. */
   loadSigninConfig: () => Promise<void>;
@@ -799,9 +828,10 @@ interface BrowserStoreState {
   clearSiteSession: (ruleId: string) => Promise<void>;
   /** WI-E "Import my session": copy the human's persist:user cookies for the
    *  rule's origin into the agent partition, then refresh the session center.
-   *  Returns the import result so the row can show the `imported:0` fallback
-   *  notice. HUMAN-CHROME-ONLY. */
-  importUserSession: (ruleId: string) => Promise<{ imported: number; origin: string }>;
+   *  Returns the import result so the row can show the `candidateCookiesCopied:0`
+   *  fallback notice. Phase 2 (§D line 245): a copy is a setup first step, NOT a
+   *  signed-in count — the row stays "Setup required" until verified. HUMAN-CHROME-ONLY. */
+  importUserSession: (ruleId: string) => Promise<ImportUserSessionResult>;
 
   // ── Slice 12: handoff / session center ─────────────────────────────────────
   /** Live handed tabs + persisted signed-in origins (with session-age + stale
@@ -819,7 +849,7 @@ interface BrowserStoreState {
   dismissDrivingRevoked: (tabId: string) => void;
   /** Transient success banner shown right after a sign-in hand-off completes
    *  (the agent now drives the signed-in session). null = idle. */
-  signinHandoffDone: { hostname: string } | null;
+  signinHandoffDone: { hostname: string; verification?: SigninSetupVerification } | null;
   dismissSigninHandoffDone: () => void;
 
   // ── Slice 13: user-only downloads (the shelf) ──────────────────────────────
@@ -895,6 +925,7 @@ export const useBrowserStore = create<BrowserStoreState>((set, get) => ({
   // Website-access policy initial state (single agent allowlist).
   accessViewOpen: false,
   accessRules: [],
+  siteStatus: [],
   accessRequests: [],
   handedTabIds: {},
   signinHandoff: null,
@@ -1010,6 +1041,7 @@ export const useBrowserStore = create<BrowserStoreState>((set, get) => ({
     // setActiveWorkspace re-scopes main but emits no accessChanged event, so
     // without this the slices would stay stale across a switch.
     void get().loadAccessRules();
+    void get().loadSiteStatus();
     void get().loadAccessRequests();
   },
 
@@ -1697,6 +1729,19 @@ export const useBrowserStore = create<BrowserStoreState>((set, get) => ({
     }
   },
 
+  loadSiteStatus: async () => {
+    const api = getBrowserApi();
+    // Guarded — the browser-access.test mock and older/stubbed preload shapes
+    // lack this channel; an unguarded call would crash the bridge prime.
+    if (!api?.access?.siteStatus) return;
+    try {
+      const rows = await api.access.siteStatus();
+      set({ siteStatus: Array.isArray(rows) ? rows : [] });
+    } catch (err) {
+      console.error('browser.access.siteStatus failed:', err);
+    }
+  },
+
   addAccessRule: async (input) => {
     const api = getBrowserApi();
     if (!api) throw new Error('Browser backend not available.');
@@ -1772,9 +1817,30 @@ export const useBrowserStore = create<BrowserStoreState>((set, get) => ({
     }
   },
 
+  reArmSignin: async (rule) => {
+    const api = getBrowserApi();
+    if (!api?.access?.signinReArm) return false;
+    const scheme = rule.scheme === 'any' ? 'https' : rule.scheme;
+    const origin = `${scheme}://${rule.hostname}`;
+    try {
+      // The rule's origin is keyed under the CURRENT workspace grant; the main
+      // side keys the run-scoped latch by (workspaceId, origin) too. Pass null so
+      // the manager falls back to the caller's current workspace.
+      return await api.access.signinReArm(null, origin);
+    } catch (err) {
+      console.error('browser.access.signinReArm failed:', err);
+      return false;
+    }
+  },
+
   beginSigninHandoff: async (rule) => {
     const api = getBrowserApi();
     if (!api) return;
+    // Phase 4 item 4: the human explicitly clicked Set up / Re-authenticate — clear
+    // any run-scoped signin_unavailable latch for this origin FIRST so a prior
+    // timeout/cancel this run doesn't leave the origin stuck "unavailable" after
+    // the human re-authenticates. Best-effort; never blocks the handoff.
+    await get().reArmSignin(rule);
     let result: AccessHandoffResult | null = null;
     try {
       result = await api.access.handoffSignin(rule.id);
@@ -1804,16 +1870,21 @@ export const useBrowserStore = create<BrowserStoreState>((set, get) => ({
     const handoff = get().signinHandoff;
     if (!api || !handoff) return;
     try {
-      await api.access.handoffReady(handoff.tabId);
+      // Phase 2 (§D line 247): capture how the completion was verified — 'probed'
+      // (adapter probe passed on the service origin) vs 'confirmed' (unknown site,
+      // human attestation) — so the success banner is honest. A probe FAILURE
+      // throws here (tab stays quarantined), routing to the catch below.
+      const result = await api.access.handoffReady(handoff.tabId);
       // Clear the consent banner and flash a transient success state (the agent
       // now drives the signed-in session). Refresh the session center too so a
       // newly committed origin shows up immediately.
       set({
         signinHandoff: null,
         signinHandoffError: null,
-        signinHandoffDone: { hostname: handoff.hostname },
+        signinHandoffDone: { hostname: handoff.hostname, verification: result?.verification },
       });
       void get().loadSharedSessions();
+      void get().loadSiteStatus();
     } catch (err) {
       console.error('browser.access.handoffReady failed:', err);
       set({
@@ -1866,12 +1937,21 @@ export const useBrowserStore = create<BrowserStoreState>((set, get) => ({
     if (!api || !pending) return;
     // "Done signing in" reuses access-handoff-ready: it re-validates the committed
     // URL, clears the quarantine, upserts the origin ACTIVE, and resolves the
-    // session ready. main also emits signin-resolved, but clear locally now for a
-    // snappy banner dismissal.
-    set({ signinPending: null });
+    // session ready. main also emits signin-resolved.
     try {
-      await api.access.handoffReady(pending.tabId);
+      // Phase 2 (§D line 247): capture the verification mode so the success banner
+      // is honest. A probe FAILURE (still on the login wall / off the service
+      // origin) now THROWS — so we clear the JIT banner only on success; on failure
+      // the banner stays up (the tab is still quarantined server-side).
+      const result = await api.access.handoffReady(pending.tabId);
+      let hostname = '';
+      try { hostname = new URL(pending.origin).hostname; } catch { /* origin already validated main-side */ }
+      set({
+        signinPending: null,
+        signinHandoffDone: { hostname, verification: result?.verification },
+      });
       void get().loadSharedSessions();
+      void get().loadSiteStatus();
     } catch (err) {
       console.error('browser.access.handoffReady (JIT) failed:', err);
     }
@@ -1897,7 +1977,7 @@ export const useBrowserStore = create<BrowserStoreState>((set, get) => ({
 
   approveSignedInWithConsent: async (request) => {
     const api = getBrowserApi();
-    if (!api) return;
+    if (!api) return null;
     try {
       // The server creates an allow_signed_in rule from the request's normalized
       // fields but leaves consent_acked_at null. Stamp it afterward so the
@@ -1921,8 +2001,13 @@ export const useBrowserStore = create<BrowserStoreState>((set, get) => ({
       }
       void get().loadAccessRequests();
       void get().loadAccessRules();
+      void get().loadSiteStatus();
+      // Phase 3 (§D line 261): return the created rule so RequestRow can chain
+      // immediate setup (beginSigninHandoff) straight after approval.
+      return created ?? null;
     } catch (err) {
       console.error('browser.access approveSignedInWithConsent failed:', err);
+      return null;
     }
   },
 
@@ -2001,6 +2086,7 @@ export const useBrowserStore = create<BrowserStoreState>((set, get) => ({
       // The cleared session changes the "Sessions shared with agents" picture —
       // refresh it so the row's age/stale state reflects the wipe.
       void get().loadSharedSessions();
+      void get().loadSiteStatus();
     } catch (err) {
       console.error('browser.access.clearSiteSession failed:', err);
     }
@@ -2008,17 +2094,19 @@ export const useBrowserStore = create<BrowserStoreState>((set, get) => ({
 
   importUserSession: async (ruleId) => {
     const api = getBrowserApi();
-    if (!api?.access?.importUserSession) return { imported: 0, origin: '' };
+    if (!api?.access?.importUserSession) return { candidateCookiesCopied: 0, origin: '' };
     try {
       const result = await api.access.importUserSession(ruleId);
-      // On a successful copy the origin flips to signed_in — refresh the center
-      // so the row reflects it. (On imported:0 nothing changed, but a refresh is
-      // harmless and keeps the row's state honest.)
+      // Phase 2 (§D line 245): a cookie copy is a CANDIDATE first step of setup —
+      // it does NOT flip the origin to signed-in. Refresh the center so the row
+      // shows "Setup required" (setup material present, not yet verified). On
+      // candidateCookiesCopied:0 nothing changed, but a refresh keeps state honest.
       void get().loadSharedSessions();
-      return result ?? { imported: 0, origin: '' };
+      void get().loadSiteStatus();
+      return result ?? { candidateCookiesCopied: 0, origin: '' };
     } catch (err) {
       console.error('browser.access.importUserSession failed:', err);
-      return { imported: 0, origin: '' };
+      return { candidateCookiesCopied: 0, origin: '' };
     }
   },
 
@@ -2234,6 +2322,9 @@ export function ensureBrowserBridge(): boolean {
       // Rule mutations (disable signed-in, remove, ...) change the session
       // center — keep it in sync alongside the rules.
       void useBrowserStore.getState().loadSharedSessions();
+      // Phase 3 (§D line 264): the per-row visit/login status tracks the rules +
+      // grants; refresh it on every access change too.
+      void useBrowserStore.getState().loadSiteStatus();
     });
     api.access.onRequestsChanged(() => {
       void useBrowserStore.getState().loadAccessRequests();
@@ -2249,6 +2340,7 @@ export function ensureBrowserBridge(): boolean {
     );
     const s = useBrowserStore.getState();
     void s.loadAccessRules();
+    void s.loadSiteStatus();
     void s.loadAccessRequests();
     // WI-8: prime the JIT sign-in config mirror (hold timeout + unattended flag).
     void s.loadSigninConfig();

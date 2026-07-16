@@ -1,6 +1,6 @@
 import { DashboardClient } from './types';
 import type { AgentSupervisor } from '../supervisor';
-import { getAgent } from '../database';
+import { getAgent, getTurnSectionChanges } from '../database';
 
 /** Concrete DashboardClient over AgentSupervisor + DB. The narrow surface here
  *  is the single adapter point between the ported groupthink relay loop and the
@@ -40,5 +40,11 @@ export function createDashboardClient(supervisor: AgentSupervisor): DashboardCli
     // The standalone script cleaned up via DELETE /api/agents/:id → stopAgent
     // (mark done + kill process, keep DB record). Mirror that here.
     stopAgent: (id) => supervisor.stopAgent(id),
+    // WP6 done-detection: a section counts as "written" once a plan_section_changes
+    // row (WP4 reparse effect store) exists for it since dispatch. Bounded to now
+    // so a pre-dispatch change from an earlier run never satisfies this run.
+    sectionChangedSince: (planId, sectionAnchor, sinceIso) =>
+      getTurnSectionChanges(planId, sinceIso, new Date().toISOString())
+        .some((c) => c.sectionAnchor === sectionAnchor),
   };
 }

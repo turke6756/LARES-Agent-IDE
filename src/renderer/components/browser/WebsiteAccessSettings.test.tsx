@@ -8,16 +8,23 @@ import {
   useBrowserStore,
   type AccessRequest,
   type AccessRule,
+  type AccessSiteStatus,
   type HandedTabInfo,
   type SharedAgentSessions,
   type SignedInOrigin,
 } from '../../stores/browser-store';
 
-// Slice 12 (HALF B) acceptance for the "Sessions shared with agents" section
-// (WebsiteAccessSettings.tsx ~line 444). The section renders the live handed
-// tabs + persisted signed-in origins from store.sharedSessions and wires the
-// three per-row actions to the store. The destructive "Clear site session" uses
-// the SAME asymmetric confirm step as the allowSignedIn ON→OFF flow.
+// Phase 3 (§D lines 254-266) renderer acceptance for the SIMPLIFIED Website
+// access pane. The old three-control layout (hand-off toggle + "Sign in for
+// agent" + "Import my session" per row, collapsed-by-default list) collapsed
+// into: an EXPANDED-by-default allowlist, one "Agents may use my login" toggle
+// plus ONE contextual action (Set up / Re-authenticate / Turn off) derived from
+// the workspace-exact status seam, the five-word status vocabulary (Visit
+// allowed / Login off / Setup required / Ready / Needs sign-in), immediate setup
+// after request approval, and an Advanced & Activity disclosure that hides the
+// "Sessions shared with agents" / "Agent sign-in" / idle-discard sections until
+// opened. The SessionsSharedSection internals (WI-B/WI-E) are UNCHANGED — they
+// just relocated behind the Advanced disclosure, so those tests expand it first.
 
 // ── recorded store→IPC calls (spied via the window.api.browser stub) ──────────
 const updateCalls: Array<{ id: string; patch: Record<string, unknown> }> = [];
@@ -25,12 +32,18 @@ const clearCalls: string[] = [];
 const returnCalls: string[] = [];
 const decideCalls: Array<{ id: string; decision: string }> = [];
 const signinCalls: string[] = [];
-// WI-E: track "Import my session" calls + drive the imported count the mock returns.
+// WI-E: track "Import my session" calls + drive the copied count the mock returns.
+// Phase 2 (§D line 245): the import result reports candidateCookiesCopied (a setup
+// first step), NOT an imported=>signed-in count.
 const importCalls: string[] = [];
-let importResult: { imported: number; origin: string } = { imported: 1, origin: '' };
+let importResult: { candidateCookiesCopied: number; origin: string } = { candidateCookiesCopied: 1, origin: '' };
 let sharedFixture: SharedAgentSessions = { handedTabs: [], signedInOrigins: [] };
 let rulesFixture: AccessRule[] = [];
 let requestsFixture: AccessRequest[] = [];
+// Phase 3: the workspace-exact per-rule status seam the pane reads to label each
+// row's login chip + contextual action. Empty by default; a row with no entry
+// falls back to session:'none' (→ "Setup required" / "Set up").
+let siteStatusFixture: AccessSiteStatus[] = [];
 
 function makeRule(over: Partial<AccessRule> & { id: string }): AccessRule {
   return {
@@ -40,6 +53,16 @@ function makeRule(over: Partial<AccessRule> & { id: string }): AccessRule {
     allowSignedIn: false,
     enabled: true,
     createdAt: 0,
+    ...over,
+  };
+}
+
+function siteStatus(over: Partial<AccessSiteStatus> & { ruleId: string }): AccessSiteStatus {
+  return {
+    origin: 'https://mail.example',
+    visit: true,
+    login: true,
+    session: 'active',
     ...over,
   };
 }
@@ -92,8 +115,8 @@ function render() {
   });
 }
 
-// Flush the on-mount loads (loadAccessRules / loadAccessRequests /
-// loadSharedSessions) which resolve via the async api stub.
+// Flush the on-mount loads (loadAccessRules / loadSiteStatus / loadAccessRequests
+// / loadSharedSessions / loadSigninConfig) which resolve via the async api stub.
 async function settle() {
   await act(async () => {
     await new Promise((r) => setTimeout(r, 0));
@@ -125,6 +148,19 @@ function click(btn: HTMLElement | null) {
   act(() => btn.dispatchEvent(new MouseEvent('click', { bubbles: true })));
 }
 
+// Phase 3 (§D line 262): the "Sessions shared with agents" / "Agent sign-in" /
+// idle-discard sections now live behind the collapsed-by-default Advanced &
+// Activity disclosure — expand it before asserting on those sections. Match the
+// title via getAttribute (not a CSS attribute selector — jsdom's selector engine
+// mishandles the literal "&" in the title string).
+function expandAdvanced() {
+  const btn = [...container.querySelectorAll('button')].find(
+    (b) => b.getAttribute('title') === 'Expand Advanced & Activity',
+  );
+  if (!btn) throw new Error('Advanced & Activity disclosure toggle not found');
+  act(() => btn.dispatchEvent(new MouseEvent('click', { bubbles: true })));
+}
+
 // Drive a React-controlled textarea: set the native value via the prototype
 // setter (so React's value tracker sees the change) then dispatch a bubbling
 // input event so onChange fires.
@@ -147,16 +183,19 @@ beforeEach(() => {
   decideCalls.length = 0;
   signinCalls.length = 0;
   importCalls.length = 0;
-  importResult = { imported: 1, origin: 'https://imported.example' };
+  importResult = { candidateCookiesCopied: 1, origin: 'https://imported.example' };
   sharedFixture = { handedTabs: [], signedInOrigins: [] };
   rulesFixture = [];
   requestsFixture = [];
+  siteStatusFixture = [];
   (window as unknown as { api: unknown }).api = {
     browser: {
       setVisible: () => {},
       getSharedSessions: async () => sharedFixture,
       access: {
         list: async () => rulesFixture,
+        // Phase 3: the workspace-exact status seam the pane reads on mount.
+        siteStatus: async () => siteStatusFixture,
         requestList: async () => requestsFixture,
         update: async (id: string, patch: Record<string, unknown>) => {
           updateCalls.push({ id, patch });
@@ -218,6 +257,7 @@ beforeEach(() => {
     accessViewOpen: true,
     accessRules: [],
     accessRequests: [],
+    siteStatus: [],
     sharedSessions: { handedTabs: [], signedInOrigins: [] },
     handedTabIds: {},
     tabs: [],
@@ -231,6 +271,148 @@ afterEach(() => {
   delete (window as unknown as { api?: unknown }).api;
 });
 
+// ── Phase 3 (§D line 258): expanded-by-default list + Advanced disclosure ─────
+describe('WebsiteAccessSettings — first-screen layout (Phase 3 §D 258/262)', () => {
+  it('shows the allowlist rules WITHOUT expanding (list is open by default)', async () => {
+    rulesFixture = [makeRule({ id: 'r1', hostname: 'mail.example' })];
+    render();
+    await settle();
+
+    // The row is visible on the first screen — no expander click needed.
+    expect(container.textContent).toContain('mail.example');
+    // The allowlist toggle already offers to COLLAPSE (i.e. it starts expanded).
+    expect(byTitle('Collapse the allowlist')).not.toBeNull();
+    expect(byTitle('Expand the allowlist')).toBeNull();
+  });
+
+  it('hides the Advanced & Activity sections until the disclosure is expanded', async () => {
+    sharedFixture = {
+      handedTabs: [],
+      signedInOrigins: [origin({ ruleId: 'r1', hostname: 'mail.example' })],
+    };
+    render();
+    await settle();
+
+    // Off the primary at-a-glance surface until expanded.
+    expect(container.textContent).not.toContain('Sessions shared with agents');
+    expect(container.textContent).not.toContain('Agent sign-in');
+    expect(container.textContent).not.toContain('Suspend idle tabs');
+
+    expandAdvanced();
+    expect(container.textContent).toContain('Sessions shared with agents');
+    expect(container.textContent).toContain('Agent sign-in');
+    expect(container.textContent).toContain('Suspend idle tabs');
+  });
+});
+
+// ── Phase 3 (§D lines 259-260): status vocabulary + one contextual action ─────
+describe('WebsiteAccessSettings — row status chips + contextual action (Phase 3 §D 259/260)', () => {
+  it('an enabled visit-only rule (login off) shows "Visit allowed" + "Login off" and no login action', async () => {
+    rulesFixture = [makeRule({ id: 'r1', hostname: 'mail.example', allowSignedIn: false, enabled: true })];
+    render();
+    await settle();
+
+    expect(container.textContent).toContain('Visit allowed');
+    expect(container.textContent).toContain('Login off');
+    // No contextual login action (Set up / Re-authenticate / Turn off) — login off.
+    expect(buttonByText('Set up')).toBeNull();
+    expect(buttonByText('Re-authenticate')).toBeNull();
+    expect(buttonByText('Turn off')).toBeNull();
+  });
+
+  it('a disabled rule drops the "Visit allowed" chip (line-through descriptor carries it)', async () => {
+    rulesFixture = [makeRule({ id: 'r1', hostname: 'mail.example', allowSignedIn: false, enabled: false })];
+    render();
+    await settle();
+
+    expect(container.textContent).not.toContain('Visit allowed');
+    expect(container.textContent).toContain('Login off');
+  });
+
+  it('login on + session active → "Ready" chip and a "Turn off" action', async () => {
+    rulesFixture = [makeRule({ id: 'r1', hostname: 'mail.example', allowSignedIn: true })];
+    siteStatusFixture = [siteStatus({ ruleId: 'r1', login: true, session: 'active' })];
+    render();
+    await settle();
+
+    expect(container.textContent).toContain('Ready');
+    expect(container.textContent).toContain('Visit allowed');
+    expect(buttonByText('Turn off')).not.toBeNull();
+    expect(buttonByText('Set up')).toBeNull();
+    expect(buttonByText('Re-authenticate')).toBeNull();
+  });
+
+  it('"Turn off" opens the confirm-off dialog (no store call), then "keep session" revokes only', async () => {
+    rulesFixture = [makeRule({ id: 'r1', hostname: 'mail.example', allowSignedIn: true })];
+    siteStatusFixture = [siteStatus({ ruleId: 'r1', login: true, session: 'active' })];
+    render();
+    await settle();
+
+    click(buttonByText('Turn off'));
+    // The confirm-off prompt is shown; nothing persisted yet.
+    expect(updateCalls).toEqual([]);
+    expect(clearCalls).toEqual([]);
+    expect(container.textContent).toContain('Turning this off revokes');
+
+    click(buttonByText('Turn off, keep session'));
+    await settle();
+    expect(updateCalls).toEqual([{ id: 'r1', patch: { allowSignedIn: false } }]);
+    expect(clearCalls).toEqual([]);
+  });
+
+  it('"Turn off & clear session" both revokes and clears the stored session', async () => {
+    rulesFixture = [makeRule({ id: 'r1', hostname: 'mail.example', allowSignedIn: true })];
+    siteStatusFixture = [siteStatus({ ruleId: 'r1', login: true, session: 'active' })];
+    render();
+    await settle();
+
+    click(buttonByText('Turn off'));
+    click(buttonByText('Turn off & clear session'));
+    await settle();
+    expect(updateCalls).toEqual([{ id: 'r1', patch: { allowSignedIn: false } }]);
+    expect(clearCalls).toEqual(['r1']);
+  });
+
+  it('login on + session expired → "Needs sign-in" chip and a "Re-authenticate" action → beginSigninHandoff', async () => {
+    rulesFixture = [makeRule({ id: 'r1', hostname: 'mail.example', allowSignedIn: true })];
+    siteStatusFixture = [siteStatus({ ruleId: 'r1', login: true, session: 'expired' })];
+    render();
+    await settle();
+
+    expect(container.textContent).toContain('Needs sign-in');
+    const reauth = buttonByText('Re-authenticate');
+    expect(reauth).not.toBeNull();
+    click(reauth);
+    await settle();
+    expect(signinCalls).toEqual(['r1']);
+  });
+
+  it('login on + session setup_required → "Setup required" chip and a "Set up" action → beginSigninHandoff', async () => {
+    rulesFixture = [makeRule({ id: 'r1', hostname: 'mail.example', allowSignedIn: true })];
+    siteStatusFixture = [siteStatus({ ruleId: 'r1', login: true, session: 'setup_required' })];
+    render();
+    await settle();
+
+    expect(container.textContent).toContain('Setup required');
+    const setup = buttonByText('Set up');
+    expect(setup).not.toBeNull();
+    click(setup);
+    await settle();
+    expect(signinCalls).toEqual(['r1']);
+  });
+
+  it('login on but no status row yet (session none) falls back to "Setup required" / "Set up"', async () => {
+    rulesFixture = [makeRule({ id: 'r1', hostname: 'mail.example', allowSignedIn: true })];
+    siteStatusFixture = []; // no seam entry → session 'none'
+    render();
+    await settle();
+
+    expect(container.textContent).toContain('Setup required');
+    expect(buttonByText('Set up')).not.toBeNull();
+  });
+});
+
+// ── Slice 12 (relocated behind Advanced): "Sessions shared with agents" ────────
 describe('WebsiteAccessSettings — "Sessions shared with agents" (Slice 12 Half B)', () => {
   it('renders handed tabs + signed-in origin rows from store.sharedSessions', async () => {
     sharedFixture = {
@@ -239,6 +421,7 @@ describe('WebsiteAccessSettings — "Sessions shared with agents" (Slice 12 Half
     };
     render();
     await settle();
+    expandAdvanced();
 
     expect(container.textContent).toContain('Sessions shared with agents');
     // Handed-tab row (Mechanism B).
@@ -254,6 +437,7 @@ describe('WebsiteAccessSettings — "Sessions shared with agents" (Slice 12 Half
     sharedFixture = { handedTabs: [handed({ tabId: 't1' })], signedInOrigins: [] };
     render();
     await settle();
+    expandAdvanced();
 
     click(buttonByText('Return tab'));
     expect(returnCalls).toEqual(['t1']);
@@ -266,6 +450,7 @@ describe('WebsiteAccessSettings — "Sessions shared with agents" (Slice 12 Half
     };
     render();
     await settle();
+    expandAdvanced();
 
     click(buttonByText('Disable signed-in access'));
     expect(updateCalls).toEqual([{ id: 'r1', patch: { allowSignedIn: false } }]);
@@ -278,6 +463,7 @@ describe('WebsiteAccessSettings — "Sessions shared with agents" (Slice 12 Half
     };
     render();
     await settle();
+    expandAdvanced();
 
     // First click surfaces the confirm prompt — no IPC clear yet.
     click(buttonByText('Clear site session'));
@@ -297,12 +483,14 @@ describe('WebsiteAccessSettings — "Sessions shared with agents" (Slice 12 Half
     };
     render();
     await settle();
+    expandAdvanced();
 
     expect(container.textContent).toContain('Session may have expired');
   });
 });
 
 // ── Proactive-signin (2026-06-29) WI-B: per-row "Sign in" action ──────────────
+// (SessionsSharedSection internals unchanged; now behind the Advanced disclosure.)
 describe('WebsiteAccessSettings — proactive "Sign in" per row (WI-B)', () => {
   it('a "never" origin renders a primary "Sign in" button + neutral status, no Clear', async () => {
     sharedFixture = {
@@ -311,6 +499,7 @@ describe('WebsiteAccessSettings — proactive "Sign in" per row (WI-B)', () => {
     };
     render();
     await settle();
+    expandAdvanced();
 
     expect(container.textContent).toContain('never.example');
     expect(container.textContent).toContain('Not signed in');
@@ -327,6 +516,7 @@ describe('WebsiteAccessSettings — proactive "Sign in" per row (WI-B)', () => {
     };
     render();
     await settle();
+    expandAdvanced();
 
     click(buttonByText('Sign in'));
     await settle();
@@ -340,6 +530,7 @@ describe('WebsiteAccessSettings — proactive "Sign in" per row (WI-B)', () => {
     };
     render();
     await settle();
+    expandAdvanced();
 
     const reSignIn = buttonByIncludes('Session may have expired');
     expect(reSignIn).not.toBeNull();
@@ -355,6 +546,7 @@ describe('WebsiteAccessSettings — proactive "Sign in" per row (WI-B)', () => {
     };
     render();
     await settle();
+    expandAdvanced();
 
     expect(buttonByText('Sign in')).toBeNull();
     expect(buttonByIncludes('re-sign-in')).toBeNull();
@@ -372,6 +564,7 @@ describe('WebsiteAccessSettings — "Import my session" (WI-E)', () => {
     };
     render();
     await settle();
+    expandAdvanced();
 
     expect(buttonByText('Import my session')).not.toBeNull();
     expect(buttonByText('Sign in')).not.toBeNull();
@@ -384,6 +577,7 @@ describe('WebsiteAccessSettings — "Import my session" (WI-E)', () => {
     };
     render();
     await settle();
+    expandAdvanced();
 
     expect(buttonByText('Import my session')).not.toBeNull();
     expect(buttonByIncludes('Session may have expired')).not.toBeNull();
@@ -396,6 +590,7 @@ describe('WebsiteAccessSettings — "Import my session" (WI-E)', () => {
     };
     render();
     await settle();
+    expandAdvanced();
 
     expect(buttonByText('Import my session')).toBeNull();
   });
@@ -407,20 +602,22 @@ describe('WebsiteAccessSettings — "Import my session" (WI-E)', () => {
     };
     render();
     await settle();
+    expandAdvanced();
 
     click(buttonByText('Import my session'));
     await settle();
     expect(importCalls).toEqual(['r-never']);
   });
 
-  it('an imported:0 result surfaces the quiet Sign-in fallback notice', async () => {
-    importResult = { imported: 0, origin: 'https://never.example' };
+  it('a candidateCookiesCopied:0 result surfaces the quiet Sign-in fallback notice', async () => {
+    importResult = { candidateCookiesCopied: 0, origin: 'https://never.example' };
     sharedFixture = {
       handedTabs: [],
       signedInOrigins: [origin({ ruleId: 'r-never', hostname: 'never.example', state: 'never' })],
     };
     render();
     await settle();
+    expandAdvanced();
 
     expect(container.textContent).not.toContain('No saved login found');
     click(buttonByText('Import my session'));
@@ -428,14 +625,15 @@ describe('WebsiteAccessSettings — "Import my session" (WI-E)', () => {
     expect(container.textContent).toContain('No saved login found in your browser for this site');
   });
 
-  it('an imported>0 result shows no fallback notice', async () => {
-    importResult = { imported: 3, origin: 'https://never.example' };
+  it('a candidateCookiesCopied>0 result shows no fallback notice', async () => {
+    importResult = { candidateCookiesCopied: 3, origin: 'https://never.example' };
     sharedFixture = {
       handedTabs: [],
       signedInOrigins: [origin({ ruleId: 'r-never', hostname: 'never.example', state: 'never' })],
     };
     render();
     await settle();
+    expandAdvanced();
 
     click(buttonByText('Import my session'));
     await settle();
@@ -443,11 +641,8 @@ describe('WebsiteAccessSettings — "Import my session" (WI-E)', () => {
   });
 });
 
-// ── Proactive-signin (2026-06-29) WI-C: allowlist search ──────────────────────
+// ── Proactive-signin (2026-06-29) WI-C: allowlist search (list open by default) ─
 describe('WebsiteAccessSettings — allowlist search (WI-C)', () => {
-  function expandAllowlist() {
-    click(byTitle('Expand the allowlist'));
-  }
   function setInput(el: HTMLInputElement, value: string) {
     const setter = Object.getOwnPropertyDescriptor(
       window.HTMLInputElement.prototype,
@@ -466,9 +661,8 @@ describe('WebsiteAccessSettings — allowlist search (WI-C)', () => {
     ];
     render();
     await settle();
-    expandAllowlist();
 
-    // Both rules visible before filtering.
+    // Both rules visible before filtering — no expander click (list open by default).
     expect(container.textContent).toContain('mail.example');
     expect(container.textContent).toContain('docs.example');
 
@@ -491,20 +685,16 @@ describe('WebsiteAccessSettings — allowlist search (WI-C)', () => {
 
 // ── WI-5: consent gate at every grant path + login-URL pattern validation ─────
 describe('WebsiteAccessSettings — signed-in consent gate (WI-5)', () => {
-  function expandAllowlist() {
-    click(byTitle('Expand the allowlist'));
-  }
-
-  it('toggling allow-signed-in ON shows the 4-point consent and only persists + stamps consent_acked_at after acknowledgment', async () => {
+  it('toggling "Agents may use my login" ON shows the 4-point consent and only persists + stamps consent_acked_at after acknowledgment', async () => {
     rulesFixture = [makeRule({ id: 'r1', hostname: 'mail.example', allowSignedIn: false })];
     render();
     await settle();
-    expandAllowlist();
 
-    // Flip the per-row "Allow sign-in hand-off" switch ON.
-    click(byAriaLabel('Allow sign-in hand-off'));
+    // Flip the per-row "Agents may use my login" switch ON.
+    click(byAriaLabel('Agents may use my login'));
 
-    // The 4-point consent is shown; NOTHING is persisted yet.
+    // The 4-point consent is shown; NOTHING is persisted yet. (TRAP-3: the DIALOG
+    // still reads "in this workspace" even though the row descriptor names the ws.)
     expect(container.textContent).toContain('shared by every agent in this workspace');
     expect(container.textContent).toContain('not your private');
     expect(updateCalls).toEqual([]);
@@ -518,13 +708,23 @@ describe('WebsiteAccessSettings — signed-in consent gate (WI-5)', () => {
     expect(typeof updateCalls[0].patch.consentAckedAt).toBe('number');
   });
 
+  it('names the exact workspace on the consent surface (Phase 3 §D 263)', async () => {
+    rulesFixture = [makeRule({ id: 'r1', hostname: 'mail.example', allowSignedIn: false })];
+    render();
+    await settle();
+
+    click(byAriaLabel('Agents may use my login'));
+    // Default dashboard store (no workspaces / null selection) → "the default workspace".
+    expect(container.textContent).toContain('Workspace:');
+    expect(container.textContent).toContain('the default workspace');
+  });
+
   it('WI-E: the consent copy discloses the cookie copy honestly', async () => {
     rulesFixture = [makeRule({ id: 'r1', hostname: 'mail.example', allowSignedIn: false })];
     render();
     await settle();
-    expandAllowlist();
 
-    click(byAriaLabel('Allow sign-in hand-off'));
+    click(byAriaLabel('Agents may use my login'));
     expect(container.textContent).toContain('copy your current login for this site');
     expect(container.textContent).toContain('Google SSO');
   });
@@ -533,9 +733,8 @@ describe('WebsiteAccessSettings — signed-in consent gate (WI-5)', () => {
     rulesFixture = [makeRule({ id: 'r1', hostname: 'mail.example', allowSignedIn: false })];
     render();
     await settle();
-    expandAllowlist();
 
-    click(byAriaLabel('Allow sign-in hand-off'));
+    click(byAriaLabel('Agents may use my login'));
     click(buttonByIncludes('I understand'));
     await settle();
     // The grant persisted AND the import auto-fired for the same rule.
@@ -547,44 +746,45 @@ describe('WebsiteAccessSettings — signed-in consent gate (WI-5)', () => {
     rulesFixture = [makeRule({ id: 'r1', allowSignedIn: false })];
     render();
     await settle();
-    expandAllowlist();
 
-    click(byAriaLabel('Allow sign-in hand-off'));
+    click(byAriaLabel('Agents may use my login'));
     expect(container.textContent).toContain('shared by every agent in this workspace');
     // The dialog's Cancel.
     click(buttonByText('Cancel'));
     expect(updateCalls).toEqual([]);
   });
 
-  it('approve_signed_in routes through the SAME consent and stamps consent_acked_at on the created rule', async () => {
+  it('"Allow visit and set up login" routes through the SAME consent, stamps the created rule, AND chains setup', async () => {
     requestsFixture = [request({ id: 'req1', hostname: 'boards.example', wantSignedIn: true })];
     render();
     await settle();
 
-    // The pending request is surfaced.
+    // The pending request is surfaced (always on top — not behind Advanced).
     expect(container.textContent).toContain('boards.example');
 
-    // "Approve + allow signed in" shows consent FIRST — no decision dispatched yet.
-    click(buttonByText('Approve + allow signed in'));
+    // The relabeled approve button shows consent FIRST — no decision dispatched yet.
+    click(buttonByText('Allow visit and set up login'));
     expect(decideCalls).toEqual([]);
     expect(container.textContent).toContain('shared by every agent in this workspace');
 
-    // Acknowledge → decide approve_signed_in, then stamp consent on the new rule.
+    // Acknowledge → decide approve_signed_in, stamp consent on the new rule, THEN
+    // chain beginSigninHandoff on the created rule (Phase 3 §D 261).
     click(buttonByIncludes('I understand'));
     await settle();
     expect(decideCalls).toEqual([{ id: 'req1', decision: 'approve_signed_in' }]);
     const stamp = updateCalls.find((c) => c.id === 'r-created');
     expect(stamp).toBeTruthy();
     expect(typeof stamp!.patch.consentAckedAt).toBe('number');
+    // Immediate setup after approval: the created rule id flows into handoffSignin.
+    expect(signinCalls).toContain('r-created');
   });
 
   it('rejects a regex-like login-URL pattern and accepts a glob (validation in the UI)', async () => {
     rulesFixture = [makeRule({ id: 'r1', hostname: 'mail.example', allowSignedIn: true })];
     render();
     await settle();
-    expandAllowlist();
 
-    // Open the per-rule patterns editor.
+    // Open the per-rule patterns editor (list is expanded by default).
     click(buttonByText('Login-URL patterns'));
     const ta = container.querySelector('textarea') as HTMLTextAreaElement;
     expect(ta).not.toBeNull();
@@ -603,16 +803,21 @@ describe('WebsiteAccessSettings — signed-in consent gate (WI-5)', () => {
     expect(saved?.patch.loginUrlPatterns).toEqual(['*/candidate/*', '/sso']);
   });
 
-  it('WI-8: the Agent sign-in section toggles the unattended flag through the store', async () => {
+  it('WI-8: the Agent sign-in section (behind Advanced) toggles the unattended flag through the store', async () => {
     render();
     await settle();
+    expandAdvanced();
 
     expect(container.textContent).toContain('Agent sign-in');
-    const checkbox = container.querySelector(
+    // The expanded AddRuleForm also has an "Include subdomains" checkbox, so target
+    // the unattended box specifically via its label text (not a pane-wide query).
+    const unattendedLabel = [...container.querySelectorAll('label')].find((l) =>
+      l.textContent?.includes('Unattended runs'),
+    );
+    expect(unattendedLabel).not.toBeUndefined();
+    const checkbox = unattendedLabel!.querySelector(
       'input[type="checkbox"]',
     ) as HTMLInputElement | null;
-    // The unattended checkbox is present (it's the only checkbox in this pane while
-    // the allowlist is collapsed) and starts unchecked.
     expect(checkbox).not.toBeNull();
     expect(checkbox!.checked).toBe(false);
     // A real click flips it on (jsdom toggles + fires change → onChange).

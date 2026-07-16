@@ -201,6 +201,9 @@ export class WindowsRunner extends EventEmitter {
       case 'pid':
         this._pid = msg.pid;
         console.log(`[WindowsRunner] PTY pid: ${msg.pid}`);
+        // D4 ownership: the root PID arrives asynchronously from the pty host, so
+        // surface it as an event for the supervisor to record durable ownership.
+        this.emit('pid', msg.pid);
         break;
 
       case 'exit':

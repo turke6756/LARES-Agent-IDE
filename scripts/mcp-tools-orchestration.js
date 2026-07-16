@@ -1,4 +1,10 @@
 const { decidePollAction } = require('./mcp-supervisor-poll');
+// GT-C Decision 2 (§2.5): when a launch_agent call carries a plan-rail
+// (plan_id + section_anchor), append the canonical WRITER rail contract to the
+// submitted prompt so a launch_agent worker gets the same edit-discipline +
+// PLAN-EVENT sentinel as GroupThink writers. Byte-identical mirror of the TS
+// canonical (src/main/plans/plan-rail-contract.ts), guarded by the sync test.
+const { planRailContractBlock } = require('./lib/plan-rail-contract.js');
 
 function getOrchestrationToolDefinitions() {
   return [
@@ -23,6 +29,8 @@ function getOrchestrationToolDefinitions() {
           supervised: { type: 'boolean', description: 'Whether the supervisor is notified on agent status changes (default: true for supervisor-launched workers — set false to opt out).' },
           is_researcher: { type: 'boolean', description: 'Launch the workspace RESEARCHER role-lane (default: false). The researcher browses + researches the web and writes findings into .dashboard/research/inbox/, but cannot run Bash, edit code, run notebooks, or launch agents. Claude-only (non-claude is rejected). When true, the app manages cwd/command/tools and the browser MCP — `provider`, `command`, `template_id`, and `persona` are ignored.' },
           fresh_session: { type: 'boolean', description: 'Codex-only hint (default: false). When true, the agent launches without `codex resume` so the codex CLI mints a fresh conversation rather than inheriting any prior rollout in this workspace. The dashboard still discovers and binds the new session id. Use this when you want a clean context but parallel agents in the same workspace. No-op for non-codex providers.' },
+          plan_id: { type: 'string', description: 'Planning-surface rail: an existing plan id (from create_plan). Frozen onto the agent at launch and injected as AGENT_DASHBOARD_PLAN_ID so the worker\'s read/edit breadcrumbs and plan_events attribute to this plan. The launch route 400s an unknown plan_id.' },
+          section_anchor: { type: 'string', description: 'Planning-surface rail: the sec_ section anchor this agent is dispatched to write. Frozen at launch and injected as AGENT_DASHBOARD_PLAN_SECTION (the dispatched-intent fallback when no read/edit breadcrumb is observed). Set it to the section the worker will UPDATE — for checklist execution that is sec_opitem. NEVER dispatch to sec_exectr (the execution trail is system-owned, auto-generated from trusted write events; a writer there is dropped from attribution). The plan-bound brief must mandate a turn-end writeback: the worker flips its completed items\' `&#9744;`→`&#9745;` in this section (native HTML edit) and emits a `<!--PLAN-EVENT …-->` sentinel — that edit is what materializes the trail lines and the visible checkmarks.' },
         },
         required: ['title'],
       },
@@ -148,6 +156,8 @@ function getOrchestrationToolDefinitions() {
           lead_provider:      { type: 'string', description: 'Default claude.' },
           reviewer_provider:  { type: 'string', description: 'Default codex.' },
           turn_timeout_ms:    { type: 'number', description: 'Per-turn stall timeout, default 600000.' },
+          plan_id:            { type: 'string', description: 'Planning-surface rail: an existing plan id (from create_plan). When set, the run edits that surface at section_anchor instead of writing a fresh plan file — both are injected into each member agent as AGENT_DASHBOARD_PLAN_ID/_PLAN_SECTION, one-writer-per-plan is enforced at dispatch (409 if a live run already owns this plan), and done-detection watches the section for a content change.' },
+          section_anchor:     { type: 'string', description: 'Planning-surface rail: the sec_ writeback target within plan_id. Required alongside plan_id for section-change done-detection; baked into the planner/synthesizer prompts as the write destination. Set it to the section the run will UPDATE (sec_opitem for checklist execution). NEVER target sec_exectr — the execution trail is system-owned, auto-generated from trusted write events, and edits there are dropped from attribution. The prompts must mandate a turn-end writeback: flip completed items\' `&#9744;`→`&#9745;` in this section (native HTML edit) and emit a `<!--PLAN-EVENT …-->` sentinel, which is what materializes the trail lines and the visible checkmarks.' },
           resume_run_id:      { type: 'string', description: 'Resume a prior stalled run by its runId.' },
           resume_lead_id:     { type: 'string', description: 'Legacy serial resume: lead agent id.' },
           resume_reviewer_id: { type: 'string', description: 'Legacy serial resume: reviewer agent id.' },
@@ -197,6 +207,11 @@ async function handleOrchestrationToolCall(name, args, apiRequest) {
       // true to start codex with a clean context in a workspace that has
       // had prior codex work.
       if (args.fresh_session !== undefined) input.freshSession = args.fresh_session;
+      // Planning-surface rail (WP6): freeze plan_id/section_anchor onto the agent
+      // so the launch rail injects AGENT_DASHBOARD_PLAN_ID/_PLAN_SECTION at both
+      // env sites. The route validates plan_id existence (400 on unknown).
+      if (args.plan_id !== undefined) input.planId = args.plan_id;
+      if (args.section_anchor !== undefined) input.planSection = args.section_anchor;
       // Researcher role-lane (browser-parity-and-capability-isolation §0): a
       // hardcoded app primitive. The supervisor (AgentSupervisor.launchAgent)
       // forces provider=claude, the canonical command, the browser MCP toolset,
@@ -262,9 +277,15 @@ async function handleOrchestrationToolCall(name, args, apiRequest) {
           // result reports whether the worker turn ACTUALLY started — not
           // just that bytes were typed.
           const submit = args.submit !== false;
+          // Rail dispatch: a plan-bound launch (plan_id + section_anchor) gets the
+          // writer contract appended to the submitted prompt. Non-rail launches
+          // send args.prompt verbatim.
+          const submittedPrompt = (args.plan_id && args.section_anchor)
+            ? args.prompt + '\n\n' + planRailContractBlock(args.plan_id, args.section_anchor)
+            : args.prompt;
           try {
             const r = await apiRequest('POST', `/api/agents/${agent.id}/input`, {
-              text: args.prompt,
+              text: submittedPrompt,
               submit,
               confirm: submit,
             });
@@ -341,6 +362,7 @@ async function handleOrchestrationToolCall(name, args, apiRequest) {
       const params = {
         workspaceId: args.workspace_id, supervisorId: args.supervisor_id,
         mode: args.mode, topic: args.topic, planPath: args.plan_path,
+        planId: args.plan_id, sectionAnchor: args.section_anchor,
         leadProvider: args.lead_provider, reviewerProvider: args.reviewer_provider,
         turnTimeoutMs: args.turn_timeout_ms,
         resumeRunId: args.resume_run_id, resumeLeadId: args.resume_lead_id,

@@ -5,6 +5,7 @@ import AgentGrid from '../agent/AgentGrid';
 import AgentLaunchDialog from '../agent/AgentLaunchDialog';
 import FileViewerPanel from '../fileviewer/FileViewerPanel';
 import BrowserPanel from '../browser/BrowserPanel';
+import PlansMenu from '../plan/PlansMenu';
 import { useBrowserStore, ensureBrowserBridge } from '../../stores/browser-store';
 import * as Icons from 'lucide-react';
 import vscodeIcon from '../../assets/material-icons/vscode.svg';
@@ -31,14 +32,34 @@ function useSwipe(onSwipe: () => void, direction: 'left' | 'right') {
   return { onPointerDown, onPointerUp };
 }
 
+// Shown in the center slot when the selected view is torn off into its own OS
+// window — the view is non-activatable in the main window until that window
+// closes (view-detach §5).
+function DetachedViewPlaceholder({ label }: { label: string }) {
+  return (
+    <div className="flex-1 flex items-center justify-center text-gray-500 p-6">
+      <div className="max-w-sm text-center panel-shell rounded-xl p-6" style={{ borderStyle: 'dashed' }}>
+        <Icons.ExternalLink className="w-6 h-6 mx-auto mb-3 opacity-60" />
+        <div className="text-[13px] text-gray-300">
+          The {label} is open in a separate window.
+        </div>
+        <div className="text-[12px] text-gray-500 mt-1">
+          Close that window to bring it back here.
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function MainContent() {
-  const { workspaces, selectedWorkspaceId, fileViewerOpen, browserOpen, openTabs } = useDashboardStore(
+  const { workspaces, selectedWorkspaceId, fileViewerOpen, browserOpen, openTabs, detachedViews } = useDashboardStore(
     useShallow((s) => ({
       workspaces: s.workspaces,
       selectedWorkspaceId: s.selectedWorkspaceId,
       fileViewerOpen: s.fileViewerOpen,
       browserOpen: s.browserOpen,
       openTabs: s.openTabs,
+      detachedViews: s.detachedViews,
     })),
   );
   const showFileViewer = useDashboardStore((s) => s.showFileViewer);
@@ -50,6 +71,44 @@ export default function MainContent() {
   const workspace = workspaces.find((w) => w.id === selectedWorkspaceId);
 
   const swipeToFiles = useSwipe(() => showFileViewer(), 'left');
+
+  const dashboardDetached = detachedViews.includes('dashboard');
+  const filesDetached = detachedViews.includes('files');
+  const browserDetached = detachedViews.includes('browser');
+  const plansDetached = detachedViews.includes('plans');
+
+  // View tear-off gesture — the HTML5-drag-out-of-window pattern copied from
+  // FileTabBar.handleDragEnd. A drag that ends with no accepting drop target
+  // (dropEffect 'none') spawns a detached OS window for that view at the cursor
+  // and hollows out the button. screenX/Y and dropEffect are read SYNCHRONOUSLY
+  // (the event is neutered after the first await). All four center views are
+  // draggable: Dashboard + Files (pure renderer DOM) and Browser + Plans (their
+  // main-process WebContentsView re-parents into the detached window on detach).
+  type DraggableView = 'dashboard' | 'files' | 'plans' | 'browser';
+  const handleViewDragStart = (e: React.DragEvent, view: DraggableView) => {
+    e.dataTransfer.setData('text/plain', `view:${view}`);
+    e.dataTransfer.effectAllowed = 'move';
+  };
+  const handleViewDragEnd = async (e: React.DragEvent, view: DraggableView) => {
+    const accepted = e.dataTransfer.dropEffect !== 'none';
+    const capturedX = e.screenX;
+    const capturedY = e.screenY;
+    if (accepted) return; // dropped somewhere in-app — not a tear-off
+    const store = useDashboardStore.getState();
+    const workspaceId = store.selectedWorkspaceId;
+    const ws = store.workspaces.find((w) => w.id === workspaceId);
+    if (!workspaceId || !ws) return;
+    const res = await window.api.views.detach({
+      view,
+      workspaceId,
+      label: ws.title,
+      x: capturedX,
+      y: capturedY,
+    });
+    if (res.ok && !res.focusedExisting) {
+      useDashboardStore.getState().markViewDetached(view);
+    }
+  };
 
   // Subscribe the browser store to main-process tab events. MainContent is
   // always mounted, so agent-opened tabs raise attention even while the pane
@@ -121,24 +180,9 @@ export default function MainContent() {
         <div ref={headerRowRef} className="flex items-center justify-between w-full gap-3 min-w-0">
           <div className="min-w-0">
             <div className="flex items-baseline gap-2">
-              <h2 className="text-[14px] font-semibold text-gray-100 truncate">
+              <h2 className="text-[18px] font-bold text-gray-100 truncate">
                 {workspace.title}
               </h2>
-            </div>
-
-            <div className="flex items-center gap-3 mt-0.5">
-              <span className="text-[11px] text-gray-500">
-                {workspace.path}
-              </span>
-              <span
-                className={`text-[11px] px-1.5 py-0.5 font-semibold ${
-                  workspace.pathType === 'wsl'
-                    ? 'text-accent-orange bg-accent-orange/10'
-                    : 'text-accent-blue bg-accent-blue/10'
-                }`}
-              >
-                {workspace.pathType === 'wsl' ? 'WSL' : 'Windows'}
-              </span>
             </div>
           </div>
 
@@ -149,35 +193,65 @@ export default function MainContent() {
                 launched agents nested beneath (buildAgentForest). */}
             <div ref={toolbarRef} className="flex gap-2">
               <button
-                onClick={() => showDashboard()}
+                data-testid="view-btn-dashboard"
+                draggable={!dashboardDetached}
+                onDragStart={(e) => handleViewDragStart(e, 'dashboard')}
+                onDragEnd={(e) => handleViewDragEnd(e, 'dashboard')}
+                onClick={() => { if (!dashboardDetached) showDashboard(); }}
+                aria-disabled={dashboardDetached}
                 className={`ui-btn ui-btn-outline shrink-0 whitespace-nowrap px-3 py-1.5 text-[13px] font-medium ${
-                  dashboardActive ? 'ui-btn-success is-active' : ''
+                  dashboardDetached
+                    ? 'opacity-40 cursor-not-allowed border-dashed'
+                    : dashboardActive ? 'ui-btn-success is-active' : ''
                 }`}
-                title="Agent dashboard"
+                style={dashboardDetached ? { borderStyle: 'dashed' } : undefined}
+                title={dashboardDetached ? 'Dashboard is open in a separate window — close it to restore' : 'Agent dashboard — drag out to open in its own window'}
               >
                 <Icons.LayoutGrid className="w-4 h-4 shrink-0" />
                 {!toolbarCompact && 'Dashboard'}
               </button>
               <button
-                onClick={() => showFileViewer()}
+                data-testid="view-btn-files"
+                draggable={!filesDetached}
+                onDragStart={(e) => handleViewDragStart(e, 'files')}
+                onDragEnd={(e) => handleViewDragEnd(e, 'files')}
+                onClick={() => { if (!filesDetached) showFileViewer(); }}
+                aria-disabled={filesDetached}
                 className={`ui-btn ui-btn-outline shrink-0 whitespace-nowrap px-3 py-1.5 text-[13px] font-medium ${
-                  fileViewerOpen ? 'ui-btn-success is-active' : hasOpenTabs ? 'ui-btn-success' : ''
+                  filesDetached
+                    ? 'opacity-40 cursor-not-allowed'
+                    : fileViewerOpen ? 'ui-btn-success is-active' : hasOpenTabs ? 'ui-btn-success' : ''
                 }`}
-                title={hasOpenTabs ? `Files (${workspaceTabCount} tabs open)` : 'Browse files'}
+                style={filesDetached ? { borderStyle: 'dashed' } : undefined}
+                title={filesDetached ? 'Files is open in a separate window — close it to restore' : hasOpenTabs ? `Files (${workspaceTabCount} tabs open) — drag out to open in its own window` : 'Browse files — drag out to open in its own window'}
               >
                 <Icons.FileText className="w-4 h-4 shrink-0" />
                 {toolbarCompact ? (hasOpenTabs ? workspaceTabCount : '') : `Files${hasOpenTabs ? ` (${workspaceTabCount})` : ''}`}
               </button>
               <button
-                onClick={() => showBrowser()}
+                data-testid="view-btn-browser"
+                draggable={!browserDetached}
+                onDragStart={(e) => handleViewDragStart(e, 'browser')}
+                onDragEnd={(e) => handleViewDragEnd(e, 'browser')}
+                onClick={() => { if (!browserDetached) showBrowser(); }}
+                aria-disabled={browserDetached}
                 className={`ui-btn ui-btn-outline shrink-0 whitespace-nowrap px-3 py-1.5 text-[13px] font-medium ${
-                  browserOpen && !fileViewerOpen ? 'ui-btn-success is-active' : browserPaneAttention ? 'ui-btn-warning animate-pulse' : ''
+                  browserDetached
+                    ? 'opacity-40 cursor-not-allowed'
+                    : browserOpen && !fileViewerOpen ? 'ui-btn-success is-active' : browserPaneAttention ? 'ui-btn-warning animate-pulse' : ''
                 }`}
-                title={browserPaneAttention ? 'Browser — an agent opened a page for you' : 'Open browser pane'}
+                style={browserDetached ? { borderStyle: 'dashed' } : undefined}
+                title={browserDetached ? 'Browser is open in a separate window — close it to restore' : browserPaneAttention ? 'Browser — an agent opened a page for you' : 'Open browser pane — drag out to open in its own window'}
               >
                 <Icons.Globe className="w-4 h-4 shrink-0" />
                 {!toolbarCompact && 'Browser'}
               </button>
+              <PlansMenu
+                compact={toolbarCompact}
+                detached={plansDetached}
+                onDragStart={(e) => handleViewDragStart(e, 'plans')}
+                onDragEnd={(e) => handleViewDragEnd(e, 'plans')}
+              />
               <button
                 onClick={() => window.api.workspaces.openInVSCode(workspace.id)}
                 className="ui-btn ui-btn-outline shrink-0 whitespace-nowrap px-3 py-1.5 text-[13px] font-medium"
@@ -199,11 +273,21 @@ export default function MainContent() {
         </div>
       </div>
 
-      {/* Center view — header above stays fixed across all three. */}
-      {fileViewerOpen ? (
+      {/* Center view — header above stays fixed across all three. A detached
+          view's slot is non-activatable (view-detach §5): when the selected
+          center view is torn off, its slot shows a placeholder pointing at the
+          external window instead. Selection order mirrors the flags: Files >
+          Browser > Dashboard(grid). */}
+      {fileViewerOpen && !filesDetached ? (
         <FileViewerPanel />
-      ) : browserOpen ? (
+      ) : browserOpen && !browserDetached ? (
         <BrowserPanel />
+      ) : browserOpen && browserDetached ? (
+        <DetachedViewPlaceholder label="Browser" />
+      ) : fileViewerOpen && filesDetached ? (
+        <DetachedViewPlaceholder label="Files" />
+      ) : dashboardDetached ? (
+        <DetachedViewPlaceholder label="Dashboard" />
       ) : (
         /* Agent Grid — swipe left to open file viewer */
         <div

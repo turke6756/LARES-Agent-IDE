@@ -162,6 +162,8 @@ test('table columns match plan §5 exactly — no generic target_id', () => {
     'created_at', 'updated_at', 'sent_at', 'resolved_at',
     // appended by the highlight-feature migration (ALTER TABLE ADD COLUMN)
     'kind',
+    // appended by the PDF dual-viewer trunk migration (plan Part 1.4)
+    'anchor_type', 'anchor_json',
   ]);
 });
 
@@ -353,6 +355,108 @@ test('markSelectionCommentsSendFailed sets status and updated_at, keeps sent_at 
   assert.equal(failedRow.sentAt, null);
   assert.equal(failedRow.sentToAgentId, 'agent-9', 'agent id preserved for retry context');
   assert.notEqual(failedRow.updatedAt, BACKDATE, 'updated_at maintained');
+  dbm.deleteSelectionComment(c.id);
+});
+
+// ── PDF anchor columns (plan Part 1.4) ───────────────────────────────
+
+const PDF_ANCHOR = {
+  version: 1,
+  fingerprint: 'fp-xyz',
+  prefix: 'context before',
+  suffix: 'context after',
+  pages: [
+    {
+      pageIndex: 2,
+      pageLabel: '3',
+      start: { itemIndex: 0, charOffset: 0 },
+      end: { itemIndex: 1, charOffset: 3 },
+      rects: [{ x: 0.1, y: 0.2, width: 0.3, height: 0.05 }],
+    },
+  ],
+};
+
+test('old-DB migration: ADD COLUMN … DEFAULT backfills legacy rows', () => {
+  // A store predating the trunk migration: no anchor_type/anchor_json columns.
+  const legacy = new sqlJsCtor();
+  legacy.exec(`CREATE TABLE selection_comments (
+    id TEXT PRIMARY KEY, workspace_id TEXT, target_type TEXT,
+    file_path TEXT, quoted_text TEXT, body TEXT, status TEXT )`);
+  legacy.run(
+    `INSERT INTO selection_comments (id, workspace_id, target_type, file_path, quoted_text, body, status)
+     VALUES ('old1','ws','file','f.md','q','b','draft')`
+  );
+  // The house additive-migration idiom, verbatim.
+  legacy.exec(`ALTER TABLE selection_comments ADD COLUMN anchor_type TEXT NOT NULL DEFAULT 'text'`);
+  legacy.exec(`ALTER TABLE selection_comments ADD COLUMN anchor_json TEXT`);
+
+  const stmt = legacy.prepare(`SELECT anchor_type, anchor_json FROM selection_comments WHERE id = 'old1'`);
+  stmt.step();
+  const row = stmt.getAsObject();
+  stmt.free();
+  assert.equal(row.anchor_type, 'text', 'legacy row backfilled to text');
+  assert.equal(row.anchor_json, null, 'legacy anchor_json NULL');
+});
+
+test('text comments default anchorType text with a null pdfAnchor', () => {
+  const c = dbm.createSelectionComment(makeInput());
+  assert.equal(c.anchorType, 'text');
+  assert.equal(c.pdfAnchor, null);
+  dbm.deleteSelectionComment(c.id);
+});
+
+test('PDF anchor round-trips and pins doc_hash to the fingerprint', () => {
+  const c = dbm.createSelectionComment(makeInput({ anchorType: 'pdf', pdfAnchor: PDF_ANCHOR, docHash: undefined }));
+  assert.equal(c.anchorType, 'pdf');
+  assert.deepEqual(c.pdfAnchor, PDF_ANCHOR);
+  assert.equal(c.docHash, 'fp-xyz', 'fingerprint stored as doc_hash');
+  // quoted_text/body still populated for UI/search/prompt compatibility.
+  assert.equal(c.quotedText, 'the quoted text,\nwith a line break');
+  dbm.deleteSelectionComment(c.id);
+});
+
+test('createSelectionComment rejects an invalid PDF anchor before write', () => {
+  assert.throws(
+    () => dbm.createSelectionComment(makeInput({
+      anchorType: 'pdf',
+      pdfAnchor: { version: 1, fingerprint: '', pages: [], prefix: '', suffix: '' },
+    })),
+    /Invalid PDF anchor/,
+  );
+  // anchorType 'pdf' with no anchor is also rejected.
+  assert.throws(() => dbm.createSelectionComment(makeInput({ anchorType: 'pdf' })));
+});
+
+test('malformed stored anchor_json reads back as pdfAnchor null (no throw)', () => {
+  const c = dbm.createSelectionComment(makeInput());
+  raw(`UPDATE selection_comments SET anchor_type = 'pdf', anchor_json = '{not valid json' WHERE id = ?`, [c.id]);
+  const back = dbm.getSelectionComment(c.id)!;
+  assert.equal(back.anchorType, 'pdf');
+  assert.equal(back.pdfAnchor, null, 'corrupt JSON degrades to no anchor');
+  dbm.deleteSelectionComment(c.id);
+});
+
+test('updateSelectionComment attaches then clears a PDF anchor', () => {
+  const c = dbm.createSelectionComment(makeInput());
+  const withPdf = dbm.updateSelectionComment(c.id, { anchorType: 'pdf', pdfAnchor: PDF_ANCHOR })!;
+  assert.equal(withPdf.anchorType, 'pdf');
+  assert.deepEqual(withPdf.pdfAnchor, PDF_ANCHOR);
+  assert.equal(withPdf.docHash, 'fp-xyz', 'doc_hash follows the fingerprint');
+
+  const cleared = dbm.updateSelectionComment(c.id, { anchorType: 'text', pdfAnchor: null })!;
+  assert.equal(cleared.anchorType, 'text');
+  assert.equal(cleared.pdfAnchor, null);
+  dbm.deleteSelectionComment(c.id);
+});
+
+test('updateSelectionComment rejects an invalid PDF anchor', () => {
+  const c = dbm.createSelectionComment(makeInput());
+  assert.throws(() => dbm.updateSelectionComment(c.id, {
+    anchorType: 'pdf',
+    pdfAnchor: { version: 1, fingerprint: 'fp', pages: [], prefix: '', suffix: '' },
+  }));
+  // Row untouched — still a text comment.
+  assert.equal(dbm.getSelectionComment(c.id)!.anchorType, 'text');
   dbm.deleteSelectionComment(c.id);
 });
 

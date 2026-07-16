@@ -1,11 +1,19 @@
-import { app, BrowserWindow, crashReporter, dialog, protocol, net, session, nativeTheme, ipcMain } from 'electron';
+import { app, BrowserWindow, crashReporter, dialog, protocol, session, nativeTheme, ipcMain } from 'electron';
 import path from 'path';
 import fs from 'fs';
 import { loadPersistedTheme } from './theme-persistence';
-import { initDatabase, getWorkspaces } from './database';
+import {
+  initDatabase, getWorkspaces, getActiveAgents,
+  getPlan, getWorkspace, listOrchestrationRuns, getLiveRailAgentForPlan, getPlanEventsForRender,
+} from './database';
+import { createHash } from 'crypto';
+import { readFileContents } from './file-reader';
+import { getServedPlanProjection } from './plans/watch-plans';
+import { trailMaterializer } from './plans/execution-trail-writer';
+import { EXEC_TRAIL_MAX_ENTRIES, observedViaLabel, type TrailEntry } from './plans/execution-trail';
+import { formatRepoDigest } from './plans/repo-activity';
 import { validateAndRepairClaudeJson, validateAndRepairWslClaudeJson, startClaudeJsonRuntimeWatcher, stopClaudeJsonRuntimeWatcher } from './claude-config-repair';
 import { checkManagedWebContents } from './security/webcontents-guard';
-import { resolveConfined } from './security/path-confinement';
 import { AgentSupervisor } from './supervisor';
 import { startContinuationWatcher } from './supervisor/continuation-watcher-wiring';
 import { registerIpcHandlers } from './ipc-handlers';
@@ -14,16 +22,34 @@ import { WsServer } from './ws-server';
 import { ApiServer, type BrowserToolProvider } from './api-server';
 import { OrchestrationService } from './orchestration/service';
 import { createDashboardClient } from './orchestration/dashboard-client';
-import { pathToFileURL } from 'url';
 import { wslToWindowsPath } from './path-utils';
+import { registerMediaProtocol } from './media-protocol';
 import { shutdownJupyterServer } from './jupyter-server';
 import { disposeKernelClient } from './jupyter-kernel-client';
 import { closeAllWatchers as closeAllFsWatchers } from './fs-watcher';
+import { startPlansWatcher, PlansWatcher } from './plans-watcher';
+import { configureReparser, reparsePlanFile } from './plans/watch-plans';
 import { JUPYTER_BASE_PORT, JUPYTER_PORT_RETRIES } from './control-ports';
 import { buildChromeUA } from './browser/browser-decisions';
 import { BrowserManager } from './browser/browser-manager';
 import { registerBrowserIpc } from './browser/browser-ipc';
+import { PlanPaneManager } from './plans/plan-pane-manager';
+import { registerPlanIpc } from './plans/plan-ipc';
 import { stripClaudeChildEnvInPlace } from './supervisor/env-sanitize';
+import { installShellSpellcheckContextMenu } from './spellcheck-context-menu';
+import { MemorySampler } from './watchdog/memory-sampler';
+import { createCommitReader, type NativeCommitProvider } from './watchdog/commit-reader';
+import { RenderRecoveryPolicy } from './watchdog/render-recovery';
+import type { MemorySnapshot, AdmissionDecision } from './watchdog/types';
+// WAVE-4 full-D5: per-agent attribution + budgets service (owns the periodic
+// process-memory snapshot, the cached rollup, and the budget/owned-cap admission
+// helpers). Constructed at ready alongside the sampler.
+import { AttributionService } from './watchdog/attribution-service';
+import {
+  listDetachedProcesses,
+  detachedDirFor,
+  defaultDetachedRegistryDeps,
+} from './detached-process-registry';
 
 // First executable statement of the main process, before any supervisor /
 // runner construction: strip Claude Code child-session markers inherited when
@@ -54,6 +80,15 @@ crashReporter.start({ uploadToServer: false });
 // Append (never truncate) so a crash loop preserves history. Sync write — the
 // process is about to die, there is no later flush.
 const CRASH_LOG_PATH = path.join(app.getAppPath(), '.dashboard', 'main-crash.log');
+
+/** Join a workspace-relative `plans/…` path onto the workspace root (host sep).
+ *  Mirrors api-server.ts `absPlanPath` — kept local to avoid a cross-module import
+ *  for the Execution-Trail materializer wiring. */
+function planAbsPath(wsPath: string, relPath: string): string {
+  const sep = wsPath.includes('\\') ? '\\' : '/';
+  const base = wsPath.replace(/[\\/]+$/, '');
+  return `${base}${sep}${relPath.replace(/\//g, sep)}`;
+}
 function logCrash(kind: string, err: unknown): void {
   const detail = err instanceof Error ? (err.stack ?? err.message) : String(err);
   try {
@@ -137,6 +172,19 @@ let wsServer: WsServer | null = null;
 let apiServer: ApiServer | null = null;
 let orchestration: OrchestrationService | null = null;
 let browserManager: BrowserManager | null = null;
+// D5-lite memory watchdog + D1 shell-crash recovery policy (incident-2026-07-11
+// §5). Constructed at ready once the supervisor + browser manager exist (their
+// counts feed the sampler); referenced lazily by the shell's render-process-gone
+// handler installed in createWindow(). Null before ready / after teardown.
+let memorySampler: MemorySampler | null = null;
+let renderRecovery: RenderRecoveryPolicy | null = null;
+// WAVE-4 full-D5: per-agent memory attribution + budget/owned-cap admission.
+let attributionService: AttributionService | null = null;
+// WP5 mount: the sandboxed plan render pane (one WebContentsView, driven by the
+// renderer's plan-tab bounds handoff). Constructed once at ready.
+let planPaneManager: PlanPaneManager | null = null;
+// B2 D5: per-workspace `plans/` watcher (sole `plans/` fs subscription owner, F-C).
+let plansWatcher: PlansWatcher | null = null;
 
 // Single-instance lock — prevent duplicate windows
 const gotTheLock = app.requestSingleInstanceLock();
@@ -279,12 +327,19 @@ function createWindow(): void {
       // before our webRequest header shim runs.
       webSecurity: false,
       allowRunningInsecureContent: true,
+      spellcheck: true,
     },
   });
   constructingShell = false;
   // The shell carries the dashboard preload — mark it trusted now that its
   // webContents exists (the constructingShell flag covered its construction).
   trustedContents.add(mainWindow.webContents);
+  try {
+    session.defaultSession.setSpellCheckerLanguages(['en-US']);
+  } catch {
+    // Best-effort: Windows' native OS spellchecker remains authoritative.
+  }
+  installShellSpellcheckContextMenu(mainWindow);
 
   // Try Vite dev server first (check multiple ports), fall back to built files
   const builtFile = path.join(__dirname, '..', '..', 'renderer', 'index.html');
@@ -319,6 +374,20 @@ function createWindow(): void {
     console.error(`Page failed to load (mainFrame=${isMainFrame}): ${code} ${desc} url=${url}`);
   });
 
+  // D1 (incident-2026-07-11 §5): shell renderer-crash recovery. Before this, a
+  // dead shell renderer left a permanent white screen while the backend kept
+  // running (the whole outage's visible symptom). We (1) log the reason/exitCode
+  // — closing evidence gap §7 Q3 for future incidents — (2) check memory pressure
+  // via the D5 sampler, (3) reload when pressure permits (bounded 3/5min), else
+  // (4) show a low-allocation native dialog. Wave-1 dialog actions only: reload
+  // (when the user opts to) or quit; the "reap & reload" action arrives with D3/D4.
+  mainWindow.webContents.on('render-process-gone', (_e, details) => {
+    console.error(
+      `[D1] shell renderer gone: reason=${details.reason} exitCode=${details.exitCode}`,
+    );
+    handleShellRenderProcessGone();
+  });
+
   // Externalize all link navigation. Without this, clicking an http(s) link
   // inside a markdown view replaces the dashboard with the external page and
   // there's no way back — closing the window to escape kills every agent.
@@ -333,8 +402,109 @@ function createWindow(): void {
   const shellContents = mainWindow.webContents;
   mainWindow.on('closed', () => {
     trustedContents.delete(shellContents);
+    // WP5 mount: tear down the plan render pane's WebContentsView with its host
+    // window so it can't outlive the shell.
+    planPaneManager?.destroy();
     mainWindow = null;
   });
+}
+
+/** Combine two admission decisions: the FIRST refusal wins (so the caller sees
+ *  exactly one machine-readable code), else allowed. Used to layer the full-D5
+ *  attribution gates on top of the D5-lite sampler gates. */
+function firstRefusal(a: AdmissionDecision, b: AdmissionDecision): AdmissionDecision {
+  if (!a.allowed) return a;
+  if (!b.allowed) return b;
+  return { allowed: true };
+}
+
+/** D1 "reap & reload" (Wave 2+ dialog action, wired in Wave 4 now D3/D4 exist):
+ *  free renderer + CLI memory before reloading into a pressured machine — run the
+ *  D3 agent-view discard pass and one D4 reaper sweep, then reload the shell. */
+async function reapAndReloadShell(): Promise<void> {
+  try { browserManager?.discardAgentViewsNow(); } catch (e) { console.warn('[D1] discard sweep failed:', e); }
+  try {
+    const swept = await supervisor?.reapNow();
+    if (swept) console.warn(`[D1] reap-now: ${swept.reaped.length} reaped of ${swept.eligible} eligible`);
+  } catch (e) { console.warn('[D1] reap-now failed:', e); }
+  renderRecovery?.onRecovered(); // manual action → reset the retry budget
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.once('did-finish-load', () => browserManager?.onShellRecovered());
+    mainWindow.reload();
+  }
+}
+
+/**
+ * D1 shell renderer-crash recovery decision + side effects (incident-2026-07-11
+ * §5 D1). Pure decision lives in RenderRecoveryPolicy; this owns the reload /
+ * dialog side effects and the D2 recovery handshake. Safe to call before the
+ * watchdog is constructed (renderRecovery null ⇒ default to a bounded reload).
+ */
+function handleShellRenderProcessGone(): void {
+  const win = mainWindow;
+  if (!win || win.isDestroyed()) return;
+
+  const criticalPressure = memorySampler?.isCriticalPressure() ?? false;
+  // No policy yet (crash during early startup) → one plain reload attempt.
+  const decision = renderRecovery
+    ? renderRecovery.registerCrashAndDecide(Date.now(), criticalPressure)
+    : { action: 'reload' as const, reason: 'reload' as const };
+
+  if (decision.action === 'reload') {
+    console.warn('[D1] reloading shell renderer (pressure OK, within retry budget)');
+    // On the next successful load, reset the retry budget and re-sync the browser
+    // pane (D2: resubscribe + full snapshot so the reloaded UI reflects live tabs).
+    win.webContents.once('did-finish-load', () => {
+      renderRecovery?.onRecovered();
+      browserManager?.onShellRecovered();
+      console.warn('[D1] shell renderer reload committed; recovery complete');
+    });
+    win.reload();
+    return;
+  }
+
+  // Dialog path: critical pressure (reloading into a machine at the ceiling
+  // invites a crash loop) or the retry budget is exhausted.
+  const critical = decision.reason === 'critical-pressure';
+  const detail = critical
+    ? 'The dashboard renderer stopped and the system is under critical memory ' +
+      'pressure. Reloading now would likely crash again. "Reap & reload" frees ' +
+      'memory first (suspends idle agent tabs and reclaims finished agents’ ' +
+      'processes), then reloads. Or free memory yourself and reload, or restart.'
+    : 'The dashboard renderer stopped and automatic reload attempts were ' +
+      'exhausted. You can reap & reload, reload manually, or restart the app.';
+  // Wave-4 (D3/D4 now exist): the "Reap & reload" action triggers the D3 agent-
+  // view discard pass + one D4 reaper sweep before reloading — the recommended
+  // action under Critical pressure (reloading into a full machine crash-loops).
+  void dialog
+    .showMessageBox(win, {
+      type: 'warning',
+      title: 'Dashboard renderer stopped',
+      message: 'The dashboard view stopped responding.',
+      detail,
+      buttons: ['Reap & reload', 'Reload', 'Quit'],
+      defaultId: critical ? 0 : 1,
+      cancelId: 2,
+      noLink: true,
+    })
+    .then((res) => {
+      if (res.response === 0) {
+        void reapAndReloadShell();
+      } else if (res.response === 1) {
+        // User override: reload regardless of pressure. Reset the budget so this
+        // manual reload isn't immediately re-blocked as "retries exhausted".
+        renderRecovery?.onRecovered();
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.once('did-finish-load', () => {
+            browserManager?.onShellRecovered();
+          });
+          mainWindow.reload();
+        }
+      } else {
+        app.quit();
+      }
+    })
+    .catch((err) => console.error('[D1] recovery dialog failed:', err));
 }
 
 app.whenReady().then(async () => {
@@ -380,61 +550,19 @@ app.whenReady().then(async () => {
   //     scheme gates additionally deny media: navigations).
   //  2. The decoded path is confined to the open workspace roots via
   //     resolveConfined() (realpath: traversal and symlink escapes → 404).
-  session.defaultSession.protocol.handle('media', async (request) => {
-    const urlObj = new URL(request.url);
-    // Path is /<encodedFilePath>, strip leading slash and decode
-    const decodedUrl = decodeURIComponent(urlObj.pathname.slice(1));
-
-    let filePath = decodedUrl;
-
-    if (process.platform === 'win32' && filePath.startsWith('/')) {
-      filePath = wslToWindowsPath(filePath);
-    }
-
-    const confined = resolveConfined(filePath, getWorkspaceRootsWin());
-    if (confined === null) {
-      console.warn(`[security] media:// request outside workspace roots rejected: ${request.url}`);
-      return new Response('File not found', { status: 404 });
-    }
-    filePath = confined;
-
-    try {
-      const response = await net.fetch(pathToFileURL(filePath).toString());
-      const headers = new Headers(response.headers);
-      
-      // Explicitly set Content-Type based on extension if missing or generic
-      const ext = path.extname(filePath).toLowerCase();
-      const mimeMap: Record<string, string> = {
-        '.pdf': 'application/pdf',
-        '.png': 'image/png',
-        '.jpg': 'image/jpeg',
-        '.jpeg': 'image/jpeg',
-        '.gif': 'image/gif',
-        '.webp': 'image/webp',
-        '.avif': 'image/avif',
-        '.bmp': 'image/bmp',
-        '.ico': 'image/x-icon',
-        '.svg': 'image/svg+xml',
-      };
-      if (mimeMap[ext]) {
-        headers.set('Content-Type', mimeMap[ext]);
-      }
-
-      return new Response(response.body, {
-        status: response.status,
-        statusText: response.statusText,
-        headers,
-      });
-    } catch (err) {
-      console.error('Failed to fetch media:', err);
-      return new Response('File not found', { status: 404 });
-    }
-  });
 
   try {
     console.log('Initializing database...');
     initDatabase();
     console.log('Database initialized');
+
+    registerMediaProtocol(session.defaultSession.protocol, {
+      workspaceRoots: getWorkspaceRootsWin(),
+      translateWslPath: wslToWindowsPath,
+      onRejected: (requestUrl) => {
+        console.warn(`[security] media:// request outside workspace roots rejected: ${requestUrl}`);
+      },
+    });
 
     // Validate + repair ~/.claude.json (Windows + WSL distro copies) BEFORE
     // the supervisor exists, i.e. before anything can spawn claude.exe — the
@@ -455,6 +583,19 @@ app.whenReady().then(async () => {
       trustedContents,
       setConstructingDetached: (v: boolean) => { constructingDetached = v; },
       getMainWindow: () => mainWindow,
+      // View tear-off re-parenting for the native-view-backed views: move the
+      // plan pane / browser tabs into the detached window on detach, home on
+      // close. The managers are constructed later in this same ready handler, so
+      // these closures read the module-level `let`s lazily at fire time (a detach
+      // can only happen long after the managers exist).
+      onViewWindowReady: (view, win) => {
+        if (view === 'plans') planPaneManager?.reparentTo(win);
+        else if (view === 'browser') browserManager?.reparentTo(win);
+      },
+      onViewWindowClosing: (view) => {
+        if (view === 'plans') planPaneManager?.reparentHome();
+        else if (view === 'browser') browserManager?.reparentHome();
+      },
     };
     registerIpcHandlers(supervisor, mainWindow!, detachedWindowDeps);
     supervisor.start();
@@ -494,6 +635,122 @@ app.whenReady().then(async () => {
     // can never observe a stale pre-retry port.
     const apiPort = await apiServer.start();
     supervisor.setApiServerPort(apiPort);
+    // B2 D5 + WP4 (F-C): boot the plans watcher with the reparse callback.
+    // `plans-watcher.ts` is the SOLE `plans/` subscription owner; WP4 injects
+    // `onPlanSettled` (a constructor dep, not a hard import) so each settled live
+    // plan row is reparsed → section-cache → plan_section_changes → snapshot.
+    configureReparser();
+    plansWatcher = startPlansWatcher({
+      onPlanSettled: async (plan) => {
+        const outcome = await reparsePlanFile(plan);
+        // WP5: fs change → reparse → full re-render. The reparse just refreshed
+        // the served projection (last-good in memory); tell the renderer to
+        // re-fetch and re-render this plan surface. This rides the SAME reparse
+        // path — NOT a second `plans/` fs subscription (F-C: plans-watcher owns
+        // the only one). No in-place DOM patching: the renderer does a full
+        // re-render off the fresh projection.
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('plan-surface:changed', {
+            planId: outcome.planId,
+            parseError: outcome.parseError,
+            degradedFrom: outcome.degradedFrom,
+          });
+        }
+        // WP5 mount: re-render the sandboxed pane from the freshly-served
+        // projection (no-op unless THIS plan is the one currently shown).
+        planPaneManager?.refresh(outcome.planId);
+      },
+    });
+    // GT-C Decision 1 (Configure site) — arm the Execution-Trail materializer ONCE,
+    // now that the DB, the served-projection/reparse pipeline, and workspace
+    // resolution are all live. Every dep re-derives from DB/fs on demand so the
+    // materialized `sec_exectr` cache and `plan_events` can never diverge.
+    trailMaterializer.configure({
+      readPlanFile: async (planId) => {
+        const plan = getPlan(planId);
+        if (!plan || plan.deletedAt) return null;
+        const ws = getWorkspace(plan.workspaceId);
+        if (!ws) return null;
+        const fc = await readFileContents(planAbsPath(ws.path, plan.path), ws.pathType);
+        if (fc.error || typeof fc.content !== 'string') return null;
+        return fc.content;
+      },
+      writePlanFile: async (planId, html) => {
+        const plan = getPlan(planId);
+        if (!plan || plan.deletedAt) return;
+        const ws = getWorkspace(plan.workspaceId);
+        if (!ws) return;
+        // Resolve to a host-writable path (WSL plans convert to their \\wsl$ UNC
+        // form). Atomic: write a sibling tmp then rename over the target.
+        let abs = planAbsPath(ws.path, plan.path);
+        if (ws.pathType === 'wsl') abs = wslToWindowsPath(abs);
+        const tmp = `${abs}.exectr.tmp`;
+        fs.writeFileSync(tmp, html, 'utf8');
+        fs.renameSync(tmp, abs);
+      },
+      // Rec #5 (planning-surface-hardening-review) — compare-and-swap write. The
+      // sibling CAS writer calls this optional dep so a human/out-of-band save that
+      // lands after the materializer's last reread cannot be clobbered; without it
+      // the writer runs its weaker fallback.
+      writePlanFileIfUnchanged: async (planId, html, expectedHash) => {
+        const plan = getPlan(planId);
+        if (!plan || plan.deletedAt) return 'conflict';
+        const ws = getWorkspace(plan.workspaceId);
+        if (!ws) return 'conflict';
+        let abs = planAbsPath(ws.path, plan.path);
+        if (ws.pathType === 'wsl') abs = wslToWindowsPath(abs);
+        // Atomic compare-and-swap: synchronous reread → hash-compare → rename with
+        // no intervening event-loop turn, so a human/out-of-band save landing after
+        // the materializer's last reread cannot be clobbered (review rec #5).
+        let current: string;
+        try {
+          current = fs.readFileSync(abs, 'utf8');
+        } catch {
+          return 'conflict'; // vanished/unreadable under us → treat as contention
+        }
+        if (createHash('sha256').update(current, 'utf8').digest('hex') !== expectedHash) {
+          return 'conflict';
+        }
+        const tmp = `${abs}.exectr.tmp`;
+        fs.writeFileSync(tmp, html, 'utf8');
+        fs.renameSync(tmp, abs);
+        return 'written';
+      },
+      hasLiveOrchestration: (planId, exemptRunId) =>
+        listOrchestrationRuns().some(
+          (r) => r.planId === planId && r.runId !== exemptRunId && (r.status === 'starting' || r.status === 'running'),
+        ),
+      getLiveRailAgentForPlan: (planId, exemptAgentIds) => getLiveRailAgentForPlan(planId, exemptAgentIds),
+      listTrailEntries: (planId) => {
+        const projection = getServedPlanProjection(planId);
+        const headingFor = (anchor: string | null): string => {
+          if (!anchor) return '(unattributed)';
+          const s = projection?.sections.find((x) => x.anchor === anchor);
+          return s?.heading ?? anchor;
+        };
+        const writes = getPlanEventsForRender(planId).filter((e) => e.changeCount > 0);
+        const last = writes.slice(-EXEC_TRAIL_MAX_ENTRIES); // oldest→newest, last ≤200
+        return last.map((e): TrailEntry => {
+          return {
+            planEventId: e.id,
+            createdAt: e.createdAt,
+            agentTitle: e.agentTitle ?? e.agentId,
+            sectionHeading: headingFor(e.observedSectionAnchor),
+            viaLabel: observedViaLabel(e.observedVia),
+            // P0 Fix-1 (planning-surface-hardening-review) — the claimed self-report
+            // (`e.claimedPayload.result`) is agent narration and is DELIBERATELY NOT
+            // surfaced on the system-owned trail line. Only server-derived fields
+            // (attribution + observed-via) and the witnessed digest below are
+            // rendered, so a forged `result` can never sit beside trusted attribution.
+            // Fix-4 §5c — the witnessed digest for this write-turn (null when no
+            // repo activity was captured). `e.repoActivity` is the tolerantly-parsed
+            // blob from getPlanEventsForRender.
+            repoDigest: formatRepoDigest(e.repoActivity?.totals ?? null),
+          };
+        });
+      },
+      hashHtml: (html) => createHash('sha256').update(html, 'utf8').digest('hex'),
+    });
     // Context-brick Inc 5A — replace the relaunch route's conservative
     // awaiting-human stub with the real predicate (question-waiting latch OR
     // idle + ends-with-question cache).
@@ -508,6 +765,11 @@ app.whenReady().then(async () => {
     // EADDRINUSE auto-increment — never a hardcoded 24678.
     browserManager = new BrowserManager(() => mainWindow, apiPort);
     registerBrowserIpc(browserManager);
+    // WP5 mount: the plan render pane + its data/lifecycle IPC. Same factory
+    // pattern as the browser manager (`() => mainWindow`); kept out of
+    // ipc-handlers.ts to avoid contention, exactly like registerBrowserIpc.
+    planPaneManager = new PlanPaneManager(() => mainWindow);
+    registerPlanIpc(planPaneManager);
     // WP2-B ⇄ WP2-A seam: inject the Phase-2 browser-tool facade into the
     // API server. Setter, not constructor param, because the manager is
     // constructed AFTER the awaited apiServer.start() (its M2 filter needs
@@ -516,7 +778,108 @@ app.whenReady().then(async () => {
     // is undefined and every /api/browser/* route answers 503 by design.
     const browserToolProvider = (browserManager as unknown as { tools?: BrowserToolProvider }).tools;
     if (browserToolProvider) apiServer.setBrowserTools(browserToolProvider);
+
+    // ── D3.1 agent-tab grace-close (incident-2026-07-11 §5 D3) ────────────────
+    // When the supervisor flips an agent to a terminal status, arm a grace-close
+    // of that agent's browser tabs (exempting signin/attention tabs, evaluated at
+    // fire time); any non-terminal transition cancels a pending close (the agent
+    // is live again). The browser manager owns the timer + exemption logic.
+    supervisor.on('statusChanged', (data: { agentId: string; status: string }) => {
+      const terminal = data.status === 'done' || data.status === 'crashed';
+      browserManager?.onAgentLifecycleStatus(data.agentId, terminal);
+    });
+
+    // ── D5-lite memory watchdog + admission control (incident-2026-07-11 §5) ──
+    // Now that the supervisor + browser manager exist (their live counts feed the
+    // sampler), construct the sampler, arm the admission gates, install the D1
+    // recovery policy, and start sampling. Everything degrades gracefully: the
+    // native module load is try/caught (→ null → commit rules fail-open, static
+    // caps stay fail-closed), and the sampler never keeps the event loop alive.
+    let nativeCommit: NativeCommitProvider | null = null;
+    try {
+      // dist/main/main/index.js → repo root is ../../.. ; the native module ships
+      // outside dist (native/lares-native). Its index.js never throws at require
+      // time (graceful no-op surface off-Windows / when the binary is missing).
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      nativeCommit = require(
+        path.join(__dirname, '..', '..', '..', 'native', 'lares-native', 'index.js'),
+      ) as NativeCommitProvider;
+    } catch (err) {
+      console.warn('[watchdog] lares-native not loadable; commit sampling degraded:', err);
+      nativeCommit = null;
+    }
+    const supervisorForWatchdog = supervisor;
+    const browserForWatchdog = browserManager;
+    renderRecovery = new RenderRecoveryPolicy();
+    memorySampler = new MemorySampler({
+      readCommit: createCommitReader(nativeCommit),
+      getLiveAgentCount: () => getActiveAgents().length,
+      getAgentViewCount: () => browserForWatchdog.getAgentViewCount(),
+      getElectronProcessCount: () => {
+        try { return app.getAppMetrics().length; } catch { return 0; }
+      },
+      getAppMemoryBytes: () => {
+        try {
+          // ProcessMetric.memory.workingSetSize is in KB.
+          return app.getAppMetrics().reduce((sum, m) => sum + (m.memory?.workingSetSize ?? 0) * 1024, 0);
+        } catch { return 0; }
+      },
+      now: () => Date.now(),
+      onSnapshot: (snap: MemorySnapshot) => {
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('memory:pressure', snap);
+        }
+      },
+      log: (m) => console.warn(m),
+    });
+    // WAVE-4 full-D5 (§5): per-agent attribution + budget/owned-cap admission.
+    // Constructed here (store is armed a few lines below via startOwnership; the
+    // service reads it lazily and fail-opens on a cold cache). The launch/tab
+    // gates below AND the sampler's D5-lite gates are combined: the FIRST refusal
+    // wins, so a caller sees exactly one machine-readable code.
+    attributionService = new AttributionService({
+      getStore: () => supervisorForWatchdog.getOwnershipStore(),
+      electron: () => {
+        try {
+          const m = app.getAppMetrics();
+          return {
+            processCount: m.length,
+            workingSetBytes: m.reduce((s, p) => s + (p.memory?.workingSetSize ?? 0) * 1024, 0),
+          };
+        } catch { return { processCount: 0, workingSetBytes: 0 }; }
+      },
+      log: (m) => console.warn(m),
+    });
+    // Arm the admission gates (§5): NEW agent launches and NEW agent tabs are
+    // refused under Critical commit pressure / static caps (D5-lite sampler) OR
+    // the whole-app owned-process cap / per-agent budget (full-D5 attribution),
+    // with a machine-readable code the API/MCP caller receives.
+    supervisorForWatchdog.setLaunchAdmissionCheck(() =>
+      firstRefusal(memorySampler!.canLaunchAgent(), attributionService!.checkLaunchOwnedCap()));
+    browserForWatchdog.setTabAdmissionCheck((agentId) =>
+      firstRefusal(memorySampler!.canOpenAgentTab(), attributionService!.checkTabAdmission(agentId)));
+    // Renderer pulls for the status-bar meter / banner / orphan list.
+    ipcMain.handle('memory:get-snapshot', () => memorySampler?.getSnapshot() ?? null);
+    ipcMain.handle('memory:attribution', () => attributionService?.getFresh() ?? null);
+    // Reap-now estimate: best-effort working-set bytes for an orphan candidate's
+    // PID set, from the attribution service's last snapshot (budget.ts math).
+    ipcMain.handle('memory:reap-estimate', (_e, pids: number[]) =>
+      attributionService?.estimateBytesForPids(pids ?? []) ?? 0);
+    // Detached-process transparency (§5 Wave 5): list + PID-verify the descriptors
+    // agents self-registered under <workspaceRoot>/.dashboard/detached/. Purely
+    // read-only; a missing dir yields [] (never throws).
+    ipcMain.handle('detached:list', (_e, workspaceRoot: string) => {
+      if (typeof workspaceRoot !== 'string' || !workspaceRoot) return [];
+      return listDetachedProcesses(detachedDirFor(workspaceRoot), defaultDetachedRegistryDeps());
+    });
+    memorySampler.start();
+
     orchestration.start();                 // boot reconcile of orphaned runs
+    // D4 (incident-2026-07-11 §5): arm durable CLI-process ownership (store +
+    // reaper + reconcile gate, native Job Object surface loaded here) BEFORE
+    // reconcile() so respawns are duplicate-CLI-gated on Windows/ConPTY.
+    supervisor.startOwnership();
+    attributionService.start();            // begin the slow attribution refresh loop
     supervisor.reconcile();
     console.log('App ready');
   } catch (err: any) {
@@ -544,6 +907,7 @@ async function shutdownApp(): Promise<void> {
   // 'crashed' for a drained agent and auto-restart it mid-quit. (The
   // handleAutoRestart shuttingDown guard is the belt; this is the braces.)
   supervisor?.stop();
+  memorySampler?.stop();
   try { await supervisor?.drainForShutdown(); }
   catch (err) { console.error('[shutdown] drain failed:', err); }
   drainCompleted = true;
@@ -552,6 +916,7 @@ async function shutdownApp(): Promise<void> {
   disposeKernelClient();
   void shutdownJupyterServer();
   stopClaudeJsonRuntimeWatcher();
+  plansWatcher?.stop();
   closeAllFsWatchers();
   app.quit();
 }

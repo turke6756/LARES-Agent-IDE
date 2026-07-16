@@ -161,6 +161,9 @@ export function registerBrowserIpc(manager: BrowserManager): void {
   // invalidate the manager's sync access cache THEN emit accessChanged (request
   // decisions also emit accessRequestsChanged) — the manager owns that ordering.
   ipcMain.handle(BROWSER_CHANNELS.accessRuleList, () => manager.accessRuleList());
+  // Phase 3 (§D line 264): read-only per-rule visit + login status for the
+  // current workspace (zero-arg → manager defaults to currentWorkspaceId).
+  ipcMain.handle(BROWSER_CHANNELS.accessSiteStatus, () => manager.accessSiteStatus());
   ipcMain.handle(BROWSER_CHANNELS.accessRuleAdd, (_e, input: AccessRuleInput) =>
     manager.accessRuleAdd(input),
   );
@@ -209,6 +212,15 @@ export function registerBrowserIpc(manager: BrowserManager): void {
   // main → renderer from the manager directly.
   ipcMain.handle(BROWSER_CHANNELS.signinPendingCancel, (_e, tabId: string) =>
     manager.accessSigninPendingCancel(tabId),
+  );
+
+  // Signed-in tabs (Phase 4 item 4): explicit human re-arm of a run-scoped
+  // `signin_unavailable` latch for one (workspace, origin) — the next agent nav
+  // reopens ONE fresh setup tab. Trusted-chrome only; durable consent untouched.
+  ipcMain.handle(
+    BROWSER_CHANNELS.signinReArm,
+    (_e, workspaceId: string | null, origin: string) =>
+      manager.accessSigninReArm(workspaceId, origin),
   );
 
   // Signed-in tabs (WI-8): JIT sign-in config — the hold-timeout round-trip and

@@ -1,11 +1,12 @@
 import React, { useEffect, useRef } from 'react';
-import { EditorState } from '@codemirror/state';
-import { EditorView, keymap, ViewUpdate, drawSelection, highlightActiveLine } from '@codemirror/view';
+import { EditorState, StateEffect, StateField } from '@codemirror/state';
+import { EditorView, keymap, ViewUpdate, drawSelection, highlightActiveLine, Decoration, type DecorationSet } from '@codemirror/view';
 import { defaultKeymap, history, historyKeymap } from '@codemirror/commands';
 import { markdown } from '@codemirror/lang-markdown';
 import { oneDark } from '@codemirror/theme-one-dark';
 import { useThemeStore } from '../../stores/theme-store';
 import { getTabScrollFraction, setTabScrollFraction } from './scrollMemory';
+import type { TabFocusRange } from '../../stores/dashboard-store';
 
 interface Props {
   initialContent: string;
@@ -15,7 +16,34 @@ interface Props {
   onChange: (content: string) => void;
   onSave: () => void;
   tabId?: string;
+  // WP4: when set, scroll this 1-based line span to center and flash a transient
+  // highlight over it (used by the knowledge / optimizer "open at source span" jump).
+  focusRange?: TabFocusRange;
 }
+
+// WP4 — a transient line highlight for the focused source span. Implemented as a
+// StateField so the decoration survives view updates and clears via a null effect.
+const setFocusHighlight = StateEffect.define<{ from: number; to: number } | null>();
+const focusLineDeco = Decoration.line({ class: 'cm-knowledge-source-line' });
+const focusHighlightField = StateField.define<DecorationSet>({
+  create() { return Decoration.none; },
+  update(deco, tr) {
+    let next = deco.map(tr.changes);
+    for (const e of tr.effects) {
+      if (!e.is(setFocusHighlight)) continue;
+      if (e.value === null) { next = Decoration.none; continue; }
+      const ranges = [];
+      const startLine = tr.state.doc.lineAt(e.value.from).number;
+      const endLine = tr.state.doc.lineAt(e.value.to).number;
+      for (let ln = startLine; ln <= endLine; ln++) {
+        ranges.push(focusLineDeco.range(tr.state.doc.line(ln).from));
+      }
+      next = Decoration.set(ranges);
+    }
+    return next;
+  },
+  provide: (f) => EditorView.decorations.from(f),
+});
 
 const editorTheme = EditorView.theme({
   '&': {
@@ -67,6 +95,7 @@ export default function CodeMirrorEditor({
   onChange,
   onSave,
   tabId,
+  focusRange,
 }: Props) {
   const theme = useThemeStore((state) => state.theme);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -91,6 +120,7 @@ export default function CodeMirrorEditor({
       highlightActiveLine(),
       EditorView.lineWrapping,
       editorTheme,
+      focusHighlightField,
       keymap.of([
         {
           key: 'Mod-s',
@@ -172,6 +202,34 @@ export default function CodeMirrorEditor({
       viewRef.current = null;
     };
   }, [language, theme]);
+
+  // WP4 — react to a focus request (fresh nonce on each click). Scroll the span to
+  // center and flash the line highlight, auto-clearing after ~2.5s. Scheduled via
+  // rAF so it lands after the mount effect's scroll-memory restore.
+  useEffect(() => {
+    if (!focusRange) return;
+    let clearTimer = 0;
+    const raf = requestAnimationFrame(() => {
+      const view = viewRef.current;
+      if (!view) return;
+      const doc = view.state.doc;
+      const start = Math.max(1, Math.min(doc.lines, focusRange.lineStart));
+      const end = Math.max(start, Math.min(doc.lines, focusRange.lineEnd));
+      const from = doc.line(start).from;
+      const to = doc.line(end).to;
+      view.dispatch({
+        effects: [EditorView.scrollIntoView(from, { y: 'center' }), setFocusHighlight.of({ from, to })],
+      });
+      clearTimer = window.setTimeout(() => {
+        const v = viewRef.current;
+        if (v) v.dispatch({ effects: setFocusHighlight.of(null) });
+      }, 2500);
+    });
+    return () => {
+      cancelAnimationFrame(raf);
+      window.clearTimeout(clearTimer);
+    };
+  }, [focusRange?.nonce]);
 
   return (
     <div className="h-full flex flex-col bg-surface-0">

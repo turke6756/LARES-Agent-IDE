@@ -1,6 +1,7 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import type { SelectionAgentTarget } from '../../lib/selection/selection-types';
+import { positionFloating, type Rect } from '../../lib/floating/positionFloating';
 import AgentPickerDropdown from './AgentPickerDropdown';
 
 // Comment-entry popover (WP-P5-B), used by both flows:
@@ -15,8 +16,10 @@ import AgentPickerDropdown from './AgentPickerDropdown';
 // be lost to a stray click. Escape always closes.
 
 interface Props {
-  x: number;
-  y: number;
+  /** Viewport rect of the selected text. The composer is placed to the LEFT or
+   *  RIGHT of this (whichever has more room) so it never covers the anchored
+   *  range (BUG-46). */
+  anchorRect: Rect;
   quotedText: string;
   workspaceId: string;
   mode: 'draft' | 'send';
@@ -28,15 +31,74 @@ interface Props {
 }
 
 const POPOVER_WIDTH = 340;
+// Fallback height before the box is measured; refined on the first layout pass.
+const POPOVER_EST_HEIGHT = 220;
 
 export default function AddCommentPopover({
-  x, y, quotedText, workspaceId, mode, currentAgentId, onClose, onSaveDraft, onSend,
+  anchorRect, quotedText, workspaceId, mode, currentAgentId, onClose, onSaveDraft, onSend,
 }: Props) {
   const popoverRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [body, setBody] = useState('');
   const [pickerOpen, setPickerOpen] = useState(false);
   const canSubmit = body.trim().length > 0;
+
+  // Auto-placed beside the selection until the user drags the composer, after
+  // which `dragPos` pins it wherever they left it.
+  const [pos, setPos] = useState<{ left: number; top: number }>(() =>
+    positionFloating(
+      anchorRect,
+      { width: POPOVER_WIDTH, height: POPOVER_EST_HEIGHT },
+      { width: window.innerWidth, height: window.innerHeight },
+      { placement: 'side' },
+    ),
+  );
+  const draggedRef = useRef(false);
+
+  // Re-place using the composer's REAL measured height once mounted (and again
+  // if it grows, e.g. the agent picker expands) — unless the user has dragged.
+  useLayoutEffect(() => {
+    if (draggedRef.current) return;
+    const el = popoverRef.current;
+    if (!el) return;
+    const box = el.getBoundingClientRect();
+    setPos(
+      positionFloating(
+        anchorRect,
+        { width: box.width || POPOVER_WIDTH, height: box.height || POPOVER_EST_HEIGHT },
+        { width: window.innerWidth, height: window.innerHeight },
+        { placement: 'side' },
+      ),
+    );
+  }, [anchorRect, pickerOpen]);
+
+  // Pointer-drag from the header moves the composer; clamped into the viewport
+  // on release so it can't be stranded off-screen.
+  const onHeaderPointerDown = (e: React.PointerEvent) => {
+    if (e.button !== 0) return;
+    const el = popoverRef.current;
+    if (!el) return;
+    const box = el.getBoundingClientRect();
+    const offsetX = e.clientX - box.left;
+    const offsetY = e.clientY - box.top;
+    e.preventDefault();
+    (e.target as Element).setPointerCapture?.(e.pointerId);
+    draggedRef.current = true;
+    const onMove = (ev: PointerEvent) => {
+      const maxLeft = window.innerWidth - box.width - 8;
+      const maxTop = window.innerHeight - box.height - 8;
+      setPos({
+        left: Math.max(8, Math.min(ev.clientX - offsetX, maxLeft)),
+        top: Math.max(8, Math.min(ev.clientY - offsetY, maxTop)),
+      });
+    };
+    const onUp = () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+    };
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+  };
 
   useEffect(() => {
     textareaRef.current?.focus();
@@ -74,9 +136,6 @@ export default function AddCommentPopover({
     onClose();
   };
 
-  const left = Math.max(8, Math.min(x, window.innerWidth - POPOVER_WIDTH - 8));
-  const top = Math.max(8, Math.min(y, window.innerHeight - 240));
-
   const quotePreview =
     quotedText.length > 160 ? `${quotedText.slice(0, 160)}…` : quotedText;
 
@@ -84,9 +143,13 @@ export default function AddCommentPopover({
     <div
       ref={popoverRef}
       className="ui-menu fixed z-50 p-2 overflow-y-auto"
-      style={{ left, top, width: POPOVER_WIDTH, maxHeight: 'calc(100vh - 16px)' }}
+      style={{ left: pos.left, top: pos.top, width: POPOVER_WIDTH, maxHeight: 'calc(100vh - 16px)' }}
     >
-      <div className="ui-menu-header">
+      <div
+        className="ui-menu-header cursor-move select-none"
+        onPointerDown={onHeaderPointerDown}
+        title="Drag to move"
+      >
         {mode === 'draft' ? 'Add comment' : 'Comment & send'}
       </div>
       <div className="px-2 py-1 mb-1 border-l-2 border-accent-blue/50 text-[12px] text-gray-400 italic whitespace-pre-wrap max-h-20 overflow-hidden">

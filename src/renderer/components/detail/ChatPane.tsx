@@ -43,6 +43,19 @@ interface Props {
   watchGlass?: boolean;
 }
 
+// Per-agent chat scroll memory (module-level, in-memory) so switching away from
+// an agent's chat — a workspace change, a detail-pane toggle — and coming back
+// restores the exact scroll spot instead of snapping to the bottom. We remember
+// distance-from-bottom (not raw scrollTop) plus a "pinned to bottom" flag, the
+// same invariant the prepend-anchor uses: messages hydrate async so total height
+// isn't known at mount, but anchoring to the bottom survives that height change.
+const chatScrollMemory = new Map<string, { distanceFromBottom: number; nearBottom: boolean }>();
+
+function captureChatScroll(agentId: string, el: HTMLDivElement) {
+  const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+  chatScrollMemory.set(agentId, { distanceFromBottom, nearBottom: distanceFromBottom < 80 });
+}
+
 // Per-session out-of-context stamp. A RenderItem drawn from a PRIOR session
 // carries `outOfContext` + its session identity so bubbles can dim/accent and so
 // (Phase 3) a selection can attribute its Source: line to the specific prior
@@ -581,6 +594,10 @@ export default function ChatPane({ agentId, agentStatus, agentName, stagingOpen 
 
     return () => {
       mounted = false;
+      // Persist the scroll spot for this agent before we unmount, so returning
+      // to this chat (workspace switch-back, pane toggle) restores it.
+      const el = scrollRef.current;
+      if (el) captureChatScroll(agentId, el);
       window.api.agents.chatUnsubscribe(agentId).catch(() => {});
       unsub();
     };
@@ -674,27 +691,51 @@ export default function ChatPane({ agentId, agentStatus, agentName, stagingOpen 
     if (!el) return;
     const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
     isNearBottomRef.current = distanceFromBottom < 80;
+    // Keep the per-agent scroll memory fresh on every scroll (user drag or
+    // programmatic autoscroll both fire this) so restore-on-return is accurate
+    // even if the unmount cleanup misses.
+    chatScrollMemory.set(agentId, { distanceFromBottom, nearBottom: distanceFromBottom < 80 });
     // Scroll-to-top auto-loads the next-older prior session (guarded by refs so
     // this never re-enters mid-load).
     if (el.scrollTop <= 4 && !loadingPriorRef.current) {
       const remaining = priorRowsRef.current.length - loadedPriorCountRef.current;
       if (remaining > 0) void loadPreviousSession();
     }
-  }, [loadPreviousSession]);
+  }, [loadPreviousSession, agentId]);
 
-  // Autoscroll on new content when near bottom. Skip first paint (hydration) animation.
+  // Autoscroll on new content when near bottom. On the first paint after mount
+  // we restore the remembered scroll spot for this agent instead of forcing the
+  // bottom — but only once there is real content to anchor against (messages
+  // hydrate async, so an empty first paint has ~zero height and nothing to
+  // restore to). skipAnimateOnceRef stays set until that content arrives.
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
     if (skipAnimateOnceRef.current) {
-      el.scrollTop = el.scrollHeight;
+      if (renderItems.length === 0) {
+        // Nothing to anchor to yet — sit at the bottom and wait for hydration,
+        // keeping the skip flag set so the real restore happens next paint.
+        el.scrollTop = el.scrollHeight;
+        return;
+      }
+      const saved = chatScrollMemory.get(agentId);
+      if (saved && !saved.nearBottom) {
+        // Restore the exact spot: same gap from the bottom as when we left.
+        el.scrollTop = Math.max(0, el.scrollHeight - el.clientHeight - saved.distanceFromBottom);
+        // We're intentionally scrolled up now, so incoming content must not yank
+        // the viewport back to the bottom until the user returns there.
+        isNearBottomRef.current = false;
+      } else {
+        // Fresh chat, or the user was pinned to the bottom — stay pinned.
+        el.scrollTop = el.scrollHeight;
+      }
       skipAnimateOnceRef.current = false;
       return;
     }
     if (isNearBottomRef.current) {
       el.scrollTop = el.scrollHeight;
     }
-  }, [renderItems]);
+  }, [renderItems, agentId]);
 
   // Paint staged-comment decorations: a subtle highlight over each staged quote
   // (via the CSS Custom Highlight API — no DOM mutation, so it survives React

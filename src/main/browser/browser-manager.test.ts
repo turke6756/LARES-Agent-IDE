@@ -32,6 +32,9 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import type { CompiledRule } from './browser-policy';
+// Pure, dependency-free (no electron/db) — safe to import at the top before the
+// require.cache mocks are installed. Used by the Phase 2 redirect-bounds test.
+import { isKnownLoginDestination, resolveSigninAdapter } from './signin-site-adapters';
 
 interface TestCase { name: string; run(): Promise<void> | void; }
 const tests: TestCase[] = [];
@@ -214,19 +217,38 @@ function fakeWC(url: string, title = 'T'): FakeWC {
   return wc;
 }
 
-interface MgrHarness { mgr: InstanceType<BMModule['BrowserManager']>; sent: Array<{ channel: string; payload: unknown }>; }
+interface ShellWC {
+  isDestroyed: () => boolean;
+  // D2 (incident-2026-07-11 §5): the guarded send() checks shell-frame liveness
+  // via isCrashed() + a mainFrame access. Model both so the fake mirrors a real
+  // shell webContents; the D2 tests flip `crashed`/`mainFrame` to a dead frame.
+  isCrashed: () => boolean;
+  mainFrame: unknown;
+  send: (channel: string, payload: unknown) => void;
+}
+interface MgrHarness {
+  mgr: InstanceType<BMModule['BrowserManager']>;
+  sent: Array<{ channel: string; payload: unknown }>;
+  shellWc: ShellWC;
+}
 
 function makeManager(): MgrHarness {
   const sent: Array<{ channel: string; payload: unknown }> = [];
+  const shellWc: ShellWC = {
+    isDestroyed: () => false,
+    isCrashed: () => false,
+    mainFrame: {},
+    send: (channel: string, payload: unknown) => { sent.push({ channel, payload }); },
+  };
   const win = {
-    webContents: { isDestroyed: () => false, send: (channel: string, payload: unknown) => { sent.push({ channel, payload }); } },
+    webContents: shellWc,
     contentView: { addChildView() {}, removeChildView() {} },
     getBackgroundColor: () => '#1e1e1e',
   };
   const mgr = new BM.BrowserManager(() => win as never, 0);
   // Stub the audit writer so a denial path never touches the filesystem.
   (mgr as unknown as { auditWriter: { record(): void } }).auditWriter = { record() {} };
-  return { mgr, sent };
+  return { mgr, sent, shellWc };
 }
 
 interface FakeTab {
@@ -1612,13 +1634,16 @@ test('WI-E importUserSessionForRule: unions + de-dups persist:user cookies, copi
     const before = sent.length;
     const result = await mgr.importUserSessionForRule(rule.id);
 
-    assert.equal(result.imported, 2, '4 raw hits de-duped to 2 unique cookies');
+    assert.equal(result.candidateCookiesCopied, 2, '4 raw hits de-duped to 2 unique cookies');
     assert.equal(result.origin, 'https://imp.example');
     const agentPartition = BM.agentPartitionForWorkspace('ws-imp');
     assert.equal((setInto.get(agentPartition) ?? []).length, 2, 'both cookies replayed into the RULE workspace agent partition');
     assert.equal(setInto.has('persist:user'), false, 'never writes back into the human partition');
-    assert.equal(store.getSignedInOriginState(rule.id, 'https://imp.example'), 'active', 'origin row upserted active on imported>0');
-    assert.ok(sent.slice(before).some((m) => m.channel === CH.accessChanged), 'accessChanged emitted so the session center refreshes');
+    // Phase 2 (§D line 245): a cookie copy is a CANDIDATE first step, NEVER proof of
+    // sign-in — the import path no longer upserts an active/verified grant (repro (b)).
+    assert.notEqual(store.getSignedInOriginState(rule.id, 'https://imp.example'), 'active', 'origin NOT flipped active from a mere cookie copy');
+    assert.notEqual(store.getLoginGrantSessionState(rule.id, 'https://imp.example', 'ws-imp'), 'active', 'workspace-exact grant NOT active from a cookie copy');
+    assert.ok(sent.slice(before).some((m) => m.channel === CH.accessChanged), 'accessChanged emitted so the session center reflects setup material is present');
   } finally {
     electronMock.session.fromPartition = orig;
   }
@@ -1637,9 +1662,9 @@ test('WI-E importUserSessionForRule: no saved login → imported 0, NO upsert, N
     mgr.invalidateAccessCache();
     const before = sent.length;
     const result = await mgr.importUserSessionForRule(rule.id);
-    assert.equal(result.imported, 0);
+    assert.equal(result.candidateCookiesCopied, 0);
     assert.equal(store.getSignedInOriginState(rule.id, 'https://noimp.example'), undefined, 'no row upserted when nothing copied');
-    assert.equal(sent.slice(before).some((m) => m.channel === CH.accessChanged), false, 'no accessChanged when imported===0');
+    assert.equal(sent.slice(before).some((m) => m.channel === CH.accessChanged), false, 'no accessChanged when nothing copied');
   } finally {
     electronMock.session.fromPartition = orig;
   }
@@ -1850,6 +1875,251 @@ test('WI-3 accessSigninPendingCancel: closes the quarantined tab + resolves unav
   assert.equal((resolved!.payload as { state: string }).state, 'signin_unavailable', 'banner clears via resolved(unavailable)');
   // Durable consent is NOT cleared — the origin can re-trigger a later sign-in.
   assert.equal(store.getRule(rule.id)?.consentAckedAt, 999, 'consent_acked_at is preserved across cancel');
+});
+
+// ── Phase 2 setup-and-verify: state machine, popup gate, redirect bounds ──────
+// BrowserSigninSharing plan §D Phase 2 (lines 240-252). These exercise the
+// setup-and-verify replacement for cookie-count success:
+//   • an anonymous cookie import copies creds but leaves the origin needs_signin
+//     (repro (b) — its retired assertion now lives here on the full harness);
+//   • completion runs an adapter probe that writes ACTIVE only when the tab has
+//     RETURNED to the service origin AND is off the login wall — else it THROWS,
+//     leaving the tab quarantined and no grant written;
+//   • the popup gate (decidePopupOpen, single source of truth) allows window.open
+//     ONLY for a signinPending agent tab or a user tab, under a scheme + SSRF
+//     floor; and a quarantined popup is never a TabEntry (invisible/non-drivable);
+//   • IdP traversal during quarantine never widens the agent visit allowlist and
+//     off-origin completion is refused.
+
+// ── (b) repro flip + the setup state machine ─────────────────────────────────
+
+test('Phase 2 setup-and-verify: (b) an anonymous cookie import copies creds but leaves the origin needs_signin (repro b)', async () => {
+  // One anonymous `lang` preference cookie — a CANDIDATE first step of setup, never
+  // proof of a signed-in session. Copying it must NOT flip the grant active.
+  const userCookies = [
+    { name: 'lang', value: 'en_US', domain: '.linkedin.com', path: '/', secure: true, httpOnly: false, hostOnly: false, session: true, sameSite: 'lax' },
+  ];
+  const orig = electronMock.session.fromPartition;
+  electronMock.session.fromPartition = (partition = '') => {
+    const base = fakeSession() as Record<string, unknown>;
+    if (partition === 'persist:user') {
+      base.cookies = { get: async () => userCookies.slice(), set: async () => {} };
+    } else {
+      base.cookies = { get: async () => [], set: async () => {} };
+    }
+    return base;
+  };
+  try {
+    const { mgr } = makeManager();
+    const rule = store.insertRule({ hostname: 'linkedin.com', scheme: 'https', includeSubdomains: true, allowSignedIn: true, workspaceId: 'ws-named' });
+    mgr.invalidateAccessCache();
+    const result = await mgr.importUserSessionForRule(rule.id);
+    assert.ok(result.candidateCookiesCopied > 0, 'the anonymous cookie is copied as a candidate first step');
+    assert.notEqual(store.getLoginGrantSessionState(rule.id, 'https://linkedin.com', 'ws-named'), 'active', 'a cookie copy NEVER flips the workspace-exact grant active (repro b)');
+    assert.equal(mgr.classifyOriginState('ws-named', 'https://linkedin.com'), 'needs_signin', 'absent an active grant the origin still needs an interactive sign-in');
+  } finally {
+    electronMock.session.fromPartition = orig;
+  }
+});
+
+test('Phase 2 setup-and-verify: a probed completion on the service origin writes ACTIVE and classifies ready', () => {
+  const { mgr } = makeManager();
+  // Handshake ships a safe probe; includeSubdomains so app.joinhandshake.com matches.
+  const rule = store.insertRule({ hostname: 'joinhandshake.com', scheme: 'https', includeSubdomains: true, allowSignedIn: true, workspaceId: 'ws-hs' });
+  mgr.invalidateAccessCache();
+  const origin = 'https://app.joinhandshake.com';
+  // Quarantined agent tab committed on the authenticated /stu page (NOT a login wall).
+  const tab = injectTab(mgr, { partition: 'agent', url: `${origin}/stu`, signinPending: true, workspaceId: 'ws-hs' });
+  (tab as unknown as { signinRuleId?: string }).signinRuleId = rule.id;
+  (mgr as unknown as { signinSessions: Map<string, unknown> }).signinSessions.set(sessKey('ws-hs', origin), {
+    ruleId: rule.id, workspaceId: 'ws-hs', origin, targetUrl: `${origin}/stu`,
+    tabId: tab.id, state: 'pending', openedAt: 0, reason: '', waiters: 1,
+  });
+
+  const r = mgr.accessHandoffReady(tab.id);
+
+  assert.equal(r.verification, 'probed', 'an adapter with a safe probe, off the login wall, verifies');
+  assert.equal(store.getLoginGrantSessionState(rule.id, origin, 'ws-hs'), 'active', 'the verified completion writes the workspace-exact grant active');
+  assert.equal(mgr.classifyOriginState('ws-hs', origin), 'ready', 'the origin now drives normally');
+  assert.equal(tab.signinPending, false, 'quarantine cleared on completion');
+});
+
+test('Phase 2 setup-and-verify: a completion still parked on the login wall THROWS and writes no grant', () => {
+  const { mgr } = makeManager();
+  const rule = store.insertRule({ hostname: 'joinhandshake.com', scheme: 'https', includeSubdomains: true, allowSignedIn: true, workspaceId: 'ws-hs2' });
+  mgr.invalidateAccessCache();
+  const origin = 'https://app.joinhandshake.com';
+  // Committed on /login — matches the handshake adapter's loginWallHints, so the
+  // probe rejects the completion (the human hasn't actually reached an auth page).
+  const tab = injectTab(mgr, { partition: 'agent', url: `${origin}/login`, signinPending: true, workspaceId: 'ws-hs2' });
+  (tab as unknown as { signinRuleId?: string }).signinRuleId = rule.id;
+
+  assert.throws(() => mgr.accessHandoffReady(tab.id), /still on the sign-in page/);
+
+  assert.notEqual(store.getLoginGrantSessionState(rule.id, origin, 'ws-hs2'), 'active', 'a failed probe writes no active grant (throws before any mutation)');
+  assert.equal(mgr.classifyOriginState('ws-hs2', origin), 'needs_signin', 'the origin stays in the sign-in flow');
+  assert.equal(tab.signinPending, true, 'the tab remains quarantined after a failed completion');
+});
+
+test('Phase 2 setup-and-verify: an unknown-site completion is CONFIRMED (human attestation), not probed', () => {
+  const { mgr } = makeManager();
+  // No adapter governs this host → no automatic probe → honest "confirmed" wording.
+  const rule = store.insertRule({ hostname: 'unknown-confirm.example', scheme: 'https', includeSubdomains: true, allowSignedIn: true, workspaceId: null });
+  mgr.invalidateAccessCache();
+  const origin = 'https://unknown-confirm.example';
+  const tab = injectTab(mgr, { partition: 'agent', url: `${origin}/dashboard`, signinPending: true });
+  (tab as unknown as { signinRuleId?: string }).signinRuleId = rule.id;
+
+  const r = mgr.accessHandoffReady(tab.id);
+
+  assert.equal(r.verification, 'confirmed', 'no adapter → the UI must say "You confirmed this session", never "Verified"');
+  assert.equal(store.getSignedInOriginState(rule.id, origin), 'active', 'a human-confirmed completion still writes the grant active');
+});
+
+// ── Popup gate (decidePopupOpen — single source of truth) ────────────────────
+
+test('Phase 2 popup gate: decidePopupOpen allows a signinPending agent tab + a user tab, denies an ordinary agent tab', () => {
+  const { mgr } = makeManager();
+  const decide = priv<boolean>(mgr, 'decidePopupOpen');
+  const oauthUrl = 'https://accounts.google.com/o/oauth2/v2/auth?client_id=x';
+  assert.equal(decide({ partition: 'agent', signinPending: true }, oauthUrl), true, 'a quarantined agent SSO popup is allowed so "Sign in with Google" can complete in-quarantine');
+  assert.equal(decide({ partition: 'agent', signinPending: false }, oauthUrl), false, 'an ordinary (non-signin) agent tab may never open a popup');
+  assert.equal(decide({ partition: 'user' }, oauthUrl), true, 'a real human tab may open OAuth popups (unchanged)');
+});
+
+test('Phase 2 popup gate: a signin popup is still held to the scheme + SSRF floor', () => {
+  const { mgr } = makeManager();
+  const decide = priv<boolean>(mgr, 'decidePopupOpen');
+  // Link-local / cloud-metadata is denied by checkNavigation regardless of apiPort.
+  assert.equal(decide({ partition: 'agent', signinPending: true }, 'http://169.254.169.254/latest/meta-data/'), false, 'a signin popup cannot become an SSRF vector to the metadata host');
+  assert.equal(decide({ partition: 'agent', signinPending: true }, 'file:///etc/passwd'), false, 'a non-http(s) scheme is denied (schemeOk fails)');
+});
+
+test('Phase 2 quarantine: a signin popup is not a TabEntry — invisible to toolListTabs, and closes with the setup session', () => {
+  const { mgr } = makeManager();
+  setCache(mgr, []);
+  injectTab(mgr, { partition: 'agent', url: 'https://normal.example/', title: 'open' });
+  const signinTab = injectTab(mgr, { partition: 'agent', url: 'https://app.joinhandshake.com/login', signinPending: true });
+  // A quarantined SSO popup is tracked in signinPopupWindows (keyed by parent tab
+  // id) but is NEVER inserted into `this.tabs`, so it structurally cannot appear
+  // in the agent's enumeration (toolListTabs iterates `this.tabs`).
+  let closed = false;
+  const fakePopup = { isDestroyed: () => false, close() { closed = true; } };
+  (mgr as unknown as { signinPopupWindows: Map<string, Set<unknown>> }).signinPopupWindows.set(signinTab.id, new Set([fakePopup]));
+
+  const listed = mgr.tools.listTabs();
+  assert.equal(listed.length, 1, 'only the non-quarantined agent tab enumerates; neither the signin tab nor its popup appear');
+  assert.equal(listed[0].url, 'https://normal.example/');
+
+  // closeSigninPopupsFor (wired into accessHandoffReady / degradeSignin / closeTab)
+  // tears the popup group down with the setup session; idempotent.
+  priv<void>(mgr, 'closeSigninPopupsFor')(signinTab.id);
+  assert.equal(closed, true, 'the tracked popup is closed with the setup session');
+  assert.equal((mgr as unknown as { signinPopupWindows: Map<string, unknown> }).signinPopupWindows.has(signinTab.id), false, 'the popup group is cleared');
+  priv<void>(mgr, 'closeSigninPopupsFor')(signinTab.id); // second call is a no-op
+});
+
+// ── Bounded sign-in redirect policy ──────────────────────────────────────────
+
+test('Phase 2 redirect bounds: IdP traversal never adds a visit rule, and off-origin completion is refused', () => {
+  const { mgr } = makeManager();
+  const rule = store.insertRule({ hostname: 'linkedin.com', scheme: 'https', includeSubdomains: true, allowSignedIn: true, workspaceId: 'ws-li' });
+  mgr.invalidateAccessCache();
+  const rulesBefore = store.listRules().length;
+
+  // The human bounced the quarantined tab through Google SSO; it is committed on
+  // the IdP origin, NOT back on linkedin.com.
+  const tab = injectTab(mgr, { partition: 'agent', url: 'https://accounts.google.com/signin', signinPending: true, workspaceId: 'ws-li' });
+  (tab as unknown as { signinRuleId?: string }).signinRuleId = rule.id;
+
+  // Completion off the service origin is refused (bounded-redirect floor): the IdP
+  // is not an allow_signed_in origin, so checkSignedInDrive denies it.
+  assert.throws(() => mgr.accessHandoffReady(tab.id), /not an allow_signed_in origin/);
+
+  // The traversal created NO access rule — accounts.google.com never gains normal
+  // agent visit permission, even though the adapter knows it as a legitimate human
+  // login destination. The two allowlists (agent-visit vs human-traversal) are
+  // deliberately separate.
+  assert.equal(store.listRules().length, rulesBefore, 'no rule was created for the traversed IdP origin');
+  assert.equal(store.listRules().some((r) => r.hostname === 'accounts.google.com'), false, 'the IdP origin is absent from the agent visit allowlist');
+  const linkedin = resolveSigninAdapter('https://linkedin.com');
+  assert.ok(linkedin, 'the linkedin adapter resolves');
+  assert.equal(isKnownLoginDestination('https://accounts.google.com/signin', linkedin!), true, 'the IdP is a known HUMAN login destination (traversal-allowlist) — separate from the agent visit allowlist');
+});
+
+// ── D2 dead-frame send guard + D5-lite admission (incident-2026-07-11 §5) ─────
+
+test('D2: sendTabState reaches a live shell frame', () => {
+  const { mgr, sent } = makeManager();
+  const tab = injectTab(mgr, { partition: 'agent', url: 'https://mail.example/inbox' });
+  sent.length = 0;
+  priv(mgr, 'sendTabState')(tab as unknown);
+  assert.ok(sent.some((s) => s.channel === 'browser:tab-state'), 'live frame receives the tab-state push');
+});
+
+test('D2: a crashed shell frame suppresses pushes and logs once, then onShellRecovered resumes', () => {
+  const { mgr, sent, shellWc } = makeManager();
+  const tab = injectTab(mgr, { partition: 'agent', url: 'https://mail.example/inbox' });
+
+  // Simulate the crashed shell renderer: webContents is NOT destroyed, but the
+  // frame is disposed (this is exactly the outage condition — isCrashed true).
+  shellWc.isCrashed = () => true;
+  sent.length = 0;
+  const warnings: string[] = [];
+  const origWarn = console.warn;
+  console.warn = (...a: unknown[]) => { warnings.push(a.map(String).join(' ')); };
+  try {
+    priv(mgr, 'sendTabState')(tab as unknown);
+    priv(mgr, 'sendTabState')(tab as unknown);
+    priv(mgr, 'sendTabState')(tab as unknown);
+  } finally {
+    console.warn = origWarn;
+  }
+  assert.equal(sent.length, 0, 'no push reaches a dead shell frame');
+  const d2Lines = warnings.filter((l) => l.includes('suppressing tab-state pushes'));
+  assert.equal(d2Lines.length, 1, 'the dead-frame condition is logged exactly once');
+
+  // D1 reload committed → onShellRecovered clears the latch and resends a full
+  // snapshot (tabs-snapshot + every tab's state).
+  shellWc.isCrashed = () => false;
+  sent.length = 0;
+  (mgr as unknown as { onShellRecovered(): void }).onShellRecovered();
+  assert.ok(sent.some((s) => s.channel === 'browser:tabs-snapshot'), 'recovery resends the tabs snapshot');
+  assert.ok(sent.some((s) => s.channel === 'browser:tab-state'), 'recovery resends per-tab state');
+});
+
+test('D5-lite: getAgentViewCount counts only agent-opened tabs', () => {
+  const { mgr } = makeManager();
+  const a = injectTab(mgr, { partition: 'agent', url: 'https://a.example' });
+  (a as unknown as { openedByAgent: boolean }).openedByAgent = true;
+  const b = injectTab(mgr, { partition: 'agent', url: 'https://b.example' });
+  (b as unknown as { openedByAgent: boolean }).openedByAgent = true;
+  injectTab(mgr, { partition: 'user', url: 'https://human.example' }); // openedByAgent false
+  assert.equal((mgr as unknown as { getAgentViewCount(): number }).getAgentViewCount(), 2);
+});
+
+test('D5-lite: tab admission denial throws AdmissionError with a machine-readable code (agent open only)', async () => {
+  const { mgr } = makeManager();
+  // Arm a gate that refuses under Critical pressure.
+  (mgr as unknown as { setTabAdmissionCheck(fn: () => unknown): void }).setTabAdmissionCheck(() => ({
+    allowed: false, code: 'memory-critical', reason: 'Critical commit pressure',
+  }));
+  const openUrl = priv<Promise<unknown>>(mgr, 'toolOpenUrl');
+  let threw: unknown = null;
+  try {
+    await openUrl('https://mail.example/inbox', {});
+  } catch (e) { threw = e; }
+  assert.ok(threw instanceof Error, 'an agent open under Critical pressure is refused');
+  assert.equal((threw as { name?: string }).name, 'AdmissionError');
+  assert.equal((threw as { code?: string }).code, 'memory-critical', 'machine-readable code is attached');
+  assert.equal((threw as { statusCode?: number }).statusCode, 503, '503 so the API answers Service-Unavailable');
+
+  // A human (forHuman) open is exempt — the gate must not block a handoff. It
+  // proceeds past admission (may fail later for other reasons, but NOT with our code).
+  let humanErr: unknown = null;
+  try { await openUrl('https://mail.example/inbox', { forHuman: true }); }
+  catch (e) { humanErr = e; }
+  assert.notEqual((humanErr as { code?: string })?.code, 'memory-critical', 'human opens are never blocked by admission');
 });
 
 // ── Run ──────────────────────────────────────────────────────────────────────

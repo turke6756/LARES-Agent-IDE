@@ -284,8 +284,6 @@ export default function DirectoryTree({ rootPath, pathType, activeFilePath, onFi
           showRevealInTree={false}
           onClose={() => setRootContextMenu(null)}
           onCreateFile={() => createFileAtRoot('text', 'New file name')}
-          onCreateMarkdownFile={() => createFileAtRoot('markdown', 'New Markdown file name', '.md')}
-          onCreateNotebook={() => createFileAtRoot('notebook', 'New notebook name', '.ipynb')}
           onCreateFolder={createFolderAtRoot}
           sortMode={sortMode}
           onSortModeChange={setSortMode}

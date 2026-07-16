@@ -43,6 +43,7 @@ export default function TopBar() {
   const selectedWorkspaceId = useDashboardStore((s) => s.selectedWorkspaceId);
   const resetLayout = useDashboardStore((s) => s.resetLayout);
   const loadWorkspaces = useDashboardStore((s) => s.loadWorkspaces);
+  const openToolTab = useDashboardStore((s) => s.openToolTab);
   const { theme, toggleTheme } = useThemeStore();
   const [openMenu, setOpenMenu] = useState<string | null>(null);
   const [showAbout, setShowAbout] = useState(false);
@@ -75,6 +76,20 @@ export default function TopBar() {
       { label: 'Reset Panel Layout', onClick: resetLayout },
       { label: '', divider: true },
       { label: 'Reload UI', onClick: () => window.location.reload() },
+    ],
+    // Observability tools. Later work packages append items here — keep each as a
+    // one-line `openToolTab(...)` entry so the menu stays trivially extendable.
+    Tools: [
+      // §5 Wave 5: the memory watchdog is now opened on demand (no ambient meter).
+      { label: 'System Memory', onClick: () => openToolTab('system-memory', 'System Memory') },
+      { label: '', divider: true },
+      { label: 'Context Overhead', onClick: () => openToolTab('context-overhead', 'Context Overhead') },
+      { label: 'Agent Knowledge', onClick: () => openToolTab('agent-knowledge-graph', 'Agent Knowledge') },
+      { label: 'Usage', onClick: () => openToolTab('skill-usage-analytics', 'Usage') },
+      // A7: the capstone is the "Context Optimizer" entry; the detailed WP6b surface
+      // (tier groups, citations, cost/phrase evidence, mark-applied) is one click deeper.
+      { label: 'Context Optimizer', onClick: () => openToolTab('optimizer-capstone', 'Context Optimizer') },
+      { label: 'Optimizer Detail', onClick: () => openToolTab('context-optimizer', 'Optimizer Detail') },
     ],
     Help: [{ label: 'About Lares', onClick: () => setShowAbout(true) }],
   };

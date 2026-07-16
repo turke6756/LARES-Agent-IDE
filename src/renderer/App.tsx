@@ -7,8 +7,11 @@ import DetailPanel from './components/layout/DetailPanel';
 import TerminalPanel from './components/terminal/TerminalPanel';
 import ResizeDivider from './components/layout/ResizeDivider';
 import { useResize } from './hooks/useResize';
+import { useDoubleSpaceSidePanelCollapse } from './hooks/useDoubleSpaceSidePanelCollapse';
 import { openExternalFileTab } from './components/fileviewer/openFileHelpers';
 import DetachedFileView from './components/fileviewer/DetachedFileView';
+import DetachedViewShell from './components/layout/DetachedViewShell';
+import PressureNotification from './components/watchdog/PressureNotification';
 
 // Error boundary to catch React render crashes and show the error instead of white screen
 class ErrorBoundary extends Component<{ children: ReactNode }, { error: Error | null }> {
@@ -54,6 +57,8 @@ function AppInner() {
   const panelLayout = useDashboardStore((s) => s.panelLayout);
   const terminalAgentId = useDashboardStore((s) => s.terminalAgentId);
 
+  useDoubleSpaceSidePanelCollapse();
+
   useEffect(() => {
     loadWorkspaces();
     checkHealth();
@@ -61,13 +66,16 @@ function AppInner() {
       /* best effort — subsequent status events repopulate the index */
     });
 
-    const unsubStatus = window.api.onAgentStatusChanged(({ agent }) => {
+    const unsubStatus = window.api.onAgentStatusChanged(({ agent, source }) => {
       if (!agent) return;
       const store = useDashboardStore.getState();
       // Unguarded: keeps background-workspace heat/waiting live.
       store.updateAgentStatusSnapshot(agent);
       // Scoped upsert (selected workspace only) — existing behavior, unchanged.
       store.updateAgent(agent);
+      // Gold "snake" border while a context-brick continuation transfer runs:
+      // set on 'restarting'+continuation, cleared on this agent's next status.
+      store.applyTransferSignal({ agentId: agent.id, status: agent.status, source });
     });
 
     const unsubAgentDeleted = window.api.onAgentDeleted(({ agentId }) => {
@@ -132,6 +140,12 @@ function AppInner() {
       openExternalFileTab(p);
     });
 
+    // A detached top-level VIEW window closed → un-hollow its toolbar button so
+    // the view is activatable in the main window again (view-detach §3).
+    const unsubViewClosed = window.api.views.onClosed((p) => {
+      useDashboardStore.getState().undetachView(p.view);
+    });
+
     return () => {
       unsubStatus();
       unsubAgentDeleted();
@@ -143,6 +157,7 @@ function AppInner() {
       unsubDeliberation();
       unsubOpenFileTab();
       unsubDetachedClosed();
+      unsubViewClosed();
     };
   }, []);
 
@@ -241,6 +256,11 @@ function AppInner() {
           <DetailPanel width={detailCollapsed ? 40 : detailResize.size} />
         </div>
       </div>
+
+      {/* D5 memory watchdog (§5 Wave 5): the ONLY ambient surface — a corner
+          pop-up that appears solely under Warn/Critical commit pressure. The
+          always-on meter was removed; open Tools ▸ System Memory to inspect. */}
+      <PressureNotification />
     </div>
   );
 }
@@ -251,6 +271,15 @@ export default function App() {
   // tabs-plan §4 1.8). Branch on the `?detached=1` query main encodes at launch.
   const params = new URLSearchParams(window.location.search);
   if (params.get('detached')) {
+    // A `view` param routes to the top-level view tear-off shell (Dashboard,
+    // …); its absence means a file-tab tear-off (the original detach path).
+    if (params.get('view')) {
+      return (
+        <ErrorBoundary>
+          <DetachedViewShell params={params} />
+        </ErrorBoundary>
+      );
+    }
     return (
       <ErrorBoundary>
         <DetachedFileView params={params} />

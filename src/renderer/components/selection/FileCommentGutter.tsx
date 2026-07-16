@@ -10,7 +10,7 @@ import {
 } from '../../lib/selection/comment-actions';
 import { onCommentsChanged } from '../../lib/selection/comment-events';
 import type { SelectionAgentTarget } from '../../lib/selection/selection-types';
-import AgentPickerDropdown from './AgentPickerDropdown';
+import CommentCard from './CommentCard';
 
 // Comment marker column for file surfaces (WP-P5-B). Mounts as an absolute
 // overlay over the surface's scroll container: one marker per non-resolved
@@ -173,7 +173,6 @@ export default function FileCommentGutter({ tabId, scrollRef }: Props) {
   );
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [expandedHighlightId, setExpandedHighlightId] = useState<string | null>(null);
-  const [pickerFor, setPickerFor] = useState<string | null>(null);
   // Status flips already requested this generation — keeps the measure pass
   // from re-issuing draft↔orphaned updates while the refetch is in flight.
   const flipsInFlight = useRef(new Set<string>());
@@ -400,13 +399,11 @@ export default function FileCommentGutter({ tabId, scrollRef }: Props) {
     .map((c) => c.id);
 
   const sendOne = (comment: SelectionComment, target: SelectionAgentTarget) => {
-    setPickerFor(null);
     setExpandedId(null);
     void sendPersistedComments([comment.id], target, filePath);
   };
 
   const sendAll = (target: SelectionAgentTarget) => {
-    setPickerFor(null);
     setExpandedId(null);
     if (draftIds.length > 0) void sendPersistedComments(draftIds, target, filePath);
   };
@@ -442,82 +439,26 @@ export default function FileCommentGutter({ tabId, scrollRef }: Props) {
       })}
 
       {expanded && (
-        <div
-          data-testid="comment-card"
-          className="ui-menu pointer-events-auto absolute p-2"
+        <CommentCard
+          comment={expanded}
+          workspaceId={workspaceId}
+          statusLabel={
+            STATUS_LABEL[positions.get(expanded.id) ? expanded.status : 'orphaned'] ??
+            expanded.status
+          }
+          sendable={SENDABLE.has(expanded.status)}
+          draftCount={draftIds.length}
           style={{
             right: CARD_RIGHT,
             top: Math.max(4, Math.min(markerCardTop(expanded, positions), containerHeight - 220)),
             width: CARD_WIDTH,
           }}
-        >
-          <div className="flex items-center justify-between mb-1">
-            <span className="text-[11px] uppercase tracking-[0.08em] font-semibold text-gray-400">
-              {STATUS_LABEL[positions.get(expanded.id) ? expanded.status : 'orphaned'] ??
-                expanded.status}
-            </span>
-            <button
-              className="ui-btn text-[11px] px-1.5 py-0"
-              onClick={() => setExpandedId(null)}
-              title="Collapse"
-            >
-              ✕
-            </button>
-          </div>
-          <div className="px-2 py-1 mb-1.5 border-l-2 border-accent-blue/50 text-[12px] text-gray-400 italic whitespace-pre-wrap max-h-24 overflow-auto">
-            {expanded.quotedText}
-          </div>
-          <div className="text-[13px] text-gray-200 whitespace-pre-wrap max-h-40 overflow-auto mb-2">
-            {expanded.body}
-          </div>
-          <div className="flex flex-wrap items-center gap-1.5">
-            {SENDABLE.has(expanded.status) && (
-              <button
-                className="ui-btn text-[12px]"
-                onClick={() => setPickerFor((v) => (v === 'one' ? null : 'one'))}
-              >
-                Send&nbsp;▸
-              </button>
-            )}
-            {draftIds.length > 1 && (
-              <button
-                className="ui-btn text-[12px]"
-                onClick={() => setPickerFor((v) => (v === 'all' ? null : 'all'))}
-                title={`Send all ${draftIds.length} draft comments as one message`}
-              >
-                Send all ({draftIds.length})&nbsp;▸
-              </button>
-            )}
-            <button
-              className="ui-btn text-[12px]"
-              onClick={() => {
-                setExpandedId(null);
-                void resolveComment(expanded.id, filePath);
-              }}
-            >
-              Resolve
-            </button>
-            <button
-              className="ui-btn text-[12px]"
-              onClick={() => {
-                setExpandedId(null);
-                void deleteComment(expanded.id, filePath);
-              }}
-            >
-              Delete
-            </button>
-          </div>
-          {pickerFor && (
-            <div className="mt-1.5">
-              <AgentPickerDropdown
-                workspaceId={workspaceId}
-                onPick={(target) =>
-                  pickerFor === 'all' ? sendAll(target) : sendOne(expanded, target)
-                }
-              />
-            </div>
-          )}
-        </div>
+          onClose={() => setExpandedId(null)}
+          onSendOne={(target) => sendOne(expanded, target)}
+          onSendAll={(target) => sendAll(target)}
+          onResolve={() => void resolveComment(expanded.id, filePath)}
+          onDelete={() => void deleteComment(expanded.id, filePath)}
+        />
       )}
 
       {highlights.map((h) => {

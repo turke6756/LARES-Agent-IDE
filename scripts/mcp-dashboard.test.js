@@ -15,6 +15,7 @@ const toolsetModulePaths = [
   './mcp-tools-observability',
   './mcp-tools-notebooks',
   './mcp-browser-tools',
+  './mcp-tools-plans',
 ];
 
 function clearProxyModules() {
@@ -106,6 +107,20 @@ test('notebooks,comms,observability exposes exactly those toolsets, not orchestr
     'restart_kernel',
     'save_continuation_brick',
     'send_message_to_agent',
+    // WP7 context-optimizer read-only agent surface (additive to observability).
+    'get_context_optimizer_proposals',
+    'get_context_optimizer_proposal',
+    'get_context_optimizer_proposal_evidence',
+    'get_context_optimizer_cluster_exemplars',
+    'get_context_optimizer_analyzability',
+    'get_improvement_proposals',
+    'get_improvement_proposal',
+    'get_skill_usage',
+    'get_skill_usage_detail',
+    'get_mcp_tool_usage',
+    'get_agent_knowledge',
+    'get_agent_knowledge_detail',
+    'get_file_heat',
   ].sort());
   assert.ok(!names.includes('launch_agent'));
   assert.ok(!names.some((name) => name.startsWith('browser_')));
@@ -117,6 +132,121 @@ test('notebooks,comms,observability exposes exactly those toolsets, not orchestr
     isError: true,
   });
   assert.strictEqual(api.calls.length, 0);
+});
+
+// ── WP-F (P5): observability split into core + analytics ──
+
+const OBSERVABILITY_CORE_TOOLS = [
+  'get_context_stats', 'get_my_context', 'get_team', 'get_usage_limits',
+  'list_agents', 'list_my_agents', 'list_teams', 'list_templates',
+  'open_file_in_view', 'read_agent_chat', 'read_agent_files_touched',
+  'read_agent_log', 'save_continuation_brick',
+].sort();
+
+const OBSERVABILITY_ANALYTICS_TOOLS = [
+  'get_agent_knowledge', 'get_agent_knowledge_detail',
+  'get_context_optimizer_analyzability',
+  'get_context_optimizer_cluster_exemplars',
+  'get_context_optimizer_proposal', 'get_context_optimizer_proposal_evidence',
+  'get_context_optimizer_proposals',
+  'get_file_heat', 'get_improvement_proposal', 'get_improvement_proposals',
+  'get_mcp_tool_usage', 'get_skill_usage', 'get_skill_usage_detail',
+].sort();
+
+test('observability-core exposes exactly the operational tools, NOT the analytics tools', async () => {
+  const proxy = loadProxy('observability-core');
+  const names = namesOf(proxy.getToolDefinitions());
+  assert.deepStrictEqual(names, OBSERVABILITY_CORE_TOOLS);
+  for (const analytics of OBSERVABILITY_ANALYTICS_TOOLS) {
+    assert.ok(!names.includes(analytics), `observability-core must NOT expose ${analytics}`);
+  }
+  // Belt-and-suspenders: an analytics tool is not routable under the core-only grant.
+  const api = fakeApi();
+  const result = await proxy.handleToolCall('get_file_heat', {}, api);
+  assert.deepStrictEqual(result, {
+    content: [{ type: 'text', text: 'Unknown tool: get_file_heat' }],
+    isError: true,
+  });
+  assert.strictEqual(api.calls.length, 0, 'no HTTP call for an analytics tool under observability-core');
+});
+
+test('observability-analytics exposes exactly the deep-analytics tools, NOT the operational core tools', async () => {
+  const proxy = loadProxy('observability-analytics');
+  const names = namesOf(proxy.getToolDefinitions());
+  assert.deepStrictEqual(names, OBSERVABILITY_ANALYTICS_TOOLS);
+  for (const core of OBSERVABILITY_CORE_TOOLS) {
+    assert.ok(!names.includes(core), `observability-analytics must NOT expose ${core}`);
+  }
+  // A core tool is not routable under the analytics-only grant.
+  const api = fakeApi();
+  const result = await proxy.handleToolCall('list_agents', {}, api);
+  assert.deepStrictEqual(result, {
+    content: [{ type: 'text', text: 'Unknown tool: list_agents' }],
+    isError: true,
+  });
+  assert.strictEqual(api.calls.length, 0);
+});
+
+test('WORKER grant (comms,observability-core,browser-present,plans-read) exposes NO analytics tools', async () => {
+  const proxy = loadProxy('comms,observability-core,browser-present,plans-read');
+  const names = namesOf(proxy.getToolDefinitions());
+  for (const analytics of OBSERVABILITY_ANALYTICS_TOOLS) {
+    assert.ok(!names.includes(analytics), `worker lane must NOT receive analytics tool ${analytics}`);
+  }
+  // But it still gets the operational core observability tools.
+  assert.ok(names.includes('list_agents'), 'worker keeps operational observability (list_agents)');
+  assert.ok(names.includes('read_agent_chat'), 'worker keeps operational observability (read_agent_chat)');
+});
+
+test('SUPERVISOR grant keeps BOTH halves: core + analytics tools present', async () => {
+  const proxy = loadProxy('orchestration,comms,observability-core,observability-analytics,plans,browser-present');
+  const names = namesOf(proxy.getToolDefinitions());
+  assert.ok(names.includes('get_file_heat'), 'supervisor keeps analytics (get_file_heat)');
+  assert.ok(names.includes('get_skill_usage'), 'supervisor keeps analytics (get_skill_usage)');
+  assert.ok(names.includes('list_agents'), 'supervisor keeps core (list_agents)');
+});
+
+test('backward-compat: the `observability` alias still exposes the full union (core + analytics)', async () => {
+  const proxy = loadProxy('observability');
+  const names = namesOf(proxy.getToolDefinitions());
+  assert.deepStrictEqual(names, [...OBSERVABILITY_CORE_TOOLS, ...OBSERVABILITY_ANALYTICS_TOOLS].sort());
+  // And both a core and an analytics tool still route through the alias handler.
+  const api = capturingApi({ ok: true });
+  await proxy.handleToolCall('get_file_heat', {}, api);
+  assert.strictEqual(api.calls.length, 1, 'analytics tool routes under the observability alias');
+  assert.strictEqual(api.calls[0].method, 'GET');
+});
+
+// ── WP-A4: plans-read worker grant exposes exactly the 3 read tools ──
+
+test('plans-read toolset exposes exactly the 3 read tools, not create_plan', async () => {
+  const proxy = loadProxy('plans-read');
+  const names = namesOf(proxy.getToolDefinitions());
+  assert.deepStrictEqual(names, [
+    'list_plan_sections',
+    'read_plan_projection',
+    'read_plan_section',
+  ]);
+  assert.ok(!names.includes('create_plan'), 'plans-read must NOT expose create_plan');
+
+  // create_plan is not routable under the plans-read grant (errors, no HTTP call).
+  const api = fakeApi();
+  const result = await proxy.handleToolCall('create_plan', { workspace_id: 'ws', title: 'T' }, api);
+  assert.ok(result.isError, 'create_plan must be an error under plans-read');
+  assert.strictEqual(api.calls.length, 0);
+});
+
+test('plans (supervisor) toolset still exposes create_plan + the read ladder + focus verbs', async () => {
+  const proxy = loadProxy('plans');
+  const names = namesOf(proxy.getToolDefinitions());
+  assert.deepStrictEqual(names, [
+    'create_plan',
+    'focus_plan',
+    'list_plan_sections',
+    'read_plan_projection',
+    'read_plan_section',
+    'unfocus_plan',
+  ]);
 });
 
 // ── get_usage_limits: returns the /api/usage-limits result verbatim ──

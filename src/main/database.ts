@@ -1,10 +1,14 @@
 import Database from 'better-sqlite3';
 import path from 'path';
 import fs from 'fs';
+import crypto from 'crypto';
 import { v4 as uuidv4 } from 'uuid';
-import { Agent, AgentProvider, AgentSessionRow, AgentStatus, AgentTemplate, CreateAgentTemplateInput, CreateSelectionCommentInput, CreateWorkspaceInput, CreateTeamInput, FileActivity, FileOperation, SelectionComment, SelectionCommentStatus, Team, TeamChannel, TeamMember, TeamMessage, TeamMessageStatus, TeamStatus, TeamTask, TeamTaskStatus, UpdateSelectionCommentInput, Workspace } from '../shared/types';
+import { Agent, AgentProvider, AgentSessionRow, AgentStatus, AgentTemplate, CreateAgentTemplateInput, CreateSelectionCommentInput, CreateWorkspaceInput, CreateTeamInput, FileActivity, FileOperation, Plan, PlanFormat, RepoActivityEvidenceV1, SelectionComment, SelectionCommentStatus, SupervisorFocus, Team, TeamChannel, TeamMember, TeamMessage, TeamMessageStatus, TeamStatus, TeamTask, TeamTaskStatus, UpdateSelectionCommentInput, Workspace } from '../shared/types';
+import { parsePdfSelectionAnchor, serializePdfSelectionAnchor, validatePdfSelectionAnchor, type PdfSelectionAnchorV1, type SelectionAnchorType } from '../shared/pdf-annotations';
 import { DEFAULT_COMMAND, DEFAULT_COMMAND_WSL, SUPERVISOR_AGENT_MD } from '../shared/constants';
+import { parseRepoActivityEvidence } from './plans/repo-activity';
 import { OrchestrationEvent, OrchestrationRun } from './orchestration/types';
+import { resolveWorkspaceForCwd, WORKSPACE_LINEAGE_VERSION, type WorkspaceRecordLite } from './skill-analytics/workspace-lineage';
 
 let db: Database.Database;
 let dbPath: string;
@@ -150,6 +154,12 @@ export function initDatabase(): void {
   // handoffs. Bumped ONLY via the attempt's successorGen inside the atomic
   // relaunch transaction (commitContinuationRelaunch), never ad-hoc.
   try { db.exec(`ALTER TABLE agents ADD COLUMN continuation_generation INTEGER NOT NULL DEFAULT 0`); } catch { /* exists */ }
+
+  // Per-agent continuation toggle (Edward 2026-07-05). When 0, the continuation
+  // watcher must NEVER open a handoff attempt for this agent — it records a
+  // `continuation-disabled` trigger blocker. Defaults to 1 so every pre-existing
+  // row keeps today's opt-in-by-default behavior. Read via Agent.continuationEnabled.
+  try { db.exec(`ALTER TABLE agents ADD COLUMN continuation_enabled INTEGER NOT NULL DEFAULT 1`); } catch { /* exists */ }
 
   // Context-brick Phase 4 — stamp each file activity with the session (and
   // generation) it happened under, so continuations retain prior-session
@@ -334,9 +344,17 @@ export function initDatabase(): void {
       started_at        TEXT,
       updated_at        TEXT,
       ended_at          TEXT,
-      error             TEXT
+      error             TEXT,
+      plan_id           TEXT,            -- WP6 planning-surface rail (nullable)
+      section_anchor    TEXT             -- WP6 writeback target sec_ anchor
     )
   `);
+  // WP6: guarded ALTERs so pre-WP6 orchestrations tables gain the plan rail
+  // columns without a table rebuild (own subsystem — NOT the planning-surface
+  // migration region; the orchestrations table is disjoint from initDatabase's
+  // agents/provenance regions).
+  try { db.exec(`ALTER TABLE orchestrations ADD COLUMN plan_id TEXT`); } catch { /* exists */ }
+  try { db.exec(`ALTER TABLE orchestrations ADD COLUMN section_anchor TEXT`); } catch { /* exists */ }
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS orchestration_events (
@@ -648,6 +666,65 @@ export function initDatabase(): void {
     db.exec(`ALTER TABLE browser_access_rules ADD COLUMN login_url_patterns TEXT`);
   } catch { /* column already exists */ }
 
+  // Phase 1 (BrowserSigninSharing plan §D — workspace-EXACT login grants). The
+  // legacy browser_access_signed_in_origins table is keyed (rule_id, origin) with
+  // no workspace in the KEY, so a NULL-workspace wildcard rule cannot hold
+  // independent per-workspace sessions — the exact defect Phase 0 reproduced (a
+  // grant established in one workspace's agent partition was consumed as `ready`
+  // by another). This ADDITIVE table makes workspace part of the primary key so a
+  // single wildcard visit-rule can carry independent login grants per workspace,
+  // and it stores DURABLE consent separately from RUNTIME session state:
+  //   - workspace_key : the effective workspace whose agent partition
+  //                     (persist:agent:<key>) actually holds the credentials.
+  //                     NOT NULL — null/'' normalizes to 'default' (mirrors
+  //                     agentPartitionForWorkspace), so the key is 1:1 with the
+  //                     partition the session lives in.
+  //   - consent_state : durable human permission ('granted' | 'setup_required').
+  //   - session_state : runtime session ('setup_required' | 'active' | 'expired').
+  // The old table is retained unchanged (revocation origin-breadth + the
+  // workspace-agnostic session-center listing still read it); this table is the
+  // workspace-exact authority classifyOriginState consults. No cookie material is
+  // ever stored here (ids, an origin, states, timestamps only).
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS browser_access_login_grants (
+      rule_id       TEXT NOT NULL,
+      workspace_key TEXT NOT NULL,
+      origin        TEXT NOT NULL,
+      consent_state TEXT NOT NULL DEFAULT 'granted'
+                      CHECK (consent_state IN ('setup_required','granted')),
+      session_state TEXT NOT NULL DEFAULT 'setup_required'
+                      CHECK (session_state IN ('setup_required','active','expired')),
+      signed_in_at  INTEGER,
+      last_used_at  INTEGER,
+      verified_at   INTEGER,
+      expired_at    INTEGER,
+      created_at    INTEGER NOT NULL,
+      PRIMARY KEY (rule_id, workspace_key, origin)
+    )
+  `);
+  // Upgrade synthesis: park each ACTIVE legacy null-workspace signed-in origin as
+  // an explicit **Setup required** grant under the default workspace key. We do
+  // NOT create an 'active' grant and we NEVER clone one default cookie jar into
+  // every workspace — Electron cannot safely infer that Ed's saved login should
+  // become a live session in a named workspace without his re-confirmation. A
+  // 'setup_required' grant is not 'active', so classifyOriginState still returns
+  // needs_signin until a real per-workspace setup lands (Phase 2). INSERT OR
+  // IGNORE keeps it idempotent and never downgrades an existing active grant.
+  // No-op on a fresh DB (nothing to synthesize).
+  try {
+    db.exec(`
+      INSERT OR IGNORE INTO browser_access_login_grants
+        (rule_id, workspace_key, origin, consent_state, session_state, created_at)
+      SELECT s.rule_id, 'default', s.origin, 'granted', 'setup_required',
+             COALESCE(s.signed_in_at, 0)
+        FROM browser_access_signed_in_origins s
+        JOIN browser_access_rules r ON r.id = s.rule_id
+       WHERE r.allow_signed_in = 1
+         AND r.workspace_id IS NULL
+         AND COALESCE(s.session_state, 'active') <> 'expired'
+    `);
+  } catch { /* best-effort synthesis — never blocks startup */ }
+
   // ── Selection comments table ──────────────────────────────────────────
   // WP-P5 — persisted file-target selection comments. Schema recorded in
   // plans/selection-to-agent-primitive-plan.md §5; copied exactly. No generic
@@ -698,6 +775,17 @@ export function initDatabase(): void {
   // row is a comment unless explicitly a 'highlight'.
   try {
     db.exec(`ALTER TABLE selection_comments ADD COLUMN kind TEXT NOT NULL DEFAULT 'comment'`);
+  } catch { /* column already exists */ }
+
+  // Additive migration for the PDF dual-viewer trunk (plan Part 1.4). A row is
+  // a 'text' anchor (markdown/plaintext) unless explicitly 'pdf', in which case
+  // `anchor_json` carries the serialized PdfSelectionAnchorV1. Existing rows
+  // default to 'text' so every markdown caller is unchanged.
+  try {
+    db.exec(`ALTER TABLE selection_comments ADD COLUMN anchor_type TEXT NOT NULL DEFAULT 'text'`);
+  } catch { /* column already exists */ }
+  try {
+    db.exec(`ALTER TABLE selection_comments ADD COLUMN anchor_json TEXT`);
   } catch { /* column already exists */ }
 
   // ── Agent templates table ────────────────────────────────────────────
@@ -753,6 +841,38 @@ export function initDatabase(): void {
     );
   }
 
+  // ── B2: Plan subscription tables ──
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS plans (
+      id            TEXT PRIMARY KEY,
+      workspace_id  TEXT NOT NULL REFERENCES workspaces(id),
+      path          TEXT NOT NULL,
+      slug          TEXT,
+      format        TEXT NOT NULL,
+      run_state     TEXT,
+      mtime_ms      INTEGER NOT NULL,
+      size_bytes    INTEGER NOT NULL,
+      created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at    TEXT NOT NULL DEFAULT (datetime('now')),
+      deleted_at    TEXT,
+      UNIQUE(workspace_id, path)
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_plans_workspace ON plans(workspace_id)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_plans_workspace_active ON plans(workspace_id) WHERE deleted_at IS NULL`);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS supervisor_focus (
+      supervisor_id     TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+      plan_id           TEXT NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+      focused_at        TEXT NOT NULL DEFAULT (datetime('now')),
+      last_attended_at  TEXT NOT NULL DEFAULT (datetime('now')),
+      notes             TEXT,
+      PRIMARY KEY (supervisor_id, plan_id)
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_supervisor_focus_supervisor ON supervisor_focus(supervisor_id)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_supervisor_focus_plan ON supervisor_focus(plan_id)`);
+
   // Phase 4a cleanup: purge file_activities rows where the legacy PTY-based tracker
   // captured codex/gemini TUI output as a comma-separated "file_path" string.
   // Naturally idempotent — the tracker is now gated to claude-only, so re-running
@@ -779,6 +899,166 @@ export function initDatabase(): void {
     console.warn('[database] aggregate file_activities purge failed:', err);
   }
 
+  // ── Planning surface: provenance + snapshots ──
+  // Disjoint migration region (amendments §F-G) placed AFTER both file_activities
+  // cleanup blocks and BEFORE the Context-brick Phase 1 lineage backfill. The B2
+  // region above already created `plans`, so every FK → plans(id) here resolves.
+  // Serial WP order means WP1/WP2/WP4 append their sub-blocks below without
+  // concurrent edits.
+
+  // WP1: agents plan rail. GUARDED ALTERs — SQLite has no ALTER … ADD COLUMN IF
+  // NOT EXISTS, so each add is wrapped in try/catch (the owner_agent_id idiom at
+  // ~:140). MUST live here, NOT in B2's gap (B2 forbids ALTERing agents there),
+  // and clear of B1a's agents-ALTER markers. plan_id is a logical FK → plans.id
+  // frozen onto the row at launch; plan_section is the target section anchor.
+  try { db.exec(`ALTER TABLE agents ADD COLUMN plan_id TEXT`); } catch { /* exists */ }
+  try { db.exec(`ALTER TABLE agents ADD COLUMN plan_section TEXT`); } catch { /* exists */ }
+
+  // WP2: provenance spine — all CREATE TABLE IF NOT EXISTS (idempotent regardless
+  // of landing order). Four tables: plan_sections (anchor registry, R1 §2),
+  // plan_events (reconciled schema, amendments §F-A — canonical dispatched-target
+  // column is `dispatched_section_anchor`), plan_section_touches (read/edit-target
+  // breadcrumbs, R2 §2.1) and plan_section_changes (effect store, R2 §2.4). The
+  // section_anchor rename to dispatched_* is scoped to plan_events ONLY; touches
+  // and changes keep their `section_anchor` columns.
+
+  // plan_sections — the durable side of addressability (R1 §2). HTML defines which
+  // sections exist and their prose; this table records anchor identity, lifecycle
+  // and lineage only (no title/status — those drift on reword).
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS plan_sections (
+      id                TEXT PRIMARY KEY,   -- row uuid
+      plan_id           TEXT NOT NULL,      -- FK → plans.id
+      anchor            TEXT NOT NULL,      -- the data-anchor value; provenance key
+      parent_section_id TEXT,               -- split/merge lineage
+      created_at        TEXT NOT NULL,
+      archived_at       TEXT,               -- soft-delete; provenance is append-only
+      UNIQUE (plan_id, anchor)
+    )
+  `);
+
+  // plan_events — RECONCILED DDL, pasted verbatim from amendments §F-A. The
+  // dispatched-target column is `dispatched_section_anchor` (R1's bare
+  // `section_anchor` is collapsed into it and does NOT survive here).
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS plan_events (
+      id                        TEXT PRIMARY KEY,           -- R1: row uuid
+      plan_id                   TEXT NOT NULL,              -- R1: FK → plans.id
+      agent_id                  TEXT NOT NULL,              -- R1: emitting agent
+      event_type                TEXT NOT NULL,              -- R1: turn outcome / lifecycle
+      created_at                TEXT NOT NULL,              -- R1: insertion time
+
+      -- Dispatched target (trusted launch fact). R1 called this section_anchor;
+      -- collapsed into R2 §2.6's clearer name. Written from frozen agents.plan_section.
+      dispatched_section_anchor TEXT,                       -- R1 ⊕ R2 §2.6 (canonical; R1 dup removed)
+
+      -- Derived attribution — output of resolveTargetAnchor (R2 §2.5).
+      observed_section_anchor   TEXT,                       -- R1 ⊕ R2 §2.6 (declared in both; single copy)
+      observed_via              TEXT,                       -- R2 §2.6
+      attribution_confidence    TEXT,                       -- R2 §2.6 (derivable from observed_via)
+      observed_candidates_json  TEXT,                       -- R2 §2.6 (audit trail)
+      read_intent_anchor        TEXT,                       -- R2 §2.6 (trusted fact; may be null)
+      edit_target_anchor        TEXT,                       -- R2 §2.6 (derived; may be null)
+
+      -- Divergence flags — declared in both R1 & R2 (single copy each).
+      section_mismatch          INTEGER NOT NULL DEFAULT 0, -- R1 ⊕ R2 §2.6
+      mismatch_reason           TEXT,                       -- R2 §2.6 ('intent-effect-divergence'|'dispatch-drift'|'multi-section'|null)
+
+      -- Payloads.
+      trusted_envelope_json     TEXT NOT NULL,              -- R1: agent_id, plan_id, section, files-touched, timing
+      claimed_payload_json      TEXT,                       -- R1: scraped sentinel; NULL on scrape failure
+      claimed_section_anchor    TEXT                        -- R2 §2.6/§3: mirrored from sentinel; diagnostics-only, never drives the join
+    )
+  `);
+  // Primary projection query is plan + observed-anchor ORDER BY time → the composite covers the sort.
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_plan_events_plan_observed_created
+      ON plan_events (plan_id, observed_section_anchor, created_at)
+  `);
+  // Full activity trail for a plan, time-ordered.
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_plan_events_plan_created
+      ON plan_events (plan_id, created_at)
+  `);
+  // GT-A WP-A1 (§2 A1.1) — sibling migrations, same idiom as initDatabase's other
+  // ALTERs. `written_section_anchors_json` = JSON array of anchors the turn
+  // actually WROTE (effect set = uniq(changed), `[]` for no-write turns —
+  // editTargets are audit signals, never counted as writes, D-4). `change_count`
+  // = the RAW fs-diff section-change cardinality (D-5). The idempotent
+  // NULL-guarded backfill below reconstructs both for historical rows.
+  try { db.exec(`ALTER TABLE plan_events ADD COLUMN written_section_anchors_json TEXT`); } catch { /* column already exists */ }
+  try { db.exec(`ALTER TABLE plan_events ADD COLUMN change_count INTEGER NOT NULL DEFAULT 0`); } catch { /* column already exists */ }
+  // Fix-4 (witnessed repo-activity) — nullable JSON blob of the turn's capped repo
+  // evidence (RepoActivityEvidenceV1). NULL = pre-fix-4 / not captured (no backfill:
+  // historical windows are unreconstructable). Guarded by a hard byte cap at write
+  // time + tolerant parse on read, so the column can never break the row or projection.
+  try { db.exec(`ALTER TABLE plan_events ADD COLUMN repo_activity_json TEXT`); } catch { /* column already exists */ }
+
+  // plan_section_touches — read=intent + edit-target breadcrumbs (R2 §2.1). Keeps
+  // its own `section_anchor` column (rename is scoped to plan_events only). The
+  // resolve_payload column stores native-edit material (old_string hash+slices /
+  // apply_patch hunk context) for the Stop-time resolver.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS plan_section_touches (
+      id             TEXT PRIMARY KEY,        -- row uuid
+      agent_id       TEXT NOT NULL,
+      plan_id        TEXT NOT NULL,           -- resolved from tool args, else agents.plan_id
+      section_anchor TEXT NOT NULL,           -- the data-anchor named/resolved (or pending sentinel)
+      block_anchor   TEXT,                    -- optional sub-section anchor (N7)
+      tool           TEXT NOT NULL,           -- 'read_plan_section' | 'list_plan_sections' | 'read_plan_projection' | 'edit' | 'apply_patch' | 'write'
+      kind           TEXT NOT NULL,           -- 'read' | 'edit-target'
+      read_mode      TEXT,                    -- for reads: 'outline'|'text'|'raw'|'raw+editWindow'|...
+      source         TEXT NOT NULL,           -- 'handler' | 'transcript'
+      tool_use_id    TEXT,                    -- dedup key across the two sources
+      resolve_payload TEXT,                   -- edit-target material for Stop-time anchor resolution
+      observed_at    TEXT NOT NULL
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_pst_agent_time ON plan_section_touches (agent_id, observed_at)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_pst_plan ON plan_section_touches (plan_id, section_anchor)`);
+
+  // plan_section_changes — effect store (R2 §2.4). One row per section/block whose
+  // byte-exact inner-HTML hash moved on a reparse. Keeps its `section_anchor`
+  // column (rename scoped to plan_events only).
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS plan_section_changes (
+      id             TEXT PRIMARY KEY,
+      plan_id        TEXT NOT NULL,
+      section_anchor TEXT NOT NULL,
+      block_anchor   TEXT,
+      content_hash   TEXT NOT NULL,      -- hash of the section's byte-exact inner HTML after reparse
+      changed_at     TEXT NOT NULL       -- reparse timestamp
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_psc_plan_time ON plan_section_changes (plan_id, changed_at)`);
+
+  // GT-A WP-A1 (§2 A1.4) — reconstruct written-sets/change_count for pre-column
+  // plan_events rows. Called AFTER plan_section_changes exists (it reads that
+  // table). NULL-guarded + idempotent: a strict no-op once every row is backfilled.
+  backfillPlanEventWrittenSets();
+
+  // WP4: snapshot history (amendments §F-B, DDL verbatim). Content-addressed blob
+  // split — each distinct HTML body stored exactly ONCE globally; plan_snapshots is
+  // the per-plan ordered reference history (consecutive-dedup skips no-op reparses).
+  // An A→B→A cycle reuses A's blob via INSERT OR IGNORE. Both FKs → tables above.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS plan_snapshot_blobs (
+      content_hash  TEXT PRIMARY KEY,   -- sha256 hex of the full HTML
+      html          TEXT NOT NULL,
+      byte_size     INTEGER NOT NULL,
+      first_seen_at TEXT NOT NULL
+    )
+  `);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS plan_snapshots (
+      id           TEXT PRIMARY KEY,    -- row uuid
+      plan_id      TEXT NOT NULL,       -- FK → plans.id
+      content_hash TEXT NOT NULL,       -- FK → plan_snapshot_blobs.content_hash
+      created_at   TEXT NOT NULL        -- reparse timestamp
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_plan_snapshots_plan_time ON plan_snapshots (plan_id, created_at)`);
+
   // Context-brick Phase 1 — one-time, best-effort lineage backfill from the
   // append-only events trail. Per-agent guarded (skips agents already carrying
   // rows) + ON CONFLICT DO NOTHING, so it is idempotent across boots and never
@@ -788,6 +1068,365 @@ export function initDatabase(): void {
     backfillAgentSessionsFromEvents();
   } catch (err) {
     console.warn('[database] agent_sessions backfill failed:', err);
+  }
+
+  initContextOptimizerSchema();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Context-optimizer WP2 — parse-foundation schema (P0 + WP2b, ONE parser_version,
+// ONE backfill). Self-contained, ADDITIVE region: every statement is
+// CREATE TABLE/INDEX IF NOT EXISTS or a guarded ALTER, so it is idempotent and
+// never reorders or mutates any pre-existing region (incl. the planning-surface
+// `plan_*` provenance spine above, which is a DIFFERENT workstream's "WP2").
+// Specs of record: dashboard-skill-observability-tools.md §P0.6/P0.7;
+// behavior-grounded-optimizer-design.md §4.1; hardening-wp2b-capture.md §1;
+// hardening-epochs-outcomes.md §1 (config_* / optimizer_* CREATEs land here,
+// writers live in WP5/WP6 — Fix-6).
+// ─────────────────────────────────────────────────────────────────────────────
+function initContextOptimizerSchema(): void {
+  // WAL is already enabled at init (line ~23); no pragma needed here (wp2b §1.6).
+
+  // ── P0.6 — monotonic parse cursor (byte_offset = start of next unparsed line) ──
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS skill_parse_cursors (
+      jsonl_path        TEXT PRIMARY KEY,
+      first_fingerprint TEXT NOT NULL DEFAULT '',   -- rotation/rebuild discriminator (P0.3)
+      byte_offset       INTEGER NOT NULL DEFAULT 0,
+      size_bytes        INTEGER NOT NULL DEFAULT 0,
+      parser_version    INTEGER NOT NULL DEFAULT 1,
+      last_parsed_at    INTEGER NOT NULL DEFAULT 0
+    );
+  `);
+
+  // ── P0.6 — skill invocations (window rows) ──
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS skill_invocations (
+      id            TEXT PRIMARY KEY,            -- tool_use: \`\${entryUuid}#\${blockIndex}\`; slash: \`\${entryUuid}#slash:\${matchIndex}\`
+      stream_id     TEXT NOT NULL,               -- normalized jsonl_path — window key
+      jsonl_path    TEXT NOT NULL,
+      session_id    TEXT,
+      parent_session_id TEXT,                    -- subagent files; null for top-level
+      sub_agent_name TEXT,                       -- \`agent-*\` stem; null for top-level
+      working_dir   TEXT, workspace_root TEXT, slug TEXT,
+      ts_ms         INTEGER NOT NULL,
+      skill_name    TEXT NOT NULL, args TEXT,
+      detector      TEXT NOT NULL,               -- 'tool_use' | 'slash_command'
+      window_open        INTEGER NOT NULL DEFAULT 1,
+      window_last_ts     INTEGER,
+      window_tool_calls  INTEGER NOT NULL DEFAULT 0,
+      window_error_results INTEGER NOT NULL DEFAULT 0,
+      window_output_tokens INTEGER NOT NULL DEFAULT 0,
+      window_dur_ms      INTEGER,
+      ended_with_question INTEGER,
+      repeated_search    INTEGER,
+      window_truncated   INTEGER NOT NULL DEFAULT 0,
+      effectiveness_score REAL
+    );
+    CREATE INDEX IF NOT EXISTS idx_skill_inv_ts     ON skill_invocations(ts_ms);
+    CREATE INDEX IF NOT EXISTS idx_skill_inv_skill  ON skill_invocations(skill_name);
+    CREATE INDEX IF NOT EXISTS idx_skill_inv_stream ON skill_invocations(stream_id, window_open);
+  `);
+  // Gap-A (classifier addendum §1): time bounds for bypass window-exclusion.
+  try { db.exec(`ALTER TABLE skill_invocations ADD COLUMN start_ts_ms INTEGER`); } catch { /* exists */ }
+  try { db.exec(`ALTER TABLE skill_invocations ADD COLUMN end_ts_ms   INTEGER`); } catch { /* exists */ }
+  // Gap-A index (classifier addendum §1): bypass window-exclusion join by stream + ts bounds.
+  try { db.exec(`CREATE INDEX IF NOT EXISTS idx_si_stream_ts ON skill_invocations(stream_id, start_ts_ms, end_ts_ms)`); } catch { /* exists */ }
+  // A8 (wp2b §1.3) — per-window usage rollup persisted at finalize (skill_window_events is pruned).
+  try { db.exec(`ALTER TABLE skill_invocations ADD COLUMN start_turn_index INTEGER`); } catch { /* exists */ }
+  try { db.exec(`ALTER TABLE skill_invocations ADD COLUMN end_turn_index   INTEGER`); } catch { /* exists */ }
+  try { db.exec(`ALTER TABLE skill_invocations ADD COLUMN window_fresh_input_tokens  INTEGER NOT NULL DEFAULT 0`); } catch { /* exists */ }
+  try { db.exec(`ALTER TABLE skill_invocations ADD COLUMN window_cache_read_tokens   INTEGER NOT NULL DEFAULT 0`); } catch { /* exists */ }
+  try { db.exec(`ALTER TABLE skill_invocations ADD COLUMN window_usage_output_tokens INTEGER NOT NULL DEFAULT 0`); } catch { /* exists */ }
+  try { db.exec(`ALTER TABLE skill_invocations ADD COLUMN window_usage_turns         INTEGER NOT NULL DEFAULT 0`); } catch { /* exists */ }
+
+  // ── P0.7 — exactly-once counter guard for window-affecting events ──
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS skill_window_events (
+      id            TEXT PRIMARY KEY,            -- \`\${entryUuid}#\${blockIndex}:\${eventKind}\`
+      invocation_id TEXT NOT NULL,
+      ts_ms         INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_swe_inv ON skill_window_events(invocation_id);
+  `);
+
+  // ── P0.6 — search events (unioned with behavior_events by behavior-store) ──
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS search_events (
+      id            TEXT PRIMARY KEY,            -- \`\${entryUuid}#\${blockIndex}\`
+      stream_id     TEXT NOT NULL,
+      invocation_id TEXT,                        -- open window on this stream, if any
+      slug TEXT, working_dir TEXT, ts_ms INTEGER NOT NULL,
+      tool_name TEXT,
+      normalized_query TEXT NOT NULL,
+      search_signature_hash TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_search_hash ON search_events(search_signature_hash);
+  `);
+  // Fix-8 (wp2b §1.5) — citation columns so search hits are citable / A9-eligible.
+  try { db.exec(`ALTER TABLE search_events ADD COLUMN entry_uuid  TEXT`); } catch { /* exists */ }
+  try { db.exec(`ALTER TABLE search_events ADD COLUMN block_index INTEGER`); } catch { /* exists */ }
+  try { db.exec(`ALTER TABLE search_events ADD COLUMN byte_offset INTEGER`); } catch { /* exists */ }
+
+  // ── P0.6 — effectiveness signals (two-tier, extensible rows; see P2.4) ──
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS skill_effectiveness_signals (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      invocation_id TEXT NOT NULL,
+      signal        TEXT NOT NULL,               -- 'tool_error','repeated_search','ended_with_question',…
+      tier          TEXT NOT NULL,               -- 'observable' | 'heuristic'
+      value_num     REAL, value_text TEXT,
+      window_json   TEXT,
+      created_at    INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_eff_inv ON skill_effectiveness_signals(invocation_id);
+  `);
+
+  // ── design §4.1 — behavior events (generic tool-use/outcome histogram) ──
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS behavior_events (
+      id             TEXT PRIMARY KEY,          -- \`\${entryUuid}#\${blockIndex}:\${kind}:\${eventOrdinal}\` (wp2b §1.1)
+      stream_id      TEXT NOT NULL,
+      entry_uuid     TEXT, block_index INTEGER,
+      byte_offset    INTEGER NOT NULL,          -- citation pointer
+      ts_ms          INTEGER NOT NULL,
+      session_id     TEXT, sub_agent_name TEXT, slug TEXT,
+      kind           TEXT NOT NULL,             -- 'tool_use' | 'tool_result' | 'file_touch' | 'turn_outcome'
+      tool_name      TEXT,
+      tool_kind      TEXT,                      -- 'builtin' | 'mcp' | 'skill'
+      mcp_toolset    TEXT,
+      command_family TEXT,
+      arg_path       TEXT,                      -- canonical normalized target path (LOWER() is the heat key)
+      input_shape_hash TEXT,
+      outcome        TEXT,
+      observable     INTEGER NOT NULL DEFAULT 1
+    );
+    CREATE INDEX IF NOT EXISTS idx_be_stream  ON behavior_events(stream_id);
+    CREATE INDEX IF NOT EXISTS idx_be_tool    ON behavior_events(tool_name);
+    CREATE INDEX IF NOT EXISTS idx_be_toolset ON behavior_events(mcp_toolset);
+    CREATE INDEX IF NOT EXISTS idx_be_family  ON behavior_events(command_family);
+    CREATE INDEX IF NOT EXISTS idx_be_shape   ON behavior_events(input_shape_hash);
+    CREATE INDEX IF NOT EXISTS idx_be_ts      ON behavior_events(ts_ms);
+  `);
+  // wp2b §1.1 — event-identity ordinal + A1 executed-file capture columns.
+  try { db.exec(`ALTER TABLE behavior_events ADD COLUMN event_ordinal INTEGER NOT NULL DEFAULT 0`); } catch { /* exists */ }
+  try { db.exec(`ALTER TABLE behavior_events ADD COLUMN access_mode         TEXT`); } catch { /* exists */ } // 'read'|'write'|'executed'
+  try { db.exec(`ALTER TABLE behavior_events ADD COLUMN arg_path_raw        TEXT`); } catch { /* exists */ } // exactly as seen
+  try { db.exec(`ALTER TABLE behavior_events ADD COLUMN arg_path_confidence TEXT`); } catch { /* exists */ } // 'exact'|'normalized'|'unresolved'
+  try { db.exec(`CREATE INDEX IF NOT EXISTS idx_be_argpath     ON behavior_events(arg_path)`); } catch { /* exists */ }
+  try { db.exec(`CREATE INDEX IF NOT EXISTS idx_be_access_mode ON behavior_events(access_mode)`); } catch { /* exists */ }
+  // WP-1B (Priority 0) — cwd-RESOLVED path identity for the guidance→file-access match.
+  //   arg_path_canonical    : the raw arg resolved against the stream's recorded cwd and
+  //                           folded to a single Windows/WSL/POSIX form (LOWER() is the key).
+  //   arg_path_workspace_rel: root-anchored workspace-relative form (fwd-slash), when known.
+  // Historical rows have neither → they stay unresolved and are NEVER suffix-matched.
+  try { db.exec(`ALTER TABLE behavior_events ADD COLUMN arg_path_canonical     TEXT`); } catch { /* exists */ }
+  try { db.exec(`ALTER TABLE behavior_events ADD COLUMN arg_path_workspace_rel TEXT`); } catch { /* exists */ }
+  try { db.exec(`CREATE INDEX IF NOT EXISTS idx_be_argpath_canon ON behavior_events(arg_path_canonical)`); } catch { /* exists */ }
+  try { db.exec(`CREATE INDEX IF NOT EXISTS idx_be_argpath_wsrel ON behavior_events(arg_path_workspace_rel)`); } catch { /* exists */ }
+  // R2 WP-4B (Step 3) — redaction-safe exemplar drill. The SORTED input KEY NAMES (the
+  // same set that produced `input_shape_hash`), comma-joined. Key names only — never a
+  // value — so a cluster-exemplar drill can show the input SHAPE without leaking any raw
+  // input. Historical rows have NULL → the drill degrades to the tool short name only.
+  try { db.exec(`ALTER TABLE behavior_events ADD COLUMN input_key_set TEXT`); } catch { /* exists */ }
+
+  // ── design §4.1 — single home of lane + exposure denominator (one row per stream) ──
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS stream_lane_stats (
+      stream_id   TEXT PRIMARY KEY,
+      lane        TEXT NOT NULL,                -- 'supervisor'|'worker'|'researcher'|'legacy'|'unknown'
+      slug        TEXT,
+      working_dir TEXT,
+      turn_count  INTEGER NOT NULL DEFAULT 0,   -- end_turn events = exposure denominator
+      first_ts_ms INTEGER, last_ts_ms INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS idx_sls_lane ON stream_lane_stats(lane);
+  `);
+  // A3 — subagent flag (stream path under /subagents/); lane still inherited from cwd.
+  try { db.exec(`ALTER TABLE stream_lane_stats ADD COLUMN is_subagent INTEGER NOT NULL DEFAULT 0`); } catch { /* exists */ }
+  // A10 — workspace attribution (first-entry launch cwd folded to its workspace root).
+  try { db.exec(`ALTER TABLE stream_lane_stats ADD COLUMN workspace_root TEXT`); } catch { /* exists */ }
+  try { db.exec(`ALTER TABLE stream_lane_stats ADD COLUMN workspace_id   TEXT`); } catch { /* exists */ }
+  // WP-2B (Priority 0) — record HOW a workspace_id was derived ('explicit' launch-time
+  // association vs 'root' cwd-fold) + the resolver version, so a later correction never
+  // masquerades as a direct ingestion-time identity. NULL on rows with no workspace id.
+  try { db.exec(`ALTER TABLE stream_lane_stats ADD COLUMN workspace_attribution_method  TEXT`); } catch { /* exists */ }
+  try { db.exec(`ALTER TABLE stream_lane_stats ADD COLUMN workspace_attribution_version INTEGER`); } catch { /* exists */ }
+  try { db.exec(`CREATE INDEX IF NOT EXISTS idx_sls_workspace ON stream_lane_stats(workspace_id)`); } catch { /* exists */ }
+
+  // ── A8 (wp2b §1.2) — per-turn usage (entry-level id; NOT stream+turn_index) ──
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS turn_usage (
+      id                    TEXT PRIMARY KEY,          -- \`\${entryUuid}:usage\`
+      stream_id             TEXT NOT NULL,
+      invocation_id         TEXT,                      -- open skill window on this stream at usage time, else null
+      session_id            TEXT,
+      is_subagent           INTEGER NOT NULL DEFAULT 0,
+      ts_ms                 INTEGER NOT NULL,
+      turn_index            INTEGER NOT NULL,          -- monotonic assistant-turn ordinal (ORDERING ONLY)
+      model                 TEXT,
+      input_tokens          INTEGER NOT NULL DEFAULT 0,  -- fresh UNCACHED input (marginal spend)
+      cache_creation_tokens INTEGER NOT NULL DEFAULT 0,  -- context written to cache (marginal spend)
+      cache_read_tokens     INTEGER NOT NULL DEFAULT 0,  -- resident re-read (NOT spend; separate)
+      output_tokens         INTEGER NOT NULL DEFAULT 0   -- generation (marginal spend)
+    );
+    CREATE INDEX IF NOT EXISTS idx_tu_stream ON turn_usage(stream_id);
+    CREATE INDEX IF NOT EXISTS idx_tu_inv    ON turn_usage(invocation_id);
+    CREATE INDEX IF NOT EXISTS idx_tu_ts     ON turn_usage(ts_ms);
+  `);
+
+  // ── A9 (wp2b §1.4) — trigger-phrase snippets (over-captured in WP2; WP5 filters) ──
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS trigger_snippets (
+      event_id          TEXT PRIMARY KEY,   -- skill_invocations.id OR behavior_events.id OR search_events.id
+      event_type        TEXT NOT NULL,      -- 'skill_invocation'|'executed_file'|'command'|'search'
+      stream_id         TEXT NOT NULL,
+      snippet           TEXT,               -- truncated; NULL when no qualifying message
+      snippet_hash      TEXT,               -- sha256 of FULL normalized source text
+      source_kind       TEXT NOT NULL,      -- 'user_message'|'supervisor_brief'|'subagent_brief'|'command_args'|'none'
+      source_entry_uuid TEXT,
+      source_byte_offset INTEGER,
+      distance_entries  INTEGER,
+      selection_reason  TEXT NOT NULL,      -- 'matched' | 'no_qualifying_user_message'
+      src_ts_ms         INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS idx_ts_stream ON trigger_snippets(stream_id);
+    CREATE INDEX IF NOT EXISTS idx_ts_hash   ON trigger_snippets(snippet_hash);
+  `);
+
+  // ── A6 (wp2b §1.6) — backfill state marker ──
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS skill_analytics_meta (k TEXT PRIMARY KEY, v TEXT);
+  `);
+
+  // ── A2 (hardening-epochs-outcomes §1) — config/optimizer ledger: CREATEs ONLY.
+  // Writers live in WP5 resident-inventory (anchors/epochs) + WP6 (actions/links)
+  // — Fix-6. WP2 must NOT write these; it only guarantees the tables exist.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS config_section_anchors (
+      anchor_uid          TEXT PRIMARY KEY,
+      target_type         TEXT NOT NULL,
+      target_key          TEXT NOT NULL,
+      section_key         TEXT NOT NULL,
+      anchor_kind         TEXT NOT NULL,
+      current_source_path TEXT,
+      current_heading_text TEXT,
+      current_heading_path TEXT,
+      current_line_start  INTEGER,
+      current_line_end    INTEGER,
+      last_content_hash   TEXT,
+      last_semantic_fingerprint TEXT,
+      created_at_ms       INTEGER NOT NULL,
+      updated_at_ms       INTEGER NOT NULL,
+      UNIQUE(target_type, target_key, anchor_uid)
+    );
+    CREATE INDEX IF NOT EXISTS idx_csa_target ON config_section_anchors(target_type, target_key);
+
+    CREATE TABLE IF NOT EXISTS config_epochs (
+      id                    TEXT PRIMARY KEY,
+      section_key           TEXT NOT NULL,
+      anchor_uid            TEXT NOT NULL,
+      target_type           TEXT NOT NULL,
+      target_key            TEXT NOT NULL,
+      lanes_json            TEXT NOT NULL,
+      source_kind           TEXT NOT NULL,
+      source_path           TEXT NOT NULL,
+      source_symbol         TEXT,
+      heading_text          TEXT,
+      heading_path          TEXT,
+      content_hash          TEXT NOT NULL,
+      semantic_fingerprint  TEXT NOT NULL,
+      first_seen_ms         INTEGER NOT NULL,
+      first_seen_source     TEXT NOT NULL,
+      first_seen_confidence TEXT NOT NULL,
+      origin_first_seen_ms  INTEGER,
+      last_seen_ms          INTEGER,
+      last_seen_reason      TEXT,
+      superseded_by         TEXT,
+      moved_from_epoch_id   TEXT,
+      moved_to_section_key  TEXT,
+      parser_version        INTEGER NOT NULL,
+      created_at_ms         INTEGER NOT NULL,
+      updated_at_ms         INTEGER NOT NULL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_ce_open ON config_epochs(section_key) WHERE last_seen_ms IS NULL;
+    CREATE INDEX IF NOT EXISTS idx_ce_anchor ON config_epochs(anchor_uid);
+    CREATE INDEX IF NOT EXISTS idx_ce_target ON config_epochs(target_type, target_key);
+    CREATE INDEX IF NOT EXISTS idx_ce_hash   ON config_epochs(content_hash);
+
+    CREATE TABLE IF NOT EXISTS optimizer_actions (
+      id                    TEXT PRIMARY KEY,
+      proposal_id           TEXT,
+      kind                  TEXT NOT NULL,
+      lane                  TEXT,
+      target_json           TEXT NOT NULL,
+      target_predicate_hash TEXT NOT NULL,
+      status                TEXT NOT NULL DEFAULT 'marked_applied',
+      applied_at_ms         INTEGER NOT NULL,
+      detected_at_ms        INTEGER,
+      after_start_ms        INTEGER,
+      reverted_at_ms        INTEGER,
+      note                  TEXT,
+      created_at_ms         INTEGER NOT NULL,
+      updated_at_ms         INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_oa_proposal  ON optimizer_actions(proposal_id);
+    CREATE INDEX IF NOT EXISTS idx_oa_predicate ON optimizer_actions(target_predicate_hash);
+    CREATE INDEX IF NOT EXISTS idx_oa_applied   ON optimizer_actions(applied_at_ms);
+
+    CREATE TABLE IF NOT EXISTS optimizer_action_epoch_links (
+      action_id  TEXT NOT NULL,
+      epoch_id   TEXT NOT NULL,
+      relation   TEXT NOT NULL,
+      confidence TEXT NOT NULL,
+      PRIMARY KEY(action_id, epoch_id, relation)
+    );
+
+    -- classifier addendum §2.5 — user-editable, retroactive file-coverage ignore-list.
+    CREATE TABLE IF NOT EXISTS file_coverage_ignores (
+      id             TEXT PRIMARY KEY,
+      pattern        TEXT NOT NULL,        -- normalized (LOWER, wp2b §4.3 path form)
+      pattern_kind   TEXT NOT NULL,        -- 'glob' | 'path-prefix' | 'exact-path'
+      scope          TEXT NOT NULL,        -- 'global' | 'lane' | 'workspace'
+      lane           TEXT,                 -- when scope='lane'
+      workspace_slug TEXT,                 -- when scope='workspace'
+      reason         TEXT NOT NULL,
+      created_by     TEXT NOT NULL,        -- 'system-default' | 'human'
+      created_at_ms  INTEGER NOT NULL,
+      disabled_at_ms INTEGER               -- soft-delete: disabling re-exposes historical rows
+    );
+    CREATE INDEX IF NOT EXISTS idx_fci_scope ON file_coverage_ignores(scope, disabled_at_ms);
+
+    -- classifier addendum §4 — per-lane compiler-parity sign-off (WP6 IPC writer; no MCP mutation).
+    CREATE TABLE IF NOT EXISTS optimizer_derivation_verifications (
+      gate_name                     TEXT PRIMARY KEY,   -- '<lane>-compiler-parity'
+      lane                          TEXT NOT NULL,
+      status                        TEXT NOT NULL,      -- 'unverified'|'verified'|'stale'|'mismatch'|'no-reference'
+      parser_version                INTEGER NOT NULL,
+      compiler_version              INTEGER NOT NULL,   -- PREDICTED_ACTION_COMPILER_VERSION
+      corpus_fingerprint            TEXT NOT NULL,
+      config_fingerprint            TEXT NOT NULL,
+      toolset_inventory_fingerprint TEXT NOT NULL,
+      empirical_report_fingerprint  TEXT NOT NULL,
+      signed_histogram_json         TEXT NOT NULL,      -- {lane: orchestrationInvocations} at sign-off
+      signed_split_json             TEXT NOT NULL,      -- {occurs,never,insufficient,unobservable}
+      artifact_path                 TEXT NOT NULL,
+      artifact_sha256               TEXT NOT NULL,
+      signed_off_by                 TEXT,
+      signed_off_at_ms              INTEGER,
+      notes                         TEXT                -- explanation of any accepted deltas
+    );
+    CREATE INDEX IF NOT EXISTS idx_odv_lane ON optimizer_derivation_verifications(lane);
+  `);
+
+  // WP-2B (Priority 0) — one-time, resumable workspace-lineage backfill. Populates
+  // stream_lane_stats.workspace_id/workspace_root by folding each stream's launch cwd
+  // to a root owned by EXACTLY one workspace. Idempotent (only NULL rows, ON a unique
+  // match) + wrapped so a malformed workspace path can never crash DB init.
+  try {
+    backfillStreamWorkspaceLineage();
+  } catch (err) {
+    console.warn('[database] workspace-lineage backfill failed:', err);
   }
 }
 
@@ -850,6 +1489,8 @@ function rowToAgent(row: any): Agent {
     restartCount: row.restart_count,
     // Inc 4: continuation handoff generation (distinct from restart_count).
     continuationGeneration: row.continuation_generation ?? 0,
+    // Per-agent continuation toggle: 0 → false; 1/NULL → true (default-enabled).
+    continuationEnabled: row.continuation_enabled === 0 ? false : true,
     lastExitCode: row.last_exit_code,
     pid: row.pid,
     logPath: row.log_path,
@@ -862,6 +1503,9 @@ function rowToAgent(row: any): Agent {
     ownerAgentId: row.owner_agent_id || null,
     // notifyOwner mute: 1 → true, 0 → false, NULL/absent → true (default-notify).
     notifyOwner: row.notify_owner === 0 ? false : true,
+    // Planning surface WP1: frozen-at-launch plan rail (NULL for unbound launches).
+    planId: row.plan_id || null,
+    planSection: row.plan_section || null,
   };
 }
 
@@ -922,6 +1566,903 @@ function queryOne(sql: string, params: any[] = []): any | null {
 
 function run(sql: string, params: any[] = []): void {
   db.prepare(sql).run(...params);
+}
+
+/** Test seam — reset the module singleton cleanly (B2 A6). */
+export function closeDatabaseForTests(): void {
+  db?.close();
+}
+
+// ── B2: Plans data layer (P1-01) ──
+
+/** Slug = basename without a known plan extension (DEC-4). `html` is reserved for
+ *  a future data-plan-id hook and is ignored in B2. Never feeds plans.id (R2). */
+export function derivePlanSlug(planPath: string, _html?: string | null): string {
+  return path.basename(planPath).replace(/\.(html?|md|markdown)$/i, '');
+}
+
+function rowToPlan(row: any): Plan {
+  return {
+    id: row.id,
+    workspaceId: row.workspace_id,
+    path: row.path,
+    slug: row.slug ?? null,
+    format: row.format,
+    runState: row.run_state ?? null,
+    mtimeMs: row.mtime_ms,
+    sizeBytes: row.size_bytes,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    deletedAt: row.deleted_at ?? null,
+  };
+}
+
+/** Maps a supervisor_focus row; when the SELECT joined the plan columns (aliased
+ *  `plan_*`), attaches the joined `plan` projection. */
+function rowToSupervisorFocus(row: any): SupervisorFocus {
+  const focus: SupervisorFocus = {
+    supervisorId: row.supervisor_id,
+    planId: row.plan_id,
+    focusedAt: row.focused_at,
+    lastAttendedAt: row.last_attended_at,
+    notes: row.notes ?? null,
+  };
+  if (row.plan_id_j !== undefined && row.plan_id_j !== null) {
+    focus.plan = rowToPlan({
+      id: row.plan_id_j,
+      workspace_id: row.plan_workspace_id,
+      path: row.plan_path,
+      slug: row.plan_slug,
+      format: row.plan_format,
+      run_state: row.plan_run_state,
+      mtime_ms: row.plan_mtime_ms,
+      size_bytes: row.plan_size_bytes,
+      created_at: row.plan_created_at,
+      updated_at: row.plan_updated_at,
+      deleted_at: row.plan_deleted_at,
+    });
+  }
+  return focus;
+}
+
+type CreateOrRevivePlanInput = {
+  workspaceId: string; path: string; format: PlanFormat;
+  slug?: string | null; runState?: string | null;
+  mtimeMs?: number; sizeBytes?: number;   // default 0 (DEC-2)
+};
+type UpdatePlanInput = Partial<{
+  path: string; slug: string | null; format: PlanFormat;
+  runState: string | null; mtimeMs: number; sizeBytes: number;
+}>;
+
+export function getPlans(filters?: { workspaceId?: string; includeDeleted?: boolean }): Plan[] {
+  const clauses: string[] = [];
+  const params: any[] = [];
+  if (filters?.workspaceId) { clauses.push('workspace_id = ?'); params.push(filters.workspaceId); }
+  if (!filters?.includeDeleted) { clauses.push('deleted_at IS NULL'); }
+  const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+  return queryAll(`SELECT * FROM plans ${where} ORDER BY updated_at DESC`, params).map(rowToPlan);
+}
+
+export function getPlan(id: string): Plan | null {
+  const row = queryOne('SELECT * FROM plans WHERE id = ?', [id]);
+  return row ? rowToPlan(row) : null;
+}
+
+export function getPlanByWorkspacePath(workspaceId: string, planPath: string): Plan | null {
+  const row = queryOne('SELECT * FROM plans WHERE workspace_id = ? AND path = ?', [workspaceId, planPath]);
+  return row ? rowToPlan(row) : null;
+}
+
+/** Idempotent on (workspace_id, path). INSERT mints a fresh uuid; ON CONFLICT keeps
+ *  the existing id, refreshes metadata, and REVIVES a soft-deleted row (clears
+ *  deleted_at) so re-creating a file at the same path preserves focus rows.
+ *  id is NEVER slug/path-derived (R2/D-01). */
+export function createOrRevivePlan(input: CreateOrRevivePlanInput): Plan {
+  const id = uuidv4();
+  const slug = input.slug ?? derivePlanSlug(input.path);
+  run(
+    `INSERT INTO plans (id, workspace_id, path, slug, format, run_state, mtime_ms, size_bytes)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(workspace_id, path) DO UPDATE SET
+       slug = COALESCE(excluded.slug, plans.slug),
+       format = excluded.format,
+       mtime_ms = excluded.mtime_ms,
+       size_bytes = excluded.size_bytes,
+       deleted_at = NULL,
+       updated_at = datetime('now')`,
+    [id, input.workspaceId, input.path, slug, input.format,
+     input.runState ?? null, input.mtimeMs ?? 0, input.sizeBytes ?? 0]
+  );
+  return getPlanByWorkspacePath(input.workspaceId, input.path)!;
+}
+
+/** Partial update; bumps updated_at; ALWAYS preserves id. Setting path/slug is the
+ *  rename REBIND (D-01). Applies DEC-1 destination handling before the path write.
+ *  Returns null if the target id does not exist; throws {statusCode:409} on a live
+ *  destination-path conflict. */
+export function updatePlan(id: string, updates: UpdatePlanInput): Plan | null {
+  const current = getPlan(id);
+  if (!current) return null;
+  if (updates.path !== undefined && updates.path !== current.path) {
+    const dest = getPlanByWorkspacePath(current.workspaceId, updates.path);
+    if (dest && dest.id !== id) {
+      if (dest.deletedAt) hardDeletePlanRow(dest.id);   // DEC-1: reclaim tombstone (focus cascades)
+      else throw Object.assign(new Error('Destination path already in use by a live plan'), { statusCode: 409 });
+    }
+  }
+  const sets: string[] = [];
+  const params: any[] = [];
+  if (updates.path !== undefined) { sets.push('path = ?'); params.push(updates.path); }
+  if (updates.slug !== undefined) { sets.push('slug = ?'); params.push(updates.slug); }
+  if (updates.format !== undefined) { sets.push('format = ?'); params.push(updates.format); }
+  if (updates.runState !== undefined) { sets.push('run_state = ?'); params.push(updates.runState); }
+  if (updates.mtimeMs !== undefined) { sets.push('mtime_ms = ?'); params.push(updates.mtimeMs); }
+  if (updates.sizeBytes !== undefined) { sets.push('size_bytes = ?'); params.push(updates.sizeBytes); }
+  if (sets.length === 0) return getPlan(id);
+  sets.push("updated_at = datetime('now')");
+  params.push(id);
+  run(`UPDATE plans SET ${sets.join(', ')} WHERE id = ?`, params);
+  return getPlan(id);
+}
+
+export function softDeletePlan(id: string): Plan | null {
+  run(
+    `UPDATE plans SET deleted_at = datetime('now'), updated_at = datetime('now')
+     WHERE id = ? AND deleted_at IS NULL`,
+    [id]
+  );
+  return getPlan(id);
+}
+
+/** INTERNAL ONLY — used by updatePlan's DEC-1 tombstone reclaim. Never exposed as a
+ *  route (the API never hard-deletes plans; soft only). Relies on ON DELETE CASCADE. */
+function hardDeletePlanRow(id: string): void {
+  run('DELETE FROM plans WHERE id = ?', [id]);
+}
+
+// ── B2: Supervisor focus (P1-03 data surface) ──
+
+type FocusInput = { supervisorId: string; planId: string; notes?: string | null };
+
+const FOCUS_JOIN_SELECT = `
+  SELECT f.supervisor_id, f.plan_id, f.focused_at, f.last_attended_at, f.notes,
+         p.id AS plan_id_j, p.workspace_id AS plan_workspace_id, p.path AS plan_path,
+         p.slug AS plan_slug, p.format AS plan_format, p.run_state AS plan_run_state,
+         p.mtime_ms AS plan_mtime_ms, p.size_bytes AS plan_size_bytes,
+         p.created_at AS plan_created_at, p.updated_at AS plan_updated_at,
+         p.deleted_at AS plan_deleted_at
+  FROM supervisor_focus f JOIN plans p ON p.id = f.plan_id`;
+
+export function getSupervisorFocus(filters?: { supervisorId?: string; workspaceId?: string }): SupervisorFocus[] {
+  const clauses: string[] = [];
+  const params: any[] = [];
+  if (filters?.supervisorId) { clauses.push('f.supervisor_id = ?'); params.push(filters.supervisorId); }
+  if (filters?.workspaceId) { clauses.push('p.workspace_id = ?'); params.push(filters.workspaceId); }
+  const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+  return queryAll(`${FOCUS_JOIN_SELECT} ${where} ORDER BY f.last_attended_at DESC`, params)
+    .map(rowToSupervisorFocus);
+}
+
+function getSupervisorFocusRow(supervisorId: string, planId: string): SupervisorFocus | null {
+  const row = queryOne(`${FOCUS_JOIN_SELECT} WHERE f.supervisor_id = ? AND f.plan_id = ?`,
+    [supervisorId, planId]);
+  return row ? rowToSupervisorFocus(row) : null;
+}
+
+export function upsertSupervisorFocus(input: FocusInput): SupervisorFocus {
+  run(
+    `INSERT INTO supervisor_focus (supervisor_id, plan_id, notes)
+     VALUES (?, ?, ?)
+     ON CONFLICT(supervisor_id, plan_id) DO UPDATE SET
+       notes = COALESCE(excluded.notes, supervisor_focus.notes)`,
+    [input.supervisorId, input.planId, input.notes ?? null]
+  );
+  return getSupervisorFocusRow(input.supervisorId, input.planId)!;
+}
+
+export function deleteSupervisorFocus(supervisorId: string, planId: string): void {
+  run('DELETE FROM supervisor_focus WHERE supervisor_id = ? AND plan_id = ?', [supervisorId, planId]);
+}
+
+/** P1-07 ONLY — defined now, NOT wired to middleware in this slice. No-op when no
+ *  row exists; never throws. */
+export function bumpSupervisorFocusAttended(supervisorId: string, planId: string): SupervisorFocus | null {
+  run(
+    `UPDATE supervisor_focus SET last_attended_at = datetime('now')
+     WHERE supervisor_id = ? AND plan_id = ?`,
+    [supervisorId, planId]
+  );
+  return getSupervisorFocusRow(supervisorId, planId);
+}
+
+export type FocusedPlanSummary = {
+  planId: string;
+  path: string;
+  slug: string | null;
+  format: string;
+  focusedAt: string;
+  lastAttendedAt: string;
+  notes: string | null;
+};
+
+/** The calling supervisor's focused plans, shaped for the get_my_context
+ *  orientation payload: most-recently-attended first (SQLite sorts NULLs last on
+ *  DESC, so a never-attended row falls back to focused_at), deleted plans
+ *  excluded, capped. Empty array for a supervisor with no subscriptions. */
+export function getSupervisorFocusedPlans(supervisorId: string, limit = 10): FocusedPlanSummary[] {
+  return queryAll(
+    `SELECT f.plan_id AS planId, p.path AS path, p.slug AS slug, p.format AS format,
+            f.focused_at AS focusedAt, f.last_attended_at AS lastAttendedAt, f.notes AS notes
+     FROM supervisor_focus f JOIN plans p ON p.id = f.plan_id
+     WHERE f.supervisor_id = ? AND p.deleted_at IS NULL
+     ORDER BY f.last_attended_at DESC, f.focused_at DESC
+     LIMIT ?`,
+    [supervisorId, limit]
+  ) as FocusedPlanSummary[];
+}
+
+// ── WP2: Provenance spine — breadcrumb touches (R2 §2.1) ────────────────────
+
+/** A read=intent or edit-target breadcrumb captured from the MCP handler or the
+ *  transcript. `sectionAnchor` may be a pending sentinel for unresolved native
+ *  edits (resolved to a real anchor at Stop by the resolver, R2 §2.3/§2.5). */
+export type PlanSectionTouchInput = {
+  agentId: string;
+  planId: string;
+  sectionAnchor: string;
+  blockAnchor?: string | null;
+  tool: string;                 // 'read_plan_section' | 'list_plan_sections' | 'read_plan_projection' | 'edit' | 'apply_patch' | 'write'
+  kind: 'read' | 'edit-target';
+  readMode?: string | null;
+  source: 'handler' | 'transcript';
+  toolUseId?: string | null;
+  resolvePayload?: string | null;
+  observedAt?: string;          // ISO; defaults to now
+};
+
+export type PlanSectionTouchRow = {
+  id: string;
+  agentId: string;
+  planId: string;
+  sectionAnchor: string;
+  blockAnchor: string | null;
+  tool: string;
+  kind: 'read' | 'edit-target';
+  readMode: string | null;
+  source: 'handler' | 'transcript';
+  toolUseId: string | null;
+  resolvePayload: string | null;
+  observedAt: string;
+};
+
+function rowToPlanSectionTouch(row: any): PlanSectionTouchRow {
+  return {
+    id: row.id,
+    agentId: row.agent_id,
+    planId: row.plan_id,
+    sectionAnchor: row.section_anchor,
+    blockAnchor: row.block_anchor ?? null,
+    tool: row.tool,
+    kind: row.kind,
+    readMode: row.read_mode ?? null,
+    source: row.source,
+    toolUseId: row.tool_use_id ?? null,
+    resolvePayload: row.resolve_payload ?? null,
+    observedAt: row.observed_at,
+  };
+}
+
+/** Insert a breadcrumb with cross-source dedup (R2 §2.1): if a row with the same
+ *  non-null `tool_use_id` already exists, or (when `tool_use_id` is null) a row
+ *  matching (agent_id, tool, section_anchor, block_anchor) within a 2-second
+ *  bucket of `observed_at`, this is a no-op. This lets the handler (source:handler)
+ *  and the transcript (source:transcript) both fire without double counting.
+ *  Returns the inserted row id, or null when deduped. Never throws on caller data
+ *  the way the tracker feeds it — callers upstream stay tolerant. */
+export function recordPlanSectionTouch(input: PlanSectionTouchInput): string | null {
+  const observedAt = input.observedAt ?? new Date().toISOString();
+  const blockAnchor = input.blockAnchor ?? null;
+
+  if (input.toolUseId) {
+    const dup = queryOne(
+      'SELECT id FROM plan_section_touches WHERE tool_use_id = ?',
+      [input.toolUseId],
+    );
+    if (dup) return null;
+  } else {
+    // No tool_use_id → 2-second time-bucket dedup on the identifying tuple.
+    const dup = queryOne(
+      `SELECT id FROM plan_section_touches
+       WHERE agent_id = ? AND tool = ? AND section_anchor = ?
+         AND (block_anchor IS ? OR block_anchor = ?)
+         AND ABS((julianday(observed_at) - julianday(?)) * 86400.0) <= 2.0`,
+      [input.agentId, input.tool, input.sectionAnchor, blockAnchor, blockAnchor, observedAt],
+    );
+    if (dup) return null;
+  }
+
+  const id = uuidv4();
+  run(
+    `INSERT INTO plan_section_touches
+       (id, agent_id, plan_id, section_anchor, block_anchor, tool, kind, read_mode, source, tool_use_id, resolve_payload, observed_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [id, input.agentId, input.planId, input.sectionAnchor, blockAnchor, input.tool, input.kind,
+     input.readMode ?? null, input.source, input.toolUseId ?? null, input.resolvePayload ?? null, observedAt],
+  );
+  return id;
+}
+
+/** Window query for the Stop-time resolver (R2 §2.1/§2.5): all touches for an
+ *  agent within [sinceIso, untilIso], ordered by observed_at. */
+export function getTurnSectionTouches(agentId: string, sinceIso: string, untilIso: string): PlanSectionTouchRow[] {
+  return queryAll(
+    `SELECT * FROM plan_section_touches
+     WHERE agent_id = ? AND observed_at >= ? AND observed_at <= ?
+     ORDER BY observed_at ASC`,
+    [agentId, sinceIso, untilIso],
+  ).map(rowToPlanSectionTouch);
+}
+
+/** GT-A WP-A2 shared parse helper: tolerantly decode a JSON anchor array (the
+ *  `written_section_anchors_json` column). Returns `[]` on null / non-array /
+ *  malformed input and drops non-string members — never throws. Deliberately NOT
+ *  a `json_each` SQL dependency (A2.1): the aggregation is done in JS so the
+ *  SQLite build needs no JSON1 extension. */
+function parseAnchorList(json: string | null | undefined): string[] {
+  if (!json) return [];
+  try {
+    const parsed = JSON.parse(json);
+    if (Array.isArray(parsed)) return parsed.filter((x): x is string => typeof x === 'string');
+  } catch { /* malformed anchor JSON — treat as no anchors, never throw */ }
+  return [];
+}
+
+/** Lexicographic max of two nullable ISO-8601 timestamps (null = absent). ISO
+ *  strings sort chronologically, so `>=` is a valid time comparison. */
+function maxIso(a: string | null, b: string | null): string | null {
+  if (a == null) return b;
+  if (b == null) return a;
+  return a >= b ? a : b;
+}
+
+/** WP3 `read_plan_projection` roll-up, GT-A WP-A2.1 reshaped: per section anchor,
+ *  split the trusted `plan_events` trail into WRITE turns (an anchor in the turn's
+ *  effect set `written_section_anchors_json`, D-4) and PRESENCE turns (empty effect
+ *  set — no-op deliberation "holding the rail," keyed dispatched-first per D-6).
+ *  JS aggregation, NO `json_each` (A2.1). `'*'` orientation touches never appear
+ *  here (they live in plan_section_touches, not plan_events).
+ *
+ *  A multi-section write turn fans its `writeCount` onto EVERY written anchor
+ *  (fixes I-2). Back-compat: `eventCount = writeCount + presenceCount`,
+ *  `lastEventAt = max(lastWriteAt, lastPresenceAt)`. */
+export function getPlanEventRollup(planId: string): {
+  sectionAnchor: string;
+  writeCount: number;
+  presenceCount: number;
+  lastWriteAt: string | null;
+  lastPresenceAt: string | null;
+  eventCount: number;
+  lastEventAt: string | null;
+  // Fix-4 — witnessed repo counts, fanned with the SAME event-attribution semantics
+  // as writeCount/presenceCount (I-8: NOT a parallel SUM…GROUP BY). tests*/lastCommit
+  // are inert in cut 1 (no capture) but present so downstream reads don't branch.
+  repoFilesRead: number;
+  repoFilesEdited: number;
+  repoFilesCreated: number;
+  testsRun: number;
+  testsPassed: number;
+  testsFailed: number;
+  lastCommit: string | null;
+}[] {
+  const rows = queryAll(
+    `SELECT observed_section_anchor, dispatched_section_anchor,
+            written_section_anchors_json, change_count, created_at,
+            repo_activity_json
+     FROM plan_events
+     WHERE plan_id = ?`,
+    [planId],
+  );
+  type Acc = {
+    writeCount: number; presenceCount: number; lastWriteAt: string | null; lastPresenceAt: string | null;
+    repoFilesRead: number; repoFilesEdited: number; repoFilesCreated: number;
+    testsRun: number; testsPassed: number; testsFailed: number; lastCommit: string | null;
+  };
+  const acc = new Map<string, Acc>();
+  const bucket = (anchor: string): Acc => {
+    let a = acc.get(anchor);
+    if (!a) {
+      a = {
+        writeCount: 0, presenceCount: 0, lastWriteAt: null, lastPresenceAt: null,
+        repoFilesRead: 0, repoFilesEdited: 0, repoFilesCreated: 0,
+        testsRun: 0, testsPassed: 0, testsFailed: 0, lastCommit: null,
+      };
+      acc.set(anchor, a);
+    }
+    return a;
+  };
+  for (const r of rows) {
+    const createdAt: string | null = r.created_at ?? null;
+    // Parse the repo blob once per row (tolerant → null); fan the same totals onto
+    // every bucket the turn is attributed to, identical to writeCount fan (I-8).
+    const repo = parseRepoActivityEvidence(r.repo_activity_json);
+    const addRepo = (a: Acc): void => {
+      if (!repo) return;
+      a.repoFilesRead    += repo.totals.filesRead;
+      a.repoFilesEdited  += repo.totals.filesEdited;
+      a.repoFilesCreated += repo.totals.filesCreated;
+      a.testsRun    += repo.totals.testsRun;    // 0 in cut 1
+      a.testsPassed += repo.totals.testsPassed;
+      a.testsFailed += repo.totals.testsFailed;
+      // lastCommit reserved — no commit capture in cut 1, stays null.
+    };
+    const written = parseAnchorList(r.written_section_anchors_json);
+    if (written.length > 0) {
+      // write side (D-4): fan the turn onto every anchor it actually wrote.
+      for (const anchor of written) {
+        const a = bucket(anchor);
+        a.writeCount += 1;
+        a.lastWriteAt = maxIso(a.lastWriteAt, createdAt);
+        addRepo(a);
+      }
+    } else {
+      // presence side (D-6): empty effect set → key dispatched-first.
+      const key = r.dispatched_section_anchor ?? r.observed_section_anchor;
+      if (!key) continue; // no section to attribute this presence turn to → drop
+      const a = bucket(key);
+      a.presenceCount += 1;
+      a.lastPresenceAt = maxIso(a.lastPresenceAt, createdAt);
+      addRepo(a);
+    }
+  }
+  return Array.from(acc.entries()).map(([sectionAnchor, a]) => ({
+    sectionAnchor,
+    writeCount: a.writeCount,
+    presenceCount: a.presenceCount,
+    lastWriteAt: a.lastWriteAt,
+    lastPresenceAt: a.lastPresenceAt,
+    eventCount: a.writeCount + a.presenceCount,
+    lastEventAt: maxIso(a.lastWriteAt, a.lastPresenceAt),
+    repoFilesRead: a.repoFilesRead,
+    repoFilesEdited: a.repoFilesEdited,
+    repoFilesCreated: a.repoFilesCreated,
+    testsRun: a.testsRun,
+    testsPassed: a.testsPassed,
+    testsFailed: a.testsFailed,
+    lastCommit: a.lastCommit,
+  }));
+}
+
+/** One trusted `plan_events` row projected for the WP5 tier-2 render (R2 §2.6):
+ *  the resolver's attribution facts plus the kept-separate claimed self-report.
+ *  `claimedPayload` is parsed from `claimed_payload_json` for display only — it
+ *  is diagnostics data, never merged into the trusted fields. */
+export type PlanEventRenderRow = {
+  id: string;
+  agentId: string;
+  agentTitle: string | null;
+  createdAt: string;
+  observedSectionAnchor: string | null;
+  dispatchedSectionAnchor: string | null;
+  observedVia: string | null;
+  attributionConfidence: string | null;
+  sectionMismatch: boolean;
+  mismatchReason: string | null;
+  claimedSectionAnchor: string | null;
+  claimedPayload: Record<string, unknown> | null;
+  // GT-C §3.1 — no-op-vs-write discrimination (I-3) + honest multi-section hint
+  // (render side of I-2). `changeCount` is the RAW fs-diff cardinality read from
+  // the new `change_count` column (GT-A WP-A1 promoted it from the envelope to a
+  // real column; the backfill populates it for historical rows). `observedCandidates`
+  // is the audit candidate list, tolerantly parsed. Both never throw.
+  changeCount: number;
+  observedCandidates: string[];
+  // GT-A WP-A2.2 — the turn's effect set (anchors it actually wrote), parsed from
+  // the `written_section_anchors_json` column via `parseAnchorList` (tolerant, `[]`
+  // on null/malformed). Empty = presence/no-op turn; length drives the renderer's
+  // "wrote N sections" affordance (D-5: NOT `changeCount`).
+  writtenSectionAnchors: string[];
+  // Fix-4 — the turn's witnessed repo evidence, tolerantly parsed from the
+  // `repo_activity_json` column (NULL/malformed/oversized → null, never throws;
+  // mirrors the `claimedPayload` parse). Feeds the Layer-2 digest + Tier-1/2 counts.
+  repoActivity: RepoActivityEvidenceV1 | null;
+};
+
+/** Per-event trusted rows for a plan's render surface (WP5 tier-2), oldest
+ *  first. Unlike `getPlanEventRollup` (aggregate counts for the tier-1 chip),
+ *  this returns each event's full attribution so the renderer can show the
+ *  trusted/claimed split + mismatch flag. Events with no observed anchor are
+ *  still returned (the renderer folds them into the Archived group, F-E). */
+export function getPlanEventsForRender(planId: string): PlanEventRenderRow[] {
+  return queryAll(
+    `SELECT e.id, e.agent_id, a.title AS agent_title, e.created_at,
+            e.observed_section_anchor, e.dispatched_section_anchor,
+            e.observed_via, e.attribution_confidence,
+            e.section_mismatch, e.mismatch_reason,
+            e.claimed_section_anchor, e.claimed_payload_json,
+            e.change_count, e.observed_candidates_json,
+            e.written_section_anchors_json, e.repo_activity_json
+     FROM plan_events e
+     LEFT JOIN agents a ON a.id = e.agent_id
+     WHERE e.plan_id = ?
+     ORDER BY e.created_at ASC`,
+    [planId],
+  ).map((r) => {
+    let claimedPayload: Record<string, unknown> | null = null;
+    if (r.claimed_payload_json) {
+      try {
+        const parsed = JSON.parse(r.claimed_payload_json);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) claimedPayload = parsed;
+      } catch { /* malformed claimed payload is diagnostics-only — ignore, never throw */ }
+    }
+    // GT-C §3.1 — tolerant parse of the audit candidate list; malformed / non-array → [].
+    let observedCandidates: string[] = [];
+    if (r.observed_candidates_json) {
+      try {
+        const parsed = JSON.parse(r.observed_candidates_json);
+        if (Array.isArray(parsed)) observedCandidates = parsed.filter((x) => typeof x === 'string');
+      } catch { /* malformed candidates JSON — ignore, never throw */ }
+    }
+    return {
+      id: r.id,
+      agentId: r.agent_id,
+      agentTitle: r.agent_title ?? null,
+      createdAt: r.created_at,
+      observedSectionAnchor: r.observed_section_anchor ?? null,
+      dispatchedSectionAnchor: r.dispatched_section_anchor ?? null,
+      observedVia: r.observed_via ?? null,
+      attributionConfidence: r.attribution_confidence ?? null,
+      sectionMismatch: Number(r.section_mismatch) === 1,
+      mismatchReason: r.mismatch_reason ?? null,
+      claimedSectionAnchor: r.claimed_section_anchor ?? null,
+      claimedPayload,
+      changeCount: Number(r.change_count) || 0,
+      observedCandidates,
+      writtenSectionAnchors: parseAnchorList(r.written_section_anchors_json),
+      repoActivity: parseRepoActivityEvidence(r.repo_activity_json),
+    };
+  });
+}
+
+/** Fix-4 Tier-3 drill-down — one event's capped witnessed repo evidence, read
+ *  straight from its `repo_activity_json` blob (tolerant parse → null). The
+ *  `plan_id` in the WHERE prevents cross-plan id probing; api-server wraps the
+ *  result in `RepoActivityDetail` via `toTier3Detail`. */
+export function getPlanEventRepoActivity(planId: string, planEventId: string): RepoActivityEvidenceV1 | null {
+  const row = queryOne(
+    `SELECT repo_activity_json FROM plan_events WHERE id = ? AND plan_id = ?`,
+    [planEventId, planId],
+  );
+  return row ? parseRepoActivityEvidence(row.repo_activity_json) : null;
+}
+
+// ── WP2: Provenance spine — effect store (R2 §2.4) + plan_events ────────────
+
+export type PlanSectionChangeRow = {
+  id: string;
+  planId: string;
+  sectionAnchor: string;
+  blockAnchor: string | null;
+  contentHash: string;
+  changedAt: string;
+};
+
+function rowToPlanSectionChange(row: any): PlanSectionChangeRow {
+  return {
+    id: row.id,
+    planId: row.plan_id,
+    sectionAnchor: row.section_anchor,
+    blockAnchor: row.block_anchor ?? null,
+    contentHash: row.content_hash,
+    changedAt: row.changed_at,
+  };
+}
+
+/** Insert one effect row for a section/block whose byte-exact inner-HTML hash
+ *  moved on a reparse (R2 §2.4). Written by section-cache.ts on reparse. */
+export function recordPlanSectionChange(input: {
+  planId: string;
+  sectionAnchor: string;
+  blockAnchor?: string | null;
+  contentHash: string;
+  changedAt?: string;
+}): string {
+  const id = uuidv4();
+  run(
+    `INSERT INTO plan_section_changes (id, plan_id, section_anchor, block_anchor, content_hash, changed_at)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+    [id, input.planId, input.sectionAnchor, input.blockAnchor ?? null, input.contentHash,
+     input.changedAt ?? new Date().toISOString()],
+  );
+  return id;
+}
+
+/** Effect anchors changed within [sinceIso, untilIso] for a plan (R2 §2.5 `changed`
+ *  input), ordered by changed_at.
+ *
+ *  GT-C §1.8 — `sec_exectr` (the system-owned Execution Trail zone, a materialized
+ *  cache of plan_events) is EXCLUDED: a system trail write must never register as
+ *  an agent effect (attribution safety, distinct from clobber safety). Without
+ *  this, materializing the trail would forge a phantom write onto whichever turn
+ *  window happened to overlap the trail write. */
+export function getTurnSectionChanges(planId: string, sinceIso: string, untilIso: string): PlanSectionChangeRow[] {
+  return queryAll(
+    `SELECT * FROM plan_section_changes
+     WHERE plan_id = ? AND changed_at >= ? AND changed_at <= ?
+       AND section_anchor != 'sec_exectr'
+     ORDER BY changed_at ASC`,
+    [planId, sinceIso, untilIso],
+  ).map(rowToPlanSectionChange);
+}
+
+/** Fix-4: witnessed repo activity for a turn window. `file_activities.timestamp`
+ *  is SQLite `datetime('now')` format (`YYYY-MM-DD HH:MM:SS`) but the compose
+ *  window is ISO (`…T…Z`). Compare with `datetime()` on BOTH sides so the two
+ *  formats normalize before comparison — a raw string compare (`timestamp >= ?`)
+ *  would silently drop every row (`'2026-…T…Z' > '2026-… …'`). Second-precision
+ *  timestamps make same-second rows common, so break ties by insert order (`id`).
+ *
+ *  I-10 (capture-drift): this is the SECOND consumer of `file_activities`; the
+ *  `datetime()`-both-sides semantics + operation set are pinned by a drift test. */
+export function getTurnRepoActivity(agentId: string, sinceIso: string, untilIso: string): FileActivity[] {
+  return queryAll(
+    `SELECT * FROM file_activities
+     WHERE agent_id = ?
+       AND datetime(timestamp) >= datetime(?)
+       AND datetime(timestamp) <= datetime(?)
+     ORDER BY datetime(timestamp) ASC, id ASC`,
+    [agentId, sinceIso, untilIso],
+  ).map(rowToFileActivity);
+}
+
+/** Order-preserving de-dup of a nullable anchor list (drops null/empty). Shared by
+ *  the WP-A1 backfill's effect-set reconstruction. */
+function uniqAnchors(anchors: (string | null | undefined)[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const a of anchors) {
+    if (!a || seen.has(a)) continue;
+    seen.add(a);
+    out.push(a);
+  }
+  return out;
+}
+
+/** GT-A WP-A1 (§2 A1.4) — reconstruct `written_section_anchors_json` +
+ *  `change_count` for historical plan_events rows written before the columns
+ *  existed. Idempotent + NULL-guarded: only rows where
+ *  `written_section_anchors_json IS NULL` are processed, and every processed row
+ *  is set to a non-NULL value (malformed envelope / missing window / parse throw
+ *  → `[]` / 0), so a second run is a strict no-op and no row is ever reprocessed.
+ *
+ *  Accurate for the historical run: workers had no plan tools then (I-1), so the
+ *  fs-diff `changed` set (plan_section_changes over the turn window) was the only
+ *  write signal anyway. `change_count` is the RAW change cardinality (D-5), NOT
+ *  the de-duplicated written-set length. One transaction; per-row try/catch keeps
+ *  one bad row from aborting the batch. */
+export function backfillPlanEventWrittenSets(): void {
+  const rows = queryAll(
+    `SELECT id, trusted_envelope_json FROM plan_events WHERE written_section_anchors_json IS NULL`,
+  );
+  if (rows.length === 0) return; // strict no-op once every row is backfilled
+  const update = db.prepare(
+    `UPDATE plan_events
+       SET written_section_anchors_json = ?, change_count = ?
+     WHERE id = ?`,
+  );
+  const tx = db.transaction((batch: any[]) => {
+    for (const r of batch) {
+      try {
+        const env = JSON.parse(r.trusted_envelope_json ?? '');
+        const planId = env?.planId;
+        const since = env?.window?.since;
+        const until = env?.window?.until;
+        if (typeof planId !== 'string' || typeof since !== 'string' || typeof until !== 'string') {
+          update.run('[]', 0, r.id); // missing/malformed window → [] / 0, never NULL again
+          continue;
+        }
+        const changes = getTurnSectionChanges(planId, since, until);
+        const written = uniqAnchors(changes.map((c) => c.sectionAnchor));
+        update.run(JSON.stringify(written), changes.length, r.id); // change_count = RAW cardinality (D-5)
+      } catch {
+        update.run('[]', 0, r.id); // parse throw → [] / 0, never NULL again
+      }
+    }
+  });
+  tx(rows);
+}
+
+// ── WP4: Section registry (R1 §2) — plan_sections helpers ───────────────────
+// The durable side of addressability. HTML defines which sections exist and
+// their prose; this table records anchor identity, lifecycle and lineage only.
+// registerSectionsFromHtml (section-anchors.ts) drives inserts + soft-archives
+// through these; kept here so the DB layer owns all SQL.
+
+export type PlanSectionRow = {
+  id: string;
+  planId: string;
+  anchor: string;
+  parentSectionId: string | null;
+  createdAt: string;
+  archivedAt: string | null;
+};
+
+function rowToPlanSection(row: any): PlanSectionRow {
+  return {
+    id: row.id,
+    planId: row.plan_id,
+    anchor: row.anchor,
+    parentSectionId: row.parent_section_id ?? null,
+    createdAt: row.created_at,
+    archivedAt: row.archived_at ?? null,
+  };
+}
+
+/** All registered sections for a plan (archived included by default so orphan
+ *  events still resolve to a NAMED archived section, never "unknown", F-E). */
+export function getPlanSections(planId: string, opts?: { includeArchived?: boolean }): PlanSectionRow[] {
+  const includeArchived = opts?.includeArchived ?? true;
+  const sql = includeArchived
+    ? `SELECT * FROM plan_sections WHERE plan_id = ? ORDER BY created_at ASC`
+    : `SELECT * FROM plan_sections WHERE plan_id = ? AND archived_at IS NULL ORDER BY created_at ASC`;
+  return queryAll(sql, [planId]).map(rowToPlanSection);
+}
+
+/** Look up one section by its (plan, anchor) identity — archived or not. */
+export function getPlanSectionByAnchor(planId: string, anchor: string): PlanSectionRow | null {
+  const row = queryOne(`SELECT * FROM plan_sections WHERE plan_id = ? AND anchor = ?`, [planId, anchor]);
+  return row ? rowToPlanSection(row) : null;
+}
+
+/** Insert a section row (server-minted anchor). Idempotent on (plan_id, anchor)
+ *  via INSERT OR IGNORE — a re-registered anchor never duplicates. Returns the
+ *  row id (existing or new). */
+export function insertPlanSection(input: {
+  planId: string;
+  anchor: string;
+  parentSectionId?: string | null;
+  createdAt?: string;
+}): string {
+  const existing = getPlanSectionByAnchor(input.planId, input.anchor);
+  if (existing) {
+    // A previously-archived section that reappears un-archives (its prose came back).
+    if (existing.archivedAt) {
+      run(`UPDATE plan_sections SET archived_at = NULL WHERE id = ?`, [existing.id]);
+    }
+    return existing.id;
+  }
+  const id = uuidv4();
+  run(
+    `INSERT INTO plan_sections (id, plan_id, anchor, parent_section_id, created_at, archived_at)
+     VALUES (?, ?, ?, ?, ?, NULL)`,
+    [id, input.planId, input.anchor, input.parentSectionId ?? null, input.createdAt ?? new Date().toISOString()],
+  );
+  return id;
+}
+
+/** Soft-delete: set archived_at for an anchor that disappeared from the reparsed
+ *  HTML (F-E). NEVER DELETE the row; its plan_events stay resolvable. No-op if
+ *  the anchor is unknown or already archived. */
+export function archivePlanSection(planId: string, anchor: string, archivedAt?: string): void {
+  run(
+    `UPDATE plan_sections SET archived_at = ? WHERE plan_id = ? AND anchor = ? AND archived_at IS NULL`,
+    [archivedAt ?? new Date().toISOString(), planId, anchor],
+  );
+}
+
+// ── WP4: Snapshot history (amendments §F-B) — content-addressed blob store ────
+
+/** sha256 hex of the full HTML — the content-addressing key. */
+export function hashPlanHtml(html: string): string {
+  return crypto.createHash('sha256').update(html, 'utf8').digest('hex');
+}
+
+/**
+ * Record a reparse snapshot (F-B). Consecutive-dedup: if the plan's latest
+ * snapshot already carries this hash, nothing is written (a no-op reparse never
+ * spams identical history rows). Otherwise the blob INSERT-OR-IGNORE (stores the
+ * HTML once globally, even across A→B→A) and the history reference row are
+ * written in ONE transaction, so a crash leaves neither an orphan blob nor a
+ * dangling reference. Returns the new snapshot row id, or null on dedup skip.
+ */
+export function recordPlanSnapshot(planId: string, html: string, createdAt?: string): string | null {
+  const hash = hashPlanHtml(html);
+  const latest = queryOne(
+    `SELECT content_hash FROM plan_snapshots WHERE plan_id = ? ORDER BY created_at DESC LIMIT 1`,
+    [planId],
+  );
+  if (latest && latest.content_hash === hash) return null; // consecutive-dedup: reparse changed nothing
+  const now = createdAt ?? new Date().toISOString();
+  const id = uuidv4();
+  const tx = db.transaction(() => {
+    run(
+      `INSERT OR IGNORE INTO plan_snapshot_blobs (content_hash, html, byte_size, first_seen_at)
+       VALUES (?, ?, ?, ?)`,
+      [hash, html, Buffer.byteLength(html, 'utf8'), now],
+    );
+    run(
+      `INSERT INTO plan_snapshots (id, plan_id, content_hash, created_at) VALUES (?, ?, ?, ?)`,
+      [id, planId, hash, now],
+    );
+  });
+  tx();
+  return id;
+}
+
+/** Latest successful snapshot HTML for a plan (F-E parse-failure reconstruction:
+ *  reparse this blob when the live parse fails and no in-memory last-good exists). */
+export function getLatestPlanSnapshotHtml(planId: string): string | null {
+  const row = queryOne(
+    `SELECT b.html AS html FROM plan_snapshots s
+       JOIN plan_snapshot_blobs b ON b.content_hash = s.content_hash
+      WHERE s.plan_id = ? ORDER BY s.created_at DESC LIMIT 1`,
+    [planId],
+  );
+  return row ? (row.html as string) : null;
+}
+
+/** Observable growth metric (F-B; retention is "none, observable" in v1). Scoped
+ *  to one plan's reference rows when planId is given; blob counts/bytes are
+ *  global (blobs are shared content-addressed storage). */
+export function getPlanSnapshotStats(planId?: string): {
+  snapshotRows: number; blobRows: number; totalBlobBytes: number;
+} {
+  const snapshotRows = planId
+    ? (queryOne(`SELECT COUNT(*) AS c FROM plan_snapshots WHERE plan_id = ?`, [planId])?.c ?? 0)
+    : (queryOne(`SELECT COUNT(*) AS c FROM plan_snapshots`)?.c ?? 0);
+  const blobRows = queryOne(`SELECT COUNT(*) AS c FROM plan_snapshot_blobs`)?.c ?? 0;
+  const totalBlobBytes = queryOne(`SELECT COALESCE(SUM(byte_size), 0) AS s FROM plan_snapshot_blobs`)?.s ?? 0;
+  return { snapshotRows: Number(snapshotRows), blobRows: Number(blobRows), totalBlobBytes: Number(totalBlobBytes) };
+}
+
+/** Compose row shape written by composePlanEvent (F-A columns). */
+export type InsertPlanEventInput = {
+  planId: string;
+  agentId: string;
+  eventType: string;
+  dispatchedSectionAnchor?: string | null;
+  observedSectionAnchor?: string | null;
+  observedVia?: string | null;
+  attributionConfidence?: string | null;
+  observedCandidatesJson?: string | null;
+  readIntentAnchor?: string | null;
+  editTargetAnchor?: string | null;
+  sectionMismatch?: boolean;
+  mismatchReason?: string | null;
+  trustedEnvelopeJson: string;
+  claimedPayloadJson?: string | null;
+  claimedSectionAnchor?: string | null;
+  // GT-A WP-A1 (§2 A1.2) — effect-set columns. `writtenSectionAnchorsJson` = JSON
+  // array of anchors the turn actually wrote (uniq(changed); `[]`/omitted → NULL
+  // is never written by composePlanEvent, it always passes '[]'). `changeCount` =
+  // RAW fs-diff change cardinality (D-5).
+  writtenSectionAnchorsJson?: string | null;
+  changeCount?: number;
+  // Fix-4 — serialized RepoActivityEvidenceV1 (byte-capped at write time). NULL =
+  // not captured (deps absent / rollup failed / no plan context). Never blocks the row.
+  repoActivityJson?: string | null;
+  createdAt?: string;
+};
+
+export function insertPlanEvent(input: InsertPlanEventInput): string {
+  const id = uuidv4();
+  run(
+    `INSERT INTO plan_events
+       (id, plan_id, agent_id, event_type, created_at,
+        dispatched_section_anchor, observed_section_anchor, observed_via,
+        attribution_confidence, observed_candidates_json, read_intent_anchor,
+        edit_target_anchor, section_mismatch, mismatch_reason,
+        trusted_envelope_json, claimed_payload_json, claimed_section_anchor,
+        written_section_anchors_json, change_count, repo_activity_json)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [id, input.planId, input.agentId, input.eventType, input.createdAt ?? new Date().toISOString(),
+     input.dispatchedSectionAnchor ?? null, input.observedSectionAnchor ?? null, input.observedVia ?? null,
+     input.attributionConfidence ?? null, input.observedCandidatesJson ?? null, input.readIntentAnchor ?? null,
+     input.editTargetAnchor ?? null, input.sectionMismatch ? 1 : 0, input.mismatchReason ?? null,
+     input.trustedEnvelopeJson, input.claimedPayloadJson ?? null, input.claimedSectionAnchor ?? null,
+     input.writtenSectionAnchorsJson ?? null, input.changeCount ?? 0, input.repoActivityJson ?? null],
+  );
+  return id;
 }
 
 // Workspace operations
@@ -990,16 +2531,22 @@ export function createAgent(data: {
   ownerAgentId?: string | null;
   // notifyOwner mute (default true). undefined/true → notify_owner = 1; false → 0.
   notifyOwner?: boolean;
+  // Planning surface WP1: frozen-at-launch plan rail. plan_id references an
+  // existing plans row (validated at the launch route); plan_section is the
+  // target section anchor. Both stay NULL for unbound launches.
+  planId?: string | null;
+  planSection?: string | null;
 }): Agent {
   const id = uuidv4();
   const slug = slugify(data.title);
   run(
     `INSERT INTO agents (id, workspace_id, title, slug, role_description, working_directory,
-      command, provider, is_supervisor, is_supervised, is_worker, is_researcher, privilege_lane, wants_codex_hooks, tmux_session_name, auto_restart_enabled, log_path, template_id, system_prompt, owner_agent_id, notify_owner)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      command, provider, is_supervisor, is_supervised, is_worker, is_researcher, privilege_lane, wants_codex_hooks, tmux_session_name, auto_restart_enabled, log_path, template_id, system_prompt, owner_agent_id, notify_owner, plan_id, plan_section)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [id, data.workspaceId, data.title, slug, data.roleDescription, data.workingDirectory,
       data.command, data.provider || 'claude', data.isSupervisor ? 1 : 0, data.isSupervised ? 1 : 0, data.isWorker ? 1 : 0, data.isResearcher ? 1 : 0, data.privilegeLane === 'supervisor' ? 'supervisor' : null, data.wantsCodexHooks ? 1 : 0, data.tmuxSessionName, data.autoRestartEnabled ? 1 : 0, data.logPath,
-      data.templateId || null, data.systemPrompt || null, data.ownerAgentId || null, data.notifyOwner === false ? 0 : 1]
+      data.templateId || null, data.systemPrompt || null, data.ownerAgentId || null, data.notifyOwner === false ? 0 : 1,
+      data.planId || null, data.planSection || null]
   );
   return getAgent(id)!;
 }
@@ -1047,6 +2594,38 @@ export function getActiveAgents(): Agent[] {
   return queryAll(
     "SELECT * FROM agents WHERE status NOT IN ('done', 'crashed') ORDER BY created_at DESC"
   ).map(rowToAgent);
+}
+
+/**
+ * One-writer-per-plan agent guard (GT-C §O.1). Returns the first non-exempt agent
+ * still bound to this plan that could ACTIVELY write it, else null.
+ *
+ * AMENDED ownership model (maintainer sign-off, planning-surface-issues.md §4.4,
+ * authoritative over gt-c §O.1/O.4/O.5): filter to ACTIVELY-WORKING statuses only —
+ * `status IN ('working','launching')` — NOT the artifact's `NOT IN ('done','crashed')`.
+ * An IDLE plan-bound agent keeps its `plan_id` binding (re-messageable to continue
+ * its section; rail env intact) but MUST NOT reserve the plan — the Lares pattern of
+ * keeping a seed worker idle across GT phases stays legal, so an idle plan-bound
+ * agent resolves to null here. `exemptAgentIds` lets a completing run exclude its
+ * own members. Ordered by created_at ASC so the reservation is stable/deterministic.
+ */
+export function getLiveRailAgentForPlan(planId: string, exemptAgentIds: string[] = []): Agent | null {
+  const rows = queryAll(
+    "SELECT * FROM agents WHERE plan_id = ? AND status IN ('working', 'launching') ORDER BY created_at ASC",
+    [planId],
+  ).map(rowToAgent);
+  return rows.find((a) => !exemptAgentIds.includes(a.id)) ?? null;
+}
+
+/** GT-C §1.8 — count of agents actively writing this plan (`working`/`launching`).
+ *  Diagnostics only; shares the amended actively-working filter with
+ *  `getLiveRailAgentForPlan` (idle plan-bound agents are NOT counted). */
+export function getActiveRailWriterCount(planId: string): number {
+  const row = queryOne(
+    "SELECT COUNT(*) AS c FROM agents WHERE plan_id = ? AND status IN ('working', 'launching')",
+    [planId],
+  );
+  return Number(row?.c) || 0;
 }
 
 /** Context-brick Inc 3 (3.1) — the agents a given agent LAUNCHED (its owner
@@ -1192,6 +2771,13 @@ const NOW_MS_SQL = `strftime('%Y-%m-%d %H:%M:%f','now')`;
 
 export function setContinuationGeneration(agentId: string, gen: number): void {
   run("UPDATE agents SET continuation_generation = ?, updated_at = datetime('now') WHERE id = ?", [gen, agentId]);
+}
+
+/** Per-agent continuation toggle (Edward 2026-07-05). Persisted so the watcher's
+ *  `continuation-disabled` blocker survives restart/reconcile — the watcher reads
+ *  the flag live from the DB row via its isContinuationEnabled effect. */
+export function setContinuationEnabled(agentId: string, enabled: boolean): void {
+  run("UPDATE agents SET continuation_enabled = ?, updated_at = datetime('now') WHERE id = ?", [enabled ? 1 : 0, agentId]);
 }
 
 /** Mint a handoff attempt, allocating successorGen = agent gen + 1. The
@@ -1576,6 +3162,90 @@ export function backfillAgentSessionsFromEvents(): void {
     });
     tx();
   }
+}
+
+// ── WP-2B (Priority 0) — workspace-lineage backfill for stream_lane_stats ──────────
+//
+// skill_analytics_meta keys (co-located with the parse-manager's own markers). The
+// completion marker is stamped with the resolver VERSION so bumping
+// WORKSPACE_LINEAGE_VERSION re-arms a fresh pass (a corrected fold never keeps a stale
+// completion). Resumable: only NULL-workspace rows are touched, so a killed pass simply
+// continues on the next boot.
+const WS_LINEAGE_DONE_KEY = 'workspace_lineage_backfill_at';
+const WS_LINEAGE_VERSION_KEY = 'workspace_lineage_version';
+
+function readSkillMeta(k: string): string | null {
+  try {
+    const row = queryOne(`SELECT v FROM skill_analytics_meta WHERE k = ?`, [k]);
+    return row ? String(row.v) : null;
+  } catch { return null; }
+}
+function writeSkillMeta(k: string, v: string): void {
+  run(`INSERT OR REPLACE INTO skill_analytics_meta (k, v) VALUES (?, ?)`, [k, v]);
+}
+
+/** Live indexing state for the workspace-lineage backfill, so a surface can report
+ *  "indexing" honestly (resumable state, brief item 3). `remaining` counts NULL-
+ *  workspace streams that still carry a working_dir (i.e. still resolvable candidates). */
+export function workspaceLineageIndexState(): {
+  done: boolean; version: number; resolved: number; remaining: number;
+} {
+  const doneAt = readSkillMeta(WS_LINEAGE_DONE_KEY);
+  const ver = Number(readSkillMeta(WS_LINEAGE_VERSION_KEY) ?? 0);
+  const done = doneAt != null && ver === WORKSPACE_LINEAGE_VERSION;
+  const resolvedRow = queryOne(`SELECT COUNT(*) AS n FROM stream_lane_stats WHERE workspace_id IS NOT NULL`);
+  const remainingRow = queryOne(
+    `SELECT COUNT(*) AS n FROM stream_lane_stats WHERE workspace_id IS NULL AND working_dir IS NOT NULL`,
+  );
+  return {
+    done,
+    version: WORKSPACE_LINEAGE_VERSION,
+    resolved: resolvedRow ? Number(resolvedRow.n) : 0,
+    remaining: remainingRow ? Number(remainingRow.n) : 0,
+  };
+}
+
+/** One-time, resumable backfill: fold each stream's launch cwd → workspace root and,
+ *  when that root is owned by EXACTLY one workspace, persist workspace_id/root + the
+ *  attribution method ('root') + version. Idempotent — only NULL-workspace rows are
+ *  updated, on a UNIQUE match (shared-cwd invariant: cwd identifies a WORKSPACE, never
+ *  an agent). A no-op once complete at the current resolver version. */
+export function backfillStreamWorkspaceLineage(): void {
+  // Complete at the current version → strict no-op (avoids re-walking every boot).
+  if (readSkillMeta(WS_LINEAGE_DONE_KEY) != null
+      && Number(readSkillMeta(WS_LINEAGE_VERSION_KEY) ?? 0) === WORKSPACE_LINEAGE_VERSION) {
+    return;
+  }
+
+  const workspaces = (queryAll(`SELECT id, path FROM workspaces`) as { id: string; path: string }[])
+    .filter((w): w is WorkspaceRecordLite => !!w.path);
+
+  // Candidates: streams with a launch cwd but no resolved workspace yet (resumable).
+  const candidates = queryAll(
+    `SELECT stream_id, working_dir FROM stream_lane_stats
+     WHERE workspace_id IS NULL AND working_dir IS NOT NULL`,
+  ) as { stream_id: string; working_dir: string }[];
+
+  const upd = db.prepare(
+    `UPDATE stream_lane_stats
+       SET workspace_id = ?, workspace_root = ?,
+           workspace_attribution_method = ?, workspace_attribution_version = ?
+     WHERE stream_id = ? AND workspace_id IS NULL`,
+  );
+
+  const tx = db.transaction(() => {
+    for (const c of candidates) {
+      const lineage = resolveWorkspaceForCwd(c.working_dir, workspaces);
+      if (!lineage) continue; // ambiguous / no unique owner → retain NULL (never guess)
+      upd.run(lineage.workspaceId, lineage.workspaceRoot, lineage.method, WORKSPACE_LINEAGE_VERSION, c.stream_id);
+    }
+  });
+  tx();
+
+  // Mark complete at the current version only after the pass finishes (kill-resume:
+  // a partial/aborted pass leaves the marker unset and simply resumes next boot).
+  writeSkillMeta(WS_LINEAGE_DONE_KEY, new Date().toISOString());
+  writeSkillMeta(WS_LINEAGE_VERSION_KEY, String(WORKSPACE_LINEAGE_VERSION));
 }
 
 export function addEvent(agentId: string, eventType: string, payload?: string): void {
@@ -2209,6 +3879,10 @@ function rowToSelectionComment(row: any): SelectionComment {
     workspaceId: row.workspace_id,
     targetType: row.target_type,
     kind: row.kind ?? 'comment',
+    // Defensive parse: a corrupt anchor_json degrades to no anchor, never a
+    // throw that would blow up a whole comment list (plan Part 1.4).
+    anchorType: (row.anchor_type ?? 'text') as SelectionAnchorType,
+    pdfAnchor: parsePdfSelectionAnchor(row.anchor_json ?? null),
     filePath: row.file_path ?? null,
     pathType: row.path_type ?? null,
     rootDirectory: row.root_directory ?? null,
@@ -2230,22 +3904,43 @@ function rowToSelectionComment(row: any): SelectionComment {
   };
 }
 
+// Validate + serialize a PDF anchor for a write (plan Part 1.4): reject an
+// invalid PdfSelectionAnchorV1 rather than store a corrupt row, and surface the
+// fingerprint so callers can pin it into doc_hash. A 'text' anchor (or a null
+// pdfAnchor) serializes to no JSON.
+function resolvePdfAnchorForWrite(
+  anchorType: SelectionAnchorType | undefined,
+  pdfAnchor: PdfSelectionAnchorV1 | null | undefined,
+): { anchorJson: string | null; fingerprint: string | null } {
+  if (anchorType !== 'pdf') return { anchorJson: null, fingerprint: null };
+  if (!pdfAnchor) throw new Error('createSelectionComment: anchorType "pdf" requires a pdfAnchor');
+  const validation = validatePdfSelectionAnchor(pdfAnchor);
+  if (!validation.ok) throw new Error(`Invalid PDF anchor: ${validation.error}`);
+  return { anchorJson: serializePdfSelectionAnchor(pdfAnchor), fingerprint: pdfAnchor.fingerprint };
+}
+
 export function createSelectionComment(input: CreateSelectionCommentInput): SelectionComment {
   const id = uuidv4();
+  const anchorType: SelectionAnchorType = input.anchorType ?? 'text';
+  const { anchorJson, fingerprint } = resolvePdfAnchorForWrite(anchorType, input.pdfAnchor);
+  // For a PDF row the document fingerprint IS the reattach doc_hash; an explicit
+  // docHash still wins if a caller passes one.
+  const docHash = input.docHash ?? fingerprint ?? null;
   run(
     `INSERT INTO selection_comments (
        id, workspace_id, target_type, kind, file_path, path_type, root_directory,
        doc_hash, anchor_start, anchor_end, line_start, line_end, prefix, suffix,
-       quoted_text, body, status
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft')`,
+       quoted_text, body, status, anchor_type, anchor_json
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?)`,
     [
       id, input.workspaceId, input.targetType ?? 'file', input.kind ?? 'comment',
       input.filePath,
-      input.pathType ?? null, input.rootDirectory ?? null, input.docHash ?? null,
+      input.pathType ?? null, input.rootDirectory ?? null, docHash,
       input.anchorStart ?? null, input.anchorEnd ?? null,
       input.lineStart ?? null, input.lineEnd ?? null,
       input.prefix ?? null, input.suffix ?? null,
       input.quotedText, input.body,
+      anchorType, anchorJson,
     ]
   );
   return getSelectionComment(id)!;
@@ -2281,6 +3976,21 @@ export function updateSelectionComment(id: string, updates: UpdateSelectionComme
   if (updates.lineEnd !== undefined) { sets.push('line_end = ?'); params.push(updates.lineEnd); }
   if (updates.prefix !== undefined) { sets.push('prefix = ?'); params.push(updates.prefix); }
   if (updates.suffix !== undefined) { sets.push('suffix = ?'); params.push(updates.suffix); }
+
+  // Anchor repointing (plan Part 1.4): touched only when the caller passes
+  // anchorType or pdfAnchor. anchorType 'pdf' (or a non-null pdfAnchor) writes a
+  // validated anchor + pins doc_hash to its fingerprint; 'text'/null clears it.
+  if (updates.anchorType !== undefined || updates.pdfAnchor !== undefined) {
+    const nextType: SelectionAnchorType =
+      updates.anchorType ?? (updates.pdfAnchor ? 'pdf' : 'text');
+    const { anchorJson, fingerprint } = resolvePdfAnchorForWrite(nextType, updates.pdfAnchor);
+    sets.push('anchor_type = ?'); params.push(nextType);
+    sets.push('anchor_json = ?'); params.push(anchorJson);
+    // Keep doc_hash in step with the fingerprint unless docHash was set above.
+    if (updates.docHash === undefined && fingerprint !== null) {
+      sets.push('doc_hash = ?'); params.push(fingerprint);
+    }
+  }
 
   if (sets.length > 0) {
     sets.push("updated_at = datetime('now')");
@@ -2365,6 +4075,8 @@ function rowToOrchestrationRun(row: any): OrchestrationRun {
     updatedAt: row.updated_at,
     endedAt: row.ended_at ?? undefined,
     error: row.error ?? undefined,
+    planId: row.plan_id ?? undefined,
+    sectionAnchor: row.section_anchor ?? undefined,
   };
 }
 
@@ -2374,8 +4086,9 @@ export function insertOrchestration(r: OrchestrationRun): void {
     `INSERT INTO orchestrations (
        run_id, name, mode, status, workspace_id, supervisor_id, topic, plan_path,
        lead_provider, reviewer_provider, turn_timeout_ms, lead_id, reviewer_id,
-       turn, round, last_relayed_ts, started_at, updated_at, ended_at, error
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       turn, round, last_relayed_ts, started_at, updated_at, ended_at, error,
+       plan_id, section_anchor
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(run_id) DO UPDATE SET
        name = excluded.name, mode = excluded.mode, status = excluded.status,
        workspace_id = excluded.workspace_id, supervisor_id = excluded.supervisor_id,
@@ -2384,13 +4097,15 @@ export function insertOrchestration(r: OrchestrationRun): void {
        turn_timeout_ms = excluded.turn_timeout_ms, lead_id = excluded.lead_id,
        reviewer_id = excluded.reviewer_id, turn = excluded.turn, round = excluded.round,
        last_relayed_ts = excluded.last_relayed_ts, started_at = excluded.started_at,
-       updated_at = excluded.updated_at, ended_at = excluded.ended_at, error = excluded.error`,
+       updated_at = excluded.updated_at, ended_at = excluded.ended_at, error = excluded.error,
+       plan_id = excluded.plan_id, section_anchor = excluded.section_anchor`,
     [
       r.runId, r.name, r.mode, r.status, r.workspaceId, r.supervisorId,
       r.topic, r.planPath, r.leadProvider, r.reviewerProvider, r.turnTimeoutMs,
       r.leadId ?? null, r.reviewerId ?? null, r.turn ?? null, r.round ?? null,
       JSON.stringify(r.lastRelayedTs || {}), r.startedAt, r.updatedAt,
       r.endedAt ?? null, r.error ?? null,
+      r.planId ?? null, r.sectionAnchor ?? null,
     ]
   );
 }

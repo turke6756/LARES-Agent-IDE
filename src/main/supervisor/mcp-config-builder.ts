@@ -19,9 +19,11 @@ import type { AgentRoleLane } from '../../shared/types';
  *  module list the parameterized `mcp-dashboard.js` proxy lazily `require`s.
  *
  *  Per the human-confirmed design (browser-parity-and-capability-isolation §0):
- *  the supervisor INTENTIONALLY gets orchestration/teams/comms/observability
+ *  the supervisor INTENTIONALLY gets orchestration/comms/observability (+ plans)
  *  only — NO full browser, NO notebooks (those move to the researcher/worker
- *  lanes). Legacy agents get no dashboard MCP at all (empty grant).
+ *  lanes). `teams` was ALSO removed (QW1 — see the per-case note below); the
+ *  authoritative grant is always the string `toolsetsForLane` returns, not this
+ *  overview. Legacy agents get no dashboard MCP at all (empty grant).
  *
  *  EXCEPTION (human-confirmed): the supervisor and worker additionally get the
  *  minimal `browser-present` toolset — a single open-only `browser_open_url`
@@ -32,9 +34,37 @@ import type { AgentRoleLane } from '../../shared/types';
 export function toolsetsForLane(lane: AgentRoleLane): string {
   switch (lane) {
     case 'supervisor':
-      return 'orchestration,teams,comms,observability,browser-present';
+      // QW1 (context-optimizer §3): `teams` removed — 0 team tool calls across
+      // 176 supervisor sessions and several member tools are partly
+      // decommissioned. Re-add the day a workflow needs it — grants are one-line.
+      // Planning-surface acceptance demo (2026-07-06) found `plans` registered in
+      // the TOOLSET_REGISTRY but granted to NO lane; supervisor gets the full
+      // `plans` toolset here (create_plan + the read ladder). GT-A WP-A4 (I-1):
+      // workers get the read-only `plans-read` subset (below) — they orient/read/
+      // observe the plan surface via MCP and still write by editing the HTML
+      // natively; create_plan + write stay supervisor-native.
+      // WP-F (P5): `observability` split into `observability-core` (operational)
+      // + `observability-analytics` (context-optimizer / agent-knowledge /
+      // file-heat / skill-usage deep analytics). The supervisor keeps BOTH; the
+      // worker keeps only core (below). Justified by the P2 tool-usage surface:
+      // analytics tools showed real per-lane usage concentrated in the
+      // context-overhead supervisor, not the worker lane.
+      return 'orchestration,comms,observability-core,observability-analytics,plans,browser-present';
     case 'worker':
-      return 'notebooks,comms,observability,browser-present';
+      // QW1 (context-optimizer §3): `notebooks` removed — 0 notebook tool
+      // invocations corpus-wide in the 546-file worker matrix. This is a rent
+      // decision, not a value judgment (notebook use is event-driven). Re-add
+      // the day a workflow needs it — grants are one-line.
+      // GT-A WP-A4 (I-1): workers now get the read-only `plans-read` subset
+      // (list/read/projection — no create_plan) so a plan-bound worker can orient
+      // on and read its dispatched section via ToolSearch under --strict-mcp-config
+      // (which otherwise starved the plan-read breadcrumb trail). Writes stay
+      // native Edits; there is no plan-write MCP tool.
+      // WP-F (P5): `observability-analytics` dropped from the worker grant — the
+      // deep context-optimizer/analytics tools are a supervisor concern (observed
+      // near-zero worker usage on the P2 surface). Preserves the QW1 precedent
+      // (trim on observed-zero; one-line re-add the day a worker workflow needs it).
+      return 'comms,observability-core,browser-present,plans-read';
     case 'researcher':
       return 'browser';
     case 'legacy':
@@ -173,6 +203,14 @@ export interface DashboardMcpConfigParams {
   /** WSL→Windows-host gateway IP. Required for the wsl path; ignored on windows.
    *  Defaults to 127.0.0.1 (mirrored-mode WSL) when omitted. */
   wslHostIp?: string;
+  /** GT-A WP-A4 (D-2) — the calling agent's identity rail, forwarded into the
+   *  MCP sidecar's env so the `plans-read` env-default (AGENT_DASHBOARD_PLAN_ID)
+   *  and the CALLER_HEADERS identity spread (X-Self-Id / X-Workspace-Id /
+   *  X-Supervisor-Id) resolve from an EXPLICIT env dict rather than depending on
+   *  parent-process inheritance. Spread FIRST in every branch so the fixed API
+   *  keys (token / host / port / toolsets) always override — a hostile identityEnv
+   *  can never clobber them. */
+  identityEnv?: Record<string, string>;
 }
 
 /** Build the inline `--mcp-config` JSON string for the parameterized dashboard
@@ -182,7 +220,7 @@ export interface DashboardMcpConfigParams {
  *  the lane's toolset grant. The server key is `agent-dashboard` so the tool
  *  names the model sees are unchanged from the monolithic server. */
 export function buildDashboardMcpConfigArg(params: DashboardMcpConfigParams): string {
-  const { toolsets, pathType, scriptPath, apiPort, apiToken, wslHostIp } = params;
+  const { toolsets, pathType, scriptPath, apiPort, apiToken, wslHostIp, identityEnv } = params;
   const winScript = scriptPath.replace(/\\/g, '/');
 
   if (pathType === 'wsl') {
@@ -195,6 +233,9 @@ export function buildDashboardMcpConfigArg(params: DashboardMcpConfigParams): st
           command: 'node',
           args: [linuxScriptPath],
           env: {
+            // identityEnv FIRST so the fixed API keys below always override it —
+            // a hostile identityEnv can never clobber token/host/port/toolsets.
+            ...identityEnv,
             DASHBOARD_MCP_TOOLSETS: toolsets,
             AGENT_DASHBOARD_API_PORT: String(apiPort),
             AGENT_DASHBOARD_API_HOST: wslHostIp ?? '127.0.0.1',
@@ -211,6 +252,9 @@ export function buildDashboardMcpConfigArg(params: DashboardMcpConfigParams): st
         command: 'node',
         args: [winScript],
         env: {
+          // identityEnv FIRST so the fixed API keys below always override it —
+          // a hostile identityEnv can never clobber token/port/toolsets.
+          ...identityEnv,
           DASHBOARD_MCP_TOOLSETS: toolsets,
           AGENT_DASHBOARD_API_PORT: String(apiPort),
           AGENT_DASHBOARD_API_TOKEN: apiToken,

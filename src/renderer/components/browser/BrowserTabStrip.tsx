@@ -14,6 +14,7 @@ import TabGroupChip from './TabGroupChip';
 import TabGroupDropdown from './TabGroupDropdown';
 import TabHoverCard, { type TabHoverCardProps } from './TabHoverCard';
 import { clampToViewport } from './popover-position';
+import { applyHorizontalWheelScroll } from '../../lib/horizontal-wheel';
 import * as Icons from 'lucide-react';
 
 // User-partition vs agent-partition tabs are visually distinct (M9 partition
@@ -543,6 +544,7 @@ export default function BrowserTabStrip() {
       <div
         role="tablist"
         aria-label="Browser tabs"
+        onWheel={(e) => applyHorizontalWheelScroll(e.currentTarget, e)}
         className="flex items-center gap-0.5 px-2 pt-1.5 bg-browser-chrome border-b border-browser-divider overflow-x-auto scrollbar-thin shrink-0"
       >
         {/* Pinned cluster (always plain, ungrouped, leftmost). */}

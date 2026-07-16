@@ -1,6 +1,6 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron';
-import type { IpcApi, DetachRequest, DetachedClosedPayload } from '../shared/types';
-import { TAB_CHANNELS } from '../shared/types';
+import type { IpcApi, DetachRequest, DetachedClosedPayload, ViewDetachRequest, ViewDetachedClosedPayload } from '../shared/types';
+import { TAB_CHANNELS, VIEW_CHANNELS } from '../shared/types';
 import { BROWSER_CHANNELS } from '../shared/browser';
 import type {
   AccessRequestDecision,
@@ -51,6 +51,8 @@ const api: IpcApi = {
     },
     getSupervisor: (workspaceId) => ipcRenderer.invoke('agent:get-supervisor', workspaceId),
     updateSupervised: (id, supervised) => ipcRenderer.invoke('agent:update-supervised', id, supervised),
+    setContinuationEnabled: (agentId, enabled) => ipcRenderer.invoke('agent:set-continuation-enabled', agentId, enabled),
+    forceContinuationHandoff: (agentId) => ipcRenderer.invoke('agent:force-continuation-handoff', agentId),
     onFileActivity: (callback) => {
       const listener = (_event: any, activity: any) => callback(activity);
       ipcRenderer.on('agent:file-activity', listener);
@@ -82,6 +84,57 @@ const api: IpcApi = {
       return () => ipcRenderer.removeListener('usage:limits-changed', listener);
     },
   },
+  skillAnalytics: {
+    indexStatus: () => ipcRenderer.invoke('skill-analytics:index-status'),
+    indexPoll: () => ipcRenderer.invoke('skill-analytics:index-poll'),
+    onIndexProgress: (callback) => {
+      const listener = (_event: any, progress: any) => callback(progress);
+      ipcRenderer.on('skill-analytics:index-progress', listener);
+      return () => ipcRenderer.removeListener('skill-analytics:index-progress', listener);
+    },
+    query: (req) => ipcRenderer.invoke('skill-analytics:query', req),
+  },
+  mcpToolUsage: {
+    query: (req) => ipcRenderer.invoke('mcp-tool-usage:query', req),
+  },
+  // Memory watchdog (incident-2026-07-11 §5 D5): status-bar meter/banner +
+  // orphan-sweep panel. `memory:*` handles live in index.ts (own the sampler +
+  // attribution service); `ownership:*` handles live in ipc-handlers.ts.
+  memory: {
+    getSnapshot: () => ipcRenderer.invoke('memory:get-snapshot'),
+    getAttribution: () => ipcRenderer.invoke('memory:attribution'),
+    onPressure: (callback) => {
+      const listener = (_event: any, snap: any) => callback(snap);
+      ipcRenderer.on('memory:pressure', listener);
+      return () => ipcRenderer.removeListener('memory:pressure', listener);
+    },
+    listOrphans: () => ipcRenderer.invoke('ownership:list-orphans'),
+    reapOrphans: (agentIds) => ipcRenderer.invoke('ownership:reap-orphans', agentIds),
+    reapEstimate: (pids) => ipcRenderer.invoke('memory:reap-estimate', pids),
+  },
+  // Detached-process transparency (incident-2026-07-11 §5 Wave 5): lists the
+  // agent-launched detached processes that self-registered under the workspace's
+  // .dashboard/detached/ dir; each row is PID-verified in main. Handle in index.ts.
+  detached: {
+    list: (workspaceRoot) => ipcRenderer.invoke('detached:list', workspaceRoot),
+  },
+  plans: {
+    // WP5: fires after each WP4 reparse so the renderer re-fetches the served
+    // projection and full-re-renders (no in-place DOM patching). Rides the
+    // reparse path, not a second fs subscription (F-C).
+    onSurfaceChanged: (callback) => {
+      const listener = (_event: any, payload: any) => callback(payload);
+      ipcRenderer.on('plan-surface:changed', listener);
+      return () => ipcRenderer.removeListener('plan-surface:changed', listener);
+    },
+    // WP5 mount: data reads + render-pane lifecycle (registerPlanIpc, main).
+    list: (workspaceId) => ipcRenderer.invoke('plan:list', workspaceId),
+    getProjection: (planId, opts) => ipcRenderer.invoke('plan:projection', planId, opts),
+    paneShow: (planId) => ipcRenderer.invoke('plan-pane:show', planId),
+    paneHide: () => ipcRenderer.invoke('plan-pane:hide'),
+    paneSetBounds: (bounds) => ipcRenderer.invoke('plan-pane:setBounds', bounds),
+    paneSetVisible: (visible) => ipcRenderer.invoke('plan-pane:setVisible', visible),
+  },
   terminal: {
     attach: (agentId) => ipcRenderer.invoke('terminal:attach', agentId),
     detach: (agentId) => ipcRenderer.invoke('terminal:detach', agentId),
@@ -104,8 +157,18 @@ const api: IpcApi = {
   contextOverhead: {
     scan: (req) => ipcRenderer.invoke('context-overhead:scan', req),
   },
+  agentKnowledge: {
+    extract: (req) => ipcRenderer.invoke('agent-knowledge:extract', req),
+  },
+  contextOptimizer: {
+    analyze: (req) => ipcRenderer.invoke('context-optimizer:analyze', req),
+    markApplied: (req) => ipcRenderer.invoke('context-optimizer:mark-applied', req),
+    signDerivation: (req) => ipcRenderer.invoke('context-optimizer:sign-derivation', req),
+  },
   files: {
     readFile: (filePath, pathType) => ipcRenderer.invoke('files:read', filePath, pathType),
+    convertDocxToMarkdown: (filePath, rootDirectory, pathType) =>
+      ipcRenderer.invoke('files:convert-docx-to-markdown', filePath, rootDirectory, pathType),
     listDirectory: (dirPath, pathType) => ipcRenderer.invoke('files:list-directory', dirPath, pathType),
     writeFile: (filePath, rootDirectory, pathType, content) =>
       ipcRenderer.invoke('files:write', filePath, rootDirectory, pathType, content),
@@ -360,6 +423,7 @@ const api: IpcApi = {
       update: (id: string, patch: Partial<AccessRuleInput> & { enabled?: boolean }) =>
         ipcRenderer.invoke(BROWSER_CHANNELS.accessRuleUpdate, id, patch),
       remove: (id: string) => ipcRenderer.invoke(BROWSER_CHANNELS.accessRuleRemove, id),
+      siteStatus: () => ipcRenderer.invoke(BROWSER_CHANNELS.accessSiteStatus),
       onChanged: (callback: () => void) => {
         const listener = () => callback();
         ipcRenderer.on(BROWSER_CHANNELS.accessChanged, listener);
@@ -403,6 +467,10 @@ const api: IpcApi = {
       },
       signinPendingCancel: (tabId: string) =>
         ipcRenderer.invoke(BROWSER_CHANNELS.signinPendingCancel, tabId),
+      // Phase 4 item 4: explicit human re-arm of a run-scoped signin_unavailable
+      // latch for one (workspace, origin) → the next agent nav reopens ONE setup tab.
+      signinReArm: (workspaceId: string | null, origin: string): Promise<boolean> =>
+        ipcRenderer.invoke(BROWSER_CHANNELS.signinReArm, workspaceId, origin),
       getSigninHoldTimeoutMs: () => ipcRenderer.invoke(BROWSER_CHANNELS.getSigninHoldTimeoutMs),
       setSigninHoldTimeoutMs: (ms: number) =>
         ipcRenderer.invoke(BROWSER_CHANNELS.setSigninHoldTimeoutMs, ms),
@@ -428,6 +496,15 @@ const api: IpcApi = {
     },
     closeReply: (requestId: string, decision: 'save' | 'discard' | 'cancel') =>
       ipcRenderer.invoke(TAB_CHANNELS.closeReply, requestId, decision),
+  },
+  // Detachable (tear-off) top-level views — sibling of `tabs`, no dirty-close.
+  views: {
+    detach: (req: ViewDetachRequest) => ipcRenderer.invoke(VIEW_CHANNELS.detach, req),
+    onClosed: (cb: (p: ViewDetachedClosedPayload) => void) => {
+      const l = (_e: any, p: ViewDetachedClosedPayload) => cb(p);
+      ipcRenderer.on(VIEW_CHANNELS.closed, l);
+      return () => ipcRenderer.removeListener(VIEW_CHANNELS.closed, l);
+    },
   },
   onOpenFileTab: (callback) => {
     const listener = (_event: any, payload: any) => callback(payload);

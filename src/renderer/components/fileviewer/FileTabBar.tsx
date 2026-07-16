@@ -1,8 +1,10 @@
-import React, { useRef, useEffect, useState } from 'react';
-import { BarChart3 } from 'lucide-react';
+import React, { useRef, useEffect, useLayoutEffect, useState } from 'react';
+import { BarChart3, Map } from 'lucide-react';
 import type { FileTab } from '../../../shared/types';
 import { fileDragStart } from '../../utils/drag-file';
 import { useDashboardStore, type ColoredFileTab } from '../../stores/dashboard-store';
+import { applyHorizontalWheelScroll } from '../../lib/horizontal-wheel';
+import { positionFloating } from '../../lib/floating/positionFloating';
 
 interface Props {
   tabs: ColoredFileTab[];
@@ -50,6 +52,26 @@ function TabContextMenu({ x, y, tab, onClose }: { x: number; y: number; tab: Col
   const menuRef = useRef<HTMLDivElement>(null);
   const setTabColor = useDashboardStore((s) => s.setTabColor);
 
+  // Edge-aware placement: flip above / clamp so the menu never clips past the
+  // app edge when a tab is right-clicked near a boundary (shared with the
+  // selection menu — BUG-45).
+  const [pos, setPos] = useState(() =>
+    positionFloating({ x, y, width: 0, height: 0 }, { width: 220, height: 240 }, { width: window.innerWidth, height: window.innerHeight }, { placement: 'below', gap: 0 }),
+  );
+  useLayoutEffect(() => {
+    const el = menuRef.current;
+    if (!el) return;
+    const box = el.getBoundingClientRect();
+    setPos(
+      positionFloating(
+        { x, y, width: 0, height: 0 },
+        { width: box.width || 220, height: box.height || 240 },
+        { width: window.innerWidth, height: window.innerHeight },
+        { placement: 'below', gap: 0 },
+      ),
+    );
+  }, [x, y]);
+
   useEffect(() => {
     const handler = (e: MouseEvent) => {
       if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
@@ -81,7 +103,7 @@ function TabContextMenu({ x, y, tab, onClose }: { x: number; y: number; tab: Col
   };
 
   return (
-    <div ref={menuRef} className="ui-menu fixed z-50" style={{ left: x, top: y }}>
+    <div ref={menuRef} className="ui-menu fixed z-50" style={{ left: pos.left, top: pos.top }}>
       <div className="ui-menu-header">Tab Color</div>
       <div className="flex items-center gap-1.5 px-3 py-2">
         {TAB_COLORS.map((c) => (
@@ -130,7 +152,6 @@ export default function FileTabBar({ tabs, activeTabId, onSelectTab, onCloseTab 
   const scrollRef = useRef<HTMLDivElement>(null);
   const tabEditState = useDashboardStore((state) => state.tabEditState);
   const moveTab = useDashboardStore((state) => state.moveTab);
-  const openToolTab = useDashboardStore((state) => state.openToolTab);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; tab: ColoredFileTab } | null>(null);
   const [draggedTabId, setDraggedTabId] = useState<string | null>(null);
   // True when the in-progress drag has already reordered tabs in-strip — used
@@ -229,6 +250,7 @@ export default function FileTabBar({ tabs, activeTabId, onSelectTab, onCloseTab 
     <div className="flex items-stretch tab-bar shrink-0 overflow-hidden">
       <div
         ref={scrollRef}
+        onWheel={(e) => applyHorizontalWheelScroll(e.currentTarget, e)}
         className="flex items-stretch overflow-x-auto scrollbar-hide flex-1"
       >
         {tabs.map((tab) => {
@@ -236,11 +258,13 @@ export default function FileTabBar({ tabs, activeTabId, onSelectTab, onCloseTab 
           const isDragging = tab.id === draggedTabId;
           const displayLabel = getDisplayLabel(tab, tabs);
           const isTool = tab.kind === 'tool';
-          const dirty = !isTool && !!tabEditState[tab.id]?.dirty;
+          const isPlan = tab.kind === 'plan';
+          const dirty = !isTool && !isPlan && !!tabEditState[tab.id]?.dirty;
           return (
             <div
               key={tab.id}
               data-tab-id={tab.id}
+              data-tab-kind={tab.kind ?? 'file'}
               onClick={() => onSelectTab(tab.id)}
               onMouseDown={(e) => handleMouseDown(e, tab.id)}
               onContextMenu={(e) => {
@@ -262,7 +286,8 @@ export default function FileTabBar({ tabs, activeTabId, onSelectTab, onCloseTab 
               }}
             >
               <span className="text-[13px] truncate select-none flex items-center gap-1">
-                {isTool && <BarChart3 size={12} className="shrink-0 text-accent-blue-bright" />}
+                {isTool && <BarChart3 size={12} className="shrink-0 text-accent-blue-bright" data-testid="tool-tab-icon" />}
+                {isPlan && <Map size={12} className="shrink-0 text-accent-purple" data-testid="plan-tab-icon" />}
                 {displayLabel}
               </span>
               {dirty && (
@@ -290,15 +315,7 @@ export default function FileTabBar({ tabs, activeTabId, onSelectTab, onCloseTab 
           );
         })}
       </div>
-      {/* Files-header entry point for the Context-Overhead Analyzer tool tab
-          (reviewer-approved; no top-level nav item). */}
-      <button
-        onClick={() => openToolTab('context-overhead', 'Context Overhead')}
-        className="shrink-0 flex items-center px-2 hover:bg-white/10 text-gray-400 hover:text-gray-200 border-l dark:border-white/10 light:border-black/10"
-        title="Context Overhead Analyzer"
-      >
-        <BarChart3 size={14} />
-      </button>
+      {/* Context-Overhead entry point relocated to the TopBar "Tools" menu (A7). */}
       {contextMenu && (
         <TabContextMenu
           x={contextMenu.x}

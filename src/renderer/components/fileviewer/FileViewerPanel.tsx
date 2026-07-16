@@ -7,6 +7,12 @@ import FileContentArea from './FileContentArea';
 import FileTabBar from './FileTabBar';
 import DirectoryTree from './DirectoryTree';
 import ContextOverheadPanel from '../context-overhead/ContextOverheadPanel';
+import AgentKnowledgePanel from '../agent-knowledge/AgentKnowledgePanel';
+import SkillAnalyticsPanel from '../skill-analytics/SkillAnalyticsPanel';
+import ContextOptimizerPanel from '../context-optimizer/ContextOptimizerPanel';
+import PlanSurfaceContainer from '../plan/PlanSurfaceContainer';
+import CapstonePanel from '../context-optimizer/CapstonePanel';
+import SystemMemoryView from '../watchdog/SystemMemoryView';
 import { detectFileType } from './fileTypeUtils';
 import ResizeDivider from '../layout/ResizeDivider';
 import CollapseButton from '../layout/CollapseButton';
@@ -46,6 +52,10 @@ export default function FileViewerPanel() {
       tabEditState: s.tabEditState,
     })),
   );
+  // While Plans is torn off into its own window, that window owns the single plan
+  // pane (a main-process WebContentsView). A plan tab left open here must stop
+  // driving it, so we render a placeholder instead of PlanSurfaceContainer.
+  const plansDetached = useDashboardStore((s) => s.detachedViews.includes('plans'));
   const closeTab = useDashboardStore((s) => s.closeTab);
   const setActiveTab = useDashboardStore((s) => s.setActiveTab);
   const hideFileViewer = useDashboardStore((s) => s.hideFileViewer);
@@ -147,8 +157,11 @@ export default function FileViewerPanel() {
   // no file header, no directory tree, no FileContentArea (which would fire a
   // disk read of the tool tab's empty filePath via useFileContentCache).
   const isTool = effectiveTab.kind === 'tool';
-  // Only show file header + content for tabs that have a file (not directory-only/tool tabs)
-  const hasFile = !!effectiveTab.filePath && !isTool;
+  // Plan tabs (WP5) own their full content region too — a sandboxed plan-document
+  // pane + provenance rail — so no file header, no directory tree, no disk read.
+  const isPlan = effectiveTab.kind === 'plan';
+  // Only show file header + content for tabs that have a file (not directory-only/tool/plan tabs)
+  const hasFile = !!effectiveTab.filePath && !isTool && !isPlan;
 
   return (
     <div className="flex-1 flex flex-col min-w-0 overflow-hidden bg-surface-0" {...swipeToAgents}>
@@ -176,7 +189,7 @@ export default function FileViewerPanel() {
       <div className="flex-1 flex min-h-0">
         {/* Directory Tree Sidebar — hidden for tool tabs (R7: no treeRoot from
             a tool tab's empty rootDirectory) */}
-        {!isTool && (treeCollapsed ? (
+        {!isTool && !isPlan && (treeCollapsed ? (
           <div className="shrink-0 bg-surface-0/40 border-r dark:border-white/10 light:border-black/10 flex flex-col items-center py-2" style={{ width: 32 }}>
             <CollapseButton collapsed direction="left" onClick={() => togglePanelCollapsed('directoryTreeCollapsed')} />
             <div className="mt-2 text-[13px] font-sans text-gray-400" style={{ writingMode: 'vertical-rl' }}>
@@ -206,9 +219,29 @@ export default function FileViewerPanel() {
 
         {/* File Content */}
         <div className="flex-1 min-w-0 overflow-hidden">
-          {isTool ? (
+          {isPlan ? (
+            plansDetached ? (
+              <div className="flex items-center justify-center h-full text-gray-400 text-sm px-6 text-center">
+                Plans is open in a separate window — close it to view plans here.
+              </div>
+            ) : effectiveTab.planId ? (
+              <PlanSurfaceContainer planId={effectiveTab.planId} />
+            ) : (
+              <div className="flex items-center justify-center h-full text-gray-400 text-sm">Plan unavailable</div>
+            )
+          ) : isTool ? (
             effectiveTab.toolId === 'context-overhead' ? (
               <ContextOverheadPanel />
+            ) : effectiveTab.toolId === 'agent-knowledge-graph' ? (
+              <AgentKnowledgePanel initialAgentId={effectiveTab.params?.agentId} />
+            ) : effectiveTab.toolId === 'skill-usage-analytics' ? (
+              <SkillAnalyticsPanel />
+            ) : effectiveTab.toolId === 'context-optimizer' ? (
+              <ContextOptimizerPanel />
+            ) : effectiveTab.toolId === 'optimizer-capstone' ? (
+              <CapstonePanel />
+            ) : effectiveTab.toolId === 'system-memory' ? (
+              <SystemMemoryView />
             ) : (
               <div className="flex items-center justify-center h-full text-gray-400 text-sm">Unknown tool</div>
             )

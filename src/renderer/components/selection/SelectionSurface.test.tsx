@@ -74,6 +74,11 @@ describe('deriveFileSelectionContext', () => {
     const ctx = deriveFileSelectionContext({ filePath: '/ws/readme.MARKDOWN' }, 'ws');
     expect(ctx.capabilities.comment).toBe(true);
   });
+
+  it('PDF files are comment-capable (plan 2.5 — the PDFium reader overlay hosts the rows)', () => {
+    expect(deriveFileSelectionContext({ filePath: 'C:\\ws\\paper.pdf' }, 'ws').capabilities.comment).toBe(true);
+    expect(deriveFileSelectionContext({ filePath: '/ws/PAPER.PDF' }, 'ws').capabilities.comment).toBe(true);
+  });
 });
 
 describe('SelectionSurface wiring', () => {
@@ -125,6 +130,12 @@ describe('SelectionSurface wiring', () => {
     return ev;
   }
 
+  function rightMouseDown(el: HTMLElement) {
+    act(() => {
+      el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, button: 2 }));
+    });
+  }
+
   const menuButton = (label: string) =>
     Array.from(document.querySelectorAll('button')).find((b) =>
       b.textContent?.includes(label),
@@ -137,9 +148,10 @@ describe('SelectionSurface wiring', () => {
     expect(menuButton('Send to agent')).toBeUndefined();
   });
 
-  it('right-click on a selection opens the menu; picking "New agent" dispatches the tab-derived file context', () => {
+  it('selection present at right mousedown is prevented and opens the menu', () => {
     const para = mount();
     selectContentsOf(para);
+    rightMouseDown(para);
     const ev = rightClick(para);
     expect(ev.defaultPrevented).toBe(true);
 
@@ -161,6 +173,17 @@ describe('SelectionSurface wiring', () => {
       quotedText: 'quoted file text',
     });
     expect(items).toEqual([{ quote: 'quoted file text' }]);
+  });
+
+  it('selection created after right mousedown is not prevented and opens no menu', () => {
+    const para = mount();
+    rightMouseDown(para);
+    selectContentsOf(para);
+
+    const ev = rightClick(para);
+
+    expect(ev.defaultPrevented).toBe(false);
+    expect(menuButton('Send to agent')).toBeUndefined();
   });
 });
 

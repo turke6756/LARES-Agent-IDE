@@ -17,8 +17,9 @@ import { getWorkspace } from '../database';
 import { TokenEstimator } from './token-estimator';
 import { buildMcpInventory, type GlobalMcpProvider, type ToolsetDefsProvider } from './mcp-tool-inventory';
 import { analyzeOverhead, type FileReader } from './context-overhead-analyzer';
+import { MAX_READABLE_BYTES } from '../shared/max-readable-bytes';
 
-const READ_CAP = 1024 * 1024; // 1MB per file — overhead files are small
+const READ_CAP = MAX_READABLE_BYTES; // shared max-readable cap (§3.4); overhead files are small
 const WSL_TIMEOUT = 8000;
 
 // ── encoder ───────────────────────────────────────────────────────────────────
@@ -95,7 +96,9 @@ function expandGlobWindows(pattern: string): string[] {
 
 // ── FileReader ─────────────────────────────────────────────────────────────---
 
-function makeFileReader(pathType: PathType): FileReader {
+// Exported (additive) so the WP4 knowledge extractor reuses the same WSL-aware
+// reader instead of duplicating the fs/wsl.exe branching.
+export function makeFileReader(pathType: PathType): FileReader {
   const cache = new Map<string, { content: string; bytes: number } | null>();
 
   if (pathType === 'wsl') {
@@ -152,17 +155,29 @@ function makeFileReader(pathType: PathType): FileReader {
 
 // ── ToolsetDefsProvider (require CommonJS scripts/) ─────────────────────────--
 
+// FIRST-WINS ORDERING (GT-A WP-A4.5): where a reverse map is built name-only, the
+// first toolset to claim a tool name wins — so `plans-read` MUST precede `plans`.
+// The three shared read-tool names then resolve to `plans-read` and `create_plan`
+// (only in `plans`) resolves to `plans`.
 const TOOLSET_SCRIPT_MAP: Record<string, { script: string; fn: string }> = {
   orchestration: { script: 'mcp-tools-orchestration.js', fn: 'getOrchestrationToolDefinitions' },
   teams: { script: 'mcp-tools-teams.js', fn: 'getTeamsToolDefinitions' },
   comms: { script: 'mcp-tools-comms.js', fn: 'getCommsToolDefinitions' },
+  // WP-F (P5): observability split into core (operational, granted to supervisor
+  // + worker) and analytics (deep context-optimizer surface, supervisor-only).
+  // `observability` stays as the backward-compat union so a persona/grant still
+  // naming it resolves (and stays "registered" for the config-drift check).
   observability: { script: 'mcp-tools-observability.js', fn: 'getObservabilityToolDefinitions' },
+  'observability-core': { script: 'mcp-tools-observability.js', fn: 'getObservabilityCoreToolDefinitions' },
+  'observability-analytics': { script: 'mcp-tools-observability.js', fn: 'getObservabilityAnalyticsToolDefinitions' },
   notebooks: { script: 'mcp-tools-notebooks.js', fn: 'getNotebooksToolDefinitions' },
   browser: { script: 'mcp-browser-tools.js', fn: 'getBrowserToolDefinitions' },
   'browser-present': { script: 'mcp-browser-present-tools.js', fn: 'getBrowserPresentToolDefinitions' },
+  'plans-read': { script: 'mcp-tools-plans.js', fn: 'getPlansReadToolDefinitions' },
+  plans: { script: 'mcp-tools-plans.js', fn: 'getPlansToolDefinitions' },
 };
 
-function makeToolsetDefsProvider(): ToolsetDefsProvider {
+export function makeToolsetDefsProvider(): ToolsetDefsProvider {
   return {
     defsFor(toolset) {
       const entry = TOOLSET_SCRIPT_MAP[toolset];

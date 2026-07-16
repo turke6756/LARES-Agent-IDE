@@ -16,7 +16,7 @@ export interface Props {
   highlighted: number;
   onPick: (agent: Agent) => void;
   onHover: (index: number) => void;
-  position: { left: number; top: number } | null; // from Slice D; null → corner fallback
+  position: { left: number; top: number; maxHeight?: number } | null; // from Slice D; null → corner fallback
 }
 
 export default function AtMentionDropdown({
@@ -36,12 +36,16 @@ export default function AtMentionDropdown({
   // corner. Either way we open UPWARD — the chat input sits at the pane bottom —
   // by pinning the dropdown's bottom edge to the anchor's top.
   const style: React.CSSProperties = position
-    ? { left: position.left, bottom: `calc(100% - ${position.top}px)` }
+    ? {
+        left: position.left,
+        bottom: `calc(100% - ${position.top}px)`,
+        maxHeight: position.maxHeight,
+      }
     : { left: 0, bottom: '100%' };
 
   return (
     <div
-      className="ui-menu absolute z-50 max-h-60 max-w-[280px] overflow-y-auto rounded-md shadow-lg py-1"
+      className="ui-menu absolute z-50 w-[280px] max-w-[calc(100%-16px)] max-h-60 overflow-y-auto rounded-md shadow-lg py-1"
       style={style}
       role="listbox"
     >
@@ -58,7 +62,7 @@ export default function AtMentionDropdown({
             type="button"
             role="option"
             aria-selected={highlighted === i}
-            className={`ui-menu-item w-full text-left${highlighted === i ? ' bg-white/10' : ''}`}
+            className={`ui-menu-item w-full text-left${highlighted === i ? ' ui-menu-item-active' : ''}`}
             // Pick on mousedown (NOT click) with preventDefault so the selection
             // fires before the textarea's blur — focus stays in the textarea and
             // the pick beats the blur-driven dropdown close.

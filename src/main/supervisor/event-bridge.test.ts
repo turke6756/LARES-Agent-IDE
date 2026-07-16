@@ -1775,8 +1775,170 @@ async function TS_consolidatedReplyDigest(): Promise<void> {
   console.log('  TS_consolidated ✓ consolidated digest tags viaSubscription status as reply');
 }
 
+// ── BUG-41: continuation-swap drop windows in the event bridge ─────────
+//
+// A supervisor mid-continuation-swap walks working → done → restarting →
+// launching → idle under a STABLE agent id. Events about other workers keep
+// arriving during that walk. Before the fix: 'restarting' and the sub-second
+// 'done' window fell to deliver()'s "Dropped event" log, and a drain firing in
+// the 'done' window PURGED the whole queue. After the fix: 'restarting' (always)
+// and 'done' (only while a swap is in flight) are queue-statuses; a genuinely-
+// stopped 'done' still purges; a throwing sendInput never loses the batch.
+
+async function BUG41_restartingQueuesAndDrainsAfterIdle(): Promise<void> {
+  const f = makeFakeBridgeDeps();
+  const supervisor = makeAgent('sup-1', { isSupervisor: true, isSupervised: false, status: 'restarting' });
+  const worker = makeAgent('w-1', { status: 'working', title: 'Worker One' });
+  f.agents.set(supervisor.id, supervisor);
+  f.agents.set(worker.id, worker);
+  f.logs.set(worker.id, 'tail\n');
+  const bridge = new EventBridge(f.deps);
+
+  await bridge.onStatusChanged({ agentId: worker.id, status: 'idle', fromStatus: 'working', source: 'monitor' });
+
+  assert.equal(f.sendInputCalls.length, 0, 'BUG41: nothing sent while recipient is restarting');
+  assert.equal(bridge.getQueueSnapshot(supervisor.id).length, 1, 'BUG41: event queued during restarting');
+  assert.equal(f.scheduler.pendingCount(), 1, 'BUG41: a drain is armed');
+
+  // Swap settles: fresh session idle → the queue drains to the same agent id.
+  supervisor.status = 'idle';
+  await bridge.drainPendingFor(supervisor.id);
+  assert.equal(f.sendInputCalls.length, 1, 'BUG41: queue drains to the fresh session once idle');
+  assert.equal(f.sendInputCalls[0].agentId, supervisor.id);
+  assert.ok(f.sendInputCalls[0].text.includes('Worker One'), 'BUG41: drained payload carries the worker event');
+  assert.equal(bridge.getQueueSnapshot(supervisor.id).length, 0, 'BUG41: queue emptied after successful drain');
+  console.log('  BUG41 ✓ event during restarting queues, then drains after status returns to idle');
+}
+
+async function BUG41_drainDuringRestartingPreservesQueue(): Promise<void> {
+  const f = makeFakeBridgeDeps();
+  const supervisor = makeAgent('sup-1', { isSupervisor: true, isSupervised: false, status: 'working' });
+  const worker = makeAgent('w-1', { status: 'working' });
+  f.agents.set(supervisor.id, supervisor);
+  f.agents.set(worker.id, worker);
+  f.logs.set(worker.id, 'tail\n');
+  const bridge = new EventBridge(f.deps);
+
+  // Queue an event while the supervisor is busy.
+  await bridge.onStatusChanged({ agentId: worker.id, status: 'idle', fromStatus: 'working', source: 'monitor' });
+  assert.equal(bridge.getQueueSnapshot(supervisor.id).length, 1, 'BUG41: event queued while working');
+
+  // The drain timer fires WHILE the supervisor is now restarting (mid-swap).
+  supervisor.status = 'restarting';
+  await bridge.drainPendingFor(supervisor.id);
+
+  assert.equal(f.sendInputCalls.length, 0, 'BUG41: drain does not flush into the being-replaced PTY during restarting');
+  assert.equal(bridge.getQueueSnapshot(supervisor.id).length, 1, 'BUG41: drain preserves the queue during restarting');
+  assert.equal(f.scheduler.pendingCount(), 1, 'BUG41: drain re-armed for a later attempt');
+  console.log('  BUG41 ✓ drain firing during restarting preserves the queue (re-arms, never purges/flushes)');
+}
+
+async function BUG41_drainSendThrowDoesNotLoseEvents(): Promise<void> {
+  const f = makeFakeBridgeDeps();
+  const supervisor = makeAgent('sup-1', { isSupervisor: true, isSupervised: false, status: 'working' });
+  const w1 = makeAgent('w-1', { status: 'working', title: 'Worker One' });
+  const w2 = makeAgent('w-2', { status: 'working', title: 'Worker Two' });
+  f.agents.set(supervisor.id, supervisor);
+  f.agents.set(w1.id, w1);
+  f.agents.set(w2.id, w2);
+  f.logs.set(w1.id, 'tail\n');
+  f.logs.set(w2.id, 'tail\n');
+  const bridge = new EventBridge(f.deps);
+
+  await bridge.onStatusChanged({ agentId: w1.id, status: 'idle', fromStatus: 'working', source: 'monitor' });
+  await bridge.onStatusChanged({ agentId: w2.id, status: 'idle', fromStatus: 'working', source: 'monitor' });
+  assert.equal(bridge.getQueueSnapshot(supervisor.id).length, 2, 'BUG41: both events queued');
+
+  // Drain into a PTY whose write throws (no-op/absent PTY mid-swap).
+  supervisor.status = 'idle';
+  f.setSendInputError(new Error('pty absent'));
+  await bridge.drainPendingFor(supervisor.id);
+
+  assert.equal(f.sendInputCalls.length, 1, 'BUG41: send was attempted');
+  assert.equal(f.sendInputCalls[0].resolved, false, 'BUG41: the send threw');
+  assert.equal(f.auditEvents.length, 0, 'BUG41: no batch audit on a failed send');
+  assert.equal(bridge.getQueueSnapshot(supervisor.id).length, 2, 'BUG41: the batch was re-queued, not lost');
+  assert.equal(f.scheduler.pendingCount(), 1, 'BUG41: drain re-armed after the failed send');
+
+  // Next drain (error cleared) delivers the preserved batch.
+  await bridge.drainPendingFor(supervisor.id);
+  assert.equal(f.sendInputCalls.length, 2, 'BUG41: retry delivered the preserved batch');
+  assert.equal(f.sendInputCalls[1].resolved, true);
+  assert.ok(f.sendInputCalls[1].text.includes('Worker One'), 'BUG41: retry payload still carries the first worker');
+  assert.ok(f.sendInputCalls[1].text.includes('Worker Two'), 'BUG41: retry payload still carries the second worker');
+  assert.equal(bridge.getQueueSnapshot(supervisor.id).length, 0, 'BUG41: queue emptied only after the successful send');
+  console.log('  BUG41 ✓ a throwing sendInput on drain re-queues the batch (no events lost)');
+}
+
+async function BUG41_doneWithSwapInFlightQueuesAndDrainReArms(): Promise<void> {
+  const f = makeFakeBridgeDeps();
+  // Recipient is in the sub-second 'done' window mid-swap.
+  const supervisor = makeAgent('sup-1', { isSupervisor: true, isSupervised: false, status: 'done' });
+  const worker = makeAgent('w-1', { status: 'working', title: 'Worker One' });
+  f.agents.set(supervisor.id, supervisor);
+  f.agents.set(worker.id, worker);
+  f.logs.set(worker.id, 'tail\n');
+  f.setContinuationSwapInFlight(supervisor.id, true);
+  const bridge = new EventBridge(f.deps);
+
+  await bridge.onStatusChanged({ agentId: worker.id, status: 'idle', fromStatus: 'working', source: 'monitor' });
+  assert.equal(f.sendInputCalls.length, 0, 'BUG41: nothing sent to a done-mid-swap recipient');
+  assert.equal(bridge.getQueueSnapshot(supervisor.id).length, 1, 'BUG41: event queued (not dropped) during the done window');
+  assert.equal(f.scheduler.pendingCount(), 1, 'BUG41: drain armed');
+
+  // A drain firing while STILL done + swap-in-flight must re-arm, not purge.
+  await bridge.drainPendingFor(supervisor.id);
+  assert.equal(bridge.getQueueSnapshot(supervisor.id).length, 1, 'BUG41: drain during done+swap preserves the queue');
+  assert.equal(f.scheduler.pendingCount(), 1, 'BUG41: drain re-armed during done+swap');
+  assert.equal(f.sendInputCalls.length, 0, 'BUG41: still nothing sent');
+
+  // Swap completes: predicate clears, fresh session idle → the queue drains.
+  f.setContinuationSwapInFlight(supervisor.id, false);
+  supervisor.status = 'idle';
+  await bridge.drainPendingFor(supervisor.id);
+  assert.equal(f.sendInputCalls.length, 1, 'BUG41: drains to the fresh session after the swap');
+  assert.ok(f.sendInputCalls[0].text.includes('Worker One'));
+  console.log('  BUG41 ✓ done + swap-in-flight queues + re-arms, then drains after the swap');
+}
+
+async function BUG41_doneWithoutSwapPurges(): Promise<void> {
+  // (a) delivery: a genuinely-stopped 'done' recipient (no swap) drops the
+  // event at recipientsFor — never queued.
+  const f = makeFakeBridgeDeps();
+  const supervisor = makeAgent('sup-1', { isSupervisor: true, isSupervised: false, status: 'done' });
+  const worker = makeAgent('w-1', { status: 'working' });
+  f.agents.set(supervisor.id, supervisor);
+  f.agents.set(worker.id, worker);
+  f.logs.set(worker.id, 'tail\n');
+  // No setContinuationSwapInFlight → predicate is false.
+  const bridge = new EventBridge(f.deps);
+
+  await bridge.onStatusChanged({ agentId: worker.id, status: 'idle', fromStatus: 'working', source: 'monitor' });
+  assert.equal(f.sendInputCalls.length, 0, 'BUG41: nothing sent to a genuinely-done recipient');
+  assert.equal(bridge.getQueueSnapshot(supervisor.id).length, 0, 'BUG41: genuinely-done recipient does not queue');
+
+  // (b) drain: a queue that exists when the recipient is 'done' with no swap in
+  // flight is PURGED (the classic terminal-recipient cleanup).
+  const g = makeFakeBridgeDeps();
+  const sup2 = makeAgent('sup-2', { isSupervisor: true, isSupervised: false, status: 'working' });
+  const wk2 = makeAgent('wk-2', { status: 'working' });
+  g.agents.set(sup2.id, sup2);
+  g.agents.set(wk2.id, wk2);
+  g.logs.set(wk2.id, 'tail\n');
+  const bridge2 = new EventBridge(g.deps);
+
+  await bridge2.onStatusChanged({ agentId: wk2.id, status: 'idle', fromStatus: 'working', source: 'monitor' });
+  assert.equal(bridge2.getQueueSnapshot(sup2.id).length, 1, 'BUG41: event queued while working');
+
+  sup2.status = 'done'; // genuinely stopped, no swap in flight
+  await bridge2.drainPendingFor(sup2.id);
+  assert.equal(bridge2.getQueueSnapshot(sup2.id).length, 0, 'BUG41: drain purges the queue for a genuinely-done recipient');
+  assert.equal(g.sendInputCalls.length, 0, 'BUG41: nothing sent to the stopped recipient');
+  console.log('  BUG41 ✓ genuinely-done (no swap) drops at delivery and purges on drain');
+}
+
 async function main(): Promise<void> {
-  console.log('event-bridge.test: running BR-01..BR-20 + BUG-18 + BUG-22 + TS-subscriptions');
+  console.log('event-bridge.test: running BR-01..BR-20 + BUG-18 + BUG-22 + BUG-41 + TS-subscriptions');
   await BR_01_happyPath();
   await BR_02_crashViaRunnerExit();
   await BR_02b_runnerExitBypassesCooldown();
@@ -1835,6 +1997,11 @@ async function main(): Promise<void> {
   await TS13_contextStatsSupervisorGuard();
   await TS14_recipientScopedQueueUnderFanOut();
   await TS_consolidatedReplyDigest();
+  await BUG41_restartingQueuesAndDrainsAfterIdle();
+  await BUG41_drainDuringRestartingPreservesQueue();
+  await BUG41_drainSendThrowDoesNotLoseEvents();
+  await BUG41_doneWithSwapInFlightQueuesAndDrainReArms();
+  await BUG41_doneWithoutSwapPurges();
   console.log('event-bridge.test: all tests passed');
 }
 

@@ -2,8 +2,11 @@ import React, { useEffect, useState, useRef } from 'react';
 import type { Agent } from '../../../shared/types';
 import StatusBadge from './StatusBadge';
 import { RoleChips, ContextStatsBar } from './agent-card-bits';
+import ContinuationSplitButton from './ContinuationSplitButton';
+import { isContinuationEligible } from './continuation-controls';
 import { PROVIDER_META } from '../../../shared/constants';
 import { useDashboardStore } from '../../stores/dashboard-store';
+import { useCursorMenuPosition } from '../../lib/floating/useCursorMenuPosition';
 
 // The header bar for an owner-container: a horizontal, full-width band (gold top
 // accent + thick blue fill) standing in for the vertical AgentCard when an agent
@@ -47,6 +50,8 @@ export default function OwnerContainerBar({
   const isSelected = useDashboardStore((s) => s.selectedAgentId === agent.id);
   const isTerminalActive = useDashboardStore((s) => s.terminalAgentId === agent.id);
   const cs = useDashboardStore((s) => s.contextStats[agent.id] ?? null);
+  // Gold "snake" border while this supervisor is mid context-brick continuation transfer.
+  const transferring = useDashboardStore((s) => s.continuationTransferIds.has(agent.id));
   const selectAgent = useDashboardStore((s) => s.selectAgent);
   const setTerminalAgent = useDashboardStore((s) => s.setTerminalAgent);
 
@@ -55,6 +60,7 @@ export default function OwnerContainerBar({
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
+  const menuPosition = useCursorMenuPosition(menuRef, contextMenu, { width: 260, height: 85 }, confirmDelete);
 
   // Dismiss the menu on any outside click (mirrors AgentCard's context menu).
   useEffect(() => {
@@ -111,7 +117,7 @@ export default function OwnerContainerBar({
       className={`relative ${accent} ${isSelected ? 'owner-bar-selected' : fill} border border-surface-3
         ${expanded ? 'rounded-t border-b-0' : 'rounded'}
         ${!isSelected && isTerminalActive ? 'bg-accent-blue/[0.18]' : ''} ${ring}
-        ${childrenActive ? 'owner-active-pulse' : ''}`}
+        ${childrenActive ? 'owner-active-pulse' : ''} ${transferring ? 'agent-transfer-glow' : ''}`}
       title={childrenActive ? 'An agent owned by this one is working' : undefined}
       onContextMenu={(e) => {
         // Right-click anywhere on the bar → cascade-delete menu.
@@ -188,7 +194,9 @@ export default function OwnerContainerBar({
             </div>
           )}
 
-          <div className="ml-auto shrink-0">
+          <div className="ml-auto shrink-0 flex items-center gap-2">
+            {/* Context-brick continuation control — claude-provider supervisors only. */}
+            {isContinuationEligible(agent) && <ContinuationSplitButton agent={agent} />}
             <StatusBadge status={agent.status} />
           </div>
         </div>
@@ -201,7 +209,7 @@ export default function OwnerContainerBar({
         <div
           ref={menuRef}
           className="ui-menu fixed z-50"
-          style={{ left: contextMenu.x, top: contextMenu.y }}
+          style={{ left: menuPosition.left, top: menuPosition.top, maxHeight: 'calc(100vh - 16px)', overflowY: 'auto' }}
         >
           <div className="ui-menu-header">Supervisor</div>
           <button

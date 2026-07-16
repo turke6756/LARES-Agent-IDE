@@ -167,6 +167,9 @@ function makeHarness(): Harness {
     // BUG-11: integration tests don't exercise the user-typing gate; return
     // undefined so every event flows through as before.
     getLastUserPtyWriteAt: () => undefined,
+    // BUG-41: integration tests don't exercise continuation swaps; no swap is
+    // ever in flight, so 'done'/'restarting' recipients behave as before.
+    isContinuationSwapInFlight: () => false,
     // BUG-20: the chat / file-activities deps. Default to empty so existing
     // integration scenarios (which set up real chat events via the dispatcher
     // path, not the supervisor preview path) keep their original payload

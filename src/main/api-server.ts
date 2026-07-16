@@ -15,7 +15,19 @@ import {
   createContinuationHandoffAttempt, getOpenContinuationAttempt, getLatestContinuationAttempt,
   getContinuationAttempt, getContinuationEscapeBudget, closeContinuationHandoffAttempt, insertContinuationBrick,
   getLatestBrickForAttempt, hasRunningOrchestrationForSupervisor,
+  getPlans, getPlan, getPlanByWorkspacePath, createOrRevivePlan, updatePlan, softDeletePlan, derivePlanSlug,
+  getSupervisorFocus, upsertSupervisorFocus, deleteSupervisorFocus,
+  bumpSupervisorFocusAttended, getSupervisorFocusedPlans,
+  recordPlanSectionTouch, getPlanSections, getPlanEventRollup, getPlanEventsForRender,
+  getPlanEventRepoActivity,
 } from './database';
+import { toTier2Digest, toTier3Detail } from './plans/repo-activity';
+import { assertPlanRailFree } from './orchestration/plan-ownership';
+import { createPlanSurface } from './plans/create-plan';
+import { readPlanSection, listPlanSections, type ReadMode } from './plans/read-ladder';
+import { parsePlanHtmlSafe, type PlanProjection } from './plans/section-reader';
+import { getServedPlanProjection } from './plans/watch-plans';
+import { readFileContents } from './file-reader';
 import {
   executeCell as kernelExecuteCell,
   executeNotebook as kernelExecuteNotebook,
@@ -26,12 +38,36 @@ import {
 } from './jupyter-kernel-client';
 import { scanPersonas, scaffoldPersona } from './persona-scanner';
 import { TEAM_MAX_MESSAGES_PER_5MIN, TEAM_MAX_ALTERNATIONS, TEAM_ALTERNATION_WINDOW_MS, TEAM_PAIR_COOLDOWN_MS, CONTINUATION_BRICK_MAX_BYTES, CONTINUATION_ESCAPE_MAX_ATTEMPTS, CONTINUATION_ESCAPE_MAX_ALIVE_MS } from '../shared/constants';
-import { TeamMessageStatus } from '../shared/types';
-import type { Agent } from '../shared/types';
+import { TeamMessageStatus, hasSupervisorPrivilege } from '../shared/types';
+import type { Agent, Workspace, PlanActivityEvent, RepoActivityDetail } from '../shared/types';
+import fs from 'fs';
+import * as nodePath from 'path';
 import type { SigninPendingResult, SigninPendingEntry } from '../shared/browser';
 import { isKeyName, mapKeyToBytes, SUPPORTED_KEY_NAMES } from './supervisor/key-bytes';
 import type { OrchestrationService } from './orchestration/service';
 import crypto from 'crypto';
+import os from 'os';
+// ── WP7 agent-facing read-only optimizer surface (additive; GET-only). ──
+import { getDb, getWorkspace as getWorkspaceRecord } from './database';
+import type { PipelineDb } from './context-optimizer/optimizer-pipeline';
+import { runLiveOptimizerAnalyze } from './context-optimizer/optimizer-live-analyze';
+import {
+  buildProposalsPage, buildProposalDetail, buildProposalEvidence, buildFileHeatPage,
+  buildClusterExemplars, buildAnalyzabilityPage,
+  IMPROVEMENT_ROUTE, IMPROVEMENT_LEVERS,
+} from './context-optimizer/agent-dto-build';
+import { BehaviorStore } from './context-optimizer/behavior-store';
+import {
+  buildSkillUsagePage, buildSkillUsageDetail,
+  buildAgentKnowledgePage, buildAgentKnowledgeDetail,
+  buildMcpToolUsagePage,
+} from './context-optimizer/agent-observability-build';
+import { errResponse, type AgentDtoResponse, type RedactionRoots } from './context-optimizer/agent-dto';
+import { querySkillUsage, type QueryDb } from './skill-analytics/queries';
+import { getSharedParseManager } from './skill-analytics/parse-manager-factory';
+import { queryMcpToolUsage } from './skill-analytics/mcp-tool-usage-queries';
+import { runKnowledgeExtract } from './agent-knowledge/knowledge-extract-runner';
+import type { AgentRoleLane, BehaviorEvidenceTier, ContextOptimizerProposalKind, ContextOptimizerResult, AgentKnowledgeGraph, SkillUsageResult, McpToolUsageRollupDTO, WorkspaceScopeMode, PathRole } from '../shared/types';
 
 /** Machine-readable failure classes the top-level error serializer is allowed
  *  to expose in JSON bodies. Errors thrown inside routes can carry raw Node
@@ -52,9 +88,11 @@ const API_ERROR_CODES = new Set<string>([
   // Context-brick Inc 4 (4.4) — continuation attempt/brick/relaunch gates.
   'continuation-open-attempt-exists', 'continuation-no-open-attempt',
   'continuation-note-too-large', 'continuation-attempt-not-committed',
-  'continuation-no-tool-brick', 'continuation-owned-busy',
+  'continuation-no-tool-brick',
   'continuation-input-in-flight', 'continuation-awaiting-human',
   'continuation-orchestration-running',
+  // WP7 agent-facing read-only optimizer surface — non-GET to a GET-only route.
+  'method-not-allowed',
   // Context-brick Inc 5 (5B) — the note-less empty-memo escape's gates. The
   // escape is gated on the durable EFFORT BUDGET (aborts / alive-time), NOT a
   // context percentage, so the not-yet-authorized code is budget-not-exhausted.
@@ -63,6 +101,13 @@ const API_ERROR_CODES = new Set<string>([
   // BUG-39 (WP1) — self-busy gate: the target agent's OWN turn must be complete
   // before its PTY is killed (belt to the watcher's advisory post-note grace).
   'continuation-self-busy',
+  // D5-lite memory watchdog admission control (incident-2026-07-11 §5). A new
+  // agent launch / agent tab is refused under Critical commit pressure
+  // (`memory-critical`) or at a static cap (`memory-capacity`) so the calling
+  // agent/orchestrator receives a machine-readable "no" instead of degrading.
+  // Full-D5 (Wave 4) adds `memory-budget` — the per-agent budget refusal, same
+  // family, surfaced identically to the API/MCP caller.
+  'memory-critical', 'memory-capacity', 'memory-budget',
 ]);
 
 /** Context-brick Inc 1 — the identity an inbound request asserts via headers,
@@ -173,6 +218,13 @@ export interface BrowserToolProvider {
    *  `requests` in the browser_list_my_access_requests payload. workspaceId is
    *  resolved trust-side (agentId → workspace) by this layer. */
   listSigninPending(workspaceId: string | null): SigninPendingEntry[];
+}
+
+/** WP-2B — parse the optional `scopeMode` query param for workspace-scoped usage
+ *  routes. Unknown/absent → undefined, so the query layer applies its 'include-proxy'
+ *  default. */
+function parseScopeMode(raw: string | null): WorkspaceScopeMode | undefined {
+  return raw === 'strict' || raw === 'include-proxy' || raw === 'global-diagnostic' ? raw : undefined;
 }
 
 /**
@@ -429,9 +481,18 @@ export class ApiServer {
           { statusCode: 403, code: 'supervisor-workspace-mismatch' },
         );
       }
-      if (!caller.isSupervisor) {
+      // Supervisor-privilege gate (#19): the structural workspace supervisor OR a
+      // privilegeLane:'supervisor' persona. Both already receive the full
+      // supervisor MCP toolset (roleLaneOf → toolsetsForLane 'supervisor'), so the
+      // rail admits both — a persona calling save_continuation_brick /
+      // get_my_context / list_my_agents authenticates as its own id. A plain
+      // worker/researcher still 403s. Every downstream caller of resolveIdentity
+      // scopes strictly by identity.supervisor.id (owned-agents, focus rows, brick
+      // author) — none assumes THE single workspace supervisor — so loosening the
+      // predicate here is safe; see the resolveIdentity callers audited for #19.
+      if (!hasSupervisorPrivilege(caller)) {
         throw Object.assign(
-          new Error(`X-Supervisor-Id '${supervisorId}' is not a supervisor agent`),
+          new Error(`X-Supervisor-Id '${supervisorId}' is not a supervisor-privileged agent`),
           { statusCode: 403, code: 'not-a-supervisor' },
         );
       }
@@ -460,6 +521,148 @@ export class ApiServer {
       new Error(`workspaceId '${explicit}' does not match asserted X-Workspace-Id '${identity.workspaceId}'`),
       { statusCode: 403, code: 'workspace-scope-mismatch' },
     );
+  }
+
+  /** Planning-surface focus auto-subscribe: when the caller resolves to an
+   *  asserted supervisor (validated X-Supervisor-Id → identity.supervisorId), record
+   *  a supervisor_focus row so the plan resurfaces in its get_my_context orientation
+   *  after a /clear. Silent no-op for non-supervisor callers (workers/humans, whose
+   *  supervisorId is null) and NEVER throws — focus attribution must never turn an
+   *  otherwise-valid create/dispatch into a 4xx. Notes are left untouched on an
+   *  existing row (upsert COALESCEs a null note). */
+  private autoFocusPlan(identity: IdentityContext, planId: string | null | undefined): void {
+    try {
+      if (!identity.supervisorId || !planId) return;
+      upsertSupervisorFocus({ supervisorId: identity.supervisorId, planId, notes: null });
+    } catch (err) {
+      console.warn('[api-server] auto-focus upsert failed (non-fatal):', err);
+    }
+  }
+
+  /** Attended-bump on a plan read (P1-07 wiring): when an asserted supervisor reads a
+   *  plan it already focuses, freshen last_attended_at so the orientation ordering
+   *  reflects real attention. No focus row → the helper UPDATEs zero rows and returns
+   *  null (never auto-creates one). Best-effort — never fails the read. */
+  private bumpFocusOnRead(identity: IdentityContext, planId: string): void {
+    try {
+      if (identity.supervisorId) bumpSupervisorFocusAttended(identity.supervisorId, planId);
+    } catch { /* best-effort — a focus bump must never gate the content (R2 §0) */ }
+  }
+
+  // ── WP7 agent-facing read-only optimizer surface (helpers). ──
+  // READ-ONLY: these only READ. No route below writes a DB row, marks an action
+  // applied, or signs a derivation (those stay UI/IPC-only — classifier §5.4). Every
+  // path here is GET; a non-GET to a matched path 405s (see the route block).
+
+  /** Run the live optimizer analyze scoped to the caller's workspace (§5.6 default).
+   *  Mirrors ipc-handlers' composition via the shared runLiveOptimizerAnalyze helper. */
+  private runOptimizerForRequest(identity: IdentityContext, url: URL): ContextOptimizerResult {
+    const workspaceId = this.resolveWorkspaceScope(identity, url.searchParams.get('workspaceId')) ?? undefined;
+    const laneParam = (url.searchParams.get('lane') as AgentRoleLane | null) ?? undefined;
+    const repoDir = nodePath.resolve(__dirname, '..', '..', '..');
+    // WP-4A — file-heat is now workspace-scoped at the query layer. `slug` unlocks the
+    // include-proxy leg; `scopeMode` defaults to 'strict' in queryFileTouchesScoped.
+    const slug = url.searchParams.get('slug') ?? undefined;
+    const scopeMode = parseScopeMode(url.searchParams.get('scopeMode'));
+    const includeOperationalNoise = url.searchParams.get('includeOperationalNoise') === 'true';
+    return runLiveOptimizerAnalyze({
+      workspaceId,
+      db: getDb() as unknown as PipelineDb,
+      repoDir,
+      generatedAtIso: new Date().toISOString(),
+      nowMs: Date.now(),
+      query: { lane: laneParam, workspaceId, slug, scopeMode, includeOperationalNoise },
+    });
+  }
+
+  /** R2 WP-4B (Step 3) — the live BehaviorStore backing the cluster-exemplar drill. Built
+   *  UNSCOPED (`new BehaviorStore(getDb())`), mirroring how optimizer-assemble builds the
+   *  store for `improvisationClusters`, so the drill sees the SAME folded members the
+   *  rollup did (a workspace-scoped store would drift from the rollup's member set). */
+  private buildClusterExemplarStore(_identity: IdentityContext, _url: URL): BehaviorStore {
+    return new BehaviorStore(getDb() as unknown as import('./context-optimizer/behavior-store').QueryDb);
+  }
+
+  /** Redaction roots (§5.6) for the caller's workspace. `absPath` is never populated on
+   *  this MCP/API path — only pathDisplay/pathScope/pathHash cross the boundary. */
+  private buildRedactionRoots(identity: IdentityContext, url: URL): RedactionRoots {
+    const workspaceId = this.resolveWorkspaceScope(identity, url.searchParams.get('workspaceId'));
+    const workspaceRoot = workspaceId ? getWorkspaceRecord(workspaceId)?.path : undefined;
+    return {
+      workspaceRoot,
+      dashboardRoot: workspaceRoot ? nodePath.join(workspaceRoot, '.dashboard') : undefined,
+      homeDir: os.homedir(),
+      // SEAM: per-skill roots (`$SKILL/<name>`) require a scaffold scan; without it a
+      // skill path falls back to $DASHBOARD/$WORKSPACE (still username/drive-free — safe).
+    };
+  }
+
+  /** Parse an optional integer query param; undefined when absent/malformed (the DTO
+   *  layer then applies the per-tool default). */
+  private intParam(url: URL, name: string): number | undefined {
+    const raw = url.searchParams.get(name);
+    if (raw === null || raw === '') return undefined;
+    const n = parseInt(raw, 10);
+    return Number.isNaN(n) ? undefined : n;
+  }
+
+  /** Run the WP3 skill-usage rollup scoped to the caller's workspace (§5.6). WP-D fix
+   *  leg: scope by the authoritative agents-join `workspaceId` — NOT the structurally-
+   *  NULL `workspace_root` (which excluded every row, reading as "skills unused"). Also
+   *  parse-first parity with the IPC panel: on a fresh install the backfill marker is
+   *  unset, so kick `ensureIndexed()` (gated behind the cheap marker check — a no-op in
+   *  steady state) and signal `indexing` so the surface reads 'indexing', not empty. */
+  private runSkillUsageForRequest(identity: IdentityContext, url: URL): { usage: SkillUsageResult; indexing: boolean } {
+    const workspaceId = this.resolveWorkspaceScope(identity, url.searchParams.get('workspaceId')) ?? undefined;
+    const slug = url.searchParams.get('slug') ?? undefined;
+    const mgr = getSharedParseManager();
+    let indexing = false;
+    if (!mgr.isBackfillComplete()) {
+      mgr.ensureIndexed();   // non-blocking; kicks the cooperative first-run backfill
+      indexing = true;
+    }
+    // WP-2B — workspace scope policy. Defaults to 'strict' in the skill-usage query
+    // layer (its vetted honest agents-join scope); 'include-proxy' is opt-in via ?scopeMode=.
+    const scopeMode = parseScopeMode(url.searchParams.get('scopeMode'));
+    const usage = querySkillUsage(getDb() as unknown as QueryDb, { workspaceId, slug, scopeMode });
+    return { usage, indexing };
+  }
+
+  /** Run the wave2 per-MCP-tool usage rollup scoped to the caller (§2.3), projected to
+   *  the lean four-tier attribution rollup DTO (WP-C / P2). Workspace scope degrades
+   *  honestly: `workspaceId` matches attributed streams via the agents-join, and
+   *  callers scope the honest (unattributed-inclusive) view via `slug`. Attribution is
+   *  honest four-tier (agent > explicit-lane > exclusive-grant > unattributed) — the
+   *  DTO carries the tierBreakdown + coverage %; the raw enriched result stays on IPC
+   *  for the panel. */
+  private runMcpToolUsageForRequest(identity: IdentityContext, url: URL): AgentDtoResponse<McpToolUsageRollupDTO> {
+    const workspaceId = this.resolveWorkspaceScope(identity, url.searchParams.get('workspaceId')) ?? undefined;
+    const slug = url.searchParams.get('slug') ?? undefined;
+    const lane = url.searchParams.get('lane') ?? undefined;
+    const agentId = url.searchParams.get('agentId') ?? undefined;
+    // WP-2B — workspace scope policy. Defaults to 'include-proxy' in the query layer,
+    // which self-determines slug↔workspace uniqueness before admitting any proxy row.
+    const scopeMode = parseScopeMode(url.searchParams.get('scopeMode'));
+    const result = queryMcpToolUsage(getDb() as unknown as QueryDb, { workspaceId, slug, lane, agentId, scopeMode });
+    return buildMcpToolUsagePage(result, { full: url.searchParams.get('full') === 'true' });
+  }
+
+  /** Run the WP4 agent-knowledge extraction for the caller-scoped workspace + a required
+   *  `agentId`. Throws a 400/404-mapped error the top-level serializer turns into an
+   *  AgentDtoError-shaped body; on a missing agent the pure runner throws, so we surface
+   *  it as INVALID_ARGUMENT rather than a raw 500. */
+  private runAgentKnowledgeForRequest(identity: IdentityContext, url: URL): AgentKnowledgeGraph {
+    const workspaceId = this.resolveWorkspaceScope(identity, url.searchParams.get('workspaceId'));
+    const agentId = url.searchParams.get('agentId');
+    if (!workspaceId) {
+      throw Object.assign(new Error('agent-knowledge requires a resolvable workspace scope'),
+        { statusCode: 400, code: 'invalid-argument' });
+    }
+    if (!agentId) {
+      throw Object.assign(new Error('agent-knowledge requires an agentId query param'),
+        { statusCode: 400, code: 'invalid-argument' });
+    }
+    return runKnowledgeExtract(workspaceId, agentId);
   }
 
   private async route(method: string, url: URL, req: http.IncomingMessage, identity: IdentityContext): Promise<any> {
@@ -509,6 +712,156 @@ export class ApiServer {
     // and `account_wide: true`). Consumed verbatim by the MCP get_usage_limits tool.
     if (method === 'GET' && path === '/api/usage-limits') {
       return this.supervisor.getUsageLimits();
+    }
+
+    // ══ WP7 agent-facing read-only optimizer surface (classifier addendum §5). ══
+    // Lean summary lists + detail-on-demand, in the AgentDtoResponse envelope. GET-only:
+    // a non-GET to any matched path 405s (read-only audit — test 29). Cursor/empty/
+    // unverified states ride the envelope as ok:true|false, NOT as HTTP errors (§5.1).
+    // The observability MCP tools (Module 3) call these localhost routes.
+    const optProposalsList = path === '/api/context-optimizer/proposals';
+    // WP-1A: the evidence-drill sub-route is MORE SPECIFIC than the detail route and
+    // MUST be matched first (its `/evidence` suffix means the detail regex — anchored on
+    // a single trailing segment — never matches it, but order the dispatch explicitly).
+    const optProposalEvidence = path.match(/^\/api\/context-optimizer\/proposals\/([^/]+)\/evidence$/);
+    // R2 WP-4B: the cluster-exemplar drill sub-route, like /evidence, is MORE SPECIFIC than
+    // the detail route (its `/cluster-exemplars` suffix means the single-trailing-segment
+    // detail regex never matches it) — match + dispatch it before optProposalDetail.
+    const optClusterExemplars = path.match(/^\/api\/context-optimizer\/proposals\/([^/]+)\/cluster-exemplars$/);
+    const optProposalDetail = path.match(/^\/api\/context-optimizer\/proposals\/([^/]+)$/);
+    const optFileHeat = path === '/api/context-optimizer/file-heat';
+    // R2 WP-4C — the capped section-level analyzability detail route (explains + ranks the
+    // notAnalyzable blind spot by trapped cost). GET-only, same read-only envelope.
+    const optAnalyzability = path === '/api/context-optimizer/analyzability';
+    if (optProposalsList || optProposalEvidence || optClusterExemplars || optProposalDetail
+        || optFileHeat || optAnalyzability) {
+      if (method !== 'GET') {
+        throw Object.assign(
+          new Error('This is a read-only GET surface; agents propose edits via chat, not by writing here.'),
+          { statusCode: 405, code: 'method-not-allowed' },
+        );
+      }
+      const result = this.runOptimizerForRequest(identity, url);
+      if (optProposalEvidence) {
+        return buildProposalEvidence(result, decodeURIComponent(optProposalEvidence[1]));
+      }
+      if (optClusterExemplars) {
+        return buildClusterExemplars(
+          result, this.buildClusterExemplarStore(identity, url),
+          decodeURIComponent(optClusterExemplars[1]),
+          { cursor: url.searchParams.get('cursor') ?? undefined, limit: this.intParam(url, 'limit') });
+      }
+      if (optProposalDetail) {
+        return buildProposalDetail(result, decodeURIComponent(optProposalDetail[1]), {
+          includePatch: url.searchParams.get('includePatch') === 'true',
+        });
+      }
+      if (optFileHeat) {
+        // WP-4A — surface the guidance-gap split + role/coverage/access filters. The
+        // corpus is workspace-scoped at the query layer (runOptimizerForRequest threads
+        // slug/scopeMode/includeOperationalNoise into the analyze query); these params
+        // shape the DTO projection (view split, filters, operational-noise widening).
+        return buildFileHeatPage(result, this.buildRedactionRoots(identity, url), {
+          lane: (url.searchParams.get('lane') as AgentRoleLane | null) ?? undefined,
+          limit: this.intParam(url, 'limit'),
+          cursor: url.searchParams.get('cursor') ?? undefined,
+          view: (url.searchParams.get('view') as 'hot' | 'guidance-gaps' | null) ?? undefined,
+          role: (url.searchParams.get('role') as PathRole | null) ?? undefined,
+          coverage: url.searchParams.get('coverage') ?? undefined,
+          accessMode: (url.searchParams.get('accessMode') as 'read' | 'write' | 'executed' | null) ?? undefined,
+          includeOperationalNoise: url.searchParams.get('includeOperationalNoise') === 'true',
+          allWorkspaces: url.searchParams.get('allWorkspaces') === 'true',
+        });
+      }
+      if (optAnalyzability) {
+        return buildAnalyzabilityPage(result, this.buildRedactionRoots(identity, url), {
+          lane: (url.searchParams.get('lane') as AgentRoleLane | null) ?? undefined,
+          limit: this.intParam(url, 'limit'),
+          cursor: url.searchParams.get('cursor') ?? undefined,
+        });
+      }
+      return buildProposalsPage(result, {
+        lane: (url.searchParams.get('lane') as AgentRoleLane | null) ?? undefined,
+        kind: (url.searchParams.get('kind') as ContextOptimizerProposalKind | null) ?? undefined,
+        minTier: (url.searchParams.get('minTier') as BehaviorEvidenceTier | null) ?? undefined,
+        limit: this.intParam(url, 'limit'),
+        cursor: url.searchParams.get('cursor') ?? undefined,
+        includeUnverified: url.searchParams.get('includeUnverified') === 'true',
+      });
+    }
+
+    // ══ WP7 Module 2: skill-usage / agent-knowledge / improvement-proposals ══
+    // Same envelope, same GET-only read-only guarantee (405 on non-GET — test 29).
+    // skill-usage + agent-knowledge are backed by WP3/WP4 read layers (NOT the
+    // optimizer engine); improvement-proposals is the SAME live analyze filtered to
+    // the ADD/TUNE/RELOCATE levers (Task 1b, supervisor-endorsed).
+    const optSkillUsageList = path === '/api/context-optimizer/skill-usage';
+    const optSkillUsageDetail = path.match(/^\/api\/context-optimizer\/skill-usage\/([^/]+)$/);
+    const optMcpToolUsage = path === '/api/context-optimizer/mcp-tool-usage';
+    const optKnowledgeList = path === '/api/context-optimizer/agent-knowledge';
+    const optKnowledgeDetail = path.match(/^\/api\/context-optimizer\/agent-knowledge\/([^/]+)$/);
+    const optImproveList = path === '/api/context-optimizer/improvement-proposals';
+    const optImproveDetail = path.match(/^\/api\/context-optimizer\/improvement-proposals\/([^/]+)$/);
+    if (optSkillUsageList || optSkillUsageDetail || optMcpToolUsage || optKnowledgeList || optKnowledgeDetail
+        || optImproveList || optImproveDetail) {
+      if (method !== 'GET') {
+        throw Object.assign(
+          new Error('This is a read-only GET surface; agents propose edits via chat, not by writing here.'),
+          { statusCode: 405, code: 'method-not-allowed' },
+        );
+      }
+      // Per-MCP-tool usage (wave2 §2.3 / WP-C P2) — the lean four-tier attribution
+      // rollup DTO (top-N byTool, capped byToolLane cross-tab, tierBreakdown +
+      // coverage %, capped timeline, next-drill hint) in the AgentDtoResponse envelope.
+      if (optMcpToolUsage) {
+        return this.runMcpToolUsageForRequest(identity, url);
+      }
+      // Improvement proposals reuse the optimizer analyze + proposal builders.
+      if (optImproveList || optImproveDetail) {
+        const result = this.runOptimizerForRequest(identity, url);
+        if (optImproveDetail) {
+          return buildProposalDetail(result, decodeURIComponent(optImproveDetail[1]), {
+            includePatch: url.searchParams.get('includePatch') === 'true',
+          });
+        }
+        return buildProposalsPage(result, {
+          lane: (url.searchParams.get('lane') as AgentRoleLane | null) ?? undefined,
+          kind: (url.searchParams.get('kind') as ContextOptimizerProposalKind | null) ?? undefined,
+          minTier: (url.searchParams.get('minTier') as BehaviorEvidenceTier | null) ?? undefined,
+          limit: this.intParam(url, 'limit'),
+          cursor: url.searchParams.get('cursor') ?? undefined,
+          includeUnverified: url.searchParams.get('includeUnverified') === 'true',
+        }, { route: IMPROVEMENT_ROUTE, levers: IMPROVEMENT_LEVERS });
+      }
+      // Skill usage (WP3).
+      if (optSkillUsageList || optSkillUsageDetail) {
+        const { usage, indexing } = this.runSkillUsageForRequest(identity, url);
+        if (optSkillUsageDetail) return buildSkillUsageDetail(usage, decodeURIComponent(optSkillUsageDetail[1]));
+        return buildSkillUsagePage(usage, {
+          limit: this.intParam(url, 'limit'),
+          cursor: url.searchParams.get('cursor') ?? undefined,
+        }, { indexing });
+      }
+      // Agent knowledge (WP4). Scope-mismatch (403) still throws; a missing/unknown
+      // agent is returned as an INVALID_ARGUMENT envelope, never a raw 500.
+      const roots = this.buildRedactionRoots(identity, url);
+      let graph: AgentKnowledgeGraph;
+      try {
+        graph = this.runAgentKnowledgeForRequest(identity, url);
+      } catch (err) {
+        const e = err as Error & { statusCode?: number };
+        if (e.statusCode === 403) throw e; // scope violation must not be masked
+        return errResponse({
+          code: 'INVALID_ARGUMENT',
+          message: e.message || 'agent-knowledge extraction failed',
+          retriable: false,
+        });
+      }
+      if (optKnowledgeDetail) return buildAgentKnowledgeDetail(graph, roots, decodeURIComponent(optKnowledgeDetail[1]));
+      return buildAgentKnowledgePage(graph, roots, {
+        limit: this.intParam(url, 'limit'),
+        cursor: url.searchParams.get('cursor') ?? undefined,
+      });
     }
 
     // GET /api/agents/:id/messages — read structured agent chat
@@ -774,6 +1127,42 @@ export class ApiServer {
       return { ok: true, agentId, state, source: sourceTag, result };
     }
 
+    // POST /api/agents/:id/codex-session — Layer A codex SessionStart-hook bind.
+    // The codex SessionStart hook carries codex's own session_id; this endpoint
+    // is the dedicated, authed surface that binds it env-direct (agentId from
+    // the URL, resolved from the hook's AGENT_ID launcher env — race-free under
+    // the shared-cwd invariant). Body: { sessionId: string }. The bind logic +
+    // null-guard live in supervisor.bindCodexSessionFromHook, which the /status
+    // multi-transport path also drives; this route maps its decision to HTTP.
+    const codexBindMatch = path.match(/^\/api\/agents\/([^/]+)\/codex-session$/);
+    if (method === 'POST' && codexBindMatch) {
+      const agentId = codexBindMatch[1];
+      const body = await readBody(req);
+      const parsed = JSON.parse(body);
+      const sessionId: unknown = parsed.sessionId;
+      const decision = this.supervisor.bindCodexSessionFromHook(
+        agentId,
+        typeof sessionId === 'string' ? sessionId : undefined,
+      );
+      if (decision.action === 'bind') {
+        return { ok: true, agentId, bound: true, sessionId: decision.sessionId };
+      }
+      // Ignore reasons → HTTP: unknown agent 404; wrong provider / sibling-owned
+      // sid 409 (conflict); empty sid 400. 'already-bound' is an idempotent
+      // no-op — 200 with bound:false so a retrying hook never sees an error.
+      if (decision.reason === 'already-bound') {
+        return { ok: true, agentId, bound: false, reason: decision.reason };
+      }
+      const statusCode =
+        decision.reason === 'unknown-agent' ? 404 :
+        decision.reason === 'empty-session-id' ? 400 :
+        409; // non-codex | session-owned-by-sibling
+      throw Object.assign(
+        new Error(`codex-session bind ignored: ${decision.reason}`),
+        { statusCode },
+      );
+    }
+
     // POST /api/agents — launch a new agent
     if (method === 'POST' && path === '/api/agents') {
       const body = await readBody(req);
@@ -797,12 +1186,41 @@ export class ApiServer {
       if (input && input.notify_owner !== undefined && input.notifyOwner === undefined) {
         input.notifyOwner = input.notify_owner;
       }
+      // Planning surface WP1: normalize the snake_case launch-rail plan binding
+      // (plan_id/plan_section) used by the launch_agent MCP tool / raw HTTP callers
+      // to the camelCase LaunchAgentInput fields the supervisor reads.
+      if (input && input.plan_id !== undefined && input.planId === undefined) {
+        input.planId = input.plan_id;
+      }
+      if (input && input.plan_section !== undefined && input.planSection === undefined) {
+        input.planSection = input.plan_section;
+      }
+      // Validate the plan binding before launch: an unknown plan_id is a 400 (a
+      // plans row must exist so agents.plan_id's FK resolves and the frozen stamp
+      // is meaningful). Empty/omitted planId is fine — the rail is optional.
+      if (input && input.planId !== undefined && input.planId !== null && input.planId !== '') {
+        if (typeof input.planId !== 'string' || getPlan(input.planId) === null) {
+          throw Object.assign(
+            new Error(`Unknown plan_id '${input.planId}' — a plan surface must exist before launching an agent bound to it`),
+            { statusCode: 400 },
+          );
+        }
+        // GT-C §O.2 — one-writer-per-plan guard on the named `launch_agent` (MCP)
+        // dispatch path (I-10). 409s on an active run, an actively-working plan-bound
+        // agent, or an in-flight trail materialization. Idle plan-bound agents do NOT
+        // reserve the plan (amended ownership model, §4.4), so keeping a seed worker
+        // idle across phases stays legal.
+        assertPlanRailFree(input.planId);
+      }
       // Inc 1 (B4 server side): self-scope launches. Asserted caller + no
       // workspaceId → fill from header; matching → ok; mismatch → 403. No header
       // + no workspaceId → unchanged (launchAgent enforces as before).
       const scopedWorkspaceId = this.resolveWorkspaceScope(identity, (input?.workspaceId as string) ?? null);
       if (scopedWorkspaceId) input.workspaceId = scopedWorkspaceId;
       const agent = await this.supervisor.launchAgent(input);
+      // Planning-surface P1: a plan-bound dispatch auto-subscribes the dispatching
+      // supervisor to that plan (best-effort; no-op for non-supervisor callers).
+      if (input && input.planId) this.autoFocusPlan(identity, input.planId as string);
       return agent;
     }
 
@@ -846,7 +1264,11 @@ export class ApiServer {
           { statusCode: 400 },
         );
       }
-      return this.orchestration!.start_run({ name, ...params });
+      const run = this.orchestration!.start_run({ name, ...params });
+      // Planning-surface P1: a plan-bound orchestration run auto-subscribes the
+      // dispatching supervisor to that plan (best-effort; no-op for non-supervisors).
+      if (params.planId) this.autoFocusPlan(identity, params.planId as string);
+      return run;
     }
 
     const orchOne = path.match(/^\/api\/orchestrations\/([^/]+)$/);
@@ -901,6 +1323,13 @@ export class ApiServer {
           terminal: ownedRows.filter(a => a.status === 'done' || a.status === 'crashed').length,
         },
       };
+      // Planning-surface P1: the plans this asserted supervisor is subscribed to
+      // (supervisor_focus → plans), most-recently-attended first, deleted plans
+      // excluded, capped at 10. This is the /clear-heal — a revived supervisor
+      // re-learns the surfaces it minted/dispatched. Header-less callers get NO
+      // `plans` key at all (consistent with supervisorId: null); only an asserted
+      // caller can be attributed a subscription.
+      const plans = identity.supervisorId ? getSupervisorFocusedPlans(identity.supervisorId, 10) : undefined;
       return {
         workspaceId,
         workspaceTitle: workspace.title,
@@ -911,6 +1340,7 @@ export class ApiServer {
           ? { id: supervisor.id, title: supervisor.title, provider: supervisor.provider, status: supervisor.status }
           : null,
         counts,
+        ...(plans ? { plans } : {}),
       };
     }
 
@@ -1149,19 +1579,11 @@ export class ApiServer {
         );
       }
 
-      // Gate 3 — owned-agent busy-blocklist (Inc 5 §5B): raw DB statuses
-      // launching|working|waiting|restarting block; crashed is non-blocking
-      // (its ids ride the attempt reason for triage); 'receiving' never
-      // appears in a raw row (projection-only) so it is not in this set.
+      // Owned-busy no longer blocks (Edward 2026-07-05): a continuation
+      // transfer is ALLOWED while owned agents work — their dashboard events
+      // queue by agent id and land in the successor session. Only the explicit
+      // in-flight guard below (Gate 4) still consults the owned set.
       const owned = getAgentsByOwner(agentId, { includeTerminal: false });
-      const busyBlocklist = new Set(['launching', 'working', 'waiting', 'restarting']);
-      const busy = owned.filter(a => busyBlocklist.has(a.status));
-      if (busy.length > 0) {
-        throw Object.assign(
-          new Error(`owned agents busy: ${busy.map(a => `${a.id}(${a.status})`).join(', ')}`),
-          { statusCode: 409, code: 'continuation-owned-busy' },
-        );
-      }
 
       // Gate 4 — explicit in-flight guard, separately from the status set:
       // catches a mid-delivery PTY for every owned agent AND :id itself (a
@@ -2102,8 +2524,449 @@ export class ApiServer {
       };
     }
 
+    // ── Plan routes (B2 P1-02) — rail-independent; NO header reads (R1) ──
+    // GET /api/plans?workspaceId=&includeDeleted=
+    if (method === 'GET' && path === '/api/plans') {
+      return getPlans({
+        workspaceId: url.searchParams.get('workspaceId') || undefined,
+        includeDeleted: url.searchParams.get('includeDeleted') === 'true',
+      });
+    }
+
+    // GET /api/plans/:id
+    const planGet = path.match(/^\/api\/plans\/([^/]+)$/);
+    if (method === 'GET' && planGet) {
+      const p = getPlan(planGet[1]);
+      if (!p) throw Object.assign(new Error('Plan not found'), { statusCode: 404 });
+      return p;
+    }
+
+    // POST /api/plans
+    //   Create branch (WP3, R1 F0): { workspace_id, title } + no `path` → mint a
+    //     new surface from DEFAULT_SURFACE_TEMPLATE (createPlanSurface).
+    //   Register branch (B2): { workspace_id, path, format, … } → register an
+    //     existing file. Rename stays PATCH-only.
+    if (method === 'POST' && path === '/api/plans') {
+      const b = JSON.parse(await readBody(req));
+      rejectMarkdownMigration(b); // F-F: markdown migration is deferred out of v1
+      if ('id' in b) throw Object.assign(new Error('id is server-generated; do not supply it'), { statusCode: 400 }); // R2
+      const workspaceId = pickBody<string>(b, 'workspace_id', 'workspaceId');
+
+      // Create branch: a title with no explicit file path mints a fresh surface.
+      const title = pickBody<string>(b, 'title', 'title');
+      if (title !== undefined && b.path === undefined) {
+        if (!workspaceId) throw Object.assign(new Error('Missing workspace_id'), { statusCode: 400 });
+        const created = createPlanSurface({ workspaceId, title }); // seedMarkdown intentionally not threaded (F-F)
+        // Planning-surface P1: auto-subscribe the creating supervisor so the freshly
+        // minted surface survives its /clear (best-effort; no-op for non-supervisors).
+        this.autoFocusPlan(identity, created.planId);
+        const plan = getPlan(created.planId);
+        return plan ?? created;
+      }
+
+      const relPath = normalizePlanPath(b.path);
+      const format = b.format;
+      if (!workspaceId || !format) throw Object.assign(new Error('Missing workspace_id or format'), { statusCode: 400 });
+      const ws = getWorkspace(workspaceId);
+      if (!ws) throw Object.assign(new Error('Workspace not found'), { statusCode: 404 });
+      let mtimeMs = coerceNum(pickBody(b, 'mtime_ms', 'mtimeMs'));
+      let sizeBytes = coerceNum(pickBody(b, 'size_bytes', 'sizeBytes'));
+      if (mtimeMs === undefined || sizeBytes === undefined) {           // DEC-2
+        const stat = await statPlanMeta(ws, relPath);
+        if (!stat) throw Object.assign(new Error('Cannot stat plan file; supply mtime_ms and size_bytes'), { statusCode: 400 });
+        mtimeMs ??= stat.mtimeMs; sizeBytes ??= stat.sizeBytes;
+      }
+      return createOrRevivePlan({
+        workspaceId, path: relPath, format,
+        slug: pickBody(b, 'slug', 'slug'), runState: pickBody(b, 'run_state', 'runState'),
+        mtimeMs, sizeBytes,
+      });
+    }
+
+    // PATCH /api/plans/:id  { run_state?, mtime_ms?, size_bytes?, format?, path?, slug? }
+    const planPatch = path.match(/^\/api\/plans\/([^/]+)$/);
+    if (method === 'PATCH' && planPatch) {
+      const b = JSON.parse(await readBody(req));
+      const updates: any = {
+        runState: pickBody(b, 'run_state', 'runState'), format: b.format,
+        mtimeMs: coerceNum(pickBody(b, 'mtime_ms', 'mtimeMs')),
+        sizeBytes: coerceNum(pickBody(b, 'size_bytes', 'sizeBytes')),
+        slug: pickBody(b, 'slug', 'slug'),
+      };
+      if (b.path !== undefined) {
+        updates.path = normalizePlanPath(b.path);                       // rename rebind
+        if (updates.slug === undefined) updates.slug = derivePlanSlug(updates.path); // DEC-4 recompute
+      }
+      const updated = updatePlan(planPatch[1], updates);               // may throw 409 (DEC-1)
+      if (!updated) throw Object.assign(new Error('Plan not found'), { statusCode: 404 });
+      return updated;
+    }
+
+    // DELETE /api/plans/:id  (soft)
+    const planDel = path.match(/^\/api\/plans\/([^/]+)$/);
+    if (method === 'DELETE' && planDel) {
+      const deleted = softDeletePlan(planDel[1]);
+      if (!deleted) throw Object.assign(new Error('Plan not found'), { statusCode: 404 });
+      return { ok: true, planId: deleted.id, deletedAt: deleted.deletedAt };
+    }
+
+    // ── Plan read ladder (WP3 — backs the mcp-tools-plans.js read tools) ──
+    // Every read handler records a `source:'handler'` breadcrumb BEFORE returning
+    // content (R2 §2.2); attribution is best-effort (never gates the content).
+
+    // GET /api/plans/:id/sections — list_plan_sections orientation (~200 tokens).
+    const planSectionsList = path.match(/^\/api\/plans\/([^/]+)\/sections$/);
+    if (method === 'GET' && planSectionsList) {
+      const resolved = await resolvePlanProjection(planSectionsList[1]);
+      if (!resolved) throw Object.assign(new Error('Plan not found'), { statusCode: 404 });
+      // One `'*'` orientation touch for the whole list (R2 §2.2), before content.
+      recordPlanReadBreadcrumb(req, resolved.plan.id, { sectionAnchor: '*', tool: 'list_plan_sections' });
+      this.bumpFocusOnRead(identity, resolved.plan.id); // P1-07: freshen an existing focus row
+      return listPlanSections(resolved.projection);
+    }
+
+    // GET /api/plans/:id/projection — read_plan_projection: trusted activity
+    // roll-up joined from plan_events, per live section.
+    const planProjection = path.match(/^\/api\/plans\/([^/]+)\/projection$/);
+    if (method === 'GET' && planProjection) {
+      const resolved = await resolvePlanProjection(planProjection[1]);
+      if (!resolved) throw Object.assign(new Error('Plan not found'), { statusCode: 404 });
+      recordPlanReadBreadcrumb(req, resolved.plan.id, { sectionAnchor: '*', tool: 'read_plan_projection' });
+      this.bumpFocusOnRead(identity, resolved.plan.id); // P1-07: freshen an existing focus row
+      const includeEvents = url.searchParams.get('events') === 'full';
+      const eventsLimit = queryNum(url.searchParams, 'events_limit');       // reuse I-5 helper
+      const eventsSectionAnchor = url.searchParams.get('section_anchor') || undefined;
+      const eventDetailId = url.searchParams.get('event_detail_id') || undefined;  // Fix-4 Tier-3
+      return buildPlanActivityProjection(resolved.plan.id, resolved.projection,
+        { includeEvents, eventsLimit, eventsSectionAnchor, eventDetailId });
+    }
+
+    // GET /api/plans/:id/sections/:anchor?mode=&offset=&limit= — read_plan_section.
+    const planSectionRead = path.match(/^\/api\/plans\/([^/]+)\/sections\/([^/]+)$/);
+    if (method === 'GET' && planSectionRead) {
+      const anchor = decodeURIComponent(planSectionRead[2]);
+      const resolved = await resolvePlanProjection(planSectionRead[1]);
+      if (!resolved) throw Object.assign(new Error('Plan not found'), { statusCode: 404 });
+      this.bumpFocusOnRead(identity, resolved.plan.id); // P1-07: freshen an existing focus row
+      const mode = (url.searchParams.get('mode') || undefined) as ReadMode | undefined;
+      const offset = queryNum(url.searchParams, 'offset');
+      const limit = queryNum(url.searchParams, 'limit');
+      const result = readPlanSection(resolved.projection, anchor, { mode, offset, limit });
+      // Breadcrumb BEFORE returning content — record the RESOLVED anchor (section
+      // vs block) so a `blk_` read is attributed to its owning section.
+      if (result.found) {
+        const sectionAnchor = result.kind === 'block' ? sectionAnchorOfBlock(resolved.projection, anchor) : anchor;
+        recordPlanReadBreadcrumb(req, resolved.plan.id, {
+          sectionAnchor: sectionAnchor ?? anchor,
+          blockAnchor: result.kind === 'block' ? anchor : null,
+          tool: 'read_plan_section', readMode: result.mode,
+        });
+      }
+      return result;
+    }
+
+    // ── Supervisor-focus routes (B2 P1-03) — explicit supervisor_id; NO ACL (R1/R4) ──
+    // GET /api/supervisor-focus?supervisorId=&workspaceId=
+    if (method === 'GET' && path === '/api/supervisor-focus') {
+      return getSupervisorFocus({
+        supervisorId: url.searchParams.get('supervisorId') || undefined,
+        workspaceId: url.searchParams.get('workspaceId') || undefined,
+      });
+    }
+
+    // POST /api/supervisor-focus  { supervisor_id|supervisorId, plan_id|planId, notes? }
+    if (method === 'POST' && path === '/api/supervisor-focus') {
+      const b = JSON.parse(await readBody(req));
+      const supervisorId = pickBody<string>(b, 'supervisor_id', 'supervisorId');
+      const planId = pickBody<string>(b, 'plan_id', 'planId');
+      if (!supervisorId || !planId) throw Object.assign(new Error('Missing supervisor_id or plan_id'), { statusCode: 400 });
+      if (!getAgent(supervisorId)) throw Object.assign(new Error('Supervisor agent not found'), { statusCode: 404 });
+      if (!getPlan(planId)) throw Object.assign(new Error('Plan not found'), { statusCode: 404 });
+      return upsertSupervisorFocus({ supervisorId, planId, notes: pickBody(b, 'notes', 'notes') }); // DEC-3 full row
+    }
+
+    // ── Identity-scoped focus (planning-surface P1) — the calling supervisor
+    //    subscribes/unsubscribes ITSELF (focus_plan / unfocus_plan MCP tools). The
+    //    supervisor is derived from the validated X-Supervisor-Id, never a body/path
+    //    param, so an agent can never focus on another supervisor's behalf. A
+    //    non-supervisor caller (no identity.supervisorId) is rejected — this is the
+    //    server-side gate behind the supervisor-only `plans` toolset.
+
+    // POST /api/supervisor-focus/self  { plan_id|planId, notes? }
+    if (method === 'POST' && path === '/api/supervisor-focus/self') {
+      if (!identity.supervisorId) {
+        throw Object.assign(new Error('supervisor identity required to focus a plan (send X-Supervisor-Id header)'),
+          { statusCode: 403, code: 'not-a-supervisor' });
+      }
+      const b = JSON.parse(await readBody(req));
+      const planId = pickBody<string>(b, 'plan_id', 'planId');
+      if (!planId) throw Object.assign(new Error('Missing plan_id'), { statusCode: 400 });
+      if (!getPlan(planId)) throw Object.assign(new Error('Plan not found'), { statusCode: 404 });
+      return upsertSupervisorFocus({ supervisorId: identity.supervisorId, planId, notes: pickBody(b, 'notes', 'notes') });
+    }
+
+    // DELETE /api/supervisor-focus/self/:plan_id — matched BEFORE the generic
+    // :supervisor_id/:plan_id delete so the literal "self" is never captured as a
+    // supervisor id.
+    const focusSelfDel = path.match(/^\/api\/supervisor-focus\/self\/([^/]+)$/);
+    if (method === 'DELETE' && focusSelfDel) {
+      if (!identity.supervisorId) {
+        throw Object.assign(new Error('supervisor identity required to unfocus a plan (send X-Supervisor-Id header)'),
+          { statusCode: 403, code: 'not-a-supervisor' });
+      }
+      const planId = decodeURIComponent(focusSelfDel[1]);
+      deleteSupervisorFocus(identity.supervisorId, planId);
+      return { ok: true, supervisorId: identity.supervisorId, planId };
+    }
+
+    // DELETE /api/supervisor-focus/:supervisor_id/:plan_id
+    const focusDel = path.match(/^\/api\/supervisor-focus\/([^/]+)\/([^/]+)$/);
+    if (method === 'DELETE' && focusDel) {
+      deleteSupervisorFocus(decodeURIComponent(focusDel[1]), decodeURIComponent(focusDel[2]));
+      return { ok: true, supervisorId: decodeURIComponent(focusDel[1]), planId: decodeURIComponent(focusDel[2]) };
+    }
+
     throw Object.assign(new Error(`Not found: ${method} ${path}`), { statusCode: 404 });
   }
+}
+
+// ── B2 plan-route helpers (P1-02) ──────────────────────────────────────────────
+
+/** Normalizes a plan path: '\'→'/', rejects absolute / '..' segments, requires a
+ *  leading 'plans/' segment. Throws {statusCode:400} otherwise. */
+function normalizePlanPath(raw: unknown): string {
+  if (typeof raw !== 'string' || !raw.trim()) {
+    throw Object.assign(new Error('path is required'), { statusCode: 400 });
+  }
+  const norm = raw.replace(/\\/g, '/').replace(/^\.\//, '');
+  if (/^([a-zA-Z]:\/|\/)/.test(norm)) {
+    throw Object.assign(new Error('path must be workspace-relative, not absolute'), { statusCode: 400 });
+  }
+  const segments = norm.split('/');
+  if (segments.some(s => s === '..')) {
+    throw Object.assign(new Error("path must not contain '..' segments"), { statusCode: 400 });
+  }
+  if (segments[0] !== 'plans') {
+    throw Object.assign(new Error("path must be under the 'plans/' directory"), { statusCode: 400 });
+  }
+  return norm;
+}
+
+/** Number passthrough; undefined when absent/non-numeric (DEC-6 casing handled by pickBody). */
+function coerceNum(v: unknown): number | undefined {
+  return typeof v === 'number' && Number.isFinite(v) ? v : undefined;
+}
+
+/** Parse a numeric query param; undefined when absent/empty/non-finite. Distinct
+ *  from coerceNum(Number(param)) which turns a MISSING param into 0
+ *  (Number(null)===0) and silently windows a section to empty (I-5). */
+export function queryNum(params: URLSearchParams, name: string): number | undefined {
+  const raw = params.get(name);
+  if (raw === null || raw.trim() === '') return undefined;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+/** F-F: markdown→zones migration is DEFERRED out of v1. The create/register
+ *  boundary must REJECT any markdown-migration input rather than 200-with-silent
+ *  ignore (which would fabricate migration success). `seedMarkdown` is inert in
+ *  `createPlanSurface`, but the boundary never advertises or accepts it. */
+const MARKDOWN_MIGRATION_FIELDS = [
+  'seed_markdown', 'seedMarkdown', 'markdown',
+  'migrate', 'migrate_from', 'migrateFrom', 'migrate_md', 'migrateMd',
+];
+function rejectMarkdownMigration(b: any): void {
+  if (b == null || typeof b !== 'object') return;
+  for (const f of MARKDOWN_MIGRATION_FIELDS) {
+    if (b[f] !== undefined) {
+      throw Object.assign(
+        new Error('markdown migration is not supported in v1 (deferred)'),
+        { statusCode: 400 },
+      );
+    }
+  }
+}
+
+/** Join a workspace-relative `plans/…` path onto the workspace root (host sep). */
+function absPlanPath(ws: Workspace, relPath: string): string {
+  const sep = ws.pathType === 'wsl' ? '/' : (ws.path.includes('\\') ? '\\' : '/');
+  const base = ws.path.replace(/[\\/]+$/, '');
+  return `${base}${sep}${relPath.replace(/\//g, sep)}`;
+}
+
+/** Resolve the projection a read tool serves for a plan (WP3). Prefers WP4's
+ *  in-memory last-good projection; falls back to reading + parsing the file on
+ *  disk (the reparser may not have run yet — e.g. right after create, or in
+ *  tests where it is unconfigured). Returns null for a missing/deleted plan. */
+export async function resolvePlanProjection(planId: string): Promise<{ plan: import('../shared/types').Plan; projection: PlanProjection } | null> {
+  const plan = getPlan(planId);
+  if (!plan || plan.deletedAt) return null;
+  const served = getServedPlanProjection(planId);
+  if (served) return { plan, projection: served };
+  const ws = getWorkspace(plan.workspaceId);
+  if (!ws) return { plan, projection: { sections: [], parseError: 'workspace not found', warnings: [], source: '' } };
+  try {
+    const fc = await readFileContents(absPlanPath(ws, plan.path), ws.pathType);
+    if (fc.error || typeof fc.content !== 'string') {
+      return { plan, projection: { sections: [], parseError: fc.error ?? 'no content', warnings: [], source: '' } };
+    }
+    return { plan, projection: parsePlanHtmlSafe(fc.content) };
+  } catch (err) {
+    return { plan, projection: { sections: [], parseError: err instanceof Error ? err.message : String(err), warnings: [], source: '' } };
+  }
+}
+
+/** The owning section anchor of a `blk_` block within a projection (else null). */
+function sectionAnchorOfBlock(projection: PlanProjection, blockAnchor: string): string | null {
+  for (const s of projection.sections) {
+    if (s.blocks.some((blk) => blk.anchor === blockAnchor)) return s.anchor;
+  }
+  return null;
+}
+
+/** Record a `source:'handler'` read breadcrumb BEFORE returning content (R2
+ *  §2.2). The calling agent is the forwarded `X-Self-Id` (workers) falling back
+ *  to `X-Supervisor-Id`. Tolerant: never throws, never gates the read. */
+function recordPlanReadBreadcrumb(
+  req: http.IncomingMessage,
+  planId: string,
+  args: { sectionAnchor: string; blockAnchor?: string | null; tool: string; readMode?: string | null },
+): void {
+  try {
+    const hdr = (name: string): string | null => {
+      const v = req.headers[name];
+      return typeof v === 'string' && v.length > 0 ? v : null;
+    };
+    const agentId = hdr('x-self-id') ?? hdr('x-supervisor-id');
+    if (!agentId) return; // no attributable caller → skip (best-effort provenance)
+    recordPlanSectionTouch({
+      agentId, planId,
+      sectionAnchor: args.sectionAnchor,
+      blockAnchor: args.blockAnchor ?? null,
+      tool: args.tool, kind: 'read',
+      readMode: args.readMode ?? null,
+      source: 'handler',
+      toolUseId: hdr('x-tool-use-id'),
+    });
+  } catch { /* provenance is best-effort — never fail the read (R2 §0) */ }
+}
+
+/** read_plan_projection payload: each live section's structure + its trusted
+ *  `plan_events` activity roll-up (count + last event). With
+ *  `opts.includeEvents`, also attach the per-event trusted rows (WP5 tier-2:
+ *  observed_via / attribution_confidence / section_mismatch + the kept-separate
+ *  claimed self-report) so the render surface can show the trusted/claimed
+ *  split. Omitted by default to keep the tier-1 orient payload small (C7). */
+export function buildPlanActivityProjection(
+  planId: string,
+  projection: PlanProjection,
+  opts?: { includeEvents?: boolean; eventsLimit?: number; eventsSectionAnchor?: string; eventDetailId?: string },
+) {
+  const rollup = new Map(getPlanEventRollup(planId).map((r) => [r.sectionAnchor, r]));
+  const archived = new Set(
+    getPlanSections(planId, { includeArchived: true })
+      .filter((s) => s.archivedAt)
+      .map((s) => s.anchor),
+  );
+  const sections = projection.sections.map((s) => {
+    const act = s.anchor ? rollup.get(s.anchor) : undefined;
+    return {
+      anchor: s.anchor,
+      zone: s.zone,
+      heading: s.heading,
+      tokenEstimate: s.tokenEstimate,
+      archived: s.anchor ? archived.has(s.anchor) : false,
+      // GT-A WP-A2.3 — surface the write/presence split from the reshaped rollup
+      // (D-4/D-6). eventCount/lastEventAt kept for back-compat; no route change.
+      writeCount: act?.writeCount ?? 0,
+      presenceCount: act?.presenceCount ?? 0,
+      lastWriteAt: act?.lastWriteAt ?? null,
+      eventCount: act?.eventCount ?? 0,
+      lastEventAt: act?.lastEventAt ?? null,
+      // Fix-4 §4a — witnessed repo rollup fields (the section literal is
+      // UNANNOTATED, so these must be added deliberately). tests*/lastCommit are
+      // inert in cut 1 (no capture) but present so the DTO shape is stable.
+      repoFilesRead: act?.repoFilesRead ?? 0,
+      repoFilesEdited: act?.repoFilesEdited ?? 0,
+      repoFilesCreated: act?.repoFilesCreated ?? 0,
+      testsRun: act?.testsRun ?? 0,
+      testsPassed: act?.testsPassed ?? 0,
+      testsFailed: act?.testsFailed ?? 0,
+      lastCommit: act?.lastCommit ?? null,
+    };
+  });
+  // I-7 — events are opt-in and BOUNDED. A cap (eventsLimit) or a section filter
+  // (eventsSectionAnchor) attaches eventsTruncated/eventsOmitted metadata; a bare
+  // ?events=full (no cap, no filter) stays byte-identical to the pre-I-7 payload
+  // so the dashboard rail is unaffected.
+  let eventsOut = opts?.includeEvents ? getPlanEventsForRender(planId) : undefined;
+  const bounded = opts?.eventsLimit !== undefined || !!opts?.eventsSectionAnchor;
+  let eventsTruncated = false, eventsOmitted = 0;
+  if (eventsOut) {
+    if (opts?.eventsSectionAnchor) {
+      const a = opts.eventsSectionAnchor;
+      // P0 Fix-1 (planning-surface-hardening-review) — section-scoped membership is
+      // an EFFECT-SET / DISPATCHED-fact predicate ONLY. `claimedSectionAnchor` is an
+      // untrusted, agent-supplied value; admitting it here let a forged sentinel
+      // select an event into a section's "trusted" projection. It is deliberately
+      // excluded, with NO replacement diagnostics filter in this pass.
+      eventsOut = eventsOut.filter((e) =>
+        e.observedSectionAnchor === a || e.dispatchedSectionAnchor === a);
+    }
+    if (opts?.eventsLimit !== undefined) {
+      const lim = Math.max(0, Math.floor(opts.eventsLimit)); // clamp: non-negative integer
+      if (eventsOut.length > lim) {
+        eventsOmitted = eventsOut.length - lim;
+        eventsOut = eventsOut.slice(eventsOut.length - lim);  // keep the latest N; rows stay oldest-first
+        eventsTruncated = true;
+      }
+    }
+  }
+  // Fix-4 §4a — Tier-2 strip: map events into a SEPARATE typed payload so the heavy
+  // `repoActivity` blob NEVER rides the wire (dropped here) and each event instead
+  // carries a counts-only `repoActivityDigest`. Tier-2 events carrying a digest is
+  // the fix itself — the payload is NOT byte-identical to pre-fix-4; no test asserts
+  // it is. The events_limit/section_anchor bounded-metadata behavior is unchanged.
+  const eventsPayload: PlanActivityEvent[] | undefined = eventsOut?.map((e) => {
+    const { repoActivity, ...rest } = e;
+    return { ...rest, repoActivityDigest: toTier2Digest(repoActivity ?? null) };
+  });
+  // Fix-4 §4a — Tier-3 drill-down: one event's capped witnessed file list, fetched
+  // ONLY when event_detail_id was requested. `plan_id` in the DB WHERE prevents
+  // cross-plan id probing; a bad/foreign id yields `null` (not an error).
+  let eventDetail: RepoActivityDetail | null = null;
+  if (opts?.eventDetailId) {
+    const ev = getPlanEventRepoActivity(planId, opts.eventDetailId);
+    eventDetail = ev ? toTier3Detail(opts.eventDetailId, ev) : null;
+  }
+  return {
+    planId, sections, parseError: projection.parseError, warnings: projection.warnings,
+    events: eventsPayload,
+    // metadata ONLY when a cap/filter was requested → bare ?events=full stays byte-identical
+    ...(eventsPayload && bounded ? { eventsTruncated, eventsOmitted } : {}),
+    // eventDetail key present ONLY when a drill-down was requested (opt-in cost).
+    ...(opts?.eventDetailId ? { eventDetail } : {}),
+  };
+}
+
+/** Best-effort file stat for DEC-2 metadata fill. Windows: statSync(join(ws.path, rel)).
+ *  WSL: skip → null (the watcher supplies real values; the POST caller must pass them). */
+async function statPlanMeta(ws: Workspace, relPath: string): Promise<{ mtimeMs: number; sizeBytes: number } | null> {
+  if (ws.pathType !== 'windows') return null;
+  try {
+    const stat = fs.statSync(nodePath.join(ws.path, relPath));
+    return { mtimeMs: stat.mtimeMs, sizeBytes: stat.size };
+  } catch {
+    return null;
+  }
+}
+
+/** DEC-6 alias tolerance: snake_case is canonical, camelCase accepted. */
+function pickBody<T>(b: any, snake: string, camel: string): T | undefined {
+  if (b == null) return undefined;
+  if (b[snake] !== undefined) return b[snake] as T;
+  if (b[camel] !== undefined) return b[camel] as T;
+  return undefined;
 }
 
 function readBody(req: http.IncomingMessage): Promise<string> {

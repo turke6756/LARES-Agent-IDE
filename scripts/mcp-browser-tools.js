@@ -35,6 +35,22 @@ const ACTIONS_TOGGLE_NOTE =
   'dashboard; while the toggle is off the call returns a policy error explaining that — relay ' +
   'it to the human instead of retrying.';
 
+// Signed-in-site semantics (BrowserSigninSharing §D). A page-producing browser
+// call against a login-gated origin may return the signin envelope
+// ({ ok:false, status, origin, message }) INSTEAD of page content — read status:
+// pending_signin = a human is signing in now, WAIT/poll browser_list_my_access_requests
+// and retry the SAME call (do not treat the site as blocked, do not read the
+// logged-out page as the answer); signin_unavailable = blocked until a human
+// re-arms it (stop retrying, tell the human). A guest / logged-out view is NEVER
+// authenticated success — report it as an auth-verification failure.
+const SIGNIN_NOTE =
+  'If this returns a signin envelope ({ ok:false, status, origin, message }) instead of the page: ' +
+  'status "pending_signin" means a human is signing in — WAIT, poll ' +
+  'browser_list_my_access_requests, then retry this same call (do NOT treat the site as blocked ' +
+  'or read the logged-out page as your answer); status "signin_unavailable" means blocked until a ' +
+  'human re-arms sign-in (stop retrying and tell the human). A guest/logged-out view is NEVER ' +
+  'authenticated success — report it as an auth-verification failure.';
+
 function getBrowserToolDefinitions() {
   return [
     {
@@ -49,7 +65,7 @@ function getBrowserToolDefinitions() {
         'does NOT require the browser-actions toggle. (2) default (agent mode) — navigates a ' +
         'tab in YOUR agent partition for the read/click tools below. ' + ACTIONS_TOGGLE_NOTE + ' ' +
         'Both modes are scheme- and SSRF-checked (http/https only; control ports and metadata ' +
-        'IPs are refused). ' + UNTRUSTED_NOTE,
+        'IPs are refused). ' + SIGNIN_NOTE + ' ' + UNTRUSTED_NOTE,
       inputSchema: {
         type: 'object',
         properties: {
@@ -348,7 +364,13 @@ function imageContentFromBase64Png(base64Png) {
  *  an MCP text block that JSON-prints the WHOLE envelope so the researcher reads
  *  `status` / `origin` / `requestId` / `message` and decides wait vs degrade.
  *  This is a NORMAL result, not an error — do NOT raise isError. Returns null
- *  when `r` is not an envelope (the caller formats the normal content). */
+ *  when `r` is not an envelope (the caller formats the normal content).
+ *
+ *  The text is EXACTLY the JSON envelope (callers/tests JSON.parse it whole), so
+ *  the wait/poll-vs-blocked contract is carried by the envelope's own `status` +
+ *  `message` and by the tool descriptions (SIGNIN_NOTE), not by wrapping prose
+ *  here — `pending_signin` = wait/poll + retry the same call; `signin_unavailable`
+ *  = blocked on a human re-arm; a guest view is never authenticated success. */
 function signinEnvelopeResult(r) {
   if (r && typeof r === 'object' && r.ok === false) {
     return { content: [{ type: 'text', text: JSON.stringify(r, null, 2) }] };

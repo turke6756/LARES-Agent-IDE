@@ -377,6 +377,30 @@ export interface AccessHandoffResult {
   tabId: string;
 }
 
+/** BrowserSigninSharing plan §D Phase 2: result of the "Import my session" IPC.
+ *  A cookie copy is a CANDIDATE first step of setup — NOT proof of a signed-in
+ *  session (locked decision Q3). `candidateCookiesCopied` is the number of
+ *  persist:user cookies copied into the workspace agent partition; it NEVER
+ *  upserts an active/verified grant on its own. `origin` is the rule's origin. */
+export interface ImportUserSessionResult {
+  candidateCookiesCopied: number;
+  origin: string;
+}
+
+/** BrowserSigninSharing plan §D Phase 2: how a completed sign-in setup was
+ *  verified. `'probed'` = a safe adapter probe confirmed the setup tab returned
+ *  to the approved service origin on an authenticated (non-login-wall) page →
+ *  the UI may say "Verified". `'confirmed'` = no safe probe for this site, so
+ *  completion is the human's attestation → the UI must say "You confirmed this
+ *  session", never "Verified automatically". */
+export type SigninSetupVerification = 'probed' | 'confirmed';
+
+/** Result of access-handoff-ready (§12-A step 4) — additive Phase 2 return
+ *  (previously void; older callers that ignore it are unaffected). */
+export interface SigninHandoffReadyResult {
+  verification: SigninSetupVerification;
+}
+
 // ── Signed-in tabs (on-demand user sign-in for research agents) ──────────────
 // The third lifecycle state for an `allow_signed_in` origin. `pending_signin` /
 // `signin_unavailable` are NORMAL structured results — NOT a PolicyError / 403:
@@ -475,6 +499,24 @@ export interface SignedInOrigin {
   stale: boolean;
 }
 
+/** Phase 1 (BrowserSigninSharing plan §D — workspace-exact login grants): the
+ *  DURABLE human consent for a login grant, tracked SEPARATELY from the runtime
+ *  session below. `'granted'` = the human authorized agents to use their login
+ *  for this (rule, workspace, origin); `'setup_required'` = consent is recorded
+ *  but setup/verification has not (re)established a session in this workspace yet
+ *  (also the state an upgrade migration parks legacy null-workspace grants in —
+ *  old credentials are NEVER silently claimed as migrated). */
+export type LoginGrantConsentState = 'setup_required' | 'granted';
+
+/** Phase 1: the RUNTIME session state of a workspace-exact login grant. A grant
+ *  is usable (`'active'`) ONLY in the workspace whose agent partition
+ *  (persist:agent:<workspaceId>) actually holds its credentials — a grant
+ *  established in workspace A is never `'active'` for workspace B (locked
+ *  decision Q2). `'setup_required'` = consent exists but no verified session in
+ *  THIS workspace; `'expired'` = a login-wall / 401 was detected (consent
+ *  preserved, re-auth required). */
+export type LoginGrantSessionState = 'setup_required' | 'active' | 'expired';
+
 /** A live tab currently handed to / drivable by an agent (Mechanism B), for the
  *  "Sessions shared with agents" center. Runtime only (never persisted). */
 export interface HandedTabInfo {
@@ -489,6 +531,26 @@ export interface HandedTabInfo {
 export interface SharedAgentSessions {
   handedTabs: HandedTabInfo[];
   signedInOrigins: SignedInOrigin[];
+}
+
+/** Phase 3 (BrowserSigninSharing plan §D line 259/264): the READ-ONLY per-rule
+ *  visit + login status for ONE allowlist row, scoped to the SELECTED workspace.
+ *  Lets the renderer label each row with the combined vocabulary (Visit allowed /
+ *  Login off / Setup required / Ready / Needs sign-in) WITHOUT a second lookup.
+ *  `session` is sourced from the WORKSPACE-EXACT login grant
+ *  (getLoginGrantSessionState for this workspace) — NEVER a bare legacy
+ *  signed-in-origins row (line 264: "Never show Ready solely from a database
+ *  row"). `'none'` = login off OR no grant row exists in this workspace. */
+export interface AccessSiteStatus {
+  ruleId: string;
+  /** Canonical origin the status keys on (scheme `any` → https). */
+  origin: string;
+  /** An enabled visit rule exists → the agent may navigate here ("Visit allowed"). */
+  visit: boolean;
+  /** The rule grants allow_signed_in (login sharing is ON for this row). */
+  login: boolean;
+  /** Workspace-exact grant runtime state, or `'none'` when login is off / no grant. */
+  session: LoginGrantSessionState | 'none';
 }
 
 /** Event payload: a handed tab was auto-revoked because it navigated off its
@@ -742,6 +804,10 @@ export const BROWSER_CHANNELS = {
   accessRuleRemove: 'browser:access-rule-remove',
   /** event main→renderer (no payload) — rules changed; renderer refetches */
   accessChanged: 'browser:access-changed',
+  /** Phase 3 (§D line 264): () → AccessSiteStatus[] — READ-ONLY per-rule visit +
+   *  login status for the SELECTED workspace, sourced from the workspace-exact
+   *  login grant (never a bare legacy row). Trusted chrome only. */
+  accessSiteStatus: 'browser:access-site-status',
 
   // Agent-initiated access requests (§18.5). Renderer = trusted chrome only.
   /** () → AccessRequest[] (pending + recent) */
@@ -785,6 +851,12 @@ export const BROWSER_CHANNELS = {
    *  unavailable, close the quarantined tab, emit resolved. Does NOT clear the
    *  rule's durable consent (consent_acked_at stays). Trusted-chrome only. */
   signinPendingCancel: 'browser:signin-pending-cancel',
+  /** Phase 4 (§D line 275): (workspaceId: string | null, origin: string) →
+   *  boolean — explicit human re-arm/retry of a run-scoped `signin_unavailable`
+   *  latch for one (workspace, origin), so the next agent nav opens a fresh setup
+   *  tab. Only clears an `unavailable` session; never disturbs pending/ready.
+   *  Trusted-chrome only; durable consent untouched. */
+  signinReArm: 'browser:signin-re-arm',
 
   // ── Signed-in tabs (WI-8): JIT sign-in config (timeout + unattended flag) ───
   // Trusted-chrome only. The hold timeout drives the WI-3 degrade timer; the

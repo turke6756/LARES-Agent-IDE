@@ -8,6 +8,7 @@ import {
   agentSignedInRuleForUrl,
   type AccessRequest,
   type AccessRule,
+  type AccessSiteStatus,
 } from './browser-store';
 
 // Renderer-lane acceptance for the SIMPLIFIED website-access policy
@@ -356,6 +357,28 @@ describe('Slice-4: per-workspace access scoping', () => {
     expect(api.setActiveWorkspace).toHaveBeenCalledWith('ws-2');
     expect(api.access.list).toHaveBeenCalled();
     expect(api.access.requestList).toHaveBeenCalled();
+  });
+});
+
+describe('loadSiteStatus (Phase 3 workspace-exact status seam)', () => {
+  it('is a safe no-op when the siteStatus channel is absent (guarded prime)', async () => {
+    // makeAccessMock has NO siteStatus — the action must guard on
+    // api?.access?.siteStatus and leave store.siteStatus untouched (an unguarded
+    // call would crash the bridge prime against an older/stubbed preload).
+    expect((api.access as Record<string, unknown>).siteStatus).toBeUndefined();
+    useBrowserStore.setState({ siteStatus: [] });
+    await useBrowserStore.getState().loadSiteStatus();
+    expect(useBrowserStore.getState().siteStatus).toEqual([]);
+  });
+
+  it('populates store.siteStatus from the channel when the preload exposes it', async () => {
+    const rows: AccessSiteStatus[] = [
+      { ruleId: 'r1', origin: 'https://github.com', visit: true, login: true, session: 'active' },
+    ];
+    (api.access as Record<string, unknown>).siteStatus = vi.fn(async () => rows);
+    useBrowserStore.setState({ siteStatus: [] });
+    await useBrowserStore.getState().loadSiteStatus();
+    expect(useBrowserStore.getState().siteStatus).toEqual(rows);
   });
 });
 

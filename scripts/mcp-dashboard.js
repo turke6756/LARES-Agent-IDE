@@ -132,11 +132,48 @@ const TOOLSET_REGISTRY = {
       handleToolCall: mod.handleCommsToolCall,
     };
   },
+  // WP-F (P5): observability split into `observability-core` (operational status,
+  // granted to the supervisor + worker lanes) and `observability-analytics` (the
+  // context-optimizer / agent-knowledge / file-heat / skill-usage deep-analytics
+  // surface, supervisor-only). `observability` stays as a backward-compat alias
+  // for the full union so any grant still naming it keeps working (QW1 precedent:
+  // reversible, one-line).
+  'observability-core': () => {
+    const mod = require('./mcp-tools-observability');
+    return {
+      getToolDefinitions: mod.getObservabilityCoreToolDefinitions,
+      handleToolCall: mod.handleObservabilityCoreToolCall,
+    };
+  },
+  'observability-analytics': () => {
+    const mod = require('./mcp-tools-observability');
+    return {
+      getToolDefinitions: mod.getObservabilityAnalyticsToolDefinitions,
+      handleToolCall: mod.handleObservabilityAnalyticsToolCall,
+    };
+  },
   observability: () => {
     const mod = require('./mcp-tools-observability');
     return {
       getToolDefinitions: mod.getObservabilityToolDefinitions,
       handleToolCall: mod.handleObservabilityToolCall,
+    };
+  },
+  plans: () => {
+    const mod = require('./mcp-tools-plans');
+    return {
+      getToolDefinitions: mod.getPlansToolDefinitions,
+      handleToolCall: mod.handlePlansToolCall,
+    };
+  },
+  // WP-A4 (GT-A I-1 / D-1): read-only plans subset for the worker lane — the
+  // three read tools, no create_plan. Advertised via getPlansReadToolDefinitions;
+  // handlePlansReadToolCall errors on create_plan belt-and-suspenders.
+  'plans-read': () => {
+    const mod = require('./mcp-tools-plans');
+    return {
+      getToolDefinitions: mod.getPlansReadToolDefinitions,
+      handleToolCall: mod.handlePlansReadToolCall,
     };
   },
   notebooks: () => {

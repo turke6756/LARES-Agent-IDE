@@ -10,10 +10,12 @@ import {
   OrchestrationDescriptor, OrchestrationRunContext, OrchestrationRunner,
 } from './types';
 import {
-  getWorkspace,
+  getWorkspace, getPlan,
   insertOrchestration, updateOrchestration, getOrchestrationRun, listOrchestrationRuns,
   insertOrchestrationEvent, insertOrchestrationMember, markActiveRunsAborted,
 } from '../database';
+import { assertPlanRailFree } from './plan-ownership';
+import { trailMaterializer } from '../plans/execution-trail-writer';
 
 const READY_STATUSES = new Set(['idle', 'waiting']);
 
@@ -109,7 +111,31 @@ export class OrchestrationService extends EventEmitter {
     } else {
       const ws = getWorkspace(req.workspaceId);
       if (!ws) throw httpErr(404, 'Workspace not found');
-      const planRel = req.planPath || 'plans/new-plan.md';
+      // WP6 §D-WRITE-POLICY / GT-C §O.2 — one active writer per plan file, enforced
+      // AT DISPATCH through the SHARED `assertPlanRailFree` guard (so this path and
+      // `POST /api/agents` cannot drift). A second groupthink targeting a plan that
+      // already has a live (starting/running) run — or an actively-working plan-bound
+      // agent, or an in-flight trail materialization — is REJECTED 409 rather than
+      // queued (v1 choice): two concurrent deliberations editing the same surface
+      // would race the native writeback with no safe auto-merge. Resume re-arms the
+      // SAME writer (not a second one) and lives in the ELSE branch, so it never
+      // reaches this fresh-run guard.
+      if (req.planId) {
+        assertPlanRailFree(req.planId);
+      }
+      // WP6 / planning-surface demo fix (2026-07-06): a plan-rail run (planId
+      // set) edits an EXISTING plan surface, so its planPath MUST be that plan
+      // row's real `path` — not the legacy `plans/new-plan.md` default. The
+      // acceptance demo shipped the default into the rail Lead's termination
+      // instructions and the groupthink.complete message (both derive from
+      // run.planPath), forcing the Lead to self-correct; a sloppier model would
+      // have written a stray file. Resolve the row here so every downstream
+      // consumer (writebackClause, prompt mentions, completion event) is honest.
+      let planRel = req.planPath || 'plans/new-plan.md';
+      if (req.planId) {
+        const planRow = getPlan(req.planId);
+        if (planRow?.path) planRel = planRow.path;
+      }
       run = {
         runId: uuidv4().slice(0, 8),
         name: 'groupthink',
@@ -119,6 +145,8 @@ export class OrchestrationService extends EventEmitter {
         supervisorId: req.supervisorId,
         topic: req.topic || 'Research and plan a feature.',
         planPath: path.isAbsolute(planRel) ? planRel : path.join(ws.path, planRel),
+        planId: req.planId,
+        sectionAnchor: req.sectionAnchor,
         leadProvider: req.leadProvider || 'claude',
         reviewerProvider: req.reviewerProvider || 'codex',
         turnTimeoutMs: req.turnTimeoutMs && req.turnTimeoutMs > 0 ? req.turnTimeoutMs : 600000,
@@ -132,7 +160,10 @@ export class OrchestrationService extends EventEmitter {
       // failed archive throws here, refusing the start before any run row exists.
       // Gated on all three resume signals — resumeLeadId/resumeReviewerId can be
       // set via structured/legacy params even without resumeRunId.
-      if (!req.resumeRunId && !req.resumeLeadId && !req.resumeReviewerId) {
+      // WP6: a plan-rail run edits an EXISTING surface (create_plan wrote it),
+      // so NEVER archive it away — archiving is only for the legacy fresh-file
+      // deliverable path where a leftover plan would trip the existsSync gate.
+      if (!req.resumeRunId && !req.resumeLeadId && !req.resumeReviewerId && !req.planId) {
         archiveStalePlan(run.planPath, run.runId);
       }
     }
@@ -148,6 +179,11 @@ export class OrchestrationService extends EventEmitter {
     run.status = 'aborted'; run.endedAt = nowIso(); run.updatedAt = nowIso();
     updateOrchestration(run);
     this.emitActiveChanged();
+    // GT-C §1.6 abort path: best-effort trail materialization. The run is already
+    // `aborted` so the 409 no longer protects the write — the in-flight guard does.
+    // If the plan isn't quiescent (a kept member still working), this no-ops and the
+    // next terminal/safe trigger regenerates. No correctness claim beyond best-effort.
+    if (run.planId) trailMaterializer.request(run.planId);
     insertOrchestrationEvent({ runId, ts: nowIso(), kind: 'aborted', payload: {} });
     void this.cleanupMembers(run);
     void this.relay(runId, run.supervisorId,
@@ -176,15 +212,37 @@ export class OrchestrationService extends EventEmitter {
     try {
       if (run.mode === 'serial') await this.runners.serial(this.client, ctx);
       else await this.runners.parallel(this.client, ctx);
+      // GT-C §1.6 T1: the runner has returned → it will not press another turn.
+      // Materialize the Execution Trail while the row is STILL `running` (the
+      // one-writer 409 holds through the whole-file write) so no other run can start
+      // during it. Exempt this run + its own (possibly still-idle) members.
+      if (run.planId) {
+        await trailMaterializer.materialize(run.planId, {
+          completingRunId: run.runId,
+          exemptAgentIds: [run.leadId, run.reviewerId].filter(Boolean) as string[],
+        });
+      }
       run.status = 'complete'; run.endedAt = nowIso(); run.updatedAt = nowIso();
       updateOrchestration(run);
-      this.stampPlanMembers(run);
+      // Legacy fresh-file stamp is a whole-file write — NEVER on a rail surface
+      // (the run is recorded via plan_events / the exec-trail instead, and a raw
+      // stamp write would clobber the materialized trail). Non-rail path only.
+      if (!run.planId) this.stampPlanMembers(run);
       ctx.emit('complete', { planPath: run.planPath });
       await this.relay(run.runId, run.supervisorId,
         `[DASHBOARD EVENT] groupthink.complete (mode=${run.mode}): Plan at ${run.planPath}. runId=${run.runId}`);
       if (!keepAgents) await this.cleanupMembers(run);
     } catch (err: any) {
       if (controller.signal.aborted) return;   // abort() already handled delivery
+      // GT-C §1.6 T1 (stalled/error path): the runner has actually stopped and the
+      // row is still `running` (terminal flip is below), so the one-writer 409 still
+      // holds — materialize the trail under the held ownership before releasing it.
+      if (run.planId) {
+        await trailMaterializer.materialize(run.planId, {
+          completingRunId: run.runId,
+          exemptAgentIds: [run.leadId, run.reviewerId].filter(Boolean) as string[],
+        });
+      }
       const msg = err?.message || String(err);
       const isStall = msg.startsWith('STALL') || msg.includes('Timeout');
       run.status = isStall ? 'stalled' : 'error'; run.error = msg; run.endedAt = nowIso();

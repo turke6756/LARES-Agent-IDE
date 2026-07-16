@@ -40,6 +40,11 @@ export default function FileContentArea({ tabId, filePath, pathType }: Props) {
   const dismissExternalChange = useDashboardStore((state) => state.dismissExternalChange);
   const enterWysiwygMode = useDashboardStore((state) => state.enterWysiwygMode);
   const enterSourceMode = useDashboardStore((state) => state.enterSourceMode);
+  // WP4: a pending "open at source span" request carried on the tab.
+  const focusRange = useDashboardStore((state) => state.openTabs.find((t) => t.id === tabId)?.focusRange);
+  // Identity the PDF reader threads through for the Phase-3 comment seam.
+  const pdfWorkspaceId = useDashboardStore((state) => state.openTabs.find((t) => t.id === tabId)?.workspaceId);
+  const pdfRootDirectory = useDashboardStore((state) => state.openTabs.find((t) => t.id === tabId)?.rootDirectory);
 
   // Media + geospatial binary types are fetched via media:// protocol — skip text file reading entirely
   const isMediaType =
@@ -108,6 +113,18 @@ export default function FileContentArea({ tabId, filePath, pathType }: Props) {
     }
   }, [pendingWysiwygContent, enterWysiwygMode, tabId]);
 
+  // WP4: span highlighting is only meaningful in the CodeMirror source view (not the
+  // Milkdown WYSIWYG), so when a focus request asks for `source` on a markdown tab,
+  // force source mode once the bytes are in. Non-source-mode requests are a no-op here.
+  const wantSourceFocus =
+    focusRange?.mode === 'source' && isMarkdown && !!content && !content.error &&
+    (!editState || editState.mode !== 'source');
+  useEffect(() => {
+    if (wantSourceFocus && content && !content.error) {
+      enterSourceMode(tabId, content.content);
+    }
+  }, [wantSourceFocus, content, enterSourceMode, tabId]);
+
   if (!filePath) {
     return (
       <div className="flex items-center justify-center h-full">
@@ -123,7 +140,15 @@ export default function FileContentArea({ tabId, filePath, pathType }: Props) {
     return <ImageRenderer filePath={filePath} pathType={pathType} />;
   }
   if (fileType === 'pdf') {
-    return <PdfRenderer filePath={filePath} pathType={pathType} />;
+    return (
+      <PdfRenderer
+        filePath={filePath}
+        pathType={pathType}
+        tabId={tabId}
+        workspaceId={pdfWorkspaceId}
+        rootDirectory={pdfRootDirectory}
+      />
+    );
   }
   if (fileType === 'geotiff') {
     return <GeoTiffRenderer filePath={filePath} />;
@@ -187,6 +212,7 @@ export default function FileContentArea({ tabId, filePath, pathType }: Props) {
         error={editState.error}
         onChange={(draft) => setDraftContent(tabId, draft)}
         onSave={() => { void saveTab(tabId); }}
+        focusRange={focusRange}
       />,
     );
   }
@@ -226,6 +252,7 @@ export default function FileContentArea({ tabId, filePath, pathType }: Props) {
       filePath={filePath}
       pathType={pathType}
       error={content.error}
+      warnings={content.warnings}
     />
   );
 

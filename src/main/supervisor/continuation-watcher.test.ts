@@ -24,7 +24,7 @@ import {
   buildNoteRequestMessage,
   buildContinuationKickoffMessage,
   decidePostNoteProceed,
-  OWNED_BUSY_BLOCKLIST,
+  isContinuationWatchEligible,
   CONTINUATION_TRIGGER_CONTEXT_PCT,
 } from './continuation-watcher';
 import * as watcherModule from './continuation-watcher';
@@ -66,6 +66,31 @@ test('Phase 5B — no CONTINUATION_HARD_CEILING_PCT / decideEmptyMemoOutcome sym
     'the hard ceiling was deleted — no export may reintroduce it');
   assert.equal('decideEmptyMemoOutcome' in watcherModule, false,
     'the percentage split was deleted — replaced by the effort-budget escape');
+});
+
+// ── Watcher-tick eligibility (#19 supervisor-tools-for-personas) ──────
+
+test('isContinuationWatchEligible — a claude structural supervisor rides the tick', () => {
+  assert.equal(isContinuationWatchEligible({ isSupervisor: true, provider: 'claude' }), true);
+});
+
+test("isContinuationWatchEligible — a claude privilegeLane:'supervisor' persona rides the tick (isSupervisor false)", () => {
+  assert.equal(
+    isContinuationWatchEligible({ isSupervisor: false, privilegeLane: 'supervisor', provider: 'claude' }),
+    true,
+  );
+});
+
+test('isContinuationWatchEligible — a plain claude worker is excluded', () => {
+  assert.equal(isContinuationWatchEligible({ isSupervisor: false, provider: 'claude' }), false);
+});
+
+test('isContinuationWatchEligible — a privilege-lane persona on a non-claude provider is excluded (claude-only)', () => {
+  assert.equal(
+    isContinuationWatchEligible({ isSupervisor: false, privilegeLane: 'supervisor', provider: 'codex' }),
+    false,
+  );
+  assert.equal(isContinuationWatchEligible({ isSupervisor: true, provider: 'gemini' }), false);
 });
 
 // ── 5A: getWaitingKind (real StatusMonitor, private latch) ────────────
@@ -136,6 +161,7 @@ function allClearSnapshot(overrides: Partial<TriggerSnapshot> = {}): TriggerSnap
     inputInFlightIds: [],
     orchestrationRunning: false,
     attemptInProgress: false,
+    continuationDisabled: false,
     now: 1_000_000,
     backoffUntil: 0,
     ...overrides,
@@ -154,10 +180,10 @@ test('trigger: each gate independently blocks', () => {
     ['context unknown', { contextPercentage: null }],
     ['idle debounce not met', { consecutiveIdleTicks: CONTINUATION_IDLE_DEBOUNCE_TICKS - 1 }],
     ['awaiting human', { awaitingHuman: true }],
-    ['owned busy', { owned: [{ id: 'w1', status: 'working' as AgentStatus }] }],
     ['input in flight', { inputInFlightIds: ['w1'] }],
     ['orchestration running', { orchestrationRunning: true }],
     ['attempt in progress', { attemptInProgress: true }],
+    ['continuation disabled', { continuationDisabled: true }],
     ['backoff', { backoffUntil: 2_000_000 }],
   ];
   for (const [name, ov] of cases) {
@@ -167,18 +193,31 @@ test('trigger: each gate independently blocks', () => {
   }
 });
 
-test('busy-blocklist: launching|working|waiting|restarting block; idle/done/crashed do not; receiving not in the set', () => {
-  for (const s of ['launching', 'working', 'waiting', 'restarting'] as AgentStatus[]) {
+test('trigger: the disabled toggle records the `continuation-disabled` blocker (Edward 2026-07-05)', () => {
+  const d = decideContinuationTrigger(allClearSnapshot({ continuationDisabled: true }));
+  assert.equal(d.fire, false);
+  assert.ok(d.blockers.includes('continuation-disabled'),
+    `disabled must record continuation-disabled, got: ${d.blockers.join(',')}`);
+});
+
+test('owned-busy is NO LONGER a blocker (Edward 2026-07-05): busy owned agents do not gate the trigger', () => {
+  // Every owned status — busy or idle/terminal — must let the trigger fire;
+  // worker dashboard events queue by agent id and land in the successor.
+  for (const s of ['launching', 'working', 'waiting', 'restarting',
+                   'idle', 'done', 'crashed'] as AgentStatus[]) {
     const d = decideContinuationTrigger(allClearSnapshot({ owned: [{ id: 'w', status: s }] }));
-    assert.equal(d.fire, false, `${s} should block`);
+    assert.equal(d.fire, true, `${s} owned agent must NOT block the trigger`);
+    assert.equal(d.blockers.some(b => b.startsWith('owned-busy')), false,
+      `${s} must not record an owned-busy blocker`);
   }
-  for (const s of ['idle', 'done', 'crashed'] as AgentStatus[]) {
-    const d = decideContinuationTrigger(allClearSnapshot({ owned: [{ id: 'w', status: s }] }));
-    assert.equal(d.fire, true, `${s} should NOT block`);
-  }
-  // 'receiving' is projection-only and never appears in a raw DB row — a
-  // blocklist entry for it would be a silent no-op, so it must not be there.
-  assert.equal(OWNED_BUSY_BLOCKLIST.has('receiving' as AgentStatus), false);
+});
+
+test('trigger fires while an owned agent is working (owned-busy removed)', () => {
+  const d = decideContinuationTrigger(allClearSnapshot({
+    owned: [{ id: 'w-working', status: 'working' as AgentStatus }],
+  }));
+  assert.equal(d.fire, true);
+  assert.deepEqual(d.blockers, []);
 });
 
 test('crashed owned agents are non-blocking but their ids ride the decision', () => {
@@ -244,6 +283,7 @@ interface FakeWorld {
   contextPct: number | null;
   idle: boolean;
   awaitingHuman: boolean;
+  continuationEnabled: boolean;
   owned: OwnedAgentRow[];
   inFlight: Set<string>;
   orchestration: boolean;
@@ -272,6 +312,7 @@ function makeWorld(overrides: Partial<FakeWorld> = {}): FakeWorld {
     contextPct: CONTINUATION_TRIGGER_CONTEXT_PCT + 5,
     idle: true,
     awaitingHuman: false,
+    continuationEnabled: true,
     owned: [],
     inFlight: new Set(),
     orchestration: false,
@@ -301,6 +342,7 @@ function makeEffects(w: FakeWorld): ContinuationWatcherEffects {
     getContextPercentage: () => w.contextPct,
     isIdle: () => w.idle,
     isAwaitingHuman: () => w.awaitingHuman,
+    isContinuationEnabled: () => w.continuationEnabled,
     getOwnedAgents: () => w.owned,
     isInputInFlight: (id) => w.inFlight.has(id),
     hasRunningOrchestration: () => w.orchestration,
@@ -587,9 +629,8 @@ test('trigger gates hold the watcher back before any attempt: awaiting-human blo
   assert.equal(w.calls.requestNote.length, 0);
 });
 
-test('owned busy / in-flight / orchestration block before any attempt', async () => {
+test('in-flight / orchestration block before any attempt (owned-busy no longer does)', async () => {
   for (const ov of [
-    { owned: [{ id: 'w1', status: 'working' as AgentStatus }] },
     { owned: [{ id: 'w1', status: 'idle' as AgentStatus }], inFlight: new Set(['w1']) },
     { orchestration: true },
   ] as Partial<FakeWorld>[]) {
@@ -598,6 +639,16 @@ test('owned busy / in-flight / orchestration block before any attempt', async ()
     for (let i = 0; i < 4; i++) watcher.tick([SELF]);
     assert.equal(w.calls.openAttempt.length, 0);
   }
+});
+
+test('a busy owned worker no longer blocks the attempt from opening (owned-busy removed)', async () => {
+  const w = makeWorld({
+    owned: [{ id: 'w1', status: 'working' as AgentStatus }],
+    toolBrick: { id: 'b1', writtenAt: '2026-07-03T10:00:05.000Z' },
+  });
+  const watcher = new ContinuationWatcher(makeEffects(w));
+  await fireAndDrain(watcher, w);
+  assert.equal(w.calls.openAttempt.length, 1);
 });
 
 test('crashed owned ids ride the attempt reason', async () => {
@@ -728,6 +779,87 @@ test('kickoff message: [DASHBOARD]-labelled, orientation-only, hard stop before 
     'will do on the human\'s go) and END YOUR TURN. Do NOT start or resume work, do NOT',
     'dispatch/message workers, do NOT edit files until the human speaks.',
   ].join('\n'));
+});
+
+// ── Per-agent toggle + force handoff (Edward 2026-07-05) ──────────────
+
+/** Force, then tick once and drain the detached attempt cycle. */
+async function forceAndDrain(watcher: ContinuationWatcher, w: FakeWorld): Promise<{ ok: boolean; error?: string }> {
+  const res = watcher.forceHandoff(SELF);
+  watcher.tick([SELF]);
+  for (let i = 0; i < 500 && watcher.getAgentState(SELF).attemptInProgress; i++) {
+    await new Promise((r) => setImmediate(r));
+  }
+  assert.equal(watcher.getAgentState(SELF).attemptInProgress, false, 'forced attempt cycle should settle');
+  return res;
+}
+
+test('disabled agent: the trigger never opens an attempt even with every other gate clear', async () => {
+  const w = makeWorld({
+    continuationEnabled: false,
+    contextPct: 100,
+    toolBrick: { id: 'b1', writtenAt: '2026-07-03T10:00:05.000Z' },
+  });
+  const watcher = new ContinuationWatcher(makeEffects(w));
+  await fireAndDrain(watcher, w);
+  assert.equal(w.calls.openAttempt.length, 0, 'disabled → no attempt via the trigger');
+  assert.equal(w.calls.requestNote.length, 0);
+});
+
+test('force: opens an attempt with the trigger conditions UNMET (below threshold), runs the normal cycle', async () => {
+  // Context below threshold → the normal trigger would never fire. Idle so the
+  // post-note grace completes quickly once the brick commits.
+  const w = makeWorld({
+    contextPct: CONTINUATION_TRIGGER_CONTEXT_PCT - 30,
+    toolBrick: { id: 'b1', writtenAt: '2026-07-03T10:00:05.000Z' },
+  });
+  const watcher = new ContinuationWatcher(makeEffects(w));
+  // Prove the trigger alone is inert here.
+  for (let i = 0; i < CONTINUATION_IDLE_DEBOUNCE_TICKS + 2; i++) watcher.tick([SELF]);
+  assert.equal(w.calls.openAttempt.length, 0, 'below-threshold trigger must not fire on its own');
+  // Now force: the normal attempt cycle runs end-to-end.
+  const res = await forceAndDrain(watcher, w);
+  assert.deepEqual(res, { ok: true });
+  assert.equal(w.calls.openAttempt.length, 1, 'force opened exactly one attempt');
+  assert.equal(w.calls.requestNote.length, 1, 'force ran the note-request handshake');
+  assert.deepEqual(w.calls.relaunch, [{ agentId: SELF, attemptId: 'att-1' }], 'force ran the relaunch');
+});
+
+test('force on a disabled agent → rejected with a clear error, no attempt opened', async () => {
+  const w = makeWorld({ continuationEnabled: false });
+  const watcher = new ContinuationWatcher(makeEffects(w));
+  const res = await forceAndDrain(watcher, w);
+  assert.equal(res.ok, false);
+  assert.ok(res.error && res.error.length > 0, 'rejection carries a clear error');
+  assert.equal(w.calls.openAttempt.length, 0, 'disabled force never opens an attempt');
+});
+
+test('force is idempotent: a second force before the tick does not mint a second attempt', async () => {
+  const w = makeWorld({
+    contextPct: CONTINUATION_TRIGGER_CONTEXT_PCT - 30,
+    toolBrick: { id: 'b1', writtenAt: '2026-07-03T10:00:05.000Z' },
+  });
+  const watcher = new ContinuationWatcher(makeEffects(w));
+  assert.deepEqual(watcher.forceHandoff(SELF), { ok: true }, 'first force queued');
+  assert.deepEqual(watcher.forceHandoff(SELF), { ok: true }, 'second force is a no-op ok (already queued)');
+  watcher.tick([SELF]);
+  for (let i = 0; i < 500 && watcher.getAgentState(SELF).attemptInProgress; i++) {
+    await new Promise((r) => setImmediate(r));
+  }
+  assert.equal(w.calls.openAttempt.length, 1, 'two forces before a tick → exactly one attempt');
+});
+
+test('force queued then agent disabled before the tick → the force is dropped, no attempt', async () => {
+  const w = makeWorld({ contextPct: CONTINUATION_TRIGGER_CONTEXT_PCT - 30 });
+  const watcher = new ContinuationWatcher(makeEffects(w));
+  assert.deepEqual(watcher.forceHandoff(SELF), { ok: true });
+  w.continuationEnabled = false;   // toggled off after the force was queued
+  watcher.tick([SELF]);
+  for (let i = 0; i < 500 && watcher.getAgentState(SELF).attemptInProgress; i++) {
+    await new Promise((r) => setImmediate(r));
+  }
+  assert.equal(w.calls.openAttempt.length, 0, 'a disabled agent never opens an attempt, even a queued force');
+  assert.equal(watcher.getAgentState(SELF).forcePending, false, 'the stale force is cleared, not left to resurrect');
 });
 
 // ── Runner ───────────────────────────────────────────────────────────

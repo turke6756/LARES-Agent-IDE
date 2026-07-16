@@ -6,9 +6,11 @@ import {
   type AccessRequestDecision,
   type AccessRule,
   type AccessRuleInput,
+  type AccessSiteStatus,
   type HandedTabInfo,
   type SignedInOrigin,
 } from '../../stores/browser-store';
+import { useDashboardStore } from '../../stores/dashboard-store';
 import { useBrowserSuspension } from './useBrowserSuspension';
 
 // ── Relative "x ago" label (trusted-chrome only; epoch ms in, short label out).
@@ -62,6 +64,44 @@ function ruleDescriptor(r: {
   return `${scheme}://${host}${path}`;
 }
 
+// ── Phase 3 (§D line 259): the FIVE-word status vocabulary ────────────────────
+// Combines each row's visit permission with its WORKSPACE-EXACT login-grant state
+// into the exact labels a non-engineer reads at a glance — Visit allowed / Login
+// off / Setup required / Ready / Needs sign-in. `session` is the workspace-exact
+// grant runtime state from AccessSiteStatus (never a bare legacy row — line 264).
+type AccessSiteSession = AccessSiteStatus['session'];
+
+/** The login-status chip label for a row given its grant `login` + `session`. */
+function loginStatusLabel(login: boolean, session: AccessSiteSession): string {
+  if (!login) return 'Login off';
+  if (session === 'active') return 'Ready';
+  if (session === 'expired') return 'Needs sign-in';
+  return 'Setup required'; // 'setup_required' | 'none' (login on, no active grant yet)
+}
+
+/** The SINGLE contextual action label for an allow_signed_in row (line 260):
+ *  active → Turn off; expired → Re-authenticate; otherwise → Set up. */
+function loginActionLabel(session: AccessSiteSession): 'Turn off' | 'Re-authenticate' | 'Set up' {
+  if (session === 'active') return 'Turn off';
+  if (session === 'expired') return 'Re-authenticate';
+  return 'Set up';
+}
+
+/** Chip tint for a login-status label (Ready green / Needs sign-in red /
+ *  Setup required amber / Login off muted). */
+function loginChipClass(label: string): string {
+  switch (label) {
+    case 'Ready':
+      return 'bg-accent-green/15 text-accent-green';
+    case 'Needs sign-in':
+      return 'bg-accent-red/15 text-accent-red';
+    case 'Setup required':
+      return 'bg-accent-orange/15 text-accent-orange';
+    default:
+      return 'bg-tab-border text-fg-muted'; // Login off
+  }
+}
+
 // ── Signed-in capability: the 4-point consent gate (WI-5) ─────────────────────
 // EVERY path that grants `allow_signed_in` (the per-row toggle AND the
 // access-request "Approve + allow signed in") routes through this dialog FIRST,
@@ -71,10 +111,12 @@ function ruleDescriptor(r: {
 // not a re-consent. `label` names the origin the capability applies to.
 function SignedInConsentDialog({
   label,
+  workspaceLabel,
   onAcknowledge,
   onCancel,
 }: {
   label: string;
+  workspaceLabel: string;
   onAcknowledge: () => void;
   onCancel: () => void;
 }) {
@@ -86,6 +128,11 @@ function SignedInConsentDialog({
           Allow agents to use a signed-in session on{' '}
           <span className="font-mono">{label}</span>?
         </div>
+      </div>
+      {/* Phase 3 (§D line 263): the grant is workspace-exact — name the workspace
+          it applies to on every consent surface. */}
+      <div className="text-[11px] text-fg-secondary">
+        Workspace: <span className="font-semibold text-fg-primary">{workspaceLabel}</span>
       </div>
       <ul className="list-disc pl-6 space-y-0.5 text-[11px] text-fg-secondary">
         <li>This session is shared by every agent in this workspace.</li>
@@ -352,7 +399,15 @@ function AddRuleForm() {
 }
 
 // ── A single agent-allowlist rule row ─────────────────────────────────────────
-function RuleRow({ rule }: { rule: AccessRule }) {
+function RuleRow({
+  rule,
+  status,
+  workspaceLabel,
+}: {
+  rule: AccessRule;
+  status?: AccessSiteStatus;
+  workspaceLabel: string;
+}) {
   const updateAccessRule = useBrowserStore((s) => s.updateAccessRule);
   const removeAccessRule = useBrowserStore((s) => s.removeAccessRule);
   const beginSigninHandoff = useBrowserStore((s) => s.beginSigninHandoff);
@@ -363,6 +418,14 @@ function RuleRow({ rule }: { rule: AccessRule }) {
   const [confirmingOff, setConfirmingOff] = useState(false);
   // WI-5: turning the capability ON routes through the 4-point consent first.
   const [consenting, setConsenting] = useState(false);
+
+  // Phase 3 (§D lines 259-260/264): the row's combined vocabulary + single
+  // contextual action derive from the WORKSPACE-EXACT status seam (never a bare
+  // row). Fall back to the rule's own fields before the first status load.
+  const login = status?.login ?? rule.allowSignedIn;
+  const session: AccessSiteSession = status?.session ?? 'none';
+  const loginLabel = loginStatusLabel(login, session);
+  const actionLabel = loginActionLabel(session);
 
   const toggleSignedIn = () => {
     if (rule.allowSignedIn) {
@@ -397,6 +460,23 @@ function RuleRow({ rule }: { rule: AccessRule }) {
             {ruleDescriptor(rule)}
           </div>
           {rule.note && <div className="text-[10px] text-fg-muted truncate">{rule.note}</div>}
+          {/* Phase 3 (§D line 259): combined visit + login status at a glance. An
+              enabled rule shows "Visit allowed"; a disabled one relies on the
+              line-through descriptor above (no invented word). */}
+          <div className="flex flex-wrap items-center gap-1.5 mt-1">
+            {rule.enabled && (
+              <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-accent-blue/15 text-accent-blue">
+                <Icons.Globe className="w-3 h-3" />
+                Visit allowed
+              </span>
+            )}
+            <span
+              className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium ${loginChipClass(loginLabel)}`}
+            >
+              <Icons.KeyRound className="w-3 h-3" />
+              {loginLabel}
+            </span>
+          </div>
         </div>
         <button
           onClick={() => void removeAccessRule(rule.id)}
@@ -407,16 +487,17 @@ function RuleRow({ rule }: { rule: AccessRule }) {
         </button>
       </div>
 
-      {/* Per-row authenticated-drive ("Allow sign-in hand-off") toggle. */}
+      {/* Phase 3 (§D line 260): ONE "Agents may use my login" toggle + ONE
+          contextual action (Set up / Re-authenticate / Turn off). */}
       <div className="flex items-start gap-2 pl-8">
         <button
           type="button"
           role="switch"
           aria-checked={rule.allowSignedIn}
-          aria-label="Allow sign-in hand-off"
+          aria-label="Agents may use my login"
           onClick={toggleSignedIn}
           className="shrink-0 mt-0.5"
-          title="Let the agent use my signed-in session (right-click hand-off becomes eligible for this origin)"
+          title="Let agents in this workspace use your signed-in session for this site"
         >
           <span
             className={`relative inline-flex h-3.5 w-6 items-center rounded-full transition-colors ${
@@ -431,28 +512,35 @@ function RuleRow({ rule }: { rule: AccessRule }) {
           </span>
         </button>
         <div className="flex-1 min-w-0">
-          <div className="text-[11px] text-fg-secondary">Allow sign-in hand-off</div>
+          <div className="text-[11px] text-fg-secondary">Agents may use my login</div>
           <div className="text-[10px] text-fg-muted">
-            Lets the agent drive your signed-in session here; shared by every agent in this
-            workspace; persists until you clear it.
+            Lets agents drive your signed-in session here; shared by every agent in{' '}
+            <span className="font-medium text-fg-secondary">{workspaceLabel}</span>; persists until
+            you clear it.
           </div>
         </div>
         {rule.allowSignedIn && (
           <div className="flex items-center gap-1.5 shrink-0">
+            {/* Single contextual action, label derived from the workspace-exact
+                grant state (line 260). "Turn off" reuses the confirm-off dialog;
+                Set up / Re-authenticate open the quarantined setup tab. */}
             <button
-              onClick={() => void beginSigninHandoff(rule)}
-              className="ui-btn ui-btn-outline px-2 py-1 text-[11px]"
-              title="Open a quarantined login tab so you can sign in for the agent"
+              onClick={() =>
+                actionLabel === 'Turn off'
+                  ? setConfirmingOff(true)
+                  : void beginSigninHandoff(rule)
+              }
+              className={`ui-btn px-2 py-1 text-[11px] ${
+                actionLabel === 'Turn off' ? 'ui-btn-ghost hover:text-accent-red' : 'ui-btn-outline'
+              }`}
+              title={
+                actionLabel === 'Turn off'
+                  ? "Turn off agents' access to your signed-in session for this site"
+                  : 'Open a quarantined login tab so you can sign in for the agent'
+              }
             >
-              <Icons.LogIn className="w-3.5 h-3.5" />
-              Sign in for agent
-            </button>
-            <button
-              onClick={() => void clearSiteSession(rule.id)}
-              className="ui-btn ui-btn-ghost px-2 py-1 text-[11px] hover:text-accent-red"
-              title="Clear the agent's stored session for this site"
-            >
-              Clear agent session
+              {actionLabel !== 'Turn off' && <Icons.LogIn className="w-3.5 h-3.5" />}
+              {actionLabel}
             </button>
           </div>
         )}
@@ -462,6 +550,7 @@ function RuleRow({ rule }: { rule: AccessRule }) {
       {consenting && (
         <SignedInConsentDialog
           label={ruleDescriptor(rule)}
+          workspaceLabel={workspaceLabel}
           onAcknowledge={() => {
             setConsenting(false);
             void (async () => {
@@ -512,9 +601,16 @@ function RuleRow({ rule }: { rule: AccessRule }) {
 }
 
 // ── A single agent request row (§18.4) ────────────────────────────────────────
-function RequestRow({ request }: { request: AccessRequest }) {
+function RequestRow({
+  request,
+  workspaceLabel,
+}: {
+  request: AccessRequest;
+  workspaceLabel: string;
+}) {
   const decideAccessRequest = useBrowserStore((s) => s.decideAccessRequest);
   const approveSignedInWithConsent = useBrowserStore((s) => s.approveSignedInWithConsent);
+  const beginSigninHandoff = useBrowserStore((s) => s.beginSigninHandoff);
   const decide = (decision: AccessRequestDecision) => void decideAccessRequest(request.id, decision);
 
   // WI-5: "Approve + allow signed in" must route through the SAME 4-point consent
@@ -569,10 +665,10 @@ function RequestRow({ request }: { request: AccessRequest }) {
         <button
           onClick={() => setConsenting(true)}
           className="ui-btn px-2.5 py-1 text-[11px] font-semibold bg-accent-orange text-white border border-accent-orange hover:bg-accent-orange/90"
-          title="Create the rule AND allow the agent to drive a signed-in session — you still sign in / hand off separately"
+          title="Create the rule, allow signed-in access, AND open the setup tab so you can sign in now"
         >
           <Icons.KeyRound className="w-3.5 h-3.5" />
-          Approve + allow signed in
+          Allow visit and set up login
         </button>
         <button
           onClick={() => decide('deny')}
@@ -587,9 +683,15 @@ function RequestRow({ request }: { request: AccessRequest }) {
       {consenting && (
         <SignedInConsentDialog
           label={ruleDescriptor(request)}
+          workspaceLabel={workspaceLabel}
           onAcknowledge={() => {
             setConsenting(false);
-            void approveSignedInWithConsent(request);
+            // Phase 3 (§D line 261): approval flows STRAIGHT into the quarantined
+            // setup tab — the human doesn't have to hunt for a second button.
+            void (async () => {
+              const created = await approveSignedInWithConsent(request);
+              if (created) await beginSigninHandoff(created);
+            })();
           }}
           onCancel={() => setConsenting(false)}
         />
@@ -731,7 +833,9 @@ function SignedInOriginRow({ origin }: { origin: SignedInOrigin }) {
   const importSession = async () => {
     setImportNotice(false);
     const result = await importUserSession(origin.ruleId);
-    if (result.imported === 0) setImportNotice(true);
+    // Phase 2 (§D line 245): candidateCookiesCopied is the count of cookies staged
+    // for setup — zero means nothing to import, so surface the Sign-in fallback.
+    if (result.candidateCookiesCopied === 0) setImportNotice(true);
   };
 
   return (
@@ -955,14 +1059,28 @@ function WebsiteAccessSettingsInner() {
   const closeAccessView = useBrowserStore((s) => s.closeAccessView);
   const accessRules = useBrowserStore((s) => s.accessRules);
   const accessRequests = useBrowserStore((s) => s.accessRequests);
+  const siteStatus = useBrowserStore((s) => s.siteStatus);
   const loadAccessRules = useBrowserStore((s) => s.loadAccessRules);
+  const loadSiteStatus = useBrowserStore((s) => s.loadSiteStatus);
   const loadAccessRequests = useBrowserStore((s) => s.loadAccessRequests);
   const loadSharedSessions = useBrowserStore((s) => s.loadSharedSessions);
   const loadSigninConfig = useBrowserStore((s) => s.loadSigninConfig);
 
-  // The allowlist itself is collapsed by default so pending approvals (above)
-  // are always visible without scrolling past a long list (§6).
-  const [listExpanded, setListExpanded] = useState(false);
+  // Phase 3 (§D line 263): name the exact workspace on the consent/setup surfaces.
+  // `Workspace.title` is the display name (there is no `.name`); default store
+  // state (no workspaces / null selection) → "the default workspace".
+  const workspaceLabel = useDashboardStore(
+    (s) => s.workspaces.find((w) => w.id === s.selectedWorkspaceId)?.title ?? 'the default workspace',
+  );
+
+  // Phase 3 (§D line 258): the allowlist is EXPANDED by default so a non-engineer
+  // can answer "which sites may agents visit / use my login?" from the first
+  // screen. The collapse toggle stays (harmless).
+  const [listExpanded, setListExpanded] = useState(true);
+  // Phase 3 (§D line 262): Advanced & Activity (live handed tabs, JIT timeout,
+  // unattended, session age, idle-tab suspend) is collapsed by default so it is
+  // off the primary at-a-glance surface.
+  const [advancedOpen, setAdvancedOpen] = useState(false);
 
   // Proactive-signin (2026-06-29) WI-C: case-insensitive substring filter over
   // the allowlist rows (hostname / path-prefix / note). Empty = show all.
@@ -981,10 +1099,11 @@ function WebsiteAccessSettingsInner() {
   // Refresh on open (the bridge also keeps these live via the change events).
   useEffect(() => {
     void loadAccessRules();
+    void loadSiteStatus();
     void loadAccessRequests();
     void loadSharedSessions();
     void loadSigninConfig();
-  }, [loadAccessRules, loadAccessRequests, loadSharedSessions, loadSigninConfig]);
+  }, [loadAccessRules, loadSiteStatus, loadAccessRequests, loadSharedSessions, loadSigninConfig]);
 
   // Close on Esc.
   useEffect(() => {
@@ -1036,7 +1155,7 @@ function WebsiteAccessSettingsInner() {
                 so the request text/buttons stay steady and readable. */}
             <div className="flex flex-col gap-2 [animation:none]">
               {pending.map((r) => (
-                <RequestRow key={r.id} request={r} />
+                <RequestRow key={r.id} request={r} workspaceLabel={workspaceLabel} />
               ))}
             </div>
           </section>
@@ -1095,22 +1214,56 @@ function WebsiteAccessSettingsInner() {
                     No rules match “{ruleSearch.trim()}”.
                   </div>
                 ) : (
-                  filteredRules.map((rule) => <RuleRow key={rule.id} rule={rule} />)
+                  filteredRules.map((rule) => (
+                    <RuleRow
+                      key={rule.id}
+                      rule={rule}
+                      status={siteStatus.find((s) => s.ruleId === rule.id)}
+                      workspaceLabel={workspaceLabel}
+                    />
+                  ))
                 )}
               </div>
             </div>
           )}
         </section>
 
-        {/* ── (3) Sessions shared with agents — handed tabs + signed-in origins
-                 (Slice 12). ── */}
-        <SessionsSharedSection />
+        {/* ── (3) Advanced & Activity — collapsed by default (Phase 3 §D line
+                 262). Moves live handed tabs, JIT timeout, unattended, session
+                 age, and idle-tab suspend off the primary at-a-glance surface. ── */}
+        <section className="flex flex-col gap-2">
+          <button
+            type="button"
+            onClick={() => setAdvancedOpen((v) => !v)}
+            aria-expanded={advancedOpen}
+            className="flex items-center gap-2 text-left"
+            title={advancedOpen ? 'Collapse Advanced & Activity' : 'Expand Advanced & Activity'}
+          >
+            {advancedOpen ? (
+              <Icons.ChevronDown className="w-4 h-4 text-fg-secondary" />
+            ) : (
+              <Icons.ChevronRight className="w-4 h-4 text-fg-secondary" />
+            )}
+            <Icons.SlidersHorizontal className="w-4 h-4 text-fg-secondary" />
+            <h2 className="text-[13px] font-semibold text-fg-primary">Advanced &amp; Activity</h2>
+          </button>
+          <p className="text-[11px] text-fg-muted">
+            Live handed tabs, agent sign-in timing, and idle-tab memory settings.
+          </p>
 
-        {/* ── (4) Agent sign-in — JIT hold timeout + unattended flag (WI-8). ── */}
-        <SigninConfigSetting />
+          {advancedOpen && (
+            <div className="flex flex-col gap-5">
+              {/* Sessions shared with agents — handed tabs + signed-in origins (Slice 12). */}
+              <SessionsSharedSection />
 
-        {/* ── (5) Memory — idle-tab suspend threshold (Slice 11). ── */}
-        <DiscardThresholdSetting />
+              {/* Agent sign-in — JIT hold timeout + unattended flag (WI-8). */}
+              <SigninConfigSetting />
+
+              {/* Memory — idle-tab suspend threshold (Slice 11). */}
+              <DiscardThresholdSetting />
+            </div>
+          )}
+        </section>
       </div>
     </div>
   );

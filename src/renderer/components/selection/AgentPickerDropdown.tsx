@@ -110,7 +110,7 @@ export default function AgentPickerDropdown({ workspaceId, onPick, currentAgentI
   }, [rowCount, highlighted, rows]);
 
   const rowClass = (idx: number) =>
-    `ui-menu-item w-full text-left${highlighted === idx ? ' bg-white/10' : ''}`;
+    `ui-menu-item w-full text-left${highlighted === idx ? ' ui-menu-item-active' : ''}`;
 
   return (
     <div className="border-l border-white/10 ml-2 max-h-[40vh] overflow-y-auto">

@@ -10,6 +10,8 @@ import type {
   AgentContextOverhead,
   AgentPersona,
   AgentRoleLane,
+  ConfigSectionWeight,
+  ConfigWeightRollup,
   InheritanceFrame,
   McpServerOverhead,
   OverheadModel,
@@ -21,6 +23,7 @@ import type {
 import { TokenEstimator, sumEstimates } from './token-estimator';
 import { makePathOps } from './paths';
 import { analyzeWalkUp } from './walk-up';
+import { classifyAgentConfig, rollupTokens } from './config-weight';
 import type { McpInventory } from './mcp-tool-inventory';
 
 export interface FileReader {
@@ -46,6 +49,11 @@ interface BuiltinLane {
   kind: AgentContextOverhead['kind'];
   lane: AgentRoleLane;
 }
+
+// Disclosure-tier accounting (Wave-2 §C3) RETIRES the old `PHASE0_DISCLOSURE_VALIDATED`
+// gate: inclusion in the headline is now decided by each source's `disclosureTier`
+// (resident vs on-demand), not by a global boolean. The old "count skill bodies in
+// `total`" behavior is preserved exactly by `total = residentTotal + onDemandTotal`.
 
 const BUILTIN_LANES: BuiltinLane[] = [
   { relDir: '.dashboard/supervisor', name: 'Supervisor', kind: 'builtin-supervisor', lane: 'supervisor' },
@@ -107,12 +115,29 @@ function analyzeAgent(
     flatSources.push(...flatten(frame.sources));
   }
 
-  const countedEstimates: TokenEstimate[] = flatSources.map((s) => s.estimate);
+  // Truthful split (Wave-2 §C3): a source counts toward the resident headline iff
+  // its `disclosureTier` is `resident`. On-demand sources (skill bodies, memory
+  // body) go to a separate labeled pool, NEVER the headline. Counted MCP schemas
+  // are resident (loaded into context each session).
+  const residentEstimates: TokenEstimate[] = [];
+  const onDemandEstimates: TokenEstimate[] = [];
+  for (const s of flatSources) {
+    (s.disclosureTier === 'on-demand' ? onDemandEstimates : residentEstimates).push(s.estimate);
+  }
   const countedMcp = mcpServers.filter((s) => !s.excludedByStrictMode);
-  for (const server of countedMcp) countedEstimates.push(server.total);
+  for (const server of countedMcp) residentEstimates.push(server.total); // MCP schemas are resident
 
-  const total = sumEstimates(countedEstimates, deps.estimator.method);
-  const exactness = deriveExactness(countedEstimates.map((e) => e.method));
+  const residentTotal = sumEstimates(residentEstimates, deps.estimator.method);
+  const onDemandTotal = sumEstimates(onDemandEstimates, deps.estimator.method);
+  const total = sumEstimates([...residentEstimates, ...onDemandEstimates], deps.estimator.method);
+  const totalHeaderView = residentTotal; // header view == resident (kept for back-compat callers)
+  const exactness = deriveExactness(residentEstimates.map((e) => e.method));
+
+  // Section-level dead/live weight for this agent's resident config surfaces (§C3).
+  // BEHAVIOR SEAM (§D): the structural classifier never emits `live`/`dead`.
+  const configWeight = classifyAgentConfig(
+    flatSources, mcpServers, deps.reader, deps.estimator, pathOps, workspaceRoot,
+  );
 
   const warnings: string[] = [];
   return {
@@ -126,6 +151,10 @@ function analyzeAgent(
     mcpServers,
     flatSources,
     total,
+    totalHeaderView,
+    residentTotal,
+    onDemandTotal,
+    configWeight,
     exactness,
     warnings,
   };
@@ -172,12 +201,33 @@ export function analyzeOverhead(
     );
   }
 
+  // Per-workspace dead/live aggregate (§C4): union of workspace-scoped config
+  // sections across all agents, deduped by (sourcePath, heading), re-summed.
+  const wsRoot = pathOps.resolve(workspaceRoot);
+  const seenSection = new Set<string>();
+  const wsSections: ConfigSectionWeight[] = [];
+  for (const agent of agents) {
+    for (const sec of agent.configWeight?.sections ?? []) {
+      if (sec.scope !== 'agent' && sec.scope !== 'workspace-ancestor') continue;
+      if (!pathOps.isWithin(pathOps.resolve(sec.sourcePath), wsRoot)) continue;
+      const key = `${sec.sourcePath}::${sec.heading}::${sec.startLine}`;
+      if (seenSection.has(key)) continue;
+      seenSection.add(key);
+      wsSections.push(sec);
+    }
+  }
+  const workspaceConfigWeight: ConfigWeightRollup = {
+    sections: wsSections,
+    tokensByClass: rollupTokens(wsSections),
+  };
+
   return {
     workspaceId,
     workspaceRoot,
     pathType,
     estimatorMethod: deps.estimator.method,
     agents,
+    workspaceConfigWeight,
     globalWarnings,
   };
 }

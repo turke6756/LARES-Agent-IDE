@@ -4,7 +4,7 @@ import fs from 'fs';
 import crypto from 'crypto';
 import { execFileSync, execFile, spawn } from 'child_process';
 import { v4 as uuidv4 } from 'uuid';
-import { Agent, AgentProvider, AgentRoleLane, AgentStatus, ContextStats, LaunchAgentInput, QueryResult, Team, UsageLimitsReading } from '../../shared/types';
+import { Agent, AgentProvider, AgentRoleLane, AgentStatus, ContextStats, LaunchAgentInput, QueryResult, Team, UsageLimitsReading, hasSupervisorPrivilege } from '../../shared/types';
 import {
   TMUX_SESSION_PREFIX, PROVIDER_COMMANDS, WORKER_CLAUDE_MODEL,
   SUPERVISOR_AGENT_NAME, SUPERVISOR_AGENT_MD, SUPERVISOR_MEMORY_MD,
@@ -25,7 +25,7 @@ import {
   RESEARCH_STORE_README_MD, RESEARCH_WRITE_GUARD_MJS, RESEARCHER_CLAUDE_SETTINGS_JSON,
   RESEARCHER_CLAUDE_SETTINGS_JSON_V1, RESEARCHER_AGENT_MD,
   PERSONA_CREATE_PERSONA_SKILL, PERSONA_READ_COMMENTS_SKILL, SCRIPT_READ_COMMENTS_PY,
-  PERSONA_CREATE_PERSONA_SKILL_V1,
+  PERSONA_CREATE_PERSONA_SKILL_V1, PERSONA_READ_COMMENTS_SKILL_V1,
   CONTINUATION_BRICK_RENDER_MAX_BYTES,
   CONTINUATION_STOP_FLUSH_DELAY_MS,
   FILE_ACTIVITY_RETENTION_SESSIONS,
@@ -55,6 +55,23 @@ import { EventBridge, EventBridgeDeps } from './event-bridge';
 import { TeamMessageDeliveryEngine } from './team-delivery';
 import { WindowsRunner } from './windows-runner';
 import { WslRunner, WslLaunchDiagnostics } from './wsl-runner';
+// D4 durable CLI-process ownership (incident-2026-07-11 §5). Self-contained
+// subsystem in ./ownership; the supervisor holds the store/reaper/gate and
+// invokes them at the spawn / reconcile / periodic-sweep seams.
+import {
+  OwnershipStore,
+  Reaper,
+  ReconcileGate,
+  createProcessLister,
+  listOrphanCandidates,
+  reapOrphans,
+  type NativeJobSurface,
+  type ProcessLister,
+  type TerminalAgentRef,
+  type OrphanCandidate,
+  type ReapOrphansResult,
+  type SweepResult,
+} from './ownership';
 import { StatusMonitor } from './status-monitor';
 import type { StatusChangedEvent } from './status-events';
 import { ContextStatsMonitor, JsonlFileActivity } from './context-stats-monitor';
@@ -63,7 +80,7 @@ import { SessionLogReader } from './session-log-reader';
 import { ClaudeJsonlReader } from './log-readers/claude-jsonl-reader';
 import { parseSqliteUtcMs } from './sqlite-time';
 import { decideClearRotation, type ClearRotationTrigger } from './claude-clear-rotation';
-import { computeAwaitingHuman, buildContinuationKickoffMessage } from './continuation-watcher';
+import { computeAwaitingHuman, buildContinuationKickoffMessage, type ContinuationWatcher } from './continuation-watcher';
 import { CodexRolloutReader } from './log-readers/codex-rollout-reader';
 import { GeminiTranscriptReader } from './log-readers/gemini-transcript-reader';
 import { AgentChatService } from './agent-chat-service';
@@ -74,11 +91,15 @@ import {
   ensureCodexResumeSessionId,
   shouldDiscoverCodexSession,
   selectFreshCodexRollouts,
+  decideCodexHookBind,
   DEFAULT_SQL_POLL_TIMEOUT_MS,
   type DiscoveryResult,
+  type CodexHookBindDecision,
 } from './session-id-discovery';
 import { listCodexRolloutFiles } from './log-readers/codex-rollout-reader';
+import { CodexLaunchGate } from './codex-launch-gate';
 import { FileActivityTracker } from './file-activity-tracker';
+import { AdmissionError, type AdmissionDecision } from '../watchdog/types';
 import {
   createAgent, getAgent, getActiveAgents, getAllAgents, getSupervisorAgent, getOwnerForWorker, getWorkspace, updateAgentStatus, updateAgentPid,
   updateAgentExitCode, incrementRestartCount, updateAgentLastOutput,
@@ -86,10 +107,18 @@ import {
   updateAgentResumeSessionId, addFileActivity, getTeamMembership, addTeamMember, getAgentTemplate,
   getFileActivities, pruneFileActivitiesToRecentSessions, updateAgentHookStatus,
   updateAgentLastSendError,
+  setContinuationEnabled as dbSetContinuationEnabled,
   getContinuationAttempt, getCurrentBrick, commitContinuationRelaunch,
   getLatestContinuationAttempt,
   insertAgentSession, closeAgentSession,
+  getPlan, recordPlanSectionTouch,
+  getTurnSectionTouches, getTurnSectionChanges, insertPlanEvent, getTurnRepoActivity,
+  getDb,
 } from '../database';
+import { PlanTouchTracker } from '../plans/plan-touch-tracker';
+import { composePlanEvent, planEventTurnKey, TurnComposeGuard } from '../plans/plan-events';
+import { trailMaterializer } from '../plans/execution-trail-writer';
+import { resolveEditTargetAnchorForPlan } from '../plans/watch-plans';
 import { detectPathType, windowsToWslPath, uncToWslPath, wslToWindowsPath } from '../path-utils';
 import { getScriptPath } from './paths';
 import {
@@ -408,6 +437,10 @@ export function parseLatestClaudeHookSessionFromSpool(
 /** LRU cap for the per-agent applied-event dedupe registry. */
 const APPLIED_HOOK_EVENTS_MAX = 200;
 
+/** WP2 provenance spine — turn-window fallback when no working-hook start ts is
+ *  known (cold start / start-hook missed). Bounds the touch/change lookback. */
+const PLAN_EVENT_FALLBACK_WINDOW_MS = 30 * 60 * 1000;
+
 /** SHA-256 hex of the pre-DASHBOARD_HOST `dashboard-status.mjs` shipped in
  *  every workspace scaffolded before the WSL-status fix landed. That script
  *  hardcoded `http://127.0.0.1:${port}` and swallowed `catch {}` — the
@@ -496,6 +529,26 @@ export const SUPERVISOR_AGENT_MD_V7_HASH = '39942ff81d12aca671b54e26d8503e00ed2c
  *  both). Used in the v9 file's previousHashes for silent v8→v9 upgrade. */
 export const SUPERVISOR_AGENT_MD_V8_HASH = '56212604e2d90269888c9969adf7507ac9bf53947c1628ef8625b3c73bbb6767';
 
+/** SHA-256 hex of the v9 `.dashboard/supervisor/CLAUDE.md` (pre-planning-surface).
+ *  v10 appends the `<!-- section:planning-surface v1 -->` sentinel block: how a
+ *  supervisor mints (`create_plan`), dispatches into (`launch_agent` /
+ *  `run_orchestration` with `{plan_id, section_anchor}`), observes
+ *  (`read_plan_projection` / `read_plan_section`), and gates a plan surface, plus
+ *  the one-writer 409 policy and the read-cheap ladder. Used in the v10 file's
+ *  previousHashes for silent v9→v10 upgrade of pristine workspaces. */
+export const SUPERVISOR_AGENT_MD_V9_HASH = '91154a07a55e7c16bf6067a092ac992499ee61ebc914784ead0e0842b67f46bc';
+
+/** SHA-256 hex of the v10 `.dashboard/supervisor/CLAUDE.md` (planning-surface v1,
+ *  original wording). v11 rewrites the `<!-- section:planning-surface v1 -->` block
+ *  to teach the system-owned Execution Trail (`sec_exectr`): never dispatch a
+ *  writer to it or edit it; dispatch execution workers to the section they UPDATE
+ *  (`sec_opitem` for checklist execution); and mandate a turn-end completion
+ *  writeback (flip `&#9744;`→`&#9745;` natively + emit a PLAN-EVENT sentinel) so the
+ *  trusted fs-diff write events materialize the trail and flip the checkboxes. Used
+ *  in the v11 file's previousHashes for silent v10→v11 upgrade of pristine
+ *  workspaces. */
+export const SUPERVISOR_AGENT_MD_V10_HASH = 'e61ca4b14d22b6b63614412df0a5a491ecce7f64a5e6d44b2ce83892cee9f450';
+
 /** SHA-256 hex of the v2 `.dashboard/workers/claude/CLAUDE.md` (pre-research-store;
  *  the shared-behavioral-memory section but no research-store pointer). v3
  *  appends the `<!-- section:research-store v1 -->` section (WP-G). Used in the
@@ -509,6 +562,23 @@ export const WORKER_CLAUDE_MD_V2_HASH = '4c567327db31586de7b85ff4e37cae8d9726552
  *  are surfaced to the supervisor for the researcher lane. Used in the v4 file's
  *  previousHashes for silent v3→v4 upgrade. */
 export const WORKER_CLAUDE_MD_V3_HASH = '3e8e36537c3428e2a032090a34658f41a0668b0e3d83653df662b7f87ceb9064';
+
+/** SHA-256 hex of the v4 `.dashboard/workers/claude/CLAUDE.md` (online-research
+ *  division of labor, pre-planning-surface). v5 appends the
+ *  `<!-- section:plan-event-sentinel v1 -->` section (planning-surface WP2): the
+ *  read-before-edit habit + the optional `<!--PLAN-EVENT …-->` self-report
+ *  sentinel (status vocabulary + diagnostics-only `claimed_section_anchor`). Used
+ *  in the v5 file's previousHashes for silent v4→v5 upgrade. */
+export const WORKER_CLAUDE_MD_V4_HASH = 'ab5213d59f87eae5a22bef4bdff59a53ef8ecfac2f1fc7f44e7ac6e038708b49';
+
+/** SHA-256 hex of the v5 `.dashboard/workers/claude/CLAUDE.md` (the plan-event
+ *  sentinel section marked `v1`, worded "Optionally self-report"). v6 (GT-C
+ *  Decision 2 §2.6) rewrites that section (marker `v2`): the sentinel becomes
+ *  mandatory on EVERY plan-rail turn (not just writes) and the status vocabulary
+ *  expands to `integrated|reviewed|deliberating|blocked|rejected|scope-changed|transition`.
+ *  Used in the v6 file's previousHashes for silent v5→v6 upgrade of pristine
+ *  workspaces. */
+export const WORKER_CLAUDE_MD_V5_HASH = 'b8af4dde6335147b3b32a8e057b4f334cfdb8de5f1ec62ea6a3cee746675e1e4';
 
 /** SHA-256 hex of the v1 `.dashboard/researcher/scripts/research-write-guard.mjs`
  *  (allow-by-default for paths outside .dashboard/research/). v2 inverts that to
@@ -541,6 +611,14 @@ export const RESEARCHER_AGENT_MD_V2_HASH = '47e91371f37252e3f0eb4a0c341b1ec54833
  *  and native web browsing only — quick single-page lookups belong to the
  *  calling agent. Used in the v4 file's previousHashes for silent v3→v4 upgrade. */
 export const RESEARCHER_AGENT_MD_V3_HASH = '00c35328b92d340d62cb939076f6558238d6a64097dfd4fe0843f0bb96947271';
+
+/** SHA-256 hex of the v4 `.dashboard/researcher/CLAUDE.md` (adds `## What this
+ *  lane is for`). v5 adds a `## Signed-in sites` section: `pending_signin` means
+ *  wait/poll and retry the same call, `signin_unavailable` means blocked on a
+ *  human re-arm, and a guest/logged-out view is an auth-verification FAILURE,
+ *  never authenticated success. Used in the v5 file's previousHashes for silent
+ *  v4→v5 upgrade of pristine workspaces. */
+export const RESEARCHER_AGENT_MD_V4_HASH = 'ba8d6d9f9598dc47854030e47e7a2f50d1a01ad643b267cc3f091160fe909aab';
 
 /** Map an agent's role flags to its first-class app role-lane
  *  (browser-parity-and-capability-isolation §0, D-1). The single source of
@@ -704,6 +782,12 @@ function shellSingleQuote(value: string): string {
 // grace follows automatically; identity-blind recovery must never pre-empt
 // live discovery.
 const CODEX_DISCOVERY_GRACE_MS = DEFAULT_SQL_POLL_TIMEOUT_MS + 10_000;
+
+// Layer B — hard cap the launch gate may hold a codex launch before force-
+// releasing it. Sized to the discovery window + 10 s margin (same shape as the
+// grace above): a launch whose SessionStart hook never fires and whose SQLite
+// discovery never settles still can't wedge the per-home queue past this.
+const CODEX_LAUNCH_GATE_HARD_CAP_MS = DEFAULT_SQL_POLL_TIMEOUT_MS + 10_000;
 
 // Stale-rollout hardening (sibling bug in
 // docs/BUG_claude-child-session-env-poisoning.md): when recovery finds no
@@ -877,6 +961,25 @@ function findWindowsClaudePath(_env: NodeJS.ProcessEnv): Promise<string> {
   });
 }
 
+/** Fail-closed native surface used when `native/lares-native` can't even be
+ *  required (should not happen — its index.js catches internally — but keeps the
+ *  ownership store constructible). `supported:false` routes every reap to the
+ *  verified tree walk and makes verification fail-closed (never a false match). */
+function makeUnsupportedNativeSurface(reason: string): NativeJobSurface {
+  const err = (): never => { throw new Error(`lares-native unavailable (${reason})`); };
+  return {
+    supported: false,
+    loadError: reason,
+    jobName: (agentId, epoch) => `Local\\Lares.agent.${agentId}.${epoch}`,
+    createNamedJob: err,
+    openNamedJob: err,
+    assignPid: err,
+    listJobPids: err,
+    terminateJob: err,
+    pidCreationTime: err,
+  };
+}
+
 export class AgentSupervisor extends EventEmitter {
   private windowsRunners = new Map<string, WindowsRunner>();
   private wslRunners = new Map<string, WslRunner>();
@@ -887,6 +990,28 @@ export class AgentSupervisor extends EventEmitter {
   private sessionLogReader: SessionLogReader;
   private chatService: AgentChatService;
   private logsDir: string;
+
+  // ── D4 durable CLI-process ownership ────────────────────────────────────────
+  // Constructed by startOwnership() at app-ready (native module loaded there and
+  // getDb() initialized). Null until then; every call site guards with `?.`.
+  private ownership: OwnershipStore | null = null;
+  private reaper: Reaper | null = null;
+  private reconcileGate: ReconcileGate | null = null;
+  private processLister: ProcessLister = createProcessLister();
+  /** App-launch UUID — distinguishes this instance's ownership rows from prior
+   *  Lares instances (the cross-instance orphan trail). */
+  private readonly ownershipEpoch: string = crypto.randomUUID();
+  /** Reaper grace: terminal-status dwell before an agent's tree is eligible. */
+  private static readonly REAP_GRACE_MS =
+    Number(process.env.DASHBOARD_REAP_GRACE_MS ?? 15 * 60_000);
+  /** Reaper sweep cadence. */
+  private static readonly REAP_INTERVAL_MS =
+    Number(process.env.DASHBOARD_REAP_INTERVAL_MS ?? 5 * 60_000);
+
+  /** Inc 5 continuation watcher, attached by startContinuationWatcher so the
+   *  supervisor's force/toggle entry points can reach its per-agent state.
+   *  Null until the watcher boots (post-apiServer.start()). */
+  private continuationWatcher: ContinuationWatcher | null = null;
 
   // Class IV — the actually-bound API server port, injected as DASHBOARD_PORT
   // into supervised-worker process env so their Stop hook can POST to the
@@ -958,6 +1083,12 @@ export class AgentSupervisor extends EventEmitter {
   // APPLIED_HOOK_EVENTS_MAX per agent. ONLY applyHookStatusEvent touches it —
   // no transport dedupes on its own.
   private appliedHookEvents = new Map<string, Set<string>>();
+  // Planning-surface demo fix (2026-07-06): turn-scoped idempotency for the
+  // idle-path plan_events compose. The dedupe registry above is bypassed for
+  // `legacy` events and can't collapse a second idle delivery that carries a
+  // fresh ts, so a codex turn could compose two identical plan_events ms apart.
+  // This guard collapses them to one row per working→idle turn.
+  private planComposeGuard = new TurnComposeGuard();
   // Ordering guard: highest event `ts` applied per agent. An event with an
   // older ts than this is 'stale' (a laggy spool/tmux read must not flap a
   // newer HTTP-applied state).
@@ -972,6 +1103,15 @@ export class AgentSupervisor extends EventEmitter {
   // a fresh-enough codex rollout (see startCodexSidRecoveryPoll). Guards
   // against stacking concurrent polls when chat reads retrigger recovery.
   private codexSidRecoveryPolls = new Set<string>();
+  // Layer B (codex session-id race fix) — global per-codex-home serialization
+  // gate around the launch→sid-bind window. Both codex homes ('windows'|'wsl')
+  // are distinct keys; claude/gemini launches never touch it. Instantiated in
+  // the constructor with the hard cap sized to the discovery timeout + margin.
+  private codexLaunchGate!: CodexLaunchGate;
+  // Per-agent gate release handle, so whichever of {discovery-settle, hook-bind,
+  // hard-cap} fires first can let the next codex launch proceed. The acquisition
+  // release is itself idempotent, so double-release is a safe no-op.
+  private codexGateReleases = new Map<string, () => void>();
   // Rate limiter for invalid-event warnings (per agent, 60 s).
   private lastInvalidHookWarnAt = new Map<string, number>();
   // §3 — spool tailers, keyed by CANONICAL spool read path (the resolved
@@ -1007,6 +1147,14 @@ export class AgentSupervisor extends EventEmitter {
   // the durable fallback for boot reconcile).
   private pendingContinuationBricks = new Map<string, ContinuationBrick>();
 
+  // BUG-41 — agent ids with a continuation swap mid-flight. Added at
+  // continuationRelaunch entry (before the stop → 'done' window) and cleared in
+  // continuationLaunchTail's finally (success AND failure) plus continuationRelaunch's
+  // own catch if a step throws before the tail is scheduled. Read by the event
+  // bridge's isContinuationSwapInFlight dep so a 'done' recipient mid-swap
+  // queues (survives the swap) instead of dropping/purging its event queue.
+  private continuationSwapsInFlight = new Set<string>();
+
   // /clear context-bar rotation — per-agent pending hook-bound candidate
   // session ids. Set when a Claude UserPromptSubmit hook delivers a (possibly
   // new) session id for an agent; consulted again when that agent's tailed
@@ -1019,8 +1167,24 @@ export class AgentSupervisor extends EventEmitter {
   // imports ipc-handlers or its listener maps (no cycle). Null until wired.
   private notifyTerminalReboundFn: ((agentId: string) => void) | null = null;
 
+  // D5-lite admission control (incident-2026-07-11 §5 D5). Injected by index.ts
+  // from the memory watchdog; gates NEW agent launches under Critical commit
+  // pressure / static caps. Null until wired (and in every unit test), so the
+  // gate is a no-op unless the app explicitly installs it — reconcile /
+  // continuation respawns don't go through launchAgent and are never gated.
+  private launchAdmissionCheck: (() => AdmissionDecision) | null = null;
+
   constructor() {
     super();
+    // Layer B (codex session-id race fix) — global launch gate. Hard cap =
+    // discovery timeout + 10 s so a launch whose discovery never settles (dead
+    // codex, FS wedge) force-releases instead of wedging the queue. Escape hatch
+    // DASH_CODEX_LAUNCH_GATE=off for A/B testing / emergencies.
+    this.codexLaunchGate = new CodexLaunchGate({
+      hardCapMs: DEFAULT_SQL_POLL_TIMEOUT_MS + 10_000,
+      enabled: process.env.DASH_CODEX_LAUNCH_GATE !== 'off',
+      log: (m) => console.log(m),
+    });
     const appData = process.env.APPDATA || path.join(process.env.HOME || '', '.config');
     this.logsDir = path.join(appData, 'AgentDashboard', 'logs');
     if (!fs.existsSync(this.logsDir)) fs.mkdirSync(this.logsDir, { recursive: true });
@@ -1083,6 +1247,10 @@ export class AgentSupervisor extends EventEmitter {
         forceWorking: (agentId, opts) => this.monitor.forceWorking(agentId, opts),
       },
       getLastUserPtyWriteAt: (id) => this.lastUserPtyWriteAt.get(id),
+      // BUG-41: report whether a continuation swap is mid-flight for this id so
+      // the bridge queues (rather than drops/purges) events for a recipient in
+      // the transient 'done' window between stopAgent and the 'restarting' flip.
+      isContinuationSwapInFlight: (id) => this.continuationSwapsInFlight.has(id),
       // BUG-20: feed the bridge the clean assistant chat message + recent
       // file activities so idle events render real prose instead of Claude
       // Code TUI footer chrome, and surface what the agent just touched.
@@ -1094,6 +1262,13 @@ export class AgentSupervisor extends EventEmitter {
         return messages[0]?.content;
       },
       getFileActivities: (id) => getFileActivities(id),
+      // WP2 provenance spine — transcript-side breadcrumb capture. DB-backed
+      // deps injected so the tracker stays unit-testable with stubs.
+      planTouchTracker: new PlanTouchTracker({
+        getAgentPlanId: (id) => getAgent(id)?.planId ?? null,
+        getPlanPath: (planId) => getPlan(planId)?.path ?? null,
+        recordPlanSectionTouch: (input) => recordPlanSectionTouch(input),
+      }),
     };
     this.bridge = new EventBridge(bridgeDeps);
 
@@ -1135,6 +1310,18 @@ export class AgentSupervisor extends EventEmitter {
       if (data) this.maybeDeliverInitialUserPrompt(data.agentId, data.status);
     });
 
+    // GT-C §1.7 T2 — a plan-bound (launch_agent rail) agent reaching a TERMINAL
+    // status (`done`/`crashed`) releases the plan, so materialize the Execution
+    // Trail. No exemption: the agent is already terminal, so
+    // `getLiveRailAgentForPlan` excludes it and the quiescence gate is honest.
+    // Best-effort (`materialize` never throws); it also no-ops if some OTHER writer
+    // still holds the plan, and the next safe trigger regenerates.
+    this.on('statusChanged', (data: StatusChangedEvent | undefined) => {
+      if (!data || (data.status !== 'done' && data.status !== 'crashed')) return;
+      const agent = getAgent(data.agentId);
+      if (agent?.planId) void trailMaterializer.materialize(agent.planId);
+    });
+
     // Typed session-event reader — single source of truth for JSONL tailing.
     // ContextStatsMonitor consumes its 'usage' + 'tool-use' events.
     this.sessionLogReader = new SessionLogReader(() => {
@@ -1160,7 +1347,16 @@ export class AgentSupervisor extends EventEmitter {
       this.bridge.onChatEvents(batch);
     });
 
-    this.contextStatsMonitor = new ContextStatsMonitor(this.sessionLogReader);
+    // Fix rec-4: hand the monitor the agent's FROZEN launch workspace root so
+    // relative structured-tool paths are canonicalized to absolute at capture
+    // time (before addFileActivity), not inferred later from the shared cwd.
+    this.contextStatsMonitor = new ContextStatsMonitor(
+      this.sessionLogReader,
+      (agentId) => {
+        const a = getAgent(agentId);
+        return a ? getEffectiveWorkspaceRoot(a) : null;
+      },
+    );
     this.chatService = new AgentChatService(this.sessionLogReader);
 
     this.contextStatsMonitor.on('statsChanged', (stats: ContextStats) => {
@@ -1258,6 +1454,113 @@ export class AgentSupervisor extends EventEmitter {
     this.usageLimitsWatcher.close();
     this.sessionLogReader.stop();
     this.teamDeliveryEngine.stop();
+    this.reaper?.stop();
+  }
+
+  // ── D4 durable CLI-process ownership (incident-2026-07-11 §5) ─────────────────
+
+  /**
+   * Arm the ownership subsystem (store + reaper + reconcile gate) once getDb()
+   * is initialized. Loads the native Job Object surface (graceful no-op
+   * off-Windows or when the addon is unbuilt → the store/gate fail closed), then
+   * starts the periodic orphan reaper. Called from main once at app-ready, BEFORE
+   * `reconcile()`, so respawns are duplicate-CLI-gated. Idempotent.
+   */
+  startOwnership(): void {
+    if (this.ownership) return;
+    let native: NativeJobSurface;
+    try {
+      // dist/main/main/supervisor/index.js → repo root is ../../../.. ; the native
+      // module ships outside dist (native/lares-native) and its index.js never
+      // throws at require time (graceful unsupported surface off-Windows / unbuilt).
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      native = require(
+        path.join(__dirname, '..', '..', '..', '..', 'native', 'lares-native', 'index.js'),
+      ) as NativeJobSurface;
+    } catch (err) {
+      console.warn('[ownership] lares-native not loadable — reaper/gate fail-closed:', err);
+      native = makeUnsupportedNativeSurface(String(err));
+    }
+    const kill = (pid: number): void => { try { process.kill(pid); } catch { /* already gone */ } };
+    this.ownership = new OwnershipStore({
+      db: getDb(),
+      native,
+      instanceEpoch: this.ownershipEpoch,
+      now: () => Date.now(),
+      log: (m) => console.warn(m),
+    });
+    this.reconcileGate = new ReconcileGate({
+      store: this.ownership,
+      processLister: this.processLister,
+      kill,
+      now: () => Date.now(),
+      log: (m) => console.warn(m),
+    });
+    this.reaper = new Reaper({
+      store: this.ownership,
+      processLister: this.processLister,
+      kill,
+      // The idle-safety boundary: ONLY done/crashed agents are ever reachable
+      // here (idle is a healthy live status in Lares and must never be reaped).
+      listTerminalAgents: () => this.listTerminalAgentsForReap(),
+      isShuttingDown: () => this.shuttingDown,
+      now: () => Date.now(),
+      graceMs: AgentSupervisor.REAP_GRACE_MS,
+      intervalMs: AgentSupervisor.REAP_INTERVAL_MS,
+      log: (m) => console.warn(m),
+    });
+    this.reaper.start();
+    console.log(
+      `[ownership] armed epoch=${this.ownershipEpoch} native=${native.supported ? 'on' : 'off'} ` +
+        `reap(grace=${AgentSupervisor.REAP_GRACE_MS}ms interval=${AgentSupervisor.REAP_INTERVAL_MS}ms)`,
+    );
+  }
+
+  /** done/crashed agents + when they entered a terminal status (updatedAt proxy).
+   *  The reaper's ONLY input — idle/working agents are structurally excluded. */
+  private listTerminalAgentsForReap(): TerminalAgentRef[] {
+    const TERMINAL = new Set<AgentStatus>(['done', 'crashed']);
+    return getAllAgents()
+      .filter((a) => TERMINAL.has(a.status))
+      // Unparseable timestamp → treat as just-now so the full grace elapses before
+      // eligibility (fail-safe: never reap early on a bad/absent updatedAt).
+      .map((a) => ({ agentId: a.id, terminalSinceMs: parseSqliteUtcMs(a.updatedAt) ?? Date.now() }));
+  }
+
+  /** Startup orphan sweep (D4 item 4) — enumerate leftover CLI trees from prior
+   *  app epochs (+ current-epoch terminal rows). Read-only; kills nothing. */
+  async listOrphanCandidates(): Promise<OrphanCandidate[]> {
+    if (!this.ownership) return [];
+    const TERMINAL = new Set<AgentStatus>(['done', 'crashed']);
+    const isReapable = (agentId: string): boolean => {
+      const a = getAgent(agentId);
+      return !a || TERMINAL.has(a.status); // missing agent → its row is an orphan
+    };
+    return listOrphanCandidates(this.ownership, this.processLister, isReapable);
+  }
+
+  /** Bulk "Reap now" over selected orphan agent ids (each re-verified before any
+   *  kill; unverifiable owners are left in place — fail-closed). */
+  async reapOrphans(agentIds: string[]): Promise<ReapOrphansResult[]> {
+    if (!this.ownership) return [];
+    const kill = (pid: number): void => { try { process.kill(pid); } catch { /* already gone */ } };
+    return reapOrphans(this.ownership, agentIds, this.processLister, kill);
+  }
+
+  /** WAVE-4 SEAM (full-D5 attribution): expose the durable ownership store so the
+   *  index.ts attribution service can join rows → live PIDs (getLiveJobPids /
+   *  classifyTree). Read-only usage; null until startOwnership() arms it. */
+  getOwnershipStore(): OwnershipStore | null {
+    return this.ownership;
+  }
+
+  /** WAVE-4 SEAM (D1 "reap & reload"): run one reaper sweep immediately (terminal
+   *  agents past grace get their CLI trees reclaimed now, off the periodic timer).
+   *  No-op when shutting down or before startOwnership(). Returns the sweep result
+   *  for logging. */
+  async reapNow(): Promise<SweepResult | null> {
+    if (!this.reaper) return null;
+    return this.reaper.sweepOnce();
   }
 
   /** Graceful pre-quit drain. Windows claude.exe processes share
@@ -1269,6 +1572,10 @@ export class AgentSupervisor extends EventEmitter {
    *  ~/.claude.json, and tmux sessions outlive Electron by design. */
   async drainForShutdown(perAgentTimeoutMs = 4000, totalBudgetMs = 15000): Promise<void> {
     this.shuttingDown = true;
+    // D4: reaper off while shuttingDown (drain-time survival is intentional —
+    // reconcile respawns those agents next launch). The isShuttingDown gate also
+    // fail-safes any in-flight sweep.
+    this.reaper?.stop();
     const deadline = Date.now() + totalBudgetMs;
     for (const [id, runner] of [...this.windowsRunners]) {
       const provider = getAgent(id)?.provider;
@@ -1329,6 +1636,19 @@ export class AgentSupervisor extends EventEmitter {
   }
 
   async launchAgent(input: LaunchAgentInput): Promise<Agent> {
+    // D5-lite admission gate (incident-2026-07-11 §5 D5): refuse NEW launches
+    // under Critical commit pressure or at a static cap, BEFORE any side effect
+    // (createAgent / spawn). The refusal carries a machine-readable `code`
+    // (`memory-critical` / `memory-capacity`) + `statusCode` 503 so the API/MCP
+    // caller — e.g. weekendburn's orchestrator — receives a structured "no"
+    // instead of silently degrading. No-op until index.ts installs the gate;
+    // reconcile/continuation respawns don't go through launchAgent (see the
+    // launchAdmissionCheck field comment) and are never gated.
+    if (this.launchAdmissionCheck) {
+      const decision = this.launchAdmissionCheck();
+      if (!decision.allowed) throw new AdmissionError(decision);
+    }
+
     const workspace = getWorkspace(input.workspaceId);
     if (!workspace) throw new Error('Workspace not found');
 
@@ -1616,6 +1936,11 @@ export class AgentSupervisor extends EventEmitter {
       logPath,
       templateId: resolvedInput.templateId || null,
       systemPrompt: resolvedInput.systemPrompt || null,
+      // Planning surface WP1: freeze the launch-rail plan binding onto the agent
+      // row. The launch route (POST /api/agents) already validated that planId
+      // references an existing plans row, so the FK → plans.id resolves.
+      planId: resolvedInput.planId || null,
+      planSection: resolvedInput.planSection || null,
     });
 
     // WP-A.2 (F9) — if this launch is joining a team, record the membership now,
@@ -1783,8 +2108,8 @@ export class AgentSupervisor extends EventEmitter {
   private static SUPERVISOR_FILES: Record<string, ScaffoldFile> = {
     [`.dashboard/supervisor/CLAUDE.md`]:                                              {
       content: SUPERVISOR_AGENT_MD,
-      version: 9, // v9 adds the reorientation-note-v1 sentinel (brick Inc 1 D1/D2) + the get_usage_limits bullet
-      previousHashes: { 1: SUPERVISOR_AGENT_MD_V1_HASH, 2: SUPERVISOR_AGENT_MD_V2_HASH, 3: SUPERVISOR_AGENT_MD_V3_HASH, 4: SUPERVISOR_AGENT_MD_V4_HASH, 5: SUPERVISOR_AGENT_MD_V5_HASH, 6: SUPERVISOR_AGENT_MD_V6_HASH, 7: SUPERVISOR_AGENT_MD_V7_HASH, 8: SUPERVISOR_AGENT_MD_V8_HASH },
+      version: 11, // v11 rewrites section:planning-surface v1: sec_exectr is system-owned (never dispatch/edit); dispatch to the UPDATED section (sec_opitem); mandate the turn-end checkbox-flip + PLAN-EVENT writeback
+      previousHashes: { 1: SUPERVISOR_AGENT_MD_V1_HASH, 2: SUPERVISOR_AGENT_MD_V2_HASH, 3: SUPERVISOR_AGENT_MD_V3_HASH, 4: SUPERVISOR_AGENT_MD_V4_HASH, 5: SUPERVISOR_AGENT_MD_V5_HASH, 6: SUPERVISOR_AGENT_MD_V6_HASH, 7: SUPERVISOR_AGENT_MD_V7_HASH, 8: SUPERVISOR_AGENT_MD_V8_HASH, 9: SUPERVISOR_AGENT_MD_V9_HASH, 10: SUPERVISOR_AGENT_MD_V10_HASH },
     },
     [`.dashboard/supervisor/.claude/settings.json`]:                                  {
       content: SUPERVISOR_CLAUDE_SETTINGS_JSON,
@@ -1800,7 +2125,7 @@ export class AgentSupervisor extends EventEmitter {
     // Persona kit (§1.4) — the two default skills ship into every native lane too
     // so the supervisor/researcher/worker can guide persona creation + read comments.
     [`.dashboard/supervisor/.claude/skills/create-persona/SKILL.md`]:                 { content: PERSONA_CREATE_PERSONA_SKILL, version: 2, previousHashes: { 1: sha256Hex(PERSONA_CREATE_PERSONA_SKILL_V1) } },
-    [`.dashboard/supervisor/.claude/skills/read-comments/SKILL.md`]:                  { content: PERSONA_READ_COMMENTS_SKILL, version: 1 },
+    [`.dashboard/supervisor/.claude/skills/read-comments/SKILL.md`]:                  { content: PERSONA_READ_COMMENTS_SKILL, version: 2, previousHashes: { 1: sha256Hex(PERSONA_READ_COMMENTS_SKILL_V1) } }, // QW2: sharpened trigger description
     // NOTE: .dashboard/supervisor/memory/MEMORY.md is deliberately NOT managed
     // here — it is seeded once via seedSupervisorMemoryIfAbsent (seed-once
     // contract, parallels worker behavioral.md). Keeping it in this map would
@@ -1875,8 +2200,8 @@ export class AgentSupervisor extends EventEmitter {
   private static WORKER_FILES_CLAUDE: Record<string, ScaffoldFile> = {
     [`.dashboard/workers/claude/CLAUDE.md`]:                       {
       content: WORKER_CLAUDE_MD,
-      version: 4, // v2 adds the memory section; v3 (WP-G) adds the research-store pointer; v4 adds the online-research division of labor
-      previousHashes: { 1: sha256Hex(WORKER_CLAUDE_MD_V1), 2: WORKER_CLAUDE_MD_V2_HASH, 3: WORKER_CLAUDE_MD_V3_HASH },
+      version: 6, // v2 adds the memory section; v3 (WP-G) adds the research-store pointer; v4 adds the online-research division of labor; v5 (planning-surface WP2) adds the plan-event sentinel section; v6 (GT-C D2) makes the PLAN-EVENT sentinel mandatory on every rail turn + expands the status vocab
+      previousHashes: { 1: sha256Hex(WORKER_CLAUDE_MD_V1), 2: WORKER_CLAUDE_MD_V2_HASH, 3: WORKER_CLAUDE_MD_V3_HASH, 4: WORKER_CLAUDE_MD_V4_HASH, 5: WORKER_CLAUDE_MD_V5_HASH },
     },
     [`.dashboard/workers/claude/.claude/settings.json`]:           {
       content: WORKER_CLAUDE_SETTINGS_JSON,
@@ -1892,7 +2217,7 @@ export class AgentSupervisor extends EventEmitter {
     },
     // Persona kit (§1.4) — default skills for the Claude worker lane.
     [`.dashboard/workers/claude/.claude/skills/create-persona/SKILL.md`]: { content: PERSONA_CREATE_PERSONA_SKILL, version: 2, previousHashes: { 1: sha256Hex(PERSONA_CREATE_PERSONA_SKILL_V1) } },
-    [`.dashboard/workers/claude/.claude/skills/read-comments/SKILL.md`]:  { content: PERSONA_READ_COMMENTS_SKILL, version: 1 },
+    [`.dashboard/workers/claude/.claude/skills/read-comments/SKILL.md`]:  { content: PERSONA_READ_COMMENTS_SKILL, version: 2, previousHashes: { 1: sha256Hex(PERSONA_READ_COMMENTS_SKILL_V1) } }, // QW2: sharpened trigger description
   };
 
   /** WP-G — Research store skeleton (plans/groupthink/browser-parity-and-research-store.md).
@@ -1913,12 +2238,12 @@ export class AgentSupervisor extends EventEmitter {
    *  turn-boundary status hooks. CLAUDE.md is the generic base persona contract
    *  (RESEARCHER_AGENT_MD) — managed/version-migrated like the supervisor's. */
   private static RESEARCHER_FILES: Record<string, ScaffoldFile> = {
-    [`.dashboard/researcher/CLAUDE.md`]:                         { content: RESEARCHER_AGENT_MD, version: 4, previousHashes: { 1: RESEARCHER_AGENT_MD_V1_HASH, 2: RESEARCHER_AGENT_MD_V2_HASH, 3: RESEARCHER_AGENT_MD_V3_HASH } },
+    [`.dashboard/researcher/CLAUDE.md`]:                         { content: RESEARCHER_AGENT_MD, version: 5, previousHashes: { 1: RESEARCHER_AGENT_MD_V1_HASH, 2: RESEARCHER_AGENT_MD_V2_HASH, 3: RESEARCHER_AGENT_MD_V3_HASH, 4: RESEARCHER_AGENT_MD_V4_HASH } },
     [`.dashboard/researcher/.claude/settings.json`]:             { content: RESEARCHER_CLAUDE_SETTINGS_JSON, version: 2, previousHashes: { 1: sha256Hex(RESEARCHER_CLAUDE_SETTINGS_JSON_V1) } },
     [`.dashboard/researcher/scripts/research-write-guard.mjs`]:  { content: RESEARCH_WRITE_GUARD_MJS, version: 2, previousHashes: { 1: RESEARCH_WRITE_GUARD_MJS_V1_HASH }, executable: true },
     // Persona kit (§1.4) — default skills for the researcher lane.
     [`.dashboard/researcher/.claude/skills/create-persona/SKILL.md`]: { content: PERSONA_CREATE_PERSONA_SKILL, version: 1 },
-    [`.dashboard/researcher/.claude/skills/read-comments/SKILL.md`]:  { content: PERSONA_READ_COMMENTS_SKILL, version: 1 },
+    [`.dashboard/researcher/.claude/skills/read-comments/SKILL.md`]:  { content: PERSONA_READ_COMMENTS_SKILL, version: 2, previousHashes: { 1: sha256Hex(PERSONA_READ_COMMENTS_SKILL_V1) } }, // QW2: sharpened trigger description
   };
 
   /** Delegates to the shared free-function writer in ../scaffold-writer (D1
@@ -2374,7 +2699,7 @@ export class AgentSupervisor extends EventEmitter {
    *  in-process JSON (never on disk). Impure inputs (script path, bound port,
    *  token, WSL gateway IP) are supplied here; the JSON shape is built by the
    *  pure `buildDashboardMcpConfigArg`. */
-  buildDashboardMcpConfigForLane(lane: AgentRoleLane, pathType: string): string {
+  buildDashboardMcpConfigForLane(lane: AgentRoleLane, pathType: string, identityEnv?: Record<string, string>): string {
     return buildDashboardMcpConfigArg({
       toolsets: toolsetsForLane(lane),
       pathType,
@@ -2382,7 +2707,34 @@ export class AgentSupervisor extends EventEmitter {
       apiPort: this.apiServerPort,
       apiToken: getApiToken(),
       wslHostIp: pathType === 'wsl' ? this.resolveWslGatewayIp() : undefined,
+      // GT-A WP-A4 (D-2) — forward the agent's identity rail into the MCP sidecar
+      // env explicitly (not via parent-env inheritance) so the plans-read
+      // env-default (AGENT_DASHBOARD_PLAN_ID) + CALLER_HEADERS identity spread
+      // resolve deterministically. buildDashboardMcpConfigArg spreads it FIRST so
+      // the fixed API keys always win.
+      identityEnv,
     });
+  }
+
+  /** GT-A WP-A4 (D-2) — the identity rail forwarded into an agent's dashboard MCP
+   *  sidecar env, mirroring the FULL contract assembled into the agent's own
+   *  process env at launch (index.ts ~:2881–:2904): self/workspace always,
+   *  supervisor id for supervisors only, and the frozen-at-launch plan rail when
+   *  the agent is plan-bound. Only non-empty string values are emitted so an
+   *  absent field never lands as an empty env var. */
+  private buildIdentityEnvForAgent(agent: Agent): Record<string, string> {
+    const env: Record<string, string> = {};
+    if (agent.id) env.AGENT_DASHBOARD_SELF_ID = agent.id;
+    if (agent.workspaceId) env.AGENT_DASHBOARD_WORKSPACE_ID = agent.workspaceId;
+    // INNER guard (D-16): supervisor-privileged only — a worker/researcher must
+    // never carry another agent's supervisor assertion. A privilegeLane:'supervisor'
+    // persona (#19) DOES carry its OWN id as the assertion — it holds the supervisor
+    // toolset and must authenticate its own save_continuation_brick / get_my_context
+    // calls on the X-Supervisor-Id rail.
+    if (hasSupervisorPrivilege(agent) && agent.id) env.AGENT_DASHBOARD_SUPERVISOR_ID = agent.id;
+    if (agent.planId) env.AGENT_DASHBOARD_PLAN_ID = agent.planId;
+    if (agent.planSection) env.AGENT_DASHBOARD_PLAN_SECTION = agent.planSection;
+    return env;
   }
 
   /** Build --mcp-config JSON for a team member agent (used at launch time).
@@ -2524,7 +2876,7 @@ export class AgentSupervisor extends EventEmitter {
         const membership = getTeamMembership(agent.id);
         const mcpConfigs: string[] = [];
         if (lane !== 'legacy') {
-          mcpConfigs.push(this.buildDashboardMcpConfigForLane(lane, 'windows'));
+          mcpConfigs.push(this.buildDashboardMcpConfigForLane(lane, 'windows', this.buildIdentityEnvForAgent(agent)));
         }
         if (membership) {
           mcpConfigs.push(this.buildTeamMcpConfigArg(agent.id, membership.teamId, 'windows'));
@@ -2700,6 +3052,15 @@ export class AgentSupervisor extends EventEmitter {
       if (tracker) tracker.processData(data);
     });
 
+    // D4 ownership (incident-2026-07-11 §5): the runner's ROOT pid arrives
+    // asynchronously from the pty host, so persist the durable ownership row (and
+    // create + assign the named Job Object) when it lands, not at launch(). The
+    // store always writes the DB row; native failure only downgrades reaps to the
+    // verified tree walk. No-op until startOwnership() has armed the store.
+    runner.on('pid', (pid: number) => {
+      this.ownership?.recordWindowsSpawn(agent.id, pid);
+    });
+
     runner.on('exit', (exitCode: number) => {
       // Drain-time exits must NOT flip status to 'done'/'crashed' — keeping
       // the agent 'working'/'idle' in the DB is what makes reconcile()
@@ -2763,10 +3124,22 @@ export class AgentSupervisor extends EventEmitter {
     // freshSession opt-out left `resumeSessionId` null and forced
     // CodexRolloutReader to fall back to cwd-as-identity proxy, which
     // mis-attributed events under concurrent same-cwd launches.
-    const codexSnapshot = shouldDiscoverCodexSession({ provider: agent.provider, resume, freshSession })
-      ? await snapshotCodexSessions('windows')
-      : null;
-    const codexLaunchStartedAt = Date.now();
+    // Layer B: serialize the launch→sid-bind window per codex home. Acquire the
+    // 'windows' key BEFORE the pre-launch snapshot so a concurrent same-cwd
+    // codex launch can't interleave its snapshot/discovery with this one; the
+    // hold is released the moment this launch's sid binds (hook or SQL), on
+    // discovery decline, or at the hard cap. A solo launch acquires instantly.
+    let codexSnapshot: Awaited<ReturnType<typeof snapshotCodexSessions>> | null = null;
+    let codexLaunchStartedAt = 0;
+    if (shouldDiscoverCodexSession({ provider: agent.provider, resume, freshSession })) {
+      const gate = await this.codexLaunchGate.acquire('windows');
+      this.codexGateReleases.set(agent.id, gate.release);
+      if (gate.waitedMs > 0) {
+        console.log(`[supervisor] codex launch gate: agent ${agent.id} waited ${gate.waitedMs}ms behind ${gate.queuedBehind} launch(es) on windows`);
+      }
+      codexSnapshot = await snapshotCodexSessions('windows');
+      codexLaunchStartedAt = Date.now();
+    }
 
     // BUG-13 Path A: disable Claude Code's next-prompt ghost-text suggestion
     // rendering. The grey suggestion bytes (a) flap PTY-fallback status
@@ -2824,11 +3197,23 @@ export class AgentSupervisor extends EventEmitter {
       extraEnv.AGENT_DASHBOARD_WORKSPACE_ID = agent.workspaceId;
       // Context-brick Inc 2 (2.1, ≡ P1-10a) — the supervisor identity rail,
       // forwarded by the shim's generic CALLER_HEADERS scan as X-Supervisor-Id.
-      // INNER guard (D-16): supervisors only — workers/researchers must NOT
-      // carry another agent's supervisor assertion. Parent-process env only,
-      // never the workspace-shared .mcp.json.
-      if (agent.isSupervisor) {
+      // INNER guard (D-16): supervisor-privileged only — workers/researchers must
+      // NOT carry another agent's supervisor assertion. A privilegeLane:'supervisor'
+      // persona (#19) carries its OWN id (holds the supervisor toolset). Parent-
+      // process env only, never the workspace-shared .mcp.json.
+      if (hasSupervisorPrivilege(agent)) {
         extraEnv.AGENT_DASHBOARD_SUPERVISOR_ID = agent.id;
+      }
+      // Planning surface WP1: the frozen-at-launch plan rail, so a bound agent can
+      // resolve its plan surface + target section from its own env. MUST be
+      // mirrored at the WSL wslEnvPrefix site below — the WSL branch re-declares
+      // every var itself, so a var added only here NEVER reaches WSL agents
+      // (§7 risk 1: the dual env-injection trap).
+      if (agent.planId) {
+        extraEnv.AGENT_DASHBOARD_PLAN_ID = agent.planId;
+      }
+      if (agent.planSection) {
+        extraEnv.AGENT_DASHBOARD_PLAN_SECTION = agent.planSection;
       }
     }
     // AGENT_BROWSER_ACTIONS — INTENTIONALLY NOT SET in the researcher child env.
@@ -3156,6 +3541,10 @@ export class AgentSupervisor extends EventEmitter {
       workingDirectory,
       launchedAfterMs,
       firstUserMessagePrefix: firstUserMessagePrefix ?? '',
+      // Layer A demotes SQLite discovery to a FALLBACK: if the SessionStart hook
+      // already bound the sid (env-direct, race-free), abandon the poll and skip
+      // the file-scan fallback — the hook wrote the authoritative id.
+      shouldAbort: () => !!getAgent(agentId)?.resumeSessionId,
       // Default timeout (DEFAULT_SQL_POLL_TIMEOUT_MS = 35 s) lives in
       // session-id-discovery.ts. It's sized for codex's deferred threads-row
       // INSERT (~25-26 s after launch); see the comment on that constant.
@@ -3171,7 +3560,58 @@ export class AgentSupervisor extends EventEmitter {
       console.log(`[Codex] Captured session id ${result.sessionId} for agent ${agentId}`);
     }).catch((err) => {
       console.warn(`[Codex] session-id discovery failed for ${agentId}:`, err);
+    }).finally(() => {
+      // Layer B: release-on-discovery-settle. The gate held the NEXT codex
+      // launch's snapshot behind THIS launch until its sid bound (hook or SQL)
+      // or discovery gave up. Idempotent — a hook-bind may have released first.
+      this.releaseCodexLaunchGate(agentId);
     });
+  }
+
+  /** Layer B — release this agent's codex-launch-gate hold, if any. Called from
+   *  whichever of {discovery-settle, hook-bind} fires first (the gate's own
+   *  hard-cap timer is a third, internal, releaser). Idempotent. */
+  private releaseCodexLaunchGate(agentId: string): void {
+    const release = this.codexGateReleases.get(agentId);
+    if (!release) return;
+    this.codexGateReleases.delete(agentId);
+    release();
+  }
+
+  /** Layer A — bind a codex agent to its own session id reported by the
+   *  SessionStart hook (routed here by AGENT_ID env, so env-direct and
+   *  race-free under the shared-cwd invariant). Mirrors captureCodexSessionId's
+   *  success path (updateAgentResumeSessionId + rebindAgent) behind the same
+   *  null-guard, plus sibling-theft protection. Returns the decision so the API
+   *  endpoint can map it to an HTTP status. Also releases the Layer B launch
+   *  gate on a successful bind (release-on-bind, sub-second common case). */
+  public bindCodexSessionFromHook(
+    agentId: string,
+    sessionId: string | null | undefined,
+  ): CodexHookBindDecision {
+    const agent = getAgent(agentId);
+    let sessionOwnedByOther = false;
+    const sid = typeof sessionId === 'string' ? sessionId.trim() : '';
+    if (sid && agent) {
+      for (const other of getAllAgents()) {
+        if (other.id !== agentId && other.resumeSessionId === sid) {
+          sessionOwnedByOther = true;
+          break;
+        }
+      }
+    }
+    const decision = decideCodexHookBind({ agent, sessionId, sessionOwnedByOther });
+    if (decision.action === 'bind') {
+      updateAgentResumeSessionId(agentId, decision.sessionId);
+      // Drop any provisional/wrong ring events emitted while sessionId was
+      // empty (identity-blind window) so they can't survive into the chat.
+      this.sessionLogReader.rebindAgent(agentId);
+      // Layer B: an identity-strong hook bind lifts the chat-blind grace and
+      // lets the next codex launch proceed immediately.
+      this.releaseCodexLaunchGate(agentId);
+      console.log(`[Codex] Hook-bound session id ${decision.sessionId} for agent ${agentId}`);
+    }
+    return decision;
   }
 
   private async launchWslAgent(agent: Agent, resume = false, agentMdPrompt?: string | null, overrideCommand?: string, sessionId?: string, freshSession = false, firstUserMessagePrefix?: string | null): Promise<void> {
@@ -3258,10 +3698,21 @@ export class AgentSupervisor extends EventEmitter {
       wslEnvPrefix.push(`AGENT_DASHBOARD_WORKSPACE_ID=${shQuote(agent.workspaceId)}`);
       // Context-brick Inc 2 (2.1, ≡ P1-10a) — supervisor identity rail, same
       // tmux command-line assignment idiom as the sibling SELF_ID (needs no
-      // WSLENV declaration). INNER guard (D-16): supervisors only — workers
-      // must NOT carry AGENT_DASHBOARD_SUPERVISOR_ID.
-      if (agent.isSupervisor) {
+      // WSLENV declaration). INNER guard (D-16): supervisor-privileged only —
+      // workers must NOT carry AGENT_DASHBOARD_SUPERVISOR_ID. A
+      // privilegeLane:'supervisor' persona (#19) carries its OWN id.
+      if (hasSupervisorPrivilege(agent)) {
         wslEnvPrefix.push(`AGENT_DASHBOARD_SUPERVISOR_ID=${agent.id}`);
+      }
+      // Planning surface WP1: the frozen-at-launch plan rail (§7 risk 1: this WSL
+      // branch re-declares every var, so it MUST mirror the extraEnv site above or
+      // WSL agents silently lack the plan vars). Same tmux command-line assignment
+      // idiom as the sibling SELF_ID — needs no WSLENV declaration.
+      if (agent.planId) {
+        wslEnvPrefix.push(`AGENT_DASHBOARD_PLAN_ID=${shQuote(agent.planId)}`);
+      }
+      if (agent.planSection) {
+        wslEnvPrefix.push(`AGENT_DASHBOARD_PLAN_SECTION=${shQuote(agent.planSection)}`);
       }
     }
     if (wslEnvPrefix.length > 0) {
@@ -3331,7 +3782,7 @@ export class AgentSupervisor extends EventEmitter {
         const membership = getTeamMembership(agent.id);
         const mcpConfigs: string[] = [];
         if (lane !== 'legacy') {
-          mcpConfigs.push(this.buildDashboardMcpConfigForLane(lane, 'wsl'));
+          mcpConfigs.push(this.buildDashboardMcpConfigForLane(lane, 'wsl', this.buildIdentityEnvForAgent(agent)));
         }
         if (membership) {
           mcpConfigs.push(this.buildTeamMcpConfigArg(agent.id, membership.teamId, 'wsl'));
@@ -3608,10 +4059,21 @@ export class AgentSupervisor extends EventEmitter {
     // runs post-launch discovery so the new agent record gets bound to the
     // codex-minted session id via the race-resistant SQLite path. See the
     // longer rationale on the Windows path above.
-    const codexSnapshot = shouldDiscoverCodexSession({ provider: agent.provider, resume, freshSession })
-      ? await snapshotCodexSessions('wsl')
-      : null;
-    const codexLaunchStartedAt = Date.now();
+    // Layer B: serialize the launch→sid-bind window per codex home. Acquire the
+    // 'wsl' key (distinct from 'windows') BEFORE the pre-launch snapshot; see
+    // the Windows path above for the full rationale. Released on sid-bind (hook
+    // or SQL), discovery decline, or the hard cap.
+    let codexSnapshot: Awaited<ReturnType<typeof snapshotCodexSessions>> | null = null;
+    let codexLaunchStartedAt = 0;
+    if (shouldDiscoverCodexSession({ provider: agent.provider, resume, freshSession })) {
+      const gate = await this.codexLaunchGate.acquire('wsl');
+      this.codexGateReleases.set(agent.id, gate.release);
+      if (gate.waitedMs > 0) {
+        console.log(`[supervisor] codex launch gate: agent ${agent.id} waited ${gate.waitedMs}ms behind ${gate.queuedBehind} launch(es) on wsl`);
+      }
+      codexSnapshot = await snapshotCodexSessions('wsl');
+      codexLaunchStartedAt = Date.now();
+    }
 
     // P1 §2 step 4a(iii) — current-launch stamp for the tmux-option freshness
     // gate. Set IMMEDIATELY BEFORE the actual runner launch so no event this
@@ -3624,6 +4086,9 @@ export class AgentSupervisor extends EventEmitter {
     // builder uses. (Windows is args-array based — structurally immune — so no
     // guard there; if one is ever wanted it must use `args.includes('resume')`.)
     if (agent.provider === 'codex' && !resume && tokenizeShell(command).includes('resume')) {
+      // Release the Layer B gate before bailing so a rejected launch can't hold
+      // the queue for the full hard-cap window.
+      this.releaseCodexLaunchGate(agent.id);
       throw new Error(`Codex fresh launch for ${agent.id} unexpectedly contains a 'resume' subcommand`);
     }
     await runner.launch(wslWorkDir, command, nativeLogPath, diagnostics);
@@ -3765,7 +4230,7 @@ export class AgentSupervisor extends EventEmitter {
     if (pathType === 'windows') {
       const parts = source.command.split(/\s+/);
       const forkMcp = forkLane !== 'legacy'
-        ? ['--mcp-config', this.buildDashboardMcpConfigForLane(forkLane, 'windows'), ...(forkStrict ? ['--strict-mcp-config'] : [])]
+        ? ['--mcp-config', this.buildDashboardMcpConfigForLane(forkLane, 'windows', this.buildIdentityEnvForAgent(newAgent)), ...(forkStrict ? ['--strict-mcp-config'] : [])]
         : [];
       const forkTools = forkResearcher
         ? ['--tools', RESEARCHER_ALLOWED_TOOLS.join(','), '--disallowedTools', RESEARCHER_DISALLOWED_TOOLS.join(','), '--model', 'claude-sonnet-4-6']
@@ -3774,7 +4239,7 @@ export class AgentSupervisor extends EventEmitter {
       await this.launchWindowsAgent(newAgent, false, null, undefined, forkArgs);
     } else {
       const forkMcp = forkLane !== 'legacy'
-        ? ` --mcp-config '${this.buildDashboardMcpConfigForLane(forkLane, 'wsl')}'${forkStrict ? ' --strict-mcp-config' : ''}`
+        ? ` --mcp-config '${this.buildDashboardMcpConfigForLane(forkLane, 'wsl', this.buildIdentityEnvForAgent(newAgent))}'${forkStrict ? ' --strict-mcp-config' : ''}`
         : '';
       const forkTools = forkResearcher
         ? ` --tools '${RESEARCHER_ALLOWED_TOOLS.join(',')}' --disallowedTools '${RESEARCHER_DISALLOWED_TOOLS.join(',')}' --model claude-sonnet-4-6`
@@ -4002,6 +4467,7 @@ export class AgentSupervisor extends EventEmitter {
     this.lastAppliedHookTs.delete(agentId);
     this.launchStartedAt.delete(agentId);
     this.lastInvalidHookWarnAt.delete(agentId);
+    this.planComposeGuard.forget(agentId);
     this.releaseSpoolTailer(agentId);
     // WP-P2 — drop any undelivered initial prompt with the agent record.
     this.pendingInitialPrompts.delete(agentId);
@@ -4064,57 +4530,70 @@ export class AgentSupervisor extends EventEmitter {
       throw new Error(`continuationRelaunch: attempt ${brick.handoffAttemptId} not found for agent ${agentId}`);
     }
 
-    // Step 1.5 (BUG-39 WP1) — soften the kill: pause before the PTY stop so the
-    // Claude CLI flushes its transcript tail (the predecessor's JSONL otherwise
-    // loses even the brick tool_use/tool_result lines when stopAgent races the
-    // writer). The route re-checked self-busy against a completed turn just
-    // before calling in, so this short sleep reopens no meaningful race.
-    await new Promise((r) => setTimeout(r, CONTINUATION_STOP_FLUSH_DELAY_MS));
+    // BUG-41 — mark the swap in flight BEFORE the stop (so the sub-second 'done'
+    // window between stopAgent and the 'restarting' flip is covered). Cleared in
+    // continuationLaunchTail's finally on the normal path; the catch below clears
+    // it if a step throws before the launch tail is scheduled (the tail's finally
+    // would then never run — a permanently-failed swap must not leak the flag).
+    this.continuationSwapsInFlight.add(agentId);
+    try {
+      // Step 1.5 (BUG-39 WP1) — soften the kill: pause before the PTY stop so the
+      // Claude CLI flushes its transcript tail (the predecessor's JSONL otherwise
+      // loses even the brick tool_use/tool_result lines when stopAgent races the
+      // writer). The route re-checked self-busy against a completed turn just
+      // before calling in, so this short sleep reopens no meaningful race.
+      await new Promise((r) => setTimeout(r, CONTINUATION_STOP_FLUSH_DELAY_MS));
 
-    // Step 2 — stop + forget + clear pending per-agent state.
-    await this.stopAgent(agentId);
-    this.monitor.forgetAgent(agentId);
-    this.pendingInitialPrompts.delete(agentId);
+      // Step 2 — stop + forget + clear pending per-agent state.
+      await this.stopAgent(agentId);
+      this.monitor.forgetAgent(agentId);
+      this.pendingInitialPrompts.delete(agentId);
 
-    // Step 3 — the atomic transaction (session mint + generation bump to the
-    // attempt's successorGen + attempt close 'relaunched'). Synchronous,
-    // BEFORE the relaunch timer; generation advances nowhere else.
-    const newSession = uuidv4();
-    commitContinuationRelaunch(agentId, newSession, attempt.generation, attempt.id);
+      // Step 3 — the atomic transaction (session mint + generation bump to the
+      // attempt's successorGen + attempt close 'relaunched'). Synchronous,
+      // BEFORE the relaunch timer; generation advances nowhere else.
+      const newSession = uuidv4();
+      commitContinuationRelaunch(agentId, newSession, attempt.generation, attempt.id);
 
-    // Step 4 — ONE rebind call: delegates invalidatePath to every reader and
-    // emits agent-rebound (purges ring/context-stats/file_activities layers).
-    this.sessionLogReader.rebindAgent(agentId);
+      // Step 4 — ONE rebind call: delegates invalidatePath to every reader and
+      // emits agent-rebound (purges ring/context-stats/file_activities layers).
+      this.sessionLogReader.rebindAgent(agentId);
 
-    // Step 5 — audit + status.
-    addEvent(agentId, 'continuation', JSON.stringify({
-      generation: attempt.generation,
-      handoffAttemptId: attempt.id,
-      noteId: brick.noteId,
-      reason: brick.reason,
-      newSession,
-    }));
-    const priorCont = getAgent(agentId)?.status;
-    updateAgentStatus(agentId, 'restarting');
-    this.emit('statusChanged', { agentId, status: 'restarting', fromStatus: priorCont, source: 'continuation' } satisfies StatusChangedEvent);
+      // Step 5 — audit + status.
+      addEvent(agentId, 'continuation', JSON.stringify({
+        generation: attempt.generation,
+        handoffAttemptId: attempt.id,
+        noteId: brick.noteId,
+        reason: brick.reason,
+        newSession,
+      }));
+      const priorCont = getAgent(agentId)?.status;
+      updateAgentStatus(agentId, 'restarting');
+      this.emit('statusChanged', { agentId, status: 'restarting', fromStatus: priorCont, source: 'continuation' } satisfies StatusChangedEvent);
 
-    // Step 6 — hand the brick to the upcoming launch's sysprompt builder.
-    this.pendingContinuationBricks.set(agentId, brick);
+      // Step 6 — hand the brick to the upcoming launch's sysprompt builder.
+      this.pendingContinuationBricks.set(agentId, brick);
 
-    // Step 6.5 (BUG-39 WP2) — pre-stage the successor: seed the kickoff as an
-    // auto-submitted initial USER message so the fresh session orients itself
-    // the instant it boots (before the human types), riding the EXISTING
-    // pendingInitialPrompts delivery rail (maybeDeliverInitialUserPrompt fires
-    // on the first input-accepting transition). Step 2 deleted the predecessor's
-    // stale pending prompt; this seeds the fresh kickoff in its place. Same TTL
-    // as the launch_agent initialUserPrompt path.
-    this.pendingInitialPrompts.set(agentId, {
-      text: buildContinuationKickoffMessage(),
-      expiresAt: Date.now() + INITIAL_USER_PROMPT_TTL_MS,
-    });
+      // Step 6.5 (BUG-39 WP2) — pre-stage the successor: seed the kickoff as an
+      // auto-submitted initial USER message so the fresh session orients itself
+      // the instant it boots (before the human types), riding the EXISTING
+      // pendingInitialPrompts delivery rail (maybeDeliverInitialUserPrompt fires
+      // on the first input-accepting transition). Step 2 deleted the predecessor's
+      // stale pending prompt; this seeds the fresh kickoff in its place. Same TTL
+      // as the launch_agent initialUserPrompt path.
+      this.pendingInitialPrompts.set(agentId, {
+        text: buildContinuationKickoffMessage(),
+        expiresAt: Date.now() + INITIAL_USER_PROMPT_TTL_MS,
+      });
 
-    // Step 7 — the runner-launch tail (and ONLY the launch).
-    this.continuationLaunchTail(agentId, newSession);
+      // Step 7 — the runner-launch tail (and ONLY the launch).
+      this.continuationLaunchTail(agentId, newSession);
+    } catch (err) {
+      // A step threw before the launch tail was scheduled → its finally will
+      // never clear the predicate. Clear it here so the swap flag does not leak.
+      this.continuationSwapsInFlight.delete(agentId);
+      throw err;
+    }
   }
 
   /** Context-brick Inc 4 (4.1 step 7 / 4.9) — the idempotent runner-launch
@@ -4146,6 +4625,11 @@ export class AgentSupervisor extends EventEmitter {
         this.emit('statusChanged', { agentId, status: 'crashed', fromStatus: priorFail, source: 'continuation-failed' } satisfies StatusChangedEvent);
       } finally {
         this.pendingContinuationBricks.delete(agentId);
+        // BUG-41 — the swap is over (launch resolved OR failed): clear the
+        // predicate so a 'done'/'restarting' recipient purges normally again and
+        // no drain timer re-arms forever. Harmless no-op for the boot-reconcile
+        // re-drive, which reaches this tail without having set the flag.
+        this.continuationSwapsInFlight.delete(agentId);
       }
     }, 1000);
   }
@@ -4189,7 +4673,7 @@ export class AgentSupervisor extends EventEmitter {
     const blockB =
       `Situational identity (echo only — tools auto-scope; do NOT pass as tool args): ` +
       `dashboard_agent_id=${agent.id} workspace_id=${agent.workspaceId}` +
-      (agent.isSupervisor ? ` supervisor_id=${agent.id}` : '');
+      (hasSupervisorPrivilege(agent) ? ` supervisor_id=${agent.id}` : '');
     // Block C — the predecessor's note, verbatim.
     const blockC = `Predecessor's continuation note (verbatim):\n${brick.note}`;
 
@@ -4292,6 +4776,13 @@ export class AgentSupervisor extends EventEmitter {
    *  (handles api-server.ts EADDRINUSE auto-increment). */
   setApiServerPort(port: number): void {
     this.apiServerPort = port;
+  }
+
+  /** D5-lite (incident-2026-07-11 §5 D5) — install the memory-watchdog admission
+   *  gate for NEW agent launches. Called once from index.ts after the sampler is
+   *  constructed. A no-op until wired (unit tests never install it). */
+  setLaunchAdmissionCheck(fn: () => AdmissionDecision): void {
+    this.launchAdmissionCheck = fn;
   }
 
   /** P1 (plans/p1-hook-spool-multi-transport.md §2) — the ONE place where
@@ -4419,6 +4910,11 @@ export class AgentSupervisor extends EventEmitter {
             : event.state === 'working' ? 'hook-start' : event.state === 'active' ? 'hook-session-start' : 'hook-stop');
 
     if (event.state === 'idle') {
+      // WP2 provenance spine — compose one trusted plan_events row for this turn,
+      // ONLY on the accepted, non-duplicate idle path (past the duplicate/stale
+      // guards above). Guarded on plan_id inside; tolerant + fire-and-forget so a
+      // resolver/scrape failure never blocks the status flip.
+      this.maybeComposePlanEvent(agentId, event.turnId ?? null, receivedAt);
       this.forceIdleFromHook(agentId, flipSource);
     } else if (event.state === 'working') {
       this.forceWorkingFromHook(agentId, flipSource);
@@ -4458,7 +4954,95 @@ export class AgentSupervisor extends EventEmitter {
         candidateSessionId: event.sessionId,
       });
     }
+
+    // Layer A (codex session-id race fix) — the SessionStart hook carries
+    // codex's own session_id and this event was routed to THIS agent by its
+    // AGENT_ID launcher env, so the bind is env-direct: race-free even under the
+    // shared-cwd invariant (many codex agents, one cwd). This is the production
+    // consumer of the SessionStart hook that the worker scaffold already
+    // installs + trust-seeds — it reuses the existing multi-transport delivery
+    // (spool/HTTP/tmux + restart replay) rather than a bespoke channel. Only on
+    // the applied path (a duplicate via a second transport already bound on the
+    // first); bindCodexSessionFromHook is idempotent behind its null-guard.
+    if (
+      agent.provider === 'codex' &&
+      hookEventName === 'SessionStart' &&
+      event.state === 'active' &&
+      typeof event.sessionId === 'string' &&
+      event.sessionId.length > 0
+    ) {
+      this.bindCodexSessionFromHook(agentId, event.sessionId);
+    }
     return 'applied';
+  }
+
+  /** WP2 provenance spine — compose the turn's trusted plan_events row on the
+   *  accepted idle path. Guarded on plan_id; window = the working→idle span
+   *  (start-hook ts → this idle receivedAt). Tolerant + fire-and-forget: the
+   *  sentinel scrape is best-effort and never gates insertion (R2 §0). */
+  private maybeComposePlanEvent(agentId: string, turnId: string | null, idleReceivedAt: number): void {
+    const agent = getAgent(agentId);
+    if (!agent || !agent.planId) return; // no plan rail → no row (R1 risk 7)
+    // Window start: the turn's working-hook timestamp, else a bounded lookback.
+    const startMs = this.monitor.getLastStartHookEventAt(agentId);
+    const sinceMs = startMs !== undefined && startMs > 0
+      ? startMs
+      : idleReceivedAt - PLAN_EVENT_FALLBACK_WINDOW_MS;
+    // Turn-scoped idempotency (planning-surface demo fix): a second idle
+    // delivery for the SAME turn (codex Stop re-fire / legacy transport that
+    // bypasses the {ts,hookEventName,turnId} dedupe) must NOT compose a second
+    // plan_events row. Consulted synchronously here — before the async compose
+    // is scheduled — so the racing sibling event is suppressed. A genuinely new
+    // turn carries a new working-hook window start (or turn id) → a new key.
+    if (this.planComposeGuard.shouldSkip(agentId, planEventTurnKey(turnId, sinceMs))) return;
+    const sinceIso = new Date(sinceMs).toISOString();
+    const untilIso = new Date(idleReceivedAt).toISOString();
+
+    void (async () => {
+      let finalMessage: string | undefined;
+      try {
+        const messages = await this.chatService.getMessages(agentId, { limit: 1, role: 'assistant' });
+        finalMessage = messages[0]?.content;
+      } catch {
+        finalMessage = undefined; // scrape is best-effort; degrade to "no self-report"
+      }
+      try {
+        composePlanEvent(
+          {
+            getAgentPlan: (id) => {
+              const a = getAgent(id);
+              return a ? { planId: a.planId ?? null, planSection: a.planSection ?? null } : null;
+            },
+            getTurnSectionTouches: (id, s, u) => getTurnSectionTouches(id, s, u),
+            getTurnSectionChanges: (pid, s, u) => getTurnSectionChanges(pid, s, u),
+            insertPlanEvent: (input) => insertPlanEvent(input),
+            // Fix-4 — witnessed repo-activity capture. `getRepoActivityContext`
+            // resolves the plan's workspace root + relative HTML path (the rollup's
+            // exclusion/normalization inputs). `plan.path` is already
+            // workspace-relative; `ws.path` is the workspace root. Both deps are
+            // best-effort — composePlanEvent degrades to a NULL blob on any failure.
+            getTurnRepoActivity: (id, s, u) => getTurnRepoActivity(id, s, u),
+            getRepoActivityContext: (pid) => {
+              const plan = getPlan(pid);
+              if (!plan || plan.deletedAt) return null;
+              const ws = getWorkspace(plan.workspaceId);
+              if (!ws) return null;
+              return { workspaceRoot: ws.path, planRelPath: plan.path ?? null };
+            },
+            // WP4 byte-range matcher: resolves a native-edit payload to the
+            // section anchor whose byte-exact fragment contains it (optional dep).
+            resolveEditTargetAnchor: (payload, planId) => resolveEditTargetAnchorForPlan(payload, planId),
+            // GT-C §1.7 — a WRITE-turn REQUESTS trail materialization; it runs only
+            // if the plan is quiescent (never during a live run — an inter-turn idle
+            // is not quiescence), so this is a signal, not a forced write.
+            onWriteEvent: (e) => trailMaterializer.request(e.planId),
+          },
+          { agentId, turnId, sinceIso, untilIso, finalMessage: finalMessage ?? null },
+        );
+      } catch (err) {
+        console.warn(`[plan-events] compose failed for ${agentId}:`, err);
+      }
+    })();
   }
 
   /** Rate-limited (60 s/agent) warn helper for applyHookStatusEvent. */
@@ -4719,6 +5303,31 @@ export class AgentSupervisor extends EventEmitter {
    *  (relaunch Gate 5) and the continuation watcher's trigger. */
   isAwaitingHuman(agentId: string): boolean {
     return computeAwaitingHuman(this.monitor.getWaitingKind(agentId));
+  }
+
+  /** Attach the Inc 5 continuation watcher (called once by
+   *  startContinuationWatcher) so forceContinuationHandoff can reach it. */
+  attachContinuationWatcher(watcher: ContinuationWatcher): void {
+    this.continuationWatcher = watcher;
+  }
+
+  /** Per-agent continuation toggle (Edward 2026-07-05). Persists the flag; the
+   *  watcher reads it live from the DB row via its isContinuationEnabled effect,
+   *  so no watcher-state mutation is needed here. When disabled, the watcher's
+   *  `continuation-disabled` blocker holds back the trigger AND rejects a force. */
+  setContinuationEnabled(agentId: string, enabled: boolean): { ok: boolean } {
+    dbSetContinuationEnabled(agentId, enabled);
+    return { ok: true };
+  }
+
+  /** Force a continuation handoff to start on the watcher's next tick, bypassing
+   *  the trigger conditions but running the normal attempt cycle end-to-end.
+   *  Rejects a disabled agent; idempotent when an attempt is already open. */
+  forceContinuationHandoff(agentId: string): { ok: boolean; error?: string } {
+    if (!this.continuationWatcher) {
+      return { ok: false, error: 'continuation watcher not started' };
+    }
+    return this.continuationWatcher.forceHandoff(agentId);
   }
 
   /** Transient one-turn cross-agent subscription — registry lives in the
@@ -5250,6 +5859,41 @@ export class AgentSupervisor extends EventEmitter {
       // processes are gone. Relaunch with --continue to resume conversations.
       const hasRunner = this.windowsRunners.has(agent.id) || this.wslRunners.has(agent.id);
       if (!hasRunner) {
+        // ── D4 reconcile gate (incident-2026-07-11 §5) ─────────────────────────
+        // Duplicate-CLI prevention. On Windows/ConPTY a respawn with --resume can
+        // NEVER reattach to a surviving orphan tree from a prior (force-killed)
+        // instance, so an unconditional respawn = TWO CLIs on one session. Resolve
+        // ownership per agent FIRST: kill a verified orphan tree before --resume,
+        // fail-closed (skip) when the owner can't be verified, and honor an
+        // explicit unmanaged opt-out. WSL/tmux resolves to `reattach` and falls
+        // through to launchWslAgent's genuine reattach. `proceed` (no row / no
+        // surviving tree) is the fast path. No-op until startOwnership() arms it.
+        if (this.reconcileGate) {
+          try {
+            const gate = await this.reconcileGate.resolve(agent.id);
+            if (gate.action === 'blocked') {
+              console.warn(`[reconcile] ${agent.title} (${agent.id}): gate BLOCKED — ${gate.reason}; skipping respawn (duplicate-CLI guard)`);
+              addEvent(agent.id, 'reconcile_blocked', gate.reason);
+              await new Promise(r => setTimeout(r, AgentSupervisor.RECONCILE_STAGGER_MS));
+              continue;
+            }
+            if (gate.action === 'leave-unmanaged') {
+              console.warn(`[reconcile] ${agent.title} (${agent.id}): left unmanaged — ${gate.reason}; no respawn`);
+              addEvent(agent.id, 'reconcile_unmanaged', gate.reason);
+              await new Promise(r => setTimeout(r, AgentSupervisor.RECONCILE_STAGGER_MS));
+              continue;
+            }
+            if (gate.action === 'terminate-then-continue') {
+              console.log(`[reconcile] ${agent.title} (${agent.id}): terminated verified orphan tree (pids ${gate.pids.join(',') || 'none'}) before --resume`);
+              addEvent(agent.id, 'reconcile_terminated_orphan', JSON.stringify({ pids: gate.pids }));
+            }
+            // 'proceed' / 'reattach' → fall through to the normal respawn below.
+          } catch (err) {
+            // A gate failure must NOT strand the agent; log and respawn as before.
+            console.warn(`[reconcile] ${agent.id}: gate errored, proceeding: ${String(err)}`);
+          }
+        }
+
         // Context-brick Inc 4 (4.9) — continuation-reconcile discriminator.
         // An attempt already 'relaunched' at the agent's CURRENT generation
         // whose minted session file never hit disk means Electron died between

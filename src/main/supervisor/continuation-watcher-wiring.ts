@@ -3,6 +3,7 @@ import { Notification } from 'electron';
 import type { AgentSupervisor } from './index';
 import {
   ContinuationWatcher,
+  isContinuationWatchEligible,
   type ContinuationWatcherEffects,
   type HandshakeResult,
 } from './continuation-watcher';
@@ -75,6 +76,9 @@ export function createContinuationWatcherEffects(
       supervisor.getContextStats(agentId)?.contextPercentage ?? null,
     isIdle: (agentId) => getAgent(agentId)?.status === 'idle',
     isAwaitingHuman: (agentId) => supervisor.isAwaitingHuman(agentId),
+    // Per-agent continuation toggle read live from the DB row; absent/unknown →
+    // enabled (default-on, preserves prior behavior for every legacy row).
+    isContinuationEnabled: (agentId) => getAgent(agentId)?.continuationEnabled !== false,
     // Raw DB rows; terminal included so crashed ids can ride the attempt
     // reason (crashed is non-blocking). 'done' rows carry no signal.
     getOwnedAgents: (agentId) =>
@@ -177,9 +181,15 @@ export function startContinuationWatcher(
   apiPort: number,
 ): ContinuationWatcher {
   const watcher = new ContinuationWatcher(createContinuationWatcherEffects(supervisor, apiPort));
+  // Attach so the supervisor's force/toggle entry points can reach the watcher's
+  // per-agent state (forceContinuationHandoff → watcher.forceHandoff).
+  supervisor.attachContinuationWatcher(watcher);
   supervisor.on('monitorTick', () => {
+    // Any supervisor-privileged claude agent rides the auto continuation watcher —
+    // the structural workspace supervisor AND a privilegeLane:'supervisor' persona
+    // (#19). The provider constraint stays: continuation is claude-only.
     const ids = getActiveAgents()
-      .filter((a) => a.isSupervisor && a.provider === 'claude')
+      .filter(isContinuationWatchEligible)
       .map((a) => a.id);
     watcher.tick(ids);
   });

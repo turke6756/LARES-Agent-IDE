@@ -415,13 +415,29 @@ select {
 }
 
 .ui-menu-item {
-  display: block;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
   width: 100%;
   text-align: left;
   padding: 0.4rem 0.75rem;
   font-size: 13px;
   color: #cccccc;
   transition: background-color 80ms ease, color 80ms ease;
+}
+
+.ui-menu-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  flex: 0 0 14px;
+}
+
+.ui-menu-item-active {
+  background: color-mix(in srgb, var(--color-fg-primary) 10%, transparent);
+  color: var(--color-fg-primary);
 }
 
 .ui-menu-item:hover {
@@ -573,6 +589,206 @@ select {
     animation: none;
     box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--color-accent-green) 55%, transparent);
   }
+}
+
+/* ── Context-brick continuation transfer: gold "snake" border ────────────────
+   While a supervisor/worker is mid context-brick continuation (its session is
+   being handed to a fresh successor), its card shows a luminous gold segment
+   running around the border perimeter. Technique: a rotating conic-gradient
+   painted into a pseudo-element and masked to just the 2px border ring — the
+   @property-registered --transfer-angle animates the rotation. The ring is
+   absolutely positioned + pointer-events:none so it never shifts layout or
+   intercepts clicks; gold reads on both light and dark surfaces. Applied to the
+   AgentCard, the OwnerContainerBar, and the AgentStrip mini-card. */
+@property --transfer-angle {
+  syntax: '<angle>';
+  inherits: false;
+  initial-value: 0deg;
+}
+
+@keyframes transfer-snake-spin {
+  to {
+    --transfer-angle: 360deg;
+  }
+}
+
+.agent-transfer-glow {
+  position: relative;
+}
+.agent-transfer-glow::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: 0; /* only paints the 2px edge; card content is inset by its padding */
+  border-radius: inherit;
+  padding: 2px; /* ring thickness */
+  /* Faint gold baseline all the way round + a bright travelling hotspot. */
+  background: conic-gradient(
+    from var(--transfer-angle),
+    rgba(234, 179, 8, 0.22) 0deg,
+    rgba(234, 179, 8, 0.22) 200deg,
+    #fbbf24 280deg,
+    #fff3c4 300deg,
+    #fbbf24 320deg,
+    rgba(234, 179, 8, 0.22) 360deg
+  );
+  /* Punch out the interior so only the border ring paints (border-box minus
+     content-box). */
+  -webkit-mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  mask-composite: exclude;
+  filter: drop-shadow(0 0 3px rgba(251, 191, 36, 0.55));
+  animation: transfer-snake-spin 2.4s linear infinite;
+  pointer-events: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  /* No travel — hold a static gold ring so the "transfer in progress" signal
+     still reads for motion-sensitive users. */
+  .agent-transfer-glow::after {
+    animation: none;
+    background: none;
+    padding: 0;
+    box-shadow: inset 0 0 0 2px #fbbf24;
+    -webkit-mask: none;
+    mask: none;
+    filter: none;
+  }
+}
+
+/* ── Context-brick continuation split-button (ContinuationSplitButton.tsx) ──
+   A two-region control: [ transfer | ▾ ]. ON wears the gold/amber identity of
+   the transfer glow; OFF is desaturated gray with an inert main press. Themed
+   explicitly for both dark (default) and light so the state reads in each. */
+.csplit {
+  display: inline-flex;
+  align-items: stretch;
+  line-height: 1;
+  border: 1px solid var(--color-surface-3);
+  border-radius: 3px;
+  background: var(--color-surface-2);
+  overflow: hidden;
+}
+.csplit-main,
+.csplit-caret {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  color: #cccccc;
+  transition: background-color 100ms ease, color 100ms ease;
+}
+.csplit-main {
+  gap: 0.25rem;
+  padding: 0.2rem 0.45rem;
+}
+.csplit-caret {
+  padding: 0.2rem 0.3rem;
+  font-size: 9px;
+  border-left: 1px solid var(--color-surface-3);
+}
+.csplit-main:hover:not(:disabled),
+.csplit-caret:hover {
+  background: rgba(255, 255, 255, 0.07);
+  color: #e0e0e0;
+}
+.csplit-main:disabled {
+  cursor: not-allowed;
+}
+.csplit-main:focus-visible,
+.csplit-caret:focus-visible {
+  outline: 1px solid var(--color-accent-blue);
+  outline-offset: -1px;
+}
+
+/* ON — amber, tying to the gold transfer glow. */
+.csplit.is-on {
+  border-color: rgba(251, 191, 36, 0.5);
+}
+.csplit.is-on .csplit-caret {
+  border-left-color: rgba(251, 191, 36, 0.32);
+}
+.csplit.is-on .csplit-main {
+  color: #fbbf24;
+}
+.csplit.is-on .csplit-main:hover:not(:disabled) {
+  background: rgba(251, 191, 36, 0.14);
+  color: #fde68a;
+}
+/* While transferring the main is disabled but should stay gold, not dimmed. */
+.csplit.is-transferring .csplit-main:disabled {
+  color: #fbbf24;
+  cursor: progress;
+}
+
+/* OFF — feature disabled for this agent: desaturated, inert main press. */
+.csplit.is-off {
+  border-color: var(--color-surface-3);
+  opacity: 0.7;
+}
+.csplit.is-off .csplit-main {
+  color: #8a8a8a;
+}
+.csplit.is-off .csplit-main:disabled {
+  color: #8a8a8a;
+}
+
+.csplit-on-label {
+  color: #fbbf24;
+}
+.csplit-error {
+  background: var(--color-surface-1);
+  border: 1px solid rgba(241, 76, 76, 0.4);
+  border-radius: 2px;
+}
+
+/* Light theme */
+.light .csplit {
+  background: #ffffff;
+  border-color: #d6d0c2;
+}
+.light .csplit-main,
+.light .csplit-caret {
+  color: #5f584a;
+}
+.light .csplit-caret {
+  border-left-color: #d6d0c2;
+}
+.light .csplit-main:hover:not(:disabled),
+.light .csplit-caret:hover {
+  background: #f3efe6;
+  color: #3a352c;
+}
+.light .csplit.is-on {
+  border-color: #d9a441;
+}
+.light .csplit.is-on .csplit-caret {
+  border-left-color: #e2c079;
+}
+.light .csplit.is-on .csplit-main {
+  color: #b7791f;
+}
+.light .csplit.is-on .csplit-main:hover:not(:disabled) {
+  background: #fbf1d8;
+  color: #8a5a12;
+}
+.light .csplit.is-transferring .csplit-main:disabled {
+  color: #b7791f;
+}
+.light .csplit.is-off .csplit-main,
+.light .csplit.is-off .csplit-main:disabled {
+  color: #9b9382;
+}
+.light .csplit-on-label {
+  color: #b7791f;
+}
+.light .csplit-error {
+  background: #ffffff;
 }
 
 @keyframes notebook-ring-pulse {
@@ -943,15 +1159,41 @@ html.light body {
 
 .light .ui-menu {
   background: white;
-  border-color: #e3ded3;
+  border-color: #c9c2b4;
   border-radius: 8px;
   overflow: hidden;
   box-shadow: var(--shadow-menu);
+  color: #211f1c;
+}
+
+.light .ui-menu-header {
+  color: #5f584d;
+  border-bottom-color: #d8d2c6;
+  font-weight: 600;
+}
+
+.light .ui-menu-item {
+  color: #292620;
+}
+
+.light .ui-menu-item-active {
+  background: #e8edf3;
+  color: #171512;
 }
 
 .light .ui-menu-item:hover {
   background: var(--color-accent-blue);
   color: white;
+}
+
+.light .ui-menu-item:disabled,
+.light .ui-menu-item:disabled:hover {
+  background: transparent;
+  color: #756e61;
+}
+
+.light .ui-menu-divider {
+  border-top-color: #d8d2c6;
 }
 
 .light .ui-tab {
@@ -1001,6 +1243,81 @@ html.light .text-sky-400 { color: #0369a1; }
    prose container only. */
 html.light .prose-custom .text-gray-300 { color: #33302a; }
 html.light .prose-custom .text-gray-400 { color: #45413a; }
+
+.docx-content {
+  color: var(--color-fg-primary);
+  font-size: 14px;
+  line-height: 1.7;
+}
+
+.docx-content :where(h1, h2, h3, h4, h5, h6) {
+  color: var(--color-fg-primary);
+  font-family: var(--font-sans);
+  font-weight: 700;
+  line-height: 1.25;
+  margin: 1.25em 0 0.5em;
+}
+
+.docx-content h1 {
+  font-size: 1.5rem;
+  padding-bottom: 0.35rem;
+  border-bottom: 1px solid color-mix(in srgb, var(--color-accent-blue) 35%, transparent);
+}
+
+.docx-content h2 {
+  font-size: 1.25rem;
+  padding-bottom: 0.25rem;
+  border-bottom: 1px solid var(--color-surface-3);
+}
+
+.docx-content h3 { font-size: 1.125rem; }
+.docx-content h4 { font-size: 1rem; }
+
+.docx-content :where(p, ul, ol, blockquote, table, pre) {
+  margin: 0 0 0.9rem;
+}
+
+.docx-content :where(ul, ol) {
+  padding-left: 1.5rem;
+}
+
+.docx-content ul { list-style: disc; }
+.docx-content ol { list-style: decimal; }
+
+.docx-content a {
+  color: var(--color-accent-blue);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.docx-content blockquote {
+  border-left: 2px solid color-mix(in srgb, var(--color-accent-blue) 55%, transparent);
+  color: var(--color-fg-secondary);
+  padding-left: 1rem;
+}
+
+.docx-content table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.docx-content :where(th, td) {
+  border: 1px solid var(--color-surface-3);
+  padding: 0.5rem 0.65rem;
+  vertical-align: top;
+}
+
+.docx-content th {
+  background: var(--color-surface-2);
+  color: var(--color-fg-primary);
+  font-weight: 600;
+}
+
+.docx-content img {
+  max-width: 100%;
+  height: auto;
+}
 
 /* Hover variants */
 html.light .hover\:text-white:hover { color: #1a1814 !important; }
@@ -1823,4 +2140,31 @@ html.light ::-webkit-scrollbar-thumb:hover {
 .oo-load-btn:disabled {
   opacity: 0.6;
   cursor: default;
+}
+
+/* WP4 — transient highlight for a knowledge/optimizer "open at source span" jump.
+   Applied as a CodeMirror line decoration for ~2.5s, then cleared. */
+.cm-knowledge-source-line {
+  background-color: rgba(59, 130, 246, 0.18);
+  transition: background-color 300ms ease;
+}
+
+/* ── PDF z1 text layer: never paint a glyph, in ANY state ─────────────────────
+   The reader stacks a transparent, selectable text layer (z1) over the PDFium
+   raster (z0). `color: transparent` alone is NOT enough: Chrome repaints
+   SELECTED text in the UA selection foreground, which overrides the inline
+   colour and shows the layer's glyphs on top of the canvas ones — the "seeing
+   double" ghost. Re-assert transparency for the selection pseudo so the only
+   glyphs ever on screen are the canvas's.
+
+   The background stays translucent so the z0 glyphs read THROUGH the selection
+   band: that band is the selection feedback, not browser-painted text. Verified
+   in Electron's Chromium — the author rule wins over the UA default. */
+.pdf-text-layer ::selection {
+  color: transparent;
+  background: rgba(59, 130, 246, 0.35);
+}
+.pdf-text-layer::selection {
+  color: transparent;
+  background: rgba(59, 130, 246, 0.35);
 }

@@ -31,6 +31,7 @@ import type {
   SendSelectionCommentsResult,
 } from '../shared/types';
 import { buildQuotedPrompt, type QuoteItem, type QuotedPromptSource } from '../shared/selection-prompt';
+import type { PdfPageAnchor } from '../shared/pdf-annotations';
 
 // Mirrors INPUT_ACCEPTING in src/renderer/lib/selection/selection-dispatch.ts —
 // the statuses where slice 1 sends directly instead of falling back to staging.
@@ -52,14 +53,40 @@ export interface SendSelectionCommentsDeps {
   onCommentsChanged(commentIds: string[]): void;
 }
 
+// A coordinate-only PDF note (plan Part 1.9): zero-width text span (start deep-
+// equals end) with paint rects standing in for the area. Its quoted_text is a
+// synthetic marker like "[Area on PDF page 3]".
+function isCoordinateOnlyPage(page: PdfPageAnchor): boolean {
+  return page.start.itemIndex === page.end.itemIndex
+    && page.start.charOffset === page.end.charOffset
+    && page.rects.length > 0;
+}
+
+// Persisted rows are the AUTHORITY for prompt construction (plan Part 1.8) —
+// each PDF row carries its own page context so a multi-comment send across
+// pages 3 and 7 is unambiguous, rather than deriving one header page from row 0.
+function buildItemForRow(r: SelectionComment): QuoteItem {
+  const item: QuoteItem = { quote: r.quotedText, comment: r.body || undefined };
+  const page = r.anchorType === 'pdf' ? r.pdfAnchor?.pages[0] : undefined;
+  if (page) {
+    item.pageIndex = page.pageIndex;
+    if (page.pageLabel) item.pageLabel = page.pageLabel;
+    // Coordinate-only notes surface the normalized region since there is no
+    // real quote to blockquote.
+    if (isCoordinateOnlyPage(page)) item.region = { ...page.rects[0] };
+  }
+  return item;
+}
+
 function buildPromptForRows(rows: SelectionComment[]): string {
   const first = rows[0];
+  const isPdf = first.anchorType === 'pdf';
   const source: QuotedPromptSource = {
     targetType: 'file',
     sourceLabel: first.filePath!,
-    // `Lines:` is a header-level field (one per prompt), so it only makes
-    // sense for a single-comment send; multi-item sends omit it.
-    file: rows.length === 1
+    // `Lines:` is a header-level field for TEXT sources only (one per prompt);
+    // PDF sends carry per-quote `Anchor: page N` / a header `Page:` instead.
+    file: rows.length === 1 && !isPdf
       ? {
           filePath: first.filePath!,
           lineStart: first.lineStart ?? undefined,
@@ -67,11 +94,7 @@ function buildPromptForRows(rows: SelectionComment[]): string {
         }
       : { filePath: first.filePath! },
   };
-  // An empty body means "no comment — act on this text directly" (plan §4).
-  const items: QuoteItem[] = rows.map((r) => ({
-    quote: r.quotedText,
-    comment: r.body || undefined,
-  }));
+  const items: QuoteItem[] = rows.map(buildItemForRow);
   return buildQuotedPrompt(source, items);
 }
 

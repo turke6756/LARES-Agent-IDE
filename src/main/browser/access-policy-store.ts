@@ -19,6 +19,7 @@ import type {
   AccessRequestStatus,
   AccessRule,
   AccessRuleInput,
+  LoginGrantSessionState,
   SignedInOrigin,
 } from '../../shared/browser';
 
@@ -158,6 +159,167 @@ export function rowAppliesToWorkspace(
   return rowWorkspaceId == null || rowWorkspaceId === (workspaceId ?? null);
 }
 
+// ── Phase 0 (BrowserSigninSharing plan §D — credentialed-open diagnostics) ─────
+//
+// PURE, trusted classification of a single credentialed agent open. This is the
+// instrumentation surface for the verified root cause: a legacy NULL-workspace
+// login grant is applied to every workspace (rowAppliesToWorkspace), but its
+// imported credentials land only in persist:agent:default, while a named-
+// workspace researcher reads persist:agent:<workspaceId>. The active DB row is
+// keyed (rule_id, origin) with no workspace, so classifyOriginState reports
+// `ready` and suppresses pending_signin even though the agent is a GUEST.
+//
+// classifyCredentialedOpen() does NOT change any behavior — it only names the
+// state the current code is in, so the Phase 0 diagnostics + tests can prove it.
+// The `desiredOutcome` field encodes the POST-FIX (Phase 1/2) answer; `legacyReady`
+// models what the current classifyOriginState would return. It contains NO cookie
+// names or values by construction (its inputs are ids, partitions, and a state
+// enum — never cookie material).
+
+/** The classified situation of a credentialed open. Each value names exactly one
+ *  of the situations the Phase 0 acceptance gate must distinguish; `grantState`
+ *  is the field that tells them apart (supporting fields make the reason legible):
+ *   - visit_only          — no allow_signed_in rule governs → guest by design;
+ *   - wrong_partition      — active row, but the credential-home partition differs
+ *                            from the caller's session partition (the PRIMARY defect);
+ *   - false_active_import  — active row in the caller's own partition, but activated
+ *                            by an unverified cookie import (the SECONDARY defect);
+ *   - active               — active row, caller partition, verified sign-in → ready;
+ *   - expired              — session row flipped expired (login-wall / 401);
+ *   - needs_signin_cold    — governed origin with no session row yet (attended);
+ *   - unattended_rejected  — needs a human sign-in but the run is unattended. */
+export type CredentialedOpenGrantState =
+  | 'visit_only'
+  | 'wrong_partition'
+  | 'false_active_import'
+  | 'active'
+  | 'expired'
+  | 'needs_signin_cold'
+  | 'unattended_rejected';
+
+/** How an active session row was established. The current schema does not track
+ *  this, so runtime callers pass 'unknown'; the Phase 0 unit tests pass it
+ *  explicitly to exercise the false_active_import distinction. */
+export type CredentialedOpenActivation =
+  | 'cookie_import_unverified'
+  | 'interactive_verified'
+  | 'unknown';
+
+export interface CredentialedOpenDiagnosticInput {
+  /** Governing allow_signed_in rule id, or null when none governs (visit-only). */
+  ruleId: string | null;
+  /** Workspace the rule is scoped to (null = legacy wildcard rule). */
+  ruleWorkspaceId: string | null;
+  /** Workspace of the agent performing the open. */
+  callerWorkspaceId: string | null;
+  /** Electron session partition the rule's credentials were written to (derived
+   *  from ruleWorkspaceId) — where import/handoff put cookies. */
+  credentialHomePartition: string;
+  /** Electron session partition the caller's agent tab actually reads from
+   *  (derived from callerWorkspaceId). */
+  callerSessionPartition: string;
+  /** The DB session-row state for (rule, origin). */
+  sessionState: 'active' | 'expired' | 'none';
+  activation?: CredentialedOpenActivation;
+  unattended?: boolean;
+}
+
+export interface CredentialedOpenDiagnostic {
+  ruleId: string | null;
+  ruleWorkspaceId: string | null;
+  callerWorkspaceId: string | null;
+  credentialHomePartition: string;
+  callerSessionPartition: string;
+  /** credentialHomePartition === callerSessionPartition. */
+  partitionMatch: boolean;
+  sessionState: 'active' | 'expired' | 'none';
+  activation: CredentialedOpenActivation;
+  unattended: boolean;
+  /** The distinguishing classification (see CredentialedOpenGrantState). */
+  grantState: CredentialedOpenGrantState;
+  /** What the agent SHOULD be cleared to do (post-fix). */
+  desiredOutcome: 'ready' | 'needs_signin' | 'unavailable';
+  /** What the CURRENT classifyOriginState would report (ready iff no rule, or an
+   *  active row regardless of partition/provenance). When legacyReady is true but
+   *  desiredOutcome is not 'ready', this row is the live defect. */
+  legacyReady: boolean;
+  /** Human-readable WHY the state was classified this way. Never cookie material. */
+  readyReason: string;
+}
+
+/** PURE classifier — see the section header. No DB, no Electron, no cookies. */
+export function classifyCredentialedOpen(
+  input: CredentialedOpenDiagnosticInput,
+): CredentialedOpenDiagnostic {
+  const partitionMatch = input.credentialHomePartition === input.callerSessionPartition;
+  const activation: CredentialedOpenActivation = input.activation ?? 'unknown';
+  const unattended = input.unattended === true;
+  // The current classifyOriginState is `ready` when no allow_signed_in rule
+  // governs, OR when a session row is active — regardless of partition/provenance.
+  const legacyReady = input.ruleId === null || input.sessionState === 'active';
+
+  let grantState: CredentialedOpenGrantState;
+  let desiredOutcome: 'ready' | 'needs_signin' | 'unavailable';
+  let readyReason: string;
+
+  if (input.ruleId === null) {
+    grantState = 'visit_only';
+    desiredOutcome = 'ready';
+    readyReason =
+      'no allow_signed_in rule governs this origin; the agent browses as a guest by design (visit-only)';
+  } else if (input.sessionState === 'expired') {
+    grantState = unattended ? 'unattended_rejected' : 'expired';
+    desiredOutcome = unattended ? 'unavailable' : 'needs_signin';
+    readyReason =
+      'the tracked session row is expired (login-wall / 401 detected); re-sign-in required' +
+      (unattended ? ' but no human is present (unattended run)' : '');
+  } else if (input.sessionState === 'none') {
+    grantState = unattended ? 'unattended_rejected' : 'needs_signin_cold';
+    desiredOutcome = unattended ? 'unavailable' : 'needs_signin';
+    readyReason =
+      'no session row exists for (rule, origin); a human sign-in is required' +
+      (unattended ? ' but no human is present (unattended run)' : '');
+  } else if (!partitionMatch) {
+    // sessionState === 'active' but the credentials live in a different partition.
+    grantState = 'wrong_partition';
+    desiredOutcome = 'needs_signin';
+    readyReason =
+      `active session row is credentialed in ${input.credentialHomePartition} but the caller reads ` +
+      `${input.callerSessionPartition}; the agent is a GUEST despite the active row (a legacy ` +
+      `NULL-workspace grant consumed by a named workspace)`;
+  } else if (activation === 'cookie_import_unverified') {
+    grantState = 'false_active_import';
+    desiredOutcome = 'needs_signin';
+    readyReason =
+      'active row was established from an unverified cookie import (cookie-count > 0), not a verified ' +
+      'sign-in; the copied cookies may be anonymous (consent/locale/analytics) only';
+  } else {
+    grantState = 'active';
+    desiredOutcome = 'ready';
+    readyReason =
+      activation === 'interactive_verified'
+        ? 'active session row, the caller partition matches the credential home, and it was established ' +
+          'by a verified interactive sign-in'
+        : 'active session row in the caller partition';
+  }
+
+  return {
+    ruleId: input.ruleId,
+    ruleWorkspaceId: input.ruleWorkspaceId,
+    callerWorkspaceId: input.callerWorkspaceId,
+    credentialHomePartition: input.credentialHomePartition,
+    callerSessionPartition: input.callerSessionPartition,
+    partitionMatch,
+    sessionState: input.sessionState,
+    activation,
+    unattended,
+    grantState,
+    desiredOutcome,
+    legacyReady,
+    readyReason,
+  };
+}
+
 // ── Rules CRUD ───────────────────────────────────────────────────────────────
 
 /** All rules (enabled + disabled), newest first. ONE agent allowlist — the
@@ -295,12 +457,41 @@ export function deleteRule(id: string): void {
   const db = getDb();
   const tx = db.transaction((ruleId: string) => {
     db.prepare('DELETE FROM browser_access_signed_in_origins WHERE rule_id = ?').run(ruleId);
+    // Phase 1: the workspace-exact login grants are the §13 equivalent of the
+    // legacy known-origins rows — a deleted rule must not leave orphan ACTIVE
+    // grants behind (they would otherwise linger in the workspace-exact table).
+    db.prepare('DELETE FROM browser_access_login_grants WHERE rule_id = ?').run(ruleId);
     db.prepare('DELETE FROM browser_access_rules WHERE id = ?').run(ruleId);
   });
   tx(id);
 }
 
 // ── Signed-in origins (§13) ──────────────────────────────────────────────────
+
+/** Phase 0 (BrowserSigninSharing plan §D — startup read-only consistency check):
+ *  every ACTIVE signed-in session row whose governing rule is an allow_signed_in
+ *  rule scoped to the LEGACY NULL workspace. Such a row's credentials live only
+ *  in persist:agent:default, yet rowAppliesToWorkspace(null, W) === true for every
+ *  named workspace W — so a researcher in a named workspace consumes the row and
+ *  opens as a GUEST while classifyOriginState reports `ready`. Read-only; the
+ *  manager's startup check flags each as a latent mismatch. Never touches cookies. */
+export function listActiveNullWorkspaceSignedInGrants(): Array<{
+  ruleId: string;
+  hostname: string;
+  origin: string;
+}> {
+  const rows = getDb()
+    .prepare(
+      `SELECT s.rule_id AS rule_id, s.origin AS origin, r.hostname AS hostname
+         FROM browser_access_signed_in_origins s
+         JOIN browser_access_rules r ON r.id = s.rule_id
+        WHERE r.allow_signed_in = 1
+          AND r.workspace_id IS NULL
+          AND COALESCE(s.session_state, 'active') <> 'expired'`,
+    )
+    .all() as Array<{ rule_id: string; origin: string; hostname: string }>;
+  return rows.map((row) => ({ ruleId: row.rule_id, hostname: row.hostname, origin: row.origin }));
+}
 
 /** Tracked authenticated origins for a rule (Mechanism-A upserts on handoff-ready). */
 export function listSignedInOrigins(ruleId: string): string[] {
@@ -341,6 +532,140 @@ export function upsertSignedInOrigin(
          expired_at    = NULL`,
     )
     .run(ruleId, origin, workspaceId, signedInAt, signedInAt, verifiedAt);
+  // Phase 1: DUAL-WRITE the workspace-EXACT login grant. `workspaceId` here is the
+  // effective workspace whose agent partition holds the credentials (handoff-ready
+  // passes the tab's workspace; import passes the selected/rule workspace) — so the
+  // grant is keyed to exactly the partition the session lives in, and a wildcard
+  // rule can carry independent grants per workspace. The legacy row above stays
+  // for revocation breadth + the workspace-agnostic session-center listing.
+  upsertLoginGrant(ruleId, origin, workspaceId, { signedInAt, verifiedAt });
+}
+
+// ── Phase 1: workspace-exact login grants (browser_access_login_grants) ────────
+// Keyed (rule_id, workspace_key, origin) so a legacy NULL-workspace visit rule
+// can hold INDEPENDENT login sessions per workspace. `classifyOriginState` reads
+// getLoginGrantSessionState with the CALLER's workspace, so a grant established
+// in workspace A is invisible to workspace B (locked decision Q2 — never treat a
+// null/other-workspace login state as active in a named workspace). No cookie
+// material is stored (ids, origin, states, timestamps only).
+
+const DEFAULT_LOGIN_GRANT_WORKSPACE_KEY = 'default';
+
+/** Normalize a workspace id to the NOT-NULL grant key. null/undefined/'' collapse
+ *  to the default-workspace key — the SAME collapse agentPartitionForWorkspace()
+ *  applies (null → persist:agent:default), so a grant key is 1:1 with the agent
+ *  partition its credentials live in. Exported so the manager + tests key
+ *  identically. */
+export function loginGrantWorkspaceKey(workspaceId: string | null | undefined): string {
+  return workspaceId == null || workspaceId === '' ? DEFAULT_LOGIN_GRANT_WORKSPACE_KEY : workspaceId;
+}
+
+/** Phase 1: upsert a workspace-EXACT, ACTIVE login grant. `workspaceId` is the
+ *  EFFECTIVE workspace whose agent partition holds the credentials — NEVER a
+ *  wildcard rule's null workspace inferred blindly. An upsert IS a (re-)confirmed
+ *  live session: it stamps session_state='active', consent_state='granted', and
+ *  clears any prior expiry. Optional `signedInAt`/`verifiedAt` overwrite when
+ *  provided (COALESCE leaves stored values untouched when omitted). */
+export function upsertLoginGrant(
+  ruleId: string,
+  origin: string,
+  workspaceId: string | null | undefined,
+  opts: { signedInAt?: number | null; verifiedAt?: number | null } = {},
+): void {
+  const key = loginGrantWorkspaceKey(workspaceId);
+  const signedInAt = opts.signedInAt ?? null;
+  const verifiedAt = opts.verifiedAt ?? null;
+  const now = signedInAt ?? Date.now();
+  getDb()
+    .prepare(
+      `INSERT INTO browser_access_login_grants
+         (rule_id, workspace_key, origin, consent_state, session_state,
+          signed_in_at, last_used_at, verified_at, expired_at, created_at)
+       VALUES (?, ?, ?, 'granted', 'active', ?, ?, ?, NULL, ?)
+       ON CONFLICT(rule_id, workspace_key, origin) DO UPDATE SET
+         consent_state = 'granted',
+         session_state = 'active',
+         signed_in_at  = COALESCE(excluded.signed_in_at, signed_in_at),
+         verified_at   = COALESCE(excluded.verified_at, verified_at),
+         expired_at    = NULL`,
+    )
+    .run(ruleId, key, origin, signedInAt, signedInAt, verifiedAt, now);
+}
+
+/** Phase 1: the workspace-EXACT runtime session state for (rule, caller
+ *  workspace, origin), or undefined when no grant exists in that workspace. This
+ *  is the authority classifyOriginState reads: a grant established in a different
+ *  workspace (or the legacy default) returns undefined here for a named caller,
+ *  so the agent correctly pends a sign-in instead of opening as a guest. A
+ *  `setup_required` grant is reported as-is (never 'active'). */
+export function getLoginGrantSessionState(
+  ruleId: string,
+  origin: string,
+  workspaceId: string | null | undefined,
+): LoginGrantSessionState | undefined {
+  const row = getDb()
+    .prepare(
+      `SELECT session_state FROM browser_access_login_grants
+        WHERE rule_id = ? AND workspace_key = ? AND origin = ?`,
+    )
+    .get(ruleId, loginGrantWorkspaceKey(workspaceId), origin) as
+    | { session_state?: string }
+    | undefined;
+  if (!row) return undefined;
+  if (row.session_state === 'active') return 'active';
+  if (row.session_state === 'expired') return 'expired';
+  return 'setup_required';
+}
+
+/** Phase 1: expire the workspace-exact grant (login-wall / 401 detected) WITHOUT
+ *  deleting it — durable consent survives, so re-auth is a refresh not a re-grant.
+ *  No-op when no grant exists in that workspace. */
+export function expireLoginGrant(
+  ruleId: string,
+  origin: string,
+  workspaceId: string | null | undefined,
+  expiredAt: number = Date.now(),
+): void {
+  getDb()
+    .prepare(
+      `UPDATE browser_access_login_grants
+         SET session_state = 'expired', expired_at = ?
+       WHERE rule_id = ? AND workspace_key = ? AND origin = ?`,
+    )
+    .run(expiredAt, ruleId, loginGrantWorkspaceKey(workspaceId), origin);
+}
+
+/** Phase 1: the DISTINCT workspace keys that hold a login grant for a rule — the
+ *  AUTHORITATIVE list of workspaces whose agent partitions may host this rule's
+ *  credentials. A legacy null-workspace WILDCARD rule can hold INDEPENDENT grants
+ *  across many named workspaces, so revocation must clear every one of them, not
+ *  just the rule's own (possibly-null) workspace. Returns the raw workspace_key
+ *  strings ('default' for the legacy/null workspace); each is a valid workspaceId
+ *  for agentPartitionForWorkspace() (it collapses 'default' and null to the same
+ *  persist:agent:default partition). */
+export function listLoginGrantWorkspacesForRule(ruleId: string): string[] {
+  return (
+    getDb()
+      .prepare(
+        'SELECT DISTINCT workspace_key FROM browser_access_login_grants WHERE rule_id = ?',
+      )
+      .all(ruleId) as Array<{ workspace_key: string }>
+  ).map((r) => r.workspace_key);
+}
+
+/** Phase 1: expire EVERY login grant for a rule across ALL workspaces + origins
+ *  WITHOUT deleting them (durable consent survives — re-auth is a refresh). Used by
+ *  the per-row "Clear agent session" path so a cleared credentialed origin flips to
+ *  needs_signin IMMEDIATELY in every workspace, instead of lingering ACTIVE (a
+ *  false-ready guest) until the next lazy login-wall probe. No-op when none exist. */
+export function expireLoginGrantsForRule(ruleId: string, expiredAt: number = Date.now()): void {
+  getDb()
+    .prepare(
+      `UPDATE browser_access_login_grants
+         SET session_state = 'expired', expired_at = ?
+       WHERE rule_id = ?`,
+    )
+    .run(expiredAt, ruleId);
 }
 
 /** Signed-in tabs (WI-1): the durable session state for a tracked (rule, origin),
@@ -377,6 +702,20 @@ export function expireSignedInOrigin(
        WHERE rule_id = ? AND origin = ?`,
     )
     .run(expiredAt, ruleId, origin);
+}
+
+/** Phase 1: expire EVERY legacy signed-in origin for a rule (all origins) WITHOUT
+ *  deleting them. The clear-session path expires BOTH tables so the workspace-exact
+ *  grant authority AND the workspace-agnostic session-center listing stay
+ *  consistent (a cleared origin shows expired, not signed-in). No-op when none. */
+export function expireSignedInOriginsForRule(ruleId: string, expiredAt: number = Date.now()): void {
+  getDb()
+    .prepare(
+      `UPDATE browser_access_signed_in_origins
+         SET session_state = 'expired', expired_at = ?
+       WHERE rule_id = ?`,
+    )
+    .run(expiredAt, ruleId);
 }
 
 /** Slice 12: stamp last_used_at for every tracked signed-in origin matching an

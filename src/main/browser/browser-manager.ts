@@ -23,6 +23,22 @@ import {
 } from './browser-decisions';
 import { CdpDriver, KEYBOARD_DROPDOWN_GUIDANCE } from './cdp-driver';
 import { resolveKey, SUPPORTED_BROWSER_KEYS } from './key-map';
+// D3 agent-tab lifecycle (incident-2026-07-11 §5 D3) — pure/injected-dep logic;
+// this file supplies the Electron-coupled seams (lease touches, discard/restore,
+// grace-close, cap enforcement).
+import {
+  LeaseLedger,
+  GraceCloseScheduler,
+  isAgentDiscardEligible,
+  pickAgentTabsToDiscard,
+  closeableAgentTabs,
+  DEFAULT_AGENT_TAB_GRACE_CLOSE_MS,
+  DEFAULT_AGENT_TAB_LEASE_MS,
+  DEFAULT_MAX_LIVE_AGENT_VIEWS,
+  DEFAULT_MAX_LIVE_AGENT_VIEWS_PER_AGENT,
+  type AgentTabLifecycleInfo,
+} from './agent-tab-lifecycle';
+import { TabHydrationCoordinator, type HydrationResult } from './agent-tab-hydration';
 import { buildA11ySnapshot, RefRegistry } from './a11y-snapshot';
 import { ActionAudit, AUDIT_FILE_NAME, hashArgs, type AuditEntry } from './action-audit';
 import {
@@ -53,6 +69,7 @@ import {
   type AccessRequestInput,
   type AccessRule,
   type AccessRuleInput,
+  type AccessSiteStatus,
   type Bookmark,
   type BookmarkPatch,
   type BrowserAuditEntry,
@@ -77,7 +94,15 @@ import {
   type SigninPendingEntry,
   type SigninPendingOpened,
   type SigninResolved,
+  type ImportUserSessionResult,
+  type SigninHandoffReadyResult,
+  type SigninSetupVerification,
 } from '../../shared/browser';
+import {
+  resolveSigninAdapter,
+  isKnownLoginDestination,
+  type SigninSiteAdapter,
+} from './signin-site-adapters';
 import {
   deleteBookmark,
   insertBookmark,
@@ -86,11 +111,13 @@ import {
   updateBookmark,
 } from './bookmarks-store';
 import {
+  classifyCredentialedOpen,
   decideRequest,
   deleteRule,
   getRule,
   insertRequest,
   insertRule,
+  listActiveNullWorkspaceSignedInGrants,
   listRequests,
   listRequestsByAgent,
   listRules,
@@ -100,8 +127,14 @@ import {
   touchSignedInOrigin,
   updateRule,
   upsertSignedInOrigin,
-  getSignedInOriginState,
   expireSignedInOrigin,
+  expireSignedInOriginsForRule,
+  getLoginGrantSessionState,
+  expireLoginGrant,
+  expireLoginGrantsForRule,
+  listLoginGrantWorkspacesForRule,
+  loginGrantWorkspaceKey,
+  type CredentialedOpenDiagnostic,
   type InsertRequestInput,
 } from './access-policy-store';
 import {
@@ -127,6 +160,7 @@ import {
   peekNewestClosedAt,
   type SessionTabRow,
 } from './session-store';
+import { AdmissionError, type AdmissionDecision } from '../watchdog/types';
 import {
   getDownload,
   insertDownload,
@@ -170,6 +204,36 @@ const DISCARD_SWEEP_MS = 60_000; // idle-sweep interval
  *  Never (idle discard disabled; the hard live-view cap still applies). */
 let DISCARD_IDLE_MS: number | null = 30 * 60_000;
 const MAX_LIVE_USER_VIEWS = 12; // hard live-view cap (LRU discard beyond this)
+
+// ── D3 agent-tab lifecycle (incident-2026-07-11 §5 D3) ────────────────────────
+/** Global cap on live (non-suspended) AGENT views (plan §5 D3.2). */
+const MAX_LIVE_AGENT_VIEWS = DEFAULT_MAX_LIVE_AGENT_VIEWS; // 24
+/** Per-agent cap on live agent views (plan §5 D3.2). */
+const MAX_LIVE_AGENT_VIEWS_PER_AGENT = DEFAULT_MAX_LIVE_AGENT_VIEWS_PER_AGENT; // 6
+/** Active-operation lease window: a verb touch keeps a tab ineligible for
+ *  cap-discard for this long (plan §5 D3.2). */
+const AGENT_TAB_LEASE_MS = DEFAULT_AGENT_TAB_LEASE_MS; // 10 min
+/** Grace between an agent reaching a terminal status and its tabs being closed
+ *  (plan §5 D3.1). */
+const AGENT_TAB_GRACE_CLOSE_MS = DEFAULT_AGENT_TAB_GRACE_CLOSE_MS; // 10 min
+/** Recency window for the "needs human attention" exemption. NOTE (deviation,
+ *  see D3 report): `TabEntry.needsHumanAttention` is stamped true on EVERY
+ *  agent-opened tab at creation (createTab) and is never cleared in main, so
+ *  honoring the raw boolean would permanently exempt every agent tab and make
+ *  D3 inert. We instead treat "attention" as RECENT: exempt only while the tab's
+ *  last attention pulse (`lastAttentionAt`, the birth/raise stamp) is younger
+ *  than this window. `signinPending` remains a hard, unconditional exemption. */
+const AGENT_TAB_ATTENTION_RECENCY_MS = 10 * 60_000; // 10 min
+/** Bounded wait for a restored agent view's load to commit before a verb runs
+ *  against it (plan §5 D3.3). */
+const AGENT_TAB_RESTORE_TIMEOUT_MS = 15_000;
+/** Prepended to a read verb's output when the tab was just restored from
+ *  suspension (plan §5 D3.3 restored:true hint) — in-page state was reset. */
+const RESTORED_TAB_HINT =
+  'Note: this tab was restored from a memory-saving suspension — its URL and ' +
+  'sign-in cookies were preserved, but in-page state (scroll, form input, ' +
+  'dynamically loaded content) was reset. Re-read the page before acting on it.\n\n';
+
 const SCROLL_CAPTURE_TIMEOUT_MS = 150; // fail-open bound for scroll capture (§8)
 const SESSION_WRITE_DEBOUNCE_MS = 500; // debounced persistence after tab churn
 
@@ -354,6 +418,27 @@ interface FrozenTab {
   scrollY?: number;
   /** 'restored' (startup) vs 'discarded' (idle/cap sweep) → drives `discarded`. */
   origin: 'restored' | 'discarded';
+}
+
+/** D3 (plan §5 D3.2/D3.3): a suspended AGENT tab — its WebContentsView was torn
+ *  down to reclaim the renderer, but the tabId stays addressable and is rebuilt
+ *  on demand by the hydration path. Distinct from FrozenTab (USER-only, session-
+ *  persisted, strip-rendered): agent tabs are never persisted across restarts
+ *  (cross-cutting rule #1), so this snapshot is RUNTIME-only and holds just what
+ *  restoreAgentTab needs to reconstruct the view (URL + partition storage; NOT
+ *  in-page state). */
+interface DiscardedAgentTab {
+  id: string;
+  url: string;
+  workspaceId: string | null;
+  /** The persist:agent:<workspaceId> Electron session — cookies/localStorage
+   *  survive the discard because the session partition is preserved. */
+  sessionPartition: string;
+  partitionFull: string;
+  openedByAgentId?: string;
+  openedByAgentTitle?: string;
+  /** When the tab was suspended (diagnostics / potential future TTL). */
+  discardedAt: number;
 }
 
 // ── WP2 frozen provider contract (WP2-B injects browserManager.tools into
@@ -670,6 +755,13 @@ export class BrowserManager {
    *  renderer DOM, so renderer modals must be able to hide the pane). */
   private paneVisible = true;
   private lastBounds: BrowserBounds = { x: 0, y: 0, width: 0, height: 0 };
+  /** View tear-off (Browser detach): the window the pane views + browser-chrome
+   *  IPC attach to right now. null → the main window (default). Set by reparentTo
+   *  when the Browser view is torn off into its own window; cleared by
+   *  reparentHome on close. Every contentView attach/remove AND every chrome
+   *  push (tab-state, snapshots, open-request) routes through host(), so with the
+   *  override set the whole browser surface lives in the detached window. */
+  private hostOverride: BrowserWindow | null = null;
   private controlPorts: ControlPorts;
   /** Lazily-attached CDP drivers, persist:agent tabs only (M9). */
   private drivers = new Map<string, CdpDriver>();
@@ -678,6 +770,21 @@ export class BrowserManager {
   /** M16 audit writer — lazy so app.getPath is only touched when a tool runs. */
   private auditWriter: ActionAudit | null = null;
   private toolsFacade: BrowserToolProvider | null = null;
+  /** D5-lite admission gate (incident-2026-07-11 §5 D5): refuses NEW agent tab
+   *  opens under Critical commit pressure / static caps. Injected by index.ts
+   *  from the memory watchdog; null (and in every unit test) until wired, so the
+   *  gate is a no-op unless the app installs it. Human (forHuman) opens are never
+   *  gated — the human is driving. */
+  // WAVE-4 SEAM (full-D5): the tab-admission check now receives the opening
+  // agent's id so the wiring can apply the per-agent memory budget in addition to
+  // the global commit/static-cap rules. A plain `() => AdmissionDecision` is still
+  // assignable here, so the D5-lite wiring keeps compiling.
+  private tabAdmissionCheck: ((agentId?: string) => AdmissionDecision) | null = null;
+  /** D2 dead-frame send guard (incident-2026-07-11 §5 D2): true once a tab-state
+   *  push found the shell frame dead. Latches the one-shot log and suppresses
+   *  further pushes until the shell renderer recovers (D1 reload → onShellRecovered
+   *  → full snapshot resend). */
+  private shellFrameDead = false;
 
   // ── Overhaul (WP7) — main is authoritative for tab order / pin / closed stack ──
   /** Display order of live tabIds. Normalized so pinned tabs cluster left. */
@@ -693,9 +800,20 @@ export class BrowserManager {
    *  from a USER tab via setWindowOpenHandler (see wireViewEvents). Tracked so
    *  the M4 managed-contents guard recognizes them (no "unknown web-contents"
    *  loud-log) and so their UA-per-URL override can be wired. Entries are
-   *  removed when the popup's webContents is destroyed. AGENT popups are never
-   *  allowed, so this set only ever holds persist:user windows. */
+   *  removed when the popup's webContents is destroyed. Also holds Phase 2
+   *  quarantined AGENT sign-in popups (§D line 249) — allowed ONLY from a
+   *  signinPending agent tab, tracked here so the M4 guard recognizes them, but
+   *  ALSO listed in signinPopupWindows (below) so they stay non-drivable and are
+   *  closed with the setup session. */
   private popupContents = new Set<WebContents>();
+  /** Phase 2 (§D line 249): quarantined SSO popups opened from a signinPending
+   *  agent sign-in tab, keyed by the PARENT sign-in tab id. The child inherits
+   *  the parent's persist:agent:<workspace> Session (Electron inherits the
+   *  opener's session for window.open children), is managed but NEVER an agent
+   *  tab (no TabEntry → invisible to toolListTabs, never CDP-attachable, never
+   *  agent-drivable), and the whole group is closed when the setup session
+   *  resolves / the sign-in tab closes. */
+  private signinPopupWindows = new Map<string, Set<BrowserWindow>>();
 
   // ── Slice 10/11: frozen/discarded tab model + session persistence ───────────
   /** Snapshot-backed tabs with NO WebContentsView (restored-on-startup or
@@ -711,6 +829,36 @@ export class BrowserManager {
   private discardingTabs = new Set<string>();
   /** Idempotency latch: sessionRestore re-materializes the persisted tabs once. */
   private sessionRestored = false;
+
+  // ── D3 agent-tab lifecycle (incident-2026-07-11 §5 D3) ──────────────────────
+  /** Suspended agent tabs (WebContentsView torn down, tabId still addressable).
+   *  Rebuilt by restoreAgentTab via the hydration coordinator. RUNTIME-only. */
+  private discardedAgentTabs = new Map<string, DiscardedAgentTab>();
+  /** D3.2 active-operation leases: a verb touch pins a tab as ineligible for
+   *  cap-discard for AGENT_TAB_LEASE_MS. */
+  private readonly agentLeaseLedger = new LeaseLedger(AGENT_TAB_LEASE_MS);
+  /** D3.1 grace-close: one pending timer per terminal agent, cancelled on
+   *  revival. `listCloseableTabs` is evaluated live at fire time so exemptions
+   *  reflect the tab's state when the timer fires, not when scheduled. */
+  private readonly agentGraceClose = new GraceCloseScheduler({
+    timers: {
+      set: (fn, ms) => {
+        const h = setTimeout(fn, ms);
+        if (typeof h.unref === 'function') h.unref(); // never hold the process open
+        return h;
+      },
+      clear: (h) => clearTimeout(h),
+    },
+    graceMs: AGENT_TAB_GRACE_CLOSE_MS,
+    listCloseableTabs: (agentId) => closeableAgentTabs(this.agentTabInfos(), agentId),
+    closeTab: (tabId) => this.closeTab(tabId),
+  });
+  /** D3.3 per-tab restore serialization — concurrent verbs against one suspended
+   *  tab share exactly one restoration. */
+  private readonly agentHydration = new TabHydrationCoordinator({
+    isDiscarded: (tabId) => this.discardedAgentTabs.has(tabId),
+    restore: (tabId) => this.restoreAgentTab(tabId),
+  });
   private sessionWriteTimer: ReturnType<typeof setTimeout> | null = null;
   private discardSweepTimer: ReturnType<typeof setInterval> | null = null;
   /** Slice 12: fires when a time-boxed arming window elapses, so the renderer
@@ -800,6 +948,61 @@ export class BrowserManager {
 
     // Slice-11: start the idle-discard + hard-cap sweep (USER tabs only).
     this.startDiscardSweep();
+
+    // Phase 0 (BrowserSigninSharing plan §D): startup, read-only consistency
+    // check for legacy NULL-workspace signed-in grants consumed by named
+    // workspaces. Best-effort (self-guarded); observes + logs only. The DB is
+    // initialized (index.ts) before the manager is constructed.
+    this.checkSignedInPartitionConsistency();
+  }
+
+  /** The window the pane views + browser chrome attach to right now. Falls back to
+   *  the main window if the detach override was destroyed out from under us. */
+  private host(): BrowserWindow | null {
+    if (this.hostOverride && !this.hostOverride.isDestroyed()) return this.hostOverride;
+    return this.getMainWindow();
+  }
+
+  /** View tear-off — move the browser surface into `win` (the detached Browser
+   *  window). Sets the host override so subsequent attach/visibility/chrome IPC
+   *  route there, re-parents the currently-active tab's WebContentsView into `win`
+   *  (WITHOUT destroying it — no reload), and re-emits the tab snapshot + active
+   *  tab state so the detached window's chrome hydrates. Hidden background tabs
+   *  stay parented on the main window until the detached renderer activates them
+   *  (setActiveTab re-adds them to host()), so no per-tab bulk move is needed. */
+  reparentTo(win: BrowserWindow): void {
+    if (this.hostOverride === win) return;
+    const prev = this.host();
+    this.hostOverride = win;
+    const active = this.activeTabId ? this.tabs.get(this.activeTabId) ?? null : null;
+    if (active && !win.isDestroyed()) {
+      try { if (prev && !prev.isDestroyed() && prev !== win) prev.contentView.removeChildView(active.view); } catch { /* old host gone */ }
+      win.contentView.addChildView(active.view);
+      active.view.setBounds(this.lastBounds);
+    }
+    this.applyVisibility();
+    this.emitTabsSnapshot();
+    if (active) this.sendTabState(active);
+  }
+
+  /** View tear-off — move the browser surface back to the main window (detached
+   *  window closing). The active view re-parents home (no reload); background tabs
+   *  already sit on the main window. Re-emits chrome state so the main window's
+   *  browser pane (once un-hollowed) hydrates. */
+  reparentHome(): void {
+    if (this.hostOverride === null) return;
+    const prev = this.hostOverride;
+    this.hostOverride = null;
+    const active = this.activeTabId ? this.tabs.get(this.activeTabId) ?? null : null;
+    const main = this.getMainWindow();
+    if (active && main && !main.isDestroyed()) {
+      try { if (prev && !prev.isDestroyed()) prev.contentView.removeChildView(active.view); } catch { /* detached window gone */ }
+      main.contentView.addChildView(active.view);
+      active.view.setBounds(this.lastBounds);
+    }
+    this.applyVisibility();
+    this.emitTabsSnapshot();
+    if (active) this.sendTabState(active);
   }
 
   /** Slice-6: snapshot of the OPEN USER tabs for the omnibox (switch-to-tab
@@ -954,7 +1157,7 @@ export class BrowserManager {
     this.tabOrder.push(tabId); // new tabs append (unpinned → right cluster)
     this.wireViewEvents(tab);
 
-    const win = this.getMainWindow();
+    const win = this.host();
     if (win) {
       win.contentView.addChildView(view);
       view.setBounds(this.lastBounds);
@@ -967,6 +1170,10 @@ export class BrowserManager {
     this.sendTabState(tab);
     this.emitTabsSnapshot(); // membership changed
     if (opts.partition === 'user') this.schedulePersist(); // Slice-10 session
+    // D3.2: a new agent view may push a per-agent or the global live-view cap
+    // over the limit — suspend the LRU eligible tabs now (the just-created,
+    // loading/fresh-attention tab is ineligible, so it is never the victim).
+    if (opts.partition === 'agent') this.enforceAgentViewCap();
     return { tabId };
   }
 
@@ -992,6 +1199,9 @@ export class BrowserManager {
     }
     const tab = this.tabs.get(tabId);
     if (!tab) return;
+    // Phase 2 (§D line 249): if this quarantined sign-in tab spawned SSO popups,
+    // close the group with it. Guarded so a normal tab close is unaffected.
+    if (this.signinPopupWindows.has(tabId)) this.closeSigninPopupsFor(tabId);
     // Was this the tab currently painting the pane? If so we must re-select a
     // replacement after teardown, otherwise the destroyed view's last frame
     // lingers as a "dead tab". Compute the replacement BEFORE any teardown so
@@ -1034,7 +1244,7 @@ export class BrowserManager {
     this.lastScrollY.delete(tabId);
     this.forgetTabOrder(tabId);
     if (wasActive) this.activeTabId = null;
-    this.getMainWindow()?.contentView.removeChildView(tab.view);
+    this.host()?.contentView.removeChildView(tab.view);
     // Genuinely destroy the WebContents. waitForBeforeUnload:false → a page's
     // beforeunload / will-prevent-unload handler can neither cancel nor stall the
     // teardown, so the WebContentsView is always reaped (no lingering dead tab).
@@ -1105,7 +1315,7 @@ export class BrowserManager {
     const active = tabId === null ? null : this.tabs.get(tabId)!;
     if (active) {
       this.lastActiveAt.set(active.id, Date.now()); // idle-sweep / LRU recency
-      const win = this.getMainWindow();
+      const win = this.host();
       // Re-adding an existing child raises it to the top of the view stack.
       win?.contentView.addChildView(active.view);
       active.view.setBounds(this.lastBounds);
@@ -1285,7 +1495,12 @@ export class BrowserManager {
     // + origin storage) before the row — and its tracked known-origins rows —
     // are gone, so clearAgentSiteData can still resolve the union of origins.
     const rule = getRule(id);
-    if (rule) void this.clearAgentSiteData(rule, rule.workspaceId ?? null);
+    // Phase 1 (§D): a legacy null-workspace WILDCARD rule can hold independent
+    // credentials across many named workspaces — clear EVERY workspace that holds a
+    // grant, not just the rule's own (possibly-null) workspace. deleteRule (below)
+    // then drops the grant + known-origin rows, so this must run FIRST while the
+    // grant workspaces are still enumerable.
+    if (rule) void this.clearRuleAgentSiteDataAllWorkspaces(rule);
     deleteRule(id);
     this.invalidateAccessCache();
     this.revokeNonDrivableHandedTabs();
@@ -1358,7 +1573,7 @@ export class BrowserManager {
    *  login tab on the rule's origin. signinPending/signinRuleId are RUNTIME,
    *  NON-PERSISTED, and set ONLY here — every agent tool verb against the tab is
    *  refused (gate quarantine) until access-handoff-ready clears it. */
-  accessHandoffSignin(ruleId: string): AccessHandoffResult {
+  accessHandoffSignin(ruleId: string, callerWorkspaceId?: string | null): AccessHandoffResult {
     const rule = getRule(ruleId);
     if (!rule) {
       throw new Error(`access-handoff-signin: unknown rule ${ruleId}`);
@@ -1366,8 +1581,17 @@ export class BrowserManager {
     if (!rule.allowSignedIn) {
       throw new Error(`access-handoff-signin: rule ${ruleId} is not allow_signed_in`);
     }
+    // Phase 1 (§D): open the quarantined sign-in tab in the EXPLICIT caller
+    // workspace when supplied (undefined → fall back to the rule / current
+    // workspace; an explicit null default still wins over rule.workspaceId), so the
+    // credentials land in the caller's partition and the dual-written grant is keyed
+    // to exactly that workspace.
+    const effectiveWs =
+      callerWorkspaceId !== undefined
+        ? callerWorkspaceId
+        : rule.workspaceId ?? this.currentWorkspaceId ?? null;
     // Manual "Sign in for agent" (no triggering url) → open the rule's origin.
-    const tabId = this.openSigninHandoffTab(rule, rule.workspaceId ?? null, undefined, 'Manual sign-in for agent.');
+    const tabId = this.openSigninHandoffTab(rule, effectiveWs, undefined, 'Manual sign-in for agent.');
     return { tabId };
   }
 
@@ -1387,7 +1611,20 @@ export class BrowserManager {
     _reason: string,
   ): string {
     const scheme = rule.scheme === 'any' ? 'https' : rule.scheme;
-    const fallback = `${scheme}://${rule.hostname}${rule.pathPrefix ?? ''}`;
+    const origin = `${scheme}://${rule.hostname}`;
+    let fallback = `${origin}${rule.pathPrefix ?? ''}`;
+    // Phase 2 (§D line 246): with no specific triggering URL (manual "Set up" /
+    // post-import validation), prefer the adapter's authenticated setup-target
+    // page — a logged-out human is dropped straight onto the site's real sign-in
+    // flow, and a logged-in one lands on an authenticated page useful for visual
+    // validation. Same-origin by construction; only used when it still passes the
+    // nav floor AND matches the rule (never widens the open).
+    const adapter = resolveSigninAdapter(origin);
+    if (adapter) {
+      const setupUrl = `${origin}${adapter.setupTargetPath}`;
+      const setupNav = checkNavigation(setupUrl, { apiPort: this.controlPorts.apiPort });
+      if (setupNav.allow && matchesRule(setupUrl, rule)) fallback = setupUrl;
+    }
     let url = fallback;
     if (targetUrl) {
       // Only open the original target when it is BOTH navigable (M11 floor) and
@@ -1412,16 +1649,29 @@ export class BrowserManager {
    *  allow_signed_in origin), clear the quarantine, and upsert the committed
    *  origin into browser_access_signed_in_origins (§13) so revocation can later
    *  clear it. */
-  accessHandoffReady(tabId: string): void {
+  accessHandoffReady(tabId: string): SigninHandoffReadyResult {
     const tab = this.mustGet(tabId);
-    if (!tab.signinPending) return; // not quarantined — nothing to release
+    if (!tab.signinPending) return { verification: 'confirmed' }; // not quarantined
     const wc = tab.view.webContents;
     const url = wc.isDestroyed() ? '' : wc.getURL();
+    // Phase 2 (§D line 247): completion requires the setup tab to have RETURNED to
+    // the approved service origin — an IdP/login origin the human traversed during
+    // quarantine is not an allow_signed_in origin, so checkSignedInDrive refuses it
+    // (bounded-redirect floor: traversal never becomes completion).
     if (!checkSignedInDrive(url, this.agentCtx(tab.workspaceId)).allow) {
       throw new Error(
         `access-handoff-ready: tab ${tabId} committed URL is not an allow_signed_in origin`,
       );
     }
+    // Phase 2 (§D line 247): where a SAFE adapter probe exists, it must succeed
+    // (the tab is on the service origin AND not still parked on a login wall)
+    // before the grant is marked ready — this THROWS on a probe failure, leaving
+    // the tab quarantined and no active grant written. Unknown sites (no probe)
+    // fall back to a human attestation ('confirmed'); the UI is then honest.
+    const verifyRule = tab.signinRuleId ? getRule(tab.signinRuleId) : this.resolveSignedInRule(url, tab.workspaceId);
+    const verification: SigninSetupVerification = verifyRule
+      ? this.setupVerificationFor(verifyRule, url)
+      : 'confirmed';
     if (tab.signinRuleId) {
       try {
         // Slice 12: stamp the session age — a successful hand-off-ready commit is
@@ -1445,8 +1695,73 @@ export class BrowserManager {
     // equals it, but a redirect-finished sign-in may differ). Emits
     // browser:signin-resolved {state:'ready'}.
     this.resolveSigninSessionForTab(tabId, 'ready', releasedRuleId);
+    // Phase 2 (§D line 249): the SSO popup group is bound to the setup session —
+    // close it now that setup completed (the human is done with the OAuth window).
+    this.closeSigninPopupsFor(tabId);
     // Slice 12: the session center's list just changed (a new/refreshed origin).
     this.send(BROWSER_CHANNELS.accessChanged, undefined);
+    return { verification };
+  }
+
+  /** Phase 2 (§D line 247): decide how a completed setup was verified for `rule`
+   *  with the setup tab committed at `committedUrl`. A site with a SAFE adapter
+   *  probe must be OFF its login wall (proving the human reached an authenticated
+   *  page on the service origin) — otherwise this THROWS so the caller aborts
+   *  completion and the tab stays quarantined. Sites with no safe probe return
+   *  'confirmed' (human attestation → honest UI). Never logs cookie material. */
+  private setupVerificationFor(
+    rule: { hostname: string; loginUrlPatterns?: string[] },
+    committedUrl: string,
+  ): SigninSetupVerification {
+    const adapter: SigninSiteAdapter | undefined = resolveSigninAdapter(committedUrl);
+    if (!adapter || !adapter.hasProbe) return 'confirmed';
+    const probeRule = {
+      hostname: rule.hostname,
+      loginUrlPatterns: [...(rule.loginUrlPatterns ?? []), ...adapter.loginWallHints],
+    };
+    if (looksLikeLoginWall(committedUrl, probeRule)) {
+      throw new Error(
+        'access-handoff-ready: the setup tab is still on the sign-in page — ' +
+          'finish signing in and return to the site before completing setup',
+      );
+    }
+    return 'probed';
+  }
+
+  /** Phase 2 (§D line 249): close the whole quarantined SSO popup group bound to
+   *  the setup sign-in tab `tabId`. Called on completion (accessHandoffReady),
+   *  cancel/timeout (degradeSignin / accessSigninPendingCancel), and when the
+   *  quarantined tab itself closes. Idempotent — a no-op when the tab never
+   *  opened a popup. Never logs any cookie/URL material. */
+  private closeSigninPopupsFor(tabId: string): void {
+    const popups = this.signinPopupWindows.get(tabId);
+    if (!popups) return;
+    for (const win of popups) {
+      if (!win.isDestroyed()) win.close();
+    }
+    this.signinPopupWindows.delete(tabId);
+  }
+
+  /** Phase 2 (§D line 249): the window.open allow-decision, extracted so it has a
+   *  single source of truth and is directly unit-testable. A popup is allowed
+   *  ONLY from a USER tab (real human OAuth) OR a quarantined agent sign-in tab
+   *  (`signinPending`), so "Sign in with Google/Microsoft/USF" can complete
+   *  in-quarantine. The child inherits the opener's persist:agent:<workspace>
+   *  Session (Electron behavior for window.open), so credentials land in the agent
+   *  partition, never persist:user; it is registered managed-but-non-drivable
+   *  (did-create-window) and closed with the setup session. A signin popup also
+   *  gets the same scheme + SSRF/loopback floor an agent navigation gets (M6/M11)
+   *  so it cannot become an SSRF vector. Ordinary (non-signin) agent tabs are
+   *  never allowed to open popups. */
+  private decidePopupOpen(tab: { partition: BrowserPartition; signinPending?: boolean }, url: string): boolean {
+    const schemeOk =
+      url.startsWith('http://') || url.startsWith('https://') || url === 'about:blank';
+    const isSigninAgentPopup = tab.partition === 'agent' && tab.signinPending === true;
+    const ssrfOk =
+      !isSigninAgentPopup ||
+      url === 'about:blank' ||
+      checkNavigation(url, { apiPort: this.controlPorts.apiPort }).allow;
+    return schemeOk && ssrfOk && (tab.partition === 'user' || isSigninAgentPopup);
   }
 
   /** WI-E (Import my session) — Option A, the most-proactive path. Copy the
@@ -1460,7 +1775,10 @@ export class BrowserManager {
    *  user→agent and a point-in-time SNAPSHOT; agents still cannot see or drive
    *  `persist:user`. On `imported === 0` we do NOT upsert (no row) so the UI
    *  degrades to the Mechanism-B in-agent-tab sign-in fallback. */
-  async importUserSessionForRule(ruleId: string): Promise<{ imported: number; origin: string }> {
+  async importUserSessionForRule(
+    ruleId: string,
+    callerWorkspaceId?: string | null,
+  ): Promise<ImportUserSessionResult> {
     const rule = getRule(ruleId);
     if (!rule) {
       throw new Error(`import-user-session: unknown rule ${ruleId}`);
@@ -1468,10 +1786,20 @@ export class BrowserManager {
     if (!rule.allowSignedIn) {
       throw new Error(`import-user-session: rule ${ruleId} is not allow_signed_in`);
     }
+    // Phase 1 (§D): thread the EXPLICIT caller workspace. Distinguish undefined
+    // (caller didn't pass one → resolve from the rule / current workspace) from an
+    // explicit null (the default workspace was selected → wins over rule.workspaceId).
+    // A legacy null-workspace wildcard rule must NOT collapse a named caller's
+    // import into persist:agent:default — the credentials must land in the caller's
+    // own partition so the grant is 1:1 with where the session lives.
+    const effectiveWs =
+      callerWorkspaceId !== undefined
+        ? callerWorkspaceId
+        : rule.workspaceId ?? this.currentWorkspaceId ?? null;
     const scheme = rule.scheme === 'any' ? 'https' : rule.scheme;
     const origin = `${scheme}://${rule.hostname}`;
     const userSes = session.fromPartition('persist:user');
-    const agentSes = session.fromPartition(agentPartitionForWorkspace(rule.workspaceId));
+    const agentSes = session.fromPartition(agentPartitionForWorkspace(effectiveWs));
     // Union of origin-scoped + domain-scoped cookies: `url` captures the host-only
     // + apex set for the origin; `domain` captures `.host` domain cookies and any
     // path the origin query missed. De-dup by (name, domain, path).
@@ -1485,26 +1813,30 @@ export class BrowserManager {
       seen.add(key);
       cookies.push(c);
     }
-    let imported = 0;
+    let candidateCookiesCopied = 0;
     for (const c of cookies) {
       try {
         // One rejected cookie (expired, malformed) must not abort the batch.
         await agentSes.cookies.set(cookieToSetDetails(c, rule.hostname));
-        imported++;
+        candidateCookiesCopied++;
       } catch {
         /* skip this cookie, keep importing the rest */
       }
     }
-    if (imported > 0) {
-      const now = Date.now();
-      upsertSignedInOrigin(ruleId, origin, rule.workspaceId ?? null, {
-        signedInAt: now,
-        verifiedAt: now,
-      });
-      // The session center's list just changed (the origin flips to signed_in).
+    // Phase 2 (§D line 245, locked decision Q3): a cookie copy is a CANDIDATE
+    // first step of setup — NOT proof of a signed-in session. It NEVER upserts an
+    // active/verified grant (an anonymous `lang` cookie must not flip the origin
+    // to signed-in — repro (b)). The credentials still land in
+    // persist:agent:<effectiveWs>, but "signed in" now requires interactive
+    // setup-and-verify completion (accessHandoffReady's adapter probe / human
+    // confirmation), not a cookie count. Any existing grant's consent_state and
+    // session_state are left untouched here — absent an active grant, the origin
+    // classifies as needs_signin (UI: "Setup required"). We still notify so the
+    // session center can reflect that setup material is now present.
+    if (candidateCookiesCopied > 0) {
       this.send(BROWSER_CHANNELS.accessChanged, undefined);
     }
-    return { imported, origin };
+    return { candidateCookiesCopied, origin };
   }
 
   // ── Signed-in tabs (on-demand user sign-in) — registry, gate, lifecycle ─────
@@ -1551,12 +1883,87 @@ export class BrowserManager {
     } catch {
       return 'ready';
     }
-    if (getSignedInOriginState(rule.id, origin) !== 'active') return 'needs_signin';
-    if (committedUrl && looksLikeLoginWall(committedUrl, rule)) {
-      expireSignedInOrigin(rule.id, origin, Date.now());
+    // Phase 1 (BrowserSigninSharing §D): login grants are WORKSPACE-EXACT. Read the
+    // grant for the CALLER's workspace, never the workspace-agnostic legacy row — a
+    // grant established in persist:agent:default (a legacy NULL-workspace wildcard
+    // rule) or in another workspace is NOT active for this named caller, so the
+    // agent pends a sign-in instead of opening as a guest (locked decision Q2).
+    if (getLoginGrantSessionState(rule.id, origin, workspaceId) !== 'active') return 'needs_signin';
+    // Phase 4 item 1/2 (§D line 272-273): the committed URL is probed for expiry
+    // with the ADAPTER-AWARE signal set (URL login-wall — folding the per-board
+    // adapter's loginWallHints so a guest view parked on e.g. Handshake's /access
+    // wall is caught here too, not only at setup — PLUS a redirect to a configured
+    // IdP/login destination). A guest-viewable page must never stay `ready`.
+    if (committedUrl && this.committedUrlSignalsExpiry(committedUrl, origin, rule)) {
+      this.expireOriginGrant(workspaceId, origin, rule.id);
       return 'needs_signin';
     }
     return 'ready';
+  }
+
+  /** Phase 4 (§D line 274): atomically expire ONLY the failing (workspace, origin)
+   *  grant — the workspace-exact login grant AND the legacy signed-in-origins row
+   *  (session-center listing + old-table consumers stay consistent). Durable
+   *  CONSENT is preserved (re-auth reuses it, no re-consent dialog). Sibling
+   *  workspaces are untouched. Single source of truth for expiry so every stronger
+   *  signal (login-wall, IdP redirect, 401/403) routes through one atomic write. */
+  private expireOriginGrant(workspaceId: string | null, origin: string, ruleId: string): void {
+    const now = Date.now();
+    expireLoginGrant(ruleId, origin, workspaceId, now);
+    expireSignedInOrigin(ruleId, origin, now);
+  }
+
+  /** Phase 4 item 1/2 (§D line 272-273): does the committed URL signal that the
+   *  shared session has expired / dropped to a guest, WITHOUT reading page content?
+   *  Combines (a) the URL login-wall heuristic folded with the per-board adapter's
+   *  loginWallHints (so an adapter probe failure — the tab sitting on the board's
+   *  own sign-in surface — is a live expiry signal on the nav path, matching the
+   *  stricter setup-time probe), and (b) a redirect to a configured IdP / login
+   *  destination for the origin's adapter (login.live.com, secure.indeed.com,
+   *  sso.usf.edu, …). `serviceOrigin` is the credentialed origin; `committedUrl`
+   *  is where the tab actually landed. Never inspects cookies or page text. */
+  private committedUrlSignalsExpiry(
+    committedUrl: string,
+    serviceOrigin: string,
+    rule: { hostname?: string; loginUrlPatterns?: string[] },
+  ): boolean {
+    const adapter = resolveSigninAdapter(serviceOrigin);
+    const probeRule = adapter
+      ? {
+          hostname: rule.hostname,
+          loginUrlPatterns: [...(rule.loginUrlPatterns ?? []), ...adapter.loginWallHints],
+        }
+      : rule;
+    if (looksLikeLoginWall(committedUrl, probeRule)) return true;
+    if (adapter && isKnownLoginDestination(committedUrl, adapter)) return true;
+    return false;
+  }
+
+  /** Phase 4 item 1 (§D line 272): a main-frame HTTP 401/403 on an
+   *  allow_signed_in origin is a strong, CONTENT-FREE expiry signal — the shared
+   *  session is no longer accepted by the server. Atomically expire ONLY that
+   *  (workspace, origin) grant so the next agent verb pends a fresh sign-in
+   *  (fail-closed: the worst case is forcing a re-sign-in, never serving a guest
+   *  page as authenticated). Agent tabs only; the human's own tabs never pend.
+   *  Wired to `did-navigate`, which fires for MAIN-FRAME commits only, so a 401/403
+   *  on a sub-resource can't trip it. Never logs headers/status/cookie material. */
+  private maybeExpireOnHttpStatus(tab: TabEntry, committedUrl: string, httpStatus: number): void {
+    if (tab.partition !== 'agent') return;
+    if (httpStatus !== 401 && httpStatus !== 403) return;
+    const rule = this.resolveSignedInRule(committedUrl, tab.workspaceId);
+    if (!rule) return;
+    let origin: string;
+    try {
+      origin = new URL(committedUrl).origin;
+    } catch {
+      return;
+    }
+    // Only an ACTIVE grant can expire — a setup_required/expired/absent grant is
+    // already handled by the classify path; don't churn writes on it.
+    if (getLoginGrantSessionState(rule.id, origin, tab.workspaceId) !== 'active') return;
+    this.expireOriginGrant(tab.workspaceId, origin, rule.id);
+    // The session center + any per-row status just changed (active → expired).
+    this.send(BROWSER_CHANNELS.accessChanged, undefined);
   }
 
   /** WI-2(c): instance wrapper over the pure `looksLikeLoginWall` (kept so tests
@@ -1673,12 +2080,147 @@ export class BrowserManager {
     const rule = this.resolveSignedInRule(committed, tab.workspaceId);
     if (!rule) return null;
     // committedUrl doubles as the login-wall probe (flips an active row expired).
-    if (this.classifyOriginState(tab.workspaceId, committed, committed) !== 'needs_signin') {
+    // Phase 1 (§D): a credentialed tab is truly ready ONLY when classify says ready
+    // AND the runtime partition tripwire agrees (grant workspace ↔ tab session
+    // partition). grantPartitionAgrees fails closed on divergence → pend a sign-in.
+    if (
+      this.classifyOriginState(tab.workspaceId, committed, committed) !== 'needs_signin' &&
+      this.grantPartitionAgrees(tab)
+    ) {
       return null;
     }
     const outcome = this.ensureSignedInOrPend(tab.workspaceId, origin, rule.id, tab.id, committed);
     if (outcome === 'ready') return null; // a sibling completed in the meantime
     return this.signinResultFor(outcome, origin, tab.workspaceId);
+  }
+
+  /** Phase 1 runtime tripwire (spec §D): a credentialed agent tab is only truly
+   *  ready when the workspace its login grant is keyed to and the tab's ACTUAL
+   *  Electron session partition agree. The grant is keyed by tab.workspaceId and the
+   *  credentials live in agentPartitionForWorkspace(tab.workspaceId); classifyOrigin
+   *  State keys off the same workspaceId, so this holds STRUCTURALLY today. It is a
+   *  fail-closed guard against a future refactor that could leave a tab's
+   *  sessionPartition diverged from its workspace — on disagreement it warns and
+   *  returns false so the caller pends a sign-in instead of driving credentialed in
+   *  the wrong partition. Human tabs carry no agent grant → always agree. Never logs
+   *  cookie material. */
+  private grantPartitionAgrees(tab: TabEntry): boolean {
+    if (tab.partition !== 'agent') return true;
+    const expected = agentPartitionForWorkspace(tab.workspaceId);
+    const actual = tab.sessionPartition ?? expected;
+    if (actual !== expected) {
+      console.warn(
+        `[browser] grant/partition tripwire: tab ${tab.id} session partition ${actual} ` +
+          `disagrees with grant workspace partition ${expected} ` +
+          `(workspaceId=${String(tab.workspaceId)}) — failing closed to needs_signin.`,
+      );
+      return false;
+    }
+    return true;
+  }
+
+  /** Phase 0 (BrowserSigninSharing plan §D): emit a TRUSTED, cookie-free
+   *  diagnostic for a single credentialed agent open. Records ruleId, the rule's
+   *  workspace, the caller's workspace, the computed credential-home vs caller
+   *  session partitions, the grant state, and WHY — as one audit line
+   *  (verb='credentialedOpenDiag') plus a console warning when the current
+   *  classifier would (mis)report ready while the agent is actually a guest. This
+   *  ONLY observes; it changes no behavior (the fix is Phase 1/2). The current
+   *  schema does not track how the active row was established, so `activation` is
+   *  'unknown' at runtime — the false_active_import distinction is exercised at the
+   *  unit level. NEVER logs cookie names or values. */
+  private emitCredentialedOpenDiagnostic(
+    rule: AccessRule,
+    callerWorkspaceId: string | null,
+    origin: string,
+    ctx: { agentId?: string; agentTitle?: string },
+  ): void {
+    try {
+      const diag = classifyCredentialedOpen({
+        ruleId: rule.id,
+        ruleWorkspaceId: rule.workspaceId ?? null,
+        callerWorkspaceId: callerWorkspaceId ?? null,
+        credentialHomePartition: agentPartitionForWorkspace(rule.workspaceId),
+        callerSessionPartition: agentPartitionForWorkspace(callerWorkspaceId),
+        // Phase 1: report the WORKSPACE-EXACT grant for the CALLER's workspace (the
+        // post-fix truth) — a legacy null/other-workspace active row is no longer
+        // 'active' for a named caller. Map the grant's tri-state to the diag's
+        // 'active'|'expired'|'none' (a setup_required grant → 'none').
+        sessionState: (() => {
+          const gs = getLoginGrantSessionState(rule.id, origin, callerWorkspaceId);
+          return gs === 'active' ? 'active' : gs === 'expired' ? 'expired' : 'none';
+        })(),
+        // Provenance is not tracked by the current schema (Phase 1/2 adds it).
+        activation: 'unknown',
+        unattended: this.isSigninUnattended(callerWorkspaceId),
+      });
+      this.auditRecord(PARTITION_FULL.agent, origin, 'credentialedOpenDiag', { origin }, `diag:${diag.grantState}`, {
+        workspaceId: callerWorkspaceId,
+        agentId: ctx.agentId,
+        agentTitle: ctx.agentTitle,
+        signin: diag,
+      });
+      if (diag.legacyReady && diag.desiredOutcome !== 'ready') {
+        console.warn(
+          `[browser] signed-in diagnostic: origin ${origin} classified '${diag.grantState}' — ` +
+            `${diag.readyReason}. The legacy classifier reports READY. ` +
+            `ruleId=${diag.ruleId} ruleWs=${String(diag.ruleWorkspaceId)} callerWs=${String(diag.callerWorkspaceId)} ` +
+            `credHome=${diag.credentialHomePartition} caller=${diag.callerSessionPartition} ` +
+            `(Phase 0 flags only; Phase 1/2 fix.)`,
+        );
+      }
+    } catch (err) {
+      console.error(
+        '[browser] credentialed-open diagnostic failed:',
+        err instanceof Error ? err.message : String(err),
+      );
+    }
+  }
+
+  /** Phase 0 (BrowserSigninSharing plan §D): STARTUP, READ-ONLY consistency
+   *  check. Flags every ACTIVE signed-in session row whose governing rule is a
+   *  legacy NULL-workspace allow_signed_in rule. Its credentials live only in
+   *  persist:agent:default, yet the row applies to every named workspace — so a
+   *  researcher in a named workspace consumes it and opens as a GUEST while
+   *  classifyOriginState reports ready. Wired into the manager's own constructor
+   *  init/hardening path (NOT index.ts / api-server.ts). Observes + logs ONLY (no
+   *  schema or behavior change — the fix is Phase 1). Best-effort: never throws.
+   *  Never logs cookie material. Returns the flagged diagnostics for unit exercise. */
+  checkSignedInPartitionConsistency(): CredentialedOpenDiagnostic[] {
+    const flagged: CredentialedOpenDiagnostic[] = [];
+    try {
+      const rows = listActiveNullWorkspaceSignedInGrants();
+      for (const row of rows) {
+        // A NULL grant is latently wrong for ANY named workspace; model a
+        // representative named consumer so the partition divergence is explicit.
+        const diag = classifyCredentialedOpen({
+          ruleId: row.ruleId,
+          ruleWorkspaceId: null,
+          callerWorkspaceId: '<named-workspace>',
+          credentialHomePartition: agentPartitionForWorkspace(null),
+          callerSessionPartition: agentPartitionForWorkspace('<named-workspace>'),
+          sessionState: 'active',
+          activation: 'unknown',
+          unattended: false,
+        });
+        flagged.push(diag);
+        console.warn(
+          `[browser] startup consistency: active NULL-workspace signed-in grant for ${row.origin} ` +
+            `(ruleId=${row.ruleId}) — credentials live in ${agentPartitionForWorkspace(null)} but a named ` +
+            `workspace opens in its own partition; classifyOriginState reports READY while the agent is a GUEST ` +
+            `(grantState='${diag.grantState}'). Phase 0 flags only; Phase 1 fixes.`,
+        );
+        this.auditRecord(PARTITION_FULL.agent, row.origin, 'signinConsistencyFlag', { origin: row.origin, ruleId: row.ruleId }, `diag:${diag.grantState}`, {
+          signin: diag,
+        });
+      }
+    } catch (err) {
+      console.error(
+        '[browser] startup signed-in consistency check failed:',
+        err instanceof Error ? err.message : String(err),
+      );
+    }
+    return flagged;
   }
 
   /** WI-4: the workspace-scoped `signin_pending` rollup for the
@@ -1767,6 +2309,10 @@ export class BrowserManager {
     if (!session || session.state !== 'pending') return;
     session.state = 'unavailable';
     this.clearSigninTimeout(key);
+    // Phase 2 (§D line 249): the setup session is over — tear down its SSO popup
+    // group before closing the quarantined tab (closeTab also does this, but a
+    // degrade must close popups even if the tab was already gone). Idempotent.
+    this.closeSigninPopupsFor(session.tabId);
     const tab = this.tabs.get(session.tabId);
     if (tab?.signinPending) this.closeTab(session.tabId);
     const resolved: SigninResolved = { origin: session.origin, state: 'signin_unavailable' };
@@ -1823,6 +2369,28 @@ export class BrowserManager {
     if (tab?.signinPending) this.closeTab(tabId);
   }
 
+  /** Phase 4 item 4 (§D line 275): explicit human RE-ARM of a run-scoped
+   *  `unavailable` sign-in latch. Once a hold times out / is cancelled / an
+   *  unattended run declined it, `ensureSignedInOrPend` returns `unavailable` for
+   *  the REST of the run and never auto-reopens a setup tab (deliberate: no
+   *  infinite reopen loop against a human who isn't there). This clears that latch
+   *  for a single (workspace, origin) so the NEXT agent nav opens exactly ONE fresh
+   *  setup tab again. Only an `unavailable` session is cleared — a live `pending`
+   *  hold or a `ready` session is never disturbed (so a concurrent re-arm can't
+   *  orphan an in-flight setup tab). Returns true when a latch was actually cleared.
+   *  Trusted-chrome only; durable consent is untouched. */
+  accessSigninReArm(workspaceId: string | null, origin: string): boolean {
+    const key = signinKey(workspaceId, origin);
+    const s = this.signinSessions.get(key);
+    if (!s || s.state !== 'unavailable') return false;
+    this.clearSigninTimeout(key);
+    this.signinSessions.delete(key);
+    // The pending rollup (browser_list_my_access_requests) + any status surface
+    // just changed — a previously-unavailable origin is armable again.
+    this.send(BROWSER_CHANNELS.accessChanged, undefined);
+    return true;
+  }
+
   /** Mechanism B, §12-B: hand the human's live signed-in tab to the agent.
    *  Refuses unless the tab's COMMITTED origin is an allow_signed_in List-A rule
    *  (re-checked on every attach via isAgentDrivable). handedToAgent is RUNTIME,
@@ -1851,7 +2419,17 @@ export class BrowserManager {
    *  for a rule's origins without deleting the rule. */
   async accessClearSiteSession(ruleId: string): Promise<void> {
     const rule = getRule(ruleId);
-    if (rule) await this.clearAgentSiteData(rule, rule.workspaceId ?? null);
+    if (rule) {
+      // Phase 1 (§D): clear the agent partition in EVERY workspace holding a grant
+      // for this rule (wildcard rules span workspaces), then expire BOTH the
+      // workspace-exact grants and the legacy signed-in rows so a cleared origin
+      // flips to needs_signin IMMEDIATELY everywhere — not lingering ACTIVE (a
+      // false-ready guest) until the next lazy login-wall probe. The rule row is
+      // KEPT (per-row "Clear agent session", not a delete).
+      await this.clearRuleAgentSiteDataAllWorkspaces(rule);
+      expireLoginGrantsForRule(rule.id);
+      expireSignedInOriginsForRule(rule.id);
+    }
     // Slice 12: clearing a session drops it from the "Sessions shared with
     // agents" center — refresh the trusted chrome.
     this.send(BROWSER_CHANNELS.accessChanged, undefined);
@@ -1861,8 +2439,11 @@ export class BrowserManager {
    *  snapshot for the active workspace — the live handed tabs (Mechanism B, still
    *  drivable) plus the persisted signed-in agent origins (Mechanism A, with
    *  session-age + stale flags). Trusted-chrome only; never reaches an agent. */
-  getSharedSessions(): SharedAgentSessions {
-    const ws = this.currentWorkspaceId;
+  getSharedSessions(workspaceId: string | null = this.currentWorkspaceId): SharedAgentSessions {
+    // Phase 1 (§D): honor an EXPLICIT caller workspace (the spec's "explicit caller
+    // workspace"); defaults to the active workspace for the trusted-chrome callers
+    // that don't pass one. Body already scopes every branch by `ws`.
+    const ws = workspaceId;
     const handedTabs: HandedTabInfo[] = [];
     for (const tab of this.tabs.values()) {
       if (!tab.handedToAgent) continue;
@@ -1879,6 +2460,48 @@ export class BrowserManager {
     // allow_signed_in rule appears (signed_in / expired / never), not only
     // origins with an existing session row. handedTabs are unchanged.
     return { handedTabs, signedInOrigins: listSharedSignedInEntries(ws ?? null) };
+  }
+
+  /** Phase 3 (§D line 264): READ-ONLY per-rule visit + login status for the
+   *  SELECTED workspace, sourced from the workspace-exact login grant
+   *  (getLoginGrantSessionState) — NEVER a bare legacy signed-in-origins row.
+   *  Mirrors accessRuleList's workspace scoping so the renderer can label each row
+   *  with the combined vocabulary without a second lookup. PURE read (no login-wall
+   *  expiry side effect — that stays on the nav path in classifyOriginState). */
+  accessSiteStatus(workspaceId: string | null = this.currentWorkspaceId): AccessSiteStatus[] {
+    return listRules()
+      .filter((r) => rowAppliesToWorkspace(r.workspaceId, workspaceId))
+      .map((rule) => {
+        const scheme = rule.scheme === 'any' ? 'https' : rule.scheme;
+        const origin = `${scheme}://${rule.hostname}`;
+        const login = rule.allowSignedIn;
+        const session = login
+          ? (getLoginGrantSessionState(rule.id, origin, workspaceId) ?? 'none')
+          : 'none';
+        return { ruleId: rule.id, origin, visit: rule.enabled, login, session };
+      });
+  }
+
+  /** Phase 1 (§D) — WORKSPACE-BREADTH revocation. A legacy null-workspace WILDCARD
+   *  rule can hold INDEPENDENT credentials/grants across many named workspaces, so
+   *  clearing only `rule.workspaceId ?? null` (→ persist:agent:default) would leave
+   *  a named workspace's cookies + active grant intact (a revoked-but-still-ready
+   *  guest — the exact defect Phase 1 kills). Clear the agent partition in EVERY
+   *  workspace that holds a grant for the rule: the union of the rule's own
+   *  workspace key and every workspace_key in the workspace-exact grant table. Each
+   *  key is an explicit workspaceId (never inferred from a possibly-null
+   *  rule.workspaceId). Callers own the durable-row lifecycle (delete vs expire). */
+  private async clearRuleAgentSiteDataAllWorkspaces(rule: AccessRule): Promise<void> {
+    const workspaceKeys = new Set<string>([
+      loginGrantWorkspaceKey(rule.workspaceId ?? null),
+      ...listLoginGrantWorkspacesForRule(rule.id),
+    ]);
+    for (const ws of workspaceKeys) {
+      // ws is a grant workspace_key ('default' for the legacy/null workspace);
+      // agentPartitionForWorkspace collapses 'default'/null to persist:agent:default,
+      // so it maps 1:1 to the partition the credentials live in.
+      await this.clearAgentSiteData(rule, ws);
+    }
   }
 
   /** §14 — REQUIRED revocation breadth. Clear agent-partition site data for the
@@ -2144,7 +2767,15 @@ export class BrowserManager {
     verb: string,
     args: unknown,
     outcome: string,
-    ctx?: { tab?: TabEntry; workspaceId?: string | null; agentId?: string; agentTitle?: string },
+    ctx?: {
+      tab?: TabEntry;
+      workspaceId?: string | null;
+      agentId?: string;
+      agentTitle?: string;
+      /** Phase 0: trusted signed-in diagnostic for a credentialed-open / startup
+       *  consistency line (additive; never carries cookie material). */
+      signin?: CredentialedOpenDiagnostic;
+    },
   ): void {
     const tab = ctx?.tab;
     const workspaceId = ctx?.workspaceId ?? tab?.workspaceId ?? undefined;
@@ -2160,6 +2791,7 @@ export class BrowserManager {
       ...(workspaceId != null ? { workspaceId } : {}),
       ...(agentId ? { agentId } : {}),
       ...(agentTitle ? { agentTitle } : {}),
+      ...(ctx?.signin ? { signin: ctx.signin } : {}),
     });
 
     // Slice 12: every authenticated agent drive (read OR act — both funnel
@@ -2477,6 +3109,11 @@ export class BrowserManager {
     args: unknown,
     tab?: TabEntry,
   ): void {
+    // D3.2: a verb executing against an agent tab holds an active-operation lease
+    // (pins it out of cap-discard for AGENT_TAB_LEASE_MS). Touch even on a denial
+    // — the agent is actively operating on the tab either way.
+    if (tab && tab.partition === 'agent') this.agentLeaseLedger.touch(tab.id, Date.now());
+
     if (!browserToolsEnabled(process.env)) {
       this.auditRecord(partitionFull, url ?? '', verb, args, 'denied:tools-disabled', { tab });
       throw new PolicyError(
@@ -2547,6 +3184,16 @@ export class BrowserManager {
     },
   ): Promise<OpenUrlResult> {
     const forHuman = opts.forHuman === true;
+    // D5-lite admission gate (incident-2026-07-11 §5 D5): refuse a NEW agent tab
+    // under Critical commit pressure / static caps, before any tab is created.
+    // AdmissionError carries a machine-readable code + statusCode 503; it is NOT
+    // a PolicyError, so rethrowBrowserError passes it through to the generic
+    // API-error mapper (code surfaces in the JSON body). Human opens are exempt —
+    // the human is driving and a handoff must not be blocked by pressure.
+    if (!forHuman && this.tabAdmissionCheck) {
+      const decision = this.tabAdmissionCheck(opts.agentId);
+      if (!decision.allowed) throw new AdmissionError(decision);
+    }
     // Slice-2: trusted agent identity threaded from the API layer → stamped on
     // the created tab for the "Opened by <title>" tooltip + attention attribution.
     const agentIdentity = {
@@ -2601,6 +3248,13 @@ export class BrowserManager {
         signinOrigin = undefined;
       }
       if (signinOrigin) {
+        // Phase 0 (BrowserSigninSharing §D): trusted diagnostic on EVERY
+        // credentialed open — ruleId, rule/caller workspace, computed partitions,
+        // grant state, and why. No cookie material. Observes only.
+        this.emitCredentialedOpenDiagnostic(signinRule, workspaceId, signinOrigin, {
+          agentId: opts.agentId,
+          agentTitle: opts.agentTitle,
+        });
         const outcome = this.ensureSignedInOrPend(workspaceId, signinOrigin, signinRule.id, undefined, url);
         if (outcome !== 'ready') {
           const result = this.signinResultFor(outcome, signinOrigin, workspaceId);
@@ -2639,7 +3293,14 @@ export class BrowserManager {
     // same call. Read-verb guards (WI-4) are the backstop, not the first line.
     if (signinRule && signinOrigin) {
       const committed = this.mustGet(tabId).view.webContents.getURL();
-      if (this.classifyOriginState(workspaceId, signinOrigin, committed) === 'needs_signin') {
+      // Phase 1 (§D): before returning this credentialed tab as ready, run the
+      // runtime partition tripwire. classify says needs_signin OR the tripwire fires
+      // (grant workspace ↔ tab session partition diverged) → pend a sign-in rather
+      // than drive/snapshot a tab in the wrong partition (fail closed).
+      if (
+        this.classifyOriginState(workspaceId, signinOrigin, committed) === 'needs_signin' ||
+        !this.grantPartitionAgrees(this.mustGet(tabId))
+      ) {
         const outcome = this.ensureSignedInOrPend(workspaceId, signinOrigin, signinRule.id, tabId, url);
         if (outcome !== 'ready') {
           // The agent's own tab is on a logged-out wall — close it; the separate
@@ -2680,16 +3341,18 @@ export class BrowserManager {
   }
 
   private async toolGetPageText(tabId: string): Promise<string | SigninPendingResult> {
+    const hydrated = await this.ensureAgentTabHydrated(tabId); // D3.3
     const tab = this.mustGet(tabId);
     this.gate('getPageText', tab.partitionFull, tab.view.webContents.getURL(), { tabId }, tab);
     const signin = this.signinGuard(tab);
     if (signin) return signin;
     const text = await this.driver(tabId).getText();
     this.auditAuthedRead(tab, 'getPageText', { tabId });
-    return wrapUntrusted(text);
+    return (hydrated.restored ? RESTORED_TAB_HINT : '') + wrapUntrusted(text);
   }
 
   private async toolReadPage(tabId: string): Promise<string | SigninPendingResult> {
+    const hydrated = await this.ensureAgentTabHydrated(tabId); // D3.3
     const tab = this.mustGet(tabId);
     this.gate('readPage', tab.partitionFull, tab.view.webContents.getURL(), { tabId }, tab);
     const signin = this.signinGuard(tab);
@@ -2697,12 +3360,14 @@ export class BrowserManager {
     const snapshot = await this.snapshotTab(tabId);
     this.auditAuthedRead(tab, 'readPage', { tabId });
     return (
+      (hydrated.restored ? RESTORED_TAB_HINT : '') +
       'Accessibility snapshot. Interactable elements are marked [n] — pass n as `ref` to click.\n' +
       wrapUntrusted(snapshot)
     );
   }
 
   private async toolScreenshot(tabId: string): Promise<{ base64Png: string } | SigninPendingResult> {
+    await this.ensureAgentTabHydrated(tabId); // D3.3
     const tab = this.mustGet(tabId);
     this.gate('screenshot', tab.partitionFull, tab.view.webContents.getURL(), { tabId }, tab);
     const signin = this.signinGuard(tab);
@@ -2713,6 +3378,7 @@ export class BrowserManager {
   }
 
   private async toolClick(tabId: string, ref: number): Promise<string | SigninPendingResult> {
+    await this.ensureAgentTabHydrated(tabId); // D3.3
     const tab = this.mustGet(tabId);
     const url = tab.view.webContents.getURL();
     const args = { tabId, ref };
@@ -2747,6 +3413,7 @@ export class BrowserManager {
 
   /** type() REPLACES the field by default (focus → Ctrl+A → insertText). */
   private async toolType(tabId: string, ref: number, text: string): Promise<string | SigninPendingResult> {
+    await this.ensureAgentTabHydrated(tabId); // D3.3
     const tab = this.mustGet(tabId);
     const url = tab.view.webContents.getURL();
     const args = { tabId, ref };
@@ -2772,6 +3439,7 @@ export class BrowserManager {
 
   /** press_key acts on the focused element (no ref). */
   private async toolPressKey(tabId: string, key: string): Promise<string | SigninPendingResult> {
+    await this.ensureAgentTabHydrated(tabId); // D3.3
     const tab = this.mustGet(tabId);
     const url = tab.view.webContents.getURL();
     const args = { tabId, key };
@@ -2796,6 +3464,7 @@ export class BrowserManager {
 
   /** scroll: exactly one of { ref, dy } (the route enforces 400; this is DiD). */
   private async toolScroll(tabId: string, opts: { ref?: number; dy?: number }): Promise<string | SigninPendingResult> {
+    await this.ensureAgentTabHydrated(tabId); // D3.3
     const tab = this.mustGet(tabId);
     const url = tab.view.webContents.getURL();
     const args = { tabId, ...opts };
@@ -2832,6 +3501,7 @@ export class BrowserManager {
    *  ARIA option; a native <select> (no DOM option to click) gets a readable
    *  error pointing at press_key. NEVER Runtime.evaluate (M10). */
   private async toolSelectOption(tabId: string, ref: number, value: string): Promise<string | SigninPendingResult> {
+    await this.ensureAgentTabHydrated(tabId); // D3.3
     const tab = this.mustGet(tabId);
     const url = tab.view.webContents.getURL();
     const args = { tabId, ref, value };
@@ -2886,6 +3556,7 @@ export class BrowserManager {
   /** go_back: act-tier, but NAV_AWAY-exempt from the sensitive-origin denial
    *  (see browser-policy). Separate from the un-gated UI goBack above. */
   private async toolGoBack(tabId: string): Promise<string | SigninPendingResult> {
+    await this.ensureAgentTabHydrated(tabId); // D3.3
     const tab = this.mustGet(tabId);
     const url = tab.view.webContents.getURL();
     const args = { tabId };
@@ -2905,6 +3576,7 @@ export class BrowserManager {
 
   /** go_forward: act-tier, NAV_AWAY-exempt. */
   private async toolGoForward(tabId: string): Promise<string | SigninPendingResult> {
+    await this.ensureAgentTabHydrated(tabId); // D3.3
     const tab = this.mustGet(tabId);
     const url = tab.view.webContents.getURL();
     const args = { tabId };
@@ -2924,6 +3596,7 @@ export class BrowserManager {
 
   /** reload: act-tier; stays denied on sensitive origins (no nav-away exempt). */
   private async toolReload(tabId: string): Promise<string | SigninPendingResult> {
+    await this.ensureAgentTabHydrated(tabId); // D3.3
     const tab = this.mustGet(tabId);
     const url = tab.view.webContents.getURL();
     const args = { tabId };
@@ -2947,6 +3620,7 @@ export class BrowserManager {
     tabId: string,
     input: { text: string; timeoutMs?: number },
   ): Promise<WaitForResult | SigninPendingResult> {
+    await this.ensureAgentTabHydrated(tabId); // D3.3
     const tab = this.mustGet(tabId);
     this.gate('waitFor', tab.partitionFull, tab.view.webContents.getURL(), { tabId, ...input }, tab);
     const signin = this.signinGuard(tab);
@@ -2975,6 +3649,16 @@ export class BrowserManager {
    *  partition). Returns the UPDATED agent tab list — the closed tab is gone,
    *  so a fresh page snapshot is impossible. */
   private async toolCloseTab(tabId: string): Promise<CloseTabResult> {
+    // D3.3: closing a SUSPENDED agent tab needs no restore — drop the snapshot
+    // and release its lease directly (restoring just to tear down would waste a
+    // renderer spawn, exactly the pressure we are relieving).
+    if (this.discardedAgentTabs.has(tabId)) {
+      this.discardedAgentTabs.delete(tabId);
+      this.agentLeaseLedger.release(tabId);
+      this.forgetTabOrder(tabId);
+      this.emitTabsSnapshot();
+      return { closed: true, tabs: this.toolListTabs() };
+    }
     const tab = this.mustGet(tabId);
     const url = tab.view.webContents.getURL();
     const args = { tabId };
@@ -3082,11 +3766,9 @@ export class BrowserManager {
     // (about:blank covers flows that open a blank popup then navigate it via
     // JS); any other scheme falls through to the deny+surface path above.
     wc.setWindowOpenHandler(({ url }) => {
-      const allowPopup =
-        tab.partition === 'user' &&
-        (url.startsWith('http://') || url.startsWith('https://') || url === 'about:blank');
+      const allowPopup = this.decidePopupOpen(tab, url);
       if (allowPopup) {
-        const win = this.getMainWindow();
+        const win = this.host();
         return {
           action: 'allow',
           overrideBrowserWindowOptions: {
@@ -3098,7 +3780,7 @@ export class BrowserManager {
           },
         };
       }
-      this.getMainWindow()?.webContents.send(BROWSER_CHANNELS.openRequest, {
+      this.host()?.webContents.send(BROWSER_CHANNELS.openRequest, {
         tabId: tab.id,
         url,
       });
@@ -3118,6 +3800,28 @@ export class BrowserManager {
         if (!pwc.isDestroyed()) pwc.setUserAgent(uaForUrl(navUrl, process.versions.chrome));
       });
       pwc.once('destroyed', () => this.popupContents.delete(pwc));
+      // Phase 2 (§D line 249): a popup spawned from a quarantined agent sign-in
+      // tab is ALSO tracked in signinPopupWindows (keyed by the parent sign-in tab
+      // id) so it closes with the setup session — see closeSigninPopupsFor, wired
+      // into accessHandoffReady / degradeSignin / accessSigninPendingCancel /
+      // closeTab. It is NEVER registered as a TabEntry, so it stays structurally
+      // invisible to toolListTabs and non-drivable (no CDP/snapshot/enumeration).
+      // Re-check tab.signinPending at open time — the popup is only allowed from a
+      // user tab or a signinPending agent tab (setWindowOpenHandler above).
+      if (tab.partition === 'agent' && tab.signinPending === true) {
+        let group = this.signinPopupWindows.get(tab.id);
+        if (!group) {
+          group = new Set<BrowserWindow>();
+          this.signinPopupWindows.set(tab.id, group);
+        }
+        group.add(popupWin);
+        popupWin.once('closed', () => {
+          const g = this.signinPopupWindows.get(tab.id);
+          if (!g) return;
+          g.delete(popupWin);
+          if (g.size === 0) this.signinPopupWindows.delete(tab.id);
+        });
+      }
     });
 
     // G1 fail ladder round 2 (Ferdium tactic, their PR #2360): flip this
@@ -3136,6 +3840,14 @@ export class BrowserManager {
     // will-redirect may miss. Defense in depth atop the per-verb gate.
     wc.on('did-navigate', (_e, url) => {
       this.autoRevokeIfOffOrigin(tab, url);
+    });
+
+    // Phase 4 item 1 (§D line 272): a main-frame 401/403 is a content-free expiry
+    // signal. did-navigate carries the committed HTTP status for the top-level
+    // load; on an allow_signed_in origin with a live grant it atomically expires
+    // that (workspace, origin) so the next agent verb pends a fresh sign-in.
+    wc.on('did-navigate', (_e, url, httpResponseCode) => {
+      this.maybeExpireOnHttpStatus(tab, url, httpResponseCode);
     });
 
     // ── Slice-1 (premium browser) — clear any prior load error BEFORE the push
@@ -3318,7 +4030,7 @@ export class BrowserManager {
             break;
         }
       }
-      const win = this.getMainWindow();
+      const win = this.host();
       Menu.buildFromTemplate(template).popup(win ? { window: win } : undefined);
     });
 
@@ -3428,7 +4140,7 @@ export class BrowserManager {
   }
 
   private sendTabState(tab: TabEntry): void {
-    const win = this.getMainWindow();
+    const win = this.host();
     if (!win) return;
     const wc = tab.view.webContents;
     if (wc.isDestroyed()) return;
@@ -3469,7 +4181,11 @@ export class BrowserManager {
       ...(tab.handedToAgent ? { handedToAgent: true } : {}),
       ...(tab.signinPending ? { signinPending: true } : {}),
     };
-    win.webContents.send(BROWSER_CHANNELS.tabState, state);
+    // D2 (incident-2026-07-11 §5): route through the guarded send() so a dead
+    // shell frame doesn't throw "Render frame was disposed before WebFrameMain
+    // could be accessed" on every tab event. Previously this used
+    // win.webContents.send directly, bypassing the liveness guard.
+    this.send(BROWSER_CHANNELS.tabState, state);
   }
 
   // ── OVERHAUL impl (WP3–WP7) ──────────────────────────────────────────────
@@ -3478,11 +4194,90 @@ export class BrowserManager {
   // buildBrowserWebPreferences / debugger) except as explicit defense-in-depth.
   // Bookmarks/history are USER-PARTITION ONLY by contract.
 
-  /** Send an event to the renderer, guarding against a torn-down window. */
+  /** Send an event to the renderer, guarding against a torn-down OR crashed
+   *  shell frame. D2 (incident-2026-07-11 §5): a crashed renderer's webContents
+   *  is NOT `isDestroyed()`, but `webContents.send` to its disposed frame throws
+   *  "Render frame was disposed before WebFrameMain could be accessed" — the spam
+   *  observed during the outage. We detect the dead frame (crashed, or an mainFrame
+   *  access that throws), log EXACTLY ONCE, then suppress until the shell renderer
+   *  recovers (D1 reload calls onShellRecovered, which resets the latch and resends
+   *  a full snapshot). */
   private send(channel: string, payload: unknown): void {
-    const win = this.getMainWindow();
+    const win = this.host();
     if (!win || win.webContents.isDestroyed()) return;
-    win.webContents.send(channel, payload);
+    if (!this.isShellFrameLive(win.webContents)) {
+      if (!this.shellFrameDead) {
+        this.shellFrameDead = true;
+        console.warn(
+          '[browser] shell renderer frame is not live — suppressing tab-state pushes until it recovers (D2)',
+        );
+      }
+      return;
+    }
+    // A push that previously found the frame dead but now succeeds means the
+    // shell came back without going through onShellRecovered (e.g. a plain
+    // in-renderer remount). Clear the latch so future deaths log again.
+    if (this.shellFrameDead) this.shellFrameDead = false;
+    try {
+      win.webContents.send(channel, payload);
+    } catch {
+      // Racy frame disposal between the liveness check and the send: latch and
+      // suppress rather than let it propagate as unhandled spam.
+      if (!this.shellFrameDead) {
+        this.shellFrameDead = true;
+        console.warn('[browser] tab-state push failed on a disposed shell frame — suppressing (D2)');
+      }
+    }
+  }
+
+  /** D2: is the destination (shell) frame alive enough to receive an IPC send?
+   *  A crashed renderer keeps a non-destroyed webContents whose main frame is
+   *  disposed; both `isCrashed()` and a throwing `mainFrame` access catch it. */
+  private isShellFrameLive(wc: WebContents): boolean {
+    try {
+      if (wc.isCrashed()) return false;
+      // Accessing mainFrame throws if the render frame was disposed.
+      const frame = wc.mainFrame;
+      return !!frame;
+    } catch {
+      return false;
+    }
+  }
+
+  /** D1↔D2 recovery hook: called by the main process once the shell renderer
+   *  reload commits (`did-finish-load` after a render-process-gone reload). Clears
+   *  the dead-frame suppression latch and re-pushes a FULL snapshot (tab order +
+   *  every tab's state) so the reloaded UI reflects current browser state rather
+   *  than waiting for the next incidental tab event. */
+  onShellRecovered(): void {
+    this.shellFrameDead = false;
+    this.emitTabsSnapshot();
+    for (const tab of this.tabs.values()) this.sendTabState(tab);
+  }
+
+  /** D5-lite: live agent tab/view count (openedByAgent tabs) for the watchdog
+   *  snapshot. Local state — no syscall. */
+  getAgentViewCount(): number {
+    let n = 0;
+    for (const tab of this.tabs.values()) if (tab.openedByAgent) n++;
+    return n;
+  }
+
+  /** D5-lite (incident-2026-07-11 §5 D5) — install the memory-watchdog admission
+   *  gate for NEW agent tab opens. Called once from index.ts after the sampler is
+   *  constructed. A no-op until wired (unit tests never install it). WAVE-4: the
+   *  callback now receives the opening agent's id so the wiring can layer the
+   *  per-agent memory budget on top of the global rules. */
+  setTabAdmissionCheck(fn: (agentId?: string) => AdmissionDecision): void {
+    this.tabAdmissionCheck = fn;
+  }
+
+  /** WAVE-4 SEAM (D1 "reap & reload"): run the D3 agent-view discard pass now
+   *  (enforce the agent live-view caps immediately, off the periodic sweep) so a
+   *  recovery reload starts from reclaimed renderer memory. Respects every D3
+   *  lease/exemption — never force-closes a leased/signin/attention tab. */
+  discardAgentViewsNow(): void {
+    this.enforceAgentViewCap();
   }
 
   // WP5 — find-in-page (native WebContents.findInPage; counts via foundInPage).
@@ -3977,7 +4772,7 @@ export class BrowserManager {
     this.lastActiveAt.set(tabId, now);
     this.wireViewEvents(tab);
 
-    const win = this.getMainWindow();
+    const win = this.host();
     if (win) {
       win.contentView.addChildView(view);
       view.setBounds(this.lastBounds);
@@ -4054,7 +4849,7 @@ export class BrowserManager {
     this.tabFavicons.delete(tab.id);
     this.lastActiveAt.delete(tab.id);
     this.lastScrollY.delete(tab.id);
-    this.getMainWindow()?.contentView.removeChildView(tab.view);
+    this.host()?.contentView.removeChildView(tab.view);
     wc.close(); // → destroyed handler (guarded by discardingTabs)
 
     this.sendFrozenTabState(frozen);
@@ -4127,6 +4922,252 @@ export class BrowserManager {
         this.discardTab(liveEligible[i].id);
       }
     }
+
+    // 3) D3.2: enforce the AGENT live-view caps in the same periodic pass (also
+    //    enforced on every agent createTab). Leases that expired since the last
+    //    sweep make previously-pinned tabs eligible here.
+    this.enforceAgentViewCap();
+  }
+
+  // ── D3 agent-tab lifecycle seams (incident-2026-07-11 §5 D3) ────────────────
+
+  /** Snapshot of the LIVE agent tabs for the lifecycle logic. The exemption
+   *  booleans are computed HERE (the pure module just consumes them): loading +
+   *  pending-download are read live; signinPending is the hard flag; and
+   *  "needsHumanAttention" is RECENCY-based, NOT the raw birth flag (see
+   *  AGENT_TAB_ATTENTION_RECENCY_MS — the raw flag is set on every agent tab and
+   *  never cleared in main, so it would permanently exempt everything). */
+  private agentTabInfos(): AgentTabLifecycleInfo[] {
+    const now = Date.now();
+    const infos: AgentTabLifecycleInfo[] = [];
+    for (const tab of this.tabs.values()) {
+      if (tab.partition !== 'agent') continue;
+      const wc = tab.view.webContents;
+      const recentAttention =
+        tab.needsHumanAttention === true &&
+        now - (tab.lastAttentionAt ?? 0) < AGENT_TAB_ATTENTION_RECENCY_MS;
+      infos.push({
+        tabId: tab.id,
+        agentId: tab.openedByAgentId,
+        lruAt: this.lastActiveAt.get(tab.id) ?? tab.createdAt ?? now,
+        loading: !wc.isDestroyed() && wc.isLoading(),
+        signinPending: tab.signinPending === true,
+        needsHumanAttention: recentAttention,
+        hasPendingDownload: this.hasPendingDownloadForTab(tab),
+      });
+    }
+    return infos;
+  }
+
+  /** True while a download awaiting confirmation is anchored to this tab's
+   *  Electron session (best-effort: the confirm map is keyed by token, so we
+   *  match on sessionPartition — the finest tab-linked key it carries). */
+  private hasPendingDownloadForTab(tab: TabEntry): boolean {
+    if (this.pendingDownloadConfirms.size === 0) return false;
+    for (const pending of this.pendingDownloadConfirms.values()) {
+      if (pending.sessionPartition === tab.sessionPartition) return true;
+    }
+    return false;
+  }
+
+  /** D3.2: discard the least-recently-active ELIGIBLE agent tabs until no agent
+   *  exceeds MAX_LIVE_AGENT_VIEWS_PER_AGENT and the fleet stays within
+   *  MAX_LIVE_AGENT_VIEWS. Ineligible tabs count toward the caps but are never
+   *  suspended (never break a lease / a signin / a fresh attention). Called on
+   *  every agent createTab and each periodic sweep. */
+  private enforceAgentViewCap(): void {
+    const now = Date.now();
+    const infos = this.agentTabInfos();
+    if (infos.length === 0) return;
+    const picks = pickAgentTabsToDiscard(
+      infos,
+      (t) =>
+        t.tabId !== this.activeTabId &&
+        isAgentDiscardEligible(t, now, (id, n) => this.agentLeaseLedger.hasActiveLease(id, n)),
+      { maxGlobal: MAX_LIVE_AGENT_VIEWS, maxPerAgent: MAX_LIVE_AGENT_VIEWS_PER_AGENT },
+    );
+    for (const id of picks) this.discardAgentTab(id);
+  }
+
+  /** D3.2: suspend one live agent tab — tear down its WebContentsView but keep a
+   *  runtime snapshot so the tabId stays addressable and rebuildable. Mirrors the
+   *  user discardTab teardown; never the active tab, never a non-agent tab, never
+   *  a tab with nothing meaningful to restore. */
+  private discardAgentTab(tabId: string): void {
+    if (tabId === this.activeTabId) return;
+    const tab = this.tabs.get(tabId);
+    if (!tab || tab.partition !== 'agent') return;
+    const wc = tab.view.webContents;
+    if (wc.isDestroyed()) return;
+    const url = wc.getURL();
+    if (!url || url === 'about:blank') return; // nothing to restore to
+    const snapshot: DiscardedAgentTab = {
+      id: tab.id,
+      url,
+      workspaceId: tab.workspaceId,
+      sessionPartition: tab.sessionPartition ?? partitionFor('agent', tab.workspaceId),
+      partitionFull: tab.partitionFull,
+      openedByAgentId: tab.openedByAgentId,
+      openedByAgentTitle: tab.openedByAgentTitle,
+      discardedAt: Date.now(),
+    };
+    // Mark BEFORE close so the `destroyed` handler skips its teardown; then do the
+    // teardown ourselves (including forgetTabOrder — an agent tab has no strip
+    // snapshot to keep, unlike a user FrozenTab).
+    this.discardingTabs.add(tab.id);
+    this.discardedAgentTabs.set(tab.id, snapshot);
+    this.tabs.delete(tab.id);
+    this.drivers.delete(tab.id);
+    this.refRegistries.delete(tab.id);
+    this.tabFavicons.delete(tab.id);
+    this.lastActiveAt.delete(tab.id);
+    this.agentLeaseLedger.release(tab.id);
+    this.forgetTabOrder(tab.id);
+    this.host()?.contentView.removeChildView(tab.view);
+    wc.close(); // → destroyed handler (guarded by discardingTabs)
+    this.emitTabsSnapshot();
+  }
+
+  /** D3.3: the hydration coordinator's `restore` dependency — rebuild a suspended
+   *  agent tab's view, navigate to the stored URL, and wait (bounded) for the
+   *  load to commit before returning. Preserves URL + persist:agent storage, NOT
+   *  in-page state (restored:true tells the agent to re-read). Returns a
+   *  STRUCTURED result on failure (never throws to the caller path); on failure
+   *  the snapshot is re-stored so a later verb can retry. */
+  private async restoreAgentTab(tabId: string): Promise<HydrationResult> {
+    const snap = this.discardedAgentTabs.get(tabId);
+    if (!snap) return { tabId, restored: false }; // already live / never suspended
+    this.discardedAgentTabs.delete(tabId);
+    let tab: TabEntry | null = null;
+    try {
+      this.ensureSessionHardened(snap.sessionPartition);
+      const view = new WebContentsView({
+        webPreferences: {
+          ...buildBrowserWebPreferences('agent'),
+          session: session.fromPartition(snap.sessionPartition),
+        },
+      });
+      const now = Date.now();
+      tab = {
+        id: tabId,
+        view,
+        partition: 'agent',
+        partitionFull: snap.partitionFull,
+        sessionPartition: snap.sessionPartition,
+        workspaceId: snap.workspaceId,
+        openedByAgent: true,
+        openedByAgentId: snap.openedByAgentId,
+        openedByAgentTitle: snap.openedByAgentTitle,
+        createdAt: now,
+      };
+      this.tabs.set(tabId, tab);
+      this.lastActiveAt.set(tabId, now);
+      if (!this.tabOrder.includes(tabId)) this.tabOrder.push(tabId);
+      this.wireViewEvents(tab);
+      const win = this.host();
+      if (win) {
+        win.contentView.addChildView(view);
+        view.setBounds(this.lastBounds);
+        view.setVisible(false); // a verb-driven restore does not steal focus
+      }
+      await this.loadUrlWithCommit(view.webContents, snap.url, AGENT_TAB_RESTORE_TIMEOUT_MS);
+      // Fresh lease so the immediately-following verb — and any concurrent sweep —
+      // never re-suspends the tab we just restored.
+      this.agentLeaseLedger.touch(tabId, Date.now());
+      this.sendTabState(tab);
+      this.emitTabsSnapshot();
+      return { tabId, restored: true };
+    } catch (err) {
+      // Tear down any half-built view and re-store the snapshot for a retry.
+      if (tab) {
+        this.tabs.delete(tabId);
+        this.forgetTabOrder(tabId);
+        this.host()?.contentView.removeChildView(tab.view);
+        try {
+          if (!tab.view.webContents.isDestroyed()) tab.view.webContents.close();
+        } catch {
+          /* already gone */
+        }
+      }
+      this.discardedAgentTabs.set(tabId, snap);
+      return {
+        tabId,
+        restored: false,
+        error: { code: 'restore-failed', message: err instanceof Error ? err.message : String(err) },
+      };
+    }
+  }
+
+  /** Bounded load-commit wait for a restored view: resolves on did-finish-load,
+   *  rejects on a main-frame did-fail-load (ignoring ERR_ABORTED -3, which fires
+   *  on ordinary redirects) or after `timeoutMs`. */
+  private loadUrlWithCommit(wc: WebContents, url: string, timeoutMs: number): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const cleanup = (): void => {
+        clearTimeout(timer);
+        wc.off('did-finish-load', onLoad);
+        wc.off('did-fail-load', onFail);
+      };
+      const onLoad = (): void => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve();
+      };
+      const onFail = (
+        _e: ElectronEvent,
+        errorCode: number,
+        errorDescription: string,
+        _validatedURL: string,
+        isMainFrame: boolean,
+      ): void => {
+        if (settled || !isMainFrame || errorCode === -3) return; // -3 = ERR_ABORTED (redirect)
+        settled = true;
+        cleanup();
+        reject(new Error(`load failed (${errorCode}) ${errorDescription}`));
+      };
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(new Error(`restore did not commit within ${timeoutMs}ms`));
+      }, timeoutMs);
+      wc.on('did-finish-load', onLoad);
+      wc.on('did-fail-load', onFail);
+      void wc.loadURL(url).catch((e) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(e instanceof Error ? e : new Error(String(e)));
+      });
+    });
+  }
+
+  /** D3.3 verb-path seam: BEFORE `mustGet`/`gate`, ensure a suspended agent tab
+   *  is restored. A no-op for a live tab. Concurrent verbs share one restore.
+   *  On restore failure, throws a descriptive Error — the tool layer surfaces its
+   *  message to the agent (the established structured-failure channel), never a
+   *  hang or silent no-op. Returns the HydrationResult so read verbs can hint
+   *  `restored`. */
+  private async ensureAgentTabHydrated(tabId: string): Promise<HydrationResult> {
+    if (!this.discardedAgentTabs.has(tabId)) return { tabId, restored: false };
+    const result = await this.agentHydration.ensureHydrated(tabId);
+    if (result.error) {
+      throw new Error(
+        `browser tab ${tabId} was suspended to reclaim memory and could not be restored ` +
+          `(${result.error.code}: ${result.error.message}). Retry the action, or open a new tab.`,
+      );
+    }
+    return result;
+  }
+
+  /** D3.1 supervisor seam: called on every agent status transition. A terminal
+   *  status (done/crashed) arms a grace-close of the agent's tabs; any other
+   *  status cancels a pending close (the agent is live again). */
+  onAgentLifecycleStatus(agentId: string, terminal: boolean): void {
+    if (terminal) this.agentGraceClose.onAgentTerminal(agentId);
+    else this.agentGraceClose.onAgentRevived(agentId);
   }
 
   getTabsSnapshot(): BrowserTabSnapshotEntry[] {

@@ -3,6 +3,7 @@ import * as path from 'path';
 import type { PathType, FileContent, DirectoryEntry } from '../shared/types';
 import { ensureWslPath } from './path-utils';
 import { wslExecCommand } from './wsl-bridge';
+import { readDocxAsHtml } from './docx-converter';
 
 const MAX_FILE_SIZE = 1024 * 1024; // 1MB
 const MAX_NOTEBOOK_SIZE = 5 * 1024 * 1024; // 5MB for notebook JSON files
@@ -26,14 +27,16 @@ function parseWslDirectoryEntries(raw: string, wslPath: string): DirectoryEntry[
   for (const line of raw.trim().split('\n')) {
     if (!line) continue;
     const parts = line.split('\t');
-    if (parts.length < 5) continue;
-    const [type, sizeStr, mtimeStr, ctimeStr] = parts;
-    const name = parts.slice(4).join('\t');
+    if (parts.length < 7) continue;
+    const [type, sizeStr, mtimeStr, ctimeStr, devStr, inoStr] = parts;
+    const name = parts.slice(6).join('\t');
     if (!name) continue;
     const isDirectory = type === 'd';
     const entryPath = wslPath.endsWith('/') ? `${wslPath}${name}` : `${wslPath}/${name}`;
     const mtimeMs = Math.round(parseFloat(mtimeStr) * 1000);
     const ctimeMs = Math.round(parseFloat(ctimeStr) * 1000);
+    const dev = parseInt(devStr, 10);
+    const ino = parseInt(inoStr, 10);
     entries.push({
       name,
       path: entryPath,
@@ -43,6 +46,9 @@ function parseWslDirectoryEntries(raw: string, wslPath: string): DirectoryEntry[
       // find(1) cannot print birth time; status-change time equals creation
       // time for freshly created files, which is what the UI sorts by.
       birthtimeMs: Number.isFinite(ctimeMs) ? ctimeMs : undefined,
+      // %D device + %i inode — stable file identity for rename correlation (B2 D1).
+      dev: Number.isFinite(dev) ? dev : undefined,
+      ino: Number.isFinite(ino) ? ino : undefined,
     });
   }
   return entries;
@@ -55,6 +61,8 @@ function listWindowsDirectoryEntries(dirPath: string): DirectoryEntry[] {
     let size = 0;
     let mtimeMs: number | undefined;
     let birthtimeMs: number | undefined;
+    let dev: number | undefined;
+    let ino: number | undefined;
     try {
       const stat = fs.statSync(fullPath);
       if (!item.isDirectory()) {
@@ -62,6 +70,10 @@ function listWindowsDirectoryEntries(dirPath: string): DirectoryEntry[] {
       }
       mtimeMs = stat.mtimeMs;
       birthtimeMs = stat.birthtimeMs;
+      // NTFS file index is stable across a same-volume rename (B2 D1 rename
+      // correlation). Number() keeps the (typically small) values comparable.
+      dev = Number(stat.dev);
+      ino = Number(stat.ino);
     } catch { /* skip */ }
     return {
       name: item.name,
@@ -70,6 +82,8 @@ function listWindowsDirectoryEntries(dirPath: string): DirectoryEntry[] {
       size,
       mtimeMs,
       birthtimeMs,
+      dev,
+      ino,
     };
   });
   // Dirs first, then alpha
@@ -84,6 +98,10 @@ export async function readFileContents(filePath: string, pathType: PathType): Pr
   try {
     const lowerPath = filePath.toLowerCase();
     const isNotebook = lowerPath.endsWith('.ipynb') || lowerPath.endsWith('.pynb');
+    if (lowerPath.endsWith('.docx')) {
+      return await readDocxAsHtml(filePath, pathType);
+    }
+
     const sizeLimit = isNotebook ? MAX_NOTEBOOK_SIZE : MAX_FILE_SIZE;
 
     if (pathType === 'wsl') {
@@ -132,7 +150,7 @@ export async function listDirectoryEntriesAsync(dirPath: string, pathType: PathT
 
   const wslPath = sanitizePath(ensureWslPath(dirPath, pathType));
   const result = await wslExecCommand(
-    `find ${shellQuote(wslPath)} -maxdepth 1 -mindepth 1 -printf '%y\\t%s\\t%T@\\t%C@\\t%f\\n' 2>/dev/null | sort -t$'\\t' -k1,1r -k5,5f`,
+    `find ${shellQuote(wslPath)} -maxdepth 1 -mindepth 1 -printf '%y\\t%s\\t%T@\\t%C@\\t%D\\t%i\\t%f\\n' 2>/dev/null | sort -t$'\\t' -k1,1r -k7,7f`,
     { timeout: WSL_TIMEOUT, throwOnError: true, trimOutput: false }
   );
   return parseWslDirectoryEntries(result.stdout, wslPath);

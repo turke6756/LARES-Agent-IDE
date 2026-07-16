@@ -1,6 +1,7 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import type { SelectionAgentTarget, SelectionContext } from '../../lib/selection/selection-types';
+import { positionFloating } from '../../lib/floating/positionFloating';
 import AgentPickerDropdown from './AgentPickerDropdown';
 
 // Portal-rendered context menu for an active text selection.
@@ -21,11 +22,11 @@ interface Props {
   onHighlight?: () => void;
 }
 
-// Keep the menu fully on-screen: clamp its top-left into the viewport and let
-// it scroll internally if it (with the picker expanded) is taller than the
-// space below. Rough width/height budgets — the exact box is measured by the
-// browser; these just stop it spawning off the right/bottom edge.
+// Keep the menu fully on-screen: measure the real box and let the shared
+// helper flip it above the cursor when there's no room below, then clamp both
+// axes into the viewport (BUG-45). Width/est-height are the pre-measure budget.
 const MENU_WIDTH = 300;
+const MENU_EST_HEIGHT = 220;
 const MENU_MARGIN = 8;
 
 export default function SelectionActionMenu({
@@ -34,8 +35,31 @@ export default function SelectionActionMenu({
   const menuRef = useRef<HTMLDivElement>(null);
   const [pickerOpen, setPickerOpen] = useState(false);
 
-  const left = Math.max(MENU_MARGIN, Math.min(x, window.innerWidth - MENU_WIDTH - MENU_MARGIN));
-  const top = Math.max(MENU_MARGIN, Math.min(y, window.innerHeight - MENU_MARGIN * 2));
+  const viewport = { width: window.innerWidth, height: window.innerHeight };
+  // Cursor point is a zero-size anchor; 'below' drops the menu under it and
+  // flips above near the bottom edge.
+  const [pos, setPos] = useState(() =>
+    positionFloating({ x, y, width: 0, height: 0 }, { width: MENU_WIDTH, height: MENU_EST_HEIGHT }, viewport, {
+      placement: 'below',
+      gap: 0,
+    }),
+  );
+
+  // Reposition off the measured box (height changes when "Send to agent"
+  // expands the picker), so a menu opened low still flips fully on-screen.
+  useLayoutEffect(() => {
+    const el = menuRef.current;
+    if (!el) return;
+    const box = el.getBoundingClientRect();
+    setPos(
+      positionFloating(
+        { x, y, width: 0, height: 0 },
+        { width: box.width || MENU_WIDTH, height: box.height || MENU_EST_HEIGHT },
+        { width: window.innerWidth, height: window.innerHeight },
+        { placement: 'below', gap: 0 },
+      ),
+    );
+  }, [x, y, pickerOpen]);
 
   useEffect(() => {
     const handler = (e: MouseEvent) => {
@@ -61,7 +85,7 @@ export default function SelectionActionMenu({
     <div
       ref={menuRef}
       className="ui-menu fixed z-50 overflow-y-auto"
-      style={{ left, top, maxHeight: `calc(100vh - ${MENU_MARGIN * 2}px)` }}
+      style={{ left: pos.left, top: pos.top, width: MENU_WIDTH, maxHeight: `calc(100vh - ${MENU_MARGIN * 2}px)` }}
       // Keep the user's text selection alive: a default mousedown inside the
       // menu would collapse the document selection before the action runs.
       onMouseDown={(e) => e.preventDefault()}

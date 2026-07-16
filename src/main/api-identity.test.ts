@@ -52,7 +52,12 @@ const ALL_AGENTS = [...WS_AGENTS, { id: 'b-1', workspaceId: 'ws-2', status: 'idl
 const SUP_ROW = { id: 'sup-1', workspaceId: 'ws-1', isSupervisor: true, title: 'Supervisor', provider: 'claude', status: 'idle' };
 const SUP2_ROW = { id: 'sup-2', workspaceId: 'ws-1', isSupervisor: true, title: 'Supervisor Two', provider: 'claude', status: 'working' };
 const FOREIGN_SUP_ROW = { id: 'sup-ws2', workspaceId: 'ws-2', isSupervisor: true, title: 'Foreign Supervisor', provider: 'claude', status: 'idle' };
-const AGENT_ROWS = [SUP_ROW, SUP2_ROW, FOREIGN_SUP_ROW, ...ALL_AGENTS];
+// #19 supervisor-tools-for-personas — a custom persona launched on the
+// 'supervisor' PRIVILEGE lane: isSupervisor stays FALSE (renders as its own card)
+// but privilegeLane:'supervisor' grants it the supervisor MCP toolset, so the
+// X-Supervisor-Id rail must admit it exactly like a structural supervisor.
+const PERSONA_ROW = { id: 'persona-1', workspaceId: 'ws-1', isSupervisor: false, privilegeLane: 'supervisor', title: 'Mr Job Hunt Agent', provider: 'claude', status: 'idle' };
+const AGENT_ROWS = [SUP_ROW, SUP2_ROW, FOREIGN_SUP_ROW, PERSONA_ROW, ...ALL_AGENTS];
 
 // Inc 3 — owned-agent rows (owner edge = owner_agent_id, stamped at launch).
 // sup-1 owns two live + two terminal workers; sup-2 owns its own pair so the
@@ -84,6 +89,33 @@ db.getWorkspace = (id: string) => (id === WS.id ? WS : null);
 db.getSupervisorAgent = (wsId: string) => (wsId === WS.id ? SUP : null);
 db.listTeams = (wsId: string) => [{ id: 'team-1', workspaceId: wsId, name: 'T', status: 'active', members: [] }];
 db.listAgentTemplates = (wsId?: string) => (wsId ? [{ id: 'tpl-ws', workspaceId: wsId }] : [{ id: 'tpl-all' }]);
+
+// Planning-surface P1 — supervisor-focus fixtures. `focusedPlansStub` backs the
+// context `plans` block; `lastFocusUpsert` captures auto-subscribe calls. getPlan +
+// the plan-rail guard reads are stubbed so a plan-bound launch reaches the auto-focus
+// hook without touching the (uninitialized) real DB.
+let focusedPlansStub: Array<Record<string, unknown>> = [];
+let lastFocusUpsert: Record<string, unknown> | null = null;
+let lastFocusBump: { supervisorId: string; planId: string } | null = null;
+db.getSupervisorFocusedPlans = (_supervisorId: string, _limit?: number) => focusedPlansStub;
+db.upsertSupervisorFocus = (input: Record<string, unknown>) => { lastFocusUpsert = input; return { ...input }; };
+db.bumpSupervisorFocusAttended = (supervisorId: string, planId: string) => { lastFocusBump = { supervisorId, planId }; return { supervisorId, planId }; };
+db.getPlan = (id: string) => (id === 'plan-1' ? { id: 'plan-1', workspaceId: 'ws-1', deletedAt: null } : null);
+// Serve an (empty) projection so resolvePlanProjection short-circuits before any
+// file / workspace read — the read routes reach bumpFocusOnRead against the stub DB.
+db.getServedPlanProjection = () => ({ sections: [], parseError: null, warnings: [], source: '' });
+db.recordPlanSectionTouch = () => undefined; // best-effort breadcrumb — keep it a no-op under the stub DB
+db.listOrchestrationRuns = () => [];
+db.getLiveRailAgentForPlan = () => null;
+function focusUpserted(): Record<string, unknown> | null { return lastFocusUpsert; }
+function focusBumped(): { supervisorId: string; planId: string } | null { return lastFocusBump; }
+
+// createPlanSurface is a direct import in api-server; patch the module export it
+// resolves at call time so POST /api/plans (create branch) mints a plan without
+// writing files / touching the DB.
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const createPlanMod = require('./plans/create-plan') as Record<string, unknown>;
+createPlanMod.createPlanSurface = () => ({ planId: 'plan-1' });
 
 let lastCreateTeamInput: Record<string, unknown> | null = null;
 db.createTeam = (input: Record<string, unknown>) => {
@@ -327,6 +359,24 @@ test("Inc 2 (c): non-is_supervisor agent id in header → 403 'not-a-supervisor'
     assert.equal(JSON.parse(res.body).code, 'not-a-supervisor');
   }));
 
+test("#19: privilegeLane:'supervisor' persona id in header → authenticates as its OWN id (rail admits it like a supervisor)", () =>
+  withServer(async (port) => {
+    const res = await request(port, 'GET', '/api/supervisor/context',
+      { ...WS_HDR, 'X-Supervisor-Id': 'persona-1' });
+    assert.equal(res.status, 200);
+    const ctx = JSON.parse(res.body);
+    assert.equal(ctx.supervisorId, 'persona-1');
+    assert.equal(ctx.supervisor.id, 'persona-1');
+  }));
+
+test("#19: a plain worker (no isSupervisor, no privilegeLane) in header still 403s 'not-a-supervisor'", () =>
+  withServer(async (port) => {
+    const res = await request(port, 'GET', '/api/supervisor/context',
+      { ...WS_HDR, 'X-Supervisor-Id': 'a-1' });
+    assert.equal(res.status, 403);
+    assert.equal(JSON.parse(res.body).code, 'not-a-supervisor');
+  }));
+
 test("Inc 2 (d): nonexistent id in header → 403 'unknown-supervisor'", () =>
   withServer(async (port) => {
     const res = await request(port, 'GET', '/api/supervisor/context',
@@ -509,6 +559,110 @@ test('OPTIONS preflight advertises X-Workspace-Id / X-Supervisor-Id / X-Project-
     assert.match(allowed, /X-Project-Id/);
   }));
 
+// ── Planning-surface P1 — focus orientation + auto-subscribe ────────────────
+//
+// The context `plans` block appears ONLY for an asserted supervisor; auto-subscribe
+// fires on the natural verbs (create_plan / plan-bound launch_agent /
+// run_orchestration) and is a silent no-op for non-supervisor callers.
+
+test('P1 context: asserted supervisor gets the `plans` block (subscriptions), header-less callers do not', () =>
+  withServer(async (port) => {
+    focusedPlansStub = [
+      { planId: 'plan-1', path: 'plans/a.html', slug: 'a', format: 'html', focusedAt: 't0', lastAttendedAt: 't1', notes: null },
+    ];
+    const asserted = await request(port, 'GET', '/api/supervisor/context', { ...WS_HDR, 'X-Supervisor-Id': 'sup-1' });
+    assert.equal(asserted.status, 200);
+    const ctx = JSON.parse(asserted.body);
+    assert.deepEqual(ctx.plans, focusedPlansStub, 'asserted supervisor sees its focused plans');
+
+    // Header-less (no X-Supervisor-Id) → no `plans` key at all (parity with supervisorId: null).
+    const headerless = await request(port, 'GET', '/api/supervisor/context', WS_HDR);
+    assert.equal(headerless.status, 200);
+    const ctx2 = JSON.parse(headerless.body);
+    assert.equal('plans' in ctx2, false, 'header-less caller gets no plans key');
+    assert.equal(ctx2.supervisorId, null);
+    focusedPlansStub = [];
+  }));
+
+test('P1 auto-subscribe: create_plan by an asserted supervisor upserts a focus row', () =>
+  withServer(async (port) => {
+    lastFocusUpsert = null;
+    const res = await request(port, 'POST', '/api/plans',
+      { ...WS_HDR, 'X-Supervisor-Id': 'sup-1', 'Content-Type': 'application/json' },
+      JSON.stringify({ workspace_id: 'ws-1', title: 'My Plan' }));
+    assert.equal(res.status, 200);
+    assert.equal(focusUpserted()?.supervisorId, 'sup-1');
+    assert.equal(focusUpserted()?.planId, 'plan-1');
+  }));
+
+test('P1 auto-subscribe: create_plan by a header-less caller does NOT upsert (silent skip, still 200)', () =>
+  withServer(async (port) => {
+    lastFocusUpsert = null;
+    const res = await request(port, 'POST', '/api/plans',
+      { ...AUTH, 'Content-Type': 'application/json' },
+      JSON.stringify({ workspace_id: 'ws-1', title: 'My Plan' }));
+    assert.equal(res.status, 200, 'create still succeeds — focus attribution never gates it');
+    assert.equal(focusUpserted(), null, 'no supervisor identity → no focus row');
+  }));
+
+test('P1 auto-subscribe: a plan-bound launch_agent by an asserted supervisor upserts a focus row', () =>
+  withServer(async (port) => {
+    lastFocusUpsert = null;
+    const res = await request(port, 'POST', '/api/agents',
+      { ...WS_HDR, 'X-Supervisor-Id': 'sup-1', 'Content-Type': 'application/json' },
+      JSON.stringify({ title: 'w1', plan_id: 'plan-1' }));
+    assert.equal(res.status, 200);
+    assert.equal(focusUpserted()?.supervisorId, 'sup-1');
+    assert.equal(focusUpserted()?.planId, 'plan-1');
+  }));
+
+test('P1 auto-subscribe: a launch_agent with NO plan binding upserts nothing', () =>
+  withServer(async (port) => {
+    lastFocusUpsert = null;
+    const res = await request(port, 'POST', '/api/agents',
+      { ...WS_HDR, 'X-Supervisor-Id': 'sup-1', 'Content-Type': 'application/json' },
+      JSON.stringify({ title: 'w1' }));
+    assert.equal(res.status, 200);
+    assert.equal(focusUpserted(), null, 'no plan_id → nothing to subscribe to');
+  }));
+
+test('P1 auto-subscribe: run_orchestration with a plan_id upserts for the dispatching supervisor', async () => {
+  lastFocusUpsert = null;
+  const stubOrchestration = { start_run: () => ({ runId: 'run-1' }) } as unknown as ConstructorParameters<typeof ApiServer>[2];
+  const server = new ApiServer(stubSupervisor, 0, stubOrchestration, '127.0.0.1');
+  const port = await server.start();
+  try {
+    const res = await request(port, 'POST', '/api/orchestrations',
+      { ...WS_HDR, 'X-Supervisor-Id': 'sup-1', 'Content-Type': 'application/json' },
+      JSON.stringify({ name: 'groupthink', params: { workspaceId: 'ws-1', supervisorId: 'sup-1', planId: 'plan-1' } }));
+    assert.equal(res.status, 200);
+    assert.equal(JSON.parse(res.body).runId, 'run-1');
+    assert.equal(focusUpserted()?.supervisorId, 'sup-1');
+    assert.equal(focusUpserted()?.planId, 'plan-1');
+  } finally { server.stop(); }
+});
+
+test('P1-07 bump-on-read: an asserted supervisor reading a plan freshens its focus row', () =>
+  withServer(async (port) => {
+    // list_plan_sections + read_plan_section wire the identical bumpFocusOnRead one-liner
+    // (read_plan_projection shares it too, but its response body is DB-backed — out of
+    // scope for this identity-level stub; the bump wiring is proven by these two routes).
+    for (const p of ['/api/plans/plan-1/sections', '/api/plans/plan-1/sections/sec_x']) {
+      lastFocusBump = null;
+      const res = await request(port, 'GET', p, { ...WS_HDR, 'X-Supervisor-Id': 'sup-1' });
+      assert.equal(res.status, 200, `${p} → ${res.body}`);
+      assert.deepEqual(focusBumped(), { supervisorId: 'sup-1', planId: 'plan-1' }, `${p} bumps (sup-1, plan-1)`);
+    }
+  }));
+
+test('P1-07 bump-on-read: a header-less caller reading a plan bumps nothing (no auto-create)', () =>
+  withServer(async (port) => {
+    lastFocusBump = null;
+    const res = await request(port, 'GET', '/api/plans/plan-1/sections', WS_HDR);
+    assert.equal(res.status, 200, res.body);
+    assert.equal(focusBumped(), null, 'no supervisor identity → no attended bump');
+  }));
+
 // ── Context-brick Inc 4 (4.4) — continuation attempt / brick / relaunch ─────
 //
 // Same stub-the-database-module pattern as above: the routes' continuation
@@ -653,6 +807,27 @@ test('Inc 4: continuation-brick POST from wrong (foreign-workspace) supervisor �
       JSON.stringify({ note: 'n' }));
     assert.equal(res.status, 403);
   }));
+
+test("#19: continuation-brick POST from a privilegeLane:'supervisor' persona → 200, author = the persona's own id", () => {
+  let inserted: Record<string, unknown> | null = null;
+  let closed: string | null = null;
+  return withContinuationDb({
+    // Attempt is keyed to persona-1 (the route reads the open attempt for the
+    // asserted author id), proving the persona authenticates as itself.
+    getOpenContinuationAttempt: (id: string) => (id === 'persona-1' ? attemptRow({ dashboardAgentId: 'persona-1' }) : null),
+    insertContinuationBrick: (input: Record<string, unknown>) => { inserted = input; return 'brick-p'; },
+    closeContinuationHandoffAttempt: (attemptId: string) => { closed = attemptId; },
+  }, async (port) => {
+    const res = await request(port, 'POST', '/api/supervisor/continuation-brick',
+      { ...WS_HDR, 'X-Supervisor-Id': 'persona-1', 'Content-Type': 'application/json' },
+      JSON.stringify({ note: 'persona handoff note' }));
+    assert.equal(res.status, 200, res.body);
+    assert.equal(JSON.parse(res.body).id, 'brick-p');
+    assert.equal((inserted as unknown as Record<string, unknown>)!.agentId, 'persona-1');
+    assert.equal((inserted as unknown as Record<string, unknown>)!.noteSource, 'tool');
+    assert.equal(closed, 'att-1');
+  });
+});
 
 test('Inc 4: continuation-brick POST with no open attempt → 409 continuation-no-open-attempt', () =>
   withContinuationDb({ getOpenContinuationAttempt: () => null }, async (port) => {
@@ -811,15 +986,14 @@ test('Inc 4: relaunch gate — tool brick written BEFORE the attempt opened → 
     assert.equal(relaunched(), null);
   }));
 
-test('Inc 4: relaunch gate — each busy owned status (launching/working/waiting/restarting) blocks → 409', async () => {
+test('Inc 4: relaunch gate — busy owned status (launching/working/waiting/restarting) NO LONGER blocks (Edward 2026-07-05) → 200', async () => {
   for (const status of ['launching', 'working', 'waiting', 'restarting']) {
     await withContinuationDb(relaunchStubs({
       getAgentsByOwner: () => [{ id: 'w-busy', status }],
     }), async (port) => {
       const res = await relaunch(port);
-      assert.equal(res.status, 409, `status '${status}' must block`);
-      assert.equal(JSON.parse(res.body).code, 'continuation-owned-busy');
-      assert.equal(relaunched(), null);
+      assert.equal(res.status, 200, `status '${status}' must NOT block: ${res.body}`);
+      assert.equal(relaunched()!.agentId, 'sup-1');
     });
   }
 });
@@ -1020,14 +1194,13 @@ test('Inc 5: escape while a tool brick EXISTS → 409 continuation-escape-has-br
     assert.equal(relaunched(), null);
   }));
 
-test('Inc 5: escape still re-checks the shared gates (owned busy → 409, no kill)', () =>
+test('Inc 5: escape with a busy owned worker NO LONGER blocks (owned-busy removed, Edward 2026-07-05) → 200', () =>
   withContinuationDb(escapeStubs({
     getAgentsByOwner: () => [{ id: 'w-busy', status: 'working' }],
   }), async (port) => {
     const res = await relaunch(port, ESCAPE_BODY);
-    assert.equal(res.status, 409);
-    assert.equal(JSON.parse(res.body).code, 'continuation-owned-busy');
-    assert.equal(relaunched(), null);
+    assert.equal(res.status, 200, res.body);
+    assert.equal(JSON.parse(res.body).noteId, 'none');
   }));
 
 // ── Run ─────────────────────────────────────────────────────────────────────

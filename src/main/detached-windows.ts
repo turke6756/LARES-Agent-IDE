@@ -11,14 +11,29 @@ import { BrowserWindow, shell } from 'electron';
 import path from 'path';
 import { JUPYTER_BASE_PORT, JUPYTER_PORT_RETRIES } from './control-ports';
 import { normalizeFileKey } from '../shared/file-key';
-import { TAB_CHANNELS } from '../shared/types';
-import type { DetachRequest, DetachedClosedPayload, DetachResult } from '../shared/types';
+import { TAB_CHANNELS, VIEW_CHANNELS } from '../shared/types';
+import { installShellSpellcheckContextMenu } from './spellcheck-context-menu';
+import type {
+  DetachRequest,
+  DetachedClosedPayload,
+  DetachResult,
+  DetachableView,
+  ViewDetachRequest,
+  ViewDetachedClosedPayload,
+} from '../shared/types';
 
 // ── Registries ──────────────────────────────────────────────────────────
 // Window registry: lifecycle keyed by BrowserWindow id.
 const detached = new Map<number /* win.id */, { win: BrowserWindow; req: DetachRequest }>();
 // File-keyed ownership registry: who is allowed to write this file.
 const owners = new Map<string /* fileKey */, { winId: number; webContentsId: number }>();
+
+// ── View tear-off registries (parallel to the file ones above) ──────────
+// Detached top-level VIEW windows. Lifecycle keyed by window id; single-owner
+// ownership keyed by the view id so at most one window per view. No write /
+// dirty-close state — a view has nothing to save.
+const detachedViews = new Map<number /* win.id */, { win: BrowserWindow; req: ViewDetachRequest }>();
+const viewOwners = new Map<DetachableView, number /* winId */>();
 
 // ── Phase 2: dirty-on-close protocol state ──────────────────────────────
 // Outstanding close-confirmation requests keyed by a deterministic requestId
@@ -103,6 +118,10 @@ export function forceCloseAllDetached(): void {
   for (const { win } of detached.values()) {
     if (!win.isDestroyed()) win.close();
   }
+  // View windows have no close intercept, so a plain close is safe on shutdown.
+  for (const { win } of detachedViews.values()) {
+    if (!win.isDestroyed()) win.close();
+  }
 }
 
 // ── External navigation handlers (shared with the shell) ────────────────
@@ -155,6 +174,21 @@ export interface DetachedWindowDeps {
   // `new BrowserWindow()` is used — letting the unit tests exercise the
   // ownership / duplicate-focus logic without an Electron runtime.
   createWindow?: (opts: Electron.BrowserWindowConstructorOptions) => BrowserWindow;
+  // Test seam for the native editable-surface context menu. Production uses the
+  // real installer; tests inject a recorder without constructing Electron Menu.
+  installSpellcheckContextMenu?: (win: BrowserWindow) => void;
+  // View re-parenting hooks (plans/browser). A detachable view whose content is a
+  // main-process WebContentsView (the plan pane, the browser tabs) must move that
+  // native view OUT of the main window and INTO the detached window on detach, and
+  // back to the main window when the detached window closes. `onViewWindowReady`
+  // fires as the window is created (before load) so the view is already re-parented
+  // by the time the detached renderer streams show/setBounds; `onViewWindowClosing`
+  // fires on the window's 'close' (BEFORE destruction) so the pane can be moved
+  // home while the detached window still exists (a clean removeChildView). Both are
+  // no-ops for the pure-DOM views (dashboard/files). Optional so the unit-test deps
+  // and any caller that doesn't own the managers can omit them.
+  onViewWindowReady?: (view: DetachableView, win: BrowserWindow) => void;
+  onViewWindowClosing?: (view: DetachableView) => void;
 }
 
 export function createDetachedWindow(req: DetachRequest, deps: DetachedWindowDeps): DetachResult {
@@ -197,6 +231,7 @@ export function createDetachedWindow(req: DetachRequest, deps: DetachedWindowDep
       },
     });
     deps.trustedContents.add(win.webContents); // BEFORE load (Reviewer answer (a))
+    (deps.installSpellcheckContextMenu ?? installShellSpellcheckContextMenu)(win);
   } finally {
     deps.setConstructingDetached(false);
   }
@@ -260,10 +295,131 @@ export function createDetachedWindow(req: DetachRequest, deps: DetachedWindowDep
   return { ok: true };
 }
 
+// ── View tear-off window factory ────────────────────────────────────────
+// Spawns (or focuses) a trusted, preload-bearing window that renders one
+// top-level view full-screen. Reuses the same trust seam as the file factory:
+// constructingDetached exempts the window from the M4 guard during its own
+// construction, and trustedContents holds it after load (added BEFORE load,
+// removed on close). No ownership-by-file / single-writer / dirty-close — a
+// view is read-only chrome, so the window closes immediately on user close and
+// main fires VIEW_CHANNELS.closed so the shell un-hollows the button.
+export function createDetachedViewWindow(req: ViewDetachRequest, deps: DetachedWindowDeps): DetachResult {
+  // Duplicate detach → focus the existing window, abort the new spawn.
+  const existingWinId = viewOwners.get(req.view);
+  if (existingWinId !== undefined) {
+    const e = detachedViews.get(existingWinId);
+    if (e) {
+      e.win.focus();
+      return { ok: true, focusedExisting: true };
+    }
+  }
+
+  const makeWindow = deps.createWindow ?? ((opts) => new BrowserWindow(opts));
+
+  let win: BrowserWindow;
+  deps.setConstructingDetached(true);
+  try {
+    win = makeWindow({
+      // Wider default than a file window — a view holds a full pane, not one file.
+      width: 1100,
+      height: 800,
+      x: req.x,
+      y: req.y,
+      title: req.label,
+      backgroundColor: deps.theme === 'light' ? '#f7f5f0' : '#1e1e1e',
+      webPreferences: {
+        preload: path.join(__dirname, '..', 'preload', 'index.js'),
+        nodeIntegration: false,
+        contextIsolation: true,
+        sandbox: false, // trust triple — required so the preload can require shared modules
+        webSecurity: true,
+      },
+    });
+    deps.trustedContents.add(win.webContents); // BEFORE load
+  } finally {
+    deps.setConstructingDetached(false);
+  }
+
+  installExternalNavHandlers(win);
+
+  const q = new URLSearchParams({
+    detached: '1',
+    view: req.view,
+    workspaceId: req.workspaceId,
+    label: req.label,
+  }).toString();
+  if (deps.devServerUrl) win.loadURL(`${deps.devServerUrl}/?${q}`);
+  else win.loadFile(deps.builtIndexHtml, { search: q });
+
+  detachedViews.set(win.id, { win, req });
+  viewOwners.set(req.view, win.id);
+
+  // Re-parent a native-view-backed view (plans/browser) into this window so its
+  // WebContentsView paints here, not the main window. Fired before load so the
+  // reparent is in place by the time the detached renderer drives show/setBounds.
+  // No-op for the pure-DOM views (dashboard/files).
+  deps.onViewWindowReady?.(req.view, win);
+
+  // Capture references up front — after 'closed' fires, win.webContents / win.id
+  // throw "Object has been destroyed" (see the file factory's note).
+  const winContents = win.webContents;
+  const winId = win.id;
+  const view = req.view;
+
+  // A dead renderer can't be recovered — close the window so the view returns.
+  winContents.on('render-process-gone', () => {
+    if (!win.isDestroyed()) win.close();
+  });
+
+  // 'close' fires BEFORE destruction — move a native-view-backed view home while
+  // this window still exists (so removeChildView targets a live window). Does not
+  // preventDefault; the close proceeds to 'closed' below for registry cleanup.
+  win.on('close', () => {
+    deps.onViewWindowClosing?.(view);
+  });
+
+  win.on('closed', () => {
+    deps.trustedContents.delete(winContents);
+    detachedViews.delete(winId);
+    if (viewOwners.get(view) === winId) viewOwners.delete(view);
+    const mw = deps.getMainWindow();
+    if (mw && !mw.isDestroyed()) {
+      const payload: ViewDetachedClosedPayload = { view, workspaceId: req.workspaceId };
+      mw.webContents.send(VIEW_CHANNELS.closed, payload);
+    }
+  });
+
+  return { ok: true };
+}
+
+/** True when the given view is currently torn off into its own window. */
+export function isViewDetached(view: DetachableView): boolean {
+  return viewOwners.has(view);
+}
+
+/** Live detached view windows — used to broadcast the shell's data feeds so a
+ *  torn-off view (e.g. the Dashboard grid) stays live. */
+export function getDetachedViewWindows(): BrowserWindow[] {
+  return [...detachedViews.values()].map((e) => e.win);
+}
+
+/** Forward a main→renderer push to every live detached view window. The shell's
+ *  IPC feeds (agent status, deletions, context stats…) are sent to the main
+ *  window only; a torn-off Dashboard needs the same stream to stay in sync. */
+export function broadcastToDetachedViews(channel: string, ...args: unknown[]): void {
+  for (const { win } of detachedViews.values()) {
+    if (!win.isDestroyed() && !win.webContents.isDestroyed()) {
+      win.webContents.send(channel, ...args);
+    }
+  }
+}
+
 // Test-only: reset module state between unit-test cases.
 export function __resetDetachedRegistryForTest(): void {
   detached.clear();
   owners.clear();
+  detachedViews.clear();
+  viewOwners.clear();
   pendingCloses.clear();
   allowClose.clear();
   forceCloseAll = false;

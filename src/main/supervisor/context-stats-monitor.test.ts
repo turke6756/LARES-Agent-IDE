@@ -5,7 +5,7 @@
 
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { ContextStatsMonitor, type JsonlFileActivity } from './context-stats-monitor';
+import { ContextStatsMonitor, normalizeCapturedPath, type JsonlFileActivity } from './context-stats-monitor';
 import type { ToolResultEvent, ToolUseEvent, UsageEvent } from '../../shared/session-events';
 
 class FakeReader extends EventEmitter {
@@ -84,11 +84,52 @@ test('Gemini read_many_files with file_paths ignores non-string members', () => 
   ]);
 });
 
-test('structured tool duplicate paths are deduped', () => {
+test('structured tool duplicate paths WITHIN ONE tool-use are deduped', () => {
   const { reader, emitted } = makeHarness();
   reader.emit('tool-use', toolUse('read_many_files', { paths: ['a.ts', 'a.ts'] }, 'tool-1'));
-  reader.emit('tool-use', toolUse('read_file', { file_path: 'a.ts' }, 'tool-2'));
   assert.deepEqual(emitted, [{ agentId: 'agent-1', filePath: 'a.ts', operation: 'read' }]);
+});
+
+test('replaying the SAME tool-use id is deduped (idempotent replay guard)', () => {
+  const { reader, emitted } = makeHarness();
+  reader.emit('tool-use', toolUse('read_file', { file_path: 'a.ts' }, 'tool-1'));
+  reader.emit('tool-use', toolUse('read_file', { file_path: 'a.ts' }, 'tool-1')); // replay, same id
+  assert.deepEqual(emitted, [{ agentId: 'agent-1', filePath: 'a.ts', operation: 'read' }]);
+});
+
+// Fix rec-3: dedupe is TOOL-USE-ID scoped, NOT agent-lifetime. Two DISTINCT
+// tool-use ids reading the same path (e.g. a later turn) BOTH emit; the old
+// `op:path` lifetime key suppressed the second, hiding real later-turn work.
+test('same (op,path) under DIFFERENT tool-use ids each emit (no lifetime suppression)', () => {
+  const { reader, emitted } = makeHarness();
+  reader.emit('tool-use', toolUse('read_file', { file_path: 'a.ts' }, 'tool-1'));
+  reader.emit('tool-use', toolUse('read_file', { file_path: 'a.ts' }, 'tool-2'));
+  assert.deepEqual(emitted, [
+    { agentId: 'agent-1', filePath: 'a.ts', operation: 'read' },
+    { agentId: 'agent-1', filePath: 'a.ts', operation: 'read' },
+  ]);
+});
+
+// The review's exact repro: turn 1 read+edit a file, turn 2 read+edit the SAME
+// file (same agent/session, distinct tool-use ids) → turn 2 MUST still emit
+// witnessed rows. Under the old lifetime dedupe, turn 2 emitted zero.
+test('review repro — repeated read+edit in a later turn still emits witnessed rows', () => {
+  const { reader, emitted } = makeHarness();
+  // Turn 1
+  reader.emit('tool-use', toolUse('read_file', { file_path: 'src/a.ts' }, 't1-read'));
+  reader.emit('tool-use', toolUse('replace', { file_path: 'src/a.ts' }, 't1-edit'));
+  assert.equal(emitted.length, 2, 'turn 1 emits read + write');
+  // Turn 2 — same file, new tool-use ids
+  reader.emit('tool-use', toolUse('read_file', { file_path: 'src/a.ts' }, 't2-read'));
+  reader.emit('tool-use', toolUse('replace', { file_path: 'src/a.ts' }, 't2-edit'));
+  assert.deepEqual(
+    emitted.slice(2),
+    [
+      { agentId: 'agent-1', filePath: 'src/a.ts', operation: 'read' },
+      { agentId: 'agent-1', filePath: 'src/a.ts', operation: 'write' },
+    ],
+    'turn 2 re-emits both ops — no false-negative',
+  );
 });
 
 test('apply_patch activity is emitted only after successful tool-result', () => {
@@ -166,7 +207,7 @@ test('BUG-26: invalidateAgent does NOT emit statsChanged (next legitimate usage 
   assert.equal(statsChangedCount, 2, 'next legitimate usage repopulates and fires statsChanged');
 });
 
-test('BUG-26: invalidateAgent clears seenFiles dedupe set (re-emit after rebind)', () => {
+test('BUG-26: invalidateAgent clears seenFiles dedupe set (SAME tool-use id re-emits after rebind)', () => {
   const reader = new FakeReader();
   const monitor = new ContextStatsMonitor(reader as any);
   const emitted: JsonlFileActivity[] = [];
@@ -174,16 +215,18 @@ test('BUG-26: invalidateAgent clears seenFiles dedupe set (re-emit after rebind)
   monitor.start();
 
   reader.emit('tool-use', toolUse('read_file', { file_path: 'src/a.ts' }, 'tool-1'));
-  reader.emit('tool-use', toolUse('read_file', { file_path: 'src/a.ts' }, 'tool-2'));
-  assert.equal(emitted.length, 1, 'pre-rebind: second identical (op,path) deduped');
+  reader.emit('tool-use', toolUse('read_file', { file_path: 'src/a.ts' }, 'tool-1')); // replay same id
+  assert.equal(emitted.length, 1, 'pre-rebind: replay of the same tool-use id deduped');
 
   monitor.invalidateAgent('agent-1');
 
-  reader.emit('tool-use', toolUse('read_file', { file_path: 'src/a.ts' }, 'tool-3'));
+  // After a rebind wiped the DB rows, a replay of the SAME tool-use id must
+  // re-emit so the agent's own (now-correctly-attributed) activity re-inserts.
+  reader.emit('tool-use', toolUse('read_file', { file_path: 'src/a.ts' }, 'tool-1'));
   assert.equal(
     emitted.length,
     2,
-    'post-rebind: same (op,path) re-emits because seenFiles was cleared (needed because deleteFileActivitiesForAgent wiped the DB row)'
+    'post-rebind: same tool-use id re-emits because seenFiles was cleared'
   );
 });
 
@@ -230,6 +273,87 @@ test('BUG-26: invalidateAgent on agent A does not touch agent B state', () => {
   monitor.invalidateAgent('agent-A');
   assert.equal(monitor.getStats('agent-A'), null);
   assert.ok(monitor.getStats('agent-B'), 'agent-B stats survive invalidating agent-A');
+});
+
+// ── Fix rec-4: path normalization at ingress ────────────────────────────────
+
+const WIN_ROOT = 'C:\\Users\\turke\\Projects\\AgentDashboard';
+const WSL_ROOT = '/home/edward/agentdashboard';
+
+function makeHarnessWithRoot(root: string | null): {
+  reader: FakeReader;
+  emitted: JsonlFileActivity[];
+} {
+  const reader = new FakeReader();
+  const monitor = new ContextStatsMonitor(reader as any, () => root);
+  const emitted: JsonlFileActivity[] = [];
+  monitor.on('fileActivity', (a) => emitted.push(a));
+  monitor.start();
+  return { reader, emitted };
+}
+
+test('normalizeCapturedPath — relative resolved against Windows root → absolute', () => {
+  assert.equal(
+    normalizeCapturedPath('plans/example.html', WIN_ROOT),
+    'C:\\Users\\turke\\Projects\\AgentDashboard\\plans\\example.html',
+  );
+});
+
+test('normalizeCapturedPath — leading ./ stripped before resolve', () => {
+  assert.equal(
+    normalizeCapturedPath('./.dashboard/state.json', WIN_ROOT),
+    'C:\\Users\\turke\\Projects\\AgentDashboard\\.dashboard\\state.json',
+  );
+});
+
+test('normalizeCapturedPath — relative resolved against WSL/POSIX root (forward-slash join)', () => {
+  assert.equal(
+    normalizeCapturedPath('plans/example.html', WSL_ROOT),
+    '/home/edward/agentdashboard/plans/example.html',
+  );
+});
+
+test('normalizeCapturedPath — absolute paths pass through verbatim (Windows / WSL / UNC)', () => {
+  assert.equal(normalizeCapturedPath('C:\\repo\\src\\foo.ts', WIN_ROOT), 'C:\\repo\\src\\foo.ts');
+  assert.equal(normalizeCapturedPath('/home/edward/other/x.ts', WIN_ROOT), '/home/edward/other/x.ts');
+  assert.equal(normalizeCapturedPath('\\\\server\\share\\x.ts', WIN_ROOT), '\\\\server\\share\\x.ts');
+});
+
+test('normalizeCapturedPath — no root → relative kept verbatim (best-effort)', () => {
+  assert.equal(normalizeCapturedPath('plans/example.html', null), 'plans/example.html');
+});
+
+test('normalizeCapturedPath — empty / whitespace-only → null (quarantined)', () => {
+  assert.equal(normalizeCapturedPath('', WIN_ROOT), null);
+  assert.equal(normalizeCapturedPath('   ', WIN_ROOT), null);
+});
+
+test('ingress — relative plan/.dashboard paths are resolved to absolute before emit', () => {
+  const { reader, emitted } = makeHarnessWithRoot(WIN_ROOT);
+  reader.emit('tool-use', toolUse('read_file', { file_path: 'plans/example.html' }, 't1'));
+  reader.emit('tool-use', toolUse('read_file', { file_path: '.dashboard/state.json' }, 't2'));
+  assert.deepEqual(emitted.map((e) => e.filePath), [
+    'C:\\Users\\turke\\Projects\\AgentDashboard\\plans\\example.html',
+    'C:\\Users\\turke\\Projects\\AgentDashboard\\.dashboard\\state.json',
+  ]);
+});
+
+test('ingress — an already-absolute captured path is unchanged', () => {
+  const { reader, emitted } = makeHarnessWithRoot(WIN_ROOT);
+  reader.emit('tool-use', toolUse('replace', { file_path: 'C:\\Users\\turke\\Projects\\AgentDashboard\\src\\a.ts' }, 't1'));
+  assert.deepEqual(emitted, [
+    { agentId: 'agent-1', filePath: 'C:\\Users\\turke\\Projects\\AgentDashboard\\src\\a.ts', operation: 'write' },
+  ]);
+});
+
+test('ingress — a genuinely-outside relative path resolves under root (classification is repo-activity’s job)', () => {
+  // Normalization only makes the path ABSOLUTE + workspace-anchored; whether it
+  // lands inside/outside is decided later by repo-activity.toRel. A '../' escape
+  // resolves above the root and will be flagged outside there.
+  const { reader, emitted } = makeHarnessWithRoot(WIN_ROOT);
+  reader.emit('tool-use', toolUse('read_file', { file_path: '../OtherRepo/x.ts' }, 't1'));
+  assert.equal(emitted.length, 1);
+  assert.equal(emitted[0].filePath, 'C:\\Users\\turke\\Projects\\OtherRepo\\x.ts');
 });
 
 (async () => {

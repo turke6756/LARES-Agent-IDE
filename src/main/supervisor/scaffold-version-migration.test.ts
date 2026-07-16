@@ -26,6 +26,10 @@ import {
   DASHBOARD_STATUS_SCRIPT_V2_HASH,
   SCAFFOLD_SIDECAR_REL,
   SUPERVISOR_AGENT_MD_V8_HASH,
+  SUPERVISOR_AGENT_MD_V9_HASH,
+  SUPERVISOR_AGENT_MD_V10_HASH,
+  WORKER_CLAUDE_MD_V5_HASH,
+  RESEARCHER_AGENT_MD_V4_HASH,
   normalizeManagedKey,
   sha256Hex,
 } from './index';
@@ -781,7 +785,7 @@ test('WP-B. researcher scaffold: fresh workspace writes persona CLAUDE.md + sett
     assert.ok(settings.includes('dashboard-statusline.mjs'), 'statusLine must point at dashboard-statusline.mjs');
 
     const sidecar = readSidecar(workDir);
-    assert.equal(sidecar['researcher/CLAUDE.md'], 4, `sidecar must record researcher CLAUDE.md v4; got ${JSON.stringify(sidecar)}`);
+    assert.equal(sidecar['researcher/CLAUDE.md'], 5, `sidecar must record researcher CLAUDE.md v5; got ${JSON.stringify(sidecar)}`);
     assert.equal(sidecar['researcher/.claude/settings.json'], 2, 'sidecar must record settings v2 (statusLine added)');
 
     // Idempotent second pass — no rewrites, no backups.
@@ -816,7 +820,65 @@ test('WP-B. researcher CLAUDE.md: user-modified persona is backed up + overwritt
   }
 });
 
-test('G5. worker CLAUDE.md: pristine v1 silently upgrades to v4 carrying the research-store pointer', () => {
+// ── Phase 4 (BrowserSigninSharing §D): researcher CLAUDE.md v4 → v5 ──────────
+//
+// v5 adds the `## Signed-in sites` section (`pending_signin` = wait/poll + retry
+// the same call; `signin_unavailable` = blocked on a human re-arm; a guest view
+// is an auth-verification FAILURE, never authenticated success). A pristine v4
+// file must silently upgrade (no backup); the previousHashes[4] entry makes that
+// silent upgrade possible.
+
+/** The v4 researcher CLAUDE.md, reconstructed by stripping the v5 `## Signed-in
+ *  sites` section back out of the current bundled constant. The precondition test
+ *  pins this to RESEARCHER_AGENT_MD_V4_HASH so any drift fails loudly. */
+const RESEARCHER_AGENT_MD_V4 = RESEARCHER_AGENT_MD.replace(
+  /## Signed-in sites:[\s\S]*?\n\n(## Untrusted web content)/,
+  '$1',
+);
+
+test('P4-0. precondition: reconstructed v4 researcher CLAUDE.md hashes to the shipped constant', () => {
+  assert.notEqual(RESEARCHER_AGENT_MD_V4, RESEARCHER_AGENT_MD, 'the v5 signed-in-sites section must differ from v4');
+  const hash = sha256Hex(RESEARCHER_AGENT_MD_V4);
+  assert.equal(
+    hash,
+    RESEARCHER_AGENT_MD_V4_HASH,
+    `Reconstructed v4 researcher CLAUDE.md hash (${hash}) does not match ` +
+    `RESEARCHER_AGENT_MD_V4_HASH (${RESEARCHER_AGENT_MD_V4_HASH}). Old workspaces' ` +
+    `pristine v4 researcher contract would be .bak'd instead of silently upgraded.`,
+  );
+});
+
+test('P4-1. researcher CLAUDE.md: pristine v4 silently upgrades to v5 carrying the signed-in-sites wording once', () => {
+  const workDir = mktmp('researcher-v4');
+  const { supervisor, cleanup } = makeSupervisor();
+  try {
+    const mdPath = researcherPath(workDir, 'CLAUDE.md');
+    fs.mkdirSync(path.dirname(mdPath), { recursive: true });
+    fs.writeFileSync(mdPath, RESEARCHER_AGENT_MD_V4, 'utf-8');
+    fs.mkdirSync(path.dirname(sidecarPath(workDir)), { recursive: true });
+    fs.writeFileSync(
+      sidecarPath(workDir),
+      JSON.stringify({ 'researcher/CLAUDE.md': 4 }, null, 2) + '\n',
+      'utf-8',
+    );
+
+    supervisor.ensureResearcherScaffold(workDir, 'windows');
+
+    const content = fs.readFileSync(mdPath, 'utf-8');
+    assert.equal(content, RESEARCHER_AGENT_MD, 'pristine v4 researcher CLAUDE.md must silently upgrade to v5 bundled content');
+    assert.equal(countMatches(content, '## Signed-in sites:'), 1, 'the signed-in-sites section appears exactly once (not double-appended)');
+    assert.ok(content.includes('a guest view is NOT success') || content.includes('AUTH-VERIFICATION FAILURE'), 'upgraded contract must carry the guest≠success wording');
+    const backups = fs.readdirSync(researcherPath(workDir)).filter((n) => n.startsWith('CLAUDE.md.bak.'));
+    assert.equal(backups.length, 0, 'known-hash v4→v5 upgrade must NOT create a backup');
+    const sidecar = readSidecar(workDir);
+    assert.equal(sidecar['researcher/CLAUDE.md'], 5, `sidecar must record v5; got ${JSON.stringify(sidecar)}`);
+  } finally {
+    cleanup();
+    rmrf(workDir);
+  }
+});
+
+test('G5. worker CLAUDE.md: pristine v1 silently upgrades to current carrying the research-store pointer', () => {
   const workDir = mktmp('worker-claudemd-v1');
   const { supervisor, cleanup } = makeSupervisor();
   try {
@@ -833,12 +895,153 @@ test('G5. worker CLAUDE.md: pristine v1 silently upgrades to v4 carrying the res
     supervisor.ensureWorkerScaffold(workDir, 'claude', 'windows');
 
     const content = fs.readFileSync(mdPath, 'utf-8');
-    assert.equal(content, WORKER_CLAUDE_MD, 'v1 worker CLAUDE.md must silently upgrade to v4 bundled content');
+    assert.equal(content, WORKER_CLAUDE_MD, 'v1 worker CLAUDE.md must silently upgrade to current bundled content');
     assert.equal(countMatches(content, RESEARCH_SECTION_MARKER), 1, 'research-store section appears exactly once (not double-appended)');
     const backups = fs.readdirSync(path.dirname(mdPath)).filter((n) => n.startsWith('CLAUDE.md.bak.'));
-    assert.equal(backups.length, 0, 'known-hash v1→v4 upgrade must NOT create a backup');
+    assert.equal(backups.length, 0, 'known-hash v1→current upgrade must NOT create a backup');
     const sidecar = readSidecar(workDir);
-    assert.equal(sidecar['workers/claude/CLAUDE.md'], 4, `sidecar must record v4; got ${JSON.stringify(sidecar)}`);
+    assert.equal(sidecar['workers/claude/CLAUDE.md'], 6, `sidecar must record v6; got ${JSON.stringify(sidecar)}`);
+  } finally {
+    cleanup();
+    rmrf(workDir);
+  }
+});
+
+// ── GT-C Decision 2: worker CLAUDE.md v5 → v6 migration ──────────────────
+//
+// v6 (§2.6) rewrites the plan-event sentinel section (marker v1 → v2): the
+// PLAN-EVENT sentinel becomes mandatory on EVERY plan-rail turn (not just writes)
+// and the status vocabulary expands to
+// integrated|reviewed|deliberating|blocked|rejected|scope-changed|transition. A
+// pristine v5 file must silently upgrade; a locally-edited one must be .bak'd +
+// overwritten.
+
+const PLAN_EVENT_MARKER = '<!-- section:plan-event-sentinel v2 -->';
+
+/** Verbatim v5 plan-event sentinel section (marker v1, "Optionally self-report").
+ *  Used to reconstruct the pristine v5 worker CLAUDE.md from the current v6
+ *  bundled constant; the precondition test pins the reconstruction to
+ *  WORKER_CLAUDE_MD_V5_HASH so any drift fails loudly. */
+const PLAN_EVENT_SECTION_V5 = `<!-- section:plan-event-sentinel v1 -->
+## Planning surface: editing a plan section
+
+If your launch bound you to a plan (you'll see \`AGENT_DASHBOARD_PLAN_ID\` /
+\`AGENT_DASHBOARD_PLAN_SECTION\` in your environment), the dashboard records a
+**trusted** provenance trail of what you actually touched — server-witnessed from
+your tool calls, not from anything you narrate. Two habits keep that trail clean:
+
+**1. Read the target section before you edit it.** Use the plan read tools
+(\`read_plan_section\`, \`list_plan_sections\`, \`read_plan_projection\`) and, when
+you're about to edit, request the section with \`mode:"raw+editWindow"\` — it
+returns the byte-exact fragment to replace plus edit-discipline instructions. A
+\`raw+editWindow\` read is a stronger edit-intent signal than a plain read. Then
+edit natively (\`Edit\` / \`MultiEdit\`) — replace only that exact fragment and
+**never** change a \`data-anchor\` value. Native edits are the only write path;
+there is no plan-write MCP tool.
+
+**2. Optionally self-report at turn-end via the sentinel.** End your final message
+with a \`PLAN-EVENT\` comment block so the surface can show your own summary
+alongside the trusted facts:
+
+\`\`\`
+<!--PLAN-EVENT
+{ "status": "integrated", "result": "…", "next": "…", "claimed_section_anchor": "sec_a1b2c3" }
+-->
+\`\`\`
+
+- \`status\` — one of \`integrated | rejected | scope-changed | transition\`.
+- \`result\` / \`next\` — short free text (what landed; what's next).
+- \`claimed_section_anchor\` — **optional, self-report ONLY.** It is stored for a
+  claimed-vs-observed diagnostic comparison and is **never** used to attribute
+  your edit; the trusted anchor is always derived server-side from your actual
+  read/edit tool calls. Omit it if unsure — a wrong claim only shows as a
+  mismatch, it never changes what you're credited with.
+
+The sentinel is best-effort: if you omit it, the surface just shows "no
+self-report" and your trusted trail is unaffected.
+<!-- /section:plan-event-sentinel -->`;
+
+/** The v5 worker CLAUDE.md, reconstructed by swapping the current v6 plan-event
+ *  sentinel section back to its v5 form. The precondition test pins this to
+ *  WORKER_CLAUDE_MD_V5_HASH. */
+const WORKER_CLAUDE_MD_V5 = WORKER_CLAUDE_MD.replace(
+  /<!-- section:plan-event-sentinel v2 -->[\s\S]*?<!-- \/section:plan-event-sentinel -->/,
+  PLAN_EVENT_SECTION_V5,
+);
+
+function workerClaudeMdPath(workDir: string): string {
+  return path.join(workDir, '.dashboard', 'workers', 'claude', 'CLAUDE.md');
+}
+
+test('D2-0. precondition: reconstructed v5 worker CLAUDE.md hashes to the shipped constant', () => {
+  assert.notEqual(WORKER_CLAUDE_MD_V5, WORKER_CLAUDE_MD, 'the v6 plan-event section must differ from v5');
+  const hash = sha256Hex(WORKER_CLAUDE_MD_V5);
+  assert.equal(
+    hash,
+    WORKER_CLAUDE_MD_V5_HASH,
+    `Reconstructed v5 worker CLAUDE.md hash (${hash}) does not match ` +
+    `WORKER_CLAUDE_MD_V5_HASH (${WORKER_CLAUDE_MD_V5_HASH}). Old workspaces' ` +
+    `pristine v5 CLAUDE.md would be .bak'd instead of silently upgraded.`,
+  );
+});
+
+test('D2-1. worker CLAUDE.md: pristine v5 silently upgrades to v6 carrying the mandatory-sentinel wording once', () => {
+  const workDir = mktmp('worker-claudemd-v5');
+  const { supervisor, cleanup } = makeSupervisor();
+  try {
+    const mdPath = workerClaudeMdPath(workDir);
+    fs.mkdirSync(path.dirname(mdPath), { recursive: true });
+    fs.writeFileSync(mdPath, WORKER_CLAUDE_MD_V5, 'utf-8');
+    fs.mkdirSync(path.dirname(sidecarPath(workDir)), { recursive: true });
+    fs.writeFileSync(
+      sidecarPath(workDir),
+      JSON.stringify({ 'workers/claude/CLAUDE.md': 5 }, null, 2) + '\n',
+      'utf-8',
+    );
+
+    supervisor.ensureWorkerScaffold(workDir, 'claude', 'windows');
+
+    const content = fs.readFileSync(mdPath, 'utf-8');
+    assert.equal(content, WORKER_CLAUDE_MD, 'v5 worker CLAUDE.md must silently upgrade to v6 bundled content');
+    assert.equal(countMatches(content, PLAN_EVENT_MARKER), 1, 'v2 plan-event marker appears exactly once');
+    assert.ok(content.includes('End EVERY plan-rail turn'), 'upgraded CLAUDE.md must carry the mandatory-sentinel wording');
+    assert.ok(content.includes('reviewed | deliberating | blocked'), 'upgraded CLAUDE.md must carry the expanded status vocabulary');
+    const backups = fs.readdirSync(path.dirname(mdPath)).filter((n) => n.startsWith('CLAUDE.md.bak.'));
+    assert.equal(backups.length, 0, 'known-hash v5→v6 upgrade must NOT create a backup');
+    const sidecar = readSidecar(workDir);
+    assert.equal(sidecar['workers/claude/CLAUDE.md'], 6, `sidecar must record v6; got ${JSON.stringify(sidecar)}`);
+  } finally {
+    cleanup();
+    rmrf(workDir);
+  }
+});
+
+test('D2-2. worker CLAUDE.md: locally-edited v5 (unknown hash) → .bak + overwrite with v6', () => {
+  const workDir = mktmp('worker-claudemd-v5-edited');
+  const { supervisor, cleanup } = makeSupervisor();
+  try {
+    const mdPath = workerClaudeMdPath(workDir);
+    fs.mkdirSync(path.dirname(mdPath), { recursive: true });
+    const edited = WORKER_CLAUDE_MD_V5 + '\n## My local worker notes\n';
+    fs.writeFileSync(mdPath, edited, 'utf-8');
+    fs.mkdirSync(path.dirname(sidecarPath(workDir)), { recursive: true });
+    fs.writeFileSync(
+      sidecarPath(workDir),
+      JSON.stringify({ 'workers/claude/CLAUDE.md': 5 }, null, 2) + '\n',
+      'utf-8',
+    );
+
+    supervisor.ensureWorkerScaffold(workDir, 'claude', 'windows');
+
+    assert.equal(fs.readFileSync(mdPath, 'utf-8'), WORKER_CLAUDE_MD, 'edited CLAUDE.md must be overwritten with v6 bundled content');
+    const backups = fs.readdirSync(path.dirname(mdPath)).filter((n) => n.startsWith('CLAUDE.md.bak.'));
+    assert.equal(backups.length, 1, `expected exactly one CLAUDE.md .bak.<ts>; got: ${backups.join(', ')}`);
+    assert.equal(
+      fs.readFileSync(path.join(path.dirname(mdPath), backups[0]), 'utf-8'),
+      edited,
+      'backup must hold the locally-edited content verbatim',
+    );
+    assert.equal(readSidecar(workDir)['workers/claude/CLAUDE.md'], 6, 'sidecar must record v6');
   } finally {
     cleanup();
     rmrf(workDir);
@@ -856,7 +1059,7 @@ test('G5. supervisor CLAUDE.md: fresh scaffold carries the research-store pointe
     assert.equal(content, SUPERVISOR_AGENT_MD, 'supervisor CLAUDE.md must be exact bundled content');
     assert.equal(countMatches(content, RESEARCH_SECTION_MARKER), 1, 'research-store section appears exactly once');
     const sidecar = readSidecar(workDir);
-    assert.equal(sidecar['supervisor/CLAUDE.md'], 9, `sidecar must record v9; got ${JSON.stringify(sidecar)}`);
+    assert.equal(sidecar['supervisor/CLAUDE.md'], 11, `sidecar must record v11; got ${JSON.stringify(sidecar)}`);
 
     const beforeMtime = fs.statSync(mdPath).mtimeMs;
     supervisor.ensureSupervisorScaffold(workDir, 'windows');
@@ -952,12 +1155,20 @@ test('UL-2. worker settings.json locally-edited (unknown hash) → .bak + overwr
 // silently upgrade; a locally-edited one must be .bak'd + overwritten.
 
 const REORIENTATION_MARKER = '<!-- reorientation-note-v1 -->';
+const PLANNING_SURFACE_MARKER = '<!-- section:planning-surface v1 -->';
 
-/** The v8 supervisor CLAUDE.md, reconstructed by removing exactly the two v9
- *  additions from the current bundled constant. The precondition test below
- *  pins this reconstruction to the shipped SUPERVISOR_AGENT_MD_V8_HASH — if
- *  either addition stops being a clean append, the hash check fails loudly. */
-const SUPERVISOR_AGENT_MD_V8 = SUPERVISOR_AGENT_MD
+/** The v9 supervisor CLAUDE.md, reconstructed by removing the one v10 addition
+ *  (the planning-surface sentinel block) from the current bundled constant. The
+ *  precondition test below pins this reconstruction to SUPERVISOR_AGENT_MD_V9_HASH
+ *  — if the append stops being clean, the hash check fails loudly. */
+const SUPERVISOR_AGENT_MD_V9 = SUPERVISOR_AGENT_MD
+  .replace(/\n<!-- section:planning-surface v1 -->[\s\S]*?<!-- \/section:planning-surface -->\n/, '');
+
+/** The v8 supervisor CLAUDE.md, reconstructed by further removing the two v9
+ *  additions from the v9 reconstruction. The precondition test below pins this to
+ *  the shipped SUPERVISOR_AGENT_MD_V8_HASH — if either addition stops being a
+ *  clean append, the hash check fails loudly. */
+const SUPERVISOR_AGENT_MD_V8 = SUPERVISOR_AGENT_MD_V9
   .replace(/\n<!-- reorientation-note-v1 -->[\s\S]*?<!-- \/reorientation-note-v1 -->\n/, '')
   .replace(/\n- \*\*get_usage_limits\*\*[^\n]*\n/, '\n');
 
@@ -972,7 +1183,7 @@ test('CB-0. precondition: reconstructed v8 supervisor CLAUDE.md hashes to the sh
   );
 });
 
-test('CB-1. supervisor CLAUDE.md: pristine v8 silently upgrades to v9 carrying the reorientation sentinel once', () => {
+test('CB-1. supervisor CLAUDE.md: pristine v8 silently upgrades to current carrying the reorientation sentinel once', () => {
   const workDir = mktmp('sup-claudemd-v8');
   const { supervisor, cleanup } = makeSupervisor();
   try {
@@ -989,21 +1200,21 @@ test('CB-1. supervisor CLAUDE.md: pristine v8 silently upgrades to v9 carrying t
     supervisor.ensureSupervisorScaffold(workDir, 'windows');
 
     const content = fs.readFileSync(mdPath, 'utf-8');
-    assert.equal(content, SUPERVISOR_AGENT_MD, 'v8 supervisor CLAUDE.md must silently upgrade to v9 bundled content');
+    assert.equal(content, SUPERVISOR_AGENT_MD, 'v8 supervisor CLAUDE.md must silently upgrade to current bundled content');
     assert.equal(countMatches(content, REORIENTATION_MARKER), 1, 'reorientation sentinel appears exactly once (not double-appended)');
     assert.ok(content.includes('## Re-Orientation on Revival'), 'upgraded CLAUDE.md must carry the re-orientation section');
     assert.ok(content.includes('**get_my_context**'), 'upgraded CLAUDE.md must carry the get_my_context tool bullet');
     const backups = fs.readdirSync(path.dirname(mdPath)).filter((n) => n.startsWith('CLAUDE.md.bak.'));
-    assert.equal(backups.length, 0, 'known-hash v8→v9 upgrade must NOT create a backup');
+    assert.equal(backups.length, 0, 'known-hash v8→current upgrade must NOT create a backup');
     const sidecar = readSidecar(workDir);
-    assert.equal(sidecar['supervisor/CLAUDE.md'], 9, `sidecar must record v9; got ${JSON.stringify(sidecar)}`);
+    assert.equal(sidecar['supervisor/CLAUDE.md'], 11, `sidecar must record v11; got ${JSON.stringify(sidecar)}`);
   } finally {
     cleanup();
     rmrf(workDir);
   }
 });
 
-test('CB-2. supervisor CLAUDE.md: locally-edited v8 (unknown hash) → .bak + overwrite with v9', () => {
+test('CB-2. supervisor CLAUDE.md: locally-edited v8 (unknown hash) → .bak + overwrite with current', () => {
   const workDir = mktmp('sup-claudemd-v8-edited');
   const { supervisor, cleanup } = makeSupervisor();
   try {
@@ -1020,7 +1231,7 @@ test('CB-2. supervisor CLAUDE.md: locally-edited v8 (unknown hash) → .bak + ov
 
     supervisor.ensureSupervisorScaffold(workDir, 'windows');
 
-    assert.equal(fs.readFileSync(mdPath, 'utf-8'), SUPERVISOR_AGENT_MD, 'edited CLAUDE.md must be overwritten with v9 bundled content');
+    assert.equal(fs.readFileSync(mdPath, 'utf-8'), SUPERVISOR_AGENT_MD, 'edited CLAUDE.md must be overwritten with current bundled content');
     const backups = fs.readdirSync(path.dirname(mdPath)).filter((n) => n.startsWith('CLAUDE.md.bak.'));
     assert.equal(backups.length, 1, `expected exactly one CLAUDE.md .bak.<ts>; got: ${backups.join(', ')}`);
     assert.equal(
@@ -1028,7 +1239,222 @@ test('CB-2. supervisor CLAUDE.md: locally-edited v8 (unknown hash) → .bak + ov
       edited,
       'backup must hold the locally-edited content verbatim',
     );
-    assert.equal(readSidecar(workDir)['supervisor/CLAUDE.md'], 9, 'sidecar must record v9');
+    assert.equal(readSidecar(workDir)['supervisor/CLAUDE.md'], 11, 'sidecar must record v11');
+  } finally {
+    cleanup();
+    rmrf(workDir);
+  }
+});
+
+// ── Planning-surface: supervisor CLAUDE.md v9 → v10 migration ────────────
+//
+// v10 appends the `<!-- section:planning-surface v1 -->` sentinel block: how a
+// supervisor mints (`create_plan`), dispatches into (`launch_agent` /
+// `run_orchestration` with `{plan_id, section_anchor}`), observes
+// (`read_plan_projection` / `read_plan_section`), and gates a plan surface, plus
+// the one-writer 409 policy. A pristine v9 file must silently upgrade; a
+// locally-edited one must be .bak'd + overwritten.
+
+test('PS-0. precondition: reconstructed v9 supervisor CLAUDE.md hashes to the shipped constant', () => {
+  const hash = sha256Hex(SUPERVISOR_AGENT_MD_V9);
+  assert.equal(
+    hash,
+    SUPERVISOR_AGENT_MD_V9_HASH,
+    `Reconstructed v9 hash (${hash}) does not match SUPERVISOR_AGENT_MD_V9_HASH ` +
+    `(${SUPERVISOR_AGENT_MD_V9_HASH}). Old workspaces' pristine v9 CLAUDE.md ` +
+    `would be .bak'd instead of silently upgraded.`,
+  );
+});
+
+test('PS-1. supervisor CLAUDE.md: pristine v9 silently upgrades to v10 carrying the planning-surface sentinel once', () => {
+  const workDir = mktmp('sup-claudemd-v9');
+  const { supervisor, cleanup } = makeSupervisor();
+  try {
+    const mdPath = path.join(workDir, '.dashboard', 'supervisor', 'CLAUDE.md');
+    fs.mkdirSync(path.dirname(mdPath), { recursive: true });
+    fs.writeFileSync(mdPath, SUPERVISOR_AGENT_MD_V9, 'utf-8');
+    fs.mkdirSync(path.dirname(sidecarPath(workDir)), { recursive: true });
+    fs.writeFileSync(
+      sidecarPath(workDir),
+      JSON.stringify({ 'supervisor/CLAUDE.md': 9 }, null, 2) + '\n',
+      'utf-8',
+    );
+
+    supervisor.ensureSupervisorScaffold(workDir, 'windows');
+
+    const content = fs.readFileSync(mdPath, 'utf-8');
+    assert.equal(content, SUPERVISOR_AGENT_MD, 'v9 supervisor CLAUDE.md must silently upgrade to v10 bundled content');
+    assert.equal(countMatches(content, PLANNING_SURFACE_MARKER), 1, 'planning-surface sentinel appears exactly once (not double-appended)');
+    assert.ok(content.includes('## Planning surface: minting and gating a plan'), 'upgraded CLAUDE.md must carry the planning-surface section');
+    assert.ok(content.includes('`create_plan`'), 'upgraded CLAUDE.md must mention create_plan');
+    const backups = fs.readdirSync(path.dirname(mdPath)).filter((n) => n.startsWith('CLAUDE.md.bak.'));
+    assert.equal(backups.length, 0, 'known-hash v9→current upgrade must NOT create a backup');
+    const sidecar = readSidecar(workDir);
+    assert.equal(sidecar['supervisor/CLAUDE.md'], 11, `sidecar must record v11; got ${JSON.stringify(sidecar)}`);
+  } finally {
+    cleanup();
+    rmrf(workDir);
+  }
+});
+
+test('PS-2. supervisor CLAUDE.md: locally-edited v9 (unknown hash) → .bak + overwrite with v10', () => {
+  const workDir = mktmp('sup-claudemd-v9-edited');
+  const { supervisor, cleanup } = makeSupervisor();
+  try {
+    const mdPath = path.join(workDir, '.dashboard', 'supervisor', 'CLAUDE.md');
+    fs.mkdirSync(path.dirname(mdPath), { recursive: true });
+    const edited = SUPERVISOR_AGENT_MD_V9 + '\n## My local notes\n';
+    fs.writeFileSync(mdPath, edited, 'utf-8');
+    fs.mkdirSync(path.dirname(sidecarPath(workDir)), { recursive: true });
+    fs.writeFileSync(
+      sidecarPath(workDir),
+      JSON.stringify({ 'supervisor/CLAUDE.md': 9 }, null, 2) + '\n',
+      'utf-8',
+    );
+
+    supervisor.ensureSupervisorScaffold(workDir, 'windows');
+
+    assert.equal(fs.readFileSync(mdPath, 'utf-8'), SUPERVISOR_AGENT_MD, 'edited CLAUDE.md must be overwritten with current bundled content');
+    const backups = fs.readdirSync(path.dirname(mdPath)).filter((n) => n.startsWith('CLAUDE.md.bak.'));
+    assert.equal(backups.length, 1, `expected exactly one CLAUDE.md .bak.<ts>; got: ${backups.join(', ')}`);
+    assert.equal(
+      fs.readFileSync(path.join(path.dirname(mdPath), backups[0]), 'utf-8'),
+      edited,
+      'backup must hold the locally-edited content verbatim',
+    );
+    assert.equal(readSidecar(workDir)['supervisor/CLAUDE.md'], 11, 'sidecar must record v11');
+  } finally {
+    cleanup();
+    rmrf(workDir);
+  }
+});
+
+// ── Execution-Trail doctrine: supervisor CLAUDE.md v10 → v11 migration ────
+//
+// v11 rewrites the `<!-- section:planning-surface v1 -->` block to teach that the
+// Execution Trail (`sec_exectr`) is system-owned — never dispatch a writer to it or
+// edit it — and to dispatch execution workers to the section they UPDATE
+// (`sec_opitem` for checklist execution) with a mandated turn-end completion
+// writeback (flip `&#9744;`→`&#9745;` natively + emit a PLAN-EVENT sentinel). The
+// section markers are unchanged, so the v9 reconstruction (whole-block removal)
+// still holds; the v10 reconstruction swaps the block back to its original wording.
+// A pristine v10 file must silently upgrade; a locally-edited one must be .bak'd +
+// overwritten.
+
+/** The original (v10) `<!-- section:planning-surface v1 -->` block, verbatim.
+ *  SUPERVISOR_AGENT_MD_V10 swaps the current (v11) block back to this; the
+ *  precondition test pins the reconstruction to SUPERVISOR_AGENT_MD_V10_HASH so any
+ *  drift in the swap fails loudly. */
+const PLANNING_SURFACE_SECTION_V10 = `<!-- section:planning-surface v1 -->
+## Planning surface: minting and gating a plan
+
+A **plan surface** is a workspace HTML planning document (\`plans/*.html\`) with
+anchored sections (\`sec_…\`), a **trusted server-witnessed provenance trail** (what
+each dispatched agent actually read/edited, derived from its tool calls — not from
+what it narrates), and a dashboard render pane. Every plan is minted from a
+pre-baked **6-zone template** — Summary / Open Questions / Research / Decisions /
+Execution Trail / Open Items — so you and your agents **fill sections in; you never
+author the structure**.
+
+The loop:
+
+- **Mint** with \`create_plan\` — returns the plan id and its section anchors.
+- **Dispatch** with \`launch_agent {plan_id, section_anchor}\` (single worker) or
+  \`run_orchestration {plan_id, section_anchor}\` (GroupThink rail). The dispatched
+  agent edits its assigned section **natively in the HTML** — there is no markdown
+  deliverable and no plan-write MCP tool.
+- **Observe** with \`read_plan_projection\` (per-section trusted event roll-up) and
+  \`read_plan_section\` (ladder modes: \`outline\` ≈150 tokens / \`text\` / \`raw\` /
+  \`raw+editWindow\`).
+- **Gate** the returned work as you would any worker turn.
+
+**One-writer policy:** dispatching a second active writer to the same plan is
+**409-rejected**, naming the run that already owns it — sequence writers, don't
+double-book a plan.
+
+**Reading is cheap by design:** prefer \`outline\` mode + section-scoped reads over
+whole-file reads; pull \`raw\` / \`raw+editWindow\` only when you actually need bytes.
+<!-- /section:planning-surface -->`;
+
+/** The v10 supervisor CLAUDE.md, reconstructed by swapping the current (v11)
+ *  planning-surface block back to its original v10 wording. The precondition test
+ *  below pins this to SUPERVISOR_AGENT_MD_V10_HASH. */
+const SUPERVISOR_AGENT_MD_V10 = SUPERVISOR_AGENT_MD.replace(
+  /\n<!-- section:planning-surface v1 -->[\s\S]*?<!-- \/section:planning-surface -->\n/,
+  '\n' + PLANNING_SURFACE_SECTION_V10 + '\n',
+);
+
+test('ET-0. precondition: reconstructed v10 supervisor CLAUDE.md hashes to the shipped constant', () => {
+  assert.notEqual(SUPERVISOR_AGENT_MD_V10, SUPERVISOR_AGENT_MD, 'the v11 planning-surface block must differ from v10');
+  const hash = sha256Hex(SUPERVISOR_AGENT_MD_V10);
+  assert.equal(
+    hash,
+    SUPERVISOR_AGENT_MD_V10_HASH,
+    `Reconstructed v10 hash (${hash}) does not match SUPERVISOR_AGENT_MD_V10_HASH ` +
+    `(${SUPERVISOR_AGENT_MD_V10_HASH}). Old workspaces' pristine v10 CLAUDE.md ` +
+    `would be .bak'd instead of silently upgraded.`,
+  );
+});
+
+test('ET-1. supervisor CLAUDE.md: pristine v10 silently upgrades to v11 carrying the sec_exectr doctrine once', () => {
+  const workDir = mktmp('sup-claudemd-v10');
+  const { supervisor, cleanup } = makeSupervisor();
+  try {
+    const mdPath = path.join(workDir, '.dashboard', 'supervisor', 'CLAUDE.md');
+    fs.mkdirSync(path.dirname(mdPath), { recursive: true });
+    fs.writeFileSync(mdPath, SUPERVISOR_AGENT_MD_V10, 'utf-8');
+    fs.mkdirSync(path.dirname(sidecarPath(workDir)), { recursive: true });
+    fs.writeFileSync(
+      sidecarPath(workDir),
+      JSON.stringify({ 'supervisor/CLAUDE.md': 10 }, null, 2) + '\n',
+      'utf-8',
+    );
+
+    supervisor.ensureSupervisorScaffold(workDir, 'windows');
+
+    const content = fs.readFileSync(mdPath, 'utf-8');
+    assert.equal(content, SUPERVISOR_AGENT_MD, 'v10 supervisor CLAUDE.md must silently upgrade to v11 bundled content');
+    assert.equal(countMatches(content, PLANNING_SURFACE_MARKER), 1, 'planning-surface sentinel appears exactly once (not double-appended)');
+    assert.ok(content.includes('system-owned'), 'upgraded CLAUDE.md must carry the system-owned sec_exectr doctrine');
+    assert.ok(content.includes('NEVER dispatch a writer to `sec_exectr`'), 'upgraded CLAUDE.md must forbid dispatching to sec_exectr');
+    assert.ok(content.includes('`sec_opitem`'), 'upgraded CLAUDE.md must name sec_opitem as the checklist-execution target');
+    assert.ok(content.includes('completion writeback'), 'upgraded CLAUDE.md must mandate the completion writeback');
+    const backups = fs.readdirSync(path.dirname(mdPath)).filter((n) => n.startsWith('CLAUDE.md.bak.'));
+    assert.equal(backups.length, 0, 'known-hash v10→v11 upgrade must NOT create a backup');
+    const sidecar = readSidecar(workDir);
+    assert.equal(sidecar['supervisor/CLAUDE.md'], 11, `sidecar must record v11; got ${JSON.stringify(sidecar)}`);
+  } finally {
+    cleanup();
+    rmrf(workDir);
+  }
+});
+
+test('ET-2. supervisor CLAUDE.md: locally-edited v10 (unknown hash) → .bak + overwrite with v11', () => {
+  const workDir = mktmp('sup-claudemd-v10-edited');
+  const { supervisor, cleanup } = makeSupervisor();
+  try {
+    const mdPath = path.join(workDir, '.dashboard', 'supervisor', 'CLAUDE.md');
+    fs.mkdirSync(path.dirname(mdPath), { recursive: true });
+    const edited = SUPERVISOR_AGENT_MD_V10 + '\n## My local notes\n';
+    fs.writeFileSync(mdPath, edited, 'utf-8');
+    fs.mkdirSync(path.dirname(sidecarPath(workDir)), { recursive: true });
+    fs.writeFileSync(
+      sidecarPath(workDir),
+      JSON.stringify({ 'supervisor/CLAUDE.md': 10 }, null, 2) + '\n',
+      'utf-8',
+    );
+
+    supervisor.ensureSupervisorScaffold(workDir, 'windows');
+
+    assert.equal(fs.readFileSync(mdPath, 'utf-8'), SUPERVISOR_AGENT_MD, 'edited CLAUDE.md must be overwritten with v11 bundled content');
+    const backups = fs.readdirSync(path.dirname(mdPath)).filter((n) => n.startsWith('CLAUDE.md.bak.'));
+    assert.equal(backups.length, 1, `expected exactly one CLAUDE.md .bak.<ts>; got: ${backups.join(', ')}`);
+    assert.equal(
+      fs.readFileSync(path.join(path.dirname(mdPath), backups[0]), 'utf-8'),
+      edited,
+      'backup must hold the locally-edited content verbatim',
+    );
+    assert.equal(readSidecar(workDir)['supervisor/CLAUDE.md'], 11, 'sidecar must record v11');
   } finally {
     cleanup();
     rmrf(workDir);

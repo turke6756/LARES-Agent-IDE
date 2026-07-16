@@ -1,4 +1,5 @@
 import { EventEmitter } from 'events';
+import path from 'path';
 import { ContextStats, FileOperation } from '../../shared/types';
 import { DEFAULT_CONTEXT_WINDOW_TOKENS } from '../../shared/constants';
 import type { UsageEvent, ToolUseEvent, ToolResultEvent } from '../../shared/session-events';
@@ -29,16 +30,28 @@ const TOOL_MAP: Record<string, FileOperation> = {
 export class ContextStatsMonitor extends EventEmitter {
   private stats = new Map<string, ContextStats>();
   private seenUuids = new Map<string, Set<string>>(); // per agentId
-  private seenFiles = new Map<string, Set<string>>(); // per agentId: "op:path" dedup
+  // Fix rec-3: per-agent capture dedupe, TOOL-USE-ID scoped (key
+  // `${toolUseId}\0${op}\0${normalizedPath}`), NOT agent-lifetime `op:path`.
+  // A genuine repeat read/edit in a LATER turn carries a distinct toolUseId and
+  // therefore re-emits (→ persists, subject only to the DB's own 5s same-session
+  // window); only an intra-call duplicate path or a replay of the SAME tool-use
+  // event (same id) is suppressed here.
+  private seenFiles = new Map<string, Set<string>>(); // per agentId
   // Codex shell-command activity is parsed at tool-use time but only emitted
   // once the matching tool-result confirms success. Keyed `${agentId}:${toolUseId}`.
   private pendingShellActivity = new Map<string, ParsedShellActivity[]>();
   private reader: SessionLogReader;
   private started = false;
+  // Fix rec-4: resolves an agent's FROZEN launch workspace root so relative
+  // structured-tool paths are canonicalized to absolute AT CAPTURE TIME (before
+  // addFileActivity), never inferred later from a shared cwd. Optional so tests
+  // (and any non-wired caller) get raw pass-through.
+  private resolveWorkspaceRoot?: (agentId: string) => string | null;
 
-  constructor(reader: SessionLogReader) {
+  constructor(reader: SessionLogReader, resolveWorkspaceRoot?: (agentId: string) => string | null) {
     super();
     this.reader = reader;
+    this.resolveWorkspaceRoot = resolveWorkspaceRoot;
   }
 
   start(): void {
@@ -78,11 +91,11 @@ export class ContextStatsMonitor extends EventEmitter {
    * stats, not a new stats snapshot, and the next legitimate `handleUsage`
    * will fire `'statsChanged'` with real numbers.
    *
-   * Also clears the per-agent `seenFiles` dedupe so a previously-emitted
-   * `(op, path)` will re-emit a `fileActivity` event when the freshly-bound
-   * rollout's tool-use lands — important after `deleteFileActivitiesForAgent`
-   * wipes the DB rows, since otherwise the dedupe set would prevent the
-   * re-insertion of the agent's own (now-correctly-attributed) activity.
+   * Also clears the per-agent `seenFiles` dedupe so a REPLAY of an
+   * already-seen tool-use event (same `toolUseId`) will re-emit a `fileActivity`
+   * — important after `deleteFileActivitiesForAgent` wipes the DB rows, since
+   * otherwise the dedupe set would prevent re-insertion of the agent's own
+   * (now-correctly-attributed) activity.
    */
   invalidateAgent(agentId: string): void {
     this.stats.delete(agentId);
@@ -166,19 +179,40 @@ export class ContextStatsMonitor extends EventEmitter {
     const filePaths = extractStructuredToolPaths(e.input);
     if (filePaths.length === 0) return;
 
-    let seen = this.seenFiles.get(e.agentId);
-    if (!seen) {
-      seen = new Set();
-      this.seenFiles.set(e.agentId, seen);
-    }
     for (const filePath of filePaths) {
-      const key = `${operation}:${filePath}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-
-      this.emit('fileActivity', { agentId: e.agentId, filePath, operation } as JsonlFileActivity);
+      this.captureFileActivity(e.agentId, filePath, operation, e.toolUseId);
     }
   };
+
+  /**
+   * Single capture chokepoint (Fix rec-3 + rec-4): normalize the path against the
+   * agent's frozen workspace root, quarantine impossible (empty) paths, then dedupe
+   * per tool-use id before emitting. Both the structured-tool and shell/apply_patch
+   * paths flow through here so ingress normalization + scoping stay identical.
+   */
+  private captureFileActivity(
+    agentId: string,
+    rawPath: string,
+    operation: FileOperation,
+    toolUseId: string,
+  ): void {
+    const root = this.resolveWorkspaceRoot ? this.resolveWorkspaceRoot(agentId) : null;
+    const filePath = normalizeCapturedPath(rawPath, root);
+    if (!filePath) return; // impossible / empty path — quarantined, never persisted
+
+    let seen = this.seenFiles.get(agentId);
+    if (!seen) {
+      seen = new Set();
+      this.seenFiles.set(agentId, seen);
+    }
+    // JSON tuple key: toolUseId / op / path are opaque and may contain a colon
+    // — a stringified array is unambiguous where a plain join is not.
+    const key = JSON.stringify([toolUseId, operation, filePath]);
+    if (seen.has(key)) return;
+    seen.add(key);
+
+    this.emit('fileActivity', { agentId, filePath, operation } as JsonlFileActivity);
+  }
 
   private handleToolResult = (e: ToolResultEvent): void => {
     const key = `${e.agentId}:${e.toolUseId}`;
@@ -189,18 +223,46 @@ export class ContextStatsMonitor extends EventEmitter {
     if (e.isError) return;
     if (!shellResultIndicatesSuccess(e.content)) return;
 
-    let seen = this.seenFiles.get(e.agentId);
-    if (!seen) {
-      seen = new Set();
-      this.seenFiles.set(e.agentId, seen);
-    }
     for (const a of pending) {
-      const dedupKey = `${a.operation}:${a.filePath}`;
-      if (seen.has(dedupKey)) continue;
-      seen.add(dedupKey);
-      this.emit('fileActivity', { agentId: e.agentId, filePath: a.filePath, operation: a.operation } as JsonlFileActivity);
+      this.captureFileActivity(e.agentId, a.filePath, a.operation, e.toolUseId);
     }
   };
+}
+
+/**
+ * Fix rec-4: canonicalize a captured transcript path AT INGRESS.
+ *
+ * - Absolute paths (Windows drive, UNC, POSIX/WSL) pass through verbatim; the
+ *   downstream relativizer (`repo-activity.toRel`) handles separators + case.
+ * - Relative paths are resolved against the agent's FROZEN launch workspace root
+ *   so `plans/example.html` / `.dashboard/state.json` become absolute and are
+ *   correctly hit by the plan-file and `.dashboard/**` exclusions instead of
+ *   being misclassified as outside-workspace evidence.
+ * - Empty / whitespace-only ("impossible") paths are rejected → `null` (caller
+ *   drops them; nothing is persisted).
+ * - With no known root a relative path can't be safely resolved, so it is kept
+ *   verbatim (best-effort) — `repo-activity`'s defensive relative-path exclusion
+ *   still catches the plan/`.dashboard` cases for such legacy/unresolved rows.
+ */
+export function normalizeCapturedPath(rawPath: string, workspaceRoot: string | null): string | null {
+  const raw = rawPath.trim();
+  if (!raw) return null;
+
+  const isAbsolute =
+    path.isAbsolute(raw) ||
+    /^[a-zA-Z]:[\\/]/.test(raw) || // Windows drive
+    raw.startsWith('/') ||          // POSIX / WSL
+    raw.startsWith('\\\\');        // UNC
+  if (isAbsolute) return raw;
+
+  if (!workspaceRoot) return raw;
+
+  const rel = raw.replace(/^\.[\\/]/, ''); // strip a leading './' or '.\'
+  // WSL/POSIX root → forward-slash join (host path.resolve would inject '\').
+  if (workspaceRoot.startsWith('/')) {
+    return workspaceRoot.replace(/\/+$/, '') + '/' + rel.replace(/\\/g, '/');
+  }
+  return path.resolve(workspaceRoot, rel);
 }
 
 function extractStructuredToolPaths(input: unknown): string[] {

@@ -193,6 +193,24 @@ describe('baseline / dirty / splice flow', () => {
     await mounted.unmount();
   });
 
+  it('flushes a dirty draft on unmount before the debounced listener fires', async () => {
+    const mounted = await mountEditor(
+      <MilkdownEditor tabId="leave-fast" filePath="C:\\ws\\doc.md" content={ORIGINAL} />,
+    );
+    const view = getCanvasEditorHandle('leave-fast')!.getEditorView!()!;
+
+    const pos = findTextPos(view, 'Second paragraph');
+    act(() => {
+      view.dispatch(view.state.tr.insertText('LEAVING ', pos));
+    });
+
+    // No debounce wait: leaving the Files view unmounts the editor immediately.
+    expect(drafts()).toHaveLength(0);
+    await mounted.unmount();
+
+    expect(lastDraft()).toContain('LEAVING Second paragraph to edit.');
+  });
+
   it('Ctrl+S flushes the splice ahead of the debounce, saves, and rebaselines', async () => {
     const mounted = await mountEditor(
       <MilkdownEditor tabId="t2" filePath="C:\\ws\\doc.md" content={ORIGINAL} />,

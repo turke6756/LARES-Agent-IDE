@@ -312,18 +312,30 @@ export default function DetailPanel({ width }: DetailPanelProps) {
       </div>
 
       {/* Controls */}
-      <div className="panel-header flex items-stretch gap-2 p-3">
+      <div className="panel-header flex items-stretch gap-1 p-2">
         <button
           onClick={toggleStaging}
-          className={`ui-btn ui-btn-primary flex-1 px-3 py-2 text-[13px] font-bold ${stagingOpen ? 'is-active' : ''}`}
+          className={`ui-btn ui-btn-primary min-w-0 flex-[1.35] px-2 py-2 text-[12px] font-bold ${stagingOpen ? 'is-active' : ''}`}
           aria-pressed={stagingOpen}
         >
           Prompt Staging
         </button>
         <button
+          onClick={() => window.api.agents.restart(agent.id)}
+          className="ui-btn ui-btn-ghost px-2 py-2 text-[12px] font-bold text-accent-yellow"
+        >
+          Restart
+        </button>
+        <button
+          onClick={() => window.api.agents.stop(agent.id)}
+          className="ui-btn ui-btn-ghost px-2 py-2 text-[12px] font-bold text-accent-red"
+        >
+          Stop
+        </button>
+        <button
           onClick={() => setWatchGlass((v) => !v)}
           aria-pressed={watchGlass}
-          className={`ui-btn flex-1 px-3 py-2 text-[13px] font-bold ${
+          className={`ui-btn min-w-0 flex-1 px-2 py-2 text-[12px] font-bold ${
             watchGlass ? 'bg-accent-blue/20 text-accent-blue' : 'ui-btn-ghost text-accent-blue/80'
           }`}
         >
@@ -335,7 +347,7 @@ export default function DetailPanel({ width }: DetailPanelProps) {
             aria-label="More agent actions"
             aria-haspopup="menu"
             aria-expanded={showOverflow}
-            className="ui-btn ui-btn-ghost px-3 py-2 text-[15px] font-bold leading-none"
+            className="ui-btn ui-btn-ghost px-2 py-2 text-[15px] font-bold leading-none"
           >
             &#x22EF;
           </button>
@@ -366,26 +378,6 @@ export default function DetailPanel({ width }: DetailPanelProps) {
                 className="w-full text-left px-3 py-1.5 text-[13px] text-accent-purple disabled:opacity-40 disabled:cursor-not-allowed hover:bg-surface-2"
               >
                 Query Agent
-              </button>
-              <button
-                role="menuitem"
-                onClick={() => {
-                  setShowOverflow(false);
-                  window.api.agents.restart(agent.id);
-                }}
-                className="w-full text-left px-3 py-1.5 text-[13px] text-accent-yellow hover:bg-surface-2"
-              >
-                Restart
-              </button>
-              <button
-                role="menuitem"
-                onClick={() => {
-                  setShowOverflow(false);
-                  window.api.agents.stop(agent.id);
-                }}
-                className="w-full text-left px-3 py-1.5 text-[13px] text-accent-red hover:bg-surface-2"
-              >
-                Stop
               </button>
             </div>
           )}

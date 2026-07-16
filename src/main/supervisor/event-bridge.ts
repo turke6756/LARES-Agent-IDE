@@ -1,5 +1,6 @@
 import type { Agent, AgentStatus, ContextStats, FileActivity } from '../../shared/types';
-import type { ChatEventBatch } from '../../shared/session-events';
+import { hasSupervisorPrivilege } from '../../shared/types';
+import type { ChatEventBatch, ToolUseEvent } from '../../shared/session-events';
 import type { StatusChangedEvent } from './status-events';
 import type { ForceWorkingOpts, WaitingKind } from './status-monitor';
 import {
@@ -55,6 +56,17 @@ export interface EventBridgeDeps {
    *  Returns undefined when the agent has never received a user-PTY write.
    *  Used to defer event auto-submit while the user is actively typing. */
   getLastUserPtyWriteAt(agentId: string): number | undefined;
+  /** BUG-41: true while a continuation swap is mid-flight for this agent id
+   *  (from `continuationRelaunch` entry until the launch tail's `finally`,
+   *  success AND failure). During that window the recipient's status walks
+   *  `working → done → restarting → launching`; the sub-second `done` window
+   *  between `stopAgent` and the `restarting` flip would otherwise DROP (and a
+   *  drain firing then would PURGE) events keyed to that recipient. The bridge
+   *  treats a `done` recipient as a queue-status — never a drop/purge — only
+   *  while this holds; a genuinely-stopped `done` (predicate false) still
+   *  purges, and because the predicate always clears in the launch tail's
+   *  finally, the drain re-arm loop always terminates. */
+  isContinuationSwapInFlight(agentId: string): boolean;
   /** BUG-20: fetch the agent's most recent clean assistant chat message
    *  (typically wrapping `AgentChatService.getMessages`). Returning
    *  `undefined` (or throwing — the caller swallows errors) makes the bridge
@@ -64,6 +76,18 @@ export interface EventBridgeDeps {
    *  wrapper over `getFileActivities(agentId)`. Returning an empty array (or
    *  throwing) makes the bridge omit the "Files touched:" section. */
   getFileActivities(agentId: string): FileActivity[];
+  /** WP2 provenance spine — transcript-side breadcrumb capture. When present,
+   *  `case 'tool-use':` forwards the event so plan read/edit-target touches are
+   *  persisted as trusted turn evidence. Optional: absent → the bridge runs
+   *  exactly as before (planning-surface code stays independently shippable). */
+  planTouchTracker?: PlanTouchTrackerCollaborator;
+}
+
+/** The one method the bridge needs from the tracker; injected so tests can stub
+ *  it and so the tracker's DB deps stay out of the bridge. Tolerant by contract
+ *  (never throws), so the bridge does not guard the call. */
+export interface PlanTouchTrackerCollaborator {
+  observeToolUse(agentId: string, event: ToolUseEvent): void;
 }
 
 // P2-03: 'waiting' is a trigger status so the supervisor gets a notification
@@ -172,7 +196,13 @@ export class EventBridge {
   private recipientsFor(agent: Agent, event: SupervisorEvent): Array<{ recipient: Agent; viaSubscription: boolean }> {
     const out: Array<{ recipient: Agent; viaSubscription: boolean }> = [];
     const owner = agent.isSupervisor ? null : this.ownerRecipientComponent(agent);
-    if (owner && !['done', 'crashed'].includes(owner.status)) {
+    // A terminal owner is normally dropped here (genuinely dead → no delivery).
+    // BUG-41 exception: a 'done' owner whose continuation swap is mid-flight is
+    // NOT dead — its PTY is being replaced under the same id. Admit it so
+    // deliver()'s 'done'+swap branch can QUEUE the event (it would otherwise be
+    // dropped before deliver() is ever reached). 'crashed' is still terminal.
+    if (owner && (!['done', 'crashed'].includes(owner.status)
+        || (owner.status === 'done' && this.deps.isContinuationSwapInFlight(owner.id)))) {
       out.push({ recipient: owner, viaSubscription: false });
     }
     if (this.eventIsSubscriberEligible(event)) {
@@ -204,7 +234,7 @@ export class EventBridge {
       return { registered: false, reason: 'subscriber-not-live' };
     }
     // Privilege gate — structurally forecloses "worker subscribes to the fleet".
-    if (!(subscriber.isSupervisor === true || subscriber.privilegeLane === 'supervisor')) {
+    if (!hasSupervisorPrivilege(subscriber)) {
       return { registered: false, reason: 'not-privileged' };
     }
     // Owner dedup: a subscriber that is already the target's resolved recipient
@@ -516,6 +546,12 @@ export class EventBridge {
             });
             break;
           case 'tool-use':
+            // WP2 provenance spine (R2 §2.3) — capture read=intent + native
+            // edit-target breadcrumbs BEFORE the status latch. The transcript
+            // carries the tool name + args for both providers; native Edit never
+            // hits the MCP handler, so this is the ONLY capture path for edit
+            // targets. Tolerant by contract (never throws), so no guard here.
+            this.deps.planTouchTracker?.observeToolUse(agentId, event as ToolUseEvent);
             // BUG-18 Change 3 — mark the turn as in-flight; the latch keeps
             // tool-pending TTL even after this tool resolves until either
             // (a) the next refresh stores a longer ttlClass, or (b)
@@ -726,10 +762,26 @@ export class EventBridge {
     const fresh = this.deps.getAgent(supervisor.id);
     if (!fresh) return;
 
-    if (fresh.status === 'working' || fresh.status === 'launching') {
+    // BUG-41: 'restarting' is the continuation-swap PTY-replacement window —
+    // busy, not terminal. Queue + drain exactly like working/launching so the
+    // batch survives to the fresh session; NEVER drop it into the line-below
+    // drop, and never flush into the not-yet-spawned PTY.
+    if (fresh.status === 'working' || fresh.status === 'launching' || fresh.status === 'restarting') {
       this.queueEvent(supervisor.id, event);
       this.armDrain(supervisor.id);
-      console.log(`[event-bridge] Queued event (supervisor busy): ${event.type} for "${event.agentTitle}"`);
+      console.log(`[event-bridge] Queued event (supervisor ${fresh.status}): ${event.type} for "${event.agentTitle}"`);
+      return;
+    }
+
+    // BUG-41: the sub-second 'done' window mid-continuation-swap, between
+    // `stopAgent` and the 'restarting' status flip. Only when a swap is in
+    // flight for THIS recipient do we treat 'done' as a queue-status — the PTY
+    // is about to be replaced under the same id, so the event must survive. A
+    // genuinely-stopped 'done' (no swap in flight) falls through to the drop.
+    if (fresh.status === 'done' && this.deps.isContinuationSwapInFlight(fresh.id)) {
+      this.queueEvent(supervisor.id, event);
+      this.armDrain(supervisor.id);
+      console.log(`[event-bridge] Queued event (recipient done, continuation swap in flight): ${event.type} for "${event.agentTitle}"`);
       return;
     }
 
@@ -784,6 +836,18 @@ export class EventBridge {
     this.queuedEventsByRecipient.set(recipientId, q);
   }
 
+  /** BUG-41: re-queue a batch that failed to send at the FRONT of the
+   *  recipient's queue — ahead of anything that arrived during the send await —
+   *  preserving order and respecting SUPERVISOR_EVENT_QUEUE_MAX (drop oldest on
+   *  overflow, the same policy as `queueEvent`). Used by `drain()` so a
+   *  throwing/no-op `sendInput` never silently loses the batch. */
+  private requeueFront(recipientId: string, events: SupervisorEvent[]): void {
+    const q = this.queuedEventsByRecipient.get(recipientId) ?? [];
+    const merged = [...events, ...q];
+    while (merged.length > SUPERVISOR_EVENT_QUEUE_MAX) merged.shift();
+    this.queuedEventsByRecipient.set(recipientId, merged);
+  }
+
   private armDrain(recipientId: string): void {
     if (this.drainHandlesByRecipient.has(recipientId)) return;
     const handle = this.deps.scheduleDrain(
@@ -800,11 +864,26 @@ export class EventBridge {
 
     const supervisor = this.deps.getAgent(recipientId);
     if (!supervisor || ['done', 'crashed'].includes(supervisor.status)) {
+      // BUG-41: a 'done' recipient mid-continuation-swap is NOT terminal — the
+      // PTY is about to be replaced under the same id. Re-arm and KEEP the
+      // queue so it drains to the fresh session; do NOT purge. A genuinely-
+      // stopped 'done' (no swap in flight), a 'crashed', or a missing agent
+      // still purges as before. The launch tail clears the predicate in its
+      // finally (success AND failure), so this re-arm loop always terminates.
+      if (supervisor && supervisor.status === 'done'
+          && this.deps.isContinuationSwapInFlight(recipientId)) {
+        this.armDrain(recipientId);
+        return;
+      }
       this.queuedEventsByRecipient.delete(recipientId);
       return;
     }
 
-    if (supervisor.status === 'working' || supervisor.status === 'launching') {
+    // BUG-41: 'restarting' is the continuation-swap PTY-replacement window —
+    // busy, not terminal. Re-arm and keep the queue (never flush into a
+    // possibly-absent PTY, never purge). Mirrors deliver()'s restarting branch.
+    if (supervisor.status === 'working' || supervisor.status === 'launching'
+        || supervisor.status === 'restarting') {
       this.armDrain(recipientId);
       return;
     }
@@ -819,10 +898,22 @@ export class EventBridge {
 
     const events = this.queuedEventsByRecipient.get(recipientId) ?? [];
     if (events.length === 0) return;
-    this.queuedEventsByRecipient.delete(recipientId);
 
+    // BUG-41: delete-AFTER-send. Remove the batch, attempt the send, and on
+    // throw re-queue it at the FRONT (ahead of anything that arrived during the
+    // await) capped at SUPERVISOR_EVENT_QUEUE_MAX, then re-arm. Net effect:
+    // events leave the queue only once `sendInput` resolves successfully, so a
+    // write that no-ops/throws into an absent PTY never loses the batch.
+    this.queuedEventsByRecipient.delete(recipientId);
     const payload = buildConsolidatedPayload(events);
-    await this.deps.sendInput(supervisor.id, payload);
+    try {
+      await this.deps.sendInput(supervisor.id, payload);
+    } catch (err) {
+      this.requeueFront(recipientId, events);
+      this.armDrain(recipientId);
+      console.error(`[event-bridge] drain sendInput failed for ${recipientId}; re-queued ${events.length} event(s):`, err);
+      return;
+    }
     this.deps.addAuditEvent(
       supervisor.id,
       'supervisor_event_batch',

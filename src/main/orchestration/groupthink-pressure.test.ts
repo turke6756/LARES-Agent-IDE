@@ -219,6 +219,7 @@ function makeFake(cfg: FakeConfig = {}): { client: DashboardClient; state: FakeS
     },
     isInputInFlight: (id) => (cfg.inFlight ? cfg.inFlight(id) : false),
     stopAgent: async () => {},
+    sectionChangedSince: () => false,   // WP6: pressure harness runs legacy fresh-file path
   };
 
   return { client, state };

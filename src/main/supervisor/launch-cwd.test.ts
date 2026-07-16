@@ -44,7 +44,8 @@ function patchDb(workspacePath: string, createdAgents: Agent[]): () => void {
     'getAgent', 'addEvent', 'updateAgentLastOutput', 'updateAgentExitCode',
     'getActiveAgents', 'getAllAgents', 'getSupervisorAgent',
     'addFileActivity', 'updateAgentResumeSessionId', 'getTeamMembership',
-    'getAgentTemplate', 'getFileActivities',
+    'getAgentTemplate', 'getFileActivities', 'insertAgentSession',
+    'getCurrentBrick', 'getContinuationAttempt',
   ];
   const orig: Record<string, unknown> = {};
   for (const k of keys) orig[k] = db[k];
@@ -73,6 +74,14 @@ function patchDb(workspacePath: string, createdAgents: Agent[]): () => void {
   db.getTeamMembership = () => null;
   db.getAgentTemplate = () => null;
   db.getFileActivities = () => [];
+  // The claude fresh-launch path (index.ts, added in c758edc) records a gen-0
+  // agent_sessions row, then buildContinuationBrickBlock reads the continuation
+  // brick tables. Without initDatabase() these real fns dereference the undefined
+  // module-level db handle; stub them like every other launch write. Returning a
+  // null brick makes the builder no-op (correct for a fresh, non-continuation launch).
+  db.insertAgentSession = () => {};
+  db.getCurrentBrick = () => null;
+  db.getContinuationAttempt = () => null;
 
   return () => {
     for (const k of keys) db[k] = orig[k];

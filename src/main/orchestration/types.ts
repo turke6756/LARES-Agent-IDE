@@ -26,6 +26,14 @@ export interface RunOrchestrationRequest {
   mode?: OrchestrationMode;          // default 'serial'
   topic?: string;
   planPath?: string;                 // resolved against workspace root
+  // WP6 planning-surface rail: when set, the run edits an EXISTING plan surface
+  // (created via create_plan) at `sectionAnchor` rather than writing a fresh
+  // plan file. planId references a `plans` row; sectionAnchor is the `sec_`
+  // writeback target. Both are stamped onto every launched member's env
+  // (AGENT_DASHBOARD_PLAN_ID / _PLAN_SECTION) via the WP1 launch rail, and drive
+  // one-writer-per-plan enforcement (§D-WRITE-POLICY) + section-change done-detection.
+  planId?: string;
+  sectionAnchor?: string;
   leadProvider?: string;             // default 'claude'
   reviewerProvider?: string;         // default 'codex'
   turnTimeoutMs?: number;            // default 600000
@@ -66,6 +74,9 @@ export interface OrchestrationRun {
   supervisorId: string;
   topic: string;
   planPath: string;                  // absolute
+  // WP6 planning-surface rail (frozen at dispatch). See RunOrchestrationRequest.
+  planId?: string;
+  sectionAnchor?: string;
   leadProvider: string;
   reviewerProvider: string;
   turnTimeoutMs: number;
@@ -131,6 +142,15 @@ export interface DashboardClient {
   // stays browsable). We name the seam `stopAgent` to match that semantics — not
   // `deleteAgent`, which fully purges the row.
   stopAgent(id: string): Promise<void>;
+  /** WP6 done-detection for planning-surface runs. Returns true once the target
+   *  section's byte-exact content hash has moved since `sinceIso` — i.e. a
+   *  `plan_section_changes` row exists for (planId, sectionAnchor) in
+   *  [sinceIso, now]. The relay loop uses this INSTEAD of existsSync(planPath)
+   *  when the run carries a plan rail, because the plan file already exists (the
+   *  surface was created up front by create_plan) — the deliverable is a native
+   *  Edit of one section, not a fresh file appearing. Backed by
+   *  database.getTurnSectionChanges (WP4). */
+  sectionChangedSince(planId: string, sectionAnchor: string, sinceIso: string): boolean;
 }
 
 /** Per-run hooks the runner calls to persist progress + emit events. */

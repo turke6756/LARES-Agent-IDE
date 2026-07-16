@@ -22,8 +22,12 @@ export default function FileViewerHeader({ tabId, filePath, pathType, fileSize, 
   const language = fileType === 'code' ? detectLanguage(filePath) : fileType;
   const editable = isEditableFileType(filePath);
   const isMarkdown = fileType === 'markdown';
+  const isDocx = fileType === 'docx';
   const [switchingMode, setSwitchingMode] = useState(false);
+  const [convertingDocx, setConvertingDocx] = useState(false);
   const editState = useDashboardStore((state) => state.tabEditState[tabId]);
+  const openTab = useDashboardStore((state) => state.openTab);
+  const selectedWorkspaceId = useDashboardStore((state) => state.selectedWorkspaceId);
   const enterSourceMode = useDashboardStore((state) => state.enterSourceMode);
   const enterWysiwygMode = useDashboardStore((state) => state.enterWysiwygMode);
   const enterViewMode = useDashboardStore((state) => state.enterViewMode);
@@ -109,6 +113,22 @@ export default function FileViewerHeader({ tabId, filePath, pathType, fileSize, 
 
   const handleSave = () => {
     void saveTab(tabId);
+  };
+
+  const handleEditDocxAsMarkdown = async () => {
+    if (!workingDirectory || convertingDocx) return;
+    setConvertingDocx(true);
+    try {
+      const result = await window.api.files.convertDocxToMarkdown(filePath, workingDirectory, pathType);
+      if (!result.ok || !result.path) {
+        window.alert(result.ok ? 'Converted Markdown path was not returned.' : result.error);
+        return;
+      }
+      openTab(result.path, workingDirectory, pathType, undefined, selectedWorkspaceId ?? undefined);
+    } finally {
+      if (pathType === 'wsl') void checkHealth();
+      setConvertingDocx(false);
+    }
   };
 
   // Build breadcrumb paths. The absolute prefix up to the workspace folder is
@@ -238,6 +258,18 @@ export default function FileViewerHeader({ tabId, filePath, pathType, fileSize, 
           >
             {saving ? <Icons.Loader2 className="w-3 h-3 animate-spin" /> : <Icons.Save className="w-3 h-3" />}
             Save
+          </button>
+        )}
+
+        {isDocx && (
+          <button
+            onClick={() => { void handleEditDocxAsMarkdown(); }}
+            disabled={convertingDocx}
+            className="ui-btn text-[13px]"
+            title="Create a Markdown copy next to this Word document and open it for editing"
+          >
+            {convertingDocx ? <Icons.Loader2 className="w-3 h-3 animate-spin" /> : <Icons.PenLine className="w-3 h-3" />}
+            Edit as Markdown
           </button>
         )}
 

@@ -1,10 +1,12 @@
 import type { SessionEvent, ChatEventBatch } from './session-events';
+import type { PdfSelectionAnchorV1, SelectionAnchorType } from './pdf-annotations';
 import type {
   AccessHandoffResult,
   AccessRequest,
   AccessRequestDecision,
   AccessRule,
   AccessRuleInput,
+  AccessSiteStatus,
   AgentActionsCommand,
   AgentActionsState,
   AgentDrivingRevoked,
@@ -39,6 +41,13 @@ export type AgentProvider = 'claude' | 'gemini' | 'codex';
 // roleLaneOf() in src/main/supervisor/index.ts for the flag→lane mapping.
 export type AgentRoleLane = 'legacy' | 'supervisor' | 'worker' | 'researcher';
 
+// Behavior-grounded optimizer confidence ladder (behavior-grounded-optimizer-design.md
+// §6/§7.1). Ordered best→worst: `observed-safe` is the flagship "clean lane-level
+// dead signal" tier, minted ONLY by attribution.ts (occurrence-classifier's local
+// 3-tier ConfidenceTier lifts into this via evidence). The final proposal tier is
+// `min(evidenceTier, attributionTier)` on this ladder — see attribution.ts.
+export type BehaviorEvidenceTier = 'observed-safe' | 'observed' | 'inferred' | 'heuristic';
+
 // ── Team types ──────────────────────────────────────────────────────────
 export type TeamStatus = 'active' | 'paused' | 'disbanded';
 export type TeamTemplate = 'mesh' | 'pipeline' | 'custom';
@@ -70,6 +79,39 @@ export interface Workspace {
   createdAt: string;
   updatedAt: string;
   lastOpenedAt: string | null;
+}
+
+// ── B2: Plans data layer ──
+export type PlanFormat = 'html' | 'md' | string;
+
+export interface Plan {
+  id: string;            // stable uuid; never slug/path-derived (D-01)
+  workspaceId: string;
+  path: string;          // mutable; relative to workspace root, e.g. "plans/auth.html"
+  slug: string | null;   // mutable display/lookup alias; never the PK
+  format: PlanFormat;
+  runState: string | null;   // nullable; populated later by the planning surface
+  mtimeMs: number;
+  sizeBytes: number;
+  createdAt: string;
+  updatedAt: string;
+  deletedAt: string | null;  // soft-delete marker (D-05)
+}
+
+/** A plan row plus a cheap gallery snippet. Returned by `plans.list` for the
+ *  card gallery: the snippet is the summary-zone prose (~160 chars), null when
+ *  unavailable or for non-`html` (markdown-adopted) rows. */
+export interface PlanListItem extends Plan {
+  snippet: string | null;
+}
+
+export interface SupervisorFocus {
+  supervisorId: string;
+  planId: string;
+  focusedAt: string;
+  lastAttendedAt: string;
+  notes: string | null;
+  plan?: Plan;           // joined projection on GET (includes deletedAt for "[deleted]" UI)
 }
 
 export interface Agent {
@@ -139,6 +181,12 @@ export interface Agent {
    *  continuation-relaunch transaction; crash restarts use restartCount.
    *  Optional so partial Agent fixtures stay valid; absent ⇒ 0. */
   continuationGeneration?: number;
+  /** Per-agent continuation toggle (Edward 2026-07-05). true (default) = the
+   *  continuation watcher may open a handoff attempt for this agent; false = the
+   *  watcher's `continuation-disabled` blocker holds it back. Optional so partial
+   *  Agent fixtures stay valid; absent ⇒ enabled. Serialized into every agent
+   *  payload reaching the renderer via rowToAgent. */
+  continuationEnabled?: boolean;
   lastExitCode: number | null;
   pid: number | null;
   logPath: string | null;
@@ -160,6 +208,24 @@ export interface Agent {
   // events are SUPPRESSED at the EventBridge choke point. The terminal-owner
   // structural backstop is NOT muted — see EventBridge.recipientFor.
   notifyOwner?: boolean;
+  // Planning surface WP1: frozen-at-launch plan rail. planId references an
+  // existing plans row; planSection is the target section anchor the launcher
+  // bound this agent to. NULL for unbound launches. Injected into the agent env
+  // (AGENT_DASHBOARD_PLAN_ID / _PLAN_SECTION) at both the extraEnv and WSL sites.
+  planId?: string | null;
+  planSection?: string | null;
+}
+
+/** Supervisor-privilege predicate — the single source of truth for "this agent
+ *  gets supervisor-tier treatment" across the continuation pipeline, the
+ *  X-Supervisor-Id identity rail, and the renderer controls. An agent qualifies
+ *  when it is the structural workspace supervisor (`isSupervisor`) OR a custom
+ *  persona launched on the 'supervisor' PRIVILEGE lane (#19 — `isSupervisor`
+ *  stays false so it renders as its own card, but roleLaneOf still grants it the
+ *  supervisor MCP toolset). Kept as one shared function so the predicate cannot
+ *  drift between the ~half-dozen gate sites that must agree on it. */
+export function hasSupervisorPrivilege(a: { isSupervisor?: boolean; privilegeLane?: 'supervisor' }): boolean {
+  return a.isSupervisor === true || a.privilegeLane === 'supervisor';
 }
 
 export interface AgentEvent {
@@ -298,6 +364,14 @@ export interface LaunchAgentInput {
   // fact. Used by team resurrect.
   teamId?: string;
   teamRole?: string;
+  // Planning surface WP1 (planning-surface-master-implementation.md §3): optional
+  // launch rail binding this agent to a plan surface and a specific section anchor.
+  // Frozen at launch onto the agent row (agents.plan_id / agents.plan_section) and
+  // injected into the agent env (AGENT_DASHBOARD_PLAN_ID / _PLAN_SECTION) at BOTH
+  // the extraEnv and WSL wslEnvPrefix sites. planId must reference an existing
+  // plans row — the launch route rejects an unknown plan_id with 400.
+  planId?: string;
+  planSection?: string;
 }
 
 /** A declarable persona lane — every value of AgentRoleLane except 'legacy'
@@ -383,12 +457,16 @@ export interface DirectoryEntry {
   /** Creation time, ms since epoch. On WSL this is status-change time —
    *  find(1) has no birth-time printf — which matches creation for new files. */
   birthtimeMs?: number;
+  /** Device id + inode — stable file identity across a same-volume rename
+   *  (B2 D1: rename correlation). Undefined when unavailable. */
+  dev?: number;
+  ino?: number;
 }
 
 export type FsEvent =
-  | { type: 'add'; path: string; parentDir: string; isDirectory: boolean; size: number }
+  | { type: 'add'; path: string; parentDir: string; isDirectory: boolean; size: number; mtimeMs?: number; dev?: number; ino?: number }
   | { type: 'unlink'; path: string; parentDir: string }
-  | { type: 'change'; path: string; parentDir: string };
+  | { type: 'change'; path: string; parentDir: string; mtimeMs?: number; dev?: number; ino?: number };
 
 export interface FileContent {
   path: string;
@@ -396,6 +474,8 @@ export interface FileContent {
   encoding: string;
   size: number;
   error?: string;
+  contentKind?: 'text' | 'html';
+  warnings?: string[];
 }
 
 export type FileMutationResult =
@@ -434,8 +514,13 @@ export interface FileTab {
   agentId?: string;
   workspaceId?: string;    // scopes the tab to a workspace; unset for legacy/orphan tabs
   label: string;           // display name (filename or dirname/)
-  kind?: 'file' | 'directory' | 'tool';  // default 'file' when undefined
+  kind?: 'file' | 'directory' | 'tool' | 'plan';  // default 'file' when undefined
   toolId?: string;         // set when kind==='tool' (e.g. 'context-overhead')
+  planId?: string;         // set when kind==='plan' — the plan surface this tab renders
+  // Per-tab tool params (base plan §3.5). Part of the tool-tab dedup key, so a
+  // per-agent tool (e.g. agent-knowledge-graph with { agentId }) opens one tab
+  // per distinct params instead of collapsing into a single shared tab.
+  params?: Record<string, string>;
 }
 
 /**
@@ -491,6 +576,40 @@ export const TAB_CHANNELS = {
   closeReply: 'tab-sync:close-reply',       // detached renderer → main (invoke, returns decision)
 } as const;
 
+// ── Detachable (tear-off) top-level VIEWS ───────────────────────────────
+// A sibling of the file-tab tear-off (above): the whole center VIEW (the
+// Dashboard grid, etc.) is dragged out of the shell header into its own OS
+// window. Unlike a file tab there is nothing to save, so there is NO
+// dirty-on-close protocol — the window closes immediately and main fires
+// VIEW_CHANNELS.closed so the shell un-hollows the button and re-activates the
+// view. Ownership is keyed by the view id ('view:dashboard') so at most one
+// window exists per view; a duplicate detach focuses the existing one.
+//
+// v1 ships Dashboard only. `files`/`browser`/`plans` are reserved in the union
+// so the registry/IPC/type surface is forward-compatible, but their buttons are
+// left non-draggable (see MainContent.tsx and the patch summary for why).
+export type DetachableView = 'dashboard' | 'files' | 'browser' | 'plans';
+
+export interface ViewDetachRequest {
+  view: DetachableView;
+  workspaceId: string;   // the view pins to the workspace it was detached from (v1)
+  label: string;         // window title (workspace title, for context)
+  x: number;             // screen coords (cursor at release)
+  y: number;
+}
+
+// main→shell when a detached view window closes, so the shell un-hollows the
+// button and makes the view activatable again.
+export interface ViewDetachedClosedPayload {
+  view: DetachableView;
+  workspaceId: string;
+}
+
+export const VIEW_CHANNELS = {
+  detach: 'view:detach',   // shell → main (invoke, returns DetachResult)
+  closed: 'view:closed',   // main → shell when the detached view window closes
+} as const;
+
 // ── Selection comments (WP-P5) ──────────────────────────────────────────
 // plans/selection-to-agent-primitive-plan.md §5 (schema) / §7 WP-P5-A.
 // Persisted file-target comments; chat/note targets keep the discriminator
@@ -519,6 +638,12 @@ export interface SelectionComment {
   targetType: SelectionCommentTargetType;
   /** 'comment' (default) or 'highlight'. */
   kind: SelectionCommentKind;
+  /** 'text' (markdown/plaintext, the default for every legacy row) or 'pdf'
+   *  (page/coordinate anchor carried in `pdfAnchor`). See plan Part 1.3/1.5. */
+  anchorType: SelectionAnchorType;
+  /** Durable PDF anchor; null for text comments and for malformed stored JSON
+   *  (parsed defensively in `rowToSelectionComment`). */
+  pdfAnchor: PdfSelectionAnchorV1 | null;
   // File target columns (the only implemented target). Null for hypothetical
   // future chat/note rows.
   filePath: string | null;
@@ -561,6 +686,10 @@ export interface CreateSelectionCommentInput {
   suffix?: string;
   quotedText: string;
   body: string;
+  /** Defaults to 'text' so every existing markdown caller is unchanged. Pass
+   *  'pdf' with a `pdfAnchor` to persist a PDF page/coordinate anchor. */
+  anchorType?: SelectionAnchorType;
+  pdfAnchor?: PdfSelectionAnchorV1 | null;
 }
 
 export interface UpdateSelectionCommentInput {
@@ -575,6 +704,10 @@ export interface UpdateSelectionCommentInput {
   lineEnd?: number | null;
   prefix?: string | null;
   suffix?: string | null;
+  /** Repoint a comment at a new PDF anchor (reattach ladder writes these). Pass
+   *  'text'/null to clear a PDF anchor; omit to leave the anchor untouched. */
+  anchorType?: SelectionAnchorType;
+  pdfAnchor?: PdfSelectionAnchorV1 | null;
 }
 
 export type SelectionCommentSendTarget =
@@ -784,6 +917,124 @@ export interface UsageLimitsReading {
   seven_day?: UsageWindowReading | null;
 }
 
+/** WP5 render-refresh nudge broadcast after each WP4 reparse of a plan file.
+ *  The renderer re-fetches `/api/plans/:id/projection` and full-re-renders.
+ *  `parseError`/`degradedFrom` mirror the reparse outcome so the surface can
+ *  show the F-E degradation banner without a second round-trip. */
+export interface PlanSurfaceChangedEvent {
+  planId: string;
+  parseError: string | null;
+  degradedFrom: 'memory' | 'snapshot' | 'empty' | null;
+}
+
+/** One section row of the WP5 activity projection (mirrors the server-side
+ *  `buildPlanActivityProjection`). Shared so the plan-pane IPC passthrough and
+ *  the renderer container agree on the shape. */
+export interface PlanActivitySection {
+  anchor: string | null;
+  zone: string | null;
+  heading: string | null;
+  tokenEstimate: number;
+  archived: boolean;
+  eventCount: number;
+  lastEventAt: string | null;
+  // ── Fix-4: witnessed repo-activity rollup (tests/commit fields inert in cut 1) ──
+  repoFilesRead: number;
+  repoFilesEdited: number;
+  repoFilesCreated: number;
+  testsRun: number;
+  testsPassed: number;
+  testsFailed: number;
+  lastCommit: string | null;
+}
+
+/** One trusted `plan_events` row + its (kept-separate) claimed self-report, as
+ *  served for render. Field-for-field the renderer's `PlanEventView`. */
+export interface PlanActivityEvent {
+  id: string;
+  agentId: string;
+  agentTitle?: string | null;
+  createdAt: string;
+  observedSectionAnchor: string | null;
+  dispatchedSectionAnchor: string | null;
+  observedVia: string | null;
+  attributionConfidence: string | null;
+  sectionMismatch: boolean;
+  mismatchReason: string | null;
+  claimedSectionAnchor?: string | null;
+  claimedPayload?: Record<string, unknown> | null;
+  // Fix-4: Tier-2 witnessed digest (counts only, no file list). null = not captured.
+  repoActivityDigest?: RepoActivityDigest | null;
+}
+
+/** The full projection the WP5 surface renders — sections + degradation fields,
+ *  plus the trusted event trail when requested (`events=full`). Returned by the
+ *  `plan:projection` IPC (an in-process mirror of
+ *  GET /api/plans/:id/projection?events=full). */
+export interface PlanActivityProjection {
+  planId: string;
+  sections: PlanActivitySection[];
+  parseError: string | null;
+  warnings: string[];
+  events?: PlanActivityEvent[];
+  // Fix-4: Tier-3 drill-down — one event's capped witnessed file list. Present
+  // only when the projection was requested with an `eventDetailId`.
+  eventDetail?: RepoActivityDetail | null;
+}
+
+// ── Fix-4: witnessed repo-activity evidence (V1, versioned) ──────────────────
+export interface RepoActivityFileItem {
+  path: string;                                   // workspace-relative, forward-slash
+  operations: Array<'read' | 'write' | 'create'>; // distinct ops seen this turn
+  counts: { read: number; write: number; create: number };
+  firstAt: string;                                // ISO (normalized in rollup)
+  lastAt: string;                                 // ISO (normalized in rollup)
+  outsideWorkspace?: boolean;                     // path could not be relativized
+}
+
+export interface RepoActivityEvidenceV1 {
+  schemaVersion: 1;
+  status: 'captured';
+  window: { sinceIso: string; untilIso: string };
+  totals: {
+    filesRead: number;  filesEdited: number;  filesCreated: number;
+    fileEvents: number; distinctFiles: number;
+    testsRun: number;   testsPassed: number;  testsFailed: number; // always 0 in cut 1
+  };
+  files:   { truncated: boolean; items: RepoActivityFileItem[] };
+  tests:   { truncated: boolean; items: never[] };  // RESERVED — always [] in cut 1
+  commits: { truncated: boolean; items: never[] };  // RESERVED — always [] in cut 1
+  caps: { fileDetailMax: number };
+}
+
+export interface RepoActivityDigest {   // Tier-2 (counts only, no file list)
+  status: 'captured' | 'not-captured';
+  totals: RepoActivityEvidenceV1['totals'] | null;
+  line: string | null;                  // formatRepoDigest(...) output; null = captured but no activity
+}
+export interface RepoActivityDetail {   // Tier-3 (one event's capped files)
+  planEventId: string;
+  files: RepoActivityEvidenceV1['files'];
+  totals: RepoActivityEvidenceV1['totals'];
+  window: RepoActivityEvidenceV1['window'];
+}
+
+/** A6 (wp2b §5) — skill-analytics indexing progress pushed to the renderer. */
+export interface IndexProgressDto {
+  filesDone: number;
+  filesTotal: number;
+  bytesDone: number;
+  bytesTotal: number;
+  rowsAdded: number;
+  currentFile: string;
+}
+/** A6 (wp2b §5) — `indexing` IPC contract result. `ready:false` → render
+ *  "indexing… N of M files" off `progress`; `stale:true` → a large tail is
+ *  re-indexing in the background while the current (stale) index is served. */
+export type IndexStatusDto =
+  | { ready: false; status: 'indexing'; progress: IndexProgressDto }
+  | { ready: true; stale?: boolean; status?: 'indexing' };
+
 export interface IpcApi {
   workspaces: {
     list: () => Promise<Workspace[]>;
@@ -822,6 +1073,13 @@ export interface IpcApi {
     onSendInputError: (callback: (data: { agentId: string; error: string }) => void) => () => void;
     getSupervisor: (workspaceId: string) => Promise<Agent | null>;
     updateSupervised: (id: string, supervised: boolean) => Promise<Agent>;
+    // Per-agent continuation control (Edward 2026-07-05). setContinuationEnabled
+    // persists the toggle (false → the watcher's `continuation-disabled` blocker);
+    // forceContinuationHandoff makes the watcher open an attempt on its next tick,
+    // bypassing the trigger conditions but running the normal attempt cycle
+    // (rejects a disabled agent; idempotent when an attempt is already open).
+    setContinuationEnabled: (agentId: string, enabled: boolean) => Promise<{ ok: boolean }>;
+    forceContinuationHandoff: (agentId: string) => Promise<{ ok: boolean; error?: string }>;
   };
   terminal: {
     attach: (agentId: string) => Promise<void>;
@@ -836,6 +1094,11 @@ export interface IpcApi {
   };
   files: {
     readFile: (filePath: string, pathType: PathType) => Promise<FileContent>;
+    convertDocxToMarkdown: (
+      filePath: string,
+      rootDirectory: string,
+      pathType: PathType
+    ) => Promise<FileMutationResult>;
     listDirectory: (dirPath: string, pathType: PathType) => Promise<DirectoryEntry[]>;
     writeFile: (
       filePath: string,
@@ -891,6 +1154,14 @@ export interface IpcApi {
   };
   contextOverhead: {
     scan: (req: ScanOverheadRequest) => Promise<ScanOverheadResult>;
+  };
+  agentKnowledge: {
+    extract: (req: ExtractKnowledgeRequest) => Promise<ExtractKnowledgeResult>;
+  };
+  contextOptimizer: {
+    analyze: (req: ContextOptimizerQuery) => Promise<ContextOptimizerQueryResult>;
+    markApplied: (req: MarkOptimizerActionAppliedRequest) => Promise<MarkOptimizerActionAppliedResult>;
+    signDerivation: (req: SignOptimizerDerivationRequest) => Promise<SignOptimizerDerivationResult>;
   };
   system: {
     pickDirectory: (startInWsl?: boolean) => Promise<string | null>;
@@ -1096,6 +1367,10 @@ export interface IpcApi {
         patch: Partial<AccessRuleInput> & { enabled?: boolean },
       ) => Promise<AccessRule>;
       remove: (id: string) => Promise<void>;
+      // Phase 3 (§D line 264): read-only per-rule visit + login status for the
+      // current workspace (sourced from the workspace-exact grant, never a bare
+      // row). Optional so older preload shapes without the channel still satisfy.
+      siteStatus?: () => Promise<AccessSiteStatus[]>;
       onChanged: (callback: () => void) => () => void;
       // Agent-initiated requests (§18).
       requestList: () => Promise<AccessRequest[]>;
@@ -1116,6 +1391,8 @@ export interface IpcApi {
       onSigninPendingOpened: (callback: (payload: SigninPendingOpened) => void) => () => void;
       onSigninResolved: (callback: (payload: SigninResolved) => void) => () => void;
       signinPendingCancel: (tabId: string) => Promise<void>;
+      // Phase 4 item 4: explicit human re-arm of a run-scoped signin_unavailable latch.
+      signinReArm: (workspaceId: string | null, origin: string) => Promise<boolean>;
       getSigninHoldTimeoutMs: () => Promise<number>;
       setSigninHoldTimeoutMs: (ms: number) => Promise<void>;
       setSigninUnattended: (workspaceId: string | null, unattended: boolean) => Promise<void>;
@@ -1130,13 +1407,57 @@ export interface IpcApi {
     onCloseQuery: (callback: (req: { requestId: string }) => void) => () => void;
     closeReply: (requestId: string, decision: 'save' | 'discard' | 'cancel') => Promise<void>;
   };
+  // Detachable (tear-off) top-level views — mirrors `tabs` above, minus the
+  // dirty-on-close protocol (a view has nothing to save).
+  views: {
+    detach: (req: ViewDetachRequest) => Promise<DetachResult>;
+    onClosed: (callback: (payload: ViewDetachedClosedPayload) => void) => () => void;
+  };
   /** Account-wide Claude subscription usage limits (singleton, not per-agent).
    *  See plans/usage-limits-mcp-and-ui.md. */
   usage: {
     getLimits: () => Promise<UsageLimitsReading>;
     onLimitsChanged: (callback: (reading: UsageLimitsReading) => void) => () => void;
   };
-  onAgentStatusChanged: (callback: (data: { agentId: string; status: AgentStatus; agent: Agent }) => void) => () => void;
+  /** A6 (wp2b §5) — skill-analytics indexing. `indexStatus` is the contract
+   *  entrypoint (kicks first-run backfill, returns progress); `indexPoll` is a
+   *  no-parse status read for panels mounting mid-backfill; `onIndexProgress`
+   *  subscribes to the push stream. */
+  skillAnalytics: {
+    indexStatus: () => Promise<IndexStatusDto>;
+    indexPoll: () => Promise<IndexStatusDto>;
+    onIndexProgress: (callback: (progress: IndexProgressDto) => void) => () => void;
+    // WP3 (§P2.2) — read-only usage rollup. Ensures the index first, then queries.
+    query: (req: SkillUsageQuery) => Promise<SkillUsageQueryResult>;
+  };
+  /** wave2-mcp-tool-observability §2.2 — per-MCP-tool usage rollup. Separate
+   *  endpoint/DTO from skillAnalytics so the MCP tab lazy-loads; same parse-first
+   *  contract (ensureIndexed → pure SQL). */
+  mcpToolUsage: {
+    query: (req: McpToolUsageQuery) => Promise<McpToolUsageQueryResult>;
+  };
+  /** WP5 plan render surface. `onSurfaceChanged` fires after each WP4 reparse
+   *  (fs change → reparse → re-render) so the renderer re-fetches the served
+   *  projection and does a full re-render — NOT a second `plans/` fs
+   *  subscription (F-C: plans-watcher owns the only one). */
+  plans: {
+    onSurfaceChanged: (callback: (payload: PlanSurfaceChangedEvent) => void) => () => void;
+    /** List a workspace's plans for the "Plans" card gallery. Each row carries a
+     *  cheap description snippet (summary-zone prose) for `html` surfaces. */
+    list: (workspaceId?: string) => Promise<PlanListItem[]>;
+    /** Full activity projection (sections + trusted event trail) — the in-process
+     *  mirror of GET /api/plans/:id/projection?events=full. `null` if unknown. */
+    getProjection: (planId: string, opts?: { eventDetailId?: string }) => Promise<PlanActivityProjection | null>;
+    /** Sandboxed render-pane lifecycle, same bounds-handoff as the browser pane:
+     *  the renderer streams the pane rectangle while main drives the view. */
+    paneShow: (planId: string) => Promise<void>;
+    paneHide: () => Promise<void>;
+    paneSetBounds: (bounds: { x: number; y: number; width: number; height: number }) => Promise<void>;
+    /** Visibility-only pane toggle (no document reload) — lets a renderer overlay
+     *  such as the Plans gallery temporarily hide the native pane so DOM wins. */
+    paneSetVisible: (visible: boolean) => Promise<void>;
+  };
+  onAgentStatusChanged: (callback: (data: { agentId: string; status: AgentStatus; agent: Agent; source?: string }) => void) => () => void;
   onAgentDeleted: (callback: (data: { agentId: string }) => void) => () => void;
   onOpenFileTab: (callback: (payload: OpenFileTabRequest) => void) => () => void;
   onTeamUpdated: (callback: (team: Team) => void) => () => void;
@@ -1146,6 +1467,25 @@ export interface IpcApi {
   // these supervisors even while their planner agents are idle between turns.
   listActiveOrchestrations: () => Promise<string[]>;
   onOrchestrationActiveChanged: (callback: (supervisorIds: string[]) => void) => () => void;
+  /** Memory watchdog (incident-2026-07-11 §5 D5). Renderer-facing read surface:
+   *  the status-bar meter/banner poll `getSnapshot` + subscribe to `onPressure`;
+   *  the orphan-sweep panel lists candidates, estimates reclaimable bytes, and
+   *  reaps. Read-only except `reapOrphans` (each tree re-verified before any kill). */
+  memory: {
+    getSnapshot: () => Promise<MemorySnapshotDto | null>;
+    getAttribution: () => Promise<AttributionDto | null>;
+    onPressure: (callback: (snap: MemorySnapshotDto) => void) => () => void;
+    listOrphans: () => Promise<OrphanCandidateDto[]>;
+    reapOrphans: (agentIds: string[]) => Promise<ReapOrphansResultDto[]>;
+    /** Best-effort working-set bytes for a PID set (the "reap now" estimate). */
+    reapEstimate: (pids: number[]) => Promise<number>;
+  };
+  /** Detached-process transparency (incident-2026-07-11 §5 Wave 5). Lists the
+   *  agent-launched detached processes that self-registered under
+   *  <workspaceRoot>/.dashboard/detached/, each verified against its live PID. */
+  detached: {
+    list: (workspaceRoot: string) => Promise<DetachedProcessDto[]>;
+  };
 }
 
 // ───────────────────────── Context-Overhead Analyzer ─────────────────────────
@@ -1169,7 +1509,18 @@ export interface TokenEstimate {
 export type OverheadSourceKind =
   | 'agent-claude' | 'inherited-claude' | 'claude-local' | 'user-claude'
   | 'managed-policy' | 'rules' | 'memory' | 'behavioral'
-  | 'settings-hooks' | 'skill' | 'import' | 'mcp-tool-schema'
+  // Memory costing split (Wave-2 §1), mirroring skill-header/skill-body. `memory-index`
+  // = resident head actually injected (0 today: autoMemoryEnabled:false + manual read);
+  // `memory-body` = on-demand pool (measured size, NOT injected each session). Legacy
+  // `'memory'` kept for external consumers but NO LONGER emitted by walk-up.
+  | 'memory-index' | 'memory-body'
+  | 'settings-hooks'
+  // Skill costing split (P1.1). `skill-header` = resident YAML frontmatter
+  // (counted in the always-on baseline); `skill-body` = on-invoke body (scenario
+  // overlay, excluded from the header-view baseline). Legacy `'skill'` is kept in
+  // the union for external consumers but is NO LONGER emitted by walk-up.
+  | 'skill' | 'skill-header' | 'skill-body'
+  | 'import' | 'mcp-tool-schema'
   | 'system-baseline' | 'unknown';
 
 // NOTE (R3): naming is unified on `managed` (matches the legitimacy report's
@@ -1189,8 +1540,60 @@ export interface OverheadSource {
   exists: boolean;
   inherited: boolean;          // pulled via walk-up, not the agent's own dir
   estimate: TokenEstimate;
+  // How this source was produced (P1.2). `frontmatter-split` marks the two skill
+  // rows emitted from a single SKILL.md via `splitFrontmatter`.
+  origin: 'walk-up' | 'import' | 'glob' | 'frontmatter-split';
+  // Skill rows only: which disclosure tier this row represents. Drives the
+  // evidence badge (neutral wording until the Phase-0 gate validates injection).
+  disclosureState?: 'advertised-header' | 'scenario-body';
+  // Disclosure tier for truthful accounting (Wave-2 §1). `resident` = injected into
+  // context every session (counts toward the overhead headline). `on-demand` = disclosed
+  // only when read/invoked (shown in a separate pool, NEVER in the headline).
+  // skill-header/memory-index → resident; skill-body/memory-body → on-demand; all other
+  // kinds → resident. Optional at the type level so pre-existing OverheadSource fixtures
+  // outside this pipeline still compile; the analyzer/walk-up populate it on every source
+  // (a missing value is treated as `resident` by consumers).
+  disclosureTier?: 'resident' | 'on-demand';
+  // Edit-safety class for the mutability badge (§3.1). Inlined union rather than
+  // importing the main-side `MutabilityClass` so `shared/` stays dependency-free.
+  mutable: 'user-owned' | 'scaffold-managed' | 'generated-vendor';
   children?: OverheadSource[]; // @import subgraph nested under the importing source
   warnings?: string[];
+}
+
+// Section weight status (Wave-2 req 3). SIX values — never collapse to binary dead/live.
+// This plan's structural classifier emits ONLY the last four; `live`/`dead` require behavior
+// data (a later plan) and are defined here so the type is stable and the UI can render them
+// when populated.
+//   live                  — observed behavior exercises this guidance (needs behavior corpus).
+//   dead                  — sufficient exposure exists but guidance is never exercised (needs corpus).
+//   structurally-broken   — a concrete reference provably does not resolve (missing file /
+//                           absent skill / ungranted toolset). Actionable dead weight, provable now.
+//   insufficient-evidence — has references that DO resolve, but no behavior data to judge live/dead.
+//   unobservable          — pure prose with no mechanical predicate; cannot be judged either axis.
+//   not-analyzed          — classification did not run (file too large, read failed, etc.).
+export type SectionWeightClass =
+  | 'live' | 'dead' | 'structurally-broken'
+  | 'insufficient-evidence' | 'unobservable' | 'not-analyzed';
+
+export interface ConfigSectionWeight {
+  sourcePath: string;          // absolute path of the CLAUDE.md/config file
+  sourceLabel: string;         // walk-up row label
+  scope: InheritanceScope;
+  heading: string;             // section heading text ('(preamble)' for pre-heading content)
+  startLine: number;           // 1-based; for click-through highlight
+  endLine: number;
+  tokens: number;              // resident cost of this section
+  weightClass: SectionWeightClass;
+  // Structural-resolution facts ONLY. Feeds the tooltip. Never itself a verdict.
+  evidence: string[];
+}
+
+export interface ConfigWeightRollup {
+  sections: ConfigSectionWeight[];
+  // Token totals bucketed by status; all six keys always present (0 when empty) so the UI
+  // never has to guess a missing bucket.
+  tokensByClass: Record<SectionWeightClass, number>;
 }
 
 export interface InheritanceFrame {
@@ -1241,6 +1644,21 @@ export interface AgentContextOverhead {
   mcpServers: McpServerOverhead[];
   flatSources: OverheadSource[];         // denormalized for chart stacking
   total: TokenEstimate;                  // agent-variable overhead (EXCLUDES systemBaseline & strict-excluded MCP)
+  // Header-view baseline (P1.2/P1.3): all skill *headers* + non-skill always-on
+  // overhead, i.e. `total` with every skill body excluded. Additive field; the
+  // `total`-changing behavior itself is gated behind the Phase-0 disclosure
+  // validation (see context-overhead-analyzer.ts PHASE0_DISCLOSURE_VALIDATED).
+  totalHeaderView: TokenEstimate;
+  // Truthful split (Wave-2 §1). `residentTotal` = every resident-tier source + counted MCP
+  // (what actually enters context each session; this is the panel headline). `onDemandTotal`
+  // = on-demand sources (skill bodies, memory body) — shown as a labeled pool, never in the
+  // headline. `total` stays = residentTotal + onDemandTotal (worst case) for back-compat.
+  // Optional so external OverheadSource/AgentContextOverhead fixtures compile; the analyzer
+  // always populates all three.
+  residentTotal?: TokenEstimate;
+  onDemandTotal?: TokenEstimate;
+  // Section-level weight classification for this agent's resident config (§D).
+  configWeight?: ConfigWeightRollup;
   exactness: 'exact' | 'mixed' | 'estimated';
   warnings: string[];
 }
@@ -1253,6 +1671,9 @@ export interface OverheadModel {
   estimatorMethod: TokenCountMethod;
   systemBaseline?: TokenEstimate;        // OPTIONAL/synthetic; shown separately, never per-agent
   agents: AgentContextOverhead[];
+  // Per-workspace dead/live aggregate across all agents (§C3). Union of workspace-scoped
+  // config sections, deduped by (sourcePath, heading).
+  workspaceConfigWeight?: ConfigWeightRollup;
   globalWarnings: string[];
 }
 
@@ -1265,6 +1686,1115 @@ export interface ScanOverheadRequest {
 export type ScanOverheadResult =
   | { ok: true; model: OverheadModel }
   | { ok: false; error: string };
+
+// ── "What This Agent Knows" — knowledge graph (base plan P3 / master WP4) ──────
+//
+// DETERMINISTIC extraction from an agent's resolved config surfaces (the P1
+// walk-up inheritance chain + `mcpInventory.forLane`) — NO LLM anywhere in the
+// pipeline. Nodes are markdown-structure facts with a click-through provenance
+// pointer back to the source line.
+export type KnowledgeNodeType =
+  | 'capability' | 'constraint' | 'tool' | 'memory' | 'workflow' | 'file-reference';
+
+// ── Wave-2 knowledge ⇄ behavior linkage (§WP1) ─────────────────────────────────
+//
+// Precise, human-facing provenance role — distinct from `InheritanceScope` (which
+// answers "which walk-up tier") because the feedback's north star is "WHICH
+// CLAUDE.md" (this agent's own vs the workspace root vs an ancestor).
+export type KnowledgeSourceRole =
+  | 'agent-claude'      // this worker template's own CLAUDE.md
+  | 'workspace-claude'  // repo-root CLAUDE.md (frame.dir === workspaceRoot)
+  | 'ancestor-claude'   // other inherited CLAUDE.md up the walk-up
+  | 'user-claude' | 'managed' | 'import' | 'skill' | 'mcp' | 'memory' | 'other';
+
+// A byte-span back into the source file. `lineEnd` powers the WP4 highlight (a
+// heading spans to the next same-or-higher heading; a bullet/path is a single line).
+export interface KnowledgeSourceSpan { absPath: string; lineStart: number; lineEnd: number }
+
+export type KnowledgeBehaviorStatus =
+  | 'observed'               // a matching behavior predicate fired ≥1× in-window
+  | 'never-observed'         // observable + enough lane exposure, but 0 matches (likely stale)
+  | 'insufficient-exposure'  // observable but the lane has too little corpus to judge
+  | 'unobservable';          // no mechanical predicate (pure prose) — not judgeable
+
+export interface KnowledgeBehaviorEvidence {
+  status: KnowledgeBehaviorStatus;
+  actionKinds: string[];       // PredictedAction kinds the node compiled to
+  occurrences: number;
+  distinctStreams: number;
+  distinctSlugs: number;
+  lastObservedMs: number | null;
+  exposureTurns: number;       // denominator from exposureForLane
+  windowDays: number;          // recency window the counts cover (default 30)
+  explanation: string;         // one-line, panel tooltip (definition + scope)
+}
+
+export interface KnowledgeFileReferenceStats {
+  touches: number; reads: number; writes: number; executes: number;
+  distinctStreams: number; lastTouchedMs: number | null; windowDays: number;
+}
+
+export interface KnowledgeNode {
+  type: KnowledgeNodeType;
+  label: string;                 // verbatim heading / bullet / token text (bounded)
+  detail?: string;               // synopsis (first sentence) or surrounding context
+  source: KnowledgeSourceSpan;   // 1-based span; absPath '' for path-less MCP servers (WP2)
+  // Provenance: the walk-up `sourceScope` the node was inherited through (A11).
+  sourceScope?: InheritanceScope;
+  sourceRole: KnowledgeSourceRole;       // WP2 — precise agent-vs-workspace attribution
+  sourceKind?: OverheadSourceKind;       // exact walk-up kind
+  behavior?: KnowledgeBehaviorEvidence;  // WP3 — load-bearing vs stale
+  fileReferenceStats?: KnowledgeFileReferenceStats; // WP3 (file-reference nodes only)
+}
+
+export interface KnowledgeSourceFile {
+  absPath: string;
+  scope: InheritanceScope;
+  kind: OverheadSourceKind;
+  label: string;                 // walk-up row label (e.g. `CLAUDE.md`, `.claude/skills/foo/SKILL.md`)
+  nodeCount: number;
+}
+
+export interface AgentKnowledgeGraph {
+  agentId: string;
+  agentName: string;
+  nodes: KnowledgeNode[];
+  sourceFiles: KnowledgeSourceFile[];
+  generatedAtIso: string;        // stamped by the IPC/caller layer, not the pure extractor
+}
+
+export interface ExtractKnowledgeRequest {
+  // `workspaceId` is additive vs the base-plan `{ agentId }` sketch — the main
+  // process needs it to run the same walk-up scan the picker was populated from.
+  workspaceId: string;
+  agentId: string;
+}
+
+export type ExtractKnowledgeResult =
+  | { ok: true; graph: AgentKnowledgeGraph }
+  | { ok: false; error: string };
+
+// ── Skill Usage Analytics — query layer results (base plan §P2 / master WP3) ───
+//
+// Read-only rollups over the WP2 parse foundation. TWO HARD RULES the shape
+// encodes: (1) effectiveness is TWO TIERS never blended into one number — the
+// advisory `observableScore` comes from the observable tier only, with every raw
+// input surfaced beside it; the heuristic tier is shown but never folded in.
+// (2) COST (A8) is a SEPARATE dimension rendered beside effectiveness, never
+// blended into the composite.
+export interface SkillUsageQuery {
+  // WP-D fix leg: scope by the authoritative agents-join (session_id → agents.workspace_id),
+  // NOT the structurally-NULL skill_invocations.workspace_root (A10 deferred). Mirrors the
+  // vetted sibling McpToolUsageQuery.workspaceId. Unattributed rows are disclosed via
+  // scopeMeta.droppedUnattributedCount, never silently hidden.
+  workspaceId?: string;
+  slug?: string;
+  agentId?: string;         // reserved: historical rows are NOT per-agent (CLAUDE.md invariant)
+  lane?: AgentRoleLane | 'unknown'; // NEW (skill-legibility A1) — agent-type scope via stream_lane_stats.lane
+  sinceMs?: number;
+  untilMs?: number;
+  // WP-2B — workspace scope policy (parity with McpToolUsageQuery). Defaults to 'strict'
+  // here (skill usage's vetted default is the honest agents-join scope); 'include-proxy'
+  // is opt-in and admits slug-proxy rows ONLY when the slug uniquely maps to workspaceId.
+  scopeMode?: WorkspaceScopeMode;
+  /** Set by the scope resolver (NOT the raw caller): true when `slug` uniquely maps to
+   *  `workspaceId`, which unlocks the slug-proxy leg of 'include-proxy'. */
+  slugUniqueToWorkspace?: boolean;
+}
+
+export interface SkillMostUsedRow {
+  skill: string;
+  count: number;
+  avgEffectiveness: number | null;   // mean observable composite; null when no scorable window
+  lastUsedMs: number | null;
+}
+
+// Enriched (skill-legibility A2) so the timeline click-drill can show a real
+// source identifier per invocation, and Agent-type / Workspace / Detection
+// columns without any renderer-side lane derivation.
+export interface SkillTimelineRow {
+  tsMs: number;
+  skill: string;
+  slug: string | null;
+  lane: string;                 // NEW — sls.lane (may be 'unknown')
+  workspaceKey: string;         // NEW — COALESCE(workspace_root, si.slug, sls.slug, '(unknown)')
+  detector: string;             // NEW — 'tool_use' | 'slash_command'
+  id: string;                   // NEW — skill_invocations.id (source identifier)
+  jsonlPath: string | null;     // NEW — source jsonl (shown, not opened)
+}
+
+export interface SkillGroupRow { key: string; count: number; }
+
+export interface SkillContextSample {
+  skill: string;
+  tsMs: number;
+  slug: string | null;
+  workingDir: string | null;
+  lane: string;                      // NEW (skill-legibility D7) — COALESCE(sls.lane,'unknown')
+  detector: string;                  // 'tool_use' | 'slash_command'
+  args: string | null;
+}
+
+// §P2.4 — per-skill two-tier effectiveness. `observableScore` is the ONLY scored
+// number; the heuristic counts and every observable raw input are surfaced so the
+// score never hides its inputs.
+export interface SkillEffectiveness {
+  skill: string;
+  observableScore: number | null;    // ∈ [0,1] from the observable tier ONLY
+  scoredInvocations: number;         // finalized windows that fed the composite
+  positiveWindows: number;           // ≥1 non-error tool_result AND a clean end_turn
+  errorWindows: number;              // window_error_results > 0
+  repeatedSearchWindows: number;
+  endedWithQuestionWindows: number;
+  heuristic: { userCorrection: number; workflowFollowed: number };  // NEVER folded in
+}
+
+// A8 — per-skill token cost rollup (median + spread). Fresh input/output kept
+// SEPARATE from cache reads (four-field spend model). Never blended into effectiveness.
+export interface SkillCostRollup {
+  skill: string;
+  invocations: number;               // windows that carried usage
+  freshMedian: number;               // median (input+cache_creation+output) per invocation
+  freshP25: number;
+  freshP75: number;
+  freshInputMedian: number;          // input + cache_creation
+  outputMedian: number;
+  cacheReadMedian: number;           // resident re-read — reported separately, never spend
+}
+
+export interface SkillUsageResult {
+  mostUsed: SkillMostUsedRow[];
+  timeline: SkillTimelineRow[];
+  timelineTruncated: boolean;        // true when the timeline hit its cap (no silent truncation)
+  byWorkspace: SkillGroupRow[];      // COALESCE(workspace_root, si.slug, sls.slug, '(unknown)')
+  byAgentType: SkillGroupRow[];      // NEW (skill-legibility A4) — COALESCE(sls.lane,'unknown')
+  byAgentDir: SkillGroupRow[];       // COALESCE(working_dir, sls.working_dir, '(unknown)')
+  byInvoker: SkillGroupRow[];        // detector — relabeled "Detection" in the UI
+  contextSamples: SkillContextSample[];
+  effectiveness: SkillEffectiveness[];
+  cost: SkillCostRollup[];
+  totalInvocations: number;
+  // NEW (skill-legibility A4/req#5) — truthful accounting of the active scope.
+  scopeMeta: {
+    workspaceKeyIsSlugProxy: boolean; // true while workspace_root is unpopulated (today: always true)
+    windowSinceMs: number | null;
+    windowUntilMs: number | null;
+    appliedLane: string | null;
+    appliedSlug: string | null;
+    // WP-D fix leg — honest workspace scoping (agents-join). Optional so the many
+    // literal SkillUsageResult builders in tests need not all be updated; queries.ts
+    // always populates them.
+    appliedWorkspaceId?: string | null;
+    /** Rows matching the base (lane/slug/window) filter that attribute to NO workspace
+     *  and so can never match the workspace scope — disclosed, never silently hidden.
+     *  0 when no workspace scope is applied. Mirrors the sibling MCP surface. */
+    droppedUnattributedCount?: number;
+    /** Whether `skill_invocations` holds ANY row at all — lets the DTO reserve the
+     *  `empty_not_instrumented` state for a truly empty table (WB-01: don't assert an
+     *  unproven cause) and distinguish it from a scope/window artifact. */
+    hasAnyInvocations?: boolean;
+    // WP-2B — workspace scope policy disclosure (parity with the MCP surface). Optional
+    // so existing literal builders need not update; queries.ts always populates them.
+    appliedScopeMode?: WorkspaceScopeMode;
+    /** Rows admitted into a workspace scope ONLY via the slug-proxy leg (real id NULL,
+     *  slug matches, slug uniquely maps). 0 outside 'include-proxy'. */
+    proxyIncludedCount?: number;
+  };
+  generatedAtIso: string;
+}
+
+export type SkillUsageQueryResult =
+  | { ok: true; data: SkillUsageResult }
+  | { ok: false; error: string };
+
+// ── MCP tool-level usage engine (wave2-mcp-tool-observability §2.1) ────────────
+//
+// The MCP usage surface OWNS per-tool MCP attribution — separate module + DTO so
+// the MCP tab lazy-loads and an agent-facing read tool can reuse it without the
+// skill effectiveness engine. Per-agent attribution is SESSION-BASED: a call is
+// tied to a dashboard agent only when `session_id → agent_sessions → agents`
+// hits (LEFT JOIN). Unmatched streams keep their rows in an honest
+// "(unattributed)" bucket — never dropped, never implied to be a specific agent
+// (CLAUDE.md shared-cwd invariant). Live corpus: ~93% of MCP calls are
+// unattributed, so that bucket is first-class, not an edge case.
+// ── Workspace-LEVEL attribution (Priority 0 / WP-2B) ──────────────────────────
+//
+// SEPARATE from the four LANE tiers below (which classify agent/lane attribution
+// WITHIN a workspace population). A behavior row's WORKSPACE identity degrades
+// through its own honesty ladder, strongest first:
+//   - workspace-explicit             — a direct launch-time association wrote the id
+//                                       (reserved; not emitted until launch metadata
+//                                       is wired — the resolver never CLAIMS it).
+//   - workspace-from-launch-session  — session → agent → workspace join resolves.
+//   - workspace-from-root            — the launch cwd folded to a root owned by
+//                                       EXACTLY one workspace (root is redacted, never
+//                                       disclosed across the API boundary).
+//   - workspace-slug-proxy           — no id, only the Claude project slug (a
+//                                       workspace-LEVEL proxy, not a stable identity).
+//   - workspace-unattributed         — no workspace signal at all; first-class, visible.
+export type WorkspaceAttribution =
+  | { tier: 'workspace-explicit'; workspaceId: string }
+  | { tier: 'workspace-from-launch-session'; workspaceId: string }
+  | { tier: 'workspace-from-root'; workspaceId: string } // root intentionally omitted
+  | { tier: 'workspace-slug-proxy'; slug: string }
+  | { tier: 'workspace-unattributed' };
+
+export type WorkspaceAttributionTier = WorkspaceAttribution['tier'];
+export type WorkspaceAttributionBreakdown = Record<WorkspaceAttributionTier, number>;
+
+/** Scope-mode for a workspace-scoped behavior query (Priority 0 / WP-2B). Governs
+ *  which workspace tiers are admitted into the scoped population:
+ *   - 'strict'            — only rows with a REAL workspace identity (launch-session or
+ *                           folded-root id). No slug proxy.
+ *   - 'include-proxy'     — DEFAULT. Adds slug-proxy rows, but ONLY when the caller's
+ *                           slug uniquely maps to the caller workspace (otherwise it
+ *                           degrades to 'strict' to avoid cross-workspace leakage).
+ *   - 'global-diagnostic' — no workspace filter; every row, with proxy/unattributed
+ *                           counts reported separately. Diagnostics only. */
+export type WorkspaceScopeMode = 'strict' | 'include-proxy' | 'global-diagnostic';
+
+export interface McpToolUsageQuery {
+  workspaceId?: string; // matched against the resolved workspace expr (see queries)
+  slug?: string;
+  agentId?: string;     // dashboard_agent_id (only attributed streams match)
+  lane?: string;        // stream_lane_stats.lane
+  sinceMs?: number;
+  untilMs?: number;
+  // WP-2B — workspace scope policy. Defaults to 'include-proxy'.
+  scopeMode?: WorkspaceScopeMode;
+  /** Set by the API/scope resolver (NOT the raw caller): true when `slug` uniquely maps
+   *  to `workspaceId`, which is what unlocks the slug-proxy leg of 'include-proxy'. */
+  slugUniqueToWorkspace?: boolean;
+}
+
+export interface McpToolRow {
+  toolName: string;            // full mcp__agent-dashboard__browser_read_page
+  toolShort: string;           // browser_read_page (server prefix stripped)
+  toolset: string | null;      // browser (null = unknown / unresolved MCP tool)
+  count: number;
+  distinctStreams: number;
+  lastTsMs: number | null;
+}
+
+export interface McpToolsetRollup {
+  toolset: string | null;
+  count: number;
+  distinctStreams: number;
+  tools: McpToolRow[];
+}
+
+// by lane / workspace / agent / session. `label` carries the human name
+// (agent title / workspace title / '(unattributed)'); `key` is the group value.
+export interface McpUsageGroupRow {
+  key: string;
+  label: string;
+  count: number;
+  agentId?: string | null;     // present on byAgent rows (nullable — unattributed)
+}
+
+// ── Attribution as a confidence-bearing product output (WP-C / P2) ────────────
+//
+// Four-tier honest attribution for an MCP call. Precedence, strongest first:
+//   1. agent-attributed                  — session/agent metadata resolves to ONE
+//                                          agent (session-based; still capped by the
+//                                          cwd-uniqueness invariant, never "direct").
+//   2. lane-attributed-explicit          — runner / terminal / session lane metadata
+//                                          (stream_lane_stats.lane) is present.
+//   3. lane-inferred-from-current-grant  — no explicit lane, but the tool's toolset is
+//                                          granted to EXACTLY ONE lane today
+//                                          (`toolsetsForLane`). Lower confidence,
+//                                          carries a reason. NEVER emitted for a toolset
+//                                          granted to > 1 lane. True grant-epoch history
+//                                          (config_epochs) is explicitly deferred.
+//   4. unattributed                      — retained, visible, never dropped, never
+//                                          implied to be a single agent.
+export type AttributionTier =
+  | 'agent-attributed'
+  | 'lane-attributed-explicit'
+  | 'lane-inferred-from-current-grant'
+  | 'unattributed';
+
+/** Per-tier call counts. The four tier counts sum to totalCalls. */
+export type AttributionTierBreakdown = Record<AttributionTier, number>;
+
+/** Lane-coverage confidence band — applies to LANE-tier claims ONLY. A per-agent
+ *  claim is NEVER promoted to 'direct' on coverage strength; the cwd-uniqueness
+ *  invariant caps per-agent confidence regardless of coverage. */
+export type AttributionCoverageBand = 'direct' | 'cautioned' | 'provisional' | 'diagnostic';
+
+/** One cell of the tool × lane cross-tab: how many calls of a given MCP tool
+ *  resolved to a given lane, and by which attribution tier. `lane` is
+ *  '(unattributed)' for the tier-4 bucket, which is kept first-class. */
+export interface McpToolLaneCell {
+  toolName: string;
+  toolShort: string;
+  toolset: string | null;
+  lane: string;
+  tier: AttributionTier;
+  count: number;
+}
+
+export interface McpToolUsageResult {
+  byTool: McpToolRow[];
+  byToolset: McpToolsetRollup[];
+  byAgent: McpUsageGroupRow[];    // unmatched streams collapse to '(unattributed)'
+  bySession: McpUsageGroupRow[];  // group by stream_id — "session / agent run"
+  byWorkspace: McpUsageGroupRow[];
+  byLane: McpUsageGroupRow[];
+  timeline: Array<{ tsMs: number; toolShort: string; toolset: string | null }>;
+  timelineTruncated: boolean;
+  totalCalls: number;
+  attributedCalls: number;        // calls whose session resolved to a dashboard agent
+  // ── Four-tier attribution (WP-C / P2). byToolLane / tierBreakdown / coverage live
+  //    on this shared enriched result so the IPC panel and the lean MCP-route DTO
+  //    tell the same story. ──
+  byToolLane: McpToolLaneCell[];  // tool × lane cross-tab, honest four-tier
+  tierBreakdown: AttributionTierBreakdown;
+  attributedCount: number;        // tiers 1–3 — an agent OR a lane signal resolved
+  unattributedCount: number;      // tier 4 — no agent, no lane, no exclusive-grant
+  attributionCoveragePct: number; // attributedCount / totalCalls × 100 (0 if none)
+  scopeMeta: {
+    // stream_lane_stats.workspace_id/workspace_root are unpopulated today, so
+    // the workspace dimension degrades to the Claude project slug — disclosed.
+    workspaceKeyIsSlugProxy: boolean;
+    attributionIsSessionBased: true;
+    // When a workspace scope is applied, MCP calls that attribute to NO workspace
+    // (session-based attribution missed and stream_lane_stats.workspace_id is
+    // unpopulated) can never match any workspaceId and are silently excluded by
+    // the filter. This is the count of those hidden rows, so the panel can
+    // disclose them instead of breaking "attributed + unattributed = total".
+    // 0 when no workspace scope is applied.
+    droppedUnattributedCalls: number;
+    appliedLane: string | null;
+    appliedSlug: string | null;
+    appliedAgentId: string | null;
+    windowSinceMs: number | null;
+    windowUntilMs: number | null;
+    // ── WP-2B workspace-lineage disclosure. Optional so the many literal scopeMeta
+    //    builders (DTO layer + tests) need not all be updated; the query always
+    //    populates them. ──
+    /** The scope-mode actually applied (defaults to 'include-proxy'). */
+    appliedScopeMode?: WorkspaceScopeMode;
+    /** Per-workspace-tier call counts over the base (non-workspace-filtered)
+     *  population — how every matching row attributes to a workspace, so proxy /
+     *  unattributed rows are reported SEPARATELY from the real-identity tiers. Sums to
+     *  totalCalls before the workspace filter. */
+    workspaceAttribution?: WorkspaceAttributionBreakdown;
+    /** Rows admitted into a scoped result ONLY via the slug-proxy leg of 'include-proxy'
+     *  (i.e. they carried no real workspace id). 0 under 'strict'/'global-diagnostic' or
+     *  when no proxy leg fired — lets the panel disclose "N of these are slug-proxy". */
+    proxyIncludedCalls?: number;
+  };
+  generatedAtIso: string;
+}
+
+export type McpToolUsageQueryResult =
+  | { ok: true; data: McpToolUsageResult }
+  | { ok: false; error: string };
+
+/** Lean MCP-route rollup (WP-C / P2). The `get_mcp_tool_usage` MCP tool returns THIS
+ *  (inside the AgentDtoResponse envelope) instead of the full `McpToolUsageResult`:
+ *  top-line totals, top-N `byTool`, a capped `byToolLane` cross-tab, the four-tier
+ *  `tierBreakdown` + coverage %, a capped timeline, and a next-drill hint. Full
+ *  per-session detail moves behind an explicit pagination/filter param. Target
+ *  ≤ ~15k serialized chars. The IPC panel keeps the enriched `McpToolUsageResult`. */
+export interface McpToolUsageRollupDTO {
+  totalCalls: number;
+  attributedCount: number;
+  unattributedCount: number;
+  attributionCoveragePct: number;
+  /** Confidence band for the LANE coverage figure only (never a per-agent claim). */
+  laneCoverageBand: AttributionCoverageBand;
+  tierBreakdown: AttributionTierBreakdown;
+  byTool: McpToolRow[];              // top-N by count
+  byToolLane: McpToolLaneCell[];     // capped tool × lane cross-tab
+  byLane: McpUsageGroupRow[];
+  timeline: Array<{ tsMs: number; toolShort: string; toolset: string | null }>;
+  timelineTruncated: boolean;
+  scopeMeta: McpToolUsageResult['scopeMeta'];
+  /** Human hint for the next honest drill (e.g. which lane/tool to filter, or that
+   *  coverage is too low for a lane-specific claim). */
+  nextDrill: string;
+  generatedAtIso: string;
+}
+
+// ── MCP tool-grant dead-weight (wave2-mcp-tool-observability §3.1) ─────────────
+//
+// Granted-but-uninvoked MCP tools per lane, gated by exposure so a tool with too
+// few turns to judge is 'insufficient-exposure', not falsely 'dead'. Schema
+// tokens reuse the same estimator the tool-schemas view sizes with, so the
+// reclaim figure matches. Lives in the analytics layer, never in the static scan.
+export interface DeadMcpToolGrantRow {
+  lane: string;
+  toolset: string;
+  toolName: string;            // full mcp__agent-dashboard__<name>
+  toolShort: string;
+  schemaTokens: number;        // per-tool resident schema cost
+  exposureTurns: number;       // Σ stream_lane_stats.turn_count for the lane/scope
+  exposureStreams: number;
+  status: 'dead' | 'insufficient-exposure';
+  suggestedAction: string;     // "Exclude '<toolShort>' from the <lane> MCP grant."
+}
+
+export type McpDeadWeightResult =
+  | { ok: true; data: DeadMcpToolGrantRow[] }
+  | { ok: false; error: string };
+
+// ── Resident assets (context-optimizer R2 WP-3 / Priority 1) ───────────────────
+//
+// First-class model for the two largest unmodeled subtract opportunities: an
+// advertised skill HEADER (resident every session so the agent can discover the
+// skill) and a granted MCP tool SCHEMA. Both already carry a token estimate in the
+// static scan (skill-header sources; McpServerOverhead per-tool + per-toolset totals);
+// this promotes them from lane-total line-items to individually rankable assets so the
+// engine can size an unused-skill/-toolset subtract by its REAL schema/header cost.
+//
+// Scope discipline (spec risk): the target is always the LANE/workspace advertisement
+// or grant, NEVER a global "delete the skill". `Lane` == the existing `AgentRoleLane`.
+export type ResidentAsset =
+  | { kind: 'skill-advertisement'; skillName: string; headerTokens: number;
+      lanes: AgentRoleLane[]; sourcePath: string }
+  | { kind: 'mcp-tool-schema'; toolset: string; toolName: string;
+      schemaTokens: number; lane: AgentRoleLane }
+  | { kind: 'mcp-toolset'; toolset: string; schemaTokens: number;
+      lane: AgentRoleLane; members: string[] };
+
+/** A resident asset joined to observed usage over the lane's workspace-lineage-aware,
+ *  strict-tier behavior spine (WP-2B). Carries the honest coverage/recency signals the
+ *  ranking + gating consume. `usageCoveragePct` low ⇒ the backing proposal stays
+ *  UNVERIFIED (indirect/provider-specific invocation can hide real usage — spec risk).
+ *  `eligibleExposureTurns` is the ranking denominator (exposure only across sessions
+ *  where the asset was actually advertised/granted, or the conservative approximation
+ *  with `exposureApproximate:true` when advertisement/grant epochs are not derivable). */
+export interface ResidentAssetUsage {
+  asset: ResidentAsset;
+  observedUses: number;          // member/skill invocations attributed to the lane (strict)
+  eligibleExposureTurns: number; // ranking denominator (see note)
+  exposureApproximate: boolean;  // true ⇒ conservative epoch approximation, proposal unverified
+  usageCoveragePct: number;      // capture coverage over the exposure window (0–100)
+  lastUsedAt: number | null;     // ms of the most recent attributed use, null if never
+  zeroUseWindow: { sinceMs: number | null; untilMs: number | null }; // the dead window observed
+  /** Scope disclosure mirroring the usage-query surface (WP-2B): what workspace policy
+   *  the join ran under, so a proxy/slug-degraded population is never silently trusted. */
+  scopeMeta: {
+    appliedScopeMode: WorkspaceScopeMode;
+    workspaceKeyIsSlugProxy: boolean;
+    proxyIncluded: boolean;
+  };
+}
+
+// ── Context optimizer — unified proposal engine DTO (design §7; master WP6b) ────
+//
+// A DEDICATED internal DTO (design §7.1): it carries concepts the capstone
+// `ImprovementProposal` does not express — occurrence classification, derivability,
+// the exposure denominator, the shared-cwd attribution caveat, and a resident-token
+// basis. It is mapped into `ImprovementProposal` only at the capstone boundary
+// (context-optimizer.ts CAPSTONE_KIND_MAP). Hardened per classifier addendum
+// §4.5/§4.6: `verification` (per-lane parity state + staleReasons), `phraseGap`,
+// `actionability`, `costEvidence`, and a redacted `fileHeat` rollup on the result.
+export type ContextOptimizerProposalKind =
+  | 'subtract-unused-toolset' | 'subtract-dead-guidance'
+  // WP-E (P4): grant-mismatch — guidance for a tool the lane no longer holds. A
+  // deadness class behavior-only detectors structurally cannot see (the tool is
+  // absent, so never observed either way); verified-by-construction from config drift.
+  | 'subtract-grant-mismatch'
+  // R2 WP-3 (Priority 1): an advertised skill HEADER that is resident in a lane's
+  // discovery surface but never invoked in this workspace. The action removes the skill
+  // from THIS lane's advertised surface (or shortens its description) — NEVER a global
+  // "delete the skill" ("never used here" ≠ "globally useless").
+  | 'subtract-unused-skill-advertisement'
+  // R2 WP-3 (Priority 1, stretch): split a broad toolset along a workflow boundary when
+  // schema savings clear a minimum bar and some members are used (mixed toolset).
+  | 'tune-split-toolset'
+  | 'add-improvisation-support' | 'add-missing-guidance'
+  | 'tune-skill-trigger' | 'tune-split-section' | 'relocate-to-progressive-disclosure';
+
+/** The four levers (panel groups SUBTRACT / ADD / TUNE·RELOCATE). */
+export type ContextOptimizerLever = 'subtract' | 'add' | 'tune' | 'relocate';
+
+export type GuidanceOccurrence = 'occurs' | 'never' | 'insufficient-exposure' | 'unobservable';
+
+// Inlined so `shared/` stays dependency-free — mirrors compiler-parity-gate
+// `ParityVerificationState` / `ProposalVerification` (main-side).
+export type ProposalVerificationStateDTO =
+  | 'verified' | 'unverified' | 'stale' | 'mismatch' | 'unverified-no-reference';
+
+export interface ProposalVerificationDTO {
+  state: ProposalVerificationStateDTO;
+  verified: boolean;
+  requiresDerivationGate: boolean;
+  staleReasons?: string[];
+  verifiedAsOf?: string;
+}
+
+/** §4.6 display state. A gate-governed proposal that is NOT derivation-verified is a
+ *  `candidate-unverified` (shown, badged, never silently suppressed from the panel;
+ *  it IS excluded from the WP7 agent actionable list — `suppressedFromAgentSurface`).
+ *  A cluster/bypass proposal is `actionable` regardless of gate state. */
+export type ProposalActionability = 'actionable' | 'candidate-unverified' | 'watch-only';
+
+/** A9 phrase-gap evidence (later leg fills it; the field exists here so the DTO is
+ *  stable). Terms + counts only — never raw snippet sentences. */
+export interface ProposalPhraseGap {
+  terms: Array<{ term: string; bypassCount: number; invocationCount: number;
+                 gapBps: number; liftBps: number }>;
+}
+
+/** A8 cost evidence — cited only where it strengthens the case. Rates normalized
+ *  per-100-turns, never raw counts (master WP6 A8 / A4 rule). */
+export interface ProposalCostEvidence {
+  improvisedPathTokensPer100Turns?: number;   // tune cards: improvised path cost
+  skillPathTokensPerInvocation?: number;       // tune cards: skill path cost
+  residentTokensTimesExposure?: number;        // SUBTRACT: the tokenTurnsWeight surfaced (no new math)
+  note?: string;
+}
+
+/** R2 WP-3 (Priority 1) — asset-backed coverage/recency evidence for a resident-asset
+ *  subtract (skill-advertisement today; toolset later). Additive + optional: present
+ *  ONLY on asset-derived rows, so the surface can show honest coverage/recency without a
+ *  parser-version bump. Mirrors the `ResidentAssetUsage` join signals the ranking + gate
+ *  consumed. `exposureApproximate:true` (advertisement/grant epoch not derivable) is why
+ *  the backing proposal is surfaced UNVERIFIED (candidate) — see `scopeMeta` for the
+ *  workspace-scope disclosure (a slug proxy while WP-2B leaves workspace_id unpopulated). */
+export interface ProposalAssetEvidence {
+  usageCoveragePct: number;      // capture coverage over the exposure window (0–100)
+  lastUsedAt: number | null;     // ms of the most recent attributed use, null if never
+  zeroUseWindow: { sinceMs: number | null; untilMs: number | null };
+  exposureApproximate: boolean;  // true ⇒ conservative epoch approximation → proposal unverified
+  scopeMeta: {
+    appliedScopeMode: WorkspaceScopeMode;
+    workspaceKeyIsSlugProxy: boolean;
+    proxyIncluded: boolean;
+  };
+}
+
+/** WP-1A (Priority 0) — the auditable, same-generation non-occurrence evidence
+ *  behind a `never`/subtract verdict. Mirrors main-side `OccurrenceEvidenceV1`
+ *  (occurrence-classifier.ts) but `predicate` is loosened to a structural shape so
+ *  `shared/` stays dependency-free (no import of main-side `BehaviorPredicate`).
+ *  Carries ONLY identifiers + counts — never raw path text or snippets — so it is
+ *  redaction-safe by construction. `evidenceState` on the proposal says whether this
+ *  object survived the fail-closed gates (`auditable`) or a gate failed (`partial`). */
+export interface OccurrenceEvidenceDTO {
+  predicate: { kind: string } & Record<string, unknown>;
+  matcherVersion: string;
+  normalizedMatcher: Record<string, unknown>;
+  epoch: { id?: string; sinceMs?: number; untilMs?: number; confidence: string };
+  denominator: {
+    turns: number; streams: number; slugs: number;
+    sampledStreams: Array<{ streamId: string; turns: number; lane: string }>;   // capped
+  };
+  numerator: {
+    occurrences: number; streams: number;
+    sampledEvents: Array<{ streamId: string; entryUuid: string; blockIndex: number; byteOffset: number }>; // capped
+  };
+  captureCoverage: {
+    providers: Record<string, { streams: number; pathEventsSupported: boolean }>;
+    unknownToolEvents: number;
+    unresolvedPathEvents: number;
+  };
+  exclusions: { subagents: boolean; reasons: string[] };
+}
+
+/** WP-1A fail-closed audit state for a proposal's `never` verdict.
+ *  `auditable` = the fail-closed gates passed AND a reproducible evidence object with
+ *  ≥1 denominator sample is attached; `partial` = a provisional-never downgraded
+ *  (capture-incomplete) — evidence attached so the reason is auditable, but the
+ *  subtract is not asserted as safe; `unavailable` = legacy / static-config /
+ *  non-`never` rows that carry no behavior audit trail. */
+export type ProposalEvidenceState = 'auditable' | 'partial' | 'unavailable';
+
+export interface ContextOptimizerProposal {
+  id: string;
+  kind: ContextOptimizerProposalKind;
+  lever: ContextOptimizerLever;
+  title: string;
+  rationale: string;
+  target: { absPath?: string; lineStart?: number; lineEnd?: number;
+            mcpToolset?: string; mcpToolName?: string; skillName?: string;
+            lane?: AgentRoleLane;
+            // WP-B2 hash-only cluster rollup: when present, this proposal is the ONE
+            // actionable summary standing in for `count` hash-only clusters along
+            // `dimension` (so it is NOT treated as hash-only noise). B1 only READS this;
+            // B2 populates it. Optional + additive — prevents a cross-package break.
+            // R2 WP-4B extends it (additive) with capped OPAQUE member refs + top-K
+            // member summaries (never raw keys) + totalOccurrences/distinctStreams so the
+            // rollup carries drillable evidence, and `hasDrillableMembers` so a rollup
+            // with nothing to drill surfaces as a diagnostic (hasActionableContent:false).
+            rollup?: { count: number; dimension: 'input_shape_hash' | 'search_signature_hash';
+                       memberRefs?: string[];
+                       topMembers?: Array<{ ref: string; count: number; distinctStreams: number }>;
+                       totalOccurrences?: number; distinctStreams?: number;
+                       hasDrillableMembers?: boolean };
+            // Inlined MutabilityClass (shared/ stays dependency-free — cf. OverheadSource).
+            mutable: 'user-owned' | 'scaffold-managed' | 'generated-vendor' };
+  residentTokenDelta: { estimate: number;      // labeled estimate (cl100k proxy)
+                        basis: 'remove-resident' | 'add-resident' | 'relocate-to-disclosure' | 'header-only' };
+  tokenTurnsWeight: number;                     // residentTokens × exposureTurns (ranking, §7.3)
+  occurrence: GuidanceOccurrence;
+  confidence: BehaviorEvidenceTier;
+  epochConfidence: 'high' | 'low' | 'unknown';  // classifier down-rank within tier (§7.3)
+  attribution: { lane?: AgentRoleLane; slug?: string; streamIds: string[];
+                 sharedCwdRisk: 'none' | 'possible' | 'high'; caveat?: string };
+  exposure: { turns: number; streams: number; slugs: number };
+  citations: Array<{ source: 'staticOverheadModel' | 'historicalChatLogAnalytics';
+                     absPath?: string; line?: number; streamId?: string;
+                     byteOffset?: number; entryUuid?: string; blockIndex?: number }>;
+  costEvidence?: ProposalCostEvidence;
+  phraseGap?: ProposalPhraseGap;
+  /** R2 WP-3 (Priority 1) — asset-backed coverage/recency evidence. Present ONLY on
+   *  resident-asset subtracts (skill-advertisement); additive + optional (no parser bump). */
+  assetEvidence?: ProposalAssetEvidence;
+  proposedEdit?: { summary: string; patch?: string };   // unified diff, NOT auto-applied
+  verification: ProposalVerificationDTO;
+  actionability: ProposalActionability;
+  derivationVerified: boolean;                  // false until Phase-E gate cleared → UI "candidate"
+  suppressedFromAgentSurface: boolean;          // §4.6: gate-governed + unverified → off the agent list
+  // WP-E (P4): the per-lane insight this proposal serves — the "insight bar" label
+  // (`grant-mismatch` | `dead-guidance` | `unused-toolset-grant` | …). Additive; every
+  // SUBTRACT carries one so the surface can frame WHICH lane insight it answers. Its
+  // verification class lives on `verification` / `confidence` / `actionability`.
+  laneInsight?: string;
+  // WP-1A (Priority 0) — fail-closed, auditable `never` verdicts. Split from
+  // `citations` (which prove residency); `behaviorEvidence` is the NON-OCCURRENCE
+  // audit trail behind a `never`/subtract, derived in the SAME analysis generation as
+  // the verdict (never a second pass). Absent on non-behavioral / legacy rows.
+  behaviorEvidence?: OccurrenceEvidenceDTO;
+  /** REQUIRED on every proposal (default `'unavailable'`). `auditable` = fail-closed
+   *  gates passed with samples; `partial` = capture-incomplete; `unavailable` =
+   *  legacy / static-config (drift) / non-`never`. */
+  evidenceState: ProposalEvidenceState;
+  /** Drill key for `GET /api/context-optimizer/proposals/:id/evidence` (== the
+   *  proposal id today). Present only when `behaviorEvidence` is attached. */
+  evidenceRef?: string;
+  /** R2 WP-4B (Phase 4) — the benefit model that orders an ADD/TUNE/RELOCATE proposal
+   *  WITHIN its confidence tier (never blended across tiers). `tokenTurnsWeight=0` is
+   *  correct for subtraction math but inadequate as the sole ordering key for additions,
+   *  so improvements carry an explicit benefit magnitude instead. Absent on subtracts
+   *  (they rank by `tokenTurnsWeight`). Additive + optional (no parser bump). */
+  benefitModel?: ProposalBenefitModel;
+  /** R2 WP-4B — the exemplar-drill key for a hash-only cluster rollup: pass to
+   *  `GET /api/context-optimizer/proposals/:id/cluster-exemplars`. Present only on a
+   *  rollup proposal that has drillable members. */
+  clusterExemplarRef?: string;
+}
+
+/** R2 WP-4B (Phase 4) — benefit model for improve-lever proposals. The magnitude orders
+ *  WITHIN a confidence tier only; it is NEVER combined with the evidence tier (hard
+ *  confidence grouping is preserved). One of three additive benefit kinds:
+ *   - `repeated-cost-avoided`     : tokens re-derived by a repeated improvisation.
+ *   - `failure-rate-reduced`      : count of failed/unknown/discoverability events a
+ *                                   documented grant would relieve.
+ *   - `resident-tokens-relocated` : resident tokens moved off the always-on surface. */
+export interface ProposalBenefitModel {
+  kind: 'repeated-cost-avoided' | 'failure-rate-reduced' | 'resident-tokens-relocated';
+  magnitude: number;
+  basis: string;
+}
+
+export type ContextOptimizerQuery = { lane?: AgentRoleLane; agentId?: string;
+  sinceMs?: number; untilMs?: number; minEligibleTurns?: number;
+  // WP6 acceptance leg: the workspace whose scaffold the pipeline analyzes. Optional
+  // + additive — when absent the handler resolves it from `agentId`, else returns the
+  // honest EMPTY result (no lanes ⇒ engine's empty-lane surface, never a crash).
+  workspaceId?: string;
+  // WP-4A (Phase 4): workspace-scope policy for the file-heat corpus (parity with
+  // McpToolUsageQuery). `slug` unlocks the include-proxy leg; `scopeMode` defaults to
+  // 'strict' in the file-touch query layer. `includeOperationalNoise` widens the
+  // guidance-gaps view to include low-value roles (build-generated / vendor / test).
+  slug?: string;
+  scopeMode?: WorkspaceScopeMode;
+  includeOperationalNoise?: boolean };
+
+/** WP-4A (Phase 4) — repository-relative path ROLE (spec 260-271). Classified BEFORE
+ *  coverage so file-heat can separate honest implementation/generated activity from a
+ *  real guidance gap. Roles are VERBATIM from the spec. */
+export type PathRole =
+  | 'product-source'
+  | 'guidance-or-config'
+  | 'test-or-fixture'
+  | 'build-generated'
+  | 'dependency-or-vendor'
+  | 'skill-owned'
+  | 'external'
+  | 'unknown';
+
+/** WP-4A — the ONE canonical heat score components (spec 273). Published on every
+ *  rollup row so BOTH engine and DTO sort by the SAME value (killing the old
+ *  engine-vs-DTO disagreement). `score` = weighted sum; components are the raw parts. */
+export interface FileHeatScoreComponents {
+  reads: number;
+  writes: number;
+  executes: number;
+  distinctStreams: number;
+}
+
+/** WP-4A — the canonical heat-score version. Bump when the weighting changes so a
+ *  consumer can tell two score generations apart. */
+export const FILE_HEAT_SCORE_VERSION = 1;
+
+/** WP-4A — workspace-scope disclosure for the file-heat surface, mirroring MCP-usage
+ *  `scopeMeta` (spec risk 3: a smaller visible dataset disclosed with counts, never
+ *  silence). Summed across the analyzed lanes of ONE run. */
+export interface FileHeatScopeMeta {
+  /** True when a real workspaceId scope was applied (scopeMode !== 'global-diagnostic'). */
+  workspaceScoped: boolean;
+  appliedScopeMode: WorkspaceScopeMode;
+  /** The workspace dimension degraded to the slug proxy (no row carried a real id). */
+  workspaceKeyIsSlugProxy: boolean;
+  /** file_touch rows the workspace filter dropped (no workspace identity, not proxy-rescued). */
+  droppedUnattributedTouches: number;
+  /** file_touch rows admitted ONLY via the include-proxy slug leg. */
+  proxyIncludedTouches: number;
+  /** Per-workspace-tier counts over the base (pre-filter) population. */
+  workspaceAttribution: WorkspaceAttributionBreakdown;
+}
+
+/** WP-4A — per-lane scope counts from the workspace-scoped file-touch query. Summed
+ *  across lanes into `FileHeatScopeMeta`. */
+export interface FileTouchScopeCounts {
+  droppedUnattributed: number;
+  proxyIncluded: number;
+  breakdown: WorkspaceAttributionBreakdown;
+  /** Rows carrying any REAL workspace id (explicit/launch-session/root) → drives the
+   *  honest slug-proxy flag when 0 across the run. */
+  realIdCount: number;
+}
+
+/** WP-4A — the workspace scope a file-touch query runs under (parity with
+ *  `McpToolUsageQuery` scope fields). `slugUniqueToWorkspace` is resolver-set. */
+export interface FileTouchScope {
+  workspaceId?: string;
+  slug?: string;
+  scopeMode?: WorkspaceScopeMode;
+  slugUniqueToWorkspace?: boolean;
+}
+
+/** File-heat rollup row (§5.6-redacted): `pathDisplay`/`pathHash` carry the
+ *  redaction-ready path; no usernames/home prefixes. `uncovered` marks an ADD
+ *  candidate (hot-but-uncovered). */
+export interface FileHeatRollupEntry {
+  lane: AgentRoleLane;
+  pathDisplay: string; pathHash: string;
+  coverage: string;    // CoverageBucket (inlined)
+  reads: number; writes: number; executes: number; distinctStreams: number;
+  matchConfidence?: 'exact' | 'suffix' | 'basename';
+  uncovered: boolean;
+  // ── WP-4A (Phase 4) additive projections. Absent ⇒ pre-Phase-4 shape (honest degrade). ──
+  /** Repository-relative path role (spec 260-271). */
+  role?: PathRole;
+  /** WHY this role was chosen (explainable rules, spec risk 2). */
+  roleReason?: string;
+  /** Canonical heat score (spec 273) — the SAME value engine + DTO sort by. */
+  score?: number;
+  /** Raw components behind `score`. */
+  scoreComponents?: FileHeatScoreComponents;
+  /** True when this row met the guidance-gap-candidate bar (spec 273). A strict subset
+   *  of uncovered rows: workflow-level artifact + repeated cross-stream + no coverage. */
+  guidanceGapCandidate?: boolean;
+  /** True for low-value operational-noise roles excluded from the default guidance-gaps
+   *  view (build-generated / dependency-or-vendor / test-or-fixture). Kept in diagnostics;
+   *  surfaced only under `includeOperationalNoise` (spec 271). */
+  operationalNoise?: boolean;
+}
+
+/** WP-E (P4) suppress-only diagnostics — a SUBTRACT the engine chose NOT to surface as
+ *  an actionable proposal, with the reason. NEVER a proposal kind (the P4 non-goal:
+ *  no `detector-mismatch` kind is introduced). Two suppress paths:
+ *   - `grant-mismatch-contradiction`: a related capability-family signal contradicts
+ *     deadness (e.g. the planning-surface sentinel is flagged dead but plans-read tools
+ *     ARE used — 55 calls). The subtract is withheld and the counter-evidence attached.
+ *   - `coverage-insufficient`: a behavioral subtract for a lane with insufficient
+ *     attributed sample (researcher, n≈1) — labelled `insufficient-sample`, never
+ *     actionable. */
+/** WP-2A (Priority 0) — the typed verdict every `subtract-grant-mismatch` CANDIDATE
+ *  receives, whether or not it became a live row. A defaults-only proposals call reads
+ *  the per-verdict histogram (`meta.diagnosticCounts`) to distinguish "0 rows because N
+ *  were suppressed" from "0 candidates detected".
+ *   - `emitted`                  — a live `subtract-grant-mismatch` row was produced.
+ *   - `suppressed-counterevidence` — capability-family usage contradicts deadness.
+ *   - `unresolved-documentation` — a resident section names a capability area but no
+ *                                  code-form tool name inside it resolved to a toolset
+ *                                  (heading-only, inferred → human-review, never subtracted).
+ *   - `ambiguous-toolset`        — a documented tool name maps to MULTIPLE toolsets;
+ *                                  ambiguity SUPPRESSES, never guesses.
+ *   - `section-not-resident`     — no resident section text resolved for the anchor.
+ *   - `zero-token-estimate`      — a section resolved but the estimate was 0. */
+export type GrantMismatchVerdict =
+  | 'emitted'
+  | 'suppressed-counterevidence'
+  | 'unresolved-documentation'
+  | 'ambiguous-toolset'
+  | 'section-not-resident'
+  | 'zero-token-estimate';
+
+export interface ContextOptimizerDiagnostic {
+  kind: 'grant-mismatch-contradiction' | 'coverage-insufficient' | 'capture-incomplete'
+    | 'grant-mismatch-evaluation'
+    // R2 WP-4B (Phase 4): the aggregated `granted-but-undocumented` findings that carry
+    // NO behavioral-need signal — demoted from individual zero-weight `add-missing-guidance`
+    // proposals to ONE config-completeness lane card (never adds resident tokens for
+    // grant↔doc symmetry). `undocumentedCount` + `undocumentedToolsets` carry the roll-up.
+    | 'config-completeness';
+  lane: AgentRoleLane;
+  detail: string;
+  /** The withheld subtract's proposal id (so the surface can cross-reference). */
+  relatedProposalId?: string;
+  /** contradiction: the capability family whose live usage contradicts deadness. */
+  capabilityFamily?: string;
+  /** contradiction: observed usage count of that family (the counter-evidence). */
+  counterEvidenceCalls?: number;
+  /** coverage-insufficient: the conservative evidence label (pre-C signal). */
+  evidence?: 'insufficient-sample';
+  /** coverage-insufficient: the attributed stream count that fell short. */
+  sampleStreams?: number;
+  // ── WP-2A (Priority 0) grant-mismatch-evaluation: one per candidate, typed. ──
+  /** grant-mismatch-evaluation: the typed verdict for this candidate. */
+  grantMismatchVerdict?: GrantMismatchVerdict;
+  /** grant-mismatch-evaluation: the toolset the candidate concerns. */
+  toolset?: string;
+  /** grant-mismatch-evaluation: the toolset a documented tool name resolved to (unique). */
+  resolvedToolset?: string;
+  /** grant-mismatch-evaluation: the code-form tool name mentioned in resident markdown. */
+  mentionedToolName?: string;
+  /** grant-mismatch-evaluation: how the toolset was resolved — a `code-name` match is the
+   *  only observed-safe basis for a subtract; `heading` stays inferred/human-review. */
+  resolutionConfidence?: 'code-name' | 'heading';
+  /** grant-mismatch-evaluation (ambiguous): the multiple toolsets a name resolved to. */
+  candidateToolsets?: string[];
+  /** grant-mismatch-evaluation: the resident-section token estimate used to size (or 0). */
+  tokenEstimate?: number;
+  /** grant-mismatch-evaluation: the grant epoch topology the evaluation was run against —
+   *  current-grant topology is NOT historical truth (spec risk), so the evidence carries it. */
+  grantEpoch?: string;
+  // WP-1A (Priority 0) capture-incomplete: a provisional-`never` that FAILED a
+  // fail-closed gate (matcher not exact/canonical, capture unsupported, or the
+  // unresolved-path rate crossed the declared threshold) → the subtract is withheld
+  // and downgraded rather than asserted. The reason is auditable via these fields.
+  /** capture-incomplete: fraction of unresolved-path events in the denominator window. */
+  unresolvedPathRate?: number;
+  /** capture-incomplete: whether the matcher was exact/canonical (false ⇒ glob/legacy). */
+  matcherCanonical?: boolean;
+  // ── R2 WP-4B (Phase 4) config-completeness: aggregated symmetry-only undocumented grants. ──
+  /** config-completeness: how many `granted-but-undocumented` findings (no behavioral
+   *  need) were folded into this ONE lane card. */
+  undocumentedCount?: number;
+  /** config-completeness: the folded findings — toolset key + the drift one-liner. Never
+   *  a proposal; the card is a completeness note, not a recommendation to add tokens. */
+  undocumentedToolsets?: Array<{ toolset: string; detail: string }>;
+}
+
+// ── R2 WP-4C: section-level analyzability diagnostic. ──────────────────────────
+// Explains WHY a section is not analyzable in ACTIONABLE terms (a stable reason
+// `code` + an advisory `suggestedDetector`) and FIXES the notAnalyzable dedupe bug:
+// a section is deduped by section identity + LANE SET, so a section shared across
+// lanes is counted ONCE carrying BOTH lanes (never mislabeled to the first lane
+// seen). `suggestedDetector` is ADVISORY ONLY — it informs authoring; WP-4C adds no
+// classification-changing detector (spec Risk: heuristics never drive actionable
+// subtraction). Additive: the legacy per-action `notAnalyzable[]` array is retained.
+export type AnalyzabilityReasonCode =
+  | 'pure-prose'          // imperative prose / derivability unmatchable
+  | 'sequence-deferred'   // temporal workflow: ordered events, not a countMatching predicate
+  | 'branch-deferred'     // decision branch / policy-constraint: no behavior-store predicate
+  | 'capture-missing'     // path we could not resolve, or a fail-closed capture-incomplete withhold
+  | 'exposure-low'        // insufficient exposure to observe (watch-item)
+  | 'matcher-ambiguous';  // named tool/coarse server grant with no fine resolver
+
+export interface AnalyzabilityDiagnostic {
+  /** Section identity (epoch `sourceSectionKey`, or `absPath:line` when unresolved). */
+  sectionKey: string;
+  source: { absPath: string; lineStart: number; lineEnd: number };
+  /** The FULL set of lanes this section appears under (the dedupe fix). */
+  lanes: AgentRoleLane[];
+  /** Cost of the smallest enclosing section — the trapped-cost unit. */
+  residentTokens: number;
+  /** Max exposure (turns) across the lanes it appears under — the route's sort co-factor. */
+  exposureTurns: number;
+  /** How many rejected actions this section carries (report BOTH section and action counts). */
+  actionCount: number;
+  reasons: Array<{ code: AnalyzabilityReasonCode; count: number; suggestedDetector?: string }>;
+}
+
+export interface ContextOptimizerResult {
+  generatedAtIso: string;
+  proposals: ContextOptimizerProposal[];       // ranked: hard tier groups, tokenTurnsWeight within
+  fileHeat: FileHeatRollupEntry[];             // top-N per lane passthrough (A1)
+  modelStats: {
+    residentTokensByLane: Array<{ lane: AgentRoleLane; total: number; claude: number;
+      mcp: number; skillHeaders: number; exposureTurns: number }>;
+    behaviorEvents: number;
+    attributionWarnings: number;
+    notAnalyzable: Array<{ absPath: string; line: number; label: string; lane?: AgentRoleLane }>;
+    /** R2 WP-4C: section-level, deduped-by-section+laneSet diagnostic (the dedupe-bug
+     *  fix + the actionable reason taxonomy). Additive sibling of `notAnalyzable`. */
+    analyzability?: AnalyzabilityDiagnostic[];
+  };
+  meta: { tierGroups: BehaviorEvidenceTier[]; unverifiedSuppressedCount: number;
+    /** WP-4A (Phase 4): workspace-scope disclosure for the file-heat surface. Absent on
+     *  a run with no workspace scope (honest lane-global heat). */
+    fileHeatScope?: FileHeatScopeMeta };
+  /** WP-E (P4) suppress-only guardrail + sample-gate diagnostics (additive). */
+  diagnostics?: ContextOptimizerDiagnostic[];
+}
+
+export type ContextOptimizerQueryResult =
+  | { ok: true; data: ContextOptimizerResult }
+  | { ok: false; error: string };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WP6 human-surface writers. BOTH are UI/IPC-only, human-gated, additive.
+// NEITHER auto-writes a config file: "Mark applied" records an INTENT row in
+// `optimizer_actions` (via outcome-tracker buildOptimizerActionTarget); the G2
+// sign-off inserts a `verified` row in `optimizer_derivation_verifications` only
+// when Edward clicks. No MCP path exists to either (classifier addendum §5.4).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** "Mark applied" request. The renderer supplies what the proposal already carries;
+ *  the snapshotted matchers (`epochRefs`) are optional — an empty intent row is the
+ *  honest state until the acceptance leg enriches them. */
+export interface MarkOptimizerActionAppliedRequest {
+  proposalId: string;
+  kind: ContextOptimizerProposalKind;
+  lane: AgentRoleLane;
+  target: ContextOptimizerProposal['target'];
+  proposedEdit: { summary: string; patchHash?: string; beforeHash?: string; afterHash?: string };
+  /** Lanes the watch recompute pools over (§3.3). */
+  watchLanes: AgentRoleLane[];
+  /** MUST equal the original verdict's basis (Bug-4): true for toolset/tool grants,
+   *  false for persona/CLAUDE guidance. */
+  includeSubagents: boolean;
+  /** §4.6: the proposal was `candidate-unverified` when the human clicked. Stamped
+   *  into the row note so a later reconciliation knows the gate had not cleared. */
+  unverifiedAtApply: boolean;
+  note?: string;
+  epochRefs?: Array<{ sectionKey: string; epochId: string; contentHash: string;
+                      sourcePath: string; lineStart?: number; lineEnd?: number }>;
+}
+
+export type MarkOptimizerActionAppliedResult =
+  | { ok: true; actionId: string; targetPredicateHash: string }
+  | { ok: false; error: string };
+
+/** G2 sign-off request — inserts/updates a `verified` derivation row. Every column
+ *  the parity artifact produced is supplied by the caller (the acceptance leg builds
+ *  the artifact); this writer NEVER re-derives or auto-signs. */
+export interface SignOptimizerDerivationRequest {
+  gateName: string;
+  lane: AgentRoleLane;
+  parserVersion: number;
+  compilerVersion: number;
+  corpusFingerprint: string;
+  configFingerprint: string;
+  toolsetInventoryFingerprint: string;
+  empiricalReportFingerprint: string;
+  signedHistogramJson: string;
+  signedSplitJson: string;
+  artifactPath: string;
+  artifactSha256: string;
+  signedOffBy?: string;
+  notes?: string;
+}
+
+export type SignOptimizerDerivationResult =
+  | { ok: true; gateName: string }
+  | { ok: false; error: string };
+
+// ───────────────────── Memory Watchdog (incident-2026-07-11 §5 D5) ─────────────────────
+// Renderer-facing DTOs — the IPC contract for the status-bar meter / pressure
+// banner / orphan-sweep panel. Structural mirrors of the main-process watchdog
+// types (src/main/watchdog/*, src/main/supervisor/ownership/orphan-sweep.ts);
+// kept here so the renderer never imports from `main/`.
+
+export type WatchdogPressureLevel = 'normal' | 'warn' | 'critical';
+
+export interface MemorySnapshotDto {
+  level: WatchdogPressureLevel;
+  /** false ⇒ commit sampler failed this tick; meter shows "unknown". */
+  commitKnown: boolean;
+  /** Commit charge as % of commit limit (0–100), null when commitKnown is false. */
+  commitPercent: number | null;
+  commitLimitBytes: number | null;
+  commitChargeBytes: number | null;
+  appProcessCount: number;
+  appMemoryBytes: number;
+  liveAgentCount: number;
+  agentViewCount: number;
+  projectedMinutesToLimit: number | null;
+  staticCapsOnly: boolean;
+  at: number;
+}
+
+export interface AgentMemoryUsageDto {
+  agentId: string;
+  transport: 'conpty' | 'wsl';
+  cliTreeBytes: number;
+  cliCommitBytes: number;
+  pidCount: number;
+  source: 'job' | 'tree-walk' | 'none';
+}
+
+export interface AppOwnedTotalsDto {
+  electronProcessCount: number;
+  electronBytes: number;
+  ownedCliProcessCount: number;
+  ownedCliBytes: number;
+  totalOwnedProcessCount: number;
+  totalOwnedBytes: number;
+}
+
+export interface AttributionDto {
+  perAgent: AgentMemoryUsageDto[];
+  totals: AppOwnedTotalsDto;
+  at: number;
+}
+
+export interface OrphanCandidateDto {
+  agentId: string;
+  instanceEpoch: string;
+  transport: 'conpty' | 'wsl';
+  rootPid: number | null;
+  tmuxSession: string | null;
+  priorEpoch: boolean;
+  status: 'tree' | 'no-tree' | 'unverifiable' | 'wsl';
+  pids: number[];
+}
+
+export interface ReapOrphansResultDto {
+  agentId: string;
+  action: string;
+  pids: number[];
+}
+
+// ── Detached-process transparency (incident-2026-07-11 §5 Wave 5) ──
+// Agent-launched detached OS processes self-register JSON descriptors under
+// <workspace>/.dashboard/detached/*.json. The main-side registry
+// (src/main/detached-process-registry.ts) verifies each descriptor's PID before
+// trusting its `running` flag, since a hard kill can't update the file.
+export type DetachedLiveness = 'running' | 'ended' | 'dead' | 'reused' | 'unknown';
+
+export interface DetachedProcessDto {
+  /** Absolute path of the source descriptor JSON. */
+  file: string;
+  pid: number | null;
+  /** Full recorded command line. */
+  command: string | null;
+  /** Launching AGENT_ID, when the descriptor recorded one. */
+  agentId: string | null;
+  /** Epoch-ms start time (parsed from a number or ISO string). */
+  startTime: number | null;
+  phase: string | null;
+  stateFile: string | null;
+  logFile: string | null;
+  stopFile: string | null;
+  /** The `running` flag exactly as recorded in the file (untrusted). */
+  runningFlag: boolean;
+  /** Verified verdict — never trusts `runningFlag` alone. */
+  liveness: DetachedLiveness;
+  /** Live command line of the PID when probed (drives the reuse check). */
+  actualCommand: string | null;
+  /** Set when the descriptor was unreadable / malformed (display-only row). */
+  error: string | null;
+}
 
 declare global {
   interface Window {

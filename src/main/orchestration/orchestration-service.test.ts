@@ -17,6 +17,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { OrchestrationService } from './service';
 import { DashboardClient, OrchestrationRun, OrchestrationRunContext, OrchestrationRunner } from './types';
+import { trailMaterializer } from '../plans/execution-trail-writer';
 
 // ── In-memory DB patch ───────────────────────────────────────────────
 // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -27,10 +28,20 @@ const runsStore = new Map<string, OrchestrationRun>();
 const eventsStore: Array<{ runId: string; ts: string; kind: string; payload: unknown }> = [];
 
 db.getWorkspace = (id: string) => (id === 'ws-1' ? { id: 'ws-1', path: os.tmpdir() } : null);
+// Fix 3 (planning-surface demo): start_run now resolves getPlan(planId).path for
+// rail runs. These lifecycle tests don't assert path resolution, so a plans store
+// keyed by id suffices; unknown ids fall back to null → the legacy planPath default.
+const plansStore = new Map<string, { id: string; workspaceId: string; path: string }>();
+db.getPlan = (id: string) => (plansStore.has(id) ? clone(plansStore.get(id)!) : null);
 db.insertOrchestration = (r: OrchestrationRun) => { runsStore.set(r.runId, clone(r)); };
 db.updateOrchestration = (r: OrchestrationRun) => { runsStore.set(r.runId, clone(r)); };
 db.getOrchestrationRun = (id: string) => (runsStore.has(id) ? clone(runsStore.get(id)!) : null);
 db.listOrchestrationRuns = () => Array.from(runsStore.values()).map(clone);
+// GT-C §O.2 — the fresh-run start branch now routes through the shared
+// `assertPlanRailFree`, which also consults `getLiveRailAgentForPlan`. These
+// lifecycle tests carry no live plan-bound agents, so stub it to null (the
+// one-writer-per-plan run lock is still exercised via `listOrchestrationRuns`).
+db.getLiveRailAgentForPlan = () => null;
 db.insertOrchestrationEvent = (e: any) => { eventsStore.push(clone(e)); };
 db.insertOrchestrationMember = () => {};
 db.markActiveRunsAborted = (reason: string) => {
@@ -65,6 +76,7 @@ function makeClient(overrides: Partial<DashboardClient> = {}): DashboardClient {
     recoverChatBinding: () => {},
     isInputInFlight: () => false,
     stopAgent: async () => {},
+    sectionChangedSince: () => false,
     ...overrides,
   };
 }
@@ -216,6 +228,124 @@ test('boot reconcile marks orphaned running rows aborted + emits a resume hint',
   const delivered = calls.find((c) => /dashboard_restarted/.test(c.text))!;
   assert.match(delivered.text, /orphan01/, 'resume hint carries the orphaned runId');
   assert.equal(delivered.supervisorId, 'sup-boot');
+});
+
+// ── WP6: planning-surface rail persistence + one-writer-per-plan ─────────────
+
+test('WP6: start_run persists planId + sectionAnchor onto the run row', async () => {
+  const gate = deferred();
+  const runner: OrchestrationRunner = async () => { await gate.promise; };
+  const { fn } = makeDeliver();
+  const svc = new OrchestrationService(makeClient(), fn, { serial: runner, parallel: runner });
+
+  const { runId } = svc.start_run(baseReq({ planId: 'plan-abc', sectionAnchor: 'sec_x1' }));
+  const run = getRun(runId)!;
+  assert.equal(run.planId, 'plan-abc', 'planId frozen on the run');
+  assert.equal(run.sectionAnchor, 'sec_x1', 'sectionAnchor frozen on the run');
+  gate.resolve();
+  await waitFor(() => getRun(runId)?.status === 'complete');
+});
+
+test('WP6: a second dispatch to a plan with an active writer is rejected 409', async () => {
+  const gate = deferred();
+  const runner: OrchestrationRunner = async () => { await gate.promise; };
+  const { fn } = makeDeliver();
+  const svc = new OrchestrationService(makeClient(), fn, { serial: runner, parallel: runner });
+
+  const first = svc.start_run(baseReq({ planId: 'plan-lock', sectionAnchor: 'sec_a' }));
+  await waitFor(() => getRun(first.runId)?.status === 'running');
+
+  let caught: any;
+  try {
+    svc.start_run(baseReq({ planId: 'plan-lock', sectionAnchor: 'sec_b' }));
+  } catch (err) { caught = err; }
+  assert.ok(caught, 'second dispatch to the locked plan threw');
+  assert.equal(caught.statusCode, 409, '409 conflict, not a silent second writer');
+  assert.match(caught.message, /active writer/i);
+
+  // A different plan is unaffected — the lock is per-plan, not global.
+  const other = svc.start_run(baseReq({ planId: 'plan-other', sectionAnchor: 'sec_a' }));
+  assert.ok(other.runId, 'a different plan dispatches concurrently');
+
+  // Once the first writer finishes, the plan frees up for a fresh dispatch.
+  gate.resolve();
+  await waitFor(() => getRun(first.runId)?.status === 'complete');
+  const reDispatch = svc.start_run(baseReq({ planId: 'plan-lock', sectionAnchor: 'sec_c' }));
+  assert.ok(reDispatch.runId, 'plan re-dispatchable after its writer completes');
+});
+
+test('WP6: a run WITHOUT a planId is never blocked by the one-writer lock', () => {
+  const gate = deferred();
+  const runner: OrchestrationRunner = async () => { await gate.promise; };
+  const { fn } = makeDeliver();
+  const svc = new OrchestrationService(makeClient(), fn, { serial: runner, parallel: runner });
+
+  const a = svc.start_run(baseReq());   // legacy fresh-file run, no plan rail
+  const b = svc.start_run(baseReq());   // another — no lock applies
+  assert.ok(a.runId && b.runId && a.runId !== b.runId, 'two rail-less runs coexist');
+  gate.resolve();
+});
+
+// ── GT-C §1.6 / §1.10 — T1 trail materialization ordering ────────────
+
+test('GT-C T1: a rail run materializes the trail while STILL running, exempts its members, skips stampPlanMembers', async () => {
+  const gate = deferred();
+  const runner: OrchestrationRunner = async () => { await gate.promise; };
+  const svc = new OrchestrationService(makeClient(), makeDeliver().fn, { serial: runner, parallel: runner });
+
+  let stampCalled = false;
+  (svc as any).stampPlanMembers = () => { stampCalled = true; };
+
+  const calls: Array<{ planId: string; statusAtCall: string | undefined; opts: any }> = [];
+  const orig = trailMaterializer.materialize;
+  let runId = '';
+  (trailMaterializer as any).materialize = async (planId: string, opts?: any) => {
+    calls.push({ planId, statusAtCall: getRun(runId)?.status, opts });
+  };
+  try {
+    const started = svc.start_run(baseReq({
+      planId: 'plan-t1', sectionAnchor: 'sec_z',
+      resumeLeadId: 'lead-1', resumeReviewerId: 'rev-1',
+    }));
+    runId = started.runId;
+    await waitFor(() => getRun(runId)?.status === 'running');
+    gate.resolve();
+    await waitFor(() => getRun(runId)?.status === 'complete');
+
+    assert.equal(calls.length, 1, 'materialize invoked exactly once for the rail run');
+    assert.equal(calls[0].planId, 'plan-t1');
+    assert.equal(calls[0].statusAtCall, 'running',
+      'materialize fired while the run row is STILL running (the one-writer 409 holds through the write)');
+    assert.equal(calls[0].opts.completingRunId, runId, 'the completing run exempts itself');
+    assert.deepEqual(calls[0].opts.exemptAgentIds, ['lead-1', 'rev-1'],
+      'its own members are exempt (they may still be idle)');
+    assert.equal(stampCalled, false, 'the legacy whole-file stamp is SKIPPED on a rail surface');
+  } finally {
+    (trailMaterializer as any).materialize = orig;
+  }
+});
+
+test('GT-C T1: a NON-rail run never materializes the trail and DOES stamp', async () => {
+  const gate = deferred();
+  const runner: OrchestrationRunner = async () => { await gate.promise; };
+  const svc = new OrchestrationService(makeClient(), makeDeliver().fn, { serial: runner, parallel: runner });
+
+  let stampCalled = false;
+  (svc as any).stampPlanMembers = () => { stampCalled = true; };
+
+  let materializeCalls = 0;
+  const orig = trailMaterializer.materialize;
+  (trailMaterializer as any).materialize = async () => { materializeCalls++; };
+  try {
+    const { runId } = svc.start_run(baseReq()); // no planId → legacy fresh-file run
+    await waitFor(() => getRun(runId)?.status === 'running');
+    gate.resolve();
+    await waitFor(() => getRun(runId)?.status === 'complete');
+    assert.equal(materializeCalls, 0, 'no plan rail → no trail materialization');
+    assert.equal(stampCalled, true, 'the non-rail path still stamps groupthink_run');
+  } finally {
+    (trailMaterializer as any).materialize = orig;
+  }
 });
 
 // ── Runner ───────────────────────────────────────────────────────────

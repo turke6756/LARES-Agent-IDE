@@ -501,8 +501,6 @@ function DirectoryTreeNode({
           showRevealInTree={false}
           onClose={() => setContextMenu(null)}
           onCreateFile={() => createFileInDirectory('text', 'New file name')}
-          onCreateMarkdownFile={() => createFileInDirectory('markdown', 'New Markdown file name', '.md')}
-          onCreateNotebook={() => createFileInDirectory('notebook', 'New notebook name', '.ipynb')}
           onCreateFolder={createFolderInDirectory}
           onRename={renameCurrentEntry}
           onDelete={deleteCurrentEntry}

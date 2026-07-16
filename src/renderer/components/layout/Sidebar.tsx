@@ -10,6 +10,7 @@ import { useTreeHoverStore } from '../../stores/tree-hover-store';
 import type { DirectoryEntry, PathType } from '../../../shared/types';
 import { useNamePrompt } from '../../hooks/useNamePrompt';
 import { detectSyncFolder } from '../../../shared/sync-folder-detection';
+import { useCursorMenuPosition } from '../../lib/floating/useCursorMenuPosition';
 
 // Internal drag type for reordering workspace cards. Distinct from OS folder
 // drops (dataTransfer.files), which add a new workspace.
@@ -184,6 +185,7 @@ export default function Sidebar({ width }: SidebarProps) {
   // directory cache so the tree re-lists from disk.
   const [refreshTick, setRefreshTick] = useState(0);
   const menuRef = useRef<HTMLDivElement>(null);
+  const menuPosition = useCursorMenuPosition(menuRef, contextMenu, { width: 210, height: 245 }, confirmDelete);
   const collapsed = panelLayout.sidebarCollapsed;
   const wslState = health?.wslStatus?.state;
   const wslLabel = healthChecking
@@ -598,7 +600,7 @@ export default function Sidebar({ width }: SidebarProps) {
         <div
           ref={menuRef}
           className="ui-menu fixed z-50"
-          style={{ left: contextMenu.x, top: contextMenu.y }}
+          style={{ left: menuPosition.left, top: menuPosition.top, maxHeight: 'calc(100vh - 16px)', overflowY: 'auto' }}
         >
           <div className="ui-menu-header">
             Workspace Options

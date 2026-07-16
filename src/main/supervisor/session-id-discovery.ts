@@ -78,6 +78,12 @@ export interface DiscoverCodexSessionOptions {
   openSqliteDb?: CodexStateDbOpener;
   /** Test seam: capture the fallback-fired warning. Defaults to console.warn. */
   warn?: (msg: string) => void;
+  /** Layer A demotes SQLite discovery to a fallback: checked before each poll
+   *  tick (and before the file-scan fallback), this lets the caller abandon the
+   *  poll the moment the SessionStart hook has already bound the sid. Returns
+   *  null on abort — the hook wrote the authoritative id, so there is nothing
+   *  left to discover and the fallback scan must be skipped too. */
+  shouldAbort?: () => boolean;
 }
 
 /** Snapshot rollout paths currently on disk for one Codex home root. */
@@ -116,6 +122,9 @@ export async function discoverNewCodexSession(
 
   let lastSqlOutcome: SqlQueryOutcome = { kind: 'miss' };
   while (Date.now() < deadline) {
+    // Layer A: the SessionStart hook already bound the sid — stop polling. The
+    // fallback file scan below is skipped too (we return here, not break).
+    if (options.shouldAbort?.()) return null;
     lastSqlOutcome = queryStateSqlite({
       statePath: options.statePath,
       opener: options.openSqliteDb,
@@ -148,6 +157,10 @@ export async function discoverNewCodexSession(
     if (lastSqlOutcome.kind !== 'miss') break;
     await sleep(pollIntervalMs);
   }
+
+  // Layer A: if the hook bound during the final poll wait, skip the fallback
+  // scan (it would only rediscover the same, already-bound id).
+  if (options.shouldAbort?.()) return null;
 
   const reason: 'empty-result' | 'sqlite-error' | 'schema-mismatch' =
     lastSqlOutcome.kind === 'miss' ? 'empty-result' :
@@ -342,6 +355,62 @@ export function shouldDiscoverCodexSession(opts: {
   if (opts.provider !== 'codex') return false;
   if (opts.resume) return false;
   return true;
+}
+
+/**
+ * Layer A (SessionStart-hook binding) — pure decision for a codex session-id
+ * bind arriving from the SessionStart hook (via the `/status` multi-transport
+ * or the dedicated `/api/agents/:id/codex-session` endpoint).
+ *
+ * The hook payload carries codex's own `session_id`, and the event was routed
+ * to THIS agent by its `AGENT_ID` launcher env — so the bind is env-direct and
+ * race-free even under the shared-cwd invariant (many codex agents, one cwd).
+ * No cwd / first-user-message disambiguation is involved.
+ *
+ * Ordering mirrors `captureCodexSessionId`'s success path exactly so the two
+ * bind channels can never disagree:
+ *   1. empty/absent session id       → ignore (nothing to bind)
+ *   2. unknown agent                  → ignore (report for a since-gone agent)
+ *   3. provider !== 'codex'           → ignore (only codex mints late ids)
+ *   4. agent already has a sid        → ignore  ← the NULL-GUARD. Never
+ *      overwrite an existing `resumeSessionId`; a later restart/`resume` may
+ *      have set a newer one, and clobbering it re-opens BUG-29. Idempotent when
+ *      the incoming id equals the bound one.
+ *   5. session id already owned by a  → ignore (sibling-theft protection, same
+ *      DIFFERENT agent                        spirit as selectFreshCodexRollouts'
+ *                                             excludeSessionIds)
+ *   6. otherwise                      → bind
+ *
+ * Pure / synchronous so it is unit-testable without a supervisor, DB, or FS.
+ */
+export type CodexHookBindDecision =
+  | { action: 'bind'; sessionId: string }
+  | {
+      action: 'ignore';
+      reason:
+        | 'empty-session-id'
+        | 'unknown-agent'
+        | 'non-codex'
+        | 'already-bound'
+        | 'session-owned-by-sibling';
+    };
+
+export function decideCodexHookBind(opts: {
+  agent: { provider: string; resumeSessionId?: string | null } | null | undefined;
+  sessionId: string | null | undefined;
+  /** True when some OTHER agent already carries this session id as its
+   *  `resumeSessionId`. Resolved by the caller against the agent registry. */
+  sessionOwnedByOther?: boolean;
+}): CodexHookBindDecision {
+  const sessionId = typeof opts.sessionId === 'string' ? opts.sessionId.trim() : '';
+  if (!sessionId) return { action: 'ignore', reason: 'empty-session-id' };
+  if (!opts.agent) return { action: 'ignore', reason: 'unknown-agent' };
+  if (opts.agent.provider !== 'codex') return { action: 'ignore', reason: 'non-codex' };
+  // Null-guard (mirror captureCodexSessionId): a set resumeSessionId is
+  // authoritative — never overwrite it, even with a different id.
+  if (opts.agent.resumeSessionId) return { action: 'ignore', reason: 'already-bound' };
+  if (opts.sessionOwnedByOther) return { action: 'ignore', reason: 'session-owned-by-sibling' };
+  return { action: 'bind', sessionId };
 }
 
 /**

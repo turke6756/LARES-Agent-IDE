@@ -42,12 +42,57 @@ const WIN_SCRIPT = 'C:\\Users\\me\\Projects\\AgentDashboard\\scripts\\mcp-dashbo
 
 // ── toolsetsForLane ──────────────────────────────────────────────────
 
-test('toolsetsForLane: supervisor gets orchestration/teams/comms/observability + browser-present (NO full browser/notebooks)', () => {
-  assert.equal(toolsetsForLane('supervisor'), 'orchestration,teams,comms,observability,browser-present');
+test('toolsetsForLane: supervisor gets orchestration/comms/observability-core+analytics/plans + browser-present (NO teams/full browser/notebooks)', () => {
+  // QW1 (context-optimizer §3): `teams` dropped from the supervisor grant.
+  // Planning-surface demo (2026-07-06): `plans` added to the supervisor lane.
+  // WP-F (P5): observability split into core + analytics; supervisor keeps BOTH.
+  assert.equal(toolsetsForLane('supervisor'), 'orchestration,comms,observability-core,observability-analytics,plans,browser-present');
 });
 
-test('toolsetsForLane: worker gets notebooks,comms,observability + browser-present (no orchestration/full browser)', () => {
-  assert.equal(toolsetsForLane('worker'), 'notebooks,comms,observability,browser-present');
+test('toolsetsForLane: the full `plans` grant is supervisor-ONLY (not worker/researcher/legacy)', () => {
+  // GT-A WP-A4 (I-1): the supervisor keeps the full `plans` toolset (create + read).
+  // Workers get the read-only `plans-read` subset — a DISTINCT grant, not `plans`.
+  assert.ok(toolsetsForLane('supervisor').split(',').includes('plans'));
+  for (const lane of ['worker', 'researcher', 'legacy'] as const) {
+    assert.ok(!toolsetsForLane(lane).split(',').includes('plans'), `${lane} must NOT include the full plans grant`);
+  }
+});
+
+test('toolsetsForLane: worker gets the read-only plans-read subset, NOT the full plans grant', () => {
+  // GT-A WP-A4 (I-1): plans-read added so a plan-bound worker can orient/read/
+  // observe under --strict-mcp-config; create_plan + write stay supervisor-native.
+  const grant = toolsetsForLane('worker').split(',');
+  assert.ok(grant.includes('plans-read'), 'worker must include plans-read');
+  assert.ok(!grant.includes('plans'), 'worker must NOT include the full plans grant');
+});
+
+test('toolsetsForLane: plans-read is granted to the worker lane ONLY (not supervisor/researcher/legacy)', () => {
+  assert.ok(toolsetsForLane('worker').split(',').includes('plans-read'));
+  for (const lane of ['supervisor', 'researcher', 'legacy'] as const) {
+    assert.ok(!toolsetsForLane(lane).split(',').includes('plans-read'), `${lane} must NOT include plans-read`);
+  }
+});
+
+test('toolsetsForLane: worker gets comms,observability-core,browser-present + plans-read (no notebooks/orchestration/full browser/analytics)', () => {
+  // QW1 (context-optimizer §3): `notebooks` dropped from the worker grant.
+  // GT-A WP-A4: `plans-read` appended.
+  // WP-F (P5): `observability` → `observability-core`; the analytics half is dropped.
+  assert.equal(toolsetsForLane('worker'), 'comms,observability-core,browser-present,plans-read');
+});
+
+test('toolsetsForLane (WP-F): observability-analytics is supervisor-ONLY; observability-core is supervisor+worker', () => {
+  // The acceptance split: worker lanes do NOT receive analytics tools by default.
+  const sup = toolsetsForLane('supervisor').split(',');
+  const worker = toolsetsForLane('worker').split(',');
+  assert.ok(sup.includes('observability-core'), 'supervisor must include observability-core');
+  assert.ok(sup.includes('observability-analytics'), 'supervisor must include observability-analytics');
+  assert.ok(worker.includes('observability-core'), 'worker must include observability-core');
+  assert.ok(!worker.includes('observability-analytics'), 'worker must NOT include observability-analytics');
+  // The bare (pre-split) `observability` union grant is granted to no lane now.
+  for (const lane of ['supervisor', 'worker', 'researcher', 'legacy'] as const) {
+    assert.ok(!toolsetsForLane(lane).split(',').includes('observability'),
+      `${lane} must not grant the bare pre-split observability union`);
+  }
 });
 
 test('toolsetsForLane: supervisor + worker get the open-only browser-present grant, never the full browser', () => {
@@ -226,6 +271,84 @@ test('buildDashboardMcpConfigArg: compact JSON has no whitespace after "env" (WS
     toolsets: 'browser', pathType: 'windows', scriptPath: WIN_SCRIPT, apiPort: 1, apiToken: FAKE_TOKEN,
   });
   assert.ok(!/env\s/.test(json), `compact config JSON must not contain "env" followed by whitespace; got ${json}`);
+});
+
+// ── identityEnv pass-through (GT-A WP-A4 / D-2) ──────────────────────
+
+test('buildDashboardMcpConfigArg: merges identityEnv into the windows env dict', () => {
+  const parsed = JSON.parse(buildDashboardMcpConfigArg({
+    toolsets: 'comms,observability,browser-present,plans-read',
+    pathType: 'windows',
+    scriptPath: WIN_SCRIPT,
+    apiPort: 24681,
+    apiToken: FAKE_TOKEN,
+    identityEnv: {
+      AGENT_DASHBOARD_SELF_ID: 'agent-w',
+      AGENT_DASHBOARD_WORKSPACE_ID: 'ws-1',
+      AGENT_DASHBOARD_PLAN_ID: 'plan-77',
+      AGENT_DASHBOARD_PLAN_SECTION: 'sec_abc',
+    },
+  }));
+  const env = parsed.mcpServers['agent-dashboard'].env;
+  assert.equal(env.AGENT_DASHBOARD_SELF_ID, 'agent-w');
+  assert.equal(env.AGENT_DASHBOARD_WORKSPACE_ID, 'ws-1');
+  assert.equal(env.AGENT_DASHBOARD_PLAN_ID, 'plan-77');
+  assert.equal(env.AGENT_DASHBOARD_PLAN_SECTION, 'sec_abc');
+  // fixed API keys still present + correct.
+  assert.equal(env.AGENT_DASHBOARD_API_TOKEN, FAKE_TOKEN);
+  assert.equal(env.AGENT_DASHBOARD_API_PORT, '24681');
+  assert.equal(env.DASHBOARD_MCP_TOOLSETS, 'comms,observability,browser-present,plans-read');
+});
+
+test('buildDashboardMcpConfigArg: merges identityEnv (incl. supervisor id) into the WSL env dict', () => {
+  const parsed = JSON.parse(buildDashboardMcpConfigArg({
+    toolsets: 'orchestration,comms,observability,plans,browser-present',
+    pathType: 'wsl',
+    scriptPath: WIN_SCRIPT,
+    apiPort: 24681,
+    apiToken: FAKE_TOKEN,
+    wslHostIp: '172.22.208.1',
+    identityEnv: {
+      AGENT_DASHBOARD_SELF_ID: 'sup-1',
+      AGENT_DASHBOARD_WORKSPACE_ID: 'ws-1',
+      AGENT_DASHBOARD_SUPERVISOR_ID: 'sup-1',
+    },
+  }));
+  const env = parsed.mcpServers['agent-dashboard'].env;
+  assert.equal(env.AGENT_DASHBOARD_SUPERVISOR_ID, 'sup-1');
+  assert.equal(env.AGENT_DASHBOARD_SELF_ID, 'sup-1');
+  assert.equal(env.AGENT_DASHBOARD_WORKSPACE_ID, 'ws-1');
+  assert.equal(env.AGENT_DASHBOARD_API_HOST, '172.22.208.1');
+  assert.equal(env.AGENT_DASHBOARD_API_TOKEN, FAKE_TOKEN);
+});
+
+test('buildDashboardMcpConfigArg: a hostile identityEnv CANNOT override token/host/port/toolsets', () => {
+  // identityEnv is spread FIRST, so the fixed API keys always win — proven on
+  // both branches (windows has no HOST key, WSL does).
+  const hostile = {
+    AGENT_DASHBOARD_API_TOKEN: 'ATTACKER-TOKEN',
+    AGENT_DASHBOARD_API_PORT: '9',
+    AGENT_DASHBOARD_API_HOST: 'evil.example',
+    DASHBOARD_MCP_TOOLSETS: 'orchestration',
+    AGENT_DASHBOARD_SELF_ID: 'agent-w',
+  };
+  const win = JSON.parse(buildDashboardMcpConfigArg({
+    toolsets: 'plans-read', pathType: 'windows', scriptPath: WIN_SCRIPT,
+    apiPort: 24681, apiToken: FAKE_TOKEN, identityEnv: hostile,
+  })).mcpServers['agent-dashboard'].env;
+  assert.equal(win.AGENT_DASHBOARD_API_TOKEN, FAKE_TOKEN, 'token must not be clobbered');
+  assert.equal(win.AGENT_DASHBOARD_API_PORT, '24681', 'port must not be clobbered');
+  assert.equal(win.DASHBOARD_MCP_TOOLSETS, 'plans-read', 'toolsets must not be clobbered');
+  assert.equal(win.AGENT_DASHBOARD_SELF_ID, 'agent-w', 'non-conflicting identity still lands');
+
+  const wsl = JSON.parse(buildDashboardMcpConfigArg({
+    toolsets: 'plans-read', pathType: 'wsl', scriptPath: WIN_SCRIPT,
+    apiPort: 24681, apiToken: FAKE_TOKEN, wslHostIp: '172.22.208.1', identityEnv: hostile,
+  })).mcpServers['agent-dashboard'].env;
+  assert.equal(wsl.AGENT_DASHBOARD_API_TOKEN, FAKE_TOKEN, 'token must not be clobbered (wsl)');
+  assert.equal(wsl.AGENT_DASHBOARD_API_PORT, '24681', 'port must not be clobbered (wsl)');
+  assert.equal(wsl.AGENT_DASHBOARD_API_HOST, '172.22.208.1', 'host must not be clobbered (wsl)');
+  assert.equal(wsl.DASHBOARD_MCP_TOOLSETS, 'plans-read', 'toolsets must not be clobbered (wsl)');
 });
 
 // ── redactMcpToken ───────────────────────────────────────────────────

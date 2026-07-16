@@ -4,8 +4,11 @@ import type { Agent } from '../../../shared/types';
 import StatusBadge from './StatusBadge';
 import { formatAgentToken } from '../../lib/agent-mention';
 import { RoleChips, ContextStatsBar } from './agent-card-bits';
+import ContinuationSplitButton from './ContinuationSplitButton';
+import { isContinuationEligible } from './continuation-controls';
 import { PROVIDER_META } from '../../../shared/constants';
 import { useDashboardStore } from '../../stores/dashboard-store';
+import { useCursorMenuPosition } from '../../lib/floating/useCursorMenuPosition';
 
 function getDisplayDirectory(agent: Agent): string {
   const dir = agent.workingDirectory.replace(/\\/g, '/');
@@ -66,6 +69,8 @@ export default function AgentCard({
   // a sibling agent's status update won't re-render this card.
   const isSelected = useDashboardStore((s) => s.selectedAgentId === agent.id);
   const isTerminalActive = useDashboardStore((s) => s.terminalAgentId === agent.id);
+  // Gold "snake" border while this agent is mid context-brick continuation transfer.
+  const transferring = useDashboardStore((s) => s.continuationTransferIds.has(agent.id));
   const cs = useDashboardStore((s) => s.contextStats[agent.id] ?? null);
   const selectAgent = useDashboardStore((s) => s.selectAgent);
   const setTerminalAgent = useDashboardStore((s) => s.setTerminalAgent);
@@ -83,6 +88,7 @@ export default function AgentCard({
   const [dragQuerying, setDragQuerying] = useState(false);
   const cardRef = useRef<HTMLDivElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
+  const menuPosition = useCursorMenuPosition(menuRef, contextMenu, { width: 230, height: 190 }, confirmDeleteSelected);
   const popoverRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -268,6 +274,7 @@ export default function AgentCard({
         ${agent.status === 'working' ? 'bg-accent-green/[0.03]' : ''}
         ${dragOver ? 'bg-accent-purple/[0.06] border-l-accent-purple' : ''}
         ${multiSelected ? 'agent-card-multiselected' : unread ? 'agent-card-unread' : ''}
+        ${transferring ? 'agent-transfer-glow' : ''}
       `}
       onMouseDown={(e) => {
         // Shift+click toggles multi-selection here, on mousedown: the card is
@@ -300,6 +307,8 @@ export default function AgentCard({
           <div className="flex items-center gap-2 shrink-0">
              {forking && <span className="text-[11px] text-accent-purple animate-pulse font-semibold">FORKING...</span>}
              {forkError && <span className="text-[11px] text-accent-red font-semibold">{forkError}</span>}
+             {/* Context-brick continuation control — claude-provider supervisors only. */}
+             {isContinuationEligible(agent) && <ContinuationSplitButton agent={agent} />}
              <StatusBadge status={agent.status} />
 
              {!confirmDelete && (
@@ -388,7 +397,7 @@ export default function AgentCard({
         <div
           ref={menuRef}
           className="ui-menu fixed z-50"
-          style={{ left: contextMenu.x, top: contextMenu.y }}
+          style={{ left: menuPosition.left, top: menuPosition.top, maxHeight: 'calc(100vh - 16px)', overflowY: 'auto' }}
         >
           <div className="ui-menu-header">
              Agent Actions

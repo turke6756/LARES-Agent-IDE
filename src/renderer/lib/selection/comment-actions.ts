@@ -7,9 +7,12 @@
 import type {
   PathType,
   SelectionComment,
+  SelectionCommentKind,
   SelectionCommentSendTarget,
+  SelectionCommentStatus,
   SendSelectionCommentsResult,
 } from '../../../shared/types';
+import type { PdfSelectionAnchorV1 } from '../../../shared/pdf-annotations';
 import { useDashboardStore } from '../../stores/dashboard-store';
 import { loadStaging, saveStaging, newNoteId } from '../prompt-staging';
 import { notifyStagingExternalChange } from './staging-events';
@@ -135,6 +138,71 @@ export async function sendPersistedComments(
 
   notifyCommentsChanged(filePath);
   return result;
+}
+
+// ── PDF anchor variants (plan §1.10) ─────────────────────────────────────────
+// The SAME `window.api.comments` IPC, status machine, and event invalidation as
+// the text path — only the anchor payload differs. A PDF row carries
+// `anchorType:'pdf'` + the durable `pdfAnchor`, and pins `doc_hash` to the PDF
+// fingerprint (plan §1.4) instead of a markdown content hash.
+
+export interface PdfDraftCommentCapture {
+  workspaceId: string;
+  filePath: string;
+  pathType?: PathType;
+  rootDirectory?: string;
+  quotedText: string;
+  body: string;
+  /** The durable anchor from `capturePdfAnchor` / `captureCoordinateOnlyAnchor`
+   *  (carries fingerprint, pages, rects, prefix/suffix). */
+  anchor: PdfSelectionAnchorV1;
+  /** 'comment' (default) or 'highlight' (empty body, painted overlay only). */
+  kind?: SelectionCommentKind;
+}
+
+/** Persist a PDF-anchored comment or highlight. Throws on IPC failure (callers
+ *  toast), matching `createDraftComment`. */
+export async function createPdfComment(capture: PdfDraftCommentCapture): Promise<SelectionComment> {
+  const kind = capture.kind ?? 'comment';
+  const comment = await window.api.comments.create({
+    workspaceId: capture.workspaceId,
+    kind,
+    filePath: capture.filePath,
+    pathType: capture.pathType,
+    rootDirectory: capture.rootDirectory,
+    quotedText: capture.quotedText,
+    body: kind === 'highlight' ? '' : capture.body,
+    prefix: capture.anchor.prefix || undefined,
+    suffix: capture.anchor.suffix || undefined,
+    // doc_hash pins the PDF fingerprint (plan §1.4), not a markdown hash.
+    docHash: capture.anchor.fingerprint || undefined,
+    anchorType: 'pdf',
+    pdfAnchor: capture.anchor,
+  });
+  notifyCommentsChanged(capture.filePath);
+  return comment;
+}
+
+/**
+ * Repoint a PDF comment at a freshly reattached anchor (the reattach ladder,
+ * plan §1.9, writes the outcome through here). `status` carries the ladder verdict
+ * — e.g. 'needs-review' or 'orphaned' — so the surface reflects reattachment.
+ */
+export async function updatePdfAnchor(
+  id: string,
+  anchor: PdfSelectionAnchorV1,
+  status: SelectionCommentStatus,
+  filePath: string,
+): Promise<void> {
+  await window.api.comments.update(id, {
+    anchorType: 'pdf',
+    pdfAnchor: anchor,
+    status,
+    prefix: anchor.prefix,
+    suffix: anchor.suffix,
+    docHash: anchor.fingerprint,
+  });
+  notifyCommentsChanged(filePath);
 }
 
 export async function resolveComment(id: string, filePath: string): Promise<void> {

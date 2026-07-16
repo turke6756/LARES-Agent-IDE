@@ -1,5 +1,5 @@
 export type FileType =
-  | 'markdown' | 'code' | 'text' | 'image' | 'pdf' | 'notebook' | 'csv'
+  | 'markdown' | 'code' | 'text' | 'image' | 'pdf' | 'docx' | 'notebook' | 'csv'
   | 'geotiff' | 'shapefile' | 'geopackage'
   | 'binary';
 
@@ -31,13 +31,14 @@ const CODE_EXTS: Record<string, string> = {
 
 const IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico', '.webp', '.avif', '.svg']);
 const PDF_EXTS = new Set(['.pdf']);
+const DOCX_EXTS = new Set(['.docx']);
 const NOTEBOOK_EXTS = new Set(['.ipynb', '.pynb']);
 
 const BINARY_EXTS = new Set([
   '.mp3', '.mp4', '.wav', '.ogg', '.webm', '.avi', '.mov',
   '.zip', '.tar', '.gz', '.bz2', '.7z', '.rar', '.xz',
   '.exe', '.dll', '.so', '.dylib', '.bin', '.o', '.a',
-  '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
+  '.doc', '.xls', '.xlsx', '.ppt', '.pptx',
   '.woff', '.woff2', '.ttf', '.otf', '.eot',
   '.db', '.sqlite', '.sqlite3',
 ]);
@@ -71,6 +72,7 @@ export function detectFileType(filePath: string): FileType {
   if (GEOPACKAGE_EXTS.has(ext)) return 'geopackage';
   if (IMAGE_EXTS.has(ext)) return 'image';
   if (PDF_EXTS.has(ext)) return 'pdf';
+  if (DOCX_EXTS.has(ext)) return 'docx';
   if (NOTEBOOK_EXTS.has(ext)) return 'notebook';
   if (ext in CODE_EXTS) return 'code';
   if (BINARY_EXTS.has(ext)) return 'binary';
@@ -129,6 +131,7 @@ export function getFileIconName(filePath: string, isDirectory: boolean): string 
     case 'geopackage': return 'Map';
     case 'image': return 'FileImage';
     case 'pdf': return 'FileText'; // FileText as placeholder if FileArchive isn't right
+    case 'docx': return 'FileText';
     case 'notebook': return 'BookOpen';
     case 'code':
       if (['.ts', '.tsx'].includes(ext)) return 'FileType2';
@@ -179,6 +182,7 @@ export function getFileIconColor(filePath: string, isDirectory: boolean): string
       return 'var(--color-accent-green)';
     case 'image': return 'var(--color-icon-image)';
     case 'pdf': return 'var(--color-icon-package)';
+    case 'docx': return 'var(--color-accent-blue)';
     case 'notebook': return 'var(--color-icon-py)';
     case 'code':
       if (['.ts', '.tsx'].includes(ext)) return 'var(--color-icon-ts)';

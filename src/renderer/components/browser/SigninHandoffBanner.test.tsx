@@ -67,7 +67,9 @@ describe('SigninHandoffBanner (Slice 12 — Mechanism A consent banner)', () => 
     expect(buttonByText('Hand to agent')).not.toBeNull();
   });
 
-  it('after completion: renders the transient success state naming the hostname', () => {
+  it('after completion with no probe: renders an HONEST "You confirmed this session" success (Phase 2 §D line 247)', () => {
+    // No verification (unknown site / older main) → the banner must NOT imply
+    // automatic verification; it is a human attestation only.
     useBrowserStore.setState({
       signinHandoff: null,
       signinHandoffDone: { hostname: 'mail.example' },
@@ -75,8 +77,23 @@ describe('SigninHandoffBanner (Slice 12 — Mechanism A consent banner)', () => 
     render();
 
     expect(container.querySelector('[role="status"]')).not.toBeNull();
-    expect(container.textContent).toContain('The agent can now use your signed-in session');
+    expect(container.textContent).toContain('You confirmed this session');
+    expect(container.textContent).not.toContain('Verified');
     expect(container.textContent).toContain('mail.example');
+  });
+
+  it('after a PROBED completion: renders the "Verified" success naming the hostname', () => {
+    // A safe adapter probe succeeded → the banner may honestly say "Verified".
+    useBrowserStore.setState({
+      signinHandoff: null,
+      signinHandoffDone: { hostname: 'app.joinhandshake.com', verification: 'probed' },
+    });
+    render();
+
+    expect(container.querySelector('[role="status"]')).not.toBeNull();
+    expect(container.textContent).toContain('Verified');
+    expect(container.textContent).toContain('the agent can now use your signed-in session');
+    expect(container.textContent).toContain('app.joinhandshake.com');
   });
 
   it('renders nothing when fully idle', () => {

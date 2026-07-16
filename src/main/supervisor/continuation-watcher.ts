@@ -1,4 +1,5 @@
 import type { AgentStatus } from '../../shared/types';
+import { hasSupervisorPrivilege } from '../../shared/types';
 import type { WaitingKind } from './status-monitor';
 import {
   SUPERVISOR_CONTEXT_THRESHOLDS,
@@ -23,8 +24,13 @@ import {
  *  server-side against fresh reads.
  *
  *  Fail-safe direction is ALWAYS keep-alive + page human (timeout,
- *  scrape-only, owned-busy, awaiting-human). A stuck-alive supervisor is
- *  recoverable; a killed-without-note one is not. */
+ *  scrape-only, awaiting-human). A stuck-alive supervisor is
+ *  recoverable; a killed-without-note one is not.
+ *
+ *  Owned-busy is NOT a blocker (Edward 2026-07-05): a continuation transfer
+ *  is ALLOWED while owned agents work — their worker dashboard events queue
+ *  by agent id and land in the successor session. The owned rows are still
+ *  observed for crashed-id triage and the in-flight guard. */
 
 // The trigger context percentage is an ALIAS of the shared threshold array's
 // SOFT OPPORTUNITY FLOOR ([0] = 80%) — the same per-agent source event-bridge.ts
@@ -35,16 +41,6 @@ export const CONTINUATION_TRIGGER_CONTEXT_PCT = SUPERVISOR_CONTEXT_THRESHOLDS[0]
 
 /** How often the commit-observation loop re-reads the brick row. */
 export const CONTINUATION_NOTE_POLL_MS = 5_000;
-
-/** Raw-DB-row statuses of OWNED agents that block a handoff. 'receiving' is
- *  deliberately absent: it is projection-only (overlaid by
- *  `ApiServer.withInputInFlight`) and never appears in a raw DB row, so a
- *  status-set check for it would be a silent no-op — the explicit
- *  `isInputInFlight` guard covers that hazard instead. 'crashed' is
- *  non-blocking; crashed ids ride the attempt reason for successor triage.
- *  There is no 'stopped' status. */
-export const OWNED_BUSY_BLOCKLIST: ReadonlySet<AgentStatus> =
-  new Set<AgentStatus>(['launching', 'working', 'waiting', 'restarting']);
 
 export interface OwnedAgentRow {
   id: string;
@@ -84,6 +80,9 @@ export interface TriggerSnapshot {
   orchestrationRunning: boolean;
   /** Watcher-internal: an attempt cycle is already running for this agent. */
   attemptInProgress: boolean;
+  /** Per-agent continuation toggle is OFF (Agent.continuationEnabled === false).
+   *  A hard blocker: a disabled agent must never open a handoff attempt. */
+  continuationDisabled: boolean;
   /** Watcher-internal backoff gate. */
   now: number;
   backoffUntil: number;
@@ -101,6 +100,10 @@ export function decideContinuationTrigger(s: TriggerSnapshot): TriggerDecision {
   const blockers: string[] = [];
   const crashedOwnedIds = s.owned.filter(a => a.status === 'crashed').map(a => a.id);
 
+  // Per-agent policy gate (Edward 2026-07-05): a disabled agent never opens an
+  // attempt via the normal trigger. (The force entry point bypasses the trigger
+  // but rejects a disabled agent up front, so this invariant still holds.)
+  if (s.continuationDisabled) blockers.push('continuation-disabled');
   if (s.attemptInProgress) blockers.push('attempt-in-progress');
   if (s.now < s.backoffUntil) blockers.push('backoff');
   if (s.contextPercentage === null || s.contextPercentage < CONTINUATION_TRIGGER_CONTEXT_PCT) {
@@ -108,10 +111,9 @@ export function decideContinuationTrigger(s: TriggerSnapshot): TriggerDecision {
   }
   if (s.consecutiveIdleTicks < CONTINUATION_IDLE_DEBOUNCE_TICKS) blockers.push('not-idle');
   if (s.awaitingHuman) blockers.push('awaiting-human');
-  const busy = s.owned.filter(a => OWNED_BUSY_BLOCKLIST.has(a.status));
-  if (busy.length > 0) {
-    blockers.push(`owned-busy:${busy.map(a => `${a.id}(${a.status})`).join(',')}`);
-  }
+  // Owned-busy is NOT a blocker (Edward 2026-07-05): busy owned agents no
+  // longer gate the handoff. The owned rows still feed crashed-id triage and
+  // the input-in-flight guard below.
   if (s.inputInFlightIds.length > 0) {
     blockers.push(`input-in-flight:${s.inputInFlightIds.join(',')}`);
   }
@@ -185,6 +187,17 @@ export function decidePostNoteProceed(
  *  human arrives. The hard stop is load-bearing: pre-stage spends ORIENTATION
  *  tokens, never ACTION tokens — acting before the human replies would repeat
  *  the exact class of surprise this removes. Unit-testable (fixed text). */
+/** Which active agents ride the auto continuation watcher on each monitor tick:
+ *  supervisor-PRIVILEGED (the structural workspace supervisor OR a
+ *  privilegeLane:'supervisor' persona, #19) AND claude-provider (continuation is
+ *  claude-only). Exported from this pure module so the wiring's monitorTick filter
+ *  is unit-testable without pulling in electron. */
+export function isContinuationWatchEligible(
+  a: { isSupervisor?: boolean; privilegeLane?: 'supervisor'; provider?: string },
+): boolean {
+  return hasSupervisorPrivilege(a) && a.provider === 'claude';
+}
+
 export function buildContinuationKickoffMessage(): string {
   return (
     `[DASHBOARD] Continuation pre-stage (automatic — the human has not spoken yet).\n` +
@@ -227,6 +240,9 @@ export interface ContinuationWatcherEffects {
   isIdle(agentId: string): boolean;
   /** Inc 5A — SupervisorManager.isAwaitingHuman. */
   isAwaitingHuman(agentId: string): boolean;
+  /** Per-agent continuation toggle (Agent.continuationEnabled). false → the
+   *  `continuation-disabled` trigger blocker AND force rejection. */
+  isContinuationEnabled(agentId: string): boolean;
   /** Raw DB rows via getAgentsByOwner (terminal included, 'done' filtered by wiring). */
   getOwnedAgents(agentId: string): OwnedAgentRow[];
   /** SupervisorManager.isInputInFlight — via the injected instance handle. */
@@ -274,6 +290,9 @@ interface AgentWatchState {
   openAttempt: { attemptId: string; startedAt: string } | null;
   /** Brick committed but relaunch rejected server-side — retry relaunch only. */
   committedReady: boolean;
+  /** A supervisor-requested force is queued: the next tick opens an attempt
+   *  bypassing the trigger conditions (but still honoring disabled + one-open). */
+  forcePending: boolean;
 }
 
 export class ContinuationWatcher {
@@ -299,9 +318,33 @@ export class ContinuationWatcher {
           .filter(id => this.fx.isInputInFlight(id)),
         orchestrationRunning: this.fx.hasRunningOrchestration(agentId),
         attemptInProgress: st.attemptInProgress,
+        continuationDisabled: !this.fx.isContinuationEnabled(agentId),
         now: this.fx.now(),
         backoffUntil: st.backoffUntil,
       });
+
+      // Force (Edward 2026-07-05): a supervisor-requested handoff bypasses the
+      // TRIGGER conditions (context threshold, idle debounce, backoff) but runs
+      // the NORMAL attempt cycle end-to-end. It still honors the two invariants
+      // force must never cross: a disabled agent never opens an attempt, and an
+      // attempt already in progress is not duplicated (idempotent "start now").
+      if (st.forcePending) {
+        if (!this.fx.isContinuationEnabled(agentId)) {
+          st.forcePending = false;          // disabled after the force was queued — drop it
+          continue;
+        }
+        if (st.attemptInProgress) {
+          st.forcePending = false;          // idempotent: the running cycle IS the handoff
+          continue;
+        }
+        st.forcePending = false;
+        st.attemptInProgress = true;
+        void this.runAttemptCycle(agentId, decision.crashedOwnedIds, st)
+          .catch(err => this.fx.log(`[continuation-watcher] forced attempt cycle error for ${agentId}: ${err}`))
+          .finally(() => { st.attemptInProgress = false; });
+        continue;
+      }
+
       if (!decision.fire) continue;
 
       st.attemptInProgress = true;
@@ -309,6 +352,25 @@ export class ContinuationWatcher {
         .catch(err => this.fx.log(`[continuation-watcher] attempt cycle error for ${agentId}: ${err}`))
         .finally(() => { st.attemptInProgress = false; });
     }
+  }
+
+  /** Supervisor-level entry point (Edward 2026-07-05): request the watcher open
+   *  a continuation attempt for this agent on its NEXT tick, bypassing the
+   *  trigger conditions but running the normal attempt cycle (note-request →
+   *  brick commit → post-note grace → relaunch, escape budget if the author
+   *  never responds). Force means "start now", NOT "kill now" — the attempt
+   *  cycle's own safety is preserved.
+   *   - Rejects a disabled agent (a disabled agent must never open an attempt).
+   *   - Idempotent when an attempt is already open / in progress OR a force is
+   *     already queued → returns ok without minting a second. */
+  forceHandoff(agentId: string): { ok: boolean; error?: string } {
+    if (!this.fx.isContinuationEnabled(agentId)) {
+      return { ok: false, error: 'continuation is disabled for this agent; enable it before forcing a handoff' };
+    }
+    const st = this.getState(agentId);
+    if (st.attemptInProgress || st.forcePending) return { ok: true };
+    st.forcePending = true;
+    return { ok: true };
   }
 
   /** Test/observability hook. */
@@ -330,6 +392,7 @@ export class ContinuationWatcher {
         lastBackoffMs: null,
         openAttempt: null,
         committedReady: false,
+        forcePending: false,
       };
       this.state.set(agentId, st);
     }
@@ -377,7 +440,7 @@ export class ContinuationWatcher {
     const attempt = st.openAttempt;
 
     // 1b. Relaunch-only retry: the brick already committed on a prior cycle
-    //     but the route said no (owned-busy etc.). Nothing to re-request. Re-run
+    //     but the route said no (self-busy / in-flight etc.). Nothing to re-request. Re-run
     //     the post-note grace loop: a retry-later relaunch can race a NEW turn
     //     (e.g. the human replied meanwhile), so re-observe turn-complete first.
     if (st.committedReady) {
@@ -491,7 +554,7 @@ export class ContinuationWatcher {
       this.clearCycle(st);
       return;
     }
-    // Server-side gate disagreed (owned-busy / in-flight / awaiting-human /
+    // Server-side gate disagreed (self-busy / in-flight / awaiting-human /
     // orchestration). Keep-alive, keep the committed brick, back off and
     // retry the relaunch only.
     this.fx.log(`[continuation-watcher] relaunch rejected server-side for ${agentId} (attempt ${attemptId}); keep-alive, will retry`);

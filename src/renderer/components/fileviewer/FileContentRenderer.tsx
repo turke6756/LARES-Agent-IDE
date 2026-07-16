@@ -8,7 +8,7 @@ import GeoTiffRenderer from './GeoTiffRenderer';
 import ShapefileRenderer from './ShapefileRenderer';
 import GeoPackageRenderer from './GeoPackageRenderer';
 import ImageRenderer from './ImageRenderer';
-import PdfRenderer from './PdfRenderer';
+import DocxRenderer from './DocxRenderer';
 import NotebookRenderer from './NotebookRenderer';
 import { NotebookView } from '../notebook/NotebookView';
 import type { PathType } from '../../../shared/types';
@@ -18,10 +18,11 @@ interface Props {
   filePath: string;
   pathType: PathType;
   error?: string;
+  warnings?: string[];
   tabId?: string;
 }
 
-export default function FileContentRenderer({ content, filePath, pathType, error, tabId }: Props) {
+export default function FileContentRenderer({ content, filePath, pathType, error, warnings, tabId }: Props) {
   if (error) {
     return (
       <div className="flex items-center justify-center h-full">
@@ -87,8 +88,12 @@ export default function FileContentRenderer({ content, filePath, pathType, error
     return <ImageRenderer filePath={filePath} pathType={pathType} />;
   }
 
-  if (fileType === 'pdf') {
-    return <PdfRenderer filePath={filePath} pathType={pathType} />;
+  // PDF is dispatched earlier by FileContentArea (media types render before file
+  // content is read), so this branch is dead — the orchestrator is instantiated
+  // in exactly one place. Kept out of here to avoid a second PdfRenderer path.
+
+  if (fileType === 'docx') {
+    return <DocxRenderer content={content} warnings={warnings} tabId={tabId} />;
   }
 
   if (fileType === 'notebook') {

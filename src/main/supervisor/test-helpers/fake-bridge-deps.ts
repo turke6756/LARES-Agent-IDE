@@ -111,6 +111,10 @@ export interface FakeBridgeDepsBundle {
   setLastAssistantMessageError(err: Error | null): void;
   /** BUG-20: make the file-activities dep throw on next call (one-shot). */
   setFileActivitiesError(err: Error | null): void;
+  /** BUG-41: mark/unmark an agent id as having a continuation swap in flight.
+   *  The bridge reads this via `isContinuationSwapInFlight` to decide whether a
+   *  'done' recipient queues (survives the swap) instead of dropping/purging. */
+  setContinuationSwapInFlight(agentId: string, inFlight: boolean): void;
 }
 
 export function makeFakeBridgeDeps(): FakeBridgeDepsBundle {
@@ -128,6 +132,7 @@ export function makeFakeBridgeDeps(): FakeBridgeDepsBundle {
   const fileActivities = new Map<string, FileActivity[]>();
   let nextChatError: Error | null = null;
   let nextFilesError: Error | null = null;
+  const continuationSwapsInFlight = new Set<string>();
 
   const deps: EventBridgeDeps = {
     getAgent: (id) => agents.get(id) ?? null,
@@ -182,6 +187,7 @@ export function makeFakeBridgeDeps(): FakeBridgeDepsBundle {
       },
     },
     getLastUserPtyWriteAt: (id) => lastUserPtyWriteAt.get(id),
+    isContinuationSwapInFlight: (id) => continuationSwapsInFlight.has(id),
     getLastAssistantMessage: async (id) => {
       if (nextChatError) {
         const err = nextChatError;
@@ -225,6 +231,10 @@ export function makeFakeBridgeDeps(): FakeBridgeDepsBundle {
     },
     setLastAssistantMessageError: (err) => { nextChatError = err; },
     setFileActivitiesError: (err) => { nextFilesError = err; },
+    setContinuationSwapInFlight: (agentId, inFlight) => {
+      if (inFlight) continuationSwapsInFlight.add(agentId);
+      else continuationSwapsInFlight.delete(agentId);
+    },
   };
 }
 

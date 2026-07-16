@@ -126,6 +126,7 @@ function makeBridge(agents: Record<string, Agent>, supervisor: Agent | null): Br
       forceWaiting: () => {},
     } as unknown as EventBridgeDeps['statusMonitor'],
     getLastUserPtyWriteAt: () => undefined,
+    isContinuationSwapInFlight: () => false,
     getLastAssistantMessage: async () => undefined,
     getFileActivities: () => [],
   };

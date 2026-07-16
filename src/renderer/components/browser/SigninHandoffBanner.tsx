@@ -1,6 +1,7 @@
 import React, { useEffect } from 'react';
 import * as Icons from 'lucide-react';
 import { useBrowserStore } from '../../stores/browser-store';
+import type { SigninSetupVerification } from '../../../shared/browser';
 
 // ── Mechanism-A sign-in hand-off banner (plans/website-allowlist-design.md §15)
 //
@@ -26,13 +27,26 @@ const SUCCESS_MS = 5_000;
 
 // Transient confirmation shown for a few seconds once the human hands the
 // signed-in tab to the agent. Self-dismisses; also dismissable by hand.
-function HandoffSuccess({ hostname }: { hostname: string }) {
+function HandoffSuccess({
+  hostname,
+  verification,
+}: {
+  hostname: string;
+  verification?: SigninSetupVerification;
+}) {
   const dismiss = useBrowserStore((s) => s.dismissSigninHandoffDone);
 
   useEffect(() => {
     const t = window.setTimeout(() => dismiss(), SUCCESS_MS);
     return () => clearTimeout(t);
   }, [dismiss]);
+
+  // Phase 2 (§D line 247): be HONEST about what was verified. 'probed' means a
+  // safe adapter probe confirmed the human reached an authenticated page on the
+  // service origin — we may say "Verified". Anything else ('confirmed', or a
+  // missing verification from an older main) is a human attestation only — we
+  // MUST say "You confirmed this session", never imply automatic verification.
+  const probed = verification === 'probed';
 
   return (
     <div
@@ -41,8 +55,17 @@ function HandoffSuccess({ hostname }: { hostname: string }) {
     >
       <Icons.CheckCircle2 className="w-4 h-4 text-accent-green shrink-0" />
       <span className="flex-1">
-        The agent can now use your signed-in session for{' '}
-        <span className="font-mono">{hostname}</span>.
+        {probed ? (
+          <>
+            Verified — the agent can now use your signed-in session for{' '}
+            <span className="font-mono">{hostname}</span>.
+          </>
+        ) : (
+          <>
+            You confirmed this session for{' '}
+            <span className="font-mono">{hostname}</span>; the agent will use it.
+          </>
+        )}
       </span>
       <button onClick={() => dismiss()} className="ui-btn ui-btn-ghost p-1 shrink-0" title="Dismiss">
         <Icons.X className="w-3.5 h-3.5" />
@@ -116,7 +139,7 @@ export default function SigninHandoffBanner() {
     return (
       <>
         {jit}
-        {done ? <HandoffSuccess hostname={done.hostname} /> : null}
+        {done ? <HandoffSuccess hostname={done.hostname} verification={done.verification} /> : null}
       </>
     );
   }

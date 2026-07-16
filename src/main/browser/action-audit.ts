@@ -9,6 +9,9 @@
 
 import { appendFile, readFileSync } from 'fs';
 import { createHash } from 'crypto';
+// Type-only import — erased at compile time, so this adds NO runtime dependency
+// (action-audit stays the pure compiled-node test surface; it never loads the DB).
+import type { CredentialedOpenDiagnostic } from './access-policy-store';
 
 export const AUDIT_FILE_NAME = 'browser-action-audit.jsonl';
 
@@ -35,8 +38,14 @@ export interface AuditEntry {
   /** sha256 hex of the canonical args JSON — args themselves may contain
    *  page-derived data and are deliberately NOT logged. */
   argsHash: string;
-  /** 'ok' | 'denied:<policy-code>' | 'error:<message>'. */
+  /** 'ok' | 'denied:<policy-code>' | 'error:<message>' | 'diag:<grantState>'. */
   outcome: string;
+  /** Phase 0 (BrowserSigninSharing plan §D): trusted signed-in diagnostics for a
+   *  credentialed open / startup consistency flag — ruleId, rule + caller
+   *  workspace, computed session partitions, and the classified grant state +
+   *  reason. Emitted ONLY on the diagnostic verbs (additive; every legacy row
+   *  omits it). Contains NO cookie names or values by construction. */
+  signin?: CredentialedOpenDiagnostic;
 }
 
 /** Stable hash of a tool call's arguments. */
@@ -52,7 +61,7 @@ export function hashArgs(args: unknown): string {
  * only emitted when present, so legacy lines keep the original key set.
  */
 export function formatAuditLine(entry: AuditEntry): string {
-  const ordered: Record<string, string> = { ts: entry.ts };
+  const ordered: Record<string, unknown> = { ts: entry.ts };
   if (entry.agentId !== undefined) ordered.agentId = entry.agentId;
   if (entry.agentTitle !== undefined) ordered.agentTitle = entry.agentTitle;
   if (entry.workspaceId !== undefined) ordered.workspaceId = entry.workspaceId;
@@ -62,6 +71,10 @@ export function formatAuditLine(entry: AuditEntry): string {
   ordered.verb = entry.verb;
   ordered.argsHash = entry.argsHash;
   ordered.outcome = entry.outcome;
+  // Phase 0: additive diagnostic object, appended AFTER outcome so the legacy key
+  // order is untouched. JSON.stringify keeps the line single-line (escapes any
+  // embedded newlines) and the object carries no cookie material.
+  if (entry.signin !== undefined) ordered.signin = entry.signin;
   return JSON.stringify(ordered);
 }
 

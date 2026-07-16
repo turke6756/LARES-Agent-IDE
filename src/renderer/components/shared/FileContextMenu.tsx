@@ -1,5 +1,17 @@
-import React, { useRef, useEffect } from 'react';
+import React, { useRef, useEffect, useLayoutEffect, useState } from 'react';
+import {
+  Check,
+  Code2,
+  Copy,
+  FilePlus2,
+  FolderOpen,
+  FolderPlus,
+  ListTree,
+  Pencil,
+  Trash2,
+} from 'lucide-react';
 import type { PathType } from '../../../shared/types';
+import { positionFloating } from '../../lib/floating/positionFloating';
 
 export type TreeSortMode = 'name' | 'modified' | 'created';
 
@@ -20,9 +32,7 @@ interface Props {
   onClose: () => void;
   onRevealInTree?: () => void;
   onCreateFile?: () => void;
-  onCreateMarkdownFile?: () => void;
   onCreateFolder?: () => void;
-  onCreateNotebook?: () => void;
   onRename?: () => void;
   onDelete?: () => void;
   sortMode?: TreeSortMode;
@@ -40,10 +50,30 @@ function getRelativePath(filePath: string, workingDirectory: string): string {
 
 export default function FileContextMenu({
   x, y, filePath, workingDirectory, pathType, isDirectory, showRevealInTree, onClose, onRevealInTree,
-  onCreateFile, onCreateMarkdownFile, onCreateFolder, onCreateNotebook, onRename, onDelete,
+  onCreateFile, onCreateFolder, onRename, onDelete,
   sortMode, onSortModeChange,
 }: Props) {
   const menuRef = useRef<HTMLDivElement>(null);
+  const [pos, setPos] = useState(() =>
+    positionFloating(
+      { x, y, width: 0, height: 0 },
+      { width: 220, height: 420 },
+      { width: window.innerWidth, height: window.innerHeight },
+      { placement: 'below', gap: 0 },
+    ),
+  );
+
+  useLayoutEffect(() => {
+    const el = menuRef.current;
+    if (!el) return;
+    const box = el.getBoundingClientRect();
+    setPos(positionFloating(
+      { x, y, width: 0, height: 0 },
+      { width: box.width || 220, height: box.height || 420 },
+      { width: window.innerWidth, height: window.innerHeight },
+      { placement: 'below', gap: 0 },
+    ));
+  }, [x, y]);
 
   useEffect(() => {
     const handler = (e: MouseEvent) => {
@@ -90,31 +120,29 @@ export default function FileContextMenu({
   return (
     <div
       ref={menuRef}
-      className="ui-menu fixed z-50"
-      style={{ left: x, top: y }}
+      className="ui-menu fixed z-50 overflow-y-auto"
+      style={{ left: pos.left, top: pos.top, minWidth: 220, maxHeight: 'calc(100vh - 16px)' }}
     >
       <div className="ui-menu-header">
         File Operations
       </div>
       <button onClick={handleCopyPath} className="ui-menu-item">
+        <Copy className="ui-menu-icon" aria-hidden="true" />
         Copy Path
       </button>
       <button onClick={handleCopyRelativePath} className="ui-menu-item">
+        <Copy className="ui-menu-icon" aria-hidden="true" />
         Copy Relative Path
       </button>
       <div className="ui-menu-divider" />
       {isDirectory && (
         <>
           <button onClick={() => runAction(onCreateFile)} className="ui-menu-item">
+            <FilePlus2 className="ui-menu-icon" aria-hidden="true" />
             New File...
           </button>
-          <button onClick={() => runAction(onCreateMarkdownFile)} className="ui-menu-item">
-            New Markdown File...
-          </button>
-          <button onClick={() => runAction(onCreateNotebook)} className="ui-menu-item">
-            New Notebook...
-          </button>
           <button onClick={() => runAction(onCreateFolder)} className="ui-menu-item">
+            <FolderPlus className="ui-menu-icon" aria-hidden="true" />
             New Folder...
           </button>
           <div className="ui-menu-divider" />
@@ -131,7 +159,9 @@ export default function FileContextMenu({
               onClick={() => runAction(() => onSortModeChange(mode))}
               className="ui-menu-item"
             >
-              <span className="inline-block w-3.5">{sortMode === mode ? '✓' : ''}</span>
+              <span className="ui-menu-icon" aria-hidden="true">
+                {sortMode === mode && <Check className="w-3.5 h-3.5" />}
+              </span>
               {label}
             </button>
           ))}
@@ -142,11 +172,13 @@ export default function FileContextMenu({
         <>
           {onRename && (
             <button onClick={() => runAction(onRename)} className="ui-menu-item">
+              <Pencil className="ui-menu-icon" aria-hidden="true" />
               Rename...
             </button>
           )}
           {onDelete && (
             <button onClick={() => runAction(onDelete)} className="ui-menu-item text-accent-red">
+              <Trash2 className="ui-menu-icon" aria-hidden="true" />
               Delete...
             </button>
           )}
@@ -154,15 +186,18 @@ export default function FileContextMenu({
         </>
       )}
       <button onClick={handleOpenInVSCode} className="ui-menu-item">
+        <Code2 className="ui-menu-icon" aria-hidden="true" />
         Open in VS Code
       </button>
       <button onClick={handleRevealInExplorer} className="ui-menu-item">
+        <FolderOpen className="ui-menu-icon" aria-hidden="true" />
         Reveal in Explorer
       </button>
       {showRevealInTree && onRevealInTree && (
         <>
           <div className="ui-menu-divider" />
           <button onClick={handleRevealInTree} className="ui-menu-item">
+            <ListTree className="ui-menu-icon" aria-hidden="true" />
             Reveal in Tree
           </button>
         </>

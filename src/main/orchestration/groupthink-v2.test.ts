@@ -58,6 +58,7 @@ interface FakeConfig {
   inFlight?: (id: string) => boolean;        // isInputInFlight override
   onTurn?: (a: FakeAgent, state: FakeState) => void;  // hook on each revealed turn
   seedAgents?: Array<{ id: string; title: string; provider: string; latest: RelayMessage | null }>;
+  sectionChanged?: (planId: string, anchor: string, sinceIso: string) => boolean; // WP6 done-detection
 }
 
 let agentSeq = 0;
@@ -134,6 +135,10 @@ function makeFake(cfg: FakeConfig = {}): { client: DashboardClient; state: FakeS
     recoverChatBinding: () => {},
     isInputInFlight: (id) => (cfg.inFlight ? cfg.inFlight(id) : false),
     stopAgent: async () => {},
+    // Default: no section ever changes → plan-rail runs fall through to the
+    // legacy existsSync path unless a test overrides via cfg.sectionChanged.
+    sectionChangedSince: (planId, anchor, sinceIso) =>
+      cfg.sectionChanged ? cfg.sectionChanged(planId, anchor, sinceIso) : false,
   };
 
   return { client, state };

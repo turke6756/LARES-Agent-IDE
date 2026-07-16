@@ -256,7 +256,7 @@ export default function ChatInputBar({
   // the wrapper (the dropdown's positioned ancestor): caret point + textarea
   // bounding rect − wrapper rect. The dropdown opens upward from here. On
   // NaN / throw, return null so the dropdown falls back to the corner anchor.
-  const mentionPosition = useMemo<{ left: number; top: number } | null>(() => {
+  const mentionPosition = useMemo<{ left: number; top: number; maxHeight: number } | null>(() => {
     if (!mention) return null;
     const ta = inputRef.current;
     const wrap = wrapperRef.current;
@@ -267,10 +267,14 @@ export default function ChatInputBar({
       if (!coords || Number.isNaN(coords.top) || Number.isNaN(coords.left)) return null;
       const taRect = ta.getBoundingClientRect();
       const wrapRect = wrap.getBoundingClientRect();
-      const left = taRect.left + coords.left - wrapRect.left;
+      const rawLeft = taRect.left + coords.left - wrapRect.left;
       const top = taRect.top + coords.top - wrapRect.top;
-      if (Number.isNaN(left) || Number.isNaN(top)) return null;
-      return { left, top };
+      if (Number.isNaN(rawLeft) || Number.isNaN(top)) return null;
+      const pickerWidth = Math.min(280, Math.max(0, wrapRect.width - 16));
+      const left = Math.max(8, Math.min(rawLeft, wrapRect.width - pickerWidth - 8));
+      const caretViewportY = wrapRect.top + top;
+      const maxHeight = Math.max(40, Math.min(240, caretViewportY - 8));
+      return { left, top, maxHeight };
     } catch {
       return null;
     }

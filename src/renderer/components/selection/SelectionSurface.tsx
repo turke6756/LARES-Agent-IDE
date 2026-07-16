@@ -49,10 +49,21 @@ function isMarkdownPath(filePath: string): boolean {
   return /\.(md|markdown)$/i.test(filePath);
 }
 
+function isPdfPath(filePath: string): boolean {
+  return /\.pdf$/i.test(filePath);
+}
+
+// Surfaces that can persist comment rows: markdown (gutter over the document
+// range) and PDF (the PDFium reader's own page/rect overlay + sidebar, plan 2.4
+// / Part 1.10). Exported for the commentable-path test.
+export function isCommentablePath(filePath: string): boolean {
+  return isMarkdownPath(filePath) || isPdfPath(filePath);
+}
+
 // Pure derivation, exported for unit tests. The bare path goes into
 // sourceLabel — buildQuotedPrompt prefixes `Source: file ` for file targets.
-// Comment capability is markdown-only for now: those are the surfaces with a
-// gutter to display the rows (canvas WYSIWYG + markdown read mode).
+// Comment capability covers the surfaces with a place to display the rows
+// (markdown gutter, canvas WYSIWYG, and the PDF reader overlay/sidebar).
 export function deriveFileSelectionContext(
   tab: { filePath: string; workspaceId?: string } | undefined,
   selectedWorkspaceId: string | null,
@@ -63,7 +74,7 @@ export function deriveFileSelectionContext(
     workspaceId: tab?.workspaceId ?? selectedWorkspaceId ?? '',
     sourceLabel: filePath,
     file: { filePath },
-    capabilities: { comment: isMarkdownPath(filePath) },
+    capabilities: { comment: isCommentablePath(filePath) },
   };
 }
 

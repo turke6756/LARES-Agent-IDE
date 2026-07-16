@@ -27,7 +27,7 @@
  */
 import React, { memo, useEffect, useLayoutEffect, useRef } from 'react';
 import { Crepe } from '@milkdown/crepe';
-import { editorViewCtx } from '@milkdown/kit/core';
+import { editorViewCtx, editorViewOptionsCtx } from '@milkdown/kit/core';
 import { replaceAll } from '@milkdown/kit/utils';
 import type { EditorView } from '@milkdown/kit/prose/view';
 import '@milkdown/crepe/theme/common/style.css';
@@ -234,6 +234,13 @@ function MilkdownEditor({ tabId, filePath, content, registerFreshContentHandler 
     crepeRef.current = crepe;
     activeInstances += 1;
 
+    crepe.editor.config((ctx) =>
+      ctx.update(editorViewOptionsCtx, (prev) => ({
+        ...prev,
+        attributes: { ...(prev.attributes ?? {}), spellcheck: 'true' },
+      })),
+    );
+
     /** Splice the editor state against the original bytes and push it as the
      * store draft. Returns the draft that was pushed. */
     const pushSplicedDraft = (markdown: string): string => {
@@ -243,6 +250,9 @@ function MilkdownEditor({ tabId, filePath, content, registerFreshContentHandler 
       setDraftContentRef.current(tabId, draft);
       return draft;
     };
+
+    const editorIsDirty = (): boolean =>
+      readyRef.current && !disposed && crepe.getMarkdown() !== loadSerializedRef.current;
 
     /** Dirty iff Crepe's serialization differs from the load/save baseline
      * (plan §5) — only then does the store hear about a draft. */
@@ -264,6 +274,16 @@ function MilkdownEditor({ tabId, filePath, content, registerFreshContentHandler 
       pushSplicedDraft(markdown);
     };
 
+    const flushDirtyDraft = (): string | null => {
+      if (!editorIsDirty()) {
+        if (dirtyRef.current) syncDirtyState(crepe.getMarkdown());
+        return null;
+      }
+      const markdown = crepe.getMarkdown();
+      dirtyRef.current = true;
+      return pushSplicedDraft(markdown);
+    };
+
     crepe.on((listener) => {
       listener.markdownUpdated((_ctx, markdown) => {
         syncDirtyState(markdown);
@@ -277,13 +297,12 @@ function MilkdownEditor({ tabId, filePath, content, registerFreshContentHandler 
      * our own write matches the new baseline. */
     const performSave = () => {
       if (!readyRef.current || disposed) return;
+      const draft = flushDirtyDraft();
       const markdown = crepe.getMarkdown();
-      if (markdown === loadSerializedRef.current) {
+      if (draft === null) {
         if (dirtyRef.current) syncDirtyState(markdown);
         return; // pristine — nothing to write
       }
-      dirtyRef.current = true;
-      const draft = pushSplicedDraft(markdown);
       void saveTabRef.current(tabId).then((ok) => {
         if (!ok || disposed) return;
         try {
@@ -337,7 +356,7 @@ function MilkdownEditor({ tabId, filePath, content, registerFreshContentHandler 
     // below refreshes the baseline). Phase 3 upgrades this to applying a
     // ProseMirror transaction and returning 'handled'.
     const unregister = tabId
-      ? registerRef.current?.(tabId, () => (dirtyRef.current ? 'conflict' : 'fallback'))
+      ? registerRef.current?.(tabId, () => (editorIsDirty() || dirtyRef.current ? 'conflict' : 'fallback'))
       : undefined;
 
     /** Clean-editor content swap + baseline refresh (plan §5 'fallback'). */
@@ -382,6 +401,7 @@ function MilkdownEditor({ tabId, filePath, content, registerFreshContentHandler 
       });
 
     return () => {
+      flushDirtyDraft();
       disposed = true;
       readyRef.current = false;
       if (applyFreshContentRef.current === applyFreshContent) {

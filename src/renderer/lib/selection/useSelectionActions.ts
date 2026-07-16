@@ -18,6 +18,7 @@ import AddCommentPopover from '../../components/selection/AddCommentPopover';
 import { sendSelectionToAgent } from './selection-dispatch';
 import { captureSelectionDetail } from './comment-anchors';
 import type { SelectionAgentTarget, SelectionContext } from './selection-types';
+import type { Rect } from '../floating/positionFloating';
 
 export interface SelectionCommentDetail {
   context: SelectionContext;
@@ -47,6 +48,10 @@ export interface UseSelectionActionsOptions {
 interface OpenMenuState {
   x: number;
   y: number;
+  /** Viewport rect of the selected range at capture time. The comment composer
+   *  positions itself BESIDE this so it never covers the text being commented
+   *  on (BUG-46). Captured now because the DOM selection is gone by submit. */
+  anchorRect: Rect;
   context: SelectionContext;
   prefix: string;
   suffix: string;
@@ -93,7 +98,28 @@ export function useSelectionActions({
     const container = containerRef.current;
     if (!container) return;
 
+    // `null` means a right-button mousedown occurred without a user selection;
+    // `undefined` preserves the existing behavior for keyboard context menus.
+    let selectionAtRightMouseDown: Range | null | undefined;
+    const onMouseDown = (e: MouseEvent) => {
+      if (e.button !== 2) return;
+      const sel = window.getSelection();
+      if (!sel || sel.isCollapsed || sel.rangeCount === 0 || !sel.toString().trim()) {
+        selectionAtRightMouseDown = null;
+        return;
+      }
+      const range = sel.getRangeAt(0);
+      selectionAtRightMouseDown =
+        container.contains(range.startContainer) && container.contains(range.endContainer)
+          ? range.cloneRange()
+          : null;
+    };
+
     const onContextMenu = (e: MouseEvent) => {
+      const preexistingRange = selectionAtRightMouseDown;
+      selectionAtRightMouseDown = undefined;
+      if (preexistingRange === null) return;
+
       const sel = window.getSelection();
       if (!sel || sel.isCollapsed || sel.rangeCount === 0) return;
       const text = sel.toString();
@@ -102,19 +128,36 @@ export function useSelectionActions({
       if (!container.contains(range.startContainer) || !container.contains(range.endContainer)) {
         return;
       }
+      if (preexistingRange && (
+        range.startContainer !== preexistingRange.startContainer ||
+        range.startOffset !== preexistingRange.startOffset ||
+        range.endContainer !== preexistingRange.endContainer ||
+        range.endOffset !== preexistingRange.endOffset
+      )) return;
       e.preventDefault();
       const { prefix, suffix } = captureSelectionDetail(range, container);
+      // Range.getBoundingClientRect is absent in jsdom; fall back to a zero-size
+      // rect at the cursor so placement still works under test.
+      const r =
+        typeof range.getBoundingClientRect === 'function'
+          ? range.getBoundingClientRect()
+          : ({ left: e.clientX, top: e.clientY, width: 0, height: 0 } as DOMRect);
       setMenu({
         x: e.clientX,
         y: e.clientY,
+        anchorRect: { x: r.left, y: r.top, width: r.width, height: r.height },
         context: { ...getContextRef.current(), quotedText: text },
         prefix,
         suffix,
       });
     };
 
+    container.addEventListener('mousedown', onMouseDown, true);
     container.addEventListener('contextmenu', onContextMenu);
-    return () => container.removeEventListener('contextmenu', onContextMenu);
+    return () => {
+      container.removeEventListener('mousedown', onMouseDown, true);
+      container.removeEventListener('contextmenu', onContextMenu);
+    };
   }, [containerRef]);
 
   // While the menu is open: close on scroll/resize/Escape. Click-away is
@@ -222,8 +265,7 @@ export function useSelectionActions({
       : null,
     popover
       ? React.createElement(AddCommentPopover, {
-          x: popover.x,
-          y: popover.y,
+          anchorRect: popover.anchorRect,
           quotedText: popover.context.quotedText,
           workspaceId: popover.context.workspaceId,
           mode: popover.mode,

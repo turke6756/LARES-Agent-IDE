@@ -2,9 +2,9 @@ import { ipcMain, dialog, shell, BrowserWindow, nativeTheme } from 'electron';
 import type { WebContents } from 'electron';
 import * as fs from 'fs';
 import { persistTheme } from './theme-persistence';
-import type { PathType, FsEvent, DetachRequest, DetachResult, ScanOverheadRequest, ScanOverheadResult, PriorSessionChat } from '../shared/types';
-import { TAB_CHANNELS } from '../shared/types';
-import { createDetachedWindow, canWrite, handleDetachedCloseReply, type DetachedWindowDeps } from './detached-windows';
+import type { PathType, FsEvent, DetachRequest, DetachResult, ViewDetachRequest, ScanOverheadRequest, ScanOverheadResult, ExtractKnowledgeRequest, ExtractKnowledgeResult, SkillUsageQuery, SkillUsageQueryResult, McpToolUsageQuery, McpToolUsageQueryResult, PriorSessionChat, ContextOptimizerQuery, ContextOptimizerQueryResult, MarkOptimizerActionAppliedRequest, MarkOptimizerActionAppliedResult, SignOptimizerDerivationRequest, SignOptimizerDerivationResult } from '../shared/types';
+import { TAB_CHANNELS, VIEW_CHANNELS } from '../shared/types';
+import { createDetachedWindow, createDetachedViewWindow, broadcastToDetachedViews, canWrite, handleDetachedCloseReply, type DetachedWindowDeps } from './detached-windows';
 import { AgentSupervisor } from './supervisor';
 import {
   getWorkspaces, createWorkspace, deleteWorkspace, getWorkspace, reorderWorkspaces,
@@ -18,6 +18,7 @@ import {
   markSelectionCommentsQueued, markSelectionCommentsSent, markSelectionCommentsSendFailed,
 } from './database';
 import { sendSelectionComments } from './selection-comments-send';
+import { assertPlanRailFree } from './orchestration/plan-ownership';
 import { getApiToken } from './security/api-auth';
 import { openInVSCode, openFileInVSCode, openFileInWorkspace } from './vscode-launcher';
 import { getPassiveWslStatus, isTmuxAvailable, isClaudeAvailableInWsl } from './wsl-bridge';
@@ -25,10 +26,25 @@ import { execFileSync } from 'child_process';
 import { detectPathType, ensureWindowsPath } from './path-utils';
 import { readFileContents, listDirectoryEntriesAsync } from './file-reader';
 import { writeFileContents, createFile, createDirectory, renameEntry, moveEntry, copyFiles, deleteEntry } from './file-writer';
+import { createMarkdownFromDocx } from './docx-converter';
 import { subscribe as subscribeFsWatch } from './fs-watcher';
 import { scanPersonas, scaffoldPersona, setPersonaLane } from './persona-scanner';
 import { ensureJupyterServer, listKernelspecs } from './jupyter-server';
 import { runOverheadScan } from './context-overhead/ipc-deps';
+import { runKnowledgeExtract } from './agent-knowledge/knowledge-extract-runner';
+import {
+  runOptimizerAnalyze,
+  markOptimizerActionApplied,
+  signOptimizerDerivation,
+  type OptimizerWriterDb,
+} from './context-optimizer/optimizer-surface';
+import { buildAssembleContext, assembleAllLaneInputs } from './context-optimizer/optimizer-assemble';
+import { makeProductionBirthdayResolver } from './context-optimizer/optimizer-production';
+import type { PipelineDb } from './context-optimizer/optimizer-pipeline';
+import { getSharedParseManager, setParseManagerProgressSink } from './skill-analytics/parse-manager-factory';
+import { querySkillUsage, type QueryDb } from './skill-analytics/queries';
+import { queryMcpToolUsage } from './skill-analytics/mcp-tool-usage-queries';
+import { getDb } from './database';
 
 function resolveMutationPathType(primaryPath: string, rootDirectory: string, pathType?: PathType): PathType {
   const primaryType = detectPathType(primaryPath);
@@ -56,7 +72,14 @@ export function registerIpcHandlers(
   // Agent handlers
   ipcMain.handle('agent:list', (_e, workspaceId) => getAgentsByWorkspace(workspaceId));
   ipcMain.handle('agent:list-all', () => getAllAgents());
-  ipcMain.handle('agent:launch', (_e, input) => supervisor.launchAgent(input));
+  ipcMain.handle('agent:launch', (_e, input) => {
+    // GT-C §O.2 — the renderer "Launch Agent" IPC path must apply the SAME
+    // one-writer-per-plan guard as `POST /api/agents` so the two dispatch routes
+    // cannot drift. Normalizes both the camelCase and snake_case plan bindings.
+    const planId = input?.planId ?? input?.plan_id;
+    if (typeof planId === 'string' && planId !== '') assertPlanRailFree(planId);
+    return supervisor.launchAgent(input);
+  });
   ipcMain.handle('agent:stop', (_e, id) => supervisor.stopAgent(id));
   ipcMain.handle('agent:restart', (_e, id) => supervisor.restartAgent(id));
   ipcMain.handle('agent:get-log', (_e, id, lines) => supervisor.getAgentLog(id, lines));
@@ -102,6 +125,59 @@ export function registerIpcHandlers(
 
   // Account-wide Claude subscription usage limits (singleton, not per-agent).
   ipcMain.handle('usage:get-limits', () => supervisor.getUsageLimits());
+
+  // ── D4 startup orphan sweep (incident-2026-07-11 §5) ──
+  // `list` enumerates leftover CLI process trees from prior app epochs (+ current
+  // terminal rows) without killing anything; `reap` bulk-terminates the selected
+  // ones (each re-verified before any kill; unverifiable owners left in place).
+  // Renderer UI is a follow-on — these are the main-process contract.
+  ipcMain.handle('ownership:list-orphans', () => supervisor.listOrphanCandidates());
+  ipcMain.handle('ownership:reap-orphans', (_e, agentIds: string[]) => supervisor.reapOrphans(agentIds ?? []));
+
+  // ── A6 (wp2b §5) — skill-analytics indexing contract ──
+  // Lazily constructed on first query so the corpus walk / cursor reads happen only
+  // when a panel actually asks. `index-status` is the contract entrypoint: it kicks the
+  // first-run cooperative backfill (returns {indexing, progress} immediately) and, once
+  // complete, tail-parses within the steady-state budget. Progress is ALSO pushed to the
+  // renderer via `skill-analytics:index-progress` for panels mounted mid-backfill.
+  // Shared with the MCP/HTTP read route (api-server) so a fresh-install backfill is
+  // never kicked twice. The renderer progress-push sink is layered on here, where
+  // `mainWindow` lives.
+  setParseManagerProgressSink((p) => {
+    if (!mainWindow.isDestroyed()) mainWindow.webContents.send('skill-analytics:index-progress', p);
+  });
+  const getParseManager = getSharedParseManager;
+  ipcMain.handle('skill-analytics:index-status', () => getParseManager().ensureIndexed());
+  ipcMain.handle('skill-analytics:index-poll', () => getParseManager().status());
+
+  // WP3 (§P2.2) — read-only Skill Usage Analytics query. Parse-first (§P2.1):
+  // `ensureIndexed()` kicks the first-run backfill (non-blocking) or tail-parses
+  // within budget in steady state, THEN we run pure SQL over the freshest rows.
+  // During an in-progress backfill this returns partial data (honest, not an
+  // error) — the panel also renders indexing progress off the index contract.
+  ipcMain.handle('skill-analytics:query', (_e, req: SkillUsageQuery): SkillUsageQueryResult => {
+    try {
+      getParseManager().ensureIndexed();
+      const data = querySkillUsage(getDb() as unknown as QueryDb, req ?? {});
+      return { ok: true, data };
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+  });
+
+  // wave2-mcp-tool-observability §2.2 — per-MCP-tool usage query. Same parse-first
+  // contract as skill-analytics:query (ensureIndexed → pure SQL over the freshest
+  // rows). Separate handler + DTO so the MCP tab lazy-loads without dragging the
+  // skill-effectiveness engine, and the agent-facing read tool can reuse the engine.
+  ipcMain.handle('mcp-tool-usage:query', (_e, req: McpToolUsageQuery): McpToolUsageQueryResult => {
+    try {
+      getParseManager().ensureIndexed();
+      const data = queryMcpToolUsage(getDb() as unknown as QueryDb, req ?? {});
+      return { ok: true, data };
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+  });
 
   // Chat pane (session-log-reader)
   ipcMain.handle('agent:get-chat-events', (_e, agentId, sinceUuid) => {
@@ -158,6 +234,13 @@ export function registerIpcHandlers(
     updateAgentSupervised(id, supervised);
     return getAgent(id);
   });
+
+  // Per-agent continuation control (Edward 2026-07-05). Both back the pinned
+  // preload contract; the supervisor methods own the persist / force logic.
+  ipcMain.handle('agent:set-continuation-enabled', (_e, id, enabled) =>
+    supervisor.setContinuationEnabled(id, enabled));
+  ipcMain.handle('agent:force-continuation-handoff', (_e, id) =>
+    supervisor.forceContinuationHandoff(id));
 
   // Team handlers
   ipcMain.handle('team:create', (_e, input) => {
@@ -397,6 +480,11 @@ export function registerIpcHandlers(
   ipcMain.handle(TAB_CHANNELS.detach, (_e, req: DetachRequest): DetachResult =>
     createDetachedWindow(req, detachedWindowDeps));
 
+  // Detachable top-level views — spawn a trusted window that renders one view
+  // (Dashboard, …) full-screen. Reuses the same trust deps as the file factory.
+  ipcMain.handle(VIEW_CHANNELS.detach, (_e, req: ViewDetachRequest): DetachResult =>
+    createDetachedViewWindow(req, detachedWindowDeps));
+
   // Phase 2 dirty-on-close: the detached renderer replies here with the user's
   // decision after a close-query. 'save' arrives only after the renderer has
   // persisted the buffer; main just closes (or keeps open on 'cancel').
@@ -417,9 +505,80 @@ export function registerIpcHandlers(
     }
   });
 
+  // "What This Agent Knows" — deterministic knowledge extraction (P3.2 / WP4).
+  // Additive sibling of the overhead scan; same discriminated-result contract.
+  ipcMain.handle('agent-knowledge:extract', async (_e, req: ExtractKnowledgeRequest): Promise<ExtractKnowledgeResult> => {
+    try {
+      const graph = runKnowledgeExtract(req.workspaceId, req.agentId);
+      return { ok: true, graph };
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+  });
+
+  // ── Context Optimizer (WP6) — behavior-grounded proposal surface. ──
+  // Read-only analyze; production supplies no per-lane inputs yet (acceptance leg),
+  // so this returns the engine's honest EMPTY result rather than a blank panel.
+  ipcMain.handle('context-optimizer:analyze', async (_e, req: ContextOptimizerQuery): Promise<ContextOptimizerQueryResult> => {
+    try {
+      // Resolve the workspace to analyze: explicit `workspaceId`, else the agent's own
+      // workspace, else none (→ honest EMPTY result, unchanged from the pre-wiring path).
+      const workspaceId = req.workspaceId ?? (req.agentId ? getAgent(req.agentId)?.workspaceId : undefined);
+      const base = { generatedAtIso: new Date().toISOString(), nowMs: Date.now(), query: req };
+      if (!workspaceId) {
+        return { ok: true, data: runOptimizerAnalyze(base) };
+      }
+      // Live pipeline: assemble one RawLaneInputs per real persona lane over the
+      // workspace scaffold + DB spine, and date brand-new sections via the git-backed
+      // birthday resolver (backfill→classify ordering enforced inside runOptimizerPipeline).
+      const db = getDb() as unknown as PipelineDb;
+      const ctx = buildAssembleContext({ workspaceId, db });
+      const nodePath = require('node:path') as typeof import('node:path');
+      const repoDir = nodePath.resolve(__dirname, '..', '..', '..');
+      const data = runOptimizerAnalyze({
+        ...base,
+        lanes: assembleAllLaneInputs(ctx),
+        db,
+        backfillTargets: ctx.residentTargets,
+        birthdayResolver: makeProductionBirthdayResolver(repoDir),
+      });
+      return { ok: true, data };
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+  });
+
+  // "Mark applied" — records a human-intent row in optimizer_actions. NEVER edits a
+  // config file (the human owns the actual edit); guarded by an explicit confirm in
+  // the renderer. Stamps §4.6 `unverified_at_apply` when the proposal was unverified.
+  ipcMain.handle('context-optimizer:mark-applied', async (_e, req: MarkOptimizerActionAppliedRequest): Promise<MarkOptimizerActionAppliedResult> => {
+    try {
+      const out = markOptimizerActionApplied(getDb() as unknown as OptimizerWriterDb, req, Date.now());
+      return { ok: true, ...out };
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+  });
+
+  // G2 sign-off (classifier addendum §5.4) — UI/IPC-only. Inserts a `verified`
+  // derivation row when Edward clicks; no MCP path, no auto-sign.
+  ipcMain.handle('context-optimizer:sign-derivation', async (_e, req: SignOptimizerDerivationRequest): Promise<SignOptimizerDerivationResult> => {
+    try {
+      const out = signOptimizerDerivation(getDb() as unknown as OptimizerWriterDb, req, Date.now());
+      return { ok: true, ...out };
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+  });
+
   // File viewer handlers
   ipcMain.handle('files:read', async (_e, filePath, pathType) => {
     return await readFileContents(filePath, pathType || detectPathType(filePath));
+  });
+
+  ipcMain.handle('files:convert-docx-to-markdown', async (_e, filePath, rootDirectory, pathType) => {
+    const resolved = resolveMutationPathType(filePath, rootDirectory, pathType);
+    return await createMarkdownFromDocx(filePath, rootDirectory, resolved);
   });
 
   ipcMain.handle('files:list-directory', async (_e, dirPath, pathType) => {
@@ -597,12 +756,20 @@ export function registerIpcHandlers(
     }
   });
 
+  // Broadcast a main→renderer push to the shell AND every detached view window.
+  // The shell's data feeds are otherwise main-window-only; a torn-off Dashboard
+  // grid needs the same stream (status, deletions, context stats, heat) to stay
+  // live. Only the dashboard-relevant feeds below use `emit`; per-window feeds
+  // (chat, terminal, file:open-tab) stay mainWindow-only.
+  const emit = (channel: string, ...args: unknown[]) => {
+    if (!mainWindow.isDestroyed()) mainWindow.webContents.send(channel, ...args);
+    broadcastToDetachedViews(channel, ...args);
+  };
+
   // Forward supervisor status changes to renderer
   supervisor.on('statusChanged', (data) => {
-    if (!mainWindow.isDestroyed()) {
-      const agent = getAgent(data.agentId);
-      mainWindow.webContents.send('agent:status-changed', { ...data, agent });
-    }
+    const agent = getAgent(data.agentId);
+    emit('agent:status-changed', { ...data, agent });
   });
 
   // Forward agent deletions so the cross-workspace status map (sidebar waiting
@@ -610,9 +777,7 @@ export function registerIpcHandlers(
   // `statusChanged`, so without this a background-workspace agent that was
   // `waiting` at delete time would strand its red outline forever.
   supervisor.on('agentDeleted', ({ agentId }: { agentId: string }) => {
-    if (!mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('agent:deleted', { agentId });
-    }
+    emit('agent:deleted', { agentId });
   });
 
   // WP-P2 — async initial-prompt delivery failures surface through the same
@@ -623,18 +788,16 @@ export function registerIpcHandlers(
     }
   });
 
-  // Forward file activity events to renderer
+  // Forward file activity events to renderer (+ detached views — drives the
+  // grid's per-agent heat, which a torn-off Dashboard shows too).
   supervisor.on('fileActivity', (activity) => {
-    if (!mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('agent:file-activity', activity);
-    }
+    emit('agent:file-activity', activity);
   });
 
-  // Forward context stats changes to renderer
+  // Forward context stats changes to renderer (+ detached views — the grid
+  // cards render a per-agent context bar off this feed).
   supervisor.on('contextStatsChanged', (stats) => {
-    if (!mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('agent:context-stats-changed', stats);
-    }
+    emit('agent:context-stats-changed', stats);
   });
 
   // Forward account-wide usage-limits changes to renderer

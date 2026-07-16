@@ -12,6 +12,9 @@ import type {
   OverheadSource,
   OverheadSourceKind,
 } from '../../shared/types';
+import { extractClaudeImports } from '../shared/claude-import-resolver';
+import { splitFrontmatter } from '../shared/frontmatter-split';
+import { classifyPathMutability } from '../shared/path-mutability';
 import type { FileReader } from './context-overhead-analyzer';
 import type { PathOps } from './paths';
 import type { TokenEstimator } from './token-estimator';
@@ -31,24 +34,9 @@ export interface WalkUpDeps {
 
 const IMPORT_MAX_DEPTH = 4;
 
-// ── @import extraction (R5) ──────────────────────────────────────────────────
-
-/** Extract `@path` import targets from a CLAUDE.md body. Skips fenced code
- *  blocks (``` … ```), inline code spans (`…`), and backtick-escaped tokens
- *  (`@README`). Returns raw path strings in document order (relative or
- *  absolute). An `@` only starts an import at a line boundary or after
- *  whitespace, so `foo@bar.com` is never treated as an import. */
-export function extractClaudeImports(markdown: string): string[] {
-  const noFences = markdown.replace(/```[\s\S]*?```/g, '');
-  const noInline = noFences.replace(/`[^`]*`/g, '');
-  const out: string[] = [];
-  const re = /(?:^|\s)@(\S+)/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(noInline)) !== null) {
-    out.push(m[1]);
-  }
-  return out;
-}
+// `@import` extraction now lives in the shared `claude-import-resolver` module
+// (base plan §3.2) and is imported above — walk-up no longer carries a private
+// byte-identical copy.
 
 // ── source construction ──────────────────────────────────────────────────────
 
@@ -81,6 +69,7 @@ function buildSource(
   label: string,
   scope: InheritanceScope,
   inherited: boolean,
+  origin: OverheadSource['origin'] = 'walk-up',
 ): OverheadSource {
   const file = deps.reader.read(resolved);
   const exists = file !== null;
@@ -98,9 +87,124 @@ function buildSource(
     exists,
     inherited,
     estimate,
+    origin,
+    mutable: classifyPathMutability(resolved),
+    disclosureTier: 'resident', // generic config surfaces are injected each session
     children: [],
     warnings: [],
   };
+}
+
+/** Split a SKILL.md into two costed sources (P1.1): a `skill-header`
+ *  (resident YAML frontmatter, always-on baseline) and a `skill-body`
+ *  (on-invoke body, scenario overlay). Both carry the same `resolvedPath` so
+ *  clicking either opens the file; `@import` resolution attaches to the body. */
+function buildSkillSources(
+  deps: WalkUpDeps,
+  resolved: string,
+  label: string,
+  scope: InheritanceScope,
+  inherited: boolean,
+): OverheadSource[] {
+  const file = deps.reader.read(resolved);
+  const exists = file !== null;
+  const mutable = classifyPathMutability(resolved);
+  const base = {
+    label,
+    resolvedPath: resolved,
+    dedupeKey: resolved,
+    sourceScope: scope,
+    openable: exists,
+    exists,
+    inherited,
+    origin: 'frontmatter-split' as const,
+    mutable,
+  };
+  if (!exists) {
+    // Missing skill: emit a single header row so the row is still visible.
+    return [{
+      ...base,
+      id: `${resolved}#skill-header`,
+      kind: 'skill-header',
+      disclosureState: 'advertised-header',
+      disclosureTier: 'resident',
+      estimate: deps.estimator.estimate(''),
+      children: [],
+      warnings: [],
+    }];
+  }
+  const split = splitFrontmatter(file!.content);
+  const header: OverheadSource = {
+    ...base,
+    id: `${resolved}#skill-header`,
+    kind: 'skill-header',
+    disclosureState: 'advertised-header',
+    disclosureTier: 'resident', // YAML header is the always-on baseline
+    estimate: deps.estimator.estimate(split.header),
+    children: [],
+    warnings: split.confidence === 'low'
+      ? ['No valid YAML frontmatter fence — header is a synthesized estimate.']
+      : [],
+  };
+  const body: OverheadSource = {
+    ...base,
+    id: `${resolved}#skill-body`,
+    kind: 'skill-body',
+    disclosureState: 'scenario-body',
+    disclosureTier: 'on-demand', // body loads only when the skill runs
+    estimate: deps.estimator.estimate(split.body),
+    children: [],
+    warnings: split.approximate ? ['Body exceeded the max-readable cap — truncated estimate.'] : [],
+  };
+  return [header, body];
+}
+
+/** Split a MEMORY.md into two costed rows (Wave-2 §C2), modeled on
+ *  `buildSkillSources`: a `memory-index` (resident, 0 tokens — the manual "check
+ *  MEMORY.md" pointer already lives inside CLAUDE.md) and a `memory-body`
+ *  (on-demand, MEASURED size for the labeled pool but NOT injected each session).
+ *  Both carry the same `resolvedPath` so clicking either opens the file. */
+function buildMemorySources(
+  deps: WalkUpDeps,
+  resolved: string,
+  label: string,
+  scope: InheritanceScope,
+  inherited: boolean,
+): OverheadSource[] {
+  const file = deps.reader.read(resolved);
+  const exists = file !== null;
+  const mutable = classifyPathMutability(resolved);
+  const base = {
+    label,
+    resolvedPath: resolved,
+    dedupeKey: resolved,
+    sourceScope: scope,
+    openable: exists,
+    exists,
+    inherited,
+    origin: 'frontmatter-split' as const,
+    mutable,
+  };
+  const index: OverheadSource = {
+    ...base,
+    id: `${resolved}#memory-index`,
+    kind: 'memory-index',
+    disclosureTier: 'resident',
+    estimate: deps.estimator.estimate(''), // resident cost is 0 — pointer counted inside CLAUDE.md
+    children: [],
+    warnings: ['MEMORY.md is progressively disclosed (autoMemoryEnabled:false; CLAUDE.md instructs a manual read at session start). No index is injected, so resident cost is 0 — the one-line pointer is already counted inside CLAUDE.md.'],
+  };
+  if (!exists) return [index];
+  const body: OverheadSource = {
+    ...base,
+    id: `${resolved}#memory-body`,
+    kind: 'memory-body',
+    disclosureTier: 'on-demand',
+    estimate: deps.estimator.estimate(file!.content), // measured size, on-demand pool only
+    children: [],
+    warnings: [],
+  };
+  return [index, body];
 }
 
 /** A dedup placeholder: the file was already counted via another frame, so it is
@@ -124,6 +228,9 @@ function dedupPlaceholder(
     exists: true,
     inherited,
     estimate: estimator.estimate(''), // zero — counted elsewhere
+    origin: 'walk-up',
+    mutable: classifyPathMutability(resolved),
+    disclosureTier: 'resident',
     children: [],
     warnings: ['Already counted via a nearer scope (deduped).'],
   };
@@ -183,7 +290,7 @@ export function analyzeWalkUp(
       const importPath = ops.isAbsolute(p)
         ? ops.resolve(p)
         : ops.join(ops.dirname(source.resolvedPath), p);
-      const child = buildSource(deps, importPath, 'import', `@${p}`, source.sourceScope, source.inherited);
+      const child = buildSource(deps, importPath, 'import', `@${p}`, source.sourceScope, source.inherited, 'import');
       if (seen.has(importPath)) {
         source.children!.push(
           dedupPlaceholder(importPath, 'import', `@${p}`, source.sourceScope, source.inherited, deps.estimator),
@@ -213,6 +320,23 @@ export function analyzeWalkUp(
       // Skip non-existent candidates silently (a missing CLAUDE.md is the norm).
       if (!deps.reader.exists(resolved)) continue;
       seen.add(resolved);
+      if (kind === 'skill') {
+        // Split into skill-header (baseline) + skill-body (scenario) (P1.1).
+        const [header, body] = buildSkillSources(deps, resolved, cand.rel, scope, inherited);
+        // @imports live in the body markdown → attach them under the body row.
+        if (body) resolveImports(body, 0);
+        sources.push(header);
+        if (body) sources.push(body);
+        continue;
+      }
+      if (kind === 'memory') {
+        // Split into memory-index (resident, 0) + memory-body (on-demand, measured) (§C2).
+        const [index, body] = buildMemorySources(deps, resolved, cand.rel, scope, inherited);
+        if (body) resolveImports(body, 0); // memory indexes may @import
+        sources.push(index);
+        if (body) sources.push(body);
+        continue;
+      }
       const source = buildSource(deps, resolved, kind, cand.rel, scope, inherited);
       resolveImports(source, 0);
       sources.push(source);
