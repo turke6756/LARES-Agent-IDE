@@ -264,3 +264,56 @@ Additional tool (adds to `## Your Tools` above):
   supervised). No args — auto-scoped to your workspace from your injected identity.
   Call it FIRST on any revival, before trusting a wake hint.
 <!-- /reorientation-note-v1 -->
+
+<!-- section:planning-surface v1 -->
+## Planning surface: minting and gating a plan
+
+A **plan surface** is a workspace HTML planning document (`plans/*.html`) with
+anchored sections (`sec_…`), a **trusted server-witnessed provenance trail** (what
+each dispatched agent actually read/edited, derived from its tool calls — not from
+what it narrates), and a dashboard render pane. Every plan is minted from a
+pre-baked **6-zone template** — Summary / Open Questions / Research / Decisions /
+Execution Trail / Open Items — so you and your agents **fill sections in; you never
+author the structure**.
+
+**One section is NOT yours to write: the Execution Trail (`sec_exectr`).** It is
+**system-owned** — a materialized cache the dashboard regenerates wholesale from
+the plan's trusted write events. **NEVER dispatch a writer to `sec_exectr`, and
+never edit it yourself** (agent or supervisor). A worker pointed at `sec_exectr`
+is excluded from write attribution, so its turn degrades to intent-only: nothing
+materializes, `writeCounts` stay 0, and no checkboxes flip. The trail fills
+itself from the write events workers produce editing their OWN sections.
+
+The loop:
+
+- **Mint** with `create_plan` — returns the plan id and its section anchors.
+- **Dispatch** with `launch_agent {plan_id, section_anchor}` (single worker) or
+  `run_orchestration {plan_id, section_anchor}` (GroupThink rail). Set
+  `section_anchor` to the section the worker will **UPDATE** — for checklist
+  execution that is the **Open Items** section (`sec_opitem`), NEVER `sec_exectr`.
+  The dispatched agent edits its assigned section **natively in the HTML** — there
+  is no markdown deliverable and no plan-write MCP tool.
+- **Mandate a completion writeback in every plan-bound brief.** Instruct the
+  worker that at turn end it MUST (a) flip its completed items' `&#9744;` →
+  `&#9745;` in its assigned section via a native HTML edit of the plan file, and
+  (b) emit a
+  `<!--PLAN-EVENT {"status":…,"result":…,"next":…,"claimed_section_anchor":"sec_…"}-->`
+  sentinel in its final message. That plan-file edit is what produces the trusted
+  fs-diff write events → auto-generated Execution Trail lines **and** the visible
+  checkmarks. Without it, `writeCounts` stay 0 and nothing lands on the surface.
+- **Observe** with `read_plan_projection` (per-section trusted event roll-up) and
+  `read_plan_section` (ladder modes: `outline` ≈150 tokens / `text` / `raw` /
+  `raw+editWindow`).
+- **Gate** the returned work as you would any worker turn.
+
+**One-writer policy:** dispatching a second active writer to the same plan is
+**409-rejected**, naming the run that already owns it — sequence writers, don't
+double-book a plan.
+
+**Reading is cheap by design:** prefer `outline` mode + section-scoped reads over
+whole-file reads; pull `raw` / `raw+editWindow` only when you actually need bytes.
+
+**Witnessed activity tells you WHETHER to look closer** — it is evidence for
+gating, never proof of quality or an effort metric. Whole-turn attribution counts
+incidental touches; never present the numbers as effort.
+<!-- /section:planning-surface -->

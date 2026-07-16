@@ -1,6 +1,6 @@
 ---
 name: read-comments
-description: Read the markdown-editor comments a user attached to a document. Use whenever the user refers to "the comments I made", "my comments/notes/annotations in this doc", "feedback I left", or asks you to address review notes on a file — given a file path but no inline comment text. The comments live in the AgentDashboard database, not in the file itself.
+description: Read the markdown-editor comments a user left on a document — invoke THIS skill; do not write or run your own script (or Bash read-comments.py) against the file. Use whenever the user says "the comments I made", "my comments/notes/annotations in this doc", "the feedback I left", or asks you to "address the review notes on <file>" — i.e. they point at a file path but give you no inline comment text. The comments are stored in the AgentDashboard SQLite database keyed by file path, NOT in the markdown file itself, so opening or grepping the file will not find them; this skill is the only way to retrieve them.
 ---
 
 # Read Comments
