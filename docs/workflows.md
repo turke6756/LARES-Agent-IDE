@@ -42,6 +42,18 @@ reasoning, and you see the two sessions exchange messages and converge. Convenin
 one is a judgment call (policy); the protocol that runs it is deterministic
 (mechanism).
 
+It comes in two flavors. **Parallel** gives both agents the *same* prompt and
+lets each reach its own solution independently, then shows them each other's
+answers to reconcile across a few rounds until they converge — the way to pin
+down the *shape* of a solution before committing to it. **Serial** is an
+adversarial review: one agent leads with a proposal and the other tries to poke
+holes, then they refine back and forth toward consensus.
+
+A supervisor knows both, which unlocks a strong sequence: **talk it through with
+the supervisor** so it has your intent, let it run a **parallel** groupthink to
+settle the shape, then a **serial** one to harden it. By the time you implement,
+most of the surprises have already been argued out.
+
 **Good for:** a design decision, a plan review, or an ambiguous trade-off where a
 single agent's first answer shouldn't be the last word.
 

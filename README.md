@@ -68,11 +68,14 @@ logs, and messages them directly. You watch each agent's live status and context
 budget, attach to its chat, inspect the tool calls it makes and the files it
 reads versus writes, and step in at any point.
 
-Code is one tool among many. The same workspace edits Markdown in a real editor
-(Milkdown) with native spellcheck, takes comments anchored to a selection in
-documents and PDFs, browses the web, and views PDFs, images, and CSVs inline —
-so drafting a document is something you do here rather than somewhere else.
-Non-code work is a first-class citizen, not an afterthought.
+Code is one tool among many. Once agents write most of the code, an IDE becomes,
+in practice, a file editor with a model attached — so Lares puts as much care
+into editing and reviewing documents as into running terminals. The same
+workspace edits Markdown in a real editor (Milkdown) with native spellcheck,
+takes comments anchored to a selection in documents and PDFs, browses the web,
+and views PDFs, images, and CSVs inline — so drafting a document is something you
+do here rather than somewhere else. Non-code work is a first-class citizen, not
+an afterthought.
 
 ## Core features
 
@@ -82,7 +85,9 @@ Non-code work is a first-class citizen, not an afterthought.
 - **Orchestrate** — Real terminals (node-pty + xterm, with a WSL/tmux bridge)
   host the agents. A supervisor dispatches worker and researcher waves, and
   two providers can run a cross-provider **groupthink** deliberation
-  (Claude ↔ Codex) that converges on a shared answer.
+  (Claude ↔ Codex) — in *parallel* (each solves independently, then they
+  reconcile) or *serial* (one proposes, the other pokes holes) — converging on a
+  shared answer.
 - **Plan** — An HTML planning surface captures structured plans with a
   server-witnessed provenance trail of which agent actually read and edited each
   section.
@@ -188,6 +193,12 @@ running Lares instance rather than working standalone, and it doubles as a
 reference for writing your own orchestration scripts. The same loop now also runs
 in-process behind the `run_orchestration` MCP tool, which is the path new work
 should take.
+
+A powerful sequence is to brief the supervisor on what you want, have it run a
+*parallel* groupthink to settle the solution's shape, then a *serial* one to
+harden it against holes — so that by the time you implement, most surprises have
+already been argued out. See [docs/workflows.md](docs/workflows.md) for the
+deliberation patterns in full.
 
 ## Providers
 
