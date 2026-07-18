@@ -134,7 +134,7 @@ import {
 // follow-on researcher-lane slice) get them from the supervisor module too;
 // the canonical home is ./mcp-config-builder.
 export { toolsetsForLane, buildDashboardMcpConfigArg, laneUsesStrictMcp, redactMcpToken };
-import { tmuxListSessions, tmuxSendInput, tmuxSendSubmit, tmuxReadStatusOptions, shQuote } from '../wsl-bridge';
+import { tmuxListSessions, tmuxSendInput, tmuxSendSubmit, tmuxReadStatusOptions, shQuote, getPassiveWslStatus } from '../wsl-bridge';
 import { getWindowsSubmitSequence } from './send-input-encoders';
 import { HookSpoolTailer, resolveSpoolReadPath, canonicalSpoolKey } from './hook-spool-tailer';
 
@@ -957,6 +957,60 @@ function findWindowsClaudePath(_env: NodeJS.ProcessEnv): Promise<string> {
       }
 
       resolve(match);
+    });
+  });
+}
+
+/** Absolute-path resolver for the codex / gemini CLIs on Windows.
+ *
+ *  Unlike claude (findWindowsClaudePath), codex and gemini have no known
+ *  installer location, no existence preflight, and no clear error — so on a
+ *  Windows machine they silently fail. Electron inherits the LOGIN-time PATH,
+ *  NOT the user's shell PATH, so a `codex`/`gemini` shim that works in their
+ *  terminal can be invisible to a bare `cmd.exe /c codex`. Search the common
+ *  npm-global and per-user install locations directly, then fall back to
+ *  `where.exe` (which resolves anything already on the login PATH). Returns an
+ *  absolute path — including a `.cmd` shim, which `cmd.exe /c` runs fine — or
+ *  null when the binary genuinely cannot be found. */
+function findWindowsProviderBinary(provider: 'codex' | 'gemini'): Promise<string | null> {
+  const home = process.env.USERPROFILE || 'C:\\Users\\turke';
+  const appData = process.env.APPDATA || path.join(home, 'AppData', 'Roaming');
+  const localAppData = process.env.LOCALAPPDATA || path.join(home, 'AppData', 'Local');
+  const npmDirs = [path.join(appData, 'npm'), path.join(localAppData, 'npm')];
+  const exts = ['.cmd', '.exe', '.ps1', ''];
+
+  const candidates: string[] = [];
+  for (const dir of npmDirs) {
+    for (const ext of exts) candidates.push(path.join(dir, `${provider}${ext}`));
+  }
+  candidates.push(path.join(localAppData, 'Programs', provider, `${provider}.exe`));
+  candidates.push(path.join(home, '.local', 'bin', `${provider}.exe`));
+  candidates.push(path.join(home, '.local', 'bin', provider));
+
+  for (const candidate of candidates) {
+    try {
+      if (fs.existsSync(candidate)) return Promise.resolve(candidate);
+    } catch {
+      /* ignore unreadable candidate and keep searching */
+    }
+  }
+
+  // Fallback: where.exe through cmd.exe resolves anything on the login PATH.
+  return new Promise<string | null>((resolve) => {
+    execFile(getWindowsSystemPath('cmd.exe'), ['/c', 'where', provider], {
+      encoding: 'utf-8',
+      timeout: 5000,
+      windowsHide: true,
+    }, (err, stdout) => {
+      if (err) {
+        resolve(null);
+        return;
+      }
+      const match = stdout
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .find((line) => new RegExp(`${provider}(\\.(exe|cmd|ps1|bat))?$`, 'i').test(line));
+      resolve(match || null);
     });
   });
 }
@@ -3117,6 +3171,29 @@ export class AgentSupervisor extends EventEmitter {
     }
     const useDirectSpawn = needsDirectSpawn && launchCmd !== cmd;
 
+    // Codex/Gemini have no known-install resolver like claude's, and go through
+    // pty-host's `cmd.exe /c` wrap (useDirectSpawn is claude-only). Electron's
+    // login-time PATH can omit a codex/gemini shim that works in the user's
+    // terminal, so a bare `cmd.exe /c codex` crashes with a cryptic "'codex' is
+    // not recognized". Resolve the real binary to an absolute path and launch
+    // that; if it genuinely can't be found, fail loudly with a user-visible
+    // message. Keying off provider (not the literal token) also rescues a
+    // wsl-style `ccodex`/`ccode` command that landed on the Windows path.
+    if (agent.provider === 'codex' || agent.provider === 'gemini') {
+      const resolvedBinary = await findWindowsProviderBinary(agent.provider);
+      if (resolvedBinary) {
+        launchCmd = resolvedBinary;
+        console.log(`[Windows] Resolved ${agent.provider} binary: ${resolvedBinary}`);
+      } else {
+        const message = `${agent.provider} binary not found on this machine — install it or add it to PATH.`;
+        console.error(`[Windows] ${message}`);
+        this.windowsRunners.delete(agent.id);
+        updateAgentStatus(agent.id, 'crashed');
+        addEvent(agent.id, 'crashed', JSON.stringify({ error: message }));
+        throw new Error(message);
+      }
+    }
+
     // BUG-26: every non-resume codex launch (including freshSession=true)
     // runs post-launch discovery so the new agent record gets bound to the
     // codex-minted session id via the race-resistant SQLite path
@@ -3616,6 +3693,23 @@ export class AgentSupervisor extends EventEmitter {
 
   private async launchWslAgent(agent: Agent, resume = false, agentMdPrompt?: string | null, overrideCommand?: string, sessionId?: string, freshSession = false, firstUserMessagePrefix?: string | null): Promise<void> {
     if (!agent.tmuxSessionName) throw new Error('No tmux session name');
+
+    // A workspace typed 'wsl' on a machine WITHOUT WSL routes here and tries to
+    // run `ccodex`/`ccode` inside a distro that doesn't exist, failing
+    // cryptically — the Windows resolver in launchWindowsAgent can't help a
+    // wsl-typed workspace. Preflight WSL availability for codex/gemini and fail
+    // with a user-visible message instead. Uses the cached passive probe, so it
+    // never re-triggers Windows' "install WSL" popup once WSL is known absent.
+    if (agent.provider === 'codex' || agent.provider === 'gemini') {
+      const wslStatus = await getPassiveWslStatus();
+      if (wslStatus.state === 'unavailable' || wslStatus.state === 'no-distro') {
+        const message = `Cannot launch ${agent.provider} in a WSL workspace — WSL is not available on this machine. Re-create the workspace as a Windows path type, or install WSL.`;
+        console.error(`[WSL] ${message}`);
+        updateAgentStatus(agent.id, 'crashed');
+        addEvent(agent.id, 'crashed', JSON.stringify({ error: message }));
+        throw new Error(message);
+      }
+    }
 
     const runner = new WslRunner(agent.tmuxSessionName);
     this.wslRunners.set(agent.id, runner);
