@@ -109,7 +109,30 @@ function parseWslListVerbose(output: string, error?: string): WslStatus {
   };
 }
 
+// On a Windows-only machine every `wsl.exe` invocation can trigger Windows'
+// "install WSL" flow (windowsHide:true hides the probe console but NOT that
+// install UI). getPassiveWslStatus is called from the health-check on startup
+// and on every workspace select / Sidebar / DirectoryTree mount, so an
+// uncached negative result means a popup storm. Cache the first "WSL is absent"
+// outcome for the process lifetime and never re-invoke wsl.exe again once we
+// know it isn't there. Present-but-transient states ('unknown', 'stopped',
+// 'running') are NOT cached so a later start of WSL is still observed.
+let cachedAbsentWslStatus: WslStatus | null = null;
+
+function isAbsentWslState(state: WslStatus['state']): boolean {
+  return state === 'no-distro' || state === 'unavailable';
+}
+
 export async function getPassiveWslStatus(): Promise<WslStatus> {
+  if (cachedAbsentWslStatus) return cachedAbsentWslStatus;
+  const status = await probePassiveWslStatus();
+  if (isAbsentWslState(status.state)) {
+    cachedAbsentWslStatus = status;
+  }
+  return status;
+}
+
+async function probePassiveWslStatus(): Promise<WslStatus> {
   try {
     const { stdout, stderr } = await execFileAsync('wsl.exe', ['-l', '-v'], {
       encoding: 'buffer',

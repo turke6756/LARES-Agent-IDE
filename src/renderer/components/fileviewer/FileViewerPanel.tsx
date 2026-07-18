@@ -80,7 +80,7 @@ export default function FileViewerPanel() {
 
   // Use the effective tab's rootDirectory for the tree
   const treeRoot = effectiveTab?.rootDirectory || '';
-  const treePathType = effectiveTab?.pathType || 'wsl';
+  const treePathType = effectiveTab?.pathType || 'windows';
 
   // Directory tree resize
   const treeResize = useResize({

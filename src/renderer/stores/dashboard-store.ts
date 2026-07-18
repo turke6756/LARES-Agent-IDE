@@ -1002,7 +1002,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
     const agent = get().agents.find((a) => a.id === agentId);
     if (!agent) return;
     const workspace = get().workspaces.find((w) => w.id === agent.workspaceId);
-    const pathType = workspace?.pathType || 'wsl';
+    const pathType = workspace?.pathType || 'windows';
     // Paths mentioned in chat are normally workspace-relative (for example
     // `plans/foo.md` or `src/main/index.ts`). Supervisors and managed workers
     // run from scaffold directories under `.dashboard`, so resolving those

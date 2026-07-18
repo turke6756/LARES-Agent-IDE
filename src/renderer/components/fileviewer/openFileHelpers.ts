@@ -194,7 +194,7 @@ export function openExternalFileTab(payload: OpenFileTabRequest): void {
   const resolved = isAbsolutePath(payload.filePath)
     ? payload.filePath
     : joinAndNormalize(rootDirectory, payload.filePath);
-  const pathType = payload.pathType ?? inferPathType(resolved, workspace?.pathType ?? 'wsl');
+  const pathType = payload.pathType ?? inferPathType(resolved, workspace?.pathType ?? 'windows');
   if (workspace && workspace.id !== store.selectedWorkspaceId) {
     store.selectWorkspace(workspace.id);
   }

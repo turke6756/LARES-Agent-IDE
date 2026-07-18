@@ -17,7 +17,7 @@ export default function DetachedFileView({ params }: Props) {
   // Parse the launch params once. createDetachedWindow encodes these into the
   // query string (index.ts / detached-windows.ts).
   const meta = useMemo(() => {
-    const pathType = (params.get('pathType') as PathType) || 'wsl';
+    const pathType = (params.get('pathType') as PathType) || 'windows';
     return {
       filePath: params.get('filePath') ?? '',
       rootDirectory: params.get('rootDirectory') ?? '',

@@ -2,7 +2,7 @@ import { ipcMain, dialog, shell, BrowserWindow, nativeTheme } from 'electron';
 import type { WebContents } from 'electron';
 import * as fs from 'fs';
 import { persistTheme } from './theme-persistence';
-import type { PathType, FsEvent, DetachRequest, DetachResult, ViewDetachRequest, ScanOverheadRequest, ScanOverheadResult, ExtractKnowledgeRequest, ExtractKnowledgeResult, SkillUsageQuery, SkillUsageQueryResult, McpToolUsageQuery, McpToolUsageQueryResult, PriorSessionChat, ContextOptimizerQuery, ContextOptimizerQueryResult, MarkOptimizerActionAppliedRequest, MarkOptimizerActionAppliedResult, SignOptimizerDerivationRequest, SignOptimizerDerivationResult } from '../shared/types';
+import type { PathType, WslStatus, FsEvent, DetachRequest, DetachResult, ViewDetachRequest, ScanOverheadRequest, ScanOverheadResult, ExtractKnowledgeRequest, ExtractKnowledgeResult, SkillUsageQuery, SkillUsageQueryResult, McpToolUsageQuery, McpToolUsageQueryResult, PriorSessionChat, ContextOptimizerQuery, ContextOptimizerQueryResult, MarkOptimizerActionAppliedRequest, MarkOptimizerActionAppliedResult, SignOptimizerDerivationRequest, SignOptimizerDerivationResult } from '../shared/types';
 import { TAB_CHANNELS, VIEW_CHANNELS } from '../shared/types';
 import { createDetachedWindow, createDetachedViewWindow, broadcastToDetachedViews, canWrite, handleDetachedCloseReply, type DetachedWindowDeps } from './detached-windows';
 import { AgentSupervisor } from './supervisor';
@@ -444,7 +444,14 @@ export function registerIpcHandlers(
   });
 
   ipcMain.handle('system:health-check', async () => {
-    const wslStatus = await getPassiveWslStatus();
+    // Only probe WSL if the user actually has a wsl-typed workspace. On a
+    // Windows-only machine `wsl.exe` can trigger Windows' "install WSL" flow,
+    // and this handler fires on startup and on every workspace select / Sidebar
+    // / DirectoryTree mount — so an unconditional probe means repeated popups.
+    const hasWslWorkspace = getWorkspaces().some((w) => w.pathType === 'wsl');
+    const wslStatus: WslStatus = hasWslWorkspace
+      ? await getPassiveWslStatus()
+      : { state: 'unavailable', distros: [] };
     let claudeWindowsAvailable = false;
     try {
       const env = { ...process.env };

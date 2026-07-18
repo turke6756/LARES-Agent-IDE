@@ -102,7 +102,7 @@ export default function FileActivityList({ activities, pathType, agentId, title,
   const grouped = useMemo(() => groupByFile(activities, liveSessionId), [activities, liveSessionId]);
 
   const workingDirectory = agent?.workingDirectory || '';
-  const resolvedPathType = workspace?.pathType || pathType || 'wsl';
+  const resolvedPathType = workspace?.pathType || pathType || 'windows';
 
   if (grouped.length === 0) {
     if (embedded) return null;
