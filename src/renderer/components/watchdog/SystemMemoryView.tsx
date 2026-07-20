@@ -18,6 +18,7 @@ import type { MemorySnapshotDto, AttributionDto } from '../../../shared/types';
 import { formatBytes, formatMinutesToLimit } from './format';
 import OrphanSweepPanel from './OrphanSweepPanel';
 import DetachedProcessesPanel from './DetachedProcessesPanel';
+import StopStaleIdlePanel from './StopStaleIdlePanel';
 
 const WARN_PCT = 75;
 const CRITICAL_PCT = 88;
@@ -119,6 +120,11 @@ export default function SystemMemoryView() {
 
         {/* Per-agent attribution. */}
         <AttributionTable attr={attr} />
+
+        {/* Stale-idle agent lifecycle (§B8) — sits above the orphan sweep: an
+            idle agent is a LIVE process we own, the orphan sweep deals with
+            leftovers from prior runs. Different things, adjacent reclaim. */}
+        <StopStaleIdlePanel />
 
         {/* Orphaned-process sweep — reuse the D4 panel. */}
         <section className="ui-card p-4 flex items-center gap-3">

@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import type { StopExclusionCode } from '@shared/types';
+import type { StopExclusionCode } from '../../shared/types';
 import {
   STOP_EXCLUSION_CODES,
   STOP_EXCLUSION_COPY,

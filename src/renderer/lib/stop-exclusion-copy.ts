@@ -11,7 +11,7 @@
 //
 // Pure module — no React, no `window`, no imports beyond the shared type.
 
-import type { StopExclusionCode } from '@shared/types';
+import type { StopExclusionCode } from '../../shared/types';
 
 export interface StopExclusionCopy {
   /** Two-or-three words, for a chip/badge next to an agent name. */
