@@ -6,6 +6,8 @@ import OwnerContainerBar from './OwnerContainerBar';
 import TeamDialog from '../team/TeamDialog';
 import { buildAgentForest, isOwnerContainer, hasActiveDescendant, collectSubtreeIds, type AgentTreeNode } from './agent-grouping';
 import { useOwnerExpand, pruneOwnerExpandKeys } from '../../hooks/useOwnerExpand';
+import { BULK_STOP_MAX, type BulkStopResult } from '../../../shared/types';
+import { summarizeStopExclusions } from '../../lib/stop-exclusion-copy';
 
 // Per-card props that are identical at every depth of the ownership forest —
 // threaded through the recursive renderer so a nested child behaves exactly
@@ -113,6 +115,13 @@ export default function AgentGrid() {
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   // Two-step confirm for the bulk-action bar.
   const [confirmBulk, setConfirmBulk] = useState(false);
+  // Stop-selected (§B8) keeps its OWN confirm latch. Sharing one with delete
+  // would let a click that armed "delete" fire a stop (or the reverse) — two
+  // different destructive actions must never share a confirmation.
+  const [confirmStop, setConfirmStop] = useState(false);
+  const [stopBusy, setStopBusy] = useState(false);
+  const [stopResult, setStopResult] = useState<BulkStopResult | null>(null);
+  const [stopError, setStopError] = useState<string | null>(null);
   const prevStatusRef = useRef<Map<string, string>>(new Map());
 
   // Detect working→idle transitions and mark those agents unread.
@@ -189,10 +198,66 @@ export default function AgentGrid() {
     }
   }, [selectedIds, deleteAgent]);
 
+  // The ids a bulk stop would actually send: deduped, then capped — same order
+  // as the main-side `normalizeBulkRequest`, so 300 selected agents can't push
+  // the request past the cap and get silently truncated somewhere else.
+  const stopIds = useMemo(() => [...new Set(selectedIds)].slice(0, BULK_STOP_MAX), [selectedIds]);
+  const stopOverflow = selectedIds.size - stopIds.length;
+
+  // Statuses in the selection, for the confirm copy. `launching` is called out
+  // separately because it is the one status where stopping is not merely
+  // interrupting work: the agent has no settled process yet, so a stop lands
+  // mid-spawn and can leave a half-started CLI behind.
+  const selectedLaunching = useMemo(
+    () => agents.filter((a) => stopIds.includes(a.id) && a.status === 'launching'),
+    [agents, stopIds],
+  );
+  const selectedLive = useMemo(
+    () => agents.filter((a) => stopIds.includes(a.id) && !['done', 'crashed'].includes(a.status)),
+    [agents, stopIds],
+  );
+
+  const handleStopSelected = useCallback(async () => {
+    if (stopIds.length === 0) return;
+    setStopBusy(true);
+    setStopError(null);
+    setStopResult(null);
+    try {
+      // `confirmActive: true` is what makes main EXECUTE on agents whose guards
+      // came back as warnings — it is not a formality carried along, it is the
+      // flag the human just supplied by passing the second confirm step. The
+      // renderer never supplies a reason; main assigns `manual-selection`.
+      const result = await window.api.agents.stopBulk({
+        agentIds: stopIds,
+        mode: 'explicit',
+        confirmActive: true,
+      });
+      setStopResult(result);
+      // Keep the selection so the per-agent results below stay attributable;
+      // just disarm the confirm.
+      setConfirmStop(false);
+    } catch (e) {
+      setStopError(String(e));
+    } finally {
+      setStopBusy(false);
+    }
+  }, [stopIds]);
+
   // Reset the confirm step whenever the selection empties so a stale
   // "confirm" can't apply to a new selection.
   useEffect(() => {
-    if (selectedIds.size === 0) setConfirmBulk(false);
+    if (selectedIds.size === 0) {
+      setConfirmBulk(false);
+      setStopResult(null);
+      setStopError(null);
+    }
+  }, [selectedIds]);
+
+  // Changing WHICH agents are selected disarms a primed stop — the confirm the
+  // human just read described the old set, and its launching-agent warning may
+  // not be true of the new one.
+  useEffect(() => {
+    setConfirmStop(false);
   }, [selectedIds]);
 
   // Keyboard: Delete removes the selection (with one confirm step), Escape
@@ -269,29 +334,121 @@ export default function AgentGrid() {
           active. Sticky inside the grid's scroll container. */}
       {selectedIds.size > 0 && (
         <div className="sticky bottom-3 z-20 mt-4 flex justify-center pointer-events-none">
-          <div className="ui-card pointer-events-auto flex items-center gap-3 px-4 py-2 shadow-lg ring-1 ring-accent-purple/40">
-            <span className="text-[13px] text-gray-300">
-              {selectedIds.size} agent{selectedIds.size === 1 ? '' : 's'} selected
-            </span>
-            <button
-              onClick={() => setSelectedIds(new Set())}
-              className="ui-btn ui-btn-ghost px-2 py-1 text-[12px]"
-              title="Clear selection (Esc)"
-            >
-              Clear
-            </button>
-            <button
-              onClick={() => {
-                if (confirmBulk) void handleDeleteSelected();
-                else setConfirmBulk(true);
-              }}
-              className="ui-btn ui-btn-danger px-3 py-1 text-[12px]"
-              title="Delete all selected agents (Del)"
-            >
-              {confirmBulk
-                ? `Confirm delete ${selectedIds.size}`
-                : 'Delete selected'}
-            </button>
+          <div className="ui-card pointer-events-auto flex flex-col gap-2 px-4 py-2 shadow-lg ring-1 ring-accent-purple/40 max-w-[560px]">
+            {/* Stop confirm — step 2 of two. Deliberately a BLOCK of copy, not
+                a re-labelled button: it names what is about to be interrupted,
+                and calls out `launching` agents as their own risk. */}
+            {confirmStop && (
+              <div
+                className="rounded border border-accent-red/40 bg-accent-red/[0.07] px-3 py-2 text-[12px] space-y-1"
+                role="alertdialog"
+                aria-label="Confirm stop selected agents"
+              >
+                <div className="text-gray-200 font-semibold">
+                  Stop {stopIds.length} agent{stopIds.length === 1 ? '' : 's'}?
+                </div>
+                <div className="text-gray-400">
+                  {selectedLive.length > 0
+                    ? `${selectedLive.length} of them ${selectedLive.length === 1 ? 'is' : 'are'} still live — their process will be killed and any work in progress is lost. This is not a pause; there is no resume.`
+                    : 'None of them are currently live; already-stopped agents are reported as such.'}
+                </div>
+                {selectedLaunching.length > 0 && (
+                  <div className="text-accent-red">
+                    {selectedLaunching.length} {selectedLaunching.length === 1 ? 'is' : 'are'} still
+                    LAUNCHING ({selectedLaunching.map((a) => a.title).join(', ')}). Stopping mid-launch
+                    hits an agent whose process has not settled yet — the CLI may be left
+                    half-started, and the stop can fail to confirm.
+                  </div>
+                )}
+                {stopOverflow > 0 && (
+                  <div className="text-accent-yellow">
+                    Only the first {BULK_STOP_MAX} selected agents will be sent; {stopOverflow} will
+                    be left running.
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Per-agent outcome. Anything not `stopped` is named; `failed`
+                means the process was NOT confirmed gone and is never counted
+                as a success. */}
+            {stopResult && (
+              <div className="rounded border border-white/10 px-3 py-2 text-[11px] space-y-0.5" role="status">
+                <div className="text-gray-300">
+                  Stopped {stopResult.items.filter((i) => i.result === 'stopped').length} of{' '}
+                  {stopResult.items.length}
+                </div>
+                {stopResult.items
+                  .filter((i) => i.result !== 'stopped')
+                  .map((i) => {
+                    const title = agents.find((a) => a.id === i.agentId)?.title ?? i.agentId;
+                    return (
+                      <div
+                        key={i.agentId}
+                        className={i.result === 'failed' ? 'text-accent-red' : 'text-gray-500'}
+                      >
+                        {title} —{' '}
+                        {i.result === 'failed'
+                          ? 'stop could not be confirmed; it may still be running'
+                          : i.result === 'not_found'
+                            ? 'no longer exists'
+                            : (summarizeStopExclusions(i.codes) ?? 'skipped')}
+                      </div>
+                    );
+                  })}
+              </div>
+            )}
+            {stopError && (
+              <div className="text-[11px] text-accent-red" role="alert">{stopError}</div>
+            )}
+
+            <div className="flex items-center gap-3">
+              <span className="text-[13px] text-gray-300">
+                {selectedIds.size} agent{selectedIds.size === 1 ? '' : 's'} selected
+              </span>
+              <button
+                onClick={() => setSelectedIds(new Set())}
+                className="ui-btn ui-btn-ghost px-2 py-1 text-[12px]"
+                title="Clear selection (Esc)"
+              >
+                Clear
+              </button>
+              <button
+                onClick={() => {
+                  if (confirmStop) void handleStopSelected();
+                  else setConfirmStop(true);
+                }}
+                disabled={stopBusy || stopIds.length === 0}
+                className="ui-btn ui-btn-danger px-3 py-1 text-[12px]"
+                title="Stop all selected agents"
+              >
+                {stopBusy
+                  ? 'Stopping…'
+                  : confirmStop
+                    ? `Yes, stop ${stopIds.length}`
+                    : 'Stop selected'}
+              </button>
+              {confirmStop && (
+                <button
+                  onClick={() => setConfirmStop(false)}
+                  className="ui-btn ui-btn-ghost px-2 py-1 text-[12px]"
+                >
+                  Cancel
+                </button>
+              )}
+              <button
+                onClick={() => {
+                  if (confirmBulk) void handleDeleteSelected();
+                  else setConfirmBulk(true);
+                }}
+                className="ui-btn ui-btn-danger px-3 py-1 text-[12px]"
+                title="Delete all selected agents (Del)"
+              >
+                {confirmBulk
+                  ? `Confirm delete ${selectedIds.size}`
+                  : 'Delete selected'}
+              </button>
+            </div>
           </div>
         </div>
       )}
