@@ -1035,6 +1035,10 @@ export type IndexStatusDto =
   | { ready: false; status: 'indexing'; progress: IndexProgressDto }
   | { ready: true; stale?: boolean; status?: 'indexing' };
 
+/** Result of resolving pasted/dropped image bytes or paths into an agent-space
+ *  absolute path (see files.writeImageTemp / files.resolveImageDrops). */
+export type ImagePathResult = { ok: true; path: string } | { ok: false; error: string };
+
 export interface IpcApi {
   workspaces: {
     list: () => Promise<Workspace[]>;
@@ -1057,7 +1061,12 @@ export interface IpcApi {
     onFileActivity: (callback: (activity: FileActivity) => void) => () => void;
     getContextStats: (agentId: string) => Promise<ContextStats | null>;
     onContextStatsChanged: (callback: (stats: ContextStats) => void) => () => void;
-    getChatEvents: (agentId: string, sinceUuid?: string) => Promise<{ events: SessionEvent[]; truncated: boolean }>;
+    /** `source` distinguishes a live ring read from a dead agent's history
+     *  re-read off disk, and flags the one case the pane must NOT render as an
+     *  empty chat: `'unavailable'` — the agent is terminal and its history
+     *  cannot be recovered (provider without a one-shot session reader, or a
+     *  pruned/missing session file). Optional so a stale preload still typechecks. */
+    getChatEvents: (agentId: string, sinceUuid?: string) => Promise<{ events: SessionEvent[]; truncated: boolean; source?: 'live' | 'disk' | 'unavailable' }>;
     chatSubscribe: (agentId: string) => Promise<void>;
     chatUnsubscribe: (agentId: string) => Promise<void>;
     getFullToolResult: (agentId: string, toolUseId: string) => Promise<string | null>;
@@ -1140,6 +1149,12 @@ export interface IpcApi {
     /** Native filesystem path of a dropped OS file, via Electron webUtils
      *  (Electron 41 removed the non-standard File.path). */
     getPathForFile: (file: RendererFile) => string;
+    /** Persist a clipboard image blob to a managed temp file; returns an absolute
+     *  path in the agent's path space (Windows or WSL). */
+    writeImageTemp: (bytes: Uint8Array, mime: string, workingDirectory: string) => Promise<ImagePathResult>;
+    /** Resolve dropped OS image FILE paths into the agent's path space (their own
+     *  on-disk paths; no copy). One result per input, in order. */
+    resolveImageDrops: (nativePaths: string[], workingDirectory: string) => Promise<ImagePathResult[]>;
     deleteEntry: (
       entryPath: string,
       rootDirectory: string,

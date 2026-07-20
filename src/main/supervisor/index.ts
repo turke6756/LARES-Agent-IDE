@@ -28,8 +28,10 @@ import {
   PERSONA_CREATE_PERSONA_SKILL_V1, PERSONA_READ_COMMENTS_SKILL_V1,
   CONTINUATION_BRICK_RENDER_MAX_BYTES,
   CONTINUATION_STOP_FLUSH_DELAY_MS,
+  TERMINAL_AGENT_RELEASE_DELAY_MS,
   FILE_ACTIVITY_RETENTION_SESSIONS,
 } from '../../shared/constants';
+import { isTerminalChatStatus } from './agent-chat-history';
 import {
   writeScaffoldMap as writeSharedScaffoldMap,
   scaffoldFileExists,
@@ -120,7 +122,7 @@ import { composePlanEvent, planEventTurnKey, TurnComposeGuard } from '../plans/p
 import { trailMaterializer } from '../plans/execution-trail-writer';
 import { resolveEditTargetAnchorForPlan } from '../plans/watch-plans';
 import { detectPathType, windowsToWslPath, uncToWslPath, wslToWindowsPath } from '../path-utils';
-import { getScriptPath } from './paths';
+import { getScriptPath, getLaresNativeDir } from './paths';
 import {
   toolsetsForLane,
   buildDashboardMcpConfigArg,
@@ -548,6 +550,29 @@ export const SUPERVISOR_AGENT_MD_V9_HASH = '91154a07a55e7c16bf6067a092ac992499ee
  *  in the v11 file's previousHashes for silent v10→v11 upgrade of pristine
  *  workspaces. */
 export const SUPERVISOR_AGENT_MD_V10_HASH = 'e61ca4b14d22b6b63614412df0a5a491ecce7f64a5e6d44b2ce83892cee9f450';
+
+/** SHA-256 hex of the v11 `.dashboard/supervisor/CLAUDE.md` (pre-capability-parity
+ *  trim). v12 (plans/context-overhead-review.md §2, Tier 1) removes resident
+ *  documentation for tools this lane is NOT granted — `## Teams`,
+ *  `## Notebooks (live kernel)`, and the full-`browser` readback/automation prose —
+ *  drops the obsolete `## Platform notes (Windows + PowerShell 5.1)` launch-quoting
+ *  section, replaces the browser section with the accurate one-arg `browser-present`
+ *  schema, and compresses `## Multi-agent orchestration` to a pointer at the
+ *  run-orchestration skill. Used in the v12 file's previousHashes for silent
+ *  v11→v12 upgrade of pristine workspaces. */
+export const SUPERVISOR_AGENT_MD_V11_HASH = 'b2222fda999066036675f5831868aad09e67b727ca71b3d4a3f10b5487caf614';
+
+/** SHA-256 hex of the v12 `.dashboard/supervisor/CLAUDE.md` (capability-parity
+ *  trim). v13 is the event-noise reduction: the `idle/done` Automatic-Events
+ *  bullet becomes `idle` only (a clean `done` exit no longer notifies at all),
+ *  the `context threshold (80%+)` bullet becomes a single 95% ADVISORY tier that
+ *  explicitly says 100% is not a literal cutoff and that a near-complete agent
+ *  should be allowed to finish, the Tier-1 decision line follows it to ≥ 95%,
+ *  and `## Multi-agent orchestration` gains the muted-members paragraph (run
+ *  members' per-turn idle events are suppressed; the run reports itself). Used
+ *  in the v13 file's previousHashes for silent v12→v13 upgrade of pristine
+ *  workspaces. */
+export const SUPERVISOR_AGENT_MD_V12_HASH = '1b4772ff5accee627d0ae632857801da4dc213d456b8ce6cd339047af7a54eeb';
 
 /** SHA-256 hex of the v2 `.dashboard/workers/claude/CLAUDE.md` (pre-research-store;
  *  the shared-behavioral-memory section but no research-store pointer). v3
@@ -1524,13 +1549,13 @@ export class AgentSupervisor extends EventEmitter {
     if (this.ownership) return;
     let native: NativeJobSurface;
     try {
-      // dist/main/main/supervisor/index.js → repo root is ../../../.. ; the native
-      // module ships outside dist (native/lares-native) and its index.js never
-      // throws at require time (graceful unsupported surface off-Windows / unbuilt).
+      // The native module ships outside dist (native/lares-native): in dev from
+      // the repo root, packaged from resources/ (getLaresNativeDir handles both —
+      // resolving it relative to __dirname would land inside app.asar, F6). Its
+      // index.js never throws at require time (graceful unsupported surface
+      // off-Windows / unbuilt).
       // eslint-disable-next-line @typescript-eslint/no-var-requires
-      native = require(
-        path.join(__dirname, '..', '..', '..', '..', 'native', 'lares-native', 'index.js'),
-      ) as NativeJobSurface;
+      native = require(path.join(getLaresNativeDir(), 'index.js')) as NativeJobSurface;
     } catch (err) {
       console.warn('[ownership] lares-native not loadable — reaper/gate fail-closed:', err);
       native = makeUnsupportedNativeSurface(String(err));
@@ -2162,8 +2187,8 @@ export class AgentSupervisor extends EventEmitter {
   private static SUPERVISOR_FILES: Record<string, ScaffoldFile> = {
     [`.dashboard/supervisor/CLAUDE.md`]:                                              {
       content: SUPERVISOR_AGENT_MD,
-      version: 11, // v11 rewrites section:planning-surface v1: sec_exectr is system-owned (never dispatch/edit); dispatch to the UPDATED section (sec_opitem); mandate the turn-end checkbox-flip + PLAN-EVENT writeback
-      previousHashes: { 1: SUPERVISOR_AGENT_MD_V1_HASH, 2: SUPERVISOR_AGENT_MD_V2_HASH, 3: SUPERVISOR_AGENT_MD_V3_HASH, 4: SUPERVISOR_AGENT_MD_V4_HASH, 5: SUPERVISOR_AGENT_MD_V5_HASH, 6: SUPERVISOR_AGENT_MD_V6_HASH, 7: SUPERVISOR_AGENT_MD_V7_HASH, 8: SUPERVISOR_AGENT_MD_V8_HASH, 9: SUPERVISOR_AGENT_MD_V9_HASH, 10: SUPERVISOR_AGENT_MD_V10_HASH },
+      version: 13, // v13 (supervisor event-noise reduction) aligns the doc with the bridge: the Automatic-Events `idle/done` bullet becomes `idle` only (a clean `done` exit no longer notifies), `context threshold (80%+)` becomes a single 95% ADVISORY tier stating that 100% is not a literal cutoff and that a near-complete agent should be allowed to finish, the Tier-1 decision line follows to ≥ 95%, and ## Multi-agent orchestration gains the muted-members paragraph (run members' per-turn idle events are suppressed; the run reports itself).
+      previousHashes: { 1: SUPERVISOR_AGENT_MD_V1_HASH, 2: SUPERVISOR_AGENT_MD_V2_HASH, 3: SUPERVISOR_AGENT_MD_V3_HASH, 4: SUPERVISOR_AGENT_MD_V4_HASH, 5: SUPERVISOR_AGENT_MD_V5_HASH, 6: SUPERVISOR_AGENT_MD_V6_HASH, 7: SUPERVISOR_AGENT_MD_V7_HASH, 8: SUPERVISOR_AGENT_MD_V8_HASH, 9: SUPERVISOR_AGENT_MD_V9_HASH, 10: SUPERVISOR_AGENT_MD_V10_HASH, 11: SUPERVISOR_AGENT_MD_V11_HASH, 12: SUPERVISOR_AGENT_MD_V12_HASH },
     },
     [`.dashboard/supervisor/.claude/settings.json`]:                                  {
       content: SUPERVISOR_CLAUDE_SETTINGS_JSON,
@@ -2815,6 +2840,9 @@ export class AgentSupervisor extends EventEmitter {
       return JSON.stringify({
         mcpServers: {
           'agent-dashboard-team': {
+            // WSL-typed workspace: the sidecar runs inside the distro, where
+            // Windows Lares.exe cannot execute — keep the literal `node`.
+            // node-in-WSL is a WSL-workspace-only prerequisite (plan §5.4, F4).
             command: 'node',
             args: [linuxScriptPath],
             env: {
@@ -2832,9 +2860,13 @@ export class AgentSupervisor extends EventEmitter {
     return JSON.stringify({
       mcpServers: {
         'agent-dashboard-team': {
-          command: 'node',
+          // Windows-typed workspace: run on the Node runtime bundled inside
+          // Electron, not a system `node` a clean machine lacks (F4). Looks
+          // inconsistent with the wsl branch above on purpose — see plan §5.4.
+          command: process.execPath,
           args: [mcpTeamScriptPath.replace(/\\/g, '/')],
           env: {
+            ELECTRON_RUN_AS_NODE: '1',
             AGENT_ID: agentId,
             TEAM_ID: teamId,
             AGENT_DASHBOARD_API_PORT: String(this.apiServerPort),
@@ -3131,6 +3163,9 @@ export class AgentSupervisor extends EventEmitter {
       this.monitor.clearLaunch(agent.id);
       // P1 §3 — drop this worker's spool-tailer claim (a relaunch re-claims).
       this.releaseSpoolTailer(agent.id);
+      // Dead agent: its chat is served from disk now, so drop the ring.
+      // Deferred + status-re-checked, so the auto-restart below cancels it.
+      this.releaseChatRing(agent.id);
 
       // Auto-restart
       const latest = getAgent(agent.id);
@@ -4071,6 +4106,8 @@ export class AgentSupervisor extends EventEmitter {
       this.monitor.clearLaunch(agent.id);
       // P1 §3 — drop this worker's spool-tailer claim (a relaunch re-claims).
       this.releaseSpoolTailer(agent.id);
+      // Dead agent: chat comes from disk now — drop the ring (see Windows path).
+      this.releaseChatRing(agent.id);
 
       const latest = getAgent(agent.id);
       if (latest && status === 'crashed' && latest.autoRestartEnabled) {
@@ -4531,6 +4568,37 @@ export class AgentSupervisor extends EventEmitter {
     updateAgentExitCode(agentId, 0);
     addEvent(agentId, 'stopped');
     this.emit('statusChanged', { agentId, status: 'done', fromStatus: priorStop, source: 'stop' } satisfies StatusChangedEvent);
+    // Release the chat ring LAST — after the status write, so a concurrent read
+    // already sees `done` and takes the disk path rather than racing an emptied
+    // ring while the row still says `working`.
+    this.releaseChatRing(agentId);
+  }
+
+  /**
+   * Release the dispatcher's per-agent chat ring once the agent has actually
+   * SETTLED terminal. Reads for a `done`/`crashed` agent come off disk
+   * (`resolveAgentChatEvents`), so the RAM is pure leak from here on.
+   *
+   * Deferred and re-checked rather than immediate, because `stopAgent` and the
+   * runner-exit handler are ALSO the first step of manual restart, continuation
+   * relaunch, and auto-restart — all of which flip the status back off
+   * `done`/`crashed` within a second. Clearing the ring under an agent that
+   * comes back on the SAME session would drop the reader's file offsets, replay
+   * the whole session log from byte 0, and double every turn in an open chat
+   * pane (which appends incoming batches without deduping by uuid).
+   *
+   * A deleted agent (`getAgent` → undefined) still releases: only a live,
+   * non-terminal status cancels. `forgetAgent` is idempotent, so overlapping
+   * stop/exit calls are harmless.
+   */
+  private releaseChatRing(agentId: string): void {
+    const timer = setTimeout(() => {
+      const status = getAgent(agentId)?.status;
+      if (status && !isTerminalChatStatus(status)) return; // came back to life
+      this.sessionLogReader.forgetAgent(agentId);
+    }, TERMINAL_AGENT_RELEASE_DELAY_MS);
+    // Never hold the event loop open at shutdown for a memory release.
+    timer.unref?.();
   }
 
   async deleteAgent(agentId: string): Promise<void> {
@@ -4548,6 +4616,9 @@ export class AgentSupervisor extends EventEmitter {
     }
 
     this.fileTrackers.delete(agentId);
+    // Drop the chat ring with the record itself (deleteAgent never did this —
+    // the ring outlived the agent row for the life of the process).
+    this.sessionLogReader.forgetAgent(agentId);
     this.bridge.forgetAgent(agentId);
     // BUG-09 §3.7 — drop the latch + hold-until entries so a 15-min
     // tool-pending latch can't survive into a future agent record reusing this id.

@@ -1,5 +1,6 @@
 import { SessionLogReader } from './session-log-reader';
 import { getAgent } from '../database';
+import { resolveAgentChatEvents } from './agent-chat-history';
 import { SessionEvent, AssistantTextEvent, UserTextEvent, ThinkingEvent } from '../../shared/session-events';
 
 export interface ChatMessage {
@@ -23,13 +24,26 @@ export class AgentChatService {
     const agent = getAgent(agentId);
     if (!agent) return [];
 
-    // Trigger a fresh poll to ensure we have the latest messages. Scoped to
-    // this agent so the force-poll does not reset other agents' rate-limit
-    // timers. BUG-07: must bypass the dispatcher's `nextPollAt` gate or a
-    // recent background tick can silently keep our read stale.
-    this.dispatcher.pollNow(agentId);
-
-    const { events } = this.dispatcher.getCachedEvents(agentId);
+    // Live agent: trigger a fresh poll to ensure we have the latest messages.
+    // Scoped to this agent so the force-poll does not reset other agents'
+    // rate-limit timers. BUG-07: must bypass the dispatcher's `nextPollAt` gate
+    // or a recent background tick can silently keep our read stale.
+    //
+    // Terminal agent (`done`/`crashed`): the ring is released on exit and
+    // `pollNow` is a no-op for it anyway, so the events come back off disk.
+    // Everything below is unchanged — same events, same turn grouping, same
+    // output shape — so `read_agent_chat` cannot tell a dead agent's history
+    // from a live one except that it is frozen.
+    const { events } = resolveAgentChatEvents(
+      {
+        getAgent,
+        getCachedEvents: (id, since) => this.dispatcher.getCachedEvents(id, since),
+        pollNow: (id) => this.dispatcher.pollNow(id),
+        readPriorSessionEvents: (p, wd, sid) => this.dispatcher.readPriorSessionEvents(p, wd, sid),
+      },
+      agentId,
+      { pollLive: true },
+    );
     if (events.length === 0) return [];
 
     const messages: ChatMessage[] = [];

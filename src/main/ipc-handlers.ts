@@ -1,11 +1,13 @@
-import { ipcMain, dialog, shell, BrowserWindow, nativeTheme } from 'electron';
+import { ipcMain, dialog, shell, BrowserWindow, nativeTheme, app } from 'electron';
 import type { WebContents } from 'electron';
 import * as fs from 'fs';
+import * as path from 'path';
 import { persistTheme } from './theme-persistence';
 import type { PathType, WslStatus, FsEvent, DetachRequest, DetachResult, ViewDetachRequest, ScanOverheadRequest, ScanOverheadResult, ExtractKnowledgeRequest, ExtractKnowledgeResult, SkillUsageQuery, SkillUsageQueryResult, McpToolUsageQuery, McpToolUsageQueryResult, PriorSessionChat, ContextOptimizerQuery, ContextOptimizerQueryResult, MarkOptimizerActionAppliedRequest, MarkOptimizerActionAppliedResult, SignOptimizerDerivationRequest, SignOptimizerDerivationResult } from '../shared/types';
 import { TAB_CHANNELS, VIEW_CHANNELS } from '../shared/types';
 import { createDetachedWindow, createDetachedViewWindow, broadcastToDetachedViews, canWrite, handleDetachedCloseReply, type DetachedWindowDeps } from './detached-windows';
 import { AgentSupervisor } from './supervisor';
+import { resolveAgentChatEvents } from './supervisor/agent-chat-history';
 import {
   getWorkspaces, createWorkspace, deleteWorkspace, getWorkspace, reorderWorkspaces,
   getAgentsByWorkspace, getAllAgents, getAgent, getFileActivities, getWorkspaceAgentSummary,
@@ -23,7 +25,8 @@ import { getApiToken } from './security/api-auth';
 import { openInVSCode, openFileInVSCode, openFileInWorkspace } from './vscode-launcher';
 import { getPassiveWslStatus, isTmuxAvailable, isClaudeAvailableInWsl } from './wsl-bridge';
 import { execFileSync } from 'child_process';
-import { detectPathType, ensureWindowsPath } from './path-utils';
+import { detectPathType, ensureWindowsPath, toAgentPath } from './path-utils';
+import { saveImage, pruneImages } from './pasted-image-store';
 import { readFileContents, listDirectoryEntriesAsync } from './file-reader';
 import { writeFileContents, createFile, createDirectory, renameEntry, moveEntry, copyFiles, deleteEntry } from './file-writer';
 import { createMarkdownFromDocx } from './docx-converter';
@@ -45,6 +48,10 @@ import { getSharedParseManager, setParseManagerProgressSink } from './skill-anal
 import { querySkillUsage, type QueryDb } from './skill-analytics/queries';
 import { queryMcpToolUsage } from './skill-analytics/mcp-tool-usage-queries';
 import { getDb } from './database';
+
+// Managed temp dir for clipboard-bitmap pastes. Dropped OS files inject their
+// OWN on-disk path (converted) and never land here — only screenshots do.
+const PASTED_IMAGE_DIR = path.join(app.getPath('temp'), 'lares-pasted-images');
 
 function resolveMutationPathType(primaryPath: string, rootDirectory: string, pathType?: PathType): PathType {
   const primaryType = detectPathType(primaryPath);
@@ -189,7 +196,21 @@ export function registerIpcHandlers(
     // JSONL on disk has every assistant turn. No-op for non-codex agents and
     // codex agents that already have a sid.
     supervisor.maybeRecoverCodexSid(agentId);
-    return supervisor.getSessionLogReader().getCachedEvents(agentId, sinceUuid);
+    // A `done`/`crashed` agent's ring has been released (`forgetAgent`) and can
+    // never be refilled — `resolveAgentChatEvents` re-reads its history from the
+    // provider's session log on disk instead, and reports `source` so the pane
+    // can distinguish "frozen history" from "provider has no disk reader".
+    const reader = supervisor.getSessionLogReader();
+    return resolveAgentChatEvents(
+      {
+        getAgent,
+        getCachedEvents: (id, since) => reader.getCachedEvents(id, since),
+        pollNow: (id) => reader.pollNow(id),
+        readPriorSessionEvents: (p, wd, sid) => reader.readPriorSessionEvents(p, wd, sid),
+      },
+      agentId,
+      { sinceUuid },
+    );
   });
   ipcMain.handle('agent:chat-subscribe', (_e, agentId) => {
     supervisor.maybeRecoverCodexSid(agentId); // BUG-28: see get-chat-events
@@ -667,6 +688,43 @@ export function registerIpcHandlers(
     }
     return { ok: true };
   });
+
+  // ── Pasted / dropped image support ──
+  // Startup prune (fire-and-forget): drop any temp images left over past the
+  // age / count / byte caps from prior app runs.
+  pruneImages(PASTED_IMAGE_DIR, Date.now()).catch(() => {});
+
+  // Clipboard bitmap (screenshot) → managed temp file → agent-space path. No
+  // file exists on disk for a screenshot, so we persist the bytes and convert
+  // the written native path into the agent's path space (Windows or WSL).
+  ipcMain.handle('files:write-image-temp',
+    async (_e, bytes: Uint8Array, mime: string, workingDirectory: string) => {
+      const saved = await saveImage(PASTED_IMAGE_DIR, bytes, mime, Date.now());
+      if (!saved.ok) return saved;
+      return toAgentPath(saved.path, workingDirectory); // {ok,path} | {ok:false,error}
+    });
+
+  // Dropped OS image FILES → agent-space paths. Batch, per-path result so one
+  // bad entry doesn't kill the rest. Injects each file's OWN on-disk path
+  // (converted); does NOT copy into the temp dir.
+  ipcMain.handle('files:resolve-image-drops',
+    async (_e, nativePaths: string[], workingDirectory: string) => {
+      const results = await Promise.all((nativePaths || []).map(async (p) => {
+        if (!/\.(png|jpe?g)$/i.test(p)) {
+          return { ok: false, error: `Unsupported file (only .png/.jpg/.jpeg): ${p}` };
+        }
+        // stat().isFile() — access() succeeds on a DIRECTORY named picture.png,
+        // which would then be injected as a bad path (addendum D).
+        try {
+          const st = await fs.promises.stat(p);
+          if (!st.isFile()) return { ok: false, error: `Not a file: ${p}` };
+        } catch {
+          return { ok: false, error: `File not found: ${p}` };
+        }
+        return toAgentPath(p, workingDirectory);
+      }));
+      return results; // Array<{ok:true,path}|{ok:false,error}>
+    });
 
   // Live file watcher — one entry per subscription id, keyed across renderers.
   // Events are batched per-id with a short debounce so a 1000-file change produces

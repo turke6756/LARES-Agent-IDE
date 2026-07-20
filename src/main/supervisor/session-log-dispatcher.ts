@@ -297,6 +297,35 @@ export class SessionLogDispatcher extends EventEmitter {
     this.emit('agent-rebound', { agentId } satisfies AgentReboundEvent);
   }
 
+  /**
+   * Release every per-agent scrap of RAM the dispatcher holds for `agentId`.
+   *
+   * Called when an agent reaches a TERMINAL state (`done` / `crashed`) and at
+   * `deleteAgent`. Distinct from `rebindAgent`, which clears the same maps but
+   * additionally emits `'agent-rebound'` so downstream caches (context stats,
+   * `file_activities`) purge — that is a *misattribution* repair, not a
+   * lifecycle release, and firing it on every stop would wrongly nuke a dead
+   * agent's derived history.
+   *
+   * Safe because a terminal agent's chat is no longer served from this ring:
+   * `resolveAgentChatEvents` (agent-chat-history.ts) reads it back from the
+   * provider's on-disk session log instead. Idempotent — calling it for an
+   * unknown or already-forgotten agent is a no-op.
+   */
+  forgetAgent(agentId: string): void {
+    this.eventsByAgent.delete(agentId);
+    this.truncatedByAgent.delete(agentId);
+    this.seenEventUuids.delete(agentId);
+    this.seenEventUuidOrder.delete(agentId);
+    this.syntheticMarkers.delete(agentId);
+    this.emittedInitialBatch.delete(agentId);
+    // Poll bookkeeping: `tick()` only walks ACTIVE sessions, so a terminal
+    // agent's entries here are pure garbage that never gets revisited.
+    this.nextPollAt.delete(agentId);
+    this.subscribers.delete(agentId);
+    for (const reader of this.readers.values()) reader.invalidatePath(agentId);
+  }
+
   /** Provider-agnostic check that the on-disk session log for a given session
    *  id exists. Currently only the Claude reader implements `sessionFileExists`;
    *  any other registered reader is asked via duck-typing, and a missing

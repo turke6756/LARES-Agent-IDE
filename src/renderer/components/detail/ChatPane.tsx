@@ -79,6 +79,10 @@ type RenderItem =
       result?: { content: string; truncated: boolean; isError?: boolean };
     } & OutOfContextStamp)
   | ({ kind: 'system'; uuid: string; text: string } & OutOfContextStamp)
+  // A dashboard notification injected into a supervisor's terminal. Claude Code
+  // records it in the session JSONL as an ordinary `user` message, so the only
+  // signal left by the time the renderer sees it is the text prefix.
+  | ({ kind: 'dashboard-event'; uuid: string; text: string; label: string; agentName?: string } & OutOfContextStamp)
   // A session-labeled divider drawn above each loaded prior session. Labeled
   // with SESSION identity, never `gen N` alone (generations repeat across /clear).
   | { kind: 'divider'; uuid: string; sessionRowId: number; sessionId: string; generation: number; unavailable?: boolean };
@@ -108,6 +112,38 @@ function wrapResult(res: ToolResultEvent) {
   return w;
 }
 
+export const DASHBOARD_EVENT_PREFIX = '[DASHBOARD EVENT]';
+
+export interface DashboardEventHeader {
+  /** First line with the `[DASHBOARD EVENT] ` prefix stripped, e.g. "Agent status changed". */
+  label: string;
+  /** Quoted title from the `Agent: "<title>" (<id>)` second line, when present. */
+  agentName?: string;
+}
+
+/**
+ * Classify + parse a dashboard notification out of a raw `user-text` payload.
+ * Returns null for anything a human actually typed.
+ *
+ * Prefix-sniffing is the only signal available: the supervisor's notifications
+ * are injected as terminal text and land in the JSONL indistinguishable from a
+ * human turn (payload shapes live in
+ * src/main/supervisor/event-payload-builder.ts). Parsing is deliberately
+ * defensive — orchestration payloads (src/main/orchestration/service.ts) carry
+ * NO `Agent:` line, so the agent name is optional and we never render a
+ * placeholder for it.
+ */
+export function parseDashboardEvent(text: string): DashboardEventHeader | null {
+  const body = text.trimStart();
+  if (!body.startsWith(DASHBOARD_EVENT_PREFIX)) return null;
+  const lines = body.split('\n');
+  const label = lines[0].slice(DASHBOARD_EVENT_PREFIX.length).trim() || 'Dashboard event';
+  // Greedy inner group so a title containing quotes still ends at the ` (<id>)`.
+  const match = lines[1]?.match(/^Agent:\s*"(.*)"\s*\([^)]*\)\s*$/);
+  const agentName = match && match[1].trim().length > 0 ? match[1] : undefined;
+  return { label, agentName };
+}
+
 /**
  * Pair tool-use ↔ tool-result by `toolUseId`, then flatten into a render list.
  * Usage events are consumed by ContextUsageBar and dropped from the list.
@@ -126,9 +162,17 @@ function pairEvents(events: SessionEvent[]): ChatContentItem[] {
 
   for (const e of events) {
     switch (e.type) {
-      case 'user-text':
-        items.push({ kind: 'user', uuid: e.uuid, text: e.text });
+      case 'user-text': {
+        // Dashboard notifications arrive as `user` turns but are not human
+        // messages — split them out so they render as telemetry.
+        const dashboardEvent = parseDashboardEvent(e.text);
+        items.push(
+          dashboardEvent
+            ? { kind: 'dashboard-event', uuid: e.uuid, text: e.text, ...dashboardEvent }
+            : { kind: 'user', uuid: e.uuid, text: e.text },
+        );
         break;
+      }
       case 'assistant-text':
         items.push({ kind: 'assistant', uuid: e.uuid, text: e.text });
         break;
@@ -321,6 +365,48 @@ const SystemNote = React.memo(function SystemNote({ text }: { text: string }) {
   );
 });
 
+// A dashboard notification, rendered as collapsed telemetry rather than as a
+// human turn. The summary row is a real <button> (keyboard-accessible, with a
+// chevron affordance); expanding reveals the raw payload verbatim — never
+// through the markdown renderer, since payloads carry quotes, JSON and log
+// tails. Expansion is local state: one bubble's toggle is nobody else's
+// business, so no store plumbing.
+const DashboardEventNote = React.memo(function DashboardEventNote({
+  text,
+  label,
+  agentName,
+}: {
+  text: string;
+  label: string;
+  agentName?: string;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  return (
+    <div className="dash-evt">
+      <button
+        type="button"
+        className="dash-evt__summary"
+        aria-expanded={expanded}
+        title={expanded ? 'Collapse dashboard event' : 'Expand dashboard event'}
+        onClick={() => setExpanded((v) => !v)}
+      >
+        <span className="dash-evt__chevron" aria-hidden>{expanded ? '▼' : '▶'}</span>
+        <span className="dash-evt__badge">Dashboard event</span>
+        {agentName && (
+          <>
+            <span className="dash-evt__agent">{agentName}</span>
+            <span className="dash-evt__sep" aria-hidden>·</span>
+          </>
+        )}
+        <span className="dash-evt__label">{label}</span>
+      </button>
+      {expanded && (
+        <pre className="dash-evt__body select-text cursor-text">{text}</pre>
+      )}
+    </div>
+  );
+});
+
 // Short, human-scannable slice of a session id for the divider caption.
 function shortSessionId(sessionId: string): string {
   return sessionId.length > 8 ? sessionId.slice(0, 8) : sessionId;
@@ -406,6 +492,8 @@ function renderChatItem(
       );
     case 'system':
       return <SystemNote text={item.text} />;
+    case 'dashboard-event':
+      return <DashboardEventNote text={item.text} label={item.label} agentName={item.agentName} />;
   }
 }
 
@@ -461,6 +549,11 @@ export default function ChatPane({ agentId, agentStatus, agentName, stagingOpen 
   const isLight = useThemeStore((s) => s.theme) === 'light';
   const [events, setEvents] = useState<SessionEvent[]>([]);
   const [hydrated, setHydrated] = useState(false);
+  // True when the agent is dead AND its history could not be recovered from
+  // disk — a provider whose log reader has no one-shot session read, or a
+  // pruned/missing session file. Distinct from "no messages yet": the chat
+  // existed, we just can't show it. Never set for a live agent.
+  const [historyUnavailable, setHistoryUnavailable] = useState(false);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const [scrollEl, setScrollEl] = useState<HTMLDivElement | null>(null);
   const setScrollRef = useCallback((el: HTMLDivElement | null) => {
@@ -557,6 +650,7 @@ export default function ChatPane({ agentId, agentStatus, agentName, stagingOpen 
     let mounted = true;
     setEvents([]);
     setHydrated(false);
+    setHistoryUnavailable(false);
     setStagedComments([]);
     setPriorBlocks([]);
     setLoadedPriorCount(0);
@@ -572,6 +666,7 @@ export default function ChatPane({ agentId, agentStatus, agentName, stagingOpen 
       const initial = await window.api.agents.getChatEvents(agentId);
       if (!mounted) return;
       setEvents(initial.events);
+      setHistoryUnavailable(initial.source === 'unavailable');
       setHydrated(true);
       // Cheap DB lineage (no JSONL read) so we know whether prior sessions
       // exist and which row ids to lazily walk back to.
@@ -806,10 +901,23 @@ export default function ChatPane({ agentId, agentStatus, agentName, stagingOpen 
         >
           {empty ? (
             <div className={`h-full flex items-center justify-center px-6 ${isLight ? 'text-[#8b949e]' : 'text-gray-500'}`}>
-              <div className="text-center">
-                <div className="text-[13px] mb-1">No messages yet</div>
-                <div className="text-[11px]">Send a message below to start the conversation.</div>
-              </div>
+              {historyUnavailable ? (
+                // Dead agent whose transcript can't be read back. Say so
+                // explicitly — a silent "No messages yet" would read as "this
+                // agent never said anything," which is a lie.
+                <div className="text-center">
+                  <div className="text-[13px] mb-1">Chat history not available</div>
+                  <div className="text-[11px]">
+                    This agent has stopped, and its transcript can&rsquo;t be read back
+                    from disk for this provider.
+                  </div>
+                </div>
+              ) : (
+                <div className="text-center">
+                  <div className="text-[13px] mb-1">No messages yet</div>
+                  <div className="text-[11px]">Send a message below to start the conversation.</div>
+                </div>
+              )}
             </div>
           ) : (
             <>

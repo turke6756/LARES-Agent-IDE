@@ -5,7 +5,8 @@ import { WebglAddon } from '@xterm/addon-webgl';
 import '@xterm/xterm/css/xterm.css';
 import { useDashboardStore } from '../../stores/dashboard-store';
 import { useThemeStore } from '../../stores/theme-store';
-import { shellEscapePath } from '../../utils/drag-file';
+import { shellEscapePath, isExternalFileDrop, getDroppedNativePaths, readClipboardImage } from '../../utils/drag-file';
+import { terminalCache, disposeCachedTerminal, reapOnLeave } from './terminal-cache';
 import type { Agent } from '../../../shared/types';
 
 /** Strip persona-folder suffix to show the workspace root name.
@@ -77,14 +78,9 @@ function getTerminalTheme(theme: string) {
   return theme === 'light' ? LIGHT_TERMINAL_THEME : DARK_TERMINAL_THEME;
 }
 
-interface CachedTerminal {
-  terminal: Terminal;
-  fitAddon: FitAddon;
-  unsub: (() => void) | null;
-}
-
-// Module-level cache — survives re-renders, preserves scrollback
-const terminalCache = new Map<string, CachedTerminal>();
+// The xterm cache, its single teardown helper, and the terminal-status reaper
+// that disposes a DEAD agent's terminal now live in `./terminal-cache` — see
+// that module's header for why the cache survives unmount but not death.
 
 // Auto-focus the terminal WITHOUT yanking focus away from a text field the
 // user is actively typing in (e.g. the chat bar). The terminal's mount/reattach
@@ -129,6 +125,49 @@ export default function TerminalPanel({ height }: TerminalPanelProps) {
   // mount effect to re-run into its create-new branch on the fresh bridge.
   const [reboundNonce, setReboundNonce] = useState(0);
 
+  // Transient paste/drop error surfaced in the toolbar. The timeout id is
+  // ref-managed (addendum J) so an older timer can't clear a newer error, and
+  // it's cleared on unmount.
+  const [pasteError, setPasteError] = useState<string | null>(null);
+  const pasteErrorTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const flashPasteError = useCallback((msg: string) => {
+    setPasteError(msg);
+    if (pasteErrorTimerRef.current) clearTimeout(pasteErrorTimerRef.current);
+    pasteErrorTimerRef.current = setTimeout(() => setPasteError(null), 4000);
+  }, []);
+  useEffect(() => () => {
+    if (pasteErrorTimerRef.current) clearTimeout(pasteErrorTimerRef.current);
+  }, []);
+
+  // Shared paste routine — used by Ctrl+V, Ctrl+Shift+V, AND right-click. Reads
+  // the agent cwd live from the store to avoid stale closures.
+  const pasteIntoTerminal = useCallback(async (agentId: string) => {
+    const img = await readClipboardImage();
+    if (img && 'error' in img) { flashPasteError(img.error); return; }
+    if (img) {
+      const wd = useDashboardStore.getState().agents.find((a) => a.id === agentId)?.workingDirectory || '';
+      const res = await window.api.files.writeImageTemp(img.bytes, img.mime, wd);
+      if (res.ok) window.api.terminal.write(agentId, shellEscapePath(res.path) + ' ');
+      else flashPasteError(res.error);
+      return;
+    }
+    // No image → text fallback. readText() can also reject when the clipboard
+    // permission was denied (addendum I) — don't let it become an unhandled
+    // rejection.
+    try {
+      const text = await navigator.clipboard.readText();
+      if (text) window.api.terminal.write(agentId, text);
+    } catch {
+      flashPasteError('Could not read the clipboard.');
+    }
+  }, [flashPasteError]);
+
+  // The xterm custom-key handler is (re)bound on every mount below and reads the
+  // latest paste routine through this ref, so a cached terminal that survives an
+  // unmount/remount never calls a stale mount's flashPasteError (addendum H).
+  const pasteHandlerRef = useRef(pasteIntoTerminal);
+  useEffect(() => { pasteHandlerRef.current = pasteIntoTerminal; }, [pasteIntoTerminal]);
+
   const isOpen = terminalAgentId !== null;
   const isNub = panelLayout.terminalCollapsed && isOpen;
   const isLight = theme === 'light';
@@ -146,6 +185,41 @@ export default function TerminalPanel({ height }: TerminalPanelProps) {
     const agentId = terminalAgentId;
     const container = termRef.current;
 
+    // Copy/paste key handler. (Re)bound on EVERY mount — including the cached
+    // reattach branch — so a terminal that survives unmount/remount always runs
+    // the current mount's paste routine (addendum H). Reads the paste routine
+    // through pasteHandlerRef so it never closes over a stale flashPasteError.
+    const installKeyHandler = (terminal: Terminal) => {
+      terminal.attachCustomKeyEventHandler((ev) => {
+        // Ctrl+Shift+C → always copy
+        if (ev.ctrlKey && ev.shiftKey && ev.key === 'C' && ev.type === 'keydown') {
+          const sel = terminal.getSelection();
+          if (sel) navigator.clipboard.writeText(sel);
+          return false;
+        }
+        // Ctrl+Shift+V → always paste (image-aware)
+        if (ev.ctrlKey && ev.shiftKey && ev.key === 'V' && ev.type === 'keydown') {
+          pasteHandlerRef.current(agentId);
+          return false;
+        }
+        // Ctrl+C with selection → copy (otherwise pass through as SIGINT)
+        if (ev.ctrlKey && !ev.shiftKey && ev.key === 'c' && ev.type === 'keydown') {
+          const sel = terminal.getSelection();
+          if (sel) {
+            navigator.clipboard.writeText(sel);
+            terminal.clearSelection();
+            return false;
+          }
+        }
+        // Ctrl+V → paste (image-aware)
+        if (ev.ctrlKey && !ev.shiftKey && ev.key === 'v' && ev.type === 'keydown') {
+          pasteHandlerRef.current(agentId);
+          return false;
+        }
+        return true;
+      });
+    };
+
     let cached = terminalCache.get(agentId);
 
     if (cached) {
@@ -153,6 +227,7 @@ export default function TerminalPanel({ height }: TerminalPanelProps) {
       container.appendChild(cached.terminal.element!);
       xtermRef.current = cached.terminal;
       fitAddonRef.current = cached.fitAddon;
+      installKeyHandler(cached.terminal); // rebind to THIS mount (addendum H)
 
       // Delayed fit to ensure container has final dimensions
       const fitReattach = () => {
@@ -212,39 +287,8 @@ export default function TerminalPanel({ height }: TerminalPanelProps) {
       xtermRef.current = terminal;
       fitAddonRef.current = fitAddon;
 
-      // Copy/paste key handler
-      terminal.attachCustomKeyEventHandler((ev) => {
-        // Ctrl+Shift+C → always copy
-        if (ev.ctrlKey && ev.shiftKey && ev.key === 'C' && ev.type === 'keydown') {
-          const sel = terminal.getSelection();
-          if (sel) navigator.clipboard.writeText(sel);
-          return false;
-        }
-        // Ctrl+Shift+V → always paste
-        if (ev.ctrlKey && ev.shiftKey && ev.key === 'V' && ev.type === 'keydown') {
-          navigator.clipboard.readText().then((text) => {
-            if (text) window.api.terminal.write(agentId, text);
-          });
-          return false;
-        }
-        // Ctrl+C with selection → copy (otherwise pass through as SIGINT)
-        if (ev.ctrlKey && !ev.shiftKey && ev.key === 'c' && ev.type === 'keydown') {
-          const sel = terminal.getSelection();
-          if (sel) {
-            navigator.clipboard.writeText(sel);
-            terminal.clearSelection();
-            return false;
-          }
-        }
-        // Ctrl+V → paste
-        if (ev.ctrlKey && !ev.shiftKey && ev.key === 'v' && ev.type === 'keydown') {
-          navigator.clipboard.readText().then((text) => {
-            if (text) window.api.terminal.write(agentId, text);
-          });
-          return false;
-        }
-        return true;
-      });
+      // Copy/paste key handler (image-aware; see installKeyHandler above).
+      installKeyHandler(terminal);
 
       // Forward terminal input to agent
       terminal.onData((data) => {
@@ -373,6 +417,13 @@ export default function TerminalPanel({ height }: TerminalPanelProps) {
         }
       }
 
+      // ...UNLESS the agent is dead. A terminal agent has no live PTY to buffer
+      // and nothing to come back for, so leaving here is the moment to release
+      // its scrollback + WebGL context. No-op for a live agent (the whole point
+      // of the block above). Re-opening the dead agent rebuilds read-only from
+      // the persisted `.scrollback` via `getRingBuffer`.
+      reapOnLeave(agentId);
+
       xtermRef.current = null;
       fitAddonRef.current = null;
     };
@@ -386,12 +437,7 @@ export default function TerminalPanel({ height }: TerminalPanelProps) {
   // lazily the next time they're opened — the cache is already cleared for them.
   useEffect(() => {
     const unsub = window.api.terminal.onRebound((reboundAgentId: string) => {
-      const entry = terminalCache.get(reboundAgentId);
-      if (entry) {
-        entry.unsub?.();
-        entry.terminal.dispose();
-        terminalCache.delete(reboundAgentId);
-      }
+      disposeCachedTerminal(reboundAgentId);
       // Only force a re-mount for the terminal currently on screen.
       if (reboundAgentId === terminalAgentId) {
         setReboundNonce((n) => n + 1);
@@ -433,11 +479,9 @@ export default function TerminalPanel({ height }: TerminalPanelProps) {
       navigator.clipboard.writeText(sel);
       terminal.clearSelection();
     } else {
-      navigator.clipboard.readText().then((text) => {
-        if (text) window.api.terminal.write(terminalAgentId, text);
-      });
+      pasteIntoTerminal(terminalAgentId); // image-aware, shared with Ctrl+V
     }
-  }, [terminalAgentId]);
+  }, [terminalAgentId, pasteIntoTerminal]);
 
   // Drag-and-drop handler (shared between full and nub modes)
   const handleDragOver = useCallback((e: React.DragEvent) => {
@@ -449,15 +493,42 @@ export default function TerminalPanel({ height }: TerminalPanelProps) {
     setIsDragOver(false);
   }, []);
 
-  const handleDrop = useCallback((e: React.DragEvent) => {
+  const handleDrop = useCallback(async (e: React.DragEvent) => {
     e.preventDefault();
     setIsDragOver(false);
-    const filePath = e.dataTransfer.getData('application/x-file-path') || e.dataTransfer.getData('text/plain');
-    if (filePath && terminalAgentId) {
-      window.api.terminal.write(terminalAgentId, shellEscapePath(filePath));
+    if (!terminalAgentId) return;
+
+    // 1. In-app path (tree/file chips) — already in workspace path space; inject as-is.
+    const inApp = e.dataTransfer.getData('application/x-file-path');
+    if (inApp) {
+      window.api.terminal.write(terminalAgentId, shellEscapePath(inApp) + ' '); // trailing space: intentional
+      xtermRef.current?.focus();
+      return;
+    }
+    // 2. External OS files — BEFORE text/plain (Explorer drops also expose text/plain).
+    if (isExternalFileDrop(e.dataTransfer)) {
+      const native = getDroppedNativePaths(e.dataTransfer); // sync: call before any await
+      const wd = useDashboardStore.getState().agents.find((a) => a.id === terminalAgentId)?.workingDirectory || '';
+      if (native.length === 0) {
+        flashPasteError('Dropped item has no file path (drag the image file from Explorer).');
+        return;
+      }
+      const results = await window.api.files.resolveImageDrops(native, wd);
+      for (const r of results) {
+        if (r.ok) window.api.terminal.write(terminalAgentId, shellEscapePath(r.path) + ' ');
+      }
+      const bad = results.find((r) => !r.ok);
+      if (bad && !bad.ok) flashPasteError(bad.error);
+      xtermRef.current?.focus();
+      return;
+    }
+    // 3. Generic text fallback.
+    const text = e.dataTransfer.getData('text/plain');
+    if (text) {
+      window.api.terminal.write(terminalAgentId, shellEscapePath(text) + ' ');
       xtermRef.current?.focus();
     }
-  }, [terminalAgentId]);
+  }, [terminalAgentId, flashPasteError]);
 
   // --- Nub mode rendering ---
   if (isNub) {
@@ -564,6 +635,14 @@ export default function TerminalPanel({ height }: TerminalPanelProps) {
           )}
         </div>
         <div className="flex items-center gap-2">
+            {pasteError && (
+              <span
+                className="text-[10px] text-[var(--color-accent-red)] max-w-[280px] truncate"
+                title={pasteError}
+              >
+                {pasteError}
+              </span>
+            )}
             <button
                 onClick={() => xtermRef.current?.clear()}
                 className={toolbarBtn(false, '')}
