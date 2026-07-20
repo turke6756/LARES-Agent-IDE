@@ -3157,29 +3157,7 @@ export class AgentSupervisor extends EventEmitter {
     });
 
     runner.on('exit', (exitCode: number) => {
-      // Drain-time exits must NOT flip status to 'done'/'crashed' — keeping
-      // the agent 'working'/'idle' in the DB is what makes reconcile()
-      // respawn it with --continue at next startup.
-      if (this.shuttingDown) { this.windowsRunners.delete(agent.id); return; }
-      updateAgentExitCode(agent.id, exitCode);
-      this.windowsRunners.delete(agent.id);
-      const status: AgentStatus = exitCode === 0 ? 'done' : 'crashed';
-      const t = applyStatusTransition(agent.id, status);
-      addEvent(agent.id, status, JSON.stringify({ exitCode }));
-      this.emit('statusChanged', { agentId: agent.id, status, fromStatus: t?.prior, source: 'runner-exit' } satisfies StatusChangedEvent);
-      // BUG-23 — terminal exit invalidates any pending settle timer.
-      this.monitor.clearLaunch(agent.id);
-      // P1 §3 — drop this worker's spool-tailer claim (a relaunch re-claims).
-      this.releaseSpoolTailer(agent.id);
-      // Dead agent: its chat is served from disk now, so drop the ring.
-      // Deferred + status-re-checked, so the auto-restart below cancels it.
-      this.releaseChatRing(agent.id);
-
-      // Auto-restart
-      const latest = getAgent(agent.id);
-      if (latest && status === 'crashed' && latest.autoRestartEnabled) {
-        this.handleAutoRestart(latest);
-      }
+      this.handleRunnerExit(agent.id, exitCode, 'windows');
     });
 
     // Use directSpawn when we have a multiline positional argument (prompt text)
@@ -4099,26 +4077,7 @@ export class AgentSupervisor extends EventEmitter {
     });
 
     runner.on('exit', (exitCode: number) => {
-      // See the Windows runner-exit handler: shutdown-time exits keep the
-      // agent's pre-quit status so reconcile() picks it up next startup.
-      if (this.shuttingDown) { this.wslRunners.delete(agent.id); return; }
-      updateAgentExitCode(agent.id, exitCode);
-      this.wslRunners.delete(agent.id);
-      const status: AgentStatus = exitCode === 0 ? 'done' : 'crashed';
-      const t = applyStatusTransition(agent.id, status);
-      addEvent(agent.id, status, JSON.stringify({ exitCode }));
-      this.emit('statusChanged', { agentId: agent.id, status, fromStatus: t?.prior, source: 'runner-exit' } satisfies StatusChangedEvent);
-      // BUG-23 — terminal exit invalidates any pending settle timer.
-      this.monitor.clearLaunch(agent.id);
-      // P1 §3 — drop this worker's spool-tailer claim (a relaunch re-claims).
-      this.releaseSpoolTailer(agent.id);
-      // Dead agent: chat comes from disk now — drop the ring (see Windows path).
-      this.releaseChatRing(agent.id);
-
-      const latest = getAgent(agent.id);
-      if (latest && status === 'crashed' && latest.autoRestartEnabled) {
-        this.handleAutoRestart(latest);
-      }
+      this.handleRunnerExit(agent.id, exitCode, 'wsl');
     });
 
     // D-4/F10 (BLOCKER): the rendered WSL command now embeds the bearer token
@@ -4587,6 +4546,92 @@ export class AgentSupervisor extends EventEmitter {
     return this.lifecycleLocks.has(agentId);
   }
 
+  // ── Stop-intent record (§B5 honest-failure follow-up) ───────────────────────
+  //
+  // §B5 deliberately RETAINS the runner-map entry when a stop could not be
+  // verified. Without this record, the process's eventual exit would flow
+  // through the normal runner-exit path: a second `statusChanged`, and — the
+  // real danger — an auto-restart on a crash exit code, resurrecting the agent
+  // the user just tried to stop.
+  //
+  // So every stop registers its intent. A clean stop clears it in the `finally`
+  // of `stopAgentLocked`; an HONEST FAILURE retains it (as `stop-failed`) so a
+  // late exit is attributed to that stop instead of to a crash. The record also
+  // carries the reason, so the late exit can record honest attribution rather
+  // than inventing one.
+  private stopIntents = new Map<string, { phase: 'stopping' | 'stop-failed'; reason: AgentStopReason }>();
+
+  /** Test/diagnostic seam — the pending stop intent for an agent, if any. */
+  peekStopIntent(agentId: string): 'stopping' | 'stop-failed' | null {
+    return this.stopIntents.get(agentId)?.phase ?? null;
+  }
+
+  /**
+   * The single runner-exit authority for BOTH transports.
+   *
+   * Three cases:
+   *  - shutting down → keep the pre-quit status so reconcile() respawns it;
+   *  - a stop intent exists → the exit is INTENTIONAL: the stop path owns the
+   *    status write (`stopping`), or we own the one-and-only write for a stop
+   *    that previously failed honestly (`stop-failed`). Either way: no
+   *    duplicate `statusChanged`, and NEVER an auto-restart;
+   *  - otherwise → the historical natural-exit path, auto-restart included.
+   */
+  private handleRunnerExit(agentId: string, exitCode: number, transport: 'windows' | 'wsl'): void {
+    const dropRunner = (): void => {
+      if (transport === 'windows') this.windowsRunners.delete(agentId);
+      else this.wslRunners.delete(agentId);
+    };
+
+    // Drain-time exits must NOT flip status to 'done'/'crashed' — keeping the
+    // agent 'working'/'idle' in the DB is what makes reconcile() respawn it
+    // with --continue at next startup.
+    if (this.shuttingDown) { dropRunner(); return; }
+
+    const intent = this.stopIntents.get(agentId);
+    if (intent) {
+      // Handled — the record's job is done either way.
+      this.stopIntents.delete(agentId);
+      updateAgentExitCode(agentId, exitCode);
+      dropRunner();
+      this.monitor.clearLaunch(agentId);
+      this.releaseSpoolTailer(agentId);
+      if (intent.phase === 'stopping') {
+        // A stop is in flight and is awaiting exactly this exit; it writes the
+        // status, the audit row and the single `statusChanged` itself.
+        return;
+      }
+      // 'stop-failed': the stop gave up honestly and left the row in its live
+      // status. The process has now genuinely gone, so this is the FIRST (not a
+      // duplicate) terminal write for that stop, attributed to its reason.
+      const t = applyStatusTransition(agentId, 'done', { stopReason: intent.reason });
+      addEvent(agentId, 'stopped', JSON.stringify({ reason: intent.reason, detail: 'late-runner-exit', exitCode }));
+      this.emit('statusChanged', { agentId, status: 'done', fromStatus: t?.prior, source: 'stop' } satisfies StatusChangedEvent);
+      this.releaseChatRing(agentId);
+      return;
+    }
+
+    updateAgentExitCode(agentId, exitCode);
+    dropRunner();
+    const status: AgentStatus = exitCode === 0 ? 'done' : 'crashed';
+    const t = applyStatusTransition(agentId, status);
+    addEvent(agentId, status, JSON.stringify({ exitCode }));
+    this.emit('statusChanged', { agentId, status, fromStatus: t?.prior, source: 'runner-exit' } satisfies StatusChangedEvent);
+    // BUG-23 — terminal exit invalidates any pending settle timer.
+    this.monitor.clearLaunch(agentId);
+    // P1 §3 — drop this worker's spool-tailer claim (a relaunch re-claims).
+    this.releaseSpoolTailer(agentId);
+    // Dead agent: its chat is served from disk now, so drop the ring.
+    // Deferred + status-re-checked, so the auto-restart below cancels it.
+    this.releaseChatRing(agentId);
+
+    // Auto-restart
+    const latest = getAgent(agentId);
+    if (latest && status === 'crashed' && latest.autoRestartEnabled) {
+      this.handleAutoRestart(latest);
+    }
+  }
+
   /**
    * Idle-agent lifecycle §B5 — verified, transport-aware per-agent termination.
    * The escalation path when a runner will not confirm its own exit.
@@ -4675,6 +4720,37 @@ export class AgentSupervisor extends EventEmitter {
    *  calling the public `stopAgent` from inside the lock would deadlock. */
   private async stopAgentLocked(agentId: string, options?: { reason?: AgentStopReason }): Promise<StopResult> {
     const reason = options?.reason ?? 'supervisor';
+    // Register the intent BEFORE anything can kill the runner, so no exit can
+    // slip through the natural-exit path (see handleRunnerExit).
+    this.stopIntents.set(agentId, { phase: 'stopping', reason });
+    try {
+      const result = await this.stopAgentBody(agentId, reason);
+      if (result.outcome === 'failed') {
+        // HONEST FAILURE — RETAIN the intent. The runner entry is retained too,
+        // so its eventual exit must be attributed to this stop and must never
+        // auto-restart.
+        //
+        // Unless the exit ALREADY landed in the narrow window between the wait
+        // timing out and the escalation returning: the exit handler then took
+        // the `stopping` branch and dropped the runner entry, so the process is
+        // demonstrably gone and there is no future exit to attribute. Retaining
+        // an intent nothing will ever consume would suppress a genuine later
+        // auto-restart. A retry stop normalizes the row.
+        const stillRunning = this.windowsRunners.has(agentId) || this.wslRunners.has(agentId);
+        if (stillRunning) this.stopIntents.set(agentId, { phase: 'stop-failed', reason });
+        else this.stopIntents.delete(agentId);
+      } else {
+        this.stopIntents.delete(agentId);
+      }
+      return result;
+    } catch (e) {
+      this.stopIntents.delete(agentId);
+      throw e;
+    }
+  }
+
+  /** The stop body proper. Always runs with a `stopping` intent registered. */
+  private async stopAgentBody(agentId: string, reason: AgentStopReason): Promise<StopResult> {
     const prior = getAgent(agentId);
     if (!prior) return { agentId, outcome: 'not_found', killedRunner: false, reason };
 
