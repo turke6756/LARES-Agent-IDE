@@ -87,7 +87,9 @@ export function registerIpcHandlers(
     if (typeof planId === 'string' && planId !== '') assertPlanRailFree(planId);
     return supervisor.launchAgent(input);
   });
-  ipcMain.handle('agent:stop', (_e, id) => supervisor.stopAgent(id));
+  // 'agent:stop' is registered by registerLifecycleIpc (lifecycle/lifecycle-ipc.ts)
+  // so that every stop endpoint assigns its own reason in ONE place and a
+  // renderer can never supply one (§B9).
   ipcMain.handle('agent:restart', (_e, id) => supervisor.restartAgent(id));
   ipcMain.handle('agent:get-log', (_e, id, lines) => supervisor.getAgentLog(id, lines));
   ipcMain.handle('agent:get-ring-buffer', (_e, id) => supervisor.getAgentRingBuffer(id));

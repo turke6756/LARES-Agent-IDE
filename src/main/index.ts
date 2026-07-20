@@ -1,4 +1,8 @@
 import { app, BrowserWindow, crashReporter, dialog, protocol, session, nativeTheme, ipcMain } from 'electron';
+import { powerMonitor } from 'electron';
+import { registerLifecycleIpc, LIFECYCLE_CHANNELS, type BulkStopDeps } from './lifecycle/lifecycle-ipc';
+import { loadLifecycleSettings, saveLifecycleSettings } from './lifecycle/lifecycle-settings';
+import { IdleSweep } from './lifecycle/idle-sweep';
 import path from 'path';
 import fs from 'fs';
 import { loadPersistedTheme } from './theme-persistence';
@@ -172,6 +176,9 @@ let wsServer: WsServer | null = null;
 let apiServer: ApiServer | null = null;
 let orchestration: OrchestrationService | null = null;
 let browserManager: BrowserManager | null = null;
+// Idle-agent lifecycle §B9 — the automatic stale-idle sweep. Armed after
+// app.whenReady(); stopped (and drained) by shutdownApp.
+let idleSweep: IdleSweep | null = null;
 // D5-lite memory watchdog + D1 shell-crash recovery policy (incident-2026-07-11
 // §5). Constructed at ready once the supervisor + browser manager exist (their
 // counts feed the sampler); referenced lazily by the shell's render-process-gone
@@ -789,6 +796,31 @@ app.whenReady().then(async () => {
       browserManager?.onAgentLifecycleStatus(data.agentId, terminal);
     });
 
+    // ── Idle-agent lifecycle §B7/§B9 — guards, IPC and the stale-idle sweep ───
+    // Wired HERE because the two out-of-supervisor guard sources (browser tabs,
+    // active deliberations) only exist at this point. The sweep is armed after
+    // app.whenReady() (we are inside it) — powerMonitor throws if touched
+    // earlier.
+    supervisor.setLifecycleGuardSources({
+      getAgentBrowserState: (agentId) => browserManager?.getAgentBrowserState(agentId) ?? null,
+      activeOrchestrationIds: () => orchestration?.activeSupervisorIds() ?? [],
+    });
+    const lifecycleDeps: BulkStopDeps = {
+      stopIfEligible: (agentId, mode, reason, o) => supervisor!.stopIfEligibleLocked(agentId, mode, reason, o),
+      listAgents: () => getActiveAgents().map((a) => ({ id: a.id, status: a.status, idleSince: a.idleSince ?? null })),
+      get guardDeps() { return supervisor!.guardDeps; },
+      loadSettings: () => loadLifecycleSettings(),
+      saveSettings: (s) => saveLifecycleSettings(s),
+      broadcastSettings: (s) => {
+        for (const win of BrowserWindow.getAllWindows()) {
+          if (!win.isDestroyed()) win.webContents.send(LIFECYCLE_CHANNELS.settingsChanged, s);
+        }
+      },
+    };
+    registerLifecycleIpc(ipcMain, lifecycleDeps);
+    idleSweep = new IdleSweep({ ...lifecycleDeps, powerMonitor });
+    idleSweep.start();
+
     // ── D5-lite memory watchdog + admission control (incident-2026-07-11 §5) ──
     // Now that the supervisor + browser manager exist (their live counts feed the
     // sampler), construct the sampler, arm the admission gates, install the D1
@@ -907,6 +939,9 @@ async function shutdownApp(): Promise<void> {
   // 'crashed' for a drained agent and auto-restart it mid-quit. (The
   // handleAutoRestart shuttingDown guard is the belt; this is the braces.)
   supervisor?.stop();
+  // §B9 — disarm the sweep BEFORE the drain and await any in-flight run, so a
+  // stale-idle kill is never abandoned half-way through shutdown.
+  await idleSweep?.stop();
   memorySampler?.stop();
   try { await supervisor?.drainForShutdown(); }
   catch (err) { console.error('[shutdown] drain failed:', err); }

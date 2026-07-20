@@ -1192,7 +1192,11 @@ export interface IpcApi {
     list: (workspaceId: string) => Promise<Agent[]>;
     listAll: () => Promise<Agent[]>;
     launch: (input: LaunchAgentInput) => Promise<Agent>;
-    stop: (id: string) => Promise<void>;
+    /** Main assigns the stop reason per endpoint (§B9) — never the renderer. */
+    stop: (id: string) => Promise<BulkStopResult>;
+    stopBulk: (req: BulkStopRequest) => Promise<BulkStopResult>;
+    stopStaleIdle: () => Promise<BulkStopResult>;
+    previewStaleIdle: () => Promise<StaleIdlePreview>;
     restart: (id: string) => Promise<void>;
     getLog: (id: string, lines?: number) => Promise<string>;
     getRingBuffer: (id: string) => Promise<string>;
@@ -1373,6 +1377,11 @@ export interface IpcApi {
   /** WP1-A — embedded browser pane. FROZEN WP1 contract: payload shapes and
    *  channel names live in src/shared/browser.ts; WP1-B consumes this
    *  namespace. Changes require both workers + a plans-doc progress-log note. */
+  lifecycle: {
+    getSettings: () => Promise<LifecycleSettings>;
+    setSettings: (settings: LifecycleSettings) => Promise<LifecycleSettings>;
+    onSettingsChanged: (cb: (settings: LifecycleSettings) => void) => () => void;
+  };
   browser: {
     createTab: (opts: BrowserCreateTabOptions) => Promise<{ tabId: string }>;
     closeTab: (tabId: string) => Promise<void>;

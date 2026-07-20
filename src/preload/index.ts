@@ -35,6 +35,9 @@ const api: IpcApi = {
     listAll: () => ipcRenderer.invoke('agent:list-all'),
     launch: (input) => ipcRenderer.invoke('agent:launch', input),
     stop: (id) => ipcRenderer.invoke('agent:stop', id),
+    stopBulk: (req) => ipcRenderer.invoke('agent:stop-bulk', req),
+    stopStaleIdle: () => ipcRenderer.invoke('agent:stop-stale-idle'),
+    previewStaleIdle: () => ipcRenderer.invoke('agent:preview-stale-idle'),
     restart: (id) => ipcRenderer.invoke('agent:restart', id),
     getLog: (id, lines) => ipcRenderer.invoke('agent:get-log', id, lines),
     getRingBuffer: (id) => ipcRenderer.invoke('agent:get-ring-buffer', id),
@@ -259,6 +262,15 @@ const api: IpcApi = {
     listKernelspecs: () => ipcRenderer.invoke('notebook:list-kernelspecs'),
   },
   // WP1-A — embedded browser pane, frozen WP1 contract (src/shared/browser.ts).
+  lifecycle: {
+    getSettings: () => ipcRenderer.invoke('lifecycle:get-settings'),
+    setSettings: (settings) => ipcRenderer.invoke('lifecycle:set-settings', settings),
+    onSettingsChanged: (callback) => {
+      const listener = (_event: any, settings: any) => callback(settings);
+      ipcRenderer.on('lifecycle:settings-changed', listener);
+      return () => ipcRenderer.removeListener('lifecycle:settings-changed', listener);
+    },
+  },
   browser: {
     createTab: (opts) => ipcRenderer.invoke(BROWSER_CHANNELS.createTab, opts),
     closeTab: (tabId) => ipcRenderer.invoke(BROWSER_CHANNELS.closeTab, tabId),
