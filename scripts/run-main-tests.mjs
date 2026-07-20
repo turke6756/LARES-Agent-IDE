@@ -37,6 +37,9 @@ const TESTS = [
   'dist/main/main/supervisor/event-payload-builder.test.js',
   'dist/main/main/supervisor/status-monitor.test.js',
   'dist/main/main/supervisor/agent-supervisor.test.js',
+  // Idle-agent lifecycle: §B2/§B3 migration + transition writer, §B5/§B6 stop engine.
+  'dist/main/main/lifecycle-transition.test.js',
+  'dist/main/main/supervisor/lifecycle-stop.test.js',
   'dist/main/main/supervisor/initial-user-prompt.test.js',
   'dist/main/main/supervisor/hook-spool-tailer.test.js',
   'dist/main/main/supervisor/send-input-encoder.test.js',

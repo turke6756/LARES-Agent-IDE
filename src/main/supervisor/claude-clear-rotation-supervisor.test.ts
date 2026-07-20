@@ -19,6 +19,7 @@
 //   node dist/main/main/supervisor/claude-clear-rotation-supervisor.test.js
 
 import assert from 'node:assert/strict';
+import { patchApplyStatusTransition } from './test-helpers/patch-apply-transition';
 import { AgentSupervisor, parseLatestClaudeHookSessionFromSpool } from './index';
 import type { ParsedHookEvent } from './index';
 import { makeAgent } from './test-helpers/fake-bridge-deps';
@@ -42,7 +43,7 @@ function patchDb(agentsMap: Map<string, Agent>, audit: AuditRow[]): () => void {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const db = require('../database') as Record<string, unknown>;
   const keys = [
-    'updateAgentStatus', 'updateAgentHookStatus', 'updateAgentPid', 'getAgent',
+    'updateAgentStatus', 'applyStatusTransition', 'updateAgentHookStatus', 'updateAgentPid', 'getAgent',
     'addEvent', 'updateAgentLastOutput', 'updateAgentExitCode',
     'getActiveAgents', 'getAllAgents', 'getSupervisorAgent', 'addFileActivity',
     'updateAgentResumeSessionId', 'getWorkspace', 'createAgent',
@@ -85,6 +86,9 @@ function patchDb(agentsMap: Map<string, Agent>, audit: AuditRow[]): () => void {
   db.pruneFileActivitiesToRecentSessions = () => ({ prunedRows: 0, prunedSessions: 0 });
   db.closeAgentSession = () => {};
   db.insertAgentSession = () => {};
+
+  // §B3 — status writes route through applyStatusTransition; keep them in the fake.
+  patchApplyStatusTransition(db as unknown as Record<string, unknown>);
 
   return () => { for (const k of keys) db[k] = orig[k]; };
 }

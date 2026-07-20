@@ -13,6 +13,7 @@
 //   node dist/main/main/supervisor/launch-cwd.test.js
 
 import assert from 'node:assert/strict';
+import { patchApplyStatusTransition } from './test-helpers/patch-apply-transition';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -40,7 +41,7 @@ function patchDb(workspacePath: string, createdAgents: Agent[]): () => void {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const db = require('../database') as Record<string, unknown>;
   const keys = [
-    'getWorkspace', 'createAgent', 'updateAgentStatus', 'updateAgentPid',
+    'getWorkspace', 'createAgent', 'updateAgentStatus', 'applyStatusTransition', 'updateAgentPid',
     'getAgent', 'addEvent', 'updateAgentLastOutput', 'updateAgentExitCode',
     'getActiveAgents', 'getAllAgents', 'getSupervisorAgent',
     'addFileActivity', 'updateAgentResumeSessionId', 'getTeamMembership',
@@ -82,6 +83,9 @@ function patchDb(workspacePath: string, createdAgents: Agent[]): () => void {
   db.insertAgentSession = () => {};
   db.getCurrentBrick = () => null;
   db.getContinuationAttempt = () => null;
+
+  // §B3 — status writes route through applyStatusTransition; keep them in the fake.
+  patchApplyStatusTransition(db as unknown as Record<string, unknown>);
 
   return () => {
     for (const k of keys) db[k] = orig[k];

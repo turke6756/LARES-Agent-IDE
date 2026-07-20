@@ -29,6 +29,7 @@
 //   node dist/main/main/supervisor/agent-supervisor.test.js
 
 import assert from 'node:assert/strict';
+import { patchApplyStatusTransition } from './test-helpers/patch-apply-transition';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -55,7 +56,7 @@ function patchDb(agentsMap: Map<string, Agent>): () => void {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const db = require('../database') as Record<string, unknown>;
   const keys = [
-    'updateAgentStatus',
+    'updateAgentStatus', 'applyStatusTransition',
     'updateAgentHookStatus',
     'updateAgentLastSendError',
     'updateAgentPid',
@@ -111,6 +112,9 @@ function patchDb(agentsMap: Map<string, Agent>): () => void {
   // Context-brick Inc 4 (4.2) — every fresh launch consults the brick gate's
   // DB fallback; no continuation state in these fixtures.
   db.getCurrentBrick = () => null;
+
+  // §B3 — status writes route through applyStatusTransition; keep them in the fake.
+  patchApplyStatusTransition(db as unknown as Record<string, unknown>);
 
   return () => {
     for (const k of keys) db[k] = orig[k];

@@ -1,5 +1,5 @@
 import { EventEmitter } from 'events';
-import { Agent, AgentStatus } from '../../shared/types';
+import { Agent, AgentStatus, PersistedAgentStatus } from '../../shared/types';
 import {
   STATUS_POLL_INTERVAL_MS,
   HOOK_SILENCE_WARN_MS,
@@ -16,7 +16,7 @@ import {
   HOOK_CANARY_WINDOW_MS,
   WORKER_STALL_WARN_MS,
 } from '../../shared/constants';
-import { getActiveAgents, updateAgentStatus, updateAgentHookStatus, addEvent } from '../database';
+import { getActiveAgents, applyStatusTransition, updateAgentHookStatus, addEvent } from '../database';
 import type { StatusChangedEvent } from './status-events';
 
 export type WaitingKind = 'question' | 'y-n' | 'enter' | 'choice' | 'approve' | 'tty-pattern' | 'notification';
@@ -294,12 +294,14 @@ export class StatusMonitor extends EventEmitter {
     this.turnLatch.set(agentId, { state: 'idle', setAt: this.now() });
     if (prior === 'idle') return; // already idle — latch updated, no event needed
 
-    updateAgentStatus(agentId, 'idle');
+    const t = applyStatusTransition(agentId, 'idle');
     addEvent(agentId, 'status_change', JSON.stringify({ from: prior, to: 'idle', source }));
     const payload: StatusChangedEvent = {
       agentId,
       status: 'idle',
-      fromStatus: prior,
+      // §B3: fromStatus comes from the in-transaction prior read, never a
+      // separate getAgent() — a second read can observe another writer.
+      fromStatus: t?.prior,
       source: 'monitor',
     };
     this.emit('statusChanged', payload);
@@ -322,12 +324,12 @@ export class StatusMonitor extends EventEmitter {
     });
     if (prior === 'waiting') return;
 
-    updateAgentStatus(agentId, 'waiting');
+    const t = applyStatusTransition(agentId, 'waiting');
     addEvent(agentId, 'status_change', JSON.stringify({ from: prior, to: 'waiting', source: kind }));
     const payload: StatusChangedEvent = {
       agentId,
       status: 'waiting',
-      fromStatus: prior,
+      fromStatus: t?.prior,
       source: 'monitor',
       // P2-03: kind + excerpt ride on the event so the bridge can render
       // "[DASHBOARD EVENT] Agent waiting for input" without re-reading the latch.
@@ -406,12 +408,12 @@ export class StatusMonitor extends EventEmitter {
     if (agent.status === 'working') return; // already working — latch refreshed, no event needed
 
     const prior = agent.status;
-    updateAgentStatus(agentId, 'working');
+    const t = applyStatusTransition(agentId, 'working');
     addEvent(agentId, 'status_change', JSON.stringify({ from: prior, to: 'working', source: opts.source }));
     const payload: StatusChangedEvent = {
       agentId,
       status: 'working',
-      fromStatus: prior,
+      fromStatus: t?.prior,
       source: 'monitor',
     };
     this.emit('statusChanged', payload);
@@ -441,12 +443,12 @@ export class StatusMonitor extends EventEmitter {
     });
     if (prior === 'working') return;
 
-    updateAgentStatus(agentId, 'working');
+    const t = applyStatusTransition(agentId, 'working');
     addEvent(agentId, 'status_change', JSON.stringify({ from: prior, to: 'working', source }));
     const payload: StatusChangedEvent = {
       agentId,
       status: 'working',
-      fromStatus: prior,
+      fromStatus: t?.prior,
       source: 'monitor',
     };
     this.emit('statusChanged', payload);
@@ -573,12 +575,12 @@ export class StatusMonitor extends EventEmitter {
     this.turnLatch.set(agentId, { state: 'idle', setAt: this.now() });
 
     const prior = agent.status;
-    updateAgentStatus(agentId, 'idle');
+    const t = applyStatusTransition(agentId, 'idle');
     addEvent(agentId, 'status_change', JSON.stringify({ from: prior, to: 'idle', source }));
     const payload: StatusChangedEvent = {
       agentId,
       status: 'idle',
-      fromStatus: prior,
+      fromStatus: t?.prior,
       source: 'monitor',
     };
     this.emit('statusChanged', payload);
@@ -745,14 +747,14 @@ export class StatusMonitor extends EventEmitter {
           const holdUntil = this.statusHoldUntil.get(agent.id) || 0;
           if (this.now() < holdUntil) continue;
 
-          updateAgentStatus(agent.id, newStatus);
+          const t = applyStatusTransition(agent.id, newStatus);
           // Shorter hold for idle transitions (agent finished), longer for working
           this.statusHoldUntil.set(agent.id, this.now() + (newStatus === 'idle' ? 1500 : 2500));
           addEvent(agent.id, 'status_change', JSON.stringify({ from: agent.status, to: newStatus }));
           const payload: StatusChangedEvent = {
             agentId: agent.id,
             status: newStatus,
-            fromStatus: agent.status,
+            fromStatus: t?.prior,
             source: 'monitor',
           };
           this.emit('statusChanged', payload);
@@ -1070,7 +1072,9 @@ export class StatusMonitor extends EventEmitter {
     }
   }
 
-  private async inferStatus(agent: Agent): Promise<AgentStatus | null> {
+  // Returns a PERSISTED status (never the projection-only 'receiving') — the
+  // poll loop feeds this straight into applyStatusTransition.
+  private async inferStatus(agent: Agent): Promise<PersistedAgentStatus | null> {
     if (agent.status === 'restarting' || agent.status === 'launching') {
       return null; // Don't override transitional states
     }

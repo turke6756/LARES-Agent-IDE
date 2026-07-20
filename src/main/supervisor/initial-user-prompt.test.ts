@@ -22,6 +22,7 @@
 //   node dist/main/main/supervisor/initial-user-prompt.test.js
 
 import assert from 'node:assert/strict';
+import { patchApplyStatusTransition } from './test-helpers/patch-apply-transition';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -50,7 +51,7 @@ function patchDb(agentsMap: Map<string, Agent>, workspace: Workspace): () => voi
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const db = require('../database') as Record<string, unknown>;
   const keys = [
-    'updateAgentStatus',
+    'updateAgentStatus', 'applyStatusTransition',
     'updateAgentHookStatus',
     'updateAgentLastSendError',
     'updateAgentPid',
@@ -131,6 +132,9 @@ function patchDb(agentsMap: Map<string, Agent>, workspace: Workspace): () => voi
   // so the real fns don't hit the uninitialized module-level db handle.
   db.insertAgentSession = () => {};
   db.closeAgentSession = () => {};
+
+  // §B3 — status writes route through applyStatusTransition; keep them in the fake.
+  patchApplyStatusTransition(db as unknown as Record<string, unknown>);
 
   return () => {
     for (const k of keys) db[k] = orig[k];
@@ -227,7 +231,13 @@ function setup(opts: { stubLaunch?: boolean; sendInputError?: Error } = {}): Har
       const fake = new WindowsRunner();
       Object.defineProperty(fake, 'isAlive', { get: () => true, configurable: true });
       (fake as unknown as { write: (d: string) => void }).write = () => {};
-      (fake as unknown as { kill: () => void }).kill = () => {};
+      // §B5 — the double must honor the real runner contract: kill() leads to
+      // an 'exit' emission. `stopAgent` now WAITS for that confirmation before
+      // it will mark an agent done (a runner that never confirms escalates to
+      // verified termination and, failing that, reports an honest 'failed').
+      (fake as unknown as { kill: () => void }).kill = () => {
+        setImmediate(() => fake.emit('exit', 0, null));
+      };
       (supervisor as unknown as { windowsRunners: Map<string, WindowsRunner> })
         .windowsRunners.set(agentId, fake);
     },

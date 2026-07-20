@@ -68,12 +68,18 @@ export function patchDatabaseModule(fakes: StatusMonitorFakes): () => void {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const db = require('../../database') as {
     updateAgentStatus: (id: string, status: AgentStatus) => void;
+    applyStatusTransition: (
+      id: string,
+      status: AgentStatus,
+      opts?: { stopReason?: string },
+    ) => { prior: AgentStatus; current: AgentStatus } | null;
     updateAgentHookStatus: (id: string, hookStatus: NonNullable<Agent['hookStatus']>, lastHookEventAt?: number) => void;
     addEvent: (id: string, type: string, payload: string | null) => void;
     getActiveAgents: () => Agent[];
   };
 
   const origUpdate = db.updateAgentStatus;
+  const origApply = db.applyStatusTransition;
   const origHookUpdate = db.updateAgentHookStatus;
   const origAdd = db.addEvent;
   const origActive = db.getActiveAgents;
@@ -82,6 +88,18 @@ export function patchDatabaseModule(fakes: StatusMonitorFakes): () => void {
     fakes.updates.push({ agentId: id, status });
     const a = fakes.agents.get(id);
     if (a) a.status = status;
+  };
+  // §B3 — StatusMonitor now writes through applyStatusTransition (which also
+  // returns the in-transaction prior status the emitter puts on `fromStatus`).
+  // The fake mirrors that contract: record the update, mutate the in-memory
+  // row, and hand back {prior, current} (null for an unknown agent).
+  db.applyStatusTransition = (id, status) => {
+    const a = fakes.agents.get(id);
+    if (!a) return null;
+    const prior = a.status;
+    fakes.updates.push({ agentId: id, status });
+    a.status = status;
+    return { prior, current: status };
   };
   db.updateAgentHookStatus = (id, hookStatus, lastHookEventAt) => {
     fakes.hookUpdates.push({ agentId: id, hookStatus, lastHookEventAt });
@@ -98,6 +116,7 @@ export function patchDatabaseModule(fakes: StatusMonitorFakes): () => void {
 
   return () => {
     db.updateAgentStatus = origUpdate;
+    db.applyStatusTransition = origApply;
     db.updateAgentHookStatus = origHookUpdate;
     db.addEvent = origAdd;
     db.getActiveAgents = origActive;

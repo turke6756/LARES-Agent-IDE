@@ -69,6 +69,134 @@ export type AgentStatus =
   // `ApiServer.withInputInFlight` and docs/AGENT_STATUS_LANES_AND_SUBMIT_RECOVERY.md §1.
   | 'receiving';
 
+// ── Idle-agent lifecycle (plans/terminal-history-and-idle-agent-lifecycle-impl.md §B1) ──
+//
+// The stop engine's vocabulary. Defined once here so the main process, the IPC
+// layer and the renderer all agree on what a stop reason / outcome / exclusion
+// is. Several of these are consumed only by later legs (guards & eligibility,
+// bulk stop, the stale-idle sweep, settings) — they are declared now so those
+// legs never have to re-litigate the shape.
+
+/** Why an agent was stopped. Persisted on the row (`last_stop_reason`) and
+ *  surfaced as a card badge. NEVER a renderer input — the IPC handler assigns
+ *  it per endpoint, so a renderer can't claim `automatic-stale-idle`,
+ *  `supervisor`, `restart` or `terminal-capture-failure`. */
+export type AgentStopReason =
+  | 'supervisor'
+  | 'manual-card'
+  | 'manual-selection'
+  | 'manual-stale-idle'
+  | 'automatic-stale-idle'
+  | 'restart'
+  | 'terminal-capture-failure';
+
+export const AGENT_STOP_REASONS: readonly AgentStopReason[] = [
+  'supervisor',
+  'manual-card',
+  'manual-selection',
+  'manual-stale-idle',
+  'automatic-stale-idle',
+  'restart',
+  'terminal-capture-failure',
+] as const;
+
+/** `'explicit'` = the user named these agents (guards become warnings);
+ *  `'stale-idle'` = the sweep/preview picked them (guards are fail-closed). */
+export type StopEligibilityMode = 'explicit' | 'stale-idle';
+
+export type StopExclusionCode =
+  | 'not_idle'
+  | 'threshold_not_met'
+  | 'active_child'
+  | 'active_orchestration'
+  | 'pending_delivery'
+  | 'human_attention'
+  | 'browser_lease'
+  | 'detached_process'
+  | 'ownership_unverified'
+  | 'lifecycle_busy'
+  | 'guard_unavailable'
+  | 'not_found';
+
+export interface StopEligibility {
+  agentId: string;
+  eligible: boolean;
+  exclusions: StopExclusionCode[];
+  warnings: StopExclusionCode[];
+  idleSince: string | null;
+}
+
+/** `'failed'` is the honest-failure outcome: the runner did not confirm exit
+ *  AND verified termination could not confirm the tree is gone. The agent keeps
+ *  its live status — the UI must never say "Stopped" while the process may
+ *  still be running. */
+export type StopOutcome = 'stopped' | 'already_stopped' | 'normalized' | 'failed' | 'not_found';
+
+export interface StopResult {
+  agentId: string;
+  outcome: StopOutcome;
+  killedRunner: boolean;
+  reason: AgentStopReason;
+}
+
+/** reason is assigned main-side per endpoint — deliberately absent here. */
+export interface BulkStopRequest {
+  agentIds: string[];
+  mode: StopEligibilityMode;
+  confirmActive?: boolean;
+}
+
+export interface BulkStopItemResult {
+  agentId: string;
+  result: 'stopped' | 'skipped' | 'failed' | 'not_found';
+  codes: StopExclusionCode[];
+  outcome?: StopOutcome;
+}
+
+export interface BulkStopResult {
+  items: BulkStopItemResult[];
+}
+
+export type AutoStopThreshold = 'never' | '6h' | '12h' | '24h' | '3d' | '7d';
+
+export interface StaleIdlePreview {
+  thresholdLabel: AutoStopThreshold;
+  eligible: Array<{ agentId: string; idleSince: string }>;
+  excluded: Array<{ agentId: string; codes: StopExclusionCode[] }>;
+  estimatedReclaimBytes: number | null;
+}
+
+export interface LifecycleSettings {
+  autoStopIdleThreshold: AutoStopThreshold;
+}
+
+export const DEFAULT_LIFECYCLE_SETTINGS: LifecycleSettings = { autoStopIdleThreshold: '24h' };
+
+/** Hard cap on a single bulk-stop request (dedupe first, then cap). */
+export const BULK_STOP_MAX = 200;
+
+/** The statuses that may be written to `agents.status`. `receiving` is a
+ *  PROJECTION-ONLY overlay (see AgentStatus) and must never be persisted —
+ *  enforced by this type at compile time AND by a runtime throw in
+ *  `applyStatusTransition`. */
+export type PersistedAgentStatus = Exclude<AgentStatus, 'receiving'>;
+
+const STOP_REASON_SET: ReadonlySet<string> = new Set<string>(AGENT_STOP_REASONS);
+
+export function isAgentStopReason(v: unknown): v is AgentStopReason {
+  return typeof v === 'string' && STOP_REASON_SET.has(v);
+}
+
+export function isStopEligibilityMode(v: unknown): v is StopEligibilityMode {
+  return v === 'explicit' || v === 'stale-idle';
+}
+
+/** DB → TS boundary for `last_stop_reason`: an unknown/garbage value reads as
+ *  null rather than leaking an unmapped string into the UI. */
+export function parseStopReason(raw: string | null | undefined): AgentStopReason | null {
+  return raw && isAgentStopReason(raw) ? raw : null;
+}
+
 export interface Workspace {
   id: string;
   title: string;
@@ -214,6 +342,19 @@ export interface Agent {
   // (AGENT_DASHBOARD_PLAN_ID / _PLAN_SECTION) at both the extraEnv and WSL sites.
   planId?: string | null;
   planSection?: string | null;
+  // ── Idle-agent lifecycle bookkeeping (§B2/§B3.1) ──
+  /** When `status` last CHANGED (not merely when the row was touched).
+   *  Informational/diagnostic ONLY — never an eligibility clock. Non-null at
+   *  this boundary (coalesced from `updated_at ?? created_at` on read). */
+  statusChangedAt?: string;
+  /** When the agent entered `idle`, or null if it is not idle. THE sole
+   *  stale-idle eligibility clock. Preserved across idle→idle writes, cleared
+   *  the moment the agent leaves idle. */
+  idleSince?: string | null;
+  /** When the last real stop landed (a transition carrying a stop reason). */
+  stoppedAt?: string | null;
+  /** Why the last real stop happened; null when never stopped or unmapped. */
+  lastStopReason?: AgentStopReason | null;
 }
 
 /** Supervisor-privilege predicate — the single source of truth for "this agent

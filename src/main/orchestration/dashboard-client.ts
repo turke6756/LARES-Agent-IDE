@@ -39,7 +39,9 @@ export function createDashboardClient(supervisor: AgentSupervisor): DashboardCli
     isInputInFlight: (id) => supervisor.isInputInFlight(id),
     // The standalone script cleaned up via DELETE /api/agents/:id → stopAgent
     // (mark done + kill process, keep DB record). Mirror that here.
-    stopAgent: (id) => supervisor.stopAgent(id),
+    // §B5 — stopAgent now returns a StopResult; the orchestration seam only
+    // cares that the stop completed, so the result is intentionally dropped.
+    stopAgent: async (id) => { await supervisor.stopAgent(id); },
     // WP6 done-detection: a section counts as "written" once a plan_section_changes
     // row (WP4 reparse effect store) exists for it since dispatch. Bounded to now
     // so a pre-dispatch change from an earlier run never satisfies this run.

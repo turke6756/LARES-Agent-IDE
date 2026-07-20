@@ -4,7 +4,7 @@ import fs from 'fs';
 import crypto from 'crypto';
 import { execFileSync, execFile, spawn } from 'child_process';
 import { v4 as uuidv4 } from 'uuid';
-import { Agent, AgentProvider, AgentRoleLane, AgentStatus, ContextStats, LaunchAgentInput, QueryResult, Team, UsageLimitsReading, hasSupervisorPrivilege } from '../../shared/types';
+import { Agent, AgentProvider, AgentRoleLane, AgentStatus, AgentStopReason, ContextStats, LaunchAgentInput, QueryResult, StopResult, Team, UsageLimitsReading, hasSupervisorPrivilege } from '../../shared/types';
 import {
   TMUX_SESSION_PREFIX, PROVIDER_COMMANDS, WORKER_CLAUDE_MODEL,
   SUPERVISOR_AGENT_NAME, SUPERVISOR_AGENT_MD, SUPERVISOR_MEMORY_MD,
@@ -69,6 +69,7 @@ import {
   reapOrphans,
   type NativeJobSurface,
   type ProcessLister,
+  type ProcessInfo,
   type TerminalAgentRef,
   type OrphanCandidate,
   type ReapOrphansResult,
@@ -103,7 +104,7 @@ import { CodexLaunchGate } from './codex-launch-gate';
 import { FileActivityTracker } from './file-activity-tracker';
 import { AdmissionError, type AdmissionDecision } from '../watchdog/types';
 import {
-  createAgent, getAgent, getActiveAgents, getAllAgents, getSupervisorAgent, getOwnerForWorker, getWorkspace, updateAgentStatus, updateAgentPid,
+  createAgent, getAgent, getActiveAgents, getAllAgents, getSupervisorAgent, getOwnerForWorker, getWorkspace, updateAgentStatus, applyStatusTransition, updateAgentPid,
   updateAgentExitCode, incrementRestartCount, updateAgentLastOutput,
   updateAgentAttached, addEvent, deleteAgent as dbDeleteAgent,
   updateAgentResumeSessionId, addFileActivity, getTeamMembership, addTeamMember, getAgentTemplate,
@@ -136,7 +137,7 @@ import {
 // follow-on researcher-lane slice) get them from the supervisor module too;
 // the canonical home is ./mcp-config-builder.
 export { toolsetsForLane, buildDashboardMcpConfigArg, laneUsesStrictMcp, redactMcpToken };
-import { tmuxListSessions, tmuxSendInput, tmuxSendSubmit, tmuxReadStatusOptions, shQuote, getPassiveWslStatus } from '../wsl-bridge';
+import { tmuxListSessions, tmuxSendInput, tmuxSendSubmit, tmuxReadStatusOptions, shQuote, getPassiveWslStatus, tmuxKillSession } from '../wsl-bridge';
 import { getWindowsSubmitSequence } from './send-input-encoders';
 import { HookSpoolTailer, resolveSpoolReadPath, canonicalSpoolKey } from './hook-spool-tailer';
 
@@ -1086,6 +1087,14 @@ export class AgentSupervisor extends EventEmitter {
   /** Reaper sweep cadence. */
   private static readonly REAP_INTERVAL_MS =
     Number(process.env.DASHBOARD_REAP_INTERVAL_MS ?? 5 * 60_000);
+  /** §B5 — how long a stop waits for a runner to CONFIRM its own exit before
+   *  escalating to verified termination. The WSL budget is larger because
+   *  `WslRunner.kill()` runs its own graceful tmux drain (C-c, /exit, up to 3 s
+   *  of has-session polling) before it ever signals the pty host. */
+  private static readonly STOP_RUNNER_WAIT_MS =
+    Number(process.env.DASHBOARD_STOP_RUNNER_WAIT_MS ?? 4_000);
+  private static readonly STOP_WSL_RUNNER_WAIT_MS =
+    Number(process.env.DASHBOARD_STOP_WSL_RUNNER_WAIT_MS ?? 12_000);
 
   /** Inc 5 continuation watcher, attached by startContinuationWatcher so the
    *  supervisor's force/toggle entry points can reach its per-agent state.
@@ -3155,10 +3164,9 @@ export class AgentSupervisor extends EventEmitter {
       updateAgentExitCode(agent.id, exitCode);
       this.windowsRunners.delete(agent.id);
       const status: AgentStatus = exitCode === 0 ? 'done' : 'crashed';
-      const prior = getAgent(agent.id)?.status;
-      updateAgentStatus(agent.id, status);
+      const t = applyStatusTransition(agent.id, status);
       addEvent(agent.id, status, JSON.stringify({ exitCode }));
-      this.emit('statusChanged', { agentId: agent.id, status, fromStatus: prior, source: 'runner-exit' } satisfies StatusChangedEvent);
+      this.emit('statusChanged', { agentId: agent.id, status, fromStatus: t?.prior, source: 'runner-exit' } satisfies StatusChangedEvent);
       // BUG-23 — terminal exit invalidates any pending settle timer.
       this.monitor.clearLaunch(agent.id);
       // P1 §3 — drop this worker's spool-tailer claim (a relaunch re-claims).
@@ -3347,10 +3355,9 @@ export class AgentSupervisor extends EventEmitter {
     // `LAUNCH_SETTLE_TIMEOUT_MS[provider]` has elapsed, or a Stop hook
     // arriving inside the window can short-circuit the wallclock via
     // `forceIdleFromHook → promoteFromLaunching('stop-hook')`.
-    const priorWinLaunch = getAgent(agent.id)?.status;
-    updateAgentStatus(agent.id, 'launching');
+    const tWinLaunch = applyStatusTransition(agent.id, 'launching');
     this.monitor.recordLaunch(agent.id);
-    this.emit('statusChanged', { agentId: agent.id, status: 'launching', fromStatus: priorWinLaunch, source: 'launch' } satisfies StatusChangedEvent);
+    this.emit('statusChanged', { agentId: agent.id, status: 'launching', fromStatus: tWinLaunch?.prior, source: 'launch' } satisfies StatusChangedEvent);
 
     if (codexSnapshot) {
       this.captureCodexSessionId(
@@ -4098,10 +4105,9 @@ export class AgentSupervisor extends EventEmitter {
       updateAgentExitCode(agent.id, exitCode);
       this.wslRunners.delete(agent.id);
       const status: AgentStatus = exitCode === 0 ? 'done' : 'crashed';
-      const prior = getAgent(agent.id)?.status;
-      updateAgentStatus(agent.id, status);
+      const t = applyStatusTransition(agent.id, status);
       addEvent(agent.id, status, JSON.stringify({ exitCode }));
-      this.emit('statusChanged', { agentId: agent.id, status, fromStatus: prior, source: 'runner-exit' } satisfies StatusChangedEvent);
+      this.emit('statusChanged', { agentId: agent.id, status, fromStatus: t?.prior, source: 'runner-exit' } satisfies StatusChangedEvent);
       // BUG-23 — terminal exit invalidates any pending settle timer.
       this.monitor.clearLaunch(agent.id);
       // P1 §3 — drop this worker's spool-tailer claim (a relaunch re-claims).
@@ -4226,10 +4232,9 @@ export class AgentSupervisor extends EventEmitter {
     // BUG-23 — write `'launching'` (was `'working'`) and stamp the settle
     // timer. See the Windows path above for the lifecycle description; the
     // promotion mechanism is provider-neutral.
-    const priorWslLaunch = getAgent(agent.id)?.status;
-    updateAgentStatus(agent.id, 'launching');
+    const tWslLaunch = applyStatusTransition(agent.id, 'launching');
     this.monitor.recordLaunch(agent.id);
-    this.emit('statusChanged', { agentId: agent.id, status: 'launching', fromStatus: priorWslLaunch, source: 'launch' } satisfies StatusChangedEvent);
+    this.emit('statusChanged', { agentId: agent.id, status: 'launching', fromStatus: tWslLaunch?.prior, source: 'launch' } satisfies StatusChangedEvent);
 
     if (codexSnapshot) {
       this.captureCodexSessionId(
@@ -4253,39 +4258,46 @@ export class AgentSupervisor extends EventEmitter {
       addEvent(agent.id, 'restart_limit_reached');
       return;
     }
+    // §B6 — natural-exit auto-restart runs under the SAME serializer as manual
+    // stop/restart/continuation, so it can never race them. Callers invoke this
+    // fire-and-forget, so the rejection is absorbed here rather than becoming
+    // an unhandled rejection.
+    await this.withLifecycleLock(agent.id, () => this.autoRestartLocked(agent))
+      .catch((err) => console.warn(`[lifecycle] auto-restart of ${agent.id} failed:`, err));
+  }
 
+  private async autoRestartLocked(agent: Agent): Promise<void> {
     // BUG-09 §3.7 — drop the latch before transitioning to `restarting` so a
     // mid-tool crash does not leave a tool-pending latch alive for 15 min.
     this.monitor.forgetAgent(agent.id);
 
-    const priorRestart = getAgent(agent.id)?.status;
-    updateAgentStatus(agent.id, 'restarting');
+    const tAutoRestart = applyStatusTransition(agent.id, 'restarting');
     addEvent(agent.id, 'restarting');
-    this.emit('statusChanged', { agentId: agent.id, status: 'restarting', fromStatus: priorRestart, source: 'restart' } satisfies StatusChangedEvent);
+    this.emit('statusChanged', { agentId: agent.id, status: 'restarting', fromStatus: tAutoRestart?.prior, source: 'restart' } satisfies StatusChangedEvent);
     incrementRestartCount(agent.id);
 
-    setTimeout(async () => {
-      const latest = getAgent(agent.id);
-      if (!latest || latest.status !== 'restarting') return;
+    // Held IN-LOCK (was a detached setTimeout): a Stop arriving during the
+    // settle window now queues behind the relaunch instead of racing it.
+    await new Promise((r) => setTimeout(r, 2000));
+    const latest = getAgent(agent.id);
+    if (!latest || latest.status !== 'restarting') return;
 
-      try {
-        const pathType = detectPathType(latest.workingDirectory);
-        if (pathType === 'windows') {
-          await this.launchWindowsAgent(latest, true);
-        } else {
-          await this.launchWslAgent(latest, true);
-        }
-        // BUG-38 — auto-restart swapped the PTY under the same agent id; the
-        // renderer's cached terminal is bound to the dead bridge. Notify AFTER
-        // the launch resolves, on success only, so it rebinds to the new PTY.
-        this.notifyTerminalRebound(agent.id);
-      } catch (err) {
-        const priorRestartFail = getAgent(agent.id)?.status;
-        updateAgentStatus(agent.id, 'crashed');
-        addEvent(agent.id, 'restart_failed', String(err));
-        this.emit('statusChanged', { agentId: agent.id, status: 'crashed', fromStatus: priorRestartFail, source: 'restart-failed' } satisfies StatusChangedEvent);
+    try {
+      const pathType = detectPathType(latest.workingDirectory);
+      if (pathType === 'windows') {
+        await this.launchWindowsAgent(latest, true);
+      } else {
+        await this.launchWslAgent(latest, true);
       }
-    }, 2000);
+      // BUG-38 — auto-restart swapped the PTY under the same agent id; the
+      // renderer's cached terminal is bound to the dead bridge. Notify AFTER
+      // the launch resolves, on success only, so it rebinds to the new PTY.
+      this.notifyTerminalRebound(agent.id);
+    } catch (err) {
+      const tAutoRestartFail = applyStatusTransition(agent.id, 'crashed');
+      addEvent(agent.id, 'restart_failed', String(err));
+      this.emit('statusChanged', { agentId: agent.id, status: 'crashed', fromStatus: tAutoRestartFail?.prior, source: 'restart-failed' } satisfies StatusChangedEvent);
+    }
   }
 
   async forkAgent(sourceAgentId: string): Promise<Agent> {
@@ -4546,32 +4558,188 @@ export class AgentSupervisor extends EventEmitter {
     return result;
   }
 
-  async stopAgent(agentId: string): Promise<void> {
-    const winRunner = this.windowsRunners.get(agentId);
-    if (winRunner) {
-      winRunner.kill();
-      this.windowsRunners.delete(agentId);
-    }
+  // ── Idle-agent lifecycle §B6: the per-agent lifecycle lock ──────────────────
+  //
+  // Every operation that stops, restarts, continues or auto-restarts an agent
+  // runs under this serializer, so they can never interleave on the same agent
+  // (a stop landing halfway through a restart used to be able to kill the
+  // freshly-relaunched runner and leave the row `restarting` forever).
+  private lifecycleLocks = new Map<string, Promise<unknown>>();
 
+  private withLifecycleLock<T>(agentId: string, fn: (token: symbol) => Promise<T>): Promise<T> {
+    const token = Symbol(agentId);
+    const prev = this.lifecycleLocks.get(agentId) ?? Promise.resolve();
+    // `prev.catch(() => {})` — a failed predecessor must not poison the chain.
+    const next = prev.catch(() => {}).then(() => fn(token));
+    this.lifecycleLocks.set(agentId, next);
+    const cleanup = (): void => {
+      if (this.lifecycleLocks.get(agentId) === next) this.lifecycleLocks.delete(agentId);
+    };
+    // Non-rethrowing on BOTH settle paths: the cleanup subscription must never
+    // become an unhandled rejection of its own. The caller still sees `next`.
+    void next.then(cleanup, cleanup);
+    return next;
+  }
+
+  /** Test/diagnostic seam — true while a lifecycle op holds this agent's lock.
+   *  (§B4's `lifecycle_busy` guard consumes this in a later leg.) */
+  isLifecycleLocked(agentId: string): boolean {
+    return this.lifecycleLocks.has(agentId);
+  }
+
+  /**
+   * Idle-agent lifecycle §B5 — verified, transport-aware per-agent termination.
+   * The escalation path when a runner will not confirm its own exit.
+   *
+   * Built on the REAL ownership primitives (`getOwnership` / `reapViaJob` /
+   * `reapViaTreeWalk` / `deleteOwnership`) — the same verification the orphan
+   * sweep uses, so "verified gone" means exactly one thing across the app.
+   * Fail-closed: an identity we cannot verify is reported `unverifiable` and
+   * NOTHING is killed.
+   */
+  async terminateVerifiedAgent(agentId: string): Promise<
+    | { outcome: 'terminated' | 'already-gone'; pids: number[] }
+    | { outcome: 'unverifiable' | 'failed'; error?: string }
+  > {
+    const store = this.ownership;
+    if (!store) return { outcome: 'unverifiable', error: 'ownership store not armed' };
+    const row = store.getOwnership(agentId);
+    if (!row) return { outcome: 'already-gone', pids: [] };
+    try {
+      if (row.transport === 'wsl') {
+        // tmux is the process authority for WSL agents — the same kill the
+        // reaper performs. No tmux session on record → nothing to terminate.
+        if (!row.tmuxSession) return { outcome: 'already-gone', pids: [] };
+        await tmuxKillSession(row.tmuxSession);
+        store.deleteOwnership(agentId);
+        return { outcome: 'terminated', pids: [] };
+      }
+      let out = store.reapViaJob(row); // creation-time-verified job terminate
+      if (out.action === 'unavailable') {
+        // native off / prior epoch → the verified Win32_Process tree walk
+        let processes: ProcessInfo[] = [];
+        try { processes = await this.processLister.list(); } catch { processes = []; }
+        out = store.reapViaTreeWalk(row, processes, (pid) => {
+          try { process.kill(pid); } catch { /* already gone */ }
+        });
+      }
+      switch (out.action) {
+        case 'terminated':
+          store.deleteOwnership(agentId);
+          return { outcome: 'terminated', pids: out.pids };
+        case 'gone':
+        case 'reused':
+          // 'reused' means the PID now belongs to something else — our tree is
+          // gone and we deliberately declined to kill a stranger.
+          store.deleteOwnership(agentId);
+          return { outcome: 'already-gone', pids: out.pids };
+        case 'unverifiable':
+          return { outcome: 'unverifiable' }; // fail-closed: never killed
+        case 'unavailable':
+          return { outcome: 'failed', error: 'no usable termination path' };
+      }
+      return { outcome: 'failed', error: `unrecognized reap action` };
+    } catch (e) {
+      return { outcome: 'failed', error: String(e) };
+    }
+  }
+
+  /** Register the exit waiter, then let the caller kill — never the other way
+   *  round, or a runner that dies instantly resolves into a listener that does
+   *  not exist yet. Resolves false on timeout (the escalation trigger). */
+  private waitForRunnerExit(
+    runner: { once(ev: 'exit', l: () => void): unknown; removeListener(ev: 'exit', l: () => void): unknown },
+    timeoutMs: number,
+  ): Promise<boolean> {
+    return new Promise<boolean>((resolve) => {
+      const onExit = (): void => { clearTimeout(timer); resolve(true); };
+      // Deliberately NOT unref'd: this timer is the load-bearing half of an
+      // in-flight stop. An unref'd one lets an otherwise-idle event loop drain
+      // and exit while the stop is still awaiting its own escalation decision.
+      const timer = setTimeout(() => { runner.removeListener('exit', onExit); resolve(false); }, timeoutMs);
+      runner.once('exit', onExit);
+    });
+  }
+
+  /**
+   * Public stop. Idempotent, serialized against every other lifecycle op on
+   * this agent, and HONEST: the returned `StopResult` says `failed` rather than
+   * `stopped` whenever we could not establish that the process is gone.
+   */
+  async stopAgent(agentId: string, options?: { reason?: AgentStopReason }): Promise<StopResult> {
+    return this.withLifecycleLock(agentId, () => this.stopAgentLocked(agentId, options));
+  }
+
+  /** The lock-held stop body. Callers that ALREADY hold the lifecycle lock for
+   *  this agent (restart / continuation / auto-restart) call this directly —
+   *  calling the public `stopAgent` from inside the lock would deadlock. */
+  private async stopAgentLocked(agentId: string, options?: { reason?: AgentStopReason }): Promise<StopResult> {
+    const reason = options?.reason ?? 'supervisor';
+    const prior = getAgent(agentId);
+    if (!prior) return { agentId, outcome: 'not_found', killedRunner: false, reason };
+
+    let killedRunner = false;
+    const winRunner = this.windowsRunners.get(agentId);
     const wslRunner = this.wslRunners.get(agentId);
-    if (wslRunner) {
-      await wslRunner.kill();
-      this.wslRunners.delete(agentId);
+    const runner = winRunner ?? wslRunner;
+
+    if (runner) {
+      // Waiter FIRST, kill second (see waitForRunnerExit).
+      const waitMs = wslRunner
+        ? AgentSupervisor.STOP_WSL_RUNNER_WAIT_MS
+        : AgentSupervisor.STOP_RUNNER_WAIT_MS;
+      const exitedPromise = this.waitForRunnerExit(runner, waitMs);
+      // WslRunner.kill() is async (graceful tmux drain then host kill);
+      // WindowsRunner.kill() is sync. Neither may reject into the stop path.
+      void Promise.resolve()
+        .then(() => (wslRunner ? wslRunner.kill() : winRunner!.kill()))
+        .catch((e) => console.warn(`[lifecycle] runner kill threw for ${agentId}:`, e));
+      const exited = await exitedPromise;
+
+      if (!exited) {
+        const term = await this.terminateVerifiedAgent(agentId);
+        if (term.outcome === 'unverifiable' || term.outcome === 'failed') {
+          // HONEST FAILURE. The process may still be running and we could NOT
+          // verify it is gone, so: do NOT mark the agent done, do NOT drop its
+          // runner-map entry, do NOT claim killedRunner. The UI must never say
+          // "Stopped" over a live process. A retry re-enters this same path.
+          addEvent(agentId, 'stop-failed', JSON.stringify({
+            reason,
+            detail: term.outcome,
+            error: (term as { error?: string }).error ?? null,
+          }));
+          console.warn(`[lifecycle] stop of ${agentId} FAILED (${term.outcome}) — agent left in '${prior.status}'`);
+          return { agentId, outcome: 'failed', killedRunner: false, reason };
+        }
+      }
+      killedRunner = true; // exited, or verified terminated / already-gone
+      if (winRunner) this.windowsRunners.delete(agentId);
+      if (wslRunner) this.wslRunners.delete(agentId);
     }
 
     this.fileTrackers.delete(agentId);
     // WP-P2 — a stopped agent must never receive its pending initial prompt
     // (clear BEFORE the 'done' emission below; 'done' is input-accepting).
     this.pendingInitialPrompts.delete(agentId);
-    const priorStop = getAgent(agentId)?.status;
-    updateAgentStatus(agentId, 'done');
+
+    if (!killedRunner && (prior.status === 'done' || prior.status === 'crashed')) {
+      // Idempotent no-op: already terminal with no runner to kill. Deliberately
+      // does NOT re-write status/stop metadata (a reasonless done→done write
+      // would be a no-op anyway) and does NOT re-emit `statusChanged`. The ring
+      // release still runs — the RAM is pure leak either way.
+      this.releaseChatRing(agentId);
+      return { agentId, outcome: 'already_stopped', killedRunner, reason };
+    }
+
+    const t = applyStatusTransition(agentId, 'done', { stopReason: reason });
     updateAgentExitCode(agentId, 0);
-    addEvent(agentId, 'stopped');
-    this.emit('statusChanged', { agentId, status: 'done', fromStatus: priorStop, source: 'stop' } satisfies StatusChangedEvent);
+    addEvent(agentId, 'stopped', JSON.stringify({ reason }));
+    this.emit('statusChanged', { agentId, status: 'done', fromStatus: t?.prior, source: 'stop' } satisfies StatusChangedEvent);
     // Release the chat ring LAST — after the status write, so a concurrent read
     // already sees `done` and takes the disk path rather than racing an emptied
     // ring while the row still says `working`.
     this.releaseChatRing(agentId);
+    return { agentId, outcome: killedRunner ? 'stopped' : 'normalized', killedRunner, reason };
   }
 
   /**
@@ -4640,8 +4808,18 @@ export class AgentSupervisor extends EventEmitter {
     this.emit('agentDeleted', { agentId });
   }
 
+  /** §B6 — restart is ONE locked lifecycle op (stop → restarting → settle →
+   *  relaunch), so a concurrent Stop can no longer land between the status flip
+   *  and the relaunch and kill the fresh runner. Note this now resolves AFTER
+   *  the relaunch attempt rather than at the `restarting` flip. */
   async restartAgent(agentId: string): Promise<void> {
-    await this.stopAgent(agentId);
+    return this.withLifecycleLock(agentId, () => this.restartAgentLocked(agentId));
+  }
+
+  private async restartAgentLocked(agentId: string): Promise<void> {
+    // `restart` is the stop reason: the badge suppresses it, so a restarted
+    // agent never renders "Stopped by …" for the stop half of its own restart.
+    await this.stopAgentLocked(agentId, { reason: 'restart' });
     const agent = getAgent(agentId);
     if (!agent) return;
 
@@ -4650,30 +4828,29 @@ export class AgentSupervisor extends EventEmitter {
     // we transition to `restarting`.
     this.monitor.forgetAgent(agentId);
 
-    const priorRestart = getAgent(agentId)?.status;
-    updateAgentStatus(agentId, 'restarting');
+    const tRestart = applyStatusTransition(agentId, 'restarting');
     incrementRestartCount(agentId);
-    this.emit('statusChanged', { agentId, status: 'restarting', fromStatus: priorRestart, source: 'restart' } satisfies StatusChangedEvent);
+    this.emit('statusChanged', { agentId, status: 'restarting', fromStatus: tRestart?.prior, source: 'restart' } satisfies StatusChangedEvent);
 
-    setTimeout(async () => {
-      const latest = getAgent(agentId);
-      if (!latest) return;
-      try {
-        const pathType = detectPathType(latest.workingDirectory);
-        if (pathType === 'windows') {
-          await this.launchWindowsAgent(latest, true);
-        } else {
-          await this.launchWslAgent(latest, true);
-        }
-        // BUG-38 — manual restart swapped the PTY under the same agent id;
-        // rebind the renderer's terminal to the fresh bridge on success only.
-        this.notifyTerminalRebound(agentId);
-      } catch (err) {
-        const priorRestartFail = getAgent(agentId)?.status;
-        updateAgentStatus(agentId, 'crashed');
-        this.emit('statusChanged', { agentId, status: 'crashed', fromStatus: priorRestartFail, source: 'restart-failed' } satisfies StatusChangedEvent);
+    // The settle delay is now held IN-LOCK (it used to be a detached
+    // setTimeout, which is precisely the window a stop could slip through).
+    await new Promise((r) => setTimeout(r, 1000));
+    const latest = getAgent(agentId);
+    if (!latest) return;
+    try {
+      const pathType = detectPathType(latest.workingDirectory);
+      if (pathType === 'windows') {
+        await this.launchWindowsAgent(latest, true);
+      } else {
+        await this.launchWslAgent(latest, true);
       }
-    }, 1000);
+      // BUG-38 — manual restart swapped the PTY under the same agent id;
+      // rebind the renderer's terminal to the fresh bridge on success only.
+      this.notifyTerminalRebound(agentId);
+    } catch (err) {
+      const tRestartFail = applyStatusTransition(agentId, 'crashed');
+      this.emit('statusChanged', { agentId, status: 'crashed', fromStatus: tRestartFail?.prior, source: 'restart-failed' } satisfies StatusChangedEvent);
+    }
   }
 
   /** Context-brick Inc 4 (4.1) — sibling of restartAgent that mints a FRESH
@@ -4684,6 +4861,14 @@ export class AgentSupervisor extends EventEmitter {
    *  Callers (the relaunch route) run the 4.4 atomic re-check first; this
    *  method assumes authorization and only re-validates structural facts. */
   async continuationRelaunch(agentId: string, brick: ContinuationBrick): Promise<void> {
+    // §B6 — the stop + atomic transaction + status flip run as ONE locked op,
+    // so a manual Stop can never interleave between them. (The launch tail
+    // stays a detached timer: it is shared verbatim with the boot-reconcile
+    // re-drive, which reaches it without a lock.)
+    return this.withLifecycleLock(agentId, () => this.continuationRelaunchLocked(agentId, brick));
+  }
+
+  private async continuationRelaunchLocked(agentId: string, brick: ContinuationBrick): Promise<void> {
     // Step 1 — guard FIRST, before any stop: never stop a non-eligible agent.
     const agent = getAgent(agentId);
     if (!agent) throw new Error(`continuationRelaunch: no agent ${agentId}`);
@@ -4709,8 +4894,10 @@ export class AgentSupervisor extends EventEmitter {
       // before calling in, so this short sleep reopens no meaningful race.
       await new Promise((r) => setTimeout(r, CONTINUATION_STOP_FLUSH_DELAY_MS));
 
-      // Step 2 — stop + forget + clear pending per-agent state.
-      await this.stopAgent(agentId);
+      // Step 2 — stop + forget + clear pending per-agent state. (Locked body:
+      // we already hold this agent's lifecycle lock — calling the public
+      // stopAgent here would deadlock on ourselves.)
+      await this.stopAgentLocked(agentId, { reason: 'restart' });
       this.monitor.forgetAgent(agentId);
       this.pendingInitialPrompts.delete(agentId);
 
@@ -4732,9 +4919,8 @@ export class AgentSupervisor extends EventEmitter {
         reason: brick.reason,
         newSession,
       }));
-      const priorCont = getAgent(agentId)?.status;
-      updateAgentStatus(agentId, 'restarting');
-      this.emit('statusChanged', { agentId, status: 'restarting', fromStatus: priorCont, source: 'continuation' } satisfies StatusChangedEvent);
+      const tCont = applyStatusTransition(agentId, 'restarting');
+      this.emit('statusChanged', { agentId, status: 'restarting', fromStatus: tCont?.prior, source: 'continuation' } satisfies StatusChangedEvent);
 
       // Step 6 — hand the brick to the upcoming launch's sysprompt builder.
       this.pendingContinuationBricks.set(agentId, brick);
@@ -4785,9 +4971,8 @@ export class AgentSupervisor extends EventEmitter {
         // success only, so the terminal rebinds to the new session's PTY.
         this.notifyTerminalRebound(agentId);
       } catch (err) {
-        const priorFail = getAgent(agentId)?.status;
-        updateAgentStatus(agentId, 'crashed');
-        this.emit('statusChanged', { agentId, status: 'crashed', fromStatus: priorFail, source: 'continuation-failed' } satisfies StatusChangedEvent);
+        const tContFail = applyStatusTransition(agentId, 'crashed');
+        this.emit('statusChanged', { agentId, status: 'crashed', fromStatus: tContFail?.prior, source: 'continuation-failed' } satisfies StatusChangedEvent);
       } finally {
         this.pendingContinuationBricks.delete(agentId);
         // BUG-41 — the swap is over (launch resolved OR failed): clear the
@@ -6171,10 +6356,9 @@ export class AgentSupervisor extends EventEmitter {
           addEvent(agent.id, 'reconnected');
         } catch (err) {
           console.error(`Failed to reconnect agent ${agent.id}:`, err);
-          const priorReconnect = getAgent(agent.id)?.status;
-          updateAgentStatus(agent.id, 'crashed');
+          const tReconnect = applyStatusTransition(agent.id, 'crashed');
           addEvent(agent.id, 'reconnect_failed', String(err));
-          this.emit('statusChanged', { agentId: agent.id, status: 'crashed', fromStatus: priorReconnect, source: 'restart-failed' } satisfies StatusChangedEvent);
+          this.emit('statusChanged', { agentId: agent.id, status: 'crashed', fromStatus: tReconnect?.prior, source: 'restart-failed' } satisfies StatusChangedEvent);
         }
         await new Promise(r => setTimeout(r, AgentSupervisor.RECONCILE_STAGGER_MS));
       }

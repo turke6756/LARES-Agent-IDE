@@ -3,6 +3,7 @@ import path from 'path';
 import fs from 'fs';
 import crypto from 'crypto';
 import { v4 as uuidv4 } from 'uuid';
+import { AgentStopReason, isAgentStopReason, parseStopReason, PersistedAgentStatus } from '../shared/types';
 import { Agent, AgentProvider, AgentSessionRow, AgentStatus, AgentTemplate, CreateAgentTemplateInput, CreateSelectionCommentInput, CreateWorkspaceInput, CreateTeamInput, FileActivity, FileOperation, Plan, PlanFormat, RepoActivityEvidenceV1, SelectionComment, SelectionCommentStatus, SupervisorFocus, Team, TeamChannel, TeamMember, TeamMessage, TeamMessageStatus, TeamStatus, TeamTask, TeamTaskStatus, UpdateSelectionCommentInput, Workspace } from '../shared/types';
 import { parsePdfSelectionAnchor, serializePdfSelectionAnchor, validatePdfSelectionAnchor, type PdfSelectionAnchorV1, type SelectionAnchorType } from '../shared/pdf-annotations';
 import { DEFAULT_COMMAND, DEFAULT_COMMAND_WSL, SUPERVISOR_AGENT_MD } from '../shared/constants';
@@ -914,6 +915,12 @@ export function initDatabase(): void {
   try { db.exec(`ALTER TABLE agents ADD COLUMN plan_id TEXT`); } catch { /* exists */ }
   try { db.exec(`ALTER TABLE agents ADD COLUMN plan_section TEXT`); } catch { /* exists */ }
 
+  // Idle-agent lifecycle §B2 — idle/stop bookkeeping columns. Runs inside its
+  // own transaction with ONE captured `migratedAt`, so every backfilled row
+  // agrees on the migration instant (a per-row datetime('now') would smear the
+  // idle clock across the backfill and make "idle for N hours" unreproducible).
+  migrateLifecycleColumns(db);
+
   // WP2: provenance spine — all CREATE TABLE IF NOT EXISTS (idempotent regardless
   // of landing order). Four tables: plan_sections (anchor registry, R1 §2),
   // plan_events (reconciled schema, amendments §F-A — canonical dispatched-target
@@ -1506,6 +1513,13 @@ function rowToAgent(row: any): Agent {
     // Planning surface WP1: frozen-at-launch plan rail (NULL for unbound launches).
     planId: row.plan_id || null,
     planSection: row.plan_section || null,
+    // Idle-agent lifecycle §B3.1. `status_changed_at` is nullable in SQLite
+    // (rows written before the migration, or by a raw INSERT) but non-null at
+    // the TS boundary — coalesce through the same fallback the migration used.
+    statusChangedAt: row.status_changed_at ?? row.updated_at ?? row.created_at,
+    idleSince: row.idle_since ?? null,
+    stoppedAt: row.stopped_at ?? null,
+    lastStopReason: parseStopReason(row.last_stop_reason ?? null),
   };
 }
 
@@ -1554,6 +1568,60 @@ export function normalizeLegacyChromeDefaultCommands(database: Database.Database
       update.run(stripped, row.id);
     }
   }
+}
+
+/**
+ * Idle-agent lifecycle §B2 — additive migration for the four idle/stop
+ * bookkeeping columns on `agents`.
+ *
+ *   status_changed_at  when `status` last CHANGED. Backfilled to
+ *                      COALESCE(updated_at, migratedAt). INFORMATIONAL ONLY —
+ *                      it is deliberately NOT an eligibility clock, because
+ *                      `updated_at` is bumped by dozens of unrelated writes
+ *                      (last output, pid, exit code, hook status…).
+ *   idle_since         when the agent entered `idle`, else NULL. Backfilled to
+ *                      migratedAt for rows already `idle`. THE sole stale-idle
+ *                      eligibility clock.
+ *   stopped_at         when the last real stop landed.
+ *   last_stop_reason   why (an AgentStopReason), NULL when never stopped.
+ *
+ * Idempotent: each column is added only when `PRAGMA table_info(agents)` says
+ * it is absent, and the backfill is scoped to the columns this run actually
+ * added — a second pass is a no-op and can never re-stamp a live idle clock.
+ * Exported so the migration can be unit-tested against an isolated handle.
+ */
+export function migrateLifecycleColumns(database: Database.Database): void {
+  const agentsColumnExists = (col: string): boolean => {
+    // Fixed identifier (`agents`); the column name is compared in JS, never
+    // interpolated into SQL.
+    const cols = database.prepare(`PRAGMA table_info(agents)`).all() as { name: string }[];
+    return cols.some((c) => c.name === col);
+  };
+
+  const migratedAt = (database.prepare(`SELECT datetime('now') AS t`).get() as { t: string }).t;
+
+  database.transaction(() => {
+    if (!agentsColumnExists('status_changed_at')) {
+      database.exec(`ALTER TABLE agents ADD COLUMN status_changed_at TEXT`);
+      database
+        .prepare(`UPDATE agents SET status_changed_at = COALESCE(updated_at, ?)`)
+        .run(migratedAt);
+    }
+    if (!agentsColumnExists('idle_since')) {
+      database.exec(`ALTER TABLE agents ADD COLUMN idle_since TEXT`);
+      // Only rows that are idle RIGHT NOW get a clock; everything else stays
+      // NULL so the sweep can never see a fabricated idle age.
+      database
+        .prepare(`UPDATE agents SET idle_since = CASE WHEN status = 'idle' THEN ? ELSE NULL END`)
+        .run(migratedAt);
+    }
+    if (!agentsColumnExists('stopped_at')) {
+      database.exec(`ALTER TABLE agents ADD COLUMN stopped_at TEXT`);
+    }
+    if (!agentsColumnExists('last_stop_reason')) {
+      database.exec(`ALTER TABLE agents ADD COLUMN last_stop_reason TEXT`);
+    }
+  })();
 }
 
 function queryAll(sql: string, params: any[] = []): any[] {
@@ -2641,8 +2709,84 @@ export function getAgentsByOwner(ownerAgentId: string, opts?: { includeTerminal?
   return queryAll(sql, [ownerAgentId]).map(rowToAgent);
 }
 
-export function updateAgentStatus(id: string, status: AgentStatus): void {
-  run("UPDATE agents SET status = ?, updated_at = datetime('now') WHERE id = ?", [status, id]);
+/**
+ * Idle-agent lifecycle §B3 — THE single atomic status-transition writer.
+ *
+ * Every status write goes through here so the idle/stop bookkeeping columns
+ * stay truthful. If any writer bypasses it, `idle_since` silently goes wrong
+ * and the whole stale-idle feature becomes untrustworthy.
+ *
+ * Returns the in-transaction prior status alongside the new one, so a
+ * `statusChanged` emitter can carry an honest `fromStatus` WITHOUT a second,
+ * racy `getAgent()` read. Returns null when the row does not exist.
+ *
+ * Invariants (all enforced in one UPDATE, inside one transaction):
+ *   - `idle_since` is stamped on entering idle, PRESERVED across an idle→idle
+ *     write, and cleared the instant the agent leaves idle.
+ *   - `status_changed_at` moves only on a genuine status change.
+ *   - `stopped_at` / `last_stop_reason` are SET when a reason is supplied,
+ *     cleared on a genuine status change with no reason, and otherwise LEFT
+ *     INTACT — so a redundant reasonless `done → done` write can never erase
+ *     "Stopped manually".
+ *   - `receiving` is projection-only and is rejected at runtime as well as by
+ *     the `PersistedAgentStatus` parameter type.
+ *   - an invalid stop reason is rejected BEFORE anything is persisted.
+ *
+ * Positional `?` parameters (rather than the named `@s`/`@now` form) so the
+ * statement binds identically under better-sqlite3 and under the sql.js
+ * stand-in the main-process tests use.
+ */
+export function applyStatusTransition(
+  id: string,
+  status: PersistedAgentStatus,
+  opts?: { stopReason?: AgentStopReason },
+): { prior: AgentStatus; current: AgentStatus } | null {
+  if ((status as AgentStatus) === 'receiving') {
+    throw new Error('receiving is projection-only and must not be persisted');
+  }
+  const reason = opts?.stopReason ?? null;
+  if (reason !== null && !isAgentStopReason(reason)) {
+    throw new Error(`invalid stop reason: ${String(reason)}`);
+  }
+  return db.transaction(() => {
+    const row = db.prepare(`SELECT status FROM agents WHERE id = ?`).get(id) as
+      | { status: AgentStatus }
+      | undefined;
+    if (!row) return null;
+    const now = (db.prepare(`SELECT datetime('now') AS t`).get() as { t: string }).t;
+    db.prepare(
+      `UPDATE agents SET
+         idle_since = CASE
+           WHEN ? = 'idle' AND status <> 'idle' THEN ?
+           WHEN ? <> 'idle'                     THEN NULL
+           ELSE idle_since END,
+         status_changed_at = CASE WHEN status <> ? THEN ? ELSE status_changed_at END,
+         stopped_at = CASE
+           WHEN ? IS NOT NULL THEN ?     -- a real stop (reason present) sets it
+           WHEN status <> ?   THEN NULL  -- a genuine status change clears it
+           ELSE stopped_at END,          -- redundant same-status write PRESERVES it
+         last_stop_reason = CASE
+           WHEN ? IS NOT NULL THEN ?
+           WHEN status <> ?   THEN NULL
+           ELSE last_stop_reason END,
+         status = ?, updated_at = ?
+       WHERE id = ?`,
+    ).run(
+      status, now, status,      // idle_since
+      status, now,              // status_changed_at
+      reason, now, status,      // stopped_at
+      reason, reason, status,   // last_stop_reason
+      status, now, id,          // status / updated_at / WHERE
+    );
+    return { prior: row.status, current: status as AgentStatus };
+  })();
+}
+
+/** Shim for the many non-emitting status writes. Kept so existing callers
+ *  compile unchanged while still routing through the transition writer — there
+ *  is no status-write path that bypasses `applyStatusTransition`. */
+export function updateAgentStatus(id: string, status: PersistedAgentStatus): void {
+  applyStatusTransition(id, status);
 }
 
 /** HOOK_SYSTEM_DESIGN.md §5.4 — set the hook-scaffold health field. When a hook
