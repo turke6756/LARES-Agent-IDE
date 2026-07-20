@@ -153,6 +153,86 @@ export class CodexRolloutReader implements ChatLogReader {
     }
   }
 
+  /** Context-brick Phase 2 — one-shot PURE read of a *prior* session's
+   *  structured chat straight from disk, mirroring the Claude reader's
+   *  `readSessionEventsOnce`. A terminal (`done`/`crashed`) agent has no live
+   *  tail and its in-memory ring is released, so its chat survives only as the
+   *  rollout `.jsonl` on disk (readers never unlink).
+   *
+   *  Side-effect free with respect to the live tail:
+   *   - locates the rollout via the SAME `candidateBaseDirs` + `findBySessionId`
+   *     resolution the live path uses, but bypasses `resolveJsonlPath` so the
+   *     `resolvedPaths` cache is never written,
+   *   - does NOT touch `fileOffsets` / `partialLines` (never calls pollSession),
+   *   - does NOT subscribe or emit,
+   *   - parses under an EPHEMERAL scope id, so the per-agent maps
+   *     (`emittedSystemInit` / `currentModel` / `modelContextWindow` /
+   *     `toolResultLocations` / `lastAssistantTextEvent` / `eofStreak`) of any
+   *     LIVE agent sharing this working directory are never touched, and the
+   *     scope's own rows are cleared afterward so no residue leaks.
+   *
+   *  Returns `null` when the rollout cannot be located or read (pruned/missing,
+   *  or no session id) so the caller can degrade to "history unavailable";
+   *  returns `[]` for a located-but-empty session. */
+  readSessionEventsOnce(workingDirectory: string, sessionId: string): SessionEvent[] | null {
+    if (!sessionId) return null;
+
+    const scopeId = `__prior-session__:${sessionId}`;
+    const session: ChatLogReaderSession = {
+      agentId: scopeId,
+      sessionId,
+      workingDirectory,
+      provider: this.provider,
+      subscribed: false,
+    };
+
+    const baseDirs = this.candidateBaseDirs(session);
+    if (baseDirs.length === 0) return null;
+    const jsonlPath = this.findBySessionId(baseDirs, sessionId);
+    if (!jsonlPath) return null;
+
+    let raw: string;
+    try {
+      raw = fs.readFileSync(jsonlPath, 'utf-8');
+    } catch {
+      return null;
+    }
+
+    const out: SessionEvent[] = [];
+    try {
+      let cursor = 0;
+      for (const line of raw.split('\n')) {
+        const lineBytes = Buffer.byteLength(line, 'utf-8');
+        const lineStartOffset = cursor;
+        const lineEndOffset = cursor + lineBytes;
+        cursor = lineEndOffset + 1; // +1 for the split-consumed '\n'
+
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+
+        let entry: any;
+        try {
+          entry = JSON.parse(trimmed);
+        } catch {
+          continue;
+        }
+
+        this.parseEntry(session, jsonlPath, entry, lineStartOffset, lineEndOffset, out);
+      }
+    } finally {
+      this.emittedSystemInit.delete(scopeId);
+      this.currentModel.delete(scopeId);
+      this.modelContextWindow.delete(scopeId);
+      this.lastAssistantTextEvent.delete(scopeId);
+      this.eofStreak.delete(scopeId);
+      const prefix = `${scopeId}:`;
+      for (const key of this.toolResultLocations.keys()) {
+        if (key.startsWith(prefix)) this.toolResultLocations.delete(key);
+      }
+    }
+    return out;
+  }
+
   pollSession(session: ChatLogReaderSession): SessionEvent[] {
     const jsonlPath = this.resolveJsonlPath(session);
     if (!jsonlPath) return [];

@@ -881,6 +881,172 @@ test('subscribed idle path refresh does not replay the same rollout', () => {
   }
 });
 
+// ── Phase 2: one-shot prior-session disk reader ──────────────────────
+//
+// readSessionEventsOnce is a PURE read: it must parse a prior session's rollout
+// straight from disk WITHOUT touching the per-agent maps of any live agent that
+// shares the same working directory (many agents share one cwd by design), and
+// WITHOUT advancing tail offsets or writing the resolved-path cache.
+
+const P2_CWD = 'C:\\Users\\fixture\\priorsess';
+
+/** Write a rollout under a temp `<root>/YYYY/MM/DD/rollout-<ts>-<sid>.jsonl`
+ *  tree so resolution goes through the reader's real base-dir walk. */
+function writeRollout(root: string, sessionId: string, entries: unknown[]): string {
+  const dir = path.join(root, '2026', '07', '01');
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, `rollout-2026-07-01T09-00-00-${sessionId}.jsonl`);
+  fs.writeFileSync(file, entries.map((e) => JSON.stringify(e)).join('\n') + '\n');
+  return file;
+}
+
+function makeP2Reader(root: string): CodexRolloutReader {
+  const reader = new CodexRolloutReader();
+  (reader as any).windowsSessionsDir = root;
+  (reader as any).wslSessionsUncDir = null;
+  return reader;
+}
+
+function p2Entries(sessionId: string) {
+  return [
+    {
+      timestamp: '2026-07-01T09:00:00.000Z',
+      type: 'session_meta',
+      payload: { id: sessionId, cwd: P2_CWD, model_provider: 'openai', cli_version: '0.128.0' },
+    },
+    {
+      timestamp: '2026-07-01T09:00:01.000Z',
+      type: 'event_msg',
+      payload: { type: 'user_message', message: 'hello from the past' },
+    },
+    {
+      timestamp: '2026-07-01T09:00:02.000Z',
+      type: 'response_item',
+      payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'a prior reply' }] },
+    },
+    {
+      timestamp: '2026-07-01T09:00:03.000Z',
+      type: 'response_item',
+      payload: { type: 'function_call', call_id: 'call_p2', name: 'shell', arguments: '{"command":"ls"}' },
+    },
+    {
+      timestamp: '2026-07-01T09:00:04.000Z',
+      type: 'response_item',
+      payload: { type: 'function_call_output', call_id: 'call_p2', output: 'a.txt' },
+    },
+    { timestamp: '2026-07-01T09:00:05.000Z', type: 'event_msg', payload: { type: 'task_complete' } },
+  ];
+}
+
+test('P2: readSessionEventsOnce parses a prior session from disk (located by session id)', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-p2-parse-'));
+  const sid = 'aaaa1111-2222-3333-4444-555555555555';
+  writeRollout(root, sid, p2Entries(sid));
+  try {
+    const reader = makeP2Reader(root);
+    const events = reader.readSessionEventsOnce(P2_CWD, sid);
+    assert.ok(events, 'located + parsed');
+
+    const kinds = events!.map((e) => e.type);
+    assert.ok(kinds.includes('system-init'), 'has system-init');
+    assert.ok(kinds.includes('user-text'), 'has the user turn');
+    assert.ok(kinds.includes('assistant-text'), 'has the assistant turn');
+    assert.ok(kinds.includes('tool-use'), 'has the tool call');
+    assert.ok(kinds.includes('tool-result'), 'has the tool result');
+
+    const user = events!.find((e) => e.type === 'user-text');
+    assert.ok(user && user.type === 'user-text');
+    assert.equal(user.text, 'hello from the past');
+
+    // Shape-identical to the live tail path: same events, same order, same
+    // turn-completion tagging (only the synthetic agentId differs).
+    const live = makeP2Reader(root).pollSession(makeSession({ sessionId: sid, workingDirectory: P2_CWD }));
+    assert.deepEqual(
+      events!.map((e) => ({ ...e, agentId: 'X' })),
+      live.map((e) => ({ ...e, agentId: 'X' })),
+      'one-shot read must produce the same SessionEvent[] as the live tail',
+    );
+    const at = events!.find((e) => e.type === 'assistant-text');
+    assert.ok(at && at.type === 'assistant-text');
+    assert.equal(at.turnComplete, true, 'task_complete walk-back still tags the turn');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('P2: readSessionEventsOnce returns null for a missing/pruned session', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-p2-missing-'));
+  try {
+    const reader = makeP2Reader(root);
+    assert.equal(reader.readSessionEventsOnce(P2_CWD, 'ffffffff-0000-1111-2222-333333333333'), null);
+    // An empty session id is "cannot locate", not "found it, it was empty".
+    assert.equal(reader.readSessionEventsOnce(P2_CWD, ''), null);
+
+    // A located-but-empty rollout returns [] — distinct from null.
+    const emptySid = 'bbbb1111-2222-3333-4444-555555555555';
+    writeRollout(root, emptySid, []);
+    assert.deepEqual(reader.readSessionEventsOnce(P2_CWD, emptySid), []);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('P2: readSessionEventsOnce leaves NO residue in per-agent maps (shared-cwd purity)', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-p2-purity-'));
+  const sid = 'cccc1111-2222-3333-4444-555555555555';
+  writeRollout(root, sid, p2Entries(sid));
+  try {
+    const reader = makeP2Reader(root);
+    // A LIVE agent sharing this cwd is already tailing its own rollout.
+    const liveSid = 'dddd1111-2222-3333-4444-555555555555';
+    writeRollout(root, liveSid, p2Entries(liveSid));
+    reader.pollSession(makeSession({ sessionId: liveSid, workingDirectory: P2_CWD }));
+
+    const snapshot = () => ({
+      init: (reader as any).emittedSystemInit.size,
+      model: (reader as any).currentModel.size,
+      window: (reader as any).modelContextWindow.size,
+      lastAt: (reader as any).lastAssistantTextEvent.size,
+      eof: (reader as any).eofStreak.size,
+      toolLocs: (reader as any).toolResultLocations.size,
+      resolved: (reader as any).resolvedPaths.size,
+    });
+    const before = snapshot();
+    reader.readSessionEventsOnce(P2_CWD, sid);
+    assert.deepEqual(snapshot(), before, 'ephemeral parse scope fully cleaned up');
+    // And the live agent's own state is intact: its next poll is still a no-op
+    // (offset preserved), not a replay from byte 0.
+    assert.equal(
+      reader.pollSession(makeSession({ sessionId: liveSid, workingDirectory: P2_CWD })).length,
+      0,
+      'live agent unaffected by the concurrent one-shot read',
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('P2: readSessionEventsOnce does not advance tail offsets (no subscription/offset cache)', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-p2-offsets-'));
+  const sid = 'eeee1111-2222-3333-4444-555555555555';
+  writeRollout(root, sid, p2Entries(sid));
+  try {
+    const reader = makeP2Reader(root);
+    const events = reader.readSessionEventsOnce(P2_CWD, sid);
+    assert.ok(events && events.length > 0);
+    assert.equal((reader as any).fileOffsets.size, 0, 'no fileOffsets written');
+    assert.equal((reader as any).partialLines.size, 0, 'no partialLines written');
+    assert.equal((reader as any).resolvedPaths.size, 0, 'no resolved-path cache written');
+
+    // A subsequent live tail of the SAME session still replays from byte 0 —
+    // the one-shot read consumed nothing.
+    const live = reader.pollSession(makeSession({ sessionId: sid, workingDirectory: P2_CWD }));
+    assert.equal(live.length, events!.length, 'live tail still sees the whole file');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 // ── Runner ───────────────────────────────────────────────────────────
 
 (async () => {
