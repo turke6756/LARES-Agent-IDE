@@ -4937,6 +4937,47 @@ export class BrowserManager {
    *  "needsHumanAttention" is RECENCY-based, NOT the raw birth flag (see
    *  AGENT_TAB_ATTENTION_RECENCY_MS — the raw flag is set on every agent tab and
    *  never cleared in main, so it would permanently exempt everything). */
+  /**
+   * Idle-agent lifecycle §B4 — read-only browser guard for one agent.
+   *
+   * An agent that still owns loading tabs, a pending sign-in, a tab flagged for
+   * human attention, an in-flight download or a live action lease must not be
+   * auto-stopped underneath the human.
+   *
+   * Contract:
+   *  - no agent tabs at all → every flag false ("clear"), NOT null. An agent
+   *    that never opened a tab is trivially safe to stop;
+   *  - `null` means we could not ENUMERATE the tabs (shell frame dead, a
+   *    destroyed webContents throwing mid-walk). The caller maps that to
+   *    `guard_unavailable` and fails closed — an unreadable guard is never
+   *    read as "clear".
+   */
+  getAgentBrowserState(agentId: string): {
+    agentId: string;
+    tabCount: number;
+    loading: boolean;
+    signinPending: boolean;
+    needsHumanAttention: boolean;
+    pendingDownload: boolean;
+    activeLease: boolean;
+  } | null {
+    try {
+      const now = Date.now();
+      const mine = this.agentTabInfos().filter((t) => t.agentId === agentId);
+      return {
+        agentId,
+        tabCount: mine.length,
+        loading: mine.some((t) => t.loading),
+        signinPending: mine.some((t) => t.signinPending),
+        needsHumanAttention: mine.some((t) => t.needsHumanAttention),
+        pendingDownload: mine.some((t) => t.hasPendingDownload),
+        activeLease: mine.some((t) => this.agentLeaseLedger.hasActiveLease(t.tabId, now)),
+      };
+    } catch {
+      return null; // → guard_unavailable
+    }
+  }
+
   private agentTabInfos(): AgentTabLifecycleInfo[] {
     const now = Date.now();
     const infos: AgentTabLifecycleInfo[] = [];

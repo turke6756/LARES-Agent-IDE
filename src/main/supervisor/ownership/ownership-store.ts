@@ -10,7 +10,7 @@
 // All OS/DB/native access is injected so the decision logic is unit-testable.
 
 import type Database from 'better-sqlite3';
-import { FindTreeResult, findVerifiedTree, verifyRoot } from './tree-walk';
+import { FindTreeResult, findVerifiedTree, verifyRoot, VerifyResult } from './tree-walk';
 import {
   JobHandle,
   NativeJobSurface,
@@ -240,6 +240,59 @@ export class OwnershipStore {
     } catch (e) {
       this.deps.log(`[ownership] getLiveJobPids(${agentId}) failed: ${String(e)}`);
       return null;
+    }
+  }
+
+  /**
+   * Idle-agent lifecycle §B4 — can we establish, without killing anything, that
+   * we own a terminable handle on this agent's process?
+   *
+   * This is the SAME verification `terminateVerifiedAgent` (§B5) runs, so
+   * eligibility and termination can never disagree about what "verified" means.
+   * The mapping is the one `findVerifiedTree` already uses:
+   *
+   *  - no row                          → `gone`
+   *  - WSL row with a tmux session     → `wsl-tmux` (tmux is the authority there)
+   *  - root gone / PID reused          → `gone`   (nothing of ours survives)
+   *  - root verified + a usable job    → `verified-job`
+   *  - root verified, no usable job    → `verified-tree` (the Win32 tree walk)
+   *  - creation time unobtainable      → `unverifiable` (fail-closed)
+   *
+   * Deliberately NOT a failure: the named Job Object being absent/released. A
+   * released job name means its members are already gone, and the tree walk is
+   * always available as the verified fallback — so job absence downgrades the
+   * kind, it never makes an agent ineligible. The only `unverifiable` source is
+   * the creation-time identity check (nothing stored, or no native source now),
+   * which is exactly what stops us from killing a recycled PID.
+   */
+  verifyStopOwnership(agentId: string): { kind: 'verified-job' | 'verified-tree' | 'wsl-tmux' | 'gone' | 'unverifiable' } {
+    const row = this.getOwnership(agentId);
+    if (!row) return { kind: 'gone' };
+    if (row.transport === 'wsl') {
+      return { kind: row.tmuxSession ? 'wsl-tmux' : 'gone' };
+    }
+    if (row.rootPid == null) return { kind: 'gone' };
+    const { native } = this.deps;
+    const getter = native.supported
+      ? (pid: number) => native.pidCreationTime(pid)
+      : () => { throw new Error('lares-native unavailable'); };
+    let v: VerifyResult;
+    try {
+      v = verifyRoot(row.rootPid, row.pidCreationTime, getter);
+    } catch {
+      return { kind: 'unverifiable' };
+    }
+    switch (v.reason) {
+      case 'root-gone':
+      case 'creation-mismatch':
+        return { kind: 'gone' };
+      case 'no-stored-creation':
+      case 'no-creation-source':
+        return { kind: 'unverifiable' };
+      default: {
+        const jobUsable = native.supported && !!row.jobName && row.instanceEpoch === this.deps.instanceEpoch;
+        return { kind: jobUsable ? 'verified-job' : 'verified-tree' };
+      }
     }
   }
 

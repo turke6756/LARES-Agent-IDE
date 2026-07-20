@@ -4546,6 +4546,26 @@ export class AgentSupervisor extends EventEmitter {
     return this.lifecycleLocks.has(agentId);
   }
 
+  /**
+   * §B4 guard — an initial user prompt is queued for this agent and has not
+   * been delivered yet (and has not expired). Stopping now would silently eat
+   * the human's first instruction.
+   */
+  hasPendingDelivery(agentId: string): boolean {
+    const pending = this.pendingInitialPrompts.get(agentId);
+    return !!pending && Date.now() <= pending.expiresAt;
+  }
+
+  /**
+   * §B4 guard — a continuation swap is mid-flight for this agent: the brick has
+   * been handed to a relaunch, or the agent is inside the stop → relaunch window
+   * that BUG-41's `continuationSwapsInFlight` set marks. Stopping there strands
+   * the handoff.
+   */
+  isContinuationInFlight(agentId: string): boolean {
+    return this.continuationSwapsInFlight.has(agentId) || this.pendingContinuationBricks.has(agentId);
+  }
+
   // ── Stop-intent record (§B5 honest-failure follow-up) ───────────────────────
   //
   // §B5 deliberately RETAINS the runner-map entry when a stop could not be
@@ -4650,6 +4670,12 @@ export class AgentSupervisor extends EventEmitter {
     if (!store) return { outcome: 'unverifiable', error: 'ownership store not armed' };
     const row = store.getOwnership(agentId);
     if (!row) return { outcome: 'already-gone', pids: [] };
+    // §B4 — the SAME verification eligibility runs, so the two can never
+    // disagree about "verified". Optional-call so older test doubles of the
+    // store (which predate the method) still exercise the paths below.
+    const pre = store.verifyStopOwnership?.(agentId);
+    if (pre?.kind === 'gone') { store.deleteOwnership(agentId); return { outcome: 'already-gone', pids: [] }; }
+    if (pre?.kind === 'unverifiable') return { outcome: 'unverifiable' }; // fail-closed: nothing killed
     try {
       if (row.transport === 'wsl') {
         // tmux is the process authority for WSL agents — the same kill the
