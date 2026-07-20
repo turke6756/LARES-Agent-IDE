@@ -42,6 +42,7 @@ const TESTS = [
   'dist/main/main/supervisor/lifecycle-stop.test.js',
   'dist/main/main/supervisor/lifecycle-stop-intent.test.js',
   'dist/main/main/lifecycle/guards.test.js',
+  'dist/main/main/supervisor/lifecycle-eligible-stop.test.js',
   'dist/main/main/supervisor/initial-user-prompt.test.js',
   'dist/main/main/supervisor/hook-spool-tailer.test.js',
   'dist/main/main/supervisor/send-input-encoder.test.js',

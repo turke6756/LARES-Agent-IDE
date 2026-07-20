@@ -4,7 +4,8 @@ import fs from 'fs';
 import crypto from 'crypto';
 import { execFileSync, execFile, spawn } from 'child_process';
 import { v4 as uuidv4 } from 'uuid';
-import { Agent, AgentProvider, AgentRoleLane, AgentStatus, AgentStopReason, ContextStats, LaunchAgentInput, QueryResult, StopResult, Team, UsageLimitsReading, hasSupervisorPrivilege } from '../../shared/types';
+import { Agent, AgentProvider, AgentRoleLane, AgentStatus, AgentStopReason, BulkStopItemResult, ContextStats, LaunchAgentInput, QueryResult, StopEligibilityMode, StopResult, Team, UsageLimitsReading, hasSupervisorPrivilege } from '../../shared/types';
+import { assembleGuardSnapshot, evaluateStopEligibility, type AgentBrowserState, type GuardDeps } from '../lifecycle/guards';
 import {
   TMUX_SESSION_PREFIX, PROVIDER_COMMANDS, WORKER_CLAUDE_MODEL,
   SUPERVISOR_AGENT_NAME, SUPERVISOR_AGENT_MD, SUPERVISOR_MEMORY_MD,
@@ -114,6 +115,7 @@ import {
   getContinuationAttempt, getCurrentBrick, commitContinuationRelaunch,
   getLatestContinuationAttempt,
   insertAgentSession, closeAgentSession,
+  getAgentsByOwner,
   getPlan, recordPlanSectionTouch,
   getTurnSectionTouches, getTurnSectionChanges, insertPlanEvent, getTurnRepoActivity,
   getDb,
@@ -4544,6 +4546,91 @@ export class AgentSupervisor extends EventEmitter {
    *  (§B4's `lifecycle_busy` guard consumes this in a later leg.) */
   isLifecycleLocked(agentId: string): boolean {
     return this.lifecycleLocks.has(agentId);
+  }
+
+  // ── §B4/§B6.1 eligible stop ────────────────────────────────────────────────
+  //
+  // The browser manager and the orchestration service live outside the
+  // supervisor, so their guard readings are injected at wiring time. An
+  // UNWIRED source is not an unreadable one: a build with no browser subsystem
+  // has no tabs to protect, so it reads CLEAR rather than `guard_unavailable`
+  // (which would make stale-idle stop nothing, forever, and silently).
+  private guardSources: {
+    getAgentBrowserState?: (agentId: string) => AgentBrowserState | null;
+    activeOrchestrationIds?: () => Iterable<string>;
+  } = {};
+
+  setLifecycleGuardSources(sources: {
+    getAgentBrowserState?: (agentId: string) => AgentBrowserState | null;
+    activeOrchestrationIds?: () => Iterable<string>;
+  }): void {
+    this.guardSources = { ...this.guardSources, ...sources };
+  }
+
+  /** The §B4 guard surface, bound to this supervisor's live state. */
+  get guardDeps(): GuardDeps {
+    return {
+      getAgent: (id) => {
+        const a = getAgent(id);
+        return a ? { id: a.id, status: a.status, idleSince: a.idleSince ?? null } : null;
+      },
+      getLiveChildren: (id) =>
+        getAgentsByOwner(id).map((a) => ({ id: a.id, status: a.status, idleSince: a.idleSince ?? null })),
+      activeOrchestrationIds: () => this.guardSources.activeOrchestrationIds?.() ?? [],
+      hasPendingDelivery: (id) => this.hasPendingDelivery(id),
+      isContinuationInFlight: (id) => this.isContinuationInFlight(id),
+      isLifecycleLocked: (id) => this.isLifecycleLocked(id),
+      hasLiveRunner: (id) => this.hasRunner(id),
+      verifyStopOwnership: (id) => this.ownership?.verifyStopOwnership(id) ?? { kind: 'gone' },
+      getAgentBrowserState: (id) =>
+        this.guardSources.getAgentBrowserState
+          ? this.guardSources.getAgentBrowserState(id)
+          : { agentId: id, tabCount: 0, loading: false, signinPending: false, needsHumanAttention: false, pendingDownload: false, activeLease: false },
+      now: () => Date.now(),
+    };
+  }
+
+  /**
+   * §B6.1 — the TOCTOU-free eligible stop.
+   *
+   * Guards are evaluated INSIDE the same lifecycle lock that performs the stop,
+   * so nothing can start (a continuation, a delivery, another stop) between the
+   * decision and the kill. `selfLockedAgent` keeps the lock we are holding from
+   * excluding the very agent we are stopping.
+   *
+   * `confirmActive` GATES EXECUTION: in `explicit` mode an agent whose guards
+   * are active comes back `skipped` with those guards as codes unless the
+   * caller explicitly confirmed. The flag is not merely carried through.
+   *
+   * An honest `failed` stop (§B5) surfaces as a per-agent `failed` — never
+   * silently as `stopped`.
+   */
+  stopIfEligibleLocked(
+    agentId: string,
+    mode: StopEligibilityMode,
+    reason: AgentStopReason,
+    opts?: { staleThresholdMs?: number | null; confirmActive?: boolean },
+  ): Promise<BulkStopItemResult> {
+    return this.withLifecycleLock(agentId, async () => {
+      const snap = await assembleGuardSnapshot([agentId], this.guardDeps, {
+        selfLockedAgent: agentId,
+        staleThresholdMs: opts?.staleThresholdMs ?? null,
+      });
+      const e = evaluateStopEligibility(agentId, mode, snap);
+      if (!e.eligible) {
+        const result = e.exclusions.includes('not_found') ? 'not_found' : 'skipped';
+        return { agentId, result, codes: e.exclusions };
+      }
+      if (mode === 'explicit' && e.warnings.length > 0 && opts?.confirmActive !== true) {
+        return { agentId, result: 'skipped' as const, codes: e.warnings };
+      }
+      const r = await this.stopAgentLocked(agentId, { reason });
+      const result =
+        r.outcome === 'not_found' ? ('not_found' as const)
+          : r.outcome === 'failed' ? ('failed' as const)
+            : ('stopped' as const);
+      return { agentId, result, codes: [], outcome: r.outcome };
+    });
   }
 
   /**
