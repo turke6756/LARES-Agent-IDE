@@ -24,6 +24,7 @@ const TESTS = [
   'dist/main/main/supervisor/env-sanitize.test.js',
   'dist/main/main/supervisor/codex-sid-recovery-on-chat-read.test.js',
   'dist/main/main/supervisor/session-log-dispatcher.test.js',
+  'dist/main/main/supervisor/agent-chat-history.test.js',
   'dist/main/main/supervisor/claude-clear-rotation.test.js',
   'dist/main/main/supervisor/claude-clear-rotation-integration.test.js',
   'dist/main/main/supervisor/claude-clear-rotation-supervisor.test.js',
