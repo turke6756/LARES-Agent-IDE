@@ -1,11 +1,12 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { motion } from 'framer-motion';
-import type { Agent } from '../../../shared/types';
+import type { Agent, AgentStopReason } from '../../../shared/types';
 import StatusBadge from './StatusBadge';
 import { formatAgentToken } from '../../lib/agent-mention';
 import { RoleChips, ContextStatsBar } from './agent-card-bits';
 import ContinuationSplitButton from './ContinuationSplitButton';
 import { isContinuationEligible } from './continuation-controls';
+import { summarizeStopExclusions } from '../../lib/stop-exclusion-copy';
 import { PROVIDER_META } from '../../../shared/constants';
 import { useDashboardStore } from '../../stores/dashboard-store';
 import { useCursorMenuPosition } from '../../lib/floating/useCursorMenuPosition';
@@ -32,6 +33,30 @@ function formatSpawnTime(dateStr: string): string {
   const pad = (n: number) => n.toString().padStart(2, '0');
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
+
+/**
+ * Idle-agent lifecycle §B8 — how a persisted `last_stop_reason` reads on the
+ * card. `Record<AgentStopReason, …>` so a new reason is a compile error rather
+ * than a silently unlabelled stop.
+ *
+ * `restart` is deliberately null: a restart's stop is an implementation detail
+ * of the restart, not something the human did to this agent, and badging it
+ * would make every restarted agent look like it had been killed.
+ *
+ * The provenance this renders is trustworthy precisely because the renderer
+ * cannot write it — every reason is assigned main-side per IPC endpoint, and
+ * `automatic-stale-idle` / `supervisor` / `terminal-capture-failure` have no
+ * IPC channel at all.
+ */
+export const STOP_REASON_BADGE: Record<AgentStopReason, string | null> = {
+  supervisor: 'Stopped by supervisor',
+  'manual-card': 'Stopped manually',
+  'manual-selection': 'Stopped manually',
+  'manual-stale-idle': 'Stopped manually (idle sweep)',
+  'automatic-stale-idle': 'Stopped automatically after being idle',
+  restart: null,
+  'terminal-capture-failure': 'Stopped after a terminal capture failure',
+};
 
 const BORDER_COLORS: Record<string, string> = {
   working: 'border-l-accent-green',
@@ -80,6 +105,10 @@ export default function AgentCard({
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
   const [confirmDeleteSelected, setConfirmDeleteSelected] = useState(false);
+  // §B8 stop: its own confirm latch and its own toast — never shared with the
+  // delete flow, so one destructive action can't arm the other.
+  const [confirmStop, setConfirmStop] = useState(false);
+  const [stopToast, setStopToast] = useState<{ tone: 'error' | 'info'; text: string } | null>(null);
   const [forking, setForking] = useState(false);
   const [dragOver, setDragOver] = useState(false);
   const [dragQuery, setDragQuery] = useState<{ sourceId: string } | null>(null);
@@ -144,6 +173,40 @@ export default function AgentCard({
       return;
     }
     await deleteAgent(agent.id);
+  };
+
+  // §B8 — Stop Agent. Two-step inside the context menu for a live agent; the
+  // renderer passes NO reason (main assigns `manual-card`).
+  const handleStopAgent = async () => {
+    const strongConfirm = ['launching', 'working', 'waiting', 'restarting'].includes(agent.status);
+    if (strongConfirm && !confirmStop) {
+      setConfirmStop(true);
+      return;
+    }
+    setContextMenu(null);
+    setConfirmStop(false);
+    setStopToast(null);
+    try {
+      const result = await window.api.agents.stop(agent.id);
+      const item = result?.items?.[0];
+      if (item?.result === 'failed') {
+        // The honest-failure case (B5): the runner never confirmed exit AND
+        // verified termination could not confirm the tree is gone. The agent
+        // KEEPS its live status — saying "Stopped" here would be a lie.
+        setStopToast({
+          tone: 'error',
+          text: 'Stop could not be confirmed — the process may still be running.',
+        });
+      } else if (item?.result === 'not_found') {
+        setStopToast({ tone: 'info', text: 'This agent no longer exists.' });
+      } else if (item?.result === 'skipped') {
+        setStopToast({ tone: 'info', text: summarizeStopExclusions(item.codes) ?? 'Stop was skipped.' });
+      }
+      // 'stopped' says nothing: the status transition arrives over the event
+      // rail and the card re-renders with its badge.
+    } catch (e) {
+      setStopToast({ tone: 'error', text: `Stop failed: ${String(e)}` });
+    }
   };
 
   const handleCancelDelete = (e: React.MouseEvent) => {
@@ -392,6 +455,36 @@ export default function AgentCard({
         Spawned: {formatSpawnTime(agent.createdAt)}
       </div>
 
+      {/* §B8 stopped-reason badge. Only for an agent that actually reached
+          `done` carrying a reason — a `crashed` agent was not stopped by
+          anyone, and `restart` maps to null above. */}
+      {agent.status === 'done' && agent.lastStopReason && STOP_REASON_BADGE[agent.lastStopReason] && (
+        <div
+          className="mt-1 inline-block text-[10px] px-1.5 py-0.5 rounded text-gray-400 bg-white/5"
+          title={agent.stoppedAt ? `Stopped at ${formatSpawnTime(agent.stoppedAt)}` : undefined}
+          data-testid="stop-reason-badge"
+        >
+          {STOP_REASON_BADGE[agent.lastStopReason]}
+        </div>
+      )}
+
+      {/* Stop outcome. An unconfirmed stop must be visible ON the card that
+          still shows a live status — never dismissed as success. */}
+      {stopToast && (
+        <div
+          role={stopToast.tone === 'error' ? 'alert' : 'status'}
+          className={`mt-1 text-[10px] px-1.5 py-1 rounded ${
+            stopToast.tone === 'error'
+              ? 'text-accent-red bg-accent-red/10 border border-accent-red/40'
+              : 'text-gray-400 bg-white/5'
+          }`}
+          onClick={(e) => { e.stopPropagation(); setStopToast(null); }}
+          title="Click to dismiss"
+        >
+          {stopToast.text}
+        </div>
+      )}
+
       {/* Context menu */}
       {contextMenu && (
         <div
@@ -415,6 +508,23 @@ export default function AgentCard({
           >
             {agent.isSupervised ? 'Disable Supervision' : 'Enable Supervision'}
           </button>
+          {!['done', 'crashed'].includes(agent.status) && (
+            <button
+              onClick={(e) => {
+                // A plain card click clears state the confirm depends on.
+                e.stopPropagation();
+                void handleStopAgent();
+              }}
+              className="ui-menu-item text-accent-red"
+              title="Stop this agent's process (it is not a pause — there is no resume)"
+            >
+              {confirmStop
+                ? agent.isSupervisor
+                  ? 'Confirm stop (its children keep running)'
+                  : `Confirm stop — ${agent.status} work is lost`
+                : 'Stop Agent'}
+            </button>
+          )}
           {onTeam && !agent.isSupervisor && !['done', 'crashed'].includes(agent.status) && (
             <button
               onClick={() => { setContextMenu(null); onTeam(agent.id); }}
