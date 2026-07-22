@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo } from 'react';
+import React, { useEffect, useMemo, useRef } from 'react';
 import type { PathType } from '../../../shared/types';
 import { useFileContentCache, registerFreshContentHandler } from './useFileContentCache';
 import { detectFileType, isEditableFileType } from './fileTypeUtils';
@@ -15,6 +15,7 @@ import GeoTiffRenderer from './GeoTiffRenderer';
 import ShapefileRenderer from './ShapefileRenderer';
 import GeoPackageRenderer from './GeoPackageRenderer';
 import { useDashboardStore } from '../../stores/dashboard-store';
+import { diag, diagBasename } from './editLossDiag';
 
 interface Props {
   tabId: string;
@@ -124,6 +125,29 @@ export default function FileContentArea({ tabId, filePath, pathType }: Props) {
       enterSourceMode(tabId, content.content);
     }
   }, [wantSourceFocus, content, enterSourceMode, tabId]);
+
+  // DIAG(edit-loss): log-only transition tracker — renders nothing, changes no
+  // tree shape; lives with the other hooks ABOVE the first early return so the
+  // hook order is stable. Logs transitions of the inputs that decide whether
+  // the editor subtree gets replaced (H1 discriminators).
+  const diagPrevSnapshotRef = useRef<string | null>(null);
+  useEffect(() => {
+    const snapshot = JSON.stringify({
+      kind: resolved.kind,
+      externalChange: !!editState?.externalChange,
+      mode: editState?.mode ?? null,
+      reloadVersion: editState?.reloadVersion ?? 0,
+      // The MilkdownEditor key string as computed at :234 (basename only).
+      editorKey: `${tabId}:${diagBasename(filePath)}:${editState?.reloadVersion ?? 0}`,
+    });
+    if (diagPrevSnapshotRef.current === snapshot) return;
+    diag('content-area-transition', {
+      tabId,
+      from: diagPrevSnapshotRef.current,
+      to: snapshot,
+    });
+    diagPrevSnapshotRef.current = snapshot;
+  });
 
   if (!filePath) {
     return (

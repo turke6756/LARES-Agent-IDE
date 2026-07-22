@@ -337,6 +337,78 @@ describe('fresh-content handler seam', () => {
   });
 });
 
+describe('TOCTOU hole (H3): fresh content applied inside the markdownUpdated debounce window', () => {
+  // FIXME(edit-loss): un-fail in Phase 1 — applyFreshContent must re-check the
+  // LIVE doc (crepe.getMarkdown() vs loadSerializedRef) at replacement time;
+  // today it guards only on the ~200ms-debounced dirtyRef, so a transaction
+  // applied just before a clean 'fallback' content swap is erased.
+  it.fails('a transaction applied just before the content prop changes survives the swap', async () => {
+    const element = (content: string) => (
+      <MilkdownEditor tabId="toctou" filePath="C:\\ws\\doc.md" content={content} />
+    );
+    const mounted = await mountEditor(element(ORIGINAL));
+    try {
+      // Settle any pending pristine-side debounce before freezing time.
+      await flushDebounce();
+      const view = getCanvasEditorHandle('toctou')!.getEditorView!()!;
+      const pos = findTextPos(view, 'Second paragraph');
+
+      vi.useFakeTimers();
+      try {
+        // Live edit — the debounced markdownUpdated has NOT fired, so dirtyRef
+        // is still false (the consult-to-commit gap).
+        act(() => {
+          view.dispatch(view.state.tr.insertText('SURVIVES ', pos));
+        });
+        // Fresh disk content arrives via the content prop inside that gap
+        // (the 'fallback' path: handler judged the editor clean).
+        const FRESH = '# Title\r\n\r\nFresh from disk.\r\n';
+        act(() => {
+          mounted.root.render(element(FRESH));
+        });
+        // Desired: the live transaction survives the replacement.
+        expect(getCanvasEditorHandle('toctou')!.getMarkdown()).toContain('SURVIVES');
+      } finally {
+        vi.useRealTimers();
+      }
+    } finally {
+      await mounted.unmount();
+    }
+  });
+
+  it('locks the CURRENT clobber mechanics (bounded loss, diagnosis H3 — remove with the Phase 1 fix)', async () => {
+    const element = (content: string) => (
+      <MilkdownEditor tabId="toctou-cur" filePath="C:\\ws\\doc.md" content={content} />
+    );
+    const mounted = await mountEditor(element(ORIGINAL));
+    try {
+      await flushDebounce();
+      const view = getCanvasEditorHandle('toctou-cur')!.getEditorView!()!;
+      const pos = findTextPos(view, 'Second paragraph');
+
+      vi.useFakeTimers();
+      try {
+        act(() => {
+          view.dispatch(view.state.tr.insertText('ERASED ', pos));
+        });
+        const FRESH = '# Title\r\n\r\nFresh from disk.\r\n';
+        act(() => {
+          mounted.root.render(element(FRESH));
+        });
+        // Today: replaceAll fires guarded only by the stale dirtyRef — the
+        // in-gap edit is gone and the fresh bytes won.
+        const md = getCanvasEditorHandle('toctou-cur')!.getMarkdown();
+        expect(md).not.toContain('ERASED');
+        expect(md).toContain('Fresh from disk.');
+      } finally {
+        vi.useRealTimers();
+      }
+    } finally {
+      await mounted.unmount();
+    }
+  });
+});
+
 describe('editor handle registry', () => {
   it('exposes a small handle per tabId while mounted, gone after unmount', async () => {
     expect(getCanvasEditorHandle('t5')).toBeUndefined();

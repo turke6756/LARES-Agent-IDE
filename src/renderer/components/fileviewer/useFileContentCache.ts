@@ -2,6 +2,15 @@ import { useState, useEffect } from 'react';
 import type { FileContent, FsEvent, PathType } from '../../../shared/types';
 import { useDashboardStore } from '../../stores/dashboard-store';
 import { contentHash } from './markdownSplice';
+import { diag, diagBasename, diagHash } from './editLossDiag';
+
+// DIAG(edit-loss): read-ordering diagnostic only — a module-level counter so
+// overlapping reads can be told apart in the log (Phase 3 replaces this with a
+// real generation check). Purely observational in Phase 0.
+let diagReadSeq = 0;
+
+/** Why a revalidate pass ran (DIAG threading; no behavioral use in Phase 0). */
+type RevalidateCause = 'watcher' | 'cached-mount' | 'initial';
 
 // Module-level cache: tabId -> FileContent
 const contentCache = new Map<string, FileContent>();
@@ -111,7 +120,11 @@ export function useFileContentCache(tabId: string, filePath: string, pathType: P
     // Re-read the file from disk and, if it differs from the cache, swap the
     // fresh content into both the cache and this hook's state. Shared by the
     // fs-watcher handler and the on-mount revalidation pass below.
-    const revalidate = () => {
+    const revalidate = (cause: RevalidateCause) => {
+      // DIAG(edit-loss): entry — cause + read ordering (overlapping reads have
+      // no generation control in Phase 0; readGen just names them in the log).
+      const readGen = ++diagReadSeq;
+      diag('revalidate-entry', { tabId, file: diagBasename(filePath), cause, readGen });
       window.api.files.readFile(filePath, pathType).then((fresh) => {
         if (cancelled) return;
         if (fresh.error) return;
@@ -121,12 +134,23 @@ export function useFileContentCache(tabId: string, filePath: string, pathType: P
           // Cache already matches disk, but local state may lag behind the
           // shared cache (e.g., another pass updated it first) — sync it so
           // the renderer never displays older content than the cache holds.
+          // DIAG(edit-loss): guard 1 terminated — cache already matches disk.
+          diag('revalidate-cache-match', {
+            tabId, cause, readGen,
+            freshHash: diagHash(fresh.content),
+          });
           setContent((prev) => (prev === cachedNow ? prev : cachedNow));
           return;
         }
         // Write-generation token: drop watcher echoes of our own saves before
         // any state-based checks (originalContent may not be updated yet).
         if (isRecentWriteEcho(tabId, fresh.content)) {
+          // DIAG(edit-loss): guard 2 terminated — recent-write echo token.
+          diag('revalidate-write-echo', {
+            tabId, cause, readGen,
+            freshHash: diagHash(fresh.content),
+            cachedHash: diagHash(cachedNow?.content),
+          });
           contentCache.set(tabId, fresh);
           return;
         }
@@ -134,6 +158,13 @@ export function useFileContentCache(tabId: string, filePath: string, pathType: P
         const editState = store.tabEditState[tabId];
         if (editState && editState.originalContent === fresh.content && !editState.dirty) {
           // Echo of the content we just saved from the editor.
+          // DIAG(edit-loss): guard 3 terminated — bytes match originalContent
+          // while clean (note the !dirty restriction — H2b's leak point).
+          diag('revalidate-original-match', {
+            tabId, cause, readGen,
+            freshHash: diagHash(fresh.content),
+            originalHash: diagHash(editState.originalContent),
+          });
           contentCache.set(tabId, fresh);
           return;
         }
@@ -142,6 +173,17 @@ export function useFileContentCache(tabId: string, filePath: string, pathType: P
 
         // A registered per-tab handler (the WYSIWYG editor) gets first say.
         const verdict = consultFreshContentHandler(tabId, fresh.content);
+        // DIAG(edit-loss): guard 4 — handler verdict branch taken, with the
+        // fresh/cached/original hashes and read generation at completion.
+        if (verdict !== null) {
+          diag('revalidate-handler-verdict', {
+            tabId, cause, readGen, verdict,
+            freshHash: diagHash(fresh.content),
+            cachedHash: diagHash(cachedNow?.content),
+            originalHash: diagHash(editState?.originalContent),
+            storeDirty: !!editState?.dirty,
+          });
+        }
         if (verdict === 'handled') {
           return;
         }
@@ -157,6 +199,15 @@ export function useFileContentCache(tabId: string, filePath: string, pathType: P
           return;
         }
 
+        // DIAG(edit-loss): guard 5 — no handler registered.
+        diag('revalidate-no-handler', {
+          tabId, cause, readGen,
+          branch: editState && editState.mode !== 'view' ? 'banner' : 'content-swap',
+          freshHash: diagHash(fresh.content),
+          cachedHash: diagHash(cachedNow?.content),
+          originalHash: diagHash(editState?.originalContent),
+          storeDirty: !!editState?.dirty,
+        });
         if (editState && editState.mode !== 'view') {
           // Don't trample the editor while the user has it open.
           // Surface a banner so they can choose to reload or keep edits.
@@ -181,11 +232,20 @@ export function useFileContentCache(tabId: string, filePath: string, pathType: P
       // content area is unmounted on tab switch) leaves the cache stale, so
       // switching back must revalidate against disk — otherwise the tab
       // shows old content until it's closed and reopened.
-      revalidate();
+      revalidate('cached-mount');
     } else {
       setLoading(true);
+      // DIAG(edit-loss): initial uncached read (no guard chain — direct swap).
+      const readGen = ++diagReadSeq;
+      diag('revalidate-entry', { tabId, file: diagBasename(filePath), cause: 'initial', readGen });
       window.api.files.readFile(filePath, pathType).then((result) => {
         if (cancelled) return;
+        // DIAG(edit-loss): initial read completed and installed unconditionally.
+        diag('initial-read-installed', {
+          tabId, readGen,
+          freshHash: result.error ? null : diagHash(result.content),
+          error: !!result.error,
+        });
         contentCache.set(tabId, result);
         setContent(result);
         setLoading(false);
@@ -205,7 +265,7 @@ export function useFileContentCache(tabId: string, filePath: string, pathType: P
       if (cancelled) return;
       if (event.type === 'unlink') return;
       if (normalizePath(event.path) !== targetKey) return;
-      revalidate();
+      revalidate('watcher');
     };
 
     const unsubscribe = window.api.files.watchDirectory(parentDir, pathType, handleFsEvent);

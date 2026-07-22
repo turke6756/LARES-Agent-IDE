@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import type { Agent, AgentStatus, Workspace, HealthCheck, FileActivity, QueryResult, ContextStats, UsageLimitsReading, PathType, FileTab, PanelLayout, Team, TeamMessage, CreateTeamInput, DetachedClosedPayload, DetachableView } from '../../shared/types';
 import { evictTabCache, recordRecentWrite } from '../components/fileviewer/useFileContentCache';
+import { diag, diagBasename, diagHash } from '../components/fileviewer/editLossDiag';
 import { clearDraft } from '../lib/chat-drafts';
 import {
   nextTransferSet,
@@ -771,6 +772,14 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
     }
 
     evictTabCache(tabId);
+    // DIAG(edit-loss): save success — what reached disk vs the live draft
+    // (a draft that moved during the write leaves dirty=true below).
+    diag('store-save-success', {
+      tabId,
+      file: diagBasename(tab.filePath),
+      writtenHash: diagHash(draftToSave),
+      liveDraftHash: diagHash(get().tabEditState[tabId]?.draftContent),
+    });
     set((state) => {
       const current = state.tabEditState[tabId];
       if (!current) return state;
@@ -813,6 +822,19 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
   },
 
   markExternalChange: (tabId, freshContent) => {
+    // DIAG(edit-loss): the banner trigger — what the store believed at the
+    // moment the external change was surfaced.
+    {
+      const es = get().tabEditState[tabId];
+      diag('store-mark-external-change', {
+        tabId,
+        freshHash: diagHash(freshContent),
+        storeDirty: !!es?.dirty,
+        draftHash: diagHash(es?.draftContent),
+        originalHash: diagHash(es?.originalContent),
+        alreadyBannered: !!es?.externalChange,
+      });
+    }
     set((state) => {
       const existing = state.tabEditState[tabId];
       if (!existing) return state;
@@ -848,6 +870,18 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
   },
 
   reloadFromDisk: (tabId) => {
+    // DIAG(edit-loss): the draft-destroying path — pendingDiskContent replaces
+    // the draft permanently.
+    {
+      const es = get().tabEditState[tabId];
+      diag('store-reload-from-disk', {
+        tabId,
+        pendingHash: diagHash(es?.pendingDiskContent),
+        draftHash: diagHash(es?.draftContent),
+        storeDirty: !!es?.dirty,
+        reloadVersion: es?.reloadVersion ?? 0,
+      });
+    }
     set((state) => {
       const existing = state.tabEditState[tabId];
       if (!existing || existing.pendingDiskContent === undefined) return state;
@@ -871,6 +905,18 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
   },
 
   refreshOriginalContent: (tabId, freshContent) => {
+    // DIAG(edit-loss): baseline refresh after a clean 'fallback' swap — the
+    // H5 path rebaselines the store here.
+    {
+      const es = get().tabEditState[tabId];
+      diag('store-refresh-original', {
+        tabId,
+        freshHash: diagHash(freshContent),
+        storeDirty: !!es?.dirty,
+        originalHash: diagHash(es?.originalContent),
+        applied: !!es && !es.dirty && es.originalContent !== freshContent,
+      });
+    }
     set((state) => {
       const existing = state.tabEditState[tabId];
       if (!existing) return state;

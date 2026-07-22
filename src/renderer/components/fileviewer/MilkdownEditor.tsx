@@ -36,6 +36,7 @@ import '@milkdown/crepe/theme/common/style.css';
 // mode. See milkdownTheme.css.
 import './milkdownTheme.css';
 import { useDashboardStore } from '../../stores/dashboard-store';
+import { diag, diagBasename, diagHash, nextEditorMountGeneration } from './editLossDiag';
 import FileCommentGutter from '../selection/FileCommentGutter';
 import { getTabScrollFraction, setTabScrollFraction } from './scrollMemory';
 import {
@@ -203,6 +204,24 @@ function MilkdownEditor({ tabId, filePath, content, registerFreshContentHandler 
     readyRef.current = false;
     dirtyRef.current = false;
 
+    // DIAG(edit-loss): per-mount generation + what this mount initializes from
+    // vs what the store believes (a dirty store draft at mount time is the H1
+    // invisible-draft signature).
+    const mountGen = nextEditorMountGeneration();
+    {
+      const es = useDashboardStore.getState().tabEditState[tabId];
+      diag('editor-mount', {
+        gen: mountGen,
+        tabId,
+        file: diagBasename(filePath),
+        contentHash: diagHash(contentRef.current),
+        storeDirty: !!es?.dirty,
+        draftHash: diagHash(es?.draftContent),
+        reloadVersion: es?.reloadVersion ?? 0,
+        mode: es?.mode,
+      });
+    }
+
     // Splice baseline from the ORIGINAL bytes; the editor itself receives the
     // LF-normalized text (plan §6.1).
     let baseline: SpliceBaseline | null = null;
@@ -356,19 +375,57 @@ function MilkdownEditor({ tabId, filePath, content, registerFreshContentHandler 
     // below refreshes the baseline). Phase 3 upgrades this to applying a
     // ProseMirror transaction and returning 'handled'.
     const unregister = tabId
-      ? registerRef.current?.(tabId, () => (editorIsDirty() || dirtyRef.current ? 'conflict' : 'fallback'))
+      ? registerRef.current?.(tabId, () => {
+          const editorDirty = editorIsDirty();
+          const verdict: FreshContentResult = editorDirty || dirtyRef.current ? 'conflict' : 'fallback';
+          // DIAG(edit-loss): handler verdict + which dirty authority produced it.
+          diag('handler-verdict', {
+            gen: mountGen,
+            tabId,
+            verdict,
+            editorDirty,
+            dirtyRef: dirtyRef.current,
+            storeDirty: !!useDashboardStore.getState().tabEditState[tabId]?.dirty,
+          });
+          return verdict;
+        })
       : undefined;
 
     /** Clean-editor content swap + baseline refresh (plan §5 'fallback'). */
     const applyFreshContent = (fresh: string) => {
-      if (disposed || !readyRef.current || dirtyRef.current) return;
-      if (fresh === baselineRef.current?.originalContent) return;
+      if (disposed || !readyRef.current || dirtyRef.current) {
+        // DIAG(edit-loss): which guard blocked the replace.
+        diag('apply-fresh-blocked', {
+          gen: mountGen,
+          tabId,
+          freshHash: diagHash(fresh),
+          disposed,
+          ready: readyRef.current,
+          dirtyRef: dirtyRef.current,
+        });
+        return;
+      }
+      if (fresh === baselineRef.current?.originalContent) {
+        // DIAG(edit-loss): fresh bytes already ARE the baseline — no-op.
+        diag('apply-fresh-baseline-match', {
+          gen: mountGen,
+          tabId,
+          freshHash: diagHash(fresh),
+        });
+        return;
+      }
       try {
         const next = prepareSpliceBaseline(fresh);
         crepe.editor.action(replaceAll(next.editorContent, true));
         baselineRef.current = next;
         loadSerializedRef.current = crepe.getMarkdown();
         dirtyRef.current = false;
+        // DIAG(edit-loss): replaceAll ran — the live doc was swapped.
+        diag('apply-fresh-replaced', {
+          gen: mountGen,
+          tabId,
+          freshHash: diagHash(fresh),
+        });
       } catch (err) {
         console.error('[MilkdownEditor] failed to apply fresh content', err);
       }
@@ -401,7 +458,15 @@ function MilkdownEditor({ tabId, filePath, content, registerFreshContentHandler 
       });
 
     return () => {
-      flushDirtyDraft();
+      // DIAG(edit-loss): the single flushDirtyDraft() call — capture its
+      // return value once into a local, log it, never call twice.
+      const flushedDraft = flushDirtyDraft();
+      diag('editor-cleanup', {
+        gen: mountGen,
+        tabId,
+        dirtyRef: dirtyRef.current,
+        flushedDraftHash: flushedDraft === null ? null : diagHash(flushedDraft),
+      });
       disposed = true;
       readyRef.current = false;
       if (applyFreshContentRef.current === applyFreshContent) {
@@ -433,7 +498,10 @@ function MilkdownEditor({ tabId, filePath, content, registerFreshContentHandler 
   // the store banner's business, never a content trample.
   useEffect(() => {
     contentRef.current = content;
+    // DIAG(edit-loss): content-prop sync effect fired.
+    diag('content-sync-effect', { tabId, contentHash: diagHash(content) });
     applyFreshContentRef.current?.(content);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- tabId is read for DIAG logging only; keying this effect on it would change replace timing
   }, [content]);
 
   // The gutter overlays the scroll container as a sibling (WP-P5-B): Crepe
