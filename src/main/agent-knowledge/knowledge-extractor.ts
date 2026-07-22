@@ -70,6 +70,9 @@ function roleForSource(
       return 'memory';
     case 'mcp-tool-schema':
       return 'mcp';
+    case 'agents-md':
+      // WP2 (G2): an applicable AGENTS.md on the root→cwd directory chain.
+      return 'agents-md';
     default:
       return 'other';
   }
@@ -82,6 +85,11 @@ const MARKDOWN_KINDS = new Set<OverheadSourceKind>([
   'agent-claude', 'inherited-claude', 'claude-local', 'user-claude',
   'managed-policy', 'rules', 'memory', 'behavioral',
   'skill', 'skill-header', 'skill-body', 'import',
+  // WP2 (G2): APPLICABLE AGENTS.md files reach the chain only when the agent's
+  // provider is in the file's audience (analyzer-side filter) — so admitting the
+  // kind here never extracts guidance an agent doesn't load. Heading-based
+  // sourceSectionKey derivation downstream is file-agnostic.
+  'agents-md',
 ]);
 
 const SKILL_KINDS = new Set<OverheadSourceKind>(['skill', 'skill-header', 'skill-body']);
@@ -309,7 +317,14 @@ export function extractAgentKnowledge(
       }
 
       const content = deps.readFile(abs);
-      if (content !== null) nodes.push(...parseMarkdownNodes(content, abs, src.sourceScope, role, src.kind));
+      if (content !== null) {
+        const parsed = parseMarkdownNodes(content, abs, src.sourceScope, role, src.kind);
+        // WP2 (G2): nodes carry their source's provider audience so downstream
+        // liveness/costing can filter by who actually loads the guidance.
+        const audience = src.guidanceSource?.audienceProviders;
+        if (audience !== undefined) for (const n of parsed) n.audienceProviders = audience;
+        nodes.push(...parsed);
+      }
 
       sourceFiles.push({
         absPath: abs,

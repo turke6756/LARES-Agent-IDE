@@ -79,6 +79,12 @@ export interface PredictedAction {
   sourceEpochId: string;               // the open epoch this action was compiled from ('' when unresolved)
   requiresDerivationGate: boolean;     // WP5 parity gate governs it (true ⇔ occurrence-derived, i.e. not unmatchable)
   fileAccess?: FileAccessInfo;         // WP-1B: resolved identity for path-touch actions (absent otherwise)
+  /** WP2 (G2): the owning guidance source's provider audience, carried verbatim
+   *  from the KnowledgeNode. Present ⇒ the action is AUDIENCE-SCOPED and its
+   *  liveness verdict is subject to the capture-coverage never-gate (only a
+   *  provably `complete` audience cohort may support `never`/dead). Absent ⇒
+   *  legacy Claude walk-up guidance — semantics unchanged. */
+  audienceProviders?: string[] | 'unknown';
 }
 
 export interface CompileDeps {
@@ -415,6 +421,10 @@ export function compileGuidanceActions(nodes: KnowledgeNode[], deps: CompileDeps
         sourceEpochId,
         requiresDerivationGate: raw.kind !== 'unmatchable',
       };
+      // WP2 (G2): AGENTS.md (and any audience-tagged) nodes propagate their
+      // provider audience so the occurrence classifier can gate `never` on
+      // capture coverage of that audience.
+      if (node.audienceProviders !== undefined) action.audienceProviders = node.audienceProviders;
       if (raw.kind === 'path-touch' && raw.pathToken) {
         action.fileAccess = buildFileAccess(raw.pathToken, raw.modeText ?? '', agentCwd, workspaceRoot);
       }

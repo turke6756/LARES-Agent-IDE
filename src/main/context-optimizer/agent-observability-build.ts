@@ -341,6 +341,9 @@ export interface AgentKnowledgeNodeDTO {
   sourceSpan?: { lineStart: number; lineEnd: number };
   behavior?: KnowledgeBehaviorEvidence;
   fileReferenceStats?: KnowledgeFileReferenceStats;
+  // WP2 (G2): the owning guidance source's provider audience ('unknown' is the
+  // explicit disclosed state). Present only on nodes from audience-tagged sources.
+  audienceProviders?: string[] | 'unknown';
 }
 
 export interface AgentKnowledgePage {
@@ -376,12 +379,14 @@ function citationsFor(n: KnowledgeNode, roots: RedactionRoots, max: number): Kno
 /** Shared WP8 projection of the CLAUDE.md ⇄ behavior linkage onto the DTO. Used by
  *  BOTH list + detail so an agent sees the same fields either way. */
 function knowledgeExtras(n: KnowledgeNode): Pick<AgentKnowledgeNodeDTO,
-  'sourceRole' | 'sourceSpan' | 'behavior' | 'fileReferenceStats'> {
+  'sourceRole' | 'sourceSpan' | 'behavior' | 'fileReferenceStats' | 'audienceProviders'> {
   return {
     sourceRole: n.sourceRole,
     sourceSpan: { lineStart: n.source.lineStart, lineEnd: n.source.lineEnd },
     ...(n.behavior ? { behavior: n.behavior } : {}),
     ...(n.fileReferenceStats ? { fileReferenceStats: n.fileReferenceStats } : {}),
+    // WP2 (G2): identifiers only (provider names), redaction-safe by construction.
+    ...(n.audienceProviders !== undefined ? { audienceProviders: n.audienceProviders } : {}),
   };
 }
 
@@ -557,6 +562,8 @@ export interface AgentKnowledgeNodeDetail {
   sourceSpan?: { lineStart: number; lineEnd: number };
   behavior?: KnowledgeBehaviorEvidence;
   fileReferenceStats?: KnowledgeFileReferenceStats;
+  // WP2 (G2): same audience projection as the list route.
+  audienceProviders?: string[] | 'unknown';
 }
 
 export function buildAgentKnowledgeDetail(

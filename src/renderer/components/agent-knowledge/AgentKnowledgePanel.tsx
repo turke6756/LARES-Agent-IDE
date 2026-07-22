@@ -53,6 +53,7 @@ const ROLE_LABEL: Record<KnowledgeSourceRole, string> = {
   'skill': 'Skill',
   'mcp': 'MCP tool',
   'memory': 'MEMORY.md',
+  'agents-md': 'AGENTS.md',
   'other': 'Other',
 };
 
@@ -61,7 +62,7 @@ interface Section { key: string; label: string; roles: KnowledgeSourceRole[] }
 const SECTIONS: Section[] = [
   { key: 'agent', label: 'Agent CLAUDE.md', roles: ['agent-claude'] },
   { key: 'workspace', label: 'Workspace CLAUDE.md', roles: ['workspace-claude'] },
-  { key: 'inherited', label: 'Inherited / Imported', roles: ['ancestor-claude', 'user-claude', 'managed', 'import'] },
+  { key: 'inherited', label: 'Inherited / Imported', roles: ['ancestor-claude', 'user-claude', 'managed', 'import', 'agents-md'] },
   { key: 'tools', label: 'Tools & Skills', roles: ['skill', 'mcp'] },
   { key: 'memory', label: 'Memory', roles: ['memory'] },
   { key: 'other', label: 'Other', roles: ['other'] },

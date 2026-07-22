@@ -32,10 +32,12 @@ import type { TokenEstimator } from './token-estimator';
 
 // Resident config surfaces whose prose we decompose into sections. Skill/memory/
 // behavioral/import/mcp rows are deliberately excluded — they are not free-form
-// config guidance.
+// config guidance. WP2 (G2): applicable AGENTS.md rows (`agents-md`) join the
+// sectioned set; their sections carry the source's GuidanceSource record and are
+// rolled up PER fileKind, never summed into the Claude-config bucket.
 const CONFIG_KINDS: ReadonlySet<OverheadSourceKind> = new Set<OverheadSourceKind>([
   'agent-claude', 'inherited-claude', 'claude-local', 'user-claude',
-  'managed-policy', 'rules', 'settings-hooks',
+  'managed-policy', 'rules', 'settings-hooks', 'agents-md',
 ]);
 
 const ALL_CLASSES: SectionWeightClass[] = [
@@ -230,11 +232,18 @@ export function classifyAgentConfig(
         tokens: estimator.estimate(sec.text).tokens,
         weightClass,
         evidence,
+        // WP2 (G2): thread the owning source's guidance record through so the
+        // section is joinable to its provider audience + chain applicability.
+        ...(src.guidanceSource ? { guidanceSource: src.guidanceSource } : {}),
       });
     }
   }
 
-  return { sections, tokensByClass: rollupTokens(sections) };
+  return {
+    sections,
+    tokensByClass: rollupTokens(sections),
+    tokensByClassByFileKind: rollupTokensByFileKind(sections),
+  };
 }
 
 function oneSection(
@@ -260,9 +269,37 @@ function oneSection(
   };
 }
 
-/** Sum section tokens into the six-key bucket map (all keys always present). */
+/** WP2 (G2): the rollup bucket key for a section — its guidance fileKind, or the
+ *  legacy 'claude-config' bucket for config surfaces without a GuidanceSource
+ *  record (rules / settings / pre-WP2 fixtures). */
+export function fileKindBucketOf(s: ConfigSectionWeight): string {
+  return s.guidanceSource?.fileKind ?? 'claude-config';
+}
+
+/**
+ * Sum section tokens into the six-key bucket map (all keys always present).
+ * WP2 (G2): this headline rollup NEVER sums across `fileKind` — AGENTS.md
+ * sections are excluded here and appear only in their own
+ * `rollupTokensByFileKind` bucket. The pre-WP2 population (CLAUDE-family +
+ * rules + settings) is unchanged.
+ */
 export function rollupTokens(sections: ConfigSectionWeight[]): Record<SectionWeightClass, number> {
   const by = emptyTokensByClass();
-  for (const s of sections) by[s.weightClass] += s.tokens;
+  for (const s of sections) {
+    if (fileKindBucketOf(s) === 'agents-md') continue; // never summed across fileKind
+    by[s.weightClass] += s.tokens;
+  }
   return by;
+}
+
+/** WP2 (G2): per-fileKind six-key buckets. Consumers must never sum across keys. */
+export function rollupTokensByFileKind(
+  sections: ConfigSectionWeight[],
+): Record<string, Record<SectionWeightClass, number>> {
+  const out: Record<string, Record<SectionWeightClass, number>> = {};
+  for (const s of sections) {
+    const bucket = fileKindBucketOf(s);
+    (out[bucket] ??= emptyTokensByClass())[s.weightClass] += s.tokens;
+  }
+  return out;
 }

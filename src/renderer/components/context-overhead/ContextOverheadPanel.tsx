@@ -22,6 +22,7 @@ const KIND_COLOR: Record<OverheadSourceKind, string> = {
   'claude-local': '#818cf8',
   'user-claude': '#a855f7',
   'managed-policy': '#ec4899',
+  'agents-md': '#fb923c', // WP2 — AGENTS.md directory chain (provider-audience scoped)
   rules: '#f59e0b',
   memory: '#10b981', // legacy (no longer emitted; kept for the union)
   'memory-index': '#10b981', // resident pointer (0 tokens)
@@ -47,6 +48,7 @@ const KIND_LABEL: Record<OverheadSourceKind, string> = {
   'claude-local': 'CLAUDE.local.md (local override)',
   'user-claude': 'User CLAUDE.md (~/.claude)',
   'managed-policy': 'Managed-policy CLAUDE.md (enterprise)',
+  'agents-md': 'AGENTS.md — directory chain, provider-audience scoped (WP2)',
   rules: 'Rules file (.claude/rules/*.md)',
   memory: 'Memory (legacy — no longer emitted)',
   'memory-index': 'Memory index — resident pointer, 0 tokens (body read on demand)',

@@ -31,7 +31,7 @@
 //
 // Pure over (action, injected deps). Deterministic: no clocks, no DB handle held.
 
-import type { AgentRoleLane, BehaviorEvidenceTier } from '../../shared/types';
+import type { AgentRoleLane, BehaviorEvidenceTier, GuidanceCaptureCoverage } from '../../shared/types';
 import type { BehaviorPredicate, BehaviorStore, Lane, MatchCount } from './behavior-store';
 import type { PredictedAction } from './guidance-action-model';
 import { OPTIMIZER_CONFIG } from './optimizer-config';
@@ -134,6 +134,12 @@ export interface OccurrenceVerdict {
   /** `'unavailable'` on every non-`never`/legacy path; `'auditable'` when the
    *  fail-closed gates passed; `'partial'` on a `capture-incomplete` downgrade. */
   evidenceState: EvidenceState;
+  /** WP2 (G2): audience capture-coverage state, stamped ONLY on audience-scoped
+   *  actions (`pa.audienceProviders` present). `observed` = presence, not
+   *  completeness; `complete` requires a measured denominator (window-stream
+   *  enumeration). ONLY `complete` may support `never`/dead — every other state
+   *  forces the `capture-incomplete` downgrade by explicit check. */
+  captureCoverage?: GuidanceCaptureCoverage;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -197,6 +203,45 @@ export interface ClassifyDeps {
   sinceMs?: number;
   /** Override the exposure floors (defaults to OPTIMIZER_CONFIG — the source of truth). */
   config?: { MIN_EXPOSURE_TURNS: number; MIN_STREAMS: number };
+  /** WP2 (G2): the measured-denominator seam. `complete` coverage is emittable
+   *  ONLY through this — the capture source must ENUMERATE the analysis window's
+   *  streams and confirm that every stream whose provider is in the audience is a
+   *  captured stream. Absent (the current production state) ⇒ `complete` is
+   *  unreachable, so every audience-scoped `never` downgrades to
+   *  `capture-incomplete`. This is deliberate fail-closed wiring, not a TODO. */
+  windowStreamEnumeration?: {
+    /** True only when the window's stream population is enumerated AND every
+     *  stream whose provider is in `providers` is captured. */
+    allAudienceStreamsCaptured(providers: string[], opts: { lanes: Lane[]; includeSubagents: boolean; sinceMs?: number }): boolean;
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WP2 (G2) — audience capture-coverage resolution
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Resolve the capture-coverage state for an audience-scoped action.
+ * `capturedProviders` are the providers with ≥1 captured stream in the evidence
+ * window (from `OccurrenceEvidenceV1.captureCoverage.providers`; empty/undefined
+ * when no evidence resolver ran — which reads as `unknown`, never as covered).
+ * `complete` is emitted ONLY when the enumeration callback measures the full
+ * denominator; presence never masquerades as completeness.
+ */
+export function resolveCaptureCoverage(
+  audience: string[] | 'unknown',
+  capturedProviders: string[] | undefined,
+  enumerationComplete: boolean,
+): GuidanceCaptureCoverage {
+  if (audience === 'unknown' || audience.length === 0) return 'unknown';
+  if (capturedProviders === undefined) return 'unknown';
+  const captured = new Set(capturedProviders.map((p) => p.toLowerCase()));
+  const overlap = audience.filter((p) => captured.has(p.toLowerCase()));
+  if (overlap.length === 0) return 'none';
+  if (overlap.length < audience.length) return 'partial';
+  // Every audience provider has ≥1 captured stream — PRESENCE. Completeness
+  // additionally requires the measured denominator.
+  return enumerationComplete ? 'complete' : 'observed';
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -462,6 +507,26 @@ export function classifyAction(pa: PredictedAction, deps: ClassifyDeps): Occurre
     }
   }
 
+  // WP2 (G2) — audience capture-coverage never-gate, by EXPLICIT check (not by
+  // hoping exposure gating catches it). Audience-scoped actions (AGENTS.md et al)
+  // can hold `never` ONLY under a provably `complete` capture cohort: every
+  // stream in the analysis window whose provider is in the audience must be a
+  // captured stream, measurable only through the enumeration seam. `observed`
+  // is presence, never completeness. Legacy actions (no audience) are untouched.
+  let captureCoverage: GuidanceCaptureCoverage | undefined;
+  if (pa.audienceProviders !== undefined) {
+    const audience = pa.audienceProviders;
+    const capturedProviders = evidence ? Object.keys(evidence.captureCoverage.providers) : undefined;
+    const enumerationComplete = audience !== 'unknown' && audience.length > 0
+      && deps.windowStreamEnumeration?.allAudienceStreamsCaptured(
+        audience, { lanes, includeSubagents: includeSubs, sinceMs: deps.sinceMs }) === true;
+    captureCoverage = resolveCaptureCoverage(audience, capturedProviders, enumerationComplete);
+    if (status === 'never' && captureCoverage !== 'complete') {
+      status = 'capture-incomplete';
+      if (evidence) evidenceState = 'partial';
+    }
+  }
+
   // WP-1B: an AMBIGUOUS-mode file-access predicate (empty modes — the instruction's
   // verb did not disambiguate read vs write) may match any touch, but is capped at
   // `inferred` so attribution can never promote it to an observed-safe subtract.
@@ -485,6 +550,7 @@ export function classifyAction(pa: PredictedAction, deps: ClassifyDeps): Occurre
     predicate,
     evidenceState,
   };
+  if (captureCoverage !== undefined) verdict.captureCoverage = captureCoverage;
   if (evidence) verdict.evidence = evidence;
   if (match.lastTsMs != null) verdict.lastTsMs = match.lastTsMs;
   return verdict;
