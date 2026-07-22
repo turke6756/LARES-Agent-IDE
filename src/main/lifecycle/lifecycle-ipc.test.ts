@@ -246,6 +246,54 @@ test("preview with threshold 'never' is empty", async () => {
   assert.deepEqual(p.excluded, []);
 });
 
+// ── Reclaim estimate (System-Memory polish Part 4) ───────────────────────────
+
+test('estimator absent → both reclaim fields null (back-compat)', async () => {
+  const h = makeHarness();
+  assert.equal(h.deps.estimateAgentBytes, undefined);
+  const p = await buildStaleIdlePreview(h.deps);
+  assert.deepEqual(p.eligible.map((e) => e.agentId), ['a1'], 'preview fully functional without an estimator');
+  assert.equal(p.estimatedReclaimBytes, null);
+  assert.equal(p.reclaimEstimateComplete, null);
+});
+
+test('all eligible agents resolved → exact bytes + complete true', async () => {
+  const h = makeHarness();
+  let asked: string[] = [];
+  h.deps.estimateAgentBytes = (ids) => { asked = ids; return { bytes: 1234, complete: true }; };
+  const p = await buildStaleIdlePreview(h.deps);
+  assert.deepEqual(asked, ['a1'], 'the estimator is asked about exactly the eligible set');
+  assert.equal(p.estimatedReclaimBytes, 1234);
+  assert.equal(p.reclaimEstimateComplete, true);
+});
+
+test('one agent unresolved → partial sum + complete false', async () => {
+  const h = makeHarness();
+  h.deps.estimateAgentBytes = () => ({ bytes: 500, complete: false });
+  const p = await buildStaleIdlePreview(h.deps);
+  assert.equal(p.estimatedReclaimBytes, 500);
+  assert.equal(p.reclaimEstimateComplete, false);
+});
+
+test('attribution cold (estimator returns null) → both fields null, preview intact', async () => {
+  const h = makeHarness();
+  h.deps.estimateAgentBytes = () => null;
+  const p = await buildStaleIdlePreview(h.deps);
+  assert.deepEqual(p.eligible.map((e) => e.agentId), ['a1']);
+  assert.equal(p.estimatedReclaimBytes, null);
+  assert.equal(p.reclaimEstimateComplete, null);
+});
+
+test("threshold 'never' returns before the estimator is consulted", async () => {
+  const h = makeHarness({ threshold: 'never' });
+  let called = 0;
+  h.deps.estimateAgentBytes = () => { called++; return { bytes: 9, complete: true }; };
+  const p = await buildStaleIdlePreview(h.deps);
+  assert.equal(called, 0);
+  assert.equal(p.estimatedReclaimBytes, null);
+  assert.equal(p.reclaimEstimateComplete, null);
+});
+
 // ── Settings ─────────────────────────────────────────────────────────────────
 
 function tmpDir(): string {

@@ -38,10 +38,10 @@ function facade(over: Partial<OwnershipReadFacade> & { rows?: OwnershipRow[]; jo
   };
 }
 
-function svc(store: OwnershipReadFacade | null, snapshot: ProcessMemEntry[], opts: { electronProcs?: number; electronBytes?: number } = {}) {
+function svc(store: OwnershipReadFacade | null, snapshot: ProcessMemEntry[], opts: { electronProcs?: number; electronBytes?: number; electronPids?: number[] } = {}) {
   return new AttributionService({
     getStore: () => store,
-    electron: () => ({ processCount: opts.electronProcs ?? 10, workingSetBytes: opts.electronBytes ?? 1 * GiB }),
+    electron: () => ({ processCount: opts.electronProcs ?? 10, workingSetBytes: opts.electronBytes ?? 1 * GiB, pids: opts.electronPids ?? [] }),
     readSnapshot: () => Promise.resolve(makeSnapshot(snapshot)),
     now: () => 12345,
     config: { perAgentBudgetBytes: 4 * GiB, maxOwnedProcesses: 100 },
@@ -86,6 +86,17 @@ test('getFresh refreshes then returns the latest rollup', async () => {
   assert.equal(s.getLatest(), r);
 });
 
+test('electron PIDs resolve commit through the SAME snapshot as CLI trees', async () => {
+  const store = facade({ rows: [row({ agentId: 'a' })], jobPids: { a: [100] } });
+  // Electron pid 50 is in the snapshot, 51 is not → known sum + incomplete.
+  const s = svc(store, [entry(100, 1 * GiB, 2 * GiB), entry(50, 0, 3 * GiB)], { electronPids: [50, 51] });
+  const r = await s.refresh();
+  assert.deepEqual(r.electronCommit, { bytes: 3 * GiB, complete: false });
+  const a = r.perAgent.find((u) => u.agentId === 'a')!;
+  assert.equal(a.cliCommitBytes, 2 * GiB);
+  assert.equal(a.commitComplete, true);
+});
+
 // ── admission helpers ────────────────────────────────────────────────────────────
 
 test('checkLaunchOwnedCap fail-opens on a cold cache', () => {
@@ -125,7 +136,7 @@ test('estimateBytesForPids sums working set from the last snapshot', async () =>
 test('a throwing snapshot reader degrades to an empty rollup, never throws', async () => {
   const s = new AttributionService({
     getStore: () => facade({ rows: [row({ agentId: 'a' })], jobPids: { a: [100] } }),
-    electron: () => ({ processCount: 3, workingSetBytes: 0 }),
+    electron: () => ({ processCount: 3, workingSetBytes: 0, pids: [] }),
     readSnapshot: () => Promise.reject(new Error('wmic down')),
     now: () => 1,
   });

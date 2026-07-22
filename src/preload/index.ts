@@ -112,6 +112,7 @@ const api: IpcApi = {
   memory: {
     getSnapshot: () => ipcRenderer.invoke('memory:get-snapshot'),
     getAttribution: () => ipcRenderer.invoke('memory:attribution'),
+    getSystemView: () => ipcRenderer.invoke('memory:system-view'),
     onPressure: (callback) => {
       const listener = (_event: any, snap: any) => callback(snap);
       ipcRenderer.on('memory:pressure', listener);

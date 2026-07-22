@@ -38,8 +38,9 @@ export interface OwnershipReadFacade {
 export interface AttributionServiceDeps {
   /** The ownership store, or null until startOwnership() arms it. */
   getStore: () => OwnershipReadFacade | null;
-  /** app.getAppMetrics() rollup — Electron process count + working-set bytes. */
-  electron: () => { processCount: number; workingSetBytes: number };
+  /** app.getAppMetrics() rollup — Electron process count + working-set bytes +
+   *  the PID list (commit resolved via the shared per-PID snapshot). */
+  electron: () => { processCount: number; workingSetBytes: number; pids: number[] };
   /** Injectable for tests; defaults to the real Win32_Process snapshot. */
   readSnapshot?: () => Promise<ProcessMemorySnapshot>;
   now?: () => number;

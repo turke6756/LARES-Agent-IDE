@@ -19,7 +19,7 @@ function test(name: string, fn: () => void): void { tests.push({ name, run: fn }
 const GiB = 1024 * 1024 * 1024;
 
 function usage(over: Partial<AgentMemoryUsage>): AgentMemoryUsage {
-  return { agentId: 'a', transport: 'conpty', cliTreeBytes: 0, cliCommitBytes: 0, pidCount: 1, source: 'job', ...over };
+  return { agentId: 'a', transport: 'conpty', cliTreeBytes: 0, cliCommitBytes: 0, commitComplete: true, pidCount: 1, source: 'job', ...over };
 }
 function totals(over: Partial<AppOwnedTotals>): AppOwnedTotals {
   return {

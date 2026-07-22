@@ -11,14 +11,14 @@
 //   • orphaned-process sweep (the existing D4 OrphanSweepPanel, opened here);
 //   • detached-process transparency (Wave 5 registry).
 
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import * as Icons from 'lucide-react';
 import { useDashboardStore } from '../../stores/dashboard-store';
-import type { MemorySnapshotDto, AttributionDto } from '../../../shared/types';
+import type { MemorySnapshotDto, SystemMemoryViewDto, CommitBreakdownDto, CommitCategoryDto } from '../../../shared/types';
 import { formatBytes, formatMinutesToLimit } from './format';
 import OrphanSweepPanel from './OrphanSweepPanel';
 import DetachedProcessesPanel from './DetachedProcessesPanel';
-import StopStaleIdlePanel from './StopStaleIdlePanel';
+import LiveAgentsPanel from './LiveAgentsPanel';
 
 const WARN_PCT = 75;
 const CRITICAL_PCT = 88;
@@ -38,7 +38,7 @@ export default function SystemMemoryView() {
     (s) => s.workspaces.find((w) => w.id === s.selectedWorkspaceId)?.path,
   );
   const [snap, setSnap] = useState<MemorySnapshotDto | null>(null);
-  const [attr, setAttr] = useState<AttributionDto | null>(null);
+  const [view, setView] = useState<SystemMemoryViewDto | null>(null);
   const [showSweep, setShowSweep] = useState(false);
   const history = useRef<HistPoint[]>([]);
   const [, forceTick] = useState(0);
@@ -58,12 +58,18 @@ export default function SystemMemoryView() {
     };
     const poll = () => {
       window.api.memory.getSnapshot().then((s) => { if (s) push(s); }).catch(() => {});
-      window.api.memory.getAttribution().then((a) => { if (live) setAttr(a); }).catch(() => {});
+      window.api.memory.getSystemView().then((v) => { if (live) setView(v); }).catch(() => {});
     };
     poll();
     const id = window.setInterval(poll, POLL_MS);
     const unsub = window.api.memory.onPressure((s) => push(s));
     return () => { live = false; window.clearInterval(id); unsub(); };
+  }, []);
+
+  // Immediate refresh after a sweep stop — the 4 s poll remains as eventual
+  // recovery if this pull races the kill.
+  const refetchView = useCallback(() => {
+    window.api.memory.getSystemView().then((v) => { if (v) setView(v); }).catch(() => {});
   }, []);
 
   const level = snap?.level ?? 'normal';
@@ -100,13 +106,27 @@ export default function SystemMemoryView() {
               value={snap?.commitChargeBytes != null ? formatBytes(snap.commitChargeBytes) : '—'} />
             <Stat label="Commit limit"
               value={snap?.commitLimitBytes != null ? formatBytes(snap.commitLimitBytes) : '—'} />
-            <Stat label="App memory" value={snap ? formatBytes(snap.appMemoryBytes) : '—'} />
-            <Stat label="Live agents" value={snap ? String(snap.liveAgentCount) : '—'} />
+            {/* appMemoryBytes is a WORKING SET — named as such so it is never
+                conflated with the commit breakdown below. */}
+            <Stat label="Electron working set" value={snap ? formatBytes(snap.appMemoryBytes) : '—'} />
+            <span
+              className="tabular-nums"
+              title="Registered non-terminal agents (launching/working/idle/waiting/restarting)"
+            >
+              <span className="text-gray-600">Live agents: </span>
+              {/* Prefer the composed DTO so this number equals the live-agent
+                  table's row count by construction. */}
+              <span className="text-gray-300">{view ? String(view.liveAgentCount) : snap ? String(snap.liveAgentCount) : '—'}</span>
+            </span>
             <Stat label="Agent tabs" value={snap ? String(snap.agentViewCount) : '—'} />
             {snap?.projectedMinutesToLimit != null && (
               <Stat label="Projection" value={formatMinutesToLimit(snap.projectedMinutesToLimit)} />
             )}
           </div>
+
+          {/* Commit-charge breakdown: App / live agents / other-system. Commit
+              bytes ONLY — the working-set stats above never enter this bar. */}
+          <CommitBreakdownBar breakdown={view?.breakdown ?? null} />
         </section>
 
         {/* In-view usage history sparkline. */}
@@ -118,13 +138,11 @@ export default function SystemMemoryView() {
           <Sparkline points={history.current} />
         </section>
 
-        {/* Per-agent attribution. */}
-        <AttributionTable attr={attr} />
-
-        {/* Stale-idle agent lifecycle (§B8) — sits above the orphan sweep: an
-            idle agent is a LIVE process we own, the orphan sweep deals with
-            leftovers from prior runs. Different things, adjacent reclaim. */}
-        <StopStaleIdlePanel />
+        {/* Live agents & memory (Part 5) — registry rows joined to attribution
+            plus the §B8 stale-idle sweep, above the orphan sweep: an idle agent
+            is a LIVE process we own, the orphan sweep deals with leftovers from
+            prior runs. Different things, adjacent reclaim. */}
+        <LiveAgentsPanel view={view} onAfterStop={refetchView} />
 
         {/* Orphaned-process sweep — reuse the D4 panel. */}
         <section className="ui-card p-4 flex items-center gap-3">
@@ -155,6 +173,110 @@ function Stat({ label, value }: { label: string; value: string }) {
       <span className="text-gray-600">{label}: </span>
       <span className="text-gray-300">{value}</span>
     </span>
+  );
+}
+
+/** ≥-qualified byte figure for a category legend: "≥1.2 GB" when the category
+ *  is a known-incomplete sum, "—" when the category itself is unknown. */
+function categoryFigure(cat: CommitCategoryDto | null): string {
+  if (cat == null) return '—';
+  return `${cat.complete ? '' : '≥'}${formatBytes(cat.bytes)}`;
+}
+
+/** Stacked commit-charge breakdown (System-Memory polish task 1).
+ *
+ *  Three renders, honest about what is known:
+ *    - full data: exact stacked bar App / Live agents / Other-system;
+ *    - partial attribution: known segments exact, remainder labeled
+ *      "Other/system + unattributed" with NO percentage;
+ *    - unknown total: no bar, legend-only "system total unknown" line.
+ *  Unknown ≠ zero everywhere: "—" and "≥" qualifiers, never a false 0 B.
+ *
+ *  Exported for direct renderer tests (CommitBreakdownBar.test.tsx). */
+export function CommitBreakdownBar({ breakdown }: { breakdown: CommitBreakdownDto | null }) {
+  if (breakdown == null) {
+    return <div className="mt-3 text-[11px] text-gray-600">attribution loading…</div>;
+  }
+  const { commitChargeBytes, electron, liveAgents, otherSystemBytes, unattributedLiveAgentCount, approximate } = breakdown;
+  const approx = (s: string) => (approximate ? `≈${s}` : s);
+
+  // Unknown total (staticCapsOnly / commit sampler failure): no bar, no
+  // percentages — the known category sums only, "≥" when incomplete.
+  if (commitChargeBytes == null) {
+    return (
+      <div className="mt-3 text-[11px] text-gray-500 tabular-nums">
+        App {categoryFigure(electron)} · Live agents {categoryFigure(liveAgents)} · system total unknown
+      </div>
+    );
+  }
+
+  // Segment widths from RAW bytes (never rounded display values), clamped.
+  const pctOf = (bytes: number) => Math.min(100, Math.max(0, (bytes / commitChargeBytes) * 100));
+  const electronBytes = electron?.bytes ?? 0;
+  const liveBytes = liveAgents?.bytes ?? 0;
+  const exact = otherSystemBytes != null;
+  const remainderBytes = exact
+    ? otherSystemBytes
+    : Math.max(0, commitChargeBytes - electronBytes - liveBytes);
+
+  const segments = [
+    { key: 'app', label: 'App (Electron)', cls: 'bg-accent-blue', bytes: electronBytes, cat: electron },
+    { key: 'agents', label: 'Live agent CLIs', cls: 'bg-accent-purple', bytes: liveBytes, cat: liveAgents },
+  ];
+
+  return (
+    <div className="mt-3">
+      <div className="flex h-3 rounded-full bg-white/10 overflow-hidden">
+        {segments.map((s) => (
+          <div key={s.key} className={s.cls} style={{ width: `${pctOf(s.bytes)}%` }} />
+        ))}
+        <div className="bg-white/25" style={{ width: `${pctOf(remainderBytes)}%` }} />
+      </div>
+      <div className="flex flex-wrap gap-x-4 gap-y-1 mt-1.5 text-[10px] text-gray-500 tabular-nums">
+        {segments.map((s) => (
+          <span key={s.key} className="inline-flex items-center gap-1.5">
+            <span className={`w-2 h-2 rounded-sm ${s.cls} inline-block shrink-0`} />
+            <span>
+              {s.label}{' '}
+              <span className="text-gray-400">
+                {s.cat == null ? '—' : <>{approx(categoryFigure(s.cat))} · {approx(`${pctOf(s.bytes).toFixed(1)}%`)}</>}
+              </span>
+            </span>
+          </span>
+        ))}
+        <span className="inline-flex items-center gap-1.5">
+          <span className="w-2 h-2 rounded-sm bg-white/25 inline-block shrink-0" />
+          {exact ? (
+            <span>
+              Other/system{' '}
+              <span className="text-gray-400">
+                {approx(formatBytes(remainderBytes))} · {approx(`${pctOf(remainderBytes).toFixed(1)}%`)}
+              </span>
+            </span>
+          ) : (
+            // Partial attribution: the remainder contains unattributed agent
+            // memory — no percentage, never presented as purely other processes.
+            <span>Other/system + unattributed <span className="text-gray-400">{approx(formatBytes(remainderBytes))}</span></span>
+          )}
+        </span>
+      </div>
+      {!exact && (unattributedLiveAgentCount > 0 || electron == null) && (
+        <div className="mt-1 text-[10px] text-gray-600">
+          {unattributedLiveAgentCount > 0 && (
+            <>
+              {unattributedLiveAgentCount} live agent{unattributedLiveAgentCount === 1 ? '' : 's'} unattributable
+              (e.g. WSL) — their memory is inside the remainder.
+            </>
+          )}
+          {electron == null && (
+            <>
+              {unattributedLiveAgentCount > 0 ? ' ' : ''}App (Electron) share unknown — its memory is
+              also inside the remainder.
+            </>
+          )}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -204,54 +326,3 @@ function Sparkline({ points }: { points: HistPoint[] }) {
   );
 }
 
-function AttributionTable({ attr }: { attr: AttributionDto | null }) {
-  const rows = useMemo(
-    () => (attr?.perAgent ?? []).slice().sort((a, b) => b.cliTreeBytes - a.cliTreeBytes),
-    [attr],
-  );
-  return (
-    <section className="ui-card p-0 overflow-hidden">
-      <header className="flex items-center gap-2 px-4 py-2.5 border-b border-white/10">
-        <Icons.Users className="w-4 h-4 text-accent-blue" />
-        <h3 className="text-[13px] font-semibold text-gray-100">Per-agent memory</h3>
-        {attr && (
-          <span className="ml-auto text-[11px] text-gray-500 tabular-nums">
-            {attr.totals.totalOwnedProcessCount} procs · {formatBytes(attr.totals.totalOwnedBytes)} owned
-          </span>
-        )}
-      </header>
-      {attr === null && <div className="p-5 text-center text-[12px] text-gray-500">Loading…</div>}
-      {attr !== null && rows.length === 0 && (
-        <div className="p-5 text-center text-[12px] text-gray-500">No attributed agent processes.</div>
-      )}
-      {rows.length > 0 && (
-        <div className="overflow-x-auto">
-          <table className="w-full text-[12px] border-collapse">
-            <thead>
-              <tr className="text-[10px] uppercase tracking-wide text-gray-600">
-                <th className="text-left font-medium px-4 py-1.5">Agent</th>
-                <th className="text-left font-medium px-2 py-1.5">Transport</th>
-                <th className="text-right font-medium px-2 py-1.5">Working set</th>
-                <th className="text-right font-medium px-2 py-1.5">Commit</th>
-                <th className="text-right font-medium px-2 py-1.5">Procs</th>
-                <th className="text-left font-medium px-4 py-1.5">Source</th>
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map((r) => (
-                <tr key={r.agentId} className="border-t border-white/5">
-                  <td className="px-4 py-1.5 font-mono text-gray-200 truncate max-w-[220px]">{r.agentId}</td>
-                  <td className="px-2 py-1.5 text-gray-400">{r.transport}</td>
-                  <td className="px-2 py-1.5 text-right tabular-nums text-gray-300">{formatBytes(r.cliTreeBytes)}</td>
-                  <td className="px-2 py-1.5 text-right tabular-nums text-gray-400">{formatBytes(r.cliCommitBytes)}</td>
-                  <td className="px-2 py-1.5 text-right tabular-nums text-gray-400">{r.pidCount}</td>
-                  <td className="px-4 py-1.5 text-gray-500">{r.source}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
-    </section>
-  );
-}

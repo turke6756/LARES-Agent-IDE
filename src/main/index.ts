@@ -54,6 +54,8 @@ import type { MemorySnapshot, AdmissionDecision } from './watchdog/types';
 // process-memory snapshot, the cached rollup, and the budget/owned-cap admission
 // helpers). Constructed at ready alongside the sampler.
 import { AttributionService } from './watchdog/attribution-service';
+import { usageForAgent } from './watchdog/attribution';
+import { composeSystemMemoryView } from './watchdog/system-memory-view';
 import { parseAnalyticsSnapshotArgv, flushStdio } from './analytics-export/analytics-snapshot-argv';
 import {
   listDetachedProcesses,
@@ -932,6 +934,24 @@ app.whenReady().then(async () => {
           if (!win.isDestroyed()) win.webContents.send(LIFECYCLE_CHANNELS.settingsChanged, s);
         }
       },
+      // Stale-idle reclaim estimate (System-Memory polish Part 4): known
+      // working-set sum + completeness from the attribution cache. Fail-open:
+      // a cold cache (null) leaves preview/stop fully functional.
+      estimateAgentBytes: (ids) => {
+        const r = attributionService?.getLatest();
+        if (!r) return null;
+        let bytes = 0;
+        let complete = ids.length > 0;
+        let any = false;
+        for (const id of ids) {
+          const u = usageForAgent(r, id);
+          if (u && u.pidCount > 0) {
+            bytes += u.cliTreeBytes;
+            any = true;
+          } else complete = false;
+        }
+        return any || ids.length === 0 ? { bytes, complete } : null;
+      },
     };
     registerLifecycleIpc(ipcMain, lifecycleDeps);
     idleSweep = new IdleSweep({ ...lifecycleDeps, powerMonitor });
@@ -956,6 +976,7 @@ app.whenReady().then(async () => {
     };
     registerContextGaugeIpc(ipcMain, contextGaugeDeps);
     apiServer.setContextGaugeDeps(contextGaugeDeps);
+
     // ── D5-lite memory watchdog + admission control (incident-2026-07-11 §5) ──
     // Now that the supervisor + browser manager exist (their live counts feed the
     // sampler), construct the sampler, arm the admission gates, install the D1
@@ -1008,12 +1029,13 @@ app.whenReady().then(async () => {
       getStore: () => supervisorForWatchdog.getOwnershipStore(),
       electron: () => {
         try {
-          const m = app.getAppMetrics();
+          const m = app.getAppMetrics(); // ONE call: count + working set + pids
           return {
             processCount: m.length,
             workingSetBytes: m.reduce((s, p) => s + (p.memory?.workingSetSize ?? 0) * 1024, 0),
+            pids: m.map((p) => p.pid),
           };
-        } catch { return { processCount: 0, workingSetBytes: 0 }; }
+        } catch { return { processCount: 0, workingSetBytes: 0, pids: [] }; }
       },
       log: (m) => console.warn(m),
     });
@@ -1028,12 +1050,31 @@ app.whenReady().then(async () => {
     // Renderer pulls for the status-bar meter / banner / orphan list.
     ipcMain.handle('memory:get-snapshot', () => memorySampler?.getSnapshot() ?? null);
     ipcMain.handle('memory:attribution', () => attributionService?.getFresh() ?? null);
+    // Composed System-Memory view (polish Part 2): live registry rows joined to
+    // the attribution rollup + the commit-charge breakdown. getActiveAgents is
+    // the single live-agent source — the same provider semantics as the
+    // sampler's getLiveAgentCount; ownership rows are never the live set.
+    ipcMain.handle('memory:system-view', async () => {
+      await attributionService?.refresh();
+      return composeSystemMemoryView({
+        listLiveAgents: () =>
+          getActiveAgents().map((a) => ({
+            id: a.id,
+            title: a.title,
+            status: a.status,
+            idleSince: a.idleSince ?? null,
+          })),
+        getAttribution: () => attributionService?.getLatest() ?? null,
+        getSnapshot: () => memorySampler?.getSnapshot() ?? null,
+        now: () => Date.now(),
+      });
+    });
     // Reap-now estimate: best-effort working-set bytes for an orphan candidate's
     // PID set, from the attribution service's last snapshot (budget.ts math).
     ipcMain.handle('memory:reap-estimate', (_e, pids: number[]) =>
       attributionService?.estimateBytesForPids(pids ?? []) ?? 0);
     // Detached-process transparency (§5 Wave 5): list + PID-verify the descriptors
-    // agents self-registered under <workspaceRoot>/.dashboard/detached/. Purely
+    // agents self-registered under <workspaceRoot>/.lares/detached/. Purely
     // read-only; a missing dir yields [] (never throws).
     ipcMain.handle('detached:list', (_e, workspaceRoot: string) => {
       if (typeof workspaceRoot !== 'string' || !workspaceRoot) return [];

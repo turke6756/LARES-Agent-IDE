@@ -164,6 +164,10 @@ export interface StaleIdlePreview {
   eligible: Array<{ agentId: string; idleSince: string }>;
   excluded: Array<{ agentId: string; codes: StopExclusionCode[] }>;
   estimatedReclaimBytes: number | null;
+  /** true ⇔ every eligible agent had a resolved tree in the estimate; false ⇒
+   *  `estimatedReclaimBytes` is a known-partial sum ("at least"); null ⇒ no
+   *  estimate at all (estimator absent / attribution cold). */
+  reclaimEstimateComplete: boolean | null;
 }
 
 export interface LifecycleSettings {
@@ -1814,6 +1818,9 @@ export interface IpcApi {
   memory: {
     getSnapshot: () => Promise<MemorySnapshotDto | null>;
     getAttribution: () => Promise<AttributionDto | null>;
+    /** Composed System-Memory view: live registry rows joined to attribution +
+     *  the commit-charge breakdown (System-Memory polish Part 2). */
+    getSystemView: () => Promise<SystemMemoryViewDto | null>;
     onPressure: (callback: (snap: MemorySnapshotDto) => void) => () => void;
     listOrphans: () => Promise<OrphanCandidateDto[]>;
     reapOrphans: (agentIds: string[]) => Promise<ReapOrphansResultDto[]>;
@@ -3292,6 +3299,56 @@ export interface AppOwnedTotalsDto {
 export interface AttributionDto {
   perAgent: AgentMemoryUsageDto[];
   totals: AppOwnedTotalsDto;
+  at: number;
+}
+
+// ── Composed System-Memory view (System-Memory polish Part 2) ──
+// Structural mirrors of src/main/watchdog/system-memory-view.ts — the renderer
+// imports only from shared. Composed main-side from the live registry
+// (getActiveAgents), the attribution rollup and the sampler snapshot.
+
+/** A commit-byte category: the sum of every PID that resolved, plus whether
+ *  EVERY expected PID resolved. `complete: false` means the true figure is
+ *  ≥ `bytes` — the shortfall must never be attributed to "other/system". */
+export interface CommitCategoryDto { bytes: number; complete: boolean }
+
+export interface LiveAgentMemoryRowDto {
+  agentId: string;
+  title: string;                      // registry title; never blank — falls back to agentId
+  status: string;                     // AgentStatus at composition time
+  idleSince: string | null;           // registry idleSince (SQLite UTC string)
+  transport: 'conpty' | 'wsl' | null; // null ⇒ no ownership row for this live agent
+  source: 'job' | 'tree-walk' | 'none' | null;
+  workingSetBytes: number | null;     // null ⇒ unattributable (no row / source none)
+  commitBytes: number | null;
+  commitComplete: boolean;
+  pidCount: number;
+}
+
+export interface CommitBreakdownDto {
+  commitChargeBytes: number | null;        // null ⇔ sampler commitKnown false
+  electron: CommitCategoryDto | null;
+  liveAgents: CommitCategoryDto | null;    // sum over LIVE rows only
+  unattributedLiveAgentCount: number;      // live rows with commitBytes === null or !commitComplete
+  /** Exact only when charge known AND both categories complete AND every live
+   *  agent attributed; otherwise null — UI labels the remainder
+   *  "Other/system + unattributed". */
+  otherSystemBytes: number | null;
+  /** True when the exact residual was negative within tolerance (clamped), or
+   *  attribution `at` is > 60 s older than the commit sample. */
+  approximate: boolean;
+  attributionAt: number | null;
+  sampleAt: number | null;
+}
+
+export interface SystemMemoryViewDto {
+  liveAgents: LiveAgentMemoryRowDto[]; // exactly one row per registry live agent
+  liveAgentCount: number;              // === liveAgents.length, by construction
+  /** Ownership rows whose agentId is NOT in the live registry (prior-epoch /
+   *  terminal). Kept visible: memory-consuming trees must not silently vanish
+   *  from a memory view — the orphan sweep is where they get reclaimed. */
+  unregisteredTrees: Array<{ agentId: string; transport: string; workingSetBytes: number; commitBytes: number; pidCount: number; source: string }>;
+  breakdown: CommitBreakdownDto;
   at: number;
 }
 

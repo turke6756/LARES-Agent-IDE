@@ -21,6 +21,11 @@ import type { OwnershipRow } from '../supervisor/ownership/types';
  *  Win32 PID) or nothing resolvable. */
 export type AttributionSource = 'job' | 'tree-walk' | 'none';
 
+/** A commit-byte category: the sum of every PID that resolved, plus whether
+ *  EVERY expected PID resolved. `complete: false` means the true figure is
+ *  ≥ `bytes` — the shortfall must never be attributed to "other/system". */
+export interface CommitCategory { bytes: number; complete: boolean }
+
 /** Per-agent memory footprint of the hosted CLI process tree. */
 export interface AgentMemoryUsage {
   agentId: string;
@@ -29,6 +34,9 @@ export interface AgentMemoryUsage {
   cliTreeBytes: number;
   /** Sum of the tree's per-PID commit/private bytes (best-effort proxy). */
   cliCommitBytes: number;
+  /** True iff the tree resolved (source !== 'none') AND every PID in it
+   *  returned commit bytes. WSL rows are always false. */
+  commitComplete: boolean;
   /** Number of live PIDs in the resolved tree. */
   pidCount: number;
   source: AttributionSource;
@@ -49,6 +57,9 @@ export interface AppOwnedTotals {
 export interface AttributionResult {
   perAgent: AgentMemoryUsage[];
   totals: AppOwnedTotals;
+  /** Electron's own commit bytes from the shared snapshot; null when no
+   *  Electron PID was supplied. complete ⇔ every supplied PID resolved. */
+  electronCommit: CommitCategory | null;
   at: number;
 }
 
@@ -68,8 +79,10 @@ export interface AttributionDeps {
   workingSetBytes: (pid: number) => number | null;
   /** Per-PID commit/private bytes; null when unknown. */
   commitBytes: (pid: number) => number | null;
-  /** Electron app-owned processes summary (app.getAppMetrics()). */
-  electron: () => { processCount: number; workingSetBytes: number };
+  /** Electron app-owned processes summary (app.getAppMetrics()). `pids` feeds
+   *  the commit-category rollup through the SAME injected `commitBytes(pid)` as
+   *  the CLI trees — one snapshot, one timestamp, one missing-data behavior. */
+  electron: () => { processCount: number; workingSetBytes: number; pids: number[] };
   now: () => number;
 }
 
@@ -92,6 +105,7 @@ export function computeAttribution(deps: AttributionDeps): AttributionResult {
         transport: 'wsl',
         cliTreeBytes: 0,
         cliCommitBytes: 0,
+        commitComplete: false, // no Win32 PID → commit is unknowable, not zero
         pidCount: 0,
         source: 'none',
       });
@@ -100,28 +114,46 @@ export function computeAttribution(deps: AttributionDeps): AttributionResult {
     const resolved = safe(() => deps.resolveTree(row), { pids: [], source: 'none' as const });
     let treeBytes = 0;
     let treeCommit = 0;
+    let allResolved = true; // a PID whose commitBytes returns null flips this
     for (const pid of resolved.pids) {
       const ws = safe(() => deps.workingSetBytes(pid), null);
       if (ws != null) treeBytes += ws;
       const cm = safe(() => deps.commitBytes(pid), null);
       if (cm != null) treeCommit += cm;
+      else allResolved = false;
       if (!countedPids.has(pid)) {
         countedPids.add(pid);
         ownedCliProcessCount += 1;
         if (ws != null) ownedCliBytes += ws;
       }
     }
+    const source: AttributionSource = resolved.pids.length > 0 ? resolved.source : 'none';
     perAgent.push({
       agentId: row.agentId,
       transport: 'conpty',
       cliTreeBytes: treeBytes,
       cliCommitBytes: treeCommit,
+      commitComplete: resolved.pids.length > 0 && source !== 'none' && allResolved,
       pidCount: resolved.pids.length,
-      source: resolved.pids.length > 0 ? resolved.source : 'none',
+      source,
     });
   }
 
-  const el = safe(() => deps.electron(), { processCount: 0, workingSetBytes: 0 });
+  const el = safe(() => deps.electron(), { processCount: 0, workingSetBytes: 0, pids: [] as number[] });
+  // Electron's commit category, through the SAME commitBytes snapshot as the
+  // CLI trees. No PIDs supplied (getAppMetrics threw / degraded) → null, never
+  // a false "0 B complete".
+  let electronCommit: CommitCategory | null = null;
+  if (el.pids.length > 0) {
+    let bytes = 0;
+    let complete = true;
+    for (const pid of el.pids) {
+      const cm = safe(() => deps.commitBytes(pid), null);
+      if (cm != null) bytes += cm;
+      else complete = false;
+    }
+    electronCommit = { bytes, complete };
+  }
   const totals: AppOwnedTotals = {
     electronProcessCount: el.processCount,
     electronBytes: el.workingSetBytes,
@@ -130,7 +162,7 @@ export function computeAttribution(deps: AttributionDeps): AttributionResult {
     totalOwnedProcessCount: el.processCount + ownedCliProcessCount,
     totalOwnedBytes: el.workingSetBytes + ownedCliBytes,
   };
-  return { perAgent, totals, at: safe(() => deps.now(), 0) };
+  return { perAgent, totals, electronCommit, at: safe(() => deps.now(), 0) };
 }
 
 /** Look up one agent's usage in a computed result (for the per-agent budget gate). */

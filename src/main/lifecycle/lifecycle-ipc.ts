@@ -60,6 +60,11 @@ export interface BulkStopDeps {
   saveSettings(settings: LifecycleSettings): LifecycleSettings;
   /** Push the new settings to EVERY window, not just the sender's. */
   broadcastSettings(settings: LifecycleSettings): void;
+  /** Best-effort reclaim estimate for a set of agents from the latest
+   *  attribution cache. bytes = sum of known working sets (working set is the
+   *  reclaim-relevant figure per attribution.ts); complete ⇔ every requested
+   *  agent had a resolved tree. null ⇒ attribution cold / nothing measurable. */
+  estimateAgentBytes?: (agentIds: string[]) => { bytes: number; complete: boolean } | null;
 }
 
 // ── Request validation ───────────────────────────────────────────────────────
@@ -142,6 +147,7 @@ export async function buildStaleIdlePreview(deps: BulkStopDeps): Promise<StaleId
     eligible: [],
     excluded: [],
     estimatedReclaimBytes: null,
+    reclaimEstimateComplete: null,
   };
   if (staleThresholdMs === null) return preview;
 
@@ -158,6 +164,13 @@ export async function buildStaleIdlePreview(deps: BulkStopDeps): Promise<StaleId
       preview.excluded.push({ agentId: agent.id, codes: e.exclusions });
     }
   }
+  // Best-effort reclaim estimate from the attribution cache (System-Memory
+  // polish Part 4). Policy: known sum + completeness, not all-or-nothing —
+  // "at least ≈X" can't overstate and doesn't discard signal. Preview/stop
+  // stay fully functional when the estimator is absent or attribution is cold.
+  const est = deps.estimateAgentBytes?.(preview.eligible.map((e) => e.agentId)) ?? null;
+  preview.estimatedReclaimBytes = est?.bytes ?? null;
+  preview.reclaimEstimateComplete = est?.complete ?? null;
   return preview;
 }
 

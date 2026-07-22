@@ -50,6 +50,12 @@ const TESTS = [
   'dist/main/main/lifecycle/lifecycle-ipc.test.js',
   // Context Window Warning: per-role gauge-cap settings + resolution.
   'dist/main/main/context-gauge/context-gauge-settings.test.js',
+  // System-Memory polish: commit attribution completeness + composed view DTO
+  // + the getActiveAgents live-registry predicate.
+  'dist/main/main/watchdog/attribution.test.js',
+  'dist/main/main/watchdog/attribution-service.test.js',
+  'dist/main/main/watchdog/system-memory-view.test.js',
+  'dist/main/main/database.active-agents.test.js',
   'dist/main/main/supervisor/initial-user-prompt.test.js',
   'dist/main/main/supervisor/hook-spool-tailer.test.js',
   'dist/main/main/supervisor/send-input-encoder.test.js',
