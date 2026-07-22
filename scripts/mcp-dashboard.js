@@ -132,24 +132,21 @@ const TOOLSET_REGISTRY = {
       handleToolCall: mod.handleCommsToolCall,
     };
   },
-  // WP-F (P5): observability split into `observability-core` (operational status,
+  // WP-F (P5) split observability into `observability-core` (operational status,
   // granted to the supervisor + worker lanes) and `observability-analytics` (the
   // context-optimizer / agent-knowledge / file-heat / skill-usage deep-analytics
-  // surface, supervisor-only). `observability` stays as a backward-compat alias
-  // for the full union so any grant still naming it keeps working (QW1 precedent:
-  // reversible, one-line).
+  // surface, supervisor-only). The analytics toolset has since been RETIRED
+  // outright — all 13 of its tools were removed in favour of the on-demand
+  // snapshot exporter + the `context-analytics` skill, leaving the toolset empty,
+  // so it is unregistered here rather than left as a zero-tool entry. The
+  // /api/context-optimizer/* routes it called are untouched. `observability`
+  // stays as a backward-compat alias so any grant still naming it keeps working
+  // (QW1 precedent: reversible, one-line).
   'observability-core': () => {
     const mod = require('./mcp-tools-observability');
     return {
       getToolDefinitions: mod.getObservabilityCoreToolDefinitions,
       handleToolCall: mod.handleObservabilityCoreToolCall,
-    };
-  },
-  'observability-analytics': () => {
-    const mod = require('./mcp-tools-observability');
-    return {
-      getToolDefinitions: mod.getObservabilityAnalyticsToolDefinitions,
-      handleToolCall: mod.handleObservabilityAnalyticsToolCall,
     };
   },
   observability: () => {

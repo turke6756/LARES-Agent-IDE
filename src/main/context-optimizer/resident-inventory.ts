@@ -33,6 +33,7 @@
 //    grant WRITER (corpus-floor birthday) belongs with config-drift (module 5).
 
 import { createHash } from 'node:crypto';
+import { sectionKeyFor as sectionIdentityKeyFor } from '../../shared/section-identity';
 import type {
   AgentContextOverhead,
   AgentRoleLane,
@@ -292,8 +293,10 @@ export function deriveAnchors(sections: ParsedSection[]): SectionCandidate[] {
 // The §2.5 resident-inventory diff + writer (per target)
 // ─────────────────────────────────────────────────────────────────────────────
 
+// WP5 (G5): delegates to the shared identity helper (moved verbatim; epoch
+// continuity untouched — the composed string is byte-identical).
 function sectionKeyFor(t: { targetType: string; targetKey: string }, rawAnchor: string): string {
-  return `${t.targetType}:${t.targetKey}:${rawAnchor}`;
+  return sectionIdentityKeyFor(t, rawAnchor);
 }
 
 interface OpenEpoch {
@@ -445,6 +448,9 @@ export function reconcileTarget(
 
 // Resident markdown config kinds. Skills (progressive-disclosure) + settings JSON are
 // NOT persona residency and are handled by the file-coverage / skill modules.
+// WP2 (G2): 'agents-md' is DELIBERATELY absent — AGENTS.md is never a
+// Claude-resident target. Its residency/liveness story is provider-audience
+// scoped (guidance-sources.ts) and must not mint Claude config epochs.
 const MARKDOWN_KINDS = new Set<OverheadSourceKind>([
   'agent-claude', 'inherited-claude', 'claude-local', 'user-claude',
   'managed-policy', 'rules', 'memory', 'behavioral', 'import',
@@ -482,6 +488,9 @@ export function collectMarkdownTargets(
       if (!frame.included) continue;
       for (const s of flattenSources(frame.sources)) {
         if (!s.resolvedPath || !MARKDOWN_KINDS.has(s.kind)) continue;
+        // WP2 (G2) belt: AGENTS.md is never a Claude-resident target, even if a
+        // future kind-map change were to slip it past the allowlist above.
+        if (s.kind === ('agents-md' as OverheadSourceKind)) continue;
         if (isExcludedResidentPath(s.resolvedPath)) continue;
         const acc = byPath.get(s.resolvedPath) ?? { lanes: new Set<AgentRoleLane>(), scope: s.sourceScope };
         acc.lanes.add(agent.lane);
@@ -515,7 +524,8 @@ function normalizePathKey(p: string): string { return p.replace(/\\/g, '/'); }
  *  ScaffoldMatcher seam; absent that, they read as user_file (per-path, honest). */
 function classifyPerPathKind(p: string): ConfigSourceKind {
   const lower = normalizePathKey(p).toLowerCase();
-  if (lower.includes('/.dashboard/workers/')) return 'ignored_scaffold';
+  // Both spellings — historical epochs carry the pre-rename `.dashboard`.
+  if (lower.includes('/.lares/workers/') || lower.includes('/.dashboard/workers/')) return 'ignored_scaffold';
   return 'user_file';
 }
 

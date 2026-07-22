@@ -34,14 +34,17 @@ export const DASHBOARD_TOOLSETS: readonly string[] = [
   'orchestration',
   'teams',
   'comms',
-  // WP-F (P5): observability split. A logged analytics tool now resolves to
-  // `observability-analytics` (supervisor-exclusive), so the P2 lane attribution
-  // can infer supervisor for it; `observability-core` stays shared (supervisor +
-  // worker) → no inference. The bare `observability` union is intentionally NOT
-  // listed here so new ingestion resolves to the split names (historical rows keep
-  // their stored `observability` value — they are read from the column, not re-resolved).
+  // WP-F (P5): observability split. `observability-core` is shared (supervisor +
+  // worker) → no lane inference. `observability-analytics` was here too, and was
+  // the one supervisor-EXCLUSIVE observability toolset, so a logged analytics
+  // tool could be lane-inferred to supervisor; it is gone now — its 13 tools were
+  // retired in favour of the on-demand snapshot exporter + the `context-analytics`
+  // skill, so no such tool can be logged again. Historical rows are unaffected:
+  // they keep their stored `observability-analytics` toolset value, which is read
+  // from the column and never re-resolved through this map.
+  // The bare `observability` union is intentionally NOT listed here so new
+  // ingestion resolves to the split names.
   'observability-core',
-  'observability-analytics',
   'notebooks',
   'browser',
   'browser-present',

@@ -122,6 +122,29 @@ export interface FileHeatEntry {
   /** Met the guidance-gap-candidate bar: uncovered ∧ workflow-level artifact ∧ repeated
    *  cross-stream activity (spec 273). A strict subset of `uncovered`. */
   guidanceGapCandidate?: boolean;
+  // ── WP3 (G3) — hot uncovered NON-guidance workflow files (plan WP3 point 1). ──
+  /** Met the hot-uncovered-candidate bar: uncovered ∧ role on the explicit allowlist
+   *  (product-source / test / build-control) ∧ score ≥ HOT_UNCOVERED_MIN_SCORE ∧
+   *  generated/vendor/cache roles excluded ∧ NO guidance file-access prediction
+   *  matches the path (coverageChecks.matched === 0). */
+  hotUncoveredCandidate?: boolean;
+  /** The BOUNDED predicate-sweep record behind the candidate bar. Present on every
+   *  row that cleared the role/score bars (so a near-miss with `matched > 0` is
+   *  disclosed, not silently dropped); `hotUncoveredCandidate` additionally requires
+   *  `matched === 0`. */
+  coverageChecks?: CoverageChecks;
+}
+
+/** WP3 (G3) — bounded disclosure of the guidance-prediction sweep for one path:
+ *  how many path-touch predicates were tested, how many matched, a CAPPED sample of
+ *  predicate refs, and explicit truncation metadata. NEVER the full predicate list. */
+export interface CoverageChecks {
+  totalPredicatesTested: number;
+  matched: number;
+  /** Top-N predicate refs (`<actionId>:<pathGlob>`), deterministically ordered. */
+  sample: string[];
+  truncated: boolean;
+  limit: number;
 }
 
 export interface FileCoverageResult {
@@ -137,6 +160,13 @@ export interface FileCoverageResult {
   operationalNoiseCount?: number;
   /** Rows in `fileHeat` meeting the guidance-gap-candidate bar (spec 273). */
   guidanceGapCandidateCount?: number;
+  /** WP3 (G3) — rows in `fileHeat` meeting the hot-uncovered-candidate bar. */
+  hotUncoveredCandidateCount?: number;
+  /** WP6 (G6) — size of the CLASSIFIED (non-ignored) population BEFORE the top-N
+   *  slice, so the exporter can disclose file-heat truncation machine-readably
+   *  (`populationAvailable`). Ignored paths are excluded by design (they are
+   *  dropped from the rollup, not truncated out of it). */
+  populationSize?: number;
 }
 
 export interface ClassifyDeps {
@@ -283,6 +313,56 @@ export function isOperationalNoiseRole(role: PathRole): boolean {
   return OPERATIONAL_NOISE_ROLES.has(role);
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// WP3 (G3) — hot-uncovered candidate role allowlist (plan WP3 point 1)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** WP3's plan names the allowlist `product-source` / `test` / `build-control`,
+ *  "worker maps to the real enum". The real taxonomy above has no `test` or
+ *  `build-control` role, so the mapping is:
+ *    - `product-source` ⇔ `product-source` (verbatim);
+ *    - `test`           ⇔ `test-or-fixture`. NOTE: test-or-fixture is an
+ *      operational-noise role in the DEFAULT heat view, but the plan EXPLICITLY
+ *      allowlists tests here, so the candidate bar's noise exclusion is the
+ *      plan's own enumerated set (generated/vendor/cache =
+ *      HOT_UNCOVERED_EXCLUDED_ROLES below), not `isOperationalNoiseRole`;
+ *    - `build-control`  ⇔ a `guidance-or-config` row whose BASENAME is a
+ *      build-control file (`isBuildControlBasename`). The whole
+ *      guidance-or-config role is NOT admitted — guidance .md files stay the
+ *      `guidanceGapCandidate` signal's domain (this candidate is the
+ *      NON-guidance one). */
+export const HOT_UNCOVERED_ROLE_ALLOWLIST: ReadonlySet<PathRole> = new Set<PathRole>([
+  'product-source',
+  'test-or-fixture',
+]);
+
+/** Explicitly excluded generated/vendor/cache roles — never a candidate, even if a
+ *  future allowlist edit overlaps. */
+export const HOT_UNCOVERED_EXCLUDED_ROLES: ReadonlySet<PathRole> = new Set<PathRole>([
+  'build-generated',
+  'dependency-or-vendor',
+  'skill-owned',
+  'external',
+  'unknown',
+]);
+
+const BUILD_CONTROL_BASENAMES =
+  /^(package\.json|tsconfig(\.[^/]+)?\.json|jsconfig\.json|pyproject\.toml|cargo\.toml|go\.mod|makefile|dockerfile|justfile|cmakelists\.txt|\.nvmrc|\.npmrc)$/;
+const BUILD_CONTROL_CONFIG_EXT = /\.(config|conf)\.(js|cjs|mjs|ts|json)$/;
+
+/** Is a (normalized) basename a build-control file (the plan's `build-control`)? */
+export function isBuildControlBasename(basename: string): boolean {
+  return BUILD_CONTROL_BASENAMES.test(basename) || BUILD_CONTROL_CONFIG_EXT.test(basename);
+}
+
+/** The WP3 role bar: allowlisted role, or a build-control guidance/config file;
+ *  generated/vendor/cache roles explicitly out. */
+export function isHotUncoveredEligibleRole(role: PathRole, basename: string): boolean {
+  if (HOT_UNCOVERED_EXCLUDED_ROLES.has(role)) return false;
+  if (HOT_UNCOVERED_ROLE_ALLOWLIST.has(role)) return true;
+  return role === 'guidance-or-config' && isBuildControlBasename(basename);
+}
+
 export interface PathRoleDeps {
   classifyPathMutability: (absPath: string) => MutabilityClass;
   /** Skills visible to this lane make a path `skill-owned`. Optional. */
@@ -302,7 +382,9 @@ export interface PathRoleVerdict {
 const BUILD_GENERATED_SEG = /(^|\/)(dist|build|out|coverage|\.next|\.turbo|\.cache|caches|__pycache__)\//;
 const VENDOR_SEG = /(^|\/)(node_modules|vendor|site-packages|\.venv|bower_components)\//;
 const TEST_SEG = /(^|\/)(__tests__|tests?|spec|fixtures?|__fixtures__|__mocks__|__snapshots__)\//;
-const SKILLS_SEG = /(^|\/)(\.claude|\.dashboard)\/.*(^|\/)?skills\//;
+// `.lares` is the live state-dir name; `.dashboard` stays recognized because
+// historical touch records permanently carry the old name.
+const SKILLS_SEG = /(^|\/)(\.claude|\.lares|\.dashboard)\/.*(^|\/)?skills\//;
 const SOURCE_EXTS = [
   '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.py', '.rb', '.go', '.rs',
   '.java', '.kt', '.swift', '.c', '.cc', '.cpp', '.h', '.hpp', '.cs', '.php',
@@ -349,11 +431,11 @@ export function classifyPathRole(path: string, deps: PathRoleDeps): PathRoleVerd
     return { role: 'dependency-or-vendor', reason: 'generated-vendor path mutability (plugin/cache)' };
   }
 
-  // 3. skill-owned — under a lane-visible skill root, or a `.claude`/`.dashboard` skills tree.
+  // 3. skill-owned — under a lane-visible skill root, or a `.claude`/`.lares` (or legacy `.dashboard`) skills tree.
   const laneSkills = (deps.skillIndex ?? []).filter((s) => !deps.lane || s.lanes.includes(deps.lane!));
   const owningSkill = laneSkills.find((s) => underNormRoot(n, s.skillRoot));
   if (owningSkill) return { role: 'skill-owned', reason: `under skill root '${owningSkill.skillName}'` };
-  if (SKILLS_SEG.test(n)) return { role: 'skill-owned', reason: 'under a `.claude`/`.dashboard` skills tree' };
+  if (SKILLS_SEG.test(n)) return { role: 'skill-owned', reason: 'under a `.claude`/`.lares` skills tree' };
 
   // 4. external — another project's file (only when a workspace root is known to compare against).
   if (deps.workspaceRoot && looksAbsolute(n)
@@ -533,6 +615,14 @@ export function classifyFileCoverage(
   const topN = deps.topN ?? OPTIMIZER_CONFIG.FILE_HEAT_TOP_N;
   const bucketCounts = EMPTY_BUCKETS();
   const heat: FileHeatEntry[] = [];
+  // ── WP3 (G3): the lane's guidance file-access predictions, tested against every
+  // candidate-eligible path. Conservative: ALL path-touch predicates for the lane,
+  // regardless of derivability or epoch state — a prediction that MIGHT cover the
+  // path disqualifies the candidate (fail-closed for proposing new guidance).
+  // Deterministically ordered so `coverageChecks.sample` is byte-stable. ──
+  const pathTouchPredicates = predictedActions
+    .filter((a) => a.kind === 'path-touch' && a.lanes.includes(lane) && typeof a.params.pathGlob === 'string')
+    .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
   const roleDeps: PathRoleDeps = {
     classifyPathMutability: deps.classifyPathMutability,
     skillIndex, lane,
@@ -559,6 +649,31 @@ export function classifyFileCoverage(
       role.role === 'guidance-or-config' &&
       t.distinctStreams >= OPTIMIZER_CONFIG.REPEAT_MIN_STREAMS &&
       t.reads + t.writes + t.executes >= OPTIMIZER_CONFIG.REPEAT_MIN;
+    // ── WP3 (G3) hot-uncovered candidate bar: uncovered ∧ allowlisted role
+    // (generated/vendor/cache explicitly out) ∧ score ≥ disclosed threshold ∧ NO
+    // guidance file-access prediction matches. `coverageChecks` (bounded, with
+    // truncation metadata) is attached to every row that cleared the role/score
+    // bars, so a near-miss (`matched > 0`) is disclosed rather than dropped. ──
+    const score = canonicalHeatScore(scoreComponents);
+    const hotEligible =
+      v.bucket === 'uncovered' &&
+      isHotUncoveredEligibleRole(role.role, basenameOf(normPath(t.path))) &&
+      score >= OPTIMIZER_CONFIG.HOT_UNCOVERED_MIN_SCORE;
+    let coverageChecks: CoverageChecks | undefined;
+    let hotUncoveredCandidate = false;
+    if (hotEligible) {
+      const limit = OPTIMIZER_CONFIG.COVERAGE_CHECKS_SAMPLE_LIMIT;
+      const matched = pathTouchPredicates
+        .filter((a) => globMatch(String(a.params.pathGlob), t.path)).length;
+      coverageChecks = {
+        totalPredicatesTested: pathTouchPredicates.length,
+        matched,
+        sample: pathTouchPredicates.slice(0, limit).map((a) => `${a.id}:${String(a.params.pathGlob)}`),
+        truncated: pathTouchPredicates.length > limit,
+        limit,
+      };
+      hotUncoveredCandidate = matched === 0;
+    }
     heat.push({
       pathDisplay: normPath(t.path),
       pathHash: sha256Hex(normPath(t.path)),
@@ -571,9 +686,11 @@ export function classifyFileCoverage(
       role: role.role,
       roleReason: role.reason,
       operationalNoise,
-      score: canonicalHeatScore(scoreComponents),
+      score,
       scoreComponents,
       guidanceGapCandidate,
+      hotUncoveredCandidate,
+      ...(coverageChecks ? { coverageChecks } : {}),
     });
   }
 
@@ -582,7 +699,14 @@ export function classifyFileCoverage(
   const uncoveredHot = fileHeat.filter((h) => h.coverage === 'uncovered');
   const operationalNoiseCount = fileHeat.filter((h) => h.operationalNoise).length;
   const guidanceGapCandidateCount = fileHeat.filter((h) => h.guidanceGapCandidate).length;
-  return { lane, fileHeat, bucketCounts, uncoveredHot, operationalNoiseCount, guidanceGapCandidateCount };
+  const hotUncoveredCandidateCount = fileHeat.filter((h) => h.hotUncoveredCandidate).length;
+  return {
+    lane, fileHeat, bucketCounts, uncoveredHot,
+    operationalNoiseCount, guidanceGapCandidateCount, hotUncoveredCandidateCount,
+    // WP6 (G6): the pre-slice population — `fileHeat.length < populationSize` IS the
+    // top-N truncation, disclosed rather than silent.
+    populationSize: heat.length,
+  };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

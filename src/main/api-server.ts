@@ -67,7 +67,9 @@ import { querySkillUsage, type QueryDb } from './skill-analytics/queries';
 import { getSharedParseManager } from './skill-analytics/parse-manager-factory';
 import { queryMcpToolUsage } from './skill-analytics/mcp-tool-usage-queries';
 import { runKnowledgeExtract } from './agent-knowledge/knowledge-extract-runner';
-import type { AgentRoleLane, BehaviorEvidenceTier, ContextOptimizerProposalKind, ContextOptimizerResult, AgentKnowledgeGraph, SkillUsageResult, McpToolUsageRollupDTO, WorkspaceScopeMode, PathRole } from '../shared/types';
+import { runOverheadScan } from './context-overhead/ipc-deps';
+import { buildOverheadSnapshot, scrubPaths } from './context-overhead/overhead-dto';
+import type { AgentRoleLane, BehaviorEvidenceTier, ContextOptimizerProposalKind, ContextOptimizerResult, AgentKnowledgeGraph, SkillUsageResult, McpToolUsageRollupDTO, WorkspaceScopeMode, PathRole, OverheadModel } from '../shared/types';
 
 /** Machine-readable failure classes the top-level error serializer is allowed
  *  to expose in JSON bodies. Errors thrown inside routes can carry raw Node
@@ -108,7 +110,18 @@ const API_ERROR_CODES = new Set<string>([
   // Full-D5 (Wave 4) adds `memory-budget` — the per-agent budget refusal, same
   // family, surfaced identically to the API/MCP caller.
   'memory-critical', 'memory-capacity', 'memory-budget',
+  // GET /api/context-overhead — a request that resolves to no workspace scope.
+  'invalid-argument',
 ]);
+
+/** Strip absolute paths out of an error message before it crosses the API
+ *  boundary. A failed overhead scan can surface an unreadable-file error whose
+ *  message embeds a full path; the route must not become a path-disclosure side
+ *  channel. Delegates to the one redaction implementation shared with the
+ *  exporter rather than keeping a second copy of the patterns. */
+function sanitizeErrorMessage(msg: string): string {
+  return scrubPaths(msg || '');
+}
 
 /** Context-brick Inc 1 — the identity an inbound request asserts via headers,
  *  resolved once per request between the admission gate and route(). This is an
@@ -575,6 +588,19 @@ export class ApiServer {
     });
   }
 
+  /** Overhead scan scoped to the caller's workspace. READ-ONLY: runOverheadScan is a
+   *  filesystem + estimator composition with no DB writes (ipc-deps.ts:251-275). */
+  private runOverheadForRequest(identity: IdentityContext, url: URL): OverheadModel {
+    const workspaceId = this.resolveWorkspaceScope(identity, url.searchParams.get('workspaceId'));
+    if (!workspaceId) {
+      throw Object.assign(
+        new Error('context-overhead requires a resolvable workspace scope'),
+        { statusCode: 400, code: 'invalid-argument' },
+      );
+    }
+    return runOverheadScan(workspaceId);
+  }
+
   /** R2 WP-4B (Step 3) — the live BehaviorStore backing the cluster-exemplar drill. Built
    *  UNSCOPED (`new BehaviorStore(getDb())`), mirroring how optimizer-assemble builds the
    *  store for `improvisationClusters`, so the drill sees the SAME folded members the
@@ -862,6 +888,34 @@ export class ApiServer {
         limit: this.intParam(url, 'limit'),
         cursor: url.searchParams.get('cursor') ?? undefined,
       });
+    }
+
+    // ══ Context-Overhead read surface — closes the IPC-only gap (work item §4.1). ══
+    // Same GET-only, read-only envelope as the optimizer family: 405 on non-GET.
+    // Reuses runOverheadScan() unchanged — the same call the panel's IPC handler makes
+    // (ipc-handlers.ts:512). No write path exists here.
+    if (path === '/api/context-overhead') {
+      if (method !== 'GET') {
+        throw Object.assign(
+          new Error('This is a read-only GET surface; agents propose edits via chat, not by writing here.'),
+          { statusCode: 405, code: 'method-not-allowed' },
+        );
+      }
+      try {
+        return buildOverheadSnapshot(
+          this.runOverheadForRequest(identity, url),
+          this.buildRedactionRoots(identity, url),
+        );
+      } catch (err) {
+        const e = err as Error & { statusCode?: number };
+        if (e.statusCode === 403) throw e;            // scope violation must not be masked
+        if (e.statusCode === 400) throw e;
+        return errResponse({
+          code: 'INVALID_ARGUMENT',
+          message: sanitizeErrorMessage(e.message),
+          retriable: false,
+        });
+      }
     }
 
     // GET /api/agents/:id/messages — read structured agent chat
@@ -1240,9 +1294,11 @@ export class ApiServer {
 
     // ── Orchestration routes ─────────────────────────────────────────────
     // Dashboard-owned orchestration runs (groupthink). The MCP supervisor
-    // proxies list_orchestrations / run_orchestration / get_orchestration_run /
-    // abort_orchestration here. `/catalog` is matched BEFORE the `:runId` regex
-    // so the literal "catalog" isn't captured as a runId.
+    // proxies run_orchestration / get_orchestration_run / abort_orchestration
+    // here. `/catalog` is matched BEFORE the `:runId` regex so the literal
+    // "catalog" isn't captured as a runId. (The `list_orchestrations` MCP tool
+    // was deleted in the context-overhead pass — the catalog route stays, it is
+    // just no longer exposed as a resident tool schema.)
 
     // GET /api/orchestrations/catalog — descriptors for the catalog
     if (method === 'GET' && path === '/api/orchestrations/catalog') {

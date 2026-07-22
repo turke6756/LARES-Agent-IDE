@@ -51,6 +51,7 @@ import type { MemorySnapshot, AdmissionDecision } from './watchdog/types';
 // process-memory snapshot, the cached rollup, and the budget/owned-cap admission
 // helpers). Constructed at ready alongside the sampler.
 import { AttributionService } from './watchdog/attribution-service';
+import { parseAnalyticsSnapshotArgv, flushStdio } from './analytics-export/analytics-snapshot-argv';
 import {
   listDetachedProcesses,
   detachedDirFor,
@@ -124,6 +125,36 @@ process.on('unhandledRejection', (reason) => {
 process.stdout?.on?.('error', () => {});
 process.stderr?.on?.('error', () => {});
 
+// ── WP1 (G1): headless analytics-snapshot CLI mode ──────────────────────────
+// `<binary> --analytics-snapshot export --json …` runs the snapshot CLI inside
+// this compiled app binary (asar-safe, packaged builds included) and exits.
+// Evaluated BEFORE the single-instance lock, any BrowserWindow, and all
+// supervisor construction: the export must run while a dashboard instance is
+// open (no lock contention) and must never spawn UI. Exit codes pass through
+// verbatim (0 ok / 2 partial / 4 cold index) via app.exit — app.quit() always
+// exits 0 and would silently erase them.
+const analyticsSnapshotArgv = parseAnalyticsSnapshotArgv(process.argv);
+if (analyticsSnapshotArgv !== null) {
+  const finishSnapshotCli = (code: number): void => {
+    process.exitCode = code;
+    void flushStdio().then(() => app.exit(code));
+  };
+  app.whenReady()
+    .then(() => {
+      // Lazy require so normal startup never pays for the exporter machinery
+      // (and snapshot mode stays decoupled from the UI import graph above).
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { runSnapshotCli } = require('./analytics-export/analytics-snapshot-cli') as
+        typeof import('./analytics-export/analytics-snapshot-cli');
+      return runSnapshotCli(analyticsSnapshotArgv);
+    })
+    .then(finishSnapshotCli)
+    .catch((err: Error) => {
+      process.stderr.write(`analytics-snapshot: fatal: ${err.message}\n`);
+      finishSnapshotCli(1);
+    });
+}
+
 // Electron 41/Chromium 130+ blocks file://→http://127.0.0.1 iframe loads via
 // Private Network Access preflights. Disable PNA and insecure-loopback checks
 // for our locally-spawned Jupyter server embed. Must run before app.ready.
@@ -195,19 +226,23 @@ let planPaneManager: PlanPaneManager | null = null;
 // B2 D5: per-workspace `plans/` watcher (sole `plans/` fs subscription owner, F-C).
 let plansWatcher: PlansWatcher | null = null;
 
-// Single-instance lock — prevent duplicate windows
-const gotTheLock = app.requestSingleInstanceLock();
-if (!gotTheLock) {
-  console.log('Another instance is already running — exiting.');
-  app.quit();
-}
-app.on('second-instance', () => {
-  // Focus the existing window when a second instance tries to launch
-  if (mainWindow) {
-    if (mainWindow.isMinimized()) mainWindow.restore();
-    mainWindow.focus();
+// Single-instance lock — prevent duplicate windows. Skipped in analytics-
+// snapshot mode (WP1): the headless CLI must neither steal the lock from a
+// running dashboard nor be refused by it.
+if (analyticsSnapshotArgv === null) {
+  const gotTheLock = app.requestSingleInstanceLock();
+  if (!gotTheLock) {
+    console.log('Another instance is already running — exiting.');
+    app.quit();
   }
-});
+  app.on('second-instance', () => {
+    // Focus the existing window when a second instance tries to launch
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.focus();
+    }
+  });
+}
 
 // Register media protocol before app is ready.
 // WP0.3 / M8 (plans/embedded-browser-safety-deepdive.md): no `bypassCSP` —
@@ -579,6 +614,9 @@ function handleShellRenderProcessGone(): void {
 }
 
 app.whenReady().then(async () => {
+  // WP1: the analytics-snapshot branch above owns this launch end-to-end —
+  // no window, no supervisor, no servers.
+  if (analyticsSnapshotArgv !== null) return;
   // Strip any frame-blocking headers from Jupyter responses. Don't add CORS
   // headers here — `Access-Control-Allow-Origin: *` combined with
   // `Access-Control-Allow-Credentials: true` is an invalid pair that Chromium

@@ -209,6 +209,34 @@ export interface Workspace {
   lastOpenedAt: string | null;
 }
 
+// ── WP1 (G1): installation-owned snapshot launcher ──
+/** `.lares/installation.json` — the workspace's pointer back to the Lares
+ *  installation that manages it. Written at workspace registration and
+ *  refreshed on every lane launch (the unconditional workspace-script refresh
+ *  path); healed by full-payload comparison whenever any field other than
+ *  `writtenAt` differs from the current installation. Consumed at runtime by
+ *  `.lares/scripts/analytics-snapshot.mjs`, which spawns
+ *  `invocation.command` with `invocation.argsPrefix + argv` (array args, no
+ *  shell — spaces-in-path safe). */
+export interface InstallationDescriptor {
+  descriptorVersion: number;
+  /** 'source' = dev checkout (command is the installation's Electron binary,
+   *  argsPrefix carries the absolute dist CLI path); 'packaged' = installed
+   *  build (command is the app binary, argsPrefix is ['--analytics-snapshot']). */
+  mode: 'source' | 'packaged';
+  invocation: {
+    command: string;
+    argsPrefix: string[];
+  };
+  installRoot: string;
+  appVersion: string;
+  /** WSL-spawnable form of `invocation.command` (e.g. /mnt/c/...), present on
+   *  Windows installations so the shim works from inside a WSL distro. */
+  wsl?: { commandWslPath: string };
+  /** Diagnostic only — excluded from the heal comparison. */
+  writtenAt: string;
+}
+
 // ── B2: Plans data layer ──
 export type PlanFormat = 'html' | 'md' | string;
 
@@ -1728,9 +1756,59 @@ export interface TokenEstimate {
   approximate: boolean;        // true unless method === 'anthropic-count-tokens'
 }
 
+// ── WP2 (G2) — provider-aware guidance-source model ──────────────────────────
+// AGENTS.md becomes a first-class guidance surface WITHOUT touching Claude
+// walk-up semantics. Every guidance file carries WHO loads it
+// (`audienceProviders`), UNDER WHICH model it applies (`applicability`), and HOW
+// confident we are in the loading semantics claim. `'unknown'` audiences can
+// never support `complete` capture coverage nor a resolved recommendation
+// target — the explicit, disclosed state, never a silent default.
+
+export type GuidanceFileKind = 'claude-md' | 'claude-local-md' | 'agents-md';
+
+/** How a guidance file reaches an agent's context:
+ *  - `walk-up-chain`   — the Claude CLAUDE.md walk-up (UNCHANGED semantics).
+ *  - `directory-chain` — AGENTS.md on the chain from workspace root to the
+ *    launch cwd of a captured stream; deeper files override applicable parent
+ *    guidance. Applicability is never inferred from launch cwd alone for
+ *    below-cwd files.
+ *  - `inventory-only`  — a below-cwd / off-chain file: costed and listed (WP7),
+ *    NEVER fed to per-agent costing or liveness until a captured task/file
+ *    scope proves applicability. */
+export type GuidanceApplicabilityModel = 'walk-up-chain' | 'directory-chain' | 'inventory-only';
+
+export interface GuidanceSource {
+  /** Absolute path of the guidance file. */
+  path: string;
+  fileKind: GuidanceFileKind;
+  /** Provider identifiers ('claude', 'codex', …) whose loading of this file is
+   *  documented for the lane context, or the explicit literal 'unknown'. */
+  audienceProviders: string[] | 'unknown';
+  applicability: {
+    model: GuidanceApplicabilityModel;
+    /** The next guidance file UP the same chain (directory-chain only). */
+    chainParent?: string;
+  };
+  /** Confidence in the loading-semantics claim behind `audienceProviders`. */
+  loadingSemanticsConfidence: 'documented' | 'assumed' | 'unknown';
+}
+
+/** WP2 capture-coverage state for audience-scoped liveness records.
+ *  `observed` = ≥1 captured stream whose provider is in the audience (PRESENCE,
+ *  not completeness); `partial`/`none` per measured overlap; `complete` is
+ *  emitted ONLY when a measured denominator exists (the capture source
+ *  enumerates the analysis window's streams). Only `complete` may support a
+ *  dead verdict — every other state forces the fail-closed
+ *  `capture-incomplete` downgrade. */
+export type GuidanceCaptureCoverage = 'complete' | 'observed' | 'partial' | 'none' | 'unknown';
+
 export type OverheadSourceKind =
   | 'agent-claude' | 'inherited-claude' | 'claude-local' | 'user-claude'
   | 'managed-policy' | 'rules' | 'memory' | 'behavioral'
+  // WP2 (G2): an AGENTS.md on the root→cwd directory chain, applicable to this
+  // agent's provider. Only emitted for agents whose provider is in the file's
+  // documented audience — never a Claude-resident target (resident-inventory).
+  | 'agents-md'
   // Memory costing split (Wave-2 §1), mirroring skill-header/skill-body. `memory-index`
   // = resident head actually injected (0 today: autoMemoryEnabled:false + manual read);
   // `memory-body` = on-demand pool (measured size, NOT injected each session). Legacy
@@ -1781,6 +1859,10 @@ export interface OverheadSource {
   mutable: 'user-owned' | 'scaffold-managed' | 'generated-vendor';
   children?: OverheadSource[]; // @import subgraph nested under the importing source
   warnings?: string[];
+  // WP2 (G2): the provider-aware guidance-source record behind this row. Populated
+  // by the analyzer for CLAUDE-family and agents-md sources; optional so external
+  // fixtures compile unchanged.
+  guidanceSource?: GuidanceSource;
 }
 
 // Section weight status (Wave-2 req 3). SIX values — never collapse to binary dead/live.
@@ -1809,13 +1891,73 @@ export interface ConfigSectionWeight {
   weightClass: SectionWeightClass;
   // Structural-resolution facts ONLY. Feeds the tooltip. Never itself a verdict.
   evidence: string[];
+  // WP2 (G2): the guidance source this section was cut from. Optional so
+  // pre-existing fixtures compile; the classifier populates it whenever the
+  // owning OverheadSource carries one.
+  guidanceSource?: GuidanceSource;
+  // WP5 (G5, v2-optional): the shared section-identity key
+  // (`${targetType}:${targetKey}:${rawAnchor}`, shared/section-identity.ts) —
+  // the SAME key occurrence verdicts carry (`sourceSectionKey`), so the
+  // behavior join is a key-equality join, never a reconstruction. Embeds an
+  // absolute path; DTO projections strip it (overhead-dto redactRollup).
+  sectionKey?: string;
+  // WP5 (G5, v2-optional): the SEPARATE behavior axis (section-liveness.ts).
+  // Structural `weightClass` is untouched — a structurally-broken + observed
+  // section exports BOTH axes. Absent ⇒ the behavior join did not run / could
+  // not key this section (never a claim of deadness).
+  behaviorStatus?: SectionBehaviorStatus;
+  // WP5 (G5, v2-optional): per-provider-cohort statuses — ALWAYS exported
+  // alongside `behaviorStatus` when the join ran (cohort disagreement forces
+  // the top-level status to 'mixed', but the map keeps the per-cohort truth).
+  behaviorStatusByCohort?: Record<string, SectionBehaviorStatus>;
+}
+
+// WP5 (G5) — the behavior-status axis for config sections. STRICT lattice
+// (section-liveness.ts): `dead` requires every analyzable node dead via the
+// fail-closed never-gates AND captureCoverage `complete` AND zero
+// unmatchable/unobservable nodes; anything less fails closed.
+export type SectionBehaviorStatus =
+  | 'live' | 'dead' | 'mixed' | 'unobservable'
+  | 'capture-incomplete' | 'insufficient-evidence' | 'not-analyzed';
+
+/** WP5 (G5, v2-optional): one joined behavior record per section identity —
+ *  identifiers + counts only (redaction-safe by construction; the embedded
+ *  `sectionKey` path is redacted/stripped at every emission boundary). */
+export interface SectionBehaviorRecord {
+  sectionKey: string;
+  behaviorStatus: SectionBehaviorStatus;
+  behaviorStatusByCohort: Record<string, SectionBehaviorStatus>;
+  nodeCounts: {
+    total: number;
+    observed: number;
+    /** `never` verdicts that PASSED the fail-closed never-gates (`evidenceState
+     *  === 'auditable'`) — the only nodes that may support dead. */
+    deadFailClosed: number;
+    unobservable: number;
+    captureIncomplete: number;
+    /** Actions with no verdict (analysis gap) — bars `dead`, disclosed. */
+    unpaired: number;
+  };
 }
 
 export interface ConfigWeightRollup {
   sections: ConfigSectionWeight[];
   // Token totals bucketed by status; all six keys always present (0 when empty) so the UI
   // never has to guess a missing bucket.
+  // WP2 (G2): this rollup NEVER sums across `fileKind` — it covers only the
+  // Claude-config sections (the pre-WP2 population). AGENTS.md sections appear
+  // exclusively in `tokensByClassByFileKind['agents-md']`.
   tokensByClass: Record<SectionWeightClass, number>;
+  // WP2 (G2, v2-optional): per-fileKind buckets. Keys are GuidanceFileKind values
+  // plus 'claude-config' for legacy non-GuidanceSource config surfaces
+  // (rules/settings). Consumers must never sum buckets across keys.
+  tokensByClassByFileKind?: Record<string, Record<SectionWeightClass, number>>;
+  // WP5 (G5, v2-optional): token totals bucketed by the SEPARATE behavior axis
+  // (config-weight `rollupTokensByBehavior`, parallel to `tokensByClass`).
+  // Present only after the section-liveness join ran. Sections without a
+  // joined `behaviorStatus` count under 'not-analyzed'; agents-md sections are
+  // excluded (never summed across fileKind), mirroring `tokensByClass`.
+  tokensByBehavior?: Record<SectionBehaviorStatus, number>;
 }
 
 export interface InheritanceFrame {
@@ -1881,6 +2023,14 @@ export interface AgentContextOverhead {
   onDemandTotal?: TokenEstimate;
   // Section-level weight classification for this agent's resident config (§D).
   configWeight?: ConfigWeightRollup;
+  // WP2 (G2): every guidance source composed for this agent — the Claude walk-up
+  // chain (unchanged semantics) plus the AGENTS.md directory chain. Includes
+  // chain files NOT applicable to this agent's provider (they are listed but
+  // never costed); optional so external fixtures compile.
+  guidanceSources?: GuidanceSource[];
+  // WP2 (G2): the provider identifier this agent's lane context runs under
+  // ('claude', 'codex', …). Drives audience-filtered per-agent costing.
+  provider?: string;
   exactness: 'exact' | 'mixed' | 'estimated';
   warnings: string[];
 }
@@ -1927,7 +2077,10 @@ export type KnowledgeSourceRole =
   | 'agent-claude'      // this worker template's own CLAUDE.md
   | 'workspace-claude'  // repo-root CLAUDE.md (frame.dir === workspaceRoot)
   | 'ancestor-claude'   // other inherited CLAUDE.md up the walk-up
-  | 'user-claude' | 'managed' | 'import' | 'skill' | 'mcp' | 'memory' | 'other';
+  | 'user-claude' | 'managed' | 'import' | 'skill' | 'mcp' | 'memory'
+  // WP2 (G2): an applicable AGENTS.md on the root→cwd directory chain.
+  | 'agents-md'
+  | 'other';
 
 // A byte-span back into the source file. `lineEnd` powers the WP4 highlight (a
 // heading spans to the next same-or-higher heading; a bullet/path is a single line).
@@ -1967,6 +2120,10 @@ export interface KnowledgeNode {
   sourceKind?: OverheadSourceKind;       // exact walk-up kind
   behavior?: KnowledgeBehaviorEvidence;  // WP3 — load-bearing vs stale
   fileReferenceStats?: KnowledgeFileReferenceStats; // WP3 (file-reference nodes only)
+  // WP2 (G2): the owning guidance source's audience — providers documented to
+  // load the file this node came from, or the explicit 'unknown'. Absent on
+  // nodes from sources without a GuidanceSource record (MCP rows, fixtures).
+  audienceProviders?: string[] | 'unknown';
 }
 
 export interface KnowledgeSourceFile {
@@ -2526,6 +2683,58 @@ export interface OccurrenceEvidenceDTO {
  *  non-`never` rows that carry no behavior audit trail. */
 export type ProposalEvidenceState = 'auditable' | 'partial' | 'unavailable';
 
+// ─────────────────────────────────────────────────────────────────────────────
+// WP3 (G3) — friction → recommendation chain, joinable evidence only.
+//
+// A `RecommendationDraft` is a template-constrained, human-review-required draft
+// attached to an ADD proposal. Honesty boundaries (plan WP3):
+//   - `claim` is rendered from a deterministic template; every substituted slot
+//     mechanically cites a row, and a denylist of causal tokens ("because",
+//     "in order to", "so that") is test-enforced. NO causal/intent language.
+//   - `evidence` entries are SAME-SURFACE (optimizer) rows joined by
+//     `generationId` + row ids. Cross-surface evidence is barred at construction
+//     until WP8 provenance exists.
+//   - `command_family` evidence may only support workspace-level candidates
+//     (`target.unresolved` — never a specific file) until WP9's
+//     `associatedCommandFamilies` join lands (generationId-gated, prospective).
+//   - The target-selection policy consumes WP2 `GuidanceSource.audienceProviders`:
+//     a file target only when the observing cohort maps to exactly ONE applicable
+//     guidance source; ambiguous/unknown → `{ unresolved, reason }`. NEVER a
+//     CLAUDE.md default.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export type RecommendationEvidenceKind =
+  | 'file-heat' | 'coverage-check' | 'phrase-gap' | 'bypass' | 'command_family';
+
+/** One joinable evidence entry: rows on the SAME optimizer surface, joined by
+ *  `generationId` + row ids. Nothing else (no free text, no cross-surface refs). */
+export interface RecommendationEvidence {
+  kind: RecommendationEvidenceKind;
+  rowIds: string[];
+  generationId: string;
+  /** WP8 (v2-optional, capability 'surface-provenance'): the comparabilityKey of
+   *  the surface the cited rows live on — stamped by the analytics exporter at
+   *  snapshot time (all draft evidence is optimizer-surface by construction).
+   *  Does NOT lift WP3's cross-surface bar; a future cross-surface join would
+   *  have to match this key. */
+  comparabilityKey?: string;
+}
+
+export type RecommendationTarget =
+  | { file: string; section?: string }
+  | { unresolved: true; reason: string };
+
+export interface RecommendationDraft {
+  target: RecommendationTarget;
+  /** Template-constrained claim — every slot cites a row; causal tokens denied. */
+  claim: string;
+  evidence: RecommendationEvidence[];
+  /** Optional deterministic template output — never free-form prose. */
+  suggestedBulletText?: string;
+  /** ALWAYS true: no draft is ever auto-applied. */
+  humanReviewRequired: true;
+}
+
 export interface ContextOptimizerProposal {
   id: string;
   kind: ContextOptimizerProposalKind;
@@ -2599,6 +2808,10 @@ export interface ContextOptimizerProposal {
    *  `GET /api/context-optimizer/proposals/:id/cluster-exemplars`. Present only on a
    *  rollup proposal that has drillable members. */
   clusterExemplarRef?: string;
+  /** WP3 (G3) — template-constrained, human-review-required recommendation draft
+   *  with joinable same-surface evidence. Present only on ADD proposals whose
+   *  evidence rows exist on this analysis generation. Additive + optional. */
+  recommendationDraft?: RecommendationDraft;
 }
 
 /** R2 WP-4B (Phase 4) — benefit model for improve-lever proposals. The magnitude orders
@@ -2718,6 +2931,15 @@ export interface FileHeatRollupEntry {
    *  view (build-generated / dependency-or-vendor / test-or-fixture). Kept in diagnostics;
    *  surfaced only under `includeOperationalNoise` (spec 271). */
   operationalNoise?: boolean;
+  /** WP3 (G3) — hot UNCOVERED workflow file on the explicit role allowlist whose path
+   *  matched NO guidance file-access prediction (coverageChecks.matched === 0). The
+   *  ADD-candidate signal behind file-targeted recommendation drafts. */
+  hotUncoveredCandidate?: boolean;
+  /** WP3 (G3) — the BOUNDED record of the predicate sweep behind the candidate bar:
+   *  totals + a capped sample of predicate refs + truncation metadata, never the full
+   *  predicate list. Inlined shape (shared/ stays dependency-free — cf. `mutable`). */
+  coverageChecks?: { totalPredicatesTested: number; matched: number; sample: string[];
+                     truncated: boolean; limit: number };
 }
 
 /** WP-E (P4) suppress-only diagnostics — a SUBTRACT the engine chose NOT to surface as
@@ -2854,9 +3076,22 @@ export interface ContextOptimizerResult {
   meta: { tierGroups: BehaviorEvidenceTier[]; unverifiedSuppressedCount: number;
     /** WP-4A (Phase 4): workspace-scope disclosure for the file-heat surface. Absent on
      *  a run with no workspace scope (honest lane-global heat). */
-    fileHeatScope?: FileHeatScopeMeta };
+    fileHeatScope?: FileHeatScopeMeta;
+    /** WP3 (G3): the analysis-generation id every `recommendationDraft.evidence` entry
+     *  in THIS result is keyed by (the join key for same-surface evidence rows).
+     *  Present only when ≥1 proposal carries a draft (honest absence). */
+    recommendationGenerationId?: string;
+    /** WP6 (G6): total CLASSIFIED (non-ignored) file-heat population across lanes
+     *  BEFORE the per-lane top-N slice — the exporter's `populationAvailable`.
+     *  Present only when EVERY lane with coverage disclosed its pre-slice
+     *  population (honest absence: a partially-known total would understate). */
+    fileHeatPopulation?: number };
   /** WP-E (P4) suppress-only guardrail + sample-gate diagnostics (additive). */
   diagnostics?: ContextOptimizerDiagnostic[];
+  /** WP5 (G5, v2-optional): occurrence verdicts joined per section identity —
+   *  the input to the config-weight behavior-axis annotation (section-liveness).
+   *  Present only when ≥1 section-keyed action was analyzed (honest absence). */
+  sectionBehavior?: SectionBehaviorRecord[];
 }
 
 export type ContextOptimizerQueryResult =

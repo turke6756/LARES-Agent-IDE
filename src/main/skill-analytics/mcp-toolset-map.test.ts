@@ -114,28 +114,52 @@ test('plans tools map to the plans toolset', () => {
   assert.equal(m.resolve('mcp__agent-dashboard__list_agents'), 'observability-core');
 });
 
-// WP-F (P5) split: DASHBOARD_TOOLSETS lists the two observability halves and NOT
-// the pre-split `observability` union, so analytics tools resolve to
-// `observability-analytics` (supervisor-exclusive → P2 lane inference works).
-test('DASHBOARD_TOOLSETS splits observability into core + analytics (WP-F)', () => {
+// WP-F (P5) split: DASHBOARD_TOOLSETS lists `observability-core` and NOT the
+// pre-split `observability` union. Its sibling `observability-analytics` was
+// retired (all 13 tools deleted) and is no longer canonical either.
+test('DASHBOARD_TOOLSETS carries observability-core, and neither the union nor the retired analytics half', () => {
   assert.ok(DASHBOARD_TOOLSETS.includes('observability-core'), 'observability-core must be canonical');
-  assert.ok(DASHBOARD_TOOLSETS.includes('observability-analytics'), 'observability-analytics must be canonical');
   assert.ok(!DASHBOARD_TOOLSETS.includes('observability'), 'the pre-split observability union must NOT be a canonical reverse-map toolset');
+  assert.ok(!DASHBOARD_TOOLSETS.includes('observability-analytics'), 'the retired analytics toolset must NOT be canonical — no tool can be logged under it again');
 });
 
-test('WP-F split: a core tool and an analytics tool resolve to their respective halves', () => {
+test('a core tool resolves to observability-core', () => {
   const splitDefs: ToolsetDefsLike = {
     defsFor(t) {
       return t === 'observability-core'
-        ? [{ name: 'list_agents' }, { name: 'get_context_stats' }]
-        : t === 'observability-analytics'
-          ? [{ name: 'get_file_heat' }, { name: 'get_skill_usage' }]
-          : null;
+        ? [{ name: 'list_agents' }, { name: 'read_agent_chat' }]
+        : null;
     },
   };
   const m = buildMcpToolsetReverseMap(splitDefs);
   assert.equal(m.resolve('mcp__agent-dashboard__list_agents'), 'observability-core');
-  assert.equal(m.resolve('mcp__agent-dashboard__get_file_heat'), 'observability-analytics');
+});
+
+test('a retired analytics tool no longer resolves to any toolset', () => {
+  // Built over the REAL canonical toolset list (not a hand-written stand-in), so
+  // this fails the day one of the 13 is re-registered somewhere without a
+  // deliberate decision. Historical usage rows are unaffected — they carry their
+  // stored `observability-analytics` value and are read from the column, never
+  // re-resolved through this map.
+  const realDefs: ToolsetDefsLike = {
+    defsFor(t) {
+      return t === 'observability-core'
+        ? [{ name: 'list_agents' }, { name: 'read_agent_chat' }]
+        : t === 'observability-analytics'
+          ? [{ name: 'get_file_heat' }, { name: 'get_skill_usage' }]  // would-be, if still registered
+          : null;
+    },
+  };
+  // Restricted to the CANONICAL list: `observability-analytics` is absent from it,
+  // so defsFor is never consulted for it and its tools stay unresolved.
+  const m = buildMcpToolsetReverseMap(realDefs, { toolsets: DASHBOARD_TOOLSETS });
+  for (const retired of ['get_file_heat', 'get_skill_usage']) {
+    assert.equal(
+      m.resolve(`mcp__agent-dashboard__${retired}`), null,
+      `${retired} is retired and must not resolve to a toolset`,
+    );
+  }
+  assert.equal(m.resolve('mcp__agent-dashboard__list_agents'), 'observability-core');
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);

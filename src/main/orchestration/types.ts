@@ -4,7 +4,9 @@ export type OrchestrationName = 'groupthink';
 export type OrchestrationMode = 'serial' | 'parallel';
 export type RunStatus = 'starting' | 'running' | 'complete' | 'stalled' | 'aborted' | 'error';
 
-/** Catalog entry returned by list_orchestrations. */
+/** Catalog entry returned by GET /api/orchestrations/catalog. (The
+ *  `list_orchestrations` MCP tool that used to front this was deleted in the
+ *  context-overhead pass; the route and this type remain.) */
 export interface OrchestrationDescriptor {
   name: OrchestrationName;
   title: string;

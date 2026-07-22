@@ -73,9 +73,12 @@ check('grant topology: exclusive toolsets map to their single lane', () => {
   assert.equal(exclusiveLaneForToolset('plans', grants), 'supervisor');
   assert.equal(exclusiveLaneForToolset('plans-read', grants), 'worker');
   assert.equal(exclusiveLaneForToolset('browser', grants), 'researcher');
-  // WP-F (P5): observability-analytics is granted to the supervisor lane ONLY, so
-  // an analytics tool call can be inferred to supervisor from the grant topology.
-  assert.equal(exclusiveLaneForToolset('observability-analytics', grants), 'supervisor');
+  // WP-F (P5) made observability-analytics supervisor-exclusive so an analytics
+  // call could be inferred to supervisor. That toolset is now RETIRED and granted
+  // to no lane, so it is no longer exclusive to anything — see the dedicated
+  // check below. `orchestration` and `plans` still carry the supervisor-exclusive
+  // case above, so the tier-3 mechanic itself stays covered.
+  assert.equal(exclusiveLaneForToolset('observability-analytics', grants), null);
 });
 
 check('grant topology: multi-lane toolsets are NOT exclusive (gating invariant)', () => {
@@ -138,11 +141,20 @@ check('tier 3: exclusive-grant inference with basis + reason', () => {
   assert.match(o.reason!, /granted to exactly one lane \(supervisor\)/);
 });
 
-check('tier 3 (WP-F): an observability-analytics call with no agent/lane infers supervisor', () => {
+check('tier 3: a RETIRED toolset is never inferred — a historical analytics row stays unattributed', () => {
+  // observability-analytics was retired (its 13 tools deleted). Historical usage
+  // rows still carry the stored toolset string, so this classifier will keep
+  // seeing it — and must NOT infer supervisor from a grant topology that no
+  // longer contains it. Inferring from a stale grant would silently backdate
+  // today's topology onto old rows.
   const o = classifyAttribution({ hasAgent: false, explicitLane: null, toolset: 'observability-analytics' }, grants);
-  assert.equal(o.tier, 'lane-inferred-from-current-grant');
-  assert.equal(o.lane, 'supervisor');
-  assert.match(o.reason!, /granted to exactly one lane \(supervisor\)/);
+  assert.equal(o.tier, 'unattributed');
+  assert.equal(o.lane, UNATTRIBUTED_LANE);
+  // An explicit lane on the row is still honoured — retirement costs us the
+  // inference, not the recorded facts.
+  const explicit = classifyAttribution({ hasAgent: false, explicitLane: 'supervisor', toolset: 'observability-analytics' }, grants);
+  assert.equal(explicit.tier, 'lane-attributed-explicit');
+  assert.equal(explicit.lane, 'supervisor');
 });
 
 check('tier 3 gating: multi-lane toolset is NEVER inferred (stays unattributed)', () => {

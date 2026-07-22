@@ -14,11 +14,35 @@ import { resolveWorkspaceForCwd, WORKSPACE_LINEAGE_VERSION, type WorkspaceRecord
 let db: Database.Database;
 let dbPath: string;
 
-function getDbPath(): string {
+/** Pure path computation — NO side effects. Split out of getDbPath() so the
+ *  read-only analytics path cannot create the AppData directory (plan §2.1). */
+export function getDbPathExisting(): string {
   const appData = process.env.APPDATA || path.join(process.env.HOME || '', '.config');
-  const dir = path.join(appData, 'AgentDashboard');
+  return path.join(appData, 'AgentDashboard', 'dashboard.db');
+}
+
+function getDbPath(): string {
+  const dbFile = getDbPathExisting();
+  const dir = path.dirname(dbFile);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  return path.join(dir, 'dashboard.db');
+  return dbFile;
+}
+
+/**
+ * Read-only, query-only open for the analytics exporter (plan §2.1). Never
+ * creates the directory or the file, never migrates, never changes journal mode
+ * (a second read-only connection coexists with the running app's WAL database).
+ */
+export function initDatabaseReadOnly(): void {
+  dbPath = getDbPathExisting();
+  db = new Database(dbPath, { readonly: true, fileMustExist: true });
+  db.pragma('query_only = ON');
+  db.pragma('foreign_keys = ON');
+}
+
+/** Close the module singleton. Generalizes the former test-only seam. */
+export function closeDatabase(): void {
+  db?.close();
 }
 
 export function initDatabase(): void {
@@ -1638,7 +1662,7 @@ function run(sql: string, params: any[] = []): void {
 
 /** Test seam — reset the module singleton cleanly (B2 A6). */
 export function closeDatabaseForTests(): void {
-  db?.close();
+  closeDatabase();
 }
 
 // ── B2: Plans data layer (P1-01) ──

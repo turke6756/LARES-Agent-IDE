@@ -28,6 +28,10 @@ export interface LiveOptimizerAnalyzeDeps {
   generatedAtIso: string;
   nowMs: number;
   query?: ContextOptimizerQuery;
+  /** 'skip' suppresses the one-shot cold-start epoch backfill (the only writer on
+   *  this path), making the whole analyze provably non-writing. Exporter-only;
+   *  never exposed over IPC or HTTP (no route reads this from a query param). */
+  backfillMode?: 'run' | 'skip';
 }
 
 /**
@@ -36,7 +40,12 @@ export interface LiveOptimizerAnalyzeDeps {
  * runOptimizerPipeline (via runOptimizerAnalyze), unchanged.
  */
 export function runLiveOptimizerAnalyze(deps: LiveOptimizerAnalyzeDeps): ContextOptimizerResult {
-  const base = { generatedAtIso: deps.generatedAtIso, nowMs: deps.nowMs, query: deps.query };
+  const base = {
+    generatedAtIso: deps.generatedAtIso,
+    nowMs: deps.nowMs,
+    query: deps.query,
+    ...(deps.backfillMode ? { backfillMode: deps.backfillMode } : {}),
+  };
   if (!deps.workspaceId) {
     return runOptimizerAnalyze(base);
   }

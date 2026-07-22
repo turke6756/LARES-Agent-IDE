@@ -39,11 +39,13 @@
 
 import * as path from 'node:path';
 import type {
-  AgentRoleLane, ContextOptimizerQuery, ContextOptimizerResult,
+  AgentRoleLane, ContextOptimizerQuery, ContextOptimizerResult, GuidanceSource,
   ResidentAsset, ResidentAssetUsage,
   FileTouchScope, FileTouchScopeCounts, WorkspaceAttributionBreakdown, WorkspaceAttributionTier,
 } from '../../shared/types';
 import { BehaviorStore, type Lane, type QueryDb } from './behavior-store';
+import { streamAgentIdentityJoin } from './stream-identity';
+import { classifyAccessOp } from './behavior-sequences';
 import {
   runEpochBackfill,
   type EpochBackfillOutcome,
@@ -240,7 +242,7 @@ export function makeProductionEvidenceResolver(db: QueryDb): EvidenceResolver {
 // ─────────────────────────────────────────────────────────────────────────────
 // SEAM #2 — ScaffoldConstantBridge production impl.
 //
-// A resident file that is gitignored/generated (a `.dashboard/…` scaffold copy)
+// A resident file that is gitignored/generated (a `.lares/…` scaffold copy)
 // has no git history of its OWN, but it MIRRORS a managed constant in
 // `src/shared/constants.ts` (SUPERVISOR_AGENT_MD, WORKER_CLAUDE_MD, the SKILL.md
 // constants, …). The backfill's git resolver dates such a section from the
@@ -505,16 +507,13 @@ export interface FileTouchRow {
 // the dropped/proxy counts are reported so the shrunken dataset is disclosed honestly.
 
 /** LEFT joins so a file_touch row keeps its COUNT even when no session/agent/workspace
- *  resolves (unattributed stays first-class — CLAUDE.md shared-cwd invariant). */
+ *  resolves (unattributed stays first-class — CLAUDE.md shared-cwd invariant).
+ *  WP9: the session→agent leg is the pinned identity join, now provided by the
+ *  shared stream-identity helper so this site and behavior-sequences cannot drift. */
 const FILE_TOUCH_JOINS = `
   FROM behavior_events ev
   LEFT JOIN stream_lane_stats sls ON sls.stream_id = ev.stream_id
-  LEFT JOIN (
-    SELECT session_id, MIN(dashboard_agent_id) AS dashboard_agent_id
-    FROM agent_sessions GROUP BY session_id
-  ) asx ON asx.session_id = ev.session_id
-  LEFT JOIN agents ag ON ag.id = asx.dashboard_agent_id
-`;
+${streamAgentIdentityJoin('ev', 'asx', 'ag')}`;
 
 /** The workspace-tier CASE (precedence strongest real identity first) — parity with the
  *  MCP-usage classifier. `workspace-explicit` is reserved (launch metadata not yet wired). */
@@ -709,8 +708,11 @@ export function aggregateFileTouches(rows: FileTouchRow[]): FileTouch[] {
     if (!r.path) continue;
     let acc = byPath.get(r.path);
     if (!acc) { acc = { reads: 0, writes: 0, executes: 0, streams: new Set() }; byPath.set(r.path, acc); }
-    if (r.accessMode === 'executed') acc.executes++;
-    else if (r.accessMode === 'write') acc.writes++;
+    // WP9: THE file-coverage op mapping, extracted to behavior-sequences so the
+    // sequence miner reuses it byte-for-byte rather than reinventing it.
+    const op = classifyAccessOp(r.accessMode);
+    if (op === 'execute') acc.executes++;
+    else if (op === 'write') acc.writes++;
     else acc.reads++; // read (and any other non-exec/non-write access) counts as a read
     if (r.streamId) acc.streams.add(r.streamId);
   }
@@ -903,6 +905,11 @@ export interface RawLaneInputs {
   //    optimizer-assemble from the TokenEstimator + residentTargets.
   residentSectionTextAt?: (absPath: string, line: number) => string | null;
   estimateTokens?: (text: string) => number;
+  // ── WP3 (G3) recommendation-draft target policy inputs (both optional; absent ⇒
+  //    every draft target is honestly `{ unresolved, reason }` — never a CLAUDE.md
+  //    default). Populated by the caller that composed WP2 guidance sources.
+  guidanceSources?: GuidanceSource[];
+  observedProviders?: string[];
 }
 
 /**
@@ -999,6 +1006,8 @@ export function assembleLaneInput(
     residentSectionTextAt: raw.residentSectionTextAt,
     estimateTokens: raw.estimateTokens,
     capabilityFamilyUsageFor,
+    guidanceSources: raw.guidanceSources,
+    observedProviders: raw.observedProviders,
   };
 }
 
@@ -1024,6 +1033,10 @@ export interface OptimizerPipelineDeps {
   evidenceResolver?: EvidenceResolver;
   /** Epoch → birth confidence lookup for the classifier (optional). */
   epochConfidenceFor?: (epochId: string) => 'high' | 'low' | null;
+  /** 'skip' suppresses the one-shot cold-start epoch backfill (the only writer on
+   *  this path). Exporter-only; never exposed over IPC or HTTP. Default 'run'
+   *  preserves today's behavior exactly. */
+  backfillMode?: 'run' | 'skip';
 }
 
 export interface OptimizerPipelineOutcome {
@@ -1039,11 +1052,17 @@ export interface OptimizerPipelineOutcome {
  */
 export function runOptimizerPipeline(deps: OptimizerPipelineDeps): OptimizerPipelineOutcome {
   // ── STEP 1 — one-shot cold-start backfill (MUST precede classification). ──
-  const backfill = runEpochBackfill(deps.backfillTargets, {
-    db: deps.db,
-    resolver: deps.birthdayResolver,
-    nowMs: deps.nowMs,
-  });
+  // `backfillMode:'skip'` is the read-only exporter's opt-out: it is the ONLY
+  // writer on this path, so skipping it makes the whole analyze non-writing. The
+  // exporter refuses to snapshot a cold DB rather than freeze the degraded
+  // (`insufficient-exposure`) analysis this skip would otherwise produce.
+  const backfill: EpochBackfillOutcome = deps.backfillMode === 'skip'
+    ? { ran: false, results: [] }
+    : runEpochBackfill(deps.backfillTargets, {
+      db: deps.db,
+      resolver: deps.birthdayResolver,
+      nowMs: deps.nowMs,
+    });
 
   // ── STEP 2 — build the classifier deps over the real DB (seam #3 default). ──
   const store = new BehaviorStore(deps.db);

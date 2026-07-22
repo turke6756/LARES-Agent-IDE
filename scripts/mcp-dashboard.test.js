@@ -90,15 +90,12 @@ test('notebooks,comms,observability exposes exactly those toolsets, not orchestr
     'execute_cell',
     'execute_notebook',
     'execute_range',
-    'get_context_stats',
     'get_kernel_state',
     'get_my_context',
-    'get_team',
     'get_usage_limits',
     'interrupt_kernel',
     'list_agents',
     'list_my_agents',
-    'list_teams',
     'list_templates',
     'open_file_in_view',
     'read_agent_chat',
@@ -107,20 +104,9 @@ test('notebooks,comms,observability exposes exactly those toolsets, not orchestr
     'restart_kernel',
     'save_continuation_brick',
     'send_message_to_agent',
-    // WP7 context-optimizer read-only agent surface (additive to observability).
-    'get_context_optimizer_proposals',
-    'get_context_optimizer_proposal',
-    'get_context_optimizer_proposal_evidence',
-    'get_context_optimizer_cluster_exemplars',
-    'get_context_optimizer_analyzability',
-    'get_improvement_proposals',
-    'get_improvement_proposal',
-    'get_skill_usage',
-    'get_skill_usage_detail',
-    'get_mcp_tool_usage',
-    'get_agent_knowledge',
-    'get_agent_knowledge_detail',
-    'get_file_heat',
+    // The WP7 context-optimizer read-only agent surface used to be additive to
+    // `observability` here. Those 13 tools are RETIRED (see RETIRED_ANALYTICS_TOOLS
+    // below) — the `observability` alias now resolves to the core surface alone.
   ].sort());
   assert.ok(!names.includes('launch_agent'));
   assert.ok(!names.some((name) => name.startsWith('browser_')));
@@ -134,16 +120,21 @@ test('notebooks,comms,observability exposes exactly those toolsets, not orchestr
   assert.strictEqual(api.calls.length, 0);
 });
 
-// ── WP-F (P5): observability split into core + analytics ──
+// ── WP-F (P5) observability split, and the retirement of the analytics half ──
 
 const OBSERVABILITY_CORE_TOOLS = [
-  'get_context_stats', 'get_my_context', 'get_team', 'get_usage_limits',
-  'list_agents', 'list_my_agents', 'list_teams', 'list_templates',
+  'get_my_context', 'get_usage_limits',
+  'list_agents', 'list_my_agents', 'list_templates',
   'open_file_in_view', 'read_agent_chat', 'read_agent_files_touched',
   'read_agent_log', 'save_continuation_brick',
 ].sort();
 
-const OBSERVABILITY_ANALYTICS_TOOLS = [
+/** The 13 tools that made up the `observability-analytics` toolset, retired in
+ *  favour of the on-demand analytics snapshot exporter + the `context-analytics`
+ *  skill. This list is deliberately KEPT so the guards below can assert the
+ *  retirement is total — that no grant, alias, or registry entry can reach any of
+ *  them — instead of the list simply disappearing along with the coverage. */
+const RETIRED_ANALYTICS_TOOLS = [
   'get_agent_knowledge', 'get_agent_knowledge_detail',
   'get_context_optimizer_analyzability',
   'get_context_optimizer_cluster_exemplars',
@@ -153,67 +144,79 @@ const OBSERVABILITY_ANALYTICS_TOOLS = [
   'get_mcp_tool_usage', 'get_skill_usage', 'get_skill_usage_detail',
 ].sort();
 
-test('observability-core exposes exactly the operational tools, NOT the analytics tools', async () => {
+test('observability-core exposes exactly the operational tools', async () => {
   const proxy = loadProxy('observability-core');
   const names = namesOf(proxy.getToolDefinitions());
   assert.deepStrictEqual(names, OBSERVABILITY_CORE_TOOLS);
-  for (const analytics of OBSERVABILITY_ANALYTICS_TOOLS) {
-    assert.ok(!names.includes(analytics), `observability-core must NOT expose ${analytics}`);
-  }
-  // Belt-and-suspenders: an analytics tool is not routable under the core-only grant.
-  const api = fakeApi();
-  const result = await proxy.handleToolCall('get_file_heat', {}, api);
-  assert.deepStrictEqual(result, {
-    content: [{ type: 'text', text: 'Unknown tool: get_file_heat' }],
-    isError: true,
-  });
-  assert.strictEqual(api.calls.length, 0, 'no HTTP call for an analytics tool under observability-core');
 });
 
-test('observability-analytics exposes exactly the deep-analytics tools, NOT the operational core tools', async () => {
+test('the `observability-analytics` toolset is UNREGISTERED — the name resolves to nothing', async () => {
+  // The retirement removed all 13 of its tools, so the toolset would have been an
+  // empty entry; it was unregistered instead. An unknown toolset name must not
+  // silently smuggle in some other surface.
   const proxy = loadProxy('observability-analytics');
-  const names = namesOf(proxy.getToolDefinitions());
-  assert.deepStrictEqual(names, OBSERVABILITY_ANALYTICS_TOOLS);
-  for (const core of OBSERVABILITY_CORE_TOOLS) {
-    assert.ok(!names.includes(core), `observability-analytics must NOT expose ${core}`);
-  }
-  // A core tool is not routable under the analytics-only grant.
-  const api = fakeApi();
-  const result = await proxy.handleToolCall('list_agents', {}, api);
-  assert.deepStrictEqual(result, {
-    content: [{ type: 'text', text: 'Unknown tool: list_agents' }],
-    isError: true,
-  });
-  assert.strictEqual(api.calls.length, 0);
+  assert.deepStrictEqual(
+    namesOf(proxy.getToolDefinitions()), [],
+    'a retired toolset name must expose zero tools, not fall back to another toolset',
+  );
 });
 
-test('WORKER grant (comms,observability-core,browser-present,plans-read) exposes NO analytics tools', async () => {
+test('every retired analytics tool is unreachable under EVERY grant that could have carried it', async () => {
+  const grants = [
+    'observability',                    // the backward-compat alias (was the union)
+    'observability-core',
+    'observability-analytics',          // the retired name itself
+    'observability,observability-core,observability-analytics',
+    'orchestration,comms,observability-core,plans,browser-present',      // supervisor
+    'comms,observability-core,browser-present,plans-read',               // worker
+  ];
+  for (const grant of grants) {
+    const proxy = loadProxy(grant);
+    const names = namesOf(proxy.getToolDefinitions());
+    for (const retired of RETIRED_ANALYTICS_TOOLS) {
+      assert.ok(
+        !names.includes(retired),
+        `grant '${grant}' still advertises retired analytics tool ${retired}`,
+      );
+      // Not merely unadvertised — not routable, and it must make NO HTTP call.
+      // (The /api/context-optimizer/* routes still exist for the exporter, so a
+      // surviving handler case would silently keep working. This is the guard.)
+      const api = fakeApi();
+      const result = await proxy.handleToolCall(retired, {}, api);
+      assert.deepStrictEqual(
+        result,
+        { content: [{ type: 'text', text: `Unknown tool: ${retired}` }], isError: true },
+        `grant '${grant}' still ROUTES retired analytics tool ${retired}`,
+      );
+      assert.strictEqual(api.calls.length, 0, `${retired} under '${grant}' still issued an HTTP call`);
+    }
+  }
+});
+
+test('SUPERVISOR grant keeps its operational surface after the analytics retirement', async () => {
+  const proxy = loadProxy('orchestration,comms,observability-core,plans,browser-present');
+  const names = namesOf(proxy.getToolDefinitions());
+  for (const kept of ['list_agents', 'read_agent_chat', 'get_my_context', 'launch_agent', 'create_plan']) {
+    assert.ok(names.includes(kept), `supervisor must keep ${kept}`);
+  }
+});
+
+test('WORKER grant is unchanged by the retirement and keeps operational observability', async () => {
   const proxy = loadProxy('comms,observability-core,browser-present,plans-read');
   const names = namesOf(proxy.getToolDefinitions());
-  for (const analytics of OBSERVABILITY_ANALYTICS_TOOLS) {
-    assert.ok(!names.includes(analytics), `worker lane must NOT receive analytics tool ${analytics}`);
-  }
-  // But it still gets the operational core observability tools.
   assert.ok(names.includes('list_agents'), 'worker keeps operational observability (list_agents)');
   assert.ok(names.includes('read_agent_chat'), 'worker keeps operational observability (read_agent_chat)');
 });
 
-test('SUPERVISOR grant keeps BOTH halves: core + analytics tools present', async () => {
-  const proxy = loadProxy('orchestration,comms,observability-core,observability-analytics,plans,browser-present');
-  const names = namesOf(proxy.getToolDefinitions());
-  assert.ok(names.includes('get_file_heat'), 'supervisor keeps analytics (get_file_heat)');
-  assert.ok(names.includes('get_skill_usage'), 'supervisor keeps analytics (get_skill_usage)');
-  assert.ok(names.includes('list_agents'), 'supervisor keeps core (list_agents)');
-});
-
-test('backward-compat: the `observability` alias still exposes the full union (core + analytics)', async () => {
+test('backward-compat: the `observability` alias resolves to the core surface and still routes', async () => {
   const proxy = loadProxy('observability');
   const names = namesOf(proxy.getToolDefinitions());
-  assert.deepStrictEqual(names, [...OBSERVABILITY_CORE_TOOLS, ...OBSERVABILITY_ANALYTICS_TOOLS].sort());
-  // And both a core and an analytics tool still route through the alias handler.
+  assert.deepStrictEqual(names, OBSERVABILITY_CORE_TOOLS);
+  // A core tool still routes through the alias handler (the alias is a live seam,
+  // not a dead name).
   const api = capturingApi({ ok: true });
-  await proxy.handleToolCall('get_file_heat', {}, api);
-  assert.strictEqual(api.calls.length, 1, 'analytics tool routes under the observability alias');
+  await proxy.handleToolCall('read_agent_log', { agent_id: 'a1' }, api);
+  assert.strictEqual(api.calls.length, 1, 'a core tool must still route under the observability alias');
   assert.strictEqual(api.calls[0].method, 'GET');
 });
 

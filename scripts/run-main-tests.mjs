@@ -113,6 +113,12 @@ const TESTS = [
   'dist/main/main/context-overhead/walk-up.test.js',
   'dist/main/main/context-overhead/context-overhead-analyzer.test.js',
   'dist/main/main/context-overhead/mcp-tool-inventory.test.js',
+  // WP2 (G2) provider-aware guidance sources.
+  'dist/main/main/context-overhead/guidance-sources.test.js',
+  'dist/main/main/context-overhead/guidance-costing.test.js',
+  // WP7 (G7) nested guidance inventory: declared scan contract, budget
+  // stopped-reasons, known-vs-unknown omissions, ordering determinism.
+  'dist/main/main/context-overhead/guidance-inventory.test.js',
   'dist/main/main/context-optimizer/lane-attribution.test.js',
   'dist/main/main/context-optimizer/behavior-store.test.js',
   'dist/main/main/context-optimizer/file-access-path.test.js',
@@ -121,10 +127,21 @@ const TESTS = [
   'dist/main/main/context-optimizer/config-epoch-backfill.test.js',
   'dist/main/main/context-optimizer/guidance-action-model.test.js',
   'dist/main/main/context-optimizer/occurrence-classifier.test.js',
+  // WP2 (G2) audience capture-coverage never-gate.
+  'dist/main/main/context-optimizer/occurrence-capture-coverage.test.js',
+  // WP5 (G5) section-level liveness join: strict lattice + two-axis annotation,
+  // and the preserved section identity (shared helper equivalence + regression).
+  'dist/main/main/context-optimizer/section-liveness.test.js',
+  'dist/main/main/context-overhead/section-identity-join.test.js',
   'dist/main/main/context-optimizer/improvisation-clusters.test.js',
   'dist/main/main/context-optimizer/attribution.test.js',
   'dist/main/main/context-optimizer/config-drift.test.js',
   'dist/main/main/context-optimizer/file-coverage.test.js',
+  // WP3 (G3): hot-uncovered candidate allowlist + bounded coverageChecks,
+  // recommendation-draft construction bars + target policy, engine integration.
+  'dist/main/main/context-optimizer/file-coverage-hot-uncovered.test.js',
+  'dist/main/main/context-optimizer/recommendation-draft.test.js',
+  'dist/main/main/context-optimizer/recommendation-draft-integration.test.js',
   'dist/main/main/context-optimizer/compiler-parity-gate.test.js',
   'dist/main/main/context-optimizer/context-optimizer.test.js',
   'dist/main/main/context-optimizer/phrase-gap.test.js',
@@ -133,11 +150,39 @@ const TESTS = [
   'dist/main/main/context-optimizer/optimizer-surface.test.js',
   'dist/main/main/context-optimizer/optimizer-scaffold-registry.test.js',
   'dist/main/main/context-optimizer/optimizer-pipeline-seams.test.js',
+  // WP9 (G9): sequence/co-touch + command-family association + the pinned
+  // stream-identity join (incl. equivalence with optimizer-pipeline's join).
+  'dist/main/main/context-optimizer/behavior-sequences.test.js',
   'dist/main/main/context-optimizer/optimizer-corpus-backfill.test.js',
   'dist/main/main/context-optimizer/agent-dto.test.js',
   'dist/main/main/context-optimizer/agent-dto-build.test.js',
   'dist/main/main/context-optimizer/agent-dto-observability.test.js',
   'dist/main/main/context-optimizer/agent-dto-acceptance.test.js',
+  'dist/main/main/context-overhead/overhead-dto.test.js',
+  'dist/main/main/analytics-export/analytics-exporter.test.js',
+  // WP-S schema v2 migration + capability contract.
+  'dist/main/main/analytics-export/analytics-schema-v2.test.js',
+  // WP3 (G3): recommendation-drafts capability + proposals.csv columns + golden refresh.
+  'dist/main/main/analytics-export/recommendation-drafts-export.test.js',
+  // WP5 (G5): section-behavior-status capability + DTO projection + SUMMARY + golden refresh.
+  'dist/main/main/analytics-export/section-behavior-export.test.js',
+  // WP6 (G6): file-heat-extended capability + file-heat.csv columns + per-table
+  // truncation metadata + SUMMARY section + golden refresh.
+  'dist/main/main/analytics-export/file-heat-export.test.js',
+  // WP8 (G8): surface-provenance capability — per-surface provenance, one
+  // anchor, comparability keys, computed caveat downgrade, --window, golden.
+  'dist/main/main/analytics-export/surface-provenance.test.js',
+  // WP9 (G9): file-sequences capability + file-sequences.csv + redaction +
+  // WP6-shaped truncation + TOOL_ERROR_RATES_UNAVAILABLE + golden refresh.
+  'dist/main/main/analytics-export/file-sequences-export.test.js',
+  // WP1 (G1): installation-owned snapshot launcher — argv branch purity,
+  // descriptor write/heal, shim passthrough, and the (env-gated, default-skip)
+  // source-mode integration run.
+  'dist/main/main/analytics-export/analytics-snapshot-argv.test.js',
+  'dist/main/main/installation-descriptor.test.js',
+  'dist/main/main/analytics-export/analytics-snapshot-shim.test.js',
+  'dist/main/main/analytics-export/analytics-snapshot-source-integration.test.js',
+  'dist/main/main/api-server-overhead-route.test.js',
   'dist/main/main/agent-dto-routes.test.js',
   'dist/main/main/api-server-optimizer-routes.test.js',
   'scripts/mcp-tools-observability.test.js',

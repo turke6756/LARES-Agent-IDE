@@ -1706,10 +1706,89 @@ process.exit(0);
 
 export const DASHBOARD_STATUS_SCRIPT_MJS = buildDashboardStatusScript();
 
-/** Dashboard statusLine script — .dashboard/scripts/dashboard-statusline.mjs.
+/** Analytics snapshot launcher shim — .lares/scripts/analytics-snapshot.mjs
+ *  (WP1/G1, plans/context-analytics-implementation-plan.md).
+ *
+ *  One verbatim command on every platform:
+ *    node .lares/scripts/analytics-snapshot.mjs export --json
+ *
+ *  Resolves the owning Lares installation at RUNTIME from
+ *  ../installation.json (never inlined — descriptor healing needs no shim
+ *  rewrite), spawns `invocation.command` with `argsPrefix + argv` (array
+ *  args, no shell → spaces-in-path safe), passes stdout/stderr through, and
+ *  exits with the child's code verbatim (2 = partial and 4 = cold index
+ *  preserved). Deliberately avoids JS template literals / `${}` so the body
+ *  survives embedding in this template. */
+export const ANALYTICS_SNAPSHOT_SHIM_MJS = `#!/usr/bin/env node
+// analytics-snapshot.mjs — Lares-managed snapshot launcher shim (managed file,
+// do not edit; refreshed on every lane launch).
+//
+//   node .lares/scripts/analytics-snapshot.mjs export --json
+//
+// Reads ../installation.json at runtime and spawns the owning Lares
+// installation's snapshot CLI. stdout/stderr pass through; the child's exit
+// code (incl. 2 = partial, 4 = cold index) is preserved verbatim.
+import { readFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const HEAL_HINT = 'Lares installation moved or uninstalled — reopen this workspace in Lares to heal .lares/installation.json.';
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+const descriptorPath = path.join(here, '..', 'installation.json');
+
+let descriptor;
+try {
+  descriptor = JSON.parse(readFileSync(descriptorPath, 'utf8'));
+} catch (err) {
+  process.stderr.write('analytics-snapshot: cannot read installation descriptor at ' + descriptorPath +
+    ' (' + (err && err.message) + ').\\n' + HEAL_HINT + '\\n');
+  process.exit(1);
+}
+const invocation = descriptor && descriptor.invocation;
+if (!invocation || typeof invocation.command !== 'string' || !Array.isArray(invocation.argsPrefix)) {
+  process.stderr.write('analytics-snapshot: malformed installation descriptor at ' + descriptorPath + '.\\n' + HEAL_HINT + '\\n');
+  process.exit(1);
+}
+
+// LARES_SHIM_PLATFORM is a test-only override (unit tests exercise the WSL
+// branch from a Windows host); real runs always take process.platform.
+const platform = process.env.LARES_SHIM_PLATFORM || process.platform;
+let command = invocation.command;
+if (platform === 'linux') {
+  if (descriptor.wsl && typeof descriptor.wsl.commandWslPath === 'string' && descriptor.wsl.commandWslPath) {
+    command = descriptor.wsl.commandWslPath;
+  } else {
+    // Documented limitation: a non-Windows-hosted installation has no WSL
+    // command path; the same command works from the Windows side.
+    process.stderr.write('analytics-snapshot: this installation descriptor has no WSL command path ' +
+      '(descriptor.wsl.commandWslPath). Run the same command from the Windows side of the workspace, ' +
+      'or reopen the workspace in Lares to refresh .lares/installation.json.\\n');
+    process.exit(1);
+  }
+}
+
+const args = invocation.argsPrefix.concat(process.argv.slice(2));
+// Array args + shell:false → spaces-in-path safe on every platform.
+const child = spawn(command, args, { stdio: 'inherit', shell: false });
+child.on('error', (err) => {
+  if (err && err.code === 'ENOENT') {
+    process.stderr.write('analytics-snapshot: ' + command + ' not found. ' + HEAL_HINT + '\\n');
+  } else {
+    process.stderr.write('analytics-snapshot: failed to launch ' + command + ': ' + (err && err.message) + '\\n');
+  }
+  process.exit(1);
+});
+child.on('exit', (code) => {
+  process.exit(code === null ? 1 : code);
+});
+`;
+
+/** Dashboard statusLine script — .lares/scripts/dashboard-statusline.mjs.
  *  Prints the terminal status line (model | dir | ctx% | 5h | 7d) AND passively
  *  captures the harness-native `rate_limits` blob to
- *  <ws>/.dashboard/usage/latest.json at zero agent-context cost. Owned by
+ *  <ws>/.lares/usage/latest.json at zero agent-context cost. Owned by
  *  dashboard sessions only via the per-lane project .claude/settings.json
  *  `statusLine` block — the user-global ~/.claude/settings.json is never touched.
  *  Everything is wrapped so the harness never sees a crash (always exit 0).

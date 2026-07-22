@@ -659,6 +659,10 @@ export interface FileHeatRowDTO extends FileHeatPath {
   score?: number;
   scoreComponents?: FileHeatScoreComponents;
   guidanceGapCandidate?: boolean;
+  // ── WP6 (G6): hot-uncovered candidate flag (WP3 engine bar) projected onto the
+  //    DTO row so the snapshot exporter's `hot_uncovered` column is populated from
+  //    the same rows the live surface serves. Additive; absent ⇒ pre-WP3 rollup. ──
+  hotUncoveredCandidate?: boolean;
 }
 
 export interface FileHeatPageParams {
@@ -740,6 +744,9 @@ export function buildFileHeatPage(
       ...(f.score !== undefined ? { score: f.score } : {}),
       ...(f.scoreComponents ? { scoreComponents: f.scoreComponents } : {}),
       ...(f.guidanceGapCandidate !== undefined ? { guidanceGapCandidate: f.guidanceGapCandidate } : {}),
+      // WP6 (G6): pass the WP3 hot-uncovered flag through (never the full
+      // coverageChecks predicate sweep — that stays engine-side, bounded).
+      ...(f.hotUncoveredCandidate !== undefined ? { hotUncoveredCandidate: f.hotUncoveredCandidate } : {}),
     };
   });
 

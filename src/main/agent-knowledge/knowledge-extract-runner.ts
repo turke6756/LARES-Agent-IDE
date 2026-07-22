@@ -6,7 +6,7 @@
 // FileReader (reused from the overhead deps, no duplication). The IPC handler is
 // a thin try/catch around `runKnowledgeExtract`.
 
-import type { AgentKnowledgeGraph } from '../../shared/types';
+import type { AgentKnowledgeGraph, OverheadModel } from '../../shared/types';
 import { runOverheadScan, makeFileReader } from '../context-overhead/ipc-deps';
 import { extractAgentKnowledge } from './knowledge-extractor';
 import { enrichKnowledgeWithBehavior } from './knowledge-behavior-enrichment';
@@ -16,8 +16,17 @@ import { getDb } from '../database';
  *  behavior linkage (WP3), and stamp `generatedAtIso`. Throws on a missing
  *  workspace/agent (the handler turns it into the error variant of the discriminated
  *  result). The pure extractor stays DB-free; only this runner touches the DB. */
-export function runKnowledgeExtract(workspaceId: string, agentId: string): AgentKnowledgeGraph {
-  const model = runOverheadScan(workspaceId);
+export function runKnowledgeExtract(
+  workspaceId: string,
+  agentId: string,
+  /** Optional pre-scanned model. The analytics exporter passes the ONE scan its
+   *  snapshot is built from: extracting N agents would otherwise run N further
+   *  filesystem scans, each a *different* scan, breaking the single-scan
+   *  consistency the snapshot exists to provide. IPC callers pass nothing and are
+   *  unaffected. */
+  preScanned?: OverheadModel,
+): AgentKnowledgeGraph {
+  const model = preScanned ?? runOverheadScan(workspaceId);
   const agent = model.agents.find((a) => a.id === agentId);
   if (!agent) throw new Error(`Agent not found in workspace scan: ${agentId}`);
 

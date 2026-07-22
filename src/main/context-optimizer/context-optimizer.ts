@@ -354,6 +354,12 @@ export function generateContextOptimizerProposals(
     droppedUnattributed: 0, proxyIncluded: 0, breakdown: emptyWorkspaceBreakdown(), realIdCount: 0,
   };
   let sawCoverageScope = false;
+  // ── WP6 (G6): sum the per-lane PRE-slice populations so the exporter can disclose
+  // file-heat truncation. Known only when EVERY covered lane disclosed its size —
+  // a partially-known total would understate the population, so it is withheld. ──
+  let fileHeatPopulation = 0;
+  let fileHeatPopulationKnown = false;
+  let fileHeatPopulationUndisclosed = false;
   // ── WP3 (G3): ONE analysis-generation id for every recommendation-draft evidence
   // entry in this result — the join key that makes evidence rows same-surface
   // joinable. Deterministic over the engine input (purity preserved: derived from
@@ -457,6 +463,13 @@ export function generateContextOptimizerProposals(
 
     // ── File-heat rollup passthrough (A1, §5.6-redacted). ──
     if (lane.coverage) {
+      // WP6 (G6): fold this lane's pre-slice population into the run-level total.
+      if (typeof lane.coverage.populationSize === 'number') {
+        fileHeatPopulation += lane.coverage.populationSize;
+        fileHeatPopulationKnown = true;
+      } else {
+        fileHeatPopulationUndisclosed = true;
+      }
       const uncovered = new Set(lane.coverage.uncoveredHot.map((h) => h.pathHash));
       for (const h of lane.coverage.fileHeat) {
         fileHeat.push({
@@ -563,6 +576,10 @@ export function generateContextOptimizerProposals(
       // ≥1 proposal actually carries a draft (honest absence otherwise).
       ...(proposals.some((p) => p.recommendationDraft)
         ? { recommendationGenerationId: draftGenerationId } : {}),
+      // WP6 (G6): the exporter's `populationAvailable` for the file-heat table —
+      // present only when every covered lane disclosed its pre-slice population.
+      ...(fileHeatPopulationKnown && !fileHeatPopulationUndisclosed
+        ? { fileHeatPopulation } : {}),
     },
     diagnostics,
   };

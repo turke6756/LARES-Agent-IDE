@@ -27,7 +27,7 @@ function getOrchestrationToolDefinitions() {
           working_directory: { type: 'string', description: 'Working directory for the agent. Defaults to workspace root.' },
           auto_restart: { type: 'boolean', description: 'Auto-restart the agent on crash (default: true).' },
           supervised: { type: 'boolean', description: 'Whether the supervisor is notified on agent status changes (default: true for supervisor-launched workers — set false to opt out).' },
-          is_researcher: { type: 'boolean', description: 'Launch the workspace RESEARCHER role-lane (default: false). The researcher browses + researches the web and writes findings into .dashboard/research/inbox/, but cannot run Bash, edit code, run notebooks, or launch agents. Claude-only (non-claude is rejected). When true, the app manages cwd/command/tools and the browser MCP — `provider`, `command`, `template_id`, and `persona` are ignored.' },
+          is_researcher: { type: 'boolean', description: 'Launch the workspace RESEARCHER role-lane (default: false). The researcher browses + researches the web and writes findings into .lares/research/inbox/, but cannot run Bash, edit code, run notebooks, or launch agents. Claude-only (non-claude is rejected). When true, the app manages cwd/command/tools and the browser MCP — `provider`, `command`, `template_id`, and `persona` are ignored.' },
           fresh_session: { type: 'boolean', description: 'Codex-only hint (default: false). When true, the agent launches without `codex resume` so the codex CLI mints a fresh conversation rather than inheriting any prior rollout in this workspace. The dashboard still discovers and binds the new session id. Use this when you want a clean context but parallel agents in the same workspace. No-op for non-codex providers.' },
           plan_id: { type: 'string', description: 'Planning-surface rail: an existing plan id (from create_plan). Frozen onto the agent at launch and injected as AGENT_DASHBOARD_PLAN_ID so the worker\'s read/edit breadcrumbs and plan_events attribute to this plan. The launch route 400s an unknown plan_id.' },
           section_anchor: { type: 'string', description: 'Planning-surface rail: the sec_ section anchor this agent is dispatched to write. Frozen at launch and injected as AGENT_DASHBOARD_PLAN_SECTION (the dispatched-intent fallback when no read/edit breadcrumb is observed). Set it to the section the worker will UPDATE — for checklist execution that is sec_opitem. NEVER dispatch to sec_exectr (the execution trail is system-owned, auto-generated from trusted write events; a writer there is dropped from attribution). The plan-bound brief must mandate a turn-end writeback: the worker flips its completed items\' `&#9744;`→`&#9745;` in this section (native HTML edit) and emits a `<!--PLAN-EVENT …-->` sentinel — that edit is what materializes the trail lines and the visible checkmarks.' },
@@ -139,7 +139,10 @@ function getOrchestrationToolDefinitions() {
     },
     {
       name: 'run_orchestration',
-      description: 'Start an orchestration. Returns immediately with a runId; the run executes ' +
+      description: 'Start an orchestration. The only orchestration is `groupthink`, in one of two ' +
+        'modes: `serial` (Lead drafts → Reviewer critiques → Lead writes the plan) or `parallel` ' +
+        '(two planners draft independently → cross-pollinate → synthesizer writes the plan). ' +
+        'Returns immediately with a runId; the run executes ' +
         'detached inside the dashboard and streams [DASHBOARD EVENT] messages back to you ' +
         '(groupthink.complete / orchestration.groupthink.stalled / .aborted). ' +
         'Resume a stalled run with params.resume_run_id. To re-run an OLD ' +
@@ -156,8 +159,8 @@ function getOrchestrationToolDefinitions() {
           lead_provider:      { type: 'string', description: 'Default claude.' },
           reviewer_provider:  { type: 'string', description: 'Default codex.' },
           turn_timeout_ms:    { type: 'number', description: 'Per-turn stall timeout, default 600000.' },
-          plan_id:            { type: 'string', description: 'Planning-surface rail: an existing plan id (from create_plan). When set, the run edits that surface at section_anchor instead of writing a fresh plan file — both are injected into each member agent as AGENT_DASHBOARD_PLAN_ID/_PLAN_SECTION, one-writer-per-plan is enforced at dispatch (409 if a live run already owns this plan), and done-detection watches the section for a content change.' },
-          section_anchor:     { type: 'string', description: 'Planning-surface rail: the sec_ writeback target within plan_id. Required alongside plan_id for section-change done-detection; baked into the planner/synthesizer prompts as the write destination. Set it to the section the run will UPDATE (sec_opitem for checklist execution). NEVER target sec_exectr — the execution trail is system-owned, auto-generated from trusted write events, and edits there are dropped from attribution. The prompts must mandate a turn-end writeback: flip completed items\' `&#9744;`→`&#9745;` in this section (native HTML edit) and emit a `<!--PLAN-EVENT …-->` sentinel, which is what materializes the trail lines and the visible checkmarks.' },
+          plan_id:            { type: 'string', description: 'Plan rail: an existing plan id (from create_plan). The run edits that plan at section_anchor instead of writing a fresh plan file. One live run per plan (409 otherwise).' },
+          section_anchor:     { type: 'string', description: 'Plan rail: the sec_ section this run writes (required with plan_id); never sec_exectr.' },
           resume_run_id:      { type: 'string', description: 'Resume a prior stalled run by its runId.' },
           resume_lead_id:     { type: 'string', description: 'Legacy serial resume: lead agent id.' },
           resume_reviewer_id: { type: 'string', description: 'Legacy serial resume: reviewer agent id.' },
@@ -171,12 +174,11 @@ function getOrchestrationToolDefinitions() {
       description: 'Abort a running orchestration and clean up its member agents.',
       inputSchema: { type: 'object', properties: { run_id: { type: 'string' } }, required: ['run_id'] },
     },
-    {
-      name: 'list_orchestrations',
-      description: 'List available dashboard-run orchestrations (e.g. groupthink) and their parameters. ' +
-        'Orchestrations now run INSIDE the dashboard — do not look for scripts/*.js.',
-      inputSchema: { type: 'object', properties: {} },
-    },
+    // NOTE (context-overhead pass): `list_orchestrations` was removed — the
+    // catalog it listed holds exactly one entry (groupthink), and the only
+    // meaningful choice (mode: serial | parallel) was not surfaced by it. Both
+    // are now stated in run_orchestration's own description. The
+    // GET /api/orchestrations/catalog route is untouched.
     {
       name: 'get_orchestration_run',
       description: 'Get the status/progress of an orchestration run by runId.',
@@ -216,7 +218,7 @@ async function handleOrchestrationToolCall(name, args, apiRequest) {
       // hardcoded app primitive. The supervisor (AgentSupervisor.launchAgent)
       // forces provider=claude, the canonical command, the browser MCP toolset,
       // the --tools/--disallowedTools native boundary, and the
-      // .dashboard/researcher/ cwd. Just pass the flag through.
+      // .lares/researcher/ cwd. Just pass the flag through.
       if (args.is_researcher !== undefined) input.isResearcher = args.is_researcher;
       // Default supervised=true when called via the supervisor MCP — workers
       // launched by the supervisor should bump it on idle/done/crashed so it
@@ -378,11 +380,6 @@ async function handleOrchestrationToolCall(name, args, apiRequest) {
     case 'abort_orchestration': {
       const r = await apiRequest('DELETE', `/api/orchestrations/${encodeURIComponent(args.run_id)}`);
       return { content: [{ type: 'text', text: JSON.stringify(r) }] };
-    }
-
-    case 'list_orchestrations': {
-      const r = await apiRequest('GET', '/api/orchestrations/catalog');
-      return { content: [{ type: 'text', text: JSON.stringify(r.orchestrations, null, 2) }] };
     }
 
     case 'get_orchestration_run': {

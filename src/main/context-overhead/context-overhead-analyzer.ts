@@ -12,6 +12,7 @@ import type {
   AgentRoleLane,
   ConfigSectionWeight,
   ConfigWeightRollup,
+  GuidanceSource,
   InheritanceFrame,
   McpServerOverhead,
   OverheadModel,
@@ -20,10 +21,12 @@ import type {
   TokenCountMethod,
   TokenEstimate,
 } from '../../shared/types';
+import { classifyPathMutability } from '../shared/path-mutability';
 import { TokenEstimator, sumEstimates } from './token-estimator';
-import { makePathOps } from './paths';
+import { makePathOps, type PathOps } from './paths';
 import { analyzeWalkUp } from './walk-up';
-import { classifyAgentConfig, rollupTokens } from './config-weight';
+import { classifyAgentConfig, rollupTokens, rollupTokensByFileKind } from './config-weight';
+import { appliesToAgent, composeGuidanceSources, providerForAgent } from './guidance-sources';
 import type { McpInventory } from './mcp-tool-inventory';
 
 export interface FileReader {
@@ -56,11 +59,18 @@ interface BuiltinLane {
 // `total`" behavior is preserved exactly by `total = residentTotal + onDemandTotal`.
 
 const BUILTIN_LANES: BuiltinLane[] = [
-  { relDir: '.dashboard/supervisor', name: 'Supervisor', kind: 'builtin-supervisor', lane: 'supervisor' },
-  { relDir: '.dashboard/researcher', name: 'Researcher', kind: 'builtin-researcher', lane: 'researcher' },
-  { relDir: '.dashboard/workers/claude', name: 'Worker (claude)', kind: 'builtin-worker', lane: 'worker' },
-  { relDir: '.dashboard/workers/codex', name: 'Worker (codex)', kind: 'builtin-worker', lane: 'worker' },
+  { relDir: '.lares/supervisor', name: 'Supervisor', kind: 'builtin-supervisor', lane: 'supervisor' },
+  { relDir: '.lares/researcher', name: 'Researcher', kind: 'builtin-researcher', lane: 'researcher' },
+  { relDir: '.lares/workers/claude', name: 'Worker (claude)', kind: 'builtin-worker', lane: 'worker' },
+  { relDir: '.lares/workers/codex', name: 'Worker (codex)', kind: 'builtin-worker', lane: 'worker' },
 ];
+
+/** Legacy spelling of a built-in lane dir — probed as a fallback when the
+ *  `.lares/**` dir is absent (an unmigrated or rename-failed workspace still
+ *  carries `.dashboard/**`). Kept reader-based so the analyzer stays pure. */
+function legacyRelDir(relDir: string): string {
+  return relDir.replace(/^\.lares\//, '.dashboard/');
+}
 
 /** Flatten a frame's sources + their @import children (depth-first, document
  *  order) for chart stacking. */
@@ -115,6 +125,24 @@ function analyzeAgent(
     flatSources.push(...flatten(frame.sources));
   }
 
+  // WP2 (G2) — provider-aware guidance sources. The Claude walk-up output above is
+  // UNCHANGED; it is merely tagged. AGENTS.md joins as a directory-scoped chain
+  // (workspace root → this agent's launch cwd) and is per-agent costed ONLY when
+  // this agent's provider is in the file's documented audience — no agent is ever
+  // charged for guidance it doesn't load.
+  const provider = providerForAgent({ workingDir, kind });
+  const guidanceSources = composeGuidanceSources(
+    { workingDir, flatSources }, workspaceRoot, { reader: deps.reader, pathOps },
+  );
+  const guidanceByPath = new Map(guidanceSources.map((g) => [g.path, g]));
+  for (const s of flatSources) {
+    const g = s.resolvedPath ? guidanceByPath.get(s.resolvedPath) : undefined;
+    if (g && g.fileKind !== 'agents-md') s.guidanceSource = g;
+  }
+  attachApplicableAgentsMd(
+    guidanceSources, provider, workingDir, inheritanceChain, flatSources, pathOps, deps,
+  );
+
   // Truthful split (Wave-2 §C3): a source counts toward the resident headline iff
   // its `disclosureTier` is `resident`. On-demand sources (skill bodies, memory
   // body) go to a separate labeled pool, NEVER the headline. Counted MCP schemas
@@ -155,9 +183,68 @@ function analyzeAgent(
     residentTotal,
     onDemandTotal,
     configWeight,
+    guidanceSources,
+    provider,
     exactness,
     warnings,
   };
+}
+
+/** WP2 (G2) — turn each APPLICABLE agents-md chain source into a resident
+ *  OverheadSource, attached both to `flatSources` (costing + config-weight +
+ *  extraction inputs) and to the inheritance frame of its directory (so the
+ *  chart/extractor walk sees it in place). Non-applicable chain files are listed
+ *  in `guidanceSources` only — never costed. */
+function attachApplicableAgentsMd(
+  guidanceSources: GuidanceSource[],
+  provider: string,
+  workingDir: string,
+  inheritanceChain: InheritanceFrame[],
+  flatSources: OverheadSource[],
+  pathOps: PathOps,
+  deps: OverheadServiceDeps,
+): void {
+  const cwd = pathOps.resolve(workingDir);
+  for (const g of guidanceSources) {
+    if (g.fileKind !== 'agents-md' || !appliesToAgent(g, provider)) continue;
+    const file = deps.reader.read(g.path);
+    const dir = pathOps.dirname(pathOps.resolve(g.path));
+    const isAgentLevel = dir === cwd;
+    const src: OverheadSource = {
+      id: `${g.path}#agents-md`,
+      kind: 'agents-md',
+      label: 'AGENTS.md',
+      resolvedPath: g.path,
+      dedupeKey: g.path,
+      sourceScope: isAgentLevel ? 'agent' : 'workspace-ancestor',
+      openable: file !== null,
+      exists: file !== null,
+      inherited: !isAgentLevel,
+      estimate: deps.estimator.estimate(file?.content ?? ''),
+      origin: 'walk-up',
+      mutable: classifyPathMutability(g.path),
+      disclosureTier: 'resident', // loaded into the provider's context each session
+      children: [],
+      warnings: [],
+      guidanceSource: g,
+    };
+    flatSources.push(src);
+    const frame = inheritanceChain.find((f) => f.included && pathOps.resolve(f.dir) === dir);
+    if (frame) {
+      frame.sources.push(src);
+    } else {
+      // Distance = steps from the agent cwd up to the file's directory.
+      let distance = 0;
+      for (let d = cwd; d !== dir && pathOps.dirname(d) !== d; d = pathOps.dirname(d)) distance += 1;
+      inheritanceChain.push({
+        dir,
+        scope: isAgentLevel ? 'agent' : 'workspace-ancestor',
+        distanceFromAgentCwd: distance,
+        included: true,
+        sources: [src],
+      });
+    }
+  }
 }
 
 function personaLane(p: AgentPersona): AgentRoleLane {
@@ -176,10 +263,19 @@ export function analyzeOverhead(
   const globalWarnings: string[] = [];
 
   for (const bl of BUILTIN_LANES) {
-    const dir = pathOps.join(workspaceRoot, bl.relDir);
+    // Prefer the live `.lares/**` dir; fall back to the legacy `.dashboard/**`
+    // spelling for an unmigrated (or rename-failed) workspace. The stable
+    // `builtin:.lares/...` id is kept for BOTH so lane identity survives the
+    // on-disk migration.
+    let dir = pathOps.join(workspaceRoot, bl.relDir);
     if (!deps.reader.exists(dir)) {
-      globalWarnings.push(`Built-in lane directory not found, skipped: ${bl.relDir}`);
-      continue;
+      const legacyDir = pathOps.join(workspaceRoot, legacyRelDir(bl.relDir));
+      if (deps.reader.exists(legacyDir)) {
+        dir = legacyDir;
+      } else {
+        globalWarnings.push(`Built-in lane directory not found, skipped: ${bl.relDir}`);
+        continue;
+      }
     }
     agents.push(
       analyzeAgent(`builtin:${bl.relDir}`, bl.name, bl.kind, bl.lane, dir, pathType, workspaceRoot, deps),
@@ -218,7 +314,10 @@ export function analyzeOverhead(
   }
   const workspaceConfigWeight: ConfigWeightRollup = {
     sections: wsSections,
+    // WP2 (G2): tokensByClass never sums across fileKind — AGENTS.md sections
+    // live only in their own tokensByClassByFileKind bucket.
     tokensByClass: rollupTokens(wsSections),
+    tokensByClassByFileKind: rollupTokensByFileKind(wsSections),
   };
 
   return {

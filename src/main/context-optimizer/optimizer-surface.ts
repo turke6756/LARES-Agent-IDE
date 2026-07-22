@@ -47,6 +47,9 @@ export interface OptimizerAnalyzeDeps {
   backfillTargets?: ResidentTarget[];
   birthdayResolver?: BirthdayResolver;
   query?: ContextOptimizerQuery;
+  /** 'skip' suppresses the one-shot cold-start epoch backfill (the only writer on
+   *  this path). Exporter-only; never exposed over IPC or HTTP. */
+  backfillMode?: 'run' | 'skip';
 }
 
 /**
@@ -73,6 +76,7 @@ export function runOptimizerAnalyze(deps: OptimizerAnalyzeDeps): ContextOptimize
     birthdayResolver: deps.birthdayResolver,
     lanes,
     query: deps.query,
+    ...(deps.backfillMode ? { backfillMode: deps.backfillMode } : {}),
   });
   return result;
 }

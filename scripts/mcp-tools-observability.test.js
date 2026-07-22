@@ -1,13 +1,31 @@
-// mcp-tools-observability.test.js — WP7 §7 test 29 (read-only audit) at the MCP layer.
+// mcp-tools-observability.test.js — the MCP-layer half of the WP7 §5.4 read-only
+// audit, plus the guard on the retirement of the analytics surface.
 //   node scripts/mcp-tools-observability.test.js
 //
-// Asserts the observability toolset exposes NO mutation-named tool and that the WP7
-// context-optimizer tools carry zero mutation verbs in their descriptions and only ever
-// issue GET requests — the MCP half of the §5.4 read-only guarantee. The route half
-// (POST → 405) is covered by agent-dto-routes.test.ts.
+// HISTORY. This file used to assert that the 13 WP7 context-optimizer tools were
+// registered, carried zero mutation verbs, and only ever issued GETs. Those tools
+// are RETIRED — replaced by the on-demand analytics snapshot exporter and the
+// `context-analytics` skill — so the strongest available statement flipped from
+// "they are read-only" to "they are gone, and nothing can call them." Two things
+// were deliberately KEPT rather than deleted with them:
+//
+//   1. The mutation-verb guard, now over the surviving observability surface.
+//      The §5.4 property was never specific to the WP7 tools.
+//   2. The WP-1C contract test. It pins `buildProposalsPage`'s DEFAULT-view
+//      behavior — that a MATERIAL unverified subtract is surfaced with its
+//      verification state rather than hidden. That builder is still live: it is
+//      exactly what the analytics EXPORTER drains, which is what makes the tool
+//      retirement safe. Its contract text now lives in the skill, so the text
+//      half of the test is asserted against the skill instead of a tool
+//      description that no longer exists.
 
 const assert = require('node:assert/strict');
-const { getObservabilityToolDefinitions, handleObservabilityToolCall } = require('./mcp-tools-observability');
+const path = require('node:path');
+const {
+  getObservabilityToolDefinitions,
+  getObservabilityCoreToolDefinitions,
+  handleObservabilityToolCall,
+} = require('./mcp-tools-observability');
 
 let passed = 0;
 function ok(name, fn) { fn(); passed++; console.log(`  ok - ${name}`); }
@@ -15,9 +33,11 @@ async function okAsync(name, fn) { await fn(); passed++; console.log(`  ok - ${n
 
 // The mutation-verb blacklist (§5.4 / test 29). A read-only surface must expose none.
 const MUTATION_VERBS = ['write', 'set', 'apply', 'sign', 'mark', 'delete', 'update', 'create', 'edit'];
-const WP7_TOOLS = [
+
+/** The 13 retired `observability-analytics` tools. */
+const RETIRED_WP7_TOOLS = [
   'get_context_optimizer_proposals', 'get_context_optimizer_proposal',
-  'get_context_optimizer_proposal_evidence',
+  'get_context_optimizer_proposal_evidence', 'get_context_optimizer_cluster_exemplars',
   'get_improvement_proposals', 'get_improvement_proposal',
   'get_skill_usage', 'get_skill_usage_detail',
   'get_mcp_tool_usage',
@@ -28,10 +48,22 @@ const WP7_TOOLS = [
 
 const defs = getObservabilityToolDefinitions();
 
-ok('all WP7 read-only tools are registered', () => {
-  for (const n of WP7_TOOLS) {
-    assert.ok(defs.some((d) => d.name === n), `missing tool ${n}`);
+ok('the 13 WP7 analytics tools are retired — none is registered on any observability surface', () => {
+  assert.equal(RETIRED_WP7_TOOLS.length, 13, 'the retirement covered exactly 13 tools');
+  for (const surface of [defs, getObservabilityCoreToolDefinitions()]) {
+    for (const n of RETIRED_WP7_TOOLS) {
+      assert.ok(!surface.some((d) => d.name === n), `retired tool ${n} is still registered`);
+    }
   }
+});
+
+ok('the `observability` alias now resolves to exactly the core surface', () => {
+  assert.deepStrictEqual(
+    defs.map((d) => d.name).sort(),
+    getObservabilityCoreToolDefinitions().map((d) => d.name).sort(),
+    'the backward-compat alias must expose the core surface and nothing else',
+  );
+  assert.ok(defs.length > 0, 'the alias must not resolve to an empty surface');
 });
 
 ok('NO observability tool NAME contains a mutation verb', () => {
@@ -42,36 +74,30 @@ ok('NO observability tool NAME contains a mutation verb', () => {
   }
 });
 
-ok('NO WP7 tool DESCRIPTION contains a mutation verb (whole word)', () => {
-  for (const d of defs.filter((x) => WP7_TOOLS.includes(x.name))) {
-    const desc = (d.description || '').toLowerCase();
-    for (const v of MUTATION_VERBS) {
-      assert.ok(!new RegExp(`\\b${v}\\b`).test(desc), `"${d.name}" description contains mutation verb "${v}"`);
-    }
-  }
-});
-
-ok('every WP7 description instructs the reader it is read-only', () => {
-  for (const d of defs.filter((x) => WP7_TOOLS.includes(x.name))) {
-    assert.match(d.description.toLowerCase(), /read-only/, `${d.name} must state read-only`);
-  }
-});
-
 // ── WP-1C: contract text is TESTED against real builder behavior, not prose ──
-// The description must not claim material unverified subtracts are "hidden by default",
-// because the shared default-surface policy makes them default-visible-with-caveat.
-const proposalsDesc = defs.find((d) => d.name === 'get_context_optimizer_proposals').description;
+// The claim must not be that material unverified subtracts are "hidden by
+// default", because the shared default-surface policy makes them
+// default-visible-with-caveat. The text carrying this contract is now the
+// `context-analytics` skill (the tool description that used to carry it is gone).
+const { SUPERVISOR_CONTEXT_ANALYTICS_SKILL } = require(
+  path.join(__dirname, '..', 'dist', 'main', 'shared', 'constants.js'),
+);
 
-ok('1C description does NOT assert unverified subtracts are hidden from the default list', () => {
-  const d = proposalsDesc.toLowerCase();
+ok('1C: the skill does NOT assert unverified subtracts are hidden, and states the gate is a wiring state', () => {
+  const d = SUPERVISOR_CONTEXT_ANALYTICS_SKILL.toLowerCase();
   // The specific contract lie that WP-B1 invalidated.
   assert.ok(!/hidden from the actionable list by default/.test(d),
     'stale claim: "hidden from the actionable list by default"');
   assert.ok(!/unverified subtract candidates are hidden/.test(d),
     'stale claim: unverified subtract candidates are hidden');
-  // It must still preserve the honest disclosure contract (count is authoritative).
-  assert.match(proposalsDesc, /meta\.unverifiedSuppressedCount/,
-    'description must still point at the disclosure count');
+  // And it must still carry the honest reading of the gate: `verified: false` is
+  // a wiring state, not a confidence score. This is the claim the retired tool
+  // descriptions used to make, and the reason a zero verified-count must not be
+  // read as "nothing qualifies".
+  assert.match(SUPERVISOR_CONTEXT_ANALYTICS_SKILL, /DERIVATION_GATE_ALWAYS_UNVERIFIED/,
+    'the skill must name the derivation-gate caveat');
+  assert.match(d, /wiring state, not a score/,
+    'the skill must state that verified:false is a wiring state, not a score');
 });
 
 ok('1C fixture: a MATERIAL unverified subtract IS surfaced by the default builder (matches the text)', () => {
@@ -101,36 +127,51 @@ ok('1C fixture: a MATERIAL unverified subtract IS surfaced by the default builde
   assert.equal(page.data[0].actionability, 'candidate-unverified', 'and carries its verification state');
 });
 
-// ── handler audit: every WP7 tool issues GET only, never a write verb ──
+// ── handler audit: no retired tool routes, and no HTTP call escapes ──
 async function run() {
-  await okAsync('every WP7 handler issues GET only (never POST/PUT/PATCH/DELETE)', async () => {
+  await okAsync('no retired analytics tool routes through any observability handler', async () => {
     const calls = [];
-    const fakeApi = (method, path) => { calls.push({ method, path }); return Promise.resolve({ ok: true }); };
+    const fakeApi = (method, p) => { calls.push({ method, path: p }); return Promise.resolve({ ok: true }); };
+    // The /api/context-optimizer/* routes these tools called STILL EXIST — the
+    // exporter depends on them — so a leftover handler case would keep working
+    // silently. Assert on the HTTP call, not just on the return value.
     const argsFor = {
       get_context_optimizer_proposal: { id: 'x' },
       get_context_optimizer_proposal_evidence: { id: 'x' },
+      get_context_optimizer_cluster_exemplars: { id: 'x' },
       get_improvement_proposal: { id: 'x' },
       get_skill_usage_detail: { id: 'x' },
       get_agent_knowledge: { agent_id: 'a' },
       get_agent_knowledge_detail: { agent_id: 'a', id: 'x' },
     };
-    for (const name of WP7_TOOLS) {
+    for (const name of RETIRED_WP7_TOOLS) {
       calls.length = 0;
-      await handleObservabilityToolCall(name, argsFor[name] || {}, fakeApi);
-      assert.equal(calls.length, 1, `${name} made exactly one API call`);
-      assert.equal(calls[0].method, 'GET', `${name} used GET, got ${calls[0].method}`);
+      const result = await handleObservabilityToolCall(name, argsFor[name] || {}, fakeApi);
+      assert.equal(result, null, `${name} must be unhandled (null), got ${JSON.stringify(result)}`);
+      assert.equal(calls.length, 0, `${name} still issued an HTTP call: ${JSON.stringify(calls)}`);
     }
   });
 
-  // ── WP-1A: the evidence drill tool routes to the read-only evidence GET ──
-  await okAsync('get_context_optimizer_proposal_evidence routes to GET /proposals/:id/evidence', async () => {
+  await okAsync('the surviving core surface still routes, and only ever via GET', async () => {
     const calls = [];
-    const fakeApi = (method, path) => { calls.push({ method, path }); return Promise.resolve({ ok: true }); };
-    await handleObservabilityToolCall('get_context_optimizer_proposal_evidence', { id: 'subtract:sup:abc' }, fakeApi);
-    assert.equal(calls.length, 1);
-    assert.equal(calls[0].method, 'GET');
-    assert.match(calls[0].path, /^\/api\/context-optimizer\/proposals\/subtract%3Asup%3Aabc\/evidence$/,
-      `id must be percent-encoded and routed to the evidence subpath, got ${calls[0].path}`);
+    // Shape-aware stub: /api/agents returns an ARRAY, the rest return objects.
+    const fakeApi = (method, p) => {
+      calls.push({ method, path: p });
+      if (/^\/api\/agents(\?|$)/.test(p)) return Promise.resolve([]);
+      return Promise.resolve({ log: '', messages: [], activities: [] });
+    };
+    // The read verbs of the surviving surface. (save_continuation_brick and
+    // open_file_in_view are deliberately excluded — they are the two POST tools
+    // on this toolset and were never part of the read-only §5.4 claim.)
+    for (const name of ['list_agents', 'read_agent_log', 'read_agent_chat',
+      'read_agent_files_touched', 'get_usage_limits', 'get_my_context', 'list_my_agents']) {
+      calls.length = 0;
+      await handleObservabilityToolCall(name, { agent_id: 'a1' }, fakeApi);
+      assert.ok(calls.length >= 1, `${name} made no API call`);
+      for (const c of calls) {
+        assert.equal(c.method, 'GET', `${name} used ${c.method}, expected GET`);
+      }
+    }
   });
 
   console.log(`\nmcp-tools-observability: ${passed} checks passed`);

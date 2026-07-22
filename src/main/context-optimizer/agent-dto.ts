@@ -25,6 +25,7 @@ import type {
   ProposalAssetEvidence,
   ProposalBenefitModel,
   ProposalVerificationDTO,
+  RecommendationDraft,
 } from '../../shared/types';
 import { proposalHasActionableContent } from '../../shared/context-optimizer-policy';
 
@@ -427,6 +428,11 @@ export interface ProposalSummaryDTO {
   benefitModel?: ProposalBenefitModel;
   clusterExemplarRef?: string;
   rollup?: NonNullable<ContextOptimizerProposal['target']['rollup']>;
+  // WP3 (G3) — template-constrained, human-review-required recommendation draft with
+  // joinable same-surface evidence. Additive + optional (present only on ADD rows
+  // that carry one); no parser-version bump. v2-OPTIONAL in the snapshot under
+  // capability 'recommendation-drafts'.
+  recommendationDraft?: RecommendationDraft;
 }
 
 export function toProposalSummary(p: ContextOptimizerProposal): ProposalSummaryDTO {
@@ -453,6 +459,7 @@ export function toProposalSummary(p: ContextOptimizerProposal): ProposalSummaryD
     ...(p.benefitModel ? { benefitModel: p.benefitModel } : {}),
     ...(p.clusterExemplarRef ? { clusterExemplarRef: p.clusterExemplarRef } : {}),
     ...(p.target.rollup ? { rollup: p.target.rollup } : {}),
+    ...(p.recommendationDraft ? { recommendationDraft: p.recommendationDraft } : {}),
   };
 }
 
@@ -530,6 +537,18 @@ function relUnder(absLower: string, root: string | undefined): string | null {
   return null;
 }
 
+/** The other spelling of the workspace state-dir root (`…/.lares` ↔
+ *  `…/.dashboard`). File-heat paths come from HISTORICAL activity rows, which
+ *  permanently carry whichever name was live when they were recorded — both
+ *  must scope to `$DASHBOARD`, never leak into `$WORKSPACE`. */
+function legacyStateRootSibling(root: string | undefined): string | undefined {
+  if (!root) return undefined;
+  const n = normSlash(root).toLowerCase();
+  if (n.endsWith('/.lares')) return n.slice(0, -'.lares'.length) + '.dashboard';
+  if (n.endsWith('/.dashboard')) return n.slice(0, -'.dashboard'.length) + '.lares';
+  return undefined;
+}
+
 /**
  * Redact a canonical absolute path into a scoped, username/drive-free display (§5.6).
  * Most-specific root wins: skill → dashboard → workspace → home → external. Sensitive
@@ -555,7 +574,8 @@ export function redactFileHeatPath(
       return { pathDisplay: rel ? `$SKILL/${skillName}/${rel}` : `$SKILL/${skillName}`, pathHash, pathScope: 'skill' };
     }
   }
-  const dashRel = relUnder(absLower, roots.dashboardRoot);
+  const dashRel = relUnder(absLower, roots.dashboardRoot)
+    ?? relUnder(absLower, legacyStateRootSibling(roots.dashboardRoot));
   if (dashRel !== null) {
     return { pathDisplay: dashRel ? `$DASHBOARD/${dashRel}` : '$DASHBOARD', pathHash, pathScope: 'dashboard' };
   }

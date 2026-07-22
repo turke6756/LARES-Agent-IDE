@@ -163,13 +163,15 @@ const TOOLSET_SCRIPT_MAP: Record<string, { script: string; fn: string }> = {
   orchestration: { script: 'mcp-tools-orchestration.js', fn: 'getOrchestrationToolDefinitions' },
   teams: { script: 'mcp-tools-teams.js', fn: 'getTeamsToolDefinitions' },
   comms: { script: 'mcp-tools-comms.js', fn: 'getCommsToolDefinitions' },
-  // WP-F (P5): observability split into core (operational, granted to supervisor
+  // WP-F (P5) split observability into core (operational, granted to supervisor
   // + worker) and analytics (deep context-optimizer surface, supervisor-only).
-  // `observability` stays as the backward-compat union so a persona/grant still
-  // naming it resolves (and stays "registered" for the config-drift check).
+  // The analytics toolset was later RETIRED — its 13 tools were replaced by the
+  // on-demand snapshot exporter + the `context-analytics` skill — so it no longer
+  // resolves here. `observability` stays as the backward-compat alias so a
+  // persona/grant still naming it resolves (and stays "registered" for the
+  // config-drift check).
   observability: { script: 'mcp-tools-observability.js', fn: 'getObservabilityToolDefinitions' },
   'observability-core': { script: 'mcp-tools-observability.js', fn: 'getObservabilityCoreToolDefinitions' },
-  'observability-analytics': { script: 'mcp-tools-observability.js', fn: 'getObservabilityAnalyticsToolDefinitions' },
   notebooks: { script: 'mcp-tools-notebooks.js', fn: 'getNotebooksToolDefinitions' },
   browser: { script: 'mcp-browser-tools.js', fn: 'getBrowserToolDefinitions' },
   'browser-present': { script: 'mcp-browser-present-tools.js', fn: 'getBrowserPresentToolDefinitions' },
