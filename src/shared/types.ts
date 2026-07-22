@@ -1633,6 +1633,12 @@ export interface IpcApi {
     setSettings: (settings: LifecycleSettings) => Promise<LifecycleSettings>;
     onSettingsChanged: (cb: (settings: LifecycleSettings) => void) => () => void;
   };
+  contextGauge: {
+    getSettings: () => Promise<ContextGaugeSettings>;
+    /** Returns the settings actually stored (sanitized + clamped main-side). */
+    setSettings: (settings: ContextGaugeSettings) => Promise<ContextGaugeSettings>;
+    onSettingsChanged: (cb: (settings: ContextGaugeSettings) => void) => () => void;
+  };
   browser: {
     createTab: (opts: BrowserCreateTabOptions) => Promise<{ tabId: string }>;
     closeTab: (tabId: string) => Promise<void>;
