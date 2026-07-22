@@ -72,3 +72,26 @@ export function ensureWindowsPath(p: string, pathType: PathType): string {
   if (pathType === 'windows') return p;
   return wslToWindowsPath(p);
 }
+
+/** Convert a Windows-native path into the agent's path space. Native-Windows
+ *  agents keep the path; WSL agents get the /mnt or /home form. Detects
+ *  unmappable paths (windowsToWslPath returns its input unchanged for those)
+ *  and reports an error instead of emitting a bad path.
+ *
+ *  A missing workingDirectory is rejected outright (addendum E): falling back to
+ *  detectPathType(winPath) would silently treat a WSL agent's target as Windows
+ *  when the agent lookup failed, reintroducing the wrong-path bug. */
+export function toAgentPath(
+  winPath: string, workingDirectory: string,
+): { ok: true; path: string } | { ok: false; error: string } {
+  if (!workingDirectory) {
+    return { ok: false, error: 'Agent working directory unavailable.' };
+  }
+  const agentType = detectPathType(workingDirectory);
+  if (agentType !== 'wsl') return { ok: true, path: winPath };
+  const wsl = windowsToWslPath(winPath);
+  if (!wsl.startsWith('/')) {
+    return { ok: false, error: `Cannot map "${winPath}" into this WSL agent's path space.` };
+  }
+  return { ok: true, path: wsl };
+}

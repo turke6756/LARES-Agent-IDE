@@ -64,6 +64,8 @@ const TESTS = [
   'dist/main/main/supervisor/role-lane.test.js',
   'dist/main/main/supervisor/resolve-launch-command.test.js',
   'dist/main/main/persona-scanner.test.js',
+  'dist/main/main/pasted-image-store.test.js',
+  'dist/main/main/path-utils-to-agent.test.js',
   'dist/main/main/supervisor/mcp-config-builder.test.js',
   'dist/main/main/supervisor/scaffold-version-migration.test.js',
   'dist/main/main/supervisor/provider-dir-trust.test.js',

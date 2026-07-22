@@ -218,6 +218,13 @@ const api: IpcApi = {
   system: {
     pickDirectory: (startInWsl?: boolean) => ipcRenderer.invoke('system:pick-directory', startInWsl),
     healthCheck: () => ipcRenderer.invoke('system:health-check'),
+    // Full prerequisite report (first-run dialog, status card, Help ▸ Check
+    // prerequisites). Same main-side detector that backs healthCheck above —
+    // `force` bypasses its TTL cache for the Recheck button.
+    getRuntimePrerequisites: (force?: boolean) =>
+      ipcRenderer.invoke('system:get-runtime-prerequisites', force),
+    /** https-only, main-side allowlisted. Returns false if the URL was rejected. */
+    openExternal: (url: string) => ipcRenderer.invoke('system:open-external', url),
     openFile: (filePath, pathType) => ipcRenderer.invoke('system:open-file', filePath, pathType),
     openFileInWorkspace: (filePath, workspaceDir, pathType) =>
       ipcRenderer.invoke('system:open-file-in-workspace', filePath, workspaceDir, pathType),

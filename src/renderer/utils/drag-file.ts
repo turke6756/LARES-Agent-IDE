@@ -85,3 +85,57 @@ export function getDroppedNativePaths(dataTransfer: DataTransfer): string[] {
     .map((file) => window.api.files.getPathForFile(file))
     .filter(Boolean);
 }
+
+export const SUPPORTED_IMAGE_MIMES = ['image/png', 'image/jpeg'] as const;
+const MAX_IMAGE_BYTES = 25 * 1024 * 1024; // mirror of main; early reject
+
+/** Prefer PNG, then JPEG; null if no supported image type present. */
+export function pickSupportedImageMime(types: readonly string[]): string | null {
+  if (types.includes('image/png')) return 'image/png';
+  if (types.includes('image/jpeg')) return 'image/jpeg';
+  return null;
+}
+
+async function blobToImage(
+  blob: Blob, mime: string,
+): Promise<{ bytes: Uint8Array; mime: string } | { error: string }> {
+  if (blob.size === 0) return { error: 'Image was empty.' };
+  if (blob.size > MAX_IMAGE_BYTES) return { error: 'Image too large (max 25 MB).' };
+  const buf = await blob.arrayBuffer();
+  return { bytes: new Uint8Array(buf), mime };
+}
+
+/** For xterm's keyboard handler (no ClipboardEvent available). Returns:
+ *  - {bytes,mime} on a supported image
+ *  - null when there is no image at all (→ caller does text fallback)
+ *  - {error} when an image exists but is unsupported/too-large (→ surface it) */
+export async function readClipboardImage():
+  Promise<{ bytes: Uint8Array; mime: string } | { error: string } | null> {
+  try {
+    if (!navigator.clipboard?.read) return null;
+    const items = await navigator.clipboard.read();
+    let sawImage = false;
+    for (const item of items) {
+      if (item.types.some((t) => t.startsWith('image/'))) sawImage = true;
+      const mime = pickSupportedImageMime(item.types);
+      if (!mime) continue;
+      return await blobToImage(await item.getType(mime), mime);
+    }
+    return sawImage ? { error: 'Only PNG and JPEG images are supported.' } : null;
+  } catch { return null; }
+}
+
+/** For chat's onPaste — consume the Blob already on the ClipboardEvent (no
+ *  second navigator.clipboard.read(), avoiding a permission/race window). */
+export async function imageFromClipboardEvent(
+  e: React.ClipboardEvent,
+): Promise<{ bytes: Uint8Array; mime: string } | { error: string } | null> {
+  const items = Array.from(e.clipboardData.items);
+  const anyImage = items.some((i) => i.type.startsWith('image/'));
+  const supported = items.find((i) =>
+    (SUPPORTED_IMAGE_MIMES as readonly string[]).includes(i.type));
+  if (!supported) return anyImage ? { error: 'Only PNG and JPEG images are supported.' } : null;
+  const file = supported.getAsFile();
+  if (!file) return { error: 'Could not read the pasted image.' };
+  return blobToImage(file, supported.type);
+}

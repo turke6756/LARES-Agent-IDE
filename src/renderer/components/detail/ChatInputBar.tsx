@@ -10,6 +10,7 @@ import {
   type MentionContext,
 } from '../../lib/agent-mention';
 import { getCaretCoordinates } from '../../lib/textarea-caret';
+import { imageFromClipboardEvent, isExternalFileDrop, getDroppedNativePaths } from '../../utils/drag-file';
 import AtMentionDropdown from './AtMentionDropdown';
 
 const ACCEPTING_INPUT: AgentStatus[] = ['idle', 'waiting', 'done', 'crashed'];
@@ -42,6 +43,9 @@ export default function ChatInputBar({
   const [sending, setSending] = useState(false);
   const [isDragOver, setIsDragOver] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
+  // Attachment (paste/drop image) errors — kept separate from sendError so the
+  // banner reads "Attachment failed:", not the misleading "Send failed:".
+  const [attachError, setAttachError] = useState<string | null>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   // Positioned ancestor for the absolutely-positioned mention dropdown; caret
   // coordinates are expressed relative to this wrapper (Slice D wire-up).
@@ -56,6 +60,12 @@ export default function ChatInputBar({
   const wsAgents = useMemo(
     () => allAgents.filter((a) => a.workspaceId === selectedWorkspaceId),
     [allAgents, selectedWorkspaceId],
+  );
+  // This agent's working directory — drives image-path conversion into the
+  // agent's path space (Windows vs. WSL).
+  const agentCwd = useMemo(
+    () => allAgents.find((a) => a.id === agentId)?.workingDirectory || '',
+    [allAgents, agentId],
   );
   const [mention, setMention] = useState<MentionContext | null>(null);
   const [highlighted, setHighlighted] = useState(0);
@@ -75,17 +85,29 @@ export default function ChatInputBar({
   const lastSentRef = useRef<string>('');
   // Mirror of `input` readable synchronously inside the (agentId-scoped)
   // onSendInputError callback, which would otherwise close over a stale value.
+  // updateInput (and the agent-change / staging-draft loads) also assign this
+  // synchronously BEFORE setInput (addendum F) so an async paste callback always
+  // appends onto the very latest text — this effect is a backstop, not the
+  // guarantee.
   const inputValueRef = useRef(input);
   useEffect(() => {
     inputValueRef.current = input;
   }, [input]);
+  // Latest selected agent, read synchronously by the async paste callback so an
+  // image saved for agent A can't land in agent B's draft after a mid-save
+  // switch (addendum G).
+  const currentAgentIdRef = useRef(agentId);
+  currentAgentIdRef.current = agentId;
 
   // If the selected agent changes while this component stays mounted, swap to that agent's draft.
   useEffect(() => {
     if (lastAgentIdRef.current === agentId) return;
     lastAgentIdRef.current = agentId;
-    setInput(loadDraft(agentId));
+    const next = loadDraft(agentId);
+    inputValueRef.current = next; // sync mirror before setInput (addendum F)
+    setInput(next);
     setSendError(null);
+    setAttachError(null);
   }, [agentId]);
 
   // When the staging container performs a swap, it writes the new value to
@@ -96,6 +118,7 @@ export default function ChatInputBar({
     if (lastSyncSignalRef.current === syncSignal) return;
     lastSyncSignalRef.current = syncSignal;
     const next = loadDraft(agentId);
+    inputValueRef.current = next; // sync mirror before setInput (addendum F)
     setInput(next);
     requestAnimationFrame(() => {
       const ta = inputRef.current;
@@ -131,10 +154,12 @@ export default function ChatInputBar({
   }, [agentId]);
 
   const updateInput = useCallback((next: string) => {
+    inputValueRef.current = next; // sync mirror BEFORE setInput (addendum F)
     setInput(next);
     saveDraft(agentId, next);
     if (sendError) setSendError(null);
-  }, [agentId, sendError]);
+    if (attachError) setAttachError(null);
+  }, [agentId, sendError, attachError]);
 
   // Re-run "@"-mention detection from the live caret. Called on input changes
   // AND on caret moves (keyup / click / select) so the menu opens/closes as the
@@ -285,6 +310,7 @@ export default function ChatInputBar({
     if (
       types.includes('application/x-agent-card') ||
       types.includes('application/x-file-path') ||
+      types.includes('Files') ||
       types.includes('text/plain')
     ) {
       e.preventDefault();
@@ -299,31 +325,9 @@ export default function ChatInputBar({
     setIsDragOver(false);
   }, []);
 
-  const handleDrop = useCallback((e: React.DragEvent) => {
-    e.preventDefault();
-    setIsDragOver(false);
-
-    // Agent cards carry a dedicated payload (set in AgentCard.tsx). Insert an
-    // identity token so the receiving agent knows it's a dashboard agent.
-    let token: string;
-    const agentPayload = e.dataTransfer.getData('application/x-agent-card');
-    if (agentPayload) {
-      try {
-        const a = JSON.parse(agentPayload) as { id: string; title: string };
-        // Shared full-id token — same format as the "@"-mention path.
-        token = formatAgentToken(a);
-      } catch {
-        token = `@${agentPayload}`;
-      }
-    } else {
-      const path =
-        e.dataTransfer.getData('application/x-file-path') ||
-        e.dataTransfer.getData('text/plain');
-      if (!path) return;
-      // Format as @path — readable in prose and visually distinct.
-      token = `@${path}`;
-    }
-
+  // Sync-only: splices at the captured caret. Safe for drop (no await between
+  // capture and apply). Behavior identical to the previous inline drop insertion.
+  const insertTokenAtCaret = useCallback((token: string) => {
     const ta = inputRef.current;
     const prev = input;
     let next: string;
@@ -336,7 +340,6 @@ export default function ChatInputBar({
       const needsTrailingSpace = after.length > 0 && !/^\s/.test(after);
       const insert = `${needsLeadingSpace ? ' ' : ''}${token}${needsTrailingSpace ? ' ' : ' '}`;
       next = before + insert + after;
-      // Restore caret after the inserted token
       requestAnimationFrame(() => {
         const caret = (before + insert).length;
         ta.focus();
@@ -353,6 +356,79 @@ export default function ChatInputBar({
     }
     updateInput(next);
   }, [input, updateInput]);
+
+  // Async-safe: appends to the LATEST input (inputValueRef mirrors it
+  // synchronously via updateInput), so text typed while the IPC was pending is
+  // preserved (no overwrite race).
+  const insertTokenAtEnd = useCallback((token: string) => {
+    const prev = inputValueRef.current;
+    const sep = prev.length === 0 || /\s$/.test(prev) ? '' : ' ';
+    const next = `${prev}${sep}${token} `;
+    updateInput(next);
+    requestAnimationFrame(() => {
+      const ta = inputRef.current;
+      ta?.focus();
+      ta?.setSelectionRange(next.length, next.length);
+    });
+  }, [updateInput]);
+
+  // Paste — consume the event Blob directly (no second navigator.clipboard.read),
+  // append via the async-safe helper.
+  const handlePaste = useCallback(async (e: React.ClipboardEvent) => {
+    // Only intercept when the clipboard actually carries an image; let text paste through.
+    if (!Array.from(e.clipboardData.items).some((i) => i.type.startsWith('image/'))) return;
+    e.preventDefault();
+    const startAgentId = agentId; // guard against a mid-save agent switch (addendum G)
+    const img = await imageFromClipboardEvent(e);
+    if (!img) return;
+    if ('error' in img) { setAttachError(img.error); return; }
+    const res = await window.api.files.writeImageTemp(img.bytes, img.mime, agentCwd);
+    if (currentAgentIdRef.current !== startAgentId) return; // switched agents — drop it
+    if (res.ok) insertTokenAtEnd(`@${res.path}`);
+    else setAttachError(res.error);
+  }, [agentId, agentCwd, insertTokenAtEnd]);
+
+  const handleDrop = useCallback(async (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragOver(false);
+
+    // 1. Agent cards carry a dedicated payload (set in AgentCard.tsx). Insert an
+    //    identity token so the receiving agent knows it's a dashboard agent.
+    const agentPayload = e.dataTransfer.getData('application/x-agent-card');
+    if (agentPayload) {
+      let token: string;
+      try {
+        const a = JSON.parse(agentPayload) as { id: string; title: string };
+        token = formatAgentToken(a); // shared full-id token — same as the "@"-mention path
+      } catch {
+        token = `@${agentPayload}`;
+      }
+      insertTokenAtCaret(token);
+      return;
+    }
+    // 2. In-app file path (tree/file chips).
+    const inApp = e.dataTransfer.getData('application/x-file-path');
+    if (inApp) {
+      insertTokenAtCaret(`@${inApp}`);
+      return;
+    }
+    // 3. External OS image files — BEFORE text/plain (Explorer drops also expose it).
+    if (isExternalFileDrop(e.dataTransfer)) {
+      const native = getDroppedNativePaths(e.dataTransfer); // sync: call before any await
+      if (native.length === 0) {
+        setAttachError('Dropped item has no file path (drag the image file from Explorer).');
+        return;
+      }
+      const results = await window.api.files.resolveImageDrops(native, agentCwd);
+      for (const r of results) if (r.ok) insertTokenAtCaret(`@${r.path}`);
+      const bad = results.find((r) => !r.ok);
+      if (bad && !bad.ok) setAttachError(bad.error);
+      return;
+    }
+    // 4. Generic text fallback.
+    const text = e.dataTransfer.getData('text/plain');
+    if (text) insertTokenAtCaret(`@${text}`);
+  }, [insertTokenAtCaret, agentCwd]);
 
   const statusHint = isDragOver
     ? 'Drop to attach file path…'
@@ -405,6 +481,7 @@ export default function ChatInputBar({
           onKeyUp={handleCaretSync}
           onClick={handleCaretSync}
           onSelect={handleCaretSync}
+          onPaste={handlePaste}
           onBlur={handleBlur}
           disabled={isDisabled}
           placeholder={statusHint}
@@ -458,6 +535,21 @@ export default function ChatInputBar({
           </span>
         </div>
       ) : null}
+      {attachError && (
+        <div className="flex items-start gap-1.5 mt-1.5 px-2">
+          <span className="inline-block w-1.5 h-1.5 mt-1.5 rounded-full bg-[var(--color-accent-red)] shrink-0" />
+          <span className="text-[11px] text-[var(--color-accent-red)] leading-snug break-words">
+            Attachment failed: {attachError}
+          </span>
+          <button
+            onClick={() => setAttachError(null)}
+            className="ml-auto text-[10px] uppercase tracking-wider text-gray-500 hover:text-gray-300 shrink-0"
+            aria-label="Dismiss attachment error"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
     </div>
   );
 }
