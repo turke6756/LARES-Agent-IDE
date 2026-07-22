@@ -34,6 +34,7 @@ import {
   CONTINUATION_STOP_FLUSH_DELAY_MS,
   TERMINAL_AGENT_RELEASE_DELAY_MS,
   FILE_ACTIVITY_RETENTION_SESSIONS,
+  LARES_DIR_NAME, LEGACY_LARES_DIR_NAME,
 } from '../../shared/constants';
 import { isTerminalChatStatus } from './agent-chat-history';
 import {
@@ -2536,6 +2537,68 @@ export class AgentSupervisor extends EventEmitter {
     }
   }
 
+  /** Lares-rename regression fix — heal the lane scaffold for an agent whose
+   *  PERSISTED cwd still carries the legacy `.dashboard/` spelling after the
+   *  workspace state dir was renamed to `.lares/`.
+   *
+   *  Pre-rename agent rows deliberately keep their old working_directory (the
+   *  Claude project slug — and therefore session resume — derives from the
+   *  cwd, so rewriting the row would orphan the agent's transcript). But the
+   *  in-place rename moved `.claude/settings.json` + the shared hook script
+   *  out from under that cwd, and a relaunch/reconcile re-creates the folder
+   *  EMPTY (mkdir + sysprompt only). Claude Code then runs with NO hooks:
+   *  status never flips (hook-owned lanes have PTY inference disabled) and
+   *  sendInput's submit confirmation times out → false "Send failed" on
+   *  every successfully delivered chat message.
+   *
+   *  Existence-only heal, on purpose: write the CURRENT bundled content for
+   *  any missing lane file under the agent's actual legacy-spelling cwd, and
+   *  never touch files that exist (no version migration, no sidecar writes —
+   *  the shared `.lares/` sidecar keeps governing the live copies; keying the
+   *  legacy copies into it would let either side mask the other's upgrades).
+   *  No-op when the workspace itself still resolves to `.dashboard/`
+   *  (rename-failed fallback — spellings already agree). */
+  private healLegacyStateDirScaffold(agent: Agent, pathType: string): void {
+    const norm = agent.workingDirectory.replace(/\\/g, '/').replace(/\/+$/, '');
+    const laneMatch = norm.match(
+      new RegExp(`/${LEGACY_LARES_DIR_NAME.replace('.', '\\.')}/(supervisor|researcher|workers/[^/]+|agents/[^/]+)$`),
+    );
+    if (!laneMatch) return;
+    const root = getEffectiveWorkspaceRoot(agent);
+    if (workspaceStateDirName(root, pathType) === LEGACY_LARES_DIR_NAME) return;
+
+    const lane = laneMatch[1];
+    // Every matched lane needs the shared hook script — the lane settings.json
+    // hooks resolve `${CLAUDE_PROJECT_DIR}/../scripts/dashboard-status.mjs`
+    // (or `../../` for workers/personas) against the agent's ACTUAL cwd.
+    const files: Record<string, ScaffoldFile> = { ...AgentSupervisor.WORKSPACE_SCRIPT_FILES };
+    if (lane === 'supervisor') Object.assign(files, AgentSupervisor.SUPERVISOR_FILES);
+    else if (lane === 'researcher') Object.assign(files, AgentSupervisor.RESEARCHER_FILES);
+    else if (lane === 'workers/claude') Object.assign(files, AgentSupervisor.WORKER_FILES_CLAUDE);
+    // codex/gemini workers: hooks ride CODEX_HOME / chat-stream, not cwd files.
+
+    let wrote = 0;
+    for (const [rel, file] of Object.entries(files)) {
+      // `.lares/…` map key → literal `.dashboard/…` write path. Legacy-prefixed
+      // paths pass through translateStateRelPath untouched, so the write lands
+      // in the agent's actual cwd spelling regardless of the resolver.
+      const legacyRel = LEGACY_LARES_DIR_NAME + rel.slice(LARES_DIR_NAME.length);
+      try {
+        if (scaffoldFileExists(root, legacyRel, pathType)) continue;
+        atomicWriteScaffoldText(root, legacyRel, file.content, !!file.executable, pathType);
+        wrote++;
+      } catch (err) {
+        console.warn(`[state-dir] could not heal legacy scaffold file ${legacyRel} for ${agent.id}:`, err);
+      }
+    }
+    if (wrote > 0) {
+      console.log(
+        `[state-dir] healed ${wrote} scaffold file(s) into legacy ${LEGACY_LARES_DIR_NAME}/${lane} ` +
+        `for agent ${agent.id} (cwd pre-dates the .lares rename)`,
+      );
+    }
+  }
+
   /** Seed the shared worker behavioral memory (`.lares/workers/claude/
    *  behavioral.md`) — write-if-absent, then hands off ownership to workers.
    *
@@ -3360,6 +3423,11 @@ export class AgentSupervisor extends EventEmitter {
         spoolRoot, workspaceStateDirName(spoolRoot), 'pending-status.jsonl');
       // Tail the same file from the dashboard side.
       this.ensureSpoolTailer(agent);
+      // Lares-rename regression fix: a pre-rename agent relaunches into its
+      // persisted `.dashboard/…` cwd, which the in-place rename left without
+      // `.claude/settings.json` — no hooks, frozen status, false send errors.
+      // Restore any missing lane files at the agent's actual cwd spelling.
+      this.healLegacyStateDirScaffold(agent, 'windows');
     }
     // PHASE 0 (agent-ownership) — propagate the dashboard API credential into the
     // agent's OWN process env so its Bash tool / child subprocesses inherit it.
@@ -3876,6 +3944,9 @@ export class AgentSupervisor extends EventEmitter {
         `DASHBOARD_SPOOL_PATH=${shQuote(`${wslSpoolRoot}/${workspaceStateDirName(wslSpoolRoot, 'wsl')}/pending-status.jsonl`)}`);
       // Tail the same file from the dashboard side (UNC form).
       this.ensureSpoolTailer(agent);
+      // Lares-rename regression fix (mirror of the Windows path above): heal
+      // missing lane scaffold files under a pre-rename `.dashboard/…` cwd.
+      this.healLegacyStateDirScaffold(agent, 'wsl');
     }
     // PHASE 0 (agent-ownership) — propagate the dashboard API credential into the
     // agent's OWN process env (mirrors the Windows path above) so its Bash tool /

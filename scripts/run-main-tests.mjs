@@ -73,6 +73,8 @@ const TESTS = [
   'dist/main/main/supervisor/scaffold-version-migration.test.js',
   // Lares rebrand — one-time .dashboard → .lares state-dir migration.
   'dist/main/main/workspace-state-dir.test.js',
+  // Lares-rename regression: legacy-cwd agents regain their hook scaffold at launch.
+  'dist/main/main/supervisor/legacy-state-dir-heal.test.js',
   'dist/main/main/supervisor/supervisor-persona-capability-parity.test.js',
   'dist/main/main/supervisor/provider-dir-trust.test.js',
   'dist/main/main/supervisor/handoff-handshake.test.js',
