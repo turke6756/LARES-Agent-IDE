@@ -95,6 +95,12 @@ export default function FileContentArea({ tabId, filePath, pathType }: Props) {
     // editing.
     wysiwygIsDefault: false,
     sniff,
+    // Anti-eviction (edit-loss hotfix): a dirty wysiwyg session means the
+    // sniff above ran over the LIVE DRAFT — the editor's own serialization,
+    // which represents ordinary states (empty paragraph, empty list item) as
+    // `<br />` html blocks. The session owns the doc; the sniff only gates
+    // entry (pristine sessions sniff disk/baseline bytes and still route).
+    sessionOwnsDoc: editState?.mode === 'wysiwyg' && !!editState.dirty,
   });
 
   // WYSIWYG mounts need tabEditState created *first* (plan §5: created on

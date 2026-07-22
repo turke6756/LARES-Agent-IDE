@@ -505,6 +505,17 @@ export type SniffResult = { ok: true } | { ok: false; reason: SniffReason };
 const ESM_LINE = /^(?:import\s+(?:.+\s+from\s+)?['"][^'"]+['"]|export\s+(?:default\s|const\s|let\s|var\s|function\s|class\s|\{))/;
 
 /**
+ * Crepe serializer artifact (edit-loss hotfix, probe-verified): Milkdown's
+ * getMarkdown() serializes ordinary empty editing states as standalone
+ * `<br />` html blocks — an empty paragraph (Enter between blocks) becomes
+ * `<br />`, an empty list item becomes `* <br />`. Those are round-trip
+ * artifacts of the editor itself, not authored raw HTML, so they must never
+ * flip a doc (or a live draft) to the raw-html exclusion. One or more br
+ * tags, whitespace-separated, any casing / self-closing form.
+ */
+const BR_ARTIFACT_ONLY = /^(?:<br\s*\/?>\s*)+$/i;
+
+/**
  * Pure routing decision: can this markdown open in WYSIWYG, or does it stay on
  * the old renderer? `.mdx` is normally routed by extension at the dispatch;
  * pass `opts.filePath` to let the sniffer own that rule too. Content-level MDX
@@ -543,6 +554,11 @@ export function sniffWysiwygCompatibility(
   let rawHtmlBlock = false;
   visit(root, (node, parent) => {
     if (node.type !== 'html' || parent === null) return;
+    // Serializer artifacts (`<br />`-only blocks) are tolerated — see
+    // BR_ARTIFACT_ONLY above. Real raw HTML (divs, tables, comments) still
+    // excludes the doc at entry.
+    const value = (node as { value?: string }).value ?? '';
+    if (BR_ARTIFACT_ONLY.test(value.trim())) return;
     const t = parent.type;
     if (t === 'root' || t === 'blockquote' || t === 'listItem') rawHtmlBlock = true;
   });

@@ -485,6 +485,31 @@ describe('sniffWysiwygCompatibility', () => {
     });
   });
 
+  it('Crepe `<br />` serializer artifacts are tolerated (edit-loss hotfix)', () => {
+    // Probe-verified: Crepe serializes an empty paragraph (Enter between
+    // blocks) as a standalone `<br />` html block. Not authored raw HTML.
+    expect(sniffWysiwygCompatibility('para one\n\n<br />\n\npara two\n', 50)).toEqual(ok);
+    // Variant spellings / casing / repetition, whitespace-separated.
+    expect(sniffWysiwygCompatibility('a\n\n<br>\n\nb\n', 50)).toEqual(ok);
+    expect(sniffWysiwygCompatibility('a\n\n<BR/> <br />\n\nb\n', 50)).toEqual(ok);
+    // Probe-verified: an empty list item serializes as `* <br />` — the html
+    // node lands nested under the listItem.
+    expect(sniffWysiwygCompatibility('* item one\n\n* <br />\n', 50)).toEqual(ok);
+  });
+
+  it('a real HTML block alongside a br artifact is still excluded', () => {
+    expect(sniffWysiwygCompatibility('a\n\n<br />\n\n<div>x</div>\n', 50)).toEqual({
+      ok: false,
+      reason: 'raw-html',
+    });
+    // br mixed with real content inside ONE html block is not an artifact
+    // (`<br />\n<div>…` parses as a single html block node).
+    expect(sniffWysiwygCompatibility('a\n\n<br />\n<div>x</div>\n', 50)).toEqual({
+      ok: false,
+      reason: 'raw-html',
+    });
+  });
+
   it('inline HTML is allowed', () => {
     expect(sniffWysiwygCompatibility('Press <kbd>Ctrl</kbd> to win.\n', 50)).toEqual(ok);
   });

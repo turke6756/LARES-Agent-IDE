@@ -43,8 +43,17 @@ export function resolveContentView(opts: {
   wysiwygIsDefault: boolean;
   /** sniffWysiwygCompatibility() result; null = not markdown / nothing to sniff */
   sniff: SniffResult | null;
+  /**
+   * The wysiwyg edit session already OWNS the doc: it holds a live (dirty)
+   * draft, so the sniff ran over the editor's own serialization, not over
+   * entry content (disk bytes / a pristine baseline). Anti-eviction invariant
+   * (edit-loss hotfix): such a session is never demoted by a failing sniff —
+   * the sniff's job is gating ENTRY into wysiwyg, not policing a mounted
+   * editor whose serializer artifacts it might misread as raw HTML.
+   */
+  sessionOwnsDoc: boolean;
 }): ResolvedContentView {
-  const { isMarkdown, isEditable, mode, wysiwygIsDefault, sniff } = opts;
+  const { isMarkdown, isEditable, mode, wysiwygIsDefault, sniff, sessionOwnsDoc } = opts;
 
   if (mode === 'source') {
     return isEditable ? { kind: 'source' } : { kind: 'view' };
@@ -58,6 +67,13 @@ export function resolveContentView(opts: {
   const desired = mode ?? (wysiwygIsDefault ? 'wysiwyg' : 'view');
   if (desired !== 'wysiwyg') {
     return { kind: 'view' };
+  }
+  // Anti-eviction: an active wysiwyg session with a live draft keeps the
+  // editor mounted no matter what the draft sniffs as. Entry stays gated:
+  // a session with no live draft (pristine — sniffing disk/baseline bytes)
+  // or no session at all still routes through the sniff below.
+  if (mode === 'wysiwyg' && sessionOwnsDoc) {
+    return { kind: 'wysiwyg' };
   }
   if (sniff?.ok) {
     return { kind: 'wysiwyg' };
