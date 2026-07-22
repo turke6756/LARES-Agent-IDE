@@ -50,7 +50,11 @@ vi.mock('@milkdown/crepe', () => {
     private listeners: Array<(markdown: string) => void> = [];
     editor = {
       config: (fn: (ctx: unknown) => void) => {
-        fn({ update: (_key: unknown, updater: (prev: Record<string, unknown>) => unknown) => updater({}) });
+        // MilkdownEditor updates two ctxs: editorViewOptionsCtx (object
+        // spread + .attributes read) and prosePluginsCtx (array spread,
+        // Phase 2's revision plugin). An empty ARRAY satisfies both updater
+        // shapes ({...[]} === {}, [].attributes === undefined).
+        fn({ update: (_key: unknown, updater: (prev: never) => unknown) => updater([] as never) });
       },
       action: (_fn: unknown) => {
         /* replaceAll etc. — inert in the fake */

@@ -236,7 +236,18 @@ interface DashboardState {
   enterViewMode: (tabId: string, initialContent: string) => void;
   exitEditMode: (tabId: string) => void;
   setDraftContent: (tabId: string, content: string) => void;
-  saveTab: (tabId: string) => Promise<boolean>;
+  // The single write executor (edit-loss Phase 2): echo token + evictTabCache
+  // + saving/error state live here. `opts` is passed ONLY by the save
+  // coordinator (saveCoordinator.ts) — `content` writes the coordinator's
+  // captured snapshot instead of the live draft (and leaves `dirty` untouched
+  // so the store can never blip clean under an in-flight edit; the
+  // coordinator recomputes dirty after its completion gates). `revision` /
+  // `expectedDiskHash` / `force` are threaded but unenforced until Phases 3-4
+  // (conditional-write IPC).
+  saveTab: (
+    tabId: string,
+    opts?: { content?: string; revision?: number; expectedDiskHash?: string | null; force?: boolean },
+  ) => Promise<boolean>;
   discardTabChanges: (tabId: string) => void;
   markExternalChange: (tabId: string, freshContent: string) => void;
   dismissExternalChange: (tabId: string) => void;
@@ -730,12 +741,16 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
     });
   },
 
-  saveTab: async (tabId) => {
+  saveTab: async (tabId, opts) => {
     const { openTabs, tabEditState } = get();
     const tab = openTabs.find((t) => t.id === tabId);
     const editState = tabEditState[tabId];
     if (!tab || !tab.filePath || !editState) return false;
-    const draftToSave = editState.draftContent;
+    // Coordinator path: write the captured snapshot, not the live draft (a
+    // draft that moves mid-write must not change what this write puts on
+    // disk — the coordinator's gates decide what happens next).
+    const fromCoordinator = opts?.content !== undefined;
+    const draftToSave = opts?.content ?? editState.draftContent;
 
     set((state) => ({
       tabEditState: {
@@ -779,6 +794,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
       tabId,
       file: diagBasename(tab.filePath),
       writtenHash: diagHash(draftToSave),
+      revision: opts?.revision,
       liveDraftHash: diagHash(get().tabEditState[tabId]?.draftContent),
     });
     set((state) => {
@@ -789,8 +805,13 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
           ...state.tabEditState,
           [tabId]: {
             ...current,
+            // B1 install: disk truth is what THIS write put there.
             originalContent: draftToSave,
-            dirty: current.draftContent !== draftToSave,
+            // Coordinator writes leave `dirty` untouched: the coordinator
+            // recomputes it after its revision/serialization gates, so the
+            // store never blips clean while a raced edit is still live only
+            // in the editor (edit-loss Phase 2 §2.1).
+            dirty: fromCoordinator ? current.dirty : current.draftContent !== draftToSave,
             saving: false,
             error: null,
           },

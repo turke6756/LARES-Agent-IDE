@@ -5,6 +5,7 @@ import { fileDragStart } from '../../utils/drag-file';
 import { useDashboardStore, type ColoredFileTab } from '../../stores/dashboard-store';
 import { applyHorizontalWheelScroll } from '../../lib/horizontal-wheel';
 import { positionFloating } from '../../lib/floating/positionFloating';
+import { hasUnsavedWork, requestSave } from './saveCoordinator';
 
 interface Props {
   tabs: ColoredFileTab[];
@@ -226,9 +227,11 @@ export default function FileTabBar({ tabs, activeTabId, onSelectTab, onCloseTab 
 
     // SAVE-BEFORE-DETACH: never lose a source-tab draft (Reviewer #1). On
     // cancel/failure, abort the detach and keep the dirty tab in the strip.
-    const dirty = !!store.tabEditState[tab.id]?.dirty;
-    if (dirty) {
-      const saved = await store.saveTab(tab.id);
+    // Routed through the save coordinator (edit-loss Phase 2):
+    // hasUnsavedWork() synchronously flushes a live canvas edit still inside
+    // the ~200ms debounce into the store draft, so it counts — and saves.
+    if (hasUnsavedWork(tab.id)) {
+      const saved = await requestSave(tab.id);
       if (!saved) return;
     }
 

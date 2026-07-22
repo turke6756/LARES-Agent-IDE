@@ -18,11 +18,11 @@
  * draft).
  *
  * (4b) H4 bypass — a LIVE Milkdown edit inside the ~200ms markdownUpdated
- * debounce window, then each bypass path is invoked. Desired (un-failed in
- * Phase 2): the written bytes contain the live edit (synchronous snapshot
- * flush) AND the editor rebaselines — the post-save watcher echo terminates
- * before the handler and never yields 'conflict'. Today these paths save
- * debounce-stale store content and never rebaseline.
+ * debounce window, then each bypass path is invoked. Fixed in Phase 2 (save
+ * coordinator): every entry point routes through requestSave, which snapshots
+ * the live doc synchronously at gesture time — the written bytes contain the
+ * live edit AND the editor rebaselines, so the post-save watcher echo
+ * terminates before the handler and never yields 'conflict'.
  *
  * Registered per-path with a plain loop (one failing path never hides the
  * others).
@@ -638,11 +638,11 @@ const bypassDrivers: BypassDriver[] = [
 
 describe('4b — H4 bypass: save with a live edit inside the ~200ms debounce window', () => {
   for (const driver of bypassDrivers) {
-    // FIXME(edit-loss): un-fail in Phase 2 — every entry point routes through
-    // the save coordinator, which synchronously snapshots the live doc and
-    // rebaselines on completion; the post-save watcher echo then terminates
-    // before any handler consult and never yields 'conflict'.
-    it.fails(`${driver.name} writes the live doc and rebaselines the editor`, async () => {
+    // Un-failed in Phase 2: every entry point routes through the save
+    // coordinator, which synchronously snapshots the live doc and rebaselines
+    // on completion; the post-save watcher echo then terminates before any
+    // handler consult and never yields 'conflict'.
+    it(`${driver.name} writes the live doc and rebaselines the editor`, async () => {
       const mounted = await driver.mount();
       const view = getCanvasEditorHandle(driver.tabId)!.getEditorView!()!;
       const pos = findTextPos(view, 'Second paragraph');
@@ -692,4 +692,34 @@ describe('4b — H4 bypass: save with a live edit inside the ~200ms debounce win
       }
     });
   }
+});
+
+// -- Phase 2 §2.3 — canvas Ctrl+S never double-fires through the window handler
+
+describe('canvas Ctrl+S with the window handler mounted (Phase 2 §2.3)', () => {
+  it('produces exactly one write: stopPropagation keeps the FileViewerPanel handler out', async () => {
+    seedMainTab({});
+    const mounted = await mountElement(<FileViewerPanel />);
+    await flushCrepe();
+
+    const view = getCanvasEditorHandle(TAB)!.getEditorView!()!;
+    const pos = findTextPos(view, 'Second paragraph');
+    act(() => {
+      view.dispatch(view.state.tr.insertText('ONCE ', pos));
+    });
+
+    // Dispatch on the canvas container so the event would bubble to the
+    // window handler if the canvas handler failed to stopPropagation.
+    const container = mounted.host.querySelector('.milkdown-editor')!;
+    act(() => {
+      container.dispatchEvent(
+        new KeyboardEvent('keydown', { key: 's', ctrlKey: true, bubbles: true, cancelable: true }),
+      );
+    });
+    await flushMicrotasks();
+    await flushMicrotasks();
+
+    expect(api.written).toHaveLength(1);
+    expect(api.written[0]).toContain('ONCE Second paragraph to edit.');
+  });
 });

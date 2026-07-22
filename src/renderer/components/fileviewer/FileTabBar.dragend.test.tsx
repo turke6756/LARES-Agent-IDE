@@ -177,13 +177,20 @@ describe('FileTabBar tear-off (handleDragEnd)', () => {
   });
 
   it('aborts detach when a dirty tab fails to save (save-before-detach)', async () => {
-    storeMock.state.tabEditState = { 'tab-1': { dirty: true, mode: 'source' } };
+    // Phase 2: the save routes through the coordinator, which snapshots the
+    // store draft (no editor adapter here) and passes it to saveTab as opts.
+    storeMock.state.tabEditState = {
+      'tab-1': { dirty: true, mode: 'source', draftContent: 'DRAFT', originalContent: 'ORIG' },
+    };
     storeMock.state.saveTab = vi.fn(async () => false);
     render([FILE_TAB]);
     const el = draggableTabs()[0];
     fireDrag(el, 'dragend', { dataTransfer: makeDataTransfer(), screenX: 1, screenY: 1 });
     await flush();
-    expect(storeMock.state.saveTab).toHaveBeenCalledWith('tab-1');
+    expect(storeMock.state.saveTab).toHaveBeenCalledWith(
+      'tab-1',
+      expect.objectContaining({ content: 'DRAFT' }),
+    );
     expect(detach).not.toHaveBeenCalled();
     expect(storeMock.state.detachTab).not.toHaveBeenCalled();
   });

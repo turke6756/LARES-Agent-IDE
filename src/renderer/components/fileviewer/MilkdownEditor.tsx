@@ -8,7 +8,8 @@
  * mount → unmount → mount cycle never destroys an instance mid-create.
  *
  * Store wiring (props contract with WP1-A): this component only ever calls
- * `setDraftContent` / `saveTab`, the way CodeMirrorEditor's callbacks do. It
+ * `setDraftContent` (saves route through the save coordinator's
+ * `requestSave`, edit-loss Phase 2), the way CodeMirrorEditor's callbacks do. It
  * NEVER creates `tabEditState` (WP1-A's `enterWysiwygMode` does, before
  * rendering this component) and never imports `useFileContentCache`
  * internals — fresh-content coordination arrives via the
@@ -27,8 +28,9 @@
  */
 import React, { memo, useEffect, useLayoutEffect, useRef } from 'react';
 import { Crepe } from '@milkdown/crepe';
-import { editorViewCtx, editorViewOptionsCtx } from '@milkdown/kit/core';
+import { editorViewCtx, editorViewOptionsCtx, prosePluginsCtx } from '@milkdown/kit/core';
 import { replaceAll } from '@milkdown/kit/utils';
+import { Plugin as ProsePlugin } from '@milkdown/kit/prose/state';
 import type { EditorView } from '@milkdown/kit/prose/view';
 import '@milkdown/crepe/theme/common/style.css';
 // Theme-aware palette (light + dark) keyed off the app's <html> theme class,
@@ -40,12 +42,21 @@ import { diag, diagBasename, diagHash, nextEditorMountGeneration } from './editL
 import FileCommentGutter from '../selection/FileCommentGutter';
 import { getTabScrollFraction, setTabScrollFraction } from './scrollMemory';
 import {
+  contentHash,
   prepareSpliceBaseline,
   spliceMarkdown,
   getSpliceFallbackCount,
   onSpliceFallback,
   type SpliceBaseline,
 } from './markdownSplice';
+import {
+  currentRevision,
+  noteEdit,
+  registerSaveAdapter,
+  requestSave,
+  type SaveAdapter,
+  type SaveSnapshot,
+} from './saveCoordinator';
 
 // ---------------------------------------------------------------------------
 // Fresh-content seam (WP1-A owns the registry in useFileContentCache; this
@@ -172,20 +183,17 @@ function MilkdownEditor({ tabId, filePath, content, registerFreshContentHandler 
   const containerRef = useRef<HTMLDivElement>(null);
 
   const setDraftContent = useDashboardStore((s) => s.setDraftContent);
-  const saveTab = useDashboardStore((s) => s.saveTab);
 
   // Refs keep the mount effect's dep list down to identity (tabId/filePath):
   // store actions, the registration seam, and the content prop must be
   // readable from inside the effect without remounting the editor.
   const setDraftContentRef = useRef(setDraftContent);
-  const saveTabRef = useRef(saveTab);
   const registerRef = useRef(registerFreshContentHandler);
   const contentRef = useRef(content);
   useEffect(() => {
     setDraftContentRef.current = setDraftContent;
-    saveTabRef.current = saveTab;
     registerRef.current = registerFreshContentHandler;
-  }, [setDraftContent, saveTab, registerFreshContentHandler]);
+  }, [setDraftContent, registerFreshContentHandler]);
 
   const crepeRef = useRef<Crepe | null>(null);
   const readyRef = useRef(false);
@@ -274,12 +282,29 @@ function MilkdownEditor({ tabId, filePath, content, registerFreshContentHandler 
     crepeRef.current = crepe;
     activeInstances += 1;
 
-    crepe.editor.config((ctx) =>
+    // Undebounced revision source (edit-loss Phase 2 §2.1): a per-transaction
+    // ProseMirror plugin — NOT Crepe's `listener.updated`, which this
+    // @milkdown/plugin-listener version debounces 200ms exactly like
+    // `markdownUpdated` (see saveCoordinator.noteEdit). Every doc-changing
+    // transaction advances the tab's revision synchronously with dispatch, so
+    // the coordinator's gate (a) sees an edit the instant it lands.
+    const editRevisionPlugin = new ProsePlugin({
+      state: {
+        init: () => null,
+        apply: (tr) => {
+          if (tr.docChanged && tabId) noteEdit(tabId);
+          return null;
+        },
+      },
+    });
+
+    crepe.editor.config((ctx) => {
       ctx.update(editorViewOptionsCtx, (prev) => ({
         ...prev,
         attributes: { ...(prev.attributes ?? {}), spellcheck: 'true' },
-      })),
-    );
+      }));
+      ctx.update(prosePluginsCtx, (prev) => [...prev, editRevisionPlugin]);
+    });
 
     /** Splice the editor state against the original bytes and push it as the
      * store draft. Returns the draft that was pushed. */
@@ -341,46 +366,63 @@ function MilkdownEditor({ tabId, filePath, content, registerFreshContentHandler 
       });
     });
 
-    /** Explicit save (WP1-B task 2, reshaped by plan §1.3d): flush the splice
-     * synchronously — the markdownUpdated listener is debounced 200ms and may
-     * lag a keystroke — and save when ANY dirty authority says so: a
+    /** Save adapter (edit-loss Phase 2 §2.1): the coordinator's window into
+     * this mount. `snapshot()` flushes the splice SYNCHRONOUSLY — the
+     * markdownUpdated listener is debounced 200ms and may lag a keystroke —
+     * and reports unsaved work when ANY dirty authority says so: a
      * draft-mounted canvas is editor-pristine while its preserved work lives
-     * only in the store, and that draft must still reach disk. On success,
-     * rebaseline B1+B2 on the written bytes. (Phase 2 replaces this with the
-     * save coordinator's requestSave; the dirty condition is already the
-     * coordinator's.) */
-    const performSave = (): Promise<boolean> => {
-      if (!readyRef.current || disposed) return Promise.resolve(false);
-      // Live flush wins; else the preserved store draft; null ⇒ genuinely
-      // pristine ⇒ resolve true without writing. Re-read the store AFTER the
-      // flush — flushDirtyDraft may itself update the draft.
-      const flushed = flushDirtyDraft();
-      const es = useDashboardStore.getState().tabEditState[tabId];
-      const draft = flushed ?? (es?.dirty ? es.draftContent : null);
-      if (draft === null) {
-        return Promise.resolve(true); // pristine — nothing to write
-      }
-      return saveTabRef.current(tabId).then((ok) => {
-        if (!ok || disposed) return false;
+     * only in the store, and that draft must still reach disk. `rebaseline()`
+     * installs B1+B2 after a fully-gated completed write; both are no-ops
+     * once this mount is disposed (the mount-generation guard — each mount
+     * registers its own closure). */
+    const saveAdapter: SaveAdapter = {
+      snapshot: (): SaveSnapshot | null => {
+        if (disposed || !readyRef.current) return null;
+        // Live flush wins; else the preserved store draft; null ⇒ genuinely
+        // pristine ⇒ nothing to write. Re-read the store AFTER the flush —
+        // flushDirtyDraft may itself update the draft.
+        const flushed = flushDirtyDraft();
+        const es = useDashboardStore.getState().tabEditState[tabId];
+        const draft = flushed ?? (es?.dirty ? es.draftContent : null);
+        if (draft === null) return null;
+        return {
+          draft,
+          revision: currentRevision(tabId),
+          editorSerialized: crepe.getMarkdown(),
+          // Phase 2: derived, threaded, unenforced (plan §2.1 sequencing note).
+          expectedDiskHash: es ? contentHash(es.originalContent) : null,
+        };
+      },
+      rebaseline: (written: SaveSnapshot) => {
+        if (disposed || !readyRef.current) return;
         // Rebaseline B1 (splice baseline = written bytes) + B2 (this mount's
         // serialization) + the mount bytes; dirtyRef recomputed against the
-        // fresh B2 (plan §1.3d).
+        // fresh B2 (plan §1.3d). The coordinator's gate (b) guarantees the
+        // live serialization still equals the captured one here.
         try {
-          baselineRef.current = prepareSpliceBaseline(draft);
+          baselineRef.current = prepareSpliceBaseline(written.draft);
         } catch (err) {
           console.error('[MilkdownEditor] rebaseline after save failed', err);
         }
-        mountBytesRef.current = draft;
+        mountBytesRef.current = written.draft;
         loadSerializedRef.current = crepe.getMarkdown();
         dirtyRef.current = editorIsDirty();
-        return true;
-      });
+      },
     };
+    // Registered once create() settles (below): a request that arrives while
+    // create() is still in flight must fall back to the coordinator's store
+    // adapter (which writes the preserved draft) rather than hit a
+    // half-initialized snapshot that would misreport "pristine".
+    let unregisterAdapter: (() => void) | null = null;
 
     const onKeyDown = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && !e.altKey && (e.key === 's' || e.key === 'S')) {
         e.preventDefault();
-        void performSave();
+        // Never let the window-level Ctrl+S handler (FileViewerPanel /
+        // DetachedFileView) double-fire on the same gesture (plan §2.3);
+        // coordinator coalescing is the backstop, not the primary defense.
+        e.stopPropagation();
+        if (tabId) void requestSave(tabId);
       }
     };
     container.addEventListener('keydown', onKeyDown);
@@ -497,6 +539,10 @@ function MilkdownEditor({ tabId, filePath, content, registerFreshContentHandler 
         if (disposed) return null;
         loadSerializedRef.current = crepe.getMarkdown();
         readyRef.current = true;
+        // Live snapshots are meaningful from here on — take over from the
+        // coordinator's store-adapter fallback (identity-guarded unregister,
+        // so a successor mount's registration is never torn down by us).
+        if (tabId) unregisterAdapter = registerSaveAdapter(tabId, saveAdapter);
         // Content prop may have moved while create() was in flight.
         applyFreshContent(contentRef.current);
         // Restore the remembered scroll position now that the doc is laid out.
@@ -546,6 +592,10 @@ function MilkdownEditor({ tabId, filePath, content, registerFreshContentHandler 
       cancelAnimationFrame(restoreFrame);
       if (tabId && editorHandles.get(tabId) === handle) editorHandles.delete(tabId);
       if (typeof unregister === 'function') unregister();
+      // After this the coordinator's store-adapter fallback carries any
+      // still-queued save for the flushed draft (Phase 4 adds the unmount
+      // flush that relies on exactly that).
+      unregisterAdapter?.();
       if (crepeRef.current === crepe) crepeRef.current = null;
       // Always wait for create() to settle before destroy() — under
       // StrictMode the cleanup runs while create() is still in flight.

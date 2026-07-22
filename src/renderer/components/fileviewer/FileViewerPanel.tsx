@@ -17,6 +17,7 @@ import { detectFileType } from './fileTypeUtils';
 import ResizeDivider from '../layout/ResizeDivider';
 import CollapseButton from '../layout/CollapseButton';
 import { evictTabCache } from './useFileContentCache';
+import { requestSave } from './saveCoordinator';
 
 function useSwipeRight(onSwipe: () => void) {
   const startRef = useRef<{ x: number; y: number } | null>(null);
@@ -61,7 +62,6 @@ export default function FileViewerPanel() {
   const hideFileViewer = useDashboardStore((s) => s.hideFileViewer);
   const openTab = useDashboardStore((s) => s.openTab);
   const togglePanelCollapsed = useDashboardStore((s) => s.togglePanelCollapsed);
-  const saveTab = useDashboardStore((s) => s.saveTab);
 
   const swipeToAgents = useSwipeRight(hideFileViewer);
 
@@ -125,7 +125,10 @@ export default function FileViewerPanel() {
         const editState = displayedTabId ? tabEditState[displayedTabId] : null;
         if (displayedTabId && editState && editState.mode !== 'view') {
           e.preventDefault();
-          void saveTab(displayedTabId);
+          // Save coordinator (edit-loss Phase 2): snapshots the live editor
+          // synchronously. Canvas Ctrl+S stopPropagation()s before reaching
+          // this window handler; coalescing is the double-fire backstop.
+          void requestSave(displayedTabId);
         }
       } else if (e.key === 'Escape') {
         if (displayedTabId) {
@@ -140,7 +143,7 @@ export default function FileViewerPanel() {
     };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, [displayedTabId, handleCloseTab, saveTab, tabEditState]);
+  }, [displayedTabId, handleCloseTab, tabEditState]);
 
   // Clicking a file in the tree opens it as a new tab (or focuses existing)
   const handleFileSelect = useCallback((filePath: string) => {

@@ -3,6 +3,7 @@ import type { PathType } from '../../../shared/types';
 import { useDashboardStore } from '../../stores/dashboard-store';
 import FileViewerHeader from './FileViewerHeader';
 import FileContentArea from './FileContentArea';
+import { hasUnsavedWork, requestSave } from './saveCoordinator';
 
 // Minimal single-tab file viewer for a detached (tear-off) window
 // (detachable-file-tabs-plan §4 1.8). NO Sidebar / MainContent grid / Terminal /
@@ -46,8 +47,11 @@ export default function DetachedFileView({ params }: Props) {
 
   useEffect(() => {
     const unsub = window.api.tabs.onCloseQuery(({ requestId }) => {
-      const dirty = !!useDashboardStore.getState().tabEditState[tabId]?.dirty;
-      if (!dirty) {
+      // Coordinator probe, not bare store dirty (edit-loss Phase 2): a live
+      // canvas edit still inside the ~200ms debounce hasn't reached the store
+      // yet — hasUnsavedWork() flushes it synchronously so it raises the
+      // modal instead of being silently discarded.
+      if (!hasUnsavedWork(tabId)) {
         void window.api.tabs.closeReply(requestId, 'discard');
         return;
       }
@@ -59,7 +63,7 @@ export default function DetachedFileView({ params }: Props) {
 
   const handleSaveAndClose = async () => {
     if (!closeRequest) return;
-    const ok = await useDashboardStore.getState().saveTab(tabId);
+    const ok = await requestSave(tabId);
     if (ok) {
       void window.api.tabs.closeReply(closeRequest.requestId, 'save');
       setCloseRequest(null);
@@ -85,7 +89,9 @@ export default function DetachedFileView({ params }: Props) {
         const editState = useDashboardStore.getState().tabEditState[tabId];
         if (editState && editState.mode !== 'view') {
           e.preventDefault();
-          void useDashboardStore.getState().saveTab(tabId);
+          // Coordinator routing (edit-loss Phase 2); the canvas Ctrl+S
+          // handler stopPropagation()s before this window handler fires.
+          void requestSave(tabId);
         }
       }
     };

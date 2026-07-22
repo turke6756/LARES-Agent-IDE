@@ -6,6 +6,7 @@ import FileIcon from './FileIcon';
 import { useDashboardStore } from '../../stores/dashboard-store';
 import { SNIFF_REASON_LABELS, type TabMode } from './contentViewMode';
 import { sniffWysiwygCompatibility } from './markdownSplice';
+import { requestSave } from './saveCoordinator';
 
 interface Props {
   tabId: string;
@@ -34,7 +35,6 @@ export default function FileViewerHeader({ tabId, filePath, pathType, fileSize, 
   const enterViewMode = useDashboardStore((state) => state.enterViewMode);
   const exitEditMode = useDashboardStore((state) => state.exitEditMode);
   const discardTabChanges = useDashboardStore((state) => state.discardTabChanges);
-  const saveTab = useDashboardStore((state) => state.saveTab);
   const checkHealth = useDashboardStore((state) => state.checkHealth);
   const dirty = !!editState?.dirty;
   const saving = !!editState?.saving;
@@ -136,8 +136,11 @@ export default function FileViewerHeader({ tabId, filePath, pathType, fileSize, 
     }
   };
 
+  // Routed through the save coordinator (edit-loss Phase 2): requestSave
+  // snapshots the live editor synchronously, so a canvas edit still inside
+  // the ~200ms debounce window reaches disk; genuinely pristine ⇒ no write.
   const handleSave = () => {
-    void saveTab(tabId);
+    void requestSave(tabId);
   };
 
   const handleEditDocxAsMarkdown = async () => {
@@ -276,10 +279,15 @@ export default function FileViewerHeader({ tabId, filePath, pathType, fileSize, 
         )}
 
         {editable && mode !== 'view' && (
+          // Not gated on store `dirty`: it lags a live canvas edit by the
+          // ~200ms markdownUpdated debounce (H4), so a dirty-gated button
+          // could not save the visible doc. The coordinator snapshots the
+          // live editor and no-ops when genuinely pristine. `dirty` still
+          // drives the visual emphasis as the saved/unsaved affordance.
           <button
             onClick={handleSave}
-            disabled={!dirty || saving}
-            className="ui-btn ui-btn-primary text-[13px]"
+            disabled={saving}
+            className={`ui-btn text-[13px] ${dirty ? 'ui-btn-primary' : ''}`}
           >
             {saving ? <Icons.Loader2 className="w-3 h-3 animate-spin" /> : <Icons.Save className="w-3 h-3" />}
             Save

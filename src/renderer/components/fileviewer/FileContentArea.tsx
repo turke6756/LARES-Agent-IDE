@@ -16,6 +16,7 @@ import ShapefileRenderer from './ShapefileRenderer';
 import GeoPackageRenderer from './GeoPackageRenderer';
 import { useDashboardStore } from '../../stores/dashboard-store';
 import { diag, diagBasename } from './editLossDiag';
+import { noteEdit, requestSave } from './saveCoordinator';
 
 interface Props {
   tabId: string;
@@ -28,7 +29,6 @@ export default function FileContentArea({ tabId, filePath, pathType }: Props) {
   const isMarkdown = fileType === 'markdown';
   const editState = useDashboardStore((state) => state.tabEditState[tabId]);
   const setDraftContent = useDashboardStore((state) => state.setDraftContent);
-  const saveTab = useDashboardStore((state) => state.saveTab);
   const reloadFromDisk = useDashboardStore((state) => state.reloadFromDisk);
   const dismissExternalChange = useDashboardStore((state) => state.dismissExternalChange);
   const enterWysiwygMode = useDashboardStore((state) => state.enterWysiwygMode);
@@ -237,8 +237,10 @@ export default function FileContentArea({ tabId, filePath, pathType }: Props) {
         language={fileType === 'markdown' ? 'markdown' : 'text'}
         saving={editState.saving}
         error={editState.error}
-        onChange={(draft) => setDraftContent(tabId, draft)}
-        onSave={() => { void saveTab(tabId); }}
+        // noteEdit: CodeMirror's undebounced revision source (edit-loss
+        // Phase 2 §2.1) — the coordinator's gate (a) sees every keystroke.
+        onChange={(draft) => { noteEdit(tabId); setDraftContent(tabId, draft); }}
+        onSave={() => { void requestSave(tabId); }}
         focusRange={focusRange}
       />,
     );
