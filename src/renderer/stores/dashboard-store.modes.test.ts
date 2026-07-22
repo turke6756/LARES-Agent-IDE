@@ -6,7 +6,8 @@
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { useDashboardStore } from './dashboard-store';
-import { isRecentWriteEcho } from '../components/fileviewer/useFileContentCache';
+import { matchRecentWrite } from '../components/fileviewer/useFileContentCache';
+import { contentHash } from '../components/fileviewer/markdownSplice';
 
 const TAB = 'tab-modes-1';
 
@@ -156,9 +157,11 @@ describe('saveTab', () => {
       'windows',
       'spliced save payload',
     );
-    // Write-generation token: the fs-watcher echo of this save must be
-    // recognizable even before originalContent updates.
-    expect(isRecentWriteEcho(TAB, 'spliced save payload')).toBe(true);
+    // Write ledger: the fs-watcher echo of this save must be recognizable
+    // even before originalContent updates — and the token is committed.
+    expect(matchRecentWrite(TAB, contentHash('spliced save payload'))).toMatchObject({
+      state: 'committed',
+    });
     expect(editState()).toMatchObject({
       mode: 'wysiwyg',
       originalContent: 'spliced save payload',

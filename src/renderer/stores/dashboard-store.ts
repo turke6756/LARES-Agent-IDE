@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import type { Agent, AgentStatus, Workspace, HealthCheck, FileActivity, QueryResult, ContextStats, UsageLimitsReading, PathType, FileTab, PanelLayout, Team, TeamMessage, CreateTeamInput, DetachedClosedPayload, DetachableView } from '../../shared/types';
-import { evictTabCache, recordRecentWrite } from '../components/fileviewer/useFileContentCache';
+import { beginWrite, evictTabCache } from '../components/fileviewer/useFileContentCache';
+import { contentHash } from '../components/fileviewer/markdownSplice';
 import { diag, diagBasename, diagHash } from '../components/fileviewer/editLossDiag';
 import { clearDraft } from '../lib/chat-drafts';
 import {
@@ -759,10 +760,12 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
       },
     }));
 
-    // Write-generation token (plan §5): record what we're about to write
+    // Write-ledger token (edit-loss Phase 3 §3.2): open a generation token
     // *before* the write so the fs-watcher revalidate can drop the echo even
-    // when it fires before the post-save state update below lands.
-    recordRecentWrite(tabId, draftToSave);
+    // when it fires before the post-save state update below lands. Committed
+    // on success; invalidated on failure so a failed write never suppresses
+    // an identical EXTERNAL write as our own echo (R5).
+    const writeToken = beginWrite(tabId, contentHash(draftToSave));
     const result = await window.api.files.writeFile(
       tab.filePath,
       tab.rootDirectory,
@@ -774,6 +777,9 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
     }
 
     if (!result.ok) {
+      // R5: the bytes never reached disk — drop this exact generation's
+      // token so an identical external write is surfaced, not swallowed.
+      writeToken.invalidate();
       set((state) => {
         const current = state.tabEditState[tabId];
         if (!current) return state;
@@ -787,6 +793,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
       return false;
     }
 
+    writeToken.commit();
     evictTabCache(tabId);
     // DIAG(edit-loss): save success — what reached disk vs the live draft
     // (a draft that moved during the write leaves dirty=true below).
