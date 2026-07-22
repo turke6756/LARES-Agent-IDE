@@ -108,6 +108,14 @@ interface TabEditState {
   externalChange?: boolean;
   pendingDiskContent?: string;
   reloadVersion?: number;
+  /** CAS guard for conditional writes (edit-loss §4.1): contentHash of the
+   *  bytes we believe are on disk; `null` = expect the file absent. Usually
+   *  tracks hash(originalContent), EXCEPT after dismissExternalChange, which
+   *  advances it to hash(pendingDiskContent) — acknowledging the external
+   *  bytes so the next conditional save may overwrite them, while still
+   *  conflicting if disk moved on again. `undefined` = pre-4.1 session state;
+   *  consumers fall back to contentHash(originalContent). */
+  expectedDiskHash?: string | null;
 }
 
 // Per-workspace snapshot of "what the user was looking at" (view-state
@@ -242,13 +250,15 @@ interface DashboardState {
   // coordinator (saveCoordinator.ts) — `content` writes the coordinator's
   // captured snapshot instead of the live draft (and leaves `dirty` untouched
   // so the store can never blip clean under an in-flight edit; the
-  // coordinator recomputes dirty after its completion gates). `revision` /
-  // `expectedDiskHash` / `force` are threaded but unenforced until Phases 3-4
-  // (conditional-write IPC).
+  // coordinator recomputes dirty after its completion gates). Every save is
+  // CONDITIONAL (edit-loss §4.1): `expectedDiskHash` becomes the writer's CAS
+  // guard; `force: true` maps to an unconditional write (close-dialog
+  // "Overwrite anyway" and tests only). A CAS refusal resolves 'conflict' —
+  // banner raised, draft/dirty/revision preserved, nothing written.
   saveTab: (
     tabId: string,
     opts?: { content?: string; revision?: number; expectedDiskHash?: string | null; force?: boolean },
-  ) => Promise<boolean>;
+  ) => Promise<boolean | 'conflict'>;
   discardTabChanges: (tabId: string) => void;
   markExternalChange: (tabId: string, freshContent: string) => void;
   dismissExternalChange: (tabId: string) => void;
@@ -639,6 +649,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
             dirty: false,
             saving: false,
             error: null,
+            expectedDiskHash: contentHash(initialContent),
           },
         },
       };
@@ -675,6 +686,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
             dirty: false,
             saving: false,
             error: null,
+            expectedDiskHash: contentHash(initialContent),
           },
         },
       };
@@ -705,6 +717,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
             dirty: false,
             saving: false,
             error: null,
+            expectedDiskHash: contentHash(initialContent),
           },
         },
       };
@@ -752,6 +765,18 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
     // disk — the coordinator's gates decide what happens next).
     const fromCoordinator = opts?.content !== undefined;
     const draftToSave = opts?.content ?? editState.draftContent;
+    // Conditional write (edit-loss §4.1): every normal save carries the CAS
+    // guard — the coordinator's captured hash when present, else the store
+    // field, else (pre-4.1 session state) derived from originalContent.
+    // `force` maps to an UNCONDITIONAL write (expectedHash omitted): the
+    // close-dialog "Overwrite anyway" and tests only, never a banner button.
+    const expectedHash = opts?.force
+      ? undefined
+      : opts?.expectedDiskHash !== undefined
+        ? opts.expectedDiskHash
+        : editState.expectedDiskHash !== undefined
+          ? editState.expectedDiskHash
+          : contentHash(editState.originalContent);
 
     set((state) => ({
       tabEditState: {
@@ -771,6 +796,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
       tab.rootDirectory,
       tab.pathType,
       draftToSave,
+      expectedHash,
     );
     if (tab.pathType === 'wsl') {
       await get().checkHealth();
@@ -780,6 +806,30 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
       // R5: the bytes never reached disk — drop this exact generation's
       // token so an identical external write is surfaced, not swallowed.
       writeToken.invalidate();
+      if (result.conflict) {
+        // CAS refusal (§4.1): disk moved since our baseline. Raise the banner
+        // with the fresh bytes the writer already read; draft, dirty, and the
+        // coordinator's revision are all preserved — nothing was written.
+        // DIAG(edit-loss): conditional write refused by the CAS check.
+        diag('store-save-conflict', {
+          tabId,
+          file: diagBasename(tab.filePath),
+          expectedHash,
+          freshHash: diagHash(result.freshContent),
+        });
+        set((state) => {
+          const current = state.tabEditState[tabId];
+          if (!current) return state;
+          return {
+            tabEditState: {
+              ...state.tabEditState,
+              [tabId]: { ...current, saving: false },
+            },
+          };
+        });
+        get().markExternalChange(tabId, result.freshContent);
+        return 'conflict';
+      }
       set((state) => {
         const current = state.tabEditState[tabId];
         if (!current) return state;
@@ -814,6 +864,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
             ...current,
             // B1 install: disk truth is what THIS write put there.
             originalContent: draftToSave,
+            expectedDiskHash: contentHash(draftToSave),
             // Coordinator writes leave `dirty` untouched: the coordinator
             // recomputes it after its revision/serialization gates, so the
             // store never blips clean while a raced edit is still live only
@@ -898,6 +949,15 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
             ...existing,
             externalChange: false,
             pendingDiskContent: undefined,
+            // "Keep my changes" acknowledges the external bytes: ADVANCE the
+            // CAS guard to hash(pendingDiskContent) so the next conditional
+            // save may overwrite them — but conflicts again if disk moved on
+            // yet again (edit-loss §4.1). originalContent stays: it is the
+            // splice/EOL baseline, not the CAS guard.
+            expectedDiskHash:
+              existing.pendingDiskContent !== undefined
+                ? contentHash(existing.pendingDiskContent)
+                : existing.expectedDiskHash,
           },
         },
       };
@@ -933,6 +993,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
             externalChange: false,
             pendingDiskContent: undefined,
             reloadVersion: (existing.reloadVersion ?? 0) + 1,
+            expectedDiskHash: contentHash(fresh),
           },
         },
       };
@@ -964,6 +1025,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
             ...existing,
             originalContent: freshContent,
             draftContent: freshContent,
+            expectedDiskHash: contentHash(freshContent),
           },
         },
       };

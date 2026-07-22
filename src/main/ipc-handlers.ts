@@ -620,7 +620,7 @@ export function registerIpcHandlers(
     }
   });
 
-  ipcMain.handle('files:write', async (event, filePath, rootDirectory, pathType, content) => {
+  ipcMain.handle('files:write', async (event, filePath, rootDirectory, pathType, content, expectedHash) => {
     // Single-writer enforcement (detachable-file-tabs-plan §1 Claim 2): if the
     // file is owned by a detached window, only that webContents may write it.
     // The authoritative backstop behind the best-effort focus-existing UX.
@@ -628,7 +628,7 @@ export function registerIpcHandlers(
       return { ok: false, error: 'File is open in a detached window; edit it there.' };
     }
     const resolved = resolveMutationPathType(filePath, rootDirectory, pathType);
-    return await writeFileContents(filePath, rootDirectory, resolved, content);
+    return await writeFileContents(filePath, rootDirectory, resolved, content, expectedHash);
   });
 
   ipcMain.handle('files:create-file', async (_e, parentDir, rootDirectory, pathType, name, template) => {

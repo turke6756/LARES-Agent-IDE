@@ -156,6 +156,9 @@ describe('saveTab', () => {
       'C:/ws',
       'windows',
       'spliced save payload',
+      // §4.1: a bare saveTab is conditional too — the CAS guard is the store's
+      // expectedDiskHash, seeded by enterWysiwygMode from the initial content.
+      contentHash('original'),
     );
     // Write ledger: the fs-watcher echo of this save must be recognizable
     // even before originalContent updates — and the token is committed.

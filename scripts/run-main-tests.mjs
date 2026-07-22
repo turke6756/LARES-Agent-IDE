@@ -11,6 +11,10 @@ import { spawnSync } from 'node:child_process'
 
 const TESTS = [
   'dist/main/shared/notification-classify.test.js',
+  // Edit-loss §4.0/§4.1: shared content-identity hash vectors + the
+  // conditional-write (CAS) contract of writeFileContents.
+  'dist/main/shared/content-hash.test.js',
+  'dist/main/main/file-writer.test.js',
   'dist/main/main/usage-limits-watcher.test.js',
   'dist/main/main/supervisor/codex-shell-parser.test.js',
   'dist/main/main/supervisor/codex-resume-command-builder.test.js',

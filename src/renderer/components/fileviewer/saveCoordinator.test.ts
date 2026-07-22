@@ -21,13 +21,16 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { useDashboardStore } from '../../stores/dashboard-store';
-import { contentHash } from './markdownSplice';
+import { contentHash } from '../../../shared/content-hash';
+import type { ConditionalWriteResult } from '../../../shared/types';
 import {
   currentRevision,
   hasUnsavedWork,
+  isConflictPaused,
   noteEdit,
   registerSaveAdapter,
   requestSave,
+  storeExpectedDiskHash,
   type SaveAdapter,
   type SaveSnapshot,
 } from './saveCoordinator';
@@ -38,7 +41,9 @@ const ORIGINAL = 'original content\n';
 
 interface PendingWrite {
   content: string;
-  resolve: (r: { ok: boolean; error?: string }) => void;
+  /** §4.1: the CAS guard the store handed the writer (undefined = force). */
+  expectedHash: string | null | undefined;
+  resolve: (r: ConditionalWriteResult) => void;
 }
 
 let pendingWrites: PendingWrite[];
@@ -47,9 +52,15 @@ let writeFile: ReturnType<typeof vi.fn>;
 function installApi() {
   pendingWrites = [];
   writeFile = vi.fn(
-    (_path: string, _root: string, _pt: string, content: string) =>
-      new Promise<{ ok: boolean; error?: string }>((resolve) => {
-        pendingWrites.push({ content, resolve });
+    (
+      _path: string,
+      _root: string,
+      _pt: string,
+      content: string,
+      expectedHash: string | null | undefined,
+    ) =>
+      new Promise<ConditionalWriteResult>((resolve) => {
+        pendingWrites.push({ content, expectedHash, resolve });
       }),
   );
   (window as unknown as { api: unknown }).api = {
@@ -62,7 +73,15 @@ const flush = async () => {
 };
 
 async function settleWrite(index: number, ok = true, error?: string) {
-  pendingWrites[index].resolve(ok ? { ok: true } : { ok: false, error });
+  pendingWrites[index].resolve(
+    ok ? { ok: true, path: 'x' } : { ok: false, error: error ?? 'write failed' },
+  );
+  await flush();
+}
+
+/** Settle a pending write as a CAS refusal carrying the fresh disk bytes. */
+async function settleConflict(index: number, freshContent: string) {
+  pendingWrites[index].resolve({ ok: false, conflict: true, freshContent });
   await flush();
 }
 
@@ -131,7 +150,9 @@ function attachEditor(tabId: string): FakeEditor {
           draft: fake.doc,
           revision: currentRevision(tabId),
           editorSerialized: fake.doc,
-          expectedDiskHash: es ? contentHash(es.originalContent) : null,
+          // Mirrors the Milkdown adapter: store field first (§4.1), derived
+          // hash for pre-4.1 state.
+          expectedDiskHash: storeExpectedDiskHash(es),
         };
       },
       rebaseline(written: SaveSnapshot) {
@@ -374,5 +395,142 @@ describe('saveCoordinator — revision-serialized single-flight drain', () => {
       content: 'content B\n',
       expectedDiskHash: contentHash('content A\n'),
     });
+  });
+});
+
+// ── §4.1 — conditional writes (CAS) through the coordinator ──────────────────
+
+describe('saveCoordinator — conditional writes (§4.1)', () => {
+  const EXTERNAL = 'external agent bytes\n';
+
+  it('CAS race: external mutation before write execution ⇒ conflict — banner up, draft intact, no write landed, tab conflict-paused', async () => {
+    const tabId = seedTab();
+    const ed = attachEditor(tabId);
+    cleanups.push(ed.unregister);
+
+    ed.doc = 'content A\n';
+    noteEdit(tabId);
+    const p = requestSave(tabId);
+    await flush();
+    expect(pendingWrites).toHaveLength(1);
+    // Every normal save carries the CAS guard for the current disk belief.
+    expect(pendingWrites[0].expectedHash).toBe(contentHash(ORIGINAL));
+
+    // The writer refuses: disk moved between scheduling and execution.
+    await settleConflict(0, EXTERNAL);
+
+    expect(await p).toBe(false);
+    const es = editState(tabId);
+    // Banner up with the fresh bytes the writer already read.
+    expect(es?.externalChange).toBe(true);
+    expect(es?.pendingDiskContent).toBe(EXTERNAL);
+    // Draft + dirty preserved; B1 NOT installed (nothing reached disk).
+    expect(es?.dirty).toBe(true);
+    expect(es?.draftContent).toBe('content A\n');
+    expect(es?.originalContent).toBe(ORIGINAL);
+    expect(es?.saving).toBe(false);
+    expect(es?.error).toBeNull();
+    expect(ed.rebaselines).toHaveLength(0);
+    // No retry was enqueued; autosave (4B) will consult the pause flag.
+    expect(pendingWrites).toHaveLength(1);
+    expect(isConflictPaused(tabId)).toBe(true);
+  });
+
+  it('dismiss-then-save: dismiss advances the CAS guard to the acknowledged bytes; the next save overwrites them and lifts the pause', async () => {
+    const tabId = seedTab();
+    const ed = attachEditor(tabId);
+    cleanups.push(ed.unregister);
+
+    ed.doc = 'content A\n';
+    noteEdit(tabId);
+    const p1 = requestSave(tabId);
+    await flush();
+    await settleConflict(0, EXTERNAL);
+    expect(await p1).toBe(false);
+    expect(isConflictPaused(tabId)).toBe(true);
+
+    // "Keep my changes": acknowledge the external bytes.
+    useDashboardStore.getState().dismissExternalChange(tabId);
+    const es = editState(tabId) as { expectedDiskHash?: string | null } | undefined;
+    expect(es?.expectedDiskHash).toBe(contentHash(EXTERNAL));
+
+    // Manual save is still allowed on a conflicted tab — and now expects the
+    // acknowledged external bytes on disk.
+    const p2 = requestSave(tabId);
+    await flush();
+    expect(pendingWrites).toHaveLength(2);
+    expect(pendingWrites[1].expectedHash).toBe(contentHash(EXTERNAL));
+
+    await settleWrite(1);
+    expect(await p2).toBe(true);
+    const after = editState(tabId) as
+      | { dirty: boolean; originalContent: string; expectedDiskHash?: string | null }
+      | undefined;
+    expect(after?.dirty).toBe(false);
+    expect(after?.originalContent).toBe('content A\n');
+    // Save success re-anchors the guard to the written draft.
+    expect(after?.expectedDiskHash).toBe(contentHash('content A\n'));
+    expect(isConflictPaused(tabId)).toBe(false);
+  });
+
+  it('dismiss-then-save conflicts AGAIN if disk moved on past the acknowledged bytes', async () => {
+    const tabId = seedTab();
+    const ed = attachEditor(tabId);
+    cleanups.push(ed.unregister);
+
+    ed.doc = 'content A\n';
+    noteEdit(tabId);
+    const p1 = requestSave(tabId);
+    await flush();
+    await settleConflict(0, EXTERNAL);
+    await p1;
+    useDashboardStore.getState().dismissExternalChange(tabId);
+
+    const p2 = requestSave(tabId);
+    await flush();
+    expect(pendingWrites[1].expectedHash).toBe(contentHash(EXTERNAL));
+    // Disk moved AGAIN after the dismissal — the writer refuses again.
+    await settleConflict(1, 'moved on again\n');
+
+    expect(await p2).toBe(false);
+    const es = editState(tabId);
+    expect(es?.externalChange).toBe(true);
+    expect(es?.pendingDiskContent).toBe('moved on again\n');
+    expect(es?.dirty).toBe(true);
+    expect(es?.draftContent).toBe('content A\n');
+    expect(isConflictPaused(tabId)).toBe(true);
+  });
+
+  it('force bypasses CAS: the writer receives expectedHash undefined', async () => {
+    const tabId = seedTab();
+    const ed = attachEditor(tabId);
+    cleanups.push(ed.unregister);
+
+    ed.doc = 'content A\n';
+    noteEdit(tabId);
+    const p = requestSave(tabId, { force: true });
+    await flush();
+    expect(pendingWrites).toHaveLength(1);
+    expect(pendingWrites[0].expectedHash).toBeUndefined();
+
+    await settleWrite(0);
+    expect(await p).toBe(true);
+    expect(editState(tabId)?.dirty).toBe(false);
+  });
+
+  it('snapshots prefer the explicit store expectedDiskHash over the derived hash', async () => {
+    // A dismissal-advanced guard must survive into the snapshot even though
+    // originalContent still hashes differently.
+    const tabId = seedTab({ expectedDiskHash: contentHash(EXTERNAL) } as never);
+    const ed = attachEditor(tabId);
+    cleanups.push(ed.unregister);
+
+    ed.doc = 'content A\n';
+    noteEdit(tabId);
+    void requestSave(tabId);
+    await flush();
+    expect(pendingWrites).toHaveLength(1);
+    expect(pendingWrites[0].expectedHash).toBe(contentHash(EXTERNAL));
+    await settleWrite(0);
   });
 });

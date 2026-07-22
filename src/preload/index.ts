@@ -173,8 +173,8 @@ const api: IpcApi = {
     convertDocxToMarkdown: (filePath, rootDirectory, pathType) =>
       ipcRenderer.invoke('files:convert-docx-to-markdown', filePath, rootDirectory, pathType),
     listDirectory: (dirPath, pathType) => ipcRenderer.invoke('files:list-directory', dirPath, pathType),
-    writeFile: (filePath, rootDirectory, pathType, content) =>
-      ipcRenderer.invoke('files:write', filePath, rootDirectory, pathType, content),
+    writeFile: (filePath, rootDirectory, pathType, content, expectedHash) =>
+      ipcRenderer.invoke('files:write', filePath, rootDirectory, pathType, content, expectedHash),
     createFile: (parentDir, rootDirectory, pathType, name, template) =>
       ipcRenderer.invoke('files:create-file', parentDir, rootDirectory, pathType, name, template),
     mkdir: (parentDir, rootDirectory, pathType, name) =>

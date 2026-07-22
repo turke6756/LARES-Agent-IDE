@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import type { FileContent, FsEvent, PathType } from '../../../shared/types';
 import { useDashboardStore } from '../../stores/dashboard-store';
-import { contentHash } from './markdownSplice';
+import { contentHash } from '../../../shared/content-hash';
 import { diag, diagBasename, diagHash } from './editLossDiag';
 
 /** Why a read pass ran (threaded through the shared read function). */

@@ -76,6 +76,7 @@ import {
   useFileContentCache,
 } from './useFileContentCache';
 import type { FsEvent } from '../../../shared/types';
+import { contentHash } from '../../../shared/content-hash';
 
 (globalThis as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT = true;
 polyfillJsdomForProseMirror();
@@ -109,6 +110,8 @@ const PRESERVED_DRAFT =
 
 interface ApiMock {
   written: string[];
+  /** §4.1: the CAS guard each write carried (undefined = unconditional). */
+  expectedHashes: Array<string | null | undefined>;
   writeFile: ReturnType<typeof vi.fn>;
   watcherCbs: Array<(event: FsEvent) => void>;
   closeQueryCb: ((payload: { requestId: string }) => void) | null;
@@ -123,11 +126,21 @@ function installApi(initialDisk: string): ApiMock {
   let disk = initialDisk;
   const mock: ApiMock = {
     written: [],
-    writeFile: vi.fn(async (_path: string, _root: string, _pt: string, content: string) => {
-      mock.written.push(content);
-      disk = content;
-      return { ok: true };
-    }),
+    expectedHashes: [],
+    writeFile: vi.fn(
+      async (
+        _path: string,
+        _root: string,
+        _pt: string,
+        content: string,
+        expectedHash: string | null | undefined,
+      ) => {
+        mock.written.push(content);
+        mock.expectedHashes.push(expectedHash);
+        disk = content;
+        return { ok: true };
+      },
+    ),
     watcherCbs: [],
     closeQueryCb: null,
     closeReply: vi.fn(async () => {}),
@@ -468,6 +481,9 @@ describe('4a — preserved-draft save: the six bare store-save paths already wri
     it(`${driver.name} writes the preserved draft to disk`, async () => {
       await driver.run();
       expect(api.written).toEqual([PRESERVED_DRAFT]);
+      // §4.1: every save entry point is CONDITIONAL — the write carries the
+      // CAS guard for the disk baseline (no force path in any normal UI).
+      expect(api.expectedHashes).toEqual([contentHash(ORIGINAL)]);
       const es = useDashboardStore.getState().tabEditState[driver.tabId];
       if (driver.editStateRemovedAfterSave) {
         // detachTab handed the (now-clean) tab to the detached window.
@@ -507,6 +523,8 @@ describe('4a — preserved-draft save: canvas Ctrl+S (performSave) — fixed in 
 
     // Desired: the preserved draft reaches disk and becomes B1.
     expect(api.written).toEqual([PRESERVED_DRAFT]);
+    // §4.1: canvas Ctrl+S is conditional like every other entry point.
+    expect(api.expectedHashes).toEqual([contentHash(ORIGINAL)]);
     expect(useDashboardStore.getState().tabEditState[TAB]?.dirty).toBe(false);
   });
 });
@@ -661,6 +679,8 @@ describe('4b — H4 bypass: save with a live edit inside the ~200ms debounce win
         // snapshot flush at the entry point).
         const written = api.written.at(-1) ?? '';
         expect(written).toContain('LIVE EDIT');
+        // §4.1: no entry point ever writes unconditionally.
+        expect(api.expectedHashes.every((h) => h !== undefined)).toBe(true);
 
         // Let the delayed markdownUpdated settle AFTER the bypass save —
         // this exposes the missing rebaseline (H4) before the echo arrives.

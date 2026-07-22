@@ -1,6 +1,14 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import type { FileCopyResult, FileMutationResult, PathType } from '../shared/types';
+import type {
+  ConditionalWriteResult,
+  FileCopyResult,
+  FileMutationResult,
+  PathType,
+  WriteErrorCode,
+} from '../shared/types';
+import { contentHash } from '../shared/content-hash';
+import { readFileContents } from './file-reader';
 import { ensureWslPath } from './path-utils';
 import { wslExecCommand } from './wsl-bridge';
 import {
@@ -168,25 +176,79 @@ async function assertWslParentDirectory(targetPath: string): Promise<void> {
   }
 }
 
+/** Classify a write failure for the renderer's retry policy (edit-loss §4.4):
+ *  'too-large' and 'permission' stop retries immediately; 'not-found' means
+ *  the parent/target vanished; everything else is a retryable 'io'. */
+export function classifyWriteError(err: unknown): WriteErrorCode {
+  const code = (err as NodeJS.ErrnoException | null)?.code;
+  if (code === 'EACCES' || code === 'EPERM') return 'permission';
+  if (code === 'ENOENT') return 'not-found';
+  const message = err instanceof Error ? err.message : '';
+  if (message.includes('too large to write')) return 'too-large';
+  if (message.includes('Parent directory does not exist')) return 'not-found';
+  return 'io';
+}
+
+function conditionalErrorResult(err: unknown, fallback: string): ConditionalWriteResult {
+  const message = err instanceof Error ? err.message || fallback : fallback;
+  return { ok: false, error: message, code: classifyWriteError(err) };
+}
+
+/**
+ * Write a file, optionally guarded by a compare-and-swap check (edit-loss
+ * plan §4.1, R6). When `expectedHash !== undefined` the current file is read
+ * through the existing reader path and its `contentHash` compared to
+ * `expectedHash` (`null` = "expect the file absent"); any mismatch — content
+ * moved, file deleted, or file appeared — returns a conflict result carrying
+ * the fresh disk bytes and performs NO write.
+ *
+ * ADVISORY, NOT ATOMIC: the read-then-write runs in this one process, which
+ * minimizes but cannot eliminate the read/write race — on WSL the comparison
+ * read and the write each cross the bridge and may be seconds apart, so an
+ * external writer can still land between them. The CAS closes the common
+ * races (agent writes between save scheduling and execution); the fs-watcher
+ * banner remains the backstop for the residual window.
+ */
 export async function writeFileContents(
   filePath: string,
   rootDirectory: string,
   pathType: PathType,
   content: string,
-): Promise<FileMutationResult> {
+  expectedHash?: string | null,
+): Promise<ConditionalWriteResult> {
   try {
-    assertWriteSize(content);
+    // Size check first so the failure classifies as 'too-large' (§4.4).
+    const bytes = Buffer.byteLength(content, 'utf-8');
+    if (bytes > MAX_TEXT_WRITE_SIZE) {
+      return {
+        ok: false,
+        error: `File is too large to write (${(bytes / 1024 / 1024).toFixed(1)}MB). Limit is 5MB.`,
+        code: 'too-large',
+      };
+    }
     assertInsideRoot(filePath, rootDirectory, pathType);
 
     if (pathType === 'wsl') {
       const wslPath = normalizeWslPath(ensureWslPath(filePath, pathType));
       assertInsideRoot(wslPath, rootDirectory, pathType);
+      if (expectedHash !== undefined) {
+        const conflict = await checkWriteConflict(filePath, pathType, expectedHash, () =>
+          wslPathExists(wslPath),
+        );
+        if (conflict) return conflict;
+      }
       await assertWslParentDirectory(wslPath);
       await runWsl(`cat > ${shellQuote(wslPath)}`, content);
       return { ok: true, path: wslPath };
     }
 
     const resolved = normalizeWindowsPath(filePath);
+    if (expectedHash !== undefined) {
+      const conflict = await checkWriteConflict(filePath, pathType, expectedHash, async () =>
+        fs.existsSync(resolved),
+      );
+      if (conflict) return conflict;
+    }
     const parent = path.dirname(resolved);
     if (!fs.statSync(parent).isDirectory()) {
       throw new Error('Parent directory does not exist');
@@ -194,8 +256,38 @@ export async function writeFileContents(
     fs.writeFileSync(resolved, content, { encoding: 'utf-8', flag: 'w' });
     return { ok: true, path: resolved };
   } catch (err) {
-    return errorResult(err, 'Failed to write file');
+    return conditionalErrorResult(err, 'Failed to write file');
   }
+}
+
+/** The CAS comparison for writeFileContents. Returns a result to short-circuit
+ *  with (conflict or read error), or null when the write may proceed. */
+async function checkWriteConflict(
+  filePath: string,
+  pathType: PathType,
+  expectedHash: string | null,
+  exists: () => Promise<boolean>,
+): Promise<ConditionalWriteResult | null> {
+  const present = await exists();
+  if (expectedHash === null) {
+    // Caller expects no file. One appearing IS the conflict.
+    if (!present) return null;
+    const fresh = await readFileContents(filePath, pathType);
+    if (fresh.error) return { ok: false, error: fresh.error, code: 'io' };
+    return { ok: false, conflict: true, freshContent: fresh.content };
+  }
+  if (!present) {
+    // Caller expects bytes on disk; the file vanished. Surface as a conflict
+    // (existence mismatch) with empty fresh bytes — the renderer's banner
+    // shows the file was externally removed rather than silently recreating.
+    return { ok: false, conflict: true, freshContent: '' };
+  }
+  const fresh = await readFileContents(filePath, pathType);
+  if (fresh.error) return { ok: false, error: fresh.error, code: 'io' };
+  if (contentHash(fresh.content) !== expectedHash) {
+    return { ok: false, conflict: true, freshContent: fresh.content };
+  }
+  return null;
 }
 
 export async function createFile(

@@ -623,6 +623,21 @@ export type FileMutationResult =
   | { ok: true; path?: string }
   | { ok: false; error: string };
 
+// ── Conditional writes (edit-loss plan §4.1, R6) ────────────────────────────
+// Dedicated result type for `files:write` ONLY — the general FileMutationResult
+// above stays untouched for every other file mutation. `expectedHash` on the
+// write is a compare-and-swap guard: the writer reads the current file, hashes
+// it with the shared contentHash (src/shared/content-hash.ts), and refuses to
+// write on a mismatch, returning the fresh disk bytes so the renderer can
+// raise the external-change banner without a second read.
+
+export type WriteErrorCode = 'too-large' | 'permission' | 'not-found' | 'io';
+
+export type ConditionalWriteResult =
+  | { ok: true; path: string }
+  | { ok: false; conflict: true; freshContent: string }
+  | { ok: false; conflict?: false; error: string; code?: WriteErrorCode };
+
 /**
  * Result of `files:copy`. Distinguishes full success, validation failures
  * (nothing copied — `failed` lists the offending sources), and partial
@@ -1254,12 +1269,16 @@ export interface IpcApi {
       pathType: PathType
     ) => Promise<FileMutationResult>;
     listDirectory: (dirPath: string, pathType: PathType) => Promise<DirectoryEntry[]>;
+    /** Conditional write (edit-loss §4.1): `expectedHash` = contentHash of
+     *  the bytes the caller believes are on disk (`null` = expect the file
+     *  absent); omit it for an unconditional write (force / non-CAS callers). */
     writeFile: (
       filePath: string,
       rootDirectory: string,
       pathType: PathType,
-      content: string
-    ) => Promise<FileMutationResult>;
+      content: string,
+      expectedHash?: string | null
+    ) => Promise<ConditionalWriteResult>;
     createFile: (
       parentDir: string,
       rootDirectory: string,

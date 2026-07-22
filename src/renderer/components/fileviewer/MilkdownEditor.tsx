@@ -54,6 +54,7 @@ import {
   noteEdit,
   registerSaveAdapter,
   requestSave,
+  storeExpectedDiskHash,
   type SaveAdapter,
   type SaveSnapshot,
 } from './saveCoordinator';
@@ -389,8 +390,9 @@ function MilkdownEditor({ tabId, filePath, content, registerFreshContentHandler 
           draft,
           revision: currentRevision(tabId),
           editorSerialized: crepe.getMarkdown(),
-          // Phase 2: derived, threaded, unenforced (plan §2.1 sequencing note).
-          expectedDiskHash: es ? contentHash(es.originalContent) : null,
+          // §4.1: the store's CAS guard (falls back to hash(originalContent)
+          // for pre-4.1 state) — enforced by the conditional-write IPC.
+          expectedDiskHash: storeExpectedDiskHash(es),
         };
       },
       rebaseline: (written: SaveSnapshot) => {

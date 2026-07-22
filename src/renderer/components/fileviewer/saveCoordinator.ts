@@ -19,7 +19,7 @@
  * this module is the only caller passing `opts`.
  */
 import { useDashboardStore } from '../../stores/dashboard-store';
-import { contentHash } from './markdownSplice';
+import { contentHash } from '../../../shared/content-hash';
 import { diag } from './editLossDiag';
 
 export interface SaveSnapshot {
@@ -28,10 +28,10 @@ export interface SaveSnapshot {
   /** Exact live serialization captured with the draft (Milkdown only). */
   editorSerialized?: string;
   /**
-   * Phase 2: derived as contentHash(editState.originalContent); captured and
-   * threaded but UNENFORCED (the writer ignores it) until Phase 4 adds the
-   * conditional-write IPC. Phase 4 migrates to the explicit store field with
-   * null = "expect the file absent".
+   * The CAS guard for this snapshot's write (edit-loss §4.1, ENFORCED): the
+   * store's explicit `expectedDiskHash` field (null = "expect the file
+   * absent"), falling back to contentHash(originalContent) for pre-4.1
+   * session state. Captured via storeExpectedDiskHash().
    */
   expectedDiskHash: string | null;
 }
@@ -66,6 +66,38 @@ interface TabSaveState {
 const adapters = new Map<string, SaveAdapter>();
 const revisions = new Map<string, number>();
 const tabStates = new Map<string, TabSaveState>();
+
+// Tabs whose last write was refused by the CAS check (edit-loss §4.1): the
+// banner is up and queued/idle AUTOSAVES must not retry into the same
+// conflict — Phase 4B's useAutosave consults isConflictPaused() at timer-fire
+// time. Manual requestSave is deliberately NOT gated here: after
+// dismissExternalChange advances the store's expectedDiskHash, a manual save
+// legitimately overwrites the acknowledged bytes. Cleared on any subsequent
+// successful (or pristine) drain, or explicitly via clearConflictPause()
+// (4B's dismiss/reload paths).
+const conflictPaused = new Set<string>();
+
+/** Is this tab's autosave paused on an unresolved CAS conflict? (4B) */
+export function isConflictPaused(tabId: string): boolean {
+  return conflictPaused.has(tabId);
+}
+
+/** Explicitly lift the conflict pause (4B: dismiss/reload/close paths). */
+export function clearConflictPause(tabId: string): void {
+  conflictPaused.delete(tabId);
+}
+
+/** The CAS guard for a tab (edit-loss §4.1): the store's explicit
+ *  expectedDiskHash when present (null = expect absent), else — pre-4.1
+ *  session state — derived from originalContent. Shared by every snapshot
+ *  producer (store adapter here, Milkdown adapter) so they can never
+ *  disagree. */
+export function storeExpectedDiskHash(
+  es: { expectedDiskHash?: string | null; originalContent: string } | undefined,
+): string | null {
+  if (!es) return null;
+  return es.expectedDiskHash !== undefined ? es.expectedDiskHash : contentHash(es.originalContent);
+}
 
 /** Identity-guarded unregister (mirrors registerFreshContentHandler). */
 export function registerSaveAdapter(tabId: string, adapter: SaveAdapter): () => void {
@@ -122,7 +154,7 @@ function captureSnapshot(tabId: string): SaveSnapshot | null {
   return {
     draft: es.draftContent,
     revision: currentRevision(tabId),
-    expectedDiskHash: contentHash(es.originalContent),
+    expectedDiskHash: storeExpectedDiskHash(es),
   };
 }
 
@@ -152,8 +184,9 @@ function resolveWaiters(st: TabSaveState, upTo: number, ok: boolean): void {
  * only once a write with revision ≥ the caller's captured revision succeeds
  * (or fails terminally). Same-revision requests coalesce into one write.
  *
- * `force` = unconditional write — used ONLY by Phase 4's close-dialog
- * "Overwrite anyway" (inert in Phase 2: the writer ignores expectedDiskHash).
+ * `force` = unconditional write (expectedHash omitted at the writer) — used
+ * ONLY by Phase 4B's close-dialog "Overwrite anyway" and tests; no UI in 4A
+ * calls it.
  */
 export function requestSave(tabId: string, opts?: { force?: boolean }): Promise<boolean> {
   const st = tabState(tabId);
@@ -183,6 +216,7 @@ async function drain(tabId: string, st: TabSaveState): Promise<void> {
       const snap = captureSnapshot(tabId);
       if (snap === null) {
         // Genuinely pristine — nothing to write; every caller succeeds.
+        conflictPaused.delete(tabId);
         diag('coordinator-pristine', { tabId });
         resolveWaiters(st, Infinity, true);
         break;
@@ -196,6 +230,17 @@ async function drain(tabId: string, st: TabSaveState): Promise<void> {
         expectedDiskHash: snap.expectedDiskHash,
         force,
       });
+      if (ok === 'conflict') {
+        // CAS refusal (§4.1): the store already raised the banner with the
+        // fresh disk bytes; draft/dirty/revision preserved. Pause this tab's
+        // autosaves (4B consults the flag) — retrying the same expected hash
+        // can only conflict again until the user resolves the banner (dismiss
+        // advances the store hash; reload drops the draft).
+        conflictPaused.add(tabId);
+        diag('coordinator-conflict', { tabId, revision: snap.revision });
+        resolveWaiters(st, Infinity, false);
+        break;
+      }
       if (!ok) {
         // Terminal failure: the store surfaced editState.error; draft/dirty/
         // revision retained. Every pending caller learns of the failure.
@@ -203,6 +248,9 @@ async function drain(tabId: string, st: TabSaveState): Promise<void> {
         resolveWaiters(st, Infinity, false);
         break;
       }
+      // A completed write is disk truth at our expected hash — any prior
+      // conflict pause is stale.
+      conflictPaused.delete(tabId);
 
       // ── Completion gating (plan §2.1, normative) ──────────────────────────
       // A fresh adapter snapshot FIRST: it synchronously flushes the live doc,
