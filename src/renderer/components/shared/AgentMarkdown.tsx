@@ -11,12 +11,100 @@ import { useDashboardStore } from '../../stores/dashboard-store';
 //   plans/notes-canvas-implementation.md
 //   src/main/database.ts
 //   ./docs/ORCHESTRATION_SPIKE.md
+//   node_modules/@scope/pkg/index.ts   (@ allowed for scoped packages)
 //   C:\Users\foo\bar.txt
 //   /home/user/file.py
 // Trailing sentence punctuation (".", ",", ")", etc.) is naturally excluded
-// because [\w.\-] doesn't include them and the regex engine backtracks the
+// because [\w.@\-] doesn't include them and the regex engine backtracks the
 // extension off the end.
-const FILE_PATH_RE = /((?:[A-Za-z]:[\\/]|\/|\.{1,2}[\\/]|~\/)?(?:[\w.\-]+[\\/])+[\w.\-]+\.[A-Za-z0-9]{1,8})/g;
+//
+// This regex intentionally OVER-captures: its intermediate-directory group
+// accepts any token — including a full `filename.ext` — as a directory segment.
+// So a run like `README.md/index.ts` (two files an agent joined with a slash as
+// shorthand) is captured whole here, then trimmed by truncateAtFirstFile()
+// below. Keep the trimming as a post-step rather than encoding it in the regex:
+// a lookahead that forbade extension-bearing intermediate segments could not
+// distinguish `foo.bar/` (a real dotted directory) from `foo.md/` (a file) —
+// only a known-extension check can, and that is far clearer as a helper.
+const FILE_PATH_RE = /((?:[A-Za-z]:[\\/]|\/|\.{1,2}[\\/]|~\/)?(?:[\w.@\-]+[\\/])+[\w.@\-]+\.[A-Za-z0-9]{1,8})/g;
+
+// Common file extensions used to decide whether an INTERMEDIATE path segment is
+// really a file (so the path must stop there) rather than a directory. The crux
+// the detector must get right: `src/foo.bar/baz.ts` — `foo.bar` is a directory,
+// so the path keeps going — versus `README.md/index.ts` — `README.md` is a
+// file, so the path must stop at it. Both `.bar` and `.md` are short alphabetic
+// suffixes, so no length/char-class heuristic can separate them; only a bounded
+// known-extension list can. A suffix NOT in this set (`foo.bar`, `.github`) is
+// treated as a directory and left intact. The set is deliberately generous —
+// missing an exotic extension only means an over-capture survives (today's
+// behavior), never that a legit path stops early.
+const KNOWN_FILE_EXTENSIONS = new Set([
+  // code
+  'ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs', 'json', 'json5', 'py', 'pyi', 'rb', 'go',
+  'rs', 'java', 'kt', 'kts', 'scala', 'c', 'h', 'cc', 'cpp', 'cxx', 'hpp', 'hh',
+  'cs', 'php', 'swift', 'm', 'mm', 'sh', 'bash', 'zsh', 'fish', 'ps1', 'bat', 'cmd',
+  'lua', 'pl', 'r', 'sql', 'dart', 'ex', 'exs', 'clj', 'edn', 'elm', 'hs',
+  // web / styles
+  'html', 'htm', 'css', 'scss', 'sass', 'less', 'vue', 'svelte', 'astro',
+  // docs / config / data
+  'md', 'mdx', 'markdown', 'txt', 'rst', 'adoc', 'csv', 'tsv', 'xml', 'yml', 'yaml',
+  'toml', 'ini', 'cfg', 'conf', 'env', 'properties', 'lock', 'log', 'gitignore',
+  // notebooks / office
+  'ipynb', 'pynb', 'docx', 'doc', 'pdf', 'xlsx', 'xls', 'pptx', 'ppt', 'rtf',
+  // images / media (rare as intermediate segments)
+  'png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'ico', 'bmp', 'tiff', 'mp4', 'mov',
+  'webm', 'mp3', 'wav',
+]);
+
+// True when a single path segment "looks like a file" — i.e. its final dotted
+// component is a known file extension. A leading-dot dotfile like `.github` or
+// `.env` (lastIndexOf('.') === 0) is treated as a directory/dotfile, NOT a
+// file, so config-dir paths keep matching.
+function segmentLooksLikeFile(segment: string): boolean {
+  const dot = segment.lastIndexOf('.');
+  if (dot <= 0) return false;
+  return KNOWN_FILE_EXTENSIONS.has(segment.slice(dot + 1).toLowerCase());
+}
+
+// Trim an over-captured path run so it ends at its FIRST file-like segment. An
+// extension-bearing token can no longer masquerade as an intermediate directory:
+//   README.md/index.ts   -> README.md
+//   CLAUDE.md/AGENTS.md   -> CLAUDE.md
+//   -wiring.ts/.test.ts   -> -wiring.ts
+// while legit dotted directories are preserved because their suffix is unknown:
+//   src/foo.bar/baz.ts            -> src/foo.bar/baz.ts   (bar ∉ known)
+//   .github/workflows/ci.yml      -> .github/workflows/ci.yml
+//   node_modules/@scope/pkg/x.ts  -> node_modules/@scope/pkg/x.ts
+// Only NON-terminal segments are tested; the leaf keeps whatever extension it
+// has (the regex already required it to end in `.ext`).
+export function truncateAtFirstFile(candidate: string): string {
+  // Iterate "<segment><separator>" prefixes; the trailing leaf (no separator)
+  // is never inspected, so a normal single path is returned untouched.
+  const segRe = /([^\\/]+)[\\/]/g;
+  let m: RegExpExecArray | null;
+  while ((m = segRe.exec(candidate)) !== null) {
+    if (segmentLooksLikeFile(m[1])) {
+      return candidate.slice(0, m.index + m[1].length);
+    }
+  }
+  return candidate;
+}
+
+// Extract the clickable file paths from a chunk of text, in order, each already
+// trimmed by truncateAtFirstFile(). Exported for unit testing the detector.
+export function extractFilePaths(text: string): string[] {
+  const re = new RegExp(FILE_PATH_RE.source, 'g');
+  const out: string[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    const path = truncateAtFirstFile(m[1]);
+    out.push(path);
+    // Resume scanning right after the trimmed path so the dropped tail (e.g.
+    // `/index.ts` in `README.md/index.ts`) is re-examined rather than skipped.
+    re.lastIndex = m.index + path.length;
+  }
+  return out;
+}
 
 function renderTextWithPaths(
   text: string,
@@ -28,9 +116,12 @@ function renderTextWithPaths(
   let m: RegExpExecArray | null;
   const re = new RegExp(FILE_PATH_RE.source, 'g');
   while ((m = re.exec(text)) !== null) {
-    const path = m[1];
+    const path = truncateAtFirstFile(m[1]);
     const start = m.index;
     const end = start + path.length;
+    // Trimmed captures leave a tail (e.g. `/index.ts`); rewind so it can be
+    // re-scanned as its own link candidate instead of being skipped.
+    re.lastIndex = end;
     if (start > lastIndex) parts.push(text.slice(lastIndex, start));
     parts.push(
       <span

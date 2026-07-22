@@ -96,6 +96,36 @@ function resolveAgainstRoot(filePath: string, rootDirectory: string): string {
   return `${trimmedRoot}\\${trimmedFile.replace(/\//g, '\\')}`;
 }
 
+// B2 (smarter resolution): before blindly joining a relative prose path under
+// the workspace root, prefer an absolute path the agent actually touched. Chat
+// text often names a file loosely (`index.ts`, or a truncated `README.md`); if
+// the agent read/wrote a file matching that reference, opening the real file it
+// touched beats fabricating a root-relative path that may not exist. Returns
+// null when nothing matches, so the caller falls back to the root join.
+//
+// Matching is basename-anchored, most-recent-first (fileActivities is stored
+// newest-first): a full relative-suffix match wins over a bare basename match to
+// avoid opening an unrelated same-named file when the reference carries dirs.
+function findTouchedFileMatch(
+  activities: FileActivity[],
+  agentId: string,
+  relPath: string,
+): string | null {
+  const relKey = relPath.replace(/\\/g, '/').replace(/^\.?\/+/, '').toLowerCase();
+  if (!relKey) return null;
+  const base = relKey.split('/').pop();
+  if (!base) return null;
+  const mine = activities.filter((a) => a.agentId === agentId);
+  const norm = (p: string) => p.replace(/\\/g, '/').toLowerCase();
+  const suffixHit = mine.find((a) => {
+    const k = norm(a.filePath);
+    return k === relKey || k.endsWith(`/${relKey}`);
+  });
+  if (suffixHit) return suffixHit.filePath;
+  const baseHit = mine.find((a) => norm(a.filePath).split('/').pop() === base);
+  return baseHit ? baseHit.filePath : null;
+}
+
 interface TabEditState {
   // Three-mode model (plan §5): 'view' = rendered preview, 'wysiwyg' = the
   // Milkdown canvas, 'source' = CodeMirror raw text (the old 'edit').
@@ -1159,13 +1189,22 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
     const pathType = workspace?.pathType || 'windows';
     // Paths mentioned in chat are normally workspace-relative (for example
     // `plans/foo.md` or `src/main/index.ts`). Supervisors and managed workers
-    // run from scaffold directories under `.dashboard`, so resolving those
+    // run from scaffold directories under `.lares`, so resolving those
     // references against the agent cwd incorrectly produces paths such as
-    // `.dashboard/supervisor/plans/foo.md`. Use the workspace root when it is
+    // `.lares/supervisor/plans/foo.md`. Use the workspace root when it is
     // available; retain the agent cwd as a compatibility fallback for agents
     // whose workspace record has not hydrated yet.
     const rootDirectory = workspace?.path || agent.workingDirectory;
-    get().openTab(resolveAgainstRoot(filePath, rootDirectory), rootDirectory, pathType, agentId, agent.workspaceId);
+    // B2: for a relative reference, prefer a real file this agent touched whose
+    // name matches before falling back to a workspace-root join (which can
+    // point at a path that never existed). Absolute references are honored
+    // as-is. See findTouchedFileMatch.
+    let resolved = resolveAgainstRoot(filePath, rootDirectory);
+    if (!isAbsolutePath(filePath)) {
+      const touched = findTouchedFileMatch(get().fileActivities, agentId, filePath);
+      if (touched) resolved = touched;
+    }
+    get().openTab(resolved, rootDirectory, pathType, agentId, agent.workspaceId);
   },
 
   closeFileViewer: () => get().closeAllTabs(),
