@@ -816,6 +816,12 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
             error: null,
             externalChange: false,
             pendingDiskContent: undefined,
+            // Explicit discard is unambiguous user intent: bump reloadVersion
+            // (the same supersession gate the editor cleanup honors for
+            // reloadFromDisk) so the dying mount's cleanup flushDirtyDraft()
+            // cannot resurrect the discarded draft (edit-loss Phase 2
+            // pre-task).
+            reloadVersion: (existing.reloadVersion ?? 0) + 1,
           },
         },
       };
