@@ -2142,6 +2142,95 @@ html.light ::-webkit-scrollbar-thumb:hover {
   cursor: default;
 }
 
+/* ── Dashboard event notes ───────────────────────────────────────────────────
+   A supervisor receives dashboard notifications as text injected into its
+   terminal, which Claude Code records in the session JSONL as an ordinary
+   `user` message. They are telemetry, not conversation, so they get their own
+   accent (amber — deliberately neither the blue "You" bubble nor the purple
+   agent bubble) and collapse to a single summary row by default.
+
+   Colours resolve through the shared accent token rather than a local hex, and
+   are referenced at the USE SITE (never hoisted into an intermediate custom
+   property on :root) so `.light`'s redefinition of the accent still wins. */
+.dash-evt {
+  margin: 4px 0;
+}
+.dash-evt__summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 3px 8px;
+  border-radius: 6px;
+  border: 1px solid color-mix(in srgb, var(--color-accent-orange) 30%, transparent);
+  border-left-width: 3px;
+  background: color-mix(in srgb, var(--color-accent-orange) 9%, transparent);
+  color: var(--color-fg-secondary);
+  font-size: 11px;
+  line-height: 1.5;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color 120ms ease, border-color 120ms ease;
+}
+.dash-evt__summary:hover,
+.dash-evt__summary:focus-visible {
+  background: color-mix(in srgb, var(--color-accent-orange) 16%, transparent);
+  border-color: color-mix(in srgb, var(--color-accent-orange) 48%, transparent);
+}
+.dash-evt__chevron {
+  flex: 0 0 auto;
+  color: var(--color-accent-orange);
+  font-size: 9px;
+  line-height: 1;
+}
+.dash-evt__badge {
+  flex: 0 0 auto;
+  padding: 1px 6px;
+  border-radius: 9999px;
+  background: color-mix(in srgb, var(--color-accent-orange) 18%, transparent);
+  border: 1px solid color-mix(in srgb, var(--color-accent-orange) 34%, transparent);
+  color: var(--color-accent-orange);
+  font-size: 9px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.dash-evt__agent {
+  flex: 0 1 auto;
+  min-width: 0;
+  color: var(--color-fg-primary);
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.dash-evt__sep {
+  flex: 0 0 auto;
+  color: var(--color-fg-muted);
+}
+.dash-evt__label {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* Payloads carry quotes, JSON and log tails — rendered verbatim, never through
+   the markdown renderer. */
+.dash-evt__body {
+  margin: 3px 0 0;
+  padding: 6px 10px;
+  border-radius: 6px;
+  border-left: 3px solid color-mix(in srgb, var(--color-accent-orange) 30%, transparent);
+  background: color-mix(in srgb, var(--color-accent-orange) 6%, transparent);
+  color: var(--color-fg-secondary);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 /* WP4 — transient highlight for a knowledge/optimizer "open at source span" jump.
    Applied as a CodeMirror line decoration for ~2.5s, then cleared. */
 .cm-knowledge-source-line {

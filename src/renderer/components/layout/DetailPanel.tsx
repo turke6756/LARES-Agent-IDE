@@ -1,4 +1,5 @@
 import React, { useEffect, useState, useCallback, useRef } from 'react';
+import { ListEnd, Zap, Octagon, Search } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import { useDashboardStore } from '../../stores/dashboard-store';
 import StatusBadge from '../agent/StatusBadge';
@@ -315,22 +316,28 @@ export default function DetailPanel({ width }: DetailPanelProps) {
       <div className="panel-header flex items-stretch gap-1 p-2">
         <button
           onClick={toggleStaging}
-          className={`ui-btn ui-btn-primary min-w-0 flex-[1.35] px-2 py-2 text-[12px] font-bold ${stagingOpen ? 'is-active' : ''}`}
+          className={`ui-btn ui-btn-primary min-w-0 flex-1 px-2 py-2 text-[12px] font-bold ${stagingOpen ? 'is-active' : ''}`}
           aria-pressed={stagingOpen}
+          title="Prompt Staging"
         >
-          Prompt Staging
+          <ListEnd size={13} className="shrink-0" />
+          <span className="truncate">Prompt Staging</span>
         </button>
         <button
           onClick={() => window.api.agents.restart(agent.id)}
-          className="ui-btn ui-btn-ghost px-2 py-2 text-[12px] font-bold text-accent-yellow"
+          className="ui-btn ui-btn-ghost min-w-0 flex-1 px-2 py-2 text-[12px] font-bold text-accent-yellow"
+          title="Restart"
         >
-          Restart
+          <Zap size={13} className="shrink-0" />
+          <span className="truncate">Restart</span>
         </button>
         <button
           onClick={() => window.api.agents.stop(agent.id)}
-          className="ui-btn ui-btn-ghost px-2 py-2 text-[12px] font-bold text-accent-red"
+          className="ui-btn ui-btn-ghost min-w-0 flex-1 px-2 py-2 text-[12px] font-bold text-accent-red"
+          title="Stop"
         >
-          Stop
+          <Octagon size={13} className="shrink-0" />
+          <span className="truncate">Stop</span>
         </button>
         <button
           onClick={() => setWatchGlass((v) => !v)}
@@ -338,8 +345,10 @@ export default function DetailPanel({ width }: DetailPanelProps) {
           className={`ui-btn min-w-0 flex-1 px-2 py-2 text-[12px] font-bold ${
             watchGlass ? 'bg-accent-blue/20 text-accent-blue' : 'ui-btn-ghost text-accent-blue/80'
           }`}
+          title="Watch Glass"
         >
-          Watch Glass
+          <Search size={13} className="shrink-0" />
+          <span className="truncate">Watch Glass</span>
         </button>
         <div ref={overflowRef} className="relative">
           <button
