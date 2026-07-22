@@ -3,9 +3,17 @@
  * investigation (plans/markdown-editor-edit-loss-implementation.md §0.1,
  * plans/markdown-editor-edit-loss-diagnosis.md §5.5).
  *
- * Phase 0 instrumentation only — no behavior. Call sites across
- * MilkdownEditor / FileContentArea / useFileContentCache / dashboard-store are
- * tagged `// DIAG(edit-loss):` so Phase 5 can find and prune them.
+ * Instrumentation only — no behavior. Call sites across MilkdownEditor /
+ * FileContentArea / useFileContentCache / dashboard-store / saveCoordinator /
+ * useAutosave are tagged `// DIAG(edit-loss):`.
+ *
+ * Phase 5 status: the ORIGINAL live edit-loss trigger is still unpinned
+ * (bannerless loss of accumulated edits — diagnosis §"Observed-incident
+ * constraints"), so the diagnostic lines stay in the tree behind the
+ * runtime opt-in gate below. Arm them while chasing a repro with
+ * `localStorage.setItem('diagEditLoss', '1')` (devtools console), disarm
+ * with `localStorage.removeItem('diagEditLoss')`. They are silent
+ * otherwise — including in dev builds.
  *
  * Logging rules (normative):
  *  - content is NEVER logged raw — always `diagHash(...)` (contentHash);
@@ -30,14 +38,8 @@ export function nextEditorMountGeneration(): number {
 }
 
 function diagEnabled(): boolean {
-  // Dev builds always log; production only with the opt-in flag so a user can
-  // arm the diagnostics (`localStorage.setItem('diagEditLoss', '1')`) while
-  // chasing a live repro.
-  try {
-    if (import.meta.env?.DEV) return true;
-  } catch {
-    // no vite env (plain node) — fall through to the localStorage gate
-  }
+  // Opt-in only (Phase 5): arm with `localStorage.setItem('diagEditLoss', '1')`
+  // while chasing a live repro. Dev builds are no longer auto-armed.
   try {
     return typeof localStorage !== 'undefined' && localStorage.getItem('diagEditLoss') !== null;
   } catch {
@@ -59,8 +61,8 @@ export function diagBasename(p: string | null | undefined): string | null {
 }
 
 /**
- * Emit one DIAG line. No-op unless dev build or the `diagEditLoss`
- * localStorage flag is set.
+ * Emit one DIAG line. No-op unless the `diagEditLoss` localStorage flag is
+ * set.
  */
 export function diag(tag: string, fields: Record<string, unknown>): void {
   if (!diagEnabled()) return;

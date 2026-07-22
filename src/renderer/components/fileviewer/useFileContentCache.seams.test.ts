@@ -144,6 +144,9 @@ describe('write ledger (generation tokens, §3.2)', () => {
 
   it('a pending token neither committed nor invalidated expires after 30s and DIAG-logs', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    // Phase 5: DIAG is opt-in only (no dev auto-arm) — arm the runtime gate
+    // so the expiry line is observable.
+    localStorage.setItem('diagEditLoss', '1');
     try {
       const h = contentHash('stuck write');
       beginWrite('tab-wl-stuck', h);
@@ -158,6 +161,7 @@ describe('write ledger (generation tokens, §3.2)', () => {
         warn.mock.calls.some((args) => args.includes('write-ledger-pending-expired')),
       ).toBe(true);
     } finally {
+      localStorage.removeItem('diagEditLoss');
       warn.mockRestore();
     }
   });

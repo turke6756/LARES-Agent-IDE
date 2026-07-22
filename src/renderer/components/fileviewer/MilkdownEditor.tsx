@@ -630,10 +630,8 @@ function MilkdownEditor({ tabId, filePath, content, registerFreshContentHandler 
   // the store banner's business, never a content trample.
   useEffect(() => {
     contentRef.current = content;
-    // DIAG(edit-loss): content-prop sync effect fired.
-    diag('content-sync-effect', { tabId, contentHash: diagHash(content) });
+    // Outcome is DIAG-logged inside applyFreshContent (apply-fresh-*).
     applyFreshContentRef.current?.(content);
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- tabId is read for DIAG logging only; keying this effect on it would change replace timing
   }, [content]);
 
   // The gutter overlays the scroll container as a sibling (WP-P5-B): Crepe
