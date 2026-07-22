@@ -7,8 +7,8 @@ import { useBrowserSuspension } from '../browser/useBrowserSuspension';
 const PROVIDERS: AgentProvider[] = ['claude', 'gemini', 'codex'];
 
 // Single "Agent type" selector values. The first three are first-class role
-// lanes (app-managed cwd + scaffold under .dashboard/); personas are custom
-// agent types (.dashboard/agents/<name>/); templates are advanced DB presets;
+// lanes (app-managed cwd + scaffold under .lares/); personas are custom
+// agent types (.lares/agents/<name>/); templates are advanced DB presets;
 // ephemeral is the only no-lane / project-root / no-scaffold path.
 const TYPE_WORKER = 'role:worker';
 const TYPE_SUPERVISOR = 'role:supervisor';
@@ -29,6 +29,7 @@ export default function AgentLaunchDialog({ workspace, onClose }: Props) {
   // The browser WebContentsView paints above this dialog — hide it while open.
   useBrowserSuspension();
   const { loadAgents, checkHealth, agents } = useDashboardStore();
+  const openPrerequisitesDialog = useDashboardStore((s) => s.openPrerequisitesDialog);
   const [title, setTitle] = useState('');
   const [roleDescription, setRoleDescription] = useState('');
   const [workingDirectory, setWorkingDirectory] = useState(workspace.path);
@@ -41,6 +42,12 @@ export default function AgentLaunchDialog({ workspace, onClose }: Props) {
   // supervisor first, then use its id as the owner.
   const [supervisorId, setSupervisorId] = useState<string | null>(null);
   const [launching, setLaunching] = useState(false);
+  // A failed launch used to be console.error only: the dialog just stopped
+  // spinning and the user was told nothing. That is precisely the silent
+  // failure packaging plan §6.4 exists to kill — the supervisor now throws a
+  // plain-language message (e.g. "Codex CLI was not found…") and this renders
+  // it where the person who pressed Launch is actually looking.
+  const [launchError, setLaunchError] = useState<string | null>(null);
   const [agentMd, setAgentMd] = useState<{ found: boolean; fileName: string | null } | null>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -184,6 +191,7 @@ export default function AgentLaunchDialog({ workspace, onClose }: Props) {
     e.preventDefault();
     if (!title.trim()) return;
 
+    setLaunchError(null);
     setLaunching(true);
     try {
       const base: any = {
@@ -214,11 +222,11 @@ export default function AgentLaunchDialog({ workspace, onClose }: Props) {
       };
 
       if (isSupervisorType) {
-        // Supervisor role-lane → .dashboard/supervisor/, ensureSupervisorScaffold.
+        // Supervisor role-lane → .lares/supervisor/, ensureSupervisorScaffold.
         // Multiple supervisors per workspace are allowed (backend no longer blocks).
         launchInput = { ...base, provider: 'claude', isSupervisor: true, workingDirectory: workspace.path };
       } else if (isResearcherType) {
-        // Researcher role-lane → .dashboard/researcher/, ensureResearcherScaffold.
+        // Researcher role-lane → .lares/researcher/, ensureResearcherScaffold.
         // App-managed cwd/command/tools/browser-MCP; Claude-only (backend rejects
         // non-claude). UNSUPERVISED by default — the user opts in via the
         // "Supervised by" dropdown, which also sets the owner edge.
@@ -232,7 +240,7 @@ export default function AgentLaunchDialog({ workspace, onClose }: Props) {
           ownerAgentId: ownerId ?? undefined,
         };
       } else if (isWorkerType) {
-        // Worker role-lane → .dashboard/workers/<provider>/, ensureWorkerScaffold.
+        // Worker role-lane → .lares/workers/<provider>/, ensureWorkerScaffold.
         // Hook-based status; gemini has no hook scaffold so it never joins the
         // lane (and can't be supervised). Unsupervised by default — the user
         // opts into supervision via the "Supervised by" dropdown, which also
@@ -248,7 +256,7 @@ export default function AgentLaunchDialog({ workspace, onClose }: Props) {
           ownerAgentId: ownerId ?? undefined,
         };
       } else if (isNewAgent) {
-        // Mint a fresh persona under .dashboard/agents/<slug>/ then launch it.
+        // Mint a fresh persona under .lares/agents/<slug>/ then launch it.
         if (!newAgentSlug) { setLaunching(false); return; }
         await window.api.personas.create(
           workspace.path, workspace.pathType, newAgentSlug, roleDescription.trim() || undefined,
@@ -262,7 +270,7 @@ export default function AgentLaunchDialog({ workspace, onClose }: Props) {
           persona: newAgentSlug,
         };
       } else if (isPersona) {
-        // Existing custom agent → runs in its own .dashboard/agents/<name>/ cwd.
+        // Existing custom agent → runs in its own .lares/agents/<name>/ cwd.
         const personaName = selectedType.slice('persona:'.length);
         // If the user changed the privilege lane, persist it to persona.json
         // BEFORE launch so the backend reads the new lane and injects live-token
@@ -308,6 +316,10 @@ export default function AgentLaunchDialog({ workspace, onClose }: Props) {
       onClose();
     } catch (err) {
       console.error('Failed to launch agent:', err);
+      // Electron prefixes IPC rejections with "Error invoking remote method
+      // '<channel>':" — strip it so the user reads our sentence, not plumbing.
+      const raw = err instanceof Error ? err.message : String(err);
+      setLaunchError(raw.replace(/^Error invoking remote method '[^']*':\s*/, '').trim() || 'Launch failed.');
       setLaunching(false);
     }
   };
@@ -389,12 +401,12 @@ export default function AgentLaunchDialog({ workspace, onClose }: Props) {
             {/* Per-type hint line */}
             {isWorkerType && (
               <div className="mt-1 text-[11px] text-gray-500">
-                Hook-based worker in .dashboard/workers/{provider}/ — unsupervised by default.
+                Hook-based worker in .lares/workers/{provider}/ — unsupervised by default.
               </div>
             )}
             {isSupervisorType && (
               <div className="mt-1 text-[11px] text-gray-500">
-                Runs in .dashboard/supervisor/ with the supervisor scaffold (Claude only).
+                Runs in .lares/supervisor/ with the supervisor scaffold (Claude only).
               </div>
             )}
             {isResearcherType && (
@@ -404,12 +416,12 @@ export default function AgentLaunchDialog({ workspace, onClose }: Props) {
             )}
             {isPersona && (
               <div className="mt-1 text-[11px] text-accent-blue">
-                Runs in .dashboard/agents/{selectedType.slice('persona:'.length)}/ with its own CLAUDE.md.
+                Runs in .lares/agents/{selectedType.slice('persona:'.length)}/ with its own CLAUDE.md.
               </div>
             )}
             {isNewAgent && (
               <div className="mt-1 text-[11px] text-accent-blue">
-                Creates .dashboard/agents/{newAgentSlug || '<agent-title>'}/ — Role Description becomes its CLAUDE.md.
+                Creates .lares/agents/{newAgentSlug || '<agent-title>'}/ — Role Description becomes its CLAUDE.md.
               </div>
             )}
             {isTemplate && (() => {
@@ -634,6 +646,19 @@ export default function AgentLaunchDialog({ workspace, onClose }: Props) {
                 Save as template...
               </button>
             )
+          )}
+
+          {launchError && (
+            <div className="rounded-lg border border-accent-red/40 bg-accent-red/5 px-3 py-2.5 text-[13px] text-gray-200 space-y-1.5">
+              <p className="whitespace-pre-line">{launchError}</p>
+              <button
+                type="button"
+                onClick={() => { onClose(); openPrerequisitesDialog(); }}
+                className="text-[12px] text-accent-blue hover:underline"
+              >
+                Check prerequisites
+              </button>
+            </div>
           )}
 
           <div className="flex justify-end gap-2 pt-2">

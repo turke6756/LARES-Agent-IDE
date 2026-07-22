@@ -12,6 +12,8 @@ import { openExternalFileTab } from './components/fileviewer/openFileHelpers';
 import DetachedFileView from './components/fileviewer/DetachedFileView';
 import DetachedViewShell from './components/layout/DetachedViewShell';
 import PressureNotification from './components/watchdog/PressureNotification';
+import RuntimePrerequisitesDialog from './components/onboarding/RuntimePrerequisitesDialog';
+import PrerequisitesCard from './components/onboarding/PrerequisitesCard';
 
 // Error boundary to catch React render crashes and show the error instead of white screen
 class ErrorBoundary extends Component<{ children: ReactNode }, { error: Error | null }> {
@@ -62,20 +64,36 @@ function AppInner() {
   useEffect(() => {
     loadWorkspaces();
     checkHealth();
+    // Prerequisite preflight (packaging plan §6). Loads the report and opens
+    // the first-run dialog at most ONCE per app version, and only when no agent
+    // CLI is installed. It never blocks startup: a rejected probe just leaves
+    // the report null and the app opens normally.
+    useDashboardStore.getState().maybeShowFirstRunPrerequisites().catch(() => {
+      /* best effort — Help > Check prerequisites always reopens the report */
+    });
     useDashboardStore.getState().loadAgentStatuses().catch(() => {
       /* best effort — subsequent status events repopulate the index */
     });
 
-    const unsubStatus = window.api.onAgentStatusChanged(({ agent, source }) => {
+    const unsubStatus = window.api.onAgentStatusChanged(({ agent }) => {
       if (!agent) return;
       const store = useDashboardStore.getState();
       // Unguarded: keeps background-workspace heat/waiting live.
       store.updateAgentStatusSnapshot(agent);
       // Scoped upsert (selected workspace only) — existing behavior, unchanged.
       store.updateAgent(agent);
-      // Gold "snake" border while a context-brick continuation transfer runs:
-      // set on 'restarting'+continuation, cleared on this agent's next status.
-      store.applyTransferSignal({ agentId: agent.id, status: agent.status, source });
+    });
+
+    // Continuation handoff phases (gold glow + the per-phase card label). Seed
+    // from the authoritative main-process map on mount — the broadcast only
+    // fires on change, so a renderer that reloads mid-cycle would otherwise
+    // show nothing for the rest of a 180 s wait, which IS the defect this rail
+    // exists to fix — then keep it live.
+    window.api.agents.listContinuationPhases()
+      .then((phases) => useDashboardStore.getState().hydrateContinuationPhases(phases))
+      .catch(() => { /* best effort — the next broadcast populates it */ });
+    const unsubContinuation = window.api.agents.onContinuationPhaseChanged((signal) => {
+      useDashboardStore.getState().applyContinuationPhase(signal);
     });
 
     const unsubAgentDeleted = window.api.onAgentDeleted(({ agentId }) => {
@@ -230,6 +248,7 @@ function AppInner() {
         <div className="flex flex-1 min-w-0 min-h-0 z-10">
           {/* Main content column (with terminal below) */}
           <div className="flex flex-col flex-1 min-w-0 min-h-0">
+            <PrerequisitesCard />
             <MainContent />
 
             {/* Terminal resize divider (above terminal) — hidden when collapsed */}
@@ -262,6 +281,10 @@ function AppInner() {
           pop-up that appears solely under Warn/Critical commit pressure. The
           always-on meter was removed; open Tools ▸ System Memory to inspect. */}
       <PressureNotification />
+
+      {/* Prerequisite surfaces (packaging plan §6.3): a once-per-version modal
+          plus a dismissible, rediscoverable card while no agent CLI exists. */}
+      <RuntimePrerequisitesDialog />
     </div>
   );
 }

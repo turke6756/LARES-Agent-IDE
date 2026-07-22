@@ -3,6 +3,7 @@ import * as Icons from 'lucide-react';
 import { useDashboardStore } from '../../stores/dashboard-store';
 import { useThemeStore } from '../../stores/theme-store';
 import logoImg from '../../assets/logo.png';
+import { LARES_RELEASES_URL } from '../../../shared/constants';
 
 // The spanning top chrome for the frameless window. The window is
 // titleBarStyle:'hidden' + titleBarOverlay, so the native min/max/close buttons
@@ -44,6 +45,7 @@ export default function TopBar() {
   const resetLayout = useDashboardStore((s) => s.resetLayout);
   const loadWorkspaces = useDashboardStore((s) => s.loadWorkspaces);
   const openToolTab = useDashboardStore((s) => s.openToolTab);
+  const openPrerequisitesDialog = useDashboardStore((s) => s.openPrerequisitesDialog);
   const { theme, toggleTheme } = useThemeStore();
   const [openMenu, setOpenMenu] = useState<string | null>(null);
   const [showAbout, setShowAbout] = useState(false);
@@ -92,7 +94,21 @@ export default function TopBar() {
       { label: 'Context Optimizer', onClick: () => openToolTab('optimizer-capstone', 'Context Optimizer') },
       { label: 'Optimizer Detail', onClick: () => openToolTab('context-optimizer', 'Optimizer Detail') },
     ],
-    Help: [{ label: 'About Lares', onClick: () => setShowAbout(true) }],
+    Help: [
+      // The prerequisite report's permanent home. The first-run modal shows
+      // once per version and the status card is dismissible, so this is what
+      // makes the report rediscoverable afterwards (packaging plan §6.3).
+      { label: 'Check prerequisites…', onClick: openPrerequisitesDialog },
+      // Deliberately a link, not a background check: Lares 0.2.0 ships no
+      // auto-update and makes NO network call on its own (plan §1). This fires
+      // only on an explicit click and opens the releases page in the browser.
+      {
+        label: 'Check for updates…',
+        onClick: () => { void window.api.system.openExternal(LARES_RELEASES_URL); },
+      },
+      { label: '', divider: true },
+      { label: 'About Lares', onClick: () => setShowAbout(true) },
+    ],
   };
 
   const handleItem = (item: MenuItem) => {

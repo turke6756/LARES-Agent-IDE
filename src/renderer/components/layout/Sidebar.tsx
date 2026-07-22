@@ -198,7 +198,11 @@ export default function Sidebar({ width }: SidebarProps) {
           ? 'No WSL distro'
           : wslState === 'unavailable'
             ? 'WSL Unavailable'
-            : 'WSL Unknown';
+            // 'unknown' means the prerequisite check deliberately did NOT probe
+            // WSL — there is no wsl-typed workspace, and probing anyway can raise
+            // Windows' "install WSL" dialog (see runtime-prerequisites.ts). Say
+            // "not checked" rather than implying a fault we never looked for.
+            : 'WSL not checked';
   const wslStatusClass = healthChecking
     ? 'text-accent-blue animate-pulse'
     : wslState === 'running'
@@ -207,7 +211,9 @@ export default function Sidebar({ width }: SidebarProps) {
         ? 'text-gray-500'
         : wslState === 'no-distro'
           ? 'text-accent-orange'
-          : 'text-accent-red';
+          : wslState === 'unknown'
+            ? 'text-gray-500'
+            : 'text-accent-red';
 
   const handleTreeExpandedChange = useCallback((dirPath: string, expanded: boolean) => {
     setExpandedTreePaths((prev) => {

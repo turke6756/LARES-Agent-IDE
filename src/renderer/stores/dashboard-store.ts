@@ -1,14 +1,19 @@
 import { create } from 'zustand';
-import type { Agent, AgentStatus, Workspace, HealthCheck, FileActivity, QueryResult, ContextStats, UsageLimitsReading, PathType, FileTab, PanelLayout, Team, TeamMessage, CreateTeamInput, DetachedClosedPayload, DetachableView, WriteErrorCode } from '../../shared/types';
+import type { Agent, AgentStatus, Workspace, HealthCheck, RuntimePrerequisiteReport, FileActivity, QueryResult, ContextStats, ContinuationPhaseSignal, ContinuationPhaseState, UsageLimitsReading, PathType, FileTab, PanelLayout, Team, TeamMessage, CreateTeamInput, DetachedClosedPayload, DetachableView, WriteErrorCode } from '../../shared/types';
 import { beginWrite, evictTabCache } from '../components/fileviewer/useFileContentCache';
 import { contentHash } from '../components/fileviewer/markdownSplice';
 import { diag, diagBasename, diagHash } from '../components/fileviewer/editLossDiag';
 import { clearDraft } from '../lib/chat-drafts';
 import {
-  nextTransferSet,
-  reconcileTransferSet,
-  type TransferStatusSignal,
-} from '../components/agent/continuation-transfer';
+  nextPhaseMap,
+  prunePhasesForAgents,
+} from '../components/agent/continuation-phase-view';
+
+/** Which app version's first-run prerequisite modal this user has already
+ *  seen. Versioned rather than boolean so a future release that adds a new
+ *  prerequisite gets one fresh chance to explain it. */
+const PREREQ_SEEN_VERSION_KEY = 'lares.onboarding.prereqSeenVersion';
+
 
 interface WorkspaceHeat {
   activeCount: number;
@@ -179,6 +184,17 @@ interface DashboardState {
   workspaceViewState: Record<string, WorkspaceViewState>;
   health: HealthCheck | null;
   healthChecking: boolean;
+  // ── Runtime prerequisites (packaging plan §6.3) ──
+  // The full report behind `health`. Null until the first load.
+  prerequisites: RuntimePrerequisiteReport | null;
+  prerequisitesChecking: boolean;
+  /** First-run modal visibility. Opened once per app version when no provider
+   *  is installed, and on demand from Help > Check prerequisites. */
+  prerequisitesDialogOpen: boolean;
+  /** The non-modal status card was dismissed this session. Deliberately NOT
+   *  persisted: dismissing the card hides a reminder, it should not
+   *  permanently hide the fact that agents cannot launch. */
+  prerequisitesCardDismissed: boolean;
   loading: boolean;
   detailPane: 0 | 1 | 2;
   fileActivities: FileActivity[];
@@ -240,6 +256,13 @@ interface DashboardState {
   removeAgent: (id: string) => void;
   deleteAgent: (id: string) => Promise<void>;
   checkHealth: () => Promise<void>;
+  loadPrerequisites: (force?: boolean) => Promise<RuntimePrerequisiteReport | null>;
+  /** Load the report and open the modal only if this app version has not shown
+   *  it yet AND no provider is available. Called once on startup. */
+  maybeShowFirstRunPrerequisites: () => Promise<void>;
+  openPrerequisitesDialog: () => void;
+  closePrerequisitesDialog: () => void;
+  dismissPrerequisitesCard: () => void;
   setDetailPane: (pane: 0 | 1 | 2) => void;
   setFileActivities: (activities: FileActivity[]) => void;
   addFileActivity: (activity: FileActivity) => void;
@@ -336,6 +359,10 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
   workspaceViewState: {},
   health: null,
   healthChecking: false,
+  prerequisites: null,
+  prerequisitesChecking: false,
+  prerequisitesDialogOpen: false,
+  prerequisitesCardDismissed: false,
   loading: false,
   detailPane: 2,
   fileActivities: [],
@@ -1455,7 +1482,10 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
     set({ healthChecking: true });
     try {
       const health = await window.api.system.healthCheck();
-      set({ health, healthChecking: false });
+      // The health check is a projection of the full prerequisite report, so a
+      // refresh of one refreshes the other — the sidebar ticker and the
+      // prerequisites dialog can never show contradictory answers.
+      set({ health, healthChecking: false, ...(health.prerequisites ? { prerequisites: health.prerequisites } : {}) });
     } catch (err) {
       console.error('Health check failed:', err);
       set({
@@ -1474,6 +1504,51 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
       });
     }
   },
+
+  // ── Runtime prerequisites (packaging plan §6.3) ──
+
+  loadPrerequisites: async (force) => {
+    set({ prerequisitesChecking: true });
+    try {
+      const report = await window.api.system.getRuntimePrerequisites(force);
+      set({ prerequisites: report, prerequisitesChecking: false });
+      return report;
+    } catch (err) {
+      // A failed probe must never blank the last known answer — stale truth
+      // beats an empty panel that reads as "nothing is installed".
+      console.error('Prerequisite check failed:', err);
+      set({ prerequisitesChecking: false });
+      return get().prerequisites;
+    }
+  },
+
+  maybeShowFirstRunPrerequisites: async () => {
+    const report = await get().loadPrerequisites();
+    if (!report) return;
+    // Display policy, settled in the plan: show the modal ONCE per app version,
+    // not on every launch while no provider is installed. Re-nagging someone
+    // who deliberately chose "Continue without agents" is a worse failure than
+    // under-informing them — the non-modal card and Help ▸ Check prerequisites
+    // keep it rediscoverable, and a real launch attempt always errors clearly.
+    if (report.anyProviderAvailable) return;
+    let seen: string | null = null;
+    try {
+      seen = window.localStorage.getItem(PREREQ_SEEN_VERSION_KEY);
+    } catch {
+      /* storage unavailable — fall through and show it */
+    }
+    if (seen === report.appVersion) return;
+    try {
+      window.localStorage.setItem(PREREQ_SEEN_VERSION_KEY, report.appVersion);
+    } catch {
+      /* best effort */
+    }
+    set({ prerequisitesDialogOpen: true });
+  },
+
+  openPrerequisitesDialog: () => set({ prerequisitesDialogOpen: true }),
+  closePrerequisitesDialog: () => set({ prerequisitesDialogOpen: false }),
+  dismissPrerequisitesCard: () => set({ prerequisitesCardDismissed: true }),
 
   setDetailPane: (pane) => set({ detailPane: pane }),
 
