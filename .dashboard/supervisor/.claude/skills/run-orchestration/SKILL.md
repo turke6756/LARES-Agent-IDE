@@ -11,7 +11,6 @@ Orchestrations now run **in-process inside the dashboard** and are controlled th
 
 ## MCP tools
 
-- **list_orchestrations** — Discover available orchestrations: name, modes, parameters, defaults.
 - **run_orchestration** — Start a run (detached). Returns `{ runId }` synchronously. Args: `name`, `workspace_id`, `supervisor_id`, plus orchestration params (`topic`, `plan_path`, `mode`, `lead_provider`, `reviewer_provider`, `turn_timeout_ms`). Resume with `resume_run_id` (preferred) or `legacy_command` (paste a whole old `node scripts/groupthink-v2.js …` line).
 - **get_orchestration_run** — Pull current status/progress for a `run_id` (status, turn/round, members, last error).
 - **abort_orchestration** — Abort a run by `run_id`; cleans up member agents and emits `orchestration.groupthink.aborted`.
@@ -24,13 +23,13 @@ Orchestrations now run **in-process inside the dashboard** and are controlled th
 
 **Legacy resume.** Older plans/`.runs` may carry a `node scripts/groupthink-v2.js … --resume-lead-id=… --resume-reviewer-id=…` resume_hint. Don't run that script — pass the whole line through `run_orchestration({name:'groupthink', workspace_id, supervisor_id, legacy_command:"<the whole old line>"})`. The dashboard parses it into structured resume params and runs the in-process runner. (`scripts/groupthink-v2.js` still exists only as a thin compat shim that forwards to this same tool.)
 
-Call `list_orchestrations` for the authoritative parameter list; new orchestrations appear there automatically.
+`groupthink` is the only orchestration in the catalog; the table above and `run_orchestration`'s own schema are the authoritative parameter list.
 
 ## Workflow
 
 ### 1. Identify the orchestration
 
-The user will name one (e.g., "run a GroupThink on X") or describe a goal that maps to one. If unclear, ask. Don't guess — orchestrations launch real agents and burn real tokens. Call `list_orchestrations` to confirm the name and its parameters.
+The user will name one (e.g., "run a GroupThink on X") or describe a goal that maps to one. If unclear, ask. Don't guess — orchestrations launch real agents and burn real tokens. Today `groupthink` is the only one; the real choice is `mode: 'serial'` vs `'parallel'`.
 
 ### 2. Discover IDs
 
@@ -84,5 +83,5 @@ Orchestrations and the agents they launch should not write to paths under `.clau
 
 - Run orchestrations only when the user asks. Don't autonomously launch them.
 - Confirm the constructed call with the user before launching, especially for non-trivial topics.
-- `list_orchestrations` is the source of truth for each orchestration's parameters and defaults.
+- `run_orchestration`'s tool schema is the source of truth for parameters and defaults.
 - After launch, return to idle. Don't poll in a loop; let `[DASHBOARD EVENT]` messages drive your wake-ups (use `get_orchestration_run` for an on-demand status check).

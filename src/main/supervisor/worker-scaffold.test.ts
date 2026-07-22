@@ -1,10 +1,10 @@
 // Class IV worker-scaffold tests — plans/class-iv-worker-hook-scaffold.md §12.
 //
 // Exercises the per-provider branches of AgentSupervisor.ensureWorkerScaffold:
-//   1. Claude: writes .dashboard/scripts/dashboard-status.mjs +
-//      .dashboard/workers/claude/{CLAUDE.md,.claude/settings.json} verbatim
+//   1. Claude: writes .lares/scripts/dashboard-status.mjs +
+//      .lares/workers/claude/{CLAUDE.md,.claude/settings.json} verbatim
 //      (path expansion deferred to Claude Code's ${CLAUDE_PROJECT_DIR}).
-//   2. Codex: writes the shared script + .dashboard/workers/codex/.codex/config.toml
+//   2. Codex: writes the shared script + .lares/workers/codex/.codex/config.toml
 //      with ${WORKSPACE_ROOT} replaced by the absolute workspace path.
 //   3. Never-overwrite: re-running on the same workDir does not clobber an
 //      existing settings.json / config.toml.
@@ -69,7 +69,7 @@ test('Codex: scaffold writes .codex/config.toml with absolute workspace path int
   try {
     supervisor.ensureWorkerScaffold(workDir, 'codex', 'windows');
 
-    const configPath = path.join(workDir, '.dashboard', 'workers', 'codex', '.codex', 'config.toml');
+    const configPath = path.join(workDir, '.lares', 'workers', 'codex', '.codex', 'config.toml');
     assert.ok(fs.existsSync(configPath), `expected ${configPath} to exist`);
 
     const content = fs.readFileSync(configPath, 'utf-8');
@@ -86,18 +86,18 @@ test('Codex: scaffold writes .codex/config.toml with absolute workspace path int
     );
 
     // Forward-slash normalized workspace path appears in the command.
-    const expectedScriptPath = `${workDir.replace(/\\/g, '/')}/.dashboard/scripts/dashboard-status.mjs`;
+    const expectedScriptPath = `${workDir.replace(/\\/g, '/')}/.lares/scripts/dashboard-status.mjs`;
     assert.ok(
       content.includes(expectedScriptPath),
       `config.toml does not reference the workspace's dashboard-status.mjs path. Expected substring: ${expectedScriptPath}\nGot: ${content}`,
     );
 
     // The shared script is also written.
-    const scriptPath = path.join(workDir, '.dashboard', 'scripts', 'dashboard-status.mjs');
+    const scriptPath = path.join(workDir, '.lares', 'scripts', 'dashboard-status.mjs');
     assert.ok(fs.existsSync(scriptPath), `expected shared hook script at ${scriptPath}`);
 
     // Negative: codex scaffold must not write the Claude-side worker files.
-    const claudeSettings = path.join(workDir, '.dashboard', 'workers', 'claude', '.claude', 'settings.json');
+    const claudeSettings = path.join(workDir, '.lares', 'workers', 'claude', '.claude', 'settings.json');
     assert.ok(
       !fs.existsSync(claudeSettings),
       `codex scaffold should not create ${claudeSettings}`,
@@ -114,7 +114,7 @@ test('Codex: never overwrites existing config.toml on second scaffold call', () 
   try {
     supervisor.ensureWorkerScaffold(workDir, 'codex', 'windows');
 
-    const configPath = path.join(workDir, '.dashboard', 'workers', 'codex', '.codex', 'config.toml');
+    const configPath = path.join(workDir, '.lares', 'workers', 'codex', '.codex', 'config.toml');
     const sentinel = '# user-edited-marker-do-not-clobber\n';
     fs.writeFileSync(configPath, sentinel, 'utf-8');
 
@@ -159,7 +159,7 @@ test('Codex: WSL scaffold writes config.toml with /mnt-style absolute path', () 
     // expected conversion for WSL: drive letter → /mnt/<lowercase>/<rest>.
     supervisor.ensureWorkerScaffold(workDir, 'codex', 'wsl');
 
-    const configRel = '.dashboard/workers/codex/.codex/config.toml';
+    const configRel = '.lares/workers/codex/.codex/config.toml';
     const content = captured[configRel];
     assert.ok(content, `expected captured ${configRel}; got keys: ${Object.keys(captured).join(', ')}`);
 
@@ -171,8 +171,8 @@ test('Codex: WSL scaffold writes config.toml with /mnt-style absolute path', () 
     const expectedPrefix = `/mnt/${expectedDrive}/${expectedRest}`;
 
     assert.ok(
-      content.includes(`${expectedPrefix}/.dashboard/scripts/dashboard-status.mjs`),
-      `WSL config.toml should reference /mnt/${expectedDrive}/... path. Expected substring: ${expectedPrefix}/.dashboard/scripts/dashboard-status.mjs\nGot: ${content}`,
+      content.includes(`${expectedPrefix}/.lares/scripts/dashboard-status.mjs`),
+      `WSL config.toml should reference /mnt/${expectedDrive}/... path. Expected substring: ${expectedPrefix}/.lares/scripts/dashboard-status.mjs\nGot: ${content}`,
     );
 
     // Negative: no leftover Windows-style C:/ in the rendered TOML.
@@ -200,7 +200,7 @@ test('Claude: scaffold writes .claude/settings.json verbatim (no path materializ
   try {
     supervisor.ensureWorkerScaffold(workDir, 'claude', 'windows');
 
-    const settingsPath = path.join(workDir, '.dashboard', 'workers', 'claude', '.claude', 'settings.json');
+    const settingsPath = path.join(workDir, '.lares', 'workers', 'claude', '.claude', 'settings.json');
     assert.ok(fs.existsSync(settingsPath), `expected ${settingsPath}`);
 
     const content = fs.readFileSync(settingsPath, 'utf-8');
@@ -213,7 +213,7 @@ test('Claude: scaffold writes .claude/settings.json verbatim (no path materializ
     );
 
     // Negative: claude scaffold must not write the codex config.
-    const codexConfig = path.join(workDir, '.dashboard', 'workers', 'codex', '.codex', 'config.toml');
+    const codexConfig = path.join(workDir, '.lares', 'workers', 'codex', '.codex', 'config.toml');
     assert.ok(
       !fs.existsSync(codexConfig),
       `claude scaffold should not create ${codexConfig}`,
@@ -230,7 +230,7 @@ test('Claude: scaffold seeds the shared behavioral.md worker memory', () => {
   try {
     supervisor.ensureWorkerScaffold(workDir, 'claude', 'windows');
 
-    const memPath = path.join(workDir, '.dashboard', 'workers', 'claude', 'behavioral.md');
+    const memPath = path.join(workDir, '.lares', 'workers', 'claude', 'behavioral.md');
     assert.ok(fs.existsSync(memPath), `expected ${memPath}`);
 
     const content = fs.readFileSync(memPath, 'utf-8');
@@ -255,7 +255,7 @@ test('Claude: behavioral.md is never overwritten once a worker has edited it', (
   try {
     // First launch seeds it.
     supervisor.ensureWorkerScaffold(workDir, 'claude', 'windows');
-    const memPath = path.join(workDir, '.dashboard', 'workers', 'claude', 'behavioral.md');
+    const memPath = path.join(workDir, '.lares', 'workers', 'claude', 'behavioral.md');
 
     // A worker appends a lesson — exactly the edit the scaffold must preserve.
     const appended = '\n\n## WB-99: test-appended lesson — must survive relaunch\n';
@@ -286,7 +286,7 @@ test('Supervisor: scaffold seeds memory/MEMORY.md', () => {
   try {
     supervisor.ensureSupervisorScaffold(workDir, 'windows');
 
-    const memPath = path.join(workDir, '.dashboard', 'supervisor', 'memory', 'MEMORY.md');
+    const memPath = path.join(workDir, '.lares', 'supervisor', 'memory', 'MEMORY.md');
     assert.ok(fs.existsSync(memPath), `expected ${memPath}`);
 
     const content = fs.readFileSync(memPath, 'utf-8');
@@ -312,7 +312,7 @@ test('Supervisor: MEMORY.md is seed-once — an edited copy survives relaunch by
   try {
     // First launch seeds it.
     supervisor.ensureSupervisorScaffold(workDir, 'windows');
-    const memPath = path.join(workDir, '.dashboard', 'supervisor', 'memory', 'MEMORY.md');
+    const memPath = path.join(workDir, '.lares', 'supervisor', 'memory', 'MEMORY.md');
 
     // The supervisor (or human) curates memory across sessions — simulate an
     // edit that the scaffold must preserve verbatim.

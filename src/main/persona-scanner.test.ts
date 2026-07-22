@@ -1,5 +1,5 @@
 // persona-scanner tests — Agent-type redesign relocates custom-agent personas
-// from the legacy .claude/agents/ path to .dashboard/agents/, and #18 adds the
+// from the legacy .claude/agents/ path to .lares/agents/, and #18 adds the
 // per-persona kit (managed settings.json + skills), seed-once identity files
 // (CLAUDE.md rendered from PERSONA_AGENT_MD_TEMPLATE, MEMORY.md), the
 // write-if-absent persona.json lane sidecar, and the launch-input lane mapper.
@@ -7,7 +7,7 @@
 // Covers (windows pathType only — the wsl branch shells out to wsl.exe and is
 // not exercised here):
 //   1. scaffoldPersona writes the kit + seed-once identity into
-//      .dashboard/agents/<name>/ (NOT .claude/agents); the managed sidecar lists
+//      .lares/agents/<name>/ (NOT .claude/agents); the managed sidecar lists
 //      only the operational kit, never CLAUDE.md/MEMORY.md/persona.json.
 //   2. lane sidecar: write-if-absent persona.json, readPersonaLane, scanPersonas
 //      surfacing the declared lane, invalid-lane rejection.
@@ -15,8 +15,8 @@
 //      operational kit (settings.json) still upgrades when deleted.
 //   4. applyPersonaLaneToLaunchInput maps the declared lane onto launch flags.
 //   5. migratePersonas copies legacy .claude/agents/<name>/ into
-//      .dashboard/agents/, skips the supervisor, and never clobbers an existing
-//      .dashboard/agents/ entry.
+//      .lares/agents/, skips the supervisor, and never clobbers an existing
+//      .lares/agents/ entry.
 //
 //   npm run build:main
 //   node dist/main/main/persona-scanner.test.js
@@ -53,19 +53,19 @@ function writeLegacyPersona(ws: string, name: string, body = `# ${name}\n`): voi
 }
 
 function agentFile(ws: string, name: string, ...rel: string[]): string {
-  return path.join(ws, '.dashboard', 'agents', name, ...rel);
+  return path.join(ws, '.lares', 'agents', name, ...rel);
 }
 function readSidecar(ws: string): Record<string, number> {
-  const p = path.join(ws, '.dashboard', '.scaffold-versions.json');
+  const p = path.join(ws, '.lares', '.scaffold-versions.json');
   return fs.existsSync(p) ? JSON.parse(fs.readFileSync(p, 'utf-8')) : {};
 }
 
 // ── scaffoldPersona: kit + seed-once identity ────────────────────────
 
-test('scaffoldPersona writes into .dashboard/agents/<name>/, not .claude/agents/', () => {
+test('scaffoldPersona writes into .lares/agents/<name>/, not .claude/agents/', () => {
   const ws = freshWorkspace();
   const persona = scaffoldPersona(ws, 'windows', 'builder', '# Builder');
-  const expectedDir = path.join(ws, '.dashboard', 'agents', 'builder');
+  const expectedDir = path.join(ws, '.lares', 'agents', 'builder');
   assert.equal(persona.directory, expectedDir);
   assert.equal(persona.lane, undefined, 'no lane declared → undefined');
   // Identity (seed-once) + operational kit all present.
@@ -141,7 +141,7 @@ test('a supervisor-lane persona gets SUPERVISOR_PERSONA settings (double-`..` pa
   assert.ok(body.includes('dashboard-status.mjs\\" waiting') || body.includes('dashboard-status.mjs" waiting'),
     'Notification hook invokes the script with the waiting arg');
   // It must NOT be the supervisor's single-`..` ../scripts variant (silent no-op
-  // footgun: a persona at .dashboard/agents/<name>/ needs ../../scripts).
+  // footgun: a persona at .lares/agents/<name>/ needs ../../scripts).
   assert.notEqual(body, SUPERVISOR_CLAUDE_SETTINGS_JSON,
     'persona must NOT receive the supervisor single-`..` settings variant');
 });
@@ -331,7 +331,7 @@ test('applyPersonaLaneToLaunchInput throws on a conflicting explicit flag, no-op
 
 // ── scanPersonas ─────────────────────────────────────────────────────
 
-test('scanPersonas finds personas under .dashboard/agents/', () => {
+test('scanPersonas finds personas under .lares/agents/', () => {
   const ws = freshWorkspace();
   scaffoldPersona(ws, 'windows', 'alpha');
   scaffoldPersona(ws, 'windows', 'beta');
@@ -341,23 +341,23 @@ test('scanPersonas finds personas under .dashboard/agents/', () => {
 
 // ── migratePersonas ──────────────────────────────────────────────────
 
-test('migratePersonas copies legacy .claude/agents personas into .dashboard/agents', () => {
+test('migratePersonas copies legacy .claude/agents personas into .lares/agents', () => {
   const ws = freshWorkspace();
   writeLegacyPersona(ws, 'legacy-one', '# Legacy One\n');
   migratePersonas(ws, 'windows');
-  const dst = path.join(ws, '.dashboard', 'agents', 'legacy-one', 'CLAUDE.md');
-  assert.ok(fs.existsSync(dst), 'legacy persona should be copied to .dashboard/agents');
+  const dst = path.join(ws, '.lares', 'agents', 'legacy-one', 'CLAUDE.md');
+  assert.ok(fs.existsSync(dst), 'legacy persona should be copied to .lares/agents');
   assert.equal(fs.readFileSync(dst, 'utf-8'), '# Legacy One\n');
   // Non-destructive: legacy copy is left in place.
   assert.ok(fs.existsSync(path.join(ws, '.claude', 'agents', 'legacy-one', 'CLAUDE.md')));
 });
 
-test('migratePersonas does not clobber an existing .dashboard/agents entry', () => {
+test('migratePersonas does not clobber an existing .lares/agents entry', () => {
   const ws = freshWorkspace();
   writeLegacyPersona(ws, 'dup', '# Legacy version\n');
   scaffoldPersona(ws, 'windows', 'dup', '# Dashboard version');
   migratePersonas(ws, 'windows');
-  const dst = path.join(ws, '.dashboard', 'agents', 'dup', 'CLAUDE.md');
+  const dst = path.join(ws, '.lares', 'agents', 'dup', 'CLAUDE.md');
   const body = fs.readFileSync(dst, 'utf-8');
   // The existing dashboard entry (template-rendered, with the dashboard role
   // body) must win — migration must not overwrite it with the legacy content.
@@ -369,13 +369,13 @@ test('migratePersonas skips the supervisor persona', () => {
   const ws = freshWorkspace();
   writeLegacyPersona(ws, 'supervisor', '# Supervisor\n');
   migratePersonas(ws, 'windows');
-  assert.ok(!fs.existsSync(path.join(ws, '.dashboard', 'agents', 'supervisor')), 'supervisor must not migrate into agents/');
+  assert.ok(!fs.existsSync(path.join(ws, '.lares', 'agents', 'supervisor')), 'supervisor must not migrate into agents/');
 });
 
 test('migratePersonas is a no-op when there is no legacy dir', () => {
   const ws = freshWorkspace();
   migratePersonas(ws, 'windows'); // must not throw
-  assert.ok(!fs.existsSync(path.join(ws, '.dashboard', 'agents')));
+  assert.ok(!fs.existsSync(path.join(ws, '.lares', 'agents')));
 });
 
 test('scanPersonas implicitly migrates legacy personas', () => {
@@ -383,7 +383,7 @@ test('scanPersonas implicitly migrates legacy personas', () => {
   writeLegacyPersona(ws, 'auto-migrated');
   const names = scanPersonas(ws, 'windows').map(p => p.name);
   assert.deepEqual(names, ['auto-migrated']);
-  assert.ok(fs.existsSync(path.join(ws, '.dashboard', 'agents', 'auto-migrated', 'CLAUDE.md')));
+  assert.ok(fs.existsSync(path.join(ws, '.lares', 'agents', 'auto-migrated', 'CLAUDE.md')));
 });
 
 // ── setPersonaLane: overwrite-capable lane editing for an EXISTING persona ──

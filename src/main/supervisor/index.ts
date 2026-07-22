@@ -12,11 +12,13 @@ import {
   SUPERVISOR_CLAUDE_SETTINGS_JSON, SUPERVISOR_CLAUDE_SETTINGS_JSON_V1, SUPERVISOR_CLAUDE_SETTINGS_JSON_V2,
   SUPERVISOR_CLAUDE_SETTINGS_JSON_V3,
   SUPERVISOR_RUN_ORCHESTRATION_SKILL, SUPERVISOR_ORCHESTRATION_SPIKE_SKILL,
+  SUPERVISOR_CONTEXT_ANALYTICS_SKILL,
   SCRIPT_READ_AGENT_LOG, SCRIPT_LIST_AGENTS, SCRIPT_SEND_MESSAGE, SCRIPT_GET_CONTEXT_STATS,
   WORKER_CLAUDE_MD, WORKER_CLAUDE_MD_V1, WORKER_BEHAVIORAL_MD,
   WORKER_CLAUDE_SETTINGS_JSON, WORKER_CLAUDE_SETTINGS_JSON_V2, WORKER_CLAUDE_SETTINGS_JSON_V3,
   WORKER_CLAUDE_SETTINGS_JSON_V4, WORKER_CLAUDE_SETTINGS_JSON_V5, WORKER_CLAUDE_SETTINGS_JSON_V6,
   WORKER_CODEX_CONFIG_TOML, WORKER_CODEX_CONFIG_TOML_V1, WORKER_CODEX_CONFIG_TOML_V2,
+  WORKER_CODEX_CONFIG_TOML_V3,
   DASHBOARD_STATUS_SCRIPT_MJS, DASHBOARD_STATUS_SCRIPT_MJS_V3, DASHBOARD_STATUS_SCRIPT_MJS_V4, DASHBOARD_STATUS_SCRIPT_MJS_V5,
   DASHBOARD_STATUS_SCRIPT_MJS_V6, DASHBOARD_STATUS_SCRIPT_V7_HASH, DASHBOARD_STATUS_SCRIPT_V8_HASH,
   DASHBOARD_STATUSLINE_SCRIPT_MJS,
@@ -26,7 +28,8 @@ import {
   RESEARCH_STORE_README_MD, RESEARCH_WRITE_GUARD_MJS, RESEARCHER_CLAUDE_SETTINGS_JSON,
   RESEARCHER_CLAUDE_SETTINGS_JSON_V1, RESEARCHER_AGENT_MD,
   PERSONA_CREATE_PERSONA_SKILL, PERSONA_READ_COMMENTS_SKILL, SCRIPT_READ_COMMENTS_PY,
-  PERSONA_CREATE_PERSONA_SKILL_V1, PERSONA_READ_COMMENTS_SKILL_V1,
+  PERSONA_CREATE_PERSONA_SKILL_V1, PERSONA_READ_COMMENTS_SKILL_V1, PERSONA_READ_COMMENTS_SKILL_V2,
+  PERSONA_CREATE_PERSONA_SKILL_V3_HASH,
   CONTINUATION_BRICK_RENDER_MAX_BYTES,
   CONTINUATION_STOP_FLUSH_DELAY_MS,
   TERMINAL_AGENT_RELEASE_DELAY_MS,
@@ -503,6 +506,23 @@ export const SUPERVISOR_AGENT_MD_V2_HASH = '85993687d0bd2b17f94b95d8db45585ccbec
  *  the v3 file's previousHashes for silent v2→v3 upgrade. */
 export const SUPERVISOR_RUN_ORCHESTRATION_SKILL_V2_HASH = 'a8f79058f73df5a3aa2e17a1d0f66f100086413083a7b911b99daad06200cd74';
 
+/** SHA-256 hex of the v3 `.dashboard/supervisor/.claude/skills/run-orchestration/SKILL.md`
+ *  (MCP-first playbook that still documented `list_orchestrations`). v4 drops
+ *  every `list_orchestrations` reference — the tool was deleted in the
+ *  context-overhead pass because its catalog holds exactly one entry
+ *  (groupthink) and it never surfaced the one real choice (mode:
+ *  serial | parallel), which `run_orchestration`'s own description now carries.
+ *  Used in the v4 file's previousHashes for silent v3→v4 upgrade. */
+export const SUPERVISOR_RUN_ORCHESTRATION_SKILL_V3_HASH = '4190bf9697005c27a325464f61975cf208f14f77391d6f8c9add320917e5ed47';
+
+/** SHA-256 hex of the v2 `create-persona/SKILL.md` (shipped into the supervisor,
+ *  worker, and researcher lanes). v3 drops `get_context_stats` from the
+ *  orchestration-capability table row — that tool was deleted in the
+ *  context-overhead pass (its reading is already inline in `list_agents`), and a
+ *  persona-authoring doc must not name a tool that no longer exists. Used in the
+ *  v3 file's previousHashes for silent v2→v3 upgrade. */
+export const PERSONA_CREATE_PERSONA_SKILL_V2_HASH = '5b7caaea2588573667da3bd51d8dba8a56867f7219666679021762b0904cd4b4';
+
 /** SHA-256 hex of the v3 `.dashboard/supervisor/CLAUDE.md` (pre-browser-tools).
  *  v4 appends the `<!-- section:browser-tools v1 -->` section (WP2-B, embedded
  *  browser MCP tools + for-human-action pattern + untrusted-content rule).
@@ -590,6 +610,28 @@ export const SUPERVISOR_AGENT_MD_V11_HASH = 'b2222fda999066036675f5831868aad09e6
  *  workspaces. */
 export const SUPERVISOR_AGENT_MD_V12_HASH = '1b4772ff5accee627d0ae632857801da4dc213d456b8ce6cd339047af7a54eeb';
 
+/** SHA-256 hex of the v13 `.dashboard/supervisor/CLAUDE.md` (event-noise
+ *  reduction). v14 is the MCP context-overhead cut: `get_context_stats` and
+ *  `list_orchestrations` were deleted as MCP tools, so their resident
+ *  documentation goes with them — the `get_context_stats` bullet is removed and
+ *  the `list_agents` bullet now states that the per-agent context reading is
+ *  returned inline (the capability is preserved, not dropped), and the
+ *  orchestration section's "Discover with `list_orchestrations`" clause is
+ *  removed. Used in the v14 file's previousHashes for silent v13→v14 upgrade of
+ *  pristine workspaces. */
+export const SUPERVISOR_AGENT_MD_V13_HASH = '34b550974bbcd814581f257dfb4f9677d738e40b579a995a5f963a4d2e2f9c78';
+
+/** SHA-256 hex of the v14 `.dashboard/supervisor/CLAUDE.md` (MCP context-overhead
+ *  cut). v15 teaches the persona about the continuation handoff it is the SUBJECT
+ *  of (plans/continuation-handoff-feedback.md §4.6): a `save_continuation_brick`
+ *  tool bullet, and the `<!-- section:continuation-request v1 -->` block telling it
+ *  to answer a continuation request THAT TURN with state-not-prose, stay under the
+ *  stated byte limit, finish its response normally, and start no new work. The
+ *  runtime note-request injection is unchanged — it carries the attempt-specific
+ *  instruction; the scaffold carries the durable capability awareness. Used in the
+ *  v15 file's previousHashes for silent v14→v15 upgrade of pristine workspaces. */
+export const SUPERVISOR_AGENT_MD_V14_HASH = '1e017868036e16780540493644e3a38a47d1ba2ddfe6e341375e387e463ddef4';
+
 /** SHA-256 hex of the v2 `.dashboard/workers/claude/CLAUDE.md` (pre-research-store;
  *  the shared-behavioral-memory section but no research-store pointer). v3
  *  appends the `<!-- section:research-store v1 -->` section (WP-G). Used in the
@@ -660,6 +702,45 @@ export const RESEARCHER_AGENT_MD_V3_HASH = '00c35328b92d340d62cb939076f6558238d6
  *  never authenticated success. Used in the v5 file's previousHashes for silent
  *  v4→v5 upgrade of pristine workspaces. */
 export const RESEARCHER_AGENT_MD_V4_HASH = 'ba8d6d9f9598dc47854030e47e7a2f50d1a01ad643b267cc3f091160fe909aab';
+
+// ── `.dashboard` → `.lares` rename (Lares rebrand) — pre-rename hashes ──
+// Every managed scaffold file whose CONTENT mentioned the state folder was
+// bumped one version when `.dashboard/` became `.lares/`. These literals are
+// the sha256 of the last pre-rename bundled bodies, so a migrated (or
+// still-`.dashboard`) workspace's pristine on-disk copies upgrade silently.
+
+/** SHA-256 hex of the v15 `.dashboard/supervisor/CLAUDE.md` (pre-`.lares`
+ *  rename). Used in the v16 file's previousHashes. */
+export const SUPERVISOR_AGENT_MD_V15_HASH = '6947bfbb882d76fc7ee97a93a96dacae12c0dfc0dd70bb3aa071b2f8770979dc';
+
+/** SHA-256 hex of the v6 `.dashboard/workers/claude/CLAUDE.md` (pre-`.lares`
+ *  rename). Used in the v7 file's previousHashes. */
+export const WORKER_CLAUDE_MD_V6_HASH = '7d4af7db5264f03283a3de6a78eb5df93ce61b960193b2aa9936012e2c00e55d';
+
+/** SHA-256 hex of the v5 `.dashboard/researcher/CLAUDE.md` (pre-`.lares`
+ *  rename). Used in the v6 file's previousHashes. */
+export const RESEARCHER_AGENT_MD_V5_HASH = '90e26bca4b533513c0c59e0fffb7fad431ddff9695cdd327d29f54e15a0c7bad';
+
+/** SHA-256 hex of the v2 research-write-guard.mjs (single `.dashboard/research/`
+ *  marker). v3 accepts BOTH markers (rename-failed fallback sessions still
+ *  write under `.dashboard/`). Used in the v3 file's previousHashes. */
+export const RESEARCH_WRITE_GUARD_MJS_V2_HASH = 'a179be1c232f4515e83db70063b7c3eee41306fe8d35e09e88bd92e8c6a4d98f';
+
+// PERSONA_CREATE_PERSONA_SKILL_V3_HASH lives in shared/constants.ts (imported
+// above) so persona-scanner can use it without an import cycle through here.
+
+/** SHA-256 hex of the v1 orchestration-spike SKILL.md (pre-`.lares` rename).
+ *  Used in the v2 file's previousHashes. */
+export const SUPERVISOR_ORCHESTRATION_SPIKE_SKILL_V1_HASH = '9ed562c59acb5e5293fa0b4a75c7329b323366313fb504b74bc40bdde29524f2';
+
+/** SHA-256 hex of the v1 context-analytics SKILL.md (pre-`.lares` rename).
+ *  Used in the v2 file's previousHashes. */
+export const SUPERVISOR_CONTEXT_ANALYTICS_SKILL_V1_HASH = '7b537aeec337acb9c8000124db136bb529c6d0575c9dadac7eccb05fbea01091';
+
+/** SHA-256 hex of the v1 dashboard-statusline.mjs (comments named
+ *  `.dashboard`; the usage-dir resolution is script-relative and unchanged).
+ *  Used in the v2 file's previousHashes. */
+export const DASHBOARD_STATUSLINE_SCRIPT_V1_HASH = '371de2e4dc5241d4de8f42969098b6d3523d283eb7a92a20b60396c41b370448';
 
 /** Map an agent's role flags to its first-class app role-lane
  *  (browser-parity-and-capability-isolation §0, D-1). The single source of
@@ -2154,39 +2235,55 @@ export class AgentSupervisor extends EventEmitter {
    *  Versioning per plans/scaffold-version-migration.md — bumping a file's
    *  `version` triggers managed-upgrade-on-launch in old workspaces. */
   private static SUPERVISOR_FILES: Record<string, ScaffoldFile> = {
-    [`.dashboard/supervisor/CLAUDE.md`]:                                              {
+    [`.lares/supervisor/CLAUDE.md`]:                                              {
       content: SUPERVISOR_AGENT_MD,
-      version: 13, // v13 (supervisor event-noise reduction) aligns the doc with the bridge: the Automatic-Events `idle/done` bullet becomes `idle` only (a clean `done` exit no longer notifies), `context threshold (80%+)` becomes a single 95% ADVISORY tier stating that 100% is not a literal cutoff and that a near-complete agent should be allowed to finish, the Tier-1 decision line follows to ≥ 95%, and ## Multi-agent orchestration gains the muted-members paragraph (run members' per-turn idle events are suppressed; the run reports itself).
-      previousHashes: { 1: SUPERVISOR_AGENT_MD_V1_HASH, 2: SUPERVISOR_AGENT_MD_V2_HASH, 3: SUPERVISOR_AGENT_MD_V3_HASH, 4: SUPERVISOR_AGENT_MD_V4_HASH, 5: SUPERVISOR_AGENT_MD_V5_HASH, 6: SUPERVISOR_AGENT_MD_V6_HASH, 7: SUPERVISOR_AGENT_MD_V7_HASH, 8: SUPERVISOR_AGENT_MD_V8_HASH, 9: SUPERVISOR_AGENT_MD_V9_HASH, 10: SUPERVISOR_AGENT_MD_V10_HASH, 11: SUPERVISOR_AGENT_MD_V11_HASH, 12: SUPERVISOR_AGENT_MD_V12_HASH },
+      version: 16, // v16 (Lares rebrand) renames every `.dashboard/…` state-folder reference to `.lares/…` (working-directory note, researcher inbox pointers, research-store section). Previously: v15 (continuation-request awareness) adds the `save_continuation_brick` tool bullet and the `<!-- section:continuation-request v1 -->` block: answer a dashboard continuation request THAT TURN, write per-agent state + pointers rather than prose, respect the stated byte cap, finish the current response normally (the dashboard waits for turn completion before swapping), and start no new work. Previously: v14 (MCP context-overhead cut) removes the resident documentation for two deleted MCP tools: the `get_context_stats` bullet is gone (the `list_agents` bullet now states the per-agent context reading is returned inline, so the capability is preserved), and `## Multi-agent orchestration` no longer says "Discover with `list_orchestrations`".
+      previousHashes: { 1: SUPERVISOR_AGENT_MD_V1_HASH, 2: SUPERVISOR_AGENT_MD_V2_HASH, 3: SUPERVISOR_AGENT_MD_V3_HASH, 4: SUPERVISOR_AGENT_MD_V4_HASH, 5: SUPERVISOR_AGENT_MD_V5_HASH, 6: SUPERVISOR_AGENT_MD_V6_HASH, 7: SUPERVISOR_AGENT_MD_V7_HASH, 8: SUPERVISOR_AGENT_MD_V8_HASH, 9: SUPERVISOR_AGENT_MD_V9_HASH, 10: SUPERVISOR_AGENT_MD_V10_HASH, 11: SUPERVISOR_AGENT_MD_V11_HASH, 12: SUPERVISOR_AGENT_MD_V12_HASH, 13: SUPERVISOR_AGENT_MD_V13_HASH, 14: SUPERVISOR_AGENT_MD_V14_HASH, 15: SUPERVISOR_AGENT_MD_V15_HASH },
     },
-    [`.dashboard/supervisor/.claude/settings.json`]:                                  {
+    [`.lares/supervisor/.claude/settings.json`]:                                  {
       content: SUPERVISOR_CLAUDE_SETTINGS_JSON,
       version: 4, // v4 adds the statusLine → dashboard-statusline.mjs usage-capture block
       previousHashes: { 1: sha256Hex(SUPERVISOR_CLAUDE_SETTINGS_JSON_V1), 2: sha256Hex(SUPERVISOR_CLAUDE_SETTINGS_JSON_V2), 3: sha256Hex(SUPERVISOR_CLAUDE_SETTINGS_JSON_V3) },
     },
-    [`.dashboard/supervisor/.claude/skills/run-orchestration/SKILL.md`]:              {
+    [`.lares/supervisor/.claude/skills/run-orchestration/SKILL.md`]:              {
       content: SUPERVISOR_RUN_ORCHESTRATION_SKILL,
-      version: 3,
-      previousHashes: { 1: SUPERVISOR_RUN_ORCHESTRATION_SKILL_V1_HASH, 2: SUPERVISOR_RUN_ORCHESTRATION_SKILL_V2_HASH },
+      version: 4, // v4 drops every `list_orchestrations` reference (tool deleted in the context-overhead pass)
+      previousHashes: { 1: SUPERVISOR_RUN_ORCHESTRATION_SKILL_V1_HASH, 2: SUPERVISOR_RUN_ORCHESTRATION_SKILL_V2_HASH, 3: SUPERVISOR_RUN_ORCHESTRATION_SKILL_V3_HASH },
     },
-    [`.dashboard/supervisor/.claude/skills/orchestration-spike/SKILL.md`]:            { content: SUPERVISOR_ORCHESTRATION_SPIKE_SKILL, version: 1 },
+    [`.lares/supervisor/.claude/skills/orchestration-spike/SKILL.md`]:            { content: SUPERVISOR_ORCHESTRATION_SPIKE_SKILL, version: 2, previousHashes: { 1: SUPERVISOR_ORCHESTRATION_SPIKE_SKILL_V1_HASH } }, // v2: `.lares` rename
+    // The replacement capability for the 13 retired `observability-analytics` MCP
+    // tools. version 1 with NO previousHashes: nothing by this name has ever been
+    // scaffolded, so there is no prior on-disk content to migrate from — same
+    // shape as orchestration-spike above. (previousHashes exists only to
+    // recognize an older MANAGED version as pristine; a first version has none,
+    // and an unmanaged file already at this path is treated as user-authored and
+    // .bak'd rather than silently overwritten.)
+    //
+    // SUPERVISOR LANE ONLY — deliberately not added to WORKER_FILES or
+    // RESEARCHER_FILES. A scaffolded skill's frontmatter description is resident
+    // in every session on the lanes that carry it, so each extra lane pays that
+    // header forever. The supervisor is the analytics consumer (the retired
+    // toolset was already supervisor-exclusive, and the P2 usage surface put what
+    // analytics traffic existed on the supervisor lane); a worker that needs a
+    // number gets it dispatched. One-line add per lane the day that changes.
+    [`.lares/supervisor/.claude/skills/context-analytics/SKILL.md`]:              { content: SUPERVISOR_CONTEXT_ANALYTICS_SKILL, version: 2, previousHashes: { 1: SUPERVISOR_CONTEXT_ANALYTICS_SKILL_V1_HASH } }, // v2: `.lares` rename
     // Persona kit (§1.4) — the two default skills ship into every native lane too
     // so the supervisor/researcher/worker can guide persona creation + read comments.
-    [`.dashboard/supervisor/.claude/skills/create-persona/SKILL.md`]:                 { content: PERSONA_CREATE_PERSONA_SKILL, version: 2, previousHashes: { 1: sha256Hex(PERSONA_CREATE_PERSONA_SKILL_V1) } },
-    [`.dashboard/supervisor/.claude/skills/read-comments/SKILL.md`]:                  { content: PERSONA_READ_COMMENTS_SKILL, version: 2, previousHashes: { 1: sha256Hex(PERSONA_READ_COMMENTS_SKILL_V1) } }, // QW2: sharpened trigger description
-    // NOTE: .dashboard/supervisor/memory/MEMORY.md is deliberately NOT managed
+    [`.lares/supervisor/.claude/skills/create-persona/SKILL.md`]:                 { content: PERSONA_CREATE_PERSONA_SKILL, version: 4, previousHashes: { 1: sha256Hex(PERSONA_CREATE_PERSONA_SKILL_V1), 2: PERSONA_CREATE_PERSONA_SKILL_V2_HASH, 3: PERSONA_CREATE_PERSONA_SKILL_V3_HASH } }, // v4: `.lares` rename
+    [`.lares/supervisor/.claude/skills/read-comments/SKILL.md`]:                  { content: PERSONA_READ_COMMENTS_SKILL, version: 3, previousHashes: { 1: sha256Hex(PERSONA_READ_COMMENTS_SKILL_V1), 2: sha256Hex(PERSONA_READ_COMMENTS_SKILL_V2) } }, // v3: `.lares` rename
+    // NOTE: .lares/supervisor/memory/MEMORY.md is deliberately NOT managed
     // here — it is seeded once via seedSupervisorMemoryIfAbsent (seed-once
     // contract, parallels worker behavioral.md). Keeping it in this map would
     // let a future version bump `.bak` + overwrite a supervisor's accumulated
     // memory. Do not re-add it.
-    [`.dashboard/supervisor/scripts/read-agent-log.sh`]:                              { content: SCRIPT_READ_AGENT_LOG,                version: 1, executable: true },
-    [`.dashboard/supervisor/scripts/list-agents.sh`]:                                 { content: SCRIPT_LIST_AGENTS,                   version: 1, executable: true },
-    [`.dashboard/supervisor/scripts/send-message.sh`]:                                { content: SCRIPT_SEND_MESSAGE,                  version: 1, executable: true },
-    [`.dashboard/supervisor/scripts/get-context-stats.sh`]:                           { content: SCRIPT_GET_CONTEXT_STATS,             version: 1, executable: true },
+    [`.lares/supervisor/scripts/read-agent-log.sh`]:                              { content: SCRIPT_READ_AGENT_LOG,                version: 1, executable: true },
+    [`.lares/supervisor/scripts/list-agents.sh`]:                                 { content: SCRIPT_LIST_AGENTS,                   version: 1, executable: true },
+    [`.lares/supervisor/scripts/send-message.sh`]:                                { content: SCRIPT_SEND_MESSAGE,                  version: 1, executable: true },
+    [`.lares/supervisor/scripts/get-context-stats.sh`]:                           { content: SCRIPT_GET_CONTEXT_STATS,             version: 1, executable: true },
   };
 
   /** Class IV — workspace-shared hook script. Written on first supervised
-   *  worker launch of any provider; lives at .dashboard/scripts/ so a single
+   *  worker launch of any provider; lives at .lares/scripts/ so a single
    *  copy serves every per-provider worker template.
    *
    *  v2 added DASHBOARD_HOST support + pending-status.jsonl failure logging.
@@ -2206,7 +2303,7 @@ export class AgentSupervisor extends EventEmitter {
    *  flips the card to waiting.
    *  All previous hashes are recorded for silent upgrade. */
   private static WORKSPACE_SCRIPT_FILES: Record<string, ScaffoldFile> = {
-    [`.dashboard/scripts/dashboard-status.mjs`]: {
+    [`.lares/scripts/dashboard-status.mjs`]: {
       content: DASHBOARD_STATUS_SCRIPT_MJS,
       version: 9,
       executable: true,
@@ -2223,14 +2320,14 @@ export class AgentSupervisor extends EventEmitter {
     },
     // Persona kit (§1.4) — one shared copy of the read-comments helper script.
     // The read-comments skill references the absolute
-    // <workspace-root>/.dashboard/scripts/read-comments.py, so no per-lane copy
+    // <workspace-root>/.lares/scripts/read-comments.py, so no per-lane copy
     // is needed. Written alongside dashboard-status.mjs on any workspace-script
     // scaffold pass (incl. the persona-launch branch in launchAgent).
-    [`.dashboard/scripts/read-comments.py`]: { content: SCRIPT_READ_COMMENTS_PY, version: 1, executable: true },
+    [`.lares/scripts/read-comments.py`]: { content: SCRIPT_READ_COMMENTS_PY, version: 1, executable: true },
     // Usage-limits capture (plans/usage-limits-mcp-and-ui.md) — the statusLine
     // command each lane's settings.json points at. Prints the terminal status
-    // line AND writes the rate_limits reading to .dashboard/usage/latest.json.
-    [`.dashboard/scripts/dashboard-statusline.mjs`]: { content: DASHBOARD_STATUSLINE_SCRIPT_MJS, version: 1, executable: true },
+    // line AND writes the rate_limits reading to .lares/usage/latest.json.
+    [`.lares/scripts/dashboard-statusline.mjs`]: { content: DASHBOARD_STATUSLINE_SCRIPT_MJS, version: 2, executable: true, previousHashes: { 1: DASHBOARD_STATUSLINE_SCRIPT_V1_HASH } }, // v2: `.lares` rename (comment-only; resolution stays script-relative)
   };
 
   /** Class IV — Claude worker template files. Shared cwd for N supervised
@@ -2246,12 +2343,12 @@ export class AgentSupervisor extends EventEmitter {
    *  v6 adds the Notification hook (Notification → waiting) so a worker that
    *  blocks on input flips to `waiting` (plans/hook-driven-waiting-status.md §4). */
   private static WORKER_FILES_CLAUDE: Record<string, ScaffoldFile> = {
-    [`.dashboard/workers/claude/CLAUDE.md`]:                       {
+    [`.lares/workers/claude/CLAUDE.md`]:                       {
       content: WORKER_CLAUDE_MD,
-      version: 6, // v2 adds the memory section; v3 (WP-G) adds the research-store pointer; v4 adds the online-research division of labor; v5 (planning-surface WP2) adds the plan-event sentinel section; v6 (GT-C D2) makes the PLAN-EVENT sentinel mandatory on every rail turn + expands the status vocab
-      previousHashes: { 1: sha256Hex(WORKER_CLAUDE_MD_V1), 2: WORKER_CLAUDE_MD_V2_HASH, 3: WORKER_CLAUDE_MD_V3_HASH, 4: WORKER_CLAUDE_MD_V4_HASH, 5: WORKER_CLAUDE_MD_V5_HASH },
+      version: 7, // v2 adds the memory section; v3 (WP-G) adds the research-store pointer; v4 adds the online-research division of labor; v5 (planning-surface WP2) adds the plan-event sentinel section; v6 (GT-C D2) makes the PLAN-EVENT sentinel mandatory on every rail turn + expands the status vocab; v7 (Lares rebrand) renames `.dashboard/…` → `.lares/…`
+      previousHashes: { 1: sha256Hex(WORKER_CLAUDE_MD_V1), 2: WORKER_CLAUDE_MD_V2_HASH, 3: WORKER_CLAUDE_MD_V3_HASH, 4: WORKER_CLAUDE_MD_V4_HASH, 5: WORKER_CLAUDE_MD_V5_HASH, 6: WORKER_CLAUDE_MD_V6_HASH },
     },
-    [`.dashboard/workers/claude/.claude/settings.json`]:           {
+    [`.lares/workers/claude/.claude/settings.json`]:           {
       content: WORKER_CLAUDE_SETTINGS_JSON,
       version: 7, // v7 adds the statusLine → dashboard-statusline.mjs usage-capture block
       previousHashes: {
@@ -2264,8 +2361,8 @@ export class AgentSupervisor extends EventEmitter {
       },
     },
     // Persona kit (§1.4) — default skills for the Claude worker lane.
-    [`.dashboard/workers/claude/.claude/skills/create-persona/SKILL.md`]: { content: PERSONA_CREATE_PERSONA_SKILL, version: 2, previousHashes: { 1: sha256Hex(PERSONA_CREATE_PERSONA_SKILL_V1) } },
-    [`.dashboard/workers/claude/.claude/skills/read-comments/SKILL.md`]:  { content: PERSONA_READ_COMMENTS_SKILL, version: 2, previousHashes: { 1: sha256Hex(PERSONA_READ_COMMENTS_SKILL_V1) } }, // QW2: sharpened trigger description
+    [`.lares/workers/claude/.claude/skills/create-persona/SKILL.md`]: { content: PERSONA_CREATE_PERSONA_SKILL, version: 4, previousHashes: { 1: sha256Hex(PERSONA_CREATE_PERSONA_SKILL_V1), 2: PERSONA_CREATE_PERSONA_SKILL_V2_HASH, 3: PERSONA_CREATE_PERSONA_SKILL_V3_HASH } }, // v4: `.lares` rename
+    [`.lares/workers/claude/.claude/skills/read-comments/SKILL.md`]:  { content: PERSONA_READ_COMMENTS_SKILL, version: 3, previousHashes: { 1: sha256Hex(PERSONA_READ_COMMENTS_SKILL_V1), 2: sha256Hex(PERSONA_READ_COMMENTS_SKILL_V2) } }, // v3: `.lares` rename
   };
 
   /** WP-G — Research store skeleton (plans/groupthink/browser-parity-and-research-store.md).
@@ -2275,9 +2372,9 @@ export class AgentSupervisor extends EventEmitter {
    *  fresh checkout. README is managed (version-migrated); the .gitkeeps are
    *  empty placeholders. */
   private static RESEARCH_STORE_FILES: Record<string, ScaffoldFile> = {
-    [`.dashboard/research/README.md`]:        { content: RESEARCH_STORE_README_MD, version: 1 },
-    [`.dashboard/research/inbox/.gitkeep`]:   { content: '', version: 1 },
-    [`.dashboard/research/cleared/.gitkeep`]: { content: '', version: 1 },
+    [`.lares/research/README.md`]:        { content: RESEARCH_STORE_README_MD, version: 1 },
+    [`.lares/research/inbox/.gitkeep`]:   { content: '', version: 1 },
+    [`.lares/research/cleared/.gitkeep`]: { content: '', version: 1 },
   };
 
   /** WP-B/WP-G — Researcher persona files, written by ensureResearcherScaffold
@@ -2286,12 +2383,12 @@ export class AgentSupervisor extends EventEmitter {
    *  turn-boundary status hooks. CLAUDE.md is the generic base persona contract
    *  (RESEARCHER_AGENT_MD) — managed/version-migrated like the supervisor's. */
   private static RESEARCHER_FILES: Record<string, ScaffoldFile> = {
-    [`.dashboard/researcher/CLAUDE.md`]:                         { content: RESEARCHER_AGENT_MD, version: 5, previousHashes: { 1: RESEARCHER_AGENT_MD_V1_HASH, 2: RESEARCHER_AGENT_MD_V2_HASH, 3: RESEARCHER_AGENT_MD_V3_HASH, 4: RESEARCHER_AGENT_MD_V4_HASH } },
-    [`.dashboard/researcher/.claude/settings.json`]:             { content: RESEARCHER_CLAUDE_SETTINGS_JSON, version: 2, previousHashes: { 1: sha256Hex(RESEARCHER_CLAUDE_SETTINGS_JSON_V1) } },
-    [`.dashboard/researcher/scripts/research-write-guard.mjs`]:  { content: RESEARCH_WRITE_GUARD_MJS, version: 2, previousHashes: { 1: RESEARCH_WRITE_GUARD_MJS_V1_HASH }, executable: true },
+    [`.lares/researcher/CLAUDE.md`]:                         { content: RESEARCHER_AGENT_MD, version: 6, previousHashes: { 1: RESEARCHER_AGENT_MD_V1_HASH, 2: RESEARCHER_AGENT_MD_V2_HASH, 3: RESEARCHER_AGENT_MD_V3_HASH, 4: RESEARCHER_AGENT_MD_V4_HASH, 5: RESEARCHER_AGENT_MD_V5_HASH } }, // v6: `.lares` rename
+    [`.lares/researcher/.claude/settings.json`]:             { content: RESEARCHER_CLAUDE_SETTINGS_JSON, version: 2, previousHashes: { 1: sha256Hex(RESEARCHER_CLAUDE_SETTINGS_JSON_V1) } },
+    [`.lares/researcher/scripts/research-write-guard.mjs`]:  { content: RESEARCH_WRITE_GUARD_MJS, version: 3, previousHashes: { 1: RESEARCH_WRITE_GUARD_MJS_V1_HASH, 2: RESEARCH_WRITE_GUARD_MJS_V2_HASH }, executable: true }, // v3: accepts both `.lares`/`.dashboard` research markers
     // Persona kit (§1.4) — default skills for the researcher lane.
-    [`.dashboard/researcher/.claude/skills/create-persona/SKILL.md`]: { content: PERSONA_CREATE_PERSONA_SKILL, version: 1 },
-    [`.dashboard/researcher/.claude/skills/read-comments/SKILL.md`]:  { content: PERSONA_READ_COMMENTS_SKILL, version: 2, previousHashes: { 1: sha256Hex(PERSONA_READ_COMMENTS_SKILL_V1) } }, // QW2: sharpened trigger description
+    [`.lares/researcher/.claude/skills/create-persona/SKILL.md`]: { content: PERSONA_CREATE_PERSONA_SKILL, version: 4, previousHashes: { 1: sha256Hex(PERSONA_CREATE_PERSONA_SKILL_V1), 2: PERSONA_CREATE_PERSONA_SKILL_V2_HASH, 3: PERSONA_CREATE_PERSONA_SKILL_V3_HASH } }, // v4: `.lares` rename
+    [`.lares/researcher/.claude/skills/read-comments/SKILL.md`]:  { content: PERSONA_READ_COMMENTS_SKILL, version: 3, previousHashes: { 1: sha256Hex(PERSONA_READ_COMMENTS_SKILL_V1), 2: sha256Hex(PERSONA_READ_COMMENTS_SKILL_V2) } }, // v3: `.lares` rename
   };
 
   /** Delegates to the shared free-function writer in ../scaffold-writer (D1
@@ -2326,13 +2423,19 @@ export class AgentSupervisor extends EventEmitter {
   }
 
   /** Lane-agnostic refresh of the shared workspace hook scripts
-   *  (WORKSPACE_SCRIPT_FILES — .dashboard/scripts/dashboard-status.mjs +
+   *  (WORKSPACE_SCRIPT_FILES — .lares/scripts/dashboard-status.mjs +
    *  read-comments.py). Called unconditionally at launch BEFORE the lane
    *  dispatch so every lane (supervisor, researcher, worker, persona) self-heals
    *  a stale or missing shared script via the standard version-migration engine.
    *  Idempotent: a workspace already at the bundled version is a no-op skip. */
   private ensureWorkspaceScripts(workDir: string, pathType: string): void {
     this.writeScaffoldMap(workDir, AgentSupervisor.WORKSPACE_SCRIPT_FILES, pathType);
+    // WP1 (G1) — the installation-owned snapshot launcher rides this same
+    // unconditional per-launch refresh: the analytics-snapshot shim (versioned
+    // scaffold) plus .lares/installation.json (healed by full-payload
+    // comparison, so a moved/upgraded installation self-repairs on the next
+    // lane launch). Never throws (warn-and-skip inside).
+    ensureInstallationLauncher(workDir, pathType, undefined, { logPrefix: '[supervisor]' });
     // Register this workspace's usage dir with the account-wide watcher so the
     // statusline script's rate_limits captures surface over IPC/API/MCP.
     // Idempotent (addWorkspace no-ops on an already-watched dir).
@@ -2372,9 +2475,10 @@ export class AgentSupervisor extends EventEmitter {
         /\$\{WORKSPACE_ROOT\}/g,
         posixWorkspaceRoot,
       );
-      // v1/v2 content with the same materialized workspace root, so an old
+      // v1/v2/v3 content with the same materialized workspace root, so an old
       // workspace's on-disk file hashes match and upgrade silently. v1 = Stop
-      // only; v2 = Stop + UserPromptSubmit; v3 (current) adds SessionStart.
+      // only; v2 = Stop + UserPromptSubmit; v3 adds SessionStart; v4 (current)
+      // renames the hook script path `.dashboard/` → `.lares/`.
       const codexConfigV1 = WORKER_CODEX_CONFIG_TOML_V1.replace(
         /\$\{WORKSPACE_ROOT\}/g,
         posixWorkspaceRoot,
@@ -2383,13 +2487,18 @@ export class AgentSupervisor extends EventEmitter {
         /\$\{WORKSPACE_ROOT\}/g,
         posixWorkspaceRoot,
       );
+      const codexConfigV3 = WORKER_CODEX_CONFIG_TOML_V3.replace(
+        /\$\{WORKSPACE_ROOT\}/g,
+        posixWorkspaceRoot,
+      );
       const codexFiles: Record<string, ScaffoldFile> = {
-        [`.dashboard/workers/codex/.codex/config.toml`]: {
+        [`.lares/workers/codex/.codex/config.toml`]: {
           content: codexConfig,
-          version: 3,
+          version: 4,
           previousHashes: {
             1: sha256Hex(codexConfigV1),
             2: sha256Hex(codexConfigV2),
+            3: sha256Hex(codexConfigV3),
           },
         },
       };

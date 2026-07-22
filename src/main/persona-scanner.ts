@@ -11,14 +11,16 @@ import {
   WORKER_CLAUDE_SETTINGS_JSON, WORKER_CLAUDE_SETTINGS_JSON_V5, WORKER_CLAUDE_SETTINGS_JSON_V6,
   SUPERVISOR_PERSONA_CLAUDE_SETTINGS_JSON, SUPERVISOR_PERSONA_CLAUDE_SETTINGS_JSON_V1,
   PERSONA_CREATE_PERSONA_SKILL, PERSONA_CREATE_PERSONA_SKILL_V1,
-  PERSONA_READ_COMMENTS_SKILL, PERSONA_AGENT_MD_TEMPLATE,
+  PERSONA_READ_COMMENTS_SKILL, PERSONA_READ_COMMENTS_SKILL_V2, PERSONA_AGENT_MD_TEMPLATE,
+  PERSONA_CREATE_PERSONA_SKILL_V3_HASH,
 } from '../shared/constants';
+import { workspaceStateDirName } from './workspace-state-dir';
 
 const VALID_NAME = /^[a-z0-9_-]+$/;
 
 // ── Persona lane sidecar (#18 / D3, D7) ──────────────────────────────
 // A persona may declare exactly ONE native lane in
-// .dashboard/agents/<name>/persona.json {"lane":"worker"}. The sidecar is
+// .lares/agents/<name>/persona.json {"lane":"worker"}. The sidecar is
 // NEVER a member of any managed scaffold map (writeScaffoldMap can't touch it)
 // and is written only when absent, so a lane choice survives every kit upgrade.
 const VALID_PERSONA_LANES = new Set<PersonaLane>(['supervisor', 'researcher', 'worker']);
@@ -28,9 +30,9 @@ export function parsePersonaLane(value: unknown): PersonaLane | undefined {
     ? value as PersonaLane : undefined;
 }
 
-function personaJsonRel(name: string): string { return `.dashboard/agents/${name}/persona.json`; }
+function personaJsonRel(name: string): string { return `.lares/agents/${name}/persona.json`; }
 
-/** Read .dashboard/agents/<name>/persona.json; invalid/malformed → undefined. */
+/** Read .lares/agents/<name>/persona.json; invalid/malformed → undefined. */
 export function readPersonaLane(workspacePath: string, pathType: PathType, name: string): PersonaLane | undefined {
   const raw = readScaffoldText(workspacePath, personaJsonRel(name), pathType);
   if (raw === null) return undefined;
@@ -50,7 +52,7 @@ function writePersonaJsonIfAbsent(workspacePath: string, pathType: PathType, nam
   atomicWriteScaffoldText(workspacePath, rel, JSON.stringify({ lane }, null, 2) + '\n', false, pathType);
 }
 
-/** Delete .dashboard/agents/<name>/persona.json if it exists (path-type aware).
+/** Delete .lares/agents/<name>/persona.json if it exists (path-type aware).
  *  Used by setPersonaLane to revert a persona to the legacy (no-lane) path. */
 function deletePersonaJson(workspacePath: string, pathType: PathType, name: string): void {
   const rel = personaJsonRel(name);
@@ -119,7 +121,7 @@ function buildPersonaClaudeMd(displayName: string, roleDescription?: string): st
  *  the pre-Notification worker hash (WORKER_CLAUDE_SETTINGS_JSON_V5) so an existing
  *  persona carrying the old worker settings on disk upgrades silently (no `.bak`). */
 function buildPersonaManagedFiles(name: string, lane?: PersonaLane): Record<string, ScaffoldFile> {
-  const base = `.dashboard/agents/${name}`;
+  const base = `.lares/agents/${name}`;
   const settingsContent = lane === 'supervisor'
     ? SUPERVISOR_PERSONA_CLAUDE_SETTINGS_JSON
     : WORKER_CLAUDE_SETTINGS_JSON;
@@ -133,8 +135,16 @@ function buildPersonaManagedFiles(name: string, lane?: PersonaLane): Record<stri
     : { 1: sha256Hex(WORKER_CLAUDE_SETTINGS_JSON_V5), 2: sha256Hex(WORKER_CLAUDE_SETTINGS_JSON_V6) };
   return {
     [`${base}/.claude/settings.json`]:                  { content: settingsContent, version: 3, previousHashes: settingsPrevHashes },
-    [`${base}/.claude/skills/create-persona/SKILL.md`]: { content: PERSONA_CREATE_PERSONA_SKILL, version: 2, previousHashes: { 1: sha256Hex(PERSONA_CREATE_PERSONA_SKILL_V1) } },
-    [`${base}/.claude/skills/read-comments/SKILL.md`]:  { content: PERSONA_READ_COMMENTS_SKILL, version: 1 },
+    // v3 (`.lares` rename): previousHashes[2] is the LAST v2-era bundled body
+    // (the post-QW2 skill). A persona kit scaffolded between the QW2 bump and
+    // that content change also sits at sidecar version 2 but with the older
+    // body — those fall through to the `.bak` + overwrite branch (recoverable),
+    // since the sidecar format holds one hash per version.
+    [`${base}/.claude/skills/create-persona/SKILL.md`]: { content: PERSONA_CREATE_PERSONA_SKILL, version: 3, previousHashes: { 1: sha256Hex(PERSONA_CREATE_PERSONA_SKILL_V1), 2: PERSONA_CREATE_PERSONA_SKILL_V3_HASH } },
+    // v2 (`.lares` rename): same single-hash caveat — previousHashes[1] is the
+    // last v1-era bundled body (PERSONA_READ_COMMENTS_SKILL_V2 = pre-rename);
+    // pre-QW2 kit copies `.bak` instead of upgrading silently.
+    [`${base}/.claude/skills/read-comments/SKILL.md`]:  { content: PERSONA_READ_COMMENTS_SKILL, version: 2, previousHashes: { 1: sha256Hex(PERSONA_READ_COMMENTS_SKILL_V2) } },
   };
 }
 
@@ -158,7 +168,7 @@ export function ensurePersonaScaffold(workspacePath: string, pathType: PathType,
   writeScaffoldMap(workspacePath, buildPersonaManagedFiles(name, lane), pathType, { logPrefix: '[persona]' });
   // Identity — seed-once. A persona created by scaffoldPersona already has both;
   // a hand-written legacy persona (mr-job-hunt-agent) keeps its own CLAUDE.md.
-  const base = `.dashboard/agents/${name}`;
+  const base = `.lares/agents/${name}`;
   seedFileIfAbsent(workspacePath, pathType, `${base}/CLAUDE.md`, buildPersonaClaudeMd(displayNameFor(name)));
   seedFileIfAbsent(workspacePath, pathType, `${base}/memory/MEMORY.md`, `# Memory Index\n`);
 }
@@ -190,7 +200,7 @@ export function applyPersonaLaneToLaunchInput(
   // #19 — the 'supervisor' PRIVILEGE lane is NOT the structural supervisor UI
   // role. Granting isSupervisor here conflated the two: the renderer hides every
   // isSupervisor agent from the worker grid and keeps a single supervisor slot
-  // (already owned by the workspace's .dashboard/supervisor), so a supervisor-
+  // (already owned by the workspace's .lares/supervisor), so a supervisor-
   // lane persona got no card. Set privilegeLane instead — the persona renders as
   // its own card (isSupervisor stays false) and roleLaneOf still grants it the
   // supervisor-tier MCP toolset. researcher/worker already render as cards, so
@@ -200,32 +210,39 @@ export function applyPersonaLaneToLaunchInput(
   else if (declared === 'worker') input.isWorker = true;
 }
 
-// Custom agent personas live under .dashboard/agents/<name>/ (relocated from the
+// Custom agent personas live under .lares/agents/<name>/ (relocated from the
 // legacy .claude/agents/ path, which the harness gates behind an interactive
 // edit-confirmation dialog even with bypass-permissions on — see CLAUDE.md
 // "avoid .claude/"). migratePersonas() below lifts any pre-existing legacy
 // personas into the new location on first scan.
 const LEGACY_REL = ['.claude', 'agents'];
-const PERSONAS_REL = ['.dashboard', 'agents'];
+/** Personas live under `<state-dir>/agents/` — `.lares/agents/` normally, or
+ *  `.dashboard/agents/` for a rename-failed fallback session. Resolved per
+ *  workspace via workspace-state-dir (which also performs the one-time
+ *  `.dashboard` → `.lares` folder migration on first touch). */
+function personasRel(workspacePath: string, pathType: PathType): string[] {
+  return [workspaceStateDirName(workspacePath, pathType), 'agents'];
+}
 
 /**
  * One-time, idempotent migration: copy any persona that still lives under the
- * legacy `.claude/agents/<name>/` into `.dashboard/agents/<name>/`. Existing
- * `.dashboard/agents/` entries are never clobbered; the supervisor persona is
- * skipped (it lives at `.dashboard/supervisor/`, not in the agents dir). Logs
+ * legacy `.claude/agents/<name>/` into `.lares/agents/<name>/`. Existing
+ * `.lares/agents/` entries are never clobbered; the supervisor persona is
+ * skipped (it lives at `.lares/supervisor/`, not in the agents dir). Logs
  * each persona it moves. Safe to call on every scan — once the copy exists it
  * is a no-op.
  */
 export function migratePersonas(workspacePath: string, pathType: PathType): void {
+  const stateDirName = workspaceStateDirName(workspacePath, pathType);
   if (pathType === 'wsl') {
     try {
       const env = { ...process.env };
       delete env.CLAUDECODE;
       delete env.ELECTRON_RUN_AS_NODE;
       // For each legacy persona dir with a CLAUDE.md, copy it into
-      // .dashboard/agents/ unless a same-named entry already exists there.
+      // .lares/agents/ unless a same-named entry already exists there.
       const script =
-        `legacy='${workspacePath}/.claude/agents'; dest='${workspacePath}/.dashboard/agents'; ` +
+        `legacy='${workspacePath}/.claude/agents'; dest='${workspacePath}/${stateDirName}/agents'; ` +
         `[ -d "$legacy" ] || exit 0; mkdir -p "$dest"; ` +
         `for d in "$legacy"/*/; do ` +
         `[ -f "$d/CLAUDE.md" ] || continue; ` +
@@ -241,7 +258,7 @@ export function migratePersonas(workspacePath: string, pathType: PathType): void
       ) as { stdout: string };
       const moved = (stdout || '').trim().split('\n').filter(Boolean);
       for (const name of moved) {
-        console.log(`[persona] Migrated legacy persona "${name}" → .dashboard/agents/${name}`);
+        console.log(`[persona] Migrated legacy persona "${name}" → ${stateDirName}/agents/${name}`);
       }
     } catch {
       // Legacy dir absent or WSL unavailable — nothing to migrate.
@@ -251,7 +268,7 @@ export function migratePersonas(workspacePath: string, pathType: PathType): void
 
   const legacyDir = path.join(workspacePath, ...LEGACY_REL);
   if (!fs.existsSync(legacyDir)) return;
-  const destDir = path.join(workspacePath, ...PERSONAS_REL);
+  const destDir = path.join(workspacePath, ...personasRel(workspacePath, pathType));
   try {
     const entries = fs.readdirSync(legacyDir, { withFileTypes: true });
     for (const entry of entries) {
@@ -260,10 +277,10 @@ export function migratePersonas(workspacePath: string, pathType: PathType): void
       const src = path.join(legacyDir, entry.name);
       if (!fs.existsSync(path.join(src, 'CLAUDE.md'))) continue;
       const dst = path.join(destDir, entry.name);
-      if (fs.existsSync(dst)) continue; // don't clobber existing .dashboard/agents entry
+      if (fs.existsSync(dst)) continue; // don't clobber existing .lares/agents entry
       fs.mkdirSync(destDir, { recursive: true });
       fs.cpSync(src, dst, { recursive: true });
-      console.log(`[persona] Migrated legacy persona "${entry.name}" → .dashboard/agents/${entry.name}`);
+      console.log(`[persona] Migrated legacy persona "${entry.name}" → ${stateDirName}/agents/${entry.name}`);
     }
   } catch {
     // Permission error or similar — leave legacy in place.
@@ -271,15 +288,16 @@ export function migratePersonas(workspacePath: string, pathType: PathType): void
 }
 
 /**
- * Scan .dashboard/agents/ for subdirectories containing CLAUDE.md.
+ * Scan .lares/agents/ for subdirectories containing CLAUDE.md.
  * Each is a persistent agent persona (custom agent type).
  */
 export function scanPersonas(workspacePath: string, pathType: PathType): AgentPersona[] {
-  // Lift any legacy .claude/agents/ personas into .dashboard/agents/ first so
+  // Lift any legacy .claude/agents/ personas into .lares/agents/ first so
   // existing custom agents keep showing up after the relocation.
   migratePersonas(workspacePath, pathType);
 
   const personas: AgentPersona[] = [];
+  const stateDirName = workspaceStateDirName(workspacePath, pathType);
 
   if (pathType === 'wsl') {
     try {
@@ -288,12 +306,12 @@ export function scanPersonas(workspacePath: string, pathType: PathType): AgentPe
       delete env.ELECTRON_RUN_AS_NODE;
       const { stdout } = require('child_process').execFileSync(
         'wsl.exe',
-        ['bash', '-lc', `for d in '${workspacePath}'/.dashboard/agents/*/; do [ -f "$d/CLAUDE.md" ] && basename "$d"; done 2>/dev/null || true`],
+        ['bash', '-lc', `for d in '${workspacePath}'/${stateDirName}/agents/*/; do [ -f "$d/CLAUDE.md" ] && basename "$d"; done 2>/dev/null || true`],
         { encoding: 'utf-8', timeout: 10000, env }
       ) as { stdout: string };
       const names = (stdout || '').trim().split('\n').filter(Boolean);
       for (const name of names) {
-        const dir = `${workspacePath}/.dashboard/agents/${name}`;
+        const dir = `${workspacePath}/${stateDirName}/agents/${name}`;
         // Check if memory/MEMORY.md exists
         let hasMemory = false;
         try {
@@ -309,10 +327,10 @@ export function scanPersonas(workspacePath: string, pathType: PathType): AgentPe
         });
       }
     } catch {
-      // .dashboard/agents/ doesn't exist or WSL unavailable
+      // .lares/agents/ doesn't exist or WSL unavailable
     }
   } else {
-    const agentsDir = path.join(workspacePath, ...PERSONAS_REL);
+    const agentsDir = path.join(workspacePath, ...personasRel(workspacePath, pathType));
     if (!fs.existsSync(agentsDir)) return personas;
 
     try {
@@ -339,7 +357,7 @@ export function scanPersonas(workspacePath: string, pathType: PathType): AgentPe
 }
 
 /**
- * Create a new persona under .dashboard/agents/<name>/. Writes the managed
+ * Create a new persona under .lares/agents/<name>/. Writes the managed
  * operational kit (settings.json + default skills) through the shared
  * version-migrated scaffold writer, seed-once identity files (CLAUDE.md with the
  * user's role body, memory/MEMORY.md), and — if a lane is declared — the
@@ -360,7 +378,7 @@ export function scaffoldPersona(
     throw new Error(`Invalid persona lane "${lane}". Must be one of supervisor | researcher | worker, or omitted.`);
   }
 
-  const base = `.dashboard/agents/${name}`;
+  const base = `.lares/agents/${name}`;
   // Operational plumbing — managed (atomic + version-migrated + locked). The
   // declared lane selects the settings.json variant (supervisor-privilege persona
   // inherits the hook scaffold; everything else gets the worker variant).
@@ -372,7 +390,7 @@ export function scaffoldPersona(
   if (lane) writePersonaJsonIfAbsent(workspacePath, pathType, name, lane);
 
   const dir = pathType === 'wsl'
-    ? `${workspacePath}/.dashboard/agents/${name}`
-    : path.join(workspacePath, ...PERSONAS_REL, name);
+    ? `${workspacePath}/${workspaceStateDirName(workspacePath, pathType)}/agents/${name}`
+    : path.join(workspacePath, ...personasRel(workspacePath, pathType), name);
   return { name, directory: dir, hasMemory: true, isSupervisor: false, lane: readPersonaLane(workspacePath, pathType, name) };
 }
