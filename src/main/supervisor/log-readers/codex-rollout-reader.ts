@@ -12,7 +12,8 @@ import type {
   UsageEvent,
   SystemInitEvent,
 } from '../../../shared/session-events';
-import { DEFAULT_CONTEXT_WINDOW_TOKENS, CONTEXT_GAUGE_CAP_TOKENS, getContextWindowForModel } from '../../../shared/constants';
+import { DEFAULT_CONTEXT_WINDOW_TOKENS, getContextWindowForModel } from '../../../shared/constants';
+import { resolveContextGaugeCap } from '../../context-gauge/context-gauge-cap';
 import type { AgentProvider } from '../../../shared/types';
 import {
   flattenToolResultContent,
@@ -588,11 +589,12 @@ export class CodexRolloutReader implements ChatLogReader {
 
     const model = this.currentModel.get(session.agentId) || 'codex/unknown';
     const stashWindow = this.modelContextWindow.get(session.agentId);
-    // Gauge policy: 100% = 200K even when the rollout reports a larger
-    // window (e.g. 258K/1M GPT models) — matches the claude reader.
+    // Gauge policy: 100% = the per-role configured cap (default 200K) even
+    // when the rollout reports a larger window (e.g. 258K/1M GPT models) —
+    // matches the claude reader.
     const contextWindowMax = Math.min(
       stashWindow ?? windowFromInfo ?? getContextWindowForModel(model) ?? DEFAULT_CONTEXT_WINDOW_TOKENS,
-      CONTEXT_GAUGE_CAP_TOKENS
+      resolveContextGaugeCap(session.role)
     );
     const cumulativeContextTokens = totalTokens || (inputTokens + outputTokens);
     const contextPercentage = Math.min(

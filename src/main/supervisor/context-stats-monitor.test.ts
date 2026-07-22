@@ -356,6 +356,65 @@ test('ingress — a genuinely-outside relative path resolves under root (classif
   assert.equal(emitted[0].filePath, 'C:\\Users\\turke\\Projects\\OtherRepo\\x.ts');
 });
 
+// ── Context Window Warning: recomputeContextWindows ────────────────────
+
+test('recomputeContextWindows re-derives window+percentage and emits statsChanged', () => {
+  const reader = new FakeReader();
+  const monitor = new ContextStatsMonitor(reader as any);
+  let statsChangedCount = 0;
+  monitor.on('statsChanged', () => { statsChangedCount += 1; });
+  monitor.start();
+
+  // claude-opus resolves to the 1M window; the reader capped the gauge at 200K.
+  reader.emit('usage', makeUsage('agent-1', 's1', {
+    model: 'claude-opus-4-7',
+    cumulativeContextTokens: 100_000,
+    contextWindowMax: 200_000,
+    contextPercentage: 50,
+  }));
+  assert.equal(statsChangedCount, 1);
+
+  // Raise the cap to 400K → window 400K (< the 1M model window), 25%.
+  monitor.recomputeContextWindows(() => 400_000);
+  const stats = monitor.getStats('agent-1');
+  assert.ok(stats);
+  assert.equal(stats.contextWindowMax, 400_000);
+  assert.equal(stats.contextPercentage, 25);
+  assert.equal(statsChangedCount, 2, 'recompute emits statsChanged for the moved reading');
+
+  // Same cap again → no change, no emission.
+  monitor.recomputeContextWindows(() => 400_000);
+  assert.equal(statsChangedCount, 2, 'a no-op recompute stays silent');
+});
+
+test('recomputeContextWindows never exceeds the model window and skips null (gemini) agents', () => {
+  const reader = new FakeReader();
+  const monitor = new ContextStatsMonitor(reader as any);
+  monitor.start();
+
+  // claude-sonnet-4-5 → 200K real window; a 1M cap must clamp to 200K.
+  reader.emit('usage', makeUsage('agent-small', 's1', {
+    model: 'claude-sonnet-4-5',
+    cumulativeContextTokens: 100_000,
+    contextWindowMax: 150_000,
+    contextPercentage: 67,
+  }));
+  // gemini-style agent the caller opts out of via null.
+  reader.emit('usage', makeUsage('agent-gemini', 's2', {
+    model: 'gemini-2.5-pro',
+    cumulativeContextTokens: 500_000,
+    contextWindowMax: 1_000_000,
+    contextPercentage: 50,
+  }));
+
+  monitor.recomputeContextWindows((agentId) => (agentId === 'agent-gemini' ? null : 1_000_000));
+  assert.equal(monitor.getStats('agent-small')!.contextWindowMax, 200_000,
+    'cap is min(model window, configured) — never the raw configured value');
+  assert.equal(monitor.getStats('agent-small')!.contextPercentage, 50);
+  assert.equal(monitor.getStats('agent-gemini')!.contextWindowMax, 1_000_000,
+    'null from capForAgent leaves the reading untouched');
+});
+
 (async () => {
   let passed = 0;
   let failed = 0;

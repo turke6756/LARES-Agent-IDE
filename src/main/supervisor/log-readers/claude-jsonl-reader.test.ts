@@ -12,6 +12,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { ClaudeJsonlReader } from './claude-jsonl-reader';
 import type { ChatLogReaderSession } from './types';
+import { setContextGaugeCapResolver } from '../../context-gauge/context-gauge-cap';
 
 interface TestCase { name: string; run(): void | Promise<void>; }
 const tests: TestCase[] = [];
@@ -91,6 +92,77 @@ function validClearHead(sid: string): object[] {
 }
 
 const BASE_MS = 1_700_000_000_000;
+
+// ── Context Window Warning: per-role gauge cap in usage events ───────
+
+function usageFixtureLine(model: string): object {
+  return {
+    type: 'assistant',
+    uuid: 'u-1',
+    timestamp: '2026-07-21T10:00:00.000Z',
+    message: {
+      model,
+      stop_reason: 'end_turn',
+      content: [{ type: 'text', text: 'ok' }],
+      usage: { input_tokens: 50_000, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 0 },
+    },
+  };
+}
+
+function pollUsage(model: string, role?: ChatLogReaderSession['role']): { contextWindowMax: number; contextPercentage: number } {
+  const tmpPath = writeFixture([usageFixtureLine(model)]);
+  try {
+    const reader = makeReader(tmpPath);
+    const events = reader.pollSession(makeSession({ role }));
+    const usage = events.find(e => e.type === 'usage');
+    assert.ok(usage && usage.type === 'usage');
+    return { contextWindowMax: usage.contextWindowMax, contextPercentage: usage.contextPercentage };
+  } finally {
+    fs.unlinkSync(tmpPath);
+  }
+}
+
+test('gauge cap: no resolver installed → historical 200K cap on a 1M model', () => {
+  setContextGaugeCapResolver(null);
+  const { contextWindowMax, contextPercentage } = pollUsage('claude-opus-4-7');
+  assert.equal(contextWindowMax, 200_000);
+  assert.equal(contextPercentage, 25);
+});
+
+test('gauge cap: per-role resolver raises the window for that role only', () => {
+  setContextGaugeCapResolver((role) => (role === 'supervisor' ? 500_000 : 200_000));
+  try {
+    const sup = pollUsage('claude-opus-4-7', 'supervisor');
+    assert.equal(sup.contextWindowMax, 500_000);
+    assert.equal(sup.contextPercentage, 10);
+    const worker = pollUsage('claude-opus-4-7', 'worker');
+    assert.equal(worker.contextWindowMax, 200_000);
+    assert.equal(worker.contextPercentage, 25);
+  } finally {
+    setContextGaugeCapResolver(null);
+  }
+});
+
+test('gauge cap: never exceeds the model’s real window (min with model window)', () => {
+  setContextGaugeCapResolver(() => 1_000_000);
+  try {
+    // claude-sonnet-4-5 → 200K real window; a 1M cap must not widen it.
+    const r = pollUsage('claude-sonnet-4-5', 'worker');
+    assert.equal(r.contextWindowMax, 200_000);
+  } finally {
+    setContextGaugeCapResolver(null);
+  }
+});
+
+test('gauge cap: absent session role → default 200K even with a resolver installed', () => {
+  setContextGaugeCapResolver((role) => (role ? 900_000 : 200_000));
+  try {
+    const r = pollUsage('claude-opus-4-7');
+    assert.equal(r.contextWindowMax, 200_000);
+  } finally {
+    setContextGaugeCapResolver(null);
+  }
+});
 
 // ── P2-01: endsWithQuestion ──────────────────────────────────────────
 

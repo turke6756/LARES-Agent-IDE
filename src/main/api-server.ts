@@ -37,6 +37,7 @@ import {
   getKernelState as kernelGetState,
 } from './jupyter-kernel-client';
 import { scanPersonas, scaffoldPersona } from './persona-scanner';
+import { applyContextGaugeSettings, type ContextGaugeIpcDeps } from './context-gauge/context-gauge-ipc';
 import { TEAM_MAX_MESSAGES_PER_5MIN, TEAM_MAX_ALTERNATIONS, TEAM_ALTERNATION_WINDOW_MS, TEAM_PAIR_COOLDOWN_MS, CONTINUATION_BRICK_MAX_BYTES, CONTINUATION_ESCAPE_MAX_ATTEMPTS, CONTINUATION_ESCAPE_MAX_ALIVE_MS } from '../shared/constants';
 import { TeamMessageStatus, hasSupervisorPrivilege } from '../shared/types';
 import type { Agent, Workspace, PlanActivityEvent, RepoActivityDetail } from '../shared/types';
@@ -281,6 +282,14 @@ export class ApiServer {
    *  every /api/browser/* route answers 503. */
   setBrowserTools(provider: BrowserToolProvider): void {
     this.browserTools = provider;
+  }
+
+  /** Context Window Warning: late-injected settings deps (same object the IPC
+   *  surface uses, so both write paths sanitize/persist/broadcast identically).
+   *  Until wired, the /api/settings/context-gauge routes answer 503. */
+  private contextGaugeDeps?: ContextGaugeIpcDeps;
+  setContextGaugeDeps(deps: ContextGaugeIpcDeps): void {
+    this.contextGaugeDeps = deps;
   }
 
   private requireBrowserTools(): BrowserToolProvider {
@@ -731,6 +740,18 @@ export class ApiServer {
       const stats = this.supervisor.getContextStats(ctxMatch[1]);
       if (!stats) return { agentId: ctxMatch[1], stats: null };
       return { agentId: ctxMatch[1], stats };
+    }
+
+    // ── Context Window Warning settings (per-role gauge caps) ───────────
+    // GET returns the current settings; POST replaces them (sanitized +
+    // clamped main-side, same path the IPC setter uses). 503 until wired.
+    if (path === '/api/settings/context-gauge' && (method === 'GET' || method === 'POST')) {
+      if (!this.contextGaugeDeps) {
+        throw Object.assign(new Error('Context-gauge settings not wired'), { statusCode: 503 });
+      }
+      if (method === 'GET') return this.contextGaugeDeps.loadSettings();
+      const body = await readBody(req);
+      return applyContextGaugeSettings(JSON.parse(body), this.contextGaugeDeps);
     }
 
     // GET /api/usage-limits — account-wide Claude subscription usage reading.

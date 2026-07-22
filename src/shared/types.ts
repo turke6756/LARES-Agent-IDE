@@ -172,6 +172,32 @@ export interface LifecycleSettings {
 
 export const DEFAULT_LIFECYCLE_SETTINGS: LifecycleSettings = { autoStopIdleThreshold: '24h' };
 
+// ── Context-gauge settings (user-configurable context-window warning caps) ──
+
+/** The three fixed app role-lanes a gauge cap can be configured for. Custom
+ *  personas get their own per-name entry in `ContextWindowCaps.personas`. */
+export type ContextGaugeFixedRole = 'worker' | 'supervisor' | 'researcher';
+
+/** The resolved per-agent role key the cap lookup uses: a fixed role, or
+ *  `persona:<name>` for an agent launched from `.lares/agents/<name>/`. */
+export type ContextGaugeRoleKey = ContextGaugeFixedRole | `persona:${string}`;
+
+/** Per-role token counts at which the context gauge reads 100%. The effective
+ *  cap for an agent is always `min(configured, real model window)` — a cap can
+ *  narrow the gauge below the model's window, never widen it past it. */
+export interface ContextWindowCaps {
+  worker: number;
+  supervisor: number;
+  researcher: number;
+  /** Custom personas by name (subdirectory under `.lares/agents/`). A persona
+   *  with no entry falls back to the default cap, not to its lane's cap. */
+  personas: Record<string, number>;
+}
+
+export interface ContextGaugeSettings {
+  contextWindowCaps: ContextWindowCaps;
+}
+
 /** Hard cap on a single bulk-stop request (dedupe first, then cap). */
 export const BULK_STOP_MAX = 200;
 

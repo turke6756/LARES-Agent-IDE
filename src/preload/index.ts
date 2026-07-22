@@ -277,6 +277,16 @@ const api: IpcApi = {
       return () => ipcRenderer.removeListener('lifecycle:settings-changed', listener);
     },
   },
+  // Context Window Warning — per-role gauge-cap settings.
+  contextGauge: {
+    getSettings: () => ipcRenderer.invoke('context-gauge:get-settings'),
+    setSettings: (settings) => ipcRenderer.invoke('context-gauge:set-settings', settings),
+    onSettingsChanged: (callback) => {
+      const listener = (_event: any, settings: any) => callback(settings);
+      ipcRenderer.on('context-gauge:settings-changed', listener);
+      return () => ipcRenderer.removeListener('context-gauge:settings-changed', listener);
+    },
+  },
   browser: {
     createTab: (opts) => ipcRenderer.invoke(BROWSER_CHANNELS.createTab, opts),
     closeTab: (tabId) => ipcRenderer.invoke(BROWSER_CHANNELS.closeTab, tabId),

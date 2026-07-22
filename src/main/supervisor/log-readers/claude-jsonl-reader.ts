@@ -10,7 +10,8 @@ import type {
   UsageEvent,
   SystemInitEvent,
 } from '../../../shared/session-events';
-import { DEFAULT_CONTEXT_WINDOW_TOKENS, CONTEXT_GAUGE_CAP_TOKENS, getContextWindowForModel } from '../../../shared/constants';
+import { DEFAULT_CONTEXT_WINDOW_TOKENS, getContextWindowForModel } from '../../../shared/constants';
+import { resolveContextGaugeCap } from '../../context-gauge/context-gauge-cap';
 import type { AgentProvider } from '../../../shared/types';
 import {
   flattenToolResultContent,
@@ -635,10 +636,11 @@ export class ClaudeJsonlReader implements ChatLogReader {
 
       const usage = msg.usage;
       if (usage) {
-        // Gauge policy: 100% = 200K even on 1M-window models.
+        // Gauge policy: 100% = the per-role configured cap (default 200K),
+        // never above the model's real window.
         const contextWindowMax = Math.min(
           getContextWindowForModel(model) || DEFAULT_CONTEXT_WINDOW_TOKENS,
-          CONTEXT_GAUGE_CAP_TOKENS
+          resolveContextGaugeCap(session.role)
         );
         const inputTokens = usage.input_tokens || 0;
         const cacheCreationTokens = usage.cache_creation_input_tokens || 0;

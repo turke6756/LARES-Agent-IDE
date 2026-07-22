@@ -52,6 +52,7 @@ import { isNonBlockingNotificationType } from '../../shared/notification-classif
 export { SCAFFOLD_SIDECAR_REL, SCAFFOLD_LOCK_REL, sha256Hex, normalizeManagedKey };
 export type { ScaffoldFile };
 import { ensurePersonaScaffold, applyPersonaLaneToLaunchInput } from '../persona-scanner';
+import { contextGaugeRoleKeyOf, resolveContextGaugeCap } from '../context-gauge/context-gauge-cap';
 
 import { getApiToken } from '../security/api-auth';
 import { EventBridge, EventBridgeDeps } from './event-bridge';
@@ -1433,6 +1434,10 @@ export class AgentSupervisor extends EventEmitter {
           workingDirectory: a.workingDirectory,
           provider: a.provider,
           startedAt: a.createdAt,
+          // Context Window Warning: which per-role gauge cap this agent's
+          // readings are computed against (readers apply it via
+          // resolveContextGaugeCap).
+          role: contextGaugeRoleKeyOf(a),
         }));
     });
     this.sessionLogReader.register(new ClaudeJsonlReader());
@@ -1696,6 +1701,21 @@ export class AgentSupervisor extends EventEmitter {
 
   getContextStats(agentId: string): ContextStats | null {
     return this.contextStatsMonitor.getStats(agentId);
+  }
+
+  /** Context Window Warning: after a gauge-cap settings change, recompute every
+   *  cached reading under the new caps and re-emit `statsChanged`, so cards and
+   *  threshold events update without waiting for each agent's next usage event.
+   *  Claude only: gemini keeps its real window (the readers never capped it),
+   *  and a codex window may come from the rollout's `model_context_window`
+   *  (which the monitor can't re-derive from the model string) — codex readings
+   *  pick up the new cap on their next `token_count` event instead. */
+  recomputeContextGaugeCaps(): void {
+    this.contextStatsMonitor.recomputeContextWindows((agentId) => {
+      const agent = getAgent(agentId);
+      if (!agent || agent.provider !== 'claude') return null;
+      return resolveContextGaugeCap(contextGaugeRoleKeyOf(agent));
+    });
   }
 
   getSessionLogReader(): SessionLogReader {

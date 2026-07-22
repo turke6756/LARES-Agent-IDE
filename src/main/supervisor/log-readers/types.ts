@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { execFileSync } from 'child_process';
-import type { AgentProvider } from '../../../shared/types';
+import type { AgentProvider, ContextGaugeRoleKey } from '../../../shared/types';
 import type { SessionEvent } from '../../../shared/session-events';
 
 export interface ChatLogReaderSession {
@@ -12,6 +12,10 @@ export interface ChatLogReaderSession {
   startedAt?: string;
   /** True when the chat pane is open for this agent — readers may use this to do aggressive path re-resolution after N empty ticks. */
   subscribed: boolean;
+  /** Gauge-cap role key (Context Window Warning): which per-role cap this
+   *  agent's context gauge reads 100% against. Absent (internally-synthesized
+   *  sessions, tests) ⇒ the flat 200K default. */
+  role?: ContextGaugeRoleKey;
 }
 
 export interface ChatLogReader {

@@ -3,6 +3,9 @@ import { powerMonitor } from 'electron';
 import { registerLifecycleIpc, LIFECYCLE_CHANNELS, type BulkStopDeps } from './lifecycle/lifecycle-ipc';
 import { loadLifecycleSettings, saveLifecycleSettings } from './lifecycle/lifecycle-settings';
 import { IdleSweep } from './lifecycle/idle-sweep';
+import { registerContextGaugeIpc, CONTEXT_GAUGE_CHANNELS, type ContextGaugeIpcDeps } from './context-gauge/context-gauge-ipc';
+import { getContextGaugeSettingsCached, updateContextGaugeSettings } from './context-gauge/context-gauge-settings';
+import { capForRoleKey, setContextGaugeCapResolver } from './context-gauge/context-gauge-cap';
 import path from 'path';
 import fs from 'fs';
 import { loadPersistedTheme } from './theme-persistence';
@@ -934,6 +937,25 @@ app.whenReady().then(async () => {
     idleSweep = new IdleSweep({ ...lifecycleDeps, powerMonitor });
     idleSweep.start();
 
+    // ── Context Window Warning — per-role gauge caps ──────────────────────────
+    // The log readers resolve their cap through this resolver on every usage
+    // event; the settings cache is refreshed synchronously by every write path
+    // (IPC + HTTP), so a slider move affects the next reading immediately.
+    setContextGaugeCapResolver((roleKey) => capForRoleKey(getContextGaugeSettingsCached(), roleKey));
+    const contextGaugeDeps: ContextGaugeIpcDeps = {
+      loadSettings: () => getContextGaugeSettingsCached(),
+      saveSettings: (raw) => updateContextGaugeSettings(raw),
+      broadcastSettings: (s) => {
+        for (const win of BrowserWindow.getAllWindows()) {
+          if (!win.isDestroyed()) win.webContents.send(CONTEXT_GAUGE_CHANNELS.settingsChanged, s);
+        }
+      },
+      // Recompute cached readings (claude agents) so cards + threshold events
+      // reflect the new cap without waiting for the next usage event.
+      onChanged: () => supervisor!.recomputeContextGaugeCaps(),
+    };
+    registerContextGaugeIpc(ipcMain, contextGaugeDeps);
+    apiServer.setContextGaugeDeps(contextGaugeDeps);
     // ── D5-lite memory watchdog + admission control (incident-2026-07-11 §5) ──
     // Now that the supervisor + browser manager exist (their live counts feed the
     // sampler), construct the sampler, arm the admission gates, install the D1

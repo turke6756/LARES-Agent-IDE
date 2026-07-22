@@ -13,6 +13,7 @@ import ContextOptimizerPanel from '../context-optimizer/ContextOptimizerPanel';
 import PlanSurfaceContainer from '../plan/PlanSurfaceContainer';
 import CapstonePanel from '../context-optimizer/CapstonePanel';
 import SystemMemoryView from '../watchdog/SystemMemoryView';
+import ContextWindowWarningPanel from '../context-gauge/ContextWindowWarningPanel';
 import { detectFileType } from './fileTypeUtils';
 import ResizeDivider from '../layout/ResizeDivider';
 import CollapseButton from '../layout/CollapseButton';
@@ -253,6 +254,8 @@ export default function FileViewerPanel() {
               <CapstonePanel />
             ) : effectiveTab.toolId === 'system-memory' ? (
               <SystemMemoryView />
+            ) : effectiveTab.toolId === 'context-window-warning' ? (
+              <ContextWindowWarningPanel />
             ) : (
               <div className="flex items-center justify-center h-full text-gray-400 text-sm">Unknown tool</div>
             )

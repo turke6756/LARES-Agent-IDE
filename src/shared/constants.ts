@@ -1,4 +1,4 @@
-import type { AgentProvider } from './types';
+import type { AgentProvider, ContextGaugeSettings } from './types';
 import { buildUsageStatusText, buildUsageRawRecord } from './usage-limits-record';
 
 export const DEFAULT_COMMAND = 'claude --dangerously-skip-permissions';
@@ -2372,6 +2372,22 @@ export const MODEL_CONTEXT_WINDOWS: Record<string, number> = {
  * gemini keeps its real window.
  */
 export const CONTEXT_GAUGE_CAP_TOKENS = 200_000;
+
+/** Slider bounds for the per-role gauge caps (Context Window Warning tool).
+ *  Values outside this range are clamped at load/save time. */
+export const CONTEXT_GAUGE_CAP_MIN_TOKENS = 50_000;
+export const CONTEXT_GAUGE_CAP_MAX_TOKENS = EXTENDED_CONTEXT_WINDOW_TOKENS;
+
+/** Default per-role gauge caps — everything starts at the historical 200K cap
+ *  so behavior is unchanged until the user moves a slider. */
+export const DEFAULT_CONTEXT_GAUGE_SETTINGS: ContextGaugeSettings = {
+  contextWindowCaps: {
+    worker: CONTEXT_GAUGE_CAP_TOKENS,
+    supervisor: CONTEXT_GAUGE_CAP_TOKENS,
+    researcher: CONTEXT_GAUGE_CAP_TOKENS,
+    personas: {},
+  },
+};
 
 export function getContextWindowForModel(model: string): number {
   const lower = model.toLowerCase();

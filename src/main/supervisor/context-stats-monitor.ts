@@ -1,7 +1,7 @@
 import { EventEmitter } from 'events';
 import path from 'path';
 import { ContextStats, FileOperation } from '../../shared/types';
-import { DEFAULT_CONTEXT_WINDOW_TOKENS } from '../../shared/constants';
+import { DEFAULT_CONTEXT_WINDOW_TOKENS, getContextWindowForModel } from '../../shared/constants';
 import type { UsageEvent, ToolUseEvent, ToolResultEvent } from '../../shared/session-events';
 import { SessionLogReader } from './session-log-reader';
 import { parseShellCommand, parseApplyPatch, shellResultIndicatesSuccess, type ParsedShellActivity } from './codex-shell-parser';
@@ -104,6 +104,35 @@ export class ContextStatsMonitor extends EventEmitter {
     const prefix = `${agentId}:`;
     for (const key of this.pendingShellActivity.keys()) {
       if (key.startsWith(prefix)) this.pendingShellActivity.delete(key);
+    }
+  }
+
+  /**
+   * Context Window Warning: re-derive each cached reading's window under a new
+   * per-role gauge cap and re-emit `statsChanged` for any that moved. Live
+   * effect for the settings sliders — without this, an idle agent's gauge
+   * would keep the old denominator until its next usage event.
+   *
+   * `capForAgent` returns the configured cap in tokens, or null to leave that
+   * agent's window untouched (unknown agent, or a provider the readers never
+   * cap — gemini). The effective window stays `min(model window, cap)`, the
+   * same formula the readers apply at event time.
+   */
+  recomputeContextWindows(capForAgent: (agentId: string) => number | null): void {
+    for (const stats of this.stats.values()) {
+      const cap = capForAgent(stats.agentId);
+      if (cap === null) continue;
+      const windowMax = Math.min(
+        getContextWindowForModel(stats.model) || DEFAULT_CONTEXT_WINDOW_TOKENS,
+        cap,
+      );
+      if (windowMax === stats.contextWindowMax) continue;
+      stats.contextWindowMax = windowMax;
+      stats.contextPercentage = Math.min(
+        100,
+        Math.round((stats.totalContextTokens / windowMax) * 100),
+      );
+      this.emit('statsChanged', stats);
     }
   }
 
@@ -235,14 +264,14 @@ export class ContextStatsMonitor extends EventEmitter {
  * - Absolute paths (Windows drive, UNC, POSIX/WSL) pass through verbatim; the
  *   downstream relativizer (`repo-activity.toRel`) handles separators + case.
  * - Relative paths are resolved against the agent's FROZEN launch workspace root
- *   so `plans/example.html` / `.dashboard/state.json` become absolute and are
- *   correctly hit by the plan-file and `.dashboard/**` exclusions instead of
+ *   so `plans/example.html` / `.lares/state.json` become absolute and are
+ *   correctly hit by the plan-file and `.lares/**` exclusions instead of
  *   being misclassified as outside-workspace evidence.
  * - Empty / whitespace-only ("impossible") paths are rejected → `null` (caller
  *   drops them; nothing is persisted).
  * - With no known root a relative path can't be safely resolved, so it is kept
  *   verbatim (best-effort) — `repo-activity`'s defensive relative-path exclusion
- *   still catches the plan/`.dashboard` cases for such legacy/unresolved rows.
+ *   still catches the plan/`.lares` cases for such legacy/unresolved rows.
  */
 export function normalizeCapturedPath(rawPath: string, workspaceRoot: string | null): string | null {
   const raw = rawPath.trim();
