@@ -10,9 +10,12 @@
 //      denylist of causal tokens ("because", "in order to", "so that") rejects any
 //      claim/bullet that smuggles causal or intent language in.
 //   2. EVIDENCE entries are `{ kind, rowIds, generationId }` ONLY — same-surface
-//      (optimizer) rows joined by generationId + row ids. Cross-surface evidence is
-//      barred at construction until WP8 surface provenance exists (WP8 may then add
-//      `comparabilityKey` under its own capability).
+//      (optimizer) rows joined by generationId + row ids. Cross-surface evidence
+//      REMAINS barred at construction (WP8 landed surface provenance and stamps a
+//      v2-optional `comparabilityKey` onto each stored evidence entry at snapshot
+//      time — analytics-exporter.ts stampRecommendationEvidenceComparability —
+//      but that stamp does NOT lift this bar; it is the key any future
+//      cross-surface join would have to match).
 //   3. `command_family` evidence may only support WORKSPACE-LEVEL candidates
 //      (`target.unresolved`) — attaching it to a specific file throws. Liftable only
 //      by WP9's `associatedCommandFamilies` join (generationId-gated, prospective).
