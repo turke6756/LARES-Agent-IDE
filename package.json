@@ -1,6 +1,6 @@
 {
   "name": "lares-app",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "An agent-native workspace for orchestrating AI agents across terminals, files, browsers, documents, and notebooks.",
   "main": "dist/main/main/index.js",
   "scripts": {
@@ -18,41 +18,96 @@
     "analytics:snapshot": "npm run build:main && electron dist/main/main/analytics-export/analytics-snapshot-cli.js",
     "analytics:snapshot:fast": "electron dist/main/main/analytics-export/analytics-snapshot-cli.js",
     "test:analytics": "npm run build:main && node dist/main/main/context-overhead/overhead-dto.test.js && node dist/main/main/analytics-export/analytics-exporter.test.js && node dist/main/main/api-server-overhead-route.test.js",
-    "rebuild": "node scripts/rebuild-native.js",
-    "pack": "npm run build && electron-builder --dir",
-    "dist": "npm run build && npm run rebuild && npx electron-builder --config.npmRebuild=false",
+    "rebuild": "npm run rebuild:native",
+    "rebuild:native": "node scripts/rebuild-native.js --arch=x64",
+    "verify:native": "electron scripts/verify-native.cjs",
+    "package:prepare": "npm run build && npm run rebuild:native && npm run verify:native",
+    "pack": "npm run package:prepare && electron-builder --dir --win --x64 --config.npmRebuild=false --publish never",
+    "dist": "npm run dist:win",
+    "dist:win": "npm run package:prepare && electron-builder --win nsis portable --x64 --config.npmRebuild=false --publish never",
+    "verify:package": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/verify-windows-package.ps1",
     "verify:bundled-node": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/verify-bundled-node.ps1"
   },
   "build": {
     "appId": "com.lares.app",
     "productName": "Lares",
+    "executableName": "Lares",
+    "copyright": "Copyright © 2026 Edward Turk",
     "directories": {
       "output": "release"
     },
     "files": [
       "dist/**/*",
-      "node_modules/**/*",
-      "scripts/**/*",
       "package.json"
     ],
     "extraResources": [
       {
         "from": "scripts",
-        "to": "scripts"
+        "to": "scripts",
+        "filter": [
+          "**/*",
+          "!**/*.test.js",
+          "!spike/**",
+          "!spike-prompts/**"
+        ]
       },
       {
         "from": "assets",
         "to": "assets"
+      },
+      {
+        "from": "native/lares-native",
+        "to": "native/lares-native",
+        "filter": [
+          "index.js",
+          "index.d.ts",
+          "package.json",
+          "build/Release/lares_native.node"
+        ]
       }
     ],
     "asarUnpack": [
-      "**/node_modules/better-sqlite3/**"
+      "**/node_modules/better-sqlite3/**",
+      "**/node_modules/node-pty/**",
+      "**/node_modules/@hyzyla/pdfium/**",
+      "**/*.node"
     ],
     "icon": "assets/icon.ico",
     "win": {
-      "target": "dir",
-      "signAndEditExecutable": false,
-      "icon": "assets/icon.ico"
+      "icon": "assets/icon.ico",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowElevation": false,
+      "allowToChangeInstallationDirectory": false,
+      "createDesktopShortcut": "always",
+      "createStartMenuShortcut": true,
+      "shortcutName": "Lares",
+      "menuCategory": false,
+      "installerIcon": "assets/icon.ico",
+      "uninstallerIcon": "assets/icon.ico",
+      "installerHeaderIcon": "assets/icon.ico",
+      "deleteAppDataOnUninstall": false,
+      "runAfterFinish": true,
+      "artifactName": "Lares-Setup-${version}-${arch}.${ext}"
+    },
+    "portable": {
+      "artifactName": "Lares-Portable-${version}-${arch}.${ext}"
     }
   },
   "overrides": {
