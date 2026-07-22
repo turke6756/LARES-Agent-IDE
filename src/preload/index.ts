@@ -197,6 +197,10 @@ const api: IpcApi = {
     // Cast: the IpcApi contract uses a structural File stand-in because
     // shared types compile without the DOM lib (tsconfig.main.json).
     getPathForFile: (file) => webUtils.getPathForFile(file as Parameters<typeof webUtils.getPathForFile>[0]),
+    writeImageTemp: (bytes, mime, workingDirectory) =>
+      ipcRenderer.invoke('files:write-image-temp', bytes, mime, workingDirectory),
+    resolveImageDrops: (nativePaths, workingDirectory) =>
+      ipcRenderer.invoke('files:resolve-image-drops', nativePaths, workingDirectory),
     deleteEntry: (entryPath, rootDirectory, pathType, recursive) =>
       ipcRenderer.invoke('files:delete', entryPath, rootDirectory, pathType, recursive),
     reveal: (entryPath, pathType) =>
