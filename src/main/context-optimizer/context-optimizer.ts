@@ -40,6 +40,8 @@ import type {
   ResidentAssetUsage,
   AnalyzabilityDiagnostic,
   AnalyzabilityReasonCode,
+  GuidanceSource,
+  RecommendationDraft,
 } from '../../shared/types';
 import { leverFor } from './capstone-map';
 import { OPTIMIZER_CONFIG } from './optimizer-config';
@@ -51,13 +53,23 @@ import { evidenceTierOf } from './attribution';
 import type { ImprovisationCandidate } from './improvisation-clusters';
 import { isHashOnlyDimension } from './improvisation-clusters';
 import type { DriftFinding } from './config-drift';
-import type { BypassProposal, BypassResult, FileCoverageResult } from './file-coverage';
+import type { BypassProposal, BypassResult, FileCoverageResult, FileHeatEntry } from './file-coverage';
 import {
   proposalRequiresDerivationGate,
   resolveProposalVerification,
   isSuppressedFromAgentSurface,
   type DerivationVerifiedResult,
 } from './compiler-parity-gate';
+import { sha256Hex } from './resident-inventory';
+import {
+  buildRecommendationDraft,
+  commandFamilyClaimTemplate,
+  hotUncoveredClaimTemplate,
+  hotUncoveredSuggestedBullet,
+  selectRecommendationTarget,
+  targetIsFile,
+  RECOMMENDATION_EVIDENCE_SURFACE,
+} from './recommendation-draft';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Injected input contract — one bundle per lane. The engine is pure over these;
@@ -145,6 +157,14 @@ export interface LaneOptimizerInput {
    *  navigation cost)? Any one signal crossing its floor (`behavioralNeedTriggers`)
    *  justifies a real `add-missing-guidance` proposal; no signal ⇒ demote. */
   behavioralNeedFor?: (finding: DriftFinding) => BehavioralNeedSignal | null | undefined;
+
+  // ── WP3 (G3) recommendation-draft target policy (both optional; absent ⇒ every
+  //    draft target is HONESTLY `{ unresolved, reason }` — never a CLAUDE.md default).
+  /** WP2 provider-aware guidance-source inventory for this lane's cohort. */
+  guidanceSources?: GuidanceSource[];
+  /** Provider identifiers ('claude', 'codex', …) of the OBSERVING cohort behind this
+   *  lane's captured rows. Drives the audience→target mapping. */
+  observedProviders?: string[];
 }
 
 /** R2 WP-4B (Step 1) — the explicit, testable behavioral-need signals behind keeping a
@@ -333,6 +353,11 @@ export function generateContextOptimizerProposals(
     droppedUnattributed: 0, proxyIncluded: 0, breakdown: emptyWorkspaceBreakdown(), realIdCount: 0,
   };
   let sawCoverageScope = false;
+  // ── WP3 (G3): ONE analysis-generation id for every recommendation-draft evidence
+  // entry in this result — the join key that makes evidence rows same-surface
+  // joinable. Deterministic over the engine input (purity preserved: derived from
+  // the injected clock stamp, never a wall clock read here). ──
+  const draftGenerationId = sha256Hex(`recommendation-drafts:${input.generatedAtIso}`);
 
   for (const lane of input.lanes) {
     const verdictById = new Map<string, OccurrenceVerdict>();
@@ -423,8 +448,11 @@ export function generateContextOptimizerProposals(
     buildSkillAdvertisementProposals(lane, rows, diagnostics);
     buildSectionProposals(lane, verdictById, rows, diagnostics);
     buildDriftProposals(lane, rows, diagnostics);
-    buildClusterProposals(lane, rows);
+    buildClusterProposals(lane, rows, draftGenerationId);
     buildBypassProposals(lane, rows);
+    // WP3 (G3): hot uncovered allowlisted files → ADD proposals carrying a
+    // template-constrained recommendationDraft with joinable same-surface evidence.
+    buildHotUncoveredProposals(lane, rows, draftGenerationId);
 
     // ── File-heat rollup passthrough (A1, §5.6-redacted). ──
     if (lane.coverage) {
@@ -448,6 +476,10 @@ export function generateContextOptimizerProposals(
           ...(h.score !== undefined ? { score: h.score } : {}),
           ...(h.scoreComponents ? { scoreComponents: h.scoreComponents } : {}),
           ...(h.guidanceGapCandidate !== undefined ? { guidanceGapCandidate: h.guidanceGapCandidate } : {}),
+          // ── WP3 (G3): hot-uncovered candidate flag + BOUNDED coverage-check
+          //    disclosure (truncation metadata included, never the full list). ──
+          ...(h.hotUncoveredCandidate !== undefined ? { hotUncoveredCandidate: h.hotUncoveredCandidate } : {}),
+          ...(h.coverageChecks ? { coverageChecks: h.coverageChecks } : {}),
         });
       }
     }
@@ -520,6 +552,10 @@ export function generateContextOptimizerProposals(
       tierGroups: TIER_ORDER,
       unverifiedSuppressedCount,
       ...(fileHeatScope ? { fileHeatScope } : {}),
+      // WP3 (G3): the join key for recommendation-draft evidence — present only when
+      // ≥1 proposal actually carries a draft (honest absence otherwise).
+      ...(proposals.some((p) => p.recommendationDraft)
+        ? { recommendationGenerationId: draftGenerationId } : {}),
     },
     diagnostics,
   };
@@ -1191,7 +1227,7 @@ function buildDriftProposals(
 }
 
 // ── ADD: uncovered improvisation clusters (§5.3). ──
-function buildClusterProposals(lane: LaneOptimizerInput, rows: RankRow[]): void {
+function buildClusterProposals(lane: LaneOptimizerInput, rows: RankRow[], draftGenerationId: string): void {
   for (const c of lane.clusters) {
     if (c.count < OPTIMIZER_CONFIG.REPEAT_MIN || c.distinctStreams < OPTIMIZER_CONFIG.REPEAT_MIN_STREAMS) continue;
 
@@ -1246,8 +1282,124 @@ function buildClusterProposals(lane: LaneOptimizerInput, rows: RankRow[]): void 
       evidenceState: 'unavailable', // ADD lever — not a `never`, no non-occurrence audit
       ...verificationFields(requiresGate, lane.derivation),
     };
+    // ── WP3 (G3): a command_family cluster is a WORKSPACE-LEVEL candidate ONLY.
+    // Its draft target is FORCED unresolved (never a file — the code-level bar in
+    // buildRecommendationDraft would throw on one), liftable only by WP9's
+    // associatedCommandFamilies join. Evidence cites this proposal's own surface row.
+    if (c.dimension === 'command_family') {
+      proposal.recommendationDraft = buildRecommendationDraft({
+        target: {
+          unresolved: true,
+          reason: 'command_family evidence supports only workspace-level candidates — '
+            + "a file target requires WP9's associatedCommandFamilies join (generationId-gated, prospective)",
+        },
+        claimTemplate: commandFamilyClaimTemplate({
+          family: c.key, count: c.count, distinctStreams: c.distinctStreams, rowId: proposal.id,
+        }),
+        evidence: [{
+          kind: 'command_family', rowIds: [proposal.id],
+          generationId: draftGenerationId, surface: RECOMMENDATION_EVIDENCE_SURFACE,
+        }],
+        generationId: draftGenerationId,
+      });
+    }
     pushRow(lane, rows, proposal, c.count);
   }
+}
+
+// ── WP3 (G3) ADD: hot uncovered allowlisted files → recommendation drafts. ──
+//
+// Every `hotUncoveredCandidate` file-heat row (uncovered ∧ role allowlist ∧ score ≥
+// disclosed threshold ∧ zero guidance-prediction matches — file-coverage.ts) yields
+// one ADD proposal whose `recommendationDraft` cites ONLY its own joinable
+// same-surface evidence: the file-heat row + the bounded coverage-check summary,
+// keyed by this analysis's draftGenerationId. The draft target comes from the WP2
+// audience policy (`selectRecommendationTarget`) — exactly one applicable
+// GuidanceSource for the observing cohort, else `{ unresolved, reason }`, never a
+// CLAUDE.md default.
+function buildHotUncoveredProposals(
+  lane: LaneOptimizerInput,
+  rows: RankRow[],
+  draftGenerationId: string,
+): void {
+  if (!lane.coverage) return;
+  for (const h of lane.coverage.fileHeat) {
+    if (h.hotUncoveredCandidate !== true || !h.coverageChecks) continue;
+    const draft = buildHotUncoveredDraft(lane, h, draftGenerationId);
+    const kind: ContextOptimizerProposalKind = 'add-missing-guidance';
+    const proposal: ContextOptimizerProposal = {
+      id: `add-hot-uncovered:${lane.lane}:${h.pathHash}`,
+      kind,
+      lever: leverFor(kind),
+      title: `Cover the hot uncovered file '${h.pathDisplay}' with guidance in ${lane.lane}`,
+      rationale: `Agents in ${lane.lane} touched '${h.pathDisplay}' across ${h.distinctStreams} stream(s) `
+        + `(${h.reads} reads, ${h.writes} writes, ${h.executes} executes); `
+        + `${h.coverageChecks.totalPredicatesTested} guidance path prediction(s) were tested against it and `
+        + `${h.coverageChecks.matched} matched. See the attached recommendation draft (human review required).`,
+      target: {
+        // The GUIDANCE file the draft would edit (only when the audience policy
+        // resolved one); the hot file itself lives in the evidence rows.
+        ...(targetIsFile(draft.target) ? { absPath: draft.target.file } : {}),
+        lane: lane.lane,
+        mutable: 'scaffold-managed',
+      },
+      residentTokenDelta: { estimate: 0, basis: 'add-resident' },
+      tokenTurnsWeight: 0, // ADD proposals are not token-removal-motivated
+      occurrence: 'occurs',
+      confidence: 'inferred', // observed touches; the "missing guidance" benefit is inferred
+      epochConfidence: 'unknown',
+      attribution: { lane: lane.lane, streamIds: [], sharedCwdRisk: 'none' },
+      exposure: { turns: lane.resident.exposureTurns, streams: h.distinctStreams, slugs: lane.resident.exposureSlugs },
+      citations: [],
+      costEvidence: {
+        note: `${h.distinctStreams} stream(s) touched '${h.pathDisplay}' with no covering guidance prediction `
+          + `(${h.coverageChecks.totalPredicatesTested} tested, ${h.coverageChecks.matched} matched).`,
+      },
+      // Orders WITHIN its tier by observed heat (repeated activity a covering line
+      // would support) — same benefit family as the improvisation ADDs.
+      benefitModel: {
+        kind: 'repeated-cost-avoided',
+        magnitude: h.score ?? 0,
+        basis: `canonical heat score ${h.score ?? 0} across ${h.distinctStreams} stream(s)`,
+      },
+      evidenceState: 'unavailable', // ADD lever — not a `never`, no non-occurrence audit
+      recommendationDraft: draft,
+      ...verificationFields(false, lane.derivation), // direct behavior → gate-exempt (§4.5)
+    };
+    pushRow(lane, rows, proposal, h.distinctStreams);
+  }
+}
+
+/** Build the draft for one hot-uncovered row: WP2 audience target policy + the
+ *  template-constrained claim citing the row's own evidence ids. */
+function buildHotUncoveredDraft(
+  lane: LaneOptimizerInput,
+  h: FileHeatEntry,
+  draftGenerationId: string,
+): RecommendationDraft {
+  const target = selectRecommendationTarget({
+    guidanceSources: lane.guidanceSources,
+    observingProviders: lane.observedProviders,
+  });
+  const checks = h.coverageChecks!;
+  return buildRecommendationDraft({
+    target,
+    claimTemplate: hotUncoveredClaimTemplate({
+      pathDisplay: h.pathDisplay,
+      pathHash: h.pathHash,
+      reads: h.reads,
+      writes: h.writes,
+      executes: h.executes,
+      distinctStreams: h.distinctStreams,
+      coverageChecks: checks,
+    }),
+    evidence: [
+      { kind: 'file-heat', rowIds: [h.pathHash], generationId: draftGenerationId, surface: RECOMMENDATION_EVIDENCE_SURFACE },
+      { kind: 'coverage-check', rowIds: [h.pathHash], generationId: draftGenerationId, surface: RECOMMENDATION_EVIDENCE_SURFACE },
+    ],
+    generationId: draftGenerationId,
+    suggestedBulletText: hotUncoveredSuggestedBullet({ pathDisplay: h.pathDisplay, distinctStreams: h.distinctStreams }),
+  });
 }
 
 // WP-B2: the single rollup proposal that stands in for `rollupCount` folded hash-only

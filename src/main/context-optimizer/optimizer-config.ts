@@ -156,6 +156,16 @@ export const OPTIMIZER_CONFIG = {
   CLUSTER_EXEMPLAR_INPUT_KEYS_CAP: 12,
   CLUSTER_EXEMPLAR_SEARCH_TERMS_CAP: 12,
   CLUSTER_EXEMPLAR_EVENT_REFS_CAP: 5,
+
+  // ── WP3 (G3) hot-uncovered candidate + recommendation drafts ───────────────────
+  //    A hot UNCOVERED workflow file (explicit role allowlist, file-coverage.ts) only
+  //    becomes an ADD candidate at/above this canonical heat score
+  //    (`canonicalHeatScore` = executes×3 + writes×2 + reads). Disclosed threshold —
+  //    surfaced in the candidate's coverageChecks disclosure, never a silent filter.
+  HOT_UNCOVERED_MIN_SCORE: 10,
+  //    Bounded predicate-ref sample on `coverageChecks` (truncation metadata is
+  //    always attached; the FULL predicate list is never exported).
+  COVERAGE_CHECKS_SAMPLE_LIMIT: 10,
 } as const;
 
 /** Script file extensions that make a file under a skill root a bypass-candidate
