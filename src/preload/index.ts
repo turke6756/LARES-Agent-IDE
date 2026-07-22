@@ -56,6 +56,12 @@ const api: IpcApi = {
     updateSupervised: (id, supervised) => ipcRenderer.invoke('agent:update-supervised', id, supervised),
     setContinuationEnabled: (agentId, enabled) => ipcRenderer.invoke('agent:set-continuation-enabled', agentId, enabled),
     forceContinuationHandoff: (agentId) => ipcRenderer.invoke('agent:force-continuation-handoff', agentId),
+    listContinuationPhases: () => ipcRenderer.invoke('agent:list-continuation-phases'),
+    onContinuationPhaseChanged: (callback) => {
+      const listener = (_event: any, signal: any) => callback(signal);
+      ipcRenderer.on('continuation:phase', listener);
+      return () => ipcRenderer.removeListener('continuation:phase', listener);
+    },
     onFileActivity: (callback) => {
       const listener = (_event: any, activity: any) => callback(activity);
       ipcRenderer.on('agent:file-activity', listener);

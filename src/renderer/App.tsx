@@ -150,6 +150,7 @@ function AppInner() {
       unsubStatus();
       unsubAgentDeleted();
       unsubContext();
+      unsubContinuation();
       unsubUsage();
       window.clearInterval(usagePoll);
       unsubTeam();

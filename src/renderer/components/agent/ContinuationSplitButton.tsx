@@ -5,7 +5,9 @@ import {
   getContinuationApi,
   getContinuationEnabled,
   forceErrorMessage,
+  continuationForceBlockedReason,
 } from './continuation-controls';
+import { isActivePhase } from './continuation-phase-view';
 
 // Split button for the context-brick continuation feature (Edward, 2026-07-05).
 //
@@ -18,10 +20,16 @@ import {
 // While a transfer runs the card's existing gold glow is the progress signal;
 // the main press is disabled so it can't be double-fired.
 export default function ContinuationSplitButton({ agent }: { agent: Agent }) {
-  // The card already lights the gold glow off this same set; we reuse it to
-  // disable the main press while a transfer for this agent is in flight.
-  const transferring = useDashboardStore((s) => s.continuationTransferIds.has(agent.id));
+  // The card lights its gold glow and phase label off this same entry; we reuse
+  // it to disable the main press while a handoff for this agent is in flight.
+  const transferring = useDashboardStore((s) => isActivePhase(s.continuationPhases[agent.id]?.phase));
+  const setOptimisticQueued = useDashboardStore((s) => s.setOptimisticContinuationQueued);
+  const clearOptimisticPhase = useDashboardStore((s) => s.clearOptimisticContinuationPhase);
   const propEnabled = getContinuationEnabled(agent);
+  // Status gate: the watcher's tick only visits ACTIVE agents, so a press on a
+  // done/crashed/starting card could never execute. Disable with the reason
+  // rather than hiding — hiding is another kind of invisibility.
+  const blockedReason = continuationForceBlockedReason(agent);
 
   // Optimistic toggle: a local override paints immediately, then clears whenever
   // the agent payload delivers a fresh continuationEnabled (the next refresh is
@@ -35,6 +43,10 @@ export default function ContinuationSplitButton({ agent }: { agent: Agent }) {
   const [menuOpen, setMenuOpen] = useState(false);
   const [forcing, setForcing] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Slice 1's local `notice` ("Handoff queued…") is GONE: it confirmed the press
+  // for 3 s and then went dark for the remaining minutes. The card's phase line
+  // — driven by the authoritative `queued` state — says the same thing and keeps
+  // saying it, truthfully, until the cycle actually ends.
   const wrapRef = useRef<HTMLDivElement>(null);
 
   // Dismiss the menu on outside click / Escape (mirrors AgentCard's menus).
@@ -62,7 +74,7 @@ export default function ContinuationSplitButton({ agent }: { agent: Agent }) {
 
   const handleForce = async (e: React.MouseEvent) => {
     e.stopPropagation();
-    if (!enabled || forcing || transferring) return;
+    if (!enabled || blockedReason || forcing || transferring) return;
     const api = getContinuationApi();
     if (!api) {
       flashError('Transfer unavailable');
@@ -70,11 +82,22 @@ export default function ContinuationSplitButton({ agent }: { agent: Agent }) {
     }
     setForcing(true);
     setError(null);
+    // Paint `queued` BEFORE awaiting IPC. `forcing` clears the instant the
+    // promise resolves — milliseconds into a minutes-long operation — so it was
+    // never the progress signal; the phase is. The authoritative `queued` event
+    // arrives right behind this and replaces it.
+    setOptimisticQueued(agent.id);
     try {
       const res = await api.forceContinuationHandoff(agent.id);
       const msg = forceErrorMessage(res);
-      if (msg) flashError(msg);
+      if (msg) {
+        // Rejected: replace the optimistic label with the reason rather than
+        // silently dropping it (a press that vanishes is the original bug).
+        clearOptimisticPhase(agent.id);
+        flashError(msg);
+      }
     } catch (err) {
+      clearOptimisticPhase(agent.id);
       flashError(forceErrorMessage(undefined, err) ?? 'Transfer failed');
     } finally {
       setForcing(false);
@@ -104,12 +127,14 @@ export default function ContinuationSplitButton({ agent }: { agent: Agent }) {
     }
   };
 
-  const mainDisabled = !enabled || forcing || transferring;
-  const mainTitle = !enabled
-    ? 'Auto context transfer is off for this agent'
-    : transferring
-      ? 'Context transfer in progress…'
-      : 'Transfer context';
+  const mainDisabled = !enabled || !!blockedReason || forcing || transferring;
+  const mainTitle = blockedReason
+    ? blockedReason
+    : !enabled
+      ? 'Auto context transfer is off for this agent'
+      : transferring
+        ? 'Context transfer in progress…'
+        : 'Transfer context';
 
   return (
     <div
@@ -189,6 +214,7 @@ export default function ContinuationSplitButton({ agent }: { agent: Agent }) {
           {error}
         </span>
       )}
+
     </div>
   );
 }

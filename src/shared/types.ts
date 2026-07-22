@@ -1257,6 +1257,64 @@ export type IndexStatusDto =
  *  absolute path (see files.writeImageTemp / files.resolveImageDrops). */
 export type ImagePathResult = { ok: true; path: string } | { ok: false; error: string };
 
+/** Why a forced continuation handoff was refused. The press used to return a
+ *  blanket `{ok:true}` even when the watcher would never visit the agent, so a
+ *  press on a stopped supervisor was indistinguishable from a working one.
+ *  Every rejection now carries a stable code the renderer can explain and a
+ *  field report can quote. Defined HERE (the shared contract) so main, preload
+ *  and the renderer share exactly one definition. */
+export type ForceContinuationCode =
+  | 'continuation-not-watched'
+  | 'continuation-disabled'
+  | 'continuation-watcher-unavailable';
+
+export interface ForceContinuationResult {
+  ok: boolean;
+  code?: ForceContinuationCode;
+  error?: string;
+}
+
+/** Slice 2 — the continuation handoff's live lifecycle, as the card renders it.
+ *  Between the press and the fresh session the cycle can run 30–150 s (and up to
+ *  ~8 minutes on the note-timeout + backoff path) during which the app used to
+ *  tell the UI NOTHING; the card sat looking idle and the transfer glow only lit
+ *  for the sub-second `restarting` window at the very end.
+ *
+ *  Deliberate omissions:
+ *   - `requesting-note` — sub-second on the happy path; it would only flicker,
+ *     so it collapses into `awaiting-note`.
+ *   - `aborted` — the 180 s note timeout SCHEDULES A RETRY, so it emits
+ *     `backoff` carrying the abort message + `retryAt`. A terminal-sounding
+ *     state overwritten one frame later is both wrong and a guaranteed flicker.
+ *   - anything on `AgentStatus` — continuation phases are a separate axis and
+ *     must never widen the status union. */
+export type ContinuationPhase =
+  | 'queued'           // force accepted; waiting for the next tick
+  | 'opening'          // attempt-open in flight
+  | 'awaiting-note'    // note requested; polling for the brick (up to 180 s)
+  | 'note-committed'   // brick landed
+  | 'waiting-for-idle' // post-note grace: author finishing its turn
+  | 'relaunching'      // relaunch route called (stop → session mint)
+  | 'launching'        // launch tail running
+  | 'backoff'          // this attempt failed; automatic retry at retryAt
+  | 'failed';          // no automatic retry (launch-tail failure)
+
+export interface ContinuationPhaseState {
+  agentId: string;
+  phase: ContinuationPhase;
+  attemptId?: string;
+  /** Why, in card-sized prose. Carried by `backoff` and `failed`. */
+  message?: string;
+  /** Epoch ms the automatic retry is due (backoff only). The renderer runs its
+   *  own 1 s display timer off this — main sends NO countdown events. */
+  retryAt?: number;
+  updatedAt: number;
+}
+
+/** One phase broadcast. `phase: null` is the CLEAR signal (the cycle finished
+ *  successfully, or the agent's entry was dropped) — it is not a phase. */
+export type ContinuationPhaseSignal = ContinuationPhaseState | { agentId: string; phase: null };
+
 export interface IpcApi {
   workspaces: {
     list: () => Promise<Workspace[]>;
@@ -1310,7 +1368,13 @@ export interface IpcApi {
     // bypassing the trigger conditions but running the normal attempt cycle
     // (rejects a disabled agent; idempotent when an attempt is already open).
     setContinuationEnabled: (agentId: string, enabled: boolean) => Promise<{ ok: boolean }>;
-    forceContinuationHandoff: (agentId: string) => Promise<{ ok: boolean; error?: string }>;
+    forceContinuationHandoff: (agentId: string) => Promise<ForceContinuationResult>;
+    /** Slice 2 — HYDRATION, not just events. A renderer reload (or a detached
+     *  dashboard opened) mid-cycle would otherwise recreate the exact defect
+     *  being fixed: a 180 s wait with no label. Main holds the authoritative
+     *  in-memory map; this reads it on mount. */
+    listContinuationPhases: () => Promise<ContinuationPhaseState[]>;
+    onContinuationPhaseChanged: (callback: (signal: ContinuationPhaseSignal) => void) => () => void;
   };
   terminal: {
     attach: (agentId: string) => Promise<void>;

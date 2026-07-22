@@ -168,12 +168,13 @@ interface DashboardState {
   // container pulse so the border keeps animating through the idle gaps
   // between deliberation turns, not just on per-agent status flips.
   deliberatingSupervisorIds: string[];
-  // Agent ids currently mid context-brick continuation transfer — the gold
-  // "snake" border. Set on a 'restarting'+continuation status event, cleared on
-  // that agent's next status change (successor launches/works, or crashes on a
-  // failed swap), and reconciled against full agent-list refreshes so a dropped
-  // end-event can't strand the border (see continuation-transfer.ts).
-  continuationTransferIds: Set<string>;
+  // Live continuation handoff phase per agent — the gold "snake" border AND the
+  // per-phase label line. Main-authoritative: hydrated from
+  // agents.listContinuationPhases() on mount and kept live by the
+  // 'continuation:phase' broadcast, so a renderer reload or a detached window
+  // opened mid-cycle shows the same state (see continuation-phase-view.ts).
+  // Absent id = no handoff running.
+  continuationPhases: Record<string, ContinuationPhaseState>;
 
   // Teams
   teams: Team[];
@@ -220,7 +221,10 @@ interface DashboardState {
   updateContextStats: (stats: ContextStats) => void;
   updateUsageLimits: (reading: UsageLimitsReading) => void;
   setDeliberatingSupervisorIds: (ids: string[]) => void;
-  applyTransferSignal: (sig: TransferStatusSignal) => void;
+  hydrateContinuationPhases: (phases: ContinuationPhaseState[]) => void;
+  applyContinuationPhase: (signal: ContinuationPhaseSignal) => void;
+  setOptimisticContinuationQueued: (agentId: string) => void;
+  clearOptimisticContinuationPhase: (agentId: string) => void;
   forkAgent: (id: string) => Promise<Agent | null>;
   queryAgent: (targetAgentId: string, question: string, sourceAgentId?: string) => Promise<QueryResult | null>;
 
@@ -310,7 +314,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
   contextStats: {},
   usageLimits: null,
   deliberatingSupervisorIds: [],
-  continuationTransferIds: new Set(),
+  continuationPhases: {},
   teams: [],
   teamMessages: {},
 
@@ -1214,12 +1218,20 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
         if (snap.workspaceId !== workspaceId) next[id] = snap;
       }
       for (const a of agents) next[a.id] = { workspaceId: a.workspaceId, status: a.status };
-      // Missed-event safety: drop the gold transfer flag from any agent this
-      // refresh shows is no longer 'restarting' (or has vanished).
-      const transfers = reconcileTransferSet(state.continuationTransferIds, agents);
-      return transfers === state.continuationTransferIds
+      // A generic agent refresh must NOT clear a continuation phase. The old
+      // reconcile did (it dropped any agent not currently 'restarting'), which
+      // is why the transfer flag only ever survived the sub-second swap window.
+      // The single thing this refresh proves is that an agent is GONE — and
+      // only for THIS workspace, since the list is workspace-scoped.
+      const present = new Set(agents.map((a) => a.id));
+      const phases = prunePhasesForAgents(
+        state.continuationPhases,
+        present,
+        (id) => state.agentStatuses[id]?.workspaceId === workspaceId,
+      );
+      return phases === state.continuationPhases
         ? { agents, agentStatuses: next }
-        : { agents, agentStatuses: next, continuationTransferIds: transfers };
+        : { agents, agentStatuses: next, continuationPhases: phases };
     });
     get().updateWorkspaceHeat();
   },
@@ -1228,10 +1240,12 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
     // All-workspaces view: same as loadAgents — supervisors are real cards now.
     const agents = await window.api.agents.listAll();
     set((state) => {
-      const transfers = reconcileTransferSet(state.continuationTransferIds, agents);
-      return transfers === state.continuationTransferIds
+      // Authoritative across every workspace, so absence really does mean gone.
+      const present = new Set(agents.map((a) => a.id));
+      const phases = prunePhasesForAgents(state.continuationPhases, present);
+      return phases === state.continuationPhases
         ? { agents }
-        : { agents, continuationTransferIds: transfers };
+        : { agents, continuationPhases: phases };
     });
     get().updateWorkspaceHeat();
   },
@@ -1482,13 +1496,49 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
     });
   },
 
-  // Fold one statusChanged signal into the continuation-transfer set (gold
-  // border). The reducer returns the same Set reference on a no-op so we skip
-  // the state write — only cards whose `.has(id)` boolean flips re-render.
-  applyTransferSignal: (sig: TransferStatusSignal) => {
+  // ── Continuation handoff phases (main-authoritative) ───────────────────
+
+  /** Replace the map wholesale from listContinuationPhases(). Called once on
+   *  mount by every window that renders cards — this is what stops a renderer
+   *  reload mid-180-s-wait from recreating the original "nothing happened"
+   *  defect. */
+  hydrateContinuationPhases: (phases: ContinuationPhaseState[]) => {
+    const next: Record<string, ContinuationPhaseState> = {};
+    for (const p of phases) next[p.agentId] = p;
+    set({ continuationPhases: next });
+  },
+
+  /** Fold one authoritative broadcast in. `phase: null` deletes (completion).
+   *  The reducer returns the same object reference on a no-op so only cards
+   *  whose own entry changed re-render. */
+  applyContinuationPhase: (signal: ContinuationPhaseSignal) => {
     set((state) => {
-      const next = nextTransferSet(state.continuationTransferIds, sig);
-      return next === state.continuationTransferIds ? {} : { continuationTransferIds: next };
+      const next = nextPhaseMap(state.continuationPhases, signal);
+      return next === state.continuationPhases ? {} : { continuationPhases: next };
+    });
+  },
+
+  /** Paint `queued` the instant the button is pressed, BEFORE awaiting IPC.
+   *  The authoritative `queued` event lands milliseconds later and replaces
+   *  this identical-looking entry; on rejection the caller clears it. */
+  setOptimisticContinuationQueued: (agentId: string) => {
+    set((state) => ({
+      continuationPhases: {
+        ...state.continuationPhases,
+        [agentId]: { agentId, phase: 'queued', updatedAt: Date.now() },
+      },
+    }));
+  },
+
+  /** Roll back an optimistic `queued` after a rejected press. Deliberately
+   *  narrow: it only drops an entry still sitting at `queued`, so it can never
+   *  erase a real phase the authoritative rail has since advanced to. */
+  clearOptimisticContinuationPhase: (agentId: string) => {
+    set((state) => {
+      if (state.continuationPhases[agentId]?.phase !== 'queued') return {};
+      const next = { ...state.continuationPhases };
+      delete next[agentId];
+      return { continuationPhases: next };
     });
   },
 

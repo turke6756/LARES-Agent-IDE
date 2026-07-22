@@ -119,12 +119,21 @@ export default function DetachedViewShell({ params }: Props) {
       })
       .catch(() => { /* best effort — status broadcasts repopulate the grid */ });
 
-    const unsubStatus = window.api.onAgentStatusChanged(({ agent, source }) => {
+    const unsubStatus = window.api.onAgentStatusChanged(({ agent }) => {
       if (!agent) return;
       const s = useDashboardStore.getState();
       s.updateAgentStatusSnapshot(agent);
       s.updateAgent(agent);
-      s.applyTransferSignal({ agentId: agent.id, status: agent.status, source });
+    });
+    // Same hydrate-then-subscribe pair as AppInner: a detached Dashboard opened
+    // DURING a handoff must show the phase it walked in on, not wait for the
+    // next transition (§2.3 — hydration is why this is a map in main, not a
+    // pure event stream).
+    window.api.agents.listContinuationPhases()
+      .then((phases) => useDashboardStore.getState().hydrateContinuationPhases(phases))
+      .catch(() => { /* best effort — the next broadcast populates it */ });
+    const unsubContinuation = window.api.agents.onContinuationPhaseChanged((signal) => {
+      useDashboardStore.getState().applyContinuationPhase(signal);
     });
     const unsubDeleted = window.api.onAgentDeleted(({ agentId }) => {
       useDashboardStore.getState().removeAgent(agentId);
@@ -137,6 +146,7 @@ export default function DetachedViewShell({ params }: Props) {
       unsubStatus();
       unsubDeleted();
       unsubContext();
+      unsubContinuation();
     };
   }, [meta]);
 

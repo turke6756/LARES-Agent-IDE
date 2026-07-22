@@ -1,8 +1,13 @@
-import type { AgentStatus } from '../../shared/types';
+import type {
+  AgentStatus,
+  ContinuationPhase,
+  ContinuationPhaseSignal,
+  ForceContinuationResult,
+} from '../../shared/types';
 import { hasSupervisorPrivilege } from '../../shared/types';
 import type { WaitingKind } from './status-monitor';
 import {
-  SUPERVISOR_CONTEXT_THRESHOLDS,
+  CONTINUATION_OPPORTUNITY_FLOOR_PCT,
   CONTINUATION_IDLE_DEBOUNCE_TICKS,
   CONTINUATION_BACKOFF_MS,
   CONTINUATION_BACKOFF_CAP_MS,
@@ -33,11 +38,40 @@ import {
  *  observed for crashed-id triage and the in-flight guard. */
 
 // The trigger context percentage is an ALIAS of the shared threshold array's
-// SOFT OPPORTUNITY FLOOR ([0] = 80%) — the same per-agent source event-bridge.ts
-// uses for context_threshold events. Never re-declare it as a literal that can
+// SOFT OPPORTUNITY FLOOR (80%). Never re-declare it as a literal that can
 // silently diverge. There is NO hard ceiling (Phase 5B removed it): higher
 // context only makes the opportunity more desirable, it never forces a kill.
-export const CONTINUATION_TRIGGER_CONTEXT_PCT = SUPERVISOR_CONTEXT_THRESHOLDS[0];
+//
+// This is NOT the supervisor's context_threshold notification tier — those were
+// collapsed to a single 95% interrupt to stop spamming owners, while the
+// continuation opportunity still opens at 80%. Two questions, two constants.
+export const CONTINUATION_TRIGGER_CONTEXT_PCT = CONTINUATION_OPPORTUNITY_FLOOR_PCT;
+
+/** The force-press contract. One definition lives in `shared/types.ts` (main,
+ *  preload and renderer all read it); re-exported here so callers inside the
+ *  supervisor tree can import it beside the watcher itself. */
+export type { ForceContinuationCode, ForceContinuationResult } from '../../shared/types';
+
+/** Result of the attempt-open effect. `null` used to collapse every rejection
+ *  — a 409 (an attempt row is already open), a transport failure and a missing
+ *  row all looked identical, so the watcher logged one indistinguishable line
+ *  and backed off for 300 s. The discriminated shape keeps the server's reason
+ *  alive as far as the log today, and as far as the card in Slice 2. */
+export type OpenAttemptResult =
+  | { status: 'ok'; attemptId: string; startedAt: string }
+  | { status: 'rejected'; code: string; httpStatus: number; error: string };
+
+/** Slice 2 §2.6 — the relaunch effects' result. `boolean` discarded the server's
+ *  reason into a `console.warn` in the wiring, so the card could only replace
+ *  SILENT failure with VAGUE failure ("relaunch rejected"). Mirrors
+ *  `OpenAttemptResult`; the rejection reason rides onto the `backoff` phase. */
+export type RelaunchResult =
+  | { ok: true }
+  | { ok: false; code: string; httpStatus: number; error: string };
+
+/** Slice 2 — the phase contract re-exported beside the watcher that emits it,
+ *  the same way `ForceContinuationResult` is. One definition, in shared/types. */
+export type { ContinuationPhase, ContinuationPhaseState, ContinuationPhaseSignal } from '../../shared/types';
 
 /** How often the commit-observation loop re-reads the brick row. */
 export const CONTINUATION_NOTE_POLL_MS = 5_000;
@@ -249,12 +283,17 @@ export interface ContinuationWatcherEffects {
   isInputInFlight(agentId: string): boolean;
   /** hasRunningOrchestrationForSupervisor ('starting'|'running' block). */
   hasRunningOrchestration(agentId: string): boolean;
+  /** Is this agent in the set the tick actually visits? A force on an agent
+   *  outside it sets a flag nothing will ever read — reject instead of lying.
+   *  Wired to the SAME expression `watcher.tick(ids)` is fed
+   *  (`getContinuationWatchIds`), evaluated at call time — never a mirror. */
+  isWatchEligible(agentId: string): boolean;
   /** POST /api/agents/:id/continuation-attempt — server allocates successorGen.
-   *  Null on rejection (e.g. 409 open-attempt-exists). */
+   *  A rejection (e.g. 409 open-attempt-exists) carries its code + reason. */
   openAttempt(
     agentId: string,
     input: { reason: string; thresholdContextPct: number },
-  ): Promise<{ attemptId: string; startedAt: string } | null>;
+  ): Promise<OpenAttemptResult>;
   /** Inject the note request via the send_message HANDSHAKE machinery
    *  (sendInputConfirmed) — never a bare PTY write. */
   requestNote(agentId: string, message: string): Promise<HandshakeResult>;
@@ -262,11 +301,12 @@ export interface ContinuationWatcherEffects {
    *  commit-observation read. Tool source ONLY; scrape never authorizes. */
   getCommittedToolBrick(agentId: string, attemptId: string): Promise<CommittedBrickView | null>;
   /** POST /api/agents/:id/continuation-relaunch — the ONLY kill path; the
-   *  route re-checks every gate server-side. False on 4xx (keep-alive). */
-  relaunch(agentId: string, attemptId: string): Promise<boolean>;
+   *  route re-checks every gate server-side. A 4xx is keep-alive AND carries
+   *  the route's reason (which gate said no) onto the `backoff` phase. */
+  relaunch(agentId: string, attemptId: string): Promise<RelaunchResult>;
   /** Same route with emptyMemoEscape=true — the note-less "none" escape mode
    *  (Phase 5B). The route re-checks the effort budget server-side. */
-  relaunchNone(agentId: string, attemptId: string): Promise<boolean>;
+  relaunchNone(agentId: string, attemptId: string): Promise<RelaunchResult>;
   /** Phase 5B — the durable escape budget for the current successor cycle,
    *  resolved by the wiring (DB helper scoped to the agent's current successor
    *  generation, converting UTC timestamps to epoch ms). */
@@ -278,6 +318,13 @@ export interface ContinuationWatcherEffects {
   handoffFailedRecovery(agentId: string, attemptId: string): Promise<void>;
   /** Page the human — existing surface: dashboard timeline event (+ log). */
   pageHuman(agentId: string, message: string): void;
+  /** Slice 2 §4.2 — publish the cycle's live phase to the authoritative
+   *  main-process map (which broadcasts it to every dashboard window). Pure
+   *  observation: it NEVER affects control flow, and the watcher never reads
+   *  it back. Completion is deliberately NOT published here — relaunch-ok
+   *  leaves the phase at `relaunching` and the supervisor's launch tail owns
+   *  the clear/`failed` outcome (§2.4). */
+  publishPhase(signal: ContinuationPhaseSignal): void;
   log(message: string): void;
 }
 
@@ -360,15 +407,36 @@ export class ContinuationWatcher {
    *  brick commit → post-note grace → relaunch, escape budget if the author
    *  never responds). Force means "start now", NOT "kill now" — the attempt
    *  cycle's own safety is preserved.
+   *   - Rejects an agent the tick will never visit (the press cannot lie).
    *   - Rejects a disabled agent (a disabled agent must never open an attempt).
    *   - Idempotent when an attempt is already open / in progress OR a force is
    *     already queued → returns ok without minting a second. */
-  forceHandoff(agentId: string): { ok: boolean; error?: string } {
-    if (!this.fx.isContinuationEnabled(agentId)) {
-      return { ok: false, error: 'continuation is disabled for this agent; enable it before forcing a handoff' };
+  forceHandoff(agentId: string): ForceContinuationResult {
+    // Order matters: the watch-set check is FIRST because it is the only failure
+    // whose OLD behavior was a false ok — the flag was set on a state entry no
+    // tick would ever visit (getActiveAgents excludes done/crashed).
+    if (!this.fx.isWatchEligible(agentId)) {
+      return {
+        ok: false,
+        code: 'continuation-not-watched',
+        error: 'This agent is not being watched for continuation — it must be a running Claude supervisor.',
+      };
     }
+    if (!this.fx.isContinuationEnabled(agentId)) {
+      return {
+        ok: false,
+        code: 'continuation-disabled',
+        error: 'Automatic context transfer is off for this agent; turn it on before forcing a handoff.',
+      };
+    }
+    // Reached only past both rejections, so a refused force creates NO watcher
+    // state (getState is the allocating read).
     const st = this.getState(agentId);
     if (st.attemptInProgress || st.forcePending) return { ok: true };
+    // The press is accepted: say so on the authoritative rail BEFORE the flag,
+    // so the card's label + glow are live from this instant rather than from
+    // whenever the next monitor tick happens to land.
+    this.publish(agentId, 'queued');
     st.forcePending = true;
     return { ok: true };
   }
@@ -399,6 +467,26 @@ export class ContinuationWatcher {
     return st;
   }
 
+  /** One-line phase emit. Every call site is a pure observation bolted beside
+   *  existing control flow — none of them branch on the result. */
+  private publish(
+    agentId: string,
+    phase: ContinuationPhase,
+    extra: { attemptId?: string; message?: string; retryAt?: number } = {},
+  ): void {
+    this.fx.publishPhase({ agentId, phase, ...extra, updatedAt: this.fx.now() });
+  }
+
+  /** `backoff` + the phase that explains it. Always called AFTER `this.backoff`
+   *  so `st.backoffUntil` is the real retry deadline the card counts down to. */
+  private publishBackoff(agentId: string, st: AgentWatchState, message: string): void {
+    this.publish(agentId, 'backoff', {
+      message,
+      retryAt: st.backoffUntil,
+      ...(st.openAttempt ? { attemptId: st.openAttempt.attemptId } : {}),
+    });
+  }
+
   private backoff(st: AgentWatchState): void {
     st.lastBackoffMs = nextBackoffMs(st.lastBackoffMs);
     st.backoffUntil = this.fx.now() + st.lastBackoffMs;
@@ -426,16 +514,18 @@ export class ContinuationWatcher {
         (crashedOwnedIds.length > 0
           ? `; crashed owned agents (non-blocking, need triage): ${crashedOwnedIds.join(', ')}`
           : '');
+      this.publish(agentId, 'opening');
       const opened = await this.fx.openAttempt(agentId, {
         reason,
         thresholdContextPct: CONTINUATION_TRIGGER_CONTEXT_PCT,
       });
-      if (!opened) {
-        this.fx.log(`[continuation-watcher] openAttempt rejected for ${agentId}; backing off`);
+      if (opened.status !== 'ok') {
+        this.fx.log(`[continuation-watcher] openAttempt rejected for ${agentId} (${opened.code}): ${opened.error}; backing off`);
         this.backoff(st);
+        this.publishBackoff(agentId, st, opened.error);
         return;
       }
-      st.openAttempt = opened;
+      st.openAttempt = { attemptId: opened.attemptId, startedAt: opened.startedAt };
     }
     const attempt = st.openAttempt;
 
@@ -463,6 +553,7 @@ export class ContinuationWatcher {
       this.fx.log(`[continuation-watcher] note-request handshake FAILED for ${agentId} (pre-attempt); attempt ${attempt.attemptId} stays open`);
       await this.fx.handoffFailedRecovery(agentId, attempt.attemptId);
       this.backoff(st);
+      this.publishBackoff(agentId, st, 'the note request was not delivered');
       return;
     }
     // 'ok' | 'unconfirmed' both proceed to commit observation: 'unconfirmed'
@@ -473,10 +564,14 @@ export class ContinuationWatcher {
     //    timeout. A tool/HTTP timeout AFTER commit still lands here as
     //    success because we read the row, not the response.
     const deadline = this.fx.now() + HANDSHAKE_TIMEOUT_MS;
+    // The 180 s wait is the single longest silence in the whole cycle and the
+    // one users read as a hang. Name it before entering the loop.
+    this.publish(agentId, 'awaiting-note', { attemptId: attempt.attemptId });
     for (;;) {
       const brick = await this.fx.getCommittedToolBrick(agentId, attempt.attemptId);
       if (isKillAuthorized(brick, attempt.startedAt)) {
         st.committedReady = true;
+        this.publish(agentId, 'note-committed', { attemptId: attempt.attemptId });
         // BUG-39: the commit is kill-AUTHORIZATION, not kill-TIMING. The author
         // is by construction still mid-turn (it just made the tool call), so
         // wait for its turn to complete before the PTY stop — else its closing
@@ -500,16 +595,21 @@ export class ContinuationWatcher {
       // Effort budget spent: proceed with the "none" Block C so an idle
       // supervisor that never authors a note is never left alive+expensive
       // forever. The route re-checks the same budget + every other gate.
-      const ok = await this.fx.relaunchNone(agentId, attempt.attemptId);
-      if (ok) {
+      const res = await this.fx.relaunchNone(agentId, attempt.attemptId);
+      if (res.ok) {
         this.fx.pageHuman(agentId,
           `Continuation note-less escape fired after effort budget exhausted (attempt ${attempt.attemptId}; ${budget.abortedCount} prior aborts this cycle).`);
+        // Same rule as tryRelaunch: relaunch-ok is NOT completion. The route
+        // hands off to the supervisor's stop → mint → launch tail, and only the
+        // tail knows whether the successor actually came up.
+        this.publish(agentId, 'relaunching', { attemptId: attempt.attemptId });
         this.clearCycle(st);
         return;
       }
       this.fx.pageHuman(agentId,
         `Continuation note-less escape relaunch was rejected server-side (attempt ${attempt.attemptId}); supervisor kept alive.`);
       this.backoff(st);
+      this.publishBackoff(agentId, st, res.error);
       return;
     }
     // Budget not yet spent: ABORT keep-alive — close 'aborted', page the human,
@@ -523,6 +623,15 @@ export class ContinuationWatcher {
     st.openAttempt = null;
     st.committedReady = false;
     this.backoff(st);
+    // §2.5 — the abort closes ONE attempt but schedules a retry, so the phase is
+    // `backoff` carrying the abort message. Emitting a terminal-sounding
+    // `aborted` here would be wrong AND would flicker: `backoff` overwrites it
+    // one statement later.
+    this.publish(agentId, 'backoff', {
+      attemptId: attempt.attemptId,
+      message: `Attempt aborted: no continuation note was saved within ${Math.round(HANDSHAKE_TIMEOUT_MS / 1000)} seconds.`,
+      retryAt: st.backoffUntil,
+    });
   }
 
   /** BUG-39 (WP1) — post-note grace: after the brick commits, poll self-idle on
@@ -531,6 +640,9 @@ export class ContinuationWatcher {
    *  passes — then proceed to relaunch either way. `isIdle` is the same injected
    *  StatusMonitor-latch effect the trigger uses; no new wiring surface. */
   private async waitPostNoteGrace(agentId: string): Promise<void> {
+    // Emitted HERE rather than at the two call sites so the committedReady
+    // retry path is covered by the same one line.
+    this.publish(agentId, 'waiting-for-idle');
     const graceDeadline = this.fx.now() + CONTINUATION_POST_NOTE_GRACE_MS;
     let consecutiveIdlePolls = 0;
     for (;;) {
@@ -549,15 +661,22 @@ export class ContinuationWatcher {
   }
 
   private async tryRelaunch(agentId: string, attemptId: string, st: AgentWatchState): Promise<void> {
-    const ok = await this.fx.relaunch(agentId, attemptId);
-    if (ok) {
+    this.publish(agentId, 'relaunching', { attemptId });
+    const res = await this.fx.relaunch(agentId, attemptId);
+    if (res.ok) {
+      // §2.4 — relaunch-ok is NOT completion and MUST NOT clear the phase. The
+      // route schedules a DETACHED launch tail that can still fail and mark the
+      // agent crashed; the tail publishes `launching`, then either the clear or
+      // a persistent `failed`. Ending the label here would put the card back to
+      // "nothing happening" for the last, most failure-prone second.
       this.clearCycle(st);
       return;
     }
     // Server-side gate disagreed (self-busy / in-flight / awaiting-human /
     // orchestration). Keep-alive, keep the committed brick, back off and
     // retry the relaunch only.
-    this.fx.log(`[continuation-watcher] relaunch rejected server-side for ${agentId} (attempt ${attemptId}); keep-alive, will retry`);
+    this.fx.log(`[continuation-watcher] relaunch rejected server-side for ${agentId} (attempt ${attemptId}) (${res.code}): ${res.error}; keep-alive, will retry`);
     this.backoff(st);
+    this.publish(agentId, 'backoff', { attemptId, message: res.error, retryAt: st.backoffUntil });
   }
 }

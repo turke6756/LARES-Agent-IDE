@@ -4,7 +4,7 @@ import fs from 'fs';
 import crypto from 'crypto';
 import { execFileSync, execFile, spawn } from 'child_process';
 import { v4 as uuidv4 } from 'uuid';
-import { Agent, AgentProvider, AgentRoleLane, AgentStatus, AgentStopReason, BulkStopItemResult, ContextStats, LaunchAgentInput, QueryResult, StopEligibilityMode, StopResult, Team, UsageLimitsReading, hasSupervisorPrivilege } from '../../shared/types';
+import { Agent, AgentProvider, AgentRoleLane, AgentStatus, AgentStopReason, BulkStopItemResult, ContextStats, ContinuationPhaseSignal, ContinuationPhaseState, ForceContinuationResult, LaunchAgentInput, QueryResult, StopEligibilityMode, StopResult, Team, UsageLimitsReading, hasSupervisorPrivilege } from '../../shared/types';
 import { assembleGuardSnapshot, evaluateStopEligibility, type AgentBrowserState, type GuardDeps } from '../lifecycle/guards';
 import {
   TMUX_SESSION_PREFIX, PROVIDER_COMMANDS, WORKER_CLAUDE_MODEL,
@@ -1244,6 +1244,15 @@ export class AgentSupervisor extends EventEmitter {
   // bridge's isContinuationSwapInFlight dep so a 'done' recipient mid-swap
   // queues (survives the swap) instead of dropping/purging its event queue.
   private continuationSwapsInFlight = new Set<string>();
+
+  // Slice 2 §4.3 — the AUTHORITATIVE live continuation phase per agent. Held in
+  // memory ON PURPOSE (§6): phases must survive a renderer reload or a detached
+  // window opening mid-cycle, NOT a main restart — the durable record is
+  // continuation_handoff_attempts + continuation_bricks, and a phase row would
+  // just be a second, staler copy of it. Written by publishContinuationPhase
+  // (watcher emissions + this class's launch tail), read by
+  // listContinuationPhases for renderer hydration.
+  private continuationPhases = new Map<string, ContinuationPhaseState>();
 
   // /clear context-bar rotation — per-agent pending hook-bound candidate
   // session ids. Set when a Claude UserPromptSubmit hook delivers a (possibly
@@ -5126,7 +5135,10 @@ export class AgentSupervisor extends EventEmitter {
         expiresAt: Date.now() + INITIAL_USER_PROMPT_TTL_MS,
       });
 
-      // Step 7 — the runner-launch tail (and ONLY the launch).
+      // Step 7 — the runner-launch tail (and ONLY the launch). The phase moves
+      // to `launching` HERE, not inside the tail's timer, so the card is never
+      // dark across the 1 s gap between the session mint and the launch.
+      this.publishContinuationPhase({ agentId, phase: 'launching', updatedAt: Date.now() });
       this.continuationLaunchTail(agentId, newSession);
     } catch (err) {
       // A step threw before the launch tail was scheduled → its finally will
@@ -5159,9 +5171,22 @@ export class AgentSupervisor extends EventEmitter {
         // retired session's dead bridge. Notify AFTER launch resolves, on
         // success only, so the terminal rebinds to the new session's PTY.
         this.notifyTerminalRebound(agentId);
+        // Slice 2 §4.3 — THE completion point. Nothing earlier may clear the
+        // phase: relaunch-ok only means the route accepted, and this tail can
+        // still throw below and crash the agent.
+        this.publishContinuationPhase({ agentId, phase: null });
       } catch (err) {
         const tContFail = applyStatusTransition(agentId, 'crashed');
         this.emit('statusChanged', { agentId, status: 'crashed', fromStatus: tContFail?.prior, source: 'continuation-failed' } satisfies StatusChangedEvent);
+        // A PERSISTENT phase: unlike `backoff` there is no automatic retry from
+        // here, so the label must stay until the human acts. It clears on the
+        // next force, the next successful continuation, or an app restart.
+        this.publishContinuationPhase({
+          agentId,
+          phase: 'failed',
+          message: err instanceof Error ? err.message : String(err),
+          updatedAt: Date.now(),
+        });
       } finally {
         this.pendingContinuationBricks.delete(agentId);
         // BUG-41 — the swap is over (launch resolved OR failed): clear the
@@ -5844,6 +5869,25 @@ export class AgentSupervisor extends EventEmitter {
     return computeAwaitingHuman(this.monitor.getWaitingKind(agentId));
   }
 
+  /** Slice 2 §4.3 — record and broadcast one continuation phase change. The map
+   *  is the authority the renderer hydrates from; the event keeps live windows
+   *  in step. `phase: null` is the CLEAR signal (successful completion), stored
+   *  as a deletion so a later hydration shows nothing rather than a stale label.
+   *
+   *  Called from exactly two places: the watcher's `publishPhase` effect (the
+   *  attempt cycle) and this class's launch tail (the only place that knows a
+   *  handoff actually finished — see §2.4). */
+  publishContinuationPhase(signal: ContinuationPhaseSignal): void {
+    if (signal.phase === null) this.continuationPhases.delete(signal.agentId);
+    else this.continuationPhases.set(signal.agentId, signal);
+    this.emit('continuationPhaseChanged', signal);
+  }
+
+  /** Every live continuation phase, for renderer hydration on mount. */
+  listContinuationPhases(): ContinuationPhaseState[] {
+    return Array.from(this.continuationPhases.values());
+  }
+
   /** Attach the Inc 5 continuation watcher (called once by
    *  startContinuationWatcher) so forceContinuationHandoff can reach it. */
   attachContinuationWatcher(watcher: ContinuationWatcher): void {
@@ -5862,9 +5906,13 @@ export class AgentSupervisor extends EventEmitter {
   /** Force a continuation handoff to start on the watcher's next tick, bypassing
    *  the trigger conditions but running the normal attempt cycle end-to-end.
    *  Rejects a disabled agent; idempotent when an attempt is already open. */
-  forceContinuationHandoff(agentId: string): { ok: boolean; error?: string } {
+  forceContinuationHandoff(agentId: string): ForceContinuationResult {
     if (!this.continuationWatcher) {
-      return { ok: false, error: 'continuation watcher not started' };
+      return {
+        ok: false,
+        code: 'continuation-watcher-unavailable',
+        error: 'continuation watcher not started',
+      };
     }
     return this.continuationWatcher.forceHandoff(agentId);
   }

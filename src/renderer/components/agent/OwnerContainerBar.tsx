@@ -6,6 +6,7 @@ import ContinuationSplitButton from './ContinuationSplitButton';
 import { isContinuationEligible } from './continuation-controls';
 import { PROVIDER_META } from '../../../shared/constants';
 import { useDashboardStore } from '../../stores/dashboard-store';
+import { isActivePhase } from './continuation-phase-view';
 import { useCursorMenuPosition } from '../../lib/floating/useCursorMenuPosition';
 
 // The header bar for an owner-container: a horizontal, full-width band (gold top
@@ -51,7 +52,7 @@ export default function OwnerContainerBar({
   const isTerminalActive = useDashboardStore((s) => s.terminalAgentId === agent.id);
   const cs = useDashboardStore((s) => s.contextStats[agent.id] ?? null);
   // Gold "snake" border while this supervisor is mid context-brick continuation transfer.
-  const transferring = useDashboardStore((s) => s.continuationTransferIds.has(agent.id));
+  const transferring = useDashboardStore((s) => isActivePhase(s.continuationPhases[agent.id]?.phase));
   const selectAgent = useDashboardStore((s) => s.selectAgent);
   const setTerminalAgent = useDashboardStore((s) => s.setTerminalAgent);
 

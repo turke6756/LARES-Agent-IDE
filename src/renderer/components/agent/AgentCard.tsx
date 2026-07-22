@@ -5,7 +5,9 @@ import StatusBadge from './StatusBadge';
 import { formatAgentToken } from '../../lib/agent-mention';
 import { RoleChips, ContextStatsBar } from './agent-card-bits';
 import ContinuationSplitButton from './ContinuationSplitButton';
+import ContinuationPhaseLine from './ContinuationPhaseLine';
 import { isContinuationEligible } from './continuation-controls';
+import { isActivePhase } from './continuation-phase-view';
 import { summarizeStopExclusions } from '../../lib/stop-exclusion-copy';
 import { PROVIDER_META } from '../../../shared/constants';
 import { useDashboardStore } from '../../stores/dashboard-store';
@@ -94,8 +96,13 @@ export default function AgentCard({
   // a sibling agent's status update won't re-render this card.
   const isSelected = useDashboardStore((s) => s.selectedAgentId === agent.id);
   const isTerminalActive = useDashboardStore((s) => s.terminalAgentId === agent.id);
-  // Gold "snake" border while this agent is mid context-brick continuation transfer.
-  const transferring = useDashboardStore((s) => s.continuationTransferIds.has(agent.id));
+  // Live continuation handoff phase. THE fix for the invisible handoff: the gold
+  // glow used to be bound to a flag set only by the 'restarting'+continuation
+  // status event — the very LAST second of a 30–150 s cycle — so a 2.4 s
+  // animation got a sub-second window and was effectively never seen. Bound to
+  // the phase, it covers the whole cycle it was designed for. No CSS change.
+  const phaseState = useDashboardStore((s) => s.continuationPhases[agent.id] ?? null);
+  const transferring = isActivePhase(phaseState?.phase);
   const cs = useDashboardStore((s) => s.contextStats[agent.id] ?? null);
   const selectAgent = useDashboardStore((s) => s.selectAgent);
   const setTerminalAgent = useDashboardStore((s) => s.setTerminalAgent);
@@ -402,6 +409,9 @@ export default function AgentCard({
             {agent.title}
           </h4>
         </div>
+
+        {/* Row 3 (conditional): the live continuation-handoff phase. */}
+        {phaseState && <ContinuationPhaseLine state={phaseState} />}
       </div>
 
       {confirmDelete && (

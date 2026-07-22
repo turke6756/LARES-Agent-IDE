@@ -4,6 +4,7 @@ import {
   isContinuationEligible,
   getContinuationEnabled,
   forceErrorMessage,
+  continuationForceBlockedReason,
 } from './continuation-controls';
 
 // Minimal Agent stub — the helpers only read `provider` / `isSupervisor` /
@@ -80,5 +81,44 @@ describe('forceErrorMessage', () => {
 
   it('uses the generic message for an empty thrown message', () => {
     expect(forceErrorMessage(undefined, new Error('   '))).toBe('Transfer failed');
+  });
+
+  it('prefers the stable code copy over the server prose', () => {
+    expect(forceErrorMessage({ ok: false, code: 'continuation-not-watched', error: 'long main-process prose' }))
+      .toBe('Transfer failed — this agent is not being watched (needs a running Claude supervisor)');
+    expect(forceErrorMessage({ ok: false, code: 'continuation-disabled', error: 'x' }))
+      .toBe('Transfer failed — auto context transfer is off for this agent');
+    expect(forceErrorMessage({ ok: false, code: 'continuation-watcher-unavailable' }))
+      .toBe('Transfer failed — the continuation watcher is not running');
+  });
+});
+
+describe('continuationForceBlockedReason', () => {
+  const withStatus = (status: string) =>
+    continuationForceBlockedReason({ status } as unknown as Pick<Agent, 'status'>);
+
+  // The main-process watcher tick only visits getActiveAgents() ∩ eligible, and
+  // getActiveAgents excludes done/crashed. A live-looking button on one of those
+  // cards IS the "I clicked the arrow and nothing happened" report.
+  it('blocks a finished agent', () => {
+    expect(withStatus('done')).toBe('Agent has finished — there is no session to hand off');
+  });
+
+  it('blocks a crashed agent', () => {
+    expect(withStatus('crashed')).toBe('Agent has crashed — restart it before transferring context');
+  });
+
+  it('blocks a starting agent (launching / restarting share one reason)', () => {
+    const reason = 'Agent is still starting — transfer available once it is running';
+    expect(withStatus('launching')).toBe(reason);
+    expect(withStatus('restarting')).toBe(reason);
+  });
+
+  it('allows every live status', () => {
+    expect(withStatus('working')).toBeNull();
+    expect(withStatus('idle')).toBeNull();
+    expect(withStatus('waiting')).toBeNull();
+    // Projection-only overlay while a send is being typed in — still a live agent.
+    expect(withStatus('receiving')).toBeNull();
   });
 });

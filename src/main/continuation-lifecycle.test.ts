@@ -143,6 +143,13 @@ type DbModule = {
   getCurrentBrick(agentId: string): Brick | null;
   commitContinuationRelaunch(agentId: string, newSessionId: string, successorGen: number, attemptId: string): void;
   hasRunningOrchestrationForSupervisor(supervisorId: string): boolean;
+  updateAgentStatus(id: string, status: string): void;
+  // Slice 1 §3.3 — boot reconcile of orphaned 'open' attempts.
+  getAllOpenContinuationAttempts(): Attempt[];
+  reconcileStaleOpenContinuationAttempts(): {
+    aborted: Array<{ agentId: string; attemptId: string; reason: string }>;
+    resumable: Array<{ agentId: string; attemptId: string }>;
+  };
   // Phase 1 — durable session lineage.
   insertAgentSession(agentId: string, generation: number, sessionId: string, cwd: string, provider: string): void;
   closeAgentSession(agentId: string, sessionId: string): void;
@@ -714,6 +721,181 @@ test('lineage backfill: reconstructs from events chronologically, stamps started
   // Idempotency: a second backfill pass (e.g. next boot) changes nothing.
   dbm.backfillAgentSessionsFromEvents();
   assert.equal(dbm.getAgentSessions(agent.id).length, 3, 'per-agent guard + ON CONFLICT keeps backfill idempotent');
+});
+
+// ── Slice 1 §3.3: boot reconcile of orphaned 'open' attempts ─────────────────
+//
+// An 'open' row is owned by an in-memory watcher cycle that dies with the
+// process. Left alone it 409s every future attempt-open, permanently and
+// silently disabling handoff for that agent — the "I clicked the arrow and
+// nothing happened" poison. The sweep is NOT a blanket abort: a row that has
+// already earned kill authorization (a tool-source brick written after it
+// opened) is exactly the brick-committed→relaunch window, and aborting it would
+// destroy a note the agent worked to write AND burn an escape-budget abort.
+
+/** Open an attempt, then (optionally) commit a tool brick for it. The sleep is
+ *  load-bearing: written_at > started_at is the authorization predicate and
+ *  NOW_MS_SQL has millisecond grain. */
+async function openAttemptWithBrick(
+  agentId: string,
+  brick: { source: 'tool' | 'scrape' } | null,
+): Promise<Attempt> {
+  const att = dbm.createContinuationHandoffAttempt(agentId, { reason: 'boot-reconcile fixture' });
+  if (brick) {
+    await sleep(5);
+    dbm.insertContinuationBrick({
+      agentId, handoffAttemptId: att.id, generation: att.generation,
+      note: 'committed note', noteSource: brick.source,
+    });
+  }
+  return att;
+}
+
+test('boot reconcile: open row, agent alive at current generation, NO brick → aborted with a reason', async () => {
+  const agent = makeDbAgent();
+  dbm.updateAgentStatus(agent.id, 'idle');
+  const att = await openAttemptWithBrick(agent.id, null);
+
+  const res = dbm.reconcileStaleOpenContinuationAttempts();
+  const mine = res.aborted.find(a => a.attemptId === att.id);
+  assert.ok(mine, 'the orphaned row was aborted');
+  assert.match(mine!.reason, /no continuation note was committed/);
+  assert.equal(dbm.getContinuationAttempt(att.id)!.status, 'aborted');
+  assert.equal(dbm.getOpenContinuationAttempt(agent.id), null, 'the 409 poison is gone');
+
+  const ev = rawOne(
+    "SELECT payload FROM events WHERE agent_id = ? AND event_type = 'continuation_aborted'",
+    [agent.id],
+  );
+  assert.ok(ev, 'the abort is recorded on the timeline');
+  assert.match(String(ev!.payload), /abandoned across app restart/);
+});
+
+test('boot reconcile: open row WITH a tool brick written after started_at → left OPEN and reported resumable', async () => {
+  const agent = makeDbAgent();
+  dbm.updateAgentStatus(agent.id, 'idle');
+  const att = await openAttemptWithBrick(agent.id, { source: 'tool' });
+
+  const res = dbm.reconcileStaleOpenContinuationAttempts();
+  assert.ok(res.resumable.some(r => r.attemptId === att.id), 'reported resumable');
+  assert.ok(!res.aborted.some(a => a.attemptId === att.id), 'NOT aborted — that would destroy a committed brick');
+  assert.equal(dbm.getContinuationAttempt(att.id)!.status, 'open', 'the row stays open for the watcher to adopt');
+  assert.equal(dbm.getOpenContinuationAttempt(agent.id)!.id, att.id);
+
+  const ev = rawOne(
+    "SELECT payload FROM events WHERE agent_id = ? AND event_type = 'continuation_attempt_resumable'",
+    [agent.id],
+  );
+  assert.ok(ev, 'a continuation_attempt_resumable event was recorded');
+});
+
+test('boot reconcile: a SCRAPE brick does not authorize — the row is aborted like a note-less one', async () => {
+  const agent = makeDbAgent();
+  dbm.updateAgentStatus(agent.id, 'idle');
+  const att = await openAttemptWithBrick(agent.id, { source: 'scrape' });
+
+  const res = dbm.reconcileStaleOpenContinuationAttempts();
+  const mine = res.aborted.find(a => a.attemptId === att.id);
+  assert.ok(mine, 'scrape is never kill-authorization (isKillAuthorized parity)');
+  assert.match(mine!.reason, /no continuation note was committed/);
+});
+
+test('boot reconcile: a tool brick written BEFORE started_at does not authorize', async () => {
+  const agent = makeDbAgent();
+  dbm.updateAgentStatus(agent.id, 'idle');
+  const att = await openAttemptWithBrick(agent.id, { source: 'tool' });
+  // Back-date the brick behind the attempt: a leftover from a PRIOR attempt
+  // must never be read as authorization for this one.
+  liveDb!.prepare('UPDATE continuation_bricks SET written_at = ? WHERE handoff_attempt_id = ?')
+    .run('2000-01-01 00:00:00.000', att.id);
+
+  const res = dbm.reconcileStaleOpenContinuationAttempts();
+  assert.ok(res.aborted.some(a => a.attemptId === att.id), 'written_at must be strictly after started_at');
+});
+
+test('boot reconcile: agent crashed → aborted even WITH a committed brick', async () => {
+  const agent = makeDbAgent();
+  const att = await openAttemptWithBrick(agent.id, { source: 'tool' });
+  dbm.updateAgentStatus(agent.id, 'crashed');
+
+  const res = dbm.reconcileStaleOpenContinuationAttempts();
+  const mine = res.aborted.find(a => a.attemptId === att.id);
+  assert.ok(mine, 'a terminal agent has nothing to hand off');
+  assert.match(mine!.reason, /agent is crashed/);
+  assert.equal(dbm.getContinuationAttempt(att.id)!.status, 'aborted');
+});
+
+test("boot reconcile: agent 'done' → aborted", async () => {
+  const agent = makeDbAgent();
+  const att = await openAttemptWithBrick(agent.id, { source: 'tool' });
+  dbm.updateAgentStatus(agent.id, 'done');
+
+  const res = dbm.reconcileStaleOpenContinuationAttempts();
+  assert.match(res.aborted.find(a => a.attemptId === att.id)!.reason, /agent is done/);
+});
+
+test('boot reconcile: stale generation → aborted (the row targets a superseded successor)', async () => {
+  const agent = makeDbAgent();
+  dbm.updateAgentStatus(agent.id, 'idle');
+  const att = await openAttemptWithBrick(agent.id, { source: 'tool' });
+  assert.equal(att.generation, 1);
+  // The agent moved on (e.g. a later cycle relaunched it); this row's successor
+  // generation is no longer the next one.
+  dbm.setContinuationGeneration(agent.id, 5);
+
+  const res = dbm.reconcileStaleOpenContinuationAttempts();
+  const mine = res.aborted.find(a => a.attemptId === att.id);
+  assert.ok(mine, 'a stale-generation row is aborted even with a brick');
+  assert.match(mine!.reason, /stale generation 1 \(successor is 6\)/);
+});
+
+test("boot reconcile: 'committed' / 'relaunched' / 'aborted' rows are untouched", async () => {
+  const agent = makeDbAgent();
+  dbm.updateAgentStatus(agent.id, 'idle');
+  const closed: Array<{ id: string; status: string; closedAt: string | null }> = [];
+  for (const status of ['committed', 'relaunched', 'aborted']) {
+    const att = dbm.createContinuationHandoffAttempt(agent.id);
+    dbm.closeContinuationHandoffAttempt(att.id, status);
+    const row = dbm.getContinuationAttempt(att.id)!;
+    closed.push({ id: att.id, status: row.status, closedAt: row.closedAt });
+  }
+
+  const res = dbm.reconcileStaleOpenContinuationAttempts();
+  for (const c of closed) {
+    assert.ok(!res.aborted.some(a => a.attemptId === c.id), `${c.status} row was not swept`);
+    assert.ok(!res.resumable.some(r => r.attemptId === c.id), `${c.status} row was not reported resumable`);
+    const after = dbm.getContinuationAttempt(c.id)!;
+    assert.equal(after.status, c.status, `${c.status} status unchanged`);
+    assert.equal(after.closedAt, c.closedAt, `${c.status} closed_at unchanged`);
+  }
+});
+
+test('boot reconcile is an EXPLICIT lifecycle op: a second initDatabase() does not run it', async () => {
+  const agent = makeDbAgent();
+  dbm.updateAgentStatus(agent.id, 'idle');
+  const att = await openAttemptWithBrick(agent.id, null);
+
+  dbm.initDatabase();   // schema init only — must NOT sweep
+  assert.equal(dbm.getContinuationAttempt(att.id)!.status, 'open',
+    'initDatabase runs more than once in some processes; the sweep must be a separate boot call');
+
+  dbm.reconcileStaleOpenContinuationAttempts();
+  assert.equal(dbm.getContinuationAttempt(att.id)!.status, 'aborted', 'the explicit call does sweep');
+});
+
+test('boot reconcile: a fresh attempt opens successfully afterwards (the poison is actually cleared)', async () => {
+  const agent = makeDbAgent();
+  dbm.updateAgentStatus(agent.id, 'idle');
+  const stale = await openAttemptWithBrick(agent.id, null);
+  // Before the sweep, the one-open-max rule is what 409s every future press.
+  assert.throws(() => dbm.createContinuationHandoffAttempt(agent.id), /open attempt/);
+
+  dbm.reconcileStaleOpenContinuationAttempts();
+  assert.equal(dbm.getContinuationAttempt(stale.id)!.status, 'aborted');
+
+  const fresh = dbm.createContinuationHandoffAttempt(agent.id);
+  assert.equal(fresh.status, 'open');
+  assert.equal(fresh.generation, 1, 'an aborted attempt never advanced the generation');
 });
 
 // ── Runner ───────────────────────────────────────────────────────────────────

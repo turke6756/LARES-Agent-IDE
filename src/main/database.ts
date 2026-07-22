@@ -3055,6 +3055,63 @@ export function getOpenContinuationAttempt(agentId: string): ContinuationHandoff
   return row ? rowToContinuationAttempt(row) : null;
 }
 
+export function getAllOpenContinuationAttempts(): ContinuationHandoffAttempt[] {
+  return queryAll(
+    "SELECT * FROM continuation_handoff_attempts WHERE status = 'open' ORDER BY started_at ASC",
+  ).map(rowToContinuationAttempt);
+}
+
+/** Application-boot lifecycle op (NOT schema init — tests and some processes call
+ *  initDatabase more than once; this must run exactly once per app start).
+ *
+ *  An 'open' attempt row is owned by one live watcher cycle, and that ownership
+ *  is in-memory only — it does not survive process exit. Left alone the row 409s
+ *  every future attempt-open forever, silently disabling handoff for the agent.
+ *
+ *  We do NOT blanket-abort, because an attempt stays 'open' until relaunch closes
+ *  it 'relaunched' — so the window between brick-commit and relaunch is an open
+ *  row that ALREADY earned kill authorization. Aborting that row would destroy a
+ *  committed note and burn an escape-budget abort. Resumability is therefore
+ *  keyed on a DURABLE fact (a tool-source brick written after the attempt opened
+ *  — the same predicate as isKillAuthorized), never on generation equality, which
+ *  proves the row targets the next generation but proves nothing about ownership. */
+export function reconcileStaleOpenContinuationAttempts(): {
+  aborted: Array<{ agentId: string; attemptId: string; reason: string }>;
+  resumable: Array<{ agentId: string; attemptId: string }>;
+} {
+  const aborted: Array<{ agentId: string; attemptId: string; reason: string }> = [];
+  const resumable: Array<{ agentId: string; attemptId: string }> = [];
+  const tx = db.transaction(() => {
+    for (const att of getAllOpenContinuationAttempts()) {
+      const agent = getAgent(att.dashboardAgentId);
+      let reason: string | null = null;
+      if (!agent) reason = 'agent no longer exists';
+      else if (agent.status === 'done' || agent.status === 'crashed') reason = `agent is ${agent.status}`;
+      else if (att.generation !== (agent.continuationGeneration ?? 0) + 1) {
+        reason = `stale generation ${att.generation} (successor is ${(agent.continuationGeneration ?? 0) + 1})`;
+      } else {
+        const brick = getLatestBrickForAttempt(att.dashboardAgentId, att.id, { source: 'tool' });
+        if (!brick || !(brick.writtenAt > att.startedAt)) reason = 'no continuation note was committed';
+      }
+      if (reason === null) {
+        resumable.push({ agentId: att.dashboardAgentId, attemptId: att.id });
+        addEvent(att.dashboardAgentId, 'continuation_attempt_resumable', JSON.stringify({
+          attemptId: att.id, generation: att.generation,
+          detail: 'open attempt survived an app restart WITH a committed note; the watcher may adopt it',
+        }));
+        continue;
+      }
+      closeContinuationHandoffAttempt(att.id, 'aborted');
+      addEvent(att.dashboardAgentId, 'continuation_aborted', JSON.stringify({
+        attemptId: att.id, detail: `abandoned across app restart — ${reason}`,
+      }));
+      aborted.push({ agentId: att.dashboardAgentId, attemptId: att.id, reason });
+    }
+  });
+  tx();
+  return { aborted, resumable };
+}
+
 export function closeContinuationHandoffAttempt(id: string, status: ContinuationAttemptStatus): void {
   run(
     `UPDATE continuation_handoff_attempts SET status = ?, closed_at = ${NOW_MS_SQL} WHERE id = ?`,

@@ -13,6 +13,8 @@ import {
   getAgentsByOwner,
   getContinuationAttempt,
   getContinuationEscapeBudget,
+  getOpenContinuationAttempt,
+  getLatestBrickForAttempt,
   closeContinuationHandoffAttempt,
   hasRunningOrchestrationForSupervisor,
   addEvent,
@@ -65,6 +67,15 @@ function apiCall(port: number, method: string, path: string, body?: unknown): Pr
   });
 }
 
+/** The EXACT set the continuation tick visits: active (getActiveAgents excludes
+ *  'done'/'crashed') ∩ supervisor-privileged ∩ claude. Exported so the force
+ *  entry point rejects against the same expression the tick uses — there must
+ *  never be two "must mirror" predicates. Evaluated at CALL time, so a
+ *  just-launched supervisor is forceable before the first monitorTick. */
+export function getContinuationWatchIds(): string[] {
+  return getActiveAgents().filter(isContinuationWatchEligible).map((a) => a.id);
+}
+
 export function createContinuationWatcherEffects(
   supervisor: AgentSupervisor,
   apiPort: number,
@@ -87,15 +98,39 @@ export function createContinuationWatcherEffects(
         .map((a) => ({ id: a.id, status: a.status })),
     isInputInFlight: (agentId) => supervisor.isInputInFlight(agentId),
     hasRunningOrchestration: (agentId) => hasRunningOrchestrationForSupervisor(agentId),
+    isWatchEligible: (agentId) => getContinuationWatchIds().includes(agentId),
 
     openAttempt: async (agentId, input) => {
       const res = await apiCall(apiPort, 'POST', `/api/agents/${agentId}/continuation-attempt`, input);
-      if (!res.ok || !res.json?.attemptId) return null;
-      // startedAt is an observation read (the route returns attemptId +
-      // successorGen only); the row is the authority for the kill-auth clock.
-      const row = getContinuationAttempt(res.json.attemptId);
-      if (!row) return null;
-      return { attemptId: row.id, startedAt: row.startedAt };
+      if (res.ok && res.json?.attemptId) {
+        // startedAt is an observation read (the route returns attemptId +
+        // successorGen only); the row is the authority for the kill-auth clock.
+        const row = getContinuationAttempt(res.json.attemptId);
+        return row
+          ? { status: 'ok', attemptId: row.id, startedAt: row.startedAt }
+          : { status: 'rejected', code: 'attempt-row-missing', httpStatus: res.status, error: 'attempt row not found after open' };
+      }
+      // An open row already exists. Same rule as the boot reconcile: adopt ONLY
+      // when the row already earned kill authorization (a tool-source brick
+      // written after it opened). Otherwise report a NAMED failure — never guess
+      // ownership from generation equality inside a live process.
+      const open = getOpenContinuationAttempt(agentId);
+      if (open) {
+        const brick = getLatestBrickForAttempt(agentId, open.id, { source: 'tool' });
+        if (brick && brick.writtenAt > open.startedAt) {
+          console.warn(`[continuation-watcher] adopting authorized open attempt ${open.id} for ${agentId}`);
+          addEvent(agentId, 'continuation_attempt_adopted', JSON.stringify({ attemptId: open.id, generation: open.generation }));
+          return { status: 'ok', attemptId: open.id, startedAt: open.startedAt };
+        }
+        return {
+          status: 'rejected', code: 'open-attempt-exists', httpStatus: res.status,
+          error: `an unfinished handoff attempt (${open.id}) is already open for this agent`,
+        };
+      }
+      return {
+        status: 'rejected', code: res.json?.code ?? 'open-rejected', httpStatus: res.status,
+        error: res.json?.error ?? `attempt-open rejected (HTTP ${res.status})`,
+      };
     },
 
     requestNote: async (agentId, message): Promise<HandshakeResult> => {
@@ -118,16 +153,27 @@ export function createContinuationWatcherEffects(
       return brick ? { id: brick.id, writtenAt: brick.writtenAt } : null;
     },
 
+    // Slice 2 §2.6 — the rejection reason used to die in a console.warn here.
+    // It is the ONE string that says WHICH gate refused (self-busy, in-flight,
+    // awaiting-human, orchestration), so it rides the result onto the card.
     relaunch: async (agentId, attemptId) => {
       const res = await apiCall(apiPort, 'POST', `/api/agents/${agentId}/continuation-relaunch`, { attemptId });
-      if (!res.ok) console.warn(`[continuation-watcher] relaunch rejected (${res.status}) for ${agentId}:`, res.json?.error ?? '');
-      return res.ok;
+      if (res.ok) return { ok: true };
+      console.warn(`[continuation-watcher] relaunch rejected (${res.status}) for ${agentId}:`, res.json?.error ?? '');
+      return {
+        ok: false, code: res.json?.code ?? 'relaunch-rejected', httpStatus: res.status,
+        error: res.json?.error ?? `relaunch rejected (HTTP ${res.status})`,
+      };
     },
 
     relaunchNone: async (agentId, attemptId) => {
       const res = await apiCall(apiPort, 'POST', `/api/agents/${agentId}/continuation-relaunch`, { attemptId, emptyMemoEscape: true });
-      if (!res.ok) console.warn(`[continuation-watcher] none-mode relaunch rejected (${res.status}) for ${agentId}:`, res.json?.error ?? '');
-      return res.ok;
+      if (res.ok) return { ok: true };
+      console.warn(`[continuation-watcher] none-mode relaunch rejected (${res.status}) for ${agentId}:`, res.json?.error ?? '');
+      return {
+        ok: false, code: res.json?.code ?? 'relaunch-none-rejected', httpStatus: res.status,
+        error: res.json?.error ?? `note-less relaunch rejected (HTTP ${res.status})`,
+      };
     },
 
     getEscapeBudget: (agentId) => {
@@ -169,6 +215,11 @@ export function createContinuationWatcherEffects(
       } catch { /* headless / test environment */ }
     },
 
+    // Slice 2 §4.3 — the supervisor holds the AUTHORITATIVE phase map (so a
+    // renderer reload re-hydrates) and owns the broadcast. The watcher just
+    // hands it the signal.
+    publishPhase: (signal) => supervisor.publishContinuationPhase(signal),
+
     log: (message) => console.log(message),
   };
 }
@@ -187,14 +238,16 @@ export function startContinuationWatcher(
   supervisor.on('monitorTick', () => {
     // Any supervisor-privileged claude agent rides the auto continuation watcher —
     // the structural workspace supervisor AND a privilegeLane:'supervisor' persona
-    // (#19). The provider constraint stays: continuation is claude-only.
-    const ids = getActiveAgents()
-      .filter(isContinuationWatchEligible)
-      .map((a) => a.id);
-    watcher.tick(ids);
+    // (#19). The provider constraint stays: continuation is claude-only. Same
+    // expression the force entry point rejects against (isWatchEligible).
+    watcher.tick(getContinuationWatchIds());
   });
   supervisor.on('agentDeleted', (payload: { agentId: string } | undefined) => {
-    if (payload?.agentId) watcher.forgetAgent(payload.agentId);
+    if (!payload?.agentId) return;
+    watcher.forgetAgent(payload.agentId);
+    // Drop the phase with the watcher state it belongs to, so a deleted agent's
+    // label cannot outlive it and be served to the next window that hydrates.
+    supervisor.publishContinuationPhase({ agentId: payload.agentId, phase: null });
   });
   return watcher;
 }

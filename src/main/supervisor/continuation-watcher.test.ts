@@ -15,6 +15,11 @@ import {
   type CommittedBrickView,
   type HandshakeResult,
   type EscapeBudget,
+  type OpenAttemptResult,
+  type RelaunchResult,
+  type ContinuationPhase,
+  type ContinuationPhaseSignal,
+  type ForceContinuationResult,
   decideContinuationTrigger,
   computeAwaitingHuman,
   isBlockingWaitKind,
@@ -30,6 +35,7 @@ import {
 import * as watcherModule from './continuation-watcher';
 import {
   SUPERVISOR_CONTEXT_THRESHOLDS,
+  CONTINUATION_OPPORTUNITY_FLOOR_PCT,
   CONTINUATION_IDLE_DEBOUNCE_TICKS,
   CONTINUATION_BACKOFF_MS,
   CONTINUATION_BACKOFF_CAP_MS,
@@ -56,9 +62,15 @@ function test(name: string, fn: () => void | Promise<void>): void {
 
 // ── Threshold aliasing + no-hard-ceiling assertion ────────────────────
 
-test('trigger percentage is an ALIAS of the soft opportunity floor SUPERVISOR_CONTEXT_THRESHOLDS[0]', () => {
-  assert.equal(CONTINUATION_TRIGGER_CONTEXT_PCT, SUPERVISOR_CONTEXT_THRESHOLDS[0]);
+test('trigger percentage is an ALIAS of CONTINUATION_OPPORTUNITY_FLOOR_PCT, decoupled from the notification tier', () => {
+  assert.equal(CONTINUATION_TRIGGER_CONTEXT_PCT, CONTINUATION_OPPORTUNITY_FLOOR_PCT);
   assert.equal(CONTINUATION_TRIGGER_CONTEXT_PCT, 80);
+  // The continuation opportunity floor and the supervisor's context_threshold
+  // notification tier are deliberately SEPARATE constants: notification was
+  // collapsed to a single 95% interrupt to stop spamming owners, while a
+  // fresh-session mint is still worthwhile from 80%. Re-aliasing them would
+  // silently drag the continuation trigger up to 95%.
+  assert.notEqual(CONTINUATION_TRIGGER_CONTEXT_PCT, SUPERVISOR_CONTEXT_THRESHOLDS[0]);
 });
 
 test('Phase 5B — no CONTINUATION_HARD_CEILING_PCT / decideEmptyMemoOutcome symbol remains in the watcher module', () => {
@@ -289,10 +301,14 @@ interface FakeWorld {
   orchestration: boolean;
   toolBrick: CommittedBrickView | null;
   handshakeResult: HandshakeResult;
-  openAttemptResult: { attemptId: string; startedAt: string } | null;
-  relaunchOk: boolean;
-  relaunchNoneOk: boolean;
+  openAttemptResult: OpenAttemptResult;
+  /** The force-gate watch set the tick would actually visit (Slice 1 §3.1/§3.2). */
+  watchEligible: boolean;
+  relaunchResult: RelaunchResult;
+  relaunchNoneResult: RelaunchResult;
   escapeBudget: EscapeBudget;
+  /** Slice 2 §4.7 — every phase signal the watcher published, in order. */
+  phases: ContinuationPhaseSignal[];
   calls: {
     openAttempt: Array<{ agentId: string; reason: string; thresholdContextPct: number }>;
     requestNote: Array<{ agentId: string; message: string }>;
@@ -303,6 +319,7 @@ interface FakeWorld {
     handoffFailedRecovery: Array<{ agentId: string; attemptId: string }>;
     pageHuman: Array<{ agentId: string; message: string }>;
     getEscapeBudget: number;
+    log: string[];
   };
 }
 
@@ -318,16 +335,18 @@ function makeWorld(overrides: Partial<FakeWorld> = {}): FakeWorld {
     orchestration: false,
     toolBrick: null,
     handshakeResult: 'ok',
-    openAttemptResult: { attemptId: 'att-1', startedAt: '2026-07-03T10:00:00.000Z' },
-    relaunchOk: true,
-    relaunchNoneOk: true,
+    openAttemptResult: { status: 'ok', attemptId: 'att-1', startedAt: '2026-07-03T10:00:00.000Z' },
+    watchEligible: true,
+    relaunchResult: { ok: true },
+    relaunchNoneResult: { ok: true },
+    phases: [],
     // Default: a fresh cycle — one open attempt started "now", zero aborts, so
     // the escape branch never fires unless a test arms the budget.
     escapeBudget: { abortedCount: 0, firstAttemptStartedAtMs: 1_000_000 },
     calls: {
       openAttempt: [], requestNote: [], brickPolls: 0, relaunch: [],
       relaunchNone: [], abortAttempt: [], handoffFailedRecovery: [], pageHuman: [],
-      getEscapeBudget: 0,
+      getEscapeBudget: 0, log: [],
     },
     ...overrides,
   };
@@ -346,6 +365,7 @@ function makeEffects(w: FakeWorld): ContinuationWatcherEffects {
     getOwnedAgents: () => w.owned,
     isInputInFlight: (id) => w.inFlight.has(id),
     hasRunningOrchestration: () => w.orchestration,
+    isWatchEligible: () => w.watchEligible,
     openAttempt: async (agentId, input) => {
       w.calls.openAttempt.push({ agentId, ...input });
       return w.openAttemptResult;
@@ -360,11 +380,11 @@ function makeEffects(w: FakeWorld): ContinuationWatcherEffects {
     },
     relaunch: async (agentId, attemptId) => {
       w.calls.relaunch.push({ agentId, attemptId });
-      return w.relaunchOk;
+      return w.relaunchResult;
     },
     relaunchNone: async (agentId, attemptId) => {
       w.calls.relaunchNone.push({ agentId, attemptId });
-      return w.relaunchNoneOk;
+      return w.relaunchNoneResult;
     },
     getEscapeBudget: () => {
       w.calls.getEscapeBudget++;
@@ -377,7 +397,8 @@ function makeEffects(w: FakeWorld): ContinuationWatcherEffects {
       w.calls.handoffFailedRecovery.push({ agentId, attemptId });
     },
     pageHuman: (agentId, message) => { w.calls.pageHuman.push({ agentId, message }); },
-    log: () => {},
+    publishPhase: (signal) => { w.phases.push(signal); },
+    log: (message) => { w.calls.log.push(message); },
   };
 }
 
@@ -593,7 +614,7 @@ test('"none"-mode escape rejected server-side → keep-alive + page + backoff', 
   const w = makeWorld({
     toolBrick: null,
     escapeBudget: { abortedCount: CONTINUATION_ESCAPE_MAX_ATTEMPTS, firstAttemptStartedAtMs: 1_000_000 },
-    relaunchNoneOk: false,
+    relaunchNoneResult: { ok: false, code: 'escape-rejected', httpStatus: 409, error: 'escape budget not satisfied server-side' },
   });
   const watcher = new ContinuationWatcher(makeEffects(w));
   await fireAndDrain(watcher, w);
@@ -605,7 +626,7 @@ test('"none"-mode escape rejected server-side → keep-alive + page + backoff', 
 test('relaunch rejected server-side after a committed brick → keep-alive, retry relaunch only', async () => {
   const w = makeWorld({
     toolBrick: { id: 'b1', writtenAt: '2026-07-03T10:00:05.000Z' },
-    relaunchOk: false,
+    relaunchResult: { ok: false, code: 'self-busy', httpStatus: 409, error: 'agent is busy — relaunch refused' },
   });
   const watcher = new ContinuationWatcher(makeEffects(w));
   await fireAndDrain(watcher, w);
@@ -613,7 +634,7 @@ test('relaunch rejected server-side after a committed brick → keep-alive, retr
   assert.equal(w.calls.abortAttempt.length, 0, 'committed attempt kept');
   // gates clear again after backoff → retries the relaunch WITHOUT a second
   // note request or attempt
-  w.relaunchOk = true;
+  w.relaunchResult = { ok: true };
   w.now.value = watcher.getAgentState(SELF).backoffUntil + 1;
   await fireAndDrain(watcher, w);
   assert.equal(w.calls.relaunch.length, 2);
@@ -663,12 +684,24 @@ test('crashed owned ids ride the attempt reason', async () => {
     `crashed id should ride the reason, got: ${w.calls.openAttempt[0].reason}`);
 });
 
-test('openAttempt rejection (e.g. 409 open-attempt-exists) → backoff, no note request', async () => {
-  const w = makeWorld({ openAttemptResult: null });
+test('openAttempt rejection (409 open-attempt-exists) → backoff, no note request, and the CODE reaches the log', async () => {
+  const w = makeWorld({
+    openAttemptResult: {
+      status: 'rejected', code: 'open-attempt-exists', httpStatus: 409,
+      error: 'an unfinished handoff attempt (att-old) is already open for this agent',
+    },
+  });
   const watcher = new ContinuationWatcher(makeEffects(w));
   await fireAndDrain(watcher, w);
   assert.equal(w.calls.requestNote.length, 0);
   assert.ok(watcher.getAgentState(SELF).backoffUntil > 0);
+  // Slice 1 §3.4: the whole point of the discriminated result is that the next
+  // field report is diagnosable — the code and the server reason must survive
+  // the effect boundary, not collapse into "rejected".
+  const line = w.calls.log.find(l => l.includes('openAttempt rejected'));
+  assert.ok(line, `expected an openAttempt-rejected log line, got: ${JSON.stringify(w.calls.log)}`);
+  assert.ok(line!.includes('open-attempt-exists'), `log should name the code: ${line}`);
+  assert.ok(line!.includes('att-old'), `log should carry the server reason: ${line}`);
 });
 
 test('note-request message content: attempt id + tool instruction + byte cap', () => {
@@ -739,7 +772,7 @@ test('post-note grace: author never goes idle → relaunch fires at the grace de
 test('committedReady retry path re-runs the post-note grace loop before relaunching', async () => {
   const w = makeWorld({
     toolBrick: { id: 'b1', writtenAt: '2026-07-03T10:00:05.000Z' },
-    relaunchOk: false,
+    relaunchResult: { ok: false, code: 'self-busy', httpStatus: 409, error: 'agent is busy — relaunch refused' },
   });
   const effects = makeEffects(w);
   const logs: string[] = [];
@@ -750,7 +783,7 @@ test('committedReady retry path re-runs the post-note grace loop before relaunch
   const graceExitsAfterFirst = logs.filter(l => l.includes('proceeding to relaunch')).length;
   assert.equal(graceExitsAfterFirst, 1, 'grace ran once on the first cycle');
   // Recover: relaunch now succeeds; advance past backoff so the retry fires.
-  w.relaunchOk = true;
+  w.relaunchResult = { ok: true };
   w.now.value = watcher.getAgentState(SELF).backoffUntil + 1;
   await fireAndDrain(watcher, w);
   assert.equal(w.calls.relaunch.length, 2, 'committedReady retry relaunches');
@@ -784,7 +817,7 @@ test('kickoff message: [DASHBOARD]-labelled, orientation-only, hard stop before 
 // ── Per-agent toggle + force handoff (Edward 2026-07-05) ──────────────
 
 /** Force, then tick once and drain the detached attempt cycle. */
-async function forceAndDrain(watcher: ContinuationWatcher, w: FakeWorld): Promise<{ ok: boolean; error?: string }> {
+async function forceAndDrain(watcher: ContinuationWatcher, w: FakeWorld): Promise<ForceContinuationResult> {
   const res = watcher.forceHandoff(SELF);
   watcher.tick([SELF]);
   for (let i = 0; i < 500 && watcher.getAgentState(SELF).attemptInProgress; i++) {
@@ -860,6 +893,291 @@ test('force queued then agent disabled before the tick → the force is dropped,
   }
   assert.equal(w.calls.openAttempt.length, 0, 'a disabled agent never opens an attempt, even a queued force');
   assert.equal(watcher.getAgentState(SELF).forcePending, false, 'the stale force is cleared, not left to resurrect');
+});
+
+// ── Slice 1 §3.2: the press cannot lie ────────────────────────────────
+
+/** The watcher's private per-agent map. Asserted directly because the public
+ *  `getAgentState` ALLOCATES — reading it would create the very state a
+ *  rejected force must not create. */
+function hasWatcherState(watcher: ContinuationWatcher, agentId: string): boolean {
+  return (watcher as unknown as { state: Map<string, unknown> }).state.has(agentId);
+}
+
+test('force on an agent OUTSIDE the watch set → {ok:false, continuation-not-watched} and NO watcher state is created', async () => {
+  // The regression this pins: the tick only visits getActiveAgents() ∩ eligible
+  // (done/crashed are excluded), but forceHandoff used to set forcePending on a
+  // state entry no tick would ever visit and return {ok:true} — a press that
+  // could never execute, reported as success.
+  const w = makeWorld({ watchEligible: false, contextPct: CONTINUATION_TRIGGER_CONTEXT_PCT - 30 });
+  const watcher = new ContinuationWatcher(makeEffects(w));
+
+  const res = watcher.forceHandoff(SELF);
+  assert.equal(res.ok, false);
+  assert.equal(res.code, 'continuation-not-watched');
+  assert.ok(res.error && res.error.length > 0, 'rejection carries human copy');
+
+  assert.equal(hasWatcherState(watcher, SELF), false,
+    'a rejected force must not allocate watcher state (the not-watched check runs BEFORE getState)');
+  // And nothing is left behind to resurrect on a later tick.
+  watcher.tick([SELF]);
+  assert.equal(w.calls.openAttempt.length, 0, 'no attempt opened for a non-watched agent');
+  assert.equal(watcher.getAgentState(SELF).forcePending, false, 'no force was queued');
+});
+
+test('force ORDERING guard: a watched-but-disabled agent reports continuation-disabled, not not-watched', async () => {
+  // Ordering regression guard for §3.2: not-watched is checked first, so a
+  // genuinely-watched agent whose only problem is the toggle must still get the
+  // toggle's code — otherwise the honest error is replaced by a different lie.
+  const w = makeWorld({ watchEligible: true, continuationEnabled: false });
+  const watcher = new ContinuationWatcher(makeEffects(w));
+
+  const res = watcher.forceHandoff(SELF);
+  assert.equal(res.ok, false);
+  assert.equal(res.code, 'continuation-disabled');
+  assert.equal(hasWatcherState(watcher, SELF), false, 'a disabled rejection allocates no state either');
+});
+
+test('force on a non-watched AND disabled agent reports not-watched (the outer gate wins)', () => {
+  const w = makeWorld({ watchEligible: false, continuationEnabled: false });
+  const watcher = new ContinuationWatcher(makeEffects(w));
+  assert.equal(watcher.forceHandoff(SELF).code, 'continuation-not-watched');
+});
+
+test('repeat force while forcePending is queued → still {ok:true}, exactly one queued force', () => {
+  const w = makeWorld({ contextPct: CONTINUATION_TRIGGER_CONTEXT_PCT - 30 });
+  const watcher = new ContinuationWatcher(makeEffects(w));
+  assert.deepEqual(watcher.forceHandoff(SELF), { ok: true }, 'first force queued');
+  assert.deepEqual(watcher.forceHandoff(SELF), { ok: true }, 'repeat force is an idempotent ok, not an error');
+  assert.equal(watcher.getAgentState(SELF).forcePending, true);
+});
+
+test('force while an attempt cycle is IN PROGRESS → {ok:true}, no second force queued behind it', async () => {
+  const w = makeWorld({
+    contextPct: CONTINUATION_TRIGGER_CONTEXT_PCT - 30,
+    toolBrick: { id: 'b1', writtenAt: '2026-07-03T10:00:05.000Z' },
+  });
+  const effects = makeEffects(w);
+  // Hold the cycle open at the note request so attemptInProgress is observable.
+  let release: () => void = () => {};
+  const gate = new Promise<void>((r) => { release = r; });
+  const innerRequestNote = effects.requestNote;
+  effects.requestNote = async (id, msg) => { await gate; return innerRequestNote(id, msg); };
+
+  const watcher = new ContinuationWatcher(effects);
+  assert.deepEqual(watcher.forceHandoff(SELF), { ok: true });
+  watcher.tick([SELF]);
+  for (let i = 0; i < 20 && !watcher.getAgentState(SELF).attemptInProgress; i++) {
+    await new Promise((r) => setImmediate(r));
+  }
+  assert.equal(watcher.getAgentState(SELF).attemptInProgress, true, 'the cycle is latched in-progress');
+
+  assert.deepEqual(watcher.forceHandoff(SELF), { ok: true }, 'the running cycle IS the handoff — ok, not an error');
+  assert.equal(watcher.getAgentState(SELF).forcePending, false, 'no duplicate force queued behind the running cycle');
+
+  release();
+  for (let i = 0; i < 500 && watcher.getAgentState(SELF).attemptInProgress; i++) {
+    await new Promise((r) => setImmediate(r));
+  }
+  assert.equal(w.calls.openAttempt.length, 1, 'still exactly one attempt');
+});
+
+// ── Slice 2 §4.2/§4.7: the phase rail ────────────────────────────────
+
+/** Just the phase names, in publication order. */
+function phaseOrder(w: FakeWorld): Array<ContinuationPhase | null> {
+  return w.phases.map((p) => p.phase);
+}
+
+function lastPhase(w: FakeWorld): ContinuationPhaseSignal {
+  assert.ok(w.phases.length > 0, 'expected at least one published phase');
+  return w.phases[w.phases.length - 1];
+}
+
+test('phase rail: the happy path publishes the full order and NEVER completes from the watcher', async () => {
+  const w = makeWorld({
+    contextPct: CONTINUATION_TRIGGER_CONTEXT_PCT - 30,
+    toolBrick: { id: 'b1', writtenAt: '2026-07-03T10:00:05.000Z' },
+  });
+  const watcher = new ContinuationWatcher(makeEffects(w));
+  await forceAndDrain(watcher, w);
+  assert.deepEqual(phaseOrder(w), [
+    'queued', 'opening', 'awaiting-note', 'note-committed', 'waiting-for-idle', 'relaunching',
+  ]);
+  // §2.4 — relaunch-ok is NOT completion. Only the supervisor's launch tail may
+  // clear (phase:null) or fail. A clear here would blank the card for the last,
+  // most failure-prone second of the cycle.
+  assert.equal(w.phases.some((p) => p.phase === null), false,
+    'the watcher must never publish the clear signal');
+  assert.equal(w.phases.some((p) => p.phase === 'failed'), false,
+    '`failed` is reserved for the no-automatic-retry launch-tail failure');
+  assert.equal(w.phases.some((p) => p.phase === 'launching'), false,
+    '`launching` belongs to the supervisor, not the watcher');
+  // Every signal names the agent and carries a timestamp.
+  for (const p of w.phases) {
+    assert.equal(p.agentId, SELF);
+    assert.equal(typeof (p as { updatedAt: number }).updatedAt, 'number');
+  }
+});
+
+test('phase rail: `awaiting-note` and `note-committed` carry the attempt id', async () => {
+  const w = makeWorld({
+    contextPct: CONTINUATION_TRIGGER_CONTEXT_PCT - 30,
+    toolBrick: { id: 'b1', writtenAt: '2026-07-03T10:00:05.000Z' },
+  });
+  const watcher = new ContinuationWatcher(makeEffects(w));
+  await forceAndDrain(watcher, w);
+  for (const name of ['awaiting-note', 'note-committed', 'relaunching'] as ContinuationPhase[]) {
+    const sig = w.phases.find((p) => p.phase === name) as { attemptId?: string };
+    assert.equal(sig?.attemptId, 'att-1', `${name} should carry the attempt id`);
+  }
+});
+
+test('phase rail: handshake failure → backoff carrying a reason AND a retryAt in the future', async () => {
+  const w = makeWorld({ handshakeResult: 'failed' });
+  const watcher = new ContinuationWatcher(makeEffects(w));
+  await fireAndDrain(watcher, w);
+  const last = lastPhase(w) as { phase: string; message?: string; retryAt?: number };
+  assert.equal(last.phase, 'backoff');
+  assert.ok(last.message && /not delivered/.test(last.message), `message should explain: ${last.message}`);
+  assert.equal(last.retryAt, watcher.getAgentState(SELF).backoffUntil,
+    'retryAt must be the REAL backoff deadline the watcher will honor, not an estimate');
+  assert.ok(last.retryAt! > w.now.value, 'the countdown must point forward');
+});
+
+test('phase rail: the 180 s abort emits ONE backoff carrying the abort message — no intermediate terminal phase', async () => {
+  const w = makeWorld({
+    contextPct: 100,
+    toolBrick: null,
+    escapeBudget: { abortedCount: 0, firstAttemptStartedAtMs: 1_000_000 },
+  });
+  const watcher = new ContinuationWatcher(makeEffects(w));
+  await fireAndDrain(watcher, w);
+  // §2.5 — `aborted` is deliberately NOT a phase: the timeout SCHEDULES a retry,
+  // so a terminal-sounding state would be both wrong and a guaranteed flicker
+  // (overwritten by `backoff` one statement later).
+  assert.equal(w.phases.some((p) => p.phase === 'failed'), false,
+    'no terminal phase may precede the backoff');
+  assert.equal(w.phases.some((p) => p.phase === null), false);
+  assert.deepEqual(phaseOrder(w), ['opening', 'awaiting-note', 'backoff']);
+  const last = lastPhase(w) as { message?: string; retryAt?: number };
+  assert.ok(last.message && last.message.includes('180 seconds'),
+    `the abort message must name the wait it just spent: ${last.message}`);
+  assert.equal(last.retryAt, watcher.getAgentState(SELF).backoffUntil);
+});
+
+test('phase rail: an open-409 rejection carries the server code\'s message onto backoff', async () => {
+  const w = makeWorld({
+    openAttemptResult: {
+      status: 'rejected', code: 'open-attempt-exists', httpStatus: 409,
+      error: 'an unfinished handoff attempt (att-old) is already open for this agent',
+    },
+  });
+  const watcher = new ContinuationWatcher(makeEffects(w));
+  await fireAndDrain(watcher, w);
+  assert.deepEqual(phaseOrder(w), ['opening', 'backoff']);
+  const last = lastPhase(w) as { message?: string; retryAt?: number };
+  assert.ok(last.message?.includes('att-old'),
+    `the card must show WHICH attempt is stuck, not "transfer failed": ${last.message}`);
+  assert.equal(last.retryAt, watcher.getAgentState(SELF).backoffUntil);
+});
+
+test('phase rail: a relaunch rejection carries the server reason (§2.6 — typed, not a discarded console.warn)', async () => {
+  const w = makeWorld({
+    toolBrick: { id: 'b1', writtenAt: '2026-07-03T10:00:05.000Z' },
+    relaunchResult: { ok: false, code: 'self-busy', httpStatus: 409, error: 'agent is busy — relaunch refused' },
+  });
+  const watcher = new ContinuationWatcher(makeEffects(w));
+  await fireAndDrain(watcher, w);
+  const last = lastPhase(w) as { phase: string; message?: string; attemptId?: string };
+  assert.equal(last.phase, 'backoff');
+  assert.equal(last.message, 'agent is busy — relaunch refused');
+  assert.equal(last.attemptId, 'att-1');
+  // The code reaches the log too, so a field report names the gate that refused.
+  assert.ok(w.calls.log.some((l) => l.includes('self-busy')),
+    `the relaunch rejection log should name the code: ${JSON.stringify(w.calls.log)}`);
+});
+
+test('phase rail: the note-less escape publishes `relaunching` on success and a reasoned `backoff` on rejection', async () => {
+  const ok = makeWorld({
+    toolBrick: null,
+    escapeBudget: { abortedCount: CONTINUATION_ESCAPE_MAX_ATTEMPTS, firstAttemptStartedAtMs: 1_000_000 },
+  });
+  await fireAndDrain(new ContinuationWatcher(makeEffects(ok)), ok);
+  assert.equal(lastPhase(ok).phase, 'relaunching',
+    'escape-ok hands off to the supervisor exactly like a normal relaunch — it does not complete');
+
+  const bad = makeWorld({
+    toolBrick: null,
+    escapeBudget: { abortedCount: CONTINUATION_ESCAPE_MAX_ATTEMPTS, firstAttemptStartedAtMs: 1_000_000 },
+    relaunchNoneResult: { ok: false, code: 'escape-rejected', httpStatus: 409, error: 'escape budget not satisfied server-side' },
+  });
+  await fireAndDrain(new ContinuationWatcher(makeEffects(bad)), bad);
+  const last = lastPhase(bad) as { phase: string; message?: string };
+  assert.equal(last.phase, 'backoff');
+  assert.equal(last.message, 'escape budget not satisfied server-side');
+});
+
+test('phase rail: force publishes `queued` BEFORE the flag, and a REJECTED force publishes nothing', () => {
+  const ok = makeWorld({ contextPct: CONTINUATION_TRIGGER_CONTEXT_PCT - 30 });
+  const okWatcher = new ContinuationWatcher(makeEffects(ok));
+  assert.deepEqual(okWatcher.forceHandoff(SELF), { ok: true });
+  assert.deepEqual(phaseOrder(ok), ['queued'],
+    'the press must be visible from the press, not from the next monitor tick');
+
+  // A rejected press must not paint progress that will never happen — the whole
+  // point of Slice 1's coded rejections.
+  for (const world of [
+    makeWorld({ watchEligible: false }),
+    makeWorld({ continuationEnabled: false }),
+  ]) {
+    const watcher = new ContinuationWatcher(makeEffects(world));
+    assert.equal(watcher.forceHandoff(SELF).ok, false);
+    assert.deepEqual(world.phases, [], 'a rejected force publishes no phase');
+  }
+});
+
+test('phase rail: a repeat force while one is already queued does not republish', () => {
+  const w = makeWorld({ contextPct: CONTINUATION_TRIGGER_CONTEXT_PCT - 30 });
+  const watcher = new ContinuationWatcher(makeEffects(w));
+  watcher.forceHandoff(SELF);
+  watcher.forceHandoff(SELF);
+  assert.deepEqual(phaseOrder(w), ['queued'], 'idempotent press → one signal');
+});
+
+test('phase rail: the committedReady retry re-publishes waiting-for-idle → relaunching (no re-open, no re-request)', async () => {
+  const w = makeWorld({
+    toolBrick: { id: 'b1', writtenAt: '2026-07-03T10:00:05.000Z' },
+    relaunchResult: { ok: false, code: 'self-busy', httpStatus: 409, error: 'agent is busy — relaunch refused' },
+  });
+  const watcher = new ContinuationWatcher(makeEffects(w));
+  await fireAndDrain(watcher, w);
+  const afterFirst = phaseOrder(w).length;
+  w.relaunchResult = { ok: true };
+  w.now.value = watcher.getAgentState(SELF).backoffUntil + 1;
+  await fireAndDrain(watcher, w);
+  assert.deepEqual(phaseOrder(w).slice(afterFirst), ['waiting-for-idle', 'relaunching'],
+    'the retry path is narrated too — it is another minute the card would otherwise sit dark');
+  assert.equal(w.calls.openAttempt.length, 1);
+  assert.equal(w.calls.requestNote.length, 1);
+});
+
+test('phase rail: publishing NEVER affects control flow (a throwing publishPhase would surface as a broken cycle)', async () => {
+  // Pin the observation-only contract: the rail is instrumentation. If a future
+  // edit made the watcher branch on it, this ordering assertion is where the
+  // regression shows up first.
+  const w = makeWorld({ toolBrick: { id: 'b1', writtenAt: '2026-07-03T10:00:05.000Z' } });
+  const effects = makeEffects(w);
+  const seen: string[] = [];
+  effects.publishPhase = (signal) => {
+    w.phases.push(signal);
+    seen.push(String(signal.phase));
+  };
+  const watcher = new ContinuationWatcher(effects);
+  await fireAndDrain(watcher, w);
+  assert.deepEqual(w.calls.relaunch, [{ agentId: SELF, attemptId: 'att-1' }],
+    'the cycle completes identically with the rail attached');
+  assert.ok(seen.includes('note-committed'));
 });
 
 // ── Runner ───────────────────────────────────────────────────────────

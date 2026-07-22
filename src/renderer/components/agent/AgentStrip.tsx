@@ -1,6 +1,7 @@
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { useDashboardStore } from '../../stores/dashboard-store';
+import { isActivePhase } from './continuation-phase-view';
 import type { Agent, AgentProvider, AgentStatus } from '../../../shared/types';
 import {
   buildAgentForest,
@@ -55,7 +56,7 @@ function MiniAgentCard({
   const isSelected = useDashboardStore((s) => s.selectedAgentId === agent.id);
   const pct = useDashboardStore((s) => s.contextStats[agent.id]?.contextPercentage ?? null);
   // Gold "snake" border while this agent is mid context-brick continuation transfer.
-  const transferring = useDashboardStore((s) => s.continuationTransferIds.has(agent.id));
+  const transferring = useDashboardStore((s) => isActivePhase(s.continuationPhases[agent.id]?.phase));
 
   const dot = DOT_COLORS[agent.status] || DOT_COLORS.done;
   const tint = PROVIDER_TINT[agent.provider || 'claude'] || PROVIDER_TINT.claude;

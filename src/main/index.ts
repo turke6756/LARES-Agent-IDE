@@ -7,7 +7,7 @@ import path from 'path';
 import fs from 'fs';
 import { loadPersistedTheme } from './theme-persistence';
 import {
-  initDatabase, getWorkspaces, getActiveAgents,
+  initDatabase, getWorkspaces, getActiveAgents, reconcileStaleOpenContinuationAttempts,
   getPlan, getWorkspace, listOrchestrationRuns, getLiveRailAgentForPlan, getPlanEventsForRender,
 } from './database';
 import { createHash } from 'crypto';
@@ -664,6 +664,17 @@ app.whenReady().then(async () => {
     console.log('Initializing database...');
     initDatabase();
     console.log('Database initialized');
+
+    // Boot lifecycle op, deliberately OUTSIDE initDatabase (which runs more than
+    // once in some processes/tests). An 'open' continuation attempt is owned by
+    // an in-memory watcher cycle that died with the previous process; left alone
+    // it 409s every future attempt-open, permanently and silently disabling
+    // handoff for that agent. Rows that already earned kill authorization (a
+    // committed tool note) are left open to be adopted, never aborted.
+    const contRecon = reconcileStaleOpenContinuationAttempts();
+    if (contRecon.aborted.length || contRecon.resumable.length) {
+      console.log(`[continuation] boot reconcile: aborted ${contRecon.aborted.length} orphaned attempt(s), ${contRecon.resumable.length} resumable`, contRecon);
+    }
 
     registerMediaProtocol(session.defaultSession.protocol, {
       workspaceRoots: getWorkspaceRootsWin(),

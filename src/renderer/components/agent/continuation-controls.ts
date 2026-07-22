@@ -1,4 +1,4 @@
-import type { Agent } from '../../../shared/types';
+import type { Agent, ForceContinuationCode, ForceContinuationResult } from '../../../shared/types';
 import { hasSupervisorPrivilege } from '../../../shared/types';
 
 // ── Context-brick continuation split-button: renderer-local contract mirror ──
@@ -17,7 +17,7 @@ import { hasSupervisorPrivilege } from '../../../shared/types';
 
 export interface ContinuationApi {
   setContinuationEnabled(agentId: string, enabled: boolean): Promise<{ ok: boolean }>;
-  forceContinuationHandoff(agentId: string): Promise<{ ok: boolean; error?: string }>;
+  forceContinuationHandoff(agentId: string): Promise<ForceContinuationResult>;
 }
 
 /** Null-tolerant accessor. Returns the two contract methods only when BOTH are
@@ -57,12 +57,22 @@ export function getContinuationEnabled(agent: Agent): boolean {
   return v === undefined ? true : v;
 }
 
+/** Short renderer copy per rejection code. The main-process `error` strings are
+ *  written for a log line; these are written for a 5 s inline note beside a
+ *  32 px button. Codes not listed here fall through to the server string. */
+const FORCE_CODE_COPY: Record<ForceContinuationCode, string> = {
+  'continuation-not-watched': 'this agent is not being watched (needs a running Claude supervisor)',
+  'continuation-disabled': 'auto context transfer is off for this agent',
+  'continuation-watcher-unavailable': 'the continuation watcher is not running',
+};
+
 /** Turn a forceContinuationHandoff outcome into a short, unobtrusive message —
  *  or null when it succeeded. Mirrors browser-store's navErrorMessage(): pure,
  *  so the button's error surfacing is unit-testable without React. Pass a caught
- *  value as `thrown` for the IPC-rejected path. */
+ *  value as `thrown` for the IPC-rejected path. Prefers the stable `code` over
+ *  the server prose so the copy stays legible if the prose is retuned. */
 export function forceErrorMessage(
-  res: { ok: boolean; error?: string } | null | undefined,
+  res: ForceContinuationResult | null | undefined,
   thrown?: unknown,
 ): string | null {
   if (thrown !== undefined) {
@@ -71,5 +81,22 @@ export function forceErrorMessage(
   }
   if (!res) return 'Transfer unavailable';
   if (res.ok) return null;
+  const coded = res.code ? FORCE_CODE_COPY[res.code] : undefined;
+  if (coded) return `Transfer failed — ${coded}`;
   return res.error?.trim() ? `Transfer failed — ${res.error.trim()}` : 'Transfer failed';
+}
+
+/** Renderer mirror of the main-process watch gate. Returns a human reason the
+ *  force press is unavailable, or null when it is live. Rendering a live-looking
+ *  button on a terminal agent IS the "nothing happened" report — the press was
+ *  accepted and then discarded. Disable and say why; do not hide. The main-process
+ *  rejection stays the correctness boundary regardless of this. */
+export function continuationForceBlockedReason(agent: Pick<Agent, 'status'>): string | null {
+  switch (agent.status) {
+    case 'done':       return 'Agent has finished — there is no session to hand off';
+    case 'crashed':    return 'Agent has crashed — restart it before transferring context';
+    case 'launching':
+    case 'restarting': return 'Agent is still starting — transfer available once it is running';
+    default:           return null;
+  }
 }

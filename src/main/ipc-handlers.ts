@@ -266,6 +266,10 @@ export function registerIpcHandlers(
     supervisor.setContinuationEnabled(id, enabled));
   ipcMain.handle('agent:force-continuation-handoff', (_e, id) =>
     supervisor.forceContinuationHandoff(id));
+  // Slice 2 — hydration read for the live handoff phases (the broadcast is
+  // registered with the other supervisor forwards below, on the `emit` helper
+  // so detached dashboard windows get it too).
+  ipcMain.handle('agent:list-continuation-phases', () => supervisor.listContinuationPhases());
 
   // Team handlers
   ipcMain.handle('team:create', (_e, input) => {
@@ -866,6 +870,13 @@ export function registerIpcHandlers(
   // grid's per-agent heat, which a torn-off Dashboard shows too).
   supervisor.on('fileActivity', (activity) => {
     emit('agent:file-activity', activity);
+  });
+
+  // Forward continuation handoff phases (+ detached views — a torn-off
+  // Dashboard renders the same cards, and a handoff started in one window must
+  // light the glow in both). Rides `emit` for exactly that reason.
+  supervisor.on('continuationPhaseChanged', (signal: ContinuationPhaseSignal) => {
+    emit('continuation:phase', signal);
   });
 
   // Forward context stats changes to renderer (+ detached views — the grid
