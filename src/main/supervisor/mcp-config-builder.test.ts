@@ -20,6 +20,7 @@ import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { builtinModules } from 'node:module';
 import {
   toolsetsForLane,
   buildDashboardMcpConfigArg,
@@ -42,11 +43,14 @@ const WIN_SCRIPT = 'C:\\Users\\me\\Projects\\AgentDashboard\\scripts\\mcp-dashbo
 
 // ── toolsetsForLane ──────────────────────────────────────────────────
 
-test('toolsetsForLane: supervisor gets orchestration/comms/observability-core+analytics/plans + browser-present (NO teams/full browser/notebooks)', () => {
+test('toolsetsForLane: supervisor gets orchestration/comms/observability-core/plans + browser-present (NO teams/full browser/notebooks/analytics)', () => {
   // QW1 (context-optimizer §3): `teams` dropped from the supervisor grant.
   // Planning-surface demo (2026-07-06): `plans` added to the supervisor lane.
-  // WP-F (P5): observability split into core + analytics; supervisor keeps BOTH.
-  assert.equal(toolsetsForLane('supervisor'), 'orchestration,comms,observability-core,observability-analytics,plans,browser-present');
+  // WP-F (P5) split observability into core + analytics and gave the supervisor
+  // both; the analytics half has since been RETIRED (all 13 tools deleted,
+  // replaced by the on-demand snapshot exporter + the `context-analytics` skill),
+  // so it is gone from this grant.
+  assert.equal(toolsetsForLane('supervisor'), 'orchestration,comms,observability-core,plans,browser-present');
 });
 
 test('toolsetsForLane: the full `plans` grant is supervisor-ONLY (not worker/researcher/legacy)', () => {
@@ -80,16 +84,19 @@ test('toolsetsForLane: worker gets comms,observability-core,browser-present + pl
   assert.equal(toolsetsForLane('worker'), 'comms,observability-core,browser-present,plans-read');
 });
 
-test('toolsetsForLane (WP-F): observability-analytics is supervisor-ONLY; observability-core is supervisor+worker', () => {
-  // The acceptance split: worker lanes do NOT receive analytics tools by default.
+test('observability-core is supervisor+worker; the retired observability-analytics is granted to NO lane', () => {
   const sup = toolsetsForLane('supervisor').split(',');
   const worker = toolsetsForLane('worker').split(',');
   assert.ok(sup.includes('observability-core'), 'supervisor must include observability-core');
-  assert.ok(sup.includes('observability-analytics'), 'supervisor must include observability-analytics');
   assert.ok(worker.includes('observability-core'), 'worker must include observability-core');
-  assert.ok(!worker.includes('observability-analytics'), 'worker must NOT include observability-analytics');
-  // The bare (pre-split) `observability` union grant is granted to no lane now.
+  // The analytics toolset was retired outright — no lane may name it, not even
+  // the supervisor that used to hold it exclusively. Granting a name the proxy no
+  // longer registers would fail OPEN (the entry is logged and ignored), so this
+  // has to be asserted at the grant layer rather than left to the proxy.
   for (const lane of ['supervisor', 'worker', 'researcher', 'legacy'] as const) {
+    assert.ok(!toolsetsForLane(lane).split(',').includes('observability-analytics'),
+      `${lane} must NOT grant the retired observability-analytics toolset`);
+    // The bare (pre-split) `observability` union grant is granted to no lane either.
     assert.ok(!toolsetsForLane(lane).split(',').includes('observability'),
       `${lane} must not grant the bare pre-split observability union`);
   }
@@ -227,7 +234,11 @@ test('buildDashboardMcpConfigArg windows: correct env/command/args, token presen
   const parsed = JSON.parse(json);
   const srv = parsed.mcpServers['agent-dashboard'];
   assert.ok(srv, 'server key must be agent-dashboard');
-  assert.equal(srv.command, 'node');
+  // Plan §5.4 / F4: a Windows-typed sidecar runs on the Node runtime bundled
+  // inside Electron, never a system `node` (a clean machine has none).
+  assert.equal(srv.command, process.execPath);
+  assert.notEqual(srv.command, 'node');
+  assert.equal(srv.env.ELECTRON_RUN_AS_NODE, '1');
   assert.equal(srv.args.length, 1);
   assert.ok(srv.args[0].endsWith('mcp-dashboard.js'), `args[0] should point at mcp-dashboard.js; got ${srv.args[0]}`);
   assert.ok(!srv.args[0].includes('\\'), 'windows args path must be forward-slash normalized');
@@ -250,6 +261,12 @@ test('buildDashboardMcpConfigArg wsl: /mnt rewrite + AGENT_DASHBOARD_API_HOST ga
   });
   const parsed = JSON.parse(json);
   const srv = parsed.mcpServers['agent-dashboard'];
+  // Plan §5.4: the WSL branch deliberately KEEPS the literal `node` — the
+  // Windows Lares.exe cannot execute inside the distro. Node-in-WSL stays a
+  // WSL-workspace-only prerequisite.
+  assert.equal(srv.command, 'node');
+  assert.equal(srv.env.ELECTRON_RUN_AS_NODE, undefined,
+    'an Electron marker inside WSL would be meaningless and inherited by the agent');
   assert.equal(srv.args[0], '/mnt/c/Users/me/Projects/AgentDashboard/scripts/mcp-dashboard.js',
     `WSL args must be /mnt/<drive> form; got ${srv.args[0]}`);
   assert.equal(srv.env.DASHBOARD_MCP_TOOLSETS, 'notebooks,comms,observability');
@@ -482,6 +499,55 @@ test('buildLaunchRecord: passthrough copies command verbatim (redaction is the c
   assert.ok(!JSON.stringify(rec).includes(FAKE_TOKEN));
   // appendLaunchRecord is exported for the runner; just assert it's a function.
   assert.equal(typeof appendLaunchRecord, 'function');
+});
+
+test('buildDashboardMcpConfigArg windows: a hostile identityEnv cannot clobber the runtime flag', () => {
+  const parsed = JSON.parse(buildDashboardMcpConfigArg({
+    toolsets: 'browser', pathType: 'windows', scriptPath: WIN_SCRIPT, apiPort: 1, apiToken: FAKE_TOKEN,
+    identityEnv: { ELECTRON_RUN_AS_NODE: '0', AGENT_DASHBOARD_API_TOKEN: 'stolen' },
+  }));
+  const srv = parsed.mcpServers['agent-dashboard'];
+  assert.equal(srv.env.ELECTRON_RUN_AS_NODE, '1',
+    'identityEnv is spread FIRST — the fixed keys must win');
+  assert.equal(srv.env.AGENT_DASHBOARD_API_TOKEN, FAKE_TOKEN);
+});
+
+// ── §5.4a external-helper dependency closure ─────────────────────────
+//
+// The MCP sidecar scripts stay in `resources/scripts/` (an agent CLI launches
+// them by absolute path, and the WSL ones must be real files a Linux `node` can
+// read — they cannot move into the asar). From there NO node_modules is on the
+// resolution path, so they may only require Node builtins. Measured 2026-07-20:
+// they require exactly http/fs/readline plus siblings, so no dependency closure
+// needs to be shipped. This test is what keeps that true.
+
+test('closure gate: resources/scripts MCP sidecars require only builtins and siblings', () => {
+  const scriptsDir = path.join(process.cwd(), 'scripts');
+  const entries = fs.readdirSync(scriptsDir)
+    .filter((f) => /^mcp-.*\.js$/.test(f) && !f.endsWith('.test.js'));
+  assert.ok(entries.length >= 4, `expected the mcp-*.js sidecars in ${scriptsDir}; found ${entries.length}`);
+
+  const builtins = new Set(builtinModules);
+  const offenders: string[] = [];
+  for (const file of entries) {
+    const src = fs.readFileSync(path.join(scriptsDir, file), 'utf8');
+    for (const m of src.matchAll(/require\((['"])([^'"]+)\1\)/g)) {
+      const spec = m[2];
+      if (spec.startsWith('.')) {
+        // A sibling is fine; reaching into ../dist would land outside
+        // resources/scripts when packaged and must never appear here.
+        if (spec.includes('..')) offenders.push(`${file}: require('${spec}') escapes resources/scripts`);
+        continue;
+      }
+      if (!builtins.has(spec.replace(/^node:/, ''))) {
+        offenders.push(`${file}: require('${spec}') is a third-party dep with no node_modules on its path`);
+      }
+    }
+  }
+  assert.deepEqual(offenders, [],
+    'plan §5.4a: adding a third-party require to an MCP sidecar means shipping its ' +
+    'transitive prod closure into resources/scripts/node_modules — do that deliberately, ' +
+    'then update this gate.\n' + offenders.join('\n'));
 });
 
 // ── Source-scan grep gate ────────────────────────────────────────────

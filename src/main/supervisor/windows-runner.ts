@@ -1,9 +1,10 @@
-import { spawn, ChildProcess } from 'child_process';
+import { ChildProcess } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import { EventEmitter } from 'events';
-import { getScriptPath } from './paths';
+import { getPtyHostPath } from './paths';
 import { sanitizeClaudeChildEnv } from './env-sanitize';
+import { spawnBundledNode } from '../node-runtime';
 
 /**
  * Spawns Claude via a separate Node.js process that uses node-pty.
@@ -76,23 +77,24 @@ export class WindowsRunner extends EventEmitter {
     this.logStream = fs.createWriteStream(logPath, { flags: 'a' });
     this._logPath = logPath;
 
-    // Find the pty-host script
-    const ptyHostPath = getScriptPath('pty-host.js');
+    // The pty-host helper ships inside the app bundle (dist/ → app.asar), so its
+    // `require('node-pty')` resolves through our own module tree.
+    const ptyHostPath = getPtyHostPath();
 
-    // Spawn pty-host under regular Node.js (not Electron). `extraEnv` is
-    // merged in so callers can inject provider-specific vars (e.g. BUG-13
-    // Path A sets CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false on Claude
-    // launches). pty-host forwards its process.env into pty.spawn, so
-    // anything we set here reaches the PTY child. Sanitized AFTER the merge so
-    // child-session markers can't sneak back in via extraEnv
-    // (docs/BUG_claude-child-session-env-poisoning.md).
+    // Spawn pty-host on the runtime we ship — Electron-as-Node, never a system
+    // `node` (F3). `extraEnv` is merged in so callers can inject
+    // provider-specific vars (e.g. BUG-13 Path A sets
+    // CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false on Claude launches). pty-host
+    // builds the PTY child's env from its own process.env, so anything we set
+    // here reaches the PTY child. Sanitized AFTER the merge so child-session
+    // markers can't sneak back in via extraEnv
+    // (docs/BUG_claude-child-session-env-poisoning.md), and sanitized BEFORE
+    // spawnBundledNode adds ELECTRON_RUN_AS_NODE so the sanitizer can never
+    // strip the flag the helper needs. pty-host itself deletes that marker
+    // again before it spawns the PTY child (plan §5.3).
     const env = sanitizeClaudeChildEnv({ ...process.env, ...(extraEnv || {}) });
-    delete env.ELECTRON_RUN_AS_NODE;
 
-    this.host = spawn('node', [ptyHostPath], {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      env,
-    });
+    this.host = spawnBundledNode(ptyHostPath, [], { env });
 
     this.host.stdout?.setEncoding('utf-8');
     this.host.stdout?.on('data', (chunk: string) => {

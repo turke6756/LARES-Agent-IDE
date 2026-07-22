@@ -16,6 +16,7 @@ const TESTS = [
   'dist/main/shared/content-hash.test.js',
   'dist/main/main/file-writer.test.js',
   'dist/main/main/usage-limits-watcher.test.js',
+  'dist/main/main/node-runtime.test.js',
   'dist/main/main/supervisor/codex-shell-parser.test.js',
   'dist/main/main/supervisor/codex-resume-command-builder.test.js',
   'dist/main/main/supervisor/context-stats-monitor.test.js',

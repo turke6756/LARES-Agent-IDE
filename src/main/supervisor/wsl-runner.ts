@@ -1,10 +1,11 @@
-import { spawn, ChildProcess } from 'child_process';
+import { ChildProcess } from 'child_process';
 import { EventEmitter } from 'events';
 import * as fs from 'fs';
 import path from 'path';
 import { tmuxNewSession, tmuxKillSession, isTmuxSessionAlive, tmuxCapturePane, wslExec, buildTmuxAttachCmd, tmuxWaitForSession, TmuxNewSessionResult } from '../wsl-bridge';
-import { getScriptPath } from './paths';
+import { getPtyHostPath } from './paths';
 import { sanitizeClaudeChildEnv } from './env-sanitize';
+import { spawnBundledNode } from '../node-runtime';
 import { redactMcpToken } from './mcp-config-builder';
 import { stripAnsi } from './strip-ansi';
 
@@ -13,7 +14,7 @@ import { stripAnsi } from './strip-ansi';
  *  attach result is known. */
 export interface WslLaunchDiagnostics {
   launchStartedAt: string;
-  /** Workspace-relative `.dashboard/launches.log` path. When null, JSONL
+  /** Workspace-relative `.lares/launches.log` path. When null, JSONL
    *  appending is disabled (no workspace path available). */
   launchesLogPath: string | null;
   agentId: string;
@@ -130,7 +131,7 @@ export function appendLaunchRecord(
 }
 
 /** BUG-22 Step 1 diagnostic: shape of the JSONL record appended to
- *  `<workspace>/.dashboard/launches.log` once per launch attempt. */
+ *  `<workspace>/.lares/launches.log` once per launch attempt. */
 export interface WslLaunchAttemptLogRecord {
   schema_version: 1;
   timestamp: string;
@@ -217,7 +218,7 @@ export class WslRunner extends EventEmitter {
   private logStream: fs.WriteStream | null = null;
   // BUG-22 Step 1 diagnostic state — captured at launch and consumed once at
   // the first attach exit (or pre-attach failure) to append exactly one JSONL
-  // record to `<workspace>/.dashboard/launches.log`.
+  // record to `<workspace>/.lares/launches.log`.
   private _diagnostics: WslLaunchDiagnostics | null = null;
   private _launchWorkDir: string = '';
   private _launchCommand: string = '';
@@ -583,18 +584,19 @@ export class WslRunner extends EventEmitter {
       this._logPath = logPath;
     }
 
-    const ptyHostPath = getScriptPath('pty-host.js');
+    // The pty-host itself runs on the WINDOWS side (it is what spawns
+    // `wsl.exe`), so it ships inside the app bundle and runs on our bundled
+    // runtime exactly like the Windows runner's — no system `node` (F3).
+    const ptyHostPath = getPtyHostPath();
 
     // tmux mostly insulates WSL agents from the host env, but the pty-host /
     // wsl.exe attach chain still inherits ours — strip the Claude child-session
     // markers explicitly (docs/BUG_claude-child-session-env-poisoning.md).
+    // Sanitize BEFORE spawnBundledNode adds ELECTRON_RUN_AS_NODE; pty-host
+    // deletes that marker again before spawning wsl.exe (plan §5.3).
     const env = sanitizeClaudeChildEnv(process.env);
-    delete env.ELECTRON_RUN_AS_NODE;
 
-    this.host = spawn('node', [ptyHostPath], {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      env,
-    });
+    this.host = spawnBundledNode(ptyHostPath, [], { env });
 
     this.host.stderr?.setEncoding('utf-8');
     this.host.stderr?.on('data', (chunk: string) => {

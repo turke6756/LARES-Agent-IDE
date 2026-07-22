@@ -45,6 +45,7 @@ import { registerBrowserIpc } from './browser/browser-ipc';
 import { PlanPaneManager } from './plans/plan-pane-manager';
 import { registerPlanIpc } from './plans/plan-ipc';
 import { stripClaudeChildEnvInPlace } from './supervisor/env-sanitize';
+import { getLaresNativeDir } from './supervisor/paths';
 import { installShellSpellcheckContextMenu } from './spellcheck-context-menu';
 import { MemorySampler } from './watchdog/memory-sampler';
 import { createCommitReader, type NativeCommitProvider } from './watchdog/commit-reader';
@@ -91,7 +92,14 @@ crashReporter.start({ uploadToServer: false });
 // uncaught exception is visible today, and it vanishes when the window closes.
 // Append (never truncate) so a crash loop preserves history. Sync write — the
 // process is about to die, there is no later flush.
-const CRASH_LOG_PATH = path.join(app.getAppPath(), '.dashboard', 'main-crash.log');
+// Packaged, `app.getAppPath()` points INSIDE app.asar — a read-only archive —
+// so the handler's own mkdirSync threw and crash logging was dead in exactly
+// the build that needs it (ground truth F10). `userData` is writable in both
+// dev and packaged builds. Note this is Electron's per-app data dir (named from
+// the package name), NOT the %APPDATA%\AgentDashboard directory the database
+// lives in (F9) — the two are deliberately unrelated.
+const CRASH_LOG_PATH = path.join(app.getPath('userData'), 'logs', 'main-crash.log');
+console.log(`[startup] crash log: ${CRASH_LOG_PATH}`);
 
 /** Join a workspace-relative `plans/…` path onto the workspace root (host sep).
  *  Mirrors api-server.ts `absPlanPath` — kept local to avoid a cross-module import
@@ -985,12 +993,16 @@ app.whenReady().then(async () => {
     // caps stay fail-closed), and the sampler never keeps the event loop alive.
     let nativeCommit: NativeCommitProvider | null = null;
     try {
-      // dist/main/main/index.js → repo root is ../../.. ; the native module ships
-      // outside dist (native/lares-native). Its index.js never throws at require
-      // time (graceful no-op surface off-Windows / when the binary is missing).
+      // The native module ships outside dist (native/lares-native). Packaged, it
+      // is copied to resources/native/lares-native via extraResources — resolving
+      // it relative to __dirname would land inside app.asar, where it does not
+      // exist (ground truth F6). getLaresNativeDir() owns both layouts, and is
+      // shared with the ownership store so the two can never diverge. Its
+      // index.js never throws at require time (graceful no-op surface
+      // off-Windows / when the binary is missing).
       // eslint-disable-next-line @typescript-eslint/no-var-requires
       nativeCommit = require(
-        path.join(__dirname, '..', '..', '..', 'native', 'lares-native', 'index.js'),
+        path.join(getLaresNativeDir(), 'index.js'),
       ) as NativeCommitProvider;
     } catch (err) {
       console.warn('[watchdog] lares-native not loadable; commit sampling degraded:', err);

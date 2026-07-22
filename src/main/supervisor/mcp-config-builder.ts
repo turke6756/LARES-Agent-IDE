@@ -43,13 +43,19 @@ export function toolsetsForLane(lane: AgentRoleLane): string {
       // workers get the read-only `plans-read` subset (below) — they orient/read/
       // observe the plan surface via MCP and still write by editing the HTML
       // natively; create_plan + write stay supervisor-native.
-      // WP-F (P5): `observability` split into `observability-core` (operational)
+      // WP-F (P5) split `observability` into `observability-core` (operational)
       // + `observability-analytics` (context-optimizer / agent-knowledge /
-      // file-heat / skill-usage deep analytics). The supervisor keeps BOTH; the
-      // worker keeps only core (below). Justified by the P2 tool-usage surface:
-      // analytics tools showed real per-lane usage concentrated in the
-      // context-overhead supervisor, not the worker lane.
-      return 'orchestration,comms,observability-core,observability-analytics,plans,browser-present';
+      // file-heat / skill-usage deep analytics), granting BOTH to the supervisor
+      // and only core to the worker. `observability-analytics` has since been
+      // RETIRED from this grant and from the registry: its 13 tools cost 3,172
+      // resident tokens on EVERY supervisor session (measured — the largest
+      // single toolset on this lane after orchestration), and the same analysis
+      // surfaces are now emitted to disk on demand by the snapshot exporter,
+      // which drains the same DTO builders those routes called. The supervisor
+      // reaches them through the scaffolded `context-analytics` skill instead —
+      // a few hundred resident tokens of frontmatter rather than 13 always-loaded
+      // schemas. Cost decision, not a value judgment; the HTTP routes are intact.
+      return 'orchestration,comms,observability-core,plans,browser-present';
     case 'worker':
       // QW1 (context-optimizer §3): `notebooks` removed — 0 notebook tool
       // invocations corpus-wide in the 546-file worker matrix. This is a rent
@@ -60,10 +66,12 @@ export function toolsetsForLane(lane: AgentRoleLane): string {
       // on and read its dispatched section via ToolSearch under --strict-mcp-config
       // (which otherwise starved the plan-read breadcrumb trail). Writes stay
       // native Edits; there is no plan-write MCP tool.
-      // WP-F (P5): `observability-analytics` dropped from the worker grant — the
-      // deep context-optimizer/analytics tools are a supervisor concern (observed
-      // near-zero worker usage on the P2 surface). Preserves the QW1 precedent
-      // (trim on observed-zero; one-line re-add the day a worker workflow needs it).
+      // WP-F (P5) dropped `observability-analytics` from the worker grant — the
+      // deep context-optimizer/analytics tools were a supervisor concern (observed
+      // near-zero worker usage on the P2 surface). That toolset has since been
+      // retired entirely, so this lane's grant is unchanged by the retirement:
+      // the worker never carried those 13 schemas and its resident cost is
+      // identical before and after.
       return 'comms,observability-core,browser-present,plans-read';
     case 'researcher':
       return 'browser';
@@ -148,7 +156,7 @@ export function shouldDirectSpawn(p: DirectSpawnParams): boolean {
  *
  *  - WebSearch / WebFetch / Read / Grep / Glob / Task / Skill are Claude
  *    built-ins (Task spawns ephemeral in-process subagents, NOT dashboard agents).
- *  - Write is offered but path-confined to .dashboard/research/inbox/ by the
+ *  - Write is offered but path-confined to .lares/research/inbox/ by the
  *    scaffolded PreToolUse(Write) guard (RESEARCH_WRITE_GUARD_MJS).
  *  - mcp__agent-dashboard__browser_* are the dashboard browser tools, which
  *    arrive via the injected `browser` MCP toolset (toolsetsForLane).
@@ -230,6 +238,11 @@ export function buildDashboardMcpConfigArg(params: DashboardMcpConfigParams): st
     return JSON.stringify({
       mcpServers: {
         'agent-dashboard': {
+          // WSL-typed workspace: the sidecar runs INSIDE the distro, where the
+          // Windows `Lares.exe` cannot execute. So this branch keeps the literal
+          // `node` — node-in-WSL is a documented, preflight-detected
+          // prerequisite for WSL workspaces only. The windows branch below
+          // deliberately differs; see plan §5.4 / ground truth F4.
           command: 'node',
           args: [linuxScriptPath],
           env: {
@@ -249,12 +262,19 @@ export function buildDashboardMcpConfigArg(params: DashboardMcpConfigParams): st
   return JSON.stringify({
     mcpServers: {
       'agent-dashboard': {
-        command: 'node',
+        // Windows-typed workspace: run the sidecar on the Node runtime we ship
+        // inside Electron rather than a system `node`, which a clean machine
+        // does not have (F4). `ELECTRON_RUN_AS_NODE=1` makes Lares.exe behave
+        // as a bare node binary. The wsl branch above intentionally still says
+        // `node`; see plan §5.4.
+        command: process.execPath,
         args: [winScript],
         env: {
           // identityEnv FIRST so the fixed API keys below always override it —
-          // a hostile identityEnv can never clobber token/port/toolsets.
+          // a hostile identityEnv can never clobber token/port/toolsets, and
+          // cannot suppress the runtime flag.
           ...identityEnv,
+          ELECTRON_RUN_AS_NODE: '1',
           DASHBOARD_MCP_TOOLSETS: toolsets,
           AGENT_DASHBOARD_API_PORT: String(apiPort),
           AGENT_DASHBOARD_API_TOKEN: apiToken,

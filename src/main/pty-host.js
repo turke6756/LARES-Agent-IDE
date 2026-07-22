@@ -1,5 +1,15 @@
-// This script runs under regular Node.js (not Electron) so node-pty works.
-// It communicates with the Electron main process via stdin/stdout JSON messages.
+// PTY helper. Runs as a separate process from the Electron main process and
+// communicates with it via stdin/stdout JSON messages.
+//
+// It is launched by `spawnBundledNode` (src/main/node-runtime.ts), i.e. as
+// `Lares.exe` with ELECTRON_RUN_AS_NODE=1 — Electron's embedded Node runtime,
+// which matches the ABI node-pty is rebuilt for and needs no system Node.js.
+//
+// This file deliberately lives under `src/main/` (copied verbatim into
+// `dist/main/main/` by scripts/copy-static-main.mjs) rather than `scripts/`, so
+// that packaged it sits inside `app.asar` and the bare `require('node-pty')`
+// below resolves through the app's own module tree. Do not move it back.
+// It must stay plain CommonJS and must never `require('electron')`.
 
 const pty = require('node-pty');
 
@@ -53,7 +63,17 @@ function handleMessage(msg) {
 
       const env = { ...process.env };
       delete env.CLAUDECODE;
-      
+
+      // Electron-as-Node markers must not reach cmd.exe / wsl.exe / the agent
+      // CLI: this host is itself Lares.exe running with ELECTRON_RUN_AS_NODE=1,
+      // and a provider that re-execs node while inheriting that flag misbehaves
+      // (it would silently turn any `electron` invocation downstream into a
+      // bare node one). Strip them for the PTY child only — our own process
+      // still needs them.
+      delete env.ELECTRON_RUN_AS_NODE;
+      delete env.ELECTRON_NO_ATTACH_CONSOLE;
+
+
       // Force CLI tools like Claude Code to output ANSI colors even when wrapped
       // inside cmd.exe under node-pty on Windows.
       env.FORCE_COLOR = '3';
