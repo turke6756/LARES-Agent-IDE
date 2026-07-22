@@ -22,10 +22,17 @@ import type {
   McpServerOverhead,
   OverheadSource,
   OverheadSourceKind,
+  SectionBehaviorStatus,
   SectionWeightClass,
 } from '../../shared/types';
+import { normalizeSectionPathKey, sectionKeyFor } from '../../shared/section-identity';
 import { MAX_READABLE_BYTES } from '../shared/max-readable-bytes';
 import { splitIntoSections } from '../shared/markdown-sections';
+// WP5 (G5): the OPTIMIZER's section parser/anchor derivation — imported (never
+// re-implemented) so config-weight sections derive the SAME markdown anchor the
+// occurrence plumbing persists. Type-only coupling back into context-overhead
+// (FileReader) is erased at compile time, so there is no runtime cycle.
+import { deriveAnchors, parseMarkdownSections } from '../context-optimizer/resident-inventory';
 import type { FileReader } from './context-overhead-analyzer';
 import type { PathOps } from './paths';
 import type { TokenEstimator } from './token-estimator';
@@ -49,6 +56,36 @@ export function emptyTokensByClass(): Record<SectionWeightClass, number> {
   const out = {} as Record<SectionWeightClass, number>;
   for (const c of ALL_CLASSES) out[c] = 0;
   return out;
+}
+
+// WP5 (G5): the SEPARATE behavior axis (strict lattice — section-liveness.ts).
+const ALL_BEHAVIOR_STATUSES: SectionBehaviorStatus[] = [
+  'live', 'dead', 'mixed', 'unobservable',
+  'capture-incomplete', 'insufficient-evidence', 'not-analyzed',
+];
+
+/** A fresh, all-zero `tokensByBehavior` with every one of the seven keys present. */
+export function emptyTokensByBehavior(): Record<SectionBehaviorStatus, number> {
+  const out = {} as Record<SectionBehaviorStatus, number>;
+  for (const c of ALL_BEHAVIOR_STATUSES) out[c] = 0;
+  return out;
+}
+
+/**
+ * WP5 (G5): parallel of `rollupTokens` for the behavior axis. Sections without a
+ * joined `behaviorStatus` count under 'not-analyzed' (the axis did not run for
+ * them — honest, never a liveness claim). Mirrors the headline rule: agents-md
+ * sections are excluded here (never summed across fileKind).
+ */
+export function rollupTokensByBehavior(
+  sections: ConfigSectionWeight[],
+): Record<SectionBehaviorStatus, number> {
+  const by = emptyTokensByBehavior();
+  for (const s of sections) {
+    if (fileKindBucketOf(s) === 'agents-md') continue; // never summed across fileKind
+    by[s.behaviorStatus ?? 'not-analyzed'] += s.tokens;
+  }
+  return by;
 }
 
 // ── reference extraction (deterministic) ──────────────────────────────────────
@@ -220,8 +257,16 @@ export function classifyAgentConfig(
     }
 
     const sourceDir = pathOps.dirname(path);
+    // WP5 (G5): derive the OPTIMIZER's anchors over the same content and key each
+    // split section by the candidate anchored at its own start line — the SAME
+    // `${targetType}:${targetKey}:${rawAnchor}` identity the occurrence verdicts
+    // carry, via the shared helper (never a parallel derivation). Sections whose
+    // start line has no optimizer candidate (e.g. a blank-only preamble the
+    // optimizer suppresses) simply carry no key — they can never be behavior-joined.
+    const keyByStartLine = deriveSectionKeysByStartLine(path, file.content);
     for (const sec of splitIntoSections(file.content)) {
       const { weightClass, evidence } = classifySectionText(sec.text, sourceDir, resolver);
+      const sectionKey = keyByStartLine.get(sec.startLine);
       sections.push({
         sourcePath: path,
         sourceLabel: src.label,
@@ -235,6 +280,7 @@ export function classifyAgentConfig(
         // WP2 (G2): thread the owning source's guidance record through so the
         // section is joinable to its provider audience + chain applicability.
         ...(src.guidanceSource ? { guidanceSource: src.guidanceSource } : {}),
+        ...(sectionKey ? { sectionKey } : {}),
       });
     }
   }
@@ -244,6 +290,27 @@ export function classifyAgentConfig(
     tokensByClass: rollupTokens(sections),
     tokensByClassByFileKind: rollupTokensByFileKind(sections),
   };
+}
+
+/**
+ * WP5 (G5): the section-identity map for one resident config file — optimizer
+ * anchor derivation (`parseMarkdownSections` + `deriveAnchors`, imported, not
+ * re-implemented) keyed through the SHARED helper with the per-path target
+ * identity (`markdown_section` + normalized path — resident-inventory's
+ * un-pooled `targetKey`). Returned as startLine → sectionKey so the split
+ * sections (same 1-based numbering, same content) attach their own anchor.
+ *
+ * Pooled scaffold-constant targets (ScaffoldMatcher) carry a constant-symbol
+ * `targetKey` this map cannot know; their sections stay keyless here and are
+ * therefore never behavior-joined — honest absence, never a wrong join.
+ */
+export function deriveSectionKeysByStartLine(path: string, content: string): Map<number, string> {
+  const target = { targetType: 'markdown_section', targetKey: normalizeSectionPathKey(path) };
+  const out = new Map<number, string>();
+  for (const c of deriveAnchors(parseMarkdownSections(content))) {
+    if (!out.has(c.lineStart)) out.set(c.lineStart, sectionKeyFor(target, c.rawAnchor));
+  }
+  return out;
 }
 
 function oneSection(

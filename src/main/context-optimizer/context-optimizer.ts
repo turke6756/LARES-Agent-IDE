@@ -61,6 +61,7 @@ import {
   type DerivationVerifiedResult,
 } from './compiler-parity-gate';
 import { sha256Hex } from './resident-inventory';
+import { joinSectionBehavior } from './section-liveness';
 import {
   buildRecommendationDraft,
   commandFamilyClaimTemplate,
@@ -540,10 +541,16 @@ export function generateContextOptimizerProposals(
     })),
   }));
 
+  // ── WP5 (G5): occurrence verdicts joined per section identity — the input to
+  // the config-weight behavior-axis annotation. Per-lane pairing (the same
+  // action id recurs across lanes with different verdicts); pure + deterministic.
+  const sectionBehavior = joinSectionBehavior(input.lanes);
+
   return {
     generatedAtIso: input.generatedAtIso,
     proposals,
     fileHeat,
+    ...(sectionBehavior.length > 0 ? { sectionBehavior } : {}),
     modelStats: {
       residentTokensByLane, behaviorEvents, attributionWarnings, notAnalyzable,
       ...(analyzability.length ? { analyzability } : {}),

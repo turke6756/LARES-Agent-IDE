@@ -23,6 +23,7 @@
 // kind + sorted params), stable ordering (node order, then action order). No clocks.
 
 import type { AgentRoleLane, KnowledgeNode } from '../../shared/types';
+import { sectionKeyFor as sectionIdentityKeyFor } from '../../shared/section-identity';
 import {
   deriveAnchors,
   parseMarkdownSections,
@@ -335,11 +336,12 @@ function enclosingSection(sections: SectionCandidate[], line: number): SectionCa
 
 function normKey(p: string): string { return p.replace(/\\/g, '/'); }
 
-/** section_key format mirrors resident-inventory `sectionKeyFor`
- *  (`${targetType}:${targetKey}:${rawAnchor}`) so the compiler's key JOINs the
- *  ledger the reconciler wrote. */
+/** section_key format is the shared identity helper (WP5: moved verbatim into
+ *  `shared/section-identity.ts`, `${targetType}:${targetKey}:${rawAnchor}`) so
+ *  the compiler's key JOINs the ledger the reconciler wrote AND the
+ *  config-weight section it prices. */
 function sectionKeyFor(target: ResidentTarget, section: SectionCandidate): string {
-  return `${target.targetType}:${target.targetKey}:${section.rawAnchor}`;
+  return sectionIdentityKeyFor(target, section.rawAnchor);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
