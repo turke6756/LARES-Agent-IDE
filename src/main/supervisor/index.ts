@@ -143,6 +143,16 @@ export { toolsetsForLane, buildDashboardMcpConfigArg, laneUsesStrictMcp, redactM
 import { tmuxListSessions, tmuxSendInput, tmuxSendSubmit, tmuxReadStatusOptions, shQuote, getPassiveWslStatus, tmuxKillSession } from '../wsl-bridge';
 import { getWindowsSubmitSequence } from './send-input-encoders';
 import { HookSpoolTailer, resolveSpoolReadPath, canonicalSpoolKey } from './hook-spool-tailer';
+// Single source of truth for "where does this provider CLI live on Windows".
+// runtime-prerequisites.ts calls the very same functions, so what preflight
+// REPORTS and what launch DOES can never drift apart (plan §6.1).
+import {
+  getWindowsSystemPath,
+  findWindowsClaudePath,
+  findWindowsProviderBinary,
+  probeWindowsProvider,
+  missingProviderMessage,
+} from './provider-resolver';
 
 // ── Codex hook-trust seeding (B8; docs/HOOK_SYSTEM_DESIGN.md §8.5) ──────
 //
@@ -951,98 +961,10 @@ function encodePowerShell(script: string): string {
   return Buffer.from(script, 'utf16le').toString('base64');
 }
 
-function getWindowsSystemPath(...parts: string[]): string {
-  const systemRoot = process.env.SystemRoot || process.env.windir || 'C:\\Windows';
-  return path.win32.join(systemRoot, 'System32', ...parts);
-}
-
-function findWindowsClaudePath(_env: NodeJS.ProcessEnv): Promise<string> {
-  // Use known install path directly — avoids all PATH/shell resolution issues in Electron
-  const knownPath = path.join(process.env.USERPROFILE || 'C:\\Users\\turke', '.local', 'bin', 'claude.exe');
-  if (fs.existsSync(knownPath)) {
-    return Promise.resolve(knownPath);
-  }
-
-  // Fallback: try where.exe through cmd.exe
-  return new Promise<string>((resolve, reject) => {
-    execFile(getWindowsSystemPath('cmd.exe'), ['/c', 'where', 'claude'], {
-      encoding: 'utf-8',
-      timeout: 5000,
-      windowsHide: true,
-    }, (err, stdout, stderr) => {
-      if (err) {
-        reject(new Error(stderr?.trim() || err.message || 'Failed to locate claude'));
-        return;
-      }
-
-      const match = stdout
-        .split(/\r?\n/)
-        .map(line => line.trim())
-        .find(line => /claude(\.exe)?$/i.test(line));
-
-      if (!match) {
-        reject(new Error('Failed to locate claude'));
-        return;
-      }
-
-      resolve(match);
-    });
-  });
-}
-
-/** Absolute-path resolver for the codex / gemini CLIs on Windows.
- *
- *  Unlike claude (findWindowsClaudePath), codex and gemini have no known
- *  installer location, no existence preflight, and no clear error — so on a
- *  Windows machine they silently fail. Electron inherits the LOGIN-time PATH,
- *  NOT the user's shell PATH, so a `codex`/`gemini` shim that works in their
- *  terminal can be invisible to a bare `cmd.exe /c codex`. Search the common
- *  npm-global and per-user install locations directly, then fall back to
- *  `where.exe` (which resolves anything already on the login PATH). Returns an
- *  absolute path — including a `.cmd` shim, which `cmd.exe /c` runs fine — or
- *  null when the binary genuinely cannot be found. */
-function findWindowsProviderBinary(provider: 'codex' | 'gemini'): Promise<string | null> {
-  const home = process.env.USERPROFILE || 'C:\\Users\\turke';
-  const appData = process.env.APPDATA || path.join(home, 'AppData', 'Roaming');
-  const localAppData = process.env.LOCALAPPDATA || path.join(home, 'AppData', 'Local');
-  const npmDirs = [path.join(appData, 'npm'), path.join(localAppData, 'npm')];
-  const exts = ['.cmd', '.exe', '.ps1', ''];
-
-  const candidates: string[] = [];
-  for (const dir of npmDirs) {
-    for (const ext of exts) candidates.push(path.join(dir, `${provider}${ext}`));
-  }
-  candidates.push(path.join(localAppData, 'Programs', provider, `${provider}.exe`));
-  candidates.push(path.join(home, '.local', 'bin', `${provider}.exe`));
-  candidates.push(path.join(home, '.local', 'bin', provider));
-
-  for (const candidate of candidates) {
-    try {
-      if (fs.existsSync(candidate)) return Promise.resolve(candidate);
-    } catch {
-      /* ignore unreadable candidate and keep searching */
-    }
-  }
-
-  // Fallback: where.exe through cmd.exe resolves anything on the login PATH.
-  return new Promise<string | null>((resolve) => {
-    execFile(getWindowsSystemPath('cmd.exe'), ['/c', 'where', provider], {
-      encoding: 'utf-8',
-      timeout: 5000,
-      windowsHide: true,
-    }, (err, stdout) => {
-      if (err) {
-        resolve(null);
-        return;
-      }
-      const match = stdout
-        .split(/\r?\n/)
-        .map((line) => line.trim())
-        .find((line) => new RegExp(`${provider}(\\.(exe|cmd|ps1|bat))?$`, 'i').test(line));
-      resolve(match || null);
-    });
-  });
-}
+// getWindowsSystemPath / findWindowsClaudePath / findWindowsProviderBinary used
+// to live here. They moved to ./provider-resolver so the startup prerequisite
+// check can call the SAME code the launcher does — see that module's header for
+// why a second, PATH-based detector is a bug rather than a convenience.
 
 /** Fail-closed native surface used when `native/lares-native` can't even be
  *  required (should not happen — its index.js catches internally — but keeps the
@@ -3221,6 +3143,25 @@ export class AgentSupervisor extends EventEmitter {
         console.warn(`[Windows] Could not resolve claude.exe path, falling back to cmd.exe:`, err);
       }
     }
+
+    // §6.4 — claude's counterpart to the codex/gemini preflight below. When the
+    // resolver finds nothing, the cmd.exe fallback above cannot work either:
+    // findWindowsClaudePath's own fallback IS `where claude`, so a failure here
+    // means the same PATH lookup cmd.exe would do has already come up empty.
+    // Without this the user gets a terminal that prints "'claude' is not
+    // recognized" and dies — the exact silent failure this phase exists to end.
+    // Narrow on purpose: only when the launch command really is bare `claude`,
+    // so a custom template command is never second-guessed.
+    if (agent.provider === 'claude' && /^\s*claude(\.exe|\.cmd)?(\s|$)/i.test(cmd)) {
+      if (launchCmd === cmd && !(await probeWindowsProvider('claude'))) {
+        const message = missingProviderMessage('claude');
+        console.error('[Windows] claude binary not found on this machine.');
+        this.windowsRunners.delete(agent.id);
+        updateAgentStatus(agent.id, 'crashed');
+        addEvent(agent.id, 'crashed', JSON.stringify({ error: message }));
+        throw new Error(message);
+      }
+    }
     const useDirectSpawn = needsDirectSpawn && launchCmd !== cmd;
 
     // Codex/Gemini have no known-install resolver like claude's, and go through
@@ -3237,8 +3178,10 @@ export class AgentSupervisor extends EventEmitter {
         launchCmd = resolvedBinary;
         console.log(`[Windows] Resolved ${agent.provider} binary: ${resolvedBinary}`);
       } else {
-        const message = `${agent.provider} binary not found on this machine — install it or add it to PATH.`;
-        console.error(`[Windows] ${message}`);
+        // §6.4: this string reaches the renderer (AgentLaunchDialog renders it
+        // inline), so it must be user-language, not a diagnostic.
+        const message = missingProviderMessage(agent.provider);
+        console.error(`[Windows] ${agent.provider} binary not found on this machine.`);
         this.windowsRunners.delete(agent.id);
         updateAgentStatus(agent.id, 'crashed');
         addEvent(agent.id, 'crashed', JSON.stringify({ error: message }));

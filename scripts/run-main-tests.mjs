@@ -69,6 +69,9 @@ const TESTS = [
   'dist/main/main/path-utils-to-agent.test.js',
   'dist/main/main/supervisor/mcp-config-builder.test.js',
   'dist/main/main/supervisor/scaffold-version-migration.test.js',
+  // Lares rebrand — one-time .dashboard → .lares state-dir migration.
+  'dist/main/main/workspace-state-dir.test.js',
+  'dist/main/main/supervisor/supervisor-persona-capability-parity.test.js',
   'dist/main/main/supervisor/provider-dir-trust.test.js',
   'dist/main/main/supervisor/handoff-handshake.test.js',
   'dist/main/main/supervisor/hook-status-detection.test.js',

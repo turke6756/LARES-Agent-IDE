@@ -3502,3 +3502,88 @@ fetches the markdown-editor comments a user attached to a document.
   route to the **researcher** lane rather than digging yourself (surface it to
   the supervisor if you can't launch agents).
 `;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Prerequisite install hints (packaging plan §6.3)
+//
+// Lares cannot bundle the agent CLIs — they are separate programs it drives —
+// so a fresh install has to TELL the user what to get and how. Two rules shape
+// this constant:
+//
+//   1. The documentation link is the PRIMARY affordance. It is maintained by
+//      the provider and does not rot.
+//   2. Exactly ONE copyable command per provider, and it carries the date it
+//      was checked. The UI renders that date verbatim ("verified <date> — see
+//      the official docs if this fails") so we are honest about staleness
+//      instead of silently shipping a command that stopped working.
+//
+// When you update a command, update its `verifiedOn` in the same edit.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** The date every `installCommand` below was last checked against the
+ *  provider's official documentation. Bump when you re-verify. */
+export const PROVIDER_INSTALL_HINTS_VERIFIED_ON = '2026-07-20';
+
+export interface ProviderInstallHint {
+  /** Human name as the provider brands it. */
+  label: string;
+  /** Official install/setup documentation — the primary affordance. */
+  docsUrl: string;
+  /** One copyable command. Windows-first, since Lares 0.2.0 is Windows-only. */
+  installCommand: string;
+  /** Shell the command is written for, shown as a hint next to it. */
+  installShell: 'PowerShell' | 'PowerShell or CMD';
+  /** Optional second route for users who already have npm. */
+  altCommand?: string;
+  verifiedOn: string;
+}
+
+export const PROVIDER_INSTALL_HINTS: Record<'claude' | 'codex' | 'gemini', ProviderInstallHint> = {
+  // The PowerShell installer is listed first deliberately: it installs to
+  // %USERPROFILE%\.local\bin\claude.exe, which is exactly the first location
+  // supervisor/provider-resolver.ts looks in. Following this command produces a
+  // claude that Lares is guaranteed to find.
+  claude: {
+    label: 'Claude Code',
+    docsUrl: 'https://code.claude.com/docs/en/setup',
+    installCommand: 'irm https://claude.ai/install.ps1 | iex',
+    installShell: 'PowerShell',
+    altCommand: 'npm install -g @anthropic-ai/claude-code',
+    verifiedOn: PROVIDER_INSTALL_HINTS_VERIFIED_ON,
+  },
+  codex: {
+    label: 'Codex CLI',
+    docsUrl: 'https://github.com/openai/codex',
+    installCommand: 'npm install -g @openai/codex',
+    installShell: 'PowerShell or CMD',
+    verifiedOn: PROVIDER_INSTALL_HINTS_VERIFIED_ON,
+  },
+  gemini: {
+    label: 'Gemini CLI',
+    docsUrl: 'https://github.com/google-gemini/gemini-cli',
+    installCommand: 'npm install -g @google/gemini-cli',
+    installShell: 'PowerShell or CMD',
+    verifiedOn: PROVIDER_INSTALL_HINTS_VERIFIED_ON,
+  },
+};
+
+/** Optional / feature-gated tooling. Deliberately SEPARATE from the provider
+ *  map above so no UI can accidentally render Git next to "required to launch
+ *  agents" — plan §6.1 is explicit that Git is feature-dependent, not core. */
+export const OPTIONAL_TOOL_HINTS: Record<'git' | 'python' | 'node' | 'wsl' | 'tmux', {
+  label: string;
+  docsUrl: string;
+  installCommand?: string;
+}> = {
+  git: { label: 'Git', docsUrl: 'https://git-scm.com/downloads/win', installCommand: 'winget install --id Git.Git -e' },
+  python: { label: 'Python', docsUrl: 'https://www.python.org/downloads/windows/', installCommand: 'winget install --id Python.Python.3.12 -e' },
+  node: { label: 'Node.js', docsUrl: 'https://nodejs.org/en/download', installCommand: 'winget install --id OpenJS.NodeJS.LTS -e' },
+  wsl: { label: 'WSL', docsUrl: 'https://learn.microsoft.com/windows/wsl/install', installCommand: 'wsl --install' },
+  tmux: { label: 'tmux (inside WSL)', docsUrl: 'https://github.com/tmux/tmux/wiki', installCommand: 'sudo apt install tmux' },
+};
+
+/** Where "Help ▸ Check for updates" sends the user. Deliberately the
+ *  `/releases/latest` alias, never a version-pinned URL — the latter goes stale
+ *  the moment 0.2.1 ships. There is no background update check in 0.2.0 (plan
+ *  §1): this opens only on an explicit user click. */
+export const LARES_RELEASES_URL = 'https://github.com/turke6756/AgentDashboard/releases/latest';

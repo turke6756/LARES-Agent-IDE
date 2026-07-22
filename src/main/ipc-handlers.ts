@@ -3,7 +3,7 @@ import type { WebContents } from 'electron';
 import * as fs from 'fs';
 import * as path from 'path';
 import { persistTheme } from './theme-persistence';
-import type { PathType, WslStatus, FsEvent, DetachRequest, DetachResult, ViewDetachRequest, ScanOverheadRequest, ScanOverheadResult, ExtractKnowledgeRequest, ExtractKnowledgeResult, SkillUsageQuery, SkillUsageQueryResult, McpToolUsageQuery, McpToolUsageQueryResult, PriorSessionChat, ContextOptimizerQuery, ContextOptimizerQueryResult, MarkOptimizerActionAppliedRequest, MarkOptimizerActionAppliedResult, SignOptimizerDerivationRequest, SignOptimizerDerivationResult } from '../shared/types';
+import type { ContinuationPhaseSignal, PathType, WslStatus, HealthCheck, RuntimePrerequisiteReport, FsEvent, DetachRequest, DetachResult, ViewDetachRequest, ScanOverheadRequest, ScanOverheadResult, ExtractKnowledgeRequest, ExtractKnowledgeResult, SkillUsageQuery, SkillUsageQueryResult, McpToolUsageQuery, McpToolUsageQueryResult, PriorSessionChat, ContextOptimizerQuery, ContextOptimizerQueryResult, MarkOptimizerActionAppliedRequest, MarkOptimizerActionAppliedResult, SignOptimizerDerivationRequest, SignOptimizerDerivationResult } from '../shared/types';
 import { TAB_CHANNELS, VIEW_CHANNELS } from '../shared/types';
 import { createDetachedWindow, createDetachedViewWindow, broadcastToDetachedViews, canWrite, handleDetachedCloseReply, type DetachedWindowDeps } from './detached-windows';
 import { handleFlushReply } from './close-flush';
@@ -25,8 +25,7 @@ import { sendSelectionComments } from './selection-comments-send';
 import { assertPlanRailFree } from './orchestration/plan-ownership';
 import { getApiToken } from './security/api-auth';
 import { openInVSCode, openFileInVSCode, openFileInWorkspace } from './vscode-launcher';
-import { getPassiveWslStatus, isTmuxAvailable, isClaudeAvailableInWsl } from './wsl-bridge';
-import { execFileSync } from 'child_process';
+import { detectRuntimePrerequisites, toHealthCheck } from './runtime-prerequisites';
 import { detectPathType, ensureWindowsPath, toAgentPath } from './path-utils';
 import { saveImage, pruneImages } from './pasted-image-store';
 import { readFileContents, listDirectoryEntriesAsync } from './file-reader';
@@ -472,34 +471,44 @@ export function registerIpcHandlers(
     return result.filePaths[0] || null;
   });
 
-  ipcMain.handle('system:health-check', async () => {
-    // Only probe WSL if the user actually has a wsl-typed workspace. On a
-    // Windows-only machine `wsl.exe` can trigger Windows' "install WSL" flow,
-    // and this handler fires on startup and on every workspace select / Sidebar
-    // / DirectoryTree mount — so an unconditional probe means repeated popups.
-    const hasWslWorkspace = getWorkspaces().some((w) => w.pathType === 'wsl');
-    const wslStatus: WslStatus = hasWslWorkspace
-      ? await getPassiveWslStatus()
-      : { state: 'unavailable', distros: [] };
-    let claudeWindowsAvailable = false;
+  // Only probe WSL if the user actually has a wsl-typed workspace. On a
+  // Windows-only machine `wsl.exe` can trigger Windows' "install WSL" flow,
+  // and these handlers fire on startup and on every workspace select / Sidebar
+  // / DirectoryTree mount — so an unconditional probe means repeated popups.
+  const hasWslWorkspace = () => getWorkspaces().some((w) => w.pathType === 'wsl');
+
+  // The startup health check is now a PROJECTION of the full prerequisite
+  // report, not a second detector. It used to run its own
+  // `execFileSync('claude', ['--version'])` — a bare PATH lookup that Electron's
+  // login-time PATH makes unreliable, and which could therefore disagree with
+  // the launcher about whether claude exists. One detector, two renderings.
+  ipcMain.handle('system:health-check', async (): Promise<HealthCheck> => {
+    const report = await detectRuntimePrerequisites({ hasWslWorkspace: hasWslWorkspace() });
+    return toHealthCheck(report);
+  });
+
+  // The full report, for the first-run dialog / status card / Help ▸ Check
+  // prerequisites. `force` is the Recheck button: it bypasses the TTL cache so
+  // a user who just installed a CLI sees the change immediately.
+  ipcMain.handle(
+    'system:get-runtime-prerequisites',
+    async (_e, force?: boolean): Promise<RuntimePrerequisiteReport> =>
+      detectRuntimePrerequisites({ hasWslWorkspace: hasWslWorkspace(), force: Boolean(force) }),
+  );
+
+  // Opening an external URL from the renderer. Deliberately ALLOWLISTED to
+  // https, because the renderer runs with webSecurity:false and an unrestricted
+  // shell.openExternal is a launch-anything primitive. This exists for the
+  // prerequisite doc links and Help ▸ Check for updates, nothing else.
+  ipcMain.handle('system:open-external', async (_e, url: string): Promise<boolean> => {
     try {
-      const env = { ...process.env };
-      delete env.CLAUDECODE;
-      execFileSync('claude', ['--version'], { encoding: 'utf-8', timeout: 5000, env });
-      claudeWindowsAvailable = true;
+      const parsed = new URL(String(url));
+      if (parsed.protocol !== 'https:') return false;
+      await shell.openExternal(parsed.toString());
+      return true;
     } catch {
-      // not available
+      return false;
     }
-
-    const wslAvailable = wslStatus.state === 'running';
-    const [tmuxAvailable, claudeWslAvailable] = wslAvailable
-      ? await Promise.all([
-        isTmuxAvailable(),
-        isClaudeAvailableInWsl(),
-      ])
-      : [false, false];
-
-    return { wslAvailable, tmuxAvailable, claudeWindowsAvailable, claudeWslAvailable, wslStatus };
   });
 
   // Notebook (Jupyter) handlers

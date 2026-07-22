@@ -638,12 +638,86 @@ export interface WslStatus {
   error?: string;
 }
 
+/** How badly a missing prerequisite hurts. The tiers are a promise to the user
+ *  as much as a data field — the first-run UI groups by them, so getting one
+ *  wrong is how "you're missing Git" turns into "this app is broken".
+ *
+ *  - `agent-cli`     at least ONE of claude/codex/gemini is needed to launch
+ *                    agents. Never all three; no surface may imply otherwise.
+ *  - `wsl-feature`   only matters for WSL-backed workspaces / persistent
+ *                    WSL terminals.
+ *  - `optional`      feature-dependent. Git, Python and an external Node all
+ *                    live here: Lares opens ordinary directories fine without
+ *                    them, and Phase 3 means Lares's own helpers no longer
+ *                    need a system Node at all. */
+export type PrerequisiteTier = 'agent-cli' | 'wsl-feature' | 'optional';
+
+export type PrerequisiteStatus =
+  /** Found, and at the path a launch would actually use. */
+  | 'available'
+  /** Looked for it properly and it isn't there. */
+  | 'missing'
+  /** Present but not running (WSL specifically). */
+  | 'stopped'
+  /** Deliberately not probed — e.g. WSL internals with no WSL workspace.
+   *  Distinct from `missing`: we do NOT know, and must not claim to. */
+  | 'not-checked';
+
+export interface PrerequisiteCheck {
+  id: string;
+  label: string;
+  status: PrerequisiteStatus;
+  tier: PrerequisiteTier;
+  /** Absolute path the launcher resolved, when we have one. */
+  path?: string;
+  version?: string;
+  /** What does NOT work while this is missing. Plain language, user-facing. */
+  impact: string;
+  /** What to do about it. Plain language, user-facing. */
+  remediation: string;
+  docsUrl?: string;
+  installCommand?: string;
+  installShell?: string;
+  altCommand?: string;
+  /** Date `installCommand` was last checked; rendered so staleness is visible. */
+  verifiedOn?: string;
+  /** Diagnostic detail (a timeout, a probe error). Never the whole story. */
+  detail?: string;
+}
+
+export interface RuntimePrerequisiteReport {
+  appVersion: string;
+  checkedAt: number;
+  /** claude / codex / gemini, always all three, always independent entries. */
+  providers: PrerequisiteCheck[];
+  /** True when AT LEAST ONE provider resolved. The single flag the UI should
+   *  branch on for "can this user launch an agent at all". */
+  anyProviderAvailable: boolean;
+  /** Feature-dependent tools. Never gates startup. */
+  optional: PrerequisiteCheck[];
+  /** WSL and everything inside it. Entries are `not-checked` unless the user
+   *  actually has a WSL workspace — probing WSL on a Windows-only machine can
+   *  raise Windows' "install WSL" dialog (regression guard for 8eaa103). */
+  wsl: PrerequisiteCheck[];
+  /** Whether the WSL group was probed at all. */
+  wslChecked: boolean;
+  wslStatus: WslStatus;
+}
+
+/** The original startup health shape, kept because the Sidebar ticker and the
+ *  store both read it. It is now DERIVED from the same detector that produces
+ *  RuntimePrerequisiteReport (see main/runtime-prerequisites.ts) rather than
+ *  doing its own PATH lookup, so the ticker and the first-run dialog cannot
+ *  contradict each other. */
 export interface HealthCheck {
   wslAvailable: boolean;
   tmuxAvailable: boolean;
   claudeWindowsAvailable: boolean;
   claudeWslAvailable: boolean;
   wslStatus: WslStatus;
+  /** The full report the legacy booleans were derived from. Optional so old
+   *  consumers and tests constructing a bare HealthCheck still compile. */
+  prerequisites?: RuntimePrerequisiteReport;
 }
 
 export interface DirectoryEntry {
@@ -1501,6 +1575,8 @@ export interface IpcApi {
   system: {
     pickDirectory: (startInWsl?: boolean) => Promise<string | null>;
     healthCheck: () => Promise<HealthCheck>;
+    getRuntimePrerequisites: (force?: boolean) => Promise<RuntimePrerequisiteReport>;
+    openExternal: (url: string) => Promise<boolean>;
     openFile: (filePath: string, pathType: PathType) => Promise<void>;
     openFileInWorkspace: (filePath: string, workspaceDir: string, pathType: PathType) => Promise<void>;
     setTheme: (theme: 'dark' | 'light') => Promise<void>;
