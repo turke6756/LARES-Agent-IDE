@@ -48,7 +48,7 @@ Requirements at a glance:
 - **Match the surrounding style.** Follow the conventions already in the files
   you edit rather than introducing new patterns.
 - **Don't commit secrets or machine-specific state.** `.env`, `.mcp.json`,
-  `*.db`, and per-workspace runtime state under `.dashboard/` are git-ignored —
+  `*.db`, and per-workspace runtime state under `.lares/` (legacy `.dashboard/`) are git-ignored —
   keep it that way.
 
 ## Commit and review

@@ -1,18 +1,12 @@
 <p align="center">
-  <img src="assets/brand/agent-workspace-icon-animated.svg" alt="Lares icon — an animated agent workspace mark" width="150" />
+  <img src="assets/brand/lares-lockup-animated.svg" alt="Lares — an animated agent workspace mark beside the Lares wordmark" width="640" />
 </p>
-
-<p align="center">
-  <img src="assets/brand/lares-lockup.svg" alt="Lares" width="360" />
-</p>
-
-<h1 align="center">Lares</h1>
 
 <p align="center"><strong>Watch, direct, and collaborate with teams of AI agents — in one workspace.</strong></p>
 
 <p align="center">An agent-native workspace for orchestrating AI agents across terminals, files, browsers, documents, and notebooks.</p>
 
-<p align="center"><strong>Built on terminal-agent harnesses, not provider SDKs</strong> — drop in Claude Code, Codex,<br />or any agent that speaks MCP and hooks, and put them on the same problem together.</p>
+<p align="center"><strong>A harness for agent harnesses.</strong> Lares wraps Claude Code, Codex, and other<br />compatible terminal agents in a visible system for supervision, communication,<br />and scripted cross-provider deliberation.</p>
 
 <p align="center">
   <img src="docs/images/hero.png" width="900"
@@ -39,12 +33,23 @@
 
 ## What & why
 
-**Lares is built on terminal-agent harnesses, not provider SDKs.** Agents run as
-real CLIs in real terminals, so any harness that speaks MCP and can fire hooks
-drops straight in — no vendor SDK, no integration to wait on, no lock-in. That
-neutrality is the point: it's what lets Claude Code and Codex work the same
-problem and converge on a shared answer, which has turned out to be the most
-powerful thing the app does.
+**Start with what an agent actually is:** a large language model inside a
+lab-built harness — Claude Code, Codex — that gives it the tools to work through
+a terminal or client interface. Model + harness, together, is the agent. Lares
+does not decompose that unit into API calls; it takes the whole agent, terminal
+and all, as its primitive, and wraps it in a second harness. Through the
+dashboard's MCP server, authorized agents — above all the supervisor — get tools
+their own harness doesn't give them: tools to launch other agents, message
+them, read their chats and files-touched, and coordinate their work. **Lares is
+a harness for agent harnesses.**
+
+That outer harness needs no provider SDK: it is designed around MCP, lifecycle
+hooks, and observable terminal sessions, so the architecture is provider-neutral
+by construction. Claude Code and Codex are the tested surface today; broader
+harness support is a roadmap item, not a current guarantee. The neutrality isn't
+incidental — it's what lets Claude Code and Codex work the same problem and
+check each other's answers, which has turned out to be the most powerful thing
+the app does.
 
 It exists because of three frustrations:
 
@@ -54,17 +59,25 @@ It exists because of three frustrations:
   glance.
 - **I wanted Claude Code and Codex to talk to each other.** I liked working with
   both, and there was no way to put them on the same problem together.
-- **Agents stalled.** They asked too many questions and paused too often, and
-  more often than not they already knew the right next step and simply didn't
-  take it. So Lares has a supervisor whose job is to orchestrate agents and keep
-  them working — one that knows what's left in an agent's context window and
-  where you are against your usage limits.
+- **Agents stalled, and long projects outgrew individual context windows.**
+  Every agent works inside a finite context window, so no single session can
+  carry a large project end to end — and agents also paused on questions they
+  could answer themselves. Lares addresses both at the system level: a
+  supervisor keeps work moving, divides goals into bounded assignments sized to
+  a worker's context budget, watches each worker's remaining context, and hands
+  work to fresh sessions when necessary — so the durable project state lives
+  increasingly in plans, artifacts, and explicit handoffs rather than only in
+  one agent's transcript.
 
 The thesis is visibility-first: agents are never headless and never a black box.
 Agents can still spawn their own native task subagents, and those stay internal
 to the harness — what's different is the top level. The supervisor launches and
 monitors **full agent harnesses from more than one provider**, reads their chat
-logs, and messages them directly. You watch each agent's live status and context
+logs, and messages them directly.
+The moment you run more than one agent, terminals aren't enough — you need a
+system that organizes them, keeps track of who's who, lets them talk to each
+other, and coordinates them into repeatable interactions. That system is Lares.
+You watch each agent's live status and context
 budget, attach to its chat, inspect the tool calls it makes and the files it
 reads versus writes, and step in at any point.
 
@@ -84,10 +97,11 @@ an afterthought.
   calls, see files-read-vs-written, and leave inline comments on what it touched.
 - **Orchestrate** — Real terminals (node-pty + xterm, with a WSL/tmux bridge)
   host the agents. A supervisor dispatches worker and researcher waves, and
-  two providers can run a cross-provider **groupthink** deliberation
-  (Claude ↔ Codex) — in *parallel* (each solves independently, then they
-  reconcile) or *serial* (one proposes, the other pokes holes) — converging on a
-  shared answer.
+  orchestrations run as **scripted primitives**: deterministic scripts that use
+  the same MCP tools a supervisor would, so a deliberation happens the same way
+  every time. The flagship is cross-provider **groupthink** (Claude ↔ Codex) —
+  *parallel* (each solves independently, then they reconcile) or *serial* (one
+  proposes, the other pokes holes) — converging on a shared answer.
 - **Plan** — An HTML planning surface captures structured plans with a
   server-witnessed provenance trail of which agent actually read and edited each
   section.
@@ -98,7 +112,8 @@ an afterthought.
 - **Documents & notebooks** — Jupyter notebooks run with live outputs; Markdown
   documents (Milkdown/Crepe) carry agent-visible comments, and Word, PDF, and
   figure/GIS formats (GeoTIFF, Leaflet, KaTeX) render inline.
-- **Context & usage intelligence** — Lares is context-aware. A supervisor nearing
+- **Context & usage intelligence** — Context is the scarce resource in
+  multi-agent work, and Lares treats it that way. A supervisor nearing
   its context window hands off automatically: it writes a continuation note and
   relaunches into a fresh session with its work intact. Supervisors are notified
   when a worker's context runs hot, and can see where you stand against your
@@ -184,26 +199,53 @@ examples:
 - [notebook-cleanup](examples/notebook-cleanup/) — repair and validate a notebook.
 - [code-review](examples/code-review/) — a multi-agent review pass.
 
-Cross-provider groupthink also ships as a real orchestration script.
-[`scripts/groupthink-v1.js`](scripts/groupthink-v1.js) drives an entire two-agent
-deliberation through the dashboard's local HTTP API — launching the lead and the
-reviewer, relaying messages between them with framing prose, gating each turn on
-the other agent being ready, and polling the run to completion. It drives a
-running Lares instance rather than working standalone, and it doubles as a
-reference for writing your own orchestration scripts. The same loop now also runs
-in-process behind the `run_orchestration` MCP tool, which is the path new work
-should take.
+## Cross-provider deliberation
+
+Different models have different strengths, blind spots, and failure modes. Put
+two of them — in their own lab-built harnesses, each with its own terminal and
+its own tool calls on the same workspace — into an adversarial review or a
+collaboration, and they catch what the other missed. Convergence between
+independent models is stronger evidence than agreement produced after one model
+has already seen the other's answer; divergence tells you exactly where to
+look. This is one of the most powerful things Lares does, and it is **not an
+ad-hoc trick you re-prompt into existence each time — it's a scripted,
+repeatable primitive.**
+
+The script is the point. A **groupthink** run is driven by an orchestration
+script that uses the app's own MCP tools — the same tools a supervisor would
+use — to launch both agents, set the stage, relay each message to the other
+side, count turns, and gate the run until a final artifact exists. The
+supervisor supplies judgment (when to convene one, whom to include, how to
+frame the question); the script guarantees the shape. It happens the same way
+every time. That scripting layer is, concretely, what "a harness for the
+harnesses" means.
+
+It runs in two modes:
+
+- **Parallel** — both agents solve independently, preserving genuine
+  independent judgment, then reconcile. Best for settling the *shape* of a
+  solution.
+- **Serial** — one proposes, the other pokes holes. Best when a proposal needs
+  pushback from a different provider.
 
 A powerful sequence is to brief the supervisor on what you want, have it run a
 *parallel* groupthink to settle the solution's shape, then a *serial* one to
-harden it against holes — so that by the time you implement, most surprises have
-already been argued out. See [docs/workflows.md](docs/workflows.md) for the
-deliberation patterns in full.
+harden it against holes — so that by the time you implement, most surprises
+have already been argued out.
+
+[`scripts/groupthink-v1.js`](scripts/groupthink-v1.js) is the reference script:
+it drives an entire two-agent deliberation through the dashboard's local HTTP
+API — launching the lead and the reviewer, relaying messages with framing
+prose, gating each turn on the other agent being ready, and polling the run to
+completion — and doubles as a template for writing your own orchestration
+primitives. The same loop also runs in-process behind the `run_orchestration`
+MCP tool, which is the path new work should take. See
+[docs/workflows.md](docs/workflows.md) for the deliberation patterns in full.
 
 ## Providers
 
-As above: no provider SDK, no lock-in. Lares only needs what a terminal-agent
-harness already exposes, which comes down to two things:
+The outer harness only needs what a terminal-agent harness already exposes — no
+provider SDK, no lock-in. That comes down to two things:
 
 - **MCP** — how agents reach the workspace. The dashboard's tools (launch and
   message agents, read chats, read plans, drive the browser, query context and
@@ -213,14 +255,15 @@ harness already exposes, which comes down to two things:
   status back to the dashboard. Hooks are what make an agent's state visible
   rather than guessed at.
 
-A harness with both drops in and works. Claude Code is the reference we develop
-and test against, and Codex is wired in for cross-provider groupthink; those two
-are the tested surface today.
+A harness with both fits the architecture. Claude Code is the reference we
+develop and test against, and Codex is wired in for cross-provider groupthink;
+those two are the tested surface today. Broader harness support is a roadmap
+item, not a current compatibility guarantee.
 
 | Provider | Status |
 |---|---|
 | **Claude Code** | Primary, tested. |
-| **Codex** | Used for cross-provider groupthink. |
+| **Codex** | Wired and tested as the second provider in cross-provider groupthink. |
 | **Core** | Provider-neutral by design; any MCP + hooks harness should work. Additional harnesses welcome. |
 
 <p align="center">

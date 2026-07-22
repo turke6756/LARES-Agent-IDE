@@ -49,7 +49,7 @@ Architecture overview: [docs/architecture.md](docs/architecture.md).
 ## Conventions that will bite you
 
 - **Agents share a working directory by design.** Every supervisor lives in
-  `.dashboard/supervisor/` and every Claude worker in `.dashboard/workers/claude/`,
+  `.lares/supervisor/` and every Claude worker in `.lares/workers/claude/`,
   and the project slug is derived purely from the working directory — so it is
   **not unique per agent.** Any code mapping a session log back to an agent must
   disambiguate with a per-agent signal, never "one agent per directory."

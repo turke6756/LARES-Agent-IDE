@@ -6,10 +6,12 @@ they fit. For *why* the app is shaped this way, read [Vision](./vision.md).
 
 ## The shape in one paragraph
 
-Lares is an **Electron + React desktop app** that launches agentic-CLI agents
-(Claude Code today; other terminal agents by design) into a workspace, watches
-their session logs in real time, and exposes a **dashboard MCP server** so a
-designated *supervisor agent* can coordinate the others. It runs on Windows and
+Lares is an **Electron + React desktop app** that launches agentic-CLI agents —
+a model inside its lab-built harness (Claude Code today; other terminal agents
+by design) — into a workspace, watches their session logs in real time, and
+exposes a **dashboard MCP server** that acts as a harness around those
+harnesses: it gives authorized agents the tools to launch and message each
+other, and lets a designated *supervisor agent* coordinate the others. It runs on Windows and
 supports both Windows-native and WSL workspaces transparently. Around that agent
 core sit a file browser with native renderers, a live Jupyter kernel, a real
 embedded web browser with an access-policy layer, a planning surface, a
@@ -27,6 +29,12 @@ Lares runs as a small set of cooperating processes:
 | **Preload** bridge | `src/preload/` | `contextBridge` — the typed `window.api` IPC surface |
 | **Jupyter server** (child) | `src/main/jupyter-server.ts` | Notebook kernel host, driven over MCP |
 
+There are two nested control layers here. The provider harness controls the
+model's own reasoning-and-tool loop inside one terminal session; Lares controls
+the relationships *among* sessions — launching, identity, role, status,
+communication, hierarchy, shared artifacts, context-aware handoff, and scripted
+deliberation. The outer layer needs no provider model SDK.
+
 Inside the main process, a local **HTTP API server** (`src/main/api-server.ts`)
 is the hub: the MCP scripts in `scripts/mcp-*.js` are thin proxies that translate
 MCP tool calls into HTTP requests against it. Because of that indirection, the
@@ -40,15 +48,25 @@ truth. The load-bearing ones:
 
 - **Workspace** — a directory, tagged as a Windows path or a WSL path. The unit of
   "what am I working on."
-- **Agent** — one launched CLI process tied to a workspace, with a status machine
+- **Agent** — one model-plus-harness session, launched as a CLI process and tied
+  to a workspace, with a status machine
   (`launching → working → idle → waiting → done | crashed`), its session-log path,
   and supervisor/supervised flags.
 - **Persona** — a role: supervisor, worker, or researcher. Each pairs a tool grant
   with a behavioral spec.
-- **ContextStats** — per-agent token usage and context-window percentage, derived
-  from the session log.
+- **ContextStats** — per-agent token usage and context-window percentage,
+  derived from the session log. Context is treated as a delegation constraint,
+  not merely a UI metric.
 
 ## The supervisor (`src/main/supervisor/`)
+
+The supervisor is the outer harness's policy-bearing agent. It keeps the
+higher-level goal and plan in view, assigns bounded work to workers and
+researchers, receives their events and results, and decides whether to continue
+a session, launch another wave, request cross-provider review, or hand work to
+a fresh context window. The hierarchy exists to divide both labor and context:
+each worker concentrates on a slice that fits its window while the supervisor
+maintains continuity across the project.
 
 The supervisor subsystem is the orchestration core. Its responsibilities are
 split across siblings in that directory:
@@ -62,22 +80,29 @@ split across siblings in that directory:
   session transcript (e.g. Claude Code's per-session JSONL), parse it into typed
   events, and push them to the renderer's chat pane. This is how you can attach to
   any agent and read its reasoning, tool calls, and results.
-- **context-stats-monitor** — aggregates token usage and raises supervisor
-  notifications as agents approach context-window limits.
+- **context-stats-monitor** — treats each agent's context window as a finite
+  orchestration resource: aggregates token usage, and raises supervisor
+  notifications as agents approach context-window limits so continuation,
+  replacement, and handoff decisions can be made.
 - **file-activity tracking** — records each agent's read/write/create operations
   so the UI can show files-read-versus-written and a heat map.
 - **worker/role scaffolding** — writes the per-persona scaffold (supervisor,
   worker, researcher) that lets a supervisor delegate waves of work.
 
 > **Architectural invariant — agents share a working directory.** Every
-> supervisor in a workspace runs from `.dashboard/supervisor/`, and every Claude
-> worker from `.dashboard/workers/claude/`. The project slug that maps a session
+> supervisor in a workspace runs from `.lares/supervisor/`, and every Claude
+> worker from `.lares/workers/claude/` (formerly `.dashboard/`; migrated in
+> place on first touch). The project slug that maps a session
 > log back to an agent is derived purely from the working directory, so it is
 > **not** unique per agent. Any code that maps a session file back to an agent must
 > disambiguate with a per-agent signal, never "one agent per directory." This is
 > intentional and load-bearing; see the root `CLAUDE.md`.
 
 ## The MCP surface (`scripts/mcp-*.js`)
+
+The MCP surface is where "a harness for agent harnesses" is implemented: a
+provider's harness gives its model tools to act on the workspace; this server
+gives whole agents tools to act on each other.
 
 The MCP server is the primary interface for an agent working inside Lares. Agents
 are injected with a scoped toolset: a **supervisor** gets the full orchestration
@@ -89,11 +114,17 @@ proxies.
 
 ## Orchestration & groupthink (`src/main/orchestration/`)
 
-Beyond one-to-one supervision, Lares can run **groupthink**: a structured,
-multi-round deliberation between agents — including *across providers* (Claude and
-a second harness) — where a script guarantees turn order and aggregation while the
-agents supply the judgment. The protocol is mechanism; deciding to convene one is
-policy. See [Workflows](./workflows.md) for how this is used in practice.
+Beyond one-to-one supervision, Lares runs orchestrations as **scripted
+primitives**: deterministic scripts that use the app's own MCP tools — the same
+tools a supervisor would use — to launch agents, inject prompts, relay
+messages, count turns, and gate completion on a final artifact. The flagship is
+**groupthink**: a structured, multi-round deliberation between agents *across
+providers* (Claude and a second harness), in *parallel* mode (independent
+solutions, preserving genuine independent judgment, then reconciliation) or
+*serial* mode (proposal, then pushback). The script guarantees turn order and
+aggregation; the agents supply the judgment. The protocol is mechanism;
+deciding to convene one is policy. See [Workflows](./workflows.md) for how this
+is used in practice.
 
 ## Planning surface (`src/main/plans/`)
 
@@ -128,7 +159,9 @@ browser. These boundaries are real but partial — read [Security](./security.md
 
 ## Context & usage intelligence
 
-A family of telemetry subsystems make agent behavior legible over time:
+Context is the scarce resource the hierarchy exists to divide, so Lares
+instruments it. A family of telemetry subsystems make agent behavior — and
+context spend — legible over time:
 
 - `src/main/context-overhead/` — measures what is consuming each agent's context
   window (system prompt, tool schemas, memory files).

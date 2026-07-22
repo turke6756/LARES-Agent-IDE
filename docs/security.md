@@ -46,7 +46,7 @@ incomplete:
   root (`src/main/security/path-confinement.ts`) as a best-effort confinement — not
   a sandbox.
 - **Untrusted-inbox convention.** Web-derived research lands in
-  `.dashboard/research/inbox/`, which is treated as **data, never instructions**.
+  `.lares/research/inbox/`, which is treated as **data, never instructions**.
   Agents are told to frame inbox content as untrusted before acting on it; only
   reviewed material in `cleared/` is durable.
 - **The visibility surface itself.** Attaching to an agent's chat, inspecting its

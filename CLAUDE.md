@@ -49,8 +49,10 @@ For how these fit together, read [docs/architecture.md](docs/architecture.md).
 ## Architectural invariant: agents share a working directory
 
 Many agents run from the **same** working directory by design: every supervisor in
-a workspace lives in `.dashboard/supervisor/`, and every Claude worker in
-`.dashboard/workers/claude/`. The Claude project slug is derived **purely from the
+a workspace lives in `.lares/supervisor/`, and every Claude worker in
+`.lares/workers/claude/`. (Formerly `.dashboard/` — existing workspaces are
+renamed in place on first touch; see src/main/workspace-state-dir.ts.) The
+Claude project slug is derived **purely from the
 working directory**, so it is **not unique per agent** — many concurrent agents map
 to one slug.
 
