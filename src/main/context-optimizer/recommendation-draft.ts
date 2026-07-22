@@ -17,8 +17,11 @@
 //      but that stamp does NOT lift this bar; it is the key any future
 //      cross-surface join would have to match).
 //   3. `command_family` evidence may only support WORKSPACE-LEVEL candidates
-//      (`target.unresolved`) — attaching it to a specific file throws. Liftable only
-//      by WP9's `associatedCommandFamilies` join (generationId-gated, prospective).
+//      (`target.unresolved`) — attaching it to a specific file throws, UNLESS the
+//      caller supplies a WP9 `associatedCommandFamilies` join entry for that exact
+//      file, from the SAME analysis generation, meeting the WP9 minimum stream
+//      support. The generationId equality makes the lift PROSPECTIVE ONLY: a draft
+//      from an older generation can never retroactively gain the join.
 //   4. TARGET-SELECTION consumes WP2 `GuidanceSource.audienceProviders`: a file
 //      target only when the observing cohort's audience maps to exactly ONE
 //      applicable guidance source; ambiguous/unknown → `{ unresolved, reason }`.
@@ -36,6 +39,10 @@ import type {
 } from '../../shared/types';
 import { appliesToAgent } from '../context-overhead/guidance-sources';
 import type { CoverageChecks } from './file-coverage';
+import {
+  FILE_SEQUENCES_MIN_SUPPORT_STREAMS,
+  type AssociatedCommandFamilyV1,
+} from './behavior-sequences';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Errors + denylist
@@ -226,10 +233,42 @@ export interface BuildRecommendationDraftInput {
   /** The analysis-generation id every evidence entry must carry (the join key). */
   generationId: string;
   suggestedBulletText?: string;
+  /** WP9 — the ONLY thing that can lift the command_family file-target bar: the
+   *  `associatedCommandFamilies` join entries (behavior-sequences.ts) recorded
+   *  for THIS analysis generation. A file target with command_family evidence is
+   *  accepted iff ≥1 entry names exactly `target.file`, carries the draft's own
+   *  `generationId` (prospective only — an older draft's generation can never
+   *  match), and meets `FILE_SEQUENCES_MIN_SUPPORT_STREAMS`. */
+  associatedCommandFamilies?: AssociatedCommandFamilyV1[];
 }
 
 export function targetIsFile(t: RecommendationTarget): t is { file: string; section?: string } {
   return (t as { file?: unknown }).file !== undefined && !(t as { unresolved?: unknown }).unresolved;
+}
+
+/** Path equality for the WP9 lift: association paths are stored normalized
+ *  (LOWER, from behavior_events.arg_path); compare separator- and case-folded. */
+function sequencePathsEqual(a: string, b: string): boolean {
+  const norm = (p: string): string => p.replace(/\\/g, '/').toLowerCase();
+  return norm(a) === norm(b);
+}
+
+/**
+ * WP9 (milestone gate 5) — does a recorded `associatedCommandFamilies` join lift
+ * the command_family file-target bar for `file` under `generationId`? True iff
+ * ≥1 entry names exactly that file, carries EXACTLY that generation
+ * (generationId-gated → prospective only), and meets the WP9 minimum stream
+ * support. Anything less keeps the bar (fail-closed).
+ */
+export function associationLiftsCommandFamilyBar(
+  associations: AssociatedCommandFamilyV1[] | undefined,
+  file: string,
+  generationId: string,
+): boolean {
+  return (associations ?? []).some((a) =>
+    a.generationId === generationId
+    && a.streamsSupporting >= FILE_SEQUENCES_MIN_SUPPORT_STREAMS
+    && sequencePathsEqual(a.path, file));
 }
 
 export function buildRecommendationDraft(input: BuildRecommendationDraftInput): RecommendationDraft {
@@ -250,11 +289,17 @@ export function buildRecommendationDraft(input: BuildRecommendationDraftInput): 
     if (ev.rowIds.length === 0) {
       throw new RecommendationDraftError(`a '${ev.kind}' evidence entry cites no rows`);
     }
-    // (3) command_family evidence supports workspace-level candidates ONLY.
-    if (ev.kind === 'command_family' && targetIsFile(input.target)) {
+    // (3) command_family evidence supports workspace-level candidates ONLY —
+    // unless a WP9 associatedCommandFamilies join entry for exactly this file,
+    // this generation (prospective only), at ≥ min stream support, lifts the bar.
+    if (ev.kind === 'command_family' && targetIsFile(input.target)
+      && !associationLiftsCommandFamilyBar(
+        input.associatedCommandFamilies, input.target.file, input.generationId)) {
       throw new RecommendationDraftError(
         'command_family evidence may only support workspace-level candidates (target.unresolved) — '
-        + "a file target is liftable only by WP9's associatedCommandFamilies join");
+        + "a file target is liftable only by WP9's associatedCommandFamilies join "
+        + `(same generationId, streamsSupporting ≥ ${FILE_SEQUENCES_MIN_SUPPORT_STREAMS}, `
+        + 'path matching the target file)');
     }
   }
 
