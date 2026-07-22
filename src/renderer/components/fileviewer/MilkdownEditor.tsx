@@ -192,6 +192,10 @@ function MilkdownEditor({ tabId, filePath, content, registerFreshContentHandler 
   const baselineRef = useRef<SpliceBaseline | null>(null);
   /** Crepe's own serialization of the last loaded/saved state — the dirty baseline. */
   const loadSerializedRef = useRef('');
+  /** The exact bytes THIS mount initialized from (B2's byte-side twin): the
+   * dirty store draft on a draft mount, else the disk original. "Back to
+   * pristine" restores these bytes — never the splice baseline's original. */
+  const mountBytesRef = useRef('');
   const dirtyRef = useRef(false);
   /** Set by the mount effect; lets the content-sync effect reach the live instance. */
   const applyFreshContentRef = useRef<((fresh: string) => void) | null>(null);
@@ -204,23 +208,34 @@ function MilkdownEditor({ tabId, filePath, content, registerFreshContentHandler 
     readyRef.current = false;
     dirtyRef.current = false;
 
+    // Mount-from-draft (plan §1.2): a dirty store draft is the user's unsaved
+    // work — EVERY mount initializes the canvas from it; only a pristine tab
+    // mounts from the disk original. B1 (the splice baseline below) stays the
+    // DISK ORIGINAL bytes regardless, so post-draft-mount edits keep full
+    // splice/EOL fidelity against what is actually on disk. B3 (store
+    // draft/dirty) is left untouched — Save stays enabled.
+    const mountEditState = useDashboardStore.getState().tabEditState[tabId];
+    const mountReloadVersion = mountEditState?.reloadVersion ?? 0;
+    const mountedFromDraft = !!mountEditState?.dirty;
+    const mountText = mountedFromDraft
+      ? mountEditState.draftContent
+      : contentRef.current;
+    mountBytesRef.current = mountText;
+
     // DIAG(edit-loss): per-mount generation + what this mount initializes from
-    // vs what the store believes (a dirty store draft at mount time is the H1
-    // invisible-draft signature).
+    // vs what the store believes.
     const mountGen = nextEditorMountGeneration();
-    {
-      const es = useDashboardStore.getState().tabEditState[tabId];
-      diag('editor-mount', {
-        gen: mountGen,
-        tabId,
-        file: diagBasename(filePath),
-        contentHash: diagHash(contentRef.current),
-        storeDirty: !!es?.dirty,
-        draftHash: diagHash(es?.draftContent),
-        reloadVersion: es?.reloadVersion ?? 0,
-        mode: es?.mode,
-      });
-    }
+    diag('editor-mount', {
+      gen: mountGen,
+      tabId,
+      file: diagBasename(filePath),
+      contentHash: diagHash(contentRef.current),
+      storeDirty: mountedFromDraft,
+      draftHash: diagHash(mountEditState?.draftContent),
+      mountTextHash: diagHash(mountText),
+      reloadVersion: mountEditState?.reloadVersion ?? 0,
+      mode: mountEditState?.mode,
+    });
 
     // Splice baseline from the ORIGINAL bytes; the editor itself receives the
     // LF-normalized text (plan §6.1).
@@ -239,7 +254,13 @@ function MilkdownEditor({ tabId, filePath, content, registerFreshContentHandler 
 
     const crepe = new Crepe({
       root: container,
-      defaultValue: baseline ? baseline.editorContent : normalizeEolLocal(contentRef.current),
+      // A draft mount loads the draft's bytes (LF-normalized for the editor);
+      // a pristine mount keeps the baseline's prepared editorContent.
+      defaultValue: mountedFromDraft
+        ? normalizeEolLocal(mountText)
+        : baseline
+          ? baseline.editorContent
+          : normalizeEolLocal(mountText),
       features: {
         // explicit since the Gate 2 KaTeX/Vite font probe; on by default in 7.21.2
         [Crepe.Feature.Latex]: true,
@@ -273,6 +294,17 @@ function MilkdownEditor({ tabId, filePath, content, registerFreshContentHandler 
     const editorIsDirty = (): boolean =>
       readyRef.current && !disposed && crepe.getMarkdown() !== loadSerializedRef.current;
 
+    const storeDirty = (): boolean =>
+      !!useDashboardStore.getState().tabEditState[tabId]?.dirty;
+
+    /** Dirty-for-save ⇔ the live doc differs from THIS mount's serialization
+     * (B2) OR any lagging/store authority still flags unsaved work (plan
+     * §1.3b: editor-live ∨ dirtyRef ∨ B3). A draft-mounted canvas is
+     * editor-pristine but store-dirty — its preserved draft must still save
+     * and must still conflict with external changes. */
+    const saveDirty = (): boolean =>
+      editorIsDirty() || dirtyRef.current || storeDirty();
+
     /** Dirty iff Crepe's serialization differs from the load/save baseline
      * (plan §5) — only then does the store hear about a draft. */
     const syncDirtyState = (markdown: string) => {
@@ -280,12 +312,12 @@ function MilkdownEditor({ tabId, filePath, content, registerFreshContentHandler 
       if (markdown === loadSerializedRef.current) {
         if (dirtyRef.current) {
           dirtyRef.current = false;
-          // Back to pristine (e.g. undo): draft = original bytes, so the
-          // store's dirty flag agrees.
-          setDraftContentRef.current(
-            tabId,
-            baselineRef.current?.originalContent ?? markdown,
-          );
+          // Back to the MOUNT state (e.g. undo): restore the bytes this mount
+          // loaded — on a draft mount those are the dirty draft, NOT the
+          // splice baseline's disk original (plan §1.3a). Writing the
+          // original here would silently mark the store clean while the
+          // canvas still shows unsaved work.
+          setDraftContentRef.current(tabId, mountBytesRef.current);
         }
         return;
       }
@@ -309,35 +341,46 @@ function MilkdownEditor({ tabId, filePath, content, registerFreshContentHandler 
       });
     });
 
-    /** Explicit save only (WP1-B task 2): flush the splice synchronously —
-     * the markdownUpdated listener is debounced 200ms and may lag a keystroke
-     * — then saveTab. On success, rebaseline on the bytes just written so the
-     * next edit splices against the new on-disk truth and the watcher echo of
-     * our own write matches the new baseline. */
-    const performSave = () => {
-      if (!readyRef.current || disposed) return;
-      const draft = flushDirtyDraft();
-      const markdown = crepe.getMarkdown();
+    /** Explicit save (WP1-B task 2, reshaped by plan §1.3d): flush the splice
+     * synchronously — the markdownUpdated listener is debounced 200ms and may
+     * lag a keystroke — and save when ANY dirty authority says so: a
+     * draft-mounted canvas is editor-pristine while its preserved work lives
+     * only in the store, and that draft must still reach disk. On success,
+     * rebaseline B1+B2 on the written bytes. (Phase 2 replaces this with the
+     * save coordinator's requestSave; the dirty condition is already the
+     * coordinator's.) */
+    const performSave = (): Promise<boolean> => {
+      if (!readyRef.current || disposed) return Promise.resolve(false);
+      // Live flush wins; else the preserved store draft; null ⇒ genuinely
+      // pristine ⇒ resolve true without writing. Re-read the store AFTER the
+      // flush — flushDirtyDraft may itself update the draft.
+      const flushed = flushDirtyDraft();
+      const es = useDashboardStore.getState().tabEditState[tabId];
+      const draft = flushed ?? (es?.dirty ? es.draftContent : null);
       if (draft === null) {
-        if (dirtyRef.current) syncDirtyState(markdown);
-        return; // pristine — nothing to write
+        return Promise.resolve(true); // pristine — nothing to write
       }
-      void saveTabRef.current(tabId).then((ok) => {
-        if (!ok || disposed) return;
+      return saveTabRef.current(tabId).then((ok) => {
+        if (!ok || disposed) return false;
+        // Rebaseline B1 (splice baseline = written bytes) + B2 (this mount's
+        // serialization) + the mount bytes; dirtyRef recomputed against the
+        // fresh B2 (plan §1.3d).
         try {
           baselineRef.current = prepareSpliceBaseline(draft);
         } catch (err) {
           console.error('[MilkdownEditor] rebaseline after save failed', err);
         }
-        loadSerializedRef.current = markdown;
-        dirtyRef.current = crepe.getMarkdown() !== markdown;
+        mountBytesRef.current = draft;
+        loadSerializedRef.current = crepe.getMarkdown();
+        dirtyRef.current = editorIsDirty();
+        return true;
       });
     };
 
     const onKeyDown = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && !e.altKey && (e.key === 's' || e.key === 'S')) {
         e.preventDefault();
-        performSave();
+        void performSave();
       }
     };
     container.addEventListener('keydown', onKeyDown);
@@ -376,8 +419,12 @@ function MilkdownEditor({ tabId, filePath, content, registerFreshContentHandler 
     // ProseMirror transaction and returning 'handled'.
     const unregister = tabId
       ? registerRef.current?.(tabId, () => {
+          // saveDirty() (plan §1.3b): a draft-mounted canvas is
+          // editor-pristine but still carries unsaved store work — external
+          // content must conflict, never silently replace it.
           const editorDirty = editorIsDirty();
-          const verdict: FreshContentResult = editorDirty || dirtyRef.current ? 'conflict' : 'fallback';
+          const verdict: FreshContentResult =
+            editorDirty || dirtyRef.current || storeDirty() ? 'conflict' : 'fallback';
           // DIAG(edit-loss): handler verdict + which dirty authority produced it.
           diag('handler-verdict', {
             gen: mountGen,
@@ -385,26 +432,37 @@ function MilkdownEditor({ tabId, filePath, content, registerFreshContentHandler 
             verdict,
             editorDirty,
             dirtyRef: dirtyRef.current,
-            storeDirty: !!useDashboardStore.getState().tabEditState[tabId]?.dirty,
+            storeDirty: storeDirty(),
           });
           return verdict;
         })
       : undefined;
 
-    /** Clean-editor content swap + baseline refresh (plan §5 'fallback'). */
+    /** Clean-editor content swap + baseline refresh (plan §5 'fallback').
+     * R7 live triple-check AT REPLACEMENT TIME (plan §1.3c): the decision to
+     * swap was made earlier (handler consult / prop change) — re-verify
+     * against the LIVE doc and the store at the moment replaceAll would run.
+     * The debounced dirtyRef alone is not a safe guard (H3 TOCTOU), and a
+     * draft-mounted canvas is editor-pristine while the store still carries
+     * unsaved work — without the store check, the post-create
+     * applyFreshContent(original) would replaceAll(original) over the
+     * just-mounted draft. */
     const applyFreshContent = (fresh: string) => {
-      if (disposed || !readyRef.current || dirtyRef.current) {
+      const blocked = (guard: string) => {
         // DIAG(edit-loss): which guard blocked the replace.
         diag('apply-fresh-blocked', {
           gen: mountGen,
           tabId,
           freshHash: diagHash(fresh),
+          guard,
           disposed,
           ready: readyRef.current,
           dirtyRef: dirtyRef.current,
         });
-        return;
-      }
+      };
+      if (disposed || !readyRef.current) return blocked('disposed-or-not-ready');
+      if (crepe.getMarkdown() !== loadSerializedRef.current) return blocked('live-doc-differs');
+      if (useDashboardStore.getState().tabEditState[tabId]?.dirty) return blocked('store-dirty');
       if (fresh === baselineRef.current?.originalContent) {
         // DIAG(edit-loss): fresh bytes already ARE the baseline — no-op.
         diag('apply-fresh-baseline-match', {
@@ -419,6 +477,7 @@ function MilkdownEditor({ tabId, filePath, content, registerFreshContentHandler 
         crepe.editor.action(replaceAll(next.editorContent, true));
         baselineRef.current = next;
         loadSerializedRef.current = crepe.getMarkdown();
+        mountBytesRef.current = fresh;
         dirtyRef.current = false;
         // DIAG(edit-loss): replaceAll ran — the live doc was swapped.
         diag('apply-fresh-replaced', {
@@ -458,13 +517,23 @@ function MilkdownEditor({ tabId, filePath, content, registerFreshContentHandler 
       });
 
     return () => {
+      // An explicit "Reload from disk" bumped reloadVersion and reset the
+      // store to the disk bytes; since the canvas now mounts FROM the store
+      // draft (plan §1.2), this dying mount's flush must not resurrect the
+      // discarded draft over the reload — the successor mount would show it
+      // instead of the disk bytes. The flush authority is scoped to this
+      // mount's own reload generation.
+      const supersededByReload =
+        (useDashboardStore.getState().tabEditState[tabId]?.reloadVersion ?? 0) !==
+        mountReloadVersion;
       // DIAG(edit-loss): the single flushDirtyDraft() call — capture its
       // return value once into a local, log it, never call twice.
-      const flushedDraft = flushDirtyDraft();
+      const flushedDraft = supersededByReload ? null : flushDirtyDraft();
       diag('editor-cleanup', {
         gen: mountGen,
         tabId,
         dirtyRef: dirtyRef.current,
+        supersededByReload,
         flushedDraftHash: flushedDraft === null ? null : diagHash(flushedDraft),
       });
       disposed = true;

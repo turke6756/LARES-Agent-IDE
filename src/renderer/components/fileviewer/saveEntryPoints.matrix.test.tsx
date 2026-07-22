@@ -13,9 +13,9 @@
  *
  * (4a) Preserved-draft save: passing regression tests for the six bare
  * store-save paths (they read draftContent directly and already write the
- * preserved draft), `test.fails` ONLY for canvas Ctrl+S (`performSave` hits
- * the pristine short-circuit on a draft-mounted canvas and writes nothing —
- * un-failed in Phase 1).
+ * preserved draft), plus canvas Ctrl+S (un-failed by Phase 1's `saveDirty()`
+ * in `performSave` — a draft-mounted canvas writes the preserved store
+ * draft).
  *
  * (4b) H4 bypass — a LIVE Milkdown edit inside the ~200ms markdownUpdated
  * debounce window, then each bypass path is invoked. Desired (un-failed in
@@ -480,16 +480,14 @@ describe('4a — preserved-draft save: the six bare store-save paths already wri
   }
 });
 
-describe('4a — preserved-draft save: canvas Ctrl+S (performSave) — confirmed defective', () => {
-  // FIXME(edit-loss): un-fail in Phase 1 — performSave must save when
-  // `saveDirty()` (editor dirty OR dirtyRef OR store dirty); today the
-  // draft-mounted (or banner-reverted) canvas hits the pristine short-circuit
-  // (MilkdownEditor performSave "nothing to write") and writes nothing while
-  // the store still holds the preserved dirty draft.
-  it.fails('canvas Ctrl+S writes the preserved store draft to disk', async () => {
+describe('4a — preserved-draft save: canvas Ctrl+S (performSave) — fixed in Phase 1', () => {
+  // Phase 1 §1.3d: performSave saves when `saveDirty()` (editor dirty OR
+  // dirtyRef OR store dirty) — the draft-mounted canvas is editor-pristine
+  // (the canvas now mounts FROM the draft, §1.2) but the preserved store
+  // draft must still reach disk and become B1.
+  it('canvas Ctrl+S writes the preserved store draft to disk', async () => {
     seedMainTab({ draftContent: PRESERVED_DRAFT, dirty: true });
-    // Draft-mounted canvas: the editor initializes from originalContent while
-    // the store still carries the dirty draft (H1 aftermath).
+    // Draft-mounted canvas: the store carries the dirty draft at mount time.
     const mounted = await mountElement(
       <MilkdownEditor
         tabId={TAB}

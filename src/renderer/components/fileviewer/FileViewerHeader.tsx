@@ -4,7 +4,8 @@ import { detectFileType, detectLanguage, formatFileSize, isEditableFileType } fr
 import * as Icons from 'lucide-react';
 import FileIcon from './FileIcon';
 import { useDashboardStore } from '../../stores/dashboard-store';
-import type { TabMode } from './contentViewMode';
+import { SNIFF_REASON_LABELS, type TabMode } from './contentViewMode';
+import { sniffWysiwygCompatibility } from './markdownSplice';
 
 interface Props {
   tabId: string;
@@ -65,14 +66,36 @@ export default function FileViewerHeader({ tabId, filePath, pathType, fileSize, 
 
   // Single mode-switch path for the three-state markdown control and the
   // legacy Edit/View buttons on other editable types. A dirty draft survives
-  // only the wysiwyg → source direction (CodeMirror can show the spliced
-  // draft; the WYSIWYG editor only loads original on-disk bytes per the WP1
-  // props contract) — every other dirty switch asks before discarding.
+  // BOTH directions between the two edit modes (D2, plan §1.4): CodeMirror
+  // shows the spliced draft, and since Phase 1 the WYSIWYG canvas mounts from
+  // the dirty draft too. Only a dirty switch to 'view' asks before
+  // discarding. A source → wysiwyg carry must sniff THE DRAFT (what the
+  // canvas would mount); an incompatible draft stays in source mode with an
+  // explanation — never a prompt that can discard.
   const switchMode = async (target: TabMode) => {
     if (switchingMode || mode === target) return;
     if (!editable && target !== 'view') return;
-    const carriesDraft = dirty && mode === 'wysiwyg' && target === 'source';
+    const carriesDraft =
+      dirty &&
+      ((mode === 'wysiwyg' && target === 'source') ||
+        (mode === 'source' && target === 'wysiwyg'));
     if (dirty && !carriesDraft && !window.confirm('Discard unsaved changes?')) return;
+
+    if (target === 'wysiwyg' && carriesDraft && editState) {
+      const draft = editState.draftContent;
+      const sniff = sniffWysiwygCompatibility(
+        draft,
+        new TextEncoder().encode(draft).length,
+        { filePath },
+      );
+      if (!sniff.ok) {
+        window.alert(
+          `Can't open this draft in the WYSIWYG editor — ${SNIFF_REASON_LABELS[sniff.reason]}. ` +
+            'Your unsaved changes are kept in Source mode.',
+        );
+        return;
+      }
+    }
 
     if (target === 'view') {
       if (dirty) {
@@ -103,6 +126,8 @@ export default function FileViewerHeader({ tabId, filePath, pathType, fileSize, 
         // enterSourceMode preserves a dirty draft (the wysiwyg → source carry).
         enterSourceMode(tabId, content);
       } else {
+        // enterWysiwygMode also preserves a dirty draft (the source → wysiwyg
+        // carry, sniffed above); the canvas mounts from it.
         enterWysiwygMode(tabId, content);
       }
     } finally {

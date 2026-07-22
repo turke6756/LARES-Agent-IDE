@@ -14,6 +14,19 @@ import type { SniffReason, SniffResult } from './markdownSplice';
 
 export type TabMode = 'view' | 'wysiwyg' | 'source';
 
+/**
+ * User-facing copy for the §6.3 exclusion reasons — shared by the
+ * content-area "WYSIWYG unavailable" notice and the header's dirty
+ * source→wysiwyg carry gate (plan §1.4).
+ */
+export const SNIFF_REASON_LABELS: Record<SniffReason, string> = {
+  mdx: 'MDX is not supported',
+  frontmatter: 'it has frontmatter',
+  'raw-html': 'it contains raw HTML blocks',
+  'too-large': 'it is too large',
+  'parse-failure': 'it failed to parse',
+};
+
 export type ResolvedContentView =
   | { kind: 'view'; wysiwygBlockedReason?: SniffReason }
   | { kind: 'source' }

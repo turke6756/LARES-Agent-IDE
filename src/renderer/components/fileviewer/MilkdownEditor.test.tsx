@@ -337,12 +337,12 @@ describe('fresh-content handler seam', () => {
   });
 });
 
-describe('TOCTOU hole (H3): fresh content applied inside the markdownUpdated debounce window', () => {
-  // FIXME(edit-loss): un-fail in Phase 1 — applyFreshContent must re-check the
-  // LIVE doc (crepe.getMarkdown() vs loadSerializedRef) at replacement time;
-  // today it guards only on the ~200ms-debounced dirtyRef, so a transaction
-  // applied just before a clean 'fallback' content swap is erased.
-  it.fails('a transaction applied just before the content prop changes survives the swap', async () => {
+describe('TOCTOU (H3, closed by Phase 1 §1.3c): fresh content applied inside the markdownUpdated debounce window', () => {
+  // applyFreshContent re-checks the LIVE doc (crepe.getMarkdown() vs
+  // loadSerializedRef) at replacement time — the ~200ms-debounced dirtyRef is
+  // never the deciding guard, so a transaction applied just before a clean
+  // 'fallback' content swap survives.
+  it('a transaction applied just before the content prop changes survives the swap', async () => {
     const element = (content: string) => (
       <MilkdownEditor tabId="toctou" filePath="C:\\ws\\doc.md" content={content} />
     );
@@ -376,35 +376,131 @@ describe('TOCTOU hole (H3): fresh content applied inside the markdownUpdated deb
     }
   });
 
-  it('locks the CURRENT clobber mechanics (bounded loss, diagnosis H3 — remove with the Phase 1 fix)', async () => {
+  it('a clean editor still swaps fresh content after the live re-check passes', async () => {
     const element = (content: string) => (
-      <MilkdownEditor tabId="toctou-cur" filePath="C:\\ws\\doc.md" content={content} />
+      <MilkdownEditor tabId="toctou-clean" filePath="C:\\ws\\doc.md" content={content} />
     );
     const mounted = await mountEditor(element(ORIGINAL));
     try {
       await flushDebounce();
-      const view = getCanvasEditorHandle('toctou-cur')!.getEditorView!()!;
-      const pos = findTextPos(view, 'Second paragraph');
-
-      vi.useFakeTimers();
-      try {
-        act(() => {
-          view.dispatch(view.state.tr.insertText('ERASED ', pos));
-        });
-        const FRESH = '# Title\r\n\r\nFresh from disk.\r\n';
-        act(() => {
-          mounted.root.render(element(FRESH));
-        });
-        // Today: replaceAll fires guarded only by the stale dirtyRef — the
-        // in-gap edit is gone and the fresh bytes won.
-        const md = getCanvasEditorHandle('toctou-cur')!.getMarkdown();
-        expect(md).not.toContain('ERASED');
-        expect(md).toContain('Fresh from disk.');
-      } finally {
-        vi.useRealTimers();
-      }
+      // No live edit: getMarkdown() === loadSerializedRef, store pristine —
+      // the R7 triple-check must NOT over-block the legitimate clean swap.
+      const FRESH = '# Title\r\n\r\nFresh from disk.\r\n';
+      await act(async () => {
+        mounted.root.render(element(FRESH));
+      });
+      await flushDebounce();
+      expect(getCanvasEditorHandle('toctou-clean')!.getMarkdown()).toContain('Fresh from disk.');
     } finally {
       await mounted.unmount();
+    }
+  });
+});
+
+describe('mount-from-draft (Phase 1 §1.2/§1.3)', () => {
+  const DRAFT =
+    '# Title\r\n' +
+    '\r\n' +
+    'First paragraph stays.\r\n' +
+    '\r\n' +
+    'PRESERVED Second paragraph to edit.\r\n' +
+    '\r\n' +
+    '- item one\r\n' +
+    '- item two\r\n';
+
+  const seedDirtyDraft = (tabId: string) => {
+    storeMock.useDashboardStore.getState().tabEditState[tabId] = {
+      mode: 'wysiwyg',
+      draftContent: DRAFT,
+      originalContent: ORIGINAL,
+      dirty: true,
+      saving: false,
+      error: null,
+    };
+  };
+  const clearEditState = (tabId: string) => {
+    delete storeMock.useDashboardStore.getState().tabEditState[tabId];
+  };
+
+  it('a dirty tab mounts the canvas from the store DRAFT, store dirty state untouched', async () => {
+    seedDirtyDraft('dm1');
+    try {
+      const mounted = await mountEditor(
+        <MilkdownEditor tabId="dm1" filePath="C:\\ws\\doc.md" content={ORIGINAL} />,
+      );
+      await flushDebounce();
+
+      // The canvas shows the draft — and the post-create
+      // applyFreshContent(contentRef = original) was BLOCKED by the
+      // store-dirty check (§1.3c), or it would replaceAll(original) over the
+      // just-mounted draft.
+      expect(getCanvasEditorHandle('dm1')!.getMarkdown()).toContain(
+        'PRESERVED Second paragraph',
+      );
+      // B3 untouched: no draft push at mount (the store already holds it).
+      expect(drafts()).toHaveLength(0);
+
+      await mounted.unmount();
+    } finally {
+      clearEditState('dm1');
+    }
+  });
+
+  it('a content-prop change while store-dirty never replaces the draft-mounted canvas', async () => {
+    seedDirtyDraft('dm2');
+    try {
+      const element = (content: string) => (
+        <MilkdownEditor tabId="dm2" filePath="C:\\ws\\doc.md" content={content} />
+      );
+      const mounted = await mountEditor(element(ORIGINAL));
+      await flushDebounce();
+
+      const FRESH = '# Title\r\n\r\nFresh from disk.\r\n';
+      await act(async () => {
+        mounted.root.render(element(FRESH));
+      });
+      await flushDebounce();
+
+      const md = getCanvasEditorHandle('dm2')!.getMarkdown();
+      expect(md).toContain('PRESERVED Second paragraph');
+      expect(md).not.toContain('Fresh from disk.');
+
+      await mounted.unmount();
+    } finally {
+      clearEditState('dm2');
+    }
+  });
+
+  it('pristine-branch preservation: edit → undo back to the MOUNT state restores the mounted draft bytes, not the disk original', async () => {
+    seedDirtyDraft('dm3');
+    try {
+      const mounted = await mountEditor(
+        <MilkdownEditor tabId="dm3" filePath="C:\\ws\\doc.md" content={ORIGINAL} />,
+      );
+      await flushDebounce();
+      const view = getCanvasEditorHandle('dm3')!.getEditorView!()!;
+
+      const pos = findTextPos(view, 'First paragraph');
+      act(() => {
+        view.dispatch(view.state.tr.insertText('TEMP ', pos));
+      });
+      await flushDebounce();
+      expect(lastDraft()).toContain('TEMP First paragraph stays.');
+
+      // Undo back to exactly what THIS mount loaded (the draft): the store
+      // draft must return to the mounted draft bytes — never the splice
+      // baseline's disk original, which would silently mark the tab clean
+      // while the canvas still shows unsaved work (§1.3a).
+      act(() => {
+        view.dispatch(view.state.tr.delete(pos, pos + 'TEMP '.length));
+      });
+      await flushDebounce();
+      expect(lastDraft()).toBe(DRAFT);
+      expect(lastDraft()).not.toBe(ORIGINAL);
+
+      await mounted.unmount();
+    } finally {
+      clearEditState('dm3');
     }
   });
 });

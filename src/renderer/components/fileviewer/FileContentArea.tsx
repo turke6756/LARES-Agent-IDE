@@ -7,8 +7,8 @@ import CodeMirrorEditor from './CodeMirrorEditor';
 import MilkdownEditor from './MilkdownEditor';
 import SelectionSurface from '../selection/SelectionSurface';
 import { sniffWysiwygCompatibility } from './markdownSplice';
-import type { SniffReason, SniffResult } from './markdownSplice';
-import { resolveContentView } from './contentViewMode';
+import type { SniffResult } from './markdownSplice';
+import { resolveContentView, SNIFF_REASON_LABELS } from './contentViewMode';
 import ImageRenderer from './ImageRenderer';
 import PdfRenderer from './PdfRenderer';
 import GeoTiffRenderer from './GeoTiffRenderer';
@@ -22,14 +22,6 @@ interface Props {
   filePath: string;
   pathType: PathType;
 }
-
-const SNIFF_REASON_LABELS: Record<SniffReason, string> = {
-  mdx: 'MDX is not supported',
-  frontmatter: 'it has frontmatter',
-  'raw-html': 'it contains raw HTML blocks',
-  'too-large': 'it is too large',
-  'parse-failure': 'it failed to parse',
-};
 
 export default function FileContentArea({ tabId, filePath, pathType }: Props) {
   const fileType = filePath ? detectFileType(filePath) : null;
@@ -74,13 +66,17 @@ export default function FileContentArea({ tabId, filePath, pathType }: Props) {
   const content = cachedContent && cachedContent.path === filePath ? cachedContent : null;
   const loading = cacheLoading || (!isMediaType && !!filePath && content === null);
 
-  // §6.3 exclusion sniffing at the dispatch. Sniff the edit-session baseline
-  // when one exists (what the WYSIWYG editor would load), else the cached
-  // disk content. The rules live in markdownSplice — never reimplemented here.
+  // §6.3 exclusion sniffing at the dispatch. Sniff exactly what the WYSIWYG
+  // editor would mount (plan §1.4): the dirty draft when one exists (the
+  // canvas initializes from it since Phase 1), else the edit-session baseline,
+  // else the cached disk content. The rules live in markdownSplice — never
+  // reimplemented here.
   const sniffSource = !isMarkdown
     ? null
     : editState
-      ? editState.originalContent
+      ? editState.dirty
+        ? editState.draftContent
+        : editState.originalContent
       : content && !content.error
         ? content.content
         : null;
@@ -194,12 +190,19 @@ export default function FileContentArea({ tabId, filePath, pathType }: Props) {
 
   if (!content) return null;
 
-  // External-change banner — shared by both non-view editor modes.
-  const withExternalChangeBanner = (editor: React.ReactElement): React.ReactElement => {
-    if (!editState?.externalChange) return editor;
-    return (
-      <div className="h-full flex flex-col bg-surface-0">
-        <div className="shrink-0 px-3 py-2 bg-amber-900/30 border-b border-amber-700/50 text-[12px] font-sans text-amber-200 flex items-center justify-between gap-3">
+  // External-change banner — shared by both non-view editor modes. The
+  // wrapper is ALWAYS mounted with one stable root element type and a keyed
+  // editor slot; only the banner row toggles (plan §1.1, diagnosis H1).
+  // Toggling externalChange must never change the tree shape around the
+  // editor — a root-type flip would unmount/remount the whole editor subtree
+  // mid-edit and revert the visible canvas.
+  const withExternalChangeBanner = (editor: React.ReactElement): React.ReactElement => (
+    <div className="h-full flex flex-col bg-surface-0">
+      {editState?.externalChange ? (
+        <div
+          key="banner"
+          className="shrink-0 px-3 py-2 bg-amber-900/30 border-b border-amber-700/50 text-[12px] font-sans text-amber-200 flex items-center justify-between gap-3"
+        >
           <span>This file changed on disk{editState.dirty ? ' while you were editing' : ''}.</span>
           <div className="flex items-center gap-2 shrink-0">
             <button
@@ -218,12 +221,12 @@ export default function FileContentArea({ tabId, filePath, pathType }: Props) {
             </button>
           </div>
         </div>
-        <div className="flex-1 min-h-0">
-          {editor}
-        </div>
+      ) : null}
+      <div key="editor" className="flex-1 min-h-0">
+        {editor}
       </div>
-    );
-  };
+    </div>
+  );
 
   if (resolved.kind === 'source' && editState && !content.error) {
     return withExternalChangeBanner(

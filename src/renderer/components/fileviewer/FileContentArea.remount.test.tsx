@@ -1,12 +1,12 @@
 // @vitest-environment jsdom
 /**
- * Phase 0 defect-locking test for H1 (plans/markdown-editor-edit-loss-
- * implementation.md §0.3(1), diagnosis §1 H1): toggling the external-change
- * banner changes the ROOT ELEMENT TYPE of FileContentArea's returned tree
- * (SelectionSurface-rooted vs banner-div-rooted), so React destroys and
- * recreates the whole editor subtree — a full Crepe unmount/mount cycle per
- * flip — and every remount re-initializes from `originalContent`, never the
- * dirty draft.
+ * H1 regression suite (plans/markdown-editor-edit-loss-implementation.md
+ * §0.3(1), un-failed by Phase 1 §1.1/§1.2): the external-change banner is
+ * chrome, never a tree-shape change — `withExternalChangeBanner` keeps one
+ * stable root with a keyed editor slot, so toggling `externalChange` cannot
+ * unmount the editor. Legitimate remounts (reloadFromDisk's reloadVersion
+ * bump) initialize from the store draft when dirty, and from the disk bytes
+ * after an explicit reload reset the store.
  *
  * Cycle counting uses test-only Crepe create/destroy spies (module mock) —
  * NOT the settled `getActiveCrepeInstanceCount()`, which returns to 1 after
@@ -215,10 +215,9 @@ function makeLiveEdit(edited: string) {
 describe('external-change banner vs editor subtree (H1)', () => {
   const EDITED = '# Title\n\nHello EDITED world.\n';
 
-  // FIXME(edit-loss): un-fail in Phase 1 — withExternalChangeBanner must keep
-  // one stable root (banner row toggles inside it) and any legitimate remount
-  // must initialize from the dirty draft, not originalContent.
-  it.fails(
+  // Phase 1 §1.1: withExternalChangeBanner keeps one stable root (the banner
+  // row toggles inside it), so the editor subtree is never unmounted.
+  it(
     'toggling externalChange false→true→false never unmounts the editor and the dirty edit stays in the canvas',
     async () => {
       const mounted = await mountArea();
@@ -232,16 +231,18 @@ describe('external-change banner vs editor subtree (H1)', () => {
         const createsBefore = crepeSpy.createCalls;
         const destroysBefore = crepeSpy.destroyCalls;
 
-        // External change lands mid-edit → banner appears…
+        // External change lands mid-edit → banner appears IN PLACE…
         await act(async () => {
           useDashboardStore.getState().markExternalChange(TAB, '# Someone else\n');
         });
         await flush();
+        expect(mounted.host.textContent).toContain('This file changed on disk');
         // …and "Keep my changes" dismisses it.
         await act(async () => {
           useDashboardStore.getState().dismissExternalChange(TAB);
         });
         await flush();
+        expect(mounted.host.textContent).not.toContain('This file changed on disk');
 
         // Desired: the banner is chrome, not a tree-shape change — zero
         // unmount/mount cycles across both flips…
@@ -257,7 +258,7 @@ describe('external-change banner vs editor subtree (H1)', () => {
     },
   );
 
-  it('the flushed draft survives the banner remount in the STORE (current behavior: preserved but invisible)', async () => {
+  it('the dirty draft survives the banner toggle in the STORE and Save stays possible', async () => {
     const mounted = await mountArea();
     makeLiveEdit(EDITED);
     expect(useDashboardStore.getState().tabEditState[TAB]?.dirty).toBe(true);
@@ -271,8 +272,8 @@ describe('external-change banner vs editor subtree (H1)', () => {
     });
     await flush();
 
-    // The unmount cleanup flushes the live doc into the store before destroy,
-    // and "Keep my changes" must not clobber it: Save stays possible.
+    // The debounced sync landed the draft in the store, and "Keep my changes"
+    // must not clobber it: Save stays possible.
     const es = useDashboardStore.getState().tabEditState[TAB];
     expect(es?.dirty).toBe(true);
     expect(es?.draftContent).toContain('EDITED');
@@ -281,28 +282,57 @@ describe('external-change banner vs editor subtree (H1)', () => {
     await mounted.unmount();
   });
 
-  it('locks the CURRENT defective remount mechanics so a partial fix cannot masquerade as Phase 1 (remove with the Phase 1 fix)', async () => {
+  it('"Reload from disk" remounts (reloadVersion bump) and the new canvas shows the DISK bytes, store pristine', async () => {
+    const DISK = '# Someone else\n\nFresh disk bytes.\n';
     const mounted = await mountArea();
     makeLiveEdit(EDITED);
+    expect(useDashboardStore.getState().tabEditState[TAB]?.dirty).toBe(true);
+
+    await act(async () => {
+      useDashboardStore.getState().markExternalChange(TAB, DISK);
+    });
+    await flush();
 
     const createsBefore = crepeSpy.createCalls;
     await act(async () => {
-      useDashboardStore.getState().markExternalChange(TAB, '# Someone else\n');
-    });
-    await flush();
-    await act(async () => {
-      useDashboardStore.getState().dismissExternalChange(TAB);
+      useDashboardStore.getState().reloadFromDisk(TAB);
     });
     await flush();
 
-    // Two flips → two full unmount/mount cycles today, and the remounted
-    // canvas shows originalContent (the visual revert) while the store still
-    // holds the draft. This is the confirmed H1 signature.
-    expect(crepeSpy.createCalls).toBe(createsBefore + 2);
+    // A deliberate reload IS a remount (the key includes reloadVersion)…
+    expect(crepeSpy.createCalls).toBe(createsBefore + 1);
+    // …and the new canvas shows the disk bytes — the dying mount's cleanup
+    // flush must NOT resurrect the discarded draft over the reload.
+    expect(crepeSpy.latest().markdown).toContain('Fresh disk bytes.');
     expect(crepeSpy.latest().markdown).not.toContain('EDITED');
-    expect(crepeSpy.latest().markdown).toContain('Hello world.');
-    expect(useDashboardStore.getState().tabEditState[TAB]?.draftContent).toContain('EDITED');
+    const es = useDashboardStore.getState().tabEditState[TAB];
+    expect(es?.dirty).toBe(false);
+    expect(es?.draftContent).toBe(DISK);
+    expect(es?.originalContent).toBe(DISK);
+    expect(es?.externalChange).toBeFalsy();
 
     await mounted.unmount();
+  });
+
+  it('a remount while dirty (tab switch away/back) initializes the canvas from the preserved store draft', async () => {
+    const mounted = await mountArea();
+    makeLiveEdit(EDITED);
+    const draftBefore = useDashboardStore.getState().tabEditState[TAB]?.draftContent;
+    expect(draftBefore).toContain('EDITED');
+
+    // Simulate leaving and returning to the Files view: full unmount, then a
+    // fresh mount with the SAME dirty edit session in the store.
+    await mounted.unmount();
+    const remounted = await mountArea();
+
+    // Phase 1 §1.2: the new mount reads the store imperatively — a dirty tab
+    // mounts from draftContent, never originalContent.
+    expect(crepeSpy.latest().markdown).toContain('EDITED');
+    // B3 untouched: still dirty, Save stays enabled.
+    const es = useDashboardStore.getState().tabEditState[TAB];
+    expect(es?.dirty).toBe(true);
+    expect(es?.draftContent).toContain('EDITED');
+
+    await remounted.unmount();
   });
 });

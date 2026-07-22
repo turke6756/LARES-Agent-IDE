@@ -635,11 +635,12 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
 
   // Creates the edit session for the WYSIWYG canvas (plan §5: state is
   // created on WYSIWYG mount by FileContentArea, never by the editor
-  // component itself, so saveTab always has state to act on). Callers must
-  // discard or carry a dirty draft before switching into this mode — the
-  // editor only loads original bytes, so a preserved stale draft would be
-  // invisible; if one is still present we keep it and only flip the mode,
-  // mirroring enterSourceMode.
+  // component itself, so saveTab always has state to act on). A dirty draft
+  // is preserved — mode flips, everything else is kept — and the canvas
+  // mounts FROM the preserved draft (edit-loss Phase 1), so this is the
+  // source → wysiwyg carry, mirroring enterSourceMode. Callers gate
+  // incompatible drafts via sniffWysiwygCompatibility(draftContent) before
+  // switching in.
   enterWysiwygMode: (tabId, initialContent) => {
     set((state) => {
       const existing = state.tabEditState[tabId];
