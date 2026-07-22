@@ -6,6 +6,8 @@ import { persistTheme } from './theme-persistence';
 import type { PathType, WslStatus, FsEvent, DetachRequest, DetachResult, ViewDetachRequest, ScanOverheadRequest, ScanOverheadResult, ExtractKnowledgeRequest, ExtractKnowledgeResult, SkillUsageQuery, SkillUsageQueryResult, McpToolUsageQuery, McpToolUsageQueryResult, PriorSessionChat, ContextOptimizerQuery, ContextOptimizerQueryResult, MarkOptimizerActionAppliedRequest, MarkOptimizerActionAppliedResult, SignOptimizerDerivationRequest, SignOptimizerDerivationResult } from '../shared/types';
 import { TAB_CHANNELS, VIEW_CHANNELS } from '../shared/types';
 import { createDetachedWindow, createDetachedViewWindow, broadcastToDetachedViews, canWrite, handleDetachedCloseReply, type DetachedWindowDeps } from './detached-windows';
+import { handleFlushReply } from './close-flush';
+import type { FlushReplyPayload } from '../shared/types';
 import { AgentSupervisor } from './supervisor';
 import { resolveAgentChatEvents } from './supervisor/agent-chat-history';
 import {
@@ -523,6 +525,11 @@ export function registerIpcHandlers(
     (_e, requestId: string, decision: 'save' | 'discard' | 'cancel') =>
       handleDetachedCloseReply(requestId, decision),
   );
+
+  // Edit-loss §4.3 close-flush handshake: a renderer answered a flush request
+  // (main-window/app close) with its per-tab outcomes.
+  ipcMain.handle(TAB_CHANNELS.flushReply, (_e, payload: FlushReplyPayload) =>
+    handleFlushReply(payload));
 
   // Context-Overhead Analyzer — trusted main-process scan (plan §2.5). Always
   // returns the ScanOverheadResult discriminated union (R1).

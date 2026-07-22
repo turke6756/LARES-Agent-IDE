@@ -16,7 +16,7 @@ import ShapefileRenderer from './ShapefileRenderer';
 import GeoPackageRenderer from './GeoPackageRenderer';
 import { useDashboardStore } from '../../stores/dashboard-store';
 import { diag, diagBasename } from './editLossDiag';
-import { noteEdit, requestSave } from './saveCoordinator';
+import { clearConflictPause, requestSave } from './saveCoordinator';
 
 interface Props {
   tabId: string;
@@ -206,20 +206,49 @@ export default function FileContentArea({ tabId, filePath, pathType }: Props) {
           <span>This file changed on disk{editState.dirty ? ' while you were editing' : ''}.</span>
           <div className="flex items-center gap-2 shrink-0">
             <button
-              onClick={() => reloadFromDisk(tabId)}
+              onClick={() => {
+                // §4.1/§4.2: resolving the banner lifts the autosave
+                // conflict pause — reload drops the draft entirely.
+                clearConflictPause(tabId);
+                reloadFromDisk(tabId);
+              }}
               className="ui-btn text-[12px]"
               title="Replace the editor contents with the version on disk"
             >
               Reload from disk
             </button>
             <button
-              onClick={() => dismissExternalChange(tabId)}
+              onClick={() => {
+                // Dismiss advances the CAS guard to the acknowledged bytes —
+                // the next (auto)save may overwrite them, so unpause.
+                clearConflictPause(tabId);
+                dismissExternalChange(tabId);
+              }}
               className="ui-btn text-[12px]"
               title="Keep editing — saving will overwrite the disk version"
             >
               Keep my changes
             </button>
           </div>
+        </div>
+      ) : null}
+      {/* §4.4 (R10): failed saves — autosave included — surface as this
+          non-blocking chip in the always-stable wrapper, never window.alert.
+          A conditional row keyed like the banner: toggling it never changes
+          the tree shape around the keyed editor slot. */}
+      {editState?.error && !editState.saving ? (
+        <div
+          key="save-error"
+          className="shrink-0 px-3 py-1.5 bg-red-900/30 border-b border-red-700/50 text-[12px] font-sans text-red-200 flex items-center justify-between gap-3"
+        >
+          <span>Save failed: {editState.error}</span>
+          <button
+            onClick={() => { void requestSave(tabId); }}
+            className="ui-btn text-[12px] shrink-0"
+            title="Try saving again now"
+          >
+            Retry now
+          </button>
         </div>
       ) : null}
       <div key="editor" className="flex-1 min-h-0">
@@ -236,10 +265,11 @@ export default function FileContentArea({ tabId, filePath, pathType }: Props) {
         initialContent={editState.draftContent}
         language={fileType === 'markdown' ? 'markdown' : 'text'}
         saving={editState.saving}
-        error={editState.error}
-        // noteEdit: CodeMirror's undebounced revision source (edit-loss
-        // Phase 2 §2.1) — the coordinator's gate (a) sees every keystroke.
-        onChange={(draft) => { noteEdit(tabId); setDraftContent(tabId, draft); }}
+        // error deliberately not passed: since 4B the wrapper's chip above is
+        // the single failed-save surface (CodeMirror's footer would double it).
+        // The undebounced revision source moved INTO CodeMirrorEditor
+        // (useAutosave's onEdit calls noteEdit before this onChange fires).
+        onChange={(draft) => { setDraftContent(tabId, draft); }}
         onSave={() => { void requestSave(tabId); }}
         focusRange={focusRange}
       />,

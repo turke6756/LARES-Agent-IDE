@@ -51,13 +51,13 @@ import {
 } from './markdownSplice';
 import {
   currentRevision,
-  noteEdit,
   registerSaveAdapter,
   requestSave,
   storeExpectedDiskHash,
   type SaveAdapter,
   type SaveSnapshot,
 } from './saveCoordinator';
+import { useAutosave } from './useAutosave';
 
 // ---------------------------------------------------------------------------
 // Fresh-content seam (WP1-A owns the registry in useFileContentCache; this
@@ -185,6 +185,15 @@ function MilkdownEditor({ tabId, filePath, content, registerFreshContentHandler 
 
   const setDraftContent = useDashboardStore((s) => s.setDraftContent);
 
+  // Autosave (edit-loss §4.2): onEdit is the undebounced edit signal (it owns
+  // noteEdit + the idle timer); rootRef arms the focusout flush trigger. The
+  // hook's unmount flush runs AFTER this component's layout cleanup (passive
+  // cleanups follow layout cleanups), i.e. after flushDirtyDraft() landed the
+  // final draft in the store — the coordinator's store adapter carries it.
+  const { onEdit, rootRef: autosaveRootRef } = useAutosave(tabId);
+  const onEditRef = useRef(onEdit);
+  onEditRef.current = onEdit;
+
   // Refs keep the mount effect's dep list down to identity (tabId/filePath):
   // store actions, the registration seam, and the content prop must be
   // readable from inside the effect without remounting the editor.
@@ -288,12 +297,14 @@ function MilkdownEditor({ tabId, filePath, content, registerFreshContentHandler 
     // @milkdown/plugin-listener version debounces 200ms exactly like
     // `markdownUpdated` (see saveCoordinator.noteEdit). Every doc-changing
     // transaction advances the tab's revision synchronously with dispatch, so
-    // the coordinator's gate (a) sees an edit the instant it lands.
+    // the coordinator's gate (a) sees an edit the instant it lands. Since
+    // Phase 4B the signal routes through useAutosave's onEdit, which calls
+    // noteEdit AND re-arms the idle autosave timer (§4.2).
     const editRevisionPlugin = new ProsePlugin({
       state: {
         init: () => null,
         apply: (tr) => {
-          if (tr.docChanged && tabId) noteEdit(tabId);
+          if (tr.docChanged && tabId) onEditRef.current();
           return null;
         },
       },
@@ -628,7 +639,7 @@ function MilkdownEditor({ tabId, filePath, content, registerFreshContentHandler 
   // The gutter overlays the scroll container as a sibling (WP-P5-B): Crepe
   // owns every node inside containerRef, so React must not render into it.
   return (
-    <div className="relative h-full">
+    <div className="relative h-full" ref={autosaveRootRef}>
       <div ref={containerRef} className="milkdown-editor h-full overflow-auto" />
       <FileCommentGutter tabId={tabId} scrollRef={containerRef} />
     </div>

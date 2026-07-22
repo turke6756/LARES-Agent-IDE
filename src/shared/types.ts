@@ -730,7 +730,41 @@ export const TAB_CHANNELS = {
   // Phase 2 dirty-on-close request/response:
   closeQuery: 'tab-sync:close-query',       // main → detached renderer (with requestId)
   closeReply: 'tab-sync:close-reply',       // detached renderer → main (invoke, returns decision)
+  // Edit-loss §4.3 close-flush handshake (main-window/app close):
+  flushRequest: 'tab-sync:flush-request',   // main → every editing renderer (with requestId)
+  flushReply: 'tab-sync:flush-reply',       // renderer → main (invoke, carries FlushResult[])
 } as const;
+
+// ── Close-flush handshake (edit-loss plan §4.3) ─────────────────────────
+// Main-window/app close must never silently discard dirty editor tabs: main
+// intercepts the close, asks every relevant renderer (the main window AND
+// every detached file window) to flush via saveCoordinator.flushAll, and only
+// closes once every outcome is saved/pristine — anything else raises a native
+// dialog (Keep waiting / Overwrite anyway / Discard and close / Cancel).
+
+export interface FlushRequestPayload {
+  requestId: string;
+  /** How long the renderer may spend before reporting 'timeout' per tab. */
+  deadlineMs: number;
+  /** 'flush' = every editing tab; 'retry' = re-save the listed tabs;
+   *  'force' = unconditional re-save of CONFLICT tabs only (the dialog's
+   *  explicitly labeled "Overwrite anyway"). */
+  action: 'flush' | 'retry' | 'force';
+  tabIds?: string[];
+}
+
+export interface FlushResult {
+  tabId: string;
+  /** basename, for the close dialog */
+  fileName: string;
+  outcome: 'saved' | 'pristine' | 'conflict' | 'error' | 'timeout';
+  error?: string;
+}
+
+export interface FlushReplyPayload {
+  requestId: string;
+  results: FlushResult[];
+}
 
 // ── Detachable (tear-off) top-level VIEWS ───────────────────────────────
 // A sibling of the file-tab tear-off (above): the whole center VIEW (the
@@ -1590,6 +1624,10 @@ export interface IpcApi {
     // Phase 2 dirty-on-close protocol — declared now, wired in Phase 2.
     onCloseQuery: (callback: (req: { requestId: string }) => void) => () => void;
     closeReply: (requestId: string, decision: 'save' | 'discard' | 'cancel') => Promise<void>;
+    // Edit-loss §4.3 close-flush handshake: main asks every editing renderer
+    // to flush its dirty tabs before the main window / app closes.
+    onFlushRequest: (callback: (req: FlushRequestPayload) => void) => () => void;
+    flushReply: (payload: FlushReplyPayload) => Promise<void>;
   };
   // Detachable (tear-off) top-level views — mirrors `tabs` above, minus the
   // dirty-on-close protocol (a view has nothing to save).

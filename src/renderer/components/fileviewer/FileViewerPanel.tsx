@@ -17,7 +17,7 @@ import { detectFileType } from './fileTypeUtils';
 import ResizeDivider from '../layout/ResizeDivider';
 import CollapseButton from '../layout/CollapseButton';
 import { evictTabCache } from './useFileContentCache';
-import { requestSave } from './saveCoordinator';
+import { hasUnsavedWork, requestSave } from './saveCoordinator';
 
 function useSwipeRight(onSwipe: () => void) {
   const startRef = useRef<{ x: number; y: number } | null>(null);
@@ -112,13 +112,21 @@ export default function FileViewerPanel() {
   // Keyboard shortcuts — close the tab currently displayed in this workspace's viewer
   const displayedTabId = effectiveTab?.id;
   const handleCloseTab = useCallback((tabId: string) => {
-    const editState = tabEditState[tabId];
-    if (editState?.dirty && !window.confirm('Discard unsaved changes?')) {
-      return;
-    }
-    evictTabCache(tabId);
-    closeTab(tabId);
-  }, [closeTab, tabEditState]);
+    void (async () => {
+      // §4.3: closing a dirty tab SAVES first (hasUnsavedWork also flushes a
+      // live canvas edit still inside the debounce window into the store);
+      // only a failed/conflicted save falls back to the confirm-discard
+      // dialog — never a silent discard.
+      if (hasUnsavedWork(tabId)) {
+        const saved = await requestSave(tabId).catch(() => false);
+        if (!saved && !window.confirm('Saving failed — discard unsaved changes?')) {
+          return;
+        }
+      }
+      evictTabCache(tabId);
+      closeTab(tabId);
+    })();
+  }, [closeTab]);
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {

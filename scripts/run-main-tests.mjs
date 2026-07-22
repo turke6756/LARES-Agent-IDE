@@ -96,6 +96,8 @@ const TESTS = [
   'dist/main/main/selection-comments-send.test.js',
   'dist/main/main/detached-windows.test.js',
   'dist/main/main/detached-view-windows.test.js',
+  // Edit-loss §4.3: main-window/app close flush handshake state machine.
+  'dist/main/main/close-flush.test.js',
   'dist/main/main/browser/context-menu.test.js',
   'dist/main/main/browser/manager-shortcuts.test.js',
   'dist/main/main/browser/reader-mode.test.js',

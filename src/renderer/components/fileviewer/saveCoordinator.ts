@@ -20,6 +20,7 @@
  */
 import { useDashboardStore } from '../../stores/dashboard-store';
 import { contentHash } from '../../../shared/content-hash';
+import type { FlushResult } from '../../../shared/types';
 import { diag } from './editLossDiag';
 
 export interface SaveSnapshot {
@@ -43,13 +44,9 @@ export interface SaveAdapter {
   rebaseline?(written: SaveSnapshot): void;
 }
 
-/** Phase 4 fills the payload (plan §4.3); stub shape only in Phase 2. */
-export interface FlushResult {
-  tabId: string;
-  fileName: string;
-  outcome: 'saved' | 'pristine' | 'conflict' | 'error' | 'timeout';
-  error?: string;
-}
+// Close-flush payload (plan §4.3) — shape lives in shared/types so main's
+// close handshake and this renderer side can never drift.
+export type { FlushResult } from '../../../shared/types';
 
 interface Waiter {
   revision: number;
@@ -202,10 +199,76 @@ export function requestSave(tabId: string, opts?: { force?: boolean }): Promise<
   return promise;
 }
 
-/** Phase 4 payload (plan §4.3): flush every dirty tab against a deadline for
- * the app-close handshake. Stub in Phase 2 — signature only. */
-export async function flushAll(_deadlineMs: number): Promise<FlushResult[]> {
-  return [];
+/** A tab whose next conditional save is known-doomed (or already refused):
+ * the banner is up, or the coordinator paused it on a CAS refusal. */
+function inConflict(tabId: string): boolean {
+  return (
+    isConflictPaused(tabId) ||
+    !!useDashboardStore.getState().tabEditState[tabId]?.externalChange
+  );
+}
+
+/**
+ * App-close flush (plan §4.3): drive every editing tab to disk against a
+ * deadline and report a per-tab outcome for main's close dialog.
+ *
+ * - `action: 'flush'` (default) targets every open tab with an edit session;
+ * - `'retry'` re-saves the listed tabs (error/timeout survivors);
+ * - `'force'` re-saves ONLY conflict tabs, unconditionally — the dialog's
+ *   explicitly labeled "Overwrite anyway".
+ *
+ * A bannered/conflict-paused tab is reported 'conflict' WITHOUT re-attempting
+ * the doomed conditional write (unless forced); a tab whose save doesn't
+ * settle inside the deadline reports 'timeout' (the write itself is not
+ * cancelled — a late success is still a success).
+ */
+export async function flushAll(
+  deadlineMs: number,
+  opts?: { action?: 'flush' | 'retry' | 'force'; tabIds?: string[] },
+): Promise<FlushResult[]> {
+  const action = opts?.action ?? 'flush';
+  const { openTabs, tabEditState } = useDashboardStore.getState();
+  let targets = openTabs.filter((t) => t.filePath && tabEditState[t.id]);
+  if (opts?.tabIds) targets = targets.filter((t) => opts.tabIds!.includes(t.id));
+  if (action === 'force') targets = targets.filter((t) => inConflict(t.id));
+
+  let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<'timeout'>((resolve) => {
+    deadlineTimer = setTimeout(() => resolve('timeout'), deadlineMs);
+  });
+
+  const results = await Promise.all(
+    targets.map(async (t): Promise<FlushResult> => {
+      const fileName = t.filePath.split(/[\\/]/).pop() ?? t.filePath;
+      if (action !== 'force') {
+        if (!hasUnsavedWork(t.id)) return { tabId: t.id, fileName, outcome: 'pristine' };
+        if (inConflict(t.id)) return { tabId: t.id, fileName, outcome: 'conflict' };
+      }
+      const settled = await Promise.race([
+        requestSave(t.id, action === 'force' ? { force: true } : undefined).then(
+          (ok): 'saved' | 'failed' => (ok ? 'saved' : 'failed'),
+        ),
+        deadline,
+      ]);
+      if (settled === 'timeout') return { tabId: t.id, fileName, outcome: 'timeout' };
+      if (settled === 'saved') return { tabId: t.id, fileName, outcome: 'saved' };
+      if (inConflict(t.id)) return { tabId: t.id, fileName, outcome: 'conflict' };
+      return {
+        tabId: t.id,
+        fileName,
+        outcome: 'error',
+        error: useDashboardStore.getState().tabEditState[t.id]?.error ?? 'save failed',
+      };
+    }),
+  );
+  clearTimeout(deadlineTimer);
+  // DIAG(edit-loss): close-flush round summary — which tabs the app-close
+  // handshake drove to disk, and any it had to abandon to the dialog.
+  diag('close-flush', {
+    action,
+    results: results.map((r) => `${r.fileName}:${r.outcome}`),
+  });
+  return results;
 }
 
 async function drain(tabId: string, st: TabSaveState): Promise<void> {

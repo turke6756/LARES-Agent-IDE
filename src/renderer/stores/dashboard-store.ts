@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import type { Agent, AgentStatus, Workspace, HealthCheck, FileActivity, QueryResult, ContextStats, UsageLimitsReading, PathType, FileTab, PanelLayout, Team, TeamMessage, CreateTeamInput, DetachedClosedPayload, DetachableView } from '../../shared/types';
+import type { Agent, AgentStatus, Workspace, HealthCheck, FileActivity, QueryResult, ContextStats, UsageLimitsReading, PathType, FileTab, PanelLayout, Team, TeamMessage, CreateTeamInput, DetachedClosedPayload, DetachableView, WriteErrorCode } from '../../shared/types';
 import { beginWrite, evictTabCache } from '../components/fileviewer/useFileContentCache';
 import { contentHash } from '../components/fileviewer/markdownSplice';
 import { diag, diagBasename, diagHash } from '../components/fileviewer/editLossDiag';
@@ -116,6 +116,11 @@ interface TabEditState {
    *  conflicting if disk moved on again. `undefined` = pre-4.1 session state;
    *  consumers fall back to contentHash(originalContent). */
   expectedDiskHash?: string | null;
+  /** Writer-classified code for the last failed save (edit-loss §4.4):
+   *  'too-large'/'permission' stop autosave retries immediately; 'io' (and
+   *  unclassified failures) follow the 5s → 15s → stop backoff. Cleared
+   *  whenever `error` clears. */
+  errorCode?: WriteErrorCode | null;
 }
 
 // Per-workspace snapshot of "what the user was looking at" (view-state
@@ -749,6 +754,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
             draftContent: content,
             dirty: content !== existing.originalContent,
             error: null,
+            errorCode: null,
           },
         },
       };
@@ -836,7 +842,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
         return {
           tabEditState: {
             ...state.tabEditState,
-            [tabId]: { ...current, saving: false, error: result.error },
+            [tabId]: { ...current, saving: false, error: result.error, errorCode: result.code ?? null },
           },
         };
       });
@@ -872,6 +878,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
             dirty: fromCoordinator ? current.dirty : current.draftContent !== draftToSave,
             saving: false,
             error: null,
+            errorCode: null,
           },
         },
       };

@@ -21,7 +21,9 @@ import { checkManagedWebContents } from './security/webcontents-guard';
 import { AgentSupervisor } from './supervisor';
 import { startContinuationWatcher } from './supervisor/continuation-watcher-wiring';
 import { registerIpcHandlers } from './ipc-handlers';
-import { installExternalNavHandlers, forceCloseAllDetached, type DetachedWindowDeps } from './detached-windows';
+import { installExternalNavHandlers, forceCloseAllDetached, getDetachedEntries, type DetachedWindowDeps } from './detached-windows';
+import { runCloseFlush, type FlushTarget } from './close-flush';
+import { TAB_CHANNELS, type FlushRequestPayload } from '../shared/types';
 import { WsServer } from './ws-server';
 import { ApiServer, type BrowserToolProvider } from './api-server';
 import { OrchestrationService } from './orchestration/service';
@@ -405,6 +407,68 @@ function createWindow(): void {
   if (!app.isPackaged) {
     mainWindow.webContents.openDevTools({ mode: 'detach' });
   }
+
+  // Edit-loss §4.3: main-window close flush handshake. Closing the shell used
+  // to silently drop dirty editor tabs — in the main window AND in every
+  // detached file window (whose force-close path bypasses the per-window
+  // prompt on app quit). Now the close is intercepted, every editing renderer
+  // flushes via its save coordinator, and any conflict/error/timeout raises a
+  // native dialog (Keep waiting / Overwrite anyway / Discard and close /
+  // Cancel) — never a silent close. The shutdownStarted guard keeps an
+  // already-running quit (which force-closes windows) from deadlocking on
+  // preventDefault; OS-forced session end Electron cannot delay remains a
+  // documented best-effort exception.
+  let closeFlushState: 'idle' | 'running' | 'cleared' = 'idle';
+  mainWindow.on('close', (e) => {
+    if (closeFlushState === 'cleared' || shutdownStarted) return;
+    e.preventDefault();
+    if (closeFlushState === 'running') return;
+    closeFlushState = 'running';
+    const targets = (): FlushTarget[] => {
+      const wins: Array<{ id: string; label: string; wc: Electron.WebContents }> = [];
+      if (mainWindow && !mainWindow.isDestroyed() && !mainWindow.webContents.isDestroyed()) {
+        wins.push({ id: `main:${mainWindow.id}`, label: 'Main window', wc: mainWindow.webContents });
+      }
+      // Every detached file window participates in the same handshake —
+      // enumerate the live registry (plan §4.3.2).
+      for (const { win, req } of getDetachedEntries()) {
+        if (!win.isDestroyed() && !win.webContents.isDestroyed()) {
+          wins.push({ id: `detached:${win.id}`, label: req.label, wc: win.webContents });
+        }
+      }
+      return wins.map(({ id, label, wc }) => ({
+        id,
+        label,
+        send: (payload: FlushRequestPayload) => wc.send(TAB_CHANNELS.flushRequest, payload),
+        isAlive: () => !wc.isDestroyed(),
+      }));
+    };
+    void runCloseFlush({
+      targets,
+      showDialog: async (opts) => {
+        const parent = mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined;
+        const boxOpts = { type: 'warning' as const, title: 'Unsaved changes', noLink: true, ...opts };
+        const r = parent
+          ? await dialog.showMessageBox(parent, boxOpts)
+          : await dialog.showMessageBox(boxOpts);
+        return r.response;
+      },
+    })
+      .then((proceed) => {
+        if (proceed) {
+          closeFlushState = 'cleared';
+          if (mainWindow && !mainWindow.isDestroyed()) mainWindow.close();
+        } else {
+          closeFlushState = 'idle';
+        }
+      })
+      .catch((err) => {
+        // Never trap the user in an unclosable window on a handshake bug.
+        console.error('[close-flush] handshake failed — allowing close', err);
+        closeFlushState = 'cleared';
+        if (mainWindow && !mainWindow.isDestroyed()) mainWindow.close();
+      });
+  });
 
   const shellContents = mainWindow.webContents;
   mainWindow.on('closed', () => {

@@ -318,24 +318,31 @@ describe('external-change banner vs editor subtree (H1)', () => {
     await mounted.unmount();
   });
 
-  it('a remount while dirty (tab switch away/back) initializes the canvas from the preserved store draft', async () => {
+  it('a remount after tab switch away/back never loses the edit (Phase 4B: the unmount flush SAVES it)', async () => {
     const mounted = await mountArea();
     makeLiveEdit(EDITED);
     const draftBefore = useDashboardStore.getState().tabEditState[TAB]?.draftContent;
     expect(draftBefore).toContain('EDITED');
 
     // Simulate leaving and returning to the Files view: full unmount, then a
-    // fresh mount with the SAME dirty edit session in the store.
+    // fresh mount of the SAME edit session. Since Phase 4B the unmount is an
+    // autosave flush trigger (§4.2): the dying mount's cleanup lands the
+    // draft in the store and useAutosave's post-disposal requestSave writes
+    // it via the coordinator's store adapter.
     await mounted.unmount();
+    await flush();
     const remounted = await mountArea();
 
-    // Phase 1 §1.2: the new mount reads the store imperatively — a dirty tab
-    // mounts from draftContent, never originalContent.
+    // The edit is never lost: the new canvas still shows it (Phase 1 §1.2 —
+    // a dirty tab would mount from draftContent; a flushed-clean tab mounts
+    // from the rebaselined originalContent, which now IS the edit).
     expect(crepeSpy.latest().markdown).toContain('EDITED');
-    // B3 untouched: still dirty, Save stays enabled.
     const es = useDashboardStore.getState().tabEditState[TAB];
-    expect(es?.dirty).toBe(true);
     expect(es?.draftContent).toContain('EDITED');
+    // …and the unmount flush actually saved: B1 rebaselined to the edit,
+    // store clean (the write mock in this suite always succeeds).
+    expect(es?.dirty).toBe(false);
+    expect(es?.originalContent).toContain('EDITED');
 
     await remounted.unmount();
   });

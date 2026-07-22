@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron';
-import type { IpcApi, DetachRequest, DetachedClosedPayload, ViewDetachRequest, ViewDetachedClosedPayload } from '../shared/types';
+import type { IpcApi, DetachRequest, DetachedClosedPayload, ViewDetachRequest, ViewDetachedClosedPayload, FlushRequestPayload, FlushReplyPayload } from '../shared/types';
 import { TAB_CHANNELS, VIEW_CHANNELS } from '../shared/types';
 import { BROWSER_CHANNELS } from '../shared/browser';
 import type {
@@ -508,6 +508,15 @@ const api: IpcApi = {
     },
     closeReply: (requestId: string, decision: 'save' | 'discard' | 'cancel') =>
       ipcRenderer.invoke(TAB_CHANNELS.closeReply, requestId, decision),
+    // Edit-loss §4.3 close-flush handshake: main asks this renderer to flush
+    // its dirty editor tabs before the main window / app closes.
+    onFlushRequest: (cb: (req: FlushRequestPayload) => void) => {
+      const l = (_e: any, req: FlushRequestPayload) => cb(req);
+      ipcRenderer.on(TAB_CHANNELS.flushRequest, l);
+      return () => ipcRenderer.removeListener(TAB_CHANNELS.flushRequest, l);
+    },
+    flushReply: (payload: FlushReplyPayload) =>
+      ipcRenderer.invoke(TAB_CHANNELS.flushReply, payload),
   },
   // Detachable (tear-off) top-level views — sibling of `tabs`, no dirty-close.
   views: {

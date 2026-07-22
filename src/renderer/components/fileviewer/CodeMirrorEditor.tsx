@@ -7,6 +7,7 @@ import { oneDark } from '@codemirror/theme-one-dark';
 import { useThemeStore } from '../../stores/theme-store';
 import { getTabScrollFraction, setTabScrollFraction } from './scrollMemory';
 import type { TabFocusRange } from '../../stores/dashboard-store';
+import { useAutosave } from './useAutosave';
 
 interface Props {
   initialContent: string;
@@ -105,11 +106,19 @@ export default function CodeMirrorEditor({
   const initialContentRef = useRef(initialContent);
   const tabIdRef = useRef(tabId);
 
+  // Autosave (edit-loss §4.2): CodeMirror's undebounced edit signal — onEdit
+  // owns noteEdit (the coordinator revision, formerly called by the parent's
+  // onChange) plus the idle autosave timer; rootRef arms the focusout flush.
+  // No-op when this editor is mounted without a tabId.
+  const { onEdit, rootRef: autosaveRootRef } = useAutosave(tabId);
+  const onEditRef = useRef(onEdit);
+
   useEffect(() => {
     onChangeRef.current = onChange;
     onSaveRef.current = onSave;
     tabIdRef.current = tabId;
-  }, [onChange, onSave, tabId]);
+    onEditRef.current = onEdit;
+  }, [onChange, onSave, tabId, onEdit]);
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -134,6 +143,9 @@ export default function CodeMirrorEditor({
       ]),
       EditorView.updateListener.of((update: ViewUpdate) => {
         if (update.docChanged) {
+          // Revision first (undebounced, edit-loss §2.1), then the draft push
+          // — same ordering the pre-4B parent onChange used.
+          onEditRef.current();
           onChangeRef.current(update.state.doc.toString());
         }
       }),
@@ -232,7 +244,7 @@ export default function CodeMirrorEditor({
   }, [focusRange?.nonce]);
 
   return (
-    <div className="h-full flex flex-col bg-surface-0">
+    <div className="h-full flex flex-col bg-surface-0" ref={autosaveRootRef}>
       <div ref={containerRef} className="flex-1 min-h-0 overflow-hidden" />
       {(saving || error) && (
         <div className="shrink-0 px-3 py-1 border-t border-surface-3 text-[12px] font-sans">
