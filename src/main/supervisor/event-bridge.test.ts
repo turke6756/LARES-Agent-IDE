@@ -238,18 +238,24 @@ async function BR_07_contextThresholdOrdering(): Promise<void> {
   f.agents.set(worker.id, worker);
   const bridge = new EventBridge(f.deps);
 
+  // Noise reduction: the tiers collapsed from [80, 90, 95] to a single 95%
+  // advisory. Everything under it is silent — that is the whole point.
   bridge.onContextStatsChanged(statsAt(worker.id, 80, 1));
   await flushMicrotasks();
-  assert.equal(f.sendInputCalls.length, 1, 'BR-07: crossing 80 fires once');
+  assert.equal(f.sendInputCalls.length, 0, 'BR-07: 80% no longer notifies (sub-threshold)');
 
-  bridge.onContextStatsChanged(statsAt(worker.id, 82, 2));
+  bridge.onContextStatsChanged(statsAt(worker.id, 90, 2));
   await flushMicrotasks();
-  assert.equal(f.sendInputCalls.length, 1, 'BR-07: still in 80 bucket — no new event');
+  assert.equal(f.sendInputCalls.length, 0, 'BR-07: 90% no longer notifies (sub-threshold)');
 
-  bridge.onContextStatsChanged(statsAt(worker.id, 90, 3));
+  bridge.onContextStatsChanged(statsAt(worker.id, 95, 3));
   await flushMicrotasks();
-  assert.equal(f.sendInputCalls.length, 2, 'BR-07: crossing 90 fires a new event');
-  console.log('  BR-07 ✓ context threshold ordering 80 → 80 → 90');
+  assert.equal(f.sendInputCalls.length, 1, 'BR-07: crossing 95 fires once');
+
+  bridge.onContextStatsChanged(statsAt(worker.id, 98, 4));
+  await flushMicrotasks();
+  assert.equal(f.sendInputCalls.length, 1, 'BR-07: still in the 95 bucket — no repeat');
+  console.log('  BR-07 ✓ single 95% tier: 80/90 silent, 95 fires once, 98 does not repeat');
 }
 
 async function BR_08_consolidatedMixesKinds(): Promise<void> {
@@ -260,7 +266,7 @@ async function BR_08_consolidatedMixesKinds(): Promise<void> {
   f.agents.set(worker.id, worker);
   const bridge = new EventBridge(f.deps);
 
-  bridge.onContextStatsChanged(statsAt(worker.id, 80, 1));
+  bridge.onContextStatsChanged(statsAt(worker.id, 95, 1));
   await flushMicrotasks();
   await bridge.onStatusChanged({ agentId: worker.id, status: 'idle', fromStatus: 'working', source: 'monitor' });
 
@@ -272,7 +278,7 @@ async function BR_08_consolidatedMixesKinds(): Promise<void> {
 
   assert.equal(f.sendInputCalls.length, 1, 'BR-08: drain emitted one consolidated payload');
   const payload = f.sendInputCalls[0].text;
-  assert.ok(payload.includes('context at 80%'), 'BR-08: context_threshold rendered');
+  assert.ok(payload.includes('context at 95%'), 'BR-08: context_threshold rendered');
   assert.ok(/working → idle/.test(payload), 'BR-08: status_change rendered');
   console.log('  BR-08 ✓ consolidated batch mixes status + context');
 }
@@ -770,12 +776,12 @@ async function launchingToOtherStatuses_stillFire(): Promise<void> {
   console.log('  launching→idle ✓ guard is transition-exact (crashed/waiting from launching still fire)');
 }
 
-async function idleToDone_isSuppressed(): Promise<void> {
-  // idle → done is clean-shutdown noise: the worker already emitted its
-  // turn-end idle event, and its process has now simply exited cleanly
-  // (exit code 0 → 'done'). The supervisor must NOT be notified. A
-  // working → done from a different worker still fires, proving the guard is
-  // transition-scoped (idle → done), not status-scoped (→ done).
+async function done_isNeverNotified(): Promise<void> {
+  // 'done' is no longer a trigger status AT ALL. A clean exit (code 0) is never
+  // the actionable signal: working → idle already delivered the worker's
+  // hand-off, and the process exiting afterwards adds nothing to react to. This
+  // used to suppress only (idle → done), which still left working → done and
+  // every stop_agent teardown waking the owner for a non-event.
   const f = makeFakeBridgeDeps();
   const supervisor = makeAgent('sup-1', { isSupervisor: true, isSupervised: false, status: 'idle' });
   const worker = makeAgent('w-d1', { status: 'idle' });
@@ -789,13 +795,8 @@ async function idleToDone_isSuppressed(): Promise<void> {
     fromStatus: 'idle',
     source: 'monitor',
   });
-  assert.equal(f.sendInputCalls.length, 0,
-    'idle → done must be suppressed (pure clean-shutdown noise)');
-  assert.equal(bridge.getQueueSnapshot().length, 0,
-    'idle → done must not even be queued');
-
-  // The guard is exactly (idle, done). working → done (a worker that exits
-  // cleanly mid-turn) is still a real event the supervisor must hear about.
+  // working → done (a worker that exits cleanly mid-turn) is equally silent —
+  // the rule is status-scoped now, not transition-scoped.
   const worker2 = makeAgent('w-d2', { status: 'working' });
   f.agents.set(worker2.id, worker2);
   await bridge.onStatusChanged({
@@ -804,9 +805,24 @@ async function idleToDone_isSuppressed(): Promise<void> {
     fromStatus: 'working',
     source: 'runner-exit',
   });
+  assert.equal(f.sendInputCalls.length, 0,
+    'no → done transition may notify (idle → done AND working → done)');
+  assert.equal(bridge.getQueueSnapshot().length, 0,
+    '→ done must not even be queued');
+
+  // A non-clean exit is 'crashed', not 'done' — that one still delivers, which
+  // is what keeps this a noise cut rather than a signal loss.
+  const worker3 = makeAgent('w-d3', { status: 'working' });
+  f.agents.set(worker3.id, worker3);
+  await bridge.onStatusChanged({
+    agentId: worker3.id,
+    status: 'crashed',
+    fromStatus: 'working',
+    source: 'runner-exit',
+  });
   assert.equal(f.sendInputCalls.length, 1,
-    'working → done still fires (guard is transition-exact)');
-  console.log('  idle→done ✓ suppressed; working→done still fires');
+    'working → crashed still fires (real failure, must reach the owner)');
+  console.log('  done ✓ never notified (any transition); crashed still fires');
 }
 
 // ── BUG-11: user-typing deferral ────────────────────────────────────────
@@ -1704,7 +1720,7 @@ async function TS13_contextStatsSupervisorGuard(): Promise<void> {
   f.agents.set(supTarget.id, supTarget);
   const bridge = new EventBridge(f.deps);
 
-  bridge.onContextStatsChanged(statsAt(supTarget.id, 80, 1));
+  bridge.onContextStatsChanged(statsAt(supTarget.id, 95, 1));
   await flushMicrotasks();
   assert.equal(f.sendInputCalls.length, 0, 'TS13: supervisor context-threshold delivers nothing');
   assert.equal(bridge.getQueueSnapshot().length, 0, 'TS13: nothing queued');
@@ -1715,7 +1731,7 @@ async function TS13_contextStatsSupervisorGuard(): Promise<void> {
   const worker = makeAgent('w-1', { workspaceId: 'ws-B', isSupervised: true, status: 'working' });
   f.agents.set(supB.id, supB);
   f.agents.set(worker.id, worker);
-  bridge.onContextStatsChanged(statsAt(worker.id, 80, 1));
+  bridge.onContextStatsChanged(statsAt(worker.id, 95, 1));
   await flushMicrotasks();
   assert.equal(f.sendInputCalls.length, 1, 'TS13: worker threshold still delivers (no state corruption)');
   assert.equal(f.sendInputCalls[0].agentId, supB.id);
@@ -1960,7 +1976,7 @@ async function main(): Promise<void> {
   await BR_20_waitingToWorkingIsSuppressed();
   await launchingToIdle_isSuppressed();
   await launchingToOtherStatuses_stillFire();
-  await idleToDone_isSuppressed();
+  await done_isNeverNotified();
   await onChatEvents_codexTurnComplete();
   await onChatEvents_dispatchTable();
   await onChatEvents_geminiToolUseStillRoutes();

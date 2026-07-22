@@ -253,11 +253,23 @@ export function buildEventPayload(event: SupervisorEvent): string {
   }
 
   if (event.type === 'context_threshold') {
+    // Advisory framing, deliberately. The old wording ("compact this agent")
+    // read as a command and, fired at 80/90/95, trained supervisors to
+    // interrupt healthy near-complete work. 100% context is a COST boundary,
+    // not a model cliff — nothing breaks there and no handoff is mandatory.
     return [
       '[DASHBOARD EVENT] Context threshold crossed',
       agentLine,
       formatContext(event),
-      `Threshold: ${event.contextPercentage}% — compact this agent (read log, launch new agent with summary, stop old agent)`,
+      `Threshold: ${event.contextPercentage}% — ADVISORY, not a deadline.`,
+      '100% is not a literal cutoff: nothing breaks when an agent fills its window, '
+        + 'and no handoff is strictly required. This is about cost and efficiency — '
+        + 'a bloated context makes every remaining turn more expensive.',
+      'Prefer a continuation handoff when the agent is idle or between tasks: read its '
+        + 'log, launch a successor via launch_agent carrying the compacted context '
+        + '(accomplished / current state / next), then stop_agent the old one.',
+      'If it is mid-task and genuinely close to finishing, LET IT FINISH — tearing down '
+        + 'near-complete work costs more than the context does. Hand off after.',
     ].filter(Boolean).join('\n');
   }
 

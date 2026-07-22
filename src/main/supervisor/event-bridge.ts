@@ -93,7 +93,14 @@ export interface PlanTouchTrackerCollaborator {
 // P2-03: 'waiting' is a trigger status so the supervisor gets a notification
 // when an agent blocks on user input. The waiting → working transition (user
 // answered the prompt) is filtered below as noise.
-const TRIGGER_STATUSES: ReadonlyArray<AgentStatus> = ['idle', 'crashed', 'done', 'waiting'];
+//
+// 'done' is NOT a trigger status. A clean exit (code 0) is never the actionable
+// signal — the turn-end `idle` event already carried the worker's hand-off, and
+// the process exiting afterwards adds nothing a supervisor can act on. This
+// previously suppressed only the (idle → done) transition, which still left
+// working → done and every stop_agent teardown waking the owner for a
+// non-event. A non-clean exit is 'crashed', which still delivers.
+const TRIGGER_STATUSES: ReadonlyArray<AgentStatus> = ['idle', 'crashed', 'waiting'];
 
 // BUG-20: the chat-first preview + file-activity sections only make sense
 // for terminal statuses where the agent has just produced output. Skipped
@@ -367,6 +374,17 @@ export class EventBridge {
         this.promoteOnWorking(agent.id);
       }
 
+      // 'done' is filtered by TRIGGER_STATUSES below, but the target's turn is
+      // definitively over — consume any transient one-turn subscriptions here.
+      // Otherwise they would sit until TTL and then fire a
+      // `transient_subscription_expired` notice for an agent that simply exited
+      // cleanly: exactly the noise that dropping the 'done' event removes.
+      if (data.status === 'done') {
+        for (const s of [...(this.subscriptionsByTarget.get(agent.id) ?? [])]) {
+          this.removeSubscription(agent.id, s.subscriberAgentId);
+        }
+      }
+
       if (!TRIGGER_STATUSES.includes(data.status)) return;
       if (data.fromStatus !== undefined && data.fromStatus === data.status) return;
 
@@ -382,13 +400,8 @@ export class EventBridge {
       // still deliver.
       if (data.fromStatus === 'launching' && data.status === 'idle') return;
 
-      // idle → done is clean-shutdown noise: the worker already emitted its
-      // turn-end idle event (the actionable hand-off), and its process has now
-      // simply exited cleanly (exit code 0 → 'done'). The supervisor has
-      // nothing to react to on the exit itself, so this second event is pure
-      // noise. A non-clean exit is 'crashed', not 'done', and still delivers;
-      // any other → done transition (e.g. working → done) also still delivers.
-      if (data.fromStatus === 'idle' && data.status === 'done') return;
+      // (The former idle → done suppression is gone — 'done' is no longer a
+      // trigger status at all, so every → done transition is filtered above.)
 
       // Crashes / completions bypass the per-agent 10s cooldown (D-06): a
       // runner exit isn't a flicker, and silently dropping the second of two

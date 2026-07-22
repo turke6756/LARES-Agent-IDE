@@ -355,7 +355,8 @@ async function single_crash_BR_02b(): Promise<void> {
 }
 
 async function single_contextThreshold(): Promise<void> {
-  // Trigger: `onContextStatsChanged` with pct >= 80. Covers BR-07's wiring
+  // Trigger: `onContextStatsChanged` with pct >= 95 (the single notification
+  // tier — 80/90 are silent since the noise cut). Covers BR-07's wiring
   // end-to-end (the unit test asserts threshold ordering against a stub
   // supervisor; this asserts the dashboard-event header reaches the real
   // sendInput dep).
@@ -366,19 +367,21 @@ async function single_contextThreshold(): Promise<void> {
     h.agents.set(sup.id, sup);
     h.agents.set(worker.id, worker);
 
-    h.bridge.onContextStatsChanged(statsAt(worker.id, 80));
+    h.bridge.onContextStatsChanged(statsAt(worker.id, 95));
     await h.settle();
 
-    assert.equal(h.sendInputCalls.length, 1, 'single/ctx: one delivery on 80% crossing');
+    assert.equal(h.sendInputCalls.length, 1, 'single/ctx: one delivery on 95% crossing');
     assert.match(h.sendInputCalls[0].text, /\[DASHBOARD EVENT\] Context threshold crossed/,
       'single/ctx: context-threshold dashboard header rendered');
-    assert.match(h.sendInputCalls[0].text, /Context: 80%/,
+    assert.match(h.sendInputCalls[0].text, /Context: 95%/,
       'single/ctx: percentage line rendered');
+    assert.match(h.sendInputCalls[0].text, /ADVISORY, not a deadline/,
+      'single/ctx: advisory framing reaches the supervisor (not a compact order)');
 
     // Same bucket → no new event (BR-07 ordering verified end-to-end).
-    h.bridge.onContextStatsChanged(statsAt(worker.id, 82));
+    h.bridge.onContextStatsChanged(statsAt(worker.id, 98));
     await h.settle();
-    assert.equal(h.sendInputCalls.length, 1, 'single/ctx: 82% in same bucket — no new event');
+    assert.equal(h.sendInputCalls.length, 1, 'single/ctx: 98% in same bucket — no new event');
     console.log('  single/ctx ✓ context threshold crossing → supervisor notified');
   } finally { h.dispose(); }
 }
@@ -571,7 +574,7 @@ async function MS_02_perSupervisorQueueIsolation(): Promise<void> {
 
 async function MS_03_perSupervisorThresholdIsolation(): Promise<void> {
   // MS-03 — Two workers under different supervisors (same workspace) each
-  // cross 80%; each supervisor receives only its own worker's threshold
+  // cross 95%; each supervisor receives only its own worker's threshold
   // event. Per the ticket text, this also asserts "per-supervisor
   // `lastContextThreshold` state isolated" — that map is already per-worker
   // today, so the real failure surface is the routing seam.
@@ -591,8 +594,8 @@ async function MS_03_perSupervisorThresholdIsolation(): Promise<void> {
     h.agents.set(workerB.id, workerB);
     // INTENTIONALLY no installSupervisorIdResolver — testing HEAD wiring.
 
-    h.bridge.onContextStatsChanged(statsAt(workerA.id, 80));
-    h.bridge.onContextStatsChanged(statsAt(workerB.id, 80));
+    h.bridge.onContextStatsChanged(statsAt(workerA.id, 95));
+    h.bridge.onContextStatsChanged(statsAt(workerB.id, 95));
     await h.settle();
 
     const aSends = h.sendInputCalls.filter(c => c.agentId === supA.id);

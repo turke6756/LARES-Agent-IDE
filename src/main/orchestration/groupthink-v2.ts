@@ -470,6 +470,20 @@ async function launchAgentWithKickoff(
     freshSession: true,
     isSupervised: true,
     ownerAgentId: opts.ownerAgentId,
+    // notifyOwner mute — GroupThink members stay OWNED by the launching
+    // supervisor (grouping, investigation authority, and the terminal-owner
+    // structural backstop are all preserved) but their per-turn lifecycle
+    // events are suppressed at the EventBridge choke point.
+    //
+    // Rationale: inside a deliberation, working → idle is the ORCHESTRATOR's
+    // signal — it is how this script knows a member finished a turn and it is
+    // time to relay the message to the other member. Those flips happen once
+    // per round per member and mean nothing to the supervisor, which is not
+    // driving the relay. The supervisor's real signals are the run-level ones
+    // this orchestration emits itself: the final written artifact, or a stall /
+    // failure. Leaving the mute off made every GroupThink run spam its
+    // launcher with a dozen turn-end events it must read and discard.
+    notifyOwner: false,
     // WP6 planning-surface rail: stamp the run's plan_id/section onto EVERY
     // launched member (lead, reviewer, both parallel planners). The supervisor
     // launch rail (WP1) injects these into AGENT_DASHBOARD_PLAN_ID /
