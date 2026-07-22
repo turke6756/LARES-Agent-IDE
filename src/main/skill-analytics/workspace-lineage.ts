@@ -30,6 +30,12 @@ export type WorkspaceAttributionMethod = 'explicit' | 'root';
  *  of lane-attribution's TEMPLATE_TAILS) so the workspace concern stays decoupled from
  *  the lane concern — the two evolve independently. */
 const TEMPLATE_TAILS: readonly string[] = [
+  '.lares/supervisor',
+  '.lares/researcher',
+  '.lares/workers/claude',
+  '.lares/workers/codex',
+  // Legacy `.dashboard/**` — historical session streams permanently carry the
+  // pre-rename template dirs; folding must keep recognizing them.
   '.dashboard/supervisor',
   '.dashboard/researcher',
   '.dashboard/workers/claude',

@@ -2,7 +2,7 @@
 // launchAgent (src/main/supervisor/index.ts, just after agentCwd resolution).
 //
 // Covers:
-//   1. Supervised codex launch on Windows mkdirs `.dashboard/workers/codex/`
+//   1. Supervised codex launch on Windows mkdirs `.lares/workers/codex/`
 //      that the claude-only scaffolder would otherwise skip.
 //   2. Explicit `working_directory` that escapes the workspace root is
 //      rejected with a clear error instead of silently mkdir-ing arbitrary
@@ -120,7 +120,7 @@ function makeSupervisor(): AgentSupervisor {
 
 // ── Tests ────────────────────────────────────────────────────────────
 
-test('launchAgent mkdirs .dashboard/workers/<provider>/ for a supervised codex launch (Windows)', async () => {
+test('launchAgent mkdirs .lares/workers/<provider>/ for a supervised codex launch (Windows)', async () => {
   const workspacePath = fs.mkdtempSync(path.join(os.tmpdir(), 'ad-cwd-codex-'));
   const created: Agent[] = [];
   const restoreDb = patchDb(workspacePath, created);
@@ -128,7 +128,7 @@ test('launchAgent mkdirs .dashboard/workers/<provider>/ for a supervised codex l
   try {
     const supervisor = makeSupervisor();
 
-    const expectedCwd = path.join(workspacePath, '.dashboard', 'workers', 'codex');
+    const expectedCwd = path.join(workspacePath, '.lares', 'workers', 'codex');
     assert.equal(
       fs.existsSync(expectedCwd),
       false,
@@ -185,9 +185,9 @@ test('launchAgent rejects working_directory that escapes the workspace root', as
     );
 
     // The escape dir was a pre-existing tmpdir — confirm we didn't leak any
-    // .dashboard subtree into it (i.e. the throw happened before mkdir).
+    // .lares subtree into it (i.e. the throw happened before mkdir).
     assert.equal(
-      fs.existsSync(path.join(escapePath, '.dashboard')),
+      fs.existsSync(path.join(escapePath, '.lares')),
       false,
       'guard must throw before any mkdir under the escape path',
     );

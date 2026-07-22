@@ -7,10 +7,12 @@
 
 export type MutabilityClass = 'user-owned' | 'scaffold-managed' | 'generated-vendor';
 
-// A `.dashboard/**/.claude/skills/` tree: skill dirs the dashboard scaffolds
-// from constants (SUPERVISOR_*_SKILL, worker templates) and re-writes on launch
-// with content-hash migration. Editing one in place is not durable → managed.
-const SCAFFOLD_SKILLS = /\/\.dashboard\/.*\/\.claude\/skills(\/|$)/;
+// A `.lares/**/.claude/skills/` tree (legacy spelling `.dashboard/**` — kept
+// recognized because historical records carry it): skill dirs the dashboard
+// scaffolds from constants (SUPERVISOR_*_SKILL, worker templates) and
+// re-writes on launch with content-hash migration. Editing one in place is
+// not durable → managed.
+const SCAFFOLD_SKILLS = /\/\.(?:lares|dashboard)\/.*\/\.claude\/skills(\/|$)/;
 
 // Plugin + cache + vendored trees are regenerated, never hand-authored. Checked
 // BEFORE the user-owned catch-all so `~/.claude/plugins/**` classifies as vendor
@@ -18,7 +20,7 @@ const SCAFFOLD_SKILLS = /\/\.dashboard\/.*\/\.claude\/skills(\/|$)/;
 const GENERATED_VENDOR = /(^|\/)(node_modules|\.cache|caches)(\/|$)|\/plugins\//;
 
 /** Classify how mutable (safe-to-edit) an absolute path is.
- *  - `scaffold-managed` — dashboard-scaffolded skill dirs under `.dashboard`.
+ *  - `scaffold-managed` — dashboard-scaffolded skill dirs under `.lares` (or legacy `.dashboard`).
  *  - `generated-vendor` — plugin/cache/vendored trees; propose editing the source, not the file.
  *  - `user-owned` — workspace `CLAUDE.md`, `~/.claude/**`, and anything else the user authored.
  *  Case-insensitive; tolerant of both `\\` and `/` separators. */

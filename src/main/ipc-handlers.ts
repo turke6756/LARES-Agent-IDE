@@ -49,6 +49,8 @@ import { getSharedParseManager, setParseManagerProgressSink } from './skill-anal
 import { querySkillUsage, type QueryDb } from './skill-analytics/queries';
 import { queryMcpToolUsage } from './skill-analytics/mcp-tool-usage-queries';
 import { getDb } from './database';
+import { migrateWorkspaceStateDir } from './workspace-state-dir';
+import { ensureInstallationLauncher } from './installation-descriptor';
 
 // Managed temp dir for clipboard-bitmap pastes. Dropped OS files inject their
 // OWN on-disk path (converted) and never land here — only screenshots do.
@@ -68,7 +70,18 @@ export function registerIpcHandlers(
 ): void {
   // Workspace handlers
   ipcMain.handle('workspace:list', () => getWorkspaces());
-  ipcMain.handle('workspace:create', (_e, input) => createWorkspace(input));
+  ipcMain.handle('workspace:create', (_e, input) => {
+    const ws = createWorkspace(input);
+    // One-time `.dashboard/` → `.lares/` state-dir migration: a newly
+    // registered workspace may be an existing project folder that still
+    // carries the legacy state dir. Never throws (warn-and-continue inside).
+    migrateWorkspaceStateDir(ws.path, ws.pathType);
+    // WP1 (G1) — installation-owned snapshot launcher, written at workspace
+    // registration (the per-launch refresh in ensureWorkspaceScripts heals it
+    // thereafter). Never throws (warn-and-skip inside).
+    ensureInstallationLauncher(ws.path, ws.pathType);
+    return ws;
+  });
   ipcMain.handle('workspace:delete', (_e, id) => deleteWorkspace(id));
   ipcMain.handle('workspace:reorder', (_e, ids: string[]) => reorderWorkspaces(ids));
 

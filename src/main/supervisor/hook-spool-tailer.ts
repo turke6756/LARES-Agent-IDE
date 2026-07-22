@@ -2,7 +2,7 @@
 // (plans/p1-hook-spool-multi-transport.md §3).
 //
 // The v7 hook script ALWAYS appends its event record to
-// <workspace>/.dashboard/pending-status.jsonl (transport 1). This tailer
+// <workspace>/.lares/pending-status.jsonl (transport 1). This tailer
 // polls that file once per StatusMonitor tick (driven by the supervisor's
 // single hook-transport poller — never per-agent) and forwards every
 // complete, well-formed record to the supervisor's central applier.
@@ -18,6 +18,7 @@
 import fs from 'fs';
 import path from 'path';
 import { detectPathType, wslToWindowsPath } from '../path-utils';
+import { workspaceStateDir } from '../workspace-state-dir';
 import type { ParsedHookEvent } from './index';
 
 /** Startup lookback window: at init the tailer seeks to
@@ -39,7 +40,7 @@ export function resolveSpoolReadPath(workspaceRoot: string): string {
   const winRoot = detectPathType(workspaceRoot) === 'wsl' && workspaceRoot.startsWith('/')
     ? wslToWindowsPath(workspaceRoot)
     : workspaceRoot;
-  return path.join(winRoot, '.dashboard', 'pending-status.jsonl');
+  return path.join(workspaceStateDir(winRoot), 'pending-status.jsonl');
 }
 
 /** Canonical map key for a spool read path. Tailer instances are keyed by

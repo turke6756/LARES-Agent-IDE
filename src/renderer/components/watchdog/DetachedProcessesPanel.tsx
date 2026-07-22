@@ -1,7 +1,7 @@
 // Detached-process transparency section (incident-2026-07-11 §5 Wave 5).
 //
 // Lists the detached OS processes that agents self-registered under the
-// workspace's .dashboard/detached/ directory. Each row's `liveness` is the
+// workspace's .lares/detached/ directory. Each row's `liveness` is the
 // main-process verdict — NEVER the raw `running` flag — so a hard-killed
 // process (whose descriptor still claims running:true) shows as "dead", and a
 // recycled PID shows as "reused". Read-only; polls on a slow cadence.

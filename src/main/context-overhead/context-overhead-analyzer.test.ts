@@ -126,7 +126,10 @@ test('missing built-in lane dirs are skipped with a global warning', () => {
   const readLog: string[] = [];
   const deps = makeDeps(baseFiles(), new Set([WORKER_DIR]), readLog);
   const model = analyzeOverhead('w1', WS, 'windows', deps);
-  assert.ok(model.globalWarnings.some((w) => w.includes('.dashboard/supervisor')));
+  // The skip warning names the canonical `.lares/**` relDir even though this
+  // fixture workspace carries its lane dirs under the legacy `.dashboard/**`
+  // spelling (which the analyzer probes as a fallback).
+  assert.ok(model.globalWarnings.some((w) => w.includes('.lares/supervisor')));
 });
 
 test('resident headline excludes skill bodies (on-demand); total = resident + on-demand', () => {

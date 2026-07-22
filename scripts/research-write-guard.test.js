@@ -40,7 +40,10 @@ function writePayload(filePath, content) {
 }
 
 const WS = '/tmp/ws';
-const INBOX = `${WS}/.dashboard/research/inbox`;
+const INBOX = `${WS}/.lares/research/inbox`;
+// Legacy spelling — exercises the guard's `.dashboard/research/` fallback marker
+// (rename-blocked sessions still write there).
+const LEGACY_INBOX = `${WS}/.dashboard/research/inbox`;
 const VALID_PATH = `${INBOX}/my-topic/2026-06-14T120000-findings.md`;
 
 function artifact(over) {
@@ -89,7 +92,7 @@ test('valid artifact in inbox/ is allowed', () => {
 test('write outside the research store is blocked (default-deny containment)', () => {
   assertBlocked(
     runGuard(writePayload(`${WS}/src/foo.ts`, 'export const x = 1;\n')),
-    /confined to \.dashboard\/research\/inbox\/ \(path is outside the research store\)/,
+    /confined to \.lares\/research\/inbox\/ \(path is outside the research store\)/,
   );
 });
 
@@ -134,17 +137,17 @@ test('trust: cleared in inbox is blocked with the WP-F pointer', () => {
 });
 
 test('write under research/ but outside inbox/ is blocked', () => {
-  const clearedPath = `${WS}/.dashboard/research/cleared/my-topic/2026-06-14T120000-findings.md`;
+  const clearedPath = `${WS}/.lares/research/cleared/my-topic/2026-06-14T120000-findings.md`;
   assertBlocked(
     runGuard(writePayload(clearedPath, artifact())),
-    /researcher may only write under \.dashboard\/research\/inbox\//,
+    /researcher may only write under \.lares\/research\/inbox\//,
   );
 });
 
 test('write directly under research/ root is blocked (outside inbox)', () => {
   assertBlocked(
-    runGuard(writePayload(`${WS}/.dashboard/research/notes.md`, artifact())),
-    /researcher may only write under \.dashboard\/research\/inbox\//,
+    runGuard(writePayload(`${WS}/.lares/research/notes.md`, artifact())),
+    /researcher may only write under \.lares\/research\/inbox\//,
   );
 });
 
@@ -156,8 +159,21 @@ test('malformed filename (no timestamp prefix) is blocked', () => {
 });
 
 test('Windows-style backslash path is normalized and validated', () => {
-  const winPath = 'C:\\ws\\.dashboard\\research\\inbox\\my-topic\\2026-06-14T120000-findings.md';
+  const winPath = 'C:\\ws\\.lares\\research\\inbox\\my-topic\\2026-06-14T120000-findings.md';
   assertAllowed(runGuard(writePayload(winPath, artifact())));
+});
+
+// ── Legacy `.dashboard/research/` marker (rename-blocked fallback session) ──
+
+test('valid artifact in the LEGACY .dashboard inbox is still allowed', () => {
+  assertAllowed(runGuard(writePayload(`${LEGACY_INBOX}/my-topic/2026-06-14T120000-findings.md`, artifact())));
+});
+
+test('legacy .dashboard research/ write outside inbox/ is still blocked', () => {
+  assertBlocked(
+    runGuard(writePayload(`${WS}/.dashboard/research/notes.md`, artifact())),
+    /researcher may only write under \.lares\/research\/inbox\//,
+  );
 });
 
 // ── Runner ───────────────────────────────────────────────────────────

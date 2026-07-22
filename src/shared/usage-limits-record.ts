@@ -1,7 +1,7 @@
 // Pure, dependency-free builders for the dashboard statusline script.
 //
 // These two functions are the ONLY logic the on-disk
-// `.dashboard/scripts/dashboard-statusline.mjs` needs beyond stdin/IO plumbing.
+// `.lares/scripts/dashboard-statusline.mjs` needs beyond stdin/IO plumbing.
 // They are embedded verbatim into DASHBOARD_STATUSLINE_SCRIPT_MJS via
 // Function.prototype.toString() (see src/shared/constants.ts) AND imported
 // directly by usage-limits-watcher.test.ts — so the tested logic and the bytes

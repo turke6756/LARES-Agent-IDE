@@ -21,7 +21,7 @@ import type { BirthdayResolver } from './resident-inventory';
  * resident section by walking git history:
  *   • the resident file's OWN git history (tracked runtime files), else
  *   • the mirrored scaffold constant's lineage in `<repoDir>/src/shared/constants.ts`
- *     (gitignored `.dashboard/…` copies — via `makeProductionScaffoldConstantResolver`),
+ *     (gitignored `.lares/…` copies — via `makeProductionScaffoldConstantResolver`),
  *   • falling through to the file mtime, then 'none'.
  *
  * `repoDir` is the APP's own repository root (where `src/shared/constants.ts` lives),

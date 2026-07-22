@@ -329,7 +329,7 @@ export function composePlanEvent(deps: ComposePlanEventDeps, args: ComposePlanEv
       untilIso: args.untilIso,
       workspaceRoot: ctx.workspaceRoot,
       planRelPath: ctx.planRelPath,
-      excludeDirs: ['.dashboard'],
+      excludeDirs: ['.lares', '.dashboard'],
     });
     return serializeRepoActivityEvidence(evidence);
   }, null);

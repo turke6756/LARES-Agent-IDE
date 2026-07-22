@@ -873,7 +873,7 @@ export class StatusMonitor extends EventEmitter {
     console.warn(
       `[class-iv] supervised ${agent.provider} worker ${agent.id} received input ` +
       `${minutes} min ago and is idle, but no Stop-hook event has ever ` +
-      `been recorded — verify .dashboard/scripts/dashboard-status.mjs is ` +
+      `been recorded — verify .lares/scripts/dashboard-status.mjs is ` +
       `wired and AGENT_ID + DASHBOARD_PORT envs reach the worker.`
     );
     this.lastWatchdogWarnAt.set(agent.id, now);

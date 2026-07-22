@@ -31,7 +31,7 @@ import { toolsetsForLane } from '../supervisor/mcp-config-builder';
 // source of truth for deriving it.
 //
 // Pure + IO-free. Lane is derived from a stream's FIRST-entry (launch) working
-// directory — NOT last-seen — because dashboard agents launch in a `.dashboard/**`
+// directory — NOT last-seen — because dashboard agents launch in a `.lares/**`
 // template subdir and then `cd` to the workspace root (wp2b §4.3 / master caution).
 // The launch cwd is the stable role signal; the post-cd cwd is not.
 //
@@ -41,10 +41,17 @@ import { toolsetsForLane } from '../supervisor/mcp-config-builder';
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** The lane a launch cwd resolves to. Superset of `AgentRoleLane` with `unknown`
- *  for an unrecognized `.dashboard/**` template dir or an unusable path. */
+ *  for an unrecognized `.lares/**` (or legacy `.dashboard/**`) template dir or an unusable path. */
 export type LaneVerdict = 'supervisor' | 'researcher' | 'worker' | 'legacy' | 'unknown';
 
 const TEMPLATE_TAILS: readonly { tail: string; lane: LaneVerdict }[] = [
+  { tail: '.lares/supervisor', lane: 'supervisor' },
+  { tail: '.lares/researcher', lane: 'researcher' },
+  { tail: '.lares/workers/claude', lane: 'worker' },
+  { tail: '.lares/workers/codex', lane: 'worker' },
+  // Legacy `.dashboard/**` template dirs — historical session streams (and
+  // rename-failed fallback sessions) permanently carry the old name, so the
+  // lane derivation must keep recognizing both. Never used for construction.
   { tail: '.dashboard/supervisor', lane: 'supervisor' },
   { tail: '.dashboard/researcher', lane: 'researcher' },
   { tail: '.dashboard/workers/claude', lane: 'worker' },
@@ -63,7 +70,10 @@ export function laneForWorkingDir(dir: string | null | undefined): LaneVerdict {
   for (const { tail, lane } of TEMPLATE_TAILS) {
     if (n === tail || n.endsWith('/' + tail)) return lane;
   }
-  if (n === '.dashboard' || n.includes('/.dashboard/') || n.endsWith('/.dashboard')) {
+  if (
+    n === '.lares' || n.includes('/.lares/') || n.endsWith('/.lares') ||
+    n === '.dashboard' || n.includes('/.dashboard/') || n.endsWith('/.dashboard')
+  ) {
     return 'unknown';
   }
   return 'legacy';

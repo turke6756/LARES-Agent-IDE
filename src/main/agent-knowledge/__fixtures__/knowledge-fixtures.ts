@@ -17,10 +17,10 @@ import type {
 } from '../../../shared/types';
 
 export const WS_ROOT = '/ws';
-export const AGENT_CLAUDE = '/ws/.dashboard/workers/claude/CLAUDE.md';
+export const AGENT_CLAUDE = '/ws/.lares/workers/claude/CLAUDE.md';
 export const WS_CLAUDE = '/ws/CLAUDE.md';
 export const IMPORTED = '/ws/behavioral-notes.md';
-export const SKILL = '/ws/.dashboard/workers/claude/.claude/skills/deep-research/SKILL.md';
+export const SKILL = '/ws/.lares/workers/claude/.claude/skills/deep-research/SKILL.md';
 
 // Agent-level CLAUDE.md: one positive imperative, one prohibition, a workflow
 // heading with a numbered step, a MEMORY reference, and a backticked path.
@@ -136,7 +136,7 @@ export function buildFixtureAgent(): AgentContextOverhead {
   const importChild = mkSource('import', IMPORTED, '@behavioral-notes.md', 'workspace-ancestor');
 
   const agentFrame: InheritanceFrame = {
-    dir: '/ws/.dashboard/workers/claude',
+    dir: '/ws/.lares/workers/claude',
     scope: 'agent',
     distanceFromAgentCwd: 0,
     included: true,
@@ -166,11 +166,11 @@ export function buildFixtureAgent(): AgentContextOverhead {
   };
 
   return {
-    id: 'builtin:.dashboard/workers/claude',
+    id: 'builtin:.lares/workers/claude',
     name: 'Worker (claude)',
     kind: 'builtin-worker',
     lane: 'worker',
-    workingDir: '/ws/.dashboard/workers/claude',
+    workingDir: '/ws/.lares/workers/claude',
     pathType: 'wsl',
     inheritanceChain: [agentFrame, ancestorFrame, excludedFrame],
     mcpServers: [

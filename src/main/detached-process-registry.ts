@@ -3,7 +3,7 @@
 // Agents can launch *detached* OS processes — long-running jobs that outlive the
 // turn that spawned them and are NOT owned by the CLI Job Object the watchdog
 // tracks. By convention each such process self-registers a JSON descriptor at
-//   <workspace>/.dashboard/detached/<something>.json
+//   <workspace>/.lares/detached/<something>.json
 // and refreshes it on every state write (flipping `running:false` on any clean
 // exit path).
 //
@@ -29,6 +29,7 @@ import { promises as fsp } from 'fs';
 import { spawn } from 'child_process';
 import * as path from 'path';
 import type { DetachedProcessDto, DetachedLiveness } from '../shared/types';
+import { workspaceStateDir } from './workspace-state-dir';
 
 /** Per-PID probe result: is it alive, and (best-effort) its live command line. */
 export interface DetachedProbeResult {
@@ -316,5 +317,5 @@ export function defaultDetachedRegistryDeps(): DetachedRegistryDeps {
 /** Convenience for the IPC handler: resolve the detached dir under a workspace
  *  root and list it with the default deps. */
 export function detachedDirFor(workspaceRoot: string): string {
-  return path.join(workspaceRoot, '.dashboard', 'detached');
+  return path.join(workspaceStateDir(workspaceRoot), 'detached');
 }

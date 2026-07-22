@@ -57,6 +57,7 @@ import type { MemorySnapshot, AdmissionDecision } from './watchdog/types';
 import { AttributionService } from './watchdog/attribution-service';
 import { usageForAgent } from './watchdog/attribution';
 import { composeSystemMemoryView } from './watchdog/system-memory-view';
+import { migrateWorkspaceStateDir } from './workspace-state-dir';
 import { parseAnalyticsSnapshotArgv, flushStdio } from './analytics-export/analytics-snapshot-argv';
 import {
   listDetachedProcesses,
@@ -348,9 +349,9 @@ function createWindow(): void {
     minWidth: 1000,
     minHeight: 700,
     center: true,
-    title: 'Agent Dashboard',
+    title: 'Lares',
     icon: iconPath,
-    // Hide the native title bar row ("Agent Dashboard") to reclaim vertical
+    // Hide the native title bar row ("Lares") to reclaim vertical
     // space. The min/max/close buttons float top-right via the overlay, and
     // the menu bar (File / Edit / View / Help) becomes the top row.
     titleBarStyle: 'hidden',
@@ -630,6 +631,13 @@ app.whenReady().then(async () => {
   // WP1: the analytics-snapshot branch above owns this launch end-to-end —
   // no window, no supervisor, no servers.
   if (analyticsSnapshotArgv !== null) return;
+  // Give Windows an explicit app identity so the taskbar/jump-list uses our
+  // window icon (the Lares mark) instead of falling back to electron.exe's
+  // default atom icon. No-op on macOS/Linux.
+  if (process.platform === 'win32') {
+    app.setAppUserModelId('com.lares.app');
+  }
+
   // Strip any frame-blocking headers from Jupyter responses. Don't add CORS
   // headers here — `Access-Control-Allow-Origin: *` combined with
   // `Access-Control-Allow-Credentials: true` is an invalid pair that Chromium
@@ -677,6 +685,16 @@ app.whenReady().then(async () => {
     console.log('Initializing database...');
     initDatabase();
     console.log('Database initialized');
+
+    // Lares rebrand — one-time `.dashboard/` → `.lares/` state-dir rename for
+    // every registered workspace, BEFORE anything touches workspace state
+    // (detached-process registry, usage-limits watcher, persona scan, agent
+    // launches). Lazy call sites (workspaceStateDirName) would migrate on
+    // first touch anyway; running it here makes the rename happen at one
+    // predictable moment. Never throws — warn-and-fall-back inside.
+    for (const ws of getWorkspaces()) {
+      migrateWorkspaceStateDir(ws.path, ws.pathType);
+    }
 
     // Boot lifecycle op, deliberately OUTSIDE initDatabase (which runs more than
     // once in some processes/tests). An 'open' continuation attempt is owned by

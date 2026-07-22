@@ -10,12 +10,13 @@ import { terminalCache, disposeCachedTerminal, reapOnLeave } from './terminal-ca
 import type { Agent } from '../../../shared/types';
 
 /** Strip persona-folder suffix to show the workspace root name.
- *  Handles both the new .dashboard/supervisor layout and the legacy
- *  .claude/agents/<name> layout still in persisted agent rows. */
+ *  Handles the live .lares/supervisor layout plus the legacy
+ *  .dashboard/supervisor and .claude/agents/<name> layouts still in
+ *  persisted agent rows. */
 function getDisplayDirectory(agent: Agent): string {
   const dir = agent.workingDirectory.replace(/\\/g, '/');
   const stripped = agent.isSupervisor
-    ? dir.replace(/\/\.dashboard\/supervisor$/, '').replace(/\/\.claude\/agents\/[^/]+$/, '')
+    ? dir.replace(/\/\.(?:lares|dashboard)\/supervisor$/, '').replace(/\/\.claude\/agents\/[^/]+$/, '')
     : dir;
   return stripped.split('/').filter(Boolean).pop() || stripped;
 }

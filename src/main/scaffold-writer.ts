@@ -15,6 +15,8 @@ import fs from 'fs';
 import path from 'path';
 import { execFileSync } from 'child_process';
 import crypto from 'crypto';
+import { LARES_DIR_NAME, LEGACY_LARES_DIR_NAME } from '../shared/constants';
+import { translateStateRelPath } from './workspace-state-dir';
 
 /** A managed scaffold-map entry. Per-file `version` is hand-bumped when the
  *  bundled `content` changes; `previousHashes` maps old version numbers to
@@ -29,10 +31,12 @@ export interface ScaffoldFile {
 }
 
 /** Sidecar tracks the on-disk version of every managed scaffold file in a
- *  workspace. Keyed by path relative to `.dashboard/`, no leading slash,
- *  forward slashes always. */
-export const SCAFFOLD_SIDECAR_REL = '.dashboard/.scaffold-versions.json';
-export const SCAFFOLD_LOCK_REL = '.dashboard/.scaffold-versions.lock';
+ *  workspace. Keyed by path relative to the state dir (`.lares/`), no leading
+ *  slash, forward slashes always — the prefix is stripped so sidecar keys
+ *  written under the legacy `.dashboard/` name stay valid after the folder
+ *  rename. */
+export const SCAFFOLD_SIDECAR_REL = `${LARES_DIR_NAME}/.scaffold-versions.json`;
+export const SCAFFOLD_LOCK_REL = `${LARES_DIR_NAME}/.scaffold-versions.lock`;
 const SCAFFOLD_LOCK_STALE_MS = 60_000;
 const SCAFFOLD_LOCK_POLL_MS = 100;
 const SCAFFOLD_LOCK_TIMEOUT_MS = 5_000;
@@ -41,12 +45,15 @@ export function sha256Hex(content: string | Buffer): string {
   return crypto.createHash('sha256').update(content).digest('hex');
 }
 
-/** Strip the leading `.dashboard/` segment from a scaffold-map relPath so
- *  the sidecar key is stable across map reshuffles. `\` is normalized to
- *  `/` to keep Windows and WSL keys identical. */
+/** Strip the leading state-dir segment (`.lares/`, or the legacy
+ *  `.dashboard/`) from a scaffold-map relPath so the sidecar key is stable
+ *  across map reshuffles AND across the `.dashboard` → `.lares` folder
+ *  rename (a migrated workspace's existing sidecar keys keep matching). `\`
+ *  is normalized to `/` to keep Windows and WSL keys identical. */
 export function normalizeManagedKey(relPath: string): string {
   let s = relPath.replace(/\\/g, '/');
-  if (s.startsWith('.dashboard/')) s = s.slice('.dashboard/'.length);
+  if (s.startsWith(`${LARES_DIR_NAME}/`)) s = s.slice(`${LARES_DIR_NAME}/`.length);
+  else if (s.startsWith(`${LEGACY_LARES_DIR_NAME}/`)) s = s.slice(`${LEGACY_LARES_DIR_NAME}/`.length);
   return s.replace(/^\/+/, '');
 }
 
@@ -175,10 +182,13 @@ export function writeScaffoldMap(
 
 /** Resolve a workspace-relative path to its absolute form for the given
  *  pathType. Windows uses path.join (handles backslashes); WSL/Linux uses
- *  forward slashes throughout. */
+ *  forward slashes throughout. `.lares/`-prefixed paths are translated to the
+ *  workspace's ACTUAL state dir first, so a rename-failed workspace (still on
+ *  `.dashboard/` this session) keeps its scaffolds in one folder. */
 function scaffoldFullPath(workDir: string, relPath: string, pathType: string): string {
-  if (pathType === 'wsl') return `${workDir}/${relPath}`;
-  return path.join(workDir, relPath);
+  const effectiveRel = translateStateRelPath(workDir, relPath, pathType);
+  if (pathType === 'wsl') return `${workDir}/${effectiveRel}`;
+  return path.join(workDir, effectiveRel);
 }
 
 export function scaffoldFileExists(workDir: string, relPath: string, pathType: string): boolean {
@@ -296,7 +306,7 @@ function writeScaffoldSidecar(workDir: string, sidecar: Record<string, number>, 
  *  race the sidecar — atomic writes still keep individual files intact). */
 function acquireScaffoldLock(workDir: string, pathType: string, logPrefix = '[scaffold]'): () => void {
   const lockFull = scaffoldFullPath(workDir, SCAFFOLD_LOCK_REL, pathType);
-  const dashboardDir = scaffoldFullPath(workDir, '.dashboard', pathType);
+  const dashboardDir = scaffoldFullPath(workDir, LARES_DIR_NAME, pathType);
   const start = Date.now();
 
   while (Date.now() - start < SCAFFOLD_LOCK_TIMEOUT_MS) {

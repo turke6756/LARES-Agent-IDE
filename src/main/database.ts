@@ -138,12 +138,12 @@ export function initDatabase(): void {
   try { db.exec(`ALTER TABLE agents ADD COLUMN is_supervised INTEGER NOT NULL DEFAULT 0`); } catch { /* column already exists */ }
 
   // Migration: add is_worker column (hook-based status lane — launches from
-  // .dashboard/workers/<provider>/, disables PTY + chat-event inference; does
+  // .lares/workers/<provider>/, disables PTY + chat-event inference; does
   // NOT notify a supervisor). Orthogonal to is_supervised; see Agent.isWorker.
   try { db.exec(`ALTER TABLE agents ADD COLUMN is_worker INTEGER NOT NULL DEFAULT 0`); } catch { /* column already exists */ }
 
   // Migration: add is_researcher column (browser-parity-and-capability-isolation
-  // §0, D-1) — the researcher role-lane: scaffolded into .dashboard/researcher,
+  // §0, D-1) — the researcher role-lane: scaffolded into .lares/researcher,
   // browser MCP only, native dangerous tools withheld. Mutually exclusive with
   // the other lane flags; see Agent.isResearcher.
   try { db.exec(`ALTER TABLE agents ADD COLUMN is_researcher INTEGER DEFAULT 0`); } catch { /* column already exists */ }

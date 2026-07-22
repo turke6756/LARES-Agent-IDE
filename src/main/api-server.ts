@@ -2,6 +2,7 @@ import http from 'http';
 import type { AddressInfo } from 'net';
 import { URL } from 'url';
 import { getApiToken, decideApiAccess } from './security/api-auth';
+import { workspaceStateDir } from './workspace-state-dir';
 import type { AgentSupervisor } from './supervisor';
 import {
   getAgent, getAllAgents, getAgentsByWorkspace, getAgentsByOwner, getWorkspace, getSupervisorAgent,
@@ -625,7 +626,7 @@ export class ApiServer {
     const workspaceRoot = workspaceId ? getWorkspaceRecord(workspaceId)?.path : undefined;
     return {
       workspaceRoot,
-      dashboardRoot: workspaceRoot ? nodePath.join(workspaceRoot, '.dashboard') : undefined,
+      dashboardRoot: workspaceRoot ? workspaceStateDir(workspaceRoot) : undefined,
       homeDir: os.homedir(),
       // SEAM: per-skill roots (`$SKILL/<name>`) require a scaffold scan; without it a
       // skill path falls back to $DASHBOARD/$WORKSPACE (still username/drive-free — safe).

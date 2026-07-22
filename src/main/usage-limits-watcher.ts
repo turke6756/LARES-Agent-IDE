@@ -1,6 +1,6 @@
 // Claude subscription usage-limits watcher (plans/usage-limits-mcp-and-ui.md).
 //
-// Watches each open workspace's `.dashboard/usage/latest.json` — the raw record
+// Watches each open workspace's `.lares/usage/latest.json` — the raw record
 // written by the dashboard-statusline.mjs script — and maintains an account-wide
 // per-window last-known state. The pure `toReading` projection is the unit-test
 // seam; the class is the runtime glue (fs.watch + 300ms debounce + per-window
@@ -15,6 +15,7 @@ import type {
   UsageWindowReading,
 } from '../shared/types';
 import { USAGE_LIMITS_STALE_MS } from '../shared/constants';
+import { workspaceStateDir } from './workspace-state-dir';
 
 /** Per-window last-known state kept in memory by the watcher. `captured_at` is
  *  the observing record's `captured_at`, tracked PER WINDOW so a five-hour-only
@@ -157,7 +158,7 @@ export class UsageLimitsWatcher extends EventEmitter {
   private closed = false;
 
   private usageDirFor(root: string): string {
-    return path.join(root, '.dashboard', 'usage');
+    return path.join(workspaceStateDir(root), 'usage');
   }
 
   /** Idempotent. Ensures the usage dir exists, watches the PARENT dir (survives

@@ -176,8 +176,8 @@ async function runCell(opts: CellOpts): Promise<void> {
     // real file.
     const root = isWsl ? windowsToWslPath(tmp) : tmp;
     const cwd = isWsl
-      ? `${root}/.dashboard/workers/${opts.provider}`
-      : path.join(tmp, '.dashboard', 'workers', opts.provider);
+      ? `${root}/.lares/workers/${opts.provider}`
+      : path.join(tmp, '.lares', 'workers', opts.provider);
     const agent = makeAgent(`m-${opts.provider}-${opts.pathType}`, {
       provider: opts.provider,
       isSupervised: false,
@@ -200,17 +200,17 @@ async function runCell(opts: CellOpts): Promise<void> {
     if (isWsl) {
       assert.equal(runners.wslCommands.length, 1);
       const cmd = runners.wslCommands[0];
-      const expected = `DASHBOARD_SPOOL_PATH='${root}/.dashboard/pending-status.jsonl'`;
+      const expected = `DASHBOARD_SPOOL_PATH='${root}/.lares/pending-status.jsonl'`;
       assert.ok(cmd.includes(expected),
         `WSL launch must inject the shell-quoted WSL-native spool path; expected ${expected} in: ${cmd}`);
     } else {
       assert.equal(runners.winEnvs.length, 1);
       const env = runners.winEnvs[0]!;
-      assert.equal(env.DASHBOARD_SPOOL_PATH, path.join(tmp, '.dashboard', 'pending-status.jsonl'),
+      assert.equal(env.DASHBOARD_SPOOL_PATH, path.join(tmp, '.lares', 'pending-status.jsonl'),
         'Windows launch must inject the native spool path in extraEnv');
     }
 
-    const spoolFile = path.join(tmp, '.dashboard', 'pending-status.jsonl');
+    const spoolFile = path.join(tmp, '.lares', 'pending-status.jsonl');
     fs.mkdirSync(path.dirname(spoolFile), { recursive: true });
 
     // (iv) — first, while NO hook event exists on any transport (HTTP+spool
@@ -280,7 +280,7 @@ test('restart-shaped: empty registries + live WSL agent + OLD tmux option → re
   try {
     const agent = makeAgent('rs-1', {
       provider: 'claude', isWorker: true, isSupervised: false, status: 'working',
-      workingDirectory: '/home/u/proj/.dashboard/workers/claude',
+      workingDirectory: '/home/u/proj/.lares/workers/claude',
       tmuxSessionName: 'cad__rs_1',
     });
     agentsMap.set(agent.id, agent);
@@ -346,7 +346,7 @@ function makeWaitingEnv(): WaitingEnv {
   const restoreDb = patchDb(agentsMap, audit);
   const agent = makeAgent('w-1', {
     provider: 'claude', isWorker: true, isSupervised: false, status: 'working',
-    workingDirectory: '/home/u/proj/.dashboard/workers/claude',
+    workingDirectory: '/home/u/proj/.lares/workers/claude',
   });
   agentsMap.set(agent.id, agent);
   const supervisor = makeSupervisor();

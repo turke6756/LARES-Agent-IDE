@@ -312,20 +312,20 @@ export interface Agent {
   isSupervisor: boolean;
   isSupervised: boolean;
   // Hook-based status lane (orthogonal to isSupervised). A worker launches from
-  // .dashboard/workers/<provider>/, gets the turn-boundary hook scaffold, and has
+  // .lares/workers/<provider>/, gets the turn-boundary hook scaffold, and has
   // PTY inference + chat-event status disabled — but unlike isSupervised it does
   // NOT notify a supervisor. isSupervised implies the worker lane; isWorker alone
   // is the default for user-launched claude/codex agents.
   isWorker: boolean;
   // Researcher role-lane (browser-parity-and-capability-isolation §0, D-1). A
   // third first-class hardcoded app lane alongside supervisor/worker: scaffolded
-  // into .dashboard/researcher, browser MCP wired in, native dangerous tools
+  // into .lares/researcher, browser MCP wired in, native dangerous tools
   // (Bash/Edit/NotebookEdit) withheld. Mutually exclusive with the other lanes.
   isResearcher: boolean;
   // Persona privilege lane (#19 supervisor-tools-for-personas). A persona that
   // declares the 'supervisor' lane is NOT the structural workspace supervisor:
   // isSupervisor stays false so it renders as its own card under
-  // .dashboard/agents/<name>/. This field ONLY grants the supervisor-tier MCP
+  // .lares/agents/<name>/. This field ONLY grants the supervisor-tier MCP
   // toolset, via roleLaneOf (which prefers it). Persisted so the grant survives
   // relaunch (the MCP-injection sites read the persisted record, not the launch
   // input). Only 'supervisor' exists — researcher/worker already render as cards
@@ -582,7 +582,7 @@ export interface AgentPersona {
   directory: string;     // full path to the persona directory
   hasMemory: boolean;    // whether memory/MEMORY.md exists
   isSupervisor: boolean; // true if name matches SUPERVISOR_AGENT_NAME
-  lane?: PersonaLane;    // declared in .dashboard/agents/<name>/persona.json (#18)
+  lane?: PersonaLane;    // declared in .lares/agents/<name>/persona.json (#18)
 }
 
 export interface AgentTemplate {
@@ -1201,7 +1201,7 @@ export interface ContextStats {
 // plans/usage-limits-mcp-and-ui.md.
 
 /** Raw record written by the statusline script to
- *  `<ws>/.dashboard/usage/latest.json` — observed windows only, no derived
+ *  `<ws>/.lares/usage/latest.json` — observed windows only, no derived
  *  fields. `resets_at` is stored exactly as received from the harness. */
 export interface UsageLimitsRawRecord {
   schema: 1;
@@ -1911,7 +1911,7 @@ export interface IpcApi {
   };
   /** Detached-process transparency (incident-2026-07-11 §5 Wave 5). Lists the
    *  agent-launched detached processes that self-registered under
-   *  <workspaceRoot>/.dashboard/detached/, each verified against its live PID. */
+   *  <workspaceRoot>/.lares/detached/, each verified against its live PID. */
   detached: {
     list: (workspaceRoot: string) => Promise<DetachedProcessDto[]>;
   };
@@ -3453,7 +3453,7 @@ export interface ReapOrphansResultDto {
 
 // ── Detached-process transparency (incident-2026-07-11 §5 Wave 5) ──
 // Agent-launched detached OS processes self-register JSON descriptors under
-// <workspace>/.dashboard/detached/*.json. The main-side registry
+// <workspace>/.lares/detached/*.json. The main-side registry
 // (src/main/detached-process-registry.ts) verifies each descriptor's PID before
 // trusting its `running` flag, since a hard kill can't update the file.
 export type DetachedLiveness = 'running' | 'ended' | 'dead' | 'reused' | 'unknown';

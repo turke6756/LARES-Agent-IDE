@@ -77,17 +77,22 @@ export const DEFAULT_NAVIGATION_TIMEOUT_MS = 30_000;
 // dropped sentinel takes effect on the very next type/press_key — NO app
 // restart required for the sentinel path):
 //   1. env  CDP_TRACE=1                — set before launching Electron.
-//   2. sentinel file                   — `touch <workspaceRoot>/.dashboard/cdp-trace.on`.
+//   2. sentinel file                   — `touch <workspaceRoot>/.lares/cdp-trace.on`.
 // The sentinel is the RELIABLE path for the running Electron main: the env var
 // would require relaunching the already-running app, whereas the sentinel is
 // re-probed (existsSync) at the start of every traced verb. Output JSONL is
-// appended to `<workspaceRoot>/.dashboard/cdp-trace.log`.
+// appended to `<workspaceRoot>/.lares/cdp-trace.log`.
 //
 // `<workspaceRoot>` resolves from `process.cwd()` — the Electron main process is
 // launched via `electron .` (npm `start`) from the project root, so its cwd IS
-// the workspace root. `CDP_TRACE_DIR` overrides the `.dashboard` base dir if a
-// deployment ever launches from elsewhere.
-const TRACE_BASE_DIR = process.env.CDP_TRACE_DIR ?? join(process.cwd(), '.dashboard');
+// the workspace root. `CDP_TRACE_DIR` overrides the `.lares` base dir if a
+// deployment ever launches from elsewhere. Diagnostics-only, so this does a
+// plain exists-preference (`.lares`, else legacy `.dashboard`) rather than
+// triggering the state-dir migration as a module-load side effect.
+const TRACE_BASE_DIR = process.env.CDP_TRACE_DIR
+  ?? (!existsSync(join(process.cwd(), '.lares')) && existsSync(join(process.cwd(), '.dashboard'))
+    ? join(process.cwd(), '.dashboard')
+    : join(process.cwd(), '.lares'));
 const TRACE_SENTINEL = join(TRACE_BASE_DIR, 'cdp-trace.on');
 const TRACE_LOG = join(TRACE_BASE_DIR, 'cdp-trace.log');
 

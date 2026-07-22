@@ -53,10 +53,11 @@ interface ScaffoldRegistryRow {
 // carry datable markdown sections; settings.json / .sh / .mjs scaffolds are not
 // markdown targets and never reach this bridge.
 const REGISTRY_ROWS: ScaffoldRegistryRow[] = [
-  // Persona CLAUDE.md (one per native lane).
-  { constantSymbol: 'SUPERVISOR_AGENT_MD', pathTails: ['/.dashboard/supervisor/claude.md'] },
-  { constantSymbol: 'WORKER_CLAUDE_MD', pathTails: ['/.dashboard/workers/claude/claude.md'] },
-  { constantSymbol: 'RESEARCHER_AGENT_MD', pathTails: ['/.dashboard/researcher/claude.md'] },
+  // Persona CLAUDE.md (one per native lane). Both state-dir spellings: `.lares`
+  // is live; `.dashboard` appears in pre-rename resident targets.
+  { constantSymbol: 'SUPERVISOR_AGENT_MD', pathTails: ['/.lares/supervisor/claude.md', '/.dashboard/supervisor/claude.md'] },
+  { constantSymbol: 'WORKER_CLAUDE_MD', pathTails: ['/.lares/workers/claude/claude.md', '/.dashboard/workers/claude/claude.md'] },
+  { constantSymbol: 'RESEARCHER_AGENT_MD', pathTails: ['/.lares/researcher/claude.md', '/.dashboard/researcher/claude.md'] },
   // Skill bodies — one tail matches every lane's copy of that skill's SKILL.md.
   { constantSymbol: 'SUPERVISOR_RUN_ORCHESTRATION_SKILL', pathTails: ['/skills/run-orchestration/skill.md'] },
   { constantSymbol: 'SUPERVISOR_ORCHESTRATION_SPIKE_SKILL', pathTails: ['/skills/orchestration-spike/skill.md'] },

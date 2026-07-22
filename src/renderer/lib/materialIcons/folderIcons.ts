@@ -1332,7 +1332,9 @@ export const folderIcons: FolderTheme[] = [
       },
       {
         name: 'folder-dashboard',
-        folderNames: ['.dashboard'],
+        // Live `.lares` state dir + the legacy `.dashboard` spelling (an
+        // unmigrated workspace, or a leftover the migration refused to merge).
+        folderNames: ['.lares', '.dashboard'],
       },
       {
         name: 'folder-cursor',

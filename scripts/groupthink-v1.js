@@ -340,7 +340,7 @@ async function main() {
   const supervisorId = args.supervisorId;
   const topic = args.topic || "Research and plan a feature.";
   // Resolve to absolute: the path is embedded verbatim in agent prompts, and
-  // supervised agents run from the worker-lane cwd (.dashboard/workers/<p>/),
+  // supervised agents run from the worker-lane cwd (.lares/workers/<p>/),
   // not from this script's cwd — a relative path would land in the wrong dir.
   const planPath = path.resolve(args.planPath || "plans/new-plan.md");
   const turnTimeoutRaw = args['turn-timeout-ms'];

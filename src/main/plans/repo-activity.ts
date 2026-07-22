@@ -12,7 +12,9 @@ import type {
 
 export const FILE_DETAIL_MAX = 200;
 export const BLOB_BYTE_CAP = 32_768;
-export const DEFAULT_EXCLUDE_DIRS = ['.dashboard'];
+// Both spellings: `.lares` is the live state dir; `.dashboard` still appears
+// in historical provenance rows and rename-failed fallback sessions.
+export const DEFAULT_EXCLUDE_DIRS = ['.lares', '.dashboard'];
 
 // Runtime-testable exhaustive op set; the drift test (I-10) asserts its keys, and
 // the `satisfies` clause breaks compile if the FileOperation union changes.

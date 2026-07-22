@@ -1,4 +1,4 @@
-// Tests for T1-A (pending-status.jsonl failure log in .dashboard/scripts/
+// Tests for T1-A (pending-status.jsonl failure log in .lares/scripts/
 // dashboard-status.mjs) and T1-B (DASHBOARD_HOST env-var injection for WSL
 // supervised workers, no DASHBOARD_HOST on the Windows path). See
 // plans/windows-wsl-issues-review-2026-05-23.md §Tier 1 T1-A / T1-B.
@@ -557,11 +557,11 @@ test('PHASE 0 WSL: the injected token is scrubbed by redactMcpToken before any l
 test('dashboard-status.mjs (v7) spools to pending-status.jsonl when fetch fails', async () => {
   // Build a fake workspace tree from the BUNDLED script constant (not the
   // repo's on-disk scaffold copy, which lags until the workspace rescaffolds):
-  //   <workspace>/.dashboard/scripts/dashboard-status.mjs   ← v7 script
-  //   <workspace>/.dashboard/pending-status.jsonl           ← spool (always-write)
+  //   <workspace>/.lares/scripts/dashboard-status.mjs   ← v7 script
+  //   <workspace>/.lares/pending-status.jsonl           ← spool (always-write)
   // No DASHBOARD_SPOOL_PATH in env → exercises the script-relative fallback.
   const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ad-status-fail-'));
-  const scriptsDir = path.join(workspace, '.dashboard', 'scripts');
+  const scriptsDir = path.join(workspace, '.lares', 'scripts');
   fs.mkdirSync(scriptsDir, { recursive: true });
 
   // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -571,7 +571,7 @@ test('dashboard-status.mjs (v7) spools to pending-status.jsonl when fetch fails'
   const destScript = path.join(scriptsDir, 'dashboard-status.mjs');
   fs.writeFileSync(destScript, DASHBOARD_STATUS_SCRIPT_MJS, 'utf-8');
 
-  const pendingLog = path.join(workspace, '.dashboard', 'pending-status.jsonl');
+  const pendingLog = path.join(workspace, '.lares', 'pending-status.jsonl');
   assert.equal(fs.existsSync(pendingLog), false, 'precondition: pending-status.jsonl must not exist');
 
   // Run the script with a port that won't accept connections so fetch fails fast.

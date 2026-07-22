@@ -1,6 +1,19 @@
 import type { AgentProvider, ContextGaugeSettings } from './types';
 import { buildUsageStatusText, buildUsageRawRecord } from './usage-limits-record';
 
+/** Workspace state folder name — `<workspace>/.lares/` holds the supervisor /
+ *  worker / researcher scaffolds, shared scripts, personas, research store,
+ *  analytics exports, and usage captures. Formerly `.dashboard`; existing
+ *  workspaces are renamed in place on first touch (see
+ *  src/main/workspace-state-dir.ts). Route every LIVE path construction
+ *  through this constant (or the workspace-state-dir resolver, which also
+ *  covers the rename-failed fallback session). */
+export const LARES_DIR_NAME = '.lares';
+/** Legacy state folder name. Recognition-only: historical transcripts,
+ *  analytics records, and unmigrated (rename-failed) workspaces still carry
+ *  it. Never use it to construct a NEW path. */
+export const LEGACY_LARES_DIR_NAME = '.dashboard';
+
 export const DEFAULT_COMMAND = 'claude --dangerously-skip-permissions';
 export const DEFAULT_COMMAND_WSL = 'ccode --dangerously-skip-permissions';
 export const TMUX_SESSION_PREFIX = 'cad__';

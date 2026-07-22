@@ -124,7 +124,7 @@ const api: IpcApi = {
   },
   // Detached-process transparency (incident-2026-07-11 §5 Wave 5): lists the
   // agent-launched detached processes that self-registered under the workspace's
-  // .dashboard/detached/ dir; each row is PID-verified in main. Handle in index.ts.
+  // .lares/detached/ dir; each row is PID-verified in main. Handle in index.ts.
   detached: {
     list: (workspaceRoot) => ipcRenderer.invoke('detached:list', workspaceRoot),
   },

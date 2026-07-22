@@ -26,7 +26,17 @@ experiments/
 # Automated backup files
 *.bak.*
 
-# Per-workspace runtime state (not part of repo template)
+# Per-workspace runtime state (not part of repo template).
+# `.lares/` is the live state-dir name; the `.dashboard/` twins stay because a
+# not-yet-migrated (or rename-blocked) clone still carries the legacy dir.
+.lares/.scaffold-versions.json
+.lares/workers/
+.lares/scripts/
+.lares/pending-status.jsonl
+.lares/usage/
+.lares/*/.claude/.sysprompt-*.txt
+.lares/*/.claude/scheduled_tasks.lock
+.lares/main-crash.log
 .dashboard/.scaffold-versions.json
 .dashboard/workers/
 .dashboard/scripts/
@@ -37,17 +47,29 @@ experiments/
 .dashboard/main-crash.log
 
 # Internal agent state that must not ship in the public scaffold (anchored/specific)
+/.lares/*/memory/
+/.lares/cdp-trace.*.jsonl
+/.lares/staging/
+/.lares/*/staging/
 /.dashboard/*/memory/
 /.dashboard/cdp-trace.*.jsonl
 /.dashboard/staging/
 /.dashboard/*/staging/
+# Frozen analytics exports — machine-local, timestamped, pruned by the exporter.
+# Contains workspace-scoped analytics; never committable.
+/.lares/analytics/
+/.lares/*/plan-surface-eval-handoff.md
+/.lares/*/.claude/settings.local.json
+/.dashboard/analytics/
 /.dashboard/*/plan-surface-eval-handoff.md
 /.dashboard/*/.claude/settings.local.json
 
 # >>> agentdashboard-research-store >>>
 # WP-G — research store: inbox/ holds raw, untrusted, web-derived artifacts and
 # must never be committed; cleared/ (reviewed) stays trackable. (Case A — no
-# blanket /.dashboard/* ignore is in effect, so a single inbox/ rule suffices.)
+# blanket /.lares/* ignore is in effect, so a single inbox/ rule suffices.
+# Legacy `.dashboard` twin kept for unmigrated clones.)
+/.lares/research/inbox/
 /.dashboard/research/inbox/
 # <<< agentdashboard-research-store <<<
 
