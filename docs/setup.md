@@ -1,7 +1,9 @@
 # Setup
 
 How to install and run Lares from a fresh clone. Lares is an **alpha that runs
-from source** — there are no packaged installers yet. Before you run it, read
+from source** — packaged releases are not published yet; when they are, the
+distribution is a single NSIS installer per version (there is no portable
+build). Before you run it, read
 [SECURITY.md](../SECURITY.md): agents execute real commands.
 
 ## Two ways to install

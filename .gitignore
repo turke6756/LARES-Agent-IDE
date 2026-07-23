@@ -82,7 +82,6 @@ experiments/
 # Machine-local launchers — these hardcode an absolute developer path, so they
 # are useless to anyone else cloning the repo. Keep your own copy locally.
 /AgentDashboard.bat
-/launch.vbs
 
 # Local scratch — throwaway files from spikes and manual pokes.
 /hello.py

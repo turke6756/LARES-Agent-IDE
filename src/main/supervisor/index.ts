@@ -11,7 +11,7 @@ import {
   SUPERVISOR_AGENT_NAME, SUPERVISOR_AGENT_MD, SUPERVISOR_MEMORY_MD,
   SUPERVISOR_CLAUDE_SETTINGS_JSON, SUPERVISOR_CLAUDE_SETTINGS_JSON_V1, SUPERVISOR_CLAUDE_SETTINGS_JSON_V2,
   SUPERVISOR_CLAUDE_SETTINGS_JSON_V3,
-  SUPERVISOR_RUN_ORCHESTRATION_SKILL, SUPERVISOR_ORCHESTRATION_SPIKE_SKILL,
+  SUPERVISOR_RUN_ORCHESTRATION_SKILL,
   SUPERVISOR_CONTEXT_ANALYTICS_SKILL,
   SCRIPT_READ_AGENT_LOG, SCRIPT_LIST_AGENTS, SCRIPT_SEND_MESSAGE, SCRIPT_GET_CONTEXT_STATS,
   WORKER_CLAUDE_MD, WORKER_CLAUDE_MD_V1, WORKER_BEHAVIORAL_MD,
@@ -731,8 +731,19 @@ export const RESEARCH_WRITE_GUARD_MJS_V2_HASH = 'a179be1c232f4515e83db70063b7c3e
 // above) so persona-scanner can use it without an import cycle through here.
 
 /** SHA-256 hex of the v1 orchestration-spike SKILL.md (pre-`.lares` rename).
- *  Used in the v2 file's previousHashes. */
+ *  Used in the v3 REMOVAL entry's previousHashes. */
 export const SUPERVISOR_ORCHESTRATION_SPIKE_SKILL_V1_HASH = '9ed562c59acb5e5293fa0b4a75c7329b323366313fb504b74bc40bdde29524f2';
+
+/** SHA-256 hex of the v2 orchestration-spike SKILL.md (`.lares` rename — the
+ *  LAST shipped body; the SUPERVISOR_ORCHESTRATION_SPIKE_SKILL constant was
+ *  deleted with the retirement and survives only in git history). v3 RETIRES
+ *  the skill (plans/edr-safety-hardening.md P0.1): its detached/hidden launch
+ *  recipe (`nohup … &`, `Start-Process -WindowStyle Hidden cmd`) is the exact
+ *  pattern EDR heuristics flag as malware — the SentinelOne incident class.
+ *  Orchestrations run in-process via the `run_orchestration` MCP tool (see the
+ *  run-orchestration skill). Used in the v3 removal entry's previousHashes so
+ *  pristine deployed copies are deleted silently on next template touch. */
+export const SUPERVISOR_ORCHESTRATION_SPIKE_SKILL_V2_HASH = 'dacdbda55bdb860d91ba402b17664c2fdc431681a62d27d54f7d880324662b15';
 
 /** SHA-256 hex of the v1 context-analytics SKILL.md (pre-`.lares` rename).
  *  Used in the v2 file's previousHashes. */
@@ -1040,10 +1051,6 @@ function formatQueryError(err: Error | null, stdout: string, stderr: string): Qu
     sessionId: '',
     isError: true,
   };
-}
-
-function encodePowerShell(script: string): string {
-  return Buffer.from(script, 'utf16le').toString('base64');
 }
 
 // getWindowsSystemPath / findWindowsClaudePath / findWindowsProviderBinary used
@@ -2251,7 +2258,16 @@ export class AgentSupervisor extends EventEmitter {
       version: 4, // v4 drops every `list_orchestrations` reference (tool deleted in the context-overhead pass)
       previousHashes: { 1: SUPERVISOR_RUN_ORCHESTRATION_SKILL_V1_HASH, 2: SUPERVISOR_RUN_ORCHESTRATION_SKILL_V2_HASH, 3: SUPERVISOR_RUN_ORCHESTRATION_SKILL_V3_HASH },
     },
-    [`.lares/supervisor/.claude/skills/orchestration-spike/SKILL.md`]:            { content: SUPERVISOR_ORCHESTRATION_SPIKE_SKILL, version: 2, previousHashes: { 1: SUPERVISOR_ORCHESTRATION_SPIKE_SKILL_V1_HASH } }, // v2: `.lares` rename
+    // v3 RETIRES orchestration-spike (EDR hardening, plans/edr-safety-hardening.md
+    // P0.1): the skill's detached/hidden launch recipe (`nohup … &`,
+    // `Start-Process -WindowStyle Hidden cmd`) pattern-matches malware to EDR
+    // heuristics — the SentinelOne quarantine incident class. `removed: true`
+    // makes writeScaffoldMap DELETE a pristine v1/v2 on-disk copy (user-modified
+    // copies are .bak'd first) and record the removal in the sidecar so a file
+    // later created at this path is left alone. The run-orchestration skill above
+    // covers orchestration (in-process via the run_orchestration MCP tool). Keep
+    // this entry permanently — dropping it strands not-yet-upgraded workspaces.
+    [`.lares/supervisor/.claude/skills/orchestration-spike/SKILL.md`]:            { content: '', removed: true, version: 3, previousHashes: { 1: SUPERVISOR_ORCHESTRATION_SPIKE_SKILL_V1_HASH, 2: SUPERVISOR_ORCHESTRATION_SPIKE_SKILL_V2_HASH } },
     // The replacement capability for the 13 retired `observability-analytics` MCP
     // tools. version 1 with NO previousHashes: nothing by this name has ever been
     // scaffolded, so there is no prior on-disk content to migrate from — same

@@ -1,0 +1,20 @@
+{
+  "$comment": "P0.4 (plans/edr-safety-hardening.md) — the ONLY files from scripts/ allowed to ship in the packaged app's resources/scripts. Consumed by scripts/verify-packaged-scripts.mjs, which also asserts that package.json build.extraResources (from: scripts) filter stays in sync with this list. Validated 2026-07-22 against every runtime consumer: getScriptPath() call sites (supervisor/index.ts mcp-dashboard.js + mcp-team.js launches; context-overhead/ipc-deps.ts TOOLSET_SCRIPT_MAP; skill-analytics/plans-toolset-defs.ts) and the relative require() graph inside the scripts themselves (mcp-supervisor.js -> mcp-dashboard.js; mcp-dashboard.js -> mcp-tools-*.js + mcp-browser*.js; mcp-tools-orchestration.js -> mcp-supervisor-poll.js + lib/plan-rail-contract.js). Workspace scaffold scripts (dashboard-status.mjs etc.) ship as embedded constants in src/shared/constants.ts, never from this directory.",
+  "files": [
+    "mcp-dashboard.js",
+    "mcp-supervisor.js",
+    "mcp-supervisor-poll.js",
+    "mcp-team.js",
+    "mcp-tools-orchestration.js",
+    "mcp-tools-teams.js",
+    "mcp-tools-comms.js",
+    "mcp-tools-observability.js",
+    "mcp-tools-plans.js",
+    "mcp-tools-notebooks.js",
+    "mcp-browser-tools.js",
+    "mcp-browser-present-tools.js"
+  ],
+  "dirs": [
+    "lib"
+  ]
+}

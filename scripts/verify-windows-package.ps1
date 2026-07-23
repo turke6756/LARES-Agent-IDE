@@ -69,7 +69,7 @@ if (-not (Test-Path -LiteralPath $release)) {
 # ---------------------------------------------------------------------------
 Write-Host "`n[1] artifacts"
 $setup = Assert-NonEmptyFile 'installer' (Join-Path $release "Lares-Setup-$version-x64.exe")
-$portable = Assert-NonEmptyFile 'portable' (Join-Path $release "Lares-Portable-$version-x64.exe")
+# P0.5: the portable target is retired — the NSIS installer is the single distribution.
 
 if ($setup) {
   $sizeMb = $setup.Length / 1MB

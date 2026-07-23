@@ -71,6 +71,9 @@ const TESTS = [
   'dist/main/main/path-utils-to-agent.test.js',
   'dist/main/main/supervisor/mcp-config-builder.test.js',
   'dist/main/main/supervisor/scaffold-version-migration.test.js',
+  // Free-function scaffold writer branches, incl. the EDR P0.1 retirement
+  // (removed: true) entries — silent delete / .bak+delete / never-touch-recreated.
+  'dist/main/main/scaffold-writer.test.js',
   // Lares rebrand — one-time .dashboard → .lares state-dir migration.
   'dist/main/main/workspace-state-dir.test.js',
   // Lares-rename regression: legacy-cwd agents regain their hook scaffold at launch.
@@ -123,6 +126,8 @@ const TESTS = [
   'dist/main/main/research/frontmatter.test.js',
   'scripts/research-write-guard.test.js',
   'scripts/research-store-gitignore.test.js',
+  // P0.3 EDR-surface lint (plans/edr-safety-hardening.md): self-test fixtures + real-tree lint.
+  'scripts/check-edr-patterns.test.js',
   'scripts/mcp-dashboard.test.js',
   'dist/main/main/shared/max-readable-bytes.test.js',
   'dist/main/main/shared/path-mutability.test.js',

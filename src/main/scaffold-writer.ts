@@ -28,6 +28,15 @@ export interface ScaffoldFile {
   executable?: boolean;
   version: number;
   previousHashes?: Record<number, string>;
+  /** Retirement entry: the bundled "content" for this version is the file's
+   *  ABSENCE. On upgrade, a pristine on-disk copy (hash matches any
+   *  previousHashes value) is deleted silently; a user-modified copy is backed
+   *  up to `.bak.<ts>` first, then deleted. The removal is recorded in the
+   *  sidecar at `version`, so a file the user later creates at this path is
+   *  never touched again. `content` is ignored (pass ''). Keep the entry (and
+   *  its previousHashes) in the map permanently — dropping it would strand
+   *  not-yet-upgraded workspaces with the retired file. */
+  removed?: boolean;
 }
 
 /** Sidecar tracks the on-disk version of every managed scaffold file in a
@@ -102,6 +111,35 @@ export function writeScaffoldMap(
       const diskVersion = Number.isInteger(sidecar[managedKey]) ? sidecar[managedKey] : 0;
 
       try {
+        // Retirement entries — the managed file is being REMOVED, not updated.
+        if (file.removed) {
+          if (diskVersion >= bundledVersion) continue; // removal already applied (or future) — a later user-created file here is theirs
+          if (!scaffoldFileExists(workDir, relPath, pathType)) {
+            sidecar[managedKey] = bundledVersion; // record so nothing re-checks (or later deletes a user's new file)
+            changed++;
+            continue;
+          }
+          const diskContent = readScaffoldText(workDir, relPath, pathType);
+          const diskHash = diskContent === null ? null : sha256Hex(diskContent);
+          const knownManaged = diskHash !== null &&
+            Object.values(file.previousHashes ?? {}).includes(diskHash);
+          if (!knownManaged) {
+            // User-modified (or unreadable) — preserve the bytes before removal,
+            // mirroring the backup-then-overwrite path below.
+            const bakRel = `${relPath}.bak.${timestampForFilename()}`;
+            try { copyScaffoldForBackup(workDir, relPath, bakRel, pathType); } catch (bakErr) {
+              console.warn(`${logPrefix} Could not back up ${managedKey} before removal:`, bakErr);
+            }
+            console.warn(`${logPrefix} Scaffold file ${managedKey} differed from known managed content; backed up to ${bakRel} and removed (retired at v${bundledVersion})`);
+          } else {
+            console.log(`${logPrefix} Scaffold file ${managedKey} removed (retired at v${bundledVersion}; matched known managed hash)`);
+          }
+          deleteScaffoldFile(workDir, relPath, pathType);
+          sidecar[managedKey] = bundledVersion;
+          changed++;
+          continue;
+        }
+
         if (!scaffoldFileExists(workDir, relPath, pathType)) {
           atomicWriteScaffoldText(workDir, relPath, file.content, !!file.executable, pathType);
           sidecar[managedKey] = bundledVersion;
@@ -258,6 +296,22 @@ export function atomicWriteScaffoldText(
       throw err;
     }
   }
+}
+
+/** Delete a managed scaffold file (retirement path). Best-effort removes the
+ *  now-empty parent directory too (e.g. a retired skill's folder) — rmdir on a
+ *  non-empty dir (a .bak sibling, other files) just no-ops. */
+export function deleteScaffoldFile(workDir: string, relPath: string, pathType: string): void {
+  const full = scaffoldFullPath(workDir, relPath, pathType);
+  if (pathType === 'wsl') {
+    const dir = full.substring(0, full.lastIndexOf('/'));
+    execFileSync('wsl.exe', ['bash', '-lc', `rm -f '${full}'; rmdir '${dir}' 2>/dev/null || true`], {
+      timeout: 5000, stdio: 'ignore',
+    });
+    return;
+  }
+  fs.rmSync(full, { force: true });
+  try { fs.rmdirSync(path.dirname(full)); } catch { /* non-empty or shared dir — leave it */ }
 }
 
 function copyScaffoldForBackup(workDir: string, srcRel: string, dstRel: string, pathType: string): void {

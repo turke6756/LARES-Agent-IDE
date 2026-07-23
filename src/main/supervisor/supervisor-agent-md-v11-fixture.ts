@@ -16,7 +16,14 @@
 /** The v11 orchestration-through-browser region, verbatim (two-paths orchestration
  *  + Teams + Platform notes + Notebooks + the full browser docs). v12 replaced this
  *  whole contiguous span; there is no sentinel block to swap, so the fixture IS the
- *  removed text and CP-0 pins the reconstruction to SUPERVISOR_AGENT_MD_V11_HASH. */
+ *  removed text and CP-0 pins the reconstruction to SUPERVISOR_AGENT_MD_V11_HASH.
+ *
+ *  EDR NOTE (plans/edr-safety-hardening.md P0.1): the "Platform notes" span below
+ *  intentionally preserves the RETIRED hidden/detached PowerShell launch guidance
+ *  (`Start-Process cmd -ArgumentList @('/c', …)`) BYTE-EXACT — this string must
+ *  hash-match historical deployed CLAUDE.md files for silent v11→current upgrade
+ *  to work. It is migration-matching data only; never shipped, never executed.
+ *  Do not edit the string body. */
 export const SUPERVISOR_V11_ORCH_THROUGH_BROWSER = `## Multi-agent orchestration: two paths
 
 When the user asks you to coordinate multiple agents, choose one of two paths:

@@ -1,0 +1,161 @@
+{
+  "$comment": "P0.3 (plans/edr-safety-hardening.md) — allowlist for scripts/check-edr-patterns.mjs. Every entry needs {file, lineContext, purpose, owner}. lineContext is a case-insensitive substring the hit line must contain ('*' = whole-file exemption, reserved for test files / fixtures of detector code). Tier-1 entries are legal ONLY for detector/remediation code, its fixtures, user-facing prose about the banned pattern, or the temporary P2.1-pending call sites.",
+  "entries": [
+    {
+      "file": "src/main/detached-process-registry.ts",
+      "lineContext": "'powershell.exe'",
+      "purpose": "TEMPORARY until P2.1 native lister: hidden PowerShell Get-CimInstance command-line reader for detached-runner PID revalidation.",
+      "owner": "edr-hardening/P2.1"
+    },
+    {
+      "file": "src/main/detached-process-registry.ts",
+      "lineContext": "windowsHide: true",
+      "purpose": "TEMPORARY until P2.1: hides the console of the bounded command-line reader child above.",
+      "owner": "edr-hardening/P2.1"
+    },
+    {
+      "file": "src/main/watchdog/process-memory.ts",
+      "lineContext": "'powershell.exe'",
+      "purpose": "TEMPORARY until P2.1 native lister: hidden PowerShell WorkingSet memory sampler for the watchdog.",
+      "owner": "edr-hardening/P2.1"
+    },
+    {
+      "file": "src/main/watchdog/process-memory.ts",
+      "lineContext": "windowsHide: true",
+      "purpose": "TEMPORARY until P2.1: hides the console of the bounded memory-sampler child above.",
+      "owner": "edr-hardening/P2.1"
+    },
+    {
+      "file": "src/main/supervisor/ownership/process-lister.ts",
+      "lineContext": "'powershell.exe'",
+      "purpose": "TEMPORARY until P2.1 native lister: hidden PowerShell process lister for the ownership registry.",
+      "owner": "edr-hardening/P2.1"
+    },
+    {
+      "file": "src/main/supervisor/ownership/process-lister.ts",
+      "lineContext": "windowsHide: true",
+      "purpose": "TEMPORARY until P2.1: hides the console of the bounded process-lister child above.",
+      "owner": "edr-hardening/P2.1"
+    },
+    {
+      "file": "src/main/supervisor/log-readers/types.ts",
+      "lineContext": "windowsHide: true",
+      "purpose": "PERMANENT Tier-2: bounded direct `wsl.exe wslpath` probe — absolute exe, discrete argv, 5s timeout, captured output.",
+      "owner": "supervisor/log-readers"
+    },
+    {
+      "file": "src/main/supervisor/index.ts",
+      "lineContext": "windowsHide: true",
+      "purpose": "One-turn `claude -p` query children (2 sites) — visible attribution/registration handled by P2.2 spawn audit.",
+      "owner": "edr-hardening/P2.2"
+    },
+    {
+      "file": "src/main/wsl-bridge.ts",
+      "lineContext": "windowsHide: true",
+      "purpose": "PERMANENT Tier-2: bounded direct WSL status/path probes (wsl.exe, discrete argv, timeouts) — plan-listed as allowed.",
+      "owner": "wsl-bridge"
+    },
+    {
+      "file": "src/main/wsl-bridge.ts",
+      "lineContext": "windowsHide:true hides the probe console",
+      "purpose": "Comment explaining the windowsHide probe behavior, not a spawn.",
+      "owner": "wsl-bridge"
+    },
+    {
+      "file": "src/main/runtime-prerequisites.ts",
+      "lineContext": "windowsHide: true",
+      "purpose": "PERMANENT Tier-2: bounded version/prerequisite probes (discrete argv, PROBE_TIMEOUT_MS, capped output) — plan-listed as allowed.",
+      "owner": "runtime-prerequisites"
+    },
+    {
+      "file": "src/main/context-optimizer/git-history.ts",
+      "lineContext": "windowsHide: true",
+      "purpose": "PERMANENT Tier-2: bounded `git` history probe — plan-listed as allowed.",
+      "owner": "context-optimizer"
+    },
+    {
+      "file": "src/main/supervisor/provider-resolver.ts",
+      "lineContext": "windowsHide: true",
+      "purpose": "PERMANENT Tier-2: bounded `cmd /c where <provider>` PATH-resolution probes, 5s timeout, captured output.",
+      "owner": "supervisor/provider-resolver"
+    },
+    {
+      "file": "src/main/browser/browser-manager.ts",
+      "lineContext": "h.unref()",
+      "purpose": "Timer-handle unref on the grace-close scheduler (never a child process) — keeps timers from holding the process open.",
+      "owner": "browser"
+    },
+    {
+      "file": "src/main/browser/browser-manager.ts",
+      "lineContext": "(timer as { unref: () => void }).unref()",
+      "purpose": "Timer-handle unref (typed setTimeout handle, not a child process).",
+      "owner": "browser"
+    },
+    {
+      "file": "src/main/browser/browser-manager.ts",
+      "lineContext": "this.sessionWriteTimer.unref()",
+      "purpose": "Timer-handle unref on the session-write debounce timer (not a child process).",
+      "owner": "browser"
+    },
+    {
+      "file": "src/main/browser/browser-manager.ts",
+      "lineContext": "this.discardSweepTimer.unref()",
+      "purpose": "Timer-handle unref on the discard-sweep interval (not a child process).",
+      "owner": "browser"
+    },
+    {
+      "file": "src/main/supervisor/dashboard-status-script.test.ts",
+      "lineContext": ".unref()",
+      "purpose": "Test-harness stdin-error timer unref (timer, not a child process).",
+      "owner": "supervisor/tests"
+    },
+    {
+      "file": "scripts/wsl-boundary-check.js",
+      "lineContext": "windowsHide: true",
+      "purpose": "Dev-only boundary-check harness: bounded `wsl.exe bash -lc` probe with 20s timeout; not shipped (P0.4 allowlist excludes it).",
+      "owner": "scripts/dev"
+    },
+    {
+      "file": "src/main/workspace-state-dir.ts",
+      "lineContext": "wscript.shell",
+      "purpose": "P0.2 legacy-launcher DETECTOR: matches WScript.Shell content in order to quarantine/remove it. Detects the pattern, never uses it.",
+      "owner": "edr-hardening/P0.2"
+    },
+    {
+      "file": "src/main/workspace-state-dir.test.ts",
+      "lineContext": "*",
+      "purpose": "Fixtures for the P0.2 legacy-launcher detector — must contain the exact WScript.Shell / -WindowStyle Hidden shapes the detector removes.",
+      "owner": "edr-hardening/P0.2"
+    },
+    {
+      "file": "src/renderer/components/workspace/SecurityNoticeCard.tsx",
+      "lineContext": "WScript.Shell",
+      "purpose": "User-facing security notice PROSE explaining why the legacy launcher file is quarantined; names the pattern, never executes it.",
+      "owner": "edr-hardening/P0.2"
+    },
+    {
+      "file": "src/main/supervisor/index.ts",
+      "lineContext": "Start-Process -WindowStyle Hidden cmd",
+      "purpose": "Comments (2 sites) documenting the BANNED legacy recipe as the reason for the current design — prose, not an invocation.",
+      "owner": "supervisor"
+    },
+    {
+      "file": "src/main/supervisor/scaffold-version-migration.test.ts",
+      "lineContext": "*",
+      "purpose": "Regression tests asserting the banned patterns are ABSENT from scaffold templates — the test necessarily names them.",
+      "owner": "edr-hardening/P0.1"
+    },
+    {
+      "file": "src/main/skill-analytics/command-path-extractor.ts",
+      "lineContext": "-encodedcommand",
+      "purpose": "Analytics PARSER string literals: recognizes -EncodedCommand in observed agent commands to skip them. Detects, never uses.",
+      "owner": "skill-analytics"
+    },
+    {
+      "file": "src/main/supervisor/supervisor-agent-md-v11-fixture.ts",
+      "lineContext": "*",
+      "purpose": "Frozen historical scaffold fixture (v11) for migration tests; mentions `powershell -Command` in a quoting-gotcha prose note.",
+      "owner": "supervisor/scaffold-migration"
+    }
+  ]
+}

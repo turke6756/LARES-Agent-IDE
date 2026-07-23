@@ -146,7 +146,8 @@ an afterthought.
 
 ## Quick start
 
-Lares runs from source during alpha (no packaged installer yet).
+Lares runs from source during alpha. When packaged releases ship, the
+distribution will be a single NSIS installer per version (no portable build).
 
 <details>
 <summary><strong>Prerequisites</strong></summary>

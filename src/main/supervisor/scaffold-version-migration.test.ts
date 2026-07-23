@@ -33,6 +33,8 @@ import {
   SUPERVISOR_AGENT_MD_V13_HASH,
   SUPERVISOR_AGENT_MD_V14_HASH,
   SUPERVISOR_AGENT_MD_V15_HASH,
+  SUPERVISOR_ORCHESTRATION_SPIKE_SKILL_V1_HASH,
+  SUPERVISOR_ORCHESTRATION_SPIKE_SKILL_V2_HASH,
   WORKER_CLAUDE_MD_V6_HASH,
   RESEARCHER_AGENT_MD_V5_HASH,
   WORKER_CLAUDE_MD_V5_HASH,
@@ -2083,6 +2085,89 @@ test('PV-3. supervisor CLAUDE.md: locally-edited v14 (unknown hash) → .bak + o
     cleanup();
     rmrf(workDir);
   }
+});
+
+// ── EDR P0.1: orchestration-spike skill RETIREMENT (v3 removal entry) ──
+//
+// The skill's detached/hidden launch recipe (`nohup … &`, `Start-Process
+// -WindowStyle Hidden cmd`) is the SentinelOne false-positive class; v3 is a
+// `removed: true` entry so deployed kits DELETE the file on next template touch.
+// The v1/v2 bodies no longer exist in code (the constant was deleted), so the
+// pristine-hash delete path is covered by scaffold-writer.test.ts R1–R4 with
+// synthetic content; here we pin the shipped entry's shape and the end-to-end
+// supervisor behavior around it.
+
+const SPIKE_REL = '.lares/supervisor/.claude/skills/orchestration-spike/SKILL.md';
+
+test('EDR-0. the orchestration-spike entry is a v3 removal with both shipped-body hashes frozen', () => {
+  const managed = (AgentSupervisor as unknown as {
+    SUPERVISOR_FILES: Record<string, { version: number; removed?: boolean; content: string; previousHashes?: Record<number, string> }>;
+  }).SUPERVISOR_FILES[SPIKE_REL];
+  assert.ok(managed, 'the retirement entry must stay in SUPERVISOR_FILES — dropping it strands not-yet-upgraded workspaces');
+  assert.equal(managed.removed, true, 'the entry must be a removal, not content');
+  assert.equal(managed.version, 3, 'the retirement is v3');
+  assert.equal(managed.previousHashes?.[1], SUPERVISOR_ORCHESTRATION_SPIKE_SKILL_V1_HASH, 'v1 (pre-.lares) body hash must be registered');
+  assert.equal(managed.previousHashes?.[2], SUPERVISOR_ORCHESTRATION_SPIKE_SKILL_V2_HASH, 'v2 (last shipped) body hash must be registered');
+  assert.notEqual(managed.previousHashes?.[1], managed.previousHashes?.[2], 'the two frozen hashes must differ');
+});
+
+test('EDR-1. fresh supervisor scaffold does NOT create the retired skill; sidecar records the removal', () => {
+  const workDir = mktmp('sup-spike-fresh');
+  const { supervisor, cleanup } = makeSupervisor();
+  try {
+    supervisor.ensureSupervisorScaffold(workDir, 'windows');
+    const skillPath = path.join(workDir, ...SPIKE_REL.split('/'));
+    assert.equal(fs.existsSync(skillPath), false, 'the retired skill must never be scaffolded');
+    assert.equal(readSidecar(workDir)['supervisor/.claude/skills/orchestration-spike/SKILL.md'], 3,
+      'sidecar must record the applied removal so a user file later created here is left alone');
+  } finally {
+    cleanup();
+    rmrf(workDir);
+  }
+});
+
+test('EDR-2. deployed copy at sidecar v2 with drifted content → .bak + deleted on next scaffold', () => {
+  const workDir = mktmp('sup-spike-v2');
+  const { supervisor, cleanup } = makeSupervisor();
+  try {
+    // The real v2 body is retired from code; any non-matching bytes exercise the
+    // conservative branch (backup before removal). The pristine silent-delete
+    // branch is unit-tested in scaffold-writer.test.ts R1.
+    const skillPath = path.join(workDir, ...SPIKE_REL.split('/'));
+    fs.mkdirSync(path.dirname(skillPath), { recursive: true });
+    const body = '---\nname: orchestration-spike\n---\nlocally drifted copy\n';
+    fs.writeFileSync(skillPath, body, 'utf-8');
+    fs.mkdirSync(path.dirname(sidecarPath(workDir)), { recursive: true });
+    fs.writeFileSync(
+      sidecarPath(workDir),
+      JSON.stringify({ 'supervisor/.claude/skills/orchestration-spike/SKILL.md': 2 }, null, 2) + '\n',
+      'utf-8',
+    );
+
+    supervisor.ensureSupervisorScaffold(workDir, 'windows');
+
+    assert.equal(fs.existsSync(skillPath), false, 'the retired skill file must be deleted');
+    const dir = path.dirname(skillPath);
+    const backups = fs.existsSync(dir) ? fs.readdirSync(dir).filter((n) => n.startsWith('SKILL.md.bak.')) : [];
+    assert.equal(backups.length, 1, `unknown-hash removal must back up first; got: ${backups.join(', ')}`);
+    assert.equal(fs.readFileSync(path.join(dir, backups[0]), 'utf-8'), body, 'backup must hold the drifted content verbatim');
+    assert.equal(readSidecar(workDir)['supervisor/.claude/skills/orchestration-spike/SKILL.md'], 3, 'sidecar must record the removal');
+  } finally {
+    cleanup();
+    rmrf(workDir);
+  }
+});
+
+test('EDR-3. no shipped supervisor scaffold content carries a hidden/detached launch recipe', () => {
+  const files = (AgentSupervisor as unknown as {
+    SUPERVISOR_FILES: Record<string, { content: string; removed?: boolean }>;
+  }).SUPERVISOR_FILES;
+  const pattern = /WindowStyle|Start-Process|nohup|WScript|wscript|EncodedCommand/;
+  for (const [rel, f] of Object.entries(files)) {
+    if (f.removed) continue;
+    assert.ok(!pattern.test(f.content), `${rel} must not ship a hidden/detached launch pattern`);
+  }
+  assert.ok(!pattern.test(SUPERVISOR_AGENT_MD), 'the supervisor persona must not ship a hidden/detached launch pattern');
 });
 
 // ── normalizeManagedKey: small builder unit ──────────────────────────

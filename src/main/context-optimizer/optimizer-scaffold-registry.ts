@@ -60,6 +60,10 @@ const REGISTRY_ROWS: ScaffoldRegistryRow[] = [
   { constantSymbol: 'RESEARCHER_AGENT_MD', pathTails: ['/.lares/researcher/claude.md', '/.dashboard/researcher/claude.md'] },
   // Skill bodies — one tail matches every lane's copy of that skill's SKILL.md.
   { constantSymbol: 'SUPERVISOR_RUN_ORCHESTRATION_SKILL', pathTails: ['/skills/run-orchestration/skill.md'] },
+  // orchestration-spike was RETIRED (EDR hardening P0.1) — the constant now exists
+  // only in git history. The row stays: not-yet-upgraded workspaces still carry a
+  // resident copy to date, and extractConstantTemplate returns null at revisions
+  // where the constant is absent ("not born yet" — and now "already retired").
   { constantSymbol: 'SUPERVISOR_ORCHESTRATION_SPIKE_SKILL', pathTails: ['/skills/orchestration-spike/skill.md'] },
   { constantSymbol: 'PERSONA_CREATE_PERSONA_SKILL', pathTails: ['/skills/create-persona/skill.md'] },
   { constantSymbol: 'PERSONA_READ_COMMENTS_SKILL', pathTails: ['/skills/read-comments/skill.md'] },
