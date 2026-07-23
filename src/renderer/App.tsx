@@ -12,6 +12,7 @@ import { openExternalFileTab } from './components/fileviewer/openFileHelpers';
 import DetachedFileView from './components/fileviewer/DetachedFileView';
 import DetachedViewShell from './components/layout/DetachedViewShell';
 import PressureNotification from './components/watchdog/PressureNotification';
+import SecurityNoticeCard from './components/workspace/SecurityNoticeCard';
 import RuntimePrerequisitesDialog from './components/onboarding/RuntimePrerequisitesDialog';
 import PrerequisitesCard from './components/onboarding/PrerequisitesCard';
 
@@ -281,6 +282,11 @@ function AppInner() {
           pop-up that appears solely under Warn/Critical commit pressure. The
           always-on meter was removed; open Tools ▸ System Memory to inspect. */}
       <PressureNotification />
+
+      {/* P0.2 legacy-launcher security notice (bottom-LEFT corner — the
+          pressure pop-up owns bottom-right): detection + user-authorized
+          Recycle-Bin removal of the old EDR-triggering launch.vbs. */}
+      <SecurityNoticeCard />
 
       {/* Prerequisite surfaces (packaging plan §6.3): a once-per-version modal
           plus a dismissible, rediscoverable card while no agent CLI exists. */}

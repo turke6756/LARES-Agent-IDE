@@ -29,6 +29,15 @@ const api: IpcApi = {
     delete: (id) => ipcRenderer.invoke('workspace:delete', id),
     reorder: (ids) => ipcRenderer.invoke('workspace:reorder', ids),
     openInVSCode: (id) => ipcRenderer.invoke('workspace:open-vscode', id),
+    // P0.2 legacy-launcher security sweep: mount-time pull, live push, and the
+    // explicit user-authorized Recycle-Bin removal.
+    getSecurityNotices: () => ipcRenderer.invoke('workspace:security-notices'),
+    removeLegacyLauncher: (filePath) => ipcRenderer.invoke('workspace:remove-legacy-launcher', filePath),
+    onSecurityNotice: (callback) => {
+      const listener = (_event: any, notice: any) => callback(notice);
+      ipcRenderer.on('workspace:security-notice', listener);
+      return () => ipcRenderer.removeListener('workspace:security-notice', listener);
+    },
   },
   agents: {
     list: (workspaceId) => ipcRenderer.invoke('agent:list', workspaceId),

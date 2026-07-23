@@ -57,7 +57,7 @@ import type { MemorySnapshot, AdmissionDecision } from './watchdog/types';
 import { AttributionService } from './watchdog/attribution-service';
 import { usageForAgent } from './watchdog/attribution';
 import { composeSystemMemoryView } from './watchdog/system-memory-view';
-import { migrateWorkspaceStateDir } from './workspace-state-dir';
+import { migrateWorkspaceStateDir, checkWorkspaceSecurityOnOpen } from './workspace-state-dir';
 import { parseAnalyticsSnapshotArgv, flushStdio } from './analytics-export/analytics-snapshot-argv';
 import {
   listDetachedProcesses,
@@ -694,6 +694,11 @@ app.whenReady().then(async () => {
     // predictable moment. Never throws — warn-and-fall-back inside.
     for (const ws of getWorkspaces()) {
       migrateWorkspaceStateDir(ws.path, ws.pathType);
+      // P0.2 legacy `launch.vbs` sweep — detection + notice only, at the same
+      // first-touch moment. Never executes/deletes anything; the renderer
+      // pulls pending notices on mount (`workspace:security-notices`) and the
+      // user decides on removal. Never throws (warn-and-continue inside).
+      checkWorkspaceSecurityOnOpen(ws.path, ws.pathType);
     }
 
     // Boot lifecycle op, deliberately OUTSIDE initDatabase (which runs more than

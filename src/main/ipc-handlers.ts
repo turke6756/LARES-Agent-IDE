@@ -49,7 +49,12 @@ import { getSharedParseManager, setParseManagerProgressSink } from './skill-anal
 import { querySkillUsage, type QueryDb } from './skill-analytics/queries';
 import { queryMcpToolUsage } from './skill-analytics/mcp-tool-usage-queries';
 import { getDb } from './database';
-import { migrateWorkspaceStateDir } from './workspace-state-dir';
+import {
+  migrateWorkspaceStateDir,
+  checkWorkspaceSecurityOnOpen,
+  listPendingSecurityNotices,
+  removeLegacyLauncher,
+} from './workspace-state-dir';
 import { ensureInstallationLauncher } from './installation-descriptor';
 
 // Managed temp dir for clipboard-bitmap pastes. Dropped OS files inject their
@@ -76,6 +81,15 @@ export function registerIpcHandlers(
     // registered workspace may be an existing project folder that still
     // carries the legacy state dir. Never throws (warn-and-continue inside).
     migrateWorkspaceStateDir(ws.path, ws.pathType);
+    // P0.2 legacy launcher `.vbs` sweep at the same first-touch moment:
+    // detect by content (one notice per matching root-level .vbs), push each
+    // security notice to the renderer, never execute or silently delete.
+    // Removal is a separate, user-authorized IPC below.
+    for (const secNotice of checkWorkspaceSecurityOnOpen(ws.path, ws.pathType)) {
+      if (!mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('workspace:security-notice', secNotice);
+      }
+    }
     // WP1 (G1) — installation-owned snapshot launcher, written at workspace
     // registration (the per-launch refresh in ensureWorkspaceScripts heals it
     // thereafter). Never throws (warn-and-skip inside).
@@ -83,6 +97,19 @@ export function registerIpcHandlers(
     return ws;
   });
   ipcMain.handle('workspace:delete', (_e, id) => deleteWorkspace(id));
+
+  // P0.2 — pending legacy-launcher notices (renderer pull on mount) + the
+  // explicit "Remove legacy launcher" action. The removal path only accepts a
+  // file main itself flagged this session, re-validates its content signature,
+  // and moves it to the Recycle Bin (shell.trashItem) — never a hard delete.
+  ipcMain.handle('workspace:security-notices', () => listPendingSecurityNotices());
+  ipcMain.handle('workspace:remove-legacy-launcher', async (_e, filePath: string) => {
+    const flagged = listPendingSecurityNotices().some((n) => n.filePath === filePath);
+    if (!flagged) {
+      return { removed: false, reason: 'path was not flagged by the security sweep' };
+    }
+    return removeLegacyLauncher(filePath, { trashItem: (p) => shell.trashItem(p) });
+  });
   ipcMain.handle('workspace:reorder', (_e, ids: string[]) => reorderWorkspaces(ids));
 
   ipcMain.handle('workspace:open-vscode', (_e, id) => {

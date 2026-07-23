@@ -679,6 +679,8 @@ export interface PrerequisiteCheck {
   installCommand?: string;
   installShell?: string;
   altCommand?: string;
+  /** Caveat for `installCommand` itself (e.g. "requires Node.js"). */
+  installNote?: string;
   /** Date `installCommand` was last checked; rendered so staleness is visible. */
   verifiedOn?: string;
   /** Diagnostic detail (a timeout, a probe error). Never the whole story. */
@@ -1419,6 +1421,19 @@ export interface ContinuationPhaseState {
  *  successfully, or the agent's entry was dropped) — it is not a phase. */
 export type ContinuationPhaseSignal = ContinuationPhaseState | { agentId: string; phase: null };
 
+/** P0.2 — legacy `launch.vbs` security notice (EDR-safety hardening).
+ *  Mirror of the main-process shape in workspace-state-dir.ts. */
+export interface WorkspaceSecurityNotice {
+  workspaceRoot: string;
+  filePath: string;
+  sha256: string;
+  title: string;
+  detail: string;
+  /** Inert scaffold-migration `.bak` files still quoting the old hidden-launch
+   *  recipe text — reported only, never part of the removal action. */
+  inertBackups: string[];
+}
+
 export interface IpcApi {
   workspaces: {
     list: () => Promise<Workspace[]>;
@@ -1426,6 +1441,13 @@ export interface IpcApi {
     delete: (id: string) => Promise<void>;
     reorder: (ids: string[]) => Promise<void>;
     openInVSCode: (id: string) => Promise<void>;
+    /** P0.2 legacy-launcher sweep: pending notices for this session. */
+    getSecurityNotices: () => Promise<WorkspaceSecurityNotice[]>;
+    /** Explicit, user-authorized move-to-Recycle-Bin of a flagged launcher. */
+    removeLegacyLauncher: (
+      filePath: string
+    ) => Promise<{ removed: boolean; sha256?: string; reason?: string }>;
+    onSecurityNotice: (callback: (notice: WorkspaceSecurityNotice) => void) => () => void;
   };
   agents: {
     list: (workspaceId: string) => Promise<Agent[]>;
