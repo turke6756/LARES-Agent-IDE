@@ -89,6 +89,11 @@ export function findWindowsProviderBinary(provider: 'codex' | 'gemini'): Promise
     for (const ext of exts) candidates.push(path.join(dir, `${provider}${ext}`));
   }
   candidates.push(path.join(localAppData, 'Programs', provider, `${provider}.exe`));
+  if (provider === 'codex') {
+    // OpenAI's native PowerShell installer (irm https://chatgpt.com/codex/install.ps1 | iex)
+    // lands here — the exact command PROVIDER_INSTALL_HINTS now recommends.
+    candidates.push(path.join(localAppData, 'Programs', 'OpenAI', 'Codex', 'bin', 'codex.exe'));
+  }
   candidates.push(path.join(home, '.local', 'bin', `${provider}.exe`));
   candidates.push(path.join(home, '.local', 'bin', provider));
 

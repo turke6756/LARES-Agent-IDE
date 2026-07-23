@@ -159,6 +159,7 @@ async function checkProvider(id: ProviderId): Promise<PrerequisiteCheck> {
     installCommand: hint.installCommand,
     installShell: hint.installShell,
     altCommand: hint.altCommand,
+    installNote: hint.installNote,
     verifiedOn: hint.verifiedOn,
   };
 

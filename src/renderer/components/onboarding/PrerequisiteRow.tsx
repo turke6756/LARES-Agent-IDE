@@ -107,6 +107,9 @@ export default function PrerequisiteRow({
 
           {check.installCommand && (
             <>
+              {check.installNote && (
+                <p className="text-[11px] text-accent-orange">{check.installNote}</p>
+              )}
               <CopyableCommand command={check.installCommand} shell={check.installShell} />
               <p className="text-[10.5px] text-gray-600">
                 {check.installShell ? `${check.installShell} — ` : ''}
