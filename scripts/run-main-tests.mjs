@@ -88,6 +88,10 @@ const TESTS = [
   // Git-Native WP-G1.3c: guarded blob-write restore (real git) — byte-exact, path-scoped
   // PRE safety ref, directory-transition + symlink-ancestor guards, partial accounting.
   'dist/main/main/git-checkpoints/checkpoint-restore.test.js',
+  // Git-Native WP-G1.5: turn-coordinator — before/after boundary state machine,
+  // fail-open before edge, never-two-open overlap, delivery-reject, completion
+  // via turn-completion-tracker, startup reconciliation.
+  'dist/main/main/git-checkpoints/turn-coordinator.test.js',
   'dist/main/main/supervisor/initial-user-prompt.test.js',
   'dist/main/main/supervisor/hook-spool-tailer.test.js',
   'dist/main/main/supervisor/send-input-encoder.test.js',
