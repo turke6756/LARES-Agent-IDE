@@ -3896,3 +3896,17 @@ export const MIN_SYSTEM_NODE_MAJOR = 18;
  *  the moment 0.2.1 ships. There is no background update check in 0.2.0 (plan
  *  §1): this opens only on an explicit user click. */
 export const LARES_RELEASES_URL = 'https://github.com/turke6756/AgentDashboard/releases/latest';
+
+// ── Git-Native checkpoint engine (WP-G0.1) ───────────────────────────────────
+// Pure literals, renderer-safe. Latency/scope knobs ship as provisional
+// defaults (telemetry-adjusted later); see plans/git-native-implementation-v2.md.
+export const MIN_GIT_VERSION = { major: 2, minor: 35 } as const;
+// Latency / scope (shipping provisional defaults; telemetry-adjusted later)
+export const BEFORE_CHECKPOINT_BUDGET_MS = 5000;
+export const AFTER_CHECKPOINT_BUDGET_MS = 15000;
+export const FINALIZE_ALLOWANCE_MS = 2000;   // scheduling target carved OUT of the budget
+export const CLEANUP_ALLOWANCE_MS = 1000;    // async, off the delivery path
+export const MAX_CHECKPOINT_PATHS = 20000;   // total in-scope tracked+untracked (see G1.3a)
+export const MAX_CHECKPOINT_BYTES = 256 * 1024 * 1024;
+export const MAINTENANCE_LOOSE_OBJECT_THRESHOLD = 4000; // below the ~6700 user auto-gc heuristic [T]
+export const TEMP_INDEX_SWEEP_GRACE_MS = 60 * 60 * 1000; // startup sweeper grace

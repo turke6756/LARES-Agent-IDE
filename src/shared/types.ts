@@ -719,6 +719,34 @@ export type PrerequisiteStatus =
    *  Distinct from `missing`: we do NOT know, and must not claim to. */
   | 'not-checked';
 
+// ── Git-Native capability DTOs (WP-G0.1) ─────────────────────────────────────
+// Pure types, renderer-safe. Two INDEPENDENT resolutions (agent-shell PATH-first
+// vs Lares-internal) plus the probed repo capability. Protected-root is a
+// boolean flag carried ALONGSIDE the underlying `reason` — never a reason value;
+// WP-G0.3 and WP-G1.3a gate on the boolean.
+export type GitSource = 'system' | 'bundled';
+export type GitRepoState =
+  'repo' | 'non-repo' | 'unborn' | 'nested' | 'spans-boundary' | 'unsupported-wsl';
+export type GitCapabilityReason =
+  'ok' | 'missing' | 'too-old' | 'unsafe-directory' | 'broken' | 'timeout'
+  | 'unsupported-layout' | 'unsupported-path';   // protected-root is a boolean flag, NOT a reason
+export interface GitResolution {                 // two independent resolutions
+  agentShell: { source: GitSource | null; note: string };  // PTY resolves PATH-first, bundled appended
+  internal:   { source: GitSource; execPath: string;
+                semver: { major: number; minor: number; patch: number } } | null;
+}
+export interface GitCapability {
+  resolution: GitResolution;
+  repoState: GitRepoState | null;
+  commonDir: string | null;          // CANONICAL real path (diagnostics + git ops)
+  commonDirQueueKey: string | null;  // case-folded on Windows — serialization key ONLY
+  repoRoot: string | null;
+  workspacePrefix: string | null;    // '' when workspace === repoRoot; POSIX, top-anchored
+  protectedRoot: boolean;            // agenda §8 — set alongside the underlying reason
+  reason: GitCapabilityReason;
+  detail: string | null;             // human-actionable
+}
+
 export interface PrerequisiteCheck {
   id: string;
   label: string;
@@ -741,6 +769,10 @@ export interface PrerequisiteCheck {
   verifiedOn?: string;
   /** Diagnostic detail (a timeout, a probe error). Never the whole story. */
   detail?: string;
+  /** Git-Native (WP-G0.1): the richer git capability state. The `status` field
+   *  above still drives the row; this carries resolution/repo/protected-root
+   *  detail. Populated only for the git optional-tool check. */
+  git?: GitCapability;
 }
 
 export interface RuntimePrerequisiteReport {
