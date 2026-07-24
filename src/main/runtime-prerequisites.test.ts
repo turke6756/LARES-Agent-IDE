@@ -22,6 +22,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import Module from 'node:module';
+import type { GitCapability } from '../shared/types';
 
 interface TestCase { name: string; run(): Promise<void> | void }
 const tests: TestCase[] = [];
@@ -59,7 +60,34 @@ const {
   __resetPrerequisiteCache,
   parseNodeMajor,
   decideNodeOptional,
+  decideGitStatus,
+  __setProbeWorkspaceGitForTest,
+  forcePrerequisiteRecheck,
 } = require('./runtime-prerequisites') as typeof import('./runtime-prerequisites');
+
+/** A healthy git capability (system git, at repo root, non-protected). Override
+ *  individual fields per case. */
+function gitCap(overrides: Partial<GitCapability> = {}): GitCapability {
+  return {
+    resolution: {
+      agentShell: { source: 'system', note: 'Agent shell and Lares both resolve system git.' },
+      internal: {
+        source: 'system',
+        execPath: 'C:\\Program Files\\Git\\cmd\\git.exe',
+        semver: { major: 2, minor: 45, patch: 2 },
+      },
+    },
+    repoState: 'repo',
+    commonDir: null,
+    commonDirQueueKey: null,
+    repoRoot: null,
+    workspacePrefix: null,
+    protectedRoot: false,
+    reason: 'ok',
+    detail: null,
+    ...overrides,
+  };
+}
 
 /** Point the resolver at an empty scratch home so no real CLI on the dev box
  *  makes these assertions depend on what happens to be installed. */
@@ -319,6 +347,134 @@ test('the TTL cache is bypassed by force, and never serves a WSL-less report to 
     assert.ok(wslCalls.passive >= 1);
   } finally {
     wslStatusToReturn = { state: 'unavailable', distros: [] };
+    restore();
+  }
+});
+
+// ── Git-Native WP-G0.3: capability-aware git row ────────────────────────────
+// The mapping is pure, so the reason × protectedRoot matrix is tested without
+// spawning git. The key honesty rule (mirrors the acceptance case): a
+// git-present-but-broken workspace must NOT read as "available".
+
+test('decideGitStatus: healthy repo on a non-protected root → available, no remediation', () => {
+  const d = decideGitStatus(gitCap());
+  assert.equal(d.status, 'available');
+  assert.equal(d.impact, '');
+  assert.equal(d.remediation, '');
+});
+
+test('decideGitStatus: non-repo and unborn HEAD (reason ok) stay available — supported', () => {
+  assert.equal(decideGitStatus(gitCap({ reason: 'ok', repoState: 'non-repo' })).status, 'available');
+  assert.equal(decideGitStatus(gitCap({ reason: 'ok', repoState: 'unborn' })).status, 'available');
+});
+
+// The acceptance case: safe.directory on a foreign-owned workspace.
+test('decideGitStatus: unsafe-directory → status NOT available + actionable remediation', () => {
+  const d = decideGitStatus(gitCap({ reason: 'unsafe-directory', repoState: 'repo' }));
+  assert.notEqual(d.status, 'available');
+  assert.ok(d.remediation.trim().length > 0, 'must carry a non-empty remediation');
+  assert.match(d.remediation, /safe\.directory/);
+});
+
+test('decideGitStatus: protectedRoot flags even a healthy repo → not available, protected-root remediation', () => {
+  const d = decideGitStatus(gitCap({ reason: 'ok', protectedRoot: true }));
+  assert.notEqual(d.status, 'available');
+  assert.ok(d.remediation.trim().length > 0);
+  assert.match(d.remediation, /protected root/i);
+});
+
+test('decideGitStatus: missing git → not available, install remediation', () => {
+  const d = decideGitStatus(
+    gitCap({
+      reason: 'missing',
+      repoState: null,
+      resolution: {
+        agentShell: { source: null, note: 'No git resolves on the agent shell PATH.' },
+        internal: null,
+      },
+    }),
+  );
+  assert.notEqual(d.status, 'available');
+  assert.match(d.remediation, /install/i);
+});
+
+test('decideGitStatus: divergent internal vs agent-shell resolution is surfaced in detail', () => {
+  const d = decideGitStatus(
+    gitCap({
+      reason: 'ok',
+      resolution: {
+        agentShell: {
+          source: 'system',
+          note: 'Divergent: the agent shell resolves system git first, while Lares uses bundled git (X) internally.',
+        },
+        internal: { source: 'bundled', execPath: 'X\\git.exe', semver: { major: 2, minor: 45, patch: 0 } },
+      },
+    }),
+  );
+  // Both resolutions must be legible in the rendered detail.
+  assert.ok(d.detail, 'divergence must produce a detail line');
+  assert.match(d.detail as string, /Divergent/i);
+  assert.match(d.detail as string, /bundled/);
+  assert.match(d.detail as string, /system/);
+});
+
+test('checkGit: an injected fake probe drives the git optional row + attaches the DTO', async () => {
+  const restore = withEmptyHome();
+  reset();
+  __setProbeWorkspaceGitForTest(async () => gitCap({ reason: 'unsafe-directory' }));
+  try {
+    const report = await detectRuntimePrerequisites({ force: true });
+    const git = report.optional.find((c) => c.id === 'git');
+    assert.ok(git, 'git must be present in the optional group');
+    assert.equal(git.tier, 'optional');
+    assert.notEqual(git.status, 'available');
+    assert.ok(git.remediation.trim().length > 0);
+    assert.ok(git.git, 'the full git DTO rides along on the check');
+    assert.equal(git.git?.reason, 'unsafe-directory');
+    // A degraded row must not advertise a usable path/version.
+    assert.equal(git.path, undefined);
+  } finally {
+    __setProbeWorkspaceGitForTest(null);
+    restore();
+  }
+});
+
+test('checkGit: a healthy probe → available, with the internal git path + version', async () => {
+  const restore = withEmptyHome();
+  reset();
+  __setProbeWorkspaceGitForTest(async () => gitCap());
+  try {
+    const report = await detectRuntimePrerequisites({ force: true });
+    const git = report.optional.find((c) => c.id === 'git');
+    assert.equal(git?.status, 'available');
+    assert.equal(git?.path, 'C:\\Program Files\\Git\\cmd\\git.exe');
+    assert.equal(git?.version, '2.45.2');
+    // A missing git must never flip the launch flag (git is optional).
+    assert.equal(report.anyProviderAvailable, false);
+  } finally {
+    __setProbeWorkspaceGitForTest(null);
+    restore();
+  }
+});
+
+test('forcePrerequisiteRecheck drops the TTL cache so the git row re-probes', async () => {
+  const restore = withEmptyHome();
+  reset();
+  __setProbeWorkspaceGitForTest(async () => gitCap({ reason: 'unsafe-directory' }));
+  try {
+    const first = await detectRuntimePrerequisites({});
+    assert.equal(first.optional.find((c) => c.id === 'git')?.git?.reason, 'unsafe-directory');
+    // Swap the probe result. Within the TTL and without invalidation, the cached
+    // (stale) report is served — proving the cache is real…
+    __setProbeWorkspaceGitForTest(async () => gitCap());
+    const cached = await detectRuntimePrerequisites({});
+    assert.equal(cached.optional.find((c) => c.id === 'git')?.git?.reason, 'unsafe-directory');
+    // …then the force hook drops it and the next pass recomputes.
+    forcePrerequisiteRecheck();
+    const fresh = await detectRuntimePrerequisites({});
+    assert.equal(fresh.optional.find((c) => c.id === 'git')?.status, 'available');
+  } finally {
+    __setProbeWorkspaceGitForTest(null);
     restore();
   }
 });

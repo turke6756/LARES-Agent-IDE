@@ -28,13 +28,16 @@
 import { execFile } from 'child_process';
 import { app } from 'electron';
 import type {
+  GitCapability,
   HealthCheck,
   PrerequisiteCheck,
+  PrerequisiteStatus,
   RuntimePrerequisiteReport,
   WslStatus,
 } from '../shared/types';
-import { PROVIDER_INSTALL_HINTS, OPTIONAL_TOOL_HINTS, MIN_SYSTEM_NODE_MAJOR } from '../shared/constants';
+import { PROVIDER_INSTALL_HINTS, OPTIONAL_TOOL_HINTS, MIN_SYSTEM_NODE_MAJOR, MIN_GIT_VERSION } from '../shared/constants';
 import { getWindowsSystemPath, probeWindowsProvider } from './supervisor/provider-resolver';
+import { probeWorkspaceGit } from './git/git-runtime';
 import { getPassiveWslStatus, wslExec } from './wsl-bridge';
 
 /** Per-probe budget. The plan says 2s; that is generous for a `--version` on a
@@ -238,8 +241,195 @@ export function decideNodeOptional(
   return { status: 'available', impact: '', remediation: '' };
 }
 
+// ── Git: dedicated capability-aware row (Git-Native WP-G0.3) ─────────────────
+//
+// The generic `checkOptional('git', …)` — a bare `where git` + `--version` — only
+// answered "is a git binary on PATH". That is the wrong question for checkpoints:
+// a present, resolvable, correctly-versioned git can still be unusable here
+// (foreign-owned workspace → `safe.directory`; a WSL/Linux path a Windows MinGit
+// cannot touch; a protected root we must never checkpoint; an unsupported nested
+// layout). So this row is driven by `probeWorkspaceGit`, and the mapping below is
+// deliberately strict: ONLY a clean `reason:'ok'` on a non-protected root reads as
+// "available". Every degraded reason — and `protectedRoot` regardless of reason —
+// is reported as NOT available, with an actionable remediation, never a silent
+// "available". (Unborn HEAD is `reason:'ok'` and stays available: it is supported,
+// seeded empty in G1.)
+
+/** What breaks with no usable git at all (binary absent / too old / unsafe /
+ *  broken). History, diffs AND checkpoints are gone, but Lares still opens the
+ *  folder. */
+const GIT_FEATURES_IMPACT =
+  'Git-specific features (history, diffs, checkpoints) are unavailable. Lares opens ordinary folders as workspaces without it.';
+/** What breaks when git itself is fine but THIS workspace can't be checkpointed
+ *  (protected root, or an unsupported repo layout). Narrower than the above. */
+const GIT_CHECKPOINTS_IMPACT =
+  'Lares cannot create Git checkpoints for this workspace. Git itself works — history and diffs on other workspaces are unaffected.';
+
+/** Render the internal-vs-agent-shell divergence into one human line, or null
+ *  when the two resolutions agree. "Agree" means the same source (or both
+ *  none); an internal-null while the shell still resolves *something* is itself a
+ *  divergence worth surfacing (the agent shell will run a git Lares won't use
+ *  internally). We reuse the probe's own `agentShell.note` verbatim so there is a
+ *  single source of truth for the phrasing. */
+function renderResolutionDivergence(git: GitCapability): string | null {
+  const internalSource = git.resolution.internal?.source ?? null;
+  const shellSource = git.resolution.agentShell.source;
+  if (internalSource === shellSource) return null;
+  const internalDesc = git.resolution.internal
+    ? `${git.resolution.internal.source} git (${git.resolution.internal.execPath})`
+    : 'no git meeting the version floor';
+  const shellDesc = shellSource ? `${shellSource} git` : 'no git';
+  return `Divergent Git resolution — Lares uses ${internalDesc} internally, while the agent shell resolves ${shellDesc}. ${git.resolution.agentShell.note}`;
+}
+
+/** Map a probed {@link GitCapability} onto the prerequisite-row fields. Pure and
+ *  exported so every branch of the reason × protectedRoot matrix is unit-testable
+ *  without spawning git. The divergence line (when the two resolutions differ) is
+ *  appended to whatever diagnostic `detail` the probe already produced. */
+export function decideGitStatus(git: GitCapability): {
+  status: PrerequisiteStatus;
+  impact: string;
+  remediation: string;
+  detail?: string;
+} {
+  const divergence = renderResolutionDivergence(git);
+  const detail =
+    [git.detail, divergence].filter(Boolean).join(' ').trim() || undefined;
+
+  // Protected root wins over the underlying reason: even a perfectly healthy repo
+  // at $HOME / Desktop / a drive root must never be checkpointed (invariant §8).
+  if (git.protectedRoot) {
+    return {
+      status: 'missing',
+      impact: GIT_CHECKPOINTS_IMPACT,
+      remediation:
+        'This workspace is a protected root (your home folder, Desktop, Documents, Downloads, or a drive/filesystem root). Lares will not create Git checkpoints here — open a specific project subfolder as the workspace instead.',
+      detail,
+    };
+  }
+
+  switch (git.reason) {
+    case 'ok':
+      // Includes non-repo (an ordinary folder) and unborn HEAD — both supported.
+      return { status: 'available', impact: '', remediation: '', detail };
+    case 'missing':
+      return {
+        status: 'missing',
+        impact: GIT_FEATURES_IMPACT,
+        remediation: `Optional — install ${OPTIONAL_TOOL_HINTS.git.label} (\`${OPTIONAL_TOOL_HINTS.git.installCommand}\`) to enable history, diffs, and checkpoints, then fully quit and restart Lares so it picks up your updated PATH.`,
+        detail,
+      };
+    case 'too-old':
+      return {
+        status: 'missing',
+        impact: GIT_FEATURES_IMPACT,
+        remediation: `Your Git is older than ${MIN_GIT_VERSION.major}.${MIN_GIT_VERSION.minor}, which Lares needs for checkpoints. Upgrade Git (\`${OPTIONAL_TOOL_HINTS.git.installCommand}\`), then fully quit and restart Lares.`,
+        detail,
+      };
+    case 'unsafe-directory':
+      return {
+        status: 'missing',
+        impact: GIT_FEATURES_IMPACT,
+        remediation:
+          'Git refuses to operate here because the workspace is owned by a different user (detected dubious ownership). Trust it with `git config --global --add safe.directory "<workspace path>"`, then choose Recheck.',
+        detail,
+      };
+    case 'timeout':
+      return {
+        status: 'missing',
+        impact: GIT_FEATURES_IMPACT,
+        remediation: 'Git did not respond in time while inspecting this workspace. Choose Recheck to try again.',
+        detail,
+      };
+    case 'unsupported-path':
+      return {
+        status: 'missing',
+        impact: GIT_CHECKPOINTS_IMPACT,
+        remediation:
+          'The bundled Git is a Windows executable and cannot operate on a WSL/Linux workspace path. Install Git inside your WSL distribution to use Git there.',
+        detail,
+      };
+    case 'unsupported-layout':
+      return {
+        status: 'missing',
+        impact: GIT_CHECKPOINTS_IMPACT,
+        remediation:
+          'This repository layout (a nested repo or in-tree submodule, or a repository root outside the workspace) is not supported for checkpoints. The rest of Lares works normally.',
+        detail,
+      };
+    case 'broken':
+    default:
+      return {
+        status: 'missing',
+        impact: GIT_FEATURES_IMPACT,
+        remediation: 'Git is installed but failed to inspect this workspace. See the diagnostic detail, then choose Recheck.',
+        detail,
+      };
+  }
+}
+
+/** Injectable seam: the probe the git row runs. Swapped in tests so no real git
+ *  is spawned; production always uses the real {@link probeWorkspaceGit}. */
+type ProbeWorkspaceGitFn = typeof probeWorkspaceGit;
+let probeWorkspaceGitImpl: ProbeWorkspaceGitFn = probeWorkspaceGit;
+
+/** Test seam: install a fake `probeWorkspaceGit` (pass null to restore the real
+ *  one). */
+export function __setProbeWorkspaceGitForTest(fn: ProbeWorkspaceGitFn | null): void {
+  probeWorkspaceGitImpl = fn ?? probeWorkspaceGit;
+}
+
+/** The dedicated git optional-tool check. Probes the workspace capability, maps
+ *  it to the row via {@link decideGitStatus}, and attaches the full `git` DTO.
+ *  Never throws — a probe failure degrades this one row. */
+async function checkGit(canonicalWorkspaceDir?: string): Promise<PrerequisiteCheck> {
+  const hint = OPTIONAL_TOOL_HINTS.git;
+  const base = {
+    id: 'git',
+    label: hint.label,
+    tier: 'optional' as const,
+    docsUrl: hint.docsUrl,
+    installCommand: hint.installCommand,
+  };
+
+  let git: GitCapability;
+  try {
+    // No bound workspace yet (startup): probe the app's cwd so we still learn
+    // whether a usable git exists at all. Repo-state is secondary there — the
+    // status mapping only reads it as `available` when git is genuinely healthy.
+    git = await probeWorkspaceGitImpl(canonicalWorkspaceDir ?? process.cwd());
+  } catch (err) {
+    return {
+      ...base,
+      status: 'missing',
+      impact: GIT_FEATURES_IMPACT,
+      remediation: 'Git could not be probed. Choose Recheck to try again.',
+      detail: err instanceof Error ? err.message : String(err),
+    };
+  }
+
+  const decision = decideGitStatus(git);
+  const check: PrerequisiteCheck = {
+    ...base,
+    status: decision.status,
+    impact: decision.impact,
+    remediation: decision.remediation,
+    git,
+  };
+  // Surface the resolved internal git path/version only when it is the one we'd
+  // actually use (a clean "available"); on a degraded row the path would imply a
+  // usability we just denied.
+  if (decision.status === 'available' && git.resolution.internal) {
+    const s = git.resolution.internal.semver;
+    check.path = git.resolution.internal.execPath;
+    check.version = `${s.major}.${s.minor}.${s.patch}`;
+  }
+  if (decision.detail) check.detail = decision.detail;
+  return check;
+}
+
 async function checkOptional(
-  id: 'git' | 'python' | 'node',
+  id: 'python' | 'node',
   impact: string,
 ): Promise<PrerequisiteCheck> {
   const hint = OPTIONAL_TOOL_HINTS[id];
@@ -454,6 +644,11 @@ export interface DetectOptions {
   hasWslWorkspace?: boolean;
   /** Bypass the TTL cache. The Recheck button sets this. */
   force?: boolean;
+  /** Canonical dir of the currently-bound workspace, threaded to the git probe
+   *  (WP-G0.3) so `git` reflects THIS workspace's capability (safe.directory,
+   *  protected-root, layout), not just "is a git binary on PATH". Undefined at
+   *  startup before a workspace is selected. */
+  canonicalWorkspaceDir?: string;
 }
 
 /** Build the report. Never throws. */
@@ -471,10 +666,7 @@ export async function detectRuntimePrerequisites(
     const [providers, optional, wslGroup] = await Promise.all([
       Promise.all(PROVIDER_IDS.map(checkProvider)),
       Promise.all([
-        checkOptional(
-          'git',
-          'Git-specific features (history, diffs) are unavailable. Lares opens ordinary folders as workspaces without it.',
-        ),
+        checkGit(opts.canonicalWorkspaceDir),
         checkOptional(
           'python',
           'Jupyter notebooks and Python-based workspace tooling will not run.',
@@ -536,6 +728,19 @@ export function toHealthCheck(report: RuntimePrerequisiteReport): HealthCheck {
     wslStatus: report.wslStatus,
     prerequisites: report,
   };
+}
+
+/** Production force-recheck hook (WP-G0.3). Drops the TTL-cached report so the
+ *  NEXT `detectRuntimePrerequisites` recomputes from scratch — the git row in
+ *  particular re-probes the workspace capability. Intended for the events that
+ *  invalidate that capability out from under the TTL: a `git init` (G3.4), a
+ *  workspace change, or a change in git exe availability. Deliberately minimal —
+ *  it only invalidates; it does not re-run detection or wire any caller itself.
+ *  (Distinct from {@link __resetPrerequisiteCache}, which is test-only and also
+ *  clears any in-flight run.) */
+export function forcePrerequisiteRecheck(): void {
+  cachedReport = null;
+  cachedAt = 0;
 }
 
 /** Test seam: drop the TTL cache. */
