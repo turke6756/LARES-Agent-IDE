@@ -6,7 +6,7 @@ import { workspaceStateDir } from './workspace-state-dir';
 import type { AgentSupervisor } from './supervisor';
 import {
   getAgent, getAllAgents, getAgentsByWorkspace, getAgentsByOwner, getWorkspace, getSupervisorAgent,
-  getFileActivities,
+  getFileActivities, findSelectionCommentsByPath,
   createTeam, getTeam, listTeams, updateTeamStatus, saveTeamManifest, getTeamManifest,
   addTeamMember, removeTeamMember, getTeamMembers,
   createChannel, removeChannel, getChannel, listChannels,
@@ -968,6 +968,34 @@ export class ApiServer {
       const currentOnly = url.searchParams.get('current_only') === 'true';
       const activities = getFileActivities(agentId, operation, currentOnly).slice(0, limit);
       return { agentId, operation: operation || null, activities };
+    }
+
+    // GET /api/comments?file_path=...&include_resolved=... — markdown-editor
+    // selection comments for a file. Backs the in-process `read_comments` MCP
+    // tool that replaces the pure-Python .lares/scripts/read-comments.py, so a
+    // machine with no real Python (clean Windows VMs ship only a 0-byte Store
+    // stub) can still read comments. Global, forgiving path-based lookup — the
+    // stored file path is the disambiguator, not a workspace scope (matches the
+    // script's semantics).
+    if (method === 'GET' && path === '/api/comments') {
+      const filePath = url.searchParams.get('file_path');
+      if (!filePath) {
+        throw Object.assign(new Error('Missing "file_path" query parameter'), { statusCode: 400 });
+      }
+      const includeResolved = url.searchParams.get('include_resolved') === 'true';
+      const { comments, matchedByFilename } = findSelectionCommentsByPath(filePath, includeResolved);
+      const items = comments.map((c) => ({
+        id: c.id,
+        lineStart: c.lineStart,
+        lineEnd: c.lineEnd,
+        quotedText: c.quotedText,
+        body: c.body,
+        status: c.status,
+        kind: c.kind,
+        createdAt: c.createdAt,
+        filePath: c.filePath,
+      }));
+      return { filePath, matchedByFilename, count: items.length, comments: items };
     }
 
     // POST /api/agents/:id/input — queue a message for delivery and return.

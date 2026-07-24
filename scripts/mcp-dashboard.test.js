@@ -101,6 +101,7 @@ test('notebooks,comms,observability exposes exactly those toolsets, not orchestr
     'read_agent_chat',
     'read_agent_files_touched',
     'read_agent_log',
+    'read_comments',
     'restart_kernel',
     'save_continuation_brick',
     'send_message_to_agent',
@@ -126,7 +127,7 @@ const OBSERVABILITY_CORE_TOOLS = [
   'get_my_context', 'get_usage_limits',
   'list_agents', 'list_my_agents', 'list_templates',
   'open_file_in_view', 'read_agent_chat', 'read_agent_files_touched',
-  'read_agent_log', 'save_continuation_brick',
+  'read_agent_log', 'read_comments', 'save_continuation_brick',
 ].sort();
 
 /** The 13 tools that made up the `observability-analytics` toolset, retired in

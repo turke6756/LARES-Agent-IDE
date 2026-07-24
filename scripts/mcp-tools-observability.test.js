@@ -74,6 +74,17 @@ ok('NO observability tool NAME contains a mutation verb', () => {
   }
 });
 
+// ── read_comments: the in-process replacement for the pure-Python
+// .lares/scripts/read-comments.py (removes the app's only hard Python dep). ──
+ok('read_comments is registered on the core surface with a file_path-required schema', () => {
+  const rc = getObservabilityCoreToolDefinitions().find((d) => d.name === 'read_comments');
+  assert.ok(rc, 'read_comments must be registered on observability-core (granted to supervisor + worker)');
+  assert.equal(rc.inputSchema.type, 'object');
+  assert.ok(rc.inputSchema.properties.file_path, 'read_comments must accept file_path');
+  assert.ok(rc.inputSchema.properties.include_resolved, 'read_comments must accept include_resolved');
+  assert.deepStrictEqual(rc.inputSchema.required, ['file_path'], 'file_path is the only required arg');
+});
+
 // ── WP-1C: contract text is TESTED against real builder behavior, not prose ──
 // The claim must not be that material unverified subtracts are "hidden by
 // default", because the shared default-surface policy makes them
@@ -158,20 +169,36 @@ async function run() {
     const fakeApi = (method, p) => {
       calls.push({ method, path: p });
       if (/^\/api\/agents(\?|$)/.test(p)) return Promise.resolve([]);
-      return Promise.resolve({ log: '', messages: [], activities: [] });
+      return Promise.resolve({ log: '', messages: [], activities: [], comments: [] });
     };
     // The read verbs of the surviving surface. (save_continuation_brick and
     // open_file_in_view are deliberately excluded — they are the two POST tools
     // on this toolset and were never part of the read-only §5.4 claim.)
     for (const name of ['list_agents', 'read_agent_log', 'read_agent_chat',
-      'read_agent_files_touched', 'get_usage_limits', 'get_my_context', 'list_my_agents']) {
+      'read_agent_files_touched', 'get_usage_limits', 'get_my_context', 'list_my_agents',
+      'read_comments']) {
       calls.length = 0;
-      await handleObservabilityToolCall(name, { agent_id: 'a1' }, fakeApi);
+      await handleObservabilityToolCall(name, { agent_id: 'a1', file_path: 'C:\\ws\\doc.md' }, fakeApi);
       assert.ok(calls.length >= 1, `${name} made no API call`);
       for (const c of calls) {
         assert.equal(c.method, 'GET', `${name} used ${c.method}, expected GET`);
       }
     }
+  });
+
+  await okAsync('read_comments GETs /api/comments with the file_path (and include_resolved when set)', async () => {
+    const calls = [];
+    const fakeApi = (method, p) => { calls.push({ method, path: p }); return Promise.resolve({ comments: [] }); };
+    await handleObservabilityToolCall('read_comments', { file_path: 'C:\\ws\\my doc.md' }, fakeApi);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].method, 'GET');
+    assert.ok(calls[0].path.startsWith('/api/comments?file_path='), `unexpected path: ${calls[0].path}`);
+    assert.ok(calls[0].path.includes(encodeURIComponent('C:\\ws\\my doc.md')), 'file_path must be URL-encoded');
+    assert.ok(!calls[0].path.includes('include_resolved'), 'include_resolved omitted when unset');
+
+    calls.length = 0;
+    await handleObservabilityToolCall('read_comments', { file_path: '/ws/doc.md', include_resolved: true }, fakeApi);
+    assert.ok(calls[0].path.includes('include_resolved=true'), 'include_resolved=true must be forwarded');
   });
 
   console.log(`\nmcp-tools-observability: ${passed} checks passed`);

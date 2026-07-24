@@ -11,7 +11,7 @@ import {
   WORKER_CLAUDE_SETTINGS_JSON, WORKER_CLAUDE_SETTINGS_JSON_V5, WORKER_CLAUDE_SETTINGS_JSON_V6,
   SUPERVISOR_PERSONA_CLAUDE_SETTINGS_JSON, SUPERVISOR_PERSONA_CLAUDE_SETTINGS_JSON_V1,
   PERSONA_CREATE_PERSONA_SKILL, PERSONA_CREATE_PERSONA_SKILL_V1,
-  PERSONA_READ_COMMENTS_SKILL, PERSONA_READ_COMMENTS_SKILL_V2, PERSONA_AGENT_MD_TEMPLATE,
+  PERSONA_READ_COMMENTS_SKILL, PERSONA_READ_COMMENTS_SKILL_V2, PERSONA_READ_COMMENTS_SKILL_V3, PERSONA_AGENT_MD_TEMPLATE,
   PERSONA_CREATE_PERSONA_SKILL_V3_HASH,
 } from '../shared/constants';
 import { workspaceStateDirName } from './workspace-state-dir';
@@ -141,10 +141,12 @@ function buildPersonaManagedFiles(name: string, lane?: PersonaLane): Record<stri
     // body — those fall through to the `.bak` + overwrite branch (recoverable),
     // since the sidecar format holds one hash per version.
     [`${base}/.claude/skills/create-persona/SKILL.md`]: { content: PERSONA_CREATE_PERSONA_SKILL, version: 3, previousHashes: { 1: sha256Hex(PERSONA_CREATE_PERSONA_SKILL_V1), 2: PERSONA_CREATE_PERSONA_SKILL_V3_HASH } },
-    // v2 (`.lares` rename): same single-hash caveat — previousHashes[1] is the
-    // last v1-era bundled body (PERSONA_READ_COMMENTS_SKILL_V2 = pre-rename);
-    // pre-QW2 kit copies `.bak` instead of upgrading silently.
-    [`${base}/.claude/skills/read-comments/SKILL.md`]:  { content: PERSONA_READ_COMMENTS_SKILL, version: 2, previousHashes: { 1: sha256Hex(PERSONA_READ_COMMENTS_SKILL_V2) } },
+    // v3 (read_comments MCP tool primary; Python demoted to fallback):
+    // previousHashes[2] is the last v2-era bundled body
+    // (PERSONA_READ_COMMENTS_SKILL_V3 = the `.lares`-renamed Python-primary body a
+    // persona kit at sidecar version 2 carries); previousHashes[1] stays the
+    // pre-rename body. Same single-hash caveat as create-persona above.
+    [`${base}/.claude/skills/read-comments/SKILL.md`]:  { content: PERSONA_READ_COMMENTS_SKILL, version: 3, previousHashes: { 1: sha256Hex(PERSONA_READ_COMMENTS_SKILL_V2), 2: sha256Hex(PERSONA_READ_COMMENTS_SKILL_V3) } },
   };
 }
 

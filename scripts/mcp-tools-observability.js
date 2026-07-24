@@ -167,6 +167,33 @@ function getObservabilityCoreToolDefinitions() {
       },
     },
     {
+      name: 'read_comments',
+      description:
+        'Read the markdown-editor comments/notes a user left on a document, given its file path. ' +
+        'The comments are stored in the dashboard database keyed by file path — NOT in the file itself — ' +
+        'so opening or grepping the file will never find them; this is the way to retrieve them. Use ' +
+        'whenever the user says "the comments I made", "my notes/feedback in this doc", or asks you to ' +
+        '"address the review notes on <file>" but gives you no inline comment text. Returns each ' +
+        "comment's line range, the quoted_text the user highlighted, their note (body), and status/kind, " +
+        'sorted by line. Resolved/orphaned comments are excluded unless include_resolved is true.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          file_path: {
+            type: 'string',
+            description:
+              'Path to the document (absolute preferred). Matching is forgiving: slashes and case are ' +
+              'normalized, with a filename-only fallback if the exact stored path is not found.',
+          },
+          include_resolved: {
+            type: 'boolean',
+            description: 'Include resolved/orphaned comments (default false: active comments only).',
+          },
+        },
+        required: ['file_path'],
+      },
+    },
+    {
       name: 'open_file_in_view',
       description:
         "Open a file as a tab in the user's dashboard file viewer — markdown, code, CSV/TSV, " +
@@ -339,6 +366,13 @@ async function handleObservabilityCoreToolCall(name, args, apiRequest) {
       } catch { /* personas endpoint may not exist yet */ }
       const combined = [...personaSummary, ...templateSummary];
       return { content: [{ type: 'text', text: JSON.stringify(combined, null, 2) }] };
+    }
+
+    case 'read_comments': {
+      let p = `/api/comments?file_path=${encodeURIComponent(args.file_path)}`;
+      if (args.include_resolved) p += '&include_resolved=true';
+      const result = await apiRequest('GET', p);
+      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
     }
 
     case 'open_file_in_view': {

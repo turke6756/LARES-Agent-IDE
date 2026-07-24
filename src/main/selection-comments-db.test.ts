@@ -116,6 +116,10 @@ type DbModule = {
   createSelectionComment(input: Record<string, unknown>): SelectionComment;
   getSelectionComment(id: string): SelectionComment | null;
   listSelectionComments(workspaceId: string, filePath: string): SelectionComment[];
+  findSelectionCommentsByPath(
+    targetPath: string,
+    includeResolved: boolean,
+  ): { comments: SelectionComment[]; matchedByFilename: boolean };
   updateSelectionComment(id: string, updates: Record<string, unknown>): SelectionComment | null;
   deleteSelectionComment(id: string): void;
   resolveSelectionComment(id: string): SelectionComment | null;
@@ -265,6 +269,71 @@ test('deleteSelectionComment removes the row', () => {
   const c = dbm.createSelectionComment(makeInput());
   dbm.deleteSelectionComment(c.id);
   assert.equal(dbm.getSelectionComment(c.id), null);
+});
+
+// ── findSelectionCommentsByPath — ports read-comments.py in-process ──────────
+// (removes the app's only hard Python dependency; §7 of the clean-VM report)
+
+test('findSelectionCommentsByPath: exact-path match, matchedByFilename false, resolved excluded', () => {
+  const a = dbm.createSelectionComment(makeInput({ body: 'active', lineStart: 10 }));
+  const r = dbm.createSelectionComment(makeInput({ body: 'resolved', lineStart: 5 }));
+  dbm.resolveSelectionComment(r.id);
+
+  const { comments, matchedByFilename } = dbm.findSelectionCommentsByPath('C:\\repo\\doc.md', false);
+  assert.equal(matchedByFilename, false, 'an exact path match must not set the filename-fallback flag');
+  assert.deepEqual(comments.map((c) => c.body), ['active'], 'resolved/orphaned excluded by default');
+
+  const withResolved = dbm.findSelectionCommentsByPath('C:\\repo\\doc.md', true);
+  assert.deepEqual(
+    withResolved.comments.map((c) => c.body).sort(),
+    ['active', 'resolved'],
+    'include_resolved=true returns resolved rows too',
+  );
+  dbm.deleteSelectionComment(a.id);
+  dbm.deleteSelectionComment(r.id);
+});
+
+test('findSelectionCommentsByPath: normalizes slashes + case', () => {
+  const c = dbm.createSelectionComment(makeInput({ filePath: 'C:\\Repo\\Doc.md' }));
+  const hit = dbm.findSelectionCommentsByPath('c:/repo/doc.md', false);
+  assert.equal(hit.comments.length, 1, 'forward slashes + lowercase still match the stored backslash/mixed-case path');
+  assert.equal(hit.matchedByFilename, false, 'a normalized exact match is still exact');
+  dbm.deleteSelectionComment(c.id);
+});
+
+test('findSelectionCommentsByPath: basename fallback sets matchedByFilename', () => {
+  const c = dbm.createSelectionComment(makeInput({ filePath: 'C:\\repo\\nested\\report.md' }));
+  const hit = dbm.findSelectionCommentsByPath('D:\\somewhere\\else\\report.md', false);
+  assert.equal(hit.comments.length, 1, 'basename match when the exact path is absent');
+  assert.equal(hit.matchedByFilename, true, 'fallback must flag matchedByFilename so the caller can verify');
+  // An exact match anywhere suppresses the fallback flag.
+  const exact = dbm.findSelectionCommentsByPath('C:\\repo\\nested\\report.md', false);
+  assert.equal(exact.matchedByFilename, false);
+  dbm.deleteSelectionComment(c.id);
+});
+
+test('findSelectionCommentsByPath: sorts by line_start (nulls last) then created_at', () => {
+  const p = 'C:\\repo\\sortme.md';
+  const noLine = dbm.createSelectionComment(makeInput({ filePath: p, lineStart: null, lineEnd: null, body: 'noline' }));
+  const l20 = dbm.createSelectionComment(makeInput({ filePath: p, lineStart: 20, body: 'l20' }));
+  const l5a = dbm.createSelectionComment(makeInput({ filePath: p, lineStart: 5, body: 'l5-earlier' }));
+  const l5b = dbm.createSelectionComment(makeInput({ filePath: p, lineStart: 5, body: 'l5-later' }));
+  raw(`UPDATE selection_comments SET created_at = '2026-06-12 00:00:00' WHERE id = ?`, [l5a.id]);
+  raw(`UPDATE selection_comments SET created_at = '2026-06-12 00:00:05' WHERE id = ?`, [l5b.id]);
+
+  const { comments } = dbm.findSelectionCommentsByPath(p, false);
+  assert.deepEqual(
+    comments.map((c) => c.body),
+    ['l5-earlier', 'l5-later', 'l20', 'noline'],
+    'line_start asc; ties break on created_at; null anchors sort last',
+  );
+  for (const id of [noLine.id, l20.id, l5a.id, l5b.id]) dbm.deleteSelectionComment(id);
+});
+
+test('findSelectionCommentsByPath: no match returns empty + matchedByFilename false', () => {
+  const hit = dbm.findSelectionCommentsByPath('C:\\nothing\\here.md', false);
+  assert.deepEqual(hit.comments, []);
+  assert.equal(hit.matchedByFilename, false);
 });
 
 // ── update / resolve maintain updated_at explicitly ──────────────────

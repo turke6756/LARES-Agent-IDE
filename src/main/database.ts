@@ -4187,6 +4187,52 @@ export function listSelectionComments(workspaceId: string, filePath: string): Se
   ).map(rowToSelectionComment);
 }
 
+/** Forgiving path-based comment lookup that ports `.lares/scripts/read-comments.py`
+ *  in-process for the `read_comments` MCP tool — removing the app's only hard
+ *  Python dependency (clean Windows VMs ship no real Python, only a 0-byte Store
+ *  stub). Matches ACROSS every workspace by file path: the DB is global and the
+ *  stored file path is the disambiguator, not the workspace (the script is
+ *  likewise workspace-agnostic). Normalizes slashes + case, prefers an exact-path
+ *  match, and falls back to a basename match with a `matchedByFilename` warning
+ *  flag. Resolved/orphaned rows are excluded unless `includeResolved`. Sorted by
+ *  line_start (null anchors last) then created_at — byte-for-byte the script's
+ *  ordering. */
+export function findSelectionCommentsByPath(
+  targetPath: string,
+  includeResolved: boolean,
+): { comments: SelectionComment[]; matchedByFilename: boolean } {
+  const norm = (p: string | null | undefined): string =>
+    p ? p.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase() : '';
+  const baseOf = (p: string): string => {
+    const i = p.lastIndexOf('/');
+    return i >= 0 ? p.slice(i + 1) : p;
+  };
+
+  const rows = queryAll(
+    `SELECT * FROM selection_comments WHERE file_path IS NOT NULL`
+  ).map(rowToSelectionComment);
+
+  const nt = norm(targetPath);
+  const base = baseOf(nt);
+  const exact = rows.filter((r) => norm(r.filePath) === nt);
+  let matched = exact.length > 0
+    ? exact
+    : rows.filter((r) => baseOf(norm(r.filePath)) === base);
+  if (!includeResolved) {
+    matched = matched.filter((r) => r.status !== 'resolved' && r.status !== 'orphaned');
+  }
+  matched.sort((a, b) => {
+    const aNull = a.lineStart == null;
+    const bNull = b.lineStart == null;
+    if (aNull !== bNull) return aNull ? 1 : -1;
+    const al = a.lineStart ?? 0;
+    const bl = b.lineStart ?? 0;
+    if (al !== bl) return al - bl;
+    return (a.createdAt || '').localeCompare(b.createdAt || '');
+  });
+  return { comments: matched, matchedByFilename: exact.length === 0 && matched.length > 0 };
+}
+
 export function updateSelectionComment(id: string, updates: UpdateSelectionCommentInput): SelectionComment | null {
   const sets: string[] = [];
   const params: any[] = [];
