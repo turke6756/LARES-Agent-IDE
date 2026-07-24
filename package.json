@@ -18,6 +18,7 @@
     "analytics:snapshot": "npm run build:main && electron dist/main/main/analytics-export/analytics-snapshot-cli.js",
     "analytics:snapshot:fast": "electron dist/main/main/analytics-export/analytics-snapshot-cli.js",
     "test:analytics": "npm run build:main && node dist/main/main/context-overhead/overhead-dto.test.js && node dist/main/main/analytics-export/analytics-exporter.test.js && node dist/main/main/api-server-overhead-route.test.js",
+    "fetch:mingit": "node scripts/fetch-mingit.mjs",
     "rebuild": "npm run rebuild:native",
     "rebuild:native": "node scripts/rebuild-native.js --arch=x64",
     "verify:native": "electron scripts/verify-native.cjs",
@@ -28,7 +29,8 @@
     "dist:win": "npm run package:prepare && electron-builder --win nsis --x64 --config.npmRebuild=false --publish never",
     "verify:packaged-scripts": "node scripts/verify-packaged-scripts.mjs",
     "verify:package": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/verify-windows-package.ps1",
-    "verify:bundled-node": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/verify-bundled-node.ps1"
+    "verify:bundled-node": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/verify-bundled-node.ps1",
+    "verify:bundled-git": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/verify-bundled-git.ps1"
   },
   "build": {
     "appId": "com.lares.app",
@@ -65,6 +67,10 @@
       {
         "from": "assets",
         "to": "assets"
+      },
+      {
+        "from": "third_party/git-for-windows/.staging/mingit",
+        "to": "mingit"
       },
       {
         "from": "native/lares-native",

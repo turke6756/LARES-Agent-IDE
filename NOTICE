@@ -15,3 +15,33 @@ at src/renderer/assets/material-icons/LICENSE.
 
 Other third-party dependencies are declared in package.json and their licenses
 are distributed with their respective packages under node_modules/.
+
+--------------------------------------------------------------------------------
+Bundled Git for Windows (MinGit) — GNU GPL v2 (separately licensed)
+--------------------------------------------------------------------------------
+
+Binary distributions of Lares for Windows bundle a copy of Git for Windows in
+its minimal "MinGit" form (hereafter "the Program"), used as a fallback Git
+runtime when no compatible Git is already installed. The Program is NOT part of
+Lares' own Apache-2.0-licensed code: it is a separate program, licensed under
+the GNU General Public License, version 2.
+
+  - Full license text:  third_party/git-for-windows/GPLv2.txt
+  - Pinned version:     third_party/git-for-windows/mingit-manifest.json
+  - Written source offer (GPLv2 §3(b), 3-year):
+                        third_party/git-for-windows/SOURCE-OFFER.txt
+  - Upstream source URL template:
+                        third_party/git-for-windows/SOURCE-URL.txt
+
+Corresponding source availability: the exact corresponding source code for the
+pinned version of the Program is retained by Edward Turk and is available on
+request for at least three years, as stated in the written offer above. The
+canonical upstream source is the git-for-windows/git repository on GitHub.
+
+Git config note: Lares never writes the user's global (~/.gitconfig) or system
+Git configuration. The bundled Program carries its own inert system config at
+mingit/etc/gitconfig containing only `[core] longpaths = true`; that config
+applies solely to the bundled Program and is not consulted when Lares' internal
+resolution or the user's shell uses a system-installed Git. Lares reads the
+user's own Git configuration normally but never mutates global, system, or repo
+Git trust or configuration.

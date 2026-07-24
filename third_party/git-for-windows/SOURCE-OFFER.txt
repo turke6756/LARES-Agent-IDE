@@ -1,0 +1,44 @@
+Written Offer of Source Code (GNU GPL v2, Section 3(b))
+========================================================
+
+Lares distributes a copy of Git for Windows in the form of the "MinGit"
+minimal runtime (hereafter "the Program"). The Program is licensed under the
+GNU General Public License, version 2, whose full text ships alongside this
+file as GPLv2.txt.
+
+The exact, pinned version of the Program that Lares bundles is:
+
+    Git for Windows / MinGit <PINNED-VERSION>
+
+For any binary distribution of Lares that includes the Program, and for a
+period of at least THREE (3) YEARS from the date Lares distributed that binary
+(or for as long as Lares offers spare parts or customer support for that
+product version, whichever is longer), Edward Turk will provide to any third
+party, upon written request and for a charge no more than the cost of
+physically performing source distribution, a complete machine-readable copy of
+the corresponding source code for the exact pinned version of the Program named
+above, to be distributed under the terms of the GNU General Public License,
+version 2, as published by the Free Software Foundation.
+
+"Corresponding source code" means the complete source code for all modules the
+Program contains, plus any associated interface definition files and the
+scripts used to control compilation and installation of the executable, as
+required by GPLv2 Section 3.
+
+The exact corresponding source archive for the pinned version above is
+RETAINED by Edward Turk and is available on request under this offer. The
+canonical upstream location for that source is recorded in SOURCE-URL.txt
+(provided for convenience; this written offer, not the URL, is what satisfies
+GPLv2 Section 3(b)).
+
+To exercise this offer, send a written request to:
+
+    Edward Turk
+    turke6756@gmail.com
+
+Please include the exact Lares version you received and the pinned Program
+version named above so the corresponding source can be identified.
+
+This offer is valid to anyone who receives this notice and applies to the
+Program only. Lares' own code is licensed separately under the Apache License,
+Version 2.0 (see LICENSE); this offer does not extend to it.

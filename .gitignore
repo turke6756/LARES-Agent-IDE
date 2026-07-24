@@ -91,3 +91,9 @@ experiments/
 # Machine-local runtime descriptor (absolute paths) — generated at launch
 /.lares/installation.json
 /.dashboard/installation.json
+
+# Bundled MinGit staging (WP-G0.5) — the fetched/verified Git-for-Windows payload
+# is downloaded by scripts/fetch-mingit.mjs in release CI and packaged via
+# build.extraResources; it is NEVER checked into git. git-runtime's dev fallback
+# resolves the bundled git.exe out of this same path.
+/third_party/git-for-windows/.staging/
