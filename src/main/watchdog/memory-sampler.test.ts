@@ -149,38 +149,19 @@ test('sampler failure suspends commit rules but keeps static caps; meter unknown
   assert.equal(failureLines.length, 1, 'sampler failure is logged exactly once per episode');
 });
 
-// ── growth-rate Critical trip (below 88%) ─────────────────────────────────────
+// ── fast commit growth below the band stays admitted (thresholds only) ────────
 
-test('growth-rate trips Critical below 88% when projected time-to-limit < 30 min', () => {
-  // 128 GB limit. Ramp commit fast enough that the 5-min slope projects < 30 min
-  // while the absolute level stays well under the 88% Critical trip.
+test('fast commit growth below 88% stays below Critical — only the threshold trips', () => {
   const h = makeHarness();
   const base = 2_000_000;
-  // 50% → 70% over 5 minutes (4 pct-points/min ≈ 5.1 GB/min); remaining ~38 GB
-  // at that slope projects in < 8 min.
+  // 50% → 70% over 5 minutes: steep, but still under the 88% trip.
   for (let min = 0; min <= 5; min++) {
     h.setTime(base + min * 60_000);
     h.setPercent(50 + min * 4);
     h.sampler.sample();
   }
-  const snap = h.sampler.getSnapshot()!;
-  assert.ok(snap.commitPercent !== null && snap.commitPercent < 88,
-    `absolute level must stay below the 88% trip (got ${snap.commitPercent}%)`);
-  assert.equal(h.sampler.isCriticalPressure(), true, 'steep sustained growth trips Critical below 88%');
-  assert.ok(snap.projectedMinutesToLimit !== null && snap.projectedMinutesToLimit < 30,
-    `projection should be < 30 min (got ${snap.projectedMinutesToLimit})`);
-});
-
-test('a flat commit series does not trip the growth-rate rule', () => {
-  const h = makeHarness();
-  const base = 3_000_000;
-  for (let min = 0; min <= 6; min++) {
-    h.setTime(base + min * 60_000);
-    h.setPercent(60); // flat
-    h.sampler.sample();
-  }
-  assert.equal(h.sampler.getLevel(), 'normal', 'flat 60% stays normal');
-  assert.equal(h.sampler.getSnapshot()!.projectedMinutesToLimit, null, 'flat slope yields no projection');
+  assert.equal(h.sampler.getLevel(), 'normal', 'sub-warn commit stays normal regardless of growth rate');
+  assert.equal(h.sampler.canLaunchAgent().allowed, true, 'launches admitted below the thresholds');
 });
 
 // ── snapshot passthrough of local counts ──────────────────────────────────────

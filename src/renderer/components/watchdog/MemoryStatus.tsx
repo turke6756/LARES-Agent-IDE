@@ -10,7 +10,7 @@
 import React, { useEffect, useState } from 'react';
 import * as Icons from 'lucide-react';
 import type { MemorySnapshotDto } from '../../../shared/types';
-import { formatBytes, formatMinutesToLimit } from './format';
+import { formatBytes } from './format';
 import OrphanSweepPanel from './OrphanSweepPanel';
 
 const BAND = {
@@ -83,9 +83,6 @@ export default function MemoryStatus() {
           <span className={`font-medium ${band.text}`}>{band.label}</span>
           <span className="text-gray-400 min-w-0 truncate">
             Commit at {Math.round(pct)}% of limit
-            {snap.projectedMinutesToLimit != null
-              ? ` · ${formatMinutesToLimit(snap.projectedMinutesToLimit)}`
-              : ''}
             {level === 'critical'
               ? ' — new agent launches and tabs are being refused.'
               : ' — consider reaping idle or finished agents.'}

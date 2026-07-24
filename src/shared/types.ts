@@ -3434,7 +3434,6 @@ export interface MemorySnapshotDto {
   appMemoryBytes: number;
   liveAgentCount: number;
   agentViewCount: number;
-  projectedMinutesToLimit: number | null;
   staticCapsOnly: boolean;
   at: number;
 }

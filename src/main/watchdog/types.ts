@@ -44,9 +44,6 @@ export interface MemorySnapshot {
   liveAgentCount: number;
   /** Live agent tabs/views. */
   agentViewCount: number;
-  /** Projected minutes until commit hits the limit from the 5-min rolling slope;
-   *  null when the slope is flat/negative or the window is too short. */
-  projectedMinutesToLimit: number | null;
   /** true when the sampler is degraded to static-caps-only (commit unknown). */
   staticCapsOnly: boolean;
   at: number;
@@ -99,13 +96,6 @@ export interface WatchdogConfig {
   /** Critical band trip / clear (percent of commit limit). */
   criticalOnPercent: number;
   criticalClearPercent: number;
-  /** Rolling window for the growth-rate slope (ms). */
-  slopeWindowMs: number;
-  /** Minimum span of samples before the slope is trusted (ms). */
-  slopeMinSpanMs: number;
-  /** Growth-rate Critical trip: projected minutes-to-limit below this trips
-   *  Critical even below `criticalOnPercent`. */
-  projectionCriticalMinutes: number;
   /** Fail-closed static caps — enforced from local state even when the sampler
    *  is down. */
   maxLiveAgents: number;
@@ -118,9 +108,6 @@ export const DEFAULT_WATCHDOG_CONFIG: WatchdogConfig = {
   warnClearPercent: 70,
   criticalOnPercent: 88,
   criticalClearPercent: 80,
-  slopeWindowMs: 5 * 60_000,
-  slopeMinSpanMs: 60_000,
-  projectionCriticalMinutes: 30,
   maxLiveAgents: 32,
   maxElectronProcesses: 350,
 };

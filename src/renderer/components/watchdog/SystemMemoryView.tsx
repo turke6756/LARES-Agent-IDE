@@ -15,7 +15,7 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import * as Icons from 'lucide-react';
 import { useDashboardStore } from '../../stores/dashboard-store';
 import type { MemorySnapshotDto, SystemMemoryViewDto, CommitBreakdownDto, CommitCategoryDto } from '../../../shared/types';
-import { formatBytes, formatMinutesToLimit } from './format';
+import { formatBytes } from './format';
 import OrphanSweepPanel from './OrphanSweepPanel';
 import DetachedProcessesPanel from './DetachedProcessesPanel';
 import LiveAgentsPanel from './LiveAgentsPanel';
@@ -119,9 +119,6 @@ export default function SystemMemoryView() {
               <span className="text-gray-300">{view ? String(view.liveAgentCount) : snap ? String(snap.liveAgentCount) : '—'}</span>
             </span>
             <Stat label="Agent tabs" value={snap ? String(snap.agentViewCount) : '—'} />
-            {snap?.projectedMinutesToLimit != null && (
-              <Stat label="Projection" value={formatMinutesToLimit(snap.projectedMinutesToLimit)} />
-            )}
           </div>
 
           {/* Commit-charge breakdown: App / live agents / other-system. Commit

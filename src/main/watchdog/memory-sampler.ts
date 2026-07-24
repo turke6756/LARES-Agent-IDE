@@ -1,8 +1,8 @@
 // Memory watchdog sampler + admission engine (incident-2026-07-11 §5 D5-lite).
 //
 // Samples system commit every 15 s off the hot path, maintains a hysteretic
-// pressure band (Warn 75/70, Critical 88/80) plus a 5-min growth-rate Critical
-// trip, tracks Electron process/agent/view counts, and answers admission checks
+// pressure band (Warn 75/70, Critical 88/80), tracks Electron
+// process/agent/view counts, and answers admission checks
 // for new agent launches and new agent tabs. Enforcement is split exactly as the
 // plan requires:
 //   • Static caps (max live agents, max Electron processes) are fail-CLOSED —
@@ -42,12 +42,6 @@ export interface MemorySamplerDeps {
   config?: Partial<WatchdogConfig>;
 }
 
-interface SlopeSample {
-  t: number;
-  chargeBytes: number;
-  limitBytes: number;
-}
-
 export class MemorySampler {
   private readonly cfg: WatchdogConfig;
   private readonly deps: MemorySamplerDeps;
@@ -55,7 +49,6 @@ export class MemorySampler {
   private level: PressureLevel = 'normal';
   private commitKnown = false;
   private samplerFailureLogged = false;
-  private history: SlopeSample[] = [];
   private lastSnapshot: MemorySnapshot | null = null;
   private timer: ReturnType<typeof setInterval> | null = null;
 
@@ -88,7 +81,6 @@ export class MemorySampler {
     const reading = this.deps.readCommit();
 
     let commitPercent: number | null = null;
-    let projectedMinutes: number | null = null;
 
     if (reading) {
       // Sampler recovered (or is healthy) — reset the one-shot failure latch.
@@ -103,17 +95,11 @@ export class MemorySampler {
           ? (reading.commitChargeBytes / reading.commitLimitBytes) * 100
           : 0;
 
-      this.pushHistory({ t: now, chargeBytes: reading.commitChargeBytes, limitBytes: reading.commitLimitBytes });
-      projectedMinutes = this.projectMinutesToLimit(now, reading);
-
-      const projTrips =
-        projectedMinutes !== null && projectedMinutes < this.cfg.projectionCriticalMinutes;
-      this.transition(this.computeLevel(commitPercent, projTrips), commitPercent, projectedMinutes);
+      this.transition(this.computeLevel(commitPercent), commitPercent);
     } else {
       // Sampler failure: commit rules suspend (fail-open); static caps stay
       // enforced elsewhere. Meter shows "unknown". Log exactly once per episode.
       this.commitKnown = false;
-      this.history = [];
       if (!this.samplerFailureLogged) {
         this.log('[watchdog] commit sampler unavailable — commit-threshold enforcement suspended; static caps still enforced; meter=unknown');
         this.samplerFailureLogged = true;
@@ -130,7 +116,6 @@ export class MemorySampler {
       appMemoryBytes: safeCount(this.deps.getAppMemoryBytes),
       liveAgentCount: safeCount(this.deps.getLiveAgentCount),
       agentViewCount: safeCount(this.deps.getAgentViewCount),
-      projectedMinutesToLimit: projectedMinutes === null ? null : round1(projectedMinutes),
       staticCapsOnly: !this.commitKnown,
       at: now,
     };
@@ -222,11 +207,11 @@ export class MemorySampler {
     };
   }
 
-  /** Hysteretic band selection. `projTrips` is the growth-rate Critical trip. */
-  private computeLevel(pct: number, projTrips: boolean): PressureLevel {
+  /** Hysteretic band selection. */
+  private computeLevel(pct: number): PressureLevel {
     const cfg = this.cfg;
-    const criticalTrip = pct >= cfg.criticalOnPercent || projTrips;
-    const criticalHold = pct >= cfg.criticalClearPercent || projTrips;
+    const criticalTrip = pct >= cfg.criticalOnPercent;
+    const criticalHold = pct >= cfg.criticalClearPercent;
     const warnTrip = pct >= cfg.warnOnPercent;
     const warnHold = pct >= cfg.warnClearPercent;
 
@@ -244,48 +229,10 @@ export class MemorySampler {
     }
   }
 
-  private transition(next: PressureLevel, pct: number, projMin: number | null): void {
+  private transition(next: PressureLevel, pct: number): void {
     if (next === this.level) return;
-    const proj = projMin === null ? '' : `, projTToLimit=${round1(projMin)}min`;
-    this.log(`[watchdog] pressure ${this.level} → ${next} (commit=${round1(pct)}%${proj})`);
+    this.log(`[watchdog] pressure ${this.level} → ${next} (commit=${round1(pct)}%)`);
     this.level = next;
-  }
-
-  private pushHistory(s: SlopeSample): void {
-    this.history.push(s);
-    const cutoff = s.t - this.cfg.slopeWindowMs;
-    while (this.history.length > 0 && this.history[0].t < cutoff) this.history.shift();
-  }
-
-  /** Least-squares slope of commit charge over the rolling window; project the
-   *  time until charge reaches the limit. null when the window is too short or
-   *  the slope is flat/negative (no imminent exhaustion). */
-  private projectMinutesToLimit(now: number, reading: CommitReading): number | null {
-    if (this.history.length < 2) return null;
-    const span = now - this.history[0].t;
-    if (span < this.cfg.slopeMinSpanMs) return null;
-
-    const n = this.history.length;
-    let sumT = 0;
-    let sumC = 0;
-    let sumTT = 0;
-    let sumTC = 0;
-    const t0 = this.history[0].t;
-    for (const s of this.history) {
-      const x = s.t - t0;
-      sumT += x;
-      sumC += s.chargeBytes;
-      sumTT += x * x;
-      sumTC += x * s.chargeBytes;
-    }
-    const denom = n * sumTT - sumT * sumT;
-    if (denom === 0) return null;
-    const slopeBytesPerMs = (n * sumTC - sumT * sumC) / denom;
-    if (slopeBytesPerMs <= 0) return null; // flat or shrinking → no projection
-
-    const headroom = reading.commitLimitBytes - reading.commitChargeBytes;
-    if (headroom <= 0) return 0;
-    return headroom / slopeBytesPerMs / 60_000;
   }
 
   private log(msg: string): void {

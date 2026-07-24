@@ -87,3 +87,7 @@ experiments/
 /hello.py
 /proposed
 /spike-hello-world.md
+
+# Machine-local runtime descriptor (absolute paths) — generated at launch
+/.lares/installation.json
+/.dashboard/installation.json

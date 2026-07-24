@@ -17,7 +17,6 @@ import React, { useEffect, useRef, useState } from 'react';
 import * as Icons from 'lucide-react';
 import { useDashboardStore } from '../../stores/dashboard-store';
 import type { MemorySnapshotDto, WatchdogPressureLevel } from '../../../shared/types';
-import { formatMinutesToLimit } from './format';
 
 const RANK: Record<WatchdogPressureLevel, number> = { normal: 0, warn: 1, critical: 2 };
 
@@ -69,8 +68,7 @@ export default function PressureNotification() {
               {critical ? 'Critical memory pressure' : 'Memory pressure'}
             </div>
             <div className="text-[11px] text-gray-300 mt-0.5">
-              Commit at {pct != null ? `${pct}%` : 'high %'} of the limit
-              {snap.projectedMinutesToLimit != null ? ` · ${formatMinutesToLimit(snap.projectedMinutesToLimit)}` : ''}.
+              Commit at {pct != null ? `${pct}%` : 'high %'} of the limit.
               {critical
                 ? ' New agent launches and tabs are being refused.'
                 : ' Consider reaping idle or finished agents.'}

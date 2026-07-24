@@ -29,10 +29,3 @@ export function idleFor(idleSince: string): string {
   if (mins < 1440) return `${Math.round(mins / 60)}h`;
   return `${Math.round(mins / 1440)}d`;
 }
-
-/** "in ~12 min" / "in ~2 h" for the projected-time-to-limit hint; null → "". */
-export function formatMinutesToLimit(minutes: number | null | undefined): string {
-  if (minutes == null || !Number.isFinite(minutes) || minutes <= 0) return '';
-  if (minutes < 90) return `~${Math.round(minutes)} min to limit`;
-  return `~${(minutes / 60).toFixed(1)} h to limit`;
-}
