@@ -76,6 +76,10 @@ const TESTS = [
   'dist/main/main/git-checkpoints/git-command.test.js',
   // Git-Native WP-G1.2: per-key priority queue + eager timer-driven deadline expiry.
   'dist/main/main/git-checkpoints/checkpoint-queue.test.js',
+  // Git-Native WP-G1.3a: ref encoding round-trip + check-ref-format validation.
+  'dist/main/main/git-checkpoints/ref-encoding.test.js',
+  // Git-Native WP-G1.3a: capability gate + enumeration preflight + check-ignore trichotomy.
+  'dist/main/main/git-checkpoints/checkpoint-gating.test.js',
   'dist/main/main/supervisor/initial-user-prompt.test.js',
   'dist/main/main/supervisor/hook-spool-tailer.test.js',
   'dist/main/main/supervisor/send-input-encoder.test.js',
