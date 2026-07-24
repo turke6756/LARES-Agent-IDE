@@ -62,6 +62,8 @@ const TESTS = [
   'dist/main/main/watchdog/attribution-service.test.js',
   'dist/main/main/watchdog/system-memory-view.test.js',
   'dist/main/main/database.active-agents.test.js',
+  // Git-Native WP-A0: turn_records + recovery_operations schema/accessors.
+  'dist/main/main/turn-records.test.js',
   'dist/main/main/supervisor/initial-user-prompt.test.js',
   'dist/main/main/supervisor/hook-spool-tailer.test.js',
   'dist/main/main/supervisor/send-input-encoder.test.js',

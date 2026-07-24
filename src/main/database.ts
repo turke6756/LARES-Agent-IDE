@@ -1454,6 +1454,56 @@ function initContextOptimizerSchema(): void {
     CREATE INDEX IF NOT EXISTS idx_odv_lane ON optimizer_derivation_verifications(lane);
   `);
 
+  // Git-Native WP-A0 — durable turn spine + recovery-operation ledger. Lands
+  // before the checkpoint engine so that service fills these columns rather
+  // than defining them. `agent_id`/`agent_title` are PLAIN attributes with NO
+  // FK cascade (memory §4.2): deleteAgent must never purge these rows.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS turn_records (
+      id TEXT PRIMARY KEY,
+      workspace_id TEXT NOT NULL,
+      turn_seq INTEGER NOT NULL,
+      agent_id TEXT, agent_title TEXT,          -- plain attributes, NO FK cascade
+      owner_agent_id TEXT, owner_brick_generation INTEGER,  -- stamped server-side at dispatch
+      session_id TEXT, task_label TEXT,
+      started_at INTEGER, ended_at INTEGER,
+      status TEXT NOT NULL DEFAULT 'open',       -- see transition table in accessors
+      before_oid TEXT, after_oid TEXT,           -- CANDIDATE commit OIDs, persisted inside finalize
+      before_ref TEXT, after_ref TEXT,           -- deterministic ref names (encoder, G1.3a)
+      before_ready INTEGER NOT NULL DEFAULT 0,   -- edge verified: ref exists AND == oid
+      after_ready  INTEGER NOT NULL DEFAULT 0,
+      before_quality TEXT,                       -- BOUNDARY: guaranteed | late | degraded
+      after_quality  TEXT,                       -- hook | session-log | terminal | idle-fallback | none
+      before_raw_filter_bypassed INTEGER NOT NULL DEFAULT 0, -- CONTENT semantics, BEFORE edge only
+      before_filtered_paths TEXT,                -- JSON [path,...], BEFORE edge only
+      before_pruned_at INTEGER, after_pruned_at INTEGER,  -- hints; git rev-parse is the authority
+      touched TEXT,                              -- JSON [{path, op}] witnessed write/create
+      diff_stats TEXT,                           -- JSON {witnessed:{...}, window:{...}}
+      compact_diff TEXT,                         -- WITNESSED-PATH diff only, bounded (~100KB)
+      compact_diff_provenance TEXT,              -- always 'witnessed' (never raw-window)
+      failure_reason TEXT,
+      UNIQUE(workspace_id, turn_seq)
+    );
+    CREATE TABLE IF NOT EXISTS recovery_operations (
+      id TEXT PRIMARY KEY,                -- operationId
+      workspace_id TEXT NOT NULL,
+      kind TEXT NOT NULL,                 -- restore_paths | revert_turn | whole_tree(human)
+      actor TEXT NOT NULL,                -- supervisor agentId | 'human-ipc'
+      source_turn_id TEXT,
+      pre_ref TEXT, pre_oid TEXT,         -- refs/lares/recovery/<enc(ws)>/<enc(operationId)>/pre
+      pre_ready INTEGER NOT NULL DEFAULT 0,  -- pre-restore safety checkpoint verified
+      pre_included_paths TEXT,           -- JSON [{ path, state, oid?, mode? }] (path-scoped, NON-ignored only)
+      requested_paths TEXT,              -- JSON
+      preview_token TEXT,
+      status TEXT NOT NULL,              -- pending | ready | completed | partial | failed
+      completed_paths TEXT,              -- JSON — partial-restore recoverability
+      result TEXT, failure_reason TEXT,
+      created_at INTEGER, ended_at INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS idx_turn_records_ws_seq ON turn_records(workspace_id, turn_seq);
+    CREATE INDEX IF NOT EXISTS idx_turn_records_agent ON turn_records(agent_id);
+  `);
+
   // WP-2B (Priority 0) — one-time, resumable workspace-lineage backfill. Populates
   // stream_lane_stats.workspace_id/workspace_root by folding each stream's launch cwd
   // to a root owned by EXACTLY one workspace. Idempotent (only NULL rows, ON a unique
@@ -3714,6 +3764,11 @@ export function pruneFileActivitiesToRecentSessions(
 export function deleteAgent(id: string): void {
   run('DELETE FROM file_activities WHERE agent_id = ?', [id]);
   run('DELETE FROM events WHERE agent_id = ?', [id]);
+  // Git-Native WP-A0 (memory §4.2): deliberately DO NOT touch `turn_records` or
+  // `recovery_operations`. Their `agent_id`/`agent_title` are PLAIN attributes
+  // (no FK cascade) so the durable turn spine + recovery ledger survive agent
+  // deletion — a restore/revert must remain possible after the agent is gone.
+  // Regression-guarded in turn-records.test.ts.
   run('DELETE FROM agents WHERE id = ?', [id]);
 }
 
@@ -3731,6 +3786,610 @@ export function deleteAgent(id: string): void {
  */
 export function deleteFileActivitiesForAgent(agentId: string): void {
   run('DELETE FROM file_activities WHERE agent_id = ?', [agentId]);
+}
+
+// ── Git-Native WP-A0: turn_records + recovery_operations accessors ───────────
+//
+// The durable turn spine. Accessors are exported functions here (the raw
+// singleton is never re-exposed for these tables). Status transitions and the
+// atomic sequence allocation are enforced in code, not left to callers.
+
+/** Turn lifecycle statuses. `open` is the only non-terminal state; every other
+ *  value is terminal and immutable once written (see updateTurnRecord). */
+export type TurnStatus =
+  | 'open'
+  | 'accepted'
+  | 'interrupted'
+  | 'crashed'
+  | 'stopped'
+  | 'delivery_failed'
+  | 'skipped'
+  | 'reverted';
+
+/** Valid transition targets out of `open`. Mirrors the plan's transition table:
+ *  `open → { accepted, interrupted, crashed, stopped, delivery_failed, skipped,
+ *  reverted }`. Everything in this set is terminal. */
+const TURN_TERMINAL_STATUSES: ReadonlySet<TurnStatus> = new Set<TurnStatus>([
+  'accepted',
+  'interrupted',
+  'crashed',
+  'stopped',
+  'delivery_failed',
+  'skipped',
+  'reverted',
+]);
+
+export type TurnWitnessOp = 'write' | 'create' | string;
+
+export interface TurnWitnessEntry {
+  path: string;
+  op: TurnWitnessOp;
+}
+
+export interface TurnRecord {
+  id: string;
+  workspaceId: string;
+  turnSeq: number;
+  agentId: string | null;
+  agentTitle: string | null;
+  ownerAgentId: string | null;
+  ownerBrickGeneration: number | null;
+  sessionId: string | null;
+  taskLabel: string | null;
+  startedAt: number | null;
+  endedAt: number | null;
+  status: TurnStatus;
+  beforeOid: string | null;
+  afterOid: string | null;
+  beforeRef: string | null;
+  afterRef: string | null;
+  beforeReady: boolean;
+  afterReady: boolean;
+  beforeQuality: string | null;
+  afterQuality: string | null;
+  beforeRawFilterBypassed: boolean;
+  beforeFilteredPaths: string[] | null;
+  beforePrunedAt: number | null;
+  afterPrunedAt: number | null;
+  touched: TurnWitnessEntry[] | null;
+  diffStats: unknown | null;
+  compactDiff: string | null;
+  compactDiffProvenance: string | null;
+  failureReason: string | null;
+}
+
+/** Fields accepted at allocation. Identity/attribution only — OIDs, refs, and
+ *  diff payloads are filled later by updateTurnRecord as the edge is captured. */
+export interface AllocateTurnFields {
+  id?: string;
+  agentId?: string | null;
+  agentTitle?: string | null;
+  ownerAgentId?: string | null;
+  ownerBrickGeneration?: number | null;
+  sessionId?: string | null;
+  taskLabel?: string | null;
+  startedAt?: number | null;
+  status?: TurnStatus;
+}
+
+/** Mutable columns, keyed camelCase → { col, json? }. Anything not in this map
+ *  can never be written through updateTurnRecord/closeTurn (typo + injection
+ *  guard). `turn_seq`, `workspace_id`, and `id` are intentionally absent —
+ *  identity is immutable. */
+const TURN_UPDATABLE_COLUMNS: Record<string, { col: string; json?: boolean; bool?: boolean }> = {
+  agentId: { col: 'agent_id' },
+  agentTitle: { col: 'agent_title' },
+  ownerAgentId: { col: 'owner_agent_id' },
+  ownerBrickGeneration: { col: 'owner_brick_generation' },
+  sessionId: { col: 'session_id' },
+  taskLabel: { col: 'task_label' },
+  startedAt: { col: 'started_at' },
+  endedAt: { col: 'ended_at' },
+  status: { col: 'status' },
+  beforeOid: { col: 'before_oid' },
+  afterOid: { col: 'after_oid' },
+  beforeRef: { col: 'before_ref' },
+  afterRef: { col: 'after_ref' },
+  beforeReady: { col: 'before_ready', bool: true },
+  afterReady: { col: 'after_ready', bool: true },
+  beforeQuality: { col: 'before_quality' },
+  afterQuality: { col: 'after_quality' },
+  beforeRawFilterBypassed: { col: 'before_raw_filter_bypassed', bool: true },
+  beforeFilteredPaths: { col: 'before_filtered_paths', json: true },
+  beforePrunedAt: { col: 'before_pruned_at' },
+  afterPrunedAt: { col: 'after_pruned_at' },
+  touched: { col: 'touched', json: true },
+  diffStats: { col: 'diff_stats', json: true },
+  compactDiff: { col: 'compact_diff' },
+  compactDiffProvenance: { col: 'compact_diff_provenance' },
+  failureReason: { col: 'failure_reason' },
+};
+
+function parseJsonColumn<T>(raw: unknown): T | null {
+  if (typeof raw !== 'string' || raw.length === 0) return null;
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    return null;
+  }
+}
+
+function rowToTurnRecord(row: any): TurnRecord {
+  return {
+    id: row.id,
+    workspaceId: row.workspace_id,
+    turnSeq: row.turn_seq,
+    agentId: row.agent_id ?? null,
+    agentTitle: row.agent_title ?? null,
+    ownerAgentId: row.owner_agent_id ?? null,
+    ownerBrickGeneration: row.owner_brick_generation ?? null,
+    sessionId: row.session_id ?? null,
+    taskLabel: row.task_label ?? null,
+    startedAt: row.started_at ?? null,
+    endedAt: row.ended_at ?? null,
+    status: (row.status as TurnStatus) ?? 'open',
+    beforeOid: row.before_oid ?? null,
+    afterOid: row.after_oid ?? null,
+    beforeRef: row.before_ref ?? null,
+    afterRef: row.after_ref ?? null,
+    beforeReady: !!row.before_ready,
+    afterReady: !!row.after_ready,
+    beforeQuality: row.before_quality ?? null,
+    afterQuality: row.after_quality ?? null,
+    beforeRawFilterBypassed: !!row.before_raw_filter_bypassed,
+    beforeFilteredPaths: parseJsonColumn<string[]>(row.before_filtered_paths),
+    beforePrunedAt: row.before_pruned_at ?? null,
+    afterPrunedAt: row.after_pruned_at ?? null,
+    touched: parseJsonColumn<TurnWitnessEntry[]>(row.touched),
+    diffStats: parseJsonColumn<unknown>(row.diff_stats),
+    compactDiff: row.compact_diff ?? null,
+    compactDiffProvenance: row.compact_diff_provenance ?? null,
+    failureReason: row.failure_reason ?? null,
+  };
+}
+
+/** True for better-sqlite3 (`err.code` starts `SQLITE_CONSTRAINT`) AND the
+ *  sql.js test stand-in (message `UNIQUE constraint failed: …`). */
+function isUniqueConstraintError(err: unknown): boolean {
+  if (!err) return false;
+  const code = (err as { code?: unknown }).code;
+  if (typeof code === 'string' && code.startsWith('SQLITE_CONSTRAINT')) return true;
+  const message = (err as { message?: unknown }).message;
+  return typeof message === 'string' && /UNIQUE constraint failed/i.test(message);
+}
+
+export function getTurnRecord(id: string): TurnRecord | null {
+  const row = queryOne('SELECT * FROM turn_records WHERE id = ?', [id]);
+  return row ? rowToTurnRecord(row) : null;
+}
+
+export function listTurnRecords(
+  workspaceId: string,
+  opts?: { agentId?: string }
+): TurnRecord[] {
+  const clauses = ['workspace_id = ?'];
+  const params: unknown[] = [workspaceId];
+  if (opts?.agentId) {
+    clauses.push('agent_id = ?');
+    params.push(opts.agentId);
+  }
+  return queryAll(
+    `SELECT * FROM turn_records WHERE ${clauses.join(' AND ')} ORDER BY turn_seq ASC`,
+    params
+  ).map(rowToTurnRecord);
+}
+
+/**
+ * Atomic sequence allocation + insert. `MAX(turn_seq)+1` AND the insert run
+ * inside ONE `db.transaction(...)`; on a `UNIQUE(workspace_id, turn_seq)`
+ * violation the whole transaction is retried ONCE (a second racer having taken
+ * the seq re-reads a fresh MAX). Returns the inserted record.
+ */
+export function allocateAndInsertTurn(
+  workspaceId: string,
+  fields: AllocateTurnFields = {}
+): TurnRecord {
+  const id = fields.id ?? uuidv4();
+  const status: TurnStatus = fields.status ?? 'open';
+
+  const insertOnce = db.transaction((): TurnRecord => {
+    const next = db
+      .prepare(
+        'SELECT COALESCE(MAX(turn_seq), 0) + 1 AS next FROM turn_records WHERE workspace_id = ?'
+      )
+      .get(workspaceId) as { next: number };
+    const turnSeq = next.next;
+    db.prepare(
+      `INSERT INTO turn_records
+         (id, workspace_id, turn_seq, agent_id, agent_title, owner_agent_id,
+          owner_brick_generation, session_id, task_label, started_at, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      id,
+      workspaceId,
+      turnSeq,
+      fields.agentId ?? null,
+      fields.agentTitle ?? null,
+      fields.ownerAgentId ?? null,
+      fields.ownerBrickGeneration ?? null,
+      fields.sessionId ?? null,
+      fields.taskLabel ?? null,
+      fields.startedAt ?? null,
+      status
+    );
+    return rowToTurnRecord(
+      db.prepare('SELECT * FROM turn_records WHERE id = ?').get(id)
+    );
+  });
+
+  try {
+    return insertOnce();
+  } catch (err) {
+    if (isUniqueConstraintError(err)) {
+      // One racer took our seq; a fresh MAX read on retry resolves it.
+      return insertOnce();
+    }
+    throw err;
+  }
+}
+
+function buildTurnUpdate(updates: Record<string, unknown>): { sql: string; params: unknown[] } {
+  const sets: string[] = [];
+  const params: unknown[] = [];
+  for (const [key, value] of Object.entries(updates)) {
+    const spec = TURN_UPDATABLE_COLUMNS[key];
+    if (!spec) continue; // ignore unknown keys (identity columns, typos)
+    sets.push(`${spec.col} = ?`);
+    if (value === null || value === undefined) {
+      params.push(null);
+    } else if (spec.json) {
+      params.push(JSON.stringify(value));
+    } else if (spec.bool) {
+      params.push(value ? 1 : 0);
+    } else {
+      params.push(value);
+    }
+  }
+  return { sql: sets.join(', '), params };
+}
+
+/**
+ * Update a turn record with status-transition enforcement:
+ *  - a terminal row is IMMUTABLE — any update throws.
+ *  - a `status` change is legal only `open → <terminal target>`; an illegal
+ *    target throws. Setting `status` to the same value (a no-op) is allowed.
+ * Returns the updated record, or null if `id` is unknown.
+ */
+export function updateTurnRecord(
+  id: string,
+  updates: Partial<Record<keyof typeof TURN_UPDATABLE_COLUMNS, unknown>>
+): TurnRecord | null {
+  const tx = db.transaction((): TurnRecord | null => {
+    const current = db.prepare('SELECT * FROM turn_records WHERE id = ?').get(id) as
+      | { status: TurnStatus }
+      | undefined;
+    if (!current) return null;
+
+    if (current.status !== 'open') {
+      throw new Error(
+        `turn_records ${id} is terminal ('${current.status}') and immutable`
+      );
+    }
+
+    const nextStatus = (updates as { status?: TurnStatus }).status;
+    if (nextStatus !== undefined && nextStatus !== current.status) {
+      if (!TURN_TERMINAL_STATUSES.has(nextStatus)) {
+        throw new Error(
+          `illegal turn transition 'open' → '${nextStatus}' for ${id}`
+        );
+      }
+    }
+
+    const { sql, params } = buildTurnUpdate(updates as Record<string, unknown>);
+    if (sql.length > 0) {
+      db.prepare(`UPDATE turn_records SET ${sql} WHERE id = ?`).run(...params, id);
+    }
+    return rowToTurnRecord(db.prepare('SELECT * FROM turn_records WHERE id = ?').get(id));
+  });
+  return tx();
+}
+
+/**
+ * Idempotent close: transition an OPEN turn to a terminal `status` (stamping
+ * `ended_at` and any extra fields). If the turn is ALREADY terminal this is a
+ * no-op that returns the existing record unchanged — this closes the
+ * double-close / after-edge race. Returns null if `id` is unknown.
+ */
+export function closeTurn(
+  id: string,
+  status: Exclude<TurnStatus, 'open'>,
+  extra?: Partial<Record<keyof typeof TURN_UPDATABLE_COLUMNS, unknown>>,
+  endedAt?: number | null
+): TurnRecord | null {
+  if (!TURN_TERMINAL_STATUSES.has(status)) {
+    throw new Error(`closeTurn requires a terminal status, got '${status}'`);
+  }
+  const tx = db.transaction((): TurnRecord | null => {
+    const current = db.prepare('SELECT * FROM turn_records WHERE id = ?').get(id) as
+      | { status: TurnStatus }
+      | undefined;
+    if (!current) return null;
+    // Idempotent: already terminal → return as-is, never re-close.
+    if (current.status !== 'open') return rowToTurnRecord(current);
+
+    const merged: Record<string, unknown> = {
+      ...(extra ?? {}),
+      status,
+      endedAt: endedAt ?? Date.now(),
+    };
+    const { sql, params } = buildTurnUpdate(merged);
+    db.prepare(`UPDATE turn_records SET ${sql} WHERE id = ?`).run(...params, id);
+    return rowToTurnRecord(db.prepare('SELECT * FROM turn_records WHERE id = ?').get(id));
+  });
+  return tx();
+}
+
+/**
+ * Append a witnessed write/create to a turn's `touched` JSON array, with
+ * transactional `(turnId, path, op)` dedupe: the read-modify-write runs inside
+ * one transaction, and an already-present `(path, op)` tuple is a no-op.
+ * Returns true if a new entry was appended, false if it was a dedupe no-op or
+ * the turn is unknown.
+ */
+export function recordWitnessedActivity(
+  turnId: string,
+  filePath: string,
+  op: TurnWitnessOp
+): boolean {
+  const tx = db.transaction((): boolean => {
+    const row = db.prepare('SELECT touched FROM turn_records WHERE id = ?').get(turnId) as
+      | { touched: string | null }
+      | undefined;
+    if (!row) return false;
+    const entries = parseJsonColumn<TurnWitnessEntry[]>(row.touched) ?? [];
+    if (entries.some((e) => e.path === filePath && e.op === op)) return false; // dedupe
+    entries.push({ path: filePath, op });
+    db.prepare('UPDATE turn_records SET touched = ? WHERE id = ?').run(
+      JSON.stringify(entries),
+      turnId
+    );
+    return true;
+  });
+  return tx();
+}
+
+// ── turn_records export projection ───────────────────────────────────────────
+//
+// Named allowlist for any analytics/export path that serializes turn_records.
+// Refs and diffs contain raw workspace bytes / path lists (cross-cutting
+// invariant §7 — keep local, exclude from telemetry/export by default), so
+// `compact_diff`, `touched`, and `before_filtered_paths` are DELIBERATELY
+// excluded. Callers that need those must opt in explicitly, never by default.
+export const TURN_RECORD_EXPORT_ALLOWLIST = [
+  'id',
+  'workspace_id',
+  'turn_seq',
+  'agent_id',
+  'agent_title',
+  'owner_agent_id',
+  'owner_brick_generation',
+  'session_id',
+  'task_label',
+  'started_at',
+  'ended_at',
+  'status',
+  'before_oid',
+  'after_oid',
+  'before_ref',
+  'after_ref',
+  'before_ready',
+  'after_ready',
+  'before_quality',
+  'after_quality',
+  'before_raw_filter_bypassed',
+  'before_pruned_at',
+  'after_pruned_at',
+  'diff_stats',
+  'compact_diff_provenance',
+  'failure_reason',
+] as const;
+
+/** Columns intentionally withheld from the default export (invariant §7). */
+export const TURN_RECORD_EXPORT_EXCLUDED = [
+  'compact_diff',
+  'touched',
+  'before_filtered_paths',
+] as const;
+
+/**
+ * Project turn_records rows to the export allowlist. The returned objects
+ * NEVER carry `compact_diff`, `touched`, or `before_filtered_paths`.
+ */
+export function exportTurnRecords(
+  workspaceId: string,
+  opts?: { agentId?: string }
+): Record<string, unknown>[] {
+  const cols = TURN_RECORD_EXPORT_ALLOWLIST.join(', ');
+  const clauses = ['workspace_id = ?'];
+  const params: unknown[] = [workspaceId];
+  if (opts?.agentId) {
+    clauses.push('agent_id = ?');
+    params.push(opts.agentId);
+  }
+  return queryAll(
+    `SELECT ${cols} FROM turn_records WHERE ${clauses.join(' AND ')} ORDER BY turn_seq ASC`,
+    params
+  ) as Record<string, unknown>[];
+}
+
+// ── recovery_operations CRUD ─────────────────────────────────────────────────
+
+export type RecoveryOperationKind = 'restore_paths' | 'revert_turn' | 'whole_tree' | string;
+export type RecoveryOperationStatus =
+  | 'pending'
+  | 'ready'
+  | 'completed'
+  | 'partial'
+  | 'failed'
+  | string;
+
+export interface RecoveryOperation {
+  id: string;
+  workspaceId: string;
+  kind: RecoveryOperationKind;
+  actor: string;
+  sourceTurnId: string | null;
+  preRef: string | null;
+  preOid: string | null;
+  preReady: boolean;
+  preIncludedPaths: unknown | null;
+  requestedPaths: unknown | null;
+  previewToken: string | null;
+  status: RecoveryOperationStatus;
+  completedPaths: unknown | null;
+  result: string | null;
+  failureReason: string | null;
+  createdAt: number | null;
+  endedAt: number | null;
+}
+
+const RECOVERY_UPDATABLE_COLUMNS: Record<string, { col: string; json?: boolean; bool?: boolean }> = {
+  kind: { col: 'kind' },
+  actor: { col: 'actor' },
+  sourceTurnId: { col: 'source_turn_id' },
+  preRef: { col: 'pre_ref' },
+  preOid: { col: 'pre_oid' },
+  preReady: { col: 'pre_ready', bool: true },
+  preIncludedPaths: { col: 'pre_included_paths', json: true },
+  requestedPaths: { col: 'requested_paths', json: true },
+  previewToken: { col: 'preview_token' },
+  status: { col: 'status' },
+  completedPaths: { col: 'completed_paths', json: true },
+  result: { col: 'result' },
+  failureReason: { col: 'failure_reason' },
+  endedAt: { col: 'ended_at' },
+};
+
+function rowToRecoveryOperation(row: any): RecoveryOperation {
+  return {
+    id: row.id,
+    workspaceId: row.workspace_id,
+    kind: row.kind,
+    actor: row.actor,
+    sourceTurnId: row.source_turn_id ?? null,
+    preRef: row.pre_ref ?? null,
+    preOid: row.pre_oid ?? null,
+    preReady: !!row.pre_ready,
+    preIncludedPaths: parseJsonColumn<unknown>(row.pre_included_paths),
+    requestedPaths: parseJsonColumn<unknown>(row.requested_paths),
+    previewToken: row.preview_token ?? null,
+    status: row.status,
+    completedPaths: parseJsonColumn<unknown>(row.completed_paths),
+    result: row.result ?? null,
+    failureReason: row.failure_reason ?? null,
+    createdAt: row.created_at ?? null,
+    endedAt: row.ended_at ?? null,
+  };
+}
+
+export interface InsertRecoveryOperationFields {
+  id?: string;
+  kind: RecoveryOperationKind;
+  actor: string;
+  status?: RecoveryOperationStatus;
+  sourceTurnId?: string | null;
+  preRef?: string | null;
+  preOid?: string | null;
+  preReady?: boolean;
+  preIncludedPaths?: unknown;
+  requestedPaths?: unknown;
+  previewToken?: string | null;
+  completedPaths?: unknown;
+  result?: string | null;
+  failureReason?: string | null;
+  createdAt?: number | null;
+}
+
+export function insertRecoveryOperation(
+  workspaceId: string,
+  fields: InsertRecoveryOperationFields
+): RecoveryOperation {
+  const id = fields.id ?? uuidv4();
+  db.prepare(
+    `INSERT INTO recovery_operations
+       (id, workspace_id, kind, actor, source_turn_id, pre_ref, pre_oid,
+        pre_ready, pre_included_paths, requested_paths, preview_token, status,
+        completed_paths, result, failure_reason, created_at, ended_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    id,
+    workspaceId,
+    fields.kind,
+    fields.actor,
+    fields.sourceTurnId ?? null,
+    fields.preRef ?? null,
+    fields.preOid ?? null,
+    fields.preReady ? 1 : 0,
+    fields.preIncludedPaths !== undefined ? JSON.stringify(fields.preIncludedPaths) : null,
+    fields.requestedPaths !== undefined ? JSON.stringify(fields.requestedPaths) : null,
+    fields.previewToken ?? null,
+    fields.status ?? 'pending',
+    fields.completedPaths !== undefined ? JSON.stringify(fields.completedPaths) : null,
+    fields.result ?? null,
+    fields.failureReason ?? null,
+    fields.createdAt ?? Date.now()
+  );
+  return rowToRecoveryOperation(
+    db.prepare('SELECT * FROM recovery_operations WHERE id = ?').get(id)
+  );
+}
+
+export function getRecoveryOperation(id: string): RecoveryOperation | null {
+  const row = queryOne('SELECT * FROM recovery_operations WHERE id = ?', [id]);
+  return row ? rowToRecoveryOperation(row) : null;
+}
+
+export function listRecoveryOperations(
+  workspaceId: string,
+  opts?: { sourceTurnId?: string }
+): RecoveryOperation[] {
+  const clauses = ['workspace_id = ?'];
+  const params: unknown[] = [workspaceId];
+  if (opts?.sourceTurnId) {
+    clauses.push('source_turn_id = ?');
+    params.push(opts.sourceTurnId);
+  }
+  return queryAll(
+    `SELECT * FROM recovery_operations WHERE ${clauses.join(' AND ')} ORDER BY created_at ASC`,
+    params
+  ).map(rowToRecoveryOperation);
+}
+
+export function updateRecoveryOperation(
+  id: string,
+  updates: Partial<Record<keyof typeof RECOVERY_UPDATABLE_COLUMNS, unknown>>
+): RecoveryOperation | null {
+  const sets: string[] = [];
+  const params: unknown[] = [];
+  for (const [key, value] of Object.entries(updates)) {
+    const spec = RECOVERY_UPDATABLE_COLUMNS[key];
+    if (!spec) continue;
+    sets.push(`${spec.col} = ?`);
+    if (value === null || value === undefined) params.push(null);
+    else if (spec.json) params.push(JSON.stringify(value));
+    else if (spec.bool) params.push(value ? 1 : 0);
+    else params.push(value);
+  }
+  if (sets.length === 0) return getRecoveryOperation(id);
+  const info = db
+    .prepare(`UPDATE recovery_operations SET ${sets.join(', ')} WHERE id = ?`)
+    .run(...params, id) as { changes?: number };
+  if (info && info.changes === 0) return null;
+  return getRecoveryOperation(id);
+}
+
+export function deleteRecoveryOperation(id: string): void {
+  run('DELETE FROM recovery_operations WHERE id = ?', [id]);
 }
 
 export function checkAgentMdExists(workingDirectory: string, pathType: string): { found: boolean; fileName: string | null } {
