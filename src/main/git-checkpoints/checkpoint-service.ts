@@ -60,24 +60,37 @@ import {
   CLEANUP_ALLOWANCE_MS,
 } from '../../shared/constants';
 import type { GitCapability } from '../../shared/types';
-import type { TurnRecord } from '../database';
+import type { TurnRecord, RecoveryOperation, InsertRecoveryOperationFields } from '../database';
 import {
   getTurnRecord as dbGetTurnRecord,
   updateTurnRecord as dbUpdateTurnRecord,
   listTurnRecords as dbListTurnRecords,
+  insertRecoveryOperation as dbInsertRecoveryOperation,
+  getRecoveryOperation as dbGetRecoveryOperation,
+  updateRecoveryOperation as dbUpdateRecoveryOperation,
 } from '../database';
 import { buildGitEnv } from '../git/git-runtime';
 import {
   gateCheckpoint,
   enumerateScope,
+  classifyIgnored,
   type CapturableEntry,
   type EnumerationOutcome,
   type EnumerationResult,
+  type LstatInfo,
   type LstatFn,
 } from './checkpoint-gating';
-import { runGit as realRunGit, type GitRunResult, type RunGitOptions, GitCommandError } from './git-command';
+import {
+  runGit as realRunGit,
+  runGitBlobToFile as realRunGitBlobToFile,
+  type GitRunResult,
+  type RunGitOptions,
+  type RunGitBlobToFileOptions,
+  GitCommandError,
+  GitBlobError,
+} from './git-command';
 import { CheckpointQueue, type CheckpointPriority, type SkippedDeadline } from './checkpoint-queue';
-import { checkpointRef, type CheckpointEdge } from './ref-encoding';
+import { checkpointRef, recoveryRef, type CheckpointEdge } from './ref-encoding';
 
 // ── injectable seams ──────────────────────────────────────────────────────────
 
@@ -97,6 +110,52 @@ const DEFAULT_TURN_STORE: CheckpointTurnStore = {
   getTurnRecord: dbGetTurnRecord,
   updateTurnRecord: (id, updates) => dbUpdateTurnRecord(id, updates as never),
   listTurnRecords: dbListTurnRecords,
+};
+
+/** The subset of the WP-A0 `recovery_operations` accessors the restore path needs.
+ *  Defaults bind to the real database.ts exports; tests inject an in-memory fake so
+ *  the pending → ready → completed/partial/failed lifecycle + `completed_paths`
+ *  incremental record are observable. */
+export interface CheckpointRecoveryStore {
+  insertRecoveryOperation(workspaceId: string, fields: InsertRecoveryOperationFields): RecoveryOperation;
+  getRecoveryOperation(id: string): RecoveryOperation | null;
+  updateRecoveryOperation(id: string, updates: Record<string, unknown>): RecoveryOperation | null;
+}
+
+const DEFAULT_RECOVERY_STORE: CheckpointRecoveryStore = {
+  insertRecoveryOperation: dbInsertRecoveryOperation,
+  getRecoveryOperation: dbGetRecoveryOperation,
+  updateRecoveryOperation: (id, updates) => dbUpdateRecoveryOperation(id, updates as never),
+};
+
+/** The `runGitBlobToFile` shape (cwd, blobOid, destTmpPath, opts) — injectable so a
+ *  restore test can force a stream failure/AV-lock path without a real git process. */
+export type RunGitBlobToFileLike = (
+  cwd: string,
+  blobOid: string,
+  destTmpPath: string,
+  opts: RunGitBlobToFileOptions,
+) => Promise<{ bytesWritten: number }>;
+
+/** Per-file guarded-write tuning. Injectable so the AV-lock retry semantics can be
+ *  exercised deterministically (a fake fs seam throwing EPERM a bounded number of
+ *  times before succeeding). */
+export interface RestoreTuning {
+  /** Byte cap handed to `runGitBlobToFile` per restored blob (over-cap → visible fail). */
+  fileMaxBytes: number;
+  /** Absolute per-file git bound (stream + validation probes) in ms. */
+  fileTimeoutMs: number;
+  /** Windows read-only/EPERM/EBUSY (AV lock) replace attempts before failing visibly. */
+  replaceRetries: number;
+  /** Backoff between replace attempts (ms). */
+  replaceBackoffMs: number;
+}
+
+const DEFAULT_RESTORE_TUNING: RestoreTuning = {
+  fileMaxBytes: 256 << 20,
+  fileTimeoutMs: 60_000,
+  replaceRetries: 5,
+  replaceBackoffMs: 50,
 };
 
 /** Timing constants — injectable so the timing tests use scaled-down REAL budgets
@@ -120,7 +179,13 @@ export interface CheckpointServiceOptions {
   /** Resolved absolute git exe (cached `resolveInternalGit()` in production). */
   gitExe: string;
   runGit?: RunGitLike;
+  /** Restore's binary blob-write seam — defaults to git-command.runGitBlobToFile. */
+  runGitBlobToFile?: RunGitBlobToFileLike;
   store?: CheckpointTurnStore;
+  recoveryStore?: CheckpointRecoveryStore;
+  restore?: Partial<RestoreTuning>;
+  /** lstat seam for the restore guards (defaults to a real fs.lstatSync reader). */
+  lstat?: (absPath: string) => LstatInfo | null;
   timing?: Partial<CheckpointTiming>;
   /** OS temp dir for the per-op index (defaults to os.tmpdir()). NEVER `.git/`. */
   tmpDir?: string;
@@ -207,7 +272,11 @@ export class CheckpointService {
   private readonly queue: CheckpointQueue;
   private readonly gitExe: string;
   private readonly runGit: RunGitLike;
+  private readonly runGitBlobToFile: RunGitBlobToFileLike;
   private readonly store: CheckpointTurnStore;
+  private readonly recoveryStore: CheckpointRecoveryStore;
+  private readonly restoreTuning: RestoreTuning;
+  private readonly lstatAbs: (absPath: string) => LstatInfo | null;
   private readonly timing: CheckpointTiming;
   private readonly tmpDir: string;
   private readonly now: () => number;
@@ -220,7 +289,11 @@ export class CheckpointService {
     this.queue = opts.queue;
     this.gitExe = opts.gitExe;
     this.runGit = opts.runGit ?? realRunGit;
+    this.runGitBlobToFile = opts.runGitBlobToFile ?? realRunGitBlobToFile;
     this.store = opts.store ?? DEFAULT_TURN_STORE;
+    this.recoveryStore = opts.recoveryStore ?? DEFAULT_RECOVERY_STORE;
+    this.restoreTuning = { ...DEFAULT_RESTORE_TUNING, ...(opts.restore ?? {}) };
+    this.lstatAbs = opts.lstat ?? defaultAbsLstat;
     this.timing = { ...DEFAULT_TIMING, ...(opts.timing ?? {}) };
     this.tmpDir = opts.tmpDir ?? os.tmpdir();
     this.now = opts.now ?? Date.now;
@@ -856,6 +929,625 @@ export class CheckpointService {
   async settleCleanups(): Promise<void> {
     await Promise.allSettled(this.cleanups.splice(0));
   }
+
+  // ══ WP-G1.3c: guarded blob-write restore ════════════════════════════════════
+  //
+  // Restore is worktree-only (invariant #2): NEVER `git restore`/`git checkout`. The
+  // whole compound op runs under ONE `queue.withLock` acquisition at RESTORE priority
+  // (invariant #23) — no BEFORE/AFTER can interleave between the path-scoped safety
+  // snapshot and the mutation, and continuous sends cannot starve it. Sources are the
+  // before-edge blob OIDs resolved via `ls-tree` from the before commit (the tree blob
+  // OID, never `before_oid`), and the mode always comes from the ls-tree entry.
+
+  /**
+   * Restore a caller-chosen SUBSET of a turn's witnessed write/create paths to their
+   * before-edge bytes. The requested set is validated against the G1.3b witnessed
+   * contract (`validateRestorePaths`); any non-witnessed path fails the op visibly
+   * (whole-tree recovery is never reachable here).
+   */
+  async restorePaths(params: {
+    turnId: string;
+    requestedPaths: string[];
+    workspaceId: string;
+    /** supervisor agentId | 'human-ipc' — the row's `actor`. */
+    actor: string;
+    capability: GitCapability;
+    /** Optional caller-supplied operationId (defaults to a fresh UUID). */
+    operationId?: string;
+    /** Optional preview tokens (path → OID seen at preview time) for the anti-TOCTOU
+     *  recheck (Open #4 / WP-G2.2). Absent → no preview to compare. */
+    previewTokens?: Record<string, string>;
+    /** Human-force bypass of a preview-token mismatch. */
+    force?: boolean;
+  }): Promise<RestoreOutcome> {
+    const validation = this.validateRestorePaths(params.turnId, params.requestedPaths, params.workspaceId);
+    if (!validation.ok) {
+      // Non-witnessed paths never reach a mutation; fail visibly WITHOUT a lock/row.
+      return {
+        status: 'failed',
+        operationId: params.operationId ?? '',
+        kind: 'restore_paths',
+        preRef: null,
+        preOid: null,
+        requestedPaths: dedupe(params.requestedPaths),
+        completedPaths: [],
+        rejectedPaths: validation.rejectedPaths,
+        failures: [],
+        contention: validation.contention,
+        failureReason: 'non-witnessed-paths',
+      };
+    }
+    return this.executeRestore('restore_paths', {
+      ...params,
+      paths: validation.validatedPaths,
+      contention: validation.contention,
+    });
+  }
+
+  /**
+   * Revert an ENTIRE turn: restore every path in its canonical witnessed write/create
+   * set to the before-edge bytes (create → delete; modify/delete → exact prior bytes).
+   */
+  async revertTurn(params: {
+    turnId: string;
+    workspaceId: string;
+    actor: string;
+    capability: GitCapability;
+    operationId?: string;
+    previewTokens?: Record<string, string>;
+    force?: boolean;
+  }): Promise<RestoreOutcome> {
+    const paths = this.revertTurnPathSet(params.turnId).paths;
+    // Surface same-path open-turn contention for symmetry with restorePaths.
+    const validation = this.validateRestorePaths(params.turnId, paths, params.workspaceId);
+    return this.executeRestore('revert_turn', {
+      ...params,
+      paths,
+      contention: validation.contention,
+    });
+  }
+
+  // ── the compound op: one RESTORE-priority lock acquisition ─────────────────────
+
+  private async executeRestore(
+    kind: 'restore_paths' | 'revert_turn',
+    args: {
+      turnId: string;
+      paths: string[];
+      workspaceId: string;
+      actor: string;
+      capability: GitCapability;
+      operationId?: string;
+      previewTokens?: Record<string, string>;
+      force?: boolean;
+      contention: { path: string; turnId: string }[];
+    },
+  ): Promise<RestoreOutcome> {
+    const key = args.capability.commonDirQueueKey;
+    const repoRoot = args.capability.repoRoot;
+    if (!key || !repoRoot) {
+      return this.failedOutcome(kind, args.operationId ?? '', args.paths, args.contention, 'missing-repo');
+    }
+    const settled = await this.queue.withLock(key, () => this.runRestore(kind, { ...args, repoRoot }));
+    if (isSkippedDeadline(settled)) {
+      // withLock uses an infinite deadline, so this is unreachable in practice.
+      return this.failedOutcome(kind, args.operationId ?? '', args.paths, args.contention, 'lock-skipped');
+    }
+    return settled;
+  }
+
+  private async runRestore(
+    kind: 'restore_paths' | 'revert_turn',
+    args: {
+      turnId: string;
+      paths: string[];
+      workspaceId: string;
+      actor: string;
+      capability: GitCapability;
+      repoRoot: string;
+      operationId?: string;
+      previewTokens?: Record<string, string>;
+      force?: boolean;
+      contention: { path: string; turnId: string }[];
+    },
+  ): Promise<RestoreOutcome> {
+    const { repoRoot } = args;
+    // Canonical (realpath'd) root — all filesystem paths key off this so a
+    // symlinked temp dir (mac `/var`→`/private/var`, Windows short names) can never
+    // make an in-workspace descendant look out-of-workspace. Git commands keep
+    // `repoRoot` (git resolves either).
+    const root = this.canonicalRoot(repoRoot);
+    const paths = dedupe(args.paths);
+    const operationId = args.operationId ?? randomUUID();
+
+    // 1. Write the recovery_operations row `pending` (before any snapshot/mutation).
+    this.recoveryStore.insertRecoveryOperation(args.workspaceId, {
+      id: operationId,
+      kind,
+      actor: args.actor,
+      status: 'pending',
+      sourceTurnId: args.turnId,
+      requestedPaths: paths,
+    });
+
+    const fail = (reason: string, extra?: Partial<RestoreOutcome>): RestoreOutcome => {
+      this.recoveryStore.updateRecoveryOperation(operationId, {
+        status: 'failed',
+        failureReason: reason,
+        endedAt: this.now(),
+        ...(extra?.rejectedPaths ? { result: JSON.stringify({ rejectedPaths: extra.rejectedPaths }) } : {}),
+      });
+      return {
+        status: 'failed',
+        operationId,
+        kind,
+        preRef: extra?.preRef ?? null,
+        preOid: extra?.preOid ?? null,
+        requestedPaths: paths,
+        completedPaths: [],
+        rejectedPaths: extra?.rejectedPaths ?? [],
+        failures: extra?.failures ?? [],
+        contention: args.contention,
+        failureReason: reason,
+      };
+    };
+
+    // 0. Classify requested paths: ignored (check-ignore trichotomy) + unsupported
+    //    current entry types are REJECTED as not-covered-by-before-checkpoint. Any
+    //    rejection fails the whole op visibly with NO mutation.
+    const ignore = await classifyIgnored({ repoRoot, paths, runGit: this.runGit, gitExe: this.gitExe });
+    if (ignore.kind === 'error') {
+      return fail('check-ignore-error');
+    }
+    const ignored = ignore.kind === 'some-ignored' ? ignore.ignored : [];
+    const unsupported: string[] = [];
+    const currentStat = new Map<string, LstatInfo | null>();
+    for (const p of paths) {
+      const st = this.lstatAbs(this.abs(root, p));
+      currentStat.set(p, st);
+      if (st && isUnsupportedEntry(st)) unsupported.push(p);
+    }
+    const rejectedPaths = dedupe([...ignored, ...unsupported]);
+    if (rejectedPaths.length > 0) {
+      return fail('not-covered-by-before-checkpoint', { rejectedPaths });
+    }
+
+    // The before edge is the ONLY source: it must be ready AND live rev-parse-verify
+    // to the stored OID (reuse the G1.3b guard — DB ready flags are hints, not authority).
+    const row = this.store.getTurnRecord(args.turnId);
+    if (!row) return fail('unknown-turn');
+    const beforeUsable = await this.isEdgeUsable(repoRoot, row.beforeReady, row.beforeRef, row.beforeOid);
+    if (!beforeUsable) return fail('before-edge-unusable');
+    const beforeOid = row.beforeOid as string;
+
+    // 2. Path-scoped PRE safety checkpoint (present-with-OID/mode or explicitly absent);
+    //    create + verify the recovery `pre` ref. Abort the ENTIRE restore unless verified.
+    let pre: SafetyPreOutcome;
+    try {
+      pre = await this.captureSafetyPre({
+        repoRoot,
+        repoState: args.capability.repoState === 'unborn' ? 'unborn' : 'repo',
+        workspaceId: args.workspaceId,
+        operationId,
+        paths,
+        currentStat,
+      });
+    } catch (err) {
+      return fail(`pre-snapshot-failed:${describeError(err)}`);
+    }
+    this.recoveryStore.updateRecoveryOperation(operationId, {
+      preIncludedPaths: pre.included,
+    });
+    if (!pre.ok) {
+      return fail(pre.reason ?? 'pre-snapshot-failed', { preRef: pre.ref, preOid: pre.oid });
+    }
+
+    // 3. pending → ready. (Distinguishes kill-during-snapshot=`pending` from
+    //    failure-before-mutation=`ready` with no `completed_paths`.)
+    this.recoveryStore.updateRecoveryOperation(operationId, { status: 'ready' });
+
+    // 4. Resolve restore sources from the BEFORE commit via ls-tree: blob OID + mode
+    //    per present path; absent-from-tree paths are targeted for deletion.
+    let targets: Map<string, RestoreTarget>;
+    try {
+      targets = await this.lsTreeTargets(repoRoot, beforeOid, paths);
+    } catch (err) {
+      return fail(`ls-tree-failed:${describeError(err)}`);
+    }
+
+    // 5. Anti-TOCTOU: compare the current OID (captured in the PRE snapshot) to the
+    //    preview token; abort on mismatch unless human-force.
+    if (args.previewTokens && !args.force) {
+      for (const p of paths) {
+        const token = args.previewTokens[p];
+        if (token === undefined) continue;
+        const now = pre.currentOid.get(p) ?? ABSENT_SENTINEL;
+        if (token !== now) {
+          return fail('preview-token-mismatch', { preRef: pre.ref, preOid: pre.oid });
+        }
+      }
+    }
+
+    // 6–8. Per-path guarded mutation. A per-path failure is accounted (partial); the
+    //      op continues so `completed_paths` stays a faithful recoverability record.
+    const requestedSet = new Set(paths);
+    const completed: string[] = [];
+    const failures: { path: string; reason: string }[] = [];
+    for (const p of paths) {
+      try {
+        await this.mutateOnePath(repoRoot, root, p, targets.get(p) ?? { kind: 'absent' }, requestedSet);
+        completed.push(p);
+        // Record `completed_paths` incrementally → a killed multi-path restore is
+        // recoverable to exactly the point it reached.
+        this.recoveryStore.updateRecoveryOperation(operationId, { completedPaths: completed });
+      } catch (err) {
+        failures.push({ path: p, reason: describeError(err) });
+      }
+    }
+
+    const status: RestoreOutcome['status'] = failures.length === 0 ? 'completed' : 'partial';
+    this.recoveryStore.updateRecoveryOperation(operationId, {
+      status,
+      completedPaths: completed,
+      failureReason: failures.length > 0 ? failures.map((f) => `${f.path}:${f.reason}`).join('; ') : null,
+      result: JSON.stringify({ completed, failures }),
+      endedAt: this.now(),
+    });
+
+    return {
+      status,
+      operationId,
+      kind,
+      preRef: pre.ref,
+      preOid: pre.oid,
+      requestedPaths: paths,
+      completedPaths: completed,
+      rejectedPaths: [],
+      failures,
+      contention: args.contention,
+      failureReason: null,
+    };
+  }
+
+  // ── step 2: path-scoped PRE safety checkpoint ──────────────────────────────────
+
+  /**
+   * Snapshot the CURRENT state of exactly the requested paths so the whole restore is
+   * reversible. Each surviving path is recorded present (raw blob OID + mode via
+   * `hash-object --no-filters`) or explicitly absent; a path currently occupied by a
+   * directory is recorded as such (its rollback is a no-op — the mutation step guards
+   * it). The `…/pre` commit is HEAD-seeded for coherence but is PATH-SCOPED: it
+   * authoritatively covers ONLY `pre_included_paths` and can never feed whole-tree
+   * recovery. The ref is created + verified with the same durable write order the
+   * before/after edges use (persist OID → create-only update-ref → rev-parse verify →
+   * mark ready); the entire restore aborts unless that ref + OID verify.
+   */
+  private async captureSafetyPre(a: {
+    repoRoot: string;
+    repoState: 'repo' | 'unborn';
+    workspaceId: string;
+    operationId: string;
+    paths: string[];
+    currentStat: Map<string, LstatInfo | null>;
+  }): Promise<SafetyPreOutcome> {
+    const { repoRoot, repoState, operationId, paths, currentStat } = a;
+    const ref = recoveryRef({ workspaceId: a.workspaceId, operationId });
+    const indexFile = path.join(this.tmpDir, `lares-idx-${randomUUID()}`);
+    const included: PreIncludedPath[] = [];
+    const currentOid = new Map<string, string>();
+
+    try {
+      const seedArgs = repoState === 'unborn' ? ['read-tree', '--empty'] : ['read-tree', 'HEAD'];
+      await this.git(repoRoot, seedArgs, { indexFile });
+      const seededModes = await this.readSeededModes(repoRoot, indexFile, this.now() + this.restoreTuning.fileTimeoutMs);
+
+      // Partition present (file/symlink) vs absent vs directory.
+      const presentPaths: string[] = [];
+      for (const p of paths) {
+        const st = currentStat.get(p) ?? null;
+        if (st === null) {
+          included.push({ path: p, state: 'absent' });
+        } else if (st.isDirectory) {
+          // A directory occupying a requested (file) path: not a present-blob rollback
+          // target. Recorded so the safety ref is honest; the mutation step's
+          // directory-transition guard decides whether it may be removed.
+          included.push({ path: p, state: 'directory' });
+        } else {
+          presentPaths.push(p);
+        }
+      }
+
+      const oidByPath = await this.hashPaths(repoRoot, presentPaths, this.now() + this.restoreTuning.fileTimeoutMs);
+      const additions: string[] = [];
+      let sampleOidLen = 0;
+      const deletions: string[] = [];
+      for (const p of presentPaths) {
+        const oid = oidByPath.get(p);
+        if (!oid) throw new Error(`hash-object produced no OID for ${p}`);
+        currentOid.set(p, oid);
+        if (sampleOidLen === 0) sampleOidLen = oid.length;
+        const st = currentStat.get(p);
+        const mode = seededModes.get(p) ?? this.deriveMode({ path: p, type: st?.isSymbolicLink ? 'symlink' : 'regular', mode: st?.mode ?? 0, size: st?.size ?? 0 });
+        included.push({ path: p, state: 'present', oid, mode });
+        additions.push(`${mode} ${oid}\t${p}`);
+      }
+      const zeroOid = sampleOidLen > 0 ? '0'.repeat(sampleOidLen) : SHA1_ZERO;
+      for (const rec of included) {
+        if (rec.state === 'absent') deletions.push(`0 ${zeroOid}\t${rec.path}`);
+      }
+      // Absent paths in the PRE snapshot get the ABSENT sentinel for the token compare.
+      for (const rec of included) if (rec.state !== 'present') currentOid.set(rec.path, ABSENT_SENTINEL);
+
+      const indexInfo = [...additions, ...deletions];
+      if (indexInfo.length > 0) {
+        const stdin = indexInfo.map((line) => `${line}\0`).join('');
+        await this.git(repoRoot, ['update-index', '-z', '--index-info'], { indexFile, stdin });
+      }
+
+      const treeOid = (await this.git(repoRoot, ['write-tree'], { indexFile })).stdout.trim();
+      const commitTopLevel = this.longpaths().concat(['-c', 'commit.gpgsign=false']);
+      const commitOid = (
+        await this.git(repoRoot, [...commitTopLevel, 'commit-tree', treeOid, '-m', `lares:recovery-pre:${operationId}`], {
+          mode: 'commit',
+        })
+      ).stdout.trim();
+
+      // Durable write order: persist candidate + ref (pre_ready=0) → create-only
+      // update-ref → verify → pre_ready=1. A collision/kill yields a mismatch, never a
+      // false safety guarantee.
+      this.recoveryStore.updateRecoveryOperation(operationId, {
+        preOid: commitOid,
+        preRef: ref,
+        preReady: false,
+        preIncludedPaths: included,
+      });
+      await this.git(repoRoot, ['update-ref', ref, commitOid, SHA1_ZERO], { allowNonzero: true });
+      const verify = await this.git(repoRoot, ['rev-parse', '--verify', `${ref}^{commit}`], { allowNonzero: true });
+      if (verify.code !== 0 || verify.stdout.trim() !== commitOid) {
+        return { ok: false, ref, oid: commitOid, included, currentOid, reason: 'pre-verify-mismatch' };
+      }
+      this.recoveryStore.updateRecoveryOperation(operationId, { preReady: true });
+      return { ok: true, ref, oid: commitOid, included, currentOid, reason: null };
+    } finally {
+      this.scheduleCleanup(indexFile);
+    }
+  }
+
+  // ── step 4: resolve restore sources from the before commit ─────────────────────
+
+  /** `ls-tree -z <before_commit> -- <literal path…>` → present (blob OID + mode) vs
+   *  absent-in-tree (→ delete). The mode comes from the tree entry, never cat-file. */
+  private async lsTreeTargets(
+    repoRoot: string,
+    beforeCommit: string,
+    paths: string[],
+  ): Promise<Map<string, RestoreTarget>> {
+    const out = new Map<string, RestoreTarget>();
+    // Default every requested path to absent-in-tree (→ delete) until ls-tree proves present.
+    for (const p of paths) out.set(p, { kind: 'absent' });
+    if (paths.length === 0) return out;
+
+    const res = await this.git(repoRoot, ['ls-tree', '-z', beforeCommit, '--', ...paths], {
+      maxBytes: 64 << 20,
+    });
+    for (const rec of res.stdout.split('\0')) {
+      if (rec.length === 0) continue;
+      // `<mode> SP <type> SP <oid>\t<path>`
+      const tab = rec.indexOf('\t');
+      if (tab < 0) continue;
+      const meta = rec.slice(0, tab).split(/\s+/);
+      const p = rec.slice(tab + 1);
+      if (meta.length < 3) continue;
+      const [mode, , oid] = meta;
+      out.set(p, { kind: 'present', mode, oid });
+    }
+    return out;
+  }
+
+  // ── steps 6–8: per-path guarded mutation ───────────────────────────────────────
+
+  private async mutateOnePath(
+    repoRoot: string,
+    root: string,
+    relPath: string,
+    target: RestoreTarget,
+    requestedSet: Set<string>,
+  ): Promise<void> {
+    const targetAbs = this.abs(root, relPath);
+
+    // Ancestor guard: reject if any existing ancestor is a symlink/junction/reparse
+    // point escaping the canonical workspace.
+    this.assertSafeAncestors(root, relPath);
+
+    if (target.kind === 'present') {
+      // 9. Symlink / gitlink / non-regular tree modes → visible failure (never silent
+      //    conversion). Symlink restore is unsupported-until-implemented.
+      if (target.mode === '120000') throw new RestoreError('symlink-restore-unsupported');
+      if (target.mode === '160000') throw new RestoreError('gitlink-restore-unsupported');
+      if (target.mode !== '100644' && target.mode !== '100755') {
+        throw new RestoreError(`unsupported-tree-mode:${target.mode}`);
+      }
+
+      // 7. Directory-transition safety: the target may become a file only if it is not
+      //    currently a NON-EMPTY directory holding unrelated (non-requested) descendants.
+      this.clearDirectoryForTransition(root, targetAbs, requestedSet);
+
+      // Ensure the parent directory exists (guarded), then write to a same-dir temp.
+      const dir = path.dirname(targetAbs);
+      fs.mkdirSync(dir, { recursive: true });
+      // Recheck ancestors immediately before the rename (TOCTOU window).
+      this.assertSafeAncestors(root, relPath);
+
+      const tmp = path.join(dir, `.lares-restore-${randomUUID()}.tmp`);
+      try {
+        await this.runGitBlobToFile(repoRoot, target.oid, tmp, {
+          maxBytes: this.restoreTuning.fileMaxBytes,
+          deadlineAt: this.now() + this.restoreTuning.fileTimeoutMs,
+          gitExe: this.gitExe,
+        });
+        this.applyMode(tmp, target.mode);
+        await this.atomicReplace(tmp, targetAbs);
+      } catch (err) {
+        try { fs.unlinkSync(tmp); } catch { /* best-effort — never leave a temp behind */ }
+        if (err instanceof GitBlobError) throw new RestoreError(`blob-${err.reason}`);
+        throw err;
+      }
+      return;
+    }
+
+    // 8. Absent-in-tree → guarded delete of a file/symlink or empty dir ONLY. Never a
+    //    recursive removal of unrelated descendants.
+    const st = this.lstatAbs(targetAbs);
+    if (st === null) return; // already absent → nothing to do
+    if (st.isDirectory) {
+      this.clearDirectoryForTransition(root, targetAbs, requestedSet);
+      return;
+    }
+    // file/symlink → guarded delete (recheck ancestors immediately before).
+    this.assertSafeAncestors(root, relPath);
+    await this.guardedUnlink(targetAbs);
+  }
+
+  /**
+   * Directory-transition guard (invariant #24). An existing EMPTY directory at the
+   * target is removed. A NON-EMPTY directory fails visibly UNLESS every descendant is
+   * itself explicitly requested (and therefore previewed + captured in the PRE
+   * snapshot), in which case the whole subtree is removed. Unrelated descendant files
+   * are NEVER recursively deleted.
+   */
+  private clearDirectoryForTransition(root: string, targetAbs: string, requestedSet: Set<string>): void {
+    const st = this.lstatAbs(targetAbs);
+    if (st === null || !st.isDirectory) return; // not a directory → nothing to clear here
+    const descendants = listDescendantFiles(targetAbs);
+    if (descendants.length === 0) {
+      fs.rmdirSync(targetAbs);
+      return;
+    }
+    for (const abs of descendants) {
+      const rel = toRepoRel(root, abs);
+      if (rel === null || !requestedSet.has(rel)) {
+        throw new RestoreError('dir-transition-blocked-unrelated-descendant');
+      }
+    }
+    // Every descendant is itself requested → removing the subtree deletes nothing
+    // unrelated.
+    fs.rmSync(targetAbs, { recursive: true, force: true });
+  }
+
+  /** Atomic rename-replace with Windows read-only clear + EPERM/EBUSY (AV-lock) retry.
+   *  On failure the caller deletes the temp; here we only leave the target untouched. */
+  private async atomicReplace(tmpAbs: string, targetAbs: string): Promise<void> {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        if (this.platform === 'win32') this.clearReadOnly(targetAbs);
+        fs.renameSync(tmpAbs, targetAbs);
+        return;
+      } catch (err) {
+        if (attempt >= this.restoreTuning.replaceRetries || !isTransientFsError(err)) {
+          throw new RestoreError(`replace-failed:${errCode(err)}`);
+        }
+        await sleep(this.restoreTuning.replaceBackoffMs * (attempt + 1));
+      }
+    }
+  }
+
+  /** Guarded unlink with the same Windows read-only clear + AV-lock retry semantics. */
+  private async guardedUnlink(targetAbs: string): Promise<void> {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        if (this.platform === 'win32') this.clearReadOnly(targetAbs);
+        fs.unlinkSync(targetAbs);
+        return;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === 'ENOENT') return;
+        if (attempt >= this.restoreTuning.replaceRetries || !isTransientFsError(err)) {
+          throw new RestoreError(`delete-failed:${errCode(err)}`);
+        }
+        await sleep(this.restoreTuning.replaceBackoffMs * (attempt + 1));
+      }
+    }
+  }
+
+  private clearReadOnly(targetAbs: string): void {
+    try {
+      const st = fs.lstatSync(targetAbs);
+      // Clear the read-only bit (add owner-write) before a replace/delete on Windows.
+      fs.chmodSync(targetAbs, st.mode | 0o200);
+    } catch {
+      /* ENOENT / unsupported — nothing to clear */
+    }
+  }
+
+  /** Apply the ls-tree git filemode to the freshly-written temp file. On POSIX this
+   *  sets 0755 for 100755 else 0644; on Windows only the read-only bit is meaningful. */
+  private applyMode(tmpAbs: string, mode: string): void {
+    try {
+      fs.chmodSync(tmpAbs, mode === '100755' ? 0o755 : 0o644);
+    } catch {
+      /* best-effort — Windows chmod is a no-op beyond the read-only bit */
+    }
+  }
+
+  /** Reject if any EXISTING ancestor directory of `relPath` resolves (realpath) outside
+   *  the canonical workspace — a symlink/junction/reparse-point escape (invariant #13).
+   *  Uses the nearest existing ancestor so a not-yet-created leaf never blocks. */
+  private assertSafeAncestors(root: string, relPath: string): void {
+    const parentAbs = path.dirname(this.abs(root, relPath));
+    let nearest = parentAbs;
+    // Walk up until an existing ancestor is found.
+    // (`mkdirSync(recursive)` may create these later; we only guard what exists now.)
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      if (fs.existsSync(nearest)) break;
+      const up = path.dirname(nearest);
+      if (up === nearest) break;
+      nearest = up;
+    }
+    let real: string;
+    try {
+      real = fs.realpathSync(nearest);
+    } catch {
+      throw new RestoreError('ancestor-unresolvable');
+    }
+    if (!withinRoot(real, root)) {
+      throw new RestoreError('ancestor-escapes-workspace');
+    }
+  }
+
+  private canonicalRoot(repoRoot: string): string {
+    try {
+      return fs.realpathSync(repoRoot);
+    } catch {
+      return path.resolve(repoRoot);
+    }
+  }
+
+  /** Join a repo-relative POSIX path onto the (canonical) root as an absolute OS path. */
+  private abs(rootAbs: string, relPath: string): string {
+    return path.resolve(rootAbs, relPath.split('/').join(path.sep));
+  }
+
+  private failedOutcome(
+    kind: 'restore_paths' | 'revert_turn',
+    operationId: string,
+    paths: string[],
+    contention: { path: string; turnId: string }[],
+    reason: string,
+  ): RestoreOutcome {
+    return {
+      status: 'failed',
+      operationId,
+      kind,
+      preRef: null,
+      preOid: null,
+      requestedPaths: dedupe(paths),
+      completedPaths: [],
+      rejectedPaths: [],
+      failures: [],
+      contention,
+      failureReason: reason,
+    };
+  }
 }
 
 // ── diff / validation DTOs ──────────────────────────────────────────────────────
@@ -882,6 +1574,55 @@ export interface RestorePathValidation {
   contention: { path: string; turnId: string }[];
 }
 
+// ── restore DTOs ────────────────────────────────────────────────────────────────
+
+/** One entry in `recovery_operations.pre_included_paths`. Path-scoped: authoritatively
+ *  covers ONLY these paths. `present` carries the current raw blob OID + git mode;
+ *  `absent` means the path did not exist; `directory` means a directory occupied the
+ *  (file) path and was left untouched (its rollback is a no-op). */
+export interface PreIncludedPath {
+  path: string;
+  state: 'present' | 'absent' | 'directory';
+  oid?: string;
+  mode?: string;
+}
+
+/** A restore source resolved from the before commit via ls-tree. */
+type RestoreTarget =
+  | { kind: 'present'; mode: string; oid: string }
+  | { kind: 'absent' };
+
+interface SafetyPreOutcome {
+  ok: boolean;
+  ref: string;
+  oid: string;
+  included: PreIncludedPath[];
+  /** path → current-worktree OID (present) or the ABSENT sentinel — for the preview
+   *  token compare (reuses the PRE-captured hash, no re-hash). */
+  currentOid: Map<string, string>;
+  reason: string | null;
+}
+
+export interface RestoreOutcome {
+  status: 'completed' | 'partial' | 'failed';
+  operationId: string;
+  kind: 'restore_paths' | 'revert_turn';
+  /** The path-scoped safety `pre` ref (usable to roll the restore back). */
+  preRef: string | null;
+  preOid: string | null;
+  requestedPaths: string[];
+  /** Paths successfully restored (incrementally recorded → partial-recoverable). */
+  completedPaths: string[];
+  /** Paths rejected at classification (ignored / unsupported-entry-type / non-witnessed). */
+  rejectedPaths: string[];
+  /** Per-path mutation failures (partial outcome). */
+  failures: { path: string; reason: string }[];
+  /** Same-path open-turn contention surfaced to the caller. */
+  contention: { path: string; turnId: string }[];
+  /** Op-level failure reason (classification / before-edge / pre-snapshot). */
+  failureReason: string | null;
+}
+
 // ── internals ────────────────────────────────────────────────────────────────
 
 /** Thrown out of rawSnapshot when enumeration returns an oversized skip. */
@@ -904,4 +1645,97 @@ function describeError(err: unknown): string {
 
 function dedupe(paths: string[]): string[] {
   return Array.from(new Set(paths));
+}
+
+// ── restore internals ─────────────────────────────────────────────────────────
+
+/** Sentinel OID for an absent path in the preview-token compare (an OID can never
+ *  collide with it). */
+const ABSENT_SENTINEL = '<absent>';
+
+/** A per-path restore mutation failure (accounted as `partial`, never fatal to the op). */
+class RestoreError extends Error {
+  constructor(readonly reason: string) {
+    super(reason);
+    this.name = 'RestoreError';
+  }
+}
+
+/** FIFO / socket / char-or-block device (door) current entries are unsupported — the
+ *  before edge never captured a byte-exact pre-image for them (invariant #28 mirror). */
+function isUnsupportedEntry(st: LstatInfo): boolean {
+  if (st.isFile || st.isSymbolicLink || st.isDirectory) return false;
+  return st.isFIFO || st.isSocket || st.isCharacterDevice || st.isBlockDevice;
+}
+
+/** Default lstat over an ABSOLUTE path; null on ENOENT/unreadable. Never follows the
+ *  final symlink (lstat). */
+function defaultAbsLstat(absPath: string): LstatInfo | null {
+  try {
+    const st = fs.lstatSync(absPath);
+    return {
+      isFile: st.isFile(),
+      isSymbolicLink: st.isSymbolicLink(),
+      isDirectory: st.isDirectory(),
+      isFIFO: st.isFIFO(),
+      isSocket: st.isSocket(),
+      isCharacterDevice: st.isCharacterDevice(),
+      isBlockDevice: st.isBlockDevice(),
+      mode: st.mode,
+      size: st.size,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** Every regular-file/symlink descendant (absolute paths) under `dirAbs`, recursively. */
+function listDescendantFiles(dirAbs: string): string[] {
+  const out: string[] = [];
+  const walk = (d: string): void => {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(d, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      const abs = path.join(d, e.name);
+      if (e.isDirectory()) walk(abs);
+      else out.push(abs);
+    }
+  };
+  walk(dirAbs);
+  return out;
+}
+
+/** Convert an absolute path under `canonicalRoot` to a repo-relative POSIX path, or
+ *  null if it is not within the root. */
+function toRepoRel(canonicalRoot: string, abs: string): string | null {
+  const rel = path.relative(canonicalRoot, abs);
+  if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) return null;
+  return rel.split(path.sep).join('/');
+}
+
+/** True when `real` is the canonical root itself or strictly inside it. */
+function withinRoot(real: string, canonicalRoot: string): boolean {
+  const a = path.resolve(real);
+  const root = path.resolve(canonicalRoot);
+  if (a === root) return true;
+  const withSep = root.endsWith(path.sep) ? root : root + path.sep;
+  return a.startsWith(withSep);
+}
+
+/** Transient FS errors worth a bounded retry (Windows read-only/AV-lock contention). */
+function isTransientFsError(err: unknown): boolean {
+  const code = (err as NodeJS.ErrnoException).code;
+  return code === 'EPERM' || code === 'EACCES' || code === 'EBUSY';
+}
+
+function errCode(err: unknown): string {
+  return (err as NodeJS.ErrnoException).code ?? (err instanceof Error ? err.message.slice(0, 40) : String(err));
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
 }

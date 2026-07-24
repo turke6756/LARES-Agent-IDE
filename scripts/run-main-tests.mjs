@@ -82,6 +82,9 @@ const TESTS = [
   'dist/main/main/git-checkpoints/checkpoint-gating.test.js',
   // Git-Native WP-G1.3b: snapshot core — full raw capture (real git) + durable finalize.
   'dist/main/main/git-checkpoints/checkpoint-service.test.js',
+  // Git-Native WP-G1.3c: guarded blob-write restore (real git) — byte-exact, path-scoped
+  // PRE safety ref, directory-transition + symlink-ancestor guards, partial accounting.
+  'dist/main/main/git-checkpoints/checkpoint-restore.test.js',
   'dist/main/main/supervisor/initial-user-prompt.test.js',
   'dist/main/main/supervisor/hook-spool-tailer.test.js',
   'dist/main/main/supervisor/send-input-encoder.test.js',
