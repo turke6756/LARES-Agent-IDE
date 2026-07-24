@@ -74,6 +74,12 @@
       "owner": "context-optimizer"
     },
     {
+      "file": "src/main/git/git-runtime.ts",
+      "lineContext": "windowsHide: true",
+      "purpose": "PERMANENT Tier-2 (Git-Native WP-G0.2): bounded git discovery/`--version` and workspace rev-parse/config probes — absolute exe, discrete argv, GIT_PROBE_TIMEOUT_MS, capped output.",
+      "owner": "git-native/git-runtime"
+    },
+    {
       "file": "src/main/supervisor/provider-resolver.ts",
       "lineContext": "windowsHide: true",
       "purpose": "PERMANENT Tier-2: bounded `cmd /c where <provider>` PATH-resolution probes, 5s timeout, captured output.",

@@ -66,6 +66,8 @@ const TESTS = [
   'dist/main/main/turn-records.test.js',
   // Git-Native WP-G0.1: MinGit manifest loader + shape validation.
   'dist/main/main/git/mingit-manifest.test.js',
+  // Git-Native WP-G0.2: git-runtime dual resolution + capability probe.
+  'dist/main/main/git/git-runtime.test.js',
   'dist/main/main/supervisor/initial-user-prompt.test.js',
   'dist/main/main/supervisor/hook-spool-tailer.test.js',
   'dist/main/main/supervisor/send-input-encoder.test.js',
