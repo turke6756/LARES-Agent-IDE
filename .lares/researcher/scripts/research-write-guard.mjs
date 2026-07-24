@@ -1,13 +1,16 @@
 #!/usr/bin/env node
 // Research-store PreToolUse(Write) guard — WP-G.
-// Blocks researcher writes that escape .dashboard/research/inbox/ or violate the
+// Blocks researcher writes that escape .lares/research/inbox/ or violate the
 // artifact naming / frontmatter schema. Validation mirrors
 // src/main/research/frontmatter.ts. Dependency-free.
 
 import fs from 'node:fs';
 
 const MAX_STDIN_BYTES = 5 * 1024 * 1024;
-const RESEARCH_MARKER = '.dashboard/research/';
+// '.lares/' is the live state-dir name; '.dashboard/' is accepted for a
+// workspace whose folder rename was blocked (locked files) and which is
+// still running against the legacy dir this session.
+const RESEARCH_MARKERS = ['.lares/research/', '.dashboard/research/'];
 const REQUIRED_FRONTMATTER_KEYS = ['id', 'topic', 'created', 'source_urls', 'trust', 'summary'];
 const ISO_8601_RE = /^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?)?$/;
 
@@ -120,21 +123,27 @@ if (!filePath || content === null) {
 }
 
 // Hard containment (default-deny): the researcher's Write TOOL may ONLY target
-// the research store. Any path outside .dashboard/research/ is blocked outright
+// the research store. Any path outside .lares/research/ (or the legacy
+// .dashboard/research/ for an unmigrated session) is blocked outright
 // — this inverts the previous allow-by-default so arbitrary-location writes can
 // no longer slip through. (This gates the agent's Write tool, not internal
 // harness file ops, which is the intended containment boundary.)
 const norm = filePath.replace(/\\/g, '/');
-const at = norm.indexOf(RESEARCH_MARKER);
-if (at === -1) {
-  block('researcher Write is confined to .dashboard/research/inbox/ (path is outside the research store)');
+let at = -1;
+let markerLen = 0;
+for (const marker of RESEARCH_MARKERS) {
+  const idx = norm.indexOf(marker);
+  if (idx !== -1) { at = idx; markerLen = marker.length; break; }
 }
-const rel = norm.slice(at + RESEARCH_MARKER.length);
+if (at === -1) {
+  block('researcher Write is confined to .lares/research/inbox/ (path is outside the research store)');
+}
+const rel = norm.slice(at + markerLen);
 
 // Defense in depth behind WP-B's permission rule: researcher may only write
 // under inbox/.
 if (!rel.startsWith('inbox/')) {
-  block('researcher may only write under .dashboard/research/inbox/');
+  block('researcher may only write under .lares/research/inbox/');
 }
 
 // Naming: inbox/<topic-slug>/<timestamp>-<slug>.md

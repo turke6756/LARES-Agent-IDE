@@ -27,13 +27,13 @@ path, do **not** open the `.md` file looking for comments — run the helper.
 A helper script ships at the workspace-shared scripts dir:
 
 ```
-<workspace-root>/.dashboard/scripts/read-comments.py
+<workspace-root>/.lares/scripts/read-comments.py
 ```
 
 Run it with the file path (use the absolute path to the document):
 
 ```bash
-python "<workspace-root>/.dashboard/scripts/read-comments.py" "<absolute-path-to-the.md>"
+python "<workspace-root>/.lares/scripts/read-comments.py" "<absolute-path-to-the.md>"
 ```
 
 It prints every comment with its line range, the quoted text, and the user's note,
