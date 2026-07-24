@@ -6,6 +6,7 @@ import { getPtyHostPath } from './paths';
 import { sanitizeClaudeChildEnv } from './env-sanitize';
 import { spawnBundledNode } from '../node-runtime';
 import { ensureNodeShimDir, withNodeShimOnPath } from '../node-shim';
+import { ensureGitShimDir } from '../git/git-shim';
 
 /**
  * Spawns Claude via a separate Node.js process that uses node-pty.
@@ -103,6 +104,11 @@ export class WindowsRunner extends EventEmitter {
     // transparently reaches the provider CLI and its hooks — no pty-host edit.
     try {
       env = withNodeShimOnPath(env, ensureNodeShimDir());
+      // Git-Native WP-G0.4: drop a `git` shim into that SAME (already-appended)
+      // dir, but only when Lares fell back to bundled git. Async resolution →
+      // fire-and-forget; the shim is consumed only when the agent later runs
+      // `git`, and ensureGitShimDir never rejects.
+      void ensureGitShimDir();
     } catch (err) {
       // Retry failed. Don't pretend hooks will work, but don't block the launch
       // either (the agent is still usable for MCP-tool work per the VM report).

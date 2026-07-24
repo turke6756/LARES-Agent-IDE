@@ -40,7 +40,9 @@ export function getNodeShimDir(): string {
   return path.join(base, 'node-shim');
 }
 
-function writeIfChanged(file: string, content: string): void {
+/** Atomic write-if-content-differs. Exported so the sibling `git-shim` reuses
+ *  the exact same idempotent write (WP-G0.4 — reuse, do not fork a shim-util). */
+export function writeIfChanged(file: string, content: string): void {
   try {
     if (fs.existsSync(file) && fs.readFileSync(file, 'utf-8') === content) return;
   } catch { /* fall through to write */ }

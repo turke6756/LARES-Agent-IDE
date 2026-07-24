@@ -68,6 +68,8 @@ const TESTS = [
   'dist/main/main/git/mingit-manifest.test.js',
   // Git-Native WP-G0.2: git-runtime dual resolution + capability probe.
   'dist/main/main/git/git-runtime.test.js',
+  // Git-Native WP-G0.4: bundled-git shim for agent terminals.
+  'dist/main/main/git/git-shim.test.js',
   'dist/main/main/supervisor/initial-user-prompt.test.js',
   'dist/main/main/supervisor/hook-spool-tailer.test.js',
   'dist/main/main/supervisor/send-input-encoder.test.js',
