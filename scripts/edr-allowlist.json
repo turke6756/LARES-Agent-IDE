@@ -80,6 +80,18 @@
       "owner": "git-native/git-runtime"
     },
     {
+      "file": "src/main/git-checkpoints/git-command.ts",
+      "lineContext": "windowsHide: true",
+      "purpose": "PERMANENT Tier-2 (Git-Native WP-G1.1): bounded checkpoint/restore git exec + `cat-file blob` stream — absolute exe, discrete argv, no shell, per-op timeout/deadline hard-kill, byte-capped output.",
+      "owner": "git-native/git-command"
+    },
+    {
+      "file": "src/main/git-checkpoints/git-command.ts",
+      "lineContext": "timer.unref()",
+      "purpose": "Timer-handle unref on the per-op timeout/deadline kill timer (a setTimeout handle, never a child process) — keeps the bounding timer from holding the process open.",
+      "owner": "git-native/git-command"
+    },
+    {
       "file": "src/main/supervisor/provider-resolver.ts",
       "lineContext": "windowsHide: true",
       "purpose": "PERMANENT Tier-2: bounded `cmd /c where <provider>` PATH-resolution probes, 5s timeout, captured output.",
