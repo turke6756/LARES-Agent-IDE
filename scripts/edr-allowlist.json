@@ -92,6 +92,12 @@
       "owner": "git-native/git-command"
     },
     {
+      "file": "src/main/git-checkpoints/checkpoint-queue.ts",
+      "lineContext": "item.timer.unref()",
+      "purpose": "Timer-handle unref on each queued item's eager deadline-expiry timer (a setTimeout handle, never a child process) — keeps a pending checkpoint deadline from holding the process open.",
+      "owner": "git-native/checkpoint-queue"
+    },
+    {
       "file": "src/main/supervisor/provider-resolver.ts",
       "lineContext": "windowsHide: true",
       "purpose": "PERMANENT Tier-2: bounded `cmd /c where <provider>` PATH-resolution probes, 5s timeout, captured output.",

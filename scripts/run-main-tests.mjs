@@ -74,6 +74,8 @@ const TESTS = [
   'scripts/fetch-mingit.test.mjs',
   // Git-Native WP-G1.1: git-command bounded exec + binary blob streaming (real git).
   'dist/main/main/git-checkpoints/git-command.test.js',
+  // Git-Native WP-G1.2: per-key priority queue + eager timer-driven deadline expiry.
+  'dist/main/main/git-checkpoints/checkpoint-queue.test.js',
   'dist/main/main/supervisor/initial-user-prompt.test.js',
   'dist/main/main/supervisor/hook-spool-tailer.test.js',
   'dist/main/main/supervisor/send-input-encoder.test.js',
