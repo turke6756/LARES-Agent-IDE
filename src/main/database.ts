@@ -4095,6 +4095,34 @@ export function updateTurnRecord(
 }
 
 /**
+ * Reconciliation-only writer (Git-Native WP-G1.8). Unlike {@link updateTurnRecord}
+ * this may write to a TERMINAL row, because a persisted-but-non-ready edge routinely
+ * outlives its turn's close: finalize (WP-G1.3b) persists the candidate OID + ref
+ * INSIDE the durable section, then may overrun the wall-clock deadline before the
+ * ref is verified — delivery is released and the row eventually closes with the edge
+ * still `*_ready=0`. Startup reconciliation regenerates/adopts the ref and must be
+ * able to flip `before_ready`/`after_ready` (+ backfill the reconciled `*_quality` /
+ * `failure_reason`) on that already-terminal row. It NEVER changes `status` (identity
+ * of the terminal outcome is immutable) and only touches the whitelisted columns.
+ * Returns the updated record, or null if `id` is unknown.
+ */
+export function reconcileTurnRecord(
+  id: string,
+  updates: Partial<Record<keyof typeof TURN_UPDATABLE_COLUMNS, unknown>>
+): TurnRecord | null {
+  if ('status' in updates) {
+    throw new Error('reconcileTurnRecord may never change status');
+  }
+  const { sql, params } = buildTurnUpdate(updates as Record<string, unknown>);
+  if (sql.length === 0) return getTurnRecord(id);
+  const info = db
+    .prepare(`UPDATE turn_records SET ${sql} WHERE id = ?`)
+    .run(...params, id) as { changes?: number };
+  if (info && info.changes === 0) return null;
+  return getTurnRecord(id);
+}
+
+/**
  * Idempotent close: transition an OPEN turn to a terminal `status` (stamping
  * `ended_at` and any extra fields). If the turn is ALREADY terminal this is a
  * no-op that returns the existing record unchanged — this closes the

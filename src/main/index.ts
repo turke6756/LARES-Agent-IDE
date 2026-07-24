@@ -23,6 +23,7 @@ import { validateAndRepairClaudeJson, validateAndRepairWslClaudeJson, startClaud
 import { checkManagedWebContents } from './security/webcontents-guard';
 import { AgentSupervisor } from './supervisor';
 import { startContinuationWatcher } from './supervisor/continuation-watcher-wiring';
+import { runCheckpointStartupMaintenance } from './git-checkpoints/reconciler';
 import { registerIpcHandlers } from './ipc-handlers';
 import { installExternalNavHandlers, forceCloseAllDetached, getDetachedEntries, type DetachedWindowDeps } from './detached-windows';
 import { runCloseFlush, type FlushTarget } from './close-flush';
@@ -727,6 +728,15 @@ app.whenReady().then(async () => {
     if (contRecon.aborted.length || contRecon.resumable.length) {
       console.log(`[continuation] boot reconcile: aborted ${contRecon.aborted.length} orphaned attempt(s), ${contRecon.resumable.length} resumable`, contRecon);
     }
+
+    // Git-Native WP-G1.8: temp-artifact sweep + ref/DB crash-consistency
+    // reconciliation of persisted-non-ready checkpoint edges. Fire-and-forget so it
+    // never delays window creation; every workspace is isolated and non-fatal inside.
+    // (Full engine wiring — the exact workspaceId mapping + a live coordinator — lands
+    // with G1.7; this seam stays a couple of lines.)
+    void runCheckpointStartupMaintenance({ workspaces: getWorkspaces() }).catch((err) => {
+      console.error('[checkpoint] startup maintenance failed:', err);
+    });
 
     registerMediaProtocol(session.defaultSession.protocol, {
       workspaceRoots: getWorkspaceRootsWin(),

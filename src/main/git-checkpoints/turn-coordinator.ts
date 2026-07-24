@@ -369,9 +369,12 @@ export class TurnCoordinator {
     for (const [agentId, state] of this.openByAgent) {
       if (state.ctx.workspaceId === workspaceId) this.clearAgent(agentId);
     }
-    // SEAM (WP-G1.8): ref/DB crash-consistency reconciliation + temp-artifact sweep
-    // run here once landed — regenerate the deterministic ref names and finish any
-    // persisted-non-ready edge. Intentionally not implemented in WP-G1.5.
+    // SEAM (WP-G1.8): ref/DB crash-consistency reconciliation lives in
+    // `reconciler.ts`. `reconciler.reconcileWorkspace` runs the edge reconciliation
+    // FIRST (regenerating/adopting the deterministic ref for each persisted-non-ready
+    // edge) and then drives the dangling-open close through this method (passed as its
+    // `closeOpenTurns` seam), so a live coordinator's close path and the boot path
+    // share one implementation. This method itself stays the pure close primitive.
     return closed;
   }
 

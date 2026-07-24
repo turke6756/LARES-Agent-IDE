@@ -92,6 +92,9 @@ const TESTS = [
   // fail-open before edge, never-two-open overlap, delivery-reject, completion
   // via turn-completion-tracker, startup reconciliation.
   'dist/main/main/git-checkpoints/turn-coordinator.test.js',
+  // Git-Native WP-G1.8: ref/DB crash-consistency reconciliation (create/adopt/conflict
+  // on real git) + dangling-open close + paired-ref deletion + temp-artifact sweeper.
+  'dist/main/main/git-checkpoints/reconciler.test.js',
   'dist/main/main/supervisor/initial-user-prompt.test.js',
   'dist/main/main/supervisor/hook-spool-tailer.test.js',
   'dist/main/main/supervisor/send-input-encoder.test.js',

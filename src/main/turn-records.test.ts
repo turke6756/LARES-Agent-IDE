@@ -122,6 +122,7 @@ type DbModule = {
   getTurnRecord(id: string): TurnRecord | null;
   updateTurnRecord(id: string, updates: Record<string, unknown>): TurnRecord | null;
   closeTurn(id: string, status: string, extra?: Record<string, unknown>, endedAt?: number | null): TurnRecord | null;
+  reconcileTurnRecord(id: string, updates: Record<string, unknown>): (TurnRecord & { beforeReady?: boolean; beforeQuality?: string | null; failureReason?: string | null }) | null;
   listTurnRecords(workspaceId: string, opts?: { agentId?: string }): TurnRecord[];
   recordWitnessedActivity(turnId: string, filePath: string, op: string): boolean;
   exportTurnRecords(workspaceId: string, opts?: { agentId?: string }): Record<string, unknown>[];
@@ -305,6 +306,26 @@ test('recovery_operations CRUD round-trips', () => {
   assert.equal(dbm.listRecoveryOperations(ws).length, 1);
   assert.equal(dbm.listRecoveryOperations(ws, { sourceTurnId: 'none' }).length, 0);
   assert.equal(dbm.updateRecoveryOperation('missing-id', { status: 'failed' }), null);
+});
+
+test('reconcileTurnRecord (WP-G1.8) writes ready flags on a TERMINAL row; never touches status', () => {
+  const ws = freshWorkspace();
+  const t = dbm.allocateAndInsertTurn(ws);
+  // Persist a candidate + non-ready edge, then close the turn terminal — exactly the
+  // shape a finalize-overrun leaves for startup reconciliation to finish.
+  dbm.updateTurnRecord(t.id, { beforeOid: 'cafe', beforeRef: 'refs/lares/x/before' });
+  dbm.closeTurn(t.id, 'accepted', {}, 5);
+  assert.equal(dbm.getTurnRecord(t.id)?.status, 'accepted');
+  // updateTurnRecord is blocked on the terminal row…
+  assert.throws(() => dbm.updateTurnRecord(t.id, { beforeReady: true } as Record<string, unknown>), /terminal/);
+  // …but the reconciliation-only writer flips the ready flag + backfills quality.
+  const r = dbm.reconcileTurnRecord(t.id, { beforeReady: true, beforeQuality: 'reconciled' });
+  assert.equal(r?.beforeReady, true, 'ready flag set on the terminal row');
+  assert.equal(r?.beforeQuality, 'reconciled');
+  assert.equal(r?.status, 'accepted', 'terminal status is left untouched');
+  // It refuses to change status, and reports null for an unknown id.
+  assert.throws(() => dbm.reconcileTurnRecord(t.id, { status: 'reverted' }), /never change status/);
+  assert.equal(dbm.reconcileTurnRecord('no-such-turn', { beforeReady: true }), null);
 });
 
 // ── Runner ───────────────────────────────────────────────────────────────────
