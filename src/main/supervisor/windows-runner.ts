@@ -5,6 +5,7 @@ import { EventEmitter } from 'events';
 import { getPtyHostPath } from './paths';
 import { sanitizeClaudeChildEnv } from './env-sanitize';
 import { spawnBundledNode } from '../node-runtime';
+import { ensureNodeShimDir, withNodeShimOnPath } from '../node-shim';
 
 /**
  * Spawns Claude via a separate Node.js process that uses node-pty.
@@ -92,7 +93,22 @@ export class WindowsRunner extends EventEmitter {
     // spawnBundledNode adds ELECTRON_RUN_AS_NODE so the sanitizer can never
     // strip the flag the helper needs. pty-host itself deletes that marker
     // again before it spawns the PTY child (plan §5.3).
-    const env = sanitizeClaudeChildEnv({ ...process.env, ...(extraEnv || {}) });
+    let env = sanitizeClaudeChildEnv({ ...process.env, ...(extraEnv || {}) });
+
+    // Bundled-node-exposure plan §1.3: APPEND the userData node-shim dir to the
+    // pty-host's PATH so a Node-free Windows machine still resolves `node` for
+    // hook / statusLine subprocesses. Appended → any real project/system node
+    // keeps precedence (§0.3). pty-host builds the PTY child env from its own
+    // process.env (deleting ELECTRON_RUN_AS_NODE first), so this shim dir
+    // transparently reaches the provider CLI and its hooks — no pty-host edit.
+    try {
+      env = withNodeShimOnPath(env, ensureNodeShimDir());
+    } catch (err) {
+      // Retry failed. Don't pretend hooks will work, but don't block the launch
+      // either (the agent is still usable for MCP-tool work per the VM report).
+      // Surface it honestly: the console is the signal.
+      console.error(`[node-shim] shim unavailable for ${workDir}; hooks may fail if no system node:`, err);
+    }
 
     this.host = spawnBundledNode(ptyHostPath, [], { env });
 

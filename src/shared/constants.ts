@@ -3794,6 +3794,12 @@ export const OPTIONAL_TOOL_HINTS: Record<'git' | 'python' | 'node' | 'wsl' | 'tm
   tmux: { label: 'tmux (inside WSL)', docsUrl: 'https://github.com/tmux/tmux/wiki', installCommand: 'sudo apt install tmux' },
 };
 
+/** Minimum system Node major version that can run the managed hook/statusline
+ *  scripts (ESM + top-level await + global fetch + AbortController). Below
+ *  this, the bundled runtime is authoritative (bundled-node-exposure plan §4).
+ *  Node 18 is the first release with unflagged global `fetch`. */
+export const MIN_SYSTEM_NODE_MAJOR = 18;
+
 /** Where "Help ▸ Check for updates" sends the user. Deliberately the
  *  `/releases/latest` alias, never a version-pinned URL — the latter goes stale
  *  the moment 0.2.1 ships. There is no background update check in 0.2.0 (plan

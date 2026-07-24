@@ -33,7 +33,7 @@ import type {
   RuntimePrerequisiteReport,
   WslStatus,
 } from '../shared/types';
-import { PROVIDER_INSTALL_HINTS, OPTIONAL_TOOL_HINTS } from '../shared/constants';
+import { PROVIDER_INSTALL_HINTS, OPTIONAL_TOOL_HINTS, MIN_SYSTEM_NODE_MAJOR } from '../shared/constants';
 import { getWindowsSystemPath, probeWindowsProvider } from './supervisor/provider-resolver';
 import { getPassiveWslStatus, wslExec } from './wsl-bridge';
 
@@ -191,6 +191,53 @@ async function checkProvider(id: ProviderId): Promise<PrerequisiteCheck> {
   };
 }
 
+/** Parse a Node major version integer out of a `--version` line
+ *  (e.g. `v18.17.0` → 18). Returns null when it can't be parsed — a version is
+ *  best-effort (see {@link probeVersion}), so an unparseable one must never be
+ *  treated as "too old". */
+export function parseNodeMajor(version: string | undefined): number | null {
+  if (!version) return null;
+  const m = version.match(/v?(\d+)\./);
+  if (!m) return null;
+  const major = Number.parseInt(m[1], 10);
+  return Number.isFinite(major) ? major : null;
+}
+
+/** The status/impact/remediation fields for the optional `node` row, per plan
+ *  §4. Pure and exported so all three branches (compatible / too-old / missing)
+ *  are unit-testable without spawning `where`/`--version`.
+ *
+ *  - missing: bundled fallback covers hooks — installing node is only for your
+ *    own `node` on PATH.
+ *  - too old (< MIN_SYSTEM_NODE_MAJOR): available, but flag that a bare `node`
+ *    resolves to a runtime too old for managed scripts (bundled runtime is the
+ *    fallback for those); do NOT silently override the user's own node.
+ *  - compatible (>= min, or version unparseable): authoritative, no impact. */
+export function decideNodeOptional(
+  resolved: string | null,
+  version: string | undefined,
+  label = OPTIONAL_TOOL_HINTS.node.label,
+): { status: 'available' | 'missing'; impact: string; remediation: string } {
+  if (!resolved) {
+    return {
+      status: 'missing',
+      impact:
+        'Lares ships a bundled Node fallback, so managed hooks/status lines work without a system Node. Install Node only if you want your own version on PATH for agent shell commands.',
+      remediation: `Optional — install ${label} only if you want your own \`node\` on PATH for agent shell commands.`,
+    };
+  }
+  const major = parseNodeMajor(version);
+  if (major !== null && major < MIN_SYSTEM_NODE_MAJOR) {
+    return {
+      status: 'available',
+      impact:
+        `System ${label} ${version} is too old for Lares hooks; Lares' bundled runtime will be used as a fallback for managed scripts, but any bare \`node\` you run resolves to this old version.`,
+      remediation: `Upgrade to Node ${MIN_SYSTEM_NODE_MAJOR} or newer.`,
+    };
+  }
+  return { status: 'available', impact: '', remediation: '' };
+}
+
 async function checkOptional(
   id: 'git' | 'python' | 'node',
   impact: string,
@@ -212,6 +259,22 @@ async function checkOptional(
     docsUrl: hint.docsUrl,
     installCommand: hint.installCommand,
   };
+
+  // Bundled-node-exposure plan §4: `node` gets its own precedence-aware
+  // messaging (bundled fallback covers hooks; an obsolete system node still
+  // wins the appended-shim race). Missing node no longer reports the generic
+  // "features above" impact.
+  if (id === 'node') {
+    const version = resolved ? await probeVersion(resolved) : undefined;
+    const decision = decideNodeOptional(resolved, version, hint.label);
+    return {
+      ...base,
+      status: decision.status,
+      ...(resolved ? { path: resolved, version } : {}),
+      impact: decision.impact,
+      remediation: decision.remediation,
+    };
+  }
 
   if (!resolved) {
     return {

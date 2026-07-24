@@ -102,6 +102,30 @@ test('runtime detection is the default when no override is given', () => {
   assert.equal(plan.electronAsNode, isElectronRuntime());
 });
 
+test('host-helper env carries ELECTRON_RUN_AS_NODE=1; the PTY-child env (post pty-host deletion) does not, but keeps the shim on PATH', () => {
+  // Bundled-node-exposure plan §1.4/§1.6. The pty-host helper is spawned as
+  // Electron-as-Node, so its env MUST carry the flag. windows-runner (§1.3)
+  // appends the node-shim dir to that same env's PATH.
+  const hostPlan = buildBundledNodeSpawn('C:\\app\\pty-host.js', [], {
+    env: { PATH: 'C:\\Windows\\system32;C:\\Users\\me\\AppData\\Roaming\\Lares\\node-shim' },
+    electron: true,
+  });
+  assert.equal(hostPlan.env.ELECTRON_RUN_AS_NODE, '1');
+  assert.ok((hostPlan.env.PATH || '').includes('node-shim'), 'the shim dir rides on the host-helper PATH');
+
+  // pty-host.js builds the PTY child's env from its own process.env, deleting
+  // the two Electron markers FIRST (defense in depth — plan §0.4/§1.4). Simulate
+  // that deletion: the child must NOT inherit ELECTRON_RUN_AS_NODE, yet the shim
+  // dir must remain on PATH so bare `node` in a hook still resolves it.
+  const childEnv: NodeJS.ProcessEnv = { ...hostPlan.env };
+  delete childEnv.ELECTRON_RUN_AS_NODE;
+  delete childEnv.ELECTRON_NO_ATTACH_CONSOLE;
+  assert.equal('ELECTRON_RUN_AS_NODE' in childEnv, false,
+    'the PTY child (and its hook subprocesses) must never see the runtime flag');
+  assert.ok((childEnv.PATH || '').includes('node-shim'),
+    'the shim dir survives into the PTY child PATH after the flag is stripped');
+});
+
 let passed = 0;
 let failed = 0;
 for (const t of tests) {

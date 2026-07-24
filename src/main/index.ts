@@ -45,6 +45,7 @@ import { registerBrowserIpc } from './browser/browser-ipc';
 import { PlanPaneManager } from './plans/plan-pane-manager';
 import { registerPlanIpc } from './plans/plan-ipc';
 import { stripClaudeChildEnvInPlace } from './supervisor/env-sanitize';
+import { ensureNodeShimDir } from './node-shim';
 import { getLaresNativeDir } from './supervisor/paths';
 import { installShellSpellcheckContextMenu } from './spellcheck-context-menu';
 import { MemorySampler } from './watchdog/memory-sampler';
@@ -685,6 +686,21 @@ app.whenReady().then(async () => {
     console.log('Initializing database...');
     initDatabase();
     console.log('Database initialized');
+
+    // Windows node shim (bundled-node-exposure plan §1.2). Generate the
+    // userData `node` trampoline BEFORE any agent can launch, so a Node-free
+    // Windows machine still resolves the bundled runtime for hook/statusline
+    // subprocesses. Idempotent + regenerated per launch (§1.3) so this self-
+    // heals; non-fatal on failure — the app still opens and the prerequisite
+    // report (§4) surfaces the runtime state.
+    // TODO(Phase 2, WSL): WSL agents need a bundled Linux Node provisioned off
+    // the launch hot path instead — this Windows shim is useless in-distro
+    // (plan §2 / §2.2 `ensureWslNodeRuntime`).
+    try {
+      ensureNodeShimDir();
+    } catch (err) {
+      console.error('[node-shim] could not generate Windows node shim at startup:', err);
+    }
 
     // Lares rebrand — one-time `.dashboard/` → `.lares/` state-dir rename for
     // every registered workspace, BEFORE anything touches workspace state

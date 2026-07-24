@@ -41,7 +41,12 @@ param(
   # falling back to an installed copy under %LOCALAPPDATA%\Programs\Lares.
   [string]$Exe = '',
   # Seconds to wait for the GUI launch check in [2].
-  [int]$LaunchWaitSeconds = 20
+  [int]$LaunchWaitSeconds = 20,
+  # Optional path to a scaffolded workspace root (the folder that CONTAINS
+  # `.lares\scripts\dashboard-status.mjs`). When provided, [5] additionally
+  # exercises the REAL status hook + status line through the shim. Skipped when
+  # absent — the shim contract (5a-5d) is proven regardless.
+  [string]$Workspace = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -363,6 +368,22 @@ if (-not $nodeIsHidden) {
       Pass 'V10 pty spawned'      'pty-host reported a PTY pid - node-pty loaded out of app.asar.unpacked'
       Pass 'V10 sentinel echoed'  "cmd.exe wrote '$SENTINEL' back through the PTY"
       $v10Done = $true
+
+      # Plan §1.7 / §0.4: the PTY CHILD must NOT inherit ELECTRON_RUN_AS_NODE.
+      # pty-host is spawned WITH the flag (it is Electron-as-Node) but deletes it
+      # before spawning the PTY child. Dump the child env with `cmd /c set` and
+      # assert the marker is gone (defense in depth against runtime leakage).
+      $envDump = New-TempDir 'ptyenv'
+      $setMsg = '{"type":"spawn","command":"cmd.exe","args":["/d","/s","/c","set"],"cwd":' +
+                (ConvertTo-Json $envDump) + ',"cols":80,"rows":24}' + "`n"
+      $re = Invoke-HiddenNodeChild -FilePath $Exe -Arguments @($entry) -StdinText $setMsg `
+        -ExtraEnv @{ ELECTRON_RUN_AS_NODE = '1' } -WaitSeconds 25 -WorkDir $envDump
+      if ($re.Stdout -match '(?im)^ELECTRON_RUN_AS_NODE=') {
+        Fail 'V10 pty child env' 'the PTY child inherited ELECTRON_RUN_AS_NODE - pty-host must delete it before spawning (plan §0.4/§1.4)'
+      } else {
+        Pass 'V10 pty child env' 'ELECTRON_RUN_AS_NODE absent from the PTY child environment (confined to the shim/helper process)'
+      }
+      if (Test-Path -LiteralPath $envDump) { try { Remove-Item -LiteralPath $envDump -Recurse -Force -ErrorAction SilentlyContinue } catch { } }
       break
     }
     if ($sawReady -and $sawPid -and -not $sawSentinel) {
@@ -453,6 +474,135 @@ if (-not $nodeIsHidden) {
   }
   if (Test-Path -LiteralPath $r.Dir) {
     try { Remove-Item -LiteralPath $r.Dir -Recurse -Force -ErrorAction SilentlyContinue } catch { }
+  }
+}
+
+# ---------------------------------------------------------------------------
+# [5] The node shim (bundled-node-exposure plan §1.7)
+# ---------------------------------------------------------------------------
+# [3]/[4] prove the bundled runtime boots when we hand it ELECTRON_RUN_AS_NODE=1
+# explicitly. This section proves the SHIM: a `node` command on PATH, generated
+# under an install path with a SPACE, re-execs Lares.exe as Node so a Node-free
+# machine's bare `node` (hooks, status line) just works — with system node
+# keeping precedence.
+Write-Host "`n[5] node shim -> Lares.exe (hook/statusline path)"
+
+# The shim dir deliberately contains a space (matches the plan's "install path
+# containing spaces" requirement and userData paths like `C:\Users\First Last`).
+$shimRoot = Join-Path (New-TempDir 'shim root') 'node-shim'
+New-Item -ItemType Directory -Path $shimRoot -Force | Out-Null
+
+# node.cmd content is a byte-for-byte mirror of src/main/node-shim.ts. If that
+# module changes, change this too (there is no shared source across TS/PS).
+$nodeCmd = "@echo off`r`nsetlocal`r`nset `"ELECTRON_RUN_AS_NODE=1`"`r`n`"$Exe`" %*`r`n"
+[System.IO.File]::WriteAllText((Join-Path $shimRoot 'node.cmd'), $nodeCmd, (New-Object System.Text.ASCIIEncoding))
+
+if (-not $nodeIsHidden) {
+  Skip 'V12 shim' 'the hidden-Node environment could not be established (see [1])'
+} else {
+  # 5b/5c: with the shim APPENDED to a node-free PATH, bare `node` resolves the
+  # shim and runs as Electron-as-Node.
+  $savedEnv2 = @{}
+  foreach ($k in @('PATH')) { $savedEnv2[$k] = [Environment]::GetEnvironmentVariable($k, 'Process') }
+  Enter-HiddenNodeEnv
+  try {
+    $env:PATH = $strippedPath + ';' + $shimRoot
+
+    $whereOut = & (Join-Path $env:SystemRoot 'System32\cmd.exe') /d /c "where node 2>nul"
+    $whereFirst = @($whereOut | Where-Object { $_ }) | Select-Object -First 1
+    if ($whereFirst -and ($whereFirst.Trim().ToLower() -eq (Join-Path $shimRoot 'node.cmd').ToLower())) {
+      Pass 'V12 where node' "bare 'node' resolves the shim: $($whereFirst.Trim())"
+    } else {
+      Fail 'V12 where node' "expected the shim's node.cmd first; 'where node' returned: $($whereOut -join ', ')"
+    }
+
+    $ver = & (Join-Path $env:SystemRoot 'System32\cmd.exe') /d /c "node -p `"process.versions.node`" 2>nul"
+    $ver = ($ver | Where-Object { $_ } | Select-Object -First 1)
+    if ($ver -and $ver.Trim() -match '^\d+\.\d+\.\d+') {
+      Pass 'V12 node -p versions.node' "shim ran and reported node $($ver.Trim())"
+    } else {
+      Fail 'V12 node -p versions.node' "no version came back through the shim (got: '$ver')"
+    }
+
+    # The crux: it is ELECTRON-as-Node, not a stray system node. A real node
+    # binary has an empty process.versions.electron.
+    $elec = & (Join-Path $env:SystemRoot 'System32\cmd.exe') /d /c "node -p `"process.versions.electron`" 2>nul"
+    $elec = ($elec | Where-Object { $_ } | Select-Object -First 1)
+    if ($elec -and $elec.Trim() -match '^\d+\.') {
+      Pass 'V12 electron-as-node' "process.versions.electron=$($elec.Trim()) - the shim really re-execs Lares.exe"
+    } else {
+      Fail 'V12 electron-as-node' "process.versions.electron was empty - the shim did NOT resolve to Lares.exe (got: '$elec')"
+    }
+
+    # 5d: precedence. A fake node.cmd EARLIER on PATH must win (system-first),
+    # and the shim must still be the fallback once the fake is gone.
+    $fakeDir = Join-Path (New-TempDir 'fake node') 'bin'
+    New-Item -ItemType Directory -Path $fakeDir -Force | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $fakeDir 'node.cmd'), "@echo off`r`necho FAKENODE_SENTINEL`r`n", (New-Object System.Text.ASCIIEncoding))
+    $env:PATH = $fakeDir + ';' + $strippedPath + ';' + $shimRoot
+    $pre = & (Join-Path $env:SystemRoot 'System32\cmd.exe') /d /c "node 2>nul"
+    if (($pre -join '') -match 'FAKENODE_SENTINEL') {
+      Pass 'V12 precedence' 'a node.cmd earlier on PATH wins - the shim is a strict fallback (append-only, plan §0.3)'
+    } else {
+      Fail 'V12 precedence' "the earlier fake node was NOT preferred; the shim must never override a real node. Got: $($pre -join ' ')"
+    }
+  } finally {
+    Exit-HiddenNodeEnv
+    foreach ($k in $savedEnv2.Keys) {
+      $v = $savedEnv2[$k]
+      if ($null -eq $v) { Remove-Item -LiteralPath "Env:$k" -ErrorAction SilentlyContinue }
+      else { Set-Item -LiteralPath "Env:$k" -Value $v }
+    }
+  }
+
+  # 5e/5f: the REAL scaffolded hook + status line, through the shim. Requires a
+  # scaffolded workspace; skip loudly otherwise.
+  $statusHook = ''
+  $statusLine = ''
+  if ($Workspace) {
+    $statusHook = Join-Path $Workspace '.lares\scripts\dashboard-status.mjs'
+    $statusLine = Join-Path $Workspace '.lares\scripts\dashboard-statusline.mjs'
+  }
+  if (-not $Workspace) {
+    Skip 'V12 status hook' 'no -Workspace given; pass a scaffolded workspace root to exercise the real hook + status line through the shim'
+  } elseif (-not (Test-Path -LiteralPath $statusHook)) {
+    Skip 'V12 status hook' "no dashboard-status.mjs under $Workspace\.lares\scripts (is it a scaffolded workspace?)"
+  } else {
+    $spool = Join-Path (New-TempDir 'spool') 'pending-status.jsonl'
+    # No dashboard API is up, so HTTP delivery fails and the hook falls back to
+    # the spool - which is exactly the path we want to prove works under the shim.
+    $r = Invoke-HiddenNodeChild -FilePath (Join-Path $shimRoot 'node.cmd') -Arguments @($statusHook, 'working') -StdinText '' -ExtraEnv @{
+      AGENT_ID            = 'verify-shim-agent'
+      DASHBOARD_PORT      = '24680'
+      DASHBOARD_SPOOL_PATH = $spool
+    } -WaitSeconds 20
+    if (Test-Path -LiteralPath $spool) {
+      $rec = Read-AllText $spool
+      if ($rec -match 'verify-shim-agent') {
+        Pass 'V12 status hook -> spool' "dashboard-status.mjs ran through the shim and wrote a spool record"
+      } else {
+        Fail 'V12 status hook -> spool' "spool file exists but has no agent record. stderr: $((($r.Stderr) -replace '\s+',' ').Trim())"
+      }
+    } else {
+      Fail 'V12 status hook -> spool' "no spool record written. stdout: $((($r.Stdout) -replace '\s+',' ').Trim()) stderr: $((($r.Stderr) -replace '\s+',' ').Trim())"
+    }
+
+    if (Test-Path -LiteralPath $statusLine) {
+      $usageDir = Join-Path (New-TempDir 'ws') '.lares\usage'
+      New-Item -ItemType Directory -Path $usageDir -Force | Out-Null
+      $wsForLine = Split-Path -Parent (Split-Path -Parent $usageDir)
+      $rateBlob = '{"rate_limits":[{"type":"5h","used_pct":10,"resets_at":"2099-01-01T00:00:00Z"}]}'
+      $r2 = Invoke-HiddenNodeChild -FilePath (Join-Path $shimRoot 'node.cmd') -Arguments @($statusLine) -StdinText $rateBlob -ExtraEnv @{
+        AGENT_ID      = 'verify-shim-agent'
+        DASHBOARD_PORT = '24680'
+        CLAUDE_PROJECT_DIR = $wsForLine
+      } -WaitSeconds 20
+      if (($r2.Stdout).Trim().Length -gt 0) {
+        Pass 'V12 status line -> stdout' 'dashboard-statusline.mjs printed a line through the shim'
+      } else {
+        Warn 'V12 status line -> stdout' "no status line printed. stderr: $((($r2.Stderr) -replace '\s+',' ').Trim())"
+      }
+    }
   }
 }
 

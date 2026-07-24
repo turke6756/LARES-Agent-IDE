@@ -57,6 +57,8 @@ const {
   detectRuntimePrerequisites,
   toHealthCheck,
   __resetPrerequisiteCache,
+  parseNodeMajor,
+  decideNodeOptional,
 } = require('./runtime-prerequisites') as typeof import('./runtime-prerequisites');
 
 /** Point the resolver at an empty scratch home so no real CLI on the dev box
@@ -199,7 +201,7 @@ test('git is optional, never an agent-cli requirement', async () => {
   }
 });
 
-test('external node is optional — Lares ships its own runtime', async () => {
+test('external node is optional — a missing node reports the bundled-fallback copy (plan §4)', async () => {
   const restore = withEmptyHome();
   reset();
   try {
@@ -207,10 +209,57 @@ test('external node is optional — Lares ships its own runtime', async () => {
     const node = report.optional.find((c) => c.id === 'node');
     assert.ok(node);
     assert.equal(node.tier, 'optional');
-    assert.match(node.impact, /Lares itself does not need this/);
+    assert.equal(node.status, 'missing');
+    // Plan §4: a MISSING system node is no longer a hook-breaker — the bundled
+    // runtime fallback covers managed scripts. The impact must SAY so, and must
+    // not tell the user the app is broken.
+    assert.match(node.impact, /bundled Node fallback/);
+    assert.match(node.remediation, /only if you want your own/i);
   } finally {
     restore();
   }
+});
+
+// ── Plan §4: system-Node minimum-version branching ─────────────────────────
+// The precedence-aware node decision is a pure function so all three branches
+// are testable without spawning `where` / `node --version`.
+test('parseNodeMajor: extracts the major, tolerates the v-prefix, null on garbage', () => {
+  assert.equal(parseNodeMajor('v18.17.0'), 18);
+  assert.equal(parseNodeMajor('20.11.1'), 20);
+  assert.equal(parseNodeMajor('v16.20.2'), 16);
+  assert.equal(parseNodeMajor(undefined), null);
+  assert.equal(parseNodeMajor(''), null);
+  assert.equal(parseNodeMajor('not a version'), null);
+});
+
+test('decideNodeOptional: MISSING → bundled-fallback copy, status missing', () => {
+  const d = decideNodeOptional(null, undefined);
+  assert.equal(d.status, 'missing');
+  assert.match(d.impact, /bundled Node fallback/);
+  assert.match(d.remediation, /your own `node`/);
+});
+
+test('decideNodeOptional: TOO OLD (< 18) → available but flagged, do not override', () => {
+  const d = decideNodeOptional('C:\\old\\node.exe', 'v16.20.2');
+  assert.equal(d.status, 'available');
+  assert.match(d.impact, /too old for Lares hooks/);
+  assert.match(d.impact, /v16\.20\.2/);
+  assert.match(d.remediation, /Upgrade to Node 18 or newer/);
+});
+
+test('decideNodeOptional: COMPATIBLE (>= 18) → authoritative, no impact', () => {
+  const d = decideNodeOptional('C:\\ok\\node.exe', 'v18.17.0');
+  assert.equal(d.status, 'available');
+  assert.equal(d.impact, '');
+  assert.equal(d.remediation, '');
+});
+
+test('decideNodeOptional: an unparseable version is treated as compatible, never too-old', () => {
+  // Version is best-effort; a resolved-but-unparseable node must not be
+  // slandered as obsolete.
+  const d = decideNodeOptional('C:\\ok\\node.exe', undefined);
+  assert.equal(d.status, 'available');
+  assert.equal(d.impact, '');
 });
 
 test('never throws, even when every probe fails', async () => {
