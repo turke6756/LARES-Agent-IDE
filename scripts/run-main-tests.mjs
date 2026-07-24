@@ -80,6 +80,8 @@ const TESTS = [
   'dist/main/main/git-checkpoints/ref-encoding.test.js',
   // Git-Native WP-G1.3a: capability gate + enumeration preflight + check-ignore trichotomy.
   'dist/main/main/git-checkpoints/checkpoint-gating.test.js',
+  // Git-Native WP-G1.3b: snapshot core — full raw capture (real git) + durable finalize.
+  'dist/main/main/git-checkpoints/checkpoint-service.test.js',
   'dist/main/main/supervisor/initial-user-prompt.test.js',
   'dist/main/main/supervisor/hook-spool-tailer.test.js',
   'dist/main/main/supervisor/send-input-encoder.test.js',
