@@ -34,6 +34,28 @@ export function RoleChips({ agent }: { agent: Agent }) {
   );
 }
 
+// WP2 (hook-absence-resilience) — compact "HOOKS OFF" pill shown beside the
+// operational StatusBadge whenever the status-hook transport is unavailable for
+// this agent (hooksUnavailable derived from hook_status = broken/degraded). Hook
+// health is ORTHOGONAL to the operational status — this never replaces the
+// StatusBadge; it only warns that status is being recovered from the session log
+// and may lag. Renders nothing when hooks are healthy/unknown.
+export function HooksOffBadge({ agent }: { agent: Agent }) {
+  if (!agent.hooksUnavailable) return null;
+  const tooltip =
+    agent.hooksUnavailableReason === 'instrumentation-unavailable'
+      ? "This command couldn't be instrumented for Lares hooks. Status is recovered from the session log and may lag — double-click the card to watch the terminal directly."
+      : "Lares received no status hook from this agent (usually Node.js isn't on PATH). Status is recovered from the session log and may lag — double-click the card to watch the terminal directly.";
+  return (
+    <span
+      className="text-[11px] text-amber-400 bg-amber-500/15 px-1.5 py-0.5 font-semibold truncate shrink-0"
+      title={tooltip}
+    >
+      HOOKS OFF
+    </span>
+  );
+}
+
 // Context-usage bar: token counts, a colored fill scaled to context %, model id
 // and percentage. `className` overrides the wrapper spacing so the vertical card
 // and the horizontal owner bar can each place it appropriately.

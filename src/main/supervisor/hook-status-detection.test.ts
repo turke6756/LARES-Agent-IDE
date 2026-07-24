@@ -22,6 +22,7 @@ import {
   CODEX_WORKER_PROFILE_NAME,
 } from '../../shared/constants';
 import { instrumentCodexWorkerCommand } from './index';
+import { deriveHookAvailability } from '../../shared/types';
 
 interface TestCase {
   name: string;
@@ -136,6 +137,28 @@ test('B2e. un-instrumentable command (not recognizably codex) → instrumented:f
 test('B2f. foreign --profile we must not clobber → instrumented:false (caller marks degraded)', () => {
   const { instrumented } = instrumentCodexWorkerCommand('codex --profile someones-custom-profile');
   assert.equal(instrumented, false, 'a foreign --profile must report instrumented:false rather than be clobbered');
+});
+
+// ── WP2. deriveHookAvailability — the DTO projection of hook_status ───
+
+test('WP2a. broken → hooksUnavailable with reason canary-timeout', () => {
+  const d = deriveHookAvailability('broken');
+  assert.equal(d.hooksUnavailable, true, 'broken hooks are unavailable');
+  assert.equal(d.hooksUnavailableReason, 'canary-timeout');
+});
+
+test('WP2b. degraded → hooksUnavailable with reason instrumentation-unavailable', () => {
+  const d = deriveHookAvailability('degraded');
+  assert.equal(d.hooksUnavailable, true, 'degraded hooks are unavailable for UI/fallback');
+  assert.equal(d.hooksUnavailableReason, 'instrumentation-unavailable');
+});
+
+test('WP2c. healthy / unknown / undefined → hooks available, no reason', () => {
+  for (const hs of ['healthy', 'unknown', undefined] as const) {
+    const d = deriveHookAvailability(hs);
+    assert.equal(d.hooksUnavailable, false, `hooks available for ${hs}`);
+    assert.equal(d.hooksUnavailableReason, undefined, `no reason for ${hs}`);
+  }
 });
 
 // ── Runner ───────────────────────────────────────────────────────────

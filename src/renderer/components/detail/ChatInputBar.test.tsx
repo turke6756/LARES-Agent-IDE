@@ -5,7 +5,8 @@ import { createRoot, type Root } from 'react-dom/client';
 import ChatInputBar from './ChatInputBar';
 import { useDashboardStore } from '../../stores/dashboard-store';
 import { formatAgentToken } from '../../lib/agent-mention';
-import type { Agent } from '../../../shared/types';
+import type { Agent, SendOutcome } from '../../../shared/types';
+import { TERMINAL_CHECK_SENTENCE } from '../../../shared/send-outcome-copy';
 
 // Component test via the createRoot-on-jsdom probe pattern (React Testing
 // Library is intentionally NOT a dependency of this repo — see
@@ -79,6 +80,7 @@ beforeEach(() => {
     agents: {
       sendInput,
       onSendInputError: vi.fn(() => () => {}),
+      onSendInputResult: vi.fn(() => () => {}),
     },
   };
   useDashboardStore.setState({
@@ -153,5 +155,48 @@ describe('ChatInputBar "@"-mention', () => {
     key('Enter');
     expect(sendInput).toHaveBeenCalledTimes(1);
     expect(sendInput).toHaveBeenCalledWith('me', '@res');
+  });
+});
+
+describe('ChatInputBar WP8 send-outcome banner', () => {
+  function captureResultCallback(): (o: SendOutcome) => void {
+    let cb: ((o: SendOutcome) => void) | null = null;
+    (window as unknown as { api: { agents: { onSendInputResult: unknown } } }).api.agents.onSendInputResult =
+      vi.fn((callback: (o: SendOutcome) => void) => { cb = callback; return () => {}; });
+    return (o: SendOutcome) => { if (cb) act(() => cb!(o)); };
+  }
+
+  it('delivered-unconfirmed renders an amber banner with the mandatory terminal-check sentence (never "Send failed")', () => {
+    const fire = captureResultCallback();
+    render('me');
+    fire({ disposition: 'delivered-unconfirmed', agentId: 'me', delivered: true, reason: 'confirmation-timeout', completedAt: 0 });
+    expect(container.textContent).toContain(TERMINAL_CHECK_SENTENCE);
+    expect(container.textContent).not.toContain('Send failed');
+  });
+
+  it('a detected prompt is named in the banner', () => {
+    const fire = captureResultCallback();
+    render('me');
+    fire({
+      disposition: 'delivered-unconfirmed', agentId: 'me', delivered: true, reason: 'interactive-prompt',
+      prompt: { kind: 'trust-dialog', label: 'workspace trust dialog', excerpt: 'Do you trust the files in this folder?' },
+      completedAt: 0,
+    });
+    expect(container.textContent).toContain('workspace trust dialog');
+    expect(container.textContent).toContain(TERMINAL_CHECK_SENTENCE);
+  });
+
+  it('failed renders the same terminal-check sentence', () => {
+    const fire = captureResultCallback();
+    render('me');
+    fire({ disposition: 'failed', agentId: 'me', delivered: false, reason: 'delivery-failed', completedAt: 0 });
+    expect(container.textContent).toContain(TERMINAL_CHECK_SENTENCE);
+  });
+
+  it('an outcome for a DIFFERENT agent is ignored', () => {
+    const fire = captureResultCallback();
+    render('me');
+    fire({ disposition: 'failed', agentId: 'someone-else', delivered: false, reason: 'delivery-failed', completedAt: 0 });
+    expect(container.textContent).not.toContain(TERMINAL_CHECK_SENTENCE);
   });
 });

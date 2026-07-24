@@ -4,7 +4,7 @@ import fs from 'fs';
 import crypto from 'crypto';
 import { execFileSync, execFile, spawn } from 'child_process';
 import { v4 as uuidv4 } from 'uuid';
-import { Agent, AgentProvider, AgentRoleLane, AgentStatus, AgentStopReason, BulkStopItemResult, ContextStats, ContinuationPhaseSignal, ContinuationPhaseState, ForceContinuationResult, LaunchAgentInput, QueryResult, StopEligibilityMode, StopResult, Team, UsageLimitsReading, hasSupervisorPrivilege } from '../../shared/types';
+import { Agent, AgentProvider, AgentRoleLane, AgentStatus, AgentStopReason, BulkStopItemResult, ContextStats, ContinuationPhaseSignal, ContinuationPhaseState, ForceContinuationResult, LaunchAgentInput, QueryResult, SendOutcome, StopEligibilityMode, StopResult, Team, UsageLimitsReading, hasSupervisorPrivilege } from '../../shared/types';
 import { assembleGuardSnapshot, evaluateStopEligibility, type AgentBrowserState, type GuardDeps } from '../lifecycle/guards';
 import {
   TMUX_SESSION_PREFIX, PROVIDER_COMMANDS, WORKER_CLAUDE_MODEL,
@@ -23,7 +23,7 @@ import {
   DASHBOARD_STATUS_SCRIPT_MJS_V6, DASHBOARD_STATUS_SCRIPT_V7_HASH, DASHBOARD_STATUS_SCRIPT_V8_HASH,
   DASHBOARD_STATUSLINE_SCRIPT_MJS,
   CODEX_WORKER_PROFILE_NAME, CODEX_WORKER_PROFILE_TOML, HOOK_CANARY_WINDOW_MS,
-  MAX_SUBMIT_RETRIES, HANDSHAKE_CONFIRM_WINDOW_MS, HANDSHAKE_CONFIRM_POLL_MS,
+  HANDSHAKE_CONFIRM_WINDOW_MS, HANDSHAKE_CONFIRM_POLL_MS,
   TMUX_OPTION_MAX_AGE_MS, TMUX_OPTION_LAUNCH_SKEW_MS, STATUS_POLL_INTERVAL_MS,
   RESEARCH_STORE_README_MD, RESEARCH_WRITE_GUARD_MJS, RESEARCHER_CLAUDE_SETTINGS_JSON,
   RESEARCHER_CLAUDE_SETTINGS_JSON_V1, RESEARCHER_AGENT_MD,
@@ -48,6 +48,8 @@ import {
   normalizeManagedKey,
 } from '../scaffold-writer';
 import { resolveLaunchCommand } from './launch-command';
+import { TurnEvidenceTracker } from './turn-evidence';
+import { detectInteractivePrompt } from './interactive-prompt-detector';
 import { isNonBlockingNotificationType } from '../../shared/notification-classify';
 import { workspaceStateDirName } from '../workspace-state-dir';
 import { ensureInstallationLauncher } from '../installation-descriptor';
@@ -117,7 +119,7 @@ import {
   updateAgentAttached, addEvent, deleteAgent as dbDeleteAgent,
   updateAgentResumeSessionId, addFileActivity, getTeamMembership, addTeamMember, getAgentTemplate,
   getFileActivities, pruneFileActivitiesToRecentSessions, updateAgentHookStatus,
-  updateAgentLastSendError,
+  updateAgentLastSendError, updateAgentLastSend,
   setContinuationEnabled as dbSetContinuationEnabled,
   getContinuationAttempt, getCurrentBrick, commitContinuationRelaunch,
   getLatestContinuationAttempt,
@@ -1173,6 +1175,10 @@ export class AgentSupervisor extends EventEmitter {
   // "meaningful burst", so it would otherwise read 'idle' the entire time).
   private inputQueues = new Map<string, Promise<unknown>>();
   private inputInFlight = new Set<string>();
+  // WP3 (hook-absence-resilience) — hook-independent turn-START evidence from the
+  // live session-log stream, with the synthetic-echo + session-rebound guards.
+  // Consumed by the WP5 unified send confirmation as the 'session-log' source.
+  private turnEvidence = new TurnEvidenceTracker();
 
   // BUG-11: epoch-ms of the last user-initiated PTY write per agent. Bumped
   // in `writeToAgent` (the only entrypoint for user-driven bytes — xterm
@@ -1399,6 +1405,13 @@ export class AgentSupervisor extends EventEmitter {
       void this.bridge.onStatusChanged({ ...data, source: 'monitor' });
     });
 
+    // WP2 (hook-absence-resilience) — re-surface the monitor's hook-health flip
+    // on the supervisor's public emitter so ipc-handlers can push a fresh agent
+    // DTO (with hooksUnavailable) for the HOOKS OFF card badge. This carries no
+    // status change, so it deliberately does NOT touch the bridge / notification
+    // path — it is a pure DTO-refresh signal.
+    this.monitor.on('hookStatusChanged', (data) => this.emit('hookStatusChanged', data));
+
     // Context-brick Inc 5B — re-surface the monitor's end-of-poll tick on the
     // supervisor's public emitter; the continuation watcher (wired in
     // src/main/index.ts) rides this existing periodic seam instead of owning
@@ -1462,6 +1475,17 @@ export class AgentSupervisor extends EventEmitter {
       // awaiting-human gate (a merely-idle question-ending turn is available).
       // isAwaitingHuman now reads ONLY the formal WaitingKind latch.
       this.emit('chatEvents', batch);
+      // WP3 — feed hook-independent turn-START evidence BEFORE UI-status routing,
+      // for EVERY lane regardless of hook health (WP7 only skips the duplicate
+      // status transitions, never the evidence). initialLoad replay advances the
+      // seq counter but never registers as a live start (baseline-gated). Tag
+      // each batch with the agent's current session id (rebound guard).
+      this.turnEvidence.noteEvents(
+        batch.agentId,
+        batch.events,
+        getAgent(batch.agentId)?.resumeSessionId ?? null,
+        batch.initialLoad !== true,
+      );
       this.bridge.onChatEvents(batch);
     });
 
@@ -1516,6 +1540,9 @@ export class AgentSupervisor extends EventEmitter {
     // recovery, `/clear`) don't advance the stamp on existing rows, so retained
     // rows correctly stay "current". A true purge lives only in `deleteAgent`.
     this.sessionLogReader.on('agent-rebound', ({ agentId }) => {
+      // WP3 — a stale session's start events must not survive into the new
+      // session and confirm a send taken against the old one (shared-cwd rebound).
+      this.turnEvidence.reset(agentId);
       this.contextStatsMonitor.invalidateAgent(agentId);
       // Guard the prune: a retention-prune failure must never abort the rebind
       // (which would strand a continuation agent — DB committed but relaunch
@@ -2094,9 +2121,16 @@ export class AgentSupervisor extends EventEmitter {
     // safely instrument runs hookless; surface that as hook_status='degraded'
     // now that the agent row exists. The launch canary below will NOT override
     // a degraded status (it only acts on 'unknown').
+    // WP2 (hook-absence-resilience) — the supervisor lane (and any non-legacy
+    // claude lane) now arms the canary too. Without this the supervisor stayed
+    // hookStatus:'unknown' and threw false 'Send failed' (VM report §6).
+    const isSupervisorLane = roleLaneOf(agent) === 'supervisor';
     if (codexHookDegraded) {
       updateAgentHookStatus(agent.id, 'degraded');
-    } else if (isWorkerLane || isResearcher || wantsCodexHooks) {
+    } else if (
+      isWorkerLane || isResearcher || wantsCodexHooks || isSupervisorLane
+      || (agent.provider === 'claude' && roleLaneOf(agent) !== 'legacy')
+    ) {
       // Arm the launch-time hook canary: if no hook event reaches the dashboard
       // within HOOK_CANARY_WINDOW_MS and hook_status is still 'unknown', the
       // StatusMonitor flips it to 'broken'. See StatusMonitor.checkHookCanary.
@@ -5156,6 +5190,8 @@ export class AgentSupervisor extends EventEmitter {
     // the ring outlived the agent row for the life of the process).
     this.sessionLogReader.forgetAgent(agentId);
     this.bridge.forgetAgent(agentId);
+    // WP3 — release turn-evidence for a forgotten/terminal agent.
+    this.turnEvidence.reset(agentId);
     // BUG-09 §3.7 — drop the latch + hold-until entries so a 15-min
     // tool-pending latch can't survive into a future agent record reusing this id.
     this.monitor.forgetAgent(agentId);
@@ -5944,11 +5980,12 @@ export class AgentSupervisor extends EventEmitter {
     }
   }
 
-  /** Contract-vs-fallback predicate (plan §SCOPE, Q6). Decides, per agent,
-   *  whether a submit goes through the THROWING synchronous confirm-and-retry
-   *  (true) or stays on the existing best-effort reactive Enter-resend (false).
-   *  Centralizes the provider-applicability matrix so the send path and the
-   *  reactive poller agree on exactly one set of agents.
+  /** Re-press-applicability predicate (plan §SCOPE, Q6; WP5 retired its
+   *  throw/no-throw role). Decides, per agent, whether the unified send
+   *  confirmation should ATTEMPT the synchronous submit-only Enter re-press
+   *  (true) or just watch for evidence (false) — it no longer decides whether a
+   *  send throws (an unconfirmed send is always `delivered-unconfirmed`). The
+   *  reactive poller still shares this matrix to skip contract providers.
    *
    *    - Claude worker (hooked) → true. Proven live; settings.json hooks just
    *      run. A 'broken' canary verdict means the scaffold never loaded for this
@@ -6117,58 +6154,47 @@ export class AgentSupervisor extends EventEmitter {
    * `submit:false` flag).
    */
   sendInput(agentId: string, text: string, opts: { submit?: boolean } = {}): Promise<boolean> {
+    // WP5 — thin shim over the unified send op. Returns the outcome's
+    // `delivered` boolean (false ONLY when no runner accepted the bytes), so
+    // existing delivery-proof callers keep working. It NEVER rejects for a
+    // merely-unconfirmed submit; a missing-runner still rejects eagerly.
+    return this.sendInputWithOutcome(agentId, text, opts).then((o) => o.delivered);
+  }
+
+  /**
+   * WP5 (hook-absence-resilience) — THE single send operation. Serializes
+   * per-agent (a previous send that is still typing/confirming holds the queue),
+   * delivers the body+submit, then races the three independent evidence sources
+   * — start hook, session-log turn start (WP3), and a `working` status flip —
+   * until the confirmation deadline, and resolves a three-state `SendOutcome`:
+   *
+   *   - `failed`               — no runner accepted the bytes (nothing typed).
+   *   - `confirmed`            — a turn provably started (with the winning source).
+   *   - `delivered-unconfirmed`— bytes accepted but no start evidence in time.
+   *                              NOT a failure; the WP4 PTY classifier annotates
+   *                              a blocking prompt when it recognizes one.
+   *
+   * Hook absence (or hooks-were-healthy-earlier) is NEVER converted into
+   * `failed` — that is the plan's core invariant. The outcome is persisted and
+   * broadcast (`sendInputResult`) so every surface can render identical copy for
+   * identical evidence, regardless of the target's lane.
+   */
+  sendInputWithOutcome(
+    agentId: string,
+    text: string,
+    opts: { submit?: boolean } = {},
+  ): Promise<SendOutcome> {
     if (!this.windowsRunners.get(agentId) && !this.wslRunners.get(agentId)) {
       return Promise.reject(new Error(`No runner for agent ${agentId}`));
     }
     const submit = opts.submit !== false;
     this.inputInFlight.add(agentId);
     const previous = this.inputQueues.get(agentId) || Promise.resolve();
-    const ours: Promise<boolean> = previous
+    const ours: Promise<SendOutcome> = previous
       .catch(() => undefined) // a prior failed send must not poison the queue
-      .then(() => this._doSendInput(agentId, text, submit))
-      .then((delivered) => {
-        if (submit && delivered) {
-          // P2-03: if the agent was waiting on user input, the send just
-          // answered the prompt — clear the latch so status flips back to
-          // working immediately. Bridge filters the resulting waiting→working
-          // emission so the supervisor doesn't get a noise notification.
-          // Skip when submit:false — without an Enter the prompt is still
-          // unanswered, so the waiting latch must stay set.
-          //
-          // notifyUserInputDelivered must run FIRST: if the agent was in
-          // `waiting`, this clears the waiting latch and emits the specific
-          // waiting→working transition with source 'user-input'. Seeding the
-          // working latch before would no-op that path.
-          this.bridge.notifyUserInputDelivered(agentId);
-          // (The BUG-23 delivered-input timestamp is stamped inside
-          // `_doSendInput` the moment the body+Enter is written — BEFORE the
-          // synchronous confirm-and-retry wait — so it can never land after
-          // the observed UserPromptSubmit hook timestamp. See the comment
-          // there.)
-          // No optimistic working-latch seed here. A send that *reports*
-          // delivery (WSL `_doSendInput` returns true unconditionally once
-          // send-keys are issued) does not prove the prompt was actually
-          // submitted — when the kitty-CSI Enter is dropped the prompt sits
-          // unentered, yet the old seed flipped status to `working` anyway.
-          // That false-working signature is exactly what the hook scaffold
-          // exists to avoid, so every lane now derives `working` from a real
-          // signal instead of a delivery guess:
-          //   - claude/codex workers (supervised or plain): UserPromptSubmit
-          //     hook → forceWorkingFromHook.
-          //   - gemini + non-worker unsupervised agents: chat-stream events /
-          //     PTY inference in status-monitor.
-          // The seed predated the worker-lane broadening and only ever masked
-          // missing-submit / missing-hook failures, so it is removed entirely.
-        }
-        return delivered;
-      });
+      .then(() => this._deliverAndConfirm(agentId, text, submit));
     this.inputQueues.set(agentId, ours);
     // Clear in-flight only when the chain has fully drained for this agent.
-    // If more sends queued behind us, they own the cleanup. The trailing
-    // `.catch` keeps this bookkeeping chain from surfacing as an unhandled
-    // rejection when a send rejects (e.g. a SubmitNotConfirmedError from the
-    // synchronous confirm-and-retry); the rejection is still delivered to the
-    // returned `ours` for the caller to observe/handle.
     void ours
       .finally(() => {
         if (this.inputQueues.get(agentId) === ours) {
@@ -6178,6 +6204,147 @@ export class AgentSupervisor extends EventEmitter {
       })
       .catch(() => undefined);
     return ours;
+  }
+
+  /** WP5 — deliver, then unify confirmation into a SendOutcome. Runs inside the
+   *  per-agent queue chain (see {@link sendInputWithOutcome}). */
+  private async _deliverAndConfirm(
+    agentId: string,
+    text: string,
+    submit: boolean,
+  ): Promise<SendOutcome> {
+    const agent = getAgent(agentId);
+    // Baselines captured BEFORE delivery so replayed/pre-existing evidence can
+    // never confirm this send (baseline-gated on both the hook clock and the
+    // session-log high-water mark).
+    const baselineStartHook = this.monitor.getLastStartHookEventAt(agentId) ?? 0;
+    const evidenceBaseline = this.turnEvidence.baseline(agentId, agent?.resumeSessionId ?? null);
+
+    const delivered = await this._doSendInput(agentId, text, submit);
+    if (!delivered) {
+      // The runner rejected/disappeared before accepting the bytes — nothing was
+      // typed. This is the ONLY `failed` path; hook/confirmation gaps never are.
+      return this.recordSendOutcome({
+        disposition: 'failed', agentId, delivered: false,
+        reason: 'delivery-failed', completedAt: Date.now(),
+      });
+    }
+
+    if (submit) {
+      // P2-03: a delivered submit answers any pending waiting-latch — clear it so
+      // status flips back to working immediately (bridge filters the noise
+      // emission for supervised agents). Must run before confirmation so a
+      // `waiting → working` flip is observable as `status` evidence too.
+      this.bridge.notifyUserInputDelivered(agentId);
+    } else {
+      // submit:false leaves the body unsubmitted (launch prefill, BUG-01). There
+      // is no turn to confirm — report a benign delivered outcome (no banner).
+      return this.recordSendOutcome({
+        disposition: 'confirmed', agentId, delivered: true, completedAt: Date.now(),
+      });
+    }
+
+    const source = await this.awaitSendConfirmation(agentId, agent, baselineStartHook, evidenceBaseline);
+    if (source) {
+      return this.recordSendOutcome({
+        disposition: 'confirmed', agentId, delivered: true,
+        confirmationSource: source, completedAt: Date.now(),
+      });
+    }
+
+    // Delivered, but no start evidence before the deadline. Run the WP4 PTY
+    // classifier so the (amber) copy can name a blocking prompt when one is up.
+    const prompt = this.classifyPtyPrompt(agentId);
+    return this.recordSendOutcome({
+      disposition: 'delivered-unconfirmed', agentId, delivered: true,
+      reason: prompt ? 'interactive-prompt' : 'confirmation-timeout',
+      prompt: prompt ? { kind: prompt.kind, label: prompt.label, excerpt: prompt.excerpt } : undefined,
+      completedAt: Date.now(),
+    });
+  }
+
+  /** WP5 — persist + broadcast a send outcome, and keep the legacy
+   *  `lastSendError` surface coherent: a `confirmed` send clears a stale error;
+   *  `delivered-unconfirmed` / `failed` do NOT set one (neither is an error the
+   *  old pollers should treat as a hard failure — that was the false "Send
+   *  failed" the plan removes). Returns the outcome for chaining. */
+  private recordSendOutcome(outcome: SendOutcome): SendOutcome {
+    updateAgentLastSend(outcome.agentId, outcome);
+    if (outcome.disposition === 'confirmed') {
+      const agent = getAgent(outcome.agentId);
+      if (agent?.lastSendError) updateAgentLastSendError(outcome.agentId, null);
+    }
+    this.emit('sendInputResult', outcome);
+    return outcome;
+  }
+
+  /** WP5 — race the three independent confirmation evidence sources. For lanes
+   *  that can confirm via hooks (healthy/unknown), the submit-only Enter re-press
+   *  recovery still runs (evidence-gated, never a body resend); its EXHAUSTION
+   *  returns `null` (→ delivered-unconfirmed), never a throw. Broken/degraded/
+   *  gemini lanes skip the re-press and just watch for evidence to the deadline.
+   *  Returns the winning source, or null when nothing confirmed in time. */
+  private async awaitSendConfirmation(
+    agentId: string,
+    agent: Agent | null,
+    baselineStartHook: number,
+    evidenceBaseline: import('./turn-evidence').TurnEvidenceBaseline,
+  ): Promise<SendOutcome['confirmationSource'] | null> {
+    // Evidence may already be present the instant we return from delivery.
+    const immediate = this.readFallbackConfirmation(agentId, baselineStartHook, evidenceBaseline);
+    if (immediate) return immediate;
+
+    if (agent && this.usesSubmitConfirmation(agent)) {
+      // Hook path + submit-only re-press across the confirm windows.
+      const confirmed = await this.monitor.confirmSubmission(agentId, baselineStartHook);
+      if (confirmed) return 'hook';
+      // Re-press exhausted — session-log/status evidence may have accrued during
+      // the wait. Never throw: an unconfirmed send is delivered-unconfirmed.
+      return this.readFallbackConfirmation(agentId, baselineStartHook, evidenceBaseline);
+    }
+
+    // Non-contract lane (broken/degraded hooks, gemini, unconfirmable codex): no
+    // re-press. Watch the hook-independent evidence to the confirmation deadline.
+    return this.pollFallbackConfirmation(agentId, baselineStartHook, evidenceBaseline);
+  }
+
+  /** WP5 — one immediate, side-effect-free read of the three evidence sources. */
+  private readFallbackConfirmation(
+    agentId: string,
+    baselineStartHook: number,
+    evidenceBaseline: import('./turn-evidence').TurnEvidenceBaseline,
+  ): SendOutcome['confirmationSource'] | null {
+    if ((this.monitor.getLastStartHookEventAt(agentId) ?? 0) > baselineStartHook) return 'hook';
+    if (this.turnEvidence.hasStartSince(agentId, evidenceBaseline)) return 'session-log';
+    if (getAgent(agentId)?.status === 'working') return 'status';
+    return null;
+  }
+
+  /** WP5 — bounded (absolute-deadline) poll of the fallback evidence for lanes
+   *  that don't re-press. Always settles at the deadline; a stale `working`
+   *  status counts as evidence only because a genuine turn also sets it. */
+  private async pollFallbackConfirmation(
+    agentId: string,
+    baselineStartHook: number,
+    evidenceBaseline: import('./turn-evidence').TurnEvidenceBaseline,
+  ): Promise<SendOutcome['confirmationSource'] | null> {
+    const deadline = Date.now() + HANDSHAKE_CONFIRM_WINDOW_MS;
+    for (;;) {
+      const source = this.readFallbackConfirmation(agentId, baselineStartHook, evidenceBaseline);
+      if (source) return source;
+      if (Date.now() >= deadline) return null;
+      await new Promise((resolve) => setTimeout(resolve, HANDSHAKE_CONFIRM_POLL_MS));
+    }
+  }
+
+  /** WP4/WP5 — classify the agent's PTY ring tail for a blocking interactive
+   *  prompt (diagnostic only: labels a delivered-unconfirmed outcome, never
+   *  drives status — that is WP7's job). Pure classifier over the ring tail. */
+  private classifyPtyPrompt(agentId: string): { kind: string; label: string; excerpt: string } | null {
+    const win = this.windowsRunners.get(agentId);
+    const tail = win ? win.getOutputRingTail() : this.wslRunners.get(agentId)?.getOutputRingTail();
+    const match = detectInteractivePrompt(tail);
+    return match ? { kind: match.kind, label: match.label, excerpt: match.excerpt } : null;
   }
 
   /**
@@ -6297,13 +6464,9 @@ export class AgentSupervisor extends EventEmitter {
 
   private async _doSendInput(agentId: string, text: string, submit: boolean = true): Promise<boolean> {
     const agent = getAgent(agentId);
-    // §2.3 PRE-SEND BASELINE — capture the start-hook timestamp BEFORE sending
-    // the body+Enter. Confirmation later requires the hook to advance PAST this
-    // value, so a fast hook that POSTs before our send is recorded can't be
-    // mistaken for a stale prior hook (which would falsely time out and
-    // re-press after a real submit). This is a real Date.now-based value, so the
-    // comparison in `confirmSubmission` is host-clock-vs-host-clock.
-    const priorStartHookAt = this.monitor.getLastStartHookEventAt(agentId) ?? 0;
+    // WP5 — pure delivery. The pre-send start-hook baseline that confirmation
+    // needs is captured by the caller (`_deliverAndConfirm`) BEFORE this runs, so
+    // it isn't re-read here.
     let delivered = false;
 
     // For WSL agents, dispatch by provider. All three providers enable the
@@ -6409,39 +6572,11 @@ export class AgentSupervisor extends EventEmitter {
     // start-hook watchdogs must not arm).
     if (submit) this.monitor.recordInputDelivered(agentId);
 
-    // Synchronous confirm-and-retry (plan §1 part 1). For contract providers,
-    // the dashboard's send path — not the caller — owns the guarantee that the
-    // prompt actually submitted. Re-press the submit-only keystroke until the
-    // UserPromptSubmit hook proves a turn started; on exhaustion raise a real
-    // error and surface it via `lastSendError`. Non-contract providers
-    // (Gemini / unconfirmable-Codex / non-hook) skip this and stay on the
-    // reactive resend / PTY inference — never throw for them.
-    if (submit && agent && this.usesSubmitConfirmation(agent)) {
-      const confirmed = await this.monitor.confirmSubmission(agentId, priorStartHookAt);
-      if (!confirmed) {
-        const message =
-          `Submit not confirmed for ${agent.provider} agent ${agentId} after ` +
-          `${MAX_SUBMIT_RETRIES} re-press attempts — no UserPromptSubmit hook ` +
-          `fired (prompt delivered but turn never started).`;
-        updateAgentLastSendError(agentId, { message, ts: Date.now() });
-        console.error(`[confirm-submit] ${message}`);
-        // Handoff handshake — wake the workspace supervisor with a
-        // handoff_failed [DASHBOARD EVENT] regardless of how this send was
-        // initiated. Fire-and-forget callers (UI chat bar, /input without
-        // confirm, orchestration scripts) never observe the throw below, and
-        // a worker whose turn never started will never emit the Stop-hook
-        // idle event the supervisor is waiting on. The bridge gates on
-        // isSupervised, so this is a no-op for plain workers.
-        void this.bridge.onHandoffFailed({
-          agent,
-          attempts: MAX_SUBMIT_RETRIES,
-          message,
-        });
-        throw new SubmitNotConfirmedError(message, agentId);
-      }
-      // Confirmed turn start — clear any stale failure surface from a prior send.
-      if (agent.lastSendError) updateAgentLastSendError(agentId, null);
-    }
+    // WP5 — `_doSendInput` is now PURE DELIVERY. Confirmation (hook + re-press +
+    // session-log + status evidence) and the three-state outcome are owned by
+    // `_deliverAndConfirm`/`awaitSendConfirmation`, so a delivered-but-unconfirmed
+    // submit is `delivered-unconfirmed`, never a thrown SubmitNotConfirmedError.
+    // A `true` here means only "the runner accepted the bytes".
     return true;
   }
 

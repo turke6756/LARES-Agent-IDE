@@ -156,16 +156,28 @@ export function registerIpcHandlers(
     // Fire-and-forget: the Windows codex/gemini path types one char at a time
     // to dodge paste-burst, so multi-KB sends take 30+ seconds. Returning the
     // delivery promise here would freeze the chat input UI for that whole
-    // window. Async failures (PTY closed mid-typing, runner removed, etc.)
-    // are surfaced to the renderer via 'agent:send-input-error' so the chat
-    // input can render them inline instead of swallowing them.
-    supervisor.sendInput(agentId, text).catch((err: Error) => {
-      console.error(`[ipc] Background input delivery to ${agentId} failed:`, err);
-      mainWindow.webContents.send('agent:send-input-error', {
-        agentId,
-        error: err.message,
+    // window. WP8 — the eventual three-state SendOutcome is surfaced to the
+    // renderer via 'agent:send-input-result' (replacing the error-only
+    // 'agent:send-input-error'); ChatInputBar renders confirmed / amber
+    // delivered-unconfirmed / red failed, always with the mandatory
+    // terminal-check guidance for the two non-confirmed states.
+    supervisor.sendInputWithOutcome(agentId, text)
+      .then((outcome) => {
+        if (!mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('agent:send-input-result', outcome);
+        }
+      })
+      .catch((err: Error) => {
+        // Eager reject (no runner) — nothing was typed; synthesize a `failed`
+        // outcome so the same surface renders it with the terminal-check text.
+        console.error(`[ipc] Background input delivery to ${agentId} failed:`, err);
+        if (!mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('agent:send-input-result', {
+            disposition: 'failed', agentId, delivered: false,
+            reason: 'delivery-failed', completedAt: Date.now(),
+          });
+        }
       });
-    });
     return { ok: true, queued: true };
   });
   ipcMain.handle('agent:check-agent-md', (_e, workingDirectory, pathType) => checkAgentMdExists(workingDirectory, pathType));
@@ -897,6 +909,15 @@ export function registerIpcHandlers(
   supervisor.on('statusChanged', (data) => {
     const agent = getAgent(data.agentId);
     emit('agent:status-changed', { ...data, agent });
+  });
+
+  // WP2 (hook-absence-resilience) — the launch canary can flip hook_status to
+  // 'broken' WITHOUT any status change, so it rides no `statusChanged`. Forward
+  // the dedicated `hookStatusChanged` as a plain agent DTO refresh so the HOOKS
+  // OFF badge (derived hooksUnavailable) lands on the card immediately.
+  supervisor.on('hookStatusChanged', ({ agentId }: { agentId: string }) => {
+    const agent = getAgent(agentId);
+    if (agent) emit('agent:status-changed', { agentId, status: agent.status, agent });
   });
 
   // Forward agent deletions so the cross-workspace status map (sidebar waiting

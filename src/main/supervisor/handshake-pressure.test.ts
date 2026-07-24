@@ -28,6 +28,7 @@ import { makeAgent } from './test-helpers/fake-bridge-deps';
 import { makeStatusMonitorFakes, patchDatabaseModule } from './test-helpers/fake-status-deps';
 import {
   MAX_SUBMIT_RETRIES, CONFIRM_WINDOW_FIRST_MS, CONFIRM_WINDOW_RETRY_MS,
+  HANDSHAKE_CONFIRM_WINDOW_MS,
 } from '../../shared/constants';
 import type { Agent, AgentStatus } from '../../shared/types';
 
@@ -48,6 +49,7 @@ function patchDb(agentsMap: Map<string, Agent>): () => void {
   const db = require('../database') as Record<string, unknown>;
   const keys = [
     'updateAgentStatus', 'applyStatusTransition', 'updateAgentHookStatus', 'updateAgentLastSendError',
+    'updateAgentLastSend',
     'updateAgentPid', 'getAgent', 'addEvent', 'updateAgentLastOutput',
     'updateAgentExitCode', 'getActiveAgents', 'getAllAgents',
     'getSupervisorAgent', 'addFileActivity',
@@ -63,6 +65,10 @@ function patchDb(agentsMap: Map<string, Agent>): () => void {
   db.updateAgentLastSendError = (id: string, err: { message: string; ts: number } | null) => {
     const a = agentsMap.get(id);
     if (a) a.lastSendError = err;
+  };
+  db.updateAgentLastSend = (id: string, outcome: Agent['lastSend']) => {
+    const a = agentsMap.get(id);
+    if (a) a.lastSend = outcome;
   };
   db.updateAgentPid = () => {};
   db.getAgent = (id: string) => agentsMap.get(id) ?? null;
@@ -178,6 +184,96 @@ test('PROBE-H1 sendInputConfirmed: a pre-existing working status confirms a subm
 });
 
 // ═════════════════════════════════════════════════════════════════════
+// WP5 evidence matrix at the sendInputConfirmed (layer 3) seam.
+//
+// The dead-hook behavior is now UNIFIED across lanes (VM report §6 fix):
+//   • supervisor/contract target, hooks dead → the re-press exhausts but the
+//     send NO LONGER throws; sendInputConfirmed resolves
+//     { delivered:true, confirmed:false, mode:'unconfirmed' }.
+//   • worker target with the SAME dead hooks (hook_status='broken') → same
+//     unconfirmed resolution.
+//   • no runner accepted the bytes → still REJECTS with a delivery-failed error
+//     (the ONLY reject — nothing was typed).
+// ═════════════════════════════════════════════════════════════════════
+test('WP5-H supervisor target, dead hooks → sendInputConfirmed resolves unconfirmed (NO reject)', async () => {
+  const agent = makeAgent('wp1h-sup', {
+    provider: 'claude', isSupervisor: true, isWorker: false, isSupervised: false,
+    status: 'idle', hookStatus: 'unknown', command: 'claude', workingDirectory: 'C:\\tmp',
+  });
+  // confirmResults:[false] → the re-press exhausts; the send resolves delivered-
+  // unconfirmed (no throw) and the layer-3 poll then reports unconfirmed.
+  const h = setupSupervisor({ agent, confirmResults: [false] });
+  // Fast-forward the layer-3 confirm-poll deadline (monotonic jump, as in the
+  // worker case below) so the unconfirmed branch is reached without the real
+  // 15 s wall-clock wait.
+  const realNow = Date.now;
+  let clock = 1_000_000;
+  const step = HANDSHAKE_CONFIRM_WINDOW_MS * 10;
+  (global as unknown as { Date: { now: () => number } }).Date.now = () => { clock += step; return clock; };
+  try {
+    const result = await h.supervisor.sendInputConfirmed(agent.id, 'hi');
+    assert.deepEqual(result, { delivered: true, confirmed: false, mode: 'unconfirmed' },
+      'a contract target with dead hooks now resolves unconfirmed — never rejects (VM §6 unified)');
+  } finally {
+    (global as unknown as { Date: { now: () => number } }).Date.now = realNow;
+    h.cleanup();
+  }
+});
+
+test('WP1-H worker target, SAME dead hooks (broken) → resolves delivered+unconfirmed (no reject)', async () => {
+  const agent = makeAgent('wp1h-wrk', {
+    provider: 'claude', isWorker: true, isSupervised: true, status: 'idle',
+    hookStatus: 'broken', command: 'claude', workingDirectory: 'C:\\tmp',
+  });
+  // confirmResults never consumed — usesSubmitConfirmation is false for broken.
+  const h = setupSupervisor({ agent, confirmResults: [false] });
+  // Force the confirm-poll deadline to expire quickly so the unconfirmed branch
+  // is reached without the real 15 s wall-clock wait. A MONOTONIC stub (each
+  // call jumps far forward) is robust no matter how many Date.now calls the
+  // send path makes before the deadline is computed — within two iterations the
+  // clock has passed any deadline of HANDSHAKE_CONFIRM_WINDOW_MS.
+  const realNow = Date.now;
+  let clock = 1_000_000;
+  const step = HANDSHAKE_CONFIRM_WINDOW_MS * 10;
+  (global as unknown as { Date: { now: () => number } }).Date.now = () => {
+    clock += step;
+    return clock;
+  };
+  try {
+    const result = await h.supervisor.sendInputConfirmed(agent.id, 'hi');
+    assert.deepEqual(result, { delivered: true, confirmed: false, mode: 'unconfirmed' },
+      'the broken worker delivers but cannot confirm — resolves, never rejects');
+  } finally {
+    (global as unknown as { Date: { now: () => number } }).Date.now = realNow;
+    h.cleanup();
+  }
+});
+
+test('WP1-H runner present but not alive → sendInputConfirmed REJECTS (delivery-failed)', async () => {
+  const agent = makeAgent('wp1h-dead', {
+    provider: 'claude', isWorker: true, isSupervised: true, status: 'idle',
+    hookStatus: 'broken', command: 'claude', workingDirectory: '/home/test',
+    tmuxSessionName: 'agent-wp1h-dead',
+  });
+  const h = setupSupervisor({ agent, confirmResults: [true] });
+  // Swap the injected (alive) windows runner for a dead WSL runner: the runner
+  // EXISTS (so sendInput's eager no-runner guard passes) but reports not-alive,
+  // so _doSendInput returns delivered:false and sendInputConfirmed raises the
+  // delivery-failed coded error — the "nothing was typed" path.
+  (h.supervisor as unknown as { windowsRunners: Map<string, unknown> }).windowsRunners.delete(agent.id);
+  (h.supervisor as unknown as { wslRunners: Map<string, unknown> }).wslRunners.set(agent.id, { isAlive: false });
+  try {
+    await assert.rejects(
+      () => h.supervisor.sendInputConfirmed(agent.id, 'hi'),
+      (err: unknown) => err instanceof Error && (err as { code?: string }).code === 'delivery-failed',
+      'a not-alive runner rejects with a delivery-failed code — nothing was typed',
+    );
+  } finally {
+    h.cleanup();
+  }
+});
+
+// ═════════════════════════════════════════════════════════════════════
 // PROBE-H2 — a hook landing after confirm exhaustion is never reconciled:
 //            the handshake reports a hard failure for a turn that started
 //
@@ -249,19 +345,18 @@ test('PROBE-H2 confirmSubmission: hook arriving past the 7.6s exhaustion budget 
 // Esc / Ctrl+U per provider) before allowing the next queued send, or surface
 // a composer-dirty flag the caller must acknowledge.
 // ═════════════════════════════════════════════════════════════════════
-test('PROBE-H3 sendInput: a send after a confirm-exhausted send pastes a second body with no composer clear in between', async () => {
+test('PROBE-H3 sendInput: a send after an unconfirmed send pastes a second body with no composer clear in between', async () => {
   const h = setupSupervisor({
     agent: makeClaudeWorker('h3-worker'),
-    confirmResults: [false, true],   // send #1 exhausts; send #2 confirms
+    confirmResults: [false, true],   // send #1 exhausts (unconfirmed); send #2 confirms
   });
   try {
-    await assert.rejects(
-      () => h.supervisor.sendInput(h.agent.id, 'FIRST BODY', { submit: true }),
-      (err: unknown) => err instanceof SubmitNotConfirmedError,
-      'send #1 fails the handshake (body typed, turn never started)',
-    );
+    // WP5 — send #1 no longer throws; it delivers unconfirmed (body typed, turn
+    // never confirmed). The composer is still the likely holder of body #1.
+    const delivered1 = await h.supervisor.sendInput(h.agent.id, 'FIRST BODY', { submit: true });
+    assert.equal(delivered1, true, 'send #1 delivered (unconfirmed) — no throw under WP5');
     const ok = await h.supervisor.sendInput(h.agent.id, 'SECOND BODY', { submit: true });
-    assert.equal(ok, true, 'queue un-poisoned: send #2 proceeds normally');
+    assert.equal(ok, true, 'send #2 proceeds normally');
 
     const idx1 = h.writes.findIndex((w) => w.includes('FIRST BODY'));
     const idx2 = h.writes.findIndex((w) => w.includes('SECOND BODY'));
@@ -315,27 +410,25 @@ test('INVARIANT-H4 deliverToSupervisor: an unconfirmed send retries then returns
 });
 
 // ═════════════════════════════════════════════════════════════════════
-// INVARIANT-H5 — confirm exhaustion must throw SubmitNotConfirmedError, set
-// lastSendError, and wake the supervisor with handoff_failed. This is the
-// handshake's whole reason to exist; if any leg regresses, a dead handoff is
-// silent again.
+// INVARIANT-H5 (WP5) — re-press exhaustion is NOT a failure. The send resolves
+// delivered-unconfirmed: it does NOT throw, does NOT set the legacy
+// lastSendError, and does NOT auto-fire handoff_failed (hook absence is never a
+// hard failure — VM §6). The persisted lastSend records the delivered-unconfirmed
+// outcome so pollers can still see the confirmation gap.
 // ═════════════════════════════════════════════════════════════════════
-test('INVARIANT-H5 exhaustion: throws SubmitNotConfirmedError + sets lastSendError + emits handoff_failed', async () => {
+test('INVARIANT-H5 (WP5) exhaustion: delivered-unconfirmed — no throw, no lastSendError, no handoff_failed', async () => {
   const h = setupSupervisor({
     agent: makeClaudeWorker('h5-worker'),
     confirmResults: [false],
   });
   try {
-    await assert.rejects(
-      () => h.supervisor.sendInput(h.agent.id, 'hello', { submit: true }),
-      (err: unknown) => err instanceof SubmitNotConfirmedError
-        && (err as SubmitNotConfirmedError).agentId === h.agent.id,
-    );
-    assert.ok(h.agent.lastSendError && /Submit not confirmed/.test(h.agent.lastSendError.message),
-      'lastSendError persisted');
-    assert.equal(h.handoffFailures.length, 1, 'handoff_failed emitted exactly once');
-    assert.equal(h.handoffFailures[0].agentId, h.agent.id);
-    assert.equal(h.handoffFailures[0].attempts, MAX_SUBMIT_RETRIES);
+    const outcome = await h.supervisor.sendInputWithOutcome(h.agent.id, 'hello', { submit: true });
+    assert.equal(outcome.disposition, 'delivered-unconfirmed', 'exhausted re-press → delivered-unconfirmed');
+    assert.equal(outcome.delivered, true);
+    assert.ok(!h.agent.lastSendError, 'no legacy lastSendError set for a delivered-unconfirmed send');
+    assert.equal(h.handoffFailures.length, 0, 'delivered-unconfirmed does NOT auto-fire handoff_failed');
+    assert.ok(h.agent.lastSend && h.agent.lastSend.disposition === 'delivered-unconfirmed',
+      'the outcome is persisted via updateAgentLastSend');
   } finally {
     h.cleanup();
   }

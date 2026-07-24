@@ -503,8 +503,21 @@ export class EventBridge {
         //
         // Gemini has no hook scaffold, so it falls through to the chat-stream
         // below as its only working/idle signal (it never reaches `waiting`).
-        if ((agent.isSupervised || agent.isWorker || agent.isSupervisor || agent.isResearcher)
-            && agent.provider !== 'gemini') {
+        //
+        // WP7 (hook-absence-resilience) — the skip is now hook-health
+        // CONDITIONAL. When the hooks are actually LIVE, they own status and the
+        // chat-stream must not race them (skip). But when the launch canary
+        // proved the scaffold dead (`hooksUnavailable`), these lanes get NO
+        // working/idle from hooks — so fall through to the same transcript switch
+        // gemini uses (non-terminal assistant-text/thinking/tool-use →
+        // forceWorking; turnComplete → forceIdle). A transcript question still
+        // must NOT become `waiting` — that stays reserved for a Notification hook
+        // (WP7 drives waiting from the PTY classifier in status-monitor instead).
+        // Turn-START evidence for send confirmation (WP3) is recorded upstream in
+        // the supervisor's chat-events handler regardless of this skip.
+        const hookOwned = (agent.isSupervised || agent.isWorker || agent.isSupervisor || agent.isResearcher)
+          && agent.provider !== 'gemini';
+        if (hookOwned && !agent.hooksUnavailable) {
           continue;
         }
 

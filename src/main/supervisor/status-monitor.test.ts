@@ -1672,6 +1672,30 @@ test('canary: marks hook_status=broken after the window with no hook event', asy
   }
 });
 
+test('canary: WP2 — the broken flip emits hookStatusChanged for a DTO refresh', async () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeAgent('cw-hsc', { provider: 'claude', isSupervised: true, status: 'idle' });
+    const monitor = makeMonitor({ fakes, agent });
+    const emitted: Array<{ agentId: string }> = [];
+    monitor.on('hookStatusChanged', (d) => emitted.push(d));
+
+    monitor.recordHookCanary(agent.id, fakes.now.value);
+    fakes.now.value += HOOK_CANARY_WINDOW_MS + 100;
+    await poll(monitor);
+
+    assert.equal(emitted.length, 1, 'exactly one hookStatusChanged on the broken flip');
+    assert.equal(emitted[0].agentId, agent.id);
+
+    // Idempotent: a second poll neither re-flips nor re-emits.
+    await poll(monitor);
+    assert.equal(emitted.length, 1, 'no duplicate hookStatusChanged after disarm');
+  } finally {
+    restore();
+  }
+});
+
 test('canary: a hook event before the window disarms it → never marked broken', async () => {
   const fakes = makeStatusMonitorFakes();
   const restore = patchDatabaseModule(fakes);
@@ -2014,6 +2038,89 @@ test('P1 tick ordering: a throwing transport poller never breaks the poll loop',
       'per-agent work (settle promotion) still ran despite the poller throwing');
   } finally {
     console.warn = origWarn;
+    restore();
+  }
+});
+
+// ── WP7 (hook-absence-resilience) — launch resolution + ongoing PTY waiting ──
+
+test('WP7: canary-broken while launching → promoteFromLaunching(hook-canary-degraded) to idle (no prompt)', async () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeAgent('wp7-launch', { provider: 'claude', isWorker: true, status: 'launching', hookStatus: 'unknown' });
+    const monitor = makeMonitor({ fakes, agent }); // empty ring tail → no prompt
+    monitor.recordHookCanary(agent.id, fakes.now.value);
+    fakes.now.value += HOOK_CANARY_WINDOW_MS + 100;
+    await poll(monitor);
+
+    assert.equal(fakes.hookUpdates[0]?.hookStatus, 'broken', 'canary flips hook_status broken');
+    assert.equal(agent.status, 'idle', 'the stuck launching spinner is resolved to idle');
+    assert.ok(fakes.updates.some((u) => u.agentId === agent.id && u.status === 'idle'),
+      'promoteFromLaunching wrote idle');
+    assert.equal(monitor.getWaitingKind(agent.id), null, 'no blocking prompt → not waiting');
+  } finally {
+    restore();
+  }
+});
+
+test('WP7: canary-broken while launching AT a trust dialog → launching→idle→waiting(approve)', async () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeAgent('wp7-trust', { provider: 'claude', isWorker: true, status: 'launching', hookStatus: 'unknown' });
+    const ringTails = new Map<string, string>([[agent.id, 'Do you trust the files in this folder?\n❯ 1. Yes  2. No']]);
+    const monitor = makeMonitor({ fakes, agent, ringTails });
+    monitor.recordHookCanary(agent.id, fakes.now.value);
+    fakes.now.value += HOOK_CANARY_WINDOW_MS + 100;
+    await poll(monitor);
+
+    assert.equal(agent.status, 'waiting', 'a launch blocked on a trust dialog reads waiting, not a false idle');
+    assert.equal(monitor.getWaitingKind(agent.id), 'approve', 'trust-dialog maps to the approve WaitingKind');
+    const waitingEmit = fakes.emissions.find((e) => e.status === 'waiting');
+    assert.ok(waitingEmit, 'a waiting statusChanged was emitted');
+  } finally {
+    restore();
+  }
+});
+
+test('WP7: ongoing PTY waiting for a hooks-unavailable agent — stable prompt over two polls → waiting', async () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeAgent('wp7-pty', {
+      provider: 'claude', isWorker: true, status: 'idle', hookStatus: 'broken', hooksUnavailable: true,
+    });
+    const ringTails = new Map<string, string>([[agent.id, 'Do you trust the files in this folder?']]);
+    const monitor = makeMonitor({ fakes, agent, ringTails });
+
+    // First poll records the signature but does not yet drive (stability gate).
+    await poll(monitor);
+    assert.notEqual(agent.status, 'waiting', 'first sighting must not drive status');
+    // Second poll with the same signature drives waiting.
+    await poll(monitor);
+    assert.equal(agent.status, 'waiting', 'a stable prompt over two polls drives waiting');
+    assert.equal(monitor.getWaitingKind(agent.id), 'approve');
+  } finally {
+    restore();
+  }
+});
+
+test('WP7: ongoing PTY waiting is a NO-OP for a healthy hook-owned agent (regression guard)', async () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeAgent('wp7-healthy', {
+      provider: 'claude', isWorker: true, status: 'idle', hookStatus: 'healthy', hooksUnavailable: false,
+    });
+    const ringTails = new Map<string, string>([[agent.id, 'Do you trust the files in this folder?']]);
+    const monitor = makeMonitor({ fakes, agent, ringTails });
+
+    await poll(monitor);
+    await poll(monitor);
+    assert.equal(agent.status, 'idle', 'healthy hooks own status — the classifier must not drive waiting');
+    assert.equal(monitor.getWaitingKind(agent.id), null);
+  } finally {
     restore();
   }
 });

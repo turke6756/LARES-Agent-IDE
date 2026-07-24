@@ -2,6 +2,7 @@ import http from 'http';
 import type { AddressInfo } from 'net';
 import { URL } from 'url';
 import { getApiToken, decideApiAccess } from './security/api-auth';
+import { sendOutcomeMessage } from '../shared/send-outcome-copy';
 import { workspaceStateDir } from './workspace-state-dir';
 import type { AgentSupervisor } from './supervisor';
 import {
@@ -1055,7 +1056,17 @@ export class ApiServer {
       if (confirm === true && submit !== false) {
         try {
           const result = await this.supervisor.sendInputConfirmed(agentId, text);
-          return { ok: true, agentId, submit: true, ...result, transientSubscription };
+          // WP8 — bytes were accepted (delivery-failed would have thrown below),
+          // so an unconfirmed turn start is `delivered-unconfirmed`, NOT a
+          // failure: HTTP 200, plus the mandatory terminal-check guidance so an
+          // MCP/HTTP caller relays the same instruction every other surface does.
+          const message = result.confirmed
+            ? undefined
+            : sendOutcomeMessage({
+                disposition: 'delivered-unconfirmed', agentId, delivered: true,
+                reason: 'confirmation-timeout', completedAt: Date.now(),
+              }).text;
+          return { ok: true, agentId, submit: true, ...result, message, transientSubscription };
         } catch (err) {
           // A delivery/confirm throw means no turn will start — drop the
           // just-registered subscription so it can't consume an unrelated idle.

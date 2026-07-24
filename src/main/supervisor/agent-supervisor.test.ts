@@ -59,6 +59,7 @@ function patchDb(agentsMap: Map<string, Agent>): () => void {
     'updateAgentStatus', 'applyStatusTransition',
     'updateAgentHookStatus',
     'updateAgentLastSendError',
+    'updateAgentLastSend',
     'updateAgentPid',
     'getAgent',
     'addEvent',
@@ -95,6 +96,11 @@ function patchDb(agentsMap: Map<string, Agent>): () => void {
   ) => {
     const a = agentsMap.get(id);
     if (a) a.lastSendError = err;
+  };
+  // WP5 — the unified SendOutcome persistence; mirror it onto the fixture.
+  db.updateAgentLastSend = (id: string, outcome: Agent['lastSend']) => {
+    const a = agentsMap.get(id);
+    if (a) a.lastSend = outcome;
   };
   db.updateAgentPid = () => {};
   db.getAgent = (id: string) => agentsMap.get(id) ?? null;
@@ -204,6 +210,12 @@ function setup(opts: {
     calls.push('confirmSubmission');
     return opts.confirmResult !== false;
   };
+  // WP5 — the non-contract (broken/gemini) lane's fallback-evidence poll waits on
+  // the real wall-clock in production. Stub it to resolve immediately (no
+  // confirmation) so these tests stay fast; the immediate readFallbackConfirmation
+  // still runs before it, so a `working` fixture confirms via 'status' without it.
+  (supervisor as unknown as { pollFallbackConfirmation: () => Promise<null> })
+    .pollFallbackConfirmation = async () => null;
 
   return {
     supervisor,
@@ -1203,24 +1215,24 @@ test('usesSubmitConfirmation matrix: claude worker yes; broken no; codex needs o
   }
 });
 
-test('Case 10: confirm exhaustion on a contract claude worker throws + sets lastSendError; no notify', async () => {
+test('Case 10 (WP5): re-press exhaustion on a contract claude worker → delivered-unconfirmed, NO throw', async () => {
   const agent = makeAgent('cc-fail', {
     provider: 'claude', status: 'idle', isWorker: true,
     command: 'claude', workingDirectory: 'C:\\tmp',
   });
   const h = setup({ agent, injectRunner: 'windows', alive: true, confirmResult: false });
   try {
-    await assert.rejects(
-      () => h.supervisor.sendInput(agent.id, 'hi', { submit: true }),
-      (err: unknown) => err instanceof SubmitNotConfirmedError && (err as SubmitNotConfirmedError).agentId === agent.id,
-      'exhausted confirm rejects with SubmitNotConfirmedError carrying the agent id',
-    );
-    assert.ok(h.calls.includes('confirmSubmission'), 'the contract path engaged');
-    assert.ok(agent.lastSendError && /Submit not confirmed/.test(agent.lastSendError.message),
-      `lastSendError persisted on exhaustion; got ${JSON.stringify(agent.lastSendError)}`);
-    assert.ok(typeof agent.lastSendError?.ts === 'number', 'lastSendError carries a ts');
-    assert.ok(!seedCalls(h.calls).includes('notifyUserInputDelivered'),
-      'a failed submit must not run the delivered-side-effects');
+    // WP5 — the send no longer throws; an exhausted re-press is delivered-unconfirmed.
+    const outcome = await h.supervisor.sendInputWithOutcome(agent.id, 'hi', { submit: true });
+    assert.equal(outcome.disposition, 'delivered-unconfirmed',
+      'exhausted re-press resolves delivered-unconfirmed, not a throw');
+    assert.equal(outcome.delivered, true);
+    assert.ok(h.calls.includes('confirmSubmission'), 'the re-press path engaged');
+    // Delivered — the waiting→working side-effect still runs (bytes reached the PTY).
+    assert.ok(seedCalls(h.calls).includes('notifyUserInputDelivered'),
+      'a delivered (if unconfirmed) submit still runs the delivered-side-effects');
+    assert.ok(!agent.lastSendError,
+      'delivered-unconfirmed does NOT set the legacy lastSendError (it is not a hard failure)');
   } finally {
     h.cleanup();
   }
@@ -1294,6 +1306,140 @@ test('Case 12: gemini worker never enters the confirm path (no throw, normal del
   } finally {
     h.cleanup();
   }
+});
+
+// ── WP1: hook-absence send-outcome matrix (CHARACTERIZATION) ──────────
+// Locks the CURRENT (pre-WP5) send behavior for a claude agent whose hooks are
+// dead, across a supervisor-lane and a worker-lane target. These tests document
+// the deterministic asymmetry root-caused in plans/hook-absence-resilience.md §1:
+// the same "hooks never delivered" reality resolves to a THROWN
+// SubmitNotConfirmedError for a supervisor target (hook_status stayed 'unknown',
+// contract path engaged, confirm exhausted) but a SILENT success for a worker
+// target (canary flipped hook_status to 'broken', so usesSubmitConfirmation is
+// false and the confirm path is skipped entirely).
+//
+// TODO(WP5): both targets must resolve to a single `delivered-unconfirmed`
+// disposition for identical evidence. When WP5 lands, these assertions flip from
+// "documents the defect" to "asserts the unified outcome" (see plan §WP5 tests).
+
+test('WP5 matrix: bytes accepted + start hook arrives → confirmed (source hook)', async () => {
+  const agent = makeAgent('wp5-confirmed', {
+    provider: 'claude', status: 'idle', isSupervisor: true,
+    command: 'claude', workingDirectory: 'C:\\tmp',
+  });
+  // confirmResult:true models the start hook (or a turn) arriving before the deadline.
+  const h = setup({ agent, injectRunner: 'windows', alive: true, confirmResult: true });
+  try {
+    const outcome = await h.supervisor.sendInputWithOutcome(agent.id, 'hi', { submit: true });
+    assert.equal(outcome.disposition, 'confirmed', 'a hook-confirmed send is confirmed');
+    assert.equal(outcome.delivered, true);
+    assert.equal(outcome.confirmationSource, 'hook');
+    assert.ok(h.calls.includes('confirmSubmission'), 'the re-press/hook path engaged for the supervisor lane');
+    assert.ok(!agent.lastSendError, 'a confirmed send leaves no lastSendError');
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('WP5 matrix (UNIFIED): supervisor target with dead hooks → delivered-unconfirmed (NO throw)', async () => {
+  // hook_status 'unknown' (contract lane) → the re-press runs and exhausts, but
+  // the send is now delivered-unconfirmed, never a thrown SubmitNotConfirmedError.
+  const agent = makeAgent('wp5-sup-dead', {
+    provider: 'claude', status: 'idle', isSupervisor: true, hookStatus: 'unknown',
+    command: 'claude', workingDirectory: 'C:\\tmp',
+  });
+  const h = setup({ agent, injectRunner: 'windows', alive: true, confirmResult: false });
+  try {
+    assert.equal(h.supervisor.usesSubmitConfirmation(agent), true,
+      'supervisor-lane claude with unknown hooks still ATTEMPTS the re-press');
+    const outcome = await h.supervisor.sendInputWithOutcome(agent.id, 'hi', { submit: true });
+    assert.equal(outcome.disposition, 'delivered-unconfirmed',
+      'dead hooks on a supervisor target no longer throw — delivered-unconfirmed');
+    assert.equal(outcome.delivered, true);
+    assert.ok(h.calls.includes('confirmSubmission'), 'the re-press path engaged');
+    assert.ok(!agent.lastSendError, 'delivered-unconfirmed is NOT surfaced as a hard error');
+    assert.ok(agent.lastSend && agent.lastSend.disposition === 'delivered-unconfirmed',
+      'the outcome is persisted via updateAgentLastSend');
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('WP5 matrix (UNIFIED): worker target with the SAME dead-hook evidence → delivered-unconfirmed', async () => {
+  // Broken hooks (non-contract) → the re-press is skipped, but the fallback
+  // evidence poll finds nothing, so the outcome is the SAME as the supervisor
+  // lane: delivered-unconfirmed. No more silent success.
+  const agent = makeAgent('wp5-wrk-dead', {
+    provider: 'claude', status: 'idle', isWorker: true, hookStatus: 'broken',
+    command: 'claude', workingDirectory: 'C:\\tmp',
+  });
+  const h = setup({ agent, injectRunner: 'windows', alive: true, confirmResult: false });
+  try {
+    assert.equal(h.supervisor.usesSubmitConfirmation(agent), false,
+      'worker-lane claude with broken hooks skips the re-press');
+    const outcome = await h.supervisor.sendInputWithOutcome(agent.id, 'hi', { submit: true });
+    assert.equal(outcome.disposition, 'delivered-unconfirmed',
+      'the broken worker now surfaces the delivery gap as delivered-unconfirmed');
+    assert.equal(outcome.delivered, true);
+    assert.ok(!h.calls.includes('confirmSubmission'), 'the broken worker skips the re-press path');
+    assert.ok(agent.lastSend && agent.lastSend.disposition === 'delivered-unconfirmed',
+      'the outcome is persisted');
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('WP5 matrix: runner disappears before accepting bytes → disposition failed, delivered=false', async () => {
+  // alive:false makes _doSendInput return false without delivering — the ONLY
+  // `failed` path (a hook/confirmation gap is never `failed`).
+  const agent = makeAgent('wp5-dead-runner', {
+    provider: 'claude', status: 'idle', isWorker: true,
+    command: 'claude', workingDirectory: '/home/test', tmuxSessionName: 'agent-wp5',
+  });
+  const h = setup({ agent, injectRunner: 'wsl', alive: false, confirmResult: false });
+  try {
+    const outcome = await h.supervisor.sendInputWithOutcome(agent.id, 'hi', { submit: true });
+    assert.equal(outcome.disposition, 'failed', 'a rejected/disappeared runner → failed');
+    assert.equal(outcome.delivered, false);
+    assert.equal(outcome.reason, 'delivery-failed');
+    assert.ok(!h.calls.includes('confirmSubmission'), 'no confirm attempt on an undelivered send');
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('WP5 matrix (UNIFIED summary): identical dead-hook evidence → both lanes delivered-unconfirmed', async () => {
+  // The regression lock, flipped: run the two lanes side-by-side with byte-for-
+  // byte identical evidence (delivered bytes, no confirmation) and assert they
+  // now produce the SAME disposition — the VM §6 asymmetry is gone.
+  const sup = makeAgent('wp5-sum-sup', {
+    provider: 'claude', status: 'idle', isSupervisor: true, hookStatus: 'unknown',
+    command: 'claude', workingDirectory: 'C:\\tmp',
+  });
+  const hSup = setup({ agent: sup, injectRunner: 'windows', alive: true, confirmResult: false });
+  let supDisposition: string | undefined;
+  try {
+    supDisposition = (await hSup.supervisor.sendInputWithOutcome(sup.id, 'hi', { submit: true })).disposition;
+  } finally {
+    hSup.cleanup();
+  }
+
+  const wrk = makeAgent('wp5-sum-wrk', {
+    provider: 'claude', status: 'idle', isWorker: true, hookStatus: 'broken',
+    command: 'claude', workingDirectory: 'C:\\tmp',
+  });
+  const hWrk = setup({ agent: wrk, injectRunner: 'windows', alive: true, confirmResult: false });
+  let wrkDisposition: string | undefined;
+  try {
+    wrkDisposition = (await hWrk.supervisor.sendInputWithOutcome(wrk.id, 'hi', { submit: true })).disposition;
+  } finally {
+    hWrk.cleanup();
+  }
+
+  assert.equal(supDisposition, 'delivered-unconfirmed', 'supervisor lane → delivered-unconfirmed');
+  assert.equal(wrkDisposition, 'delivered-unconfirmed', 'worker lane → delivered-unconfirmed');
+  assert.equal(supDisposition, wrkDisposition,
+    'identical evidence now yields identical dispositions across lanes (VM §6 unified)');
 });
 
 // ── Researcher role-lane launch arg-set (WP-B STEP 5) ────────────────

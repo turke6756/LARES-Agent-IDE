@@ -3,7 +3,7 @@ import path from 'path';
 import fs from 'fs';
 import crypto from 'crypto';
 import { v4 as uuidv4 } from 'uuid';
-import { AgentStopReason, isAgentStopReason, parseStopReason, PersistedAgentStatus } from '../shared/types';
+import { AgentStopReason, deriveHookAvailability, isAgentStopReason, parseStopReason, PersistedAgentStatus } from '../shared/types';
 import { Agent, AgentProvider, AgentSessionRow, AgentStatus, AgentTemplate, CreateAgentTemplateInput, CreateSelectionCommentInput, CreateWorkspaceInput, CreateTeamInput, FileActivity, FileOperation, Plan, PlanFormat, RepoActivityEvidenceV1, SelectionComment, SelectionCommentStatus, SupervisorFocus, Team, TeamChannel, TeamMember, TeamMessage, TeamMessageStatus, TeamStatus, TeamTask, TeamTaskStatus, UpdateSelectionCommentInput, Workspace } from '../shared/types';
 import { parsePdfSelectionAnchor, serializePdfSelectionAnchor, validatePdfSelectionAnchor, type PdfSelectionAnchorV1, type SelectionAnchorType } from '../shared/pdf-annotations';
 import { DEFAULT_COMMAND, DEFAULT_COMMAND_WSL, SUPERVISOR_AGENT_MD } from '../shared/constants';
@@ -847,6 +847,10 @@ export function initDatabase(): void {
   // `{message,ts}` or NULL; set when confirm-and-retry exhausts, cleared on a
   // confirmed submit. Read projection only — never gates status.
   try { db.exec(`ALTER TABLE agents ADD COLUMN last_send_error TEXT`); } catch { /* exists */ }
+  // WP5 (hook-absence-resilience) — the unified three-state SendOutcome of the
+  // most recent submit (JSON blob or NULL). Supersedes last_send_error as
+  // consumers migrate; read projection only, never gates status.
+  try { db.exec(`ALTER TABLE agents ADD COLUMN last_send TEXT`); } catch { /* exists */ }
   // Migration: add is_worker to agent_templates (default 1 — worker is the
   // default lane for user-launched claude/codex agents).
   try { db.exec(`ALTER TABLE agent_templates ADD COLUMN is_worker INTEGER NOT NULL DEFAULT 1`); } catch { /* exists */ }
@@ -1492,6 +1496,24 @@ function parseLastSendError(raw: unknown): Agent['lastSendError'] {
   return null;
 }
 
+/** WP5 — decode the `last_send` JSON blob into the typed SendOutcome field. */
+function parseLastSend(raw: unknown): Agent['lastSend'] {
+  if (typeof raw !== 'string' || raw.length === 0) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (
+      parsed &&
+      typeof parsed.disposition === 'string' &&
+      typeof parsed.agentId === 'string' &&
+      typeof parsed.delivered === 'boolean' &&
+      typeof parsed.completedAt === 'number'
+    ) {
+      return parsed as NonNullable<Agent['lastSend']>;
+    }
+  } catch { /* fall through */ }
+  return null;
+}
+
 function rowToAgent(row: any): Agent {
   return {
     id: row.id,
@@ -1514,8 +1536,13 @@ function rowToAgent(row: any): Agent {
     resumeSessionId: row.resume_session_id,
     status: row.status as AgentStatus,
     hookStatus: (row.hook_status || 'unknown') as Agent['hookStatus'],
+    // WP2 (hook-absence-resilience) — DERIVED from hook_status (still the sole
+    // authority; no new column). 'broken'/'degraded' → hooksUnavailable, with a
+    // distinct reason for the card badge tooltip.
+    ...deriveHookAvailability((row.hook_status || 'unknown') as Agent['hookStatus']),
     lastHookEventAt: row.last_hook_event_at ?? undefined,
     lastSendError: parseLastSendError(row.last_send_error),
+    lastSend: parseLastSend(row.last_send),
     isAttached: !!row.is_attached,
     restartCount: row.restart_count,
     // Inc 4: continuation handoff generation (distinct from restart_count).
@@ -2844,6 +2871,19 @@ export function updateAgentLastSendError(
   run(
     "UPDATE agents SET last_send_error = ?, updated_at = datetime('now') WHERE id = ?",
     [err ? JSON.stringify(err) : null, id],
+  );
+}
+
+/** WP5 — persist the unified SendOutcome for an agent (or clear it with null).
+ *  A later `confirmed` outcome supersedes a prior `delivered-unconfirmed`; the
+ *  caller owns that ordering. Read projection only — never gates status. */
+export function updateAgentLastSend(
+  id: string,
+  outcome: import('../shared/types').SendOutcome | null,
+): void {
+  run(
+    "UPDATE agents SET last_send = ?, updated_at = datetime('now') WHERE id = ?",
+    [outcome ? JSON.stringify(outcome) : null, id],
   );
 }
 

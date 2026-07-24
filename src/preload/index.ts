@@ -61,6 +61,14 @@ const api: IpcApi = {
       ipcRenderer.on('agent:send-input-error', listener);
       return () => ipcRenderer.removeListener('agent:send-input-error', listener);
     },
+    // WP8 — the three-state SendOutcome for a chat send (confirmed /
+    // delivered-unconfirmed / failed). Supersedes onSendInputError for the chat
+    // input; the comments path still rides the error-only channel above.
+    onSendInputResult: (callback) => {
+      const listener = (_event: any, outcome: import('../shared/types').SendOutcome) => callback(outcome);
+      ipcRenderer.on('agent:send-input-result', listener);
+      return () => ipcRenderer.removeListener('agent:send-input-result', listener);
+    },
     getSupervisor: (workspaceId) => ipcRenderer.invoke('agent:get-supervisor', workspaceId),
     updateSupervised: (id, supervised) => ipcRenderer.invoke('agent:update-supervised', id, supervised),
     setContinuationEnabled: (agentId, enabled) => ipcRenderer.invoke('agent:set-continuation-enabled', agentId, enabled),

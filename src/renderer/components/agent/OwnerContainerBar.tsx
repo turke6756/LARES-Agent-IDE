@@ -1,7 +1,7 @@
 import React, { useEffect, useState, useRef } from 'react';
 import type { Agent } from '../../../shared/types';
 import StatusBadge from './StatusBadge';
-import { RoleChips, ContextStatsBar } from './agent-card-bits';
+import { RoleChips, ContextStatsBar, HooksOffBadge } from './agent-card-bits';
 import ContinuationSplitButton from './ContinuationSplitButton';
 import { isContinuationEligible } from './continuation-controls';
 import { PROVIDER_META } from '../../../shared/constants';
@@ -198,6 +198,8 @@ export default function OwnerContainerBar({
           <div className="ml-auto shrink-0 flex items-center gap-2">
             {/* Context-brick continuation control — claude-provider supervisors only. */}
             {isContinuationEligible(agent) && <ContinuationSplitButton agent={agent} />}
+            {/* WP2 — hook-health badge, orthogonal to (and never replacing) the operational status. */}
+            <HooksOffBadge agent={agent} />
             <StatusBadge status={agent.status} />
           </div>
         </div>

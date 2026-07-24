@@ -18,8 +18,30 @@ import {
 } from '../../shared/constants';
 import { getActiveAgents, applyStatusTransition, updateAgentHookStatus, addEvent } from '../database';
 import type { StatusChangedEvent } from './status-events';
+import { detectInteractivePrompt, InteractivePromptKind } from './interactive-prompt-detector';
 
 export type WaitingKind = 'question' | 'y-n' | 'enter' | 'choice' | 'approve' | 'tty-pattern' | 'notification';
+
+/** WP7 (hook-absence-resilience) — map a WP4 classifier kind to the formal
+ *  keystroke-blocking WaitingKind the card + supervisor payload render. Both
+ *  trust flavours and an approval box read as `approve`; sign-in and a numbered
+ *  selection menu read as `choice`; an explicit y/n reads as `y-n`; a
+ *  press-Enter gate reads as `enter`. */
+function promptKindToWaitingKind(kind: InteractivePromptKind): WaitingKind {
+  switch (kind) {
+    case 'trust-dialog':
+    case 'hook-trust':
+    case 'approval':
+      return 'approve';
+    case 'sign-in':
+    case 'choice':
+      return 'choice';
+    case 'yes-no':
+      return 'y-n';
+    case 'press-enter':
+      return 'enter';
+  }
+}
 
 // BUG-18 Change 1 — added `thinking-pending` (900 s ceiling) for Claude
 // extended-thinking and equivalent provider phases where no chat event
@@ -92,7 +114,7 @@ const TRANSITIONAL_STATUSES: ReadonlyArray<AgentStatus> = ['launching', 'restart
  *  pattern is correct; this surgical exception is a load-bearing decision —
  *  keep `canForceTransition()` as the named locus so the bypass stays
  *  visible. */
-export type PromoteFromLaunchingSource = 'launch-settle' | 'stop-hook' | 'other';
+export type PromoteFromLaunchingSource = 'launch-settle' | 'stop-hook' | 'hook-canary-degraded' | 'other';
 function canForceTransition(
   curr: AgentStatus,
   target: AgentStatus,
@@ -100,7 +122,9 @@ function canForceTransition(
 ): boolean {
   if (curr !== 'launching') return false;
   if (target !== 'idle') return false;
-  return source === 'launch-settle' || source === 'stop-hook';
+  // WP7 — a broken launch canary resolves the stuck spinner through this same
+  // sanctioned seam (a hookless launch stays `'launching'` forever otherwise).
+  return source === 'launch-settle' || source === 'stop-hook' || source === 'hook-canary-degraded';
 }
 
 export class StatusMonitor extends EventEmitter {
@@ -190,6 +214,10 @@ export class StatusMonitor extends EventEmitter {
   // Cleared when the agent leaves `working`, when any signal goes fresh
   // again, and in forgetAgent.
   private workerStallWarned = new Set<string>();
+  // WP7 — last PTY blocking-prompt signature per hook-unavailable agent, for the
+  // classifier's two-consecutive-polls stability gate. Cleared when the prompt
+  // clears, when hooks come back, and in forgetAgent.
+  private lastPtyPromptSig = new Map<string, string>();
   // Injected by AgentSupervisor: delivers the worker_stalled supervisor event
   // (EventBridge.onWorkerStalled). Left undefined in tests that don't
   // exercise the stall seam (then the watchdog is warn-only via console).
@@ -473,6 +501,7 @@ export class StatusMonitor extends EventEmitter {
     this.canaryArmedAt.delete(agentId);
     this.confirmInFlight.delete(agentId);
     this.workerStallWarned.delete(agentId);
+    this.lastPtyPromptSig.delete(agentId);
   }
 
   /** Class IV §2.3 — called by `AgentSupervisor.forceIdleFromHook` and
@@ -695,6 +724,17 @@ export class StatusMonitor extends EventEmitter {
     const agents = getActiveAgents();
     for (const agent of agents) {
       try {
+        // WP7 — the launch canary runs BEFORE checkLaunchSettle so it can resolve
+        // a stuck `launching` spinner (checkLaunchSettle otherwise `continue`s for
+        // every launching agent, and its no-launchedAt-stamp branch never promotes
+        // at all — root cause #4's "launching forever"). At the 8 s canary window
+        // (< the 10 s claude settle budget) a hookless launch flips to `broken`
+        // and promoteFromLaunching('hook-canary-degraded') resolves it, inspecting
+        // for a blocking trust/sign-in prompt so it reads `waiting`, not a false
+        // idle. For a non-launching agent this is the same 'unknown'→'broken'
+        // health flip as before (order vs checkLaunchSettle is immaterial there).
+        this.checkHookCanary(agent);
+
         // BUG-23 — settle-timer promotion. Runs before inference so we don't
         // race the (no-op for `'launching'`) `inferStatus` short-circuit.
         // Returns true if the agent was promoted on this tick; either way
@@ -716,10 +756,10 @@ export class StatusMonitor extends EventEmitter {
         // BUG-10 reactive recovery — resend the dropped Enter (bounded) when
         // the start-hook silence is the paste-race signature.
         this.checkStartHookResend(agent);
-        // HOOK_SYSTEM_DESIGN.md §5.4 / B5 — launch-time hook canary. Flips
-        // hook_status 'unknown' → 'broken' once the launch window elapses with
-        // no hook event. Status itself is untouched; inference stays disabled.
-        this.checkHookCanary(agent);
+        // WP7 — ongoing PTY-driven `waiting` for hook-unavailable agents (no-op
+        // for healthy hook-owned lanes; runs after the canary so a just-flipped
+        // agent participates on the next tick).
+        this.checkPtyWaiting(agent);
         // Handoff handshake — stalled-worker watchdog. One-shot
         // worker_stalled supervisor event when a worker sits `working` with
         // zero PTY/hook/input signal for WORKER_STALL_WARN_MS.
@@ -906,6 +946,12 @@ export class StatusMonitor extends EventEmitter {
     if ((agent.hookStatus ?? 'unknown') !== 'unknown') return;
 
     updateAgentHookStatus(agent.id, 'broken');
+    // WP2 (hook-absence-resilience) — the hook-health flip does NOT change
+    // `status`, so it rides no `statusChanged` event. Emit a dedicated
+    // `hookStatusChanged` so the supervisor re-pushes a fresh agent DTO (now
+    // carrying hooksUnavailable=true) and the HOOKS OFF card badge appears
+    // immediately, rather than waiting for the next general refresh.
+    this.emit('hookStatusChanged', { agentId: agent.id });
     console.warn(
       `[hook-canary] ${agent.provider} worker ${agent.id} produced no hook event ` +
       `within ${Math.round(HOOK_CANARY_WINDOW_MS / 1000)} s of launch — hook scaffold ` +
@@ -913,6 +959,51 @@ export class StatusMonitor extends EventEmitter {
       `AGENT_ID/DASHBOARD_PORT env, or an un-instrumented command). hook_status='broken'. ` +
       `Worker-lane status stays hook-owned (PTY inference remains disabled).`,
     );
+
+    // WP7 — launch resolution. The canary intentionally leaves `status`, so a
+    // hookless launch stays `'launching'` forever (forceIdle/inferStatus no-op on
+    // transitional states; the only sanctioned exit is promoteFromLaunching).
+    // Resolve the stuck spinner through that seam, inspecting the settled PTY
+    // tail for a blocking startup prompt FIRST so a launch blocked on a
+    // trust/sign-in dialog reads `waiting`, not a false `idle`.
+    if (agent.status === 'launching') {
+      const prompt = detectInteractivePrompt(this.getOutputRingTail(agent.id));
+      this.promoteFromLaunching(agent.id, 'hook-canary-degraded');
+      if (prompt) {
+        // idle→waiting is allowed; the excerpt flows to the card tooltip.
+        this.forceWaiting(agent.id, promptKindToWaitingKind(prompt.kind), prompt.excerpt);
+      }
+    }
+  }
+
+  /** WP7 — ongoing waiting from the PTY for a hook-unavailable agent. Runs ONLY
+   *  when `agent.hooksUnavailable` (healthy hook-owned lanes remain untouched —
+   *  the regression guard for the removed PromptPatternDetector). On a STABLE
+   *  WP4 blocking-prompt match (the same signature on two consecutive polls, per
+   *  the classifier's stability contract), latch `waiting` with the mapped kind +
+   *  excerpt. This is the one sanctioned status-driving use of the classifier;
+   *  every other use is diagnostic. */
+  private checkPtyWaiting(agent: Agent): void {
+    if (!agent.hooksUnavailable) {
+      this.lastPtyPromptSig.delete(agent.id);
+      return;
+    }
+    // Only meaningful for a live, non-transitional, non-terminal agent.
+    if (TRANSITIONAL_STATUSES.includes(agent.status) || TERMINAL_STATUSES.includes(agent.status)) return;
+
+    const prompt = detectInteractivePrompt(this.getOutputRingTail(agent.id));
+    if (!prompt) {
+      this.lastPtyPromptSig.delete(agent.id);
+      return;
+    }
+    const sig = `${prompt.kind}:${prompt.excerpt}`;
+    const prev = this.lastPtyPromptSig.get(agent.id);
+    this.lastPtyPromptSig.set(agent.id, sig);
+    // Stability: require the same signature across two consecutive polls before
+    // driving status. Already-`waiting` on the same latch needs no re-drive.
+    if (prev !== sig) return;
+    if (this.getWaitingKind(agent.id) !== null) return;
+    this.forceWaiting(agent.id, promptKindToWaitingKind(prompt.kind), prompt.excerpt);
   }
 
   /** Start-hook silence watchdog (BUG-10 paste-race fix). For supervised

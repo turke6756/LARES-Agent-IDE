@@ -1,5 +1,6 @@
 import React, { useState, useRef, useCallback, useEffect, useMemo } from 'react';
 import type { Agent, AgentStatus } from '../../../shared/types';
+import { sendOutcomeMessage } from '../../../shared/send-outcome-copy';
 import { useThemeStore } from '../../stores/theme-store';
 import { useDashboardStore } from '../../stores/dashboard-store';
 import { loadDraft, saveDraft } from '../../lib/chat-drafts';
@@ -43,6 +44,11 @@ export default function ChatInputBar({
   const [sending, setSending] = useState(false);
   const [isDragOver, setIsDragOver] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
+  // WP8 — the three-state SendOutcome banner (confirmed clears it; amber
+  // delivered-unconfirmed; red failed). Held separately from `sendError` (which
+  // covers synchronous status-gate rejects) and rendered via the shared
+  // formatter so the mandatory terminal-check guidance can never be dropped.
+  const [sendOutcome, setSendOutcome] = useState<{ tone: 'ok' | 'warn' | 'error'; text: string } | null>(null);
   // Attachment (paste/drop image) errors — kept separate from sendError so the
   // banner reads "Attachment failed:", not the misleading "Send failed:".
   const [attachError, setAttachError] = useState<string | null>(null);
@@ -107,6 +113,7 @@ export default function ChatInputBar({
     inputValueRef.current = next; // sync mirror before setInput (addendum F)
     setInput(next);
     setSendError(null);
+    setSendOutcome(null);
     setAttachError(null);
   }, [agentId]);
 
@@ -153,13 +160,43 @@ export default function ChatInputBar({
     return unsubscribe;
   }, [agentId]);
 
+  // WP8 — the three-state SendOutcome for a chat send. `confirmed` clears any
+  // banner; `delivered-unconfirmed` shows an AMBER warning (never "Send failed")
+  // and does NOT restore the draft (the agent may already have the text);
+  // `failed` shows a RED error and restores the draft so the user can retry.
+  // Both non-confirmed states carry the mandatory double-click terminal-check
+  // sentence (and name a detected prompt) via the shared formatter.
+  useEffect(() => {
+    const unsubscribe = window.api.agents.onSendInputResult((outcome) => {
+      if (outcome.agentId !== agentId) return;
+      if (outcome.disposition === 'confirmed') {
+        setSendOutcome(null);
+        setSendError(null);
+        return;
+      }
+      if (outcome.disposition === 'failed') {
+        const failed = lastSentRef.current;
+        if (failed && inputValueRef.current.trim().length === 0) {
+          inputValueRef.current = failed;
+          setInput(failed);
+          saveDraft(agentId, failed);
+        }
+      }
+      const copy = sendOutcomeMessage(outcome);
+      setSendError(null); // the outcome banner supersedes the generic error line
+      setSendOutcome({ tone: copy.tone, text: copy.text });
+    });
+    return unsubscribe;
+  }, [agentId]);
+
   const updateInput = useCallback((next: string) => {
     inputValueRef.current = next; // sync mirror BEFORE setInput (addendum F)
     setInput(next);
     saveDraft(agentId, next);
     if (sendError) setSendError(null);
+    if (sendOutcome) setSendOutcome(null);
     if (attachError) setAttachError(null);
-  }, [agentId, sendError, attachError]);
+  }, [agentId, sendError, sendOutcome, attachError]);
 
   // Re-run "@"-mention detection from the live caret. Called on input changes
   // AND on caret moves (keyup / click / select) so the menu opens/closes as the
@@ -199,7 +236,8 @@ export default function ChatInputBar({
 
     setSending(true);
     setSendError(null);
-    lastSentRef.current = text; // remembered so onSendInputError can restore it
+    setSendOutcome(null); // clear a stale banner; the eventual result replaces it
+    lastSentRef.current = text; // remembered so a failed outcome can restore it
     try {
       await window.api.agents.sendInput(agentId, text);
       updateInput('');
@@ -509,7 +547,33 @@ export default function ChatInputBar({
           position={mentionPosition}
         />
       )}
-      {sendError ? (
+      {sendOutcome ? (
+        <div className="flex items-start gap-1.5 mt-1.5 px-2" role="status">
+          <span
+            className={`inline-block w-1.5 h-1.5 mt-1.5 rounded-full shrink-0 ${
+              sendOutcome.tone === 'error'
+                ? 'bg-[var(--color-accent-red)]'
+                : 'bg-[var(--color-accent-yellow)]'
+            }`}
+          />
+          <span
+            className={`text-[11px] leading-snug break-words ${
+              sendOutcome.tone === 'error'
+                ? 'text-[var(--color-accent-red)]'
+                : 'text-[var(--color-accent-yellow)]'
+            }`}
+          >
+            {sendOutcome.text}
+          </span>
+          <button
+            onClick={() => setSendOutcome(null)}
+            className="ml-auto text-[10px] uppercase tracking-wider text-gray-500 hover:text-gray-300 shrink-0"
+            aria-label="Dismiss message"
+          >
+            Dismiss
+          </button>
+        </div>
+      ) : sendError ? (
         <div className="flex items-start gap-1.5 mt-1.5 px-2">
           <span className="inline-block w-1.5 h-1.5 mt-1.5 rounded-full bg-[var(--color-accent-red)] shrink-0" />
           <span className="text-[11px] text-[var(--color-accent-red)] leading-snug break-words">

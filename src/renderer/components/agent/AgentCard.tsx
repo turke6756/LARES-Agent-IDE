@@ -3,7 +3,7 @@ import { motion } from 'framer-motion';
 import type { Agent, AgentStopReason } from '../../../shared/types';
 import StatusBadge from './StatusBadge';
 import { formatAgentToken } from '../../lib/agent-mention';
-import { RoleChips, ContextStatsBar } from './agent-card-bits';
+import { RoleChips, ContextStatsBar, HooksOffBadge } from './agent-card-bits';
 import ContinuationSplitButton from './ContinuationSplitButton';
 import ContinuationPhaseLine from './ContinuationPhaseLine';
 import { isContinuationEligible } from './continuation-controls';
@@ -379,6 +379,8 @@ export default function AgentCard({
              {forkError && <span className="text-[11px] text-accent-red font-semibold">{forkError}</span>}
              {/* Context-brick continuation control — claude-provider supervisors only. */}
              {isContinuationEligible(agent) && <ContinuationSplitButton agent={agent} />}
+             {/* WP2 — hook-health badge, orthogonal to (and never replacing) the operational status. */}
+             <HooksOffBadge agent={agent} />
              <StatusBadge status={agent.status} />
 
              {!confirmDelete && (

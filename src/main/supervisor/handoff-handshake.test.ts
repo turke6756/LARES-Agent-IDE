@@ -312,6 +312,28 @@ test('sendInputConfirmed resolves mode=hook when delivered and the start hook ad
   assert.deepEqual(result, { delivered: true, confirmed: true, mode: 'hook' });
 });
 
+// WP1 evidence matrix (CHARACTERIZATION): with the hooks DEAD (the start-hook
+// timestamp never advances), a fallback `status === 'working'` still confirms a
+// send via mode:'status-poll'. This is the hook-independent evidence source the
+// plan leans on (WP3/WP7); pinned here so its current semantics are locked
+// alongside the delivery-failed and mode=hook poles already tested above.
+// TODO(WP5): status-poll confirmation folds into the unified SendOutcome
+// (confirmationSource:'status').
+test('WP1: dead hooks but a working status confirms via status-poll (hook-independent evidence)', async () => {
+  const { sup } = makeConfirmSeam({ delivered: true, startHookAts: [0, 0, 0] });
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const db = require('../database') as Record<string, unknown>;
+  const origGetAgent = db.getAgent;
+  db.getAgent = (id: string) => (id === 'w-status-1' ? { id, status: 'working' } : null);
+  try {
+    const result = await sup.sendInputConfirmed('w-status-1', 'hello');
+    assert.deepEqual(result, { delivered: true, confirmed: true, mode: 'status-poll' },
+      'a flat hook + working status confirms via the status-poll fallback');
+  } finally {
+    db.getAgent = origGetAgent;
+  }
+});
+
 test('constants invariant: CONFIRM_WINDOW_FIRST_MS ≥ hook POST self-abort + cold-spawn budget', () => {
   // The v6 dashboard-status.mjs hook script self-aborts its POST at 2500ms
   // (buildDashboardStatusScript(2500, true)) — but that timer starts INSIDE

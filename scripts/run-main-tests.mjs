@@ -31,6 +31,9 @@ const TESTS = [
   'dist/main/main/runtime-prerequisites.test.js',
   'dist/main/main/supervisor/codex-sid-recovery-on-chat-read.test.js',
   'dist/main/main/supervisor/session-log-dispatcher.test.js',
+  // WP3/WP8 (hook-absence-resilience) — turn-evidence tracker + send-outcome copy.
+  'dist/main/main/supervisor/turn-evidence.test.js',
+  'dist/main/shared/send-outcome-copy.test.js',
   'dist/main/main/supervisor/agent-chat-history.test.js',
   'dist/main/main/supervisor/claude-clear-rotation.test.js',
   'dist/main/main/supervisor/claude-clear-rotation-integration.test.js',

@@ -1953,6 +1953,40 @@ async function BUG41_doneWithoutSwapPurges(): Promise<void> {
   console.log('  BUG41 ✓ genuinely-done (no swap) drops at delivery and purges on drain');
 }
 
+// ── WP7 (hook-absence-resilience) — hook-health-conditional skip ──────────
+
+async function WP7_hooksUnavailableFallsThroughToTranscript(): Promise<void> {
+  // A supervised claude worker with LIVE hooks: the chat-stream must NOT drive
+  // status (hooks own it) — the turnComplete is skipped.
+  const fHealthy = makeFakeBridgeDeps();
+  const healthy = makeAgent('wp7-healthy', {
+    provider: 'claude', status: 'working', isSupervised: true, isWorker: true,
+    hooksUnavailable: false,
+  });
+  fHealthy.agents.set(healthy.id, healthy);
+  new EventBridge(fHealthy.deps).onChatEvents(batchFor(healthy.id, [
+    assistantText(healthy.id, { turnComplete: true }),
+  ]));
+  assert.equal(fHealthy.statusForceCalls.length, 0,
+    'WP7: healthy hook-owned lane still skips the chat-stream status switch');
+
+  // Same worker but the canary proved the hooks DEAD: it now falls through to the
+  // transcript switch (gemini path) and turnComplete → forceIdle.
+  const fDead = makeFakeBridgeDeps();
+  const dead = makeAgent('wp7-dead', {
+    provider: 'claude', status: 'working', isSupervised: true, isWorker: true,
+    hooksUnavailable: true,
+  });
+  fDead.agents.set(dead.id, dead);
+  new EventBridge(fDead.deps).onChatEvents(batchFor(dead.id, [
+    assistantText(dead.id, { turnComplete: true }),
+  ]));
+  assert.equal(fDead.statusForceCalls.length, 1, 'WP7: hooks-unavailable lane recovers status from the transcript');
+  assert.equal(fDead.statusForceCalls[0].method, 'forceIdle');
+  assert.equal(fDead.statusForceCalls[0].source, 'turnComplete');
+  console.log('  WP7 ✓ hooksUnavailable falls through to transcript status routing; healthy still skips');
+}
+
 async function main(): Promise<void> {
   console.log('event-bridge.test: running BR-01..BR-20 + BUG-18 + BUG-22 + BUG-41 + TS-subscriptions');
   await BR_01_happyPath();
@@ -1980,6 +2014,7 @@ async function main(): Promise<void> {
   await onChatEvents_codexTurnComplete();
   await onChatEvents_dispatchTable();
   await onChatEvents_geminiToolUseStillRoutes();
+  await WP7_hooksUnavailableFallsThroughToTranscript();
   await onChatEvents_initialLoadSuppressesForceCalls();
   await onChatEvents_secondBatchIsNotInitialLoad();
   await BR_11a_deliverDefersWhileUserTyping();

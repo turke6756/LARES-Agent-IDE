@@ -351,6 +351,14 @@ export interface Agent {
   // Surfaced for visibility only — a 'broken'/'degraded' status NEVER re-enables
   // PTY inference for worker-lane agents.
   hookStatus?: 'unknown' | 'healthy' | 'broken' | 'degraded';
+  /** WP2 (hook-absence-resilience) — DERIVED from hookStatus, non-persisted.
+   *  True when the status-hook transport is unavailable for this agent — either
+   *  the launch canary proved it dead ('broken') or the command could not be
+   *  instrumented ('degraded'). Drives the card badge and degraded-mode
+   *  fallbacks. NOT a database authority — always projected from hook_status via
+   *  deriveHookAvailability(); never written directly. */
+  hooksUnavailable?: boolean;
+  hooksUnavailableReason?: 'canary-timeout' | 'instrumentation-unavailable';
   // Wall-clock (ms) of the most recent hook event from this agent, any source.
   lastHookEventAt?: number;
   // C1 (plans/global-hook-rollout-and-submit-confirmation.md §2.1/§3.1) — the
@@ -361,6 +369,13 @@ export interface Agent {
   // GroupThink) can see a swallowed delivery failure instead of an agent that
   // silently never goes `working`.
   lastSendError?: { message: string; ts: number } | null;
+  /** WP5 (hook-absence-resilience) — the three-state outcome of the most recent
+   *  submit to this agent. Supersedes `lastSendError` as consumers migrate: a
+   *  `failed` or `delivered-unconfirmed` outcome is the surface pollers
+   *  (MCP/HTTP/GroupThink) read to see a swallowed delivery/confirmation gap, and
+   *  a later `confirmed` outcome supersedes an earlier `delivered-unconfirmed`
+   *  (UI upgrade, never a re-send). Persisted; projected via rowToAgent. */
+  lastSend?: SendOutcome | null;
   isAttached: boolean;
   restartCount: number;
   /** Inc 4: continuation handoff generation — bumped only by the atomic
@@ -415,6 +430,32 @@ export interface Agent {
   lastStopReason?: AgentStopReason | null;
 }
 
+/** WP5 (hook-absence-resilience) — the unified three-state disposition of a
+ *  submit. `confirmed`: a turn provably started (hook, session-log turn, or a
+ *  `working` status flip). `delivered-unconfirmed`: the runner accepted the
+ *  bytes but no start evidence arrived before the confirmation deadline — this
+ *  is NOT a failure (a hookless provider can start a turn invisibly), so it must
+ *  never be rendered as "Send failed". `failed`: no runner accepted the bytes,
+ *  so nothing was typed. Hook absence (or hooks-were-healthy-earlier) must NEVER
+ *  be converted into `failed`. */
+export type SendDisposition = 'confirmed' | 'delivered-unconfirmed' | 'failed';
+
+export interface SendOutcome {
+  disposition: SendDisposition;
+  agentId: string;
+  /** True when the runner accepted the bytes (delivered-unconfirmed + confirmed);
+   *  false only for `failed`. */
+  delivered: boolean;
+  /** Which independent evidence source proved the turn started (confirmed only). */
+  confirmationSource?: 'hook' | 'session-log' | 'status';
+  reason?: 'delivery-failed' | 'confirmation-timeout' | 'interactive-prompt';
+  /** Populated when the WP4 PTY classifier recognized a blocking prompt on a
+   *  `delivered-unconfirmed` outcome, so surfaces can name what the terminal is
+   *  waiting on. */
+  prompt?: { kind: string; label: string; excerpt: string };
+  completedAt: number;
+}
+
 /** Supervisor-privilege predicate — the single source of truth for "this agent
  *  gets supervisor-tier treatment" across the continuation pipeline, the
  *  X-Supervisor-Id identity rail, and the renderer controls. An agent qualifies
@@ -425,6 +466,21 @@ export interface Agent {
  *  drift between the ~half-dozen gate sites that must agree on it. */
 export function hasSupervisorPrivilege(a: { isSupervisor?: boolean; privilegeLane?: 'supervisor' }): boolean {
   return a.isSupervisor === true || a.privilegeLane === 'supervisor';
+}
+
+/** WP2 (hook-absence-resilience) — project the DERIVED, non-persisted
+ *  `hooksUnavailable` / `hooksUnavailableReason` DTO fields from the persisted
+ *  `hook_status` (the sole authority — no new column). Both `'broken'` (launch
+ *  canary expired with no hook) and `'degraded'` (command couldn't be
+ *  instrumented) count as unavailable for UI/fallback purposes; the distinct
+ *  reason keeps the card tooltip accurate. Called at every Agent projection so
+ *  cards, list endpoints, and fallbacks all agree. */
+export function deriveHookAvailability(
+  hookStatus: Agent['hookStatus'] | null | undefined,
+): { hooksUnavailable: boolean; hooksUnavailableReason?: 'canary-timeout' | 'instrumentation-unavailable' } {
+  if (hookStatus === 'broken') return { hooksUnavailable: true, hooksUnavailableReason: 'canary-timeout' };
+  if (hookStatus === 'degraded') return { hooksUnavailable: true, hooksUnavailableReason: 'instrumentation-unavailable' };
+  return { hooksUnavailable: false, hooksUnavailableReason: undefined };
 }
 
 export interface AgentEvent {
@@ -1486,6 +1542,7 @@ export interface IpcApi {
     query: (targetAgentId: string, question: string, sourceAgentId?: string) => Promise<QueryResult>;
     sendInput: (agentId: string, text: string) => Promise<void>;
     onSendInputError: (callback: (data: { agentId: string; error: string }) => void) => () => void;
+    onSendInputResult: (callback: (outcome: SendOutcome) => void) => () => void;
     getSupervisor: (workspaceId: string) => Promise<Agent | null>;
     updateSupervised: (id: string, supervised: boolean) => Promise<Agent>;
     // Per-agent continuation control (Edward 2026-07-05). setContinuationEnabled
