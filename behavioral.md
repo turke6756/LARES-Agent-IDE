@@ -1,6 +1,10 @@
 
 ## WB-15: On a shared dirty tree, `git add <path>` still sweeps up OTHER workers' edits to that same path — diff each path before staging
 
+<br />
+
+<br />
+
 **Trigger:** You're told the tree has many uncommitted files from concurrent
 workstreams and to commit "explicit paths only," and your change touches a
 long-lived shared file (a store, an index, a constants module, a test runner).
@@ -42,3 +46,34 @@ suspect a silent event-loop drain before you suspect the assertions.
 **Source:** 2026-07-20 idle-agent-lifecycle leg 1 — `stopAgent`'s
 runner-exit-vs-timeout race unref'd its timeout; the new test file exited 0
 after 15 of 26 tests with no summary. Dropping the `unref()` fixed it.
+
+## Bisect live regressions with a live experiment before diffing commits
+
+When a running system misbehaves and you have API/DB access to it, inject a
+synthetic event at a mid-pipeline seam and observe where it dies — one
+controlled probe can prove half the suspect pipeline healthy in seconds,
+collapsing hours of commit-diff archaeology. Restore any state you touched.
+
+**Source:** 2026-07-22 frozen-status regression — POSTing a hook event to the
+live dashboard proved hook→DB worked, so the break had to be upstream (agents
+launching hookless from a stale cwd), not in the 17 suspect pipeline commits.
+
+## WB-17: Default ripgrep/glob sweeps silently skip gitignored files and dot-directories — security/EDR sweeps need `--no-ignore --hidden` or an explicit walk
+
+**Trigger:** You're sweeping a tree for something that must be found *everywhere
+it exists* — banned patterns, leaked secrets, stale mirrors, security-relevant
+strings — and you reach for `rg`, `Grep`, or a glob with default settings.
+
+**Action:** Default walks honor .gitignore and skip dot-directories, which are
+exactly where problem files hide (gitignored scaffolds, `.dashboard/`-style
+state dirs, machine-local copies). For any completeness-critical sweep, pass
+`--no-ignore --hidden` (then exclude `node_modules`/`.git` explicitly), or
+implement your own readdir walk with documented exclusions. Also beware rg's
+binary-file bail: a single NUL byte makes it stop scanning a file after the
+first match — a full-content read caught three `.unref()` sites in one source
+file that rg had silently truncated.
+
+**Source:** 2026-07-22 EDR hardening P0.3 — the original hidden-launcher
+mirrors lived in gitignored dot-dirs that every default sweep missed;
+`check-edr-patterns.mjs` implements its own walk for this reason, and its first
+real run immediately found hits rg had skipped via the NUL-byte bail.
