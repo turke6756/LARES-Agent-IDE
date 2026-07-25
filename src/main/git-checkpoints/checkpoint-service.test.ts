@@ -638,6 +638,55 @@ test('witnessed-path diff and raw-window diff returned separately + labeled; unu
   assert.equal(gone.window.available, false);
 });
 
+// ── WP-G3.1 file history ────────────────────────────────────────────────────────
+
+test('fileHistory lists only live-verified before-edges; a pruned edge is excluded', async () => {
+  const repo = mkRepo();
+  fs.writeFileSync(path.join(repo, 'a.txt'), 'v0\n');
+  commitAll(repo);
+  const store = new FakeStore();
+  const svc = mkService({ store });
+
+  // Turn T1 writes a.txt (witnessed) — both edges captured + ready.
+  store.seedOpen('T1', 'WS', { turnSeq: 1, agentId: 'ag', agentTitle: 'Worker 7', taskLabel: 'edit a' });
+  const b1 = await svc.captureEdge({ edge: 'before', turnId: 'T1', workspaceId: 'WS', agentId: 'ag', capability: capFor(repo), quality: 'guaranteed' });
+  assert.equal(b1.status, 'ready');
+  fs.writeFileSync(path.join(repo, 'a.txt'), 'v1\n');
+  store.rows.get('T1')!.touched = [{ path: 'a.txt', op: 'write' }];
+  const a1 = await svc.captureEdge({ edge: 'after', turnId: 'T1', workspaceId: 'WS', agentId: 'ag', capability: capFor(repo), quality: 'hook' });
+  assert.equal(a1.status, 'ready');
+
+  // Turn T2 also writes a.txt, but its before ref is later PRUNED.
+  store.seedOpen('T2', 'WS', { turnSeq: 2, agentId: 'ag', agentTitle: 'Worker 7', taskLabel: 'edit a again' });
+  const b2 = await svc.captureEdge({ edge: 'before', turnId: 'T2', workspaceId: 'WS', agentId: 'ag', capability: capFor(repo), quality: 'guaranteed' });
+  assert.equal(b2.status, 'ready');
+  store.rows.get('T2')!.touched = [{ path: 'a.txt', op: 'write' }];
+  await svc.settleCleanups();
+
+  // Prune T2's before ref → live rev-parse fails → the version must be excluded.
+  git(repo, ['update-ref', '-d', b2.ref as string]);
+
+  const versions = await svc.fileHistory({ workspaceId: 'WS', path: 'a.txt', repoRoot: repo });
+  assert.equal(versions.length, 1, 'only the live-verified before-edge is listed');
+  assert.equal(versions[0].turnId, 'T1');
+  assert.equal(versions[0].witnessedPath, 'a.txt');
+  assert.equal(versions[0].op, 'write');
+  assert.equal(versions[0].agentTitle, 'Worker 7');
+  assert.equal(versions[0].afterVerified, true, 'both edges live → diff available');
+
+  // A path with no witnessed history → empty.
+  assert.deepEqual(await svc.fileHistory({ workspaceId: 'WS', path: 'nope.txt', repoRoot: repo }), []);
+
+  // An absolute worktree path canonicalizes to the same repo-relative key.
+  const abs = await svc.fileHistory({ workspaceId: 'WS', path: path.join(repo, 'a.txt'), repoRoot: repo });
+  assert.equal(abs.length, 1, 'absolute path resolves to the repo-relative witnessed key');
+  assert.equal(abs[0].turnId, 'T1');
+
+  // If T1's before ref is ALSO pruned, the whole history goes empty (nothing restorable).
+  git(repo, ['update-ref', '-d', b1.ref as string]);
+  assert.deepEqual(await svc.fileHistory({ workspaceId: 'WS', path: 'a.txt', repoRoot: repo }), []);
+});
+
 // ── attribution enforcement ─────────────────────────────────────────────────────
 
 test('revertTurn path set = canonical witnessed write/create set (deduped)', () => {

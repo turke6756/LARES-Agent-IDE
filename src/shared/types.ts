@@ -1637,6 +1637,53 @@ export interface CheckpointRevertRequest {
   force?: boolean;
 }
 
+// ── Git-Native WP-G3.1: file-history contract ───────────────────────────────────
+// One version = one retained turn that WITNESSED a write/create to the queried
+// canonical relative path AND whose before-edge ref is LIVE-verified right now
+// (same rev-parse discipline as diff/restore). A pruned/dead-ref edge is never
+// listed — the presence of a version is itself the restorable guarantee. The
+// restore path reuses the WP-G2.4 preview-required flow (RestoreDialog); this
+// surface only names the versions.
+
+/** One per-turn/per-agent version of a single path. Mirrors the main-process
+ *  FileHistoryVersion (git-checkpoints/checkpoint-service.ts) field-for-field so
+ *  the engine adapter stays structurally assignable. Carries witnessed PATHS only,
+ *  never worktree bytes. */
+export interface CheckpointFileHistoryVersion {
+  turnId: string;
+  turnSeq: number;
+  agentId: string | null;
+  agentTitle: string | null;
+  taskLabel: string | null;
+  status: string;
+  startedAt: number | null;
+  endedAt: number | null;
+  beforeReady: boolean;
+  afterReady: boolean;
+  beforeQuality: string | null;
+  afterQuality: string | null;
+  /** The canonical (repo-relative) witnessed path this version covers — the exact
+   *  path that will be restored (a subset-of-one of the turn's witnessed set). */
+  witnessedPath: string;
+  /** The witnessed op for this path in this turn. */
+  op: 'write' | 'create';
+  /** True when the AFTER edge is also live-verified → a turn diff is available. The
+   *  BEFORE edge is ALWAYS live-verified for a listed version (the restorable
+   *  source), so a pruned edge is simply absent from the list. */
+  afterVerified: boolean;
+  /** BEFORE-edge CONTENT-semantics diagnostic (turn_records.before_raw_filter_bypassed).
+   *  RestoreDialog surfaces the LFS/git-crypt warning when true. */
+  beforeRawFilterBypassed: boolean;
+}
+
+/** The file-history route/IPC envelope: the resolved workspace + queried path + its
+ *  live-verified versions (newest first). */
+export interface CheckpointFileHistoryResult {
+  workspaceId: string;
+  path: string;
+  versions: CheckpointFileHistoryVersion[];
+}
+
 /** IPC channel names for the renderer checkpoint surface — one source of truth for
  *  preload, the main registrar, and the contract test. */
 export const CHECKPOINT_CHANNELS = {
@@ -1645,6 +1692,8 @@ export const CHECKPOINT_CHANNELS = {
   preview: 'checkpoint:preview',
   restore: 'checkpoint:restore',
   revert: 'checkpoint:revert',
+  // WP-G3.1 — per-path version history (view/diff/restore one file).
+  fileHistory: 'checkpoint:fileHistory',
 } as const;
 
 export interface IpcApi {
@@ -2164,6 +2213,9 @@ export interface IpcApi {
     preview: (workspaceId: string, turnId: string, paths?: string[]) => Promise<CheckpointPreviewResult>;
     restore: (req: CheckpointRestoreRequest) => Promise<CheckpointRestoreResult>;
     revert: (req: CheckpointRevertRequest) => Promise<CheckpointRestoreResult>;
+    /** WP-G3.1 — versions of ONE canonical path across retained, live-verified
+     *  turns (file right-click → History). */
+    fileHistory: (workspaceId: string, path: string, opts?: { agentId?: string }) => Promise<CheckpointFileHistoryResult>;
   };
 }
 

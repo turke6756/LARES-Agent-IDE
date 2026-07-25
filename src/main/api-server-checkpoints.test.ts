@@ -61,6 +61,15 @@ function makeFakeRoutes(overrides: Partial<CheckpointRoutes> = {}): CheckpointRo
         beforeRawFilterBypassed: false,
       }];
     },
+    fileHistory: async (workspaceId, filePath, opts) => {
+      rec('fileHistory', [workspaceId, filePath, opts]);
+      return [{
+        turnId: 't1', turnSeq: 1, agentId: 'a1', agentTitle: 'A', taskLabel: 'task',
+        status: 'accepted', startedAt: 1, endedAt: 2, beforeReady: true, afterReady: true,
+        beforeQuality: 'guaranteed', afterQuality: 'hook', witnessedPath: filePath, op: 'write',
+        afterVerified: true, beforeRawFilterBypassed: false,
+      }];
+    },
     diff: async (turnId, workspaceId) => {
       rec('diff', [turnId, workspaceId]);
       return {
@@ -161,6 +170,7 @@ test('global bearer is rejected on every checkpoint route (read AND mutation)', 
     const auth = { Authorization: `Bearer ${GLOBAL_BEARER}` };
     const cases: [string, string, unknown?][] = [
       ['GET', '/api/checkpoints'],
+      ['GET', '/api/checkpoints/file-history?path=a.txt'],
       ['GET', '/api/checkpoints/t1/diff'],
       ['POST', '/api/checkpoints/t1/preview', {}],
       ['POST', '/api/checkpoints/t1/restore', { paths: ['a.txt'], previewTokens: { 'a.txt': 'x' } }],
@@ -444,6 +454,70 @@ test('list route carries beforeRawFilterBypassed=false onto the HTTP wire (warni
     const res = await request(port, 'GET', '/api/checkpoints', { Authorization: bearerFor('supervisor', 'sup-A') });
     assert.equal(res.status, 200);
     assert.equal(parse(res).turns[0].beforeRawFilterBypassed, false);
+  }));
+
+// ── 13. WP-G3.1 file-history route — capability-bound + shape ─────────────────────
+
+test('file-history: a minted worker credential is refused (supervisor-tier)', () =>
+  withServer(async (port) => {
+    const res = await request(port, 'GET', '/api/checkpoints/file-history?path=a.txt', {
+      Authorization: bearerFor('worker', 'worker-1'),
+    });
+    assert.equal(res.status, 403);
+    assert.equal(parse(res).code, 'checkpoint-requires-supervisor');
+  }));
+
+test('file-history: a supervisor asserting ANOTHER agent id is rejected', () =>
+  withServer(async (port) => {
+    const res = await request(port, 'GET', '/api/checkpoints/file-history?path=a.txt', {
+      Authorization: bearerFor('supervisor', 'sup-A'),
+      'X-Supervisor-Id': 'sup-B',
+    });
+    assert.equal(res.status, 403);
+    assert.equal(parse(res).code, 'checkpoint-identity-mismatch');
+  }));
+
+test('file-history: a mismatched ?workspaceId= is outside the claim scope (403)', () =>
+  withServer(async (port) => {
+    const res = await request(port, 'GET', '/api/checkpoints/file-history?path=a.txt&workspaceId=other-ws', {
+      Authorization: bearerFor('supervisor', 'sup-A', WS),
+    });
+    assert.equal(res.status, 403);
+    assert.equal(parse(res).code, 'checkpoint-workspace-mismatch');
+  }));
+
+test('file-history: a supervisor gets versions scoped to the claim workspace + path', () =>
+  withServer(async (port) => {
+    const routes = makeFakeRoutes();
+    const server = new ApiServer(stubSupervisor, 0, undefined, '127.0.0.1');
+    server.setCheckpointRoutes(routes);
+    const p = await server.start();
+    try {
+      const res = await request(p, 'GET', '/api/checkpoints/file-history?path=src/a.txt', {
+        Authorization: bearerFor('supervisor', 'sup-A', WS),
+      });
+      assert.equal(res.status, 200);
+      const body = parse(res);
+      assert.equal(body.workspaceId, WS);
+      assert.equal(body.path, 'src/a.txt');
+      assert.equal(body.versions.length, 1);
+      assert.equal(body.versions[0].witnessedPath, 'src/a.txt');
+      const call = routes.state.calls.find((c) => c.method === 'fileHistory');
+      assert.ok(call, 'fileHistory must be called');
+      assert.equal(call!.args[0], WS, 'scoped to the claim workspace');
+      assert.equal(call!.args[1], 'src/a.txt', 'the canonical path is forwarded');
+    } finally {
+      server.stop();
+    }
+  }));
+
+test('file-history without a `path` query → 400', () =>
+  withServer(async (port) => {
+    const res = await request(port, 'GET', '/api/checkpoints/file-history', {
+      Authorization: bearerFor('supervisor', 'sup-A'),
+    });
+    assert.equal(res.status, 400);
+    assert.equal(parse(res).code, 'checkpoint-bad-request');
   }));
 
 // ── Run ──────────────────────────────────────────────────────────────────────────

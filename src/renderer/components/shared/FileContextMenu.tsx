@@ -6,6 +6,7 @@ import {
   FilePlus2,
   FolderOpen,
   FolderPlus,
+  History,
   ListTree,
   Pencil,
   Trash2,
@@ -31,6 +32,9 @@ interface Props {
   showRevealInTree?: boolean;
   onClose: () => void;
   onRevealInTree?: () => void;
+  /** WP-G3.1 — file right-click → History. When provided (files only), a "History"
+   *  item opens the per-turn/per-agent version list (view/diff/restore one path). */
+  onShowHistory?: () => void;
   onCreateFile?: () => void;
   onCreateFolder?: () => void;
   onRename?: () => void;
@@ -50,6 +54,7 @@ function getRelativePath(filePath: string, workingDirectory: string): string {
 
 export default function FileContextMenu({
   x, y, filePath, workingDirectory, pathType, isDirectory, showRevealInTree, onClose, onRevealInTree,
+  onShowHistory,
   onCreateFile, onCreateFolder, onRename, onDelete,
   sortMode, onSortModeChange,
 }: Props) {
@@ -134,6 +139,12 @@ export default function FileContextMenu({
         <Copy className="ui-menu-icon" aria-hidden="true" />
         Copy Relative Path
       </button>
+      {!isDirectory && onShowHistory && (
+        <button onClick={() => runAction(onShowHistory)} className="ui-menu-item" data-testid="ctx-history">
+          <History className="ui-menu-icon" aria-hidden="true" />
+          History
+        </button>
+      )}
       <div className="ui-menu-divider" />
       {isDirectory && (
         <>

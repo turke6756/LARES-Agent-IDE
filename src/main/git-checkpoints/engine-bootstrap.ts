@@ -139,6 +139,15 @@ export async function createCheckpointEngine(): Promise<CheckpointEngineHandle |
   };
   const checkpointRoutes: CheckpointRoutes = {
     list: (workspaceId, opts) => listTurnRecords(workspaceId, opts).map(toCheckpointSummary),
+    fileHistory: async (workspaceId, filePath, opts) => {
+      const cap = await requireCapability(workspaceId);
+      return service.fileHistory({
+        workspaceId,
+        path: filePath,
+        repoRoot: cap.repoRoot as string,
+        agentId: opts?.agentId,
+      });
+    },
     diff: async (turnId, workspaceId) => {
       const cap = await requireCapability(workspaceId);
       return service.generateDiffs(turnId, cap.repoRoot as string);
@@ -184,6 +193,11 @@ export async function createCheckpointEngine(): Promise<CheckpointEngineHandle |
     list: async (workspaceId, opts) => ({
       workspaceId,
       turns: await checkpointRoutes.list(workspaceId, opts),
+    }),
+    fileHistory: async (workspaceId, filePath, opts) => ({
+      workspaceId,
+      path: filePath,
+      versions: await checkpointRoutes.fileHistory(workspaceId, filePath, opts),
     }),
     diff: async (workspaceId, turnId) => {
       const d = await checkpointRoutes.diff(turnId, workspaceId);

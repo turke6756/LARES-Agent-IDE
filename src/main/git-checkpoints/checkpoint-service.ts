@@ -950,6 +950,82 @@ export class CheckpointService {
     return { ...base, available: beforeUsable && validation.ok, reason, tokens };
   }
 
+  // ── WP-G3.1: per-path version history (view/diff/restore one file) ─────────────
+
+  /**
+   * Versions of ONE canonical relative path across the workspace's retained turns:
+   * every turn that WITNESSED a write/create to the path AND whose before-edge ref
+   * LIVE-verifies right now (`isEdgeUsable` — the same rev-parse/readiness discipline
+   * diff/restore use; the DB `*_ready`/`*_pruned_at` flags are hints, never
+   * authority). A pruned/dead-ref edge is EXCLUDED — the presence of a version is
+   * the restorable guarantee, so `FileHistoryView` never offers a restore against a
+   * ref git can no longer resolve. Newest first (turnSeq desc). The path is matched
+   * canonically so an absolute worktree path from the renderer resolves to the same
+   * repo-relative key the witness join stored.
+   */
+  async fileHistory(params: {
+    workspaceId: string;
+    path: string;
+    repoRoot: string;
+    agentId?: string;
+  }): Promise<FileHistoryVersion[]> {
+    const target = canonicalHistoryPath(params.path, params.repoRoot);
+    if (target === '') return [];
+    const rows = this.store.listTurnRecords(
+      params.workspaceId,
+      params.agentId ? { agentId: params.agentId } : undefined,
+    );
+
+    const out: FileHistoryVersion[] = [];
+    for (const row of rows) {
+      const entry = (row.touched ?? []).find(
+        (e) =>
+          (e.op === 'write' || e.op === 'create') &&
+          canonicalHistoryPath(e.path, params.repoRoot) === target,
+      );
+      if (!entry) continue;
+
+      // The before edge is the restorable source — it must LIVE-verify (a pruned
+      // ref drops the whole version, never listed as restorable).
+      const beforeUsable = await this.isEdgeUsable(
+        params.repoRoot,
+        row.beforeReady,
+        row.beforeRef,
+        row.beforeOid,
+      );
+      if (!beforeUsable) continue;
+
+      const afterUsable = await this.isEdgeUsable(
+        params.repoRoot,
+        row.afterReady,
+        row.afterRef,
+        row.afterOid,
+      );
+
+      out.push({
+        turnId: row.id,
+        turnSeq: row.turnSeq,
+        agentId: row.agentId,
+        agentTitle: row.agentTitle,
+        taskLabel: row.taskLabel,
+        status: row.status,
+        startedAt: row.startedAt,
+        endedAt: row.endedAt,
+        beforeReady: row.beforeReady,
+        afterReady: row.afterReady,
+        beforeQuality: row.beforeQuality,
+        afterQuality: row.afterQuality,
+        witnessedPath: entry.path,
+        op: entry.op as 'write' | 'create',
+        afterVerified: afterUsable,
+        beforeRawFilterBypassed: row.beforeRawFilterBypassed,
+      });
+    }
+
+    out.sort((a, b) => b.turnSeq - a.turnSeq);
+    return out;
+  }
+
   // ── helpers ────────────────────────────────────────────────────────────────────
 
   private longpaths(): string[] {
@@ -1627,6 +1703,31 @@ export interface DiffResult {
   provenance?: 'witnessed' | 'raw-window';
 }
 
+/** WP-G3.1 file-history version: one retained turn that WITNESSED a write/create to
+ *  a single canonical path AND whose before-edge ref LIVE-verifies right now. A
+ *  pruned/dead-ref edge is never emitted (the presence of a version IS the
+ *  restorable guarantee). Carries witnessed PATHS only, never worktree bytes. */
+export interface FileHistoryVersion {
+  turnId: string;
+  turnSeq: number;
+  agentId: string | null;
+  agentTitle: string | null;
+  taskLabel: string | null;
+  status: string;
+  startedAt: number | null;
+  endedAt: number | null;
+  beforeReady: boolean;
+  afterReady: boolean;
+  beforeQuality: string | null;
+  afterQuality: string | null;
+  /** The canonical (repo-relative) witnessed path this version covers. */
+  witnessedPath: string;
+  op: 'write' | 'create';
+  /** After edge also live-verified → the turn diff is available. */
+  afterVerified: boolean;
+  beforeRawFilterBypassed: boolean;
+}
+
 /** WP-G2.1 restore preview: witnessed set + per-path anti-TOCTOU tokens (current
  *  worktree OID, or the ABSENT sentinel) the HTTP caller echoes back to
  *  restore/revert. `available` is true only when the before edge is usable AND every
@@ -1723,6 +1824,24 @@ function describeError(err: unknown): string {
   if (err instanceof GitCommandError) return `git-${err.kind}`;
   if (err instanceof Error) return err.message.slice(0, 200);
   return String(err).slice(0, 200);
+}
+
+/** Normalize a path to the canonical repo-relative form the witness join stores
+ *  (forward slashes, no leading `./` or `/`). An absolute worktree path is made
+ *  repo-relative by stripping the `repoRoot` prefix (case-insensitive prefix match
+ *  for Windows drive-letter/short-name divergence; the relative TAIL keeps its
+ *  git-stored case, so it still matches the stored witnessed path exactly). A path
+ *  outside `repoRoot`, or `repoRoot` itself, yields '' (never matches a version). */
+function canonicalHistoryPath(input: string, repoRoot: string): string {
+  let p = (input ?? '').replace(/\\/g, '/');
+  const root = (repoRoot ?? '').replace(/\\/g, '/').replace(/\/+$/, '');
+  if (root) {
+    const lower = p.toLowerCase();
+    const rootLower = root.toLowerCase();
+    if (lower === rootLower) return '';
+    if (lower.startsWith(rootLower + '/')) p = p.slice(root.length + 1);
+  }
+  return p.replace(/^\.\//, '').replace(/^\/+/, '');
 }
 
 function dedupe(paths: string[]): string[] {

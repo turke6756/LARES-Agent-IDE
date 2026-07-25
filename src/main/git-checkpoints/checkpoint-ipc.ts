@@ -21,6 +21,7 @@
 import {
   CHECKPOINT_CHANNELS,
   type CheckpointDiffResult,
+  type CheckpointFileHistoryResult,
   type CheckpointListResult,
   type CheckpointPreviewResult,
   type CheckpointRestoreRequest,
@@ -35,6 +36,8 @@ import {
  *  the whole point of the IPC-only path. All args are workspace-scoped. */
 export interface HumanCheckpointRoutes {
   list(workspaceId: string, opts?: { agentId?: string }): Promise<CheckpointListResult>;
+  /** WP-G3.1 — versions of one canonical path across retained, live-verified turns. */
+  fileHistory(workspaceId: string, path: string, opts?: { agentId?: string }): Promise<CheckpointFileHistoryResult>;
   diff(workspaceId: string, turnId: string): Promise<CheckpointDiffResult>;
   preview(workspaceId: string, turnId: string, paths?: string[]): Promise<CheckpointPreviewResult>;
   restore(args: {
@@ -158,6 +161,16 @@ export function registerCheckpointIpc(ipc: IpcLike, getRoutes: () => HumanCheckp
     const wsId = requireWorkspaceId(workspaceId);
     const agentId = (opts as { agentId?: unknown } | undefined)?.agentId;
     return routes.list(wsId, typeof agentId === 'string' && agentId ? { agentId } : undefined);
+  });
+
+  ipc.handle(CHECKPOINT_CHANNELS.fileHistory, async (_e, workspaceId: unknown, filePath: unknown, opts: unknown) => {
+    const routes = requireRoutes(getRoutes());
+    const wsId = requireWorkspaceId(workspaceId);
+    if (typeof filePath !== 'string' || filePath === '') {
+      throw new CheckpointIpcError('a non-empty path is required', 'checkpoint-bad-request');
+    }
+    const agentId = (opts as { agentId?: unknown } | undefined)?.agentId;
+    return routes.fileHistory(wsId, filePath, typeof agentId === 'string' && agentId ? { agentId } : undefined);
   });
 
   ipc.handle(CHECKPOINT_CHANNELS.diff, async (_e, workspaceId: unknown, turnId: unknown) => {

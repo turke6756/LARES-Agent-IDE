@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import type { Agent, AgentStatus, Workspace, HealthCheck, RuntimePrerequisiteReport, FileActivity, QueryResult, ContextStats, ContinuationPhaseSignal, ContinuationPhaseState, UsageLimitsReading, PathType, FileTab, PanelLayout, Team, TeamMessage, CreateTeamInput, DetachedClosedPayload, DetachableView, WriteErrorCode, CheckpointTurnSummary, CheckpointPreviewResult, CheckpointRestoreRequest, CheckpointRevertRequest, CheckpointRestoreResult } from '../../shared/types';
+import type { Agent, AgentStatus, Workspace, HealthCheck, RuntimePrerequisiteReport, FileActivity, QueryResult, ContextStats, ContinuationPhaseSignal, ContinuationPhaseState, UsageLimitsReading, PathType, FileTab, PanelLayout, Team, TeamMessage, CreateTeamInput, DetachedClosedPayload, DetachableView, WriteErrorCode, CheckpointTurnSummary, CheckpointPreviewResult, CheckpointRestoreRequest, CheckpointRevertRequest, CheckpointRestoreResult, CheckpointFileHistoryVersion } from '../../shared/types';
 import { beginWrite, evictTabCache } from '../components/fileviewer/useFileContentCache';
 import { contentHash } from '../components/fileviewer/markdownSplice';
 import { diag, diagBasename, diagHash } from '../components/fileviewer/editLossDiag';
@@ -247,6 +247,14 @@ interface DashboardState {
     req: CheckpointRevertRequest,
     agentId: string,
   ) => Promise<CheckpointRestoreResult>;
+  /** WP-G3.1 — versions of ONE canonical path across retained, live-verified turns
+   *  (file right-click → History). Returns the versions (newest first) or `null` when
+   *  the engine is unavailable, so FileHistoryView can render an honest empty state
+   *  rather than throw. Restore of a version reuses the preview-gated RestoreDialog. */
+  loadFileHistory: (
+    workspaceId: string,
+    path: string,
+  ) => Promise<CheckpointFileHistoryVersion[] | null>;
 
   // Teams
   teams: Team[];
@@ -1382,6 +1390,18 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
     const result = await window.api.checkpoints.revert(req);
     await get().loadCheckpointTurns(req.workspaceId, agentId);
     return result;
+  },
+
+  loadFileHistory: async (workspaceId, path) => {
+    try {
+      const res = await window.api.checkpoints.fileHistory(workspaceId, path);
+      return res.versions;
+    } catch (err) {
+      // Honest failure: the engine may be unavailable (no usable git / still
+      // bootstrapping). FileHistoryView renders the empty/unavailable state.
+      console.error('Failed to load file history:', err);
+      return null;
+    }
   },
 
   // Switch workspaces with per-workspace view-state persistence: snapshot the

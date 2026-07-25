@@ -63,6 +63,9 @@ interface Props {
   /** Register rows with the tree-hover store so the sidebar's space-bar
    *  hotkeys (tap to toggle, hold to reveal timestamps) can act on them. */
   hoverHotkeys?: boolean;
+  /** WP-G3.1 — file right-click → History. When provided, a file's context menu
+   *  gains a "History" item; forwarded unchanged to descendant nodes. */
+  onShowHistory?: (filePath: string) => void;
 }
 
 function parentPath(entryPath: string): string {
@@ -92,6 +95,7 @@ function DirectoryTreeNode({
   expandedPaths,
   onExpandedChange,
   hoverHotkeys,
+  onShowHistory,
 }: Props) {
   const [localExpanded, setLocalExpanded] = useState(false);
   // Controlled mode (expandedPaths provided) reads/writes the ancestor's set;
@@ -485,6 +489,7 @@ function DirectoryTreeNode({
               expandedPaths={expandedPaths}
               onExpandedChange={onExpandedChange}
               hoverHotkeys={hoverHotkeys}
+              onShowHistory={onShowHistory}
             />
           ))}
         </div>
@@ -504,6 +509,9 @@ function DirectoryTreeNode({
           onCreateFolder={createFolderInDirectory}
           onRename={renameCurrentEntry}
           onDelete={deleteCurrentEntry}
+          onShowHistory={
+            !entry.isDirectory && onShowHistory ? () => onShowHistory(entry.path) : undefined
+          }
           sortMode={sortMode}
           onSortModeChange={onSortModeChange}
         />

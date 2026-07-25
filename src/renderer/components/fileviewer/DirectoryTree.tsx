@@ -3,6 +3,7 @@ import * as Icons from 'lucide-react';
 import type { DirectoryEntry, PathType } from '../../../shared/types';
 import DirectoryTreeNode, { sortEntries, FS_RELIST_DEBOUNCE_MS } from './DirectoryTreeNode';
 import FileContextMenu, { type TreeSortMode } from '../shared/FileContextMenu';
+import FileHistoryView from '../checkpoints/FileHistoryView';
 import { useNamePrompt } from '../../hooks/useNamePrompt';
 import { useDashboardStore } from '../../stores/dashboard-store';
 import { TREE_ENTRY_MIME, isInternalTreeDrag, isExternalFileDrop, hasDroppedDirectory, getDroppedNativePaths } from '../../utils/drag-file';
@@ -28,11 +29,20 @@ export default function DirectoryTree({ rootPath, pathType, activeFilePath, onFi
   const [rootContextMenu, setRootContextMenu] = useState<{ x: number; y: number } | null>(null);
   const [isRootDropTarget, setIsRootDropTarget] = useState(false);
   const [sortMode, setSortMode] = useState<TreeSortMode>('name');
+  // WP-G3.1 — file right-click → History. The checkpoint surface is workspace-scoped,
+  // so History is only offered when this tree's root maps to a known workspace.
+  const [historyPath, setHistoryPath] = useState<string | null>(null);
   const cache = useRef(new Map<string, DirectoryEntry[]>());
   const { prompt: promptName, modal: namePromptModal } = useNamePrompt();
   const checkHealth = useDashboardStore((s) => s.checkHealth);
   const renameTabPath = useDashboardStore((s) => s.renameTabPath);
   const hasDirtyTabForPath = useDashboardStore((s) => s.hasDirtyTabForPath);
+  const workspaceId = useDashboardStore((s) => {
+    const norm = (p: string) => p.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+    const target = norm(rootPath);
+    return s.workspaces.find((w) => norm(w.path) === target)?.id ?? null;
+  });
+  const showHistory = workspaceId ? (filePath: string) => setHistoryPath(filePath) : undefined;
 
   const reloadRoot = useCallback(async () => {
     if (!rootPath) return;
@@ -222,7 +232,7 @@ export default function DirectoryTree({ rootPath, pathType, activeFilePath, onFi
 
   return (
     <div
-      className="h-full flex flex-col border-r dark:border-white/10 light:border-black/10 bg-surface-0/40"
+      className="relative h-full flex flex-col border-r dark:border-white/10 light:border-black/10 bg-surface-0/40"
       onContextMenu={handleRootContextMenu}
     >
       <div className="px-3 py-2 border-b dark:border-white/10 light:border-black/10 flex items-start justify-between gap-2">
@@ -269,10 +279,19 @@ export default function DirectoryTree({ rootPath, pathType, activeFilePath, onFi
               onTreeChanged={invalidateDir}
               onSiblingsChanged={reloadRoot}
               promptName={promptName}
+              onShowHistory={showHistory}
             />
           ))
         )}
       </div>
+
+      {historyPath && workspaceId && (
+        <FileHistoryView
+          workspaceId={workspaceId}
+          path={historyPath}
+          onClose={() => setHistoryPath(null)}
+        />
+      )}
       {rootContextMenu && (
         <FileContextMenu
           x={rootContextMenu.x}

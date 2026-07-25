@@ -156,6 +156,9 @@ const api: IpcApi = {
       ipcRenderer.invoke(CHECKPOINT_CHANNELS.preview, workspaceId, turnId, paths),
     restore: (req) => ipcRenderer.invoke(CHECKPOINT_CHANNELS.restore, req),
     revert: (req) => ipcRenderer.invoke(CHECKPOINT_CHANNELS.revert, req),
+    // WP-G3.1 — per-path version history (file right-click → History).
+    fileHistory: (workspaceId, path, opts) =>
+      ipcRenderer.invoke(CHECKPOINT_CHANNELS.fileHistory, workspaceId, path, opts),
   },
   plans: {
     // WP5: fires after each WP4 reparse so the renderer re-fetches the served

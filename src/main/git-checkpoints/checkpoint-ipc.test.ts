@@ -114,6 +114,18 @@ function makeRoutes(cfg: FakeCfg = {}): HumanCheckpointRoutes & { state: FakeSta
         }],
       };
     },
+    fileHistory: async (workspaceId, filePath, opts) => {
+      rec('fileHistory', [workspaceId, filePath, opts]);
+      return {
+        workspaceId, path: filePath,
+        versions: [{
+          turnId: 't1', turnSeq: 1, agentId: 'a1', agentTitle: 'A', taskLabel: 'task',
+          status: 'accepted', startedAt: 1, endedAt: 2, beforeReady: true, afterReady: true,
+          beforeQuality: 'guaranteed', afterQuality: 'hook', witnessedPath: filePath, op: 'write' as const,
+          afterVerified: true, beforeRawFilterBypassed: false,
+        }],
+      };
+    },
     diff: async (workspaceId, turnId) => {
       rec('diff', [workspaceId, turnId]);
       return {
@@ -166,6 +178,20 @@ test('list/diff/preview delegate with the workspace + turn, scoped', async () =>
 
   await ipc.invoke(CHECKPOINT_CHANNELS.preview, 'ws-1', 't1', ['a.txt']);
   assert.deepEqual(routes.state.calls.at(-1), { method: 'preview', args: ['ws-1', 't1', ['a.txt']] });
+});
+
+test('file-history delegates workspace-scoped with the canonical path + optional agent filter', async () => {
+  const { ipc, routes } = wire();
+  const res = await ipc.invoke(CHECKPOINT_CHANNELS.fileHistory, 'ws-1', 'src/a.txt', { agentId: 'a1' }) as {
+    workspaceId: string; path: string; versions: unknown[];
+  };
+  assert.equal(res.workspaceId, 'ws-1');
+  assert.equal(res.path, 'src/a.txt');
+  assert.equal(res.versions.length, 1);
+  assert.deepEqual(routes.state.calls.at(-1), { method: 'fileHistory', args: ['ws-1', 'src/a.txt', { agentId: 'a1' }] });
+
+  // A missing path is rejected before any engine call.
+  await assert.rejects(() => ipc.invoke(CHECKPOINT_CHANNELS.fileHistory, 'ws-1', ''), /path/);
 });
 
 // ── 1b. beforeRawFilterBypassed rides the list summary to the renderer ───────────

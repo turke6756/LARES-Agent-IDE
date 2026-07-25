@@ -3,6 +3,7 @@ import { useShallow } from 'zustand/react/shallow';
 import type { FileActivity, PathType } from '../../../shared/types';
 import { useDashboardStore } from '../../stores/dashboard-store';
 import FileContextMenu from '../shared/FileContextMenu';
+import FileHistoryView from '../checkpoints/FileHistoryView';
 import { fileDragStart } from '../../utils/drag-file';
 
 interface Props {
@@ -96,6 +97,9 @@ export default function FileActivityList({ activities, pathType, agentId, title,
   );
   const clickTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; filePath: string } | null>(null);
+  // WP-G3.1 — file right-click → History. Scoped to the resolved workspace (present
+  // only when this list is bound to an agent, so the checkpoint surface has a scope).
+  const [historyPath, setHistoryPath] = useState<string | null>(null);
   // The agent's live session is its current resume session id; any activity
   // stamped under a different session is prior (out-of-context) history.
   const liveSessionId = agent?.resumeSessionId ?? null;
@@ -237,6 +241,15 @@ export default function FileActivityList({ activities, pathType, agentId, title,
           showRevealInTree={!!agentId}
           onClose={() => setContextMenu(null)}
           onRevealInTree={handleRevealInTree}
+          onShowHistory={workspace ? () => setHistoryPath(contextMenu.filePath) : undefined}
+        />
+      )}
+
+      {historyPath && workspace && (
+        <FileHistoryView
+          workspaceId={workspace.id}
+          path={historyPath}
+          onClose={() => setHistoryPath(null)}
         />
       )}
     </div>

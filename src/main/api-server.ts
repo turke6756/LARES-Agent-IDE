@@ -74,7 +74,7 @@ import { runKnowledgeExtract } from './agent-knowledge/knowledge-extract-runner'
 import { runOverheadScan } from './context-overhead/ipc-deps';
 import { buildOverheadSnapshot, scrubPaths } from './context-overhead/overhead-dto';
 import type { AgentRoleLane, BehaviorEvidenceTier, ContextOptimizerProposalKind, ContextOptimizerResult, AgentKnowledgeGraph, SkillUsageResult, McpToolUsageRollupDTO, WorkspaceScopeMode, PathRole, OverheadModel } from '../shared/types';
-import type { DiffResult, RestoreOutcome, CheckpointPreviewResult } from './git-checkpoints/checkpoint-service';
+import type { DiffResult, RestoreOutcome, CheckpointPreviewResult, FileHistoryVersion } from './git-checkpoints/checkpoint-service';
 
 /** Machine-readable failure classes the top-level error serializer is allowed
  *  to expose in JSON bodies. Errors thrown inside routes can carry raw Node
@@ -290,6 +290,10 @@ export interface TurnCheckpointSummary {
  *  reachable over HTTP/MCP. The interface simply gives no way to pass it. */
 export interface CheckpointRoutes {
   list(workspaceId: string, opts?: { agentId?: string }): Promise<TurnCheckpointSummary[]> | TurnCheckpointSummary[];
+  /** WP-G3.1 — versions of ONE canonical path across retained, live-verified turns.
+   *  Only edges with a live-verified before-ref are returned (a pruned edge is never
+   *  listed as restorable). */
+  fileHistory(workspaceId: string, path: string, opts?: { agentId?: string }): Promise<FileHistoryVersion[]>;
   diff(turnId: string, workspaceId: string): Promise<{ witnessed: DiffResult; window: DiffResult }>;
   preview(turnId: string, workspaceId: string, requestedPaths?: string[]): Promise<CheckpointPreviewResult>;
   restorePaths(args: {
@@ -735,6 +739,27 @@ export class ApiServer {
       const agentFilter = url.searchParams.get('agentId') || undefined;
       const turns = await routes.list(workspaceId, agentFilter ? { agentId: agentFilter } : undefined);
       return { workspaceId, turns };
+    }
+
+    // GET /api/checkpoints/file-history?path= — versions of ONE canonical path across
+    // retained turns (WP-G3.1). Same capability gate as every checkpoint route (run
+    // above); only live-verified before-edges come back (pruned edges excluded).
+    if (method === 'GET' && path === '/api/checkpoints/file-history') {
+      const routes = this.requireCheckpointRoutes();
+      const filePath = url.searchParams.get('path');
+      if (!filePath) {
+        throw Object.assign(
+          new Error('file-history requires a non-empty `path` query param'),
+          { statusCode: 400, code: 'checkpoint-bad-request' },
+        );
+      }
+      const agentFilter = url.searchParams.get('agentId') || undefined;
+      const versions = await routes.fileHistory(
+        workspaceId,
+        filePath,
+        agentFilter ? { agentId: agentFilter } : undefined,
+      );
+      return { workspaceId, path: filePath, versions };
     }
 
     // POST /api/checkpoints/prune — mechanism route (retention policy = WP-G3.5).
