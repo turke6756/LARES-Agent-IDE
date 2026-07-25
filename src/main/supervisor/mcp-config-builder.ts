@@ -55,7 +55,13 @@ export function toolsetsForLane(lane: AgentRoleLane): string {
       // reaches them through the scaffolded `context-analytics` skill instead —
       // a few hundred resident tokens of frontmatter rather than 13 always-loaded
       // schemas. Cost decision, not a value judgment; the HTTP routes are intact.
-      return 'orchestration,comms,observability-core,plans,browser-present';
+      // WP-G2.3 (Git-Native): `checkpoints` — the capability-bound checkpoint
+      // recovery toolset — is appended to the SUPERVISOR lane ONLY. Shape §8.3:
+      // recovery tools are supervisor-tier + human, NEVER workers/researchers.
+      // Toolset-hiding here is defense-in-depth; the authorization boundary is
+      // the minted capability token the /api/checkpoints* routes require
+      // (WP-G2.0/2.1). Do NOT add `checkpoints` to the worker or researcher grant.
+      return 'orchestration,comms,observability-core,plans,browser-present,checkpoints';
     case 'worker':
       // QW1 (context-optimizer §3): `notebooks` removed — 0 notebook tool
       // invocations corpus-wide in the 546-file worker matrix. This is a rent

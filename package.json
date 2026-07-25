@@ -59,6 +59,7 @@
           "mcp-tools-observability.js",
           "mcp-tools-plans.js",
           "mcp-tools-notebooks.js",
+          "mcp-tools-checkpoints.js",
           "mcp-browser-tools.js",
           "mcp-browser-present-tools.js",
           "lib/**"

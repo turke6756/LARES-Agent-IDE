@@ -50,7 +50,8 @@ test('toolsetsForLane: supervisor gets orchestration/comms/observability-core/pl
   // both; the analytics half has since been RETIRED (all 13 tools deleted,
   // replaced by the on-demand snapshot exporter + the `context-analytics` skill),
   // so it is gone from this grant.
-  assert.equal(toolsetsForLane('supervisor'), 'orchestration,comms,observability-core,plans,browser-present');
+  // WP-G2.3 appended `checkpoints` (supervisor-lane-only recovery toolset).
+  assert.equal(toolsetsForLane('supervisor'), 'orchestration,comms,observability-core,plans,browser-present,checkpoints');
 });
 
 test('toolsetsForLane: the full `plans` grant is supervisor-ONLY (not worker/researcher/legacy)', () => {
@@ -112,6 +113,30 @@ test('toolsetsForLane: supervisor + worker get the open-only browser-present gra
 
 test('toolsetsForLane: researcher gets the full browser, NOT the open-only browser-present', () => {
   assert.equal(toolsetsForLane('researcher'), 'browser');
+});
+
+// ── WP-G2.3: the `checkpoints` recovery toolset is supervisor-lane ONLY ──────
+// Shape §8.3: checkpoint recovery tools are supervisor-tier + human, NEVER
+// workers/researchers. Toolset-hiding is defense-in-depth; the real boundary is
+// the minted capability token the /api/checkpoints* routes require (WP-G2.0/2.1)
+// — the server-side rejection of a non-supervisor caller is proven in
+// api-server-checkpoints.test.ts ("a minted worker credential … is refused
+// (supervisor-tier)"). Here we own the config/grant side.
+
+test('toolsetsForLane: the supervisor grant contains the `checkpoints` toolset (WP-G2.3)', () => {
+  assert.ok(toolsetsForLane('supervisor').split(',').includes('checkpoints'),
+    'supervisor must be granted the checkpoints recovery toolset');
+});
+
+test('toolsetsForLane: `checkpoints` is granted to the supervisor lane ONLY (never worker/researcher/legacy)', () => {
+  // Shape §8.3: recovery tools NEVER reach workers. This asserts the grant layer
+  // hides the toolset from every non-supervisor lane (belt-and-suspenders behind
+  // the capability-token authorization the routes enforce).
+  assert.ok(toolsetsForLane('supervisor').split(',').includes('checkpoints'));
+  for (const lane of ['worker', 'researcher', 'legacy'] as const) {
+    assert.ok(!toolsetsForLane(lane).split(',').includes('checkpoints'),
+      `${lane} must NOT be granted the checkpoints toolset (shape §8.3: never workers)`);
+  }
 });
 
 test('toolsetsForLane: legacy gets the empty grant (no dashboard MCP)', () => {
