@@ -1,6 +1,6 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron';
 import type { IpcApi, DetachRequest, DetachedClosedPayload, ViewDetachRequest, ViewDetachedClosedPayload, FlushRequestPayload, FlushReplyPayload } from '../shared/types';
-import { TAB_CHANNELS, VIEW_CHANNELS } from '../shared/types';
+import { TAB_CHANNELS, VIEW_CHANNELS, CHECKPOINT_CHANNELS } from '../shared/types';
 import { BROWSER_CHANNELS } from '../shared/browser';
 import type {
   AccessRequestDecision,
@@ -144,6 +144,18 @@ const api: IpcApi = {
   // .lares/detached/ dir; each row is PID-verified in main. Handle in index.ts.
   detached: {
     list: (workspaceRoot) => ipcRenderer.invoke('detached:list', workspaceRoot),
+  },
+  // Git-Native WP-G2.2 — human checkpoint recovery surface (list/diff/preview/
+  // restore/revert). Handlers live in git-checkpoints/checkpoint-ipc.ts (registered
+  // from ipc-handlers.ts). `restore`/`revert` carry an IPC-only `force` on their
+  // request object; main refuses it while an active turn witnesses a path.
+  checkpoints: {
+    list: (workspaceId, opts) => ipcRenderer.invoke(CHECKPOINT_CHANNELS.list, workspaceId, opts),
+    diff: (workspaceId, turnId) => ipcRenderer.invoke(CHECKPOINT_CHANNELS.diff, workspaceId, turnId),
+    preview: (workspaceId, turnId, paths) =>
+      ipcRenderer.invoke(CHECKPOINT_CHANNELS.preview, workspaceId, turnId, paths),
+    restore: (req) => ipcRenderer.invoke(CHECKPOINT_CHANNELS.restore, req),
+    revert: (req) => ipcRenderer.invoke(CHECKPOINT_CHANNELS.revert, req),
   },
   plans: {
     // WP5: fires after each WP4 reparse so the renderer re-fetches the served

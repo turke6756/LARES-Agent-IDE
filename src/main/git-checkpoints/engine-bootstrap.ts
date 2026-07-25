@@ -20,6 +20,7 @@ import {
   type WitnessObserver,
 } from '../database';
 import type { CheckpointRoutes, TurnCheckpointSummary } from '../api-server';
+import type { HumanCheckpointRoutes } from './checkpoint-ipc';
 import { resolveInternalGit, probeWorkspaceGit } from '../git/git-runtime';
 import { CheckpointQueue } from './checkpoint-queue';
 import { CheckpointService } from './checkpoint-service';
@@ -42,6 +43,12 @@ export interface CheckpointEngineHandle {
    *  restore/revert), resolving the git capability per workspace and delegating to
    *  the CheckpointService. Injected into ApiServer via `setCheckpointRoutes`. */
   checkpointRoutes: CheckpointRoutes;
+  /** WP-G2.2 — the HUMAN renderer surface. Same service + domain checks as
+   *  `checkpointRoutes`, but `restore`/`revert` accept `force` (the IPC-only
+   *  stale-preview override). Injected into the IPC layer via
+   *  `setHumanCheckpointRoutes`. The Open #4 force gate (refuse while an active
+   *  turn witnesses a path) lives in the IPC layer, not here. */
+  humanCheckpointRoutes: HumanCheckpointRoutes;
 }
 
 /** TurnRecord → the workspace-scoped list DTO. Carries witnessed PATHS only, never
@@ -162,6 +169,49 @@ export async function createCheckpointEngine(): Promise<CheckpointEngineHandle |
     // backend; ApiServer returns a clear 501 not-yet-available for POST …/prune.
   };
 
+  // WP-G2.2 — the HUMAN renderer surface. It REUSES the WP-G2.1 checkpointRoutes for
+  // the read paths (list/diff/preview) so the workspace-scoped envelope and the
+  // witnessed-subset / preview-token checks are shared, not reimplemented; only
+  // restore/revert differ, adding the IPC-only `force` passed straight to the
+  // CheckpointService (which bypasses a stale preview-token mismatch). The Open #4
+  // gate that decides WHETHER a force is allowed (no active turn may witness a
+  // requested path) is enforced one layer up, in checkpoint-ipc.ts, via this same
+  // surface's `preview` contention. The row actor for every human op is 'human-ipc'.
+  const humanCheckpointRoutes: HumanCheckpointRoutes = {
+    list: async (workspaceId, opts) => ({
+      workspaceId,
+      turns: await checkpointRoutes.list(workspaceId, opts),
+    }),
+    diff: async (workspaceId, turnId) => {
+      const d = await checkpointRoutes.diff(turnId, workspaceId);
+      return { workspaceId, turnId, witnessed: d.witnessed, window: d.window };
+    },
+    preview: (workspaceId, turnId, paths) => checkpointRoutes.preview(turnId, workspaceId, paths),
+    restore: async ({ workspaceId, turnId, paths, previewTokens, force }) => {
+      const cap = await requireCapability(workspaceId);
+      return service.restorePaths({
+        turnId,
+        requestedPaths: paths,
+        workspaceId,
+        actor: 'human-ipc',
+        capability: cap,
+        previewTokens,
+        force,
+      });
+    },
+    revert: async ({ workspaceId, turnId, previewTokens, force }) => {
+      const cap = await requireCapability(workspaceId);
+      return service.revertTurn({
+        turnId,
+        workspaceId,
+        actor: 'human-ipc',
+        capability: cap,
+        previewTokens,
+        force,
+      });
+    },
+  };
+
   const buildTurnContext = (agentId: string, dispatch: DispatchContext) =>
     buildDispatchTurnContext(
       { getAgent: (id) => getAgent(id) as unknown as DispatchAgentInfo | null, resolveCapability },
@@ -188,5 +238,6 @@ export async function createCheckpointEngine(): Promise<CheckpointEngineHandle |
     witnessObserve: witness.observe,
     runStartupMaintenance,
     checkpointRoutes,
+    humanCheckpointRoutes,
   };
 }

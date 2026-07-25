@@ -26,7 +26,7 @@ import { AgentSupervisor } from './supervisor';
 import { startContinuationWatcher } from './supervisor/continuation-watcher-wiring';
 import { runCheckpointStartupMaintenance } from './git-checkpoints/reconciler';
 import { createCheckpointEngine } from './git-checkpoints/engine-bootstrap';
-import { registerIpcHandlers } from './ipc-handlers';
+import { registerIpcHandlers, setHumanCheckpointRoutes } from './ipc-handlers';
 import { installExternalNavHandlers, forceCloseAllDetached, getDetachedEntries, type DetachedWindowDeps } from './detached-windows';
 import { runCloseFlush, type FlushTarget } from './close-flush';
 import { TAB_CHANNELS, type FlushRequestPayload } from '../shared/types';
@@ -765,6 +765,8 @@ app.whenReady().then(async () => {
           // (no await precedes it), so it is non-null by the time this async IIFE
           // resumes; the `?.` is belt-and-suspenders.
           apiServer?.setCheckpointRoutes(engine.checkpointRoutes);
+          // WP-G2.2: hand the force-capable human surface to the renderer IPC layer.
+          setHumanCheckpointRoutes(engine.humanCheckpointRoutes);
           await engine.runStartupMaintenance();
         } else {
           // No usable internal git → engine off, but the sweep backstop still runs.

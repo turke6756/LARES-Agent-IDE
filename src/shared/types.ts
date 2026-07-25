@@ -1522,6 +1522,124 @@ export interface WorkspaceSecurityNotice {
   inertBackups: string[];
 }
 
+// ── Git-Native WP-G2.2: renderer checkpoint IPC contract ────────────────────────
+// Wire DTOs for the HUMAN renderer's checkpoint recovery surface. They mirror the
+// main-process shapes (TurnCheckpointSummary in api-server.ts; DiffResult /
+// CheckpointPreviewResult / RestoreOutcome in git-checkpoints/checkpoint-service.ts)
+// field-for-field, but live here because the renderer cannot import from src/main.
+// The engine's human-routes adapter (engine-bootstrap.ts) returns the concrete
+// main-process objects, which must stay STRUCTURALLY ASSIGNABLE to these — so any
+// drift in the source shapes is a compile error at the adapter, not a silent gap.
+
+/** One turn's checkpoint state as the renderer list surface returns it. Witnessed
+ *  PATHS only — never worktree bytes. */
+export interface CheckpointTurnSummary {
+  turnId: string;
+  turnSeq: number;
+  agentId: string | null;
+  agentTitle: string | null;
+  taskLabel: string | null;
+  status: string;
+  startedAt: number | null;
+  endedAt: number | null;
+  beforeReady: boolean;
+  afterReady: boolean;
+  beforeQuality: string | null;
+  afterQuality: string | null;
+  /** Witnessed write/create paths — the ONLY revertable set for this turn. */
+  witnessedPaths: string[];
+  failureReason: string | null;
+}
+
+/** One side of a turn diff: the witnessed (attributed) changes OR the separately
+ *  labeled raw window ("unattributed changes in this window"). Carries text, not
+ *  the raw blobs. */
+export interface CheckpointDiffEntry {
+  available: boolean;
+  reason: string | null;
+  /** Human label — witnessed vs. "unattributed changes in this window". */
+  label: string;
+  text: string | null;
+  provenance?: 'witnessed' | 'raw-window';
+}
+
+/** The list route's envelope: the resolved workspace + its turns. */
+export interface CheckpointListResult {
+  workspaceId: string;
+  turns: CheckpointTurnSummary[];
+}
+
+/** A turn diff: witnessed changes PLUS the separately-labeled raw window. */
+export interface CheckpointDiffResult {
+  workspaceId: string;
+  turnId: string;
+  witnessed: CheckpointDiffEntry;
+  window: CheckpointDiffEntry;
+}
+
+/** Restore preview: the witnessed set + per-path anti-TOCTOU tokens (current
+ *  worktree OID, or an ABSENT sentinel) the renderer echoes back to restore/revert.
+ *  `contention` lists any OTHER open turn currently witnessing a requested path —
+ *  the signal that gates a human `force`. Carries NO worktree bytes. */
+export interface CheckpointPreviewResult {
+  available: boolean;
+  reason: string | null;
+  turnId: string;
+  witnessedSet: string[];
+  tokens: Record<string, string>;
+  validatedPaths: string[];
+  rejectedPaths: string[];
+  contention: { path: string; turnId: string }[];
+}
+
+/** Outcome of a restore/revert (path-scoped, partial-recoverable). A human `force`
+ *  refused because an active turn witnesses a requested path surfaces here as
+ *  `status: 'failed'` + `failureReason: 'active-turn-witnesses-path'` with the
+ *  offending turns in `contention` (no mutation happened). */
+export interface CheckpointRestoreResult {
+  status: 'completed' | 'partial' | 'failed';
+  operationId: string;
+  kind: 'restore_paths' | 'revert_turn';
+  preRef: string | null;
+  preOid: string | null;
+  requestedPaths: string[];
+  completedPaths: string[];
+  rejectedPaths: string[];
+  failures: { path: string; reason: string }[];
+  contention: { path: string; turnId: string }[];
+  failureReason: string | null;
+}
+
+/** Renderer → main restore request. `force` (stale-preview override) is IPC-ONLY
+ *  and only honored when no active turn witnesses a requested path. */
+export interface CheckpointRestoreRequest {
+  workspaceId: string;
+  turnId: string;
+  /** A subset of the turn's witnessed set. */
+  paths: string[];
+  /** path → OID seen at preview time (the anti-TOCTOU tokens). */
+  previewTokens?: Record<string, string>;
+  force?: boolean;
+}
+
+/** Renderer → main revert request (the turn's full witnessed set). */
+export interface CheckpointRevertRequest {
+  workspaceId: string;
+  turnId: string;
+  previewTokens?: Record<string, string>;
+  force?: boolean;
+}
+
+/** IPC channel names for the renderer checkpoint surface — one source of truth for
+ *  preload, the main registrar, and the contract test. */
+export const CHECKPOINT_CHANNELS = {
+  list: 'checkpoint:list',
+  diff: 'checkpoint:diff',
+  preview: 'checkpoint:preview',
+  restore: 'checkpoint:restore',
+  revert: 'checkpoint:revert',
+} as const;
+
 export interface IpcApi {
   workspaces: {
     list: () => Promise<Workspace[]>;
@@ -2025,6 +2143,20 @@ export interface IpcApi {
    *  <workspaceRoot>/.lares/detached/, each verified against its live PID. */
   detached: {
     list: (workspaceRoot: string) => Promise<DetachedProcessDto[]>;
+  };
+  /** Git-Native WP-G2.2 — the HUMAN renderer's checkpoint recovery surface,
+   *  workspace-scoped. Mirrors the capability-bound HTTP routes (WP-G2.1) for
+   *  agents, but this path is TRUSTED (it's the renderer, no capability token)
+   *  while reusing the same domain checks (witnessed-subset, preview token) via the
+   *  shared engine/service surface. `restore`/`revert` accept a `force`
+   *  (stale-preview override) that is IPC-ONLY and refused while an active turn
+   *  witnesses a requested path. */
+  checkpoints: {
+    list: (workspaceId: string, opts?: { agentId?: string }) => Promise<CheckpointListResult>;
+    diff: (workspaceId: string, turnId: string) => Promise<CheckpointDiffResult>;
+    preview: (workspaceId: string, turnId: string, paths?: string[]) => Promise<CheckpointPreviewResult>;
+    restore: (req: CheckpointRestoreRequest) => Promise<CheckpointRestoreResult>;
+    revert: (req: CheckpointRevertRequest) => Promise<CheckpointRestoreResult>;
   };
 }
 

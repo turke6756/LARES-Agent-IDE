@@ -102,6 +102,9 @@ const TESTS = [
   // dedupe), dispatch-context builder, and the send-queue → before-checkpoint wiring.
   'dist/main/main/git-checkpoints/witness-recorder.test.js',
   'dist/main/main/git-checkpoints/dispatch-context.test.js',
+  // Git-Native WP-G2.2: the human renderer's checkpoint IPC registrar + the
+  // Open #4 force gate (refuse while an active turn witnesses a requested path).
+  'dist/main/main/git-checkpoints/checkpoint-ipc.test.js',
   'dist/main/main/supervisor/send-queue-checkpoint.test.js',
   'dist/main/main/supervisor/initial-user-prompt.test.js',
   'dist/main/main/supervisor/hook-spool-tailer.test.js',

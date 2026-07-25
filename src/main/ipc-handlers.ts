@@ -56,10 +56,22 @@ import {
   removeLegacyLauncher,
 } from './workspace-state-dir';
 import { ensureInstallationLauncher } from './installation-descriptor';
+import { registerCheckpointIpc, type HumanCheckpointRoutes } from './git-checkpoints/checkpoint-ipc';
 
 // Managed temp dir for clipboard-bitmap pastes. Dropped OS files inject their
 // OWN on-disk path (converted) and never land here — only screenshots do.
 const PASTED_IMAGE_DIR = path.join(app.getPath('temp'), 'lares-pasted-images');
+
+// Git-Native WP-G2.2 — the human renderer's checkpoint surface. The checkpoint
+// engine bootstraps ASYNCHRONOUSLY (after these handlers are registered), so the
+// force-capable HumanCheckpointRoutes is late-injected here via
+// `setHumanCheckpointRoutes`; the registered handlers read it lazily and answer an
+// honest "engine unavailable" until it lands (mirrors ApiServer.setCheckpointRoutes
+// / setWitnessObserver). Null when there is no usable git.
+let humanCheckpointRoutes: HumanCheckpointRoutes | null = null;
+export function setHumanCheckpointRoutes(routes: HumanCheckpointRoutes | null): void {
+  humanCheckpointRoutes = routes;
+}
 
 function resolveMutationPathType(primaryPath: string, rootDirectory: string, pathType?: PathType): PathType {
   const primaryType = detectPathType(primaryPath);
@@ -128,6 +140,10 @@ export function registerIpcHandlers(
     if (typeof planId === 'string' && planId !== '') assertPlanRailFree(planId);
     return supervisor.launchAgent(input);
   });
+  // Git-Native WP-G2.2 — human checkpoint recovery surface (list/diff/preview/
+  // restore/revert). Registered synchronously here with a lazy getter so the
+  // channels exist before the async engine bootstrap injects the routes.
+  registerCheckpointIpc(ipcMain, () => humanCheckpointRoutes);
   // 'agent:stop' is registered by registerLifecycleIpc (lifecycle/lifecycle-ipc.ts)
   // so that every stop endpoint assigns its own reason in ONE place and a
   // renderer can never supply one (§B9).
