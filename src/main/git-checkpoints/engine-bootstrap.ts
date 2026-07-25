@@ -53,7 +53,7 @@ export interface CheckpointEngineHandle {
 
 /** TurnRecord → the workspace-scoped list DTO. Carries witnessed PATHS only, never
  *  worktree bytes. */
-function toCheckpointSummary(r: import('../database').TurnRecord): TurnCheckpointSummary {
+export function toCheckpointSummary(r: import('../database').TurnRecord): TurnCheckpointSummary {
   return {
     turnId: r.id,
     turnSeq: r.turnSeq,
@@ -71,6 +71,9 @@ function toCheckpointSummary(r: import('../database').TurnRecord): TurnCheckpoin
       .filter((e) => e.op === 'write' || e.op === 'create')
       .map((e) => e.path),
     failureReason: r.failureReason,
+    // CONTENT-semantics diagnostic — surfaced so RestoreDialog can warn that a
+    // restore of filter-managed (LFS/git-crypt) paths rewrites on-disk bytes.
+    beforeRawFilterBypassed: r.beforeRawFilterBypassed,
   };
 }
 

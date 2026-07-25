@@ -19,6 +19,8 @@ import { ApiServer, type CheckpointRoutes } from './api-server';
 import { getApiToken } from './security/api-auth';
 import { agentCapabilities } from './security/agent-capabilities';
 import type { AgentSupervisor } from './supervisor';
+import { toCheckpointSummary } from './git-checkpoints/engine-bootstrap';
+import type { TurnRecord } from './database';
 
 interface TestCase { name: string; run(): Promise<void> | void; }
 const tests: TestCase[] = [];
@@ -56,6 +58,7 @@ function makeFakeRoutes(overrides: Partial<CheckpointRoutes> = {}): CheckpointRo
         turnId: 't1', turnSeq: 1, agentId: 'a1', agentTitle: 'A', taskLabel: 'task',
         status: 'accepted', startedAt: 1, endedAt: 2, beforeReady: true, afterReady: true,
         beforeQuality: 'guaranteed', afterQuality: 'hook', witnessedPaths: ['a.txt'], failureReason: null,
+        beforeRawFilterBypassed: false,
       }];
     },
     diff: async (turnId, workspaceId) => {
@@ -388,6 +391,60 @@ test('with the engine unwired, an AUTHORIZED supervisor gets 503 (feature off)',
     assert.equal(res.status, 503);
     assert.equal(parse(res).code, 'checkpoint-engine-unavailable');
   }, { routes: null }));
+
+// ── 12. beforeRawFilterBypassed flows TurnRecord → summary → HTTP wire ───────────
+// The CONTENT-semantics diagnostic is dropped by neither the adapter nor the route:
+// RestoreDialog's filter-managed warning is dormant unless the whole chain carries it.
+
+function makeTurnRecord(overrides: Partial<TurnRecord> = {}): TurnRecord {
+  return {
+    id: 't1', workspaceId: WS, turnSeq: 1, agentId: 'a1', agentTitle: 'A',
+    ownerAgentId: null, ownerBrickGeneration: null, sessionId: null, taskLabel: 'task',
+    startedAt: 1, endedAt: 2, status: 'accepted',
+    beforeOid: null, afterOid: null, beforeRef: null, afterRef: null,
+    beforeReady: true, afterReady: true, beforeQuality: 'guaranteed', afterQuality: 'hook',
+    beforeRawFilterBypassed: false, beforeFilteredPaths: null, beforePrunedAt: null, afterPrunedAt: null,
+    touched: [{ path: 'a.txt', op: 'write' }], diffStats: null, compactDiff: null,
+    compactDiffProvenance: null, failureReason: null,
+    ...overrides,
+  };
+}
+
+test('adapter maps beforeRawFilterBypassed=true from the turn record into the summary', () => {
+  const summary = toCheckpointSummary(makeTurnRecord({ beforeRawFilterBypassed: true }));
+  assert.equal(summary.beforeRawFilterBypassed, true);
+  // sanity: witnessed paths still derive from touched write/create entries.
+  assert.deepEqual(summary.witnessedPaths, ['a.txt']);
+});
+
+test('adapter maps beforeRawFilterBypassed=false from the turn record into the summary', () => {
+  const summary = toCheckpointSummary(makeTurnRecord({ beforeRawFilterBypassed: false }));
+  assert.equal(summary.beforeRawFilterBypassed, false);
+});
+
+test('list route carries beforeRawFilterBypassed=true onto the HTTP wire', () =>
+  withServer(async (port) => {
+    const res = await request(port, 'GET', '/api/checkpoints', { Authorization: bearerFor('supervisor', 'sup-A') });
+    assert.equal(res.status, 200);
+    assert.equal(parse(res).turns[0].beforeRawFilterBypassed, true);
+  }, {
+    routes: makeFakeRoutes({
+      list: () => [{
+        turnId: 't1', turnSeq: 1, agentId: 'a1', agentTitle: 'A', taskLabel: 'task',
+        status: 'accepted', startedAt: 1, endedAt: 2, beforeReady: true, afterReady: true,
+        beforeQuality: 'guaranteed', afterQuality: 'hook', witnessedPaths: ['a.txt'], failureReason: null,
+        beforeRawFilterBypassed: true,
+      }],
+    }),
+  }));
+
+test('list route carries beforeRawFilterBypassed=false onto the HTTP wire (warning dormant)', () =>
+  withServer(async (port) => {
+    // The default fake summary sets the flag false.
+    const res = await request(port, 'GET', '/api/checkpoints', { Authorization: bearerFor('supervisor', 'sup-A') });
+    assert.equal(res.status, 200);
+    assert.equal(parse(res).turns[0].beforeRawFilterBypassed, false);
+  }));
 
 // ── Run ──────────────────────────────────────────────────────────────────────────
 

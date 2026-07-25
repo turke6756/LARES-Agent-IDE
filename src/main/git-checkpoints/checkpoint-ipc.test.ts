@@ -56,6 +56,9 @@ interface FakeCfg {
   /** when true, a restore/revert WITHOUT force but WITH tokens fails as a stale
    *  preview; force flips it to completed (models the service's token bypass). */
   staleTokens?: boolean;
+  /** CONTENT-semantics diagnostic surfaced on the list summary. Left undefined to
+   *  model the absent case; set true/false to model the wired flag. */
+  rawFilterBypassed?: boolean;
 }
 
 interface FakeState {
@@ -107,6 +110,7 @@ function makeRoutes(cfg: FakeCfg = {}): HumanCheckpointRoutes & { state: FakeSta
           turnId: 't1', turnSeq: 1, agentId: 'a1', agentTitle: 'A', taskLabel: 'task',
           status: 'accepted', startedAt: 1, endedAt: 2, beforeReady: true, afterReady: true,
           beforeQuality: 'guaranteed', afterQuality: 'hook', witnessedPaths: ['a.txt'], failureReason: null,
+          ...(cfg.rawFilterBypassed === undefined ? {} : { beforeRawFilterBypassed: cfg.rawFilterBypassed }),
         }],
       };
     },
@@ -162,6 +166,26 @@ test('list/diff/preview delegate with the workspace + turn, scoped', async () =>
 
   await ipc.invoke(CHECKPOINT_CHANNELS.preview, 'ws-1', 't1', ['a.txt']);
   assert.deepEqual(routes.state.calls.at(-1), { method: 'preview', args: ['ws-1', 't1', ['a.txt']] });
+});
+
+// ── 1b. beforeRawFilterBypassed rides the list summary to the renderer ───────────
+// The CONTENT-semantics diagnostic must survive the IPC list contract so
+// RestoreDialog can warn on filter-managed (LFS/git-crypt) paths.
+
+test('list summary carries beforeRawFilterBypassed=true through the IPC contract', async () => {
+  const { ipc } = wire({ rawFilterBypassed: true });
+  const list = await ipc.invoke(CHECKPOINT_CHANNELS.list, 'ws-1') as { turns: { beforeRawFilterBypassed?: boolean }[] };
+  assert.equal(list.turns[0].beforeRawFilterBypassed, true);
+});
+
+test('list summary carries beforeRawFilterBypassed=false / absent through the IPC contract', async () => {
+  const falseCase = await wire({ rawFilterBypassed: false }).ipc
+    .invoke(CHECKPOINT_CHANNELS.list, 'ws-1') as { turns: { beforeRawFilterBypassed?: boolean }[] };
+  assert.equal(falseCase.turns[0].beforeRawFilterBypassed, false);
+
+  const absentCase = await wire().ipc
+    .invoke(CHECKPOINT_CHANNELS.list, 'ws-1') as { turns: { beforeRawFilterBypassed?: boolean }[] };
+  assert.equal(absentCase.turns[0].beforeRawFilterBypassed, undefined);
 });
 
 // ── 2. Input validation ─────────────────────────────────────────────────────────

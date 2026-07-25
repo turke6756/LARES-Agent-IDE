@@ -270,6 +270,14 @@ export interface TurnCheckpointSummary {
   /** Witnessed write/create paths (the ONLY revertable set for this turn). */
   witnessedPaths: string[];
   failureReason: string | null;
+  /** BEFORE-edge CONTENT-semantics diagnostic (turn_records.before_raw_filter_bypassed).
+   *  True when the before-snapshot captured on-disk bytes of a filter-managed path
+   *  (LFS / git-crypt) rather than its managed form — so a restore rewrites those
+   *  on-disk bytes and does NOT reconstruct the managed representation. Mirrors
+   *  CheckpointTurnSummary.beforeRawFilterBypassed so the HTTP list route and the
+   *  renderer IPC surface agree; RestoreDialog surfaces its content-semantics warning
+   *  when true. */
+  beforeRawFilterBypassed: boolean;
 }
 
 /** WP-G2.1 — the checkpoint engine surface the capability-bound `/api/checkpoints*`
