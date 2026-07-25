@@ -12,6 +12,7 @@ import { loadPersistedTheme } from './theme-persistence';
 import {
   initDatabase, getWorkspaces, getActiveAgents, reconcileStaleOpenContinuationAttempts,
   getPlan, getWorkspace, listOrchestrationRuns, getLiveRailAgentForPlan, getPlanEventsForRender,
+  setWitnessObserver,
 } from './database';
 import { createHash } from 'crypto';
 import { readFileContents } from './file-reader';
@@ -24,6 +25,7 @@ import { checkManagedWebContents } from './security/webcontents-guard';
 import { AgentSupervisor } from './supervisor';
 import { startContinuationWatcher } from './supervisor/continuation-watcher-wiring';
 import { runCheckpointStartupMaintenance } from './git-checkpoints/reconciler';
+import { createCheckpointEngine } from './git-checkpoints/engine-bootstrap';
 import { registerIpcHandlers } from './ipc-handlers';
 import { installExternalNavHandlers, forceCloseAllDetached, getDetachedEntries, type DetachedWindowDeps } from './detached-windows';
 import { runCloseFlush, type FlushTarget } from './close-flush';
@@ -729,15 +731,6 @@ app.whenReady().then(async () => {
       console.log(`[continuation] boot reconcile: aborted ${contRecon.aborted.length} orphaned attempt(s), ${contRecon.resumable.length} resumable`, contRecon);
     }
 
-    // Git-Native WP-G1.8: temp-artifact sweep + ref/DB crash-consistency
-    // reconciliation of persisted-non-ready checkpoint edges. Fire-and-forget so it
-    // never delays window creation; every workspace is isolated and non-fatal inside.
-    // (Full engine wiring — the exact workspaceId mapping + a live coordinator — lands
-    // with G1.7; this seam stays a couple of lines.)
-    void runCheckpointStartupMaintenance({ workspaces: getWorkspaces() }).catch((err) => {
-      console.error('[checkpoint] startup maintenance failed:', err);
-    });
-
     registerMediaProtocol(session.defaultSession.protocol, {
       workspaceRoots: getWorkspaceRootsWin(),
       translateWslPath: wslToWindowsPath,
@@ -754,6 +747,29 @@ app.whenReady().then(async () => {
     validateAndRepairWslClaudeJson();
 
     supervisor = new AgentSupervisor();
+
+    // Git-Native WP-G1.7 — construct the checkpoint engine (queue/service/
+    // completion-tracker/coordinator/witness), wire it into the supervisor, install
+    // the witness-join observer, and run the WP-G1.8 startup pass (temp-artifact
+    // sweep + ref/DB reconciliation) with the LIVE coordinator as the dangling-open
+    // close seam. Fire-and-forget so it never delays window creation; a git that
+    // cannot be resolved simply leaves the feature off (sweep-only fallback).
+    void (async () => {
+      try {
+        const engine = await createCheckpointEngine();
+        if (engine && supervisor) {
+          supervisor.attachCheckpointEngine(engine);
+          setWitnessObserver(engine.witnessObserve);
+          await engine.runStartupMaintenance();
+        } else {
+          // No usable internal git → engine off, but the sweep backstop still runs.
+          await runCheckpointStartupMaintenance({ workspaces: getWorkspaces() });
+        }
+      } catch (err) {
+        console.error('[checkpoint] engine bootstrap / startup maintenance failed:', err);
+      }
+    })();
+
     createWindow();
     // Detached-window deps (detachable-file-tabs-plan §4 1.3/1.4). devServerUrl
     // and theme are read live via getters so a tear-off spawned long after

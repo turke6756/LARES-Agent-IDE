@@ -49,6 +49,9 @@ import {
 } from '../scaffold-writer';
 import { resolveLaunchCommand } from './launch-command';
 import { TurnEvidenceTracker } from './turn-evidence';
+import type { TurnCoordinator, TurnContext } from '../git-checkpoints/turn-coordinator';
+import type { TurnCompletionTracker } from './turn-completion-tracker';
+import type { DispatchContext } from '../git-checkpoints/dispatch-context';
 import { detectInteractivePrompt } from './interactive-prompt-detector';
 import { isNonBlockingNotificationType } from '../../shared/notification-classify';
 import { workspaceStateDirName } from '../workspace-state-dir';
@@ -117,7 +120,7 @@ import {
   createAgent, getAgent, getActiveAgents, getAllAgents, getSupervisorAgent, getOwnerForWorker, getWorkspace, updateAgentStatus, applyStatusTransition, updateAgentPid,
   updateAgentExitCode, incrementRestartCount, updateAgentLastOutput,
   updateAgentAttached, addEvent, deleteAgent as dbDeleteAgent,
-  updateAgentResumeSessionId, addFileActivity, getTeamMembership, addTeamMember, getAgentTemplate,
+  updateAgentResumeSessionId, addFileActivity, clearWitnessObserver, getTeamMembership, addTeamMember, getAgentTemplate,
   getFileActivities, pruneFileActivitiesToRecentSessions, updateAgentHookStatus,
   updateAgentLastSendError, updateAgentLastSend,
   setContinuationEnabled as dbSetContinuationEnabled,
@@ -1180,6 +1183,20 @@ export class AgentSupervisor extends EventEmitter {
   // Consumed by the WP5 unified send confirmation as the 'session-log' source.
   private turnEvidence = new TurnEvidenceTracker();
 
+  // ── Git-Native WP-G1.7: checkpoint engine (attached by the bootstrap) ─────────
+  // Null until `attachCheckpointEngine()` wires the live coordinator + completion
+  // tracker + dispatch-context builder from src/main/index.ts. Every send-path and
+  // lifecycle touch guards with `?.`, so the supervisor runs identically when no
+  // engine is attached (tests, non-git workspaces, engine bootstrap failure).
+  private checkpointEngine: {
+    coordinator: TurnCoordinator;
+    completionTracker: TurnCompletionTracker;
+    buildTurnContext: (agentId: string, dispatch: DispatchContext) => Promise<TurnContext | null>;
+  } | null = null;
+  /** True once the lifecycle-evidence `statusChanged` listener has been registered,
+   *  so a re-attach never double-subscribes. */
+  private checkpointEvidenceWired = false;
+
   // BUG-11: epoch-ms of the last user-initiated PTY write per agent. Bumped
   // in `writeToAgent` (the only entrypoint for user-driven bytes — xterm
   // keystrokes, paste, file-drop, query-injection). NOT bumped by
@@ -1715,6 +1732,54 @@ export class AgentSupervisor extends EventEmitter {
    *  they don't write ~/.claude.json and /exit into their TUIs is undefined.
    *  WSL runners are only detached: their claude writes the distro's own
    *  ~/.claude.json, and tmux sessions outlive Electron by design. */
+  /**
+   * Git-Native WP-G1.7 — wire the live checkpoint engine (constructed in
+   * src/main/index.ts) into the supervisor. Called once at boot. Registers a
+   * single lifecycle-evidence listener that forwards accepted start/idle/exit/crash
+   * transitions into the completion tracker + coordinator. Idempotent on the
+   * listener (guarded by `checkpointEvidenceWired`).
+   */
+  attachCheckpointEngine(engine: {
+    coordinator: TurnCoordinator;
+    completionTracker: TurnCompletionTracker;
+    buildTurnContext: (agentId: string, dispatch: DispatchContext) => Promise<TurnContext | null>;
+  }): void {
+    this.checkpointEngine = engine;
+    if (this.checkpointEvidenceWired) return;
+    this.checkpointEvidenceWired = true;
+    // All hook / session-log / terminal / status transports converge on the
+    // supervisor's public 'statusChanged' emission, so it is the single seam for
+    // forwarding turn lifecycle evidence. 'working' is correlated START evidence
+    // (unlocks the tracker's idle-fallback); 'idle' is the debounced completion
+    // fallback; 'done' is a clean terminal exit; 'crashed'/'stopped' terminate the
+    // open turn with a best-effort degraded after-snapshot. Unknown agents / no
+    // open turn are all safe no-ops inside the tracker + coordinator.
+    this.on('statusChanged', (data: StatusChangedEvent | undefined) => {
+      const eng = this.checkpointEngine;
+      if (!data || !eng) return;
+      switch (data.status) {
+        case 'working':
+          eng.completionTracker.noteStart(data.agentId);
+          break;
+        case 'idle':
+          eng.completionTracker.noteIdle(data.agentId);
+          break;
+        case 'done':
+          eng.completionTracker.noteTerminalExit(data.agentId);
+          break;
+        case 'crashed':
+          eng.coordinator.markCrashed(data.agentId);
+          break;
+        case 'restarting':
+          // A restart interrupts the open turn (best-effort degraded after-snap).
+          eng.coordinator.markInterrupted(data.agentId);
+          break;
+        default:
+          break;
+      }
+    });
+  }
+
   async drainForShutdown(perAgentTimeoutMs = 4000, totalBudgetMs = 15000): Promise<void> {
     this.shuttingDown = true;
     // D4: reaper off while shuttingDown (drain-time survival is intentional —
@@ -1737,6 +1802,21 @@ export class AgentSupervisor extends EventEmitter {
     }
     for (const [, runner] of [...this.wslRunners]) {
       runner.detachHost();
+    }
+
+    // Git-Native WP-G1.7 — checkpoint-engine teardown. Stop the witness join
+    // (no new touches route after shutdown), then best-effort close any still-open
+    // turns (degraded after-snapshot) + dispose the completion tracker's timers.
+    // Best-effort: a teardown failure never blocks shutdown.
+    try {
+      clearWitnessObserver();
+      const eng = this.checkpointEngine;
+      if (eng) {
+        eng.completionTracker.disposeAll();
+        await eng.coordinator.shutdown();
+      }
+    } catch (err) {
+      console.warn('[checkpoint] engine teardown failed:', err);
     }
   }
 
@@ -6153,12 +6233,17 @@ export class AgentSupervisor extends EventEmitter {
    * agent's prompt buffer without pressing Enter (BUG-01: launch_agent's
    * `submit:false` flag).
    */
-  sendInput(agentId: string, text: string, opts: { submit?: boolean } = {}): Promise<boolean> {
+  sendInput(
+    agentId: string,
+    text: string,
+    opts: { submit?: boolean } = {},
+    dispatch?: DispatchContext,
+  ): Promise<boolean> {
     // WP5 — thin shim over the unified send op. Returns the outcome's
     // `delivered` boolean (false ONLY when no runner accepted the bytes), so
     // existing delivery-proof callers keep working. It NEVER rejects for a
     // merely-unconfirmed submit; a missing-runner still rejects eagerly.
-    return this.sendInputWithOutcome(agentId, text, opts).then((o) => o.delivered);
+    return this.sendInputWithOutcome(agentId, text, opts, dispatch).then((o) => o.delivered);
   }
 
   /**
@@ -6183,6 +6268,7 @@ export class AgentSupervisor extends EventEmitter {
     agentId: string,
     text: string,
     opts: { submit?: boolean } = {},
+    dispatch?: DispatchContext,
   ): Promise<SendOutcome> {
     if (!this.windowsRunners.get(agentId) && !this.wslRunners.get(agentId)) {
       return Promise.reject(new Error(`No runner for agent ${agentId}`));
@@ -6192,7 +6278,7 @@ export class AgentSupervisor extends EventEmitter {
     const previous = this.inputQueues.get(agentId) || Promise.resolve();
     const ours: Promise<SendOutcome> = previous
       .catch(() => undefined) // a prior failed send must not poison the queue
-      .then(() => this._deliverAndConfirm(agentId, text, submit));
+      .then(() => this._deliverAndConfirm(agentId, text, submit, dispatch));
     this.inputQueues.set(agentId, ours);
     // Clear in-flight only when the chain has fully drained for this agent.
     void ours
@@ -6212,6 +6298,7 @@ export class AgentSupervisor extends EventEmitter {
     agentId: string,
     text: string,
     submit: boolean,
+    dispatch?: DispatchContext,
   ): Promise<SendOutcome> {
     const agent = getAgent(agentId);
     // Baselines captured BEFORE delivery so replayed/pre-existing evidence can
@@ -6220,10 +6307,33 @@ export class AgentSupervisor extends EventEmitter {
     const baselineStartHook = this.monitor.getLastStartHookEventAt(agentId) ?? 0;
     const evidenceBaseline = this.turnEvidence.baseline(agentId, agent?.resumeSessionId ?? null);
 
+    // Git-Native WP-G1.7 — the BEFORE-checkpoint. Gated on `submit === true` and
+    // taken AFTER the baselines, BEFORE any PTY byte, so the snapshot precedes the
+    // agent's writes (plan §2.6). It FAILS OPEN: `beforeCheckpoint` never throws by
+    // contract, and even a thrown context-build is swallowed here — delivery is
+    // never blocked by the checkpoint (released by the WP-G1.5 wall-clock bound).
+    let openedTurn = false;
+    if (submit && this.checkpointEngine) {
+      try {
+        const ctx = await this.checkpointEngine.buildTurnContext(
+          agentId,
+          dispatch ?? { origin: 'human-terminal' },
+        );
+        if (ctx) {
+          await this.checkpointEngine.coordinator.beforeCheckpoint(agentId, ctx);
+          openedTurn = true;
+        }
+      } catch (err) {
+        console.warn(`[checkpoint] before-checkpoint failed for ${agentId} (delivery proceeds):`, err);
+      }
+    }
+
     const delivered = await this._doSendInput(agentId, text, submit);
     if (!delivered) {
       // The runner rejected/disappeared before accepting the bytes — nothing was
       // typed. This is the ONLY `failed` path; hook/confirmation gaps never are.
+      // Close the just-opened turn `delivery_failed` (never leave it `open`).
+      if (openedTurn) this.checkpointEngine?.coordinator.onDeliveryFailed(agentId);
       return this.recordSendOutcome({
         disposition: 'failed', agentId, delivered: false,
         reason: 'delivery-failed', completedAt: Date.now(),

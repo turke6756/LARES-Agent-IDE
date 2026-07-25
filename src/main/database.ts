@@ -3657,7 +3657,41 @@ function rowToFileActivity(row: any): FileActivity {
   };
 }
 
+// ── Git-Native WP-G1.7: witness-join observer seam ───────────────────────────
+//
+// Both witness sources — the Claude PTY scraper (`file-activity-tracker.ts`) and
+// the multi-provider structured monitor (`context-stats-monitor.ts` → supervisor)
+// — converge on `addFileActivity`. To feed a turn's `touched[]` we need a choke
+// point ABOVE the 5-second live-cache dedupe below (which would otherwise drop a
+// repeat touch that the turn spine must still witness). An injected observer is
+// invoked at the TOP of `addFileActivity`, before that early-return; it owns its
+// OWN independent transactional `(turnId,path,op)` dedupe (see
+// `recordWitnessedActivity`). Injected via a setter (there is no class here to
+// take constructor injection); `clearWitnessObserver()` restores the null default
+// for test isolation and supervisor teardown. Failures are swallowed so the
+// witness join can NEVER break the `file_activities` insert path.
+export type WitnessObserver = (agentId: string, filePath: string, operation: FileOperation) => void;
+let witnessObserver: WitnessObserver | null = null;
+export function setWitnessObserver(fn: WitnessObserver | null): void {
+  witnessObserver = fn;
+}
+export function clearWitnessObserver(): void {
+  witnessObserver = null;
+}
+
 export function addFileActivity(agentId: string, filePath: string, operation: FileOperation): FileActivity | null {
+  // Git-Native WP-G1.7 witness join — fire the choke point BEFORE the live-cache
+  // dedupe early-return, so two same-path writes 1s apart both reach the turn
+  // spine even though only the first inserts a `file_activities` row. Never lets a
+  // witness failure disturb the (unchanged) file_activities role below.
+  if (witnessObserver) {
+    try {
+      witnessObserver(agentId, filePath, operation);
+    } catch {
+      /* witness join is best-effort — never break file_activities */
+    }
+  }
+
   // Stamp with the agent's CURRENT session + generation so a continuation's new
   // session inserts distinct rows instead of colliding with the prior session's.
   // resume_session_id is the live session id; continuation_generation is the

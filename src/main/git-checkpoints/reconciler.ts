@@ -477,6 +477,11 @@ export interface StartupMaintenanceDeps {
   sweep?: SweepDeps;
   now?: () => number;
   logger?: ReconLogger;
+  /** WP-G1.7 seam upgrade: the dangling-open close step. Defaults to
+   *  {@link closeDanglingOpenTurns} (boot path, store-direct). The bootstrap passes
+   *  a live `TurnCoordinator.reconcileOpenTurns` so the same close runs through the
+   *  coordinator — reconciler.ts's documented open item. */
+  closeOpenTurns?: (workspaceId: string) => number;
 }
 
 /**
@@ -520,6 +525,7 @@ export async function runCheckpointStartupMaintenance(deps: StartupMaintenanceDe
         recoveryStore: deps.recoveryStore,
         now: deps.now,
         logger: log,
+        closeOpenTurns: deps.closeOpenTurns,
       });
       if (r.refs.created || r.refs.adopted || r.refs.conflicts.length || r.closedOpen) {
         log.info(

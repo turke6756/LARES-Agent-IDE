@@ -173,6 +173,22 @@ export class TurnCoordinator {
     return this.openByAgent.get(agentId)?.turnId ?? null;
   }
 
+  /** The full pull target the witness recorder (WP-G1.7) needs to normalize a
+   *  witnessed path and attach it to the right turn: the open turn id PLUS the
+   *  exact `repoRoot`/`workspacePrefix` the before-snapshot used (so `touched[]`
+   *  paths are repo-relative, aligned with the captured tree, and scoped to the
+   *  canonical workspace). Sourced from the open turn's own capability — the
+   *  authoritative record — so it can never drift from what was snapshotted.
+   *  Returns null when there is no open turn or the capability lacks a repoRoot. */
+  currentWitnessTarget(
+    agentId: string,
+  ): { turnId: string; repoRoot: string; workspacePrefix: string } | null {
+    const state = this.openByAgent.get(agentId);
+    const repoRoot = state?.ctx.capability.repoRoot;
+    if (!state || !repoRoot) return null;
+    return { turnId: state.turnId, repoRoot, workspacePrefix: state.ctx.capability.workspacePrefix ?? '' };
+  }
+
   // ── before edge ────────────────────────────────────────────────────────────────
 
   /**
