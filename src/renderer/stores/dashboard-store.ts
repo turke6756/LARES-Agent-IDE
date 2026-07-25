@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import type { Agent, AgentStatus, Workspace, HealthCheck, RuntimePrerequisiteReport, FileActivity, QueryResult, ContextStats, ContinuationPhaseSignal, ContinuationPhaseState, UsageLimitsReading, PathType, FileTab, PanelLayout, Team, TeamMessage, CreateTeamInput, DetachedClosedPayload, DetachableView, WriteErrorCode } from '../../shared/types';
+import type { Agent, AgentStatus, Workspace, HealthCheck, RuntimePrerequisiteReport, FileActivity, QueryResult, ContextStats, ContinuationPhaseSignal, ContinuationPhaseState, UsageLimitsReading, PathType, FileTab, PanelLayout, Team, TeamMessage, CreateTeamInput, DetachedClosedPayload, DetachableView, WriteErrorCode, CheckpointTurnSummary, CheckpointPreviewResult, CheckpointRestoreRequest, CheckpointRevertRequest, CheckpointRestoreResult } from '../../shared/types';
 import { beginWrite, evictTabCache } from '../components/fileviewer/useFileContentCache';
 import { contentHash } from '../components/fileviewer/markdownSplice';
 import { diag, diagBasename, diagHash } from '../components/fileviewer/editLossDiag';
@@ -222,6 +222,32 @@ interface DashboardState {
   // Absent id = no handoff running.
   continuationPhases: Record<string, ContinuationPhaseState>;
 
+  // Git-Native WP-G2.4 — per-agent checkpoint time-rail data. Keyed by agentId
+  // (NOT cwd/slug — the CLAUDE.md invariant: many agents share one working dir).
+  // Loaded lazily when a card's rail is expanded, refreshed after a restore/revert.
+  // Witnessed PATHS only — never worktree bytes.
+  checkpointTurns: Record<string, CheckpointTurnSummary[]>;
+  checkpointLoading: Record<string, boolean>;
+  loadCheckpointTurns: (workspaceId: string, agentId: string) => Promise<void>;
+  /** Fetch a restore preview (witnessed set + anti-TOCTOU tokens + open-turn
+   *  contention). RestoreDialog REQUIRES this before a restore can be confirmed. */
+  previewCheckpointRestore: (
+    workspaceId: string,
+    turnId: string,
+    paths?: string[],
+  ) => Promise<CheckpointPreviewResult>;
+  /** Path-scoped restore, then refresh the agent's rail (a restore always leaves a
+   *  recoverable pre-restore checkpoint that should appear). */
+  restoreCheckpointPaths: (
+    req: CheckpointRestoreRequest,
+    agentId: string,
+  ) => Promise<CheckpointRestoreResult>;
+  /** Whole-turn "undo", then refresh the agent's rail. */
+  revertCheckpointTurn: (
+    req: CheckpointRevertRequest,
+    agentId: string,
+  ) => Promise<CheckpointRestoreResult>;
+
   // Teams
   teams: Team[];
   teamMessages: Record<string, TeamMessage[]>;
@@ -372,6 +398,8 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
   usageLimits: null,
   deliberatingSupervisorIds: [],
   continuationPhases: {},
+  checkpointTurns: {},
+  checkpointLoading: {},
   teams: [],
   teamMessages: {},
 
@@ -1314,6 +1342,46 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
         : { agents, continuationPhases: phases };
     });
     get().updateWorkspaceHeat();
+  },
+
+  // ── Git-Native WP-G2.4 — checkpoint time rail ──────────────────────────────
+  loadCheckpointTurns: async (workspaceId, agentId) => {
+    set((s) => ({ checkpointLoading: { ...s.checkpointLoading, [agentId]: true } }));
+    try {
+      const res = await window.api.checkpoints.list(workspaceId, { agentId });
+      set((s) => ({
+        checkpointTurns: { ...s.checkpointTurns, [agentId]: res.turns },
+        checkpointLoading: { ...s.checkpointLoading, [agentId]: false },
+      }));
+    } catch (err) {
+      // Honest failure: the engine may be unavailable (no usable git / still
+      // bootstrapping). Clear the spinner and leave any prior turns in place; the
+      // rail renders the empty/unavailable state rather than throwing.
+      console.error('Failed to load checkpoint turns:', err);
+      set((s) => ({ checkpointLoading: { ...s.checkpointLoading, [agentId]: false } }));
+    }
+  },
+
+  previewCheckpointRestore: (workspaceId, turnId, paths) =>
+    window.api.checkpoints.preview(
+      workspaceId,
+      turnId,
+      paths && paths.length > 0 ? paths : undefined,
+    ),
+
+  restoreCheckpointPaths: async (req, agentId) => {
+    const result = await window.api.checkpoints.restore(req);
+    // Refresh AFTER the mutation regardless of outcome: a completed/partial
+    // restore changes the witnessed state, and even a failed force leaves the
+    // rail's contention view worth re-deriving.
+    await get().loadCheckpointTurns(req.workspaceId, agentId);
+    return result;
+  },
+
+  revertCheckpointTurn: async (req, agentId) => {
+    const result = await window.api.checkpoints.revert(req);
+    await get().loadCheckpointTurns(req.workspaceId, agentId);
+    return result;
   },
 
   // Switch workspaces with per-workspace view-state persistence: snapshot the

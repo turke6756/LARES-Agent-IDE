@@ -1549,6 +1549,13 @@ export interface CheckpointTurnSummary {
   /** Witnessed write/create paths — the ONLY revertable set for this turn. */
   witnessedPaths: string[];
   failureReason: string | null;
+  /** BEFORE-edge CONTENT-semantics diagnostic (turn_records.before_raw_filter_bypassed).
+   *  True when the before-snapshot captured on-disk bytes of a filter-managed path
+   *  (LFS / git-crypt) rather than its managed form — so a restore rewrites those
+   *  on-disk bytes and does NOT reconstruct the managed representation. Optional so
+   *  the WP-G2.2 main summary (which does not yet carry it) stays structurally
+   *  assignable; RestoreDialog surfaces the content-semantics warning when true. */
+  beforeRawFilterBypassed?: boolean;
 }
 
 /** One side of a turn diff: the witnessed (attributed) changes OR the separately

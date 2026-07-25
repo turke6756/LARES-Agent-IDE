@@ -5,6 +5,7 @@ import StatusBadge from './StatusBadge';
 import { formatAgentToken } from '../../lib/agent-mention';
 import { RoleChips, ContextStatsBar, HooksOffBadge } from './agent-card-bits';
 import ContinuationSplitButton from './ContinuationSplitButton';
+import AgentTurnRail from './AgentTurnRail';
 import ContinuationPhaseLine from './ContinuationPhaseLine';
 import { isContinuationEligible } from './continuation-controls';
 import { isActivePhase } from './continuation-phase-view';
@@ -110,6 +111,10 @@ export default function AgentCard({
   const forkAgent = useDashboardStore((s) => s.forkAgent);
   const queryAgent = useDashboardStore((s) => s.queryAgent);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  // WP-G2.4 checkpoint time-rail: COLLAPSED by default so the default card
+  // footprint is unchanged; the rail (and its lazy checkpoint load) only mount
+  // when the human expands the timeline.
+  const [railOpen, setRailOpen] = useState(false);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
   const [confirmDeleteSelected, setConfirmDeleteSelected] = useState(false);
   // §B8 stop: its own confirm latch and its own toast — never shared with the
@@ -466,6 +471,22 @@ export default function AgentCard({
       <div className="text-[11px] text-gray-500 mt-0.5">
         Spawned: {formatSpawnTime(agent.createdAt)}
       </div>
+
+      {/* WP-G2.4 — checkpoint time rail, collapsed by default. The toggle keeps the
+          rail (and its checkpoint IPC load) out of the default card footprint. */}
+      <button
+        onClick={(e) => { e.stopPropagation(); setRailOpen((o) => !o); }}
+        className="mt-1 text-[10px] text-gray-500 hover:text-gray-300"
+        aria-expanded={railOpen}
+        data-testid="timeline-toggle"
+      >
+        {railOpen ? '▾ Hide timeline' : '▸ Timeline'}
+      </button>
+      {railOpen && (
+        <div onClick={(e) => e.stopPropagation()}>
+          <AgentTurnRail workspaceId={agent.workspaceId} agentId={agent.id} />
+        </div>
+      )}
 
       {/* §B8 stopped-reason badge. Only for an agent that actually reached
           `done` carrying a reason — a `crashed` agent was not stopped by
