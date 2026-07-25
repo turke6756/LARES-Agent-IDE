@@ -98,6 +98,12 @@
       "owner": "git-native/checkpoint-queue"
     },
     {
+      "file": "src/main/index.ts",
+      "lineContext": "retentionTimer.unref()",
+      "purpose": "Timer-handle unref on the WP-G3.3 periodic retention setInterval (a setInterval handle, never a child process) — keeps the retention sweep timer from holding the process open at shutdown.",
+      "owner": "git-native/retention"
+    },
+    {
       "file": "src/main/supervisor/provider-resolver.ts",
       "lineContext": "windowsHide: true",
       "purpose": "PERMANENT Tier-2: bounded `cmd /c where <provider>` PATH-resolution probes, 5s timeout, captured output.",

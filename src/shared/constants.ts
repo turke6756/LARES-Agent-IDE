@@ -3910,3 +3910,13 @@ export const MAX_CHECKPOINT_PATHS = 20000;   // total in-scope tracked+untracked
 export const MAX_CHECKPOINT_BYTES = 256 * 1024 * 1024;
 export const MAINTENANCE_LOOSE_OBJECT_THRESHOLD = 4000; // below the ~6700 user auto-gc heuristic [T]
 export const TEMP_INDEX_SWEEP_GRACE_MS = 60 * 60 * 1000; // startup sweeper grace
+// Retention (WP-G3.3). PROVISIONAL 10-day dense window (Open #6 — no hard cap/ceiling
+// ships until Edward accepts the object-growth spike); thereafter thin to accepted-task
+// boundary snapshots. `COMPACT_DIFF_MAX_BYTES` bounds the witnessed-path compact_diff
+// distilled before a ref is pruned. `MAINTENANCE_RUNTIME_DEADLINE_MS` bounds the
+// triggered loose-object maintenance job. `RETENTION_CYCLE_INTERVAL_MS` paces the
+// periodic scheduler.
+export const RETENTION_DENSE_WINDOW_MS = 10 * 24 * 60 * 60 * 1000; // provisional 10 days
+export const COMPACT_DIFF_MAX_BYTES = 100 * 1024;                  // witnessed-path compact_diff cap (~100 KB)
+export const MAINTENANCE_RUNTIME_DEADLINE_MS = 120 * 1000;         // bounded `git maintenance run` runtime
+export const RETENTION_CYCLE_INTERVAL_MS = 6 * 60 * 60 * 1000;     // periodic retention sweep cadence

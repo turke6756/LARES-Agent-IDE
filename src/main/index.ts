@@ -26,6 +26,7 @@ import { AgentSupervisor } from './supervisor';
 import { startContinuationWatcher } from './supervisor/continuation-watcher-wiring';
 import { runCheckpointStartupMaintenance } from './git-checkpoints/reconciler';
 import { createCheckpointEngine } from './git-checkpoints/engine-bootstrap';
+import { RETENTION_CYCLE_INTERVAL_MS } from '../shared/constants';
 import { registerIpcHandlers, setHumanCheckpointRoutes } from './ipc-handlers';
 import { installExternalNavHandlers, forceCloseAllDetached, getDetachedEntries, type DetachedWindowDeps } from './detached-windows';
 import { runCloseFlush, type FlushTarget } from './close-flush';
@@ -768,6 +769,16 @@ app.whenReady().then(async () => {
           // WP-G2.2: hand the force-capable human surface to the renderer IPC layer.
           setHumanCheckpointRoutes(engine.humanCheckpointRoutes);
           await engine.runStartupMaintenance();
+          // WP-G3.3 — schedule the periodic retention cycle (distill-before-prune +
+          // triggered loose-object maintenance + storage report) on the shared engine
+          // queue. `unref()` so the interval never keeps the process alive; each cycle
+          // is best-effort and never throws. NO hard cap / ceiling ships here (Open #6).
+          const retentionTimer = setInterval(() => {
+            void engine.runRetention().catch((err) =>
+              console.error('[retention] cycle failed:', err),
+            );
+          }, RETENTION_CYCLE_INTERVAL_MS);
+          if (typeof retentionTimer.unref === 'function') retentionTimer.unref();
         } else {
           // No usable internal git → engine off, but the sweep backstop still runs.
           await runCheckpointStartupMaintenance({ workspaces: getWorkspaces() });

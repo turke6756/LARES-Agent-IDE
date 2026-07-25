@@ -29,6 +29,7 @@ import { TurnCompletionTracker } from '../supervisor/turn-completion-tracker';
 import { WitnessRecorder } from './witness-recorder';
 import { buildDispatchTurnContext, type DispatchContext, type DispatchAgentInfo } from './dispatch-context';
 import { runCheckpointStartupMaintenance } from './reconciler';
+import { runWorkspaceRetention, type WorkspaceRetentionResult } from './retention';
 
 export interface CheckpointEngineHandle {
   coordinator: TurnCoordinator;
@@ -39,6 +40,12 @@ export interface CheckpointEngineHandle {
   /** Run the WP-G1.8 startup pass (temp-artifact sweep + ref/DB reconciliation)
    *  with the LIVE coordinator as the dangling-open close seam. */
   runStartupMaintenance: () => Promise<void>;
+  /** WP-G3.3 — one retention cycle across every registered workspace: distill-
+   *  before-prune → triggered loose-object maintenance → storage report. Uses the
+   *  LIVE engine's CheckpointQueue so the MAINTENANCE idle-only slot serializes
+   *  against real checkpoint traffic. Best-effort + isolated per workspace; never
+   *  throws. index.ts schedules it on an interval. */
+  runRetention: () => Promise<WorkspaceRetentionResult[]>;
   /** WP-G2.1 — the capability-bound HTTP checkpoint surface (list/diff/preview/
    *  restore/revert), resolving the git capability per workspace and delegating to
    *  the CheckpointService. Injected into ApiServer via `setCheckpointRoutes`. */
@@ -248,12 +255,39 @@ export async function createCheckpointEngine(): Promise<CheckpointEngineHandle |
       closeOpenTurns: (workspaceId: string) => coordinator.reconcileOpenTurns(workspaceId),
     });
 
+  // WP-G3.3 — retention cycle. Each workspace resolves its git capability through the
+  // shared per-workspace cache; a workspace with no usable repo (or no queue key) is
+  // skipped (detect-and-degrade). The SAME `queue` the live engine uses is passed in
+  // so the loose-object MAINTENANCE slot is genuinely idle-only against real traffic.
+  const runRetention = async (): Promise<WorkspaceRetentionResult[]> => {
+    const results: WorkspaceRetentionResult[] = [];
+    for (const ws of getWorkspaces()) {
+      try {
+        const cap = await resolveCapabilityByWorkspace(ws.id);
+        if (!cap || !cap.repoRoot || !cap.commonDirQueueKey) continue; // detect-and-degrade
+        results.push(
+          await runWorkspaceRetention({
+            workspaceId: ws.id,
+            repoRoot: cap.repoRoot,
+            gitExe,
+            queue,
+            commonDirQueueKey: cap.commonDirQueueKey,
+          }),
+        );
+      } catch (err) {
+        console.error(`[retention] workspace ${ws.id} cycle failed:`, err);
+      }
+    }
+    return results;
+  };
+
   return {
     coordinator,
     completionTracker,
     buildTurnContext,
     witnessObserve: witness.observe,
     runStartupMaintenance,
+    runRetention,
     checkpointRoutes,
     humanCheckpointRoutes,
   };

@@ -98,6 +98,10 @@ const TESTS = [
   // Git-Native WP-G1.8: ref/DB crash-consistency reconciliation (create/adopt/conflict
   // on real git) + dangling-open close + paired-ref deletion + temp-artifact sweeper.
   'dist/main/main/git-checkpoints/reconciler.test.js',
+  // Git-Native WP-G3.3: retention (dense-window thinning to accepted-task boundary),
+  // distill-before-prune ordering + G3 gate back-fill, triggered/bounded loose-object
+  // maintenance (idle-only slot, no config mutation, nonfatal on lock), storage report.
+  'dist/main/main/git-checkpoints/retention.test.js',
   // Git-Native WP-G1.7: witness-join recorder + DB choke point (above the live-cache
   // dedupe), dispatch-context builder, and the send-queue → before-checkpoint wiring.
   'dist/main/main/git-checkpoints/witness-recorder.test.js',
