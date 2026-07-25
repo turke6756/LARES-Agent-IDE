@@ -30,6 +30,8 @@ import { WitnessRecorder } from './witness-recorder';
 import { buildDispatchTurnContext, type DispatchContext, type DispatchAgentInfo } from './dispatch-context';
 import { runCheckpointStartupMaintenance } from './reconciler';
 import { runWorkspaceRetention, type WorkspaceRetentionResult } from './retention';
+import { initWorkspaceGitRepo } from './git-init';
+import { forcePrerequisiteRecheck } from '../runtime-prerequisites';
 
 export interface CheckpointEngineHandle {
   coordinator: TurnCoordinator;
@@ -233,6 +235,29 @@ export async function createCheckpointEngine(): Promise<CheckpointEngineHandle |
         previewTokens,
         force,
       });
+    },
+    // WP-G3.4 — the human-only `git init` consent action. It lives here, next to the
+    // per-workspace `capabilityCache` + probe, because the ONLY thing it adds over
+    // the pure init in git-init.ts is the invalidation of the two existing seams on
+    // success: drop this workspace's cached capability so the send path re-probes and
+    // the checkpoint engine picks up the fresh repo, and `forcePrerequisiteRecheck`
+    // (WP-G0.3) so the prerequisite/status UI re-probes it as a repo. No parallel
+    // probe or cache is introduced.
+    initRepo: async (workspaceId) => {
+      const ws = getWorkspace(workspaceId);
+      if (!ws?.path) {
+        return {
+          ok: false,
+          status: 'error',
+          message: `Unknown workspace '${workspaceId}'. Nothing was created.`,
+        };
+      }
+      const result = await initWorkspaceGitRepo(canonicalDir(ws.path), gitExe);
+      if (result.ok) {
+        capabilityCache.delete(workspaceId);
+        forcePrerequisiteRecheck();
+      }
+      return result;
     },
   };
 

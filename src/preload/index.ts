@@ -159,6 +159,9 @@ const api: IpcApi = {
     // WP-G3.1 — per-path version history (file right-click → History).
     fileHistory: (workspaceId, path, opts) =>
       ipcRenderer.invoke(CHECKPOINT_CHANNELS.fileHistory, workspaceId, path, opts),
+    // WP-G3.4 — human-only `git init` consent action (enable checkpoints on a
+    // non-repo workspace). Handler in git-checkpoints/checkpoint-ipc.ts.
+    gitInit: (workspaceId) => ipcRenderer.invoke(CHECKPOINT_CHANNELS.gitInit, workspaceId),
   },
   plans: {
     // WP5: fires after each WP4 reparse so the renderer re-fetches the served

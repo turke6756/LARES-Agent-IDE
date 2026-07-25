@@ -48,6 +48,8 @@ const CONTRACT_WITNESS: CheckpointApi = {
     requestedPaths: [], completedPaths: [], rejectedPaths: [], failures: [],
     contention: [], failureReason: null,
   }),
+  fileHistory: async (workspaceId, path) => ({ workspaceId, path, versions: [] }),
+  gitInit: async () => ({ ok: false, status: 'error', message: '' }),
 };
 
 describe('checkpoint IPC contract (WP-G2.2)', () => {

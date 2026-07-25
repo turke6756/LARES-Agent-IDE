@@ -26,6 +26,7 @@ import { CHECKPOINT_CHANNELS } from '../../shared/types';
 import type {
   CheckpointPreviewResult,
   CheckpointRestoreResult,
+  GitInitResult,
 } from '../../shared/types';
 
 interface TestCase { name: string; run(): Promise<void> | void; }
@@ -59,6 +60,8 @@ interface FakeCfg {
   /** CONTENT-semantics diagnostic surfaced on the list summary. Left undefined to
    *  model the absent case; set true/false to model the wired flag. */
   rawFilterBypassed?: boolean;
+  /** WP-G3.4 — the GitInitResult the fake `initRepo` returns (default: initialized). */
+  initResult?: GitInitResult;
 }
 
 interface FakeState {
@@ -146,6 +149,14 @@ function makeRoutes(cfg: FakeCfg = {}): HumanCheckpointRoutes & { state: FakeSta
       rec('revert', [args]);
       return outcome('revert_turn', ['a.txt'], args.force);
     },
+    initRepo: async (workspaceId) => {
+      rec('initRepo', [workspaceId]);
+      return cfg.initResult ?? {
+        ok: true,
+        status: 'initialized',
+        message: 'Created a Git repository at the workspace root.',
+      };
+    },
   };
   return Object.assign(routes, { state });
 }
@@ -229,6 +240,37 @@ test('an unwired engine answers "unavailable", never a silent empty result', asy
   const ipc = new FakeIpc();
   registerCheckpointIpc(ipc, () => null);
   await assert.rejects(() => ipc.invoke(CHECKPOINT_CHANNELS.list, 'ws-1'), /unavailable|bootstrapping/i);
+});
+
+// ── 2b. WP-G3.4: the `git init` consent channel (human IPC only) ─────────────────
+
+test('gitInit delegates the workspace to initRepo and returns the result verbatim', async () => {
+  const { ipc, routes } = wire();
+  const res = await ipc.invoke(CHECKPOINT_CHANNELS.gitInit, 'ws-1') as GitInitResult;
+  assert.equal(res.ok, true);
+  assert.equal(res.status, 'initialized');
+  assert.deepEqual(routes.state.calls.at(-1), { method: 'initRepo', args: ['ws-1'] });
+});
+
+test('gitInit surfaces an already-repo refusal honestly (no ok)', async () => {
+  const { ipc } = wire({
+    initResult: { ok: false, status: 'already-repo', message: 'already a Git repository' },
+  });
+  const res = await ipc.invoke(CHECKPOINT_CHANNELS.gitInit, 'ws-1') as GitInitResult;
+  assert.equal(res.ok, false);
+  assert.equal(res.status, 'already-repo');
+});
+
+test('gitInit rejects a missing workspaceId before any engine call', async () => {
+  const { ipc, routes } = wire();
+  await assert.rejects(() => ipc.invoke(CHECKPOINT_CHANNELS.gitInit, ''), /workspaceId/);
+  assert.equal(routes.state.calls.length, 0);
+});
+
+test('gitInit on an unwired engine answers "unavailable" (no usable git ⇒ cannot init)', async () => {
+  const ipc = new FakeIpc();
+  registerCheckpointIpc(ipc, () => null);
+  await assert.rejects(() => ipc.invoke(CHECKPOINT_CHANNELS.gitInit, 'ws-1'), /unavailable|bootstrapping/i);
 });
 
 // ── 3. Non-force restore rides the preview token (no gate consulted) ─────────────

@@ -27,6 +27,7 @@ import {
   type CheckpointRestoreRequest,
   type CheckpointRestoreResult,
   type CheckpointRevertRequest,
+  type GitInitResult,
 } from '../../shared/types';
 
 /** The force-capable engine surface the IPC layer drives. Built by the engine
@@ -53,6 +54,12 @@ export interface HumanCheckpointRoutes {
     previewTokens?: Record<string, string>;
     force?: boolean;
   }): Promise<CheckpointRestoreResult>;
+  /** WP-G3.4 — the human-only `git init` consent action. Creates a repository at a
+   *  non-repo workspace root (refusing an already-repo / protected root / unusable
+   *  git), then invalidates the WP-G0.2/G0.3 capability + prerequisite caches so the
+   *  workspace re-probes as a repo. Human-side only — never an agent MCP tool or a
+   *  capability HTTP route. */
+  initRepo(workspaceId: string): Promise<GitInitResult>;
 }
 
 /** The minimal `ipcMain.handle` shape (mirrors lifecycle-ipc's IpcLike) so the
@@ -220,5 +227,16 @@ export function registerCheckpointIpc(ipc: IpcLike, getRoutes: () => HumanCheckp
       if (contention.length > 0) return refusal('revert_turn', [], contention);
     }
     return routes.revert({ workspaceId, turnId, previewTokens, force });
+  });
+
+  // WP-G3.4 — the human-only `git init` consent action. Registered here alongside
+  // the other renderer checkpoint channels so it shares the trusted-renderer,
+  // NO-capability-token surface; it is deliberately NOT mirrored as an agent MCP
+  // tool or a `/api/checkpoints*` HTTP route (a human clicks to create a repo, an
+  // agent never does). `requireRoutes` answers an honest "engine unavailable" when
+  // there is no usable git, which is itself a truthful reason init cannot run.
+  ipc.handle(CHECKPOINT_CHANNELS.gitInit, async (_e, workspaceId: unknown) => {
+    const routes = requireRoutes(getRoutes());
+    return routes.initRepo(requireWorkspaceId(workspaceId));
   });
 }

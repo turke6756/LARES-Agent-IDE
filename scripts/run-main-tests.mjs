@@ -109,6 +109,9 @@ const TESTS = [
   // Git-Native WP-G2.2: the human renderer's checkpoint IPC registrar + the
   // Open #4 force gate (refuse while an active turn witnesses a requested path).
   'dist/main/main/git-checkpoints/checkpoint-ipc.test.js',
+  // Git-Native WP-G3.4: the human-only `git init` consent action (init a non-repo
+  // + re-probe; refuse already-repo; error leaves no partial state; human-only).
+  'dist/main/main/git-checkpoints/git-init.test.js',
   'dist/main/main/supervisor/send-queue-checkpoint.test.js',
   'dist/main/main/supervisor/initial-user-prompt.test.js',
   'dist/main/main/supervisor/hook-spool-tailer.test.js',

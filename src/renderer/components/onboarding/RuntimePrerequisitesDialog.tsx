@@ -2,6 +2,7 @@ import React from 'react';
 import * as Icons from 'lucide-react';
 import { useDashboardStore } from '../../stores/dashboard-store';
 import PrerequisiteRow from './PrerequisiteRow';
+import GitInitConsent from './GitInitConsent';
 
 /** First-run prerequisite report (packaging plan §6.3).
  *
@@ -83,6 +84,11 @@ export default function RuntimePrerequisitesDialog() {
                 {report.optional.map((c) => (
                   <PrerequisiteRow key={c.id} check={c} onOpenDocs={openDocs} />
                 ))}
+                {/* WP-G3.4 — human-only consent action to enable Git checkpoints on
+                    a non-repo workspace. Renders only when git is usable + a
+                    workspace is selected; the main process refuses honestly when the
+                    workspace is already a repository. */}
+                <GitInitConsent />
               </section>
 
               <section className="mb-4">

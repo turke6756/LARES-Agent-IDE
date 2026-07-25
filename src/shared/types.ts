@@ -1694,7 +1694,25 @@ export const CHECKPOINT_CHANNELS = {
   revert: 'checkpoint:revert',
   // WP-G3.1 — per-path version history (view/diff/restore one file).
   fileHistory: 'checkpoint:fileHistory',
+  // WP-G3.4 — human-only `git init` consent action for a non-repo workspace.
+  // Renderer IPC ONLY (like the force override path): never an agent MCP tool,
+  // never a capability-token HTTP route.
+  gitInit: 'checkpoint:gitInit',
 } as const;
+
+/** WP-G3.4 — outcome of the human-only `git init` consent action. A non-repo
+ *  workspace is the honest-disabled state (no silent `.git`); this action, driven
+ *  by an explicit human click, either creates the repository or refuses with an
+ *  honest reason. `ok` is true ONLY for `initialized`; every other status is a
+ *  no-op that left NO partial state on disk. */
+export interface GitInitResult {
+  ok: boolean;
+  status: 'initialized' | 'already-repo' | 'protected-root' | 'unusable-git' | 'error';
+  /** Plain-language, user-facing sentence for the consent UI to render verbatim. */
+  message: string;
+  /** Optional diagnostic detail (probe reason / git stderr tail). */
+  detail?: string;
+}
 
 export interface IpcApi {
   workspaces: {
@@ -2216,6 +2234,10 @@ export interface IpcApi {
     /** WP-G3.1 — versions of ONE canonical path across retained, live-verified
      *  turns (file right-click → History). */
     fileHistory: (workspaceId: string, path: string, opts?: { agentId?: string }) => Promise<CheckpointFileHistoryResult>;
+    /** WP-G3.4 — human-only consent action: `git init` a non-repo workspace to
+     *  enable checkpoints. Refuses honestly when the workspace is already a repo,
+     *  a protected root, or git is unusable. */
+    gitInit: (workspaceId: string) => Promise<GitInitResult>;
   };
 }
 
