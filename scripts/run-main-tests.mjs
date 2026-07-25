@@ -61,6 +61,9 @@ const TESTS = [
   'dist/main/main/context-gauge/context-gauge-settings.test.js',
   // System-Memory polish: commit attribution completeness + composed view DTO
   // + the getActiveAgents live-registry predicate.
+  // Layer 3 crash diagnosability: main-process V8 heap telemetry — JSONL line
+  // shape, ~5 MiB rotation, once-per-crossing 75/90% warnings.
+  'dist/main/main/watchdog/heap-telemetry.test.js',
   'dist/main/main/watchdog/attribution.test.js',
   'dist/main/main/watchdog/attribution-service.test.js',
   'dist/main/main/watchdog/system-memory-view.test.js',
@@ -250,6 +253,7 @@ const TESTS = [
   'dist/main/main/analytics-export/analytics-snapshot-shim.test.js',
   'dist/main/main/analytics-export/analytics-snapshot-source-integration.test.js',
   'dist/main/main/api-server-overhead-route.test.js',
+  'dist/main/main/api-server-checkpoints.test.js',
   'dist/main/main/agent-dto-routes.test.js',
   'dist/main/main/api-server-optimizer-routes.test.js',
   'scripts/mcp-tools-observability.test.js',

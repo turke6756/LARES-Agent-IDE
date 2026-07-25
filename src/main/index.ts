@@ -760,6 +760,11 @@ app.whenReady().then(async () => {
         if (engine && supervisor) {
           supervisor.attachCheckpointEngine(engine);
           setWitnessObserver(engine.witnessObserve);
+          // WP-G2.1: hand the capability-bound checkpoint surface to the HTTP API.
+          // apiServer is constructed synchronously earlier in this ready handler
+          // (no await precedes it), so it is non-null by the time this async IIFE
+          // resumes; the `?.` is belt-and-suspenders.
+          apiServer?.setCheckpointRoutes(engine.checkpointRoutes);
           await engine.runStartupMaintenance();
         } else {
           // No usable internal git → engine off, but the sweep backstop still runs.

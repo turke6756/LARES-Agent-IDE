@@ -15,9 +15,11 @@ import {
   getWorkspaces,
   getWorkspace,
   getAgent,
+  listTurnRecords,
   recordWitnessedActivity,
   type WitnessObserver,
 } from '../database';
+import type { CheckpointRoutes, TurnCheckpointSummary } from '../api-server';
 import { resolveInternalGit, probeWorkspaceGit } from '../git/git-runtime';
 import { CheckpointQueue } from './checkpoint-queue';
 import { CheckpointService } from './checkpoint-service';
@@ -36,6 +38,33 @@ export interface CheckpointEngineHandle {
   /** Run the WP-G1.8 startup pass (temp-artifact sweep + ref/DB reconciliation)
    *  with the LIVE coordinator as the dangling-open close seam. */
   runStartupMaintenance: () => Promise<void>;
+  /** WP-G2.1 — the capability-bound HTTP checkpoint surface (list/diff/preview/
+   *  restore/revert), resolving the git capability per workspace and delegating to
+   *  the CheckpointService. Injected into ApiServer via `setCheckpointRoutes`. */
+  checkpointRoutes: CheckpointRoutes;
+}
+
+/** TurnRecord → the workspace-scoped list DTO. Carries witnessed PATHS only, never
+ *  worktree bytes. */
+function toCheckpointSummary(r: import('../database').TurnRecord): TurnCheckpointSummary {
+  return {
+    turnId: r.id,
+    turnSeq: r.turnSeq,
+    agentId: r.agentId,
+    agentTitle: r.agentTitle,
+    taskLabel: r.taskLabel,
+    status: r.status,
+    startedAt: r.startedAt,
+    endedAt: r.endedAt,
+    beforeReady: r.beforeReady,
+    afterReady: r.afterReady,
+    beforeQuality: r.beforeQuality,
+    afterQuality: r.afterQuality,
+    witnessedPaths: (r.touched ?? [])
+      .filter((e) => e.op === 'write' || e.op === 'create')
+      .map((e) => e.path),
+    failureReason: r.failureReason,
+  };
 }
 
 /** Canonicalize a workspace directory best-effort (realpath), so a probe keys off
@@ -68,8 +97,7 @@ export async function createCheckpointEngine(): Promise<CheckpointEngineHandle |
   // Per-workspace capability cache (keyed by workspaceId). A missing/unusable repo
   // caches as null so the send path short-circuits without re-probing every turn.
   const capabilityCache = new Map<string, GitCapability | null>();
-  const resolveCapability = async (agent: DispatchAgentInfo): Promise<GitCapability | null> => {
-    const wsId = agent.workspaceId;
+  const resolveCapabilityByWorkspace = async (wsId: string): Promise<GitCapability | null> => {
     if (capabilityCache.has(wsId)) return capabilityCache.get(wsId) ?? null;
     let cap: GitCapability | null = null;
     try {
@@ -80,6 +108,58 @@ export async function createCheckpointEngine(): Promise<CheckpointEngineHandle |
     }
     capabilityCache.set(wsId, cap);
     return cap;
+  };
+  const resolveCapability = (agent: DispatchAgentInfo): Promise<GitCapability | null> =>
+    resolveCapabilityByWorkspace(agent.workspaceId);
+
+  // WP-G2.1 — the capability-bound HTTP checkpoint surface. Authorization (supervisor
+  // capability, self-assertion, workspace scope) is enforced in ApiServer BEFORE any
+  // of these run; here we only resolve the git capability for the (already-authorized)
+  // workspace and delegate to the CheckpointService. A workspace with no usable repo
+  // fails visibly rather than silently doing nothing.
+  const requireCapability = async (workspaceId: string): Promise<GitCapability> => {
+    const cap = await resolveCapabilityByWorkspace(workspaceId);
+    if (!cap || !cap.repoRoot) {
+      throw Object.assign(
+        new Error(`no usable git checkpoint capability for workspace '${workspaceId}'`),
+        { statusCode: 409, code: 'checkpoint-unavailable' },
+      );
+    }
+    return cap;
+  };
+  const checkpointRoutes: CheckpointRoutes = {
+    list: (workspaceId, opts) => listTurnRecords(workspaceId, opts).map(toCheckpointSummary),
+    diff: async (turnId, workspaceId) => {
+      const cap = await requireCapability(workspaceId);
+      return service.generateDiffs(turnId, cap.repoRoot as string);
+    },
+    preview: async (turnId, workspaceId, requestedPaths) => {
+      const cap = await requireCapability(workspaceId);
+      return service.previewRestore({ turnId, workspaceId, capability: cap, requestedPaths });
+    },
+    restorePaths: async (args) => {
+      const cap = await requireCapability(args.workspaceId);
+      return service.restorePaths({
+        turnId: args.turnId,
+        requestedPaths: args.paths,
+        workspaceId: args.workspaceId,
+        actor: args.agentId,
+        capability: cap,
+        previewTokens: args.previewTokens,
+      });
+    },
+    revertTurn: async (args) => {
+      const cap = await requireCapability(args.workspaceId);
+      return service.revertTurn({
+        turnId: args.turnId,
+        workspaceId: args.workspaceId,
+        actor: args.agentId,
+        capability: cap,
+        previewTokens: args.previewTokens,
+      });
+    },
+    // `prune` is intentionally omitted until WP-G3.5 lands the retention/prune
+    // backend; ApiServer returns a clear 501 not-yet-available for POST …/prune.
   };
 
   const buildTurnContext = (agentId: string, dispatch: DispatchContext) =>
@@ -107,5 +187,6 @@ export async function createCheckpointEngine(): Promise<CheckpointEngineHandle |
     buildTurnContext,
     witnessObserve: witness.observe,
     runStartupMaintenance,
+    checkpointRoutes,
   };
 }

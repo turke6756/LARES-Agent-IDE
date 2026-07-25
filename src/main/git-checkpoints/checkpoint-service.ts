@@ -884,6 +884,72 @@ export class CheckpointService {
     };
   }
 
+  // ── restore preview (WP-G2.1: mint anti-TOCTOU preview tokens) ─────────────────
+
+  /**
+   * Read-only preview for a restore/revert: the witnessed set, the current
+   * worktree OID per validated path (the anti-TOCTOU **preview token** the HTTP
+   * caller echoes back to `restorePaths`/`revertTurn`), before-edge usability, and
+   * same-path open-turn contention. Never mutates the worktree, index, or refs —
+   * it only `hash-object`s the current bytes, so the token it hands back is exactly
+   * what `captureSafetyPre` will re-derive at restore time (identical OID ⇒ the
+   * token compare passes when the path is unchanged). Non-witnessed requested paths
+   * are rejected, mirroring `validateRestorePaths` (whole-tree recovery is never
+   * reachable here). Defaults `requestedPaths` to the full witnessed set.
+   */
+  async previewRestore(params: {
+    turnId: string;
+    workspaceId: string;
+    capability: GitCapability;
+    requestedPaths?: string[];
+  }): Promise<CheckpointPreviewResult> {
+    const { turnId, workspaceId, capability } = params;
+    const repoRoot = capability.repoRoot;
+    const witnessedSet = this.revertTurnPathSet(turnId).paths;
+    const requested =
+      params.requestedPaths && params.requestedPaths.length > 0 ? params.requestedPaths : witnessedSet;
+    const validation = this.validateRestorePaths(turnId, requested, workspaceId);
+
+    const base: CheckpointPreviewResult = {
+      available: false,
+      reason: null,
+      turnId,
+      witnessedSet,
+      tokens: {},
+      validatedPaths: validation.validatedPaths,
+      rejectedPaths: validation.rejectedPaths,
+      contention: validation.contention,
+    };
+
+    if (!repoRoot) return { ...base, reason: 'missing-repo' };
+    const row = this.store.getTurnRecord(turnId);
+    if (!row) return { ...base, reason: 'unknown-turn' };
+    const beforeUsable = await this.isEdgeUsable(repoRoot, row.beforeReady, row.beforeRef, row.beforeOid);
+
+    // Compute a token for every VALIDATED (witnessed) path: current raw blob OID for
+    // a present file, the ABSENT sentinel for an absent path or a directory-occupied
+    // slot (matches captureSafetyPre's currentOid semantics exactly).
+    const root = this.canonicalRoot(repoRoot);
+    const tokens: Record<string, string> = {};
+    const present: string[] = [];
+    for (const p of validation.validatedPaths) {
+      const st = this.lstatAbs(this.abs(root, p));
+      if (st === null || st.isDirectory) tokens[p] = ABSENT_SENTINEL;
+      else present.push(p);
+    }
+    if (present.length > 0) {
+      const oidByPath = await this.hashPaths(
+        repoRoot,
+        present,
+        this.now() + this.restoreTuning.fileTimeoutMs,
+      );
+      for (const p of present) tokens[p] = oidByPath.get(p) ?? ABSENT_SENTINEL;
+    }
+
+    const reason = !beforeUsable ? 'before-edge-unusable' : validation.ok ? null : 'non-witnessed-paths';
+    return { ...base, available: beforeUsable && validation.ok, reason, tokens };
+  }
+
   // ── helpers ────────────────────────────────────────────────────────────────────
 
   private longpaths(): string[] {
@@ -1559,6 +1625,22 @@ export interface DiffResult {
   label: string;
   text: string | null;
   provenance?: 'witnessed' | 'raw-window';
+}
+
+/** WP-G2.1 restore preview: witnessed set + per-path anti-TOCTOU tokens (current
+ *  worktree OID, or the ABSENT sentinel) the HTTP caller echoes back to
+ *  restore/revert. `available` is true only when the before edge is usable AND every
+ *  requested path is witnessed. Carries NO worktree bytes — only paths + OIDs. */
+export interface CheckpointPreviewResult {
+  available: boolean;
+  reason: string | null;
+  turnId: string;
+  witnessedSet: string[];
+  /** path → current worktree OID (present) or the ABSENT sentinel — the preview token. */
+  tokens: Record<string, string>;
+  validatedPaths: string[];
+  rejectedPaths: string[];
+  contention: { path: string; turnId: string }[];
 }
 
 export interface RestorePathValidation {

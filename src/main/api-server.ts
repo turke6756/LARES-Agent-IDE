@@ -2,6 +2,7 @@ import http from 'http';
 import type { AddressInfo } from 'net';
 import { URL } from 'url';
 import { getApiToken, decideApiAccess } from './security/api-auth';
+import type { CapabilityClaim } from './security/agent-capabilities';
 import { sendOutcomeMessage } from '../shared/send-outcome-copy';
 import { workspaceStateDir } from './workspace-state-dir';
 import type { AgentSupervisor } from './supervisor';
@@ -73,6 +74,7 @@ import { runKnowledgeExtract } from './agent-knowledge/knowledge-extract-runner'
 import { runOverheadScan } from './context-overhead/ipc-deps';
 import { buildOverheadSnapshot, scrubPaths } from './context-overhead/overhead-dto';
 import type { AgentRoleLane, BehaviorEvidenceTier, ContextOptimizerProposalKind, ContextOptimizerResult, AgentKnowledgeGraph, SkillUsageResult, McpToolUsageRollupDTO, WorkspaceScopeMode, PathRole, OverheadModel } from '../shared/types';
+import type { DiffResult, RestoreOutcome, CheckpointPreviewResult } from './git-checkpoints/checkpoint-service';
 
 /** Machine-readable failure classes the top-level error serializer is allowed
  *  to expose in JSON bodies. Errors thrown inside routes can carry raw Node
@@ -115,6 +117,12 @@ const API_ERROR_CODES = new Set<string>([
   'memory-critical', 'memory-capacity', 'memory-budget',
   // GET /api/context-overhead — a request that resolves to no workspace scope.
   'invalid-argument',
+  // WP-G2.1 — capability-bound checkpoint recovery routes (authorization + shape).
+  'checkpoint-requires-capability', 'checkpoint-requires-supervisor',
+  'checkpoint-identity-mismatch', 'checkpoint-workspace-mismatch',
+  'checkpoint-force-forbidden', 'checkpoint-preview-token-required',
+  'checkpoint-bad-request', 'checkpoint-engine-unavailable',
+  'checkpoint-prune-unavailable', 'checkpoint-unavailable',
 ]);
 
 /** Strip absolute paths out of an error message before it crosses the API
@@ -243,6 +251,58 @@ function parseScopeMode(raw: string | null): WorkspaceScopeMode | undefined {
   return raw === 'strict' || raw === 'include-proxy' || raw === 'global-diagnostic' ? raw : undefined;
 }
 
+/** WP-G2.1 — one turn's checkpoint state, workspace-scoped, as the list route
+ *  returns it. Carries witnessed PATHS but NEVER worktree bytes (`compact_diff`,
+ *  raw blobs) — those stay off this surface. */
+export interface TurnCheckpointSummary {
+  turnId: string;
+  turnSeq: number;
+  agentId: string | null;
+  agentTitle: string | null;
+  taskLabel: string | null;
+  status: string;
+  startedAt: number | null;
+  endedAt: number | null;
+  beforeReady: boolean;
+  afterReady: boolean;
+  beforeQuality: string | null;
+  afterQuality: string | null;
+  /** Witnessed write/create paths (the ONLY revertable set for this turn). */
+  witnessedPaths: string[];
+  failureReason: string | null;
+}
+
+/** WP-G2.1 — the checkpoint engine surface the capability-bound `/api/checkpoints*`
+ *  routes call. The concrete implementation (engine-bootstrap) resolves the git
+ *  capability by workspace and delegates to the landed CheckpointService; ApiServer
+ *  never touches git directly. Injected late (`setCheckpointRoutes`) because the
+ *  engine bootstrap is async and may resolve after the server binds; tests inject a
+ *  fake. NOTE (security-load-bearing): NONE of these methods accepts a `force`
+ *  flag — stale-preview override is the human-IPC path only (WP-G2.2), never
+ *  reachable over HTTP/MCP. The interface simply gives no way to pass it. */
+export interface CheckpointRoutes {
+  list(workspaceId: string, opts?: { agentId?: string }): Promise<TurnCheckpointSummary[]> | TurnCheckpointSummary[];
+  diff(turnId: string, workspaceId: string): Promise<{ witnessed: DiffResult; window: DiffResult }>;
+  preview(turnId: string, workspaceId: string, requestedPaths?: string[]): Promise<CheckpointPreviewResult>;
+  restorePaths(args: {
+    turnId: string;
+    workspaceId: string;
+    /** The asserted supervisor's own agentId (== capability.agentId). Becomes the row actor. */
+    agentId: string;
+    paths: string[];
+    previewTokens?: Record<string, string>;
+  }): Promise<RestoreOutcome>;
+  revertTurn(args: {
+    turnId: string;
+    workspaceId: string;
+    agentId: string;
+    previewTokens?: Record<string, string>;
+  }): Promise<RestoreOutcome>;
+  /** Prune mechanism (WP-G2.1 route) — retention policy is WP-G3.5. Optional so the
+   *  route can return a clear not-yet-available error until the backend lands. */
+  prune?(args: { workspaceId: string; agentId: string }): Promise<unknown>;
+}
+
 /**
  * Lightweight HTTP API server that exposes supervisor methods.
  * The MCP server script (scripts/mcp-supervisor.js) calls these endpoints
@@ -292,6 +352,15 @@ export class ApiServer {
   private contextGaugeDeps?: ContextGaugeIpcDeps;
   setContextGaugeDeps(deps: ContextGaugeIpcDeps): void {
     this.contextGaugeDeps = deps;
+  }
+
+  /** WP-G2.1 late-injected checkpoint engine surface (async bootstrap; may resolve
+   *  after the server binds). Until wired, every `/api/checkpoints*` route answers
+   *  503 (the auth gate still runs first, so an unauthorized caller never learns the
+   *  feature is off). Tests inject a fake. */
+  private checkpointRoutes?: CheckpointRoutes;
+  setCheckpointRoutes(routes: CheckpointRoutes): void {
+    this.checkpointRoutes = routes;
   }
 
   private requireBrowserTools(): BrowserToolProvider {
@@ -371,7 +440,11 @@ export class ApiServer {
         // maps to HTTP via the err.statusCode catch below.
         const identity = this.resolveIdentity(req);
         const url = new URL(req.url || '/', `http://localhost:${this.port}`);
-        const result = await this.route(req.method || 'GET', url, req, identity);
+        // WP-G2.1: the minted-capability claim (present ONLY when admission came via
+        // a per-agent capability token, never the global bearer) is threaded into
+        // route() so the `/api/checkpoints*` gate can require + bind to it.
+        const capability = decision.kind === 'ok' ? decision.capability : undefined;
+        const result = await this.route(req.method || 'GET', url, req, identity, capability);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(result));
       } catch (err: any) {
@@ -547,6 +620,188 @@ export class ApiServer {
     );
   }
 
+  // ── WP-G2.1: capability-bound checkpoint recovery surface ──────────────────────
+
+  /**
+   * Authorize a `/api/checkpoints*` request. This is the WHOLE authorization
+   * boundary for the recovery surface, and it is deliberately INDEPENDENT of the
+   * header-attribution layer (`resolveIdentity`): that layer trusts a validated
+   * X-Supervisor-Id, which a global-bearer holder can forge. Here the ONLY
+   * authority is the minted per-agent capability claim bound to the presented token:
+   *
+   *   1. **Global bearer rejected.** No `capability` ⇒ admission came via the shared
+   *      global bearer (or, impossibly, an unbound token). Recovery exposes local
+   *      history + workspace bytes and is supervisor-tier — the bearer never reaches it.
+   *   2. **Supervisor privilege required.** A minted worker/researcher credential is a
+   *      valid bearer for other ops but is refused here (defense the toolset-hiding in
+   *      WP-G2.3 only backs up).
+   *   3. **Self-assertion only.** Any X-Supervisor-Id header must EQUAL `claim.agentId`
+   *      — you may assert yourself, never another agent (this is what defeats the
+   *      forged "real worker token + real supervisor's id" attack).
+   *   4. **Workspace-scoped to the claim.** Any asserted workspace (X-Workspace-Id
+   *      header or ?workspaceId=) must equal `claim.workspaceId`; the scope itself is
+   *      ALWAYS the claim's workspace, never caller-chosen.
+   *
+   * Returns the trusted `{ workspaceId, agentId }` derived from the claim.
+   */
+  private authorizeCheckpoint(
+    req: http.IncomingMessage,
+    capability: CapabilityClaim | undefined,
+    url: URL,
+  ): { workspaceId: string; agentId: string } {
+    if (!capability) {
+      throw Object.assign(
+        new Error('checkpoint routes require a minted agent capability token; the shared API bearer is not accepted here'),
+        { statusCode: 403, code: 'checkpoint-requires-capability' },
+      );
+    }
+    if (capability.privilegeLane !== 'supervisor') {
+      throw Object.assign(
+        new Error(`checkpoint routes require supervisor privilege; this credential is '${capability.privilegeLane}'`),
+        { statusCode: 403, code: 'checkpoint-requires-supervisor' },
+      );
+    }
+    const h = req.headers;
+    const hdr = (name: string): string | null => {
+      const v = h[name];
+      return typeof v === 'string' && v.length > 0 ? v : null;
+    };
+    const assertedSup = hdr('x-supervisor-id');
+    if (assertedSup !== null && assertedSup !== capability.agentId) {
+      throw Object.assign(
+        new Error('X-Supervisor-Id must equal your own capability identity (you may only assert yourself)'),
+        { statusCode: 403, code: 'checkpoint-identity-mismatch' },
+      );
+    }
+    const assertedWs = hdr('x-workspace-id');
+    const queryWs = url.searchParams.get('workspaceId');
+    for (const asserted of [assertedWs, queryWs]) {
+      if (asserted !== null && asserted !== '' && asserted !== capability.workspaceId) {
+        throw Object.assign(
+          new Error(`workspace '${asserted}' is outside your capability scope '${capability.workspaceId}'`),
+          { statusCode: 403, code: 'checkpoint-workspace-mismatch' },
+        );
+      }
+    }
+    return { workspaceId: capability.workspaceId, agentId: capability.agentId };
+  }
+
+  private requireCheckpointRoutes(): CheckpointRoutes {
+    if (!this.checkpointRoutes) {
+      throw Object.assign(
+        new Error('Checkpoint engine not available (no usable git, or the engine has not finished bootstrapping)'),
+        { statusCode: 503, code: 'checkpoint-engine-unavailable' },
+      );
+    }
+    return this.checkpointRoutes;
+  }
+
+  /** Reject a `force` key anywhere in a checkpoint mutation body: stale-preview
+   *  override is the human-IPC path ONLY (WP-G2.2), never HTTP/MCP. */
+  private static rejectForce(body: Record<string, unknown>): void {
+    if ('force' in body) {
+      throw Object.assign(
+        new Error('`force` is not accepted on HTTP/MCP checkpoint routes (human-IPC only)'),
+        { statusCode: 400, code: 'checkpoint-force-forbidden' },
+      );
+    }
+  }
+
+  /**
+   * Dispatch the `/api/checkpoints*` recovery routes. Authorization (capability gate,
+   * self-assertion, workspace scope) runs FIRST on every route; only then is the
+   * request shape parsed and forwarded to the injected engine surface.
+   */
+  private async routeCheckpoints(
+    method: string,
+    url: URL,
+    req: http.IncomingMessage,
+    capability: CapabilityClaim | undefined,
+  ): Promise<any> {
+    const { workspaceId, agentId } = this.authorizeCheckpoint(req, capability, url);
+    const path = url.pathname;
+
+    // GET /api/checkpoints — workspace-scoped turn/checkpoint list.
+    if (method === 'GET' && path === '/api/checkpoints') {
+      const routes = this.requireCheckpointRoutes();
+      const agentFilter = url.searchParams.get('agentId') || undefined;
+      const turns = await routes.list(workspaceId, agentFilter ? { agentId: agentFilter } : undefined);
+      return { workspaceId, turns };
+    }
+
+    // POST /api/checkpoints/prune — mechanism route (retention policy = WP-G3.5).
+    if (path === '/api/checkpoints/prune') {
+      if (method !== 'POST') throw methodNotAllowed();
+      const routes = this.requireCheckpointRoutes();
+      const body = parseJsonBody(await readBody(req));
+      ApiServer.rejectForce(body); // `force` is refused BEFORE the availability check.
+      if (!routes.prune) {
+        throw Object.assign(
+          new Error('checkpoint prune is not yet available (retention/prune backend lands in WP-G3.5)'),
+          { statusCode: 501, code: 'checkpoint-prune-unavailable' },
+        );
+      }
+      return routes.prune({ workspaceId, agentId });
+    }
+
+    // GET /api/checkpoints/:turnId/diff — witnessed diff + separately-labeled raw window.
+    const diffMatch = path.match(/^\/api\/checkpoints\/([^/]+)\/diff$/);
+    if (diffMatch) {
+      if (method !== 'GET') throw methodNotAllowed();
+      const routes = this.requireCheckpointRoutes();
+      const diffs = await routes.diff(diffMatch[1], workspaceId);
+      return { workspaceId, turnId: diffMatch[1], ...diffs };
+    }
+
+    // POST /api/checkpoints/:turnId/preview — mint anti-TOCTOU preview tokens.
+    const previewMatch = path.match(/^\/api\/checkpoints\/([^/]+)\/preview$/);
+    if (previewMatch) {
+      if (method !== 'POST') throw methodNotAllowed();
+      const routes = this.requireCheckpointRoutes();
+      const body = parseJsonBody(await readBody(req));
+      ApiServer.rejectForce(body);
+      const paths = parseStringArray(body.paths);
+      return routes.preview(previewMatch[1], workspaceId, paths);
+    }
+
+    // POST /api/checkpoints/:turnId/restore — restore a witnessed subset (paths[] + preview token).
+    const restoreMatch = path.match(/^\/api\/checkpoints\/([^/]+)\/restore$/);
+    if (restoreMatch) {
+      if (method !== 'POST') throw methodNotAllowed();
+      const routes = this.requireCheckpointRoutes();
+      const body = parseJsonBody(await readBody(req));
+      ApiServer.rejectForce(body);
+      const paths = parseStringArray(body.paths);
+      if (!paths || paths.length === 0) {
+        throw Object.assign(
+          new Error('restore requires a non-empty `paths` array (a subset of the turn\'s witnessed set)'),
+          { statusCode: 400, code: 'checkpoint-bad-request' },
+        );
+      }
+      const previewTokens = parseTokenMap(body.previewTokens);
+      if (!previewTokens || Object.keys(previewTokens).length === 0) {
+        throw Object.assign(
+          new Error('restore requires a valid `previewTokens` map from POST …/preview'),
+          { statusCode: 400, code: 'checkpoint-preview-token-required' },
+        );
+      }
+      return routes.restorePaths({ turnId: restoreMatch[1], workspaceId, agentId, paths, previewTokens });
+    }
+
+    // POST /api/checkpoints/:turnId/revert — undo an entire turn's witnessed set.
+    const revertMatch = path.match(/^\/api\/checkpoints\/([^/]+)\/revert$/);
+    if (revertMatch) {
+      if (method !== 'POST') throw methodNotAllowed();
+      const routes = this.requireCheckpointRoutes();
+      const body = parseJsonBody(await readBody(req));
+      ApiServer.rejectForce(body);
+      const previewTokens = parseTokenMap(body.previewTokens);
+      return routes.revertTurn({ turnId: revertMatch[1], workspaceId, agentId, previewTokens });
+    }
+
+    throw Object.assign(new Error(`Unknown checkpoint route: ${method} ${path}`), { statusCode: 404 });
+  }
+
   /** Planning-surface focus auto-subscribe: when the caller resolves to an
    *  asserted supervisor (validated X-Supervisor-Id → identity.supervisorId), record
    *  a supervisor_focus row so the plan resurfaces in its get_my_context orientation
@@ -702,8 +957,24 @@ export class ApiServer {
     return runKnowledgeExtract(workspaceId, agentId);
   }
 
-  private async route(method: string, url: URL, req: http.IncomingMessage, identity: IdentityContext): Promise<any> {
+  private async route(
+    method: string,
+    url: URL,
+    req: http.IncomingMessage,
+    identity: IdentityContext,
+    capability?: CapabilityClaim,
+  ): Promise<any> {
     const path = url.pathname;
+
+    // ── WP-G2.1: capability-bound checkpoint recovery routes ───────────────────
+    // EVERY `/api/checkpoints*` route (read AND mutation) is gated here, BEFORE any
+    // legacy route can match: the shared global bearer is rejected, a minted
+    // supervisor-privilege capability is required, and an asserted X-Supervisor-Id
+    // may only equal the caller's own claim.agentId. Legacy/read routes below keep
+    // the global bearer untouched.
+    if (path === '/api/checkpoints' || path.startsWith('/api/checkpoints/')) {
+      return this.routeCheckpoints(method, url, req, capability);
+    }
 
     // GET /api/agents — list all agents
     if (method === 'GET' && path === '/api/agents') {
@@ -3093,4 +3364,54 @@ function readBody(req: http.IncomingMessage): Promise<string> {
     req.on('end', () => resolve(data));
     req.on('error', reject);
   });
+}
+
+// ── WP-G2.1 checkpoint-route body/query helpers ────────────────────────────────
+
+/** A 405 with the machine-readable `method-not-allowed` code (already allowlisted). */
+function methodNotAllowed(): Error & { statusCode: number; code: string } {
+  return Object.assign(new Error('Method not allowed'), { statusCode: 405, code: 'method-not-allowed' });
+}
+
+/** Parse a JSON request body to a plain object; an empty body → `{}`. A non-object
+ *  or malformed JSON → 400 (checkpoint mutation bodies are always objects). */
+function parseJsonBody(raw: string): Record<string, unknown> {
+  if (!raw || raw.trim().length === 0) return {};
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw Object.assign(new Error('Request body is not valid JSON'), { statusCode: 400, code: 'checkpoint-bad-request' });
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw Object.assign(new Error('Request body must be a JSON object'), { statusCode: 400, code: 'checkpoint-bad-request' });
+  }
+  return parsed as Record<string, unknown>;
+}
+
+/** Coerce an optional `paths` field to a string[] (undefined when absent); a present
+ *  non-array or non-string element → 400. */
+function parseStringArray(v: unknown): string[] | undefined {
+  if (v === undefined || v === null) return undefined;
+  if (!Array.isArray(v) || v.some((e) => typeof e !== 'string')) {
+    throw Object.assign(new Error('`paths` must be an array of strings'), { statusCode: 400, code: 'checkpoint-bad-request' });
+  }
+  return v as string[];
+}
+
+/** Coerce an optional `previewTokens` field to a Record<string,string> (undefined
+ *  when absent); a present non-object or non-string value → 400. */
+function parseTokenMap(v: unknown): Record<string, string> | undefined {
+  if (v === undefined || v === null) return undefined;
+  if (typeof v !== 'object' || Array.isArray(v)) {
+    throw Object.assign(new Error('`previewTokens` must be a { path: oid } object'), { statusCode: 400, code: 'checkpoint-bad-request' });
+  }
+  const out: Record<string, string> = {};
+  for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
+    if (typeof val !== 'string') {
+      throw Object.assign(new Error('`previewTokens` values must be strings'), { statusCode: 400, code: 'checkpoint-bad-request' });
+    }
+    out[k] = val;
+  }
+  return out;
 }
