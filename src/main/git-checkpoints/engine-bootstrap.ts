@@ -31,7 +31,14 @@ import { buildDispatchTurnContext, type DispatchContext, type DispatchAgentInfo 
 import { runCheckpointStartupMaintenance } from './reconciler';
 import { runWorkspaceRetention, type WorkspaceRetentionResult } from './retention';
 import { initWorkspaceGitRepo } from './git-init';
+import {
+  pruneWorkspaceCheckpoints,
+  enumerateRepoLaresRefs,
+  repoWidePurgeExecute,
+  type RepoLaresRefEnumeration,
+} from './prune';
 import { forcePrerequisiteRecheck } from '../runtime-prerequisites';
+import type { RepoWidePurgeResult, RepoWidePurgeWorkspace } from '../../shared/types';
 
 export interface CheckpointEngineHandle {
   coordinator: TurnCoordinator;
@@ -186,8 +193,47 @@ export async function createCheckpointEngine(): Promise<CheckpointEngineHandle |
         previewTokens: args.previewTokens,
       });
     },
-    // `prune` is intentionally omitted until WP-G3.5 lands the retention/prune
-    // backend; ApiServer returns a clear 501 not-yet-available for POST …/prune.
+    // WP-G3.5 — the explicit "delete my checkpoint refs" command. Workspace-scoped
+    // to the (already-authorized) claim: deletes BOTH encoded namespaces for this
+    // workspace in one atomic batch under the object-db queue lock, and reports the
+    // count. NOT retention (no distill-before-prune — the user asked to delete, not to
+    // keep a distillate) and NOT a gc/prune of objects (left to git maintenance).
+    prune: async ({ workspaceId }) => {
+      const cap = await requireCapability(workspaceId);
+      const r = await pruneWorkspaceCheckpoints({
+        workspaceId,
+        repoRoot: cap.repoRoot as string,
+        gitExe,
+        queue,
+        commonDirQueueKey: cap.commonDirQueueKey ?? undefined,
+      });
+      return { workspaceId, deletedRefs: r.deletedRefs };
+    },
+  };
+
+  // WP-G3.5 — build the "name the blast radius" plan for a repo-wide purge: map each
+  // decoded workspaceId → its registered title/path (or `known:false` when the id is
+  // no longer a live workspace — a stale/foreign scope in a shared repo is still
+  // named, never silently swept). Pure metadata; carries no workspace bytes.
+  const buildPurgePlan = (repoRoot: string, e: RepoLaresRefEnumeration): RepoWidePurgeResult => {
+    const affectedWorkspaces: RepoWidePurgeWorkspace[] = e.byWorkspace.map((g) => {
+      const ws = getWorkspace(g.workspaceId);
+      return {
+        workspaceId: g.workspaceId,
+        workspaceTitle: ws?.title ?? null,
+        workspacePath: ws?.path ?? null,
+        known: !!ws,
+        refCount: g.refs.length,
+      };
+    });
+    return {
+      repoRoot,
+      totalRefs: e.allRefs.length,
+      affectedWorkspaces,
+      undecodableRefCount: e.undecodableRefs.length,
+      executed: false,
+      deletedRefs: 0,
+    };
   };
 
   // WP-G2.2 — the HUMAN renderer surface. It REUSES the WP-G2.1 checkpointRoutes for
@@ -258,6 +304,46 @@ export async function createCheckpointEngine(): Promise<CheckpointEngineHandle |
         forcePrerequisiteRecheck();
       }
       return result;
+    },
+    // WP-G3.5 — the human mirror of the supervisor prune: same workspace-scoped
+    // namespace clear + count, actor is the human renderer.
+    prune: async (workspaceId) => {
+      const cap = await requireCapability(workspaceId);
+      const r = await pruneWorkspaceCheckpoints({
+        workspaceId,
+        repoRoot: cap.repoRoot as string,
+        gitExe,
+        queue,
+        commonDirQueueKey: cap.commonDirQueueKey ?? undefined,
+      });
+      return { workspaceId, deletedRefs: r.deletedRefs };
+    },
+    // WP-G3.5 — enumerate + NAME every workspace whose refs live in this repo, without
+    // deleting. The repo is resolved from the asserted workspace's capability; in a
+    // shared repo this surfaces OTHER workspaces' refs so the human sees them first.
+    repoWidePurgePlan: async (workspaceId) => {
+      const cap = await requireCapability(workspaceId);
+      const repoRoot = cap.repoRoot as string;
+      const e = await enumerateRepoLaresRefs({ repoRoot, gitExe });
+      return buildPurgePlan(repoRoot, e);
+    },
+    // WP-G3.5 — the confirmed repo-wide purge. It ALWAYS enumerates + names first
+    // (so the result reports the blast radius either way); it only DELETES when
+    // `confirm === true`. A missing/false confirm returns the plan unexecuted — there
+    // is no code path that purges without an explicit human confirmation.
+    repoWidePurge: async ({ workspaceId, confirm }) => {
+      const cap = await requireCapability(workspaceId);
+      const repoRoot = cap.repoRoot as string;
+      const e = await enumerateRepoLaresRefs({ repoRoot, gitExe });
+      const plan = buildPurgePlan(repoRoot, e);
+      if (!confirm) return plan;
+      const res = await repoWidePurgeExecute({
+        repoRoot,
+        gitExe,
+        queue,
+        commonDirQueueKey: cap.commonDirQueueKey ?? undefined,
+      });
+      return { ...plan, executed: true, deletedRefs: res.deletedRefs };
     },
   };
 

@@ -310,9 +310,12 @@ export interface CheckpointRoutes {
     agentId: string;
     previewTokens?: Record<string, string>;
   }): Promise<RestoreOutcome>;
-  /** Prune mechanism (WP-G2.1 route) — retention policy is WP-G3.5. Optional so the
-   *  route can return a clear not-yet-available error until the backend lands. */
-  prune?(args: { workspaceId: string; agentId: string }): Promise<unknown>;
+  /** WP-G3.5 — the explicit "delete my checkpoint refs" command: deletes BOTH encoded
+   *  namespaces (`refs/lares/checkpoints/<enc(ws)>/*` + `refs/lares/recovery/<enc(ws)>/*`)
+   *  for the asserted workspace in one atomic batch and reports the count. Objects are
+   *  left for normal git maintenance. Optional so a fake / an engine that predates the
+   *  backend can still 501 the route. */
+  prune?(args: { workspaceId: string; agentId: string }): Promise<{ workspaceId: string; deletedRefs: number }>;
 }
 
 /**
@@ -762,7 +765,10 @@ export class ApiServer {
       return { workspaceId, path: filePath, versions };
     }
 
-    // POST /api/checkpoints/prune — mechanism route (retention policy = WP-G3.5).
+    // POST /api/checkpoints/prune — WP-G3.5 explicit "delete my checkpoint refs"
+    // command: deletes both encoded namespaces for the asserted workspace atomically
+    // and reports the count (objects left for git maintenance). `prune` stays optional
+    // on the interface so a fake / an engine predating the backend still 501s cleanly.
     if (path === '/api/checkpoints/prune') {
       if (method !== 'POST') throw methodNotAllowed();
       const routes = this.requireCheckpointRoutes();
@@ -770,7 +776,7 @@ export class ApiServer {
       ApiServer.rejectForce(body); // `force` is refused BEFORE the availability check.
       if (!routes.prune) {
         throw Object.assign(
-          new Error('checkpoint prune is not yet available (retention/prune backend lands in WP-G3.5)'),
+          new Error('checkpoint prune is not available (the engine predates the WP-G3.5 prune backend)'),
           { statusCode: 501, code: 'checkpoint-prune-unavailable' },
         );
       }

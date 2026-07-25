@@ -24,10 +24,12 @@ import {
   type CheckpointFileHistoryResult,
   type CheckpointListResult,
   type CheckpointPreviewResult,
+  type CheckpointPruneResult,
   type CheckpointRestoreRequest,
   type CheckpointRestoreResult,
   type CheckpointRevertRequest,
   type GitInitResult,
+  type RepoWidePurgeResult,
 } from '../../shared/types';
 
 /** The force-capable engine surface the IPC layer drives. Built by the engine
@@ -60,6 +62,18 @@ export interface HumanCheckpointRoutes {
    *  workspace re-probes as a repo. Human-side only — never an agent MCP tool or a
    *  capability HTTP route. */
   initRepo(workspaceId: string): Promise<GitInitResult>;
+  /** WP-G3.5 — delete this workspace's checkpoint + recovery refs (both encoded
+   *  namespaces) in one atomic batch and report the count. Same semantics as the
+   *  supervisor MCP tool / capability route; objects are left for git maintenance. */
+  prune(workspaceId: string): Promise<CheckpointPruneResult>;
+  /** WP-G3.5 — enumerate + NAME every workspace whose `refs/lares/*` live in the
+   *  (possibly shared) repo this workspace belongs to, WITHOUT deleting. The
+   *  "name the blast radius" step the human sees before a repo-wide purge. */
+  repoWidePurgePlan(workspaceId: string): Promise<RepoWidePurgeResult>;
+  /** WP-G3.5 — apply the repo-wide purge (ALL `refs/lares/*` in the repo, every
+   *  workspace) ONLY when `confirm` is true; otherwise returns the plan unexecuted.
+   *  Human-only; there is no unscoped `--all` on the agent surface. */
+  repoWidePurge(args: { workspaceId: string; confirm: boolean }): Promise<RepoWidePurgeResult>;
 }
 
 /** The minimal `ipcMain.handle` shape (mirrors lifecycle-ipc's IpcLike) so the
@@ -238,5 +252,32 @@ export function registerCheckpointIpc(ipc: IpcLike, getRoutes: () => HumanCheckp
   ipc.handle(CHECKPOINT_CHANNELS.gitInit, async (_e, workspaceId: unknown) => {
     const routes = requireRoutes(getRoutes());
     return routes.initRepo(requireWorkspaceId(workspaceId));
+  });
+
+  // WP-G3.5 — the explicit "delete my checkpoint refs" command. `prune` is the
+  // human mirror of the supervisor MCP tool / capability route: workspace-scoped,
+  // deletes both encoded namespaces, reports the count. It carries no `force` and
+  // needs no preview — it is a namespace clear, not a path restore.
+  ipc.handle(CHECKPOINT_CHANNELS.prune, async (_e, workspaceId: unknown) => {
+    const routes = requireRoutes(getRoutes());
+    return routes.prune(requireWorkspaceId(workspaceId));
+  });
+
+  // WP-G3.5 — the DISTINCT, human-only pre-`filter-repo` purge. The PLAN channel
+  // enumerates and NAMES every affected workspace in the (possibly shared) repo
+  // without deleting anything, so the UI can show the full blast radius. The EXECUTE
+  // channel only clears the refs when `confirm === true`; a missing/false confirm
+  // returns the same plan, unexecuted (never a silent purge). Neither is exposed as
+  // an MCP tool or an HTTP route.
+  ipc.handle(CHECKPOINT_CHANNELS.pruneRepoWidePlan, async (_e, workspaceId: unknown) => {
+    const routes = requireRoutes(getRoutes());
+    return routes.repoWidePurgePlan(requireWorkspaceId(workspaceId));
+  });
+
+  ipc.handle(CHECKPOINT_CHANNELS.pruneRepoWide, async (_e, raw: unknown) => {
+    const routes = requireRoutes(getRoutes());
+    const req = (raw ?? {}) as { workspaceId?: unknown; confirm?: unknown };
+    const workspaceId = requireWorkspaceId(req.workspaceId);
+    return routes.repoWidePurge({ workspaceId, confirm: req.confirm === true });
   });
 }

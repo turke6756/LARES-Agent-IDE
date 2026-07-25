@@ -90,9 +90,13 @@ function getCheckpointsToolDefinitions() {
     {
       name: 'prune_checkpoints',
       description:
-        'Apply the checkpoint retention/prune policy for your workspace (mechanism route; the retention '
-        + 'backend lands in WP-G3.5, so this may report "not yet available" until then). Supervisor-only, '
-        + 'workspace-scoped to your capability. No `force`.',
+        'DELETE your workspace\'s checkpoint history: removes BOTH ref namespaces for your workspace '
+        + '(refs/lares/checkpoints/<ws>/* and refs/lares/recovery/<ws>/*) in one atomic batch and reports '
+        + 'the deleted-ref count. This makes those turns UNRECOVERABLE (diff/restore/revert stop working '
+        + 'for them). It is workspace-scoped to YOUR capability — it can never touch another workspace\'s '
+        + 'refs, and it never deletes user branches/tags. Git objects are left for normal maintenance (no '
+        + 'gc/prune is run). Supervisor-only. No `force`. (The pre-mirror/pre-filter-repo repo-wide purge '
+        + 'is a separate human-only action, not available here.)',
       inputSchema: {
         type: 'object',
         properties: {},

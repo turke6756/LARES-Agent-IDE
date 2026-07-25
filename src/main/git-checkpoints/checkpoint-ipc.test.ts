@@ -157,6 +157,33 @@ function makeRoutes(cfg: FakeCfg = {}): HumanCheckpointRoutes & { state: FakeSta
         message: 'Created a Git repository at the workspace root.',
       };
     },
+    prune: async (workspaceId) => {
+      rec('prune', [workspaceId]);
+      return { workspaceId, deletedRefs: 7 };
+    },
+    repoWidePurgePlan: async (workspaceId) => {
+      rec('repoWidePurgePlan', [workspaceId]);
+      return {
+        repoRoot: '/repo', totalRefs: 10,
+        affectedWorkspaces: [
+          { workspaceId, workspaceTitle: 'Mine', workspacePath: '/repo/mine', known: true, refCount: 6 },
+          { workspaceId: 'ws-other', workspaceTitle: 'Other', workspacePath: '/repo/other', known: true, refCount: 4 },
+        ],
+        undecodableRefCount: 0, executed: false, deletedRefs: 0,
+      };
+    },
+    repoWidePurge: async ({ workspaceId, confirm }) => {
+      rec('repoWidePurge', [{ workspaceId, confirm }]);
+      const plan = {
+        repoRoot: '/repo', totalRefs: 10,
+        affectedWorkspaces: [
+          { workspaceId, workspaceTitle: 'Mine', workspacePath: '/repo/mine', known: true, refCount: 6 },
+          { workspaceId: 'ws-other', workspaceTitle: 'Other', workspacePath: '/repo/other', known: true, refCount: 4 },
+        ],
+        undecodableRefCount: 0, executed: false, deletedRefs: 0,
+      };
+      return confirm ? { ...plan, executed: true, deletedRefs: 10 } : plan;
+    },
   };
   return Object.assign(routes, { state });
 }
@@ -170,7 +197,7 @@ function wire(cfg: FakeCfg = {}): { ipc: FakeIpc; routes: ReturnType<typeof make
 
 // ── 1. Registration + workspace-scoped delegation ───────────────────────────────
 
-test('registers all five checkpoint channels', () => {
+test('registers every checkpoint channel', () => {
   const { ipc } = wire();
   for (const ch of Object.values(CHECKPOINT_CHANNELS)) {
     assert.ok(ipc.handlers.has(ch), `missing handler for ${ch}`);
@@ -271,6 +298,61 @@ test('gitInit on an unwired engine answers "unavailable" (no usable git ⇒ cann
   const ipc = new FakeIpc();
   registerCheckpointIpc(ipc, () => null);
   await assert.rejects(() => ipc.invoke(CHECKPOINT_CHANNELS.gitInit, 'ws-1'), /unavailable|bootstrapping/i);
+});
+
+// ── 2c. WP-G3.5: prune + the human-only repo-wide purge ──────────────────────────
+
+test('prune delegates the workspace and returns the deleted-ref count', async () => {
+  const { ipc, routes } = wire();
+  const res = await ipc.invoke(CHECKPOINT_CHANNELS.prune, 'ws-1') as { workspaceId: string; deletedRefs: number };
+  assert.equal(res.workspaceId, 'ws-1');
+  assert.equal(res.deletedRefs, 7);
+  assert.deepEqual(routes.state.calls.at(-1), { method: 'prune', args: ['ws-1'] });
+});
+
+test('prune rejects a missing workspaceId before any engine call', async () => {
+  const { ipc, routes } = wire();
+  await assert.rejects(() => ipc.invoke(CHECKPOINT_CHANNELS.prune, ''), /workspaceId/);
+  assert.equal(routes.state.calls.length, 0);
+});
+
+test('repo-wide purge PLAN names every affected workspace and deletes nothing', async () => {
+  const { ipc, routes } = wire();
+  const plan = await ipc.invoke(CHECKPOINT_CHANNELS.pruneRepoWidePlan, 'ws-1') as {
+    affectedWorkspaces: { workspaceId: string; workspaceTitle: string | null }[]; executed: boolean; deletedRefs: number;
+  };
+  assert.equal(plan.executed, false);
+  assert.equal(plan.deletedRefs, 0);
+  assert.deepEqual(plan.affectedWorkspaces.map((w) => w.workspaceId), ['ws-1', 'ws-other'],
+    'both workspaces in the shared repo are named BEFORE acting');
+  assert.deepEqual(routes.state.calls.at(-1), { method: 'repoWidePurgePlan', args: ['ws-1'] });
+});
+
+test('repo-wide purge WITHOUT confirm returns the plan unexecuted (no silent purge)', async () => {
+  const { ipc, routes } = wire();
+  const res = await ipc.invoke(CHECKPOINT_CHANNELS.pruneRepoWide, { workspaceId: 'ws-1' }) as {
+    executed: boolean; deletedRefs: number;
+  };
+  assert.equal(res.executed, false);
+  assert.equal(res.deletedRefs, 0);
+  // confirm is normalized to false (absent → false).
+  assert.deepEqual(routes.state.calls.at(-1), { method: 'repoWidePurge', args: [{ workspaceId: 'ws-1', confirm: false }] });
+});
+
+test('repo-wide purge WITH confirm:true executes and reports the deleted count', async () => {
+  const { ipc, routes } = wire();
+  const res = await ipc.invoke(CHECKPOINT_CHANNELS.pruneRepoWide, { workspaceId: 'ws-1', confirm: true }) as {
+    executed: boolean; deletedRefs: number;
+  };
+  assert.equal(res.executed, true);
+  assert.equal(res.deletedRefs, 10);
+  assert.deepEqual(routes.state.calls.at(-1), { method: 'repoWidePurge', args: [{ workspaceId: 'ws-1', confirm: true }] });
+});
+
+test('repo-wide purge rejects a missing workspaceId before any engine call', async () => {
+  const { ipc, routes } = wire();
+  await assert.rejects(() => ipc.invoke(CHECKPOINT_CHANNELS.pruneRepoWide, { confirm: true }), /workspaceId/);
+  assert.equal(routes.state.calls.length, 0);
 });
 
 // ── 3. Non-force restore rides the preview token (no gate consulted) ─────────────

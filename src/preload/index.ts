@@ -162,6 +162,13 @@ const api: IpcApi = {
     // WP-G3.4 — human-only `git init` consent action (enable checkpoints on a
     // non-repo workspace). Handler in git-checkpoints/checkpoint-ipc.ts.
     gitInit: (workspaceId) => ipcRenderer.invoke(CHECKPOINT_CHANNELS.gitInit, workspaceId),
+    // WP-G3.5 — explicit prune (delete this workspace's checkpoint + recovery refs)
+    // and the DISTINCT human-only, confirmed pre-`filter-repo` repo-wide purge that
+    // names every affected workspace first. Handlers in checkpoint-ipc.ts.
+    prune: (workspaceId) => ipcRenderer.invoke(CHECKPOINT_CHANNELS.prune, workspaceId),
+    pruneRepoWidePlan: (workspaceId) =>
+      ipcRenderer.invoke(CHECKPOINT_CHANNELS.pruneRepoWidePlan, workspaceId),
+    pruneRepoWide: (req) => ipcRenderer.invoke(CHECKPOINT_CHANNELS.pruneRepoWide, req),
   },
   plans: {
     // WP5: fires after each WP4 reparse so the renderer re-fetches the served

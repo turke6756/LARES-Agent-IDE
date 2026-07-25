@@ -112,6 +112,10 @@ const TESTS = [
   // Git-Native WP-G3.4: the human-only `git init` consent action (init a non-repo
   // + re-probe; refuse already-repo; error leaves no partial state; human-only).
   'dist/main/main/git-checkpoints/git-init.test.js',
+  // Git-Native WP-G3.5: explicit prune (delete a workspace's two encoded namespaces,
+  // atomic batch, no gc/prune) + the human-only repo-wide purge that names every
+  // affected workspace before clearing (real git).
+  'dist/main/main/git-checkpoints/prune.test.js',
   'dist/main/main/supervisor/send-queue-checkpoint.test.js',
   'dist/main/main/supervisor/initial-user-prompt.test.js',
   'dist/main/main/supervisor/hook-spool-tailer.test.js',

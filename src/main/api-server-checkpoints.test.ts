@@ -372,18 +372,50 @@ test('`force` in the body is refused on every checkpoint mutation route', () =>
     }
   }));
 
-// ── 10. Prune is a capability-bound mechanism, not-yet-available (WP-G3.5) ────────
+// ── 10. Prune is capability-bound; unwired backend still 501s, wired one forwards ─
 
-test('prune requires a supervisor capability first, THEN reports not-yet-available', () =>
+test('prune requires a supervisor capability first, THEN 501s when no prune backend is wired', () =>
   withServer(async (port) => {
-    // Global bearer still rejected (auth precedes the not-available check).
+    // Global bearer still rejected (auth precedes the availability check).
     const bad = await request(port, 'POST', '/api/checkpoints/prune', { Authorization: `Bearer ${GLOBAL_BEARER}` }, {});
     assert.equal(bad.status, 403);
     assert.equal(parse(bad).code, 'checkpoint-requires-capability');
-    // Authorized supervisor → 501 not-yet-available (no prune backend wired).
+    // Authorized supervisor, but the default fake omits `prune` → 501 (engine predates backend).
     const ok = await request(port, 'POST', '/api/checkpoints/prune', { Authorization: bearerFor('supervisor', 'sup-A') }, {});
     assert.equal(ok.status, 501);
     assert.equal(parse(ok).code, 'checkpoint-prune-unavailable');
+  }));
+
+test('WP-G3.5: a wired prune forwards the claim workspace + agent and returns the count', () =>
+  withServer(async (port) => {
+    const res = await request(port, 'POST', '/api/checkpoints/prune', { Authorization: bearerFor('supervisor', 'sup-A', WS) }, {});
+    assert.equal(res.status, 200);
+    const body = parse(res);
+    assert.equal(body.workspaceId, WS, 'scoped to the claim workspace');
+    assert.equal(body.deletedRefs, 3);
+  }, {
+    routes: makeFakeRoutes({
+      // The route forwards the (already-authorized) claim workspace + agent, never a
+      // caller-chosen scope; the backend reports the atomic-batch deleted-ref count.
+      prune: async ({ workspaceId, agentId }) => {
+        assert.equal(workspaceId, WS);
+        assert.equal(agentId, 'sup-A');
+        return { workspaceId, deletedRefs: 3 };
+      },
+    }),
+  }));
+
+test('WP-G3.5: prune is workspace-scoped — a mismatched ?workspaceId= is rejected before the backend', () =>
+  withServer(async (port) => {
+    const res = await request(port, 'POST', '/api/checkpoints/prune?workspaceId=other-ws', {
+      Authorization: bearerFor('supervisor', 'sup-A', WS),
+    }, {});
+    assert.equal(res.status, 403);
+    assert.equal(parse(res).code, 'checkpoint-workspace-mismatch');
+  }, {
+    routes: makeFakeRoutes({
+      prune: async () => { throw new Error('backend must not run on a scope mismatch'); },
+    }),
   }));
 
 // ── 11. Auth precedes engine-availability: unwired engine still 403s the bearer ──

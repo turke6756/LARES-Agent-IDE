@@ -1698,7 +1698,52 @@ export const CHECKPOINT_CHANNELS = {
   // Renderer IPC ONLY (like the force override path): never an agent MCP tool,
   // never a capability-token HTTP route.
   gitInit: 'checkpoint:gitInit',
+  // WP-G3.5 — the explicit "delete my checkpoint refs" command. `prune` is the
+  // workspace-scoped op mirrored from the supervisor MCP tool / capability route.
+  // `pruneRepoWidePlan` + `pruneRepoWide` are the DISTINCT human-only, explicitly-
+  // confirmed pre-`filter-repo` purge that names every affected workspace first;
+  // they are deliberately renderer-IPC ONLY (never an MCP tool / HTTP route).
+  prune: 'checkpoint:prune',
+  pruneRepoWidePlan: 'checkpoint:pruneRepoWidePlan',
+  pruneRepoWide: 'checkpoint:pruneRepoWide',
 } as const;
+
+/** WP-G3.5 — outcome of the workspace-scoped prune: both encoded namespaces
+ *  (`refs/lares/checkpoints/<enc(ws)>/*` + `refs/lares/recovery/<enc(ws)>/*`) deleted
+ *  in one atomic batch, with the deleted-ref count. Objects are left for normal git
+ *  maintenance (no gc/prune). */
+export interface CheckpointPruneResult {
+  workspaceId: string;
+  deletedRefs: number;
+}
+
+/** WP-G3.5 — one workspace whose `refs/lares/*` live in the repo a repo-wide purge
+ *  would clear. `known` is false when the decoded id no longer maps to a registered
+ *  workspace (a stale/foreign scope in a shared repo) — still named, so the human
+ *  sees the full blast radius. */
+export interface RepoWidePurgeWorkspace {
+  workspaceId: string;
+  /** The registered workspace title, or null when the id is no longer known. */
+  workspaceTitle: string | null;
+  workspacePath: string | null;
+  known: boolean;
+  refCount: number;
+}
+
+/** WP-G3.5 — the enumerated blast radius of a repo-wide purge: the repo, every
+ *  affected workspace NAMED, the total ref count, and any undecodable Lares refs. A
+ *  purge clears ALL of them; this is shown BEFORE the human confirms. `executed`
+ *  distinguishes the plan (confirm=false / preview) from the applied purge. */
+export interface RepoWidePurgeResult {
+  repoRoot: string;
+  totalRefs: number;
+  affectedWorkspaces: RepoWidePurgeWorkspace[];
+  undecodableRefCount: number;
+  /** True only after an explicitly-confirmed purge actually deleted the refs. */
+  executed: boolean;
+  /** Refs deleted (0 when only planning). */
+  deletedRefs: number;
+}
 
 /** WP-G3.4 — outcome of the human-only `git init` consent action. A non-repo
  *  workspace is the honest-disabled state (no silent `.git`); this action, driven
@@ -2238,6 +2283,16 @@ export interface IpcApi {
      *  enable checkpoints. Refuses honestly when the workspace is already a repo,
      *  a protected root, or git is unusable. */
     gitInit: (workspaceId: string) => Promise<GitInitResult>;
+    /** WP-G3.5 — delete this workspace's checkpoint + recovery refs (both encoded
+     *  namespaces) in one atomic batch; objects are left for normal git maintenance.
+     *  Same semantics as the supervisor MCP tool / capability route. */
+    prune: (workspaceId: string) => Promise<CheckpointPruneResult>;
+    /** WP-G3.5 — the DISTINCT human-only pre-`filter-repo` purge. `pruneRepoWidePlan`
+     *  enumerates and NAMES every affected workspace in the (possibly shared) repo
+     *  WITHOUT deleting; `pruneRepoWide` applies it only under `confirm: true`. Never
+     *  an MCP tool / HTTP route — there is no unscoped `--all` on the agent surface. */
+    pruneRepoWidePlan: (workspaceId: string) => Promise<RepoWidePurgeResult>;
+    pruneRepoWide: (req: { workspaceId: string; confirm: boolean }) => Promise<RepoWidePurgeResult>;
   };
 }
 
