@@ -66,6 +66,7 @@ import { ensurePersonaScaffold, applyPersonaLaneToLaunchInput } from '../persona
 import { contextGaugeRoleKeyOf, resolveContextGaugeCap } from '../context-gauge/context-gauge-cap';
 
 import { getApiToken } from '../security/api-auth';
+import { agentCapabilities } from '../security/agent-capabilities';
 import { EventBridge, EventBridgeDeps } from './event-bridge';
 import { TeamMessageDeliveryEngine } from './team-delivery';
 import { WindowsRunner } from './windows-runner';
@@ -3049,13 +3050,22 @@ export class AgentSupervisor extends EventEmitter {
    *  in-process JSON (never on disk). Impure inputs (script path, bound port,
    *  token, WSL gateway IP) are supplied here; the JSON shape is built by the
    *  pure `buildDashboardMcpConfigArg`. */
-  buildDashboardMcpConfigForLane(lane: AgentRoleLane, pathType: string, identityEnv?: Record<string, string>): string {
+  buildDashboardMcpConfigForLane(
+    lane: AgentRoleLane,
+    pathType: string,
+    identityEnv?: Record<string, string>,
+    // WP-G2.0 — the per-agent capability token to inject in place of the global
+    // bearer. Callers pass `mintAgentCapabilityToken(agent)`, which itself falls
+    // back to `getApiToken()` if minting fails. Defaulting to the global bearer
+    // keeps the pure builder + any legacy caller working (fallback-safe).
+    apiToken: string = getApiToken(),
+  ): string {
     return buildDashboardMcpConfigArg({
       toolsets: toolsetsForLane(lane),
       pathType,
       scriptPath: getScriptPath('mcp-dashboard.js'),
       apiPort: this.apiServerPort,
-      apiToken: getApiToken(),
+      apiToken,
       wslHostIp: pathType === 'wsl' ? this.resolveWslGatewayIp() : undefined,
       // GT-A WP-A4 (D-2) — forward the agent's identity rail into the MCP sidecar
       // env explicitly (not via parent-env inheritance) so the plans-read
@@ -3085,6 +3095,43 @@ export class AgentSupervisor extends EventEmitter {
     if (agent.planId) env.AGENT_DASHBOARD_PLAN_ID = agent.planId;
     if (agent.planSection) env.AGENT_DASHBOARD_PLAN_SECTION = agent.planSection;
     return env;
+  }
+
+  /** WP-G2.0 — mint (or ROTATE) the per-agent capability token to inject into
+   *  the agent's dashboard `--mcp-config`, in place of the global bearer. The
+   *  claim is derived from AUTHORITATIVE persisted state (roleLaneOf + the agent
+   *  record), never caller input. Minting again for the same agent (a relaunch)
+   *  rotates: the prior token stops resolving.
+   *
+   *  FALLBACK SWITCH (required): if minting throws for any reason, revert to the
+   *  global bearer `getApiToken()` — logged + alarmed — so a token bug can never
+   *  brick MCP. The token is a secret; never log its value. */
+  private mintAgentCapabilityToken(agent: Agent): string {
+    try {
+      return agentCapabilities.mint({
+        agentId: agent.id,
+        workspaceId: agent.workspaceId,
+        privilegeLane: roleLaneOf(agent),
+      });
+    } catch (err) {
+      // ALARM: minting failed — fall back to the global bearer so MCP still works.
+      console.error(
+        `[capability] ALARM: mint failed for agent ${agent.id}; falling back to global bearer for MCP injection:`,
+        err instanceof Error ? err.message : String(err),
+      );
+      return getApiToken();
+    }
+  }
+
+  /** WP-G2.0 — revoke an agent's capability token on stop/delete so it stops
+   *  resolving at the admission gate. Idempotent (no-op when the agent held
+   *  none, e.g. a legacy agent that never minted). */
+  private revokeAgentCapabilityToken(agentId: string): void {
+    try {
+      agentCapabilities.revokeAgent(agentId);
+    } catch (err) {
+      console.warn(`[capability] revoke failed for agent ${agentId}:`, err);
+    }
   }
 
   /** Build --mcp-config JSON for a team member agent (used at launch time).
@@ -3233,7 +3280,7 @@ export class AgentSupervisor extends EventEmitter {
         const membership = getTeamMembership(agent.id);
         const mcpConfigs: string[] = [];
         if (lane !== 'legacy') {
-          mcpConfigs.push(this.buildDashboardMcpConfigForLane(lane, 'windows', this.buildIdentityEnvForAgent(agent)));
+          mcpConfigs.push(this.buildDashboardMcpConfigForLane(lane, 'windows', this.buildIdentityEnvForAgent(agent), this.mintAgentCapabilityToken(agent)));
         }
         if (membership) {
           mcpConfigs.push(this.buildTeamMcpConfigArg(agent.id, membership.teamId, 'windows'));
@@ -4191,7 +4238,7 @@ export class AgentSupervisor extends EventEmitter {
         const membership = getTeamMembership(agent.id);
         const mcpConfigs: string[] = [];
         if (lane !== 'legacy') {
-          mcpConfigs.push(this.buildDashboardMcpConfigForLane(lane, 'wsl', this.buildIdentityEnvForAgent(agent)));
+          mcpConfigs.push(this.buildDashboardMcpConfigForLane(lane, 'wsl', this.buildIdentityEnvForAgent(agent), this.mintAgentCapabilityToken(agent)));
         }
         if (membership) {
           mcpConfigs.push(this.buildTeamMcpConfigArg(agent.id, membership.teamId, 'wsl'));
@@ -4627,7 +4674,7 @@ export class AgentSupervisor extends EventEmitter {
     if (pathType === 'windows') {
       const parts = source.command.split(/\s+/);
       const forkMcp = forkLane !== 'legacy'
-        ? ['--mcp-config', this.buildDashboardMcpConfigForLane(forkLane, 'windows', this.buildIdentityEnvForAgent(newAgent)), ...(forkStrict ? ['--strict-mcp-config'] : [])]
+        ? ['--mcp-config', this.buildDashboardMcpConfigForLane(forkLane, 'windows', this.buildIdentityEnvForAgent(newAgent), this.mintAgentCapabilityToken(newAgent)), ...(forkStrict ? ['--strict-mcp-config'] : [])]
         : [];
       const forkTools = forkResearcher
         ? ['--tools', RESEARCHER_ALLOWED_TOOLS.join(','), '--disallowedTools', RESEARCHER_DISALLOWED_TOOLS.join(','), '--model', 'claude-sonnet-4-6']
@@ -4636,7 +4683,7 @@ export class AgentSupervisor extends EventEmitter {
       await this.launchWindowsAgent(newAgent, false, null, undefined, forkArgs);
     } else {
       const forkMcp = forkLane !== 'legacy'
-        ? ` --mcp-config '${this.buildDashboardMcpConfigForLane(forkLane, 'wsl', this.buildIdentityEnvForAgent(newAgent))}'${forkStrict ? ' --strict-mcp-config' : ''}`
+        ? ` --mcp-config '${this.buildDashboardMcpConfigForLane(forkLane, 'wsl', this.buildIdentityEnvForAgent(newAgent), this.mintAgentCapabilityToken(newAgent))}'${forkStrict ? ' --strict-mcp-config' : ''}`
         : '';
       const forkTools = forkResearcher
         ? ` --tools '${RESEARCHER_ALLOWED_TOOLS.join(',')}' --disallowedTools '${RESEARCHER_DISALLOWED_TOOLS.join(',')}' --model claude-sonnet-4-6`
@@ -5200,6 +5247,11 @@ export class AgentSupervisor extends EventEmitter {
     }
 
     this.fileTrackers.delete(agentId);
+    // WP-G2.0 — revoke the agent's minted capability token on stop so it stops
+    // resolving at the admission gate. Reached for a real stop or an
+    // already-terminal no-op; the honest-failure early-return above (agent may
+    // still be live) deliberately does NOT revoke. Idempotent for legacy agents.
+    this.revokeAgentCapabilityToken(agentId);
     // WP-P2 — a stopped agent must never receive its pending initial prompt
     // (clear BEFORE the 'done' emission below; 'done' is input-accepting).
     this.pendingInitialPrompts.delete(agentId);
@@ -5266,6 +5318,8 @@ export class AgentSupervisor extends EventEmitter {
     }
 
     this.fileTrackers.delete(agentId);
+    // WP-G2.0 — revoke the agent's minted capability token on delete.
+    this.revokeAgentCapabilityToken(agentId);
     // Drop the chat ring with the record itself (deleteAgent never did this —
     // the ring outlived the agent row for the life of the process).
     this.sessionLogReader.forgetAgent(agentId);

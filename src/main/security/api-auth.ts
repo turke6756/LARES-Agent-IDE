@@ -8,6 +8,7 @@
 // unit-tested with the compiled-node runner.
 
 import crypto from 'crypto';
+import { agentCapabilities, type CapabilityClaim } from './agent-capabilities';
 
 let token: string | null = null;
 
@@ -48,17 +49,38 @@ export type ApiAccessDecision =
   | { kind: 'forbidden-origin' }
   /** Origin fine but bearer token missing/wrong → 401. */
   | { kind: 'unauthorized'; corsOrigin: string | undefined }
-  /** Authenticated request → route it; echo corsOrigin when a browser sent one. */
-  | { kind: 'ok'; corsOrigin: string | undefined };
+  /** Authenticated request → route it; echo corsOrigin when a browser sent one.
+   *  `capability` is set ONLY when admission came via a minted per-agent
+   *  capability token (WP-G2.0); it is absent for the global bearer. It carries
+   *  the caller's server-side claim for routes that CHOOSE to check it — it does
+   *  NOT change admission scope (a capability is admitted exactly like the global
+   *  bearer). Routes that ignore `capability` are unaffected, so a claimed
+   *  privilege can never leak into a route that does not consult it. */
+  | { kind: 'ok'; corsOrigin: string | undefined; capability?: CapabilityClaim };
+
+/** Extract the token value from an `Authorization: Bearer <token>` header, or
+ *  null if the header is missing / not a Bearer header. */
+function bearerValue(authorization: string | undefined): string | null {
+  if (typeof authorization !== 'string') return null;
+  const prefix = 'Bearer ';
+  return authorization.startsWith(prefix) ? authorization.slice(prefix.length) : null;
+}
 
 /** The whole request-admission decision (M1 + M8 CORS), as a pure function so
  *  the policy is machine-checkable without Electron or sockets. Order is the
- *  spec's: preflight short-circuit → origin allowlist → bearer gate. */
+ *  spec's: preflight short-circuit → origin allowlist → bearer gate.
+ *
+ *  WP-G2.0: after the global-bearer check, a token that resolves in the capability
+ *  store is ALSO admitted (with its claim attached). Admission is additive — a
+ *  minted token grants exactly the global bearer's access; per-route authorization
+ *  stays separate (WP-G2.1). `resolveCapability` is injectable for deterministic
+ *  unit tests; it defaults to the process-wide capability store. */
 export function decideApiAccess(
   method: string,
   origin: string | undefined,
   authorization: string | undefined,
   expectedToken: string,
+  resolveCapability?: (token: string) => CapabilityClaim | null,
 ): ApiAccessDecision {
   const originAllowed = isAllowedOrigin(origin);
   // Echo the origin back only when a browser sent one AND it's allowlisted.
@@ -70,6 +92,15 @@ export function decideApiAccess(
     return originAllowed ? { kind: 'preflight', corsOrigin } : { kind: 'forbidden-origin' };
   }
   if (!originAllowed) return { kind: 'forbidden-origin' };
-  if (!isAuthorized(authorization, expectedToken)) return { kind: 'unauthorized', corsOrigin };
-  return { kind: 'ok', corsOrigin };
+  // Global bearer: admission-only, no claim (unchanged legacy behavior).
+  if (isAuthorized(authorization, expectedToken)) return { kind: 'ok', corsOrigin };
+  // Capability token: admitted with its claim attached. Falls through to the
+  // global-bearer check first so the bearer path is byte-for-byte unchanged.
+  const presented = bearerValue(authorization);
+  if (presented) {
+    const resolver = resolveCapability ?? ((t) => agentCapabilities.resolve(t));
+    const claim = resolver(presented);
+    if (claim) return { kind: 'ok', corsOrigin, capability: claim };
+  }
+  return { kind: 'unauthorized', corsOrigin };
 }

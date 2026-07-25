@@ -132,6 +132,8 @@ const TESTS = [
   'dist/main/main/supervisor/wsl-attach-cmd.test.js',
   'dist/main/main/supervisor/multi-transport-matrix.test.js',
   'dist/main/main/api-auth.test.js',
+  // WP-G2.0 — per-agent capability token store (mint / rotate / revoke / resolve).
+  'dist/main/main/security/agent-capabilities.test.js',
   'dist/main/main/api-identity.test.js',
   'dist/main/main/api-codex-session-bind.test.js',
   'dist/main/main/continuation-lifecycle.test.js',

@@ -16,6 +16,8 @@ import assert from 'node:assert/strict';
 import http from 'http';
 import { ApiServer } from './api-server';
 import { getApiToken, isAuthorized, decideApiAccess } from './security/api-auth';
+import { agentCapabilities } from './security/agent-capabilities';
+import type { CapabilityClaim } from './security/agent-capabilities';
 import type { AgentSupervisor } from './supervisor';
 
 interface TestCase { name: string; run(): Promise<void> | void; }
@@ -49,6 +51,63 @@ test('decideApiAccess: order is preflight → origin → bearer', () => {
   const ok = decideApiAccess('GET', undefined, 'Bearer t', 't');
   assert.equal(ok.kind, 'ok');
   assert.equal((ok as { corsOrigin?: string }).corsOrigin, undefined);
+});
+
+// ── WP-G2.0 capability-token admission (pure decision) ───────────────────────
+
+const workerClaim: CapabilityClaim = { agentId: 'w1', workspaceId: 'ws1', privilegeLane: 'worker' };
+const resolverFor = (validToken: string, claim: CapabilityClaim) =>
+  (t: string): CapabilityClaim | null => (t === validToken ? claim : null);
+
+test('decideApiAccess: global bearer still admits with NO capability attached (legacy path unchanged)', () => {
+  const d = decideApiAccess('GET', undefined, 'Bearer t', 't', resolverFor('cap', workerClaim));
+  assert.equal(d.kind, 'ok');
+  assert.equal((d as { capability?: CapabilityClaim }).capability, undefined,
+    'global bearer must never carry a capability claim');
+});
+
+test('decideApiAccess: a minted capability token is admitted with its claim attached', () => {
+  const d = decideApiAccess('GET', undefined, 'Bearer cap', 't', resolverFor('cap', workerClaim));
+  assert.equal(d.kind, 'ok');
+  assert.deepEqual((d as { capability?: CapabilityClaim }).capability, workerClaim);
+});
+
+test('decideApiAccess: a minted WORKER credential is a valid bearer but carries a worker claim', () => {
+  const d = decideApiAccess('GET', undefined, 'Bearer cap', 't', resolverFor('cap', workerClaim));
+  assert.equal(d.kind, 'ok', 'worker capability is admitted like the global bearer');
+  assert.equal((d as { capability?: CapabilityClaim }).capability?.privilegeLane, 'worker',
+    'claim is worker, not supervisor — no privilege escalation at admission');
+});
+
+test('decideApiAccess: capability admission does not change scope — same ok for any operation', () => {
+  // Admission is identical regardless of method; per-route authz is separate.
+  for (const m of ['GET', 'POST', 'DELETE', 'PATCH']) {
+    const d = decideApiAccess(m, undefined, 'Bearer cap', 't', resolverFor('cap', workerClaim));
+    assert.equal(d.kind, 'ok', `capability must be admitted for ${m}`);
+  }
+});
+
+test('decideApiAccess: an unknown token (neither bearer nor capability) is unauthorized', () => {
+  const d = decideApiAccess('GET', undefined, 'Bearer nope', 't', resolverFor('cap', workerClaim));
+  assert.equal(d.kind, 'unauthorized');
+});
+
+test('decideApiAccess: origin gate still wins over a valid capability', () => {
+  const d = decideApiAccess('POST', 'https://evil.example', 'Bearer cap', 't', resolverFor('cap', workerClaim));
+  assert.equal(d.kind, 'forbidden-origin');
+});
+
+test('decideApiAccess: default resolver consults the real capability store singleton', () => {
+  agentCapabilities.clear();
+  const minted = agentCapabilities.mint({ agentId: 'a', workspaceId: 'ws', privilegeLane: 'supervisor' });
+  // No explicit resolver passed → must fall through to the singleton.
+  const d = decideApiAccess('GET', undefined, `Bearer ${minted}`, 'global-bearer-value');
+  assert.equal(d.kind, 'ok');
+  assert.equal((d as { capability?: CapabilityClaim }).capability?.privilegeLane, 'supervisor');
+  agentCapabilities.clear();
+  // After revocation the same token is rejected.
+  const d2 = decideApiAccess('GET', undefined, `Bearer ${minted}`, 'global-bearer-value');
+  assert.equal(d2.kind, 'unauthorized');
 });
 
 // ── HTTP-level tests against a real ApiServer ───────────────────────────────
@@ -125,6 +184,32 @@ test('valid token, no Origin (headless proxy) → 200, no CORS headers', () =>
     assert.equal(res.status, 200);
     assert.deepEqual(JSON.parse(res.body), []);
     assert.equal(res.headers['access-control-allow-origin'], undefined);
+  }));
+
+// WP-G2.0 regression (tokens-on): a minted per-agent capability token — the
+// token now injected into a worker's dashboard --mcp-config — is a valid bearer
+// over the real server for existing operations, exactly like the global bearer.
+test('minted capability token is a valid bearer over the real server (MCP tokens-on)', () =>
+  withServer(async (port) => {
+    agentCapabilities.clear();
+    const minted = agentCapabilities.mint({ agentId: 'a', workspaceId: 'ws', privilegeLane: 'worker' });
+    try {
+      const res = await request(port, 'GET', '/api/agents', { Authorization: `Bearer ${minted}` });
+      assert.equal(res.status, 200, 'MCP calls carrying a minted token must be admitted');
+      assert.deepEqual(JSON.parse(res.body), []);
+    } finally {
+      agentCapabilities.clear();
+    }
+  }));
+
+// WP-G2.0 regression: a revoked capability token is rejected (stop/delete).
+test('a revoked capability token → 401 over the real server', () =>
+  withServer(async (port) => {
+    agentCapabilities.clear();
+    const minted = agentCapabilities.mint({ agentId: 'a', workspaceId: 'ws', privilegeLane: 'worker' });
+    agentCapabilities.revokeAgent('a');
+    const res = await request(port, 'GET', '/api/agents', { Authorization: `Bearer ${minted}` });
+    assert.equal(res.status, 401);
   }));
 
 test("valid token + Origin 'null' (file:// renderer) → 200, per-origin echo", () =>
