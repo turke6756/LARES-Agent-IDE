@@ -229,6 +229,13 @@ interface DashboardState {
   checkpointTurns: Record<string, CheckpointTurnSummary[]>;
   checkpointLoading: Record<string, boolean>;
   loadCheckpointTurns: (workspaceId: string, agentId: string) => Promise<void>;
+  // Git-Native WP-G3.2 — WORKSPACE-WIDE turns (all agents), keyed by workspaceId.
+  // Feeds the richer attribution UI (cross-agent contention, filtering, stats).
+  // Loaded via the same WP-G2.2 `list` route with NO agentId (the route returns
+  // every agent's turns for the workspace). Presentation-only; no new IPC.
+  workspaceCheckpointTurns: Record<string, CheckpointTurnSummary[]>;
+  workspaceCheckpointLoading: Record<string, boolean>;
+  loadWorkspaceCheckpointTurns: (workspaceId: string) => Promise<void>;
   /** Fetch a restore preview (witnessed set + anti-TOCTOU tokens + open-turn
    *  contention). RestoreDialog REQUIRES this before a restore can be confirmed. */
   previewCheckpointRestore: (
@@ -408,6 +415,8 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
   continuationPhases: {},
   checkpointTurns: {},
   checkpointLoading: {},
+  workspaceCheckpointTurns: {},
+  workspaceCheckpointLoading: {},
   teams: [],
   teamMessages: {},
 
@@ -1367,6 +1376,26 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
       // rail renders the empty/unavailable state rather than throwing.
       console.error('Failed to load checkpoint turns:', err);
       set((s) => ({ checkpointLoading: { ...s.checkpointLoading, [agentId]: false } }));
+    }
+  },
+
+  // Git-Native WP-G3.2 — load ALL of a workspace's turns for the attribution UI.
+  // Same list route, no agentId → every agent's turns. Honest-degrade on failure.
+  loadWorkspaceCheckpointTurns: async (workspaceId) => {
+    set((s) => ({
+      workspaceCheckpointLoading: { ...s.workspaceCheckpointLoading, [workspaceId]: true },
+    }));
+    try {
+      const res = await window.api.checkpoints.list(workspaceId);
+      set((s) => ({
+        workspaceCheckpointTurns: { ...s.workspaceCheckpointTurns, [workspaceId]: res.turns },
+        workspaceCheckpointLoading: { ...s.workspaceCheckpointLoading, [workspaceId]: false },
+      }));
+    } catch (err) {
+      console.error('Failed to load workspace checkpoint turns:', err);
+      set((s) => ({
+        workspaceCheckpointLoading: { ...s.workspaceCheckpointLoading, [workspaceId]: false },
+      }));
     }
   },
 

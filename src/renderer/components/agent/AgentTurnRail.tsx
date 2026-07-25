@@ -16,6 +16,7 @@ import React, { useEffect, useState } from 'react';
 import type { CheckpointTurnSummary, CheckpointDiffResult } from '../../../shared/types';
 import { useDashboardStore } from '../../stores/dashboard-store';
 import RestoreDialog from '../checkpoints/RestoreDialog';
+import AttributionPanel from '../checkpoints/AttributionPanel';
 
 const EMPTY_TURNS: CheckpointTurnSummary[] = [];
 
@@ -74,6 +75,9 @@ export default function AgentTurnRail({
   const [openDiff, setOpenDiff] = useState<string | null>(null);
   const [diffLoading, setDiffLoading] = useState<string | null>(null);
   const [dialog, setDialog] = useState<DialogState | null>(null);
+  // WP-G3.2 — the richer, WORKSPACE-scoped attribution surface (cross-agent
+  // contention, filtering, statistics, attributed-vs-unattributed comparison).
+  const [showAttribution, setShowAttribution] = useState(false);
 
   useEffect(() => {
     void loadCheckpointTurns(workspaceId, agentId);
@@ -102,7 +106,16 @@ export default function AgentTurnRail({
 
   return (
     <div className="mt-2 border-t border-surface-3 pt-2" data-testid="agent-turn-rail">
-      <div className="text-gray-500 uppercase text-[10px] tracking-wider mb-1">Checkpoint timeline</div>
+      <div className="flex items-center justify-between mb-1">
+        <div className="text-gray-500 uppercase text-[10px] tracking-wider">Checkpoint timeline</div>
+        <button
+          onClick={() => setShowAttribution(true)}
+          className="ui-btn ui-btn-ghost px-1.5 py-0.5 text-[10px] text-accent-blue"
+          data-testid="open-attribution"
+        >
+          Workspace attribution…
+        </button>
+      </div>
 
       {loading && turns.length === 0 && (
         <div className="text-gray-500 text-[11px] italic">Loading checkpoints…</div>
@@ -235,6 +248,10 @@ export default function AgentTurnRail({
           paths={dialog.paths}
           onClose={() => setDialog(null)}
         />
+      )}
+
+      {showAttribution && (
+        <AttributionPanel workspaceId={workspaceId} onClose={() => setShowAttribution(false)} />
       )}
     </div>
   );
