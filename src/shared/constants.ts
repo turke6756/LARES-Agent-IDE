@@ -2231,18 +2231,36 @@ byte-identical to what the tool returned.
 
 ## 1. Emit a snapshot
 
+Every workspace — including one opened from a different clone or a foreign
+project (e.g. a Pi-Coding harness), NOT just a checkout of the dashboard repo —
+emits a snapshot with the **installation-owned launcher shim**, run from the
+workspace root:
+
 \`\`\`bash
 cd <workspace-root>
-npm run analytics:snapshot:fast -- export --json
+node .lares/scripts/analytics-snapshot.mjs export --json
 \`\`\`
 
-Measured: **~21–26 s**, exit 0, six surfaces \`ready\`. Writes to
+Measured: **~21–32 s**, exit 0, six surfaces \`ready\`. Writes to
 \`.lares/analytics/<ISO-timestamp>-<id8>/\`. \`--json\` prints the manifest
 summary — read the \`blockingCaveats\` array it returns before anything else.
 
-- \`analytics:snapshot:fast\` runs the **existing** \`dist/\`. Use it when \`dist/\` is
-  current. Use \`npm run analytics:snapshot\` to rebuild first — but that runs
-  \`build:main\`, so do not use it if another agent is mid-build.
+The shim reads \`.lares/installation.json\` at runtime and spawns the Lares
+installation that manages this workspace, so it needs **no** dashboard-repo
+checkout and no npm. Lares writes and self-heals both files on every workspace
+registration and every agent launch, so the shim is normally already present.
+**If it is missing or stale** (stderr says \`cannot read installation descriptor\`
+or \`installation moved or uninstalled\`), relaunch any agent into the workspace
+or restart the Lares app — either rewrites \`.lares/scripts/analytics-snapshot.mjs\`
+and \`.lares/installation.json\`.
+
+- Scope: the snapshot is **strict-scoped to ONE workspace**, never installation-
+  wide. It resolves that workspace from \`$AGENT_DASHBOARD_WORKSPACE_ID\` (set for
+  every launched agent to its OWN workspace) or an explicit \`--workspace
+  <id-or-path>\` — it is **not** derived from the shell cwd (cwd only locates the
+  shim file). Run by hand in a plain shell with neither set, it errors and lists
+  the known workspaces; pass \`--workspace\`. Output is written under the RESOLVED
+  workspace's \`.lares/analytics/\`, not the cwd's.
 - Runs under Electron (for the \`better-sqlite3\` native ABI) but builds **no**
   window, supervisor, API server, or watcher. It opens the database **read-only**
   and never writes to it. Verified working from a worker's context with the
@@ -2254,6 +2272,14 @@ summary — read the \`blockingCaveats\` array it returns before anything else.
 - Exit codes: \`0\` complete · \`1\` usage error or core-surface failure (nothing
   published) · \`2\` partial, published with ≥1 per-item failure · \`4\` indexing
   incomplete and \`--allow-cold\` not given.
+
+**In the AgentDashboard dev repo only** you may instead use the npm wrappers,
+which invoke the same CLI against \`dist/\`: \`npm run analytics:snapshot:fast --
+export --json\` runs the **existing** \`dist/\` (use when \`dist/\` is current);
+\`npm run analytics:snapshot -- export --json\` runs \`build:main\` to rebuild first
+— do not use the rebuild form if another agent is mid-build. These only work
+inside a checkout of the dashboard repo; every other workspace uses the shim
+above.
 
 If exit is \`2\`, check \`surfaces.*.status\` in the JSON before citing anything from
 a failed surface. If exit is \`4\`, the parse index is cold — the numbers would read
@@ -2395,10 +2421,12 @@ on \`path_hash\` for identity across snapshots.
 ## 6. Comparing two points in time
 
 \`\`\`bash
-npm run analytics:snapshot:fast -- diff <before-dir> <after-dir> --format markdown --output <path>
+node .lares/scripts/analytics-snapshot.mjs diff <before-dir> <after-dir> --format markdown --output <path>
 \`\`\`
 
-Also \`--format json\`. Verified working on real snapshots: it reports per-agent
+(In the AgentDashboard dev repo, \`npm run analytics:snapshot:fast -- diff …\`
+runs the same thing against \`dist/\`.) Also \`--format json\`. Verified working on
+real snapshots: it reports per-agent
 resident/on-demand deltas, added/removed/changed keyed rows per surface, and
 caveats new in \`after\`.
 

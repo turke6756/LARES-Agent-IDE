@@ -761,6 +761,12 @@ export const SUPERVISOR_ORCHESTRATION_SPIKE_SKILL_V2_HASH = 'dacdbda55bdb860d91b
  *  Used in the v2 file's previousHashes. */
 export const SUPERVISOR_CONTEXT_ANALYTICS_SKILL_V1_HASH = '7b537aeec337acb9c8000124db136bb529c6d0575c9dadac7eccb05fbea01091';
 
+/** SHA-256 hex of the v2 context-analytics SKILL.md (`.lares` rename body, whose
+ *  step-1 taught the dashboard-repo-only `npm run analytics:snapshot:fast`).
+ *  Used in the v3 file's previousHashes so a pristine v2 deploy silently
+ *  upgrades to the installation-owned-shim body (WP4/scaffold v3). */
+export const SUPERVISOR_CONTEXT_ANALYTICS_SKILL_V2_HASH = '2f382617d936e76d8cebd0ed1aefe97ae524bc3ceed2f5831b89a90bc990382c';
+
 /** SHA-256 hex of the v1 dashboard-statusline.mjs (comments named
  *  `.dashboard`; the usage-dir resolution is script-relative and unchanged).
  *  Used in the v2 file's previousHashes. */
@@ -2463,7 +2469,7 @@ export class AgentSupervisor extends EventEmitter {
     // toolset was already supervisor-exclusive, and the P2 usage surface put what
     // analytics traffic existed on the supervisor lane); a worker that needs a
     // number gets it dispatched. One-line add per lane the day that changes.
-    [`.lares/supervisor/.claude/skills/context-analytics/SKILL.md`]:              { content: SUPERVISOR_CONTEXT_ANALYTICS_SKILL, version: 2, previousHashes: { 1: SUPERVISOR_CONTEXT_ANALYTICS_SKILL_V1_HASH } }, // v2: `.lares` rename
+    [`.lares/supervisor/.claude/skills/context-analytics/SKILL.md`]:              { content: SUPERVISOR_CONTEXT_ANALYTICS_SKILL, version: 3, previousHashes: { 1: SUPERVISOR_CONTEXT_ANALYTICS_SKILL_V1_HASH, 2: SUPERVISOR_CONTEXT_ANALYTICS_SKILL_V2_HASH } }, // v3: installation-owned snapshot shim as primary path (WP4)
     // Persona kit (§1.4) — the two default skills ship into every native lane too
     // so the supervisor/researcher/worker can guide persona creation + read comments.
     [`.lares/supervisor/.claude/skills/create-persona/SKILL.md`]:                 { content: PERSONA_CREATE_PERSONA_SKILL, version: 4, previousHashes: { 1: sha256Hex(PERSONA_CREATE_PERSONA_SKILL_V1), 2: PERSONA_CREATE_PERSONA_SKILL_V2_HASH, 3: PERSONA_CREATE_PERSONA_SKILL_V3_HASH } }, // v4: `.lares` rename

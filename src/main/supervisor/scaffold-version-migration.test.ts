@@ -1149,8 +1149,8 @@ test('context-analytics skill: scaffolded onto the SUPERVISOR lane only, idempot
 
     const sidecar = readSidecar(workDir);
     assert.equal(
-      sidecar['supervisor/.claude/skills/context-analytics/SKILL.md'], 2,
-      `sidecar must record the skill at v2 (.lares rename); got ${JSON.stringify(sidecar)}`,
+      sidecar['supervisor/.claude/skills/context-analytics/SKILL.md'], 3,
+      `sidecar must record the skill at v3 (installation-owned shim); got ${JSON.stringify(sidecar)}`,
     );
 
     // Second pass is a no-op — no rewrite, no .bak.

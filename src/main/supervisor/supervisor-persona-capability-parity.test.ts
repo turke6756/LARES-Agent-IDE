@@ -228,6 +228,21 @@ test('all 13 retired analytics verbs are gone from every toolset, and the replac
     SUPERVISOR_CONTEXT_ANALYTICS_SKILL.includes('analytics:snapshot:fast'),
     'the replacement skill must name the exporter command that supplies the retired data',
   );
+  // v3 flip (WP4): the PRIMARY, every-workspace command is the installation-owned
+  // launcher shim, not the dashboard-repo-only npm script. A cross-workspace
+  // consumer (e.g. a Pi-Coding harness) has no `npm run analytics:snapshot:fast`,
+  // so the skill must teach `node .lares/scripts/analytics-snapshot.mjs export`
+  // as the path every workspace can actually run.
+  assert.ok(
+    SUPERVISOR_CONTEXT_ANALYTICS_SKILL.includes('node .lares/scripts/analytics-snapshot.mjs export'),
+    'the v3 skill must teach the installation-owned shim as the primary snapshot command',
+  );
+  // The npm route must be explicitly scoped to the dashboard dev repo, not
+  // presented as the universal command it used to be.
+  assert.ok(
+    SUPERVISOR_CONTEXT_ANALYTICS_SKILL.includes('AgentDashboard dev repo'),
+    'the v3 skill must keep the npm route only as the AgentDashboard dev-repo alternative',
+  );
   for (const surface of ['contextOverhead.json', 'agentKnowledge.json', 'optimizer.json', 'mcp-tool-usage.csv', 'file-heat.csv', 'skill-usage.csv']) {
     assert.ok(
       SUPERVISOR_CONTEXT_ANALYTICS_SKILL.includes(surface),
