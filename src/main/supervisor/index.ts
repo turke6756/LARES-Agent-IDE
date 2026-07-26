@@ -1857,6 +1857,58 @@ export class AgentSupervisor extends EventEmitter {
     return this.sessionLogReader;
   }
 
+  /** Layer-3 memory telemetry: a cheap O(agent-count) snapshot of the retained
+   *  in-main-process structures whose footprint scales with agent/launch count,
+   *  as `{name, count, bytes?}` gauges. Every read is an O(1) `.size` or a bounded
+   *  sum over already-maintained running counters — NO payload re-walks, safe on
+   *  the 15 s telemetry cadence. Never throws: each subsystem read is guarded so a
+   *  single failure degrades that one gauge to absent, not the whole batch. */
+  collectMemoryGauges(): Array<{ name: string; count: number; bytes?: number }> {
+    const gauges: Array<{ name: string; count: number; bytes?: number }> = [];
+    const push = (name: string, read: () => { count: number; bytes?: number }) => {
+      try {
+        const r = read();
+        gauges.push({ name, count: r.count, ...(r.bytes !== undefined ? { bytes: r.bytes } : {}) });
+      } catch {
+        /* a single subsystem read must never drop the rest of the batch */
+      }
+    };
+
+    // Chat ring (session-log dispatcher) — has a byte budget; bytes + entries.
+    push('chat-ring', () => {
+      const g = this.sessionLogReader.getRingGauge();
+      return { count: g.entries, bytes: g.bytes };
+    });
+
+    // Terminal RAM rings — sum bytes/lines across every LIVE runner, both
+    // transports. `count` is the aggregate line total; a separate gauge reports
+    // the live-runner count so bytes-per-runner is derivable.
+    push('terminal-rings', () => {
+      let bytes = 0;
+      let lines = 0;
+      for (const r of this.windowsRunners.values()) { bytes += r.ringBytes; lines += r.ringLines; }
+      for (const r of this.wslRunners.values()) { bytes += r.ringBytes; lines += r.ringLines; }
+      return { count: lines, bytes };
+    });
+    push('live-runners', () => ({ count: this.windowsRunners.size + this.wslRunners.size }));
+
+    // Context-stats retained maps.
+    push('context-stats-agents', () => ({ count: this.contextStatsMonitor.getGaugeCounts().statsAgents }));
+    push('context-stats-seen-uuids', () => ({ count: this.contextStatsMonitor.getGaugeCounts().seenUuidEntries }));
+    push('context-stats-seen-files', () => ({ count: this.contextStatsMonitor.getGaugeCounts().seenFileEntries }));
+
+    // Supervisor per-agent maps that can grow with agent/launch count. These are
+    // the retained-after-exit / long-lived ones most worth watching for an
+    // unbounded climb (each is an O(1) `.size`).
+    push('map:lastTerminalEpoch', () => ({ count: this.lastTerminalEpoch.size }));
+    push('map:fileTrackers', () => ({ count: this.fileTrackers.size }));
+    push('map:inputQueues', () => ({ count: this.inputQueues.size }));
+    push('map:appliedHookEvents', () => ({ count: this.appliedHookEvents.size }));
+    push('map:spoolTailers', () => ({ count: this.spoolTailers.size }));
+
+    return gauges;
+  }
+
   getChatService(): AgentChatService {
     return this.chatService;
   }

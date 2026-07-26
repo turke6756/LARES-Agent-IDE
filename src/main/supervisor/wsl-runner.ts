@@ -819,6 +819,10 @@ export class WslRunner extends EventEmitter {
     return this.outputRing.join('\n');
   }
 
+  /** Layer-3 memory telemetry: O(1) reads of this runner's retained terminal RAM
+   *  ring. Mirrors WindowsRunner.ringBytes/ringLines. */
+  get ringBytes(): number { return this.outputRingBytes; }
+  get ringLines(): number { return this.outputRing.length; }
 
   /** WP-3a — see windows-runner.ts for the full contract of these members. */
   get currentLogOffset(): number { return this._logBaseOffset + this._logBytesWritten; }

@@ -514,6 +514,19 @@ export class SessionLogDispatcher extends EventEmitter {
     return { events: all.slice(idx + 1), truncated };
   }
 
+  /** Layer-3 memory telemetry gauge: an O(1)-per-agent read of the chat ring's
+   *  retained footprint. `bytes` sums the per-agent running byte totals
+   *  (`ringBytesByAgent`, maintained on append/evict — never re-walks payloads);
+   *  `entries` sums ring lengths; `agents` is the number of agents with a ring.
+   *  Cheap enough for the same 15 s cadence as the heap sampler. */
+  getRingGauge(): { agents: number; entries: number; bytes: number } {
+    let entries = 0;
+    for (const buf of this.eventsByAgent.values()) entries += buf.length;
+    let bytes = 0;
+    for (const n of this.ringBytesByAgent.values()) bytes += n;
+    return { agents: this.eventsByAgent.size, entries, bytes };
+  }
+
   async getFullToolResult(agentId: string, toolUseId: string): Promise<string | null> {
     for (const reader of this.readers.values()) {
       if (!reader.getFullToolResult) continue;

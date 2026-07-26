@@ -344,6 +344,10 @@ export class WindowsRunner extends EventEmitter {
     return this.outputRing.join('\n');
   }
 
+  /** Layer-3 memory telemetry: O(1) reads of this runner's retained terminal RAM
+   *  ring. `outputRingBytes` is the running byte sum maintained on append/trim. */
+  get ringBytes(): number { return this.outputRingBytes; }
+  get ringLines(): number { return this.outputRing.length; }
 
   /** WP-3a: the current LOGICAL PTY cursor (append base + cumulative UTF-8
    *  bytes handed to the stream this epoch). Not proven durable — that is what

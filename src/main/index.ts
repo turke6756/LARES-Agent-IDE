@@ -54,6 +54,7 @@ import { ensureNodeShimDir } from './node-shim';
 import { getLaresNativeDir } from './supervisor/paths';
 import { installShellSpellcheckContextMenu } from './spellcheck-context-menu';
 import { MemorySampler } from './watchdog/memory-sampler';
+import { HeapTelemetry, createHeapTelemetry, readV8Heap, readProcessMetrics } from './watchdog/heap-telemetry';
 import { createCommitReader, type NativeCommitProvider } from './watchdog/commit-reader';
 import { RenderRecoveryPolicy } from './watchdog/render-recovery';
 import type { MemorySnapshot, AdmissionDecision } from './watchdog/types';
@@ -107,6 +108,36 @@ crashReporter.start({ uploadToServer: false });
 // lives in (F9) — the two are deliberately unrelated.
 const CRASH_LOG_PATH = path.join(app.getPath('userData'), 'logs', 'main-crash.log');
 console.log(`[startup] crash log: ${CRASH_LOG_PATH}`);
+
+// Layer 3 (2026-07-25): Node diagnostic report on fatal errors. A V8 fatal
+// abort — the classic being heap OOM ("JavaScript heap out of memory") — tears
+// the process down BELOW both layers above: it is neither a native crash
+// Crashpad captures (Layer 1) nor a thrown JS exception uncaughtException sees
+// (Layer 2), and its report scrolls away in the doomed launch terminal. Turning
+// on reportOnFatalError makes Node dump a full diagnostic report (heap sizes,
+// GC state, stack, resource usage) to disk in the same logs dir, so the next
+// heap-OOM abort leaves an on-disk artifact instead of vanishing. `process.report`
+// is guarded with optional access — a missing/older API can't crash startup.
+try {
+  const report = (process as { report?: { reportOnFatalError?: boolean; directory?: string } }).report;
+  if (report) {
+    fs.mkdirSync(path.dirname(CRASH_LOG_PATH), { recursive: true });
+    report.directory = path.dirname(CRASH_LOG_PATH);
+    report.reportOnFatalError = true;
+  }
+} catch {
+  // Enabling fatal-error reports must never itself break startup.
+}
+
+// Record this session's V8 heap ceiling next to the crash-log line, so every
+// launch logs the limit that a heap-OOM abort (Layer 3) would run into — and so
+// the heap-telemetry growth curve can be read against a known ceiling.
+try {
+  const limitMib = Math.round(readV8Heap().heapSizeLimit / (1024 * 1024));
+  console.log(`[startup] main heap limit: ${limitMib} MiB`);
+} catch {
+  /* diagnostic only */
+}
 
 /** Join a workspace-relative `plans/…` path onto the workspace root (host sep).
  *  Mirrors api-server.ts `absPlanPath` — kept local to avoid a cross-module import
@@ -237,6 +268,10 @@ let idleSweep: IdleSweep | null = null;
 // counts feed the sampler); referenced lazily by the shell's render-process-gone
 // handler installed in createWindow(). Null before ready / after teardown.
 let memorySampler: MemorySampler | null = null;
+// Layer 3 crash diagnosability: per-session V8 heap growth curve on disk +
+// once-per-crossing 75/90% console warnings. Independent of the MemorySampler
+// (that one watches SYSTEM commit; this one watches THIS process's own heap).
+let heapTelemetry: HeapTelemetry | null = null;
 let renderRecovery: RenderRecoveryPolicy | null = null;
 // WAVE-4 full-D5: per-agent memory attribution + budget/owned-cap admission.
 let attributionService: AttributionService | null = null;
@@ -1184,6 +1219,33 @@ app.whenReady().then(async () => {
     });
     memorySampler.start();
 
+    // Layer 3 heap telemetry: append this process's V8 heap curve to
+    // <userData>/logs/heap-telemetry.jsonl (same dir as the crash log), rotating
+    // at ~5 MiB, and warn once as heapUsed crosses 75% / 90% of the heap limit.
+    // Per-part attribution (2026-07-25): alongside the whole-process heap curve,
+    // record a per-Electron-process breakdown (getAppMetrics), cheap per-subsystem
+    // gauges (supervisor.collectMemoryGauges — chat ring, terminal RAM rings,
+    // agent-scaling maps), and a slow per-agent working-set line read from the
+    // attribution cache (NO extra process walk — it reuses the ~45 s rollup).
+    heapTelemetry = createHeapTelemetry({
+      filePath: path.join(app.getPath('userData'), 'logs', 'heap-telemetry.jsonl'),
+      log: (m) => console.warn(m),
+      readProcesses: () => {
+        try { return readProcessMetrics(app.getAppMetrics()); } catch { return []; }
+      },
+      gauges: [
+        { name: 'supervisor', read: () => supervisorForWatchdog.collectMemoryGauges() },
+      ],
+      readAgents: () =>
+        (attributionService?.getLatest()?.perAgent ?? []).map((a) => ({
+          agentId: a.agentId,
+          rss: a.cliTreeBytes,
+          pidCount: a.pidCount,
+          source: a.source,
+        })),
+    });
+    heapTelemetry.start();
+
     orchestration.start();                 // boot reconcile of orphaned runs
     // D4 (incident-2026-07-11 §5): arm durable CLI-process ownership (store +
     // reaper + reconcile gate, native Job Object surface loaded here) BEFORE
@@ -1221,6 +1283,7 @@ async function shutdownApp(): Promise<void> {
   // stale-idle kill is never abandoned half-way through shutdown.
   await idleSweep?.stop();
   memorySampler?.stop();
+  heapTelemetry?.stop();
   try { await supervisor?.drainForShutdown(); }
   catch (err) { console.error('[shutdown] drain failed:', err); }
   drainCompleted = true;

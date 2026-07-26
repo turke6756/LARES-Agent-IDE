@@ -95,6 +95,9 @@ const TESTS = [
   // Layer 3 crash diagnosability: main-process V8 heap telemetry — JSONL line
   // shape, ~5 MiB rotation, once-per-crossing 75/90% warnings.
   'dist/main/main/watchdog/heap-telemetry.test.js',
+  // Layer 3 per-part memory attribution: the analysis script's pure core —
+  // parse tolerance (mixed old/new), linear-fit exactness, classify verdicts.
+  'scripts/analyze-heap-telemetry.test.mjs',
   'dist/main/main/watchdog/attribution.test.js',
   'dist/main/main/watchdog/attribution-service.test.js',
   'dist/main/main/watchdog/system-memory-view.test.js',

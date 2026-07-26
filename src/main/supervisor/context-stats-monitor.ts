@@ -84,6 +84,28 @@ export class ContextStatsMonitor extends EventEmitter {
     return this.stats.get(agentId) || null;
   }
 
+  /** Layer-3 memory telemetry gauges: O(1) `.size` reads of the retained maps.
+   *  `seenUuidEntries`/`seenFileEntries` sum the per-agent Set sizes (bounded by
+   *  live-agent count × the per-agent SEEN_* caps) so growth beyond the agent
+   *  count is visible without any byte accounting. */
+  getGaugeCounts(): {
+    statsAgents: number;
+    seenUuidEntries: number;
+    seenFileEntries: number;
+    pendingShellActivity: number;
+  } {
+    let seenUuidEntries = 0;
+    for (const set of this.seenUuids.values()) seenUuidEntries += set.size;
+    let seenFileEntries = 0;
+    for (const set of this.seenFiles.values()) seenFileEntries += set.size;
+    return {
+      statsAgents: this.stats.size,
+      seenUuidEntries,
+      seenFileEntries,
+      pendingShellActivity: this.pendingShellActivity.size,
+    };
+  }
+
   /** Force an immediate poll — delegates to the underlying reader. */
   pollNow(): void {
     this.reader.pollNow();
