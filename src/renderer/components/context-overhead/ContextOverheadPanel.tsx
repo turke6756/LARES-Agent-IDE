@@ -8,6 +8,7 @@ import type {
   InheritanceFrame,
   InheritanceScope,
   McpServerOverhead,
+  McpToolOverhead,
   OverheadModel,
   OverheadSource,
   OverheadSourceKind,
@@ -590,6 +591,16 @@ function McpRow({
   onOpen: (s: McpServerOverhead) => void;
 }): JSX.Element {
   const clickable = !!srv.configPath;
+  const [open, setOpen] = useState(false);
+  // Per-tool drill-down: only servers that carry sourced per-tool detail are
+  // expandable. Groups without tool detail (named-only servers) render exactly
+  // as before — no chevron, identical markup.
+  const hasTools = srv.tools.length > 0;
+  // Descending by schema token cost, largest first. Copy before sorting so the
+  // scan model's array is never mutated in place.
+  const tools = hasTools
+    ? [...srv.tools].sort((a, b) => b.estimate.tokens - a.estimate.tokens)
+    : srv.tools;
   return (
     <div className={srv.excludedByStrictMode ? 'opacity-50' : ''}>
       <div
@@ -597,6 +608,16 @@ function McpRow({
         onClick={() => clickable && onOpen(srv)}
         title={srv.configPath ?? 'Discovered name only — schema requires a live MCP connection (not sourced).'}
       >
+        {hasTools && (
+          <button
+            onClick={(e) => { e.stopPropagation(); setOpen((v) => !v); }}
+            className="shrink-0 -ml-0.5 p-0.5 rounded text-gray-400 hover:text-gray-200 hover:bg-white/10"
+            title={open ? 'Hide per-tool schema costs' : 'Show per-tool schema costs'}
+            aria-expanded={open}
+          >
+            {open ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+          </button>
+        )}
         <span className="w-2 h-2 rounded-sm shrink-0" style={{ backgroundColor: MCP_COLOR }} />
         {clickable && <FileText size={12} className="text-gray-400 shrink-0" />}
         <span className="truncate flex-1">{srv.displayName}</span>
@@ -608,6 +629,31 @@ function McpRow({
         )}
         <span className="tabular-nums text-[12px] text-gray-300">{fmt(srv.total.tokens)}</span>
       </div>
+
+      {hasTools && open && (
+        <div className="space-y-0.5">
+          {tools.map((t) => (
+            <McpToolRow key={t.name} tool={t} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** One MCP tool leaf under an expanded server/toolset group: tool name + its
+ *  estimated schema token cost. Indented one level under the group row, matching
+ *  the SourceRow child indent idiom (8 + depth*16 = 24px). */
+function McpToolRow({ tool }: { tool: McpToolOverhead }): JSX.Element {
+  return (
+    <div
+      className="flex items-center gap-2 py-0.5"
+      style={{ paddingLeft: 8 + 16 }}
+      title={`${tool.name} — ${fmt(tool.estimate.tokens)} schema tokens`}
+    >
+      <span className="w-2 h-2 rounded-sm shrink-0 opacity-60" style={{ backgroundColor: MCP_COLOR }} />
+      <span className="truncate flex-1 text-gray-400">{tool.name}</span>
+      <span className="tabular-nums text-[12px] text-gray-300">{fmt(tool.estimate.tokens)}</span>
     </div>
   );
 }
