@@ -33,6 +33,7 @@ import {
   CONTINUATION_BRICK_RENDER_MAX_BYTES,
   CONTINUATION_STOP_FLUSH_DELAY_MS,
   TERMINAL_AGENT_RELEASE_DELAY_MS,
+  MAX_TERMINAL_REPLAY_BYTES,
   FILE_ACTIVITY_RETENTION_SESSIONS,
   LARES_DIR_NAME, LEGACY_LARES_DIR_NAME,
 } from '../../shared/constants';
@@ -114,6 +115,11 @@ import {
   type CodexHookBindDecision,
 } from './session-id-discovery';
 import { listCodexRolloutFiles } from './log-readers/codex-rollout-reader';
+// WP-1 (C): delete-time disk reclamation for an agent's `.log` + sidecars.
+import { reclaimAgentLogFiles } from './log-readers/reclaim-log-files';
+import { readFileTail, readFileRange, readLastLines, normalizeLines } from './log-readers/tail-file';
+import { readDeadAgentSnapshot } from './log-readers/dead-agent-snapshot';
+import { writeTerminalCheckpoint, readTerminalCheckpoint, unlinkTerminalCheckpoint, checkpointSaveAllowed, checkpointLoadValid } from './log-readers/terminal-checkpoint';
 import { CodexLaunchGate } from './codex-launch-gate';
 import { FileActivityTracker } from './file-activity-tracker';
 import { AdmissionError, type AdmissionDecision } from '../watchdog/types';
@@ -1086,6 +1092,13 @@ function makeUnsupportedNativeSurface(reason: string): NativeJobSurface {
 export class AgentSupervisor extends EventEmitter {
   private windowsRunners = new Map<string, WindowsRunner>();
   private wslRunners = new Map<string, WslRunner>();
+  // WP-3a — last terminal epoch seen per agent, updated SYNCHRONOUSLY on every
+  // runner `epochChanged` (launch AND internal reconnect/respawn) and RETAINED
+  // after the runner exits so a dead-agent reopen can still resolve "the epoch
+  // its checkpoint must match". "Current epoch" for validation = live runner
+  // epoch ?? this map. (WP-3b adds the checkpoint validation that consumes it;
+  // WP-3a only populates it and the delete-time cleanup below.)
+  lastTerminalEpoch = new Map<string, string>();
   private fileTrackers = new Map<string, FileActivityTracker>();
   private monitor: StatusMonitor;
   private contextStatsMonitor: ContextStatsMonitor;
@@ -3249,6 +3262,11 @@ export class AgentSupervisor extends EventEmitter {
   }
 
   private async launchWindowsAgent(agent: Agent, resume = false, agentMdPrompt?: string | null, sessionId?: string, overrideArgs?: string[], freshSession = false, firstUserMessagePrefix?: string | null): Promise<void> {
+    // WP-3b: a (re)launch mints a new epoch, so any surviving checkpoint sidecar
+    // from a prior epoch (incl. a prior Electron session, whose epoch is not
+    // persisted) is now stale. Drop it — bounded cleanup; the load-side epoch
+    // guard is the correctness authority.
+    this.reclaimTerminalCheckpoint(agent.logPath);
     const runner = new WindowsRunner();
     this.windowsRunners.set(agent.id, runner);
 
@@ -3455,6 +3473,13 @@ export class AgentSupervisor extends EventEmitter {
     runner.on('data', (data: string) => {
       updateAgentLastOutput(agent.id);
       if (tracker) tracker.processData(data);
+    });
+
+    // WP-3a: record the runner's terminal epoch synchronously on every stream
+    // open (launch here; the runner also re-emits on any internal respawn). The
+    // entry is retained after exit so a dead-agent reopen can resolve the epoch.
+    runner.on('epochChanged', (epoch: string) => {
+      this.lastTerminalEpoch.set(agent.id, epoch);
     });
 
     // D4 ownership (incident-2026-07-11 §5): the runner's ROOT pid arrives
@@ -4068,6 +4093,10 @@ export class AgentSupervisor extends EventEmitter {
       }
     }
 
+    // WP-3b: fresh-launch checkpoint cleanup (see launchWindowsAgent) — a new
+    // epoch invalidates any prior-epoch sidecar; drop it.
+    this.reclaimTerminalCheckpoint(agent.logPath);
+
     const runner = new WslRunner(agent.tmuxSessionName);
     this.wslRunners.set(agent.id, runner);
 
@@ -4420,6 +4449,13 @@ export class AgentSupervisor extends EventEmitter {
 
     runner.on('exit', (exitCode: number) => {
       this.handleRunnerExit(agent.id, exitCode, 'wsl');
+    });
+
+    // WP-3a: record the terminal epoch synchronously on every stream open —
+    // launch, reconnect, AND phantom respawn all re-emit `epochChanged` from
+    // the one reused WslRunner instance. Retained after exit for dead reopen.
+    runner.on('epochChanged', (epoch: string) => {
+      this.lastTerminalEpoch.set(agent.id, epoch);
     });
 
     // D-4/F10 (BLOCKER): the rendered WSL command now embeds the bearer token
@@ -5304,16 +5340,22 @@ export class AgentSupervisor extends EventEmitter {
   }
 
   async deleteAgent(agentId: string): Promise<void> {
-    // Stop process if running
+    // WP-1 (C): capture the log path BEFORE any DB mutation — dbDeleteAgent
+    // removes the row, so the only reliable read of `logPath` is up front.
+    const logPath = getAgent(agentId)?.logPath ?? null;
+
+    // Stop process if running. Use the delete-shutdown contract (not kill()):
+    // it blocks any later persistScrollback() and closes the log stream so the
+    // OS releases the file handle before we unlink `.log` below.
     const winRunner = this.windowsRunners.get(agentId);
     if (winRunner) {
-      winRunner.kill();
+      await winRunner.disposeForDelete();
       this.windowsRunners.delete(agentId);
     }
 
     const wslRunner = this.wslRunners.get(agentId);
     if (wslRunner) {
-      await wslRunner.kill();
+      await wslRunner.disposeForDelete();
       this.wslRunners.delete(agentId);
     }
 
@@ -5342,6 +5384,16 @@ export class AgentSupervisor extends EventEmitter {
     this.releaseSpoolTailer(agentId);
     // WP-P2 — drop any undelivered initial prompt with the agent record.
     this.pendingInitialPrompts.delete(agentId);
+    // WP-3a — drop the retained terminal epoch so a reused agent id can't
+    // inherit a stale epoch. (WP-3b keys its checkpoint validation off this
+    // map; introduced here alongside the map itself to avoid an unbounded
+    // leak. The checkpoint-sidecar reclamation stays WP-1's `.log`+sidecar
+    // pass above / WP-3b's SIDECARS extension.)
+    this.lastTerminalEpoch.delete(agentId);
+    // WP-1 (C): reclaim the agent's `.log` + sidecars from disk. Runs while the
+    // agent row is STILL present so the shared-reference scan can exclude this
+    // id and detect only *other* agents pointing at the same path.
+    if (logPath) reclaimAgentLogFiles(logPath, agentId, this.logsDir);
     dbDeleteAgent(agentId);
     this.emit('agentDeleted', { agentId });
   }
@@ -5606,6 +5658,12 @@ export class AgentSupervisor extends EventEmitter {
    *  otherwise the renderer reattaches to a missing/dead bridge. Idempotent on
    *  the IPC side, so a double-notify from overlapping swap paths is safe. */
   private notifyTerminalRebound(agentId: string): void {
+    // WP-3b: a rebound is a same-id PTY swap ⇒ the replacement runner already
+    // minted a fresh epoch (its `epochChanged` updated `lastTerminalEpoch`
+    // pre-await), so any surviving `.checkpoint` is now stale. Drop it before the
+    // renderer reattaches; the load-side epoch guard is the real authority, this
+    // is bounded cleanup.
+    this.reclaimTerminalCheckpoint(getAgent(agentId)?.logPath);
     try {
       this.notifyTerminalReboundFn?.(agentId);
     } catch (err) {
@@ -5613,7 +5671,7 @@ export class AgentSupervisor extends EventEmitter {
     }
   }
 
-  attachAgent(agentId: string): { write: (data: string) => void; resize: (cols: number, rows: number) => void; onData: (cb: (data: string) => void) => void } {
+  attachAgent(agentId: string): { write: (data: string) => void; resize: (cols: number, rows: number) => void; onData: (cb: (data: string, endOffset?: number) => void) => void } {
     const winRunner = this.windowsRunners.get(agentId);
     if (winRunner) {
       // P1B-03: suppress meaningful-burst advances briefly so the TUI redraw
@@ -5624,6 +5682,8 @@ export class AgentSupervisor extends EventEmitter {
       return {
         write: (data) => winRunner.write(data),
         resize: (cols, rows) => winRunner.resize(cols, rows),
+        // WP-3a: the runner emits `data` with a second logical-offset arg; the
+        // bridge forwards it (consumers that ignore it are unaffected).
         onData: (cb) => winRunner.on('data', cb),
       };
     }
@@ -6750,7 +6810,7 @@ export class AgentSupervisor extends EventEmitter {
     this.sessionLogReader.appendSyntheticUserText(agent.id, text);
   }
 
-  removeAgentListener(agentId: string, listener: (data: string) => void): void {
+  removeAgentListener(agentId: string, listener: (data: string, endOffset?: number) => void): void {
     const winRunner = this.windowsRunners.get(agentId);
     if (winRunner) {
       winRunner.off('data', listener);
@@ -6777,6 +6837,145 @@ export class AgentSupervisor extends EventEmitter {
     }
     // Windows runners don't need detach - we just stop forwarding
     updateAgentAttached(agentId, false);
+  }
+
+  // ── WP-3a terminal offset/epoch accessors ────────────────────────────
+  // These project the live runner's byte-offset/epoch instrumentation to the
+  // IPC layer (`terminal:attach` + the new `agent:read-log-*` handlers). They
+  // never reach into the runner internals — only the public WP-3a surface.
+
+  private runnerFor(agentId: string): WindowsRunner | WslRunner | undefined {
+    return this.windowsRunners.get(agentId) ?? this.wslRunners.get(agentId);
+  }
+
+  /** "Current epoch" for an agent = live runner epoch ?? the last one recorded
+   *  (retained after exit). null when never launched this process. */
+  agentEpoch(agentId: string): string | null {
+    const runner = this.runnerFor(agentId);
+    if (runner) return runner.terminalEpoch;
+    return this.lastTerminalEpoch.get(agentId) ?? null;
+  }
+
+  /** WP-3a: whether the live runner's `.log` byte offsets are still trustworthy
+   *  as replay positions this epoch (false once any write errored). Undefined
+   *  runner ⇒ true (dead-agent `.log` offsets come straight from fstat). */
+  agentLogOffsetsReliable(agentId: string): boolean {
+    const runner = this.runnerFor(agentId);
+    return runner ? runner.logOffsetsReliable : true;
+  }
+
+  /** WP-3a: live-runner write barrier — a cutoff proven readable from a fresh
+   *  fd plus a degraded flag. Only valid for a LIVE agent; callers use
+   *  {@link agentLogSize} for the dead path. */
+  async agentLogWriteBarrier(agentId: string): Promise<{ cutoff: number; degraded: boolean }> {
+    const runner = this.runnerFor(agentId);
+    if (!runner) throw new Error('Agent not found or not running');
+    return runner.logWriteBarrier();
+  }
+
+  /** WP-3a: the persisted `.log` size on disk — the dead-agent snapshot cutoff.
+   *  0 when the agent has no logPath or the file is absent. */
+  async agentLogSize(agentId: string): Promise<number> {
+    const agent = getAgent(agentId);
+    if (!agent?.logPath) return 0;
+    try {
+      return (await fs.promises.stat(agent.logPath)).size;
+    } catch (err: any) {
+      if (err?.code !== 'ENOENT') console.error(`[agentLogSize] stat ${agent.logPath}:`, err);
+      return 0;
+    }
+  }
+
+  /** WP-3a: atomic ring-text + logical-cursor capture from the LIVE runner.
+   *  Used only by degraded recovery. null when no live runner. */
+  agentRingSnapshot(agentId: string): { text: string; logicalCutoff: number } | null {
+    const runner = this.runnerFor(agentId);
+    return runner ? runner.getRingSnapshot() : null;
+  }
+
+  /** WP-3a: exact byte range [start, min(end,size)) from the agent's `.log`,
+   *  NO rune alignment (consecutive pages must join losslessly). */
+  async agentReadLogRange(agentId: string, start: number, end: number): Promise<{ bytes: Uint8Array; startOffset: number; endOffset: number; fileSize: number }> {
+    const agent = getAgent(agentId);
+    if (!agent?.logPath) return { bytes: new Uint8Array(0), startOffset: start, endOffset: start, fileSize: 0 };
+    const r = await readFileRange(agent.logPath, start, end);
+    return { bytes: new Uint8Array(r.bytes), startOffset: r.startOffset, endOffset: r.endOffset, fileSize: r.fileSize };
+  }
+
+  /** WP-3a: up to `maxBytes` ending at `endExclusive` (default EOF) from the
+   *  agent's `.log`, rune-aligned at the head when truncated. */
+  async agentReadLogTail(agentId: string, maxBytes: number, endExclusive?: number): Promise<{ bytes: Uint8Array; startOffset: number; endOffset: number; truncated: boolean }> {
+    const agent = getAgent(agentId);
+    if (!agent?.logPath) return { bytes: new Uint8Array(0), startOffset: 0, endOffset: 0, truncated: false };
+    const r = await readFileTail(agent.logPath, maxBytes, endExclusive);
+    return { bytes: new Uint8Array(r.bytes), startOffset: r.startOffset, endOffset: r.endOffset, truncated: r.truncated };
+  }
+
+  /** WP-3c: dead-agent historical snapshot for the terminal reopen path —
+   *  bounded `.scrollback` (preferred) else a capped `.log` tail, WITH structured
+   *  truncation metadata so the renderer can surface a visible banner instead of
+   *  silently dropping earlier history. Distinct from `getAgentRingBuffer`, which
+   *  serves other consumers as a plain string and stays unchanged. */
+  async getAgentDeadSnapshot(agentId: string): Promise<{ text: string; truncated: boolean; retainedBytes: number }> {
+    const agent = getAgent(agentId);
+    if (!agent?.logPath) return { text: '', truncated: false, retainedBytes: 0 };
+    return readDeadAgentSnapshot(agent.logPath, MAX_TERMINAL_REPLAY_BYTES);
+  }
+
+  // ── WP-3b terminal serialize-checkpoint (epoch-guarded) ──────────────
+  // The renderer's LRU eviction serializes its xterm buffer and hands it here;
+  // its next reopen loads it back for an exact-once rehydrate. Both directions
+  // are guarded by the terminal epoch (live runner epoch ?? `lastTerminalEpoch`)
+  // so a checkpoint from a retired PTY (rebound / relaunch / reconnect / Electron
+  // restart) is never applied to a fresh one.
+
+  /** WP-3b: persist a serialized xterm checkpoint for `agentId`. REJECTED
+   *  (returns false, no file written) when: the agent has no logPath; `epoch` is
+   *  not the agent's current epoch (stale — e.g. saved after a rebound bumped it);
+   *  or the current epoch is DEGRADED (a log write errored this epoch, so the
+   *  offset↔file mapping can't be trusted and replay would be wrong). A write
+   *  failure cleans the `.checkpoint.tmp` (helper) and returns false. */
+  async saveTerminalCheckpoint(agentId: string, epoch: string, serialized: string, appliedOffset: number): Promise<boolean> {
+    const agent = getAgent(agentId);
+    if (!agent?.logPath) return false;
+    // Guard: current epoch match + not degraded (stale-epoch and degraded saves
+    // are silently dropped — see `checkpointSaveAllowed`).
+    if (!checkpointSaveAllowed(epoch, this.agentEpoch(agentId), this.agentLogOffsetsReliable(agentId))) {
+      return false;
+    }
+    try {
+      await writeTerminalCheckpoint(agent.logPath, { epoch, serialized, appliedOffset });
+      return true;
+    } catch (err) {
+      console.error(`[checkpoint] save failed for ${agentId}:`, err);
+      return false;
+    }
+  }
+
+  /** WP-3b: load the serialized checkpoint for `agentId`. Returns
+   *  `{ serialized, appliedOffset }` ONLY when a checkpoint exists, its epoch ===
+   *  the agent's current epoch, AND `appliedOffset <= snapshotCutoff` (it cannot
+   *  claim bytes past the durable attach cutoff). Otherwise null ⇒ the renderer
+   *  falls back to cold-tail / `.scrollback`. A fresh launch / rebound / WSL
+   *  reconnect / Electron restart each mint a new epoch, so a checkpoint written
+   *  under the old one fails the epoch check here. */
+  async loadTerminalCheckpoint(agentId: string, snapshotCutoff: number): Promise<{ serialized: string; appliedOffset: number } | null> {
+    const agent = getAgent(agentId);
+    if (!agent?.logPath) return null;
+    const cp = await readTerminalCheckpoint(agent.logPath);
+    if (!cp) return null;
+    // Guard: current epoch match + appliedOffset within the durable cutoff.
+    if (!checkpointLoadValid(cp, this.agentEpoch(agentId), snapshotCutoff)) return null;
+    return { serialized: cp.serialized, appliedOffset: cp.appliedOffset };
+  }
+
+  /** WP-3b: bounded checkpoint cleanup for fresh launch + rebound. Best-effort,
+   *  ENOENT-safe. The epoch guard on load is the actual correctness authority; a
+   *  stale checkpoint is never applied even if this cleanup has not yet run.
+   *  Delete-time reclamation is handled by WP-1's `reclaimAgentLogFiles`. */
+  private reclaimTerminalCheckpoint(logPath: string | null | undefined): void {
+    if (!logPath) return;
+    void unlinkTerminalCheckpoint(logPath);
   }
 
   /**
@@ -6812,22 +7011,26 @@ export class AgentSupervisor extends EventEmitter {
       // Last-resort: tail of the raw log file. Same content the old
       // TerminalPanel path used — alt-screen quirks and all — but at least
       // shows *something* for pre-BUG-15 agents that have no .scrollback yet.
-      if (fs.existsSync(agent.logPath)) {
-        try {
-          const content = fs.readFileSync(agent.logPath, 'utf-8');
-          if (content.length > 1_000_000) {
-            return content.slice(content.length - 1_000_000);
-          }
-          return content;
-        } catch (err) {
-          console.error(`[getAgentRingBuffer] Failed to read log for ${agentId}:`, err);
-        }
+      // WP-2: bounded async tail (was a whole-file readFileSync). This keeps
+      // today's silent ~1 MB truncation; the VISIBLE dead-agent truncation
+      // banner is delivered in WP-3c — WP-2 does not introduce or worsen it.
+      try {
+        const r = await readFileTail(agent.logPath, 1_000_000);
+        return r.bytes.toString('utf8');
+      } catch (err) {
+        console.error(`[getAgentRingBuffer] Failed to read log for ${agentId}:`, err);
       }
     }
     return '';
   }
 
   async getAgentLog(agentId: string, lines = 50): Promise<string> {
+    // WP-2: normalize the line contract at the public boundary. The supported
+    // contract is a positive finite integer; zero/negative/NaN/non-integer
+    // normalize to the historical default (50). This intentionally replaces
+    // today's accidental slice(0) / negative-slice behavior.
+    lines = normalizeLines(lines);
+
     const agent = getAgent(agentId);
     if (!agent) return '';
 
@@ -6836,11 +7039,10 @@ export class AgentSupervisor extends EventEmitter {
     // persistent history with all raw ANSI color codes intact.
     // tmux capture-pane strips colors and is limited by the pane buffer.
     // Windows in-memory ring buffer is also limited.
-    if (lines >= 500 && agent.logPath && fs.existsSync(agent.logPath)) {
+    // WP-2: bounded backward-paged reader (was a whole-file readFileSync).
+    if (lines >= 500 && agent.logPath) {
       try {
-        const content = fs.readFileSync(agent.logPath, 'utf-8');
-        const allLines = content.split('\n');
-        return allLines.slice(-lines).join('\n');
+        return await readLastLines(agent.logPath, lines);
       } catch (err) {
         console.error(`[getAgentLog] Failed to read large log from disk for agent ${agentId}:`, err);
       }
@@ -6857,16 +7059,16 @@ export class AgentSupervisor extends EventEmitter {
     }
 
     // For Windows agents, use in-memory ring buffer (instant, avoids file flush delays)
+    // WP-2: captureOutput is now async (its ring-empty fallback reads the log
+    // via the bounded backward-paged reader).
     const winRunner = this.windowsRunners.get(agentId);
     if (winRunner) {
-      return winRunner.captureOutput(lines);
+      return await winRunner.captureOutput(lines);
     }
 
-    // Fallback: read from log file
-    if (agent.logPath && fs.existsSync(agent.logPath)) {
-      const content = fs.readFileSync(agent.logPath, 'utf-8');
-      const allLines = content.split('\n');
-      return allLines.slice(-lines).join('\n');
+    // Fallback: read from log file (WP-2: bounded backward-paged reader).
+    if (agent.logPath) {
+      return await readLastLines(agent.logPath, lines);
     }
 
     return '';

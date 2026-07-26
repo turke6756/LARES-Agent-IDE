@@ -45,6 +45,34 @@ const TESTS = [
   'dist/main/main/supervisor/claude-clear-rotation-integration.test.js',
   'dist/main/main/supervisor/claude-clear-rotation-supervisor.test.js',
   'dist/main/main/supervisor/log-readers/claude-jsonl-reader.test.js',
+  // Memory-hardening WP-1 (C): delete-time disk reclamation helper + the runner
+  // delete-shutdown contract (disposeForDelete / closeLogStream / _deleting guard).
+  'dist/main/main/supervisor/log-readers/reclaim-log-files.test.js',
+  'dist/main/main/supervisor/delete-log-reclaim.test.js',
+  // Memory-hardening WP-2 (B): bounded async log readers (tail/range/last-lines,
+  // rune alignment, page-boundary multibyte, no scan ceiling, ENOENT, fd close)
+  // + the whole-file .log readFileSync reintroduction guard.
+  'dist/main/main/supervisor/log-readers/tail-file.test.js',
+  'dist/main/main/supervisor/log-readers/no-whole-file-log-read.test.js',
+  // Memory-hardening WP-3c (A): dead-agent replay snapshot with structured
+  // truncation metadata (bounded .scrollback preferred, capped .log tail else;
+  // conservative log>scrollback ⇒ truncated). Feeds the renderer dead-reopen banner.
+  'dist/main/main/supervisor/log-readers/dead-agent-snapshot.test.js',
+  // Memory-hardening WP-3a (A): runner log byte-offset instrumentation, write
+  // barrier (contiguous flushed prefix + degraded-on-error freeze), epoch reset
+  // on stream open, and the ring snapshot — both runners.
+  'dist/main/main/supervisor/runner-log-offsets.test.js',
+  // Memory-hardening WP-3b (A): serialize-checkpoint sidecar I/O (atomic write +
+  // tmp cleanup, malformed→null, ENOENT-safe unlink) and the pure epoch/degraded
+  // (save) + epoch/cutoff (load) guards.
+  'dist/main/main/supervisor/log-readers/terminal-checkpoint.test.js',
+  // Memory-hardening WP-3d (A): epoch-scoped active-listener registry — the
+  // stale-epoch detach no-op that keeps a reattached epoch-B listener alive.
+  'dist/main/main/terminal-listener-registry.test.js',
+  // Memory-hardening WP-3e (A): deferred WP-3a attach-path integration —
+  // live-attach result shape (barrier cutoff/degraded + live epoch) vs dead
+  // attach (fstat cutoff + retained/last epoch, never degraded).
+  'dist/main/main/terminal-attach-integration.test.js',
   'dist/main/main/supervisor/log-readers/codex-rollout-reader.test.js',
   'dist/main/main/supervisor/log-readers/gemini-transcript-reader.test.js',
   'dist/main/main/supervisor/log-readers/wsl-base-dir-lazy.test.js',

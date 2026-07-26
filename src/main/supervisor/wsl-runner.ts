@@ -2,6 +2,7 @@ import { ChildProcess } from 'child_process';
 import { EventEmitter } from 'events';
 import * as fs from 'fs';
 import path from 'path';
+import { randomUUID } from 'crypto';
 import { tmuxNewSession, tmuxKillSession, isTmuxSessionAlive, tmuxCapturePane, wslExec, buildTmuxAttachCmd, tmuxWaitForSession, TmuxNewSessionResult } from '../wsl-bridge';
 import { getPtyHostPath } from './paths';
 import { sanitizeClaudeChildEnv } from './env-sanitize';
@@ -209,6 +210,10 @@ export class WslRunner extends EventEmitter {
   private _pid: number | null = null;
   private _alive: boolean = false;
   private _intentionalKill: boolean = false;
+  // WP-1a delete-shutdown contract: once true, persistScrollback() is a no-op so
+  // a post-kill `exit` / silent-reconnect path can never recreate `.scrollback`
+  // after delete (which would leak a sidecar the reclaim pass already unlinked).
+  private _deleting: boolean = false;
   // §2: monotonic clock (via the injectable `_now` seam) captured at the start
   // of `launch()`. The instant-empty-exit guard in `_handleHostExit` compares
   // against it to decide whether a clean exit happened inside the settle window.
@@ -243,6 +248,19 @@ export class WslRunner extends EventEmitter {
   private static readonly MAX_RING_LINES = 50000;
   private static readonly MAX_RING_BYTES = 8_000_000;
   private _logPath: string | null = null;
+
+  // WP-3a — log byte-offset instrumentation + epoch (mirrors WindowsRunner).
+  // Reset atomically at every log-stream open (`_resetLogEpoch`), which for the
+  // WSL runner covers launch, reconnect, AND phantom respawn — all of which
+  // reuse ONE runner instance. A reconnect/respawn therefore mints a fresh
+  // epoch, invalidating any prior checkpoint keyed to the retired epoch. See
+  // windows-runner.ts for the field-by-field contract.
+  private _logBaseOffset: number = 0;
+  private _logBytesWritten: number = 0;
+  private _lastFlushedOffset: number = 0;
+  private _writeErrored: boolean = false;
+  private _lastWriteFlushed: Promise<void> = Promise.resolve();
+  private _epoch: string = '';
 
   constructor(sessionName: string, seams: WslRunnerSeams = {}) {
     super();
@@ -582,6 +600,12 @@ export class WslRunner extends EventEmitter {
     if (logPath) {
       this.logStream = fs.createWriteStream(logPath, { flags: 'a' });
       this._logPath = logPath;
+      // WP-3a: a new stream ⇒ reset offsets + mint a new epoch. `_resetLogEpoch`
+      // reads the current (append) file size as the base, so it is robust even
+      // on the phantom-reconnect path where a prior stream may not have been
+      // explicitly closed. attach()'s empty-logPath re-spawn skips this branch,
+      // deliberately preserving the epoch.
+      this._resetLogEpoch();
     }
 
     // The pty-host itself runs on the WINDOWS side (it is what spawns
@@ -675,7 +699,24 @@ export class WslRunner extends EventEmitter {
             this._lastMeaningfulBurst = now;
           }
         }
-        this.logStream?.write(msg.data);
+        // WP-3a: byte-offset instrumentation + per-write barrier (mirrors
+        // windows-runner.ts). `endOff` is the logical PTY cursor; the write
+        // callback advances the flushed cutoff only on the contiguous
+        // successful prefix and permanently degrades the epoch on error.
+        const n = Buffer.byteLength(msg.data, 'utf8');
+        this._logBytesWritten += n;
+        const endOff = this._logBaseOffset + this._logBytesWritten;
+        this._lastWriteFlushed = new Promise<void>((res) => {
+          if (!this.logStream) return res();
+          this.logStream.write(msg.data, (err) => {
+            if (err) {
+              this._writeErrored = true;
+            } else if (!this._writeErrored) {
+              this._lastFlushedOffset = endOff;
+            }
+            res();
+          });
+        });
         // P2-02: feed the ring buffer for PromptPatternDetector. Same
         // partial-line handling as WindowsRunner so a chunk ending mid-line
         // doesn't fragment the next-arriving prompt across two ring entries.
@@ -701,7 +742,8 @@ export class WslRunner extends EventEmitter {
             if (this.outputRingBytes < 0) this.outputRingBytes = 0;
           }
         }
-        this.emit('data', msg.data);
+        // WP-3a: forward the logical end offset alongside the data.
+        this.emit('data', msg.data, endOff);
         break;
 
       case 'pid':
@@ -777,9 +819,45 @@ export class WslRunner extends EventEmitter {
     return this.outputRing.join('\n');
   }
 
+
+  /** WP-3a — see windows-runner.ts for the full contract of these members. */
+  get currentLogOffset(): number { return this._logBaseOffset + this._logBytesWritten; }
+  get terminalEpoch(): string { return this._epoch; }
+  get logOffsetsReliable(): boolean { return !this._writeErrored; }
+
+  /** WP-3a: reset offset/epoch state to the file's current (append) size and
+   *  mint a fresh epoch; emits `epochChanged`. Called at every log-stream open. */
+  private _resetLogEpoch(): void {
+    let base = 0;
+    try { if (this._logPath) base = fs.statSync(this._logPath).size; } catch { base = 0; }
+    this._logBaseOffset = base;
+    this._logBytesWritten = 0;
+    this._lastFlushedOffset = base;
+    this._writeErrored = false;
+    this._lastWriteFlushed = Promise.resolve();
+    this._epoch = randomUUID();
+    this.emit('epochChanged', this._epoch);
+  }
+
+  /** WP-3a: cutoff proven readable from a fresh fd + degraded flag. See
+   *  windows-runner.ts for the barrier semantics. */
+  async logWriteBarrier(): Promise<{ cutoff: number; degraded: boolean }> {
+    const pending = this._lastWriteFlushed;
+    await pending;
+    return { cutoff: this._lastFlushedOffset, degraded: this._writeErrored };
+  }
+
+  /** WP-3a: atomic ring-text + logical-cursor capture for degraded recovery. */
+  getRingSnapshot(): { text: string; logicalCutoff: number } {
+    return { text: this.outputRing.join('\n'), logicalCutoff: this.currentLogOffset };
+  }
+
   /** BUG-15: persist ring buffer to disk so the terminal viewer can recover
    *  scrollback after the runner has exited. */
   persistScrollback(): void {
+    // WP-1a: never recreate `.scrollback` once a delete is in flight — the
+    // reclaim pass has already (or is about to) unlink it.
+    if (this._deleting) return;
     if (!this._logPath) return;
     try {
       fs.writeFileSync(`${this._logPath}.scrollback`, this.outputRing.join('\n'));
@@ -837,6 +915,37 @@ export class WslRunner extends EventEmitter {
     this._intentionalKill = true;
     this.persistScrollback();
     this.sendToHost({ type: 'kill' });
+  }
+
+  /** WP-1a delete-shutdown contract. Tears the runner down for a permanent
+   *  delete: blocks any later `persistScrollback()`, kills the pty-host bridge
+   *  and the tmux session (the session must NOT outlive a delete — unlike the
+   *  shutdown-only `detachHost()`), closes the log stream so the OS releases the
+   *  file handle before the reclaim pass unlinks it. Resolves only after the log
+   *  stream has fully closed. */
+  async disposeForDelete(): Promise<void> {
+    this._deleting = true;                 // blocks any later persistScrollback()
+    this._intentionalKill = true;
+    this._alive = false;
+    this.sendToHost({ type: 'kill' });      // stop the pty-host bridge
+    await this.closeLogStream();
+    if (this.host && !this.host.killed) this.host.kill();
+    this.host = null;
+    // Delete is permanent — tear down the persistence session too so it can't
+    // be reattached later. Best-effort: never let a tmux failure hang delete.
+    try { await tmuxKillSession(this.sessionName); }
+    catch (err) { console.warn(`[WSL:${this.sessionName}] disposeForDelete tmux teardown failed:`, err); }
+  }
+
+  /** Settles exactly once on finish|close|error — never hangs delete on stream
+   *  failure. */
+  private closeLogStream(): Promise<void> {
+    return new Promise((resolve) => {
+      const s = this.logStream; this.logStream = null;
+      if (!s) return resolve();
+      let done = false; const fin = () => { if (!done) { done = true; resolve(); } };
+      s.once('finish', fin); s.once('close', fin); s.once('error', fin); s.end();
+    });
   }
 
   async kill(): Promise<void> {

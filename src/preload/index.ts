@@ -189,14 +189,40 @@ const api: IpcApi = {
   },
   terminal: {
     attach: (agentId) => ipcRenderer.invoke('terminal:attach', agentId),
-    detach: (agentId) => ipcRenderer.invoke('terminal:detach', agentId),
+    // WP-3d: `expectedEpoch` makes the detach epoch-scoped in main.
+    detach: (agentId, expectedEpoch) => ipcRenderer.invoke('terminal:detach', agentId, expectedEpoch),
     write: (agentId, data) => ipcRenderer.invoke('terminal:write', agentId, data),
     resize: (agentId, cols, rows) => ipcRenderer.invoke('terminal:resize', agentId, cols, rows),
     onData: (callback) => {
-      const listener = (_event: any, agentId: string, data: string) => callback(agentId, data);
+      // WP-3a: `terminal:data` now carries a third arg — the logical end offset
+      // of this chunk within the append-only `.log`. Older callbacks that take
+      // only (agentId, data) still work; WP-3c consumers use the offset to dedup
+      // buffered live events against the attach cutoff.
+      const listener = (_event: any, agentId: string, data: string, endOffset?: number) =>
+        callback(agentId, data, endOffset);
       ipcRenderer.on('terminal:data', listener);
       return () => ipcRenderer.removeListener('terminal:data', listener);
     },
+    // WP-3a: exact byte-range / tail readers over the agent's `.log`, plus the
+    // degraded-recovery ring snapshot. Consumed by the WP-3c rehydrate path.
+    readLogRange: (agentId, start, end) =>
+      ipcRenderer.invoke('agent:read-log-range', agentId, start, end),
+    readLogTail: (agentId, maxBytes, endExclusive) =>
+      ipcRenderer.invoke('agent:read-log-tail', agentId, maxBytes, endExclusive),
+    getRingSnapshot: (agentId) =>
+      ipcRenderer.invoke('agent:get-ring-snapshot', agentId),
+    // WP-3c: dead-agent replay snapshot with truncation metadata. Used by the
+    // renderer's dead-reopen path to paint history + a visible truncation banner.
+    readDeadAgentSnapshot: (agentId) =>
+      ipcRenderer.invoke('agent:read-dead-snapshot', agentId),
+    // WP-3b: serialize-checkpoint save/load for the LRU eviction (WP-3d) +
+    // rehydrate (WP-3c). `saveCheckpoint` resolves false when main rejects a
+    // stale-epoch or degraded save; `loadCheckpoint` resolves null when the
+    // checkpoint is stale-epoch or claims bytes past the attach cutoff.
+    saveCheckpoint: (agentId, epoch, serialized, appliedOffset) =>
+      ipcRenderer.invoke('terminal:save-checkpoint', agentId, epoch, serialized, appliedOffset),
+    loadCheckpoint: (agentId, snapshotCutoff) =>
+      ipcRenderer.invoke('terminal:load-checkpoint', agentId, snapshotCutoff),
     // BUG-38: same-id PTY swap notice. Main fires this after a successful
     // continuation / restart relaunch so the renderer can dispose the retired
     // xterm and re-attach to the fresh PTY.

@@ -2,11 +2,28 @@ import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebglAddon } from '@xterm/addon-webgl';
+import { SerializeAddon } from '@xterm/addon-serialize';
 import '@xterm/xterm/css/xterm.css';
 import { useDashboardStore } from '../../stores/dashboard-store';
 import { useThemeStore } from '../../stores/theme-store';
 import { shellEscapePath, isExternalFileDrop, getDroppedNativePaths, readClipboardImage } from '../../utils/drag-file';
-import { terminalCache, disposeCachedTerminal, reapOnLeave } from './terminal-cache';
+import {
+  terminalCache,
+  disposeCachedTerminalLocal,
+  reapOnLeave,
+  createCacheEntry,
+  queueWrite,
+  awaitTerminalEviction,
+  touchTerminal,
+  enforceLiveTerminalBound,
+} from './terminal-cache';
+import {
+  rehydrateTerminalHistory,
+  reconcileChunk,
+  type BufferedChunk,
+  type RehydrateDeps,
+} from './rehydrate-terminal';
+import { MAX_TERMINAL_REPLAY_BYTES } from '../../../shared/constants';
 import type { Agent } from '../../../shared/types';
 
 /** Strip persona-folder suffix to show the workspace root name.
@@ -79,6 +96,13 @@ function getTerminalTheme(theme: string) {
   return theme === 'light' ? LIGHT_TERMINAL_THEME : DARK_TERMINAL_THEME;
 }
 
+/** Compact human byte size for the WP-3c truncation banner (never a path). */
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(0)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
 // The xterm cache, its single teardown helper, and the terminal-status reaper
 // that disposes a DEAD agent's terminal now live in `./terminal-cache` — see
 // that module's header for why the cache survives unmount but not death.
@@ -125,6 +149,15 @@ export default function TerminalPanel({ height }: TerminalPanelProps) {
   // BUG-38 — bumped when a same-id PTY swap rebinds the terminal, forcing the
   // mount effect to re-run into its create-new branch on the fresh bridge.
   const [reboundNonce, setReboundNonce] = useState(0);
+
+  // WP-3c — two DISTINCT structured history states, rendered as stable overlays
+  // (never injected into the xterm stream, never exposing a filesystem path):
+  //   • truncationBanner — a byte bound was hit; retained size vs the attach
+  //     `snapshotCutoff` (NOT fileSize, which grows during replay).
+  //   • historyWarning — a log-write error degraded this epoch; recovery came
+  //     from the in-memory ring snapshot, so `.log` replay was skipped.
+  const [truncationBanner, setTruncationBanner] = useState<{ retainedBytes: number; snapshotTotal: number } | null>(null);
+  const [historyWarning, setHistoryWarning] = useState<{ reason: 'log-write-error' } | null>(null);
 
   // Transient paste/drop error surfaced in the toolbar. The timeout id is
   // ref-managed (addendum J) so an older timer can't clear a newer error, and
@@ -221,7 +254,26 @@ export default function TerminalPanel({ height }: TerminalPanelProps) {
       });
     };
 
+    // WP-3c: a fresh reopen recomputes history state; clear any prior agent's
+    // banners so they never bleed across an agent switch.
+    setTruncationBanner(null);
+    setHistoryWarning(null);
+
     let cached = terminalCache.get(agentId);
+
+    // WP-3c/3d: an entry mid-eviction (checkpoint save + main detach pending) is
+    // unavailable — its xterm is about to be disposed. Wait it out, then force a
+    // remount into the create-new path. In WP-3c no entry is ever `evicting`
+    // (eviction lands in WP-3d), so this guard is inert here but wired ahead.
+    if (cached && cached.evicting) {
+      let cancelled = false;
+      awaitTerminalEviction(agentId).then(() => {
+        if (!cancelled && useDashboardStore.getState().terminalAgentId === agentId) {
+          setReboundNonce((n) => n + 1);
+        }
+      });
+      return () => { cancelled = true; };
+    }
 
     if (cached) {
       // Reattach existing terminal to DOM
@@ -241,7 +293,9 @@ export default function TerminalPanel({ height }: TerminalPanelProps) {
       setTimeout(() => { fitReattach(); focusTerminalUnlessTypingElsewhere(cached!.terminal, container); }, 50);
       setTimeout(fitReattach, 200);
 
-      // Re-attach IPC if needed (unsub was cleaned up on detach)
+      // Re-attach IPC if needed (unsub was cleaned up on detach). This path only
+      // resumes LIVE forwarding on the already-hydrated buffer; it does not
+      // re-run the rehydrate (the full history is still in the cached xterm).
       if (!cached.unsub) {
         window.api.terminal.attach(agentId);
         const unsub = window.api.terminal.onData((incomingAgentId: string, data: string) => {
@@ -285,6 +339,12 @@ export default function TerminalPanel({ height }: TerminalPanelProps) {
         console.warn('[terminal] WebGL renderer unavailable, falling back to DOM:', err);
       }
 
+      // WP-3d: the serialize addon captures the live buffer on eviction so the
+      // reopen can restore it from a disk checkpoint. Load it once and keep the
+      // ref on the cache entry.
+      const serialize = new SerializeAddon();
+      terminal.loadAddon(serialize);
+
       xtermRef.current = terminal;
       fitAddonRef.current = fitAddon;
 
@@ -306,32 +366,46 @@ export default function TerminalPanel({ height }: TerminalPanelProps) {
         setIsAtBottom(viewportAtBottom);
       });
 
-      // BUG-15: atomic snapshot-with-tail mount sequence.
-      //   1. Subscribe to live PTY data; bytes arriving before the snapshot
-      //      is written get buffered locally.
-      //   2. Attach (kicks main to start forwarding).
-      //   3. Fetch the ring-buffer snapshot.
-      //   4. Write the snapshot in rAF-paced chunks so a 1 MB scrollback
-      //      doesn't lock up the renderer.
-      //   5. Drain the buffered tail in order.
-      //   6. From then on, live bytes write straight through.
-      // Naive ordering (snapshot → subscribe) would lose bytes emitted during
-      // the IPC round-trip; this ordering closes that window.
-      const pendingTail: string[] = [];
+      // WP-3c: exact-once epoch/cursor rehydrate (replaces the BUG-15
+      // snapshot-with-tail sequence).
+      //   1. Subscribe to live PTY data; each chunk carries its logical `.log`
+      //      end offset. Chunks arriving before history is applied buffer here.
+      //   2..4. `rehydrateTerminalHistory` attaches, picks the history source
+      //      (checkpoint+range / cold tail / dead snapshot / degraded ring), and
+      //      writes it via the cache write coordinator — advancing the replay
+      //      cursor (`cached.appliedOffset`) as it goes.
+      //   5. Drain the buffered chunks against the FIXED post-history cursor
+      //      (dedup by offset; a straddling chunk is byte-trimmed).
+      //   6. Steady state: dedup each live chunk by offset, else write it.
+      const enc = new TextEncoder();
+      const encodeUtf8 = (s: string) => enc.encode(s);
+      const pendingTail: BufferedChunk[] = [];
       let snapshotApplied = false;
 
-      const unsub = window.api.terminal.onData((incomingAgentId: string, data: string) => {
-        if (incomingAgentId !== agentId) return;
-        if (snapshotApplied) {
-          terminal.write(data);
-        } else {
-          pendingTail.push(data);
+      const toChunk = (data: string, endOffset?: number): BufferedChunk => {
+        // WP-3a always supplies `endOffset` for a live chunk; a missing offset
+        // (older bridge) can't be deduped, so mark it always-fresh (never drop).
+        if (endOffset === undefined) {
+          return { data, startOffset: Number.POSITIVE_INFINITY, endOffset: Number.POSITIVE_INFINITY };
         }
-      });
-      window.api.terminal.attach(agentId);
+        return { data, startOffset: endOffset - enc.encode(data).length, endOffset };
+      };
 
-      cached = { terminal, fitAddon, unsub };
+      const writeSteady = (chunk: BufferedChunk) => {
+        const action = reconcileChunk(chunk, cached!.appliedOffset, encodeUtf8);
+        if (action.kind === 'write') void queueWrite(cached!, action.data, chunk.endOffset);
+      };
+
+      const unsub = window.api.terminal.onData((incomingAgentId: string, data: string, endOffset?: number) => {
+        if (incomingAgentId !== agentId) return;
+        const chunk = toChunk(data, endOffset);
+        if (snapshotApplied) writeSteady(chunk);
+        else pendingTail.push(chunk);
+      });
+
+      cached = createCacheEntry(terminal, fitAddon, serialize, unsub);
       terminalCache.set(agentId, cached);
+      const entry = cached; // stable non-null ref for the async closure
 
       // Fit the terminal multiple times after attach to ensure correct sizing.
       // The container may not have its final dimensions on the first frame,
@@ -343,43 +417,66 @@ export default function TerminalPanel({ height }: TerminalPanelProps) {
         } catch { /* ignore during layout transitions */ }
       };
 
-      window.api.agents.getRingBuffer(agentId).then((snapshot) => {
-        const finishMount = () => {
-          for (const chunk of pendingTail) terminal.write(chunk);
-          pendingTail.length = 0;
-          snapshotApplied = true;
+      const deps: RehydrateDeps = {
+        attach: () => window.api.terminal.attach(agentId),
+        loadCheckpoint: (cutoff) => window.api.terminal.loadCheckpoint(agentId, cutoff),
+        readLogRange: (start, end) => window.api.terminal.readLogRange(agentId, start, end),
+        readLogTail: (maxBytes, endExclusive) => window.api.terminal.readLogTail(agentId, maxBytes, endExclusive),
+        getRingSnapshot: () => window.api.terminal.getRingSnapshot(agentId),
+        readDeadAgentSnapshot: () => window.api.terminal.readDeadAgentSnapshot(agentId),
+        // Cursor-neutral apply — the orchestrator owns `entry.appliedOffset`.
+        write: (data) => queueWrite(entry, data, null),
+        showTruncationBanner: (b) => setTruncationBanner(b),
+        showHistoryWarning: () => setHistoryWarning({ reason: 'log-write-error' }),
+        maxReplayBytes: MAX_TERMINAL_REPLAY_BYTES,
+      };
 
-          setTimeout(() => {
-            fitAndSync();
-            terminal.scrollToBottom();
-            focusTerminalUnlessTypingElsewhere(terminal, container);
-          }, 50);
-          setTimeout(fitAndSync, 200);
-          setTimeout(fitAndSync, 500);
-        };
-
-        if (!snapshot) {
-          finishMount();
-          return;
-        }
-
-        // Chunked write: xterm's write(data, cb) yields between calls so the
-        // event loop stays responsive even for a 1 MB scrollback. 8 KB strikes
-        // a balance — small enough to avoid jank, large enough to limit the
-        // chain depth.
-        const CHUNK_SIZE = 8192;
-        let offset = 0;
-        const writeNext = () => {
-          if (offset >= snapshot.length) {
-            finishMount();
-            return;
+      const finishMount = (live: boolean) => {
+        // Drain buffered chunks against the FIXED post-history cursor, then flip
+        // to steady state. Synchronous between reading the cursor and setting
+        // the flag, so no live event can interleave and be lost or doubled.
+        if (live) {
+          const cursor = entry.appliedOffset;
+          for (const chunk of pendingTail) {
+            const action = reconcileChunk(chunk, cursor, encodeUtf8);
+            if (action.kind === 'write') void queueWrite(entry, action.data, chunk.endOffset);
           }
-          const end = Math.min(offset + CHUNK_SIZE, snapshot.length);
-          terminal.write(snapshot.slice(offset, end), writeNext);
-          offset = end;
-        };
-        writeNext();
-      });
+        }
+        pendingTail.length = 0;
+        snapshotApplied = true;
+
+        setTimeout(() => {
+          fitAndSync();
+          terminal.scrollToBottom();
+          focusTerminalUnlessTypingElsewhere(terminal, container);
+        }, 50);
+        setTimeout(fitAndSync, 200);
+        setTimeout(fitAndSync, 500);
+      };
+
+      rehydrateTerminalHistory(entry, deps).then(
+        (res) => finishMount(res.live),
+        (err) => {
+          // A failed rehydrate must not strand live output in the buffer
+          // forever — flip to steady state (live path) so new bytes flow.
+          console.error('[terminal] rehydrate failed:', err);
+          finishMount(true);
+        },
+      );
+    }
+
+    // WP-3d: this terminal is now the most-recently-used, and never a victim
+    // (it's on screen ⇒ exempt). Enforcing the cap here evicts the oldest
+    // OFF-screen non-exempt terminals — their buffers are checkpointed to disk
+    // first, so reopening replays losslessly. The exempt set is the on-screen
+    // terminal plus (future-proof) the pinned agent; today they coincide.
+    touchTerminal(agentId);
+    {
+      const s = useDashboardStore.getState();
+      const exempt = new Set<string>();
+      if (s.terminalAgentId) exempt.add(s.terminalAgentId);
+      if (s.terminalPinned && s.terminalAgentId) exempt.add(s.terminalAgentId);
+      enforceLiveTerminalBound(exempt);
     }
 
     // ResizeObserver for responsive fitting
@@ -438,7 +535,9 @@ export default function TerminalPanel({ height }: TerminalPanelProps) {
   // lazily the next time they're opened — the cache is already cleared for them.
   useEffect(() => {
     const unsub = window.api.terminal.onRebound((reboundAgentId: string) => {
-      disposeCachedTerminal(reboundAgentId);
+      // WP-3d: main already tore down the retired epoch's attachment — a LOCAL
+      // dispose (no main detach) avoids a delayed-detach vs fresh-reattach race.
+      disposeCachedTerminalLocal(reboundAgentId);
       // Only force a re-mount for the terminal currently on screen.
       if (reboundAgentId === terminalAgentId) {
         setReboundNonce((n) => n + 1);
@@ -716,6 +815,36 @@ export default function TerminalPanel({ height }: TerminalPanelProps) {
         onContextMenu={handleContextMenu}
       >
         <div ref={termRef} className="w-full h-full" onClick={() => xtermRef.current?.focus()} />
+        {/* WP-3c structured history banners — stable overlays, never injected
+            into the xterm stream and never exposing a filesystem path. */}
+        {(truncationBanner || historyWarning) && (
+          <div className="absolute top-2 left-1/2 -translate-x-1/2 flex flex-col items-center gap-1 pointer-events-none z-10">
+            {historyWarning && (
+              <span
+                className={`text-[10px] px-2 py-0.5 rounded-sm border font-mono ${
+                  isLight
+                    ? 'text-[#9d2b13] bg-[#fdece8] border-[#e0a99e]'
+                    : 'text-accent-red bg-accent-red/10 border-accent-red/40'
+                }`}
+                title="A log-write error degraded this session; earlier history was recovered from the in-memory buffer and may be incomplete."
+              >
+                ⚠ History may be incomplete (log-write error) — recovered from memory buffer
+              </span>
+            )}
+            {truncationBanner && (
+              <span
+                className={`text-[10px] px-2 py-0.5 rounded-sm border font-mono ${
+                  isLight
+                    ? 'text-[#9d6b13] bg-[#fdf3e3] border-[#e0c79e]'
+                    : 'text-accent-orange bg-accent-orange/10 border-accent-orange/40'
+                }`}
+                title="Earlier terminal history exceeded the replay budget and was not loaded."
+              >
+                ↥ Showing last {formatBytes(truncationBanner.retainedBytes)} of {formatBytes(truncationBanner.snapshotTotal)} — earlier history truncated
+              </span>
+            )}
+          </div>
+        )}
         {!isAtBottom && !scrollLocked && (
           <button
             onClick={scrollToBottom}

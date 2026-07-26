@@ -98,6 +98,24 @@ export const CONTINUATION_STOP_FLUSH_DELAY_MS = 2_000;   // pause before the PTY
  *  window, so the re-check at fire time cancels the release for an agent that
  *  came back to life. Purely a memory reclaim; a few seconds costs nothing. */
 export const TERMINAL_AGENT_RELEASE_DELAY_MS = 5_000;
+/** WP-3c cold-replay fallback budget — the maximum number of `.log` bytes the
+ *  renderer replays into a reopened terminal when there is no valid checkpoint
+ *  (live cold tail, dead-agent snapshot, and the per-page range budget of the
+ *  checkpoint-to-cutoff catch-up loop). Matches the runner-ring byte bound
+ *  (`MAX_RING_BYTES`, windows-runner.ts / wsl-runner.ts) so a cold reopen and a
+ *  live ring surface the same amount of history. Anything older is surfaced as a
+ *  structured truncation banner — never silently dropped. */
+export const MAX_TERMINAL_REPLAY_BYTES = 8_000_000;
+/** WP-3d LRU cap — the maximum number of NON-EXEMPT cached xterm views the
+ *  renderer keeps live at once. Exempt views (the on-screen terminal and any
+ *  pinned agent) are always retained, so the true ceiling is `8 + |exempt|`.
+ *  Beyond this bound the oldest-touched non-exempt terminals are evicted:
+ *  their serialized buffer is checkpointed to disk and the xterm (WebGL context,
+ *  IPC subscription, 50k-line scrollback) is released. Reopening replays from the
+ *  checkpoint + `.log` via the WP-3c rehydrate — lossless to the retained bound,
+ *  banner beyond it. Sized to the same order as the runner ring so a handful of
+ *  active terminals stay instant while a long tail of visited agents is reclaimed. */
+export const MAX_LIVE_TERMINAL_VIEWS = 8;
 /** Commit-observed note-request timeout: the watcher polls for the committed
  *  brick DB row for this long after the handshake before deciding the
  *  empty-memo branch. Distinct from HANDSHAKE_CONFIRM_WINDOW_MS (turn-start

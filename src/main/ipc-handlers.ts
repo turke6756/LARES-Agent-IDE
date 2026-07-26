@@ -9,6 +9,8 @@ import { createDetachedWindow, createDetachedViewWindow, broadcastToDetachedView
 import { handleFlushReply } from './close-flush';
 import type { FlushReplyPayload } from '../shared/types';
 import { AgentSupervisor } from './supervisor';
+import { TerminalListenerRegistry } from './terminal-listener-registry';
+import { computeTerminalAttachResult } from './terminal-attach-result';
 import { resolveAgentChatEvents } from './supervisor/agent-chat-history';
 import {
   getWorkspaces, createWorkspace, deleteWorkspace, getWorkspace, reorderWorkspaces,
@@ -446,9 +448,11 @@ export function registerIpcHandlers(
   ipcMain.handle('template:update', (_e, id, updates) => updateAgentTemplate(id, updates));
   ipcMain.handle('template:delete', (_e, id) => deleteAgentTemplate(id));
 
-  // Terminal handlers - track attached agents and their data listeners
-  // Map<agentId, listenerFunction>
-  const activeListeners = new Map<string, (data: string) => void>();
+  // Terminal handlers - track attached agents and their data listeners.
+  // WP-3d: the registry pairs each listener with the terminal epoch it was
+  // registered under, so `terminal:detach` can be epoch-scoped (an eviction
+  // under a retired epoch never tears down a freshly reattached listener).
+  const activeListeners = new TerminalListenerRegistry();
   const attachedAgents = new Set<string>(); // Keep for backward compatibility/quick checks
 
   // BUG-38 — terminal attachment service. A same-id PTY swap (continuation,
@@ -466,12 +470,11 @@ export function registerIpcHandlers(
   // deletes are idempotent, so a double-notify is safe.
   const terminalAttach = {
     rebound(agentId: string): void {
-      const listener = activeListeners.get(agentId);
+      const listener = activeListeners.removeUnconditional(agentId);
       if (listener) {
         // The old runner is already gone; removeAgentListener targets the new
         // runner (a no-op there) — harmless, and mirrors terminal:detach.
         supervisor.removeAgentListener(agentId, listener);
-        activeListeners.delete(agentId);
       }
       attachedAgents.delete(agentId);
       if (!mainWindow.isDestroyed()) {
@@ -481,35 +484,81 @@ export function registerIpcHandlers(
   };
   supervisor.setTerminalReboundNotifier(terminalAttach.rebound);
 
-  ipcMain.handle('terminal:attach', (_e, agentId) => {
-    if (activeListeners.has(agentId)) return { ok: true }; // already attached
-
-    try {
-      const bridge = supervisor.attachAgent(agentId);
-
-      const listener = (data: string) => {
-        if (!mainWindow.isDestroyed()) {
-          mainWindow.webContents.send('terminal:data', agentId, data);
+  // WP-3a: `terminal:attach` is now async and returns an atomic cutoff so the
+  // renderer's exact-once rehydrate (WP-3c) knows exactly which `.log` bytes are
+  // already durable. There is NO early `{ok:true}` short-circuit for the
+  // already-attached case — the listener is kept and the FULL result (live,
+  // epoch, cutoff, degraded) is still recomputed and returned every call.
+  ipcMain.handle('terminal:attach', async (_e, agentId) => {
+    const live = supervisor.hasRunner(agentId);
+    if (live) {
+      try {
+        // Register the live-data listener idempotently (skip if already attached).
+        // WP-3d: tag it with the CURRENT terminal epoch so a later epoch-scoped
+        // detach can tell this listener apart from one a fresh reattach installs.
+        if (!activeListeners.has(agentId)) {
+          const bridge = supervisor.attachAgent(agentId);
+          const listener = (data: string, endOffset?: number) => {
+            if (!mainWindow.isDestroyed()) {
+              // WP-3a: forward the logical end offset so the renderer can dedup
+              // buffered live events against the attach cutoff.
+              mainWindow.webContents.send('terminal:data', agentId, data, endOffset);
+            }
+          };
+          bridge.onData(listener);
+          activeListeners.register(agentId, listener, supervisor.agentEpoch(agentId));
+          attachedAgents.add(agentId);
         }
-      };
-
-      bridge.onData(listener);
-      activeListeners.set(agentId, listener);
-      attachedAgents.add(agentId);
-      return { ok: true };
-    } catch (err: any) {
-      console.error('Failed to attach:', err.message);
-      return { ok: false, error: err.message };
+        // The listener is installed BEFORE the barrier capture (WP-3a contract);
+        // the shared builder returns the atomic {live,epoch,cutoff,degraded}.
+        return await computeTerminalAttachResult(supervisor, agentId);
+      } catch (err: any) {
+        console.error('Failed to attach:', err.message);
+        return { ok: false, error: err.message };
+      }
     }
+
+    // DEAD agent (no live runner): no listener to install. The builder reads the
+    // persisted `.log` size as the cutoff and the last recorded epoch (may be
+    // null if the agent was never launched this process).
+    return computeTerminalAttachResult(supervisor, agentId);
   });
 
-  ipcMain.handle('terminal:detach', (_e, agentId) => {
-    const listener = activeListeners.get(agentId);
-    if (listener) {
-      supervisor.removeAgentListener(agentId, listener);
-      activeListeners.delete(agentId);
+  // WP-3a: exact byte-range / tail readers + degraded-recovery ring snapshot.
+  // Renderer rehydrate (WP-3c) pages `.log` bytes via these; the range reader
+  // does NO rune alignment so consecutive pages join losslessly.
+  ipcMain.handle('agent:read-log-range', (_e, agentId, start, end) =>
+    supervisor.agentReadLogRange(agentId, start, end));
+  ipcMain.handle('agent:read-log-tail', (_e, agentId, maxBytes, endExclusive) =>
+    supervisor.agentReadLogTail(agentId, maxBytes, endExclusive));
+  ipcMain.handle('agent:get-ring-snapshot', (_e, agentId) =>
+    supervisor.agentRingSnapshot(agentId));
+  // WP-3c: dead-agent replay snapshot WITH truncation metadata (`.scrollback`
+  // preferred, else a capped `.log` tail). The renderer's dead-reopen path uses
+  // this instead of `agent:get-ring-buffer` so it can render a visible
+  // truncation banner rather than silently dropping earlier history.
+  ipcMain.handle('agent:read-dead-snapshot', (_e, agentId) =>
+    supervisor.getAgentDeadSnapshot(agentId));
+
+  // WP-3b: serialize-checkpoint persistence for the renderer's LRU eviction /
+  // reopen. `save` is epoch- + degraded-guarded (returns false when rejected);
+  // `load` is epoch- + cutoff-guarded (returns null when rejected). All
+  // validation lives in the supervisor; these are thin pass-throughs.
+  ipcMain.handle('terminal:save-checkpoint', (_e, agentId, epoch, serialized, appliedOffset) =>
+    supervisor.saveTerminalCheckpoint(agentId, epoch, serialized, appliedOffset));
+  ipcMain.handle('terminal:load-checkpoint', (_e, agentId, snapshotCutoff) =>
+    supervisor.loadTerminalCheckpoint(agentId, snapshotCutoff));
+
+  ipcMain.handle('terminal:detach', (_e, agentId, expectedEpoch?: string | null) => {
+    // WP-3d: epoch-scoped. A detach carrying a retired epoch (e.g. a delayed LRU
+    // eviction) must NOT tear down a listener a fresh reattach registered under a
+    // newer epoch — that would silently stop live forwarding on the live view.
+    const { removed, noop } = activeListeners.removeForEpoch(agentId, expectedEpoch);
+    if (noop) return;
+    if (removed) {
+      supervisor.removeAgentListener(agentId, removed);
     }
-    
+
     // Original detach logic (wsl runner detach)
     supervisor.detachAgent(agentId);
     attachedAgents.delete(agentId);

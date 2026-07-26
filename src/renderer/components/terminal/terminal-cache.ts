@@ -35,31 +35,216 @@
 
 import type { Terminal } from '@xterm/xterm';
 import type { FitAddon } from '@xterm/addon-fit';
+import type { SerializeAddon } from '@xterm/addon-serialize';
 import { useDashboardStore } from '../../stores/dashboard-store';
-import { TERMINAL_AGENT_RELEASE_DELAY_MS } from '../../../shared/constants';
+import {
+  TERMINAL_AGENT_RELEASE_DELAY_MS,
+  MAX_LIVE_TERMINAL_VIEWS,
+} from '../../../shared/constants';
 
 export interface CachedTerminal {
   terminal: Terminal;
   fitAddon: FitAddon;
   unsub: (() => void) | null;
+  // WP-3d — the loaded serialize addon, kept so eviction can snapshot the live
+  // xterm buffer to a disk checkpoint before disposing it.
+  serialize: SerializeAddon;
+  // WP-3c exact-once rehydrate state. `appliedOffset` is the highest `.log`
+  // byte offset already written into this xterm (the replay cursor);
+  // `logOffsetsReliable` is false once an epoch's log-write error forced the
+  // degraded ring-snapshot recovery (no `.log` replay for that epoch); `epoch`
+  // is the terminal epoch this buffer was hydrated under; `lastWrite` serializes
+  // every write so the cursor advances in xterm-write order; `evicting` is set
+  // by WP-3d's LRU eviction — a reopen treats an evicting entry as unavailable.
+  appliedOffset: number;
+  logOffsetsReliable: boolean;
+  epoch: string;
+  lastWrite: Promise<void>;
+  evicting: boolean;
 }
 
 /** Module-level cache — survives re-renders, preserves scrollback. */
 export const terminalCache = new Map<string, CachedTerminal>();
 
-const TERMINAL_STATUSES = new Set(['done', 'crashed']);
+/** Build a fresh cache entry with the WP-3c rehydrate fields defaulted. The
+ *  rehydrate orchestrator fills `appliedOffset` / `epoch` / `logOffsetsReliable`
+ *  as it applies history. */
+export function createCacheEntry(
+  terminal: Terminal,
+  fitAddon: FitAddon,
+  serialize: SerializeAddon,
+  unsub: (() => void) | null,
+): CachedTerminal {
+  return {
+    terminal,
+    fitAddon,
+    serialize,
+    unsub,
+    appliedOffset: 0,
+    logOffsetsReliable: true,
+    epoch: '',
+    lastWrite: Promise.resolve(),
+    evicting: false,
+  };
+}
 
 /**
- * Single teardown path for a cached terminal: drop the IPC subscription, kill
- * the xterm (and with it the WebGL canvas + DOM node), forget the entry.
- * Idempotent — an unknown or already-disposed agent id is a no-op and returns
- * false. Shared by the reaper and by the BUG-38 rebound handler so the two can
- * never diverge.
+ * WP-3c write coordinator. EVERY snapshot / range / live write goes through
+ * here so bytes land in xterm in a single serialized order and the replay
+ * cursor (`appliedOffset`) advances only once the write has actually been
+ * consumed by xterm's parser.
+ *
+ * `endOffset === null` is CURSOR-NEUTRAL — used for the serialized-checkpoint
+ * and degraded ring-snapshot writes, where the caller sets `appliedOffset`
+ * explicitly afterward (a serialized buffer has no single `.log` offset).
+ *
+ * Once eviction has begun (`entry.evicting`, WP-3d) live writes are dropped so
+ * a disposed terminal is never written to.
  */
-export function disposeCachedTerminal(agentId: string): boolean {
+export function queueWrite(
+  entry: CachedTerminal,
+  data: string | Uint8Array,
+  endOffset: number | null,
+): Promise<void> {
+  entry.lastWrite = entry.lastWrite.then(
+    () =>
+      new Promise<void>((resolve) => {
+        if (entry.evicting) return resolve();
+        entry.terminal.write(data, () => {
+          if (endOffset !== null) entry.appliedOffset = endOffset;
+          resolve();
+        });
+      }),
+  );
+  return entry.lastWrite;
+}
+
+// ── WP-3d LRU cache ──────────────────────────────────────────────────────
+//
+// The cache is bounded to `MAX_LIVE_TERMINAL_VIEWS` NON-EXEMPT live xterm views.
+// Beyond that bound the least-recently-touched non-exempt terminals are evicted:
+// their serialized buffer is saved to a disk checkpoint (unless the epoch is
+// degraded), the main-side listener is torn down (epoch-scoped), and the xterm —
+// WebGL context, 50k-line scrollback, IPC subscription — is disposed. Reopening
+// replays from the checkpoint + `.log` via the WP-3c rehydrate.
+//
+// Recency is a MONOTONIC counter (`useClock`), never wall-clock: deterministic
+// ordering with no ties, and it can't go backwards across a clock adjustment.
+
+/** Monotonic "last used" stamp per cached terminal. */
+const lastUsedAt = new Map<string, number>();
+let useClock = 0;
+
+/** Mark a terminal as just-used (mounted / reattached). Advances the monotonic
+ *  clock so the LRU order is total and tie-free. */
+export function touchTerminal(agentId: string): void {
+  lastUsedAt.set(agentId, ++useClock);
+}
+
+/** Single-flight eviction promises. An entry stays in `terminalCache` (flagged
+ *  `evicting`) while its checkpoint save + main detach are in flight, so a rapid
+ *  reopen can await the SAME promise rather than racing a half-disposed xterm. */
+const evicting = new Map<string, Promise<void>>();
+
+/** A reopen that finds an entry mid-eviction awaits this before rebuilding.
+ *  Resolves immediately when the agent is not being evicted. */
+export function awaitTerminalEviction(agentId: string): Promise<void> {
+  return evicting.get(agentId) ?? Promise.resolve();
+}
+
+/**
+ * Enforce the live-view cap. `exempt` is always retained (the on-screen
+ * terminal + any pinned agent), so the post-condition is: non-exempt cached
+ * entries ≤ `MAX_LIVE_TERMINAL_VIEWS`, hence total ≤ `8 + |exempt|`.
+ *
+ * Entries already mid-eviction are excluded from the candidate set AND from the
+ * overflow count, so repeated calls before an in-flight eviction settles never
+ * over-evict — the overflow is measured against only the entries that could
+ * still be victims.
+ */
+export function enforceLiveTerminalBound(exempt: Set<string>): void {
+  const eligible = [...terminalCache.keys()]
+    .filter((id) => !exempt.has(id) && !evicting.has(id))
+    .sort((a, b) => (lastUsedAt.get(a) ?? 0) - (lastUsedAt.get(b) ?? 0)); // oldest first
+  let overflow = Math.max(0, eligible.length - MAX_LIVE_TERMINAL_VIEWS);
+  for (const id of eligible) {
+    if (overflow-- <= 0) break;
+    void evictCachedTerminal(id);
+  }
+}
+
+/**
+ * Evict a cached terminal: checkpoint its serialized buffer (healthy epochs
+ * only), tear down the main-side listener (epoch-scoped), then ALWAYS release
+ * the renderer resources — even if the checkpoint save or the detach rejects.
+ * Single-flight via the `evicting` map; a second call returns the in-flight
+ * promise. An unknown id resolves immediately.
+ */
+export function evictCachedTerminal(agentId: string): Promise<void> {
+  const inflight = evicting.get(agentId);
+  if (inflight) return inflight;
+  const entry = terminalCache.get(agentId);
+  if (!entry) return Promise.resolve();
+
+  const p = (async () => {
+    entry.evicting = true; // queueWrite drops live writes from here on
+    try {
+      if (entry.logOffsetsReliable) {
+        // Never checkpoint a degraded epoch — its offset↔file mapping is
+        // untrusted, so a saved cursor could not be validated on reload.
+        try {
+          await entry.lastWrite; // all queued bytes are in the buffer we serialize
+          await window.api.terminal.saveCheckpoint(
+            agentId,
+            entry.epoch,
+            entry.serialize.serialize(),
+            entry.appliedOffset,
+          );
+        } catch (err) {
+          console.warn('[evict] checkpoint skipped; capped replay next open', err);
+        }
+      }
+      try {
+        entry.unsub?.();
+      } catch {
+        // a stale subscription that already tore itself down
+      }
+      try {
+        // Epoch-scoped: main no-ops this detach if a fresh reattach has already
+        // registered a listener under a newer epoch (rebound race).
+        await window.api.terminal.detach(agentId, entry.epoch);
+      } catch (err) {
+        console.error('[evict] main detach failed', err);
+      }
+    } finally {
+      // ALWAYS release renderer resources, whatever failed above.
+      terminalCache.delete(agentId);
+      lastUsedAt.delete(agentId);
+      evicting.delete(agentId);
+      pendingDisposal.delete(agentId);
+      try {
+        entry.terminal.dispose();
+      } catch {
+        // xterm can throw if the element was yanked from the DOM first
+      }
+    }
+  })();
+
+  evicting.set(agentId, p);
+  return p;
+}
+
+/**
+ * Rebound-only local teardown: main has ALREADY torn down the retired epoch's
+ * attachment (the BUG-38 rebound path is authoritative), so this only drops the
+ * renderer's stale subscription + xterm — NO main detach (a delayed detach here
+ * could race the fresh reattach). Idempotent; returns false for an unknown id.
+ */
+export function disposeCachedTerminalLocal(agentId: string): boolean {
   const entry = terminalCache.get(agentId);
   if (!entry) return false;
   terminalCache.delete(agentId);
+  lastUsedAt.delete(agentId);
   try {
     entry.unsub?.();
   } catch {
@@ -73,6 +258,8 @@ export function disposeCachedTerminal(agentId: string): boolean {
   pendingDisposal.delete(agentId);
   return true;
 }
+
+const TERMINAL_STATUSES = new Set(['done', 'crashed']);
 
 /** Agents that went terminal while being VIEWED — disposed when the panel
  *  moves off them (see `reapIfPending`). */
@@ -88,17 +275,32 @@ const pendingDisposal = new Set<string>();
  *
  * An agent that is merely being navigated away from is untouched — that is the
  * off-screen-but-alive case the cache exists to serve.
+ *
+ * WP-3d: releases via `evictCachedTerminal` (checkpoint-then-dispose) so a dead
+ * agent's final buffer is persisted before the xterm is destroyed — a same-
+ * process dead reopen then loads that checkpoint. `pendingDisposal` is cleared
+ * inside the eviction's `finally`.
  */
-export function reapOnLeave(agentId: string): boolean {
+export function reapOnLeave(agentId: string): void {
   const status = useDashboardStore.getState().agentStatuses[agentId]?.status;
   const dead = pendingDisposal.has(agentId) || (status !== undefined && TERMINAL_STATUSES.has(status));
-  if (!dead) return false;
-  return disposeCachedTerminal(agentId);
+  if (!dead) return;
+  void evictCachedTerminal(agentId);
 }
 
 /** Test seam. */
 export function __pendingDisposalForTest(): string[] {
   return [...pendingDisposal];
+}
+
+/** Test seam — clear ALL module-level cache state (cache, LRU clock, in-flight
+ *  evictions, pending disposals) so each test starts from a clean slate. */
+export function __resetTerminalCacheForTest(): void {
+  terminalCache.clear();
+  lastUsedAt.clear();
+  evicting.clear();
+  pendingDisposal.clear();
+  useClock = 0;
 }
 
 const reapTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -111,7 +313,7 @@ function cancelReap(agentId: string): void {
   }
 }
 
-/** Dispose now if off-screen; otherwise queue for the moment the viewer leaves. */
+/** Evict now if off-screen; otherwise queue for the moment the viewer leaves. */
 function reapNow(agentId: string): void {
   reapTimers.delete(agentId);
   if (!terminalCache.has(agentId)) return;
@@ -119,7 +321,7 @@ function reapNow(agentId: string): void {
     pendingDisposal.add(agentId);
     return;
   }
-  disposeCachedTerminal(agentId);
+  void evictCachedTerminal(agentId);
 }
 
 function scheduleReap(agentId: string): void {

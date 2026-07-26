@@ -1,12 +1,14 @@
 import { ChildProcess } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
+import { randomUUID } from 'crypto';
 import { EventEmitter } from 'events';
 import { getPtyHostPath } from './paths';
 import { sanitizeClaudeChildEnv } from './env-sanitize';
 import { spawnBundledNode } from '../node-runtime';
 import { ensureNodeShimDir, withNodeShimOnPath } from '../node-shim';
 import { ensureGitShimDir } from '../git/git-shim';
+import { readLastLines } from './log-readers/tail-file';
 
 /**
  * Spawns Claude via a separate Node.js process that uses node-pty.
@@ -27,6 +29,10 @@ export class WindowsRunner extends EventEmitter {
   private _pid: number | null = null;
   private _alive: boolean = false;
   private _intentionalKill: boolean = false;
+  // WP-1a delete-shutdown contract: once true, persistScrollback() is a no-op so
+  // a post-kill `exit` handler can never recreate `.scrollback` after delete
+  // (which would leak a sidecar the reclaim pass already unlinked).
+  private _deleting: boolean = false;
   private buffer: string = '';
   // In-memory ring buffer for instant log retrieval (avoids fs.createWriteStream flush delays).
   // BUG-15: bumped from 500 lines to 10000 / 1MB so the terminal viewer can paint a useful
@@ -43,6 +49,25 @@ export class WindowsRunner extends EventEmitter {
   private _logPath: string | null = null;
   private _dataCount: number = 0;
   private _totalBytes: number = 0;
+
+  // WP-3a — log byte-offset instrumentation + epoch. The append-only `.log` is
+  // the durable PTY record; its byte offset is a lightweight replay cursor for
+  // the renderer's exact-once rehydrate. All of this state is reset atomically
+  // at every log-stream open (`_resetLogEpoch`) so a reused runner instance can
+  // never carry a stale offset into a new stream.
+  //   _logBaseOffset     the file's byte size when this stream opened (append base)
+  //   _logBytesWritten   cumulative UTF-8 bytes handed to this stream since open
+  //   _lastFlushedOffset highest CONTIGUOUS successfully-flushed prefix offset
+  //   _writeErrored      once true, offset↔file mapping is permanently degraded
+  //                      this epoch (recovery falls back to the ring snapshot)
+  //   _lastWriteFlushed  settles when the most-recent queued write's callback ran
+  //   _epoch             opaque per-stream id; a new stream ⇒ a new epoch
+  private _logBaseOffset: number = 0;
+  private _logBytesWritten: number = 0;
+  private _lastFlushedOffset: number = 0;
+  private _writeErrored: boolean = false;
+  private _lastWriteFlushed: Promise<void> = Promise.resolve();
+  private _epoch: string = '';
 
   get pid(): number | null {
     return this._pid;
@@ -78,6 +103,10 @@ export class WindowsRunner extends EventEmitter {
 
     this.logStream = fs.createWriteStream(logPath, { flags: 'a' });
     this._logPath = logPath;
+    // WP-3a: a fresh WindowsRunner is minted per launch, so this always opens a
+    // brand-new stream — reset the offset/epoch state to the file's current
+    // (append) size and emit a new epoch.
+    this._resetLogEpoch();
 
     // The pty-host helper ships inside the app bundle (dist/ → app.asar), so its
     // `require('node-pty')` resolves through our own module tree.
@@ -196,7 +225,26 @@ export class WindowsRunner extends EventEmitter {
             this._lastMeaningfulBurst = now;
           }
         }
-        this.logStream?.write(msg.data);
+        // WP-3a: byte-offset instrumentation + per-write barrier. `endOff` is
+        // the LOGICAL PTY cursor (base + cumulative UTF-8 bytes); it advances
+        // unconditionally so the renderer can dedup live events by offset. The
+        // write callback advances `_lastFlushedOffset` only on the contiguous
+        // successful prefix — a single write error permanently degrades this
+        // epoch's offset↔file mapping and never advances the flushed cutoff.
+        const n = Buffer.byteLength(msg.data, 'utf8');
+        this._logBytesWritten += n;
+        const endOff = this._logBaseOffset + this._logBytesWritten;
+        this._lastWriteFlushed = new Promise<void>((res) => {
+          if (!this.logStream) return res();
+          this.logStream.write(msg.data, (err) => {
+            if (err) {
+              this._writeErrored = true;               // permanent for this epoch
+            } else if (!this._writeErrored) {
+              this._lastFlushedOffset = endOff;         // never advance past the first failed write
+            }
+            res();                                      // settle, never hang
+          });
+        });
         // Append to in-memory ring buffer for instant log reads
         const newLines = msg.data.split('\n');
         if (this.outputRing.length > 0 && newLines.length > 0) {
@@ -219,7 +267,9 @@ export class WindowsRunner extends EventEmitter {
           this.outputRingBytes -= dropped.length + 1; // +1 for the join newline
           if (this.outputRingBytes < 0) this.outputRingBytes = 0;
         }
-        this.emit('data', msg.data);
+        // WP-3a: forward the logical end offset alongside the data. Consumers
+        // that ignore the extra arg (status/file trackers) are unaffected.
+        this.emit('data', msg.data, endOff);
         break;
 
       case 'pid':
@@ -294,10 +344,63 @@ export class WindowsRunner extends EventEmitter {
     return this.outputRing.join('\n');
   }
 
+
+  /** WP-3a: the current LOGICAL PTY cursor (append base + cumulative UTF-8
+   *  bytes handed to the stream this epoch). Not proven durable — that is what
+   *  `logWriteBarrier` is for. */
+  get currentLogOffset(): number { return this._logBaseOffset + this._logBytesWritten; }
+
+  /** WP-3a: opaque per-stream epoch id. A new stream (launch) ⇒ a new epoch. */
+  get terminalEpoch(): string { return this._epoch; }
+
+  /** WP-3a: false once any write in this epoch errored — the byte offset can no
+   *  longer be trusted as a `.log` replay position (degraded recovery only). */
+  get logOffsetsReliable(): boolean { return !this._writeErrored; }
+
+  /** WP-3a: reset all offset/epoch state to the file's current (append) size and
+   *  mint a fresh epoch. Called at every log-stream open, AFTER the previous
+   *  stream has closed, so a reused runner instance can never carry a stale
+   *  offset forward. Emits `epochChanged` so the supervisor updates its
+   *  `lastTerminalEpoch` map synchronously. */
+  private _resetLogEpoch(): void {
+    let base = 0;
+    try { if (this._logPath) base = fs.statSync(this._logPath).size; } catch { base = 0; }
+    this._logBaseOffset = base;
+    this._logBytesWritten = 0;
+    this._lastFlushedOffset = base;
+    this._writeErrored = false;
+    this._lastWriteFlushed = Promise.resolve();
+    this._epoch = randomUUID();
+    this.emit('epochChanged', this._epoch);
+  }
+
+  /** WP-3a: returns a cutoff PROVEN readable from a fresh fd (the highest
+   *  contiguous flushed prefix), plus a degraded flag when any write in this
+   *  epoch errored. Captures the pending-write promise SYNCHRONOUSLY before
+   *  yielding so a write racing the await cannot change the returned cutoff; a
+   *  write error settles the per-write promise (never rejects/hangs). Never
+   *  certifies a logical offset as durable. */
+  async logWriteBarrier(): Promise<{ cutoff: number; degraded: boolean }> {
+    const pending = this._lastWriteFlushed;   // synchronous capture
+    await pending;
+    return { cutoff: this._lastFlushedOffset, degraded: this._writeErrored };
+  }
+
+  /** WP-3a: atomically capture the in-memory ring text AND the current logical
+   *  PTY cursor in one synchronous step (call AFTER the live listener is
+   *  installed). Used only by degraded recovery, where `.log` byte offsets are
+   *  no longer a valid replay position. */
+  getRingSnapshot(): { text: string; logicalCutoff: number } {
+    return { text: this.outputRing.join('\n'), logicalCutoff: this.currentLogOffset };
+  }
+
   /** BUG-15: write the current ring contents to disk so the terminal viewer
    *  can recover scrollback after the runner has exited. Best-effort — any
    *  error is swallowed (the agent is being torn down anyway). */
   persistScrollback(): void {
+    // WP-1a: never recreate `.scrollback` once a delete is in flight — the
+    // reclaim pass has already (or is about to) unlink it.
+    if (this._deleting) return;
     if (!this._logPath) return;
     try {
       fs.writeFileSync(`${this._logPath}.scrollback`, this.outputRing.join('\n'));
@@ -307,16 +410,15 @@ export class WindowsRunner extends EventEmitter {
   }
 
   /** Return the last N lines from the in-memory ring buffer (instant, no disk I/O). */
-  captureOutput(lines = 50): string {
+  async captureOutput(lines = 50): Promise<string> {
     // If ring buffer is empty, fall back to log file for initial data
     if (this.outputRing.length === 0 && this.logStream) {
-      // Ring buffer empty — try reading last bytes from log file directly
+      // Ring buffer empty — read the tail of the log file directly.
+      // WP-2: bounded backward-paged reader (was a whole-file readFileSync).
       const logPath = (this.logStream as any).path as string;
-      if (logPath && fs.existsSync(logPath)) {
+      if (logPath) {
         try {
-          const content = fs.readFileSync(logPath, 'utf-8');
-          const allLines = content.split('\n');
-          return allLines.slice(-lines).join('\n');
+          return await readLastLines(logPath, lines);
         } catch { /* ignore */ }
       }
     }
@@ -362,6 +464,32 @@ export class WindowsRunner extends EventEmitter {
     });
     if (!exited) this.kill();
     return exited;
+  }
+
+  /** WP-1a delete-shutdown contract. Tears the runner down for a permanent
+   *  delete: blocks any later `persistScrollback()`, closes the log stream so
+   *  the OS releases the file handle before the reclaim pass unlinks it, then
+   *  kills the pty-host. Resolves only after the log stream has fully closed so
+   *  the caller can safely unlink `.log` immediately afterward. */
+  async disposeForDelete(): Promise<void> {
+    this._deleting = true;                 // blocks any later persistScrollback()
+    this._intentionalKill = true;
+    this._alive = false;
+    this.sendToHost({ type: 'kill' });
+    await this.closeLogStream();
+    if (this.host && !this.host.killed) this.host.kill();
+    this.host = null;
+  }
+
+  /** Settles exactly once on finish|close|error — never hangs delete on stream
+   *  failure. */
+  private closeLogStream(): Promise<void> {
+    return new Promise((resolve) => {
+      const s = this.logStream; this.logStream = null;
+      if (!s) return resolve();
+      let done = false; const fin = () => { if (!done) { done = true; resolve(); } };
+      s.once('finish', fin); s.once('close', fin); s.once('error', fin); s.end();
+    });
   }
 
   kill(): void {

@@ -1759,6 +1759,62 @@ export interface GitInitResult {
   detail?: string;
 }
 
+/** WP-3a: result of `terminal:attach`. `snapshotCutoff` is an atomic byte
+ *  offset into the append-only `.log` proven durable at attach time (live path:
+ *  the write barrier's contiguous flushed prefix; dead path: the file size).
+ *  `terminalEpoch` is the current epoch (null if never launched this process).
+ *  `degraded` is true when a log-write error this epoch invalidated the
+ *  offset↔file mapping — recovery uses the ring snapshot, not `.log` replay. */
+export interface TerminalAttachResult {
+  ok: boolean;
+  live?: boolean;
+  terminalEpoch?: string | null;
+  snapshotCutoff?: number;
+  degraded?: boolean;
+  error?: string;
+}
+
+/** WP-3a: exact byte range from an agent's `.log` (NO rune alignment). */
+export interface TerminalLogRange {
+  bytes: Uint8Array;
+  startOffset: number;
+  endOffset: number;
+  fileSize: number;
+}
+
+/** WP-3a: tail bytes from an agent's `.log`; head rune-aligned when truncated. */
+export interface TerminalLogTail {
+  bytes: Uint8Array;
+  startOffset: number;
+  endOffset: number;
+  truncated: boolean;
+}
+
+/** WP-3a: atomic ring-text + logical PTY cursor for degraded recovery. */
+export interface TerminalRingSnapshot {
+  text: string;
+  logicalCutoff: number;
+}
+
+/** WP-3b: a validated checkpoint returned by `terminal:load-checkpoint`.
+ *  `serialized` is the `@xterm/addon-serialize` buffer; `appliedOffset` is the
+ *  `.log` byte offset already reflected in it (the renderer resumes paging from
+ *  there). null (not this shape) means no valid checkpoint. */
+export interface TerminalCheckpointLoad {
+  serialized: string;
+  appliedOffset: number;
+}
+
+/** WP-3c: dead-agent replay snapshot with STRUCTURED truncation metadata.
+ *  `truncated` is true when earlier history was provably dropped (the bounded
+ *  `.scrollback` is smaller than the raw `.log`, or a no-scrollback `.log` tail
+ *  hit its byte budget) — the renderer surfaces it as a visible banner. */
+export interface TerminalDeadSnapshot {
+  text: string;
+  truncated: boolean;
+  retainedBytes: number;
+}
+
 export interface IpcApi {
   workspaces: {
     list: () => Promise<Workspace[]>;
@@ -1829,11 +1885,39 @@ export interface IpcApi {
     onContinuationPhaseChanged: (callback: (signal: ContinuationPhaseSignal) => void) => () => void;
   };
   terminal: {
-    attach: (agentId: string) => Promise<void>;
-    detach: (agentId: string) => Promise<void>;
+    // WP-3a: attach resolves to an atomic snapshot cutoff + epoch so the
+    // renderer's exact-once rehydrate knows which `.log` bytes are durable.
+    // `live:false` is a dead agent (no runner); `terminalEpoch` is null if the
+    // agent was never launched this process. `ok:false` carries `error`.
+    attach: (agentId: string) => Promise<TerminalAttachResult>;
+    // WP-3d: `expectedEpoch` scopes the detach — main no-ops it when a fresh
+    // reattach has already registered a listener under a newer epoch (an
+    // eviction under a retired epoch must not tear down the live one). Omitted
+    // by legacy callers ⇒ unconditional detach.
+    detach: (agentId: string, expectedEpoch?: string | null) => Promise<void>;
     write: (agentId: string, data: string) => Promise<void>;
     resize: (agentId: string, cols: number, rows: number) => Promise<void>;
-    onData: (callback: (agentId: string, data: string) => void) => () => void;
+    // WP-3a: `endOffset` is the chunk's logical end offset in the append-only
+    // `.log`. Optional so existing 2-arg callbacks stay compatible.
+    onData: (callback: (agentId: string, data: string, endOffset?: number) => void) => () => void;
+    // WP-3a: exact byte-range read (NO rune alignment; pages join losslessly).
+    readLogRange: (agentId: string, start: number, end: number) => Promise<TerminalLogRange>;
+    // WP-3a: tail up to `maxBytes` ending at `endExclusive` (default EOF),
+    // rune-aligned at the head when truncated.
+    readLogTail: (agentId: string, maxBytes: number, endExclusive?: number) => Promise<TerminalLogTail>;
+    // WP-3a: atomic ring-text + logical cursor from the LIVE runner (degraded
+    // recovery only). null when there is no live runner.
+    getRingSnapshot: (agentId: string) => Promise<TerminalRingSnapshot | null>;
+    // WP-3c: dead-agent replay snapshot (`.scrollback` else a capped `.log`
+    // tail) WITH truncation metadata, for the dead-reopen banner.
+    readDeadAgentSnapshot: (agentId: string) => Promise<TerminalDeadSnapshot>;
+    // WP-3b: persist a serialized xterm checkpoint on LRU eviction. Resolves
+    // false when main rejects it (stale epoch, or a degraded epoch whose
+    // offsets can't be trusted). Reload it on the next open.
+    saveCheckpoint: (agentId: string, epoch: string, serialized: string, appliedOffset: number) => Promise<boolean>;
+    // WP-3b: load the checkpoint for an exact-once rehydrate. Resolves null when
+    // no checkpoint matches the current epoch + attach cutoff.
+    loadCheckpoint: (agentId: string, snapshotCutoff: number) => Promise<TerminalCheckpointLoad | null>;
     // BUG-38: fired when a same-id PTY swap (continuation, manual restart,
     // auto-restart) replaces the runner. The renderer disposes the retired
     // xterm and re-attaches to the fresh PTY. Returns an unsubscribe fn.
