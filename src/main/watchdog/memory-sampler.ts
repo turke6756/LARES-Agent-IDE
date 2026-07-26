@@ -25,6 +25,12 @@ import {
 export interface MemorySamplerDeps {
   /** Platform commit reader; null ⇒ sampler failure this tick. */
   readCommit: () => CommitReading | null;
+  /** Main-process V8 heap reader (bytes) for the fail-CLOSED heap admission gate.
+   *  Required: unlike the commit reader this is a deterministic in-process V8 call
+   *  (`v8.getHeapStatistics()`), so any failure to obtain a valid reading DENIES
+   *  admission rather than failing open — a wiring regression must not silently
+   *  drop the safety net. */
+  readHeapStats: () => { heapUsed: number; heapSizeLimit: number };
   /** Registered live (non-terminal) agent count — local state, no telemetry. */
   getLiveAgentCount: () => number;
   /** Live agent tabs/views count. */
@@ -150,17 +156,24 @@ export class MemorySampler {
     return this.isCriticalPressure();
   }
 
-  /** Admission gate for a new agent launch. */
+  /** Admission gate for a new agent launch. Ordered static caps → heap → commit;
+   *  the first refusal wins so the caller receives exactly one machine-readable
+   *  code. */
   canLaunchAgent(): AdmissionDecision {
     const cap = this.staticCapDenial('agent-launch');
     if (cap) return cap;
+    const heap = this.heapDenial();
+    if (heap) return heap;
     return this.commitDenial() ?? { allowed: true };
   }
 
-  /** Admission gate for a new agent tab/view. */
+  /** Admission gate for a new agent tab/view. Same static caps → heap → commit
+   *  ordering as `canLaunchAgent`. */
   canOpenAgentTab(): AdmissionDecision {
     const cap = this.staticCapDenial('agent-tab');
     if (cap) return cap;
+    const heap = this.heapDenial();
+    if (heap) return heap;
     return this.commitDenial() ?? { allowed: true };
   }
 
@@ -204,6 +217,56 @@ export class MemorySampler {
         `System memory is under Critical commit pressure` +
         (pct !== null ? ` (${pct}% of commit limit)` : '') +
         `; refusing new agents/tabs until pressure clears. Wait and retry, or reap idle agents.`,
+    };
+  }
+
+  /** Fail-CLOSED main-process V8 heap gate. `v8.getHeapStatistics()` is a
+   *  deterministic in-process call that is expected to succeed, so — unlike the
+   *  fail-OPEN commit rule — ANY of a thrown read, a non-positive limit, a
+   *  non-finite value, or a negative `heapUsed` DENIES admission (refuses new
+   *  agents/tabs). A wiring regression must not silently drop this safety net.
+   *  A valid reading denies only at/above `heapAdmissionPercent`. */
+  private heapDenial(): AdmissionDecision | null {
+    let heapUsed: number;
+    let heapSizeLimit: number;
+    try {
+      const h = this.deps.readHeapStats();
+      heapUsed = h.heapUsed;
+      heapSizeLimit = h.heapSizeLimit;
+    } catch {
+      return this.heapUnavailableDenial();
+    }
+    if (
+      !Number.isFinite(heapUsed) ||
+      !Number.isFinite(heapSizeLimit) ||
+      heapSizeLimit <= 0 ||
+      heapUsed < 0
+    ) {
+      return this.heapUnavailableDenial();
+    }
+    const pct = (heapUsed / heapSizeLimit) * 100;
+    if (pct >= this.cfg.heapAdmissionPercent) {
+      const usedMiB = Math.round(heapUsed / (1024 * 1024));
+      const limitMiB = Math.round(heapSizeLimit / (1024 * 1024));
+      return {
+        allowed: false,
+        code: 'memory-heap',
+        reason:
+          `Main-process V8 heap is at ${round1(pct)}% (${usedMiB} MiB of ${limitMiB} MiB), ` +
+          `at/above the ${this.cfg.heapAdmissionPercent}% admission threshold; ` +
+          `refusing new agents/tabs until the main heap drains.`,
+      };
+    }
+    return null;
+  }
+
+  /** The single fail-closed refusal shape for an unusable heap reading. */
+  private heapUnavailableDenial(): AdmissionDecision {
+    return {
+      allowed: false,
+      code: 'memory-heap',
+      reason:
+        'Main-process V8 heap reading unavailable; refusing new agents/tabs (fail-closed safety net).',
     };
   }
 

@@ -5,7 +5,7 @@
 //   node dist/main/main/supervisor/session-log-dispatcher.test.js
 
 import assert from 'node:assert/strict';
-import { SessionLogDispatcher, type SessionStaleEvent } from './session-log-dispatcher';
+import { SessionLogDispatcher, truncateUtf8ToBytes, type SessionStaleEvent } from './session-log-dispatcher';
 import type { ChatLogReader, ChatLogReaderSession } from './log-readers/types';
 import type { AgentProvider } from '../../shared/types';
 import type {
@@ -614,6 +614,193 @@ test('21: validateClearSuccessor delegates to the claude reader, false when meth
   // No reader registered for the provider at all → false.
   const emptyDispatcher = new SessionLogDispatcher(() => []);
   assert.equal(emptyDispatcher.validateClearSuccessor('claude', 'C:\\repo', 'cur', 'good'), false);
+});
+
+// ── WP-1c: chat ring byte budget + per-event hard cap ──────────────────
+
+const RING_BUFFER_MAX = 2000;
+const RING_BYTE_BUDGET = 8 * 1024 * 1024;
+const EVENT_TEXT_HARD_CAP = 1 * 1024 * 1024;
+const TRUNC_MARKER = '\n…[truncated]';
+
+function assistantText(uuid: string, text: string): SessionEvent {
+  return {
+    type: 'assistant-text',
+    uuid,
+    timestamp: new Date().toISOString(),
+    agentId: 'agent-1',
+    text,
+  } as SessionEvent;
+}
+
+test('WP-1c: truncateUtf8ToBytes — ASCII prefix', () => {
+  assert.equal(truncateUtf8ToBytes('hello world', 5), 'hello');
+  assert.equal(truncateUtf8ToBytes('hello', 100), 'hello', 'under cap returns whole string');
+  assert.equal(truncateUtf8ToBytes('hello', 0), '', 'zero budget yields empty');
+});
+
+test('WP-1c: truncateUtf8ToBytes — multibyte BMP counted by bytes, never split', () => {
+  // Each U+3042 (あ) is 3 UTF-8 bytes. maxBytes=4 fits exactly one.
+  const s = 'あいう';
+  const out = truncateUtf8ToBytes(s, 4);
+  assert.equal(out, 'あ');
+  assert.ok(Buffer.byteLength(out, 'utf8') <= 4);
+  // maxBytes=5 still only one whole char (two would be 6 bytes) — no partial byte.
+  assert.equal(truncateUtf8ToBytes(s, 5), 'あ');
+});
+
+test('WP-1c: truncateUtf8ToBytes — never splits a surrogate pair near the boundary', () => {
+  // U+1F600 (😀) is 4 UTF-8 bytes / 2 UTF-16 code units.
+  const s = 'A😀'; // 1 + 4 = 5 bytes
+  // Budget lands inside the emoji: must drop it wholesale, keeping only 'A'.
+  const out4 = truncateUtf8ToBytes(s, 4);
+  assert.equal(out4, 'A', 'a boundary inside the pair backs off to before the high surrogate');
+  assert.ok(Buffer.byteLength(out4, 'utf8') <= 4);
+  const lastUnit = out4.charCodeAt(out4.length - 1);
+  assert.ok(!(lastUnit >= 0xd800 && lastUnit <= 0xdbff), 'result never ends on a lone high surrogate');
+  // Exactly enough bytes: the whole pair fits.
+  assert.equal(truncateUtf8ToBytes(s, 5), 'A😀');
+  // Two emoji, budget fits one pair only (second would need 8 bytes).
+  assert.equal(truncateUtf8ToBytes('😀😀', 5), '😀');
+});
+
+test('WP-1c: whole-turn eviction when BOTH count and byte thresholds are crossed', () => {
+  const { dispatcher, reader } = makeDispatcher();
+  // 700 turns × 3 events = 2100 events (> RING_BUFFER_MAX=2000) and ~13.5 MiB
+  // (> RING_BYTE_BUDGET=8 MiB): BOTH caps are crossed.
+  //
+  // WB-24: the turn shape is deliberately `[big(20 KB), small, small]` with an
+  // ODD event count. Under CORRECT whole-turn eviction the byte budget is the
+  // binding constraint and the surviving head lands on a turn start (`#0`),
+  // with the ring length a multiple of 3. Under a naive per-EVENT eviction the
+  // budget is satisfied right after dropping some turn's big `#0` element,
+  // leaving that turn's `#1`/`#2` fragment at the head — so `head.uuid` ends
+  // `#1` and the length is not a multiple of 3. Only whole-turn eviction yields
+  // the asserted shape (a uniform 2-event fixture would let the even count-cap
+  // boundary satisfy the assertion regardless — the reason this fixture is odd).
+  const big = 'x'.repeat(20000);
+  const turns = 700;
+  for (let i = 0; i < turns; i++) {
+    reader.queue.push(assistantText(`t${i}#0`, big));
+    reader.queue.push(assistantText(`t${i}#1`, 'y'));
+    reader.queue.push(assistantText(`t${i}#2`, 'z'));
+  }
+  dispatcher.pollNow();
+
+  const buf = (dispatcher as any).eventsByAgent.get('agent-1') as SessionEvent[];
+  const bytes = (dispatcher as any).ringBytesByAgent.get('agent-1') as number;
+  const sizes = (dispatcher as any).ringEventBytes.get('agent-1') as number[];
+
+  assert.ok(buf.length <= RING_BUFFER_MAX, `count within cap (${buf.length})`);
+  assert.ok(bytes <= RING_BYTE_BUDGET, `bytes within budget (${bytes})`);
+  assert.equal(sizes.length, buf.length, 'ringEventBytes stays aligned with the ring');
+  assert.equal(dispatcher.getCachedEvents('agent-1').truncated, true, 'truncated flag set');
+
+  // The surviving ring starts at a turn boundary and holds only whole 3-event
+  // turns — no partial-turn fragment was left at the head.
+  assert.ok(buf[0].uuid.endsWith('#0'), `head is a turn start (${buf[0].uuid})`);
+  assert.equal(buf.length % 3, 0, 'only whole 3-event turns survive');
+  for (let j = 0; j < buf.length; j += 3) {
+    const prefix = buf[j].uuid.split('#')[0];
+    assert.ok(buf[j].uuid.endsWith('#0'), `turn start at index ${j} (${buf[j].uuid})`);
+    assert.ok(buf[j + 1].uuid.endsWith('#1'), `same turn at ${j + 1} (${buf[j + 1].uuid})`);
+    assert.ok(buf[j + 2].uuid.endsWith('#2'), `same turn at ${j + 2} (${buf[j + 2].uuid})`);
+    assert.equal(buf[j + 1].uuid.split('#')[0], prefix, 'events share the turn id');
+    assert.equal(buf[j + 2].uuid.split('#')[0], prefix, 'events share the turn id');
+  }
+});
+
+test('WP-1c: multibyte payload counted by bytes, not characters', () => {
+  const { dispatcher, reader } = makeDispatcher();
+  const N = 100;
+  reader.queue.push(assistantText('ascii#0', 'a'.repeat(N))); // N bytes
+  reader.queue.push(assistantText('multi#0', 'あ'.repeat(N))); // 3N bytes
+  dispatcher.pollNow();
+  const sizes = (dispatcher as any).ringEventBytes.get('agent-1') as number[];
+  // Difference is purely the byte delta (2 extra bytes per multibyte char),
+  // independent of the fixed per-event overhead.
+  assert.equal(sizes[1] - sizes[0], 2 * N, 'byte accounting, not char count');
+});
+
+test('WP-1c: oversized assistant text (>1 MiB) — cache truncated, live batch untouched', () => {
+  const { dispatcher, reader, emitted } = makeDispatcher();
+  const big = 'x'.repeat(Math.floor(1.5 * 1024 * 1024)); // 1.5 MiB
+  const ev = assistantText('big#0', big);
+  reader.queue.push(ev);
+  dispatcher.pollNow();
+
+  // Live 'chat-events' batch carries the ORIGINAL, untruncated object.
+  assert.equal(emitted.length, 1);
+  const live = emitted[0].events[0] as any;
+  assert.equal(Buffer.byteLength(live.text, 'utf8'), big.length, 'live text is not truncated');
+  assert.strictEqual(live, ev, 'batch delivers the original object reference');
+
+  // Cached ring copy is a DIFFERENT object, truncated to <= 1 MiB incl. marker.
+  const cached = dispatcher.getCachedEvents('agent-1').events[0] as any;
+  assert.notStrictEqual(cached, ev, 'ring copy is a clone, not the original');
+  assert.ok(Buffer.byteLength(cached.text, 'utf8') <= EVENT_TEXT_HARD_CAP, 'ring text <= 1 MiB');
+  assert.ok(cached.text.endsWith(TRUNC_MARKER), 'ring text ends with the truncation marker');
+});
+
+test('WP-1c: event under the cap is stored by identity (no clone)', () => {
+  const { dispatcher, reader } = makeDispatcher();
+  const ev = assistantText('small#0', 'just a little text');
+  reader.queue.push(ev);
+  dispatcher.pollNow();
+  const cached = dispatcher.getCachedEvents('agent-1').events[0];
+  assert.strictEqual(cached, ev, 'sub-cap events are stored by original reference');
+});
+
+test('WP-1c: oversized tool-use.input — live delivery intact, cache evicts it', () => {
+  const { dispatcher, reader, emitted } = makeDispatcher();
+  const toolUses: SessionEvent[] = [];
+  dispatcher.on('tool-use', (e) => toolUses.push(e));
+
+  const oversized = {
+    type: 'tool-use',
+    uuid: 'tu#0',
+    timestamp: new Date().toISOString(),
+    agentId: 'agent-1',
+    toolUseId: 'tu-0',
+    toolName: 'Write',
+    input: { data: 'x'.repeat(9 * 1024 * 1024) }, // > RING_BYTE_BUDGET
+  } as SessionEvent;
+  reader.queue.push(oversized);
+  dispatcher.pollNow();
+
+  // Both live fan-outs receive the ORIGINAL, unmodified object.
+  assert.strictEqual(emitted[0].events[0], oversized, "'chat-events' gets the original");
+  assert.equal(toolUses.length, 1);
+  assert.strictEqual(toolUses[0], oversized, "'tool-use' fan-out gets the original");
+  assert.equal((oversized as any).input.data.length, 9 * 1024 * 1024, 'input never truncated');
+
+  // The cache evicts the oversized single-event turn entirely.
+  assert.equal(dispatcher.getCachedEvents('agent-1').events.length, 0, 'evicted from the ring');
+  assert.equal((dispatcher as any).ringBytesByAgent.get('agent-1'), 0, 'ring byte total back to 0');
+});
+
+test('WP-1c: ringBytesByAgent / ringEventBytes reset on rebindAgent and forgetAgent', () => {
+  // rebind
+  {
+    const { dispatcher, reader } = makeDispatcher();
+    reader.queue.push(assistantText('r#0', 'seed'));
+    dispatcher.pollNow();
+    assert.ok((dispatcher as any).ringBytesByAgent.has('agent-1'));
+    assert.ok((dispatcher as any).ringEventBytes.has('agent-1'));
+    dispatcher.rebindAgent('agent-1');
+    assert.equal((dispatcher as any).ringBytesByAgent.has('agent-1'), false, 'rebind clears byte total');
+    assert.equal((dispatcher as any).ringEventBytes.has('agent-1'), false, 'rebind clears size array');
+  }
+  // forget
+  {
+    const { dispatcher, reader } = makeDispatcher();
+    reader.queue.push(assistantText('f#0', 'seed'));
+    dispatcher.pollNow();
+    assert.ok((dispatcher as any).ringBytesByAgent.has('agent-1'));
+    dispatcher.forgetAgent('agent-1');
+    assert.equal((dispatcher as any).ringBytesByAgent.has('agent-1'), false, 'forget clears byte total');
+    assert.equal((dispatcher as any).ringEventBytes.has('agent-1'), false, 'forget clears size array');
+  }
 });
 
 // ── Runner ───────────────────────────────────────────────────────────

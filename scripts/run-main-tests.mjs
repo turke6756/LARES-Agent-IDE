@@ -38,6 +38,9 @@ const TESTS = [
   'dist/main/main/supervisor/turn-completion-tracker.test.js',
   'dist/main/shared/send-outcome-copy.test.js',
   'dist/main/main/supervisor/agent-chat-history.test.js',
+  // Memory-hardening WP-4: getMessages(limit:1) two-scan short-circuit —
+  // parity vs the full path, non-contiguity, user precedence, tool-only skip.
+  'dist/main/main/supervisor/agent-chat-service.test.js',
   'dist/main/main/supervisor/claude-clear-rotation.test.js',
   'dist/main/main/supervisor/claude-clear-rotation-integration.test.js',
   'dist/main/main/supervisor/claude-clear-rotation-supervisor.test.js',
@@ -67,6 +70,9 @@ const TESTS = [
   'dist/main/main/watchdog/attribution.test.js',
   'dist/main/main/watchdog/attribution-service.test.js',
   'dist/main/main/watchdog/system-memory-view.test.js',
+  // Memory-hardening WP-2: fail-CLOSED main-process V8 heap admission gate —
+  // 85% boundary, NaN/zero-limit/negative/thrown fail-closed, caps→heap→commit.
+  'dist/main/main/watchdog/memory-sampler.test.js',
   'dist/main/main/database.active-agents.test.js',
   // Git-Native WP-A0: turn_records + recovery_operations schema/accessors.
   'dist/main/main/turn-records.test.js',

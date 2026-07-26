@@ -12,6 +12,16 @@ export interface JsonlFileActivity {
   operation: FileOperation;
 }
 
+// WP-1b (memory hardening P1): cap grow-forever per-agent/global structures with
+// insertion-ordered Set/Map eviction (oldest-first FIFO). A Set/Map preserves
+// insertion order, so `values()/keys().next().value` is always the oldest live
+// entry — no parallel order arrays needed. 6000 matches the reader/dispatcher
+// dedup windows; eviction beyond the window can at worst re-emit one duplicate,
+// the accepted bounded-dedup tradeoff vs unbounded growth.
+const SEEN_UUID_MAX = 6000;
+const SEEN_FILES_MAX = 6000;
+const PENDING_SHELL_MAX = 6000;
+
 const TOOL_MAP: Record<string, FileOperation> = {
   // Claude
   'Read': 'read',
@@ -146,6 +156,12 @@ export class ContextStatsMonitor extends EventEmitter {
     }
     if (seen.has(e.uuid)) return;
     seen.add(e.uuid);
+    // WP-1b: insertion-ordered eviction — drop the oldest UUIDs past the cap.
+    while (seen.size > SEEN_UUID_MAX) {
+      const oldest = seen.values().next().value;
+      if (oldest === undefined) break;
+      seen.delete(oldest);
+    }
 
     let stats = this.stats.get(e.agentId);
     if (!stats) {
@@ -197,6 +213,14 @@ export class ContextStatsMonitor extends EventEmitter {
       }
       if (parsed.length > 0) {
         this.pendingShellActivity.set(`${e.agentId}:${e.toolUseId}`, parsed);
+        // WP-1b: global FIFO cap. pendingShellActivity grows forever when a
+        // matching tool-result never arrives; bound it by evicting the oldest
+        // pending entries (insertion-ordered Map keys).
+        while (this.pendingShellActivity.size > PENDING_SHELL_MAX) {
+          const oldest = this.pendingShellActivity.keys().next().value;
+          if (oldest === undefined) break;
+          this.pendingShellActivity.delete(oldest);
+        }
       }
       return;
     }
@@ -239,6 +263,12 @@ export class ContextStatsMonitor extends EventEmitter {
     const key = JSON.stringify([toolUseId, operation, filePath]);
     if (seen.has(key)) return;
     seen.add(key);
+    // WP-1b: insertion-ordered eviction — drop the oldest keys past the cap.
+    while (seen.size > SEEN_FILES_MAX) {
+      const oldest = seen.values().next().value;
+      if (oldest === undefined) break;
+      seen.delete(oldest);
+    }
 
     this.emit('fileActivity', { agentId, filePath, operation } as JsonlFileActivity);
   }

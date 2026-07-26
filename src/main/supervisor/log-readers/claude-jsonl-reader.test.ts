@@ -528,6 +528,351 @@ test('P2: readSessionEventsOnce does not advance tail offsets (no subscription/o
   assert.equal((reader as any).partialLines.size, 0, 'no partialLines written');
 });
 
+// ── Fix 2: bounded session-log reads ─────────────────────────────────
+//
+// See docs/internal/SESSION_LOG_READ_FIX_PROPOSAL.md. 2a (seek-to-tail + chunk
+// cap in pollSession), 2b (tail-bounded readSessionEventsOnce + preview cache),
+// 2c (session-id-first resolution, never a wrong sibling in a shared slug dir).
+
+const MAX_POLL_READ_BYTES = 4 * 1024 * 1024;   // mirror of the source constant
+const OFFSET_CATCHUP_BYTES = 256 * 1024;        // mirror of the source constant
+const MAX_TERMINAL_READ_BYTES = 2 * 1024 * 1024; // mirror of the source constant
+
+function assistantLine(uuid: string, text: string): object {
+  return {
+    type: 'assistant', uuid, timestamp: '2026-07-25T00:00:00.000Z',
+    message: { model: 'claude-opus', stop_reason: 'end_turn', content: [{ type: 'text', text }] },
+  };
+}
+
+/** Write `head` lines, then ignorable filler until the file reaches ~`targetBytes`,
+ *  then `tail` lines. Filler is valid JSON of an unknown type (emits no events),
+ *  so any event in the parse came from head or tail — letting a test prove which
+ *  region was actually read. Returns the path (caller unlinks). */
+function writeSizedFixture(head: object[], targetBytes: number, tail: object[]): string {
+  const tmpPath = path.join(os.tmpdir(), `claude-jsonl-big-${Date.now()}-${Math.random()}.jsonl`);
+  const headText = head.map(l => JSON.stringify(l)).join('\n') + '\n';
+  const tailText = tail.map(l => JSON.stringify(l)).join('\n') + '\n';
+  fs.writeFileSync(tmpPath, headText);
+  const fillerLine = JSON.stringify({ type: 'filler', pad: 'x'.repeat(240) }) + '\n';
+  const fillerBytes = Buffer.byteLength(fillerLine);
+  const budget = targetBytes - Buffer.byteLength(headText) - Buffer.byteLength(tailText);
+  const count = Math.max(0, Math.ceil(budget / fillerBytes));
+  fs.appendFileSync(tmpPath, fillerLine.repeat(count));
+  fs.appendFileSync(tmpPath, tailText);
+  return tmpPath;
+}
+
+test('2a: lost/absent offset resumes at the tail — no from-zero replay of old history', () => {
+  // File larger than the catch-up window with an OLD marker at byte 0 and a NEW
+  // marker in the last window. A fresh poll (no stored offset) must surface only
+  // NEW; the whole-file-from-zero read would have surfaced OLD too.
+  const tmpPath = writeSizedFixture(
+    [assistantLine('old-1', 'OLD_MARKER')],
+    OFFSET_CATCHUP_BYTES * 2,
+    [assistantLine('new-1', 'NEW_MARKER')],
+  );
+  try {
+    const reader = makeReader(tmpPath);
+    const events = reader.pollSession(makeSession());
+    const texts = events.filter(e => e.type === 'assistant-text').map((e: any) => e.text);
+    assert.ok(texts.includes('NEW_MARKER'), 'tail event surfaced');
+    assert.ok(!texts.includes('OLD_MARKER'), 'byte-0 history NOT replayed');
+    // Offset seeded near the tail, not 0.
+    const off = (reader as any).fileOffsets.get(tmpPath);
+    assert.ok(off >= fs.statSync(tmpPath).size - OFFSET_CATCHUP_BYTES, 'offset seeded at tail window');
+  } finally {
+    fs.unlinkSync(tmpPath);
+  }
+});
+
+test('2a: invalidatePath then re-poll resumes at tail (rebind does not gulp history)', () => {
+  const tmpPath = writeSizedFixture(
+    [assistantLine('old-2', 'OLD_MARKER')],
+    OFFSET_CATCHUP_BYTES * 2,
+    [assistantLine('new-2', 'NEW_MARKER')],
+  );
+  try {
+    const reader = makeReader(tmpPath);
+    reader.pollSession(makeSession());        // initial tail bind
+    reader.invalidatePath('test-agent');       // rebind / /clear / continuation
+    // Re-seed resolvedPaths (invalidatePath dropped it) the way a live rebind
+    // would re-resolve, then poll again.
+    (reader as any).resolvedPaths.set('test-agent', tmpPath);
+    const events = reader.pollSession(makeSession());
+    const texts = events.filter(e => e.type === 'assistant-text').map((e: any) => e.text);
+    assert.ok(!texts.includes('OLD_MARKER'), 'post-rebind poll does not re-read byte-0 history');
+  } finally {
+    fs.unlinkSync(tmpPath);
+  }
+});
+
+test('2a: a single poll read is capped at MAX_POLL_READ_BYTES; catch-up spans ticks', () => {
+  // A >4 MiB backlog with a stored offset of 0 (simulating a genuinely-behind
+  // tailer). One poll advances by at most the cap, not to EOF.
+  const tmpPath = writeSizedFixture(
+    [assistantLine('h-1', 'HEAD')],
+    MAX_POLL_READ_BYTES + 512 * 1024,
+    [assistantLine('t-1', 'TAIL')],
+  );
+  try {
+    const fileSize = fs.statSync(tmpPath).size;
+    assert.ok(fileSize > MAX_POLL_READ_BYTES, 'precondition: backlog exceeds the cap');
+    const reader = makeReader(tmpPath);
+    (reader as any).fileOffsets.set(tmpPath, 0); // stored (not absent) → no tail-seek
+
+    reader.pollSession(makeSession());
+    const afterFirst = (reader as any).fileOffsets.get(tmpPath);
+    assert.equal(afterFirst, MAX_POLL_READ_BYTES, 'first poll advanced by exactly the cap');
+    assert.ok(afterFirst < fileSize, 'still behind after one poll');
+
+    reader.pollSession(makeSession());
+    const afterSecond = (reader as any).fileOffsets.get(tmpPath);
+    assert.equal(afterSecond, fileSize, 'second poll consumed the remainder');
+  } finally {
+    fs.unlinkSync(tmpPath);
+  }
+});
+
+test('2b: readSessionEventsOnce reads only the tail of a large prior session', () => {
+  const root = makeProjectsRoot();
+  const sid = 'big-prior';
+  const slugDir = path.join(root, ROTATION_SLUG);
+  fs.mkdirSync(slugDir, { recursive: true });
+  const p = path.join(slugDir, `${sid}.jsonl`);
+  // Build directly at this path so locateSessionFile finds it by slug.
+  const built = writeSizedFixture(
+    [assistantLine('old-b', 'OLD_MARKER')],
+    MAX_TERMINAL_READ_BYTES + 512 * 1024,
+    [assistantLine('new-b', 'NEW_MARKER')],
+  );
+  fs.copyFileSync(built, p);
+  fs.unlinkSync(built);
+  try {
+    const reader = makeRotationReader(root);
+    const events = reader.readSessionEventsOnce(ROTATION_WORKDIR, sid);
+    assert.ok(events, 'located + parsed');
+    const texts = events!.filter(e => e.type === 'assistant-text').map((e: any) => e.text);
+    assert.ok(texts.includes('NEW_MARKER'), 'tail event present');
+    assert.ok(!texts.includes('OLD_MARKER'), 'head beyond the tail window not read');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('2b: preview cache hit — repeated read of a frozen file returns the cached parse, no re-parse', () => {
+  const root = makeProjectsRoot();
+  const sid = 'cached-prior';
+  writeSlugFile(root, sid, [
+    assistantLine('c-1', 'CACHED_REPLY'),
+  ], BASE_MS);
+  const reader = makeRotationReader(root);
+
+  const first = reader.readSessionEventsOnce(ROTATION_WORKDIR, sid);
+  assert.ok(first && first.length > 0, 'first read parsed');
+  const second = reader.readSessionEventsOnce(ROTATION_WORKDIR, sid);
+  // A re-parse would allocate a fresh array; identical reference proves the
+  // (size,mtime) cache short-circuited the read + parse.
+  assert.strictEqual(second, first, 'same (size,mtime) → cached array returned, not re-parsed');
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('2b: preview cache re-reads when the file grows (size/mtime signature changes)', () => {
+  const root = makeProjectsRoot();
+  const sid = 'growing-prior';
+  const p = writeSlugFile(root, sid, [assistantLine('g-1', 'FIRST')], BASE_MS);
+  const reader = makeRotationReader(root);
+
+  const first = reader.readSessionEventsOnce(ROTATION_WORKDIR, sid);
+  assert.ok(first!.some((e: any) => e.type === 'assistant-text' && e.text === 'FIRST'));
+
+  // Append a new turn and bump mtime so the (size,mtime) signature differs.
+  fs.appendFileSync(p, JSON.stringify(assistantLine('g-2', 'SECOND')) + '\n');
+  const bump = (BASE_MS + 60_000) / 1000;
+  fs.utimesSync(p, bump, bump);
+
+  const second = reader.readSessionEventsOnce(ROTATION_WORKDIR, sid);
+  const texts = second!.filter(e => e.type === 'assistant-text').map((e: any) => e.text);
+  assert.ok(texts.includes('SECOND'), 'grown content re-read, not served stale from cache');
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('2c: fresh worker binds to its OWN session file, never a large sibling in the shared slug', () => {
+  const root = makeProjectsRoot();
+  const ownSid = 'own-fresh';
+  const siblingSid = 'sibling-huge';
+  // The shared slug dir holds the fresh worker's own (empty-ish) file AND a
+  // large sibling belonging to another agent in the same cwd (shared-cwd
+  // invariant). Resolution must pick the id-named own file.
+  writeSlugFile(root, ownSid, [{ type: 'system', uuid: 'own-sys', model: 'm' }], BASE_MS);
+  const built = writeSizedFixture(
+    [assistantLine('sib-1', 'SIBLING_DATA')],
+    MAX_TERMINAL_READ_BYTES + 256 * 1024,
+    [assistantLine('sib-2', 'SIBLING_TAIL')],
+  );
+  const siblingPath = path.join(root, ROTATION_SLUG, `${siblingSid}.jsonl`);
+  fs.copyFileSync(built, siblingPath);
+  fs.unlinkSync(built);
+
+  const reader = makeRotationReader(root);
+  const events = reader.pollSession(eofSession('fresh-agent', ownSid, true));
+  const resolved = (reader as any).resolvedPaths.get('fresh-agent') as string;
+  assert.ok(resolved.endsWith(`${ownSid}.jsonl`), `bound own file, got ${resolved}`);
+  // Its own file has only a system entry → no assistant text from the sibling.
+  const texts = events.filter(e => e.type === 'assistant-text').map((e: any) => e.text);
+  assert.ok(!texts.includes('SIBLING_DATA') && !texts.includes('SIBLING_TAIL'), 'no sibling content bled in');
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('2c: an empty session id does not bind any file (no guess in a shared slug dir)', () => {
+  const root = makeProjectsRoot();
+  // A file exists in the slug dir, but the agent has no session id yet.
+  writeSlugFile(root, 'someone-else', [assistantLine('x-1', 'NOT_MINE')], BASE_MS);
+  const reader = makeRotationReader(root);
+  const events = reader.pollSession(eofSession('idless-agent', '', true));
+  assert.deepEqual(events, [], 'no id → no events');
+  assert.equal((reader as any).resolvedPaths.has('idless-agent'), false, 'no path bound');
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+// ── WP-1a: cap grow-forever per-agent structures + invalidatePath cleanup ──
+//
+// The reader accretes per-agent dedup/location state (seenEntryUuids,
+// toolResultLocations/toolResultOrder, emittedSystemInit) that previously grew
+// forever and was never released on terminal. These caps bound it and
+// invalidatePath (the only path forgetAgent reaches the reader by) clears it.
+
+const SEEN_ENTRY_UUID_MAX = 6000;                 // mirror of the source constant
+const TOOL_RESULT_LOCATIONS_MAX_PER_AGENT = 2000; // mirror of the source constant
+
+/** Feed one entry through the (private) parseEntry with byte offsets. */
+function feed(reader: ClaudeJsonlReader, session: ChatLogReaderSession, jsonlPath: string,
+             entry: object, startOffset: number, endOffset: number): any[] {
+  const out: any[] = [];
+  (reader as any).parseEntry(session, jsonlPath, entry, startOffset, endOffset, out);
+  return out;
+}
+
+function userEntry(uuid: string, text: string): object {
+  return { type: 'user', uuid, message: { content: text } };
+}
+
+function toolResultEntry(uuid: string, toolUseId: string, content: string): object {
+  return { type: 'user', uuid, message: { content: [{ type: 'tool_result', tool_use_id: toolUseId, content }] } };
+}
+
+test('WP-1a: seenEntryUuids caps at 6,000 (newest retained, oldest evicted)', () => {
+  const reader = new ClaudeJsonlReader();
+  const session = makeSession();
+  for (let n = 0; n < SEEN_ENTRY_UUID_MAX + 5; n++) {
+    feed(reader, session, 'p.jsonl', userEntry(`u-${n}`, 'x'), 0, 1);
+  }
+  const seen = (reader as any).seenEntryUuids.get('test-agent') as Set<string>;
+  assert.equal(seen.size, SEEN_ENTRY_UUID_MAX, 'capped at the max');
+  assert.ok(!seen.has('u-0'), 'oldest UUID evicted');
+  assert.ok(!seen.has('u-4'), 'the 5 oldest evicted');
+  assert.ok(seen.has(`u-${SEEN_ENTRY_UUID_MAX + 4}`), 'newest UUID retained');
+});
+
+test('WP-1a: toolResultLocations per-agent cap ≤ 2,000; a second agent unaffected (per-agent, not global)', () => {
+  const reader = new ClaudeJsonlReader();
+  const a1 = makeSession({ agentId: 'agent-1' });
+  const a2 = makeSession({ agentId: 'agent-2' });
+  const over = TOOL_RESULT_LOCATIONS_MAX_PER_AGENT + 50;
+  for (let n = 0; n < over; n++) {
+    feed(reader, a1, 'p.jsonl', toolResultEntry(`a1-u-${n}`, `a1-tu-${n}`, 'r'), 0, 1);
+  }
+  // A handful for a second agent in the same reader.
+  for (let n = 0; n < 5; n++) {
+    feed(reader, a2, 'p.jsonl', toolResultEntry(`a2-u-${n}`, `a2-tu-${n}`, 'r'), 0, 1);
+  }
+  const order1 = (reader as any).toolResultOrder.get('agent-1') as Set<string>;
+  const order2 = (reader as any).toolResultOrder.get('agent-2') as Set<string>;
+  assert.equal(order1.size, TOOL_RESULT_LOCATIONS_MAX_PER_AGENT, 'agent-1 order capped');
+
+  const locs = (reader as any).toolResultLocations as Map<string, unknown>;
+  const a1Keys = [...locs.keys()].filter(k => k.startsWith('agent-1:'));
+  const a2Keys = [...locs.keys()].filter(k => k.startsWith('agent-2:'));
+  assert.equal(a1Keys.length, TOOL_RESULT_LOCATIONS_MAX_PER_AGENT, 'agent-1 locations capped');
+  assert.equal(order2.size, 5, 'agent-2 order untouched by agent-1 eviction');
+  assert.equal(a2Keys.length, 5, 'agent-2 locations untouched (per-agent, not global)');
+  // The oldest agent-1 anchors are the ones evicted.
+  assert.ok(!locs.has('agent-1:a1-tu-0'), 'oldest agent-1 anchor evicted');
+  assert.ok(locs.has(`agent-1:a1-tu-${over - 1}`), 'newest agent-1 anchor retained');
+});
+
+test('WP-1a: anchor recency refresh keeps the live value retrievable through eviction', async () => {
+  const cap = TOOL_RESULT_LOCATIONS_MAX_PER_AGENT;
+  // Write a real one-line fixture for the KEPT anchor so getFullToolResult can
+  // read it back from disk at offsets [0, lineBytes).
+  const keepLine = JSON.stringify(toolResultEntry('keep-u', 'tu-KEEP', 'KEPT_RESULT'));
+  const tmpPath = path.join(os.tmpdir(), `claude-jsonl-refresh-${Date.now()}-${Math.random()}.jsonl`);
+  fs.writeFileSync(tmpPath, keepLine + '\n');
+  const keepBytes = Buffer.byteLength(keepLine, 'utf-8');
+  try {
+    const reader = new ClaudeJsonlReader();
+    const session = makeSession();
+    const keepEntry = JSON.parse(keepLine);
+
+    // 1) Insert KEEP (oldest), then cap-1 fillers → order full, KEEP is oldest.
+    feed(reader, session, tmpPath, { ...keepEntry, uuid: 'keep-0' }, 0, keepBytes);
+    for (let n = 0; n < cap - 1; n++) {
+      feed(reader, session, 'other.jsonl', toolResultEntry(`f1-u-${n}`, `f1-tu-${n}`, 'r'), 0, 1);
+    }
+    // 2) Refresh KEEP with a fresh entry uuid (same tool_use_id) → moves it to newest.
+    feed(reader, session, tmpPath, { ...keepEntry, uuid: 'keep-1' }, 0, keepBytes);
+    // 3) Push cap-1 more distinct fillers → evicts the pre-refresh fillers, not KEEP.
+    for (let n = 0; n < cap - 1; n++) {
+      feed(reader, session, 'other.jsonl', toolResultEntry(`f2-u-${n}`, `f2-tu-${n}`, 'r'), 0, 1);
+    }
+
+    const locs = (reader as any).toolResultLocations as Map<string, unknown>;
+    assert.ok(locs.has('test-agent:tu-KEEP'), 'refreshed anchor survived eviction');
+    const result = await reader.getFullToolResult('test-agent', 'tu-KEEP');
+    assert.equal(result, 'KEPT_RESULT', 'live value still retrievable (no premature deletion)');
+  } finally {
+    fs.unlinkSync(tmpPath);
+  }
+});
+
+test('WP-1a: rebind correctness — after invalidatePath a reused UUID is emitted again (not suppressed)', () => {
+  const reader = new ClaudeJsonlReader();
+  const session = makeSession();
+  const first = feed(reader, session, 'p.jsonl', userEntry('dup', 'hello'), 0, 1);
+  assert.equal(first.filter(e => e.type === 'user-text').length, 1, 'first emit');
+  const again = feed(reader, session, 'p.jsonl', userEntry('dup', 'hello'), 0, 1);
+  assert.equal(again.length, 0, 'same UUID suppressed within the window');
+
+  reader.invalidatePath('test-agent');
+  const afterRebind = feed(reader, session, 'p.jsonl', userEntry('dup', 'hello'), 0, 1);
+  assert.equal(afterRebind.filter(e => e.type === 'user-text').length, 1,
+    'reused UUID re-emitted after invalidatePath (rebound rollout not UUID-suppressed)');
+});
+
+test('WP-1a: terminal release — invalidatePath empties every agent-owned map (assert private maps directly)', () => {
+  const reader = new ClaudeJsonlReader();
+  const session = makeSession();
+  feed(reader, session, 'p.jsonl', { type: 'system', uuid: 's-0', model: 'm' }, 0, 1);
+  feed(reader, session, 'p.jsonl', toolResultEntry('u-0', 'tu-0', 'r'), 0, 1);
+  feed(reader, session, 'p.jsonl', userEntry('u-1', 'hi'), 0, 1);
+
+  // Pre-condition: every agent-owned map carries this agent (read the raw stores,
+  // WB-20 — no allocating accessor manufactures the state).
+  assert.ok((reader as any).seenEntryUuids.has('test-agent'), 'pre: seenEntryUuids');
+  assert.ok((reader as any).emittedSystemInit.has('test-agent'), 'pre: emittedSystemInit');
+  assert.ok((reader as any).toolResultOrder.has('test-agent'), 'pre: toolResultOrder');
+  assert.ok([...(reader as any).toolResultLocations.keys()].some((k: string) => k.startsWith('test-agent:')),
+    'pre: toolResultLocations');
+
+  reader.invalidatePath('test-agent');
+
+  assert.equal((reader as any).seenEntryUuids.has('test-agent'), false, 'seenEntryUuids cleared');
+  assert.equal((reader as any).emittedSystemInit.has('test-agent'), false, 'emittedSystemInit cleared');
+  assert.equal((reader as any).toolResultOrder.has('test-agent'), false, 'toolResultOrder cleared');
+  assert.equal([...(reader as any).toolResultLocations.keys()].filter((k: string) => k.startsWith('test-agent:')).length, 0,
+    'agent-prefixed toolResultLocations cleared');
+});
+
 // ── Runner ───────────────────────────────────────────────────────────
 
 (async () => {

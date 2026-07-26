@@ -24,9 +24,20 @@ function readingAtPercent(pct: number): CommitReading {
   };
 }
 
+/** Heap injection: a concrete reading, or the sentinel 'throw' to make the
+ *  reader throw (exercising the fail-closed thrown-read branch). */
+type HeapInject = { heapUsed: number; heapSizeLimit: number } | 'throw';
+const MiB = 1024 ** 2;
+/** A heap reading at a given percent of a fixed 4 GiB limit. */
+function heapAtPercent(pct: number): { heapUsed: number; heapSizeLimit: number } {
+  const heapSizeLimit = 4096 * MiB;
+  return { heapUsed: (pct / 100) * heapSizeLimit, heapSizeLimit };
+}
+
 interface Harness {
   sampler: MemorySampler;
   setPercent(pct: number | null): void;
+  setHeap(h: HeapInject): void;
   setCounts(c: Partial<{ agents: number; procs: number; views: number; appBytes: number }>): void;
   setTime(t: number): void;
   logs: string[];
@@ -35,10 +46,17 @@ interface Harness {
 function makeHarness(config?: MemorySamplerDeps['config']): Harness {
   let pct: number | null = 10;
   let t = 1_000_000;
+  // Default heap: comfortably below any admission threshold so the pre-existing
+  // tests (which never touch heap) keep admitting.
+  let heap: HeapInject = heapAtPercent(5);
   const counts = { agents: 0, procs: 10, views: 0, appBytes: 0 };
   const logs: string[] = [];
   const deps: MemorySamplerDeps = {
     readCommit: () => (pct === null ? null : readingAtPercent(pct)),
+    readHeapStats: () => {
+      if (heap === 'throw') throw new Error('v8 heap read boom');
+      return heap;
+    },
     getLiveAgentCount: () => counts.agents,
     getAgentViewCount: () => counts.views,
     getElectronProcessCount: () => counts.procs,
@@ -51,6 +69,7 @@ function makeHarness(config?: MemorySamplerDeps['config']): Harness {
   return {
     sampler,
     setPercent: (p) => { pct = p; },
+    setHeap: (h) => { heap = h; },
     setCounts: (c) => Object.assign(counts, c),
     setTime: (nt) => { t = nt; },
     logs,
@@ -172,6 +191,7 @@ test('snapshot carries app process/agent/view counts and fires onSnapshot', () =
   let pct: number | null = 55;
   const sampler = new MemorySampler({
     readCommit: () => (pct === null ? null : readingAtPercent(pct)),
+    readHeapStats: () => heapAtPercent(5),
     getLiveAgentCount: () => counts.agents,
     getAgentViewCount: () => counts.views,
     getElectronProcessCount: () => counts.procs,
@@ -191,6 +211,7 @@ test('snapshot carries app process/agent/view counts and fires onSnapshot', () =
 test('a throwing count provider degrades to 0, never crashes the sample', () => {
   const sampler = new MemorySampler({
     readCommit: () => readingAtPercent(20),
+    readHeapStats: () => heapAtPercent(5),
     getLiveAgentCount: () => { throw new Error('boom'); },
     getAgentViewCount: () => 0,
     getElectronProcessCount: () => 10,
@@ -200,6 +221,83 @@ test('a throwing count provider degrades to 0, never crashes the sample', () => 
   const snap = sampler.sample();
   assert.equal(snap.liveAgentCount, 0, 'throwing provider counts as 0');
   assert.equal(snap.level, 'normal');
+});
+
+// ── WP-2: fail-CLOSED main-process V8 heap admission gate ─────────────────────
+
+test('heap at exactly 85% denies both launch and tab with memory-heap', () => {
+  const h = makeHarness({ heapAdmissionPercent: 85 });
+  h.setHeap(heapAtPercent(85)); h.sampler.sample();
+  const launch = h.sampler.canLaunchAgent();
+  assert.equal(launch.allowed, false, 'exactly 85% is at the threshold ⇒ deny');
+  assert.equal(launch.code, 'memory-heap');
+  assert.match(launch.reason ?? '', /85(\.0)?%/, 'reason carries the percent');
+  assert.match(launch.reason ?? '', /MiB/, 'reason carries MiB used/limit');
+  assert.equal(h.sampler.canOpenAgentTab().code, 'memory-heap', 'tab denied too');
+});
+
+test('heap just below 85% admits', () => {
+  const h = makeHarness({ heapAdmissionPercent: 85 });
+  h.setHeap(heapAtPercent(84.9)); h.sampler.sample();
+  assert.equal(h.sampler.canLaunchAgent().allowed, true, 'below the threshold ⇒ allow');
+  assert.equal(h.sampler.canOpenAgentTab().allowed, true);
+});
+
+test('non-finite heap reading (NaN) fails CLOSED → memory-heap', () => {
+  const h = makeHarness();
+  h.setHeap({ heapUsed: Number.NaN, heapSizeLimit: 4096 * MiB }); h.sampler.sample();
+  const d = h.sampler.canLaunchAgent();
+  assert.equal(d.allowed, false, 'NaN heapUsed is unusable ⇒ fail-closed deny');
+  assert.equal(d.code, 'memory-heap');
+  assert.match(d.reason ?? '', /unavailable/i, 'fail-closed unavailable reason');
+  assert.equal(h.sampler.canOpenAgentTab().code, 'memory-heap');
+});
+
+test('zero heap size limit fails CLOSED → memory-heap', () => {
+  const h = makeHarness();
+  h.setHeap({ heapUsed: 100 * MiB, heapSizeLimit: 0 }); h.sampler.sample();
+  const d = h.sampler.canLaunchAgent();
+  assert.equal(d.allowed, false, 'a non-positive limit is unusable ⇒ deny (no divide-by-zero admit)');
+  assert.equal(d.code, 'memory-heap');
+});
+
+test('negative heapUsed fails CLOSED → memory-heap', () => {
+  const h = makeHarness();
+  h.setHeap({ heapUsed: -1, heapSizeLimit: 4096 * MiB }); h.sampler.sample();
+  const d = h.sampler.canLaunchAgent();
+  assert.equal(d.allowed, false, 'a negative heapUsed is impossible ⇒ deny');
+  assert.equal(d.code, 'memory-heap');
+});
+
+test('a thrown heap reader fails CLOSED → memory-heap', () => {
+  const h = makeHarness();
+  h.setHeap('throw'); h.sampler.sample();
+  const d = h.sampler.canLaunchAgent();
+  assert.equal(d.allowed, false, 'a thrown read must NOT fall through to an admit');
+  assert.equal(d.code, 'memory-heap');
+  assert.match(d.reason ?? '', /unavailable/i);
+  assert.equal(h.sampler.canOpenAgentTab().code, 'memory-heap');
+});
+
+// ── WP-2: ordering — static caps → heap → commit; first refusal wins ──────────
+
+test('ordering: a static-cap breach beats a heap breach (memory-capacity wins)', () => {
+  const h = makeHarness({ maxLiveAgents: 32, heapAdmissionPercent: 85 });
+  h.setCounts({ agents: 32 });          // static agent cap breached
+  h.setHeap(heapAtPercent(90));         // heap also over threshold
+  h.sampler.sample();
+  assert.equal(h.sampler.canLaunchAgent().code, 'memory-capacity', 'static cap is checked first');
+});
+
+test('ordering: under static caps, a heap breach beats commit-Critical (memory-heap wins)', () => {
+  const h = makeHarness({ heapAdmissionPercent: 85 });
+  h.setCounts({ agents: 0, procs: 10 }); // under all static caps
+  h.setHeap(heapAtPercent(90));          // heap over threshold
+  h.setPercent(95);                      // commit Critical too
+  h.sampler.sample();
+  assert.equal(h.sampler.isCriticalPressure(), true, 'commit is genuinely Critical in this fixture');
+  assert.equal(h.sampler.canLaunchAgent().code, 'memory-heap', 'heap is checked before commit');
+  assert.equal(h.sampler.canOpenAgentTab().code, 'memory-heap');
 });
 
 (async () => {

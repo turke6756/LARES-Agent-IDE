@@ -22,6 +22,21 @@ const UNSUBSCRIBED_POLL_MS = 5000;
 const RING_BUFFER_MAX = 2000;
 const SEEN_UUID_MAX = RING_BUFFER_MAX * 3;
 
+// WP-1c — chat ring byte budget + per-event hard cap (memory hardening Part B).
+// The ring is bounded by BOTH the count cap above AND this byte budget; whole
+// turns are evicted from the front when either is exceeded. All provisional
+// (recalibrated per WP-7); the marker is a small constant reserved inside the
+// per-event cap so a capped field's total stays <= EVENT_TEXT_HARD_CAP.
+const RING_BYTE_BUDGET = 8 * 1024 * 1024;
+const EVENT_TEXT_HARD_CAP = 1 * 1024 * 1024;
+const TRUNC_MARKER = '\n…[truncated]';
+// Small fixed per-event bookkeeping estimate (envelope keys, uuid, timestamp,
+// type) added to each event's payload byte-count. NOT exact JS-heap accounting
+// — a retained-payload estimate that keeps the byte budget honest.
+const EVENT_OVERHEAD_BYTES = 64;
+// Depth bound for the recursive `tool-use.input` size walk.
+const ESTIMATE_JSON_DEPTH_MAX = 12;
+
 // Match window for reconciling a synthetic user-echo against the real
 // `user-text` that arrives on disk seconds later. 30s spec + 5s clock skew slack.
 const SYNTHETIC_DEDUPE_WINDOW_MS = 35_000;
@@ -67,6 +82,94 @@ export interface SessionStaleEvent {
   observedAt: number;
 }
 
+/**
+ * UTF-8-safe truncation (WP-1c). Returns the longest prefix of `text` whose
+ * UTF-8 byte length is `<= maxBytes`, never splitting a surrogate pair (so the
+ * result is always a valid UTF-16 string with no dangling high surrogate).
+ * Binary search over string indices + a surrogate-boundary back-off.
+ */
+export function truncateUtf8ToBytes(text: string, maxBytes: number): string {
+  if (maxBytes <= 0) return '';
+  if (Buffer.byteLength(text, 'utf8') <= maxBytes) return text;
+  let lo = 0;
+  let hi = text.length;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >>> 1;
+    if (Buffer.byteLength(text.slice(0, mid), 'utf8') <= maxBytes) lo = mid;
+    else hi = mid - 1;
+  }
+  // `lo` is the longest fitting prefix length in UTF-16 code units. If it lands
+  // between a high and low surrogate, back off one unit so we never emit a lone
+  // high surrogate (which would round-trip through UTF-8 as U+FFFD).
+  if (lo > 0 && lo < text.length) {
+    const prev = text.charCodeAt(lo - 1);
+    const cur = text.charCodeAt(lo);
+    if (prev >= 0xd800 && prev <= 0xdbff && cur >= 0xdc00 && cur <= 0xdfff) lo -= 1;
+  }
+  return text.slice(0, lo);
+}
+
+/**
+ * Depth-capped, cycle-safe recursive size estimate for a `tool-use.input`
+ * value (WP-1c). Saturates at `cap` and early-exits once the running total
+ * reaches it, so a large input is never undercounted against the byte budget.
+ * Exceeding the depth bound OR hitting a previously-visited object (cycle) both
+ * saturate to `cap` — conservative, never silently drops deeper content.
+ */
+export function estimateJsonSize(value: unknown, cap: number): number {
+  const seen = new WeakSet<object>();
+  let total = 0;
+  const walk = (v: unknown, depth: number): void => {
+    if (total >= cap) return;
+    if (depth > ESTIMATE_JSON_DEPTH_MAX) { total = cap; return; }
+    if (v === null || v === undefined) { total += 4; return; }
+    switch (typeof v) {
+      case 'string': total += Buffer.byteLength(v, 'utf8'); return;
+      case 'number': total += 8; return;
+      case 'boolean': total += 4; return;
+      case 'bigint': total += 16; return;
+      case 'object': {
+        const obj = v as object;
+        if (seen.has(obj)) { total = cap; return; }
+        seen.add(obj);
+        if (Array.isArray(v)) {
+          for (const item of v) {
+            if (total >= cap) return;
+            walk(item, depth + 1);
+          }
+        } else {
+          for (const key of Object.keys(v as Record<string, unknown>)) {
+            if (total >= cap) return;
+            total += Buffer.byteLength(key, 'utf8');
+            walk((v as Record<string, unknown>)[key], depth + 1);
+          }
+        }
+        return;
+      }
+      default: total += 8; return;
+    }
+  };
+  walk(value, 0);
+  return Math.min(total, cap);
+}
+
+/**
+ * Estimated retained-payload size of a single event (WP-1c) — NOT exact JS-heap
+ * accounting. Sums the UTF-8 byte length of the text-bearing fields (`text` for
+ * assistant/user/thinking, `content` for tool-result) plus a small fixed
+ * per-event overhead; for `tool-use` it adds the depth-capped `estimateJsonSize`
+ * of `input` (saturating at the byte budget). Computed once, at insert.
+ */
+export function estimateEventBytes(ev: SessionEvent): number {
+  let bytes = EVENT_OVERHEAD_BYTES;
+  const text = (ev as { text?: unknown }).text;
+  if (typeof text === 'string') bytes += Buffer.byteLength(text, 'utf8');
+  const content = (ev as { content?: unknown }).content;
+  if (typeof content === 'string') bytes += Buffer.byteLength(content, 'utf8');
+  if (ev.type === 'tool-use') bytes += estimateJsonSize(ev.input, RING_BYTE_BUDGET + 1);
+  return bytes;
+}
+
 export class SessionLogDispatcher extends EventEmitter {
   private getActiveAgentSessions: () => AgentSession[];
   private readers = new Map<AgentProvider, ChatLogReader>();
@@ -80,6 +183,11 @@ export class SessionLogDispatcher extends EventEmitter {
   private syntheticMarkers = new Map<string, SyntheticMarker[]>(); // agentId -> markers
   private seenEventUuids = new Map<string, Set<string>>();
   private seenEventUuidOrder = new Map<string, string[]>();
+  // WP-1c — byte-budget accounting for the chat ring. `ringEventBytes` is
+  // aligned index-for-index with `eventsByAgent`; `ringBytesByAgent` is its
+  // running sum, mutated on append/evict without ever re-walking payloads.
+  private ringEventBytes = new Map<string, number[]>();
+  private ringBytesByAgent = new Map<string, number>();
   // BUG-09 §3.8 — agents whose first poll-driven batch has already been
   // emitted. The dispatcher's first batch per agent contains the
   // disk-replay of pre-existing events (post-attach reattach, app restart
@@ -285,6 +393,8 @@ export class SessionLogDispatcher extends EventEmitter {
   rebindAgent(agentId: string): void {
     this.eventsByAgent.delete(agentId);
     this.truncatedByAgent.delete(agentId);
+    this.ringEventBytes.delete(agentId);
+    this.ringBytesByAgent.delete(agentId);
     this.seenEventUuids.delete(agentId);
     this.seenEventUuidOrder.delete(agentId);
     this.syntheticMarkers.delete(agentId);
@@ -315,6 +425,8 @@ export class SessionLogDispatcher extends EventEmitter {
   forgetAgent(agentId: string): void {
     this.eventsByAgent.delete(agentId);
     this.truncatedByAgent.delete(agentId);
+    this.ringEventBytes.delete(agentId);
+    this.ringBytesByAgent.delete(agentId);
     this.seenEventUuids.delete(agentId);
     this.seenEventUuidOrder.delete(agentId);
     this.syntheticMarkers.delete(agentId);
@@ -511,11 +623,77 @@ export class SessionLogDispatcher extends EventEmitter {
       buf = [];
       this.eventsByAgent.set(agentId, buf);
     }
-    buf.push(...newEvents);
-    if (buf.length > RING_BUFFER_MAX) {
-      const overflow = buf.length - RING_BUFFER_MAX;
-      buf.splice(0, overflow);
-      this.truncatedByAgent.set(agentId, true);
+    let sizes = this.ringEventBytes.get(agentId);
+    if (!sizes) {
+      sizes = [];
+      this.ringEventBytes.set(agentId, sizes);
     }
+    let totalBytes = this.ringBytesByAgent.get(agentId) || 0;
+
+    for (const ev of newEvents) {
+      // Truncation/cloning operates ONLY on the ring copy — the `newEvents`
+      // objects are the SAME references handed to live 'chat-events' /
+      // 'usage' / 'tool-use' / 'tool-result' listeners (verified wiring:
+      // appendToRingBuffer runs before those emits), so mutating them would
+      // corrupt the live delivery. Never mutate `ev`.
+      const { stored, bytes } = this.prepareRingEvent(ev);
+      buf.push(stored);
+      sizes.push(bytes);
+      totalBytes += bytes;
+    }
+
+    totalBytes = this.evictRing(agentId, buf, sizes, totalBytes);
+    this.ringBytesByAgent.set(agentId, totalBytes);
+  }
+
+  /**
+   * Produce the ring copy of an event and its estimated retained-payload size
+   * (computed ONCE, here at insert). A `text`/`content` field exceeding
+   * EVENT_TEXT_HARD_CAP forces a shallow clone whose field is truncated to
+   * `<= 1 MiB including the marker` (marker reserved inside the cap). Events
+   * under the cap are stored BY ORIGINAL REFERENCE — no clone, preserving event
+   * identity and avoiding allocation. `tool-use.input` is never structurally
+   * truncated (that would corrupt the tool JSON); its only bound is byte-budget
+   * eviction.
+   */
+  private prepareRingEvent(ev: SessionEvent): { stored: SessionEvent; bytes: number } {
+    const cap = EVENT_TEXT_HARD_CAP;
+    const markerBytes = Buffer.byteLength(TRUNC_MARKER, 'utf8');
+    let clone: Record<string, unknown> | null = null;
+    const text = (ev as { text?: unknown }).text;
+    if (typeof text === 'string' && Buffer.byteLength(text, 'utf8') > cap) {
+      clone = clone ?? { ...(ev as unknown as Record<string, unknown>) };
+      clone.text = truncateUtf8ToBytes(text, cap - markerBytes) + TRUNC_MARKER;
+    }
+    const content = (ev as { content?: unknown }).content;
+    if (typeof content === 'string' && Buffer.byteLength(content, 'utf8') > cap) {
+      clone = clone ?? { ...(ev as unknown as Record<string, unknown>) };
+      clone.content = truncateUtf8ToBytes(content, cap - markerBytes) + TRUNC_MARKER;
+    }
+    const stored: SessionEvent = clone ? (clone as unknown as SessionEvent) : ev;
+    return { stored, bytes: estimateEventBytes(stored) };
+  }
+
+  /**
+   * Whole-turn eviction from the front while the ring exceeds EITHER the count
+   * cap OR the byte budget. A turn is keyed by `uuid.split('#')[0]`; we always
+   * remove a COMPLETE leading turn so the surviving head is a turn boundary.
+   * Keeps `sizes` aligned with `buf` and returns the updated byte total.
+   */
+  private evictRing(agentId: string, buf: SessionEvent[], sizes: number[], totalBytes: number): number {
+    let evicted = false;
+    while ((buf.length > RING_BUFFER_MAX || totalBytes > RING_BYTE_BUDGET) && buf.length > 0) {
+      const frontTurnId = buf[0].uuid.split('#')[0];
+      let count = 0;
+      while (count < buf.length && buf[count].uuid.split('#')[0] === frontTurnId) count++;
+      let removedBytes = 0;
+      for (let i = 0; i < count; i++) removedBytes += sizes[i];
+      buf.splice(0, count);
+      sizes.splice(0, count);
+      totalBytes -= removedBytes;
+      evicted = true;
+    }
+    if (evicted) this.truncatedByAgent.set(agentId, true);
+    return totalBytes < 0 ? 0 : totalBytes;
   }
 }

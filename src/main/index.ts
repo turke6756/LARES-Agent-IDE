@@ -8,6 +8,7 @@ import { getContextGaugeSettingsCached, updateContextGaugeSettings } from './con
 import { capForRoleKey, setContextGaugeCapResolver } from './context-gauge/context-gauge-cap';
 import path from 'path';
 import fs from 'fs';
+import * as v8 from 'node:v8';
 import { loadPersistedTheme } from './theme-persistence';
 import {
   initDatabase, getWorkspaces, getActiveAgents, reconcileStaleOpenContinuationAttempts,
@@ -1096,6 +1097,12 @@ app.whenReady().then(async () => {
     renderRecovery = new RenderRecoveryPolicy();
     memorySampler = new MemorySampler({
       readCommit: createCommitReader(nativeCommit),
+      // WP-2 fail-CLOSED heap gate: read the main-process V8 heap directly via
+      // node:v8 (do NOT depend on the Layer-3 heap-telemetry module here).
+      readHeapStats: () => {
+        const h = v8.getHeapStatistics();
+        return { heapUsed: h.used_heap_size, heapSizeLimit: h.heap_size_limit };
+      },
       getLiveAgentCount: () => getActiveAgents().length,
       getAgentViewCount: () => browserForWatchdog.getAgentViewCount(),
       getElectronProcessCount: () => {

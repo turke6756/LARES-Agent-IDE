@@ -415,6 +415,72 @@ test('recomputeContextWindows never exceeds the model window and skips null (gem
     'null from capForAgent leaves the reading untouched');
 });
 
+// ── WP-1b: grow-forever cap eviction (SEEN_UUID_MAX / SEEN_FILES_MAX /
+//    PENDING_SHELL_MAX all = 6000) ───────────────────────────────────────────
+//
+// WB-10 mutation notes are inline: each test asserts the EXACT boundary (size
+// === 6000, oldest evicted, newest retained). Removing a cap makes size 6001
+// (fails); off-by-one on the constant fails the oldest/newest assertions.
+
+const CAP = 6000;
+
+test('WP-1b: seenUuids caps at 6000 (oldest evicted, newest retained)', () => {
+  const { reader, monitor } = makeHarness();
+  for (let i = 0; i < CAP + 1; i++) {
+    reader.emit('usage', makeUsage('agent-1', 's', { uuid: `u${i}` }));
+  }
+  const seen = (monitor as any).seenUuids.get('agent-1') as Set<string>;
+  assert.equal(seen.size, CAP, 'seenUuids bounded at exactly 6000');
+  assert.equal(seen.has('u0'), false, 'oldest UUID evicted');
+  assert.equal(seen.has(`u${CAP}`), true, 'newest UUID retained');
+});
+
+test('WP-1b: seenFiles caps at 6000 (oldest evicted, newest retained)', () => {
+  const { reader, monitor } = makeHarness();
+  // Each distinct toolUseId yields a distinct dedupe key.
+  for (let i = 0; i < CAP + 1; i++) {
+    reader.emit('tool-use', toolUse('read_file', { file_path: 'a.ts' }, `t${i}`));
+  }
+  const seen = (monitor as any).seenFiles.get('agent-1') as Set<string>;
+  assert.equal(seen.size, CAP, 'seenFiles bounded at exactly 6000');
+  assert.equal(seen.has(JSON.stringify(['t0', 'read', 'a.ts'])), false, 'oldest key evicted');
+  assert.equal(seen.has(JSON.stringify([`t${CAP}`, 'read', 'a.ts'])), true, 'newest key retained');
+});
+
+test('WP-1b: pendingShellActivity caps at 6000 under missing-result traffic', () => {
+  const { reader, monitor } = makeHarness();
+  const patch = '*** Begin Patch\n*** Update File: src/foo.ts\n@@\n+x\n*** End Patch';
+  // > 6000 apply_patch / shell_command tool-uses whose tool-results never arrive.
+  for (let i = 0; i < CAP + 1; i++) {
+    const name = i % 2 === 0 ? 'apply_patch' : 'shell_command';
+    const input = name === 'apply_patch'
+      ? { input: patch, workdir: 'C:\\repo' }
+      : { command: 'cat src/foo.ts', workdir: 'C:\\repo' };
+    reader.emit('tool-use', toolUse(name, input, `p${i}`));
+  }
+  const pending = (monitor as any).pendingShellActivity as Map<string, unknown>;
+  assert.equal(pending.size, CAP, 'pendingShellActivity bounded at exactly 6000');
+  assert.equal(pending.has('agent-1:p0'), false, 'oldest pending entry evicted');
+  assert.equal(pending.has(`agent-1:p${CAP}`), true, 'newest pending entry retained');
+});
+
+test('WP-1b: invalidateAgent empties all three capped structures', () => {
+  const { reader, monitor } = makeHarness();
+  // Populate seenUuids + seenFiles + pendingShellActivity for agent-1.
+  reader.emit('usage', makeUsage('agent-1', 's', { uuid: 'u1' }));
+  reader.emit('tool-use', toolUse('read_file', { file_path: 'a.ts' }, 't1'));
+  reader.emit('tool-use', toolUse('shell_command', { command: 'cat x', workdir: 'C:\\repo' }, 'p1'));
+  assert.ok((monitor as any).seenUuids.get('agent-1'), 'pre: seenUuids populated');
+  assert.ok((monitor as any).seenFiles.get('agent-1'), 'pre: seenFiles populated');
+  assert.equal((monitor as any).pendingShellActivity.has('agent-1:p1'), true, 'pre: pending populated');
+
+  monitor.invalidateAgent('agent-1');
+
+  assert.equal((monitor as any).seenUuids.has('agent-1'), false, 'seenUuids cleared');
+  assert.equal((monitor as any).seenFiles.has('agent-1'), false, 'seenFiles cleared');
+  assert.equal((monitor as any).pendingShellActivity.has('agent-1:p1'), false, 'pendingShellActivity cleared');
+});
+
 (async () => {
   let passed = 0;
   let failed = 0;

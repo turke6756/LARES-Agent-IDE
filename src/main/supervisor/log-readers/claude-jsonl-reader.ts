@@ -34,6 +34,43 @@ const EOF_STREAK_REREGISTER = 3;
 const STALE_SIGNAL_REEMIT_MS = 30_000;
 const CLEAR_SUCCESSOR_HEAD_LINES = 8;
 
+// ── Fix 2: bounded session-log reads (heap-OOM remediation) ────────────
+// See docs/internal/SESSION_LOG_READ_FIX_PROPOSAL.md.
+//
+// 2a: when `pollSession` has no stored offset for a path (first attach, or a
+// rebind / /clear / continuation cleared it via `invalidatePath`), seek to the
+// tail minus this catch-up window instead of gulping the whole file from byte
+// 0. A mid-line leading fragment in the window fails JSON.parse and is skipped,
+// so byte offsets stay file-absolute from the first COMPLETE line onward — no
+// explicit line-boundary alignment needed.
+const OFFSET_CATCHUP_BYTES = 256 * 1024;
+// 2a: hard cap on a single poll's delta read. A genuinely-behind tailer (poll
+// stalled on a hot file) advances by at most this per tick and catches up over
+// subsequent ticks, so no read ever allocates a file-sized buffer. Partial
+// lines already reassemble across reads via `partialLines`, so a chunk boundary
+// mid-line is handled with no extra bookkeeping.
+const MAX_POLL_READ_BYTES = 4 * 1024 * 1024;
+// 2b: `readSessionEventsOnce` reads only this much of the tail of a prior
+// (terminal / continuation) session file. Previews and read_agent_chat want
+// recent messages by definition. NOTE: this bounds a dead agent's recoverable
+// chat history to the last MAX_TERMINAL_READ_BYTES; older scrollback is not
+// rendered. A paged backwards reader for full history is a deferred follow-up
+// (the proposal's optional 2b history reader) — kept out of scope to avoid
+// redesigning the chat pane.
+const MAX_TERMINAL_READ_BYTES = 2 * 1024 * 1024;
+// 2b: LRU bound on the per-path parsed-tail cache keyed by (size,mtime). A
+// terminal session file is frozen, so repeated previews / polls hit the cache
+// instead of re-reading + re-parsing; the cap keeps a fleet of dead agents from
+// accreting parsed arrays.
+const PRIOR_SESSION_CACHE_MAX = 4;
+// WP-1a (P1): caps on the per-agent grow-forever dedup/location structures. An
+// evicted reader UUID is NOT guaranteed to be caught downstream — the
+// dispatcher's event UUID may also have left its own 6,000 window, so replaying
+// an entry older than BOTH windows can produce one duplicate chat event. That is
+// the accepted bounded-dedup tradeoff; unbounded growth is the worse failure.
+const SEEN_ENTRY_UUID_MAX = 6000;                  // per-agent, matches dispatcher's SEEN_UUID_MAX
+const TOOL_RESULT_LOCATIONS_MAX_PER_AGENT = 2000;  // ≈ max cached events that can expose an expand control
+
 /** A session-pinned stale signal: a Claude agent's tailed `.jsonl` went quiet
  *  (EOF streak). The signal carries the session id that WAS being tailed so the
  *  rotation handler can reject a retry whose target session no longer matches
@@ -70,9 +107,13 @@ export class ClaudeJsonlReader implements ChatLogReader {
   private seenEntryUuids = new Map<string, Set<string>>(); // agentId -> entry uuids
   private emittedSystemInit = new Set<string>(); // agentId
   private toolResultLocations = new Map<string, ToolResultLocation>(); // `${agentId}:${toolUseId}`
+  private toolResultOrder = new Map<string, Set<string>>(); // agentId -> ordered full keys (LRU-ish)
   private eofStreak = new Map<string, number>(); // agentId
   private pendingStale = new Map<string, ClaudeStaleSignal>(); // agentId — drained by dispatcher
   private lastStaleEmitAt = new Map<string, number>(); // agentId -> last emit ms (throttle)
+  // 2b: jsonlPath -> parsed tail of a prior session, invalidated by (size,mtime)
+  // signature. Insertion-ordered so the first key is the LRU victim.
+  private priorSessionCache = new Map<string, { sig: string; events: SessionEvent[] }>();
 
   private getWindowsProjectsDir(): string | null {
     if (this.windowsProjectsDir !== undefined) return this.windowsProjectsDir;
@@ -98,6 +139,18 @@ export class ClaudeJsonlReader implements ChatLogReader {
     this.eofStreak.delete(agentId);
     this.pendingStale.delete(agentId);
     this.lastStaleEmitAt.delete(agentId);
+    // WP-1a (P1): clear per-agent reader state on terminal release. `rebindAgent`
+    // clears the dispatcher's own dedup so a rebound rollout isn't UUID-suppressed,
+    // and `forgetAgent` reaches the reader ONLY through `invalidatePath` — so not
+    // clearing here would retain per-agent reader memory after terminal release,
+    // the exact leak P1 targets.
+    this.seenEntryUuids.delete(agentId);
+    this.emittedSystemInit.delete(agentId);
+    const prefix = `${agentId}:`;
+    for (const key of this.toolResultLocations.keys()) {
+      if (key.startsWith(prefix)) this.toolResultLocations.delete(key);
+    }
+    this.toolResultOrder.delete(agentId);
   }
 
   /** Throttled accumulation of a /clear-rotation stale signal. The dispatcher
@@ -222,9 +275,48 @@ export class ClaudeJsonlReader implements ChatLogReader {
     const jsonlPath = this.locateSessionFile(workingDirectory, sessionId);
     if (!jsonlPath) return null;
 
-    let raw: string;
+    let stat: fs.Stats;
     try {
-      raw = fs.readFileSync(jsonlPath, 'utf-8');
+      stat = fs.statSync(jsonlPath);
+    } catch {
+      return null;
+    }
+    const sig = `${stat.size}:${stat.mtimeMs}`;
+
+    // 2b cache: a terminal session file is frozen, so repeated done/crashed
+    // previews and read_agent_chat polls for the same (size,mtime) return the
+    // already-parsed tail with no re-read. LRU-refresh recency on a hit.
+    const hit = this.priorSessionCache.get(jsonlPath);
+    if (hit && hit.sig === sig) {
+      this.priorSessionCache.delete(jsonlPath);
+      this.priorSessionCache.set(jsonlPath, hit);
+      return hit.events;
+    }
+
+    // 2b: read only the tail. Callers want recent messages; the whole-file
+    // readFileSync here was one of the acute heap paths (≈3× file size per call,
+    // uncached, per read_agent_chat / preview).
+    const readStart = stat.size > MAX_TERMINAL_READ_BYTES ? stat.size - MAX_TERMINAL_READ_BYTES : 0;
+    let raw: string;
+    // File-absolute offset of the first COMPLETE line kept (the leading partial
+    // is dropped when we started mid-file). Keeps tool-result offsets correct.
+    let contentStartOffset = readStart;
+    try {
+      const fd = fs.openSync(jsonlPath, 'r');
+      try {
+        const len = stat.size - readStart;
+        const buf = Buffer.alloc(len);
+        fs.readSync(fd, buf, 0, len, readStart);
+        let from = 0;
+        if (readStart > 0) {
+          const nl = buf.indexOf(0x0a); // first '\n' — drop the partial before it
+          from = nl >= 0 ? nl + 1 : len;
+          contentStartOffset = readStart + from;
+        }
+        raw = buf.toString('utf-8', from, len);
+      } finally {
+        fs.closeSync(fd);
+      }
     } catch {
       return null;
     }
@@ -243,7 +335,7 @@ export class ClaudeJsonlReader implements ChatLogReader {
 
     const out: SessionEvent[] = [];
     try {
-      let cursor = 0;
+      let cursor = contentStartOffset;
       for (const line of raw.split('\n')) {
         const lineBytes = Buffer.byteLength(line, 'utf-8');
         const lineStartOffset = cursor;
@@ -269,6 +361,13 @@ export class ClaudeJsonlReader implements ChatLogReader {
       for (const key of this.toolResultLocations.keys()) {
         if (key.startsWith(prefix)) this.toolResultLocations.delete(key);
       }
+      this.toolResultOrder.delete(scopeId);
+    }
+
+    this.priorSessionCache.set(jsonlPath, { sig, events: out });
+    if (this.priorSessionCache.size > PRIOR_SESSION_CACHE_MAX) {
+      const oldest = this.priorSessionCache.keys().next().value;
+      if (oldest !== undefined) this.priorSessionCache.delete(oldest);
     }
     return out;
   }
@@ -400,7 +499,17 @@ export class ClaudeJsonlReader implements ChatLogReader {
       return [];
     }
 
-    const lastOffset = this.fileOffsets.get(jsonlPath) || 0;
+    // 2a: seek-to-tail on a lost/absent offset. A stored offset (even 0) is an
+    // in-progress tail we must resume exactly; ONLY a missing entry means first
+    // attach or a post-invalidatePath rebind, and there we start near the tail
+    // instead of re-reading the whole (all-day-grown) file from byte 0.
+    let lastOffset: number;
+    if (this.fileOffsets.has(jsonlPath)) {
+      lastOffset = this.fileOffsets.get(jsonlPath)!;
+    } else {
+      lastOffset = fileSize > OFFSET_CATCHUP_BYTES ? fileSize - OFFSET_CATCHUP_BYTES : 0;
+      this.fileOffsets.set(jsonlPath, lastOffset);
+    }
     if (fileSize <= lastOffset) {
       const streak = (this.eofStreak.get(session.agentId) || 0) + 1;
       this.eofStreak.set(session.agentId, streak);
@@ -432,12 +541,16 @@ export class ClaudeJsonlReader implements ChatLogReader {
     let readStart: number;
     let rawText: string;
     try {
-      const bytesToRead = fileSize - lastOffset;
+      // 2a: cap a single delta read. When genuinely behind, advance by at most
+      // MAX_POLL_READ_BYTES and let the next tick continue from the new offset
+      // (fileSize still > offset ⇒ not EOF); `partialLines` reassembles the line
+      // straddling the chunk boundary. Steady-state deltas are far under the cap.
+      const bytesToRead = Math.min(fileSize - lastOffset, MAX_POLL_READ_BYTES);
       const buffer = Buffer.alloc(bytesToRead);
       fs.readSync(fd, buffer, 0, bytesToRead, lastOffset);
       readStart = lastOffset;
       rawText = buffer.toString('utf-8');
-      this.fileOffsets.set(jsonlPath, fileSize);
+      this.fileOffsets.set(jsonlPath, lastOffset + bytesToRead);
     } finally {
       fs.closeSync(fd);
     }
@@ -492,6 +605,13 @@ export class ClaudeJsonlReader implements ChatLogReader {
       }
       if (seen.has(entryUuid)) return;
       seen.add(entryUuid);
+      // WP-1a: insertion-ordered eviction — a Set iterates in insertion order,
+      // so the first value is the oldest. No parallel order array.
+      while (seen.size > SEEN_ENTRY_UUID_MAX) {
+        const oldest = seen.values().next().value;
+        if (oldest === undefined) break;
+        seen.delete(oldest);
+      }
     }
 
     const timestamp: string = entry.timestamp || new Date().toISOString();
@@ -562,12 +682,25 @@ export class ClaudeJsonlReader implements ChatLogReader {
             };
             out.push(ev);
             if (toolUseId) {
-              this.toolResultLocations.set(`${session.agentId}:${toolUseId}`, {
+              const key = `${session.agentId}:${toolUseId}`;
+              this.toolResultLocations.set(key, {
                 jsonlPath,
                 blockIndex: i,
                 startOffset: lineStartOffset,
                 endOffset: lineEndOffset,
               });
+              // WP-1a: per-agent cap via a duplicate-safe ordered Set of keys.
+              // delete-then-add refreshes recency without duplicating; eviction
+              // walks the oldest key and drops its location too.
+              let order = this.toolResultOrder.get(session.agentId);
+              if (!order) { order = new Set(); this.toolResultOrder.set(session.agentId, order); }
+              order.delete(key); order.add(key);
+              while (order.size > TOOL_RESULT_LOCATIONS_MAX_PER_AGENT) {
+                const oldest = order.values().next().value;
+                if (oldest === undefined) break;
+                order.delete(oldest);
+                this.toolResultLocations.delete(oldest);
+              }
             }
           }
         }
@@ -679,12 +812,21 @@ export class ClaudeJsonlReader implements ChatLogReader {
     }
 
     const { workingDirectory, sessionId } = session;
+    // 2c: the launcher knows each agent's session id and the file is named
+    // `<sessionId>.jsonl`, so the session id IS the per-agent signal the
+    // shared-cwd invariant (CLAUDE.md) requires — many agents map to one slug,
+    // and only the id disambiguates. Without an id we cannot safely bind in a
+    // shared slug dir (any sibling could be another agent's), so bail rather
+    // than guess a wrong (possibly large) file.
+    if (!sessionId) return null;
+
     const slug = this.makeSlug(workingDirectory);
     const fileName = `${sessionId}.jsonl`;
 
     const wslDir = this.getWslProjectsDir();
     const windowsDir = this.getWindowsProjectsDir();
 
+    // Primary: the id-named file in the expected slug dir (session-id-exact).
     if (workingDirectory.startsWith('/') && wslDir) {
       const jsonlPath = path.join(wslDir, slug, fileName);
       if (fs.existsSync(jsonlPath)) {
@@ -701,6 +843,11 @@ export class ClaudeJsonlReader implements ChatLogReader {
       }
     }
 
+    // Fallback: the id-named file wasn't under the expected slug. Scan sibling
+    // slug dirs for the SAME `<sessionId>.jsonl` — still session-id-exact (a
+    // different agent's sibling carries a different id and can't match), so this
+    // never binds a wrong file. Logged because a hit means the slug→dir mapping
+    // drifted from what `makeSlug` produced.
     const dirsToScan = [windowsDir, wslDir].filter(Boolean) as string[];
     for (const baseDir of dirsToScan) {
       try {
@@ -708,6 +855,10 @@ export class ClaudeJsonlReader implements ChatLogReader {
         for (const dir of dirs) {
           const candidatePath = path.join(baseDir, dir, fileName);
           if (fs.existsSync(candidatePath)) {
+            console.warn(
+              `[claude-jsonl-reader] session ${sessionId} resolved via cross-slug scan `
+              + `(expected slug "${slug}", found in "${dir}") — slug mapping drift`,
+            );
             this.resolvedPaths.set(session.agentId, candidatePath);
             return candidatePath;
           }

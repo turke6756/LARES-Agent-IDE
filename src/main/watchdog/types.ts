@@ -53,7 +53,7 @@ export interface MemorySnapshot {
  *  agent/orchestrator at the API/MCP layer (see api-server API_ERROR_CODES).
  *  `memory-budget` (full-D5, Wave 4) is the per-agent budget refusal — same
  *  family as the global `memory-critical`/`memory-capacity` codes. */
-export type AdmissionCode = 'memory-critical' | 'memory-capacity' | 'memory-budget';
+export type AdmissionCode = 'memory-critical' | 'memory-capacity' | 'memory-budget' | 'memory-heap';
 
 export interface AdmissionDecision {
   allowed: boolean;
@@ -100,6 +100,10 @@ export interface WatchdogConfig {
    *  is down. */
   maxLiveAgents: number;
   maxElectronProcesses: number;
+  /** Fail-CLOSED main-process V8 heap admission threshold (percent of the V8
+   *  heap size limit). At/above this, new agent launches / tabs are refused with
+   *  `memory-heap`. Provisional (recalibrated per WP-7). */
+  heapAdmissionPercent: number;
 }
 
 export const DEFAULT_WATCHDOG_CONFIG: WatchdogConfig = {
@@ -110,4 +114,5 @@ export const DEFAULT_WATCHDOG_CONFIG: WatchdogConfig = {
   criticalClearPercent: 80,
   maxLiveAgents: 32,
   maxElectronProcesses: 350,
+  heapAdmissionPercent: 85,
 };

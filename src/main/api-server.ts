@@ -114,7 +114,10 @@ const API_ERROR_CODES = new Set<string>([
   // agent/orchestrator receives a machine-readable "no" instead of degrading.
   // Full-D5 (Wave 4) adds `memory-budget` — the per-agent budget refusal, same
   // family, surfaced identically to the API/MCP caller.
-  'memory-critical', 'memory-capacity', 'memory-budget',
+  // Memory-hardening WP-2 adds `memory-heap` — the fail-CLOSED main-process V8
+  // heap admission gate (refused at/above the heap threshold, or when the heap
+  // reading is unavailable), same family, surfaced identically.
+  'memory-critical', 'memory-capacity', 'memory-budget', 'memory-heap',
   // GET /api/context-overhead — a request that resolves to no workspace scope.
   'invalid-argument',
   // WP-G2.1 — capability-bound checkpoint recovery routes (authorization + shape).
