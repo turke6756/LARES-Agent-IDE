@@ -1,0 +1,7 @@
+[
+  { "text": "Run a groupthink orchestration on this plan", "expect": "run-orchestration" },
+  { "text": "Start the built-in orchestration and monitor the run", "expect": "run-orchestration" },
+  { "text": "Check the status of the in-process orchestration run", "expect": "run-orchestration" },
+  { "text": "Call run_orchestration for me", "expect": "run-orchestration" },
+  { "text": "What is the capital of France?", "expect": "other" }
+]

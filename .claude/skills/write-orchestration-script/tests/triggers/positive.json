@@ -1,0 +1,7 @@
+[
+  { "text": "Help me scaffold a dispatcher fan-out script that launches a worker per file", "expect": "write-orchestration-script" },
+  { "text": "Review my Lares orchestration script — the child agents aren't nesting", "expect": "write-orchestration-script" },
+  { "text": "Debug why my deliberation script keeps re-stalling on resume", "expect": "write-orchestration-script" },
+  { "text": "Convert this bash loop into a proper scheduler script for the dashboard", "expect": "write-orchestration-script" },
+  { "text": "Write a pipeline orchestration script with staged handoff", "expect": "write-orchestration-script" }
+]

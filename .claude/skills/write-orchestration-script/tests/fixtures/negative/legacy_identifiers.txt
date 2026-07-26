@@ -1,0 +1,5 @@
+Intentional legacy-identifier fixture — EXCLUDED from the --static ban.
+These strings exist so the ban's exclusion path is itself testable:
+  AGENT_ID
+  .dashboard/workers/claude
+Do not "fix" this file; it is a negative fixture (spec §F2, plan §C/§J).

@@ -1,0 +1,9 @@
+# OpenAI/Codex compatibility descriptor — consistent with SKILL.md frontmatter.
+# Honest guidance pointer (AGENTS.md-chain discovery), NOT native skill registration.
+name: write-orchestration-script
+description: >-
+  Help users author, scaffold, review, or debug external Lares orchestration
+  scripts in Python, Node.js, or Bash that drive the local HTTP API. Use for
+  dispatcher fan-out, scheduler, deliberation/relay, and pipeline scripts. Do not
+  use to start or monitor built-in orchestrations; use run-orchestration for those.
+entry: SKILL.md
