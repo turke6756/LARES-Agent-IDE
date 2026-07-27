@@ -13,6 +13,7 @@ import {
   SUPERVISOR_CLAUDE_SETTINGS_JSON_V3,
   SUPERVISOR_RUN_ORCHESTRATION_SKILL,
   SUPERVISOR_CONTEXT_ANALYTICS_SKILL,
+  SUPERVISOR_CHECKPOINT_FORENSICS_SKILL,
   SCRIPT_READ_AGENT_LOG, SCRIPT_LIST_AGENTS, SCRIPT_SEND_MESSAGE, SCRIPT_GET_CONTEXT_STATS,
   WORKER_CLAUDE_MD, WORKER_CLAUDE_MD_V1, WORKER_BEHAVIORAL_MD,
   WORKER_CLAUDE_SETTINGS_JSON, WORKER_CLAUDE_SETTINGS_JSON_V2, WORKER_CLAUDE_SETTINGS_JSON_V3,
@@ -772,6 +773,13 @@ export const SUPERVISOR_AGENT_MD_V16_HASH = 'ef82464d9f016219edc44a343e9cc5060ba
  *  `revive_agent` bullet). Used in the v18 file's previousHashes so a pristine
  *  v17 workspace upgrades silently instead of being backed up. */
 export const SUPERVISOR_AGENT_MD_V17_HASH = '9746a15ef94e171c859507b5eb9e01e6347e0d0198e069ebfc3a9b99affb834f';
+
+/** SHA-256 hex of the v18 `.lares/supervisor/CLAUDE.md` — the body BEFORE the
+ *  v19 turn-history section edit (which inserts the `<!-- section:turn-history v1 -->`
+ *  block documenting the checkpoint toolset and points at the checkpoint-forensics
+ *  skill). Used in the v19 file's previousHashes so a pristine v18 workspace
+ *  upgrades silently instead of being backed up. */
+export const SUPERVISOR_AGENT_MD_V18_HASH = 'd137657a7cbf0bda5fac32469b98eff1713d6101058969923a984a105af371f1';
 
 /** SHA-256 hex of the v6 `.dashboard/workers/claude/CLAUDE.md` (pre-`.lares`
  *  rename). Used in the v7 file's previousHashes. */
@@ -2500,8 +2508,8 @@ export class AgentSupervisor extends EventEmitter {
   private static SUPERVISOR_FILES: Record<string, ScaffoldFile> = {
     [`.lares/supervisor/CLAUDE.md`]:                                              {
       content: SUPERVISOR_AGENT_MD,
-      version: 18, // v18 (cross-workspace-collaboration WP6) extends the `launch_agent` tool bullet with the `supervisor-peer` launch mode (top-level peer, cross-workspace-only, supervisor-gated) and adds a `revive_agent` bullet (supervisor-only relaunch of a done/crashed session; providers claude+codex). Previously: v17 (WP1.3) widens the `list_agents` tool bullet to document that a foreign `workspace_id` is supervisor-only, and adds a `list_workspaces` bullet (cross-workspace discovery). Previously: v16 (Lares rebrand) renames every `.dashboard/…` state-folder reference to `.lares/…` (working-directory note, researcher inbox pointers, research-store section). Previously: v15 (continuation-request awareness) adds the `save_continuation_brick` tool bullet and the `<!-- section:continuation-request v1 -->` block: answer a dashboard continuation request THAT TURN, write per-agent state + pointers rather than prose, respect the stated byte cap, finish the current response normally (the dashboard waits for turn completion before swapping), and start no new work. Previously: v14 (MCP context-overhead cut) removes the resident documentation for two deleted MCP tools: the `get_context_stats` bullet is gone (the `list_agents` bullet now states the per-agent context reading is returned inline, so the capability is preserved), and `## Multi-agent orchestration` no longer says "Discover with `list_orchestrations`".
-      previousHashes: { 1: SUPERVISOR_AGENT_MD_V1_HASH, 2: SUPERVISOR_AGENT_MD_V2_HASH, 3: SUPERVISOR_AGENT_MD_V3_HASH, 4: SUPERVISOR_AGENT_MD_V4_HASH, 5: SUPERVISOR_AGENT_MD_V5_HASH, 6: SUPERVISOR_AGENT_MD_V6_HASH, 7: SUPERVISOR_AGENT_MD_V7_HASH, 8: SUPERVISOR_AGENT_MD_V8_HASH, 9: SUPERVISOR_AGENT_MD_V9_HASH, 10: SUPERVISOR_AGENT_MD_V10_HASH, 11: SUPERVISOR_AGENT_MD_V11_HASH, 12: SUPERVISOR_AGENT_MD_V12_HASH, 13: SUPERVISOR_AGENT_MD_V13_HASH, 14: SUPERVISOR_AGENT_MD_V14_HASH, 15: SUPERVISOR_AGENT_MD_V15_HASH, 16: SUPERVISOR_AGENT_MD_V16_HASH, 17: SUPERVISOR_AGENT_MD_V17_HASH },
+      version: 19, // v19 (turn-history) adds the <!-- section:turn-history v1 --> block documenting the checkpoint toolset (list_checkpoints/diff_turn/restore_paths/revert_turn/prune_checkpoints/read_agent_files_touched), the three-layer evidence model, capture-health ambiguity, forward-only paging, and immediate/destructive mutation in a shared tree; points at the checkpoint-forensics skill. Previously: v18 (cross-workspace-collaboration WP6) extends the `launch_agent` tool bullet with the `supervisor-peer` launch mode (top-level peer, cross-workspace-only, supervisor-gated) and adds a `revive_agent` bullet (supervisor-only relaunch of a done/crashed session; providers claude+codex). Previously: v17 (WP1.3) widens the `list_agents` tool bullet to document that a foreign `workspace_id` is supervisor-only, and adds a `list_workspaces` bullet (cross-workspace discovery). Previously: v16 (Lares rebrand) renames every `.dashboard/…` state-folder reference to `.lares/…` (working-directory note, researcher inbox pointers, research-store section). Previously: v15 (continuation-request awareness) adds the `save_continuation_brick` tool bullet and the `<!-- section:continuation-request v1 -->` block: answer a dashboard continuation request THAT TURN, write per-agent state + pointers rather than prose, respect the stated byte cap, finish the current response normally (the dashboard waits for turn completion before swapping), and start no new work. Previously: v14 (MCP context-overhead cut) removes the resident documentation for two deleted MCP tools: the `get_context_stats` bullet is gone (the `list_agents` bullet now states the per-agent context reading is returned inline, so the capability is preserved), and `## Multi-agent orchestration` no longer says "Discover with `list_orchestrations`".
+      previousHashes: { 1: SUPERVISOR_AGENT_MD_V1_HASH, 2: SUPERVISOR_AGENT_MD_V2_HASH, 3: SUPERVISOR_AGENT_MD_V3_HASH, 4: SUPERVISOR_AGENT_MD_V4_HASH, 5: SUPERVISOR_AGENT_MD_V5_HASH, 6: SUPERVISOR_AGENT_MD_V6_HASH, 7: SUPERVISOR_AGENT_MD_V7_HASH, 8: SUPERVISOR_AGENT_MD_V8_HASH, 9: SUPERVISOR_AGENT_MD_V9_HASH, 10: SUPERVISOR_AGENT_MD_V10_HASH, 11: SUPERVISOR_AGENT_MD_V11_HASH, 12: SUPERVISOR_AGENT_MD_V12_HASH, 13: SUPERVISOR_AGENT_MD_V13_HASH, 14: SUPERVISOR_AGENT_MD_V14_HASH, 15: SUPERVISOR_AGENT_MD_V15_HASH, 16: SUPERVISOR_AGENT_MD_V16_HASH, 17: SUPERVISOR_AGENT_MD_V17_HASH, 18: SUPERVISOR_AGENT_MD_V18_HASH },
     },
     [`.lares/supervisor/.claude/settings.json`]:                                  {
       content: SUPERVISOR_CLAUDE_SETTINGS_JSON,
@@ -2539,6 +2547,16 @@ export class AgentSupervisor extends EventEmitter {
     // analytics traffic existed on the supervisor lane); a worker that needs a
     // number gets it dispatched. One-line add per lane the day that changes.
     [`.lares/supervisor/.claude/skills/context-analytics/SKILL.md`]:              { content: SUPERVISOR_CONTEXT_ANALYTICS_SKILL, version: 3, previousHashes: { 1: SUPERVISOR_CONTEXT_ANALYTICS_SKILL_V1_HASH, 2: SUPERVISOR_CONTEXT_ANALYTICS_SKILL_V2_HASH } }, // v3: installation-owned snapshot shim as primary path (WP4)
+    // SUPERVISOR LANE ONLY — deliberately not added to WORKER_FILES or
+    // RESEARCHER_FILES or <workspace>/.claude/skills. The `checkpoints` toolset is
+    // supervisor-only (recovery tools are supervisor-tier + human, NEVER
+    // workers/researchers), so a scaffolded skill's always-resident frontmatter
+    // description would tax the worker/researcher lanes with a header for tools they
+    // cannot call. version 1 with NO previousHashes: nothing by this name has ever
+    // been scaffolded, so there is no prior on-disk content to migrate from (an
+    // unmanaged file already at this path is treated as user-authored and .bak'd
+    // rather than silently overwritten). Same shape as context-analytics above.
+    [`.lares/supervisor/.claude/skills/checkpoint-forensics/SKILL.md`]:           { content: SUPERVISOR_CHECKPOINT_FORENSICS_SKILL, version: 1 },
     // Persona kit (§1.4) — the two default skills ship into every native lane too
     // so the supervisor/researcher/worker can guide persona creation + read comments.
     [`.lares/supervisor/.claude/skills/create-persona/SKILL.md`]:                 { content: PERSONA_CREATE_PERSONA_SKILL, version: 4, previousHashes: { 1: sha256Hex(PERSONA_CREATE_PERSONA_SKILL_V1), 2: PERSONA_CREATE_PERSONA_SKILL_V2_HASH, 3: PERSONA_CREATE_PERSONA_SKILL_V3_HASH } }, // v4: `.lares` rename
