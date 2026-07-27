@@ -21,7 +21,11 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import { toolsetsForLane } from './mcp-config-builder';
 import { DASHBOARD_TOOLSETS } from '../skill-analytics/mcp-toolset-map';
-import { SUPERVISOR_AGENT_MD, SUPERVISOR_CONTEXT_ANALYTICS_SKILL } from '../../shared/constants';
+import {
+  SUPERVISOR_AGENT_MD,
+  SUPERVISOR_CHECKPOINT_FORENSICS_SKILL,
+  SUPERVISOR_CONTEXT_ANALYTICS_SKILL,
+} from '../../shared/constants';
 
 interface TestCase {
   name: string;
@@ -294,6 +298,81 @@ test('get_my_context is documented exactly once (Re-Orientation dedup)', () => {
   assert.ok(SUPERVISOR_AGENT_MD.includes('get_my_context'), 'the revival ground-truth call must stay documented');
   assert.ok(SUPERVISOR_AGENT_MD.includes('advisory, not authoritative'), 'the distrust-stale-wake-hint action must survive');
   assert.ok(SUPERVISOR_AGENT_MD.includes('`list_agents`'), 'the refresh-list_agents action must survive');
+});
+
+// ── Checkpoint-forensics: the six checkpoint verbs are granted, and the ──────
+// resident persona section + on-demand skill carry the load-bearing invariants ──
+
+test('the six checkpoint/turn-history verbs the persona names are all granted to the supervisor lane', () => {
+  // Five live in the `checkpoints` toolset; read_agent_files_touched lives in
+  // `observability-core`. Both are granted to the supervisor, so naming all six
+  // resident passes the ungranted-verb gate above — assert the grant directly so a
+  // future grant trim that strands one of them fails HERE with a clear message.
+  for (const verb of [
+    'list_checkpoints', 'diff_turn', 'restore_paths', 'revert_turn', 'prune_checkpoints',
+    'read_agent_files_touched',
+  ]) {
+    assert.ok(SUPERVISOR_AGENT_MD.includes(verb), `the persona must document the ${verb} checkpoint verb`);
+    assert.ok(
+      GRANTED_VERBS.has(verb),
+      `${verb} is named in the persona but not granted to the supervisor lane — grant is '${toolsetsForLane('supervisor')}'`,
+    );
+  }
+});
+
+test('the persona turn-history section carries its load-bearing guardrails and points at the skill', () => {
+  assert.equal(
+    (SUPERVISOR_AGENT_MD.match(/<!-- section:turn-history v1 -->/g) || []).length, 1,
+    'the turn-history section must be present exactly once',
+  );
+  // Three-record evidence model, both-edges gate, empty-witness ambiguity.
+  assert.ok(SUPERVISOR_AGENT_MD.includes('three records'), 'persona must open on the three-record layered model');
+  assert.ok(SUPERVISOR_AGENT_MD.includes('`beforeReady` and `afterReady` are both true'), 'persona must gate evidence on BOTH readiness edges');
+  assert.ok(SUPERVISOR_AGENT_MD.includes("we didn't look"), 'persona must state the empty-witness ambiguity (never "nothing changed"/"the worker lied")');
+  // Forward-only paging + unattributed window.
+  assert.ok(SUPERVISOR_AGENT_MD.includes('pages forward only'), 'persona must state that `since` pages forward only');
+  assert.ok(SUPERVISOR_AGENT_MD.includes('unattributed'), 'persona must call the raw `window` diff unattributed');
+  // Shared-tree immediate/destructive mutation + prune-never-a-fix.
+  assert.ok(SUPERVISOR_AGENT_MD.includes('immediate and destructive in a shared tree'), 'persona must warn mutation is immediate/destructive in a shared tree');
+  assert.ok(SUPERVISOR_AGENT_MD.includes('never a fix for broken'), 'persona must state prune is never a fix for broken capture');
+  // The amendment: a preview return is a refusal (present in the PERSONA).
+  assert.ok(
+    SUPERVISOR_AGENT_MD.includes('*preview* instead of a result is a'),
+    'persona must state that a restore_paths call returning a preview is a refusal',
+  );
+  assert.ok(SUPERVISOR_AGENT_MD.includes('checkpoint-forensics'), 'persona must point at the checkpoint-forensics skill');
+});
+
+test('the checkpoint-forensics skill carries the three-layer model, both edges, recipes A–F, and the destructive-mutation warnings', () => {
+  const skill = SUPERVISOR_CHECKPOINT_FORENSICS_SKILL;
+  assert.ok(skill.startsWith('---\nname: checkpoint-forensics\n'), 'the skill frontmatter must open the file');
+  // Three record layers.
+  assert.ok(skill.includes('Three records of different reach'), 'skill must name the three-record evidence model');
+  for (const layer of ['Raw git checkpoints', 'read_agent_files_touched', 'witnessedPaths']) {
+    assert.ok(skill.includes(layer), `skill evidence model must name the ${layer} layer`);
+  }
+  // Both readiness edges as the usability gate.
+  assert.ok(skill.includes('beforeReady && afterReady && failureReason==null'), 'skill must gate a usable pair on both edges + null failureReason');
+  // Empty-witness ambiguity.
+  assert.ok(skill.includes('Empty witnessed ≠ dishonesty'), 'skill must state the empty-witness ambiguity');
+  // Newest-N window + forward-only paging.
+  assert.ok(skill.includes('newest-N'), 'skill must describe list_checkpoints as a newest-N window');
+  assert.ok(skill.includes('cannot page backward'), 'skill must state `since` cannot page backward');
+  // Normal unattributed window.
+  assert.ok(skill.includes("additions ≠ the selected agent's by default"), 'skill must treat raw `window` additions as unattributed by default');
+  // All six recipes present.
+  for (const r of ['## Recipe A', '## Recipe B', '## Recipe C', '## Recipe D', '## Recipe E', '## Recipe F']) {
+    assert.ok(skill.includes(r), `skill must contain ${r}`);
+  }
+  // Shared-tree rollback warning (Recipe F).
+  assert.ok(skill.includes("never destroys a peer's uncommitted work"), 'skill Recipe F must warn about a shared tree / peer uncommitted work');
+  // prune_checkpoints destructive / never-remediation.
+  assert.ok(skill.includes('never** health'), 'skill must state prune is never health maintenance');
+  assert.ok(skill.includes('is never outage'), 'skill must state prune is never outage remediation and is irreversible');
+  // The amendment: a preview return is a refusal (present in the SKILL — both the
+  // tool map and Recipe F).
+  assert.ok(skill.includes('refusal, not a success'), 'skill tool map must state a preview return is a refusal, not a success');
+  assert.ok(skill.includes('the restore was refused and'), 'skill Recipe F must state a returned preview means the restore was refused');
 });
 
 // ── Runner ───────────────────────────────────────────────────────────
