@@ -14,7 +14,7 @@
 import assert from 'node:assert/strict';
 
 import type { GitCapability } from '../../shared/types';
-import { buildDispatchTurnContext, type DispatchDeps, type DispatchAgentInfo } from './dispatch-context';
+import { buildDispatchTurnContext, deriveTaskLabel, type DispatchDeps, type DispatchAgentInfo } from './dispatch-context';
 
 interface TestCase { name: string; run(): Promise<void> | void; }
 const tests: TestCase[] = [];
@@ -91,6 +91,59 @@ test('non-repo / unusable capability → null (no checkpoint, delivery unaffecte
   const noRoot = { ...capOk(), repoRoot: null } as GitCapability;
   const deps2 = makeDeps({ worker: { workspaceId: 'ws1' } }, noRoot);
   assert.equal(await buildDispatchTurnContext(deps2, 'worker', { origin: 'api' }), null);
+});
+
+// ── WP3: deriveTaskLabel (defect-2 first-prompt-line fallback) ────────────────
+
+test('deriveTaskLabel: empty / blank / nullish → null', () => {
+  assert.equal(deriveTaskLabel(undefined), null);
+  assert.equal(deriveTaskLabel(null), null);
+  assert.equal(deriveTaskLabel(''), null);
+  assert.equal(deriveTaskLabel('   '), null);
+  assert.equal(deriveTaskLabel('\n\n  \n'), null);
+});
+
+test('deriveTaskLabel: first-line fallback (single line)', () => {
+  assert.equal(deriveTaskLabel('Fix the login bug'), 'Fix the login bug');
+});
+
+test('deriveTaskLabel: multi-line uses the first NON-EMPTY line', () => {
+  assert.equal(deriveTaskLabel('\n\n  Refactor the parser  \nand add tests'), 'Refactor the parser');
+});
+
+test('deriveTaskLabel: leading @mention stripped', () => {
+  assert.equal(deriveTaskLabel('@worker implement the cache'), 'implement the cache');
+});
+
+test('deriveTaskLabel: leading -/* bullet stripped', () => {
+  assert.equal(deriveTaskLabel('- do the thing'), 'do the thing');
+  assert.equal(deriveTaskLabel('* do the other thing'), 'do the other thing');
+});
+
+test('deriveTaskLabel: internal whitespace collapsed (incl. tabs)', () => {
+  assert.equal(deriveTaskLabel('add   the\t\tfeature   now'), 'add the feature now');
+});
+
+test('deriveTaskLabel: >120 chars truncated to 120', () => {
+  const long = 'a'.repeat(200);
+  const out = deriveTaskLabel(long);
+  assert.ok(out);
+  assert.equal(out!.length, 120);
+  assert.equal(out, 'a'.repeat(120));
+});
+
+test('deriveTaskLabel: a bare marker with no following content is left as-is', () => {
+  assert.equal(deriveTaskLabel('@worker'), '@worker');
+  assert.equal(deriveTaskLabel('-'), '-');
+});
+
+test('explicit dispatch.taskLabel is the brief the coordinator will prefer (precedence lives in openTurn)', async () => {
+  // buildDispatchTurnContext maps the brief into ctx.taskLabel; the openTurn
+  // precedence (explicit brief beats derived promptText) is asserted here by
+  // confirming the brief survives onto the context verbatim.
+  const deps = makeDeps({ worker: { workspaceId: 'ws1' } });
+  const ctx = await buildDispatchTurnContext(deps, 'worker', { origin: 'orchestration', taskLabel: 'Explicit brief' });
+  assert.equal(ctx!.taskLabel, 'Explicit brief');
 });
 
 // ── Runner ───────────────────────────────────────────────────────────────────

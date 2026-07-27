@@ -31,6 +31,33 @@ export interface DispatchContext {
   sessionId?: string | null;
 }
 
+/**
+ * Derive a turn's task label from free prompt text (WP3, defect-2 fallback). Used
+ * only when the dispatch carries no explicit `taskLabel` (== dispatch brief). Steps,
+ * in order: first non-empty trimmed line → collapse internal whitespace runs to a
+ * single space → strip a single leading `@mention` or `-`/`*` bullet marker →
+ * truncate to 120 chars. Returns null when nothing usable remains (blank/empty in).
+ */
+export function deriveTaskLabel(promptText: string | null | undefined): string | null {
+  if (!promptText) return null;
+  // 1. First non-empty trimmed line.
+  let line = '';
+  for (const raw of promptText.split(/\r?\n/)) {
+    const trimmed = raw.trim();
+    if (trimmed) { line = trimmed; break; }
+  }
+  if (!line) return null;
+  // 2. Collapse internal whitespace runs to a single space.
+  line = line.replace(/\s+/g, ' ').trim();
+  // 3. Strip a single leading @mention or -/* bullet marker (only when followed by
+  //    content — a bare marker with nothing after it is left as-is).
+  line = line.replace(/^(?:@\S+|[-*])\s+/, '').trim();
+  if (!line) return null;
+  // 4. Truncate to 120 chars.
+  if (line.length > 120) line = line.slice(0, 120).trimEnd();
+  return line || null;
+}
+
 /** The minimal agent shape the builder reads (a subset of the DB `Agent`). */
 export interface DispatchAgentInfo {
   workspaceId: string;

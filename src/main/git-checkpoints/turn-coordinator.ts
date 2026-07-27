@@ -41,6 +41,7 @@ import {
   listTurnRecords as dbListTurnRecords,
 } from '../database';
 import type { GitCapability } from '../../shared/types';
+import { deriveTaskLabel } from './dispatch-context';
 import type { CaptureEdgeParams, EdgeCaptureResult } from './checkpoint-service';
 import type { AfterQuality, TurnCompleteEvent } from '../supervisor/turn-completion-tracker';
 
@@ -117,6 +118,10 @@ export interface TurnContext {
   ownerBrickGeneration?: number | null;
   sessionId?: string | null;
   taskLabel?: string | null;
+  /** Free prompt text for this turn (WP3). A turn-opening input — deliberately NOT on
+   *  `DispatchContext` (which stays dispatch metadata). When `taskLabel` (the dispatch
+   *  brief) is blank, `openTurn` derives the label from this via `deriveTaskLabel`. */
+  promptText?: string;
   /** `guaranteed` (default) for a normal pre-write edge; `late` for a manual-terminal
    *  late-bound turn. Downgraded to `degraded` automatically if capture fails. */
   quality?: BeforeQuality;
@@ -219,7 +224,9 @@ export class TurnCoordinator {
       ownerAgentId: ctx.ownerAgentId ?? null,
       ownerBrickGeneration: ctx.ownerBrickGeneration ?? null,
       sessionId: ctx.sessionId ?? null,
-      taskLabel: ctx.taskLabel ?? null,
+      // WP3: explicit dispatch brief (`taskLabel`) wins; else derive from the first
+      // usable prompt line; else null. `.trim() || …` makes a blank brief fall through.
+      taskLabel: ctx.taskLabel?.trim() || deriveTaskLabel(ctx.promptText) || null,
       startedAt: this.now(),
       status: 'open',
     });

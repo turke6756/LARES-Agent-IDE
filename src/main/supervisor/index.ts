@@ -6492,6 +6492,9 @@ export class AgentSupervisor extends EventEmitter {
           dispatch ?? { origin: 'human-terminal' },
         );
         if (ctx) {
+          // WP3 (defect-2): supply the raw send text so `openTurn` can derive a
+          // task_label when the dispatch carried no explicit brief (`taskLabel`).
+          ctx.promptText = text;
           await this.checkpointEngine.coordinator.beforeCheckpoint(agentId, ctx);
           openedTurn = true;
         }

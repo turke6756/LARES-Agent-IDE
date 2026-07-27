@@ -446,6 +446,47 @@ test('shutdown closes all open turns `interrupted` and unsubscribes', async () =
   assert.equal(store.getTurnRecord(a.turnId)!.status, 'interrupted');
 });
 
+// ── WP3: task_label populated at openTurn (defect-2) ────────────────────────────
+
+test('openTurn: an orchestration/dispatch submit (explicit brief) yields non-null task_label', async () => {
+  const store = new FakeStore();
+  const co = new TurnCoordinator({ capture: makeCapture(store).fn, completion: new FakeCompletion(), store, now: () => 1000 });
+  // A dispatch carries the brief as ctx.taskLabel (buildDispatchTurnContext maps it).
+  const res = await co.beforeCheckpoint(A, mkCtx({ taskLabel: 'Implement the cache', promptText: undefined }));
+  assert.equal(store.getTurnRecord(res.turnId)!.taskLabel, 'Implement the cache');
+});
+
+test('openTurn: a human-terminal submit (no brief, promptText only) derives a non-null task_label', async () => {
+  const store = new FakeStore();
+  const co = new TurnCoordinator({ capture: makeCapture(store).fn, completion: new FakeCompletion(), store, now: () => 1000 });
+  // Human terminals carry no taskLabel; _deliverAndConfirm attaches ctx.promptText = text.
+  const res = await co.beforeCheckpoint(A, mkCtx({ taskLabel: undefined, promptText: '@worker  fix the\tlogin bug\nand ship it' }));
+  assert.equal(store.getTurnRecord(res.turnId)!.taskLabel, 'fix the login bug', 'derived from the first prompt line');
+});
+
+test('openTurn precedence: explicit brief BEATS promptText (mutation check)', async () => {
+  const store = new FakeStore();
+  const co = new TurnCoordinator({ capture: makeCapture(store).fn, completion: new FakeCompletion(), store, now: () => 1000 });
+  const res = await co.beforeCheckpoint(A, mkCtx({ taskLabel: 'Explicit brief', promptText: 'derived would-be label' }));
+  const label = store.getTurnRecord(res.turnId)!.taskLabel;
+  assert.equal(label, 'Explicit brief', 'the brief wins; the derived promptText label must NOT be used');
+  assert.notEqual(label, 'derived would-be label');
+});
+
+test('openTurn precedence: a BLANK brief falls through to the derived promptText label', async () => {
+  const store = new FakeStore();
+  const co = new TurnCoordinator({ capture: makeCapture(store).fn, completion: new FakeCompletion(), store, now: () => 1000 });
+  const res = await co.beforeCheckpoint(A, mkCtx({ taskLabel: '   ', promptText: 'derived label' }));
+  assert.equal(store.getTurnRecord(res.turnId)!.taskLabel, 'derived label', 'a whitespace-only brief is not a usable label');
+});
+
+test('openTurn: no brief and no usable promptText → task_label null', async () => {
+  const store = new FakeStore();
+  const co = new TurnCoordinator({ capture: makeCapture(store).fn, completion: new FakeCompletion(), store, now: () => 1000 });
+  const res = await co.beforeCheckpoint(A, mkCtx({ taskLabel: undefined, promptText: '   \n\n  ' }));
+  assert.equal(store.getTurnRecord(res.turnId)!.taskLabel, null);
+});
+
 // ── runner ─────────────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
