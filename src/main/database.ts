@@ -11,7 +11,7 @@ import { DEFAULT_COMMAND, DEFAULT_COMMAND_WSL, SUPERVISOR_AGENT_MD } from '../sh
 import { parseRepoActivityEvidence } from './plans/repo-activity';
 import { OrchestrationEvent, OrchestrationRun } from './orchestration/types';
 import { resolveWorkspaceForCwd, WORKSPACE_LINEAGE_VERSION, type WorkspaceRecordLite } from './skill-analytics/workspace-lineage';
-import { unwrapOsc8, stripTerminalEscapes, canonicalizeToAbsolute } from './file-activity-normalize';
+import { unwrapOsc8, stripTerminalEscapes, canonicalizeToAbsolute, looksPolluted } from './file-activity-normalize';
 
 let db: Database.Database;
 let dbPath: string;
@@ -1515,6 +1515,16 @@ function initContextOptimizerSchema(): void {
   } catch (err) {
     console.warn('[database] workspace-lineage backfill failed:', err);
   }
+
+  // Checkpoint Surface Hardening WP2 — remediate defect-1 pollution (OSC-8 /
+  // terminal-escape residue) in the historical witness-bearing path stores. Follows
+  // the file_activities cleanup precedent above (self-limiting via `looksPolluted`,
+  // no version table); wrapped so a malformed row can never crash DB init.
+  try {
+    sanitizeHistoricalWitnessPaths(db);
+  } catch (err) {
+    console.warn('[database] WP2 witness-path sanitize migration failed:', err);
+  }
 }
 
 function slugify(text: string): string {
@@ -1624,6 +1634,203 @@ function rowToAgent(row: any): Agent {
     stoppedAt: row.stopped_at ?? null,
     lastStopReason: parseStopReason(row.last_stop_reason ?? null),
   };
+}
+
+// ── Checkpoint Surface Hardening WP2: historical witness-path backfill ────────
+//
+// Idempotent boot-time remediation of defect-1 pollution (OSC-8 / terminal-escape
+// residue) in the four witness-bearing path stores, following the
+// `initDatabase` file_activities-cleanup precedent (self-limiting `WHERE` via the
+// `looksPolluted` prefilter, try/catch, NO version table) wrapped in ONE
+// `db.transaction`. Re-running is a no-op once the polluted rows/entries are
+// cleaned — the prefilter no longer matches them.
+//
+// Two NON-interchangeable canonical forms are preserved per-store (plan §"Two
+// explicit, non-interchangeable canonicalizers"):
+//   • `file_activities.file_path`  → verified absolute NATIVE path. The historical
+//     cwd/home are NOT immutably attributable, so ONLY context-independent spelling
+//     transforms run (`file:` URI decode, percent-decode, separator/drive-case) —
+//     NEVER `~`/relative resolution (empty ctx passed to `canonicalizeToAbsolute`).
+//     A value that recovers ambiguous, empty, or only to a relative/`~` path → the
+//     ROW is DELETED (quarantine == delete; there is no quarantine store).
+//   • `turn_records.touched[]` and `recovery_operations.{pre_included_paths,
+//     requested_paths,completed_paths}` → validated workspace-relative POSIX. These
+//     were stored via `normalizeWitnessPath`, so the only corruption is embedded
+//     escape text; after unwrap the repoRoot-INDEPENDENT structural subset of the
+//     witness checks runs (relative, POSIX-separated, non-empty, not `..`-escaping).
+//     `repoRoot`/`workspacePrefix` are unavailable at migration time, so the full
+//     scope re-check is not run; an entry that comes out absolute, drive-rooted,
+//     outward-traversing, or ambiguous is REMOVED from the array (never coerced).
+//     Entries are re-deduped after cleaning.
+//
+// No blanket separator conversion across the two representations — native for
+// `file_activities`, POSIX for the JSON arrays, handled per-store.
+
+type SanitizeCounts = { repaired: number; discarded: number; merged: number };
+
+/** Post-`canonicalizeToAbsolute` (empty ctx) verified-absolute predicate: a
+ *  Windows drive-rooted path, a UNC share, or a POSIX-absolute (WSL) path. A
+ *  relative or unexpanded-`~` residue fails this → the row is discarded. */
+function isVerifiedAbsolutePath(p: string): boolean {
+  return /^[A-Za-z]:[\\/]/.test(p) || p.startsWith('\\\\') || p.startsWith('/');
+}
+
+/** Clean a stored workspace-relative POSIX witness path (defect-1 unwrap only)
+ *  and validate it against the repoRoot-independent structural subset. Returns the
+ *  normalized POSIX path to keep, or `null` to REMOVE the entry (ambiguous /
+ *  absolute / drive-rooted / backslash / outward-traversing / empty). Never
+ *  coerces a failing shape into a passing one. */
+function cleanWorkspaceRelativePath(raw: unknown): string | null {
+  if (typeof raw !== 'string' || raw === '') return null;
+  const clean = unwrapOsc8(raw);
+  if ('ambiguous' in clean) return null;
+  const t = stripTerminalEscapes(clean.text).trim();
+  if (t === '') return null;
+  if (t.includes('\\')) return null;                        // not POSIX-separated
+  if (t.includes('\x1b') || t.includes(']8;')) return null; // residual pollution
+  if (/^[A-Za-z]:[\\/]/.test(t)) return null;               // drive-rooted (absolute)
+  if (t.startsWith('/')) return null;                       // absolute
+  const norm = path.posix.normalize(t);
+  if (norm === '' || norm === '.') return null;
+  if (norm === '..' || norm.startsWith('../')) return null; // outward traversal
+  return norm;
+}
+
+/**
+ * Remediate defect-1 pollution across the witness-bearing path stores. Idempotent;
+ * runs inside ONE transaction (rolls back on error). Emits and logs aggregate
+ * `{ repaired, discarded, merged }` per table.
+ */
+export function sanitizeHistoricalWitnessPaths(handle: Database.Database): {
+  file_activities: SanitizeCounts;
+  turn_records: SanitizeCounts;
+  recovery_operations: SanitizeCounts;
+} {
+  const tx = handle.transaction(() => {
+    const fa: SanitizeCounts = { repaired: 0, discarded: 0, merged: 0 };
+    const tr: SanitizeCounts = { repaired: 0, discarded: 0, merged: 0 };
+    const ro: SanitizeCounts = { repaired: 0, discarded: 0, merged: 0 };
+
+    // ── file_activities.file_path → verified absolute NATIVE path ───────────────
+    const faDelete = handle.prepare('DELETE FROM file_activities WHERE id = ?');
+    const faUpdate = handle.prepare('UPDATE file_activities SET file_path = ? WHERE id = ?');
+    const faRows = handle
+      .prepare('SELECT id, agent_id, file_path, operation, generation, session_id FROM file_activities')
+      .all() as Array<{
+        id: number; agent_id: string; file_path: string; operation: string;
+        generation: number; session_id: string | null;
+      }>;
+    // Identity tuples touched by a repair — the ONLY groups a post-normalization
+    // collision merge is allowed to collapse (a group never touched by repair is
+    // left untouched, so genuinely-clean rows are never merged).
+    const repairedIdentities: Array<{
+      agent_id: string; file_path: string; operation: string;
+      generation: number; session_id: string | null;
+    }> = [];
+    for (const r of faRows) {
+      if (!looksPolluted(r.file_path)) continue;
+      const clean = unwrapOsc8(r.file_path);
+      if ('ambiguous' in clean) { faDelete.run(r.id); fa.discarded++; continue; }
+      // Empty ctx: context-independent transforms ONLY — never ~/relative resolution.
+      const abs = canonicalizeToAbsolute(stripTerminalEscapes(clean.text), {});
+      if (abs === '' || !isVerifiedAbsolutePath(abs)) { faDelete.run(r.id); fa.discarded++; continue; }
+      faUpdate.run(abs, r.id);
+      fa.repaired++;
+      repairedIdentities.push({
+        agent_id: r.agent_id, file_path: abs, operation: r.operation,
+        generation: r.generation, session_id: r.session_id,
+      });
+    }
+    // Collision merge — production dedupe identity
+    // (agent_id, file_path, operation, generation, session_id) with null-safe `IS`.
+    // Keep the lowest `id` (earliest event identity), delete the rest.
+    const faGroup = handle.prepare(
+      `SELECT id FROM file_activities
+       WHERE agent_id = ? AND file_path = ? AND operation = ? AND generation = ? AND session_id IS ?
+       ORDER BY id ASC`
+    );
+    const mergedKeys = new Set<string>();
+    for (const idn of repairedIdentities) {
+      const key = JSON.stringify([idn.agent_id, idn.file_path, idn.operation, idn.generation, idn.session_id]);
+      if (mergedKeys.has(key)) continue;
+      mergedKeys.add(key);
+      const dupes = faGroup.all(
+        idn.agent_id, idn.file_path, idn.operation, idn.generation, idn.session_id
+      ) as Array<{ id: number }>;
+      for (let i = 1; i < dupes.length; i++) { faDelete.run(dupes[i].id); fa.merged++; }
+    }
+
+    // ── turn_records.touched[] → validated workspace-relative POSIX ─────────────
+    const trUpdate = handle.prepare('UPDATE turn_records SET touched = ? WHERE id = ?');
+    const trRows = handle
+      .prepare('SELECT id, touched FROM turn_records WHERE touched IS NOT NULL')
+      .all() as Array<{ id: string; touched: string }>;
+    for (const r of trRows) {
+      if (!looksPolluted(r.touched)) continue;
+      let arr: unknown;
+      try { arr = JSON.parse(r.touched); } catch { continue; }
+      if (!Array.isArray(arr)) continue;
+      const seen = new Set<string>();
+      const cleaned: Array<Record<string, unknown>> = [];
+      for (const entry of arr) {
+        if (!entry || typeof entry !== 'object') { tr.discarded++; continue; }
+        const e = entry as Record<string, unknown>;
+        const cp = cleanWorkspaceRelativePath(e.path);
+        if (cp === null) { tr.discarded++; continue; }
+        const dk = JSON.stringify([cp, e.op]);
+        if (seen.has(dk)) { tr.merged++; continue; } // re-dedupe (path, op)
+        seen.add(dk);
+        cleaned.push({ ...e, path: cp });
+      }
+      const next = JSON.stringify(cleaned);
+      if (next !== r.touched) { trUpdate.run(next, r.id); tr.repaired++; }
+    }
+
+    // ── recovery_operations.{pre_included,requested,completed}_paths → POSIX ─────
+    const roCols = ['pre_included_paths', 'requested_paths', 'completed_paths'] as const;
+    const roRows = handle
+      .prepare('SELECT id, pre_included_paths, requested_paths, completed_paths FROM recovery_operations')
+      .all() as Array<Record<string, string | null> & { id: string }>;
+    for (const r of roRows) {
+      const updates: Record<string, string> = {};
+      for (const col of roCols) {
+        const rawJson = r[col];
+        if (rawJson == null || !looksPolluted(rawJson)) continue;
+        let arr: unknown;
+        try { arr = JSON.parse(rawJson); } catch { continue; }
+        if (!Array.isArray(arr)) continue;
+        const seen = new Set<string>();
+        const cleaned: unknown[] = [];
+        for (const entry of arr) {
+          const isObj = !!entry && typeof entry === 'object';
+          const pathVal = isObj ? (entry as Record<string, unknown>).path
+            : (typeof entry === 'string' ? entry : undefined);
+          const cp = cleanWorkspaceRelativePath(pathVal);
+          if (cp === null) { ro.discarded++; continue; }
+          const rebuilt = isObj ? { ...(entry as Record<string, unknown>), path: cp } : cp;
+          const dk = isObj ? JSON.stringify(rebuilt) : cp;
+          if (seen.has(dk)) { ro.merged++; continue; } // re-dedupe after normalization
+          seen.add(dk);
+          cleaned.push(rebuilt);
+        }
+        const next = JSON.stringify(cleaned);
+        if (next !== rawJson) updates[col] = next;
+      }
+      const cols = Object.keys(updates);
+      if (cols.length > 0) {
+        handle
+          .prepare(`UPDATE recovery_operations SET ${cols.map((c) => `${c} = ?`).join(', ')} WHERE id = ?`)
+          .run(...cols.map((c) => updates[c]), r.id);
+        ro.repaired++;
+      }
+    }
+
+    return { file_activities: fa, turn_records: tr, recovery_operations: ro };
+  });
+
+  const counts = tx();
+  console.log('[database] WP2 witness-path sanitize:', JSON.stringify(counts));
+  return counts;
 }
 
 /** Accessor for the process-wide better-sqlite3 handle. Used by sibling main
