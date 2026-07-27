@@ -25,11 +25,11 @@ function test(name: string, fn: () => void): void { tests.push({ name, run: fn }
 test('the checked-in manifest parses and has the expected shape', () => {
   const p = resolveMinGitManifestPath({ isPackaged: false });
   const m = loadMinGitManifestFrom(p);
-  // Placeholders are empty strings until WP-G0.5 pins the version.
-  assert.equal(m.version, '');
-  assert.equal(m.archiveUrl, '');
-  assert.equal(m.sha256, '');
-  assert.equal(m.archiveName, '');
+  // Open decision #1 resolved: the manifest is pinned to a real MinGit release.
+  assert.match(m.version, /\.windows\.\d+$/);
+  assert.match(m.archiveUrl, /^https:\/\/github\.com\/git-for-windows\/git\/releases\/download\//);
+  assert.match(m.sha256, /^[0-9a-f]{64}$/);
+  assert.ok(m.archiveName && m.archiveUrl.endsWith(m.archiveName), 'archiveName matches the tail of archiveUrl');
   // Standard MinGit layout value ships now.
   assert.equal(m.packagedGitExeRelPath, 'cmd/git.exe');
 });

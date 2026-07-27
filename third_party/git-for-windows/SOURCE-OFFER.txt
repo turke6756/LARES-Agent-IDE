@@ -8,7 +8,8 @@ file as GPLv2.txt.
 
 The exact, pinned version of the Program that Lares bundles is:
 
-    Git for Windows / MinGit <PINNED-VERSION>
+    Git for Windows / MinGit v2.55.0.windows.3
+    (Git for Windows 2.55.0(3), bundled as MinGit 64-bit)
 
 For any binary distribution of Lares that includes the Program, and for a
 period of at least THREE (3) YEARS from the date Lares distributed that binary

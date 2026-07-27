@@ -6,20 +6,21 @@ code for the exact pinned version of Git for Windows that Lares bundles as
 MinGit. It is provided for convenience only; the binding obligation is the
 three-year written offer in SOURCE-OFFER.txt, not this URL.
 
-Replace <PINNED-VERSION> with the pinned git-for-windows release tag recorded in
-mingit-manifest.json (for example, a tag of the form vX.Y.Z.windows.N).
+The pinned git-for-windows release tag recorded in mingit-manifest.json is:
+
+    v2.55.0.windows.3   (Git for Windows 2.55.0(3), bundled as MinGit 64-bit)
 
 Source release page (tag + release notes + source archives):
 
-    https://github.com/git-for-windows/git/releases/tag/<PINNED-VERSION>
+    https://github.com/git-for-windows/git/releases/tag/v2.55.0.windows.3
 
 Full source tree at the pinned tag:
 
-    https://github.com/git-for-windows/git/tree/<PINNED-VERSION>
+    https://github.com/git-for-windows/git/tree/v2.55.0.windows.3
 
 Source archive (tarball) at the pinned tag:
 
-    https://github.com/git-for-windows/git/archive/refs/tags/<PINNED-VERSION>.tar.gz
+    https://github.com/git-for-windows/git/archive/refs/tags/v2.55.0.windows.3.tar.gz
 
 Git for Windows is itself a downstream of upstream Git (https://git-scm.com);
 the git-for-windows/git repository above is the corresponding source for the

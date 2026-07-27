@@ -318,7 +318,7 @@ function makeDeps(over: Partial<ExporterDeps> = {}): { deps: Partial<ExporterDep
     buildPlanActivityProjection: (() => ({})) as unknown as ExporterDeps['buildPlanActivityProjection'],
     isEpochsBackfilled: () => true,
     skillIndexComplete: () => true,
-    gitInfo: () => ({ sha: 'abc123', branch: 'master', dirty: false }),
+    gitInfo: async () => ({ sha: 'abc123', branch: 'master', dirty: false }),
     appVersion: () => '0.0.0-test',
     repoDir: () => WS_ROOT,
     closeDatabase: () => { spy.closed += 1; },

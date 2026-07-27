@@ -82,12 +82,17 @@ function buildFixtureArchive(tag) {
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
-await test('real checked-in manifest is a placeholder → assertManifestPinned throws not-pinned', () => {
+await test('real checked-in manifest is now PINNED → assertManifestPinned passes and fields are well-formed', () => {
   const p = mingitPaths(repoRoot);
   const real = readManifest(p.manifestPath);
-  assert.ok(isPlaceholderManifest(real), 'checked-in manifest should still be unpinned (Open decision #1)');
-  assert.throws(() => assertManifestPinned(real), /not yet pinned/i);
-  // packagedGitExeRelPath is the one non-placeholder field.
+  // Open decision #1 is resolved: the manifest is pinned to a real MinGit release.
+  assert.equal(isPlaceholderManifest(real), false, 'checked-in manifest must be pinned (Open decision #1 resolved)');
+  assert.doesNotThrow(() => assertManifestPinned(real));
+  // The pinned fields must be well-formed and mutually consistent.
+  assert.match(real.version, /\.windows\.\d+$/, 'version is a git-for-windows release tag');
+  assert.match(real.sha256, /^[0-9a-f]{64}$/, 'sha256 is a 64-hex lowercase digest');
+  assert.match(real.archiveUrl, /^https:\/\/github\.com\/git-for-windows\/git\/releases\/download\//, 'archiveUrl is an official GfW release asset');
+  assert.ok(real.archiveName && real.archiveUrl.endsWith(real.archiveName), 'archiveName matches the tail of archiveUrl');
   assert.equal(real.packagedGitExeRelPath, 'cmd/git.exe');
 });
 

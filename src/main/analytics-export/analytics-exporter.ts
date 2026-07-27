@@ -34,6 +34,7 @@ import {
 } from '../database';
 import type { AgentRoleLane, ContextOptimizerResult, OverheadModel, Workspace } from '../../shared/types';
 import { runOverheadScan } from '../context-overhead/ipc-deps';
+import { resolveInternalGit } from '../git/git-runtime';
 import { workspaceStateDir } from '../workspace-state-dir';
 import { redactOverheadModel, computeOverheadGenerationId } from '../context-overhead/overhead-dto';
 import { runLiveOptimizerAnalyze, type LiveOptimizerAnalyzeDeps } from '../context-optimizer/optimizer-live-analyze';
@@ -149,7 +150,7 @@ export interface ExporterDeps {
   buildPlanActivityProjection: typeof buildPlanActivityProjection;
   isEpochsBackfilled(db: unknown): boolean;
   skillIndexComplete(db: unknown): boolean;
-  gitInfo(root: string): { sha: string | null; branch: string | null; dirty: boolean | null };
+  gitInfo(root: string): Promise<{ sha: string | null; branch: string | null; dirty: boolean | null }>;
   appVersion(): string;
   repoDir(): string;
   /** WP7 (G7): the nested guidance-inventory scan under the declared contract.
@@ -225,10 +226,19 @@ export function defaultSkillIndexComplete(db: unknown): boolean {
   }
 }
 
-function defaultGitInfo(root: string): { sha: string | null; branch: string | null; dirty: boolean | null } {
+async function defaultGitInfo(root: string): Promise<{ sha: string | null; branch: string | null; dirty: boolean | null }> {
+  // DEF-6: route through the same resolver the checkpoint engine uses
+  // (resolveInternalGit) instead of a bare `git`, so attribution works on a box
+  // with bundled MinGit but no *system* git. Falls back to a bare `git` only if
+  // the resolver finds nothing — attribution is best-effort, never fatal.
+  let gitExe = 'git';
+  try {
+    const internal = await resolveInternalGit();
+    if (internal?.execPath) gitExe = internal.execPath;
+  } catch { /* keep the bare-git fallback */ }
   const run = (args: string[]): string | null => {
     try {
-      return execFileSync('git', args, { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+      return execFileSync(gitExe, args, { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
     } catch { return null; }
   };
   const sha = run(['rev-parse', 'HEAD']);
@@ -839,7 +849,7 @@ export async function captureAnalyticsSnapshot(o: AnalyticsSnapshotOptions): Pro
       SURFACE_KEYS.map((k) => [k, surfaceProvenances[k].comparabilityKey]),
     ) as Record<SurfaceKey, string>,
   };
-  const git = d.gitInfo(ws.path);
+  const git = await d.gitInfo(ws.path);
   conditions.gitShaAvailable = git.sha !== null;
   const caveats = buildCaveats(conditions);
 
