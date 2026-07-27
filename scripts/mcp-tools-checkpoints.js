@@ -23,12 +23,26 @@ function getCheckpointsToolDefinitions() {
         'List the recoverable turns/checkpoints in YOUR workspace (workspace scope is fixed to your '
         + 'capability — you cannot list another workspace). Each row: turnId, turnSeq, agentId, '
         + 'agentTitle, taskLabel, status, timing, before/after checkpoint readiness + quality, the '
-        + 'witnessed touched paths, and any failureReason. Optionally filter to one agent with `agent_id`. '
-        + 'Use this to find the turnId to diff, restore from, or revert.',
+        + 'witnessed touched paths, and any failureReason. Use this to find the turnId to diff, restore '
+        + 'from, or revert.\n'
+        + 'FILTERS (all optional): `agent_id` restricts to one agent; `since` is an EXCLUSIVE turnSeq '
+        + 'lower bound — the paging cursor (pass the largest turnSeq from your previous page to fetch only '
+        + 'newer turns); `sinceTime` is a SEPARATE coarse time floor (startedAt >=, epoch-ms or ISO-8601), '
+        + 'never the cursor; `file` returns only turns whose witnessed touched set includes that '
+        + 'workspace-relative path; `limit` bounds the page to 1–200 (DEFAULT 50 — out-of-range or '
+        + 'non-integer is REJECTED, never clamped).\n'
+        + 'ORDERING: rows come back oldest→newest (ascending) within the newest-N window the cursor '
+        + 'selected. If the serialized result would exceed the tool-output budget, the OLDEST rows are '
+        + 'dropped first and the payload carries `truncated:true` with `returnedCount` / `totalMatched` — '
+        + 'page with `since` (or a smaller `limit`/a `file` filter) to see the rest.',
       inputSchema: {
         type: 'object',
         properties: {
           agent_id: { type: 'string', description: 'Optional: restrict the list to checkpoints produced by this agent.' },
+          since: { type: 'integer', description: 'Optional: exclusive turnSeq lower bound (the paging cursor). Only turns with turnSeq > this are returned.' },
+          sinceTime: { type: ['integer', 'string'], description: 'Optional coarse time floor: only turns with startedAt >= this (epoch-ms integer or ISO-8601 string). A separate filter, never the cursor.' },
+          limit: { type: 'integer', description: 'Optional max rows, 1–200 (default 50). An out-of-range or non-integer value is rejected, not clamped.' },
+          file: { type: 'string', description: 'Optional: only turns whose witnessed touched set includes this workspace-relative path. Absolute / out-of-workspace / ..-escaping paths are rejected.' },
         },
         required: [],
       },
@@ -110,12 +124,76 @@ function asText(payload) {
   return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] };
 }
 
+// WP4 MCP byte guard (MCP seam only — the HTTP contract is unchanged). A
+// workspace-wide `list_checkpoints` with large touched[] sets once returned ~150 KB
+// and blew the tool-output cap. We serialize INCLUDING the tool-wrapper envelope +
+// the metadata fields, keep the NEWEST fitting rows, and drop the OLDEST rows first
+// when the projected size would exceed the budget — never mutating a row's shape.
+const LIST_CHECKPOINTS_OUTPUT_CAP_BYTES = 100_000;
+
+/** Build the `list_checkpoints` payload under the byte budget. `resp` is the
+ *  unchanged `{ workspaceId, turns[] }` HTTP response (turns ascending by turnSeq).
+ *  Returns a tool result whose `turns[]` stays ascending, plus `truncated`,
+ *  `returnedCount`, and `totalMatched` (the count the route returned, i.e. the
+ *  matched set BEFORE this MCP byte truncation). A single oversized row legitimately
+ *  yields zero rows with `truncated:true` — never an over-budget payload. */
+function buildListCheckpointsResult(resp) {
+  const workspaceId = resp && resp.workspaceId;
+  const allTurns = resp && Array.isArray(resp.turns) ? resp.turns : [];
+  const totalMatched = allTurns.length;
+
+  // Route returns ascending; select from the newest end first.
+  const newestFirst = allTurns.slice().reverse();
+
+  // Projected serialized size of the FULL tool result (JSON-RPC wrapper text +
+  // metadata) for a given fitting set. `truncated:true` is the longer boolean, so
+  // measuring with it reserves a byte over the eventual `false` case.
+  const projectedBytes = (fitting) => {
+    const payload = {
+      workspaceId,
+      turns: fitting,
+      truncated: true,
+      returnedCount: fitting.length,
+      totalMatched,
+    };
+    return Buffer.byteLength(
+      JSON.stringify({ content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] }),
+      'utf8',
+    );
+  };
+
+  const selected = [];
+  for (const row of newestFirst) {
+    if (projectedBytes(selected.concat([row])) > LIST_CHECKPOINTS_OUTPUT_CAP_BYTES) break;
+    selected.push(row);
+  }
+
+  const turns = selected.slice().reverse(); // restore ascending for the fitting set
+  const payload = {
+    workspaceId,
+    turns,
+    truncated: selected.length < totalMatched,
+    returnedCount: turns.length,
+    totalMatched,
+  };
+  return asText(payload);
+}
+
 async function handleCheckpointsToolCall(name, args, apiRequest) {
   switch (name) {
     case 'list_checkpoints': {
-      let path = '/api/checkpoints';
-      if (args.agent_id) path += `?agentId=${encodeURIComponent(args.agent_id)}`;
-      return asText(await apiRequest('GET', path));
+      // Thread the filters through as query params; the route validates them (a bad
+      // `limit`/`since`/`sinceTime`/`file` 400s → surfaced as a tool error). The byte
+      // budget is applied here, on the unchanged HTTP response.
+      const qs = new URLSearchParams();
+      if (args.agent_id) qs.set('agentId', String(args.agent_id));
+      if (args.since !== undefined && args.since !== null) qs.set('since', String(args.since));
+      if (args.sinceTime !== undefined && args.sinceTime !== null) qs.set('sinceTime', String(args.sinceTime));
+      if (args.limit !== undefined && args.limit !== null) qs.set('limit', String(args.limit));
+      if (args.file !== undefined && args.file !== null) qs.set('file', String(args.file));
+      const query = qs.toString();
+      const resp = await apiRequest('GET', '/api/checkpoints' + (query ? `?${query}` : ''));
+      return buildListCheckpointsResult(resp);
     }
 
     case 'diff_turn': {

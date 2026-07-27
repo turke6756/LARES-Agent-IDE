@@ -46,6 +46,9 @@ import { TeamMessageStatus, hasSupervisorPrivilege } from '../shared/types';
 import type { Agent, Workspace, PlanActivityEvent, RepoActivityDetail } from '../shared/types';
 import fs from 'fs';
 import * as nodePath from 'path';
+// Checkpoint Surface Hardening WP4 — `canonicalizeToAbsolute` is used ONLY as the
+// intermediate step when normalizing the `file` list filter to workspace-relative POSIX.
+import { canonicalizeToAbsolute } from './file-activity-normalize';
 import type { SigninPendingResult, SigninPendingEntry } from '../shared/browser';
 import { isKeyName, mapKeyToBytes, SUPPORTED_KEY_NAMES } from './supervisor/key-bytes';
 import type { OrchestrationService } from './orchestration/service';
@@ -292,7 +295,10 @@ export interface TurnCheckpointSummary {
  *  flag — stale-preview override is the human-IPC path only (WP-G2.2), never
  *  reachable over HTTP/MCP. The interface simply gives no way to pass it. */
 export interface CheckpointRoutes {
-  list(workspaceId: string, opts?: { agentId?: string }): Promise<TurnCheckpointSummary[]> | TurnCheckpointSummary[];
+  list(
+    workspaceId: string,
+    opts?: { agentId?: string; since?: number; sinceTime?: number; limit?: number; file?: string },
+  ): Promise<TurnCheckpointSummary[]> | TurnCheckpointSummary[];
   /** WP-G3.1 — versions of ONE canonical path across retained, live-verified turns.
    *  Only edges with a live-verified before-ref are returned (a pruned edge is never
    *  listed as restorable). */
@@ -739,11 +745,16 @@ export class ApiServer {
     const { workspaceId, agentId } = this.authorizeCheckpoint(req, capability, url);
     const path = url.pathname;
 
-    // GET /api/checkpoints — workspace-scoped turn/checkpoint list.
+    // GET /api/checkpoints — workspace-scoped turn/checkpoint list. WP4 adds the
+    // `agentId`/`since`/`sinceTime`/`limit`/`file` filters (parsed + validated here,
+    // `file` normalized to the touched[]-aligned workspace-relative POSIX form). The
+    // response shape is unchanged: `{ workspaceId, turns[] }` with every witnessedPaths
+    // array intact — the MCP seam, not this route, applies the byte budget.
     if (method === 'GET' && path === '/api/checkpoints') {
       const routes = this.requireCheckpointRoutes();
-      const agentFilter = url.searchParams.get('agentId') || undefined;
-      const turns = await routes.list(workspaceId, agentFilter ? { agentId: agentFilter } : undefined);
+      const workspaceRoot = getWorkspaceRecord(workspaceId)?.path;
+      const opts = parseListCheckpointsOpts(url, workspaceRoot);
+      const turns = await routes.list(workspaceId, opts);
       return { workspaceId, turns };
     }
 
@@ -3439,6 +3450,73 @@ function parseStringArray(v: unknown): string[] | undefined {
     throw Object.assign(new Error('`paths` must be an array of strings'), { statusCode: 400, code: 'checkpoint-bad-request' });
   }
   return v as string[];
+}
+
+/** Checkpoint Surface Hardening WP4 — parse + validate the `GET /api/checkpoints`
+ *  list filters from the query string. Every invalid value is a hard 400
+ *  (`checkpoint-bad-request`) — NO silent clamp. `file` is normalized to the same
+ *  workspace-relative POSIX form as `touched[]` (canonicalizeToAbsolute purely as the
+ *  intermediate step, then relativize + reject `..`-escape), so the predicate never
+ *  sees an absolute path. `since` is the exclusive turn_seq cursor; `sinceTime` is the
+ *  separate coarse epoch-ms/ISO time floor. */
+function parseListCheckpointsOpts(
+  url: URL,
+  workspaceRoot: string | undefined,
+): { agentId?: string; since?: number; sinceTime?: number; limit?: number; file?: string } {
+  const bad = (msg: string): Error & { statusCode: number; code: string } =>
+    Object.assign(new Error(msg), { statusCode: 400, code: 'checkpoint-bad-request' });
+  const opts: { agentId?: string; since?: number; sinceTime?: number; limit?: number; file?: string } = {};
+
+  const agentId = url.searchParams.get('agentId') || undefined;
+  if (agentId) opts.agentId = agentId;
+
+  // limit: integer in [1,200]; absent → undefined (DB defaults 50). A float, NaN,
+  // non-numeric, 0/negative, or >200 is rejected outright — never clamped.
+  const limitRaw = url.searchParams.get('limit');
+  if (limitRaw !== null && limitRaw.trim() !== '') {
+    const t = limitRaw.trim();
+    if (!/^-?\d+$/.test(t)) throw bad('`limit` must be an integer in [1,200]');
+    const limit = Number(t);
+    if (!Number.isInteger(limit) || limit < 1 || limit > 200) {
+      throw bad('`limit` must be an integer in [1,200]');
+    }
+    opts.limit = limit;
+  }
+
+  // since: exclusive turn_seq cursor (integer). Unparseable → 400.
+  const sinceRaw = url.searchParams.get('since');
+  if (sinceRaw !== null && sinceRaw.trim() !== '') {
+    const t = sinceRaw.trim();
+    if (!/^-?\d+$/.test(t)) throw bad('`since` must be an integer turn_seq cursor');
+    opts.since = Number(t);
+  }
+
+  // sinceTime: epoch-ms integer OR an ISO-8601 timestamp → epoch-ms. Unparseable → 400.
+  const sinceTimeRaw = url.searchParams.get('sinceTime');
+  if (sinceTimeRaw !== null && sinceTimeRaw.trim() !== '') {
+    const t = sinceTimeRaw.trim();
+    const ms = /^-?\d+$/.test(t) ? Number(t) : Date.parse(t);
+    if (!Number.isFinite(ms)) throw bad('`sinceTime` must be epoch-ms or an ISO-8601 timestamp');
+    opts.sinceTime = ms;
+  }
+
+  // file: normalize to workspace-relative POSIX (the touched[] form). Empty, outside
+  // the workspace, or `..`-escaping → 400. url.searchParams already percent-decoded.
+  const fileRaw = url.searchParams.get('file');
+  if (fileRaw !== null) {
+    const trimmed = fileRaw.trim();
+    if (trimmed === '') throw bad('`file` must be a non-empty path');
+    if (!workspaceRoot) throw bad('workspace root is unavailable for `file` normalization');
+    const abs = canonicalizeToAbsolute(trimmed, { cwd: workspaceRoot });
+    if (abs === '') throw bad('`file` did not resolve to a path');
+    const rel = nodePath.relative(workspaceRoot, abs);
+    if (rel === '' || rel.startsWith('..') || nodePath.isAbsolute(rel)) {
+      throw bad('`file` resolves outside the workspace');
+    }
+    opts.file = rel.split(nodePath.sep).join('/');
+  }
+
+  return opts;
 }
 
 /** Coerce an optional `previewTokens` field to a Record<string,string> (undefined

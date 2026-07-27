@@ -4233,9 +4233,24 @@ export function getTurnRecord(id: string): TurnRecord | null {
   return row ? rowToTurnRecord(row) : null;
 }
 
+/** Filters for {@link listTurnRecords}. Checkpoint Surface Hardening WP4. */
+export interface ListTurnRecordsOpts {
+  agentId?: string;
+  /** Exclusive `turn_seq` lower bound — the lossless workspace paging cursor
+   *  (`turn_seq` is workspace-wide monotonic, so no shared-millisecond skip). */
+  since?: number;
+  /** Coarse `started_at >=` epoch-ms floor. A SEPARATE filter, NEVER the cursor. */
+  sinceTime?: number;
+  /** Bounded page size. Callers validate the range ([1,200]); undefined → 50. */
+  limit?: number;
+  /** Workspace-relative POSIX path. Matches a turn whose `touched[]` contains it
+   *  (op-agnostic path-presence). Applied in WHERE — evaluated BEFORE `LIMIT`. */
+  file?: string;
+}
+
 export function listTurnRecords(
   workspaceId: string,
-  opts?: { agentId?: string }
+  opts?: ListTurnRecordsOpts
 ): TurnRecord[] {
   const clauses = ['workspace_id = ?'];
   const params: unknown[] = [workspaceId];
@@ -4243,10 +4258,35 @@ export function listTurnRecords(
     clauses.push('agent_id = ?');
     params.push(opts.agentId);
   }
-  return queryAll(
-    `SELECT * FROM turn_records WHERE ${clauses.join(' AND ')} ORDER BY turn_seq ASC`,
-    params
+  if (opts?.since !== undefined) {
+    clauses.push('turn_seq > ?');
+    params.push(opts.since);
+  }
+  if (opts?.sinceTime !== undefined) {
+    clauses.push('started_at >= ?');
+    params.push(opts.sinceTime);
+  }
+  if (opts?.file !== undefined) {
+    // JSON1 path-presence predicate (op-agnostic — `touched[]` holds only
+    // write/create today, and this stays correct if the op set grows). The
+    // `touched IS NOT NULL` guard keeps `json_each(NULL)` out of the plan. It
+    // lives in WHERE, so SQLite applies it BEFORE `ORDER BY … LIMIT`: an older
+    // matching turn beyond the newest-N window is still found.
+    clauses.push(
+      "touched IS NOT NULL AND EXISTS (SELECT 1 FROM json_each(turn_records.touched) je "
+      + "WHERE json_extract(je.value, '$.path') = ?)"
+    );
+    params.push(opts.file);
+  }
+  const limit = opts?.limit ?? 50;
+  // Newest-first bounded window (the cursor is `turn_seq`), then reversed to the
+  // ascending API contract that `dashboard-store` / `FileHistoryView` expect.
+  const rows = queryAll(
+    `SELECT * FROM turn_records WHERE ${clauses.join(' AND ')} ORDER BY turn_seq DESC LIMIT ?`,
+    [...params, limit]
   ).map(rowToTurnRecord);
+  rows.reverse();
+  return rows;
 }
 
 /**

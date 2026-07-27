@@ -552,6 +552,126 @@ test('file-history without a `path` query → 400', () =>
     assert.equal(parse(res).code, 'checkpoint-bad-request');
   }));
 
+// ── 14. WP4 list filters — parsing, validation, `file` normalization, threading ──
+// The workspace root the route normalizes `file` against is the DB stub's `/tmp/ws`.
+
+/** Run one authorized GET /api/checkpoints and return {status, body, listOpts}. */
+async function listWith(query: string): Promise<{ status: number; body: any; opts: any }> {
+  const routes = makeFakeRoutes();
+  const server = new ApiServer(stubSupervisor, 0, undefined, '127.0.0.1');
+  server.setCheckpointRoutes(routes);
+  const p = await server.start();
+  try {
+    const res = await request(p, 'GET', `/api/checkpoints${query}`, { Authorization: bearerFor('supervisor', 'sup-A', WS) });
+    let body: any = null;
+    try { body = JSON.parse(res.body); } catch { /* non-JSON */ }
+    const call = routes.state.calls.find((c) => c.method === 'list');
+    return { status: res.status, body, opts: call ? call.args[1] : undefined };
+  } finally {
+    server.stop();
+  }
+}
+
+test('WP4: no filters → list is threaded an opts object (default limit resolved in the DB)', async () => {
+  const { status, opts } = await listWith('');
+  assert.equal(status, 200);
+  assert.ok(opts && typeof opts === 'object', 'route always threads an opts object');
+  assert.equal(opts.limit, undefined, 'no limit param → undefined (DB defaults 50), never a silent clamp value');
+});
+
+test('WP4: since / sinceTime / limit are parsed and threaded', async () => {
+  const { status, opts } = await listWith('?since=7&sinceTime=1500&limit=25&agentId=a1');
+  assert.equal(status, 200);
+  assert.equal(opts.since, 7);
+  assert.equal(opts.sinceTime, 1500);
+  assert.equal(opts.limit, 25);
+  assert.equal(opts.agentId, 'a1');
+});
+
+test('WP4: sinceTime accepts an ISO-8601 string → epoch-ms', async () => {
+  const { status, opts } = await listWith('?sinceTime=2020-01-01T00:00:00.000Z');
+  assert.equal(status, 200);
+  assert.equal(opts.sinceTime, Date.parse('2020-01-01T00:00:00.000Z'));
+});
+
+test('WP4: `file` is normalized to workspace-relative POSIX (touched[] form) and threaded', async () => {
+  const { status, opts } = await listWith('?file=src/a.txt');
+  assert.equal(status, 200);
+  assert.equal(opts.file, 'src/a.txt');
+});
+
+test('WP4: `file` with redundant segments is normalized', async () => {
+  const { status, opts } = await listWith('?file=./src/../src/a.txt');
+  assert.equal(status, 200);
+  assert.equal(opts.file, 'src/a.txt');
+});
+
+test('WP4: URL-decoded `file` — an encoded valid path is accepted and normalized', async () => {
+  const { status, opts } = await listWith('?file=src%2Fa.txt');
+  assert.equal(status, 200);
+  assert.equal(opts.file, 'src/a.txt');
+});
+
+test('WP4: URL-decoded `file` — an encoded ..-traversal is rejected (400)', async () => {
+  const { status, body } = await listWith('?file=..%2F..%2Fetc%2Fpasswd');
+  assert.equal(status, 400);
+  assert.equal(body.code, 'checkpoint-bad-request');
+});
+
+test('WP4: an absolute out-of-workspace `file` is rejected (400)', async () => {
+  const { status, body } = await listWith('?file=/etc/passwd');
+  assert.equal(status, 400);
+  assert.equal(body.code, 'checkpoint-bad-request');
+});
+
+test('WP4: an empty `file` is rejected (400)', async () => {
+  const { status, body } = await listWith('?file=');
+  assert.equal(status, 400);
+  assert.equal(body.code, 'checkpoint-bad-request');
+});
+
+test('WP4: the limit validation matrix rejects 0, -1, 1.5, "abc", 201 (no silent clamp)', async () => {
+  for (const bad of ['0', '-1', '1.5', 'abc', '201']) {
+    const { status, body } = await listWith(`?limit=${encodeURIComponent(bad)}`);
+    assert.equal(status, 400, `limit=${bad} must 400`);
+    assert.equal(body.code, 'checkpoint-bad-request', `limit=${bad} code`);
+  }
+  // The boundary values 1 and 200 ARE accepted.
+  for (const ok of ['1', '200']) {
+    const { status, opts } = await listWith(`?limit=${ok}`);
+    assert.equal(status, 200, `limit=${ok} must be accepted`);
+    assert.equal(opts.limit, Number(ok));
+  }
+});
+
+test('WP4: an unparseable `since` is rejected (400)', async () => {
+  const { status, body } = await listWith('?since=notanumber');
+  assert.equal(status, 400);
+  assert.equal(body.code, 'checkpoint-bad-request');
+});
+
+test('WP4: an unparseable `sinceTime` is rejected (400)', async () => {
+  const { status, body } = await listWith('?sinceTime=not-a-date');
+  assert.equal(status, 400);
+  assert.equal(body.code, 'checkpoint-bad-request');
+});
+
+test('WP4: the ascending list contract is preserved (route does not reorder the engine rows)', () =>
+  withServer(async (port) => {
+    const res = await request(port, 'GET', '/api/checkpoints', { Authorization: bearerFor('supervisor', 'sup-A', WS) });
+    assert.equal(res.status, 200);
+    const turns = parse(res).turns;
+    const seqs = turns.map((t: any) => t.turnSeq);
+    assert.deepEqual(seqs, [...seqs].sort((a, b) => a - b), 'turns stay ascending by turnSeq');
+  }, {
+    routes: makeFakeRoutes({
+      list: () => [
+        { turnId: 't1', turnSeq: 4, agentId: 'a1', agentTitle: 'A', taskLabel: null, status: 'accepted', startedAt: 1, endedAt: 2, beforeReady: true, afterReady: true, beforeQuality: 'guaranteed', afterQuality: 'hook', witnessedPaths: ['a.txt'], failureReason: null, beforeRawFilterBypassed: false },
+        { turnId: 't2', turnSeq: 9, agentId: 'a1', agentTitle: 'A', taskLabel: null, status: 'accepted', startedAt: 3, endedAt: 4, beforeReady: true, afterReady: true, beforeQuality: 'guaranteed', afterQuality: 'hook', witnessedPaths: ['b.txt'], failureReason: null, beforeRawFilterBypassed: false },
+      ],
+    }),
+  }));
+
 // ── Run ──────────────────────────────────────────────────────────────────────────
 
 (async () => {
