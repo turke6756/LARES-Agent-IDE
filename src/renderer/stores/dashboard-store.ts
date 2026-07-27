@@ -175,6 +175,12 @@ interface WorkspaceViewState {
 interface DashboardState {
   workspaces: Workspace[];
   agents: Agent[];
+  // WP5 — cross-workspace "@"-mention catalog. A SEPARATE slice from `agents`
+  // (which is intentionally selected-workspace-only — `updateAgent` discards
+  // foreign events), so the mention picker's workspace rail can target agents in
+  // any workspace without globalizing the selected-workspace view. Null until the
+  // picker first opens; loaded/refreshed on each open (see loadMentionCatalog).
+  mentionCatalog: { agents: Agent[]; workspaces: Workspace[]; loading: boolean } | null;
   selectedWorkspaceId: string | null;
   selectedAgentId: string | null;
   terminalAgentId: string | null;
@@ -289,6 +295,10 @@ interface DashboardState {
   deleteWorkspace: (id: string) => Promise<void>;
   loadAgents: (workspaceId: string) => Promise<void>;
   loadAllAgents: () => Promise<void>;
+  /** WP5 — load/refresh the cross-workspace mention catalog. Called when the
+   *  "@" picker opens. Uses window.api.agents.listAll() for the agents and the
+   *  already-loaded `workspaces` for the rail. */
+  loadMentionCatalog: () => Promise<void>;
   selectWorkspace: (id: string | null) => void;
   selectAgent: (id: string | null) => void;
   setTerminalAgent: (id: string | null) => void;
@@ -393,6 +403,7 @@ interface DashboardState {
 export const useDashboardStore = create<DashboardState>((set, get) => ({
   workspaces: [],
   agents: [],
+  mentionCatalog: null,
   selectedWorkspaceId: null,
   selectedAgentId: null,
   terminalAgentId: null,
@@ -1359,6 +1370,33 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
         : { agents, continuationPhases: phases };
     });
     get().updateWorkspaceHeat();
+  },
+
+  loadMentionCatalog: async () => {
+    // Keep any previously-loaded agents visible while refreshing so reopening
+    // the picker doesn't flash empty; snapshot the currently-loaded workspaces.
+    set((s) => ({
+      mentionCatalog: {
+        agents: s.mentionCatalog?.agents ?? [],
+        workspaces: get().workspaces,
+        loading: true,
+      },
+    }));
+    try {
+      const agents = await window.api.agents.listAll();
+      set(() => ({
+        mentionCatalog: { agents, workspaces: get().workspaces, loading: false },
+      }));
+    } catch {
+      // Honest failure: drop the loading flag, keep whatever agents we had.
+      set((s) => ({
+        mentionCatalog: {
+          agents: s.mentionCatalog?.agents ?? [],
+          workspaces: get().workspaces,
+          loading: false,
+        },
+      }));
+    }
   },
 
   // ── Git-Native WP-G2.4 — checkpoint time rail ──────────────────────────────

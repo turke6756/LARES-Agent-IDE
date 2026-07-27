@@ -3,34 +3,59 @@ import StatusBadge from '../agent/StatusBadge';
 import type { Agent } from '../../../shared/types';
 
 // Presentational dropdown for the "@"-mention autocomplete in ChatInputBar.
-// ALL state (candidates, query, highlight, open/closed, positioning) lives in
-// ChatInputBar (Slice B) — this component only renders. Row markup mirrors
-// AgentPickerDropdown (ui-menu-item, truncate title + StatusBadge, bg-white/10
-// highlight), but it deliberately does NOT register a document keydown listener:
-// that listener ignores TEXTAREA targets, so it cannot drive an in-textarea
-// dropdown. All keyboard nav is owned by ChatInputBar's onKeyDown.
+// ALL state (catalog, active workspace, query, highlight, open/closed,
+// positioning) lives in ChatInputBar — this component only renders. It has two
+// panes (WP5.2): a LEFT workspace rail and a RIGHT agent pane for the active
+// rail workspace. Row markup mirrors AgentPickerDropdown (ui-menu-item, truncate
+// title + StatusBadge, ui-menu-item-active highlight), but it deliberately does
+// NOT register a document keydown listener: all keyboard nav is owned by
+// ChatInputBar's onKeyDown (↑/↓ agents, ←/→/Tab workspaces, Enter commits).
+
+export interface MentionRailWorkspace {
+  id: string;
+  title: string;
+  agentCount: number;
+  matchCount: number;
+}
 
 export interface Props {
-  candidates: Agent[];
-  query: string; // for no-match derivation
+  workspaces: MentionRailWorkspace[];
+  activeWorkspaceId: string | null;
+  // The app-wide selected workspace, tracked separately from activeWorkspaceId
+  // (the rail selection). Used to label FOREIGN agent rows for disambiguation.
+  selectedWorkspaceId: string | null;
+  onSelectWorkspace: (id: string) => void;
+  candidates: Agent[]; // agents in the active workspace matching the query (cap 8)
   highlighted: number;
+  loading: boolean; // catalog is (re)loading
+  activeWorkspaceHasAgents: boolean; // distinguishes empty-workspace from no-match
   onPick: (agent: Agent) => void;
   onHover: (index: number) => void;
   position: { left: number; top: number; maxHeight?: number } | null; // from Slice D; null → corner fallback
 }
 
 export default function AtMentionDropdown({
+  workspaces,
+  activeWorkspaceId,
+  selectedWorkspaceId,
+  onSelectWorkspace,
   candidates,
-  query,
   highlighted,
+  loading,
+  activeWorkspaceHasAgents,
   onPick,
   onHover,
   position,
 }: Props) {
-  const showNoMatch = query.length > 0 && candidates.length === 0;
+  // Nothing to render only when the catalog is empty AND not loading — the
+  // parent already gates on an active mention, so loading/empty/no-match all
+  // render below.
+  if (!loading && workspaces.length === 0 && candidates.length === 0) return null;
 
-  // Nothing to render unless there are candidates or an active (non-empty) query.
-  if (candidates.length === 0 && !showNoMatch) return null;
+  // A foreign active workspace (not the app-selected one) labels its agent rows
+  // with the workspace title so duplicate agent titles disambiguate (WP5.2).
+  const activeIsForeign = activeWorkspaceId != null && activeWorkspaceId !== selectedWorkspaceId;
+  const activeWs = workspaces.find((w) => w.id === activeWorkspaceId);
 
   // Anchor: caret coordinates when available, else the input-bar top-left
   // corner. Either way we open UPWARD — the chat input sits at the pane bottom —
@@ -45,40 +70,98 @@ export default function AtMentionDropdown({
 
   return (
     <div
-      className="ui-menu absolute z-50 w-[280px] max-w-[calc(100%-16px)] max-h-60 overflow-y-auto rounded-md shadow-lg py-1"
+      className="ui-menu absolute z-50 flex w-[360px] max-w-[calc(100%-16px)] max-h-60 overflow-hidden rounded-md shadow-lg"
       style={style}
       role="listbox"
+      aria-label="Mention an agent"
     >
-      {showNoMatch ? (
-        // Non-interactive: a plain div (no ui-menu-item :hover accent), so the
-        // row never looks selectable.
-        <div className="px-3 py-1.5 text-[13px] text-fg-muted cursor-default">
-          No agents match
-        </div>
-      ) : (
-        candidates.map((agent, i) => (
-          <button
-            key={agent.id}
-            type="button"
-            role="option"
-            aria-selected={highlighted === i}
-            className={`ui-menu-item w-full text-left${highlighted === i ? ' ui-menu-item-active' : ''}`}
-            // Pick on mousedown (NOT click) with preventDefault so the selection
-            // fires before the textarea's blur — focus stays in the textarea and
-            // the pick beats the blur-driven dropdown close.
-            onMouseDown={(e) => {
-              e.preventDefault();
-              onPick(agent);
-            }}
-            onMouseEnter={() => onHover(i)}
+      {/* Left: workspace rail — always visible, even at zero matches. */}
+      <div
+        className="w-[130px] shrink-0 overflow-y-auto border-r border-surface-3 py-1"
+        role="tablist"
+        aria-label="Workspaces"
+      >
+        {workspaces.length === 0 ? (
+          <div className="px-2 py-1.5 text-[11px] text-fg-muted cursor-default">No workspaces</div>
+        ) : (
+          workspaces.map((w) => {
+            const active = w.id === activeWorkspaceId;
+            return (
+              <button
+                key={w.id}
+                type="button"
+                role="tab"
+                aria-selected={active}
+                title={w.title}
+                className={`ui-menu-item flex w-full items-center gap-1.5 text-left${active ? ' ui-menu-item-active' : ''}`}
+                // Select on mousedown (NOT click) with preventDefault so it
+                // fires before the textarea's blur closes the dropdown.
+                onMouseDown={(e) => {
+                  e.preventDefault();
+                  onSelectWorkspace(w.id);
+                }}
+              >
+                <span className="flex-1 truncate">{w.title}</span>
+                <span
+                  className={`text-[10px] tabular-nums text-fg-muted${w.matchCount === 0 ? ' opacity-40' : ''}`}
+                >
+                  {w.matchCount}
+                </span>
+              </button>
+            );
+          })
+        )}
+      </div>
+
+      {/* Right: agent pane for the active rail workspace. */}
+      <div className="min-w-0 flex-1 overflow-y-auto py-1">
+        {activeIsForeign && activeWs && (
+          <div
+            className="truncate px-3 pb-1 pt-0.5 text-[10px] uppercase tracking-wider text-fg-muted"
+            title={activeWs.title}
           >
-            <span className="inline-flex items-center gap-2 max-w-[260px]">
-              <span className="truncate">{agent.title}</span>
-              <StatusBadge status={agent.status} />
-            </span>
-          </button>
-        ))
-      )}
+            {activeWs.title}
+          </div>
+        )}
+        {candidates.length > 0 ? (
+          // Cached candidates win over the loading flag so a refresh of an
+          // already-populated catalog doesn't flash "Loading…" over the list.
+          candidates.map((agent, i) => (
+            <button
+              key={agent.id}
+              type="button"
+              role="option"
+              aria-selected={highlighted === i}
+              className={`ui-menu-item w-full text-left${highlighted === i ? ' ui-menu-item-active' : ''}`}
+              // Pick on mousedown (NOT click) with preventDefault so the selection
+              // fires before the textarea's blur — focus stays in the textarea and
+              // the pick beats the blur-driven dropdown close.
+              onMouseDown={(e) => {
+                e.preventDefault();
+                onPick(agent);
+              }}
+              onMouseEnter={() => onHover(i)}
+            >
+              <span className="inline-flex max-w-full items-center gap-2">
+                <span className="truncate">{agent.title}</span>
+                <StatusBadge status={agent.status} />
+              </span>
+            </button>
+          ))
+        ) : loading ? (
+          <div className="px-3 py-1.5 text-[13px] text-fg-muted cursor-default" role="status">
+            Loading agents…
+          </div>
+        ) : !activeWorkspaceHasAgents ? (
+          // empty-workspace: the active workspace has no agents at all.
+          <div className="px-3 py-1.5 text-[13px] text-fg-muted cursor-default">
+            No agents in this workspace
+          </div>
+        ) : (
+          // no-match: the workspace has agents, but none match the query.
+          <div className="px-3 py-1.5 text-[13px] text-fg-muted cursor-default">No agents match</div>
+        )}
+      </div>
     </div>
   );
 }

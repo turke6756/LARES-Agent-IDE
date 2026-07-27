@@ -57,33 +57,108 @@ export default function ChatInputBar({
   // coordinates are expressed relative to this wrapper (Slice D wire-up).
   const wrapperRef = useRef<HTMLDivElement>(null);
 
-  // ── "@"-mention autocomplete (Slice B) ──────────────────────────────────
-  // Candidate source is the agents in the currently-selected workspace — the
-  // same filter AgentPickerDropdown uses. Self is INCLUDED. No "visible agents"
-  // selector exists; if one is added later, swap the source here only.
+  // ── "@"-mention autocomplete (Slice B; WP5 cross-workspace) ─────────────────
+  // The picker draws from a SEPARATE cross-workspace catalog (mentionCatalog),
+  // NOT the selected-workspace-only `agents` slice, so a supervisor can mention a
+  // foreign agent. The catalog is loaded/refreshed on each picker open below.
   const selectedWorkspaceId = useDashboardStore((s) => s.selectedWorkspaceId);
   const allAgents = useDashboardStore((s) => s.agents);
-  const wsAgents = useMemo(
-    () => allAgents.filter((a) => a.workspaceId === selectedWorkspaceId),
-    [allAgents, selectedWorkspaceId],
-  );
+  const mentionCatalog = useDashboardStore((s) => s.mentionCatalog);
+  const loadMentionCatalog = useDashboardStore((s) => s.loadMentionCatalog);
   // This agent's working directory — drives image-path conversion into the
-  // agent's path space (Windows vs. WSL).
+  // agent's path space (Windows vs. WSL). This agent always lives in the
+  // selected workspace (the bar renders in its detail pane), so the
+  // selected-workspace `agents` slice is the right source here.
   const agentCwd = useMemo(
     () => allAgents.find((a) => a.id === agentId)?.workingDirectory || '',
     [allAgents, agentId],
   );
   const [mention, setMention] = useState<MentionContext | null>(null);
   const [highlighted, setHighlighted] = useState(0);
+  // The workspace whose agents the picker's right pane shows. Tracked SEPARATELY
+  // from the app-wide selectedWorkspaceId (WP5.2): ←/→/Tab move it without
+  // changing the app selection. Defaults to selectedWorkspaceId on each open.
+  const [mentionWorkspaceId, setMentionWorkspaceId] = useState<string | null>(selectedWorkspaceId);
+
+  const catalogAgents = useMemo(() => mentionCatalog?.agents ?? [], [mentionCatalog]);
+  const catalogLoading = mentionCatalog?.loading ?? false;
+
+  // Workspace rail: every catalog workspace with its match count for the live
+  // query, the app-selected workspace sorted first. Rail entries stay visible
+  // even at zero matches (WP5.2); order is otherwise the catalog's own (the
+  // sort below is stable).
+  const rail = useMemo(() => {
+    if (!mention) return [];
+    const list = (mentionCatalog?.workspaces ?? []).map((w) => {
+      const wsAgents = catalogAgents.filter((a) => a.workspaceId === w.id);
+      return {
+        id: w.id,
+        title: w.title,
+        agentCount: wsAgents.length,
+        matchCount: filterAgents(wsAgents, mention.query).length,
+      };
+    });
+    list.sort((a, b) => {
+      if (a.id === selectedWorkspaceId && b.id !== selectedWorkspaceId) return -1;
+      if (b.id === selectedWorkspaceId && a.id !== selectedWorkspaceId) return 1;
+      return 0;
+    });
+    return list;
+  }, [mention, mentionCatalog, catalogAgents, selectedWorkspaceId]);
+
+  // Candidates = agents in the ACTIVE rail workspace matching the query (cap 8).
   const candidates = useMemo(
-    () => (mention ? filterAgents(wsAgents, mention.query).slice(0, 8) : []),
-    [mention, wsAgents],
+    () =>
+      mention
+        ? filterAgents(
+            catalogAgents.filter((a) => a.workspaceId === mentionWorkspaceId),
+            mention.query,
+          ).slice(0, 8)
+        : [],
+    [mention, catalogAgents, mentionWorkspaceId],
   );
+  // Whether the active workspace has ANY agents — distinguishes the picker's
+  // "empty-workspace" pane state from "no-match" (WP5.2).
+  const activeWorkspaceHasAgents = useMemo(
+    () => catalogAgents.some((a) => a.workspaceId === mentionWorkspaceId),
+    [catalogAgents, mentionWorkspaceId],
+  );
+
   // Clamp the highlight whenever the candidate list changes so
   // candidates[highlighted] can never be undefined after filtering narrows it.
   useEffect(() => {
     setHighlighted(0);
   }, [candidates]);
+
+  // Clamp the active rail workspace on catalog load / query change: if the
+  // current selection isn't a rail entry, fall back to the first (selected) one.
+  useEffect(() => {
+    if (!mention || rail.length === 0) return;
+    if (mentionWorkspaceId == null || !rail.some((r) => r.id === mentionWorkspaceId)) {
+      setMentionWorkspaceId(rail[0].id);
+    }
+  }, [mention, rail, mentionWorkspaceId]);
+
+  // On each picker OPEN (mention null→non-null): reset the rail selection to the
+  // app-selected workspace and refresh the catalog (WP5.1/5.2).
+  const mentionOpenRef = useRef(false);
+  useEffect(() => {
+    const open = mention !== null;
+    if (open && !mentionOpenRef.current) {
+      setMentionWorkspaceId(selectedWorkspaceId);
+      void loadMentionCatalog();
+    }
+    mentionOpenRef.current = open;
+  }, [mention, selectedWorkspaceId, loadMentionCatalog]);
+
+  // Cycle the active rail workspace by `dir` (wraps). Used by ←/→/Tab (WP5.3).
+  const cycleWorkspace = useCallback((dir: number) => {
+    const ids = rail.map((r) => r.id);
+    if (ids.length === 0) return;
+    const cur = ids.indexOf(mentionWorkspaceId ?? '');
+    const base = cur < 0 ? 0 : cur;
+    setMentionWorkspaceId(ids[(base + dir + ids.length) % ids.length]);
+  }, [rail, mentionWorkspaceId]);
   const lastAgentIdRef = useRef(agentId);
   const lastSyncSignalRef = useRef(syncSignal);
   // The text of the most recent send, kept so an async delivery failure can
@@ -274,12 +349,21 @@ export default function ChatInputBar({
 
   const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
     // Intercept BEFORE the Enter-sends branch: while the dropdown is open it
-    // owns Enter/Tab/Arrow keys so we neither send nor move the caret.
+    // owns Enter/Arrow/Tab keys so we neither send nor move the caret.
     if (mention) {
       if (e.key === 'Escape') { e.preventDefault(); setMention(null); return; }
+      // ←/→ and Tab cycle the workspace rail (WP5.3). Tab is repurposed AWAY
+      // from commit — only Enter commits. Shift+Tab / ← go back, Tab / → forward.
+      if (e.key === 'ArrowLeft' || e.key === 'ArrowRight' || e.key === 'Tab') {
+        e.preventDefault();
+        const back = e.key === 'ArrowLeft' || (e.key === 'Tab' && e.shiftKey);
+        cycleWorkspace(back ? -1 : 1);
+        return;
+      }
       if (candidates.length === 0) {
-        // No-match row visible: swallow nav + commit keys.
-        if (e.key === 'Enter' || e.key === 'Tab' || e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+        // No agent to move to / commit: swallow the agent-nav + commit keys so
+        // they neither move the caret nor send. (Rail keys handled above.)
+        if (e.key === 'Enter' || e.key === 'ArrowDown' || e.key === 'ArrowUp') {
           e.preventDefault();
           return;
         }
@@ -294,7 +378,7 @@ export default function ChatInputBar({
           setHighlighted((h) => (h - 1 + candidates.length) % candidates.length);
           return;
         }
-        if (e.key === 'Enter' || e.key === 'Tab') {
+        if (e.key === 'Enter') {
           e.preventDefault();
           selectMention(candidates[highlighted]);
           return;
@@ -306,7 +390,7 @@ export default function ChatInputBar({
       e.preventDefault();
       handleSend();
     }
-  }, [mention, candidates, highlighted, selectMention, handleSend]);
+  }, [mention, candidates, highlighted, selectMention, handleSend, cycleWorkspace]);
 
   // Close the dropdown on blur, but defer one tick so a row's onMouseDown
   // (which keeps focus via preventDefault — Slice C) commits the pick first.
@@ -333,7 +417,7 @@ export default function ChatInputBar({
       const rawLeft = taRect.left + coords.left - wrapRect.left;
       const top = taRect.top + coords.top - wrapRect.top;
       if (Number.isNaN(rawLeft) || Number.isNaN(top)) return null;
-      const pickerWidth = Math.min(280, Math.max(0, wrapRect.width - 16));
+      const pickerWidth = Math.min(360, Math.max(0, wrapRect.width - 16));
       const left = Math.max(8, Math.min(rawLeft, wrapRect.width - pickerWidth - 8));
       const caretViewportY = wrapRect.top + top;
       const maxHeight = Math.max(40, Math.min(240, caretViewportY - 8));
@@ -539,9 +623,14 @@ export default function ChatInputBar({
       </div>
       {mention && (
         <AtMentionDropdown
+          workspaces={rail}
+          activeWorkspaceId={mentionWorkspaceId}
+          selectedWorkspaceId={selectedWorkspaceId}
+          onSelectWorkspace={setMentionWorkspaceId}
           candidates={candidates}
-          query={mention.query}
           highlighted={highlighted}
+          loading={catalogLoading}
+          activeWorkspaceHasAgents={activeWorkspaceHasAgents}
           onPick={selectMention}
           onHover={setHighlighted}
           position={mentionPosition}
