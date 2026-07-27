@@ -112,6 +112,51 @@ the planning surface); a **worker** or **researcher** gets a narrower grant. The
 tool implementations are HTTP routes in `src/main/api-server.ts`; the scripts are
 proxies.
 
+## Cross-workspace collaboration (`src/main/security/`, `api-server.ts`)
+
+By default an agent's reach is its own workspace. A **supervisor** can reach
+across workspaces — but only a supervisor, only on the routes opened for it, and
+every crossing is written to an audit ledger. The trust model rests on the
+**per-agent capability token** minted at launch (`src/main/security/agent-capabilities.ts`):
+each token carries a server-side claim `{agentId, workspaceId, privilegeLane}`.
+
+- **Two trust tiers.** A request bearing the shared global bearer (no minted
+  claim) is the trusted UI/admin path and keeps today's behavior. A request
+  bearing a minted claim is a real agent; cross-workspace discovery, foreign
+  targets, foreign peer launch, and **all** revival require
+  `privilegeLane === 'supervisor'`.
+- **Two authorizers** (`api-server.ts`): `authorizeCrossWorkspace` gates
+  workspace-scoped discovery (list); `authorizeAgentTarget` gates per-ID target
+  actions (read/send/revive). The general self-scope fence (`resolveWorkspaceScope`)
+  is untouched — cross-workspace reach is granted *only* by these helpers, only on
+  the routes that opened it.
+- **The four capabilities.** `list_workspaces` (+ cross-workspace `list_agents
+  {workspace_id}`) for discovery; cross-workspace `read_agent_chat` /
+  `send_message_to_agent` for per-ID reach; `revive_agent` to relaunch a
+  done/crashed agent's original session in its original workspace/cwd
+  (supervisor-only even same-workspace — revival is a launch-class mutation;
+  providers **claude** and **codex**, gemini is not session-addressable); and
+  `launch_agent` with `mode: 'supervisor-peer'` to create a top-level peer
+  supervisor (no owner edge) — the only launch class allowed to target a foreign
+  workspace.
+- **Audit** (`cross_workspace_audit`, `src/main/database.ts`). Every discovery,
+  foreign read/send, foreign/peer launch, and revival — **success AND denial** —
+  is recorded with actor/target workspace+agent ids, operation, outcome/error
+  code, and sanitized metadata (a fixed key allowlist). Message **contents are
+  never stored** — only `queued_message_len`.
+- **The credential model is real.** A capability token is minted **exactly once**
+  per launch/relaunch/fork and threaded to the dashboard MCP config, the child
+  env, and any team MCP config; the global bearer is **never** injected into an
+  agent sidecar (otherwise a worker's raw HTTP would present the bearer and read
+  as admin). A mint failure **fails closed** — the launch aborts rather than fall
+  back to the bearer.
+
+The MCP tool docs (`scripts/mcp-tools-observability.js`, `scripts/mcp-tools-orchestration.js`)
+and the resident supervisor scaffold (`SUPERVISOR_AGENT_MD` in
+`src/shared/constants.ts`) describe `list_workspaces`, `revive_agent`, and the
+`launch_agent` `supervisor-peer` mode, including the supervisor-only reach and the
+supported revive providers.
+
 ## Orchestration & groupthink (`src/main/orchestration/`)
 
 Beyond one-to-one supervision, Lares runs orchestrations as **scripted

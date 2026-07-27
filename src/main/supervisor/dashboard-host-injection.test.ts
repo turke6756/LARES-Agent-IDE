@@ -19,6 +19,7 @@ import { WslRunner } from './wsl-runner';
 import { makeAgent } from './test-helpers/fake-bridge-deps';
 import { redactMcpToken } from './mcp-config-builder';
 import { getApiToken } from '../security/api-auth';
+import { agentCapabilities } from '../security/agent-capabilities';
 import type { Agent, AgentStatus } from '../../shared/types';
 
 interface TestCase {
@@ -401,9 +402,17 @@ for (const [laneName, flags] of [
 ] as [string, Partial<Agent>][]) {
   test(`PHASE 0 Windows ${laneName} lane: AGENT_DASHBOARD_* injected into agent process env`, async () => {
     const env = await captureWindowsExtraEnv(`win-own-${laneName}`, flags);
-    assert.equal(
+    // WP0.5 (cross-workspace-collaboration): the child env now carries the
+    // per-agent MINTED capability token, NEVER the shared global bearer. It must
+    // be present, differ from getApiToken(), and resolve to this agent's claim.
+    assert.ok(env.AGENT_DASHBOARD_API_TOKEN, `${laneName} must carry a credential; got: ${JSON.stringify(env)}`);
+    assert.notEqual(
       env.AGENT_DASHBOARD_API_TOKEN, getApiToken(),
-      `${laneName} must inherit the live API token; got: ${JSON.stringify(env)}`,
+      `${laneName} must NOT carry the shared global bearer (WP0.5)`,
+    );
+    assert.equal(
+      agentCapabilities.resolve(env.AGENT_DASHBOARD_API_TOKEN)?.agentId, `win-own-${laneName}`,
+      `${laneName} token must resolve to this agent's own capability claim`,
     );
     assert.match(env.AGENT_DASHBOARD_API_PORT ?? '', /^\d+$/, `${laneName} must get a numeric API port`);
     assert.equal(env.AGENT_DASHBOARD_API_HOST, '127.0.0.1', `${laneName} Windows host must be loopback`);
@@ -436,9 +445,18 @@ for (const [laneName, flags] of [
       cmd, /AGENT_DASHBOARD_API_TOKEN=/,
       `${laneName} must inject AGENT_DASHBOARD_API_TOKEN=; got: ${cmd}`,
     );
+    // WP0.5: the WSL command-prefix carries the per-agent minted capability token,
+    // never the global bearer.
     assert.ok(
-      cmd.includes(getApiToken()),
-      `${laneName} command-prefix must carry the live token value; got: ${cmd}`,
+      !cmd.includes(getApiToken()),
+      `${laneName} command-prefix must NOT carry the shared global bearer (WP0.5); got: ${cmd}`,
+    );
+    // shQuote wraps the base64url token in single quotes: TOKEN='<value>'.
+    const wslTokMatch = cmd.match(/AGENT_DASHBOARD_API_TOKEN='?([A-Za-z0-9_-]+)'?/);
+    assert.ok(wslTokMatch, `${laneName} must inject a token value`);
+    assert.equal(
+      agentCapabilities.resolve(wslTokMatch![1])?.agentId, `wsl-own-${laneName}`,
+      `${laneName} command-prefix token must resolve to this agent's own claim`,
     );
     assert.match(cmd, /AGENT_DASHBOARD_API_PORT=\d+/, `${laneName} must inject AGENT_DASHBOARD_API_PORT=`);
     assert.match(
@@ -546,8 +564,11 @@ test('Inc 2 D-16: two supervisors launched by ONE AgentSupervisor each keep thei
 
 test('PHASE 0 WSL: the injected token is scrubbed by redactMcpToken before any log sink', async () => {
   const cmd = await captureWslLaunch('wsl-own-redact', WORKER_FLAGS);
-  const token = getApiToken();
-  assert.ok(cmd.includes(token), 'precondition: live command must contain the raw token');
+  // WP0.5: the embedded secret is the per-agent minted capability token
+  // (shQuote wraps it in single quotes in the command-prefix).
+  const token = cmd.match(/AGENT_DASHBOARD_API_TOKEN='?([A-Za-z0-9_-]+)'?/)?.[1] ?? '';
+  assert.ok(token && agentCapabilities.resolve(token), 'precondition: token resolves to a live capability');
+  assert.ok(cmd.includes(token), 'precondition: live command must contain the raw per-agent token');
   const redacted = redactMcpToken(cmd, token);
   assert.ok(!redacted.includes(token), `redacted command must not leak the token; got: ${redacted}`);
 });

@@ -19,6 +19,14 @@ there is no per-command approval wall, path-confinement is not a jail, and the
 browser acts in whatever sessions you are signed into. **Do not rely on Lares to
 contain a hostile or prompt-injected agent.**
 
+One boundary *is* enforced: **cross-workspace collaboration is supervisor-only and
+audited.** Only a supervisor-lane agent can discover, read, message, revive, or
+peer-launch across workspaces; a worker or researcher is refused. Every crossing —
+success **and** denial — is written to a `cross_workspace_audit` ledger (message
+contents are never stored), each agent carries a per-agent capability token
+(never the shared global bearer), and a token-mint failure fails closed rather
+than grant admin authority.
+
 The full threat model — what is dangerous, which boundaries exist today, and which
 do not — is in [docs/security.md](docs/security.md).
 

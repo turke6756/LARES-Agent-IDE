@@ -89,6 +89,7 @@ import {
   type OrphanCandidate,
   type ReapOrphansResult,
   type SweepResult,
+  type GateResolution,
 } from './ownership';
 import { StatusMonitor } from './status-monitor';
 import type { StatusChangedEvent } from './status-events';
@@ -124,7 +125,7 @@ import { CodexLaunchGate } from './codex-launch-gate';
 import { FileActivityTracker } from './file-activity-tracker';
 import { AdmissionError, type AdmissionDecision } from '../watchdog/types';
 import {
-  createAgent, getAgent, getActiveAgents, getAllAgents, getSupervisorAgent, getOwnerForWorker, getWorkspace, updateAgentStatus, applyStatusTransition, updateAgentPid,
+  createAgent, getAgent, getActiveAgents, getAllAgents, getAgentsByWorkspace, getSupervisorAgent, getOwnerForWorker, getWorkspace, updateAgentStatus, applyStatusTransition, updateAgentPid,
   updateAgentExitCode, incrementRestartCount, updateAgentLastOutput,
   updateAgentAttached, addEvent, deleteAgent as dbDeleteAgent,
   updateAgentResumeSessionId, addFileActivity, clearWitnessObserver, getTeamMembership, addTeamMember, getAgentTemplate,
@@ -389,6 +390,38 @@ export class SubmitNotConfirmedError extends Error {
 // status inside this window (stuck launch, crash loop) must not receive a
 // stale selection prompt minutes later.
 const INITIAL_USER_PROMPT_TTL_MS = 10 * 60_000;
+
+// ── WP3 revival lifecycle (plans/cross-workspace-collaboration.md) ──────────────
+
+/** Build a revival error carrying the plan's machine-readable `code` plus the
+ *  HTTP `statusCode` the /revive route maps straight to a response, and any
+ *  extra sanitized-allowlist fields (e.g. `successorId`) the audit trail needs.
+ *  The message defaults to the code; pass `{ message }` in `extra` to override. */
+function revErr(
+  code: string,
+  statusCode: number,
+  extra?: Record<string, unknown>,
+): Error & { code: string; statusCode: number } {
+  return Object.assign(new Error(code), { code, statusCode, ...extra }) as Error & {
+    code: string;
+    statusCode: number;
+  };
+}
+
+/** WP3.1 — the orientation preamble prepended to a revival wake message. There is
+ *  no primitive to force a tool call before the revived agent reads its queued
+ *  message, so the ordering guarantee is carried by the text: it instructs the
+ *  agent to call `get_my_context` (re-orienting to its workspace, identity, owned
+ *  agents, and plans) BEFORE acting on the supervisor's instruction. */
+export function buildRevivalWakeMessage(message: string): string {
+  return (
+    'You have just been revived by a supervisor after being stopped. ' +
+    'Before acting on the message below, call the `get_my_context` tool first to ' +
+    're-orient yourself (your workspace, identity, owned agents, and any plans). ' +
+    'Then:\n\n' +
+    message
+  );
+}
 
 // ── P1 multi-transport hook delivery (plans/p1-hook-spool-multi-transport.md §2) ──
 
@@ -725,6 +758,20 @@ export const RESEARCHER_AGENT_MD_V4_HASH = 'ba8d6d9f9598dc47854030e47e7a2f50d1a0
 /** SHA-256 hex of the v15 `.dashboard/supervisor/CLAUDE.md` (pre-`.lares`
  *  rename). Used in the v16 file's previousHashes. */
 export const SUPERVISOR_AGENT_MD_V15_HASH = '6947bfbb882d76fc7ee97a93a96dacae12c0dfc0dd70bb3aa071b2f8770979dc';
+
+/** SHA-256 hex of the v16 `.lares/supervisor/CLAUDE.md` — the body BEFORE the
+ *  cross-workspace-collaboration WP1.3 documentation edit (which widened the
+ *  `list_agents` tool bullet to note the supervisor-only foreign reach and added a
+ *  `list_workspaces` bullet). Used in the v17 file's previousHashes so a pristine
+ *  v16 workspace upgrades silently instead of being backed up. */
+export const SUPERVISOR_AGENT_MD_V16_HASH = 'ef82464d9f016219edc44a343e9cc5060baa1fc0c9f20a1fb5de17989b4738ce';
+
+/** SHA-256 hex of the v17 `.lares/supervisor/CLAUDE.md` — the body BEFORE the
+ *  cross-workspace-collaboration WP6 documentation edit (which extended the
+ *  `launch_agent` tool bullet with the `supervisor-peer` mode and added a
+ *  `revive_agent` bullet). Used in the v18 file's previousHashes so a pristine
+ *  v17 workspace upgrades silently instead of being backed up. */
+export const SUPERVISOR_AGENT_MD_V17_HASH = '9746a15ef94e171c859507b5eb9e01e6347e0d0198e069ebfc3a9b99affb834f';
 
 /** SHA-256 hex of the v6 `.dashboard/workers/claude/CLAUDE.md` (pre-`.lares`
  *  rename). Used in the v7 file's previousHashes. */
@@ -1992,6 +2039,28 @@ export class AgentSupervisor extends EventEmitter {
     // second supervisor no longer throws. getSupervisorAgent() still returns the
     // first/primary one for callers that need a single representative.
 
+    // WP4.2 (plans/cross-workspace-collaboration.md) — canonicalize a
+    // `supervisor-peer` launch BEFORE any lane/cwd derivation (agentCwd + the lane
+    // flags are computed below). Peer mode creates a TOP-LEVEL supervisor: force
+    // the supervisor role, clear every worker/supervised/researcher flag, and drop
+    // any owner edge so it renders un-nested. A researcher/persona combination is
+    // incompatible (it would otherwise mis-lane into the researcher/persona cwd) →
+    // reject with a 400 rather than silently mis-route. `worker` mode is untouched
+    // (the existing owner validation at the ownerAgentId block below still applies).
+    if (resolvedInput.launchMode === 'supervisor-peer') {
+      if (resolvedInput.isResearcher || resolvedInput.persona) {
+        throw Object.assign(
+          new Error('supervisor-peer cannot be a researcher or persona'),
+          { statusCode: 400, code: 'peer-mode-incompatible' },
+        );
+      }
+      resolvedInput.isSupervisor = true;
+      resolvedInput.isSupervised = false;
+      resolvedInput.isWorker = false;
+      resolvedInput.isResearcher = false;
+      resolvedInput.ownerAgentId = undefined;   // no owner edge — a peer, not a child
+    }
+
     let workDir = resolvedInput.workingDirectory || workspace.path;
     const pathType = detectPathType(workDir);
     // Convert UNC WSL paths (\\wsl.localhost\...) to Linux paths (/home/...)
@@ -2431,8 +2500,8 @@ export class AgentSupervisor extends EventEmitter {
   private static SUPERVISOR_FILES: Record<string, ScaffoldFile> = {
     [`.lares/supervisor/CLAUDE.md`]:                                              {
       content: SUPERVISOR_AGENT_MD,
-      version: 16, // v16 (Lares rebrand) renames every `.dashboard/…` state-folder reference to `.lares/…` (working-directory note, researcher inbox pointers, research-store section). Previously: v15 (continuation-request awareness) adds the `save_continuation_brick` tool bullet and the `<!-- section:continuation-request v1 -->` block: answer a dashboard continuation request THAT TURN, write per-agent state + pointers rather than prose, respect the stated byte cap, finish the current response normally (the dashboard waits for turn completion before swapping), and start no new work. Previously: v14 (MCP context-overhead cut) removes the resident documentation for two deleted MCP tools: the `get_context_stats` bullet is gone (the `list_agents` bullet now states the per-agent context reading is returned inline, so the capability is preserved), and `## Multi-agent orchestration` no longer says "Discover with `list_orchestrations`".
-      previousHashes: { 1: SUPERVISOR_AGENT_MD_V1_HASH, 2: SUPERVISOR_AGENT_MD_V2_HASH, 3: SUPERVISOR_AGENT_MD_V3_HASH, 4: SUPERVISOR_AGENT_MD_V4_HASH, 5: SUPERVISOR_AGENT_MD_V5_HASH, 6: SUPERVISOR_AGENT_MD_V6_HASH, 7: SUPERVISOR_AGENT_MD_V7_HASH, 8: SUPERVISOR_AGENT_MD_V8_HASH, 9: SUPERVISOR_AGENT_MD_V9_HASH, 10: SUPERVISOR_AGENT_MD_V10_HASH, 11: SUPERVISOR_AGENT_MD_V11_HASH, 12: SUPERVISOR_AGENT_MD_V12_HASH, 13: SUPERVISOR_AGENT_MD_V13_HASH, 14: SUPERVISOR_AGENT_MD_V14_HASH, 15: SUPERVISOR_AGENT_MD_V15_HASH },
+      version: 18, // v18 (cross-workspace-collaboration WP6) extends the `launch_agent` tool bullet with the `supervisor-peer` launch mode (top-level peer, cross-workspace-only, supervisor-gated) and adds a `revive_agent` bullet (supervisor-only relaunch of a done/crashed session; providers claude+codex). Previously: v17 (WP1.3) widens the `list_agents` tool bullet to document that a foreign `workspace_id` is supervisor-only, and adds a `list_workspaces` bullet (cross-workspace discovery). Previously: v16 (Lares rebrand) renames every `.dashboard/…` state-folder reference to `.lares/…` (working-directory note, researcher inbox pointers, research-store section). Previously: v15 (continuation-request awareness) adds the `save_continuation_brick` tool bullet and the `<!-- section:continuation-request v1 -->` block: answer a dashboard continuation request THAT TURN, write per-agent state + pointers rather than prose, respect the stated byte cap, finish the current response normally (the dashboard waits for turn completion before swapping), and start no new work. Previously: v14 (MCP context-overhead cut) removes the resident documentation for two deleted MCP tools: the `get_context_stats` bullet is gone (the `list_agents` bullet now states the per-agent context reading is returned inline, so the capability is preserved), and `## Multi-agent orchestration` no longer says "Discover with `list_orchestrations`".
+      previousHashes: { 1: SUPERVISOR_AGENT_MD_V1_HASH, 2: SUPERVISOR_AGENT_MD_V2_HASH, 3: SUPERVISOR_AGENT_MD_V3_HASH, 4: SUPERVISOR_AGENT_MD_V4_HASH, 5: SUPERVISOR_AGENT_MD_V5_HASH, 6: SUPERVISOR_AGENT_MD_V6_HASH, 7: SUPERVISOR_AGENT_MD_V7_HASH, 8: SUPERVISOR_AGENT_MD_V8_HASH, 9: SUPERVISOR_AGENT_MD_V9_HASH, 10: SUPERVISOR_AGENT_MD_V10_HASH, 11: SUPERVISOR_AGENT_MD_V11_HASH, 12: SUPERVISOR_AGENT_MD_V12_HASH, 13: SUPERVISOR_AGENT_MD_V13_HASH, 14: SUPERVISOR_AGENT_MD_V14_HASH, 15: SUPERVISOR_AGENT_MD_V15_HASH, 16: SUPERVISOR_AGENT_MD_V16_HASH, 17: SUPERVISOR_AGENT_MD_V17_HASH },
     },
     [`.lares/supervisor/.claude/settings.json`]:                                  {
       content: SUPERVISOR_CLAUDE_SETTINGS_JSON,
@@ -3125,11 +3194,11 @@ export class AgentSupervisor extends EventEmitter {
     lane: AgentRoleLane,
     pathType: string,
     identityEnv?: Record<string, string>,
-    // WP-G2.0 — the per-agent capability token to inject in place of the global
-    // bearer. Callers pass `mintAgentCapabilityToken(agent)`, which itself falls
-    // back to `getApiToken()` if minting fails. Defaulting to the global bearer
-    // keeps the pure builder + any legacy caller working (fallback-safe).
-    apiToken: string = getApiToken(),
+    // WP0.5 — the per-agent capability token to inject in place of the global
+    // bearer. REQUIRED (no `getApiToken()` default): the single token minted once
+    // per launch/relaunch/fork is threaded in explicitly, so no agent sidecar can
+    // ever receive the shared global bearer.
+    apiToken: string = (() => { throw new Error('buildDashboardMcpConfigForLane: apiToken is required'); })(),
   ): string {
     return buildDashboardMcpConfigArg({
       toolsets: toolsetsForLane(lane),
@@ -3174,9 +3243,12 @@ export class AgentSupervisor extends EventEmitter {
    *  record), never caller input. Minting again for the same agent (a relaunch)
    *  rotates: the prior token stops resolving.
    *
-   *  FALLBACK SWITCH (required): if minting throws for any reason, revert to the
-   *  global bearer `getApiToken()` — logged + alarmed — so a token bug can never
-   *  brick MCP. The token is a secret; never log its value. */
+   *  FAIL CLOSED (WP0.4, plans/cross-workspace-collaboration.md): under this trust
+   *  model `capability===undefined` = admin, so a mint-failure fallback to the
+   *  shared global bearer would hand an agent sidecar UNRESTRICTED authority
+   *  (silently defeating the whole model). A mint failure therefore aborts this
+   *  agent's launch (surfaces as `crashed`) rather than granting the bearer. The
+   *  token is a secret; never log its value. */
   private mintAgentCapabilityToken(agent: Agent): string {
     try {
       return agentCapabilities.mint({
@@ -3185,12 +3257,14 @@ export class AgentSupervisor extends EventEmitter {
         privilegeLane: roleLaneOf(agent),
       });
     } catch (err) {
-      // ALARM: minting failed — fall back to the global bearer so MCP still works.
       console.error(
-        `[capability] ALARM: mint failed for agent ${agent.id}; falling back to global bearer for MCP injection:`,
-        err instanceof Error ? err.message : String(err),
+        `[capability] ALARM: mint failed for ${agent.id}; FAILING CLOSED (no bearer fallback)`,
+        err,
       );
-      return getApiToken();
+      throw Object.assign(
+        new Error('capability mint failed — refusing global-bearer fallback'),
+        { code: 'capability-mint-failed' },
+      );
     }
   }
 
@@ -3205,9 +3279,25 @@ export class AgentSupervisor extends EventEmitter {
     }
   }
 
+  /** WP0.5 — scrub BOTH the launch-scoped per-agent `capabilityToken` AND the
+   *  shared global bearer `getApiToken()` from any rendered command / args /
+   *  mcp-config string before it is written to a log or diagnostic sink. The raw
+   *  per-agent token is never logged. Delegates to `redactMcpToken` (which also
+   *  scrubs the `AGENT_DASHBOARD_API_TOKEN=…` / `"…":"…"` key forms and the WSL
+   *  base64 envelope) once per secret. */
+  private redactSecrets(s: string, capabilityToken?: string): string {
+    let out = s;
+    if (capabilityToken) out = redactMcpToken(out, capabilityToken);
+    out = redactMcpToken(out, getApiToken());
+    return out;
+  }
+
   /** Build --mcp-config JSON for a team member agent (used at launch time).
-   *  Returns the JSON string to pass via --mcp-config flag. */
-  buildTeamMcpConfigArg(agentId: string, teamId: string, pathType: string): string {
+   *  Returns the JSON string to pass via --mcp-config flag. WP0.5 — the
+   *  `capabilityToken` is REQUIRED (replaces the former `getApiToken()`): the team
+   *  sidecar carries the SAME single per-agent token as the dashboard sidecar and
+   *  child env, never the shared global bearer. */
+  buildTeamMcpConfigArg(agentId: string, teamId: string, pathType: string, capabilityToken: string): string {
     const mcpTeamScriptPath = getScriptPath('mcp-team.js');
 
     if (pathType === 'wsl') {
@@ -3239,7 +3329,7 @@ export class AgentSupervisor extends EventEmitter {
               TEAM_ID: teamId,
               AGENT_DASHBOARD_API_PORT: String(this.apiServerPort),
               AGENT_DASHBOARD_API_HOST: windowsHostIp,
-              AGENT_DASHBOARD_API_TOKEN: getApiToken(),
+              AGENT_DASHBOARD_API_TOKEN: capabilityToken,
             },
           },
         },
@@ -3259,7 +3349,7 @@ export class AgentSupervisor extends EventEmitter {
             AGENT_ID: agentId,
             TEAM_ID: teamId,
             AGENT_DASHBOARD_API_PORT: String(this.apiServerPort),
-            AGENT_DASHBOARD_API_TOKEN: getApiToken(),
+            AGENT_DASHBOARD_API_TOKEN: capabilityToken,
           },
         },
       },
@@ -3319,7 +3409,21 @@ export class AgentSupervisor extends EventEmitter {
     return tracker;
   }
 
-  private async launchWindowsAgent(agent: Agent, resume = false, agentMdPrompt?: string | null, sessionId?: string, overrideArgs?: string[], freshSession = false, firstUserMessagePrefix?: string | null): Promise<void> {
+  private async launchWindowsAgent(agent: Agent, resume = false, agentMdPrompt?: string | null, sessionId?: string, overrideArgs?: string[], freshSession = false, firstUserMessagePrefix?: string | null, preMintedToken?: string): Promise<void> {
+    // WP0.5 — resolve EXACTLY ONE per-agent capability token at method entry,
+    // before ANY environment or command construction. `mint()` rotates, so the
+    // single token is threaded to the dashboard MCP config, the team MCP config,
+    // AND the child-process env; the global bearer is never injected into a
+    // sidecar. `preMintedToken` (fork) is taken via `??` so a supplied value
+    // skips minting (no rotation); a legacy, non-team agent reaches none of the
+    // token consumers, so `undefined` is correct there. Fail-closed on a mint
+    // failure (mintAgentCapabilityToken throws) — before the runner exists.
+    const membership = getTeamMembership(agent.id);                       // imported accessor
+    const needsToken = roleLaneOf(agent) !== 'legacy' || membership !== null;
+    const capabilityToken = needsToken
+      ? (preMintedToken ?? this.mintAgentCapabilityToken(agent))
+      : undefined;
+
     // WP-3b: a (re)launch mints a new epoch, so any surviving checkpoint sidecar
     // from a prior epoch (incl. a prior Electron session, whose epoch is not
     // persisted) is now stale. Drop it — bounded cleanup; the load-side epoch
@@ -3353,13 +3457,15 @@ export class AgentSupervisor extends EventEmitter {
       // agent keeps its toolset + strict disposition (AU-7).
       if (isClaude) {
         const lane = roleLaneOf(agent);
-        const membership = getTeamMembership(agent.id);
+        // WP0.5 — use the entry-resolved `membership` + single `capabilityToken`;
+        // never re-mint here. `capabilityToken` is `undefined` only for a legacy,
+        // non-team agent, which enters neither branch below, so the `!` holds.
         const mcpConfigs: string[] = [];
         if (lane !== 'legacy') {
-          mcpConfigs.push(this.buildDashboardMcpConfigForLane(lane, 'windows', this.buildIdentityEnvForAgent(agent), this.mintAgentCapabilityToken(agent)));
+          mcpConfigs.push(this.buildDashboardMcpConfigForLane(lane, 'windows', this.buildIdentityEnvForAgent(agent), capabilityToken!));
         }
         if (membership) {
-          mcpConfigs.push(this.buildTeamMcpConfigArg(agent.id, membership.teamId, 'windows'));
+          mcpConfigs.push(this.buildTeamMcpConfigArg(agent.id, membership.teamId, 'windows', capabilityToken!));
         }
         if (mcpConfigs.length > 0) {
           const strict = laneUsesStrictMcp(lane);
@@ -3704,7 +3810,11 @@ export class AgentSupervisor extends EventEmitter {
     // roleLaneOf(agent) !== 'legacy', the same lane decision the MCP injection and
     // shouldDirectSpawn key off (mcp-config-builder.ts), so it can never diverge.
     if (agent.provider === 'claude' && roleLaneOf(agent) !== 'legacy') {
-      extraEnv.AGENT_DASHBOARD_API_TOKEN = getApiToken();
+      // WP0.5 — the child env carries the SAME single per-agent capability token
+      // as the MCP sidecar(s), never `getApiToken()`. This block is gated on
+      // non-legacy, so `capabilityToken` was minted at entry (`needsToken`) and is
+      // defined here.
+      extraEnv.AGENT_DASHBOARD_API_TOKEN = capabilityToken!;
       extraEnv.AGENT_DASHBOARD_API_PORT = String(this.apiServerPort);
       extraEnv.AGENT_DASHBOARD_API_HOST = '127.0.0.1';
       extraEnv.AGENT_DASHBOARD_SELF_ID = agent.id;
@@ -4131,8 +4241,21 @@ export class AgentSupervisor extends EventEmitter {
     return decision;
   }
 
-  private async launchWslAgent(agent: Agent, resume = false, agentMdPrompt?: string | null, overrideCommand?: string, sessionId?: string, freshSession = false, firstUserMessagePrefix?: string | null): Promise<void> {
+  private async launchWslAgent(agent: Agent, resume = false, agentMdPrompt?: string | null, overrideCommand?: string, sessionId?: string, freshSession = false, firstUserMessagePrefix?: string | null, preMintedToken?: string): Promise<void> {
     if (!agent.tmuxSessionName) throw new Error('No tmux session name');
+
+    // WP0.5 — resolve EXACTLY ONE per-agent capability token at method entry,
+    // BEFORE the wslEnvPrefix child-env block (which on WSL executes before the
+    // MCP block) or any command construction. The single token threads to the
+    // child env, the dashboard MCP config, and the team MCP config; the global
+    // bearer is never injected into a sidecar. `preMintedToken` (fork) skips
+    // minting via `??`; a legacy non-team agent needs no token. Fail-closed on a
+    // mint failure.
+    const membership = getTeamMembership(agent.id);                       // imported accessor
+    const needsToken = roleLaneOf(agent) !== 'legacy' || membership !== null;
+    const capabilityToken = needsToken
+      ? (preMintedToken ?? this.mintAgentCapabilityToken(agent))
+      : undefined;
 
     // A workspace typed 'wsl' on a machine WITHOUT WSL routes here and tries to
     // run `ccodex`/`ccode` inside a distro that doesn't exist, failing
@@ -4229,7 +4352,10 @@ export class AgentSupervisor extends EventEmitter {
     // id forwarded by a later script); no ownership logic is built here. An agent's
     // subprocesses inherit the agent's dashboard credential level BY DESIGN.
     if (isClaude && roleLaneOf(agent) !== 'legacy') {
-      wslEnvPrefix.push(`AGENT_DASHBOARD_API_TOKEN=${shQuote(getApiToken())}`);
+      // WP0.5 — the WSL child env carries the SAME single per-agent capability
+      // token as the MCP sidecar(s), never `getApiToken()`. Non-legacy gate ⇒
+      // `capabilityToken` was minted at entry and is defined here.
+      wslEnvPrefix.push(`AGENT_DASHBOARD_API_TOKEN=${shQuote(capabilityToken!)}`);
       wslEnvPrefix.push(`AGENT_DASHBOARD_API_PORT=${this.apiServerPort}`);
       wslEnvPrefix.push(`AGENT_DASHBOARD_API_HOST=${this.resolveWslGatewayIp()}`);
       wslEnvPrefix.push(`AGENT_DASHBOARD_SELF_ID=${agent.id}`);
@@ -4322,13 +4448,15 @@ export class AgentSupervisor extends EventEmitter {
       // + strict disposition (AU-7).
       if (isClaude) {
         const lane = roleLaneOf(agent);
-        const membership = getTeamMembership(agent.id);
+        // WP0.5 — reuse the entry-resolved `membership` + single `capabilityToken`;
+        // never re-mint. `undefined` only for a legacy non-team agent (neither
+        // branch below), so the `!` holds.
         const mcpConfigs: string[] = [];
         if (lane !== 'legacy') {
-          mcpConfigs.push(this.buildDashboardMcpConfigForLane(lane, 'wsl', this.buildIdentityEnvForAgent(agent), this.mintAgentCapabilityToken(agent)));
+          mcpConfigs.push(this.buildDashboardMcpConfigForLane(lane, 'wsl', this.buildIdentityEnvForAgent(agent), capabilityToken!));
         }
         if (membership) {
-          mcpConfigs.push(this.buildTeamMcpConfigArg(agent.id, membership.teamId, 'wsl'));
+          mcpConfigs.push(this.buildTeamMcpConfigArg(agent.id, membership.teamId, 'wsl', capabilityToken!));
         }
         if (mcpConfigs.length > 0) {
           const strict = laneUsesStrictMcp(lane);
@@ -4516,15 +4644,19 @@ export class AgentSupervisor extends EventEmitter {
       this.lastTerminalEpoch.set(agent.id, epoch);
     });
 
-    // D-4/F10 (BLOCKER): the rendered WSL command now embeds the bearer token
-    // inside the inline --mcp-config JSON. Redact it before EVERY serialization
-    // sink — console here, plus `buildLaunchRecord`'s `command` field and the
-    // tmux failure header inside WslRunner (driven by `diagnostics.redactSecret`
-    // below). The REAL command is still handed to the runner for the live tmux
-    // create / PTY attach; only the persisted/logged copies are scrubbed.
-    const apiToken = getApiToken();
+    // D-4/F10 (BLOCKER): the rendered WSL command now embeds a secret token
+    // inside the inline --mcp-config JSON and the env prefix. Redact it before
+    // EVERY serialization sink — console here, plus `buildLaunchRecord`'s
+    // `command` field and the tmux failure header inside WslRunner (driven by
+    // `diagnostics.redactSecret` below). The REAL command is still handed to the
+    // runner for the live tmux create / PTY attach; only the persisted/logged
+    // copies are scrubbed. WP0.5 — the embedded token is now the per-agent
+    // `capabilityToken` (never `getApiToken()`); `redactSecrets` scrubs BOTH, and
+    // `redactSecret` for the runner carries the per-agent token (the command holds
+    // only that; falls back to the bearer for a legacy agent that embeds neither).
+    const apiToken = capabilityToken ?? getApiToken();
     console.log(`[WSL] Launching agent '${agent.tmuxSessionName}' in ${wslWorkDir}`);
-    console.log(`[WSL] Command: ${redactMcpToken(command, apiToken)}`);
+    console.log(`[WSL] Command: ${this.redactSecrets(command, capabilityToken)}`);
 
     // BUG-22 Step 1 diagnostic: assemble metadata so the runner can append one
     // structured JSONL record per launch attempt to
@@ -4765,25 +4897,32 @@ export class AgentSupervisor extends EventEmitter {
     // (--tools/--disallowedTools), which the bypassed lane-aware injection would
     // otherwise have added. Without it the fork would be offered Bash/Edit again.
     const forkResearcher = forkLane === 'researcher';
+    // WP0.5 — fork bypasses the launch method's lane-aware MCP injection via
+    // overrideArgs/overrideCommand, but STILL runs the launch method's child-env
+    // block. Mint EXACTLY ONE token here and thread it to both the override MCP
+    // config AND the launch method (as `preMintedToken`) so the fork's MCP config
+    // and its child env carry the same capability. Legacy fork → no token (omit,
+    // so the launch-entry resolver never sees a value it could bypass minting with).
+    const forkToken = forkLane !== 'legacy' ? this.mintAgentCapabilityToken(newAgent) : undefined;
     if (pathType === 'windows') {
       const parts = source.command.split(/\s+/);
       const forkMcp = forkLane !== 'legacy'
-        ? ['--mcp-config', this.buildDashboardMcpConfigForLane(forkLane, 'windows', this.buildIdentityEnvForAgent(newAgent), this.mintAgentCapabilityToken(newAgent)), ...(forkStrict ? ['--strict-mcp-config'] : [])]
+        ? ['--mcp-config', this.buildDashboardMcpConfigForLane(forkLane, 'windows', this.buildIdentityEnvForAgent(newAgent), forkToken!), ...(forkStrict ? ['--strict-mcp-config'] : [])]
         : [];
       const forkTools = forkResearcher
         ? ['--tools', RESEARCHER_ALLOWED_TOOLS.join(','), '--disallowedTools', RESEARCHER_DISALLOWED_TOOLS.join(','), '--model', 'claude-sonnet-4-6']
         : [];
       const forkArgs = [...parts.slice(1), ...forkMcp, ...forkTools, '--resume', source.resumeSessionId, '--fork-session', '--session-id', newSessionId];
-      await this.launchWindowsAgent(newAgent, false, null, undefined, forkArgs);
+      await this.launchWindowsAgent(newAgent, false, null, undefined, forkArgs, false, undefined, forkToken);
     } else {
       const forkMcp = forkLane !== 'legacy'
-        ? ` --mcp-config '${this.buildDashboardMcpConfigForLane(forkLane, 'wsl', this.buildIdentityEnvForAgent(newAgent), this.mintAgentCapabilityToken(newAgent))}'${forkStrict ? ' --strict-mcp-config' : ''}`
+        ? ` --mcp-config '${this.buildDashboardMcpConfigForLane(forkLane, 'wsl', this.buildIdentityEnvForAgent(newAgent), forkToken!)}'${forkStrict ? ' --strict-mcp-config' : ''}`
         : '';
       const forkTools = forkResearcher
         ? ` --tools '${RESEARCHER_ALLOWED_TOOLS.join(',')}' --disallowedTools '${RESEARCHER_DISALLOWED_TOOLS.join(',')}' --model claude-sonnet-4-6`
         : '';
       const forkCommand = `${source.command}${forkMcp}${forkTools} --resume ${source.resumeSessionId} --fork-session --session-id ${newSessionId}`;
-      await this.launchWslAgent(newAgent, false, null, forkCommand);
+      await this.launchWslAgent(newAgent, false, null, forkCommand, undefined, false, undefined, forkToken);
     }
 
     return getAgent(newAgent.id)!;
@@ -5464,41 +5603,156 @@ export class AgentSupervisor extends EventEmitter {
     return this.withLifecycleLock(agentId, () => this.restartAgentLocked(agentId));
   }
 
-  private async restartAgentLocked(agentId: string): Promise<void> {
-    // `restart` is the stop reason: the badge suppresses it, so a restarted
-    // agent never renders "Stopped by …" for the stop half of its own restart.
-    await this.stopAgentLocked(agentId, { reason: 'restart' });
+  /**
+   * WP3.1 — the shared POST-STOP relaunch tail (resume=true, original session +
+   * cwd), extracted from `restartAgentLocked` so both restart and revive can own
+   * their own `stopAgentLocked` call. Splitting it lets `reviveAgent` stage a
+   * wake message in the gap BETWEEN stop and relaunch — `stopAgentBody:5351`
+   * would otherwise wipe any pending prompt.
+   *
+   * Unlike the old inline tail (which returned quietly on a missing agent), this
+   * THROWS on a missing agent or launch failure (after emitting 'crashed'), so a
+   * failed revival can never be reported as success. Manual restart wraps the
+   * call in `.catch(() => {})` to preserve its swallow-on-failure behavior.
+   */
+  private async resumeAgentAfterStopLocked(agentId: string): Promise<void> {
     const agent = getAgent(agentId);
-    if (!agent) return;
-
+    if (!agent) throw new Error(`resume-after-stop: agent ${agentId} gone after stop`);
     // BUG-09 §3.7 — a runner crash mid-tool would otherwise leave a
     // tool-pending latch in place for the full 15-min TTL. Clear it before
     // we transition to `restarting`.
     this.monitor.forgetAgent(agentId);
-
-    const tRestart = applyStatusTransition(agentId, 'restarting');
+    const t = applyStatusTransition(agentId, 'restarting');
     incrementRestartCount(agentId);
-    this.emit('statusChanged', { agentId, status: 'restarting', fromStatus: tRestart?.prior, source: 'restart' } satisfies StatusChangedEvent);
-
-    // The settle delay is now held IN-LOCK (it used to be a detached
-    // setTimeout, which is precisely the window a stop could slip through).
+    this.emit('statusChanged', { agentId, status: 'restarting', fromStatus: t?.prior, source: 'restart' } satisfies StatusChangedEvent);
+    // The settle delay is held IN-LOCK (it used to be a detached setTimeout,
+    // which is precisely the window a stop could slip through).
     await new Promise((r) => setTimeout(r, 1000));
     const latest = getAgent(agentId);
-    if (!latest) return;
+    if (!latest) throw new Error(`resume-after-stop: agent ${agentId} gone before relaunch`);
     try {
       const pathType = detectPathType(latest.workingDirectory);
-      if (pathType === 'windows') {
-        await this.launchWindowsAgent(latest, true);
-      } else {
-        await this.launchWslAgent(latest, true);
-      }
+      if (pathType === 'windows') await this.launchWindowsAgent(latest, true);
+      else                        await this.launchWslAgent(latest, true);
       // BUG-38 — manual restart swapped the PTY under the same agent id;
       // rebind the renderer's terminal to the fresh bridge on success only.
       this.notifyTerminalRebound(agentId);
     } catch (err) {
-      const tRestartFail = applyStatusTransition(agentId, 'crashed');
-      this.emit('statusChanged', { agentId, status: 'crashed', fromStatus: tRestartFail?.prior, source: 'restart-failed' } satisfies StatusChangedEvent);
+      const tf = applyStatusTransition(agentId, 'crashed');
+      this.emit('statusChanged', { agentId, status: 'crashed', fromStatus: tf?.prior, source: 'restart-failed' } satisfies StatusChangedEvent);
+      throw err;
     }
+  }
+
+  private async restartAgentLocked(agentId: string): Promise<void> {
+    // `restart` is the stop reason: the badge suppresses it, so a restarted
+    // agent never renders "Stopped by …" for the stop half of its own restart.
+    // Manual restart SWALLOWS a failed tail (incl. a missing agent) — behavior
+    // preserved from the old inline body.
+    await this.stopAgentLocked(agentId, { reason: 'restart' });
+    await this.resumeAgentAfterStopLocked(agentId).catch(() => {});
+  }
+
+  /**
+   * WP3.2 — precondition for revival: the agent's provider must be session-
+   * addressable AND its session must still be resumable on disk. Throws a
+   * `revErr` on failure; returns void when the agent can be resumed.
+   *
+   * - claude: `resumeSessionId` non-null AND the JSONL exists on disk (mirrors
+   *   the launch-time BUG-21 guard at launchWindowsAgent/launchWslAgent).
+   * - codex:  `resolveCodexResumeSessionId` resolves (record OR cwd-matching
+   *   rollout), mirroring the launch throw.
+   * - gemini (and any other provider): bare `--resume` is not session-
+   *   addressable → v1 rejects with `revive-unsupported-provider`, naming the
+   *   supported providers in the error message.
+   */
+  private assertResumable(agent: Agent): void {
+    switch (agent.provider) {
+      case 'claude': {
+        if (!agent.resumeSessionId) throw revErr('revive-no-session', 422);
+        const onDisk = this.sessionLogReader.sessionFileExists(
+          'claude', agent.workingDirectory, agent.resumeSessionId,
+        );
+        if (!onDisk) throw revErr('revive-no-session', 422);
+        return;
+      }
+      case 'codex': {
+        if (!this.resolveCodexResumeSessionId(agent)) throw revErr('revive-no-session', 422);
+        return;
+      }
+      default:
+        throw revErr('revive-unsupported-provider', 422, {
+          message: 'revive supports: claude, codex; gemini not yet supported',
+        });
+    }
+  }
+
+  /**
+   * WP3.1 — relaunch a `done`/`crashed` terminal agent's ORIGINAL session in its
+   * original workspace/cwd, with guardrails. One lifecycle lock wraps the whole
+   * op; order is: validate (fail fast, non-mutating) → assertResumable →
+   * supervisor-successor guard (+force) → ownership gate (fail closed) → stop +
+   * verify StopResult → stage the wake message AFTER stop → shared post-stop
+   * tail. A throw anywhere means NO relaunch happened, so the caller never
+   * reports success. The relaunch mints a fresh capability token (WP0.5); the
+   * leading stop revoked the old one (5348).
+   */
+  async reviveAgent(
+    agentId: string,
+    opts: { force?: boolean; message?: string },
+  ): Promise<{ revived: true; queued: boolean }> {
+    return this.withLifecycleLock(agentId, async () => {
+      // 1) validate (non-mutating, fail fast)
+      const agent = getAgent(agentId);
+      if (!agent) throw revErr('revive-agent-missing', 404);
+      if (agent.status !== 'done' && agent.status !== 'crashed') throw revErr('revive-not-terminal', 409);
+      if (this.hasRunner(agentId)) throw revErr('revive-runner-live', 409);         // separate early guard only
+      const ws = getWorkspace(agent.workspaceId);
+      if (!ws) throw revErr('revive-workspace-gone', 410);
+      if (!fs.existsSync(agent.workingDirectory)) throw revErr('revive-cwd-gone', 410);
+      this.assertResumable(agent);                                                   // WP3.2
+      if (agent.isSupervisor) {                                                      // successor guard: supervisor targets ONLY
+        const successor = getAgentsByWorkspace(agent.workspaceId).find(a =>
+          a.id !== agentId && a.isSupervisor && a.status !== 'done' && a.status !== 'crashed');
+        if (successor && !opts.force) throw revErr('revive-live-successor', 409, { successorId: successor.id });
+      }
+
+      // 2) ownership gate — capture nullable, fail closed (stopAgentBody won't verify a no-runner agent)
+      const reconcileGate = this.reconcileGate;
+      if (!reconcileGate) throw revErr('revive-ownership-unverified', 503);
+      let gate: GateResolution;
+      try { gate = await reconcileGate.resolve(agentId); }
+      catch { throw revErr('revive-ownership-unverified', 503); }
+      switch (gate.action) {
+        case 'proceed': case 'terminate-then-continue': break;
+        case 'reattach':                                                            // WSL/tmux tested reattach path only
+          if (detectPathType(agent.workingDirectory) !== 'wsl') throw revErr('revive-ownership-blocked', 409);
+          break;
+        case 'leave-unmanaged': case 'blocked': default: throw revErr('revive-ownership-blocked', 409);
+      }
+
+      // 3) stop, then verify StopResult (never relaunch over a possibly-live process)
+      const stop = await this.stopAgentLocked(agentId, { reason: 'restart' });
+      if (stop.outcome === 'failed')    throw revErr('revive-stop-failed', 409);
+      if (stop.outcome === 'not_found') throw revErr('revive-agent-missing', 404);
+
+      // 4) stage wake AFTER stop (stopAgentBody:5351 deleted any prior pending prompt)
+      let queued = false;
+      if (opts.message) {
+        this.pendingInitialPrompts.set(agentId, {
+          text: buildRevivalWakeMessage(opts.message),      // preamble: "call get_my_context first, then:"
+          expiresAt: Date.now() + INITIAL_USER_PROMPT_TTL_MS,
+        });
+        queued = true;
+      }
+
+      // 5) shared post-stop tail; a throw means NO relaunch → do not report success
+      try { await this.resumeAgentAfterStopLocked(agentId); }
+      catch { if (queued) this.pendingInitialPrompts.delete(agentId); throw revErr('revive-relaunch-failed', 500); }
+
+      addEvent(agentId, 'revived', JSON.stringify({ force: !!opts.force, queued, gate: gate.action }));
+      return { revived: true, queued };
+    });
   }
 
   /** Context-brick Inc 4 (4.1) — sibling of restartAgent that mints a FRESH

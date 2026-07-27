@@ -28,6 +28,7 @@ function getOrchestrationToolDefinitions() {
           auto_restart: { type: 'boolean', description: 'Auto-restart the agent on crash (default: true).' },
           supervised: { type: 'boolean', description: 'Whether the supervisor is notified on agent status changes (default: true for supervisor-launched workers — set false to opt out).' },
           is_researcher: { type: 'boolean', description: 'Launch the workspace RESEARCHER role-lane (default: false). The researcher browses + researches the web and writes findings into .lares/research/inbox/, but cannot run Bash, edit code, run notebooks, or launch agents. Claude-only (non-claude is rejected). When true, the app manages cwd/command/tools and the browser MCP — `provider`, `command`, `template_id`, and `persona` are ignored.' },
+          mode: { type: 'string', enum: ['worker', 'supervisor-peer'], description: 'Launch class (default: worker). `worker` launches an owned child under you. `supervisor-peer` launches a TOP-LEVEL peer supervisor with NO owner edge (renders un-nested), with the supervisor toolset and .lares/supervisor cwd. Peer mode is the ONLY way to launch into a workspace other than your own (pass `workspace_id`), and cross-workspace peer launch requires supervisor privilege. `supervisor-peer` is incompatible with `is_researcher`/`persona`.' },
           fresh_session: { type: 'boolean', description: 'Codex-only hint (default: false). When true, the agent launches without `codex resume` so the codex CLI mints a fresh conversation rather than inheriting any prior rollout in this workspace. The dashboard still discovers and binds the new session id. Use this when you want a clean context but parallel agents in the same workspace. No-op for non-codex providers.' },
           plan_id: { type: 'string', description: 'Planning-surface rail: an existing plan id (from create_plan). Frozen onto the agent at launch and injected as AGENT_DASHBOARD_PLAN_ID so the worker\'s read/edit breadcrumbs and plan_events attribute to this plan. The launch route 400s an unknown plan_id.' },
           section_anchor: { type: 'string', description: 'Planning-surface rail: the sec_ section anchor this agent is dispatched to write. Frozen at launch and injected as AGENT_DASHBOARD_PLAN_SECTION (the dispatched-intent fallback when no read/edit breadcrumb is observed). Set it to the section the worker will UPDATE — for checklist execution that is sec_opitem. NEVER dispatch to sec_exectr (the execution trail is system-owned, auto-generated from trusted write events; a writer there is dropped from attribution). The plan-bound brief must mandate a turn-end writeback: the worker flips its completed items\' `&#9744;`→`&#9745;` in this section (native HTML edit) and emits a `<!--PLAN-EVENT …-->` sentinel — that edit is what materializes the trail lines and the visible checkmarks.' },
@@ -53,6 +54,28 @@ function getOrchestrationToolDefinitions() {
         type: 'object',
         properties: {
           agent_id: { type: 'string', description: 'The agent ID to fork.' },
+        },
+        required: ['agent_id'],
+      },
+    },
+    {
+      name: 'revive_agent',
+      description:
+        'Revive a DONE or CRASHED terminal agent: relaunch its ORIGINAL session (resume) in its ' +
+        'original workspace and working directory, top-level (no new owner edge). Use to bring a ' +
+        'finished/crashed agent back with its full prior context instead of launching a fresh one. ' +
+        'Cross-workspace and same-workspace revival BOTH require supervisor privilege (revival is a ' +
+        'launch-class mutation) and every attempt is audited. Provider support: revive supports ' +
+        'claude and codex; gemini is not yet session-addressable and is rejected. Optionally pass ' +
+        '`message` to queue a wake instruction — it is delivered only AFTER the revived agent can ' +
+        'orient (the dashboard prepends a get_my_context orientation preamble). Pass `force: true` ' +
+        'to revive a supervisor even when a live successor supervisor already exists in its workspace.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          agent_id: { type: 'string', description: 'The terminal (done/crashed) agent ID to revive.' },
+          message: { type: 'string', description: 'Optional wake message queued for delivery after the revived agent orients (get_my_context preamble is prepended by the dashboard).' },
+          force: { type: 'boolean', description: 'Revive a supervisor even if a live successor supervisor exists in its workspace (default: false). Ignored for non-supervisor targets.' },
         },
         required: ['agent_id'],
       },
@@ -220,6 +243,12 @@ async function handleOrchestrationToolCall(name, args, apiRequest) {
       // the --tools/--disallowedTools native boundary, and the
       // .lares/researcher/ cwd. Just pass the flag through.
       if (args.is_researcher !== undefined) input.isResearcher = args.is_researcher;
+      // Peer-supervisor launch class (cross-workspace-collaboration WP4.1). Forward
+      // the `mode` enum as `launchMode`; the server canonicalizes it (top of
+      // launchAgent) and gates foreign-workspace peer launches to supervisors. We
+      // deliberately do NOT forward a caller-controlled ownerAgentId — the owner
+      // edge is server-derived from AGENT_DASHBOARD_SELF_ID (worker mode only).
+      if (args.mode !== undefined) input.launchMode = args.mode;
       // Default supervised=true when called via the supervisor MCP — workers
       // launched by the supervisor should bump it on idle/done/crashed so it
       // can react without polling. Caller can pass supervised:false to opt out.
@@ -321,6 +350,17 @@ async function handleOrchestrationToolCall(name, args, apiRequest) {
     case 'fork_agent': {
       const newAgent = await apiRequest('POST', `/api/agents/${args.agent_id}/fork`);
       return { content: [{ type: 'text', text: `Forked agent ${args.agent_id} → new agent "${newAgent.title}" (${newAgent.id})` }] };
+    }
+
+    case 'revive_agent': {
+      const body = {};
+      if (args.message !== undefined) body.message = args.message;
+      if (args.force !== undefined) body.force = args.force;
+      const result = await apiRequest('POST', `/api/agents/${args.agent_id}/revive`, body);
+      const queuedNote = result?.queued
+        ? ' A wake message was queued and will be delivered after the agent orients (get_my_context first).'
+        : '';
+      return { content: [{ type: 'text', text: `Revived agent ${args.agent_id} — relaunching its original session in its original workspace/cwd.${queuedNote}` }] };
     }
 
     case 'create_persona': {

@@ -97,6 +97,7 @@ test('notebooks,comms,observability exposes exactly those toolsets, not orchestr
     'list_agents',
     'list_my_agents',
     'list_templates',
+    'list_workspaces',
     'open_file_in_view',
     'read_agent_chat',
     'read_agent_files_touched',
@@ -125,7 +126,7 @@ test('notebooks,comms,observability exposes exactly those toolsets, not orchestr
 
 const OBSERVABILITY_CORE_TOOLS = [
   'get_my_context', 'get_usage_limits',
-  'list_agents', 'list_my_agents', 'list_templates',
+  'list_agents', 'list_my_agents', 'list_templates', 'list_workspaces',
   'open_file_in_view', 'read_agent_chat', 'read_agent_files_touched',
   'read_agent_log', 'read_comments', 'save_continuation_brick',
 ].sort();

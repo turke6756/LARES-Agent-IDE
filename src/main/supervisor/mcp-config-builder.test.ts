@@ -593,8 +593,11 @@ test('grep gate: index.ts no longer writes the dashboard/team token to a root .m
 
 test('grep gate: WSL command serializations are wrapped in redactMcpToken (D-4/F10)', () => {
   const idx = readSrc('supervisor/index.ts');
-  assert.ok(/redactMcpToken\(command, apiToken\)/.test(idx),
-    'the [WSL] Command console log must redact the token');
+  // WP0.5 (cross-workspace-collaboration): the WSL command now embeds the
+  // per-agent capabilityToken (not getApiToken()), so the console log routes
+  // through redactSecrets, which scrubs BOTH that token and the global bearer.
+  assert.ok(/this\.redactSecrets\(command, capabilityToken\)/.test(idx),
+    'the [WSL] Command console log must redact the token via redactSecrets');
   assert.ok(/redactSecret: apiToken/.test(idx),
     'the WSL diagnostics must carry redactSecret so the runner redacts the persisted command');
 

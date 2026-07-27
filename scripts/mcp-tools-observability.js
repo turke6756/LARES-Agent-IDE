@@ -21,12 +21,27 @@ function getObservabilityCoreToolDefinitions() {
   return [
     {
       name: 'list_agents',
-      description: 'List all agents in the dashboard with their status, context usage, and metadata.',
+      description:
+        'List agents with their status, context usage, and metadata (incl. workspaceId/workspaceTitle and ' +
+        'lastActivityAt). With no workspace_id, lists agents in YOUR OWN workspace. Passing a different ' +
+        'workspace_id reaches across workspaces — that is SUPERVISOR-ONLY: a worker/researcher requesting a ' +
+        'foreign workspace_id is refused (403). Use list_workspaces to discover the ids you can target.',
       inputSchema: {
         type: 'object',
         properties: {
-          workspace_id: { type: 'string', description: 'Optional: filter by workspace ID.' },
+          workspace_id: { type: 'string', description: 'Optional: filter by workspace ID. A foreign id is supervisor-only.' },
         },
+      },
+    },
+    {
+      name: 'list_workspaces',
+      description:
+        'List the workspaces you can see, each with {id, title, agentCounts:{activeCount, workingCount}}. A ' +
+        'SUPERVISOR sees every workspace (the cross-workspace discovery surface — pair with list_agents ' +
+        '{workspace_id}); a worker/researcher sees only its own. Takes NO arguments.',
+      inputSchema: {
+        type: 'object',
+        properties: {},
       },
     },
     {
@@ -254,13 +269,33 @@ async function handleObservabilityCoreToolCall(name, args, apiRequest) {
         status: a.status,
         provider: a.provider,
         isSupervisor: a.isSupervisor,
+        // Cross-workspace fields (WP1) — the owning workspace so a foreign agent
+        // is disambiguated from a same-titled local one; recency so a caller can
+        // rank stale vs fresh agents without a second read.
+        workspaceId: a.workspaceId,
+        workspaceTitle: a.workspaceTitle ?? null,
         workingDirectory: a.workingDirectory,
+        updatedAt: a.updatedAt,
+        lastOutputAt: a.lastOutputAt ?? null,
+        // Documented: newest of the two — last terminal output, else last row touch.
+        lastActivityAt: a.lastOutputAt ?? a.updatedAt,
         context: a.contextStats ? {
           percentage: Math.round(a.contextStats.contextPercentage) + '%',
+          contextPercentage: a.contextStats.contextPercentage,
           tokensUsed: a.contextStats.totalTokens,
           turns: a.contextStats.turnCount,
           model: a.contextStats.model,
         } : null,
+      }));
+      return { content: [{ type: 'text', text: JSON.stringify(summary, null, 2) }] };
+    }
+
+    case 'list_workspaces': {
+      const workspaces = await apiRequest('GET', '/api/workspaces');
+      const summary = workspaces.map(w => ({
+        id: w.id,
+        title: w.title,
+        agentCounts: w.agentCounts ?? null,
       }));
       return { content: [{ type: 'text', text: JSON.stringify(summary, null, 2) }] };
     }

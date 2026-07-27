@@ -188,6 +188,54 @@ const TESTS = [
   'dist/main/main/api-auth.test.js',
   // WP-G2.0 — per-agent capability token store (mint / rotate / revoke / resolve).
   'dist/main/main/security/agent-capabilities.test.js',
+  // Cross-workspace collaboration WP0 — the two cross-workspace authorizers +
+  // the cross_workspace_audit round-trip (successes AND denials; contents never
+  // stored; detail sanitized).
+  'dist/main/main/security/cross-workspace-policy.test.js',
+  // Cross-workspace collaboration WP0.4/0.5 — fail-closed capability mint + the
+  // single-token credential-propagation model (one mint per launch/restart/fork;
+  // same token in child env + dashboard + team MCP; never the global bearer).
+  'dist/main/main/supervisor/credential-propagation.test.js',
+  // Cross-workspace collaboration WP1 — discovery surfaces: GET /api/workspaces +
+  // cross-workspace GET /api/agents (supervisor-gated foreign reach, reduced
+  // projection, zero-active default, audit on foreign-supervisor + denied-worker)
+  // and the MCP shim projection (list_agents lastActivityAt + list_workspaces).
+  'dist/main/main/api-cross-workspace-list.test.js',
+  // WP2 (plans/cross-workspace-collaboration.md — per-ID intentional gating):
+  // authorizeAgentTarget on the five per-ID routes (GET :id/log/messages/
+  // file-activities, POST :id/input) — local worker allowed no-audit, foreign
+  // worker 403 audited denial, foreign supervisor allowed + audit, global bearer
+  // UI-compat no-audit, send arms the one-turn subscription, foreign send stores
+  // queued_message_len (length only, never contents), same-workspace input unaudited.
+  'dist/main/main/api-agent-target-scope.test.js',
+  // WP3 (plans/cross-workspace-collaboration.md — revival lifecycle + revive_agent):
+  // AgentSupervisor.reviveAgent (validate → assertResumable → successor guard →
+  // ownership gate → stop+verify → stage-after-stop → resume tail); both done/
+  // crashed revive, gate matrix, StopResult verification, staged-prompt cleanup on
+  // relaunch failure, provider gating, fresh-capability re-mint.
+  'dist/main/main/supervisor/revive-agent.test.js',
+  // WP3.3 — POST /api/agents/:id/revive authorization + audit (supervisor-only even
+  // same-workspace, global-bearer allowed, cross-workspace target gate, audit on
+  // success/denial/failure, queued_message_len length-only, revErr status/code map).
+  'dist/main/main/api-revive.test.js',
+  // WP4 (plans/cross-workspace-collaboration.md — peer-supervisor launch mode):
+  // launchAgent's launchMode:'supervisor-peer' canonicalization — resolves the
+  // .lares/supervisor cwd, forces isSupervisor / clears isSupervised/isWorker/owner
+  // edge, rejects researcher+persona with peer-mode-incompatible, worker mode
+  // (owner edge) unchanged.
+  'dist/main/main/supervisor/launch-peer-supervisor.test.js',
+  // WP4.3 — POST /api/agents launch-scope authorization: mode→launchMode
+  // normalization, foreign launch only for supervisor-peer (supervisor-gated,
+  // audited), worker mode stays self-scoped via resolveWorkspaceScope.
+  'dist/main/main/api-launch-peer-supervisor.test.js',
+  // WP6 (plans/cross-workspace-collaboration.md — integration, security matrix):
+  // the proposal §5 acceptance scenario end-to-end (discover → list → read →
+  // revive → message with a minted supervisor token; worker 403s; global bearer
+  // allowed), the consolidated list/read/send/launch/revive × {bearer, supervisor,
+  // worker, researcher} × {own, foreign} allow/deny/audit matrix, and the
+  // credential rows (no launched agent of any lane holds getApiToken(); mint fails
+  // closed).
+  'dist/main/main/cross-workspace-integration.test.js',
   'dist/main/main/api-identity.test.js',
   'dist/main/main/api-codex-session-bind.test.js',
   'dist/main/main/continuation-lifecycle.test.js',

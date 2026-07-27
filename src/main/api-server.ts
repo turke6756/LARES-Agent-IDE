@@ -7,7 +7,8 @@ import { sendOutcomeMessage } from '../shared/send-outcome-copy';
 import { workspaceStateDir } from './workspace-state-dir';
 import type { AgentSupervisor } from './supervisor';
 import {
-  getAgent, getAllAgents, getAgentsByWorkspace, getAgentsByOwner, getWorkspace, getSupervisorAgent,
+  getAgent, getAllAgents, getAgentsByWorkspace, getAgentsByOwner, getWorkspace, getWorkspaces, getSupervisorAgent,
+  getWorkspaceAgentSummary, recordCrossWorkspaceAudit,
   getFileActivities, findSelectionCommentsByPath,
   createTeam, getTeam, listTeams, updateTeamStatus, saveTeamManifest, getTeamManifest,
   addTeamMember, removeTeamMember, getTeamMembers,
@@ -129,6 +130,16 @@ const API_ERROR_CODES = new Set<string>([
   'checkpoint-force-forbidden', 'checkpoint-preview-token-required',
   'checkpoint-bad-request', 'checkpoint-engine-unavailable',
   'checkpoint-prune-unavailable', 'checkpoint-unavailable',
+  // Cross-workspace collaboration (plans/cross-workspace-collaboration.md WP0):
+  // the cross-workspace / cross-agent authorization helpers, capability
+  // fail-closed mint, peer-supervisor launch mode, and the revival lifecycle all
+  // attach these machine-readable codes to their 4xx/5xx errors.
+  'cross-workspace-requires-supervisor', 'cross-workspace-target-forbidden',
+  'capability-mint-failed', 'peer-mode-incompatible',
+  'revive-agent-missing', 'revive-not-terminal', 'revive-runner-live',
+  'revive-workspace-gone', 'revive-cwd-gone', 'revive-no-session',
+  'revive-unsupported-provider', 'revive-live-successor', 'revive-ownership-blocked',
+  'revive-ownership-unverified', 'revive-stop-failed', 'revive-relaunch-failed',
 ]);
 
 /** Strip absolute paths out of an error message before it crosses the API
@@ -644,6 +655,96 @@ export class ApiServer {
     );
   }
 
+  // ── Cross-workspace collaboration (plans/cross-workspace-collaboration.md WP0) ──
+  //
+  // Two NEW authorizers, deliberately separate from resolveWorkspaceScope (which
+  // stays byte-identical — it guards many self-scoped routes). These are invoked
+  // ONLY on the routes this plan opens (WP1–WP4). Both key off the minted
+  // capability CLAIM's `privilegeLane`, never `identity.supervisor` (an asserted
+  // worker inherits the structural supervisor as IdentityContext.supervisor, so
+  // that field is NOT proof of privilege). `capability === undefined` = admission
+  // via the shared global bearer = the trusted UI/admin path → today's behavior.
+
+  /** WP0.1 — authorize a workspace-scoped (discovery/list) request. Global bearer
+   *  (no claim) is trusted and keeps the caller-supplied scope. A real agent may
+   *  only reach a workspace other than its own with supervisor privilege; a
+   *  non-supervisor reaching foreign is rejected. Returns the resolved scope
+   *  (`null` = "all workspaces", only reachable by the trusted path or a
+   *  no-explicit supervisor asking for its own) and the acting claim. */
+  private authorizeCrossWorkspace(
+    capability: CapabilityClaim | undefined,
+    explicitWorkspaceId: string | null,
+  ): { trusted: boolean; scope: string | null; actor: CapabilityClaim | null } {
+    if (!capability) return { trusted: true, scope: explicitWorkspaceId, actor: null };   // global bearer / UI
+    if (explicitWorkspaceId && explicitWorkspaceId !== capability.workspaceId
+        && capability.privilegeLane !== 'supervisor')
+      throw Object.assign(new Error('cross-workspace reach requires supervisor privilege'),
+        { statusCode: 403, code: 'cross-workspace-requires-supervisor' });
+    return { trusted: false, scope: explicitWorkspaceId ?? capability.workspaceId, actor: capability };
+  }
+
+  /** WP0.2 — authorize a per-ID (target-agent) request. Global bearer is trusted.
+   *  A real agent reaching an agent in its OWN workspace is allowed; reaching a
+   *  foreign-workspace agent requires supervisor privilege, else rejected. */
+  private authorizeAgentTarget(
+    capability: CapabilityClaim | undefined,
+    target: Agent,
+  ): { trusted: boolean; actor: CapabilityClaim | null } {
+    if (!capability) return { trusted: true, actor: null };                                 // global bearer / UI
+    if (target.workspaceId === capability.workspaceId) return { trusted: false, actor: capability };
+    if (capability.privilegeLane === 'supervisor') return { trusted: false, actor: capability };
+    throw Object.assign(new Error('cross-workspace target requires supervisor privilege'),
+      { statusCode: 403, code: 'cross-workspace-target-forbidden' });
+  }
+
+  /** WP2 — authorize a per-ID target request AND record the cross-workspace audit
+   *  trail. Wraps `authorizeAgentTarget`: on a denial (throw) it records a denial
+   *  row then rethrows; on success it records a row ONLY for a FOREIGN target
+   *  (actor present, target in another workspace). Same-workspace reads/sends and
+   *  the trusted global-bearer/UI path are deliberately NOT audited (avoids a
+   *  high-volume duplicate ledger). For `send_message`, `queuedMessageLen` carries
+   *  the message LENGTH only — contents are never passed or stored. */
+  private authorizeAgentTargetAudited(
+    capability: CapabilityClaim | undefined,
+    target: Agent,
+    operation: 'read_agent' | 'send_message',
+    extra?: { queuedMessageLen?: number | null },
+  ): { trusted: boolean; actor: CapabilityClaim | null } {
+    const len = operation === 'send_message' ? (extra?.queuedMessageLen ?? null) : null;
+    let result: { trusted: boolean; actor: CapabilityClaim | null };
+    try {
+      result = this.authorizeAgentTarget(capability, target);
+    } catch (err) {
+      const code = (err as { code?: string }).code;
+      recordCrossWorkspaceAudit({
+        operation,
+        actorAgentId: capability?.agentId,
+        actorWorkspaceId: capability?.workspaceId,
+        actorLane: capability?.privilegeLane,
+        targetAgentId: target.id,
+        targetWorkspaceId: target.workspaceId,
+        queuedMessageLen: len,
+        outcome: `denied:${code ?? 'cross-workspace-target-forbidden'}`,
+        detail: { code },
+      });
+      throw err;
+    }
+    // Audit only a FOREIGN success (actor present, target in another workspace).
+    if (result.actor && target.workspaceId !== result.actor.workspaceId) {
+      recordCrossWorkspaceAudit({
+        operation,
+        actorAgentId: result.actor.agentId,
+        actorWorkspaceId: result.actor.workspaceId,
+        actorLane: result.actor.privilegeLane,
+        targetAgentId: target.id,
+        targetWorkspaceId: target.workspaceId,
+        queuedMessageLen: len,
+        outcome: 'ok',
+      });
+    }
+    return result;
+  }
+
   // ── WP-G2.1: capability-bound checkpoint recovery surface ──────────────────────
 
   /**
@@ -1029,14 +1130,87 @@ export class ApiServer {
       return this.routeCheckpoints(method, url, req, capability);
     }
 
+    // GET /api/workspaces — discovery list (WP1.1, plans/cross-workspace-collaboration.md).
+    // Supervisor claim or global bearer → all workspaces; a non-supervisor claim →
+    // its own only. Agent (capability) callers get the reduced projection
+    // {id, title, agentCounts} — NO `path`; the trusted global-bearer/UI path keeps
+    // the full Workspace object. getWorkspaceAgentSummary() is an ARRAY that omits
+    // zero-active workspaces, so we key it and default missing entries to zero.
+    if (method === 'GET' && path === '/api/workspaces') {
+      const all = getWorkspaces();
+      // Global bearer / UI (no minted claim) → today's trusted admin path: full objects.
+      if (!capability) return all;
+      const summary = getWorkspaceAgentSummary();
+      const byWs = new Map(summary.map(s => [s.workspaceId, s]));
+      const project = (w: Workspace): { id: string; title: string; agentCounts: { activeCount: number; workingCount: number } } => {
+        const s = byWs.get(w.id);
+        return {
+          id: w.id,
+          title: w.title,
+          agentCounts: s ? { activeCount: s.activeCount, workingCount: s.workingCount } : { activeCount: 0, workingCount: 0 },
+        };
+      };
+      const isSupervisor = capability.privilegeLane === 'supervisor';
+      const visible = isSupervisor ? all : all.filter(w => w.id === capability.workspaceId);
+      // Audit only when the actor's scope is broader than its own workspace.
+      if (visible.some(w => w.id !== capability.workspaceId)) {
+        recordCrossWorkspaceAudit({
+          operation: 'list_workspaces',
+          actorAgentId: capability.agentId,
+          actorWorkspaceId: capability.workspaceId,
+          actorLane: capability.privilegeLane,
+          outcome: 'ok',
+        });
+      }
+      return visible.map(project);
+    }
+
     // GET /api/agents — list all agents
     if (method === 'GET' && path === '/api/agents') {
-      // Inc 1 (A3): header-scoped when asserted, else today's optional ?workspaceId.
-      const workspaceId = this.resolveWorkspaceScope(identity, url.searchParams.get('workspaceId'));
-      const agents = workspaceId ? getAgentsByWorkspace(workspaceId) : getAllAgents();
-      // Enrich with context stats
+      // WP1.2 (plans/cross-workspace-collaboration.md): a real agent's (capability)
+      // scoping now runs through authorizeCrossWorkspace so a supervisor may reach
+      // a foreign `workspaceId` while a worker/researcher reaching foreign → 403
+      // (audited denial). The trusted global-bearer/UI path is deliberately
+      // UNCHANGED — it keeps resolveWorkspaceScope, which honors the X-Workspace-Id
+      // header self-scope that authorizeCrossWorkspace (query-param only) does not.
+      const explicit = url.searchParams.get('workspaceId');
+      let scope: string | null;
+      let actor: CapabilityClaim | null = null;
+      if (!capability) {
+        scope = this.resolveWorkspaceScope(identity, explicit);
+      } else {
+        try {
+          ({ scope, actor } = this.authorizeCrossWorkspace(capability, explicit));
+        } catch (err) {
+          recordCrossWorkspaceAudit({
+            operation: 'list_agents',
+            actorAgentId: capability.agentId,
+            actorWorkspaceId: capability.workspaceId,
+            actorLane: capability.privilegeLane,
+            targetWorkspaceId: explicit,
+            outcome: `denied:${(err as { code?: string }).code ?? 'cross-workspace-requires-supervisor'}`,
+            detail: { code: (err as { code?: string }).code },
+          });
+          throw err;
+        }
+      }
+      const agents = scope ? getAgentsByWorkspace(scope) : getAllAgents();
+      // Audit a supervisor's foreign list (scope explicitly other than its own).
+      if (actor && explicit && explicit !== capability!.workspaceId) {
+        recordCrossWorkspaceAudit({
+          operation: 'list_agents',
+          actorAgentId: capability!.agentId,
+          actorWorkspaceId: capability!.workspaceId,
+          actorLane: capability!.privilegeLane,
+          targetWorkspaceId: explicit,
+          outcome: 'ok',
+        });
+      }
+      // Enrich with context stats + the owning workspace's title (cross-workspace
+      // rows need it to disambiguate duplicate agent titles).
       return agents.map(a => this.withInputInFlight({
         ...a,
+        workspaceTitle: getWorkspace(a.workspaceId)?.title ?? null,
         contextStats: this.supervisor.getContextStats(a.id),
       }));
     }
@@ -1046,6 +1220,8 @@ export class ApiServer {
     if (method === 'GET' && agentGetMatch) {
       const agent = getAgent(agentGetMatch[1]);
       if (!agent) throw Object.assign(new Error('Agent not found'), { statusCode: 404 });
+      // WP2: foreign target + non-supervisor claim → 403; foreign read audited.
+      this.authorizeAgentTargetAudited(capability, agent, 'read_agent');
       return this.withInputInFlight({
         ...agent,
         contextStats: this.supervisor.getContextStats(agent.id),
@@ -1055,6 +1231,10 @@ export class ApiServer {
     // GET /api/agents/:id/log — read agent log
     const logMatch = path.match(/^\/api\/agents\/([^/]+)\/log$/);
     if (method === 'GET' && logMatch) {
+      const target = getAgent(logMatch[1]);
+      if (!target) throw Object.assign(new Error('Agent not found'), { statusCode: 404 });
+      // WP2: foreign target + non-supervisor claim → 403; foreign read audited.
+      this.authorizeAgentTargetAudited(capability, target, 'read_agent');
       const lines = parseInt(url.searchParams.get('lines') || '50', 10);
       const log = await this.supervisor.getAgentLog(logMatch[1], lines);
       return { agentId: logMatch[1], lines, log };
@@ -1269,6 +1449,10 @@ export class ApiServer {
     const messagesMatch = path.match(/^\/api\/agents\/([^/]+)\/messages$/);
     if (method === 'GET' && messagesMatch) {
       const agentId = messagesMatch[1];
+      const target = getAgent(agentId);
+      if (!target) throw Object.assign(new Error('Agent not found'), { statusCode: 404 });
+      // WP2: foreign target + non-supervisor claim → 403; foreign read audited.
+      this.authorizeAgentTargetAudited(capability, target, 'read_agent');
       const limit = parseInt(url.searchParams.get('limit') || '50', 10);
       const role = url.searchParams.get('role') as 'assistant' | 'user' | undefined;
       // BUG-28: lazy-recover Codex resumeSessionId on chat-read so a discovery
@@ -1285,6 +1469,10 @@ export class ApiServer {
     const filesMatch = path.match(/^\/api\/agents\/([^/]+)\/file-activities$/);
     if (method === 'GET' && filesMatch) {
       const agentId = filesMatch[1];
+      const target = getAgent(agentId);
+      if (!target) throw Object.assign(new Error('Agent not found'), { statusCode: 404 });
+      // WP2: foreign target + non-supervisor claim → 403; foreign read audited.
+      this.authorizeAgentTargetAudited(capability, target, 'read_agent');
       const op = url.searchParams.get('operation');
       const operation = op === 'read' || op === 'write' || op === 'create' ? op : undefined;
       const limit = parseInt(url.searchParams.get('limit') || '200', 10);
@@ -1349,6 +1537,12 @@ export class ApiServer {
 
       const agent = getAgent(agentId);
       if (!agent) throw Object.assign(new Error('Agent not found'), { statusCode: 404 });
+
+      // WP2: foreign target + non-supervisor claim → 403; a FOREIGN send is audited
+      // (operation 'send_message', queued_message_len ONLY — never contents). A
+      // same-workspace send is intentionally NOT audited (no high-volume ledger).
+      // Sits BEFORE the 409 busy-gate so a foreign worker can't even probe state.
+      this.authorizeAgentTargetAudited(capability, agent, 'send_message', { queuedMessageLen: text.length });
 
       // Safety gate: only send to idle/waiting agents. `isInputInFlight`
       // covers the window between enqueue and the agent's first response
@@ -1651,11 +1845,57 @@ export class ApiServer {
         // idle across phases stays legal.
         assertPlanRailFree(input.planId);
       }
-      // Inc 1 (B4 server side): self-scope launches. Asserted caller + no
-      // workspaceId → fill from header; matching → ok; mismatch → 403. No header
-      // + no workspaceId → unchanged (launchAgent enforces as before).
-      const scopedWorkspaceId = this.resolveWorkspaceScope(identity, (input?.workspaceId as string) ?? null);
-      if (scopedWorkspaceId) input.workspaceId = scopedWorkspaceId;
+      // WP4 (plans/cross-workspace-collaboration.md) — normalize the snake_case
+      // `mode` launch class to the camelCase `launchMode` LaunchAgentInput field
+      // (the launch_agent MCP tool already sends launchMode; a raw HTTP caller may
+      // send `mode`). Peer mode is the only launch class allowed to target a
+      // foreign workspace.
+      if (input && input.mode !== undefined && input.launchMode === undefined) {
+        input.launchMode = input.mode;
+      }
+      // WP4.3 — authorize the launch scope against the NORMALIZED input.workspaceId
+      // (never the raw body). A `supervisor-peer` launch is the ONLY class permitted
+      // to reach a foreign workspace, and only with supervisor privilege; a
+      // capability-bearing non-supervisor is refused even in its own workspace (a
+      // peer supervisor is a launch-class privilege). A `worker`-mode launch stays
+      // self-scoped exactly as before via resolveWorkspaceScope — no foreign reach.
+      // Foreign peer launches (and denials) are audited; same-workspace and the
+      // trusted global-bearer/UI path are not (avoids a high-volume duplicate ledger).
+      if (input?.launchMode === 'supervisor-peer') {
+        if (capability && capability.privilegeLane !== 'supervisor') {
+          recordCrossWorkspaceAudit({
+            operation: 'launch',
+            actorAgentId: capability.agentId,
+            actorWorkspaceId: capability.workspaceId,
+            actorLane: capability.privilegeLane,
+            targetWorkspaceId: (input.workspaceId as string) ?? null,
+            outcome: 'denied:cross-workspace-requires-supervisor',
+            detail: { code: 'cross-workspace-requires-supervisor' },
+          });
+          throw Object.assign(
+            new Error('supervisor-peer launch requires supervisor privilege'),
+            { statusCode: 403, code: 'cross-workspace-requires-supervisor' },
+          );
+        }
+        const { scope, actor } = this.authorizeCrossWorkspace(capability, (input.workspaceId as string) ?? null);
+        if (scope) input.workspaceId = scope;
+        if (actor && input.workspaceId && input.workspaceId !== actor.workspaceId) {
+          recordCrossWorkspaceAudit({
+            operation: 'launch',
+            actorAgentId: actor.agentId,
+            actorWorkspaceId: actor.workspaceId,
+            actorLane: actor.privilegeLane,
+            targetWorkspaceId: input.workspaceId as string,
+            outcome: 'ok',
+          });
+        }
+      } else {
+        // Inc 1 (B4 server side): self-scope launches. Asserted caller + no
+        // workspaceId → fill from header; matching → ok; mismatch → 403. No header
+        // + no workspaceId → unchanged (launchAgent enforces as before).
+        const scopedWorkspaceId = this.resolveWorkspaceScope(identity, (input?.workspaceId as string) ?? null);
+        if (scopedWorkspaceId) input.workspaceId = scopedWorkspaceId;
+      }
       const agent = await this.supervisor.launchAgent(input);
       // Planning-surface P1: a plan-bound dispatch auto-subscribes the dispatching
       // supervisor to that plan (best-effort; no-op for non-supervisor callers).
@@ -1675,6 +1915,66 @@ export class ApiServer {
     if (method === 'POST' && forkMatch) {
       const newAgent = await this.supervisor.forkAgent(forkMatch[1]);
       return newAgent;
+    }
+
+    // POST /api/agents/:id/revive — WP3.3 (plans/cross-workspace-collaboration.md).
+    // Relaunch a done/crashed terminal agent's original session in its original
+    // cwd/workspace. Revival is a launch-class mutation → it requires SUPERVISOR
+    // privilege even same-workspace when a capability is present (a same-workspace
+    // worker read/send is fine, but never a revive); the trusted global-bearer/UI
+    // path is allowed. Cross-workspace targets go through authorizeAgentTarget.
+    // Every attempt — success, denial, AND failure — is audited with sanitized
+    // detail; queued_message_len carries the LENGTH only, never contents.
+    const reviveMatch = path.match(/^\/api\/agents\/([^/]+)\/revive$/);
+    if (method === 'POST' && reviveMatch) {
+      const agentId = reviveMatch[1];
+      const target = getAgent(agentId);
+      if (!target) throw Object.assign(new Error('Agent not found'), { statusCode: 404 });
+      const raw = await readBody(req);
+      const body = raw ? JSON.parse(raw) : {};
+      const message: string | undefined = typeof body.message === 'string' ? body.message : undefined;
+      const force = body.force === true;
+      const audit = (outcome: string, detail?: Record<string, unknown> | null): void => {
+        recordCrossWorkspaceAudit({
+          operation: 'revive',
+          actorAgentId: capability?.agentId,
+          actorWorkspaceId: capability?.workspaceId,
+          actorLane: capability ? capability.privilegeLane : 'global-bearer',
+          targetAgentId: target.id,
+          targetWorkspaceId: target.workspaceId,
+          force,
+          queuedMessageLen: message?.length ?? null,
+          outcome,
+          detail: detail ?? null,
+        });
+      };
+      // Authorize: (a) cross-workspace target gate, then (b) supervisor-only even
+      // same-workspace (global bearer allowed). Denials are audited then rethrown.
+      try {
+        this.authorizeAgentTarget(capability, target);
+        if (capability && capability.privilegeLane !== 'supervisor') {
+          throw Object.assign(new Error('revival requires supervisor privilege'),
+            { statusCode: 403, code: 'cross-workspace-requires-supervisor' });
+        }
+      } catch (err) {
+        const code = (err as { code?: string }).code;
+        audit(`denied:${code ?? 'cross-workspace-target-forbidden'}`, { code });
+        throw err;
+      }
+      // Perform the revival; audit success AND every thrown failure/denial with
+      // sanitized detail (code + successorId are the only revival-specific keys).
+      try {
+        const result = await this.supervisor.reviveAgent(agentId, { message, force });
+        audit('ok');
+        return result;
+      } catch (err) {
+        const code = (err as { code?: string }).code;
+        const successorId = (err as { successorId?: string }).successorId;
+        const detail: Record<string, unknown> = { code };
+        if (successorId !== undefined) detail.successorId = successorId;
+        audit(`error:${code ?? 'revive-relaunch-failed'}`, detail);
+        throw err;
+      }
     }
 
     // ── Orchestration routes ─────────────────────────────────────────────

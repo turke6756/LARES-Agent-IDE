@@ -16,6 +16,7 @@ import assert from 'node:assert/strict';
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const dbModule = require('../database') as {
   getFileActivities: (agentId: string, op?: string, currentOnly?: boolean) => unknown[];
+  getAgent: (id: string) => unknown;
 };
 
 interface FakeRow {
@@ -32,6 +33,16 @@ interface FakeRow {
 
 let fakeRows: FakeRow[] = [];
 const dbCalls: Array<{ agentId: string; op: string | undefined; currentOnly: boolean | undefined }> = [];
+
+// WP2 (plans/cross-workspace-collaboration.md) added a target lookup + per-ID
+// authorization to this route: `getAgent(id)` (404 if missing) → authorizeAgentTarget.
+// This test drives route() with a bare `{}` request (no capability = trusted
+// global bearer), so authorization is a pass-through; we only need getAgent to
+// resolve the target so the read reaches getFileActivities. 'ghost-agent' stays
+// unknown so the missing-target 404 path can be asserted.
+const origGetAgent = dbModule.getAgent;
+dbModule.getAgent = (id: string) =>
+  id === 'ghost-agent' ? null : { id, workspaceId: 'ws-x' };
 
 const origGetFileActivities = dbModule.getFileActivities;
 dbModule.getFileActivities = (agentId: string, op?: string, currentOnly?: boolean) => {
@@ -149,12 +160,14 @@ test('bogus operation value is rejected, falls back to no-filter (no SQL injecti
   assert.deepEqual(dbCalls, [{ agentId: 'agent-x', op: undefined, currentOnly: false }]);
 });
 
-test('non-existent agent returns an empty activities array (not null, not 404)', async () => {
+test('non-existent target agent → 404 (WP2 per-ID target lookup)', async () => {
+  // WP2 changed this route's contract: a missing target is now a 404 (was an
+  // empty activities array), matching the other per-ID routes.
   fakeRows = [makeRow({ id: 1, agentId: 'agent-x' })];
-  const result = await get('/api/agents/ghost-agent/file-activities');
-  assert.equal(result.agentId, 'ghost-agent');
-  assert.equal(result.operation, null);
-  assert.deepEqual(result.activities, []);
+  await assert.rejects(
+    () => get('/api/agents/ghost-agent/file-activities'),
+    (err: any) => err.statusCode === 404,
+  );
 });
 
 test('payload row shape matches the writeup example', async () => {
@@ -228,6 +241,7 @@ test('limit param trims the result array', async () => {
     }
   }
   dbModule.getFileActivities = origGetFileActivities;
+  dbModule.getAgent = origGetAgent;
   console.log(`\n${passed} passed, ${failed} failed`);
   process.exit(failed === 0 ? 0 : 1);
 })();

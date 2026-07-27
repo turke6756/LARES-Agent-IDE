@@ -274,6 +274,27 @@ export function initDatabase(): void {
     )
   `);
 
+  // Cross-workspace collaboration audit (plans/cross-workspace-collaboration.md
+  // WP0.3). `addEvent` is single-agent_id-keyed and cannot express discovery
+  // events (list / list_workspaces have no natural target agent), so this
+  // dedicated table records every cross-workspace/foreign-target operation —
+  // SUCCESSES AND every denied/failed attempt. It NEVER stores message contents
+  // (only `queued_message_len`); `detail` is a sanitized fixed-key allowlist JSON,
+  // never a raw error string or message body.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS cross_workspace_audit (
+      id TEXT PRIMARY KEY, ts INTEGER NOT NULL,
+      operation TEXT NOT NULL,            -- list_agents | list_workspaces | read_agent | send_message | launch | revive
+      actor_agent_id TEXT, actor_workspace_id TEXT, actor_lane TEXT,   -- lane | 'global-bearer'
+      target_agent_id TEXT, target_workspace_id TEXT,
+      force INTEGER DEFAULT 0, queued_message_len INTEGER,             -- length only, NEVER contents
+      outcome TEXT NOT NULL,              -- 'ok' | 'denied:<code>' | 'error:<code>'
+      detail TEXT                          -- sanitized allowlist JSON (fixed keys) — never a raw error string/body
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_cwa_ts ON cross_workspace_audit(ts)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_cwa_target_ws ON cross_workspace_audit(target_workspace_id, ts)`);
+
   // ── Team tables ─────────────────────────────────────────────────────────
 
   db.exec(`
@@ -3774,6 +3795,129 @@ export function backfillStreamWorkspaceLineage(): void {
 
 export function addEvent(agentId: string, eventType: string, payload?: string): void {
   run('INSERT INTO events (agent_id, event_type, payload) VALUES (?, ?, ?)', [agentId, eventType, payload || null]);
+}
+
+// ── Cross-workspace collaboration audit (plans/cross-workspace-collaboration.md WP0.3) ──
+
+/** The operations recorded in `cross_workspace_audit`. */
+export type CrossWorkspaceAuditOperation =
+  | 'list_agents' | 'list_workspaces' | 'read_agent' | 'send_message' | 'launch' | 'revive';
+
+/** A raw audit entry as supplied by a route. `detail` is SANITIZED here to a
+ *  fixed key allowlist before storage — a caller can pass a wider object and only
+ *  the allowlisted keys survive. Message contents are NEVER accepted (callers
+ *  pass `queuedMessageLen`, a length, instead). */
+export interface CrossWorkspaceAuditEntry {
+  operation: CrossWorkspaceAuditOperation;
+  actorAgentId?: string | null;
+  actorWorkspaceId?: string | null;
+  /** The actor's privilege lane, or the literal `'global-bearer'` for the trusted path. */
+  actorLane?: string | null;
+  targetAgentId?: string | null;
+  targetWorkspaceId?: string | null;
+  force?: boolean;
+  /** Length ONLY — never the message text. */
+  queuedMessageLen?: number | null;
+  /** `'ok' | 'denied:<code>' | 'error:<code>'`. */
+  outcome: string;
+  /** Sanitized to the fixed allowlist below; anything else is dropped. */
+  detail?: Record<string, unknown> | null;
+}
+
+export interface CrossWorkspaceAuditRow {
+  id: string;
+  ts: number;
+  operation: string;
+  actorAgentId: string | null;
+  actorWorkspaceId: string | null;
+  actorLane: string | null;
+  targetAgentId: string | null;
+  targetWorkspaceId: string | null;
+  force: boolean;
+  queuedMessageLen: number | null;
+  outcome: string;
+  detail: Record<string, unknown> | null;
+}
+
+/** The ONLY keys allowed to survive into a stored `detail` blob. Deliberately
+ *  narrow (fixed, non-free-text) so `detail` can never become a path/error/body
+ *  disclosure side channel. */
+const CROSS_WORKSPACE_AUDIT_DETAIL_KEYS = ['code', 'gate', 'successorId', 'provider'] as const;
+
+/** Reduce an arbitrary detail object to the fixed allowlist, coercing values to
+ *  strings so a raw Error/body object can never smuggle nested content through. */
+function sanitizeCrossWorkspaceAuditDetail(
+  detail: Record<string, unknown> | null | undefined,
+): Record<string, string> | null {
+  if (!detail || typeof detail !== 'object') return null;
+  const out: Record<string, string> = {};
+  for (const key of CROSS_WORKSPACE_AUDIT_DETAIL_KEYS) {
+    const v = (detail as Record<string, unknown>)[key];
+    if (v === undefined || v === null) continue;
+    out[key] = String(v);
+  }
+  return Object.keys(out).length > 0 ? out : null;
+}
+
+/** Insert a cross-workspace audit row. Records successes AND every denied/failed
+ *  attempt. `detail` is sanitized to the fixed key allowlist; message contents
+ *  are never stored (only `queuedMessageLen`). */
+export function recordCrossWorkspaceAudit(entry: CrossWorkspaceAuditEntry): void {
+  const id = uuidv4();
+  const detail = sanitizeCrossWorkspaceAuditDetail(entry.detail);
+  run(
+    `INSERT INTO cross_workspace_audit
+       (id, ts, operation, actor_agent_id, actor_workspace_id, actor_lane,
+        target_agent_id, target_workspace_id, force, queued_message_len, outcome, detail)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      id, Date.now(), entry.operation,
+      entry.actorAgentId ?? null, entry.actorWorkspaceId ?? null, entry.actorLane ?? null,
+      entry.targetAgentId ?? null, entry.targetWorkspaceId ?? null,
+      entry.force ? 1 : 0, entry.queuedMessageLen ?? null, entry.outcome,
+      detail ? JSON.stringify(detail) : null,
+    ],
+  );
+}
+
+function rowToCrossWorkspaceAudit(row: any): CrossWorkspaceAuditRow {
+  let detail: Record<string, unknown> | null = null;
+  if (row.detail) {
+    try { detail = JSON.parse(row.detail); } catch { detail = null; }
+  }
+  return {
+    id: row.id,
+    ts: Number(row.ts),
+    operation: row.operation,
+    actorAgentId: row.actor_agent_id ?? null,
+    actorWorkspaceId: row.actor_workspace_id ?? null,
+    actorLane: row.actor_lane ?? null,
+    targetAgentId: row.target_agent_id ?? null,
+    targetWorkspaceId: row.target_workspace_id ?? null,
+    force: !!row.force,
+    queuedMessageLen: row.queued_message_len === null || row.queued_message_len === undefined
+      ? null : Number(row.queued_message_len),
+    outcome: row.outcome,
+    detail,
+  };
+}
+
+/** Read cross-workspace audit rows, newest first. Optionally filter by a lower
+ *  timestamp bound and/or a target workspace, and cap the count. */
+export function getCrossWorkspaceAudit(
+  opts: { sinceTs?: number; workspaceId?: string; limit?: number } = {},
+): CrossWorkspaceAuditRow[] {
+  const clauses: string[] = [];
+  const params: any[] = [];
+  if (opts.sinceTs !== undefined) { clauses.push('ts >= ?'); params.push(opts.sinceTs); }
+  if (opts.workspaceId !== undefined) { clauses.push('target_workspace_id = ?'); params.push(opts.workspaceId); }
+  const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
+  const limit = opts.limit !== undefined && opts.limit > 0 ? Math.floor(opts.limit) : 200;
+  params.push(limit);
+  return queryAll(
+    `SELECT * FROM cross_workspace_audit ${where} ORDER BY ts DESC, id DESC LIMIT ?`,
+    params,
+  ).map(rowToCrossWorkspaceAudit);
 }
 
 // Agent template operations

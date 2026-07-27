@@ -573,6 +573,16 @@ export interface LaunchAgentInput {
   // Researcher role-lane (browser-parity-and-capability-isolation §0, D-1).
   // Claude-only (D-2); mutually exclusive with the other lane flags.
   isResearcher?: boolean;
+  // Launch class (plans/cross-workspace-collaboration.md WP4). 'worker' (the
+  // default) is today's behavior exactly — the owner-edge / lane derivation below
+  // is unchanged. 'supervisor-peer' creates a TOP-LEVEL supervisor with NO owner
+  // edge (a peer, not a child): launchAgent canonicalizes it BEFORE lane/cwd
+  // derivation (forces isSupervisor, clears isSupervised/isWorker/ownerAgentId)
+  // and rejects a researcher/persona combination with `peer-mode-incompatible`.
+  // Foreign-workspace launches are permitted ONLY in this mode, supervisor-gated
+  // at the route; the MCP `launch_agent` tool exposes it as `mode`, and never
+  // exposes a caller-controlled ownerAgentId.
+  launchMode?: 'worker' | 'supervisor-peer';
   // Persona privilege lane (#19). Set by applyPersonaLaneToLaunchInput when a
   // persona declares the 'supervisor' lane: grants the supervisor MCP toolset
   // WITHOUT the structural supervisor role (isSupervisor stays false). Persisted

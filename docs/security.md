@@ -61,6 +61,45 @@ incomplete:
   `shell.openExternal`. These decisions are pure and tested in
   `src/main/pdf/pdf-security.ts` (`pdf-security.test.ts`).
 
+## Cross-workspace collaboration — supervisor-gated, audited, fail-closed
+
+A supervisor can discover, read, message, revive, and launch peers *across*
+workspaces. That reach is deliberately narrow and is the one place where the
+"you trust the agents" model is backed by an enforced authorization boundary
+rather than convention:
+
+- **Supervisor-only, per-route.** Cross-workspace discovery (`list_workspaces` /
+  cross-workspace `list_agents {workspace_id}`), foreign per-ID reach
+  (`read_agent_chat` / `send_message_to_agent`), foreign / peer launch
+  (`launch_agent mode: 'supervisor-peer'`), and **all** revival (`revive_agent`)
+  require a minted capability whose `privilegeLane` is `supervisor`. A worker or
+  researcher reaching a foreign workspace is refused (HTTP 403). Revival is
+  supervisor-only **even within the same workspace** — it is a launch-class
+  mutation. Two dedicated authorizers (`authorizeCrossWorkspace`,
+  `authorizeAgentTarget` in `src/main/api-server.ts`) gate exactly these routes;
+  the general self-scope fence (`resolveWorkspaceScope`) is unchanged.
+- **The global bearer is the trusted UI/admin path.** A request with no minted
+  claim keeps today's behavior. A request with a minted claim is a real agent and
+  is held to the rules above.
+- **Every crossing is audited — including denials.** The `cross_workspace_audit`
+  table (`src/main/database.ts`) records each discovery, foreign read/send,
+  foreign/peer launch, and revival, with actor/target workspace+agent ids,
+  operation, and outcome — `ok`, `denied:<code>`, or `error:<code>`. Denied and
+  failed attempts are recorded, not just successes. **Message contents are never
+  stored** — only a length (`queued_message_len`) and a sanitized fixed-key
+  `detail`.
+- **Capability minting fails closed; the bearer never reaches a sidecar.** Each
+  agent is minted a per-agent token **exactly once** per launch/relaunch/fork,
+  threaded to its dashboard MCP config, child env, and any team MCP config. The
+  shared global bearer is **never** injected into an agent sidecar — otherwise a
+  worker issuing raw HTTP would present the bearer and be treated as admin,
+  defeating the whole model. If minting fails, the launch **aborts** (the agent
+  surfaces as `crashed`) rather than fall back to the bearer.
+
+This is an authorization boundary, not a sandbox: a supervisor you trust with
+cross-workspace reach can still act across every workspace it can see. The audit
+ledger is how you *watch* that reach.
+
 ## PDF rendering — added native-parser attack surface
 
 The fast PDF viewer renders pages with **PDFium** (compiled to WASM), pinned as
