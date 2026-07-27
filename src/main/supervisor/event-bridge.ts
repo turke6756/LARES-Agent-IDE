@@ -160,16 +160,36 @@ export class EventBridge {
    * supervisor, that recipient is not the owner → not muted → the backstop still
    * delivers. So a muted agent whose owner dies still surfaces a crash to the
    * structural supervisor (safety net preserved).
+   *
+   * `bypassMute` (watchdog-class events only — see isWatchdogClassEvent) lifts
+   * the notifyOwner mute so worker_stalled / handoff_failed always reach the
+   * supervising agent even for a muted orchestration member (launched with
+   * notifyOwner:false, commit 6e92334). The mute exists to spare owners the
+   * routine idle/done turn-end noise of a member; a stall or a failed handoff
+   * is exactly the actionable signal the supervisor must not miss, so it is not
+   * muted. Non-watchdog events (status_change idle/done, context_threshold, …)
+   * still honor the mute.
    */
-  private ownerRecipientComponent(agent: Agent): Agent | null {
+  private ownerRecipientComponent(agent: Agent, opts?: { bypassMute?: boolean }): Agent | null {
     const recipient = this.deps.getOwnerForWorker(agent);
     if (!recipient) return null;
-    if (agent.notifyOwner === false
+    if (opts?.bypassMute !== true
+        && agent.notifyOwner === false
         && agent.ownerAgentId
         && recipient.id === agent.ownerAgentId) {
       return null; // owned + muted + recipient is the explicit owner → drop
     }
     return recipient;
+  }
+
+  /** Watchdog-class events bypass the notifyOwner member mute (see
+   *  ownerRecipientComponent). These are the "something is wrong" signals a
+   *  supervising agent must always receive — a worker stuck `working` with zero
+   *  signal (worker_stalled) or a prompt typed but never submitted
+   *  (handoff_failed). Deliberately NARROW: turn-end noise (idle/done/waiting
+   *  status_change, context_threshold) is not watchdog-class and stays muted. */
+  private isWatchdogClassEvent(event: SupervisorEvent): boolean {
+    return event.type === 'worker_stalled' || event.type === 'handoff_failed';
   }
 
   private eventIsSubscriberEligible(event: SupervisorEvent): boolean {
@@ -202,7 +222,9 @@ export class EventBridge {
    *  owner wins. */
   private recipientsFor(agent: Agent, event: SupervisorEvent): Array<{ recipient: Agent; viaSubscription: boolean }> {
     const out: Array<{ recipient: Agent; viaSubscription: boolean }> = [];
-    const owner = agent.isSupervisor ? null : this.ownerRecipientComponent(agent);
+    const owner = agent.isSupervisor
+      ? null
+      : this.ownerRecipientComponent(agent, { bypassMute: this.isWatchdogClassEvent(event) });
     // A terminal owner is normally dropped here (genuinely dead → no delivery).
     // BUG-41 exception: a 'done' owner whose continuation swap is mid-flight is
     // NOT dead — its PTY is being replaced under the same id. Admit it so
@@ -597,10 +619,23 @@ export class EventBridge {
             });
             break;
           case 'user-text':
-            this.deps.statusMonitor.forceWorking(agentId, {
-              source: 'user-turn',
-              ttlClass: 'model-pending',
-            });
+            // 'user-text' is intentionally NOT status-bearing (owner decision,
+            // 2026-07-27). HOOKS ARE THE SOLE AUTHORITY FOR TURN-START. A
+            // user-text chat event is never proof the harness accepted a
+            // prompt: the dashboard's OWN echo of a just-sent prompt produces
+            // exactly this event, so flipping to 'working' here manufactured a
+            // false turn-start (GroupThink stall, runs 155867b7 / 2abeedf4 —
+            // the false 'user-turn' write made sendInputConfirmed's status-poll
+            // confirm and re-armed waitTurnComplete's stall deadline forever).
+            // The event still flows for chat display / telemetry; only the
+            // status write is gone, for ALL providers. Turn-start now comes
+            // exclusively from the hook pipeline (UserPromptSubmit / codex
+            // hook-spool). For a hookless provider (gemini today) turn-start
+            // comes only from its FIRST assistant-derived event after submit
+            // (assistant-text / thinking / tool-use / task-started) — genuine
+            // agent output the send path cannot forge. When a future harness
+            // gains hooks, those own status outright and this lane is skipped
+            // upstream by the hookOwned gate.
             break;
           case 'task-started':
             // BUG-18 Change 3 — see tool-use comment. task-started is the

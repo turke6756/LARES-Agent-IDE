@@ -467,14 +467,17 @@ async function onChatEvents_dispatchTable(): Promise<void> {
     userEv, toolEv, tsEv, stopReasonEv, patchEv,
   ]));
 
-  assert.equal(f.statusForceCalls.length, 5);
+  // user-text is NO LONGER status-bearing (hooks are the sole turn-start
+  // authority; the dashboard's own send-echo produces a user-text event and
+  // must never manufacture a 'working' flip). So the 5 events above yield only
+  // 4 force calls — user-text drops out.
+  assert.equal(f.statusForceCalls.length, 4);
   // BUG-09 §3.3 — assistant-text without turnComplete now refreshes via the
   // generic `assistant-text` source (was `turnContinues`, conditioned on
   // stopReason === 'tool_use'). All forceWorking calls now carry typed opts.
   assert.deepEqual(
     f.statusForceCalls.map(c => `${c.method}:${c.source ?? c.kind}`),
     [
-      'forceWorking:user-turn',
       'forceWorking:tool-use',
       'forceWorking:task-started',
       'forceWorking:assistant-text',
@@ -491,7 +494,9 @@ async function onChatEvents_dispatchTable(): Promise<void> {
 
 async function onChatEvents_geminiToolUseStillRoutes(): Promise<void> {
   // BR-19 is only about the assistant-text+turnComplete branch. Gemini's
-  // other events (tool-use, task-started, user-text) still drive the latch.
+  // assistant-derived events (tool-use, task-started) still drive the latch.
+  // (user-text is no longer status-bearing on any provider — hooks own
+  // turn-start; a hookless gemini turn starts from its first assistant event.)
   const f = makeFakeBridgeDeps();
   const gem = makeAgent('gem-2', { provider: 'gemini', status: 'idle' });
   f.agents.set(gem.id, gem);
@@ -1075,10 +1080,13 @@ async function BUG_18_endToEndTurnInFlightSetAndCleared(): Promise<void> {
   console.log('  BUG-18 Change 3 ✓ end-to-end turn: turnInFlight set on task-started/tool-use/assistant-text, cleared by turnComplete');
 }
 
-async function BUG_18_userTextDoesNotMarkTurnInFlight(): Promise<void> {
-  // Verify the bridge is selective: user-text is a refresh source but it
-  // does NOT begin a model turn (the next task-started / first assistant
-  // event does). Marking it would over-extend the latch on aborted turns.
+async function userTextIsNotStatusBearing(): Promise<void> {
+  // Hooks are the sole authority for turn-start (owner decision 2026-07-27).
+  // A user-text chat event — indistinguishable from the dashboard's own echo
+  // of a just-sent prompt — must NEVER write status on ANY provider. It used
+  // to forceWorking('user-turn'); that false turn-start is the GroupThink
+  // stall root cause. Verify the bridge now emits ZERO force calls for a lone
+  // user-text event, even on a hookless-fallthrough lane (unsupervised claude).
   const f = makeFakeBridgeDeps();
   const claude = makeAgent('cl-bug18-3', { provider: 'claude', status: 'working', isSupervised: false });
   f.agents.set(claude.id, claude);
@@ -1089,11 +1097,9 @@ async function BUG_18_userTextDoesNotMarkTurnInFlight(): Promise<void> {
   };
   bridge.onChatEvents(batchFor(claude.id, [userEv]));
 
-  assert.equal(f.statusForceCalls.length, 1);
-  assert.equal(f.statusForceCalls[0].source, 'user-turn');
-  assert.notEqual(f.statusForceCalls[0].workingOpts?.turnInFlight, true,
-    'user-text does not begin an in-flight turn');
-  console.log('  BUG-18 Change 3 ✓ user-text omits turnInFlight (non-regression)');
+  assert.equal(f.statusForceCalls.length, 0,
+    'user-text is not status-bearing — hooks are the sole turn-start authority');
+  console.log('  status ✓ user-text writes no status (hooks own turn-start; send-echo cannot forge working)');
 }
 
 // ── BUG-22 Step 1: tmux_new_session_failed bridge wiring ───────────────
@@ -1398,6 +1404,52 @@ async function MUTE_terminalOwnerBackstopNotMuted(): Promise<void> {
     'MUTE: backstop recipient is the structural supervisor, not the (muted) owner',
   );
   console.log('  MUTE ✓ muted worker + terminal owner → structural backstop still delivers');
+}
+
+async function MUTE_watchdogEventsBypassMute(): Promise<void> {
+  // (d) Orchestration members launch with notifyOwner:false (commit 6e92334) to
+  // spare the supervising agent routine idle/done turn-end noise. But that mute
+  // must NOT swallow the "something is wrong" signals: worker_stalled and
+  // handoff_failed are watchdog-class and bypass the mute, reaching the live
+  // owner. Meanwhile an idle status_change from the SAME muted member stays
+  // muted. Both assertions share one bridge so we prove the gate is per-event
+  // class, not a blanket un-muting.
+  const f = makeFakeBridgeDeps();
+  const owner = makeAgent('owner-1', { isSupervisor: false, isSupervised: false, status: 'idle' });
+  const worker = makeAgent('w-1', {
+    isSupervised: false,
+    isWorker: true,
+    status: 'working',
+    ownerAgentId: owner.id,
+    notifyOwner: false,
+  });
+  f.agents.set(owner.id, owner);
+  f.agents.set(worker.id, worker);
+  f.logs.set(worker.id, 'tail\n');
+  const bridge = new EventBridge(f.deps);
+
+  // worker_stalled — watchdog-class → bypasses the mute → delivered to owner.
+  await bridge.onWorkerStalled({ agent: worker, stalledForMs: 600_000 });
+  assert.equal(f.sendInputCalls.length, 1, 'MUTE: muted member worker_stalled bypasses the mute');
+  assert.equal(f.sendInputCalls[0].agentId, owner.id, 'MUTE: watchdog event reaches the muted member\'s owner');
+  assert.match(f.sendInputCalls[0].text, /stalled|Stalled|working/,
+    'MUTE: delivered payload is the stall event');
+
+  // handoff_failed — also watchdog-class → bypasses the mute.
+  await bridge.onHandoffFailed({ agent: worker, attempts: 3, message: 'submit never confirmed' });
+  assert.equal(f.sendInputCalls.length, 2, 'MUTE: muted member handoff_failed also bypasses the mute');
+  assert.equal(f.sendInputCalls[1].agentId, owner.id);
+
+  // idle turn-end noise from the SAME muted member — still muted (dropped).
+  await bridge.onStatusChanged({
+    agentId: worker.id,
+    status: 'idle',
+    fromStatus: 'working',
+    source: 'monitor',
+  });
+  assert.equal(f.sendInputCalls.length, 2, 'MUTE: idle turn-end from the muted member stays muted');
+  assert.equal(bridge.getQueueSnapshot().length, 0, 'MUTE: muted idle is not even queued');
+  console.log('  MUTE ✓ watchdog events (worker_stalled/handoff_failed) bypass member mute; idle stays muted');
 }
 
 // ── Transient one-turn cross-agent subscription (Increment 1) ──────────
@@ -2023,7 +2075,7 @@ async function main(): Promise<void> {
   await BR_11d_idleSupervisorNoTypingShipsImmediately();
   await BUG_18_thinkingForceWorkingUsesThinkingPending();
   await BUG_18_endToEndTurnInFlightSetAndCleared();
-  await BUG_18_userTextDoesNotMarkTurnInFlight();
+  await userTextIsNotStatusBearing();
   await BUG_22_tmuxFailureDeliversWithDistinctHeader();
   await BUG_22_tmuxFailureForSupervisorIsNoOpAtBridge();
   await BUG_22_tmuxFailureQueuesWhenSupervisorBusy();
@@ -2033,6 +2085,7 @@ async function main(): Promise<void> {
   await MUTE_ownedMutedLiveOwnerDropped();
   await MUTE_defaultNotifyStillDelivers();
   await MUTE_terminalOwnerBackstopNotMuted();
+  await MUTE_watchdogEventsBypassMute();
   await TS01_fanOutAndConsume();
   await TS02_waitingCap();
   await TS03_crashConsumes();
