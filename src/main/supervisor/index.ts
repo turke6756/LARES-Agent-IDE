@@ -28,7 +28,7 @@ import {
   RESEARCH_STORE_README_MD, RESEARCH_WRITE_GUARD_MJS, RESEARCHER_CLAUDE_SETTINGS_JSON,
   RESEARCHER_CLAUDE_SETTINGS_JSON_V1, RESEARCHER_AGENT_MD,
   PERSONA_CREATE_PERSONA_SKILL, PERSONA_READ_COMMENTS_SKILL, SCRIPT_READ_COMMENTS_PY,
-  PERSONA_CREATE_PERSONA_SKILL_V1, PERSONA_READ_COMMENTS_SKILL_V1, PERSONA_READ_COMMENTS_SKILL_V2, PERSONA_READ_COMMENTS_SKILL_V3,
+  PERSONA_CREATE_PERSONA_SKILL_V1, PERSONA_READ_COMMENTS_SKILL_V1, PERSONA_READ_COMMENTS_SKILL_V2, PERSONA_READ_COMMENTS_SKILL_V3, PERSONA_READ_COMMENTS_SKILL_V4,
   PERSONA_CREATE_PERSONA_SKILL_V3_HASH,
   CONTINUATION_BRICK_RENDER_MAX_BYTES,
   CONTINUATION_STOP_FLUSH_DELAY_MS,
@@ -2542,7 +2542,7 @@ export class AgentSupervisor extends EventEmitter {
     // Persona kit (§1.4) — the two default skills ship into every native lane too
     // so the supervisor/researcher/worker can guide persona creation + read comments.
     [`.lares/supervisor/.claude/skills/create-persona/SKILL.md`]:                 { content: PERSONA_CREATE_PERSONA_SKILL, version: 4, previousHashes: { 1: sha256Hex(PERSONA_CREATE_PERSONA_SKILL_V1), 2: PERSONA_CREATE_PERSONA_SKILL_V2_HASH, 3: PERSONA_CREATE_PERSONA_SKILL_V3_HASH } }, // v4: `.lares` rename
-    [`.lares/supervisor/.claude/skills/read-comments/SKILL.md`]:                  { content: PERSONA_READ_COMMENTS_SKILL, version: 4, previousHashes: { 1: sha256Hex(PERSONA_READ_COMMENTS_SKILL_V1), 2: sha256Hex(PERSONA_READ_COMMENTS_SKILL_V2), 3: sha256Hex(PERSONA_READ_COMMENTS_SKILL_V3) } }, // v4: read_comments MCP tool primary (Python demoted to fallback)
+    [`.lares/supervisor/.claude/skills/read-comments/SKILL.md`]:                  { content: PERSONA_READ_COMMENTS_SKILL, version: 5, previousHashes: { 1: sha256Hex(PERSONA_READ_COMMENTS_SKILL_V1), 2: sha256Hex(PERSONA_READ_COMMENTS_SKILL_V2), 3: sha256Hex(PERSONA_READ_COMMENTS_SKILL_V3), 4: sha256Hex(PERSONA_READ_COMMENTS_SKILL_V4) } }, // v5: Python fallback removed (honest on a Python-free clean VM)
     // NOTE: .lares/supervisor/memory/MEMORY.md is deliberately NOT managed
     // here — it is seeded once via seedSupervisorMemoryIfAbsent (seed-once
     // contract, parallels worker behavioral.md). Keeping it in this map would
@@ -2634,7 +2634,7 @@ export class AgentSupervisor extends EventEmitter {
     },
     // Persona kit (§1.4) — default skills for the Claude worker lane.
     [`.lares/workers/claude/.claude/skills/create-persona/SKILL.md`]: { content: PERSONA_CREATE_PERSONA_SKILL, version: 4, previousHashes: { 1: sha256Hex(PERSONA_CREATE_PERSONA_SKILL_V1), 2: PERSONA_CREATE_PERSONA_SKILL_V2_HASH, 3: PERSONA_CREATE_PERSONA_SKILL_V3_HASH } }, // v4: `.lares` rename
-    [`.lares/workers/claude/.claude/skills/read-comments/SKILL.md`]:  { content: PERSONA_READ_COMMENTS_SKILL, version: 4, previousHashes: { 1: sha256Hex(PERSONA_READ_COMMENTS_SKILL_V1), 2: sha256Hex(PERSONA_READ_COMMENTS_SKILL_V2), 3: sha256Hex(PERSONA_READ_COMMENTS_SKILL_V3) } }, // v4: read_comments MCP tool primary (Python demoted to fallback)
+    [`.lares/workers/claude/.claude/skills/read-comments/SKILL.md`]:  { content: PERSONA_READ_COMMENTS_SKILL, version: 5, previousHashes: { 1: sha256Hex(PERSONA_READ_COMMENTS_SKILL_V1), 2: sha256Hex(PERSONA_READ_COMMENTS_SKILL_V2), 3: sha256Hex(PERSONA_READ_COMMENTS_SKILL_V3), 4: sha256Hex(PERSONA_READ_COMMENTS_SKILL_V4) } }, // v5: Python fallback removed (honest on a Python-free clean VM)
   };
 
   /** WP-G — Research store skeleton (plans/groupthink/browser-parity-and-research-store.md).
@@ -2660,7 +2660,7 @@ export class AgentSupervisor extends EventEmitter {
     [`.lares/researcher/scripts/research-write-guard.mjs`]:  { content: RESEARCH_WRITE_GUARD_MJS, version: 3, previousHashes: { 1: RESEARCH_WRITE_GUARD_MJS_V1_HASH, 2: RESEARCH_WRITE_GUARD_MJS_V2_HASH }, executable: true }, // v3: accepts both `.lares`/`.dashboard` research markers
     // Persona kit (§1.4) — default skills for the researcher lane.
     [`.lares/researcher/.claude/skills/create-persona/SKILL.md`]: { content: PERSONA_CREATE_PERSONA_SKILL, version: 4, previousHashes: { 1: sha256Hex(PERSONA_CREATE_PERSONA_SKILL_V1), 2: PERSONA_CREATE_PERSONA_SKILL_V2_HASH, 3: PERSONA_CREATE_PERSONA_SKILL_V3_HASH } }, // v4: `.lares` rename
-    [`.lares/researcher/.claude/skills/read-comments/SKILL.md`]:  { content: PERSONA_READ_COMMENTS_SKILL, version: 4, previousHashes: { 1: sha256Hex(PERSONA_READ_COMMENTS_SKILL_V1), 2: sha256Hex(PERSONA_READ_COMMENTS_SKILL_V2), 3: sha256Hex(PERSONA_READ_COMMENTS_SKILL_V3) } }, // v4: read_comments MCP tool primary (Python demoted to fallback)
+    [`.lares/researcher/.claude/skills/read-comments/SKILL.md`]:  { content: PERSONA_READ_COMMENTS_SKILL, version: 5, previousHashes: { 1: sha256Hex(PERSONA_READ_COMMENTS_SKILL_V1), 2: sha256Hex(PERSONA_READ_COMMENTS_SKILL_V2), 3: sha256Hex(PERSONA_READ_COMMENTS_SKILL_V3), 4: sha256Hex(PERSONA_READ_COMMENTS_SKILL_V4) } }, // v5: Python fallback removed (honest on a Python-free clean VM)
   };
 
   /** Delegates to the shared free-function writer in ../scaffold-writer (D1

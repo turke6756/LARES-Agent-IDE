@@ -3539,6 +3539,42 @@ matching by filename alone — verify it's the right file before acting.
 
 ## Fallback (only if the \`read_comments\` tool is unavailable)
 
+If the MCP tool isn't granted, curl the same HTTP API the tool uses (the dashboard
+API port + bearer token are in your environment as \`AGENT_DASHBOARD_API_PORT\` /
+\`AGENT_DASHBOARD_API_TOKEN\`):
+
+\`\`\`bash
+curl -s -H "Authorization: Bearer $AGENT_DASHBOARD_API_TOKEN" \\
+  "http://127.0.0.1:$AGENT_DASHBOARD_API_PORT/api/comments?file_path=<abs-path>"
+\`\`\`
+
+Prefer the \`read_comments\` tool — it runs inside the dashboard and needs no local
+runtime (no Python) at all.
+`;
+
+// Byte-exact v4 (Python-fallback) read-comments SKILL.md, DERIVED from the live v5
+// body by re-inserting the exact pre-v5 "## Fallback" block. The v4 → v5 bump
+// removed the Python-script fallback (a clean VM has no Python) so the guidance is
+// honest, keeping only the runtime-free curl fallback. Frozen here (not hand-typed)
+// as the previousHashes source for the silent v4 → v5 upgrade in every lane's
+// scaffold map — the .replace() anchor guarantees the pre-v5 bytes reproduce exactly.
+export const PERSONA_READ_COMMENTS_SKILL_V4 = PERSONA_READ_COMMENTS_SKILL.replace(
+  `## Fallback (only if the \`read_comments\` tool is unavailable)
+
+If the MCP tool isn't granted, curl the same HTTP API the tool uses (the dashboard
+API port + bearer token are in your environment as \`AGENT_DASHBOARD_API_PORT\` /
+\`AGENT_DASHBOARD_API_TOKEN\`):
+
+\`\`\`bash
+curl -s -H "Authorization: Bearer $AGENT_DASHBOARD_API_TOKEN" \\
+  "http://127.0.0.1:$AGENT_DASHBOARD_API_PORT/api/comments?file_path=<abs-path>"
+\`\`\`
+
+Prefer the \`read_comments\` tool — it runs inside the dashboard and needs no local
+runtime (no Python) at all.
+`,
+  `## Fallback (only if the \`read_comments\` tool is unavailable)
+
 A pure-stdlib helper script also ships at
 \`<workspace-root>/.lares/scripts/read-comments.py\` and can be run when the MCP tool
 isn't granted AND a real Python is on PATH:
@@ -3559,7 +3595,8 @@ curl -s -H "Authorization: Bearer $AGENT_DASHBOARD_API_TOKEN" \\
 
 Prefer the \`read_comments\` tool — the script fallback needs Python, which clean
 machines may not have.
-`;
+`,
+);
 
 // Byte-exact v3 (Python-script-primary, pre-`read_comments`-MCP-tool) read-comments
 // SKILL.md. Frozen VERBATIM here (NOT derived from the live constant) because the
