@@ -1,5 +1,6 @@
 import Database from 'better-sqlite3';
 import path from 'path';
+import os from 'os';
 import fs from 'fs';
 import crypto from 'crypto';
 import { v4 as uuidv4 } from 'uuid';
@@ -10,6 +11,7 @@ import { DEFAULT_COMMAND, DEFAULT_COMMAND_WSL, SUPERVISOR_AGENT_MD } from '../sh
 import { parseRepoActivityEvidence } from './plans/repo-activity';
 import { OrchestrationEvent, OrchestrationRun } from './orchestration/types';
 import { resolveWorkspaceForCwd, WORKSPACE_LINEAGE_VERSION, type WorkspaceRecordLite } from './skill-analytics/workspace-lineage';
+import { unwrapOsc8, stripTerminalEscapes, canonicalizeToAbsolute } from './file-activity-normalize';
 
 let db: Database.Database;
 let dbPath: string;
@@ -3663,13 +3665,15 @@ function rowToFileActivity(row: any): FileActivity {
 // the multi-provider structured monitor (`context-stats-monitor.ts` → supervisor)
 // — converge on `addFileActivity`. To feed a turn's `touched[]` we need a choke
 // point ABOVE the 5-second live-cache dedupe below (which would otherwise drop a
-// repeat touch that the turn spine must still witness). An injected observer is
-// invoked at the TOP of `addFileActivity`, before that early-return; it owns its
-// OWN independent transactional `(turnId,path,op)` dedupe (see
-// `recordWitnessedActivity`). Injected via a setter (there is no class here to
-// take constructor injection); `clearWitnessObserver()` restores the null default
-// for test isolation and supervisor teardown. Failures are swallowed so the
-// witness join can NEVER break the `file_activities` insert path.
+// repeat touch that the turn spine must still witness). The observer is invoked
+// AFTER the WP1 ingress normalization (unwrap + canonicalize) but BEFORE that
+// dedupe early-return, so it always sees the canonical absolute path and a
+// dropped-as-ambiguous value never reaches it. It owns its OWN independent
+// transactional `(turnId,path,op)` dedupe (see `recordWitnessedActivity`).
+// Injected via a setter (there is no class here to take constructor injection);
+// `clearWitnessObserver()` restores the null default for test isolation and
+// supervisor teardown. Failures are swallowed so the witness join can NEVER break
+// the `file_activities` insert path.
 export type WitnessObserver = (agentId: string, filePath: string, operation: FileOperation) => void;
 let witnessObserver: WitnessObserver | null = null;
 export function setWitnessObserver(fn: WitnessObserver | null): void {
@@ -3679,11 +3683,47 @@ export function clearWitnessObserver(): void {
   witnessObserver = null;
 }
 
-export function addFileActivity(agentId: string, filePath: string, operation: FileOperation): FileActivity | null {
-  // Git-Native WP-G1.7 witness join — fire the choke point BEFORE the live-cache
-  // dedupe early-return, so two same-path writes 1s apart both reach the turn
-  // spine even though only the first inserts a `file_activities` row. Never lets a
-  // witness failure disturb the (unchanged) file_activities role below.
+export function addFileActivity(agentId: string, rawFilePath: string, operation: FileOperation): FileActivity | null {
+  // WP1 (checkpoint-surface-hardening): `addFileActivity` is the authoritative
+  // ingress chokepoint for witnessed paths (defects 1 + 4). Order matters —
+  //   1. agents-row lookup FIRST (session + generation for dedupe/insert, AND the
+  //      working directory used as the cwd for canonicalization),
+  //   2. unwrap the OSC-8 terminal-hyperlink pollution (drop if ambiguous),
+  //   3. canonicalize to an absolute native path (drop if empty),
+  //   4. THEN fire the witness observer with the canonical path,
+  //   5. THEN the live-cache dedupe + INSERT.
+  //
+  // Stamp with the agent's CURRENT session + generation so a continuation's new
+  // session inserts distinct rows instead of colliding with the prior session's.
+  // resume_session_id is the live session id; continuation_generation is the
+  // display label. `working_directory` is stored purely to recompute slugs, but
+  // here it doubles as the cwd for resolving a relative/`~` witnessed path.
+  const stamp = queryOne(
+    'SELECT continuation_generation, resume_session_id, working_directory FROM agents WHERE id = ?',
+    [agentId]
+  );
+  const generation: number = stamp?.continuation_generation ?? 0;
+  const sessionId: string | null = stamp?.resume_session_id ?? null;
+  const cwd: string | undefined = stamp?.working_directory ?? undefined;
+  const home: string | undefined = os.homedir() || undefined;
+
+  // Unwrap OSC-8 hyperlink residue. An ambiguous recovery is authorization-
+  // adjacent evidence, so it is DROPPED (no insert, no witness) — never guessed.
+  const clean = unwrapOsc8(rawFilePath);
+  if ('ambiguous' in clean) return null;
+
+  // Canonicalize to an absolute native path. Empty (control-only / undecodable)
+  // → drop. A relative path with no known cwd stays as its normalized value
+  // rather than being dropped — file_activities is display-only; the witness
+  // join independently scope-rejects via `normalizeWitnessPath`.
+  const filePath = canonicalizeToAbsolute(stripTerminalEscapes(clean.text), { cwd, home });
+  if (filePath === '') return null;
+
+  // Git-Native WP-G1.7 witness join — fire the choke point AFTER normalize but
+  // BEFORE the live-cache dedupe early-return, so two same-path writes 1s apart
+  // both reach the turn spine even though only the first inserts a
+  // `file_activities` row. Never lets a witness failure disturb the (unchanged)
+  // file_activities role below.
   if (witnessObserver) {
     try {
       witnessObserver(agentId, filePath, operation);
@@ -3691,17 +3731,6 @@ export function addFileActivity(agentId: string, filePath: string, operation: Fi
       /* witness join is best-effort — never break file_activities */
     }
   }
-
-  // Stamp with the agent's CURRENT session + generation so a continuation's new
-  // session inserts distinct rows instead of colliding with the prior session's.
-  // resume_session_id is the live session id; continuation_generation is the
-  // display label. Both read at the single insert chokepoint.
-  const stamp = queryOne(
-    'SELECT continuation_generation, resume_session_id FROM agents WHERE id = ?',
-    [agentId]
-  );
-  const generation: number = stamp?.continuation_generation ?? 0;
-  const sessionId: string | null = stamp?.resume_session_id ?? null;
 
   // Dedup: skip if the same (agent, file, operation) landed within the last 5
   // seconds UNDER THE SAME session + generation. Matching the session too means

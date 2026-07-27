@@ -99,7 +99,7 @@ export class FileActivityTracker extends EventEmitter {
   private stripAnsi(text: string): string {
     return text
       .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')   // CSI sequences
-      .replace(/\x1b\][^\x07]*\x07/g, '')        // OSC sequences
+      .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '') // OSC sequences (ST- or BEL-terminated)
       .replace(/\x1b[()][0-9A-Z]/g, '')          // Character set
       .replace(/\x1b\[[\?]?[0-9;]*[hlm]/g, '')  // Mode changes
       .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, ''); // Control chars (keep \n \r \t)
