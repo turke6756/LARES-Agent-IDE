@@ -1,0 +1,117 @@
+[
+  {
+    "name": "unproven-cause-say-so",
+    "description": "Diagnosing a bug where a symptom or a code read contradicts your clean root-cause story — something your theory cannot mechanically produce.",
+    "body": "Treat the contradiction as evidence, not noise. Trace the mechanism in code before asserting a cause; if you cannot construct a concrete code-to-symptom path, say \"I can't explain this yet\" rather than stretching one theory to cover everything. Keep three buckets distinct: proven-from-code, plausible-hypothesis, and can't-yet-explain. When a bug self-healed and won't reproduce, the deliverable is the minimal instrumentation to catch it next time — not a fix against an unproven cause."
+  },
+  {
+    "name": "continuation-build-before-trusting-prompt",
+    "description": "Inheriting a \"previous worker ran out of context mid-edit; expect a non-compiling / half-applied file — finish it\" handoff.",
+    "body": "Reconcile from disk and run the actual build/compile before assuming breakage. The handoff's account of where the prior worker stopped is a hint, not fact — they may have left the slice coherent (or broken somewhere else). A green build tells you the real remaining surface is behavior/tests, not getting it to compile, and stops you from \"rewriting\" work already done. Still read each named file fully for latent logic bugs the compiler can't catch (e.g. resolving a rule from the wrong URL) — but let the toolchain, not the prose, define \"is it broken.\""
+  },
+  {
+    "name": "run-sibling-suite-not-just-named",
+    "description": "Your task names a few specific test files, and your change (or the prior worker's) adds something to a shared surface — a new control in the same pane, a new global, a new event subscription.",
+    "body": "After the named suites pass, run the whole sibling directory too — not just the listed files. A pre-existing test that scans broadly (a pane-wide role=\"radio\" / querySelectorAll, a global spy, a shared store) can silently break when a new element lands next to it. The faithful fix is usually to SCOPE the old test (query within the labelled subtree) rather than loosen the new code. The narrow run looks green and hides the regression."
+  },
+  {
+    "name": "re-derive-inherited-values",
+    "description": "A handoff prompt or predecessor's notes hand you a precomputed value — a hash, version number, line count, or ID — to use in a load-bearing edit.",
+    "body": "Re-derive it yourself before use; never paste it in on trust. Before trusting your OWN derivation, calibrate the pipeline by reproducing a value that is already recorded and known-good (e.g. hash an older fixture and match its shipped constant). If your pipeline reproduces the known value but not the inherited one, the inherited value is wrong — say so and use yours."
+  },
+  {
+    "name": "mirror-unmerged-contract",
+    "description": "You must call names (API methods, payload fields) that a parallel worker owns in files you're forbidden to touch, and those names don't exist yet at your build time.",
+    "body": "Don't block or hand-wave. Mirror the contract in a file you own and reach it through a null-tolerant accessor that structurally probes the runtime surface (cast via unknown), returning null until the other side merges — the caller renders an inert/degraded control instead of crashing. Read absent payload fields through a tolerant cast ((x as { f?: T }).f ?? default) so the same source compiles both before and after the field lands. Your build stays green regardless of merge order and wires up automatically once the counterpart merges. State in the handoff whether you compiled against the real counterpart or the mirror."
+  },
+  {
+    "name": "land-determined-seams-hand-off-coupled",
+    "description": "A handoff hands you a large end-to-end wiring task that plainly exceeds one context, part of which is self-contained fully-specified leaf pieces while the rest is a tightly-coupled assembly depending on live/impure state.",
+    "body": "Land the fully-determined leaf pieces first and prove them — for DB helpers, unit-test the SQL against the REAL schema (a build/tsc pass can't catch a wrong column name; a sql.js + initDatabase stand-in can). Then STOP and hand off the coupled remainder with the exact contract, rather than starting the big module and leaving it half-compiling for the next worker to untangle. A green, tested slice the remainder will directly consume beats a larger incoherent one. Verify the load-bearing acceptance mechanic BEFORE coding against it, and if it turns on a subtle precondition (e.g. \"the candidate must still be resident on disk, not already trimmed\"), confirm it holds in the real source and state it plainly in the handoff."
+  },
+  {
+    "name": "acceptance-divergence-assert-truth",
+    "description": "You're writing an env-gated acceptance test against live data and the prompt's expected result — a specific proposal, a named rediscovery — does not surface when you run it.",
+    "body": "Before touching the assertion, instrument the pipeline end-to-end to find the EXACT reason (a sibling workstream already applied the fix; a guard/gate downgraded it; the data is cross-workspace; the input compiled to unmatchable). Then assert what is actually true-and-correct over the current code+corpus, and surface the divergence loudly (console + summary) with the query/paths that prove it. That is not \"weakening to pass\" — weakening lowers a threshold to hide a real defect; this corrects a stale expectation with evidence. Prefer shape assertions (>0, exec>=skill, ==0) over magic counts so the test survives corpus drift."
+  },
+  {
+    "name": "windows-git-commit-dash-f",
+    "description": "You're on Windows reaching for a multi-line `git commit -m` in the Bash tool, tempted to wrap the message in a PowerShell @'...'@ here-string.",
+    "body": "The Bash tool is Git Bash (POSIX sh), not PowerShell — @'...'@ is not bash syntax. Bash parses -m @'...'@ as @ + a single-quoted string + a trailing @, silently injecting a literal @ as the subject's first char and another at the body's end. Instead write the message to a file and `git commit -F <file>` (or a real bash heredoc). If it already landed, `git commit --amend -F <file>` fixes it cleanly (safe pre-push). Verify the subject with `git log -1 --format=%s` before moving on."
+  },
+  {
+    "name": "search-capability-not-named-file",
+    "description": "A continuation prompt tells you to add missing coverage/behavior and names the file to extend (\"the predecessor had not yet written X — extend foo.test\").",
+    "body": "Before writing, search for the CAPABILITY across the tree, not just the named file — the predecessor may have landed it under a sibling/adjacent filename (foo.pdf.test next to foo.test). Run it and read it. Following the instruction literally would duplicate a complete, green trunk and create two divergent suites over one surface. If it already exists, say so and redirect the leg to the coverage that is actually absent. This is the absence-side mirror of building before trusting a breakage claim: the handoff's account of what is missing is as much a hint as its account of what is broken."
+  },
+  {
+    "name": "absence-fixture-from-real-artifact",
+    "description": "You're writing or extending a test that asserts an ABSENCE — \"no X ever reaches the output\": redaction, sanitization, escaping, leak guards.",
+    "body": "Enumerate the real vectors out of a real output artifact (grep it, group hits by field path) and seed EVERY distinct shape into the fixture. A fixture built from what you imagined the data looks like passes forever while the real vector walks straight through — an absence-assertion over a fixture that never contained the thing is green by construction. Then mutate the fix and watch the assertion fail. Also check that a NEW filter/drop you add doesn't quietly retire an OLD vector from the fixture (an id that now gets dropped is no longer proving it gets redacted); if it does, re-seed that vector somewhere the new filter cannot reach."
+  },
+  {
+    "name": "single-call-site-is-a-sample",
+    "description": "Your task says \"fix the packaged path at <file>:<line>\" (or any single-site resolution/env/config fix) and gives you exact code to paste there.",
+    "body": "Apply it, then grep the whole tree for the THING being resolved before declaring done — a second consumer resolving the same asset by its own relative walk is the normal case, not the exception, and it fails identically. Then run the real built artifact and read its startup log: an end-to-end smoke that exercises the shipped layout finds sites a source read and a green compile both miss. Prefer collapsing the duplicated resolution into one shared helper so the next such fix has exactly one site. Report the extra site as a spec-vs-reality mismatch rather than silently widening scope."
+  },
+  {
+    "name": "find-the-subprocess-shape-you-can-run",
+    "description": "Your brief says the only sufficient verification is off-limits because running it would terminate your own host (restart the app, launch the packaged build, take a single-instance lock).",
+    "body": "Write the human script, then look for the NARROWEST executable slice of the same evidence that runs as a short-lived side process. A helper the app spawns is not the app: driving the shipped binary in a non-GUI mode (a -e probe, its own JSON/stdio protocol, one module resolution) exercises the real artifact without touching the running instance. Dry-run your own verification script too — it will find its own bugs (a stderr redirect that throws, non-ASCII that mangles) and may pass real checks outright. Report exactly which legs you proved and which still need the human; that beats \"unit tests pass, please try it.\""
+  },
+  {
+    "name": "foreign-edit-is-a-fact-not-a-bug",
+    "description": "Mid-task, a shared file you also edited starts failing to compile with errors naming symbols you never touched.",
+    "body": "Confirm ownership before reacting: grep the symbol (often it's exported from a sibling and just not imported yet — a half-landed refactor), and re-run your own typecheck filtered to your files. Then leave it alone. \"Helpfully\" adding the missing import races their next write and can silently revert their design. Verify your slice by other means — your own modules' tests, a leaf-module compile — and state plainly in the summary that the shared file was red on arrival and why. Your green is still provable; their file is not yours to land."
+  },
+  {
+    "name": "windows-partial-staging-blob",
+    "description": "You must commit only your own change to a shared file that also carries other workstreams' uncommitted hunks, and there is no interactive `git add -p`.",
+    "body": "Don't stage the whole file and don't try `git apply --cached` with a filtered patch — on a CRLF worktree with autocrlf the patch text is LF and the apply fails \"corrupt patch\"/\"does not apply\" for reasons unrelated to your filtering. Instead reconstruct the intended blob in a scratch file: take `git show HEAD:<file>`, replay ONLY your hunks onto it as literal old-to-new string replacements (assert each old block matches exactly once), then `git hash-object -w` it and `git update-index --cacheinfo 100644,<sha>,<path>`. Verify with `git diff --cached -- <file>` before committing. Select hunks by CONTENT (a marker string your change always contains), not by @@ line numbers — offsets shift after every commit and a neighbour's hunk in the same region is easy to swallow. And read git's output as UTF-8 bytes: a naive text-mode read on Windows decodes with the system codepage and mangles every em-dash."
+  },
+  {
+    "name": "green-runner-is-not-green-tsc",
+    "description": "You add a source file and its tests, the suite passes, and you're about to commit on that evidence alone.",
+    "body": "Run the project's typechecker too, filtered to your own files (tsc --noEmit, then grep your paths). A test runner and a build tool routinely carry path aliases, JSX settings, and paths mappings the typechecker's config does NOT, so an import that resolves perfectly at test time can be a hard type error in the real build. The failure is invisible in the runner's output and surfaces as someone else's broken build later. Two toolchains, two configs, two greens — get both before committing."
+  },
+  {
+    "name": "assert-private-container-not-getter",
+    "description": "A spec asks you to prove a rejected operation left NO state behind, and the class exposes a convenient getFooState(id) accessor.",
+    "body": "Check whether that accessor lazily CREATES the entry (a get-or-insert getState). If it does, calling it in the test manufactures the very state you were about to prove absent, and the assertion passes no matter what the code does. Assert the private container directly ((obj as unknown as { m: Map<string, unknown> }).m.has(id) === false) BEFORE any accessor call, then use the public getter only for value assertions. Same shape as any observer-with-side-effects: read the raw store first."
+  },
+  {
+    "name": "background-run-notification-is-truth",
+    "description": "You backgrounded a long command whose output runs through a pipe (… | tail -N), the interim output file is empty, and a process listing doesn't find it, so you conclude it died.",
+    "body": "Don't relaunch. A pipe like tail buffers everything until exit (empty file = still running, not dead), and a Windows CommandLine -match process check can miss the real child (wrapper shells, different image name). The harness sends a completion notification for every tracked background task — absence of that notification means IT IS STILL RUNNING. If you must re-run, TaskStop the original first; otherwise you pay for two suites and risk interleaved writes. Avoid the trap at launch: redirect to a file (> log 2>&1) instead of piping through tail, so interim reads show real progress."
+  },
+  {
+    "name": "architect-for-committability",
+    "description": "Your WP touches many files, several of which carry other workstreams' uncommitted edits (or are wholly untracked foreign work), and your policy is \"commit only what is cleanly yours.\"",
+    "body": "Decide file placement BEFORE coding, not at staging time. Run `git status --porcelain` over every planned target first and split the design: put the new capability's logic + its tests in NEW modules and in files that are CLEAN at HEAD (they commit as wholly-yours diffs), and keep edits to entangled/untracked-foreign files down to thin threading (an import, a field, a call) that stays worktree-only and is LISTED in the summary. This turns \"almost nothing is committable\" into \"the substance is committed, the glue is declared\" — and the numstat check (small adds, no whole-file churn) becomes your staging proof."
+  },
+  {
+    "name": "fixture-where-guard-is-sole-mechanism",
+    "description": "You're testing a rule that overrides or supplements another rule (a tie-breaker, disagreement override, fallback), and your fixture happens to satisfy the base rule too.",
+    "body": "Before mutating, ask: \"if I deleted the guard, would another code path still produce this expected value on this fixture?\" If yes, redesign the fixture so the guard ALONE determines the outcome — otherwise the test stays green under the mutation and proves nothing about the guard. State in a comment WHY the fixture was chosen (\"base rule says X; only the override yields Y\")."
+  },
+  {
+    "name": "grep-emitted-strings-not-helper-name",
+    "description": "You're gating, removing, or renaming diagnostic/log output (a debug flag, a console.warn helper, a metric line) and you grep tests for the helper symbol to check nothing depends on it.",
+    "body": "Also grep for the PAYLOAD strings the instrumentation emits (tag names, message fragments). A test can assert on a spied console.warn's arguments without ever importing or naming the helper — a symbol-only grep reports \"no coverage\" while a content grep finds the assertion. If a test relied on an implicit auto-arm (dev-mode flag, env var), fix it by arming the gate explicitly in that test, not by weakening the assertion."
+  },
+  {
+    "name": "trace-when-state-is-created-vs-gate",
+    "description": "Your brief hands you a verified diagnosis plus a fix keyed to a state flag (\"when an edit session exists, bypass the check\"), and separately demands an invariant the same check must still protect.",
+    "body": "Before coding, trace the order of operations: if the state is created BEFORE the gate runs on the very path the gate must protect (e.g. the entry click creates the session, then the check fires), the literal fix silently disables the protection the brief says to keep. Refine the condition to the signal that actually distinguishes the two cases (here: a live/dirty draft, not mere session existence), satisfy BOTH stated requirements, and report the refinement as a spec correction — don't silently pick one requirement over the other."
+  },
+  {
+    "name": "rebuild-forbidden-esbuild-to-scratch",
+    "description": "The task requires running compiled-output tests but constraints forbid builds because the dev app is running from dist/ (or holds native bindings).",
+    "body": "Don't run the project build and don't skip the tests. Bundle the test entry standalone with an in-repo transpiler (esbuild src/x.test.ts --bundle --platform=node --external:electron --outfile=<scratchpad>/x.test.cjs) and run it with node from the scratchpad — the app's dist/ is never touched. Pair it with tsc -p <tsconfig> --noEmit for type safety, since the bundler doesn't typecheck."
+  },
+  {
+    "name": "inject-fake-for-subprocess-oracle",
+    "description": "You're testing a decision that in one branch shells out to a live oracle (a git rev-parse to tell a branch from a filename, a stat to tell a dir from a file, a DNS/HTTP probe), and you have a plain table row exercising that branch against the real subprocess.",
+    "body": "Route the oracle through an injectable seam and write the ambiguous-branch tests with a FAKE that resolves/rejects deterministically — plus a spy test asserting the unconditional branches never call the oracle at all. A table row backed by the real subprocess can pass even when the guard's own logic is mutated away, because the subprocess independently produces the same verdict. Mutation-test it: negate the guard's special-case and confirm the INJECTED test — not the real-subprocess row — is the one that fails."
+  }
+]

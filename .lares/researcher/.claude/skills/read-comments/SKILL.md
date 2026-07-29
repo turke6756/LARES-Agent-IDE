@@ -56,23 +56,14 @@ matching by filename alone — verify it's the right file before acting.
 
 ## Fallback (only if the `read_comments` tool is unavailable)
 
-A pure-stdlib helper script also ships at
-`<workspace-root>/.lares/scripts/read-comments.py` and can be run when the MCP tool
-isn't granted AND a real Python is on PATH:
-
-```bash
-python "<workspace-root>/.lares/scripts/read-comments.py" "<absolute-path-to-the.md>"
-```
-
-It supports `--all` (include resolved/orphaned), `--has "<path>"` (exit 0/1, no
-output), and `--json`. Equivalently, curl the same HTTP API the tool uses (the
-dashboard API port + bearer token are in your environment as
-`AGENT_DASHBOARD_API_PORT` / `AGENT_DASHBOARD_API_TOKEN`):
+If the MCP tool isn't granted, curl the same HTTP API the tool uses (the dashboard
+API port + bearer token are in your environment as `AGENT_DASHBOARD_API_PORT` /
+`AGENT_DASHBOARD_API_TOKEN`):
 
 ```bash
 curl -s -H "Authorization: Bearer $AGENT_DASHBOARD_API_TOKEN" \
   "http://127.0.0.1:$AGENT_DASHBOARD_API_PORT/api/comments?file_path=<abs-path>"
 ```
 
-Prefer the `read_comments` tool — the script fallback needs Python, which clean
-machines may not have.
+Prefer the `read_comments` tool — it runs inside the dashboard and needs no local
+runtime (no Python) at all.
