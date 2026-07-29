@@ -1133,6 +1133,7 @@ export function initDatabase(): void {
   }
 
   initContextOptimizerSchema();
+  initMemoryV2Schema();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1550,6 +1551,124 @@ function initContextOptimizerSchema(): void {
   } catch (err) {
     console.warn('[database] WP2 witness-path sanitize migration failed:', err);
   }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Memory & Lessons v2 — durable state (WP-B). Self-contained, ADDITIVE region:
+// every statement is CREATE TABLE/INDEX IF NOT EXISTS, so it is idempotent, never
+// hand-drops a table on the shared DB, and never reorders any pre-existing region.
+// The store/reconciliation layer lives in src/main/memory-index/review-store.ts
+// (reached via getDb()); this function only guarantees the tables exist. Spec of
+// record: plans/memory-lessons-v2-implementation.md §WP-B.
+// ─────────────────────────────────────────────────────────────────────────────
+function initMemoryV2Schema(): void {
+  // Last-known-good SOURCE (not projected bytes) + durable runtime-error state.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS memory_index_state (
+      workspace_id          TEXT PRIMARY KEY,
+      source_text           TEXT,
+      source_hash           TEXT,
+      parsed_json           TEXT,
+      validated_at          TEXT,
+      last_runtime_error    TEXT,
+      last_runtime_error_at TEXT
+    );
+  `);
+
+  // Pending-review queue. finding_id = sha256(workspace_id | kind |
+  // COALESCE(entry_id,'') | source_hash), computed in JS by the store. status ∈
+  // {pending, cleared, resolved}. Hard-invalid findings carry entry_id = NULL + a
+  // whole-index source_hash. Rows are NEVER deleted (clear-not-delete).
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS memory_review_queue (
+      finding_id      TEXT PRIMARY KEY,
+      workspace_id    TEXT NOT NULL,
+      kind            TEXT NOT NULL,
+      entry_id        TEXT,
+      source_hash     TEXT,
+      reason          TEXT,
+      exit_condition  TEXT,
+      status          TEXT NOT NULL DEFAULT 'pending',
+      first_seen      TEXT NOT NULL,
+      last_seen       TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_mrq_ws_status ON memory_review_queue(workspace_id, status);
+  `);
+
+  // Recall-only usage tally. Documented semantics: an approximate tally of
+  // SUCCESSFUL recall API requests; one atomic increment per successful request;
+  // NO idempotency key and therefore no retry deduplication; consumed only as a
+  // `>0 vs 0` signal (never a precise count).
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS memory_usage_counts (
+      workspace_id  TEXT NOT NULL,
+      entry_id      TEXT NOT NULL,
+      count         INTEGER NOT NULL DEFAULT 0,
+      last_recalled TEXT,
+      PRIMARY KEY (workspace_id, entry_id)
+    );
+  `);
+
+  // Canonical lesson registry — single enumeration source (enables cross-provider
+  // drift repair). status ∈ {pending, active, conflict}. copies_json = intended
+  // target paths; preexisted_json = which targets pre-existed at publish time.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS memory_lessons (
+      workspace_id    TEXT NOT NULL,
+      lesson_id       TEXT NOT NULL,
+      name            TEXT NOT NULL,
+      canonical_hash  TEXT,
+      copies_json     TEXT,
+      preexisted_json TEXT,
+      batch_id        TEXT,
+      status          TEXT NOT NULL DEFAULT 'pending',
+      created_at      TEXT NOT NULL,
+      PRIMARY KEY (workspace_id, lesson_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_mlessons_ws_name ON memory_lessons(workspace_id, name);
+    CREATE INDEX IF NOT EXISTS idx_mlessons_batch   ON memory_lessons(batch_id);
+  `);
+
+  // Batch-level durable crash state for publish_lessons_batch. status ∈
+  // {pending, active, conflict}.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS memory_lesson_batches (
+      batch_id      TEXT PRIMARY KEY,
+      workspace_id  TEXT NOT NULL,
+      snapshot_id   TEXT,
+      status        TEXT NOT NULL DEFAULT 'pending',
+      created_at    TEXT NOT NULL
+    );
+  `);
+
+  // Graduation proposals. status ∈ {pending, approved, applied, rejected,
+  // needs-reapproval}. target_hash_at_proposal captures the target's hash (or an
+  // explicit ABSENT sentinel) at proposal time for later CAS.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS graduation_proposals (
+      proposal_id             TEXT PRIMARY KEY,
+      workspace_id            TEXT NOT NULL,
+      target                  TEXT NOT NULL,
+      target_hash_at_proposal TEXT,
+      text                    TEXT,
+      rationale               TEXT,
+      source_agent            TEXT,
+      status                  TEXT NOT NULL DEFAULT 'pending'
+    );
+    CREATE INDEX IF NOT EXISTS idx_grad_ws_status ON graduation_proposals(workspace_id, status);
+  `);
+
+  // Signed migration approvals (keyed per snapshot).
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS migration_approvals (
+      workspace_id  TEXT NOT NULL,
+      snapshot_id   TEXT NOT NULL,
+      table_hash    TEXT,
+      approved_by   TEXT,
+      approved_at   TEXT,
+      PRIMARY KEY (workspace_id, snapshot_id)
+    );
+  `);
 }
 
 function slugify(text: string): string {

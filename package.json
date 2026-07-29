@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "npm run build:main && concurrently -k -n vite,electron \"npm run dev:renderer\" \"node -e \\\"setTimeout(()=>process.exit(),3000)\\\" && npm run start\"",
     "dev:renderer": "vite --port 5173",
-    "build:main": "tsc -p tsconfig.main.json && node scripts/copy-static-main.mjs",
+    "build:main": "node scripts/generate-memory-index-cli.mjs && tsc -p tsconfig.main.json && node scripts/copy-static-main.mjs",
     "build:renderer": "vite build",
     "build": "npm run build:main && npm run build:renderer",
     "start": "electron .",
@@ -219,6 +219,7 @@
     "concurrently": "^9.2.1",
     "electron": "^41.0.0",
     "electron-builder": "^26.8.1",
+    "esbuild": "0.27.3",
     "framer-motion": "^12.35.2",
     "jsdom": "29.1.1",
     "postcss": "^8.5.8",
