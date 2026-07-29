@@ -61,6 +61,13 @@ const TOOLSET_SCRIPT_MAP: Record<string, { script: string; fn: string }> = {
   // WP-G2.3 (Git-Native): supervisor-lane-only checkpoint recovery toolset —
   // mirrors ipc-deps.ts TOOLSET_SCRIPT_MAP so the granted-verb surface resolves.
   checkpoints: { script: 'mcp-tools-checkpoints.js', fn: 'getCheckpointsToolDefinitions' },
+  // Memory & Lessons v2 (WP-D): both-lane `memory` recall toolset — mirrors
+  // ipc-deps.ts TOOLSET_SCRIPT_MAP so the granted-verb surface resolves recall_memory.
+  memory: { script: 'mcp-tools-memory.js', fn: 'getMemoryToolDefinitions' },
+  // Memory & Lessons v2 (WP-F2): supervisor-lane-only `migration` toolset —
+  // mirrors ipc-deps.ts TOOLSET_SCRIPT_MAP so the granted-verb surface resolves
+  // publish_lessons_batch / replace_memory_bundle / restore_memory_bundle.
+  migration: { script: 'mcp-tools-migration.js', fn: 'getMigrationToolDefinitions' },
 };
 
 /** Repo-root `scripts/` — this file compiles to dist/main/main/supervisor/. */

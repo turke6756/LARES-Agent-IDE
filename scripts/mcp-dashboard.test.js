@@ -16,6 +16,7 @@ const toolsetModulePaths = [
   './mcp-tools-notebooks',
   './mcp-browser-tools',
   './mcp-tools-plans',
+  './mcp-tools-memory',
 ];
 
 function clearProxyModules() {
@@ -252,6 +253,70 @@ test('plans (supervisor) toolset still exposes create_plan + the read ladder + f
     'read_plan_section',
     'unfocus_plan',
   ]);
+});
+
+// ── memory toolset (WP-D): recall_memory ──
+
+test('memory toolset exposes recall_memory + publish_lesson + propose_graduation', async () => {
+  // WP-D created the toolset with recall_memory; WP-F1 added the publish_lesson
+  // write path; WP-F2 added propose_graduation (the graduation PROPOSAL path) to
+  // the same both-lane toolset.
+  const proxy = loadProxy('memory');
+  const names = namesOf(proxy.getToolDefinitions());
+  assert.deepStrictEqual(names.sort(), ['propose_graduation', 'publish_lesson', 'recall_memory']);
+});
+
+test('propose_graduation POSTs { target, text, rationale } to /api/memory/propose-graduation', async () => {
+  const proxy = loadProxy('memory');
+  const body = { ok: true, proposalId: 'grad-abc', status: 'pending' };
+  const api = capturingApi(body);
+  const result = await proxy.handleToolCall('propose_graduation', { target: 'CLAUDE.md', text: 'always true', rationale: 'why' }, api);
+  assert.strictEqual(api.calls.length, 1);
+  assert.strictEqual(api.calls[0].method, 'POST');
+  assert.strictEqual(api.calls[0].route, '/api/memory/propose-graduation');
+  assert.deepStrictEqual(api.calls[0].body, { target: 'CLAUDE.md', text: 'always true', rationale: 'why' });
+  assert.deepStrictEqual(JSON.parse(result.content[0].text), body);
+});
+
+test('migration toolset exposes the three guarded ops (WP-F2)', async () => {
+  const proxy = loadProxy('migration');
+  const names = namesOf(proxy.getToolDefinitions());
+  assert.deepStrictEqual(names.sort(), ['publish_lessons_batch', 'replace_memory_bundle', 'restore_memory_bundle']);
+});
+
+test('migration ops POST to their /api/migration/* routes', async () => {
+  const proxy = loadProxy('migration');
+  const api = capturingApi({ ok: true });
+  await proxy.handleToolCall('publish_lessons_batch', { batch_id: 'b1', lessons: [] }, api);
+  await proxy.handleToolCall('replace_memory_bundle', { snapshot_id: 's1', index_source: 'i', detail_files: [], expected_prior_hash: 'h', archive: { index_text: 'i', details: {} } }, api);
+  await proxy.handleToolCall('restore_memory_bundle', { snapshot_id: 's1', expected_live_hash: 'h', archive: { index_text: 'i', details: {} } }, api);
+  assert.deepStrictEqual(api.calls.map((c) => c.route), [
+    '/api/migration/publish-lessons-batch',
+    '/api/migration/replace-bundle',
+    '/api/migration/restore-bundle',
+  ]);
+  assert.ok(api.calls.every((c) => c.method === 'POST'));
+});
+
+test('recall_memory POSTs { id } to /api/memory/recall and returns the structured body verbatim', async () => {
+  const proxy = loadProxy('memory');
+  const body = { ok: true, id: 'mb-2026-07-28-x', status: 'done', archived: false, body: 'DETAIL', truncated: false, bytes: 6 };
+  const api = capturingApi(body);
+  const result = await proxy.handleToolCall('recall_memory', { id: 'mb-2026-07-28-x' }, api);
+  assert.strictEqual(api.calls.length, 1);
+  assert.strictEqual(api.calls[0].method, 'POST');
+  assert.strictEqual(api.calls[0].route, '/api/memory/recall');
+  assert.deepStrictEqual(api.calls[0].body, { id: 'mb-2026-07-28-x' });
+  assert.deepStrictEqual(JSON.parse(result.content[0].text), body);
+});
+
+test('a structured ok:false recall error rides back as a normal body (not an isError throw)', async () => {
+  const proxy = loadProxy('memory');
+  const body = { ok: false, code: 'not_found' };
+  const api = capturingApi(body);
+  const result = await proxy.handleToolCall('recall_memory', { id: 'mb-2026-07-28-missing' }, api);
+  assert.ok(!result.isError, 'a structured recall error is data, not a tool error');
+  assert.deepStrictEqual(JSON.parse(result.content[0].text), body);
 });
 
 // ── get_usage_limits: returns the /api/usage-limits result verbatim ──

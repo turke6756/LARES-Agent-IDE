@@ -207,6 +207,27 @@ const TOOLSET_REGISTRY = {
       handleToolCall: mod.handleCheckpointsToolCall,
     };
   },
+  // Memory & Lessons v2 (WP-D): the `memory` toolset — on-demand recall of a
+  // closed memory capsule's detail body. Granted to BOTH lanes
+  // (mcp-config-builder.toolsetsForLane); every recall becomes telemetry.
+  memory: () => {
+    const mod = require('./mcp-tools-memory');
+    return {
+      getToolDefinitions: mod.getMemoryToolDefinitions,
+      handleToolCall: mod.handleMemoryToolCall,
+    };
+  },
+  // Memory & Lessons v2 (WP-F2): the SUPERVISOR-ONLY `migration` toolset — the
+  // guarded batch/bundle memory-migration operations WP-I2 drives. Granted only
+  // to the supervisor lane (mcp-config-builder.toolsetsForLane), NOT the both-lane
+  // `memory` toolset.
+  migration: () => {
+    const mod = require('./mcp-tools-migration');
+    return {
+      getToolDefinitions: mod.getMigrationToolDefinitions,
+      handleToolCall: mod.handleMigrationToolCall,
+    };
+  },
 };
 
 let grantedModules;

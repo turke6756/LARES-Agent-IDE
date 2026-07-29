@@ -55,6 +55,16 @@ export const DASHBOARD_TOOLSETS: readonly string[] = [
   // are unique, so a logged `mcp__agent-dashboard__<verb>` resolves to
   // `checkpoints` instead of a null toolset; supervisor-exclusive → lane-inferable.
   'checkpoints',
+  // Memory & Lessons v2 (WP-D): the both-lane `memory` recall toolset. Its verb
+  // (recall_memory) is unique, so a logged `mcp__agent-dashboard__recall_memory`
+  // resolves to `memory` instead of a null toolset. Shared across both lanes, so
+  // no lane can be inferred from it.
+  'memory',
+  // Memory & Lessons v2 (WP-F2): supervisor-lane-only `migration` toolset. Its
+  // verbs (publish_lessons_batch / replace_memory_bundle / restore_memory_bundle)
+  // are unique, so a logged `mcp__agent-dashboard__<verb>` resolves to `migration`
+  // instead of a null toolset; supervisor-exclusive → lane-inferable.
+  'migration',
 ];
 
 export interface McpToolsetResolver {

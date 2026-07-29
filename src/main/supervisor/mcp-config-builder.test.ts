@@ -51,7 +51,9 @@ test('toolsetsForLane: supervisor gets orchestration/comms/observability-core/pl
   // replaced by the on-demand snapshot exporter + the `context-analytics` skill),
   // so it is gone from this grant.
   // WP-G2.3 appended `checkpoints` (supervisor-lane-only recovery toolset).
-  assert.equal(toolsetsForLane('supervisor'), 'orchestration,comms,observability-core,plans,browser-present,checkpoints');
+  // WP-D (Memory & Lessons v2) appended `memory` (recall_memory; both lanes).
+  // WP-F2 (Memory & Lessons v2) appended `migration` (supervisor-lane-only).
+  assert.equal(toolsetsForLane('supervisor'), 'orchestration,comms,observability-core,plans,browser-present,checkpoints,memory,migration');
 });
 
 test('toolsetsForLane: the full `plans` grant is supervisor-ONLY (not worker/researcher/legacy)', () => {
@@ -82,7 +84,8 @@ test('toolsetsForLane: worker gets comms,observability-core,browser-present + pl
   // QW1 (context-optimizer §3): `notebooks` dropped from the worker grant.
   // GT-A WP-A4: `plans-read` appended.
   // WP-F (P5): `observability` → `observability-core`; the analytics half is dropped.
-  assert.equal(toolsetsForLane('worker'), 'comms,observability-core,browser-present,plans-read');
+  // WP-D (Memory & Lessons v2): `memory` appended (recall_memory; both lanes).
+  assert.equal(toolsetsForLane('worker'), 'comms,observability-core,browser-present,plans-read,memory');
 });
 
 test('observability-core is supervisor+worker; the retired observability-analytics is granted to NO lane', () => {
@@ -100,6 +103,17 @@ test('observability-core is supervisor+worker; the retired observability-analyti
     // The bare (pre-split) `observability` union grant is granted to no lane either.
     assert.ok(!toolsetsForLane(lane).split(',').includes('observability'),
       `${lane} must not grant the bare pre-split observability union`);
+  }
+});
+
+test('toolsetsForLane: the `memory` toolset (recall_memory) is granted to BOTH the supervisor and worker lanes (WP-D)', () => {
+  // Memory & Lessons v2 WP-D: both lanes recall closed-capsule detail on demand.
+  for (const lane of ['supervisor', 'worker'] as const) {
+    assert.ok(toolsetsForLane(lane).split(',').includes('memory'), `${lane} must include the memory toolset`);
+  }
+  // Not leaked to the researcher / legacy lanes (they get no memory recall).
+  for (const lane of ['researcher', 'legacy'] as const) {
+    assert.ok(!toolsetsForLane(lane).split(',').includes('memory'), `${lane} must NOT include the memory toolset`);
   }
 });
 
@@ -136,6 +150,23 @@ test('toolsetsForLane: `checkpoints` is granted to the supervisor lane ONLY (nev
   for (const lane of ['worker', 'researcher', 'legacy'] as const) {
     assert.ok(!toolsetsForLane(lane).split(',').includes('checkpoints'),
       `${lane} must NOT be granted the checkpoints toolset (shape §8.3: never workers)`);
+  }
+});
+
+// ── WP-F2: the `migration` toolset is supervisor-lane ONLY ──────────────────
+// Memory & Lessons v2 WP-F2: the guarded batch/bundle memory-migration
+// operations (publish_lessons_batch / replace_memory_bundle /
+// restore_memory_bundle) are supervisor-tier + human sign-off (a recorded
+// migration approval gates every bundle op). They must NEVER reach the worker
+// lane — that is the acceptance criterion "the migration toolset is absent from
+// the worker grant."
+
+test('toolsetsForLane: the `migration` toolset is granted to the supervisor lane ONLY (never worker/researcher/legacy) (WP-F2)', () => {
+  assert.ok(toolsetsForLane('supervisor').split(',').includes('migration'),
+    'supervisor must be granted the migration toolset');
+  for (const lane of ['worker', 'researcher', 'legacy'] as const) {
+    assert.ok(!toolsetsForLane(lane).split(',').includes('migration'),
+      `${lane} must NOT be granted the migration toolset (WP-F2: supervisor-only)`);
   }
 });
 

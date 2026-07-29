@@ -57,6 +57,8 @@ import crypto from 'crypto';
 import os from 'os';
 // ── WP7 agent-facing read-only optimizer surface (additive; GET-only). ──
 import { getDb, getWorkspace as getWorkspaceRecord } from './database';
+// Memory & Lessons v2 (WP-D): the recall_memory detail fetch + recall telemetry.
+import { recallMemoryDetailWithTelemetry } from './memory-index/recall';
 import type { PipelineDb } from './context-optimizer/optimizer-pipeline';
 import { runLiveOptimizerAnalyze } from './context-optimizer/optimizer-live-analyze';
 import {
@@ -1265,6 +1267,37 @@ export class ApiServer {
     // and `account_wide: true`). Consumed verbatim by the MCP get_usage_limits tool.
     if (method === 'GET' && path === '/api/usage-limits') {
       return this.supervisor.getUsageLimits();
+    }
+
+    // POST /api/memory/recall { id } — Memory & Lessons v2 (WP-D) on-demand
+    // recall of a CLOSED memory capsule's detail body. Workspace identity is
+    // derived SOLELY from the authenticated X-Workspace-Id header (resolveIdentity
+    // already 403'd an unknown workspace / cross-workspace assertion); a request
+    // without an asserted workspace has no scope to read and is refused. The id is
+    // validated against MEMORY_ID_GRAMMAR and the capsule's DECLARED detail pointer
+    // is realpath-bounded beneath the memory details dir INSIDE the recall module,
+    // which returns structured { ok:false, code } errors (rendered as a 200 body,
+    // never a throw) and increments the per-workspace recall count ONLY on ok:true.
+    if (method === 'POST' && path === '/api/memory/recall') {
+      if (!identity.asserted || !identity.workspaceId) {
+        throw Object.assign(
+          new Error('workspace identity required (send X-Workspace-Id header)'),
+          { statusCode: 400 },
+        );
+      }
+      const workspace = getWorkspaceRecord(identity.workspaceId);
+      if (!workspace) {
+        // Defensive: resolveIdentity already rejected an unknown asserted workspace.
+        throw Object.assign(new Error('workspace not found'), { statusCode: 404 });
+      }
+      const body = await readBody(req);
+      const input = body ? JSON.parse(body) : {};
+      return recallMemoryDetailWithTelemetry(
+        identity.workspaceId,
+        workspace.path,
+        input.id,
+        new Date().toISOString(),
+      );
     }
 
     // ══ WP7 agent-facing read-only optimizer surface (classifier addendum §5). ══

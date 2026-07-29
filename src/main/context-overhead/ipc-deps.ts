@@ -181,6 +181,15 @@ const TOOLSET_SCRIPT_MAP: Record<string, { script: string; fn: string }> = {
   // Mapped here so context-overhead sizing + the MCP tool→toolset reverse map
   // resolve its verbs instead of silently dropping the supervisor's new grant.
   checkpoints: { script: 'mcp-tools-checkpoints.js', fn: 'getCheckpointsToolDefinitions' },
+  // Memory & Lessons v2 (WP-D): the both-lane `memory` recall toolset. Mapped
+  // here so context-overhead sizing + the MCP tool→toolset reverse map resolve
+  // recall_memory instead of silently dropping the new grant.
+  memory: { script: 'mcp-tools-memory.js', fn: 'getMemoryToolDefinitions' },
+  // Memory & Lessons v2 (WP-F2): the supervisor-lane-only `migration` toolset.
+  // Mapped here so context-overhead sizing + the MCP tool→toolset reverse map
+  // resolve its verbs (publish_lessons_batch / replace_memory_bundle /
+  // restore_memory_bundle) instead of silently dropping the supervisor's grant.
+  migration: { script: 'mcp-tools-migration.js', fn: 'getMigrationToolDefinitions' },
 };
 
 export function makeToolsetDefsProvider(): ToolsetDefsProvider {

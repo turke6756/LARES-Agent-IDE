@@ -146,7 +146,9 @@ test('roleLaneOf: privilegeLane grants the supervisor lane without isSupervisor 
   assert.equal(
     toolsetsForLane(roleLaneOf({ privilegeLane: 'supervisor' })),
     // WP-G2.3 appended the supervisor-lane-only `checkpoints` recovery toolset.
-    'orchestration,comms,observability-core,plans,browser-present,checkpoints',
+    // WP-D (Memory & Lessons v2) appended the both-lane `memory` recall toolset.
+    // WP-F2 (Memory & Lessons v2) appended the supervisor-lane-only `migration` toolset.
+    'orchestration,comms,observability-core,plans,browser-present,checkpoints,memory,migration',
     'elevated persona must receive the supervisor MCP grant',
   );
   // A real isSupervisor still wins, and privilegeLane sits above researcher/worker.

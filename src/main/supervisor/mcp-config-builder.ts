@@ -61,7 +61,17 @@ export function toolsetsForLane(lane: AgentRoleLane): string {
       // Toolset-hiding here is defense-in-depth; the authorization boundary is
       // the minted capability token the /api/checkpoints* routes require
       // (WP-G2.0/2.1). Do NOT add `checkpoints` to the worker or researcher grant.
-      return 'orchestration,comms,observability-core,plans,browser-present,checkpoints';
+      // Memory & Lessons v2 (WP-D): `memory` — the recall_memory on-demand
+      // detail-fetch toolset — is granted to BOTH lanes (worker below). Progressive
+      // disclosure: active capsules ride inline in the injected index; recall only
+      // ever fetches closed history, and every recall becomes pruning telemetry.
+      // Memory & Lessons v2 (WP-F2): `migration` — the guarded batch/bundle
+      // memory-migration operations (publish_lessons_batch / replace_memory_bundle
+      // / restore_memory_bundle) WP-I2's signed migration drives — is appended to
+      // the SUPERVISOR lane ONLY. Never granted to the worker/researcher lanes:
+      // these mutate the whole memory tree and belong to the supervisor tier +
+      // human sign-off (a recorded migration approval gates every bundle op).
+      return 'orchestration,comms,observability-core,plans,browser-present,checkpoints,memory,migration';
     case 'worker':
       // QW1 (context-optimizer §3): `notebooks` removed — 0 notebook tool
       // invocations corpus-wide in the 546-file worker matrix. This is a rent
@@ -78,7 +88,9 @@ export function toolsetsForLane(lane: AgentRoleLane): string {
       // retired entirely, so this lane's grant is unchanged by the retirement:
       // the worker never carried those 13 schemas and its resident cost is
       // identical before and after.
-      return 'comms,observability-core,browser-present,plans-read';
+      // WP-D: the worker lane also gets `memory` (recall_memory) — both lanes
+      // read closed-capsule detail on demand.
+      return 'comms,observability-core,browser-present,plans-read,memory';
     case 'researcher':
       return 'browser';
     case 'legacy':
