@@ -19,6 +19,7 @@ import {
   DEFAULT_LIFECYCLE_SETTINGS,
   type AutoStopThreshold,
   type LifecycleSettings,
+  type LogRetentionCap,
 } from '../../shared/types';
 
 export const AUTO_STOP_THRESHOLDS: readonly AutoStopThreshold[] = [
@@ -29,6 +30,16 @@ const THRESHOLD_SET: ReadonlySet<string> = new Set<string>(AUTO_STOP_THRESHOLDS)
 
 export function isAutoStopThreshold(v: unknown): v is AutoStopThreshold {
   return typeof v === 'string' && THRESHOLD_SET.has(v);
+}
+
+export const LOG_RETENTION_CAPS: readonly LogRetentionCap[] = [
+  '1gib', '2gib', '5gib', 'unlimited',
+] as const;
+
+const RETENTION_CAP_SET: ReadonlySet<string> = new Set<string>(LOG_RETENTION_CAPS);
+
+export function isLogRetentionCap(v: unknown): v is LogRetentionCap {
+  return typeof v === 'string' && RETENTION_CAP_SET.has(v);
 }
 
 /** Injectable for tests; production resolves under Electron's userData. */
@@ -46,21 +57,38 @@ export function loadLifecycleSettings(dir?: string): LifecycleSettings {
   try {
     const raw: unknown = JSON.parse(fs.readFileSync(lifecycleSettingsPath(dir), 'utf8'));
     if (raw && typeof raw === 'object') {
-      const t = (raw as { autoStopIdleThreshold?: unknown }).autoStopIdleThreshold;
-      if (isAutoStopThreshold(t)) return { autoStopIdleThreshold: t };
+      // Validate each field INDEPENDENTLY and merge with the defaults: an invalid
+      // (or absent) value for one field defaults ONLY that field and never
+      // discards a valid sibling. An old one-field JSON therefore reads back as
+      // {valid autoStop, default retention}.
+      const obj = raw as { autoStopIdleThreshold?: unknown; logRetentionCap?: unknown };
+      return {
+        autoStopIdleThreshold: isAutoStopThreshold(obj.autoStopIdleThreshold)
+          ? obj.autoStopIdleThreshold
+          : DEFAULT_LIFECYCLE_SETTINGS.autoStopIdleThreshold,
+        logRetentionCap: isLogRetentionCap(obj.logRetentionCap)
+          ? obj.logRetentionCap
+          : DEFAULT_LIFECYCLE_SETTINGS.logRetentionCap,
+      };
     }
   } catch { /* first run or unreadable — fall through to the default */ }
   return { ...DEFAULT_LIFECYCLE_SETTINGS };
 }
 
 /**
- * Persist settings atomically. Returns the settings actually written — an
- * invalid threshold is rejected in favour of the default rather than stored.
+ * Persist settings atomically. Returns the settings actually written — each
+ * field is validated INDEPENDENTLY, an invalid value for one field falling back
+ * to that field's default without disturbing the sibling.
  */
 export function saveLifecycleSettings(settings: LifecycleSettings, dir?: string): LifecycleSettings {
-  const safe: LifecycleSettings = isAutoStopThreshold(settings?.autoStopIdleThreshold)
-    ? { autoStopIdleThreshold: settings.autoStopIdleThreshold }
-    : { ...DEFAULT_LIFECYCLE_SETTINGS };
+  const safe: LifecycleSettings = {
+    autoStopIdleThreshold: isAutoStopThreshold(settings?.autoStopIdleThreshold)
+      ? settings.autoStopIdleThreshold
+      : DEFAULT_LIFECYCLE_SETTINGS.autoStopIdleThreshold,
+    logRetentionCap: isLogRetentionCap(settings?.logRetentionCap)
+      ? settings.logRetentionCap
+      : DEFAULT_LIFECYCLE_SETTINGS.logRetentionCap,
+  };
   const target = lifecycleSettingsPath(dir);
   const tmp = `${target}.tmp`;
   try {

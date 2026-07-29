@@ -304,7 +304,10 @@ test('settings round-trip through the file', () => {
   const dir = tmpDir();
   assert.deepEqual(loadLifecycleSettings(dir), DEFAULT_LIFECYCLE_SETTINGS, 'first run → default');
   saveLifecycleSettings({ autoStopIdleThreshold: '7d' }, dir);
-  assert.deepEqual(loadLifecycleSettings(dir), { autoStopIdleThreshold: '7d' });
+  // Terminal-log retention (WP-1): load/save now validate each field
+  // independently and merge with defaults, so a saved threshold reads back with
+  // the defaulted logRetentionCap alongside it.
+  assert.deepEqual(loadLifecycleSettings(dir), { autoStopIdleThreshold: '7d', logRetentionCap: '2gib' });
 });
 
 test('the write is ATOMIC (temp file + rename) and leaves no temp behind', () => {
@@ -334,14 +337,54 @@ test('lifecycle:set-settings validates main-side and broadcasts to ALL windows',
   const h = makeHarness();
   const ipc = makeIpc();
   registerLifecycleIpc(ipc, h.deps);
+  // WP-7: set-settings loads current → merges the partial → validates each field
+  // → saves the FULL two-field settings. The current settings carry no explicit
+  // cap, so it defaults to '2gib' alongside the accepted threshold.
   const ok = await ipc.invoke(LIFECYCLE_CHANNELS.setSettings, { autoStopIdleThreshold: '12h' });
-  assert.deepEqual(ok, { autoStopIdleThreshold: '12h' });
-  assert.deepEqual(h.broadcasts, [{ autoStopIdleThreshold: '12h' }]);
+  assert.deepEqual(ok, { autoStopIdleThreshold: '12h', logRetentionCap: '2gib' });
+  assert.deepEqual(h.broadcasts, [{ autoStopIdleThreshold: '12h', logRetentionCap: '2gib' }]);
 
   const bad = await ipc.invoke(LIFECYCLE_CHANNELS.setSettings, { autoStopIdleThreshold: '999y' });
-  assert.deepEqual(bad, DEFAULT_LIFECYCLE_SETTINGS, 'a renderer-supplied enum is not trusted');
-  assert.deepEqual(await ipc.invoke(LIFECYCLE_CHANNELS.getSettings), DEFAULT_LIFECYCLE_SETTINGS);
+  // The invalid threshold falls back — but the PERSISTED sibling ('12h' from the
+  // prior write, now the current value) is what an invalid threshold defaults
+  // to, not the hard default. The cap remains '2gib'.
+  assert.deepEqual(bad, { autoStopIdleThreshold: '12h', logRetentionCap: '2gib' },
+    'a renderer-supplied bad enum falls back to the persisted value, never widening it');
+  assert.deepEqual(await ipc.invoke(LIFECYCLE_CHANNELS.getSettings), { autoStopIdleThreshold: '12h', logRetentionCap: '2gib' });
   assert.equal(h.broadcasts.length, 2, 'every accepted write is broadcast');
+});
+
+test('WP-7: a partial set-settings preserves the SIBLING field (cap↔threshold never clobber)', async () => {
+  const h = makeHarness();
+  h.settings = { autoStopIdleThreshold: '7d', logRetentionCap: '5gib' };
+  const ipc = makeIpc();
+  registerLifecycleIpc(ipc, h.deps);
+
+  // Change ONLY the cap → the threshold '7d' survives.
+  const afterCap = await ipc.invoke(LIFECYCLE_CHANNELS.setSettings, { logRetentionCap: '1gib' });
+  assert.deepEqual(afterCap, { autoStopIdleThreshold: '7d', logRetentionCap: '1gib' },
+    'a cap-only set keeps the persisted threshold');
+
+  // Now change ONLY the threshold → the cap '1gib' survives.
+  const afterThreshold = await ipc.invoke(LIFECYCLE_CHANNELS.setSettings, { autoStopIdleThreshold: '6h' });
+  assert.deepEqual(afterThreshold, { autoStopIdleThreshold: '6h', logRetentionCap: '1gib' },
+    'a threshold-only set keeps the persisted cap');
+
+  assert.deepEqual(h.broadcasts, [
+    { autoStopIdleThreshold: '7d', logRetentionCap: '1gib' },
+    { autoStopIdleThreshold: '6h', logRetentionCap: '1gib' },
+  ]);
+});
+
+test('WP-7: an invalid partial field falls back without disturbing the sibling', async () => {
+  const h = makeHarness();
+  h.settings = { autoStopIdleThreshold: '3d', logRetentionCap: '5gib' };
+  const ipc = makeIpc();
+  registerLifecycleIpc(ipc, h.deps);
+  // A garbage cap must not reset the threshold; the cap defaults to the
+  // persisted '5gib' (validation is per-field).
+  const r = await ipc.invoke(LIFECYCLE_CHANNELS.setSettings, { logRetentionCap: 'HUGE' });
+  assert.deepEqual(r, { autoStopIdleThreshold: '3d', logRetentionCap: '5gib' });
 });
 
 // ── The sweep ────────────────────────────────────────────────────────────────

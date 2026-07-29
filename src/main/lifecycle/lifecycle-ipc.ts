@@ -24,6 +24,7 @@ import {
   type BulkStopRequest,
   type BulkStopResult,
   type LifecycleSettings,
+  type LogRetentionCap,
   type StaleIdlePreview,
   type StopEligibilityMode,
 } from '../../shared/types';
@@ -34,6 +35,7 @@ import {
   type GuardAgentRow,
   type GuardDeps,
 } from './guards';
+import { isAutoStopThreshold, isLogRetentionCap } from './lifecycle-settings';
 
 export const LIFECYCLE_CHANNELS = {
   stop: 'agent:stop',
@@ -214,15 +216,28 @@ export function registerLifecycleIpc(ipc: IpcLike, deps: BulkStopDeps): void {
   ipc.handle(LIFECYCLE_CHANNELS.getSettings, () => deps.loadSettings());
 
   ipc.handle(LIFECYCLE_CHANNELS.setSettings, (_e, raw: unknown) => {
-    // Validate main-side: the renderer's enum is not to be trusted.
-    const t = (raw ?? {}) as { autoStopIdleThreshold?: unknown };
-    const next: LifecycleSettings =
-      typeof t.autoStopIdleThreshold === 'string' && t.autoStopIdleThreshold in AUTO_STOP_THRESHOLD_MS
-        ? { autoStopIdleThreshold: t.autoStopIdleThreshold as AutoStopThreshold }
-        : { ...DEFAULT_LIFECYCLE_SETTINGS };
-    const saved = deps.saveSettings(next);
+    // WP-7: accept a PARTIAL. Load current → merge the patch → validate EACH
+    // field INDEPENDENTLY → save → rebroadcast. The two controls (auto-stop
+    // threshold and terminal-history cap) each send only their own field, so a
+    // whole-object set that dropped the sibling would clobber the other
+    // control's value. Per-field validation keeps a renderer-supplied enum
+    // untrusted: an invalid or absent field falls back to the persisted value,
+    // then to the default — it never widens or resets the sibling.
+    const patch = (raw ?? {}) as Partial<LifecycleSettings>;
+    const current = deps.loadSettings();
+    const autoStopIdleThreshold: AutoStopThreshold = isAutoStopThreshold(patch.autoStopIdleThreshold)
+      ? patch.autoStopIdleThreshold
+      : isAutoStopThreshold(current.autoStopIdleThreshold)
+        ? current.autoStopIdleThreshold
+        : DEFAULT_LIFECYCLE_SETTINGS.autoStopIdleThreshold;
+    const logRetentionCap: LogRetentionCap = isLogRetentionCap(patch.logRetentionCap)
+      ? patch.logRetentionCap
+      : isLogRetentionCap(current.logRetentionCap)
+        ? current.logRetentionCap
+        : DEFAULT_LIFECYCLE_SETTINGS.logRetentionCap ?? '2gib';
+    const saved = deps.saveSettings({ autoStopIdleThreshold, logRetentionCap });
     // EVERY window — a detached window showing the same setting must not keep
-    // rendering a stale threshold.
+    // rendering a stale threshold or cap.
     deps.broadcastSettings(saved);
     return saved;
   });

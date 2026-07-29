@@ -3,6 +3,10 @@ import { powerMonitor } from 'electron';
 import { registerLifecycleIpc, LIFECYCLE_CHANNELS, type BulkStopDeps } from './lifecycle/lifecycle-ipc';
 import { loadLifecycleSettings, saveLifecycleSettings } from './lifecycle/lifecycle-settings';
 import { IdleSweep } from './lifecycle/idle-sweep';
+import { LogRetentionScheduler } from './log-retention/log-retention-scheduler';
+import { inventoryBundles } from './log-retention/log-retention-inventory';
+import { readState as readRetentionState, writeState as writeRetentionState, acknowledgeFirstSweepNotice } from './lifecycle/log-retention-state';
+import { registerLogRetentionIpc, broadcastLogRetentionState, makeRetentionSinks } from './lifecycle/log-retention-ipc';
 import { registerContextGaugeIpc, CONTEXT_GAUGE_CHANNELS, type ContextGaugeIpcDeps } from './context-gauge/context-gauge-ipc';
 import { getContextGaugeSettingsCached, updateContextGaugeSettings } from './context-gauge/context-gauge-settings';
 import { capForRoleKey, setContextGaugeCapResolver } from './context-gauge/context-gauge-cap';
@@ -11,7 +15,7 @@ import fs from 'fs';
 import * as v8 from 'node:v8';
 import { loadPersistedTheme } from './theme-persistence';
 import {
-  initDatabase, getWorkspaces, getActiveAgents, reconcileStaleOpenContinuationAttempts,
+  initDatabase, getWorkspaces, getActiveAgents, getAllAgents, reconcileStaleOpenContinuationAttempts,
   getPlan, getWorkspace, listOrchestrationRuns, getLiveRailAgentForPlan, getPlanEventsForRender,
   setWitnessObserver,
 } from './database';
@@ -31,7 +35,7 @@ import { RETENTION_CYCLE_INTERVAL_MS } from '../shared/constants';
 import { registerIpcHandlers, setHumanCheckpointRoutes } from './ipc-handlers';
 import { installExternalNavHandlers, forceCloseAllDetached, getDetachedEntries, type DetachedWindowDeps } from './detached-windows';
 import { runCloseFlush, type FlushTarget } from './close-flush';
-import { TAB_CHANNELS, type FlushRequestPayload } from '../shared/types';
+import { TAB_CHANNELS, LOG_RETENTION_CAP_BYTES, type FlushRequestPayload, type LogRetentionState } from '../shared/types';
 import { WsServer } from './ws-server';
 import { ApiServer, type BrowserToolProvider } from './api-server';
 import { OrchestrationService } from './orchestration/service';
@@ -263,6 +267,12 @@ let browserManager: BrowserManager | null = null;
 // Idle-agent lifecycle §B9 — the automatic stale-idle sweep. Armed after
 // app.whenReady(); stopped (and drained) by shutdownApp.
 let idleSweep: IdleSweep | null = null;
+// Terminal-log retention (WP-5) — the OS-idle full-scan scheduler. Constructed
+// after app.whenReady() and registered as a heap-telemetry gauge provider, but
+// deliberately NOT started here: WP-8 owns start + real event/broadcast sinks +
+// ordering. Reverting this and the construction below fully disables it (it is
+// never armed, so there are no residual timers).
+let retentionScheduler: LogRetentionScheduler | null = null;
 // D5-lite memory watchdog + D1 shell-crash recovery policy (incident-2026-07-11
 // §5). Constructed at ready once the supervisor + browser manager exist (their
 // counts feed the sampler); referenced lazily by the shell's render-process-gone
@@ -1129,6 +1139,77 @@ app.whenReady().then(async () => {
     }
     const supervisorForWatchdog = supervisor;
     const browserForWatchdog = browserManager;
+    // Terminal-log retention (WP-8): the load-bearing construction order.
+    //   (1) construct the scheduler WITHOUT starting it — its sinks close over
+    //       the live (still-null) `heapTelemetry` via an accessor;
+    //   (2) construct + start heap telemetry (a few blocks below) with the
+    //       scheduler's cached gauge provider;
+    //   (3) the real event/broadcast sinks are already installed here (they read
+    //       the live telemetry lazily — no post-hoc swap needed);
+    //   (4) START the scheduler only AFTER telemetry exists (right after
+    //       `heapTelemetry.start()`).
+    // Starting the scheduler before telemetry is constructed would drop every
+    // sweep's telemetry line, so the start is deliberately deferred.
+    //
+    // Push the durable state to EVERY window (skip destroyed), matching
+    // lifecycle-settings; a single-window push would strand a detached banner.
+    const broadcastRetentionState = (state: LogRetentionState): void =>
+      broadcastLogRetentionState(() => BrowserWindow.getAllWindows(), state);
+    // Pull + acknowledge IPC (get-state / acknowledge-notice). The scheduler is
+    // the state WRITER (WP-5); acknowledgement only sets the nested
+    // `acknowledgedAt` then rebroadcasts.
+    registerLogRetentionIpc(ipcMain, {
+      readState: () => readRetentionState(),
+      acknowledge: (nowIso) => acknowledgeFirstSweepNotice(nowIso),
+      broadcast: broadcastRetentionState,
+      now: () => Date.now(),
+    });
+    // The real scan-complete sinks: `emitSweepEvent` routes ACTUAL removals to
+    // the single heap-telemetry writer via a LIVE accessor (null until telemetry
+    // is built below); `onScanComplete` broadcasts the state the scheduler just
+    // persisted so mounted renderers update their banner.
+    const retentionSinks = makeRetentionSinks({
+      getHeapTelemetry: () => heapTelemetry,
+      getTargetBytes: () => LOG_RETENTION_CAP_BYTES[loadLifecycleSettings().logRetentionCap ?? '2gib'],
+      now: () => Date.now(),
+      readState: () => readRetentionState(),
+      broadcast: broadcastRetentionState,
+    });
+    // The inventory closure and the executor (`runRetentionSweepPlan`) BOTH
+    // resolve their approved logs dir from `getApprovedLogsDirForRetention()`,
+    // so they can never disagree on scope.
+    retentionScheduler = new LogRetentionScheduler({
+      inventory: (approvedLogsDir) => inventoryBundles(
+        getAllAgents().map((a) => ({
+          agentId: a.id,
+          status: a.status,
+          logPath: a.logPath,
+          hasRunner: supervisorForWatchdog.hasRunner(a.id),
+        })),
+        approvedLogsDir,
+        (p) => {
+          // ENOENT → null (absent); any other error THROWS so the inventory
+          // marks the bundle non-reclaimable instead of treating it as size 0.
+          try {
+            const st = fs.statSync(p);
+            return { size: st.size, mtimeMs: st.mtimeMs };
+          } catch (e: any) {
+            if (e?.code === 'ENOENT') return null;
+            throw e;
+          }
+        },
+      ),
+      runSweepPlan: (toSweep) => supervisorForWatchdog.runRetentionSweepPlan(toSweep),
+      loadCapBytes: () => LOG_RETENTION_CAP_BYTES[loadLifecycleSettings().logRetentionCap ?? '2gib'],
+      getApprovedLogsDir: () => supervisorForWatchdog.getApprovedLogsDirForRetention(),
+      powerMonitor,
+      now: () => Date.now(),
+      readState: () => readRetentionState(),
+      writeState: (s) => writeRetentionState(s),
+      emitSweepEvent: retentionSinks.emitSweepEvent,
+      onScanComplete: retentionSinks.onScanComplete,
+      log: (m) => console.warn(m),
+    });
     renderRecovery = new RenderRecoveryPolicy();
     memorySampler = new MemorySampler({
       readCommit: createCommitReader(nativeCommit),
@@ -1235,6 +1316,8 @@ app.whenReady().then(async () => {
       },
       gauges: [
         { name: 'supervisor', read: () => supervisorForWatchdog.collectMemoryGauges() },
+        // Terminal-log retention (WP-5): O(1) cached observation, never a scan.
+        { name: 'terminal-log-retention', read: () => retentionScheduler?.collectGauges() ?? [] },
       ],
       readAgents: () =>
         (attributionService?.getLatest()?.perAgent ?? []).map((a) => ({
@@ -1245,6 +1328,11 @@ app.whenReady().then(async () => {
         })),
     });
     heapTelemetry.start();
+
+    // Terminal-log retention (WP-8) STEP 4: NOW that heap telemetry exists and
+    // the scheduler's sinks (which read it live) are installed, turn the feature
+    // ON. Starting earlier would let a sweep fire with no telemetry sink.
+    retentionScheduler?.start();
 
     orchestration.start();                 // boot reconcile of orphaned runs
     // D4 (incident-2026-07-11 §5): arm durable CLI-process ownership (store +
@@ -1283,6 +1371,11 @@ async function shutdownApp(): Promise<void> {
   // stale-idle kill is never abandoned half-way through shutdown.
   await idleSweep?.stop();
   memorySampler?.stop();
+  // WP-8: stop/drain the retention scheduler BEFORE heap telemetry stops (a
+  // draining sweep may still emit a telemetry line, and its sink reads the live
+  // telemetry) and before the supervisor drain — so a reclaim is never
+  // abandoned half-way and its sweep event still reaches a live writer.
+  await retentionScheduler?.stop();
   heapTelemetry?.stop();
   try { await supervisor?.drainForShutdown(); }
   catch (err) { console.error('[shutdown] drain failed:', err); }

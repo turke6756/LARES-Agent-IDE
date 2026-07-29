@@ -972,6 +972,10 @@ export function initDatabase(): void {
   // idle clock across the backfill and make "idle for N hours" unreproducible).
   migrateLifecycleColumns(db);
 
+  // Terminal-log retention — the reclaimed-marker column. Additive, no backfill
+  // (legacy rows stay NULL = "never reclaimed"); idempotent PRAGMA guard.
+  migrateTerminalHistoryReclaimedColumn(db);
+
   // WP2: provenance spine — all CREATE TABLE IF NOT EXISTS (idempotent regardless
   // of landing order). Four tables: plan_sections (anchor registry, R1 §2),
   // plan_events (reconciled schema, amendments §F-A — canonical dispatched-target
@@ -1654,6 +1658,8 @@ function rowToAgent(row: any): Agent {
     idleSince: row.idle_since ?? null,
     stoppedAt: row.stopped_at ?? null,
     lastStopReason: parseStopReason(row.last_stop_reason ?? null),
+    // Terminal-log retention — NULL (pre-migration / never reclaimed) → null.
+    terminalHistoryReclaimedAt: row.terminal_history_reclaimed_at ?? null,
   };
 }
 
@@ -1953,6 +1959,43 @@ export function migrateLifecycleColumns(database: Database.Database): void {
       database.exec(`ALTER TABLE agents ADD COLUMN last_stop_reason TEXT`);
     }
   })();
+}
+
+/**
+ * Terminal-log retention — additive migration for the single
+ * `terminal_history_reclaimed_at TEXT NULL` (ISO-8601) marker on `agents`.
+ *
+ * Mirrors `migrateLifecycleColumns`: PRAGMA `table_info(agents)`-guarded so the
+ * `ALTER` runs at most once, and — critically — there is NO backfill. Legacy
+ * rows stay NULL, which is the "history never reclaimed" state; a backfill would
+ * fabricate a disclosure for logs that were never touched. Idempotent: a second
+ * pass sees the column present and does nothing. Exported for unit tests.
+ */
+export function migrateTerminalHistoryReclaimedColumn(database: Database.Database): void {
+  const agentsColumnExists = (col: string): boolean => {
+    // Fixed identifier (`agents`); the column name is compared in JS, never
+    // interpolated into SQL.
+    const cols = database.prepare(`PRAGMA table_info(agents)`).all() as { name: string }[];
+    return cols.some((c) => c.name === col);
+  };
+
+  if (!agentsColumnExists('terminal_history_reclaimed_at')) {
+    database.exec(`ALTER TABLE agents ADD COLUMN terminal_history_reclaimed_at TEXT`);
+  }
+}
+
+/**
+ * Terminal-log retention — stamp the reclaimed marker. Idempotent by SQL: the
+ * `AND terminal_history_reclaimed_at IS NULL` guard preserves the FIRST non-null
+ * value, so a marker survives revival and a re-sweep never overwrites it.
+ * Touches ONLY this column — never `status`, never `updated_at` — and never
+ * clears it.
+ */
+export function markAgentTerminalHistoryReclaimed(agentId: string, iso: string): void {
+  run(
+    `UPDATE agents SET terminal_history_reclaimed_at = ? WHERE id = ? AND terminal_history_reclaimed_at IS NULL`,
+    [iso, agentId],
+  );
 }
 
 function queryAll(sql: string, params: any[] = []): any[] {

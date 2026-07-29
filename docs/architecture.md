@@ -98,6 +98,37 @@ split across siblings in that directory:
 > disambiguate with a per-agent signal, never "one agent per directory." This is
 > intentional and load-bearing; see the root `CLAUDE.md`.
 
+### Terminal-log retention (`src/main/log-retention/`)
+
+Long-lived workspaces accumulate PTY terminal logs (`<agent>.log` plus its
+`.scrollback` / `.checkpoint` / `.checkpoint.tmp` sidecars) on disk. A background
+scheduler reclaims that backlog under a **strictly conservative, fail-closed**
+policy. It runs only when the OS reports idle/locked, on a 6-hour cadence seeded
+from durable state, and selects bundles **oldest-first** up to a user-selectable
+cap (default 2 GiB; `Unlimited` disables deletion but keeps observability). The
+disclosure that history was reclaimed travels as structured metadata on the
+attach / range / tail / dead-snapshot DTOs and renders as an overlay — never as
+text injected into the terminal byte stream.
+
+Four standing invariants are load-bearing and are enforced end-to-end by
+`log-retention/log-retention-integration.test.ts`:
+
+1. **DB rows are never deleted.** Reclamation removes only the on-disk files; the
+   agent's database row survives. Retention's *only* row mutation is stamping the
+   idempotent `terminal_history_reclaimed_at` marker (which survives revival). No
+   retention module imports or calls the row-deleting `deleteAgent` — asserted by
+   source grep.
+2. **A live agent's log is never swept.** Eligibility is exactly
+   `(status === 'done' || status === 'crashed') && hasRunner(id) === false`, and
+   the final gate re-checks the freshly re-fetched status and *both* runner maps
+   **under the per-agent lifecycle lock, after all awaits** — so a runner that
+   appears mid-scan is caught. Any missing row, non-terminal status, runner-map
+   throw, path mismatch, or shared `logPath` skips fail-closed.
+3. **No whole-file log reads.** Retention only `fs.stat`s the four managed paths;
+   the `no-whole-file-log-read` guard stays green.
+4. **Structured banners only.** The reclaimed-history marker is the single
+   authority for disclosure — never inferred from a missing file.
+
 ## The MCP surface (`scripts/mcp-*.js`)
 
 The MCP surface is where "a harness for agent harnesses" is implemented: a

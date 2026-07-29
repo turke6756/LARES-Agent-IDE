@@ -58,6 +58,11 @@ const TESTS = [
   // truncation metadata (bounded .scrollback preferred, capped .log tail else;
   // conservative log>scrollback ⇒ truncated). Feeds the renderer dead-reopen banner.
   'dist/main/main/supervisor/log-readers/dead-agent-snapshot.test.js',
+  // Terminal-log retention WP-6: reader/IPC structured reclaimed-history metadata —
+  // marker-only reclaimed state (never ENOENT), fetch-after-read ordering, racing
+  // range read keeps the notice, `missing` iff both fallback files absent, no
+  // epoch-ms conversion (corrupt marker → null, never NaN), string readers → ''.
+  'dist/main/main/supervisor/log-readers/terminal-history-notice.test.js',
   // Memory-hardening WP-3a (A): runner log byte-offset instrumentation, write
   // barrier (contiguous flushed prefix + degraded-on-error freeze), epoch reset
   // on stream open, and the ring snapshot — both runners.
@@ -88,6 +93,9 @@ const TESTS = [
   'dist/main/main/lifecycle/guards.test.js',
   'dist/main/main/supervisor/lifecycle-eligible-stop.test.js',
   'dist/main/main/lifecycle/lifecycle-ipc.test.js',
+  // Terminal-log retention WP-1: per-field-independent lifecycle-settings
+  // validation (autoStopIdleThreshold vs logRetentionCap) + defaults merge.
+  'dist/main/main/lifecycle/lifecycle-settings-retention.test.js',
   // Context Window Warning: per-role gauge-cap settings + resolution.
   'dist/main/main/context-gauge/context-gauge-settings.test.js',
   // System-Memory polish: commit attribution completeness + composed view DTO
@@ -105,6 +113,46 @@ const TESTS = [
   // 85% boundary, NaN/zero-limit/negative/thrown fail-closed, caps→heap→commit.
   'dist/main/main/watchdog/memory-sampler.test.js',
   'dist/main/main/database.active-agents.test.js',
+  // Terminal-log retention WP-1: reclaimed-marker column — idempotent migration,
+  // the WHERE-guarded write (first value preserved, own column only), NULL→null.
+  'dist/main/main/log-retention-marker.test.js',
+  // Terminal-log retention WP-2: pure bundle summarization + sweep selection
+  // (zero IO) — newest-mtime max, empty→null, ineligible-count-toward-totals,
+  // age boundary, oldest-first accumulation, target-unmet honesty, path guard.
+  'dist/main/main/log-retention/log-retention-policy.test.js',
+  // Terminal-log retention WP-4: supervisor executor — lifecycle lock, post-drain
+  // live recheck (runner appearing DURING the drain is caught), checkpoint
+  // reservation (overlapping-save Set, marker never gates save/load), sequential
+  // sweep with a yield every 25 agents, and marker-honesty (hook == unlink).
+  'dist/main/main/supervisor/log-retention-executor.test.js',
+  // Terminal-log retention WP-5: durable scheduler state — atomic round-trip,
+  // corrupt→defaults, and the create-once/immutable first-sweep-notice transform.
+  'dist/main/main/lifecycle/log-retention-state.test.js',
+  // Terminal-log retention WP-5: on-disk bundle inventory — validate-before-stat,
+  // shared-path→shared-reference (counted once, never selected), ENOENT-vs-stat-error.
+  'dist/main/main/log-retention/log-retention-inventory.test.js',
+  // Terminal-log retention WP-8: first-sweep IPC + broadcast (every window,
+  // skip destroyed) + acknowledge round-trip; sweep-event ACTUAL before/after
+  // mapping; the LIVE-telemetry-accessor sinks (a sweep before telemetry exists
+  // is a no-op, one after is delivered — the "start before sinks" mutation).
+  'dist/main/main/lifecycle/log-retention-ipc.test.js',
+  // Terminal-log retention WP-8: the load-bearing index.ts SOURCE order —
+  // construct scheduler → construct telemetry → START scheduler, and shutdown
+  // drain scheduler → stop telemetry → supervisor drain.
+  'dist/main/main/log-retention-wiring-order.test.js',
+  // Terminal-log retention WP-5: OS-idle scheduler — idle gate (active/unknown/
+  // throw skip; idle/locked run), cadence seeded from lastFullScanAt (no restart
+  // re-scan), single-flight, resume-no-catch-up, O(1) cached gauges, actual-removal
+  // counters (partial never overclaims), 'unlimited' cap, no-repair-pass selection.
+  'dist/main/main/log-retention/log-retention-scheduler.test.js',
+  // Terminal-log retention WP-9: the END-TO-END backstop — one real OS-idle scan
+  // over a mixed fixture wires the real scheduler → inventory → planner →
+  // supervisor executor (post-drain live recheck) → reclaim primitive → reader
+  // DTOs → durable state. Asserts only eligible bundles are reclaimed (files gone,
+  // marker set), live/young/revived-recent/shared untouched, a runner appearing
+  // mid-scan is not swept, gauges/first-sweep-notice reflect ACTUAL removals, no
+  // retention module calls dbDeleteAgent, and the whole-file-read guard stays green.
+  'dist/main/main/log-retention/log-retention-integration.test.js',
   // Git-Native WP-A0: turn_records + recovery_operations schema/accessors.
   'dist/main/main/turn-records.test.js',
   // Git-Native WP-G0.1: MinGit manifest loader + shape validation.
@@ -159,6 +207,10 @@ const TESTS = [
   'dist/main/main/supervisor/send-input-encoder.test.js',
   'dist/main/main/supervisor/key-bytes.test.js',
   'dist/main/main/supervisor/worker-scaffold.test.js',
+  // Memory & Lessons v2 WP-F1 — the `remember` skill is provisioned to every
+  // WP-R lane/provider skill root (Claude+Codex, supervisor+worker).
+  'dist/main/main/supervisor/remember-provisioning.test.js',
+  'dist/main/main/supervisor/codex-worker-parity.test.js',
   'dist/main/main/supervisor/role-lane.test.js',
   'dist/main/main/supervisor/resolve-launch-command.test.js',
   'dist/main/main/persona-scanner.test.js',
@@ -177,6 +229,7 @@ const TESTS = [
   'dist/main/main/supervisor/provider-dir-trust.test.js',
   'dist/main/main/supervisor/handoff-handshake.test.js',
   'dist/main/main/supervisor/hook-status-detection.test.js',
+  'dist/main/main/supervisor/codex-guard-hook-profile.test.js',
   'dist/main/main/supervisor/dashboard-status-script.test.js',
   'dist/main/main/supervisor/dashboard-host-injection.test.js',
   'dist/main/main/supervisor/wsl-bridge-base64-wrap.test.js',
@@ -270,6 +323,62 @@ const TESTS = [
   'dist/main/main/browser/reader-mode.test.js',
   'dist/main/main/research/frontmatter.test.js',
   'scripts/research-write-guard.test.js',
+  // Shared PreToolUse git-discard guard — pure-predicate decision table
+  // (~60 cases) + spawn harness (deny shape, exit codes, fail-OPEN).
+  'scripts/guard-git-discard.test.js',
+  // Memory & Lessons v2 WP-A1 — pure core unit tests, the CLI exec suite
+  // (shipped MEMORY_INDEX_MJS bytes vs on-disk fixtures), and the stale-artifact
+  // drift check (regenerate → byte-identity with the committed generated bundle).
+  'dist/main/main/memory-index/core.test.js',
+  'dist/main/main/memory-index/review-store.test.js',
+  // Memory & Lessons v2 WP-A2 — the I/O validation layer (validateIO +
+  // readValidateProject): dangling/escaping/orphan detail HARD classes over real
+  // on-disk fixtures, pure+I/O combination, and the shipped CLI's exit codes.
+  'dist/main/main/memory-index/io-validate.test.js',
+  // Memory & Lessons v2 WP-C — the launch projection + provider-neutral delivery
+  // (severity/fallback/runtime flow, reconcile-only-against-valid, MEMORY.md
+  // untouched, the compose/predicate helpers, and the autoMemoryEnabled gate).
+  'dist/main/main/memory-index/launch-injection.test.js',
+  // Memory & Lessons v2 WP-D — the recall_memory detail fetch + recall telemetry:
+  // declared-pointer resolution, invalid_id/not_found/read_error structured codes,
+  // escaping-pointer refusal, archived-served flag, UTF-8-safe body truncation,
+  // bump-only-on-ok, and two-workspace cross-read/cross-increment isolation.
+  'dist/main/main/memory-index/recall-tool.test.js',
+  // Memory & Lessons v2 WP-F1 — the transactional staged multi-copy writer
+  // (clean write, second-rename restore, conflict protection, shared lock) and
+  // the publish_lesson state machine + launch recovery (slug/collision/conflict
+  // gates, pending-insert-leaves-fs-untouched, and crash recovery from before
+  // first rename / between renames / before activation).
+  'dist/main/main/memory-index/staged-write.test.js',
+  'dist/main/main/memory-index/publisher.test.js',
+  // Memory & Lessons v2 WP-F2 — graduation recording (propose_graduation:
+  // .lares/** + non-root-doc rejection, ABSENT sentinel, live-hash capture) and
+  // the supervisor-only guarded migration ops: publish_lessons_batch (pending
+  // rows before fs, atomic activate, whole-batch conflict unwind, launch
+  // recovery forward/rollback) + replace_/restore_memory_bundle (proposed-set
+  // validation, hash-guarded obsolete removal, CAS, approval gate, archive restore).
+  'dist/main/main/memory-index/graduation.test.js',
+  'dist/main/main/memory-index/batch-publisher.test.js',
+  'dist/main/main/memory-index/bundle-migration.test.js',
+  // Memory & Lessons v2 WP-H1 — the renderer-only review READ IPC: the handler
+  // projects WP-B's pending queue + WP-C's index state into the summary DTO
+  // (pendingCount/capPressure/capPercent/hardInvalid/runtime), bad-workspace-id
+  // → empty summary without touching the store, and the plain-node isolation
+  // test proving the channel is absent from every MCP toolset + api-server route.
+  'dist/main/main/memory-index/memory-ipc.test.js',
+  // Memory & Lessons v2 WP-H2 — deterministic janitor brief (byte-identical for
+  // identical queue state, honest never-recalled/never-fired/evidence-unavailable
+  // wording), the coverage-guarded firing classifier, and dispatch launching a
+  // real agent via the injected user launch path with the brief as its prompt.
+  'dist/main/main/memory-index/janitor-brief.test.js',
+  // Memory & Lessons v2 WP-H3 — the human-only graduation apply (the ONLY
+  // applier): CAS on target_hash_at_proposal, UTF-8±BOM + LF/CRLF preservation,
+  // marked-append inside the Lares markers, unmarked-heading conflict, symlink/
+  // escape reject, idempotency, and concurrent-proposal serialization.
+  'dist/main/main/memory-index/graduation-apply.test.js',
+  'scripts/memory-index.test.js',
+  'scripts/memory-index-cli-generated.test.js',
+  'scripts/memory-review-channel-isolation.test.js',
   'scripts/research-store-gitignore.test.js',
   // P0.3 EDR-surface lint (plans/edr-safety-hardening.md): self-test fixtures + real-tree lint.
   'scripts/check-edr-patterns.test.js',

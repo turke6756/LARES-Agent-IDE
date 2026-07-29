@@ -172,9 +172,57 @@ export interface StaleIdlePreview {
 
 export interface LifecycleSettings {
   autoStopIdleThreshold: AutoStopThreshold;
+  // Terminal-log retention target — the on-disk budget below which the retention
+  // sweep leaves managed logs alone. User-selectable enum; 'unlimited' disables
+  // deletion (never observability). Validated INDEPENDENTLY of
+  // autoStopIdleThreshold so a corrupt or absent value defaults this field
+  // WITHOUT disturbing the sibling threshold.
+  //
+  // OPTIONAL at the type level so existing single-field `{ autoStopIdleThreshold }`
+  // literals stay valid (additive boundary); loadLifecycleSettings /
+  // saveLifecycleSettings ALWAYS populate it at runtime, so consumers reading a
+  // loaded/saved value receive a concrete cap.
+  logRetentionCap?: LogRetentionCap;
 }
 
-export const DEFAULT_LIFECYCLE_SETTINGS: LifecycleSettings = { autoStopIdleThreshold: '24h' };
+export const DEFAULT_LIFECYCLE_SETTINGS: LifecycleSettings = {
+  autoStopIdleThreshold: '24h',
+  logRetentionCap: '2gib',
+};
+
+// ── Terminal-log retention (locked shared types) ──
+//
+// Timestamps are ISO strings END-TO-END — no epoch/Date.parse conversion
+// anywhere — so `reclaimedAt: NaN` is impossible. The reclaimed marker is the
+// verbatim column value.
+
+export type LogRetentionCap = '1gib' | '2gib' | '5gib' | 'unlimited';
+
+export type HistoryNotice = null | { kind: 'retention-reclaimed'; reclaimedAt: string };
+
+export interface LogRetentionState {
+  lastFullScanAt: string | null;
+  firstSweepNotice: { completedAt: string; agents: number; bytes: number; acknowledgedAt: string | null } | null;
+}
+
+export interface RetentionExecutionResult {
+  agentId: string;
+  outcome: 'removed' | 'partial' | 'no-files' | 'skipped';
+  skipReason?: 'missing-row' | 'non-terminal' | 'live-runner' | 'invalid-path' | 'shared-reference' | 'runner-check-failed';
+  removed: Array<{ path: string; bytes: number }>;
+  failed: Array<{ path: string; code: string }>;
+}
+
+/** Minimum age (from newest managed file mtime) before a bundle is sweep-eligible. */
+export const LOG_RETENTION_MIN_AGE_MS = 7 * 24 * 3600 * 1000;
+
+/** Cap enum → bytes. Uses `2 ** 30`; 'unlimited' → +∞ (deletion disabled). */
+export const LOG_RETENTION_CAP_BYTES: Record<LogRetentionCap, number> = {
+  '1gib': 1 * 2 ** 30,
+  '2gib': 2 * 2 ** 30,
+  '5gib': 5 * 2 ** 30,
+  unlimited: Number.POSITIVE_INFINITY,
+};
 
 // ── Context-gauge settings (user-configurable context-window warning caps) ──
 
@@ -428,6 +476,19 @@ export interface Agent {
   stoppedAt?: string | null;
   /** Why the last real stop happened; null when never stopped or unmapped. */
   lastStopReason?: AgentStopReason | null;
+  // ── Terminal-log retention ──
+  /** ISO timestamp when this agent's terminal history was reclaimed to free disk
+   *  space, else null. Written once (idempotent; first non-null value preserved)
+   *  and SURVIVES revival — the marker is the sole authority for the
+   *  history-reclaimed disclosure. NEVER an eligibility clock.
+   *
+   *  OPTIONAL at the type level so existing full-Agent fixtures stay valid —
+   *  WP-1's rollback boundary is additive-only, and a required property would be
+   *  a breaking change to a widely-constructed interface. rowToAgent ALWAYS
+   *  populates it (NULL→null), so every DB-sourced Agent carries a concrete
+   *  `string | null`; the downstream notice accessor guards for a non-empty
+   *  string, tolerating an absent field on a hand-built fixture. */
+  terminalHistoryReclaimedAt?: string | null;
 }
 
 /** WP5 (hook-absence-resilience) — the unified three-state disposition of a
@@ -1782,6 +1843,9 @@ export interface TerminalAttachResult {
   snapshotCutoff?: number;
   degraded?: boolean;
   error?: string;
+  /** WP-6: reclaimed-history disclosure sourced solely from the DB marker (for
+   *  both live and dead agents). `null`/absent = nothing reclaimed. */
+  historyNotice?: HistoryNotice;
 }
 
 /** WP-3a: exact byte range from an agent's `.log` (NO rune alignment). */
@@ -1790,6 +1854,9 @@ export interface TerminalLogRange {
   startOffset: number;
   endOffset: number;
   fileSize: number;
+  /** WP-6: marker fetched AFTER the bounded read, so a read racing a deletion
+   *  returns empty bytes PLUS this structured notice. */
+  historyNotice?: HistoryNotice;
 }
 
 /** WP-3a: tail bytes from an agent's `.log`; head rune-aligned when truncated. */
@@ -1798,6 +1865,8 @@ export interface TerminalLogTail {
   startOffset: number;
   endOffset: number;
   truncated: boolean;
+  /** WP-6: marker fetched AFTER the bounded read (see `TerminalLogRange`). */
+  historyNotice?: HistoryNotice;
 }
 
 /** WP-3a: atomic ring-text + logical PTY cursor for degraded recovery. */
@@ -1823,6 +1892,14 @@ export interface TerminalDeadSnapshot {
   text: string;
   truncated: boolean;
   retainedBytes: number;
+  /** WP-6: true ONLY when BOTH `.scrollback` and `.log` are absent (ENOENT via
+   *  `sizeOrNull`). NEVER inferred from `snapshotCutoff === 0` / `retainedBytes`
+   *  — an empty-but-present log is size 0 yet `missing:false`. Drives the
+   *  renderer's separate `history-unavailable` warning, distinct from the
+   *  `retention-reclaimed` notice. */
+  missing: boolean;
+  /** WP-6: reclaimed-history disclosure fetched AFTER the bounded read. */
+  historyNotice?: HistoryNotice;
 }
 
 export interface IpcApi {
@@ -2072,7 +2149,11 @@ export interface IpcApi {
    *  namespace. Changes require both workers + a plans-doc progress-log note. */
   lifecycle: {
     getSettings: () => Promise<LifecycleSettings>;
-    setSettings: (settings: LifecycleSettings) => Promise<LifecycleSettings>;
+    /** WP-7: accepts a PARTIAL — a single control (auto-stop threshold OR
+     *  terminal-history cap) sends only its own field; main loads current,
+     *  merges the patch, validates each field independently, and returns the
+     *  full persisted settings. */
+    setSettings: (settings: Partial<LifecycleSettings>) => Promise<LifecycleSettings>;
     onSettingsChanged: (cb: (settings: LifecycleSettings) => void) => () => void;
   };
   contextGauge: {
@@ -2080,6 +2161,15 @@ export interface IpcApi {
     /** Returns the settings actually stored (sanitized + clamped main-side). */
     setSettings: (settings: ContextGaugeSettings) => Promise<ContextGaugeSettings>;
     onSettingsChanged: (cb: (settings: ContextGaugeSettings) => void) => () => void;
+  };
+  /** WP-8 — terminal-log retention first-sweep notice surface. `getState` is a
+   *  PULL (a renderer mounting after the sweep still sees the notice);
+   *  `onStateChanged` is the push; `acknowledgeNotice` dismisses the durable
+   *  banner (persists, then rebroadcasts) and returns the new state. */
+  logRetention: {
+    getState: () => Promise<LogRetentionState>;
+    onStateChanged: (cb: (state: LogRetentionState) => void) => () => void;
+    acknowledgeNotice: () => Promise<LogRetentionState>;
   };
   browser: {
     createTab: (opts: BrowserCreateTabOptions) => Promise<{ tabId: string }>;

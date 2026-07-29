@@ -4,7 +4,7 @@ import fs from 'fs';
 import crypto from 'crypto';
 import { execFileSync, execFile, spawn } from 'child_process';
 import { v4 as uuidv4 } from 'uuid';
-import { Agent, AgentProvider, AgentRoleLane, AgentStatus, AgentStopReason, BulkStopItemResult, ContextStats, ContinuationPhaseSignal, ContinuationPhaseState, ForceContinuationResult, LaunchAgentInput, QueryResult, SendOutcome, StopEligibilityMode, StopResult, Team, UsageLimitsReading, hasSupervisorPrivilege } from '../../shared/types';
+import { Agent, AgentProvider, AgentRoleLane, AgentStatus, AgentStopReason, BulkStopItemResult, ContextStats, ContinuationPhaseSignal, ContinuationPhaseState, ForceContinuationResult, HistoryNotice, LaunchAgentInput, QueryResult, RetentionExecutionResult, SendOutcome, StopEligibilityMode, StopResult, Team, TerminalDeadSnapshot, TerminalLogRange, TerminalLogTail, UsageLimitsReading, hasSupervisorPrivilege } from '../../shared/types';
 import { assembleGuardSnapshot, evaluateStopEligibility, type AgentBrowserState, type GuardDeps } from '../lifecycle/guards';
 import {
   TMUX_SESSION_PREFIX, PROVIDER_COMMANDS, WORKER_CLAUDE_MODEL,
@@ -119,8 +119,10 @@ import {
 import { listCodexRolloutFiles } from './log-readers/codex-rollout-reader';
 // WP-1 (C): delete-time disk reclamation for an agent's `.log` + sidecars.
 import { reclaimAgentLogFiles } from './log-readers/reclaim-log-files';
+import { isManagedLogPath, type RetentionBundle } from '../log-retention/log-retention-policy';
 import { readFileTail, readFileRange, readLastLines, normalizeLines } from './log-readers/tail-file';
 import { readDeadAgentSnapshot } from './log-readers/dead-agent-snapshot';
+import { historyNoticeFromMarker, readWithHistoryNotice } from './log-readers/history-notice';
 import { writeTerminalCheckpoint, readTerminalCheckpoint, unlinkTerminalCheckpoint, checkpointSaveAllowed, checkpointLoadValid } from './log-readers/terminal-checkpoint';
 import { CodexLaunchGate } from './codex-launch-gate';
 import { FileActivityTracker } from './file-activity-tracker';
@@ -128,7 +130,7 @@ import { AdmissionError, type AdmissionDecision } from '../watchdog/types';
 import {
   createAgent, getAgent, getActiveAgents, getAllAgents, getAgentsByWorkspace, getSupervisorAgent, getOwnerForWorker, getWorkspace, updateAgentStatus, applyStatusTransition, updateAgentPid,
   updateAgentExitCode, incrementRestartCount, updateAgentLastOutput,
-  updateAgentAttached, addEvent, deleteAgent as dbDeleteAgent,
+  updateAgentAttached, addEvent, deleteAgent as dbDeleteAgent, markAgentTerminalHistoryReclaimed,
   updateAgentResumeSessionId, addFileActivity, clearWitnessObserver, getTeamMembership, addTeamMember, getAgentTemplate,
   getFileActivities, pruneFileActivitiesToRecentSessions, updateAgentHookStatus,
   updateAgentLastSendError, updateAgentLastSend,
@@ -1160,6 +1162,20 @@ export class AgentSupervisor extends EventEmitter {
   // epoch ?? this map. (WP-3b adds the checkpoint validation that consumes it;
   // WP-3a only populates it and the delete-time cleanup below.)
   lastTerminalEpoch = new Map<string, string>();
+  // WP-4 (terminal-log retention) — the checkpoint↔reclaim interlock.
+  //   retentionReservations: agent ids whose terminal history is being reclaimed
+  //   RIGHT NOW (held only across `reclaimAgentTerminalHistoryLocked`). While an
+  //   id is reserved, checkpoint save/load short-circuit so a live write can
+  //   never race the synchronous unlink. The MARKER never gates save/load — a
+  //   revived agent (new epoch, same logPath) must still checkpoint even though
+  //   its marker persists; only the active reservation excludes it.
+  private retentionReservations = new Set<string>();
+  //   inFlightCheckpointWrites: per-agent SET of in-flight checkpoint write
+  //   promises. Each save registers its own promise SYNCHRONOUSLY before its
+  //   first yield and removes ONLY itself in `finally`, so overlapping saves
+  //   (the newer resolving first) never clobber each other and the reclaim can
+  //   drain every one via `Promise.allSettled` before rechecking liveness.
+  private inFlightCheckpointWrites = new Map<string, Set<Promise<unknown>>>();
   private fileTrackers = new Map<string, FileActivityTracker>();
   private monitor: StatusMonitor;
   private contextStatsMonitor: ContextStatsMonitor;
@@ -7227,32 +7243,43 @@ export class AgentSupervisor extends EventEmitter {
   }
 
   /** WP-3a: exact byte range [start, min(end,size)) from the agent's `.log`,
-   *  NO rune alignment (consecutive pages must join losslessly). */
-  async agentReadLogRange(agentId: string, start: number, end: number): Promise<{ bytes: Uint8Array; startOffset: number; endOffset: number; fileSize: number }> {
+   *  NO rune alignment (consecutive pages must join losslessly).
+   *  WP-6: the reclaimed-history marker is fetched AFTER the bounded read, so a
+   *  read that races a deletion returns empty bytes PLUS the structured notice. */
+  async agentReadLogRange(agentId: string, start: number, end: number): Promise<TerminalLogRange> {
     const agent = getAgent(agentId);
-    if (!agent?.logPath) return { bytes: new Uint8Array(0), startOffset: start, endOffset: start, fileSize: 0 };
-    const r = await readFileRange(agent.logPath, start, end);
-    return { bytes: new Uint8Array(r.bytes), startOffset: r.startOffset, endOffset: r.endOffset, fileSize: r.fileSize };
+    return readWithHistoryNotice(async () => {
+      if (!agent?.logPath) return { bytes: new Uint8Array(0), startOffset: start, endOffset: start, fileSize: 0 };
+      const r = await readFileRange(agent.logPath, start, end);
+      return { bytes: new Uint8Array(r.bytes), startOffset: r.startOffset, endOffset: r.endOffset, fileSize: r.fileSize };
+    }, () => this.agentTerminalHistoryNotice(agentId));
   }
 
   /** WP-3a: up to `maxBytes` ending at `endExclusive` (default EOF) from the
-   *  agent's `.log`, rune-aligned at the head when truncated. */
-  async agentReadLogTail(agentId: string, maxBytes: number, endExclusive?: number): Promise<{ bytes: Uint8Array; startOffset: number; endOffset: number; truncated: boolean }> {
+   *  agent's `.log`, rune-aligned at the head when truncated.
+   *  WP-6: marker fetched AFTER the read (see `agentReadLogRange`). */
+  async agentReadLogTail(agentId: string, maxBytes: number, endExclusive?: number): Promise<TerminalLogTail> {
     const agent = getAgent(agentId);
-    if (!agent?.logPath) return { bytes: new Uint8Array(0), startOffset: 0, endOffset: 0, truncated: false };
-    const r = await readFileTail(agent.logPath, maxBytes, endExclusive);
-    return { bytes: new Uint8Array(r.bytes), startOffset: r.startOffset, endOffset: r.endOffset, truncated: r.truncated };
+    return readWithHistoryNotice(async () => {
+      if (!agent?.logPath) return { bytes: new Uint8Array(0), startOffset: 0, endOffset: 0, truncated: false };
+      const r = await readFileTail(agent.logPath, maxBytes, endExclusive);
+      return { bytes: new Uint8Array(r.bytes), startOffset: r.startOffset, endOffset: r.endOffset, truncated: r.truncated };
+    }, () => this.agentTerminalHistoryNotice(agentId));
   }
 
   /** WP-3c: dead-agent historical snapshot for the terminal reopen path —
    *  bounded `.scrollback` (preferred) else a capped `.log` tail, WITH structured
    *  truncation metadata so the renderer can surface a visible banner instead of
    *  silently dropping earlier history. Distinct from `getAgentRingBuffer`, which
-   *  serves other consumers as a plain string and stays unchanged. */
-  async getAgentDeadSnapshot(agentId: string): Promise<{ text: string; truncated: boolean; retainedBytes: number }> {
+   *  serves other consumers as a plain string and stays unchanged.
+   *  WP-6: `missing` comes solely from the snapshot's dual-ENOENT check; the
+   *  reclaimed-history marker is fetched AFTER the bounded read. */
+  async getAgentDeadSnapshot(agentId: string): Promise<TerminalDeadSnapshot> {
     const agent = getAgent(agentId);
-    if (!agent?.logPath) return { text: '', truncated: false, retainedBytes: 0 };
-    return readDeadAgentSnapshot(agent.logPath, MAX_TERMINAL_REPLAY_BYTES);
+    return readWithHistoryNotice(async () => {
+      if (!agent?.logPath) return { text: '', truncated: false, retainedBytes: 0, missing: true };
+      return readDeadAgentSnapshot(agent.logPath, MAX_TERMINAL_REPLAY_BYTES);
+    }, () => this.agentTerminalHistoryNotice(agentId));
   }
 
   // ── WP-3b terminal serialize-checkpoint (epoch-guarded) ──────────────
@@ -7269,6 +7296,12 @@ export class AgentSupervisor extends EventEmitter {
    *  offset↔file mapping can't be trusted and replay would be wrong). A write
    *  failure cleans the `.checkpoint.tmp` (helper) and returns false. */
   async saveTerminalCheckpoint(agentId: string, epoch: string, serialized: string, appliedOffset: number): Promise<boolean> {
+    // WP-4: a reclaim is in progress for this agent — do NOT begin a new write
+    // that would race the synchronous unlink. Checked BEFORE any yield so it
+    // cannot interleave with the reservation add. NOTE: this is the reservation
+    // guard, NOT a marker guard — a revived agent's persisted marker never
+    // blocks its new-epoch checkpoint save.
+    if (this.retentionReservations.has(agentId)) return false;
     const agent = getAgent(agentId);
     if (!agent?.logPath) return false;
     // Guard: current epoch match + not degraded (stale-epoch and degraded saves
@@ -7276,12 +7309,24 @@ export class AgentSupervisor extends EventEmitter {
     if (!checkpointSaveAllowed(epoch, this.agentEpoch(agentId), this.agentLogOffsetsReliable(agentId))) {
       return false;
     }
+    // WP-4: register THIS write's promise in the per-agent Set SYNCHRONOUSLY
+    // (writeTerminalCheckpoint(...) is called now and returns its promise before
+    // any await), so an overlapping reclaim's `Promise.allSettled` drains it.
+    // Overlapping saves each register their own promise and remove only
+    // themselves in `finally` — a single-promise map would lose one.
+    const writePromise = writeTerminalCheckpoint(agent.logPath, { epoch, serialized, appliedOffset });
+    let inFlight = this.inFlightCheckpointWrites.get(agentId);
+    if (!inFlight) { inFlight = new Set(); this.inFlightCheckpointWrites.set(agentId, inFlight); }
+    inFlight.add(writePromise);
     try {
-      await writeTerminalCheckpoint(agent.logPath, { epoch, serialized, appliedOffset });
+      await writePromise;
       return true;
     } catch (err) {
       console.error(`[checkpoint] save failed for ${agentId}:`, err);
       return false;
+    } finally {
+      inFlight.delete(writePromise);
+      if (inFlight.size === 0) this.inFlightCheckpointWrites.delete(agentId);
     }
   }
 
@@ -7293,6 +7338,10 @@ export class AgentSupervisor extends EventEmitter {
    *  reconnect / Electron restart each mint a new epoch, so a checkpoint written
    *  under the old one fails the epoch check here. */
   async loadTerminalCheckpoint(agentId: string, snapshotCutoff: number): Promise<{ serialized: string; appliedOffset: number } | null> {
+    // WP-4: reclaim in progress — refuse to hand back a checkpoint whose backing
+    // file may be unlinked underneath the caller. Reservation guard only; the
+    // persisted marker never blocks a revived agent's new-epoch load.
+    if (this.retentionReservations.has(agentId)) return null;
     const agent = getAgent(agentId);
     if (!agent?.logPath) return null;
     const cp = await readTerminalCheckpoint(agent.logPath);
@@ -7311,6 +7360,136 @@ export class AgentSupervisor extends EventEmitter {
     void unlinkTerminalCheckpoint(logPath);
   }
 
+  // ── WP-4 (terminal-log retention) — supervisor executor + narrow seams ──────
+  //
+  // Two seams keep the scheduler/reader (WP-5/WP-6) decoupled from supervisor
+  // internals: `getApprovedLogsDirForRetention` exposes the EXACT dir the
+  // reclaim primitive validates + deletes under, and `agentTerminalHistoryNotice`
+  // reads the DB-backed reclaimed marker as a structured DTO.
+
+  /** The exact approved logs directory `reclaimAgentLogFiles` validates against
+   *  and unlinks under. Both the inventory scan (WP-5) and this executor consume
+   *  it so they can never disagree on scope. */
+  getApprovedLogsDirForRetention(): string {
+    return this.logsDir;
+  }
+
+  /** The reclaimed-history disclosure for `agentId`, sourced solely from the DB
+   *  marker. The marker is an ISO string end-to-end; accept it ONLY when it is a
+   *  non-empty string, otherwise emit `null` + a diagnostic. NOTE: WP-1 made
+   *  `terminalHistoryReclaimedAt` OPTIONAL, so `undefined` is a real value — the
+   *  string guard rejects it. No epoch/`Date.parse` conversion ever happens, so
+   *  `reclaimedAt: NaN` is impossible. */
+  agentTerminalHistoryNotice(agentId: string): HistoryNotice {
+    const v = getAgent(agentId)?.terminalHistoryReclaimedAt;
+    if (v !== undefined && v !== null && typeof v !== 'string') {
+      console.warn(`[retention] ignoring non-string terminalHistoryReclaimedAt for ${agentId}:`, v);
+    }
+    // Single normalization authority (WP-6): ISO-string-only, no epoch/Date.parse
+    // conversion, so `reclaimedAt: NaN` is impossible and a corrupt marker → null.
+    return historyNoticeFromMarker(v);
+  }
+
+  /** WP-4: reclaim one agent's terminal-log bundle under the per-agent lifecycle
+   *  lock. Serializing against stop/restart/revive is what makes the post-drain
+   *  liveness recheck authoritative. */
+  async reclaimAgentTerminalHistory(agentId: string): Promise<RetentionExecutionResult> {
+    return this.withLifecycleLock(agentId, () => this.reclaimAgentTerminalHistoryLocked(agentId));
+  }
+
+  /** The locked executor body. Order is load-bearing and is an acceptance
+   *  criterion — do NOT reorder:
+   *    1. reserve the agent (excludes new checkpoint saves/loads) — inside
+   *       try/finally so the reservation is ALWAYS released;
+   *    2. snapshot + drain every in-flight checkpoint save via `Promise.allSettled`;
+   *    3. ONLY THEN recheck — re-fetch the row and re-read BOTH runner maps. A
+   *       recheck before the drain is worthless: a runner can appear during the
+   *       await. Any throw from the runner-map access fails CLOSED
+   *       (`runner-check-failed`);
+   *    4. call the reclaim primitive SYNCHRONOUSLY (no await between the recheck
+   *       and the unlink) with the marker written in `beforeFirstUnlink` — which
+   *       WP-3 fires iff a file will actually be unlinked, so "marker = actual
+   *       reclamation" stays honest. */
+  private async reclaimAgentTerminalHistoryLocked(agentId: string): Promise<RetentionExecutionResult> {
+    const skip = (skipReason: RetentionExecutionResult['skipReason']): RetentionExecutionResult => (
+      { agentId, outcome: 'skipped', skipReason, removed: [], failed: [] }
+    );
+    this.retentionReservations.add(agentId);
+    try {
+      // ── Step 2: drain in-flight checkpoint saves (snapshot the Set first) ──
+      const writes = [...(this.inFlightCheckpointWrites.get(agentId) ?? [])];
+      await Promise.allSettled(writes);
+
+      // ── Step 3: recheck AFTER the await — never before ──
+      const agent = getAgent(agentId);
+      if (!agent) return skip('missing-row');
+      if (agent.status !== 'done' && agent.status !== 'crashed') return skip('non-terminal');
+      let live: boolean;
+      try {
+        // BOTH runner maps re-read here — a runner that appeared during the
+        // drain is caught. A throw fails closed rather than assuming no runner.
+        live = this.windowsRunners.has(agentId) || this.wslRunners.has(agentId);
+      } catch {
+        return skip('runner-check-failed');
+      }
+      if (live) return skip('live-runner');
+      const logPath = agent.logPath;
+      if (!logPath || !isManagedLogPath(logPath, agentId, this.logsDir)) return skip('invalid-path');
+
+      // ── Step 4: reclaim SYNCHRONOUSLY — NO await between here and the unlink.
+      const res = reclaimAgentLogFiles(logPath, agentId, this.logsDir, {
+        beforeFirstUnlink: () => markAgentTerminalHistoryReclaimed(agentId, new Date().toISOString()),
+      });
+      if (!res.validated) {
+        // Defensive: isManagedLogPath already screened out-of-scope, so a refusal
+        // here is a shared-reference (or a residual out-of-scope) — both skip.
+        return {
+          agentId,
+          outcome: 'skipped',
+          skipReason: res.refusedReason === 'shared-reference' ? 'shared-reference' : 'invalid-path',
+          removed: res.removed,
+          failed: res.failed,
+        };
+      }
+      const outcome: RetentionExecutionResult['outcome'] =
+        res.removed.length > 0 ? (res.failed.length ? 'partial' : 'removed') : 'no-files';
+      return { agentId, outcome, removed: res.removed, failed: res.failed };
+    } finally {
+      this.retentionReservations.delete(agentId);
+    }
+  }
+
+  /** WP-4: run a selection plan (from `planRetentionSweep`) sequentially, one
+   *  agent at a time so the per-agent lock is never contended by the sweep
+   *  against itself. A macrotask yield is injected every 25 agents to keep a
+   *  large backlog from starving the event loop — but NEVER between the final
+   *  recheck and the synchronous reclaim (those live inside one locked body and
+   *  cannot be split). `setImmediateFn` is injectable purely so tests can spy on
+   *  the yield; production uses the real `setImmediate`. */
+  async runRetentionSweepPlan(
+    toSweep: RetentionBundle[],
+    deps?: { setImmediateFn?: (cb: () => void) => void },
+  ): Promise<RetentionExecutionResult[]> {
+    const yieldFn = deps?.setImmediateFn ?? ((cb: () => void) => { setImmediate(cb); });
+    const results: RetentionExecutionResult[] = [];
+    let processed = 0;
+    for (const bundle of toSweep) {
+      results.push(await this.reclaimAgentTerminalHistory(bundle.agentId));
+      processed++;
+      if (processed % 25 === 0) {
+        await new Promise<void>((resolve) => { yieldFn(resolve); });
+      }
+    }
+    return results;
+  }
+
+  /** WP-4: telemetry/notice count — agents whose bundle ACTUALLY lost at least
+   *  one file. Not markers attempted, not agents selected; a skip or a no-files
+   *  result does not count. */
+  static countReclaimedAgents(results: RetentionExecutionResult[]): number {
+    return results.filter((r) => r.removed.length > 0).length;
+  }
+
   /**
    * BUG-15: return the entire PTY ring buffer for an agent. The terminal
    * viewer calls this on mount to paint scrollback. For live agents it pulls
@@ -7322,6 +7501,9 @@ export class AgentSupervisor extends EventEmitter {
    * replays alt-screen toggles and ends up visually empty in xterm for
    * exited agents. The ring buffer is the same raw bytes, but bounded so we
    * can persist a useful snapshot.
+   *
+   * WP-6: for reclaimed history this returns `''` and MUST NEVER synthesize
+   * banner/explanatory text — disclosure is DTO-only (`historyNotice`).
    */
   async getAgentRingBuffer(agentId: string): Promise<string> {
     const winRunner = this.windowsRunners.get(agentId);
@@ -7358,6 +7540,8 @@ export class AgentSupervisor extends EventEmitter {
   }
 
   async getAgentLog(agentId: string, lines = 50): Promise<string> {
+    // WP-6: for reclaimed history this returns `''` and MUST NEVER synthesize
+    // banner/explanatory text — disclosure is DTO-only (`historyNotice`).
     // WP-2: normalize the line contract at the public boundary. The supported
     // contract is a positive finite integer; zero/negative/NaN/non-integer
     // normalize to the historical default (50). This intentionally replaces

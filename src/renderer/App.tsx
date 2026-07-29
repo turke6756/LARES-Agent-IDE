@@ -12,6 +12,7 @@ import { openExternalFileTab } from './components/fileviewer/openFileHelpers';
 import DetachedFileView from './components/fileviewer/DetachedFileView';
 import DetachedViewShell from './components/layout/DetachedViewShell';
 import PressureNotification from './components/watchdog/PressureNotification';
+import LogRetentionNotice from './components/watchdog/LogRetentionNotice';
 import SecurityNoticeCard from './components/workspace/SecurityNoticeCard';
 import RuntimePrerequisitesDialog from './components/onboarding/RuntimePrerequisitesDialog';
 import PrerequisitesCard from './components/onboarding/PrerequisitesCard';
@@ -282,6 +283,11 @@ function AppInner() {
           pop-up that appears solely under Warn/Critical commit pressure. The
           always-on meter was removed; open Tools ▸ System Memory to inspect. */}
       <PressureNotification />
+
+      {/* WP-8 terminal-log retention: the durable, dismissible first-sweep
+          banner (app-chrome, never a per-terminal overlay). Renders only after
+          the first backlog-clearing sweep, until the human dismisses it. */}
+      <LogRetentionNotice />
 
       {/* P0.2 legacy-launcher security notice (bottom-LEFT corner — the
           pressure pop-up owns bottom-right): detection + user-authorized

@@ -367,6 +367,16 @@ const api: IpcApi = {
       return () => ipcRenderer.removeListener('context-gauge:settings-changed', listener);
     },
   },
+  // WP-8 — terminal-log retention first-sweep notice (pull + push + dismiss).
+  logRetention: {
+    getState: () => ipcRenderer.invoke('log-retention:get-state'),
+    onStateChanged: (callback) => {
+      const listener = (_event: any, state: any) => callback(state);
+      ipcRenderer.on('log-retention:state-changed', listener);
+      return () => ipcRenderer.removeListener('log-retention:state-changed', listener);
+    },
+    acknowledgeNotice: () => ipcRenderer.invoke('log-retention:acknowledge-notice'),
+  },
   browser: {
     createTab: (opts) => ipcRenderer.invoke(BROWSER_CHANNELS.createTab, opts),
     closeTab: (tabId) => ipcRenderer.invoke(BROWSER_CHANNELS.closeTab, tabId),

@@ -34,6 +34,15 @@
 //   {kind:"agents",     t, perAgent:[{agentId, rss, pidCount?, source?}]}
 //       Per-agent child-process working set, read from the attribution cache on
 //       a SLOWER cadence (default 60 s) — no per-tick process-tree walk.
+//   {kind:"log-retention-sweep", t, beforeBytes, afterBytes, removedFiles,
+//                        reclaimedBytes, reclaimedAgents, targetBytes, outcome,
+//                        durationMs, scanErrors}
+//       One line per completed terminal-log retention sweep (WP-8). NOT on a
+//       timer — emitted by the scheduler's scan-complete sink. Every counter is
+//       an ACTUAL before/after result, never a plan/estimate. Goes through the
+//       SAME single writer as every other kind (`writeLine`) so the file the
+//       memory-hardening analysis depends on is never corrupted by a second
+//       rotator.
 //
 // ── Reading it back ──────────────────────────────────────────────────────────
 // `node scripts/analyze-heap-telemetry.mjs [path]` reads the live file + its
@@ -89,6 +98,31 @@ export interface GaugeProvider {
   /** Stable id used only for once-per-failure logging attribution. */
   name: string;
   read: () => GaugeReading | GaugeReading[];
+}
+
+/** One completed terminal-log retention sweep, for the `log-retention-sweep`
+ *  line (WP-8). Every field is an ACTUAL before/after result of the sweep just
+ *  run, never a plan or estimate: `beforeBytes`/`afterBytes` are the managed
+ *  disk total before and after, and `removedFiles`/`reclaimedBytes`/
+ *  `reclaimedAgents` are the executor's real removals. */
+export interface LogRetentionSweepEvent {
+  /** Managed terminal-log disk total BEFORE the sweep (bytes). */
+  beforeBytes: number;
+  /** Managed terminal-log disk total AFTER the sweep (bytes). */
+  afterBytes: number;
+  /** Files actually unlinked this sweep. */
+  removedFiles: number;
+  /** Bytes actually reclaimed this sweep. */
+  reclaimedBytes: number;
+  /** Agents that had at least one file removed this sweep. */
+  reclaimedAgents: number;
+  /** The configured cap in bytes (`unlimited` ⇒ +∞, serialized as null). */
+  targetBytes: number;
+  outcome: 'under-target' | 'swept-to-target' | 'target-unmet';
+  /** Wall-clock from scan start to this emission. */
+  durationMs: number;
+  /** Non-ENOENT stat errors seen during the inventory pass. */
+  scanErrors: number;
 }
 
 /** One agent's child-process working set, for the `agents` line. */
@@ -273,6 +307,14 @@ export class HeapTelemetry {
       return;
     }
     this.writeLine({ kind: 'agents', t: this.iso(), perAgent });
+  }
+
+  /** WP-8: append one `log-retention-sweep` line for a completed retention
+   *  sweep. Routed through the SINGLE existing writer (`writeLine`) — there is
+   *  deliberately no second appender/rotator, so this line rotates with (and
+   *  never corrupts) the rest of the heap-telemetry stream. Never throws. */
+  emitLogRetentionSweep(ev: LogRetentionSweepEvent): void {
+    this.writeLine({ kind: 'log-retention-sweep', t: this.iso(), ...ev });
   }
 
   private iso(): string {

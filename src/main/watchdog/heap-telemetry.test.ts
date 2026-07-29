@@ -291,6 +291,65 @@ test('rotation stays correct with mixed line kinds and keeps the live file bound
   assert.ok(liveBytes <= 400 + 300, 'live file bounded near the cap, not unbounded');
 });
 
+// ── WP-8: log-retention-sweep line through the SINGLE writer ───────────────────
+
+const SWEEP_EVENT = {
+  beforeBytes: 5000,
+  afterBytes: 3000,
+  removedFiles: 4,
+  reclaimedBytes: 2000,
+  reclaimedAgents: 2,
+  targetBytes: 2 * 1024 ** 3,
+  outcome: 'swept-to-target' as const,
+  durationMs: 1234,
+  scanErrors: 0,
+};
+
+test('emitLogRetentionSweep appends one log-retention-sweep line with all actual fields', () => {
+  const h = makeHarness();
+  h.setTime(Date.parse('2026-07-27T09:00:00.000Z'));
+  h.telemetry.emitLogRetentionSweep(SWEEP_EVENT);
+  assert.equal(h.lines.length, 1, 'exactly one line');
+  const rec = JSON.parse(h.lines[0]);
+  assert.equal(rec.kind, 'log-retention-sweep');
+  assert.equal(rec.t, '2026-07-27T09:00:00.000Z', 'ISO timestamp from the injected clock');
+  assert.equal(rec.beforeBytes, 5000);
+  assert.equal(rec.afterBytes, 3000);
+  assert.equal(rec.removedFiles, 4);
+  assert.equal(rec.reclaimedBytes, 2000);
+  assert.equal(rec.reclaimedAgents, 2);
+  assert.equal(rec.reclaimedBytes, rec.beforeBytes - rec.afterBytes, 'before/after are consistent actuals');
+  assert.equal(rec.outcome, 'swept-to-target');
+  assert.equal(rec.durationMs, 1234);
+  assert.equal(rec.scanErrors, 0);
+});
+
+test('emitLogRetentionSweep goes through the SINGLE writer — same append + rotation, no second rotator', () => {
+  // Mutation guard: a second appender/rotator would bypass the injected
+  // `append`/`rotate`/`size` deps. Fill near the cap with heap lines, then emit
+  // a sweep line: it must (a) land in the SAME live buffer and (b) rotate via
+  // the SAME injected rotate — never its own file/rotator.
+  const h = makeHarness({ maxBytes: 300 });
+  h.setPercent(10);
+  h.telemetry.sample(); // one heap line, still under the cap
+  const rotationsBefore = h.rotations;
+  // Pad the live file right up against the cap so the next write must rotate.
+  while (h.lines.reduce((n, l) => n + Buffer.byteLength(l), 0) < 300) h.telemetry.sample();
+  const preSweepRotations = h.rotations;
+  h.telemetry.emitLogRetentionSweep(SWEEP_EVENT);
+  // The sweep line rotated the shared file (one more rotation via the injected
+  // rotate) and then appended into the fresh live buffer.
+  assert.ok(h.rotations > preSweepRotations, 'the sweep write rotated the SHARED file, not a private one');
+  assert.ok(h.rotations >= rotationsBefore + 1);
+  const sweepLines = [...h.rotated, ...h.lines].filter((l) => JSON.parse(l).kind === 'log-retention-sweep');
+  assert.equal(sweepLines.length, 1, 'the sweep line lives in the same rotated/live stream as every other kind');
+});
+
+test('an append failure does not throw out of emitLogRetentionSweep', () => {
+  const h = makeHarness({ append: () => { throw new Error('disk full'); } });
+  assert.doesNotThrow(() => h.telemetry.emitLogRetentionSweep(SWEEP_EVENT));
+});
+
 (async () => {
   let passed = 0; let failed = 0;
   for (const t of tests) {
