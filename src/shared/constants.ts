@@ -1232,8 +1232,67 @@ unproven cause.
 **Source:** 2026-06-12 input-lockout investigation — worker declined to unify a
 space-only terminal symptom with a global-lockout theory it could not mechanically
 support, and said so. User: "commendable… not going down some unproven path just to
-say you did it." Mirror of supervisor behavioral.md B-18.
+say you did it." The same discipline the supervisor holds itself to: an honest
+"I can't explain this yet" beats a tidy story the evidence doesn't support.
 `;
+
+/** Codex worker standing instructions — written to
+ *  <workspace>/.lares/workers/codex/AGENTS.md on first supervised Codex worker
+ *  launch. `AGENTS.md` is the project-instructions filename the Codex CLI reads
+ *  from its cwd (and up the tree) — it is this repo's established provider-neutral
+ *  convention (repo-root AGENTS.md mirrors CLAUDE.md) AND Codex's own documented
+ *  convention. Unlike the worker-cwd `.codex/config.toml` (which Codex only loads
+ *  for a *trusted* project — hooks ride a CODEX_HOME profile instead, see
+ *  src/main/supervisor/index.ts §"Class IV codex hooks"), AGENTS.md is read from
+ *  cwd unconditionally, so a Codex worker actually receives these instructions.
+ *
+ *  DERIVED, not forked, from WORKER_CLAUDE_MD via a documented `.split().join()`
+ *  chain (same anti-drift pattern as WORKER_CODEX_CONFIG_TOML_V3 / the persona
+ *  skills) so Edward's "workers consistent across providers" requirement can't
+ *  drift: editing WORKER_CLAUDE_MD updates BOTH bodies. Only the genuinely
+ *  provider-specific tokens are transformed:
+ *    1. Working-dir + memory-section cwd refs: `.lares/workers/claude/` → codex.
+ *    2. "How to ask questions": the Claude-Code-specific `AskUserQuestion` /
+ *       plan-mode dialog names → provider-neutral phrasing; the INTENT (never
+ *       invoke an interactive blocking dialog; end the turn with the question in
+ *       plain text) is preserved verbatim.
+ *    3. The promote-lessons pointer names WORKER_CODEX_AGENTS_MD, not the Claude
+ *       constant.
+ *  Every other section — crucially the "Never use git to discard uncommitted
+ *  work" section this file exists to deliver — passes through BYTE-IDENTICAL
+ *  (it contains none of the transformed tokens), which the parity test asserts. */
+export const WORKER_CODEX_AGENTS_MD = WORKER_CLAUDE_MD
+  // 1. cwd references (Working directory + Memory sections) point at the codex lane.
+  .split('.lares/workers/claude/').join('.lares/workers/codex/')
+  // 2. Claude-Code-specific blocking-dialog names → provider-neutral phrasing.
+  .split('`AskUserQuestion`,\nplan-mode approval prompts, `(y/n)` confirmations, ')
+  .join('an interactive approval prompt or `(y/n)` confirmation, ')
+  // 3. Promote-lessons pointer names the Codex constant, not the Claude one.
+  .split('`WORKER_CLAUDE_MD` constant').join('`WORKER_CODEX_AGENTS_MD` constant');
+
+/** WP-G (Memory & Lessons v2): the frozen v1 Codex AGENTS.md body — the byte-exact
+ *  Codex derivation of the FROZEN worker v8 (WORKER_CLAUDE_MD_V8), applying the same
+ *  three transforms the live derivation above applies. It is the previousHashes[1]
+ *  source for the codex/AGENTS.md scaffold entry's v1 → v2 bump (the v2 body is the
+ *  live WORKER_CODEX_AGENTS_MD, derived from the v9 worker body), so a workspace that
+ *  received the v1 AGENTS.md upgrades silently. Derived from the FROZEN v8 — never the
+ *  live body — so it can't rot on the next worker bump (D11 derivation hazard). */
+export const WORKER_CODEX_AGENTS_MD_V1 = WORKER_CLAUDE_MD_V8
+  .split('.lares/workers/claude/').join('.lares/workers/codex/')
+  .split('`AskUserQuestion`,\nplan-mode approval prompts, `(y/n)` confirmations, ')
+  .join('an interactive approval prompt or `(y/n)` confirmation, ')
+  .split('`WORKER_CLAUDE_MD` constant').join('`WORKER_CODEX_AGENTS_MD` constant');
+
+/** Seed content for the shared *Codex* worker behavioral memory, written
+ *  write-if-absent to <workspace>/.lares/workers/codex/behavioral.md on first
+ *  Codex worker launch. Mirrors WORKER_BEHAVIORAL_MD (same seed-once, not-managed
+ *  contract) so the Codex worker's AGENTS.md "Memory" section points at a file
+ *  that actually exists. DERIVED from WORKER_BEHAVIORAL_MD via `.split().join()`
+ *  so the two seeds stay in lockstep: only "Claude worker" → "Codex worker" and
+ *  the promote-target constant name are provider-specific. */
+export const WORKER_CODEX_BEHAVIORAL_MD = WORKER_BEHAVIORAL_MD
+  .split('Claude worker').join('Codex worker')
+  .split('`WORKER_CLAUDE_MD` constant').join('`WORKER_CODEX_AGENTS_MD` constant');
 
 /** Class IV worker hook config — written to
  *  <workspace>/.lares/workers/claude/.claude/settings.json on first
@@ -1259,6 +1318,76 @@ say you did it." Mirror of supervisor behavioral.md B-18.
  *  filtered by the script (since v9) and by applyHookStatusEvent, so they do
  *  NOT flip the card to waiting (the agent stays correctly idle). */
 export const WORKER_CLAUDE_SETTINGS_JSON = `{
+  "autoMemoryEnabled": false,
+  "autoCompactEnabled": false,
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \\"\${CLAUDE_PROJECT_DIR}/../../scripts/dashboard-status.mjs\\" session-start"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \\"\${CLAUDE_PROJECT_DIR}/../../scripts/dashboard-status.mjs\\""
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \\"\${CLAUDE_PROJECT_DIR}/../../scripts/dashboard-status.mjs\\" working"
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \\"\${CLAUDE_PROJECT_DIR}/../../scripts/dashboard-status.mjs\\" waiting"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \\"\${CLAUDE_PROJECT_DIR}/../../scripts/guard-git-discard.mjs\\""
+          }
+        ]
+      }
+    ]
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "node \\"\${CLAUDE_PROJECT_DIR}/../../scripts/dashboard-statusline.mjs\\"",
+    "padding": 0
+  }
+}
+`;
+
+/** Pre-guard Claude worker settings (v7) — the 4-hook + statusLine block WITHOUT
+ *  the PreToolUse(Bash) git-discard guard, kept verbatim so a v7 workspace's
+ *  on-disk settings.json can be hashed and silently upgraded to v8 (which adds
+ *  the guard-git-discard.mjs PreToolUse hook). Byte-identical to the prior live
+ *  WORKER_CLAUDE_SETTINGS_JSON v7 body. Also the previousHashes source for the
+ *  persona worker-lane settings in persona-scanner.ts (v3 body). */
+export const WORKER_CLAUDE_SETTINGS_JSON_V7 = `{
   "autoMemoryEnabled": false,
   "autoCompactEnabled": false,
   "hooks": {
@@ -3163,6 +3292,136 @@ the row is healthy and unambiguous.
 - \`restore_paths\` can overwrite newer uncommitted work on a path; \`revert_turn\` is unsafe
   when any witnessed file has later/concurrent work; \`prune_checkpoints\` is never outage
   remediation and is irreversible.
+`;
+
+/** remember/SKILL.md — the ONE user-facing memory/lesson write entry (Memory &
+ *  Lessons v2 WP-F1, proposal §5). Provisioned by SUPERVISOR_FILES,
+ *  SUPERVISOR_FILES_CODEX, WORKER_FILES_CLAUDE, and the Codex worker map to all
+ *  four lane/provider skill roots (WP-R verdict). Ships as a new-skill scaffold
+ *  entry ({ version: 1 }, no previousHashes). The body triages INSIDE the skill —
+ *  worthiness → memory-vs-lesson → capsule/lesson authoring → a named way to die →
+ *  validate — and routes to publish_lesson (lesson) or propose_graduation
+ *  (graduation). Because this path lives under `.agents/`/`.claude/skills`, an
+ *  agent NEVER hand-writes memory or lesson files. */
+export const REMEMBER_SKILL = `---
+name: remember
+description: >-
+  Something just happened that future agents shouldn't have to relearn — a
+  hard-won fix, a decision with consequences, a constraint you discovered, a trap
+  you fell into, or a loop you're leaving open. Invoke BEFORE ending the turn.
+  Walks you through: is this worth saving at all (most things aren't), is it a
+  MEMORY (current workspace state others must know) or a LESSON (reusable
+  "when X, do Y" steering), and how to write it so it actually gets found and read
+  later.
+---
+
+# remember
+
+You felt "this shouldn't be lost." Good instinct — now spend it well. Most
+moments are NOT worth saving. Work through these gates in order; stop the moment a
+gate says stop.
+
+## 1. Is this worth saving at all? (the loudest rule)
+
+**If the fact already lives somewhere durable and discoverable, DON'T save it.**
+Skip it if it is already captured by:
+
+- **git** — committed code, comments, commit messages, a CLAUDE.md/AGENTS.md line;
+- **a continuation brick or plan** — anything the dashboard already threads
+  forward for you;
+- **the database / an existing memory or lesson** — go read it instead
+  (\`recall_memory\`, or a raw read of \`.lares/supervisor/memory/\`).
+
+Save only the **non-obvious, load-bearing, and otherwise-invisible**: the reason a
+tempting approach is wrong, a constraint you only learned by tripping over it, a
+decision and its consequence, an open loop nobody else is holding. If in doubt,
+DON'T write it — a bloated index gets ignored, which defeats the point.
+
+## 2. Memory or lesson?
+
+One question decides it:
+
+> **Would this steer an agent in a DIFFERENT workspace?**
+
+- **No — it's about THIS workspace's current state** (a migration in flight, a
+  broken thing to avoid, a decision that holds only here) → it's a **MEMORY**.
+  Memories are injected into supervisors at launch and fetched by workers on
+  demand; they describe *this* workspace right now.
+- **Yes — it's reusable "when X, do Y" steering that would help anywhere** → it's a
+  **LESSON**. Lessons become skills that fire by description on both providers.
+
+## 3a. Write a MEMORY (capsule)
+
+Memories live in \`.lares/supervisor/memory/MEMORY.md\` as capsules. You do NOT edit
+that file by hand here — draft the capsule and hand it to the supervisor, who owns
+the write. A capsule looks like:
+
+\`\`\`
+## mb-YYYY-MM-DD-<slug>: <one-line title>
+- status: active            # active | done | note | archived
+- <a named way to die>      # REQUIRED for an active memory — see gate 4
+- read-if: <when a future agent should fetch the detail>   # optional
+- detail: .lares/supervisor/memory/details/<id>.md         # optional, for long bodies
+<the memory, tight — what's true and why it matters>
+\`\`\`
+
+**read-if authoring:** the index carries the *trigger*, the detail file carries the
+*body*. Write \`read-if\` as the concrete condition under which a future agent
+should spend a \`recall_memory\` call — "read-if: you're about to touch the
+auth-token refresh path", not "read-if: relevant". If there's no condition worth
+naming, the memory is probably too small for a detail file — inline it.
+
+## 3b. Write a LESSON (publish_lesson)
+
+A lesson is a skill: it fires when its **description** trigger matches what a
+future agent is mid-flight on. The description is the whole ballgame.
+
+**Lesson-description authoring:** write the trigger as the *situation the agent is
+in*, not a topic label. "When a test mutates a shared file to prove a failure,
+restore it by re-editing the line, never by discarding the file" fires; "notes
+about testing" does not. Front-load the concrete "when X".
+
+Then call **\`publish_lesson({ name, description, body })\`**:
+- \`name\` — a slug: lowercase, digits, hyphens (\`^[a-z0-9][a-z0-9-]{0,62}$\`).
+  It may not collide with \`remember\` or a shipped skill.
+- \`description\` — the mid-flight trigger above.
+- \`body\` — the "when X, do Y" steering, tight.
+
+The app writes the lesson to every provider/lane skill root transactionally — you
+never touch \`.claude/\` or \`.agents/\` directories yourself.
+
+## 4. Every active memory names a way to die
+
+An active memory with no exit is how the index rots. Before you save an **active**
+memory, give it exactly one named exit:
+
+- **expires: YYYY-MM-DD** — a date after which it's mechanically dropped;
+- **expires-when: <condition>** — a concrete condition a reviewer can check
+  ("expires-when: the pi-integration branch lands");
+- **open-loop: <what closes it>** — an unfinished thread; when you close the loop,
+  retire the memory that same turn.
+
+No exit → don't save it as active. (done/note/archived capsules are already dead;
+they don't need an exit.)
+
+## 5. Validate
+
+After the supervisor writes a memory capsule, confirm the index still parses:
+
+\`\`\`
+node .lares/scripts/memory-index.mjs validate .lares/supervisor/memory/MEMORY.md
+\`\`\`
+
+A HARD failure means the index would be REJECTED at launch — fix it before ending
+the turn. (\`publish_lesson\` validates its own slug and writes; you don't run the
+validator for a lesson.)
+
+## Graduation (the other exit)
+
+If a memory turned out to be **permanent workspace truth** (not a passing state),
+it belongs in \`CLAUDE.md\`/\`AGENTS.md\`, not the memory index. Call
+**\`propose_graduation({ target, text, rationale })\`** to record the proposal for
+human approval — never edit the root docs directly from here.
 `;
 
 /** read-agent-log.sh — .lares/supervisor/scripts/read-agent-log.sh */

@@ -59,6 +59,14 @@ import os from 'os';
 import { getDb, getWorkspace as getWorkspaceRecord } from './database';
 // Memory & Lessons v2 (WP-D): the recall_memory detail fetch + recall telemetry.
 import { recallMemoryDetailWithTelemetry } from './memory-index/recall';
+// Memory & Lessons v2 (WP-F1): the transactional publish_lesson state machine.
+import { publishLesson } from './memory-index/publisher';
+// Memory & Lessons v2 (WP-F2): graduation proposal recording + the supervisor-only
+// guarded batch/bundle migration operations WP-I2 drives.
+import { proposeGraduation } from './memory-index/graduation';
+import { publishLessonsBatch } from './memory-index/batch-publisher';
+import { replaceMemoryBundle, restoreMemoryBundle } from './memory-index/bundle-migration';
+import { detectPathType } from './path-utils';
 import type { PipelineDb } from './context-optimizer/optimizer-pipeline';
 import { runLiveOptimizerAnalyze } from './context-optimizer/optimizer-live-analyze';
 import {
@@ -1297,6 +1305,128 @@ export class ApiServer {
         workspace.path,
         input.id,
         new Date().toISOString(),
+      );
+    }
+
+    // POST /api/memory/publish-lesson { name, description, body } — Memory &
+    // Lessons v2 (WP-F1) transactional lesson publisher. Workspace identity is
+    // derived SOLELY from the authenticated X-Workspace-Id header (resolveIdentity
+    // already 403'd an unknown/cross-workspace assertion); the publisher writes
+    // the lesson SKILL.md to every lane/provider skill root under the workspace's
+    // shared scaffold lock and returns a structured { ok, ... } body (never a
+    // throw). The write dialect (windows/wsl) is detected from the workspace root.
+    if (method === 'POST' && path === '/api/memory/publish-lesson') {
+      if (!identity.asserted || !identity.workspaceId) {
+        throw Object.assign(
+          new Error('workspace identity required (send X-Workspace-Id header)'),
+          { statusCode: 400 },
+        );
+      }
+      const workspace = getWorkspaceRecord(identity.workspaceId);
+      if (!workspace) {
+        throw Object.assign(new Error('workspace not found'), { statusCode: 404 });
+      }
+      const body = await readBody(req);
+      const input = body ? JSON.parse(body) : {};
+      return publishLesson(
+        identity.workspaceId,
+        workspace.path,
+        detectPathType(workspace.path),
+        { name: input.name, description: input.description, body: input.body },
+        new Date().toISOString(),
+      );
+    }
+
+    // POST /api/memory/propose-graduation { target, text, rationale } — Memory &
+    // Lessons v2 (WP-F2). Records a PENDING graduation proposal (record-only; the
+    // human approves/applies via WP-H3). Workspace identity is derived SOLELY from
+    // the authenticated X-Workspace-Id header. The graduation module rejects any
+    // target other than the two fixed workspace-root roots (CLAUDE.md / AGENTS.md)
+    // — in particular any `.lares/**` target — and returns a structured
+    // { ok:false, code } body (never a throw). `source_agent` is the asserted
+    // supervisor id (provenance only).
+    if (method === 'POST' && path === '/api/memory/propose-graduation') {
+      if (!identity.asserted || !identity.workspaceId) {
+        throw Object.assign(
+          new Error('workspace identity required (send X-Workspace-Id header)'),
+          { statusCode: 400 },
+        );
+      }
+      const workspace = getWorkspaceRecord(identity.workspaceId);
+      if (!workspace) {
+        throw Object.assign(new Error('workspace not found'), { statusCode: 404 });
+      }
+      const body = await readBody(req);
+      const input = body ? JSON.parse(body) : {};
+      return proposeGraduation(
+        identity.workspaceId,
+        workspace.path,
+        { target: input.target, text: input.text, rationale: input.rationale },
+        identity.supervisorId,
+      );
+    }
+
+    // ══ Memory & Lessons v2 (WP-F2): the supervisor-only guarded migration ops ══
+    // POST /api/migration/{publish-lessons-batch,replace-bundle,restore-bundle}.
+    // Workspace identity is derived SOLELY from the authenticated X-Workspace-Id
+    // header; the operation writes under the workspace's shared scaffold lock and
+    // returns a structured { ok, ... } body (never a throw). The `migration` MCP
+    // toolset that reaches these routes is granted to the SUPERVISOR lane only
+    // (mcp-config-builder.toolsetsForLane); every bundle op additionally requires
+    // a recorded migration approval for its snapshot. The write dialect
+    // (windows/wsl) is detected from the workspace root.
+    if (method === 'POST' && (
+      path === '/api/migration/publish-lessons-batch' ||
+      path === '/api/migration/replace-bundle' ||
+      path === '/api/migration/restore-bundle'
+    )) {
+      if (!identity.asserted || !identity.workspaceId) {
+        throw Object.assign(
+          new Error('workspace identity required (send X-Workspace-Id header)'),
+          { statusCode: 400 },
+        );
+      }
+      const workspace = getWorkspaceRecord(identity.workspaceId);
+      if (!workspace) {
+        throw Object.assign(new Error('workspace not found'), { statusCode: 404 });
+      }
+      const body = await readBody(req);
+      const input = body ? JSON.parse(body) : {};
+      const ws = identity.workspaceId;
+      const pathType = detectPathType(workspace.path);
+      const nowISO = new Date().toISOString();
+
+      if (path === '/api/migration/publish-lessons-batch') {
+        return publishLessonsBatch(
+          ws,
+          workspace.path,
+          pathType,
+          { batchId: input.batch_id, snapshotId: input.snapshot_id ?? null, lessons: input.lessons ?? [] },
+          nowISO,
+        );
+      }
+      if (path === '/api/migration/replace-bundle') {
+        return replaceMemoryBundle(
+          ws,
+          workspace.path,
+          pathType,
+          {
+            snapshotId: input.snapshot_id,
+            indexSource: input.index_source,
+            detailFiles: (input.detail_files ?? []).map((d: { rel_path: string; content: string }) => ({ relPath: d.rel_path, content: d.content })),
+            expectedPriorHash: input.expected_prior_hash,
+          },
+          { indexText: input.archive?.index_text ?? '', details: input.archive?.details ?? {} },
+          nowISO,
+        );
+      }
+      // /api/migration/restore-bundle
+      return restoreMemoryBundle(
+        ws,
+        workspace.path,
+        pathType,
+        { snapshotId: input.snapshot_id, expectedLiveHash: input.expected_live_hash },
+        { indexText: input.archive?.index_text ?? '', details: input.archive?.details ?? {} },
       );
     }
 

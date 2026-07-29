@@ -273,6 +273,146 @@ test('R4. removal already applied: a file the user later creates at the path is 
   }
 });
 
+// ── D15 `.bak` retention (WP-J) ──────────────────────────────────────
+//
+// When a fresh `.bak` is written for a target, existing `.bak` siblings are
+// SHA-256-classified against the target's known managed bodies (current bundled
+// content + every previousHashes value). CANONICAL copies (matching a known
+// body) are pruned to the newest SCAFFOLD_BAK_RETENTION=3; UNKNOWN copies
+// (possible user edits) are always preserved; if any `.bak` is unreadable the
+// classification is uncertain and NOTHING is pruned. These drive the write via
+// the user-modified upgrade path (unknown disk content → new `.bak` + prune).
+
+// A user-modified target: differs from V1 and V2, so writeScaffoldMap(v2Map)
+// takes the backup-then-overwrite branch and creates a fresh `.bak`.
+const USER_EDITED = V1_CONTENT + '// USER ADDED A LINE — retention fixture\n';
+
+function bakName(ts: string): string {
+  return `config.txt.bak.${ts}`;
+}
+/** Plant a `.bak` sibling of the target with a fixed timestamp + content. */
+function plantBak(workDir: string, ts: string, content: string): void {
+  fs.mkdirSync(fileDir(workDir), { recursive: true });
+  fs.writeFileSync(path.join(fileDir(workDir), bakName(ts)), content, 'utf-8');
+}
+function bakExists(workDir: string, ts: string): boolean {
+  return fs.existsSync(path.join(fileDir(workDir), bakName(ts)));
+}
+/** Seed the target with user-modified content so the write backs it up first. */
+function seedUserModifiedTarget(workDir: string): void {
+  fs.mkdirSync(fileDir(workDir), { recursive: true });
+  fs.writeFileSync(filePath(workDir), USER_EDITED, 'utf-8');
+}
+
+test('J1. canonical (previousHashes) copies pruned to newest 3; unknown preserved', () => {
+  const workDir = mktmp('sw-bak-canon');
+  try {
+    seedUserModifiedTarget(workDir);
+    // 5 canonical copies of the known v1 body (hash ∈ previousHashes).
+    for (const ts of ['20260101-000001-100', '20260101-000002-100', '20260101-000003-100',
+                       '20260101-000004-100', '20260101-000005-100']) {
+      plantBak(workDir, ts, V1_CONTENT);
+    }
+    // 1 unknown copy (no known body) — a possible user edit.
+    plantBak(workDir, '20260101-000009-100', 'a genuine unknown user backup body\n');
+
+    const changed = writeScaffoldMap(workDir, v2Map(), 'windows', { logPrefix: '[test]' });
+    assert.equal(changed, 1, 'the overwrite counts as a write');
+    assert.equal(fs.readFileSync(filePath(workDir), 'utf-8'), V2_CONTENT, 'target upgraded to v2');
+
+    // Two oldest canonical copies pruned; newest three kept.
+    assert.equal(bakExists(workDir, '20260101-000001-100'), false, 'oldest canonical pruned');
+    assert.equal(bakExists(workDir, '20260101-000002-100'), false, '2nd-oldest canonical pruned');
+    assert.equal(bakExists(workDir, '20260101-000003-100'), true, 'newest-3 canonical kept');
+    assert.equal(bakExists(workDir, '20260101-000004-100'), true, 'newest-3 canonical kept');
+    assert.equal(bakExists(workDir, '20260101-000005-100'), true, 'newest-3 canonical kept');
+    // Unknown copy is never pruned.
+    assert.equal(bakExists(workDir, '20260101-000009-100'), true, 'unknown copy preserved');
+    // 3 canonical + 1 unknown + 1 freshly written = 5.
+    assert.equal(listBackups(workDir).length, 5, `expected 5 backups; got ${listBackups(workDir).join(', ')}`);
+  } finally {
+    rmrf(workDir);
+  }
+});
+
+test('J2. all-unknown backups: nothing pruned even past the retention cap', () => {
+  const workDir = mktmp('sw-bak-unknown');
+  try {
+    seedUserModifiedTarget(workDir);
+    const stamps = ['20260101-000001-100', '20260101-000002-100', '20260101-000003-100',
+                    '20260101-000004-100', '20260101-000005-100'];
+    stamps.forEach((ts, i) => plantBak(workDir, ts, `unknown user backup body #${i}\n`));
+
+    writeScaffoldMap(workDir, v2Map(), 'windows', { logPrefix: '[test]' });
+
+    for (const ts of stamps) {
+      assert.equal(bakExists(workDir, ts), true, `unknown backup ${ts} must be preserved`);
+    }
+    // 5 unknown + 1 freshly written = 6, none pruned.
+    assert.equal(listBackups(workDir).length, 6, `expected 6 backups; got ${listBackups(workDir).join(', ')}`);
+  } finally {
+    rmrf(workDir);
+  }
+});
+
+test('J3. unreadable backup ⇒ uncertain ⇒ preserve ALL (no canonical pruned)', () => {
+  const workDir = mktmp('sw-bak-uncertain');
+  const origReadFileSync = fs.readFileSync;
+  try {
+    seedUserModifiedTarget(workDir);
+    const stamps = ['20260101-000001-100', '20260101-000002-100', '20260101-000003-100',
+                    '20260101-000004-100', '20260101-000005-100'];
+    for (const ts of stamps) plantBak(workDir, ts, V1_CONTENT); // all canonical
+
+    // Poison the read of exactly one canonical backup so classification is
+    // uncertain — the guard must then preserve every backup.
+    const poisoned = path.resolve(path.join(fileDir(workDir), bakName('20260101-000003-100')));
+    (fs as unknown as { readFileSync: typeof fs.readFileSync }).readFileSync = ((p: fs.PathOrFileDescriptor, ...rest: unknown[]) => {
+      if (typeof p === 'string' && path.resolve(p) === poisoned) {
+        const err = new Error('EACCES: injected read failure') as NodeJS.ErrnoException;
+        err.code = 'EACCES';
+        throw err;
+      }
+      return (origReadFileSync as (...a: unknown[]) => unknown)(p, ...rest);
+    }) as typeof fs.readFileSync;
+
+    writeScaffoldMap(workDir, v2Map(), 'windows', { logPrefix: '[test]' });
+
+    for (const ts of stamps) {
+      assert.equal(bakExists(workDir, ts), true, `backup ${ts} must survive an uncertain classification`);
+    }
+    // 5 canonical (untouched) + 1 freshly written = 6.
+    assert.equal(listBackups(workDir).length, 6, `expected 6 backups; got ${listBackups(workDir).join(', ')}`);
+  } finally {
+    (fs as unknown as { readFileSync: typeof fs.readFileSync }).readFileSync = origReadFileSync;
+    rmrf(workDir);
+  }
+});
+
+test('J4. canonical (current-content) copies are classified + pruned to newest 3', () => {
+  const workDir = mktmp('sw-bak-current');
+  try {
+    seedUserModifiedTarget(workDir);
+    // Copies of the CURRENT bundled body (hash = sha256(file.content)), not a
+    // previousHashes value — must still classify as canonical.
+    const stamps = ['20260101-000001-100', '20260101-000002-100', '20260101-000003-100',
+                    '20260101-000004-100', '20260101-000005-100'];
+    for (const ts of stamps) plantBak(workDir, ts, V2_CONTENT);
+
+    writeScaffoldMap(workDir, v2Map(), 'windows', { logPrefix: '[test]' });
+
+    assert.equal(bakExists(workDir, '20260101-000001-100'), false, 'oldest current-body copy pruned');
+    assert.equal(bakExists(workDir, '20260101-000002-100'), false, '2nd-oldest current-body copy pruned');
+    assert.equal(bakExists(workDir, '20260101-000003-100'), true, 'newest-3 kept');
+    assert.equal(bakExists(workDir, '20260101-000004-100'), true, 'newest-3 kept');
+    assert.equal(bakExists(workDir, '20260101-000005-100'), true, 'newest-3 kept');
+    // 3 canonical + 1 freshly written = 4.
+    assert.equal(listBackups(workDir).length, 4, `expected 4 backups; got ${listBackups(workDir).join(', ')}`);
+  } finally {
+    rmrf(workDir);
+  }
+});
+
 // ── Runner ───────────────────────────────────────────────────────────
 (async () => {
   let passed = 0;
