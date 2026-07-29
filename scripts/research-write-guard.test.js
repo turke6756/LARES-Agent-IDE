@@ -4,10 +4,14 @@
 // it with fake Claude PreToolUse stdin payloads, asserting the block/allow
 // outcome AND the block shape.
 //
-// Block shape (per §5 Q7) is PENDING empirical verification against the installed
-// Claude Code build. The guard emits BOTH mechanisms, so this harness asserts
-// BOTH: a permissionDecision:"deny" JSON on stdout AND exit code 2 with the
-// reason on stderr. Whichever the real build honors, the guard blocks.
+// Block shape is now empirically verified: the guard emits
+// {hookSpecificOutput:{permissionDecision:"deny",…}} on stdout, the reason on
+// stderr, and exits 2. Exit 2 is load-bearing: Claude 2.1.220 does NOT honor an
+// exit-0 hookSpecificOutput deny (verified — the write still lands), so only
+// exit 2 blocks it. This researcher lane is Claude-only, so exit 2 is correct.
+// (A hypothetical Codex researcher would instead need exit 0 — Codex fails OPEN
+// on any nonzero exit — which is why the shared git-discard guard keys its exit
+// off isCodexPayload.)
 //
 // Run via: node scripts/research-write-guard.test.js  (after npm run build:main)
 
@@ -65,9 +69,11 @@ function artifact(over) {
   return lines.join('\n');
 }
 
-/** A block must surface the reason via BOTH channels the guard emits. */
+/** A block surfaces the reason via the deny JSON on stdout AND stderr, exit 2
+ *  (Claude-only lane; Claude 2.1.220 does not honor an exit-0 hookSpecificOutput
+ *  deny, so only exit 2 blocks the write). */
 function assertBlocked(res, reasonRe) {
-  assert.equal(res.status, 2, `expected exit 2 (block); got ${res.status}. stderr: ${res.stderr}`);
+  assert.equal(res.status, 2, `expected exit 2 (block via exit 2 + hookSpecificOutput); got ${res.status}. stderr: ${res.stderr}`);
   assert.match(res.stderr, reasonRe, `stderr must carry the reason; got: ${res.stderr}`);
   let parsed;
   try { parsed = JSON.parse(res.stdout); } catch {

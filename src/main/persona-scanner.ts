@@ -9,6 +9,7 @@ import {
 } from './scaffold-writer';
 import {
   WORKER_CLAUDE_SETTINGS_JSON, WORKER_CLAUDE_SETTINGS_JSON_V5, WORKER_CLAUDE_SETTINGS_JSON_V6,
+  WORKER_CLAUDE_SETTINGS_JSON_V7,
   SUPERVISOR_PERSONA_CLAUDE_SETTINGS_JSON, SUPERVISOR_PERSONA_CLAUDE_SETTINGS_JSON_V1,
   PERSONA_CREATE_PERSONA_SKILL, PERSONA_CREATE_PERSONA_SKILL_V1,
   PERSONA_READ_COMMENTS_SKILL, PERSONA_READ_COMMENTS_SKILL_V2, PERSONA_READ_COMMENTS_SKILL_V3, PERSONA_AGENT_MD_TEMPLATE,
@@ -126,15 +127,19 @@ function buildPersonaManagedFiles(name: string, lane?: PersonaLane): Record<stri
     ? SUPERVISOR_PERSONA_CLAUDE_SETTINGS_JSON
     : WORKER_CLAUDE_SETTINGS_JSON;
   // v2 → v3 adds the statusLine → dashboard-statusline.mjs usage-capture block.
-  // previousHashes[2] is lane-specific because the v2 body differed by lane:
-  // a supervisor-lane persona carried SUPERVISOR_PERSONA_CLAUDE_SETTINGS_JSON_V1,
-  // a worker-lane persona carried WORKER_CLAUDE_SETTINGS_JSON_V6. previousHashes[1]
-  // stays the pre-Notification worker hash for both (unchanged from v2).
+  // v3 → v4: the worker-lane body inherits the PreToolUse(Bash) → guard-git-discard.mjs
+  // hook (WORKER_CLAUDE_SETTINGS_JSON gained it at its v8), so a worker-lane
+  // persona at sidecar v3 carries the guard-less v3 body (WORKER_CLAUDE_SETTINGS_JSON_V7)
+  // and must upgrade silently. The supervisor-lane body is unchanged across v3→v4
+  // (its previousHashes[3] anchor equals the current content), so a supervisor-lane
+  // persona upgrades via the sidecar-drift branch.
+  // previousHashes[2]/[3] are lane-specific because those bodies differ by lane;
+  // previousHashes[1] stays the pre-Notification worker hash for both.
   const settingsPrevHashes: Record<number, string> = lane === 'supervisor'
-    ? { 1: sha256Hex(WORKER_CLAUDE_SETTINGS_JSON_V5), 2: sha256Hex(SUPERVISOR_PERSONA_CLAUDE_SETTINGS_JSON_V1) }
-    : { 1: sha256Hex(WORKER_CLAUDE_SETTINGS_JSON_V5), 2: sha256Hex(WORKER_CLAUDE_SETTINGS_JSON_V6) };
+    ? { 1: sha256Hex(WORKER_CLAUDE_SETTINGS_JSON_V5), 2: sha256Hex(SUPERVISOR_PERSONA_CLAUDE_SETTINGS_JSON_V1), 3: sha256Hex(SUPERVISOR_PERSONA_CLAUDE_SETTINGS_JSON) }
+    : { 1: sha256Hex(WORKER_CLAUDE_SETTINGS_JSON_V5), 2: sha256Hex(WORKER_CLAUDE_SETTINGS_JSON_V6), 3: sha256Hex(WORKER_CLAUDE_SETTINGS_JSON_V7) };
   return {
-    [`${base}/.claude/settings.json`]:                  { content: settingsContent, version: 3, previousHashes: settingsPrevHashes },
+    [`${base}/.claude/settings.json`]:                  { content: settingsContent, version: 4, previousHashes: settingsPrevHashes },
     // v3 (`.lares` rename): previousHashes[2] is the LAST v2-era bundled body
     // (the post-QW2 skill). A persona kit scaffolded between the QW2 bump and
     // that content change also sits at sidecar version 2 but with the older

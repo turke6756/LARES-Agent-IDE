@@ -192,6 +192,9 @@ const CODEX_HOOK_EVENT_IDS: Record<string, string> = {
   Stop: 'stop',
   UserPromptSubmit: 'user_prompt_submit',
   SessionStart: 'session_start',
+  // PreToolUse rides the profile too (the git-discard guard); Codex's lower-snake
+  // event id is `pre_tool_use` (HOOK_SYSTEM_DESIGN.md §8.5 convention).
+  PreToolUse: 'pre_tool_use',
 };
 
 interface CodexProfileHook { event: string; command: string }
@@ -257,6 +260,33 @@ export function buildCodexHooksStateSection(configAbsPath: string, hooks: CodexP
     out += `trusted_hash = "${hash}"\n`;
   }
   return out;
+}
+
+/** Build the `bash -lc` command the WSL profile writer runs, base64-decoding
+ *  each artifact into CODEX_HOME. BOTH hook scripts (dashboard-status.mjs AND
+ *  guard-git-discard.mjs) are always written — they carry no trust hash, so a
+ *  content bump must propagate even on the trust-intact fast path. When
+ *  `b64Profile` is supplied (the re-seed branch) the profile file is written
+ *  too; on the trust-intact branch it is omitted so the seeded `[hooks.state]`
+ *  is left untouched. Pure + exported so both branches are unit-testable without
+ *  spawning wsl.exe. */
+export function buildCodexWslProfileWriteCmd(args: {
+  codexHome: string;
+  scriptPosix: string;
+  guardPosix: string;
+  profilePath: string;
+  b64Script: string;
+  b64Guard: string;
+  b64Profile?: string;
+}): string {
+  const { codexHome, scriptPosix, guardPosix, profilePath, b64Script, b64Guard, b64Profile } = args;
+  let cmd = `mkdir -p "${codexHome}" `
+    + `&& printf %s '${b64Script}' | base64 -d > "${scriptPosix}" `
+    + `&& printf %s '${b64Guard}' | base64 -d > "${guardPosix}"`;
+  if (b64Profile !== undefined) {
+    cmd += ` && printf %s '${b64Profile}' | base64 -d > "${profilePath}"`;
+  }
+  return cmd;
 }
 
 /** A profile + seeded-trust write can be skipped iff the on-disk file already
@@ -795,6 +825,61 @@ export const RESEARCHER_AGENT_MD_V5_HASH = '90e26bca4b533513c0c59e0fffb7fad431dd
  *  marker). v3 accepts BOTH markers (rename-failed fallback sessions still
  *  write under `.dashboard/`). Used in the v3 file's previousHashes. */
 export const RESEARCH_WRITE_GUARD_MJS_V2_HASH = 'a179be1c232f4515e83db70063b7c3eee41306fe8d35e09e88bd92e8c6a4d98f';
+
+/** SHA-256 hex of the v3 research-write-guard.mjs — the body that emitted the
+ *  PreToolUse deny via {hookSpecificOutput:{permissionDecision:"deny"}} on stdout
+ *  BUT exited 2 (belt-and-braces). v4 keeps the identical deny JSON and switches
+ *  to `process.exit(0)`: verified against Claude 2.1.220 (honors the
+ *  hookSpecificOutput object at exit 0) and safe should a Codex researcher ever be
+ *  wired here (Codex fails OPEN on a nonzero exit) — see RESEARCH_WRITE_GUARD_MJS
+ *  and GUARD_GIT_DISCARD_MJS. Used in the v4 file's previousHashes for silent
+ *  v3→v4 upgrade of pristine workspaces. FROZEN literal — the live constant now
+ *  holds the v4 body, so this can no longer be re-derived from it. Value hashed
+ *  from git HEAD's RESEARCH_WRITE_GUARD_MJS String.raw body (byte-identical to the
+ *  deployed v3 copy at .lares/researcher/scripts/research-write-guard.mjs). */
+export const RESEARCH_WRITE_GUARD_MJS_V3_HASH = '828fe6833a8cffd37731f3aa1c7af68c4f6b781d81dcb1d07b872f3e579fcb49';
+
+/** SHA-256 hex of the v4 research-write-guard.mjs — the body that emitted the
+ *  hookSpecificOutput deny on stdout BUT exited 0. That exit-0 left the deny
+ *  UNENFORCING on the Claude-only researcher lane: Claude 2.1.220 does not honor
+ *  an exit-0 hookSpecificOutput deny (verified — the write still lands). v5 keeps
+ *  the identical deny JSON and switches back to `process.exit(2)`, which Claude
+ *  does honor — see RESEARCH_WRITE_GUARD_MJS. Used in the v5 file's previousHashes
+ *  for silent v4→v5 upgrade of pristine workspaces. FROZEN literal — the live
+ *  constant now holds the v5 body, so this can no longer be re-derived from it.
+ *  Value hashed from the frozen v4 body captured verbatim in
+ *  guard-script-old-body-fixtures.ts (RESEARCH_WRITE_GUARD_MJS_V4; LF, 6778
+ *  bytes), NOT from the live constant. */
+export const RESEARCH_WRITE_GUARD_MJS_V4_HASH = 'ee18176d996fa25e8e06c445b8f7d338be14804d45d649e953f569f36810c972';
+
+/** SHA-256 hex of the v1 `.lares/scripts/guard-git-discard.mjs` — the pre-
+ *  per-provider body that emitted a single deny shape for every caller. v2
+ *  discriminates the calling harness from the stdin payload (isCodexPayload) and
+ *  emits the deny PER-PROVIDER: EVERY caller gets the hookSpecificOutput deny
+ *  object at exit 0, and NON-Codex callers additionally get a top-level
+ *  {decision:"deny"} + the reason on stderr (Codex fails OPEN on that extra key,
+ *  so it gets the bare object only) — see GUARD_GIT_DISCARD_MJS. Used in the v2
+ *  file's previousHashes for silent v1→v2 upgrade of pristine workspaces. FROZEN
+ *  literal: GUARD_GIT_DISCARD_MJS was introduced and then rewritten entirely
+ *  within uncommitted work, so the v1 body exists in NO git commit — the value is
+ *  hashed from the deployed pristine v1 copy at .lares/scripts/guard-git-discard.mjs
+ *  (LF, 9660 bytes; a fresh v1 write produces byte-identical content). */
+export const GUARD_GIT_DISCARD_MJS_V1_HASH = '58812d363f4119c684c236652279ce7fe47b865d8a1d16329385cc5cb2af907b';
+
+/** SHA-256 hex of the v2 `.lares/scripts/guard-git-discard.mjs` — the per-provider
+ *  body that emitted the deny PER-PROVIDER but exited 0 for EVERY caller. That
+ *  exit-0 left the deny UNENFORCING on the Claude lane: Claude 2.1.220 does not
+ *  honor an exit-0 hookSpecificOutput deny for Bash (verified — the command still
+ *  runs); only exit 2 blocks it. v3 keeps the identical per-provider deny JSON and
+ *  switches the exit to PER-PROVIDER — `process.exit(codex ? 0 : 2)` — so Claude
+ *  gets the blocking exit 2 while Codex keeps exit 0 (Codex fails OPEN on any
+ *  nonzero exit); see GUARD_GIT_DISCARD_MJS. Used in the v3 file's previousHashes
+ *  for silent v2→v3 upgrade of pristine workspaces. FROZEN literal — the live
+ *  constant now holds the v3 body, so this can no longer be re-derived from it.
+ *  Value hashed from the frozen v2 body captured verbatim in
+ *  guard-script-old-body-fixtures.ts (GUARD_GIT_DISCARD_MJS_V2; LF, 11143 bytes,
+ *  byte-identical to the deployed v2 copy), NOT from the live constant. */
+export const GUARD_GIT_DISCARD_MJS_V2_HASH = 'e40b761d4997b2f9d0c8a3becd87e35dce7d0a944394e5296920513b890a14b0';
 
 // PERSONA_CREATE_PERSONA_SKILL_V3_HASH lives in shared/constants.ts (imported
 // above) so persona-scanner can use it without an import cycle through here.
@@ -2691,7 +2776,7 @@ export class AgentSupervisor extends EventEmitter {
   private static RESEARCHER_FILES: Record<string, ScaffoldFile> = {
     [`.lares/researcher/CLAUDE.md`]:                         { content: RESEARCHER_AGENT_MD, version: 6, previousHashes: { 1: RESEARCHER_AGENT_MD_V1_HASH, 2: RESEARCHER_AGENT_MD_V2_HASH, 3: RESEARCHER_AGENT_MD_V3_HASH, 4: RESEARCHER_AGENT_MD_V4_HASH, 5: RESEARCHER_AGENT_MD_V5_HASH } }, // v6: `.lares` rename
     [`.lares/researcher/.claude/settings.json`]:             { content: RESEARCHER_CLAUDE_SETTINGS_JSON, version: 2, previousHashes: { 1: sha256Hex(RESEARCHER_CLAUDE_SETTINGS_JSON_V1) } },
-    [`.lares/researcher/scripts/research-write-guard.mjs`]:  { content: RESEARCH_WRITE_GUARD_MJS, version: 3, previousHashes: { 1: RESEARCH_WRITE_GUARD_MJS_V1_HASH, 2: RESEARCH_WRITE_GUARD_MJS_V2_HASH }, executable: true }, // v3: accepts both `.lares`/`.dashboard` research markers
+    [`.lares/researcher/scripts/research-write-guard.mjs`]:  { content: RESEARCH_WRITE_GUARD_MJS, version: 5, previousHashes: { 1: RESEARCH_WRITE_GUARD_MJS_V1_HASH, 2: RESEARCH_WRITE_GUARD_MJS_V2_HASH, 3: RESEARCH_WRITE_GUARD_MJS_V3_HASH, 4: RESEARCH_WRITE_GUARD_MJS_V4_HASH }, executable: true }, // v5: deny exits 2 again (Claude-only lane; Claude 2.1.220 does not honor an exit-0 hookSpecificOutput deny, so v4's exit 0 left it UNENFORCING). v4 exited 0; v3 accepts both `.lares`/`.dashboard` research markers
     // Persona kit (§1.4) — default skills for the researcher lane.
     [`.lares/researcher/.claude/skills/create-persona/SKILL.md`]: { content: PERSONA_CREATE_PERSONA_SKILL, version: 4, previousHashes: { 1: sha256Hex(PERSONA_CREATE_PERSONA_SKILL_V1), 2: PERSONA_CREATE_PERSONA_SKILL_V2_HASH, 3: PERSONA_CREATE_PERSONA_SKILL_V3_HASH } }, // v4: `.lares` rename
     [`.lares/researcher/.claude/skills/read-comments/SKILL.md`]:  { content: PERSONA_READ_COMMENTS_SKILL, version: 5, previousHashes: { 1: sha256Hex(PERSONA_READ_COMMENTS_SKILL_V1), 2: sha256Hex(PERSONA_READ_COMMENTS_SKILL_V2), 3: sha256Hex(PERSONA_READ_COMMENTS_SKILL_V3), 4: sha256Hex(PERSONA_READ_COMMENTS_SKILL_V4) } }, // v5: Python fallback removed (honest on a Python-free clean VM)
@@ -2781,10 +2866,11 @@ export class AgentSupervisor extends EventEmitter {
         /\$\{WORKSPACE_ROOT\}/g,
         posixWorkspaceRoot,
       );
-      // v1/v2/v3 content with the same materialized workspace root, so an old
+      // v1/v2/v3/v4 content with the same materialized workspace root, so an old
       // workspace's on-disk file hashes match and upgrade silently. v1 = Stop
-      // only; v2 = Stop + UserPromptSubmit; v3 adds SessionStart; v4 (current)
-      // renames the hook script path `.dashboard/` → `.lares/`.
+      // only; v2 = Stop + UserPromptSubmit; v3 adds SessionStart; v4 renames the
+      // hook script path `.dashboard/` → `.lares/`; v5 (current) adds the
+      // PreToolUse → guard-git-discard.mjs block.
       const codexConfigV1 = WORKER_CODEX_CONFIG_TOML_V1.replace(
         /\$\{WORKSPACE_ROOT\}/g,
         posixWorkspaceRoot,
@@ -2963,9 +3049,17 @@ export class AgentSupervisor extends EventEmitter {
         fs.mkdirSync(codexHome, { recursive: true });
         const scriptPath = path.join(codexHome, 'dashboard-status.mjs');
         fs.writeFileSync(scriptPath, DASHBOARD_STATUS_SCRIPT_MJS);
+        // The git-discard guard rides the SAME profile (its only live delivery
+        // path for Codex — the worker-cwd config.toml is never loaded). Written
+        // into CODEX_HOME alongside dashboard-status.mjs; carries no trust hash,
+        // so a content bump propagates on every launch just like the status script.
+        const guardPath = path.join(codexHome, 'guard-git-discard.mjs');
+        fs.writeFileSync(guardPath, GUARD_GIT_DISCARD_MJS);
         // Command path uses forward slashes (matches the profile + the hashed
         // command); the config-file key path Codex stores uses native backslashes.
-        const profileBody = CODEX_WORKER_PROFILE_TOML.replace(/__SCRIPT__/g, scriptPath.replace(/\\/g, '/'));
+        const profileBody = CODEX_WORKER_PROFILE_TOML
+          .replace(/__SCRIPT__/g, scriptPath.replace(/\\/g, '/'))
+          .replace(/__GUARD__/g, guardPath.replace(/\\/g, '/'));
         const profilePath = path.join(codexHome, profileFile);
         const hooks = parseCodexProfileHooks(profileBody);
         const existing = fs.existsSync(profilePath) ? fs.readFileSync(profilePath, 'utf-8') : null;
@@ -2992,30 +3086,35 @@ export class AgentSupervisor extends EventEmitter {
         const codexHome = (di >= 0 ? probe.slice(0, di) : probe).trim() || '$HOME/.codex';
         const existing = di >= 0 ? probe.slice(di + DELIM.length) : '';
         const scriptPosix = `${codexHome}/dashboard-status.mjs`;
+        const guardPosix = `${codexHome}/guard-git-discard.mjs`;
         const profilePath = `${codexHome}/${profileFile}`;
-        const profileBody = CODEX_WORKER_PROFILE_TOML.replace(/__SCRIPT__/g, scriptPosix);
+        const profileBody = CODEX_WORKER_PROFILE_TOML
+          .replace(/__SCRIPT__/g, scriptPosix)
+          .replace(/__GUARD__/g, guardPosix);
         const hooks = parseCodexProfileHooks(profileBody);
+        // BOTH scripts carry no trust hash, so they must be (re)written on every
+        // launch — the trust-intact fast path still propagates a content bump.
+        const b64Script = Buffer.from(DASHBOARD_STATUS_SCRIPT_MJS, 'utf-8').toString('base64');
+        const b64Guard = Buffer.from(GUARD_GIT_DISCARD_MJS, 'utf-8').toString('base64');
         if (codexProfileTrustIntact(existing || null, profileBody, hooks)) {
-          // Profile already current + trusted: only (re)write the script, which
-          // carries no trust hash, so a content bump still propagates.
-          const b64Script = Buffer.from(DASHBOARD_STATUS_SCRIPT_MJS, 'utf-8').toString('base64');
+          // Profile already current + trusted: only (re)write the scripts, which
+          // carry no trust hash, so a content bump still propagates.
           execFileSync(
             'wsl.exe',
-            ['bash', '-lc',
-              `mkdir -p "${codexHome}" && printf %s '${b64Script}' | base64 -d > "${scriptPosix}"`],
+            ['bash', '-lc', buildCodexWslProfileWriteCmd({
+              codexHome, scriptPosix, guardPosix, profilePath, b64Script, b64Guard,
+            })],
             { timeout: 8000 },
           );
           console.log(`[supervisor] Codex hook profile trust intact, left untouched: ${profilePath} (wsl)`);
         } else {
           const full = profileBody + buildCodexHooksStateSection(profilePath, hooks);
-          const b64Script = Buffer.from(DASHBOARD_STATUS_SCRIPT_MJS, 'utf-8').toString('base64');
           const b64Profile = Buffer.from(full, 'utf-8').toString('base64');
           execFileSync(
             'wsl.exe',
-            ['bash', '-lc',
-              `mkdir -p "${codexHome}" `
-              + `&& printf %s '${b64Script}' | base64 -d > "${scriptPosix}" `
-              + `&& printf %s '${b64Profile}' | base64 -d > "${profilePath}"`],
+            ['bash', '-lc', buildCodexWslProfileWriteCmd({
+              codexHome, scriptPosix, guardPosix, profilePath, b64Script, b64Guard, b64Profile,
+            })],
             { timeout: 8000 },
           );
           console.log(`[supervisor] Codex hook profile written + trust seeded: ${profilePath} (wsl, ${hooks.length} hooks)`);

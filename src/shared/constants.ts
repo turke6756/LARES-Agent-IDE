@@ -1002,6 +1002,29 @@ the \`Workspace root:\` line in your initial system prompt. **Use absolute
 paths for Read / Edit / Glob / Bash.** Relative paths from your cwd will not
 find workspace files.
 
+## Never use git to discard uncommitted work
+
+**Do not run** \`git checkout -- <file>\`, \`git restore\`, \`git clean\`, or
+\`git stash\` — in this workspace or any other. No exceptions, including "I'll
+stash it and pop it right back."
+
+**Why.** Many agents share one working tree, and a single file routinely holds
+hours of uncommitted work from several lanes at once — yours, another worker's,
+and sometimes the human's. These commands operate on the *whole file*, not on
+your edit, and they discard work that was never committed. There is no undo:
+uncommitted content is not in git's object store, so nothing can recover it.
+The blast radius has nothing to do with how small your own change was.
+
+**What to do instead.** To undo a change you made, **edit the text back
+literally with the \`Edit\` tool** — the same edit you used to make it, in
+reverse; **not** by rewriting the file through a shell pipeline or redirect
+(\`>\`, \`sed -i\`, \`tee\`), which silently converts line endings — a real
+CRLF→LF incident left the content correct but every line byte-different. This
+applies in particular to mutation testing (break a line, prove a test fails,
+restore it): restore by re-editing the line, never by discarding the file. If
+you cannot reconstruct the original text, say so at turn end and let the
+supervisor resolve it; a stuck turn is cheap, destroyed work is not.
+
 ## Memory: shared behavioral notes only
 
 Your cwd (\`.lares/workers/claude/\`) is shared by **every** Claude worker, so
@@ -1452,6 +1475,56 @@ export const WORKER_CLAUDE_SETTINGS_JSON_V2 = `{
  *  by the supervisor on isSupervised launches in src/main/supervisor/index.ts),
  *  so the single workspace-shared script serves Claude and Codex unchanged. */
 export const WORKER_CODEX_CONFIG_TOML = `# Class IV worker hook config — see plans/class-iv-worker-hook-scaffold.md §12.
+#
+# ⚠ INERT FOR HOOKS. Codex NEVER loads this worker-cwd .codex/config.toml — the
+# worker directory is not a trusted Codex project, so none of the [[hooks.*]]
+# blocks below fire (including the PreToolUse git-discard guard). The REAL hook
+# delivery for Codex workers rides a --profile file in CODEX_HOME
+# (CODEX_WORKER_PROFILE_TOML, written by ensureCodexHookProfile). This file is
+# retained only as documentation of the intended hook shape; do NOT assume it
+# protects a Codex worker or flips its status. \${WORKSPACE_ROOT} is materialized
+# at scaffold-write time — Codex has no \${CLAUDE_PROJECT_DIR} analog.
+
+[[hooks.Stop]]
+
+[[hooks.Stop.hooks]]
+type = "command"
+command = 'node "\${WORKSPACE_ROOT}/.lares/scripts/dashboard-status.mjs"'
+timeout = 30
+
+[[hooks.UserPromptSubmit]]
+
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command = 'node "\${WORKSPACE_ROOT}/.lares/scripts/dashboard-status.mjs" working'
+timeout = 30
+
+[[hooks.SessionStart]]
+
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = 'node "\${WORKSPACE_ROOT}/.lares/scripts/dashboard-status.mjs" session-start'
+timeout = 30
+
+# INERT (see header): Codex does not load this file, so this guard never fires
+# here. The live guard rides CODEX_WORKER_PROFILE_TOML's [[hooks.PreToolUse]] in
+# CODEX_HOME. Kept for shape parity with the Claude scaffold only.
+[[hooks.PreToolUse]]
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = 'node "\${WORKSPACE_ROOT}/.lares/scripts/guard-git-discard.mjs"'
+timeout = 30
+`;
+
+/** Pre-guard Codex worker config (v4) — the Stop / UserPromptSubmit / SessionStart
+ *  block WITHOUT the PreToolUse git-discard guard, kept verbatim so a v4
+ *  workspace's materialized config.toml can be hashed and silently upgraded to
+ *  v5 (which adds the guard-git-discard.mjs PreToolUse hook). The
+ *  \${WORKSPACE_ROOT} substitution + hashing happen at scaffold-write time,
+ *  exactly like v1/v2/v3. Byte-identical to the prior live WORKER_CODEX_CONFIG_TOML
+ *  v4 body. */
+export const WORKER_CODEX_CONFIG_TOML_V4 = `# Class IV worker hook config — see plans/class-iv-worker-hook-scaffold.md §12.
 # Codex Stop hook fires when an agent turn completes. Our hook script reads
 # AGENT_ID + DASHBOARD_PORT from env (injected at supervised-worker launch)
 # and POSTs idle to the dashboard. \${WORKSPACE_ROOT} is materialized at
@@ -1479,13 +1552,314 @@ command = 'node "\${WORKSPACE_ROOT}/.lares/scripts/dashboard-status.mjs" session
 timeout = 30
 `;
 
+/** Shared PreToolUse guard — written to
+ *  <workspace>/.lares/scripts/guard-git-discard.mjs on any supervised worker
+ *  launch (registered in WORKSPACE_SCRIPT_FILES alongside dashboard-status.mjs)
+ *  and wired into BOTH provider hook surfaces. For Claude it is the
+ *  settings.json PreToolUse(Bash) hook. For Codex it rides the CODEX_HOME
+ *  `--profile dashboard-worker` file (CODEX_WORKER_PROFILE_TOML's
+ *  [[hooks.PreToolUse]]) — NOT the worker-cwd .codex/config.toml, which Codex
+ *  never loads (untrusted project); a copy of this script is written into
+ *  CODEX_HOME by ensureCodexHookProfile. One script serves every provider, but
+ *  the deny OUTPUT is emitted PER-PROVIDER, because Codex validates hook output
+ *  strictly (all points below verified against Codex 0.145.0 / Claude 2.1.220):
+ *    • EVERY caller gets {hookSpecificOutput:{hookEventName:"PreToolUse",
+ *      permissionDecision:"deny",…}} on stdout — the ONLY shape Codex accepts as
+ *      a block (verified: Codex logs "PreToolUse Blocked", command does not run,
+ *      content survives). Claude 2.1.220 does NOT block on this object alone at
+ *      exit 0 for Bash (verified: the command still runs) — it needs exit 2, so
+ *      the exit code (below) is what actually enforces the deny on the Claude lane.
+ *    • NON-Codex callers ADDITIONALLY get a top-level {decision:"deny"} key and
+ *      the reason on stderr. Grok Build reads .claude/settings.json natively and
+ *      its documented deny shape is that top-level key ("block" is undocumented
+ *      there); Claude tolerates the extra key. Codex gets NEITHER — its emission
+ *      is byte-exactly the verified block shape (stdout JSON only, exit 0).
+ *    • The exit code is PER-PROVIDER — this is the load-bearing fix. Codex gets
+ *      exit 0: it classifies ANY nonzero exit — AND any unknown top-level key
+ *      such as {decision} — as hook FAILURE and then fails OPEN (logs "PreToolUse
+ *      Failed" and runs the command anyway), so its output must be the bare
+ *      object at exit 0. Claude/non-Codex get exit 2: Claude does NOT honor an
+ *      exit-0 hookSpecificOutput deny (an earlier "exit 0 for everyone" body left
+ *      the Claude lane silently UNENFORCING), so only exit 2 blocks it there.
+ *  The caller is discriminated from the stdin payload: Codex PreToolUse payloads
+ *  carry a top-level `turn_id` (and `model`); Claude's carry `prompt_id`/`effort`
+ *  and never `turn_id`. See isCodexPayload.
+ *
+ *  It DENIES any git invocation that discards uncommitted work (checkout of a
+ *  pathspec, restore, clean, stash, reset --hard/--merge/--keep) in the SHARED
+ *  working tree — the exact failure that destroyed a whole file of another lane's
+ *  uncommitted work. It does NOT deny non-destructive git (status/diff/log/add/
+ *  commit/branch switching/stash list). There is deliberately NO bypass env var:
+ *  the escape hatch is escalation to the supervisor.
+ *
+ *  Dependency-free Node ESM. Fails OPEN — on an unrecognized payload or ANY
+ *  thrown error it exits 0 (allow) so it can never wedge a turn. The pure
+ *  predicate (analyzeGitDiscard / extractCandidateCommand) is exported so it can
+ *  be unit-tested without spawning a process. Authored with String.raw so the
+ *  regex backslashes survive verbatim; the literal backtick in the segment-split
+ *  character class is written as \x60 so it does not terminate the template. */
+export const GUARD_GIT_DISCARD_MJS = String.raw`#!/usr/bin/env node
+// Shared PreToolUse git-discard guard — see WORKER_CLAUDE_SETTINGS_JSON /
+// WORKER_CODEX_CONFIG_TOML. Blocks git commands that discard uncommitted work in
+// this workspace's SHARED working tree. Dependency-free; fails OPEN on error.
+import fs from 'node:fs';
+import { pathToFileURL } from 'node:url';
+import { spawnSync } from 'node:child_process';
+
+const MAX_STDIN_BYTES = 5 * 1024 * 1024;
+
+export const DENY_REASON =
+  'Blocked: this git command discards uncommitted work. This working tree is ' +
+  'SHARED by many agents and routinely holds hours of uncommitted work from ' +
+  'several lanes at once; the command operates on the WHOLE file, not just your ' +
+  'edit, and the loss is unrecoverable (uncommitted content is never in git\'s ' +
+  'object store). To undo your OWN change, edit the text back literally with ' +
+  'Edit — the same edit in reverse; for a mutation test, re-edit the line back. ' +
+  'To switch branches use "git switch <branch>". If you cannot reconstruct the ' +
+  'original text, end your turn and tell your supervisor.';
+
+// git global options that CONSUME the following token as their value (so the
+// verb is found after skipping both). The '=' forms are single tokens and are
+// skipped by the generic leading-dash rule below.
+const VALUE_OPTS = new Set(['-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path']);
+
+// Pull every plausible command string out of a provider hook payload (Claude and
+// Codex differ) and join them, so a git verb hiding in any known argv location is
+// scanned. Returns null when nothing command-shaped is present → caller allows.
+export function extractCandidateCommand(payload) {
+  if (!payload || typeof payload !== 'object') return null;
+  const ti =
+    (payload.tool_input && typeof payload.tool_input === 'object') ? payload.tool_input :
+    (payload.toolInput && typeof payload.toolInput === 'object') ? payload.toolInput :
+    (payload.input && typeof payload.input === 'object') ? payload.input : {};
+  const buckets = [];
+  const push = (v) => {
+    if (typeof v === 'string') buckets.push(v);
+    else if (Array.isArray(v)) { for (const el of v) if (typeof el === 'string') buckets.push(el); }
+  };
+  push(ti.command); push(ti.cmd); push(ti.args); push(ti.argv);
+  push(ti.script); push(ti.shell_command); push(ti.shellCommand);
+  push(payload.command); push(payload.cmd);
+  const joined = buckets.join(' ').trim();
+  return joined.length ? joined : null;
+}
+
+// Discriminate the calling harness from the stdin payload so the deny OUTPUT can
+// be emitted per-provider. Codex PreToolUse payloads carry a per-turn turn_id
+// (and a "model" string); Claude's carry prompt_id/effort and NEVER a turn_id.
+// Verified empirically against Codex 0.145.0 and Claude 2.1.220. The stdin field
+// is the reliable signal — CLAUDE_*/CODEX_* env vars leak across nested launches
+// (a Codex worker spawned inside a Claude session inherits both), so env is NOT
+// used. Fails safe: unknown payload -> NOT Codex -> the belt-and-braces output
+// that Claude and Grok honor (only Codex chokes on it).
+export function isCodexPayload(payload) {
+  if (!payload || typeof payload !== 'object') return false;
+  return typeof payload.turn_id === 'string' && payload.turn_id.length > 0;
+}
+
+function stripEnvAssignments(segment) {
+  let s = segment.trim();
+  for (;;) {
+    const m = s.match(/^([A-Za-z_][A-Za-z0-9_]*=[^\s]*|env)\s+/);
+    if (!m) break;
+    s = s.slice(m[0].length);
+  }
+  return s;
+}
+
+function tokenize(s) {
+  return s.split(/\s+/).filter(Boolean).map((t) => t.replace(/^['"]+|['"]+$/g, ''));
+}
+
+function isGitProgram(tok) {
+  if (!tok) return false;
+  const base = tok.split(/[\\/]/).pop();
+  return base === 'git' || base === 'git.exe';
+}
+
+// Resolve a bare checkout arg to a commit via a short-lived "git rev-parse".
+// Returns true iff <arg>^{commit} resolves (a real branch / tag / commit → a
+// safe branch switch), false if it does not (→ a pathspec checkout of a file).
+// THROWS on spawn error, timeout, or missing git so the caller can fail OPEN.
+// Injectable seam: analyzeGitDiscard threads a resolver through so tests can
+// exercise resolve / no-resolve / throw without touching a real repo.
+function defaultResolveRef(arg, cDir) {
+  const gitArgs = [];
+  if (cDir) gitArgs.push('-C', cDir);
+  gitArgs.push('rev-parse', '--verify', '--quiet', arg + '^{commit}');
+  const res = spawnSync('git', gitArgs, { timeout: 2000, encoding: 'utf-8' });
+  if (res.error) throw res.error;            // ENOENT (no git) / ETIMEDOUT
+  if (res.signal) throw new Error('git rev-parse killed: ' + res.signal);
+  return res.status === 0;                    // 0 → resolved; non-0 → no such ref
+}
+
+function decideCheckout(rest, resolveRef, cDir) {
+  // Branch creation (-b/-B) never discards the worktree → allow.
+  if (rest.some((t) => t === '-b' || t === '-B')) return false;
+  // Explicit pathspec separator ("git checkout [ref] -- <paths>") discards those
+  // paths → deny, unconditionally.
+  if (rest.includes('--')) return true;
+  const positional = rest.filter((t) => t && t[0] !== '-');
+  // "git checkout ." overwrites the whole worktree → deny, unconditionally.
+  if (positional.some((t) => t === '.')) return true;
+  // Bare "git checkout" (no target) is ambiguous → deny (a false deny is one
+  // lost turn; a false allow is hours of lost work).
+  if (positional.length === 0) return true;
+  // Multiple positionals → <ref> <pathspec…> → discards the pathspec → deny.
+  if (positional.length > 1) return true;
+  // A single bare arg with no "--": could be a branch/tag switch (safe) OR a
+  // pathspec checkout of a file in cwd (destructive) — "git checkout index.ts"
+  // and "git checkout v0.82.0" are indistinguishable by shape. Resolve it: a
+  // real commit → branch/tag switch → allow; unresolvable → pathspec → deny.
+  // Read-only vendored clones (vendor/pi, vendor/antigravity-cli) are
+  // legitimately version-switched with "git checkout <tag>", so this must not
+  // blanket-deny. Resolver error / timeout / missing git → fail OPEN (allow),
+  // consistent with the rest of the guard.
+  try {
+    return !resolveRef(positional[0], cDir);
+  } catch {
+    return false;
+  }
+}
+
+function decideVerb(verb, rest, resolveRef, cDir) {
+  switch (verb) {
+    case 'clean':
+    case 'restore':
+      return true;
+    case 'stash': {
+      const sub = rest.find((t) => t && t[0] !== '-');
+      // Read-only subcommands are safe; every other form (push/pop/apply/drop/
+      // clear/save/branch/create, or a bare "git stash" == push) can lose work.
+      return !(sub === 'list' || sub === 'show');
+    }
+    case 'reset':
+      return rest.some((t) => t === '--hard' || t === '--merge' || t === '--keep');
+    case 'checkout':
+      return decideCheckout(rest, resolveRef, cDir);
+    default:
+      return false;
+  }
+}
+
+// Analyze one already-split command segment. Returns true if it is a git
+// discard invocation, false otherwise (incl. non-git segments).
+function analyzeSegment(segment, resolveRef) {
+  const tokens = tokenize(stripEnvAssignments(segment));
+  if (!tokens.length || !isGitProgram(tokens[0])) return false;
+  let i = 1;
+  let cDir = null; // "git -C <dir>" → resolve refs relative to THAT repo
+  while (i < tokens.length) {
+    const t = tokens[i];
+    if (t === '--' || t[0] !== '-') break;
+    if (t === '-C') { cDir = tokens[i + 1] || null; i += 2; continue; }
+    if (VALUE_OPTS.has(t)) { i += 2; continue; }
+    i += 1;
+  }
+  const verb = tokens[i];
+  if (!verb) return false;
+  return decideVerb(verb, tokens.slice(i + 1), resolveRef, cDir);
+}
+
+// Pure predicate: does this command line contain a git-discard invocation?
+// Splits on shell separators AND command-substitution boundaries ($(...), \x60…\x60)
+// so a discard hiding inside "cd x && …", "a; b", "a | b", or a substitution is
+// still isolated. Not a full shell parser — just enough to find git segments.
+export function analyzeGitDiscard(command, resolveRef = defaultResolveRef) {
+  if (typeof command !== 'string' || !command.trim()) return { deny: false, reason: null };
+  const segments = command.split(/\$\(|[|&;\x60\n()]/g);
+  for (const seg of segments) {
+    if (analyzeSegment(seg, resolveRef)) return { deny: true, reason: DENY_REASON };
+  }
+  return { deny: false, reason: null };
+}
+
+function readStdin() {
+  try {
+    const buf = fs.readFileSync(0);
+    return (buf.length > MAX_STDIN_BYTES ? buf.subarray(0, MAX_STDIN_BYTES) : buf).toString('utf-8');
+  } catch {
+    return null;
+  }
+}
+
+function main() {
+  let raw = null;
+  try { raw = readStdin(); } catch { process.exit(0); }
+  if (raw === null || raw === '') process.exit(0);
+  let payload;
+  try { payload = JSON.parse(raw); } catch { process.exit(0); }
+  let command = null;
+  try { command = extractCandidateCommand(payload); } catch { process.exit(0); }
+  if (!command) process.exit(0);
+  let verdict;
+  try { verdict = analyzeGitDiscard(command); } catch { process.exit(0); }
+  if (!verdict || !verdict.deny) process.exit(0);
+  // The modern PreToolUse deny signal — emitted to EVERY caller. It is the ONLY
+  // shape Codex 0.145.0 accepts as a "PreToolUse Blocked". Claude 2.1.220 does
+  // NOT block on this object at exit 0 (verified: the command still runs); Claude
+  // requires exit 2 to block. The two are reconciled below by exiting 2 for
+  // non-Codex callers and 0 for Codex (which fails OPEN on any nonzero exit).
+  const out = {
+    hookSpecificOutput: {
+      hookEventName: 'PreToolUse',
+      permissionDecision: 'deny',
+      permissionDecisionReason: verdict.reason,
+    },
+  };
+  // Per-provider extras. Codex strictly validates hook output and fails OPEN on
+  // ANY unknown top-level key (verified: {decision} makes it log "PreToolUse
+  // Failed" and run the command), so Codex must receive the bare object above
+  // and NOTHING else. Non-Codex callers get the belt-and-braces additions:
+  //   • top-level {decision:"deny"} — Grok Build reads .claude/settings.json
+  //     natively and its documented deny shape is this top-level key ("block" is
+  //     undocumented there); Claude tolerates it (verified: still blocks).
+  //   • the reason on stderr — informational for Claude's transcript.
+  // Codex is discriminated by the payload's turn_id (see isCodexPayload).
+  let codex = false;
+  try { codex = isCodexPayload(payload); } catch { codex = false; }
+  if (!codex) {
+    out.decision = 'deny';
+    out.reason = verdict.reason;
+  }
+  try { process.stdout.write(JSON.stringify(out)); } catch {}
+  if (!codex) { try { process.stderr.write(verdict.reason + '\n'); } catch {} }
+  // Per-provider exit code — this is what actually enforces the deny:
+  //   • Codex: exit 0. Codex classifies ANY nonzero exit as a hook failure and
+  //     then fails OPEN (runs the command), so a Codex deny MUST exit 0 and rely
+  //     on the bare hookSpecificOutput object above.
+  //   • Claude / non-Codex: exit 2. Claude 2.1.220 does NOT honor an exit-0
+  //     hookSpecificOutput deny for Bash (verified: the command still runs);
+  //     only exit 2 blocks it. Grok's top-level {decision:"deny"} is also
+  //     present for that lane.
+  process.exit(codex ? 0 : 2);
+}
+
+// Run main() only when invoked as the entry point — NOT when the unit test
+// imports this module for the pure predicate. On any detection error, do not run
+// main (the importing test never wants stdin read).
+let invokedDirectly = false;
+try {
+  invokedDirectly = !!process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+} catch {
+  invokedDirectly = false;
+}
+if (invokedDirectly) main();
+`;
+
 /** Pre-`.lares` Codex worker config (v3) — byte-exact derivation: the v3 → v4
  *  bump ONLY renamed the state folder in the three hook command paths, so the
- *  v3 body is reconstructed by reverting that rename (mirrors the
- *  PERSONA_READ_COMMENTS_SKILL_V1 derivation pattern — no duplicated body to
- *  drift). \${WORKSPACE_ROOT} substitution + hashing happen at scaffold-write
- *  time, exactly like v1/v2. */
-export const WORKER_CODEX_CONFIG_TOML_V3 = WORKER_CODEX_CONFIG_TOML
+ *  v3 body is reconstructed by reverting that rename on the v4 body. Derived
+ *  from WORKER_CODEX_CONFIG_TOML_V4 — the immediately-later FROZEN body, which
+ *  differs from v3 by exactly that folder rename — and deliberately NOT from the
+ *  live WORKER_CODEX_CONFIG_TOML: the live body has since gained a SessionStart
+ *  header rewrite and (at v5) a PreToolUse guard block that v3 never shipped, so
+ *  deriving from it would reproduce a body v3 never had and mis-hash a genuine
+ *  on-disk v3 file (backing it up + overwriting instead of silently upgrading).
+ *  (Mirrors the PERSONA_READ_COMMENTS_SKILL_V1 derivation pattern — no
+ *  duplicated body to drift.) \${WORKSPACE_ROOT} substitution + hashing happen
+ *  at scaffold-write time, exactly like v1/v2. */
+export const WORKER_CODEX_CONFIG_TOML_V3 = WORKER_CODEX_CONFIG_TOML_V4
   .split('/.lares/scripts/dashboard-status.mjs').join('/.dashboard/scripts/dashboard-status.mjs');
 
 /** Pre-SessionStart Codex worker config (v2) — kept verbatim so a v2
@@ -2113,7 +2487,12 @@ try {
  *  dashboard-status.mjs (written alongside it in CODEX_HOME). The script reads
  *  AGENT_ID/DASHBOARD_PORT/DASHBOARD_HOST from env (injected at supervised-worker
  *  launch) and exits 0 when AGENT_ID is unset, so the profile is inert for any
- *  non-dashboard codex session that happens to select it. */
+ *  non-dashboard codex session that happens to select it.
+ *
+ *  `__GUARD__` is likewise replaced with the absolute path of guard-git-discard.mjs
+ *  (also written into CODEX_HOME). Its `[[hooks.PreToolUse]]` block is the ONLY
+ *  place the git-discard guard actually fires for Codex workers — the worker-cwd
+ *  .codex/config.toml is never loaded by Codex, so its matching block is inert. */
 export const CODEX_WORKER_PROFILE_NAME = 'dashboard-worker';
 
 export const CODEX_WORKER_PROFILE_TOML = `# AgentDashboard supervised-codex hook profile.
@@ -2149,6 +2528,21 @@ timeout = 30
 [[hooks.SessionStart.hooks]]
 type = "command"
 command = 'node "__SCRIPT__" session-start'
+timeout = 30
+
+# PreToolUse git-discard guard — this is the REAL delivery path for the guard on
+# Codex workers. The worker-cwd .lares/workers/codex/.codex/config.toml is NEVER
+# loaded by Codex (untrusted project), so its [[hooks.PreToolUse]] block is inert;
+# only this CODEX_HOME profile fires. __GUARD__ is substituted at write time with
+# the absolute path of guard-git-discard.mjs (written into CODEX_HOME alongside
+# dashboard-status.mjs). It DENIES git commands that discard uncommitted work in
+# the shared tree; PreToolUse intercepts Bash, so a discard git call is blocked
+# before it runs.
+[[hooks.PreToolUse]]
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = 'node "__GUARD__"'
 timeout = 30
 `;
 
@@ -2934,11 +3328,14 @@ the writing agent can fix the artifact and retry.
  *  Authored with String.raw so regex backslashes survive verbatim — the script
  *  body contains no \${...} or backtick, so raw interpolation never triggers.
  *
- *  SECURITY-CONTROL STATUS: the block mechanism is PENDING empirical
- *  verification of the installed Claude Code build's PreToolUse block shape.
- *  The script emits BOTH the permissionDecision:"deny" JSON (primary) AND exits
- *  2 with the reason on stderr (belt-and-braces) so whichever mechanism the
- *  build honors blocks the write. */
+ *  SECURITY-CONTROL STATUS: the block mechanism is now empirically verified.
+ *  The script emits {hookSpecificOutput:{permissionDecision:"deny",…}} on stdout
+ *  and exits 2. Claude 2.1.220 does NOT honor an exit-0 hookSpecificOutput deny
+ *  (verified: the write still lands); only exit 2 blocks it. This researcher lane
+ *  is Claude-only, so exit 2 is correct here. (A hypothetical Codex researcher
+ *  would instead need exit 0 — Codex fails OPEN on any nonzero exit — which is
+ *  exactly why the shared git-discard guard, which serves both providers, keys
+ *  its exit code off isCodexPayload; see GUARD_GIT_DISCARD_MJS.) */
 export const RESEARCH_WRITE_GUARD_MJS = String.raw`#!/usr/bin/env node
 // Research-store PreToolUse(Write) guard — WP-G.
 // Blocks researcher writes that escape .lares/research/inbox/ or violate the
@@ -2958,6 +3355,11 @@ const ISO_8601_RE = /^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2
 function allow() { process.exit(0); }
 
 function block(reason) {
+  // Claude-only lane. Emit the hookSpecificOutput deny on stdout AND exit 2:
+  // Claude 2.1.220 does NOT honor an exit-0 hookSpecificOutput deny (verified:
+  // the write still lands), so exit 2 is what actually blocks. stderr keeps the
+  // reason in Claude's transcript. (A Codex caller would need exit 0 — it fails
+  // OPEN on any nonzero exit — but no Codex researcher is wired here.)
   const out = {
     hookSpecificOutput: {
       hookEventName: 'PreToolUse',

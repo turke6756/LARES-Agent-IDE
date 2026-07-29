@@ -171,15 +171,16 @@ test('worker/researcher-lane personas get the WORKER settings variant (not the s
   }
 });
 
-test('persona settings.json is managed at version 3 with previousHashes[1] = pre-Notification worker hash', () => {
+test('persona settings.json is managed at version 4 with previousHashes[1] = pre-Notification worker hash', () => {
   const ws = freshWorkspace();
   scaffoldPersona(ws, 'windows', 'versioned', undefined, 'supervisor');
   // The managed sidecar records the on-disk version: v1 → v2 added the
-  // Notification hook, v2 → v3 added the statusLine usage-capture block, so the
-  // current shipped scaffold is version 3.
+  // Notification hook, v2 → v3 added the statusLine usage-capture block, v3 → v4
+  // inherited the PreToolUse(Bash) git-discard guard, so the current shipped
+  // scaffold is version 4.
   const sc = readSidecar(ws);
-  assert.equal(sc['agents/versioned/.claude/settings.json'], 3,
-    'persona settings.json is managed at version 3');
+  assert.equal(sc['agents/versioned/.claude/settings.json'], 4,
+    'persona settings.json is managed at version 4');
   // The previousHashes[1] anchor is the pre-Notification (v5) worker body hash, so
   // a pre-Notification on-disk persona upgrades silently. Assert the anchor const
   // exists and differs from the now-current content hashes.
@@ -209,8 +210,8 @@ test('a persona with the pre-Notification worker settings on disk upgrades SILEN
   const claudeEntries = fs.readdirSync(agentFile(ws, 'legacy-sup', '.claude'));
   assert.ok(!claudeEntries.some(e => e.includes('.bak')),
     'no .bak written when the on-disk hash matches previousHashes[1]');
-  assert.equal(readSidecar(ws)['agents/legacy-sup/.claude/settings.json'], 3,
-    'sidecar advanced to version 3 after the silent upgrade');
+  assert.equal(readSidecar(ws)['agents/legacy-sup/.claude/settings.json'], 4,
+    'sidecar advanced to version 4 after the silent upgrade');
 });
 
 test('a non-lane persona with the pre-Notification worker settings upgrades SILENTLY to the worker variant', () => {
