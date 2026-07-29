@@ -39,10 +39,13 @@ function installApi() {
   (window as any).api = {
     lifecycle: {
       getSettings: vi.fn(async () => settings),
-      setSettings: vi.fn(async (s: LifecycleSettings) => {
+      // Model the WP-7 main-side MERGE: a partial patch is merged over the
+      // current settings and the FULL object is returned, so a cap-only set
+      // never drops the threshold and vice-versa.
+      setSettings: vi.fn(async (s: Partial<LifecycleSettings>) => {
         setSettingsSpy(s);
-        settings = s;
-        return s;
+        settings = { ...settings, ...s };
+        return settings;
       }),
       onSettingsChanged: (cb: (s: LifecycleSettings) => void) => {
         settingsListener = cb;
@@ -249,6 +252,56 @@ describe('LiveAgentsPanel — reclaim estimate copy', () => {
     await render();
     await click(buttonByText('Preview'));
     expect(container.textContent).toContain('At least ≈1.0 GB would be reclaimed (some agents unmeasured)');
+  });
+});
+
+describe('LiveAgentsPanel — terminal-history cap (WP-7)', () => {
+  function capSelect(): HTMLSelectElement {
+    return container.querySelector('#log-retention-cap') as HTMLSelectElement;
+  }
+  function threshSelect(): HTMLSelectElement {
+    return container.querySelector('#stale-idle-threshold') as HTMLSelectElement;
+  }
+
+  it('defaults an absent cap field to 2 GiB (the production `?? 2gib` default)', async () => {
+    // settings fixture has NO logRetentionCap → the control must still show 2 GiB.
+    await render();
+    expect(capSelect().value).toBe('2gib');
+  });
+
+  it('changing the cap sends ONLY {logRetentionCap} and never disturbs the threshold', async () => {
+    await render();
+    expect(threshSelect().value).toBe('24h');
+    await act(async () => {
+      capSelect().value = '5gib';
+      capSelect().dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    // The control sends a PARTIAL — a whole-object set that also carried the
+    // threshold would be a clobber vector.
+    expect(setSettingsSpy).toHaveBeenCalledWith({ logRetentionCap: '5gib' });
+    // The threshold selector is untouched, and the cap now reflects the save.
+    expect(threshSelect().value).toBe('24h');
+    expect(capSelect().value).toBe('5gib');
+  });
+
+  it('changing the threshold sends ONLY {autoStopIdleThreshold} and preserves the cap', async () => {
+    settings = { autoStopIdleThreshold: '24h', logRetentionCap: '5gib' };
+    await render();
+    expect(capSelect().value).toBe('5gib');
+    await act(async () => {
+      threshSelect().value = '7d';
+      threshSelect().dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    expect(setSettingsSpy).toHaveBeenCalledWith({ autoStopIdleThreshold: '7d' });
+    // The cap survives the threshold change (merge, not clobber).
+    expect(capSelect().value).toBe('5gib');
+  });
+
+  it('the Unlimited option notes that observability continues', async () => {
+    settings = { autoStopIdleThreshold: '24h', logRetentionCap: 'unlimited' };
+    await render();
+    expect(capSelect().value).toBe('unlimited');
+    expect(container.textContent).toContain('observability continues');
   });
 });
 

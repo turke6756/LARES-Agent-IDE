@@ -157,7 +157,12 @@ export default function TerminalPanel({ height }: TerminalPanelProps) {
   //   • historyWarning — a log-write error degraded this epoch; recovery came
   //     from the in-memory ring snapshot, so `.log` replay was skipped.
   const [truncationBanner, setTruncationBanner] = useState<{ retainedBytes: number; snapshotTotal: number } | null>(null);
-  const [historyWarning, setHistoryWarning] = useState<{ reason: 'log-write-error' } | null>(null);
+  // WP-7 extends historyWarning with 'history-unavailable' (a dead agent whose
+  // `.scrollback` AND `.log` are both gone) and adds a THIRD overlay,
+  // reclaimedBanner (the retention sweep freed this agent's older history). All
+  // three are OVERLAYS — banner text is NEVER written into the xterm stream.
+  const [historyWarning, setHistoryWarning] = useState<{ reason: 'log-write-error' | 'history-unavailable' } | null>(null);
+  const [reclaimedBanner, setReclaimedBanner] = useState<{ reclaimedAt: string } | null>(null);
 
   // Transient paste/drop error surfaced in the toolbar. The timeout id is
   // ref-managed (addendum J) so an older timer can't clear a newer error, and
@@ -254,10 +259,13 @@ export default function TerminalPanel({ height }: TerminalPanelProps) {
       });
     };
 
-    // WP-3c: a fresh reopen recomputes history state; clear any prior agent's
-    // banners so they never bleed across an agent switch.
+    // WP-3c/WP-7: a fresh reopen recomputes history state; clear every prior
+    // agent's overlay so none bleeds across an agent switch or same-id rebound.
+    // setHistoryWarning(null) covers both 'log-write-error' and the WP-7
+    // 'history-unavailable' reason; reclaimedBanner is cleared alongside them.
     setTruncationBanner(null);
     setHistoryWarning(null);
+    setReclaimedBanner(null);
 
     let cached = terminalCache.get(agentId);
 
@@ -428,6 +436,8 @@ export default function TerminalPanel({ height }: TerminalPanelProps) {
         write: (data) => queueWrite(entry, data, null),
         showTruncationBanner: (b) => setTruncationBanner(b),
         showHistoryWarning: () => setHistoryWarning({ reason: 'log-write-error' }),
+        showReclaimedBanner: (b) => setReclaimedBanner(b),
+        showHistoryUnavailable: () => setHistoryWarning({ reason: 'history-unavailable' }),
         maxReplayBytes: MAX_TERMINAL_REPLAY_BYTES,
       };
 
@@ -815,11 +825,35 @@ export default function TerminalPanel({ height }: TerminalPanelProps) {
         onContextMenu={handleContextMenu}
       >
         <div ref={termRef} className="w-full h-full" onClick={() => xtermRef.current?.focus()} />
-        {/* WP-3c structured history banners — stable overlays, never injected
-            into the xterm stream and never exposing a filesystem path. */}
-        {(truncationBanner || historyWarning) && (
+        {/* WP-3c/WP-7 structured history banners — stable overlays, never
+            injected into the xterm stream and never exposing a filesystem path. */}
+        {(truncationBanner || historyWarning || reclaimedBanner) && (
           <div className="absolute top-2 left-1/2 -translate-x-1/2 flex flex-col items-center gap-1 pointer-events-none z-10">
-            {historyWarning && (
+            {reclaimedBanner && (
+              <span
+                className={`text-[10px] px-2 py-0.5 rounded-sm border font-mono ${
+                  isLight
+                    ? 'text-[#5a616b] bg-[#eef0f2] border-[#c8cdd3]'
+                    : 'text-gray-400 bg-white/5 border-white/15'
+                }`}
+                title="Older terminal history for this agent was removed by the log-retention sweep to reclaim disk space; any newer output is unaffected."
+              >
+                🗑 Terminal history was reclaimed to free disk space
+              </span>
+            )}
+            {historyWarning?.reason === 'history-unavailable' && (
+              <span
+                className={`text-[10px] px-2 py-0.5 rounded-sm border font-mono ${
+                  isLight
+                    ? 'text-[#9d2b13] bg-[#fdece8] border-[#e0a99e]'
+                    : 'text-accent-red bg-accent-red/10 border-accent-red/40'
+                }`}
+                title="No terminal history remains on disk for this agent (its scrollback and log are both gone)."
+              >
+                ⚠ Terminal history is unavailable
+              </span>
+            )}
+            {historyWarning?.reason === 'log-write-error' && (
               <span
                 className={`text-[10px] px-2 py-0.5 rounded-sm border font-mono ${
                   isLight

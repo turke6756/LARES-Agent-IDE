@@ -22,6 +22,7 @@
 //                  truncation banner when a byte bound was hit.
 
 import type {
+  HistoryNotice,
   TerminalAttachResult,
   TerminalCheckpointLoad,
   TerminalLogRange,
@@ -87,6 +88,14 @@ export interface RehydrateDeps {
   write(data: string | Uint8Array): Promise<void>;
   showTruncationBanner(b: { retainedBytes: number; snapshotTotal: number }): void;
   showHistoryWarning(): void;
+  /** WP-7: reclaimed-history disclosure (the DB marker travelled through a DTO's
+   *  `historyNotice`). Surfaced as an OVERLAY, never written into the xterm
+   *  stream. Called at most once per reopen (deduped in the orchestrator). */
+  showReclaimedBanner(b: { reclaimedAt: string }): void;
+  /** WP-7: a dead agent whose `.scrollback` AND `.log` are both absent
+   *  (`TerminalDeadSnapshot.missing`) — a distinct warning from the reclaimed
+   *  notice. Also an overlay only. */
+  showHistoryUnavailable(): void;
   maxReplayBytes: number;
 }
 
@@ -108,6 +117,25 @@ export async function rehydrateTerminalHistory(
   deps: RehydrateDeps,
 ): Promise<RehydrateResult> {
   const att = await deps.attach();
+
+  // WP-7 — surface the reclaimed-history overlay IMMEDIATELY, before ANY later
+  // read (ring snapshot, checkpoint, range, tail, dead snapshot) can throw. The
+  // marker is DISCLOSURE, never a gate: a revived agent carries the marker AND
+  // real post-reclamation bytes, so we still replay below and only ADD the
+  // overlay here. Deduped: at most one call per reopen, even though later reads
+  // also carry the notice.
+  let reclaimedSurfaced = false;
+  const surfaceNotice = (notice: HistoryNotice | undefined): void => {
+    if (!notice || notice.kind !== 'retention-reclaimed') return;
+    // Locked-types contract: accept the marker ONLY when it is a non-empty
+    // string, so `reclaimedAt: NaN`/'' can never reach the overlay.
+    if (typeof notice.reclaimedAt !== 'string' || notice.reclaimedAt === '') return;
+    if (reclaimedSurfaced) return;
+    reclaimedSurfaced = true;
+    deps.showReclaimedBanner({ reclaimedAt: notice.reclaimedAt });
+  };
+  surfaceNotice(att.historyNotice);
+
   const cutoff = att.snapshotCutoff ?? 0;
   state.epoch = att.terminalEpoch ?? '';
 
@@ -137,6 +165,7 @@ export async function rehydrateTerminalHistory(
     let pos = ckpt.appliedOffset;
     while (pos < cutoff) {
       const r = await deps.readLogRange(pos, Math.min(pos + deps.maxReplayBytes, cutoff));
+      surfaceNotice(r.historyNotice);
       await deps.write(r.bytes);
       if (r.endOffset <= pos) break; // no forward progress (EOF/short) — stop
       pos = r.endOffset;
@@ -150,6 +179,7 @@ export async function rehydrateTerminalHistory(
     // No / rejected checkpoint → cold tail, rune-aligned at the head by
     // `readFileTail`. `appliedOffset` becomes the tail's real end (== cutoff).
     const tail = await deps.readLogTail(deps.maxReplayBytes, cutoff);
+    surfaceNotice(tail.historyNotice);
     await deps.write(tail.bytes);
     state.appliedOffset = tail.endOffset;
     if (tail.truncated) {
@@ -163,6 +193,10 @@ export async function rehydrateTerminalHistory(
 
   // Dead, no valid checkpoint → `.scrollback` else a capped `.log` tail.
   const s = await deps.readDeadAgentSnapshot();
+  surfaceNotice(s.historyNotice);
+  // WP-7: both fallback files absent → a distinct "history unavailable" warning
+  // (never inferred from an empty snapshot — see `TerminalDeadSnapshot.missing`).
+  if (s.missing) deps.showHistoryUnavailable();
   await deps.write(s.text);
   state.appliedOffset = cutoff;
   if (s.truncated) {

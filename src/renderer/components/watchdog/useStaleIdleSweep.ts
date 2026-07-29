@@ -18,6 +18,7 @@ import type {
   AutoStopThreshold,
   BulkStopResult,
   LifecycleSettings,
+  LogRetentionCap,
   StaleIdlePreview,
 } from '../../../shared/types';
 import { groupExclusionsByCode } from '../../lib/stop-exclusion-copy';
@@ -25,6 +26,11 @@ import { groupExclusionsByCode } from '../../lib/stop-exclusion-copy';
 export interface StaleIdleSweep {
   settings: LifecycleSettings | null;
   threshold: AutoStopThreshold | null;
+  /** WP-7: the terminal-history cap, defaulted with `?? '2gib'` so the raw
+   *  optional field can never surface as `undefined` in the control (matches the
+   *  production `logRetentionCap ?? '2gib'` default in index.ts). null only
+   *  until settings first load. */
+  logRetentionCap: LogRetentionCap | null;
   preview: StaleIdlePreview | null;
   /** True when the on-screen preview was computed for a DIFFERENT threshold
    *  than the one now in force — it describes a sweep that will not happen. */
@@ -37,6 +43,10 @@ export interface StaleIdleSweep {
   eligibleCount: number;
   canStop: boolean;
   onThresholdChange: (value: AutoStopThreshold) => Promise<void>;
+  /** WP-7: persist the terminal-history cap. Sends the PARTIAL `{logRetentionCap}`
+   *  so it merges over the persisted threshold main-side rather than clobbering
+   *  it. */
+  onCapChange: (value: LogRetentionCap) => Promise<void>;
   runPreview: () => Promise<void>;
   runStop: () => Promise<void>;
 }
@@ -66,6 +76,11 @@ export function useStaleIdleSweep(opts?: { onAfterStop?: () => void }): StaleIdl
   }, []);
 
   const threshold = settings?.autoStopIdleThreshold ?? null;
+  // Default the OPTIONAL cap field with `?? '2gib'` (the same default the
+  // production main wiring uses) so the control never shows `undefined`; null
+  // only while settings are still loading.
+  const logRetentionCap: LogRetentionCap | null =
+    settings === null ? null : settings.logRetentionCap ?? '2gib';
 
   // A preview computed against a DIFFERENT threshold than the one now in force
   // describes a sweep that will not happen. Surface it and block the action.
@@ -81,6 +96,23 @@ export function useStaleIdleSweep(opts?: { onAfterStop?: () => void }): StaleIdl
       // it sit under the new selector looking current.
       setPreview(null);
       setResult(null);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(null);
+    }
+  }, []);
+
+  const onCapChange = useCallback(async (value: LogRetentionCap) => {
+    setBusy('settings');
+    setError(null);
+    try {
+      // PARTIAL set — WP-1 made load/save field-independent and WP-7's
+      // set-settings merges over the persisted threshold, so changing the cap
+      // never disturbs the auto-stop threshold. No preview to invalidate: the
+      // cap does not affect the stale-idle sweep selection.
+      const saved = await window.api.lifecycle.setSettings({ logRetentionCap: value });
+      setSettings(saved);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -136,8 +168,8 @@ export function useStaleIdleSweep(opts?: { onAfterStop?: () => void }): StaleIdl
     preview !== null && !previewStale && eligibleCount > 0 && threshold !== 'never' && busy === null;
 
   return {
-    settings, threshold, preview, previewStale, busy, error, result,
+    settings, threshold, logRetentionCap, preview, previewStale, busy, error, result,
     grouped, tally, eligibleCount, canStop,
-    onThresholdChange, runPreview, runStop,
+    onThresholdChange, onCapChange, runPreview, runStop,
   };
 }

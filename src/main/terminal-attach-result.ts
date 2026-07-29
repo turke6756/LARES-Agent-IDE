@@ -15,7 +15,7 @@
 //     the epoch is the last one recorded for this agent (null if it was never
 //     launched this process). A dead agent is never degraded.
 
-import type { TerminalAttachResult } from '../shared/types';
+import type { HistoryNotice, TerminalAttachResult } from '../shared/types';
 
 /** The narrow supervisor surface the attach-result builder consumes. Declaring
  *  it here (rather than importing the whole supervisor) keeps the builder unit-
@@ -26,6 +26,9 @@ export interface AttachResultSupervisor {
   agentEpoch(agentId: string): string | null;
   agentLogSize(agentId: string): Promise<number>;
   lastTerminalEpoch: Map<string, string>;
+  /** WP-6: DB-backed reclaimed-history marker (WP-4 seam). Carried on the attach
+   *  result for BOTH live and dead agents with NO extra `stat`. */
+  agentTerminalHistoryNotice(agentId: string): HistoryNotice;
 }
 
 /**
@@ -46,6 +49,9 @@ export async function computeTerminalAttachResult(
       terminalEpoch: supervisor.agentEpoch(agentId),
       snapshotCutoff: cutoff,
       degraded,
+      // WP-6: DB marker, no extra stat. The barrier already ran; this is the
+      // reclaimed-history disclosure for a revived (marked + growing log) agent.
+      historyNotice: supervisor.agentTerminalHistoryNotice(agentId),
     };
   }
   const snapshotCutoff = await supervisor.agentLogSize(agentId);
@@ -55,5 +61,7 @@ export async function computeTerminalAttachResult(
     terminalEpoch: supervisor.lastTerminalEpoch.get(agentId) ?? null,
     snapshotCutoff,
     degraded: false,
+    // WP-6: DB marker fetched after the size read (no extra stat of its own).
+    historyNotice: supervisor.agentTerminalHistoryNotice(agentId),
   };
 }

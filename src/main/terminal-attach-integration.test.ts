@@ -30,9 +30,11 @@ function fakeSupervisor(opts: {
   runners?: Record<string, { epoch: string; barrier: { cutoff: number; degraded: boolean } }>;
   logSizes?: Record<string, number>;
   lastEpochs?: Record<string, string>;
+  notices?: Record<string, string>;
 }): AttachResultSupervisor & { barrierCalls: string[] } {
   const runners = opts.runners ?? {};
   const logSizes = opts.logSizes ?? {};
+  const notices = opts.notices ?? {};
   const barrierCalls: string[] = [];
   return {
     barrierCalls,
@@ -46,6 +48,9 @@ function fakeSupervisor(opts: {
     agentEpoch: (id) => runners[id]?.epoch ?? opts.lastEpochs?.[id] ?? null,
     agentLogSize: async (id) => logSizes[id] ?? 0,
     lastTerminalEpoch: new Map(Object.entries(opts.lastEpochs ?? {})),
+    // WP-6: no marker unless a test supplies one → historyNotice defaults to null.
+    agentTerminalHistoryNotice: (id) =>
+      id in notices ? { kind: 'retention-reclaimed', reclaimedAt: notices[id] } : null,
   };
 }
 
@@ -55,7 +60,7 @@ test('LIVE attach returns the full {ok,live,epoch,cutoff,degraded} from the barr
   const sup = fakeSupervisor({ runners: { a: { epoch: 'epoch-live', barrier: { cutoff: 4242, degraded: false } } } });
   const res = await computeTerminalAttachResult(sup, 'a');
   assert.deepEqual(res, {
-    ok: true, live: true, terminalEpoch: 'epoch-live', snapshotCutoff: 4242, degraded: false,
+    ok: true, live: true, terminalEpoch: 'epoch-live', snapshotCutoff: 4242, degraded: false, historyNotice: null,
   });
   assert.deepEqual(sup.barrierCalls, ['a'], 'the live path consults the write barrier');
 });
@@ -75,7 +80,7 @@ test('DEAD attach returns live:false + fstat cutoff + the last recorded epoch', 
   const sup = fakeSupervisor({ logSizes: { a: 9000 }, lastEpochs: { a: 'epoch-was' } });
   const res = await computeTerminalAttachResult(sup, 'a');
   assert.deepEqual(res, {
-    ok: true, live: false, terminalEpoch: 'epoch-was', snapshotCutoff: 9000, degraded: false,
+    ok: true, live: false, terminalEpoch: 'epoch-was', snapshotCutoff: 9000, degraded: false, historyNotice: null,
   });
   assert.deepEqual(sup.barrierCalls, [], 'the dead path never touches the write barrier');
 });

@@ -27,6 +27,11 @@ export interface DeadAgentSnapshot {
   truncated: boolean;
   /** Bytes actually retained in `text` (for the "retained vs total" banner). */
   retainedBytes: number;
+  /** WP-6: true ONLY when BOTH `.scrollback` and `.log` are absent (both
+   *  `sizeOrNull` → null). NEVER inferred from an empty read / `retainedBytes 0`
+   *  — an empty-but-present `.log` is size 0 yet `missing:false`. This is the
+   *  "history-unavailable" signal, orthogonal to the retention-reclaimed marker. */
+  missing: boolean;
 }
 
 /** stat().size, or null on ENOENT (distinguishes "missing" from "empty"). */
@@ -59,14 +64,19 @@ export async function readDeadAgentSnapshot(
     // Earlier history dropped from the bounded ring iff the raw log outgrew it.
     // (A `.scrollback` itself larger than maxBytes also counts as truncated.)
     const truncated = logSize > sbSize || sb.truncated;
-    return { text: sb.bytes.toString('utf8'), truncated, retainedBytes: sb.bytes.length };
+    // `.scrollback` is present here, so history is NOT missing regardless of the
+    // `.log` (an empty-but-present `.scrollback` still means we have the ring).
+    return { text: sb.bytes.toString('utf8'), truncated, retainedBytes: sb.bytes.length, missing: false };
   }
 
-  // No scrollback — cold tail of the raw `.log`.
+  // No scrollback — cold tail of the raw `.log`. `missing` iff the `.log` is ALSO
+  // absent (both fallback files gone). A stat-only check, never a whole-file read.
+  const logSize = await sizeOrNull(logPath);
   const tail = await readFileTail(logPath, maxBytes);
   return {
     text: tail.bytes.toString('utf8'),
     truncated: tail.truncated,
     retainedBytes: tail.endOffset - tail.startOffset,
+    missing: logSize === null,
   };
 }

@@ -21,6 +21,7 @@ import * as Icons from 'lucide-react';
 import type {
   AutoStopThreshold,
   LiveAgentMemoryRowDto,
+  LogRetentionCap,
   SystemMemoryViewDto,
 } from '../../../shared/types';
 import { useDashboardStore } from '../../stores/dashboard-store';
@@ -36,6 +37,15 @@ const THRESHOLD_OPTIONS: Array<{ value: AutoStopThreshold; label: string }> = [
   { value: '24h', label: 'After 24 hours idle' },
   { value: '3d', label: 'After 3 days idle' },
   { value: '7d', label: 'After 7 days idle' },
+];
+
+/** Terminal-history cap options (WP-7). Order and values mirror
+ *  `LogRetentionCap`; 'unlimited' keeps every log (disk-cost only). */
+const CAP_OPTIONS: Array<{ value: LogRetentionCap; label: string }> = [
+  { value: '1gib', label: '1 GiB' },
+  { value: '2gib', label: '2 GiB' },
+  { value: '5gib', label: '5 GiB' },
+  { value: 'unlimited', label: 'Unlimited' },
 ];
 
 const THRESHOLD_PHRASE: Record<AutoStopThreshold, string> = {
@@ -101,7 +111,7 @@ export default function LiveAgentsPanel({
     return list;
   }, [view]);
 
-  const { preview, previewStale, threshold, busy, error, result, grouped, tally, eligibleCount, canStop, settings } = sweep;
+  const { preview, previewStale, threshold, logRetentionCap, busy, error, result, grouped, tally, eligibleCount, canStop, settings } = sweep;
 
   // Per-row sweep verdicts, only meaningful for a current (non-stale) preview.
   const sweepVerdicts = useMemo(() => {
@@ -159,6 +169,37 @@ export default function LiveAgentsPanel({
           <p className="text-[11px] text-gray-500">
             A background sweep applies this threshold on its own schedule. Previewing here shows
             what that sweep would do right now, and lets you run it immediately.
+          </p>
+        )}
+
+        {/* WP-7 — terminal-history retention cap. Persisted main-side as a
+            PARTIAL set, so it never disturbs the auto-stop threshold above. */}
+        <div className="flex items-center gap-3 flex-wrap border-t border-white/5 pt-3">
+          <label htmlFor="log-retention-cap" className="text-[12px] text-gray-400">
+            Keep terminal history up to
+          </label>
+          <select
+            id="log-retention-cap"
+            className="ui-input text-[12px] px-2 py-1"
+            value={logRetentionCap ?? '2gib'}
+            disabled={settings === null || busy !== null}
+            onChange={(e) => void sweep.onCapChange(e.target.value as LogRetentionCap)}
+          >
+            {CAP_OPTIONS.map((o) => (
+              <option key={o.value} value={o.value}>{o.label}</option>
+            ))}
+          </select>
+          {busy === 'settings' && <span className="text-[11px] text-gray-500">Saving…</span>}
+        </div>
+        {logRetentionCap === 'unlimited' ? (
+          <p className="text-[11px] text-gray-500">
+            Terminal logs are never reclaimed to save disk — memory observability continues either
+            way; this only governs on-disk history.
+          </p>
+        ) : (
+          <p className="text-[11px] text-gray-500">
+            When a stopped agent's logs push total on-disk history past this cap, the oldest are
+            reclaimed to free space. A one-time notice reports the first cleanup.
           </p>
         )}
 

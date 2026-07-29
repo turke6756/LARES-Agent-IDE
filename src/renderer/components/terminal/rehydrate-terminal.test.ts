@@ -59,10 +59,12 @@ function baseDeps(over: Partial<RehydrateDeps>, sink: XtermSink): RehydrateDeps 
     readLogRange: () => Promise.resolve({ bytes: new Uint8Array(0), startOffset: 0, endOffset: 0, fileSize: 0 }),
     readLogTail: () => Promise.resolve({ bytes: new Uint8Array(0), startOffset: 0, endOffset: 0, truncated: false }),
     getRingSnapshot: () => Promise.resolve(null),
-    readDeadAgentSnapshot: () => Promise.resolve({ text: '', truncated: false, retainedBytes: 0 }),
+    readDeadAgentSnapshot: () => Promise.resolve({ text: '', truncated: false, retainedBytes: 0, missing: false }),
     write: sink.write,
     showTruncationBanner: vi.fn(),
     showHistoryWarning: vi.fn(),
+    showReclaimedBanner: vi.fn(),
+    showHistoryUnavailable: vi.fn(),
     maxReplayBytes: BUDGET,
     ...over,
   };
@@ -537,5 +539,177 @@ describe('WP-3e banner acceptance', () => {
     expect(readLogRange).not.toHaveBeenCalled(); // no `.log` range replay in a degraded epoch
     expect(readLogTail).not.toHaveBeenCalled(); // and no `.log` cold tail either
     expect(state.logOffsetsReliable).toBe(false);
+  });
+});
+
+// ── WP-7 — reclaimed-history disclosure surfacing ──
+//
+// The retention marker is DISCLOSURE, never a gate. The overlay must appear the
+// instant attach resolves (before any later read can throw), a revived agent
+// must replay its real bytes AND show the overlay, and NO banner text ever
+// reaches the xterm write sink.
+describe('WP-7 reclaimed-history disclosure', () => {
+  const RECLAIMED = { kind: 'retention-reclaimed' as const, reclaimedAt: '2026-07-27T12:00:00Z' };
+
+  it('surfaces the attach notice IMMEDIATELY — even when a later read THROWS', async () => {
+    // The #1 mutation to kill: surfacing the notice only after replay. Here the
+    // tail read rejects; the banner must ALREADY have been surfaced from attach.
+    const sink = new XtermSink();
+    const state = freshState();
+    const deps = baseDeps(
+      {
+        attach: () => Promise.resolve({ ok: true, live: true, snapshotCutoff: 100, degraded: false, terminalEpoch: 'e1', historyNotice: RECLAIMED }),
+        readLogTail: () => Promise.reject(new Error('read boom')),
+      },
+      sink,
+    );
+    await expect(rehydrateTerminalHistory(state, deps)).rejects.toThrow('read boom');
+    expect(deps.showReclaimedBanner).toHaveBeenCalledWith({ reclaimedAt: RECLAIMED.reclaimedAt });
+    // And it went to the OVERLAY, not the xterm stream.
+    expect(sink.out).not.toContain(RECLAIMED.reclaimedAt);
+  });
+
+  it('surfaces the attach notice before the DEGRADED ring read (which could throw)', async () => {
+    const sink = new XtermSink();
+    const state = freshState();
+    const deps = baseDeps(
+      {
+        attach: () => Promise.resolve({ ok: true, live: true, snapshotCutoff: 10, degraded: true, terminalEpoch: 'e1', historyNotice: RECLAIMED }),
+        getRingSnapshot: () => Promise.reject(new Error('ring boom')),
+      },
+      sink,
+    );
+    await expect(rehydrateTerminalHistory(state, deps)).rejects.toThrow('ring boom');
+    expect(deps.showReclaimedBanner).toHaveBeenCalledWith({ reclaimedAt: RECLAIMED.reclaimedAt });
+  });
+
+  it('a revived agent REPLAYS its post-reclamation bytes AND shows the overlay (marker is not a gate)', async () => {
+    const history = 'post-revive-line\n';
+    const cutoff = enc(history).length;
+    const sink = new XtermSink();
+    const state = freshState();
+    const deps = baseDeps(
+      {
+        attach: () => Promise.resolve({ ok: true, live: true, snapshotCutoff: cutoff, degraded: false, terminalEpoch: 'e2', historyNotice: RECLAIMED }),
+        readLogTail: () => Promise.resolve({ bytes: enc(history), startOffset: 0, endOffset: cutoff, truncated: false }),
+      },
+      sink,
+    );
+    await reopen(deps, state, [], sink);
+    expect(sink.out).toBe(history); // the real bytes were NOT skipped
+    expect(deps.showReclaimedBanner).toHaveBeenCalledWith({ reclaimedAt: RECLAIMED.reclaimedAt });
+    // Banner glyph/text never entered the xterm stream.
+    expect(sink.out).not.toContain('🗑');
+    expect(sink.out).not.toContain('reclaimed');
+  });
+
+  it('surfaces a notice returned by a RANGE PAGE during checkpoint catch-up (not only attach)', async () => {
+    const head = 'CK;';
+    const tailText = 'catchup';
+    const log = enc('###' + tailText); // 3 filler (pre-checkpoint) + paged tail
+    const cutoff = log.length;
+    const sink = new XtermSink();
+    const state = freshState();
+    const deps = baseDeps(
+      {
+        // NO notice on attach — it must come from the range read.
+        attach: () => Promise.resolve({ ok: true, live: true, snapshotCutoff: cutoff, degraded: false, terminalEpoch: 'e1' }),
+        loadCheckpoint: () => Promise.resolve({ serialized: head, appliedOffset: 3 }),
+        readLogRange: (start: number, end: number) => Promise.resolve({
+          bytes: log.subarray(start, end), startOffset: start, endOffset: end, fileSize: log.length, historyNotice: RECLAIMED,
+        }),
+      },
+      sink,
+    );
+    await reopen(deps, state, [], sink);
+    expect(sink.out).toBe(head + tailText);
+    expect(deps.showReclaimedBanner).toHaveBeenCalledWith({ reclaimedAt: RECLAIMED.reclaimedAt });
+  });
+
+  it('surfaces a notice returned by the DEAD snapshot', async () => {
+    const sink = new XtermSink();
+    const state = freshState();
+    const deps = baseDeps(
+      {
+        attach: () => Promise.resolve({ ok: true, live: false, snapshotCutoff: 8, degraded: false, terminalEpoch: 'e1' }),
+        readDeadAgentSnapshot: () => Promise.resolve({ text: 'DEADHIST', truncated: false, retainedBytes: 8, missing: false, historyNotice: RECLAIMED }),
+      },
+      sink,
+    );
+    await reopen(deps, state, [], sink);
+    expect(sink.out).toBe('DEADHIST');
+    expect(deps.showReclaimedBanner).toHaveBeenCalledWith({ reclaimedAt: RECLAIMED.reclaimedAt });
+  });
+
+  it('DEDUPES a notice repeated across attach + a later read (surfaced at most once)', async () => {
+    const history = 'x\n';
+    const cutoff = enc(history).length;
+    const sink = new XtermSink();
+    const state = freshState();
+    const deps = baseDeps(
+      {
+        attach: () => Promise.resolve({ ok: true, live: true, snapshotCutoff: cutoff, degraded: false, terminalEpoch: 'e1', historyNotice: RECLAIMED }),
+        readLogTail: () => Promise.resolve({ bytes: enc(history), startOffset: 0, endOffset: cutoff, truncated: false, historyNotice: RECLAIMED }),
+      },
+      sink,
+    );
+    await reopen(deps, state, [], sink);
+    expect(deps.showReclaimedBanner).toHaveBeenCalledTimes(1);
+  });
+
+  it('IGNORES a malformed (empty-string) reclaimedAt', async () => {
+    const sink = new XtermSink();
+    const state = freshState();
+    const deps = baseDeps(
+      {
+        attach: () => Promise.resolve({ ok: true, live: false, snapshotCutoff: 0, degraded: false, terminalEpoch: 'e1', historyNotice: { kind: 'retention-reclaimed', reclaimedAt: '' } }),
+      },
+      sink,
+    );
+    await reopen(deps, state, [], sink);
+    expect(deps.showReclaimedBanner).not.toHaveBeenCalled();
+  });
+
+  it('a normal reopen (no marker) shows NO reclaimed banner', async () => {
+    const sink = new XtermSink();
+    const state = freshState();
+    const deps = baseDeps(
+      { attach: () => Promise.resolve({ ok: true, live: true, snapshotCutoff: 0, degraded: false, terminalEpoch: 'e1' }) },
+      sink,
+    );
+    await reopen(deps, state, [], sink);
+    expect(deps.showReclaimedBanner).not.toHaveBeenCalled();
+    expect(deps.showHistoryUnavailable).not.toHaveBeenCalled();
+  });
+
+  it('a dead agent with BOTH fallback files absent → history-unavailable (and no bytes written)', async () => {
+    const sink = new XtermSink();
+    const state = freshState();
+    const deps = baseDeps(
+      {
+        attach: () => Promise.resolve({ ok: true, live: false, snapshotCutoff: 0, degraded: false, terminalEpoch: 'e1' }),
+        readDeadAgentSnapshot: () => Promise.resolve({ text: '', truncated: false, retainedBytes: 0, missing: true }),
+      },
+      sink,
+    );
+    const res = await reopen(deps, state, [], sink);
+    expect(res.live).toBe(false);
+    expect(deps.showHistoryUnavailable).toHaveBeenCalledTimes(1);
+    expect(sink.out).toBe(''); // overlay only — nothing injected into the stream
+    expect(deps.showReclaimedBanner).not.toHaveBeenCalled();
+  });
+
+  it('an empty-but-present dead log is NOT history-unavailable', async () => {
+    const sink = new XtermSink();
+    const state = freshState();
+    const deps = baseDeps(
+      {
+        attach: () => Promise.resolve({ ok: true, live: false, snapshotCutoff: 0, degraded: false, terminalEpoch: 'e1' }),
+        readDeadAgentSnapshot: () => Promise.resolve({ text: '', truncated: false, retainedBytes: 0, missing: false }),
+      },
+      sink,
+    );
+    await reopen(deps, state, [], sink);
+    expect(deps.showHistoryUnavailable).not.toHaveBeenCalled();
   });
 });
