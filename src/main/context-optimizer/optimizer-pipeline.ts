@@ -290,7 +290,23 @@ export function extractConstantTemplate(constantsSource: string, symbol: string)
   const m = declRe.exec(constantsSource);
   if (!m) return null;
   let i = m.index + m[0].length;
-  if (constantsSource[i] !== '`') return null; // not a template-literal constant
+  if (constantsSource[i] !== '`') {
+    // Freeze-then-derive (D11): a registry-tracked managed constant may be defined
+    // as `LIVE = FROZEN_BASE\n  .split(a).join(b)…` rather than an inline template
+    // (the memory-lessons v2 SUPERVISOR_AGENT_MD / WORKER_CLAUDE_MD bump — the live
+    // body derives from the frozen `_Vn` snapshot). Follow one leading identifier to
+    // its base so the derived constant still yields a datable body (the frozen
+    // template). One hop per call; recursion resolves a base that is itself derived.
+    // Guard against a self-reference so a malformed decl can never loop. (A base
+    // followed by an inline comment before the first `.` is not followed — those
+    // derivations are not in the scaffold registry, and null-at-a-revision is the
+    // already-tolerated "not born yet" case.)
+    const baseMatch = /^([A-Za-z_$][\w$]*)\s*\./.exec(constantsSource.slice(i));
+    if (baseMatch && baseMatch[1] !== symbol) {
+      return extractConstantTemplate(constantsSource, baseMatch[1]);
+    }
+    return null; // not a template-literal constant and no resolvable base
+  }
   i += 1;
   let out = '';
   while (i < constantsSource.length) {

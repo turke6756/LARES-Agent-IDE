@@ -14,12 +14,16 @@ import {
   SUPERVISOR_RUN_ORCHESTRATION_SKILL,
   SUPERVISOR_CONTEXT_ANALYTICS_SKILL,
   SUPERVISOR_CHECKPOINT_FORENSICS_SKILL,
+  REMEMBER_SKILL,
   SCRIPT_READ_AGENT_LOG, SCRIPT_LIST_AGENTS, SCRIPT_SEND_MESSAGE, SCRIPT_GET_CONTEXT_STATS,
   WORKER_CLAUDE_MD, WORKER_CLAUDE_MD_V1, WORKER_BEHAVIORAL_MD,
   WORKER_CLAUDE_SETTINGS_JSON, WORKER_CLAUDE_SETTINGS_JSON_V2, WORKER_CLAUDE_SETTINGS_JSON_V3,
   WORKER_CLAUDE_SETTINGS_JSON_V4, WORKER_CLAUDE_SETTINGS_JSON_V5, WORKER_CLAUDE_SETTINGS_JSON_V6,
+  WORKER_CLAUDE_SETTINGS_JSON_V7,
   WORKER_CODEX_CONFIG_TOML, WORKER_CODEX_CONFIG_TOML_V1, WORKER_CODEX_CONFIG_TOML_V2,
-  WORKER_CODEX_CONFIG_TOML_V3,
+  WORKER_CODEX_CONFIG_TOML_V3, WORKER_CODEX_CONFIG_TOML_V4,
+  WORKER_CODEX_AGENTS_MD, WORKER_CODEX_AGENTS_MD_V1, WORKER_CODEX_BEHAVIORAL_MD,
+  GUARD_GIT_DISCARD_MJS,
   DASHBOARD_STATUS_SCRIPT_MJS, DASHBOARD_STATUS_SCRIPT_MJS_V3, DASHBOARD_STATUS_SCRIPT_MJS_V4, DASHBOARD_STATUS_SCRIPT_MJS_V5,
   DASHBOARD_STATUS_SCRIPT_MJS_V6, DASHBOARD_STATUS_SCRIPT_V7_HASH, DASHBOARD_STATUS_SCRIPT_V8_HASH,
   DASHBOARD_STATUSLINE_SCRIPT_MJS,
@@ -38,6 +42,16 @@ import {
   FILE_ACTIVITY_RETENTION_SESSIONS,
   LARES_DIR_NAME, LEGACY_LARES_DIR_NAME,
 } from '../../shared/constants';
+import { MEMORY_INDEX_MJS } from '../../shared/generated/memory-index-cli.generated';
+// WP-C — provider-neutral supervisor memory-index launch projection + Codex
+// pending-rail composition. The projection (readValidate + last-good/runtime
+// state + reconcile) lives in launch-injection.ts; delivery differs by provider.
+import { computeSupervisorMemoryInjection, composeMemoryPending } from '../memory-index/launch-injection';
+// WP-F1 — launch-time recovery for lesson publications interrupted mid-write
+// (a `memory_lessons` row stuck `pending`). Wired additively into the supervisor
+// launch tail (computeSupervisorMemoryInjectText) so an interrupted publish
+// completes forward or is marked `conflict` at the next supervisor launch.
+import { recoverPendingLessons } from '../memory-index/publisher';
 import { isTerminalChatStatus } from './agent-chat-history';
 import {
   writeScaffoldMap as writeSharedScaffoldMap,
@@ -813,9 +827,45 @@ export const SUPERVISOR_AGENT_MD_V17_HASH = '9746a15ef94e171c859507b5eb9e01e6347
  *  upgrades silently instead of being backed up. */
 export const SUPERVISOR_AGENT_MD_V18_HASH = 'd137657a7cbf0bda5fac32469b98eff1713d6101058969923a984a105af371f1';
 
+/** SHA-256 hex of the v19 `.lares/supervisor/CLAUDE.md` — the body BEFORE the
+ *  v20 memory-lessons-v2 edit (WP-G): the `## Memory` section becomes
+ *  injection-aware (index injected at launch for supervisors, D2 cold-resume
+ *  preamble, validate-after-edit, `remember`/`recall_memory` discoverability) and
+ *  the D10 `behavioral.md B-11/B-12` phantom is replaced with self-contained
+ *  triage guidance. Frozen as SUPERVISOR_AGENT_MD_V19 in constants.ts; the live
+ *  v20 body derives from it. Used in the v20 file's previousHashes so a pristine
+ *  v19 workspace upgrades silently instead of being backed up. */
+export const SUPERVISOR_AGENT_MD_V19_HASH = 'bb0c5b846bde9e4f857503ccd7c67087bc987f0379ac5c2eb22e3ffe2d57bb81';
+
 /** SHA-256 hex of the v6 `.dashboard/workers/claude/CLAUDE.md` (pre-`.lares`
  *  rename). Used in the v7 file's previousHashes. */
 export const WORKER_CLAUDE_MD_V6_HASH = '7d4af7db5264f03283a3de6a78eb5df93ce61b960193b2aa9936012e2c00e55d';
+
+/** SHA-256 hex of the v7 `.lares/workers/claude/CLAUDE.md` — the `.lares`-renamed
+ *  body BEFORE the git-discard guidance section. v8 inserts the
+ *  "## Never use git to discard uncommitted work" section (immediately above the
+ *  memory section) to match the new PreToolUse(guard-git-discard.mjs) block wired
+ *  into the worker settings. Used in the v8 file's previousHashes so a pristine v7
+ *  workspace upgrades silently instead of being backed up. */
+export const WORKER_CLAUDE_MD_V7_HASH = 'af1dc56c79a785498f85284d04afdaef6c54fa8ad66ba4688e9f7fef5abb35b6';
+
+/** SHA-256 hex of the v8 `.lares/workers/claude/CLAUDE.md` — the body BEFORE the
+ *  v9 memory-lessons-v2 edit (WP-G): the `## Memory: shared behavioral notes only`
+ *  section drops the `behavioral.md` read/append instruction entirely and becomes
+ *  `## Memory & lessons` with the injection-aware resident pointer (memory injected
+ *  at launch for supervisors; a worker fetches via `recall_memory` or a raw read of
+ *  `.lares/supervisor/memory/`), the cross-workspace discoverability line, and the
+ *  `remember`-skill pointer. Frozen as WORKER_CLAUDE_MD_V8 in constants.ts; the live
+ *  v9 body derives from it. Used in the v9 file's previousHashes so a pristine v8
+ *  workspace upgrades silently instead of being backed up. */
+export const WORKER_CLAUDE_MD_V8_HASH = '05bb90b3427f7ca62d18be164f9fc7cfb5c3318b1837246ae29e9848121877e7';
+
+/** SHA-256 hex of the v1 `.lares/workers/codex/AGENTS.md` — the Codex derivation
+ *  of the FROZEN worker v8 body (WORKER_CODEX_AGENTS_MD_V1). v2 is the live
+ *  WORKER_CODEX_AGENTS_MD (derived from the v9 worker body). Used in the codex
+ *  AGENTS.md scaffold entry's previousHashes[1] so a pristine v1 workspace upgrades
+ *  silently. */
+export const WORKER_CODEX_AGENTS_MD_V1_HASH = '430a331f1cfe54931583aac02036350a206377e53d8e19f785ab224bf31dbfd8';
 
 /** SHA-256 hex of the v5 `.dashboard/researcher/CLAUDE.md` (pre-`.lares`
  *  rename). Used in the v6 file's previousHashes. */
@@ -2577,7 +2627,17 @@ export class AgentSupervisor extends EventEmitter {
     // (see maybeDeliverInitialUserPrompt). Never merged into agentMdPrompt
     // above — that positional-arg path mixes content into launch framing and
     // is claude-only.
-    if (resolvedInput.initialUserPrompt) {
+    // WP-C — a supervisor-privilege CODEX launch rides its memory index on this
+    // same single-slot pending rail: index-only when there is no initial prompt,
+    // merged ahead of it when there is (exactly once — single-slot map). Claude
+    // supervisors instead get the index spliced into --append-system-prompt-file
+    // (launchWindows/WslAgent), so this is Codex-only here; every other agent
+    // (workers, researchers, Claude) keeps the plain initialUserPrompt path.
+    let stagedSupervisorMemory = false;
+    if (provider === 'codex') {
+      stagedSupervisorMemory = this.stageSupervisorMemoryInjection(agent.id, resolvedInput.initialUserPrompt ?? '');
+    }
+    if (!stagedSupervisorMemory && resolvedInput.initialUserPrompt) {
       this.pendingInitialPrompts.set(agent.id, {
         text: resolvedInput.initialUserPrompt,
         expiresAt: Date.now() + INITIAL_USER_PROMPT_TTL_MS,
@@ -2609,8 +2669,8 @@ export class AgentSupervisor extends EventEmitter {
   private static SUPERVISOR_FILES: Record<string, ScaffoldFile> = {
     [`.lares/supervisor/CLAUDE.md`]:                                              {
       content: SUPERVISOR_AGENT_MD,
-      version: 19, // v19 (turn-history) adds the <!-- section:turn-history v1 --> block documenting the checkpoint toolset (list_checkpoints/diff_turn/restore_paths/revert_turn/prune_checkpoints/read_agent_files_touched), the three-layer evidence model, capture-health ambiguity, forward-only paging, and immediate/destructive mutation in a shared tree; points at the checkpoint-forensics skill. Previously: v18 (cross-workspace-collaboration WP6) extends the `launch_agent` tool bullet with the `supervisor-peer` launch mode (top-level peer, cross-workspace-only, supervisor-gated) and adds a `revive_agent` bullet (supervisor-only relaunch of a done/crashed session; providers claude+codex). Previously: v17 (WP1.3) widens the `list_agents` tool bullet to document that a foreign `workspace_id` is supervisor-only, and adds a `list_workspaces` bullet (cross-workspace discovery). Previously: v16 (Lares rebrand) renames every `.dashboard/…` state-folder reference to `.lares/…` (working-directory note, researcher inbox pointers, research-store section). Previously: v15 (continuation-request awareness) adds the `save_continuation_brick` tool bullet and the `<!-- section:continuation-request v1 -->` block: answer a dashboard continuation request THAT TURN, write per-agent state + pointers rather than prose, respect the stated byte cap, finish the current response normally (the dashboard waits for turn completion before swapping), and start no new work. Previously: v14 (MCP context-overhead cut) removes the resident documentation for two deleted MCP tools: the `get_context_stats` bullet is gone (the `list_agents` bullet now states the per-agent context reading is returned inline, so the capability is preserved), and `## Multi-agent orchestration` no longer says "Discover with `list_orchestrations`".
-      previousHashes: { 1: SUPERVISOR_AGENT_MD_V1_HASH, 2: SUPERVISOR_AGENT_MD_V2_HASH, 3: SUPERVISOR_AGENT_MD_V3_HASH, 4: SUPERVISOR_AGENT_MD_V4_HASH, 5: SUPERVISOR_AGENT_MD_V5_HASH, 6: SUPERVISOR_AGENT_MD_V6_HASH, 7: SUPERVISOR_AGENT_MD_V7_HASH, 8: SUPERVISOR_AGENT_MD_V8_HASH, 9: SUPERVISOR_AGENT_MD_V9_HASH, 10: SUPERVISOR_AGENT_MD_V10_HASH, 11: SUPERVISOR_AGENT_MD_V11_HASH, 12: SUPERVISOR_AGENT_MD_V12_HASH, 13: SUPERVISOR_AGENT_MD_V13_HASH, 14: SUPERVISOR_AGENT_MD_V14_HASH, 15: SUPERVISOR_AGENT_MD_V15_HASH, 16: SUPERVISOR_AGENT_MD_V16_HASH, 17: SUPERVISOR_AGENT_MD_V17_HASH, 18: SUPERVISOR_AGENT_MD_V18_HASH },
+      version: 20, // v20 (memory-lessons v2, WP-G) rewrites the `## Memory` section to injection-aware text (the index is injected at launch for supervisors, not an instructed session-start read), adds the D2 cold-resume re-orientation preamble, a validate-after-edit pointer, and the discoverability paragraph (memories/lessons serve EVERY supervisor/worker, not just the author; `remember` to save, `recall_memory` to fetch); and replaces the D10 `see behavioral.md B-11/B-12` phantom with self-contained triage guidance. Previously: v19 (turn-history) adds the <!-- section:turn-history v1 --> block documenting the checkpoint toolset (list_checkpoints/diff_turn/restore_paths/revert_turn/prune_checkpoints/read_agent_files_touched), the three-layer evidence model, capture-health ambiguity, forward-only paging, and immediate/destructive mutation in a shared tree; points at the checkpoint-forensics skill. Previously: v18 (cross-workspace-collaboration WP6) extends the `launch_agent` tool bullet with the `supervisor-peer` launch mode (top-level peer, cross-workspace-only, supervisor-gated) and adds a `revive_agent` bullet (supervisor-only relaunch of a done/crashed session; providers claude+codex). Previously: v17 (WP1.3) widens the `list_agents` tool bullet to document that a foreign `workspace_id` is supervisor-only, and adds a `list_workspaces` bullet (cross-workspace discovery). Previously: v16 (Lares rebrand) renames every `.dashboard/…` state-folder reference to `.lares/…` (working-directory note, researcher inbox pointers, research-store section). Previously: v15 (continuation-request awareness) adds the `save_continuation_brick` tool bullet and the `<!-- section:continuation-request v1 -->` block: answer a dashboard continuation request THAT TURN, write per-agent state + pointers rather than prose, respect the stated byte cap, finish the current response normally (the dashboard waits for turn completion before swapping), and start no new work. Previously: v14 (MCP context-overhead cut) removes the resident documentation for two deleted MCP tools: the `get_context_stats` bullet is gone (the `list_agents` bullet now states the per-agent context reading is returned inline, so the capability is preserved), and `## Multi-agent orchestration` no longer says "Discover with `list_orchestrations`".
+      previousHashes: { 1: SUPERVISOR_AGENT_MD_V1_HASH, 2: SUPERVISOR_AGENT_MD_V2_HASH, 3: SUPERVISOR_AGENT_MD_V3_HASH, 4: SUPERVISOR_AGENT_MD_V4_HASH, 5: SUPERVISOR_AGENT_MD_V5_HASH, 6: SUPERVISOR_AGENT_MD_V6_HASH, 7: SUPERVISOR_AGENT_MD_V7_HASH, 8: SUPERVISOR_AGENT_MD_V8_HASH, 9: SUPERVISOR_AGENT_MD_V9_HASH, 10: SUPERVISOR_AGENT_MD_V10_HASH, 11: SUPERVISOR_AGENT_MD_V11_HASH, 12: SUPERVISOR_AGENT_MD_V12_HASH, 13: SUPERVISOR_AGENT_MD_V13_HASH, 14: SUPERVISOR_AGENT_MD_V14_HASH, 15: SUPERVISOR_AGENT_MD_V15_HASH, 16: SUPERVISOR_AGENT_MD_V16_HASH, 17: SUPERVISOR_AGENT_MD_V17_HASH, 18: SUPERVISOR_AGENT_MD_V18_HASH, 19: SUPERVISOR_AGENT_MD_V19_HASH },
     },
     [`.lares/supervisor/.claude/settings.json`]:                                  {
       content: SUPERVISOR_CLAUDE_SETTINGS_JSON,
@@ -2658,6 +2718,14 @@ export class AgentSupervisor extends EventEmitter {
     // unmanaged file already at this path is treated as user-authored and .bak'd
     // rather than silently overwritten). Same shape as context-analytics above.
     [`.lares/supervisor/.claude/skills/checkpoint-forensics/SKILL.md`]:           { content: SUPERVISOR_CHECKPOINT_FORENSICS_SKILL, version: 1 },
+    // Memory & Lessons v2 (WP-F1): the `remember` skill — the ONE user-facing
+    // memory/lesson write entry — ships to the Claude SUPERVISOR skill root here
+    // (the Codex supervisor `.agents/skills/` copy is SUPERVISOR_FILES_CODEX; the
+    // worker copies are WORKER_FILES_CLAUDE + codexFiles). New-skill shape
+    // ({ version: 1 }, no previousHashes — same as checkpoint-forensics above).
+    // Published lessons are NOT scaffold entries — the memory_lessons DB registry
+    // is their record; only `remember` itself is managed here.
+    [`.lares/supervisor/.claude/skills/remember/SKILL.md`]:                       { content: REMEMBER_SKILL, version: 1 },
     // Persona kit (§1.4) — the two default skills ship into every native lane too
     // so the supervisor/researcher/worker can guide persona creation + read comments.
     [`.lares/supervisor/.claude/skills/create-persona/SKILL.md`]:                 { content: PERSONA_CREATE_PERSONA_SKILL, version: 4, previousHashes: { 1: sha256Hex(PERSONA_CREATE_PERSONA_SKILL_V1), 2: PERSONA_CREATE_PERSONA_SKILL_V2_HASH, 3: PERSONA_CREATE_PERSONA_SKILL_V3_HASH } }, // v4: `.lares` rename
@@ -2671,6 +2739,18 @@ export class AgentSupervisor extends EventEmitter {
     [`.lares/supervisor/scripts/list-agents.sh`]:                                 { content: SCRIPT_LIST_AGENTS,                   version: 1, executable: true },
     [`.lares/supervisor/scripts/send-message.sh`]:                                { content: SCRIPT_SEND_MESSAGE,                  version: 1, executable: true },
     [`.lares/supervisor/scripts/get-context-stats.sh`]:                           { content: SCRIPT_GET_CONTEXT_STATS,             version: 1, executable: true },
+  };
+
+  /** Memory & Lessons v2 (WP-F1) — the Codex-supervisor skill map. WP-R proved a
+   *  Codex supervisor (provider='codex') discovers + invokes skills under its cwd
+   *  `.lares/supervisor/.agents/skills/`, so the `remember` skill is provisioned
+   *  there too. Written UNCONDITIONALLY on every supervisor scaffold pass (like
+   *  the research store) so the location is present whenever a workspace's
+   *  supervisor might run on Codex — the `.agents/` path is inert for a Claude
+   *  supervisor (Claude reads only `.claude/skills/`), so an always-present copy
+   *  is harmless. New-skill shape ({ version: 1 }, no previousHashes). */
+  private static SUPERVISOR_FILES_CODEX: Record<string, ScaffoldFile> = {
+    [`.lares/supervisor/.agents/skills/remember/SKILL.md`]: { content: REMEMBER_SKILL, version: 1 },
   };
 
   /** Class IV — workspace-shared hook script. Written on first supervised
@@ -2715,6 +2795,18 @@ export class AgentSupervisor extends EventEmitter {
     // is needed. Written alongside dashboard-status.mjs on any workspace-script
     // scaffold pass (incl. the persona-launch branch in launchAgent).
     [`.lares/scripts/read-comments.py`]: { content: SCRIPT_READ_COMMENTS_PY, version: 1, executable: true },
+    // Shared PreToolUse git-discard guard (wired by BOTH worker scaffolds — the
+    // Claude settings.json PreToolUse(Bash) hook and the Codex config.toml
+    // [[hooks.PreToolUse]] block). One dependency-free script serves both
+    // providers; blocks git commands that discard uncommitted work in the shared
+    // working tree. Written on every workspace-script scaffold pass, like
+    // dashboard-status.mjs.
+    [`.lares/scripts/guard-git-discard.mjs`]: { content: GUARD_GIT_DISCARD_MJS, version: 3, executable: true, previousHashes: { 1: GUARD_GIT_DISCARD_MJS_V1_HASH, 2: GUARD_GIT_DISCARD_MJS_V2_HASH } }, // v3: PER-PROVIDER exit — process.exit(codex ? 0 : 2). v2 exited 0 for everyone, which left the Claude lane UNENFORCING (Claude 2.1.220 does not honor an exit-0 hookSpecificOutput deny for Bash); Codex still needs exit 0 (fails OPEN on nonzero). v2: per-provider deny JSON; v1: one deny shape for everyone.
+    // Memory-index v2 CLI (WP-A1). Self-contained ESM bundled from
+    // scripts/memory-index-cli-entry.ts + src/shared/memory-index-core.ts (one
+    // source of logic; main imports the same core in-process). The `remember`
+    // skill runs `node .lares/scripts/memory-index.mjs validate <index>`.
+    [`.lares/scripts/memory-index.mjs`]: { content: MEMORY_INDEX_MJS, version: 1, executable: true },
     // Usage-limits capture (plans/usage-limits-mcp-and-ui.md) — the statusLine
     // command each lane's settings.json points at. Prints the terminal status
     // line AND writes the rate_limits reading to .lares/usage/latest.json.
@@ -2736,12 +2828,12 @@ export class AgentSupervisor extends EventEmitter {
   private static WORKER_FILES_CLAUDE: Record<string, ScaffoldFile> = {
     [`.lares/workers/claude/CLAUDE.md`]:                       {
       content: WORKER_CLAUDE_MD,
-      version: 7, // v2 adds the memory section; v3 (WP-G) adds the research-store pointer; v4 adds the online-research division of labor; v5 (planning-surface WP2) adds the plan-event sentinel section; v6 (GT-C D2) makes the PLAN-EVENT sentinel mandatory on every rail turn + expands the status vocab; v7 (Lares rebrand) renames `.dashboard/…` → `.lares/…`
-      previousHashes: { 1: sha256Hex(WORKER_CLAUDE_MD_V1), 2: WORKER_CLAUDE_MD_V2_HASH, 3: WORKER_CLAUDE_MD_V3_HASH, 4: WORKER_CLAUDE_MD_V4_HASH, 5: WORKER_CLAUDE_MD_V5_HASH, 6: WORKER_CLAUDE_MD_V6_HASH },
+      version: 9, // v9 (memory-lessons v2, WP-G) retires the shared `behavioral.md` read/append instruction: the `## Memory: shared behavioral notes only` section becomes `## Memory & lessons` with the injection-aware resident pointer (memory injected at launch for supervisors; a worker fetches via the `recall_memory` tool or a raw read of `.lares/supervisor/memory/`), the cross-workspace discoverability line, and the `remember`-skill pointer. Previously: v2 adds the memory section; v3 (WP-G) adds the research-store pointer; v4 adds the online-research division of labor; v5 (planning-surface WP2) adds the plan-event sentinel section; v6 (GT-C D2) makes the PLAN-EVENT sentinel mandatory on every rail turn + expands the status vocab; v7 (Lares rebrand) renames `.dashboard/…` → `.lares/…`; v8 adds the "Never use git to discard uncommitted work" section (pairs with the PreToolUse guard-git-discard.mjs hook)
+      previousHashes: { 1: sha256Hex(WORKER_CLAUDE_MD_V1), 2: WORKER_CLAUDE_MD_V2_HASH, 3: WORKER_CLAUDE_MD_V3_HASH, 4: WORKER_CLAUDE_MD_V4_HASH, 5: WORKER_CLAUDE_MD_V5_HASH, 6: WORKER_CLAUDE_MD_V6_HASH, 7: WORKER_CLAUDE_MD_V7_HASH, 8: WORKER_CLAUDE_MD_V8_HASH },
     },
     [`.lares/workers/claude/.claude/settings.json`]:           {
       content: WORKER_CLAUDE_SETTINGS_JSON,
-      version: 7, // v7 adds the statusLine → dashboard-statusline.mjs usage-capture block
+      version: 8, // v7 adds the statusLine → dashboard-statusline.mjs usage-capture block; v8 adds the PreToolUse(Bash) → guard-git-discard.mjs hook (blocks git commands that discard uncommitted work in the shared tree)
       previousHashes: {
         1: WORKER_CLAUDE_SETTINGS_JSON_V1_HASH,
         2: sha256Hex(WORKER_CLAUDE_SETTINGS_JSON_V2),
@@ -2749,8 +2841,12 @@ export class AgentSupervisor extends EventEmitter {
         4: sha256Hex(WORKER_CLAUDE_SETTINGS_JSON_V4),
         5: sha256Hex(WORKER_CLAUDE_SETTINGS_JSON_V5),
         6: sha256Hex(WORKER_CLAUDE_SETTINGS_JSON_V6),
+        7: sha256Hex(WORKER_CLAUDE_SETTINGS_JSON_V7),
       },
     },
+    // Memory & Lessons v2 (WP-F1): the `remember` skill for the Claude WORKER
+    // skill root. New-skill shape ({ version: 1 }, no previousHashes).
+    [`.lares/workers/claude/.claude/skills/remember/SKILL.md`]:       { content: REMEMBER_SKILL, version: 1 },
     // Persona kit (§1.4) — default skills for the Claude worker lane.
     [`.lares/workers/claude/.claude/skills/create-persona/SKILL.md`]: { content: PERSONA_CREATE_PERSONA_SKILL, version: 4, previousHashes: { 1: sha256Hex(PERSONA_CREATE_PERSONA_SKILL_V1), 2: PERSONA_CREATE_PERSONA_SKILL_V2_HASH, 3: PERSONA_CREATE_PERSONA_SKILL_V3_HASH } }, // v4: `.lares` rename
     [`.lares/workers/claude/.claude/skills/read-comments/SKILL.md`]:  { content: PERSONA_READ_COMMENTS_SKILL, version: 5, previousHashes: { 1: sha256Hex(PERSONA_READ_COMMENTS_SKILL_V1), 2: sha256Hex(PERSONA_READ_COMMENTS_SKILL_V2), 3: sha256Hex(PERSONA_READ_COMMENTS_SKILL_V3), 4: sha256Hex(PERSONA_READ_COMMENTS_SKILL_V4) } }, // v5: Python fallback removed (honest on a Python-free clean VM)
@@ -2798,13 +2894,17 @@ export class AgentSupervisor extends EventEmitter {
    *  Only writes files that don't already exist — never overwrites user edits. */
   private ensureSupervisorScaffold(workDir: string, pathType: string): void {
     const created = this.writeScaffoldMap(workDir, AgentSupervisor.SUPERVISOR_FILES, pathType);
+    // WP-F1 — the Codex-supervisor `remember` copy under `.agents/skills/` (inert
+    // for a Claude supervisor). Written on every supervisor scaffold so it is
+    // present whenever the workspace's supervisor runs on Codex.
+    const codexCreated = this.writeScaffoldMap(workDir, AgentSupervisor.SUPERVISOR_FILES_CODEX, pathType);
     // MEMORY.md is seed-once (NOT in SUPERVISOR_FILES) so an edited copy is
     // never clobbered. On workspaces scaffolded before this change the sidecar
     // still carries a stale `supervisor/memory/MEMORY.md` managed-version
     // entry; it is intentionally left orphaned — writeScaffoldMap no longer
     // iterates that key, so the entry is never read and is harmless.
     const memCreated = this.seedSupervisorMemoryIfAbsent(workDir, pathType);
-    const total = created + memCreated;
+    const total = created + codexCreated + memCreated;
     if (total > 0) {
       console.log(`[supervisor] Scaffolded ${total} files in ${workDir}/.lares/supervisor/`);
       addEvent('system', 'supervisor_scaffold_created', JSON.stringify({ workDir, filesCreated: total }));
@@ -2850,7 +2950,11 @@ export class AgentSupervisor extends EventEmitter {
     let providerCreated = 0;
     if (provider === 'claude') {
       providerCreated = this.writeScaffoldMap(workDir, AgentSupervisor.WORKER_FILES_CLAUDE, pathType);
-      providerCreated += this.seedWorkerMemoryIfAbsent(workDir, pathType);
+      // WP-G (memory-lessons v2): worker `behavioral.md` seeding is RETIRED. The
+      // worker CLAUDE.md (v9) no longer instructs a read/append of behavioral.md;
+      // memory + lessons are the injected supervisor index + the `remember` skill.
+      // seedWorkerMemoryIfAbsent stays defined but is no longer called, so fresh
+      // scaffolds create no worker behavioral.md (the constant is left inert).
     } else if (provider === 'codex') {
       // Codex hooks have no ${CLAUDE_PROJECT_DIR} analog, so materialize the
       // absolute script path at write time. The path is read by the runtime
@@ -2883,18 +2987,53 @@ export class AgentSupervisor extends EventEmitter {
         /\$\{WORKSPACE_ROOT\}/g,
         posixWorkspaceRoot,
       );
+      const codexConfigV4 = WORKER_CODEX_CONFIG_TOML_V4.replace(
+        /\$\{WORKSPACE_ROOT\}/g,
+        posixWorkspaceRoot,
+      );
       const codexFiles: Record<string, ScaffoldFile> = {
         [`.lares/workers/codex/.codex/config.toml`]: {
           content: codexConfig,
-          version: 4,
+          version: 5,
           previousHashes: {
             1: sha256Hex(codexConfigV1),
             2: sha256Hex(codexConfigV2),
             3: sha256Hex(codexConfigV3),
+            4: sha256Hex(codexConfigV4),
           },
+        },
+        // Standing instructions for the Codex worker. AGENTS.md is the file the
+        // Codex CLI reads from its cwd (unlike config.toml, which needs a trusted
+        // project) — so this is what actually delivers the turn-ending protocol,
+        // shared-cwd rules, research-store framing, plan-event sentinel, and the
+        // git-discard rule to a Codex worker. Body is DERIVED from
+        // WORKER_CLAUDE_MD (see WORKER_CODEX_AGENTS_MD) so it can't drift.
+        // v2 (memory-lessons v2, WP-G): inherits the worker v8→v9 memory-section
+        // rewrite (behavioral.md read/append instruction retired → injection-aware
+        // resident pointer + discoverability + `remember`). previousHashes[1] =
+        // the frozen v1 body (WORKER_CODEX_AGENTS_MD_V1, derived from the frozen v8
+        // worker body) so a pristine v1 workspace upgrades silently.
+        [`.lares/workers/codex/AGENTS.md`]: {
+          content: WORKER_CODEX_AGENTS_MD,
+          version: 2,
+          previousHashes: { 1: WORKER_CODEX_AGENTS_MD_V1_HASH },
+        },
+        // Memory & Lessons v2 (WP-F1): the `remember` skill for the Codex WORKER
+        // skill root (WP-R proved `.agents/skills/` discovery + invocation from
+        // the Codex worker cwd). New-skill shape ({ version: 1 }, no
+        // previousHashes) — content is provider-neutral, identical to the Claude
+        // copies.
+        [`.lares/workers/codex/.agents/skills/remember/SKILL.md`]: {
+          content: REMEMBER_SKILL,
+          version: 1,
         },
       };
       providerCreated = this.writeScaffoldMap(workDir, codexFiles, pathType);
+      // WP-G (memory-lessons v2): Codex worker `behavioral.md` seeding is RETIRED,
+      // mirroring the Claude worker. The Codex AGENTS.md (v2) points at the
+      // injected supervisor memory + the `remember` skill, not a seeded
+      // behavioral.md. seedCodexWorkerMemoryIfAbsent stays defined but uncalled, so
+      // fresh scaffolds create no Codex worker behavioral.md.
     }
     const total = scriptCreated + providerCreated;
     if (total > 0) {
@@ -3006,6 +3145,21 @@ export class AgentSupervisor extends EventEmitter {
     return 1;
   }
 
+  /** Seed the shared *Codex* worker behavioral memory
+   *  (`.lares/workers/codex/behavioral.md`) — the Codex analog of
+   *  seedWorkerMemoryIfAbsent above. Same seed-once / not-version-managed
+   *  contract: workers append behavioral lessons across sessions and those
+   *  edits must survive every relaunch, so it is written write-if-absent and
+   *  never touched again. Exists so the Codex worker's AGENTS.md "Memory"
+   *  section points at a real file rather than a nonexistent path.
+   *  Returns 1 if it wrote the seed, 0 if the file already existed. */
+  private seedCodexWorkerMemoryIfAbsent(workDir: string, pathType: string): number {
+    const relPath = `.lares/workers/codex/behavioral.md`;
+    if (scaffoldFileExists(workDir, relPath, pathType)) return 0;
+    atomicWriteScaffoldText(workDir, relPath, WORKER_CODEX_BEHAVIORAL_MD, false, pathType);
+    return 1;
+  }
+
   /** Seed the supervisor's memory (`.lares/supervisor/memory/MEMORY.md`) —
    *  write-if-absent, then hands off ownership to the supervisor (and the human
    *  curating it across sessions).
@@ -3024,16 +3178,21 @@ export class AgentSupervisor extends EventEmitter {
     return 1;
   }
 
-  /** Class IV — write the codex hook profile + shared status script into the
-   *  runtime's CODEX_HOME so `codex --profile dashboard-worker` loads turn-
-   *  boundary hooks. Unlike the worker-cwd config.toml (which codex only reads
-   *  for a trusted project), a profile file layers onto the base config
-   *  unconditionally. The in-memory guard avoids re-touching it on every launch.
+  /** Class IV — write the codex hook profile + the two shared scripts
+   *  (dashboard-status.mjs AND guard-git-discard.mjs) into the runtime's
+   *  CODEX_HOME so `codex --profile dashboard-worker` loads turn-boundary hooks
+   *  AND the PreToolUse git-discard guard. Unlike the worker-cwd config.toml
+   *  (which codex only reads for a trusted project — so its hook blocks are
+   *  INERT), a profile file layers onto the base config unconditionally. The
+   *  in-memory guard avoids re-touching it on every launch.
    *
    *  B8 (§8.5): the profile body alone is not enough — Codex gates each hook
    *  behind a per-hook trust hash, so the writer SEEDS `[hooks.state]` with the
    *  correct `trusted_hash` for every hook it installs (Stop / UserPromptSubmit /
-   *  SessionStart), pre-trusting them with zero user interaction. The write is
+   *  SessionStart / PreToolUse), pre-trusting them with zero user interaction.
+   *  The scripts carry no trust hash and are (re)written on every launch, even
+   *  on the non-clobbering trust-intact fast path, so a content bump propagates.
+   *  The write is
    *  also NON-CLOBBERING: if the on-disk file already has the identical body and
    *  all the trust hashes, it is left untouched — so a plain restart (and a
    *  user's manual `t`) survive instead of being wiped every launch. Best-effort:
@@ -3557,6 +3716,16 @@ export class AgentSupervisor extends EventEmitter {
       ? (preMintedToken ?? this.mintAgentCapabilityToken(agent))
       : undefined;
 
+    // WP-C — ordinary CODEX supervisor RESUME/relaunch (auto-restart, reconcile
+    // re-drive) bypasses launchAgent, so the fresh-launch staging never ran;
+    // stage the memory index here on the same pending rail. Only when nothing is
+    // already staged this launch — a revive pre-stages index+wake, and this guard
+    // preserves it instead of overwriting with an index-only entry. Claude resume
+    // deliberately does NOT re-inject (matrix); the sysprompt splice is FRESH-only.
+    if (resume && agent.provider === 'codex' && hasSupervisorPrivilege(agent) && !this.pendingInitialPrompts.has(agent.id)) {
+      this.stageSupervisorMemoryInjection(agent.id, '');
+    }
+
     // WP-3b: a (re)launch mints a new epoch, so any surviving checkpoint sidecar
     // from a prior epoch (incl. a prior Electron session, whose epoch is not
     // persisted) is now stale. Drop it — bounded cleanup; the load-side epoch
@@ -3675,6 +3844,17 @@ export class AgentSupervisor extends EventEmitter {
         const brickBlock = this.buildContinuationBrickBlock(agent, resume);
         if (brickBlock) {
           sysPrompt += `\n\n${brickBlock}`;
+        }
+        // WP-C — a supervisor-privilege Claude launch carries the projected
+        // memory index in this same --append-system-prompt-file block. FRESH
+        // launches only: a resume rebuilds this sysprompt but must not re-inject
+        // (relaunch re-projection would double against the pending rail). The
+        // outer gate already narrows to Claude supervisor/worker/researcher lanes;
+        // hasSupervisorPrivilege further excludes supervised workers + researchers
+        // so only true supervisors + supervisor-privilege personas get the index.
+        if (!resume && hasSupervisorPrivilege(agent)) {
+          const memText = this.computeSupervisorMemoryInjectText(agent);
+          if (memText) sysPrompt += `\n\n${memText}`;
         }
         args.push('--add-dir', addDir);
         // CLI v2.1.156 regression: inline `--append-system-prompt "<string>"`
@@ -4390,6 +4570,15 @@ export class AgentSupervisor extends EventEmitter {
       ? (preMintedToken ?? this.mintAgentCapabilityToken(agent))
       : undefined;
 
+    // WP-C — ordinary CODEX supervisor RESUME/relaunch bypasses launchAgent, so
+    // stage the memory index here on the pending rail (mirrors the Windows path).
+    // Only when nothing is already staged this launch (a revive pre-stages
+    // index+wake); Claude resume never re-injects (the sysprompt splice is
+    // FRESH-only).
+    if (resume && agent.provider === 'codex' && hasSupervisorPrivilege(agent) && !this.pendingInitialPrompts.has(agent.id)) {
+      this.stageSupervisorMemoryInjection(agent.id, '');
+    }
+
     // A workspace typed 'wsl' on a machine WITHOUT WSL routes here and tries to
     // run `ccodex`/`ccode` inside a distro that doesn't exist, failing
     // cryptically — the Windows resolver in launchWindowsAgent can't help a
@@ -4561,6 +4750,15 @@ export class AgentSupervisor extends EventEmitter {
       const brickBlock = this.buildContinuationBrickBlock(agent, resume);
       if (brickBlock) {
         sysPromptText += `\n\n${brickBlock}`;
+      }
+      // WP-C — supervisor-privilege Claude launch carries the projected memory
+      // index in the same --append-system-prompt-file block (mirrors Windows).
+      // FRESH launches only (a resume must not re-inject); hasSupervisorPrivilege
+      // narrows the supervisor/worker/researcher preamble gate to true
+      // supervisors + supervisor-privilege personas.
+      if (!resume && hasSupervisorPrivilege(agent)) {
+        const memText = this.computeSupervisorMemoryInjectText(agent);
+        if (memText) sysPromptText += `\n\n${memText}`;
       }
     }
 
@@ -5871,13 +6069,21 @@ export class AgentSupervisor extends EventEmitter {
 
       // 4) stage wake AFTER stop (stopAgentBody:5351 deleted any prior pending prompt)
       let queued = false;
-      if (opts.message) {
+      // WP-C — a revived supervisor rides its memory index on the SAME wake
+      // entry (provider-neutral): stageSupervisorMemoryInjection composes the
+      // index ahead of the wake message and sets the single-slot rail once — so
+      // the index arrives WITH the wake, not as a duplicate second delivery, for
+      // both Claude and Codex revives. A revived non-supervisor (or a supervisor
+      // with an empty projection) falls through to the plain wake-only staging.
+      const wake = opts.message ? buildRevivalWakeMessage(opts.message) : '';
+      const stagedMem = this.stageSupervisorMemoryInjection(agentId, wake);
+      if (!stagedMem && wake) {
         this.pendingInitialPrompts.set(agentId, {
-          text: buildRevivalWakeMessage(opts.message),      // preamble: "call get_my_context first, then:"
+          text: wake,      // preamble: "call get_my_context first, then:"
           expiresAt: Date.now() + INITIAL_USER_PROMPT_TTL_MS,
         });
-        queued = true;
       }
+      if (opts.message) queued = true;
 
       // 5) shared post-stop tail; a throw means NO relaunch → do not report success
       try { await this.resumeAgentAfterStopLocked(agentId); }
@@ -6178,6 +6384,50 @@ export class AgentSupervisor extends EventEmitter {
       console.error(`[initial-prompt] Delivery to ${agentId} failed:`, err);
       this.emit('sendInputError', { agentId, error: err.message });
     });
+  }
+
+  /** WP-C — the provider-neutral supervisor memory-index projection for ONE
+   *  launch, fail-open. Resolves the agent's workspace root and runs the shared
+   *  launch projection (read + validate + last-good/runtime state + reconcile),
+   *  returning the bytes to inject ('' on any failure so a launch never blocks on
+   *  memory). Both delivery adapters call THIS — Claude splices the returned text
+   *  into its --append-system-prompt-file block; Codex stages it below. */
+  private computeSupervisorMemoryInjectText(agent: Agent): string {
+    try {
+      const workspaceRoot = getEffectiveWorkspaceRoot(agent);
+      const nowISO = new Date().toISOString();
+      // WP-F1 — launch-tail recovery: complete-forward or conflict-mark any
+      // lesson publication interrupted mid-write for this workspace. Fail-open +
+      // idempotent (a no-op when nothing is pending); never blocks the launch.
+      try {
+        recoverPendingLessons(agent.workspaceId, workspaceRoot, detectPathType(workspaceRoot), nowISO);
+      } catch (recoverErr) {
+        console.error(`[memory-index] lesson recovery failed for ${agent.id} (fail-open):`, recoverErr);
+      }
+      return computeSupervisorMemoryInjection(agent.workspaceId, workspaceRoot, nowISO).injectText;
+    } catch (err) {
+      console.error(`[memory-index] projection failed for ${agent.id} (fail-open):`, err);
+      return '';
+    }
+  }
+
+  /** WP-C — Codex delivery: compose the supervisor memory index ahead of
+   *  `baseText` and stage it on the SINGLE-SLOT pending-message rail (delivered
+   *  exactly once by maybeDeliverInitialUserPrompt → sendInput). Index-only when
+   *  `baseText` is empty. Returns true iff it staged (agent is a supervisor-
+   *  privilege lane AND the composed text is non-empty); a non-supervisor or an
+   *  empty composition leaves the rail untouched so the caller can fall back to
+   *  its own base-text staging. Provider-neutral by construction — Codex launches
+   *  and both-provider revives route through here; a Claude FRESH launch instead
+   *  uses the sysprompt splice and never reaches this. */
+  private stageSupervisorMemoryInjection(agentId: string, baseText: string): boolean {
+    const agent = getAgent(agentId);
+    if (!agent || !hasSupervisorPrivilege(agent)) return false;
+    const injectText = this.computeSupervisorMemoryInjectText(agent);
+    const text = composeMemoryPending(injectText, baseText);
+    if (!text) return false;
+    this.pendingInitialPrompts.set(agentId, { text, expiresAt: Date.now() + INITIAL_USER_PROMPT_TTL_MS });
+    return true;
   }
 
   /** Class IV — called by src/main/index.ts after apiServer.start() so the

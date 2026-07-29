@@ -18,6 +18,11 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { AgentSupervisor } from './index';
+import {
+  SUPERVISOR_CLAUDE_SETTINGS_JSON,
+  WORKER_CLAUDE_SETTINGS_JSON,
+  RESEARCHER_CLAUDE_SETTINGS_JSON,
+} from '../../shared/constants';
 
 interface TestCase {
   name: string;
@@ -102,6 +107,63 @@ test('Codex: scaffold writes .codex/config.toml with absolute workspace path int
       !fs.existsSync(claudeSettings),
       `codex scaffold should not create ${claudeSettings}`,
     );
+  } finally {
+    cleanup();
+    rmrf(workDir);
+  }
+});
+
+test('Codex: scaffold writes AGENTS.md standing instructions + NO behavioral.md (WP-G)', () => {
+  const workDir = mktmp('codex-agents-md');
+  const { supervisor, cleanup } = makeSupervisor();
+  try {
+    supervisor.ensureWorkerScaffold(workDir, 'codex', 'windows');
+
+    // AGENTS.md is the file the Codex CLI reads from cwd as standing instructions.
+    const agentsPath = path.join(workDir, '.lares', 'workers', 'codex', 'AGENTS.md');
+    assert.ok(fs.existsSync(agentsPath), `expected ${agentsPath} to exist`);
+    const agents = fs.readFileSync(agentsPath, 'utf-8');
+
+    // The rule this whole file exists to deliver must be present.
+    assert.ok(
+      agents.includes('## Never use git to discard uncommitted work'),
+      'codex AGENTS.md must carry the git-discard section',
+    );
+    // Turn-ending protocol + shared-cwd + plan-event sentinel all present.
+    assert.ok(agents.includes('end your turn with the question in plain text'), 'turn-ending protocol present');
+    assert.ok(agents.includes('.lares/workers/codex/'), 'cwd references point at the codex lane');
+    assert.ok(!agents.includes('.lares/workers/claude/'), 'no leftover claude cwd references');
+    assert.ok(agents.includes('PLAN-EVENT'), 'plan-event sentinel section present');
+    assert.ok(!agents.includes('AskUserQuestion'), 'Claude-Code-specific tool name removed');
+    // v2 (WP-G): the memory-lessons section points at the injected supervisor memory
+    // + recall_memory + remember, NOT a seeded behavioral.md.
+    assert.ok(agents.includes('## Memory & lessons'), 'codex AGENTS.md carries the new memory-lessons section');
+    assert.ok(agents.includes('recall_memory'), 'codex AGENTS.md names the recall_memory fetch tool');
+    assert.ok(agents.includes('.lares/supervisor/memory/MEMORY.md'), 'codex AGENTS.md names the raw-read fallback path');
+    assert.ok(!agents.includes('The one durable exception is'), 'codex AGENTS.md drops the retired behavioral.md instruction');
+
+    // WP-G retired seeding: fresh Codex scaffold must write NO behavioral.md.
+    const memPath = path.join(workDir, '.lares', 'workers', 'codex', 'behavioral.md');
+    assert.ok(!fs.existsSync(memPath), `WP-G: no Codex worker behavioral.md must be seeded; found ${memPath}`);
+  } finally {
+    cleanup();
+    rmrf(workDir);
+  }
+});
+
+test('Codex: never overwrites existing AGENTS.md on second scaffold call', () => {
+  const workDir = mktmp('codex-agents-no-overwrite');
+  const { supervisor, cleanup } = makeSupervisor();
+  try {
+    supervisor.ensureWorkerScaffold(workDir, 'codex', 'windows');
+    const agentsPath = path.join(workDir, '.lares', 'workers', 'codex', 'AGENTS.md');
+    const sentinel = '# user-edited-marker-do-not-clobber\n';
+    fs.writeFileSync(agentsPath, sentinel, 'utf-8');
+
+    supervisor.ensureWorkerScaffold(workDir, 'codex', 'windows');
+
+    const after = fs.readFileSync(agentsPath, 'utf-8');
+    assert.equal(after, sentinel, `second scaffold call must not overwrite user-edited AGENTS.md; got: ${after}`);
   } finally {
     cleanup();
     rmrf(workDir);
@@ -224,56 +286,26 @@ test('Claude: scaffold writes .claude/settings.json verbatim (no path materializ
   }
 });
 
-test('Claude: scaffold seeds the shared behavioral.md worker memory', () => {
+test('Claude: scaffold writes NO worker behavioral.md (WP-G retired seeding)', () => {
   const workDir = mktmp('claude-worker-memory');
   const { supervisor, cleanup } = makeSupervisor();
   try {
     supervisor.ensureWorkerScaffold(workDir, 'claude', 'windows');
 
+    // WP-G (memory-lessons v2): the shared worker behavioral.md is no longer
+    // seeded. A worker's CLAUDE.md (v9) points at the injected supervisor memory +
+    // the `remember` skill instead. A fresh scaffold must create no behavioral.md.
     const memPath = path.join(workDir, '.lares', 'workers', 'claude', 'behavioral.md');
-    assert.ok(fs.existsSync(memPath), `expected ${memPath}`);
+    assert.ok(!fs.existsSync(memPath), `WP-G: no Claude worker behavioral.md must be seeded; found ${memPath}`);
 
-    const content = fs.readFileSync(memPath, 'utf-8');
-    assert.ok(
-      content.includes('# Worker Behavioral Memory'),
-      `behavioral.md should carry the seed header; got: ${content.slice(0, 120)}`,
-    );
-    // Behavioral-only contract must be stated so workers don't dump task state.
-    assert.ok(
-      content.includes('Behavioral, not project'),
-      'behavioral.md seed should state the behavioral-not-project rule',
-    );
-  } finally {
-    cleanup();
-    rmrf(workDir);
-  }
-});
-
-test('Claude: behavioral.md is never overwritten once a worker has edited it', () => {
-  const workDir = mktmp('claude-worker-memory-durable');
-  const { supervisor, cleanup } = makeSupervisor();
-  try {
-    // First launch seeds it.
-    supervisor.ensureWorkerScaffold(workDir, 'claude', 'windows');
-    const memPath = path.join(workDir, '.lares', 'workers', 'claude', 'behavioral.md');
-
-    // A worker appends a lesson — exactly the edit the scaffold must preserve.
-    const appended = '\n\n## WB-99: test-appended lesson — must survive relaunch\n';
-    fs.appendFileSync(memPath, appended, 'utf-8');
-
-    // Second launch (relaunch / another worker) must leave the edit untouched —
-    // unlike the version-managed CLAUDE.md, this file is seed-once.
-    supervisor.ensureWorkerScaffold(workDir, 'claude', 'windows');
-
-    const after = fs.readFileSync(memPath, 'utf-8');
-    assert.ok(
-      after.includes('WB-99: test-appended lesson'),
-      'worker-appended entry must survive a second scaffold pass',
-    );
-    // And no .bak file was spawned for it (managed-file overwrite signature).
-    const dir = path.dirname(memPath);
-    const baks = fs.readdirSync(dir).filter((f) => f.startsWith('behavioral.md.bak'));
-    assert.equal(baks.length, 0, `behavioral.md must not be backed up/overwritten; found: ${baks.join(', ')}`);
+    // The worker CLAUDE.md IS still written (its own managed file) and carries the
+    // new memory-lessons section rather than a behavioral.md instruction.
+    const mdPath = path.join(workDir, '.lares', 'workers', 'claude', 'CLAUDE.md');
+    assert.ok(fs.existsSync(mdPath), `expected worker CLAUDE.md at ${mdPath}`);
+    const md = fs.readFileSync(mdPath, 'utf-8');
+    assert.ok(md.includes('## Memory & lessons'), 'worker CLAUDE.md carries the new memory-lessons section');
+    assert.ok(md.includes('recall_memory') && md.includes('`remember`'), 'worker CLAUDE.md names recall_memory + remember');
+    assert.ok(!md.includes('The one durable exception is'), 'worker CLAUDE.md drops the retired behavioral.md instruction');
   } finally {
     cleanup();
     rmrf(workDir);
@@ -338,6 +370,25 @@ test('Supervisor: MEMORY.md is seed-once — an edited copy survives relaunch by
   } finally {
     cleanup();
     rmrf(workDir);
+  }
+});
+
+// ── WP-G regression: repo-wide auto-memory stays OFF ─────────────────
+//
+// memory-lessons v2 does NOT enable Claude's built-in per-project auto-memory —
+// the managed supervisor index (injected) + the `remember` skill are the only
+// memory path. A lane whose settings.json silently flipped autoMemoryEnabled to
+// true would resurrect the isolated per-session memory the design retired.
+test('WP-G: every lane settings.json keeps autoMemoryEnabled: false', () => {
+  const lanes: Array<[string, string]> = [
+    ['supervisor', SUPERVISOR_CLAUDE_SETTINGS_JSON],
+    ['worker', WORKER_CLAUDE_SETTINGS_JSON],
+    ['researcher', RESEARCHER_CLAUDE_SETTINGS_JSON],
+  ];
+  for (const [lane, blob] of lanes) {
+    const parsed = JSON.parse(blob) as { autoMemoryEnabled?: unknown };
+    assert.equal(parsed.autoMemoryEnabled, false,
+      `${lane} settings.json must keep autoMemoryEnabled: false (got ${JSON.stringify(parsed.autoMemoryEnabled)})`);
   }
 });
 

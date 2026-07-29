@@ -358,7 +358,7 @@ export const SUPERVISOR_AGENT_NAME = 'supervisor';
 // ── Supervisor scaffold: folder structure + file contents ──────────────
 
 /** Default content for .lares/supervisor/CLAUDE.md */
-export const SUPERVISOR_AGENT_MD = `# Supervisor Agent
+export const SUPERVISOR_AGENT_MD_V19 = `# Supervisor Agent
 
 You are a Supervisor Agent for the AgentDashboard. You coordinate worker agents — you do NOT edit code directly.
 
@@ -640,6 +640,39 @@ You do not schedule this and you cannot skip it — respond to the request when 
 arrives. Your card shows the human where the handoff is up to while it runs.
 <!-- /section:continuation-request -->
 `;
+
+// ── WP-G (Memory & Lessons v2): SUPERVISOR_AGENT_MD v19 → v20 ──────────────
+//  Freeze-then-derive (D11): SUPERVISOR_AGENT_MD_V19 above is the byte-exact
+//  frozen v19 body (the former live literal, renamed — the one permitted
+//  non-additive edit). The live v20 body is derived from it by two
+//  `.split().join()` transforms:
+//    1. The `## Memory` paragraph → injection-aware text (the index is injected
+//       at launch for supervisors, NOT an instructed session-start read), the D2
+//       cold-resume re-orientation preamble, a validate-after-edit pointer, and
+//       the discoverability paragraph (memories/lessons serve EVERY supervisor
+//       and worker in the workspace, not just the author; `remember` to save,
+//       `recall_memory` to fetch).
+//    2. The D10 phantom `see behavioral.md B-11/B-12` → self-contained triage
+//       guidance (no such file exists; the supervisor's behavioral memory IS its
+//       MEMORY.md / the lessons system).
+//  Each OLD literal occurs EXACTLY ONCE in the frozen source (pinned by the
+//  scaffold-version-migration D11 assertions).
+const SUPERVISOR_AGENT_MD_V20_MEMORY_OLD =
+  'Check `./memory/MEMORY.md` at session start for context from prior runs. Save important observations there. Your memory is isolated from other Claude Code sessions in this workspace via `autoMemoryEnabled: false` in your `./.claude/settings.json` — repo-wide auto-memory is off, so the manual index is your only memory source.';
+const SUPERVISOR_AGENT_MD_V20_MEMORY_NEW = [
+  'Your workspace memory index is **injected into your context at launch** — you don\'t open it at session start; it is already here. It is maintained at `./memory/MEMORY.md` (with detail files under `./memory/details/`); repo-wide auto-memory stays off (`autoMemoryEnabled: false` in your `./.claude/settings.json`), so this managed index is your only memory source.',
+  '',
+  'If you are re-orienting after a crash, reset, or continuation handoff: the injected index contains every open loop inline — read it fully before acting. Then read the `handoff-read-first` list in order, and open any other `detail:` file (via the `recall_memory` tool or a raw read) only when its `read-if` trigger matches your task.',
+  '',
+  'Memories and lessons serve **every** supervisor and worker in this workspace, not just their author. When something happens that future agents shouldn\'t have to relearn, reach for the `remember` skill to save it — don\'t hand-write memory or lesson files. Fetch a capsule\'s detail on demand with `recall_memory`. After editing the index yourself, run `node .lares/scripts/memory-index.mjs validate <index>` (exit 0) before ending your turn.',
+].join('\n');
+const SUPERVISOR_AGENT_MD_V20_PHANTOM_OLD =
+  '**Triage** before escalating to the user — see behavioral.md B-11/B-12. Bothering\nthe user is expensive; delegating research is cheap.';
+const SUPERVISOR_AGENT_MD_V20_PHANTOM_NEW =
+  '**Triage** before escalating to the user: exhaust your own tools and the researcher lane first, and batch open questions into one clear ask rather than interrupting per item. Bothering the user is expensive; delegating research is cheap.';
+export const SUPERVISOR_AGENT_MD = SUPERVISOR_AGENT_MD_V19
+  .split(SUPERVISOR_AGENT_MD_V20_MEMORY_OLD).join(SUPERVISOR_AGENT_MD_V20_MEMORY_NEW)
+  .split(SUPERVISOR_AGENT_MD_V20_PHANTOM_OLD).join(SUPERVISOR_AGENT_MD_V20_PHANTOM_NEW);
 
 export const SUPERVISOR_MEMORY_MD = `# Supervisor Memory
 
@@ -963,7 +996,7 @@ provider, by design. Everything you need for your task is in your initial
 prompt and the workspace files you can read.
 `;
 
-export const WORKER_CLAUDE_MD = `# Worker Agent
+export const WORKER_CLAUDE_MD_V8 = `# Worker Agent
 
 You are a generic worker agent launched by the dashboard supervisor.
 The supervisor is your only human-side interlocutor.
@@ -1107,6 +1140,51 @@ or malformed sentinel never breaks your trusted trail — it just shows as "no
 self-report" for that turn.
 <!-- /section:plan-event-sentinel -->
 `;
+
+// ── WP-G (Memory & Lessons v2): WORKER_CLAUDE_MD v8 → v9 ───────────────────
+//  Freeze-then-derive (D11): WORKER_CLAUDE_MD_V8 above is the byte-exact frozen
+//  v8 body (the former live literal, renamed — the one permitted non-additive
+//  edit). The live v9 body is derived from it by two `.split().join()`
+//  transforms that RETIRE the shared `behavioral.md` read/append instruction and
+//  replace it with the memory-lessons v2 discoverability + fetch-path text:
+//    1. Section header → `## Memory & lessons`.
+//    2. The `behavioral.md` durable-exception paragraph → the resident pointer
+//       (memory is INJECTED at launch for supervisors; a worker fetches it via
+//       the `recall_memory` tool OR a raw read of `.lares/supervisor/memory/`),
+//       the discoverability line (memory + lessons serve EVERY supervisor/worker,
+//       not just the author), and the `remember`-skill pointer.
+//  Each OLD literal occurs EXACTLY ONCE in the frozen source (pinned by the
+//  scaffold-version-migration D11 assertions). The derived WORKER_CODEX_AGENTS_MD
+//  below inherits the new body; its transform #3 (`WORKER_CLAUDE_MD` constant →
+//  Codex) is now a harmless no-op because the promote-to-constant sentence was in
+//  the retired paragraph — see WORKER_CODEX_AGENTS_MD_V1.
+const WORKER_CLAUDE_MD_V9_HEADER_OLD = '## Memory: shared behavioral notes only';
+const WORKER_CLAUDE_MD_V9_HEADER_NEW = '## Memory & lessons';
+const WORKER_CLAUDE_MD_V9_BODY_OLD = [
+  'The one durable exception is **`./behavioral.md`** — a small, shared memory of',
+  '*behavioral* lessons (how a worker should act: "when X, do Y"), seeded once and',
+  'owned by workers thereafter. At the start of a task, **read it**. When a',
+  'genuinely cross-task behavioral lesson surfaces — a working habit worth',
+  'repeating, or a mistake worth not repeating — **append** a short entry (don\'t',
+  'rewrite or delete others\'). Keep entries behavioral and provider-generic;',
+  'anything task-, workspace-, or project-specific does NOT belong there. A lesson',
+  'that\'s universal to workers in *every* workspace should be promoted into the',
+  '`WORKER_CLAUDE_MD` constant — surface that to your supervisor rather than only',
+  'writing it locally.',
+].join('\n');
+const WORKER_CLAUDE_MD_V9_BODY_NEW = [
+  'Workspace memory and lessons serve **every** supervisor and worker here, not',
+  'just their author. Memory is **injected at launch for supervisors**; as a',
+  'worker you fetch it two ways: use the `recall_memory` tool, or raw-read — open',
+  '`.lares/supervisor/memory/MEMORY.md`, find the entry\'s declared `detail:`',
+  'pointer, then read the file it names under `.lares/supervisor/memory/details/…`',
+  '(never `memory/details/…` relative to your cwd). When something happens that',
+  'future agents shouldn\'t have to relearn, use the `remember` skill to save it —',
+  'don\'t hand-write memory or lesson files.',
+].join('\n');
+export const WORKER_CLAUDE_MD = WORKER_CLAUDE_MD_V8
+  .split(WORKER_CLAUDE_MD_V9_HEADER_OLD).join(WORKER_CLAUDE_MD_V9_HEADER_NEW)
+  .split(WORKER_CLAUDE_MD_V9_BODY_OLD).join(WORKER_CLAUDE_MD_V9_BODY_NEW);
 
 /** Seed content for the shared worker behavioral memory, written write-if-absent
  *  to <workspace>/.lares/workers/claude/behavioral.md on first Claude worker
