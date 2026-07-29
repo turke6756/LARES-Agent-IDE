@@ -1,6 +1,12 @@
 import { app, BrowserWindow, crashReporter, dialog, protocol, session, nativeTheme, ipcMain } from 'electron';
 import { powerMonitor } from 'electron';
 import { registerLifecycleIpc, LIFECYCLE_CHANNELS, type BulkStopDeps } from './lifecycle/lifecycle-ipc';
+import {
+  liveMemoryGraduationDeps,
+  liveMemoryJanitorDeps,
+  liveMemoryReviewDeps,
+  registerMemoryReviewIpc,
+} from './memory-index/memory-ipc';
 import { loadLifecycleSettings, saveLifecycleSettings } from './lifecycle/lifecycle-settings';
 import { IdleSweep } from './lifecycle/idle-sweep';
 import { LogRetentionScheduler } from './log-retention/log-retention-scheduler';
@@ -1091,6 +1097,22 @@ app.whenReady().then(async () => {
       },
     };
     registerLifecycleIpc(ipcMain, lifecycleDeps);
+    // Memory & Lessons v2 (WP-H1 + WP-H2): renderer-only review-read channel plus
+    // the janitor siblings (generate brief / dispatch janitor). The janitor deps
+    // wire the live review-store + coverage-guarded firing query and the USER
+    // launch path (supervisor.launchAgent). Never an MCP tool or api-server route.
+    registerMemoryReviewIpc(
+      ipcMain,
+      liveMemoryReviewDeps,
+      liveMemoryJanitorDeps((input) => supervisor!.launchAgent(input)),
+      // WP-H3 — human-only graduation approve/apply + migration approval. Workspace
+      // root resolved from the opaque workspace id; renderer-only, never an MCP
+      // tool or api-server route.
+      liveMemoryGraduationDeps((ws) => {
+        const w = getWorkspace(ws);
+        return w ? { path: w.path, pathType: w.pathType } : null;
+      }),
+    );
     idleSweep = new IdleSweep({ ...lifecycleDeps, powerMonitor });
     idleSweep.start();
 

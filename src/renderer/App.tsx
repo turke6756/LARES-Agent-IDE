@@ -13,6 +13,7 @@ import DetachedFileView from './components/fileviewer/DetachedFileView';
 import DetachedViewShell from './components/layout/DetachedViewShell';
 import PressureNotification from './components/watchdog/PressureNotification';
 import LogRetentionNotice from './components/watchdog/LogRetentionNotice';
+import MemoryWarningBanner from './components/memory/MemoryWarningBanner';
 import SecurityNoticeCard from './components/workspace/SecurityNoticeCard';
 import RuntimePrerequisitesDialog from './components/onboarding/RuntimePrerequisitesDialog';
 import PrerequisitesCard from './components/onboarding/PrerequisitesCard';
@@ -60,6 +61,7 @@ function AppInner() {
   const setPanelSize = useDashboardStore((s) => s.setPanelSize);
   const panelLayout = useDashboardStore((s) => s.panelLayout);
   const terminalAgentId = useDashboardStore((s) => s.terminalAgentId);
+  const selectedWorkspaceId = useDashboardStore((s) => s.selectedWorkspaceId);
 
   useDoubleSpaceSidePanelCollapse();
 
@@ -288,6 +290,12 @@ function AppInner() {
           banner (app-chrome, never a per-terminal overlay). Renders only after
           the first backlog-clearing sweep, until the human dismisses it. */}
       <LogRetentionNotice />
+
+      {/* Memory & Lessons v2 (WP-H1): the one workspace-level memory signal —
+          "N entries pending review, cap at P%" plus the persisted hard-invalid
+          / runtime state from WP-C. Reads a renderer-only IPC channel; renders
+          nothing when the workspace's review queue and index state are clean. */}
+      <MemoryWarningBanner workspaceId={selectedWorkspaceId} />
 
       {/* P0.2 legacy-launcher security notice (bottom-LEFT corner — the
           pressure pop-up owns bottom-right): detection + user-authorized

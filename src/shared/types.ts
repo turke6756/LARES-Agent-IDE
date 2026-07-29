@@ -2441,6 +2441,30 @@ export interface IpcApi {
     /** Best-effort working-set bytes for a PID set (the "reap now" estimate). */
     reapEstimate: (pids: number[]) => Promise<number>;
   };
+  /** Memory & Lessons v2 review surface (WP-H1). A renderer-only Electron IPC
+   *  read of the per-workspace review queue + persisted index-invalid/runtime
+   *  state. NOT an MCP tool and NOT an api-server route — no agent can reach it. */
+  memoryReview: {
+    listReview: (workspaceId: string) => Promise<MemoryReviewSummaryDto>;
+    /** WP-H2 — the deterministic janitor brief for the workspace (no launch). */
+    generateJanitorBrief: (workspaceId: string) => Promise<MemoryJanitorBriefDto>;
+    /** WP-H2 — dispatch a janitor agent via the user launch path, brief as its
+     *  initial prompt. Renderer-only; never an MCP tool or api-server route. */
+    dispatchJanitor: (workspaceId: string) => Promise<MemoryJanitorDispatchDto>;
+    /** WP-H3 — human-only: APPROVE == apply a graduation proposal into its
+     *  workspace-root doc (the only applier; CAS-guarded, under the workspace
+     *  lock). Renderer-only; never an MCP tool or api-server route. */
+    graduationApprove: (workspaceId: string, proposalId: string) => Promise<MemoryGraduationApplyDto>;
+    /** WP-H3 — human-only: reject a graduation proposal (DB status only). */
+    graduationReject: (workspaceId: string, proposalId: string) => Promise<MemoryIpcOkDto>;
+    /** WP-H3 — human-only: record a migration approval (snapshot + table hash)
+     *  that WP-I2's signed migration consumes. Renderer-only. */
+    migrationApprove: (
+      workspaceId: string,
+      snapshotId: string,
+      tableHash: string,
+    ) => Promise<MemoryIpcOkDto>;
+  };
   /** Detached-process transparency (incident-2026-07-11 §5 Wave 5). Lists the
    *  agent-launched detached processes that self-registered under
    *  <workspaceRoot>/.lares/detached/, each verified against its live PID. */
@@ -4011,6 +4035,98 @@ export interface ReapOrphansResultDto {
   agentId: string;
   action: string;
   pids: number[];
+}
+
+// ── Memory & Lessons v2 — review read surface (WP-H1) ──
+// The renderer-only display DTOs for the memory review queue + the persisted
+// index-invalid/runtime state that WP-C writes. These ride a renderer-only
+// Electron IPC channel (`memory:listReview`) — NEVER an MCP toolset tool or an
+// api-server route, so no agent can reach them.
+
+/** One pending review-queue finding, projected for display. `kind` is opaque
+ *  (WP-B treats it as a string): 'hard-invalid', 'cap-pressure', 'stale-active',
+ *  'condition-review', 'never-recalled', 'never-fired', 'evidence-unavailable', … */
+export interface MemoryReviewItemDto {
+  findingId: string;
+  kind: string;
+  /** null for whole-index findings (hard-invalid, cap-pressure, …). */
+  entryId: string | null;
+  reason: string | null;
+  /** The concrete lookup for a `condition-review` (`expires-when: …`) entry. */
+  exitCondition: string | null;
+  firstSeen: string;
+  lastSeen: string;
+}
+
+/** The one workspace-level signal the user sees ("Memory index: N entries
+ *  pending review, cap at P%"). Derived main-side from WP-B's review queue +
+ *  WP-C's persisted `memory_index_state`. */
+export interface MemoryReviewSummaryDto {
+  /** Count of `pending` findings for the workspace. */
+  pendingCount: number;
+  /** A pending `cap-pressure` finding exists (index over the cap ratio). */
+  capPressure: boolean;
+  /** Byte/line budget usage of the last-known-good source, 0–100 (rounded),
+   *  or null when no valid source has been persisted yet. */
+  capPercent: number | null;
+  /** A pending whole-index `hard-invalid` finding exists (the live MEMORY.md
+   *  failed hard validation at last launch; WP-C fell back or banner-only'd). */
+  hardInvalid: boolean;
+  /** The durable last runtime (read/parse threw) error state from WP-C, or null. */
+  lastRuntimeError: string | null;
+  lastRuntimeErrorAt: string | null;
+  /** Every pending finding, for the detail panel. */
+  items: MemoryReviewItemDto[];
+}
+
+/** The deterministic janitor brief for a workspace (WP-H2). Generated on demand
+ *  from the review queue + a fresh lesson-firing check; renderer-only. `ok:false`
+ *  (empty `brief`) is returned for a blank workspace id. */
+export interface MemoryJanitorBriefDto {
+  ok: boolean;
+  brief: string;
+}
+
+/** The result of dispatching a janitor agent (WP-H2). On success carries the
+ *  launched agent id + the brief delivered as its initial prompt; a blank
+ *  workspace id is rejected with `code:'invalid_workspace'` and no launch. */
+export interface MemoryJanitorDispatchDto {
+  ok: boolean;
+  agentId?: string;
+  brief?: string;
+  code?: string;
+}
+
+/** A pending graduation proposal (memory → CLAUDE.md/AGENTS.md). Recorded by
+ *  WP-F2's `propose_graduation`; approved/applied via WP-H3's renderer-only IPC.
+ *  Declared here (WP-H1 owns the review-surface types) so WP-H3 reuses it. */
+export interface MemoryGraduationProposalDto {
+  proposalId: string;
+  target: string;
+  text: string | null;
+  rationale: string | null;
+  status: string;
+}
+
+/** The result of applying (approving) a graduation proposal (WP-H3). Renderer-only
+ *  — no agent can reach the apply path. On success `applied` is false when the
+ *  text was already present inside the managed markers (idempotent no-op). On a
+ *  CAS mismatch `code:'needs_reapproval'` carries the new `currentHash`. */
+export interface MemoryGraduationApplyDto {
+  ok: boolean;
+  proposalId?: string;
+  target?: string;
+  applied?: boolean;
+  code?: string;
+  message?: string;
+  currentHash?: string;
+}
+
+/** A minimal structured ack for the human-only graduation-reject / migration-
+ *  approval channels (WP-H3). `ok:false` carries a `code`; there is no payload. */
+export interface MemoryIpcOkDto {
+  ok: boolean;
+  code?: string;
 }
 
 // ── Detached-process transparency (incident-2026-07-11 §5 Wave 5) ──

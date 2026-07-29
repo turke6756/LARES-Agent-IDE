@@ -139,6 +139,26 @@ const api: IpcApi = {
     reapOrphans: (agentIds) => ipcRenderer.invoke('ownership:reap-orphans', agentIds),
     reapEstimate: (pids) => ipcRenderer.invoke('memory:reap-estimate', pids),
   },
+  // Memory & Lessons v2 review surface (WP-H1). Renderer-only read of the
+  // per-workspace review queue + persisted index-invalid/runtime state; the
+  // `memory:listReview` handle lives in memory-index/memory-ipc.ts. Deliberately
+  // NOT an MCP tool and NOT an api-server route — unreachable by agents.
+  memoryReview: {
+    listReview: (workspaceId) => ipcRenderer.invoke('memory:listReview', workspaceId),
+    // WP-H2 janitor siblings — renderer-only. `generateJanitorBrief` previews the
+    // deterministic brief; `dispatchJanitor` launches a janitor agent (user launch
+    // path) with the brief as its initial prompt. Neither is an MCP tool/route.
+    generateJanitorBrief: (workspaceId) => ipcRenderer.invoke('memory:generateJanitorBrief', workspaceId),
+    dispatchJanitor: (workspaceId) => ipcRenderer.invoke('memory:dispatchJanitor', workspaceId),
+    // WP-H3 human-only approve/apply + migration approval — renderer-only. Approve
+    // APPLIES the graduation into its workspace-root doc; none is an MCP tool/route.
+    graduationApprove: (workspaceId, proposalId) =>
+      ipcRenderer.invoke('memory:graduationApprove', workspaceId, proposalId),
+    graduationReject: (workspaceId, proposalId) =>
+      ipcRenderer.invoke('memory:graduationReject', workspaceId, proposalId),
+    migrationApprove: (workspaceId, snapshotId, tableHash) =>
+      ipcRenderer.invoke('memory:migrationApprove', workspaceId, snapshotId, tableHash),
+  },
   // Detached-process transparency (incident-2026-07-11 §5 Wave 5): lists the
   // agent-launched detached processes that self-registered under the workspace's
   // .lares/detached/ dir; each row is PID-verified in main. Handle in index.ts.
