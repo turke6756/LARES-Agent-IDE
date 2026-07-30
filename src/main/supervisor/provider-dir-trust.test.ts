@@ -108,6 +108,28 @@ test('dirs containing a single quote are refused (TOML literal-key limit)', () =
   assert.equal(mergeCodexProjectTrust('', ["C:\\it's-a-trap"]), null);
 });
 
+test('Path A: worker-cwd seeding writes the probe-validated 3 variants + preserves foreign content byte-exact', () => {
+  // Mirrors the probe (2026-07-28): seeding the worker cwd produces exactly the
+  // exact-case / lowercase / \\?\ trust blocks, appended after — and preserving
+  // byte-for-byte — the user's own existing config.
+  const workerCwd = 'C:\\Users\\Turke\\Projects\\WS\\.lares\\workers\\codex';
+  const existing = 'model = "gpt-5.6-sol"\n\n[projects.\'C:\\Users\\Turke\\Projects\\WS\']\ntrust_level = "trusted"\n';
+  const variants = codexTrustPathVariants(workerCwd, 'windows');
+  assert.equal(variants.length, 3, `probe used 3 spelling variants; got ${JSON.stringify(variants)}`);
+  const merged = mergeCodexProjectTrust(existing, variants);
+  assert.ok(merged !== null, 'a not-yet-trusted worker cwd must produce a write');
+  // Foreign content preserved byte-exact as a prefix (nothing outside the
+  // appended managed blocks is rewritten or reordered).
+  assert.ok(merged!.startsWith(existing), 'the user\'s existing config must be preserved byte-exact as a prefix');
+  for (const v of variants) {
+    assert.ok(merged!.includes(`[projects.'${v}']`), `missing trust block for variant: ${v}`);
+  }
+  assert.equal((merged!.slice(existing.length).match(/trust_level = "trusted"/g) || []).length, 3,
+    'exactly three new trust blocks appended');
+  // Idempotent: re-seeding the already-present variants is a no-op.
+  assert.equal(mergeCodexProjectTrust(merged, variants), null, 're-seeding the same worker cwd must be a no-op (null)');
+});
+
 // ── mergeClaudeProjectTrust ──────────────────────────────────────────────
 
 test('missing file: creates projects map with trusted entries', () => {

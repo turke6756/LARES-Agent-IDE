@@ -57,6 +57,23 @@ test('A2. Codex worker config.toml has a SessionStart hook → dashboard-status.
   );
 });
 
+test('A2b. Path A: worker-cwd config.toml carries the feature gate + PreToolUse guard + all script paths', () => {
+  // On native Windows this file is the SOLE hook carrier (no profile layer), so
+  // it must supply [features] hooks = true itself, top-level (not nested under a
+  // [profiles.*] table), using the current key (not the deprecated codex_hooks).
+  assert.ok(/^\[features\]$/m.test(WORKER_CODEX_CONFIG_TOML), '[features] must be a top-level table header on its own line');
+  assert.ok(/\[features\]\s*\nhooks = true/.test(WORKER_CODEX_CONFIG_TOML), 'config.toml missing hooks = true directly under [features]');
+  assert.ok(!/^\s*\[profiles?\./m.test(WORKER_CODEX_CONFIG_TOML), 'worker-cwd config must NOT nest config under a [profiles.*] table');
+  assert.ok(!/codex_hooks\s*=/.test(WORKER_CODEX_CONFIG_TOML), 'config.toml must NOT assign the deprecated codex_hooks key');
+  // Everything the profile carried must be present here.
+  assert.ok(WORKER_CODEX_CONFIG_TOML.includes('[[hooks.PreToolUse]]'), 'config.toml missing the PreToolUse guard block');
+  assert.ok(/guard-git-discard\.mjs/.test(WORKER_CODEX_CONFIG_TOML), 'config.toml PreToolUse must call guard-git-discard.mjs');
+  assert.ok(WORKER_CODEX_CONFIG_TOML.includes('[[hooks.Stop]]'), 'config.toml missing [[hooks.Stop]]');
+  assert.ok(WORKER_CODEX_CONFIG_TOML.includes('[[hooks.UserPromptSubmit]]'), 'config.toml missing [[hooks.UserPromptSubmit]]');
+  // The stale "INERT / Codex NEVER loads this" header must be gone.
+  assert.ok(!/NEVER loads this/.test(WORKER_CODEX_CONFIG_TOML), 'the stale INERT header must be rewritten for Path A');
+});
+
 test('A3. Codex CODEX_HOME profile has a SessionStart hook → __SCRIPT__ session-start', () => {
   assert.ok(CODEX_WORKER_PROFILE_TOML.includes('[[hooks.SessionStart]]'), 'profile missing [[hooks.SessionStart]]');
   assert.ok(CODEX_WORKER_PROFILE_TOML.includes('[[hooks.SessionStart.hooks]]'), 'profile missing [[hooks.SessionStart.hooks]]');
@@ -90,6 +107,14 @@ test('B1. Codex profile sets [features] hooks = true at top level (no codex_hook
 });
 
 // ── B2. Custom-command instrumentation ────────────────────────────────
+//
+// Two modes (see instrumentCodexWorkerCommand):
+//   • default / injectProfile:true — WSL workers + codex personas: inject BOTH
+//     --profile dashboard-worker AND --dangerously-bypass-hook-trust. (B2a–B2f.)
+//   • injectProfile:false — Path A native-Windows WORKER lane: hooks ride the
+//     worker-cwd trusted-project config.toml, so inject ONLY the bypass flag and
+//     STRIP any --profile dashboard-worker (Run D: layers merge → double-fire).
+//     (B2g–B2l.)
 
 test('B2a. injects both flags into the pristine default codex command', () => {
   const { command, instrumented } = instrumentCodexWorkerCommand('codex --dangerously-bypass-approvals-and-sandbox');
@@ -137,6 +162,55 @@ test('B2e. un-instrumentable command (not recognizably codex) → instrumented:f
 test('B2f. foreign --profile we must not clobber → instrumented:false (caller marks degraded)', () => {
   const { instrumented } = instrumentCodexWorkerCommand('codex --profile someones-custom-profile');
   assert.equal(instrumented, false, 'a foreign --profile must report instrumented:false rather than be clobbered');
+});
+
+// ── B2 Path A (injectProfile:false) — native-Windows worker lane ──────
+
+test('B2g. Path A: pristine default gets ONLY the bypass flag, never --profile', () => {
+  const { command, instrumented } = instrumentCodexWorkerCommand(
+    'codex --dangerously-bypass-approvals-and-sandbox', { injectProfile: false });
+  assert.equal(instrumented, true);
+  assert.ok(!/--profile/.test(command), `Path A must NOT inject --profile; got: ${command}`);
+  assert.ok(command.includes('--dangerously-bypass-hook-trust'), `bypass flag must be present; got: ${command}`);
+  assert.ok(command.includes('--dangerously-bypass-approvals-and-sandbox'), 'original flag must survive');
+});
+
+test('B2h. Path A: bypass binds after the launcher token, ahead of a subcommand (resume)', () => {
+  const { command, instrumented } = instrumentCodexWorkerCommand(
+    'ccodex --dangerously-bypass-approvals-and-sandbox resume 0xabc', { injectProfile: false });
+  assert.equal(instrumented, true);
+  const bypassIdx = command.indexOf('--dangerously-bypass-hook-trust');
+  const resumeIdx = command.indexOf('resume');
+  assert.ok(bypassIdx > -1 && resumeIdx > -1, `both tokens present; got: ${command}`);
+  assert.ok(bypassIdx < resumeIdx, `bypass must precede the resume subcommand; got: ${command}`);
+  assert.ok(command.startsWith('ccodex '), `launcher token must stay first; got: ${command}`);
+});
+
+test('B2i. Path A: STRIPS a stored/legacy --profile dashboard-worker (Run D double-fire)', () => {
+  const { command, instrumented } = instrumentCodexWorkerCommand(
+    `codex --profile ${CODEX_WORKER_PROFILE_NAME} --dangerously-bypass-hook-trust`, { injectProfile: false });
+  assert.equal(instrumented, true);
+  assert.ok(!/--profile/.test(command), `Path A must strip our --profile; got: ${command}`);
+  assert.ok(command.includes('--dangerously-bypass-hook-trust'), 'the bypass flag must survive the strip');
+});
+
+test('B2j. Path A: idempotent — bypass present, no profile → unchanged', () => {
+  const already = 'codex --dangerously-bypass-hook-trust';
+  const { command, instrumented } = instrumentCodexWorkerCommand(already, { injectProfile: false });
+  assert.equal(instrumented, true);
+  assert.equal(command, already, 'a command already in Path A shape must be returned unchanged');
+});
+
+test('B2k. Path A: a foreign --profile still degrades (instrumented:false)', () => {
+  const { instrumented } = instrumentCodexWorkerCommand(
+    'codex --profile someones-custom-profile', { injectProfile: false });
+  assert.equal(instrumented, false, 'a foreign --profile is un-reasonable-about in Path A too → degrade');
+});
+
+test('B2l. Path A: un-instrumentable (not recognizably codex) → instrumented:false', () => {
+  const { command, instrumented } = instrumentCodexWorkerCommand('my-codex-wrapper.sh --go', { injectProfile: false });
+  assert.equal(instrumented, false);
+  assert.equal(command, 'my-codex-wrapper.sh --go', 'command must be returned unchanged');
 });
 
 // ── WP2. deriveHookAvailability — the DTO projection of hook_status ───

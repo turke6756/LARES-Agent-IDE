@@ -1683,6 +1683,76 @@ export const WORKER_CLAUDE_SETTINGS_JSON_V2 = `{
  *  so the single workspace-shared script serves Claude and Codex unchanged. */
 export const WORKER_CODEX_CONFIG_TOML = `# Class IV worker hook config — see plans/class-iv-worker-hook-scaffold.md §12.
 #
+# ✅ LIVE ON NATIVE WINDOWS (Path A, probe 2026-07-28). This worker-cwd
+# .codex/config.toml IS the real hook carrier for native-Windows Codex workers:
+# the app marks the worker cwd a trusted Codex project (ensureCodexProjectTrust
+# seeds [projects."<cwd>"] trust_level="trusted" in CODEX_HOME/config.toml), so
+# Codex loads these [[hooks.*]] blocks — Stop/UserPromptSubmit/SessionStart AND
+# the PreToolUse git-discard guard — directly from here. The native-Windows
+# launch command therefore NO LONGER injects --profile dashboard-worker (probe
+# Run D: a profile layer + this project layer MERGE → every hook double-fires);
+# it keeps only --dangerously-bypass-hook-trust (probe Run C: hooks silently do
+# not fire without it).
+#
+# WSL is NOT yet migrated to Path A (it needs its own probe — probe §4 must-do
+# #4): WSL Codex workers still ride the CODEX_HOME --profile dashboard-worker
+# file (CODEX_WORKER_PROFILE_TOML, written by ensureCodexHookProfile), and this
+# file's role on the WSL runtime is unverified. \${WORKSPACE_ROOT} is
+# materialized at scaffold-write time — Codex has no \${CLAUDE_PROJECT_DIR} analog.
+
+# Codex hooks are on by default in current Codex, but the feature gate is cheap
+# insurance: if a user's base config (or an older Codex) leaves the feature off,
+# the [[hooks.*]] tables below parse fine yet NEVER fire. On native Windows this
+# file is the sole hook carrier, so the gate must live HERE (there is no profile
+# layer to supply it). Use the [features] hooks key — the deprecated codex_hooks
+# key is intentionally not used.
+[features]
+hooks = true
+
+[[hooks.Stop]]
+
+[[hooks.Stop.hooks]]
+type = "command"
+command = 'node "\${WORKSPACE_ROOT}/.lares/scripts/dashboard-status.mjs"'
+timeout = 30
+
+[[hooks.UserPromptSubmit]]
+
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command = 'node "\${WORKSPACE_ROOT}/.lares/scripts/dashboard-status.mjs" working'
+timeout = 30
+
+[[hooks.SessionStart]]
+
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = 'node "\${WORKSPACE_ROOT}/.lares/scripts/dashboard-status.mjs" session-start'
+timeout = 30
+
+# PreToolUse git-discard guard. On native Windows (trusted project) this is the
+# LIVE delivery path for the guard — PreToolUse intercepts the shell tool, so a
+# git command that discards uncommitted work in the shared tree is blocked before
+# it runs. (On WSL, the profile's [[hooks.PreToolUse]] is still the carrier until
+# WSL is migrated.)
+[[hooks.PreToolUse]]
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = 'node "\${WORKSPACE_ROOT}/.lares/scripts/guard-git-discard.mjs"'
+timeout = 30
+`;
+
+/** FROZEN v5 Codex worker config body — the pre-Path-A body that shipped in every
+ *  v5 workspace: the four hook blocks (Stop / UserPromptSubmit / SessionStart /
+ *  PreToolUse) WITHOUT the `[features] hooks = true` gate and with the old INERT
+ *  header. Kept VERBATIM (never derived from the live constant) so a v5
+ *  workspace's materialized config.toml can be hashed and silently upgraded to v6
+ *  (which adds the feature gate + rewrites the now-stale INERT header). The
+ *  \${WORKSPACE_ROOT} substitution + hashing happen at scaffold-write time,
+ *  exactly like v1/v2/v3/v4. */
+export const WORKER_CODEX_CONFIG_TOML_V5 = `# Class IV worker hook config — see plans/class-iv-worker-hook-scaffold.md §12.
+#
 # ⚠ INERT FOR HOOKS. Codex NEVER loads this worker-cwd .codex/config.toml — the
 # worker directory is not a trusted Codex project, so none of the [[hooks.*]]
 # blocks below fire (including the PreToolUse git-discard guard). The REAL hook

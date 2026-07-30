@@ -658,8 +658,13 @@ test('custom-codex guard control: instrumentable codex command → canary armed,
     const monitor = (supervisor as unknown as { monitor: { isHookCanaryArmed: (id: string) => boolean } }).monitor;
     assert.equal(monitor.isHookCanaryArmed(agent.id), true,
       'instrumented worker-lane codex arms the launch canary');
-    assert.ok(/--profile dashboard-worker/.test(agent.command) && /--dangerously-bypass-hook-trust/.test(agent.command),
-      `instrumented command must carry the hook profile + bypass flags; got: ${agent.command}`);
+    // Path A (probe 2026-07-28): a native-Windows worker-lane codex agent gets
+    // its hooks from the worker-cwd trusted-project .codex/config.toml, so the
+    // launch command must NOT carry --profile (Run D: layers merge → double-fire)
+    // but MUST keep --dangerously-bypass-hook-trust (Run C: hooks silently don't
+    // fire without it). The workspace above is pathType:'windows'.
+    assert.ok(!/--profile/.test(agent.command) && /--dangerously-bypass-hook-trust/.test(agent.command),
+      `native-Windows worker-lane codex must drop --profile and keep the bypass flag; got: ${agent.command}`);
   } finally {
     cleanup();
   }

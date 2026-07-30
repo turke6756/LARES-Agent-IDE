@@ -76,6 +76,7 @@ import {
   WORKER_CODEX_CONFIG_TOML_V2,
   WORKER_CODEX_CONFIG_TOML_V3,
   WORKER_CODEX_CONFIG_TOML_V4,
+  WORKER_CODEX_CONFIG_TOML_V5,
   WORKER_CLAUDE_SETTINGS_JSON,
   WORKER_CLAUDE_SETTINGS_JSON_V6,
   WORKER_CLAUDE_SETTINGS_JSON_V7,
@@ -3249,7 +3250,7 @@ test('CX-CFG-V3-upgrade. a pristine on-disk v3 codex config.toml upgrades to cur
     const expectedCurrent = WORKER_CODEX_CONFIG_TOML.replace(/\$\{WORKSPACE_ROOT\}/g, posixRoot);
     assert.equal(
       fs.readFileSync(configPath, 'utf-8'), expectedCurrent,
-      'pristine v3 config.toml must silently upgrade to the exact current (v5) bundled content',
+      'pristine v3 config.toml must silently upgrade to the exact current (v6) bundled content',
     );
 
     const codexDir = codexPath(workDir, '.codex');
@@ -3261,8 +3262,81 @@ test('CX-CFG-V3-upgrade. a pristine on-disk v3 codex config.toml upgrades to cur
 
     const sidecar = readSidecar(workDir);
     assert.equal(
-      sidecar['workers/codex/.codex/config.toml'], 5,
-      `sidecar must record the config.toml at v5 after upgrade; got: ${JSON.stringify(sidecar)}`,
+      sidecar['workers/codex/.codex/config.toml'], 6,
+      `sidecar must record the config.toml at v6 after upgrade; got: ${JSON.stringify(sidecar)}`,
+    );
+  } finally {
+    cleanup();
+    rmrf(workDir);
+  }
+});
+
+// ── Codex worker config.toml: v5 → v6 (Path A feature gate) ──────────
+//
+// v6 (Path A, probe 2026-07-28) makes the worker-cwd config the REAL native-
+// Windows hook carrier: it adds `[features] hooks = true` (no profile layer to
+// supply the gate) and rewrites the now-stale INERT header. WORKER_CODEX_CONFIG_
+// TOML_V5 is the FROZEN pre-Path-A body (verbatim, NOT derived from the live
+// constant) so a pristine v5 workspace's materialized config.toml is recognized
+// by previousHashes[5] and upgraded silently. (scaffold-content-needs-version-
+// bump lesson.)
+
+test('CX-CFG-V5-shape. the frozen v5 body is the true pre-Path-A body (no [features], old INERT header) and differs from live', () => {
+  assert.notEqual(
+    WORKER_CODEX_CONFIG_TOML_V5, WORKER_CODEX_CONFIG_TOML,
+    'the frozen v5 body must differ from the live v6 body (else no content change was made)',
+  );
+  // The distinguishing v6 additions must be ABSENT from the frozen v5 fixture —
+  // otherwise a v5 workspace would already look like v6 and the bump is moot.
+  assert.ok(!/^\[features\]$/m.test(WORKER_CODEX_CONFIG_TOML_V5), 'the frozen v5 body must NOT contain the [features] gate');
+  assert.ok(/NEVER loads this/.test(WORKER_CODEX_CONFIG_TOML_V5), 'the frozen v5 body must carry the old INERT header');
+  // And the v6 additions must be PRESENT in the live body.
+  assert.ok(/^\[features\]$/m.test(WORKER_CODEX_CONFIG_TOML), 'the live v6 body must contain the [features] gate');
+  assert.ok(!/NEVER loads this/.test(WORKER_CODEX_CONFIG_TOML), 'the live v6 body must have rewritten the INERT header');
+  // v5 still shipped all four hook blocks incl. the PreToolUse guard (added at v5).
+  assert.ok(WORKER_CODEX_CONFIG_TOML_V5.includes('[[hooks.PreToolUse]]'), 'v5 shipped the PreToolUse guard block');
+  assert.ok(WORKER_CODEX_CONFIG_TOML_V5.includes('/.lares/scripts/'), 'v5 used the .lares script paths (post-v4 rename)');
+});
+
+test('CX-CFG-V5-upgrade. a pristine on-disk v5 codex config.toml upgrades to v6 SILENTLY, no .bak', () => {
+  const workDir = mktmp('codex-cfg-v5');
+  const { supervisor, cleanup } = makeSupervisor();
+  try {
+    // Materialize a genuine historical v5 config.toml from the FROZEN v5 body
+    // (independent of the live constant), then confirm the v5→v6 migration
+    // recognizes it via previousHashes[5] and upgrades with no .bak.
+    const posixRoot = workDir.replace(/\\/g, '/');
+    const v5OnDisk = WORKER_CODEX_CONFIG_TOML_V5.replace(/\$\{WORKSPACE_ROOT\}/g, posixRoot);
+
+    const configPath = codexPath(workDir, '.codex', 'config.toml');
+    fs.mkdirSync(path.dirname(configPath), { recursive: true });
+    fs.writeFileSync(configPath, v5OnDisk, 'utf-8');
+    fs.mkdirSync(path.dirname(sidecarPath(workDir)), { recursive: true });
+    fs.writeFileSync(
+      sidecarPath(workDir),
+      JSON.stringify({ 'workers/codex/.codex/config.toml': 5 }, null, 2) + '\n',
+      'utf-8',
+    );
+
+    supervisor.ensureWorkerScaffold(workDir, 'codex', 'windows');
+
+    const expectedCurrent = WORKER_CODEX_CONFIG_TOML.replace(/\$\{WORKSPACE_ROOT\}/g, posixRoot);
+    assert.equal(
+      fs.readFileSync(configPath, 'utf-8'), expectedCurrent,
+      'pristine v5 config.toml must silently upgrade to the exact current (v6) bundled content',
+    );
+
+    const codexDir = codexPath(workDir, '.codex');
+    const baks = fs.readdirSync(codexDir).filter((n) => n.startsWith('config.toml.bak'));
+    assert.equal(
+      baks.length, 0,
+      `pristine v5 config.toml must upgrade with NO .bak (previousHashes[5] must match the frozen v5); got: ${baks.join(', ')}`,
+    );
+
+    const sidecar = readSidecar(workDir);
+    assert.equal(
+      sidecar['workers/codex/.codex/config.toml'], 6,
+      `sidecar must record the config.toml at v6 after upgrade; got: ${JSON.stringify(sidecar)}`,
     );
   } finally {
     cleanup();

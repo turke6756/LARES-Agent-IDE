@@ -21,7 +21,7 @@ import {
   WORKER_CLAUDE_SETTINGS_JSON_V4, WORKER_CLAUDE_SETTINGS_JSON_V5, WORKER_CLAUDE_SETTINGS_JSON_V6,
   WORKER_CLAUDE_SETTINGS_JSON_V7,
   WORKER_CODEX_CONFIG_TOML, WORKER_CODEX_CONFIG_TOML_V1, WORKER_CODEX_CONFIG_TOML_V2,
-  WORKER_CODEX_CONFIG_TOML_V3, WORKER_CODEX_CONFIG_TOML_V4,
+  WORKER_CODEX_CONFIG_TOML_V3, WORKER_CODEX_CONFIG_TOML_V4, WORKER_CODEX_CONFIG_TOML_V5,
   WORKER_CODEX_AGENTS_MD, WORKER_CODEX_AGENTS_MD_V1, WORKER_CODEX_BEHAVIORAL_MD,
   GUARD_GIT_DISCARD_MJS,
   DASHBOARD_STATUS_SCRIPT_MJS, DASHBOARD_STATUS_SCRIPT_MJS_V3, DASHBOARD_STATUS_SCRIPT_MJS_V4, DASHBOARD_STATUS_SCRIPT_MJS_V5,
@@ -1004,50 +1004,86 @@ export function isCodexHookPersona(a: { provider?: AgentProvider; wantsCodexHook
   return a.provider === 'codex' && !!a.wantsCodexHooks;
 }
 
-/** B2 (HOOK_SYSTEM_DESIGN.md §C) — ensure a worker-lane codex command carries
- *  the dashboard hook profile + bypass flag so its turn-boundary hooks fire.
+/** B2 (HOOK_SYSTEM_DESIGN.md §C) — ensure a hook-instrumented codex command
+ *  carries the bypass flag (and, on the pre-Path-A paths, the dashboard hook
+ *  profile) so its turn-boundary hooks fire.
  *
  *  The pre-B2 code only instrumented the pristine framework-default command
  *  (`command === defaultCmd`); a workspace-customized or caller-supplied codex
  *  command ran hookless yet stayed worker-lane (PTY inference disabled) →
- *  permanently blind. This broadens to ANY recognizably-codex command:
- *  detect whether `--profile dashboard-worker` and
- *  `--dangerously-bypass-hook-trust` are present and inject whichever is
- *  missing immediately after the `codex` / `ccodex` launcher token (so the
- *  flags bind to codex itself, ahead of any subcommand like `resume`),
+ *  permanently blind. This broadens to ANY recognizably-codex command,
  *  preserving the rest of the command verbatim.
+ *
+ *  Two modes, selected by `opts.injectProfile`:
+ *   • injectProfile=true (default — WSL workers + codex personas): hooks ride
+ *     the CODEX_HOME `--profile dashboard-worker` file, so inject BOTH
+ *     `--profile dashboard-worker` and `--dangerously-bypass-hook-trust`
+ *     (whichever is missing), immediately after the `codex`/`ccodex` launcher
+ *     token so the flags bind to codex itself, ahead of any subcommand like
+ *     `resume`.
+ *   • injectProfile=false (Path A — native-Windows WORKER lane): hooks ride the
+ *     worker-cwd trusted-project `.codex/config.toml` (ensureCodexProjectTrust
+ *     marks the cwd trusted). Do NOT inject `--profile` — probe 2026-07-28 Run D
+ *     proved a profile layer + the project layer MERGE, so every hook
+ *     double-fires. If a stored/legacy command already carries OUR
+ *     `--profile dashboard-worker`, STRIP it for the same reason. KEEP the
+ *     bypass flag — probe Run C proved hooks silently do not fire without it.
  *
  *  Returns `{ instrumented: false }` when the command can't be safely
  *  instrumented — it isn't recognizably codex (no `codex`/`ccodex` token), or
- *  it already pins a DIFFERENT `--profile` we must not clobber. The caller
- *  marks the agent hook_status='degraded' and warns rather than launch a
- *  worker-lane codex silently hookless. */
+ *  it already pins a DIFFERENT `--profile` we must not clobber (both modes: a
+ *  foreign profile means a launch we can't reason about). The caller marks the
+ *  agent hook_status='degraded' and warns rather than launch it silently
+ *  hookless. */
 export function instrumentCodexWorkerCommand(
   command: string,
+  opts: { injectProfile?: boolean } = {},
 ): { command: string; instrumented: boolean } {
+  const injectProfile = opts.injectProfile !== false; // default true (WSL + personas)
   // Locate the codex launcher token (`codex` or `ccodex`) as a whole word,
   // tolerating a path prefix (`/usr/bin/ccodex`) but not a substring match
   // inside an unrelated token.
-  const tokenMatch = command.match(/(^|\s)((?:[^\s]*[/\\])?c?codex)(?=\s|$)/);
+  const tokenRe = /(^|\s)((?:[^\s]*[/\\])?c?codex)(?=\s|$)/;
+  const tokenMatch = command.match(tokenRe);
   if (!tokenMatch) return { command, instrumented: false };
 
   // A foreign `--profile X` (X !== dashboard-worker) means the command is
-  // pinned to another layered config we can't safely override — degrade.
+  // pinned to another layered config we can't safely reason about — degrade in
+  // either mode.
   const profileMatch = command.match(/--profile(?:\s+|=)(\S+)/);
   const hasOurProfile = profileMatch?.[1] === CODEX_WORKER_PROFILE_NAME;
   if (profileMatch && !hasOurProfile) return { command, instrumented: false };
 
   const hasBypass = /--dangerously-bypass-hook-trust(?=\s|$)/.test(command);
-  if (hasOurProfile && hasBypass) return { command, instrumented: true };
 
+  /** Insert a flag string immediately after the launcher token in `cmd`. */
+  const insertAfterToken = (cmd: string, flags: string): string => {
+    const m = cmd.match(tokenRe)!; // token is never stripped, so it always re-matches
+    const end = m.index! + m[1].length + m[2].length;
+    return `${cmd.slice(0, end)} ${flags}${cmd.slice(end)}`;
+  };
+
+  if (!injectProfile) {
+    // Path A native-Windows worker lane — the worker-cwd trusted-project
+    // config.toml is the hook carrier. Strip our profile if present (double-fire),
+    // keep only the bypass flag.
+    let out = command;
+    if (hasOurProfile) {
+      out = out.replace(
+        new RegExp(`\\s*--profile(?:\\s+|=)${CODEX_WORKER_PROFILE_NAME}(?=\\s|$)`),
+        '',
+      );
+    }
+    if (!hasBypass) out = insertAfterToken(out, '--dangerously-bypass-hook-trust');
+    return { command: out, instrumented: true };
+  }
+
+  // WSL workers + codex personas — inject BOTH flags (whichever is missing).
+  if (hasOurProfile && hasBypass) return { command, instrumented: true };
   const additions: string[] = [];
   if (!hasOurProfile) additions.push(`--profile ${CODEX_WORKER_PROFILE_NAME}`);
   if (!hasBypass) additions.push('--dangerously-bypass-hook-trust');
-
-  const tokenEnd = tokenMatch.index! + tokenMatch[1].length + tokenMatch[2].length;
-  const head = command.slice(0, tokenEnd);
-  const tail = command.slice(tokenEnd);
-  return { command: `${head} ${additions.join(' ')}${tail}`, instrumented: true };
+  return { command: insertAfterToken(command, additions.join(' ')), instrumented: true };
 }
 
 const BRACKETED_PASTE_START = '\x1b[200~';
@@ -2322,25 +2358,32 @@ export class AgentSupervisor extends EventEmitter {
       // stored command. (No-op for codex/gemini commands, which never carry it.)
       command = command.replace(/\s+--chrome\b/g, '');
     }
-    // Class IV codex hooks: codex never loads the worker-cwd .codex/config.toml
-    // (it's not a trusted project), so turn-boundary hooks must ride a
-    // `--profile` file in CODEX_HOME instead. `--dangerously-bypass-hook-trust`
-    // removes the per-hook trust gate so an automated launch never stalls on an
-    // interactive trust prompt. B2 (HOOK_SYSTEM_DESIGN.md §C): inject these
-    // flags into ANY worker-lane codex command (not just the pristine default);
-    // if the command can't be safely instrumented, remember to mark the agent
-    // hook_status='degraded' (set below, once the agent row exists).
+    // Class IV codex hooks. Path A (probe 2026-07-28): a native-Windows WORKER
+    // lane gets its turn-boundary hooks from the worker-cwd trusted-project
+    // .codex/config.toml (ensureCodexProjectTrust marks the cwd trusted, so Codex
+    // loads it), so it must NOT also carry `--profile dashboard-worker` (Run D:
+    // profile + project layers merge → every hook double-fires). Every OTHER
+    // codex-hook path still needs the CODEX_HOME profile: WSL workers (NOT yet
+    // migrated — WSL needs its own probe) and codex personas (no worker-cwd hook
+    // config of their own). `--dangerously-bypass-hook-trust` is load-bearing on
+    // ALL paths (Run C: hooks silently don't fire without it) and never stalls an
+    // automated launch. B2 (HOOK_SYSTEM_DESIGN.md §C): instrument ANY codex
+    // command (not just the pristine default); if it can't be safely
+    // instrumented, mark the agent hook_status='degraded' (set below).
+    const useWorkerCwdCodexHooks = pathType === 'windows' && isWorkerLane && !resolvedInput.persona;
     let codexHookDegraded = false;
     if (wantsCodexHooks) {
-      const instrumented = instrumentCodexWorkerCommand(command);
+      const instrumented = instrumentCodexWorkerCommand(command, { injectProfile: !useWorkerCwdCodexHooks });
       if (instrumented.instrumented) {
         command = instrumented.command;
       } else {
         codexHookDegraded = true;
+        const flags = useWorkerCwdCodexHooks
+          ? '--dangerously-bypass-hook-trust (Path A: worker-cwd trusted-project hooks, no --profile)'
+          : `--profile ${CODEX_WORKER_PROFILE_NAME} --dangerously-bypass-hook-trust`;
         console.warn(
           `[hook-b2] hook-instrumented codex command could not be safely instrumented ` +
-          `with --profile ${CODEX_WORKER_PROFILE_NAME} --dangerously-bypass-hook-trust ` +
-          `(command: ${JSON.stringify(command)}). Marking hook_status='degraded' — ` +
+          `with ${flags} (command: ${JSON.stringify(command)}). Marking hook_status='degraded' — ` +
           `this agent runs hookless and its status will be stale.`,
         );
       }
@@ -2580,9 +2623,14 @@ export class AgentSupervisor extends EventEmitter {
       // (supervised or plain) — scaffold the per-provider template + shared
       // hook script so turn-boundary status hooks fire.
       this.ensureWorkerScaffold(workDir, provider, pathType);
-      // Codex turn-boundary hooks ride a CODEX_HOME profile, not the worker-cwd
-      // config (see CODEX_WORKER_PROFILE_TOML). Ensure it exists for this runtime.
-      if (provider === 'codex') this.ensureCodexHookProfile(pathType);
+      // Path A (probe 2026-07-28): native-Windows codex workers now carry their
+      // hooks in the worker-cwd trusted-project .codex/config.toml (WORKER_CODEX_
+      // CONFIG_TOML; ensureCodexProjectTrust trusts the cwd) and the launch
+      // command no longer injects --profile — so the CODEX_HOME profile is
+      // neither loaded nor written for them. WSL codex workers are NOT yet
+      // migrated (needs its own probe), so they still ride the profile: keep
+      // writing it there.
+      if (provider === 'codex' && pathType !== 'windows') this.ensureCodexHookProfile(pathType);
     }
     // WP-G — the trust-tiered research store is persona-agnostic: scaffold it on
     // both supervisor and worker launches so any persona can read/Grep it (and
@@ -2970,11 +3018,14 @@ export class AgentSupervisor extends EventEmitter {
         /\$\{WORKSPACE_ROOT\}/g,
         posixWorkspaceRoot,
       );
-      // v1/v2/v3/v4 content with the same materialized workspace root, so an old
-      // workspace's on-disk file hashes match and upgrade silently. v1 = Stop
+      // v1/v2/v3/v4/v5 content with the same materialized workspace root, so an
+      // old workspace's on-disk file hashes match and upgrade silently. v1 = Stop
       // only; v2 = Stop + UserPromptSubmit; v3 adds SessionStart; v4 renames the
-      // hook script path `.dashboard/` → `.lares/`; v5 (current) adds the
-      // PreToolUse → guard-git-discard.mjs block.
+      // hook script path `.dashboard/` → `.lares/`; v5 adds the PreToolUse →
+      // guard-git-discard.mjs block; v6 (current, Path A) adds `[features]
+      // hooks = true` (so this file works as the sole hook carrier on native
+      // Windows, with no profile layer to supply the gate) and rewrites the
+      // now-stale INERT header — see WORKER_CODEX_CONFIG_TOML.
       const codexConfigV1 = WORKER_CODEX_CONFIG_TOML_V1.replace(
         /\$\{WORKSPACE_ROOT\}/g,
         posixWorkspaceRoot,
@@ -2991,15 +3042,20 @@ export class AgentSupervisor extends EventEmitter {
         /\$\{WORKSPACE_ROOT\}/g,
         posixWorkspaceRoot,
       );
+      const codexConfigV5 = WORKER_CODEX_CONFIG_TOML_V5.replace(
+        /\$\{WORKSPACE_ROOT\}/g,
+        posixWorkspaceRoot,
+      );
       const codexFiles: Record<string, ScaffoldFile> = {
         [`.lares/workers/codex/.codex/config.toml`]: {
           content: codexConfig,
-          version: 5,
+          version: 6,
           previousHashes: {
             1: sha256Hex(codexConfigV1),
             2: sha256Hex(codexConfigV2),
             3: sha256Hex(codexConfigV3),
             4: sha256Hex(codexConfigV4),
+            5: sha256Hex(codexConfigV5),
           },
         },
         // Standing instructions for the Codex worker. AGENTS.md is the file the
@@ -3181,10 +3237,16 @@ export class AgentSupervisor extends EventEmitter {
   /** Class IV — write the codex hook profile + the two shared scripts
    *  (dashboard-status.mjs AND guard-git-discard.mjs) into the runtime's
    *  CODEX_HOME so `codex --profile dashboard-worker` loads turn-boundary hooks
-   *  AND the PreToolUse git-discard guard. Unlike the worker-cwd config.toml
-   *  (which codex only reads for a trusted project — so its hook blocks are
-   *  INERT), a profile file layers onto the base config unconditionally. The
-   *  in-memory guard avoids re-touching it on every launch.
+   *  AND the PreToolUse git-discard guard.
+   *
+   *  Path A (probe 2026-07-28) RETIRED this for the native-Windows WORKER lane:
+   *  those workers now load hooks from their trusted-project worker-cwd
+   *  config.toml and no longer inject --profile, so launchAgent no longer calls
+   *  this for them. It is still called for (a) WSL codex workers — NOT yet
+   *  migrated to Path A, needs its own probe — and (b) codex personas on either
+   *  runtime, which have no worker-cwd hook config of their own. For those, a
+   *  profile file layers onto the base config unconditionally. The in-memory
+   *  guard avoids re-touching it on every launch.
    *
    *  B8 (§8.5): the profile body alone is not enough — Codex gates each hook
    *  behind a per-hook trust hash, so the writer SEEDS `[hooks.state]` with the
