@@ -4595,6 +4595,55 @@ export function listTurnRecords(
   return rows;
 }
 
+// ── SC-WP-1A: query-only turn witness reads (bundle contract §3) ─────────────
+//
+// An IMMUTABLE, read-only projection of `turn_records` for the Save-card
+// witness join: per turn, its agent id, the owner/supervisor attribution FROZEN
+// on the row at dispatch (owner_agent_id / owner_brick_generation), and the
+// witnessed write/create paths. This is a READ accessor only — no DDL, no schema
+// change, no writes.
+//
+// DELIBERATELY narrow SELECT (never `SELECT *`): it must NOT read or expose
+// `agents.plan_id` — Stage ① performs no plan attribution for legacy/unstamped
+// turns, and `agents.plan_id` must never backfill history. `touched[]` is
+// filtered to write/create ops (contract §3: "write/create only").
+
+export interface TurnWitnessRead {
+  turnId: string;
+  agentId: string | null;
+  /** Owner/supervisor attribution frozen on the row at dispatch, if any. */
+  ownerAgentId: string | null;
+  ownerBrickGeneration: number | null;
+  /** Witnessed write/create paths (workspace-relative POSIX, as recorded). */
+  touched: TurnWitnessEntry[];
+}
+
+/** Write/create are the only ops that witness a bundle member (contract §3);
+ *  the guard keeps the projection correct if the op set later grows. */
+function isWitnessingOp(op: TurnWitnessOp): boolean {
+  return op === 'write' || op === 'create';
+}
+
+/**
+ * Immutable witness reads for a workspace's turns, ascending by `turn_seq`.
+ * Query-only — mirrors the free-function `queryAll(...).map` convention.
+ */
+export function getTurnWitnessReads(workspaceId: string): TurnWitnessRead[] {
+  return queryAll(
+    `SELECT id, agent_id, owner_agent_id, owner_brick_generation, touched
+       FROM turn_records WHERE workspace_id = ? ORDER BY turn_seq ASC`,
+    [workspaceId]
+  ).map((row: any): TurnWitnessRead => ({
+    turnId: row.id,
+    agentId: row.agent_id ?? null,
+    ownerAgentId: row.owner_agent_id ?? null,
+    ownerBrickGeneration: row.owner_brick_generation ?? null,
+    touched: (parseJsonColumn<TurnWitnessEntry[]>(row.touched) ?? []).filter(
+      (e) => e && typeof e.path === 'string' && isWitnessingOp(e.op)
+    ),
+  }));
+}
+
 /**
  * Atomic sequence allocation + insert. `MAX(turn_seq)+1` AND the insert run
  * inside ONE `db.transaction(...)`; on a `UNIQUE(workspace_id, turn_seq)`
