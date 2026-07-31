@@ -2,12 +2,14 @@
 // MAIN-PROCESS ONLY.
 //
 // The single low-level seam every Lares checkpoint/recovery op shells through.
-// Two entry points:
+// Three entry points:
 //
 //   • runGit(cwd, args, opts)          — bounded, buffered exec of a text-ish git
 //                                        command (rev-parse, ls-files, update-index,
 //                                        commit-tree, …). Buffers stdout/stderr under
 //                                        a byte cap; classifies every failure.
+//   • runGitBytes(cwd, args, opts)     — the same bounded exec semantics while
+//                                        preserving stdout as authoritative bytes.
 //   • runGitBlobToFile(cwd, oid, dst)  — restore's binary path: validates a blob's
 //                                        type+size, then STREAMS `cat-file blob` into
 //                                        a temp file, never decoding it as text.
@@ -119,6 +121,12 @@ export interface GitRunResult {
   stderr: string;
 }
 
+export interface GitRunBytesResult {
+  code: number;
+  stdout: Buffer;
+  stderr: string;
+}
+
 /** stderr shapes that mean "someone else holds a git lock" — retryable. */
 function looksLikeLock(stderr: string): boolean {
   if (/index\.lock/i.test(stderr)) return true;
@@ -166,12 +174,16 @@ function effectiveTimeout(opts: RunGitOptions): { ms: number; kind: 'timeout' | 
 }
 
 /**
- * Bounded, buffered exec of a git command. Resolves `{ code, stdout, stderr }` on
- * success (and, when `allowNonzero`, on a non-zero exit); otherwise rejects with a
- * classified `GitCommandError`. Never spawns a shell — args are passed verbatim.
+ * Shared bounded exec implementation. `projectStdout` is the sole distinction
+ * between the text and binary public seams.
  */
-export function runGit(cwd: string, args: string[], opts: RunGitOptions): Promise<GitRunResult> {
-  return new Promise<GitRunResult>((resolve, reject) => {
+function runGitBuffered<T>(
+  cwd: string,
+  args: string[],
+  opts: RunGitOptions,
+  projectStdout: (stdout: Buffer) => T,
+): Promise<{ code: number; stdout: T; stderr: string }> {
+  return new Promise<{ code: number; stdout: T; stderr: string }>((resolve, reject) => {
     let limit: { ms: number; kind: 'timeout' | 'deadline' } | null;
     try {
       limit = effectiveTimeout(opts);
@@ -205,7 +217,8 @@ export function runGit(cwd: string, args: string[], opts: RunGitOptions): Promis
           },
           (err, stdoutBuf, stderrBuf) => {
             if (timer) clearTimeout(timer);
-            const stdout = Buffer.isBuffer(stdoutBuf) ? stdoutBuf.toString('utf8') : String(stdoutBuf ?? '');
+            const rawStdout = Buffer.isBuffer(stdoutBuf) ? stdoutBuf : Buffer.from(String(stdoutBuf ?? ''));
+            const stdout = projectStdout(rawStdout);
             const stderr = Buffer.isBuffer(stderrBuf) ? stderrBuf.toString('utf8') : String(stderrBuf ?? '');
 
             if (killedBy) {
@@ -266,6 +279,24 @@ export function runGit(cwd: string, args: string[], opts: RunGitOptions): Promis
       (e) => reject(e instanceof GitCommandError ? e : new GitCommandError('spawn', String(e), null, '')),
     );
   });
+}
+
+/**
+ * Bounded, buffered exec of a git command. Resolves `{ code, stdout, stderr }` on
+ * success (and, when `allowNonzero`, on a non-zero exit); otherwise rejects with a
+ * classified `GitCommandError`. Never spawns a shell — args are passed verbatim.
+ */
+export function runGit(cwd: string, args: string[], opts: RunGitOptions): Promise<GitRunResult> {
+  return runGitBuffered(cwd, args, opts, (stdout) => stdout.toString('utf8'));
+}
+
+/**
+ * Binary counterpart to `runGit`. It has identical bounds, environment handling,
+ * timeout/deadline behavior, and failure classification, but returns stdout
+ * without decoding or otherwise changing Git's authoritative bytes.
+ */
+export function runGitBytes(cwd: string, args: string[], opts: RunGitOptions): Promise<GitRunBytesResult> {
+  return runGitBuffered(cwd, args, opts, (stdout) => stdout);
 }
 
 export interface RunGitBlobToFileOptions {
