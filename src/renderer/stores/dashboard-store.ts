@@ -169,6 +169,10 @@ interface WorkspaceViewState {
   activeTabId: string | null;
   fileViewerOpen: boolean;
   browserOpen: boolean;
+  // SC-WP-1I — the read-only Save-card center surface. A peer of the file
+  // viewer / browser panes: at most one center surface is open at a time, and
+  // this flag is snapshotted/restored per workspace like the others.
+  saveCardOpen: boolean;
   detailPane: 0 | 1 | 2;
 }
 
@@ -287,6 +291,10 @@ interface DashboardState {
   // Browser pane center-mode flag (WP1-B). Precedence: file viewer wins —
   // opening either pane closes the other.
   browserOpen: boolean;
+  // Save-card center-surface flag (SC-WP-1I). A peer of fileViewerOpen /
+  // browserOpen; the four show* actions are mutually exclusive and the center
+  // dispatch resolves precedence file viewer > browser > save card > dashboard.
+  saveCardOpen: boolean;
   tabEditState: Record<string, TabEditState>;
 
   // Actions
@@ -386,6 +394,7 @@ interface DashboardState {
   showBrowser: () => void;
   hideBrowser: () => void;
   showDashboard: () => void;
+  showSaveCard: () => void;
 
   // Detachable (tear-off) top-level views. `detachedViews` holds the views
   // currently torn off into their own OS windows; their toolbar buttons render
@@ -476,6 +485,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
   activeTabId: null,
   fileViewerOpen: false,
   browserOpen: false,
+  saveCardOpen: false,
   tabEditState: {},
 
   openTab: (filePath, rootDirectory, pathType, agentId?, workspaceId?, focusRange?) => {
@@ -1222,6 +1232,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
       set({
         fileViewerOpen: true,
         browserOpen: false,
+        saveCardOpen: false,
         activeTabId: activeBelongs ? activeTabId : wsTabs[0].id,
       });
     } else {
@@ -1242,15 +1253,21 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
 
   // Browser pane (WP1-B) — mirrors show/hideFileViewer. Opening either center
   // mode closes the other; the file viewer wins when both flags are set.
-  showBrowser: () => set({ browserOpen: true, fileViewerOpen: false }),
+  showBrowser: () => set({ browserOpen: true, fileViewerOpen: false, saveCardOpen: false }),
   hideBrowser: () => set({ browserOpen: false }),
+
+  // Save-card center surface (SC-WP-1I). Peer of the file viewer / browser
+  // panes — opening it closes the others (explicit mutual exclusion). Read-only
+  // inspect surface; there is no writer, so this only swaps what the center
+  // renders. Not detachable (Stage ① non-goal), so no detached-view guard.
+  showSaveCard: () => set({ saveCardOpen: true, fileViewerOpen: false, browserOpen: false }),
 
   // Return to the agent-card grid (WP-NAV). Tabs survive — only the view resets.
   // A detached Dashboard cannot be reactivated in the main window — no-op so the
   // ghost button stays inert (MainContent renders a placeholder instead).
   showDashboard: () => {
     if (get().detachedViews.includes('dashboard')) return;
-    set({ fileViewerOpen: false, browserOpen: false });
+    set({ fileViewerOpen: false, browserOpen: false, saveCardOpen: false });
   },
 
   // Detachable views registry (renderer mirror of main's view-window registry).
@@ -1503,6 +1520,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
         activeTabId: state.activeTabId,
         fileViewerOpen: state.fileViewerOpen,
         browserOpen: state.browserOpen,
+        saveCardOpen: state.saveCardOpen,
         detailPane: state.detailPane,
       };
     }
@@ -1519,6 +1537,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
     let nextActiveTabId: string | null;
     let nextFileViewerOpen: boolean;
     let nextBrowserOpen: boolean;
+    let nextSaveCardOpen: boolean;
     let nextDetailPane: 0 | 1 | 2;
 
     if (snap) {
@@ -1526,6 +1545,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
       nextTerminalAgentId = snap.terminalAgentId;
       nextFileViewerOpen = snap.fileViewerOpen;
       nextBrowserOpen = snap.browserOpen;
+      nextSaveCardOpen = snap.saveCardOpen;
       nextDetailPane = snap.detailPane;
       // The remembered tab may have been closed while away; validate it still
       // exists and belongs to this workspace, else re-point to any of its tabs.
@@ -1537,6 +1557,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
       nextTerminalAgentId = null;
       nextFileViewerOpen = false;
       nextBrowserOpen = false;
+      nextSaveCardOpen = false;
       nextDetailPane = state.detailPane;
       nextActiveTabId = fallbackTabId;
     }
@@ -1554,6 +1575,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
       activeTabId: nextActiveTabId,
       fileViewerOpen: nextFileViewerOpen,
       browserOpen: nextBrowserOpen,
+      saveCardOpen: nextSaveCardOpen,
       detailPane: nextDetailPane,
       workspaceViewState,
     });

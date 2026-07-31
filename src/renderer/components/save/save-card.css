@@ -1,0 +1,272 @@
+/* SC-WP-1I — read-only Save-card center surface.
+ *
+ * Layout + tone follow the Edward-approved mockup
+ * (.lares/proposals/supporting/2026-07-30-save-card-ui-mockup.html): loud
+ * unsaved section with colored card edges, quiet already-protected list,
+ * memory-jog description lines, video-game "save progress" feel. Colors are
+ * sourced from the app's real design tokens in styles/globals.css
+ * (--color-surface-*, --color-accent-*, --color-fg-*) — NOT the mockup's
+ * inlined copies. Stage ① is inspect-only: no commit/write affordance exists.
+ */
+
+.sc-root {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 22px 26px 60px;
+  color: var(--color-fg-primary);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.sc-h1 {
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--color-fg-bright);
+  margin: 4px 0 2px;
+  letter-spacing: 0.02em;
+}
+.sc-sub {
+  color: var(--color-fg-secondary);
+  font-size: 12.5px;
+  margin: 0 0 22px;
+}
+.sc-sub b { color: var(--color-fg-primary); font-weight: 600; }
+
+/* ── section rules ─────────────────────────────── */
+.sc-sect {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 4px 0 12px;
+}
+.sc-sect h2 {
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--color-fg-secondary);
+  margin: 0;
+  font-weight: 600;
+}
+.sc-sect .sc-rule { flex: 1; height: 1px; background: var(--color-surface-3); }
+.sc-sect .sc-count {
+  font-size: 11px;
+  color: var(--color-fg-muted);
+  font-family: ui-monospace, "Cascadia Code", "Consolas", Menlo, monospace;
+}
+
+.sc-slots {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-bottom: 30px;
+}
+
+/* ── message states (loading / error / empty) ──── */
+.sc-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  gap: 8px;
+  padding: 54px 24px;
+  background: var(--color-surface-1);
+  border: 1px solid var(--color-surface-3);
+  border-radius: 6px;
+  color: var(--color-fg-secondary);
+}
+.sc-state.sc-state-error { border-color: color-mix(in srgb, var(--color-accent-red) 46%, var(--color-surface-3)); }
+.sc-state-title { font-size: 14px; font-weight: 600; color: var(--color-fg-bright); }
+.sc-state-body { font-size: 12.5px; color: var(--color-fg-secondary); max-width: 460px; }
+.sc-state-hint { font-size: 11.5px; color: var(--color-fg-muted); }
+
+/* ── unsaved cards ─────────────────────────────── */
+.sc-slot {
+  background: var(--color-surface-1);
+  border: 1px solid var(--color-surface-3);
+  border-left: 3px solid var(--color-accent-blue);
+  border-radius: 4px;
+  padding: 14px 16px;
+}
+.sc-slot.sc-ready { border-left-color: var(--color-accent-green); }
+.sc-slot.sc-blocked { border-left-color: var(--color-accent-red); }
+.sc-slot.sc-ghost {
+  border-left-color: var(--color-surface-3);
+  background: var(--color-surface-0);
+}
+
+.sc-slothead {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.sc-check {
+  width: 16px;
+  height: 16px;
+  border: 1.5px solid var(--color-fg-muted);
+  border-radius: 3px;
+  flex: none;
+}
+.sc-check.sc-done {
+  border-color: var(--color-accent-green);
+  background: var(--color-accent-green);
+  position: relative;
+}
+.sc-check.sc-done::after {
+  content: "\2713";
+  position: absolute;
+  inset: 0;
+  color: #10240f;
+  font-size: 12px;
+  font-weight: 800;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.sc-slot h2 {
+  font-size: 13.5px;
+  margin: 0;
+  font-weight: 600;
+  color: var(--color-fg-bright);
+  flex: 1;
+  min-width: 220px;
+  letter-spacing: 0;
+  text-transform: none;
+}
+.sc-slot.sc-ghost h2 { color: var(--color-fg-secondary); }
+
+.sc-pill {
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 2px 8px;
+  border-radius: 2px;
+  font-family: ui-monospace, "Cascadia Code", "Consolas", Menlo, monospace;
+  flex: none;
+}
+.sc-p-live { background: var(--color-accent-blue-band); color: var(--color-accent-blue-bright); }
+.sc-p-warn { background: #33290a; color: var(--color-accent-yellow); }
+.sc-p-block { background: #3a1616; color: var(--color-accent-red); }
+.sc-p-done { background: #1e3320; color: var(--color-accent-green); }
+.sc-p-ghost { background: var(--color-surface-2); color: var(--color-fg-secondary); }
+
+.sc-desc { font-size: 12.5px; color: var(--color-fg-primary); margin: 7px 0 0; }
+.sc-desc .sc-k { color: var(--color-fg-muted); }
+.sc-desc b { color: var(--color-fg-primary); font-weight: 600; }
+.sc-meta { font-size: 11.5px; color: var(--color-fg-secondary); margin: 3px 0 0; }
+
+.sc-paths {
+  font-family: ui-monospace, "Cascadia Code", "Consolas", Menlo, monospace;
+  font-size: 12px;
+  margin: 10px 0 0;
+  padding: 8px 12px;
+  background: var(--color-surface-0);
+  border: 1px solid var(--color-surface-2);
+  border-radius: 3px;
+  overflow-x: auto;
+}
+.sc-paths div {
+  white-space: nowrap;
+  padding: 1px 0;
+  color: var(--color-fg-secondary);
+}
+.sc-paths .sc-add { color: var(--color-accent-green); }
+.sc-paths .sc-mod { color: var(--color-accent-blue-bright); }
+.sc-paths .sc-del { color: var(--color-accent-red); }
+.sc-paths .sc-more { color: var(--color-fg-muted); font-style: italic; }
+
+/* ── capture-health flags ──────────────────────── */
+.sc-flag {
+  display: inline-flex;
+  gap: 6px;
+  align-items: flex-start;
+  font-size: 11.5px;
+  color: var(--color-accent-yellow);
+  margin-top: 8px;
+}
+.sc-flag.sc-flag-muted { color: var(--color-fg-secondary); }
+
+/* ── protection ledger row ─────────────────────── */
+.sc-protect {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  font-size: 11.5px;
+  color: var(--color-fg-secondary);
+}
+.sc-rung {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-family: ui-monospace, "Cascadia Code", "Consolas", Menlo, monospace;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 2px;
+  background: var(--color-surface-2);
+}
+.sc-rung.sc-rung-unprotected { color: var(--color-accent-red); }
+.sc-rung.sc-rung-checkpoint-protected { color: var(--color-accent-blue-bright); }
+.sc-rung.sc-rung-locally-committed { color: var(--color-accent-green); }
+.sc-rung.sc-rung-remote-reachable { color: var(--color-accent-yellow); }
+
+/* ── actions (inspect-only, no writer) ─────────── */
+.sc-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+/* ── quiet already-protected list ──────────────── */
+.sc-saved {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--color-surface-2);
+  border-radius: 4px;
+  overflow: hidden;
+  margin-bottom: 14px;
+}
+.sc-savedrow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 14px;
+  background: var(--color-surface-0);
+  border-bottom: 1px solid var(--color-surface-2);
+  font-size: 12.5px;
+  color: var(--color-fg-secondary);
+}
+.sc-savedrow:last-child { border-bottom: 0; }
+.sc-savedrow .sc-tick {
+  color: var(--color-accent-green);
+  font-family: ui-monospace, "Cascadia Code", "Consolas", Menlo, monospace;
+  flex: none;
+}
+.sc-savedrow .sc-t {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sc-savedrow .sc-t b { color: var(--color-fg-primary); font-weight: 600; }
+.sc-savedrow .sc-savedrung {
+  font-family: ui-monospace, "Cascadia Code", "Consolas", Menlo, monospace;
+  font-size: 11.5px;
+  color: var(--color-fg-muted);
+  flex: none;
+}
+
+.sc-keyline {
+  margin: 36px 0 0;
+  padding-top: 14px;
+  border-top: 1px solid var(--color-surface-2);
+  font-size: 12px;
+  color: var(--color-fg-muted);
+}
+.sc-keyline b { color: var(--color-fg-secondary); }

@@ -6,6 +6,7 @@ import AgentLaunchDialog from '../agent/AgentLaunchDialog';
 import FileViewerPanel from '../fileviewer/FileViewerPanel';
 import BrowserPanel from '../browser/BrowserPanel';
 import PlansMenu from '../plan/PlansMenu';
+import SaveCard from '../save/SaveCard';
 import { useBrowserStore, ensureBrowserBridge } from '../../stores/browser-store';
 import * as Icons from 'lucide-react';
 import vscodeIcon from '../../assets/material-icons/vscode.svg';
@@ -52,12 +53,13 @@ function DetachedViewPlaceholder({ label }: { label: string }) {
 }
 
 export default function MainContent() {
-  const { workspaces, selectedWorkspaceId, fileViewerOpen, browserOpen, openTabs, detachedViews } = useDashboardStore(
+  const { workspaces, selectedWorkspaceId, fileViewerOpen, browserOpen, saveCardOpen, openTabs, detachedViews } = useDashboardStore(
     useShallow((s) => ({
       workspaces: s.workspaces,
       selectedWorkspaceId: s.selectedWorkspaceId,
       fileViewerOpen: s.fileViewerOpen,
       browserOpen: s.browserOpen,
+      saveCardOpen: s.saveCardOpen,
       openTabs: s.openTabs,
       detachedViews: s.detachedViews,
     })),
@@ -65,6 +67,7 @@ export default function MainContent() {
   const showFileViewer = useDashboardStore((s) => s.showFileViewer);
   const showBrowser = useDashboardStore((s) => s.showBrowser);
   const showDashboard = useDashboardStore((s) => s.showDashboard);
+  const showSaveCard = useDashboardStore((s) => s.showSaveCard);
   const browserPaneAttention = useBrowserStore((s) => s.paneAttention);
   const [showLaunch, setShowLaunch] = useState(false);
 
@@ -169,8 +172,10 @@ export default function MainContent() {
 
   const workspaceTabCount = openTabs.filter((t) => t.workspaceId === selectedWorkspaceId).length;
   const hasOpenTabs = workspaceTabCount > 0;
-  // Center-view dispatch — file viewer wins over the browser pane.
-  const dashboardActive = !fileViewerOpen && !browserOpen;
+  // Center-view dispatch — precedence file viewer > browser > save card >
+  // dashboard grid. The Save card is a read-only peer surface (SC-WP-1I).
+  const dashboardActive = !fileViewerOpen && !browserOpen && !saveCardOpen;
+  const saveCardActive = saveCardOpen && !fileViewerOpen && !browserOpen;
 
   return (
     <div className="flex-1 flex flex-col min-w-0 overflow-hidden relative">
@@ -253,6 +258,17 @@ export default function MainContent() {
                 onDragEnd={(e) => handleViewDragEnd(e, 'plans')}
               />
               <button
+                data-testid="view-btn-save"
+                onClick={showSaveCard}
+                className={`ui-btn ui-btn-outline shrink-0 whitespace-nowrap px-3 py-1.5 text-[13px] font-medium ${
+                  saveCardActive ? 'ui-btn-success is-active' : ''
+                }`}
+                title="Save progress — inspect uncommitted work (read-only)"
+              >
+                <Icons.Save className="w-4 h-4 shrink-0" />
+                {!toolbarCompact && 'Save'}
+              </button>
+              <button
                 onClick={() => window.api.workspaces.openInVSCode(workspace.id)}
                 className="ui-btn ui-btn-outline shrink-0 whitespace-nowrap px-3 py-1.5 text-[13px] font-medium"
                 title="Open workspace in VS Code"
@@ -286,6 +302,8 @@ export default function MainContent() {
         <DetachedViewPlaceholder label="Browser" />
       ) : fileViewerOpen && filesDetached ? (
         <DetachedViewPlaceholder label="Files" />
+      ) : saveCardActive ? (
+        <SaveCard />
       ) : dashboardDetached ? (
         <DetachedViewPlaceholder label="Dashboard" />
       ) : (
