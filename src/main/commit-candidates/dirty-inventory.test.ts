@@ -23,6 +23,7 @@ import * as path from 'node:path';
 import {
   produceDirtyInventory,
   encodeGitPath,
+  encodeHashObjectStdinPathLine,
   type DirtyInventoryDraft,
   type RunGitBytesLike,
   type RunGitTextLike,
@@ -98,7 +99,7 @@ const byPath = (draft: DirtyInventoryDraft, p: string) =>
  *  stream). Asserts the producer issues the normative status command + scope. */
 function fakeBytes(stdout: Buffer, capture?: { args?: string[] }): RunGitBytesLike {
   return async (_cwd, args, _opts) => {
-    if (capture) capture.args = args;
+    if (capture && args[1] === 'status') capture.args = args;
     return { code: 0, stdout, stderr: '' };
   };
 }
@@ -119,9 +120,140 @@ function syntheticDraft(records: string[], opts?: { capture?: { args?: string[] 
   });
 }
 
+function ordinaryRecord(pathBytes: Buffer, worktreeMode = '100644'): Buffer {
+  const header = Buffer.from(`1 M. N... 100644 100644 ${worktreeMode} aaaa bbbb `, 'ascii');
+  return Buffer.concat([header, pathBytes, Buffer.from([0])]);
+}
+
+/** Test-only model of Git's `hash-object --stdin-paths` C-unquoting. */
+function decodeHashObjectStdinLines(stdin: Buffer): Buffer[] {
+  const lines: Buffer[] = [];
+  let start = 0;
+  for (let i = 0; i < stdin.length; i++) {
+    if (stdin[i] !== 0x0a) continue;
+    const line = stdin.subarray(start, i);
+    start = i + 1;
+    if (line[0] !== 0x22) {
+      lines.push(Buffer.from(line));
+      continue;
+    }
+
+    assert.equal(line.at(-1), 0x22, 'quoted stdin-path line closes with double quote');
+    const decoded: number[] = [];
+    for (let j = 1; j < line.length - 1; j++) {
+      const byte = line[j];
+      if (byte !== 0x5c) {
+        decoded.push(byte);
+        continue;
+      }
+      const next = line[++j];
+      if (next >= 0x30 && next <= 0x37) {
+        const octal = line.subarray(j, j + 3).toString('ascii');
+        assert.match(octal, /^[0-7]{3}$/);
+        decoded.push(parseInt(octal, 8));
+        j += 2;
+      } else {
+        assert.ok(next === 0x22 || next === 0x5c, 'only quote/backslash short escapes are emitted');
+        decoded.push(next);
+      }
+    }
+    lines.push(Buffer.from(decoded));
+  }
+  assert.equal(start, stdin.length, 'stdin-path stream ends with newline');
+  return lines;
+}
+
+function syntheticOid(pathBytes: Buffer): string {
+  return createHash('sha1').update(Buffer.from('synthetic-per-entry\0')).update(pathBytes).digest('hex');
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // REAL-GIT temp-repo cases
 // ════════════════════════════════════════════════════════════════════════════
+
+test('hash-object stdin path encoder emits raw and Git C-quoted lines byte-exactly', () => {
+  const plain = Buffer.from('plain.txt');
+  assert.deepEqual(encodeHashObjectStdinPathLine(plain), Buffer.from('plain.txt\n'));
+
+  const rawBackslash = Buffer.from('dir\\name.txt');
+  assert.deepEqual(
+    encodeHashObjectStdinPathLine(rawBackslash),
+    Buffer.from('dir\\name.txt\n'),
+    'an unquoted backslash remains a literal byte',
+  );
+
+  const leadingQuote = Buffer.from('"lead.txt');
+  assert.deepEqual(encodeHashObjectStdinPathLine(leadingQuote), Buffer.from('"\\"lead.txt"\n'));
+
+  const quotedBackslash = Buffer.from('line\nback\\slash');
+  assert.deepEqual(
+    encodeHashObjectStdinPathLine(quotedBackslash),
+    Buffer.from('"line\\012back\\\\slash"\n'),
+  );
+
+  const nonUtf8Quoted = Buffer.from([0x22, 0xff, 0x0d]);
+  assert.deepEqual(
+    encodeHashObjectStdinPathLine(nonUtf8Quoted),
+    Buffer.from('"\\"\\377\\015"\n', 'ascii'),
+  );
+
+  for (const pathBytes of [plain, rawBackslash, leadingQuote, quotedBackslash, nonUtf8Quoted]) {
+    assert.deepEqual(decodeHashObjectStdinLines(encodeHashObjectStdinPathLine(pathBytes)), [pathBytes]);
+  }
+});
+
+test('mixed raw/C-quoted batch oids equal per-entry seam oids in input order', async () => {
+  const paths = [
+    Buffer.from('plain.txt'),
+    Buffer.from('"lead.txt'),
+    Buffer.from('dir\\name.txt'),
+    Buffer.from('line\nback\\slash'),
+    Buffer.from([0x22, 0xff, 0xfe, 0x2e, 0x62, 0x69, 0x6e]),
+  ];
+  const statusStdout = Buffer.concat(paths.map((p) => ordinaryRecord(p)));
+  const expectedStdin = Buffer.concat(paths.map(encodeHashObjectStdinPathLine));
+  const perEntryHash: RunGitTextLike = async (_cwd, args, opts) => {
+    assert.deepEqual(args, ['hash-object', '--no-filters', '--stdin-paths']);
+    const decoded = decodeHashObjectStdinLines(opts.stdin as Buffer);
+    assert.equal(decoded.length, 1);
+    return { code: 0, stdout: `${syntheticOid(decoded[0])}\n`, stderr: '' };
+  };
+  const expectedOids = await Promise.all(paths.map(async (p) =>
+    (await perEntryHash('C:/fake', ['hash-object', '--no-filters', '--stdin-paths'], {
+      maxBytes: 4096,
+      stdin: encodeHashObjectStdinPathLine(p),
+    })).stdout.trim(),
+  ));
+
+  let hashCalls = 0;
+  const draft = await produceDirtyInventory({
+    repoRoot: 'C:/fake',
+    workspacePrefix: '',
+    repository: IDENTITY,
+    runGitBytes: async (_cwd, args, opts) => {
+      if (args[1] === 'status') return { code: 0, stdout: statusStdout, stderr: '' };
+      hashCalls++;
+      assert.deepEqual(args, ['hash-object', '--no-filters', '--stdin-paths']);
+      assert.deepEqual(opts.stdin, expectedStdin);
+      const decoded = decodeHashObjectStdinLines(opts.stdin as Buffer);
+      return {
+        code: 0,
+        stdout: Buffer.from(`${decoded.map(syntheticOid).join('\n')}\n`, 'ascii'),
+        stderr: '',
+      };
+    },
+    runGit: async () => {
+      assert.fail('successful batch must not use the per-entry fallback');
+    },
+    gitExe: 'git',
+  });
+
+  assert.equal(hashCalls, 1, 'one hash-object batch for the inventory');
+  const oidByPath = new Map(draft.entries.map((e) => [e.path.pathBytesBase64, e.rawWorktreeBlobOid]));
+  paths.forEach((p, i) => {
+    assert.equal(oidByPath.get(p.toString('base64')), expectedOids[i]);
+  });
+});
 
 test('normative status command + scope pathspec are issued', async () => {
   const cap: { args?: string[] } = {};
@@ -134,6 +266,38 @@ test('normative status command + scope pathspec are issued', async () => {
     runGitBytes: fakeBytes(Buffer.alloc(0), cap2), runGit: fakeHash, gitExe: 'git',
   });
   assert.deepEqual(cap2.args, ['--no-optional-locks', 'status', '--porcelain=v2', '-z', '--untracked-files=all', '--', ':(top,literal)sub/dir']);
+});
+
+test('plain mixed real-git inventory uses one batch with per-entry-identical oids', async () => {
+  const repo = mkRepo();
+  fs.writeFileSync(path.join(repo, 'one.txt'), 'one\n');
+  fs.writeFileSync(path.join(repo, 'two.txt'), 'two\n');
+  commitAll(repo, 'init');
+  fs.writeFileSync(path.join(repo, 'one.txt'), 'changed one\n');
+  fs.writeFileSync(path.join(repo, 'two.txt'), 'changed two\n');
+  fs.writeFileSync(path.join(repo, 'three.txt'), 'new three\n');
+
+  let hashCalls = 0;
+  const draft = await produceDirtyInventory({
+    repoRoot: repo,
+    workspacePrefix: '',
+    repository: { ...IDENTITY, repositoryKey: `key:${repo}` },
+    runGitBytes: (cwd, args, opts) => {
+      if (args[0] === 'hash-object') hashCalls++;
+      return runGitBytes(cwd, args, { ...opts, gitExe: EXE });
+    },
+    runGit: (cwd, args, opts) => runGit(cwd, args, { ...opts, gitExe: EXE }),
+    gitExe: EXE,
+  });
+
+  assert.equal(hashCalls, 1, 'all three plain paths share one hash-object process');
+  for (const p of ['one.txt', 'two.txt', 'three.txt']) {
+    assert.equal(
+      byPath(draft, p)?.rawWorktreeBlobOid,
+      git(repo, ['hash-object', '--no-filters', '--', p]).trim(),
+      `${p} batch oid equals its per-entry hash-object oid`,
+    );
+  }
 });
 
 test('modify: ordinary entry, present, raw hash surfaced, supported', async () => {
@@ -199,6 +363,52 @@ test('copy: source + destination both surfaced in commitPathspecs', async () => 
     // Some git builds report the copy as a plain add; still must include dst path.
     assert.deepEqual(e!.commitPathspecs.map((p) => p.displayPath), ['dst.txt']);
   }
+});
+
+test('failed batch retries present entries individually; absent/unhashable remain null', async () => {
+  const good = Buffer.from('good.txt');
+  const bad = Buffer.from('bad.txt');
+  const gone = Buffer.from('gone.txt');
+  const stdout = Buffer.concat([
+    ordinaryRecord(good),
+    ordinaryRecord(bad),
+    ordinaryRecord(gone, '000000'),
+  ]);
+  const fallbackPaths: Buffer[] = [];
+  let batchCalls = 0;
+
+  const draft = await produceDirtyInventory({
+    repoRoot: 'C:/fake',
+    workspacePrefix: '',
+    repository: IDENTITY,
+    runGitBytes: async (_cwd, args, opts) => {
+      if (args[1] === 'status') return { code: 0, stdout, stderr: '' };
+      batchCalls++;
+      assert.deepEqual(
+        decodeHashObjectStdinLines(opts.stdin as Buffer),
+        [good, bad],
+        'absent path is prefiltered from the batch',
+      );
+      return { code: 1, stdout: Buffer.alloc(0), stderr: 'cannot hash bad.txt' };
+    },
+    runGit: async (_cwd, args, opts) => {
+      assert.deepEqual(args, ['hash-object', '--no-filters', '--stdin-paths']);
+      const [p] = decodeHashObjectStdinLines(opts.stdin as Buffer);
+      fallbackPaths.push(p);
+      return p.equals(good)
+        ? { code: 0, stdout: `${syntheticOid(p)}\n`, stderr: '' }
+        : { code: 1, stdout: '', stderr: 'unhashable' };
+    },
+    gitExe: 'git',
+  });
+
+  assert.equal(batchCalls, 1);
+  assert.deepEqual(fallbackPaths, [good, bad], 'only present batch members retry individually');
+  assert.equal(byPath(draft, 'good.txt')?.rawWorktreeBlobOid, syntheticOid(good));
+  assert.equal(byPath(draft, 'bad.txt')?.expectedWorktreeState, 'present');
+  assert.equal(byPath(draft, 'bad.txt')?.rawWorktreeBlobOid, null, 'unhashable present path stays null');
+  assert.equal(byPath(draft, 'gone.txt')?.expectedWorktreeState, 'absent');
+  assert.equal(byPath(draft, 'gone.txt')?.rawWorktreeBlobOid, null, 'absent path stays null');
 });
 
 test('deletion is absent (distinct from unavailable hash) with null raw hash', async () => {
@@ -316,7 +526,7 @@ test('non-UTF-8 path: bytes preserved in base64, utf8Clean false, unsupported', 
   const draft = await produceDirtyInventory({
     repoRoot: 'C:/fake', workspacePrefix: '', repository: IDENTITY,
     runGitBytes: async () => ({ code: 0, stdout, stderr: '' }),
-    runGit: fakeHash, gitExe: 'git',
+    runGit: async () => ({ code: 1, stdout: '', stderr: 'synthetic path unavailable' }), gitExe: 'git',
   });
   const e = draft.entries[0];
   assert.equal(e.path.pathBytesBase64, badPath.toString('base64'), 'raw bytes preserved authoritatively');

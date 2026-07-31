@@ -22,9 +22,10 @@
 // when checkpoint capture would report `oversized`.
 //
 // Everything that shells out routes through injected seams (`runGitBytes` for the
-// authoritative status bytes; a text `runGit` for the ascii-only `hash-object`
-// probe), so unit tests drive it with either a real git in a throwaway temp repo
-// or crafted byte fixtures (the only way to exercise non-UTF-8 paths on Windows).
+// authoritative status bytes + batched raw-path hashing; text `runGit` for the
+// ascii-only per-entry hash fallback), so unit tests drive it with either a real
+// git in a throwaway temp repo or crafted byte fixtures (the only way to exercise
+// non-UTF-8 paths on Windows).
 
 import { createHash } from 'crypto';
 
@@ -101,6 +102,38 @@ export function encodeGitPath(pathBytes: Buffer): EncodedGitPath {
   };
 }
 
+/**
+ * Encode one raw path for `hash-object --stdin-paths`.
+ *
+ * Git reads one line at a time and C-unquotes any line beginning with `"`.
+ * Ordinary paths can therefore pass through byte-for-byte, but paths containing
+ * a line terminator or beginning with `"` must use Git's C-style quoted form.
+ * Quoted non-printable/high bytes use three-digit octal so arbitrary path bytes
+ * (including non-UTF-8) survive `unquote_c_style` exactly.
+ */
+export function encodeHashObjectStdinPathLine(pathBytes: Buffer): Buffer {
+  const mustQuote =
+    pathBytes.includes(0x0a) ||
+    pathBytes.includes(0x0d) ||
+    pathBytes[0] === 0x22;
+
+  if (!mustQuote) return Buffer.concat([pathBytes, Buffer.from([0x0a])]);
+
+  const encoded: number[] = [0x22];
+  for (const byte of pathBytes) {
+    if (byte === 0x5c || byte === 0x22) {
+      encoded.push(0x5c, byte);
+    } else if (byte < 0x20 || byte >= 0x7f) {
+      const octal = byte.toString(8).padStart(3, '0');
+      encoded.push(0x5c, octal.charCodeAt(0), octal.charCodeAt(1), octal.charCodeAt(2));
+    } else {
+      encoded.push(byte);
+    }
+  }
+  encoded.push(0x22, 0x0a);
+  return Buffer.from(encoded);
+}
+
 // ── porcelain=v2 -z parsing (byte-exact) ───────────────────────────────────────
 
 /** Split a Buffer on NUL bytes, preserving each segment's exact bytes. Empty
@@ -172,9 +205,9 @@ function computeEligibility(
 /** Intermediate parse result before the (async) raw-hash pass. */
 interface ParsedEntry {
   entry: DirtyEntry;
-  /** repo-relative POSIX path string for hash-object — set only when hashable
-   *  (present + utf8Clean); null ⇒ leave rawWorktreeBlobOid null. */
-  hashPath: string | null;
+  /** Authoritative repo-relative path bytes for hash-object. Absent worktree
+   *  entries alone are omitted; non-UTF-8 paths remain hashable. */
+  hashPathBytes: Buffer | null;
 }
 
 function buildEntry(args: {
@@ -232,16 +265,11 @@ function buildEntry(args: {
     commitPathspecs,
   };
 
-  // Hashable iff the worktree file is present AND the path decodes cleanly (a
-  // non-UTF-8 path cannot be passed safely through a Node string argv; such entries
-  // are unsupported anyway and keep rawWorktreeBlobOid null = "unhashable"). Uses
-  // the RAW decoded string (NOT the control-char-escaped displayPath) so the bytes
-  // handed to git match the worktree file exactly.
-  const hashPath = expectedWorktreeState === 'present' && path.utf8Clean
-    ? args.pathBytes.toString('utf8')
-    : null;
+  // `--stdin-paths` accepts authoritative bytes, so every present path is
+  // hashable regardless of whether it round-trips through UTF-8.
+  const hashPathBytes = expectedWorktreeState === 'present' ? args.pathBytes : null;
 
-  return { entry, hashPath };
+  return { entry, hashPathBytes };
 }
 
 /** Parse the full NUL-byte status stream into entries (sync; no hashing yet). */
@@ -365,26 +393,60 @@ export async function produceDirtyInventory(opts: ProduceDirtyInventoryOptions):
 
   const parsed = parseStatus(status.stdout, repository.repositoryKey);
 
-  // Raw-hash pass: `hash-object --no-filters` gives the CHECKPOINT raw semantics
-  // (bypasses clean filters). ascii output ⇒ the text seam is fine. A failing
-  // hash (e.g. a symlink/dir that can't be hashed) leaves rawWorktreeBlobOid null
-  // = "unhashable", never a throw.
-  for (const p of parsed) {
-    if (p.hashPath === null) continue;
+  const hashable = parsed.filter((p) => p.hashPathBytes !== null);
+  const hashArgs = ['hash-object', '--no-filters', '--stdin-paths'];
+  const hashMaxBytes = Math.max(4096, hashable.length * 66);
+  const parseOids = (stdout: Buffer | string, expected: number): string[] | null => {
+    const lines = (Buffer.isBuffer(stdout) ? stdout.toString('ascii') : stdout).split('\n');
+    if (lines.at(-1) === '') lines.pop();
+    const oids = lines.map((line) => line.endsWith('\r') ? line.slice(0, -1) : line);
+    return oids.length === expected && oids.every((oid) => /^[0-9a-f]{40,64}$/.test(oid))
+      ? oids
+      : null;
+  };
+
+  // Raw-hash pass: one common-case process hashes every present path in input
+  // order. Git aborts `--stdin-paths` on the first unhashable member, so any
+  // nonzero/malformed batch result is discarded and retried one entry per process.
+  // That slower fallback preserves the exact per-entry contract: absent entries
+  // were never sent, while only the individual unhashable entries remain null.
+  let batchOids: string[] | null = null;
+  if (hashable.length > 0) {
     try {
-      const res = await runGit(repoRoot, ['hash-object', '--no-filters', '--', p.hashPath], {
-        maxBytes: 4096,
+      const res = await runGitBytes(repoRoot, hashArgs, {
+        maxBytes: hashMaxBytes,
         gitExe,
         deadlineAt,
         timeoutMs: STATUS_TIMEOUT_MS,
         allowNonzero: true,
+        stdin: Buffer.concat(hashable.map((p) => encodeHashObjectStdinPathLine(p.hashPathBytes!))),
       });
-      const oid = res.stdout.trim();
-      if (res.code === 0 && /^[0-9a-f]{40,64}$/.test(oid)) {
-        p.entry.rawWorktreeBlobOid = oid;
-      }
+      if (res.code === 0) batchOids = parseOids(res.stdout, hashable.length);
     } catch {
-      /* unhashable → leave null */
+      /* retry individually below */
+    }
+  }
+
+  if (batchOids) {
+    hashable.forEach((p, index) => {
+      p.entry.rawWorktreeBlobOid = batchOids![index];
+    });
+  } else {
+    for (const p of hashable) {
+      try {
+        const res = await runGit(repoRoot, hashArgs, {
+          maxBytes: 4096,
+          gitExe,
+          deadlineAt,
+          timeoutMs: STATUS_TIMEOUT_MS,
+          allowNonzero: true,
+          stdin: encodeHashObjectStdinPathLine(p.hashPathBytes!),
+        });
+        const oid = res.code === 0 ? parseOids(res.stdout, 1)?.[0] : undefined;
+        if (oid) p.entry.rawWorktreeBlobOid = oid;
+      } catch {
+        /* unhashable → leave null */
+      }
     }
   }
 
