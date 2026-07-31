@@ -47,6 +47,7 @@ import {
 import { runGit as realRunGit } from './git-command';
 import type { RunGitLike } from './checkpoint-service';
 import { CheckpointQueue, type SkippedDeadline } from './checkpoint-queue';
+import { verifyLiveEdge } from './live-edge';
 import { deleteRefPair, type RefDeletion, type ReconLogger } from './reconciler';
 
 const DEFAULT_LOGGER: ReconLogger = {
@@ -588,18 +589,14 @@ async function edgeUsable(
   ref: string | null,
   oid: string | null,
 ): Promise<boolean> {
-  if (!ready || !ref || !oid) return false;
-  try {
-    const res = await cfg.runGit(cfg.repoRoot, ['rev-parse', '--verify', `${ref}^{commit}`], {
-      gitExe: cfg.gitExe,
-      allowNonzero: true,
-      timeoutMs: 10_000,
-      maxBytes: 1 << 20,
-    });
-    return res.code === 0 && res.stdout.trim() === oid;
-  } catch {
-    return false;
-  }
+  if (!ready) return false;
+  return verifyLiveEdge({
+    repoRoot: cfg.repoRoot,
+    ref,
+    oid,
+    runGit: cfg.runGit,
+    gitExe: cfg.gitExe,
+  });
 }
 
 // ── small utilities ───────────────────────────────────────────────────────────
