@@ -262,6 +262,41 @@ test('facade issues only the expected read-only Git command family', async () =>
   }
 });
 
+test('scope probe memo is request-local and deduplicates only repeated target reads', async () => {
+  const revParseReads: Array<{ cwd: string; args: string[] }> = [];
+  const memoService = new CommitCandidateService({
+    runGit: async (cwd, args, options) => {
+      if (args[0] === 'rev-parse') revParseReads.push({ cwd, args: [...args] });
+      return runGit(cwd, args, { ...options, gitExe });
+    },
+    runGitBytes: (cwd, args, options) => runGitBytes(cwd, args, { ...options, gitExe }),
+    readTurnWitnesses: () => [],
+    readCaptureTurns: () => [],
+  });
+  const request = { targetWorkspaceId: 'workspace-a', workspaces };
+
+  await memoService.assembleInventory(request);
+  assert.equal(revParseReads.length, 8, 'two workspaces × four probes; target duplicate is memoized');
+  for (const args of [
+    ['rev-parse', '--is-bare-repository'],
+    ['rev-parse', '--absolute-git-dir'],
+    ['rev-parse', '--git-path', 'index'],
+    ['rev-parse', '--show-object-format'],
+  ]) {
+    assert.equal(
+      revParseReads.filter((read) =>
+        read.cwd === workspaces[0].workspaceDir
+        && JSON.stringify(read.args) === JSON.stringify(args)
+      ).length,
+      1,
+      `target probe runs once within the request: ${args.join(' ')}`,
+    );
+  }
+
+  await memoService.assembleInventory(request);
+  assert.equal(revParseReads.length, 16, 'a separate request performs fresh live probes');
+});
+
 (async () => {
   let passed = 0;
   let failed = 0;

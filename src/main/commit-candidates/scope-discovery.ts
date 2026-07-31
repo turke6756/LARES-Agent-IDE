@@ -79,14 +79,27 @@ export async function discoverRepositoryScopes(
   const accum = new Map<string, Accum>();
   const rejected: Array<{ workspaceId: string; outcome: Extract<RepositoryIdentityOutcome, { ok: false }> }> = [];
 
-  for (const input of inputs) {
-    const perWorkspaceDeps: RepositoryIdentityDeps = {
-      runGit: deps.runGitFor(input.workspaceDir),
-      platform: deps.platform,
-      realpath: deps.realpath,
-      fileExists: deps.fileExists,
-    };
-    const outcome = await deriveRepositoryIdentity(input.workspaceDir, input.capability, perWorkspaceDeps);
+  // Workspace probes are independent read-only operations. Resolve them
+  // concurrently, then fold results in input order so scope and rejection
+  // ordering remain deterministic.
+  const derived = await Promise.all(inputs.map(async (input) => {
+    try {
+      const perWorkspaceDeps: RepositoryIdentityDeps = {
+        runGit: deps.runGitFor(input.workspaceDir),
+        platform: deps.platform,
+        realpath: deps.realpath,
+        fileExists: deps.fileExists,
+      };
+      const outcome = await deriveRepositoryIdentity(input.workspaceDir, input.capability, perWorkspaceDeps);
+      return { ok: true as const, input, outcome };
+    } catch (error) {
+      return { ok: false as const, input, error };
+    }
+  }));
+
+  for (const item of derived) {
+    if (!item.ok) throw item.error;
+    const { input, outcome } = item;
     if (!outcome.ok) {
       rejected.push({ workspaceId: input.workspaceId, outcome });
       continue;

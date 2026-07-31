@@ -137,21 +137,48 @@ export async function deriveRepositoryIdentity(
   capability: Pick<GitCapability, 'commonDirQueueKey'>,
   deps: RepositoryIdentityDeps,
 ): Promise<RepositoryIdentityOutcome> {
+  // These four rev-parse reads are independent. Start them together, then apply
+  // the same authoritative result precedence as the former sequential probes:
+  // bare rejection, repository validation, index validation, format fallback.
+  // This changes only request latency; each value still comes from its original
+  // command and is interpreted exactly as before.
+  type ProbeResult = Awaited<ReturnType<RepositoryIdentityDeps['runGit']>>;
+  type SettledProbe =
+    | { ok: true; value: ProbeResult }
+    | { ok: false; error: unknown };
+  const settle = async (args: string[]): Promise<SettledProbe> => {
+    try {
+      return { ok: true, value: await deps.runGit(args) };
+    } catch (error) {
+      return { ok: false, error };
+    }
+  };
+  const unwrap = (probe: SettledProbe): ProbeResult => {
+    if (!probe.ok) throw probe.error;
+    return probe.value;
+  };
+  const [bareProbe, gitDirProbe, idxProbe, fmtProbe] = await Promise.all([
+    settle(['rev-parse', '--is-bare-repository']),
+    settle(['rev-parse', '--absolute-git-dir']),
+    settle(['rev-parse', '--git-path', 'index']),
+    settle(['rev-parse', '--show-object-format']),
+  ]);
+
   // 4. Reject bare repositories (authoritative live probe; a bare repo has no
   //    work tree and thus no worktree index to latch on).
-  const bare = await deps.runGit(['rev-parse', '--is-bare-repository']);
+  const bare = unwrap(bareProbe);
   if (bare.code === 0 && bare.stdout.trim() === 'true') {
     return { ok: false, reason: 'bare-repo', detail: 'Bare repositories have no worktree index and are never assembled.' };
   }
 
   // 1. Absolute git dir — also confirms this is a repo at all.
-  const gitDir = await deps.runGit(['rev-parse', '--absolute-git-dir']);
+  const gitDir = unwrap(gitDirProbe);
   if (gitDir.code !== 0 || !gitDir.stdout.trim()) {
     return { ok: false, reason: 'not-a-repo', detail: (gitDir.stderr.trim() || 'not a git repository').slice(0, 300) };
   }
 
   // 1. Index path (per-worktree; linked worktrees resolve to their own index).
-  const idx = await deps.runGit(['rev-parse', '--git-path', 'index']);
+  const idx = unwrap(idxProbe);
   if (idx.code !== 0 || !idx.stdout.trim()) {
     return { ok: false, reason: 'index-unresolvable', detail: (idx.stderr.trim() || 'could not resolve index path').slice(0, 300) };
   }
@@ -171,7 +198,7 @@ export async function deriveRepositoryIdentity(
 
   // Object format is for validating Git OIDs ONLY; candidate IDs are always
   // sha256. Best-effort — default sha1 when the probe fails.
-  const fmt = await deps.runGit(['rev-parse', '--show-object-format']);
+  const fmt = unwrap(fmtProbe);
   const gitObjectFormat: 'sha1' | 'sha256' =
     fmt.code === 0 && fmt.stdout.trim() === 'sha256' ? 'sha256' : 'sha1';
 

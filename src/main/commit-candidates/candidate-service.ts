@@ -155,27 +155,40 @@ export class CommitCandidateService {
     const workspaceByDir = new Map(
       request.workspaces.map((workspace) => [workspace.workspaceDir, workspace]),
     );
+    // Request-local only: discoverScopeForWorkspace probes the target once to
+    // identify its repository, then probes every input (including that target)
+    // to assemble aliases. Share identical reads within this assembly without
+    // carrying potentially stale repository state across separate requests.
+    const scopeGitReads = new Map<string, ReturnType<RunGit>>();
     const scopeDeps: ScopeDiscoveryDeps = {
       platform: this.deps.platform,
       realpath: this.deps.realpath,
       fileExists: this.deps.fileExists,
       runGitFor: (workspaceDir): RunGit => {
         const workspace = workspaceByDir.get(workspaceDir);
-        return async (args) => {
-          try {
-            return await this.deps.runGit(workspaceDir, args, {
-              gitExe: workspace ? gitExeFor(workspace) : undefined,
-              allowNonzero: true,
-              timeoutMs: 10_000,
-              maxBytes: 1 << 20,
-            });
-          } catch (error) {
-            return {
-              code: 1,
-              stdout: '',
-              stderr: error instanceof Error ? error.message : String(error),
-            };
+        return (args) => {
+          const key = JSON.stringify([workspaceDir, args]);
+          let read = scopeGitReads.get(key);
+          if (!read) {
+            read = (async () => {
+              try {
+                return await this.deps.runGit(workspaceDir, args, {
+                  gitExe: workspace ? gitExeFor(workspace) : undefined,
+                  allowNonzero: true,
+                  timeoutMs: 10_000,
+                  maxBytes: 1 << 20,
+                });
+              } catch (error) {
+                return {
+                  code: 1,
+                  stdout: '',
+                  stderr: error instanceof Error ? error.message : String(error),
+                };
+              }
+            })();
+            scopeGitReads.set(key, read);
           }
+          return read;
         };
       },
     };

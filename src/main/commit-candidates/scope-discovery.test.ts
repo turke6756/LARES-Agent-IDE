@@ -60,6 +60,40 @@ function ws(
 
 // ── aliases of one worktree → ONE scope, sorted workspaces ────────────────────
 
+test('distinct workspace identity derivations overlap without changing input-order folding', async () => {
+  const activeWorkspaces = new Set<string>();
+  let maxActiveWorkspaces = 0;
+  const deps: ScopeDiscoveryDeps = {
+    platform: 'win32',
+    realpath: () => 'C:\\Repo\\.git\\index',
+    fileExists: () => true,
+    runGitFor: (workspaceDir) => async (args) => {
+      activeWorkspaces.add(workspaceDir);
+      maxActiveWorkspaces = Math.max(maxActiveWorkspaces, activeWorkspaces.size);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      activeWorkspaces.delete(workspaceDir);
+      const key = args.join(' ');
+      if (key === 'rev-parse --is-bare-repository') return OK('false');
+      if (key === 'rev-parse --absolute-git-dir') return OK(`${workspaceDir}\\.git`);
+      if (key === 'rev-parse --git-path index') return OK(`${workspaceDir}\\.git\\index`);
+      if (key === 'rev-parse --show-object-format') return OK('sha1');
+      throw new Error(`unexpected git argv: ${key}`);
+    },
+  };
+  const inputs = [
+    ws('ws-z', 'C:\\aliasZ', 'unused', 'c:\\repo\\.git', 'z'),
+    ws('ws-a', 'C:\\aliasA', 'unused', 'c:\\repo\\.git', 'a'),
+  ];
+
+  const { scopes, rejected } = await discoverRepositoryScopes(inputs, deps);
+  assert.equal(maxActiveWorkspaces, 2, 'workspace probes overlap');
+  assert.deepEqual(rejected, []);
+  assert.deepEqual([...scopes.values()][0].identity.workspaces, [
+    { workspaceId: 'ws-a', workspacePrefix: 'a' },
+    { workspaceId: 'ws-z', workspacePrefix: 'z' },
+  ]);
+});
+
 test('multiple workspace aliases of one worktree → ONE repositoryKey, workspaces sorted by workspaceId', async () => {
   const canonical = 'C:\\Repo\\.git\\index';
   const table: GitTable = {

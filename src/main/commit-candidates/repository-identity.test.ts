@@ -56,6 +56,32 @@ const sha256 = (s: string) => createHash('sha256').update(s, 'utf8').digest('hex
 
 // ── repositoryKey from the REAL index path ────────────────────────────────────
 
+test('independent rev-parse probes run concurrently with unchanged identity result', async () => {
+  let inFlight = 0;
+  let maxInFlight = 0;
+  const runGit: RepositoryIdentityDeps['runGit'] = async (args) => {
+    inFlight++;
+    maxInFlight = Math.max(maxInFlight, inFlight);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    inFlight--;
+    const key = args.join(' ');
+    if (key === 'rev-parse --is-bare-repository') return OK('false');
+    if (key === 'rev-parse --absolute-git-dir') return OK('C:/Repo/.git');
+    if (key === 'rev-parse --git-path index') return OK('C:/Repo/.git/index');
+    if (key === 'rev-parse --show-object-format') return OK('sha1');
+    throw new Error(`unexpected git argv: ${key}`);
+  };
+
+  const out = await deriveRepositoryIdentity(
+    'C:\\Repo',
+    { commonDirQueueKey: 'c:\\repo\\.git' },
+    win32Deps(runGit),
+  );
+  assert.equal(maxInFlight, 4, 'all four independent probes overlap');
+  assert.equal(out.ok, true);
+  if (out.ok) assert.equal(out.gitObjectFormat, 'sha1');
+});
+
 test('repositoryKey = sha256 of the realpath-canonicalized, normalized index path', async () => {
   // git reports the index under a symlinked/aliased dir; realpath resolves it to
   // the canonical location. The key must hash the CANONICAL path, not the raw one.
