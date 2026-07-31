@@ -5058,3 +5058,9 @@ export const RETENTION_DENSE_WINDOW_MS = 10 * 24 * 60 * 60 * 1000; // provisiona
 export const COMPACT_DIFF_MAX_BYTES = 100 * 1024;                  // witnessed-path compact_diff cap (~100 KB)
 export const MAINTENANCE_RUNTIME_DEADLINE_MS = 120 * 1000;         // bounded `git maintenance run` runtime
 export const RETENTION_CYCLE_INTERVAL_MS = 6 * 60 * 60 * 1000;     // periodic retention sweep cadence
+
+export const BUNDLE_CONTRACT_VERSION = 1;
+export const COMMIT_CANDIDATE_TOKEN_CAP_PER_REPOSITORY = 128;
+export const RETENTION_PIN_QUOTA_BYTES = 536_870_912; // 512 MiB logical pinned-byte budget
+export const RETENTION_PIN_MAX_EXTENSION_MS = 2_592_000_000; // 30 days
+export const SAVE_CARD_COMMIT_COORDINATOR_ENABLED = false; // stays false until the Stage-4 adversarial matrix passes
