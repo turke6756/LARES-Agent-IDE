@@ -59,6 +59,7 @@ import {
 } from './workspace-state-dir';
 import { ensureInstallationLauncher } from './installation-descriptor';
 import { registerCheckpointIpc, type HumanCheckpointRoutes } from './git-checkpoints/checkpoint-ipc';
+import { registerSaveCardIpc, type SaveCardRoutes } from './commit-candidates/save-card-ipc';
 
 // Managed temp dir for clipboard-bitmap pastes. Dropped OS files inject their
 // OWN on-disk path (converted) and never land here — only screenshots do.
@@ -73,6 +74,13 @@ const PASTED_IMAGE_DIR = path.join(app.getPath('temp'), 'lares-pasted-images');
 let humanCheckpointRoutes: HumanCheckpointRoutes | null = null;
 export function setHumanCheckpointRoutes(routes: HumanCheckpointRoutes | null): void {
   humanCheckpointRoutes = routes;
+}
+
+// SC-WP-1H — the read-only Save-card engine is injected asynchronously using
+// the same lazy-route convention as HumanCheckpointRoutes above.
+let saveCardRoutes: SaveCardRoutes | null = null;
+export function setSaveCardRoutes(routes: SaveCardRoutes | null): void {
+  saveCardRoutes = routes;
 }
 
 function resolveMutationPathType(primaryPath: string, rootDirectory: string, pathType?: PathType): PathType {
@@ -146,6 +154,7 @@ export function registerIpcHandlers(
   // restore/revert). Registered synchronously here with a lazy getter so the
   // channels exist before the async engine bootstrap injects the routes.
   registerCheckpointIpc(ipcMain, () => humanCheckpointRoutes);
+  registerSaveCardIpc(ipcMain, () => saveCardRoutes);
   // 'agent:stop' is registered by registerLifecycleIpc (lifecycle/lifecycle-ipc.ts)
   // so that every stop endpoint assigns its own reason in ONE place and a
   // renderer can never supply one (§B9).

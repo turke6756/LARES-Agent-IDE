@@ -1755,6 +1755,33 @@ export interface CheckpointFileHistoryResult {
   versions: CheckpointFileHistoryVersion[];
 }
 
+/** Stage 1 Save-card IPC has one read-only inventory route. */
+export const SAVECARD_CHANNELS = {
+  getInventory: 'savecard:getInventory',
+} as const;
+
+/** Renderer request for the repository inventory containing this workspace. */
+export interface SaveCardInventoryRequest {
+  workspaceId: string;
+}
+
+/** Renderer-safe WorkBundle DTOs returned by the read-only candidate service. */
+export type SaveCardInventoryResponse = Array<{
+  bundleId: string;
+  kind: 'component' | 'unattributed';
+  label: string;
+  labels: string[];
+  repositoryKey: string;
+  workspaces: Array<{ workspaceId: string; workspacePrefix: string }>;
+  component: import('./commit-candidates').ConflictComponent | null;
+  members: Array<{
+    entry: import('./commit-candidates').DirtyEntry;
+    protection: import('./commit-candidates').ProtectionRung;
+  }>;
+  captureHealth: import('./commit-candidates').BundleCaptureHealth;
+  weakestProtection: import('./commit-candidates').ProtectionRung | null;
+}>;
+
 /** IPC channel names for the renderer checkpoint surface — one source of truth for
  *  preload, the main registrar, and the contract test. */
 export const CHECKPOINT_CHANNELS = {
@@ -2478,6 +2505,10 @@ export interface IpcApi {
    *  shared engine/service surface. `restore`/`revert` accept a `force`
    *  (stale-preview override) that is IPC-ONLY and refused while an active turn
    *  witnesses a requested path. */
+  /** Stage 1 Save card: read-only dirty inventory. No mutating method exists. */
+  saveCard: {
+    getInventory: (req: SaveCardInventoryRequest) => Promise<SaveCardInventoryResponse>;
+  };
   checkpoints: {
     list: (workspaceId: string, opts?: { agentId?: string }) => Promise<CheckpointListResult>;
     diff: (workspaceId: string, turnId: string) => Promise<CheckpointDiffResult>;

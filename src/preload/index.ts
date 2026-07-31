@@ -1,6 +1,6 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron';
 import type { IpcApi, DetachRequest, DetachedClosedPayload, ViewDetachRequest, ViewDetachedClosedPayload, FlushRequestPayload, FlushReplyPayload } from '../shared/types';
-import { TAB_CHANNELS, VIEW_CHANNELS, CHECKPOINT_CHANNELS } from '../shared/types';
+import { TAB_CHANNELS, VIEW_CHANNELS, CHECKPOINT_CHANNELS, SAVECARD_CHANNELS } from '../shared/types';
 import { BROWSER_CHANNELS } from '../shared/browser';
 import type {
   AccessRequestDecision,
@@ -164,6 +164,10 @@ const api: IpcApi = {
   // .lares/detached/ dir; each row is PID-verified in main. Handle in index.ts.
   detached: {
     list: (workspaceRoot) => ipcRenderer.invoke('detached:list', workspaceRoot),
+  },
+  // SC-WP-1H — Stage 1 is intentionally read-only: inventory fetch only.
+  saveCard: {
+    getInventory: (req) => ipcRenderer.invoke(SAVECARD_CHANNELS.getInventory, req),
   },
   // Git-Native WP-G2.2 — human checkpoint recovery surface (list/diff/preview/
   // restore/revert). Handlers live in git-checkpoints/checkpoint-ipc.ts (registered
