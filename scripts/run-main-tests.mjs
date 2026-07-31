@@ -201,6 +201,23 @@ const TESTS = [
   // atomic batch, no gc/prune) + the human-only repo-wide purge that names every
   // affected workspace before clearing (real git).
   'dist/main/main/git-checkpoints/prune.test.js',
+  // Save-card WP-0A/Stage 1: shared contract, binary Git seam, canonicalization,
+  // repository discovery, dirty inventory, capture health, witness/topology assembly,
+  // exact protection, read-only bundle service, and read-only IPC.
+  'dist/main/shared/commit-candidates.export-shape.test.js',
+  'dist/main/main/git-checkpoints/git-command.runGitBytes.test.js',
+  'dist/main/main/commit-candidates/jcs.test.js',
+  'dist/main/main/commit-candidates/repository-identity.test.js',
+  'dist/main/main/commit-candidates/scope-discovery.test.js',
+  'dist/main/main/commit-candidates/dirty-inventory.test.js',
+  'dist/main/main/commit-candidates/capture-health.test.js',
+  'dist/main/main/git-checkpoints/live-edge.test.js',
+  'dist/main/main/commit-candidates/witness-projection.test.js',
+  'dist/main/main/commit-candidates/component-assembler.test.js',
+  'dist/main/main/commit-candidates/protection-read.test.js',
+  'dist/main/main/commit-candidates/candidate-service.read.test.js',
+  'dist/main/main/commit-candidates/work-bundle.test.js',
+  'dist/main/main/commit-candidates/save-card-ipc.test.js',
   'dist/main/main/supervisor/send-queue-checkpoint.test.js',
   'dist/main/main/supervisor/initial-user-prompt.test.js',
   'dist/main/main/supervisor/hook-spool-tailer.test.js',
