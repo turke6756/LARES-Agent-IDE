@@ -218,6 +218,10 @@ const TESTS = [
   'dist/main/main/commit-candidates/candidate-service.read.test.js',
   'dist/main/main/commit-candidates/work-bundle.test.js',
   'dist/main/main/commit-candidates/save-card-ipc.test.js',
+  // Save-card SC-WP-1J: production route wiring — the bootstrap adapter that maps
+  // the renderer workspaceId to a repository-scoped request and delegates to the
+  // read-only facade (real temp git; only the registry + DB readers are faked).
+  'dist/main/main/commit-candidates/save-card-routes.test.js',
   'dist/main/main/supervisor/send-queue-checkpoint.test.js',
   'dist/main/main/supervisor/initial-user-prompt.test.js',
   'dist/main/main/supervisor/hook-spool-tailer.test.js',

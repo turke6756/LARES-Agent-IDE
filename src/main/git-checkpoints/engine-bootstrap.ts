@@ -41,6 +41,9 @@ import { forcePrerequisiteRecheck } from '../runtime-prerequisites';
 import type { RepoWidePurgeResult, RepoWidePurgeWorkspace } from '../../shared/types';
 
 export interface CheckpointEngineHandle {
+  /** The internal Git exe this engine resolved. Reused by the Save-card route
+   *  wiring (SC-WP-1J) so it does not re-resolve a second copy at bootstrap. */
+  gitExe: string;
   coordinator: TurnCoordinator;
   completionTracker: TurnCompletionTracker;
   buildTurnContext: (agentId: string, dispatch: DispatchContext) => Promise<TurnContext | null>;
@@ -393,6 +396,7 @@ export async function createCheckpointEngine(): Promise<CheckpointEngineHandle |
   };
 
   return {
+    gitExe,
     coordinator,
     completionTracker,
     buildTurnContext,

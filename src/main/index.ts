@@ -38,7 +38,8 @@ import { startContinuationWatcher } from './supervisor/continuation-watcher-wiri
 import { runCheckpointStartupMaintenance } from './git-checkpoints/reconciler';
 import { createCheckpointEngine } from './git-checkpoints/engine-bootstrap';
 import { RETENTION_CYCLE_INTERVAL_MS } from '../shared/constants';
-import { registerIpcHandlers, setHumanCheckpointRoutes } from './ipc-handlers';
+import { registerIpcHandlers, setHumanCheckpointRoutes, setSaveCardRoutes } from './ipc-handlers';
+import { createSaveCardRoutes } from './commit-candidates/save-card-routes';
 import { installExternalNavHandlers, forceCloseAllDetached, getDetachedEntries, type DetachedWindowDeps } from './detached-windows';
 import { runCloseFlush, type FlushTarget } from './close-flush';
 import { TAB_CHANNELS, LOG_RETENTION_CAP_BYTES, type FlushRequestPayload, type LogRetentionState } from '../shared/types';
@@ -820,6 +821,10 @@ app.whenReady().then(async () => {
           apiServer?.setCheckpointRoutes(engine.checkpointRoutes);
           // WP-G2.2: hand the force-capable human surface to the renderer IPC layer.
           setHumanCheckpointRoutes(engine.humanCheckpointRoutes);
+          // SC-WP-1J: hand the read-only Save-card inventory surface to the renderer
+          // IPC layer, reusing the engine's already-resolved internal Git. Until this
+          // runs the channel answers "save-card-engine-unavailable" honestly.
+          setSaveCardRoutes(createSaveCardRoutes({ gitExe: engine.gitExe }));
           await engine.runStartupMaintenance();
           // WP-G3.3 — schedule the periodic retention cycle (distill-before-prune +
           // triggered loose-object maintenance + storage report) on the shared engine
