@@ -136,10 +136,11 @@ test('copies canonical component membership verbatim and attaches labels', () =>
     component.dirtyEntryIds,
   );
   assert.deepEqual(bundle.labels, [
-    '2 changed paths',
     'Plan plan-1',
     'Overlapping work',
   ]);
+  assert.equal(bundle.label, 'Work package');
+  assert.equal(bundle.identity, null);
 });
 
 test('always adds one synthetic unattributed pseudo-bundle without components', () => {

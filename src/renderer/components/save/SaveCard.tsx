@@ -19,6 +19,19 @@ function errorMessage(err: unknown): string {
   return 'The Save engine could not be reached.';
 }
 
+function groupBySupervisor(bundles: WorkBundleDto[]): WorkBundleDto[][] {
+  const groups = new Map<string, WorkBundleDto[]>();
+  for (const bundle of bundles) {
+    const key = bundle.kind === 'unattributed'
+      ? bundle.bundleId
+      : bundle.identity?.groupingKey ?? bundle.bundleId;
+    const group = groups.get(key);
+    if (group) group.push(bundle);
+    else groups.set(key, [bundle]);
+  }
+  return [...groups.values()];
+}
+
 /**
  * SaveCard — the read-only Save-progress center surface (SC-WP-1I).
  *
@@ -189,6 +202,8 @@ export default function SaveCard() {
   const { bundles } = state;
   const quiet = bundles.filter(isQuietlySaved);
   const loud = bundles.filter((b) => !isQuietlySaved(b));
+  const loudGroups = groupBySupervisor(loud);
+  const quietGroups = groupBySupervisor(quiet);
   const loudFileCount = loud.reduce((n, b) => n + b.members.length, 0);
 
   if (bundles.length === 0) {
@@ -224,13 +239,17 @@ export default function SaveCard() {
         <h2>Unsaved work</h2>
         <span className="sc-rule" />
         <span className="sc-count" data-testid="save-card-unsaved-count">
-          {loud.length} package{loud.length === 1 ? '' : 's'} · {loudFileCount} file{loudFileCount === 1 ? '' : 's'}
+          {loudGroups.length} package{loudGroups.length === 1 ? '' : 's'} · {loudFileCount} file{loudFileCount === 1 ? '' : 's'}
         </span>
       </div>
       {loud.length > 0 ? (
         <div className="sc-slots">
-          {loud.map((b) => (
-            <SaveBundle key={b.bundleId} bundle={b} />
+          {loudGroups.map((group) => (
+            <SaveBundle
+              key={group[0].identity?.groupingKey ?? group[0].bundleId}
+              bundle={group[0]}
+              bundles={group}
+            />
           ))}
         </div>
       ) : (
@@ -247,8 +266,9 @@ export default function SaveCard() {
             <span className="sc-count">recent only</span>
           </div>
           <div className="sc-saved" data-testid="save-card-quiet">
-            {quiet.map((b) => (
-              <div className="sc-savedrow" key={b.bundleId} data-testid="save-card-quiet-row">
+            {quietGroups.map((group) => {
+              const b = group[0];
+              return <div className="sc-savedrow" key={b.identity?.groupingKey ?? b.bundleId} data-testid="save-card-quiet-row">
                 <span className="sc-tick">✓</span>
                 <span className="sc-t">
                   <b>{b.label}</b>
@@ -257,8 +277,8 @@ export default function SaveCard() {
                 <span className="sc-savedrung">
                   {b.weakestProtection === 'remote-reachable' ? 'on origin' : 'committed'}
                 </span>
-              </div>
-            ))}
+              </div>;
+            })}
           </div>
         </>
       )}

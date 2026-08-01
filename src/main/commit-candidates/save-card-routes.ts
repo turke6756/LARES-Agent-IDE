@@ -19,12 +19,15 @@
 
 import * as fs from 'node:fs';
 
-import type { GitCapability } from '../../shared/types';
-import type { SaveCardInventoryRequest, SaveCardInventoryResponse } from '../../shared/types';
+import type { Agent, GitCapability, SaveCardBundleIdentity, SaveCardInventoryRequest, SaveCardInventoryResponse, SaveCardWorkerUnit } from '../../shared/types';
 import {
+  getAgentsByWorkspace as dbGetAgentsByWorkspace,
+  getAgent as dbGetAgent,
   getWorkspaces as dbGetWorkspaces,
   getTurnWitnessReads as dbGetTurnWitnessReads,
   listTurnRecords as dbListTurnRecords,
+  type TurnRecord,
+  type TurnWitnessRead,
 } from '../database';
 import { probeWorkspaceGit as realProbeWorkspaceGit } from '../git/git-runtime';
 import { runGit as realRunGit, runGitBytes as realRunGitBytes } from '../git-checkpoints/git-command';
@@ -36,6 +39,9 @@ import {
 import type { RunGitBytesLike, RunGitTextLike } from './dirty-inventory';
 import type { TurnWitnessReader } from './witness-projection';
 import type { SaveCardRoutes } from './save-card-ipc';
+import type { WorkBundle } from './work-bundle';
+
+type BundleTurn = Pick<TurnRecord, 'id' | 'agentId' | 'agentTitle' | 'startedAt' | 'endedAt'>;
 
 /** Injected seams. Production passes only `gitExe`; the rest default to the live
  *  database / git runtime. Tests override every seam with in-memory fakes. */
@@ -46,10 +52,122 @@ export interface SaveCardRoutesDeps {
   probeWorkspaceGit?: (canonicalWorkspaceDir: string) => Promise<GitCapability>;
   readTurnWitnesses?: TurnWitnessReader;
   readCaptureTurns?: CaptureTurnReader;
+  getAgentsByWorkspace?: (workspaceId: string) => readonly Agent[];
+  getAgent?: (agentId: string) => Agent | null;
+  readBundleTurns?: (workspaceId: string) => readonly BundleTurn[];
   runGit?: RunGitTextLike;
   runGitBytes?: RunGitBytesLike;
   /** Best-effort canonicalizer; defaults to `fs.realpathSync.native`. */
   realpath?: (p: string) => string;
+}
+
+function minTime(values: Array<number | null | undefined>): number | null {
+  const present = values.filter((value): value is number => typeof value === 'number');
+  return present.length > 0 ? Math.min(...present) : null;
+}
+
+function maxTime(values: Array<number | null | undefined>): number | null {
+  const present = values.filter((value): value is number => typeof value === 'number');
+  return present.length > 0 ? Math.max(...present) : null;
+}
+
+function nonEmpty(value: string | null | undefined, fallback: string): string {
+  return value?.trim() || fallback;
+}
+
+function rendererSafeText(value: string): string {
+  return value
+    .replace(/\b[A-Za-z]:[\\/][^\s,;]+/g, '[local path]')
+    .replace(/(^|\s)\/(?:Users|home|var|tmp|opt|mnt)\/[^\s,;]+/g, '$1[local path]');
+}
+
+/** Attach presentation identity without changing component membership/topology. */
+function attachBundleIdentity(
+  bundle: WorkBundle,
+  agents: ReadonlyMap<string, Agent>,
+  turns: ReadonlyMap<string, BundleTurn>,
+  witnesses: readonly TurnWitnessRead[],
+  structuralSupervisors: ReadonlyMap<string, Agent>,
+): SaveCardInventoryResponse[number] {
+  if (bundle.kind === 'unattributed' || !bundle.component) {
+    return { ...bundle, identity: null };
+  }
+
+  const turnIds = new Set(bundle.component.associations.flatMap((a) => a.contributingTurnIds));
+  const relevantWitnesses = witnesses.filter((witness) => turnIds.has(witness.turnId));
+  const agentIds = new Set(relevantWitnesses.flatMap((w) => w.agentId ? [w.agentId] : []));
+  const ownerIds = new Set<string>();
+
+  for (const witness of relevantWitnesses) {
+    const agent = witness.agentId ? agents.get(witness.agentId) : undefined;
+    const structural = agent ? structuralSupervisors.get(agent.workspaceId) : undefined;
+    const ownerId = witness.ownerAgentId
+      ?? agent?.ownerAgentId
+      ?? (agent?.isSupervisor ? agent.id : undefined)
+      ?? (agent?.isSupervised ? structural?.id : undefined);
+    if (ownerId) ownerIds.add(ownerId);
+  }
+
+  const workerUnits: SaveCardWorkerUnit[] = [...agentIds].sort().map((agentId) => {
+    const agent = agents.get(agentId);
+    const agentTurns = relevantWitnesses
+      .filter((witness) => witness.agentId === agentId)
+      .map((witness) => turns.get(witness.turnId))
+      .filter((turn): turn is BundleTurn => Boolean(turn));
+    const memberEntryIds = Object.entries(bundle.component!.overlap.perPathContributors)
+      .filter(([, contributors]) => contributors.agentIds.includes(agentId))
+      .map(([entryId]) => entryId)
+      .sort();
+    return {
+      agentId,
+      name: rendererSafeText(nonEmpty(agent?.title, agentTurns.find((turn) => turn.agentTitle)?.agentTitle || 'Unknown agent')),
+      roleDescription: rendererSafeText(nonEmpty(agent?.roleDescription, 'No role description recorded.')),
+      kind: agent?.isSupervisor ? 'supervisor' : agent?.isWorker || agent?.isSupervised ? 'worker' : 'agent',
+      startedAt: minTime(agentTurns.map((turn) => turn.startedAt)),
+      endedAt: maxTime(agentTurns.map((turn) => turn.endedAt ?? turn.startedAt)),
+      turnCount: new Set(agentTurns.map((turn) => turn.id)).size,
+      memberEntryIds,
+    };
+  });
+
+  const owners = [...ownerIds].map((id) => agents.get(id)).filter((agent): agent is Agent => Boolean(agent));
+  let source: SaveCardBundleIdentity['source'];
+  let identityAgent: Agent | undefined;
+  if (owners.length === 1) {
+    identityAgent = owners[0];
+    source = identityAgent.isSupervisor ? 'supervisor' : 'agent';
+  } else if (owners.length === 0 && workerUnits.length === 1) {
+    source = 'agent';
+    identityAgent = workerUnits[0].agentId ? agents.get(workerUnits[0].agentId) : undefined;
+  } else {
+    source = 'mixed';
+  }
+
+  const name = rendererSafeText(identityAgent?.title
+    ?? (source === 'mixed' ? workerUnits.map((unit) => unit.name).join(' + ') : workerUnits[0]?.name)
+    ?? 'Unknown agent');
+  const roleDescription = rendererSafeText(nonEmpty(
+    identityAgent?.roleDescription,
+    workerUnits.map((unit) => unit.roleDescription).filter((value, index, all) => all.indexOf(value) === index).join(' '),
+  ));
+  const identity: SaveCardBundleIdentity = {
+    groupingKey: identityAgent
+      ? `${source}:${identityAgent.id}`
+      : `mixed:${bundle.component.componentId}`,
+    source,
+    agentId: identityAgent?.id ?? null,
+    name,
+    roleDescription,
+    startedAt: minTime(workerUnits.map((unit) => unit.startedAt)),
+    endedAt: maxTime(workerUnits.map((unit) => unit.endedAt)),
+    workerUnits,
+  };
+  return {
+    ...bundle,
+    label: name,
+    labels: [name, ...bundle.labels],
+    identity,
+  };
 }
 
 /** Canonicalize a workspace directory best-effort, mirroring the checkpoint
@@ -81,6 +199,10 @@ export function createSaveCardRoutes(deps: SaveCardRoutesDeps): SaveCardRoutes {
   const runGit = deps.runGit ?? realRunGit;
   const runGitBytes = deps.runGitBytes ?? realRunGitBytes;
   const realpath = deps.realpath ?? ((p) => fs.realpathSync.native(p));
+  const getAgentsByWorkspace = deps.getAgentsByWorkspace ?? dbGetAgentsByWorkspace;
+  const getAgent = deps.getAgent ?? dbGetAgent;
+  const readBundleTurns = deps.readBundleTurns
+    ?? ((workspaceId: string) => dbListTurnRecords(workspaceId, { limit: Number.MAX_SAFE_INTEGER }));
 
   const service = new CommitCandidateService({
     runGit,
@@ -109,10 +231,36 @@ export function createSaveCardRoutes(deps: SaveCardRoutesDeps): SaveCardRoutes {
       }),
     );
 
-    return service.listWorkBundles({
+    const bundles = await service.listWorkBundles({
       targetWorkspaceId: req.workspaceId,
       workspaces,
     });
+
+    const includedWorkspaceIds = new Set(bundles.flatMap((bundle) =>
+      bundle.workspaces.map((workspace) => workspace.workspaceId),
+    ));
+    const agentRows = [...includedWorkspaceIds].flatMap((workspaceId) => getAgentsByWorkspace(workspaceId));
+    const agents = new Map(agentRows.map((agent) => [agent.id, agent]));
+    const structuralSupervisors = new Map(
+      agentRows.filter((agent) => agent.isSupervisor).map((agent) => [agent.workspaceId, agent]),
+    );
+    const bundleTurns = [...includedWorkspaceIds].flatMap((workspaceId) => readBundleTurns(workspaceId));
+    const turns = new Map(bundleTurns.map((turn) => [turn.id, turn]));
+    const witnesses = [...includedWorkspaceIds].flatMap((workspaceId) => readTurnWitnesses(workspaceId));
+    for (const ownerId of new Set(witnesses.flatMap((witness) => witness.ownerAgentId ? [witness.ownerAgentId] : []))) {
+      if (!agents.has(ownerId)) {
+        const owner = getAgent(ownerId);
+        if (owner) agents.set(ownerId, owner);
+      }
+    }
+
+    return bundles.map((bundle) => attachBundleIdentity(
+      bundle,
+      agents,
+      turns,
+      witnesses,
+      structuralSupervisors,
+    ));
   }
 
   return { getInventory };

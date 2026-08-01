@@ -1765,6 +1765,30 @@ export interface SaveCardInventoryRequest {
   workspaceId: string;
 }
 
+/** Human identity attached by the main-process Save-card DB adapter. */
+export interface SaveCardBundleIdentity {
+  groupingKey: string;
+  source: 'supervisor' | 'agent' | 'mixed';
+  agentId: string | null;
+  name: string;
+  roleDescription: string;
+  startedAt: number | null;
+  endedAt: number | null;
+  workerUnits: SaveCardWorkerUnit[];
+}
+
+/** A contributing agent shown inside its supervisor-unit package. */
+export interface SaveCardWorkerUnit {
+  agentId: string | null;
+  name: string;
+  roleDescription: string;
+  kind: 'supervisor' | 'worker' | 'agent';
+  startedAt: number | null;
+  endedAt: number | null;
+  turnCount: number;
+  memberEntryIds: string[];
+}
+
 /** Renderer-safe WorkBundle DTOs returned by the read-only candidate service. */
 export type SaveCardInventoryResponse = Array<{
   bundleId: string;
@@ -1780,6 +1804,7 @@ export type SaveCardInventoryResponse = Array<{
   }>;
   captureHealth: import('./commit-candidates').BundleCaptureHealth;
   weakestProtection: import('./commit-candidates').ProtectionRung | null;
+  identity: SaveCardBundleIdentity | null;
 }>;
 
 /** IPC channel names for the renderer checkpoint surface — one source of truth for

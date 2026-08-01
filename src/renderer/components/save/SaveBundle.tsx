@@ -7,6 +7,19 @@ import type { DirtyEntry, ProtectionRung } from '../../../shared/commit-candidat
 export type WorkBundleDto = SaveCardInventoryResponse[number];
 
 const MAX_PATHS_COLLAPSED = 6;
+const RUNG_ORDER: ProtectionRung[] = [
+  'unprotected', 'checkpoint-protected', 'locally-committed', 'remote-reachable',
+];
+
+function dateRange(startedAt: number | null, endedAt: number | null): string {
+  if (startedAt === null && endedAt === null) return 'Date not recorded';
+  const format = (value: number) => new Intl.DateTimeFormat(undefined, {
+    month: 'short', day: 'numeric', year: 'numeric',
+  }).format(new Date(value));
+  const start = format(startedAt ?? endedAt!);
+  const end = format(endedAt ?? startedAt!);
+  return start === end ? start : `${start}–${end}`;
+}
 
 // Human wording for each protection rung — the honest three-rung ledger from
 // Amendment 5 (checkpoint-protected → locally-committed → remote-reachable),
@@ -62,12 +75,24 @@ export function isQuietlySaved(b: WorkBundleDto): boolean {
  * "Inspect", which expands the card in place — Stage ① has NO commit/write
  * affordance of any kind (no writer exists yet).
  */
-export default function SaveBundle({ bundle }: { bundle: WorkBundleDto }) {
+export default function SaveBundle({
+  bundle,
+  bundles,
+}: {
+  bundle: WorkBundleDto;
+  bundles?: WorkBundleDto[];
+}) {
   const [expanded, setExpanded] = useState(false);
+  const grouped = bundles ?? [bundle];
 
   const isUnattributed = bundle.kind === 'unattributed';
-  const captureConcern = hasCaptureConcern(bundle);
-  const rung = bundle.weakestProtection;
+  const captureConcern = grouped.some(hasCaptureConcern);
+  const rung = grouped.reduce<ProtectionRung | null>((weakest, current) => {
+    if (!current.weakestProtection) return weakest;
+    if (!weakest) return current.weakestProtection;
+    return RUNG_ORDER.indexOf(current.weakestProtection) < RUNG_ORDER.indexOf(weakest)
+      ? current.weakestProtection : weakest;
+  }, null);
   const alreadyProtected = rung === 'locally-committed' || rung === 'remote-reachable';
 
   // Card edge + pill follow the mockup's honest state coloring, derived only
@@ -92,18 +117,23 @@ export default function SaveBundle({ bundle }: { bundle: WorkBundleDto }) {
     pillText = RUNG_LABEL[rung];
   }
 
-  const entries = bundle.members.map((m) => m.entry);
+  const entries = [...new Map(
+    grouped.flatMap((item) => item.members).map((member) => [member.entry.entryId, member.entry]),
+  ).values()];
   const shownEntries = expanded ? entries : entries.slice(0, MAX_PATHS_COLLAPSED);
   const hiddenCount = entries.length - shownEntries.length;
 
   // Memory-jog line: role + label + what it touched. The DTO carries the label
   // and any plan associations; we never invent a role description that isn't in
   // the contract.
-  const planAssoc = bundle.component?.associations.find((a) => a.planId) ?? null;
-  const turnCount = bundle.component
-    ? new Set(bundle.component.associations.flatMap((a) => a.contributingTurnIds)).size
-    : 0;
-  const workspaceCount = bundle.workspaces.length;
+  const planAssoc = grouped.flatMap((item) => item.component?.associations ?? []).find((a) => a.planId) ?? null;
+  const turnCount = new Set(grouped.flatMap((item) =>
+    item.component?.associations.flatMap((a) => a.contributingTurnIds) ?? [],
+  )).size;
+  const workspaceCount = new Set(grouped.flatMap((item) => item.workspaces.map((ws) => ws.workspaceId))).size;
+  const identity = bundle.identity;
+  const workerUnits = grouped.flatMap((item) => item.identity?.workerUnits ?? []);
+  const uniqueWorkers = [...new Map(workerUnits.map((unit) => [unit.agentId ?? unit.name, unit])).values()];
 
   return (
     <div className={slotClass} data-testid="save-bundle" data-bundle-id={bundle.bundleId} data-kind={bundle.kind}>
@@ -111,7 +141,7 @@ export default function SaveBundle({ bundle }: { bundle: WorkBundleDto }) {
         {!isUnattributed && (
           <span className={`sc-check${alreadyProtected ? ' sc-done' : ''}`} aria-hidden="true" />
         )}
-        <h2>{bundle.label}</h2>
+        <h2>{identity?.name ?? bundle.label}</h2>
         <span className={pillClass} data-testid="save-bundle-pill">{pillText}</span>
       </div>
 
@@ -121,21 +151,38 @@ export default function SaveBundle({ bundle }: { bundle: WorkBundleDto }) {
           shell side effects, generated files, or a capture gap. Needs a human eye.
         </p>
       ) : (
-        <p className="sc-desc" data-testid="save-bundle-desc">
-          <span className="sc-k">{planAssoc ? 'From plan' : 'From supervisor unit'}</span>{' '}
-          <b>{bundle.label}</b>{' '}
-          <span className="sc-k">
-            — {entries.length} file{entries.length === 1 ? '' : 's'}
-            {turnCount > 0 ? `, ${turnCount} witnessed turn${turnCount === 1 ? '' : 's'}` : ''}
-            {workspaceCount > 1 ? `, across ${workspaceCount} workspaces` : ''}.
-          </span>
+        <>
+          <p className="sc-desc" data-testid="save-bundle-desc">
+            <span className="sc-k">{planAssoc ? 'From plan' : identity?.source === 'supervisor' ? 'From supervisor' : 'From agent'}</span>{' '}
+            <b>{identity?.name ?? bundle.label}</b>{' '}
+            <span className="sc-k">— {identity?.roleDescription || 'No role description recorded.'}</span>
+          </p>
+          <p className="sc-meta" data-testid="save-bundle-dates">
+            {dateRange(identity?.startedAt ?? null, identity?.endedAt ?? null)} · {uniqueWorkers.length} contributing agent{uniqueWorkers.length === 1 ? '' : 's'} · {turnCount} witnessed turn{turnCount === 1 ? '' : 's'}
+            {workspaceCount > 1 ? ` · across ${workspaceCount} workspaces` : ''}
+          </p>
+        </>
+      )}
+
+      {grouped.flatMap((item) => item.labels).filter((label) => label !== bundle.label).length > 0 && (
+        <p className="sc-meta" data-testid="save-bundle-labels">
+          Also: {[...new Set(grouped.flatMap((item) => item.labels).filter((label) => label !== bundle.label))].join(' · ')}
         </p>
       )}
 
-      {bundle.labels.length > 1 && (
-        <p className="sc-meta" data-testid="save-bundle-labels">
-          Also: {bundle.labels.filter((l) => l !== bundle.label).join(' · ')}
-        </p>
+      {!isUnattributed && uniqueWorkers.length > 0 && (
+        <div className="sc-worker-units" data-testid="save-bundle-workers">
+          {uniqueWorkers.map((worker) => (
+            <div className="sc-worker-unit" key={worker.agentId ?? worker.name}>
+              <div className="sc-worker-head">
+                <b>{worker.name}</b>
+                <span>{worker.kind === 'worker' ? 'Worker' : worker.kind === 'supervisor' ? 'Supervisor' : 'Agent'}</span>
+              </div>
+              <p>{worker.roleDescription}</p>
+              <small>{dateRange(worker.startedAt, worker.endedAt)} · {worker.turnCount} turn{worker.turnCount === 1 ? '' : 's'} · {worker.memberEntryIds.length} file{worker.memberEntryIds.length === 1 ? '' : 's'}</small>
+            </div>
+          ))}
+        </div>
       )}
 
       {entries.length > 0 && (
@@ -158,10 +205,10 @@ export default function SaveBundle({ bundle }: { bundle: WorkBundleDto }) {
         <div className="sc-flag" data-testid="save-bundle-capture">
           <Icons.AlertTriangle className="w-3.5 h-3.5 shrink-0" />
           <span>
-            {bundle.captureHealth.captureOutage
+            {grouped.some((item) => item.captureHealth.captureOutage)
               ? 'Capture outage — some turns in this bundle have no reliable snapshot.'
-              : bundle.captureHealth.pathsWithoutFinalizationEdge.length > 0
-                ? `${bundle.captureHealth.pathsWithoutFinalizationEdge.length} path(s) have no protection edge — the witnessed union may not cover the tree.`
+              : grouped.some((item) => item.captureHealth.pathsWithoutFinalizationEdge.length > 0)
+                ? `${grouped.reduce((count, item) => count + item.captureHealth.pathsWithoutFinalizationEdge.length, 0)} path(s) have no protection edge — the witnessed union may not cover the tree.`
                 : 'Some turn snapshots are degraded — the card cannot vouch this bundle is fully captured.'}
           </span>
         </div>
@@ -177,8 +224,8 @@ export default function SaveBundle({ bundle }: { bundle: WorkBundleDto }) {
       {expanded && (
         <div className="sc-meta" data-testid="save-bundle-detail" style={{ marginTop: 10 }}>
           Repository <b>{bundle.repositoryKey}</b>
-          {bundle.component ? ` · component ${bundle.component.componentId}` : ''}
-          {bundle.component && bundle.component.overlap.requiresOverlapAck
+          {grouped.some((item) => item.component) ? ` · ${grouped.filter((item) => item.component).length} conflict component(s)` : ''}
+          {grouped.some((item) => item.component?.overlap.requiresOverlapAck)
             ? ' · transitive overlap — multiple agents touched intersecting paths'
             : ''}
         </div>

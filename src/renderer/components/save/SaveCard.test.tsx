@@ -59,8 +59,8 @@ type WorkBundleDto = SaveCardInventoryResponse[number];
 const loudBundle: WorkBundleDto = {
   bundleId: 'b-loud',
   kind: 'component',
-  label: 'Memory system v2',
-  labels: ['Memory system v2'],
+  label: 'Memory Architecture',
+  labels: ['Memory Architecture'],
   repositoryKey: 'repo-1',
   workspaces: [{ workspaceId: 'ws-1', workspacePrefix: '' }],
   component: {
@@ -73,6 +73,16 @@ const loudBundle: WorkBundleDto = {
   members: [{ entry: entry('e1', 'src/main/memory/recall.ts'), protection: 'checkpoint-protected' }],
   captureHealth: { turns: [], captureOutage: false, pathsWithoutFinalizationEdge: [] },
   weakestProtection: 'checkpoint-protected',
+  identity: {
+    groupingKey: 'supervisor:sup-1', source: 'supervisor', agentId: 'sup-1',
+    name: 'Memory Architecture', roleDescription: 'Coordinated the workspace memory rebuild.',
+    startedAt: Date.UTC(2026, 6, 28), endedAt: Date.UTC(2026, 6, 29),
+    workerUnits: [{
+      agentId: 'worker-1', name: 'memory-tool-worker', roleDescription: 'Built the recall tool.',
+      kind: 'worker', startedAt: Date.UTC(2026, 6, 28), endedAt: Date.UTC(2026, 6, 29),
+      turnCount: 2, memberEntryIds: ['e1'],
+    }],
+  },
 };
 
 const captureGapBundle: WorkBundleDto = {
@@ -96,6 +106,7 @@ const unattributedBundle: WorkBundleDto = {
   members: [{ entry: entry('e3', 'package-lock.json'), protection: 'unprotected' }],
   captureHealth: { turns: [], captureOutage: false, pathsWithoutFinalizationEdge: [] },
   weakestProtection: 'unprotected',
+  identity: null,
 };
 
 const quietBundle: WorkBundleDto = {
@@ -165,8 +176,10 @@ describe('SaveCard bundle rendering', () => {
     expect(container.querySelector('[data-testid="save-card"]')).toBeTruthy();
     const bundle = container.querySelector('[data-testid="save-bundle"]');
     expect(bundle).toBeTruthy();
-    expect(container.textContent).toContain('Memory system v2');
-    expect(container.querySelector('[data-testid="save-bundle-desc"]')?.textContent).toContain('witnessed turn');
+    expect(container.textContent).toContain('Memory Architecture');
+    expect(container.querySelector('[data-testid="save-bundle-desc"]')?.textContent).toContain('workspace memory rebuild');
+    expect(container.querySelector('[data-testid="save-bundle-dates"]')?.textContent).toContain('witnessed turns');
+    expect(container.querySelector('[data-testid="save-bundle-workers"]')?.textContent).toContain('memory-tool-worker');
     expect(container.querySelector('[data-testid="save-bundle-protection"]')?.textContent).toContain('Checkpoint only');
     expect(container.querySelector('[data-testid="save-bundle-paths"]')?.textContent).toContain('src/main/memory/recall.ts');
   });
@@ -177,6 +190,33 @@ describe('SaveCard bundle rendering', () => {
     const flag = container.querySelector('[data-testid="save-bundle-capture"]');
     expect(flag).toBeTruthy();
     expect(flag?.textContent).toContain('Capture outage');
+  });
+
+  it('groups component bundles from one supervisor and keeps worker sub-units inside', async () => {
+    const second: WorkBundleDto = {
+      ...loudBundle,
+      bundleId: 'b-second',
+      component: {
+        ...loudBundle.component!, componentId: 'c2', dirtyEntryIds: ['e5'],
+        overlap: { ...loudBundle.component!.overlap, componentId: 'c2' },
+      },
+      members: [{ entry: entry('e5', 'src/renderer/memory/ReviewPane.tsx'), protection: 'checkpoint-protected' }],
+      identity: {
+        ...loudBundle.identity!,
+        workerUnits: [{
+          agentId: 'worker-2', name: 'review-ui-worker', roleDescription: 'Built the review UI.',
+          kind: 'worker', startedAt: Date.UTC(2026, 6, 29), endedAt: Date.UTC(2026, 6, 29),
+          turnCount: 1, memberEntryIds: ['e5'],
+        }],
+      },
+    };
+    getInventory.mockResolvedValue([loudBundle, second]);
+    await render();
+    expect(container.querySelectorAll('[data-testid="save-bundle"]')).toHaveLength(1);
+    const workers = container.querySelector('[data-testid="save-bundle-workers"]');
+    expect(workers?.textContent).toContain('memory-tool-worker');
+    expect(workers?.textContent).toContain('review-ui-worker');
+    expect(container.querySelector('[data-testid="save-card-unsaved-count"]')?.textContent).toContain('1 package');
   });
 
   it('renders the unattributed pseudo-bundle as a no-witness card', async () => {

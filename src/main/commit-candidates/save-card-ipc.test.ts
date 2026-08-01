@@ -58,6 +58,7 @@ function inventoryFixture(): SaveCardInventoryResponse {
       pathsWithoutFinalizationEdge: [],
     },
     weakestProtection: null,
+    identity: null,
   }];
 }
 

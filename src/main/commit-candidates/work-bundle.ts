@@ -11,6 +11,7 @@ import type {
   DirtyInventory,
   ProtectionRung,
 } from '../../shared/commit-candidates';
+import type { SaveCardBundleIdentity } from '../../shared/types';
 import { weakestProtectionRung } from './protection-read';
 
 export interface WorkBundleMember {
@@ -29,6 +30,8 @@ export interface WorkBundle {
   members: WorkBundleMember[];
   captureHealth: BundleCaptureHealth;
   weakestProtection: ProtectionRung | null;
+  /** Populated from the app DB by save-card-routes; null in the pure projector. */
+  identity: SaveCardBundleIdentity | null;
 }
 
 export interface WorkBundleProjectionInput {
@@ -39,17 +42,13 @@ export interface WorkBundleProjectionInput {
   protectionByEntryId: Readonly<Record<string, ProtectionRung>>;
 }
 
-function pluralizedChanges(count: number): string {
-  return `${count} changed ${count === 1 ? 'path' : 'paths'}`;
-}
-
 function componentLabels(component: ConflictComponent): string[] {
   const planIds = [...new Set(
     component.associations
       .map((association) => association.planId)
       .filter((planId): planId is string => planId !== null),
   )].sort();
-  const labels = [pluralizedChanges(component.dirtyEntryIds.length)];
+  const labels: string[] = [];
   if (planIds.length === 1) labels.push(`Plan ${planIds[0]}`);
   else if (planIds.length > 1) labels.push(`${planIds.length} plans`);
   if (component.overlap.requiresOverlapAck) labels.push('Overlapping work');
@@ -105,7 +104,9 @@ export function projectWorkBundles(input: WorkBundleProjectionInput): WorkBundle
     return {
       bundleId: `component:${component.componentId}`,
       kind: 'component',
-      label: labels[0],
+      // Identity is deliberately not guessed here. The production adapter owns
+      // the agents-table join and replaces this neutral fallback before IPC.
+      label: 'Work package',
       labels,
       repositoryKey: input.inventory.repository.repositoryKey,
       workspaces,
@@ -119,6 +120,7 @@ export function projectWorkBundles(input: WorkBundleProjectionInput): WorkBundle
         ),
       },
       weakestProtection: weakest(members),
+      identity: null,
     };
   });
 
@@ -133,7 +135,6 @@ export function projectWorkBundles(input: WorkBundleProjectionInput): WorkBundle
     label: 'Unattributed changes',
     labels: [
       'Unattributed changes',
-      pluralizedChanges(unattributedMembers.length),
     ],
     repositoryKey: input.inventory.repository.repositoryKey,
     workspaces,
@@ -141,6 +142,7 @@ export function projectWorkBundles(input: WorkBundleProjectionInput): WorkBundle
     members: unattributedMembers,
     captureHealth: input.unattributedCaptureHealth,
     weakestProtection: weakest(unattributedMembers),
+    identity: null,
   });
 
   return bundles;

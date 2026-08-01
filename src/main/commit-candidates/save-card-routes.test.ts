@@ -23,6 +23,7 @@ import { runGit, runGitBytes } from '../git-checkpoints/git-command';
 import { resolveInternalGit } from '../git/git-runtime';
 import { registerSaveCardIpc, type IpcLike, type SaveCardRoutes } from './save-card-ipc';
 import { SAVECARD_CHANNELS } from '../../shared/types';
+import type { Agent } from '../../shared/types';
 import type { CaptureHealthTurn } from './capture-health';
 import { createSaveCardRoutes } from './save-card-routes';
 
@@ -61,11 +62,22 @@ function witness(turnId: string, touchedPath: string): TurnWitnessRead {
   return {
     turnId,
     agentId: 'shared-agent',
-    ownerAgentId: null,
+    ownerAgentId: 'supervisor-1',
     ownerBrickGeneration: null,
     touched: [{ path: touchedPath, op: 'write' }],
   };
 }
+
+const supervisor = {
+  id: 'supervisor-1', workspaceId: 'workspace-a', title: 'Save Card Lead',
+  roleDescription: 'Coordinates the Save-card feature.', isSupervisor: true,
+  isWorker: false, isSupervised: false, ownerAgentId: null,
+} as Agent;
+const worker = {
+  id: 'shared-agent', workspaceId: 'workspace-a', title: 'Bundle Label Worker',
+  roleDescription: 'Builds recognizable bundle labels.', isSupervisor: false,
+  isWorker: true, isSupervised: true, ownerAgentId: 'supervisor-1',
+} as Agent;
 
 // Fake registry: two lanes sharing ONE worktree (packages/a, packages/b) plus a
 // third registered workspace that is NOT in this repo — the adapter must pass all
@@ -93,6 +105,14 @@ function buildRoutes(): SaveCardRoutes {
     getWorkspaces: fakeGetWorkspaces,
     readTurnWitnesses: (workspaceId) => witnessRows[workspaceId] ?? [],
     readCaptureTurns: (workspaceId) => captureRows[workspaceId] ?? [],
+    getAgentsByWorkspace: (workspaceId) => workspaceId === 'workspace-a' ? [supervisor, worker] : [],
+    readBundleTurns: (workspaceId) => (captureRows[workspaceId] ?? []).map((turn, index) => ({
+      id: turn.id,
+      agentId: 'shared-agent',
+      agentTitle: 'Bundle Label Worker',
+      startedAt: Date.UTC(2026, 6, 30 + index),
+      endedAt: Date.UTC(2026, 6, 30 + index),
+    })),
     // Real capability probe, but observe the git command family it + the facade
     // issue by wrapping the real runners.
     runGit: async (cwd, args, options) => {
@@ -140,6 +160,9 @@ test('maps the renderer workspaceId to the shared-worktree repository inventory'
   assert.ok(component, 'expected an attributed component bundle');
   assert.ok(unattributed, 'expected the unattributed pseudo-bundle');
   assert.ok(component!.component, 'component bundle carries its ConflictComponent');
+  assert.equal(component!.label, 'Save Card Lead');
+  assert.equal(component!.identity?.roleDescription, 'Coordinates the Save-card feature.');
+  assert.deepEqual(component!.identity?.workerUnits.map((unit) => unit.name), ['Bundle Label Worker']);
 
   const componentPaths = component!.members
     .map((member) => member.entry.path.displayPath)
