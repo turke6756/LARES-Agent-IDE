@@ -11,7 +11,12 @@ import * as path from 'node:path';
 
 import { resolveInternalGit } from '../git/git-runtime';
 import { runGit } from './git-command';
-import { verifyLiveEdge, type LiveEdgeRunGit } from './live-edge';
+import {
+  liveEdgeKey,
+  verifyLiveEdge,
+  verifyLiveEdgesBatch,
+  type LiveEdgeRunGit,
+} from './live-edge';
 
 interface TestCase { name: string; run(): void | Promise<void>; }
 const tests: TestCase[] = [];
@@ -75,6 +80,64 @@ test('Git execution failure degrades to false', async () => {
     oid: commitOid,
     runGit: fake,
   }), false);
+});
+
+test('batch verifier matches verifyLiveEdge over live / missing / wrong-OID edges', async () => {
+  const edges = [
+    { ref: REF, oid: commitOid },                                  // live
+    { ref: 'refs/lares/checkpoints/test/missing', oid: commitOid }, // missing ref
+    { ref: REF, oid: '0'.repeat(commitOid.length) },               // wrong OID
+    { ref: null, oid: commitOid },                                 // no ref
+    { ref: REF, oid: null },                                       // no OID
+  ];
+  const live = await verifyLiveEdgesBatch({ repoRoot: repo, edges, runGit, gitExe });
+  assert.equal(live.has(liveEdgeKey(REF, commitOid)), true);
+  assert.equal(live.has(liveEdgeKey('refs/lares/checkpoints/test/missing', commitOid)), false);
+  assert.equal(live.has(liveEdgeKey(REF, '0'.repeat(commitOid.length))), false);
+  assert.equal(live.size, 1);
+});
+
+test('batch verifier resolves each DISTINCT ref exactly once (one git spawn total)', async () => {
+  let spawns = 0;
+  const counting: LiveEdgeRunGit = async (cwd, args, opts) => {
+    spawns++;
+    return runGit(cwd, args, { ...opts, gitExe });
+  };
+  const edges = [
+    { ref: REF, oid: commitOid },
+    { ref: REF, oid: commitOid },                    // duplicate edge
+    { ref: REF, oid: '0'.repeat(commitOid.length) }, // same ref, different stored OID
+  ];
+  const live = await verifyLiveEdgesBatch({ repoRoot: repo, edges, runGit: counting, gitExe });
+  assert.equal(spawns, 1, 'one cat-file --batch-check covers every distinct ref');
+  assert.equal(live.has(liveEdgeKey(REF, commitOid)), true);
+  assert.equal(live.has(liveEdgeKey(REF, '0'.repeat(commitOid.length))), false);
+});
+
+test('batch verifier issues NO git and returns empty when every edge is unusable', async () => {
+  let spawns = 0;
+  const counting: LiveEdgeRunGit = async (cwd, args, opts) => {
+    spawns++;
+    return runGit(cwd, args, { ...opts, gitExe });
+  };
+  const live = await verifyLiveEdgesBatch({
+    repoRoot: repo,
+    edges: [{ ref: null, oid: null }, { ref: REF, oid: null }],
+    runGit: counting,
+    gitExe,
+  });
+  assert.equal(spawns, 0);
+  assert.equal(live.size, 0);
+});
+
+test('batch verifier degrades to empty on git failure (never throws)', async () => {
+  const failing: LiveEdgeRunGit = async () => { throw new Error('git unavailable'); };
+  const live = await verifyLiveEdgesBatch({
+    repoRoot: repo,
+    edges: [{ ref: REF, oid: commitOid }],
+    runGit: failing,
+  });
+  assert.equal(live.size, 0);
 });
 
 (async () => {

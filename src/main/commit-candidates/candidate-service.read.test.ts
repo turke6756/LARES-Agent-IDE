@@ -27,27 +27,50 @@ let gitExe = '';
 let repo = '';
 let service: CommitCandidateService;
 let workspaces: CandidateWorkspaceInput[] = [];
+let initialCommitOid = '';
 const observedCommands: string[][] = [];
+
+// Live checkpoint refs pointing at the fixture's initial commit. Their tree holds
+// the ORIGINAL blobs, so the (now dirty) worktree members never match — protection
+// stays `unprotected` while the batched liveness + tree reads are still exercised.
+const BEFORE_REF = 'refs/lares/checkpoints/fixture/before';
+const AFTER_REF = 'refs/lares/checkpoints/fixture/after';
 
 function git(cwd: string, args: string[]): string {
   return execFileSync(gitExe, args, { cwd, encoding: 'utf8' });
 }
 
+/** A turn whose before/after edges resolve LIVE to the fixture's initial commit,
+ *  so `evaluateCheckpointProtection` actually issues its batched Git probes. */
 function captureTurn(id: string): CaptureHealthTurn {
   return {
     id,
     status: 'accepted',
+    beforeOid: initialCommitOid,
+    afterOid: initialCommitOid,
+    beforeRef: BEFORE_REF,
+    afterRef: AFTER_REF,
+    beforeReady: true,
+    afterReady: true,
+    beforeQuality: 'guaranteed',
+    afterQuality: 'hook',
+    beforePrunedAt: null,
+    afterPrunedAt: null,
+    failureReason: null,
+  };
+}
+
+/** A turn with no live edges (all metadata null) — the pre-SC-WP-1K blind spot,
+ *  kept only to prove the batch path still issues zero Git for unusable edges. */
+function deadTurn(id: string): CaptureHealthTurn {
+  return {
+    ...captureTurn(id),
     beforeOid: null,
     afterOid: null,
     beforeRef: null,
     afterRef: null,
     beforeReady: false,
     afterReady: false,
-    beforeQuality: 'guaranteed',
-    afterQuality: 'hook',
-    beforePrunedAt: null,
-    afterPrunedAt: null,
-    failureReason: null,
   };
 }
 
@@ -110,6 +133,9 @@ async function setup(): Promise<void> {
   git(repo, ['config', 'commit.gpgsign', 'false']);
   git(repo, ['add', '-A']);
   git(repo, ['commit', '-q', '-m', 'fixture']);
+  initialCommitOid = git(repo, ['rev-parse', 'HEAD']).trim();
+  git(repo, ['update-ref', BEFORE_REF, initialCommitOid]);
+  git(repo, ['update-ref', AFTER_REF, initialCommitOid]);
 
   fs.writeFileSync(path.join(repo, 'packages', 'a', 'one.txt'), 'one changed\n');
   fs.writeFileSync(path.join(repo, 'packages', 'b', 'two.txt'), 'two changed\n');
@@ -247,7 +273,11 @@ test('facade issues only the expected read-only Git command family', async () =>
   const commandNames = new Set(observedCommands.map((args) =>
     args[0] === '--no-optional-locks' ? args[1] : args[0],
   ));
+  // No member is checkpoint-protected in this fixture (the worktree diverged from
+  // the initial commit), so the mode-confirm `ls-tree` never fires; liveness and
+  // membership are both batched `cat-file` probes.
   assert.deepEqual([...commandNames].sort(), [
+    'cat-file',
     'hash-object',
     'rev-parse',
     'status',
@@ -259,7 +289,90 @@ test('facade issues only the expected read-only Git command family', async () =>
     assert.equal(args.includes('reset'), false);
     assert.equal(args.includes('restore'), false);
     assert.equal(args.includes('checkout'), false);
+    assert.equal(args.includes('update-ref'), false);
   }
+});
+
+// SC-WP-1K perf gate. The pre-fix protection path issued one `rev-parse` PER edge
+// plus one `ls-tree` per member × live edge — thousands of serialized git spawns on
+// the real ~840-turn workspace (minutes). This asserts the batched replacement:
+// exactly TWO `cat-file` probes (liveness + membership), INDEPENDENT of the edge
+// count, and NO per-edge `ls-tree` fan-out. A fixture that exercises zero live-edge
+// calls (the SC-WP-1B.2 blind spot) issues zero `cat-file` and fails these guards.
+test('protection Git probes are request-scoped and batched, independent of edge count', async () => {
+  const commands: string[][] = [];
+  const cmdName = (args: string[]): string =>
+    args[0] === '--no-optional-locks' ? args[1] : args[0];
+  const perfService = new CommitCandidateService({
+    runGit: async (cwd, args, options) => {
+      commands.push([...args]);
+      return runGit(cwd, args, { ...options, gitExe });
+    },
+    runGitBytes: async (cwd, args, options) => {
+      commands.push([...args]);
+      return runGitBytes(cwd, args, { ...options, gitExe });
+    },
+    readTurnWitnesses: () => [],
+    // 200 live turns on the target workspace ⇒ 400 before/after edges, but only two
+    // distinct refs and ONE distinct live commit OID.
+    readCaptureTurns: (workspaceId) =>
+      workspaceId === 'workspace-a'
+        ? Array.from({ length: 200 }, (_unused, index) => captureTurn(`perf-turn-${index}`))
+        : [],
+  });
+
+  await perfService.assembleInventory({ targetWorkspaceId: 'workspace-a', workspaces });
+
+  const catFile = commands.filter((args) => cmdName(args) === 'cat-file');
+  const lsTree = commands.filter((args) => cmdName(args) === 'ls-tree');
+  const revParse = commands.filter((args) => cmdName(args) === 'rev-parse');
+
+  assert.equal(catFile.length, 2, 'liveness + membership: two batched cat-file probes for 400 edges');
+  assert.equal(
+    catFile.filter((args) => !args.includes('-z')).length,
+    1,
+    'exactly one liveness probe (cat-file --batch-check)',
+  );
+  assert.equal(
+    catFile.filter((args) => args.includes('-z')).length,
+    1,
+    'exactly one NUL-delimited membership probe (cat-file --batch-check -z)',
+  );
+  // Nothing is protected here, so the mode-confirm ls-tree never fires; crucially
+  // there is NO per-edge / per-member ls-tree fan-out regardless of the 400 edges.
+  assert.equal(lsTree.length, 0, 'no ls-tree fan-out when no member has a blob hit');
+  // rev-parse belongs to scope discovery only (a small fixed probe set), never to
+  // liveness — the pre-fix per-edge rev-parse storm must not reappear.
+  assert.ok(revParse.length <= 8, `rev-parse must not scale with edges: ${revParse.length}`);
+  assert.ok(commands.length < 40, `total git spawns must stay bounded: ${commands.length}`);
+});
+
+test('turns with no live edges issue zero liveness/tree Git (batch stays honest)', async () => {
+  const commands: string[][] = [];
+  const cmdName = (args: string[]): string =>
+    args[0] === '--no-optional-locks' ? args[1] : args[0];
+  const deadService = new CommitCandidateService({
+    runGit: async (cwd, args, options) => {
+      commands.push([...args]);
+      return runGit(cwd, args, { ...options, gitExe });
+    },
+    runGitBytes: async (cwd, args, options) => {
+      commands.push([...args]);
+      return runGitBytes(cwd, args, { ...options, gitExe });
+    },
+    readTurnWitnesses: () => [],
+    readCaptureTurns: (workspaceId) =>
+      workspaceId === 'workspace-a' ? [deadTurn('dead-1'), deadTurn('dead-2')] : [],
+  });
+
+  await deadService.assembleInventory({ targetWorkspaceId: 'workspace-a', workspaces });
+
+  assert.equal(
+    commands.filter((args) => cmdName(args) === 'cat-file').length,
+    0,
+    'no usable edges ⇒ no liveness probe spawned',
+  );
+  assert.equal(commands.filter((args) => cmdName(args) === 'ls-tree').length, 0);
 });
 
 test('scope probe memo is request-local and deduplicates only repeated target reads', async () => {

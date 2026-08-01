@@ -12,7 +12,8 @@ import type {
 } from '../../shared/commit-candidates';
 import type { TurnRecord, TurnStatus } from '../database';
 import {
-  verifyLiveEdge,
+  liveEdgeKey,
+  verifyLiveEdgesBatch,
   type LiveEdgeRunGit,
 } from '../git-checkpoints/live-edge';
 
@@ -121,23 +122,18 @@ export function classifyCaptureFailure(
   return failureReason === null ? 'none' : 'other';
 }
 
-async function computeEdgeState(
-  options: ComputeBundleCaptureHealthOptions,
+function computeEdgeState(
+  liveKeys: ReadonlySet<string>,
   edge: {
     ready: boolean;
     ref: string | null;
     oid: string | null;
     prunedAt: number | null;
   },
-): Promise<EdgeState> {
-  const live = await verifyLiveEdge({
-    repoRoot: options.repoRoot,
-    ref: edge.ref,
-    oid: edge.oid,
-    runGit: options.runGit,
-    gitExe: options.gitExe,
-  });
-  if (live) return 'verified-live';
+): EdgeState {
+  if (edge.ref && edge.oid && liveKeys.has(liveEdgeKey(edge.ref, edge.oid))) {
+    return 'verified-live';
+  }
   if (edge.prunedAt !== null) return 'pruned';
   if (edge.ready) return 'ready-hint-only';
   return 'absent';
@@ -145,35 +141,41 @@ async function computeEdgeState(
 
 /**
  * Compute §7 capture health for the turns and dirty members already selected by
- * repository/turn scope discovery.
+ * repository/turn scope discovery. Every edge's liveness is resolved in ONE
+ * batched `cat-file --batch-check` (distinct refs collapse to one probe) rather
+ * than a `rev-parse` per edge — live Git remains authoritative, semantics are
+ * unchanged.
  */
 export async function computeBundleCaptureHealth(
   options: ComputeBundleCaptureHealthOptions,
 ): Promise<BundleCaptureHealth> {
-  const turns = await Promise.all(options.turns.map(async (turn): Promise<TurnCaptureState> => {
-    const [beforeEdge, afterEdge] = await Promise.all([
-      computeEdgeState(options, {
-        ready: turn.beforeReady,
-        ref: turn.beforeRef,
-        oid: turn.beforeOid,
-        prunedAt: turn.beforePrunedAt,
-      }),
-      computeEdgeState(options, {
-        ready: turn.afterReady,
-        ref: turn.afterRef,
-        oid: turn.afterOid,
-        prunedAt: turn.afterPrunedAt,
-      }),
-    ]);
+  const liveKeys = await verifyLiveEdgesBatch({
+    repoRoot: options.repoRoot,
+    edges: options.turns.flatMap((turn) => [
+      { ref: turn.beforeRef, oid: turn.beforeOid },
+      { ref: turn.afterRef, oid: turn.afterOid },
+    ]),
+    runGit: options.runGit,
+    gitExe: options.gitExe,
+  });
 
-    return {
-      turnId: turn.id,
-      beforeEdge,
-      afterEdge,
-      beforeQuality: normalizeBeforeQuality(turn.beforeQuality),
-      afterQuality: normalizeAfterQuality(turn.afterQuality),
-      failureClass: classifyCaptureFailure(turn.status, turn.failureReason),
-    };
+  const turns = options.turns.map((turn): TurnCaptureState => ({
+    turnId: turn.id,
+    beforeEdge: computeEdgeState(liveKeys, {
+      ready: turn.beforeReady,
+      ref: turn.beforeRef,
+      oid: turn.beforeOid,
+      prunedAt: turn.beforePrunedAt,
+    }),
+    afterEdge: computeEdgeState(liveKeys, {
+      ready: turn.afterReady,
+      ref: turn.afterRef,
+      oid: turn.afterOid,
+      prunedAt: turn.afterPrunedAt,
+    }),
+    beforeQuality: normalizeBeforeQuality(turn.beforeQuality),
+    afterQuality: normalizeAfterQuality(turn.afterQuality),
+    failureClass: classifyCaptureFailure(turn.status, turn.failureReason),
   }));
 
   return {

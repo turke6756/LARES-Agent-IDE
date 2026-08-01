@@ -39,13 +39,21 @@ function turn(extra: Partial<CaptureHealthTurn> = {}): CaptureHealthTurn {
   };
 }
 
+// Emulate `git cat-file --batch-check`: one output line per stdin ref query
+// (`<ref>^{commit}`), in order — "<oid> commit <size>" when known, else
+// "<query> missing". This is the batched liveness seam capture-health now uses.
 function fakeGit(refs: Readonly<Record<string, string>>): LiveEdgeRunGit {
-  return async (_cwd, args) => {
-    const requested = args[2]?.replace(/\^\{commit\}$/, '') ?? '';
-    const oid = refs[requested];
-    return oid
-      ? { code: 0, stdout: `${oid}\n`, stderr: '' }
-      : { code: 128, stdout: '', stderr: 'missing ref' };
+  return async (_cwd, _args, opts) => {
+    const stdin = (opts.stdin ?? '').toString();
+    const queries = stdin.split('\n').filter((line) => line.length > 0);
+    const stdout = queries
+      .map((query) => {
+        const ref = query.replace(/\^\{commit\}$/, '');
+        const oid = refs[ref];
+        return oid ? `${oid} commit 100` : `${query} missing`;
+      })
+      .join('\n') + '\n';
+    return { code: 0, stdout, stderr: '' };
   };
 }
 

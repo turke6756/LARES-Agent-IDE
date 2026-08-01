@@ -12,11 +12,10 @@ import * as path from 'node:path';
 import type { ProtectionRung } from '../../shared/commit-candidates';
 import { resolveInternalGit } from '../git/git-runtime';
 import { runGit, runGitBytes } from '../git-checkpoints/git-command';
-import type { LiveEdgeRunGit } from '../git-checkpoints/live-edge';
 import {
   evaluateCheckpointProtection,
   weakestProtectionRung,
-  type CheckpointTreeEntry,
+  type CheckpointTreePresence,
   type CheckpointTreeReader,
   type ProtectionMember,
   type RunProtectionGitBytes,
@@ -115,16 +114,18 @@ test('deletion is protected by recorded absence but not while the path remains i
   assert.equal(presentResult.members[0].protection, 'unprotected');
 });
 
-test('a live ref alone is insufficient when tree lookup fails or returns a different path', async () => {
+test('a live ref + blob hit is insufficient when the mode-confirm read fails or differs', async () => {
+  // The real batch probe (runGitBytes) finds protected.txt's blob in the live
+  // checkpoint → a candidate. Only the injected Phase-2 mode-confirm reader varies.
   const exact = member('member', 'protected.txt', 'present', matchingBlobOid, '100644');
   const readers: CheckpointTreeReader[] = [
+    // Read failure for the edge → null → never protection proof.
+    async () => null,
     async () => { throw new Error('tree unavailable'); },
-    async (): Promise<CheckpointTreeEntry> => ({
-      pathBytesBase64: encodedPath('other.txt').pathBytesBase64,
-      expectedState: 'present',
-      rawBlobOid: matchingBlobOid,
-      mode: '100644',
-    }),
+    // Tree records a DIFFERENT path only → the member's path is absent from the map.
+    async (): Promise<Map<string, CheckpointTreePresence>> => new Map([
+      [encodedPath('other.txt').pathBytesBase64, { rawBlobOid: matchingBlobOid, mode: '100644' }],
+    ]),
   ];
 
   for (const reader of readers) {
@@ -133,38 +134,41 @@ test('a live ref alone is insufficient when tree lookup fails or returns a diffe
       members: [exact],
       checkpointEdges: [{ ref: CHECKPOINT_REF, oid: checkpointOid }],
       runGit,
-      runGitBytes: unreachableBytes,
-      readCheckpointTreeEntry: reader,
+      runGitBytes,
+      readCheckpointTree: reader,
       gitExe,
     });
     assert.equal(result.members[0].protection, 'unprotected');
   }
 });
 
+test('a Git failure during the batched membership probe degrades to unprotected', async () => {
+  const exact = member('member', 'protected.txt', 'present', matchingBlobOid, '100644');
+  const result = await evaluateCheckpointProtection({
+    repoRoot: repo,
+    members: [exact],
+    checkpointEdges: [{ ref: CHECKPOINT_REF, oid: checkpointOid }],
+    runGit,
+    runGitBytes: unreachableBytes, // Phase-1 batch probe throws → no proof, no throw
+    gitExe,
+  });
+  assert.equal(result.members[0].protection, 'unprotected');
+});
+
 test('Stage 1 evaluator never emits locally-committed or remote-reachable', async () => {
-  const liveRunGit: LiveEdgeRunGit = async () => ({
-    code: 0,
-    stdout: 'a'.repeat(40),
-    stderr: '',
-  });
-  const reader: CheckpointTreeReader = async ({ path: requestedPath }) => ({
-    pathBytesBase64: requestedPath.pathBytesBase64,
-    expectedState: 'present',
-    rawBlobOid: 'b'.repeat(40),
-    mode: '100644',
-  });
   const result = await evaluateCheckpointProtection({
     repoRoot: repo,
     members: [
-      member('protected', 'one.txt', 'present', 'b'.repeat(40), '100644'),
-      member('unprotected', 'two.txt', 'present', 'c'.repeat(40), '100644'),
+      member('protected', 'protected.txt', 'present', matchingBlobOid, '100644'),
+      member('unprotected', 'ghost.txt', 'present', matchingBlobOid, '100644'),
     ],
-    checkpointEdges: [{ ref: 'refs/fake', oid: 'a'.repeat(40) }],
-    runGit: liveRunGit,
-    runGitBytes: unreachableBytes,
-    readCheckpointTreeEntry: reader,
+    checkpointEdges: [{ ref: CHECKPOINT_REF, oid: checkpointOid }],
+    runGit,
+    runGitBytes,
+    gitExe,
   });
 
+  assert.equal(result.members.find((m) => m.entryId === 'protected')!.protection, 'checkpoint-protected');
   const emitted = new Set(result.members.map((item) => item.protection));
   assert.deepEqual([...emitted].sort(), ['checkpoint-protected', 'unprotected']);
   assert.equal(emitted.has('locally-committed' as ProtectionRung), false);
