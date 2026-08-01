@@ -81,6 +81,28 @@ function rendererSafeText(value: string): string {
     .replace(/(^|\s)\/(?:Users|home|var|tmp|opt|mnt)\/[^\s,;]+/g, '$1[local path]');
 }
 
+const IDENTITY_NAME_MAX_LENGTH = 80;
+const IDENTITY_ROLE_MAX_LENGTH = 200;
+
+function clampText(value: string, maxLength: number): string {
+  if (value.length <= maxLength) return value;
+  return `${value.slice(0, maxLength - 1).trimEnd()}…`;
+}
+
+function mixedIdentityName(workerUnits: readonly SaveCardWorkerUnit[]): string {
+  const visibleNames = workerUnits.slice(0, 2).map((unit) => unit.name);
+  if (workerUnits.length <= 2) {
+    return clampText(visibleNames.join(' + ') || 'Unknown agent', IDENTITY_NAME_MAX_LENGTH);
+  }
+
+  const suffix = ` + ${workerUnits.length - visibleNames.length} more agents`;
+  const prefix = clampText(
+    visibleNames.join(', '),
+    IDENTITY_NAME_MAX_LENGTH - suffix.length,
+  );
+  return `${prefix}${suffix}`;
+}
+
 /** Attach presentation identity without changing component membership/topology. */
 function attachBundleIdentity(
   bundle: WorkBundle,
@@ -143,13 +165,21 @@ function attachBundleIdentity(
     source = 'mixed';
   }
 
-  const name = rendererSafeText(identityAgent?.title
-    ?? (source === 'mixed' ? workerUnits.map((unit) => unit.name).join(' + ') : workerUnits[0]?.name)
-    ?? 'Unknown agent');
-  const roleDescription = rendererSafeText(nonEmpty(
+  const name = clampText(rendererSafeText(identityAgent?.title
+    ?? (source === 'mixed' ? mixedIdentityName(workerUnits) : workerUnits[0]?.name)
+    ?? 'Unknown agent'), IDENTITY_NAME_MAX_LENGTH);
+  const distinctRoleDescriptions = workerUnits
+    .map((unit) => unit.roleDescription)
+    .filter((value, index, all) => all.indexOf(value) === index);
+  const roleFallback = source === 'mixed'
+    ? `Overlapping work from ${workerUnits.length} agents across ${turnIds.size} turns${
+      distinctRoleDescriptions[0] ? ` — ${distinctRoleDescriptions[0]}` : ''
+    }`
+    : distinctRoleDescriptions.join(' ');
+  const roleDescription = clampText(rendererSafeText(nonEmpty(
     identityAgent?.roleDescription,
-    workerUnits.map((unit) => unit.roleDescription).filter((value, index, all) => all.indexOf(value) === index).join(' '),
-  ));
+    roleFallback,
+  )), IDENTITY_ROLE_MAX_LENGTH);
   const identity: SaveCardBundleIdentity = {
     groupingKey: identityAgent
       ? `${source}:${identityAgent.id}`

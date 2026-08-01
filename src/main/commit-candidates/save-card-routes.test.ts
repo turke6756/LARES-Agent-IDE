@@ -99,7 +99,9 @@ const captureRows: Record<string, CaptureHealthTurn[]> = {
   'workspace-b': [captureTurn('turn-b')],
 };
 
-function buildRoutes(): SaveCardRoutes {
+type RouteOverrides = Partial<Omit<Parameters<typeof createSaveCardRoutes>[0], 'gitExe'>>;
+
+function buildRoutes(overrides: RouteOverrides = {}): SaveCardRoutes {
   return createSaveCardRoutes({
     gitExe,
     getWorkspaces: fakeGetWorkspaces,
@@ -123,6 +125,7 @@ function buildRoutes(): SaveCardRoutes {
       observedCommands.push([...args]);
       return runGitBytes(cwd, args, { ...options, gitExe });
     },
+    ...overrides,
   });
 }
 
@@ -208,6 +211,96 @@ test('issues only the read-only Git command family — never a mutating verb', a
       assert.equal(args.includes(mutating), false, `mutating verb leaked: ${args.join(' ')}`);
     }
   }
+});
+
+test('mixed identity stays compact while retaining all forty worker sub-units', async () => {
+  const agents = Array.from({ length: 40 }, (_, index) => ({
+    id: `worker-${String(index).padStart(2, '0')}`,
+    workspaceId: 'workspace-a',
+    title: index === 0 ? 'app icon' : index === 1 ? 'Guard exit-code source fix' : `Agent ${index + 1}`,
+    roleDescription: index === 0
+      ? `First role memory jog ${'with deliberately verbose detail '.repeat(10)}`
+      : `Distinct role description ${index + 1}`,
+    isSupervisor: false,
+    isWorker: true,
+    isSupervised: false,
+    ownerAgentId: null,
+  } as Agent));
+  const witnesses = agents.map((agent, index): TurnWitnessRead => ({
+    turnId: `many-turn-${index}`,
+    agentId: agent.id,
+    ownerAgentId: null,
+    ownerBrickGeneration: null,
+    touched: [{ path: 'one.txt', op: 'write' }],
+  }));
+  const captureTurns = agents.map((_, index) => captureTurn(`many-turn-${index}`));
+  const routes = buildRoutes({
+    readTurnWitnesses: (workspaceId) => workspaceId === 'workspace-a' ? witnesses : [],
+    readCaptureTurns: (workspaceId) => workspaceId === 'workspace-a' ? captureTurns : [],
+    getAgentsByWorkspace: (workspaceId) => workspaceId === 'workspace-a' ? agents : [],
+    readBundleTurns: (workspaceId) => workspaceId === 'workspace-a'
+      ? agents.map((agent, index) => ({
+        id: `many-turn-${index}`,
+        agentId: agent.id,
+        agentTitle: agent.title,
+        startedAt: Date.UTC(2026, 6, 1, index),
+        endedAt: Date.UTC(2026, 6, 1, index),
+      }))
+      : [],
+  });
+
+  const bundles = await routes.getInventory({ workspaceId: 'workspace-a' });
+  const identity = bundles.find((bundle) => bundle.kind === 'component')?.identity;
+  assert.ok(identity, 'expected a mixed component identity');
+  assert.equal(identity.source, 'mixed');
+  assert.equal(identity.name, 'app icon, Guard exit-code source fix + 38 more agents');
+  assert.ok(identity.name.length <= 80, `name exceeded clamp: ${identity.name.length}`);
+  assert.match(identity.roleDescription, /^Overlapping work from 40 agents across 40 turns — First role memory jog/);
+  assert.ok(
+    identity.roleDescription.length <= 200,
+    `role description exceeded clamp: ${identity.roleDescription.length}`,
+  );
+  assert.equal(identity.roleDescription.endsWith('…'), true);
+  assert.equal(identity.workerUnits.length, 40);
+});
+
+test('single-owner identity applies the same hard text clamps', async () => {
+  const longOwner = {
+    ...supervisor,
+    id: 'long-owner',
+    title: 'Long owner title '.repeat(10),
+    roleDescription: 'Long owner role description. '.repeat(20),
+  } as Agent;
+  const ownedWorker = { ...worker, ownerAgentId: longOwner.id } as Agent;
+  const routes = buildRoutes({
+    readTurnWitnesses: (workspaceId) => workspaceId === 'workspace-a'
+      ? [{ ...witness('long-owner-turn', 'one.txt'), ownerAgentId: longOwner.id }]
+      : [],
+    readCaptureTurns: (workspaceId) => workspaceId === 'workspace-a'
+      ? [captureTurn('long-owner-turn')]
+      : [],
+    getAgentsByWorkspace: (workspaceId) => workspaceId === 'workspace-a'
+      ? [longOwner, ownedWorker]
+      : [],
+    readBundleTurns: (workspaceId) => workspaceId === 'workspace-a'
+      ? [{
+        id: 'long-owner-turn',
+        agentId: ownedWorker.id,
+        agentTitle: ownedWorker.title,
+        startedAt: Date.UTC(2026, 6, 1),
+        endedAt: Date.UTC(2026, 6, 1),
+      }]
+      : [],
+  });
+
+  const bundles = await routes.getInventory({ workspaceId: 'workspace-a' });
+  const identity = bundles.find((bundle) => bundle.kind === 'component')?.identity;
+  assert.ok(identity, 'expected an owner identity');
+  assert.equal(identity.source, 'supervisor');
+  assert.ok(identity.name.length <= 80);
+  assert.equal(identity.name.endsWith('…'), true);
+  assert.ok(identity.roleDescription.length <= 200);
+  assert.equal(identity.roleDescription.endsWith('…'), true);
 });
 
 test('serialized DTOs never leak absolute filesystem paths or the git exe', async () => {
