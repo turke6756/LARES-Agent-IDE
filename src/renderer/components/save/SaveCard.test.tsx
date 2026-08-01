@@ -136,6 +136,29 @@ afterEach(() => {
 });
 
 describe('SaveCard bundle rendering', () => {
+  it('explains the save-protection ladder and dismisses it by keyboard or click-away', async () => {
+    getInventory.mockResolvedValue([loudBundle]);
+    await render();
+
+    const button = document.querySelector<HTMLButtonElement>('[aria-label="How save protection works"]')!;
+    expect(button.getAttribute('aria-expanded')).toBe('false');
+
+    await act(async () => button.click());
+    const popover = document.querySelector('[aria-label="Save protection ladder"]');
+    expect(popover?.textContent).toContain('Your live files. They can change at any time.');
+    expect(popover?.textContent).toContain('Recoverable, but it can expire or be pruned.');
+    expect(popover?.textContent).toContain('permanent save on this machine');
+    expect(popover?.textContent).toContain('copy off this machine');
+
+    await act(async () => document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' })));
+    expect(document.querySelector('[aria-label="Save protection ladder"]')).toBeNull();
+    expect(document.activeElement).toBe(button);
+
+    await act(async () => button.click());
+    await act(async () => document.body.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })));
+    expect(document.querySelector('[aria-label="Save protection ladder"]')).toBeNull();
+  });
+
   it('renders loud unsaved bundles with memory-jog description and protection rung', async () => {
     getInventory.mockResolvedValue([loudBundle]);
     await render();

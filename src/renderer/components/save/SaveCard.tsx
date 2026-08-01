@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useDashboardStore } from '../../stores/dashboard-store';
 import type { SaveCardInventoryResponse } from '../../../shared/types';
 import SaveBundle, { isQuietlySaved, type WorkBundleDto } from './SaveBundle';
@@ -36,6 +36,27 @@ export default function SaveCard() {
     s.workspaces.find((w) => w.id === s.selectedWorkspaceId),
   );
   const [state, setState] = useState<LoadState>({ status: 'loading' });
+  const [infoOpen, setInfoOpen] = useState(false);
+  const infoRef = useRef<HTMLDivElement>(null);
+  const infoButtonRef = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    if (!infoOpen) return;
+    const onDown = (event: MouseEvent) => {
+      if (!infoRef.current?.contains(event.target as Node)) setInfoOpen(false);
+    };
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      setInfoOpen(false);
+      infoButtonRef.current?.focus();
+    };
+    document.addEventListener('mousedown', onDown);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onDown);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [infoOpen]);
 
   const load = useCallback(
     async (wsId: string, isCurrent: () => boolean) => {
@@ -72,7 +93,51 @@ export default function SaveCard() {
 
   const header = (
     <>
-      <h1 className="sc-h1">Save Progress</h1>
+      <div className="sc-heading-row">
+        <h1 className="sc-h1">Save Progress</h1>
+        <div className="sc-info-wrap" ref={infoRef}>
+          <button
+            ref={infoButtonRef}
+            type="button"
+            className="sc-info-button"
+            aria-label="How save protection works"
+            aria-haspopup="dialog"
+            aria-expanded={infoOpen}
+            aria-controls="save-protection-info"
+            onClick={() => setInfoOpen((open) => !open)}
+          >
+            i
+          </button>
+          {infoOpen && (
+            <div
+              id="save-protection-info"
+              className="sc-info-popover"
+              role="dialog"
+              aria-label="Save protection ladder"
+            >
+              <div className="sc-info-title">Your save-protection ladder</div>
+              <dl>
+                <div>
+                  <dt>Working tree</dt>
+                  <dd>Your live files. They can change at any time.</dd>
+                </div>
+                <div>
+                  <dt>Checkpoint</dt>
+                  <dd>An automatic turn snapshot. Recoverable, but it can expire or be pruned.</dd>
+                </div>
+                <div>
+                  <dt>Commit</dt>
+                  <dd>An immutable, named, permanent save on this machine.</dd>
+                </div>
+                <div>
+                  <dt>Push</dt>
+                  <dd>A copy off this machine. Your strongest protection.</dd>
+                </div>
+              </dl>
+            </div>
+          )}
+        </div>
+      </div>
       <p className="sc-sub">
         {workspace ? (
           <>Workspace <b>{workspace.title}</b> · read-only inspection of uncommitted work</>
