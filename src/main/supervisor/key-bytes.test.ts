@@ -43,6 +43,21 @@ test('enter: gemini/windows → Win32 VK_RETURN down+up', () => {
   );
 });
 
+test('enter: grok/windows → bare CR (shares the Claude-on-Windows encoding)', () => {
+  // Source-verified: grok submits on a bare crossterm KeyCode::Enter/NONE over
+  // ConPTY (grok-phase0-probe-results.md §0.1). Must be CR, not the codex/gemini
+  // Win32 VK_RETURN pair.
+  assert.equal(mapKeyToBytes('enter', 'grok', 'windows'), '\r');
+  assert.equal(
+    mapKeyToBytes('enter', 'grok', 'windows'),
+    mapKeyToBytes('enter', 'claude', 'windows'),
+  );
+  assert.notEqual(
+    mapKeyToBytes('enter', 'grok', 'windows'),
+    mapKeyToBytes('enter', 'codex', 'windows'),
+  );
+});
+
 test('enter: codex/wsl → kitty CSI-u \\x1b[13u', () => {
   assert.equal(mapKeyToBytes('enter', 'codex', 'wsl'), '\x1b[13u');
 });
@@ -61,6 +76,18 @@ test('shift-enter: codex/windows → Win32 Shift+Enter down+up', () => {
   assert.equal(
     mapKeyToBytes('shift-enter', 'codex', 'windows'),
     '\x1b[13;28;13;1;16;1_\x1b[13;28;13;0;16;1_',
+  );
+});
+
+test('shift-enter: grok/windows → backslash-continuation (`\\` + CR), not a Shift byte', () => {
+  // Grok has NO distinct Shift+Enter byte over ConPTY — both are CR — so a
+  // synthesized Shift+VK_RETURN/kitty sequence is inert. Its newline-without-
+  // submit is backslash-continuation. Source: route_enter mod.rs:2110 &
+  // 2134-2139 (grok-phase0-probe-results.md §0.1).
+  assert.equal(mapKeyToBytes('shift-enter', 'grok', 'windows'), '\\\r');
+  assert.notEqual(
+    mapKeyToBytes('shift-enter', 'grok', 'windows'),
+    mapKeyToBytes('shift-enter', 'codex', 'windows'),
   );
 });
 

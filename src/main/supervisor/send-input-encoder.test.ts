@@ -187,6 +187,9 @@ test('WSL: submit chain orders paste before sleep before kitty Enter', () => {
 
 test('WSL: unknown provider returns null (legacy tmuxSendKeys path)', () => {
   assert.equal(buildTmuxSendInputCmd(SESSION, BODY, 'unknown', true), null);
+  // Grok is deliberately NOT a TmuxProvider: grok on WSL is refused at launch
+  // (index.ts), so the tmux transport never encodes grok. The `unknown` fallback
+  // is what a non-whitelisted provider collapses to here.
 });
 
 // ── Windows path: getWindowsSubmitSequence ──────────────────────────────────
@@ -210,6 +213,15 @@ test('Windows gemini submit sequence is VK_RETURN down+up pair', () => {
     getWindowsSubmitSequence('gemini'),
     WIN32_KEY_ENTER_DOWN + WIN32_KEY_ENTER_UP,
   );
+});
+
+test('Windows grok submit sequence is CR (matches Claude-on-Windows, not codex/gemini Win32)', () => {
+  // Source-verified: grok submits on a bare crossterm KeyCode::Enter/NONE over
+  // ConPTY (grok-phase0-probe-results.md §0.1). Explicitly listed, not the CR
+  // fall-through — and must equal the claude sequence, never the Win32 pair.
+  assert.equal(getWindowsSubmitSequence('grok'), '\r');
+  assert.equal(getWindowsSubmitSequence('grok'), getWindowsSubmitSequence('claude'));
+  assert.notEqual(getWindowsSubmitSequence('grok'), getWindowsSubmitSequence('codex'));
 });
 
 test('Windows unknown provider falls back to CR', () => {

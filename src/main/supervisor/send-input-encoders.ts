@@ -16,6 +16,15 @@ const WIN32_KEY_ENTER_UP = '\x1b[13;28;13;0;0;1_';
  */
 export function getWindowsSubmitSequence(provider: string): string {
   if (provider === 'claude') return '\r';
+  // Grok submits on a bare crossterm KeyCode::Enter/NONE and never enables
+  // Win32 Input Mode, so over ConPTY a plain CR is the submit byte — same as
+  // the Claude-on-Windows lane, NOT the codex/gemini Win32 VK_RETURN records.
+  // Source-verified: xai-grok-pager prompt_widget/mod.rs:2142 (submit on
+  // Enter/NONE) + app/mod.rs:1174-1202 (kitty push) + render terminal/mod.rs:
+  // 344-388 (kitty gated OFF for ConPTY). See plans/grok-phase0-probe-results.md
+  // §0.1. Listed explicitly (not left to the CR fall-through) so the contract is
+  // a verified decision, not an implicit accident.
+  if (provider === 'grok') return '\r';
   if (provider === 'codex' || provider === 'gemini') {
     return WIN32_KEY_ENTER_DOWN + WIN32_KEY_ENTER_UP;
   }

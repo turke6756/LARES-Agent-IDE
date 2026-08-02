@@ -11,6 +11,15 @@
 //   - claude (windows or wsl):     plain CR (`\r`)
 //   - codex/gemini on Windows:     Win32 Input Mode VK_RETURN down+up pair
 //   - codex/gemini on WSL (kitty): CSI-u `\x1b[13u`
+//   - grok on Windows (ConPTY):    plain CR (`\r`) — grok submits on a bare
+//       crossterm KeyCode::Enter/NONE and never enables Win32 Input Mode, so it
+//       shares the Claude-on-Windows encoding, NOT the codex/gemini Win32 form.
+//       There is NO distinct Shift+Enter byte over ConPTY, so shift-enter uses
+//       backslash-continuation (`\` + CR). Source-verified in
+//       plans/grok-phase0-probe-results.md §0.1.
+//
+// Providers therefore do NOT all share one encoding: the split is claude/grok
+// (bare CR) vs codex/gemini (Win32 on Windows, kitty on WSL).
 //
 // This module exposes a small enum-based API that callers can use to ask
 // for a named key (`enter`, `esc`, `tab`, an arrow, Ctrl-C, etc.) and get
@@ -35,6 +44,16 @@ const WIN32_KEY_SHIFT_ENTER_DOWN = '\x1b[13;28;13;1;16;1_';
 const WIN32_KEY_SHIFT_ENTER_UP = '\x1b[13;28;13;0;16;1_';
 const WIN32_KEY_ENTER = WIN32_KEY_ENTER_DOWN + WIN32_KEY_ENTER_UP;
 const WIN32_KEY_SHIFT_ENTER = WIN32_KEY_SHIFT_ENTER_DOWN + WIN32_KEY_SHIFT_ENTER_UP;
+
+// Grok multi-line (newline-without-submit) over ConPTY. Grok has NO distinct
+// Shift+Enter byte on this transport — Shift+Enter and Enter are both just CR —
+// so a synthesized Shift+VK_RETURN or kitty sequence is inert. Grok instead
+// treats a trailing backslash immediately before Enter as a line continuation:
+// sending `\` then CR inserts a newline instead of submitting.
+// Source-verified: xai-grok-pager prompt_widget/mod.rs:2110 & 2134-2139
+// (route_enter backslash-continuation); see plans/grok-phase0-probe-results.md
+// §0.1 "Shift-Enter / newline-without-submit".
+const GROK_BACKSLASH_CONTINUATION = '\\\r';
 
 // CSI-u (kitty keyboard protocol). All three providers enable this on Linux
 // at startup; tmux's `send-keys Enter` (a bare `\r`) is dropped under
@@ -86,10 +105,14 @@ export function mapKeyToBytes(
 ): string {
   switch (key) {
     case 'enter': {
-      // claude (any host) accepts plain CR. codex/gemini need the
-      // provider+host-specific submit event — otherwise bytes render as
-      // typed text without firing submit.
+      // claude (any host) accepts plain CR. grok submits on a bare
+      // crossterm KeyCode::Enter/NONE over ConPTY, so it also takes CR — listed
+      // explicitly (not the CR fall-through) so the contract is a verified
+      // decision. codex/gemini need the provider+host-specific submit event —
+      // otherwise bytes render as typed text without firing submit. Grok source:
+      // prompt_widget/mod.rs:2142 (grok-phase0-probe-results.md §0.1).
       if (provider === 'claude') return '\r';
+      if (provider === 'grok') return '\r';
       if (provider === 'codex' || provider === 'gemini') {
         return pathType === 'wsl' ? KITTY_ENTER : WIN32_KEY_ENTER;
       }
@@ -101,6 +124,11 @@ export function mapKeyToBytes(
       // shift-enter to bracketed-paste-friendly LF — callers can use it
       // for newline-without-submit when the input is single-shot.
       if (provider === 'claude') return '\n';
+      // Grok has NO distinct Shift+Enter byte over ConPTY (both are CR); a
+      // synthesized Shift+VK_RETURN/kitty sequence is inert. Its newline-without-
+      // submit is backslash-continuation: `\` + CR. Source: route_enter
+      // mod.rs:2110 & 2134-2139 (grok-phase0-probe-results.md §0.1).
+      if (provider === 'grok') return GROK_BACKSLASH_CONTINUATION;
       if (provider === 'codex' || provider === 'gemini') {
         return pathType === 'wsl' ? KITTY_SHIFT_ENTER : WIN32_KEY_SHIFT_ENTER;
       }

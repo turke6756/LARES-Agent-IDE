@@ -1,10 +1,10 @@
 import React, { useState, useEffect, useRef } from 'react';
 import type { AgentPersona, AgentProvider, AgentTemplate, PersonaLane, Workspace } from '../../../shared/types';
-import { PROVIDER_COMMANDS, PROVIDER_META } from '../../../shared/constants';
+import { PROVIDER_COMMANDS, PROVIDER_META, PROVIDER_INSTALL_HINTS } from '../../../shared/constants';
 import { useDashboardStore } from '../../stores/dashboard-store';
 import { useBrowserSuspension } from '../browser/useBrowserSuspension';
 
-const PROVIDERS: AgentProvider[] = ['claude', 'gemini', 'codex'];
+const PROVIDERS: AgentProvider[] = ['claude', 'gemini', 'codex', 'grok'];
 
 // Single "Agent type" selector values. The first three are first-class role
 // lanes (app-managed cwd + scaffold under .lares/); personas are custom
@@ -554,6 +554,14 @@ export default function AgentLaunchDialog({ workspace, onClose }: Props) {
             {isWorkerType && provider === 'gemini' && (
               <div className="mt-1 text-[11px] text-gray-600">
                 Gemini has no hook scaffold — it launches as a plain session, not a worker-lane agent.
+              </div>
+            )}
+            {/* Grok first-run auth notice — informational only, never blocks
+                launch. Grok on WSL is refused at launch time (the supervisor
+                throws) and that error surfaces in the launchError panel below. */}
+            {provider === 'grok' && (
+              <div className="mt-1 text-[11px] text-purple-400">
+                {PROVIDER_INSTALL_HINTS.grok.installNote}
               </div>
             )}
           </div>
