@@ -3336,6 +3336,18 @@ export class AgentSupervisor extends EventEmitter {
       // to this lane. AGENTS.md is seeded write-if-absent (seed-once identity).
       providerCreated = this.writeScaffoldMap(workDir, AgentSupervisor.WORKER_FILES_GROK, pathType);
       providerCreated += this.seedGrokIdentityIfAbsent(workDir, pathType);
+      // Commit 6 fix (plans/grok-provider-lane-implementation.md; tier-0 smoke
+      // item 3.1): grok discovers project `.claude/settings.json` hooks at its
+      // projectRoot — the NEAREST `.git` ancestor of the cwd — NOT at the cwd
+      // itself (empirically verified against grok.exe 0.2.118). Our carrier lives
+      // at <cwd>/.claude/settings.json, so unless the worker cwd is itself a git
+      // repo root, grok resolves projectRoot to some OUTER repo (when an ancestor
+      // is git-backed) or nowhere (when nothing is) and never loads the carrier —
+      // the grok lane's status hooks + git-discard guard go silently inert.
+      // `git init` in the worker cwd makes nearest-.git resolve to the cwd (a
+      // nested repo beats any outer one), so all four compat hooks load. Verified
+      // in BOTH a git-backed outer workspace and a non-git workspace.
+      this.ensureGrokWorkerGitRepo(workDir, pathType);
     }
     const total = scriptCreated + providerCreated;
     if (total > 0) {
@@ -3479,6 +3491,43 @@ export class AgentSupervisor extends EventEmitter {
     if (scaffoldFileExists(workDir, relPath, pathType)) return 0;
     atomicWriteScaffoldText(workDir, relPath, WORKER_GROK_AGENTS_MD, false, pathType);
     return 1;
+  }
+
+  /** Commit 6 — make the grok worker cwd (`.lares/workers/grok/`) its OWN git
+   *  repo so grok's projectRoot (the nearest `.git` ancestor of the cwd) resolves
+   *  to the cwd, which is what makes grok load the `<cwd>/.claude/settings.json`
+   *  compat carrier. Without a `.git` here grok resolves projectRoot to an outer
+   *  repo (any git-backed ancestor) or to nothing, and the carrier — the grok
+   *  lane's ONLY hook source — is never read, leaving the dashboard status hooks
+   *  AND the git-discard guard silently inert (empirically verified against
+   *  grok.exe 0.2.118; regression captured as grok-tier0-smoke item 3.1).
+   *
+   *  - Idempotent: an existing `.git` short-circuits — no re-init, no churn.
+   *  - Best-effort: if git is unavailable or `init` fails, log a focused warning
+   *    naming the consequence and return; a hook-less grok worker still launches.
+   *  - Windows only: WSL grok is out of scope, so a `wsl` pathType is a no-op.
+   *  - A bare `git init` (no initial commit) is sufficient — projectRoot
+   *    resolution only needs the `.git` directory to exist (verified).
+   *
+   *  This `git init` targets the WORKER cwd at runtime; it NEVER touches the
+   *  dashboard's own repository. Uses the same `execFileSync('git', …)` shape the
+   *  rest of this file (and scripts/grok-tier0-smoke.mjs) already use. */
+  private ensureGrokWorkerGitRepo(workDir: string, pathType: string): void {
+    if (pathType === 'wsl') return;  // WSL grok deferred (Windows-first lane)
+    const workerCwd = path.join(workDir, '.lares', 'workers', 'grok');
+    const gitDir = path.join(workerCwd, '.git');
+    try {
+      if (fs.existsSync(gitDir)) return;  // already a repo → no-op (no mtime churn)
+    } catch { /* unreadable — fall through and attempt init */ }
+    try {
+      execFileSync('git', ['init', '-q'], { cwd: workerCwd, timeout: 20_000, stdio: 'ignore' });
+    } catch (err) {
+      console.warn(
+        `[supervisor] grok worker \`git init\` failed in ${workerCwd} — grok hooks/guard `
+        + `will not load (projectRoot won't resolve to the worker cwd): `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
 
   /** Seed the supervisor's memory (`.lares/supervisor/memory/MEMORY.md`) —

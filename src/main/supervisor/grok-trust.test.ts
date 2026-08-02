@@ -120,6 +120,43 @@ test('parent git-root trust covers .lares/workers/grok (upward collapse rational
   }
 });
 
+test('nested worker repo (Commit 6): outer git-backed → outer root; non-git → worker cwd itself', () => {
+  // Commit 6 git-init's the grok worker cwd so grok's projectRoot resolves to it.
+  // grokTrustPathKey walks up for the SHALLOWEST `.git`, so its key depends on
+  // whether an ancestor is ALSO a repo — both branches must still yield a valid,
+  // safe key that COVERS the worker cwd (grok's component-wise starts_with lookup
+  // cascades a parent-key trust down to the projectRoot).
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'grok-nested-'));
+  try {
+    // (a) Outer workspace is git-backed AND the worker cwd is now its own repo.
+    //     Shallowest .git wins → the OUTER root; trust cascades down to the cwd.
+    const outer = path.join(base, 'gitws');
+    const outerWorker = path.join(outer, '.lares', 'workers', 'grok');
+    fs.mkdirSync(outerWorker, { recursive: true });
+    fs.mkdirSync(path.join(outer, '.git'), { recursive: true });        // outer repo
+    fs.mkdirSync(path.join(outerWorker, '.git'), { recursive: true });  // Commit 6 nested repo
+    const outerKey = grokTrustPathKey(outerWorker, 'windows');
+    assert.equal(outerKey, fs.realpathSync.native(outer),
+      'nested worker repo under a git-backed workspace still collapses to the OUTER root (shallowest .git)');
+
+    // (b) Non-git workspace: the ONLY `.git` is the worker cwd's own (Commit 6),
+    //     so the key IS the worker cwd itself — grok now finds a valid projectRoot
+    //     where before there was none.
+    const plain = path.join(base, 'plainws');
+    const plainWorker = path.join(plain, '.lares', 'workers', 'grok');
+    fs.mkdirSync(plainWorker, { recursive: true });
+    fs.mkdirSync(path.join(plainWorker, '.git'), { recursive: true });  // Commit 6 nested repo only
+    const plainKey = grokTrustPathKey(plainWorker, 'windows');
+    assert.equal(plainKey, fs.realpathSync.native(plainWorker),
+      'in a non-git workspace the worker cwd is its own root → its own trust key');
+    // The produced key must be a safe, writable trust key (not refused as junk).
+    assert.ok(plainKey !== null && mergeGrokFolderTrust(null, [plainKey]) !== null,
+      'the worker-cwd key must be seedable into the trust store');
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});
+
 // ── mergeGrokFolderTrust ─────────────────────────────────────────────────
 
 const KEY_A = 'C:\\Users\\turke\\Projects\\WS';

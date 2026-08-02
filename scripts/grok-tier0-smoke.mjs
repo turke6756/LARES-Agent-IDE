@@ -24,12 +24,13 @@
 //   2. grok --version discovered from %USERPROFILE%\.grok\bin\grok.exe.
 //   3. grok inspect --json from the worker cwd → AGENTS.md discovered + no trust
 //      suppression (3), and the four claude-compat hooks load from the scaffolded
-//      carrier (3.1). NOTE: 3.1 currently FAILS and is the smoke's headline
-//      finding — grok discovers project `.claude/settings.json` hooks at the git
-//      PROJECT ROOT, not the deeper worker cwd, so the carrier at
-//      `.lares/workers/grok/.claude/settings.json` is never loaded (status hooks +
-//      git-guard silently inert). 3.1 runs a projectRoot control to prove this is
-//      a carrier-PLACEMENT bug, not a trust/format issue. See the commit summary.
+//      carrier (3.1). Commit 6 FIX: ensureWorkerScaffold now `git init`s the grok
+//      worker cwd, so grok's projectRoot (the nearest `.git` ancestor) resolves to
+//      the worker cwd ITSELF and loads `.lares/workers/grok/.claude/settings.json`.
+//      3.1 asserts the FIXED behavior — projectRoot == worker cwd and all four
+//      compat hooks enabled read directly from the worker cwd (previously this was
+//      the smoke's one failing item: the carrier at the deeper cwd was never
+//      loaded because grok read project hooks only at the outer git root).
 //   4. trusted_folders.toml has only the intended canonical entry + preserves
 //      pre-existing entries.
 //   5. Re-running scaffold + trust prep is a no-op.
@@ -252,86 +253,76 @@ try {
           `agents_md=${hasAgentsMd} projectTrusted=${inspected.projectTrusted}`);
       }
 
-      // ── 3c: the four claude-compat hooks load FROM THE WORKER-CWD CARRIER ──
-      // Grok discovers project-scope `.claude/settings.json` hooks at the git
-      // PROJECT ROOT (the `.git` ancestor), NOT at the deeper cwd. The scaffold
-      // writes the carrier at `<workspace>/.lares/workers/grok/.claude/settings.json`
-      // (the worker cwd, a subdir), so grok never loads it → the grok worker's
-      // status hooks + git-guard are silently inert. To PROVE this is a
-      // carrier-PLACEMENT bug (not a trust/format/version issue), run a control:
-      // drop the identical settings.json at the projectRoot and confirm grok
-      // loads all four hooks there.
+      // ── 3.1: the four claude-compat hooks load FROM THE WORKER-CWD CARRIER ──
+      // Commit 6 FIX: ensureWorkerScaffold `git init`s the grok worker cwd, so
+      // grok's projectRoot (the nearest `.git` ancestor of the cwd) now resolves to
+      // the worker cwd ITSELF — a nested repo beats the outer workspace repo this
+      // smoke also `git init`s (line ~87), which is the harder, git-backed-outer
+      // case. grok therefore loads `<cwd>/.claude/settings.json` (the scaffolded
+      // carrier) and enables all four compat hooks. This asserts that FIXED
+      // behavior: projectRoot == worker cwd, all four events enabled, guard Bash
+      // matcher — read directly from the worker cwd (no projectRoot control).
       const requiredEvents = ['session_start', 'user_prompt_submit', 'stop', 'pre_tool_use'];
       const enabledClaudeEvents = (insp) => new Set(
         (insp.hooks || []).filter((h) => h.vendor === 'claude' && h.compatibilityStatus === 'enabled').map((h) => h.event),
       );
       const cwdEvents = enabledClaudeEvents(inspected);
       const cwdLoadsAll = requiredEvents.every((e) => cwdEvents.has(e));
+      const cwdGuard = (inspected.hooks || []).find((h) => h.vendor === 'claude' && h.event === 'pre_tool_use');
+      // projectRoot must now BE the worker cwd (canonicalized both sides, case-
+      // insensitive on Windows, to survive dunce/native spelling differences).
+      let projectRootIsCwd = false;
+      try {
+        const canonCwd = fs.realpathSync.native(agentCwd);
+        projectRootIsCwd = !!inspected.projectRoot
+          && path.resolve(String(inspected.projectRoot)).toLowerCase() === path.resolve(canonCwd).toLowerCase();
+      } catch { projectRootIsCwd = false; }
 
-      // Control at the projectRoot (workDir = the git root of this smoke's
-      // workspace). Use the scaffolded carrier PLUS a deliberately-unknown event
-      // name so we can prove grok skips unknown Claude events without rejecting
-      // the file (the real carrier's own events — SessionStart/Stop/
-      // UserPromptSubmit/Notification/PreToolUse — are ALL recognized by grok, so
-      // an injected bogus event is the only way to exercise the skip path).
-      const rootCarrierDir = path.join(workDir, '.claude');
-      const rootCarrier = path.join(rootCarrierDir, 'settings.json');
-      const scaffoldedSettings = fs.readFileSync(path.join(agentCwd, '.claude', 'settings.json'), 'utf-8');
-      const withUnknownEvent = (() => {
-        const parsed = JSON.parse(scaffoldedSettings);
+      // Prove grok skips an UNKNOWN Claude event without rejecting the file, now
+      // exercised at the REAL worker-cwd carrier (plan §5 item 3): inject a bogus
+      // event, re-inspect from the cwd, confirm the four known events still load
+      // and the bogus one does not, then restore the pristine managed carrier.
+      const cwdCarrier = path.join(agentCwd, '.claude', 'settings.json');
+      const pristineCarrier = fs.readFileSync(cwdCarrier, 'utf-8');
+      let unknownSkipped = false;
+      try {
+        const parsed = JSON.parse(pristineCarrier);
         parsed.hooks = parsed.hooks || {};
         parsed.hooks.ZzzTotallyUnknownEvent = [{ hooks: [{ type: 'command', command: 'echo nope' }] }];
-        return JSON.stringify(parsed, null, 2);
-      })();
-      let controlLoadsAll = false;
-      let controlGuard = null;
-      let controlUnknownSkipped = false;
-      try {
-        fs.mkdirSync(rootCarrierDir, { recursive: true });
-        fs.writeFileSync(rootCarrier, withUnknownEvent);
-        const rc = runGrok(['inspect', '--json'], agentCwd);
-        const rout = `${rc.stdout || ''}`.trim();
-        if (rc.status === 0 && rout.startsWith('{')) {
-          const cj = JSON.parse(rout);
-          const ce = enabledClaudeEvents(cj);
-          controlLoadsAll = requiredEvents.every((e) => ce.has(e));
-          controlGuard = (cj.hooks || []).find((h) => h.vendor === 'claude' && h.event === 'pre_tool_use');
-          // The bogus event must NOT surface as a loaded hook, yet the known ones do.
-          const events = (cj.hooks || []).filter((h) => h.vendor === 'claude').map((h) => `${h.event}`.toLowerCase());
-          controlUnknownSkipped = !events.some((e) => e.includes('zzz') || e.includes('unknown'));
+        fs.writeFileSync(cwdCarrier, JSON.stringify(parsed, null, 2));
+        const uc = runGrok(['inspect', '--json'], agentCwd);
+        const uout = `${uc.stdout || ''}`.trim();
+        if (uc.status === 0 && uout.startsWith('{')) {
+          const uj = JSON.parse(uout);
+          const ue = enabledClaudeEvents(uj);
+          const stillAll = requiredEvents.every((e) => ue.has(e));
+          const events = (uj.hooks || []).filter((h) => h.vendor === 'claude').map((h) => `${h.event}`.toLowerCase());
+          unknownSkipped = stillAll && !events.some((e) => e.includes('zzz') || e.includes('unknown'));
         }
       } finally {
-        try { fs.rmSync(rootCarrierDir, { recursive: true, force: true }); } catch { /* best effort */ }
+        fs.writeFileSync(cwdCarrier, pristineCarrier);  // restore the managed carrier
       }
 
-      // If the worker-cwd carrier IS read (grok changed its model, or the cwd is
-      // itself a project root), validate Bash matcher + unknown-skip from the cwd
-      // inspect itself; otherwise report the placement bug with the projectRoot
-      // control result.
-      const cwdGuard = (inspected.hooks || []).find((h) => h.vendor === 'claude' && h.event === 'pre_tool_use');
-      if (cwdLoadsAll && cwdGuard && cwdGuard.matcher === 'Bash') {
-        pass(3.1, 'four claude-compat hooks load from the worker-cwd carrier (Bash matcher)',
-          `hooks=[${[...cwdEvents].join(',')}]`);
+      if (cwdLoadsAll && cwdGuard && cwdGuard.matcher === 'Bash' && projectRootIsCwd && unknownSkipped) {
+        pass(3.1, 'four claude-compat hooks load from the worker-cwd carrier (Commit 6 git-init fix)',
+          `projectRoot==cwd; hooks=[${[...cwdEvents].join(',')}]; guard matcher=Bash; unknown event skipped`);
       } else {
         fail(3.1, 'four claude-compat hooks load from the worker-cwd carrier',
-          `PRODUCT BUG: grok did NOT load the scaffolded carrier at <cwd>/.claude/settings.json `
-          + `(worker cwd=${agentCwd} is a subdir of git root=${inspected.projectRoot}). `
-          + `grok reads project hooks at <projectRoot>/.claude only. `
-          + `CONTROL (identical settings.json placed at the projectRoot): loadsAllFour=${controlLoadsAll}, `
-          + `guardMatcher=${controlGuard && controlGuard.matcher}, unknownEventSkipped=${controlUnknownSkipped} `
-          + `→ confirms a carrier-PLACEMENT bug, not a trust/format/version issue.`);
+          `Commit 6 expects the worker cwd to be its own projectRoot so the carrier loads. `
+          + `loadsAllFour=${cwdLoadsAll} guardMatcher=${cwdGuard && cwdGuard.matcher} `
+          + `projectRootIsWorkerCwd=${projectRootIsCwd} (projectRoot=${inspected.projectRoot}, cwd=${agentCwd}) `
+          + `unknownEventSkipped=${unknownSkipped}. If projectRootIsWorkerCwd=false, the worker cwd's `
+          + `\`.git\` was not created (git unavailable?) → grok fell back to the outer root and never `
+          + `loaded the carrier.`);
       }
 
       // ── item 6: compat.claude.hooks = false → lane must read NOT healthy. ──
-      // Exercised at the projectRoot control location (the ONLY place grok
-      // actually loads the compat carrier — see 3.1), so the health signal is
-      // tested against real loaded hooks rather than a carrier grok ignores.
+      // Now exercised at the REAL worker-cwd carrier (Commit 6 makes grok load it
+      // there), so the health signal is tested against the actually-loaded hooks.
       if (versionOk) {
         const cfgPath = path.join(grokHome, 'config.toml');
         try {
-          fs.mkdirSync(rootCarrierDir, { recursive: true });
-          fs.writeFileSync(rootCarrier, scaffoldedSettings);
-          // First confirm the control carrier loads ENABLED with no config…
+          // First confirm the worker-cwd carrier loads ENABLED with no config…
           const before = runGrok(['inspect', '--json'], agentCwd);
           const bj = before.status === 0 && `${before.stdout}`.trim().startsWith('{') ? JSON.parse(`${before.stdout}`.trim()) : null;
           const enabledBefore = bj ? (bj.hooks || []).some((h) => h.vendor === 'claude' && h.compatibilityStatus === 'enabled') : false;
@@ -357,7 +348,6 @@ try {
           }
         } finally {
           try { fs.rmSync(cfgPath, { force: true }); } catch { /* best effort */ }
-          try { fs.rmSync(rootCarrierDir, { recursive: true, force: true }); } catch { /* best effort */ }
         }
       } else {
         skip(6, 'compat.claude.hooks=false → lane reported NOT healthy', 'version check did not pass');

@@ -540,6 +540,97 @@ test('Grok: NO .grok/hooks carrier and NO remember skill in the minimum scope', 
   }
 });
 
+// ── Grok worker cwd is git-init'd (Commit 6 — inert-carrier fix) ─────
+//
+// grok resolves its projectRoot to the NEAREST `.git` ancestor of the cwd and
+// only loads `<projectRoot>/.claude/settings.json`. The carrier lives at the
+// worker cwd (a subdir), so unless the worker cwd is its own git repo the
+// carrier is never read and the status hooks + git-discard guard go inert.
+// ensureWorkerScaffold therefore `git init`s the worker cwd. These tests drive
+// the REAL git binary (present in the build env); the git-unavailable case is
+// forced by clearing PATH so `git` cannot resolve.
+
+test('Grok: fresh scaffold git-inits the worker cwd (.lares/workers/grok/.git exists)', () => {
+  const workDir = mktmp('grok-gitinit');
+  const { supervisor, cleanup } = makeSupervisor();
+  try {
+    supervisor.ensureWorkerScaffold(workDir, 'grok', 'windows');
+    const gitDir = path.join(workDir, '.lares', 'workers', 'grok', '.git');
+    assert.ok(
+      fs.existsSync(gitDir),
+      `expected the worker cwd to be its own git repo at ${gitDir} (grok projectRoot = nearest .git)`,
+    );
+  } finally {
+    cleanup();
+    rmrf(workDir);
+  }
+});
+
+test('Grok: re-scaffold does NOT re-init the worker cwd repo (idempotent, no churn)', () => {
+  const workDir = mktmp('grok-gitinit-noop');
+  const { supervisor, cleanup } = makeSupervisor();
+  try {
+    supervisor.ensureWorkerScaffold(workDir, 'grok', 'windows');
+    const gitDir = path.join(workDir, '.lares', 'workers', 'grok', '.git');
+    assert.ok(fs.existsSync(gitDir), 'first scaffold must create the .git dir');
+
+    // Drop a sentinel INSIDE .git; a re-init would wipe/recreate the repo and the
+    // sentinel would vanish. Its survival proves the existing-repo short-circuit.
+    const sentinel = path.join(gitDir, 'COMMIT6_SENTINEL');
+    fs.writeFileSync(sentinel, 'do-not-reinit\n', 'utf-8');
+
+    supervisor.ensureWorkerScaffold(workDir, 'grok', 'windows');
+
+    assert.ok(
+      fs.existsSync(sentinel),
+      're-scaffold must short-circuit on an existing .git (no re-init) — sentinel inside .git must survive',
+    );
+    assert.equal(fs.readFileSync(sentinel, 'utf-8'), 'do-not-reinit\n', 'sentinel content must be untouched');
+  } finally {
+    cleanup();
+    rmrf(workDir);
+  }
+});
+
+test('Grok: git unavailable → scaffold degrades with a warning, does not throw', () => {
+  const workDir = mktmp('grok-gitinit-nogit');
+  const { supervisor, cleanup } = makeSupervisor();
+  const origPath = process.env.PATH;
+  const origWarn = console.warn;
+  const warnings: string[] = [];
+  console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(' ')); };
+  try {
+    // Make `git` unresolvable: with an empty PATH, execFileSync('git', …) throws
+    // ENOENT rather than spawning — exactly the git-unavailable production case.
+    process.env.PATH = '';
+    // The scaffold's own file writes (fs.*) do not need PATH, so only the git
+    // init is affected. It must NOT throw out of ensureWorkerScaffold.
+    assert.doesNotThrow(
+      () => supervisor.ensureWorkerScaffold(workDir, 'grok', 'windows'),
+      'a missing git must not block the grok scaffold/launch',
+    );
+
+    // The carrier + identity are still delivered (git-init is best-effort, not a gate).
+    assert.ok(
+      fs.existsSync(path.join(workDir, '.lares', 'workers', 'grok', '.claude', 'settings.json')),
+      'the compat carrier must still be written even when git init fails',
+    );
+    // No repo was created…
+    assert.ok(
+      !fs.existsSync(path.join(workDir, '.lares', 'workers', 'grok', '.git')),
+      'no .git should exist when git is unavailable',
+    );
+    // …and the degradation was announced with its consequence named.
+    const warned = warnings.some((w) => /grok worker/.test(w) && /hooks\/guard will not load/.test(w));
+    assert.ok(warned, `expected a focused git-init warning naming the consequence; got: ${JSON.stringify(warnings)}`);
+  } finally {
+    process.env.PATH = origPath;
+    console.warn = origWarn;
+    cleanup();
+    rmrf(workDir);
+  }
+});
+
 // ── Grok identity derivation parity (anti-drift, plan §2.1) ──────────
 //
 // WORKER_GROK_AGENTS_MD is DERIVED from WORKER_CLAUDE_MD via the same
