@@ -38,6 +38,7 @@ import {
 } from './capture-health';
 import {
   evaluateCheckpointProtection,
+  type CommitPathLinkReader,
   type ProtectionCheckpointEdge,
   type RunProtectionGitBytes,
 } from './protection-read';
@@ -71,6 +72,7 @@ export interface CandidateServiceDeps {
   /** Immutable turn-row attribution. Null/omitted preserves Stage ① behavior. */
   stampSource?: WitnessStampSource | null;
   readCaptureTurns: CaptureTurnReader;
+  readCommitPathLinks?: CommitPathLinkReader;
   platform?: NodeJS.Platform;
   realpath?(path: string): string;
   fileExists?(path: string): boolean;
@@ -289,6 +291,8 @@ export class CommitCandidateService {
         repoRoot: target.capability.repoRoot,
         members: assembly.inventory.entries,
         checkpointEdges: checkpointEdges(allTurns),
+        repositoryKey: repository.repositoryKey,
+        readCommitPathLinks: this.deps.readCommitPathLinks,
         runGit: this.deps.runGit,
         runGitBytes: this.deps.runGitBytes as RunProtectionGitBytes,
         gitExe,

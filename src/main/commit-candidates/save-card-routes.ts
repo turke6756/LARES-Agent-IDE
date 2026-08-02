@@ -26,6 +26,7 @@ import {
   getTurnRecord as dbGetTurnRecord,
   getWorkspaces as dbGetWorkspaces,
   getTurnWitnessReads as dbGetTurnWitnessReads,
+  listCommitPathLinks as dbListCommitPathLinks,
   listTurnRecords as dbListTurnRecords,
   type TurnRecord,
   type TurnWitnessRead,
@@ -39,6 +40,7 @@ import {
 } from './candidate-service';
 import type { RunGitBytesLike, RunGitTextLike } from './dirty-inventory';
 import type { TurnWitnessReader } from './witness-projection';
+import type { CommitPathLinkReader } from './protection-read';
 import { createTurnStampSource, type TurnStampRecordReader } from './stamp-projection';
 import type { SaveCardRoutes } from './save-card-ipc';
 import type { WorkBundle } from './work-bundle';
@@ -55,6 +57,7 @@ export interface SaveCardRoutesDeps {
   readTurnWitnesses?: TurnWitnessReader;
   readTurnRecord?: TurnStampRecordReader;
   readCaptureTurns?: CaptureTurnReader;
+  readCommitPathLinks?: CommitPathLinkReader;
   getAgentsByWorkspace?: (workspaceId: string) => readonly Agent[];
   getAgent?: (agentId: string) => Agent | null;
   readBundleTurns?: (workspaceId: string) => readonly BundleTurn[];
@@ -230,6 +233,7 @@ export function createSaveCardRoutes(deps: SaveCardRoutesDeps): SaveCardRoutes {
   const readCaptureTurns: CaptureTurnReader =
     deps.readCaptureTurns ??
     ((workspaceId) => dbListTurnRecords(workspaceId, { limit: Number.MAX_SAFE_INTEGER }));
+  const readCommitPathLinks = deps.readCommitPathLinks ?? dbListCommitPathLinks;
   const runGit = deps.runGit ?? realRunGit;
   const runGitBytes = deps.runGitBytes ?? realRunGitBytes;
   const realpath = deps.realpath ?? ((p) => fs.realpathSync.native(p));
@@ -244,6 +248,7 @@ export function createSaveCardRoutes(deps: SaveCardRoutesDeps): SaveCardRoutes {
     readTurnWitnesses,
     stampSource: createTurnStampSource(readTurnRecord),
     readCaptureTurns,
+    readCommitPathLinks,
   });
 
   async function getInventory(

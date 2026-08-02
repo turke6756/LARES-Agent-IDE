@@ -20,11 +20,17 @@ import {
   verifyLiveEdgesBatch,
   type LiveEdgeRunGit,
 } from '../git-checkpoints/live-edge';
+import type { CommitPathLink } from '../database';
+import {
+  readCurrentCommitRepresentation,
+  type CommitRepresentation,
+  type ReadCurrentCommitRepresentationOptions,
+} from './commit-representation';
 
 export type ProtectionMember = Pick<
   DirtyEntry,
   'entryId' | 'path' | 'expectedWorktreeState' | 'rawWorktreeBlobOid' | 'worktreeMode'
->;
+> & Partial<Pick<DirtyEntry, 'commitPathspecs'>>;
 
 export interface ProtectionCheckpointEdge {
   ref: string | null;
@@ -71,8 +77,23 @@ export interface EvaluateCheckpointProtectionOptions {
   runGit: LiveEdgeRunGit;
   runGitBytes: RunProtectionGitBytes;
   readCheckpointTree?: CheckpointTreeReader;
+  repositoryKey?: string;
+  readCommitPathLinks?: CommitPathLinkReader;
+  /** undefined resolves HEAD live; null explicitly models an unborn repository. */
+  pinnedHeadOid?: string | null;
+  readCurrentRepresentation?: CurrentRepresentationReader;
+  remoteRefPatterns?: readonly string[];
   gitExe?: string;
 }
+
+export type CommitPathLinkReader = (
+  repositoryKey: string,
+  pathBytesBase64: readonly string[],
+) => readonly CommitPathLink[] | Promise<readonly CommitPathLink[]>;
+
+export type CurrentRepresentationReader = (
+  options: ReadCurrentCommitRepresentationOptions,
+) => Promise<CommitRepresentation>;
 
 export interface MemberProtectionResult {
   entryId: string;
@@ -220,6 +241,131 @@ export function weakestProtectionRung(
   return rungs.reduce((weakest, rung) =>
     PROTECTION_RUNG_ORDER[rung] < PROTECTION_RUNG_ORDER[weakest] ? rung : weakest,
   );
+}
+
+const OID_RE = /^[0-9a-f]{40,64}$/;
+
+/**
+ * Resolve which candidate commits are currently reachable from configured
+ * remote-tracking refs. The shape is fixed at two Git processes regardless of
+ * candidate count: one ref enumeration and one rev-list traversal.
+ */
+export async function readRemoteReachableCommitOids(options: {
+  repoRoot: string;
+  candidateOids: readonly string[];
+  runGit: LiveEdgeRunGit;
+  gitExe?: string;
+  remoteRefPatterns?: readonly string[];
+}): Promise<Set<string>> {
+  const candidates = new Set(options.candidateOids.filter((oid) => OID_RE.test(oid)));
+  if (candidates.size === 0) return new Set();
+  const patterns = options.remoteRefPatterns ?? ['refs/remotes'];
+  if (patterns.length === 0) return new Set();
+  const refs = await options.runGit(
+    options.repoRoot,
+    ['for-each-ref', '--format=%(refname)', ...patterns],
+    { gitExe: options.gitExe, allowNonzero: true, timeoutMs: GIT_TIMEOUT_MS, maxBytes: 16 << 20 },
+  );
+  if (refs.code !== 0) return new Set();
+  const refNames = [...new Set(refs.stdout.split(/\r?\n/).filter((ref) => ref.startsWith('refs/')))];
+  if (refNames.length === 0) return new Set();
+  const reachable = await options.runGit(
+    options.repoRoot,
+    ['rev-list', '--stdin'],
+    {
+      gitExe: options.gitExe,
+      allowNonzero: true,
+      timeoutMs: GIT_TIMEOUT_MS,
+      maxBytes: CAT_FILE_MAX_BYTES,
+      stdin: `${refNames.join('\n')}\n`,
+    },
+  );
+  if (reachable.code !== 0) return new Set();
+  const result = new Set<string>();
+  for (const oid of reachable.stdout.split(/\r?\n/)) {
+    if (candidates.has(oid)) result.add(oid);
+  }
+  return result;
+}
+
+async function resolvePinnedHead(options: EvaluateCheckpointProtectionOptions): Promise<string | null> {
+  if (options.pinnedHeadOid !== undefined) return options.pinnedHeadOid;
+  const result = await options.runGit(
+    options.repoRoot,
+    ['rev-parse', '--verify', 'HEAD'],
+    { gitExe: options.gitExe, allowNonzero: true, timeoutMs: GIT_TIMEOUT_MS, maxBytes: 4096 },
+  );
+  const oid = result.stdout.trim();
+  return result.code === 0 && OID_RE.test(oid) ? oid : null;
+}
+
+function commitEntryMatches(
+  representation: CommitRepresentation,
+  link: CommitPathLink,
+): boolean {
+  return link.expectedState === representation.expectedState
+    && link.commitBlobOid === representation.commitBlobOid
+    && link.commitMode === representation.commitMode;
+}
+
+/** Exact ledger proof. raw_blob_oid_at_commit is intentionally not consulted. */
+async function evaluateCommitLedgerProtection(
+  options: EvaluateCheckpointProtectionOptions,
+): Promise<Map<string, ProtectionRung>> {
+  const result = new Map<string, ProtectionRung>();
+  if (!options.repositoryKey || !options.readCommitPathLinks) return result;
+  const links = await options.readCommitPathLinks(
+    options.repositoryKey,
+    options.members.map((member) => member.path.pathBytesBase64),
+  );
+  if (links.length === 0) return result;
+  const linksByPath = new Map<string, CommitPathLink[]>();
+  for (const link of links) {
+    if (link.repositoryKey !== options.repositoryKey || !OID_RE.test(link.commitOid)) continue;
+    const atPath = linksByPath.get(link.pathBytesBase64) ?? [];
+    atPath.push(link);
+    linksByPath.set(link.pathBytesBase64, atPath);
+  }
+  if (linksByPath.size === 0) return result;
+
+  const pinnedHeadOid = await resolvePinnedHead(options).catch(() => null);
+  const representationReader = options.readCurrentRepresentation ?? readCurrentCommitRepresentation;
+  const matchingCommitOidsByEntry = new Map<string, string[]>();
+  for (const member of options.members) {
+    const atPath = linksByPath.get(member.path.pathBytesBase64);
+    if (!atPath || !member.commitPathspecs || member.commitPathspecs.length === 0) continue;
+    const representation = await representationReader({
+      repoRoot: options.repoRoot,
+      pinnedHeadOid,
+      entry: {
+        path: member.path,
+        commitPathspecs: member.commitPathspecs,
+        expectedWorktreeState: member.expectedWorktreeState,
+        rawWorktreeBlobOid: member.rawWorktreeBlobOid,
+      },
+      gitExe: options.gitExe,
+      runGit: options.runGit,
+      runGitBytes: options.runGitBytes,
+    }).catch(() => null);
+    if (!representation) continue;
+    const matching = atPath.filter((link) => commitEntryMatches(representation, link));
+    if (matching.length === 0) continue;
+    result.set(member.entryId, 'locally-committed');
+    matchingCommitOidsByEntry.set(member.entryId, matching.map((link) => link.commitOid));
+  }
+
+  const candidateOids = [...new Set([...matchingCommitOidsByEntry.values()].flat())];
+  const remote = await readRemoteReachableCommitOids({
+    repoRoot: options.repoRoot,
+    candidateOids,
+    runGit: options.runGit,
+    gitExe: options.gitExe,
+    remoteRefPatterns: options.remoteRefPatterns,
+  }).catch(() => new Set<string>());
+  for (const [entryId, commitOids] of matchingCommitOidsByEntry) {
+    if (commitOids.some((oid) => remote.has(oid))) result.set(entryId, 'remote-reachable');
+  }
+  return result;
 }
 
 /** One `cat-file --batch-check` record, classified. `present` carries the blob OID
@@ -460,9 +606,15 @@ export async function evaluateCheckpointProtection(
     }
   }
 
+  // Ledger/database and temporary-index failures degrade to checkpoint evidence;
+  // they never erase a proven live checkpoint rung or invent local protection.
+  const ledgerProtection = await evaluateCommitLedgerProtection(options).catch(
+    () => new Map<string, ProtectionRung>(),
+  );
   const members: MemberProtectionResult[] = options.members.map((member) => ({
     entryId: member.entryId,
-    protection: protectedIds.has(member.entryId) ? 'checkpoint-protected' : 'unprotected',
+    protection: ledgerProtection.get(member.entryId)
+      ?? (protectedIds.has(member.entryId) ? 'checkpoint-protected' : 'unprotected'),
   }));
 
   return {

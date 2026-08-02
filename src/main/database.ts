@@ -1558,6 +1558,49 @@ function initContextOptimizerSchema(): void {
     BEGIN SELECT RAISE(ABORT, 'turn plan stamp is immutable'); END;
   `);
 
+  // Save-card SC-WP-2G — durable commit-protection ledger. This DDL is the
+  // byte-for-byte column contract from the shared bundle specification. The
+  // cached pushed count is deliberately only a reconciliation hint; protection
+  // reads prove remote reachability from live remote-tracking refs.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS commit_records (
+      repository_key TEXT NOT NULL,
+      commit_oid TEXT NOT NULL,
+      parent_oid TEXT,
+      observed_at INTEGER NOT NULL,
+      source TEXT NOT NULL,
+      pushed_remote_count INTEGER NOT NULL DEFAULT 0,
+      last_reconciled_at INTEGER,
+      PRIMARY KEY (repository_key, commit_oid),
+      CHECK (source IN ('lares','external')),
+      CHECK (pushed_remote_count >= 0)
+    );
+    CREATE TABLE IF NOT EXISTS commit_turn_links (
+      repository_key TEXT NOT NULL,
+      commit_oid TEXT NOT NULL,
+      turn_id TEXT NOT NULL,
+      plan_id TEXT, plan_item_id TEXT,
+      relation TEXT NOT NULL,
+      capture_quality TEXT,
+      PRIMARY KEY (repository_key, commit_oid, turn_id),
+      CHECK (relation IN ('candidate_member','exact_path_match','metadata_only'))
+    );
+    CREATE TABLE IF NOT EXISTS commit_path_links (
+      repository_key TEXT NOT NULL,
+      commit_oid TEXT NOT NULL,
+      path_bytes_base64 TEXT NOT NULL,
+      expected_state TEXT NOT NULL,
+      raw_blob_oid_at_commit TEXT,
+      commit_blob_oid TEXT,
+      commit_mode TEXT,
+      contributing_turn_ids TEXT,
+      overlap_count INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (repository_key, commit_oid, path_bytes_base64),
+      CHECK (expected_state IN ('present','absent')),
+      CHECK (overlap_count >= 0)
+    );
+  `);
+
   // WP-2B (Priority 0) — one-time, resumable workspace-lineage backfill. Populates
   // stream_lane_stats.workspace_id/workspace_root by folding each stream's launch cwd
   // to a root owned by EXACTLY one workspace. Idempotent (only NULL rows, ON a unique
@@ -4437,6 +4480,194 @@ const TURN_PLAN_STAMP_SOURCES: ReadonlySet<string> = new Set<TurnPlanStampSource
   'explicit-none',
   'unbound-manual',
 ]);
+
+// ── Save-card commit-protection ledger (SC-WP-2G) ───────────────────────────
+
+export type CommitRecordSource = 'lares' | 'external';
+export type CommitTurnRelation = 'candidate_member' | 'exact_path_match' | 'metadata_only';
+export type CommitExpectedState = 'present' | 'absent';
+
+export interface CommitRecord {
+  repositoryKey: string;
+  commitOid: string;
+  parentOid: string | null;
+  observedAt: number;
+  source: CommitRecordSource;
+  pushedRemoteCount: number;
+  lastReconciledAt: number | null;
+}
+
+export interface CommitTurnLink {
+  repositoryKey: string;
+  commitOid: string;
+  turnId: string;
+  planId: string | null;
+  planItemId: string | null;
+  relation: CommitTurnRelation;
+  captureQuality: string | null;
+}
+
+export interface CommitPathLink {
+  repositoryKey: string;
+  commitOid: string;
+  pathBytesBase64: string;
+  expectedState: CommitExpectedState;
+  rawBlobOidAtCommit: string | null;
+  commitBlobOid: string | null;
+  commitMode: string | null;
+  contributingTurnIds: string[];
+  overlapCount: number;
+}
+
+export interface CommitLedgerWrite {
+  record: CommitRecord;
+  turnLinks?: readonly CommitTurnLink[];
+  pathLinks?: readonly CommitPathLink[];
+}
+
+function rowToCommitRecord(row: any): CommitRecord {
+  return {
+    repositoryKey: row.repository_key,
+    commitOid: row.commit_oid,
+    parentOid: row.parent_oid ?? null,
+    observedAt: row.observed_at,
+    source: row.source,
+    pushedRemoteCount: row.pushed_remote_count,
+    lastReconciledAt: row.last_reconciled_at ?? null,
+  };
+}
+
+function rowToCommitTurnLink(row: any): CommitTurnLink {
+  return {
+    repositoryKey: row.repository_key,
+    commitOid: row.commit_oid,
+    turnId: row.turn_id,
+    planId: row.plan_id ?? null,
+    planItemId: row.plan_item_id ?? null,
+    relation: row.relation,
+    captureQuality: row.capture_quality ?? null,
+  };
+}
+
+function rowToCommitPathLink(row: any): CommitPathLink {
+  let contributingTurnIds: string[] = [];
+  try {
+    const parsed = JSON.parse(row.contributing_turn_ids ?? '[]');
+    if (Array.isArray(parsed) && parsed.every((value) => typeof value === 'string')) {
+      contributingTurnIds = parsed;
+    }
+  } catch { /* corrupt optional provenance degrades to no contributing turns */ }
+  return {
+    repositoryKey: row.repository_key,
+    commitOid: row.commit_oid,
+    pathBytesBase64: row.path_bytes_base64,
+    expectedState: row.expected_state,
+    rawBlobOidAtCommit: row.raw_blob_oid_at_commit ?? null,
+    commitBlobOid: row.commit_blob_oid ?? null,
+    commitMode: row.commit_mode ?? null,
+    contributingTurnIds,
+    overlapCount: row.overlap_count,
+  };
+}
+
+export function upsertCommitRecord(record: CommitRecord): void {
+  run(
+    `INSERT INTO commit_records (
+       repository_key, commit_oid, parent_oid, observed_at, source,
+       pushed_remote_count, last_reconciled_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(repository_key, commit_oid) DO UPDATE SET
+       parent_oid = excluded.parent_oid,
+       observed_at = MIN(commit_records.observed_at, excluded.observed_at),
+       source = CASE WHEN excluded.source = 'lares' THEN 'lares' ELSE commit_records.source END,
+       pushed_remote_count = excluded.pushed_remote_count,
+       last_reconciled_at = excluded.last_reconciled_at`,
+    [record.repositoryKey, record.commitOid, record.parentOid, record.observedAt,
+      record.source, record.pushedRemoteCount, record.lastReconciledAt],
+  );
+}
+
+export function getCommitRecord(repositoryKey: string, commitOid: string): CommitRecord | null {
+  const row = queryOne(
+    `SELECT * FROM commit_records WHERE repository_key = ? AND commit_oid = ?`,
+    [repositoryKey, commitOid],
+  );
+  return row ? rowToCommitRecord(row) : null;
+}
+
+export function listCommitRecords(repositoryKey: string): CommitRecord[] {
+  return queryAll(
+    `SELECT * FROM commit_records WHERE repository_key = ? ORDER BY observed_at, commit_oid`,
+    [repositoryKey],
+  ).map(rowToCommitRecord);
+}
+
+export function upsertCommitTurnLink(link: CommitTurnLink): void {
+  run(
+    `INSERT INTO commit_turn_links (
+       repository_key, commit_oid, turn_id, plan_id, plan_item_id, relation, capture_quality
+     ) VALUES (?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(repository_key, commit_oid, turn_id) DO UPDATE SET
+       plan_id = excluded.plan_id, plan_item_id = excluded.plan_item_id,
+       relation = excluded.relation, capture_quality = excluded.capture_quality`,
+    [link.repositoryKey, link.commitOid, link.turnId, link.planId, link.planItemId,
+      link.relation, link.captureQuality],
+  );
+}
+
+export function listCommitTurnLinks(repositoryKey: string, commitOid: string): CommitTurnLink[] {
+  return queryAll(
+    `SELECT * FROM commit_turn_links
+     WHERE repository_key = ? AND commit_oid = ? ORDER BY turn_id`,
+    [repositoryKey, commitOid],
+  ).map(rowToCommitTurnLink);
+}
+
+export function upsertCommitPathLink(link: CommitPathLink): void {
+  run(
+    `INSERT INTO commit_path_links (
+       repository_key, commit_oid, path_bytes_base64, expected_state,
+       raw_blob_oid_at_commit, commit_blob_oid, commit_mode,
+       contributing_turn_ids, overlap_count
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(repository_key, commit_oid, path_bytes_base64) DO UPDATE SET
+       expected_state = excluded.expected_state,
+       raw_blob_oid_at_commit = excluded.raw_blob_oid_at_commit,
+       commit_blob_oid = excluded.commit_blob_oid,
+       commit_mode = excluded.commit_mode,
+       contributing_turn_ids = excluded.contributing_turn_ids,
+       overlap_count = excluded.overlap_count`,
+    [link.repositoryKey, link.commitOid, link.pathBytesBase64, link.expectedState,
+      link.rawBlobOidAtCommit, link.commitBlobOid, link.commitMode,
+      JSON.stringify(link.contributingTurnIds), link.overlapCount],
+  );
+}
+
+/** One batched lookup for protection reads; an empty path set never emits SQL. */
+export function listCommitPathLinks(
+  repositoryKey: string,
+  pathBytesBase64?: readonly string[],
+): CommitPathLink[] {
+  if (pathBytesBase64 && pathBytesBase64.length === 0) return [];
+  const uniquePaths = pathBytesBase64 ? [...new Set(pathBytesBase64)] : null;
+  const pathClause = uniquePaths
+    ? ` AND path_bytes_base64 IN (${uniquePaths.map(() => '?').join(',')})`
+    : '';
+  return queryAll(
+    `SELECT * FROM commit_path_links WHERE repository_key = ?${pathClause}
+     ORDER BY commit_oid, path_bytes_base64`,
+    [repositoryKey, ...(uniquePaths ?? [])],
+  ).map(rowToCommitPathLink);
+}
+
+/** Persist a commit and all of its exact evidence atomically. Replays are safe. */
+export function recordCommitLedger(write: CommitLedgerWrite): void {
+  db.transaction(() => {
+    upsertCommitRecord(write.record);
+    for (const link of write.turnLinks ?? []) upsertCommitTurnLink(link);
+    for (const link of write.pathLinks ?? []) upsertCommitPathLink(link);
+  })();
+}
 
 export interface TurnWitnessEntry {
   path: string;

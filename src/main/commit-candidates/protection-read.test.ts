@@ -55,6 +55,7 @@ function member(
   return {
     entryId,
     path: encodedPath(filePath),
+    commitPathspecs: [encodedPath(filePath)],
     expectedWorktreeState: state,
     rawWorktreeBlobOid: blob,
     worktreeMode: mode,
@@ -173,6 +174,72 @@ test('Stage 1 evaluator never emits locally-committed or remote-reachable', asyn
   assert.deepEqual([...emitted].sort(), ['checkpoint-protected', 'unprotected']);
   assert.equal(emitted.has('locally-committed' as ProtectionRung), false);
   assert.equal(emitted.has('remote-reachable' as ProtectionRung), false);
+});
+
+test('raw match alone is insufficient; frozen clean-filtered entry is required', async () => {
+  const exact = member('filtered', 'protected.txt', 'present', matchingBlobOid, '100644');
+  const result = await evaluateCheckpointProtection({
+    repoRoot: repo,
+    members: [exact],
+    checkpointEdges: [],
+    repositoryKey: 'repo',
+    readCommitPathLinks: () => [{
+      repositoryKey: 'repo', commitOid: checkpointOid,
+      pathBytesBase64: exact.path.pathBytesBase64,
+      expectedState: 'present',
+      rawBlobOidAtCommit: matchingBlobOid,
+      commitBlobOid: 'e'.repeat(40),
+      commitMode: '100644', contributingTurnIds: ['turn'], overlapCount: 1,
+    }],
+    readCurrentRepresentation: async () => ({
+      expectedState: 'present', rawBlobOid: matchingBlobOid,
+      commitBlobOid: 'f'.repeat(40), commitMode: '100644',
+    }),
+    runGit, runGitBytes, gitExe,
+  });
+  assert.equal(result.members[0].protection, 'unprotected');
+});
+
+test('exact frozen commit entry reaches locally-committed', async () => {
+  const exact = member('local', 'protected.txt', 'present', matchingBlobOid, '100644');
+  const result = await evaluateCheckpointProtection({
+    repoRoot: repo,
+    members: [exact], checkpointEdges: [], repositoryKey: 'repo',
+    readCommitPathLinks: () => [{
+      repositoryKey: 'repo', commitOid: checkpointOid,
+      pathBytesBase64: exact.path.pathBytesBase64, expectedState: 'present',
+      rawBlobOidAtCommit: '0'.repeat(40), // deliberately different: raw is not authority
+      commitBlobOid: matchingBlobOid, commitMode: '100644',
+      contributingTurnIds: ['turn'], overlapCount: 1,
+    }],
+    readCurrentRepresentation: async () => ({
+      expectedState: 'present', rawBlobOid: matchingBlobOid,
+      commitBlobOid: matchingBlobOid, commitMode: '100644',
+    }),
+    runGit, runGitBytes, gitExe,
+  });
+  assert.equal(result.members[0].protection, 'locally-committed');
+});
+
+test('remote rung is decided from live remote refs, not a cached database hint', async () => {
+  git(['update-ref', 'refs/remotes/origin/main', checkpointOid]);
+  const exact = member('remote', 'protected.txt', 'present', matchingBlobOid, '100644');
+  const result = await evaluateCheckpointProtection({
+    repoRoot: repo,
+    members: [exact], checkpointEdges: [], repositoryKey: 'repo',
+    readCommitPathLinks: () => [{
+      repositoryKey: 'repo', commitOid: checkpointOid,
+      pathBytesBase64: exact.path.pathBytesBase64, expectedState: 'present',
+      rawBlobOidAtCommit: null, commitBlobOid: matchingBlobOid, commitMode: '100644',
+      contributingTurnIds: [], overlapCount: 0,
+    }],
+    readCurrentRepresentation: async () => ({
+      expectedState: 'present', rawBlobOid: matchingBlobOid,
+      commitBlobOid: matchingBlobOid, commitMode: '100644',
+    }),
+    runGit, runGitBytes, gitExe,
+  });
+  assert.equal(result.members[0].protection, 'remote-reachable');
 });
 
 test('bundle weakest rung is the minimum by PROTECTION_RUNG_ORDER', () => {

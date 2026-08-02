@@ -100,6 +100,10 @@ type DbModule = {
   allocateAndInsertTurn(workspaceId: string, fields?: Record<string, unknown>): TurnRecord;
   getTurnRecord(id: string): TurnRecord | null;
   updateTurnRecord(id: string, updates: Record<string, unknown>): TurnRecord | null;
+  recordCommitLedger(write: Record<string, unknown>): void;
+  getCommitRecord(repositoryKey: string, commitOid: string): Record<string, unknown> | null;
+  listCommitTurnLinks(repositoryKey: string, commitOid: string): Record<string, unknown>[];
+  listCommitPathLinks(repositoryKey: string, paths?: readonly string[]): Record<string, unknown>[];
 };
 
 let dbm: DbModule;
@@ -128,6 +132,35 @@ test('schema creates workspace-leading indexes and the immutable trigger', () =>
     { type: 'index', name: 'idx_turn_records_ws_plan_seq' },
     { type: 'trigger', name: 'turn_records_plan_stamp_immutable' },
   ]);
+});
+
+test('commit protection ledger schema and CRUD round-trip exact evidence atomically', () => {
+  const commitOid = 'a'.repeat(40);
+  const encoded = Buffer.from('filtered.txt').toString('base64');
+  dbm.recordCommitLedger({
+    record: {
+      repositoryKey: 'repo-ledger', commitOid, parentOid: null, observedAt: 100,
+      source: 'lares', pushedRemoteCount: 1, lastReconciledAt: 110,
+    },
+    turnLinks: [{
+      repositoryKey: 'repo-ledger', commitOid, turnId: 'turn-ledger',
+      planId: 'plan-ledger', planItemId: null, relation: 'exact_path_match',
+      captureQuality: 'hook',
+    }],
+    pathLinks: [{
+      repositoryKey: 'repo-ledger', commitOid, pathBytesBase64: encoded,
+      expectedState: 'present', rawBlobOidAtCommit: 'b'.repeat(40),
+      commitBlobOid: 'c'.repeat(40), commitMode: '100644',
+      contributingTurnIds: ['turn-ledger'], overlapCount: 1,
+    }],
+  });
+  assert.deepEqual(dbm.getCommitRecord('repo-ledger', commitOid), {
+    repositoryKey: 'repo-ledger', commitOid, parentOid: null, observedAt: 100,
+    source: 'lares', pushedRemoteCount: 1, lastReconciledAt: 110,
+  });
+  assert.equal(dbm.listCommitTurnLinks('repo-ledger', commitOid)[0].relation, 'exact_path_match');
+  assert.deepEqual(dbm.listCommitPathLinks('repo-ledger', [encoded])[0].contributingTurnIds, ['turn-ledger']);
+  assert.deepEqual(dbm.listCommitPathLinks('repo-ledger', []), []);
 });
 
 test('mapper returns explicit stamps and allocations never write legacy-unstamped', () => {
