@@ -250,6 +250,10 @@ export interface RetentionPassResult {
   prunedTurns: number;
   deleteFailures: number;
   pinningWarning: RetentionPinWeakeningWarning | null;
+  /** The repository this pass accounted pins for (null when no identity was derived,
+   *  e.g. no live edges). Lets callers key `pinningWarning` per `repositoryKey` — the
+   *  Save-card `readQuotaWeakening(repositoryKey)` lookup (SC-WP-2L). */
+  repositoryKey: string | null;
 }
 
 /**
@@ -265,6 +269,7 @@ export async function runRetentionPass(deps: RetentionDeps): Promise<RetentionPa
   const result: RetentionPassResult = {
     outcomes: [], distilled: 0, prunedTurns: 0, deleteFailures: 0,
     pinningWarning: pinning.warning,
+    repositoryKey: pinning.repositoryKey,
   };
 
   for (const row of rows) {
@@ -340,6 +345,10 @@ interface PrunableLiveEdge {
 interface PreparedRetentionPins {
   retainedEdgeKeys: Set<string>;
   warning: RetentionPinWeakeningWarning | null;
+  /** The repository whose pins this pass accounted, once the dirty inventory (and
+   *  thus a repositoryKey) is known; null on the no-edge / enumeration-failure paths
+   *  where no identity could be derived. Lets the caller key the warning per repo. */
+  repositoryKey: string | null;
 }
 
 /**
@@ -366,7 +375,7 @@ async function prepareRetentionPins(
     }
     return result;
   });
-  if (possible.length === 0) return { retainedEdgeKeys: new Set(), warning: null };
+  if (possible.length === 0) return { retainedEdgeKeys: new Set(), warning: null, repositoryKey: null };
 
   const liveKeys = await verifyLiveEdgesBatch({
     repoRoot: cfg.repoRoot,
@@ -383,7 +392,7 @@ async function prepareRetentionPins(
     const oid = edge === 'before' ? row.beforeOid : row.afterOid;
     return ref !== null && oid !== null && liveKeys.has(liveEdgeKey(ref, oid));
   });
-  if (live.length === 0) return { retainedEdgeKeys: new Set(), warning: null };
+  if (live.length === 0) return { retainedEdgeKeys: new Set(), warning: null, repositoryKey: null };
 
   let inventory: { repositoryKey: string; entries: DirtyEntry[] };
   try {
@@ -404,6 +413,7 @@ async function prepareRetentionPins(
     return {
       retainedEdgeKeys: new Set(selection.retainedEdges.map((edge) => pinEdgeKey(edge.turnId, edge.edge))),
       warning: selection.warning,
+      repositoryKey: null,
     };
   }
 
@@ -433,7 +443,7 @@ async function prepareRetentionPins(
       if (entries.size === 0) return [];
       return [{ turnId: row.id, edge, normalPruneEligibleAt, dirtyEntries: [...entries.values()] }];
     });
-    if (candidates.length === 0) return { retainedEdgeKeys: new Set(), warning: null };
+    if (candidates.length === 0) return { retainedEdgeKeys: new Set(), warning: null, repositoryKey: inventory.repositoryKey };
 
     const activeBoundaryRefs = await cfg.activeBoundaryRefs();
     const selection = await accountAndSelectPins({
@@ -447,12 +457,14 @@ async function prepareRetentionPins(
     return {
       retainedEdgeKeys: new Set(selection.retainedEdges.map((edge) => pinEdgeKey(edge.turnId, edge.edge))),
       warning: selection.warning,
+      repositoryKey: inventory.repositoryKey,
     };
   } catch (error) {
     cfg.log.warn(`[retention] pin accounting failed; retaining live candidates: ${describeError(error)}`);
     return {
       retainedEdgeKeys: new Set(live.map(({ row, edge }) => pinEdgeKey(row.id, edge))),
       warning: null,
+      repositoryKey: inventory.repositoryKey,
     };
   }
 }

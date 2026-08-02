@@ -40,6 +40,7 @@ import { createCheckpointEngine } from './git-checkpoints/engine-bootstrap';
 import { RETENTION_CYCLE_INTERVAL_MS } from '../shared/constants';
 import { registerIpcHandlers, setHumanCheckpointRoutes, setSaveCardRoutes } from './ipc-handlers';
 import { createSaveCardRoutes } from './commit-candidates/save-card-routes';
+import type { SaveCardQuotaWeakening } from '../shared/commit-candidates';
 import { installExternalNavHandlers, forceCloseAllDetached, getDetachedEntries, type DetachedWindowDeps } from './detached-windows';
 import { runCloseFlush, type FlushTarget } from './close-flush';
 import { TAB_CHANNELS, LOG_RETENTION_CAP_BYTES, type FlushRequestPayload, type LogRetentionState } from '../shared/types';
@@ -821,19 +822,37 @@ app.whenReady().then(async () => {
           apiServer?.setCheckpointRoutes(engine.checkpointRoutes);
           // WP-G2.2: hand the force-capable human surface to the renderer IPC layer.
           setHumanCheckpointRoutes(engine.humanCheckpointRoutes);
+          // SC-WP-2L/2Z: latest retention pin quota-weakening warning per repository,
+          // refreshed by each retention cycle below. Empty until the first cycle runs;
+          // the Save card omits the banner while a repo has no live weakening warning.
+          const quotaWeakeningByRepo = new Map<string, SaveCardQuotaWeakening>();
           // SC-WP-1J: hand the read-only Save-card inventory surface to the renderer
           // IPC layer, reusing the engine's already-resolved internal Git. Until this
           // runs the channel answers "save-card-engine-unavailable" honestly.
-          setSaveCardRoutes(createSaveCardRoutes({ gitExe: engine.gitExe }));
+          setSaveCardRoutes(createSaveCardRoutes({
+            gitExe: engine.gitExe,
+            readQuotaWeakening: (repositoryKey) => quotaWeakeningByRepo.get(repositoryKey) ?? null,
+          }));
           await engine.runStartupMaintenance();
           // WP-G3.3 — schedule the periodic retention cycle (distill-before-prune +
           // triggered loose-object maintenance + storage report) on the shared engine
           // queue. `unref()` so the interval never keeps the process alive; each cycle
           // is best-effort and never throws. NO hard cap / ceiling ships here (Open #6).
           const retentionTimer = setInterval(() => {
-            void engine.runRetention().catch((err) =>
-              console.error('[retention] cycle failed:', err),
-            );
+            void engine.runRetention()
+              .then((results) => {
+                // SC-WP-2L/2Z: publish each repo's freshest weakening warning for the
+                // Save card. A pass that clears its warning removes the stale banner.
+                for (const { retention } of results) {
+                  if (!retention.repositoryKey) continue;
+                  if (retention.pinningWarning) {
+                    quotaWeakeningByRepo.set(retention.repositoryKey, retention.pinningWarning);
+                  } else {
+                    quotaWeakeningByRepo.delete(retention.repositoryKey);
+                  }
+                }
+              })
+              .catch((err) => console.error('[retention] cycle failed:', err));
           }, RETENTION_CYCLE_INTERVAL_MS);
           if (typeof retentionTimer.unref === 'function') retentionTimer.unref();
         } else {
