@@ -115,6 +115,7 @@ const TESTS = [
   'dist/main/main/database.active-agents.test.js',
   // Save-card SC-WP-2A: immutable turn plan-stamp schema, mapper, and guards.
   'dist/main/main/database.turnStamp.test.js',
+  'dist/main/main/dispatch-binding.boundary.test.js',
   // Save-card SC-WP-2H/2J: protected-worktree policy and commit representation.
   'dist/main/main/git-checkpoints/protection-policy.test.js',
   'dist/main/main/commit-candidates/commit-representation.test.js',
@@ -190,6 +191,7 @@ const TESTS = [
   // Git-Native WP-G1.8: ref/DB crash-consistency reconciliation (create/adopt/conflict
   // on real git) + dangling-open close + paired-ref deletion + temp-artifact sweeper.
   'dist/main/main/git-checkpoints/reconciler.test.js',
+  'dist/main/main/git-checkpoints/commit-reconciler.test.js',
   // Git-Native WP-G3.3: retention (dense-window thinning to accepted-task boundary),
   // distill-before-prune ordering + G3 gate back-fill, triggered/bounded loose-object
   // maintenance (idle-only slot, no config mutation, nonfatal on lock), storage report.
@@ -512,6 +514,7 @@ const TESTS = [
   'dist/main/main/agent-knowledge/knowledge-extractor.test.js',
   'dist/main/main/agent-knowledge/knowledge-behavior-enrichment.test.js',
   'dist/main/main/orchestration/dashboard-client.test.js',
+  'dist/main/main/orchestration/orchestration-binding.test.js',
   'dist/main/main/orchestration/orchestration-service.test.js',
   'dist/main/main/orchestration/groupthink-legacy.test.js',
   'dist/main/main/orchestration/groupthink-v2.test.js',

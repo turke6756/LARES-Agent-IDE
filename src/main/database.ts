@@ -9,7 +9,7 @@ import { Agent, AgentProvider, AgentSessionRow, AgentStatus, AgentTemplate, Crea
 import { parsePdfSelectionAnchor, serializePdfSelectionAnchor, validatePdfSelectionAnchor, type PdfSelectionAnchorV1, type SelectionAnchorType } from '../shared/pdf-annotations';
 import { DEFAULT_COMMAND, DEFAULT_COMMAND_WSL, SUPERVISOR_AGENT_MD } from '../shared/constants';
 import { parseRepoActivityEvidence } from './plans/repo-activity';
-import { OrchestrationEvent, OrchestrationRun } from './orchestration/types';
+import { OrchestrationBinding, OrchestrationEvent, OrchestrationRun, OrchestrationPlanBindingMode } from './orchestration/types';
 import { resolveWorkspaceForCwd, WORKSPACE_LINEAGE_VERSION, type WorkspaceRecordLite } from './skill-analytics/workspace-lineage';
 import { unwrapOsc8, stripTerminalEscapes, canonicalizeToAbsolute, looksPolluted } from './file-activity-normalize';
 import type { ResolvedPlanStamp } from '../shared/commit-candidates';
@@ -395,7 +395,9 @@ export function initDatabase(): void {
       ended_at          TEXT,
       error             TEXT,
       plan_id           TEXT,            -- WP6 planning-surface rail (nullable)
-      section_anchor    TEXT             -- WP6 writeback target sec_ anchor
+      section_anchor    TEXT,            -- WP6 writeback target sec_ anchor
+      plan_item_id      TEXT,            -- Stage II plan-only; reserved for Stage III
+      plan_binding_mode TEXT NOT NULL DEFAULT 'agent-default'
     )
   `);
   // WP6: guarded ALTERs so pre-WP6 orchestrations tables gain the plan rail
@@ -404,6 +406,15 @@ export function initDatabase(): void {
   // agents/provenance regions).
   try { db.exec(`ALTER TABLE orchestrations ADD COLUMN plan_id TEXT`); } catch { /* exists */ }
   try { db.exec(`ALTER TABLE orchestrations ADD COLUMN section_anchor TEXT`); } catch { /* exists */ }
+  try { db.exec(`ALTER TABLE orchestrations ADD COLUMN plan_item_id TEXT`); } catch { /* exists */ }
+  let orchestrationBindingModeAdded = false;
+  try {
+    db.exec(`ALTER TABLE orchestrations ADD COLUMN plan_binding_mode TEXT NOT NULL DEFAULT 'agent-default'`);
+    orchestrationBindingModeAdded = true;
+  } catch { /* exists */ }
+  if (orchestrationBindingModeAdded) {
+    db.exec(`UPDATE orchestrations SET plan_binding_mode = 'explicit' WHERE plan_id IS NOT NULL`);
+  }
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS orchestration_events (
@@ -6038,6 +6049,7 @@ function rowToOrchestrationRun(row: any): OrchestrationRun {
     error: row.error ?? undefined,
     planId: row.plan_id ?? undefined,
     sectionAnchor: row.section_anchor ?? undefined,
+    planBindingMode: row.plan_binding_mode ?? (row.plan_id ? 'explicit' : 'agent-default'),
   };
 }
 
@@ -6048,8 +6060,8 @@ export function insertOrchestration(r: OrchestrationRun): void {
        run_id, name, mode, status, workspace_id, supervisor_id, topic, plan_path,
        lead_provider, reviewer_provider, turn_timeout_ms, lead_id, reviewer_id,
        turn, round, last_relayed_ts, started_at, updated_at, ended_at, error,
-       plan_id, section_anchor
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       plan_id, section_anchor, plan_item_id, plan_binding_mode
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(run_id) DO UPDATE SET
        name = excluded.name, mode = excluded.mode, status = excluded.status,
        workspace_id = excluded.workspace_id, supervisor_id = excluded.supervisor_id,
@@ -6059,14 +6071,16 @@ export function insertOrchestration(r: OrchestrationRun): void {
        reviewer_id = excluded.reviewer_id, turn = excluded.turn, round = excluded.round,
        last_relayed_ts = excluded.last_relayed_ts, started_at = excluded.started_at,
        updated_at = excluded.updated_at, ended_at = excluded.ended_at, error = excluded.error,
-       plan_id = excluded.plan_id, section_anchor = excluded.section_anchor`,
+       plan_id = excluded.plan_id, section_anchor = excluded.section_anchor,
+       plan_item_id = excluded.plan_item_id, plan_binding_mode = excluded.plan_binding_mode`,
     [
       r.runId, r.name, r.mode, r.status, r.workspaceId, r.supervisorId,
       r.topic, r.planPath, r.leadProvider, r.reviewerProvider, r.turnTimeoutMs,
       r.leadId ?? null, r.reviewerId ?? null, r.turn ?? null, r.round ?? null,
       JSON.stringify(r.lastRelayedTs || {}), r.startedAt, r.updatedAt,
       r.endedAt ?? null, r.error ?? null,
-      r.planId ?? null, r.sectionAnchor ?? null,
+      r.planId ?? null, r.sectionAnchor ?? null, null,
+      r.planBindingMode ?? (r.planId ? 'explicit' : 'agent-default'),
     ]
   );
 }
@@ -6079,6 +6093,25 @@ export function updateOrchestration(r: OrchestrationRun): void {
 export function getOrchestrationRun(runId: string): OrchestrationRun | null {
   const row = queryOne('SELECT * FROM orchestrations WHERE run_id = ?', [runId]);
   return row ? rowToOrchestrationRun(row) : null;
+}
+
+/** Read the binding frozen on an orchestration run. Invalid persisted modes are
+ * rejected rather than silently falling back to a live agent default. */
+export function getOrchestrationBinding(orchestrationId: string): OrchestrationBinding | null {
+  const row = queryOne(
+    'SELECT plan_id, plan_item_id, plan_binding_mode FROM orchestrations WHERE run_id = ?',
+    [orchestrationId],
+  );
+  if (!row) return null;
+  const mode = row.plan_binding_mode as OrchestrationPlanBindingMode;
+  if (mode !== 'explicit' && mode !== 'agent-default') {
+    throw new Error(`Invalid orchestration plan binding mode: ${String(row.plan_binding_mode)}`);
+  }
+  return {
+    planId: row.plan_id ?? null,
+    planItemId: row.plan_item_id ?? null,
+    mode,
+  };
 }
 
 export function listOrchestrationRuns(): OrchestrationRun[] {

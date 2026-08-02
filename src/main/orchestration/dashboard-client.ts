@@ -30,11 +30,25 @@ export function createDashboardClient(supervisor: AgentSupervisor): DashboardCli
     // call — kept as its own seam so the runner's intent (force a rebind before
     // conceding a timeout) is legible and test fakes can fault-inject it.
     recoverChatBinding: (id) => { supervisor.maybeRecoverCodexSid(id); },
-    sendInput: async (id, text) => { await supervisor.sendInput(id, text); },
+    sendInput: async (id, text, dispatch) => { await supervisor.sendInput(id, text, {}, dispatch); },
     // Confirmed handoff send + submit-only re-press — both already exist as
     // public AgentSupervisor methods (sendInputConfirmed index.ts:4408,
     // resubmitEnter index.ts:4241). V1/V2 dropped-submit recovery uses these.
-    sendInputConfirmed: (id, text) => supervisor.sendInputConfirmed(id, text),
+    sendInputConfirmed: async (id, text, dispatch) => {
+      const outcome = await supervisor.sendInputWithOutcome(id, text, {}, dispatch);
+      if (!outcome.delivered) {
+        const err = new Error(`Input delivery to agent ${id} failed`);
+        (err as Error & { code?: string }).code = 'delivery-failed';
+        throw err;
+      }
+      return {
+        delivered: true,
+        confirmed: outcome.disposition === 'confirmed',
+        mode: outcome.disposition === 'confirmed'
+          ? (outcome.confirmationSource === 'status' ? 'status-poll' : 'hook')
+          : 'unconfirmed',
+      };
+    },
     resubmitEnter: (id) => supervisor.resubmitEnter(id),
     isInputInFlight: (id) => supervisor.isInputInFlight(id),
     // The standalone script cleaned up via DELETE /api/agents/:id → stopAgent

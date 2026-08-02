@@ -21,7 +21,9 @@ import { createHash } from 'crypto';
 import { Agent, AgentProvider, LaunchAgentInput } from '../../shared/types';
 import {
   DashboardClient, OrchestrationRunContext, SendInputConfirmedResult, SubmitRecoveryPolicy,
+  OrchestrationRun,
 } from './types';
+import { withResolvedPlanStamp, type DispatchContext } from '../git-checkpoints/dispatch-context';
 import {
   serialLeadPrompt, serialReviewerKickoff,
   parallelR1Prompt, parallelR2Prompt, parallelSynthesisPrompt,
@@ -36,6 +38,27 @@ const STATUS_CHECK_INTERVAL_MS = 10000;
 // T4 §2: grace window to let the synthesizer's plan-file Write flush land after
 // its R3 turn-complete chat event before declaring a no_plan_written stall.
 const PLAN_WRITE_GRACE_MS = 30000;
+
+const runDispatches = new WeakMap<OrchestrationRun, DispatchContext>();
+
+/** Resolve the orchestration binding once per live run object and reuse that
+ * trusted context for kickoff and every relay/follow-up send. Persisted binding
+ * fields make a rehydrated run resolve to the same stamp after restart. */
+export function getOrchestrationDispatch(run: OrchestrationRun): DispatchContext {
+  const existing = runDispatches.get(run);
+  if (existing) return existing;
+  const mode = run.planBindingMode ?? (run.planId ? 'explicit' : 'agent-default');
+  const dispatch = withResolvedPlanStamp(
+    { origin: 'orchestration', ownerAgentId: run.supervisorId },
+    {
+      planId: run.planId ?? null,
+      planItemId: null,
+      source: mode,
+    },
+  );
+  runDispatches.set(run, dispatch);
+  return dispatch;
+}
 
 // --- Dropped-submit recovery (handshake robustness) — EXPERIMENT variants ---
 // When a worker send returns UNCONFIRMED (no hook + no working flip — the codex
@@ -375,7 +398,7 @@ async function confirmedSend(
 
   let res: SendInputConfirmedResult;
   try {
-    res = await client.sendInputConfirmed(agentId, text);
+    res = await client.sendInputConfirmed(agentId, text, getOrchestrationDispatch(ctx.run));
   } catch (err) {
     ctx.emit('delivery_failed', { agentId, label, reason: 'send-threw', error: err instanceof Error ? err.message : String(err) });
     throw err;   // hard failure — re-raise untouched (kickoff relaunches)
@@ -413,7 +436,7 @@ async function sendWorker(
   agentId: string, label: string, text: string,
 ): Promise<void> {
   if (recoveryPolicy(ctx) === 'raw') {
-    await client.sendInput(agentId, text);
+    await client.sendInput(agentId, text, getOrchestrationDispatch(ctx.run));
     return;
   }
   await confirmedSend(client, ctx, agentId, label, text);
@@ -506,7 +529,7 @@ async function launchAgentWithKickoff(
     // systemPrompt). A submitted message arms the worker working-status latch;
     // a systemPrompt would not, leaving a supervised card stuck on `idle`.
     await waitReady(client, ctx, agent.id, title);
-    await client.sendInput(agent.id, kickoffPrompt);
+    await client.sendInput(agent.id, kickoffPrompt, getOrchestrationDispatch(ctx.run));
     await seedLastRelayedTsFromChat(client, ctx, agent.id, title);
     return agent;
   }

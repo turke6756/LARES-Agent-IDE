@@ -1,8 +1,16 @@
 import { Agent, LaunchAgentInput } from '../../shared/types';
+import type { DispatchContext } from '../git-checkpoints/dispatch-context';
 
 export type OrchestrationName = 'groupthink';
 export type OrchestrationMode = 'serial' | 'parallel';
 export type RunStatus = 'starting' | 'running' | 'complete' | 'stalled' | 'aborted' | 'error';
+export type OrchestrationPlanBindingMode = 'explicit' | 'agent-default';
+
+export interface OrchestrationBinding {
+  planId: string | null;
+  planItemId: string | null;
+  mode: OrchestrationPlanBindingMode;
+}
 
 /** Catalog entry returned by GET /api/orchestrations/catalog. (The
  *  `list_orchestrations` MCP tool that used to front this was deleted in the
@@ -78,6 +86,8 @@ export interface OrchestrationRun {
   planPath: string;                  // absolute
   // WP6 planning-surface rail (frozen at dispatch). See RunOrchestrationRequest.
   planId?: string;
+  /** Frozen once for the run. Stage II supports plan-only explicit bindings. */
+  planBindingMode?: OrchestrationPlanBindingMode;
   sectionAnchor?: string;
   leadProvider: string;
   reviewerProvider: string;
@@ -126,14 +136,14 @@ export interface DashboardClient {
    *  reveal a completed-but-unread turn. Self-gates in the supervisor (no-op for
    *  non-codex / already-bound / inside the discovery grace); safe to call always. */
   recoverChatBinding(id: string): void;
-  sendInput(id: string, text: string): Promise<void>;
+  sendInput(id: string, text: string, dispatch: DispatchContext): Promise<void>;
   /** Confirmed handoff send (→ supervisor.sendInputConfirmed). Resolves with
    *  turn-start proof: mode 'hook'|'status-poll' ⇒ confirmed:true; 'unconfirmed'
    *  ⇒ confirmed:false (no proof within the handshake window — NOT failure).
    *  REJECTS on hard failure (SubmitNotConfirmedError, or a `delivery-failed`-
    *  coded Error). V1/V2 use this instead of raw sendInput so a dropped submit
    *  is detected and recovered rather than silently STALLed. */
-  sendInputConfirmed(id: string, text: string): Promise<SendInputConfirmedResult>;
+  sendInputConfirmed(id: string, text: string, dispatch: DispatchContext): Promise<SendInputConfirmedResult>;
   /** Re-press ONLY the submit keystroke (→ supervisor.resubmitEnter) to recover
    *  a dropped Enter. No body, never queued — a single keystroke. */
   resubmitEnter(id: string): void;
