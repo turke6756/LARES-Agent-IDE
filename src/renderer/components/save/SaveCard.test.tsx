@@ -17,8 +17,8 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
-import type { SaveCardInventoryResponse } from '../../../shared/types';
-import type { DirtyEntry } from '../../../shared/commit-candidates';
+import type { SaveCardBundle } from '../../../shared/types';
+import type { DirtyEntry, SaveCardQuotaWeakening } from '../../../shared/commit-candidates';
 import SaveCard from './SaveCard';
 
 (globalThis as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT = true;
@@ -54,7 +54,17 @@ function entry(id: string, displayPath: string, over: Partial<DirtyEntry> = {}):
   };
 }
 
-type WorkBundleDto = SaveCardInventoryResponse[number];
+type WorkBundleDto = SaveCardBundle;
+
+// SC-WP-2L — the inventory response is now { bundles, quotaWeakening }. This
+// helper keeps the existing bundle-shaped fixtures terse while defaulting to no
+// quota-weakening warning (the common case).
+function inv(
+  bundles: WorkBundleDto[],
+  quotaWeakening: SaveCardQuotaWeakening | null = null,
+): { bundles: WorkBundleDto[]; quotaWeakening: SaveCardQuotaWeakening | null } {
+  return { bundles, quotaWeakening };
+}
 
 const loudBundle: WorkBundleDto = {
   bundleId: 'b-loud',
@@ -148,7 +158,7 @@ afterEach(() => {
 
 describe('SaveCard bundle rendering', () => {
   it('explains the save-protection ladder and dismisses it by keyboard or click-away', async () => {
-    getInventory.mockResolvedValue([loudBundle]);
+    getInventory.mockResolvedValue(inv([loudBundle]));
     await render();
 
     const button = document.querySelector<HTMLButtonElement>('[aria-label="How save protection works"]')!;
@@ -171,7 +181,7 @@ describe('SaveCard bundle rendering', () => {
   });
 
   it('renders loud unsaved bundles with memory-jog description and protection rung', async () => {
-    getInventory.mockResolvedValue([loudBundle]);
+    getInventory.mockResolvedValue(inv([loudBundle]));
     await render();
     expect(container.querySelector('[data-testid="save-card"]')).toBeTruthy();
     const bundle = container.querySelector('[data-testid="save-bundle"]');
@@ -185,7 +195,7 @@ describe('SaveCard bundle rendering', () => {
   });
 
   it('flags a capture gap honestly', async () => {
-    getInventory.mockResolvedValue([captureGapBundle]);
+    getInventory.mockResolvedValue(inv([captureGapBundle]));
     await render();
     const flag = container.querySelector('[data-testid="save-bundle-capture"]');
     expect(flag).toBeTruthy();
@@ -210,7 +220,7 @@ describe('SaveCard bundle rendering', () => {
         }],
       },
     };
-    getInventory.mockResolvedValue([loudBundle, second]);
+    getInventory.mockResolvedValue(inv([loudBundle, second]));
     await render();
     expect(container.querySelectorAll('[data-testid="save-bundle"]')).toHaveLength(1);
     const workers = container.querySelector('[data-testid="save-bundle-workers"]');
@@ -220,7 +230,7 @@ describe('SaveCard bundle rendering', () => {
   });
 
   it('renders the unattributed pseudo-bundle as a no-witness card', async () => {
-    getInventory.mockResolvedValue([unattributedBundle]);
+    getInventory.mockResolvedValue(inv([unattributedBundle]));
     await render();
     const bundle = container.querySelector('[data-kind="unattributed"]');
     expect(bundle).toBeTruthy();
@@ -229,7 +239,7 @@ describe('SaveCard bundle rendering', () => {
   });
 
   it('splits already-protected bundles into the quiet list', async () => {
-    getInventory.mockResolvedValue([loudBundle, quietBundle]);
+    getInventory.mockResolvedValue(inv([loudBundle, quietBundle]));
     await render();
     // loud section has exactly the checkpoint-only bundle; quiet has the committed one.
     const cards = container.querySelectorAll('[data-testid="save-bundle"]');
@@ -242,7 +252,7 @@ describe('SaveCard bundle rendering', () => {
   });
 
   it('exposes only an inspect affordance — NO commit/save/write button', async () => {
-    getInventory.mockResolvedValue([loudBundle, captureGapBundle, unattributedBundle]);
+    getInventory.mockResolvedValue(inv([loudBundle, captureGapBundle, unattributedBundle]));
     await render();
     expect(container.querySelector('[data-testid="save-bundle-inspect"]')).toBeTruthy();
     const buttons = Array.from(container.querySelectorAll('button'));
@@ -255,7 +265,7 @@ describe('SaveCard bundle rendering', () => {
   });
 
   it('Inspect toggles bundle detail in place (read-only)', async () => {
-    getInventory.mockResolvedValue([loudBundle]);
+    getInventory.mockResolvedValue(inv([loudBundle]));
     await render();
     expect(container.querySelector('[data-testid="save-bundle-detail"]')).toBeFalsy();
     const inspect = container.querySelector('[data-testid="save-bundle-inspect"]') as HTMLButtonElement;
@@ -277,10 +287,41 @@ describe('SaveCard honest non-populated states', () => {
   });
 
   it('renders the empty state when the tree is clean', async () => {
-    getInventory.mockResolvedValue([]);
+    getInventory.mockResolvedValue(inv([]));
     await render();
     expect(container.querySelector('[data-testid="save-card-empty"]')).toBeTruthy();
     expect(container.textContent).toContain('Nothing to save');
+  });
+});
+
+describe('SC-WP-2L quota-weakening banner', () => {
+  const weakening: SaveCardQuotaWeakening = {
+    quotaBytes: 536_870_912,
+    usedBytes: 536_870_912,
+    releasedEdges: [{ turnId: 't-old', edge: 'after' }],
+    willWeakenPaths: ['e-weak-1', 'e-weak-2'],
+  };
+
+  it('surfaces the honest "time to save" banner when a still-dirty edge is released', async () => {
+    getInventory.mockResolvedValue(inv([loudBundle], weakening));
+    await render();
+    const banner = container.querySelector('[data-testid="save-card-quota-weakening"]');
+    expect(banner).toBeTruthy();
+    expect(banner?.textContent).toContain('time to save');
+    // Renderer-safe: the warning carries entry/turn ids only — never raw paths.
+    expect(banner?.textContent).not.toContain('e-weak-1');
+  });
+
+  it('shows no banner when there is no quota-weakening warning', async () => {
+    getInventory.mockResolvedValue(inv([loudBundle], null));
+    await render();
+    expect(container.querySelector('[data-testid="save-card-quota-weakening"]')).toBeFalsy();
+  });
+
+  it('shows no banner when the warning releases no still-dirty edge', async () => {
+    getInventory.mockResolvedValue(inv([loudBundle], { ...weakening, releasedEdges: [] }));
+    await render();
+    expect(container.querySelector('[data-testid="save-card-quota-weakening"]')).toBeFalsy();
   });
 });
 

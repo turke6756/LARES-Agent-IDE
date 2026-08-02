@@ -13,6 +13,7 @@ import type {
   DirtyEntry,
   DirtyInventory,
   ProtectionRung,
+  SaveCardQuotaWeakening,
 } from '../../shared/commit-candidates';
 import type { GitCapability } from '../../shared/types';
 import type { RunGit } from '../git/git-runtime';
@@ -73,6 +74,12 @@ export interface CandidateServiceDeps {
   stampSource?: WitnessStampSource | null;
   readCaptureTurns: CaptureTurnReader;
   readCommitPathLinks?: CommitPathLinkReader;
+  /**
+   * SC-WP-2L — latest retention pin quota-weakening warning for a repository,
+   * produced by the WP-2K retention pass. Null/omitted ⇒ no banner is surfaced.
+   * The service treats it as an opaque, already-renderer-safe read seam.
+   */
+  readQuotaWeakening?: (repositoryKey: string) => SaveCardQuotaWeakening | null;
   platform?: NodeJS.Platform;
   realpath?(path: string): string;
   fileExists?(path: string): boolean;
@@ -86,6 +93,8 @@ export interface CandidateInventoryRead {
   protectionByEntryId: Record<string, ProtectionRung>;
   /** Turn IDs whose immutable stamp was legacy/missing, for honest UI labeling. */
   planAttributionUnavailableTurnIds: Set<string>;
+  /** SC-WP-2L — retention quota-weakening warning; null unless a still-dirty edge is released. */
+  quotaWeakening: SaveCardQuotaWeakening | null;
 }
 
 function compareStrings(left: string, right: string): number {
@@ -309,11 +318,23 @@ export class CommitCandidateService {
       unattributedCaptureHealth,
       protectionByEntryId,
       planAttributionUnavailableTurnIds,
+      quotaWeakening: this.deps.readQuotaWeakening?.(repository.repositoryKey) ?? null,
     };
   }
 
   async listWorkBundles(request: CandidateReadRequest): Promise<WorkBundle[]> {
     return projectWorkBundles(await this.assembleInventory(request));
+  }
+
+  /**
+   * SC-WP-2L — the full read-only inventory view: renderer bundles plus the
+   * retention quota-weakening warning attached to the same assembly.
+   */
+  async listInventoryView(
+    request: CandidateReadRequest,
+  ): Promise<{ bundles: WorkBundle[]; quotaWeakening: SaveCardQuotaWeakening | null }> {
+    const read = await this.assembleInventory(request);
+    return { bundles: projectWorkBundles(read), quotaWeakening: read.quotaWeakening };
   }
 }
 
@@ -321,4 +342,8 @@ export class CommitCandidateService {
 export interface CommitCandidateReadFacade {
   assembleInventory(request: CandidateReadRequest): Promise<CandidateInventoryRead>;
   listWorkBundles(request: CandidateReadRequest): Promise<WorkBundle[]>;
+  listInventoryView(request: CandidateReadRequest): Promise<{
+    bundles: WorkBundle[];
+    quotaWeakening: SaveCardQuotaWeakening | null;
+  }>;
 }

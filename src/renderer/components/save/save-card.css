@@ -360,3 +360,30 @@
   color: var(--color-fg-muted);
 }
 .sc-keyline b { color: var(--color-fg-secondary); }
+
+/* SC-WP-2L — retention quota-weakening banner. Amber, deliberate, not alarming:
+ * the honest "time to save" prompt that only appears when recovery space is
+ * forcing a still-dirty checkpoint to thin. */
+.sc-quota-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin: 2px 0 20px;
+  padding: 11px 14px;
+  border: 1px solid color-mix(in srgb, var(--color-accent-yellow) 40%, var(--color-surface-3));
+  border-left: 3px solid var(--color-accent-yellow);
+  border-radius: 5px;
+  background: #33290a;
+}
+.sc-quota-icon { color: var(--color-accent-yellow); flex: 0 0 auto; margin-top: 1px; }
+.sc-quota-text { min-width: 0; }
+.sc-quota-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-accent-yellow);
+}
+.sc-quota-sub {
+  font-size: 12px;
+  color: var(--color-fg-secondary);
+  margin-top: 2px;
+}

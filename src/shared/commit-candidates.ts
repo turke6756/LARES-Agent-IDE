@@ -195,3 +195,20 @@ export type CommitOutcome =
     }
   | { status: 'aborted-stale'; reason: string; attemptId: string }
   | { status: 'aborted-error'; reason: string; attemptId: string };
+
+/**
+ * SC-WP-2L — renderer-safe quota-weakening warning surfaced on the Save card.
+ *
+ * Structurally mirrors the retention pin policy's `RetentionPinWeakeningWarning`
+ * (`src/main/git-checkpoints/protection-policy.ts`) so the WP-2K pass result can
+ * be threaded through the Save-card inventory response without re-shaping. It is
+ * populated only when the retention pin quota (or max-extension) forces the
+ * release of at least one still-dirty recovery edge. `willWeakenPaths` and
+ * `releasedEdges` carry dirty-entry / turn identities only — NEVER raw paths.
+ */
+export interface SaveCardQuotaWeakening {
+  quotaBytes: number;
+  usedBytes: number;
+  releasedEdges: Array<{ turnId: string; edge: 'before' | 'after' }>;
+  willWeakenPaths: string[];
+}

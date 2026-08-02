@@ -1789,8 +1789,8 @@ export interface SaveCardWorkerUnit {
   memberEntryIds: string[];
 }
 
-/** Renderer-safe WorkBundle DTOs returned by the read-only candidate service. */
-export type SaveCardInventoryResponse = Array<{
+/** One renderer-safe WorkBundle DTO element returned by the read-only service. */
+export interface SaveCardBundle {
   bundleId: string;
   kind: 'component' | 'unattributed';
   label: string;
@@ -1805,7 +1805,17 @@ export type SaveCardInventoryResponse = Array<{
   captureHealth: import('./commit-candidates').BundleCaptureHealth;
   weakestProtection: import('./commit-candidates').ProtectionRung | null;
   identity: SaveCardBundleIdentity | null;
-}>;
+}
+
+/**
+ * Read-only Save-card inventory response. Carries the renderer-safe WorkBundle
+ * DTOs plus the SC-WP-2L retention quota-weakening warning (null unless the pin
+ * quota is forcing the release of a still-dirty recovery edge).
+ */
+export interface SaveCardInventoryResponse {
+  bundles: SaveCardBundle[];
+  quotaWeakening: import('./commit-candidates').SaveCardQuotaWeakening | null;
+}
 
 /** IPC channel names for the renderer checkpoint surface — one source of truth for
  *  preload, the main registrar, and the contract test. */

@@ -1,13 +1,15 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useDashboardStore } from '../../stores/dashboard-store';
 import type { SaveCardInventoryResponse } from '../../../shared/types';
+import type { SaveCardQuotaWeakening } from '../../../shared/commit-candidates';
 import SaveBundle, { isQuietlySaved, type WorkBundleDto } from './SaveBundle';
+import QuotaWeakeningBanner from './QuotaWeakeningBanner';
 import './save-card.css';
 
 type LoadState =
   | { status: 'loading' }
   | { status: 'error'; message: string }
-  | { status: 'ready'; bundles: WorkBundleDto[] };
+  | { status: 'ready'; bundles: WorkBundleDto[]; quotaWeakening: SaveCardQuotaWeakening | null };
 
 // Turn whatever the rejected getInventory invoke throws into a single honest
 // line. The Stage ① engine may be unavailable (route not yet injected), the
@@ -75,10 +77,16 @@ export default function SaveCard() {
     async (wsId: string, isCurrent: () => boolean) => {
       setState({ status: 'loading' });
       try {
-        const bundles: SaveCardInventoryResponse = await window.api.saveCard.getInventory({
+        const response: SaveCardInventoryResponse = await window.api.saveCard.getInventory({
           workspaceId: wsId,
         });
-        if (isCurrent()) setState({ status: 'ready', bundles });
+        if (isCurrent()) {
+          setState({
+            status: 'ready',
+            bundles: response.bundles,
+            quotaWeakening: response.quotaWeakening,
+          });
+        }
       } catch (err) {
         if (isCurrent()) setState({ status: 'error', message: errorMessage(err) });
       }
@@ -199,7 +207,7 @@ export default function SaveCard() {
     );
   }
 
-  const { bundles } = state;
+  const { bundles, quotaWeakening } = state;
   const quiet = bundles.filter(isQuietlySaved);
   const loud = bundles.filter((b) => !isQuietlySaved(b));
   const loudGroups = groupBySupervisor(loud);
@@ -234,6 +242,8 @@ export default function SaveCard() {
   return (
     <div className="sc-root" data-testid="save-card">
       {header}
+
+      <QuotaWeakeningBanner warning={quotaWeakening} />
 
       <div className="sc-sect">
         <h2>Unsaved work</h2>

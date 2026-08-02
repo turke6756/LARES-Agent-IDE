@@ -1,10 +1,10 @@
 import React, { useState } from 'react';
 import * as Icons from 'lucide-react';
-import type { SaveCardInventoryResponse } from '../../../shared/types';
+import type { SaveCardBundle } from '../../../shared/types';
 import type { DirtyEntry, ProtectionRung } from '../../../shared/commit-candidates';
 
 // One renderer-safe WorkBundle DTO element (SC-WP-1H transport shape).
-export type WorkBundleDto = SaveCardInventoryResponse[number];
+export type WorkBundleDto = SaveCardBundle;
 
 const MAX_PATHS_COLLAPSED = 6;
 const RUNG_ORDER: ProtectionRung[] = [

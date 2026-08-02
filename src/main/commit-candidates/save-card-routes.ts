@@ -19,7 +19,8 @@
 
 import * as fs from 'node:fs';
 
-import type { Agent, GitCapability, SaveCardBundleIdentity, SaveCardInventoryRequest, SaveCardInventoryResponse, SaveCardWorkerUnit } from '../../shared/types';
+import type { Agent, GitCapability, SaveCardBundle, SaveCardBundleIdentity, SaveCardInventoryRequest, SaveCardInventoryResponse, SaveCardWorkerUnit } from '../../shared/types';
+import type { SaveCardQuotaWeakening } from '../../shared/commit-candidates';
 import {
   getAgentsByWorkspace as dbGetAgentsByWorkspace,
   getAgent as dbGetAgent,
@@ -65,6 +66,12 @@ export interface SaveCardRoutesDeps {
   runGitBytes?: RunGitBytesLike;
   /** Best-effort canonicalizer; defaults to `fs.realpathSync.native`. */
   realpath?: (p: string) => string;
+  /**
+   * SC-WP-2L — the latest retention pin quota-weakening warning for the assembled
+   * repository (from the WP-2K retention pass). Defaults to none until a warning
+   * source is wired in; the Save card simply omits the banner while it is null.
+   */
+  readQuotaWeakening?: (repositoryKey: string) => SaveCardQuotaWeakening | null;
 }
 
 function minTime(values: Array<number | null | undefined>): number | null {
@@ -116,7 +123,7 @@ function attachBundleIdentity(
   turns: ReadonlyMap<string, BundleTurn>,
   witnesses: readonly TurnWitnessRead[],
   structuralSupervisors: ReadonlyMap<string, Agent>,
-): SaveCardInventoryResponse[number] {
+): SaveCardBundle {
   if (bundle.kind === 'unattributed' || !bundle.component) {
     return { ...bundle, identity: null };
   }
@@ -249,6 +256,7 @@ export function createSaveCardRoutes(deps: SaveCardRoutesDeps): SaveCardRoutes {
     stampSource: createTurnStampSource(readTurnRecord),
     readCaptureTurns,
     readCommitPathLinks,
+    readQuotaWeakening: deps.readQuotaWeakening,
   });
 
   async function getInventory(
@@ -271,7 +279,7 @@ export function createSaveCardRoutes(deps: SaveCardRoutesDeps): SaveCardRoutes {
       }),
     );
 
-    const bundles = await service.listWorkBundles({
+    const { bundles, quotaWeakening } = await service.listInventoryView({
       targetWorkspaceId: req.workspaceId,
       workspaces,
     });
@@ -294,13 +302,16 @@ export function createSaveCardRoutes(deps: SaveCardRoutesDeps): SaveCardRoutes {
       }
     }
 
-    return bundles.map((bundle) => attachBundleIdentity(
-      bundle,
-      agents,
-      turns,
-      witnesses,
-      structuralSupervisors,
-    ));
+    return {
+      bundles: bundles.map((bundle) => attachBundleIdentity(
+        bundle,
+        agents,
+        turns,
+        witnesses,
+        structuralSupervisors,
+      )),
+      quotaWeakening,
+    };
   }
 
   return { getInventory };

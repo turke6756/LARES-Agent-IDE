@@ -167,7 +167,7 @@ async function setup(): Promise<void> {
 
 test('maps the renderer workspaceId to the shared-worktree repository inventory', async () => {
   const routes = buildRoutes();
-  const bundles = await routes.getInventory({ workspaceId: 'workspace-a' });
+  const { bundles } = await routes.getInventory({ workspaceId: 'workspace-a' });
 
   // One component (attributed one.txt + two.txt) + the unattributed pseudo-bundle.
   const component = bundles.find((bundle) => bundle.kind === 'component');
@@ -200,7 +200,7 @@ test('projects immutable turn stamps into Save-card plan labels', async () => {
       planStampSource: 'agent-default',
     }),
   });
-  const bundles = await routes.getInventory({ workspaceId: 'workspace-a' });
+  const { bundles } = await routes.getInventory({ workspaceId: 'workspace-a' });
   const component = bundles.find((bundle) => bundle.kind === 'component');
 
   assert.ok(component);
@@ -210,7 +210,7 @@ test('projects immutable turn stamps into Save-card plan labels', async () => {
 
 test('candidate request carries every registered workspace so sibling lanes union', async () => {
   const routes = buildRoutes();
-  const bundles = await routes.getInventory({ workspaceId: 'workspace-b' });
+  const { bundles } = await routes.getInventory({ workspaceId: 'workspace-b' });
   // Both in-repo lanes appear in the repository identity; the out-of-repo
   // workspace was passed as a candidate but narrowed out by scope discovery.
   const component = bundles.find((bundle) => bundle.kind === 'component')!;
@@ -279,7 +279,7 @@ test('mixed identity stays compact while retaining all forty worker sub-units', 
       : [],
   });
 
-  const bundles = await routes.getInventory({ workspaceId: 'workspace-a' });
+  const { bundles } = await routes.getInventory({ workspaceId: 'workspace-a' });
   const identity = bundles.find((bundle) => bundle.kind === 'component')?.identity;
   assert.ok(identity, 'expected a mixed component identity');
   assert.equal(identity.source, 'mixed');
@@ -323,7 +323,7 @@ test('single-owner identity applies the same hard text clamps', async () => {
       : [],
   });
 
-  const bundles = await routes.getInventory({ workspaceId: 'workspace-a' });
+  const { bundles } = await routes.getInventory({ workspaceId: 'workspace-a' });
   const identity = bundles.find((bundle) => bundle.kind === 'component')?.identity;
   assert.ok(identity, 'expected an owner identity');
   assert.equal(identity.source, 'supervisor');
@@ -335,7 +335,7 @@ test('single-owner identity applies the same hard text clamps', async () => {
 
 test('serialized DTOs never leak absolute filesystem paths or the git exe', async () => {
   const routes = buildRoutes();
-  const bundles = await routes.getInventory({ workspaceId: 'workspace-a' });
+  const { bundles } = await routes.getInventory({ workspaceId: 'workspace-a' });
   const serialized = JSON.stringify(bundles);
   assert.equal(serialized.includes(repo), false);
   assert.equal(serialized.includes(repo.replace(/\\/g, '/')), false);
@@ -358,10 +358,31 @@ test('IPC seam contract: unavailable before wiring, live inventory after', async
   );
 
   routes = buildRoutes();
-  const bundles = await invoke({ workspaceId: 'workspace-a' }) as Awaited<
+  const inventory = await invoke({ workspaceId: 'workspace-a' }) as Awaited<
     ReturnType<SaveCardRoutes['getInventory']>
   >;
-  assert.ok(bundles.some((bundle) => bundle.kind === 'component'));
+  assert.ok(inventory.bundles.some((bundle) => bundle.kind === 'component'));
+});
+
+test('surfaces the WP-2K quota-weakening warning on the inventory response', async () => {
+  const warning = {
+    quotaBytes: 536_870_912,
+    usedBytes: 536_870_912,
+    releasedEdges: [{ turnId: 'turn-a', edge: 'after' as const }],
+    willWeakenPaths: ['entry-a'],
+  };
+  const routes = buildRoutes({ readQuotaWeakening: () => warning });
+  const inventory = await routes.getInventory({ workspaceId: 'workspace-a' });
+  assert.deepEqual(inventory.quotaWeakening, warning);
+
+  // Absent seam ⇒ no warning (the banner stays silent).
+  const silent = await buildRoutes().getInventory({ workspaceId: 'workspace-a' });
+  assert.equal(silent.quotaWeakening, null);
+
+  // The warning carries entry/turn identities only — never a raw path.
+  const serialized = JSON.stringify(inventory);
+  assert.equal(serialized.includes(repo), false);
+  assert.equal(serialized.includes(repo.replace(/\\/g, '/')), false);
 });
 
 (async () => {

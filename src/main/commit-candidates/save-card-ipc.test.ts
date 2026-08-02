@@ -43,23 +43,26 @@ class FakeIpc implements IpcLike {
 }
 
 function inventoryFixture(): SaveCardInventoryResponse {
-  return [{
-    bundleId: 'unattributed:repo-1',
-    kind: 'unattributed',
-    label: 'Unattributed changes',
-    labels: ['Unattributed changes', '0 changed paths'],
-    repositoryKey: 'repo-1',
-    workspaces: [{ workspaceId: 'ws-1', workspacePrefix: '' }],
-    component: null,
-    members: [],
-    captureHealth: {
-      turns: [],
-      captureOutage: false,
-      pathsWithoutFinalizationEdge: [],
-    },
-    weakestProtection: null,
-    identity: null,
-  }];
+  return {
+    bundles: [{
+      bundleId: 'unattributed:repo-1',
+      kind: 'unattributed',
+      label: 'Unattributed changes',
+      labels: ['Unattributed changes', '0 changed paths'],
+      repositoryKey: 'repo-1',
+      workspaces: [{ workspaceId: 'ws-1', workspacePrefix: '' }],
+      component: null,
+      members: [],
+      captureHealth: {
+        turns: [],
+        captureOutage: false,
+        pathsWithoutFinalizationEdge: [],
+      },
+      weakestProtection: null,
+      identity: null,
+    }],
+    quotaWeakening: null,
+  };
 }
 
 test('audit: registers exactly the one conventionally named read channel and no mutating channel', () => {
@@ -99,7 +102,7 @@ test('rejects malformed inventory requests before calling the route', async () =
   registerSaveCardIpc(ipc, () => ({
     getInventory: async () => {
       calls++;
-      return [];
+      return { bundles: [], quotaWeakening: null };
     },
   }));
 
