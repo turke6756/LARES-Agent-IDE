@@ -333,6 +333,93 @@ test('single-owner identity applies the same hard text clamps', async () => {
   assert.equal(identity.roleDescription.endsWith('…'), true);
 });
 
+test('SC-WP-1L.2 regression: a supervised agent with no owner edge is never attributed to a workspace supervisor', async () => {
+  // Defect A: a lone, human-launched agent (isSupervised, ownerAgentId null) that
+  // merely shares a workspace with a supervisor row must resolve to ITSELF — never
+  // to the structurally-present supervisor that did not launch it. Owner resolution
+  // uses only real data (witness/agent owner edges), so with none it stays 'agent'.
+  const loneAgent = {
+    id: 'lone-agent', workspaceId: 'workspace-a', title: 'minor tweeks',
+    roleDescription: 'Human-launched lone agent.', isSupervisor: false,
+    isWorker: false, isSupervised: true, ownerAgentId: null,
+  } as Agent;
+  const routes = buildRoutes({
+    readTurnWitnesses: (workspaceId) => workspaceId === 'workspace-a'
+      ? [{
+        turnId: 'lone-turn', agentId: 'lone-agent', ownerAgentId: null,
+        ownerBrickGeneration: null, touched: [{ path: 'one.txt', op: 'write' }],
+      }]
+      : [],
+    readCaptureTurns: (workspaceId) => workspaceId === 'workspace-a'
+      ? [captureTurn('lone-turn')]
+      : [],
+    // The workspace ALSO carries a supervisor row — the structural-supervisor trap.
+    getAgentsByWorkspace: (workspaceId) => workspaceId === 'workspace-a'
+      ? [supervisor, loneAgent]
+      : [],
+    readBundleTurns: (workspaceId) => workspaceId === 'workspace-a'
+      ? [{
+        id: 'lone-turn', agentId: 'lone-agent', agentTitle: 'minor tweeks',
+        startedAt: Date.UTC(2026, 6, 1), endedAt: Date.UTC(2026, 6, 1),
+      }]
+      : [],
+  });
+
+  const { bundles } = await routes.getInventory({ workspaceId: 'workspace-a' });
+  const identity = bundles.find((bundle) => bundle.kind === 'component')?.identity;
+  assert.ok(identity, 'expected a component identity');
+  assert.equal(identity.source, 'agent');
+  assert.equal(identity.agentId, 'lone-agent');
+  assert.notEqual(identity.agentId, 'supervisor-1');
+  assert.equal(identity.name, 'minor tweeks');
+});
+
+test('SC-WP-1L.2: a component with two distinct real owners resolves to mixed with no identity agent', async () => {
+  const ownerX = {
+    id: 'owner-x', workspaceId: 'workspace-a', title: 'Owner X', roleDescription: 'X.',
+    isSupervisor: true, isWorker: false, isSupervised: false, ownerAgentId: null,
+  } as Agent;
+  const ownerY = {
+    id: 'owner-y', workspaceId: 'workspace-a', title: 'Owner Y', roleDescription: 'Y.',
+    isSupervisor: true, isWorker: false, isSupervised: false, ownerAgentId: null,
+  } as Agent;
+  const workerX = {
+    id: 'worker-x', workspaceId: 'workspace-a', title: 'Worker X', roleDescription: 'wx.',
+    isSupervisor: false, isWorker: true, isSupervised: true, ownerAgentId: 'owner-x',
+  } as Agent;
+  const workerY = {
+    id: 'worker-y', workspaceId: 'workspace-a', title: 'Worker Y', roleDescription: 'wy.',
+    isSupervisor: false, isWorker: true, isSupervised: true, ownerAgentId: 'owner-y',
+  } as Agent;
+  const routes = buildRoutes({
+    readTurnWitnesses: (workspaceId) => workspaceId === 'workspace-a'
+      ? [
+        { turnId: 'turn-x', agentId: 'worker-x', ownerAgentId: 'owner-x', ownerBrickGeneration: null, touched: [{ path: 'one.txt', op: 'write' }] },
+        { turnId: 'turn-y', agentId: 'worker-y', ownerAgentId: 'owner-y', ownerBrickGeneration: null, touched: [{ path: 'one.txt', op: 'write' }] },
+      ]
+      : [],
+    readCaptureTurns: (workspaceId) => workspaceId === 'workspace-a'
+      ? [captureTurn('turn-x'), captureTurn('turn-y')]
+      : [],
+    getAgentsByWorkspace: (workspaceId) => workspaceId === 'workspace-a'
+      ? [ownerX, ownerY, workerX, workerY]
+      : [],
+    readBundleTurns: (workspaceId) => workspaceId === 'workspace-a'
+      ? [
+        { id: 'turn-x', agentId: 'worker-x', agentTitle: 'Worker X', startedAt: Date.UTC(2026, 6, 1), endedAt: Date.UTC(2026, 6, 1) },
+        { id: 'turn-y', agentId: 'worker-y', agentTitle: 'Worker Y', startedAt: Date.UTC(2026, 6, 2), endedAt: Date.UTC(2026, 6, 2) },
+      ]
+      : [],
+  });
+
+  const { bundles } = await routes.getInventory({ workspaceId: 'workspace-a' });
+  const identity = bundles.find((bundle) => bundle.kind === 'component')?.identity;
+  assert.ok(identity, 'expected a component identity');
+  assert.equal(identity.source, 'mixed');
+  assert.equal(identity.agentId, null);
+  assert.equal(identity.workerUnits.length, 2);
+});
+
 test('serialized DTOs never leak absolute filesystem paths or the git exe', async () => {
   const routes = buildRoutes();
   const { bundles } = await routes.getInventory({ workspaceId: 'workspace-a' });

@@ -132,6 +132,7 @@ export default function SaveBundle({
   )).size;
   const workspaceCount = new Set(grouped.flatMap((item) => item.workspaces.map((ws) => ws.workspaceId))).size;
   const identity = bundle.identity;
+  const isMixed = identity?.source === 'mixed';
   const workerUnits = grouped.flatMap((item) => item.identity?.workerUnits ?? []);
   const uniqueWorkers = [...new Map(workerUnits.map((unit) => [unit.agentId ?? unit.name, unit])).values()];
 
@@ -141,7 +142,7 @@ export default function SaveBundle({
         {!isUnattributed && (
           <span className={`sc-check${alreadyProtected ? ' sc-done' : ''}`} aria-hidden="true" />
         )}
-        <h2>{identity?.name ?? bundle.label}</h2>
+        <h2>{isMixed ? 'Overlapping work' : identity?.name ?? bundle.label}</h2>
         <span className={pillClass} data-testid="save-bundle-pill">{pillText}</span>
       </div>
 
@@ -152,11 +153,24 @@ export default function SaveBundle({
         </p>
       ) : (
         <>
-          <p className="sc-desc" data-testid="save-bundle-desc">
-            <span className="sc-k">{planAssoc ? 'From plan' : identity?.source === 'supervisor' ? 'From supervisor' : 'From agent'}</span>{' '}
-            <b>{identity?.name ?? bundle.label}</b>{' '}
-            <span className="sc-k">— {identity?.roleDescription || 'No role description recorded.'}</span>
-          </p>
+          {isMixed && !planAssoc ? (
+            // No single agent or supervisor owns this component — several agents'
+            // work overlaps on intersecting paths. Render that honestly (no
+            // fabricated "From agent/supervisor" prefix), keeping the clamped
+            // 1L.1 name list + role as secondary memory-jog detail.
+            <p className="sc-desc" data-testid="save-bundle-desc">
+              <span className="sc-k">Overlapping work · {uniqueWorkers.length} agent{uniqueWorkers.length === 1 ? '' : 's'} · {turnCount} turn{turnCount === 1 ? '' : 's'}</span>
+              {(identity?.name || identity?.roleDescription) && (
+                <span className="sc-mixed-names">{' '}<b>{identity?.name}</b>{identity?.roleDescription ? <> <span className="sc-k">— {identity.roleDescription}</span></> : null}</span>
+              )}
+            </p>
+          ) : (
+            <p className="sc-desc" data-testid="save-bundle-desc">
+              <span className="sc-k">{planAssoc ? 'From plan' : identity?.source === 'supervisor' ? 'From supervisor' : 'From agent'}</span>{' '}
+              <b>{identity?.name ?? bundle.label}</b>{' '}
+              <span className="sc-k">— {identity?.roleDescription || 'No role description recorded.'}</span>
+            </p>
+          )}
           <p className="sc-meta" data-testid="save-bundle-dates">
             {dateRange(identity?.startedAt ?? null, identity?.endedAt ?? null)} · {uniqueWorkers.length} contributing agent{uniqueWorkers.length === 1 ? '' : 's'} · {turnCount} witnessed turn{turnCount === 1 ? '' : 's'}
             {workspaceCount > 1 ? ` · across ${workspaceCount} workspaces` : ''}

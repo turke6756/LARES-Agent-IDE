@@ -129,6 +129,28 @@ const quietBundle: WorkBundleDto = {
   weakestProtection: 'locally-committed',
 };
 
+// SC-WP-1L.2 — a mixed-owner component: several agents' work overlaps and no
+// single agent or supervisor owns it. `source: 'mixed'`, `agentId: null`, and the
+// clamped 1L.1 name list survives on `identity.name`.
+const mixedBundle: WorkBundleDto = {
+  ...loudBundle,
+  bundleId: 'b-mixed',
+  label: 'app icon, Guard exit-code source fix + 38 more agents',
+  labels: ['app icon, Guard exit-code source fix + 38 more agents'],
+  identity: {
+    groupingKey: 'mixed:c1',
+    source: 'mixed',
+    agentId: null,
+    name: 'app icon, Guard exit-code source fix + 38 more agents',
+    roleDescription: 'Overlapping work from 40 agents across 40 turns — First role memory jog',
+    startedAt: Date.UTC(2026, 6, 1), endedAt: Date.UTC(2026, 6, 2),
+    workerUnits: [
+      { agentId: 'w-a', name: 'app icon', roleDescription: 'Built the icon.', kind: 'worker', startedAt: Date.UTC(2026, 6, 1), endedAt: Date.UTC(2026, 6, 1), turnCount: 1, memberEntryIds: ['e1'] },
+      { agentId: 'w-b', name: 'Guard exit-code source fix', roleDescription: 'Fixed the guard.', kind: 'worker', startedAt: Date.UTC(2026, 6, 2), endedAt: Date.UTC(2026, 6, 2), turnCount: 1, memberEntryIds: ['e1'] },
+    ],
+  },
+};
+
 // ── render harness ───────────────────────────────────────────────────────────
 let container: HTMLDivElement;
 let root: Root;
@@ -227,6 +249,42 @@ describe('SaveCard bundle rendering', () => {
     expect(workers?.textContent).toContain('memory-tool-worker');
     expect(workers?.textContent).toContain('review-ui-worker');
     expect(container.querySelector('[data-testid="save-card-unsaved-count"]')?.textContent).toContain('1 package');
+  });
+
+  it('renders a mixed-owner bundle honestly — no fabricated From-agent/supervisor prefix', async () => {
+    getInventory.mockResolvedValue(inv([mixedBundle]));
+    await render();
+    const desc = container.querySelector('[data-testid="save-bundle-desc"]');
+    expect(desc).toBeTruthy();
+    // Honest header, none of the fabricated ownership prefixes.
+    expect(desc?.textContent).toContain('Overlapping work');
+    expect(desc?.textContent).not.toContain('From agent');
+    expect(desc?.textContent).not.toContain('From supervisor');
+    // The card title says Overlapping work rather than parading the name list as an owner.
+    expect(container.querySelector('[data-testid="save-bundle"] h2')?.textContent).toBe('Overlapping work');
+    // Counts surface (2 contributing worker units, 2 witnessed turns from the component).
+    expect(desc?.textContent).toContain('2 agents');
+    expect(desc?.textContent).toContain('2 turns');
+    // The clamped 1L.1 name list survives as secondary memory-jog detail.
+    expect(desc?.textContent).toContain('app icon, Guard exit-code source fix + 38 more agents');
+  });
+
+  it('keeps distinct mixed components as separate cards (groupingKey mixed:<componentId>)', async () => {
+    const mixedTwo: WorkBundleDto = {
+      ...mixedBundle,
+      bundleId: 'b-mixed-2',
+      component: {
+        ...mixedBundle.component!, componentId: 'c2', dirtyEntryIds: ['e9'],
+        overlap: { ...mixedBundle.component!.overlap, componentId: 'c2' },
+      },
+      members: [{ entry: entry('e9', 'src/renderer/other.tsx'), protection: 'checkpoint-protected' }],
+      identity: { ...mixedBundle.identity!, groupingKey: 'mixed:c2' },
+    };
+    getInventory.mockResolvedValue(inv([mixedBundle, mixedTwo]));
+    await render();
+    // Distinct mixed groupingKeys must NOT collapse into one card.
+    expect(container.querySelectorAll('[data-testid="save-bundle"]')).toHaveLength(2);
+    expect(container.querySelector('[data-testid="save-card-unsaved-count"]')?.textContent).toContain('2 packages');
   });
 
   it('renders the unattributed pseudo-bundle as a no-witness card', async () => {

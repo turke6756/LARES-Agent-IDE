@@ -122,7 +122,6 @@ function attachBundleIdentity(
   agents: ReadonlyMap<string, Agent>,
   turns: ReadonlyMap<string, BundleTurn>,
   witnesses: readonly TurnWitnessRead[],
-  structuralSupervisors: ReadonlyMap<string, Agent>,
 ): SaveCardBundle {
   if (bundle.kind === 'unattributed' || !bundle.component) {
     return { ...bundle, identity: null };
@@ -133,13 +132,14 @@ function attachBundleIdentity(
   const agentIds = new Set(relevantWitnesses.flatMap((w) => w.agentId ? [w.agentId] : []));
   const ownerIds = new Set<string>();
 
+  // Owner resolution uses ONLY real data: the witness's recorded owner edge, else
+  // the contributing agent's own owner edge. We never fabricate ownership — an
+  // agent with no owner edge (even an isSupervised one) contributes as itself, and
+  // a component whose contributors lack a single real owner resolves to 'agent'
+  // (single contributor) or 'mixed' (multiple), never to a guessed supervisor.
   for (const witness of relevantWitnesses) {
     const agent = witness.agentId ? agents.get(witness.agentId) : undefined;
-    const structural = agent ? structuralSupervisors.get(agent.workspaceId) : undefined;
-    const ownerId = witness.ownerAgentId
-      ?? agent?.ownerAgentId
-      ?? (agent?.isSupervisor ? agent.id : undefined)
-      ?? (agent?.isSupervised ? structural?.id : undefined);
+    const ownerId = witness.ownerAgentId ?? agent?.ownerAgentId;
     if (ownerId) ownerIds.add(ownerId);
   }
 
@@ -289,9 +289,6 @@ export function createSaveCardRoutes(deps: SaveCardRoutesDeps): SaveCardRoutes {
     ));
     const agentRows = [...includedWorkspaceIds].flatMap((workspaceId) => getAgentsByWorkspace(workspaceId));
     const agents = new Map(agentRows.map((agent) => [agent.id, agent]));
-    const structuralSupervisors = new Map(
-      agentRows.filter((agent) => agent.isSupervisor).map((agent) => [agent.workspaceId, agent]),
-    );
     const bundleTurns = [...includedWorkspaceIds].flatMap((workspaceId) => readBundleTurns(workspaceId));
     const turns = new Map(bundleTurns.map((turn) => [turn.id, turn]));
     const witnesses = [...includedWorkspaceIds].flatMap((workspaceId) => readTurnWitnesses(workspaceId));
@@ -308,7 +305,6 @@ export function createSaveCardRoutes(deps: SaveCardRoutesDeps): SaveCardRoutes {
         agents,
         turns,
         witnesses,
-        structuralSupervisors,
       )),
       quotaWeakening,
     };
