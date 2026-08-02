@@ -34,6 +34,8 @@
 
 import {
   RETENTION_DENSE_WINDOW_MS,
+  RETENTION_PIN_MAX_EXTENSION_MS,
+  RETENTION_PIN_QUOTA_BYTES,
   COMPACT_DIFF_MAX_BYTES,
   MAINTENANCE_LOOSE_OBJECT_THRESHOLD,
   MAINTENANCE_RUNTIME_DEADLINE_MS,
@@ -42,13 +44,29 @@ import type { TurnRecord } from '../database';
 import {
   listTurnRecords as dbListTurnRecords,
   getTurnRecord as dbGetTurnRecord,
+  listCommitPathLinks as dbListCommitPathLinks,
   updateTurnRecord as dbUpdateTurnRecord,
 } from '../database';
-import { runGit as realRunGit } from './git-command';
+import { runGit as realRunGit, runGitBytes as realRunGitBytes } from './git-command';
 import type { RunGitLike } from './checkpoint-service';
 import { CheckpointQueue, type SkippedDeadline } from './checkpoint-queue';
-import { verifyLiveEdge } from './live-edge';
+import { liveEdgeKey, verifyLiveEdge, verifyLiveEdgesBatch } from './live-edge';
 import { deleteRefPair, type RefDeletion, type ReconLogger } from './reconciler';
+import { deriveRepositoryIdentity, defaultRepositoryIdentityDeps } from '../commit-candidates/repository-identity';
+import {
+  produceDirtyInventory,
+  type RunGitBytesLike,
+} from '../commit-candidates/dirty-inventory';
+import { evaluateCheckpointProtection } from '../commit-candidates/protection-read';
+import type { DirtyEntry } from '../../shared/commit-candidates';
+import {
+  accountAndSelectPins,
+  type PinAccountingCandidate,
+} from './pin-accounting';
+import {
+  selectRetentionPins,
+  type RetentionPinWeakeningWarning,
+} from './protection-policy';
 
 const DEFAULT_LOGGER: ReconLogger = {
   info: (m) => console.log(m),
@@ -83,8 +101,17 @@ export interface RetentionDeps {
   queue: CheckpointQueue;
   /** `capability.commonDirQueueKey` — the object-database serialization key. */
   commonDirQueueKey: string;
+  /** Top-anchored repository-relative prefix for this workspace. */
+  workspacePrefix?: string;
   runGit?: RunGitLike;
+  runGitBytes?: RunGitBytesLike;
   turnStore?: RetentionTurnStore;
+  /** Stage 3 supplies active finalization refs; absent in Stage 2. */
+  activeBoundaryRefs?: () => readonly string[] | Promise<readonly string[]>;
+  /** Test seam for dirty inventory. Production uses the normative WP-1B producer. */
+  enumerateDirtyEntries?: () => Promise<{ repositoryKey: string; entries: DirtyEntry[] }>;
+  /** Test seam for exact WP-2G ledger protection. */
+  readLocallyCommittedEntryIds?: (entries: readonly DirtyEntry[], repositoryKey: string) => Promise<ReadonlySet<string>>;
   now?: () => number;
   /** Dense-retention window (ms). Default `RETENTION_DENSE_WINDOW_MS` (10 days). */
   retentionMs?: number;
@@ -222,6 +249,7 @@ export interface RetentionPassResult {
   distilled: number;
   prunedTurns: number;
   deleteFailures: number;
+  pinningWarning: RetentionPinWeakeningWarning | null;
 }
 
 /**
@@ -232,12 +260,17 @@ export interface RetentionPassResult {
  */
 export async function runRetentionPass(deps: RetentionDeps): Promise<RetentionPassResult> {
   const cfg = resolveConfig(deps);
-  const result: RetentionPassResult = { outcomes: [], distilled: 0, prunedTurns: 0, deleteFailures: 0 };
+  const rows = cfg.turnStore.listTurnRecords(deps.workspaceId);
+  const pinning = await prepareRetentionPins(cfg, rows);
+  const result: RetentionPassResult = {
+    outcomes: [], distilled: 0, prunedTurns: 0, deleteFailures: 0,
+    pinningWarning: pinning.warning,
+  };
 
-  for (const row of cfg.turnStore.listTurnRecords(deps.workspaceId)) {
+  for (const row of rows) {
     let outcome: TurnRetentionOutcome;
     try {
-      outcome = await processTurn(cfg, row);
+      outcome = await processTurn(cfg, row, pinning.retainedEdgeKeys);
     } catch (err) {
       outcome = { turnId: row.id, action: 'delete-failed', detail: describeError(err) };
     }
@@ -259,7 +292,12 @@ interface ResolvedConfig {
   queue: CheckpointQueue;
   key: string;
   runGit: RunGitLike;
+  runGitBytes: RunGitBytesLike;
   turnStore: RetentionTurnStore;
+  workspacePrefix: string;
+  activeBoundaryRefs: () => readonly string[] | Promise<readonly string[]>;
+  enumerateDirtyEntries?: RetentionDeps['enumerateDirtyEntries'];
+  readLocallyCommittedEntryIds?: RetentionDeps['readLocallyCommittedEntryIds'];
   now: () => number;
   retentionMs: number;
   compactDiffMaxBytes: number;
@@ -277,7 +315,12 @@ function resolveConfig(deps: RetentionDeps): ResolvedConfig {
     queue: deps.queue,
     key: deps.commonDirQueueKey,
     runGit: deps.runGit ?? realRunGit,
+    runGitBytes: deps.runGitBytes ?? realRunGitBytes,
     turnStore: deps.turnStore ?? DEFAULT_TURN_STORE,
+    workspacePrefix: deps.workspacePrefix ?? '',
+    activeBoundaryRefs: deps.activeBoundaryRefs ?? (() => []),
+    enumerateDirtyEntries: deps.enumerateDirtyEntries,
+    readLocallyCommittedEntryIds: deps.readLocallyCommittedEntryIds,
     now: deps.now ?? Date.now,
     retentionMs: deps.retentionMs ?? RETENTION_DENSE_WINDOW_MS,
     compactDiffMaxBytes: deps.compactDiffMaxBytes ?? COMPACT_DIFF_MAX_BYTES,
@@ -288,9 +331,206 @@ function resolveConfig(deps: RetentionDeps): ResolvedConfig {
   };
 }
 
-async function processTurn(cfg: ResolvedConfig, row: TurnRecord): Promise<TurnRetentionOutcome> {
+interface PrunableLiveEdge {
+  row: TurnRecord;
+  edge: 'before' | 'after';
+  normalPruneEligibleAt: number;
+}
+
+interface PreparedRetentionPins {
+  retainedEdgeKeys: Set<string>;
+  warning: RetentionPinWeakeningWarning | null;
+}
+
+/**
+ * Build one repository-wide pin selection before mutating any ref. All live-edge
+ * checks are batched. Inventory failure takes the explicit conservative fallback;
+ * failures after inventory succeeded retain every unexpired candidate fail-safe.
+ */
+async function prepareRetentionPins(
+  cfg: ResolvedConfig,
+  rows: readonly TurnRecord[],
+): Promise<PreparedRetentionPins> {
   const now = cfg.now();
-  const decision = decidePruneEdges(row, now, cfg.retentionMs);
+  const possible = rows.flatMap((row): PrunableLiveEdge[] => {
+    const decision = decidePruneEdges(row, now, cfg.retentionMs);
+    const timestamp = row.endedAt ?? row.startedAt;
+    if (timestamp == null) return [];
+    const normalPruneEligibleAt = timestamp + cfg.retentionMs;
+    const result: PrunableLiveEdge[] = [];
+    if (decision.before && row.beforeReady && row.beforeRef && row.beforeOid) {
+      result.push({ row, edge: 'before', normalPruneEligibleAt });
+    }
+    if (decision.after && row.afterReady && row.afterRef && row.afterOid) {
+      result.push({ row, edge: 'after', normalPruneEligibleAt });
+    }
+    return result;
+  });
+  if (possible.length === 0) return { retainedEdgeKeys: new Set(), warning: null };
+
+  const liveKeys = await verifyLiveEdgesBatch({
+    repoRoot: cfg.repoRoot,
+    edges: possible.map(({ row, edge }) => ({
+      ref: edge === 'before' ? row.beforeRef : row.afterRef,
+      oid: edge === 'before' ? row.beforeOid : row.afterOid,
+    })),
+    runGit: cfg.runGit,
+    gitExe: cfg.gitExe,
+  });
+  const live = possible.filter(({ row, edge, normalPruneEligibleAt }) => {
+    if (now > normalPruneEligibleAt + RETENTION_PIN_MAX_EXTENSION_MS) return false;
+    const ref = edge === 'before' ? row.beforeRef : row.afterRef;
+    const oid = edge === 'before' ? row.beforeOid : row.afterOid;
+    return ref !== null && oid !== null && liveKeys.has(liveEdgeKey(ref, oid));
+  });
+  if (live.length === 0) return { retainedEdgeKeys: new Set(), warning: null };
+
+  let inventory: { repositoryKey: string; entries: DirtyEntry[] };
+  try {
+    inventory = cfg.enumerateDirtyEntries
+      ? await cfg.enumerateDirtyEntries()
+      : await enumerateRetentionDirtyEntries(cfg);
+  } catch {
+    // Enumeration uncertainty is a specified fallback, not proof of cleanliness.
+    // Every live otherwise-prunable edge participates, including edges far beyond
+    // the dense window, with an over-accounted full-quota logical cost.
+    const selection = selectRetentionPins(live.map(({ row, edge, normalPruneEligibleAt }) => ({
+      turnId: row.id,
+      edge,
+      dirtyEntryIds: [`unknown:${row.id}:${edge}`],
+      normalPruneEligibleAt,
+      estimatedBytes: RETENTION_PIN_QUOTA_BYTES,
+    })), now);
+    return {
+      retainedEdgeKeys: new Set(selection.retainedEdges.map((edge) => pinEdgeKey(edge.turnId, edge.edge))),
+      warning: selection.warning,
+    };
+  }
+
+  try {
+    const locallyCommitted = cfg.readLocallyCommittedEntryIds
+      ? await cfg.readLocallyCommittedEntryIds(inventory.entries, inventory.repositoryKey)
+      : await readLocallyCommittedEntryIds(cfg, inventory.entries, inventory.repositoryKey);
+    const stillDirty = inventory.entries.filter((entry) => !locallyCommitted.has(entry.entryId));
+    const byPath = new Map<string, DirtyEntry[]>();
+    for (const entry of stillDirty) {
+      for (const encoded of [entry.path, entry.originalPath].filter((value) => value !== null)) {
+        if (!encoded.utf8Clean) continue;
+        const repoPath = Buffer.from(encoded.pathBytesBase64, 'base64').toString('utf8').replace(/\\/g, '/');
+        const atPath = byPath.get(repoPath) ?? [];
+        atPath.push(entry);
+        byPath.set(repoPath, atPath);
+      }
+    }
+
+    const candidates: PinAccountingCandidate[] = live.flatMap(({ row, edge, normalPruneEligibleAt }) => {
+      const entries = new Map<string, DirtyEntry>();
+      for (const witness of row.touched ?? []) {
+        if (witness.op !== 'write' && witness.op !== 'create') continue;
+        const repoPath = joinRepoPath(cfg.workspacePrefix, witness.path);
+        for (const entry of byPath.get(repoPath) ?? []) entries.set(entry.entryId, entry);
+      }
+      if (entries.size === 0) return [];
+      return [{ turnId: row.id, edge, normalPruneEligibleAt, dirtyEntries: [...entries.values()] }];
+    });
+    if (candidates.length === 0) return { retainedEdgeKeys: new Set(), warning: null };
+
+    const activeBoundaryRefs = await cfg.activeBoundaryRefs();
+    const selection = await accountAndSelectPins({
+      repoRoot: cfg.repoRoot,
+      candidates,
+      reachableRoots: ['HEAD', ...activeBoundaryRefs],
+      now,
+      runGit: cfg.runGit,
+      gitExe: cfg.gitExe,
+    });
+    return {
+      retainedEdgeKeys: new Set(selection.retainedEdges.map((edge) => pinEdgeKey(edge.turnId, edge.edge))),
+      warning: selection.warning,
+    };
+  } catch (error) {
+    cfg.log.warn(`[retention] pin accounting failed; retaining live candidates: ${describeError(error)}`);
+    return {
+      retainedEdgeKeys: new Set(live.map(({ row, edge }) => pinEdgeKey(row.id, edge))),
+      warning: null,
+    };
+  }
+}
+
+async function enumerateRetentionDirtyEntries(
+  cfg: ResolvedConfig,
+): Promise<{ repositoryKey: string; entries: DirtyEntry[] }> {
+  const identity = await deriveRepositoryIdentity(
+    cfg.repoRoot,
+    { commonDirQueueKey: cfg.key },
+    defaultRepositoryIdentityDeps((args) => cfg.runGit(cfg.repoRoot, args, {
+      gitExe: cfg.gitExe,
+      allowNonzero: true,
+      timeoutMs: 10_000,
+      maxBytes: 1 << 20,
+    })),
+  );
+  if (!identity.ok) throw new Error(`repository identity unavailable: ${identity.reason}`);
+  const repository = {
+    repositoryKey: identity.repositoryKey,
+    objectDatabaseKey: identity.objectDatabaseKey,
+    gitObjectFormat: identity.gitObjectFormat,
+    bareRepo: false as const,
+    workspaces: [{ workspaceId: cfg.workspaceId, workspacePrefix: cfg.workspacePrefix }],
+  };
+  const draft = await produceDirtyInventory({
+    repoRoot: cfg.repoRoot,
+    workspacePrefix: cfg.workspacePrefix,
+    repository,
+    runGitBytes: cfg.runGitBytes,
+    runGit: cfg.runGit,
+    gitExe: cfg.gitExe,
+  });
+  return { repositoryKey: repository.repositoryKey, entries: draft.entries };
+}
+
+async function readLocallyCommittedEntryIds(
+  cfg: ResolvedConfig,
+  entries: readonly DirtyEntry[],
+  repositoryKey: string,
+): Promise<ReadonlySet<string>> {
+  if (entries.length === 0) return new Set();
+  const protection = await evaluateCheckpointProtection({
+    repoRoot: cfg.repoRoot,
+    members: entries,
+    checkpointEdges: [],
+    runGit: cfg.runGit,
+    runGitBytes: cfg.runGitBytes,
+    repositoryKey,
+    readCommitPathLinks: dbListCommitPathLinks,
+    gitExe: cfg.gitExe,
+  });
+  return new Set(protection.members
+    .filter((member) => member.protection === 'locally-committed' || member.protection === 'remote-reachable')
+    .map((member) => member.entryId));
+}
+
+function joinRepoPath(prefix: string, workspacePath: string): string {
+  const cleanPrefix = prefix.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+  const cleanPath = workspacePath.replace(/\\/g, '/').replace(/^\/+/, '');
+  return cleanPrefix ? `${cleanPrefix}/${cleanPath}` : cleanPath;
+}
+
+function pinEdgeKey(turnId: string, edge: 'before' | 'after'): string {
+  return `${turnId}\0${edge}`;
+}
+
+async function processTurn(
+  cfg: ResolvedConfig,
+  row: TurnRecord,
+  retainedEdgeKeys: ReadonlySet<string>,
+): Promise<TurnRetentionOutcome> {
+  const now = cfg.now();
+  const normalDecision = decidePruneEdges(row, now, cfg.retentionMs);
+  const decision = {
+    before: normalDecision.before && !retainedEdgeKeys.has(pinEdgeKey(row.id, 'before')),
+    after: normalDecision.after && !retainedEdgeKeys.has(pinEdgeKey(row.id, 'after')),
+  };
   if (!decision.before && !decision.after) return { turnId: row.id, action: 'kept' };
 
   // Which TARGETED edges are still live? A targeted-but-dead edge was pruned in a

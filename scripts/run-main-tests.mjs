@@ -116,8 +116,9 @@ const TESTS = [
   // Save-card SC-WP-2A: immutable turn plan-stamp schema, mapper, and guards.
   'dist/main/main/database.turnStamp.test.js',
   'dist/main/main/dispatch-binding.boundary.test.js',
-  // Save-card SC-WP-2H/2J: protected-worktree policy and commit representation.
+  // Save-card SC-WP-2H/2J/2K: pin policy/accounting and commit representation.
   'dist/main/main/git-checkpoints/protection-policy.test.js',
+  'dist/main/main/git-checkpoints/pin-accounting.test.js',
   'dist/main/main/commit-candidates/commit-representation.test.js',
   // Terminal-log retention WP-1: reclaimed-marker column — idempotent migration,
   // the WHERE-guarded write (first value preserved, own column only), NULL→null.
@@ -192,10 +193,11 @@ const TESTS = [
   // on real git) + dangling-open close + paired-ref deletion + temp-artifact sweeper.
   'dist/main/main/git-checkpoints/reconciler.test.js',
   'dist/main/main/git-checkpoints/commit-reconciler.test.js',
-  // Git-Native WP-G3.3: retention (dense-window thinning to accepted-task boundary),
+  // Git-Native WP-G3.3 + Save-card SC-WP-2K: retention/pinning integration,
   // distill-before-prune ordering + G3 gate back-fill, triggered/bounded loose-object
   // maintenance (idle-only slot, no config mutation, nonfatal on lock), storage report.
   'dist/main/main/git-checkpoints/retention.test.js',
+  'dist/main/main/git-checkpoints/retention.pinning.test.js',
   // Git-Native WP-G1.7: witness-join recorder + DB choke point (above the live-cache
   // dedupe), dispatch-context builder, and the send-queue → before-checkpoint wiring.
   'dist/main/main/git-checkpoints/witness-recorder.test.js',

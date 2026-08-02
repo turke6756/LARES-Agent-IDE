@@ -386,6 +386,7 @@ export async function createCheckpointEngine(): Promise<CheckpointEngineHandle |
             gitExe,
             queue,
             commonDirQueueKey: cap.commonDirQueueKey,
+            workspacePrefix: cap.workspacePrefix ?? '',
           }),
         );
       } catch (err) {
