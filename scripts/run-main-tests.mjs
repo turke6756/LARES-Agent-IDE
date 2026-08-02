@@ -330,6 +330,7 @@ const TESTS = [
   'dist/main/main/api-identity.test.js',
   'dist/main/main/api-codex-session-bind.test.js',
   'dist/main/main/continuation-lifecycle.test.js',
+  'dist/main/main/continuation-binding.restart.test.js',
   'dist/main/main/supervisor/continuation-watcher.test.js',
   'dist/main/main/supervisor/continuation-phase-authority.test.js',
   'dist/main/main/supervisor/file-activities-retention.test.js',

@@ -156,6 +156,7 @@ import {
   updateAgentLastSendError, updateAgentLastSend,
   setContinuationEnabled as dbSetContinuationEnabled,
   getContinuationAttempt, getCurrentBrick, commitContinuationRelaunch,
+  freezeContinuationAttemptBinding, getContinuationAttemptBinding,
   getLatestContinuationAttempt,
   insertAgentSession, closeAgentSession,
   getAgentsByOwner,
@@ -506,6 +507,18 @@ function resolveLifecyclePlanStamp(
   }, agent, requested);
   if (!resolution.ok) throw revErr(resolution.reason, 400);
   return Object.freeze({ ...resolution.stamp });
+}
+
+/** Rehydrate only the binding frozen on the continuation attempt. A legacy
+ * attempt has no trustworthy binding, so callers must not substitute a live
+ * agent default or a latest-turn value. */
+function getContinuationAttemptDispatch(attemptId: string): DispatchContext | null {
+  const binding = getContinuationAttemptBinding(attemptId);
+  if (!binding || binding.source === 'legacy-unstamped') return null;
+  if (binding.source !== 'continuation-carry') {
+    throw new Error(`continuation attempt ${attemptId} has invalid source '${binding.source}'`);
+  }
+  return withResolvedPlanStamp({ origin: 'human-terminal' }, binding);
 }
 
 /** WP3.1 — the orientation preamble prepended to a revival wake message. There is
@@ -6260,6 +6273,19 @@ export class AgentSupervisor extends EventEmitter {
       throw new Error(`continuationRelaunch: attempt ${brick.handoffAttemptId} not found for agent ${agentId}`);
     }
 
+    // SC-WP-2F: freeze the active binding before any teardown. The dispatch is
+    // then re-read from the attempt row; neither this rail nor restart recovery
+    // may rediscover it from turn_records or the post-relaunch agent row.
+    freezeContinuationAttemptBinding(attempt.id, Object.freeze({
+      planId: agent.planId ?? null,
+      planItemId: null,
+      source: 'continuation-carry',
+    }));
+    const continuationDispatch = getContinuationAttemptDispatch(attempt.id);
+    if (!continuationDispatch) {
+      throw new Error(`continuationRelaunch: attempt ${attempt.id} has no frozen binding`);
+    }
+
     // BUG-41 — mark the swap in flight BEFORE the stop (so the sub-second 'done'
     // window between stopAgent and the 'restarting' flip is covered). Cleared in
     // continuationLaunchTail's finally on the normal path; the catch below clears
@@ -6315,6 +6341,7 @@ export class AgentSupervisor extends EventEmitter {
       this.pendingInitialPrompts.set(agentId, {
         text: buildContinuationKickoffMessage(),
         expiresAt: Date.now() + INITIAL_USER_PROMPT_TTL_MS,
+        dispatch: continuationDispatch,
       });
 
       // Step 7 — the runner-launch tail (and ONLY the launch). The phase moves
@@ -8194,10 +8221,19 @@ export class AgentSupervisor extends EventEmitter {
               // reconcile re-drive too, so a successor whose Electron died
               // between the atomic transaction and its first write still wakes
               // warm. Same one-liner as continuationRelaunch Step 6.5.
-              this.pendingInitialPrompts.set(agent.id, {
-                text: buildContinuationKickoffMessage(),
-                expiresAt: Date.now() + INITIAL_USER_PROMPT_TTL_MS,
-              });
+              const continuationDispatch = getContinuationAttemptDispatch(relaunched.id);
+              if (continuationDispatch) {
+                this.pendingInitialPrompts.set(agent.id, {
+                  text: buildContinuationKickoffMessage(),
+                  expiresAt: Date.now() + INITIAL_USER_PROMPT_TTL_MS,
+                  dispatch: continuationDispatch,
+                });
+              } else {
+                // Migrated pre-stamping attempts are explicitly unavailable.
+                // Launch without an auto-submitted turn rather than fabricating
+                // attribution from agents.plan_id or the latest turn record.
+                console.warn(`[reconcile] Continuation attempt ${relaunched.id} has no frozen binding; kickoff omitted`);
+              }
               this.continuationLaunchTail(agent.id, agent.resumeSessionId);
               await new Promise(r => setTimeout(r, AgentSupervisor.RECONCILE_STAGGER_MS));
               continue;

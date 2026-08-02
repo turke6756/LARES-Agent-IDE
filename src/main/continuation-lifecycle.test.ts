@@ -134,6 +134,9 @@ type DbModule = {
   updateAgentResumeSessionId(id: string, sessionId: string): void;
   setContinuationGeneration(agentId: string, gen: number): void;
   createContinuationHandoffAttempt(agentId: string, opts?: { reason?: string; thresholdContextPct?: number }): Attempt;
+  freezeContinuationAttemptBinding(attemptId: string, binding: {
+    planId: string | null; planItemId: null; source: 'continuation-carry';
+  }): unknown;
   getContinuationAttempt(id: string): Attempt | null;
   getLatestContinuationAttempt(agentId: string, status?: string): Attempt | null;
   getOpenContinuationAttempt(agentId: string): Attempt | null;
@@ -564,6 +567,9 @@ test('WP2 pre-stage: a successful continuationRelaunch seeds pendingInitialPromp
 test('WP2 pre-stage §4.1: the boot-reconcile re-drive ALSO seeds the kickoff (reconcile decision pinned)', async () => {
   const agent = makeDbAgent();
   const att = dbm.createContinuationHandoffAttempt(agent.id);
+  dbm.freezeContinuationAttemptBinding(att.id, {
+    planId: null, planItemId: null, source: 'continuation-carry',
+  });
   dbm.insertContinuationBrick({
     agentId: agent.id, handoffAttemptId: att.id, generation: att.generation,
     note: 'redrive note', noteSource: 'tool',

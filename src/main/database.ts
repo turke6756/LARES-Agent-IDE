@@ -217,6 +217,18 @@ export function initDatabase(): void {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_continuation_attempts_agent_status
            ON continuation_handoff_attempts (dashboard_agent_id, status)`);
 
+  // Save-card SC-WP-2F: persist the continuation binding independently of
+  // mutable agent state and turn history so the wake survives app restart.
+  try { db.exec(`ALTER TABLE continuation_handoff_attempts ADD COLUMN plan_id TEXT`); } catch { /* exists */ }
+  try { db.exec(`ALTER TABLE continuation_handoff_attempts ADD COLUMN plan_item_id TEXT`); } catch { /* exists */ }
+  try {
+    db.exec(`ALTER TABLE continuation_handoff_attempts ADD COLUMN plan_stamp_source TEXT NOT NULL
+      DEFAULT 'legacy-unstamped'
+      CHECK (plan_stamp_source IN ('legacy-unstamped', 'explicit', 'agent-default',
+        'fork-carry', 'revive-carry', 'continuation-carry', 'explicit-none',
+        'unbound-manual'))`);
+  } catch { /* exists */ }
+
   // Context-brick Inc 4 (4.3) — append-only brick rows. Soft supersede only
   // (superseded_at); NO hard delete, NO cascade FK — the graveyard must
   // survive agent deletion.
@@ -3456,6 +3468,12 @@ export interface ContinuationHandoffAttempt {
   thresholdContextPct: number | null;
 }
 
+export type ContinuationAttemptBinding = ResolvedPlanStamp | {
+  planId: null;
+  planItemId: null;
+  source: 'legacy-unstamped';
+};
+
 export interface ContinuationBrickRow {
   id: string;
   dashboardAgentId: string;
@@ -3541,6 +3559,64 @@ export function createContinuationHandoffAttempt(
 export function getContinuationAttempt(id: string): ContinuationHandoffAttempt | null {
   const row = queryOne('SELECT * FROM continuation_handoff_attempts WHERE id = ?', [id]);
   return row ? rowToContinuationAttempt(row) : null;
+}
+
+/** Persist the continuation's active binding exactly once before teardown. */
+export function freezeContinuationAttemptBinding(
+  attemptId: string,
+  binding: ResolvedPlanStamp,
+): ContinuationAttemptBinding {
+  if (binding.source !== 'continuation-carry') {
+    throw new Error(`continuation attempt requires continuation-carry, got '${binding.source}'`);
+  }
+  if (binding.planItemId !== null) {
+    throw new Error('plan_item_id is unsupported until plan_work_packages exists');
+  }
+  const tx = db.transaction(() => {
+    const attempt = queryOne(
+      'SELECT plan_id, plan_item_id, plan_stamp_source FROM continuation_handoff_attempts WHERE id = ?',
+      [attemptId],
+    );
+    if (!attempt) throw new Error(`freezeContinuationAttemptBinding: no attempt ${attemptId}`);
+    if (attempt.plan_stamp_source === 'legacy-unstamped') {
+      run(
+        `UPDATE continuation_handoff_attempts
+            SET plan_id = ?, plan_item_id = ?, plan_stamp_source = ?
+          WHERE id = ? AND plan_stamp_source = 'legacy-unstamped'`,
+        [binding.planId, binding.planItemId, binding.source, attemptId],
+      );
+      return;
+    }
+    if (attempt.plan_stamp_source !== 'continuation-carry') {
+      throw new Error(`continuation attempt ${attemptId} has invalid frozen source '${String(attempt.plan_stamp_source)}'`);
+    }
+    // Idempotent retry: once frozen, the stored value wins even if mutable live
+    // agent state changed after a prior relaunch attempt failed.
+  });
+  tx();
+  return getContinuationAttemptBinding(attemptId)!;
+}
+
+/** Read only the attempt-frozen binding. Legacy attempts stay explicitly
+ * unavailable instead of falling back to turn_records or agents.plan_id. */
+export function getContinuationAttemptBinding(attemptId: string): ContinuationAttemptBinding | null {
+  const row = queryOne(
+    'SELECT plan_id, plan_item_id, plan_stamp_source FROM continuation_handoff_attempts WHERE id = ?',
+    [attemptId],
+  );
+  if (!row) return null;
+  const source = row.plan_stamp_source as PersistedTurnPlanStampSource;
+  if (source === 'legacy-unstamped') {
+    return { planId: null, planItemId: null, source };
+  }
+  if (!TURN_PLAN_STAMP_SOURCES.has(source)) {
+    throw new Error(`invalid continuation attempt plan stamp source '${String(row.plan_stamp_source)}'`);
+  }
+  return {
+    planId: row.plan_id ?? null,
+    planItemId: row.plan_item_id ?? null,
+    source,
+  };
 }
 
 /** Latest attempt for an agent, optionally filtered by status (newest by
