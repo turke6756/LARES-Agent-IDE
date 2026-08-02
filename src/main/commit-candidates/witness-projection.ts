@@ -41,6 +41,8 @@ export interface ProjectedWitness {
   ownerBrickGeneration: number | null;
   planId: string | null;
   planItemId: string | null;
+  /** Internal presentation signal; deliberately excluded from topology identity. */
+  planAttributionAvailable: boolean;
 }
 
 function repositoryPath(workspacePrefix: string, touchedPath: string): string {
@@ -104,6 +106,7 @@ export function projectWitnesses(
           ownerBrickGeneration: turn.ownerBrickGeneration,
           planId: stamp?.planId ?? null,
           planItemId: stamp?.planItemId ?? null,
+          planAttributionAvailable: stamp !== null,
         });
       }
     }

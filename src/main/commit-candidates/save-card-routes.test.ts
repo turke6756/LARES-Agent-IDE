@@ -26,6 +26,7 @@ import { SAVECARD_CHANNELS } from '../../shared/types';
 import type { Agent } from '../../shared/types';
 import type { CaptureHealthTurn } from './capture-health';
 import { createSaveCardRoutes } from './save-card-routes';
+import type { TurnStampRecord } from './stamp-projection';
 
 interface TestCase { name: string; run(): void | Promise<void>; }
 const tests: TestCase[] = [];
@@ -106,6 +107,17 @@ function buildRoutes(overrides: RouteOverrides = {}): SaveCardRoutes {
     gitExe,
     getWorkspaces: fakeGetWorkspaces,
     readTurnWitnesses: (workspaceId) => witnessRows[workspaceId] ?? [],
+    readTurnRecord: (turnId): TurnStampRecord | null => {
+      const workspaceId = Object.entries(witnessRows).find(([, rows]) =>
+        rows.some((row) => row.turnId === turnId))?.[0];
+      return workspaceId ? {
+        id: turnId,
+        workspaceId,
+        planId: null,
+        planItemId: null,
+        planStampSource: 'legacy-unstamped',
+      } : null;
+    },
     readCaptureTurns: (workspaceId) => captureRows[workspaceId] ?? [],
     getAgentsByWorkspace: (workspaceId) => workspaceId === 'workspace-a' ? [supervisor, worker] : [],
     readBundleTurns: (workspaceId) => (captureRows[workspaceId] ?? []).map((turn, index) => ({
@@ -176,6 +188,24 @@ test('maps the renderer workspaceId to the shared-worktree repository inventory'
   // The out-of-repo change is never scoped in.
   const allPaths = bundles.flatMap((bundle) => bundle.members.map((m) => m.entry.path.displayPath));
   assert.equal(allPaths.includes('outside.txt'), false);
+});
+
+test('projects immutable turn stamps into Save-card plan labels', async () => {
+  const routes = buildRoutes({
+    readTurnRecord: (turnId) => ({
+      id: turnId,
+      workspaceId: turnId === 'turn-a' ? 'workspace-a' : 'workspace-b',
+      planId: 'plan-frozen',
+      planItemId: null,
+      planStampSource: 'agent-default',
+    }),
+  });
+  const bundles = await routes.getInventory({ workspaceId: 'workspace-a' });
+  const component = bundles.find((bundle) => bundle.kind === 'component');
+
+  assert.ok(component);
+  assert.ok(component.labels.includes('Plan plan-frozen'));
+  assert.equal(component.labels.includes('Plan attribution unavailable — legacy-unstamped'), false);
 });
 
 test('candidate request carries every registered workspace so sibling lanes union', async () => {

@@ -23,6 +23,7 @@ import type { Agent, GitCapability, SaveCardBundleIdentity, SaveCardInventoryReq
 import {
   getAgentsByWorkspace as dbGetAgentsByWorkspace,
   getAgent as dbGetAgent,
+  getTurnRecord as dbGetTurnRecord,
   getWorkspaces as dbGetWorkspaces,
   getTurnWitnessReads as dbGetTurnWitnessReads,
   listTurnRecords as dbListTurnRecords,
@@ -38,6 +39,7 @@ import {
 } from './candidate-service';
 import type { RunGitBytesLike, RunGitTextLike } from './dirty-inventory';
 import type { TurnWitnessReader } from './witness-projection';
+import { createTurnStampSource, type TurnStampRecordReader } from './stamp-projection';
 import type { SaveCardRoutes } from './save-card-ipc';
 import type { WorkBundle } from './work-bundle';
 
@@ -51,6 +53,7 @@ export interface SaveCardRoutesDeps {
   getWorkspaces?: () => ReadonlyArray<{ id: string; path: string }>;
   probeWorkspaceGit?: (canonicalWorkspaceDir: string) => Promise<GitCapability>;
   readTurnWitnesses?: TurnWitnessReader;
+  readTurnRecord?: TurnStampRecordReader;
   readCaptureTurns?: CaptureTurnReader;
   getAgentsByWorkspace?: (workspaceId: string) => readonly Agent[];
   getAgent?: (agentId: string) => Agent | null;
@@ -220,6 +223,7 @@ export function createSaveCardRoutes(deps: SaveCardRoutesDeps): SaveCardRoutes {
   const getWorkspaces = deps.getWorkspaces ?? dbGetWorkspaces;
   const probeWorkspaceGit = deps.probeWorkspaceGit ?? realProbeWorkspaceGit;
   const readTurnWitnesses = deps.readTurnWitnesses ?? dbGetTurnWitnessReads;
+  const readTurnRecord = deps.readTurnRecord ?? dbGetTurnRecord;
   // Read ALL turns for a workspace (large limit), matching the unbounded witness
   // read, so capture-health and protection-edge projection see the same turn
   // universe rather than only the newest default window.
@@ -238,6 +242,7 @@ export function createSaveCardRoutes(deps: SaveCardRoutesDeps): SaveCardRoutes {
     runGit,
     runGitBytes,
     readTurnWitnesses,
+    stampSource: createTurnStampSource(readTurnRecord),
     readCaptureTurns,
   });
 

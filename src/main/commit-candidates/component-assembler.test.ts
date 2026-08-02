@@ -71,6 +71,7 @@ function witness(
     ownerBrickGeneration: null,
     planId,
     planItemId,
+    planAttributionAvailable: planId !== null || planItemId !== null,
   };
 }
 

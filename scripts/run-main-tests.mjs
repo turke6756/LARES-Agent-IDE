@@ -222,6 +222,7 @@ const TESTS = [
   'dist/main/main/commit-candidates/capture-health.test.js',
   'dist/main/main/git-checkpoints/live-edge.test.js',
   'dist/main/main/commit-candidates/witness-projection.test.js',
+  'dist/main/main/commit-candidates/stamp-projection.test.js',
   'dist/main/main/commit-candidates/component-assembler.test.js',
   'dist/main/main/commit-candidates/protection-read.test.js',
   'dist/main/main/commit-candidates/candidate-service.read.test.js',

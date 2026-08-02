@@ -29,6 +29,7 @@ import {
 import {
   projectWitnesses,
   type TurnWitnessReader,
+  type WitnessStampSource,
 } from './witness-projection';
 import { assembleConflictComponents } from './component-assembler';
 import {
@@ -67,6 +68,8 @@ export interface CandidateServiceDeps {
   runGit: RunGitTextLike;
   runGitBytes: RunGitBytesLike;
   readTurnWitnesses: TurnWitnessReader;
+  /** Immutable turn-row attribution. Null/omitted preserves Stage ① behavior. */
+  stampSource?: WitnessStampSource | null;
   readCaptureTurns: CaptureTurnReader;
   platform?: NodeJS.Platform;
   realpath?(path: string): string;
@@ -79,6 +82,8 @@ export interface CandidateInventoryRead {
   captureHealthByComponentId: Record<string, BundleCaptureHealth>;
   unattributedCaptureHealth: BundleCaptureHealth;
   protectionByEntryId: Record<string, ProtectionRung>;
+  /** Turn IDs whose immutable stamp was legacy/missing, for honest UI labeling. */
+  planAttributionUnavailableTurnIds: Set<string>;
 }
 
 function compareStrings(left: string, right: string): number {
@@ -236,8 +241,14 @@ export class CommitCandidateService {
       repository,
       draft.entries,
       this.deps.readTurnWitnesses,
+      this.deps.stampSource ?? null,
     );
     const assembly = assembleConflictComponents(draft, witnesses);
+    const planAttributionUnavailableTurnIds = new Set(
+      witnesses
+        .filter((witness) => !witness.planAttributionAvailable)
+        .map((witness) => witness.turnId),
+    );
 
     const allTurns = scopedWorkspaces.flatMap(
       (workspace) => [...this.deps.readCaptureTurns(workspace.workspaceId)],
@@ -293,6 +304,7 @@ export class CommitCandidateService {
       captureHealthByComponentId,
       unattributedCaptureHealth,
       protectionByEntryId,
+      planAttributionUnavailableTurnIds,
     };
   }
 

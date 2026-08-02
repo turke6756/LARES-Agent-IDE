@@ -143,6 +143,30 @@ test('copies canonical component membership verbatim and attaches labels', () =>
   assert.equal(bundle.identity, null);
 });
 
+test('labels null legacy attribution as unavailable without inventing a plan', () => {
+  const [bundle] = projectWorkBundles({
+    inventory,
+    components: [{
+      ...component,
+      associations: [{
+        planId: null,
+        planItemId: null,
+        contributingTurnIds: ['turn-legacy'],
+        memberEntryIds: component.dirtyEntryIds,
+      }],
+    }],
+    captureHealthByComponentId: { [component.componentId]: componentHealth },
+    unattributedCaptureHealth: unattributedHealth,
+    protectionByEntryId: {},
+    planAttributionUnavailableTurnIds: new Set(['turn-legacy']),
+  });
+
+  assert.deepEqual(bundle.labels, [
+    'Plan attribution unavailable — legacy-unstamped',
+    'Overlapping work',
+  ]);
+});
+
 test('always adds one synthetic unattributed pseudo-bundle without components', () => {
   const bundles = project();
   const unattributed = bundles.find((bundle) => bundle.kind === 'unattributed');

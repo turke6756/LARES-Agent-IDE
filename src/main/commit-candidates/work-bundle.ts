@@ -40,9 +40,13 @@ export interface WorkBundleProjectionInput {
   captureHealthByComponentId: Readonly<Record<string, BundleCaptureHealth>>;
   unattributedCaptureHealth: BundleCaptureHealth;
   protectionByEntryId: Readonly<Record<string, ProtectionRung>>;
+  planAttributionUnavailableTurnIds?: ReadonlySet<string>;
 }
 
-function componentLabels(component: ConflictComponent): string[] {
+function componentLabels(
+  component: ConflictComponent,
+  unavailableTurnIds: ReadonlySet<string>,
+): string[] {
   const planIds = [...new Set(
     component.associations
       .map((association) => association.planId)
@@ -51,6 +55,10 @@ function componentLabels(component: ConflictComponent): string[] {
   const labels: string[] = [];
   if (planIds.length === 1) labels.push(`Plan ${planIds[0]}`);
   else if (planIds.length > 1) labels.push(`${planIds.length} plans`);
+  if (component.associations.some((association) =>
+    association.contributingTurnIds.some((turnId) => unavailableTurnIds.has(turnId)))) {
+    labels.push('Plan attribution unavailable — legacy-unstamped');
+  }
   if (component.overlap.requiresOverlapAck) labels.push('Overlapping work');
   return labels;
 }
@@ -100,7 +108,10 @@ export function projectWorkBundles(input: WorkBundleProjectionInput): WorkBundle
       entriesById,
       input.protectionByEntryId,
     );
-    const labels = componentLabels(component);
+    const labels = componentLabels(
+      component,
+      input.planAttributionUnavailableTurnIds ?? new Set<string>(),
+    );
     return {
       bundleId: `component:${component.componentId}`,
       kind: 'component',
