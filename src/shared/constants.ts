@@ -1278,6 +1278,37 @@ export const WORKER_CODEX_AGENTS_MD = WORKER_CLAUDE_MD
   // 3. Promote-lessons pointer names the Codex constant, not the Claude one.
   .split('`WORKER_CLAUDE_MD` constant').join('`WORKER_CODEX_AGENTS_MD` constant');
 
+/** Grok Build worker standing instructions — seeded write-if-absent to
+ *  <workspace>/.lares/workers/grok/AGENTS.md on first supervised Grok worker
+ *  launch. `AGENTS.md` is the project-rules filename the Grok CLI auto-loads
+ *  from its cwd (Grok Project Rules; same provider-neutral convention Codex
+ *  uses), so a Grok worker actually receives these instructions.
+ *
+ *  DERIVED, not forked, from WORKER_CLAUDE_MD via the SAME documented
+ *  `.split().join()` anti-drift chain as WORKER_CODEX_AGENTS_MD (NOT reused from
+ *  it — the codex body hard-codes `.lares/workers/codex/` and the codex constant
+ *  name, which would mislead a grok worker). Editing WORKER_CLAUDE_MD updates ALL
+ *  three provider bodies. Only the genuinely provider-specific tokens transform:
+ *    1. Working-dir + memory-section cwd refs: `.lares/workers/claude/` → grok.
+ *    2. "How to ask questions": the Claude-Code-specific `AskUserQuestion` /
+ *       plan-mode dialog names → provider-neutral phrasing; the INTENT (never
+ *       invoke an interactive blocking dialog; end the turn with the question in
+ *       plain text) is preserved verbatim — matching WORKER_CODEX_AGENTS_MD.
+ *    3. The (already-retired-in-v9) promote-lessons pointer names the grok
+ *       constant, not the Claude one — a harmless no-op today, kept for parity
+ *       with the codex derivation so a future re-introduction can't drift.
+ *  Every other section — crucially "Never use git to discard uncommitted work" —
+ *  passes through BYTE-IDENTICAL (it contains none of the transformed tokens),
+ *  which the parity test asserts. */
+export const WORKER_GROK_AGENTS_MD = WORKER_CLAUDE_MD
+  // 1. cwd references (Working directory + Memory sections) point at the grok lane.
+  .split('.lares/workers/claude/').join('.lares/workers/grok/')
+  // 2. Claude-Code-specific blocking-dialog names → provider-neutral phrasing.
+  .split('`AskUserQuestion`,\nplan-mode approval prompts, `(y/n)` confirmations, ')
+  .join('an interactive approval prompt or `(y/n)` confirmation, ')
+  // 3. Promote-lessons pointer names the Grok constant, not the Claude one.
+  .split('`WORKER_CLAUDE_MD` constant').join('`WORKER_GROK_AGENTS_MD` constant');
+
 /** WP-G (Memory & Lessons v2): the frozen v1 Codex AGENTS.md body — the byte-exact
  *  Codex derivation of the FROZEN worker v8 (WORKER_CLAUDE_MD_V8), applying the same
  *  three transforms the live derivation above applies. It is the previousHashes[1]

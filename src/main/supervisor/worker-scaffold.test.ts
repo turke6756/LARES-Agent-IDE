@@ -17,11 +17,12 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { AgentSupervisor } from './index';
+import { AgentSupervisor, SCAFFOLD_SIDECAR_REL } from './index';
 import {
   SUPERVISOR_CLAUDE_SETTINGS_JSON,
   WORKER_CLAUDE_SETTINGS_JSON,
   RESEARCHER_CLAUDE_SETTINGS_JSON,
+  WORKER_GROK_AGENTS_MD,
 } from '../../shared/constants';
 
 interface TestCase {
@@ -390,6 +391,184 @@ test('WP-G: every lane settings.json keeps autoMemoryEnabled: false', () => {
     assert.equal(parsed.autoMemoryEnabled, false,
       `${lane} settings.json must keep autoMemoryEnabled: false (got ${JSON.stringify(parsed.autoMemoryEnabled)})`);
   }
+});
+
+// ── Grok Build worker scaffold (plan §2.6) ───────────────────────────
+//
+// The grok lane rides the claude-compat carrier: a single managed file,
+// .lares/workers/grok/.claude/settings.json (content-deduped via the shared
+// WORKER_CLAUDE_SETTINGS_JSON constant, its OWN scaffold key at version 1), plus
+// a seed-once AGENTS.md identity that is NOT in the managed map. No native
+// .grok/hooks carrier, no remember skill in this scope.
+
+function readSidecar(workDir: string): Record<string, number> {
+  const p = path.join(workDir, ...SCAFFOLD_SIDECAR_REL.split('/'));
+  return JSON.parse(fs.readFileSync(p, 'utf-8')) as Record<string, number>;
+}
+
+test('Grok: fresh scaffold writes settings.json + AGENTS.md in the grok cwd + shared scripts', () => {
+  const workDir = mktmp('grok-scaffold');
+  const { supervisor, cleanup } = makeSupervisor();
+  try {
+    supervisor.ensureWorkerScaffold(workDir, 'grok', 'windows');
+
+    // The compat carrier: grok loads <cwd>/.claude/settings.json natively.
+    const settingsPath = path.join(workDir, '.lares', 'workers', 'grok', '.claude', 'settings.json');
+    assert.ok(fs.existsSync(settingsPath), `expected ${settingsPath} to exist`);
+    // Byte-identical to the shared claude settings constant (content-dedupe).
+    assert.equal(
+      fs.readFileSync(settingsPath, 'utf-8'),
+      WORKER_CLAUDE_SETTINGS_JSON,
+      'grok settings.json must be byte-identical to WORKER_CLAUDE_SETTINGS_JSON',
+    );
+    // Keeps ${CLAUDE_PROJECT_DIR} unexpanded — grok's compat loader resolves it.
+    assert.ok(
+      fs.readFileSync(settingsPath, 'utf-8').includes('${CLAUDE_PROJECT_DIR}'),
+      'grok settings.json must retain ${CLAUDE_PROJECT_DIR} (no materialization)',
+    );
+
+    // The seed-once identity file.
+    const agentsPath = path.join(workDir, '.lares', 'workers', 'grok', 'AGENTS.md');
+    assert.ok(fs.existsSync(agentsPath), `expected ${agentsPath} to exist`);
+    const agents = fs.readFileSync(agentsPath, 'utf-8');
+    assert.equal(agents, WORKER_GROK_AGENTS_MD, 'grok AGENTS.md must be the exact derived body');
+
+    // Shared status + guard scripts are present (delivered by WORKSPACE_SCRIPT_FILES).
+    assert.ok(
+      fs.existsSync(path.join(workDir, '.lares', 'scripts', 'dashboard-status.mjs')),
+      'shared dashboard-status.mjs must be present for the grok lane',
+    );
+    assert.ok(
+      fs.existsSync(path.join(workDir, '.lares', 'scripts', 'guard-git-discard.mjs')),
+      'shared guard-git-discard.mjs must be present for the grok lane',
+    );
+  } finally {
+    cleanup();
+    rmrf(workDir);
+  }
+});
+
+test('Grok: sidecar records workers/grok/.claude/settings.json:1, independent of claude', () => {
+  const workDir = mktmp('grok-sidecar');
+  const { supervisor, cleanup } = makeSupervisor();
+  try {
+    // Scaffold BOTH lanes into one workspace so their sidecar entries coexist.
+    supervisor.ensureWorkerScaffold(workDir, 'grok', 'windows');
+    supervisor.ensureWorkerScaffold(workDir, 'claude', 'windows');
+
+    const sidecar = readSidecar(workDir);
+    assert.equal(
+      sidecar['workers/grok/.claude/settings.json'], 1,
+      `sidecar must record grok carrier v1; got ${JSON.stringify(sidecar)}`,
+    );
+    // Version independence: the grok carrier key is distinct from the claude
+    // carrier key, and the claude carrier is at its own (higher) version — so the
+    // two lanes' carrier versions diverge freely.
+    assert.equal(
+      sidecar['workers/claude/.claude/settings.json'], 8,
+      `claude carrier must keep its own version; got ${JSON.stringify(sidecar)}`,
+    );
+    assert.notEqual(
+      sidecar['workers/grok/.claude/settings.json'],
+      sidecar['workers/claude/.claude/settings.json'],
+      'grok and claude carriers must be version-independent (distinct sidecar keys)',
+    );
+  } finally {
+    cleanup();
+    rmrf(workDir);
+  }
+});
+
+test('Grok: never overwrites an edited AGENTS.md on re-scaffold (seed-once identity)', () => {
+  const workDir = mktmp('grok-agents-no-overwrite');
+  const { supervisor, cleanup } = makeSupervisor();
+  try {
+    supervisor.ensureWorkerScaffold(workDir, 'grok', 'windows');
+    const agentsPath = path.join(workDir, '.lares', 'workers', 'grok', 'AGENTS.md');
+
+    // The worker/human edits its identity; a relaunch must preserve it verbatim.
+    const edited = '# user-edited-marker-do-not-clobber\n';
+    fs.writeFileSync(agentsPath, edited, 'utf-8');
+    const before = fs.readFileSync(agentsPath);
+
+    supervisor.ensureWorkerScaffold(workDir, 'grok', 'windows');
+
+    const after = fs.readFileSync(agentsPath);
+    assert.ok(
+      before.equals(after),
+      'second scaffold call must not overwrite an edited grok AGENTS.md',
+    );
+    // And no .bak was spawned (the managed-file overwrite signature) — proves
+    // AGENTS.md is seeded, not version-managed.
+    const baks = fs.readdirSync(path.dirname(agentsPath)).filter((f) => f.startsWith('AGENTS.md.bak'));
+    assert.equal(baks.length, 0, `grok AGENTS.md must not be backed up/overwritten; found: ${baks.join(', ')}`);
+  } finally {
+    cleanup();
+    rmrf(workDir);
+  }
+});
+
+test('Grok: NO .grok/hooks carrier and NO remember skill in the minimum scope', () => {
+  const workDir = mktmp('grok-no-extras');
+  const { supervisor, cleanup } = makeSupervisor();
+  try {
+    supervisor.ensureWorkerScaffold(workDir, 'grok', 'windows');
+
+    // No native grok hook carrier — grok rides the single claude-compat carrier
+    // (two active carriers risk the codex Run-D double-fire).
+    const grokHooksDir = path.join(workDir, '.lares', 'workers', 'grok', '.grok');
+    assert.ok(!fs.existsSync(grokHooksDir), `no .grok carrier must be created; found ${grokHooksDir}`);
+
+    // No remember skill in this commit (plan §2.5).
+    const rememberClaude = path.join(workDir, '.lares', 'workers', 'grok', '.claude', 'skills', 'remember', 'SKILL.md');
+    const rememberAgents = path.join(workDir, '.lares', 'workers', 'grok', '.agents', 'skills', 'remember', 'SKILL.md');
+    assert.ok(!fs.existsSync(rememberClaude), `no remember skill (.claude) in minimum scope; found ${rememberClaude}`);
+    assert.ok(!fs.existsSync(rememberAgents), `no remember skill (.agents) in minimum scope; found ${rememberAgents}`);
+
+    // Grok scaffold must not create the claude/codex worker sibling lanes.
+    assert.ok(
+      !fs.existsSync(path.join(workDir, '.lares', 'workers', 'claude', '.claude', 'settings.json')),
+      'grok scaffold must not write the claude worker carrier',
+    );
+    assert.ok(
+      !fs.existsSync(path.join(workDir, '.lares', 'workers', 'codex', '.codex', 'config.toml')),
+      'grok scaffold must not write the codex worker carrier',
+    );
+  } finally {
+    cleanup();
+    rmrf(workDir);
+  }
+});
+
+// ── Grok identity derivation parity (anti-drift, plan §2.1) ──────────
+//
+// WORKER_GROK_AGENTS_MD is DERIVED from WORKER_CLAUDE_MD via the same
+// `.split().join()` chain WORKER_CODEX_AGENTS_MD uses — NOT reused from the codex
+// body. These guard against drift and against accidentally shipping codex tokens.
+
+test('Grok identity: derived cwd points at the grok lane, never claude or codex', () => {
+  assert.ok(WORKER_GROK_AGENTS_MD.includes('.lares/workers/grok/'), 'grok body must reference its own cwd');
+  assert.ok(!WORKER_GROK_AGENTS_MD.includes('.lares/workers/claude/'), 'grok body must not reference the claude cwd');
+  assert.ok(!WORKER_GROK_AGENTS_MD.includes('.lares/workers/codex/'), 'grok body must not reference the codex cwd (not reused from WORKER_CODEX_AGENTS_MD)');
+});
+
+test('Grok identity: git-discard section survived byte-identical; blocking-dialog intent preserved', () => {
+  const header = '## Never use git to discard uncommitted work';
+  const i = WORKER_GROK_AGENTS_MD.indexOf(header);
+  assert.ok(i >= 0, 'grok body must carry the git-discard section');
+  // The section contains none of the transformed tokens, so it must enumerate
+  // the four forbidden commands verbatim.
+  assert.ok(
+    WORKER_GROK_AGENTS_MD.includes('git checkout -- <file>') &&
+      WORKER_GROK_AGENTS_MD.includes('git restore') &&
+      WORKER_GROK_AGENTS_MD.includes('git clean') &&
+      WORKER_GROK_AGENTS_MD.includes('git stash'),
+    'the git-discard section must still enumerate the four forbidden commands',
+  );
+  // Claude-Code-specific dialog names gone; the intent preserved.
+  assert.ok(!WORKER_GROK_AGENTS_MD.includes('AskUserQuestion'), 'grok body must not name the Claude-specific AskUserQuestion tool');
+  assert.ok(!WORKER_GROK_AGENTS_MD.includes('plan-mode approval prompts'), 'grok body must not name Claude plan-mode prompts');
+  assert.ok(WORKER_GROK_AGENTS_MD.includes('end your turn with the question in plain text'), 'intent: end the turn in plain text preserved');
 });
 
 // ── Runner ───────────────────────────────────────────────────────────
