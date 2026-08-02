@@ -298,6 +298,9 @@ const TESTS = [
   // crashed revive, gate matrix, StopResult verification, staged-prompt cleanup on
   // relaunch failure, provider gating, fresh-capability re-mint.
   'dist/main/main/supervisor/revive-agent.test.js',
+  // Save-card Stage 2 SC-WP-2E — fork/revive lifecycle stamps are frozen into
+  // pending initial prompts and survive unchanged through delivery.
+  'dist/main/main/supervisor/supervisor.forkRevive.stamp.test.js',
   // WP3.3 — POST /api/agents/:id/revive authorization + audit (supervisor-only even
   // same-workspace, global-bearer allowed, cross-workspace target gate, audit on
   // success/denial/failure, queued_message_len length-only, revErr status/code map).

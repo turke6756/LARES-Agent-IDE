@@ -67,7 +67,13 @@ import { resolveLaunchCommand } from './launch-command';
 import { TurnEvidenceTracker } from './turn-evidence';
 import type { TurnCoordinator, TurnContext } from '../git-checkpoints/turn-coordinator';
 import type { TurnCompletionTracker } from './turn-completion-tracker';
-import type { DispatchContext } from '../git-checkpoints/dispatch-context';
+import {
+  resolveRequestedPlanBinding,
+  withResolvedPlanStamp,
+  type DispatchContext,
+  type ResolvedPlanStamp,
+} from '../git-checkpoints/dispatch-context';
+import type { RequestedPlanBinding } from '../../shared/commit-candidates';
 import { detectInteractivePrompt } from './interactive-prompt-detector';
 import { isNonBlockingNotificationType } from '../../shared/notification-classify';
 import { workspaceStateDirName } from '../workspace-state-dir';
@@ -438,6 +444,31 @@ export class SubmitNotConfirmedError extends Error {
 // stale selection prompt minutes later.
 const INITIAL_USER_PROMPT_TTL_MS = 10 * 60_000;
 
+interface PendingInitialPrompt {
+  text: string;
+  expiresAt: number;
+  dispatch: DispatchContext;
+}
+
+/**
+ * The continuation producer is deliberately owned by SC-WP-2F. Until that
+ * package supplies its persisted `continuation-carry` dispatch, keep accepting
+ * its legacy two-field call while normalizing every stored entry to the new
+ * metadata-preserving shape. Fork/revive producers always pass an explicit,
+ * frozen dispatch below.
+ */
+class PendingInitialPromptMap extends Map<string, PendingInitialPrompt> {
+  override set(
+    agentId: string,
+    pending: Omit<PendingInitialPrompt, 'dispatch'> & { dispatch?: DispatchContext },
+  ): this {
+    return super.set(agentId, {
+      ...pending,
+      dispatch: pending.dispatch ?? { origin: 'human-terminal' },
+    });
+  }
+}
+
 // ── WP3 revival lifecycle (plans/cross-workspace-collaboration.md) ──────────────
 
 /** Build a revival error carrying the plan's machine-readable `code` plus the
@@ -453,6 +484,28 @@ function revErr(
     code: string;
     statusCode: number;
   };
+}
+
+function resolveLifecyclePlanStamp(
+  agent: Agent,
+  requested: RequestedPlanBinding | undefined,
+  carrySource: 'fork-carry' | 'revive-carry',
+): ResolvedPlanStamp {
+  if (!requested || requested.mode === 'agent-default') {
+    return Object.freeze({
+      planId: agent.planId ?? null,
+      planItemId: null,
+      source: carrySource,
+    });
+  }
+
+  const resolution = resolveRequestedPlanBinding({
+    getAgent: (id) => getAgent(id),
+    resolveCapability: async () => null,
+    planInWorkspace: (workspaceId, planId) => getPlan(planId)?.workspaceId === workspaceId,
+  }, agent, requested);
+  if (!resolution.ok) throw revErr(resolution.reason, 400);
+  return Object.freeze({ ...resolution.stamp });
 }
 
 /** WP3.1 — the orientation preamble prepended to a revival wake message. There is
@@ -1529,7 +1582,7 @@ export class AgentSupervisor extends EventEmitter {
   // prompt must arrive as a clean user message on every provider, with zero
   // risk of duplicating or reordering launch instructions. Entries expire
   // after INITIAL_USER_PROMPT_TTL_MS and are cleared on agent stop/delete.
-  private pendingInitialPrompts = new Map<string, { text: string; expiresAt: number }>();
+  private pendingInitialPrompts = new PendingInitialPromptMap();
 
   // Context-brick Inc 4 — brick handed to the in-flight continuation launch.
   // Set just before the relaunch timer, consumed by the sysprompt builders,
@@ -5220,7 +5273,10 @@ export class AgentSupervisor extends EventEmitter {
     }
   }
 
-  async forkAgent(sourceAgentId: string): Promise<Agent> {
+  async forkAgent(
+    sourceAgentId: string,
+    opts: { message?: string; requestedPlanBinding?: RequestedPlanBinding } = {},
+  ): Promise<Agent> {
     const source = getAgent(sourceAgentId);
     if (!source) throw new Error('Source agent not found');
     if (source.provider !== 'claude') throw new Error('Fork is only supported for Claude agents');
@@ -5228,6 +5284,10 @@ export class AgentSupervisor extends EventEmitter {
 
     const workspace = getWorkspace(source.workspaceId);
     if (!workspace) throw new Error('Workspace not found');
+
+    // Resolve before creating or launching anything. The default is frozen from
+    // the source agent's persisted binding; no turn-record lookup participates.
+    const planStamp = resolveLifecyclePlanStamp(source, opts.requestedPlanBinding, 'fork-carry');
 
     const newSessionId = uuidv4();
     const logPath = path.join(this.logsDir, `${uuidv4().substring(0, 8)}.log`);
@@ -5268,6 +5328,10 @@ export class AgentSupervisor extends EventEmitter {
       // notifyOwner is inherited by a fork alongside ownerAgentId: a fork
       // continues the source's work, so a muted source yields a muted fork.
       notifyOwner: source.notifyOwner,
+      // Fork identity inherits the source's frozen plan rail. An explicit
+      // dispatch clear affects the optional fork wake only; it does not rewrite
+      // the fork agent's own default binding.
+      planId: source.planId ?? null,
       tmuxSessionName,
       autoRestartEnabled: source.autoRestartEnabled,
       logPath,
@@ -5276,6 +5340,14 @@ export class AgentSupervisor extends EventEmitter {
     updateAgentResumeSessionId(newAgent.id, newSessionId);
     this.sessionLogReader.invalidatePath(newAgent.id);
     addEvent(newAgent.id, 'forked', JSON.stringify({ sourceAgentId, sourceSessionId: source.resumeSessionId }));
+
+    if (opts.message) {
+      this.pendingInitialPrompts.set(newAgent.id, {
+        text: opts.message,
+        expiresAt: Date.now() + INITIAL_USER_PROMPT_TTL_MS,
+        dispatch: withResolvedPlanStamp({ origin: 'human-terminal' }, planStamp),
+      });
+    }
 
     // AU-7 — fork uses overrideArgs/overrideCommand, which BYPASSES the
     // lane-aware injection in launchWindowsAgent/launchWslAgent. Rebuild the
@@ -6092,7 +6164,7 @@ export class AgentSupervisor extends EventEmitter {
    */
   async reviveAgent(
     agentId: string,
-    opts: { force?: boolean; message?: string },
+    opts: { force?: boolean; message?: string; requestedPlanBinding?: RequestedPlanBinding },
   ): Promise<{ revived: true; queued: boolean }> {
     return this.withLifecycleLock(agentId, async () => {
       // 1) validate (non-mutating, fail fast)
@@ -6104,6 +6176,10 @@ export class AgentSupervisor extends EventEmitter {
       if (!ws) throw revErr('revive-workspace-gone', 410);
       if (!fs.existsSync(agent.workingDirectory)) throw revErr('revive-cwd-gone', 410);
       this.assertResumable(agent);                                                   // WP3.2
+      // Freeze before the ownership gate/stop/relaunch sequence. The default is
+      // the agent's own persisted plan rail, never a latest-turn rediscovery.
+      const planStamp = resolveLifecyclePlanStamp(agent, opts.requestedPlanBinding, 'revive-carry');
+      const wakeDispatch = withResolvedPlanStamp({ origin: 'human-terminal' }, planStamp);
       if (agent.isSupervisor) {                                                      // successor guard: supervisor targets ONLY
         const successor = getAgentsByWorkspace(agent.workspaceId).find(a =>
           a.id !== agentId && a.isSupervisor && a.status !== 'done' && a.status !== 'crashed');
@@ -6138,11 +6214,12 @@ export class AgentSupervisor extends EventEmitter {
       // both Claude and Codex revives. A revived non-supervisor (or a supervisor
       // with an empty projection) falls through to the plain wake-only staging.
       const wake = opts.message ? buildRevivalWakeMessage(opts.message) : '';
-      const stagedMem = this.stageSupervisorMemoryInjection(agentId, wake);
+      const stagedMem = this.stageSupervisorMemoryInjection(agentId, wake, wakeDispatch);
       if (!stagedMem && wake) {
         this.pendingInitialPrompts.set(agentId, {
           text: wake,      // preamble: "call get_my_context first, then:"
           expiresAt: Date.now() + INITIAL_USER_PROMPT_TTL_MS,
+          dispatch: wakeDispatch,
         });
       }
       if (opts.message) queued = true;
@@ -6442,7 +6519,7 @@ export class AgentSupervisor extends EventEmitter {
     // inside the TTL window can still deliver it, and stop/delete clear it.
     if (!this.hasRunner(agentId)) return;
     this.pendingInitialPrompts.delete(agentId);
-    this.sendInput(agentId, pending.text).catch((err: Error) => {
+    this.sendInput(agentId, pending.text, {}, pending.dispatch).catch((err: Error) => {
       console.error(`[initial-prompt] Delivery to ${agentId} failed:`, err);
       this.emit('sendInputError', { agentId, error: err.message });
     });
@@ -6482,13 +6559,21 @@ export class AgentSupervisor extends EventEmitter {
    *  its own base-text staging. Provider-neutral by construction — Codex launches
    *  and both-provider revives route through here; a Claude FRESH launch instead
    *  uses the sysprompt splice and never reaches this. */
-  private stageSupervisorMemoryInjection(agentId: string, baseText: string): boolean {
+  private stageSupervisorMemoryInjection(
+    agentId: string,
+    baseText: string,
+    dispatch?: DispatchContext,
+  ): boolean {
     const agent = getAgent(agentId);
     if (!agent || !hasSupervisorPrivilege(agent)) return false;
     const injectText = this.computeSupervisorMemoryInjectText(agent);
     const text = composeMemoryPending(injectText, baseText);
     if (!text) return false;
-    this.pendingInitialPrompts.set(agentId, { text, expiresAt: Date.now() + INITIAL_USER_PROMPT_TTL_MS });
+    this.pendingInitialPrompts.set(agentId, {
+      text,
+      expiresAt: Date.now() + INITIAL_USER_PROMPT_TTL_MS,
+      ...(dispatch ? { dispatch } : {}),
+    });
     return true;
   }
 
