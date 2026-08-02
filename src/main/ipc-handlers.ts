@@ -14,7 +14,7 @@ import { computeTerminalAttachResult } from './terminal-attach-result';
 import { resolveAgentChatEvents } from './supervisor/agent-chat-history';
 import {
   getWorkspaces, createWorkspace, deleteWorkspace, getWorkspace, reorderWorkspaces,
-  getAgentsByWorkspace, getAllAgents, getAgent, getFileActivities, getWorkspaceAgentSummary,
+  getAgentsByWorkspace, getAllAgents, getAgent, getPlan, getFileActivities, getWorkspaceAgentSummary,
   checkAgentMdExists, updateAgentSupervised, getAgentSessions,
   createTeam, getTeam, listTeams, updateTeamStatus, addTeamMember, removeTeamMember,
   createChannel, removeChannel, getTeamMessages, getTeamTasks, createTeamTask, updateTeamTask,
@@ -60,6 +60,8 @@ import {
 import { ensureInstallationLauncher } from './installation-descriptor';
 import { registerCheckpointIpc, type HumanCheckpointRoutes } from './git-checkpoints/checkpoint-ipc';
 import { registerSaveCardIpc, type SaveCardRoutes } from './commit-candidates/save-card-ipc';
+import type { RequestedPlanBinding } from '../shared/commit-candidates';
+import { resolvePlanBindingAtBoundary } from './api-server';
 
 // Managed temp dir for clipboard-bitmap pastes. Dropped OS files inject their
 // OWN on-disk path (converted) and never land here — only screenshots do.
@@ -166,7 +168,7 @@ export function registerIpcHandlers(
   ipcMain.handle('agent:delete', (_e, id) => supervisor.deleteAgent(id));
   ipcMain.handle('agent:fork', (_e, id) => supervisor.forkAgent(id));
   ipcMain.handle('agent:query', (_e, targetAgentId, question, sourceAgentId) => supervisor.queryAgent(targetAgentId, question, sourceAgentId));
-  ipcMain.handle('agent:send-input', (_e, agentId, text) => {
+  ipcMain.handle('agent:send-input', (_e, agentId, text, requestedPlanBinding?: RequestedPlanBinding) => {
     // Mirror the HTTP route's safety gate (api-server.ts) so the IPC path
     // can't bypass it when the renderer's idle detection is eager. Without
     // this, a chat-input Enter against a "looks-idle but actually-busy"
@@ -176,6 +178,11 @@ export function registerIpcHandlers(
     if (!agent) {
       throw new Error(`Agent not found: ${agentId}`);
     }
+    // SC-WP-2C: a renderer send is a direct human dispatch. Resolve its
+    // agent-default (or explicit request) before touching the delivery queue.
+    const dispatch = resolvePlanBindingAtBoundary(
+      { getPlanById: getPlan }, agent, 'human-terminal', requestedPlanBinding,
+    );
     if (supervisor.isInputInFlight(agentId) || ['working', 'launching'].includes(agent.status)) {
       const reportedStatus = supervisor.isInputInFlight(agentId) ? 'receiving' : agent.status;
       throw new Error(`Agent is "${reportedStatus}" — wait until it's idle before sending.`);
@@ -188,7 +195,7 @@ export function registerIpcHandlers(
     // 'agent:send-input-error'); ChatInputBar renders confirmed / amber
     // delivered-unconfirmed / red failed, always with the mandatory
     // terminal-check guidance for the two non-confirmed states.
-    supervisor.sendInputWithOutcome(agentId, text)
+    supervisor.sendInputWithOutcome(agentId, text, {}, dispatch)
       .then((outcome) => {
         if (!mainWindow.isDestroyed()) {
           mainWindow.webContents.send('agent:send-input-result', outcome);

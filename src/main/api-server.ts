@@ -89,6 +89,69 @@ import { runOverheadScan } from './context-overhead/ipc-deps';
 import { buildOverheadSnapshot, scrubPaths } from './context-overhead/overhead-dto';
 import type { AgentRoleLane, BehaviorEvidenceTier, ContextOptimizerProposalKind, ContextOptimizerResult, AgentKnowledgeGraph, SkillUsageResult, McpToolUsageRollupDTO, WorkspaceScopeMode, PathRole, OverheadModel } from '../shared/types';
 import type { DiffResult, RestoreOutcome, CheckpointPreviewResult, FileHistoryVersion } from './git-checkpoints/checkpoint-service';
+import type { RequestedPlanBinding } from '../shared/commit-candidates';
+import {
+  resolveRequestedPlanBinding,
+  withResolvedPlanStamp,
+  type DispatchContext,
+  type DispatchOrigin,
+} from './git-checkpoints/dispatch-context';
+
+export type PlanBindingBoundaryAgent = Pick<Agent, 'workspaceId' | 'planId'>;
+
+export interface PlanBindingBoundaryDeps {
+  getPlanById: (planId: string) => Pick<import('../shared/types').Plan, 'workspaceId' | 'deletedAt'> | null;
+}
+
+/** Resolve an untrusted API/IPC binding before anything is put on the delivery
+ * queue. The returned context carries a symbol-keyed trusted stamp, so the
+ * fail-open checkpoint path never needs to re-validate wire data. */
+export function resolvePlanBindingAtBoundary(
+  deps: PlanBindingBoundaryDeps,
+  agent: PlanBindingBoundaryAgent,
+  origin: Extract<DispatchOrigin, 'api' | 'human-terminal'>,
+  requestedPlanBinding: unknown,
+): DispatchContext {
+  if (requestedPlanBinding !== undefined && (
+    requestedPlanBinding === null
+    || typeof requestedPlanBinding !== 'object'
+    || Array.isArray(requestedPlanBinding)
+    || !['agent-default', 'explicit', 'none'].includes(
+      (requestedPlanBinding as { mode?: unknown }).mode as string,
+    )
+  )) {
+    const err = new Error('Invalid requested plan binding: invalid-request-shape') as Error & {
+      statusCode?: number;
+      code?: string;
+    };
+    err.statusCode = 400;
+    err.code = 'invalid-plan-binding';
+    throw err;
+  }
+  const requested = requestedPlanBinding as RequestedPlanBinding | undefined;
+  const resolution = resolveRequestedPlanBinding(
+    {
+      getAgent: () => null,
+      resolveCapability: async () => null,
+      planInWorkspace: (workspaceId, planId) => {
+        const plan = deps.getPlanById(planId);
+        return plan?.workspaceId === workspaceId && plan.deletedAt === null;
+      },
+    },
+    agent,
+    requested,
+  );
+  if (!resolution.ok) {
+    const err = new Error(`Invalid requested plan binding: ${resolution.reason}`) as Error & {
+      statusCode?: number;
+      code?: string;
+    };
+    err.statusCode = 400;
+    err.code = 'invalid-plan-binding';
+    throw err;
+  }
+  return withResolvedPlanStamp({ origin, requestedPlanBinding: requested }, resolution.stamp);
+}
 
 /** Machine-readable failure classes the top-level error serializer is allowed
  *  to expose in JSON bodies. Errors thrown inside routes can carry raw Node
@@ -98,6 +161,7 @@ import type { DiffResult, RestoreOutcome, CheckpointPreviewResult, FileHistoryVe
  *  here deliberately when a route starts setting them. */
 const API_ERROR_CODES = new Set<string>([
   'submit-not-confirmed', 'delivery-failed', 'browser-policy-denied',
+  'invalid-plan-binding',
   // Context-brick Inc 1 identity layer — resolveIdentity / resolveWorkspaceScope
   // attach these to their 403s. Without the allowlist entry the serializer would
   // strip `err.code`, so a caller could not machine-distinguish an unknown-workspace
@@ -1694,7 +1758,10 @@ export class ApiServer {
     if (method === 'POST' && inputMatch) {
       const agentId = inputMatch[1];
       const body = await readBody(req);
-      const { text, submit, confirm, senderAgentId, sender_agent_id } = JSON.parse(body);
+      const {
+        text, submit, confirm, senderAgentId, sender_agent_id,
+        requestedPlanBinding, requested_plan_binding,
+      } = JSON.parse(body);
       const senderId: string | undefined = senderAgentId ?? sender_agent_id;
       if (!text) throw Object.assign(new Error('Missing "text" in request body'), { statusCode: 400 });
 
@@ -1706,6 +1773,16 @@ export class ApiServer {
       // same-workspace send is intentionally NOT audited (no high-volume ledger).
       // Sits BEFORE the 409 busy-gate so a foreign worker can't even probe state.
       this.authorizeAgentTargetAudited(capability, agent, 'send_message', { queuedMessageLen: text.length });
+
+      // SC-WP-2C: resolve/freeze the untrusted binding after authorization but
+      // before the busy gate, transient subscription, or either delivery call.
+      // Invalid requests cannot write PTY bytes or allocate a turn row.
+      const dispatch = resolvePlanBindingAtBoundary(
+        { getPlanById: getPlan },
+        agent,
+        'api',
+        requestedPlanBinding !== undefined ? requestedPlanBinding : requested_plan_binding,
+      );
 
       // Safety gate: only send to idle/waiting agents. `isInputInFlight`
       // covers the window between enqueue and the agent's first response
@@ -1736,7 +1813,24 @@ export class ApiServer {
       // unsubmitted prompt can't start a turn, so there is nothing to confirm.
       if (confirm === true && submit !== false) {
         try {
-          const result = await this.supervisor.sendInputConfirmed(agentId, text);
+          // sendInputConfirmed predates DispatchContext and has no context
+          // parameter. Explicit/none wire requests take the unified send path,
+          // which carries the frozen stamp and already performs confirmation.
+          const hasWireBinding = requestedPlanBinding !== undefined || requested_plan_binding !== undefined;
+          const result = hasWireBinding
+            ? await this.supervisor.sendInputWithOutcome(agentId, text, {}, dispatch).then((outcome) => {
+                if (!outcome.delivered) {
+                  throw Object.assign(new Error('Input delivery failed'), { code: 'delivery-failed' });
+                }
+                return {
+                  delivered: true,
+                  confirmed: outcome.disposition === 'confirmed',
+                  mode: outcome.disposition === 'confirmed'
+                    ? (outcome.confirmationSource === 'status' ? 'status-poll' : outcome.confirmationSource ?? 'hook')
+                    : 'unconfirmed',
+                };
+              })
+            : await this.supervisor.sendInputConfirmed(agentId, text);
           // WP8 — bytes were accepted (delivery-failed would have thrown below),
           // so an unconfirmed turn start is `delivered-unconfirmed`, NOT a
           // failure: HTTP 200, plus the mandatory terminal-check guidance so an
@@ -1773,7 +1867,7 @@ export class ApiServer {
 
       // Don't await — typing happens in the background. Errors are logged
       // because there's no caller to return them to once we've responded.
-      this.supervisor.sendInput(agentId, text, opts).catch((err) => {
+      this.supervisor.sendInput(agentId, text, opts, dispatch).catch((err) => {
         console.error(`[api] Background input delivery to ${agentId} failed:`, err);
       });
       return { ok: true, agentId, queued: true, submit: submit !== false, message: 'Input queued', transientSubscription };
