@@ -134,6 +134,60 @@ test('returns null for a provider that is genuinely absent', async () => {
   }
 });
 
+// ── Grok: the documented installer location wins FIRST ─────────────────────
+// The xAI PowerShell installer (irm https://x.ai/cli/install.ps1 | iex) puts
+// grok.exe at %USERPROFILE%\.grok\bin\grok.exe. provider-resolver unshifts it as
+// the FIRST candidate — so even with a competing npm-global grok.cmd present, the
+// installer binary must win. If this stops matching, PROVIDER_INSTALL_HINTS' grok
+// command produces a grok Lares would skip past to a shim, so this guards advice.
+test('grok resolves .grok\\bin\\grok.exe before an npm shim', async () => {
+  const fake = withFakeHome('user', (home) => {
+    // Both present: the installer path AND an npm-global shim.
+    writeShim(path.join(home, '.grok', 'bin', 'grok.exe'));
+    writeShim(path.join(home, 'AppData', 'Roaming', 'npm', 'grok.cmd'));
+  });
+  try {
+    const found = await findWindowsProviderBinary('grok');
+    assert.ok(found, 'expected grok to be found');
+    assert.ok(
+      found.endsWith(path.join('.grok', 'bin', 'grok.exe')),
+      `expected the .grok\\bin\\grok.exe installer path to win, got: ${found}`,
+    );
+    assert.ok(fs.existsSync(found));
+  } finally {
+    fake.restore();
+  }
+});
+
+// ── Grok: candidate-directory fallback (npm-global shim) ───────────────────
+// With no installer binary, grok must still resolve from the npm-global dir the
+// same way codex/gemini do — the fallback path a `where.exe`-on-PATH install
+// also rides.
+test('grok falls back to an npm-global shim when the installer path is absent', async () => {
+  const fake = withFakeHome('user', (home) => {
+    writeShim(path.join(home, 'AppData', 'Roaming', 'npm', 'grok.cmd'));
+  });
+  try {
+    const found = await findWindowsProviderBinary('grok');
+    assert.ok(found, 'expected the npm-global grok.cmd to be found');
+    assert.ok(found.endsWith('grok.cmd'), `unexpected resolution: ${found}`);
+    assert.ok(fs.existsSync(found));
+  } finally {
+    fake.restore();
+  }
+});
+
+// ── Grok: genuinely absent → null (drives the Grok-specific message) ───────
+test('grok resolves to null when nothing is installed', async () => {
+  const fake = withFakeHome('user', () => { /* nothing installed */ });
+  try {
+    assert.equal(await findWindowsProviderBinary('grok'), null);
+    assert.equal(await probeWindowsProvider('grok'), null);
+  } finally {
+    fake.restore();
+  }
+});
+
 // probeWindowsProvider is what preflight calls. Its contract is "never throws";
 // findWindowsClaudePath REJECTS when claude is absent, so the wrapper has to
 // absorb that. A regression here would crash the whole health check.
@@ -168,7 +222,7 @@ test('preflight resolves to exactly what the launcher would use', async () => {
 
 // ── The user-facing copy (plan §6.4) ───────────────────────────────────────
 test('missing-provider copy says Lares is fine and names the restart step', () => {
-  for (const p of ['claude', 'codex', 'gemini'] as const) {
+  for (const p of ['claude', 'codex', 'gemini', 'grok'] as const) {
     const msg = missingProviderMessage(p);
     assert.match(msg, /was not found/, `${p}: must state what is missing`);
     assert.match(msg, /Lares is installed correctly/, `${p}: must not read as "Lares is broken"`);
@@ -179,6 +233,8 @@ test('missing-provider copy says Lares is fine and names the restart step', () =
     assert.doesNotMatch(msg, /ENOENT|exit code|is not recognized/i, `${p}: leaked diagnostic text`);
   }
   assert.match(missingProviderMessage('codex'), /^Codex CLI was not found\./);
+  // Grok brands as "Grok Build" — the label must reach the copy.
+  assert.match(missingProviderMessage('grok'), /^Grok Build CLI was not found\./);
 });
 
 test('getWindowsSystemPath does not depend on PATH', () => {

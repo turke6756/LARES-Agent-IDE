@@ -4151,15 +4151,16 @@ export class AgentSupervisor extends EventEmitter {
     }
     const useDirectSpawn = needsDirectSpawn && launchCmd !== cmd;
 
-    // Codex/Gemini have no known-install resolver like claude's, and go through
-    // pty-host's `cmd.exe /c` wrap (useDirectSpawn is claude-only). Electron's
-    // login-time PATH can omit a codex/gemini shim that works in the user's
-    // terminal, so a bare `cmd.exe /c codex` crashes with a cryptic "'codex' is
-    // not recognized". Resolve the real binary to an absolute path and launch
-    // that; if it genuinely can't be found, fail loudly with a user-visible
-    // message. Keying off provider (not the literal token) also rescues a
-    // wsl-style `ccodex`/`ccode` command that landed on the Windows path.
-    if (agent.provider === 'codex' || agent.provider === 'gemini') {
+    // Codex/Gemini/Grok have no known-install resolver like claude's, and go
+    // through pty-host's `cmd.exe /c` wrap (useDirectSpawn is claude-only).
+    // Electron's login-time PATH can omit a codex/gemini/grok shim that works in
+    // the user's terminal, so a bare `cmd.exe /c codex` crashes with a cryptic
+    // "'codex' is not recognized". Resolve the real binary to an absolute path
+    // and launch that; if it genuinely can't be found, fail loudly with a
+    // user-visible message. Keying off provider (not the literal token) also
+    // rescues a wsl-style `ccodex`/`ccode` command that landed on the Windows
+    // path. (Grok resolves .grok\bin\grok.exe first — see provider-resolver.)
+    if (agent.provider === 'codex' || agent.provider === 'gemini' || agent.provider === 'grok') {
       const resolvedBinary = await findWindowsProviderBinary(agent.provider);
       if (resolvedBinary) {
         launchCmd = resolvedBinary;
@@ -4684,6 +4685,18 @@ export class AgentSupervisor extends EventEmitter {
 
   private async launchWslAgent(agent: Agent, resume = false, agentMdPrompt?: string | null, overrideCommand?: string, sessionId?: string, freshSession = false, firstUserMessagePrefix?: string | null, preMintedToken?: string): Promise<void> {
     if (!agent.tmuxSessionName) throw new Error('No tmux session name');
+
+    // Grok is Windows-first: the WSL submit-encoding / transport path has not
+    // been probed, so grok on WSL is refused outright rather than shipped as an
+    // unverified guess (plan §Open item 3 — reject grok on WSL until a WSL
+    // transport probe passes). Fail with a user-visible message, not a crash.
+    if (agent.provider === 'grok') {
+      const message = 'Grok is not yet supported in WSL workspaces. Re-create the workspace as a Windows path type to launch a Grok agent.';
+      console.error(`[WSL] ${message}`);
+      updateAgentStatus(agent.id, 'crashed');
+      addEvent(agent.id, 'crashed', JSON.stringify({ error: message }));
+      throw new Error(message);
+    }
 
     // WP0.5 — resolve EXACTLY ONE per-agent capability token at method entry,
     // BEFORE the wslEnvPrefix child-env block (which on WSL executes before the
@@ -6160,7 +6173,7 @@ export class AgentSupervisor extends EventEmitter {
       }
       default:
         throw revErr('revive-unsupported-provider', 422, {
-          message: 'revive supports: claude, codex; gemini not yet supported',
+          message: 'revive supports: claude, codex; gemini and grok are not yet session-mapped',
         });
     }
   }
@@ -7582,6 +7595,11 @@ export class AgentSupervisor extends EventEmitter {
           console.warn(`[sendInput] Skipping send to ${agent.title} — runner not alive`);
           return false;
         }
+        // Grok is intentionally NOT in this tmux known-provider whitelist: grok
+        // on WSL is refused at launch (see launchWslAgent) and its WSL submit
+        // encoding is unproven, so it must never route through the kitty-CSI
+        // path here — it stays 'unknown' (legacy `\r`) and cannot reach this
+        // branch anyway.
         const provider = agent.provider === 'claude' || agent.provider === 'codex' || agent.provider === 'gemini'
           ? agent.provider
           : 'unknown';
@@ -7678,7 +7696,12 @@ export class AgentSupervisor extends EventEmitter {
 
 
   private emitSyntheticUserEcho(agent: Agent, text: string): void {
-    if (agent.provider !== 'codex' && agent.provider !== 'gemini') return;
+    // Providers with no native dashboard-readable session log: submitted text
+    // would otherwise vanish from the chat pane. Grok is deliberately in this
+    // set (it is NOT session-backed — no SessionLogReader registration), mirroring
+    // gemini. The grok Windows transport that invokes this is wired with the
+    // submit encoding (later commit); membership here is the classification seam.
+    if (agent.provider !== 'codex' && agent.provider !== 'gemini' && agent.provider !== 'grok') return;
     this.sessionLogReader.appendSyntheticUserText(agent.id, text);
   }
 

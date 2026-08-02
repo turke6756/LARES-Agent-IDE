@@ -34,7 +34,7 @@ import type {
 } from './browser';
 
 export type PathType = 'windows' | 'wsl';
-export type AgentProvider = 'claude' | 'gemini' | 'codex';
+export type AgentProvider = 'claude' | 'gemini' | 'codex' | 'grok';
 
 // Hardcoded first-class app role-lanes. 'researcher' is a third lane alongside
 // 'supervisor' and 'worker' (browser-parity-and-capability-isolation §0); see

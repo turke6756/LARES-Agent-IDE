@@ -459,6 +459,22 @@ test('gemini → revive-unsupported-provider (422), message names supported prov
     'the error names the supported providers');
 }));
 
+test('grok → revive-unsupported-provider (422), message names grok as not-yet-session-mapped', () => withHarness(async (h) => {
+  const agent = terminalWorker(h.workspacePath, { provider: 'grok' });
+  h.agents.push(agent);
+  let caught: { code?: string; statusCode?: number; message?: string } | null = null;
+  try { await h.supervisor.reviveAgent(agent.id, {}); }
+  catch (err) { caught = err as { code?: string; statusCode?: number; message?: string }; }
+  assert.ok(caught, 'grok revival throws');
+  assert.equal(caught!.code, 'revive-unsupported-provider');
+  assert.equal(caught!.statusCode, 422);
+  // Regression (plan §1.7): grok falls into the same default: branch as gemini,
+  // and the message now names grok explicitly so the copy is not misleading.
+  assert.ok(/grok/.test(caught!.message ?? ''), 'the error names grok');
+  assert.ok(/claude/.test(caught!.message ?? '') && /codex/.test(caught!.message ?? ''),
+    'the error still names the supported providers');
+}));
+
 test('codex whose session cannot be resolved → revive-no-session (422)', () => withHarness(async (h) => {
   const agent = terminalWorker(h.workspacePath, { provider: 'codex', resumeSessionId: null });
   h.agents.push(agent);

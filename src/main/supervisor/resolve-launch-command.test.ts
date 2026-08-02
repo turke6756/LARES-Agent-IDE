@@ -169,6 +169,73 @@ test('explicit input command for matching provider is used verbatim', () => {
   assert.equal(providerOverride, null);
 });
 
+// ── resolveLaunchCommand: grok (plan §1.8) ──────────────────────────────
+
+test('grok launch in a framework-default workspace resolves to the grok binary', () => {
+  const { command, providerOverride } = resolveLaunchCommand({
+    inputCommand: undefined,
+    workspaceDefaultCommand: DEFAULT_COMMAND,
+    provider: 'grok',
+    pathType: 'windows',
+  });
+  assert.equal(command, PROVIDER_COMMANDS.grok.windows);
+  assert.equal(command, 'grok');
+  assert.equal(providerOverride, null);
+});
+
+test('grok launch in a legacy --chrome default workspace still resolves to grok', () => {
+  const { command } = resolveLaunchCommand({
+    inputCommand: undefined,
+    workspaceDefaultCommand: LEGACY_DEFAULT,
+    provider: 'grok',
+    pathType: 'windows',
+  });
+  assert.equal(command, PROVIDER_COMMANDS.grok.windows);
+});
+
+test('a CUSTOM claude/ccode command can NOT silently launch grok — guarded to the grok binary', () => {
+  // Genuinely custom (non-framework) claude AND ccode wrappers: the guard, not
+  // framework-default normalization, is what must catch these — a bare
+  // `ccode --dangerously-skip-permissions` IS the WSL framework default and would
+  // be normalized instead, so add a flag to make each a real custom command.
+  for (const claudeish of ['claude --dangerously-skip-permissions --model opus', 'ccode --dangerously-skip-permissions --model opus']) {
+    const { command, providerOverride } = resolveLaunchCommand({
+      inputCommand: undefined,
+      workspaceDefaultCommand: claudeish,
+      provider: 'grok',
+      pathType: 'windows',
+    });
+    assert.equal(command, PROVIDER_COMMANDS.grok.windows, `grok must not launch via "${claudeish}"`);
+    assert.ok(providerOverride, 'the claude→grok mismatch must be flagged');
+    assert.equal(providerOverride!.from, claudeish);
+    assert.equal(providerOverride!.to, PROVIDER_COMMANDS.grok.windows);
+  }
+});
+
+test('an explicit claude input command with a grok provider is still guarded to grok', () => {
+  const { command, providerOverride } = resolveLaunchCommand({
+    inputCommand: 'claude --dangerously-skip-permissions',
+    workspaceDefaultCommand: 'grok',
+    provider: 'grok',
+    pathType: 'windows',
+  });
+  assert.equal(command, PROVIDER_COMMANDS.grok.windows);
+  assert.ok(providerOverride);
+  assert.equal(providerOverride!.to, PROVIDER_COMMANDS.grok.windows);
+});
+
+test('a genuine custom grok wrapper is respected verbatim (not clobbered)', () => {
+  const custom = 'my-grok-wrapper --flag';
+  const { command, providerOverride } = resolveLaunchCommand({
+    inputCommand: undefined,
+    workspaceDefaultCommand: custom,
+    provider: 'grok',
+    pathType: 'windows',
+  });
+  assert.equal(command, custom);
+  assert.equal(providerOverride, null);
+});
+
 // ── runner ──────────────────────────────────────────────────────────────
 
 let passed = 0;

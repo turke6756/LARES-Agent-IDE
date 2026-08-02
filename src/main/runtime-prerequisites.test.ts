@@ -189,12 +189,12 @@ test('WSL running → the in-distro checks do run', async () => {
 });
 
 // ── Honesty rules the UI depends on ────────────────────────────────────────
-test('all three providers are always listed, independently, in the agent-cli tier', async () => {
+test('all four providers are always listed, independently, in the agent-cli tier', async () => {
   const restore = withEmptyHome();
   reset();
   try {
     const report = await detectRuntimePrerequisites({ force: true });
-    assert.deepEqual(report.providers.map((p) => p.id), ['claude', 'codex', 'gemini']);
+    assert.deepEqual(report.providers.map((p) => p.id), ['claude', 'codex', 'gemini', 'grok']);
     for (const p of report.providers) {
       assert.equal(p.tier, 'agent-cli');
       assert.equal(p.status, 'missing', `${p.id} should be missing in an empty home`);
@@ -203,6 +203,77 @@ test('all three providers are always listed, independently, in the agent-cli tie
       assert.ok(p.verifiedOn, `${p.id} install command must carry its verified-on date`);
     }
     assert.equal(report.anyProviderAvailable, false);
+  } finally {
+    restore();
+  }
+});
+
+// ── Grok is the fourth provider row (plan §1.4/§1.8) ───────────────────────
+// The detector must produce a grok row driven by the SAME checkProvider +
+// probeWindowsProvider path as the other three — no bespoke grok logic.
+
+function writeExec(filePath: string, body: string): void {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, body);
+}
+
+test('grok row: MISSING in an empty home (nothing installed)', async () => {
+  const restore = withEmptyHome();
+  reset();
+  try {
+    const report = await detectRuntimePrerequisites({ force: true });
+    const grok = report.providers.find((p) => p.id === 'grok');
+    assert.ok(grok, 'grok must always be present in the providers list');
+    assert.equal(grok.tier, 'agent-cli');
+    assert.equal(grok.status, 'missing');
+    assert.equal(grok.label, 'Grok Build');
+    assert.ok(grok.docsUrl, 'grok must carry a docs link');
+    assert.ok(grok.installCommand, 'grok must carry one copyable install command');
+  } finally {
+    restore();
+  }
+});
+
+test('grok row: AVAILABLE when a runnable grok resolves — version captured best-effort', async () => {
+  const restore = withEmptyHome();
+  reset();
+  // An npm-global grok.cmd that cmd.exe can actually run and that echoes a
+  // version line, so the --version probe succeeds.
+  writeExec(
+    path.join(process.env.APPDATA as string, 'npm', 'grok.cmd'),
+    '@echo off\r\necho grok 0.2.112\r\n',
+  );
+  try {
+    const report = await detectRuntimePrerequisites({ force: true });
+    const grok = report.providers.find((p) => p.id === 'grok');
+    assert.ok(grok);
+    assert.equal(grok.status, 'available');
+    assert.ok(grok.path && grok.path.endsWith('grok.cmd'), `grok path should be the resolved shim, got ${grok.path}`);
+    assert.match(grok.version ?? '', /0\.2\.112/);
+    assert.equal(report.anyProviderAvailable, true, 'a resolvable grok flips anyProviderAvailable');
+  } finally {
+    restore();
+  }
+});
+
+test('grok row: a resolved binary whose --version never answers still reports AVAILABLE (version best-effort, like a timeout)', async () => {
+  const restore = withEmptyHome();
+  reset();
+  // The documented installer path exists (so grok RESOLVES) but the file is not
+  // a runnable PE, so `cmd.exe /c "<path> --version"` errors with no stdout —
+  // the same terminal state as a --version timeout. Knowing WHERE the binary is
+  // is what marks the provider available; the version is a nicety.
+  writeExec(
+    path.join(process.env.USERPROFILE as string, '.grok', 'bin', 'grok.exe'),
+    'not a real executable',
+  );
+  try {
+    const report = await detectRuntimePrerequisites({ force: true });
+    const grok = report.providers.find((p) => p.id === 'grok');
+    assert.ok(grok);
+    assert.equal(grok.status, 'available', 'a resolved-but-unversionable grok is still available');
+    assert.ok(grok.path && grok.path.endsWith(path.join('.grok', 'bin', 'grok.exe')), `expected the installer path, got ${grok.path}`);
+    assert.equal(grok.version, undefined, 'an unanswered --version yields no version, never a crash');
   } finally {
     restore();
   }
@@ -298,7 +369,7 @@ test('never throws, even when every probe fails', async () => {
   process.env.SystemRoot = path.join(os.tmpdir(), 'no-such-windows-root');
   try {
     const report = await detectRuntimePrerequisites({ force: true });
-    assert.ok(report.providers.length === 3);
+    assert.ok(report.providers.length === 4);
     assert.equal(report.anyProviderAvailable, false);
   } finally {
     if (savedSystemRoot === undefined) delete process.env.SystemRoot;

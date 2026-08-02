@@ -1813,6 +1813,98 @@ test('Env-gate (Bug 2 / Edit 2.6): a codex agent WITHOUT wantsCodexHooks and no 
   }
 });
 
+// ── Grok launch path (plan §1.8): resolved grok exe + worker env reach the
+//    runner ─────────────────────────────────────────────────────────────────
+// launchWindowsAgent resolves the grok BINARY (absolute path) and hands it, plus
+// the generic worker env (AGENT_ID / DASHBOARD_PORT / DASHBOARD_SPOOL_PATH), to
+// runner.launch — the same absolute-binary + env-injection seams codex/gemini
+// ride. This proves the two Commit-1 launch seams (native-Windows absolute-binary
+// branch + provider-agnostic worker env) actually reach the runner for grok.
+test('grok worker: the resolved .grok\\bin\\grok.exe + worker env reach runner.launch', async () => {
+  const scratchRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'lares-grok-launch-'));
+  const home = path.join(scratchRoot, 'home');
+  const grokExe = path.join(home, '.grok', 'bin', 'grok.exe');
+  fs.mkdirSync(path.dirname(grokExe), { recursive: true });
+  fs.writeFileSync(grokExe, 'fake grok');
+  const workDir = path.join(scratchRoot, 'ws');
+  fs.mkdirSync(workDir, { recursive: true });
+
+  const savedEnv = {
+    USERPROFILE: process.env.USERPROFILE,
+    APPDATA: process.env.APPDATA,
+    LOCALAPPDATA: process.env.LOCALAPPDATA,
+    PATH: process.env.PATH,
+  };
+  process.env.USERPROFILE = home;
+  process.env.APPDATA = path.join(home, 'AppData', 'Roaming');
+  process.env.LOCALAPPDATA = path.join(home, 'AppData', 'Local');
+  process.env.PATH = ''; // neutralize the where.exe fallback — measure candidate search alone
+
+  const agent = makeAgent('grok-launch', {
+    provider: 'grok',
+    isWorker: true,
+    isSupervised: false,
+    command: 'grok',
+    workingDirectory: workDir,
+  });
+  const h = setup({ agent, injectRunner: 'none' });
+
+  // Stub the spool tailer so no real fs tailer spins up (mirrors launchAndCaptureEnv).
+  (h.supervisor as unknown as { ensureSpoolTailer: (a: Agent) => void }).ensureSpoolTailer = () => {};
+
+  const origWinLaunch = (WindowsRunner.prototype as { launch: unknown }).launch;
+  let capturedCmd: string | undefined;
+  let capturedEnv: Record<string, string> | undefined;
+  (WindowsRunner.prototype as { launch: unknown }).launch = function (
+    this: WindowsRunner,
+    _workDir: string,
+    cmd: string,
+    _args: string[],
+    _logPath: string,
+    _directSpawn?: boolean,
+    extraEnv?: Record<string, string>,
+  ) {
+    capturedCmd = cmd;
+    capturedEnv = extraEnv;
+    (this as unknown as { _pid: number; _alive: boolean })._pid = 1;
+    (this as unknown as { _pid: number; _alive: boolean })._alive = true;
+  };
+  try {
+    await (h.supervisor as unknown as { launchWindowsAgent: (a: Agent) => Promise<void> })
+      .launchWindowsAgent(agent);
+
+    // The command that reaches the runner is the ABSOLUTE resolved grok binary,
+    // NOT the bare `grok` token — Electron's login PATH can omit the shim.
+    assert.ok(capturedCmd, 'runner.launch must receive a command');
+    assert.equal(capturedCmd, grokExe, `expected the resolved grok exe, got ${capturedCmd}`);
+    assert.ok(
+      capturedCmd!.endsWith(path.join('.grok', 'bin', 'grok.exe')),
+      'the resolved grok binary must be the .grok\\bin\\grok.exe installer path',
+    );
+
+    // The generic (provider-agnostic) worker env reaches the runner.
+    assert.ok(capturedEnv, 'a grok worker launch must inject extraEnv');
+    assert.equal(capturedEnv!.AGENT_ID, agent.id, 'grok worker must receive AGENT_ID');
+    assert.equal(
+      capturedEnv!.DASHBOARD_PORT,
+      String((h.supervisor as unknown as { apiServerPort: number }).apiServerPort),
+      'grok worker must receive DASHBOARD_PORT',
+    );
+    assert.ok(
+      typeof capturedEnv!.DASHBOARD_SPOOL_PATH === 'string' && capturedEnv!.DASHBOARD_SPOOL_PATH.length > 0,
+      'grok worker must receive DASHBOARD_SPOOL_PATH',
+    );
+  } finally {
+    (WindowsRunner.prototype as { launch: unknown }).launch = origWinLaunch;
+    h.cleanup();
+    for (const [k, v] of Object.entries(savedEnv)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    try { fs.rmSync(scratchRoot, { recursive: true, force: true }); } catch { /* best effort */ }
+  }
+});
+
 // ── Runner ───────────────────────────────────────────────────────────
 (async () => {
   let passed = 0;

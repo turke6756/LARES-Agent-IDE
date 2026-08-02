@@ -313,6 +313,7 @@ export const MAX_SUBMIT_RETRIES = 3;
 //   - AGENTDASH_LAUNCH_SETTLE_MS_CLAUDE
 //   - AGENTDASH_LAUNCH_SETTLE_MS_CODEX
 //   - AGENTDASH_LAUNCH_SETTLE_MS_GEMINI
+//   - AGENTDASH_LAUNCH_SETTLE_MS_GROK
 function _readSettleMs(envName: string, fallback: number): number {
   const raw = process.env[envName];
   if (!raw) return fallback;
@@ -324,6 +325,7 @@ export const LAUNCH_SETTLE_TIMEOUT_MS: Record<AgentProvider, number> = {
   claude: _readSettleMs('AGENTDASH_LAUNCH_SETTLE_MS_CLAUDE', 10_000),
   codex:  _readSettleMs('AGENTDASH_LAUNCH_SETTLE_MS_CODEX',  25_000),
   gemini: _readSettleMs('AGENTDASH_LAUNCH_SETTLE_MS_GEMINI', 10_000),
+  grok:   _readSettleMs('AGENTDASH_LAUNCH_SETTLE_MS_GROK',   15_000),
 };
 // Narrow watchdog: warn if a `launching` agent persists past
 // LAUNCH_SETTLE_TIMEOUT_MS[provider] + this grace, which means the settle
@@ -338,6 +340,11 @@ export const PROVIDER_COMMANDS: Record<AgentProvider, { windows: string; wsl: st
     windows: 'codex --dangerously-bypass-approvals-and-sandbox',
     wsl: 'ccodex --dangerously-bypass-approvals-and-sandbox',
   },
+  // Plain `grok` — the CLI has no `--dangerously-*`/bypass flag; the trust
+  // pre-seed (ensureGrokTrust) removes the folder-trust friction instead. The
+  // `wsl` value is a placeholder to satisfy the exhaustive Record; grok on WSL
+  // is refused at launch until a WSL transport probe passes (plan §1.6/§Open 3).
+  grok:   { windows: 'grok', wsl: 'grok' },
 };
 
 /** Default model pin for claude worker-lane agents. Injected at launch (both
@@ -350,6 +357,7 @@ export const PROVIDER_META: Record<AgentProvider, { label: string; color: string
   claude: { label: 'Claude', color: '#F59E0B', bgClass: 'bg-amber-500/20', textClass: 'text-amber-400' },
   gemini: { label: 'Gemini', color: '#3B82F6', bgClass: 'bg-blue-500/20', textClass: 'text-blue-400' },
   codex:  { label: 'Codex',  color: '#22C55E', bgClass: 'bg-green-500/20', textClass: 'text-green-400' },
+  grok:   { label: 'Grok',   color: '#A855F7', bgClass: 'bg-purple-500/20', textClass: 'text-purple-400' },
 };
 
 /** Default agent name used with --agent flag for supervisor instances */
@@ -4968,7 +4976,7 @@ export interface ProviderInstallHint {
   verifiedOn: string;
 }
 
-export const PROVIDER_INSTALL_HINTS: Record<'claude' | 'codex' | 'gemini', ProviderInstallHint> = {
+export const PROVIDER_INSTALL_HINTS: Record<AgentProvider, ProviderInstallHint> = {
   // The PowerShell installer is listed first deliberately: it installs to
   // %USERPROFILE%\.local\bin\claude.exe, which is exactly the first location
   // supervisor/provider-resolver.ts looks in. Following this command produces a
@@ -5004,6 +5012,20 @@ export const PROVIDER_INSTALL_HINTS: Record<'claude' | 'codex' | 'gemini', Provi
     installShell: 'PowerShell or CMD',
     installNote:
       'Requires Node.js 20+ (see Optional below) — Gemini CLI has no Node-free installer.',
+    verifiedOn: PROVIDER_INSTALL_HINTS_VERIFIED_ON,
+  },
+  // Grok Build (xAI CLI). The PowerShell installer lands grok at
+  // %USERPROFILE%\.grok\bin\grok.exe — the first location
+  // supervisor/provider-resolver.ts looks in — so following this command
+  // produces a grok Lares is guaranteed to find. First launch authenticates
+  // through grok.com in the browser (terminal sign-in is the product flow).
+  grok: {
+    label: 'Grok Build',
+    docsUrl: 'https://x.ai/cli',
+    installCommand: 'irm https://x.ai/cli/install.ps1 | iex',
+    installShell: 'PowerShell',
+    altCommand: 'npm i -g @xai-official/grok',
+    installNote: 'First launch authenticates through grok.com in your browser.',
     verifiedOn: PROVIDER_INSTALL_HINTS_VERIFIED_ON,
   },
 };

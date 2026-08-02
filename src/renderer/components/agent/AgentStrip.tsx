@@ -29,6 +29,7 @@ const PROVIDER_TINT: Record<AgentProvider, { base: string; selected: string; hov
   claude: { base: 'bg-amber-500/[0.07]', selected: 'bg-amber-500/[0.16]', hover: 'hover:bg-amber-500/[0.12]' },
   gemini: { base: 'bg-blue-500/[0.07]', selected: 'bg-blue-500/[0.16]', hover: 'hover:bg-blue-500/[0.12]' },
   codex: { base: 'bg-green-500/[0.07]', selected: 'bg-green-500/[0.16]', hover: 'hover:bg-green-500/[0.12]' },
+  grok: { base: 'bg-purple-500/[0.07]', selected: 'bg-purple-500/[0.16]', hover: 'hover:bg-purple-500/[0.12]' },
 };
 
 // Same left-border status colors as AgentCard.
