@@ -33,6 +33,7 @@
 // testable with in-memory fakes and no real timers / git / fs.
 
 import type { AllocateTurnFields, TurnRecord, TurnStatus } from '../database';
+import type { ResolvedPlanStamp } from '../../shared/commit-candidates';
 import {
   allocateAndInsertTurn as dbAllocateAndInsertTurn,
   updateTurnRecord as dbUpdateTurnRecord,
@@ -116,6 +117,9 @@ export interface TurnContext {
   agentTitle?: string | null;
   ownerAgentId?: string | null;
   ownerBrickGeneration?: number | null;
+  /** Frozen by the dispatch boundary. Optional only for pre-stamping adapters; live
+   * dispatch contexts always supply it. */
+  planStamp?: ResolvedPlanStamp;
   sessionId?: string | null;
   taskLabel?: string | null;
   /** Free prompt text for this turn (WP3). A turn-opening input — deliberately NOT on
@@ -223,6 +227,9 @@ export class TurnCoordinator {
       agentTitle: ctx.agentTitle ?? null,
       ownerAgentId: ctx.ownerAgentId ?? null,
       ownerBrickGeneration: ctx.ownerBrickGeneration ?? null,
+      planId: ctx.planStamp?.planId ?? null,
+      planItemId: ctx.planStamp?.planItemId ?? null,
+      planStampSource: ctx.planStamp?.source ?? 'agent-default',
       sessionId: ctx.sessionId ?? null,
       // WP3: explicit dispatch brief (`taskLabel`) wins; else derive from the first
       // usable prompt line; else null. `.trim() || …` makes a blank brief fall through.

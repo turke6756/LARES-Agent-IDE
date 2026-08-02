@@ -185,6 +185,8 @@ const TESTS = [
   // fail-open before edge, never-two-open overlap, delivery-reject, completion
   // via turn-completion-tracker, startup reconciliation.
   'dist/main/main/git-checkpoints/turn-coordinator.test.js',
+  // Save-card SC-WP-2B: trusted plan-stamp allocation + overlap re-open inheritance.
+  'dist/main/main/git-checkpoints/turn-coordinator.stamp.test.js',
   // Git-Native WP-G1.8: ref/DB crash-consistency reconciliation (create/adopt/conflict
   // on real git) + dangling-open close + paired-ref deletion + temp-artifact sweeper.
   'dist/main/main/git-checkpoints/reconciler.test.js',
@@ -196,6 +198,8 @@ const TESTS = [
   // dedupe), dispatch-context builder, and the send-queue → before-checkpoint wiring.
   'dist/main/main/git-checkpoints/witness-recorder.test.js',
   'dist/main/main/git-checkpoints/dispatch-context.test.js',
+  // Save-card SC-WP-2B: wire-safe binding resolution + trusted carry seam.
+  'dist/main/main/git-checkpoints/dispatch-context.stamp.test.js',
   // Git-Native WP-G2.2: the human renderer's checkpoint IPC registrar + the
   // Open #4 force gate (refuse while an active turn witnesses a requested path).
   'dist/main/main/git-checkpoints/checkpoint-ipc.test.js',
