@@ -12,6 +12,7 @@ import { parseRepoActivityEvidence } from './plans/repo-activity';
 import { OrchestrationEvent, OrchestrationRun } from './orchestration/types';
 import { resolveWorkspaceForCwd, WORKSPACE_LINEAGE_VERSION, type WorkspaceRecordLite } from './skill-analytics/workspace-lineage';
 import { unwrapOsc8, stripTerminalEscapes, canonicalizeToAbsolute, looksPolluted } from './file-activity-normalize';
+import type { ResolvedPlanStamp } from '../shared/commit-candidates';
 
 let db: Database.Database;
 let dbPath: string;
@@ -1530,6 +1531,31 @@ function initContextOptimizerSchema(): void {
     );
     CREATE INDEX IF NOT EXISTS idx_turn_records_ws_seq ON turn_records(workspace_id, turn_seq);
     CREATE INDEX IF NOT EXISTS idx_turn_records_agent ON turn_records(agent_id);
+  `);
+
+  // Save-card SC-WP-2A — immutable plan attribution, frozen at turn-open.
+  // SQLite has no ADD COLUMN IF NOT EXISTS, so legacy databases use the same
+  // guarded migration idiom as agents.plan_id. These are plain attributes: no
+  // FK/cascade may erase historical attribution when an agent is deleted.
+  try { db.exec(`ALTER TABLE turn_records ADD COLUMN plan_id TEXT`); } catch { /* exists */ }
+  try { db.exec(`ALTER TABLE turn_records ADD COLUMN plan_item_id TEXT`); } catch { /* exists */ }
+  try {
+    db.exec(`ALTER TABLE turn_records ADD COLUMN plan_stamp_source TEXT NOT NULL
+      DEFAULT 'legacy-unstamped'
+      CHECK (plan_stamp_source IN ('legacy-unstamped', 'explicit', 'agent-default',
+        'fork-carry', 'revive-carry', 'continuation-carry', 'explicit-none',
+        'unbound-manual'))`);
+  } catch { /* exists */ }
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_turn_records_ws_plan_seq
+      ON turn_records(workspace_id, plan_id, turn_seq);
+    CREATE INDEX IF NOT EXISTS idx_turn_records_ws_plan_item_seq
+      ON turn_records(workspace_id, plan_item_id, turn_seq);
+    CREATE TRIGGER IF NOT EXISTS turn_records_plan_stamp_immutable
+    BEFORE UPDATE OF plan_id, plan_item_id, plan_stamp_source ON turn_records
+    WHEN NEW.plan_id IS NOT OLD.plan_id OR NEW.plan_item_id IS NOT OLD.plan_item_id
+      OR NEW.plan_stamp_source IS NOT OLD.plan_stamp_source
+    BEGIN SELECT RAISE(ABORT, 'turn plan stamp is immutable'); END;
   `);
 
   // WP-2B (Priority 0) — one-time, resumable workspace-lineage backfill. Populates
@@ -4397,6 +4423,21 @@ const TURN_TERMINAL_STATUSES: ReadonlySet<TurnStatus> = new Set<TurnStatus>([
 
 export type TurnWitnessOp = 'write' | 'create' | string;
 
+/** Runtime plan-stamp sources. `legacy-unstamped` is migration-only and is
+ * deliberately excluded from allocation input. */
+export type TurnPlanStampSource = ResolvedPlanStamp['source'];
+export type PersistedTurnPlanStampSource = TurnPlanStampSource | 'legacy-unstamped';
+
+const TURN_PLAN_STAMP_SOURCES: ReadonlySet<string> = new Set<TurnPlanStampSource>([
+  'explicit',
+  'agent-default',
+  'fork-carry',
+  'revive-carry',
+  'continuation-carry',
+  'explicit-none',
+  'unbound-manual',
+]);
+
 export interface TurnWitnessEntry {
   path: string;
   op: TurnWitnessOp;
@@ -4410,6 +4451,11 @@ export interface TurnRecord {
   agentTitle: string | null;
   ownerAgentId: string | null;
   ownerBrickGeneration: number | null;
+  /** Present on records read from the current schema. Optional only so older
+   * test/store adapters can structurally model pre-migration rows. */
+  planId?: string | null;
+  planItemId?: string | null;
+  planStampSource?: PersistedTurnPlanStampSource;
   sessionId: string | null;
   taskLabel: string | null;
   startedAt: number | null;
@@ -4442,6 +4488,9 @@ export interface AllocateTurnFields {
   agentTitle?: string | null;
   ownerAgentId?: string | null;
   ownerBrickGeneration?: number | null;
+  planId?: string | null;
+  planItemId?: string | null;
+  planStampSource?: TurnPlanStampSource;
   sessionId?: string | null;
   taskLabel?: string | null;
   startedAt?: number | null;
@@ -4499,6 +4548,9 @@ function rowToTurnRecord(row: any): TurnRecord {
     agentTitle: row.agent_title ?? null,
     ownerAgentId: row.owner_agent_id ?? null,
     ownerBrickGeneration: row.owner_brick_generation ?? null,
+    planId: row.plan_id ?? null,
+    planItemId: row.plan_item_id ?? null,
+    planStampSource: (row.plan_stamp_source ?? 'legacy-unstamped') as PersistedTurnPlanStampSource,
     sessionId: row.session_id ?? null,
     taskLabel: row.task_label ?? null,
     startedAt: row.started_at ?? null,
@@ -4656,6 +4708,17 @@ export function allocateAndInsertTurn(
 ): TurnRecord {
   const id = fields.id ?? uuidv4();
   const status: TurnStatus = fields.status ?? 'open';
+  // Until plan_work_packages lands, an item stamp has no authoritative entity
+  // to validate against and must be rejected rather than stored optimistically.
+  if (fields.planItemId !== undefined && fields.planItemId !== null) {
+    throw new Error('plan_item_id is unsupported until plan_work_packages exists');
+  }
+  // Preserve compatibility for pre-stamping call sites while still writing an
+  // enum-valid runtime origin explicitly (never the column's migration default).
+  const planStampSource = fields.planStampSource ?? 'agent-default';
+  if (!TURN_PLAN_STAMP_SOURCES.has(planStampSource)) {
+    throw new Error(`invalid turn plan stamp source '${String(planStampSource)}'`);
+  }
 
   const insertOnce = db.transaction((): TurnRecord => {
     const next = db
@@ -4667,8 +4730,9 @@ export function allocateAndInsertTurn(
     db.prepare(
       `INSERT INTO turn_records
          (id, workspace_id, turn_seq, agent_id, agent_title, owner_agent_id,
-          owner_brick_generation, session_id, task_label, started_at, status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          owner_brick_generation, plan_id, plan_item_id, plan_stamp_source,
+          session_id, task_label, started_at, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).run(
       id,
       workspaceId,
@@ -4677,6 +4741,9 @@ export function allocateAndInsertTurn(
       fields.agentTitle ?? null,
       fields.ownerAgentId ?? null,
       fields.ownerBrickGeneration ?? null,
+      fields.planId ?? null,
+      null,
+      planStampSource,
       fields.sessionId ?? null,
       fields.taskLabel ?? null,
       fields.startedAt ?? null,

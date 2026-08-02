@@ -113,6 +113,8 @@ const TESTS = [
   // 85% boundary, NaN/zero-limit/negative/thrown fail-closed, caps→heap→commit.
   'dist/main/main/watchdog/memory-sampler.test.js',
   'dist/main/main/database.active-agents.test.js',
+  // Save-card SC-WP-2A: immutable turn plan-stamp schema, mapper, and guards.
+  'dist/main/main/database.turnStamp.test.js',
   // Terminal-log retention WP-1: reclaimed-marker column — idempotent migration,
   // the WHERE-guarded write (first value preserved, own column only), NULL→null.
   'dist/main/main/log-retention-marker.test.js',
