@@ -115,6 +115,9 @@ const TESTS = [
   'dist/main/main/database.active-agents.test.js',
   // Save-card SC-WP-2A: immutable turn plan-stamp schema, mapper, and guards.
   'dist/main/main/database.turnStamp.test.js',
+  // Save-card SC-WP-2H/2J: protected-worktree policy and commit representation.
+  'dist/main/main/git-checkpoints/protection-policy.test.js',
+  'dist/main/main/commit-candidates/commit-representation.test.js',
   // Terminal-log retention WP-1: reclaimed-marker column — idempotent migration,
   // the WHERE-guarded write (first value preserved, own column only), NULL→null.
   'dist/main/main/log-retention-marker.test.js',
