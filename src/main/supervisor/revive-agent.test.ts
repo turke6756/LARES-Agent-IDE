@@ -475,6 +475,44 @@ test('grok → revive-unsupported-provider (422), message names grok as not-yet-
     'the error still names the supported providers');
 }));
 
+test('grok revive rejects WITHOUT synthesizing a cwd-based session identity', () => withHarness(async (h) => {
+  // Boundary (plan §4.3): assertResumable hits the default: branch for grok and
+  // throws BEFORE any codex session resolution. A grok agent must never have a
+  // cwd-matching rollout synthesized as its "session" — resolveCodexResumeSessionId
+  // (which falls back to the cwd rollout scan) must not be consulted at all.
+  const agent = terminalWorker(h.workspacePath, { provider: 'grok' });
+  h.agents.push(agent);
+  let codexResolveCalls = 0;
+  (h.supervisor as unknown as { resolveCodexResumeSessionId: unknown }).resolveCodexResumeSessionId = () => {
+    codexResolveCalls++;
+    return 'SHOULD-NOT-BE-SYNTHESIZED';
+  };
+  const res = await revive(h.supervisor, agent.id);
+  assert.equal((res as { code?: string }).code, 'revive-unsupported-provider',
+    'grok is rejected at the unsupported-provider gate, not routed through codex resolution');
+  assert.equal(codexResolveCalls, 0, 'no cwd-based codex session identity may be synthesized for grok');
+}));
+
+test('a fresh grok launch does not scan ~/.codex (discovery gate declines non-codex providers)', () => {
+  // Boundary (plan §4.3): the post-launch codex SQLite/rollout discovery is
+  // gated by shouldDiscoverCodexSession, which is provider === 'codex' only.
+  // grok — resume or fresh — never enters that scan, so no ~/.codex read runs
+  // for a grok launch.
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { shouldDiscoverCodexSession } = require('./session-id-discovery') as {
+    shouldDiscoverCodexSession: (o: { provider: string; resume: boolean; freshSession: boolean }) => boolean;
+  };
+  assert.equal(shouldDiscoverCodexSession({ provider: 'grok', resume: false, freshSession: false }), false,
+    'a fresh grok launch does not run codex session discovery');
+  assert.equal(shouldDiscoverCodexSession({ provider: 'grok', resume: false, freshSession: true }), false,
+    'a fresh-session grok launch still does not scan ~/.codex');
+  assert.equal(shouldDiscoverCodexSession({ provider: 'grok', resume: true, freshSession: false }), false,
+    'a resume-shaped grok launch (not that grok resumes) still does not scan ~/.codex');
+  // Positive control: codex DOES trigger discovery on a fresh launch.
+  assert.equal(shouldDiscoverCodexSession({ provider: 'codex', resume: false, freshSession: false }), true,
+    'control: codex fresh launch triggers discovery');
+});
+
 test('codex whose session cannot be resolved → revive-no-session (422)', () => withHarness(async (h) => {
   const agent = terminalWorker(h.workspacePath, { provider: 'codex', resumeSessionId: null });
   h.agents.push(agent);

@@ -235,6 +235,97 @@ test('WP2c. healthy / unknown / undefined → hooks available, no reason', () =>
   }
 });
 
+// ── G. Grok compat carrier (Phase 4.2 of the grok provider lane) ──────
+//
+// The grok worker lane's SOLE hook carrier is the claude-compat
+// <cwd>/.claude/settings.json (WORKER_FILES_GROK maps its content, deduped, to
+// WORKER_CLAUDE_SETTINGS_JSON — see index.ts / plan §2.2). Grok loads that file
+// natively (Hook Locations table), skips unknown event names, and aliases
+// matcher:"Bash" → run_terminal_command. There is NO codex profile / config.toml
+// instrumentation on the grok lane, and NO native .grok/hooks carrier.
+//
+// These tests pin that contract at the constant level (the carrier CONTENT),
+// which is what the launch actually writes.
+
+function grokCarrierHooks(): Record<string, Array<{ matcher?: string; hooks: Array<{ type: string; command: string }> }>> {
+  const parsed = JSON.parse(WORKER_CLAUDE_SETTINGS_JSON) as {
+    hooks?: Record<string, Array<{ matcher?: string; hooks: Array<{ type: string; command: string }> }>>;
+  };
+  assert.ok(parsed.hooks, 'the grok carrier must have a hooks block');
+  return parsed.hooks!;
+}
+
+test('G1. grok carrier fires all four dashboard events (SessionStart/UserPromptSubmit/Stop/PreToolUse)', () => {
+  const hooks = grokCarrierHooks();
+  for (const ev of ['SessionStart', 'UserPromptSubmit', 'Stop', 'PreToolUse'] as const) {
+    assert.ok(Array.isArray(hooks[ev]) && hooks[ev].length > 0, `grok carrier missing the ${ev} hook`);
+  }
+  // Status events route through dashboard-status.mjs; the guard through guard-git-discard.mjs.
+  assert.ok(/dashboard-status\.mjs/.test(hooks.SessionStart[0].hooks[0].command), 'SessionStart → dashboard-status.mjs');
+  assert.ok(/dashboard-status\.mjs/.test(hooks.UserPromptSubmit[0].hooks[0].command), 'UserPromptSubmit → dashboard-status.mjs');
+  assert.ok(/dashboard-status\.mjs/.test(hooks.Stop[0].hooks[0].command), 'Stop → dashboard-status.mjs');
+  assert.ok(/guard-git-discard\.mjs/.test(hooks.PreToolUse[0].hooks[0].command), 'PreToolUse → guard-git-discard.mjs');
+});
+
+test('G2. grok PreToolUse guard matches "Bash" (grok aliases Bash → run_terminal_command natively)', () => {
+  const hooks = grokCarrierHooks();
+  assert.equal(hooks.PreToolUse[0].matcher, 'Bash',
+    'the PreToolUse guard matcher must be "Bash" — grok maps that to its run_terminal_command tool');
+});
+
+test('G3. NO codex profile instrumentation reaches the grok carrier (settings.json, not config.toml)', () => {
+  // The carrier is JSON, never Codex TOML. None of the codex hook-carrier
+  // markers may appear: no [[hooks.*]] TOML tables, no [features] gate, no
+  // --profile dashboard-worker, no literal run_terminal_command aliasing (grok
+  // does that itself from matcher:"Bash").
+  assert.ok(!/\[\[hooks\./.test(WORKER_CLAUDE_SETTINGS_JSON), 'grok carrier must not carry codex [[hooks.*]] TOML tables');
+  assert.ok(!/\[features\]/.test(WORKER_CLAUDE_SETTINGS_JSON), 'grok carrier must not carry the codex [features] gate');
+  assert.ok(!WORKER_CLAUDE_SETTINGS_JSON.includes(CODEX_WORKER_PROFILE_NAME),
+    `grok carrier must not reference the codex profile name (${CODEX_WORKER_PROFILE_NAME})`);
+  assert.ok(!/--profile/.test(WORKER_CLAUDE_SETTINGS_JSON), 'grok carrier must not carry a --profile flag');
+  assert.ok(!/run_terminal_command/.test(WORKER_CLAUDE_SETTINGS_JSON),
+    'grok carrier must not hard-code run_terminal_command — grok aliases matcher:"Bash" itself');
+});
+
+test('G4. grok status contract is argv-fallback authoritative — NOT stdin-enriched turnId/sessionId', () => {
+  // dashboard-status.mjs derives grok status from its ARGV (session-start /
+  // working / no-arg), NOT from stdin fields. grok's camelCase stdin payload
+  // (hookEventName/sessionId/turn ids) is deliberately NOT part of the status
+  // contract on this lane (plan §4.2 / DASHBOARD-INTEGRATION.md). Pin that the
+  // carrier commands pass the argv discriminators and template NO stdin ids.
+  const hooks = grokCarrierHooks();
+  assert.ok(/\bsession-start\b/.test(hooks.SessionStart[0].hooks[0].command), 'SessionStart passes the session-start argv');
+  assert.ok(/\bworking\b/.test(hooks.UserPromptSubmit[0].hooks[0].command), 'UserPromptSubmit passes the working argv');
+  // The Stop command carries no state argv (no-arg → idle).
+  assert.ok(!/\b(working|session-start|waiting)\b/.test(hooks.Stop[0].hooks[0].command),
+    'Stop passes no state argv (no-arg → idle)');
+  // No command interpolates a session/turn id — the contract is env+argv, never stdin ids.
+  const allCommands = Object.values(hooks).flatMap((arr) => arr.flatMap((g) => g.hooks.map((h) => h.command)));
+  for (const cmd of allCommands) {
+    assert.ok(!/session[_-]?id|turn[_-]?id/i.test(cmd),
+      `grok carrier command must not template a session/turn id (argv fallback is authoritative); got: ${cmd}`);
+  }
+});
+
+test('G5. compat.claude.hooks=false surfaces as UNHEALTHY (canary-timeout/broken), never healthy', () => {
+  // GAP NOTE (plan §4.2): the health model has no STATIC detector for a user's
+  // `~/.grok/config.toml` `[compat.claude] hooks = false`. That file is neither
+  // written nor read by the dashboard, so it cannot be asserted from a constant
+  // or a pure function here. What IS guaranteed — and what this test pins — is
+  // the REACTIVE contract: if the compat carrier is disabled, grok fires zero
+  // hooks, the launch canary times out, hook_status becomes 'broken', and the
+  // DTO projection reports the lane UNAVAILABLE (never healthy). The gap
+  // (no proactive compat-disabled warning) is flagged in the commit summary; the
+  // authoritative signal remains `grok inspect --json` / canary health.
+  const broken = deriveHookAvailability('broken');
+  assert.equal(broken.hooksUnavailable, true, 'a compat-disabled grok lane (no events → canary-timeout) is unavailable');
+  assert.equal(broken.hooksUnavailableReason, 'canary-timeout', 'the reactive signal is canary-timeout');
+  // A degraded lane (e.g. carrier not loadable) is likewise never healthy.
+  assert.equal(deriveHookAvailability('degraded').hooksUnavailable, true, 'a degraded grok lane is also unavailable');
+  // And the positive control: a lane that DID fire an event is healthy.
+  assert.equal(deriveHookAvailability('healthy').hooksUnavailable, false, 'a lane that fired a valid event is available');
+});
+
 // ── Runner ───────────────────────────────────────────────────────────
 (async () => {
   let passed = 0;

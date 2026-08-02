@@ -1,7 +1,8 @@
 // P1 multi-transport matrix tests (plans/p1-hook-spool-multi-transport.md §5
 // E5/E6 + the §5 E4 restart-shaped tmux end-to-end).
 //
-// Cells: Claude×Windows, Codex×Windows, Claude×WSL, Codex×WSL — each asserts:
+// Cells: Claude×Windows, Codex×Windows, Claude×WSL, Codex×WSL, Grok×Windows
+// (grok is Windows-only — grok-on-WSL is refused at launch) — each asserts:
 //   (i)   launch injects DASHBOARD_SPOOL_PATH in the right form for the
 //         pathType (WSL form shell-quoted);
 //   (ii)  a spool-delivered event (HTTP silent) flips status with source
@@ -135,6 +136,36 @@ function stubCodexDiscovery(): () => void {
   return () => { disc.shouldDiscoverCodexSession = orig; };
 }
 
+/** Grok-lane variant of the discovery stub: instead of forcing the gate false,
+ *  DELEGATE to the REAL shouldDiscoverCodexSession (which returns false for any
+ *  non-codex provider) while recording (a) every provider the gate was consulted
+ *  for and (b) any snapshotCodexSessions call. This is how the grok cell proves
+ *  "no codex session-discovery path runs for grok": the gate is consulted and
+ *  the REAL predicate declines grok, so snapshotCodexSessions (the ~/.codex scan)
+ *  is never entered. A snapshot spy that throws would also work, but recording
+ *  lets the assertion message show what actually happened. */
+function spyCodexDiscovery(): { discoverProviders: string[]; snapshotCalls: string[]; restore: () => void } {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const disc = require('./session-id-discovery') as Record<string, unknown>;
+  const origShould = disc.shouldDiscoverCodexSession as (o: { provider: string }) => boolean;
+  const origSnap = disc.snapshotCodexSessions as (home: string) => Promise<unknown>;
+  const discoverProviders: string[] = [];
+  const snapshotCalls: string[] = [];
+  disc.shouldDiscoverCodexSession = (o: { provider: string }) => {
+    discoverProviders.push(o.provider);
+    return origShould(o); // REAL gate — false for grok (non-codex)
+  };
+  disc.snapshotCodexSessions = async (home: string) => {
+    snapshotCalls.push(home);
+    return origSnap(home);
+  };
+  return {
+    discoverProviders,
+    snapshotCalls,
+    restore: () => { disc.shouldDiscoverCodexSession = origShould; disc.snapshotCodexSessions = origSnap; },
+  };
+}
+
 function makeSupervisor(): AgentSupervisor {
   const s = new AgentSupervisor();
   (s as unknown as { writeAgentRegistry: () => void }).writeAgentRegistry = () => {};
@@ -155,7 +186,7 @@ function statusChanges(audit: AuditRow[]): Array<{ from: string; to: string; sou
 // ── The four matrix cells ─────────────────────────────────────────────
 
 interface CellOpts {
-  provider: 'claude' | 'codex';
+  provider: 'claude' | 'codex' | 'grok';
   pathType: 'windows' | 'wsl';
 }
 
@@ -165,7 +196,24 @@ async function runCell(opts: CellOpts): Promise<void> {
   const audit: AuditRow[] = [];
   const restoreDb = patchDb(agentsMap, audit);
   const runners = stubRunnerLaunches();
-  const restoreDiscovery = stubCodexDiscovery();
+  const isGrok = opts.provider === 'grok';
+  // Grok cells use the recording spy (delegates to the REAL gate) so we can
+  // assert the codex discovery scan is never entered; the other lanes keep the
+  // hard false-stub that suppresses the real ~/.codex scan for codex cells.
+  const grokDiscovery = isGrok ? spyCodexDiscovery() : null;
+  const restoreDiscovery = isGrok ? grokDiscovery!.restore : stubCodexDiscovery();
+  // Isolate grok's trust store: ensureGrokTrust honors $GROK_HOME, so point it at
+  // a throwaway dir under tmp. The real ~/.grok must never be touched.
+  const prevGrokHome = process.env.GROK_HOME;
+  if (isGrok) process.env.GROK_HOME = path.join(tmp, '.grok-home');
+  // Keep the grok cell hermetic: the native-Windows launch resolves the provider
+  // binary to an absolute path and throws if absent. grok.exe need not be
+  // installed on the test box, so stub the resolver to a fake path (the runner
+  // launch itself is already stubbed and never execs it).
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const resolver = require('./provider-resolver') as Record<string, unknown>;
+  const origFindBinary = resolver.findWindowsProviderBinary;
+  if (isGrok) resolver.findWindowsProviderBinary = async () => 'C:\\Users\\test\\.grok\\bin\\grok.exe';
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const bridge = require('../wsl-bridge') as Record<string, unknown>;
   const origTmuxRead = bridge.tmuxReadStatusOptions;
@@ -254,11 +302,28 @@ async function runCell(opts: CellOpts): Promise<void> {
     const monitor = (supervisor as unknown as { monitor: { inferStatus: (a: Agent) => Promise<string | null> } }).monitor;
     assert.equal(await monitor.inferStatus(agent), null,
       'worker-lane PTY inference must stay disabled (hook-owned status)');
+
+    // (v) grok only: NO codex session-discovery path runs. The launch consults
+    // the discovery gate (shouldDiscoverCodexSession), but the REAL predicate
+    // declines any non-codex provider, so the ~/.codex snapshot scan
+    // (snapshotCodexSessions) is never entered. grok is deliberately
+    // non-session-addressable — no cwd rollout scan, no ~/.codex touch.
+    if (isGrok) {
+      assert.ok(grokDiscovery!.discoverProviders.includes('grok'),
+        'the launch must consult the discovery gate for the grok agent');
+      assert.ok(grokDiscovery!.discoverProviders.every((p) => p !== 'codex'),
+        `no codex-provider discovery gate call in a grok launch; got: ${grokDiscovery!.discoverProviders.join(',')}`);
+      assert.equal(grokDiscovery!.snapshotCalls.length, 0,
+        `grok must never enter the codex ~/.codex snapshot scan; got ${grokDiscovery!.snapshotCalls.length} call(s)`);
+    }
   } finally {
     bridge.tmuxReadStatusOptions = origTmuxRead;
     restoreDiscovery();
+    resolver.findWindowsProviderBinary = origFindBinary;
     runners.restore();
     restoreDb();
+    if (prevGrokHome === undefined) delete process.env.GROK_HOME;
+    else process.env.GROK_HOME = prevGrokHome;
     try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* best effort */ }
   }
 }
@@ -267,6 +332,12 @@ test('matrix cell: Claude × Windows', () => runCell({ provider: 'claude', pathT
 test('matrix cell: Codex × Windows', () => runCell({ provider: 'codex', pathType: 'windows' }));
 test('matrix cell: Claude × WSL', () => runCell({ provider: 'claude', pathType: 'wsl' }));
 test('matrix cell: Codex × WSL', () => runCell({ provider: 'codex', pathType: 'wsl' }));
+// Grok is Windows-only (grok-on-WSL is refused at launch — see Phase 1.6/4.1).
+// The cell asserts (i) native DASHBOARD_SPOOL_PATH, (ii) a spool Stop flips with
+// source 'hook-spool', (iii) worker PTY inference stays disabled, (iv) hook
+// health becomes healthy after the applied event, and (v) no codex
+// session-discovery path runs for grok.
+test('matrix cell: Grok × Windows', () => runCell({ provider: 'grok', pathType: 'windows' }));
 
 // ── Restart-shaped tmux end-to-end (plan §5 E4, third bullet) ──────────
 
