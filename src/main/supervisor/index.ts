@@ -391,6 +391,151 @@ export function mergeCodexProjectTrust(existing: string | null, dirs: string[]):
   return body + sep + appended;
 }
 
+// ── Grok folder trust (~/.grok/trusted_folders.toml) ──────────────────────
+//
+// Grok gates project-scope hooks/MCP/LSP on a per-folder trust store
+// (`[folders."<canonical path>"] trusted = true`, honoring $GROK_HOME). Unlike
+// Codex we emit exactly ONE canonical key per directory: grok collapses a
+// git-backed cwd to its repository root (workspace_key, trust.rs:351-412) and
+// canonicalizes with `dunce::canonicalize` (true on-disk case, no `\\?\`), and
+// extra same-depth aliases can trip its fail-closed tie logic. Phase-0.2 probe:
+// `fs.realpathSync.native()` matches that spelling. See
+// plans/grok-provider-lane-implementation.md §3 + grok-phase0-probe-results.md.
+
+/** Walk up from `dir` for a `.git` entry (file OR dir); the SHALLOWEST ancestor
+ *  holding one is the repo root (safe: trust cascades to children, so trusting
+ *  the outermost repo covers whichever root grok's workspace_key resolves to),
+ *  else `dir` itself. */
+function grokGitRootOrSelf(dir: string): string {
+  let best: string | null = null;
+  let cur = dir;
+  // Bounded by dirname reaching a fixed point at the filesystem root.
+  for (;;) {
+    try {
+      if (fs.existsSync(path.join(cur, '.git'))) best = cur;  // keep going up → shallowest wins
+    } catch { /* unreadable ancestor — treat as no .git here */ }
+    const parent = path.dirname(cur);
+    if (parent === cur) break;
+    cur = parent;
+  }
+  return best ?? dir;
+}
+
+/** Roots grok refuses on read AND write — never seed a junk broad key. */
+function grokUnsafeTrustRoot(key: string): boolean {
+  if (!key || !path.isAbsolute(key)) return true;
+  if (path.dirname(key) === key) return true;  // filesystem root (C:\, \, //server/share)
+  const home = (process.env.USERPROFILE || process.env.HOME || '').replace(/[\\/]+$/, '');
+  const norm = key.replace(/[\\/]+$/, '') || key;
+  if (home && norm.toLowerCase() === home.toLowerCase()) return true;  // home dir itself
+  return false;
+}
+
+/** The ONE canonical trust key grok looks a directory up by:
+ *  `canonical(gitRoot(dir) ?? dir)`. Returns null for a path grok would refuse
+ *  (non-absolute, filesystem root, home dir) so we skip it rather than write
+ *  junk. Grok trust is Windows-only in this lane (WSL deferred), so a
+ *  non-windows pathType — a distro-local posix path the Windows host can't
+ *  canonicalize — is skipped. */
+export function grokTrustPathKey(dir: string, pathType: string): string | null {
+  if (pathType !== 'windows') return null;
+  if (!dir || !path.isAbsolute(dir)) return null;
+  // Collapse to the git root FIRST (mirrors workspace_key's canonicalize-the-root
+  // order), then canonicalize the resulting dir.
+  const root = grokGitRootOrSelf(dir);
+  let key: string;
+  try {
+    // .native() matches dunce::canonicalize spelling (Phase 0.2). It throws
+    // ENOENT where Rust's canonicalize_or_owned falls back to the raw path, so
+    // wrap and fall back to keep parity for a not-yet-created dir.
+    key = fs.realpathSync.native(root);
+  } catch {
+    key = root;
+  }
+  if (grokUnsafeTrustRoot(key)) return null;
+  return key;
+}
+
+const GROK_TOML_UNESCAPE_RE = /\\(["\\])/g;
+
+/** Unescape a TOML basic-string key's inner content for comparison. Path keys
+ *  only ever carry `\\`→`\` and `\"`→`"`; other escapes can't appear in a real
+ *  directory key and are left raw. */
+function grokUnescapeTomlBasic(inner: string): string {
+  return inner.replace(GROK_TOML_UNESCAPE_RE, '$1');
+}
+
+/** Escape a path for use as a TOML basic-string key. */
+function grokEscapeTomlBasic(key: string): string {
+  return key.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+}
+
+/** Line-aware merge of `[folders."<key>"] trusted = true` tables into grok's
+ *  trusted_folders.toml — NOT append-only (a second table for an existing key is
+ *  ambiguous/invalid). Recognizes existing folder tables (basic-string keys,
+ *  unescaped for comparison); flips a `trusted = false` to `true` in place
+ *  preserving `decided_at`/other fields; appends a fresh table only for a
+ *  genuinely absent key. Returns null (no write) when every key is already
+ *  trusted, OR when the store is malformed / has duplicate ambiguous folder
+ *  tables — we never clobber the user's store. */
+export function mergeGrokFolderTrust(existing: string | null, keys: string[]): string | null {
+  const wanted = [...new Set(keys.filter(k => k && k.length > 0))];
+  if (wanted.length === 0) return null;
+
+  const src = existing ?? '';
+  const nl = /\r\n/.test(src) ? '\r\n' : '\n';
+  const lines = src.length > 0 ? src.split(/\r?\n/) : [];
+
+  const folderStartRe = /^\s*\[\s*folders\s*\./;
+  const folderHeaderRe = /^\s*\[\s*folders\s*\.\s*"((?:[^"\\]|\\.)*)"\s*\]\s*$/;
+  const anyHeaderRe = /^\s*\[/;
+
+  // Map each existing folder key → its header line index; detect ambiguity.
+  const keyToLine = new Map<string, number>();
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (!folderStartRe.test(line)) continue;
+    const m = folderHeaderRe.exec(line);
+    if (!m) return null;  // a folders.* header we can't parse → don't clobber
+    const key = grokUnescapeTomlBasic(m[1]);
+    if (keyToLine.has(key)) return null;  // duplicate ambiguous table → don't clobber
+    keyToLine.set(key, i);
+  }
+
+  // Locate the `trusted = <bool>` line inside a folder table's body (the header
+  // line's index → the next table header or EOF).
+  const findTrustedLine = (headerIdx: number): number | null => {
+    for (let i = headerIdx + 1; i < lines.length; i++) {
+      if (anyHeaderRe.test(lines[i])) break;  // next table
+      if (/^\s*trusted\s*=\s*(?:true|false)\b/.test(lines[i])) return i;
+    }
+    return null;
+  };
+
+  let changed = false;
+  const absent: string[] = [];
+  for (const key of wanted) {
+    const headerIdx = keyToLine.get(key);
+    if (headerIdx === undefined) { absent.push(key); continue; }
+    const trustedIdx = findTrustedLine(headerIdx);
+    if (trustedIdx === null) return null;  // table exists but no parseable trusted → don't clobber
+    if (/^\s*trusted\s*=\s*true\b/.test(lines[trustedIdx])) continue;  // already trusted
+    lines[trustedIdx] = lines[trustedIdx].replace(/(trusted\s*=\s*)false\b/, '$1true');
+    changed = true;
+  }
+
+  if (absent.length === 0 && !changed) return null;
+
+  let result = lines.join(nl);
+  if (absent.length > 0) {
+    const blocks = absent.map(k => `[folders."${grokEscapeTomlBasic(k)}"]${nl}trusted = true`);
+    const joined = blocks.join(nl + nl);
+    const trimmed = result.replace(/(?:\r?\n)+$/, '');
+    result = trimmed.length > 0 ? `${trimmed}${nl}${nl}${joined}${nl}` : `${joined}${nl}`;
+  }
+  return result;
+}
+
 /** Merge `hasTrustDialogAccepted: true` into `~/.claude.json` project entries.
  *  Keys use Claude's observed on-disk form (forward slashes, exact case).
  *  Preserves every other field in an existing entry; refuses to touch a file
@@ -3474,13 +3619,15 @@ export class AgentSupervisor extends EventEmitter {
    *  entries and unrelated config are never rewritten. Best-effort — a failure
    *  here degrades to today's behavior (the CLI prompts or refuses). */
   private ensureProviderDirTrust(workDir: string, agentCwd: string, provider: string, pathType: string): void {
-    if (provider !== 'claude' && provider !== 'codex') return;  // gemini --yolo has no trust gate today
+    if (provider !== 'claude' && provider !== 'codex' && provider !== 'grok') return;  // gemini --yolo has no trust gate today
     const dirs = agentCwd && agentCwd !== workDir ? [workDir, agentCwd] : [workDir];
     const cacheKey = `${pathType}|${provider}|${dirs.join('|')}`;
     if (this.providerTrustEnsured.has(cacheKey)) return;
     try {
       if (provider === 'codex') {
         this.ensureCodexProjectTrust(dirs, pathType);
+      } else if (provider === 'grok') {
+        this.ensureGrokTrust(dirs, pathType);
       } else {
         this.ensureClaudeProjectTrust(dirs, pathType);
       }
@@ -3532,6 +3679,31 @@ export class AgentSupervisor extends EventEmitter {
       { timeout: 8000 },
     );
     console.log(`[supervisor] Codex project trust seeded for ${dirs.join(', ')} in ${codexHome}/config.toml (wsl)`);
+  }
+
+  /** Seed grok's per-folder trust store so project-scope hooks/MCP aren't
+   *  silently skipped. Store = ($GROK_HOME || ~/.grok)/trusted_folders.toml.
+   *  Each dir maps to ONE canonical key (grokTrustPathKey); workspace root and
+   *  agent cwd usually collapse to the same git root, so dedupe. Best-effort:
+   *  read → pure merge → atomic tmp+rename, write only on change. WSL is out of
+   *  scope for this lane. */
+  private ensureGrokTrust(dirs: string[], pathType: string): void {
+    if (pathType !== 'windows') return;  // WSL grok transport not yet in scope
+    const grokHome = process.env.GROK_HOME
+      || path.join(process.env.USERPROFILE || process.env.HOME || '', '.grok');
+    const trustPath = path.join(grokHome, 'trusted_folders.toml');
+    const keys = [...new Set(
+      dirs.map(d => grokTrustPathKey(d, pathType)).filter((k): k is string => k !== null),
+    )];
+    if (keys.length === 0) return;
+    const existing = fs.existsSync(trustPath) ? fs.readFileSync(trustPath, 'utf-8') : null;
+    const merged = mergeGrokFolderTrust(existing, keys);
+    if (merged === null) return;
+    fs.mkdirSync(grokHome, { recursive: true });
+    const tmp = `${trustPath}.tmp-${process.pid}`;
+    fs.writeFileSync(tmp, merged);
+    fs.renameSync(tmp, trustPath);
+    console.log(`[supervisor] Grok folder trust seeded for ${keys.join(', ')} in ${trustPath}`);
   }
 
   private ensureClaudeProjectTrust(dirs: string[], pathType: string): void {

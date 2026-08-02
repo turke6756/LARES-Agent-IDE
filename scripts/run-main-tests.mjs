@@ -262,6 +262,9 @@ const TESTS = [
   'dist/main/main/supervisor/legacy-state-dir-heal.test.js',
   'dist/main/main/supervisor/supervisor-persona-capability-parity.test.js',
   'dist/main/main/supervisor/provider-dir-trust.test.js',
+  // Grok provider lane Phase 3: grokTrustPathKey (canonical git-root key) +
+  // mergeGrokFolderTrust (line-aware trusted_folders.toml merge).
+  'dist/main/main/supervisor/grok-trust.test.js',
   'dist/main/main/supervisor/handoff-handshake.test.js',
   'dist/main/main/supervisor/hook-status-detection.test.js',
   'dist/main/main/supervisor/codex-guard-hook-profile.test.js',
