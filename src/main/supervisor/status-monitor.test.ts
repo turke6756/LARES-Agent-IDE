@@ -631,10 +631,9 @@ test('Class IV: supervised Gemini worker — inference is now skipped (broadened
 });
 
 // ── Liveness-only inferStatus contract ───────────────────────────────
-// inferStatus was reduced to LIVENESS-ONLY: transitional → null; not-alive →
-// done (exit 0) / crashed (non-zero); alive → ALWAYS null, for every agent
-// and lane. The latch is still written as bookkeeping but is no longer READ
-// by inference. These tests pin that contract directly.
+// inferStatus is liveness-only except for agy's probe-mandated, demotion-only
+// PTY-quiet fallback: transitional → null; not-alive → done/crashed; other live
+// agents → null. The latch is bookkeeping and is not a generic inference input.
 
 test('inferStatus returns null for an alive agent regardless of an armed idle/working/waiting latch', async () => {
   const fakes = makeStatusMonitorFakes();
@@ -695,6 +694,68 @@ test('inferStatus returns null for an alive agent even with a (y/N) ring tail (P
       'no waiting latch produced by inferStatus from the ring tail');
     assert.equal(fakes.emissions.filter((e) => e.status === 'waiting').length, 0,
       'no waiting emission produced by inferStatus from the ring tail');
+  } finally {
+    restore();
+  }
+});
+
+test('Agy status: PreInvocation working stays working while hook/raw PTY evidence is fresh', async () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeAgent('agy-fresh', {
+      provider: 'agy', isWorker: true, isSupervised: false, status: 'working',
+    });
+    const monitor = makeMonitor({ fakes, agent });
+    monitor.recordHookEventAt(agent.id, fakes.now.value);
+    fakes.lastRawOutputAt.set(agent.id, fakes.now.value - WORKING_THRESHOLD_MS - 1);
+
+    fakes.now.value += WORKING_THRESHOLD_MS - 1;
+    assert.equal(await inferStatus(monitor, agent), null, 'fresh PreInvocation keeps the turn working');
+
+    fakes.lastRawOutputAt.set(agent.id, fakes.now.value);
+    fakes.now.value += WORKING_THRESHOLD_MS - 1;
+    assert.equal(await inferStatus(monitor, agent), null, 'fresh raw PTY output keeps the turn working');
+  } finally {
+    restore();
+  }
+});
+
+test('Agy status: an already-working worker demotes to idle after hook + raw PTY quiet', async () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const agent = makeAgent('agy-quiet', {
+      provider: 'agy', isWorker: true, isSupervised: false, status: 'working',
+    });
+    const monitor = makeMonitor({ fakes, agent });
+    const stale = fakes.now.value - WORKING_THRESHOLD_MS;
+    monitor.recordHookEventAt(agent.id, stale);
+    fakes.lastRawOutputAt.set(agent.id, stale);
+
+    assert.equal(await inferStatus(monitor, agent), 'idle');
+  } finally {
+    restore();
+  }
+});
+
+test('Agy status: PTY activity never promotes idle, and quiet inference stays agy-only', async () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  try {
+    const idleAgy = makeAgent('agy-idle', {
+      provider: 'agy', isWorker: true, isSupervised: false, status: 'idle',
+    });
+    const agyMonitor = makeMonitor({ fakes, agent: idleAgy });
+    fakes.lastRawOutputAt.set(idleAgy.id, fakes.now.value);
+    assert.equal(await inferStatus(agyMonitor, idleAgy), null, 'PTY bytes cannot start an agy turn');
+
+    const quietCodex = makeAgent('codex-quiet', {
+      provider: 'codex', isWorker: true, isSupervised: false, status: 'working',
+    });
+    const codexMonitor = makeMonitor({ fakes, agent: quietCodex });
+    fakes.lastRawOutputAt.set(quietCodex.id, fakes.now.value - WORKING_THRESHOLD_MS - 1);
+    assert.equal(await inferStatus(codexMonitor, quietCodex), null, 'other providers remain hook-owned');
   } finally {
     restore();
   }

@@ -1315,6 +1315,20 @@ export const WORKER_GROK_AGENTS_MD = WORKER_CLAUDE_MD
   // 3. Promote-lessons pointer names the Grok constant, not the Claude one.
   .split('`WORKER_CLAUDE_MD` constant').join('`WORKER_GROK_AGENTS_MD` constant');
 
+/** Antigravity CLI worker standing instructions — seeded write-if-absent to
+ *  <workspace>/.lares/workers/agy/AGENTS.md. agy 1.1.9 loads AGENTS.md (and
+ *  GEMINI.md) from its active directory; the lane uses AGENTS.md as the single
+ *  seed-once identity file so the same instructions are not loaded twice.
+ *
+ *  Keep this derived from WORKER_CLAUDE_MD through the same anti-drift chain as
+ *  the Codex and Grok bodies. Only provider-specific cwd/tool wording changes;
+ *  the shared-tree hygiene and turn-ending protocol remain byte-identical. */
+export const WORKER_AGY_AGENTS_MD = WORKER_CLAUDE_MD
+  .split('.lares/workers/claude/').join('.lares/workers/agy/')
+  .split('`AskUserQuestion`,\nplan-mode approval prompts, `(y/n)` confirmations, ')
+  .join('an interactive approval prompt or `(y/n)` confirmation, ')
+  .split('`WORKER_CLAUDE_MD` constant').join('`WORKER_AGY_AGENTS_MD` constant');
+
 /** WP-G (Memory & Lessons v2): the frozen v1 Codex AGENTS.md body — the byte-exact
  *  Codex derivation of the FROZEN worker v8 (WORKER_CLAUDE_MD_V8), applying the same
  *  three transforms the live derivation above applies. It is the previousHashes[1]

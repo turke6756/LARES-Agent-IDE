@@ -23,7 +23,13 @@ import {
   WORKER_CLAUDE_SETTINGS_JSON,
   RESEARCHER_CLAUDE_SETTINGS_JSON,
   WORKER_GROK_AGENTS_MD,
+  WORKER_AGY_AGENTS_MD,
 } from '../../shared/constants';
+import {
+  AGY_STATUS_HOOK_COMMAND,
+  AGY_STATUS_HOOK_ENTRY,
+  AGY_STATUS_HOOK_NAME,
+} from './agy-hooks';
 
 interface TestCase {
   name: string;
@@ -629,6 +635,113 @@ test('Grok: git unavailable → scaffold degrades with a warning, does not throw
     cleanup();
     rmrf(workDir);
   }
+});
+
+// ── Antigravity worker scaffold (agy plan Commit 2 + Phase-0 addendum) ──
+
+test('Agy: fresh scaffold seeds AGENTS.md, shared scripts, and one global PreInvocation carrier', () => {
+  const workDir = mktmp('agy-scaffold');
+  const fakeHome = path.join(workDir, 'fake-home');
+  const priorUserProfile = process.env.USERPROFILE;
+  process.env.USERPROFILE = fakeHome;
+  const { supervisor, cleanup } = makeSupervisor();
+  try {
+    supervisor.ensureWorkerScaffold(workDir, 'agy', 'windows');
+
+    const workerDir = path.join(workDir, '.lares', 'workers', 'agy');
+    assert.equal(
+      fs.readFileSync(path.join(workerDir, 'AGENTS.md'), 'utf-8'),
+      WORKER_AGY_AGENTS_MD,
+      'agy AGENTS.md must be the exact derived seed body',
+    );
+    assert.ok(
+      !fs.existsSync(path.join(workerDir, 'GEMINI.md')),
+      'the plan designates one AGENTS.md identity; do not duplicate it through GEMINI.md',
+    );
+    assert.ok(
+      !fs.existsSync(path.join(workerDir, '.agents', 'hooks.json')),
+      'project .agents/hooks.json is conclusively undiscovered and must not be scaffolded',
+    );
+    assert.ok(fs.existsSync(path.join(workDir, '.lares', 'scripts', 'dashboard-status.mjs')));
+
+    const hooksPath = path.join(fakeHome, '.gemini', 'config', 'hooks.json');
+    const hooks = JSON.parse(fs.readFileSync(hooksPath, 'utf-8')) as Record<string, unknown>;
+    assert.deepEqual(hooks[AGY_STATUS_HOOK_NAME], AGY_STATUS_HOOK_ENTRY);
+    assert.equal(
+      ((hooks[AGY_STATUS_HOOK_NAME] as any).PreInvocation[0].hooks[0].command),
+      AGY_STATUS_HOOK_COMMAND,
+    );
+    assert.match(AGY_STATUS_HOOK_COMMAND, /^if defined AGENT_ID set CLAUDE_HOOK_EVENT_NAME=PreInvocation&& node /);
+    assert.ok(!AGY_STATUS_HOOK_COMMAND.includes('"'), 'cmd.exe hook command must remain quote-free');
+  } finally {
+    if (priorUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = priorUserProfile;
+    cleanup();
+    rmrf(workDir);
+  }
+});
+
+test('Agy: re-scaffold preserves edited identity + foreign global hooks and is content-idempotent', () => {
+  const workDir = mktmp('agy-idempotent');
+  const fakeHome = path.join(workDir, 'fake-home');
+  const hooksPath = path.join(fakeHome, '.gemini', 'config', 'hooks.json');
+  fs.mkdirSync(path.dirname(hooksPath), { recursive: true });
+  fs.writeFileSync(hooksPath, '{"human-hook":{"PreInvocation":null}}\n', 'utf-8');
+  const priorUserProfile = process.env.USERPROFILE;
+  process.env.USERPROFILE = fakeHome;
+  const { supervisor, cleanup } = makeSupervisor();
+  try {
+    supervisor.ensureWorkerScaffold(workDir, 'agy', 'windows');
+    const agentsPath = path.join(workDir, '.lares', 'workers', 'agy', 'AGENTS.md');
+    fs.writeFileSync(agentsPath, '# user-owned agy identity\n', 'utf-8');
+    const hooksAfterFirst = fs.readFileSync(hooksPath, 'utf-8');
+
+    supervisor.ensureWorkerScaffold(workDir, 'agy', 'windows');
+
+    assert.equal(fs.readFileSync(agentsPath, 'utf-8'), '# user-owned agy identity\n');
+    assert.equal(fs.readFileSync(hooksPath, 'utf-8'), hooksAfterFirst, 'second merge must be a no-op');
+    const hooks = JSON.parse(hooksAfterFirst) as Record<string, unknown>;
+    assert.deepEqual(hooks['human-hook'], { PreInvocation: null }, 'foreign named hook must survive');
+    assert.deepEqual(hooks[AGY_STATUS_HOOK_NAME], AGY_STATUS_HOOK_ENTRY);
+  } finally {
+    if (priorUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = priorUserProfile;
+    cleanup();
+    rmrf(workDir);
+  }
+});
+
+test('Agy: malformed global hooks config is never clobbered', () => {
+  const workDir = mktmp('agy-malformed-hooks');
+  const fakeHome = path.join(workDir, 'fake-home');
+  const hooksPath = path.join(fakeHome, '.gemini', 'config', 'hooks.json');
+  fs.mkdirSync(path.dirname(hooksPath), { recursive: true });
+  const malformed = '{ user-owned malformed json';
+  fs.writeFileSync(hooksPath, malformed, 'utf-8');
+  const priorUserProfile = process.env.USERPROFILE;
+  const priorWarn = console.warn;
+  process.env.USERPROFILE = fakeHome;
+  console.warn = () => {};
+  const { supervisor, cleanup } = makeSupervisor();
+  try {
+    supervisor.ensureWorkerScaffold(workDir, 'agy', 'windows');
+    assert.equal(fs.readFileSync(hooksPath, 'utf-8'), malformed);
+  } finally {
+    console.warn = priorWarn;
+    if (priorUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = priorUserProfile;
+    cleanup();
+    rmrf(workDir);
+  }
+});
+
+test('Agy identity: derived cwd and provider-neutral question protocol stay correct', () => {
+  assert.ok(WORKER_AGY_AGENTS_MD.includes('.lares/workers/agy/'));
+  assert.ok(!WORKER_AGY_AGENTS_MD.includes('.lares/workers/claude/'));
+  assert.ok(!WORKER_AGY_AGENTS_MD.includes('.lares/workers/codex/'));
+  assert.ok(!WORKER_AGY_AGENTS_MD.includes('AskUserQuestion'));
+  assert.ok(WORKER_AGY_AGENTS_MD.includes('end your turn with the question in plain text'));
+  assert.ok(WORKER_AGY_AGENTS_MD.includes('Never use git to discard uncommitted work'));
 });
 
 // ── Grok identity derivation parity (anti-drift, plan §2.1) ──────────

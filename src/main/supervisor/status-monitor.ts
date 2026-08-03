@@ -15,6 +15,7 @@ import {
   LAUNCH_SETTLE_OVERRUN_GRACE_MS,
   HOOK_CANARY_WINDOW_MS,
   WORKER_STALL_WARN_MS,
+  WORKING_THRESHOLD_MS,
 } from '../../shared/constants';
 import { getActiveAgents, applyStatusTransition, updateAgentHookStatus, addEvent } from '../database';
 import type { StatusChangedEvent } from './status-events';
@@ -1176,7 +1177,8 @@ export class StatusMonitor extends EventEmitter {
       return 'crashed';
     }
 
-    // Status is hook-owned for EVERY agent. working/idle/waiting come from the
+    // Status is hook-owned for every fully-instrumented agent. working/idle/
+    // waiting come from the
     // hook pipeline (UserPromptSubmit→working, Stop→idle, Notification→waiting
     // via applyHookStatusEvent) and, for hookless providers (gemini), from the
     // chat-stream's turnComplete in event-bridge. PTY heuristics — the
@@ -1184,8 +1186,32 @@ export class StatusMonitor extends EventEmitter {
     // PromptPatternDetector → `waiting` fallback — were removed: they raced the
     // hooks and manufactured false working/idle and a `waiting` state that
     // didn't correspond to a real TUI prompt. `inferStatus` now only resolves
-    // liveness (done/crashed, handled by the `!alive` branch above); for a live
-    // agent it is a deliberate no-op so the last hook / chat-stream write stands.
+    // liveness (done/crashed, handled by the `!alive` branch above).
+    //
+    // Antigravity 1.1.9 is the narrow exception established by Phase-0 probes:
+    // global named+nested PreInvocation fires and authoritatively marks working,
+    // but Stop never fires. For agy workers ONLY, demote an already-working turn
+    // after both its latest hook and raw PTY output have been quiet for the
+    // established 8 s threshold. Never promote from PTY bytes — PreInvocation
+    // remains the sole start signal, avoiding the false-start behavior that led
+    // to removal of generic PTY inference.
+    if (
+      agent.provider === 'agy'
+      && (agent.isSupervised || agent.isWorker)
+      && agent.status === 'working'
+    ) {
+      const lastSignal = Math.max(
+        this.lastHookEventAt.get(agent.id) ?? 0,
+        this.getLastRawOutput(agent.id),
+      );
+      if (lastSignal > 0 && this.now() - lastSignal >= WORKING_THRESHOLD_MS) {
+        this.turnLatch.delete(agent.id);
+        return 'idle';
+      }
+    }
+
+    // Every other live agent is a deliberate no-op so the last hook/chat-stream
+    // write stands.
     return null;
   }
 }

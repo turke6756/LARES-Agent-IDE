@@ -23,7 +23,7 @@ import {
   WORKER_CODEX_CONFIG_TOML, WORKER_CODEX_CONFIG_TOML_V1, WORKER_CODEX_CONFIG_TOML_V2,
   WORKER_CODEX_CONFIG_TOML_V3, WORKER_CODEX_CONFIG_TOML_V4, WORKER_CODEX_CONFIG_TOML_V5,
   WORKER_CODEX_AGENTS_MD, WORKER_CODEX_AGENTS_MD_V1, WORKER_CODEX_BEHAVIORAL_MD,
-  WORKER_GROK_AGENTS_MD,
+  WORKER_GROK_AGENTS_MD, WORKER_AGY_AGENTS_MD,
   GUARD_GIT_DISCARD_MJS,
   DASHBOARD_STATUS_SCRIPT_MJS, DASHBOARD_STATUS_SCRIPT_MJS_V3, DASHBOARD_STATUS_SCRIPT_MJS_V4, DASHBOARD_STATUS_SCRIPT_MJS_V5,
   DASHBOARD_STATUS_SCRIPT_MJS_V6, DASHBOARD_STATUS_SCRIPT_V7_HASH, DASHBOARD_STATUS_SCRIPT_V8_HASH,
@@ -43,6 +43,7 @@ import {
   FILE_ACTIVITY_RETENTION_SESSIONS,
   LARES_DIR_NAME, LEGACY_LARES_DIR_NAME,
 } from '../../shared/constants';
+import { ensureAgyStatusHook } from './agy-hooks';
 import { MEMORY_INDEX_MJS } from '../../shared/generated/memory-index-cli.generated';
 // WP-C — provider-neutral supervisor memory-index launch projection + Codex
 // pending-rail composition. The projection (readValidate + last-good/runtime
@@ -2762,10 +2763,10 @@ export class AgentSupervisor extends EventEmitter {
     const isSupervisorLane = roleLaneOf(agent) === 'supervisor';
     if (codexHookDegraded) {
       updateAgentHookStatus(agent.id, 'degraded');
-    } else if (
+    } else if (agent.provider !== 'agy' && (
       isWorkerLane || isResearcher || wantsCodexHooks || isSupervisorLane
       || (agent.provider === 'claude' && roleLaneOf(agent) !== 'legacy')
-    ) {
+    )) {
       // Arm the launch-time hook canary: if no hook event reaches the dashboard
       // within HOOK_CANARY_WINDOW_MS and hook_status is still 'unknown', the
       // StatusMonitor flips it to 'broken'. See StatusMonitor.checkHookCanary.
@@ -3348,6 +3349,25 @@ export class AgentSupervisor extends EventEmitter {
       // nested repo beats any outer one), so all four compat hooks load. Verified
       // in BOTH a git-backed outer workspace and a non-git workspace.
       this.ensureGrokWorkerGitRepo(workDir, pathType);
+    } else if (provider === 'agy') {
+      // Phase-0 addendum: agy has no working project/plugin hook carrier. Seed
+      // only its user-owned cwd identity, then install the single supported
+      // PreInvocation status handler in the user-global named+nested carrier.
+      // There is deliberately no WORKER_FILES_AGY managed map and no git-init:
+      // project .agents/hooks.json stays undiscovered even in trusted/git cwds.
+      providerCreated += this.seedAgyIdentityIfAbsent(workDir, pathType);
+      if (pathType === 'windows') {
+        try {
+          const result = ensureAgyStatusHook(process.env.USERPROFILE || process.env.HOME);
+          if (result.action === 'written') {
+            console.log(`[supervisor] agy global PreInvocation status hook installed: ${result.configPath}`);
+          } else if (result.action === 'invalid') {
+            console.warn(`[supervisor] refusing to replace malformed agy hooks config ${result.configPath}: ${result.reason}`);
+          }
+        } catch (err) {
+          console.warn('[supervisor] ensureAgyStatusHook failed (agy status start hook may not fire):', err);
+        }
+      }
     }
     const total = scriptCreated + providerCreated;
     if (total > 0) {
@@ -3490,6 +3510,16 @@ export class AgentSupervisor extends EventEmitter {
     const relPath = `.lares/workers/grok/AGENTS.md`;
     if (scaffoldFileExists(workDir, relPath, pathType)) return 0;
     atomicWriteScaffoldText(workDir, relPath, WORKER_GROK_AGENTS_MD, false, pathType);
+    return 1;
+  }
+
+  /** Seed agy's single cwd identity/context file. Both AGENTS.md and GEMINI.md
+   *  are recognized, but the implementation plan designates AGENTS.md as the
+   *  seed-once identity; writing both would load duplicate instructions. */
+  private seedAgyIdentityIfAbsent(workDir: string, pathType: string): number {
+    const relPath = `.lares/workers/agy/AGENTS.md`;
+    if (scaffoldFileExists(workDir, relPath, pathType)) return 0;
+    atomicWriteScaffoldText(workDir, relPath, WORKER_AGY_AGENTS_MD, false, pathType);
     return 1;
   }
 
@@ -7370,6 +7400,12 @@ export class AgentSupervisor extends EventEmitter {
     if (agent.provider === 'codex') {
       return this.monitor.hasObservedStartHook(agent.id);
     }
+    if (agent.provider === 'agy') {
+      // PreInvocation is a proven start signal, but the first turn bootstraps
+      // without assuming the global carrier loaded. Once observed, subsequent
+      // sends may use the same evidence-backed confirmation contract as Codex.
+      return this.monitor.hasObservedStartHook(agent.id);
+    }
     return false;
   }
 
@@ -7980,7 +8016,15 @@ export class AgentSupervisor extends EventEmitter {
     // instant the old post-resolve stamp observed. Gated on `submit` exactly
     // like the old call site (an unsubmitted body can't start a turn, so the
     // start-hook watchdogs must not arm).
-    if (submit) this.monitor.recordInputDelivered(agentId);
+    if (submit) {
+      this.monitor.recordInputDelivered(agentId);
+      // agy has no launch-time hook event. Arm its carrier canary only once a
+      // submitted prompt can legitimately produce PreInvocation; arming at
+      // process launch would falsely mark every untouched worker hook-broken.
+      if (agent?.provider === 'agy' && (agent.isSupervised || agent.isWorker)) {
+        this.monitor.recordHookCanary(agentId);
+      }
+    }
 
     // WP5 — `_doSendInput` is now PURE DELIVERY. Confirmation (hook + re-press +
     // session-log + status evidence) and the three-state outcome are owned by
