@@ -10,12 +10,38 @@
 import { ipcMain } from 'electron';
 import type { Rectangle } from 'electron';
 import type { PlanPaneManager } from './plan-pane-manager';
-import type { PlanListItem } from '../../shared/types';
+import type { PlanListItem, PathType } from '../../shared/types';
 import { getPlans } from '../database';
 import { resolvePlanProjection, buildPlanActivityProjection } from '../api-server';
 import { derivePlanSnippet } from './plan-snippet';
+import { listPlanningEntries, readPlanningDocument } from './planning-reader';
 
 export function registerPlanIpc(manager: PlanPaneManager): void {
+  // ── WP-P1A: planning-reader (read-only fs enumeration + safe read) ──────────
+  // Bounded enumeration of bare proposals + §R0 plan folders, and a
+  // read-by-opaque-manifest-id read path. Purely read-only: NO demand-probe is
+  // emitted here — `reader_open` is a user-gesture event stamped elsewhere, so
+  // an initial render / refresh (which calls `planning-reader:list`) never
+  // counts as an open. No DB is touched.
+  ipcMain.handle(
+    'planning-reader:list',
+    (_e, workspaceRoot: string, pathType?: PathType) => {
+      if (typeof workspaceRoot !== 'string' || !workspaceRoot) {
+        return { entries: [], warnings: ['no workspace root'] };
+      }
+      return listPlanningEntries(workspaceRoot, { pathType });
+    },
+  );
+  ipcMain.handle(
+    'planning-reader:read',
+    (_e, docId: string, pathType?: PathType) => {
+      if (typeof docId !== 'string' || !docId) {
+        return { error: 'missing manifest document id' };
+      }
+      return readPlanningDocument(docId, { pathType });
+    },
+  );
+
   // Plan list for the "Plans" card gallery (workspace-scoped). Each row carries a
   // cheap description snippet derived from its already-served projection (or an
   // on-demand parse) — computed ONLY for `html` surfaces, since the gallery hides

@@ -4227,6 +4227,108 @@ export interface DetachedProcessDto {
   error: string | null;
 }
 
+// ── WP-P1A: planning-reader (bounded enumeration + safe read IPC) ──
+//
+// A read-only filesystem surface over the planning artifacts: flat bare
+// proposals (`.lares/proposals/*.md`) and §R0 folder-per-plan structures under
+// `<workspaceStateDir()>/plans/<sku>/`. Every document the renderer can open is
+// identified ONLY by an OPAQUE server-issued manifest document id (`docId`); no
+// raw absolute path ever crosses the IPC boundary, and reads re-validate
+// containment + reparse-point safety at read time.
+
+/** The four Amendment-16 lifecycle rungs. `ran` is disk-invisible pre-ledger. */
+export type PlanningRung = 'marked' | 'ran' | 'returned' | 'folded-in';
+
+/** One deliberation/research output observed in a plan folder (disk-derived). */
+export interface PlanningIntentOutputView {
+  /** In-folder relative path of the output (POSIX separators). */
+  relPath: string;
+  /** The output's declared intent linkage (frontmatter). */
+  intentId: string;
+  /** SELF-DECLARED orchestration id (frontmatter) — never authoritative for `ran`. */
+  orchestrationIdSelfDeclared: string | null;
+  /** Currently present on disk (a missing prior output would be false; readers
+   *  only surface present outputs here). */
+  presentOnDisk: boolean;
+  /** From the matching PLAN-INTEGRATION record; default `active`. */
+  disposition: 'active' | 'superseded' | 'withdrawn';
+  /** True ONLY when present AND a normalized `plan.md` Markdown link resolves
+   *  (containment + existence) to this exact output. Substring is insufficient. */
+  foldedIn: boolean;
+  /** What the integration record says this output changed (display only). */
+  integrationNote: string | null;
+}
+
+/** One PLAN-INTENT with its disk-derived lifecycle for display. */
+export interface PlanningIntentView {
+  intentId: string;
+  part: string | null;
+  kind: string;
+  targets: Array<{ provider?: string; model?: string }>;
+  reason: string | null;
+  supersedesIntentId: string | null;
+  /** `active` normally; `superseded` when a newer intent supersedes it. */
+  status: 'active' | 'withdrawn' | 'superseded';
+  /** marked = a valid PLAN-INTENT sentinel exists (always true for a listed intent). */
+  marked: true;
+  /** `ran` is NOT derivable from disk pre-ledger; always this sentinel string. */
+  ran: 'unavailable-pre-ledger';
+  /** ≥1 currently-present `active` output whose frontmatter matches. */
+  returned: boolean;
+  /** Every present `active` returned output is referenced by a resolved link. */
+  fullyFoldedIn: boolean;
+  /** Per-output history (each result listed independently). */
+  outputs: PlanningIntentOutputView[];
+}
+
+export type PlanningEntryKind = 'proposal' | 'plan-folder';
+
+/** A single document in a plan folder's bounded manifest (or the lone proposal). */
+export interface PlanningReaderDocument {
+  /** OPAQUE server-issued id — the ONLY handle the renderer uses to read. */
+  docId: string;
+  /** Basename for display. */
+  name: string;
+  category: 'plan' | 'arc' | 'deliberation' | 'research' | 'supplement' | 'proposal' | 'other';
+  sizeBytes: number;
+  mtimeMs: number;
+}
+
+/** One row in the planning reader — a bare proposal or a plan folder. */
+export interface PlanningReaderEntry {
+  /** OPAQUE server-issued id for the entry. */
+  entryId: string;
+  kind: PlanningEntryKind;
+  /** Display title (slug for a proposal; plan title/sku for a folder). */
+  title: string;
+  /** Bounded document manifest (proposal → one doc; folder → several). */
+  documents: PlanningReaderDocument[];
+  /** Max mtime across the entry's source documents. */
+  mtimeMs: number;
+  // ── plan-folder only ──
+  planArtifactId?: string | null;
+  planSku?: string | null;
+  /** Disk-derived intent lifecycle (folders only; empty when nothing marked). */
+  intents?: PlanningIntentView[];
+  /** Per-entry diagnostics (caps hit, unreadable output, malformed markup…). */
+  warnings?: string[];
+}
+
+export interface PlanningReaderListResult {
+  entries: PlanningReaderEntry[];
+  /** List-level diagnostics (skipped stray dirs, caps hit at the top level…). */
+  warnings: string[];
+}
+
+export interface PlanningReaderReadResult {
+  docId: string;
+  name: string;
+  content: string;
+  /** True when the file exceeded the per-file byte cap and was truncated. */
+  truncated: boolean;
+  sizeBytes: number;
+}
+
 declare global {
   interface Window {
     api: IpcApi;
