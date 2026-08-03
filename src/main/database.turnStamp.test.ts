@@ -207,18 +207,35 @@ test('allocation enum validation rejects legacy and unknown sources without a ro
   }
 });
 
-test('non-null plan_item_id is rejected until plan_work_packages exists', () => {
+test('SC-WP-3A: a resolved plan_item_id is stored now that plan_work_packages exists', () => {
+  const ws = freshWorkspace();
+  const stamped = dbm.allocateAndInsertTurn(ws, {
+    id: 'stamped-item',
+    planId: 'plan-1',
+    planItemId: 'item-1',
+    planStampSource: 'explicit',
+  });
+  assert.deepEqual(
+    { planId: stamped.planId, planItemId: stamped.planItemId, planStampSource: stamped.planStampSource },
+    { planId: 'plan-1', planItemId: 'item-1', planStampSource: 'explicit' },
+  );
+  assert.deepEqual(
+    { planId: dbm.getTurnRecord('stamped-item')?.planId, planItemId: dbm.getTurnRecord('stamped-item')?.planItemId },
+    { planId: 'plan-1', planItemId: 'item-1' },
+  );
+});
+
+test('an item stamp without a plan is incoherent and is rejected with no row', () => {
   const ws = freshWorkspace();
   assert.throws(
     () => dbm.allocateAndInsertTurn(ws, {
-      id: 'unsupported-item',
-      planId: 'plan-1',
+      id: 'orphan-item',
       planItemId: 'item-1',
       planStampSource: 'explicit',
     }),
-    /plan_item_id is unsupported until plan_work_packages exists/,
+    /plan_item_id requires a plan_id/,
   );
-  assert.equal(dbm.getTurnRecord('unsupported-item'), null);
+  assert.equal(dbm.getTurnRecord('orphan-item'), null);
 });
 
 test('update accessor cannot mutate any stamp column', () => {

@@ -14,7 +14,7 @@ import { computeTerminalAttachResult } from './terminal-attach-result';
 import { resolveAgentChatEvents } from './supervisor/agent-chat-history';
 import {
   getWorkspaces, createWorkspace, deleteWorkspace, getWorkspace, reorderWorkspaces,
-  getAgentsByWorkspace, getAllAgents, getAgent, getPlan, getFileActivities, getWorkspaceAgentSummary,
+  getAgentsByWorkspace, getAllAgents, getAgent, getPlan, planItemInPlan, getFileActivities, getWorkspaceAgentSummary,
   checkAgentMdExists, updateAgentSupervised, getAgentSessions,
   createTeam, getTeam, listTeams, updateTeamStatus, addTeamMember, removeTeamMember,
   createChannel, removeChannel, getTeamMessages, getTeamTasks, createTeamTask, updateTeamTask,
@@ -211,7 +211,7 @@ export function registerIpcHandlers(
     // SC-WP-2C: a renderer send is a direct human dispatch. Resolve its
     // agent-default (or explicit request) before touching the delivery queue.
     const dispatch = resolvePlanBindingAtBoundary(
-      { getPlanById: getPlan }, agent, 'human-terminal', requestedPlanBinding,
+      { getPlanById: getPlan, planItemInPlan }, agent, 'human-terminal', requestedPlanBinding,
     );
     if (supervisor.isInputInFlight(agentId) || ['working', 'launching'].includes(agent.status)) {
       const reportedStatus = supervisor.isInputInFlight(agentId) ? 'receiving' : agent.status;

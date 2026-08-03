@@ -114,6 +114,27 @@ function makeRun(overrides: Partial<OrchestrationRun> = {}): OrchestrationRun {
     });
   });
 
+  test('SC-WP-3A: an explicit plan+item run wins and carries the frozen item through dispatch', async () => {
+    const itemRun = makeRun({
+      runId: 'explicit-item', planId: 'plan-explicit', planItemId: 'item-1',
+      planBindingMode: 'explicit',
+    });
+    // The frozen run-item survives a persistence round-trip (restart rehydration).
+    db.insertOrchestration(itemRun);
+    assert.deepEqual(db.getOrchestrationBinding('explicit-item'), {
+      planId: 'plan-explicit', planItemId: 'item-1', mode: 'explicit',
+    });
+    const deps = {
+      getAgent: () => ({ workspaceId: 'ws-1', planId: 'live-plan-changed' }),
+      resolveCapability: async () => ({ repoRoot: '/repo' } as any),
+      planInWorkspace: () => true,
+    };
+    const ctx = await buildDispatchTurnContext(deps, 'worker', getOrchestrationDispatch(itemRun));
+    assert.deepEqual(ctx?.planStamp, {
+      planId: 'plan-explicit', planItemId: 'item-1', source: 'explicit',
+    });
+  });
+
   test('dashboard adapter carries orchestration context through raw and confirmed sends', async () => {
     const dispatch = getOrchestrationDispatch(makeRun({ planId: 'adapter-plan', planBindingMode: 'explicit' }));
     const seen: DispatchContext[] = [];

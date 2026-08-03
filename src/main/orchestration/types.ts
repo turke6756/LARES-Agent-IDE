@@ -86,7 +86,11 @@ export interface OrchestrationRun {
   planPath: string;                  // absolute
   // WP6 planning-surface rail (frozen at dispatch). See RunOrchestrationRequest.
   planId?: string;
-  /** Frozen once for the run. Stage II supports plan-only explicit bindings. */
+  /** Frozen item stamp for the run (SC-WP-3A). Null/absent for a plan-only or
+   *  default binding; an explicit plan+item run carries the validated item id. */
+  planItemId?: string | null;
+  /** Frozen once for the run. Stage II supports plan-only explicit bindings;
+   *  Stage III (SC-WP-3A) additionally carries a validated explicit item. */
   planBindingMode?: OrchestrationPlanBindingMode;
   sectionAnchor?: string;
   leadProvider: string;

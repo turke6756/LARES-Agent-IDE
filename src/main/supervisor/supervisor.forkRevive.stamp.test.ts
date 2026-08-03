@@ -38,7 +38,7 @@ function patchDatabase(workspacePath: string, agents: Agent[]) {
   const db = require('../database') as Record<string, unknown>;
   const keys = [
     'getAgent', 'getWorkspace', 'getAgentsByWorkspace', 'createAgent',
-    'updateAgentResumeSessionId', 'addEvent', 'getPlan',
+    'updateAgentResumeSessionId', 'addEvent', 'getPlan', 'planItemInPlan',
   ];
   const original: Record<string, unknown> = {};
   for (const key of keys) original[key] = db[key];
@@ -66,6 +66,9 @@ function patchDatabase(workspacePath: string, agents: Agent[]) {
   db.getPlan = (id: string) => id === 'plan-b'
     ? { id, workspaceId: 'ws-1', path: 'plan-b.md' }
     : null;
+  // SC-WP-3A: item-in-plan lookup — only (ws-1, plan-b, item-1) is a valid item.
+  db.planItemInPlan = (workspaceId: string, planId: string, planItemId: string) =>
+    workspaceId === 'ws-1' && planId === 'plan-b' && planItemId === 'item-1';
 
   return () => { for (const key of keys) db[key] = original[key]; };
 }
@@ -114,7 +117,7 @@ test('fork copies source.planId and freezes fork-carry; explicit none clears onl
   }
 });
 
-test('revive freezes carry/explicit/none, rejects Stage-2 items, and delivers the same dispatch', async () => {
+test('revive freezes carry/explicit/none, validates explicit items (SC-WP-3A), and delivers the same dispatch', async () => {
   const workspacePath = fs.mkdtempSync(path.join(os.tmpdir(), 'revive-stamp-'));
   const agent = makeAgent('revive-target', {
     workspaceId: 'ws-1', workingDirectory: workspacePath, command: 'claude',
@@ -151,6 +154,18 @@ test('revive freezes carry/explicit/none, rejects Stage-2 items, and delivers th
       planId: null, planItemId: null, source: 'explicit-none',
     });
 
+    // SC-WP-3A: a valid explicit item override is now accepted and frozen.
+    await supervisor.reviveAgent(agent.id, {
+      message: 'explicit item wake',
+      requestedPlanBinding: { mode: 'explicit', planId: 'plan-b', planItemId: 'item-1' },
+    });
+    const explicitItem = pending(supervisor, agent.id);
+    assert.ok(explicitItem?.dispatch);
+    assert.deepEqual(await stampOf(agent, explicitItem.dispatch), {
+      planId: 'plan-b', planItemId: 'item-1', source: 'explicit',
+    });
+
+    // An item absent from the plan is still rejected, before any stop/relaunch.
     let stops = 0;
     (supervisor as unknown as { stopAgentLocked: unknown }).stopAgentLocked = async () => {
       stops++;
@@ -158,12 +173,12 @@ test('revive freezes carry/explicit/none, rejects Stage-2 items, and delivers th
     };
     await assert.rejects(
       supervisor.reviveAgent(agent.id, {
-        message: 'unsupported item',
-        requestedPlanBinding: { mode: 'explicit', planId: 'plan-b', planItemId: 'item-1' },
+        message: 'ghost item',
+        requestedPlanBinding: { mode: 'explicit', planId: 'plan-b', planItemId: 'ghost-item' },
       }),
-      (error: unknown) => (error as { code?: string }).code === 'plan-item-unsupported',
+      (error: unknown) => (error as { code?: string }).code === 'plan-item-not-in-plan',
     );
-    assert.equal(stops, 0, 'item rejection happens before stop/relaunch');
+    assert.equal(stops, 0, 'invalid-item rejection happens before stop/relaunch');
 
     // Stage one more frozen carry, then mutate the live default before delivery.
     agent.planId = 'plan-delivery';

@@ -52,7 +52,9 @@ export function getOrchestrationDispatch(run: OrchestrationRun): DispatchContext
     { origin: 'orchestration', ownerAgentId: run.supervisorId },
     {
       planId: run.planId ?? null,
-      planItemId: null,
+      // SC-WP-3A: an explicit plan+item run carries its validated item; a
+      // plan-only or default run stays item-less.
+      planItemId: run.planItemId ?? null,
       source: mode,
     },
   );

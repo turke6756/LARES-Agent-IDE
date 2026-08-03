@@ -176,7 +176,7 @@ import {
   getLatestContinuationAttempt,
   insertAgentSession, closeAgentSession,
   getAgentsByOwner,
-  getPlan, recordPlanSectionTouch,
+  getPlan, planItemInPlan, recordPlanSectionTouch,
   getTurnSectionTouches, getTurnSectionChanges, insertPlanEvent, getTurnRepoActivity,
   getDb,
 } from '../database';
@@ -665,6 +665,9 @@ function resolveLifecyclePlanStamp(
     getAgent: (id) => getAgent(id),
     resolveCapability: async () => null,
     planInWorkspace: (workspaceId, planId) => getPlan(planId)?.workspaceId === workspaceId,
+    // SC-WP-3A: revive/fork explicit-item overrides validate against the
+    // authoritative plan_work_packages entity (item-in-plan), no longer rejected.
+    planItemInPlan: (workspaceId, planId, planItemId) => planItemInPlan(workspaceId, planId, planItemId),
   }, agent, requested);
   if (!resolution.ok) throw revErr(resolution.reason, 400);
   return Object.freeze({ ...resolution.stamp });

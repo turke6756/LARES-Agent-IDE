@@ -58,13 +58,38 @@ test('explicit plan is workspace-validated and never falls back to the agent def
   }), { ok: false, reason: 'plan-not-in-workspace' });
 });
 
-test('item requests are rejected in Stage ② without consulting a placeholder validator', () => {
-  let itemChecks = 0;
-  const d = deps({ planItemInPlan: () => { itemChecks++; return true; } });
+test('SC-WP-3A: an explicit item is validated against (workspace, plan, id) and carried', () => {
+  const seen: Array<[string, string, string]> = [];
+  const d = deps({
+    planItemInPlan: (workspaceId, planId, planItemId) => {
+      seen.push([workspaceId, planId, planItemId]);
+      return workspaceId === 'ws-1' && planId === 'plan-explicit' && planItemId === 'item-1';
+    },
+  });
   assert.deepEqual(resolveRequestedPlanBinding(d, agent, {
     mode: 'explicit', planId: 'plan-explicit', planItemId: 'item-1',
+  }), {
+    ok: true,
+    stamp: { planId: 'plan-explicit', planItemId: 'item-1', source: 'explicit' },
+  });
+  assert.deepEqual(seen, [['ws-1', 'plan-explicit', 'item-1']],
+    'the item is checked against the full (workspace_id, plan_id, id) tuple');
+});
+
+test('SC-WP-3A: an item absent from its plan rejects; a boundary with no lookup fails closed', () => {
+  // Item not in plan → reject (never fall back to a plan-only stamp).
+  assert.deepEqual(resolveRequestedPlanBinding(deps(), agent, {
+    mode: 'explicit', planId: 'plan-explicit', planItemId: 'ghost-item',
+  }), { ok: false, reason: 'plan-item-not-in-plan' });
+  // Blank item id → shape rejection before any lookup.
+  assert.deepEqual(resolveRequestedPlanBinding(deps(), agent, {
+    mode: 'explicit', planId: 'plan-explicit', planItemId: '' as unknown as string,
+  }), { ok: false, reason: 'invalid-plan-item-id' });
+  // No item lookup wired → fail closed as unsupported (never an always-true seam).
+  const noLookup = deps({ planItemInPlan: undefined });
+  assert.deepEqual(resolveRequestedPlanBinding(noLookup, agent, {
+    mode: 'explicit', planId: 'plan-explicit', planItemId: 'item-1',
   }), { ok: false, reason: 'plan-item-unsupported' });
-  assert.equal(itemChecks, 0);
 });
 
 test('a wire RequestedPlanBinding cannot forge any carry source', async () => {

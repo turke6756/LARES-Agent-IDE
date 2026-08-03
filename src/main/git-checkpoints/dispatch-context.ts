@@ -104,8 +104,10 @@ export interface DispatchDeps {
   /** Authoritative plan/workspace membership check. Required for an explicit plan;
    * optional during the 2B→2C wiring transition, where absence fails closed. */
   planInWorkspace?: (workspaceId: string, planId: string) => boolean;
-  /** Stage ③ plugs the plan_work_packages lookup into this seam. Stage ② rejects
-   * every non-null item before consulting it. */
+  /** Authoritative plan_work_packages item lookup (SC-WP-3A). When wired, a
+   * non-null item is validated against (workspace_id, plan_id, id). A boundary
+   * that does NOT wire this lookup fails closed — items are rejected there as
+   * unsupported rather than accepted through an always-true seam. */
   planItemInPlan?: (workspaceId: string, planId: string, planItemId: string) => boolean;
 }
 
@@ -113,7 +115,12 @@ export type PlanBindingResolution =
   | { ok: true; stamp: ResolvedPlanStamp }
   | {
       ok: false;
-      reason: 'invalid-plan-id' | 'plan-not-in-workspace' | 'plan-item-unsupported';
+      reason:
+        | 'invalid-plan-id'
+        | 'plan-not-in-workspace'
+        | 'plan-item-unsupported'
+        | 'invalid-plan-item-id'
+        | 'plan-item-not-in-plan';
     };
 
 const MAX_PLAN_ID_UTF8_BYTES = 256;
@@ -155,9 +162,32 @@ export function resolveRequestedPlanBinding(
     return { ok: false, reason: 'plan-not-in-workspace' };
   }
   if (binding.planItemId !== null) {
-    // Do not call an always-true placeholder. There is no authoritative item entity
-    // until plan_work_packages lands in Stage ③.
-    return { ok: false, reason: 'plan-item-unsupported' };
+    // SC-WP-3A: item stamping is enabled — validate against the authoritative
+    // plan_work_packages entity, keyed on (workspace_id, plan_id, id). A boundary
+    // that does not wire the lookup fails closed (never an always-true seam).
+    if (!deps.planItemInPlan) {
+      return { ok: false, reason: 'plan-item-unsupported' };
+    }
+    if (
+      typeof binding.planItemId !== 'string'
+      || binding.planItemId.length === 0
+      || Buffer.byteLength(binding.planItemId, 'utf8') > MAX_PLAN_ID_UTF8_BYTES
+    ) {
+      return { ok: false, reason: 'invalid-plan-item-id' };
+    }
+    let itemIsValid = false;
+    try {
+      itemIsValid = deps.planItemInPlan(agent.workspaceId, binding.planId, binding.planItemId);
+    } catch {
+      // Validation infrastructure failures are never an excuse to accept or fall back.
+    }
+    if (!itemIsValid) {
+      return { ok: false, reason: 'plan-item-not-in-plan' };
+    }
+    return {
+      ok: true,
+      stamp: { planId: binding.planId, planItemId: binding.planItemId, source: 'explicit' },
+    };
   }
   return {
     ok: true,

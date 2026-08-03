@@ -1624,6 +1624,30 @@ function initContextOptimizerSchema(): void {
     );
   `);
 
+  // Save-card SC-WP-3A — plan_work_packages: the authoritative item entity that
+  // item stamping validates against (§11 of the shared bundle contract). Until
+  // this table lands, a non-null plan_item_id is REJECTED as unsupported; it is
+  // never equated with plan_sections.anchor (that would bake legacy HTML plan
+  // architecture into the new structured model) and never validated through an
+  // always-true seam. Item validation is against (workspace_id, plan_id, id).
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS plan_work_packages (
+      id TEXT PRIMARY KEY,
+      workspace_id TEXT NOT NULL,
+      plan_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      acceptance_condition TEXT,
+      state TEXT NOT NULL,
+      assignee_agent_id TEXT,
+      revision INTEGER NOT NULL DEFAULT 1,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      CHECK (state IN ('ready','executing','blocked','done','archived')),
+      CHECK (revision > 0)
+    );
+    CREATE INDEX IF NOT EXISTS idx_plan_work_packages_plan ON plan_work_packages(plan_id);
+  `);
+
   // WP-2B (Priority 0) — one-time, resumable workspace-lineage backfill. Populates
   // stream_lane_stats.workspace_id/workspace_root by folding each stream's launch cwd
   // to a root owned by EXACTLY one workspace. Idempotent (only NULL rows, ON a unique
@@ -4747,6 +4771,83 @@ export function listCommitPathLinks(
   ).map(rowToCommitPathLink);
 }
 
+// ── Save-card SC-WP-3A — plan_work_packages CRUD + item-validity accessor ──────
+
+export type PlanWorkPackageState =
+  | 'ready' | 'executing' | 'blocked' | 'done' | 'archived';
+
+export interface PlanWorkPackage {
+  id: string;
+  workspaceId: string;
+  planId: string;
+  title: string;
+  acceptanceCondition: string | null;
+  state: PlanWorkPackageState;
+  assigneeAgentId: string | null;
+  revision: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
+function rowToPlanWorkPackage(row: any): PlanWorkPackage {
+  return {
+    id: row.id,
+    workspaceId: row.workspace_id,
+    planId: row.plan_id,
+    title: row.title,
+    acceptanceCondition: row.acceptance_condition ?? null,
+    state: row.state,
+    assigneeAgentId: row.assignee_agent_id ?? null,
+    revision: row.revision,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+export function upsertPlanWorkPackage(pkg: PlanWorkPackage): void {
+  run(
+    `INSERT INTO plan_work_packages (
+       id, workspace_id, plan_id, title, acceptance_condition, state,
+       assignee_agent_id, revision, created_at, updated_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       workspace_id = excluded.workspace_id, plan_id = excluded.plan_id,
+       title = excluded.title, acceptance_condition = excluded.acceptance_condition,
+       state = excluded.state, assignee_agent_id = excluded.assignee_agent_id,
+       revision = excluded.revision, updated_at = excluded.updated_at`,
+    [pkg.id, pkg.workspaceId, pkg.planId, pkg.title, pkg.acceptanceCondition,
+      pkg.state, pkg.assigneeAgentId, pkg.revision, pkg.createdAt, pkg.updatedAt],
+  );
+}
+
+export function getPlanWorkPackage(id: string): PlanWorkPackage | null {
+  const row = queryOne(`SELECT * FROM plan_work_packages WHERE id = ?`, [id]);
+  return row ? rowToPlanWorkPackage(row) : null;
+}
+
+export function listPlanWorkPackages(planId: string): PlanWorkPackage[] {
+  return queryAll(
+    `SELECT * FROM plan_work_packages WHERE plan_id = ? ORDER BY created_at, id`,
+    [planId],
+  ).map(rowToPlanWorkPackage);
+}
+
+/**
+ * Authoritative item-validity check for plan-stamp resolution (SC-WP-3A). A work
+ * package is valid for a binding only when its own row matches the full
+ * (workspace_id, plan_id, id) tuple — never a plan_sections.anchor, never an
+ * always-true seam. Archived packages are still valid stamp targets (a completed
+ * item may still receive attribution); only a missing/mismatched row is rejected.
+ */
+export function planItemInPlan(workspaceId: string, planId: string, planItemId: string): boolean {
+  const row = queryOne(
+    `SELECT 1 AS ok FROM plan_work_packages
+      WHERE id = ? AND workspace_id = ? AND plan_id = ?`,
+    [planItemId, workspaceId, planId],
+  );
+  return row !== null;
+}
+
 /** Persist a commit and all of its exact evidence atomically. Replays are safe. */
 export function recordCommitLedger(write: CommitLedgerWrite): void {
   db.transaction(() => {
@@ -5026,10 +5127,14 @@ export function allocateAndInsertTurn(
 ): TurnRecord {
   const id = fields.id ?? uuidv4();
   const status: TurnStatus = fields.status ?? 'open';
-  // Until plan_work_packages lands, an item stamp has no authoritative entity
-  // to validate against and must be rejected rather than stored optimistically.
-  if (fields.planItemId !== undefined && fields.planItemId !== null) {
-    throw new Error('plan_item_id is unsupported until plan_work_packages exists');
+  // SC-WP-3A: plan_work_packages now exists, so a resolved item stamp is stored.
+  // The item was already validated against (workspace_id, plan_id, id) at the
+  // dispatch boundary/resolver; allocation trusts that resolved stamp (exactly as
+  // it trusts a resolved plan_id). An item is incoherent without a plan, though —
+  // reject that rather than persist an orphan item stamp.
+  const planItemId = fields.planItemId ?? null;
+  if (planItemId !== null && (fields.planId ?? null) === null) {
+    throw new Error('plan_item_id requires a plan_id');
   }
   // Preserve compatibility for pre-stamping call sites while still writing an
   // enum-valid runtime origin explicitly (never the column's migration default).
@@ -5060,7 +5165,7 @@ export function allocateAndInsertTurn(
       fields.ownerAgentId ?? null,
       fields.ownerBrickGeneration ?? null,
       fields.planId ?? null,
-      null,
+      planItemId,
       planStampSource,
       fields.sessionId ?? null,
       fields.taskLabel ?? null,
@@ -6124,6 +6229,7 @@ function rowToOrchestrationRun(row: any): OrchestrationRun {
     endedAt: row.ended_at ?? undefined,
     error: row.error ?? undefined,
     planId: row.plan_id ?? undefined,
+    planItemId: row.plan_item_id ?? null,
     sectionAnchor: row.section_anchor ?? undefined,
     planBindingMode: row.plan_binding_mode ?? (row.plan_id ? 'explicit' : 'agent-default'),
   };
@@ -6155,7 +6261,7 @@ export function insertOrchestration(r: OrchestrationRun): void {
       r.leadId ?? null, r.reviewerId ?? null, r.turn ?? null, r.round ?? null,
       JSON.stringify(r.lastRelayedTs || {}), r.startedAt, r.updatedAt,
       r.endedAt ?? null, r.error ?? null,
-      r.planId ?? null, r.sectionAnchor ?? null, null,
+      r.planId ?? null, r.sectionAnchor ?? null, r.planItemId ?? null,
       r.planBindingMode ?? (r.planId ? 'explicit' : 'agent-default'),
     ]
   );

@@ -20,6 +20,7 @@ import {
   getContinuationAttempt, getContinuationEscapeBudget, closeContinuationHandoffAttempt, insertContinuationBrick,
   getLatestBrickForAttempt, hasRunningOrchestrationForSupervisor,
   getPlans, getPlan, getPlanByWorkspacePath, createOrRevivePlan, updatePlan, softDeletePlan, derivePlanSlug,
+  planItemInPlan,
   getSupervisorFocus, upsertSupervisorFocus, deleteSupervisorFocus,
   bumpSupervisorFocusAttended, getSupervisorFocusedPlans,
   recordPlanSectionTouch, getPlanSections, getPlanEventRollup, getPlanEventsForRender,
@@ -102,6 +103,9 @@ export type PlanBindingBoundaryAgent = Pick<Agent, 'workspaceId' | 'planId'>;
 
 export interface PlanBindingBoundaryDeps {
   getPlanById: (planId: string) => Pick<import('../shared/types').Plan, 'workspaceId' | 'deletedAt'> | null;
+  /** Authoritative plan_work_packages item lookup (SC-WP-3A). Omit to fail closed
+   * (items rejected as unsupported at this boundary). */
+  planItemInPlan?: (workspaceId: string, planId: string, planItemId: string) => boolean;
 }
 
 /** Resolve an untrusted API/IPC binding before anything is put on the delivery
@@ -138,6 +142,7 @@ export function resolvePlanBindingAtBoundary(
         const plan = deps.getPlanById(planId);
         return plan?.workspaceId === workspaceId && plan.deletedAt === null;
       },
+      planItemInPlan: deps.planItemInPlan,
     },
     agent,
     requested,
@@ -1815,7 +1820,7 @@ export class ApiServer {
       // before the busy gate, transient subscription, or either delivery call.
       // Invalid requests cannot write PTY bytes or allocate a turn row.
       const dispatch = resolvePlanBindingAtBoundary(
-        { getPlanById: getPlan },
+        { getPlanById: getPlan, planItemInPlan },
         agent,
         'api',
         requestedPlanBinding !== undefined ? requestedPlanBinding : requested_plan_binding,
