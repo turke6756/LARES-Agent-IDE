@@ -6181,23 +6181,44 @@ export const PROPOSAL_TO_PLAN_CONTRACT_MANIFEST_LOCK_MD = `# Contract reference 
 
 ---
 
-## The lock protocol (owner+nonce \`wx\` acquire · 2s heartbeat · 15s stale reclaim)
+## The lock protocol (owner+nonce \`wx\` acquire · 2s atomic heartbeat · 15s claim-marker-serialized stale reclaim)
 
 \`plan-manifest.mjs manifest\` serializes **\`plan.json\` mutation only** (recommendation:
 "The manifest lock serializes \`plan.json\` mutation only — it protects manifest integrity"). It does
 **not** serialize edits to the proposal, \`plan.md\`, or \`ARC.md\`. Protocol:
 
-- **Acquire** a sibling lock file (\`plan.json.lock\`) with an **exclusive \`wx\` create** carrying an
-  **owner id + random nonce**. \`wx\` fails if the lock already exists → the holder is live.
-- **Heartbeat** the lock every **2 seconds** (refresh its mtime / heartbeat timestamp) for as long
-  as the mutation is in progress.
-- **Stale reclaim:** a lock whose heartbeat is older than **15 seconds** is considered abandoned and
-  may be reclaimed by a new owner+nonce acquire. A reclaiming writer verifies its own nonce after
-  acquire (guards a race between two reclaimers).
+- **Acquire** a sibling lock file (\`plan.json.lock\`) with an **exclusive \`wx\` create** carrying a
+  **lock record** (\`owner_kind\` + \`owner_id\` + \`pid\` + random \`nonce\` + \`acquired_at\` +
+  \`heartbeat_at\`). \`wx\` fails if the lock already exists → the holder is live. The record schema is
+  **byte-for-byte the same as the service side (\`src/main/plans/plan-manifest.ts\`)** so a skill
+  contender and a service contender read each other's freshness correctly across processes — in
+  particular the heartbeat timestamp is \`heartbeat_at\`, **not** a short \`hb\`.
+- **Heartbeat** the lock every **2 seconds** by **atomically** rewriting \`heartbeat_at\` (temp-write
+  → fsync → rename, never a truncating in-place write) for as long as the mutation is in progress.
+  The holder first re-reads the on-disk record and renews **only if its own nonce is still present**;
+  if the lock was reclaimed out from under it (nonce mismatch) it **stops** heartbeating so it never
+  clobbers the new holder.
+- **Stale reclaim (claim-marker serialized):** a lock whose \`heartbeat_at\` is older than **15
+  seconds** may be reclaimed — but a **bare** "read stale → unlink" race is unsafe: a contender that
+  read the victim as stale can wake *after* the victim was already reclaimed and a **fresh** live lock
+  installed in its place, and its unlink/rename would then steal that fresh lock, transiently emptying
+  the lock path and breaking mutual exclusion. So reclaimers of a given victim are **serialized by an
+  exclusive per-victim claim marker** — \`plan.json.lock.reclaim-<victim-nonce>\`, created with \`wx\`.
+  Exactly one contender wins the marker and performs **confirm-still-stale → rename victim to a
+  tombstone (\`plan.json.lock.stale-<victim-nonce>\`) → drop the tombstone**; while the stale victim is
+  still present no \`wx\` acquire can install a fresh lock and no other reclaimer can act, so the
+  sequence can never grab a fresh lock. Losers of the marker back off and re-enter acquire cleanly.
+  The claim-marker and tombstone paths are **identical across the skill and service implementations**,
+  so cross-implementation contenders serialize against each other on the same marker.
+- **Windows contention tolerance:** on NTFS a concurrent create/rename/delete of the same lock path
+  surfaces as a sharing violation (\`EPERM\`/\`EACCES\`/\`EBUSY\`) rather than \`EEXIST\`; those are treated
+  as **transient contention to retry**, never a fatal acquire failure.
 - **CAS inside the lock:** read \`plan.json\`, compute its expected content-hash, apply the change,
   and write back **only if the on-disk hash still matches** — preserving any concurrent
   \`responsibility_events\`. On hash mismatch, re-read and retry within a bounded budget.
-- **Release** by unlinking the lock file after the write + fsync completes.
+- **Release** by verifying our own nonce is still the record on disk, then unlinking the lock file
+  after the write + fsync completes. If the lock was reclaimed out from under us (nonce mismatch) we
+  unlink **nothing** — the current holder owns it.
 - **Lock exhaustion** (cannot acquire within the retry budget, e.g. a live holder that never yields)
   → **clean error that blocks the mutation and reports recovery guidance** (retry after the
   15s stale-reclaim window, or surface to the supervisor). **No direct \`plan.json\` edit** is
@@ -6332,48 +6353,141 @@ function slugify(s) {
 }
 
 // ---------- the lock (§P3-MANIFEST-LOCK) ----------
+// This is the SKILL-side mirror of src/main/plans/plan-manifest.ts. It MUST stay
+// behaviorally interoperable with that service implementation: same lock path
+// (\`<dir>/plan.json.lock\`), same lock-record schema (owner_kind/owner_id/pid/nonce/
+// acquired_at/heartbeat_at — \`heartbeat_at\`, NOT a short \`hb\`, so a service holder's
+// freshness is read correctly cross-process), same 2s heartbeat / 15s stale window,
+// and — critically — the SAME claim-marker + tombstone naming, so a skill contender
+// and a service contender racing to reclaim ONE stale lock serialize against each
+// other instead of both acting.
 class LockExhaustion extends Error {}
+
+// On Windows/NTFS a concurrent create/rename/delete of the SAME path surfaces as a
+// sharing violation (EPERM/EACCES/EBUSY) — NOT EEXIST — so those are contention to
+// retry, never a fatal acquire failure. (Mirrors plan-manifest.ts isContentionError.)
+function isContentionError(code) {
+  return code === 'EEXIST' || code === 'EPERM' || code === 'EACCES' || code === 'EBUSY';
+}
+
+// Run an atomic fs op (rename/unlink) that can hit a transient Windows sharing
+// violation, retrying a few times with a tiny wait before giving up. ENOENT is
+// terminal (nothing there). Mirrors plan-manifest.ts withFsRetry.
+function withFsRetrySync(op, attempts = 5) {
+  let lastErr;
+  for (let i = 0; i < attempts; i++) {
+    try { return op(); }
+    catch (e) {
+      if (e.code === 'ENOENT' || !isContentionError(e.code)) throw e;
+      lastErr = e;
+      sleepSync(2 + i * 3);
+    }
+  }
+  throw lastErr;
+}
 
 function acquireLock(lockPath, opts) {
   const maxWaitMs = Number(opts['max-wait-ms'] ?? opts.maxWaitMs ?? DEFAULT_MAX_WAIT_MS);
   const pollMs = Number(opts['poll-ms'] ?? opts.pollMs ?? DEFAULT_POLL_MS);
-  const owner = hex(8), nonce = hex(8);
+  const ownerKind = opts.ownerKind || opts['owner-kind'] || 'skill';
+  const ownerId = opts.ownerId || opts['owner-id'] || ('skill:pid-' + process.pid);
+  const nonce = hex(16);
   const deadline = nowMs() + maxWaitMs;
   for (;;) {
+    const now = nowMs();
+    const record = { owner_kind: ownerKind, owner_id: ownerId, pid: process.pid, nonce, acquired_at: now, heartbeat_at: now };
     try {
-      const fd = fs.openSync(lockPath, 'wx');           // exclusive create
-      fs.writeSync(fd, JSON.stringify({ owner, nonce, hb: nowMs(), pid: process.pid }));
-      fs.closeSync(fd);
-      // verify our own nonce won (guards a two-reclaimer race)
-      const back = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
-      if (back.nonce !== nonce) { sleepSync(pollMs); continue; }
-      return { owner, nonce, lockPath };
+      const fd = fs.openSync(lockPath, 'wx');           // atomic exclusive create — the acquire primitive
+      try { fs.writeSync(fd, JSON.stringify(record)); fs.fsyncSync(fd); }
+      finally { fs.closeSync(fd); }
+      return { ownerKind, ownerId, nonce, lockPath, record };
     } catch (e) {
-      if (e.code !== 'EEXIST') throw e;
-      let held = null;
-      try { held = JSON.parse(fs.readFileSync(lockPath, 'utf8')); } catch { /* torn write */ }
-      const age = held && typeof held.hb === 'number' ? nowMs() - held.hb : Infinity;
-      if (age > STALE_MS) {                              // stale reclaim
-        try { fs.unlinkSync(lockPath); } catch { /* someone else reclaimed */ }
-        continue;
-      }
+      if (!isContentionError(e.code)) throw e;          // genuinely unexpected fs error → surface it
+      // Only EEXIST means the file definitively exists → eligible for stale reclaim; the
+      // Windows sharing-violation codes are transient, so just back off and retry.
+      if (e.code === 'EEXIST' && tryReclaimStaleLock(lockPath)) continue; // reclaimed a dead holder → retry create
       if (nowMs() > deadline) {
+        let age = 'unknown';
+        try { const h = JSON.parse(fs.readFileSync(lockPath, 'utf8')); if (typeof h.heartbeat_at === 'number') age = String(nowMs() - h.heartbeat_at); } catch { /* torn */ }
         throw new LockExhaustion(
           \`plan.json lock is held by a live owner (heartbeat \${age}ms old, < \${STALE_MS}ms stale window). \` +
           \`Recovery: retry after the \${STALE_MS}ms stale-reclaim window, or surface to the responsible \` +
           \`supervisor. NO direct plan.json edit is performed.\`);
       }
-      sleepSync(pollMs);
+      sleepSync(1 + Math.floor(Math.random() * pollMs)); // jittered backoff de-syncs a racing swarm
     }
   }
 }
+
+// Attempt to reclaim a stale lock. Returns true iff THIS caller won the reclaim (lock
+// path now free for a fresh 'wx' create). Race-safe and cross-implementation-safe.
+//
+// A BARE read-staleness→unlink race is NOT sufficient: a contender that read the victim
+// as stale can wake after the victim was already reclaimed and a FRESH live lock installed
+// in its place — its unlink/rename would then steal that fresh lock, transiently emptying
+// lockPath and breaking mutual exclusion. So reclaimers of a given victim are SERIALIZED by
+// an exclusive per-victim claim marker (\`plan.json.lock.reclaim-<victim-nonce>\`): exactly
+// one contender performs the confirm → tombstone → remove sequence. While the stale victim
+// is still present no 'wx' create can install a fresh lock and no other reclaimer can act,
+// so the sequence can never grab a fresh lock. Because the claim marker and tombstone use
+// the SAME paths as plan-manifest.ts, a skill contender and a service contender racing the
+// same victim serialize on the marker across processes. Losers of the claim back off.
+function tryReclaimStaleLock(lockPath) {
+  let record = null;
+  try { record = JSON.parse(fs.readFileSync(lockPath, 'utf8')); }
+  catch { return false; }                                // unreadable / mid-write heartbeat rename → back off
+  if (!record || typeof record.heartbeat_at !== 'number' || typeof record.nonce !== 'string') return false;
+  if (nowMs() - record.heartbeat_at <= STALE_MS) return false; // still live — fresh heartbeat
+
+  // Exclusive per-victim reclaim claim — the serializer. Losers back off.
+  const claim = lockPath + '.reclaim-' + record.nonce;
+  try { fs.closeSync(fs.openSync(claim, 'wx')); }
+  catch { return false; }                                // another contender owns this victim's reclaim (or transient)
+  try {
+    // Re-confirm the victim is unchanged right before acting. Under the claim nothing else
+    // can have replaced it, so this only rejects the already-reclaimed case.
+    let cur = null;
+    try { cur = JSON.parse(fs.readFileSync(lockPath, 'utf8')); } catch { cur = null; }
+    if (!cur || cur.nonce !== record.nonce || typeof cur.heartbeat_at !== 'number' || nowMs() - cur.heartbeat_at <= STALE_MS) {
+      return false;                                      // already reclaimed/replaced → nothing to do
+    }
+    const tombstone = lockPath + '.stale-' + record.nonce;
+    try { fs.renameSync(lockPath, tombstone); } catch { return false; }
+    try { fs.rmSync(tombstone, { force: true }); } catch { /* best-effort */ }
+    return true;                                         // caller re-enters acquire and 'wx'-creates a fresh lock
+  } finally {
+    try { fs.rmSync(claim, { force: true }); } catch { /* best-effort */ }
+  }
+}
+
+// Atomically rewrite heartbeat_at (temp-write + rename, never a truncating write) only
+// while the on-disk lock still carries OUR nonce. Returns false when the lock is no longer
+// ours (reclaimed) so the caller stops heartbeating and never clobbers the new holder.
 function heartbeat(lock) {
   try {
-    const rec = JSON.parse(fs.readFileSync(lock.lockPath, 'utf8'));
-    if (rec.nonce === lock.nonce) { rec.hb = nowMs(); fs.writeFileSync(lock.lockPath, JSON.stringify(rec)); }
-  } catch { /* best-effort */ }
+    const cur = JSON.parse(fs.readFileSync(lock.lockPath, 'utf8'));
+    if (!cur || cur.nonce !== lock.nonce) return false;  // reclaimed out from under us → stop
+  } catch { return false; }                              // vanished/unreadable → stop
+  lock.record.heartbeat_at = nowMs();
+  const tmp = lock.lockPath + '.hb-' + lock.nonce;
+  try {
+    const fd = fs.openSync(tmp, 'w');
+    try { fs.writeSync(fd, JSON.stringify(lock.record)); fs.fsyncSync(fd); }
+    finally { fs.closeSync(fd); }
+    fs.renameSync(tmp, lock.lockPath);                   // atomic replace
+  } catch { /* transient write failure is non-fatal; next tick retries */ }
+  return true;
 }
-function releaseLock(lock) { try { fs.unlinkSync(lock.lockPath); } catch { /* already gone */ } }
+
+// Release: verify OUR nonce is still on disk, then delete. If reclaimed out from under us
+// (nonce mismatch) delete nothing — the current holder owns it.
+function releaseLock(lock) {
+  try {
+    const cur = JSON.parse(fs.readFileSync(lock.lockPath, 'utf8'));
+    if (!cur || cur.nonce !== lock.nonce) return;        // reclaimed → delete nothing
+  } catch { return; }                                    // already gone / unreadable
+  try { withFsRetrySync(() => fs.unlinkSync(lock.lockPath)); } catch { /* already gone */ }
+}
 
 // Atomic read-modify-write / CAS on plan.json under the lock.
 // mutate(obj) returns the mutated object; the write lands only if the on-disk
@@ -6382,7 +6496,8 @@ function withManifestCAS(dir, mutate, opts = {}) {
   const manifestPath = path.join(dir, 'plan.json');
   const lockPath = manifestPath + '.lock';
   const lock = acquireLock(lockPath, opts);
-  const hbTimer = setInterval(() => heartbeat(lock), HEARTBEAT_MS);
+  let hbTimer;
+  hbTimer = setInterval(() => { if (heartbeat(lock) === false) clearInterval(hbTimer); }, HEARTBEAT_MS);
   try {
     for (let attempt = 0; attempt < CAS_RETRIES; attempt++) {
       const exists = fs.existsSync(manifestPath);
@@ -6413,7 +6528,7 @@ function withManifestCAS(dir, mutate, opts = {}) {
       const tmp = manifestPath + '.wtmp-' + hex(4);
       const fd = fs.openSync(tmp, 'wx');
       fs.writeSync(fd, serialized); fs.fsyncSync(fd); fs.closeSync(fd);
-      fs.renameSync(tmp, manifestPath);
+      withFsRetrySync(() => fs.renameSync(tmp, manifestPath)); // tolerate transient Windows sharing violation
       return next;
     }
     throw new Error(\`plan.json CAS did not converge after \${CAS_RETRIES} retries (persistent contention).\`);
