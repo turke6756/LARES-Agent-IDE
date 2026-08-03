@@ -2478,6 +2478,25 @@ export interface IpcApi {
      *  such as the Plans gallery temporarily hide the native pane so DOM wins. */
     paneSetVisible: (visible: boolean) => Promise<void>;
   };
+  /** WP-P1B: read-only planning reader. `list` enumerates bare proposals + §R0
+   *  plan folders and is a pure mount/refresh read (emits NO demand-probe);
+   *  `read` fetches one document by its OPAQUE server-issued manifest id. A
+   *  voluntary open is instrumented separately via `demandProbe.record`. */
+  planningReader: {
+    list: (workspaceRoot: string, pathType?: PathType) => Promise<PlanningReaderListResult>;
+    read: (docId: string, pathType?: PathType) => Promise<PlanningReaderReadResult | { error: string }>;
+  };
+  /** WP-P0PRE: voluntary demand-probe recorder. `source` is stamped in main from
+   *  the transport, never from this payload; `workspaceId` selects the sink. */
+  demandProbe: {
+    record: (req: {
+      workspaceId: string;
+      kind: 'proposal_authored' | 'promotion_requested' | 'reader_open' | 'savecard_open';
+      feature_exercise?: boolean;
+      manual_class?: string;
+      eventId?: string;
+    }) => Promise<{ appended: boolean; duplicate: boolean; reason?: string; eventId?: string; file?: string }>;
+  };
   onAgentStatusChanged: (callback: (data: { agentId: string; status: AgentStatus; agent: Agent; source?: string }) => void) => () => void;
   onAgentDeleted: (callback: (data: { agentId: string }) => void) => () => void;
   onOpenFileTab: (callback: (payload: OpenFileTabRequest) => void) => () => void;

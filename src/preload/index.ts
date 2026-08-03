@@ -211,6 +211,19 @@ const api: IpcApi = {
     paneSetBounds: (bounds) => ipcRenderer.invoke('plan-pane:setBounds', bounds),
     paneSetVisible: (visible) => ipcRenderer.invoke('plan-pane:setVisible', visible),
   },
+  // WP-P1B: read-only planning reader (bounded fs enumeration + read-by-opaque-id).
+  // `list` is a pure mount/refresh read (NO demand-probe); a voluntary open is
+  // instrumented separately by the renderer via `demandProbe.record`.
+  planningReader: {
+    list: (workspaceRoot, pathType) =>
+      ipcRenderer.invoke('planning-reader:list', workspaceRoot, pathType),
+    read: (docId, pathType) => ipcRenderer.invoke('planning-reader:read', docId, pathType),
+  },
+  // WP-P0PRE: voluntary demand-probe recorder. `source` is stamped in main from
+  // the transport (renderer-user-action) and is never taken from this payload.
+  demandProbe: {
+    record: (req) => ipcRenderer.invoke('demand-probe:record', req),
+  },
   terminal: {
     attach: (agentId) => ipcRenderer.invoke('terminal:attach', agentId),
     // WP-3d: `expectedEpoch` makes the detach epoch-scoped in main.

@@ -4,6 +4,7 @@ import * as Icons from 'lucide-react';
 import { useDashboardStore } from '../../stores/dashboard-store';
 import type { PlanListItem } from '../../../shared/types';
 import PlanCard, { planLabel } from './PlanCard';
+import ProposalReaderPane from './ProposalReaderPane';
 import { suspendBrowserPane, resumeBrowserPane } from '../browser/useBrowserSuspension';
 
 // WP5 mount: the toolbar affordance for opening a plan surface. Opens a card
@@ -31,8 +32,11 @@ interface PlansMenuProps {
 
 export default function PlansMenu({ compact, detached = false, onDragStart, onDragEnd }: PlansMenuProps): React.ReactElement {
   const selectedWorkspaceId = useDashboardStore((s) => s.selectedWorkspaceId);
+  const workspaces = useDashboardStore((s) => s.workspaces);
   const openPlanTab = useDashboardStore((s) => s.openPlanTab);
   const [open, setOpen] = useState(false);
+  // WP-P1B: the read-only proposal / plan reader overlay (folder-aware).
+  const [readerOpen, setReaderOpen] = useState(false);
   const [plans, setPlans] = useState<PlanListItem[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const rootRef = useRef<HTMLDivElement | null>(null);
@@ -95,6 +99,12 @@ export default function PlansMenu({ compact, detached = false, onDragStart, onDr
   };
 
   const surfaces = plans?.filter(isPlanSurface) ?? null;
+  const selectedWorkspace = workspaces.find((w) => w.id === selectedWorkspaceId) ?? null;
+
+  const openReader = () => {
+    setOpen(false);
+    setReaderOpen(true);
+  };
 
   return (
     <div ref={rootRef} className="relative">
@@ -133,6 +143,14 @@ export default function PlansMenu({ compact, detached = false, onDragStart, onDr
                 role="menu"
                 data-testid="plans-gallery"
               >
+                <button
+                  onClick={openReader}
+                  data-testid="open-proposal-reader"
+                  className="mb-2 flex w-full items-center gap-2 rounded-md border border-white/10 px-2 py-1.5 text-left text-[12px] text-gray-300 hover:bg-white/[0.06] hover:text-gray-100"
+                >
+                  <Icons.BookOpen className="h-4 w-4 shrink-0 text-accent-blue" />
+                  Browse proposals &amp; plans (read-only)
+                </button>
                 {error ? (
                   <div className="px-1 py-2 text-[12px] text-accent-red">{error}</div>
                 ) : surfaces === null ? (
@@ -151,6 +169,15 @@ export default function PlansMenu({ compact, detached = false, onDragStart, onDr
           })(),
           document.body,
         )}
+
+      {readerOpen && (
+        <ProposalReaderPane
+          workspaceRoot={selectedWorkspace?.path ?? null}
+          pathType={selectedWorkspace?.pathType ?? 'windows'}
+          workspaceId={selectedWorkspaceId}
+          onClose={() => setReaderOpen(false)}
+        />
+      )}
     </div>
   );
 }
