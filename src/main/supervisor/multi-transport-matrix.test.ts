@@ -1,8 +1,9 @@
 // P1 multi-transport matrix tests (plans/p1-hook-spool-multi-transport.md §5
 // E5/E6 + the §5 E4 restart-shaped tmux end-to-end).
 //
-// Cells: Claude×Windows, Codex×Windows, Claude×WSL, Codex×WSL, Grok×Windows
-// (grok is Windows-only — grok-on-WSL is refused at launch) — each asserts:
+// Cells: Claude×Windows, Codex×Windows, Claude×WSL, Codex×WSL, Grok×Windows,
+// and Agy×Windows. Grok and agy are Windows-only and are refused on WSL.
+// Each applicable cell asserts:
 //   (i)   launch injects DASHBOARD_SPOOL_PATH in the right form for the
 //         pathType (WSL form shell-quoted);
 //   (ii)  a spool-delivered event (HTTP silent) flips status with source
@@ -33,6 +34,8 @@ import { WindowsRunner } from './windows-runner';
 import { WslRunner } from './wsl-runner';
 import { makeAgent } from './test-helpers/fake-bridge-deps';
 import { windowsToWslPath } from '../path-utils';
+import { WORKING_THRESHOLD_MS } from '../../shared/constants';
+import { encodeAgyWindowsBody, getWindowsSubmitSequence } from './send-input-encoders';
 import type { Agent, AgentStatus, LaunchAgentInput, Workspace } from '../../shared/types';
 
 interface TestCase { name: string; run(): Promise<void> | void; }
@@ -95,21 +98,30 @@ function patchDb(agentsMap: Map<string, Agent>, audit: AuditRow[], workspace?: W
 
 function stubRunnerLaunches(): {
   winEnvs: Array<Record<string, string> | undefined>;
+  winCommands: Array<{ command: string; args: string[] }>;
+  winWrites: string[];
   wslCommands: string[];
   restore: () => void;
 } {
   const winEnvs: Array<Record<string, string> | undefined> = [];
+  const winCommands: Array<{ command: string; args: string[] }> = [];
+  const winWrites: string[] = [];
   const wslCommands: string[] = [];
   const origWin = (WindowsRunner.prototype as { launch: unknown }).launch;
+  const origWrite = (WindowsRunner.prototype as { write: unknown }).write;
   const origWsl = (WslRunner.prototype as { launch: unknown }).launch;
   (WindowsRunner.prototype as { launch: unknown }).launch = function (
     this: WindowsRunner,
-    _workDir: string, _cmd: string, _args: string[], _logPath: string,
+    _workDir: string, command: string, args: string[], _logPath: string,
     _directSpawn?: boolean, extraEnv?: Record<string, string>,
   ) {
     winEnvs.push(extraEnv);
+    winCommands.push({ command, args });
     (this as unknown as { _pid: number; _alive: boolean })._pid = 4242;
     (this as unknown as { _pid: number; _alive: boolean })._alive = true;
+  };
+  (WindowsRunner.prototype as { write: unknown }).write = function (data: string) {
+    winWrites.push(data);
   };
   (WslRunner.prototype as { launch: unknown }).launch = async function (
     this: WslRunner, _workDir: string, command: string,
@@ -119,9 +131,12 @@ function stubRunnerLaunches(): {
   };
   return {
     winEnvs,
+    winCommands,
+    winWrites,
     wslCommands,
     restore: () => {
       (WindowsRunner.prototype as { launch: unknown }).launch = origWin;
+      (WindowsRunner.prototype as { write: unknown }).write = origWrite;
       (WslRunner.prototype as { launch: unknown }).launch = origWsl;
     },
   };
@@ -136,7 +151,7 @@ function stubCodexDiscovery(): () => void {
   return () => { disc.shouldDiscoverCodexSession = orig; };
 }
 
-/** Grok-lane variant of the discovery stub: instead of forcing the gate false,
+/** Non-Codex provider variant of the discovery stub: instead of forcing the gate false,
  *  DELEGATE to the REAL shouldDiscoverCodexSession (which returns false for any
  *  non-codex provider) while recording (a) every provider the gate was consulted
  *  for and (b) any snapshotCodexSessions call. This is how the grok cell proves
@@ -183,10 +198,10 @@ function statusChanges(audit: AuditRow[]): Array<{ from: string; to: string; sou
   return audit.filter((r) => r.type === 'status_change').map((r) => JSON.parse(r.payload));
 }
 
-// ── The four matrix cells ─────────────────────────────────────────────
+// ── Provider/transport matrix cells ───────────────────────────────────
 
 interface CellOpts {
-  provider: 'claude' | 'codex' | 'grok';
+  provider: 'claude' | 'codex' | 'grok' | 'agy';
   pathType: 'windows' | 'wsl';
 }
 
@@ -197,11 +212,13 @@ async function runCell(opts: CellOpts): Promise<void> {
   const restoreDb = patchDb(agentsMap, audit);
   const runners = stubRunnerLaunches();
   const isGrok = opts.provider === 'grok';
+  const isAgy = opts.provider === 'agy';
+  const isWindowsOnlyProvider = isGrok || isAgy;
   // Grok cells use the recording spy (delegates to the REAL gate) so we can
   // assert the codex discovery scan is never entered; the other lanes keep the
   // hard false-stub that suppresses the real ~/.codex scan for codex cells.
-  const grokDiscovery = isGrok ? spyCodexDiscovery() : null;
-  const restoreDiscovery = isGrok ? grokDiscovery!.restore : stubCodexDiscovery();
+  const windowsOnlyDiscovery = isWindowsOnlyProvider ? spyCodexDiscovery() : null;
+  const restoreDiscovery = isWindowsOnlyProvider ? windowsOnlyDiscovery!.restore : stubCodexDiscovery();
   // Isolate grok's trust store: ensureGrokTrust honors $GROK_HOME, so point it at
   // a throwaway dir under tmp. The real ~/.grok must never be touched.
   const prevGrokHome = process.env.GROK_HOME;
@@ -214,6 +231,7 @@ async function runCell(opts: CellOpts): Promise<void> {
   const resolver = require('./provider-resolver') as Record<string, unknown>;
   const origFindBinary = resolver.findWindowsProviderBinary;
   if (isGrok) resolver.findWindowsProviderBinary = async () => 'C:\\Users\\test\\.grok\\bin\\grok.exe';
+  if (isAgy) resolver.findWindowsProviderBinary = async () => 'C:\\Users\\test\\AppData\\Local\\agy\\bin\\agy.exe';
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const bridge = require('../wsl-bridge') as Record<string, unknown>;
   const origTmuxRead = bridge.tmuxReadStatusOptions;
@@ -258,6 +276,33 @@ async function runCell(opts: CellOpts): Promise<void> {
         'Windows launch must inject the native spool path in extraEnv');
     }
 
+    if (isAgy) {
+      assert.deepEqual(runners.winCommands, [{
+        command: 'C:\\Users\\test\\AppData\\Local\\agy\\bin\\agy.exe',
+        args: [],
+      }], 'agy Windows launch resolves the absolute installer binary with no invented CLI flags');
+
+      const monitor = (supervisor as unknown as {
+        monitor: { isHookCanaryArmed: (id: string) => boolean; inferStatus: (a: Agent) => Promise<string | null> };
+      }).monitor;
+      const winRunner = (supervisor as unknown as { windowsRunners: Map<string, WindowsRunner> }).windowsRunners.get(agent.id)!;
+      (winRunner as unknown as { _lastRawOutputTime: number })._lastRawOutputTime = Date.now();
+      assert.equal(await monitor.inferStatus(agent), null, 'PTY activity alone never promotes an idle agy worker');
+
+      const body = 'line one\r\nline two\rline three';
+      const delivered = await (supervisor as unknown as {
+        _doSendInput: (id: string, text: string, submit: boolean) => Promise<boolean>;
+      })._doSendInput(agent.id, body, true);
+      assert.equal(delivered, true);
+      assert.deepEqual(runners.winWrites, [encodeAgyWindowsBody(body), getWindowsSubmitSequence('agy')]);
+      assert.deepEqual(runners.winWrites.map((s) => Buffer.from(s, 'utf-8')), [
+        Buffer.from('line one\nline two\nline three', 'utf-8'),
+        Buffer.from([0x0d]),
+      ], 'agy body uses LF newlines and exactly one final CR submit byte');
+      assert.equal(monitor.isHookCanaryArmed(agent.id), true,
+        'agy hook canary arms at submitted-input time, never merely at launch');
+    }
+
     const spoolFile = path.join(tmp, '.lares', 'pending-status.jsonl');
     fs.mkdirSync(path.dirname(spoolFile), { recursive: true });
 
@@ -286,10 +331,17 @@ async function runCell(opts: CellOpts): Promise<void> {
 
     // (ii) spool-delivered event (HTTP silent) flips status with source
     // 'hook-spool'. ts is set safely past any prior applied event.
-    agent.status = 'working';
-    fs.appendFileSync(spoolFile, spoolRecord(agent.id, 'idle', Date.now() + 60_000, 'spool-1'));
+    agent.status = isAgy ? 'idle' : 'working';
+    const record = isAgy
+      ? JSON.stringify({
+        v: 1, agentId: agent.id, state: 'working', source: 'hook-start',
+        ts: Date.now() + 60_000, hookEventName: 'PreInvocation', turnId: 'spool-1',
+      }) + '\n'
+      : spoolRecord(agent.id, 'idle', Date.now() + 60_000, 'spool-1');
+    fs.appendFileSync(spoolFile, record);
     (supervisor as unknown as { pollHookTransports: () => void }).pollHookTransports();
-    assert.equal(agent.status, 'idle', 'spool-delivered Stop must flip the worker to idle');
+    assert.equal(agent.status, isAgy ? 'working' : 'idle',
+      isAgy ? 'spool-delivered PreInvocation must flip agy to working' : 'spool-delivered Stop must flip the worker to idle');
     const spoolFlips = statusChanges(audit).filter((c) => c.source === 'hook-spool');
     assert.equal(spoolFlips.length, 1, `expected one hook-spool flip; got ${JSON.stringify(statusChanges(audit))}`);
     assert.equal(agent.hookStatus, 'healthy', 'applied spool event stamps hook health');
@@ -299,22 +351,36 @@ async function runCell(opts: CellOpts): Promise<void> {
       const wslRunner = (supervisor as unknown as { wslRunners: Map<string, WslRunner> }).wslRunners.get(agent.id)!;
       (wslRunner as unknown as { isStillAlive: () => Promise<boolean> }).isStillAlive = async () => true;
     }
-    const monitor = (supervisor as unknown as { monitor: { inferStatus: (a: Agent) => Promise<string | null> } }).monitor;
-    assert.equal(await monitor.inferStatus(agent), null,
-      'worker-lane PTY inference must stay disabled (hook-owned status)');
+    const monitor = (supervisor as unknown as {
+      monitor: {
+        inferStatus: (a: Agent) => Promise<string | null>;
+        recordHookEventAt: (agentId: string, ts: number) => void;
+      };
+    }).monitor;
+    if (isAgy) {
+      const winRunner = (supervisor as unknown as { windowsRunners: Map<string, WindowsRunner> }).windowsRunners.get(agent.id)!;
+      const stale = Date.now() - WORKING_THRESHOLD_MS - 1;
+      monitor.recordHookEventAt(agent.id, stale);
+      (winRunner as unknown as { _lastRawOutputTime: number })._lastRawOutputTime = stale;
+      assert.equal(await monitor.inferStatus(agent), 'idle',
+        'agy demotes an already-working turn only after PreInvocation and raw PTY are both quiet for 8s');
+    } else {
+      assert.equal(await monitor.inferStatus(agent), null,
+        'worker-lane PTY inference must stay disabled (hook-owned status)');
+    }
 
-    // (v) grok only: NO codex session-discovery path runs. The launch consults
+    // (v) grok/agy only: NO codex session-discovery path runs. The launch consults
     // the discovery gate (shouldDiscoverCodexSession), but the REAL predicate
     // declines any non-codex provider, so the ~/.codex snapshot scan
     // (snapshotCodexSessions) is never entered. grok is deliberately
     // non-session-addressable — no cwd rollout scan, no ~/.codex touch.
-    if (isGrok) {
-      assert.ok(grokDiscovery!.discoverProviders.includes('grok'),
-        'the launch must consult the discovery gate for the grok agent');
-      assert.ok(grokDiscovery!.discoverProviders.every((p) => p !== 'codex'),
-        `no codex-provider discovery gate call in a grok launch; got: ${grokDiscovery!.discoverProviders.join(',')}`);
-      assert.equal(grokDiscovery!.snapshotCalls.length, 0,
-        `grok must never enter the codex ~/.codex snapshot scan; got ${grokDiscovery!.snapshotCalls.length} call(s)`);
+    if (isWindowsOnlyProvider) {
+      assert.ok(windowsOnlyDiscovery!.discoverProviders.includes(opts.provider),
+        `the launch must consult the discovery gate for the ${opts.provider} agent`);
+      assert.ok(windowsOnlyDiscovery!.discoverProviders.every((p) => p !== 'codex'),
+        `no codex-provider discovery gate call in a ${opts.provider} launch; got: ${windowsOnlyDiscovery!.discoverProviders.join(',')}`);
+      assert.equal(windowsOnlyDiscovery!.snapshotCalls.length, 0,
+        `${opts.provider} must never enter the codex ~/.codex snapshot scan; got ${windowsOnlyDiscovery!.snapshotCalls.length} call(s)`);
     }
   } finally {
     bridge.tmuxReadStatusOptions = origTmuxRead;
@@ -338,6 +404,33 @@ test('matrix cell: Codex × WSL', () => runCell({ provider: 'codex', pathType: '
 // health becomes healthy after the applied event, and (v) no codex
 // session-discovery path runs for grok.
 test('matrix cell: Grok × Windows', () => runCell({ provider: 'grok', pathType: 'windows' }));
+test('matrix cell: Antigravity × Windows', () => runCell({ provider: 'agy', pathType: 'windows' }));
+
+test('matrix boundary: Antigravity × WSL is refused with the Windows-only teaching message', async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ad-matrix-agy-wsl-refusal-'));
+  const agentsMap = new Map<string, Agent>();
+  const audit: AuditRow[] = [];
+  const restoreDb = patchDb(agentsMap, audit);
+  const runners = stubRunnerLaunches();
+  try {
+    const agent = makeAgent('m-agy-wsl-refused', {
+      provider: 'agy', isWorker: true, status: 'launching', command: 'agy',
+      workingDirectory: '/home/u/repo/.lares/workers/agy', tmuxSessionName: 'cad__agy_refused',
+    });
+    agentsMap.set(agent.id, agent);
+    const supervisor = makeSupervisor();
+    await assert.rejects(
+      () => (supervisor as unknown as { launchWslAgent: (a: Agent) => Promise<void> }).launchWslAgent(agent),
+      /Antigravity CLI is not yet supported in WSL workspaces\. Re-create the workspace as a Windows path type/,
+    );
+    assert.equal(agent.status, 'crashed');
+    assert.equal(runners.wslCommands.length, 0, 'WSL refusal happens before any tmux/provider launch');
+  } finally {
+    runners.restore();
+    restoreDb();
+    try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* best effort */ }
+  }
+});
 
 // ── Restart-shaped tmux end-to-end (plan §5 E4, third bullet) ──────────
 

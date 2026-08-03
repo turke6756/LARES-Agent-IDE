@@ -487,6 +487,46 @@ test('agy → revive-unsupported-provider (422), message names agy as not-yet-se
   assert.match(caught!.message ?? '', /gemini, grok and agy are not yet session-mapped/);
 }));
 
+test('agy revive boundary rejects before synthesizing any cwd-based session identity', () => withHarness(async (h) => {
+  const agent = terminalWorker(h.workspacePath, { provider: 'agy' });
+  h.agents.push(agent);
+  let codexResolveCalls = 0;
+  (h.supervisor as unknown as { resolveCodexResumeSessionId: unknown }).resolveCodexResumeSessionId = () => {
+    codexResolveCalls++;
+    return 'SHOULD-NOT-BE-SYNTHESIZED';
+  };
+  let caught: { code?: string; message?: string } | null = null;
+  try { await h.supervisor.reviveAgent(agent.id, {}); }
+  catch (err) { caught = err as { code?: string; message?: string }; }
+  assert.equal(caught?.code, 'revive-unsupported-provider');
+  assert.equal(caught?.message, 'revive supports: claude, codex; gemini, grok and agy are not yet session-mapped');
+  assert.equal(codexResolveCalls, 0, 'agy must never be routed through codex cwd/session discovery');
+}));
+
+test('agy fork boundary fails closed with the Claude-only message before creating a child', () => withHarness(async (h) => {
+  const agent = terminalWorker(h.workspacePath, { provider: 'agy', resumeSessionId: 'agy-conversation' });
+  h.agents.push(agent);
+  const before = h.agents.length;
+  await assert.rejects(() => h.supervisor.forkAgent(agent.id), {
+    message: 'Fork is only supported for Claude agents',
+  });
+  assert.equal(h.agents.length, before, 'rejected agy fork must not create a child agent');
+}));
+
+test('agy launch shapes never enter codex session discovery', () => {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { shouldDiscoverCodexSession } = require('./session-id-discovery') as {
+    shouldDiscoverCodexSession: (o: { provider: string; resume: boolean; freshSession: boolean }) => boolean;
+  };
+  for (const shape of [
+    { provider: 'agy', resume: false, freshSession: false },
+    { provider: 'agy', resume: false, freshSession: true },
+    { provider: 'agy', resume: true, freshSession: false },
+  ]) {
+    assert.equal(shouldDiscoverCodexSession(shape), false, `agy discovery must stay off for ${JSON.stringify(shape)}`);
+  }
+});
+
 test('grok revive rejects WITHOUT synthesizing a cwd-based session identity', () => withHarness(async (h) => {
   // Boundary (plan §4.3): assertResumable hits the default: branch for grok and
   // throws BEFORE any codex session resolution. A grok agent must never have a
