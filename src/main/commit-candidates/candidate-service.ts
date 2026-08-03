@@ -6,15 +6,28 @@
 // canonical component assembler exactly once.
 
 import * as fs from 'node:fs';
+import { createHash } from 'node:crypto';
 
 import type {
   BundleCaptureHealth,
+  CandidateMember,
+  CommitCandidate,
+  CommitEligibility,
   ConflictComponent,
   DirtyEntry,
   DirtyInventory,
+  FinalizationRef,
+  PackageVerificationState,
   ProtectionRung,
+  RepositoryIdentity,
+  SelectionPreview,
   SaveCardQuotaWeakening,
 } from '../../shared/commit-candidates';
+import { canonicalize } from './jcs';
+import type { CommitRepresentation } from './commit-representation';
+import type { FrozenManifestMember } from './finalization-service';
+import type { IndexFingerprintResult } from './index-fingerprint';
+import type { PackageFinalization } from '../database';
 import type { GitCapability } from '../../shared/types';
 import type { RunGit } from '../git/git-runtime';
 import {
@@ -336,6 +349,448 @@ export class CommitCandidateService {
     const read = await this.assembleInventory(request);
     return { bundles: projectWorkBundles(read), quotaWeakening: read.quotaWeakening };
   }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SC-WP-3G — canonical candidate assembly + verification + identity.
+//
+// A candidate is a UNION of atomic units: whole witnessed components (never a
+// proper subset in v1) + independently-selected unattributed entries, backed by
+// finalization coverage. A selection WITHOUT finalization is a `SelectionPreview`,
+// not a candidate (contract §4/§4.1/§4.2, §5.1).
+//
+// These are PURE functions over an already-resolved context so both lenses (fleet
+// / plan) produce an identical `candidateId`: the identity inputs (§4.2) are lens-
+// independent, and the assembler never re-computes topology or splits a component.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** The explicit selection request (component ids expand server-side to ALL their
+ *  entries; unattributed entries are independent atoms; finalizations are the
+ *  requested coverage set). Empty `finalizationIds` ⇒ preview, never a candidate. */
+export interface CandidateSelectionRequest {
+  selectedComponentIds: readonly string[];
+  selectedUnattributedEntryIds: readonly string[];
+  finalizationIds: readonly string[];
+}
+
+/** The minimal `commit_path_links` shape the prior-exact-commit closure proof needs
+ *  (structurally satisfied by `database.CommitPathLink`). A member is proven
+ *  `already-locally-committed` ONLY by an EXACT frozen commit-entry match. */
+export interface CandidateLedgerLink {
+  pathBytesBase64: string;
+  expectedState: 'present' | 'absent';
+  commitBlobOid: string | null;
+  commitMode: string | null;
+}
+
+/** Everything the pure assembler reads. Production callers resolve these from the
+ *  read facade + WP-3B accessors + WP-2J temp-index reads + WP-3G fingerprint;
+ *  tests inject fakes and one real-git case drives the genuine `.gitattributes`
+ *  clean-filter divergence. */
+export interface CandidateBuildContext {
+  repository: RepositoryIdentity;
+  inventory: DirtyInventory;
+  components: readonly ConflictComponent[];
+  /** Every finalization the request may reference (requested coverage set). Only
+   *  `lifecycle_status='active'` rows actually cover a path. */
+  finalizations: readonly PackageFinalization[];
+  /** CURRENT temp-index commit representation per selected entryId (WP-2J), used to
+   *  detect a post-finalization clean-filter divergence. Absent ⇒ treated as no
+   *  current commit entry (null blob/mode). */
+  currentCommitReps: ReadonlyMap<string, CommitRepresentation>;
+  /** Repository-scoped exact commit ledger for the prior-exact-commit closure. */
+  ledger: readonly CandidateLedgerLink[];
+  protectionByEntryId?: Readonly<Record<string, ProtectionRung>>;
+  pinnedHeadOid: string | null;
+  indexFingerprint: IndexFingerprintResult;
+  contractVersion: number;
+}
+
+function compareBase64(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function sha256Hex(value: string): string {
+  return createHash('sha256').update(value, 'utf8').digest('hex');
+}
+
+function parseFrozenManifest(finalization: PackageFinalization): FrozenManifestMember[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(finalization.memberManifestJson);
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(parsed)) return [];
+  return parsed as FrozenManifestMember[];
+}
+
+interface ResolvedSelection {
+  componentIds: string[];
+  unattributedEntryIds: string[];
+  memberEntries: DirtyEntry[];
+  /** A selected "unattributed" entry that actually belongs to a witnessed component
+   *  is a smuggled proper-subset of that component — never allowed (contract §4). */
+  subsetViolation: boolean;
+}
+
+/** Expand the request into its concrete member entries and detect a component
+ *  proper-subset. Component ids expand to ALL their entries; unattributed entries
+ *  are added independently. Unknown ids are caller bugs (throw). */
+function resolveSelection(
+  request: CandidateSelectionRequest,
+  context: CandidateBuildContext,
+): ResolvedSelection {
+  const entriesById = new Map(context.inventory.entries.map((entry) => [entry.entryId, entry]));
+  const componentById = new Map(context.components.map((component) => [component.componentId, component]));
+  const allComponentEntryIds = new Set<string>();
+  for (const component of context.components) {
+    for (const entryId of component.dirtyEntryIds) allComponentEntryIds.add(entryId);
+  }
+
+  const memberIds = new Set<string>();
+  const componentIds = [...new Set(request.selectedComponentIds)].sort(compareBase64);
+  for (const componentId of componentIds) {
+    const component = componentById.get(componentId);
+    if (!component) throw new Error(`unknown component in selection: ${componentId}`);
+    for (const entryId of component.dirtyEntryIds) memberIds.add(entryId);
+  }
+
+  let subsetViolation = false;
+  const unattributedEntryIds = [...new Set(request.selectedUnattributedEntryIds)].sort(compareBase64);
+  for (const entryId of unattributedEntryIds) {
+    if (!entriesById.has(entryId)) throw new Error(`unknown unattributed entry in selection: ${entryId}`);
+    // Selecting a component's entry AS an independent unattributed atom would carve
+    // a proper subset out of that component — reject it (component atomicity).
+    if (allComponentEntryIds.has(entryId)) subsetViolation = true;
+    memberIds.add(entryId);
+  }
+
+  const memberEntries = [...memberIds]
+    .map((entryId) => entriesById.get(entryId)!)
+    .sort((left, right) => compareBase64(left.path.pathBytesBase64, right.path.pathBytesBase64));
+
+  return { componentIds, unattributedEntryIds, memberEntries, subsetViolation };
+}
+
+interface CoveringFrozen {
+  finalization: PackageFinalization;
+  frozen: FrozenManifestMember;
+}
+
+/** Index active finalizations by the path bytes their frozen manifest covers. */
+function coveringByPath(
+  finalizations: readonly PackageFinalization[],
+): Map<string, CoveringFrozen[]> {
+  const byPath = new Map<string, CoveringFrozen[]>();
+  for (const finalization of finalizations) {
+    if (finalization.lifecycleStatus !== 'active') continue;
+    for (const frozen of parseFrozenManifest(finalization)) {
+      const list = byPath.get(frozen.pathBytesBase64) ?? [];
+      list.push({ finalization, frozen });
+      byPath.set(frozen.pathBytesBase64, list);
+    }
+  }
+  return byPath;
+}
+
+function frozenAgree(a: FrozenManifestMember, b: FrozenManifestMember): boolean {
+  return a.expectedState === b.expectedState
+    && a.rawBlobOid === b.rawBlobOid
+    && a.commitBlobOid === b.commitBlobOid
+    && a.commitMode === b.commitMode;
+}
+
+interface MemberVerification {
+  member: CandidateMember;
+  conflict: boolean;
+  usedFinalizationIds: string[];
+}
+
+function verifyMember(
+  entry: DirtyEntry,
+  covering: readonly CoveringFrozen[],
+  context: CandidateBuildContext,
+): MemberVerification {
+  const protection = context.protectionByEntryId?.[entry.entryId] ?? 'unprotected';
+  const base = {
+    entryId: entry.entryId,
+    path: entry.path,
+    expectedWorktreeState: entry.expectedWorktreeState,
+    rawWorktreeBlobOid: entry.rawWorktreeBlobOid,
+    protection,
+  };
+
+  if (covering.length === 0) {
+    const verification: PackageVerificationState =
+      entry.gitLevelEligibility === 'unsupported-git-state' ? 'unsupported-entry' : 'package-not-finalized';
+    return {
+      member: {
+        ...base,
+        expectedCommitBlobOid: null,
+        expectedCommitMode: null,
+        checkpointMode: null,
+        coveringFinalizationIds: [],
+        packageVerification: verification,
+      },
+      conflict: false,
+      usedFinalizationIds: [],
+    };
+  }
+
+  const coveringFinalizationIds = [...new Set(covering.map((c) => c.finalization.id))].sort(compareBase64);
+  const frozen = covering[0].frozen;
+  const conflict = covering.some((c) => !frozenAgree(c.frozen, frozen));
+  const expectedCommitBlobOid = frozen.commitBlobOid;
+  const expectedCommitMode = frozen.commitMode;
+
+  let verification: PackageVerificationState;
+  if (entry.gitLevelEligibility === 'unsupported-git-state') {
+    verification = 'unsupported-entry';
+  } else if (covering.some((c) => c.finalization.boundaryStatus !== 'ready')) {
+    verification = 'final-checkpoint-unavailable';
+  } else if (conflict) {
+    // No single trustworthy expectation; eligibility carries the finalization-conflict.
+    verification = 'verified-mismatch';
+  } else {
+    const rawMatch =
+      entry.rawWorktreeBlobOid === frozen.rawBlobOid
+      && entry.expectedWorktreeState === frozen.expectedState;
+    const currentRep = context.currentCommitReps.get(entry.entryId);
+    const currentCommitBlobOid = currentRep ? currentRep.commitBlobOid : null;
+    const currentCommitMode = currentRep ? currentRep.commitMode : null;
+    const commitMatch =
+      currentCommitBlobOid === expectedCommitBlobOid && currentCommitMode === expectedCommitMode;
+    verification = rawMatch && commitMatch ? 'verified-match' : 'verified-mismatch';
+  }
+
+  return {
+    member: {
+      ...base,
+      expectedCommitBlobOid,
+      expectedCommitMode,
+      // Raw + commit modes coincide in v1; the field is retained for the case where
+      // raw checkpoint semantics diverge from the clean-filtered commit entry.
+      checkpointMode: expectedCommitMode,
+      coveringFinalizationIds,
+      packageVerification: verification,
+    },
+    conflict,
+    usedFinalizationIds: coveringFinalizationIds,
+  };
+}
+
+/** A frozen manifest member NOT selected in the candidate is only acceptable when
+ *  it is EXACTLY locally committed already (contract §5.1) — raw match alone never
+ *  suffices. Returns true when an exact commit-ledger proof exists. */
+function ledgerProves(frozen: FrozenManifestMember, ledger: readonly CandidateLedgerLink[]): boolean {
+  return ledger.some((link) =>
+    link.pathBytesBase64 === frozen.pathBytesBase64
+    && link.expectedState === frozen.expectedState
+    && link.commitBlobOid === frozen.commitBlobOid
+    && link.commitMode === frozen.commitMode,
+  );
+}
+
+function unionTopologyDigest(
+  context: CandidateBuildContext,
+  componentIds: readonly string[],
+  unattributedEntries: readonly DirtyEntry[],
+): string {
+  const componentById = new Map(context.components.map((component) => [component.componentId, component]));
+  // Each per-component `componentTopologyDigest` already binds that component's full
+  // §3.2 per-entry contributor graph; composing the selected components' digests +
+  // the selected unattributed atoms' path bytes yields a deterministic union digest
+  // that is identical across both lenses and changes when the selected set changes.
+  const componentDigests = componentIds
+    .map((componentId) => componentById.get(componentId)!.componentTopologyDigest)
+    .sort(compareBase64);
+  const unattributedPaths = unattributedEntries
+    .map((entry) => entry.path.pathBytesBase64)
+    .sort(compareBase64);
+  return sha256Hex(canonicalize({
+    repositoryKey: context.repository.repositoryKey,
+    components: componentDigests,
+    unattributed: unattributedPaths,
+  }));
+}
+
+/**
+ * Assemble a `SelectionPreview` — a selection WITHOUT finalization coverage. Members
+ * are listed with their git-level verification, but the preview is NEVER committable:
+ * eligibility is always `package-not-finalized` (or `component-subset-not-allowed` if
+ * the selection carves a proper subset of a witnessed component).
+ */
+export function buildSelectionPreview(
+  request: CandidateSelectionRequest,
+  context: CandidateBuildContext,
+): SelectionPreview {
+  const selection = resolveSelection(request, context);
+  const members: CandidateMember[] = selection.memberEntries.map((entry) => {
+    const protection = context.protectionByEntryId?.[entry.entryId] ?? 'unprotected';
+    const verification: PackageVerificationState =
+      entry.gitLevelEligibility === 'unsupported-git-state' ? 'unsupported-entry' : 'package-not-finalized';
+    return {
+      entryId: entry.entryId,
+      path: entry.path,
+      expectedWorktreeState: entry.expectedWorktreeState,
+      rawWorktreeBlobOid: entry.rawWorktreeBlobOid,
+      expectedCommitBlobOid: null,
+      expectedCommitMode: null,
+      checkpointMode: null,
+      coveringFinalizationIds: [],
+      packageVerification: verification,
+      protection,
+    };
+  });
+  const eligibility: CommitEligibility = selection.subsetViolation
+    ? { eligible: false, reason: 'component-subset-not-allowed' }
+    : { eligible: false, reason: 'package-not-finalized' };
+  return {
+    componentIds: selection.componentIds,
+    selectedUnattributedEntryIds: selection.unattributedEntryIds,
+    members,
+    eligibility,
+  };
+}
+
+/**
+ * Assemble a finalization-backed `CommitCandidate` (contract §4/§4.1/§4.2). With no
+ * requested finalization this degrades to a `SelectionPreview`. Otherwise it enforces
+ * component atomicity, finalization coverage + manifest agreement, the prior-exact-
+ * commit closure, and per-member raw + clean-filtered verification, then derives the
+ * lens-independent `candidateId`.
+ */
+export function buildCandidate(
+  request: CandidateSelectionRequest,
+  context: CandidateBuildContext,
+): CommitCandidate | SelectionPreview {
+  if (request.finalizationIds.length === 0) {
+    return buildSelectionPreview(request, context);
+  }
+
+  const selection = resolveSelection(request, context);
+  const requestedIds = new Set(request.finalizationIds);
+  const requestedFinalizations = context.finalizations.filter((f) => requestedIds.has(f.id));
+  const activeRequested = requestedFinalizations.filter((f) => f.lifecycleStatus === 'active');
+  const byPath = coveringByPath(activeRequested);
+
+  const selectedPaths = new Set(selection.memberEntries.map((entry) => entry.path.pathBytesBase64));
+
+  const verifications = selection.memberEntries.map((entry) =>
+    verifyMember(entry, byPath.get(entry.path.pathBytesBase64) ?? [], context),
+  );
+  const members = verifications.map((v) => v.member)
+    .sort((left, right) => compareBase64(left.path.pathBytesBase64, right.path.pathBytesBase64));
+
+  // Coverage set actually included: every active requested finalization that covers
+  // at least one selected member. A requested finalization covering NO selected
+  // member is extraneous (contract §4).
+  const usedFinalizationIds = new Set(verifications.flatMap((v) => v.usedFinalizationIds));
+  const extraneous = activeRequested.some((f) => !usedFinalizationIds.has(f.id));
+  const includedFinalizations = activeRequested
+    .filter((f) => usedFinalizationIds.has(f.id))
+    .sort((left, right) => compareBase64(left.id, right.id));
+  const finalizationRefs: FinalizationRef[] = includedFinalizations.map((f) => ({
+    finalizationId: f.id,
+    packageId: f.packageId,
+    packageRevision: f.packageRevision,
+    boundaryStatus: f.boundaryStatus,
+  }));
+
+  // Prior-exact-commit closure: every frozen manifest member of a USED finalization
+  // that is NOT selected here must be exactly locally committed already, else the
+  // package is not (yet) finalization-closed and the candidate is ineligible while
+  // the finalization stays active.
+  let closureUnproven = false;
+  for (const finalization of includedFinalizations) {
+    for (const frozen of parseFrozenManifest(finalization)) {
+      if (selectedPaths.has(frozen.pathBytesBase64)) continue;
+      if (!ledgerProves(frozen, context.ledger)) closureUnproven = true;
+    }
+  }
+
+  const eligibility = evaluateEligibility({
+    subsetViolation: selection.subsetViolation,
+    extraneous,
+    hasUnmerged: context.indexFingerprint.hasUnmerged,
+    verifications,
+    closureUnproven,
+  });
+
+  const identityDoc = {
+    contractVersion: context.contractVersion,
+    repositoryKey: context.repository.repositoryKey,
+    gitObjectFormat: context.repository.gitObjectFormat,
+    pinnedHeadOid: context.pinnedHeadOid,
+    indexFingerprint: context.indexFingerprint.fingerprint,
+    finalizations: finalizationRefs
+      .map((ref) => ({
+        finalizationId: ref.finalizationId,
+        packageId: ref.packageId,
+        packageRevision: ref.packageRevision,
+      }))
+      .sort((left, right) => compareBase64(left.finalizationId, right.finalizationId)),
+    members: members.map((member) => ({
+      pathBytesBase64: member.path.pathBytesBase64,
+      rawWorktreeBlobOid: member.rawWorktreeBlobOid,
+      expectedCommitBlobOid: member.expectedCommitBlobOid,
+      expectedCommitMode: member.expectedCommitMode,
+      expectedWorktreeState: member.expectedWorktreeState,
+      coveringFinalizationIds: member.coveringFinalizationIds,
+    })),
+    componentTopologyDigest: unionTopologyDigest(
+      context,
+      selection.componentIds,
+      selection.memberEntries.filter((entry) => selection.unattributedEntryIds.includes(entry.entryId)),
+    ),
+  };
+  const candidateId = sha256Hex(canonicalize(identityDoc));
+
+  return {
+    candidateId,
+    contractVersion: context.contractVersion,
+    repository: context.repository,
+    componentIds: selection.componentIds,
+    selectedUnattributedEntryIds: selection.unattributedEntryIds,
+    members,
+    finalizations: finalizationRefs,
+    eligibility,
+    token: null,
+  };
+}
+
+interface EligibilityInputs {
+  subsetViolation: boolean;
+  extraneous: boolean;
+  hasUnmerged: boolean;
+  verifications: readonly MemberVerification[];
+  closureUnproven: boolean;
+}
+
+/** Collapse the per-member verification states + structural checks into a single
+ *  eligibility verdict, most-structural reason first (deterministic precedence). */
+function evaluateEligibility(inputs: EligibilityInputs): CommitEligibility {
+  if (inputs.subsetViolation) return { eligible: false, reason: 'component-subset-not-allowed' };
+  if (inputs.extraneous) return { eligible: false, reason: 'extraneous-finalization' };
+
+  const states = inputs.verifications.map((v) => v.member.packageVerification);
+  if (inputs.hasUnmerged || states.includes('unsupported-entry')) {
+    return { eligible: false, reason: 'unsupported-git-state' };
+  }
+  if (inputs.verifications.some((v) => v.conflict)) {
+    return { eligible: false, reason: 'finalization-conflict' };
+  }
+  if (states.includes('package-not-finalized') || inputs.closureUnproven) {
+    return { eligible: false, reason: 'package-not-finalized' };
+  }
+  if (states.includes('final-checkpoint-unavailable')) {
+    return { eligible: false, reason: 'checkpoint-unavailable' };
+  }
+  if (states.includes('verified-mismatch')) {
+    return { eligible: false, reason: 'byte-mismatch' };
+  }
+  return { eligible: true };
 }
 
 // Kept structural and read-only for consumers that prefer a facade interface.
