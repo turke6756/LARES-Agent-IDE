@@ -4348,6 +4348,81 @@ export interface PlanningReaderReadResult {
   sizeBytes: number;
 }
 
+// ── WP-P2C — unified gallery projection ───────────────────────────────────────
+// A single server projection that unions three durable row kinds for the Plans
+// gallery: filesystem-owned proposals, folder-per-plan `structured` plans, and
+// legacy `format='html'` plans (labeled "Legacy Plan"). `format='md'` rows are
+// preserved historical records and are NEVER projected here.
+
+export type PlanGalleryRowType = 'proposal' | 'structured' | 'legacy';
+
+/** Witnessed-first author attribution. Proposals carry their witnessed author
+ *  (or `unknown`); structured-folder rows are ALWAYS `unknown` here unless
+ *  authorship was separately witnessed — responsibility is never relabeled as
+ *  authorship. Legacy rows carry no author. */
+export interface PlanGalleryAuthor {
+  role: 'supervisor' | 'worker' | 'unknown';
+  display: string | null;
+}
+
+/** Responsible-supervisor / OWNER chip for a structured folder row, sourced from
+ *  the plan folder's `plan.json` responsibility history (last `assigned` event).
+ *  This is an ownership signal, explicitly NOT an author attribution. */
+export interface PlanGalleryOwner {
+  display: string | null;
+  agentId: string | null;
+  /** Provenance of the last assignment ('manual-skill' | 'promotion-service' | …). */
+  source: string | null;
+}
+
+export interface PlanGalleryRow {
+  /** Underlying source-row id (proposal id or plan id). */
+  id: string;
+  type: PlanGalleryRowType;
+  /** Type badge label — 'Proposal' | 'Plan' | 'Legacy Plan'. */
+  typeLabel: string;
+  title: string;
+  /** State chip: proposal|promoted|archived for proposals; the plan's run_state
+   *  (nullable) for structured/legacy rows. */
+  state: string | null;
+  /** YYYY-MM-DD grouping bucket derived from the row's creation timestamp. */
+  dateGroup: string;
+  createdAt: string | number;
+  updatedAt: string | number;
+  mtimeMs: number | null;
+  sizeBytes: number | null;
+  /** Workspace-relative plan-folder path (structured rows only; else null). */
+  folderRelPath: string | null;
+  /** True iff this is a structured row backed by a plan folder on disk. */
+  hasFolder: boolean;
+  author: PlanGalleryAuthor;
+  /** Owner chip (structured folder rows only; null for proposals/legacy). */
+  owner: PlanGalleryOwner | null;
+}
+
+export interface PlanGalleryResult {
+  rows: PlanGalleryRow[];
+  /** Projection-level diagnostics (unreadable plan.json, resolution failures…). */
+  warnings: string[];
+}
+
+/** Options for the gallery projection. By default the projection HIDES proposals
+ *  in the `archived` and `promoted` states (still counted, never shown). */
+export interface PlanGalleryOptions {
+  includeArchived?: boolean;
+  includePromoted?: boolean;
+}
+
+/** Result of `proposal:read` — one proposal's markdown, containment-validated and
+ *  byte-capped. `{ error }` for an unknown id or a path that fails re-validation. */
+export interface ProposalReadResult {
+  id: string;
+  name: string;
+  content: string;
+  truncated: boolean;
+  sizeBytes: number;
+}
+
 declare global {
   interface Window {
     api: IpcApi;

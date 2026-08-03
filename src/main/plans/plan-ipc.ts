@@ -15,6 +15,8 @@ import { getPlans } from '../database';
 import { resolvePlanProjection, buildPlanActivityProjection } from '../api-server';
 import { derivePlanSnippet } from './plan-snippet';
 import { listPlanningEntries, readPlanningDocument } from './planning-reader';
+import { buildPlanGallery, readProposalDocument } from './plan-gallery';
+import type { PlanGalleryOptions } from '../../shared/types';
 
 export function registerPlanIpc(manager: PlanPaneManager): void {
   // ── WP-P1A: planning-reader (read-only fs enumeration + safe read) ──────────
@@ -41,6 +43,27 @@ export function registerPlanIpc(manager: PlanPaneManager): void {
       return readPlanningDocument(docId, { pathType });
     },
   );
+
+  // ── WP-P2C: unified gallery projection + safe proposal read ─────────────────
+  // `plan-gallery:list` unions proposals + structured (folder-per-plan) + legacy
+  // HTML rows (md excluded) for the new Plans gallery; `proposal:read` fetches one
+  // proposal's markdown by its proposals-row id with read-time containment +
+  // byte-cap re-validation. Pure reads: no DB mutation, no demand-probe here.
+  ipcMain.handle(
+    'plan-gallery:list',
+    (_e, workspaceId: string, opts?: PlanGalleryOptions) => {
+      if (typeof workspaceId !== 'string' || !workspaceId) {
+        return { rows: [], warnings: ['no workspace id'] };
+      }
+      return buildPlanGallery(workspaceId, opts ?? {});
+    },
+  );
+  ipcMain.handle('proposal:read', (_e, proposalId: string) => {
+    if (typeof proposalId !== 'string' || !proposalId) {
+      return { error: 'missing proposal id' };
+    }
+    return readProposalDocument(proposalId);
+  });
 
   // Plan list for the "Plans" card gallery (workspace-scoped). Each row carries a
   // cheap description snippet derived from its already-served projection (or an
