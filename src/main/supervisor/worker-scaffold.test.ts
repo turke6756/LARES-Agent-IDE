@@ -24,6 +24,7 @@ import {
   RESEARCHER_CLAUDE_SETTINGS_JSON,
   WORKER_GROK_AGENTS_MD,
   WORKER_AGY_AGENTS_MD,
+  PROPOSAL_TO_PLAN_SKILL_MD,
 } from '../../shared/constants';
 import {
   AGY_STATUS_HOOK_COMMAND,
@@ -136,11 +137,14 @@ test('Codex: scaffold writes AGENTS.md standing instructions + NO behavioral.md 
       agents.includes('## Never use git to discard uncommitted work'),
       'codex AGENTS.md must carry the git-discard section',
     );
-    // Turn-ending protocol + shared-cwd + plan-event sentinel all present.
+    // Turn-ending protocol + shared-cwd present.
     assert.ok(agents.includes('end your turn with the question in plain text'), 'turn-ending protocol present');
     assert.ok(agents.includes('.lares/workers/codex/'), 'cwd references point at the codex lane');
     assert.ok(!agents.includes('.lares/workers/claude/'), 'no leftover claude cwd references');
-    assert.ok(agents.includes('PLAN-EVENT'), 'plan-event sentinel section present');
+    // WP-P0C: the retired every-turn PLAN-EVENT ceremony is gone; the worker
+    // planning-surface section (proposal-to-plan orientation) is present instead.
+    assert.ok(!agents.includes('PLAN-EVENT'), 'retired every-turn PLAN-EVENT ceremony must be dropped (WP-P0C)');
+    assert.ok(agents.includes('proposal-to-plan'), 'codex AGENTS.md must carry the proposal-to-plan planning-surface section');
     assert.ok(!agents.includes('AskUserQuestion'), 'Claude-Code-specific tool name removed');
     // v2 (WP-G): the memory-lessons section points at the injected supervisor memory
     // + recall_memory + remember, NOT a seeded behavioral.md.
@@ -773,6 +777,58 @@ test('Grok identity: git-discard section survived byte-identical; blocking-dialo
   assert.ok(!WORKER_GROK_AGENTS_MD.includes('AskUserQuestion'), 'grok body must not name the Claude-specific AskUserQuestion tool');
   assert.ok(!WORKER_GROK_AGENTS_MD.includes('plan-mode approval prompts'), 'grok body must not name Claude plan-mode prompts');
   assert.ok(WORKER_GROK_AGENTS_MD.includes('end your turn with the question in plain text'), 'intent: end the turn in plain text preserved');
+});
+
+// ── WP-P0C: proposal-to-plan skill tree on the worker lanes ──────────
+
+const P2P_REL_FILES = [
+  'SKILL.md',
+  'references/activities/capture.md',
+  'references/activities/scope.md',
+  'references/activities/promote.md',
+  'references/activities/deliberate.md',
+  'references/activities/integrate.md',
+  'references/activities/package.md',
+  'references/activities/orient.md',
+  'references/contracts/arc.md',
+  'references/contracts/folder-schema.md',
+  'references/contracts/intent-lifecycle.md',
+  'references/contracts/manifest-lock.md',
+  'scripts/plan-manifest.mjs',
+];
+
+test('WP-P0C: fresh Claude worker scaffold writes the whole proposal-to-plan tree under .claude/skills', () => {
+  const workDir = mktmp('p2p-worker-claude');
+  const { supervisor, cleanup } = makeSupervisor();
+  try {
+    supervisor.ensureWorkerScaffold(workDir, 'claude', 'windows');
+    const root = path.join(workDir, '.lares', 'workers', 'claude', '.claude', 'skills', 'proposal-to-plan');
+    for (const rel of P2P_REL_FILES) {
+      assert.ok(fs.existsSync(path.join(root, ...rel.split('/'))), `claude worker root missing ${rel}`);
+    }
+    assert.equal(fs.readFileSync(path.join(root, 'SKILL.md'), 'utf-8'), PROPOSAL_TO_PLAN_SKILL_MD,
+      'SKILL.md must be the exact bundled content');
+  } finally {
+    cleanup();
+    rmrf(workDir);
+  }
+});
+
+test('WP-P0C: fresh Codex worker scaffold writes the whole proposal-to-plan tree under .agents/skills', () => {
+  const workDir = mktmp('p2p-worker-codex');
+  const { supervisor, cleanup } = makeSupervisor();
+  try {
+    supervisor.ensureWorkerScaffold(workDir, 'codex', 'windows');
+    const root = path.join(workDir, '.lares', 'workers', 'codex', '.agents', 'skills', 'proposal-to-plan');
+    for (const rel of P2P_REL_FILES) {
+      assert.ok(fs.existsSync(path.join(root, ...rel.split('/'))), `codex worker root missing ${rel}`);
+    }
+    assert.equal(fs.readFileSync(path.join(root, 'SKILL.md'), 'utf-8'), PROPOSAL_TO_PLAN_SKILL_MD,
+      'SKILL.md must be the exact bundled content in the codex root');
+  } finally {
+    cleanup();
+    rmrf(workDir);
+  }
 });
 
 // ── Runner ───────────────────────────────────────────────────────────

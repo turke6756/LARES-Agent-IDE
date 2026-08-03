@@ -42,6 +42,19 @@ import {
   MAX_TERMINAL_REPLAY_BYTES,
   FILE_ACTIVITY_RETENTION_SESSIONS,
   LARES_DIR_NAME, LEGACY_LARES_DIR_NAME,
+  PROPOSAL_TO_PLAN_SKILL_MD,
+  PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD,
+  PROPOSAL_TO_PLAN_ACTIVITY_SCOPE_MD,
+  PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD,
+  PROPOSAL_TO_PLAN_ACTIVITY_DELIBERATE_MD,
+  PROPOSAL_TO_PLAN_ACTIVITY_INTEGRATE_MD,
+  PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD,
+  PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD,
+  PROPOSAL_TO_PLAN_CONTRACT_ARC_MD,
+  PROPOSAL_TO_PLAN_CONTRACT_FOLDER_SCHEMA_MD,
+  PROPOSAL_TO_PLAN_CONTRACT_INTENT_LIFECYCLE_MD,
+  PROPOSAL_TO_PLAN_CONTRACT_MANIFEST_LOCK_MD,
+  PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS,
 } from '../../shared/constants';
 import { ensureAgyStatusHook } from './agy-hooks';
 import { ensureAgyPermissions, ensureAgyTrust } from './agy-settings';
@@ -1051,6 +1064,14 @@ export const SUPERVISOR_AGENT_MD_V18_HASH = 'd137657a7cbf0bda5fac32469b98eff1713
  *  v19 workspace upgrades silently instead of being backed up. */
 export const SUPERVISOR_AGENT_MD_V19_HASH = 'bb0c5b846bde9e4f857503ccd7c67087bc987f0379ac5c2eb22e3ffe2d57bb81';
 
+/** SHA-256 hex of the v20 `.lares/supervisor/CLAUDE.md` — the body BEFORE the
+ *  v21 WP-P0C edit (inserts the "Where planning artifacts live" section: proposals
+ *  in .lares/proposals/, plan folders under <workspaceStateDir()>/plans/, the
+ *  proposal-to-plan skill, ARC.md ownership + orient-first). Frozen as
+ *  SUPERVISOR_AGENT_MD_V20 in constants.ts; the live v21 body derives from it.
+ *  previousHashes[20] for silent v20 → v21 upgrade of pristine workspaces. */
+export const SUPERVISOR_AGENT_MD_V20_HASH = 'd9191bb1f403d1ac659a57f5c3068c4713ed5081c53c015a58ac4b31369bce9f';
+
 /** SHA-256 hex of the v6 `.dashboard/workers/claude/CLAUDE.md` (pre-`.lares`
  *  rename). Used in the v7 file's previousHashes. */
 export const WORKER_CLAUDE_MD_V6_HASH = '7d4af7db5264f03283a3de6a78eb5df93ce61b960193b2aa9936012e2c00e55d';
@@ -1074,12 +1095,56 @@ export const WORKER_CLAUDE_MD_V7_HASH = 'af1dc56c79a785498f85284d04afdaef6c54fa8
  *  workspace upgrades silently instead of being backed up. */
 export const WORKER_CLAUDE_MD_V8_HASH = '05bb90b3427f7ca62d18be164f9fc7cfb5c3318b1837246ae29e9848121877e7';
 
+/** SHA-256 hex of the v9 `.lares/workers/claude/CLAUDE.md` — the body BEFORE the
+ *  v10 WP-P0C edit (replaces the retired every-turn PLAN-EVENT ceremony section
+ *  with the worker planning-surface section; WP-P0B removed the runtime contract
+ *  that consumed the sentinel). Frozen as WORKER_CLAUDE_MD_V9 in constants.ts; the
+ *  live v10 body derives from it. previousHashes[9] for silent v9 → v10 upgrade. */
+export const WORKER_CLAUDE_MD_V9_HASH = '283c36d2fa384415c3e5f61aacfa4f40a1d3776cd2d3c045900a208de8ec8a1b';
+
 /** SHA-256 hex of the v1 `.lares/workers/codex/AGENTS.md` — the Codex derivation
  *  of the FROZEN worker v8 body (WORKER_CODEX_AGENTS_MD_V1). v2 is the live
  *  WORKER_CODEX_AGENTS_MD (derived from the v9 worker body). Used in the codex
  *  AGENTS.md scaffold entry's previousHashes[1] so a pristine v1 workspace upgrades
  *  silently. */
 export const WORKER_CODEX_AGENTS_MD_V1_HASH = '430a331f1cfe54931583aac02036350a206377e53d8e19f785ab224bf31dbfd8';
+
+/** SHA-256 hex of the v2 `.lares/workers/codex/AGENTS.md` — the Codex derivation of
+ *  the FROZEN worker v9 (WORKER_CODEX_AGENTS_MD_V2), i.e. the body BEFORE the worker
+ *  v9 → v10 ceremony-drop. previousHashes[2] for the codex AGENTS.md v2 → v3 bump. */
+export const WORKER_CODEX_AGENTS_MD_V2_HASH = '60a6b1bc6df13a8025b9a0ef12ea1ab9d6db4583c90ccbf7ac473546dd62856c';
+
+// WP-P0C — proposal-to-plan skill tree deploy. One versioned content constant per
+// file (constants.ts); this manifest expands the tree under each of the four skill
+// roots (Claude+Codex x supervisor+worker). New-skill shape (version 1, no
+// previousHashes): nothing by these names was ever scaffolded, so an unmanaged file
+// already present is treated as user-authored and .bak'd, never silently clobbered.
+const PROPOSAL_TO_PLAN_TREE: Array<{ rel: string; content: string; executable?: boolean }> = [
+  { rel: 'SKILL.md', content: PROPOSAL_TO_PLAN_SKILL_MD },
+  { rel: 'references/activities/capture.md', content: PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD },
+  { rel: 'references/activities/scope.md', content: PROPOSAL_TO_PLAN_ACTIVITY_SCOPE_MD },
+  { rel: 'references/activities/promote.md', content: PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD },
+  { rel: 'references/activities/deliberate.md', content: PROPOSAL_TO_PLAN_ACTIVITY_DELIBERATE_MD },
+  { rel: 'references/activities/integrate.md', content: PROPOSAL_TO_PLAN_ACTIVITY_INTEGRATE_MD },
+  { rel: 'references/activities/package.md', content: PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD },
+  { rel: 'references/activities/orient.md', content: PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD },
+  { rel: 'references/contracts/arc.md', content: PROPOSAL_TO_PLAN_CONTRACT_ARC_MD },
+  { rel: 'references/contracts/folder-schema.md', content: PROPOSAL_TO_PLAN_CONTRACT_FOLDER_SCHEMA_MD },
+  { rel: 'references/contracts/intent-lifecycle.md', content: PROPOSAL_TO_PLAN_CONTRACT_INTENT_LIFECYCLE_MD },
+  { rel: 'references/contracts/manifest-lock.md', content: PROPOSAL_TO_PLAN_CONTRACT_MANIFEST_LOCK_MD },
+  { rel: 'scripts/plan-manifest.mjs', content: PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS, executable: true },
+];
+/** Expand the proposal-to-plan tree under a skill-root prefix into scaffold
+ *  entries. Called for all four roots (Claude+Codex supervisor + worker). */
+export function proposalToPlanEntries(rootPrefix: string): Record<string, ScaffoldFile> {
+  const out: Record<string, ScaffoldFile> = {};
+  for (const f of PROPOSAL_TO_PLAN_TREE) {
+    out[`${rootPrefix}/${f.rel}`] = f.executable
+      ? { content: f.content, version: 1, executable: true }
+      : { content: f.content, version: 1 };
+  }
+  return out;
+}
 
 /** SHA-256 hex of the v5 `.dashboard/researcher/CLAUDE.md` (pre-`.lares`
  *  rename). Used in the v6 file's previousHashes. */
@@ -2929,10 +2994,11 @@ export class AgentSupervisor extends EventEmitter {
    *  Versioning per plans/scaffold-version-migration.md — bumping a file's
    *  `version` triggers managed-upgrade-on-launch in old workspaces. */
   private static SUPERVISOR_FILES: Record<string, ScaffoldFile> = {
+    ...proposalToPlanEntries('.lares/supervisor/.claude/skills/proposal-to-plan'),
     [`.lares/supervisor/CLAUDE.md`]:                                              {
       content: SUPERVISOR_AGENT_MD,
-      version: 20, // v20 (memory-lessons v2, WP-G) rewrites the `## Memory` section to injection-aware text (the index is injected at launch for supervisors, not an instructed session-start read), adds the D2 cold-resume re-orientation preamble, a validate-after-edit pointer, and the discoverability paragraph (memories/lessons serve EVERY supervisor/worker, not just the author; `remember` to save, `recall_memory` to fetch); and replaces the D10 `see behavioral.md B-11/B-12` phantom with self-contained triage guidance. Previously: v19 (turn-history) adds the <!-- section:turn-history v1 --> block documenting the checkpoint toolset (list_checkpoints/diff_turn/restore_paths/revert_turn/prune_checkpoints/read_agent_files_touched), the three-layer evidence model, capture-health ambiguity, forward-only paging, and immediate/destructive mutation in a shared tree; points at the checkpoint-forensics skill. Previously: v18 (cross-workspace-collaboration WP6) extends the `launch_agent` tool bullet with the `supervisor-peer` launch mode (top-level peer, cross-workspace-only, supervisor-gated) and adds a `revive_agent` bullet (supervisor-only relaunch of a done/crashed session; providers claude+codex). Previously: v17 (WP1.3) widens the `list_agents` tool bullet to document that a foreign `workspace_id` is supervisor-only, and adds a `list_workspaces` bullet (cross-workspace discovery). Previously: v16 (Lares rebrand) renames every `.dashboard/…` state-folder reference to `.lares/…` (working-directory note, researcher inbox pointers, research-store section). Previously: v15 (continuation-request awareness) adds the `save_continuation_brick` tool bullet and the `<!-- section:continuation-request v1 -->` block: answer a dashboard continuation request THAT TURN, write per-agent state + pointers rather than prose, respect the stated byte cap, finish the current response normally (the dashboard waits for turn completion before swapping), and start no new work. Previously: v14 (MCP context-overhead cut) removes the resident documentation for two deleted MCP tools: the `get_context_stats` bullet is gone (the `list_agents` bullet now states the per-agent context reading is returned inline, so the capability is preserved), and `## Multi-agent orchestration` no longer says "Discover with `list_orchestrations`".
-      previousHashes: { 1: SUPERVISOR_AGENT_MD_V1_HASH, 2: SUPERVISOR_AGENT_MD_V2_HASH, 3: SUPERVISOR_AGENT_MD_V3_HASH, 4: SUPERVISOR_AGENT_MD_V4_HASH, 5: SUPERVISOR_AGENT_MD_V5_HASH, 6: SUPERVISOR_AGENT_MD_V6_HASH, 7: SUPERVISOR_AGENT_MD_V7_HASH, 8: SUPERVISOR_AGENT_MD_V8_HASH, 9: SUPERVISOR_AGENT_MD_V9_HASH, 10: SUPERVISOR_AGENT_MD_V10_HASH, 11: SUPERVISOR_AGENT_MD_V11_HASH, 12: SUPERVISOR_AGENT_MD_V12_HASH, 13: SUPERVISOR_AGENT_MD_V13_HASH, 14: SUPERVISOR_AGENT_MD_V14_HASH, 15: SUPERVISOR_AGENT_MD_V15_HASH, 16: SUPERVISOR_AGENT_MD_V16_HASH, 17: SUPERVISOR_AGENT_MD_V17_HASH, 18: SUPERVISOR_AGENT_MD_V18_HASH, 19: SUPERVISOR_AGENT_MD_V19_HASH },
+      version: 21, // v21 (WP-P0C planning-surface) inserts the "Where planning artifacts live" section: proposals in .lares/proposals/, plan folders under <workspaceStateDir()>/plans/, the proposal-to-plan create/resume path, ARC.md owned by the responsible supervisor (created at promote, refreshed on orient/integrate), and the orient-first rule. Previously: v20 (memory-lessons v2, WP-G) rewrites the `## Memory` section to injection-aware text (the index is injected at launch for supervisors, not an instructed session-start read), adds the D2 cold-resume re-orientation preamble, a validate-after-edit pointer, and the discoverability paragraph (memories/lessons serve EVERY supervisor/worker, not just the author; `remember` to save, `recall_memory` to fetch); and replaces the D10 `see behavioral.md B-11/B-12` phantom with self-contained triage guidance. Previously: v19 (turn-history) adds the <!-- section:turn-history v1 --> block documenting the checkpoint toolset (list_checkpoints/diff_turn/restore_paths/revert_turn/prune_checkpoints/read_agent_files_touched), the three-layer evidence model, capture-health ambiguity, forward-only paging, and immediate/destructive mutation in a shared tree; points at the checkpoint-forensics skill. Previously: v18 (cross-workspace-collaboration WP6) extends the `launch_agent` tool bullet with the `supervisor-peer` launch mode (top-level peer, cross-workspace-only, supervisor-gated) and adds a `revive_agent` bullet (supervisor-only relaunch of a done/crashed session; providers claude+codex). Previously: v17 (WP1.3) widens the `list_agents` tool bullet to document that a foreign `workspace_id` is supervisor-only, and adds a `list_workspaces` bullet (cross-workspace discovery). Previously: v16 (Lares rebrand) renames every `.dashboard/…` state-folder reference to `.lares/…` (working-directory note, researcher inbox pointers, research-store section). Previously: v15 (continuation-request awareness) adds the `save_continuation_brick` tool bullet and the `<!-- section:continuation-request v1 -->` block: answer a dashboard continuation request THAT TURN, write per-agent state + pointers rather than prose, respect the stated byte cap, finish the current response normally (the dashboard waits for turn completion before swapping), and start no new work. Previously: v14 (MCP context-overhead cut) removes the resident documentation for two deleted MCP tools: the `get_context_stats` bullet is gone (the `list_agents` bullet now states the per-agent context reading is returned inline, so the capability is preserved), and `## Multi-agent orchestration` no longer says "Discover with `list_orchestrations`".
+      previousHashes: { 1: SUPERVISOR_AGENT_MD_V1_HASH, 2: SUPERVISOR_AGENT_MD_V2_HASH, 3: SUPERVISOR_AGENT_MD_V3_HASH, 4: SUPERVISOR_AGENT_MD_V4_HASH, 5: SUPERVISOR_AGENT_MD_V5_HASH, 6: SUPERVISOR_AGENT_MD_V6_HASH, 7: SUPERVISOR_AGENT_MD_V7_HASH, 8: SUPERVISOR_AGENT_MD_V8_HASH, 9: SUPERVISOR_AGENT_MD_V9_HASH, 10: SUPERVISOR_AGENT_MD_V10_HASH, 11: SUPERVISOR_AGENT_MD_V11_HASH, 12: SUPERVISOR_AGENT_MD_V12_HASH, 13: SUPERVISOR_AGENT_MD_V13_HASH, 14: SUPERVISOR_AGENT_MD_V14_HASH, 15: SUPERVISOR_AGENT_MD_V15_HASH, 16: SUPERVISOR_AGENT_MD_V16_HASH, 17: SUPERVISOR_AGENT_MD_V17_HASH, 18: SUPERVISOR_AGENT_MD_V18_HASH, 19: SUPERVISOR_AGENT_MD_V19_HASH, 20: SUPERVISOR_AGENT_MD_V20_HASH },
     },
     [`.lares/supervisor/.claude/settings.json`]:                                  {
       content: SUPERVISOR_CLAUDE_SETTINGS_JSON,
@@ -3012,6 +3078,7 @@ export class AgentSupervisor extends EventEmitter {
    *  supervisor (Claude reads only `.claude/skills/`), so an always-present copy
    *  is harmless. New-skill shape ({ version: 1 }, no previousHashes). */
   private static SUPERVISOR_FILES_CODEX: Record<string, ScaffoldFile> = {
+    ...proposalToPlanEntries('.lares/supervisor/.agents/skills/proposal-to-plan'),
     [`.lares/supervisor/.agents/skills/remember/SKILL.md`]: { content: REMEMBER_SKILL, version: 1 },
   };
 
@@ -3088,10 +3155,11 @@ export class AgentSupervisor extends EventEmitter {
    *  v6 adds the Notification hook (Notification → waiting) so a worker that
    *  blocks on input flips to `waiting` (plans/hook-driven-waiting-status.md §4). */
   private static WORKER_FILES_CLAUDE: Record<string, ScaffoldFile> = {
+    ...proposalToPlanEntries('.lares/workers/claude/.claude/skills/proposal-to-plan'),
     [`.lares/workers/claude/CLAUDE.md`]:                       {
       content: WORKER_CLAUDE_MD,
-      version: 9, // v9 (memory-lessons v2, WP-G) retires the shared `behavioral.md` read/append instruction: the `## Memory: shared behavioral notes only` section becomes `## Memory & lessons` with the injection-aware resident pointer (memory injected at launch for supervisors; a worker fetches via the `recall_memory` tool or a raw read of `.lares/supervisor/memory/`), the cross-workspace discoverability line, and the `remember`-skill pointer. Previously: v2 adds the memory section; v3 (WP-G) adds the research-store pointer; v4 adds the online-research division of labor; v5 (planning-surface WP2) adds the plan-event sentinel section; v6 (GT-C D2) makes the PLAN-EVENT sentinel mandatory on every rail turn + expands the status vocab; v7 (Lares rebrand) renames `.dashboard/…` → `.lares/…`; v8 adds the "Never use git to discard uncommitted work" section (pairs with the PreToolUse guard-git-discard.mjs hook)
-      previousHashes: { 1: sha256Hex(WORKER_CLAUDE_MD_V1), 2: WORKER_CLAUDE_MD_V2_HASH, 3: WORKER_CLAUDE_MD_V3_HASH, 4: WORKER_CLAUDE_MD_V4_HASH, 5: WORKER_CLAUDE_MD_V5_HASH, 6: WORKER_CLAUDE_MD_V6_HASH, 7: WORKER_CLAUDE_MD_V7_HASH, 8: WORKER_CLAUDE_MD_V8_HASH },
+      version: 10, // v10 (WP-P0C planning-surface) replaces the retired every-turn PLAN-EVENT ceremony section with the worker planning-surface section (where proposals/plan folders live; a worker MAY author a proposal via capture; hardening + ARC.md stay the supervisor's job; the per-turn sentinel + read-before-edit obligations are gone — WP-P0B removed the runtime contract). Previously: v9 (memory-lessons v2, WP-G) retires the shared `behavioral.md` read/append instruction: the `## Memory: shared behavioral notes only` section becomes `## Memory & lessons` with the injection-aware resident pointer (memory injected at launch for supervisors; a worker fetches via the `recall_memory` tool or a raw read of `.lares/supervisor/memory/`), the cross-workspace discoverability line, and the `remember`-skill pointer. Previously: v2 adds the memory section; v3 (WP-G) adds the research-store pointer; v4 adds the online-research division of labor; v5 (planning-surface WP2) adds the plan-event sentinel section; v6 (GT-C D2) makes the PLAN-EVENT sentinel mandatory on every rail turn + expands the status vocab; v7 (Lares rebrand) renames `.dashboard/…` → `.lares/…`; v8 adds the "Never use git to discard uncommitted work" section (pairs with the PreToolUse guard-git-discard.mjs hook)
+      previousHashes: { 1: sha256Hex(WORKER_CLAUDE_MD_V1), 2: WORKER_CLAUDE_MD_V2_HASH, 3: WORKER_CLAUDE_MD_V3_HASH, 4: WORKER_CLAUDE_MD_V4_HASH, 5: WORKER_CLAUDE_MD_V5_HASH, 6: WORKER_CLAUDE_MD_V6_HASH, 7: WORKER_CLAUDE_MD_V7_HASH, 8: WORKER_CLAUDE_MD_V8_HASH, 9: WORKER_CLAUDE_MD_V9_HASH },
     },
     [`.lares/workers/claude/.claude/settings.json`]:           {
       content: WORKER_CLAUDE_SETTINGS_JSON,
@@ -3283,6 +3351,7 @@ export class AgentSupervisor extends EventEmitter {
         posixWorkspaceRoot,
       );
       const codexFiles: Record<string, ScaffoldFile> = {
+        ...proposalToPlanEntries('.lares/workers/codex/.agents/skills/proposal-to-plan'),
         [`.lares/workers/codex/.codex/config.toml`]: {
           content: codexConfig,
           version: 6,
@@ -3307,8 +3376,8 @@ export class AgentSupervisor extends EventEmitter {
         // worker body) so a pristine v1 workspace upgrades silently.
         [`.lares/workers/codex/AGENTS.md`]: {
           content: WORKER_CODEX_AGENTS_MD,
-          version: 2,
-          previousHashes: { 1: WORKER_CODEX_AGENTS_MD_V1_HASH },
+          version: 3, // v3 (WP-P0C): inherits worker v9->v10 (ceremony drop + planning-surface section)
+          previousHashes: { 1: WORKER_CODEX_AGENTS_MD_V1_HASH, 2: WORKER_CODEX_AGENTS_MD_V2_HASH },
         },
         // Memory & Lessons v2 (WP-F1): the `remember` skill for the Codex WORKER
         // skill root (WP-R proved `.agents/skills/` discovery + invocation from

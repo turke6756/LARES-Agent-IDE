@@ -684,9 +684,63 @@ const SUPERVISOR_AGENT_MD_V20_PHANTOM_OLD =
   '**Triage** before escalating to the user — see behavioral.md B-11/B-12. Bothering\nthe user is expensive; delegating research is cheap.';
 const SUPERVISOR_AGENT_MD_V20_PHANTOM_NEW =
   '**Triage** before escalating to the user: exhaust your own tools and the researcher lane first, and batch open questions into one clear ask rather than interrupting per item. Bothering the user is expensive; delegating research is cheap.';
-export const SUPERVISOR_AGENT_MD = SUPERVISOR_AGENT_MD_V19
+// ── WP-P0C (planning-surface P0): SUPERVISOR_AGENT_MD v20 → v21 ────────────
+//  Freeze-then-derive (D11): SUPERVISOR_AGENT_MD_V20 below is the byte-exact
+//  frozen v20 body (the former live derivation, renamed). The live v21 body
+//  inserts ONE additive "Where planning artifacts live" section (proposals as
+//  flat markdown in .lares/proposals/; plan folders under
+//  <workspaceStateDir()>/plans/ (§R0); the proposal-to-plan skill as the
+//  create/resume path; ARC.md owned by the responsible supervisor — created at
+//  promote, refreshed on orient/integrate; the orient-first rule) immediately
+//  BEFORE the continuation-request section. The anchor occurs EXACTLY ONCE
+//  (pinned by the migration D11 assertions). No other bytes change.
+export const SUPERVISOR_AGENT_MD_V20 = SUPERVISOR_AGENT_MD_V19
   .split(SUPERVISOR_AGENT_MD_V20_MEMORY_OLD).join(SUPERVISOR_AGENT_MD_V20_MEMORY_NEW)
   .split(SUPERVISOR_AGENT_MD_V20_PHANTOM_OLD).join(SUPERVISOR_AGENT_MD_V20_PHANTOM_NEW);
+const SUPERVISOR_AGENT_MD_V21_ANCHOR = '<!-- section:continuation-request v1 -->';
+const SUPERVISOR_AGENT_MD_V21_PLANNING_BLOCK = [
+  '<!-- section:planning-artifacts v1 -->',
+  '## Where planning artifacts live',
+  '',
+  'You never guess where planning artifacts go — the app tells you here:',
+  '',
+  '- **Proposals** are flat markdown files in `.lares/proposals/` (deliberation /',
+  '  detail docs go in `.lares/proposals/supporting/`). A bare proposal with a',
+  '  portable `artifact_id` frontmatter is a valid terminal artifact — no folder,',
+  '  no ceremony.',
+  '- **Plan folders** live under `<workspaceStateDir()>/plans/` (resolves to',
+  '  `.lares/plans/`, or the `.dashboard` fallback) — one folder per plan,',
+  '  `plan.json` + `plan.md` + `ARC.md` + `deliberations/` `research/`',
+  '  `supplements/` (§R0). This is **distinct** from the legacy workspace-root',
+  '  `plans/` directory of flat HTML/markdown plans.',
+  '- The **`proposal-to-plan` skill** is how you create or resume any of this:',
+  '  `capture` a proposal, `scope` (triage + mark) it, `promote` it into a plan',
+  '  folder, then `deliberate` / `integrate` / `package`, with `orient` as the',
+  '  re-entry read. You never guess these paths — this section and the skill are',
+  '  the source of truth.',
+  '',
+  '**`ARC.md` is YOUR job (ruling 29).** `ARC.md` is written and maintained by the',
+  "plan's responsible supervisor — not a worker's. Create it at `promote` (the",
+  "skill's scaffold seeds the skeleton) and refresh it on `orient` and `integrate`",
+  'from current disk/ledger evidence, updating `ARC-META`. It is a summary that',
+  '**cites** durable records (intent→orchestration links, turn stamps, commit',
+  'records) — a prose row is never a substitute for work-time stamping.',
+  '',
+  '**Orient-first (ruling 30).** If you are subscribed to a plan and picking it',
+  'up, `plan.json` + `ARC.md` + the intent markers are the FIRST place you look,',
+  'before doing anything new. Run the skill\'s `orient` mode: it derives every',
+  "intent's rung from disk (`marked → ran → returned → folded-in`; `ran` is",
+  'unavailable until the ledger ships and is reported as such, never faked),',
+  'reports safe next actions, and refreshes `ARC.md`. A plan is owned by one',
+  'supervisor (the last `assigned` event in `plan.json`); a different supervisor',
+  'must append a new `assigned` event before mutating — read-only `orient` is',
+  'always allowed.',
+  '<!-- /section:planning-artifacts -->',
+  '',
+].join('\n');
+export const SUPERVISOR_AGENT_MD = SUPERVISOR_AGENT_MD_V20
+  .split(SUPERVISOR_AGENT_MD_V21_ANCHOR)
+  .join(SUPERVISOR_AGENT_MD_V21_PLANNING_BLOCK + SUPERVISOR_AGENT_MD_V21_ANCHOR);
 
 export const SUPERVISOR_MEMORY_MD = `# Supervisor Memory
 
@@ -1196,9 +1250,102 @@ const WORKER_CLAUDE_MD_V9_BODY_NEW = [
   'future agents shouldn\'t have to relearn, use the `remember` skill to save it —',
   'don\'t hand-write memory or lesson files.',
 ].join('\n');
-export const WORKER_CLAUDE_MD = WORKER_CLAUDE_MD_V8
+export const WORKER_CLAUDE_MD_V9 = WORKER_CLAUDE_MD_V8
   .split(WORKER_CLAUDE_MD_V9_HEADER_OLD).join(WORKER_CLAUDE_MD_V9_HEADER_NEW)
   .split(WORKER_CLAUDE_MD_V9_BODY_OLD).join(WORKER_CLAUDE_MD_V9_BODY_NEW);
+
+// ── WP-P0C (planning-surface P0): WORKER_CLAUDE_MD v9 → v10 ────────────────
+//  Freeze-then-derive (D11): WORKER_CLAUDE_MD_V9 above is the byte-exact frozen
+//  v9 body (the former live derivation, renamed). The live v10 body REPLACES the
+//  retired every-turn PLAN-EVENT ceremony section (WP-P0B removed the runtime
+//  contract that consumed it) with a worker-facing planning-surface section:
+//  where proposals/plan folders live, that a worker MAY author a proposal
+//  (capture) while hardening + ARC.md remain the supervisor's job, and that the
+//  per-turn sentinel + read-before-edit obligations are gone. CEREMONY_OLD is the
+//  exact frozen ceremony block sliced from the v8 source (present EXACTLY ONCE in
+//  v9 — the memory transforms do not touch it), pinned by the migration D11
+//  assertions. The three provider derivations (codex/grok/agy) inherit the new
+//  body; the new section contains none of their transform tokens, so it passes
+//  through byte-identical.
+const WORKER_CLAUDE_MD_V10_CEREMONY_OLD = `<!-- section:plan-event-sentinel v2 -->
+## Planning surface: editing a plan section
+
+If your launch bound you to a plan (you'll see \`AGENT_DASHBOARD_PLAN_ID\` /
+\`AGENT_DASHBOARD_PLAN_SECTION\` in your environment), the dashboard records a
+**trusted** provenance trail of what you actually touched — server-witnessed from
+your tool calls, not from anything you narrate. Two habits keep that trail clean:
+
+**1. Read the target section before you edit it.** Use the plan read tools
+(\`read_plan_section\`, \`list_plan_sections\`, \`read_plan_projection\`) and, when
+you're about to edit, request the section with \`mode:"raw+editWindow"\` — it
+returns the byte-exact fragment to replace plus edit-discipline instructions. A
+\`raw+editWindow\` read is a stronger edit-intent signal than a plain read. Then
+edit natively (\`Edit\` / \`MultiEdit\`) — replace only that exact fragment and
+**never** change a \`data-anchor\` value. Native edits are the only write path;
+there is no plan-write MCP tool.
+
+**2. End EVERY plan-rail turn with a \`PLAN-EVENT\` block.** Not just writes —
+review, deliberation, and no-op turns file a claim too, so the surface shows a
+continuous record of what you did. End your final message with the sentinel:
+
+\`\`\`
+<!--PLAN-EVENT
+{ "status": "integrated", "result": "…", "next": "…", "claimed_section_anchor": "sec_a1b2c3" }
+-->
+\`\`\`
+
+- \`status\` — one of
+  \`integrated | reviewed | deliberating | blocked | rejected | scope-changed | transition\`.
+  Use \`integrated\` when you wrote the section; \`reviewed\` / \`deliberating\` /
+  \`blocked\` for a turn that reviewed, discussed, or stalled without a write;
+  \`rejected\` / \`scope-changed\` / \`transition\` for the other outcomes.
+- \`result\` / \`next\` — short free text (what happened this turn; what's next).
+- \`claimed_section_anchor\` — **optional, self-report ONLY.** It is stored for a
+  claimed-vs-observed diagnostic comparison and is **never** used to attribute
+  your edit; the trusted anchor is always derived server-side from your actual
+  read/edit tool calls. Omit it if unsure — a wrong claim only shows as a
+  mismatch, it never changes what you're credited with.
+
+Parsing is fail-open: emit \`status\` + \`result\` even when unsure, and a missing
+or malformed sentinel never breaks your trusted trail — it just shows as "no
+self-report" for that turn.
+<!-- /section:plan-event-sentinel -->`;
+const WORKER_CLAUDE_MD_V10_PLANNING_NEW = [
+  '<!-- section:planning-surface v1 -->',
+  '## Planning surface: proposals and plan folders',
+  '',
+  'You never guess where planning artifacts go — the app tells you here:',
+  '',
+  '- **Proposals** are flat markdown files in `.lares/proposals/` (deliberation /',
+  '  detail docs go in `.lares/proposals/supporting/`). A bare proposal with a',
+  '  portable `artifact_id` frontmatter is a valid terminal artifact — no folder,',
+  '  no ceremony.',
+  '- **Plan folders** live under `<workspaceStateDir()>/plans/` (resolves to',
+  '  `.lares/plans/`, or the `.dashboard` fallback) — one folder per plan. This is',
+  '  distinct from the legacy workspace-root `plans/` directory of flat',
+  '  HTML/markdown plans.',
+  '- The **`proposal-to-plan` skill** is how these get created or resumed.',
+  '',
+  '**You may author a proposal yourself** — a flat markdown in `.lares/proposals/`',
+  'with portable `artifact_id` frontmatter and `author_role: worker`. That is the',
+  "skill's `capture` mode, open to your lane. Hardening a proposal into a plan",
+  'folder (`scope` / `promote` / `integrate` / `package`) and writing `ARC.md`',
+  'remain the **responsible supervisor**\'s job — surface a proposal worth',
+  'hardening in your turn-end summary and let the supervisor pick it up.',
+  '',
+  '**No per-turn planning sentinel; no read-before-edit obligation.** You do NOT',
+  'owe a per-turn planning sentinel at the end of every turn, and there is no',
+  'standing read-before-edit rule. The durable planning record is the plan',
+  'folder\'s',
+  'artifacts (`plan.json`, `plan.md` markup, `ARC.md`) — written by the',
+  'responsible supervisor and witnessed by the surface; you report nothing per',
+  'turn. If your launch still binds you to a specific plan section for a content',
+  'edit, follow the instructions in that launch — but the blanket every-turn',
+  'sentinel + read-before-edit obligations no longer apply.',
+  '<!-- /section:planning-surface -->',
+].join('\n');
+export const WORKER_CLAUDE_MD = WORKER_CLAUDE_MD_V9
+  .split(WORKER_CLAUDE_MD_V10_CEREMONY_OLD).join(WORKER_CLAUDE_MD_V10_PLANNING_NEW);
 
 /** Seed content for the shared worker behavioral memory, written write-if-absent
  *  to <workspace>/.lares/workers/claude/behavioral.md on first Claude worker
@@ -1337,6 +1484,18 @@ export const WORKER_AGY_AGENTS_MD = WORKER_CLAUDE_MD
  *  received the v1 AGENTS.md upgrades silently. Derived from the FROZEN v8 — never the
  *  live body — so it can't rot on the next worker bump (D11 derivation hazard). */
 export const WORKER_CODEX_AGENTS_MD_V1 = WORKER_CLAUDE_MD_V8
+  .split('.lares/workers/claude/').join('.lares/workers/codex/')
+  .split('`AskUserQuestion`,\nplan-mode approval prompts, `(y/n)` confirmations, ')
+  .join('an interactive approval prompt or `(y/n)` confirmation, ')
+  .split('`WORKER_CLAUDE_MD` constant').join('`WORKER_CODEX_AGENTS_MD` constant');
+
+/** WP-P0C: the frozen v2 Codex AGENTS.md — the byte-exact Codex derivation of the
+ *  FROZEN worker v9 (WORKER_CLAUDE_MD_V9), i.e. the live v2 body BEFORE the worker
+ *  v9 → v10 ceremony-drop. Derived from the FROZEN v9 (never the live body) so it
+ *  cannot rot on the worker v10 bump (D11). previousHashes[2] for the codex
+ *  AGENTS.md scaffold entry's v2 → v3 bump, so a pristine v2 workspace upgrades
+ *  silently. */
+export const WORKER_CODEX_AGENTS_MD_V2 = WORKER_CLAUDE_MD_V9
   .split('.lares/workers/claude/').join('.lares/workers/codex/')
   .split('`AskUserQuestion`,\nplan-mode approval prompts, `(y/n)` confirmations, ')
   .join('an interactive approval prompt or `(y/n)` confirmation, ')
@@ -5147,3 +5306,1150 @@ export const COMMIT_CANDIDATE_TOKEN_CAP_PER_REPOSITORY = 128;
 export const RETENTION_PIN_QUOTA_BYTES = 536_870_912; // 512 MiB logical pinned-byte budget
 export const RETENTION_PIN_MAX_EXTENSION_MS = 2_592_000_000; // 30 days
 export const SAVE_CARD_COMMIT_COORDINATOR_ENABLED = false; // stays false until the Stage-4 adversarial matrix passes
+
+// ══════════════════════════════════════════════════════════════════════════
+// WP-P0C — proposal-to-plan skill tree (scaffold content). One versioned
+// content constant per file; the supervisor lane manifests + codex worker map
+// register each under all four skill roots (Claude+Codex × supervisor+worker).
+// Bodies are the byte-exact committed drafts under
+// .lares/proposals/supporting/scaffold-drafts/proposal-to-plan/ (commit 928be3e);
+// do NOT edit the skill content here — fix it at the draft + re-derive.
+// ══════════════════════════════════════════════════════════════════════════
+export const PROPOSAL_TO_PLAN_SKILL_MD = `---
+name: proposal-to-plan
+description: >-
+  The house method for carrying a proposal to an implementation plan with
+  work packages — capture, scope (hardening triage + markup), promote (scaffold
+  the plan folder), deliberate, integrate, package, and orient. Use whenever you
+  author a proposal in .lares/proposals/, harden one into a plan folder under
+  <workspaceStateDir()>/plans/, or pick up an existing plan folder. One skill
+  root; the folder on disk is the resumable source of truth.
+---
+
+# proposal-to-plan — dispatcher
+
+This skill carries a proposal all the way to an implementation plan: **capture → scope(+mark) →
+promote → deliberate → integrate → package**, with **orient** as the re-entry read. The **plan
+folder on disk is the resumable source of truth**; the responsible supervisor plus this skill's
+policy drives the work; \`orient\` derives the *known* state and offers *safe* next actions. There is
+**one** skill root — no second root, no journey driver process, no new orchestration.
+
+## Pick a mode (seven public entries)
+
+| Mode | What it does | Playbook |
+|---|---|---|
+| \`capture\` | Write a stamped **flat** proposal in \`.lares/proposals/\`; zero ceremony. Terminal-valid. | \`references/activities/capture.md\` |
+| \`scope\` | **First hardening step:** triage what needs deliberation/research, **mark the flat proposal** (PLAN-INTENT), and record the required dated \`## Hardening scope\` verdict. **Owns marking.** | \`references/activities/scope.md\` |
+| \`promote\` | Atomic **complete-folder** scaffold (§R0) via temp-dir → rename, \`plan.md\` already inside. | \`references/activities/promote.md\` |
+| \`deliberate\` | Launch the **existing** groupthink/researcher lane keyed to **one** marked intent. | \`references/activities/deliberate.md\` |
+| \`integrate\` | Validate a returned output; **fold by Markdown-link + PLAN-INTEGRATION**; refresh \`ARC.md\`. | \`references/activities/integrate.md\` |
+| \`package\` | **Last step:** decompose into bundle-shaped WPs + create-or-verify the \`plan-baseline\` tag. | \`references/activities/package.md\` |
+| \`orient\` | **Re-entry read.** Derive every intent's rung from disk; report safe next actions. Owns the decision table. | \`references/activities/orient.md\` |
+
+There is **no standalone \`mark\` mode** — marking is owned inside \`scope\` (a separate mark would
+bypass hardening triage). The \`references/activities/*\` files are internal playbooks the dispatcher
+routes to; load only the one you need. Contracts live once under \`references/contracts/\`.
+
+## Lane rules (who may run what)
+
+- **\`orient\` — anyone.** It is **read-only**; it never mutates the plan, never launches, never
+  auto-relaunches. Judgment-bearing next actions it surfaces are **gated on the responsible
+  supervisor.** Orient-first is a standing rule: on picking up a plan folder, \`plan.json\` + \`ARC.md\`
+  + intent markers are the **FIRST** place you look.
+- **\`mark\` (inside \`scope\`) / \`integrate\` / \`package\` — the responsible supervisor ONLY.** The
+  current responsible supervisor = the **last \`assigned\` event** in \`plan.json\`. A non-supervisor
+  lane that reaches these is **rejected and instructed** to hand off.
+- **Reassignment precedes mutation.** A different supervisor must **append a new \`assigned\` event**
+  (via the helper, under the lock) **before** any mutation. Read-only \`orient\` is allowed without
+  reassignment; a mutation without a fresh \`assigned\` event is **refused**.
+- \`ARC.md\` is **supervisor-owned** — created at \`promote\`, refreshed by \`orient\`/\`integrate\`.
+- \`capture\` is open to anyone (a worker may author with \`author_role: worker\`).
+
+## Rung ladder (in brief — full text in \`references/contracts/intent-lifecycle.md\`)
+
+**marked** (valid PLAN-INTENT sentinel) → **ran** (server-witnessed orchestration link;
+**unavailable pre-ledger — reported as \`ran: unavailable\`, never faked from a filename or a
+self-declared \`orchestration_id\`**) → **returned** (≥1 currently-present in-folder output whose
+frontmatter \`intent_id\` + \`plan_artifact_id\` match) → **folded-in** (a **normalized Markdown link**
+in the relevant \`plan.md\` phase **resolves** to that exact present output — a substring is
+insufficient). Multiple outputs per intent are tracked **independently**; any present, \`active\`,
+unfolded output **keeps the intent open**.
+
+## The \`plan.json\` rule
+
+**All** \`plan.json\` creation and mutation goes through \`scripts/plan-manifest.mjs\`
+(\`scaffold\` / \`manifest\`) under the §P3-MANIFEST-LOCK protocol. **There is no hand-edit path**; lock
+exhaustion is a **clean blocking error with recovery guidance**, never a direct edit. \`inspect\` is
+the read-only dump. (\`references/contracts/manifest-lock.md\`.)
+
+## Dispatcher contract — mode selection replaces any per-turn sentinel
+
+Choosing and running one of the seven modes **is** this skill's turn obligation. **Mode selection
+replaces any per-turn PLAN-EVENT sentinel obligation** — the durable record is the plan folder's
+artifacts (\`plan.json\`, \`plan.md\` markup/integration sentinels, \`ARC.md\`), which the surface reads;
+you do **not** owe a per-turn sentinel while working this skill. (PLAN-INTENT / PLAN-INTEGRATION are
+**watcher-read document markup**, not a per-turn agent obligation, and are outside
+\`assertPlanRailFree\`.)
+`;
+
+export const PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD = `# Activity playbook — \`capture\`
+
+**Purpose.** Write a stamped **flat** proposal markdown with zero ceremony. This is the universal
+cheap entry point; a bare proposal is valid as a **terminal state** — capture does not obligate any
+later hardening.
+
+**Lane.** Anyone may capture (supervisor or worker). A worker may author a proposal with
+\`author_role: worker\` (see \`worker-claude-md.delta.md\`).
+
+**Contracts loaded.** \`references/contracts/folder-schema.md\` (the *Bare proposal* clause) only. No
+\`plan.json\`, no folder, no lock — capture never touches the plan-folder home.
+
+---
+
+## Steps
+
+1. Pick a path under \`.lares/proposals/\`:
+   \`.lares/proposals/<YYYY-MM-DD>-<slug>.md\` (deliberation/detail docs go in
+   \`.lares/proposals/supporting/\`).
+2. Write portable frontmatter — **\`artifact_id\` is required and portable** (never the local DB UUID,
+   so clones adopt without dirtying):
+
+   \`\`\`yaml
+   ---
+   artifact_id: prop_<hex>
+   title: <human title>
+   author_role: supervisor | worker
+   authored_at: <ISO-8601>
+   ---
+   \`\`\`
+
+3. Write the proposal body in plain markdown. **No additional structure** — no \`plan.json\`, no
+   subdirs, no sentinels. That is the whole ceremony.
+
+## Rules
+
+- **Zero ceremony.** Do not scaffold a folder, do not mark intents, do not open a plan. Those are
+  \`scope\`/\`promote\`, invoked later and only if the proposal graduates.
+- **Terminal-valid.** A proposal that never hardens is a legitimate durable artifact; leave it flat.
+- \`artifact_id\` **must be portable and unique** — it is the identity every later rung keys on
+  (\`source_proposal.artifact_id\`).
+
+## Hand-off
+
+When a captured proposal looks worth hardening, the responsible supervisor runs **\`scope\`** next
+(hardening triage + markup). Capture itself makes no such judgment.
+`;
+
+export const PROPOSAL_TO_PLAN_ACTIVITY_SCOPE_MD = `# Activity playbook — \`scope\`
+
+**Purpose.** The **first hardening step**: hardening **triage**, then **markup**. Scope decides
+*what deserves extra effort* — which parts need groupthink deliberation, which would benefit from
+online research — and **etches that decision as PLAN-INTENT markup on the flat proposal**, plus a
+required dated \`## Hardening scope\` verdict. **Scope is NOT decomposition** (ruling 27); worker-sized
+packaging is the LAST step (\`package\`), never here.
+
+**Lane. Responsible supervisor only** (marking is a supervisor activity, ruling 29). A non-supervisor
+lane that reaches \`scope\`/mark is **rejected and instructed** to hand off to the responsible
+supervisor (see \`SKILL.md\` lane rules).
+
+**Contracts loaded.** \`references/contracts/intent-lifecycle.md\` (§R1 — the PLAN-INTENT sentinel and
+re-entry rules) and \`references/contracts/folder-schema.md\` (the *Bare proposal* clause — marking
+lands on the flat proposal, before \`plan.md\` exists).
+
+> **Scope owns marking. There is no standalone \`mark\` mode** — a separate mark would either
+> duplicate \`scope\` or permit marking that bypasses hardening triage.
+
+---
+
+## Steps
+
+1. **Read the proposal** end to end. Understand the parts and where uncertainty/risk concentrates.
+2. **Take a second opinion (recommended, ruling 27).** An **independent** perspective —
+   a Codex-lane agent, a worker read, or a **small groupthink used as the scoping vehicle itself**.
+   Record **who was consulted, or that none was** (the second-opinion disposition).
+3. **Triage each part. BOTH hardening kinds are live options for every part (Edward's rider):**
+   - **groupthink deliberation** (\`groupthink-serial\` / \`groupthink-parallel\`), and/or
+   - **online research** (\`research\`).
+   A part may need one, both, or neither.
+4. **Mark** each part that needs hardening with a **PLAN-INTENT** sentinel **on the proposal
+   document** (§R1 — valid JSON, fresh \`intent_id\`, \`kind\`, \`targets\`, one-line \`reason\`). Marking
+   predates \`plan.md\`; the marked proposal migrates into \`plan.md\` during \`promote\` (ruling 28).
+5. **Write the required \`## Hardening scope\` verdict section** (below) — always, even when nothing
+   needs hardening.
+
+## The \`## Hardening scope\` verdict (REQUIRED, always)
+
+Absence of intents alone **cannot** distinguish "scope completed, nothing needs hardening" from
+"scope never happened." So \`scope\` **always** records an explicit, low-ceremony, human-readable
+verdict as a \`## Hardening scope\` section in the proposal:
+
+\`\`\`markdown
+## Hardening scope
+- **Verdict (dated):** <YYYY-MM-DD> — <what needs hardening, or "nothing needs hardening — package and implement">
+- **Second opinion:** <who was consulted (lane/agent), or "none consulted">
+- **Marked intents:** <int_ids + one-line each, or "none — trivial proposal">
+\`\`\`
+
+- **"Nothing needs hardening — package and implement" is a legitimate verdict** (ruling 27) and is
+  **durably recorded here**, producing **no artificial intent**. \`orient\` reads this section to tell
+  a trivial-scope verdict apart from scope-never-ran.
+- This is **prose in an existing document — not a new sentinel.** A machine-parseable verdict would
+  be a proposed §R1 amendment (Deferred), not invented here.
+- The verdict migrates into \`plan.md\` and is summarized under \`ARC.md → Decisions\` during \`promote\`.
+
+## Rules & acceptance touchpoints
+
+- Marks land on the **flat proposal, before any \`plan.md\` exists** (Accept 1).
+- A **trivial-scope verdict** produces **no artificial intent** and is durably recorded (Accept 2).
+- PLAN-INTENT sentinels **parse as valid JSON** (Accept 12); reopening a decision mints a **new
+  \`intent_id\`** carrying \`supersedes_intent_id\` (§R1) — never silently reuse a sentinel.
+- Scope does **not** cut work packages and does **not** scaffold the folder — that is \`package\` and
+  \`promote\` respectively.
+
+## Hand-off
+
+After the verdict is recorded and any intents are marked, the responsible supervisor runs
+**\`promote\`** (atomic complete-folder scaffold). If the verdict is trivial ("nothing needs
+hardening"), promote still runs to create the durable folder, then \`package\`.
+`;
+
+export const PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD = `# Activity playbook — \`promote\`
+
+**Purpose.** The deliberate mechanical transition from a **marked flat proposal** to a **complete
+plan folder** (§R0). Promote owns the **atomic, complete-folder scaffold**: it builds a
+**fully-valid** folder — including \`plan.md\` — in a temp sibling and renames it into the
+deterministic target in **one move**, so the watcher never observes a half-valid folder or a
+post-rename interval with an incomplete \`plan.md\`.
+
+**Lane. Responsible supervisor only** (promote mutates the plan-folder home). A non-supervisor lane
+is **rejected and instructed** to hand off.
+
+**Contracts loaded.** \`references/contracts/folder-schema.md\` (§R0 — layout, identity, \`.gitkeep\`),
+\`references/contracts/manifest-lock.md\` (helper-only \`plan.json\` creation), \`references/contracts/arc.md\`
+(§R2 — the ARC skeleton created here), and \`references/contracts/intent-lifecycle.md\` (§R1 — the
+markup migrated into \`plan.md\`).
+
+> **All \`plan.json\` creation goes through \`scripts/plan-manifest.mjs scaffold\`.** The agent never
+> hand-writes \`plan.json\` (§P3-MANIFEST-LOCK, helper-only).
+
+---
+
+## Preconditions
+
+- \`scope\` is complete: the flat proposal carries its PLAN-INTENT marks (if any) **and** the required
+  \`## Hardening scope\` verdict section.
+- Marking **predates** \`plan.md\`; the copy into \`plan.md\` happens **inside the temp folder during
+  promotion**, so the renamed folder is valid the instant it appears (Accept 3).
+
+## The atomic sequence (recommendation, verbatim shape)
+
+\`\`\`
+scope/mark the flat proposal (.lares/proposals/…), incl. the ## Hardening scope verdict
+  → create sibling temp folder
+  → write plan.json, ARC.md, seeded subdirs, AND plan.md (copied from the already-marked proposal)
+     into the temp folder
+  → fsync as required
+  → atomically rename the COMPLETE folder into the deterministic target
+  → continue hardening (deliberate / integrate / package)
+\`\`\`
+
+Run this via **\`plan-manifest.mjs scaffold\`**, which:
+
+1. Computes the deterministic **\`plan_artifact_id = "plan_" + <proposal artifact hex>\`** and the
+   **\`plan-sku = <YYYY-MM-DD>-<slug>-<artifact-short>\`** target path under
+   \`<workspaceStateDir()>/plans/\`.
+2. Builds the **complete** folder in a **request-ID-qualified temp sibling**
+   (\`<plan-sku>.tmp-<id>\` beside the target) containing:
+   - \`plan.json\` — with \`responsibility_events[0]\` = a \`manual-skill\` **\`assigned\`** event carrying a
+     **stable \`event_id\`**, the deterministic identity, and \`source_proposal\`;
+   - \`ARC.md\` — the §R2 skeleton with \`ARC-META\`, \`## Decisions\` seeded with the dated \`## Hardening
+     scope\` verdict, \`## Work packages\`, \`## Deliberations\`, \`## Who did what\`;
+   - \`plan.md\` — **copied from the already-marked proposal** (carries the PLAN-INTENT sentinels);
+   - \`deliberations/.gitkeep\`, \`research/.gitkeep\`, \`supplements/.gitkeep\`.
+3. \`fsync\`s, then **atomically renames the complete folder** onto the deterministic target.
+4. Migrates the \`## Hardening scope\` verdict into \`plan.md\`/\`ARC.md → Decisions\`.
+
+**No post-rename incomplete-plan interval exists** — \`plan.md\` is already inside the temp folder
+before the rename (Accept 3).
+
+## EEXIST on the target (both branches — Accept 4)
+
+If the deterministic target already exists, **\`scaffold\` does not clobber it.** Run \`orient\` against
+the occupant and read its \`plan.json.source_proposal.artifact_id\`:
+
+- **Matching \`source_proposal.artifact_id\`** → this is our own folder (a resumed/retried promotion).
+  **Orient/resume** — do not re-scaffold; continue hardening against the existing folder.
+- **Mismatching \`source_proposal.artifact_id\`** → an **unrelated** occupant of the deterministic
+  path. **Report a collision and BLOCK.** Never adopt, never overwrite, leave the occupant
+  untouched.
+
+The temp sibling is **request-ID-qualified** so a crash before rename leaves the canonical target
+**absent**, and a retry safely resumes/replaces **only its own** validated temp directory; unrelated
+directories are never removed.
+
+## Rules & acceptance touchpoints
+
+- Complete folder via **temp-dir → atomic rename** with \`plan.md\` already inside (Accept 3).
+- Both **EEXIST branches** (matching resume / mismatching block) (Accept 4).
+- \`.gitkeep\` in all three subdirs so a fresh clone/checkout preserves them (Accept 11).
+- \`plan.json\` created **only** through the helper under the lock (Accept 9 discipline).
+
+## Hand-off
+
+With the folder live, hardening proceeds: \`deliberate\` (launch marked intents) → \`integrate\` (fold
+returned outputs) → \`package\` (decompose + baseline tag). \`orient\` is the safe first read on any
+later pickup.
+`;
+
+export const PROPOSAL_TO_PLAN_ACTIVITY_DELIBERATE_MD = `# Activity playbook — \`deliberate\`
+
+**Purpose.** Launch a bounded hardening run — a **groupthink** deliberation or a **research** dig —
+**keyed to exactly one marked PLAN-INTENT**. Deliberate reuses the **existing** groupthink
+orchestration and researcher lane; it introduces **no new orchestration** and no journey driver.
+
+**Lane.** Launching a deliberation on a plan the supervisor is responsible for is a supervisor
+activity in practice; the actual **fold-in** (\`integrate\`) is supervisor-only. Orientation before
+launching is open to anyone.
+
+**Contracts loaded.** \`references/contracts/intent-lifecycle.md\` (§R1 — the intent being served, the
+required output frontmatter, and re-entry semantics).
+
+---
+
+## Steps
+
+1. **Pick the marked intent.** Read the PLAN-INTENT sentinel (from \`plan.md\`, or the source proposal
+   pre-hardening). Confirm it is **\`active\`** and belongs to this plan.
+2. **Launch the existing lane keyed to that one intent:**
+   - \`kind: groupthink-serial | groupthink-parallel\` → the **existing \`groupthink\` orchestration**
+     via \`run_orchestration\`, with the intent's \`targets\` (providers/models).
+   - \`kind: research\` → the **existing researcher lane** (writes findings to
+     \`.lares/research/inbox/\`; cleared findings become durable in \`.lares/research/cleared/\`).
+3. **Brief the lane on the hardening context** — which part of the plan it serves and why (the
+   intent's \`reason\`).
+4. **Require the output frontmatter (§R1)** on every in-folder output the run produces:
+   \`plan_artifact_id\`, \`intent_id\`, \`orchestration_id\` (self-declared cross-check only), \`kind\`.
+   \`returned\` derives from this frontmatter, **never** from a filename convention.
+
+## Rules
+
+- **One intent per launch.** A run serves exactly one PLAN-INTENT so the surface can show it "in
+  service of *this* marked part."
+- **Re-entry (§R1):** a rerun of a still-open intent launches **another** orchestration under the
+  **same \`intent_id\`** and may produce **another** output artifact (all retained). A superseding
+  decision is a **new \`intent_id\`** with \`supersedes_intent_id\` — mint it in \`scope\`, not here.
+- **\`ran\` is server-witnessed and unavailable from disk pre-ledger.** Deliberate does **not** write a
+  \`ran\` signal; the self-declared \`orchestration_id\` is a cross-check only, never authority. A
+  detached deliberation may be running with no returned artifact yet — that is "launch state
+  unknown" to \`orient\`, not "done."
+- Deliberate **does not fold**. Folding is a separate, later, supervisor-owned act (\`integrate\`),
+  triggered by a valid returned artifact's presence.
+
+## Hand-off
+
+When a run returns an in-folder output (correct frontmatter, contained), the responsible supervisor
+runs **\`integrate\`** to validate and fold it. Until then \`orient\` surfaces the intent as
+returned-but-open (or launch-unknown if nothing is present yet).
+`;
+
+export const PROPOSAL_TO_PLAN_ACTIVITY_INTEGRATE_MD = `# Activity playbook — \`integrate\`
+
+**Purpose.** Validate a **returned** deliberation/research output and **fold it into the plan** — by
+a **normalized Markdown-link reference** in the relevant \`plan.md\` phase **plus** a per-output
+**PLAN-INTEGRATION** record — then **refresh \`ARC.md\`/\`ARC-META\`**. Integration is a **tracked,
+separate, later** step; it is **never presumed** from "the workflow completed."
+
+**Lane. Responsible supervisor only** (integrate mutates \`plan.md\`/\`ARC.md\`). A non-supervisor lane
+is **rejected and instructed** to hand off.
+
+**Contracts loaded.** \`references/contracts/intent-lifecycle.md\` (§R1 — identity/containment,
+returned/folded rungs, PLAN-INTEGRATION record) and \`references/contracts/arc.md\` (§R2 — the ARC
+refresh + freshness contract).
+
+---
+
+## Steps
+
+1. **Validate identity + containment** of the candidate output:
+   - Frontmatter \`intent_id\` **and** \`plan_artifact_id\` match this plan/intent (§R1).
+   - The output path **resolves inside the plan folder** (containment): reject \`..\`-traversal,
+     symlink/junction escape, and **normalize mixed \`\\\`/\`/\` separators** before resolving.
+   - The output is **currently present** on disk.
+2. **Treat \`ran\` as unavailable** (pre-ledger). Do **not** promote a self-declared \`orchestration_id\`
+   to authority — it is a cross-check only.
+3. **Fold by reference:** add a **normalized Markdown link** to the exact output from the relevant
+   \`plan.md\` phase. A raw textual substring is **insufficient** — the link must **resolve
+   (containment + existence)** to that exact present output.
+4. **Write the per-output PLAN-INTEGRATION record** (§R1, adjacent to the reference):
+
+   \`\`\`html
+   <!--PLAN-INTEGRATION
+   { "intent_id": "int_8hex", "output_rel_path": "deliberations/2026-08-01-attr.md",
+     "changed": "what the deliberation changed", "disposition": "active" }
+   -->
+   \`\`\`
+
+5. **Refresh \`ARC.md\`** — update \`## Deliberations\` (part, rung, output ref, integration summary
+   citing \`intent_id\`/\`orchestration_id\`) and **\`ARC-META\`** (\`last_refreshed_at\`, \`source_cutoffs\`
+   over \`plan.md\`/outputs/\`plan.json\`, **excluding \`ARC.md\` itself**).
+
+## Rules & acceptance touchpoints
+
+- **Malformed frontmatter, \`..\`-traversal, broken/unresolved Markdown links, and mixed
+  \`\\\`/\`/\` separators DO NOT count as returned/folded** (Accept 10). An output failing validation is
+  **quarantined + reported**, never integrated.
+- **Multiple outputs for one intent remain independently open/folded** (Accept 6). Fold each present
+  \`active\` output on its own; an intent is \`fully_folded_in\` only when **every** present \`active\`
+  returned output is referenced. **Any present, \`active\`, unfolded output keeps the intent open.**
+- A reference removed later flips that output's \`folded_in\` back to open while the intent stays
+  \`active\` — folding is recomputed from disk, never a stored "done" flag.
+- \`superseded\`/\`withdrawn\` outputs are excluded from the fully-folded requirement.
+
+## Hand-off
+
+Once every marked intent's present \`active\` outputs are folded (or legitimately trivial), the plan
+is ready for **\`package\`** (decompose + baseline tag). \`orient\` re-derives all rungs from disk on any
+pickup.
+`;
+
+export const PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD = `# Activity playbook — \`package\`
+
+**Purpose.** The **LAST** step of the journey: decompose the **hardened** plan into
+**worker-sized, bundle-contract-shaped work packages** — after a defensible implementation plan
+exists — **and** perform **pre-implementation git prep** (the \`plan-baseline/<plan-slug>\` tag).
+Packaging is decomposition; it is **not** scope (ruling 27).
+
+**Lane. Responsible supervisor only** (package mutates the plan + records the baseline). A
+non-supervisor lane is **rejected and instructed** to hand off.
+
+**Contracts loaded.** \`references/contracts/arc.md\` (§R2 — recording the baseline + packages under
+Decisions/Work packages) and \`references/contracts/folder-schema.md\` (§R0 — the plan folder the WPs
+are recorded in).
+
+---
+
+## Part A — decompose into work packages
+
+- Cut the hardened plan into **worker-sized packages**, each fitting one worker's context, in the
+  **bundle-contract shape** (\`.lares/proposals/supporting/2026-07-30-shared-bundle-contract.md\`):
+  every WP lists **Files · Dep · Do · Accept · Non-goals · Verify**.
+- Record the packages under \`ARC.md → ## Work packages\` (\`<id> <title> — <state> — <responsible/assignee>\`).
+- **Preconditions:** a defensible implementation plan exists — every marked intent is folded or
+  legitimately trivial (\`## Hardening scope\` verdict present). Do not package an unhardened plan.
+
+## Part B — pre-implementation git prep (the baseline tag)
+
+Before declaring the plan **dispatch-ready**, create-or-verify a **local annotated** baseline tag so
+implementation has a human-visible recovery point:
+
+1. **Verify or create** a local **annotated** tag \`plan-baseline/<plan-slug>\` at the **workspace
+   HEAD**:
+   - Verify existence: \`git tag -l plan-baseline/<plan-slug>\` — if present, reuse it (verify it
+     points at a sensible commit; record what it points at).
+   - Create if absent: \`git tag -a plan-baseline/<plan-slug> -m "<plan-sku> baseline" HEAD\`.
+2. **Record the tag name + commit** under \`ARC.md → ## Decisions\` **and** in \`plan.md\` (so the
+   recovery point is durable on disk).
+3. **Warn (advisory, NEVER blocking)** when \`git status\` shows uncommitted edits the tag cannot
+   capture — the tag only captures committed HEAD. Surface the warning; do not block packaging.
+4. **Never push the tag** — it is **local only**.
+
+**Recovery framing (record this in \`plan.md\`/ARC Decisions):** any code a plan later **deletes** is
+one \`git show <tag>:<path>\` away — deletion WPs need **no** copy-aside archiving.
+
+> Once WP-P5C's per-run \`baseline_ref\` exists this tag becomes belt-and-braces; the skill step stays
+> as the **human-visible** recovery point.
+
+## Rules & acceptance touchpoints
+
+- \`package\` **creates-or-verifies** the \`plan-baseline/<plan-slug>\` tag, **records it** in
+  \`plan.md\`/\`ARC.md\`, **warns on uncommitted edits without blocking**, and **never pushes** the tag
+  (Accept 13).
+- Packaging is the **last** step, after hardening; it is **not** scope decomposition.
+- Do not run \`git checkout\`/\`restore\`/\`clean\`/\`stash\` in the shared worktree — creating a **tag** is
+  non-destructive; discarding work is forbidden.
+
+## Hand-off
+
+With packages recorded and the baseline tag in place, the plan is **dispatch-ready**. Implementation
+is a separate explicit human **trigger** (never auto-launched by the skill). \`orient\` reports
+readiness on pickup.
+`;
+
+export const PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD = `# Activity playbook — \`orient\`
+
+**Purpose.** The **re-entry interpreter**. On any pickup of an existing plan folder, \`orient\` derives
+the **known** lifecycle state from disk evidence and presents **safe** next actions — **before doing
+anything new** (ruling 23/30, orient-first). Re-entry is a **read**, not a process to resume.
+
+**Lane. Anyone may run \`orient\`** — it is **read-only**. It never mutates the plan, never launches,
+never auto-relaunches. Judgment-bearing actions it surfaces are **gated on the responsible
+supervisor**.
+
+**Contracts loaded.** \`references/contracts/folder-schema.md\` (§R0), \`references/contracts/intent-lifecycle.md\`
+(§R1 rungs), \`references/contracts/arc.md\` (§R2 — refresh on re-run), and
+\`references/contracts/manifest-lock.md\` (read-only \`inspect\` only — orient never mutates \`plan.json\`).
+
+---
+
+## Steps
+
+1. **Inspect the folder.** Run \`scripts/plan-manifest.mjs inspect\` (read-only \`plan.json\` + folder
+   listing) and read \`ARC.md\` + the PLAN-INTENT / PLAN-INTEGRATION sentinels.
+2. **Derive every intent's rung from disk** per §R1: marked → (\`ran\` **unavailable**) → returned →
+   folded-in. Report each intent independently (multiple outputs each listed).
+3. **Report launch-state honestly.** \`ran\` is server-witnessed and **unavailable from disk pre-P2L**;
+   \`orient\` **never auto-relaunches**. A detached deliberation may be running with no artifact yet.
+4. **Refresh \`ARC.md\`/\`ARC-META\`** from current disk evidence (excluding \`ARC.md\`'s own mtime from the
+   cutoff) **without clobbering** existing content (Accept 12).
+5. **Surface the safe next action** from the table below; **gate any judgment-bearing action on the
+   responsible supervisor.**
+
+## Decision table (from the recommendation doc, verbatim)
+
+| Disk evidence | \`orient\` reports | Safe next action |
+|---|---|---|
+| intent marked; \`ran\` unavailable; no present output | launch state **unknown** | inspect known run context; **ask the supervisor** whether to launch or rerun — do **not** auto-launch |
+| ≥1 valid \`active\` output, not referenced | returned, **unfolded → open** | \`integrate\` that exact output |
+| every present \`active\` output referenced | fully folded | continue hardening / \`package\` if otherwise ready |
+| output present but malformed / identity-mismatched | **invalid, not returned** | quarantine + report; do **not** integrate |
+| intent superseded / withdrawn | historical, **not open** | no launch, no integration |
+| explicit trivial-scope verdict present, no intents | scope complete; **hardening intentionally skipped** | proceed to hardening / \`package\` |
+| no intents **and** no explicit verdict | scope status **unknown/incomplete** | do **not** infer readiness; run/complete \`scope\` |
+
+## Rules & acceptance touchpoints
+
+- **\`ran\` reported unknown/unavailable without relaunching** (Accept 5).
+- **No-intents-no-verdict is reported as scope-incomplete**, never as ready (Accept 5). The explicit
+  \`## Hardening scope\` trivial verdict is what distinguishes "nothing needs hardening" from "scope
+  never happened" (Accept 2).
+- **Malformed frontmatter, \`..\`-traversal, broken/unresolved links, mixed \`\\\`/\`/\` separators** are
+  reported **invalid, not returned/folded** (Accept 10) — quarantine, never integrate.
+- **Multiple outputs** for one intent are surfaced **independently** (Accept 6) — one folded rerun
+  never hides another pending result.
+- **Re-run refreshes \`ARC.md\`/\`ARC-META\` without clobbering** (Accept 12).
+- **Read-only**: orient is the one mode a non-supervisor lane may run; \`mark\`/\`integrate\`/\`package\`
+  it may not. Mutation by a new supervisor requires a fresh \`assigned\` reassignment event **first**
+  (Accept 7, 8).
+
+## The EEXIST resume path
+
+\`promote\` delegates its EEXIST decision to \`orient\`: read the occupant's
+\`source_proposal.artifact_id\` — **matching** → orient/resume against it; **mismatching** → report a
+**collision** and **block** (occupant untouched). See \`promote.md\`.
+`;
+
+export const PROPOSAL_TO_PLAN_CONTRACT_ARC_MD = `# Contract reference — §R2: the ARC summary file
+
+> **Canonical, single copy.** This file reproduces **§R2** of
+> \`.lares/proposals/supporting/2026-08-01-planning-surface-p0-p2-rescope.md\`
+> **verbatim** (the ARC.md skeleton, ownership rule, and freshness contract). It
+> is the one authoritative copy inside the skill; \`promote\`, \`integrate\`, and
+> \`orient\` cite it and never restate it.
+
+---
+
+## §R2 — NORMATIVE: ARC summary file (ruling 21)
+
+\`ARC.md\`, committed with the plan folder, is the cheapest tier of the Amendment-18 altitude ladder
+— an agent reads the whole arc from disk with **zero DB access**. It is a **summary of durable
+records** that **cites** them; it is **not** itself the attribution authority (a skill-authored
+prose row never substitutes for work-time stamping — see §R-ATTR).
+
+**Ownership (ruling 29, 2026-08-02):** \`ARC.md\` is written and maintained by the **responsible
+supervisor** (created at promote; refreshed by the orient and integrate activities). This
+ownership is stated explicitly in the skill AND in the scaffolded supervisor CLAUDE.md/AGENTS.md
+(WP-P0C) — never merely implied.
+
+\`\`\`markdown
+# ARC — <plan title>   (plan_sku: <sku> · plan_artifact_id: <id>)
+<!--ARC-META { "last_refreshed_at": <ms>, "source_cutoffs": { "folder_mtime_ms": <ms>, "ledger_updated_at": <ms> } } -->
+## Decisions          — <dated decision → rationale>, newest last
+## Work packages       — <id> <title> — <state> — <responsible/assignee>
+## Deliberations       — <part> — <rung> — <output ref> — <PLAN-INTEGRATION summary, cites intent_id/orchestration_id>
+## Who did what        — cites durable refs (intent→orchestration links, turn stamps, commit records, §R-ATTR), NOT prose-as-authority
+\`\`\`
+
+**Freshness contract.** \`ARC-META.source_cutoffs.folder_mtime_ms\` is the **max mtime over source
+artifacts only** (\`plan.md\`, outputs, \`plan.json\`) — **excluding \`ARC.md\` itself**, so refreshing
+ARC cannot destabilize its own cutoff. The skill's **orient** and **integrate** modes must
+**refresh ARC from current disk/ledger evidence** and update \`ARC-META\`. Staleness =
+\`last_refreshed_at\` older than the source max mtime or the ledger's \`updated_at\`; readers may flag
+a stale ARC rather than silently present it as the whole current arc.
+`;
+
+export const PROPOSAL_TO_PLAN_CONTRACT_FOLDER_SCHEMA_MD = `# Contract reference — §R0: the folder-per-plan structure
+
+> **Canonical, single copy.** This file reproduces **§R0** of
+> \`.lares/proposals/supporting/2026-08-01-planning-surface-p0-p2-rescope.md\`
+> **verbatim**. It is the one authoritative copy inside the skill; activity
+> playbooks cite it and never restate it. If the source §R0 changes, update
+> here — do not fork a second copy elsewhere in the skill.
+
+---
+
+## §R0 — NORMATIVE: the folder-per-plan structure (rulings 10, 11, 21)
+
+Filesystem-owned; the DB **ingests and enriches**, never owns (ruling 10).
+
+**Bare proposal (unchanged):** a flat markdown \`<.lares/proposals/<YYYY-MM-DD>-<slug>.md>\` with
+portable \`artifact_id\` frontmatter and **no** additional structure. Valid as a terminal state.
+
+**Canonical plan-folder home:** **\`<workspaceStateDir(workspace)>/plans/\`** — resolves to
+\`.lares/plans/\`, or the \`.dashboard\` fallback, via \`translateStateRelPath\`. This is **distinct
+from the legacy workspace-root \`plans/\`** directory that holds flat HTML/markdown plans. All
+plan-folder paths in this rescope mean the **state-dir** home.
+
+**Plan folder:** \`<…/plans/<plan-sku>/>\` where **\`plan-sku = <YYYY-MM-DD>-<slug>-<artifact-short>\`**
+(\`artifact-short\` = first 8 hex of \`plan_artifact_id\`) — collision-safe. **The SKU is display /
+path metadata only, never durable identity.** Layout:
+
+\`\`\`
+<workspaceStateDir()>/plans/<plan-sku>/
+  plan.json              # CANONICAL machine-readable manifest (below). Folder-is-a-plan signal.
+  plan.md                # hardened plan document; PLAN-INTENT sentinels (§R1) + Markdown-link phase refs.
+  ARC.md                 # summary of durable records (§R2, ruling 21) — cheapest read tier.
+  deliberations/.gitkeep # scoped groupthink outputs (ruling 11); each carries §R1 output frontmatter.
+  research/.gitkeep      # scoped research findings.
+  supplements/.gitkeep   # supplementary documents.
+\`\`\`
+
+**\`plan.json\` — canonical disk metadata:**
+
+\`\`\`json
+{
+  "schema_version": 1,
+  "plan_artifact_id": "plan_<hex>",
+  "plan_sku": "<date>-<slug>-<artifact-short>",
+  "source_proposal": { "artifact_id": "prop_<hex>", "rel_path": ".lares/proposals/<slug>.md" },
+  "responsibility_events": [
+    { "event_id": "rev_<hex>", "event": "assigned", "agent_id": "<id>", "display": "<snapshot>",
+      "at": <ms>, "source": "manual-skill" | "promotion-service" }
+  ],
+  "created_at": <ms>, "updated_at": <ms>
+}
+\`\`\`
+
+- **Folder-is-a-plan signal (mechanically inspectable):** \`plan.json\` present with a valid
+  \`plan_artifact_id\`. All ingestion keys on **\`plan_artifact_id\`**, never the SKU/slug.
+- **Plan identity:**
+  - **Promotion-service scaffold (no existing folder):** deterministic
+    **\`plan_artifact_id = "plan_" + <proposal artifact hex>\`** at a **deterministic folder path**
+    — so a retry after app restart converges on the same folder/id without any in-memory lock.
+  - **Manually scaffolded folder:** keeps its **existing valid \`plan_artifact_id\`** (which may be
+    independently minted); it is discovered by the promotion **claim-scan matching
+    \`plan.json.source_proposal.artifact_id\`**, and its identity is retained, never rewritten.
+- **Responsibility is disk truth (append-only history; rulings 19, 22, 23).** The **current
+  responsible supervisor = the last \`assigned\` event.** Reassignment **appends** (stable
+  \`event_id\`), never overwrites — "who was responsible when the work happened" is recoverable. DB
+  responsibility (\`plans.responsible_supervisor_id\`, P3A) **enriches**; disk history is the durable
+  record. All \`plan.json\` mutations use the no-clobber CAS discipline of **§R-P3**.
+- **\`.gitkeep\` placeholders.** The three subdirs ship a tracked \`.gitkeep\` so the structure
+  survives clone/checkout (Git does not track empty dirs). Readers suppress \`.gitkeep\` and
+  \`plan.json\` from the document UI.
+- **Relationship to the source proposal.** The source proposal stays at
+  \`.lares/proposals/<slug>.md\` (state → \`promoted\`, linked via \`plan_documents\`). \`plan.md\` is the
+  **hardened plan document** authored by the planning skill; it references the proposal +
+  deliberations by path. The folder watcher scopes to **directories** under the state-dir plans
+  home; legacy \`.html\` **files** are never treated as plan folders.
+`;
+
+export const PROPOSAL_TO_PLAN_CONTRACT_INTENT_LIFECYCLE_MD = `# Contract reference — §R1: PLAN-INTENT markup + machine-checkable lifecycle
+
+> **Canonical, single copy.** This file reproduces **§R1** of
+> \`.lares/proposals/supporting/2026-08-01-planning-surface-p0-p2-rescope.md\`
+> **verbatim** (sentinels, output frontmatter, integration record, the rung
+> ladder, per-output rung rules, and re-entry semantics). It is the one
+> authoritative copy inside the skill; \`scope\`, \`deliberate\`, \`integrate\`, and
+> \`orient\` cite it and never restate it.
+
+---
+
+## §R1 — NORMATIVE: PLAN-INTENT markup + machine-checkable lifecycle (rulings 13, 16, 17, 20)
+
+The planning agent's markup/intent pass etches intent **durably in the canonical marked document**
+(the proposal during the markup pass; migrated into \`plan.md\` on hardening).
+
+**PLAN-INTENT sentinel** — valid JSON (the optional supersede field is added to the same object,
+never as a comment):
+
+\`\`\`html
+<!--PLAN-INTENT
+{ "intent_id": "int_8hex", "part": "attribution-timing",
+  "kind": "groupthink-serial",
+  "targets": [ { "provider": "anthropic", "model": "claude-opus-4-8" },
+               { "provider": "codex", "model": "gpt-5.1-codex" } ],
+  "reason": "one line: why this part needs deliberation" }
+-->
+\`\`\`
+
+Reopening a decision adds one field to the same object — \`"supersedes_intent_id": "int_prev"\` —
+and **mints a new \`intent_id\`**; sentinels are **never silently reused**.
+
+**Deliberation / research output frontmatter (required).** Every in-folder output declares its
+linkage; \`returned\` derives from this, never from a filename convention:
+
+\`\`\`yaml
+---
+plan_artifact_id: plan_<hex>
+intent_id: int_8hex
+orchestration_id: orc_<id>     # worker SELF-DECLARATION; honored only as a cross-check
+kind: deliberation | research
+---
+\`\`\`
+
+The self-declared \`orchestration_id\` is **not** the authoritative \`ran\` signal — the authority is
+the server-witnessed \`orchestrations.planning_intent_id\` (§P2L).
+
+**PLAN-INTEGRATION record — JSON sentinel, adjacent to the reference, per exact output** (robust to
+quotes/markup in \`changed\`):
+
+\`\`\`html
+<!--PLAN-INTEGRATION
+{ "intent_id": "int_8hex", "output_rel_path": "deliberations/2026-08-01-attr.md",
+  "changed": "what the deliberation changed", "disposition": "active" }
+-->
+\`\`\`
+
+\`disposition\` ∈ \`active | superseded | withdrawn\` (default \`active\`).
+
+**Lifecycle chain — every rung answered by inspection, machine-checkable (ruling 16):**
+
+| Rung | Authoritative signal |
+|---|---|
+| **marked** | a valid \`PLAN-INTENT\` sentinel exists in the canonical marked doc |
+| **ran** | a **server-witnessed** orchestration linked to this intent exists (\`orchestrations.planning_intent_id\`, joined on \`(plan_id, planning_intent_id)\`) — a required rail, not a heuristic; **unavailable pre-ledger** |
+| **returned** | ≥1 **currently-present** in-folder output whose frontmatter \`intent_id\` + \`plan_artifact_id\` match |
+| **folded-in** | a **normalized Markdown link** in the relevant \`plan.md\` phase **resolves (containment + existence)** to that exact present output — a raw textual substring is explicitly insufficient (false-positives on prose / code fences / comments) |
+
+**Per-output rung rules (reruns produce multiple outputs; the surface lists each result
+independently so one folded rerun never hides another pending result):**
+
+- \`returned\` = **≥1 currently-present** output.
+- \`fully_folded_in\` = **every currently-present \`active\` returned output is referenced**;
+  \`superseded\`/\`withdrawn\` outputs are excluded from the requirement.
+- **Any present, \`active\`, unfolded output keeps the intent open.**
+
+**Re-entry semantics (ruling 17):**
+
+- A **rerun of the same still-open intent** → another orchestration under the **same \`intent_id\`**;
+  potentially another output artifact (all retained, §P2L).
+- A **superseding / reopened decision** → a **new \`intent_id\`** carrying \`supersedes_intent_id\`.
+- **Removed or superseded marks stay historical** and render **withdrawn / superseded**, never as
+  current satisfaction.
+- **Scanner reconciliation** is presence-aware and scan-transactional — see WP-P2L-ingest.
+`;
+
+export const PROPOSAL_TO_PLAN_CONTRACT_MANIFEST_LOCK_MD = `# Contract reference — §P3-MANIFEST-LOCK: the plan.json lock + no-clobber CAS protocol
+
+> **Canonical, single copy. HELPER-ONLY — there is NO hand-edit path for
+> \`plan.json\`.** This file carries the lock/CAS protocol that governs **all**
+> \`plan.json\` creation and mutation. Under the approved hybrid
+> (\`.lares/proposals/supporting/2026-08-02-skill-vs-workflow-recommendation.md\`,
+> NORMATIVE), the agent **never** edits \`plan.json\` directly and there is **no
+> byte-exact fallback**: every write goes through \`scripts/plan-manifest.mjs\`
+> (\`scaffold\` / \`manifest\`), which owns the lock. If the helper cannot acquire
+> the lock, that is a **clean blocking error with recovery guidance** — not a
+> licence to hand-edit. This supersedes, *for the skill agent*, the "or byte-exact
+> edit-retry" alternative offered by the source §R-P3 seam text reproduced below
+> (that alternative remains for the P3 **service** side only).
+
+---
+
+## The lock protocol (owner+nonce \`wx\` acquire · 2s heartbeat · 15s stale reclaim)
+
+\`plan-manifest.mjs manifest\` serializes **\`plan.json\` mutation only** (recommendation:
+"The manifest lock serializes \`plan.json\` mutation only — it protects manifest integrity"). It does
+**not** serialize edits to the proposal, \`plan.md\`, or \`ARC.md\`. Protocol:
+
+- **Acquire** a sibling lock file (\`plan.json.lock\`) with an **exclusive \`wx\` create** carrying an
+  **owner id + random nonce**. \`wx\` fails if the lock already exists → the holder is live.
+- **Heartbeat** the lock every **2 seconds** (refresh its mtime / heartbeat timestamp) for as long
+  as the mutation is in progress.
+- **Stale reclaim:** a lock whose heartbeat is older than **15 seconds** is considered abandoned and
+  may be reclaimed by a new owner+nonce acquire. A reclaiming writer verifies its own nonce after
+  acquire (guards a race between two reclaimers).
+- **CAS inside the lock:** read \`plan.json\`, compute its expected content-hash, apply the change,
+  and write back **only if the on-disk hash still matches** — preserving any concurrent
+  \`responsibility_events\`. On hash mismatch, re-read and retry within a bounded budget.
+- **Release** by unlinking the lock file after the write + fsync completes.
+- **Lock exhaustion** (cannot acquire within the retry budget, e.g. a live holder that never yields)
+  → **clean error that blocks the mutation and reports recovery guidance** (retry after the
+  15s stale-reclaim window, or surface to the supervisor). **No direct \`plan.json\` edit** is
+  attempted as a fallback.
+
+---
+
+## §R-P3 — No-clobber seam, named (source text, verbatim)
+
+> The following block is reproduced **verbatim** from §R-P3 of
+> \`.lares/proposals/supporting/2026-08-01-planning-surface-p0-p2-rescope.md\`.
+> For **this skill**, only the **Skill (agent)** bullet's *helper-script* path
+> applies — the "or … byte-exact edit-retry discipline" alternative is **not** a
+> skill path (see the helper-only ruling above); it is retained here only because
+> it is part of the verbatim source seam and governs the P3 service side.
+
+**No-clobber seam, named:**
+- **P3 (service):** a shared **\`src/main/plans/plan-manifest.ts\`** helper providing **atomic
+  read-modify-write / CAS** on \`plan.json\` (expected content-hash, bounded retry, preserves
+  concurrent \`responsibility_events\`). All service-side \`plan.json\` mutations go through it.
+- **Skill (agent):** the \`proposal-to-plan\` skill uses an **included helper script** shipped in the
+  skill root for the same atomic CAS append, **or** — when editing by hand — the **byte-exact
+  edit-retry discipline** (read → verify expected hash → \`Edit\` the exact bytes → re-read; on
+  mismatch, re-read and retry), **never** a shell redirect/\`>\`/\`sed -i\`/\`tee\` (which the
+  worker-CLAUDE.md CRLF rule already forbids).
+
+---
+
+## Why helper-only for the skill
+
+The recommendation's \`plan-manifest.mjs\` scope is explicit: the helper owns **all** \`plan.json\`
+creation and mutation, and
+
+> **No hand-edit path exists.** The agent **never** edits \`plan.json\` directly. If the helper
+> cannot acquire the lock (exhaustion) or otherwise fails, that is a **clean error that blocks the
+> mutation and reports recovery guidance** … there is no byte-exact fallback, and \`manifest-lock.md\`
+> documents the helper-only protocol accordingly.
+
+Rung derivation is **not** in the helper (that is the P1 reader / P2L ledger's canonical work); the
+lock protects manifest integrity only.
+`;
+
+export const PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS = `#!/usr/bin/env node
+// plan-manifest.mjs — the proposal-to-plan skill's ONLY write path for plan.json,
+// plus the atomic complete-folder scaffold and a read-only inspect dump.
+//
+//   scaffold  build the COMPLETE §R0 folder (plan.json + plan.md + ARC.md + seeded
+//             subdirs) in a request-ID-qualified temp sibling, then ATOMICALLY rename
+//             it onto the deterministic target. EEXIST → defer to orient:
+//               matching source_proposal.artifact_id → resume (exit 0, action=resume)
+//               mismatching                          → collision, BLOCK (exit 3)
+//   manifest  ALL plan.json creation/mutation under §P3-MANIFEST-LOCK — owner+nonce
+//             \`wx\` acquire, 2s heartbeat, 15s stale reclaim, CAS inside the lock.
+//             Lock exhaustion → clean blocking error (exit 4); NEVER a direct edit.
+//   inspect   read-only dump of plan.json + folder listing. NO rung parser.
+//
+// Pure Node (no deps). Rung derivation is deliberately absent — that is the P1
+// reader / P2L ledger's canonical work (recommendation §"plan-manifest.mjs scope").
+
+import fs from 'node:fs';
+import path from 'node:path';
+import crypto from 'node:crypto';
+
+const SCHEMA_VERSION = 1;
+const HEARTBEAT_MS = 2000;      // §P3-MANIFEST-LOCK: refresh cadence
+const STALE_MS = 15000;         // §P3-MANIFEST-LOCK: reclaim threshold
+const DEFAULT_MAX_WAIT_MS = 20000;
+const DEFAULT_POLL_MS = 250;
+const CAS_RETRIES = 8;
+
+// ---------- tiny helpers ----------
+const hex = (n) => crypto.randomBytes(n).toString('hex');
+const nowMs = () => Date.now();
+const sha256 = (s) => crypto.createHash('sha256').update(s).digest('hex');
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.max(0, ms));
+}
+function die(code, msg, extra) {
+  process.stderr.write(msg.endsWith('\\n') ? msg : msg + '\\n');
+  if (extra) process.stderr.write(extra.endsWith('\\n') ? extra : extra + '\\n');
+  process.exit(code);
+}
+function out(obj) { process.stdout.write(JSON.stringify(obj, null, 2) + '\\n'); }
+
+function parseArgs(argv) {
+  const a = { _: [] };
+  for (let i = 0; i < argv.length; i++) {
+    const t = argv[i];
+    if (t.startsWith('--')) {
+      const k = t.slice(2);
+      const next = argv[i + 1];
+      if (next === undefined || next.startsWith('--')) { a[k] = true; }
+      else { a[k] = next; i++; }
+    } else a._.push(t);
+  }
+  return a;
+}
+
+// ---------- minimal YAML frontmatter reader (proposal artifact_id/title) ----------
+function readFrontmatter(mdPath) {
+  const raw = fs.readFileSync(mdPath, 'utf8');
+  const m = raw.match(/^---\\r?\\n([\\s\\S]*?)\\r?\\n---\\r?\\n?/);
+  const fm = {};
+  if (m) {
+    for (const line of m[1].split(/\\r?\\n/)) {
+      const kv = line.match(/^([A-Za-z0-9_]+):\\s*(.*)$/);
+      if (kv) fm[kv[1]] = kv[2].trim().replace(/^["']|["']$/g, '');
+    }
+  }
+  return { fm, raw };
+}
+
+// deterministic identity: plan_<proposal-artifact-hex>
+function deriveIdentity(fm, args) {
+  const propArtifact = args['proposal-artifact-id'] || fm.artifact_id;
+  if (!propArtifact) die(2, 'scaffold: proposal has no artifact_id (frontmatter) and --proposal-artifact-id not given');
+  const propHex = String(propArtifact).replace(/^prop_/, '');
+  const planArtifactId = 'plan_' + propHex;
+  const artifactShort = propHex.slice(0, 8);
+  const date = args.date || fm.authored_at?.slice(0, 10) || new Date().toISOString().slice(0, 10);
+  const slug = args.slug || slugify(fm.title || 'plan');
+  const planSku = \`\${date}-\${slug}-\${artifactShort}\`;
+  return { propArtifact, planArtifactId, artifactShort, date, slug, planSku };
+}
+function slugify(s) {
+  return String(s).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 48) || 'plan';
+}
+
+// ---------- the lock (§P3-MANIFEST-LOCK) ----------
+class LockExhaustion extends Error {}
+
+function acquireLock(lockPath, opts) {
+  const maxWaitMs = Number(opts['max-wait-ms'] ?? opts.maxWaitMs ?? DEFAULT_MAX_WAIT_MS);
+  const pollMs = Number(opts['poll-ms'] ?? opts.pollMs ?? DEFAULT_POLL_MS);
+  const owner = hex(8), nonce = hex(8);
+  const deadline = nowMs() + maxWaitMs;
+  for (;;) {
+    try {
+      const fd = fs.openSync(lockPath, 'wx');           // exclusive create
+      fs.writeSync(fd, JSON.stringify({ owner, nonce, hb: nowMs(), pid: process.pid }));
+      fs.closeSync(fd);
+      // verify our own nonce won (guards a two-reclaimer race)
+      const back = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+      if (back.nonce !== nonce) { sleepSync(pollMs); continue; }
+      return { owner, nonce, lockPath };
+    } catch (e) {
+      if (e.code !== 'EEXIST') throw e;
+      let held = null;
+      try { held = JSON.parse(fs.readFileSync(lockPath, 'utf8')); } catch { /* torn write */ }
+      const age = held && typeof held.hb === 'number' ? nowMs() - held.hb : Infinity;
+      if (age > STALE_MS) {                              // stale reclaim
+        try { fs.unlinkSync(lockPath); } catch { /* someone else reclaimed */ }
+        continue;
+      }
+      if (nowMs() > deadline) {
+        throw new LockExhaustion(
+          \`plan.json lock is held by a live owner (heartbeat \${age}ms old, < \${STALE_MS}ms stale window). \` +
+          \`Recovery: retry after the \${STALE_MS}ms stale-reclaim window, or surface to the responsible \` +
+          \`supervisor. NO direct plan.json edit is performed.\`);
+      }
+      sleepSync(pollMs);
+    }
+  }
+}
+function heartbeat(lock) {
+  try {
+    const rec = JSON.parse(fs.readFileSync(lock.lockPath, 'utf8'));
+    if (rec.nonce === lock.nonce) { rec.hb = nowMs(); fs.writeFileSync(lock.lockPath, JSON.stringify(rec)); }
+  } catch { /* best-effort */ }
+}
+function releaseLock(lock) { try { fs.unlinkSync(lock.lockPath); } catch { /* already gone */ } }
+
+// Atomic read-modify-write / CAS on plan.json under the lock.
+// mutate(obj) returns the mutated object; the write lands only if the on-disk
+// hash is unchanged since the read (preserving concurrent responsibility_events).
+function withManifestCAS(dir, mutate, opts = {}) {
+  const manifestPath = path.join(dir, 'plan.json');
+  const lockPath = manifestPath + '.lock';
+  const lock = acquireLock(lockPath, opts);
+  const hbTimer = setInterval(() => heartbeat(lock), HEARTBEAT_MS);
+  try {
+    for (let attempt = 0; attempt < CAS_RETRIES; attempt++) {
+      const exists = fs.existsSync(manifestPath);
+      const before = exists ? fs.readFileSync(manifestPath, 'utf8') : null;
+      const beforeHash = before === null ? null : sha256(before);
+      const obj = before === null ? null : JSON.parse(before);
+
+      // test-only: simulate a concurrent writer between read and write, ONCE,
+      // to prove the CAS loop re-reads and preserves the intervening append.
+      if ((opts['inject-concurrent-append-once'] || opts.injectConcurrentAppendOnce) && attempt === 0 && obj) {
+        const inj = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+        inj.responsibility_events.push({
+          event_id: 'rev_' + hex(6), event: 'assigned', agent_id: 'concurrent-writer',
+          display: 'concurrent-writer', at: nowMs(), source: 'promotion-service',
+        });
+        inj.updated_at = nowMs();
+        fs.writeFileSync(manifestPath, JSON.stringify(inj, null, 2) + '\\n');
+      }
+
+      const next = mutate(obj);
+      const serialized = JSON.stringify(next, null, 2) + '\\n';
+
+      // CAS check: has the file changed since we read it?
+      const cur = fs.existsSync(manifestPath) ? fs.readFileSync(manifestPath, 'utf8') : null;
+      const curHash = cur === null ? null : sha256(cur);
+      if (curHash !== beforeHash) continue;             // lost the race → re-read + retry
+
+      const tmp = manifestPath + '.wtmp-' + hex(4);
+      const fd = fs.openSync(tmp, 'wx');
+      fs.writeSync(fd, serialized); fs.fsyncSync(fd); fs.closeSync(fd);
+      fs.renameSync(tmp, manifestPath);
+      return next;
+    }
+    throw new Error(\`plan.json CAS did not converge after \${CAS_RETRIES} retries (persistent contention).\`);
+  } finally {
+    clearInterval(hbTimer);
+    releaseLock(lock);
+  }
+}
+
+// ---------- scaffold ----------
+function buildArcSkeleton({ title, planSku, planArtifactId, verdictLine }) {
+  const meta = { last_refreshed_at: nowMs(), source_cutoffs: { folder_mtime_ms: nowMs(), ledger_updated_at: null } };
+  return \`# ARC — \${title}   (plan_sku: \${planSku} · plan_artifact_id: \${planArtifactId})
+<!--ARC-META \${JSON.stringify(meta)} -->
+## Decisions
+- \${new Date().toISOString().slice(0, 10)} — \${verdictLine}
+## Work packages
+## Deliberations
+## Who did what
+\`;
+}
+
+function cmdScaffold(args) {
+  const proposalPath = args.proposal;
+  const plansHome = args['plans-home'];
+  if (!proposalPath || !plansHome) die(2, 'scaffold: --proposal <flat-proposal.md> and --plans-home <state-dir/plans> required');
+  const { fm, raw } = readFrontmatter(proposalPath);
+  const id = deriveIdentity(fm, args);
+  const target = path.join(plansHome, id.planSku);
+  const requestId = args['request-id'] || hex(6);
+  const agentId = args['agent-id'] || 'manual-skill-agent';
+  const display = args.display || agentId;
+  const title = fm.title || id.slug;
+
+  // ----- EEXIST → defer to orient (both branches) -----
+  if (fs.existsSync(target)) {
+    let occupant = null;
+    try { occupant = JSON.parse(fs.readFileSync(path.join(target, 'plan.json'), 'utf8')); } catch { /* malformed occupant */ }
+    const occArtifact = occupant?.source_proposal?.artifact_id;
+    if (occArtifact && occArtifact === id.propArtifact) {
+      out({ action: 'resume', reason: 'EEXIST with matching source_proposal.artifact_id', target, plan_artifact_id: id.planArtifactId });
+      return;
+    }
+    die(3, \`scaffold: EEXIST COLLISION — target \${target} is occupied by an unrelated plan \` +
+           \`(source_proposal.artifact_id=\${occArtifact ?? 'unknown/malformed'}, expected \${id.propArtifact}). \` +
+           \`Blocking; occupant left untouched. Run orient against it.\`);
+  }
+
+  // ----- build the COMPLETE folder in a request-ID-qualified temp sibling -----
+  const tmp = path.join(plansHome, \`\${id.planSku}.tmp-\${requestId}\`);
+  if (fs.existsSync(tmp)) fs.rmSync(tmp, { recursive: true, force: true }); // resume only our own temp
+  fs.mkdirSync(tmp, { recursive: true });
+  for (const sub of ['deliberations', 'research', 'supplements']) {
+    fs.mkdirSync(path.join(tmp, sub));
+    fs.writeFileSync(path.join(tmp, sub, '.gitkeep'), '');
+  }
+  // plan.md = verbatim copy of the already-marked proposal (carries PLAN-INTENT sentinels)
+  fs.writeFileSync(path.join(tmp, 'plan.md'), raw);
+  // ARC.md skeleton
+  const verdictLine = args['verdict-line'] || 'Hardening scope verdict migrated from the proposal (see ## Hardening scope).';
+  fs.writeFileSync(path.join(tmp, 'ARC.md'), buildArcSkeleton({ title, planSku: id.planSku, planArtifactId: id.planArtifactId, verdictLine }));
+  // plan.json via the manifest create path (lock on the private temp manifest)
+  withManifestCAS(tmp, () => ({
+    schema_version: SCHEMA_VERSION,
+    plan_artifact_id: id.planArtifactId,
+    plan_sku: id.planSku,
+    source_proposal: { artifact_id: id.propArtifact, rel_path: toRelProposal(proposalPath) },
+    responsibility_events: [{
+      event_id: 'rev_' + hex(8), event: 'assigned', agent_id: agentId, display,
+      at: nowMs(), source: 'manual-skill',
+    }],
+    created_at: nowMs(), updated_at: nowMs(),
+  }), args);
+
+  // fsync the temp dir, then ATOMIC rename the COMPLETE folder onto the target
+  fsyncDir(tmp);
+  try {
+    fs.renameSync(tmp, target);
+  } catch (e) {
+    // lost a rename race → re-check EEXIST semantics
+    if (e.code === 'EEXIST' || e.code === 'EPERM' || e.code === 'ENOTEMPTY') {
+      fs.rmSync(tmp, { recursive: true, force: true });
+      die(3, \`scaffold: target \${target} appeared during scaffold (rename race). Re-run scaffold; orient decides resume vs. collision.\`);
+    }
+    throw e;
+  }
+  out({ action: 'scaffolded', target, plan_artifact_id: id.planArtifactId, plan_sku: id.planSku });
+}
+
+function toRelProposal(p) {
+  const norm = p.replace(/\\\\/g, '/');
+  const i = norm.indexOf('.lares/proposals/');
+  return i >= 0 ? norm.slice(i) : path.basename(norm);
+}
+function fsyncDir(dir) {
+  try { const fd = fs.openSync(dir, 'r'); fs.fsyncSync(fd); fs.closeSync(fd); }
+  catch { /* directory fsync unsupported on some platforms (e.g. Windows) — non-fatal */ }
+}
+
+// ---------- manifest (append responsibility / generic CAS) ----------
+function cmdManifest(args) {
+  const dir = args.dir;
+  if (!dir) die(2, 'manifest: --dir <plan-folder> required');
+  const manifestPath = path.join(dir, 'plan.json');
+
+  if (args['append-responsibility']) {
+    if (!fs.existsSync(manifestPath)) die(2, \`manifest: no plan.json at \${manifestPath}\`);
+    const agentId = args['agent-id'] || die(2, 'manifest --append-responsibility: --agent-id required');
+    const display = args.display || agentId;
+    const source = args.source || 'manual-skill';
+    const eventId = 'rev_' + hex(8);
+    try {
+      const next = withManifestCAS(dir, (obj) => {
+        if (!obj) throw new Error('plan.json is empty/unreadable');
+        obj.responsibility_events.push({ event_id: eventId, event: 'assigned', agent_id: agentId, display, at: nowMs(), source });
+        obj.updated_at = nowMs();
+        return obj;
+      }, args);
+      out({ action: 'appended', event_id: eventId, responsibility_events: next.responsibility_events.length });
+    } catch (e) {
+      if (e instanceof LockExhaustion) die(4, 'manifest: LOCK EXHAUSTION — mutation BLOCKED, no direct edit performed.', e.message);
+      throw e;
+    }
+    return;
+  }
+  die(2, 'manifest: specify --append-responsibility (the only supported mutation in P0).');
+}
+
+// ---------- inspect (read-only; NO rung parser) ----------
+function cmdInspect(args) {
+  const dir = args.dir;
+  if (!dir) die(2, 'inspect: --dir <plan-folder> required');
+  const manifestPath = path.join(dir, 'plan.json');
+  let manifest = null, manifestError = null;
+  try { manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8')); }
+  catch (e) { manifestError = e.message; }
+  const listing = fs.existsSync(dir)
+    ? fs.readdirSync(dir, { withFileTypes: true }).map((d) => ({
+        name: d.name, type: d.isDirectory() ? 'dir' : 'file',
+        children: d.isDirectory() ? fs.readdirSync(path.join(dir, d.name)) : undefined,
+      }))
+    : null;
+  const responsible = manifest?.responsibility_events?.length
+    ? manifest.responsibility_events[manifest.responsibility_events.length - 1]
+    : null;
+  out({
+    action: 'inspect', dir, manifest, manifest_error: manifestError,
+    current_responsible: responsible,     // last \`assigned\` event = current responsible supervisor
+    listing,
+    note: 'read-only dump; rung derivation is NOT performed here (P1 reader / P2L ledger owns it).',
+  });
+}
+
+// ---------- dispatch ----------
+const argv = process.argv.slice(2);
+const cmd = argv[0];
+const args = parseArgs(argv.slice(1));
+switch (cmd) {
+  case 'scaffold': cmdScaffold(args); break;
+  case 'manifest': cmdManifest(args); break;
+  case 'inspect': cmdInspect(args); break;
+  default:
+    die(2, \`usage: plan-manifest.mjs <scaffold|manifest|inspect> [flags]
+  scaffold --proposal <p.md> --plans-home <dir> [--request-id x] [--agent-id x] [--display x] [--slug x] [--date YYYY-MM-DD] [--verdict-line "..."]
+  manifest --dir <plan-folder> --append-responsibility --agent-id <id> [--display x] [--source manual-skill|promotion-service]
+  inspect  --dir <plan-folder>
+lock tuning (manifest/scaffold): --max-wait-ms N --poll-ms N   |   exit codes: 2 usage · 3 collision · 4 lock-exhaustion\`);
+}
+`;
+
