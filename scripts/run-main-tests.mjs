@@ -554,6 +554,19 @@ const TESTS = [
   'dist/main/main/plans/plan-rail-contract.test.js',
   // WP-P1A: planning-reader bounded enumeration + safe read IPC.
   'dist/main/main/plans/planning-reader.test.js',
+  // Planning-surface Stage P2 (gate P2Z) — folder-per-plan ingest + proposals.
+  // WP-P2A: proposals table schema/accessors.
+  'dist/main/main/database.proposals.test.js',
+  // WP-P2B: markdown proposal-row adoption into the plans/proposals surface.
+  'dist/main/main/md-row-adoption.test.js',
+  // WP-P2B: proposals-watcher — .lares/proposals/*.md filesystem ingest.
+  'dist/main/main/proposals-watcher.test.js',
+  // WP-P2D: plan-gallery projection (date-grouped rows, type/state chips).
+  'dist/main/main/plans/plan-gallery.test.js',
+  // WP-P2C-compat: structured-format exclusion from the HTML plan-projection path.
+  'dist/main/main/plans/structured-exclusion.test.js',
+  // WP-P2B-folder: plan-folder-watcher — <workspaceStateDir()>/plans/*/ ingest.
+  'dist/main/main/plans/plan-folder-watcher.test.js',
   'dist/main/main/browser/credentialed-open-diagnostic.test.js',
   'dist/main/main/browser/browser-signin-workspace-exact.test.js',
   'dist/main/main/browser/browser-signin-expiry.test.js',
