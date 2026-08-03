@@ -3841,6 +3841,13 @@ function absPlanPath(ws: Workspace, relPath: string): string {
 export async function resolvePlanProjection(planId: string): Promise<{ plan: import('../shared/types').Plan; projection: PlanProjection } | null> {
   const plan = getPlan(planId);
   if (!plan || plan.deletedAt) return null;
+  // WP-P2C-compat: a `format='structured'` (folder-adopted) plan has no HTML
+  // projection. Mechanically exclude it from EVERY HTML plan-projection path that
+  // funnels through here — the `/api/plans/:id/{sections,projection,sections/:anchor}`
+  // routes and the `plan:projection` IPC — by returning null (→ the routes 404 and
+  // the IPC returns null; a structured-not-applicable outcome, never a crash).
+  // Legacy `html`/`md` plans are unaffected (md keeps its existing HTML-parsed read).
+  if (plan.format === 'structured') return null;
   const served = getServedPlanProjection(planId);
   if (served) return { plan, projection: served };
   const ws = getWorkspace(plan.workspaceId);

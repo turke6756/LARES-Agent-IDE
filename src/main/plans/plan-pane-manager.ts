@@ -12,8 +12,23 @@
 
 import { session, WebContentsView } from 'electron';
 import type { BrowserWindow, Rectangle } from 'electron';
+import type { PlanFormat } from '../../shared/types';
 import { PLAN_PANE_WEB_PREFERENCES, buildPlanSurfaceDataUrl, clampPaneBoundsToContent } from './plan-render-pane';
 import { getServedPlanProjection } from './watch-plans';
+import { getPlan } from '../database';
+
+/** WP-P2C-compat — the production plan-format resolver. Returns the plan's
+ *  `format`, or null when the plan is unknown OR the DB is not yet initialized
+ *  (very early boot / a unit test with no `initDatabase`). `show()` suppresses the
+ *  pane only for a KNOWN `format==='structured'` plan; a null result renders as
+ *  before. */
+function defaultPlanFormat(planId: string): PlanFormat | null {
+  try {
+    return getPlan(planId)?.format ?? null;
+  } catch {
+    return null;
+  }
+}
 
 /** Ephemeral (non-`persist:`) partition — a plan surface keeps no cookies,
  *  storage, or cache across sessions. */
@@ -36,7 +51,13 @@ export class PlanPaneManager {
   // to the main window if the override was destroyed out from under us.
   private hostOverride: BrowserWindow | null = null;
 
-  constructor(private readonly getWindow: () => BrowserWindow | null) {}
+  constructor(
+    private readonly getWindow: () => BrowserWindow | null,
+    /** WP-P2C-compat — resolves a plan's `format` so `show()` can exclude a
+     *  `format='structured'` surface from the sandboxed HTML pane. Injectable for
+     *  tests; defaults to the DB-backed resolver. */
+    private readonly getPlanFormat: (planId: string) => PlanFormat | null = defaultPlanFormat,
+  ) {}
 
   /** The window the pane's WebContentsView should attach to right now. */
   private host(): BrowserWindow | null {
@@ -120,6 +141,11 @@ export class PlanPaneManager {
    *  re-render, never in-place DOM patching. Falls back to the served projection
    *  source when `rawHtml` is omitted (the reparse-refresh path). */
   show(planId: string, rawHtml?: string): void {
+    // WP-P2C-compat: a `format='structured'` (folder-adopted) plan has no HTML
+    // document to paint — no-op rather than construct a view and load an
+    // empty/mis-rendered doc. Legacy `html`/`md` surfaces (and an unknown/null
+    // format) render as before.
+    if (this.getPlanFormat(planId) === 'structured') return;
     const view = this.ensureView();
     if (!view) return;
     this.render(view, planId, rawHtml);

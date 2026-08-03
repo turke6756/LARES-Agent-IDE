@@ -22,7 +22,7 @@ import fs from 'fs';
 import type { Plan, PathType, Workspace } from '../../shared/types';
 import { readFileContents } from '../file-reader';
 import {
-  getWorkspace, recordPlanSectionChange, recordPlanSnapshot, getLatestPlanSnapshotHtml,
+  getWorkspace, getPlan, recordPlanSectionChange, recordPlanSnapshot, getLatestPlanSnapshotHtml,
 } from '../database';
 import { SectionCache, type ParsedSectionHash } from './section-cache';
 import {
@@ -80,6 +80,12 @@ export interface ReparseDeps {
 export interface ReparseOutcome {
   planId: string;
   ok: boolean;
+  /** WP-P2C-compat — the plan was mechanically excluded from the HTML reparse
+   *  pipeline because it is a `format='structured'` (folder-adopted) plan, which
+   *  has no HTML surface. A structured-not-applicable outcome: no parse, no anchor
+   *  mint, no snapshot, no change rows, `ok:false`. (Legacy `html`/`md` rows are
+   *  untouched — only `structured` is gated.) */
+  notApplicable: boolean;
   parseError: string | null;
   degradedFrom: 'memory' | 'snapshot' | 'empty' | null;
   mintedAnchors: string[];
@@ -129,10 +135,19 @@ export class PlanReparser {
   async reparse(plan: Plan): Promise<ReparseOutcome> {
     const planId = plan.id;
     const base: ReparseOutcome = {
-      planId, ok: false, parseError: null, degradedFrom: null,
+      planId, ok: false, notApplicable: false, parseError: null, degradedFrom: null,
       mintedAnchors: [], mintedBlockAnchors: [], archivedAnchors: [], changedAnchors: [],
       snapshotId: null, htmlWritten: false, warnings: [],
     };
+
+    // WP-P2C-compat: a `format='structured'` (folder-adopted) plan has no HTML
+    // surface — mechanically exclude it from the HTML reparse pipeline here: no
+    // parse, no anchor mint/backfill write, no snapshot, no change rows, no crash.
+    // Legacy `html`/`md` rows are unaffected (md keeps its existing HTML-parsed path).
+    if (plan.format === 'structured') {
+      base.notApplicable = true;
+      return base;
+    }
 
     const resolved = this.deps.resolveAbsolutePath(plan);
     if (!resolved) { log(`could not resolve path for plan ${planId}`); return base; }
@@ -256,7 +271,18 @@ export function resolveEditTargetAnchorForPlan(payload: string | null, planId: s
 
 /** The served projection accessor for WP3/WP5. */
 export function getServedPlanProjection(planId: string): PlanProjection | null {
-  return reparser ? reparser.getServedProjection(planId) : null;
+  if (!reparser) return null;
+  // WP-P2C-compat: a `format='structured'` (folder-adopted) plan never has an HTML
+  // projection — even if one somehow got seeded into last-good, mechanically refuse
+  // to serve it down the HTML render/read paths. The DB lookup is wrapped so a
+  // not-yet-initialized DB (very early boot / a unit test that never called
+  // initDatabase) falls through to the in-memory lookup, which is empty for such
+  // plans anyway. Legacy `html`/`md` rows are unaffected.
+  try {
+    const plan = getPlan(planId);
+    if (plan && plan.format === 'structured') return null;
+  } catch { /* DB not ready — fall through to the in-memory served projection */ }
+  return reparser.getServedProjection(planId);
 }
 
 /** Test seam — reset the singleton between suites. */
