@@ -66,7 +66,7 @@ export function findWindowsClaudePath(_env: NodeJS.ProcessEnv): Promise<string> 
   });
 }
 
-/** Absolute-path resolver for the codex / gemini CLIs on Windows.
+/** Absolute-path resolver for the codex / gemini / grok / agy CLIs on Windows.
  *
  *  Unlike claude (findWindowsClaudePath), codex and gemini have no known
  *  installer location, no existence preflight, and no clear error — so on a
@@ -77,7 +77,7 @@ export function findWindowsClaudePath(_env: NodeJS.ProcessEnv): Promise<string> 
  *  `where.exe` (which resolves anything already on the login PATH). Returns an
  *  absolute path — including a `.cmd` shim, which `cmd.exe /c` runs fine — or
  *  null when the binary genuinely cannot be found. */
-export function findWindowsProviderBinary(provider: 'codex' | 'gemini' | 'grok'): Promise<string | null> {
+export function findWindowsProviderBinary(provider: 'codex' | 'gemini' | 'grok' | 'agy'): Promise<string | null> {
   const home = userHome();
   const appData = process.env.APPDATA || path.join(home, 'AppData', 'Roaming');
   const localAppData = process.env.LOCALAPPDATA || path.join(home, 'AppData', 'Local');
@@ -100,6 +100,11 @@ export function findWindowsProviderBinary(provider: 'codex' | 'gemini' | 'grok')
     // FIRST, before the generic npm/program-dir fallbacks, mirroring how claude
     // and codex prefer their installer's known location.
     candidates.unshift(path.join(home, '.grok', 'bin', 'grok.exe'));
+  }
+  if (provider === 'agy') {
+    // The official Antigravity installer lands here. LOCALAPPDATA is
+    // authoritative (not a home dotfolder); check it before generic fallbacks.
+    candidates.unshift(path.join(localAppData, 'agy', 'bin', 'agy.exe'));
   }
   candidates.push(path.join(home, '.local', 'bin', `${provider}.exe`));
   candidates.push(path.join(home, '.local', 'bin', provider));
@@ -137,7 +142,7 @@ export function findWindowsProviderBinary(provider: 'codex' | 'gemini' | 'grok')
  *  their candidate lists — if the launcher can't find it, neither can we, and
  *  vice versa. */
 export function probeWindowsProvider(
-  provider: 'claude' | 'codex' | 'gemini' | 'grok',
+  provider: 'claude' | 'codex' | 'gemini' | 'grok' | 'agy',
 ): Promise<string | null> {
   if (provider === 'claude') {
     return findWindowsClaudePath(process.env as NodeJS.ProcessEnv).catch(() => null);
@@ -161,13 +166,15 @@ export function probeWindowsProvider(
  *
  *  Never let a missing executable degrade into a blank terminal or a bare
  *  exit code. */
-export function missingProviderMessage(provider: 'claude' | 'codex' | 'gemini' | 'grok'): string {
+export function missingProviderMessage(provider: 'claude' | 'codex' | 'gemini' | 'grok' | 'agy'): string {
   const label = provider === 'claude'
     ? 'Claude Code'
     : provider === 'codex' ? 'Codex'
-    : provider === 'grok' ? 'Grok Build' : 'Gemini';
+    : provider === 'grok' ? 'Grok Build'
+    : provider === 'agy' ? 'Antigravity CLI' : 'Gemini';
+  const namedCli = provider === 'agy' ? label : `${label} CLI`;
   return (
-    `${label} CLI was not found.\n\n` +
+    `${namedCli} was not found.\n\n` +
     `Lares is installed correctly, but ${label} is a separate command-line tool ` +
     `that Lares runs on your behalf. Install ${label}, fully quit and restart ` +
     `Lares so it picks up your updated PATH, then choose Recheck in ` +

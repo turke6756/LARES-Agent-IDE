@@ -144,6 +144,7 @@ function setup(opts: {
    *  side-effects; the real confirm mechanism is unit-tested in
    *  status-monitor.test.ts. Set false to exercise the exhaustion/throw path. */
   confirmResult?: boolean;
+  outputTail?: string;
 }): Harness {
   const agentsMap = new Map<string, Agent>([[opts.agent.id, opts.agent]]);
   const restoreDb = patchDb(agentsMap);
@@ -168,13 +169,15 @@ function setup(opts: {
   // Suppress writes to ~/.claude/agent-registry.json triggered by emit('statusChanged').
   (supervisor as unknown as { writeAgentRegistry: () => void }).writeAgentRegistry = () => {};
 
+  const calls: string[] = [];
   if (opts.injectRunner === 'windows') {
     const fake = new WindowsRunner();
     Object.defineProperty(fake, 'isAlive', {
       get: () => opts.alive !== false,
       configurable: true,
     });
-    (fake as unknown as { write: (data: string) => void }).write = () => {};
+    (fake as unknown as { write: (data: string) => void }).write = () => { calls.push('runner.write'); };
+    (fake as unknown as { getOutputRingTail: () => string }).getOutputRingTail = () => opts.outputTail ?? '';
     (supervisor as unknown as { windowsRunners: Map<string, WindowsRunner> })
       .windowsRunners.set(opts.agent.id, fake);
   } else if (opts.injectRunner === 'wsl') {
@@ -187,7 +190,6 @@ function setup(opts: {
       .wslRunners.set(opts.agent.id, fake);
   }
 
-  const calls: string[] = [];
   const bridge = (supervisor as unknown as { bridge: { notifyUserInputDelivered: (id: string) => void } }).bridge;
   const realNotify = bridge.notifyUserInputDelivered.bind(bridge);
   bridge.notifyUserInputDelivered = (id: string) => {
@@ -334,6 +336,33 @@ test('Case 3c: sendInput on idle plain WORKER (isWorker) fires NO seed — statu
       ['notifyUserInputDelivered'],
       'plain workers derive working solely from the UserPromptSubmit hook',
     );
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('agy signed-out screen rejects a dashboard message before typing and returns the auth prompt', async () => {
+  const agent = makeAgent('agy-auth', {
+    provider: 'agy',
+    status: 'waiting',
+    isWorker: true,
+    command: 'agy',
+    workingDirectory: 'C:\\tmp',
+  });
+  const h = setup({
+    agent,
+    injectRunner: 'windows',
+    alive: true,
+    outputTail: 'Welcome to the Antigravity CLI. You are currently not signed in.\n⣷ Signing in…',
+  });
+  try {
+    const outcome = await h.supervisor.sendInputWithOutcome(agent.id, 'hello', { submit: true });
+    assert.equal(outcome.disposition, 'failed');
+    assert.equal(outcome.delivered, false);
+    assert.equal(outcome.reason, 'interactive-prompt');
+    assert.equal(outcome.prompt?.kind, 'sign-in');
+    assert.ok(!h.calls.includes('runner.write'), 'no prompt bytes may be typed into the auth screen');
+    assert.ok(!h.calls.includes('notifyUserInputDelivered'), 'a rejected auth-screen send cannot clear waiting');
   } finally {
     h.cleanup();
   }
@@ -1894,6 +1923,69 @@ test('grok worker: the resolved .grok\\bin\\grok.exe + worker env reach runner.l
       typeof capturedEnv!.DASHBOARD_SPOOL_PATH === 'string' && capturedEnv!.DASHBOARD_SPOOL_PATH.length > 0,
       'grok worker must receive DASHBOARD_SPOOL_PATH',
     );
+  } finally {
+    (WindowsRunner.prototype as { launch: unknown }).launch = origWinLaunch;
+    h.cleanup();
+    for (const [k, v] of Object.entries(savedEnv)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    try { fs.rmSync(scratchRoot, { recursive: true, force: true }); } catch { /* best effort */ }
+  }
+});
+
+test('agy worker: the resolved %LOCALAPPDATA%\\agy\\bin\\agy.exe + worker env reach runner.launch', async () => {
+  const scratchRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'lares-agy-launch-'));
+  const home = path.join(scratchRoot, 'home');
+  const localAppData = path.join(home, 'AppData', 'Local');
+  const agyExe = path.join(localAppData, 'agy', 'bin', 'agy.exe');
+  fs.mkdirSync(path.dirname(agyExe), { recursive: true });
+  fs.writeFileSync(agyExe, 'fake agy');
+  const workDir = path.join(scratchRoot, 'ws');
+  fs.mkdirSync(workDir, { recursive: true });
+
+  const savedEnv = {
+    USERPROFILE: process.env.USERPROFILE,
+    APPDATA: process.env.APPDATA,
+    LOCALAPPDATA: process.env.LOCALAPPDATA,
+    PATH: process.env.PATH,
+  };
+  process.env.USERPROFILE = home;
+  process.env.APPDATA = path.join(home, 'AppData', 'Roaming');
+  process.env.LOCALAPPDATA = localAppData;
+  process.env.PATH = '';
+
+  const agent = makeAgent('agy-launch', {
+    provider: 'agy', isWorker: true, isSupervised: false,
+    command: 'agy', workingDirectory: workDir,
+  });
+  const h = setup({ agent, injectRunner: 'none' });
+  (h.supervisor as unknown as { ensureSpoolTailer: (a: Agent) => void }).ensureSpoolTailer = () => {};
+
+  const origWinLaunch = (WindowsRunner.prototype as { launch: unknown }).launch;
+  let capturedCmd: string | undefined;
+  let capturedEnv: Record<string, string> | undefined;
+  (WindowsRunner.prototype as { launch: unknown }).launch = function (
+    this: WindowsRunner,
+    _workDir: string,
+    cmd: string,
+    _args: string[],
+    _logPath: string,
+    _directSpawn?: boolean,
+    extraEnv?: Record<string, string>,
+  ) {
+    capturedCmd = cmd;
+    capturedEnv = extraEnv;
+    (this as unknown as { _pid: number; _alive: boolean })._pid = 1;
+    (this as unknown as { _pid: number; _alive: boolean })._alive = true;
+  };
+  try {
+    await (h.supervisor as unknown as { launchWindowsAgent: (a: Agent) => Promise<void> })
+      .launchWindowsAgent(agent);
+    assert.equal(capturedCmd, agyExe);
+    assert.equal(capturedEnv?.AGENT_ID, agent.id);
+    assert.equal(capturedEnv?.DASHBOARD_PORT, String((h.supervisor as unknown as { apiServerPort: number }).apiServerPort));
+    assert.ok(capturedEnv?.DASHBOARD_SPOOL_PATH);
   } finally {
     (WindowsRunner.prototype as { launch: unknown }).launch = origWinLaunch;
     h.cleanup();

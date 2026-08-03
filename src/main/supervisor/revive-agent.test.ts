@@ -475,6 +475,18 @@ test('grok → revive-unsupported-provider (422), message names grok as not-yet-
     'the error still names the supported providers');
 }));
 
+test('agy → revive-unsupported-provider (422), message names agy as not-yet-session-mapped', () => withHarness(async (h) => {
+  const agent = terminalWorker(h.workspacePath, { provider: 'agy' });
+  h.agents.push(agent);
+  let caught: { code?: string; statusCode?: number; message?: string } | null = null;
+  try { await h.supervisor.reviveAgent(agent.id, {}); }
+  catch (err) { caught = err as { code?: string; statusCode?: number; message?: string }; }
+  assert.ok(caught, 'agy revival throws');
+  assert.equal(caught!.code, 'revive-unsupported-provider');
+  assert.equal(caught!.statusCode, 422);
+  assert.match(caught!.message ?? '', /gemini, grok and agy are not yet session-mapped/);
+}));
+
 test('grok revive rejects WITHOUT synthesizing a cwd-based session identity', () => withHarness(async (h) => {
   // Boundary (plan §4.3): assertResumable hits the default: branch for grok and
   // throws BEFORE any codex session resolution. A grok agent must never have a

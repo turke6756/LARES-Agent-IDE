@@ -4426,16 +4426,16 @@ export class AgentSupervisor extends EventEmitter {
     }
     const useDirectSpawn = needsDirectSpawn && launchCmd !== cmd;
 
-    // Codex/Gemini/Grok have no known-install resolver like claude's, and go
+    // Codex/Gemini/Grok/Agy have no known-install resolver like claude's, and go
     // through pty-host's `cmd.exe /c` wrap (useDirectSpawn is claude-only).
-    // Electron's login-time PATH can omit a codex/gemini/grok shim that works in
+    // Electron's login-time PATH can omit a codex/gemini/grok/agy shim that works in
     // the user's terminal, so a bare `cmd.exe /c codex` crashes with a cryptic
     // "'codex' is not recognized". Resolve the real binary to an absolute path
     // and launch that; if it genuinely can't be found, fail loudly with a
     // user-visible message. Keying off provider (not the literal token) also
     // rescues a wsl-style `ccodex`/`ccode` command that landed on the Windows
-    // path. (Grok resolves .grok\bin\grok.exe first — see provider-resolver.)
-    if (agent.provider === 'codex' || agent.provider === 'gemini' || agent.provider === 'grok') {
+    // path. Known installer locations are preferred by provider-resolver.
+    if (agent.provider === 'codex' || agent.provider === 'gemini' || agent.provider === 'grok' || agent.provider === 'agy') {
       const resolvedBinary = await findWindowsProviderBinary(agent.provider);
       if (resolvedBinary) {
         launchCmd = resolvedBinary;
@@ -4967,6 +4967,15 @@ export class AgentSupervisor extends EventEmitter {
     // transport probe passes). Fail with a user-visible message, not a crash.
     if (agent.provider === 'grok') {
       const message = 'Grok is not yet supported in WSL workspaces. Re-create the workspace as a Windows path type to launch a Grok agent.';
+      console.error(`[WSL] ${message}`);
+      updateAgentStatus(agent.id, 'crashed');
+      addEvent(agent.id, 'crashed', JSON.stringify({ error: message }));
+      throw new Error(message);
+    }
+    // Agy is Windows-first for the same reason: a WSL install is a separate
+    // Linux binary/sign-in and its transport has not been probed.
+    if (agent.provider === 'agy') {
+      const message = 'Antigravity CLI is not yet supported in WSL workspaces. Re-create the workspace as a Windows path type to launch an Antigravity agent.';
       console.error(`[WSL] ${message}`);
       updateAgentStatus(agent.id, 'crashed');
       addEvent(agent.id, 'crashed', JSON.stringify({ error: message }));
@@ -6428,7 +6437,7 @@ export class AgentSupervisor extends EventEmitter {
    *   the launch-time BUG-21 guard at launchWindowsAgent/launchWslAgent).
    * - codex:  `resolveCodexResumeSessionId` resolves (record OR cwd-matching
    *   rollout), mirroring the launch throw.
-   * - gemini (and any other provider): bare `--resume` is not session-
+   * - gemini/grok/agy (and any other provider): bare `--resume` is not session-
    *   addressable → v1 rejects with `revive-unsupported-provider`, naming the
    *   supported providers in the error message.
    */
@@ -6448,7 +6457,7 @@ export class AgentSupervisor extends EventEmitter {
       }
       default:
         throw revErr('revive-unsupported-provider', 422, {
-          message: 'revive supports: claude, codex; gemini and grok are not yet session-mapped',
+          message: 'revive supports: claude, codex; gemini, grok and agy are not yet session-mapped',
         });
     }
   }
@@ -7572,6 +7581,19 @@ export class AgentSupervisor extends EventEmitter {
     dispatch?: DispatchContext,
   ): Promise<SendOutcome> {
     const agent = getAgent(agentId);
+    // Agy's Phase-0 capture exposes a branded signed-out startup screen. Do not
+    // type a dashboard message into that authentication UI: fail before any PTY
+    // byte, preserve the draft, and return the prompt metadata used by every
+    // surface's "open the terminal to sign in" teaching hint.
+    if (submit && agent?.provider === 'agy') {
+      const prompt = this.classifyPtyPrompt(agentId);
+      if (prompt?.kind === 'sign-in') {
+        return this.recordSendOutcome({
+          disposition: 'failed', agentId, delivered: false,
+          reason: 'interactive-prompt', prompt, completedAt: Date.now(),
+        });
+      }
+    }
     // Baselines captured BEFORE delivery so replayed/pre-existing evidence can
     // never confirm this send (baseline-gated on both the hook clock and the
     // session-log high-water mark).
@@ -7605,7 +7627,8 @@ export class AgentSupervisor extends EventEmitter {
     const delivered = await this._doSendInput(agentId, text, submit);
     if (!delivered) {
       // The runner rejected/disappeared before accepting the bytes — nothing was
-      // typed. This is the ONLY `failed` path; hook/confirmation gaps never are.
+      // typed. Along with the explicit agy auth preflight above, this is a valid
+      // `failed` path; hook/confirmation gaps never are.
       // Close the just-opened turn `delivery_failed` (never leave it `open`).
       if (openedTurn) this.checkpointEngine?.coordinator.onDeliveryFailed(agentId);
       return this.recordSendOutcome({
@@ -7870,11 +7893,9 @@ export class AgentSupervisor extends EventEmitter {
           console.warn(`[sendInput] Skipping send to ${agent.title} — runner not alive`);
           return false;
         }
-        // Grok is intentionally NOT in this tmux known-provider whitelist: grok
-        // on WSL is refused at launch (see launchWslAgent) and its WSL submit
-        // encoding is unproven, so it must never route through the kitty-CSI
-        // path here — it stays 'unknown' (legacy `\r`) and cannot reach this
-        // branch anyway.
+        // Grok and agy are intentionally NOT in this tmux known-provider
+        // whitelist: both are refused on WSL until their Linux transports are
+        // probed, so neither can reach this branch as a known provider.
         const provider = agent.provider === 'claude' || agent.provider === 'codex' || agent.provider === 'gemini'
           ? agent.provider
           : 'unknown';
@@ -7972,11 +7993,9 @@ export class AgentSupervisor extends EventEmitter {
 
   private emitSyntheticUserEcho(agent: Agent, text: string): void {
     // Providers with no native dashboard-readable session log: submitted text
-    // would otherwise vanish from the chat pane. Grok is deliberately in this
-    // set (it is NOT session-backed — no SessionLogReader registration), mirroring
-    // gemini. The grok Windows transport that invokes this is wired with the
-    // submit encoding (later commit); membership here is the classification seam.
-    if (agent.provider !== 'codex' && agent.provider !== 'gemini' && agent.provider !== 'grok') return;
+    // would otherwise vanish from the chat pane. Grok and agy deliberately join
+    // gemini here; neither gets a SessionLogReader registration.
+    if (agent.provider !== 'codex' && agent.provider !== 'gemini' && agent.provider !== 'grok' && agent.provider !== 'agy') return;
     this.sessionLogReader.appendSyntheticUserText(agent.id, text);
   }
 

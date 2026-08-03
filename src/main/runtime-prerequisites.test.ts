@@ -189,12 +189,12 @@ test('WSL running → the in-distro checks do run', async () => {
 });
 
 // ── Honesty rules the UI depends on ────────────────────────────────────────
-test('all four providers are always listed, independently, in the agent-cli tier', async () => {
+test('all five providers are always listed, independently, in the agent-cli tier', async () => {
   const restore = withEmptyHome();
   reset();
   try {
     const report = await detectRuntimePrerequisites({ force: true });
-    assert.deepEqual(report.providers.map((p) => p.id), ['claude', 'codex', 'gemini', 'grok']);
+    assert.deepEqual(report.providers.map((p) => p.id), ['claude', 'codex', 'gemini', 'grok', 'agy']);
     for (const p of report.providers) {
       assert.equal(p.tier, 'agent-cli');
       assert.equal(p.status, 'missing', `${p.id} should be missing in an empty home`);
@@ -274,6 +274,42 @@ test('grok row: a resolved binary whose --version never answers still reports AV
     assert.equal(grok.status, 'available', 'a resolved-but-unversionable grok is still available');
     assert.ok(grok.path && grok.path.endsWith(path.join('.grok', 'bin', 'grok.exe')), `expected the installer path, got ${grok.path}`);
     assert.equal(grok.version, undefined, 'an unanswered --version yields no version, never a crash');
+  } finally {
+    restore();
+  }
+});
+
+// Antigravity rides the same resolver + --version path, with its official
+// installer location rooted at LOCALAPPDATA rather than USERPROFILE.
+test('agy row: MISSING in an empty home and branded as Antigravity CLI', async () => {
+  const restore = withEmptyHome();
+  reset();
+  try {
+    const report = await detectRuntimePrerequisites({ force: true });
+    const agy = report.providers.find((p) => p.id === 'agy');
+    assert.ok(agy, 'agy must always be present in the providers list');
+    assert.equal(agy.status, 'missing');
+    assert.equal(agy.label, 'Antigravity CLI');
+    assert.ok(agy.docsUrl);
+    assert.ok(agy.installCommand);
+  } finally {
+    restore();
+  }
+});
+
+test('agy row: AVAILABLE from %LOCALAPPDATA%\\agy\\bin\\agy.exe with version best-effort', async () => {
+  const restore = withEmptyHome();
+  reset();
+  writeExec(
+    path.join(process.env.LOCALAPPDATA as string, 'agy', 'bin', 'agy.exe'),
+    'not a real executable',
+  );
+  try {
+    const report = await detectRuntimePrerequisites({ force: true });
+    const agy = report.providers.find((p) => p.id === 'agy');
+    assert.ok(agy);
+    assert.equal(agy.status, 'available');
+    assert.ok(agy.path?.endsWith(path.join('agy', 'bin', 'agy.exe')), `unexpected path: ${agy.path}`);
   } finally {
     restore();
   }
@@ -369,7 +405,7 @@ test('never throws, even when every probe fails', async () => {
   process.env.SystemRoot = path.join(os.tmpdir(), 'no-such-windows-root');
   try {
     const report = await detectRuntimePrerequisites({ force: true });
-    assert.ok(report.providers.length === 4);
+    assert.ok(report.providers.length === 5);
     assert.equal(report.anyProviderAvailable, false);
   } finally {
     if (savedSystemRoot === undefined) delete process.env.SystemRoot;

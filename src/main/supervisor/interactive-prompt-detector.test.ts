@@ -78,6 +78,16 @@ test('sign-in: OAuth paste-code gate', () => {
   expectKind(tail, 'sign-in');
 });
 
+test('sign-in: agy captured signed-out startup screen', () => {
+  const tail = [
+    'Welcome to the Antigravity CLI. You are currently not signed in.',
+    '⣷ Signing in…',
+  ].join('\n');
+  expectKind(tail, 'sign-in');
+  const match = detectInteractivePrompt(tail)!;
+  assert.match(match.excerpt, /currently not signed in/i);
+});
+
 test('approval: do you want to proceed box', () => {
   const tail = [
     'Bash(rm -rf build/)',

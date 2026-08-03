@@ -134,15 +134,20 @@ const SIGNATURES: Signature[] = [
     kind: 'sign-in',
     label: 'sign-in prompt',
     // Provider login chrome. NOT a bare "Sign in" in prose — requires the
-    // login-method menu, an explicit "Log in with <provider>", or an OAuth
-    // "paste the code / visit <url> to authenticate" gate.
+    // login-method menu, an explicit "Log in with <provider>", an OAuth
+    // "paste the code / visit <url> to authenticate" gate, or agy's captured
+    // startup auth chrome. The agy signature requires its branded welcome plus
+    // the exact signed-out state so ordinary prose containing "sign in" stays
+    // forbidden (Phase-0 probe §0.1a).
     match: (c) =>
       /select login method/i.test(c.joined)
       || /\blog ?in with \S/i.test(c.joined)
       || /choose an authentication method/i.test(c.joined)
       || /(visit|open) https?:\/\/\S+ to (authenticate|sign in|log ?in)/i.test(c.joined)
       || /paste (the|your) (code|authorization code) here/i.test(c.joined)
-        ? lineMatching(c, /select login method|log ?in with \S|authentication method|to (authenticate|sign in|log ?in)|paste (the|your) (code|authorization code)/i)
+      || (/welcome to the antigravity cli/i.test(c.joined)
+        && /you are currently not signed in/i.test(c.joined))
+        ? lineMatching(c, /select login method|log ?in with \S|authentication method|to (authenticate|sign in|log ?in)|paste (the|your) (code|authorization code)|you are currently not signed in/i)
             ?? excerptOf(c.joined)
         : null,
   },

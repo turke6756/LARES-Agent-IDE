@@ -1820,7 +1820,7 @@ export class ApiServer {
           const result = hasWireBinding
             ? await this.supervisor.sendInputWithOutcome(agentId, text, {}, dispatch).then((outcome) => {
                 if (!outcome.delivered) {
-                  throw Object.assign(new Error('Input delivery failed'), { code: 'delivery-failed' });
+                  throw Object.assign(new Error(sendOutcomeMessage(outcome).text), { code: 'delivery-failed' });
                 }
                 return {
                   delivered: true,

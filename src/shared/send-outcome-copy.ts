@@ -39,6 +39,15 @@ export function sendOutcomeMessage(o: SendOutcome): SendOutcomeCopy {
   // double-click instruction. Both branches carry the mandatory sentence.
   if (o.prompt) {
     const excerpt = o.prompt.excerpt ? `: “${o.prompt.excerpt}”` : '';
+    if (o.prompt.kind === 'sign-in') {
+      const named =
+        `The agent is at its sign-in screen${excerpt}. ` +
+        'Open the terminal to finish signing in, then resend the message.';
+      return {
+        tone: o.disposition === 'failed' ? 'error' : 'warn',
+        text: `${named} ${TERMINAL_CHECK_SENTENCE}`,
+      };
+    }
     const named =
       `The terminal appears to be waiting on a ${o.prompt.label}${excerpt}. ` +
       'Double-click the agent card and accept it there.';

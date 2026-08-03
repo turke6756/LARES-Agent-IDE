@@ -56,8 +56,8 @@ let cachedReport: RuntimePrerequisiteReport | null = null;
 let cachedAt = 0;
 let inFlight: Promise<RuntimePrerequisiteReport> | null = null;
 
-type ProviderId = 'claude' | 'codex' | 'gemini' | 'grok';
-const PROVIDER_IDS: ProviderId[] = ['claude', 'codex', 'gemini', 'grok'];
+type ProviderId = 'claude' | 'codex' | 'gemini' | 'grok' | 'agy';
+const PROVIDER_IDS: ProviderId[] = ['claude', 'codex', 'gemini', 'grok', 'agy'];
 
 /** Run `<binary> --version` and return the first non-empty output line.
  *

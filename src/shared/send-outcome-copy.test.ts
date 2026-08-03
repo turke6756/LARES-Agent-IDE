@@ -43,6 +43,17 @@ test('a detected prompt is NAMED (label + excerpt) and still carries the sentenc
   assert.ok(copy.text.includes(TERMINAL_CHECK_SENTENCE), 'still carries the mandatory sentence');
 });
 
+test('a sign-in prompt teaches the user to open the terminal and finish auth', () => {
+  const copy = sendOutcomeMessage(outcome({
+    disposition: 'failed', delivered: false, reason: 'interactive-prompt',
+    prompt: { kind: 'sign-in', label: 'sign-in prompt', excerpt: 'You are currently not signed in.' },
+  }));
+  assert.equal(copy.tone, 'error');
+  assert.match(copy.text, /open the terminal to finish signing in/i);
+  assert.match(copy.text, /then resend the message/i);
+  assert.ok(copy.text.includes(TERMINAL_CHECK_SENTENCE));
+});
+
 test('confirmed is a brief/empty ok banner', () => {
   const copy = sendOutcomeMessage(outcome({ disposition: 'confirmed', confirmationSource: 'hook' }));
   assert.equal(copy.tone, 'ok');

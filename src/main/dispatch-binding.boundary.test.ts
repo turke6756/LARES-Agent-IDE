@@ -5,7 +5,7 @@ import http from 'node:http';
 
 import { ApiServer, resolvePlanBindingAtBoundary } from './api-server';
 import type { AgentSupervisor } from './supervisor';
-import type { Agent, GitCapability, Plan } from '../shared/types';
+import type { Agent, GitCapability, Plan, SendOutcome } from '../shared/types';
 import type { DispatchContext, DispatchDeps } from './git-checkpoints/dispatch-context';
 import { buildDispatchTurnContext } from './git-checkpoints/dispatch-context';
 
@@ -49,7 +49,7 @@ interface Harness {
   cleanup(): void;
 }
 
-function makeHarness(): Harness {
+function makeHarness(sendOutcome?: SendOutcome): Harness {
   // Patch the CommonJS export read by api-server's database import. This keeps
   // the boundary test isolated from the real application database.
   // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -72,7 +72,7 @@ function makeHarness(): Harness {
     },
     sendInputWithOutcome: async (agentId: string, text: string, _opts: unknown, dispatch?: DispatchContext) => {
       outcomeSends.push({ agentId, text, dispatch });
-      return { disposition: 'confirmed', agentId, delivered: true, confirmationSource: 'hook', completedAt: Date.now() };
+      return sendOutcome ?? { disposition: 'confirmed', agentId, delivered: true, confirmationSource: 'hook', completedAt: Date.now() };
     },
     sendInputConfirmed: async () => ({ delivered: true, confirmed: true, mode: 'hook' }),
   } as unknown as AgentSupervisor;
@@ -151,6 +151,28 @@ test('API confirmed explicit binding uses the context-carrying outcome path', as
     assert.deepEqual(await stampFrom(h.outcomeSends[0].dispatch!), {
       planId: 'plan-valid', planItemId: null, source: 'explicit',
     });
+  } finally { h.cleanup(); }
+});
+
+test('API confirmed delivery preserves an interactive sign-in teaching hint', async () => {
+  const h = makeHarness({
+    disposition: 'failed',
+    agentId: target.id,
+    delivered: false,
+    reason: 'interactive-prompt',
+    prompt: { kind: 'sign-in', label: 'Antigravity CLI sign-in', excerpt: 'You are currently not signed in' },
+    completedAt: Date.now(),
+  });
+  try {
+    const res = await callInput(h.api, {
+      text: 'do it', confirm: true, requestedPlanBinding: {
+        mode: 'explicit', planId: 'plan-valid', planItemId: null,
+      },
+    });
+    assert.equal(res.status, 502);
+    assert.equal(res.body.code, 'delivery-failed');
+    assert.match(res.body.error, /Open the terminal to finish signing in, then resend the message\./);
+    assert.equal(h.outcomeSends.length, 1);
   } finally { h.cleanup(); }
 });
 

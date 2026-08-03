@@ -314,6 +314,7 @@ export const MAX_SUBMIT_RETRIES = 3;
 //   - AGENTDASH_LAUNCH_SETTLE_MS_CODEX
 //   - AGENTDASH_LAUNCH_SETTLE_MS_GEMINI
 //   - AGENTDASH_LAUNCH_SETTLE_MS_GROK
+//   - AGENTDASH_LAUNCH_SETTLE_MS_AGY
 function _readSettleMs(envName: string, fallback: number): number {
   const raw = process.env[envName];
   if (!raw) return fallback;
@@ -326,6 +327,7 @@ export const LAUNCH_SETTLE_TIMEOUT_MS: Record<AgentProvider, number> = {
   codex:  _readSettleMs('AGENTDASH_LAUNCH_SETTLE_MS_CODEX',  25_000),
   gemini: _readSettleMs('AGENTDASH_LAUNCH_SETTLE_MS_GEMINI', 10_000),
   grok:   _readSettleMs('AGENTDASH_LAUNCH_SETTLE_MS_GROK',   15_000),
+  agy:    _readSettleMs('AGENTDASH_LAUNCH_SETTLE_MS_AGY',    15_000),
 };
 // Narrow watchdog: warn if a `launching` agent persists past
 // LAUNCH_SETTLE_TIMEOUT_MS[provider] + this grace, which means the settle
@@ -345,6 +347,9 @@ export const PROVIDER_COMMANDS: Record<AgentProvider, { windows: string; wsl: st
   // `wsl` value is a placeholder to satisfy the exhaustive Record; grok on WSL
   // is refused at launch until a WSL transport probe passes (plan §1.6/§Open 3).
   grok:   { windows: 'grok', wsl: 'grok' },
+  // The official installer exposes `agy`. WSL is a type-satisfying placeholder:
+  // the Linux binary/auth/transport have not been probed, so launch refuses it.
+  agy:    { windows: 'agy', wsl: 'agy' },
 };
 
 /** Default model pin for claude worker-lane agents. Injected at launch (both
@@ -358,6 +363,7 @@ export const PROVIDER_META: Record<AgentProvider, { label: string; color: string
   gemini: { label: 'Gemini', color: '#3B82F6', bgClass: 'bg-blue-500/20', textClass: 'text-blue-400' },
   codex:  { label: 'Codex',  color: '#22C55E', bgClass: 'bg-green-500/20', textClass: 'text-green-400' },
   grok:   { label: 'Grok',   color: '#A855F7', bgClass: 'bg-purple-500/20', textClass: 'text-purple-400' },
+  agy:    { label: 'Antigravity', color: '#14B8A6', bgClass: 'bg-teal-500/20', textClass: 'text-teal-400' },
 };
 
 /** Default agent name used with --agent flag for supervisor instances */
@@ -5057,6 +5063,16 @@ export const PROVIDER_INSTALL_HINTS: Record<AgentProvider, ProviderInstallHint> 
     installShell: 'PowerShell',
     altCommand: 'npm i -g @xai-official/grok',
     installNote: 'First launch authenticates through grok.com in your browser.',
+    verifiedOn: PROVIDER_INSTALL_HINTS_VERIFIED_ON,
+  },
+  // Antigravity CLI. The official PowerShell installer lands agy.exe under
+  // %LOCALAPPDATA%\agy\bin, the first location provider-resolver checks.
+  agy: {
+    label: 'Antigravity CLI',
+    docsUrl: 'https://antigravity.google/docs/cli/getting-started',
+    installCommand: 'irm https://antigravity.google/cli/install.ps1 | iex',
+    installShell: 'PowerShell',
+    installNote: 'First launch signs in with Google in your browser; credentials persist per-machine.',
     verifiedOn: PROVIDER_INSTALL_HINTS_VERIFIED_ON,
   },
 };

@@ -34,7 +34,7 @@ import type {
 } from './browser';
 
 export type PathType = 'windows' | 'wsl';
-export type AgentProvider = 'claude' | 'gemini' | 'codex' | 'grok';
+export type AgentProvider = 'claude' | 'gemini' | 'codex' | 'grok' | 'agy';
 
 // Hardcoded first-class app role-lanes. 'researcher' is a third lane alongside
 // 'supervisor' and 'worker' (browser-parity-and-capability-isolation §0); see
@@ -497,22 +497,23 @@ export interface Agent {
  *  bytes but no start evidence arrived before the confirmation deadline — this
  *  is NOT a failure (a hookless provider can start a turn invisibly), so it must
  *  never be rendered as "Send failed". `failed`: no runner accepted the bytes,
- *  so nothing was typed. Hook absence (or hooks-were-healthy-earlier) must NEVER
- *  be converted into `failed`. */
+ *  or a provider-specific preflight rejected a blocking interactive screen
+ *  before delivery, so nothing was typed. Hook absence must NEVER be converted
+ *  into `failed`. */
 export type SendDisposition = 'confirmed' | 'delivered-unconfirmed' | 'failed';
 
 export interface SendOutcome {
   disposition: SendDisposition;
   agentId: string;
   /** True when the runner accepted the bytes (delivered-unconfirmed + confirmed);
-   *  false only for `failed`. */
+   *  false only for `failed` (including a pre-delivery prompt guard). */
   delivered: boolean;
   /** Which independent evidence source proved the turn started (confirmed only). */
   confirmationSource?: 'hook' | 'session-log' | 'status';
   reason?: 'delivery-failed' | 'confirmation-timeout' | 'interactive-prompt';
   /** Populated when the WP4 PTY classifier recognized a blocking prompt on a
-   *  `delivered-unconfirmed` outcome, so surfaces can name what the terminal is
-   *  waiting on. */
+   *  `delivered-unconfirmed` outcome or a provider-specific pre-delivery guard,
+   *  so surfaces can name what the terminal is waiting on. */
   prompt?: { kind: string; label: string; excerpt: string };
   completedAt: number;
 }

@@ -188,6 +188,32 @@ test('grok resolves to null when nothing is installed', async () => {
   }
 });
 
+test('agy resolves %LOCALAPPDATA%\\agy\\bin\\agy.exe before an npm shim', async () => {
+  const fake = withFakeHome('user', (home) => {
+    writeShim(path.join(home, 'AppData', 'Local', 'agy', 'bin', 'agy.exe'));
+    writeShim(path.join(home, 'AppData', 'Roaming', 'npm', 'agy.cmd'));
+  });
+  try {
+    const found = await findWindowsProviderBinary('agy');
+    assert.ok(found);
+    assert.ok(found.endsWith(path.join('agy', 'bin', 'agy.exe')), `unexpected resolution: ${found}`);
+  } finally {
+    fake.restore();
+  }
+});
+
+test('agy falls back to an npm-global shim when the installer path is absent', async () => {
+  const fake = withFakeHome('user', (home) => {
+    writeShim(path.join(home, 'AppData', 'Roaming', 'npm', 'agy.cmd'));
+  });
+  try {
+    const found = await findWindowsProviderBinary('agy');
+    assert.ok(found?.endsWith('agy.cmd'), `unexpected resolution: ${found}`);
+  } finally {
+    fake.restore();
+  }
+});
+
 // probeWindowsProvider is what preflight calls. Its contract is "never throws";
 // findWindowsClaudePath REJECTS when claude is absent, so the wrapper has to
 // absorb that. A regression here would crash the whole health check.
@@ -222,7 +248,7 @@ test('preflight resolves to exactly what the launcher would use', async () => {
 
 // ── The user-facing copy (plan §6.4) ───────────────────────────────────────
 test('missing-provider copy says Lares is fine and names the restart step', () => {
-  for (const p of ['claude', 'codex', 'gemini', 'grok'] as const) {
+  for (const p of ['claude', 'codex', 'gemini', 'grok', 'agy'] as const) {
     const msg = missingProviderMessage(p);
     assert.match(msg, /was not found/, `${p}: must state what is missing`);
     assert.match(msg, /Lares is installed correctly/, `${p}: must not read as "Lares is broken"`);
@@ -235,6 +261,7 @@ test('missing-provider copy says Lares is fine and names the restart step', () =
   assert.match(missingProviderMessage('codex'), /^Codex CLI was not found\./);
   // Grok brands as "Grok Build" — the label must reach the copy.
   assert.match(missingProviderMessage('grok'), /^Grok Build CLI was not found\./);
+  assert.match(missingProviderMessage('agy'), /^Antigravity CLI was not found\./);
 });
 
 test('getWindowsSystemPath does not depend on PATH', () => {

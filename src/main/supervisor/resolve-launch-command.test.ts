@@ -236,6 +236,44 @@ test('a genuine custom grok wrapper is respected verbatim (not clobbered)', () =
   assert.equal(providerOverride, null);
 });
 
+// ── resolveLaunchCommand: agy (plan §1.8) ──────────────────────────────────
+
+test('agy launch in a framework-default workspace resolves to the agy binary', () => {
+  const { command, providerOverride } = resolveLaunchCommand({
+    inputCommand: undefined,
+    workspaceDefaultCommand: DEFAULT_COMMAND,
+    provider: 'agy',
+    pathType: 'windows',
+  });
+  assert.equal(command, 'agy');
+  assert.equal(providerOverride, null);
+});
+
+test('a custom claude/ccode command cannot silently launch for agy', () => {
+  for (const claudeish of ['claude --dangerously-skip-permissions --model opus', 'ccode --dangerously-skip-permissions --model opus']) {
+    const { command, providerOverride } = resolveLaunchCommand({
+      inputCommand: undefined,
+      workspaceDefaultCommand: claudeish,
+      provider: 'agy',
+      pathType: 'windows',
+    });
+    assert.equal(command, PROVIDER_COMMANDS.agy.windows);
+    assert.equal(providerOverride?.to, PROVIDER_COMMANDS.agy.windows);
+  }
+});
+
+test('a genuine custom agy wrapper is respected verbatim', () => {
+  const custom = 'my-agy-wrapper --flag';
+  const { command, providerOverride } = resolveLaunchCommand({
+    inputCommand: undefined,
+    workspaceDefaultCommand: custom,
+    provider: 'agy',
+    pathType: 'windows',
+  });
+  assert.equal(command, custom);
+  assert.equal(providerOverride, null);
+});
+
 // ── runner ──────────────────────────────────────────────────────────────
 
 let passed = 0;
