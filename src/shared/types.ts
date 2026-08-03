@@ -2466,6 +2466,12 @@ export interface IpcApi {
     /** List a workspace's plans for the "Plans" card gallery. Each row carries a
      *  cheap description snippet (summary-zone prose) for `html` surfaces. */
     list: (workspaceId?: string) => Promise<PlanListItem[]>;
+    /** WP-P2C/P2D — the unified Plans-gallery projection: proposals + structured
+     *  folder plans + legacy `format='html'` plans (md rows NEVER projected). */
+    gallery: (workspaceId: string, opts?: PlanGalleryOptions) => Promise<PlanGalleryResult>;
+    /** WP-P2C/P2D — read one proposal's markdown by its proposals-row id, with
+     *  read-time containment + byte-cap re-validation. `{ error }` on failure. */
+    readProposal: (proposalId: string) => Promise<ProposalReadResult | { error: string }>;
     /** Full activity projection (sections + trusted event trail) — the in-process
      *  mirror of GET /api/plans/:id/projection?events=full. `null` if unknown. */
     getProjection: (planId: string, opts?: { eventDetailId?: string }) => Promise<PlanActivityProjection | null>;

@@ -6,6 +6,7 @@ import AgentLaunchDialog from '../agent/AgentLaunchDialog';
 import FileViewerPanel from '../fileviewer/FileViewerPanel';
 import BrowserPanel from '../browser/BrowserPanel';
 import PlansMenu from '../plan/PlansMenu';
+import PlanGalleryPane from '../plan/PlanGalleryPane';
 import SaveCard from '../save/SaveCard';
 import { useBrowserStore, ensureBrowserBridge } from '../../stores/browser-store';
 import * as Icons from 'lucide-react';
@@ -53,13 +54,14 @@ function DetachedViewPlaceholder({ label }: { label: string }) {
 }
 
 export default function MainContent() {
-  const { workspaces, selectedWorkspaceId, fileViewerOpen, browserOpen, saveCardOpen, openTabs, detachedViews } = useDashboardStore(
+  const { workspaces, selectedWorkspaceId, fileViewerOpen, browserOpen, saveCardOpen, galleryOpen, openTabs, detachedViews } = useDashboardStore(
     useShallow((s) => ({
       workspaces: s.workspaces,
       selectedWorkspaceId: s.selectedWorkspaceId,
       fileViewerOpen: s.fileViewerOpen,
       browserOpen: s.browserOpen,
       saveCardOpen: s.saveCardOpen,
+      galleryOpen: s.galleryOpen,
       openTabs: s.openTabs,
       detachedViews: s.detachedViews,
     })),
@@ -68,6 +70,10 @@ export default function MainContent() {
   const showBrowser = useDashboardStore((s) => s.showBrowser);
   const showDashboard = useDashboardStore((s) => s.showDashboard);
   const showSaveCard = useDashboardStore((s) => s.showSaveCard);
+  // WP-P2D — the Plans gallery is a first-class center pane (Edward's binding
+  // ruling: a stable top-level pane, never the legacy modal popup).
+  const showGallery = useDashboardStore((s) => s.showGallery);
+  const openPlanTab = useDashboardStore((s) => s.openPlanTab);
   const browserPaneAttention = useBrowserStore((s) => s.paneAttention);
   const [showLaunch, setShowLaunch] = useState(false);
 
@@ -174,8 +180,11 @@ export default function MainContent() {
   const hasOpenTabs = workspaceTabCount > 0;
   // Center-view dispatch — precedence file viewer > browser > save card >
   // dashboard grid. The Save card is a read-only peer surface (SC-WP-1I).
-  const dashboardActive = !fileViewerOpen && !browserOpen && !saveCardOpen;
+  const dashboardActive = !fileViewerOpen && !browserOpen && !saveCardOpen && !galleryOpen;
   const saveCardActive = saveCardOpen && !fileViewerOpen && !browserOpen;
+  // Gallery precedence sits below file viewer / browser / save card (mirrors the
+  // center dispatch below): it renders only when no higher-priority pane is up.
+  const galleryActive = galleryOpen && !fileViewerOpen && !browserOpen && !saveCardOpen;
 
   return (
     <div className="flex-1 flex flex-col min-w-0 overflow-hidden relative">
@@ -258,6 +267,17 @@ export default function MainContent() {
                 onDragEnd={(e) => handleViewDragEnd(e, 'plans')}
               />
               <button
+                data-testid="view-btn-gallery"
+                onClick={showGallery}
+                className={`ui-btn ui-btn-outline flex-1 whitespace-nowrap px-3 py-1.5 text-[13px] font-medium ${
+                  galleryActive ? 'ui-btn-success is-active' : ''
+                }`}
+                title="Plans gallery — proposals, plans, and legacy plans in one pane"
+              >
+                <Icons.LayoutList className="w-4 h-4 shrink-0" />
+                {!toolbarCompact && 'Gallery'}
+              </button>
+              <button
                 data-testid="view-btn-save"
                 onClick={showSaveCard}
                 className={`ui-btn ui-btn-outline shrink-0 whitespace-nowrap px-3 py-1.5 text-[13px] font-medium ${
@@ -304,6 +324,13 @@ export default function MainContent() {
         <DetachedViewPlaceholder label="Files" />
       ) : saveCardActive ? (
         <SaveCard />
+      ) : galleryActive ? (
+        <PlanGalleryPane
+          workspaceId={selectedWorkspaceId}
+          workspaceRoot={workspace.path}
+          pathType={workspace.pathType}
+          onOpenLegacyPlan={(planId, title, wsId) => openPlanTab(planId, title, wsId)}
+        />
       ) : dashboardDetached ? (
         <DetachedViewPlaceholder label="Dashboard" />
       ) : (

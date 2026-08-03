@@ -205,6 +205,11 @@ const api: IpcApi = {
     },
     // WP5 mount: data reads + render-pane lifecycle (registerPlanIpc, main).
     list: (workspaceId) => ipcRenderer.invoke('plan:list', workspaceId),
+    // WP-P2C/P2D: the unified gallery projection (proposals + structured folders +
+    // legacy HTML; md excluded) and the byte-capped, containment-revalidated
+    // single-proposal markdown read that backs the WP-P2D gallery pane.
+    gallery: (workspaceId, opts) => ipcRenderer.invoke('plan-gallery:list', workspaceId, opts),
+    readProposal: (proposalId) => ipcRenderer.invoke('proposal:read', proposalId),
     getProjection: (planId, opts) => ipcRenderer.invoke('plan:projection', planId, opts),
     paneShow: (planId) => ipcRenderer.invoke('plan-pane:show', planId),
     paneHide: () => ipcRenderer.invoke('plan-pane:hide'),
