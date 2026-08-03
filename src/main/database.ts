@@ -5201,6 +5201,59 @@ export function listProposalsByWorkspace(workspaceId: string): ProposalRecord[] 
   ).map(rowToProposal);
 }
 
+// ── WP-P2B — proposals-watcher composition primitives ────────────────────────
+// The witnessed-attribution watcher (adopt/mint, duplicate/malformed policy)
+// composes these on top of the WP-P2A insert/get/list. They are thin, policy-free
+// reads/writes; the NORMATIVE duplicate/malformed rulings live in the watcher.
+
+/** Point read by the portable frontmatter `artifact_id`, scoped to one workspace.
+ *  The watcher calls this BEFORE inserting so a duplicate `artifact_id` is left
+ *  unregistered (diagnostic) rather than thrown by the partial unique index. */
+export function getProposalByWorkspaceArtifactId(
+  workspaceId: string,
+  artifactId: string,
+): ProposalRecord | null {
+  const row = queryOne(
+    `SELECT * FROM proposals WHERE workspace_id = ? AND artifact_id = ?`,
+    [workspaceId, artifactId],
+  );
+  return row ? rowToProposal(row) : null;
+}
+
+/** Refresh the mutable filesystem-derived fields of an already-registered
+ *  proposal on a content change. NEVER touches `created_at` (stable date-grouping
+ *  key) or the witnessed author columns (attribution is fixed at registration). */
+export function touchProposalRecord(
+  id: string,
+  fields: { title: string | null; mtimeMs: number | null; sizeBytes: number | null; updatedAt: number },
+): void {
+  run(
+    `UPDATE proposals SET title = ?, mtime_ms = ?, size_bytes = ?, updated_at = ? WHERE id = ?`,
+    [fields.title, fields.mtimeMs, fields.sizeBytes, fields.updatedAt, id],
+  );
+}
+
+/** Soft-delete a proposal row whose backing `.md` vanished. Idempotent — the row
+ *  survives (history/promotion linkage) with `deleted_at` stamped. */
+export function softDeleteProposalRecord(id: string, deletedAt: number): void {
+  run(`UPDATE proposals SET deleted_at = ?, updated_at = ? WHERE id = ?`, [deletedAt, deletedAt, id]);
+}
+
+/** Witnessed-author resolution for the proposals watcher (WP-P2B). Returns the
+ *  agent id that most recently WROTE/CREATED `filePath` per the display-only
+ *  `file_activities` witness store, or null when no write witness exists. This is
+ *  the ONLY attribution signal the watcher uses — it never assumes
+ *  one-agent-per-cwd (many agents share a working directory by design). */
+export function getLatestWriteWitnessAgentId(filePath: string): string | null {
+  const row = queryOne(
+    `SELECT agent_id FROM file_activities
+     WHERE file_path = ? AND operation IN ('write', 'create')
+     ORDER BY timestamp DESC, id DESC LIMIT 1`,
+    [filePath],
+  );
+  return row ? String(row.agent_id) : null;
+}
+
 /** Diagnostic inventory count of legacy `plans(format='md')` rows. These stay
  *  hidden preserved historical records — never shown as plans, never duplicated
  *  into `proposals`. This count is the sole surface of their existence (WP-P2A
