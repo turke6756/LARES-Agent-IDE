@@ -99,3 +99,62 @@ function sortedUnique(values: string[]): string[] {
 function compareStrings(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }
+
+// ── SC-WP-3F: durable finalization boundary-ref retention partition ──────────────
+//
+// A finalization pins a package boundary at a computed oid with a DURABLE Lares ref
+// (finalization-refs.ts). Retention treats that ref as a SEPARATE protected set,
+// distinct from the dirty-edge pin quota above: while the finalization row is
+// `lifecycle_status='active'` the ref is kept, and its reachable objects are handed
+// to pin accounting as an extra reachable root — so they cost ZERO pin quota
+// (pin-accounting charges only UNREACHABLE dirty blobs). The instant the
+// finalization leaves `active` — `committed`, `superseded`, or `abandoned` — the ref
+// is RELEASED so its objects fall back to normal retention.
+//
+// This module stays pure: it only classifies rows by `lifecycleStatus`. Deleting
+// released refs and feeding the protected set to accounting are the executor's job
+// (retention.ts). It deliberately does NOT read `boundaryStatus`, compute revisions,
+// or set supersede columns (all WP-3C's) — the lifecycle transition alone decides.
+
+export type BoundaryRefLifecycleStatus = 'active' | 'superseded' | 'committed' | 'abandoned';
+
+/** The minimal finalization projection the partition needs — decoupled from the DB
+ *  `PackageFinalization` row so this stays a pure, dependency-free classifier. */
+export interface BoundaryRefRecord {
+  /** The durable ref (`refs/lares/finalizations/…`), or null when none was pinned. */
+  boundaryRef: string | null;
+  lifecycleStatus: BoundaryRefLifecycleStatus;
+}
+
+export interface BoundaryRefPartition {
+  /** Kept-reachable refs — the protected set (`active`), NEVER charged to pin quota. */
+  protectedRefs: string[];
+  /** Refs to release (delete): the finalization has left `active`. */
+  releasableRefs: string[];
+}
+
+/**
+ * Partition finalization boundary refs by lifecycle: `active` → protected;
+ * `committed`/`superseded`/`abandoned` → releasable. Rows with no ref contribute to
+ * neither. Output is sorted + de-duplicated so the result is deterministic. A ref
+ * that a caller somehow lists as BOTH active and terminal (impossible by
+ * construction — one ref per (packageId, revision) — but defended here) is kept
+ * protected and never released, so a live pin is never dropped by accident.
+ */
+export function partitionBoundaryRefs(
+  records: readonly BoundaryRefRecord[],
+): BoundaryRefPartition {
+  const protectedSet = new Set<string>();
+  const releasableSet = new Set<string>();
+  for (const record of records) {
+    const ref = record.boundaryRef;
+    if (ref === null || ref.length === 0) continue;
+    if (record.lifecycleStatus === 'active') protectedSet.add(ref);
+    else releasableSet.add(ref);
+  }
+  for (const ref of protectedSet) releasableSet.delete(ref);
+  return {
+    protectedRefs: [...protectedSet].sort(compareStrings),
+    releasableRefs: [...releasableSet].sort(compareStrings),
+  };
+}

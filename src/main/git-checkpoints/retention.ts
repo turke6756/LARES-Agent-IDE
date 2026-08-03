@@ -65,8 +65,11 @@ import {
 } from './pin-accounting';
 import {
   selectRetentionPins,
+  partitionBoundaryRefs,
   type RetentionPinWeakeningWarning,
+  type BoundaryRefRecord,
 } from './protection-policy';
+import { deleteFinalizationRefs } from './finalization-refs';
 
 const DEFAULT_LOGGER: ReconLogger = {
   info: (m) => console.log(m),
@@ -774,6 +777,71 @@ export async function runWorkspaceRetention(deps: RetentionDeps): Promise<Worksp
   const maintenance = await runLooseObjectMaintenance(deps);
   const storage = await reportStorage(deps);
   return { workspaceId: deps.workspaceId, retention, maintenance, storage };
+}
+
+// ── SC-WP-3F: boundary-ref retention lifecycle ────────────────────────────────
+//
+// Durable finalization boundary refs are a SEPARATE protected set from the dirty-
+// edge pin quota. `active` refs are returned as `protectedRefs` — the caller passes
+// them to `RetentionDeps.activeBoundaryRefs`, which `prepareRetentionPins` hands to
+// `accountAndSelectPins` as extra reachable roots, so their objects cost ZERO pin
+// quota. Refs whose finalization has moved to `committed`/`superseded`/`abandoned`
+// are RELEASED — deleted so their objects fall back to normal retention.
+
+export interface BoundaryRefReconcileDeps {
+  repoRoot: string;
+  gitExe: string;
+  /** Every boundary-ref-bearing finalization row for this repo, any lifecycle. */
+  listBoundaryRefRecords: () => readonly BoundaryRefRecord[] | Promise<readonly BoundaryRefRecord[]>;
+  /** Delete a batch of released refs. Default: `deleteFinalizationRefs` (one atomic
+   *  `update-ref --stdin` txn). Injected in tests. */
+  deleteRefs?: (refs: string[]) => Promise<{ ok: boolean; code: number; stderr: string }>;
+  runGit?: RunGitLike;
+  logger?: ReconLogger;
+}
+
+export interface BoundaryRefReconcileResult {
+  /** `active` boundary refs — pass as `RetentionDeps.activeBoundaryRefs`; the protected
+   *  set handed to pin accounting as reachable roots (zero pin-quota cost). */
+  protectedRefs: string[];
+  /** Refs a delete was attempted on because their finalization left `active`. */
+  releasedRefs: string[];
+  /** False when the atomic delete failed (nonfatal — retried next cycle). */
+  releaseOk: boolean;
+}
+
+/**
+ * Reconcile durable finalization boundary refs against their lifecycle. Returns the
+ * `active` set (protected; feed to `activeBoundaryRefs`) and RELEASES every ref whose
+ * finalization has moved to `committed`/`superseded`/`abandoned`, deleting them in one
+ * atomic `update-ref --stdin` batch. Best-effort: a delete failure is logged and
+ * nonfatal — the released refs stay until the next cycle retries. The delete is
+ * unconditional, so a ref that was never actually created (an `abandoned` failed-ref
+ * attempt) deletes as a harmless no-op.
+ */
+export async function reconcileBoundaryRefs(
+  deps: BoundaryRefReconcileDeps,
+): Promise<BoundaryRefReconcileResult> {
+  const log = deps.logger ?? DEFAULT_LOGGER;
+  const records = await deps.listBoundaryRefRecords();
+  const { protectedRefs, releasableRefs } = partitionBoundaryRefs(records);
+  if (releasableRefs.length === 0) {
+    return { protectedRefs, releasedRefs: [], releaseOk: true };
+  }
+  const deleteRefs =
+    deps.deleteRefs ??
+    ((refs: string[]) =>
+      deleteFinalizationRefs({
+        repoRoot: deps.repoRoot,
+        gitExe: deps.gitExe,
+        runGit: deps.runGit,
+        refs,
+      }));
+  const del = await deleteRefs(releasableRefs);
+  if (!del.ok) {
+    log.warn(`[retention] boundary-ref release failed (code ${del.code}): ${del.stderr}`);
+  }
+  return { protectedRefs, releasedRefs: releasableRefs, releaseOk: del.ok };
 }
 
 // ── git helpers ───────────────────────────────────────────────────────────────
