@@ -1920,6 +1920,27 @@ function initContextOptimizerSchema(): void {
     )
   `);
 
+  // selection_comment_replies (WP-P4D-reply — A2 DDL slot; frozen shape from the
+  // planning-surface plan §WP-P4D-reply / P4-P8 rescope §WP-P4D-reply). A COMPANION
+  // reply row keyed to the question comment: it never overwrites selection_comments.body
+  // and never overloads that row's delivery-status `status` machine. author_agent_id is
+  // nullable (system/undeclared replies allowed); created_at is a service-owned INTEGER
+  // epoch. The answer service + answer_plan_comment MCP tool are deferred (they depend
+  // on WP-P4D-create) — this slot lands the guarded DDL only.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS selection_comment_replies (
+      id TEXT PRIMARY KEY,
+      comment_id TEXT NOT NULL REFERENCES selection_comments(id),
+      body TEXT NOT NULL,
+      author_agent_id TEXT,
+      created_at INTEGER NOT NULL
+    )
+  `);
+  // Threads are read by comment_id (P4D-proj joins replies onto their question) —
+  // index it, matching the sibling idx_plan_documents_plan(plan_id) precedent.
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_selcomment_replies_comment
+    ON selection_comment_replies(comment_id)`);
+
   // WP-2B (Priority 0) — one-time, resumable workspace-lineage backfill. Populates
   // stream_lane_stats.workspace_id/workspace_root by folding each stream's launch cwd
   // to a root owned by EXACTLY one workspace. Idempotent (only NULL rows, ON a unique
