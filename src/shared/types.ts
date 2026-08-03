@@ -1818,6 +1818,57 @@ export interface SaveCardInventoryResponse {
   quotaWeakening: import('./commit-candidates').SaveCardQuotaWeakening | null;
 }
 
+// ── SC-WP-3H — Save-lens candidate preview channel ────────────────────────────
+//
+// A SECOND Save-card channel, deliberately kept OUT of `SAVECARD_CHANNELS` (whose
+// Stage ① audit test asserts exactly one read-only inventory route) — mirroring
+// how WP-3E kept its mutating `savecard:markDoneFleetAdhoc` channel separate. The
+// preview channel is itself read-only: it assembles a `CommitCandidate` /
+// `SelectionPreview` (WP-3G) for an explicit selection and returns the renderer-
+// safe verdicts plus server-derived, READ-ONLY `Lares-*` trailer previews. It
+// mutates nothing.
+export const SAVECARD_PREVIEW_CHANNEL = 'savecard:preview' as const;
+
+/** Renderer request to preview a candidate for one explicit selection. Component
+ *  ids expand server-side to ALL their entries; unattributed entries are
+ *  independent atoms; `finalizationIds` is the requested coverage set (empty ⇒ a
+ *  `SelectionPreview`, never a committable candidate). */
+export interface SaveCardPreviewRequest {
+  workspaceId: string;
+  selectedComponentIds: string[];
+  selectedUnattributedEntryIds: string[];
+  finalizationIds: string[];
+}
+
+/**
+ * Renderer-safe result of a Save-lens preview. `candidate` is the WP-3G
+ * `CommitCandidate` (finalization-backed) or `SelectionPreview` (unfinalized) —
+ * the renderer reads its per-member `packageVerification` verdicts and
+ * `eligibility` directly. `laresTrailers` are server-derived commit-message
+ * trailer previews from the immutable snapshot; the renderer renders them
+ * READ-ONLY and MUST NEVER let a user trailer override a `Lares-*` line. The
+ * message body (`defaultMessageBody`) is a server suggestion the user may edit.
+ */
+export interface SaveCardPreviewResponse {
+  candidate:
+    | import('./commit-candidates').CommitCandidate
+    | import('./commit-candidates').SelectionPreview;
+  /** True when `candidate` is a finalization-backed `CommitCandidate`; false for a
+   *  `SelectionPreview` (no finalization requested). Never one-click when false. */
+  isCandidate: boolean;
+  /** Server-derived, READ-ONLY `Lares-*` trailer previews from the immutable
+   *  snapshot (turns/plans/finalizations). Rendered verbatim; never user-editable. */
+  laresTrailers: string[];
+  /** Server-suggested, user-EDITABLE commit-message body. */
+  defaultMessageBody: string;
+  /** True when any selected component fused ≥2 owners/plans and needs an overlap
+   *  acknowledgement before a one-click save (renderer-side ack gate). */
+  requiresOverlapAck: boolean;
+  /** Selected unattributed entry ids that each need an individual acknowledgement
+   *  before a one-click save (renderer-side ack gate). */
+  unacknowledgedUnattributedEntryIds: string[];
+}
+
 /** IPC channel names for the renderer checkpoint surface — one source of truth for
  *  preload, the main registrar, and the contract test. */
 export const CHECKPOINT_CHANNELS = {
@@ -2566,9 +2617,12 @@ export interface IpcApi {
    *  shared engine/service surface. `restore`/`revert` accept a `force`
    *  (stale-preview override) that is IPC-ONLY and refused while an active turn
    *  witnesses a requested path. */
-  /** Stage 1 Save card: read-only dirty inventory. No mutating method exists. */
+  /** Save card: read-only dirty inventory (Stage ①) + the SC-WP-3H Save-lens
+   *  candidate preview (also read-only — verdicts + read-only `Lares-*` trailer
+   *  previews). No mutating method is exposed here. */
   saveCard: {
     getInventory: (req: SaveCardInventoryRequest) => Promise<SaveCardInventoryResponse>;
+    preview: (req: SaveCardPreviewRequest) => Promise<SaveCardPreviewResponse>;
   };
   checkpoints: {
     list: (workspaceId: string, opts?: { agentId?: string }) => Promise<CheckpointListResult>;

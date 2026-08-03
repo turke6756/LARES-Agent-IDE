@@ -309,11 +309,17 @@ describe('SaveCard bundle rendering', () => {
     expect(quiet?.textContent).toContain('committed');
   });
 
-  it('exposes only an inspect affordance — NO commit/save/write button', async () => {
+  it('the read-only bundle card exposes only an inspect affordance — NO commit/save/write button', async () => {
+    // SC-WP-3H: Stage ③ adds a per-package "Save…" preview launcher as a SIBLING
+    // of the bundle card (see SavePreviewLauncher in SaveCard). The read-only
+    // Stage ① bundle CARD itself stays inspect-only, so this invariant is now
+    // scoped to the `save-bundle` card rather than the whole surface.
     getInventory.mockResolvedValue(inv([loudBundle, captureGapBundle, unattributedBundle]));
     await render();
     expect(container.querySelector('[data-testid="save-bundle-inspect"]')).toBeTruthy();
-    const buttons = Array.from(container.querySelectorAll('button'));
+    const cards = Array.from(container.querySelectorAll('[data-testid="save-bundle"]'));
+    expect(cards.length).toBeGreaterThan(0);
+    const buttons = cards.flatMap((card) => Array.from(card.querySelectorAll('button')));
     for (const b of buttons) {
       const label = (b.textContent ?? '').toLowerCase();
       expect(label).not.toContain('commit');

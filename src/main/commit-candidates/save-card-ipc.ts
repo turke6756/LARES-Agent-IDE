@@ -15,8 +15,11 @@
 
 import {
   SAVECARD_CHANNELS,
+  SAVECARD_PREVIEW_CHANNEL,
   type SaveCardInventoryRequest,
   type SaveCardInventoryResponse,
+  type SaveCardPreviewRequest,
+  type SaveCardPreviewResponse,
 } from '../../shared/types';
 import type {
   FinalizationBoundaryStatus,
@@ -28,6 +31,12 @@ import {
   type FinalizePackageDeps,
   type FinalizePackageRequest,
 } from './finalization-service';
+import {
+  buildCandidate,
+  type CandidateBuildContext,
+  type CandidateSelectionRequest,
+} from './candidate-service';
+import type { CommitCandidate, SelectionPreview } from '../../shared/commit-candidates';
 
 /** Narrow read-only surface injected after the Save-card engine is available. */
 export interface SaveCardRoutes {
@@ -200,5 +209,161 @@ export function registerSaveCardFinalizeIpc(
     };
     const result = await finalizePackage(finalizeRequest, routes.finalizeDeps);
     return toMarkDoneResponse(result.finalization, result.outcome);
+  });
+}
+
+// ── SC-WP-3H — Save-lens candidate preview channel ────────────────────────────
+
+/** The main-process seam the preview channel drives. `resolvePreviewContext`
+ *  resolves a renderer selection into the full WP-3G `CandidateBuildContext`
+ *  (inventory, components, requested finalizations, temp-index reps, ledger,
+ *  fingerprint, pinned HEAD); the handler then calls the pure `buildCandidate`
+ *  assembler so both lenses share one identity/verdict computation. Read-only. */
+export interface SaveCardPreviewRoutes {
+  resolvePreviewContext(req: SaveCardPreviewRequest): Promise<CandidateBuildContext>;
+}
+
+function requirePreviewRoutes(routes: SaveCardPreviewRoutes | null): SaveCardPreviewRoutes {
+  if (!routes) {
+    throw new SaveCardIpcError(
+      'Save-card preview engine unavailable (the engine has not finished bootstrapping)',
+      'save-card-engine-unavailable',
+    );
+  }
+  return routes;
+}
+
+function requirePreviewRequest(raw: unknown): SaveCardPreviewRequest {
+  if (!raw || typeof raw !== 'object') {
+    throw new SaveCardIpcError(
+      'a preview request with a non-empty workspaceId is required',
+      'save-card-bad-request',
+    );
+  }
+  const record = raw as Record<string, unknown>;
+  if (typeof record.workspaceId !== 'string' || record.workspaceId === '') {
+    throw new SaveCardIpcError(
+      'a non-empty workspaceId is required',
+      'save-card-bad-request',
+    );
+  }
+  const asStringArray = (value: unknown, field: string): string[] => {
+    if (value === undefined) return [];
+    if (!Array.isArray(value) || value.some((entry) => typeof entry !== 'string')) {
+      throw new SaveCardIpcError(`${field} must be an array of strings`, 'save-card-bad-request');
+    }
+    return value as string[];
+  };
+  // Only the four selection fields cross the wire — never members, trailers, acks,
+  // or digests. Everything the assembler trusts is resolved main-side (D-7).
+  return {
+    workspaceId: record.workspaceId,
+    selectedComponentIds: asStringArray(record.selectedComponentIds, 'selectedComponentIds'),
+    selectedUnattributedEntryIds: asStringArray(
+      record.selectedUnattributedEntryIds,
+      'selectedUnattributedEntryIds',
+    ),
+    finalizationIds: asStringArray(record.finalizationIds, 'finalizationIds'),
+  };
+}
+
+function isCommitCandidate(
+  candidate: CommitCandidate | SelectionPreview,
+): candidate is CommitCandidate {
+  return 'candidateId' in candidate;
+}
+
+/**
+ * Derive the READ-ONLY `Lares-*` trailer previews from the immutable snapshot
+ * (the resolved context + the assembled candidate) — never from renderer input.
+ * A mixed-plan candidate emits MULTIPLE `Lares-Plan` trailers (never one silently
+ * chosen plan; contract §3). These are server-authoritative: the renderer renders
+ * them verbatim and any user trailer lives in a separate namespace that can never
+ * override a `Lares-*` line.
+ */
+function deriveLaresTrailers(
+  request: SaveCardPreviewRequest,
+  candidate: CommitCandidate | SelectionPreview,
+  context: CandidateBuildContext,
+): string[] {
+  const selectedComponentIds = new Set(request.selectedComponentIds);
+  const selectedComponents = context.components.filter((component) =>
+    selectedComponentIds.has(component.componentId),
+  );
+  const trailers: string[] = [];
+
+  const turnIds = new Set(
+    selectedComponents.flatMap((component) =>
+      component.associations.flatMap((association) => association.contributingTurnIds),
+    ),
+  );
+  if (turnIds.size > 0) trailers.push(`Lares-Turns: ${turnIds.size}`);
+
+  const planIds = [...new Set(
+    selectedComponents.flatMap((component) =>
+      component.associations
+        .map((association) => association.planId)
+        .filter((planId): planId is string => planId !== null),
+    ),
+  )].sort();
+  for (const planId of planIds) trailers.push(`Lares-Plan: ${planId}`);
+
+  if (isCommitCandidate(candidate)) {
+    for (const ref of candidate.finalizations) {
+      trailers.push(`Lares-Finalization: ${ref.packageId}@${ref.packageRevision}`);
+    }
+  }
+
+  return trailers;
+}
+
+function toPreviewResponse(
+  request: SaveCardPreviewRequest,
+  candidate: CommitCandidate | SelectionPreview,
+  context: CandidateBuildContext,
+): SaveCardPreviewResponse {
+  const selectedComponentIds = new Set(request.selectedComponentIds);
+  const requiresOverlapAck = context.components.some(
+    (component) =>
+      selectedComponentIds.has(component.componentId) && component.overlap.requiresOverlapAck,
+  );
+  const memberCount = candidate.members.length;
+  const defaultMessageBody = `Save ${memberCount} file${memberCount === 1 ? '' : 's'}`;
+  return {
+    candidate,
+    isCandidate: isCommitCandidate(candidate),
+    laresTrailers: deriveLaresTrailers(request, candidate, context),
+    defaultMessageBody,
+    requiresOverlapAck,
+    // Every selected unattributed atom needs an explicit acknowledgement (D-5).
+    unacknowledgedUnattributedEntryIds: [...request.selectedUnattributedEntryIds],
+  };
+}
+
+/**
+ * Register the read-only Save-lens preview channel. The handler resolves the
+ * selection into a WP-3G `CandidateBuildContext` via the injected route, calls the
+ * pure `buildCandidate` assembler (identical identity + verdicts across both
+ * lenses), and returns the renderer-safe verdicts plus server-derived read-only
+ * `Lares-*` trailer previews. Nothing here mutates the worktree/index/refs.
+ *
+ * `getRoutes` is evaluated per invocation so registration can happen before the
+ * asynchronous production engine injects its route object.
+ */
+export function registerSaveCardPreviewIpc(
+  ipc: IpcLike,
+  getRoutes: () => SaveCardPreviewRoutes | null,
+): void {
+  ipc.handle(SAVECARD_PREVIEW_CHANNEL, async (_event, raw: unknown) => {
+    const routes = requirePreviewRoutes(getRoutes());
+    const request = requirePreviewRequest(raw);
+    const context = await routes.resolvePreviewContext(request);
+    const selection: CandidateSelectionRequest = {
+      selectedComponentIds: request.selectedComponentIds,
+      selectedUnattributedEntryIds: request.selectedUnattributedEntryIds,
+      finalizationIds: request.finalizationIds,
+    };
+    const candidate = buildCandidate(selection, context);
+    return toPreviewResponse(request, candidate, context);
   });
 }

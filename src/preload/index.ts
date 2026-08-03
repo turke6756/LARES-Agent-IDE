@@ -1,6 +1,6 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron';
 import type { IpcApi, DetachRequest, DetachedClosedPayload, ViewDetachRequest, ViewDetachedClosedPayload, FlushRequestPayload, FlushReplyPayload } from '../shared/types';
-import { TAB_CHANNELS, VIEW_CHANNELS, CHECKPOINT_CHANNELS, SAVECARD_CHANNELS } from '../shared/types';
+import { TAB_CHANNELS, VIEW_CHANNELS, CHECKPOINT_CHANNELS, SAVECARD_CHANNELS, SAVECARD_PREVIEW_CHANNEL } from '../shared/types';
 import { BROWSER_CHANNELS } from '../shared/browser';
 import type {
   AccessRequestDecision,
@@ -165,9 +165,11 @@ const api: IpcApi = {
   detached: {
     list: (workspaceRoot) => ipcRenderer.invoke('detached:list', workspaceRoot),
   },
-  // SC-WP-1H — Stage 1 is intentionally read-only: inventory fetch only.
+  // SC-WP-1H — read-only inventory fetch. SC-WP-3H — read-only Save-lens candidate
+  // preview (verdicts + server-derived read-only Lares-* trailer previews).
   saveCard: {
     getInventory: (req) => ipcRenderer.invoke(SAVECARD_CHANNELS.getInventory, req),
+    preview: (req) => ipcRenderer.invoke(SAVECARD_PREVIEW_CHANNEL, req),
   },
   // Git-Native WP-G2.2 — human checkpoint recovery surface (list/diff/preview/
   // restore/revert). Handlers live in git-checkpoints/checkpoint-ipc.ts (registered

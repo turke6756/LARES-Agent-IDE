@@ -3,8 +3,65 @@ import { useDashboardStore } from '../../stores/dashboard-store';
 import type { SaveCardInventoryResponse } from '../../../shared/types';
 import type { SaveCardQuotaWeakening } from '../../../shared/commit-candidates';
 import SaveBundle, { isQuietlySaved, type WorkBundleDto } from './SaveBundle';
+import CandidatePreview, { type CandidatePreviewSelection } from './CandidatePreview';
 import QuotaWeakeningBanner from './QuotaWeakeningBanner';
 import './save-card.css';
+
+// SC-WP-3H — derive the explicit WP-3G selection for a displayed group of
+// bundles. Component bundles contribute their whole component (atomic);
+// unattributed bundles contribute their member entries as independent atoms. The
+// bundle DTO carries no finalization coverage yet, so `finalizationIds` is empty
+// — the preview is a `SelectionPreview` (previewable, never one-click) until a
+// later stage surfaces the covering finalizations.
+function selectionForGroup(group: WorkBundleDto[]): CandidatePreviewSelection {
+  const selectedComponentIds = group
+    .filter((bundle) => bundle.kind === 'component' && bundle.component)
+    .map((bundle) => bundle.component!.componentId);
+  const selectedUnattributedEntryIds = group
+    .filter((bundle) => bundle.kind === 'unattributed')
+    .flatMap((bundle) => bundle.members.map((member) => member.entry.entryId));
+  return { selectedComponentIds, selectedUnattributedEntryIds, finalizationIds: [] };
+}
+
+/**
+ * SC-WP-3H — the per-package "Save…" affordance. Toggles the read-only candidate
+ * preview pane in place beneath the bundle card. Kept in SaveCard (not SaveBundle)
+ * so the Stage ① read-only bundle card stays untouched. The pane itself decides
+ * whether a one-click save is offered (never for mismatch/degraded/unfinalized).
+ */
+function SavePreviewLauncher({
+  group,
+  workspaceId,
+}: {
+  group: WorkBundleDto[];
+  workspaceId: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const selection = selectionForGroup(group);
+  const hasSelectable =
+    selection.selectedComponentIds.length > 0 || selection.selectedUnattributedEntryIds.length > 0;
+  if (!hasSelectable) return null;
+  return (
+    <div className="sc-save-launcher">
+      <button
+        type="button"
+        className="ui-btn ui-btn-outline px-3 py-1 text-[12.5px]"
+        data-testid="save-bundle-save"
+        aria-expanded={open}
+        onClick={() => setOpen((v) => !v)}
+      >
+        {open ? 'Hide save preview' : 'Save…'}
+      </button>
+      {open && (
+        <CandidatePreview
+          workspaceId={workspaceId}
+          selection={selection}
+          onClose={() => setOpen(false)}
+        />
+      )}
+    </div>
+  );
+}
 
 type LoadState =
   | { status: 'loading' }
@@ -274,11 +331,12 @@ export default function SaveCard() {
       {loud.length > 0 ? (
         <div className="sc-slots">
           {loudGroups.map((group) => (
-            <SaveBundle
-              key={group[0].identity?.groupingKey ?? group[0].bundleId}
-              bundle={group[0]}
-              bundles={group}
-            />
+            <div key={group[0].identity?.groupingKey ?? group[0].bundleId} className="sc-slot-wrap">
+              <SaveBundle bundle={group[0]} bundles={group} />
+              {/* workspaceId is non-null here: the ready state is only reached
+                  after a successful load, which requires a selected workspace. */}
+              <SavePreviewLauncher group={group} workspaceId={workspaceId!} />
+            </div>
           ))}
         </div>
       ) : (
