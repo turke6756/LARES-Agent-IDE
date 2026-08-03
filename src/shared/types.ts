@@ -1869,6 +1869,55 @@ export interface SaveCardPreviewResponse {
   unacknowledgedUnattributedEntryIds: string[];
 }
 
+// ── SC-WP-3I — Plan-lens candidate preview channel ────────────────────────────
+//
+// The plan lens's OWN read-only preview transport, deliberately kept SEPARATE from
+// the save-lens channel (mirroring how each Save-card channel stays distinct). It
+// resolves a plan-scoped selection main-side and runs the SAME WP-3G `buildCandidate`
+// service the save lens uses, so the assembled `candidateId` + member verdicts are
+// IDENTICAL across both lenses for the same effective selection (contract §14). The
+// plan lens only FILTERS / ANNOTATES whole components (D-1): it forwards whole
+// component ids and NEVER carves a sub-candidate out of a component that connects to
+// other plans, and it recomputes NO topology (identity lives solely in the 3G
+// service). It mutates nothing.
+export const PLAN_PREVIEW_CHANNEL = 'plan:previewCandidate' as const;
+
+/** Renderer request to preview a plan-lens candidate. The selection fields mirror
+ *  `SaveCardPreviewRequest` (component ids expand server-side to ALL their entries;
+ *  unattributed entries are independent atoms; empty `finalizationIds` ⇒ a preview,
+ *  never a committable candidate). `planId` scopes the D-1 filter / annotation; an
+ *  empty `selectedComponentIds` defaults to the plan's own whole components. */
+export interface PlanCandidatePreviewRequest {
+  workspaceId: string;
+  planId: string;
+  selectedComponentIds: string[];
+  selectedUnattributedEntryIds: string[];
+  finalizationIds: string[];
+}
+
+/**
+ * Renderer-safe result of a plan-lens preview. `candidate` is the WP-3G
+ * `CommitCandidate` / `SelectionPreview` from the SAME assembler the save lens uses
+ * — identical `candidateId` + member verdicts. `selection` echoes the D-1-filtered
+ * WHOLE-component selection the plan lens resolved, so the renderer can hand it to
+ * the shared `CandidatePreview` component (which fetches the save-lens preview for
+ * the editable message body + READ-ONLY `Lares-*` trailer previews). Never carves a
+ * component subset.
+ */
+export interface PlanCandidatePreviewResponse {
+  candidate:
+    | import('./commit-candidates').CommitCandidate
+    | import('./commit-candidates').SelectionPreview;
+  /** True when `candidate` is a finalization-backed `CommitCandidate`. */
+  isCandidate: boolean;
+  /** The resolved, D-1-filtered whole-component selection (echoed for the renderer). */
+  selection: {
+    selectedComponentIds: string[];
+    selectedUnattributedEntryIds: string[];
+    finalizationIds: string[];
+  };
+}
+
 /** IPC channel names for the renderer checkpoint surface — one source of truth for
  *  preload, the main registrar, and the contract test. */
 export const CHECKPOINT_CHANNELS = {
@@ -2534,6 +2583,11 @@ export interface IpcApi {
     /** Visibility-only pane toggle (no document reload) — lets a renderer overlay
      *  such as the Plans gallery temporarily hide the native pane so DOM wins. */
     paneSetVisible: (visible: boolean) => Promise<void>;
+    /** SC-WP-3I — plan-lens candidate preview (read-only). Runs the SAME WP-3G
+     *  `buildCandidate` service as the save lens, so it returns identical identity +
+     *  member verdicts plus the D-1-filtered whole-component selection for the shared
+     *  `CandidatePreview` component. Rejects until the engine route is injected. */
+    previewCandidate: (req: PlanCandidatePreviewRequest) => Promise<PlanCandidatePreviewResponse>;
   };
   /** WP-P1B: read-only planning reader. `list` enumerates bare proposals + §R0
    *  plan folders and is a pure mount/refresh read (emits NO demand-probe);

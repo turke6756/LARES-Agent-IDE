@@ -1,6 +1,6 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron';
 import type { IpcApi, DetachRequest, DetachedClosedPayload, ViewDetachRequest, ViewDetachedClosedPayload, FlushRequestPayload, FlushReplyPayload } from '../shared/types';
-import { TAB_CHANNELS, VIEW_CHANNELS, CHECKPOINT_CHANNELS, SAVECARD_CHANNELS, SAVECARD_PREVIEW_CHANNEL } from '../shared/types';
+import { TAB_CHANNELS, VIEW_CHANNELS, CHECKPOINT_CHANNELS, SAVECARD_CHANNELS, SAVECARD_PREVIEW_CHANNEL, PLAN_PREVIEW_CHANNEL } from '../shared/types';
 import { BROWSER_CHANNELS } from '../shared/browser';
 import type {
   AccessRequestDecision,
@@ -217,6 +217,8 @@ const api: IpcApi = {
     paneHide: () => ipcRenderer.invoke('plan-pane:hide'),
     paneSetBounds: (bounds) => ipcRenderer.invoke('plan-pane:setBounds', bounds),
     paneSetVisible: (visible) => ipcRenderer.invoke('plan-pane:setVisible', visible),
+    // SC-WP-3I — read-only plan-lens candidate preview (mirrors saveCard.preview).
+    previewCandidate: (req) => ipcRenderer.invoke(PLAN_PREVIEW_CHANNEL, req),
   },
   // WP-P1B: read-only planning reader (bounded fs enumeration + read-by-opaque-id).
   // `list` is a pure mount/refresh read (NO demand-probe); a voluntary open is

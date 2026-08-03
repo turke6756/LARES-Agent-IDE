@@ -23,6 +23,16 @@ import {
   type FinalizePackageResult,
 } from '../commit-candidates/finalization-service';
 import type { CommitRepresentationEntry } from '../commit-candidates/commit-representation';
+import {
+  buildCandidate,
+  type CandidateBuildContext,
+  type CandidateSelectionRequest,
+} from '../commit-candidates/candidate-service';
+import {
+  PLAN_PREVIEW_CHANNEL,
+  type PlanCandidatePreviewRequest,
+  type PlanCandidatePreviewResponse,
+} from '../../shared/types';
 
 // ── Save-card SC-WP-3D — plan-package `done` finalization wiring ──────────────
 //
@@ -112,6 +122,152 @@ export async function finalizePlanItemDone(
   });
 }
 
+// ── SC-WP-3I — plan-lens candidate preview channel ────────────────────────────
+//
+// The plan lens's own read-only preview transport. It resolves a plan-scoped
+// selection into the full WP-3G `CandidateBuildContext` (inventory, components,
+// requested finalizations, temp-index reps, ledger, fingerprint, pinned HEAD) via an
+// injected route, then calls the SAME pure `buildCandidate` assembler the save lens
+// uses. Consequences (contract §14 / D-1):
+//   • the assembled `candidateId` + member verdicts are IDENTICAL to the save lens
+//     for the same effective selection — identity/topology live ONLY in the 3G
+//     service, never recomputed here;
+//   • the lens only FILTERS / ANNOTATES whole components — it forwards whole
+//     component ids (defaulting to the plan's own components when the request omits
+//     them) and never carves a sub-candidate, and `buildCandidate` itself rejects a
+//     smuggled component subset (`component-subset-not-allowed`), so a component that
+//     connects to OTHER plans can never be split by this lens.
+// Read-only: nothing here touches the worktree, index, or refs.
+
+/** Minimal `ipcMain.handle` shape so the channel is testable without a live main. */
+export interface PlanIpcLike {
+  handle(channel: string, listener: (event: unknown, ...args: unknown[]) => unknown): void;
+}
+
+/** The main-process seam the plan-lens preview channel drives. `resolvePreviewContext`
+ *  maps a renderer plan selection to the full WP-3G build context; the handler then
+ *  calls the pure `buildCandidate` assembler. Left unset in this WP — a later
+ *  bootstrap injects the production resolver via `providePlanPreviewRoutes`. */
+export interface PlanCandidatePreviewRoutes {
+  resolvePreviewContext(req: PlanCandidatePreviewRequest): Promise<CandidateBuildContext>;
+}
+
+class PlanPreviewError extends Error {
+  constructor(message: string, readonly code: string) {
+    super(message);
+    this.name = 'PlanPreviewError';
+  }
+}
+
+/** Injected production route, evaluated per invocation so the channel can register
+ *  before the candidate engine finishes bootstrapping. Null ⇒ answer "unavailable"
+ *  honestly (mirrors the save-lens channel's null-route pattern). */
+let planPreviewRoutes: PlanCandidatePreviewRoutes | null = null;
+
+/** Inject (or clear) the production plan-lens preview route once the candidate
+ *  engine has bootstrapped. Until wired, `PLAN_PREVIEW_CHANNEL` rejects honestly. */
+export function providePlanPreviewRoutes(routes: PlanCandidatePreviewRoutes | null): void {
+  planPreviewRoutes = routes;
+}
+
+function requirePlanPreviewRequest(raw: unknown): PlanCandidatePreviewRequest {
+  if (!raw || typeof raw !== 'object') {
+    throw new PlanPreviewError(
+      'a plan preview request with a non-empty workspaceId + planId is required',
+      'plan-preview-bad-request',
+    );
+  }
+  const record = raw as Record<string, unknown>;
+  if (typeof record.workspaceId !== 'string' || record.workspaceId === '') {
+    throw new PlanPreviewError('a non-empty workspaceId is required', 'plan-preview-bad-request');
+  }
+  if (typeof record.planId !== 'string' || record.planId === '') {
+    throw new PlanPreviewError('a non-empty planId is required', 'plan-preview-bad-request');
+  }
+  const asStringArray = (value: unknown, field: string): string[] => {
+    if (value === undefined) return [];
+    if (!Array.isArray(value) || value.some((entry) => typeof entry !== 'string')) {
+      throw new PlanPreviewError(`${field} must be an array of strings`, 'plan-preview-bad-request');
+    }
+    return value as string[];
+  };
+  return {
+    workspaceId: record.workspaceId,
+    planId: record.planId,
+    selectedComponentIds: asStringArray(record.selectedComponentIds, 'selectedComponentIds'),
+    selectedUnattributedEntryIds: asStringArray(
+      record.selectedUnattributedEntryIds,
+      'selectedUnattributedEntryIds',
+    ),
+    finalizationIds: asStringArray(record.finalizationIds, 'finalizationIds'),
+  };
+}
+
+/**
+ * The pure plan-lens preview core: resolve the D-1 whole-component selection and run
+ * the shared WP-3G `buildCandidate`. Component ids are forwarded verbatim (whole
+ * components); when the request omits them the plan's OWN components — every
+ * component with an association to `planId` — are selected whole. The lens never
+ * carves a subset: `buildCandidate` alone owns identity/topology, so a component that
+ * also connects to other plans is included whole (annotated), never split.
+ */
+export function buildPlanCandidatePreview(
+  request: PlanCandidatePreviewRequest,
+  context: CandidateBuildContext,
+): PlanCandidatePreviewResponse {
+  const planOwnedComponentIds = context.components
+    .filter((component) =>
+      component.associations.some((association) => association.planId === request.planId),
+    )
+    .map((component) => component.componentId);
+  const selectedComponentIds = request.selectedComponentIds.length > 0
+    ? [...request.selectedComponentIds]
+    : planOwnedComponentIds;
+
+  const selection: CandidateSelectionRequest = {
+    selectedComponentIds,
+    selectedUnattributedEntryIds: request.selectedUnattributedEntryIds,
+    finalizationIds: request.finalizationIds,
+  };
+  const candidate = buildCandidate(selection, context);
+  return {
+    candidate,
+    isCandidate: 'candidateId' in candidate,
+    selection: {
+      selectedComponentIds: [...selectedComponentIds],
+      selectedUnattributedEntryIds: [...request.selectedUnattributedEntryIds],
+      finalizationIds: [...request.finalizationIds],
+    },
+  };
+}
+
+/**
+ * Register the read-only plan-lens preview channel. Mirrors the save-lens handler:
+ * validate → resolve context via the injected route → run the pure `buildCandidate`
+ * assembler → return the candidate + the echoed D-1 selection. `getRoutes` is
+ * evaluated per invocation so registration can precede the engine's route injection.
+ */
+export function registerPlanCandidatePreviewIpc(
+  ipc: PlanIpcLike,
+  getRoutes: () => PlanCandidatePreviewRoutes | null,
+): void {
+  ipc.handle(
+    PLAN_PREVIEW_CHANNEL,
+    async (_event, raw: unknown): Promise<PlanCandidatePreviewResponse> => {
+      const routes = getRoutes();
+      if (!routes) {
+        throw new PlanPreviewError(
+          'Plan preview engine unavailable (the engine has not finished bootstrapping)',
+          'plan-preview-engine-unavailable',
+        );
+      }
+      const request = requirePlanPreviewRequest(raw);
+      const context = await routes.resolvePreviewContext(request);
+      return buildPlanCandidatePreview(request, context);
+    },
+  );
+}
+
 export function registerPlanIpc(manager: PlanPaneManager): void {
   // ── WP-P1A: planning-reader (read-only fs enumeration + safe read) ──────────
   // Bounded enumeration of bare proposals + §R0 plan folders, and a
@@ -170,6 +326,14 @@ export function registerPlanIpc(manager: PlanPaneManager): void {
     }
     return finalizePlanItemDone(request);
   });
+
+  // ── SC-WP-3I: plan-lens candidate preview (read-only) ───────────────────────
+  // Sibling of the save-lens preview channel. Runs the SAME WP-3G `buildCandidate`
+  // service over a route-resolved context, so both lenses yield an identical
+  // `candidateId` + member verdicts. The route is injected via
+  // `providePlanPreviewRoutes` once the candidate engine bootstraps; until then the
+  // channel rejects honestly (the plan lens simply shows no preview).
+  registerPlanCandidatePreviewIpc(ipcMain, () => planPreviewRoutes);
 
   // Plan list for the "Plans" card gallery (workspace-scoped). Each row carries a
   // cheap description snippet derived from its already-served projection (or an

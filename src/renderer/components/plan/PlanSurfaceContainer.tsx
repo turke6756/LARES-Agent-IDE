@@ -3,6 +3,7 @@ import { X } from 'lucide-react';
 import PlanSurfaceView from './PlanSurfaceView';
 import type { PlanSectionView, PlanEventView, PlanProjectionView } from './plan-surface-model';
 import type { FetchEventDetail } from './TrustedEventRow';
+import type { CandidatePreviewSelection } from '../save/CandidatePreview';
 import { throttle } from '../browser/throttle';
 import { useDashboardStore } from '../../stores/dashboard-store';
 
@@ -30,8 +31,14 @@ export default function PlanSurfaceContainer({ planId }: { planId: string }): Re
   const [sections, setSections] = useState<PlanSectionView[]>([]);
   const [events, setEvents] = useState<PlanEventView[]>([]);
   const [projection, setProjection] = useState<PlanProjectionView>(EMPTY_PROJECTION);
+  // SC-WP-3I — the plan lens's D-1-filtered whole-component selection, resolved
+  // main-side via the read-only plan-lens preview channel and handed to the shared
+  // CandidatePreview component. Null until resolved (or while the engine route is
+  // unwired) so the surface simply omits the preview rather than erroring.
+  const [candidateSelection, setCandidateSelection] = useState<CandidatePreviewSelection | null>(null);
 
   const closeTab = useDashboardStore((s) => s.closeTab);
+  const selectedWorkspaceId = useDashboardStore((s) => s.selectedWorkspaceId);
 
   // Always-present dismiss for the plan pane. The pane is a native
   // WebContentsView painting ABOVE renderer DOM, so a reliable close matters
@@ -85,6 +92,38 @@ export default function PlanSurfaceContainer({ planId }: { planId: string }): Re
       void window.api.plans.paneHide();
     };
   }, [planId, load]);
+
+  // SC-WP-3I — resolve the plan lens's whole-component candidate selection over the
+  // read-only preview channel. Best-effort: any failure (including the engine route
+  // not yet being wired) leaves the selection null, so the surface just omits the
+  // preview instead of surfacing an error. A `SelectionPreview` with no members means
+  // there is nothing to save for this plan yet — also omit.
+  useEffect(() => {
+    if (!selectedWorkspaceId) {
+      setCandidateSelection(null);
+      return;
+    }
+    let active = true;
+    void (async () => {
+      try {
+        const res = await window.api.plans.previewCandidate({
+          workspaceId: selectedWorkspaceId,
+          planId,
+          selectedComponentIds: [],
+          selectedUnattributedEntryIds: [],
+          finalizationIds: [],
+        });
+        if (!active) return;
+        const hasWork = res.candidate.members.length > 0;
+        setCandidateSelection(hasWork ? res.selection : null);
+      } catch {
+        if (active) setCandidateSelection(null);
+      }
+    })();
+    return () => {
+      active = false;
+    };
+  }, [planId, selectedWorkspaceId]);
 
   // Re-fetch + full re-render on the WP4 reparse nudge (this plan only).
   useEffect(() => {
@@ -151,6 +190,8 @@ export default function PlanSurfaceContainer({ planId }: { planId: string }): Re
           sections={sections}
           events={events}
           onFetchEventDetail={fetchEventDetail}
+          workspaceId={selectedWorkspaceId ?? undefined}
+          candidateSelection={candidateSelection}
         />
       </div>
     </div>

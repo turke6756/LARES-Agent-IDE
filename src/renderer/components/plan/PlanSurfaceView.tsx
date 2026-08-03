@@ -10,6 +10,7 @@ import {
 import PlanActivityTrail from './PlanActivityTrail';
 import PlanSectionNav from './PlanSectionNav';
 import type { FetchEventDetail } from './TrustedEventRow';
+import CandidatePreview, { type CandidatePreviewSelection } from '../save/CandidatePreview';
 
 /**
  * WP5 render-surface overlay. The plan document itself renders in a sandboxed
@@ -29,11 +30,21 @@ function PlanSurfaceView({
   sections,
   events,
   onFetchEventDetail,
+  workspaceId,
+  candidateSelection,
 }: {
   projection: PlanProjectionView;
   sections: PlanSectionView[];
   events: PlanEventView[];
   onFetchEventDetail?: FetchEventDetail;
+  // SC-WP-3I — the plan lens's own preview. When a D-1-filtered whole-component
+  // selection is resolved for this plan, render the SHARED `CandidatePreview`
+  // component (reused verbatim, never forked): its verdicts come from the SAME WP-3G
+  // service as the save lens (identical `candidateId`), the message body is editable,
+  // and the `Lares-*` trailers render read-only. Absent ⇒ no preview (the engine
+  // route is not yet wired, or the plan has nothing previewable).
+  workspaceId?: string;
+  candidateSelection?: CandidatePreviewSelection | null;
 }): React.ReactElement {
   const banner = selectBannerState(projection);
   const groups = groupEventsBySection(sections, events);
@@ -106,6 +117,15 @@ function PlanSurfaceView({
               ))}
             </ul>
           )}
+        </div>
+      )}
+      {workspaceId && candidateSelection && (
+        <div className="plan-surface__candidate" data-testid="plan-candidate-preview">
+          <CandidatePreview
+            workspaceId={workspaceId}
+            selection={candidateSelection}
+            title="Save this plan's work"
+          />
         </div>
       )}
       <div className="plan-surface__viewtoggle" role="tablist" aria-label="Activity view" data-testid="plan-view-toggle">
