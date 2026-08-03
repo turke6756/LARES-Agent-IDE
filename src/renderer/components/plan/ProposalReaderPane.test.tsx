@@ -227,4 +227,85 @@ describe('ProposalReaderPane', () => {
     );
     expect(paneSetVisible).toHaveBeenCalledWith(false);
   });
+
+  // ── WP-P1C: Request-promotion affordance ──────────────────────────────────
+  // The only non-read-only gesture. It logs EXACTLY ONE voluntary-eligible
+  // `promotion_requested` demand-probe per gesture (no `feature_exercise` tag),
+  // creates no plan/registry row, and is not spammable (once per entry).
+  const promotionCalls = () =>
+    recordMock.mock.calls.filter((c) => c[0]?.kind === 'promotion_requested');
+  const requestBtn = () =>
+    document.querySelector('[data-testid="request-promotion"]') as HTMLButtonElement | null;
+
+  it('shows no promotion affordance until an entry is selected, and fires nothing on mount', async () => {
+    await render(
+      <ProposalReaderPane workspaceRoot="/ws" pathType="windows" workspaceId="ws-1" onClose={onClose} />,
+    );
+    expect(requestBtn()).toBeNull();
+    expect(document.querySelector('[data-testid="promotion-recorded"]')).toBeNull();
+    expect(promotionCalls().length).toBe(0);
+  });
+
+  it('records exactly one voluntary-eligible promotion_requested per gesture and confirms', async () => {
+    await render(
+      <ProposalReaderPane workspaceRoot="/ws" pathType="windows" workspaceId="ws-1" onClose={onClose} />,
+    );
+    const propRow = [...entries()].find((e) => e.getAttribute('data-entry-kind') === 'proposal') as HTMLButtonElement;
+    await act(async () => { propRow.click(); });
+    await flush();
+
+    // Selecting fired a reader_open, but no promotion request yet.
+    expect(promotionCalls().length).toBe(0);
+
+    await act(async () => { requestBtn()!.click(); });
+    await flush();
+
+    expect(promotionCalls().length).toBe(1);
+    const arg = promotionCalls()[0][0];
+    expect(arg).toEqual(expect.objectContaining({ workspaceId: 'ws-1', kind: 'promotion_requested' }));
+    // Voluntary-eligible: NO feature_exercise tag on the promotion event.
+    expect('feature_exercise' in arg).toBe(false);
+    // Button collapses into a confirmation; no request button remains.
+    expect(requestBtn()).toBeNull();
+    expect(document.querySelector('[data-testid="promotion-recorded"]')).not.toBeNull();
+  });
+
+  it('is not spammable: the confirmation replaces the button so a re-request cannot fire twice', async () => {
+    await render(
+      <ProposalReaderPane workspaceRoot="/ws" pathType="windows" workspaceId="ws-1" onClose={onClose} />,
+    );
+    const propRow = [...entries()].find((e) => e.getAttribute('data-entry-kind') === 'proposal') as HTMLButtonElement;
+    await act(async () => { propRow.click(); });
+    await flush();
+    await act(async () => { requestBtn()!.click(); });
+    await flush();
+    // Reselecting the same entry does not revive the request button.
+    await act(async () => { propRow.click(); });
+    await flush();
+    expect(requestBtn()).toBeNull();
+    expect(document.querySelector('[data-testid="promotion-recorded"]')).not.toBeNull();
+    expect(promotionCalls().length).toBe(1);
+  });
+
+  it('tracks per-entry: a second entry can be requested independently', async () => {
+    await render(
+      <ProposalReaderPane workspaceRoot="/ws" pathType="windows" workspaceId="ws-1" onClose={onClose} />,
+    );
+    const propRow = [...entries()].find((e) => e.getAttribute('data-entry-kind') === 'proposal') as HTMLButtonElement;
+    const folderRow = [...entries()].find((e) => e.getAttribute('data-entry-kind') === 'plan-folder') as HTMLButtonElement;
+
+    await act(async () => { propRow.click(); });
+    await flush();
+    await act(async () => { requestBtn()!.click(); });
+    await flush();
+    expect(promotionCalls().length).toBe(1);
+
+    // Switch to the folder entry: its request button is available again.
+    await act(async () => { folderRow.click(); });
+    await flush();
+    expect(requestBtn()).not.toBeNull();
+    await act(async () => { requestBtn()!.click(); });
+    await flush();
+    expect(promotionCalls().length).toBe(2);
+  });
 });

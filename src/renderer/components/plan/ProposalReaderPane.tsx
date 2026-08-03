@@ -24,7 +24,12 @@ import ProposalReader from './ProposalReader';
 //   • A `reader_open` demand-probe fires ONLY from a user click that opens a
 //     document (an entry row or a sibling), never on mount / initial render /
 //     refresh, and never on the automatic first read.
-// There are no edit / promote affordances here — those belong to later stages.
+// WP-P1C — the ONE gesture that is not read-only: a "Request promotion" button
+// on the selected entry. It logs exactly one VOLUNTARY-eligible
+// `promotion_requested` demand-probe per gesture (no `feature_exercise` tag, so
+// it survives aggregation) and creates NO plan / registry row — promotion does
+// not exist yet. Repeat requests for the same entry are suppressed (the button
+// disables into a "recorded" confirmation), so the gesture is not spammable.
 
 interface ProposalReaderPaneProps {
   /** Absolute workspace root path — the handle `planning-reader:list` needs. */
@@ -146,6 +151,9 @@ export default function ProposalReaderPane({
   const [listError, setListError] = useState<string | null>(null);
   const [selectedEntryId, setSelectedEntryId] = useState<string | null>(null);
   const [doc, setDoc] = useState<DocReadState | null>(null);
+  // Entry ids for which a promotion request has already been recorded this
+  // session — drives the once-per-item suppression + "recorded" confirmation.
+  const [promotionRequested, setPromotionRequested] = useState<Set<string>>(() => new Set());
 
   // Mount + manual refresh read. This is NOT an open: no demand-probe here.
   const refresh = useCallback(() => {
@@ -259,6 +267,24 @@ export default function ProposalReaderPane({
     [openDocument],
   );
 
+  // Voluntary human gesture: request promotion of the selected entry. Records
+  // EXACTLY ONE voluntary-eligible `promotion_requested` demand-probe per entry
+  // (no `feature_exercise` tag). Guarded so a repeat click for the same entry is
+  // a no-op — the button also disables after firing. Creates no plan/registry
+  // row; the only visible effect is the "recorded" confirmation.
+  const requestPromotion = useCallback(
+    (entry: PlanningReaderEntry) => {
+      if (promotionRequested.has(entry.entryId)) return;
+      setPromotionRequested((prev) => new Set(prev).add(entry.entryId));
+      if (workspaceId) {
+        void window.api.demandProbe
+          .record({ workspaceId, kind: 'promotion_requested' })
+          .catch(() => {});
+      }
+    },
+    [workspaceId, promotionRequested],
+  );
+
   const groups = useMemo(() => (entries ? groupByDay(entries) : []), [entries]);
 
   const selectedPrimary = selectedEntry ? primaryDocOf(selectedEntry) : null;
@@ -287,9 +313,29 @@ export default function ProposalReaderPane({
         >
           Refresh
         </button>
+        {selectedEntry &&
+          (promotionRequested.has(selectedEntry.entryId) ? (
+            <span
+              className="ml-auto flex items-center gap-1 rounded px-2 py-0.5 text-[11px] text-accent-green"
+              data-testid="promotion-recorded"
+            >
+              <Icons.Check className="h-3.5 w-3.5" />
+              Promotion requested
+            </span>
+          ) : (
+            <button
+              onClick={() => requestPromotion(selectedEntry)}
+              className="ml-auto flex items-center gap-1 rounded border border-white/15 px-2 py-0.5 text-[11px] text-gray-300 hover:bg-white/10 hover:text-gray-100"
+              data-testid="request-promotion"
+              title="Record a voluntary request to promote this proposal/plan (telemetry only — nothing is created yet)"
+            >
+              <Icons.ArrowUpCircle className="h-3.5 w-3.5" />
+              Request promotion
+            </button>
+          ))}
         <button
           onClick={onClose}
-          className="ml-auto rounded p-1 text-gray-400 hover:bg-white/10 hover:text-gray-100"
+          className={`${selectedEntry ? '' : 'ml-auto '}rounded p-1 text-gray-400 hover:bg-white/10 hover:text-gray-100`}
           data-testid="reader-close"
           aria-label="Close reader"
         >
