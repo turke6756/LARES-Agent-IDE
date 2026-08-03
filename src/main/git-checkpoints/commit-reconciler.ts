@@ -7,16 +7,24 @@
 import {
   getCommitRecord as dbGetCommitRecord,
   recordCommitLedger as dbRecordCommitLedger,
+  getDb,
+  setPackageFinalizationBoundaryStatus as dbSetBoundaryStatus,
   type CommitLedgerWrite,
   type CommitPathLink,
   type CommitRecord,
   type CommitTurnLink,
+  type FinalizationBoundaryStatus,
 } from '../database';
 import {
   runGit as realRunGit,
   type GitRunResult,
   type RunGitOptions,
 } from './git-command';
+import {
+  enumerateFinalizationRefs,
+  resolveFinalizationRef,
+  deleteFinalizationRefs,
+} from './finalization-refs';
 
 const GIT_TIMEOUT_MS = 10_000;
 const OID_RE = /^[0-9a-f]{40,64}$/;
@@ -231,3 +239,133 @@ export async function reconcileCommitHead(
 }
 
 export const reconcileCommitHeadMovement = reconcileCommitHead;
+
+// ── Save-card SC-WP-3C — finalization boundary-ref startup reconciliation ─────────
+//
+// Ref creation and the SQLite finalization row are not one transaction, so a crash
+// between them can leave an ORPHAN ref (created, no row) — and retention/pruning or
+// an external `git` can delete a ref out from under a still-`ready` row. Startup
+// reconciles both directions for one repo:
+//   • delete every `refs/lares/finalizations/*` ref with NO active finalization row
+//     (orphans — safe: nothing references them);
+//   • downgrade a `ready` active row whose durable ref no longer resolves to
+//     `unavailable` (the boundary is gone → non-committable until re-finalized).
+//
+// Ref RELEASE (a committed/superseded finalization's ref) is WP-3F's retention job;
+// this pass only GCs orphans and downgrades dangling `ready` rows.
+
+/** The minimal active-finalization projection the finalization reconciler needs. A
+ *  FOCUSED read (five columns), not the full-row accessor: the shared `database.ts`
+ *  carries a parallel lane's uncommitted work, so WP-3C reads through `getDb()`
+ *  rather than adding an accessor to it. */
+export interface ActiveFinalizationRow {
+  id: string;
+  packageId: string;
+  packageRevision: number;
+  boundaryRef: string | null;
+  boundaryStatus: FinalizationBoundaryStatus;
+}
+
+export interface FinalizationReconcileStore {
+  /** Every `lifecycle_status='active'` finalization for a repository key. */
+  listActiveFinalizations(repositoryKey: string): ActiveFinalizationRow[];
+  setPackageFinalizationBoundaryStatus(id: string, status: FinalizationBoundaryStatus): void;
+}
+
+const DATABASE_FINALIZATION_RECONCILE_STORE: FinalizationReconcileStore = {
+  listActiveFinalizations: (repositoryKey) =>
+    (getDb()
+      .prepare(
+        `SELECT id, package_id, package_revision, boundary_ref, boundary_status
+           FROM package_finalizations
+          WHERE repository_key = ? AND lifecycle_status = 'active'`,
+      )
+      .all(repositoryKey) as Array<Record<string, unknown>>).map((r) => ({
+      id: r.id as string,
+      packageId: r.package_id as string,
+      packageRevision: r.package_revision as number,
+      boundaryRef: (r.boundary_ref as string | null) ?? null,
+      boundaryStatus: r.boundary_status as FinalizationBoundaryStatus,
+    })),
+  setPackageFinalizationBoundaryStatus: dbSetBoundaryStatus,
+};
+
+export interface ReconcileFinalizationRefsDeps {
+  repoRoot: string;
+  /** The repository key whose active rows scope the downgrade probe. A `ready` row is
+   *  only downgraded when ITS repo's ref does not resolve — never another repo's. */
+  repositoryKey: string;
+  gitExe?: string;
+  runGit?: CommitReconcilerRunGit;
+  store?: FinalizationReconcileStore;
+  logger?: { info(m: string): void; warn(m: string): void };
+}
+
+export interface ReconcileFinalizationRefsResult {
+  /** Orphan refs (no active row) deleted in one atomic batch. */
+  deletedOrphanRefs: string[];
+  /** Finalization ids downgraded `ready`→`unavailable` (their ref no longer resolves). */
+  downgraded: string[];
+}
+
+/**
+ * Reconcile finalization boundary refs for one repo against its active rows: GC
+ * orphan refs and downgrade `ready` rows whose ref vanished. Repo-global refs are
+ * matched to active rows by exact ref string (package ids are globally unique, so a
+ * ref can never bleed across repos). Never throws on the downgrade path — an
+ * unusable repo aborts enumeration visibly, but a single unresolved ref is a normal
+ * downgrade, not a failure.
+ */
+export async function reconcileFinalizationRefs(
+  deps: ReconcileFinalizationRefsDeps,
+): Promise<ReconcileFinalizationRefsResult> {
+  const runGit = deps.runGit ?? realRunGit;
+  const store = deps.store ?? DATABASE_FINALIZATION_RECONCILE_STORE;
+  const active = store.listActiveFinalizations(deps.repositoryKey);
+  const activeRefs = new Set(
+    active.map((row) => row.boundaryRef).filter((ref): ref is string => ref !== null),
+  );
+
+  const refs = await enumerateFinalizationRefs({
+    repoRoot: deps.repoRoot,
+    gitExe: deps.gitExe,
+    runGit,
+  });
+  const orphans = refs.filter((ref) => !activeRefs.has(ref));
+  if (orphans.length > 0) {
+    const del = await deleteFinalizationRefs({
+      repoRoot: deps.repoRoot,
+      gitExe: deps.gitExe,
+      refs: orphans,
+      runGit,
+    });
+    if (!del.ok) {
+      deps.logger?.warn(
+        `[finalization-reconcile] orphan-ref delete failed (code ${del.code}): ${del.stderr}`,
+      );
+    }
+  }
+
+  const downgraded: string[] = [];
+  for (const row of active) {
+    if (row.boundaryStatus !== 'ready' || !row.boundaryRef) continue;
+    const oid = await resolveFinalizationRef({
+      repoRoot: deps.repoRoot,
+      gitExe: deps.gitExe,
+      ref: row.boundaryRef,
+      runGit,
+    });
+    if (oid === null) {
+      store.setPackageFinalizationBoundaryStatus(row.id, 'unavailable');
+      downgraded.push(row.id);
+    }
+  }
+
+  if (orphans.length || downgraded.length) {
+    deps.logger?.info(
+      `[finalization-reconcile] ${deps.repoRoot}: GC'd ${orphans.length} orphan ref(s), ` +
+        `downgraded ${downgraded.length} dangling ready row(s)`,
+    );
+  }
+  return { deletedOrphanRefs: orphans, downgraded };
+}
