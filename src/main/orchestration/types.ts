@@ -1,7 +1,13 @@
 import { Agent, LaunchAgentInput } from '../../shared/types';
 import type { DispatchContext } from '../git-checkpoints/dispatch-context';
 
-export type OrchestrationName = 'groupthink';
+// 'promotion' is the planning-lane promotion lifecycle (WP-P3B-core). It is NOT
+// an auto-executing catalog orchestration: it never routes through
+// OrchestrationService.start_run/execute (which immediately calls execute()).
+// Its rows are created directly by the promotion service's two-phase
+// bind-before-deliver dispatch and reconciled by WP-P3-reconcile — never
+// boot-aborted (see markActiveRunsAborted's `name <> 'promotion'` SQL filter).
+export type OrchestrationName = 'groupthink' | 'promotion';
 export type OrchestrationMode = 'serial' | 'parallel';
 export type RunStatus = 'starting' | 'running' | 'complete' | 'stalled' | 'aborted' | 'error';
 export type OrchestrationPlanBindingMode = 'explicit' | 'agent-default';
@@ -119,10 +125,29 @@ export interface OrchestrationRun {
   recoveryRepollMs?: number;
 }
 
+/** Durable evidence kinds for the promotion lifecycle (WP-P3B-core). These are
+ *  the phase markers that distinguish the internal promotion phases — the run
+ *  `status` only ever moves `starting` (reserved / bound-unconfirmed) →
+ *  `running` (confirmed delivery). Ordered by lifecycle position:
+ *   - reserved         : Phase 1 committed (orchestration row + bound onto the request)
+ *   - agent_bound      : Phase 2a committed (agent row + worker member, atomically)
+ *   - delivery_attempt : the confirmed-send body was about to be submitted
+ *   - delivered        : marker AND a matching turn-start were both observed
+ *   - failed           : terminal launch/delivery failure for this attempt
+ */
+export type PromotionEventKind =
+  | 'promotion.reserved'
+  | 'promotion.agent_bound'
+  | 'promotion.delivery_attempt'
+  | 'promotion.delivered'
+  | 'promotion.failed';
+
 export interface OrchestrationEvent {
   runId: string;
   ts: string;
-  kind: 'started' | 'turn' | 'round' | 'complete' | 'stalled' | 'aborted' | 'error' | 'delivery_failed';
+  kind:
+    | 'started' | 'turn' | 'round' | 'complete' | 'stalled' | 'aborted' | 'error' | 'delivery_failed'
+    | PromotionEventKind;
   payload: unknown;
 }
 

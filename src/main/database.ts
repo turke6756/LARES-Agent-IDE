@@ -7031,16 +7031,274 @@ export function insertOrchestrationMember(runId: string, role: string, agentId: 
 
 /** Boot reconcile: any run still 'starting'/'running' belonged to a dashboard
  *  process that died. Mark them aborted (error = reason) and return the rows as
- *  they were BEFORE the update so the caller can emit resume hints. */
+ *  they were BEFORE the update so the caller can emit resume hints.
+ *
+ *  WP-P3B-core: `name <> 'promotion'` is scoped INTO the SQL (both the SELECT and
+ *  the UPDATE) rather than filtered afterward in orchestration/service.ts —
+ *  because the DB function here is what actually aborts every starting/running
+ *  row, a post-call filter would be too late. Promotion rows legitimately live in
+ *  `starting` (reserved / bound-unconfirmed) and `running` (confirmed delivery);
+ *  they are reconciled by the pending-promotion reconciler (WP-P3-reconcile),
+ *  never boot-aborted, so they must survive this sweep. */
 export function markActiveRunsAborted(reason: string): OrchestrationRun[] {
   const rows = queryAll(
-    "SELECT * FROM orchestrations WHERE status IN ('starting', 'running')"
+    "SELECT * FROM orchestrations WHERE status IN ('starting', 'running') AND name <> 'promotion'"
   ).map(rowToOrchestrationRun);
   if (rows.length > 0) {
     run(
-      "UPDATE orchestrations SET status = 'aborted', error = ?, ended_at = ?, updated_at = ? WHERE status IN ('starting', 'running')",
+      "UPDATE orchestrations SET status = 'aborted', error = ?, ended_at = ?, updated_at = ? WHERE status IN ('starting', 'running') AND name <> 'promotion'",
       [reason, new Date().toISOString(), new Date().toISOString()]
     );
   }
   return rows;
+}
+
+// ── Promotion-request accessors (WP-P3B-core) ──────────────────────────────
+// ACCESSORS ONLY — the promotion_requests DDL is frozen (§R-A2, landed by
+// WP-P3A′); the A2 window is CLOSED, so nothing here adds a table or column.
+// These back the durable de-dup seam (UNIQUE(workspace_id, proposal_artifact_id))
+// and the crash-safe two-phase bind-before-deliver lifecycle: Phase 1 reserves
+// the promotion orchestration row AND binds it onto the request atomically;
+// Phase 2a binds the worker agent + member + `promotion.agent_bound` event
+// atomically inside launchAgent; Phase 2b records `promotion.delivered` only
+// after a confirmed turn start. Timestamps are service-owned INTEGER epochs.
+
+export interface PromotionRequestRow {
+  id: string;
+  workspaceId: string;
+  proposalId: string;
+  proposalArtifactId: string;
+  planArtifactId: string;
+  targetFolderRelPath: string;
+  supervisorId: string | null;
+  orchestrationId: string | null;
+  state: 'pending' | 'adopted' | 'failed';
+  attemptCount: number;
+  failureReason: string | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+function rowToPromotionRequest(row: any): PromotionRequestRow {
+  return {
+    id: row.id,
+    workspaceId: row.workspace_id,
+    proposalId: row.proposal_id,
+    proposalArtifactId: row.proposal_artifact_id,
+    planArtifactId: row.plan_artifact_id,
+    targetFolderRelPath: row.target_folder_rel_path,
+    supervisorId: row.supervisor_id ?? null,
+    orchestrationId: row.orchestration_id ?? null,
+    state: row.state,
+    attemptCount: row.attempt_count,
+    failureReason: row.failure_reason ?? null,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+/** Durable cross-restart de-dup seam. Insert a fresh `pending` request, or read
+ *  the existing row for `(workspace_id, proposal_artifact_id)` — the UNIQUE
+ *  constraint is authoritative, so a cross-process INSERT loser reads the
+ *  winner's row instead of duplicating (§R-P3 point 8). The identity
+ *  (plan_artifact_id / target_folder_rel_path) is caller-resolved (claim-scan
+ *  FIRST, then deterministic derivation) and persisted verbatim. */
+export function insertOrReadPromotionRequest(input: {
+  id: string;
+  workspaceId: string;
+  proposalId: string;
+  proposalArtifactId: string;
+  planArtifactId: string;
+  targetFolderRelPath: string;
+  supervisorId?: string | null;
+}): { row: PromotionRequestRow; created: boolean } {
+  const readExisting = (): PromotionRequestRow | null => {
+    const existing = queryOne(
+      'SELECT * FROM promotion_requests WHERE workspace_id = ? AND proposal_artifact_id = ?',
+      [input.workspaceId, input.proposalArtifactId],
+    );
+    return existing ? rowToPromotionRequest(existing) : null;
+  };
+  const pre = readExisting();
+  if (pre) return { row: pre, created: false };
+  const now = Date.now();
+  try {
+    run(
+      `INSERT INTO promotion_requests
+         (id, workspace_id, proposal_id, proposal_artifact_id, plan_artifact_id,
+          target_folder_rel_path, supervisor_id, orchestration_id, state,
+          attempt_count, failure_reason, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 'pending', 0, NULL, ?, ?)`,
+      [input.id, input.workspaceId, input.proposalId, input.proposalArtifactId,
+        input.planArtifactId, input.targetFolderRelPath, input.supervisorId ?? null, now, now],
+    );
+  } catch (err: any) {
+    // A racing writer (this process or another) won the UNIQUE(workspace_id,
+    // proposal_artifact_id) constraint between our read and insert — read theirs.
+    const raced = readExisting();
+    if (raced) return { row: raced, created: false };
+    throw err;
+  }
+  return { row: rowToPromotionRequest(queryOne('SELECT * FROM promotion_requests WHERE id = ?', [input.id])), created: true };
+}
+
+export function getPromotionRequestById(id: string): PromotionRequestRow | null {
+  const row = queryOne('SELECT * FROM promotion_requests WHERE id = ?', [id]);
+  return row ? rowToPromotionRequest(row) : null;
+}
+
+export function getPromotionRequestByProposal(
+  workspaceId: string, proposalArtifactId: string,
+): PromotionRequestRow | null {
+  const row = queryOne(
+    'SELECT * FROM promotion_requests WHERE workspace_id = ? AND proposal_artifact_id = ?',
+    [workspaceId, proposalArtifactId],
+  );
+  return row ? rowToPromotionRequest(row) : null;
+}
+
+export function getPromotionRequestByOrchestration(orchestrationId: string): PromotionRequestRow | null {
+  const row = queryOne(
+    'SELECT * FROM promotion_requests WHERE orchestration_id = ?',
+    [orchestrationId],
+  );
+  return row ? rowToPromotionRequest(row) : null;
+}
+
+export function listPendingPromotionRequests(): PromotionRequestRow[] {
+  return queryAll("SELECT * FROM promotion_requests WHERE state = 'pending' ORDER BY created_at ASC")
+    .map(rowToPromotionRequest);
+}
+
+/** Phase 1 (§R-P3 points 5, 6) — reserve the promotion orchestration row AND bind
+ *  its id onto the request, atomically, BEFORE any delivery. `incrementAttempt`
+ *  distinguishes a first reservation (request stays `pending`, attempt_count
+ *  unchanged) from a `failed → pending` retry (attempt_count++, failure_reason
+ *  cleared, orchestration_id replaced with the new attempt). The deterministic
+ *  identity on the request is retained across retries — only the attempt's
+ *  orchestration changes. */
+export function reservePromotionOrchestration(input: {
+  requestId: string;
+  run: OrchestrationRun;
+  ts: string;
+  incrementAttempt: boolean;
+}): void {
+  const tx = db.transaction(() => {
+    insertOrchestration(input.run);
+    insertOrchestrationEvent({
+      runId: input.run.runId, ts: input.ts, kind: 'promotion.reserved',
+      payload: { requestId: input.requestId },
+    });
+    if (input.incrementAttempt) {
+      run(
+        `UPDATE promotion_requests
+           SET orchestration_id = ?, state = 'pending', failure_reason = NULL,
+               attempt_count = attempt_count + 1, updated_at = ?
+         WHERE id = ?`,
+        [input.run.runId, Date.now(), input.requestId],
+      );
+    } else {
+      run(
+        `UPDATE promotion_requests SET orchestration_id = ?, updated_at = ? WHERE id = ?`,
+        [input.run.runId, Date.now(), input.requestId],
+      );
+    }
+  });
+  tx();
+}
+
+/** Phase 2a (§R-P3 point 5) — the atomic agent/member/event transaction. In ONE
+ *  DB transaction: create the agent row, bind it as the run's `worker` member,
+ *  persist the `promotion.agent_bound` event, and touch the orchestration
+ *  (status stays `starting`). A crash before COMMIT leaves neither the agent row
+ *  nor the member (no unbound orphan); a crash after COMMIT always yields the
+ *  exact bound agent. Invoked from AgentSupervisor.launchAgent under a trusted
+ *  InternalLaunchContext — the process spawn happens only after this returns. */
+export function bindPromotionAgentAtomic(
+  createAgentInput: Parameters<typeof createAgent>[0],
+  binding: { runId: string; ts: string },
+): Agent {
+  const tx = db.transaction((): Agent => {
+    const agent = createAgent(createAgentInput);
+    insertOrchestrationMember(binding.runId, 'worker', agent.id);
+    insertOrchestrationEvent({
+      runId: binding.runId, ts: binding.ts, kind: 'promotion.agent_bound',
+      payload: { agentId: agent.id },
+    });
+    run(
+      "UPDATE orchestrations SET status = 'starting', updated_at = ? WHERE run_id = ?",
+      [binding.ts, binding.runId],
+    );
+    return agent;
+  });
+  return tx();
+}
+
+/** The bound worker agent id for a promotion run, or null if Phase 2a never
+ *  committed (→ the oracle's `reserved-unbound`). */
+export function getPromotionWorkerMember(runId: string): string | null {
+  const row = queryOne(
+    "SELECT agent_id FROM orchestration_members WHERE run_id = ? AND role = 'worker'",
+    [runId],
+  );
+  return row ? row.agent_id : null;
+}
+
+/** Existence probe over the promotion event ledger — the oracle reads phase
+ *  markers (`promotion.delivery_attempt`, `promotion.delivered`, …) this way. */
+export function hasOrchestrationEvent(runId: string, kind: OrchestrationEvent['kind']): boolean {
+  return !!queryOne(
+    'SELECT 1 FROM orchestration_events WHERE run_id = ? AND kind = ? LIMIT 1',
+    [runId, kind],
+  );
+}
+
+/** Phase 2b — record that the confirmed-send body was submitted (before the send
+ *  resolves) so restart inspection can tell "never attempted" from "attempt
+ *  interrupted". The stable `promotion:<requestId>` marker rides the payload. */
+export function recordPromotionDeliveryAttempt(runId: string, ts: string, marker: string): void {
+  insertOrchestrationEvent({
+    runId, ts, kind: 'promotion.delivery_attempt', payload: { marker },
+  });
+}
+
+/** Phase 2b terminal-success — write `promotion.delivered` AND flip the run to
+ *  `running`, atomically. Called ONLY after a matching turn-start confirmation,
+ *  never on submission and never on launchAgent return. */
+export function recordPromotionDelivered(runId: string, ts: string): void {
+  const tx = db.transaction(() => {
+    insertOrchestrationEvent({ runId, ts, kind: 'promotion.delivered', payload: {} });
+    run("UPDATE orchestrations SET status = 'running', updated_at = ? WHERE run_id = ?", [ts, runId]);
+  });
+  tx();
+}
+
+/** Terminal failure for an attempt (§R-P3 point 5) — `promotion.failed` event +
+ *  the request row's `state='failed'` + `failure_reason`, atomically. The
+ *  orchestration row (if any) is flipped to `error` so it reads terminal. A
+ *  retry (failed → pending) goes through reservePromotionOrchestration with
+ *  incrementAttempt=true, only after the prior attempt is witnessed terminal. */
+export function recordPromotionFailed(input: {
+  requestId: string;
+  runId?: string | null;
+  ts: string;
+  reason: string;
+}): void {
+  const tx = db.transaction(() => {
+    if (input.runId) {
+      insertOrchestrationEvent({
+        runId: input.runId, ts: input.ts, kind: 'promotion.failed',
+        payload: { reason: input.reason },
+      });
+      run(
+        "UPDATE orchestrations SET status = 'error', error = ?, ended_at = ?, updated_at = ? WHERE run_id = ?",
+        [input.reason, input.ts, input.ts, input.runId],
+      );
+    }
+    run(
+      "UPDATE promotion_requests SET state = 'failed', failure_reason = ?, updated_at = ? WHERE id = ?",
+      [input.reason, Date.now(), input.requestId],
+    );
+  });
+  tx();
 }

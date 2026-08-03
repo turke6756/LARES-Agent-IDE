@@ -184,6 +184,7 @@ import {
   getPlan, planItemInPlan, recordPlanSectionTouch,
   getTurnSectionTouches, getTurnSectionChanges, insertPlanEvent, getTurnRepoActivity,
   getDb,
+  bindPromotionAgentAtomic,
 } from '../database';
 import { PlanTouchTracker } from '../plans/plan-touch-tracker';
 import { composePlanEvent, planEventTurnKey, TurnComposeGuard } from '../plans/plan-events';
@@ -610,6 +611,21 @@ export class SubmitNotConfirmedError extends Error {
 // status inside this window (stuck launch, crash loop) must not receive a
 // stale selection prompt minutes later.
 const INITIAL_USER_PROMPT_TTL_MS = 10 * 60_000;
+
+// WP-P3B-core — the trusted binding for a promotion-lane launch. This is
+// deliberately MAIN-PROCESS-ONLY and is NEVER placed on the public
+// `LaunchAgentInput` (which is populated from API/IPC-facing data): it travels
+// as a separate, non-public SECOND parameter to `launchAgent`, suppliable only
+// by the in-process promotion adapter. API/IPC callers call `launchAgent(input)`
+// with one argument and cannot serialize or supply this. It must never be added
+// to `src/shared/types.ts`.
+export interface InternalLaunchContext {
+  orchestrationBinding: {
+    runId: string;
+    role: 'worker';
+    evidenceKind: 'promotion';
+  };
+}
 
 interface PendingInitialPrompt {
   text: string;
@@ -2504,7 +2520,7 @@ export class AgentSupervisor extends EventEmitter {
     }
   }
 
-  async launchAgent(input: LaunchAgentInput): Promise<Agent> {
+  async launchAgent(input: LaunchAgentInput, internal?: InternalLaunchContext): Promise<Agent> {
     // D5-lite admission gate (incident-2026-07-11 §5 D5): refuse NEW launches
     // under Critical commit pressure or at a static cap, BEFORE any side effect
     // (createAgent / spawn). The refusal carries a machine-readable `code`
@@ -2805,7 +2821,7 @@ export class AgentSupervisor extends EventEmitter {
       }
     }
 
-    const agent = createAgent({
+    const agentCreateInput = {
       workspaceId: resolvedInput.workspaceId,
       title: resolvedInput.title,
       roleDescription: resolvedInput.roleDescription || '',
@@ -2843,7 +2859,22 @@ export class AgentSupervisor extends EventEmitter {
       // references an existing plans row, so the FK → plans.id resolves.
       planId: resolvedInput.planId || null,
       planSection: resolvedInput.planSection || null,
-    });
+    };
+
+    // WP-P3B-core Phase 2a — a promotion-lane launch carries a trusted
+    // InternalLaunchContext. When present, the agent row, the `worker`
+    // orchestration member, the `promotion.agent_bound` event, and the
+    // orchestration touch commit in ONE DB transaction (bindPromotionAgentAtomic)
+    // BEFORE the process spawn below. A crash before that commit leaves neither
+    // the agent row nor the member (no unbound orphan → the oracle's
+    // `reserved-unbound`); a crash after it always yields the exact bound agent.
+    // Every other launch keeps the plain createAgent path unchanged.
+    const agent = internal?.orchestrationBinding
+      ? bindPromotionAgentAtomic(agentCreateInput, {
+          runId: internal.orchestrationBinding.runId,
+          ts: new Date().toISOString(),
+        })
+      : createAgent(agentCreateInput);
 
     // WP-A.2 (F9) — if this launch is joining a team, record the membership now,
     // BEFORE the launch functions read `getTeamMembership` to inject the team
