@@ -39,6 +39,7 @@ experiments/
 .lares/workers/
 .lares/scripts/
 .lares/pending-status.jsonl
+# usage/ — local telemetry sinks (e.g. WP-P0PRE demand-probe.jsonl); never committed.
 .lares/usage/
 .lares/*/.claude/.sysprompt-*.txt
 .lares/*/.claude/scheduled_tasks.lock
@@ -47,6 +48,7 @@ experiments/
 .dashboard/workers/
 .dashboard/scripts/
 .dashboard/pending-status.jsonl
+# usage/ — local telemetry sinks (e.g. WP-P0PRE demand-probe.jsonl); never committed.
 .dashboard/usage/
 .dashboard/*/.claude/.sysprompt-*.txt
 .dashboard/*/.claude/scheduled_tasks.lock

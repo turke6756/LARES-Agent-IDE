@@ -25,6 +25,7 @@ test('the plans toolset — create + read ladder + focus verbs (supervisor lane)
     'list_plan_sections',
     'read_plan_projection',
     'read_plan_section',
+    'record_planning_event',
     'unfocus_plan',
   ]);
 });
@@ -69,12 +70,13 @@ test('read_plan_section advertises all four read modes incl. raw+editWindow', ()
 
 // ── WP-A4: plans-read read-only subset (worker lane) ────────────────────────
 
-test('getPlansReadToolDefinitions returns exactly the 3 read tools (no create_plan)', () => {
+test('getPlansReadToolDefinitions returns the 3 read tools + record_planning_event (no create_plan)', () => {
   const names = getPlansReadToolDefinitions().map((t) => t.name);
   assert.deepStrictEqual(names.sort(), [
     'list_plan_sections',
     'read_plan_projection',
     'read_plan_section',
+    'record_planning_event',
   ]);
   assert.ok(!names.includes('create_plan'), 'plans-read must NOT advertise create_plan');
 });

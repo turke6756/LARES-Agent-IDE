@@ -152,14 +152,43 @@ const FOCUS_DEFS = [
   },
 ];
 
+// record_planning_event — planning-surface DEMAND PROBE (WP-P0PRE). A lightweight
+// telemetry ping (NOT a plan write): it records that an agent authored a proposal
+// or requested a promotion, so the revamp can measure voluntary demand. Advertised
+// to BOTH the supervisor (`plans`) and worker (`plans-read`) lanes because
+// proposal authoring happens on the worker lane; it touches no plan section, so it
+// is safe in the read-only lane. `source` is stamped server-side as `agent-tool`
+// (the route ignores any caller-asserted origin), and voluntary eligibility is
+// computed at aggregation — never asserted here.
+const recordPlanningEventDef = {
+  name: 'record_planning_event',
+  description:
+    'Record a planning-surface demand-probe event (telemetry only — this does NOT edit any ' +
+    'plan section). Call it when you author a proposal (`proposal_authored`) or request a ' +
+    'promotion/graduation (`promotion_requested`) so the planning-surface revamp can measure ' +
+    'voluntary demand. Fire-and-forget; safe to retry (idempotent by event id).',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      kind: {
+        type: 'string',
+        enum: ['proposal_authored', 'promotion_requested'],
+        description: 'What planning action you just took.',
+      },
+    },
+    required: ['kind'],
+  },
+};
+
 function getPlansToolDefinitions() {
-  return [createDef, ...READ_DEFS, ...FOCUS_DEFS];
+  return [createDef, ...READ_DEFS, ...FOCUS_DEFS, recordPlanningEventDef];
 }
 
 /** WP-A4 (D-1): the read-only subset advertised to the worker `plans-read`
- *  toolset — the three read tools, never create_plan. */
+ *  toolset — the three read tools, never create_plan. record_planning_event is
+ *  included: it is a telemetry ping, not a plan write. */
 function getPlansReadToolDefinitions() {
-  return READ_DEFS;
+  return [...READ_DEFS, recordPlanningEventDef];
 }
 
 /** Resolve the effective plan id for a read call: explicit arg first, else the
@@ -243,6 +272,13 @@ async function handlePlansToolCall(name, args, apiRequest) {
       const planId = resolvePlanId(args);
       if (!planId) return missingPlanIdError();
       const result = await apiRequest('DELETE', `/api/supervisor-focus/self/${encodeURIComponent(planId)}`);
+      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+    }
+
+    case 'record_planning_event': {
+      // Demand probe (WP-P0PRE). Workspace + `source:'agent-tool'` are derived
+      // server-side from the caller identity headers — only `kind` is sent.
+      const result = await apiRequest('POST', '/api/demand-probe', { kind: args.kind });
       return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
     }
 

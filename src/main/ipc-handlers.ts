@@ -58,6 +58,7 @@ import {
   removeLegacyLauncher,
 } from './workspace-state-dir';
 import { ensureInstallationLauncher } from './installation-descriptor';
+import { recordDemandProbe, isDemandProbeKind, DEMAND_PROBE_RECORD_CHANNEL } from './telemetry/demand-probe';
 import { registerCheckpointIpc, type HumanCheckpointRoutes } from './git-checkpoints/checkpoint-ipc';
 import { registerSaveCardIpc, type SaveCardRoutes } from './commit-candidates/save-card-ipc';
 import type { RequestedPlanBinding } from '../shared/commit-candidates';
@@ -139,6 +140,35 @@ export function registerIpcHandlers(
   ipcMain.handle('workspace:open-vscode', (_e, id) => {
     const ws = getWorkspace(id);
     if (ws) openInVSCode(ws.path, ws.pathType);
+  });
+
+  // Planning-surface demand probe (WP-P0PRE). The renderer records voluntary
+  // user actions (reader/savecard opens, etc.). `source` is stamped here from
+  // the transport (renderer-user-action) — it is NEVER taken from the payload,
+  // so a caller cannot forge its own origin tag. Voluntary eligibility is not
+  // asserted at write time; it is computed at aggregation.
+  ipcMain.handle(DEMAND_PROBE_RECORD_CHANNEL, (_e, req: {
+    workspaceId?: string; kind?: unknown; feature_exercise?: boolean; manual_class?: string; eventId?: string;
+  }) => {
+    const workspaceId = req?.workspaceId;
+    if (typeof workspaceId !== 'string' || workspaceId === '') {
+      return { appended: false, duplicate: false, reason: 'workspaceId required' };
+    }
+    if (!isDemandProbeKind(req?.kind)) {
+      return { appended: false, duplicate: false, reason: 'unknown demand-probe kind' };
+    }
+    const ws = getWorkspace(workspaceId);
+    if (!ws) return { appended: false, duplicate: false, reason: 'workspace not found' };
+    return recordDemandProbe({
+      workspaceRoot: ws.path,
+      workspaceId,
+      kind: req.kind,
+      source: 'renderer-user-action',
+      feature_exercise: req.feature_exercise === true,
+      manual_class: req.manual_class,
+      eventId: req.eventId,
+      pathType: detectPathType(ws.path),
+    });
   });
 
   // Agent handlers

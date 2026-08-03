@@ -86,6 +86,7 @@ import { getSharedParseManager } from './skill-analytics/parse-manager-factory';
 import { queryMcpToolUsage } from './skill-analytics/mcp-tool-usage-queries';
 import { runKnowledgeExtract } from './agent-knowledge/knowledge-extract-runner';
 import { runOverheadScan } from './context-overhead/ipc-deps';
+import { recordDemandProbe, isDemandProbeKind, DEMAND_PROBE_ROUTE } from './telemetry/demand-probe';
 import { buildOverheadSnapshot, scrubPaths } from './context-overhead/overhead-dto';
 import type { AgentRoleLane, BehaviorEvidenceTier, ContextOptimizerProposalKind, ContextOptimizerResult, AgentKnowledgeGraph, SkillUsageResult, McpToolUsageRollupDTO, WorkspaceScopeMode, PathRole, OverheadModel } from '../shared/types';
 import type { DiffResult, RestoreOutcome, CheckpointPreviewResult, FileHistoryVersion } from './git-checkpoints/checkpoint-service';
@@ -1428,6 +1429,42 @@ export class ApiServer {
         { target: input.target, text: input.text, rationale: input.rationale },
         identity.supervisorId,
       );
+    }
+
+    // POST /api/demand-probe { kind, feature_exercise?, manual_class?, eventId? }
+    // — planning-surface demand probe (WP-P0PRE), the route behind the
+    // `record_planning_event` MCP tool. Workspace identity is derived SOLELY
+    // from the authenticated X-Workspace-Id header (resolveIdentity already
+    // 403'd an unknown/cross-workspace assertion). `source` is stamped here as
+    // the FACTUAL origin `agent-tool` — it is NEVER taken from the request body,
+    // so the model cannot forge its own origin tag. Voluntary eligibility is not
+    // asserted at write time; it is computed at aggregation.
+    if (method === 'POST' && path === DEMAND_PROBE_ROUTE) {
+      if (!identity.asserted || !identity.workspaceId) {
+        throw Object.assign(
+          new Error('workspace identity required (send X-Workspace-Id header)'),
+          { statusCode: 400 },
+        );
+      }
+      const workspace = getWorkspaceRecord(identity.workspaceId);
+      if (!workspace) {
+        throw Object.assign(new Error('workspace not found'), { statusCode: 404 });
+      }
+      const body = await readBody(req);
+      const input = body ? JSON.parse(body) : {};
+      if (!isDemandProbeKind(input.kind)) {
+        throw Object.assign(new Error('unknown demand-probe kind'), { statusCode: 400 });
+      }
+      return recordDemandProbe({
+        workspaceRoot: workspace.path,
+        workspaceId: identity.workspaceId,
+        kind: input.kind,
+        source: 'agent-tool',
+        feature_exercise: input.feature_exercise === true,
+        manual_class: typeof input.manual_class === 'string' ? input.manual_class : undefined,
+        eventId: typeof input.eventId === 'string' ? input.eventId : undefined,
+        pathType: detectPathType(workspace.path),
+      });
     }
 
     // ══ Memory & Lessons v2 (WP-F2): the supervisor-only guarded migration ops ══
