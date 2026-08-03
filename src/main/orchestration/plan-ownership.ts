@@ -13,7 +13,7 @@
 // The Lares pattern of keeping a seed worker idle across GroupThink phases stays
 // legal, so an idle plan-bound agent is dispatch-safe.
 
-import { listOrchestrationRuns, getLiveRailAgentForPlan } from '../database';
+import { getPlan, listOrchestrationRuns, getLiveRailAgentForPlan } from '../database';
 import { trailMaterializer } from '../plans/execution-trail-writer';
 
 /** A 409-shaped Error (statusCode carried so the API layer maps it to HTTP 409). */
@@ -31,6 +31,17 @@ export function assertPlanRailFree(
   planId: string,
   opts?: { exemptRunId?: string; exemptAgentIds?: string[] },
 ): void {
+  // WP-P0B trusted format-gate: the one-writer guard applies ONLY to legacy
+  // `format === 'html'` plans (the projection/pane surface written back by a
+  // native section edit). Structured / md plans — and an unknown or missing plan
+  // id — bypass the guard entirely, because it protects the HTML writeback race,
+  // not arbitrary external filesystem edits. The format is read from the TRUSTED
+  // `plans` row via `getPlan`, NEVER from a caller-supplied value, so a caller
+  // can neither spoof a bypass nor manufacture a lock. A null plan (unknown id)
+  // is a safe no-crash bypass.
+  const plan = getPlan(planId);
+  if (!plan || plan.format !== 'html') return;
+
   const active = listOrchestrationRuns().find(
     (r) =>
       r.planId === planId &&

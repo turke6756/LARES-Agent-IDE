@@ -10,8 +10,10 @@
 //   raw            — byte-exact HTML (offset/limit window a giant block; the
 //                    window stays a verbatim substring so old_string matches).
 //   raw+editWindow — byte-exact `oldString` + its source range + an append point
-//                    (for append-only zones) + the §3 edit-discipline text.
-//                    This is `get_section_emit` folded into a mode (N8).
+//                    (for append-only zones). This is `get_section_emit` folded
+//                    into a mode (N8). WP-P0B: the mode + its byte-exact window
+//                    are PRESERVED; only the obligating edit-discipline text is
+//                    removed — `instructions` is now empty (see EDIT_DISCIPLINE).
 //
 // This module is the clean API surface; WP3 wires it into the MCP tool + records
 // the read breadcrumb. It never reaches the DB or fs itself — pure over a
@@ -21,12 +23,13 @@ import type { PlanProjection, ParsedSection, ParsedBlock } from './section-reade
 
 export type ReadMode = 'outline' | 'text' | 'raw' | 'raw+editWindow';
 
-/** §3 edit-discipline instructions surfaced with every editWindow. */
-export const EDIT_DISCIPLINE =
-  'Edit natively: replace ONLY this exact fragment with your revision. ' +
-  'Preserve every data-anchor value verbatim (they are the provenance key — ' +
-  'reword headings/body/data-zone freely, never the data-anchor). Do not ' +
-  'reformat or re-indent surrounding zones.';
+/** WP-P0B (ceremony subtraction): the read-before-edit discipline that used to
+ *  ride on every editWindow is REMOVED — no read mode obligates a read-before-edit
+ *  ritual. The `raw+editWindow` mode still returns its byte-exact `oldString`,
+ *  source range, and append point; `instructions` is now the empty string. The
+ *  constant is retained (still surfaced as `editWindow.instructions`) so callers
+ *  and the shared response shape are unchanged. */
+export const EDIT_DISCIPLINE = '';
 
 export interface OutlineChild {
   anchor: string | null;

@@ -31,8 +31,13 @@ db.getWorkspace = (id: string) => (id === 'ws-1' ? { id: 'ws-1', path: os.tmpdir
 // Fix 3 (planning-surface demo): start_run now resolves getPlan(planId).path for
 // rail runs. These lifecycle tests don't assert path resolution, so a plans store
 // keyed by id suffices; unknown ids fall back to null → the legacy planPath default.
-const plansStore = new Map<string, { id: string; workspaceId: string; path: string }>();
+const plansStore = new Map<string, { id: string; workspaceId: string; path: string; format?: string }>();
 db.getPlan = (id: string) => (plansStore.has(id) ? clone(plansStore.get(id)!) : null);
+// WP-P0B trusted format-gate: `assertPlanRailFree` only guards legacy
+// `format === 'html'` plans, so the one-writer-per-plan run lock is exercised via
+// a registered html plan surface. (Unknown ids still resolve to null → bypass →
+// the legacy planPath default, unchanged.)
+plansStore.set('plan-lock', { id: 'plan-lock', workspaceId: 'ws-1', path: 'plans/lock.html', format: 'html' });
 db.insertOrchestration = (r: OrchestrationRun) => { runsStore.set(r.runId, clone(r)); };
 db.updateOrchestration = (r: OrchestrationRun) => { runsStore.set(r.runId, clone(r)); };
 db.getOrchestrationRun = (id: string) => (runsStore.has(id) ? clone(runsStore.get(id)!) : null);

@@ -47,7 +47,12 @@ test('rail launch (plan_id + section_anchor) appends the writer contract to the 
   assert.ok(captured.inputBody, 'the /input route must have been called');
   const expected = 'Do the thing.' + '\n\n' + planRailContractBlock('plan-42', 'sec_abc123');
   assert.strictEqual(captured.inputBody.text, expected, 'submitted prompt must be the base prompt + writer contract');
-  assert.ok(captured.inputBody.text.includes('raw+editWindow'), 'the appended block must carry the writer edit discipline');
+  // WP-P0B: the appended block is orientation only — it names the plan + section
+  // but carries NO per-turn sentinel and NO read-before-edit discipline.
+  assert.ok(captured.inputBody.text.includes('plan-42') && captured.inputBody.text.includes('sec_abc123'),
+    'the appended block names the bound plan + section');
+  assert.ok(!captured.inputBody.text.includes('raw+editWindow') && !captured.inputBody.text.includes('PLAN-EVENT'),
+    'the appended block must NOT carry the retired read-before-edit / per-turn-sentinel ceremony');
 });
 
 test('non-rail launch submits args.prompt verbatim (no contract appended)', async () => {

@@ -457,11 +457,36 @@ function fakeRun(over: Record<string, unknown>): unknown {
 }
 const is409 = (e: unknown): boolean => (e as { statusCode?: number }).statusCode === 409;
 
-test('assertPlanRailFree — a free plan does not throw', () => {
+// WP-P0B trusted format-gate: `assertPlanRailFree` guards ONLY `format === 'html'`
+// plans (read from the trusted `plans` row). These reservation tests therefore
+// seed an html plan row so the guard proceeds to its run/agent/materialize checks.
+let planGuardWs: string | null = null;
+function seedPlan(id: string, format: string): void {
+  if (!planGuardWs) planGuardWs = insertWorkspace(DEFAULT_COMMAND);
+  liveDb!.prepare(
+    `INSERT OR IGNORE INTO plans (id, workspace_id, path, slug, format, mtime_ms, size_bytes)
+     VALUES (?, ?, ?, ?, ?, 0, 0)`
+  ).run(id, planGuardWs, `plans/${id}.${format}`, id, format);
+}
+const seedHtmlPlan = (id: string): void => seedPlan(id, 'html');
+
+test('assertPlanRailFree — a free (html) plan does not throw', () => {
+  seedHtmlPlan('plan-free');
   assert.doesNotThrow(() => ownership.assertPlanRailFree('plan-free'));
 });
 
+test('assertPlanRailFree — a structured plan is bypassed even with a live writer', () => {
+  // The stored row is structured, not html → the guard short-circuits before it
+  // ever consults the (present) live writer.
+  seedPlan('plan-structured', 'structured');
+  const a = makeAgentRow({ planId: 'plan-structured' });
+  dbm.updateAgentStatus(a.id, 'working');
+  assert.doesNotThrow(() => ownership.assertPlanRailFree('plan-structured'),
+    'a structured surface is not subject to the one-writer HTML-writeback guard');
+});
+
 test('assertPlanRailFree — idle plan-bound agent does NOT 409 (amended §4.4)', () => {
+  seedHtmlPlan('plan-idle-guard');
   const a = makeAgentRow({ planId: 'plan-idle-guard' });
   dbm.updateAgentStatus(a.id, 'idle');
   assert.doesNotThrow(() => ownership.assertPlanRailFree('plan-idle-guard'),
@@ -469,6 +494,7 @@ test('assertPlanRailFree — idle plan-bound agent does NOT 409 (amended §4.4)'
 });
 
 test('assertPlanRailFree — an actively-working plan-bound agent 409s; exempt clears it', () => {
+  seedHtmlPlan('plan-busy');
   const a = makeAgentRow({ planId: 'plan-busy' });
   dbm.updateAgentStatus(a.id, 'working');
   assert.throws(() => ownership.assertPlanRailFree('plan-busy'), is409);
@@ -476,6 +502,7 @@ test('assertPlanRailFree — an actively-working plan-bound agent 409s; exempt c
 });
 
 test('assertPlanRailFree — an active run 409s; exemptRunId clears it', () => {
+  seedHtmlPlan('plan-run');
   dbm.insertOrchestration(fakeRun({ runId: 'run-active', status: 'running', planId: 'plan-run' }));
   assert.throws(() => ownership.assertPlanRailFree('plan-run'), is409);
   assert.doesNotThrow(() => ownership.assertPlanRailFree('plan-run', { exemptRunId: 'run-active' }));
