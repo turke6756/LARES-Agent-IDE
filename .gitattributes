@@ -1,0 +1,3 @@
+# planning-reader.ts briefly carried a stray NUL (commit 0db3a8b); force a
+# textual diff across that historical boundary. The source itself is plain text.
+src/main/plans/planning-reader.ts diff
