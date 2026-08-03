@@ -1759,6 +1759,80 @@ function initContextOptimizerSchema(): void {
   db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_plans_folder_rel_path
     ON plans(workspace_id, folder_rel_path) WHERE folder_rel_path IS NOT NULL`);
 
+  // Planning-surface WP-P2L-schema — planning-intent LEDGER (STAGE P2L). DDL-
+  // serialized in the NEXT serial slot after WP-P2A (above), inside this optimizer-
+  // schema init. Two additive tables + one guarded ALTER on `orchestrations`
+  // (created in initDatabase() BEFORE this init runs, so the ALTER resolves).
+  //
+  // SINGLE run-state authority stays in `orchestrations`; the ledger holds intent
+  // identity/status + presence-aware output OBSERVATIONS only — NO copied
+  // orchestration run-state, no second mutable run-state authority (rulings
+  // 12–14/16/17/20). `plan_intents` identity is (plan_id, intent_id): `intent_id`
+  // is unique only WITHIN a plan, so both the UNIQUE constraint and every join key
+  // are composite. `plan_id` is NOT NULL — P2L depends on P2 folder adoption having
+  // produced the `plans` row; `plan_artifact_id` is carried for display/lineage,
+  // NOT identity. No `author_*` columns: authorship is the proposal record's, never
+  // duplicated here.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS plan_intents (
+      id                   TEXT PRIMARY KEY,
+      workspace_id         TEXT NOT NULL,
+      plan_id              TEXT NOT NULL,
+      plan_artifact_id     TEXT NOT NULL,
+      intent_id            TEXT NOT NULL,
+      part_slug            TEXT,
+      kind                 TEXT NOT NULL,
+      targets_json         TEXT,
+      reason               TEXT,
+      source_doc_rel_path  TEXT NOT NULL,
+      status               TEXT NOT NULL DEFAULT 'active',
+      supersedes_intent_id TEXT,
+      integration_note     TEXT,
+      first_seen_at        INTEGER NOT NULL,
+      updated_at           INTEGER NOT NULL,
+      last_scanned_at      INTEGER NOT NULL,
+      UNIQUE(plan_id, intent_id),
+      CHECK (kind IN ('groupthink-serial','groupthink-parallel','research')),
+      CHECK (status IN ('active','withdrawn','superseded'))
+    );
+  `);
+
+  // `plan_intent_outputs`: multiple runs → multiple rows; each is an OBSERVATION
+  // (present/missing, disposition, folded_in) keyed by (plan_id, intent_id,
+  // rel_path). The composite FK references plan_intents(plan_id, intent_id) — a
+  // SAME-PLAN-only constraint that mechanically rejects a cross-plan output insert
+  // (foreign_keys is ON, and the parent's table-level UNIQUE(plan_id, intent_id)
+  // supplies the required unique index). `orchestration_id` is a self-declared
+  // cross-check, NOT run-state authority — plain attribute, no FK cascade.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS plan_intent_outputs (
+      plan_id         TEXT NOT NULL,
+      intent_id       TEXT NOT NULL,
+      rel_path        TEXT NOT NULL,
+      orchestration_id TEXT,
+      present_on_disk INTEGER NOT NULL DEFAULT 1,
+      disposition     TEXT NOT NULL DEFAULT 'active',
+      folded_in       INTEGER NOT NULL DEFAULT 0,
+      first_seen_at   INTEGER NOT NULL,
+      last_present_at INTEGER,
+      last_scanned_at INTEGER NOT NULL,
+      PRIMARY KEY (plan_id, intent_id, rel_path),
+      FOREIGN KEY (plan_id, intent_id) REFERENCES plan_intents(plan_id, intent_id),
+      CHECK (present_on_disk IN (0,1)),
+      CHECK (disposition IN ('active','superseded','withdrawn')),
+      CHECK (folded_in IN (0,1))
+    );
+  `);
+
+  // Guarded orchestration link: a PLAIN nullable attribute + a composite index for
+  // the `ran` join. The join is on BOTH (plan_id, planning_intent_id) because
+  // intent_id is unique only within a plan. try/catch ALTER idiom (SQLite has no
+  // ADD COLUMN IF NOT EXISTS); the index is IF NOT EXISTS. No FK cascade to
+  // orchestrations run-state — orchestrations stays the sole run-state authority.
+  try { db.exec(`ALTER TABLE orchestrations ADD COLUMN planning_intent_id TEXT`); } catch { /* exists */ }
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_orchestrations_plan_intent
+    ON orchestrations(plan_id, planning_intent_id)`);
+
   // WP-2B (Priority 0) — one-time, resumable workspace-lineage backfill. Populates
   // stream_lane_stats.workspace_id/workspace_root by folding each stream's launch cwd
   // to a root owned by EXACTLY one workspace. Idempotent (only NULL rows, ON a unique
