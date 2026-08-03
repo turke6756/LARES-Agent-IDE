@@ -225,13 +225,16 @@ test('backward-compat: the `observability` alias resolves to the core surface an
 
 // ── WP-A4: plans-read worker grant exposes exactly the 3 read tools ──
 
-test('plans-read toolset exposes exactly the 3 read tools, not create_plan', async () => {
+test('plans-read toolset exposes the 3 read tools + record_planning_event, not create_plan', async () => {
   const proxy = loadProxy('plans-read');
   const names = namesOf(proxy.getToolDefinitions());
+  // WP-P0PRE: record_planning_event is a telemetry ping (a demand probe), not a
+  // plan write, so it rides in the read-only worker lane alongside the read ladder.
   assert.deepStrictEqual(names, [
     'list_plan_sections',
     'read_plan_projection',
     'read_plan_section',
+    'record_planning_event',
   ]);
   assert.ok(!names.includes('create_plan'), 'plans-read must NOT expose create_plan');
 
@@ -251,6 +254,7 @@ test('plans (supervisor) toolset still exposes create_plan + the read ladder + f
     'list_plan_sections',
     'read_plan_projection',
     'read_plan_section',
+    'record_planning_event',
     'unfocus_plan',
   ]);
 });

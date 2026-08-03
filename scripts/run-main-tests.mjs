@@ -541,6 +541,16 @@ const TESTS = [
   'dist/main/main/plans/section-anchors.test.js',
   'dist/main/main/plans/watch-plans.test.js',
   'dist/main/main/plans-snapshot-db.test.js',
+  // Planning-surface Wave 1 — main/shared node tests landed this cycle.
+  // WP-P0PRE: demand-probe append service (telemetry).
+  'dist/main/main/telemetry/demand-probe.test.js',
+  // WP-P0B: trusted format-gate scope (assertPlanRailFree) + read-ladder
+  // enumeration bounds + the rewritten plan-rail-contract surface.
+  'dist/main/main/orchestration/plan-ownership.scope.test.js',
+  'dist/main/main/plans/read-ladder.test.js',
+  'dist/main/main/plans/plan-rail-contract.test.js',
+  // WP-P1A: planning-reader bounded enumeration + safe read IPC.
+  'dist/main/main/plans/planning-reader.test.js',
   'dist/main/main/browser/credentialed-open-diagnostic.test.js',
   'dist/main/main/browser/browser-signin-workspace-exact.test.js',
   'dist/main/main/browser/browser-signin-expiry.test.js',
