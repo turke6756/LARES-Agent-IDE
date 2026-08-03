@@ -18,17 +18,14 @@ import assert from 'node:assert/strict';
 import {
   WORKER_CLAUDE_SETTINGS_JSON,
   workerGrokSettingsJson,
+  workerAgyHooksJson,
   WORKER_CODEX_CONFIG_TOML,
   CODEX_WORKER_PROFILE_TOML,
   CODEX_WORKER_PROFILE_NAME,
 } from '../../shared/constants';
 import { instrumentCodexWorkerCommand } from './index';
 import { deriveHookAvailability } from '../../shared/types';
-import {
-  AGY_STATUS_HOOK_COMMAND,
-  AGY_STATUS_HOOK_ENTRY,
-  AGY_STATUS_HOOK_NAME,
-} from './agy-hooks';
+import { AGY_STATUS_HOOK_NAME } from './agy-hooks';
 
 interface TestCase {
   name: string;
@@ -361,52 +358,41 @@ test('G5. compat.claude.hooks=false surfaces as UNHEALTHY (canary-timeout/broken
   assert.equal(deriveHookAvailability('healthy').hooksUnavailable, false, 'a lane that fired a valid event is available');
 });
 
-// ── H. Antigravity global named/nested carrier (agy Commit 5) ─────────
+// ── H. Antigravity workspace-local flat carrier (agy Commit 6) ─────────
 
-test('H1. agy carrier is the one global named/nested hooks.json entry with PreInvocation only', () => {
+test('H1. agy carrier is one named workspace hook with flat PreInvocation only', () => {
+  const raw = workerAgyHooksJson('C:\\Workspace', 'C:\\Node Runtime\\node.cmd');
+  const carrier = JSON.parse(raw) as any;
   assert.equal(AGY_STATUS_HOOK_NAME, 'lares-dashboard-status');
-  assert.ok(Array.isArray(AGY_STATUS_HOOK_ENTRY.PreInvocation));
-  assert.equal(AGY_STATUS_HOOK_ENTRY.PreInvocation.length, 1);
-  assert.equal(AGY_STATUS_HOOK_ENTRY.PreInvocation[0].matcher, '*');
-  assert.deepEqual(AGY_STATUS_HOOK_ENTRY.PreInvocation[0].hooks, [{
-    type: 'command', command: AGY_STATUS_HOOK_COMMAND,
-  }]);
-  for (const event of ['SessionStart', 'PostInvocation', 'Stop', 'PreToolUse', 'PostToolUse'] as const) {
-    assert.equal(AGY_STATUS_HOOK_ENTRY[event], null, `agy must not claim an unproven ${event} handler`);
-  }
-  assert.match(AGY_STATUS_HOOK_COMMAND, /CLAUDE_HOOK_EVENT_NAME=PreInvocation/);
-  assert.match(AGY_STATUS_HOOK_COMMAND, /dashboard-status\.mjs working$/);
-  assert.ok(!/config\.toml|\.agents[\\/]hooks\.json|\.claude[\\/]settings\.json/.test(AGY_STATUS_HOOK_COMMAND),
-    'agy must not reference codex, project-native, or Claude-compatible carriers');
+  const handlers = carrier[AGY_STATUS_HOOK_NAME].PreInvocation;
+  assert.equal(handlers.length, 1);
+  assert.equal(typeof handlers[0].command, 'string');
+  assert.ok(!('matcher' in handlers[0]) && !('hooks' in handlers[0]));
+  assert.deepEqual(Object.keys(carrier[AGY_STATUS_HOOK_NAME]), ['PreInvocation']);
+  assert.ok(!raw.includes('${'));
 });
 
 test('H2. agy status starts only from PreInvocation; Stop is absent and idle is PTY-quiet-owned', () => {
-  const activeEvents = Object.entries(AGY_STATUS_HOOK_ENTRY)
+  const entry = JSON.parse(workerAgyHooksJson('C:\\Workspace', 'C:\\Node Runtime\\node.cmd'))[AGY_STATUS_HOOK_NAME];
+  const activeEvents = Object.entries(entry)
     .filter(([, handlers]) => Array.isArray(handlers) && handlers.length > 0)
     .map(([event]) => event);
   assert.deepEqual(activeEvents, ['PreInvocation']);
   assert.ok(!activeEvents.includes('Stop'), 'agy has no Stop hook and tests must never synthesize one');
   assert.equal(deriveHookAvailability('healthy').hooksUnavailable, false,
-    'a real PreInvocation event is positive proof that the global carrier loaded');
+    'a real PreInvocation event is positive proof that the workspace carrier loaded');
 });
 
-test('H3. agy documented flat-schema fixture has zero executable named handlers and is never healthy', () => {
-  const flatFixture = {
-    hooks: {
-      preToolUse: [{ matcher: 'run_command', command: 'node inert-canary.mjs' }],
-    },
-  };
-  const namedHandlerCount = Object.values(flatFixture).filter((entry) => {
-    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return false;
-    const nested = entry as Record<string, unknown>;
-    return Array.isArray(nested.PreInvocation);
-  }).length;
-  assert.equal(namedHandlerCount, 0,
-    'agy 1.1.9 loads the flat documented shape as zero handlers; only top-level named entries are carriers');
+test('H3. agy PreInvocation handler is flat; the retired matcher/hooks group is absent', () => {
+  const entry = JSON.parse(workerAgyHooksJson('C:\\Workspace', 'C:\\Node Runtime\\node.cmd'))[AGY_STATUS_HOOK_NAME];
+  const handler = entry.PreInvocation[0];
+  assert.equal(typeof handler.command, 'string');
+  assert.equal(handler.matcher, undefined);
+  assert.equal(handler.hooks, undefined);
 
   for (const verdict of ['broken', 'degraded'] as const) {
     const availability = deriveHookAvailability(verdict);
-    assert.equal(availability.hooksUnavailable, true, `inert flat config reported ${verdict} must be unavailable`);
+    assert.equal(availability.hooksUnavailable, true, `non-firing carrier reported ${verdict} must be unavailable`);
   }
   assert.notEqual(deriveHookAvailability('broken').hooksUnavailable, deriveHookAvailability('healthy').hooksUnavailable,
     'an input-time canary timeout must never be projected as healthy');

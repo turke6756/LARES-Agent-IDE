@@ -68,6 +68,8 @@ import {
   DASHBOARD_STATUS_SCRIPT_MJS_V4,
   DASHBOARD_STATUS_SCRIPT_MJS_V6,
   DASHBOARD_STATUS_SCRIPT_V8_HASH,
+  DASHBOARD_STATUS_SCRIPT_V9_HASH,
+  WORKER_AGY_HOOKS_JSON_V1_HASH,
   GUARD_GIT_DISCARD_MJS,
   RESEARCH_WRITE_GUARD_MJS,
   RESEARCH_STORE_README_MD,
@@ -100,6 +102,7 @@ import {
   WORKER_CLAUDE_SETTINGS_JSON_V6,
   WORKER_CLAUDE_SETTINGS_JSON_V7,
 } from '../../shared/constants';
+import { AGY_STATUS_HOOK_ENTRY } from './agy-hooks';
 import {
   GUARD_GIT_DISCARD_MJS_V1,
   GUARD_GIT_DISCARD_MJS_V2,
@@ -338,7 +341,7 @@ test('2b. v2 script + sidecar v2: silent upgrade by known v2 hash → v6', () =>
     assert.equal(listBackups(workDir).length, 0, 'known v2-hash upgrade must NOT create a backup');
 
     const sidecar = readSidecar(workDir);
-    assert.equal(sidecar['scripts/dashboard-status.mjs'], 9, `sidecar must record v6; got: ${JSON.stringify(sidecar)}`);
+    assert.equal(sidecar['scripts/dashboard-status.mjs'], 10, `sidecar must record current version; got: ${JSON.stringify(sidecar)}`);
   } finally {
     cleanup();
     rmrf(workDir);
@@ -365,7 +368,7 @@ test('2d. v6 script + sidecar v6: silent upgrade by known v6 hash → v7 (P1 pla
     assert.equal(listBackups(workDir).length, 0, 'known v6-hash upgrade must NOT create a backup');
 
     const sidecar = readSidecar(workDir);
-    assert.equal(sidecar['scripts/dashboard-status.mjs'], 9, `sidecar must record v7; got: ${JSON.stringify(sidecar)}`);
+    assert.equal(sidecar['scripts/dashboard-status.mjs'], 10, `sidecar must record current version; got: ${JSON.stringify(sidecar)}`);
   } finally {
     cleanup();
     rmrf(workDir);
@@ -377,14 +380,86 @@ test('2d. v6 script + sidecar v6: silent upgrade by known v6 hash → v7 (P1 pla
  *  frozen as a content constant (only its parent v8 hash is), so we derive it and
  *  assert the reconstruction hashes to DASHBOARD_STATUS_SCRIPT_V8_HASH — which both
  *  validates the frozen hash literal and yields a faithful v8 on-disk fixture. */
+function reconstructV9Script(): string {
+  const v9 = DASHBOARD_STATUS_SCRIPT_MJS
+    .replace(
+      `  // hookEventName: stdin → CLAUDE_HOOK_EVENT_NAME env → explicit --event\n  // argv → state-derived. The explicit flag lets agy's PreInvocation carrier\n  // report honest provenance without a shell-specific environment assignment.\n  const rawState = process.argv[2];\n  const eventFlagIndex = process.argv.indexOf('--event');\n  const explicitEventName = eventFlagIndex >= 0 && typeof process.argv[eventFlagIndex + 1] === 'string'\n    ? process.argv[eventFlagIndex + 1]\n    : '';`,
+      `  // hookEventName: stdin → CLAUDE_HOOK_EVENT_NAME env → argv-derived.\n  const rawState = process.argv[2];`,
+    )
+    .replace(
+      '  const hookEventName = stdinEventName || process.env.CLAUDE_HOOK_EVENT_NAME || explicitEventName || argvEventName;',
+      '  const hookEventName = stdinEventName || process.env.CLAUDE_HOOK_EVENT_NAME || argvEventName;',
+    );
+  assert.notEqual(v9, DASHBOARD_STATUS_SCRIPT_MJS, 'the v10 --event support must be present in the live script to remove');
+  return v9;
+}
+
 function reconstructV8Script(): string {
-  const v8 = DASHBOARD_STATUS_SCRIPT_MJS.replace(
+  const v8 = reconstructV9Script().replace(
     /  \/\/ idle-vs-waiting fix[\s\S]*?if \(isNonBlocking\) return;\n  \}\n\n/,
     '',
   );
   assert.notEqual(v8, DASHBOARD_STATUS_SCRIPT_MJS, 'the v9 bail block must be present in the live script to remove');
   return v8;
 }
+
+test('2e0. reconstructed v9 script matches the frozen v9 hash and differs from live v10', () => {
+  const v9 = reconstructV9Script();
+  assert.equal(sha256Hex(v9), DASHBOARD_STATUS_SCRIPT_V9_HASH);
+  assert.notEqual(sha256Hex(DASHBOARD_STATUS_SCRIPT_MJS), DASHBOARD_STATUS_SCRIPT_V9_HASH);
+});
+
+test('2e1. pristine v9 script silently upgrades to v10 via previousHashes[9]', () => {
+  const workDir = mktmp('scaffold-known-v9');
+  const { supervisor, cleanup } = makeSupervisor();
+  try {
+    fs.mkdirSync(path.dirname(scriptPath(workDir)), { recursive: true });
+    fs.writeFileSync(scriptPath(workDir), reconstructV9Script(), 'utf-8');
+    fs.writeFileSync(
+      sidecarPath(workDir),
+      JSON.stringify({ 'scripts/dashboard-status.mjs': 9 }, null, 2) + '\n',
+      'utf-8',
+    );
+    supervisor.ensureWorkerScaffold(workDir, 'claude', 'windows');
+    assert.equal(fs.readFileSync(scriptPath(workDir), 'utf-8'), DASHBOARD_STATUS_SCRIPT_MJS);
+    assert.equal(listBackups(workDir).length, 0);
+    assert.equal(readSidecar(workDir)['scripts/dashboard-status.mjs'], 10);
+  } finally {
+    cleanup();
+    rmrf(workDir);
+  }
+});
+
+test('2e2. pristine agy carrier v1 silently upgrades to flat workspace carrier v2', () => {
+  const workDir = mktmp('scaffold-agy-v1');
+  const carrierPath = path.join(workDir, '.lares', 'workers', 'agy', '.agents', 'hooks.json');
+  const oldBody = JSON.stringify({ 'lares-dashboard-status': AGY_STATUS_HOOK_ENTRY }, null, 2) + '\n';
+  const priorUserProfile = process.env.USERPROFILE;
+  process.env.USERPROFILE = path.join(workDir, 'fake-home');
+  const { supervisor, cleanup } = makeSupervisor();
+  try {
+    assert.equal(sha256Hex(oldBody), WORKER_AGY_HOOKS_JSON_V1_HASH);
+    fs.mkdirSync(path.dirname(carrierPath), { recursive: true });
+    fs.writeFileSync(carrierPath, oldBody, 'utf-8');
+    fs.writeFileSync(
+      sidecarPath(workDir),
+      JSON.stringify({ 'workers/agy/.agents/hooks.json': 1 }, null, 2) + '\n',
+      'utf-8',
+    );
+    supervisor.ensureWorkerScaffold(workDir, 'agy', 'windows');
+    const upgraded = JSON.parse(fs.readFileSync(carrierPath, 'utf-8'));
+    assert.equal(typeof upgraded['lares-dashboard-status'].PreInvocation[0].command, 'string');
+    assert.ok(!('matcher' in upgraded['lares-dashboard-status'].PreInvocation[0]));
+    assert.equal(readSidecar(workDir)['workers/agy/.agents/hooks.json'], 2);
+    const carrierDir = path.dirname(carrierPath);
+    assert.equal(fs.readdirSync(carrierDir).filter((name) => name.startsWith('hooks.json.bak.')).length, 0);
+  } finally {
+    if (priorUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = priorUserProfile;
+    cleanup();
+    rmrf(workDir);
+  }
+});
 
 test('2e. v8 script + sidecar v8: silent upgrade by frozen v8 hash → v9 (idle-vs-waiting fix)', () => {
   const workDir = mktmp('scaffold-known-v8');
@@ -412,7 +487,7 @@ test('2e. v8 script + sidecar v8: silent upgrade by frozen v8 hash → v9 (idle-
     assert.equal(listBackups(workDir).length, 0, 'known v8-hash upgrade must NOT create a backup');
 
     const sidecar = readSidecar(workDir);
-    assert.equal(sidecar['scripts/dashboard-status.mjs'], 9, `sidecar must record v9; got: ${JSON.stringify(sidecar)}`);
+    assert.equal(sidecar['scripts/dashboard-status.mjs'], 10, `sidecar must record v10; got: ${JSON.stringify(sidecar)}`);
   } finally {
     cleanup();
     rmrf(workDir);
@@ -447,7 +522,7 @@ test('2f. locally-edited (unknown-hash) v8-ish script → backed up + overwritte
     assert.equal(backupContent, edited, 'backup must contain the locally-edited content verbatim');
 
     const sidecar = readSidecar(workDir);
-    assert.equal(sidecar['scripts/dashboard-status.mjs'], 9, `sidecar must record v9; got: ${JSON.stringify(sidecar)}`);
+    assert.equal(sidecar['scripts/dashboard-status.mjs'], 10, `sidecar must record v10; got: ${JSON.stringify(sidecar)}`);
   } finally {
     cleanup();
     rmrf(workDir);
@@ -474,7 +549,7 @@ test('2c. v4 script + sidecar v4: silent upgrade by known v4 hash → v6', () =>
     assert.equal(listBackups(workDir).length, 0, 'known v4-hash upgrade must NOT create a backup');
 
     const sidecar = readSidecar(workDir);
-    assert.equal(sidecar['scripts/dashboard-status.mjs'], 9, `sidecar must record v6; got: ${JSON.stringify(sidecar)}`);
+    assert.equal(sidecar['scripts/dashboard-status.mjs'], 10, `sidecar must record current version; got: ${JSON.stringify(sidecar)}`);
   } finally {
     cleanup();
     rmrf(workDir);
@@ -495,7 +570,7 @@ test('1. fresh workspace: writes v6 script and sidecar with version 6', () => {
     assert.equal(content, DASHBOARD_STATUS_SCRIPT_MJS, 'script must be exact v6 bundled content');
 
     const sidecar = readSidecar(workDir);
-    assert.equal(sidecar['scripts/dashboard-status.mjs'], 9, `sidecar must record v6 for the script; got: ${JSON.stringify(sidecar)}`);
+    assert.equal(sidecar['scripts/dashboard-status.mjs'], 10, `sidecar must record current version for the script; got: ${JSON.stringify(sidecar)}`);
     assert.equal(listBackups(workDir).length, 0, 'no .bak files expected on fresh scaffold');
   } finally {
     cleanup();
@@ -518,7 +593,7 @@ test('2. v1 script + no sidecar: silent upgrade by known-hash match', () => {
     assert.equal(listBackups(workDir).length, 0, 'known-hash upgrade must NOT create a backup');
 
     const sidecar = readSidecar(workDir);
-    assert.equal(sidecar['scripts/dashboard-status.mjs'], 9, `sidecar must record v6; got: ${JSON.stringify(sidecar)}`);
+    assert.equal(sidecar['scripts/dashboard-status.mjs'], 10, `sidecar must record current version; got: ${JSON.stringify(sidecar)}`);
   } finally {
     cleanup();
     rmrf(workDir);
@@ -547,7 +622,7 @@ test('3. v1-ish but user-modified script + no sidecar: backup + overwrite', () =
     assert.equal(backupContent, userEdited, 'backup must contain the user-edited content verbatim');
 
     const sidecar = readSidecar(workDir);
-    assert.equal(sidecar['scripts/dashboard-status.mjs'], 9, `sidecar must record v6; got: ${JSON.stringify(sidecar)}`);
+    assert.equal(sidecar['scripts/dashboard-status.mjs'], 10, `sidecar must record current version; got: ${JSON.stringify(sidecar)}`);
   } finally {
     cleanup();
     rmrf(workDir);
@@ -583,7 +658,7 @@ test('4. workspace already at v5: script not rewritten, no backup, sidecar still
     assert.equal(listBackups(workDir).length, 0, 'no .bak files expected on no-op script scaffold');
 
     const sidecar = readSidecar(workDir);
-    assert.equal(sidecar['scripts/dashboard-status.mjs'], 9, `sidecar must still record v6 for the script; got: ${JSON.stringify(sidecar)}`);
+    assert.equal(sidecar['scripts/dashboard-status.mjs'], 10, `sidecar must still record current version for the script; got: ${JSON.stringify(sidecar)}`);
   } finally {
     cleanup();
     rmrf(workDir);
@@ -608,7 +683,7 @@ test('5. corrupt sidecar + v1 script: warn, treat as empty, upgrade + valid side
     assert.equal(content, DASHBOARD_STATUS_SCRIPT_MJS, 'corrupt sidecar must not block upgrade');
 
     const sidecar = readSidecar(workDir);
-    assert.equal(sidecar['scripts/dashboard-status.mjs'], 9, `sidecar must be valid JSON with v6; got: ${JSON.stringify(sidecar)}`);
+    assert.equal(sidecar['scripts/dashboard-status.mjs'], 10, `sidecar must be valid JSON with current version; got: ${JSON.stringify(sidecar)}`);
 
     const sawWarning = warnings.some((w) => /sidecar/i.test(w) && /unparseable|not an object/i.test(w));
     assert.ok(sawWarning, `expected a sidecar warning to be logged; got: ${warnings.join('\n')}`);
@@ -650,8 +725,8 @@ test('6. concurrent ensureWorkerScaffold: parseable sidecar, complete v2 content
     // Sidecar exists and parses cleanly.
     const sidecar = readSidecar(workDir);
     assert.equal(
-      sidecar['scripts/dashboard-status.mjs'], 9,
-      `sidecar should be at v9 after concurrent run; got: ${JSON.stringify(sidecar)}`,
+      sidecar['scripts/dashboard-status.mjs'], 10,
+      `sidecar should be at v10 after concurrent run; got: ${JSON.stringify(sidecar)}`,
     );
 
     // Final on-disk script is the FULL v5 content (not a torn write).
@@ -695,7 +770,7 @@ test('B1. supervisor-launch refresh, MISSING shared script → written at v9', (
     assert.ok(fs.existsSync(scriptPath(workDir)), 'shared script must exist after the launch-step refresh');
     assert.equal(fs.readFileSync(scriptPath(workDir), 'utf-8'), DASHBOARD_STATUS_SCRIPT_MJS,
       'shared script must be the exact v9 bundled content');
-    assert.equal(readSidecar(workDir)['scripts/dashboard-status.mjs'], 9, 'sidecar must record v9');
+    assert.equal(readSidecar(workDir)['scripts/dashboard-status.mjs'], 10, 'sidecar must record v10');
     assert.equal(listBackups(workDir).length, 0, 'no .bak on a fresh write');
   } finally {
     cleanup();
@@ -721,7 +796,7 @@ test('B2. supervisor-launch refresh, STALE known-managed-hash (v6) → silent up
     assert.equal(fs.readFileSync(scriptPath(workDir), 'utf-8'), DASHBOARD_STATUS_SCRIPT_MJS,
       'a v6 (pre-session_id) script must silently upgrade to v9 on a supervisor-launch refresh');
     assert.equal(listBackups(workDir).length, 0, 'known-hash upgrade must NOT create a backup');
-    assert.equal(readSidecar(workDir)['scripts/dashboard-status.mjs'], 9, 'sidecar must record v9');
+    assert.equal(readSidecar(workDir)['scripts/dashboard-status.mjs'], 10, 'sidecar must record v10');
   } finally {
     cleanup();
     rmrf(workDir);
@@ -737,7 +812,7 @@ test('B3. supervisor-launch refresh, CURRENT script (sidecar v9) → no-op, mtim
     fs.mkdirSync(path.dirname(sidecarPath(workDir)), { recursive: true });
     fs.writeFileSync(
       sidecarPath(workDir),
-      JSON.stringify({ 'scripts/dashboard-status.mjs': 9 }, null, 2) + '\n',
+      JSON.stringify({ 'scripts/dashboard-status.mjs': 10 }, null, 2) + '\n',
       'utf-8',
     );
 
@@ -774,7 +849,7 @@ test('B4. supervisor-launch refresh, LOCALLY-EDITED unknown-hash script → .bak
       edited,
       'backup must hold the locally-edited content verbatim',
     );
-    assert.equal(readSidecar(workDir)['scripts/dashboard-status.mjs'], 9, 'sidecar must record v9');
+    assert.equal(readSidecar(workDir)['scripts/dashboard-status.mjs'], 10, 'sidecar must record v10');
   } finally {
     cleanup();
     rmrf(workDir);

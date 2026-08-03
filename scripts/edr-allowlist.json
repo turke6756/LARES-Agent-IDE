@@ -152,6 +152,30 @@
       "owner": "grok-lane/commit-7"
     },
     {
+      "file": "scripts/agy-tier0-smoke.mjs",
+      "lineContext": "windowspowershell",
+      "purpose": "Dev-only release smoke (not shipped; run-main-tests omits it): executes the generated agy workspace hook command verbatim under both cmd.exe and Windows PowerShell with discrete argv and a 60s timeout.",
+      "owner": "agy-lane/commit-6"
+    },
+    {
+      "file": "src/shared/constants.ts",
+      "lineContext": "encodedcommand",
+      "purpose": "agy's hook shell is cmd.exe, but the generated carrier is also required to execute unchanged under PowerShell. A UTF-16LE EncodedCommand is the only quote-preserving common carrier for absolute executable paths containing spaces; the decoded payload is generated locally from fixed scaffold paths and pinned by tests.",
+      "owner": "agy-lane/commit-6"
+    },
+    {
+      "file": "src/main/supervisor/worker-scaffold.test.ts",
+      "lineContext": "encodedcommand",
+      "purpose": "Unit test decodes the managed agy carrier to prove its payload contains only the absolute quoted node path, absolute status-script path, and fixed lifecycle arguments.",
+      "owner": "agy-lane/commit-6"
+    },
+    {
+      "file": "scripts/agy-tier0-smoke.mjs",
+      "lineContext": "encodedcommand",
+      "purpose": "Release smoke decodes and validates the fixed-path agy carrier before executing that same generated command under both supported Windows shells.",
+      "owner": "agy-lane/commit-6"
+    },
+    {
       "file": "src/main/workspace-state-dir.ts",
       "lineContext": "wscript.shell",
       "purpose": "P0.2 legacy-launcher DETECTOR: matches WScript.Shell content in order to quarantine/remove it. Detects the pattern, never uses it.",

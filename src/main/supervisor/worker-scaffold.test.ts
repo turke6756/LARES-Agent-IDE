@@ -22,14 +22,13 @@ import {
   SUPERVISOR_CLAUDE_SETTINGS_JSON,
   WORKER_CLAUDE_SETTINGS_JSON,
   workerGrokSettingsJson,
+  workerAgyHooksJson,
   RESEARCHER_CLAUDE_SETTINGS_JSON,
   WORKER_GROK_AGENTS_MD,
   WORKER_AGY_AGENTS_MD,
   PROPOSAL_TO_PLAN_SKILL_MD,
 } from '../../shared/constants';
 import {
-  AGY_STATUS_HOOK_COMMAND,
-  AGY_STATUS_HOOK_ENTRY,
   AGY_STATUS_HOOK_NAME,
 } from './agy-hooks';
 
@@ -661,7 +660,7 @@ test('Grok: git unavailable → scaffold degrades with a warning, does not throw
 
 // ── Antigravity worker scaffold (agy plan Commit 2 + Phase-0 addendum) ──
 
-test('Agy: fresh scaffold seeds AGENTS.md, shared scripts, and one global PreInvocation carrier', () => {
+test('Agy: fresh scaffold seeds a flat workspace hook carrier in its own git root', () => {
   const workDir = mktmp('agy-scaffold');
   const fakeHome = path.join(workDir, 'fake-home');
   const priorUserProfile = process.env.USERPROFILE;
@@ -680,21 +679,21 @@ test('Agy: fresh scaffold seeds AGENTS.md, shared scripts, and one global PreInv
       !fs.existsSync(path.join(workerDir, 'GEMINI.md')),
       'the plan designates one AGENTS.md identity; do not duplicate it through GEMINI.md',
     );
-    assert.ok(
-      !fs.existsSync(path.join(workerDir, '.agents', 'hooks.json')),
-      'project .agents/hooks.json is conclusively undiscovered and must not be scaffolded',
-    );
+    const carrierPath = path.join(workerDir, '.agents', 'hooks.json');
+    assert.ok(fs.existsSync(carrierPath), 'workspace .agents/hooks.json must be scaffolded');
+    const carrier = JSON.parse(fs.readFileSync(carrierPath, 'utf-8')) as any;
+    const handlers = carrier[AGY_STATUS_HOOK_NAME].PreInvocation;
+    assert.equal(handlers.length, 1);
+    assert.equal(typeof handlers[0].command, 'string');
+    assert.ok(!('matcher' in handlers[0]) && !('hooks' in handlers[0]), 'PreInvocation must be flat');
+    assert.ok(!fs.readFileSync(carrierPath, 'utf-8').includes('${'));
+    assert.ok(fs.existsSync(path.join(workerDir, '.git')), 'agy worker cwd must be a git root');
     assert.ok(fs.existsSync(path.join(workDir, '.lares', 'scripts', 'dashboard-status.mjs')));
 
-    const hooksPath = path.join(fakeHome, '.gemini', 'config', 'hooks.json');
-    const hooks = JSON.parse(fs.readFileSync(hooksPath, 'utf-8')) as Record<string, unknown>;
-    assert.deepEqual(hooks[AGY_STATUS_HOOK_NAME], AGY_STATUS_HOOK_ENTRY);
-    assert.equal(
-      ((hooks[AGY_STATUS_HOOK_NAME] as any).PreInvocation[0].hooks[0].command),
-      AGY_STATUS_HOOK_COMMAND,
-    );
-    assert.match(AGY_STATUS_HOOK_COMMAND, /^if defined AGENT_ID set CLAUDE_HOOK_EVENT_NAME=PreInvocation&& node /);
-    assert.ok(!AGY_STATUS_HOOK_COMMAND.includes('"'), 'cmd.exe hook command must remain quote-free');
+    const generated = JSON.parse(workerAgyHooksJson('C:\\Workspace With Space', 'C:\\Node Runtime\\node.cmd')) as any;
+    const encoded = generated[AGY_STATUS_HOOK_NAME].PreInvocation[0].command.match(/-EncodedCommand\s+(\S+)$/)?.[1];
+    const invocation = Buffer.from(encoded, 'base64').toString('utf16le');
+    assert.match(invocation, /& "C:\/Node Runtime\/node\.cmd" "C:\/Workspace With Space\/\.lares\/scripts\/dashboard-status\.mjs" working --event PreInvocation/);
   } finally {
     if (priorUserProfile === undefined) delete process.env.USERPROFILE;
     else process.env.USERPROFILE = priorUserProfile;
@@ -703,12 +702,12 @@ test('Agy: fresh scaffold seeds AGENTS.md, shared scripts, and one global PreInv
   }
 });
 
-test('Agy: re-scaffold preserves edited identity + foreign global hooks and is content-idempotent', () => {
+test('Agy: re-scaffold preserves identity + foreign global hooks and removes obsolete global entry', () => {
   const workDir = mktmp('agy-idempotent');
   const fakeHome = path.join(workDir, 'fake-home');
   const hooksPath = path.join(fakeHome, '.gemini', 'config', 'hooks.json');
   fs.mkdirSync(path.dirname(hooksPath), { recursive: true });
-  fs.writeFileSync(hooksPath, '{"human-hook":{"PreInvocation":null}}\n', 'utf-8');
+  fs.writeFileSync(hooksPath, '{"human-hook":{"PreInvocation":null},"lares-dashboard-status":{"PreInvocation":[]}}\n', 'utf-8');
   const priorUserProfile = process.env.USERPROFILE;
   process.env.USERPROFILE = fakeHome;
   const { supervisor, cleanup } = makeSupervisor();
@@ -724,7 +723,7 @@ test('Agy: re-scaffold preserves edited identity + foreign global hooks and is c
     assert.equal(fs.readFileSync(hooksPath, 'utf-8'), hooksAfterFirst, 'second merge must be a no-op');
     const hooks = JSON.parse(hooksAfterFirst) as Record<string, unknown>;
     assert.deepEqual(hooks['human-hook'], { PreInvocation: null }, 'foreign named hook must survive');
-    assert.deepEqual(hooks[AGY_STATUS_HOOK_NAME], AGY_STATUS_HOOK_ENTRY);
+    assert.ok(!(AGY_STATUS_HOOK_NAME in hooks), 'obsolete global hook must be removed');
   } finally {
     if (priorUserProfile === undefined) delete process.env.USERPROFILE;
     else process.env.USERPROFILE = priorUserProfile;

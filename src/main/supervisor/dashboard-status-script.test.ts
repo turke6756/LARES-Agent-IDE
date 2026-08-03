@@ -204,6 +204,25 @@ test('(b) HTTP down → spool still written, exit 0; fallback path used when env
   }
 });
 
+test('(b2) explicit --event overrides state-derived provenance for agy PreInvocation', async () => {
+  const ws = makeWorkspace();
+  const spool = path.join(ws.dir, 'agy-spool.jsonl');
+  try {
+    const result = await runScript(ws, {
+      argv: ['working', '--event', 'PreInvocation'],
+      env: {
+        AGENT_ID: 'agy-event-flag', DASHBOARD_SPOOL_PATH: spool,
+        CLAUDE_HOOK_EVENT_NAME: undefined, DASHBOARD_PORT: '1',
+      },
+    });
+    assert.equal(result.status, 0);
+    const records = readSpool(spool);
+    assert.equal(records.length, 1);
+    assert.equal(records[0].state, 'working');
+    assert.equal(records[0].hookEventName, 'PreInvocation');
+  } finally { ws.cleanup(); }
+});
+
 test('(c) spool unwritable + HTTP down → still exit 0', async () => {
   const ws = makeWorkspace();
   try {

@@ -1,11 +1,8 @@
-import { isDeepStrictEqual } from 'node:util';
 import fs from 'node:fs';
 import path from 'node:path';
 
-/** Global named-hook id owned by Lares. Antigravity 1.1.9 discovers executable
- * handlers only from ~/.gemini/config/hooks.json using the named+nested shape
- * produced by its /hooks UI. Project .agents/hooks.json and plugin delivery are
- * conclusively inert (agy Phase-0 probes 0.5/0.6). */
+/** Global named-hook id formerly owned by Lares. Retained for the one-way
+ * migration that removes this broken entry without touching foreign hooks. */
 export const AGY_STATUS_HOOK_NAME = 'lares-dashboard-status';
 
 /** cmd.exe-safe and workspace-independent: agy runs the hook from its launch
@@ -40,10 +37,10 @@ export type AgyStatusHookMerge =
   | { action: 'unchanged' }
   | { action: 'invalid'; reason: string };
 
-/** Merge only Lares's named entry into the user-global hooks file. Foreign
- * named hooks survive untouched; malformed/non-object input fails closed to a
- * no-write result instead of clobbering user configuration. */
-export function mergeAgyStatusHook(existing: string | null): AgyStatusHookMerge {
+/** Remove only Lares's obsolete named entry from the user-global hooks file.
+ * Foreign named hooks survive untouched; malformed/non-object input fails
+ * closed to a no-write result instead of clobbering user configuration. */
+export function removeAgyStatusHook(existing: string | null): AgyStatusHookMerge {
   let root: Record<string, unknown>;
   if (existing === null || existing.trim() === '') {
     root = {};
@@ -62,11 +59,11 @@ export function mergeAgyStatusHook(existing: string | null): AgyStatusHookMerge 
     }
   }
 
-  if (isDeepStrictEqual(root[AGY_STATUS_HOOK_NAME], AGY_STATUS_HOOK_ENTRY)) {
+  if (!(AGY_STATUS_HOOK_NAME in root)) {
     return { action: 'unchanged' };
   }
 
-  root[AGY_STATUS_HOOK_NAME] = AGY_STATUS_HOOK_ENTRY;
+  delete root[AGY_STATUS_HOOK_NAME];
   return { action: 'write', content: `${JSON.stringify(root, null, 2)}\n` };
 }
 
@@ -75,14 +72,14 @@ export type EnsureAgyStatusHookResult =
   | { action: 'unchanged'; configPath: string }
   | { action: 'invalid'; configPath: string; reason: string };
 
-/** Filesystem wrapper for the merge above. Writes atomically and only when the
- * managed named entry differs; callers own best-effort logging policy. */
-export function ensureAgyStatusHook(home: string | undefined): EnsureAgyStatusHookResult {
+/** Filesystem wrapper for the removal above. Writes atomically only when the
+ * obsolete entry exists; callers own best-effort logging policy. */
+export function removeGlobalAgyStatusHook(home: string | undefined): EnsureAgyStatusHookResult {
   if (!home) throw new Error('USERPROFILE/HOME is unavailable');
   const configDir = path.join(home, '.gemini', 'config');
   const configPath = path.join(configDir, 'hooks.json');
   const existing = fs.existsSync(configPath) ? fs.readFileSync(configPath, 'utf-8') : null;
-  const merged = mergeAgyStatusHook(existing);
+  const merged = removeAgyStatusHook(existing);
   if (merged.action === 'unchanged') return { action: 'unchanged', configPath };
   if (merged.action === 'invalid') return { ...merged, configPath };
 

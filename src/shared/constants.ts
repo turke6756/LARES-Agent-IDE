@@ -1651,6 +1651,35 @@ export function workerGrokSettingsJson(posixWorkspaceRoot: string): string {
   return `${JSON.stringify(carrier, null, 2)}\n`;
 }
 
+/** Antigravity worker hook carrier, generated for the worker cwd's
+ *  `.agents/hooks.json`. agy 1.1.10 requires flat handler arrays for non-tool
+ *  events. Both executable paths are absolute and JSON.stringify owns their
+ *  quoting, so the command has no shell variables or cwd-dependent paths. */
+export function workerAgyHooksJson(workspaceRoot: string, nodePath: string): string {
+  const absoluteNode = nodePath.replace(/\\/g, '/');
+  const statusScript = [
+    workspaceRoot.replace(/\\/g, '/').replace(/\/+$/, ''),
+    '.lares', 'scripts', 'dashboard-status.mjs',
+  ].join('/');
+  // agy invokes hooks through cmd.exe, while the smoke also proves the same
+  // command is safe when launched by PowerShell. A quoted executable path is
+  // not directly invocable in both grammars, so use one explicit PowerShell
+  // process with an encoded (UTF-16LE) command. The decoded command is exactly
+  // the absolute quoted node path + absolute quoted script path and arguments.
+  const invocation = `& ${JSON.stringify(absoluteNode)} ${JSON.stringify(statusScript)} working --event PreInvocation`;
+  const encodedInvocation = Buffer.from(invocation, 'utf16le').toString('base64');
+  const command = `powershell.exe -NoProfile -NonInteractive -EncodedCommand ${encodedInvocation}`;
+  return `${JSON.stringify({
+    'lares-dashboard-status': {
+      PreInvocation: [{ command }],
+    },
+  }, null, 2)}\n`;
+}
+
+/** Frozen hash of the retired v1 agy carrier (global-shaped nested
+ *  PreInvocation entry). Used only to migrate a pristine v1 local copy. */
+export const WORKER_AGY_HOOKS_JSON_V1_HASH = 'ec6af430eb0bfc7ada36ff61de8bb86070ae48358e272964c9ed9357191e7065';
+
 /** Pre-guard Claude worker settings (v7) — the 4-hook + statusLine block WITHOUT
  *  the PreToolUse(Bash) git-discard guard, kept verbatim so a v7 workspace's
  *  on-disk settings.json can be hashed and silently upgraded to v8 (which adds
@@ -2635,14 +2664,20 @@ async function main() {
     }
   } catch { /* stdin meta is best-effort */ }
 
-  // hookEventName: stdin → CLAUDE_HOOK_EVENT_NAME env → argv-derived.
+  // hookEventName: stdin → CLAUDE_HOOK_EVENT_NAME env → explicit --event
+  // argv → state-derived. The explicit flag lets agy's PreInvocation carrier
+  // report honest provenance without a shell-specific environment assignment.
   const rawState = process.argv[2];
+  const eventFlagIndex = process.argv.indexOf('--event');
+  const explicitEventName = eventFlagIndex >= 0 && typeof process.argv[eventFlagIndex + 1] === 'string'
+    ? process.argv[eventFlagIndex + 1]
+    : '';
   const argvEventName = rawState === 'working' ? 'UserPromptSubmit'
     : rawState === 'session-start' ? 'SessionStart'
     : rawState === 'waiting' ? 'Notification'
     : 'Stop';
   const stdinEventName = typeof stdinMeta.hook_event_name === 'string' ? stdinMeta.hook_event_name : '';
-  const hookEventName = stdinEventName || process.env.CLAUDE_HOOK_EVENT_NAME || argvEventName;
+  const hookEventName = stdinEventName || process.env.CLAUDE_HOOK_EVENT_NAME || explicitEventName || argvEventName;
 
   // SubagentStop guard (v6, extended to stdin): a Task-tool subagent finishing
   // mid-turn must not flip the still-working main agent idle. Bail before any
@@ -2938,6 +2973,9 @@ export const DASHBOARD_STATUS_SCRIPT_V7_HASH = '52d652a6caf041b01876a010b25e2a7d
  *  ALWAYS → waiting, BEFORE the idle-vs-waiting bail added in v9). Frozen so a
  *  v8 workspace's on-disk script upgrades silently to v9. */
 export const DASHBOARD_STATUS_SCRIPT_V8_HASH = 'd11408d50c8e5e108af247860642edada8b77a8a0c874b861bc6ca094c03e8ee';
+
+/** v9 hash literal — the body before explicit `--event <name>` argv support. */
+export const DASHBOARD_STATUS_SCRIPT_V9_HASH = '3d51ee05cbc11a3f519db503681c0795409b9af84b720ee269a17803818e209f';
 
 /** v6 verbatim (POST self-abort 2500ms + SubagentStop guard) — frozen so a v6
  *  workspace's on-disk dashboard-status.mjs can be hashed and silently

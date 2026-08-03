@@ -9,7 +9,7 @@
 // Run via: node scripts/mcp-tools-orchestration.test.js
 
 const assert = require('assert');
-const { handleOrchestrationToolCall } = require('./mcp-tools-orchestration');
+const { getOrchestrationToolDefinitions, handleOrchestrationToolCall } = require('./mcp-tools-orchestration');
 const { planRailContractBlock } = require('./lib/plan-rail-contract.js');
 
 const tests = [];
@@ -34,6 +34,11 @@ function makeFakeApi() {
   };
   return { apiRequest, captured };
 }
+
+test('launch_agent provider enum includes agy', () => {
+  const launch = getOrchestrationToolDefinitions().find((tool) => tool.name === 'launch_agent');
+  assert.ok(launch.inputSchema.properties.provider.enum.includes('agy'));
+});
 
 test('rail launch (plan_id + section_anchor) appends the writer contract to the submitted prompt', async () => {
   const { apiRequest, captured } = makeFakeApi();

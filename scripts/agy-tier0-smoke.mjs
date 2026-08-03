@@ -57,10 +57,12 @@ fs.mkdirSync(workDir, { recursive: true });
 fs.mkdirSync(fakeHome, { recursive: true });
 
 const prior = {
+  cwd: process.cwd(),
   USERPROFILE: process.env.USERPROFILE,
   HOME: process.env.HOME,
   APPDATA: process.env.APPDATA,
 };
+process.chdir(scratch);
 process.env.USERPROFILE = fakeHome;
 process.env.HOME = fakeHome;
 process.env.APPDATA = fakeAppData;
@@ -72,6 +74,9 @@ fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
 fs.writeFileSync(hooksPath, JSON.stringify({
   'human-foreign-hook': {
     PreInvocation: [{ matcher: 'foreign', hooks: [{ type: 'command', command: 'echo foreign' }] }],
+  },
+  'lares-dashboard-status': {
+    PreInvocation: [{ matcher: '*', hooks: [{ type: 'command', command: 'broken legacy command' }] }],
   },
 }, null, 2) + '\n');
 fs.writeFileSync(settingsPath, JSON.stringify({
@@ -90,7 +95,7 @@ try {
   const { resolveLaunchCommand } = require(path.join(distSupervisor, 'launch-command.js'));
   const { encodeAgyWindowsBody, getWindowsSubmitSequence } = require(path.join(distSupervisor, 'send-input-encoders.js'));
   const { mapKeyToBytes } = require(path.join(distSupervisor, 'key-bytes.js'));
-  const { AGY_STATUS_HOOK_ENTRY, AGY_STATUS_HOOK_NAME } = require(path.join(distSupervisor, 'agy-hooks.js'));
+  const { AGY_STATUS_HOOK_NAME } = require(path.join(distSupervisor, 'agy-hooks.js'));
   const { AGY_GIT_DISCARD_DENY_RULES } = require(path.join(distSupervisor, 'agy-settings.js'));
   const db = require(path.join(repoRoot, 'dist', 'main', 'main', 'database.js'));
   db.addEvent = () => {};
@@ -100,26 +105,43 @@ try {
   supervisor.ensureWorkerScaffold(workDir, 'agy', 'windows');
   supervisor.ensureProviderDirTrust(workDir, agentCwd, 'agy', 'windows');
 
-  check('scaffold seeds AGENTS.md and shared scripts, with no project hook carrier', () => {
+  check('scaffold seeds AGENTS.md, shared scripts, and workspace hook carrier', () => {
     for (const file of [
       path.join(agentCwd, 'AGENTS.md'),
       path.join(workDir, '.lares', 'scripts', 'dashboard-status.mjs'),
       path.join(workDir, '.lares', 'scripts', 'guard-git-discard.mjs'),
     ]) assert(fs.existsSync(file), `missing ${file}`);
-    assert(!fs.existsSync(path.join(agentCwd, '.agents', 'hooks.json')), 'inert project .agents/hooks.json was written');
+    assert(fs.existsSync(path.join(agentCwd, '.agents', 'hooks.json')), 'workspace .agents/hooks.json missing');
   });
 
-  check('global named/nested hooks merge preserves foreign entries and installs PreInvocation only', () => {
+  check('global hook migration preserves foreign entries and removes only the obsolete Lares entry', () => {
     const hooks = JSON.parse(fs.readFileSync(hooksPath, 'utf-8'));
     assert(hooks['human-foreign-hook']?.PreInvocation?.length === 1, 'foreign global hook was not preserved');
-    assert(JSON.stringify(hooks[AGY_STATUS_HOOK_NAME]) === JSON.stringify(AGY_STATUS_HOOK_ENTRY),
-      'managed agy hook differs from compiled named/nested entry');
-    const active = Object.entries(hooks[AGY_STATUS_HOOK_NAME])
-      .filter(([, value]) => Array.isArray(value) && value.length).map(([event]) => event);
-    assert(JSON.stringify(active) === JSON.stringify(['PreInvocation']), `unexpected active events: ${active.join(',')}`);
+    assert(!(AGY_STATUS_HOOK_NAME in hooks), 'obsolete global Lares hook survived migration');
   });
 
-  check('trust and permissions merge preserve user settings on disposable fixtures', () => {
+  check('workspace hooks parse as named hook with flat PreInvocation and shell-safe absolute content', () => {
+    const carrierPath = path.join(agentCwd, '.agents', 'hooks.json');
+    const raw = fs.readFileSync(carrierPath, 'utf-8');
+    const carrier = JSON.parse(raw);
+    const handlers = carrier?.[AGY_STATUS_HOOK_NAME]?.PreInvocation;
+    assert(Array.isArray(handlers) && handlers.length === 1, 'PreInvocation is not a one-item flat array');
+    assert(typeof handlers[0]?.command === 'string', 'flat handler lacks command');
+    assert(!('matcher' in handlers[0]) && !('hooks' in handlers[0]), 'PreInvocation still uses a nested matcher/hooks group');
+    assert(!raw.includes('${'), 'carrier contains a ${ sequence');
+    for (const builtin of ['if defined', 'set ', '&&']) {
+      assert(!raw.toLowerCase().includes(builtin), `carrier contains shell builtin ${builtin}`);
+    }
+    const encoded = handlers[0].command.match(/-EncodedCommand\s+(\S+)$/)?.[1];
+    assert(encoded, 'carrier command lacks encoded cross-shell invocation');
+    const invocation = Buffer.from(encoded, 'base64').toString('utf16le');
+    const quotedPaths = [...invocation.matchAll(/"([^"]+)"/g)].map((match) => match[1]);
+    assert(quotedPaths.length >= 2 && quotedPaths.every((entry) => path.isAbsolute(entry)),
+      `decoded node/script paths are not absolute and quoted: ${invocation}`);
+    assert(invocation.endsWith(' working --event PreInvocation'), `decoded invocation is wrong: ${invocation}`);
+  });
+
+  check('worker cwd is a real git repo and exact trustedWorkspaces entry is present', () => {
     const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'));
     assert(settings.foreignTopLevel?.keep === true, 'foreign top-level setting changed');
     assert(settings.trustedWorkspaces.includes('C:\\Unrelated\\Workspace'), 'foreign trust entry lost');
@@ -130,6 +152,12 @@ try {
     for (const rule of AGY_GIT_DISCARD_DENY_RULES) {
       assert(settings.permissions.deny.includes(rule), `managed deny missing: ${rule}`);
     }
+    const repo = spawnSync('git', ['rev-parse', '--show-toplevel'], {
+      cwd: agentCwd, encoding: 'utf-8', timeout: 20_000, stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    assert(repo.status === 0, `worker cwd is not a git repo: ${(repo.stderr || '').trim()}`);
+    assert(path.resolve(repo.stdout.trim()).toLowerCase() === path.resolve(agentCwd).toLowerCase(),
+      `git root ${repo.stdout.trim()} is not worker cwd ${agentCwd}`);
   });
 
   check('scaffold, global hook, trust, and permissions preparation is idempotent', () => {
@@ -138,6 +166,7 @@ try {
     const before = {
       agents: fs.readFileSync(agentsPath, 'utf-8'),
       hooks: fs.readFileSync(hooksPath, 'utf-8'),
+      carrier: fs.readFileSync(path.join(agentCwd, '.agents', 'hooks.json'), 'utf-8'),
       settings: fs.readFileSync(settingsPath, 'utf-8'),
     };
     const second = new AgentSupervisor();
@@ -145,7 +174,29 @@ try {
     second.ensureProviderDirTrust(workDir, agentCwd, 'agy', 'windows');
     assert(fs.readFileSync(agentsPath, 'utf-8') === before.agents, 'seed-once AGENTS.md was overwritten');
     assert(fs.readFileSync(hooksPath, 'utf-8') === before.hooks, 'global hooks changed on no-op rerun');
+    assert(fs.readFileSync(path.join(agentCwd, '.agents', 'hooks.json'), 'utf-8') === before.carrier,
+      'workspace carrier changed on no-op rerun');
     assert(fs.readFileSync(settingsPath, 'utf-8') === before.settings, 'settings changed on no-op rerun');
+  });
+
+  check('generated hook command executes verbatim under cmd.exe and powershell.exe', () => {
+    const carrier = JSON.parse(fs.readFileSync(path.join(agentCwd, '.agents', 'hooks.json'), 'utf-8'));
+    const command = carrier[AGY_STATUS_HOOK_NAME].PreInvocation[0].command;
+    const shells = [
+      [process.env.ComSpec || path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'cmd.exe'), ['/d', '/s', '/c', command]],
+      [path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'),
+        ['-NoProfile', '-NonInteractive', '-Command', command]],
+    ];
+    for (const [exe, args] of shells) {
+      const result = spawnSync(exe, args, {
+        cwd: agentCwd, encoding: 'utf-8', timeout: 60_000,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: { ...process.env, AGENT_ID: `agy-tier0-${path.basename(exe)}` },
+      });
+      assert(result.status === 0,
+        `${exe} status=${result.status} signal=${result.signal}: ${(result.stderr || '').trim()}`);
+    }
+    return command;
   });
 
   check('launch-command construction selects agy and rejects a Claude binary mismatch', () => {
@@ -200,7 +251,9 @@ try {
 } catch (err) {
   fail('smoke harness', err instanceof Error ? err.stack || err.message : String(err));
 } finally {
+  process.chdir(prior.cwd);
   for (const [key, value] of Object.entries(prior)) {
+    if (key === 'cwd') continue;
     if (value === undefined) delete process.env[key]; else process.env[key] = value;
   }
   try { fs.rmSync(scratch, { recursive: true, force: true }); } catch { /* best effort */ }

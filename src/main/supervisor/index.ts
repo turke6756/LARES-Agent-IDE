@@ -19,7 +19,8 @@ import {
   WORKER_CLAUDE_MD, WORKER_CLAUDE_MD_V1, WORKER_BEHAVIORAL_MD,
   WORKER_CLAUDE_SETTINGS_JSON, WORKER_CLAUDE_SETTINGS_JSON_V2, WORKER_CLAUDE_SETTINGS_JSON_V3,
   WORKER_CLAUDE_SETTINGS_JSON_V4, WORKER_CLAUDE_SETTINGS_JSON_V5, WORKER_CLAUDE_SETTINGS_JSON_V6,
-  WORKER_CLAUDE_SETTINGS_JSON_V7, workerGrokSettingsJson,
+  WORKER_CLAUDE_SETTINGS_JSON_V7, workerGrokSettingsJson, workerAgyHooksJson,
+  WORKER_AGY_HOOKS_JSON_V1_HASH,
   WORKER_CODEX_CONFIG_TOML, WORKER_CODEX_CONFIG_TOML_V1, WORKER_CODEX_CONFIG_TOML_V2,
   WORKER_CODEX_CONFIG_TOML_V3, WORKER_CODEX_CONFIG_TOML_V4, WORKER_CODEX_CONFIG_TOML_V5,
   WORKER_CODEX_AGENTS_MD, WORKER_CODEX_AGENTS_MD_V1, WORKER_CODEX_BEHAVIORAL_MD,
@@ -27,6 +28,7 @@ import {
   GUARD_GIT_DISCARD_MJS,
   DASHBOARD_STATUS_SCRIPT_MJS, DASHBOARD_STATUS_SCRIPT_MJS_V3, DASHBOARD_STATUS_SCRIPT_MJS_V4, DASHBOARD_STATUS_SCRIPT_MJS_V5,
   DASHBOARD_STATUS_SCRIPT_MJS_V6, DASHBOARD_STATUS_SCRIPT_V7_HASH, DASHBOARD_STATUS_SCRIPT_V8_HASH,
+  DASHBOARD_STATUS_SCRIPT_V9_HASH,
   DASHBOARD_STATUSLINE_SCRIPT_MJS,
   CODEX_WORKER_PROFILE_NAME, CODEX_WORKER_PROFILE_TOML, HOOK_CANARY_WINDOW_MS,
   HANDSHAKE_CONFIRM_WINDOW_MS, HANDSHAKE_CONFIRM_POLL_MS,
@@ -56,8 +58,9 @@ import {
   PROPOSAL_TO_PLAN_CONTRACT_MANIFEST_LOCK_MD,
   PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS,
 } from '../../shared/constants';
-import { ensureAgyStatusHook } from './agy-hooks';
+import { removeGlobalAgyStatusHook } from './agy-hooks';
 import { ensureAgyPermissions, ensureAgyTrust } from './agy-settings';
+import { ensureNodeShimDir } from '../node-shim';
 import { MEMORY_INDEX_MJS } from '../../shared/generated/memory-index-cli.generated';
 // WP-C — provider-neutral supervisor memory-index launch projection + Codex
 // pending-rail composition. The projection (readValidate + last-good/runtime
@@ -3134,7 +3137,7 @@ export class AgentSupervisor extends EventEmitter {
   private static WORKSPACE_SCRIPT_FILES: Record<string, ScaffoldFile> = {
     [`.lares/scripts/dashboard-status.mjs`]: {
       content: DASHBOARD_STATUS_SCRIPT_MJS,
-      version: 9,
+      version: 10,
       executable: true,
       previousHashes: {
         1: DASHBOARD_STATUS_SCRIPT_V1_HASH,
@@ -3145,6 +3148,7 @@ export class AgentSupervisor extends EventEmitter {
         6: sha256Hex(DASHBOARD_STATUS_SCRIPT_MJS_V6),
         7: DASHBOARD_STATUS_SCRIPT_V7_HASH,
         8: DASHBOARD_STATUS_SCRIPT_V8_HASH,
+        9: DASHBOARD_STATUS_SCRIPT_V9_HASH,
       },
     },
     // Persona kit (§1.4) — one shared copy of the read-comments helper script.
@@ -3458,22 +3462,30 @@ export class AgentSupervisor extends EventEmitter {
       // in BOTH a git-backed outer workspace and a non-git workspace.
       this.ensureGrokWorkerGitRepo(workDir, pathType);
     } else if (provider === 'agy') {
-      // Phase-0 addendum: agy has no working project/plugin hook carrier. Seed
-      // only its user-owned cwd identity, then install the single supported
-      // PreInvocation status handler in the user-global named+nested carrier.
-      // There is deliberately no WORKER_FILES_AGY managed map and no git-init:
-      // project .agents/hooks.json stays undiscovered even in trusted/git cwds.
       providerCreated += this.seedAgyIdentityIfAbsent(workDir, pathType);
       if (pathType === 'windows') {
+        const nodePath = path.join(ensureNodeShimDir(), 'node.cmd');
+        const agyFiles: Record<string, ScaffoldFile> = {
+          [`.lares/workers/agy/.agents/hooks.json`]: {
+            content: workerAgyHooksJson(workDir, nodePath),
+            version: 2,
+            // v1 was the broken global-shaped entry retained below as a frozen
+            // hash source. A pristine migrated copy upgrades silently; edited
+            // content is backed up by writeScaffoldMap.
+            previousHashes: { 1: WORKER_AGY_HOOKS_JSON_V1_HASH },
+          },
+        };
+        providerCreated += this.writeScaffoldMap(workDir, agyFiles, pathType);
+        this.ensureAgyWorkerGitRepo(workDir, pathType);
         try {
-          const result = ensureAgyStatusHook(process.env.USERPROFILE || process.env.HOME);
+          const result = removeGlobalAgyStatusHook(process.env.USERPROFILE || process.env.HOME);
           if (result.action === 'written') {
-            console.log(`[supervisor] agy global PreInvocation status hook installed: ${result.configPath}`);
+            console.log(`[supervisor] removed obsolete agy global status hook: ${result.configPath}`);
           } else if (result.action === 'invalid') {
             console.warn(`[supervisor] refusing to replace malformed agy hooks config ${result.configPath}: ${result.reason}`);
           }
         } catch (err) {
-          console.warn('[supervisor] ensureAgyStatusHook failed (agy status start hook may not fire):', err);
+          console.warn('[supervisor] agy global status-hook migration failed (workspace hook may double-fire):', err);
         }
       }
     }
@@ -3663,6 +3675,21 @@ export class AgentSupervisor extends EventEmitter {
       console.warn(
         `[supervisor] grok worker \`git init\` failed in ${workerCwd} — grok hooks/guard `
         + `will not load (projectRoot won't resolve to the worker cwd): `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  /** agy discovers `.agents/hooks.json` only at a real repository root. */
+  private ensureAgyWorkerGitRepo(workDir: string, pathType: string): void {
+    if (pathType !== 'windows') return;
+    const workerCwd = path.join(workDir, '.lares', 'workers', 'agy');
+    try {
+      if (fs.existsSync(path.join(workerCwd, '.git'))) return;
+      execFileSync('git', ['init', '-q'], { cwd: workerCwd, timeout: 20_000, stdio: 'ignore' });
+    } catch (err) {
+      console.warn(
+        `[supervisor] agy worker \`git init\` failed in ${workerCwd} — workspace hooks will not load: `
         + `${err instanceof Error ? err.message : String(err)}`,
       );
     }
