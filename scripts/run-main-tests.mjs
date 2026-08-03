@@ -80,6 +80,7 @@ const TESTS = [
   'dist/main/main/terminal-attach-integration.test.js',
   'dist/main/main/supervisor/log-readers/codex-rollout-reader.test.js',
   'dist/main/main/supervisor/log-readers/gemini-transcript-reader.test.js',
+  'dist/main/main/supervisor/log-readers/grok-session-reader.test.js',
   'dist/main/main/supervisor/log-readers/wsl-base-dir-lazy.test.js',
   'dist/main/main/supervisor/event-bridge.test.js',
   'dist/main/main/supervisor/event-bridge.integration.test.js',

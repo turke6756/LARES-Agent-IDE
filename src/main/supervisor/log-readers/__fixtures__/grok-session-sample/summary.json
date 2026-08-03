@@ -1,0 +1,15 @@
+{
+  "info": {
+    "id": "019fffff-1111-7222-a800-aaaaaaaaaaaa",
+    "cwd": "C:\\Users\\fixture\\grok"
+  },
+  "session_summary": "Synthesized fixture session",
+  "created_at": "2026-08-03T16:00:00.000Z",
+  "updated_at": "2026-08-03T16:05:00.000Z",
+  "num_messages": 9,
+  "num_chat_messages": 4,
+  "current_model_id": "grok-4.5",
+  "chat_format_version": 1,
+  "generated_title": "Synthesized fixture session",
+  "agent_name": "grok-build-plan"
+}

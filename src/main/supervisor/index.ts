@@ -142,6 +142,7 @@ import { decideClearRotation, type ClearRotationTrigger } from './claude-clear-r
 import { computeAwaitingHuman, buildContinuationKickoffMessage, type ContinuationWatcher } from './continuation-watcher';
 import { CodexRolloutReader } from './log-readers/codex-rollout-reader';
 import { GeminiTranscriptReader } from './log-readers/gemini-transcript-reader';
+import { GrokSessionReader } from './log-readers/grok-session-reader';
 import { AgentChatService } from './agent-chat-service';
 import {
   snapshotCodexSessions,
@@ -2044,7 +2045,7 @@ export class AgentSupervisor extends EventEmitter {
     this.sessionLogReader = new SessionLogReader(() => {
       const agents = getActiveAgents();
       return agents
-        .filter(a => a.resumeSessionId || a.provider === 'codex' || a.provider === 'gemini')
+        .filter(a => a.resumeSessionId || a.provider === 'codex' || a.provider === 'gemini' || a.provider === 'grok')
         .map(a => ({
           agentId: a.id,
           sessionId: a.resumeSessionId || '',
@@ -2060,6 +2061,7 @@ export class AgentSupervisor extends EventEmitter {
     this.sessionLogReader.register(new ClaudeJsonlReader());
     this.sessionLogReader.register(new CodexRolloutReader());
     this.sessionLogReader.register(new GeminiTranscriptReader());
+    this.sessionLogReader.register(new GrokSessionReader());
     this.sessionLogReader.on('chat-events', (batch) => {
       // Phase 5A — the `endsWithQuestion` verdict no longer feeds the
       // awaiting-human gate (a merely-idle question-ending turn is available).
