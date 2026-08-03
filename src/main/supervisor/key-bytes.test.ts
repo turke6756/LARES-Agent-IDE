@@ -58,6 +58,17 @@ test('enter: grok/windows → bare CR (shares the Claude-on-Windows encoding)', 
   );
 });
 
+test('enter: agy/windows → bare CR submit, never LF', () => {
+  // Empirically proven with the dashboard's node-pty/ConPTY transport:
+  // C:/Users/turke/Projects/plans/agy-phase0-probe-results.md §0.1.
+  assert.equal(mapKeyToBytes('enter', 'agy', 'windows'), '\r');
+  assert.notEqual(mapKeyToBytes('enter', 'agy', 'windows'), '\n');
+  assert.equal(
+    mapKeyToBytes('enter', 'agy', 'windows'),
+    mapKeyToBytes('enter', 'claude', 'windows'),
+  );
+});
+
 test('enter: codex/wsl → kitty CSI-u \\x1b[13u', () => {
   assert.equal(mapKeyToBytes('enter', 'codex', 'wsl'), '\x1b[13u');
 });
@@ -88,6 +99,15 @@ test('shift-enter: grok/windows → backslash-continuation (`\\` + CR), not a Sh
   assert.notEqual(
     mapKeyToBytes('shift-enter', 'grok', 'windows'),
     mapKeyToBytes('shift-enter', 'codex', 'windows'),
+  );
+});
+
+test('shift-enter: agy/windows → LF newline without submit', () => {
+  // Probe §0.1 observed zero turn-start markers after LF and a two-line prompt.
+  assert.equal(mapKeyToBytes('shift-enter', 'agy', 'windows'), '\n');
+  assert.notEqual(
+    mapKeyToBytes('shift-enter', 'agy', 'windows'),
+    mapKeyToBytes('enter', 'agy', 'windows'),
   );
 });
 

@@ -4,7 +4,7 @@ import { PROVIDER_COMMANDS, PROVIDER_META, PROVIDER_INSTALL_HINTS } from '../../
 import { useDashboardStore } from '../../stores/dashboard-store';
 import { useBrowserSuspension } from '../browser/useBrowserSuspension';
 
-const PROVIDERS: AgentProvider[] = ['claude', 'gemini', 'codex', 'grok'];
+const PROVIDERS: AgentProvider[] = ['claude', 'gemini', 'codex', 'grok', 'agy'];
 
 // Single "Agent type" selector values. The first three are first-class role
 // lanes (app-managed cwd + scaffold under .lares/); personas are custom
@@ -562,6 +562,14 @@ export default function AgentLaunchDialog({ workspace, onClose }: Props) {
             {provider === 'grok' && (
               <div className="mt-1 text-[11px] text-purple-400">
                 {PROVIDER_INSTALL_HINTS.grok.installNote}
+              </div>
+            )}
+            {/* Probe 0.1 proved agy's CR submit contract, so the provider is no
+                longer hidden. Auth remains an informational first-run notice;
+                launch is never blocked here. */}
+            {provider === 'agy' && (
+              <div className="mt-1 text-[11px] text-teal-400">
+                {PROVIDER_INSTALL_HINTS.agy.installNote}
               </div>
             )}
           </div>

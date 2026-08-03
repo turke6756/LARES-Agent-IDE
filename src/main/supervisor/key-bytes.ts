@@ -17,9 +17,12 @@
 //       There is NO distinct Shift+Enter byte over ConPTY, so shift-enter uses
 //       backslash-continuation (`\` + CR). Source-verified in
 //       plans/grok-phase0-probe-results.md §0.1.
+//   - agy on Windows (ConPTY):     plain CR (`\r`) submits; plain LF (`\n`)
+//       inserts a newline without submitting. Empirically proven in
+//       C:/Users/turke/Projects/plans/agy-phase0-probe-results.md §0.1.
 //
-// Providers therefore do NOT all share one encoding: the split is claude/grok
-// (bare CR) vs codex/gemini (Win32 on Windows, kitty on WSL).
+// Providers therefore do NOT all share one encoding: claude/grok/agy submit
+// with bare CR on Windows, while codex/gemini use Win32 records there.
 //
 // This module exposes a small enum-based API that callers can use to ask
 // for a named key (`enter`, `esc`, `tab`, an arrow, Ctrl-C, etc.) and get
@@ -113,6 +116,10 @@ export function mapKeyToBytes(
       // prompt_widget/mod.rs:2142 (grok-phase0-probe-results.md §0.1).
       if (provider === 'claude') return '\r';
       if (provider === 'grok') return '\r';
+      // agy also accepts kitty CSI-u Enter, but the real ConPTY probe proved
+      // bare CR is its canonical, legacy-robust submit byte. LF is deliberately
+      // reserved for newline-without-submit (agy probe results §0.1).
+      if (provider === 'agy') return '\r';
       if (provider === 'codex' || provider === 'gemini') {
         return pathType === 'wsl' ? KITTY_ENTER : WIN32_KEY_ENTER;
       }
@@ -129,6 +136,9 @@ export function mapKeyToBytes(
       // submit is backslash-continuation: `\` + CR. Source: route_enter
       // mod.rs:2110 & 2134-2139 (grok-phase0-probe-results.md §0.1).
       if (provider === 'grok') return GROK_BACKSLASH_CONTINUATION;
+      // agy maps both Shift+Enter and Ctrl+J to prompt.newline; raw LF is the
+      // probe-proven ConPTY byte and never starts a turn (agy probe results §0.1).
+      if (provider === 'agy') return '\n';
       if (provider === 'codex' || provider === 'gemini') {
         return pathType === 'wsl' ? KITTY_SHIFT_ENTER : WIN32_KEY_SHIFT_ENTER;
       }

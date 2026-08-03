@@ -187,7 +187,7 @@ import {
 // the canonical home is ./mcp-config-builder.
 export { toolsetsForLane, buildDashboardMcpConfigArg, laneUsesStrictMcp, redactMcpToken };
 import { tmuxListSessions, tmuxSendInput, tmuxSendSubmit, tmuxReadStatusOptions, shQuote, getPassiveWslStatus, tmuxKillSession } from '../wsl-bridge';
-import { getWindowsSubmitSequence } from './send-input-encoders';
+import { encodeAgyWindowsBody, getWindowsSubmitSequence } from './send-input-encoders';
 import { HookSpoolTailer, resolveSpoolReadPath, canonicalSpoolKey } from './hook-spool-tailer';
 // Single source of truth for "where does this provider CLI live on Windows".
 // runtime-prerequisites.ts calls the very same functions, so what preflight
@@ -7979,6 +7979,18 @@ export class AgentSupervisor extends EventEmitter {
           await new Promise((resolve) => setTimeout(resolve, WINDOWS_SEND_INPUT_ENTER_DELAY_MS));
           winRunner.write(getWindowsSubmitSequence('claude'));
         }
+      } else if (agent?.provider === 'agy') {
+        // agy 1.1.9 distinguishes these bytes over the dashboard's real ConPTY
+        // transport: LF inserts a newline without submitting; CR submits. Strip
+        // every embedded CR (including CRLF input) to LF before sending the body,
+        // then deliver exactly one canonical CR as a separate submit event.
+        // Evidence: C:/Users/turke/Projects/plans/agy-phase0-probe-results.md §0.1.
+        winRunner.write(encodeAgyWindowsBody(text));
+        if (submit) {
+          await new Promise((resolve) => setTimeout(resolve, WINDOWS_SEND_INPUT_ENTER_DELAY_MS));
+          winRunner.write(getWindowsSubmitSequence('agy'));
+        }
+        this.emitSyntheticUserEcho(agent, text);
       } else if (agent?.provider === 'codex' || agent?.provider === 'gemini') {
         // Codex/gemini enable Win32 Input Mode (ESC[?9001h). In this mode the
         // TUI expects key events as CSI sequences with both KEY_DOWN and

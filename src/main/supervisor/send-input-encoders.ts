@@ -25,8 +25,23 @@ export function getWindowsSubmitSequence(provider: string): string {
   // §0.1. Listed explicitly (not left to the CR fall-through) so the contract is
   // a verified decision, not an implicit accident.
   if (provider === 'grok') return '\r';
+  // Empirically proven over the dashboard's real node-pty/ConPTY transport:
+  // bare CR submits agy, while LF inserts a newline without submitting. agy
+  // also accepts kitty CSI-u Enter, but CR is the canonical legacy-robust form.
+  // See C:/Users/turke/Projects/plans/agy-phase0-probe-results.md §0.1.
+  if (provider === 'agy') return '\r';
   if (provider === 'codex' || provider === 'gemini') {
     return WIN32_KEY_ENTER_DOWN + WIN32_KEY_ENTER_UP;
   }
   return '\r';
+}
+
+/**
+ * Normalize an agy prompt body without introducing submit bytes. Probe §0.1
+ * proves that every embedded CR would submit immediately, whereas LF is agy's
+ * transport-friendly newline chord. The caller writes the final submit CR as a
+ * separate event via getWindowsSubmitSequence('agy').
+ */
+export function encodeAgyWindowsBody(text: string): string {
+  return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
 }

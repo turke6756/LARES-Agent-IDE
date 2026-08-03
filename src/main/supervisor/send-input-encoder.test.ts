@@ -24,7 +24,7 @@
 
 import assert from 'node:assert/strict';
 import { buildTmuxSendInputCmd, TMUX_KITTY_ENTER_HEX } from '../wsl-bridge';
-import { getWindowsSubmitSequence } from './send-input-encoders';
+import { encodeAgyWindowsBody, getWindowsSubmitSequence } from './send-input-encoders';
 
 interface TestCase { name: string; run(): void; }
 const tests: TestCase[] = [];
@@ -222,6 +222,19 @@ test('Windows grok submit sequence is CR (matches Claude-on-Windows, not codex/g
   assert.equal(getWindowsSubmitSequence('grok'), '\r');
   assert.equal(getWindowsSubmitSequence('grok'), getWindowsSubmitSequence('claude'));
   assert.notEqual(getWindowsSubmitSequence('grok'), getWindowsSubmitSequence('codex'));
+});
+
+test('Windows agy submit sequence is CR, while LF remains newline-only', () => {
+  // Real ConPTY evidence: agy-phase0-probe-results.md §0.1.
+  assert.equal(getWindowsSubmitSequence('agy'), '\r');
+  assert.notEqual(getWindowsSubmitSequence('agy'), '\n');
+});
+
+test('Windows agy multiline body uses only LF internally and one final CR submits', () => {
+  const body = encodeAgyWindowsBody('line one\r\nline two\rline three');
+  assert.equal(body, 'line one\nline two\nline three');
+  assert.ok(!body.includes('\r'), 'an embedded CR would submit agy early');
+  assert.equal(body + getWindowsSubmitSequence('agy'), 'line one\nline two\nline three\r');
 });
 
 test('Windows unknown provider falls back to CR', () => {
