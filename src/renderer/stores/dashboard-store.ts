@@ -295,6 +295,12 @@ interface DashboardState {
   // browserOpen; the four show* actions are mutually exclusive and the center
   // dispatch resolves precedence file viewer > browser > save card > dashboard.
   saveCardOpen: boolean;
+  // WP-P1S — one-shot "the Save card was opened by a user gesture" signal.
+  // `showSaveCard()` sets it true; SaveCard consumes it on mount to emit exactly
+  // one `savecard_open` demand probe. Session-restore reopens (switchWorkspace)
+  // leave it false, so a restore-driven mount stays silent. Transient — NOT part
+  // of the per-workspace view snapshot.
+  saveCardOpenGesture: boolean;
   tabEditState: Record<string, TabEditState>;
 
   // Actions
@@ -395,6 +401,8 @@ interface DashboardState {
   hideBrowser: () => void;
   showDashboard: () => void;
   showSaveCard: () => void;
+  // WP-P1S — consume the one-shot gesture signal after SaveCard has witnessed it.
+  consumeSaveCardGesture: () => void;
 
   // Detachable (tear-off) top-level views. `detachedViews` holds the views
   // currently torn off into their own OS windows; their toolbar buttons render
@@ -486,6 +494,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
   fileViewerOpen: false,
   browserOpen: false,
   saveCardOpen: false,
+  saveCardOpenGesture: false,
   tabEditState: {},
 
   openTab: (filePath, rootDirectory, pathType, agentId?, workspaceId?, focusRange?) => {
@@ -1260,7 +1269,12 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
   // panes — opening it closes the others (explicit mutual exclusion). Read-only
   // inspect surface; there is no writer, so this only swaps what the center
   // renders. Not detachable (Stage ① non-goal), so no detached-view guard.
-  showSaveCard: () => set({ saveCardOpen: true, fileViewerOpen: false, browserOpen: false }),
+  showSaveCard: () =>
+    set({ saveCardOpen: true, saveCardOpenGesture: true, fileViewerOpen: false, browserOpen: false }),
+
+  // WP-P1S — SaveCard calls this on mount once it has recorded the voluntary-open
+  // demand probe, so a later re-render / StrictMode remount can't re-fire it.
+  consumeSaveCardGesture: () => set({ saveCardOpenGesture: false }),
 
   // Return to the agent-card grid (WP-NAV). Tabs survive — only the view resets.
   // A detached Dashboard cannot be reactivated in the main window — no-op so the

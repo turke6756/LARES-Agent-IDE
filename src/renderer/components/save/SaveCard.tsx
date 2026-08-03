@@ -55,6 +55,25 @@ export default function SaveCard() {
   const infoRef = useRef<HTMLDivElement>(null);
   const infoButtonRef = useRef<HTMLButtonElement>(null);
 
+  // WP-P1S — demand probe: witness a VOLUNTARY user open of the Save card. The
+  // store's one-shot `saveCardOpenGesture` flag is set only by `showSaveCard()`
+  // (the toolbar gesture), so we emit exactly one `savecard_open` per gesture and
+  // stay silent on a bare mount / session-restore reopen (switchWorkspace leaves
+  // the flag false) and on Refresh/Try-again (a re-fetch, not a remount). The ref
+  // guards against a re-render or StrictMode double-invoke re-firing within one
+  // mount; `feature_exercise` is intentionally omitted so the event stays
+  // voluntary-eligible at aggregation.
+  const openedByGesture = useDashboardStore((s) => s.saveCardOpenGesture);
+  const consumeSaveCardGesture = useDashboardStore((s) => s.consumeSaveCardGesture);
+  const probeFiredRef = useRef(false);
+  useEffect(() => {
+    if (!openedByGesture || probeFiredRef.current) return;
+    probeFiredRef.current = true;
+    consumeSaveCardGesture();
+    if (!workspaceId) return;
+    void window.api.demandProbe.record({ workspaceId, kind: 'savecard_open' }).catch(() => {});
+  }, [openedByGesture, workspaceId, consumeSaveCardGesture]);
+
   useEffect(() => {
     if (!infoOpen) return;
     const onDown = (event: MouseEvent) => {
