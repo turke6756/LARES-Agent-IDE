@@ -1117,34 +1117,60 @@ export const WORKER_CODEX_AGENTS_MD_V1_HASH = '430a331f1cfe54931583aac02036350a2
  *  v9 → v10 ceremony-drop. previousHashes[2] for the codex AGENTS.md v2 → v3 bump. */
 export const WORKER_CODEX_AGENTS_MD_V2_HASH = '60a6b1bc6df13a8025b9a0ef12ea1ab9d6db4583c90ccbf7ac473546dd62856c';
 
+// WP-SKILLFIX — SHA-256 hex of the v1 bundled bodies of the five proposal-to-plan
+// files hardened to v2 (fresh-agent test surfaced four doc defects: orient
+// read-only contradiction, no ARC-refresh helper, unspecified artifact_id
+// generation, undocumented sku slug source). Each is previousHashes[1] for the
+// silent v1→v2 upgrade of pristine deployed workspaces. FROZEN literals; the
+// byte-exact v1 bodies live in proposal-to-plan-old-body-fixtures.ts (imported by
+// the migration precondition tests, which assert sha256Hex(frozen)===HASH and
+// sha256Hex(live)!==HASH). The other eight tree files are unchanged and stay v1.
+export const PROPOSAL_TO_PLAN_SKILL_MD_V1_HASH = '8ff2d0d172f12c854275e670026d0fe1289fb0f078dda882398536a01eba8561';
+export const PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V1_HASH = 'ccad09cfe65ddf201498aeadde93c84d501e12048144328c53738747ce439546';
+export const PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD_V1_HASH = '41da3022372a7daec10fd98d2213443ff4dd960a5f0a6e920fe8bdb54d3f42db';
+export const PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD_V1_HASH = '78823a68f465874f05e7752a43ae1e82866c8d8b9485bedbf7465aa66048cf7f';
+export const PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V1_HASH = 'bee85a7aacc0efa624c12108c79100859f5fb640cedfc61ab29c912d84a64577';
+
 // WP-P0C — proposal-to-plan skill tree deploy. One versioned content constant per
 // file (constants.ts); this manifest expands the tree under each of the four skill
-// roots (Claude+Codex x supervisor+worker). New-skill shape (version 1, no
-// previousHashes): nothing by these names was ever scaffolded, so an unmanaged file
-// already present is treated as user-authored and .bak'd, never silently clobbered.
-const PROPOSAL_TO_PLAN_TREE: Array<{ rel: string; content: string; executable?: boolean }> = [
-  { rel: 'SKILL.md', content: PROPOSAL_TO_PLAN_SKILL_MD },
-  { rel: 'references/activities/capture.md', content: PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD },
+// roots (Claude+Codex x supervisor+worker). New-skill shape was version 1, no
+// previousHashes; WP-SKILLFIX bumps the five hardened files to v2 with a
+// previousHashes[1] so pristine v1 copies upgrade silently and hand-edited ones are
+// .bak'd. Unchanged files stay v1 (an unmanaged file already at those names is
+// treated as user-authored and .bak'd, never silently clobbered).
+const PROPOSAL_TO_PLAN_TREE: Array<{
+  rel: string; content: string; executable?: boolean;
+  version?: number; previousHashes?: Record<number, string>;
+}> = [
+  { rel: 'SKILL.md', content: PROPOSAL_TO_PLAN_SKILL_MD, version: 2,
+    previousHashes: { 1: PROPOSAL_TO_PLAN_SKILL_MD_V1_HASH } },
+  { rel: 'references/activities/capture.md', content: PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD, version: 2,
+    previousHashes: { 1: PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V1_HASH } },
   { rel: 'references/activities/scope.md', content: PROPOSAL_TO_PLAN_ACTIVITY_SCOPE_MD },
-  { rel: 'references/activities/promote.md', content: PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD },
+  { rel: 'references/activities/promote.md', content: PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD, version: 2,
+    previousHashes: { 1: PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD_V1_HASH } },
   { rel: 'references/activities/deliberate.md', content: PROPOSAL_TO_PLAN_ACTIVITY_DELIBERATE_MD },
   { rel: 'references/activities/integrate.md', content: PROPOSAL_TO_PLAN_ACTIVITY_INTEGRATE_MD },
   { rel: 'references/activities/package.md', content: PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD },
-  { rel: 'references/activities/orient.md', content: PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD },
+  { rel: 'references/activities/orient.md', content: PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD, version: 2,
+    previousHashes: { 1: PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD_V1_HASH } },
   { rel: 'references/contracts/arc.md', content: PROPOSAL_TO_PLAN_CONTRACT_ARC_MD },
   { rel: 'references/contracts/folder-schema.md', content: PROPOSAL_TO_PLAN_CONTRACT_FOLDER_SCHEMA_MD },
   { rel: 'references/contracts/intent-lifecycle.md', content: PROPOSAL_TO_PLAN_CONTRACT_INTENT_LIFECYCLE_MD },
   { rel: 'references/contracts/manifest-lock.md', content: PROPOSAL_TO_PLAN_CONTRACT_MANIFEST_LOCK_MD },
-  { rel: 'scripts/plan-manifest.mjs', content: PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS, executable: true },
+  { rel: 'scripts/plan-manifest.mjs', content: PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS, executable: true, version: 2,
+    previousHashes: { 1: PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V1_HASH } },
 ];
 /** Expand the proposal-to-plan tree under a skill-root prefix into scaffold
- *  entries. Called for all four roots (Claude+Codex supervisor + worker). */
+ *  entries. Called for all four roots (Claude+Codex supervisor + worker). Each
+ *  entry carries its own version (default 1) + optional previousHashes. */
 export function proposalToPlanEntries(rootPrefix: string): Record<string, ScaffoldFile> {
   const out: Record<string, ScaffoldFile> = {};
   for (const f of PROPOSAL_TO_PLAN_TREE) {
-    out[`${rootPrefix}/${f.rel}`] = f.executable
-      ? { content: f.content, version: 1, executable: true }
-      : { content: f.content, version: 1 };
+    const entry: ScaffoldFile = { content: f.content, version: f.version ?? 1 };
+    if (f.executable) entry.executable = true;
+    if (f.previousHashes) entry.previousHashes = f.previousHashes;
+    out[`${rootPrefix}/${f.rel}`] = entry;
   }
   return out;
 }

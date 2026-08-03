@@ -54,6 +54,11 @@ import {
   WORKER_CLAUDE_MD_V9_HASH,
   WORKER_CODEX_AGENTS_MD_V2_HASH,
   proposalToPlanEntries,
+  PROPOSAL_TO_PLAN_SKILL_MD_V1_HASH,
+  PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V1_HASH,
+  PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD_V1_HASH,
+  PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD_V1_HASH,
+  PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V1_HASH,
   normalizeManagedKey,
   sha256Hex,
 } from './index';
@@ -74,6 +79,9 @@ import {
   WORKER_CLAUDE_MD_V9,
   WORKER_CODEX_AGENTS_MD_V2,
   PROPOSAL_TO_PLAN_SKILL_MD,
+  PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD,
+  PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD,
+  PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD,
   PROPOSAL_TO_PLAN_CONTRACT_ARC_MD,
   PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS,
   SUPERVISOR_CHECKPOINT_FORENSICS_SKILL,
@@ -98,6 +106,13 @@ import {
   RESEARCH_WRITE_GUARD_MJS_V3,
   RESEARCH_WRITE_GUARD_MJS_V4,
 } from './guard-script-old-body-fixtures';
+import {
+  PROPOSAL_TO_PLAN_SKILL_MD_V1,
+  PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V1,
+  PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD_V1,
+  PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD_V1,
+  PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V1,
+} from './proposal-to-plan-old-body-fixtures';
 import {
   SUPERVISOR_V11_ORCH_THROUGH_BROWSER,
   SUPERVISOR_V11_REORIENT_EXTRA,
@@ -3515,16 +3530,78 @@ test('WP-P0C-TREE-SUP. fresh supervisor scaffold writes the whole proposal-to-pl
   }
 });
 
+// WP-SKILLFIX bumped these five files to v2 with previousHashes[1]; the other eight
+// stay v1. Keep this list in sync with PROPOSAL_TO_PLAN_TREE in index.ts.
+const PROPOSAL_TO_PLAN_V2_FILES = new Map<string, string>([
+  ['SKILL.md', PROPOSAL_TO_PLAN_SKILL_MD_V1_HASH],
+  ['references/activities/capture.md', PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V1_HASH],
+  ['references/activities/promote.md', PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD_V1_HASH],
+  ['references/activities/orient.md', PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD_V1_HASH],
+  ['scripts/plan-manifest.mjs', PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V1_HASH],
+]);
+
 test('WP-P0C-TREE-HELPER. proposalToPlanEntries expands 13 files under a root prefix; the script is executable', () => {
   const entries = proposalToPlanEntries('.lares/workers/codex/.agents/skills/proposal-to-plan');
   assert.equal(Object.keys(entries).length, 13, 'the tree must have exactly 13 files');
   for (const rel of PROPOSAL_TO_PLAN_REL_FILES) {
     const key = `.lares/workers/codex/.agents/skills/proposal-to-plan/${rel}`;
     assert.ok(entries[key], `missing entry ${key}`);
-    assert.equal(entries[key].version, 1, 'every tree file is a new-skill v1 entry');
+    if (PROPOSAL_TO_PLAN_V2_FILES.has(rel)) {
+      assert.equal(entries[key].version, 2, `${rel} is a WP-SKILLFIX-hardened v2 entry`);
+      assert.equal(entries[key].previousHashes?.[1], PROPOSAL_TO_PLAN_V2_FILES.get(rel),
+        `${rel} must carry previousHashes[1] for the silent v1→v2 upgrade`);
+    } else {
+      assert.equal(entries[key].version, 1, `${rel} is an unchanged new-skill v1 entry`);
+      assert.equal(entries[key].previousHashes, undefined, `${rel} (unchanged) must carry no previousHashes`);
+    }
   }
   const scriptKey = '.lares/workers/codex/.agents/skills/proposal-to-plan/scripts/plan-manifest.mjs';
   assert.equal(entries[scriptKey].executable, true, 'plan-manifest.mjs must be executable');
+});
+
+test('WP-SKILLFIX-PRE. frozen v1 bodies hash to the previousHashes[1] literals AND differ from the live v2 bodies', () => {
+  // Precondition: each frozen v1 body hashes to its previousHashes[1] literal, so a
+  // pristine v1 deploy upgrades silently instead of being .bak'd.
+  assert.equal(sha256Hex(PROPOSAL_TO_PLAN_SKILL_MD_V1), PROPOSAL_TO_PLAN_SKILL_MD_V1_HASH);
+  assert.equal(sha256Hex(PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V1), PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V1_HASH);
+  assert.equal(sha256Hex(PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD_V1), PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD_V1_HASH);
+  assert.equal(sha256Hex(PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD_V1), PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD_V1_HASH);
+  assert.equal(sha256Hex(PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V1), PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V1_HASH);
+  // The live v2 bodies must differ from the frozen v1 (the fixes actually landed).
+  assert.notEqual(sha256Hex(PROPOSAL_TO_PLAN_SKILL_MD), PROPOSAL_TO_PLAN_SKILL_MD_V1_HASH);
+  assert.notEqual(sha256Hex(PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD), PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V1_HASH);
+  assert.notEqual(sha256Hex(PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD), PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD_V1_HASH);
+  assert.notEqual(sha256Hex(PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD), PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD_V1_HASH);
+  assert.notEqual(sha256Hex(PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS), PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V1_HASH);
+});
+
+test('WP-SKILLFIX-CONTENT. the four defects are fixed in the live v2 bodies', () => {
+  // Fix 1 — orient read-only EXCEPT the responsible-supervisor ARC refresh.
+  assert.ok(PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD.includes('responsible supervisor ONLY'),
+    'orient step 4 must gate the ARC refresh on the responsible supervisor');
+  assert.ok(PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD.includes('SKIPS this step'),
+    'orient must tell a non-supervisor runner to skip the refresh');
+  assert.ok(PROPOSAL_TO_PLAN_SKILL_MD.includes('skips the refresh'),
+    'SKILL.md must state a non-supervisor orient skips the refresh');
+  // Fix 2 — refresh-arc helper mode exists and is routed.
+  assert.ok(PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS.includes("case 'refresh-arc':"),
+    'plan-manifest.mjs must dispatch a refresh-arc subcommand');
+  assert.ok(PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS.includes('ARC_META_RE'),
+    'refresh-arc must target the ARC-META block');
+  assert.ok(PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD.includes('plan-manifest.mjs refresh-arc'),
+    'orient must route the ARC-META update through refresh-arc');
+  assert.ok(PROPOSAL_TO_PLAN_SKILL_MD.includes('refresh-arc'), 'SKILL.md must list the refresh-arc helper mode');
+  // Fix 3 — artifact_id generation rule + collision check.
+  assert.ok(PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD.includes('8 lowercase hex'),
+    'capture.md must specify prop_ + 8 lowercase hex generation');
+  assert.ok(PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD.includes('collision check'),
+    'capture.md must mandate a collision check');
+  // Fix 4 — sku slug derives from the frontmatter title, not the filename.
+  const promoteFlat = PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD.replace(/\s+/g, ' ');
+  assert.ok(promoteFlat.includes('slugified proposal `title` frontmatter'),
+    'promote.md must document the slug source is the frontmatter title');
+  assert.ok(promoteFlat.includes('NOT the proposal filename'),
+    'promote.md must say the slug is NOT the filename');
 });
 
 test('WP-P0C-STALE-1. hash-guarded removal: an UNCHANGED retired tree file is deleted (no .bak)', () => {

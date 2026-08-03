@@ -5352,17 +5352,23 @@ routes to; load only the one you need. Contracts live once under \`references/co
 
 ## Lane rules (who may run what)
 
-- **\`orient\` — anyone.** It is **read-only**; it never mutates the plan, never launches, never
-  auto-relaunches. Judgment-bearing next actions it surfaces are **gated on the responsible
-  supervisor.** Orient-first is a standing rule: on picking up a plan folder, \`plan.json\` + \`ARC.md\`
-  + intent markers are the **FIRST** place you look.
+- **\`orient\` — anyone.** Its derivation and reporting are **read-only** for every runner: it never
+  launches, never auto-relaunches, and a non-supervisor lane never mutates the plan — so a
+  non-supervisor may **always** run it. The **one** exception is the ARC-META/ARC refresh (orient
+  step 4): that is a mutation, so it runs **only when the runner is the plan's current responsible
+  supervisor** (the last \`assigned\` event in \`plan.json\`); any other runner performs the read-only
+  derivation + report and **skips the refresh**. Judgment-bearing next actions it surfaces are
+  **gated on the responsible supervisor.** Orient-first is a standing rule: on picking up a plan
+  folder, \`plan.json\` + \`ARC.md\` + intent markers are the **FIRST** place you look.
 - **\`mark\` (inside \`scope\`) / \`integrate\` / \`package\` — the responsible supervisor ONLY.** The
   current responsible supervisor = the **last \`assigned\` event** in \`plan.json\`. A non-supervisor
   lane that reaches these is **rejected and instructed** to hand off.
 - **Reassignment precedes mutation.** A different supervisor must **append a new \`assigned\` event**
   (via the helper, under the lock) **before** any mutation. Read-only \`orient\` is allowed without
   reassignment; a mutation without a fresh \`assigned\` event is **refused**.
-- \`ARC.md\` is **supervisor-owned** — created at \`promote\`, refreshed by \`orient\`/\`integrate\`.
+- \`ARC.md\` is **supervisor-owned** — created at \`promote\`; its ARC-META/ARC refresh is performed by
+  the **responsible supervisor** via \`orient\`/\`integrate\` (a non-supervisor \`orient\` reports but does
+  **not** refresh).
 - \`capture\` is open to anyone (a worker may author with \`author_role: worker\`).
 
 ## Rung ladder (in brief — full text in \`references/contracts/intent-lifecycle.md\`)
@@ -5380,7 +5386,9 @@ unfolded output **keeps the intent open**.
 **All** \`plan.json\` creation and mutation goes through \`scripts/plan-manifest.mjs\`
 (\`scaffold\` / \`manifest\`) under the §P3-MANIFEST-LOCK protocol. **There is no hand-edit path**; lock
 exhaustion is a **clean blocking error with recovery guidance**, never a direct edit. \`inspect\` is
-the read-only dump. (\`references/contracts/manifest-lock.md\`.)
+the read-only dump. The mechanical **ARC-META** refresh has its own helper mode, \`refresh-arc\` (it
+rewrites **only** the \`<!--ARC-META-->\` block of \`ARC.md\` — never \`plan.json\`); ARC **prose** appends
+stay native supervisor edits. (\`references/contracts/manifest-lock.md\`.)
 
 ## Dispatcher contract — mode selection replaces any per-turn sentinel
 
@@ -5422,6 +5430,15 @@ later hardening.
    authored_at: <ISO-8601>
    ---
    \`\`\`
+
+   **Generate \`artifact_id\` as \`prop_\` + exactly 8 lowercase hex characters** from a
+   **crypto-quality** random source — e.g. \`crypto.randomBytes(4).toString('hex')\` (Node) or
+   \`openssl rand -hex 4\` — never a timestamp, counter, or the local DB UUID. Then **run a mandatory
+   collision check**: scan every existing \`artifact_id:\` frontmatter value under \`.lares/proposals/\`
+   (including \`.lares/proposals/supporting/\`) and, if the candidate already appears anywhere,
+   **regenerate and re-check** until it is unique. \`artifact_id\` is load-bearing identity — a
+   duplicate would make two proposals derive the **same** \`plan_artifact_id\` and collide on one plan
+   folder.
 
 3. Write the proposal body in plain markdown. **No additional structure** — no \`plan.json\`, no
    subdirs, no sentinels. That is the whole ceremony.
@@ -5555,9 +5572,15 @@ scope/mark the flat proposal (.lares/proposals/…), incl. the ## Hardening scop
 
 Run this via **\`plan-manifest.mjs scaffold\`**, which:
 
-1. Computes the deterministic **\`plan_artifact_id = "plan_" + <proposal artifact hex>\`** and the
-   **\`plan-sku = <YYYY-MM-DD>-<slug>-<artifact-short>\`** target path under
-   \`<workspaceStateDir()>/plans/\`.
+1. Computes the deterministic identity **from the proposal's frontmatter (never from its filename)**:
+   - **\`plan_artifact_id = "plan_" + <proposal artifact hex>\`** — the hex of the proposal's
+     \`artifact_id\` (minted in \`capture\` as \`prop_\` + 8 lowercase hex; see \`capture.md\`).
+   - **\`plan-sku = <YYYY-MM-DD>-<slug>-<artifact-short>\`**, where **\`<slug>\` is the slugified proposal
+     \`title\` frontmatter** (lowercased, runs of non-alphanumerics collapsed to \`-\`, trimmed) — **NOT
+     the proposal filename**; \`<YYYY-MM-DD>\` is the \`authored_at\` date; and **\`<artifact-short>\` is the
+     first 8 hex of \`plan_artifact_id\`** (so it, too, derives from the proposal \`artifact_id\`).
+
+   The target path is \`<slug>\`-and-\`<artifact-short>\`-qualified under \`<workspaceStateDir()>/plans/\`.
 2. Builds the **complete** folder in a **request-ID-qualified temp sibling**
    (\`<plan-sku>.tmp-<id>\` beside the target) containing:
    - \`plan.json\` — with \`responsibility_events[0]\` = a \`manual-skill\` **\`assigned\`** event carrying a
@@ -5781,9 +5804,12 @@ export const PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD = `# Activity playbook — \`or
 the **known** lifecycle state from disk evidence and presents **safe** next actions — **before doing
 anything new** (ruling 23/30, orient-first). Re-entry is a **read**, not a process to resume.
 
-**Lane. Anyone may run \`orient\`** — it is **read-only**. It never mutates the plan, never launches,
-never auto-relaunches. Judgment-bearing actions it surfaces are **gated on the responsible
-supervisor**.
+**Lane. Anyone may run \`orient\`** — its derivation + reporting are **read-only**: it never launches,
+never auto-relaunches, and a non-supervisor runner never mutates the plan. **Exception:** the
+ARC-META/ARC refresh (step 4) is a mutation, performed **only when the runner is the plan's current
+responsible supervisor** (the last \`assigned\` event in \`plan.json\`); any other runner does the
+read-only derivation + report and **skips the refresh**. Judgment-bearing actions it surfaces are
+**gated on the responsible supervisor**.
 
 **Contracts loaded.** \`references/contracts/folder-schema.md\` (§R0), \`references/contracts/intent-lifecycle.md\`
 (§R1 rungs), \`references/contracts/arc.md\` (§R2 — refresh on re-run), and
@@ -5799,8 +5825,15 @@ supervisor**.
    folded-in. Report each intent independently (multiple outputs each listed).
 3. **Report launch-state honestly.** \`ran\` is server-witnessed and **unavailable from disk pre-P2L**;
    \`orient\` **never auto-relaunches**. A detached deliberation may be running with no artifact yet.
-4. **Refresh \`ARC.md\`/\`ARC-META\`** from current disk evidence (excluding \`ARC.md\`'s own mtime from the
-   cutoff) **without clobbering** existing content (Accept 12).
+4. **Refresh \`ARC.md\`/\`ARC-META\` — responsible supervisor ONLY.** This step is a mutation, so run it
+   **only if you are the plan's current responsible supervisor** (the last \`assigned\` event in
+   \`plan.json\`, surfaced as \`current_responsible\` by \`inspect\`); **any other runner SKIPS this step**
+   and simply reports the derived state. When you do refresh: route the mechanical **ARC-META** update
+   (\`last_refreshed_at\`, \`folder_mtime_ms\`) through **\`scripts/plan-manifest.mjs refresh-arc --dir
+   <plan-folder>\`**, which rewrites **only** the ARC-META block atomically — every prose section stays
+   byte-identical, and \`ARC.md\`'s own mtime is excluded from the cutoff. Any **prose** refresh (a
+   \`## Deliberations\` / \`## Who did what\` append) is a **native supervisor edit** that must **add** to,
+   and never clobber, existing content (Accept 12).
 5. **Surface the safe next action** from the table below; **gate any judgment-bearing action on the
    responsible supervisor.**
 
@@ -5826,9 +5859,12 @@ supervisor**.
   reported **invalid, not returned/folded** (Accept 10) — quarantine, never integrate.
 - **Multiple outputs** for one intent are surfaced **independently** (Accept 6) — one folded rerun
   never hides another pending result.
-- **Re-run refreshes \`ARC.md\`/\`ARC-META\` without clobbering** (Accept 12).
-- **Read-only**: orient is the one mode a non-supervisor lane may run; \`mark\`/\`integrate\`/\`package\`
-  it may not. Mutation by a new supervisor requires a fresh \`assigned\` reassignment event **first**
+- **Re-run refreshes \`ARC.md\`/\`ARC-META\` without clobbering** (Accept 12) — the refresh runs **only**
+  for the responsible supervisor (step 4, via \`refresh-arc\` for ARC-META); any other runner reports
+  the derived state without refreshing.
+- **Read-only for non-supervisors**: orient's derivation + report is the one thing a non-supervisor
+  lane may run; the ARC-META/ARC refresh (step 4), \`mark\`/\`integrate\`/\`package\` it may not. Mutation
+  (including the refresh) by a new supervisor requires a fresh \`assigned\` reassignment event **first**
   (Accept 7, 8).
 
 ## The EEXIST resume path
@@ -6127,6 +6163,11 @@ export const PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS = `#!/usr/bin/env node
 //             \`wx\` acquire, 2s heartbeat, 15s stale reclaim, CAS inside the lock.
 //             Lock exhaustion → clean blocking error (exit 4); NEVER a direct edit.
 //   inspect   read-only dump of plan.json + folder listing. NO rung parser.
+//   refresh-arc  rewrite ONLY the <!--ARC-META--> block of ARC.md (last_refreshed_at
+//             + source_cutoffs.folder_mtime_ms, computed over source artifacts EXCLUDING
+//             ARC.md's own mtime). Prose sections are left byte-identical; atomic write
+//             (temp → fsync → rename) like the manifest modes. Prose appends
+//             (Deliberations / Who-did-what) stay NATIVE supervisor edits — not this helper.
 //
 // Pure Node (no deps). Rung derivation is deliberately absent — that is the P1
 // reader / P2L ledger's canonical work (recommendation §"plan-manifest.mjs scope").
@@ -6436,6 +6477,68 @@ function cmdInspect(args) {
   });
 }
 
+// ---------- refresh-arc (ARC-META only; prose byte-identical) ----------
+const ARC_META_RE = /<!--ARC-META\\s*([\\s\\S]*?)-->/;
+
+function fileMtimeMs(p) {
+  try { return fs.statSync(p).mtimeMs; } catch { return 0; }
+}
+
+// Max mtime over the plan folder's SOURCE artifacts (plan.md, plan.json, outputs)
+// — EXCLUDING ARC.md itself (§R2 freshness contract), plus inert placeholders and
+// lock/temp siblings — so refreshing ARC never destabilizes its own cutoff.
+function maxSourceMtimeMs(dir) {
+  let max = 0;
+  const walk = (d) => {
+    let entries;
+    try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      if (d === dir && e.name === 'ARC.md') continue;          // exclude ARC.md's own mtime (§R2)
+      if (e.name === '.gitkeep') continue;                     // inert placeholder, not a source artifact
+      if (e.name.endsWith('.lock') || e.name.includes('.wtmp-')) continue; // lock/temp, not sources
+      const full = path.join(d, e.name);
+      if (e.isDirectory()) { walk(full); continue; }
+      const m = fileMtimeMs(full);
+      if (m > max) max = m;
+    }
+  };
+  walk(dir);
+  return max;
+}
+
+// Rewrite ONLY the ARC-META block of ARC.md (last_refreshed_at + folder_mtime_ms);
+// every prose section is left byte-identical. Atomic temp → fsync → rename, like the
+// manifest modes. Prose appends (Deliberations / Who-did-what) are NATIVE supervisor
+// edits — deliberately NOT touched here.
+function cmdRefreshArc(args) {
+  const dir = args.dir;
+  if (!dir) die(2, 'refresh-arc: --dir <plan-folder> required');
+  const arcPath = path.join(dir, 'ARC.md');
+  if (!fs.existsSync(arcPath)) die(2, \`refresh-arc: no ARC.md at \${arcPath}\`);
+  const raw = fs.readFileSync(arcPath, 'utf8');
+  const m = raw.match(ARC_META_RE);
+  if (!m) die(2, \`refresh-arc: ARC.md at \${arcPath} carries no <!--ARC-META ... --> block; refusing to invent one (prose left untouched).\`);
+  let meta;
+  try { meta = JSON.parse(m[1].trim()); }
+  catch (e) { die(2, \`refresh-arc: ARC-META block is not valid JSON (\${e.message}); refusing to clobber prose.\`); }
+
+  meta.last_refreshed_at = nowMs();
+  meta.source_cutoffs = (meta.source_cutoffs && typeof meta.source_cutoffs === 'object') ? meta.source_cutoffs : {};
+  meta.source_cutoffs.folder_mtime_ms = maxSourceMtimeMs(dir);
+  if (!('ledger_updated_at' in meta.source_cutoffs)) meta.source_cutoffs.ledger_updated_at = null;
+
+  // Function replacer avoids $-pattern interpretation in the JSON payload; only the
+  // ARC-META comment changes, so all prose sections remain byte-identical.
+  const nextBlock = \`<!--ARC-META \${JSON.stringify(meta)} -->\`;
+  const next = raw.replace(ARC_META_RE, () => nextBlock);
+
+  const tmp = arcPath + '.wtmp-' + hex(4);
+  const fd = fs.openSync(tmp, 'wx');
+  fs.writeSync(fd, next); fs.fsyncSync(fd); fs.closeSync(fd);
+  fs.renameSync(tmp, arcPath);
+  out({ action: 'refreshed-arc', dir, last_refreshed_at: meta.last_refreshed_at, folder_mtime_ms: meta.source_cutoffs.folder_mtime_ms });
+}
+
 // ---------- dispatch ----------
 const argv = process.argv.slice(2);
 const cmd = argv[0];
@@ -6444,11 +6547,13 @@ switch (cmd) {
   case 'scaffold': cmdScaffold(args); break;
   case 'manifest': cmdManifest(args); break;
   case 'inspect': cmdInspect(args); break;
+  case 'refresh-arc': cmdRefreshArc(args); break;
   default:
-    die(2, \`usage: plan-manifest.mjs <scaffold|manifest|inspect> [flags]
-  scaffold --proposal <p.md> --plans-home <dir> [--request-id x] [--agent-id x] [--display x] [--slug x] [--date YYYY-MM-DD] [--verdict-line "..."]
-  manifest --dir <plan-folder> --append-responsibility --agent-id <id> [--display x] [--source manual-skill|promotion-service]
-  inspect  --dir <plan-folder>
+    die(2, \`usage: plan-manifest.mjs <scaffold|manifest|inspect|refresh-arc> [flags]
+  scaffold    --proposal <p.md> --plans-home <dir> [--request-id x] [--agent-id x] [--display x] [--slug x] [--date YYYY-MM-DD] [--verdict-line "..."]
+  manifest    --dir <plan-folder> --append-responsibility --agent-id <id> [--display x] [--source manual-skill|promotion-service]
+  inspect     --dir <plan-folder>
+  refresh-arc --dir <plan-folder>   (rewrites ONLY ARC.md's ARC-META block; prose untouched)
 lock tuning (manifest/scaffold): --max-wait-ms N --poll-ms N   |   exit codes: 2 usage · 3 collision · 4 lock-exhaustion\`);
 }
 `;
