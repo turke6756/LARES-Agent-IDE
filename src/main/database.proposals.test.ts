@@ -211,8 +211,8 @@ test('plans carries exactly the five WP-P2A columns (present + writable)', () =>
   for (const c of ['artifact_id', 'source_proposal_id', 'promoted_at', 'promoted_content_hash', 'folder_rel_path']) {
     assert.ok(cols.includes(c), `plans must have column ${c}`);
   }
-  // responsible_supervisor_id is P3A's, NOT this WP's.
-  assert.equal(cols.includes('responsible_supervisor_id'), false, 'responsible_supervisor_id belongs to P3A');
+  // responsible_supervisor_id is P3A's, added by its own inline FK — now landed.
+  assert.ok(cols.includes('responsible_supervisor_id'), 'responsible_supervisor_id belongs to P3A (landed)');
 });
 
 test('plans(workspace_id, artifact_id) partial unique index rejects a same-workspace collision', () => {
