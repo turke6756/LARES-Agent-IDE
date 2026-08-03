@@ -1833,6 +1833,93 @@ function initContextOptimizerSchema(): void {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_orchestrations_plan_intent
     ON orchestrations(plan_id, planning_intent_id)`);
 
+  // ── Planning-surface WP-P3A′ — responsibility + doc-link + tab-overview schema
+  //    + promotion_requests (§R-A2). Single A2-serialized DDL slot, rebased onto the
+  //    current initDatabase() head (immediately after the WP-P2L-schema plan_intents
+  //    block above). Established guarded-migration idiom: CREATE TABLE/INDEX IF NOT
+  //    EXISTS for tables/indexes, try/catch ALTER for the one column add (SQLite has
+  //    no portable ADD COLUMN IF NOT EXISTS). `plans` and `agents` were created in
+  //    the B2 region BEFORE this init runs, so every FK → plans(id)/agents(id) here
+  //    resolves. supervisor_focus keeps its existing cascade — NOT altered here. ──
+
+  // plans.responsible_supervisor_id — the plan's server-side responsible supervisor.
+  // Inline FK → agents(id) ON DELETE SET NULL (deleting the supervisor nulls the
+  // pointer, never the plan). Added ONLY here (P2A deliberately deferred it). Guarded
+  // ALTER; SQLite permits ADD COLUMN with an inline REFERENCES clause because the new
+  // column defaults to NULL. The SET NULL action fires only when foreign_keys is ON.
+  try { db.exec(`ALTER TABLE plans ADD COLUMN responsible_supervisor_id TEXT REFERENCES agents(id) ON DELETE SET NULL`); } catch { /* exists */ }
+
+  // supervisor_active_plan — at most one active plan per supervisor (supervisor_id is
+  // the PK). BOTH FKs cascade: deleting the supervisor OR the referenced plan removes
+  // the row (no dangling active-plan pointer survives either delete).
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS supervisor_active_plan (
+      supervisor_id  TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,
+      plan_id        TEXT NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+      activated_at   TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_supervisor_active_plan_plan ON supervisor_active_plan(plan_id)`);
+
+  // plan_documents — enrichment-time doc links, REL PATHS ONLY (no body column: the
+  // §R0 folder is the document set, never mirrored). §P3-GAP: P3 writes exactly ONE
+  // row per plan — the source proposal (doc_kind='proposal'). The doc_kind enum is
+  // fixed here; no selection field/table exists. Cascades away with its plan.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS plan_documents (
+      id           TEXT PRIMARY KEY,
+      plan_id      TEXT NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+      workspace_id TEXT NOT NULL,
+      doc_kind     TEXT NOT NULL,
+      rel_path     TEXT NOT NULL,
+      artifact_ref TEXT,
+      tab          TEXT,
+      sort_order   INTEGER NOT NULL DEFAULT 0,
+      created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+      CHECK (doc_kind IN ('proposal','deliberation','research','legacy-html'))
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_plan_documents_plan ON plan_documents(plan_id)`);
+
+  // plan_tab_overviews — per-tab overview body, revisioned. PK(plan_id, tab): one
+  // overview row per (plan, tab). Cascades away with its plan.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS plan_tab_overviews (
+      plan_id     TEXT NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+      tab         TEXT NOT NULL,
+      body        TEXT,
+      revision    INTEGER NOT NULL DEFAULT 1,
+      updated_by  TEXT,
+      created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (plan_id, tab)
+    )
+  `);
+
+  // promotion_requests (§R-A2 — frozen DDL; columns/constraints reproduced verbatim,
+  // not altered). The durable cross-restart de-dup seam is
+  // UNIQUE(workspace_id, proposal_artifact_id); CHECK(state) bounds the lifecycle set.
+  // created_at/updated_at are INTEGER epochs (service-owned, not datetime defaults).
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS promotion_requests (
+      id TEXT PRIMARY KEY,
+      workspace_id TEXT NOT NULL,
+      proposal_id TEXT NOT NULL,
+      proposal_artifact_id TEXT NOT NULL,
+      plan_artifact_id TEXT NOT NULL,
+      target_folder_rel_path TEXT NOT NULL,
+      supervisor_id TEXT,
+      orchestration_id TEXT,
+      state TEXT NOT NULL,
+      attempt_count INTEGER NOT NULL DEFAULT 0,
+      failure_reason TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      UNIQUE(workspace_id, proposal_artifact_id),
+      CHECK (state IN ('pending','adopted','failed'))
+    )
+  `);
+
   // WP-2B (Priority 0) — one-time, resumable workspace-lineage backfill. Populates
   // stream_lane_stats.workspace_id/workspace_root by folding each stream's launch cwd
   // to a root owned by EXACTLY one workspace. Idempotent (only NULL rows, ON a unique
