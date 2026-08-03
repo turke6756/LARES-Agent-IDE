@@ -1697,6 +1697,68 @@ function initContextOptimizerSchema(): void {
       ON package_finalizations(repository_key, package_id);
   `);
 
+  // Planning-surface WP-P2A — proposals registry table + plans folder/promotion
+  // columns + md-row policy. DDL-serialized in the NEXT serial slot after
+  // SC-WP-3A (plan_work_packages, §11) and SC-WP-3B (package_finalizations, §5)
+  // inside this optimizer-schema init. The `plans` table is created in the B2
+  // region of initDatabase() BEFORE this init runs, so the guarded ALTERs below
+  // resolve; the ALTERs use the try/catch idiom (SQLite has no ADD COLUMN IF NOT
+  // EXISTS). `responsible_supervisor_id` is deliberately NOT added here — it is
+  // P3A's, with its own inline FK.
+  //
+  // `proposals`: filesystem-owned artifacts (flat `.lares/proposals/*.md`) the DB
+  // INGESTS and enriches, never owns (§R0, ruling 10). Identity is
+  // (workspace_id, path); `artifact_id` is the portable frontmatter id, unique
+  // per workspace ONLY when present (partial index). `author_role` is
+  // witnessed-first — 'unknown' until an attribution witness proves otherwise.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS proposals (
+      id                   TEXT PRIMARY KEY,
+      artifact_id          TEXT,
+      workspace_id         TEXT NOT NULL,
+      path                 TEXT NOT NULL,
+      slug                 TEXT,
+      title                TEXT,
+      state                TEXT NOT NULL DEFAULT 'proposal',
+      author_agent_id      TEXT,
+      author_role          TEXT NOT NULL DEFAULT 'unknown',
+      author_display       TEXT,
+      authored_at          INTEGER,
+      created_at           INTEGER NOT NULL,
+      updated_at           INTEGER NOT NULL,
+      mtime_ms             INTEGER,
+      size_bytes           INTEGER,
+      promoted_to_plan_id  TEXT,
+      deleted_at           INTEGER,
+      UNIQUE(workspace_id, path),
+      CHECK (state IN ('proposal','promoted','archived')),
+      CHECK (author_role IN ('supervisor','worker','unknown'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_proposals_workspace ON proposals(workspace_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_proposals_artifact
+      ON proposals(workspace_id, artifact_id) WHERE artifact_id IS NOT NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_proposals_promoted_plan
+      ON proposals(promoted_to_plan_id) WHERE promoted_to_plan_id IS NOT NULL;
+  `);
+
+  // FIVE guarded plans columns (exactly five — no more): the promotion + folder
+  // linkage the P2/P3 pipeline enriches onto the structured plan row. All NULL for
+  // legacy/proposal-only rows. `folder_rel_path` is the workspace-relative path of
+  // the plan folder under <workspaceStateDir()>/plans/ (§R0), NULL for legacy HTML
+  // rows. Partial unique indexes enforce one-per-workspace identity only when the
+  // enriching value is present, so legacy NULL rows never collide.
+  try { db.exec(`ALTER TABLE plans ADD COLUMN artifact_id TEXT`); } catch { /* exists */ }
+  try { db.exec(`ALTER TABLE plans ADD COLUMN source_proposal_id TEXT`); } catch { /* exists */ }
+  try { db.exec(`ALTER TABLE plans ADD COLUMN promoted_at INTEGER`); } catch { /* exists */ }
+  try { db.exec(`ALTER TABLE plans ADD COLUMN promoted_content_hash TEXT`); } catch { /* exists */ }
+  try { db.exec(`ALTER TABLE plans ADD COLUMN folder_rel_path TEXT`); } catch { /* exists */ }
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_plans_artifact
+    ON plans(workspace_id, artifact_id) WHERE artifact_id IS NOT NULL`);
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_plans_source_proposal
+    ON plans(source_proposal_id) WHERE source_proposal_id IS NOT NULL`);
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_plans_folder_rel_path
+    ON plans(workspace_id, folder_rel_path) WHERE folder_rel_path IS NOT NULL`);
+
   // WP-2B (Priority 0) — one-time, resumable workspace-lineage backfill. Populates
   // stream_lane_stats.workspace_id/workspace_root by folding each stream's launch cwd
   // to a root owned by EXACTLY one workspace. Idempotent (only NULL rows, ON a unique
@@ -5053,6 +5115,102 @@ export function markPackageFinalizationCommitted(id: string, releasedAt: number)
       WHERE id = ?`,
     [releasedAt, id],
   );
+}
+
+// ── Planning-surface WP-P2A — proposals schema-layer primitives + md-row diag ──
+//
+// DDL-layer primitives ONLY: a plain insert, point/list reads, and the md-row
+// inventory diagnostic. The witnessed-attribution watcher (adopt/mint, duplicate/
+// malformed policy, dir-ensure) that COMPOSES these is WP-P2B, not this layer.
+
+export type ProposalState = 'proposal' | 'promoted' | 'archived';
+export type ProposalAuthorRole = 'supervisor' | 'worker' | 'unknown';
+
+export interface ProposalRecord {
+  id: string;
+  artifactId: string | null;
+  workspaceId: string;
+  path: string;
+  slug: string | null;
+  title: string | null;
+  state: ProposalState;
+  authorAgentId: string | null;
+  authorRole: ProposalAuthorRole;
+  authorDisplay: string | null;
+  authoredAt: number | null;
+  createdAt: number;
+  updatedAt: number;
+  mtimeMs: number | null;
+  sizeBytes: number | null;
+  promotedToPlanId: string | null;
+  deletedAt: number | null;
+}
+
+function rowToProposal(row: any): ProposalRecord {
+  return {
+    id: row.id,
+    artifactId: row.artifact_id ?? null,
+    workspaceId: row.workspace_id,
+    path: row.path,
+    slug: row.slug ?? null,
+    title: row.title ?? null,
+    state: row.state,
+    authorAgentId: row.author_agent_id ?? null,
+    authorRole: row.author_role,
+    authorDisplay: row.author_display ?? null,
+    authoredAt: row.authored_at ?? null,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    mtimeMs: row.mtime_ms ?? null,
+    sizeBytes: row.size_bytes ?? null,
+    promotedToPlanId: row.promoted_to_plan_id ?? null,
+    deletedAt: row.deleted_at ?? null,
+  };
+}
+
+/** Plain schema-layer insert of a fully-formed proposals row (throws on the
+ *  (workspace_id, path) or (workspace_id, artifact_id) uniqueness violation). The
+ *  attribution/adopt-or-mint policy lives in WP-P2B; this is the primitive it
+ *  builds on. */
+export function insertProposalRecord(rec: ProposalRecord): void {
+  run(
+    `INSERT INTO proposals (
+       id, artifact_id, workspace_id, path, slug, title, state,
+       author_agent_id, author_role, author_display, authored_at,
+       created_at, updated_at, mtime_ms, size_bytes, promoted_to_plan_id, deleted_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [rec.id, rec.artifactId, rec.workspaceId, rec.path, rec.slug, rec.title, rec.state,
+      rec.authorAgentId, rec.authorRole, rec.authorDisplay, rec.authoredAt,
+      rec.createdAt, rec.updatedAt, rec.mtimeMs, rec.sizeBytes, rec.promotedToPlanId,
+      rec.deletedAt],
+  );
+}
+
+export function getProposalByWorkspacePath(workspaceId: string, path: string): ProposalRecord | null {
+  const row = queryOne(
+    `SELECT * FROM proposals WHERE workspace_id = ? AND path = ?`,
+    [workspaceId, path],
+  );
+  return row ? rowToProposal(row) : null;
+}
+
+export function listProposalsByWorkspace(workspaceId: string): ProposalRecord[] {
+  return queryAll(
+    `SELECT * FROM proposals WHERE workspace_id = ? ORDER BY created_at, id`,
+    [workspaceId],
+  ).map(rowToProposal);
+}
+
+/** Diagnostic inventory count of legacy `plans(format='md')` rows. These stay
+ *  hidden preserved historical records — never shown as plans, never duplicated
+ *  into `proposals`. This count is the sole surface of their existence (WP-P2A
+ *  md-row policy). Counts every md row regardless of soft-deletion; pass a
+ *  workspaceId to scope. */
+export function countHiddenMdPlanRows(workspaceId?: string): number {
+  const row = workspaceId
+    ? queryOne(`SELECT COUNT(*) AS n FROM plans WHERE format = 'md' AND workspace_id = ?`, [workspaceId])
+    : queryOne(`SELECT COUNT(*) AS n FROM plans WHERE format = 'md'`);
+  return row ? Number(row.n) : 0;
 }
 
 /** Persist a commit and all of its exact evidence atomically. Replays are safe. */
