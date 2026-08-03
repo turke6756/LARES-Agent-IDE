@@ -44,6 +44,7 @@ import {
   LARES_DIR_NAME, LEGACY_LARES_DIR_NAME,
 } from '../../shared/constants';
 import { ensureAgyStatusHook } from './agy-hooks';
+import { ensureAgyPermissions, ensureAgyTrust } from './agy-settings';
 import { MEMORY_INDEX_MJS } from '../../shared/generated/memory-index-cli.generated';
 // WP-C — provider-neutral supervisor memory-index launch projection + Codex
 // pending-rail composition. The projection (readValidate + last-good/runtime
@@ -3692,14 +3693,18 @@ export class AgentSupervisor extends EventEmitter {
   }
 
   /** Seed the provider's user-global directory-trust list for the workspace
-   *  root + the agent's cwd, so a fresh workspace's first launch never hits an
+   *  root + agent cwd (or agy's probe-proven exact launch cwd), so a fresh launch never hits an
    *  interactive trust gate (Claude) or a silent trust-kill / skipped hook
    *  config (Codex — BUG-25 family). Idempotent and append/merge-only: existing
    *  entries and unrelated config are never rewritten. Best-effort — a failure
    *  here degrades to today's behavior (the CLI prompts or refuses). */
   private ensureProviderDirTrust(workDir: string, agentCwd: string, provider: string, pathType: string): void {
-    if (provider !== 'claude' && provider !== 'codex' && provider !== 'grok') return;  // gemini --yolo has no trust gate today
-    const dirs = agentCwd && agentCwd !== workDir ? [workDir, agentCwd] : [workDir];
+    if (provider !== 'claude' && provider !== 'codex' && provider !== 'grok' && provider !== 'agy') return;  // gemini --yolo has no trust gate today
+    // agy trust is exact and non-cascading: seed precisely the cwd spelling
+    // passed to its launch, with no grok-style git-root collapse or aliases.
+    const dirs = provider === 'agy'
+      ? [agentCwd]
+      : agentCwd && agentCwd !== workDir ? [workDir, agentCwd] : [workDir];
     const cacheKey = `${pathType}|${provider}|${dirs.join('|')}`;
     if (this.providerTrustEnsured.has(cacheKey)) return;
     try {
@@ -3707,6 +3712,24 @@ export class AgentSupervisor extends EventEmitter {
         this.ensureCodexProjectTrust(dirs, pathType);
       } else if (provider === 'grok') {
         this.ensureGrokTrust(dirs, pathType);
+      } else if (provider === 'agy') {
+        if (pathType !== 'windows') return;  // WSL agy is refused before launch
+        const home = process.env.USERPROFILE || process.env.HOME;
+        // Keep the two independent: an I/O failure in trust seeding must not
+        // prevent the native deny seed (and vice versa), and neither blocks launch.
+        for (const [label, ensure] of [
+          ['trust', () => ensureAgyTrust(home, dirs, pathType)],
+          ['permissions', () => ensureAgyPermissions(home)],
+        ] as const) {
+          try {
+            const result = ensure();
+            if (result.action === 'invalid') {
+              console.warn(`[supervisor] refusing to replace malformed agy settings ${result.settingsPath}: ${result.reason}`);
+            }
+          } catch (err) {
+            console.warn(`[supervisor] ensureAgy ${label} seed failed (launch continues):`, err);
+          }
+        }
       } else {
         this.ensureClaudeProjectTrust(dirs, pathType);
       }

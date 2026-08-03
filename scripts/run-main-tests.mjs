@@ -262,6 +262,9 @@ const TESTS = [
   'dist/main/main/supervisor/legacy-state-dir-heal.test.js',
   'dist/main/main/supervisor/supervisor-persona-capability-parity.test.js',
   'dist/main/main/supervisor/provider-dir-trust.test.js',
+  // Antigravity provider lane Phase 3: raw exact trust keys + add-only native
+  // regex permissions merge and atomic settings.json wrappers.
+  'dist/main/main/supervisor/agy-settings.test.js',
   // Grok provider lane Phase 3: grokTrustPathKey (canonical git-root key) +
   // mergeGrokFolderTrust (line-aware trusted_folders.toml merge).
   'dist/main/main/supervisor/grok-trust.test.js',
