@@ -11,12 +11,106 @@ import { ipcMain } from 'electron';
 import type { Rectangle } from 'electron';
 import type { PlanPaneManager } from './plan-pane-manager';
 import type { PlanListItem, PathType } from '../../shared/types';
-import { getPlans } from '../database';
+import { getPlans, getPlanWorkPackage as dbGetPlanWorkPackage } from '../database';
+import type { PlanWorkPackage } from '../database';
 import { resolvePlanProjection, buildPlanActivityProjection } from '../api-server';
 import { derivePlanSnippet } from './plan-snippet';
 import { listPlanningEntries, readPlanningDocument } from './planning-reader';
 import { buildPlanGallery, readProposalDocument } from './plan-gallery';
 import type { PlanGalleryOptions } from '../../shared/types';
+import {
+  finalizePackage,
+  type FinalizePackageResult,
+} from '../commit-candidates/finalization-service';
+import type { CommitRepresentationEntry } from '../commit-candidates/commit-representation';
+
+// ── Save-card SC-WP-3D — plan-package `done` finalization wiring ──────────────
+//
+// An explicit plan-item `done` transition mints a `finalization_kind='plan-package'`
+// finalization via the WP-3C service. The service does the crash-safe work: it
+// freezes the member manifest, force-creates the durable boundary ref, records the
+// `package_finalizations` row, AND flips `plan_work_packages.state='done'` inside the
+// SAME SQLite txn — so `done` never appears without a `ready` finalization. This is
+// the ONLY producer of a plan-package boundary; it is never auto-derived from
+// `accepted`. WP-3D is wiring only: the caller (WP-3G candidate assembly) supplies the
+// already-computed boundary OID and the members to freeze — this layer forwards them,
+// it never computes eligibility.
+
+/** Stable package identity for a plan work package's finalization boundary. The WP-3C
+ *  service keys revisions and the durable ref on `packageId`, so it MUST be a pure
+ *  function of the item id — never the workspace, the boundary oid, or a timestamp —
+ *  so re-finalizing the same item resolves to the same package and bumps a revision. */
+export function planPackageId(planItemId: string): string {
+  return `plan-package:${planItemId}`;
+}
+
+export interface FinalizePlanItemDoneRequest {
+  /** The plan work package being marked done. Its row supplies planId + workspace. */
+  planItemId: string;
+  repositoryKey: string;
+  /** The computed boundary OID (`checkpoint_oid`) + the members to freeze — supplied
+   *  by the caller (WP-3G); WP-3D forwards, it never computes them. */
+  boundaryOid: string;
+  members: CommitRepresentationEntry[];
+  checkpointTurnId: string | null;
+  finalizedBy: string;
+  /** Overrides the work package's own workspace as the finalize provenance; null ⇒
+   *  the work package's `workspaceId` is used. */
+  createdFromWorkspaceId?: string | null;
+  contractVersion: number;
+  // ── freeze inputs (temp-index base + git seam) ──
+  repoRoot: string;
+  pinnedHeadOid: string | null;
+  gitExe?: string;
+  deadlineAt?: number;
+}
+
+export interface FinalizePlanItemDoneDeps {
+  getPlanWorkPackage?: (id: string) => PlanWorkPackage | null;
+  finalize?: (
+    ...args: Parameters<typeof finalizePackage>
+  ) => ReturnType<typeof finalizePackage>;
+}
+
+/**
+ * Explicit plan-item `done` transition → a `plan-package` finalization via WP-3C.
+ * Looks up the work package to derive its `planId` (and default workspace), then calls
+ * the finalization service with `finalizationKind='plan-package'`. Throws if the item
+ * does not exist — a `done` transition on an unknown package is a caller bug, and the
+ * work-package flip to `done` happens INSIDE the service's txn, not here.
+ */
+export async function finalizePlanItemDone(
+  request: FinalizePlanItemDoneRequest,
+  deps: FinalizePlanItemDoneDeps = {},
+): Promise<FinalizePackageResult> {
+  const getPkg = deps.getPlanWorkPackage ?? dbGetPlanWorkPackage;
+  const finalize = deps.finalize ?? finalizePackage;
+
+  const pkg = getPkg(request.planItemId);
+  if (!pkg) {
+    throw new Error(
+      `cannot finalize plan-package done: no plan work package ${request.planItemId}`,
+    );
+  }
+
+  return finalize({
+    packageId: planPackageId(pkg.id),
+    repositoryKey: request.repositoryKey,
+    finalizationKind: 'plan-package',
+    planId: pkg.planId,
+    planItemId: pkg.id,
+    finalizedBy: request.finalizedBy,
+    checkpointTurnId: request.checkpointTurnId,
+    boundaryOid: request.boundaryOid,
+    contractVersion: request.contractVersion,
+    createdFromWorkspaceId: request.createdFromWorkspaceId ?? pkg.workspaceId,
+    members: request.members,
+    repoRoot: request.repoRoot,
+    pinnedHeadOid: request.pinnedHeadOid,
+    gitExe: request.gitExe,
+    deadlineAt: request.deadlineAt,
+  });
+}
 
 export function registerPlanIpc(manager: PlanPaneManager): void {
   // ── WP-P1A: planning-reader (read-only fs enumeration + safe read) ──────────
@@ -63,6 +157,18 @@ export function registerPlanIpc(manager: PlanPaneManager): void {
       return { error: 'missing proposal id' };
     }
     return readProposalDocument(proposalId);
+  });
+
+  // ── SC-WP-3D: plan-package `done` transition → finalization ─────────────────
+  // The renderer's explicit `done` gesture mints a plan-package finalization through
+  // the WP-3C service (which also flips the work package to `done` in the same txn).
+  // The channel is a thin transport around `finalizePlanItemDone`; the boundary OID
+  // and members are computed upstream (WP-3G) and carried in the request.
+  ipcMain.handle('plan:finalizeItemDone', async (_e, request: FinalizePlanItemDoneRequest) => {
+    if (!request || typeof request.planItemId !== 'string' || !request.planItemId) {
+      return { error: 'missing plan item id' };
+    }
+    return finalizePlanItemDone(request);
   });
 
   // Plan list for the "Plans" card gallery (workspace-scoped). Each row carries a
