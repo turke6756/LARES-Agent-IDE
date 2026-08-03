@@ -8,6 +8,7 @@
 // Add new main-process test files to TESTS below.
 
 import { spawnSync } from 'node:child_process'
+import path from 'node:path'
 
 const TESTS = [
   'dist/main/shared/notification-classify.test.js',
@@ -81,6 +82,7 @@ const TESTS = [
   'dist/main/main/supervisor/log-readers/codex-rollout-reader.test.js',
   'dist/main/main/supervisor/log-readers/gemini-transcript-reader.test.js',
   'dist/main/main/supervisor/log-readers/grok-session-reader.test.js',
+  'dist/main/main/supervisor/log-readers/agy-session-reader.test.js',
   'dist/main/main/supervisor/log-readers/wsl-base-dir-lazy.test.js',
   'dist/main/main/supervisor/event-bridge.test.js',
   'dist/main/main/supervisor/event-bridge.integration.test.js',
@@ -562,8 +564,18 @@ const TESTS = [
 ]
 
 let failed = null
+const electronRuntime = path.resolve(
+  'node_modules', 'electron', 'dist', process.platform === 'win32' ? 'electron.exe' : 'electron'
+)
 for (const file of TESTS) {
-  const r = spawnSync(process.execPath, [file], { stdio: 'inherit' })
+  // The agy reader exercises production's better-sqlite3 binding, which is
+  // compiled for Electron's ABI. Run that suite with the bundled Electron in
+  // Node mode; every JS-only main test keeps the faster host-Node path.
+  const nativeElectronTest = file.endsWith('/agy-session-reader.test.js')
+  const r = spawnSync(nativeElectronTest ? electronRuntime : process.execPath, [file], {
+    stdio: 'inherit',
+    env: nativeElectronTest ? { ...process.env, ELECTRON_RUN_AS_NODE: '1' } : process.env,
+  })
   if (r.status !== 0) {
     failed = file
     break

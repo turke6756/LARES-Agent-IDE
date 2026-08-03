@@ -143,6 +143,7 @@ import { computeAwaitingHuman, buildContinuationKickoffMessage, type Continuatio
 import { CodexRolloutReader } from './log-readers/codex-rollout-reader';
 import { GeminiTranscriptReader } from './log-readers/gemini-transcript-reader';
 import { GrokSessionReader } from './log-readers/grok-session-reader';
+import { AgySessionReader } from './log-readers/agy-session-reader';
 import { AgentChatService } from './agent-chat-service';
 import {
   snapshotCodexSessions,
@@ -2045,7 +2046,7 @@ export class AgentSupervisor extends EventEmitter {
     this.sessionLogReader = new SessionLogReader(() => {
       const agents = getActiveAgents();
       return agents
-        .filter(a => a.resumeSessionId || a.provider === 'codex' || a.provider === 'gemini' || a.provider === 'grok')
+        .filter(a => a.resumeSessionId || a.provider === 'codex' || a.provider === 'gemini' || a.provider === 'grok' || a.provider === 'agy')
         .map(a => ({
           agentId: a.id,
           sessionId: a.resumeSessionId || '',
@@ -2062,6 +2063,7 @@ export class AgentSupervisor extends EventEmitter {
     this.sessionLogReader.register(new CodexRolloutReader());
     this.sessionLogReader.register(new GeminiTranscriptReader());
     this.sessionLogReader.register(new GrokSessionReader());
+    this.sessionLogReader.register(new AgySessionReader());
     this.sessionLogReader.on('chat-events', (batch) => {
       // Phase 5A — the `endsWithQuestion` verdict no longer feeds the
       // awaiting-human gate (a merely-idle question-ending turn is available).
