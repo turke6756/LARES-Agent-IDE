@@ -1648,6 +1648,55 @@ function initContextOptimizerSchema(): void {
     CREATE INDEX IF NOT EXISTS idx_plan_work_packages_plan ON plan_work_packages(plan_id);
   `);
 
+  // Save-card SC-WP-3B — package_finalizations (§5 of the shared bundle contract):
+  // the finalization boundary frozen by an explicit human/supervisor plan-package
+  // `done` transition or a DISTINCT fleet-adhoc mark-done/mint step. No boundary is
+  // ever auto-derived from `accepted`. `member_manifest_json` freezes the per-path
+  // manifest (raw --no-filters + clean-filtered) at finalize time; `boundary_ref` is
+  // the durable Lares ref retention treats as protected while lifecycle_status='active'.
+  // WP-3B lands only the schema + lifecycle accessors; the ordering/re-finalization/
+  // restart SERVICE is WP-3C. The plan-item revision uniqueness is partial (plan-package
+  // only) so fleet-adhoc rows (plan_item_id NULL) never contend on it.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS package_finalizations (
+      id TEXT PRIMARY KEY,
+      package_id TEXT NOT NULL,
+      repository_key TEXT NOT NULL,
+      finalization_kind TEXT NOT NULL,
+      plan_id TEXT,
+      plan_item_id TEXT,
+      package_revision INTEGER NOT NULL,
+      finalized_at INTEGER NOT NULL,
+      finalized_by TEXT NOT NULL,
+      checkpoint_turn_id TEXT,
+      checkpoint_oid TEXT,
+      boundary_ref TEXT,
+      boundary_status TEXT NOT NULL,
+      lifecycle_status TEXT NOT NULL,
+      superseded_by_finalization_id TEXT,
+      released_at INTEGER,
+      member_manifest_json TEXT NOT NULL,
+      contract_version INTEGER NOT NULL,
+      failure_reason TEXT,
+      created_from_workspace_id TEXT,
+      CHECK (finalization_kind IN ('plan-package','fleet-adhoc')),
+      CHECK (boundary_status IN ('ready','unavailable','pruned')),
+      CHECK (lifecycle_status IN ('active','superseded','committed','abandoned')),
+      CHECK (package_revision > 0),
+      CHECK (
+        (finalization_kind='plan-package' AND plan_id IS NOT NULL AND plan_item_id IS NOT NULL)
+        OR
+        (finalization_kind='fleet-adhoc'  AND plan_id IS NULL AND plan_item_id IS NULL)
+      )
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_package_finalizations_revision
+      ON package_finalizations(package_id, package_revision);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_package_finalizations_plan_revision
+      ON package_finalizations(plan_item_id, package_revision) WHERE finalization_kind = 'plan-package';
+    CREATE INDEX IF NOT EXISTS idx_package_finalizations_repo
+      ON package_finalizations(repository_key, package_id);
+  `);
+
   // WP-2B (Priority 0) — one-time, resumable workspace-lineage backfill. Populates
   // stream_lane_stats.workspace_id/workspace_root by folding each stream's launch cwd
   // to a root owned by EXACTLY one workspace. Idempotent (only NULL rows, ON a unique
@@ -4846,6 +4895,164 @@ export function planItemInPlan(workspaceId: string, planId: string, planItemId: 
     [planItemId, workspaceId, planId],
   );
   return row !== null;
+}
+
+// ── Save-card SC-WP-3B — package_finalizations schema types + lifecycle accessors ──
+//
+// DB-layer primitives only: insert, point/latest reads, revision high-water mark, and
+// the single-row lifecycle transitions (supersede / boundary-status / committed-release).
+// The ordering, JCS re-finalization comparison, ref creation, and restart reconciler
+// that COMPOSE these primitives are WP-3C's finalization service, not this layer.
+
+export type FinalizationKind = 'plan-package' | 'fleet-adhoc';
+export type FinalizationBoundaryStatus = 'ready' | 'unavailable' | 'pruned';
+export type FinalizationLifecycleStatus =
+  | 'active' | 'superseded' | 'committed' | 'abandoned';
+
+export interface PackageFinalization {
+  id: string;
+  packageId: string;
+  repositoryKey: string;
+  finalizationKind: FinalizationKind;
+  planId: string | null;
+  planItemId: string | null;
+  packageRevision: number;
+  finalizedAt: number;
+  finalizedBy: string;
+  checkpointTurnId: string | null;
+  checkpointOid: string | null;
+  boundaryRef: string | null;
+  boundaryStatus: FinalizationBoundaryStatus;
+  lifecycleStatus: FinalizationLifecycleStatus;
+  supersededByFinalizationId: string | null;
+  releasedAt: number | null;
+  memberManifestJson: string;
+  contractVersion: number;
+  failureReason: string | null;
+  createdFromWorkspaceId: string | null;
+}
+
+function rowToPackageFinalization(row: any): PackageFinalization {
+  return {
+    id: row.id,
+    packageId: row.package_id,
+    repositoryKey: row.repository_key,
+    finalizationKind: row.finalization_kind,
+    planId: row.plan_id ?? null,
+    planItemId: row.plan_item_id ?? null,
+    packageRevision: row.package_revision,
+    finalizedAt: row.finalized_at,
+    finalizedBy: row.finalized_by,
+    checkpointTurnId: row.checkpoint_turn_id ?? null,
+    checkpointOid: row.checkpoint_oid ?? null,
+    boundaryRef: row.boundary_ref ?? null,
+    boundaryStatus: row.boundary_status,
+    lifecycleStatus: row.lifecycle_status,
+    supersededByFinalizationId: row.superseded_by_finalization_id ?? null,
+    releasedAt: row.released_at ?? null,
+    memberManifestJson: row.member_manifest_json,
+    contractVersion: row.contract_version,
+    failureReason: row.failure_reason ?? null,
+    createdFromWorkspaceId: row.created_from_workspace_id ?? null,
+  };
+}
+
+/**
+ * Insert a finalization row. Insert-only (no upsert): a re-finalization allocates a NEW
+ * `package_revision` under the same `package_id` (WP-3C), so a duplicate `id` or a
+ * duplicate `(package_id, package_revision)` is a caller bug the unique indexes reject.
+ */
+export function insertPackageFinalization(f: PackageFinalization): void {
+  run(
+    `INSERT INTO package_finalizations (
+       id, package_id, repository_key, finalization_kind, plan_id, plan_item_id,
+       package_revision, finalized_at, finalized_by, checkpoint_turn_id, checkpoint_oid,
+       boundary_ref, boundary_status, lifecycle_status, superseded_by_finalization_id,
+       released_at, member_manifest_json, contract_version, failure_reason,
+       created_from_workspace_id
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [f.id, f.packageId, f.repositoryKey, f.finalizationKind, f.planId, f.planItemId,
+      f.packageRevision, f.finalizedAt, f.finalizedBy, f.checkpointTurnId, f.checkpointOid,
+      f.boundaryRef, f.boundaryStatus, f.lifecycleStatus, f.supersededByFinalizationId,
+      f.releasedAt, f.memberManifestJson, f.contractVersion, f.failureReason,
+      f.createdFromWorkspaceId],
+  );
+}
+
+export function getPackageFinalization(id: string): PackageFinalization | null {
+  const row = queryOne(`SELECT * FROM package_finalizations WHERE id = ?`, [id]);
+  return row ? rowToPackageFinalization(row) : null;
+}
+
+/** All finalization revisions for a stable package, newest revision first. */
+export function listPackageFinalizations(packageId: string): PackageFinalization[] {
+  return queryAll(
+    `SELECT * FROM package_finalizations WHERE package_id = ?
+      ORDER BY package_revision DESC`,
+    [packageId],
+  ).map(rowToPackageFinalization);
+}
+
+/**
+ * The current `active` finalization for a package, if any. The `(package_id,
+ * package_revision)` unique index plus the supersede-on-refinalize discipline (WP-3C)
+ * keep at most one row `active`; this returns the highest-revision such row defensively.
+ */
+export function getActivePackageFinalization(packageId: string): PackageFinalization | null {
+  const row = queryOne(
+    `SELECT * FROM package_finalizations
+      WHERE package_id = ? AND lifecycle_status = 'active'
+      ORDER BY package_revision DESC LIMIT 1`,
+    [packageId],
+  );
+  return row ? rowToPackageFinalization(row) : null;
+}
+
+/** Highest allocated revision for a package (0 when none) — WP-3C's `max+1` source. */
+export function maxPackageRevision(packageId: string): number {
+  const row = queryOne(
+    `SELECT MAX(package_revision) AS mx FROM package_finalizations WHERE package_id = ?`,
+    [packageId],
+  );
+  return (row?.mx as number | null) ?? 0;
+}
+
+/**
+ * Supersede one active finalization by a newer one, atomically. The prior row flips to
+ * `lifecycle_status='superseded'` and records `superseded_by_finalization_id`; used by
+ * WP-3C inside the same SQLite txn that inserts the superseding row.
+ */
+export function supersedePackageFinalization(id: string, supersededBy: string): void {
+  run(
+    `UPDATE package_finalizations
+        SET lifecycle_status = 'superseded', superseded_by_finalization_id = ?
+      WHERE id = ?`,
+    [supersededBy, id],
+  );
+}
+
+/** Set the boundary status (e.g. downgrade a stale `ready` ref to `unavailable`/`pruned`). */
+export function setPackageFinalizationBoundaryStatus(
+  id: string, status: FinalizationBoundaryStatus,
+): void {
+  run(
+    `UPDATE package_finalizations SET boundary_status = ? WHERE id = ?`,
+    [status, id],
+  );
+}
+
+/**
+ * Close a finalization: transition `lifecycle_status='committed'` and stamp `released_at`
+ * (releasing the durable `boundary_ref` for retention). The closure PROOF over the full
+ * manifest lives in WP-3C/retention; this is the row-level commit of that decision.
+ */
+export function markPackageFinalizationCommitted(id: string, releasedAt: number): void {
+  run(
+    `UPDATE package_finalizations
+        SET lifecycle_status = 'committed', released_at = ?
+      WHERE id = ?`,
+    [releasedAt, id],
+  );
 }
 
 /** Persist a commit and all of its exact evidence atomically. Replays are safe. */
