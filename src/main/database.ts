@@ -2509,6 +2509,108 @@ function hardDeletePlanRow(id: string): void {
   run('DELETE FROM plans WHERE id = ?', [id]);
 }
 
+// ── WP-P2B-folder — structured plan-folder adoption (§R0) ─────────────────────
+// The folder watcher ADOPTS a §R0 plan folder into a `plans` row keyed by the
+// disk-truth `plan.json.plan_artifact_id`. These accessors use ONLY the WP-P2A
+// columns (`artifact_id`, `folder_rel_path`); they write NO `author_*` (those
+// columns do not exist on `plans`) and NEVER touch the P3-owned enrichment
+// columns (`source_proposal_id`, `promoted_at`, `promoted_content_hash`, and the
+// P3A `responsible_supervisor_id`). Convergence with P3: the
+// (workspace_id, artifact_id) partial unique index makes the adopted row the
+// EXACT row P3 later enriches.
+
+/** A plan row surfaced WITH the WP-P2A columns `rowToPlan` drops. Only the fields
+ *  the folder-adoption path needs. */
+export interface StructuredPlanRow {
+  id: string;
+  workspaceId: string;
+  artifactId: string | null;
+  folderRelPath: string | null;
+  path: string;
+  format: string;
+  runState: string | null;
+  mtimeMs: number;
+  sizeBytes: number;
+  deletedAt: string | null;
+}
+
+function rowToStructuredPlan(row: any): StructuredPlanRow {
+  return {
+    id: row.id,
+    workspaceId: row.workspace_id,
+    artifactId: row.artifact_id ?? null,
+    folderRelPath: row.folder_rel_path ?? null,
+    path: row.path,
+    format: row.format,
+    runState: row.run_state ?? null,
+    mtimeMs: row.mtime_ms,
+    sizeBytes: row.size_bytes,
+    deletedAt: row.deleted_at ?? null,
+  };
+}
+
+/** Point read of a plan row by its disk-truth `plan_artifact_id` (workspace-
+ *  scoped), surfacing the WP-P2A columns `rowToPlan` drops so the adopt path can
+ *  stay idempotent. INCLUDES soft-deleted rows so a folder that reappears after a
+ *  transient absence revives its existing row rather than minting a new id. */
+export function getPlanByWorkspaceArtifactId(workspaceId: string, artifactId: string): StructuredPlanRow | null {
+  const row = queryOne(
+    `SELECT * FROM plans WHERE workspace_id = ? AND artifact_id = ?`,
+    [workspaceId, artifactId],
+  );
+  return row ? rowToStructuredPlan(row) : null;
+}
+
+export interface AdoptStructuredPlanInput {
+  workspaceId: string;
+  /** disk-truth `plan.json.plan_artifact_id` — the adoption key. */
+  artifactId: string;
+  /** workspace-relative path of the plan FOLDER under <workspaceStateDir()>/plans/. */
+  folderRelPath: string;
+  /** workspace-relative path of the folder's `plan.md` (the row's `path`). */
+  planPath: string;
+  mtimeMs: number;
+  sizeBytes: number;
+}
+
+export type StructuredPlanChange = 'adopted' | 'revived' | 'changed' | 'unchanged';
+
+/** Idempotent adopt of a §R0 plan folder keyed by (workspace_id, artifact_id).
+ *  INSERT mints a fresh uuid with `format='structured'` / `run_state='hardening'`.
+ *  A later adopt of the same artifact refreshes ONLY the folder/path/fs columns
+ *  (and REVIVES a soft-deleted row), never `run_state` and never a P3-owned
+ *  enrichment column. Returns the resolved row id + what changed. Throws on a
+ *  genuine constraint violation (a foreign path/folder collision) — the caller
+ *  quarantines with a diagnostic. */
+export function adoptStructuredPlan(input: AdoptStructuredPlanInput): { planId: string; change: StructuredPlanChange } {
+  const existing = getPlanByWorkspaceArtifactId(input.workspaceId, input.artifactId);
+  if (existing) {
+    const revived = existing.deletedAt != null;
+    const metaChanged =
+      existing.folderRelPath !== input.folderRelPath ||
+      existing.path !== input.planPath ||
+      existing.mtimeMs !== input.mtimeMs ||
+      existing.sizeBytes !== input.sizeBytes;
+    if (revived || metaChanged) {
+      run(
+        `UPDATE plans SET folder_rel_path = ?, path = ?, format = 'structured',
+                mtime_ms = ?, size_bytes = ?, deleted_at = NULL, updated_at = datetime('now')
+           WHERE id = ?`,
+        [input.folderRelPath, input.planPath, input.mtimeMs, input.sizeBytes, existing.id],
+      );
+    }
+    return { planId: existing.id, change: revived ? 'revived' : metaChanged ? 'changed' : 'unchanged' };
+  }
+  const id = uuidv4();
+  const slug = derivePlanSlug(input.folderRelPath);
+  run(
+    `INSERT INTO plans (id, workspace_id, path, slug, format, run_state, mtime_ms, size_bytes, artifact_id, folder_rel_path)
+     VALUES (?, ?, ?, ?, 'structured', 'hardening', ?, ?, ?, ?)`,
+    [id, input.workspaceId, input.planPath, slug, input.mtimeMs, input.sizeBytes, input.artifactId, input.folderRelPath],
+  );
+  return { planId: id, change: 'adopted' };
+}
+
 // ── B2: Supervisor focus (P1-03 data surface) ──
 
 type FocusInput = { supervisorId: string; planId: string; notes?: string | null };

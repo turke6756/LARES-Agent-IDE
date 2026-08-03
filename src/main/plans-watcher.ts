@@ -11,6 +11,22 @@
 // constructor dependency, not a hard import — the watcher runs callback-less
 // (pure B2 behavior) until WP4 wires `reparsePlanFile`, so the two workstreams
 // ship independently.
+//
+// ── WP-P2B-folder: TWO ROOTS, one ownership module ───────────────────────────
+// This watcher now owns TWO plan roots per workspace, enumerated independently:
+//   1. LEGACY `<workspace>/plans/` — flat HTML/markdown, behavior UNCHANGED
+//      (the reconcile pipeline above; `onPlanSettled`).
+//   2. NEW `<workspaceStateDir()>/plans/` — STRUCTURED §R0 plan directories,
+//      adopted by `PlanFolderWatcher` (src/main/plans/plan-folder-watcher.ts).
+// The new root is watched RECURSIVELY via bounded child subscriptions (fs-watcher
+// is depth:0), one per valid folder + its `deliberations/`/`research/`/
+// `supplements/` subdirs, so nested `plan.md`/output edits are observed. The
+// state-dir plans home is ENSURED on init (works without a supervisor launch),
+// and a periodic full reconciliation is the backstop for late-validity folders
+// and folders beyond the child-sub cap (`degraded-watch`). The
+// `onPlanFolderSettled(planId, folderRelPath, changeKind)` seam is a constructor
+// dependency (callback-less until P2L wires it); this module imports nothing
+// from P2L.
 
 import crypto from 'crypto';
 import fs from 'fs';
@@ -21,6 +37,10 @@ import {
   getWorkspaces, createOrRevivePlan, updatePlan, softDeletePlan,
   getPlanByWorkspacePath, derivePlanSlug, getPlans, getPlan,
 } from './database';
+import {
+  PlanFolderWatcher, PLAN_FOLDER_OUTPUT_SUBDIRS,
+  type PlanFolderWatcherOptions,
+} from './plans/plan-folder-watcher';
 
 const PLANS_SUBDIR = 'plans';
 const PLAN_EXT = /\.(html?|md|markdown)$/i;
@@ -44,6 +64,15 @@ export interface PlansWatcherOptions {
    *  `data-plan-id`. Injectable for tests; defaults to a Windows fs read+write
    *  (WSL write is deferred, matching WP4's backfill policy). */
   patchPlanId?: (ws: Workspace, relPath: string, planId: string) => Promise<boolean>;
+
+  /** WP-P2B-folder: fired AFTER a §R0 structured plan folder's live `plans` row is
+   *  resolved (adopt/change), NEVER on removal. Constructor dependency — P2L
+   *  registers its intent-ledger scanner here later; callback-less until wired. */
+  onPlanFolderSettled?: PlanFolderWatcherOptions['onPlanFolderSettled'];
+  /** Max structured folders with live child subscriptions (default 64). Folders
+   *  beyond the cap are adopted + kept current by periodic reconciliation with a
+   *  surfaced `degraded-watch` diagnostic — never silently frozen. */
+  folderChildSubCap?: number;
 }
 
 /** Extract a `data-plan-id="…"` value from plan HTML (adoption identity, C6). */
@@ -201,6 +230,18 @@ type WorkspaceState = {
   debounce: ReturnType<typeof setTimeout> | null;
 };
 
+/** Per-workspace state for the NEW state-dir plans root (structured folders).
+ *  Holds the root subscription PLUS one bounded child-subscription bundle per
+ *  watchable folder (the folder dir + its output subdirs). */
+type FolderRootState = {
+  ws: Workspace;
+  home: string;
+  rootUnsubscribe: () => void;
+  /** folderRelPath → the folder's child subscription teardowns. */
+  childSubs: Map<string, Array<() => void>>;
+  debounce: ReturnType<typeof setTimeout> | null;
+};
+
 function log(msg: string, err?: unknown): void {
   if (err !== undefined) console.error(`[plans-watcher] ${msg}`, err);
   else console.log(`[plans-watcher] ${msg}`);
@@ -208,10 +249,17 @@ function log(msg: string, err?: unknown): void {
 
 export class PlansWatcher {
   private states = new Map<string, WorkspaceState>();
+  private folderStates = new Map<string, FolderRootState>();
   private refreshTimer: ReturnType<typeof setInterval> | null = null;
   private started = false;
+  private readonly folderWatcher: PlanFolderWatcher;
 
-  constructor(private readonly opts: PlansWatcherOptions = {}) {}
+  constructor(private readonly opts: PlansWatcherOptions = {}) {
+    this.folderWatcher = new PlanFolderWatcher({
+      onPlanFolderSettled: opts.onPlanFolderSettled,
+      childSubCap: opts.folderChildSubCap,
+    });
+  }
 
   start(): void {
     if (this.started) return;
@@ -228,28 +276,111 @@ export class PlansWatcher {
       try { st.unsubscribe(); } catch { /* ignore */ }
     }
     this.states.clear();
+    for (const fst of this.folderStates.values()) {
+      if (fst.debounce) clearTimeout(fst.debounce);
+      try { fst.rootUnsubscribe(); } catch { /* ignore */ }
+      for (const teardown of fst.childSubs.values()) {
+        for (const unsub of teardown) { try { unsub(); } catch { /* ignore */ } }
+      }
+    }
+    this.folderStates.clear();
   }
 
-  /** (Re)attach a watcher for every workspace whose `plans/` dir exists but is
-   *  not yet watched. Never creates `plans/` as a side effect. */
+  /** (Re)attach BOTH roots for every workspace. The legacy `plans/` root only
+   *  attaches when its dir exists (never created as a side effect); the state-dir
+   *  plans home is ENSURED and attached independently, so a workspace with only
+   *  structured folders — or none yet — is still watched. */
   private async attachAll(isBoot: boolean): Promise<void> {
     let workspaces: Workspace[];
     try { workspaces = getWorkspaces(); } catch (err) { log('getWorkspaces failed', err); return; }
     for (const ws of workspaces) {
-      if (this.states.has(ws.id)) continue;
-      const plansDir = plansDirFor(ws);
-      if (!dirExists(ws, plansDir)) continue;
-      const state: WorkspaceState = {
-        ws, plansDir, snapshots: new Map(), pending: new Map(),
-        unsubscribe: () => {}, debounce: null,
+      // ── Legacy root (unchanged; gated on existence) ──
+      if (!this.states.has(ws.id)) {
+        const plansDir = plansDirFor(ws);
+        if (dirExists(ws, plansDir)) {
+          const state: WorkspaceState = {
+            ws, plansDir, snapshots: new Map(), pending: new Map(),
+            unsubscribe: () => {}, debounce: null,
+          };
+          this.states.set(ws.id, state);
+          // Boot reconcile BEFORE subscribing so the initial listing seeds snapshots.
+          try { await this.reconcileWorkspace(ws, isBoot); }
+          catch (err) { log(`boot reconcile failed for ${ws.id}`, err); }
+          try {
+            state.unsubscribe = subscribe(plansDir, ws.pathType, () => this.scheduleReconcile(ws.id));
+          } catch (err) { log(`subscribe failed for ${ws.id}`, err); }
+        }
+      }
+      // ── New state-dir plans root (ensured; attached independently) ──
+      if (!this.folderStates.has(ws.id)) {
+        await this.attachFolderRoot(ws, isBoot);
+      }
+    }
+  }
+
+  /** Ensure + attach the state-dir plans home for one workspace: boot reconcile
+   *  (adopt existing folders) before subscribing to the root, then sync the
+   *  bounded child subscriptions from the reconcile result. */
+  private async attachFolderRoot(ws: Workspace, isBoot: boolean): Promise<void> {
+    const home = this.folderWatcher.plansHome(ws);
+    ensureDir(ws, home);
+    const fst: FolderRootState = {
+      ws, home, rootUnsubscribe: () => {}, childSubs: new Map(), debounce: null,
+    };
+    this.folderStates.set(ws.id, fst);
+    try { await this.reconcileFolderRoot(ws, isBoot); }
+    catch (err) { log(`boot folder reconcile failed for ${ws.id}`, err); }
+    try {
+      fst.rootUnsubscribe = subscribe(home, ws.pathType, () => this.scheduleFolderReconcile(ws.id));
+    } catch (err) { log(`folder-root subscribe failed for ${ws.id}`, err); }
+  }
+
+  private scheduleFolderReconcile(workspaceId: string): void {
+    const fst = this.folderStates.get(workspaceId);
+    if (!fst) return;
+    if (fst.debounce) clearTimeout(fst.debounce);
+    fst.debounce = setTimeout(() => {
+      fst.debounce = null;
+      void this.reconcileFolderRoot(fst.ws, false)
+        .catch((err) => log(`folder reconcile failed for ${workspaceId}`, err));
+    }, DEBOUNCE_MS);
+  }
+
+  /** Reconcile the structured-folder root: adopt via `PlanFolderWatcher`, then
+   *  reconcile the child subscriptions against the watchable-folder set (add on
+   *  adopt, tear down on removal / over-cap). */
+  private async reconcileFolderRoot(ws: Workspace, isBoot: boolean): Promise<void> {
+    const fst = this.folderStates.get(ws.id);
+    if (!fst) return;
+    const result = await this.folderWatcher.reconcileWorkspace(ws, isBoot);
+    this.syncChildSubs(fst, new Set(result.watchable));
+  }
+
+  /** Bring the child subscriptions in line with the desired watchable set. Each
+   *  watchable folder subscribes to its own dir (top-level `plan.md`/`plan.json`/
+   *  `ARC.md` changes) PLUS its three output subdirs (nested output edits) — the
+   *  bounded recursion fs-watcher's depth:0 backend cannot provide alone. */
+  private syncChildSubs(fst: FolderRootState, desired: Set<string>): void {
+    // Tear down folders no longer watchable (removed or now over-cap).
+    for (const [folderRelPath, teardown] of fst.childSubs) {
+      if (desired.has(folderRelPath)) continue;
+      for (const unsub of teardown) { try { unsub(); } catch { /* ignore */ } }
+      fst.childSubs.delete(folderRelPath);
+    }
+    // Add subscriptions for newly watchable folders.
+    for (const folderRelPath of desired) {
+      if (fst.childSubs.has(folderRelPath)) continue;
+      const folderAbs = childAbsFromHome(fst.ws, fst.home, folderRelPath);
+      const teardown: Array<() => void> = [];
+      const watchDir = (dir: string): void => {
+        try { teardown.push(subscribe(dir, fst.ws.pathType, () => this.scheduleFolderReconcile(fst.ws.id))); }
+        catch (err) { log(`child subscribe failed for ${dir}`, err); }
       };
-      this.states.set(ws.id, state);
-      // Boot reconcile BEFORE subscribing so the initial listing seeds snapshots.
-      try { await this.reconcileWorkspace(ws, isBoot); }
-      catch (err) { log(`boot reconcile failed for ${ws.id}`, err); }
-      try {
-        state.unsubscribe = subscribe(plansDir, ws.pathType, () => this.scheduleReconcile(ws.id));
-      } catch (err) { log(`subscribe failed for ${ws.id}`, err); }
+      watchDir(folderAbs);
+      for (const sub of PLAN_FOLDER_OUTPUT_SUBDIRS) {
+        watchDir(joinPath(folderAbs, sub, fst.ws.pathType));
+      }
+      fst.childSubs.set(folderRelPath, teardown);
     }
   }
 
@@ -440,6 +571,27 @@ function joinWorkspacePath(ws: Workspace, relPath: string): string {
 function dirExists(ws: Workspace, dir: string): boolean {
   if (ws.pathType === 'wsl') return true; // WSL existence is validated by the listing (best-effort)
   try { return fs.statSync(dir).isDirectory(); } catch { return false; }
+}
+
+/** Ensure a directory exists (Windows mkdir -p). WSL creation is best-effort
+ *  deferred — the listing tolerates an absent dir. Never throws. */
+function ensureDir(ws: Workspace, dir: string): void {
+  if (ws.pathType === 'wsl') return;
+  try { fs.mkdirSync(dir, { recursive: true }); }
+  catch (err) { log(`ensureDir failed for ${dir}`, err); }
+}
+
+/** Path-type-aware join of a single child segment onto a base. */
+function joinPath(base: string, child: string, pathType: PathType): string {
+  const sep = pathType === 'wsl' ? '/' : (base.includes('\\') ? '\\' : '/');
+  return `${base.replace(/[\\/]+$/, '')}${sep}${child}`;
+}
+
+/** Absolute path of a structured plan folder from the state-dir plans `home` and
+ *  the folder's workspace-relative path (`<stateDirName>/plans/<name>`). */
+function childAbsFromHome(ws: Workspace, home: string, folderRelPath: string): string {
+  const name = folderRelPath.replace(/[\\/]+$/, '').split(/[\\/]/).pop() ?? folderRelPath;
+  return joinPath(home, name, ws.pathType);
 }
 
 // Indirection so tests / callers never depend on Date directly at module scope.
