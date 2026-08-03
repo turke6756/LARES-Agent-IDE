@@ -17,6 +17,7 @@
 import assert from 'node:assert/strict';
 import {
   WORKER_CLAUDE_SETTINGS_JSON,
+  workerGrokSettingsJson,
   WORKER_CODEX_CONFIG_TOML,
   CODEX_WORKER_PROFILE_TOML,
   CODEX_WORKER_PROFILE_NAME,
@@ -243,17 +244,22 @@ test('WP2c. healthy / unknown / undefined → hooks available, no reason', () =>
 // ── G. Grok compat carrier (Phase 4.2 of the grok provider lane) ──────
 //
 // The grok worker lane's SOLE hook carrier is the claude-compat
-// <cwd>/.claude/settings.json (WORKER_FILES_GROK maps its content, deduped, to
-// WORKER_CLAUDE_SETTINGS_JSON — see index.ts / plan §2.2). Grok loads that file
-// natively (Hook Locations table), skips unknown event names, and aliases
-// matcher:"Bash" → run_terminal_command. There is NO codex profile / config.toml
-// instrumentation on the grok lane, and NO native .grok/hooks carrier.
+// <cwd>/.claude/settings.json. Grok loads that file natively (Hook Locations
+// table), skips unknown event names, and aliases matcher:"Bash" →
+// run_terminal_command. There is NO codex profile / config.toml instrumentation
+// on the grok lane, and NO native .grok/hooks carrier.
 //
-// These tests pin that contract at the constant level (the carrier CONTENT),
-// which is what the launch actually writes.
+// Commit 7 (PowerShell-safe carrier): the grok carrier is NO LONGER the shared
+// WORKER_CLAUDE_SETTINGS_JSON — grok 0.2.118 runs hook commands via PowerShell,
+// where ${CLAUDE_PROJECT_DIR} expands to EMPTY, so the grok carrier now embeds
+// the ABSOLUTE script path (materialized at scaffold-write time) via
+// workerGrokSettingsJson(). These tests therefore pin the contract against the
+// ACTUAL generated carrier, not the claude constant.
+const GROK_CARRIER_ROOT = 'C:/Users/dev/My Workspace'; // a space proves quoting survives
+const GROK_CARRIER = workerGrokSettingsJson(GROK_CARRIER_ROOT);
 
 function grokCarrierHooks(): Record<string, Array<{ matcher?: string; hooks: Array<{ type: string; command: string }> }>> {
-  const parsed = JSON.parse(WORKER_CLAUDE_SETTINGS_JSON) as {
+  const parsed = JSON.parse(GROK_CARRIER) as {
     hooks?: Record<string, Array<{ matcher?: string; hooks: Array<{ type: string; command: string }> }>>;
   };
   assert.ok(parsed.hooks, 'the grok carrier must have a hooks block');
@@ -283,13 +289,37 @@ test('G3. NO codex profile instrumentation reaches the grok carrier (settings.js
   // markers may appear: no [[hooks.*]] TOML tables, no [features] gate, no
   // --profile dashboard-worker, no literal run_terminal_command aliasing (grok
   // does that itself from matcher:"Bash").
-  assert.ok(!/\[\[hooks\./.test(WORKER_CLAUDE_SETTINGS_JSON), 'grok carrier must not carry codex [[hooks.*]] TOML tables');
-  assert.ok(!/\[features\]/.test(WORKER_CLAUDE_SETTINGS_JSON), 'grok carrier must not carry the codex [features] gate');
-  assert.ok(!WORKER_CLAUDE_SETTINGS_JSON.includes(CODEX_WORKER_PROFILE_NAME),
+  assert.ok(!/\[\[hooks\./.test(GROK_CARRIER), 'grok carrier must not carry codex [[hooks.*]] TOML tables');
+  assert.ok(!/\[features\]/.test(GROK_CARRIER), 'grok carrier must not carry the codex [features] gate');
+  assert.ok(!GROK_CARRIER.includes(CODEX_WORKER_PROFILE_NAME),
     `grok carrier must not reference the codex profile name (${CODEX_WORKER_PROFILE_NAME})`);
-  assert.ok(!/--profile/.test(WORKER_CLAUDE_SETTINGS_JSON), 'grok carrier must not carry a --profile flag');
-  assert.ok(!/run_terminal_command/.test(WORKER_CLAUDE_SETTINGS_JSON),
+  assert.ok(!/--profile/.test(GROK_CARRIER), 'grok carrier must not carry a --profile flag');
+  assert.ok(!/run_terminal_command/.test(GROK_CARRIER),
     'grok carrier must not hard-code run_terminal_command — grok aliases matcher:"Bash" itself');
+});
+
+test('G6. grok carrier is PowerShell-safe: NO ${ anywhere, absolute .lares/scripts paths materialized', () => {
+  // The defect this commit fixes: grok 0.2.118 executes hook commands via
+  // PowerShell, where ${CLAUDE_PROJECT_DIR} is an UNDEFINED PowerShell variable
+  // that expands to EMPTY → `node "/../../scripts/..."` → MODULE_NOT_FOUND → all
+  // hooks silently die (grok is fail-open). The generated carrier must therefore
+  // contain NO `${` sequence at all, and every command must carry the ABSOLUTE
+  // path to <workspaceRoot>/.lares/scripts/<script>.mjs with forward slashes.
+  assert.ok(!GROK_CARRIER.includes('${'),
+    `grok carrier must contain no \${ sequence (PowerShell does not expand it); got:\n${GROK_CARRIER}`);
+  const hooks = grokCarrierHooks();
+  const allCommands = Object.values(hooks).flatMap((arr) => arr.flatMap((g) => g.hooks.map((h) => h.command)));
+  const expectStatus = `${GROK_CARRIER_ROOT}/.lares/scripts/dashboard-status.mjs`;
+  const expectGuard = `${GROK_CARRIER_ROOT}/.lares/scripts/guard-git-discard.mjs`;
+  assert.ok(allCommands.some((c) => c.includes(expectStatus)),
+    `a status command must embed the absolute dashboard-status.mjs path (${expectStatus}); got: ${JSON.stringify(allCommands)}`);
+  assert.ok(allCommands.some((c) => c.includes(expectGuard)),
+    `the guard command must embed the absolute guard-git-discard.mjs path (${expectGuard}); got: ${JSON.stringify(allCommands)}`);
+  // The statusLine command is likewise materialized and ${-free.
+  const parsed = JSON.parse(GROK_CARRIER) as { statusLine?: { command?: string } };
+  assert.ok(parsed.statusLine && parsed.statusLine.command
+    && parsed.statusLine.command.includes(`${GROK_CARRIER_ROOT}/.lares/scripts/dashboard-statusline.mjs`),
+    `statusLine must embed the absolute dashboard-statusline.mjs path; got: ${JSON.stringify(parsed.statusLine)}`);
 });
 
 test('G4. grok status contract is argv-fallback authoritative — NOT stdin-enriched turnId/sessionId', () => {

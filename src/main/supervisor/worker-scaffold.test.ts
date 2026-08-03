@@ -21,6 +21,7 @@ import { AgentSupervisor, SCAFFOLD_SIDECAR_REL } from './index';
 import {
   SUPERVISOR_CLAUDE_SETTINGS_JSON,
   WORKER_CLAUDE_SETTINGS_JSON,
+  workerGrokSettingsJson,
   RESEARCHER_CLAUDE_SETTINGS_JSON,
   WORKER_GROK_AGENTS_MD,
   WORKER_AGY_AGENTS_MD,
@@ -406,10 +407,12 @@ test('WP-G: every lane settings.json keeps autoMemoryEnabled: false', () => {
 // ── Grok Build worker scaffold (plan §2.6) ───────────────────────────
 //
 // The grok lane rides the claude-compat carrier: a single managed file,
-// .lares/workers/grok/.claude/settings.json (content-deduped via the shared
-// WORKER_CLAUDE_SETTINGS_JSON constant, its OWN scaffold key at version 1), plus
-// a seed-once AGENTS.md identity that is NOT in the managed map. No native
-// .grok/hooks carrier, no remember skill in this scope.
+// .lares/workers/grok/.claude/settings.json. Commit 7 (PowerShell-safe): its
+// content is the GENERATED workerGrokSettingsJson() — absolute .lares/scripts
+// paths materialized at scaffold-write time, no ${CLAUDE_PROJECT_DIR} (grok runs
+// hooks via PowerShell, which does not expand it) — registered under its OWN
+// scaffold key at version 2. Plus a seed-once AGENTS.md identity that is NOT in
+// the managed map. No native .grok/hooks carrier, no remember skill in this scope.
 
 function readSidecar(workDir: string): Record<string, number> {
   const p = path.join(workDir, ...SCAFFOLD_SIDECAR_REL.split('/'));
@@ -425,16 +428,31 @@ test('Grok: fresh scaffold writes settings.json + AGENTS.md in the grok cwd + sh
     // The compat carrier: grok loads <cwd>/.claude/settings.json natively.
     const settingsPath = path.join(workDir, '.lares', 'workers', 'grok', '.claude', 'settings.json');
     assert.ok(fs.existsSync(settingsPath), `expected ${settingsPath} to exist`);
-    // Byte-identical to the shared claude settings constant (content-dedupe).
+    const settings = fs.readFileSync(settingsPath, 'utf-8');
+    // Commit 7 (PowerShell-safe carrier): the grok carrier is the generated,
+    // path-materialized settings — byte-identical to workerGrokSettingsJson() for
+    // this workspace root — NOT the shared claude constant.
+    const posixWorkspaceRoot = workDir.replace(/\\/g, '/');
     assert.equal(
-      fs.readFileSync(settingsPath, 'utf-8'),
-      WORKER_CLAUDE_SETTINGS_JSON,
-      'grok settings.json must be byte-identical to WORKER_CLAUDE_SETTINGS_JSON',
+      settings,
+      workerGrokSettingsJson(posixWorkspaceRoot),
+      'grok settings.json must be the generated, path-materialized carrier',
     );
-    // Keeps ${CLAUDE_PROJECT_DIR} unexpanded — grok's compat loader resolves it.
+    // NOT the shared claude carrier, and it must carry NO ${CLAUDE_PROJECT_DIR}:
+    // grok runs hooks via PowerShell where ${VAR} expands to empty, so the paths
+    // are absolute and materialized at scaffold-write time.
+    assert.notEqual(settings, WORKER_CLAUDE_SETTINGS_JSON,
+      'grok settings.json must NOT be the shared claude carrier (that one is PowerShell-broken for grok)');
+    assert.ok(!settings.includes('${'),
+      `grok settings.json must contain no \${ sequence (PowerShell-safe); got:\n${settings}`);
+    // Every hook command carries the ABSOLUTE workspace .lares/scripts path.
     assert.ok(
-      fs.readFileSync(settingsPath, 'utf-8').includes('${CLAUDE_PROJECT_DIR}'),
-      'grok settings.json must retain ${CLAUDE_PROJECT_DIR} (no materialization)',
+      settings.includes(`${posixWorkspaceRoot}/.lares/scripts/dashboard-status.mjs`),
+      `grok settings.json must embed the absolute dashboard-status.mjs path; got:\n${settings}`,
+    );
+    assert.ok(
+      settings.includes(`${posixWorkspaceRoot}/.lares/scripts/guard-git-discard.mjs`),
+      `grok settings.json must embed the absolute guard-git-discard.mjs path; got:\n${settings}`,
     );
 
     // The seed-once identity file.
@@ -458,7 +476,7 @@ test('Grok: fresh scaffold writes settings.json + AGENTS.md in the grok cwd + sh
   }
 });
 
-test('Grok: sidecar records workers/grok/.claude/settings.json:1, independent of claude', () => {
+test('Grok: sidecar records workers/grok/.claude/settings.json:2, independent of claude', () => {
   const workDir = mktmp('grok-sidecar');
   const { supervisor, cleanup } = makeSupervisor();
   try {
@@ -468,8 +486,8 @@ test('Grok: sidecar records workers/grok/.claude/settings.json:1, independent of
 
     const sidecar = readSidecar(workDir);
     assert.equal(
-      sidecar['workers/grok/.claude/settings.json'], 1,
-      `sidecar must record grok carrier v1; got ${JSON.stringify(sidecar)}`,
+      sidecar['workers/grok/.claude/settings.json'], 2,
+      `sidecar must record grok carrier v2 (Commit 7 PowerShell-safe bump); got ${JSON.stringify(sidecar)}`,
     );
     // Version independence: the grok carrier key is distinct from the claude
     // carrier key, and the claude carrier is at its own (higher) version — so the

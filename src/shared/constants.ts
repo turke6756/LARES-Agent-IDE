@@ -1599,6 +1599,58 @@ export const WORKER_CLAUDE_SETTINGS_JSON = `{
 }
 `;
 
+/** Grok Build worker hook carrier (PowerShell-safe) — generated at
+ *  scaffold-write time for the grok lane's `.claude/settings.json`.
+ *
+ *  WHY GROK NEEDS ITS OWN CARRIER (not the shared WORKER_CLAUDE_SETTINGS_JSON):
+ *  grok 0.2.118 on Windows runs claude-compat hook commands through POWERSHELL.
+ *  In PowerShell `\${CLAUDE_PROJECT_DIR}` is an *undefined PowerShell variable*
+ *  (NOT the process env var), so it expands to the EMPTY string — grok's docs
+ *  claim `\${VAR}` expansion but 0.2.118 does not perform it. The shared claude
+ *  carrier's `node "\${CLAUDE_PROJECT_DIR}/../../scripts/dashboard-status.mjs"`
+ *  therefore became `node "/../../scripts/dashboard-status.mjs"` →
+ *  MODULE_NOT_FOUND → exit 1. grok is fail-open on hook failure, so ALL four
+ *  status hooks AND the PreToolUse git-discard guard silently died: no spool
+ *  events, "hooks off" badge, handshake failures, status stuck working, guard
+ *  unenforced.
+ *
+ *  FIX: embed the ABSOLUTE path to `<workspaceRoot>/.lares/scripts/<script>.mjs`
+ *  (materialized here at write time — like the codex carrier's \${WORKSPACE_ROOT}
+ *  substitution) with FORWARD SLASHES (node accepts them on Windows and they
+ *  dodge JSON backslash-escaping bugs). NO `\${VAR}` appears in any command
+ *  string. `posixWorkspaceRoot` must already be forward-slash-normalized
+ *  (Windows drive path → `C:/...`, or a `/mnt/...` WSL path) — the caller in
+ *  ensureWorkerScaffold does that conversion, mirroring the codex arm.
+ *
+ *  Built via a JS object + JSON.stringify so escaping is always correct and the
+ *  output is guaranteed valid JSON. Hook/event set is byte-for-byte the same as
+ *  the claude carrier (SessionStart / Stop / UserPromptSubmit / Notification /
+ *  PreToolUse(Bash) + statusLine); only the command paths differ. */
+export function workerGrokSettingsJson(posixWorkspaceRoot: string): string {
+  const scriptsDir = `${posixWorkspaceRoot.replace(/\/+$/, '')}/.lares/scripts`;
+  const status = `${scriptsDir}/dashboard-status.mjs`;
+  const guard = `${scriptsDir}/guard-git-discard.mjs`;
+  const statusline = `${scriptsDir}/dashboard-statusline.mjs`;
+  // `node "<abs>"` + optional trailing arg. The absolute path is double-quoted
+  // so a space in the workspace path survives; JSON.stringify escapes the inner
+  // quotes. NO ${VAR} anywhere.
+  const cmd = (script: string, arg?: string): string =>
+    `node "${script}"${arg ? ` ${arg}` : ''}`;
+  const carrier = {
+    autoMemoryEnabled: false,
+    autoCompactEnabled: false,
+    hooks: {
+      SessionStart: [{ hooks: [{ type: 'command', command: cmd(status, 'session-start') }] }],
+      Stop: [{ hooks: [{ type: 'command', command: cmd(status) }] }],
+      UserPromptSubmit: [{ hooks: [{ type: 'command', command: cmd(status, 'working') }] }],
+      Notification: [{ hooks: [{ type: 'command', command: cmd(status, 'waiting') }] }],
+      PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command: cmd(guard) }] }],
+    },
+    statusLine: { type: 'command', command: cmd(statusline), padding: 0 },
+  };
+  return `${JSON.stringify(carrier, null, 2)}\n`;
+}
+
 /** Pre-guard Claude worker settings (v7) — the 4-hook + statusLine block WITHOUT
  *  the PreToolUse(Bash) git-discard guard, kept verbatim so a v7 workspace's
  *  on-disk settings.json can be hashed and silently upgraded to v8 (which adds

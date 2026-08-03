@@ -22,7 +22,7 @@ function getOrchestrationToolDefinitions() {
           template_id: { type: 'string', description: 'Optional template ID. Agent inherits the template persona, prompt, provider, etc.' },
           persona: { type: 'string', description: 'Persona subdirectory name under .claude/agents/. Agent inherits its CLAUDE.md as system instructions.' },
           system_prompt: { type: 'string', description: 'Optional identity prompt injected as the first message. Overrides template system_prompt.' },
-          provider: { type: 'string', enum: ['claude', 'gemini', 'codex'], description: 'AI provider (default: claude).' },
+          provider: { type: 'string', enum: ['claude', 'gemini', 'codex', 'grok'], description: 'AI provider (default: claude).' },
           command: { type: 'string', description: 'Custom command to launch the agent process. Overrides the provider default.' },
           working_directory: { type: 'string', description: 'Working directory for the agent. Defaults to workspace root.' },
           auto_restart: { type: 'boolean', description: 'Auto-restart the agent on crash (default: true).' },

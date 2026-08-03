@@ -146,6 +146,12 @@
       "owner": "scripts/dev"
     },
     {
+      "file": "scripts/grok-tier0-smoke.mjs",
+      "lineContext": "windowspowershell",
+      "purpose": "Dev-only release smoke (not shipped; run-main-tests omits it): item 8 REPRODUCES grok's real hook shell to prove the PowerShell-safe carrier fix — runs the generated hook command via an absolute System32 WindowsPowerShell exe, discrete argv, no shell, 60s timeout. Reproducing PowerShell IS the test.",
+      "owner": "grok-lane/commit-7"
+    },
+    {
       "file": "src/main/workspace-state-dir.ts",
       "lineContext": "wscript.shell",
       "purpose": "P0.2 legacy-launcher DETECTOR: matches WScript.Shell content in order to quarantine/remove it. Detects the pattern, never uses it.",

@@ -19,7 +19,7 @@ import {
   WORKER_CLAUDE_MD, WORKER_CLAUDE_MD_V1, WORKER_BEHAVIORAL_MD,
   WORKER_CLAUDE_SETTINGS_JSON, WORKER_CLAUDE_SETTINGS_JSON_V2, WORKER_CLAUDE_SETTINGS_JSON_V3,
   WORKER_CLAUDE_SETTINGS_JSON_V4, WORKER_CLAUDE_SETTINGS_JSON_V5, WORKER_CLAUDE_SETTINGS_JSON_V6,
-  WORKER_CLAUDE_SETTINGS_JSON_V7,
+  WORKER_CLAUDE_SETTINGS_JSON_V7, workerGrokSettingsJson,
   WORKER_CODEX_CONFIG_TOML, WORKER_CODEX_CONFIG_TOML_V1, WORKER_CODEX_CONFIG_TOML_V2,
   WORKER_CODEX_CONFIG_TOML_V3, WORKER_CODEX_CONFIG_TOML_V4, WORKER_CODEX_CONFIG_TOML_V5,
   WORKER_CODEX_AGENTS_MD, WORKER_CODEX_AGENTS_MD_V1, WORKER_CODEX_BEHAVIORAL_MD,
@@ -3211,28 +3211,6 @@ export class AgentSupervisor extends EventEmitter {
     [`.lares/workers/claude/.claude/skills/read-comments/SKILL.md`]:  { content: PERSONA_READ_COMMENTS_SKILL, version: 5, previousHashes: { 1: sha256Hex(PERSONA_READ_COMMENTS_SKILL_V1), 2: sha256Hex(PERSONA_READ_COMMENTS_SKILL_V2), 3: sha256Hex(PERSONA_READ_COMMENTS_SKILL_V3), 4: sha256Hex(PERSONA_READ_COMMENTS_SKILL_V4) } }, // v5: Python fallback removed (honest on a Python-free clean VM)
   };
 
-  /** Class IV — Grok Build worker template files. Grok natively loads
-   *  `<cwd>/.claude/settings.json` as a hook source (documented Hook Locations
-   *  table) and skips unrecognized event names, so the claude worker carrier
-   *  loads as-is — the compat carrier is the ENTIRE managed map. Content is
-   *  deduped via the SHARED WORKER_CLAUDE_SETTINGS_JSON constant (byte-identical
-   *  to the claude lane's), but registered under its OWN scaffold key at
-   *  version 1 so the grok lane's carrier version can diverge from claude's
-   *  without churn.
-   *
-   *  Deliberately NOT in this map: (a) AGENTS.md — the grok identity file is
-   *  seed-once / user-owned (see seedGrokIdentityIfAbsent), NOT version-migrated,
-   *  so a future previousHashes bump can never `.bak` + clobber a worker's edits;
-   *  (b) the `remember` skill — out of the minimum commission (see plan §2.5);
-   *  (c) any `.grok/hooks/*.json` native carrier — two active carriers risk the
-   *  codex Run-D double-fire, so grok rides the single claude-compat carrier. */
-  private static WORKER_FILES_GROK: Record<string, ScaffoldFile> = {
-    [`.lares/workers/grok/.claude/settings.json`]: {
-      content: WORKER_CLAUDE_SETTINGS_JSON,
-      version: 1,
-    },
-  };
-
   /** WP-G — Research store skeleton (plans/groupthink/browser-parity-and-research-store.md).
    *  The store itself is persona-agnostic: it is scaffolded on every supervisor
    *  and worker launch so any persona can read/Grep it. inbox/ is git-ignored
@@ -3428,13 +3406,44 @@ export class AgentSupervisor extends EventEmitter {
       // Grok Build lane (plans/grok-provider-lane-implementation.md §2). The
       // agent cwd (.lares/workers/grok/) is resolved by the provider-interpolated
       // cwd branch above (`workers/${provider}`) — no explicit grok switch there.
-      // The ONLY managed carrier is the claude-compat .claude/settings.json
-      // (WORKER_FILES_GROK); grok loads it natively and its ${CLAUDE_PROJECT_DIR}
-      // is resolved by grok's compat loader, so NO ${WORKSPACE_ROOT}
-      // materialization is needed (unlike codex). The shared WORKSPACE_SCRIPT_FILES
+      // The ONLY managed carrier is the claude-compat .claude/settings.json; grok
+      // loads it natively as a hook source.
+      //
+      // Commit 7 (PowerShell-safe carrier): grok 0.2.118 on Windows executes
+      // claude-compat hook commands through POWERSHELL, where ${CLAUDE_PROJECT_DIR}
+      // is an UNDEFINED PowerShell variable (NOT the process env var) and expands
+      // to EMPTY — so the shared claude carrier's
+      // `node "${CLAUDE_PROJECT_DIR}/../../scripts/..."` collapsed to
+      // `node "/../../scripts/..."` → MODULE_NOT_FOUND → exit 1, and (grok being
+      // fail-open on hook failure) all four status hooks AND the git-discard guard
+      // went silently inert. So — unlike the claude lane, and LIKE codex — the grok
+      // carrier materializes the ABSOLUTE script path at scaffold-write time
+      // (forward slashes; node accepts them and they dodge JSON backslash escaping)
+      // with NO ${VAR} in any command string. The shared WORKSPACE_SCRIPT_FILES
       // write above already delivered dashboard-status.mjs + guard-git-discard.mjs
       // to this lane. AGENTS.md is seeded write-if-absent (seed-once identity).
-      providerCreated = this.writeScaffoldMap(workDir, AgentSupervisor.WORKER_FILES_GROK, pathType);
+      //
+      // Path normalization mirrors the codex arm: WSL Node cannot read `C:/...`,
+      // so convert to /mnt/<lc>/... for a wsl launch; a windows launch keeps the
+      // drive-letter path with forward slashes.
+      const posixWorkspaceRoot = pathType === 'wsl'
+        ? windowsToWslPath(workDir)
+        : workDir.replace(/\\/g, '/');
+      const grokFiles: Record<string, ScaffoldFile> = {
+        [`.lares/workers/grok/.claude/settings.json`]: {
+          content: workerGrokSettingsJson(posixWorkspaceRoot),
+          // v2 (Commit 7, PowerShell-safe): absolute materialized script paths,
+          // no ${CLAUDE_PROJECT_DIR}. The version BUMP is load-bearing — carriers
+          // only regenerate on a version bump (writeScaffoldMap short-circuits when
+          // diskVersion === bundledVersion), so without it the broken v1 carrier on
+          // disk would stay. v1 was the byte-identical shared claude carrier
+          // (WORKER_CLAUDE_SETTINGS_JSON, workspace-independent), so hash it as the
+          // v1 previousHash → a pristine v1 grok carrier upgrades silently (no .bak).
+          version: 2,
+          previousHashes: { 1: sha256Hex(WORKER_CLAUDE_SETTINGS_JSON) },
+        },
+      };
+      providerCreated = this.writeScaffoldMap(workDir, grokFiles, pathType);
       providerCreated += this.seedGrokIdentityIfAbsent(workDir, pathType);
       // Commit 6 fix (plans/grok-provider-lane-implementation.md; tier-0 smoke
       // item 3.1): grok discovers project `.claude/settings.json` hooks at its
@@ -3597,7 +3606,7 @@ export class AgentSupervisor extends EventEmitter {
    *  (`.lares/workers/grok/AGENTS.md`) — write-if-absent, then hand ownership to
    *  the worker/human. Grok auto-loads AGENTS.md from cwd as Project Rules.
    *
-   *  Deliberately NOT part of WORKER_FILES_GROK: managed scaffold files are
+   *  Deliberately NOT a managed grok scaffold entry: managed scaffold files are
    *  version-migrated and an edited one gets `.bak`'d + overwritten on the next
    *  launch (see writeScaffoldMap). The grok identity is the opposite contract —
    *  seed-once, user-owned — so it is written once and never touched again

@@ -37,6 +37,13 @@
 //   6. compat.claude.hooks = false → the smoke reports the lane NOT healthy
 //      (fails explicitly rather than calling a compat-disabled lane healthy).
 //   7. No .grok/hooks carrier is written.
+//   8. Commit 7 (PowerShell-safe carrier): the generated carrier's
+//      UserPromptSubmit command runs through PowerShell (grok's real hook shell,
+//      -NoProfile -NonInteractive) with CLAUDE_PROJECT_DIR + a scratch AGENT_ID
+//      and exits 0. This EXECUTES a hook command rather than only checking that
+//      hooks register — the gap that let the ${CLAUDE_PROJECT_DIR}→empty carrier
+//      ship broken (registration passed; execution was MODULE_NOT_FOUND). No auth
+//      / grok API needed, so it runs even when grok.exe is absent.
 
 import { createRequire } from 'node:module';
 import { spawnSync, execFileSync } from 'node:child_process';
@@ -129,6 +136,64 @@ try {
     ].filter(([, p]) => !fs.existsSync(p)).map(([n]) => n);
     if (missing.length) fail(1, 'scaffold creates AGENTS.md + settings.json + shared scripts', `missing: ${missing.join(', ')}`);
     else pass(1, 'scaffold creates AGENTS.md + settings.json + shared scripts');
+  }
+
+  // ── item 8: EXECUTE a carrier hook command under PowerShell (the fix) ──────
+  // This is the item that would have caught the shipped-broken carrier: grok
+  // 0.2.118 on Windows runs hook commands via POWERSHELL, where the old
+  // ${CLAUDE_PROJECT_DIR} expanded to EMPTY → `node "/../../scripts/..."` →
+  // MODULE_NOT_FOUND → exit 1 (and grok, fail-open, ran with no hooks). We take
+  // the generated carrier's UserPromptSubmit command string VERBATIM and run it
+  // through PowerShell (-NoProfile -NonInteractive, the command passed as an
+  // argument) — the empirically-proven hook shell — with CLAUDE_PROJECT_DIR set
+  // (as grok sets it at fire time) and a scratch AGENT_ID, then assert exit 0. No
+  // grok API call, no auth needed. A PowerShell-broken carrier (empty-expanded
+  // path) would exit non-zero here.
+  {
+    const settingsPath = path.join(agentCwd, '.claude', 'settings.json');
+    let carrier = null;
+    try { carrier = JSON.parse(fs.readFileSync(settingsPath, 'utf-8')); } catch (err) {
+      fail(8, 'carrier UserPromptSubmit command executes under PowerShell (exit 0)', `unreadable carrier: ${err.message}`);
+      carrier = null;
+    }
+    if (carrier) {
+      // Defensive: the whole point of the fix is a ${-free, absolute-path carrier.
+      const raw = fs.readFileSync(settingsPath, 'utf-8');
+      if (raw.includes('${')) {
+        fail(8, 'carrier UserPromptSubmit command executes under PowerShell (exit 0)',
+          `carrier still contains a \${ sequence (PowerShell will expand it to empty): ${raw}`);
+      } else {
+        const cmd = carrier?.hooks?.UserPromptSubmit?.[0]?.hooks?.[0]?.command;
+        if (typeof cmd !== 'string' || !cmd) {
+          fail(8, 'carrier UserPromptSubmit command executes under PowerShell (exit 0)',
+            `no UserPromptSubmit command in carrier: ${JSON.stringify(carrier?.hooks?.UserPromptSubmit)}`);
+        } else {
+          // Absolute exe (System32 WindowsPowerShell), discrete argv, no shell,
+          // 60s timeout — the bounded, direct-probe shape the EDR lint permits
+          // (allowlisted: dev-only release smoke, never packaged/shipped).
+          const psExe = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+          const psArgs = ['-NoProfile', '-NonInteractive', '-Command', cmd];
+          const r = spawnSync(psExe, psArgs, {
+            cwd: agentCwd, encoding: 'utf-8', timeout: 60_000,
+            stdio: ['ignore', 'pipe', 'pipe'],
+            // grok sets CLAUDE_PROJECT_DIR (projectRoot == hook cwd) at fire time; the
+            // scratch AGENT_ID lets dashboard-status.mjs run its real body (it still
+            // exits 0 with no dashboard — HTTP/spool writes are best-effort).
+            env: { ...process.env, CLAUDE_PROJECT_DIR: agentCwd, AGENT_ID: 'grok-tier0-smoke' },
+          });
+          if (r.error && r.error.code === 'ENOENT') {
+            skip(8, 'carrier UserPromptSubmit command executes under PowerShell (exit 0)',
+              `powershell not found at ${psExe}: ${r.error.message}`);
+          } else if (r.status === 0) {
+            pass(8, 'carrier UserPromptSubmit command executes under PowerShell (exit 0)',
+              `powershell ran: ${cmd}`);
+          } else {
+            fail(8, 'carrier UserPromptSubmit command executes under PowerShell (exit 0)',
+              `status=${r.status} signal=${r.signal} cmd=${cmd}\nstderr=${(r.stderr || '').trim()}`);
+          }
+        }
+      }
+    }
   }
 
   // ── item 7: no .grok/hooks carrier ────────────────────────────────────────
