@@ -109,6 +109,26 @@ export interface DispatchDeps {
    * that does NOT wire this lookup fails closed — items are rejected there as
    * unsupported rather than accepted through an always-true seam. */
   planItemInPlan?: (workspaceId: string, planId: string, planItemId: string) => boolean;
+  /**
+   * WP-P5C-gate: the authoritative pre-Implement gate for a resolved plan binding,
+   * keyed by the globally-unique plan id. It reports whether the plan is a
+   * `format='structured'` plan and, if so, whether it currently has an ACTIVE
+   * execution run (`getActivePlanExecutionRun`). A structured plan WITHOUT an active
+   * run cannot be bound to a worker before Implement — the human trigger that mints
+   * the run is the only thing that opens the gate. Legacy HTML/md plans report
+   * `isStructured:false` and are NEVER gated (their behavior is unchanged). Returns
+   * null when the plan is unknown to the gate (treated as ungated — legacy). A
+   * boundary that does NOT wire this leaves the gate inactive; the pre-P5 boundaries
+   * carried no structured plans, so that is the transition-safe default. */
+  planImplementGate?: (planId: string) => PlanImplementGate | null;
+}
+
+/** The pre-Implement gate verdict for a single plan (WP-P5C-gate). */
+export interface PlanImplementGate {
+  /** True iff the plan row is `format='structured'`. */
+  isStructured: boolean;
+  /** True iff `getActivePlanExecutionRun(planId)` returned a live run. */
+  hasActiveExecutionRun: boolean;
 }
 
 export type PlanBindingResolution =
@@ -120,10 +140,36 @@ export type PlanBindingResolution =
         | 'plan-not-in-workspace'
         | 'plan-item-unsupported'
         | 'invalid-plan-item-id'
-        | 'plan-item-not-in-plan';
+        | 'plan-item-not-in-plan'
+        | 'structured-plan-not-implemented';
     };
 
 const MAX_PLAN_ID_UTF8_BYTES = 256;
+
+/**
+ * WP-P5C-gate chokepoint. Wraps a resolved stamp in the pre-Implement gate so EVERY
+ * bound plan — explicit-plan, explicit-plan+item, or agent-default — is refused when
+ * it names a `format='structured'` plan that lacks an active execution run. A null
+ * planId (`explicit-none`, or an agent with no default plan) is never gated. When no
+ * gate is wired, the seam is inactive (legacy boundaries carried no structured plans).
+ * A gate lookup that THROWS fails closed: we cannot prove the plan is dispatchable, so
+ * it is refused (validation-infra failures are never an excuse to open the gate).
+ */
+function gateResolvedStamp(deps: DispatchDeps, stamp: ResolvedPlanStamp): PlanBindingResolution {
+  if (stamp.planId === null || !deps.planImplementGate) return { ok: true, stamp };
+  let gate: PlanImplementGate | null;
+  try {
+    gate = deps.planImplementGate(stamp.planId);
+  } catch {
+    return { ok: false, reason: 'structured-plan-not-implemented' };
+  }
+  // A legacy/unknown plan (null verdict or isStructured:false) is passed through
+  // unchanged. Only an affirmatively structured plan with no active run is refused.
+  if (gate && gate.isStructured && !gate.hasActiveExecutionRun) {
+    return { ok: false, reason: 'structured-plan-not-implemented' };
+  }
+  return { ok: true, stamp };
+}
 
 /** Resolve only wire-safe sources. Carry sources are impossible through this API;
  * they can enter a DispatchContext only through `withResolvedPlanStamp`. */
@@ -134,13 +180,12 @@ export function resolveRequestedPlanBinding(
 ): PlanBindingResolution {
   const binding = requested ?? { mode: 'agent-default' };
   if (binding.mode === 'none') {
-    return { ok: true, stamp: { planId: null, planItemId: null, source: 'explicit-none' } };
+    return gateResolvedStamp(deps, { planId: null, planItemId: null, source: 'explicit-none' });
   }
   if (binding.mode === 'agent-default') {
-    return {
-      ok: true,
-      stamp: { planId: agent.planId ?? null, planItemId: null, source: 'agent-default' },
-    };
+    return gateResolvedStamp(deps, {
+      planId: agent.planId ?? null, planItemId: null, source: 'agent-default',
+    });
   }
 
   // Runtime checks are intentional: the HTTP/IPC body is not made trustworthy by
@@ -184,15 +229,13 @@ export function resolveRequestedPlanBinding(
     if (!itemIsValid) {
       return { ok: false, reason: 'plan-item-not-in-plan' };
     }
-    return {
-      ok: true,
-      stamp: { planId: binding.planId, planItemId: binding.planItemId, source: 'explicit' },
-    };
+    return gateResolvedStamp(deps, {
+      planId: binding.planId, planItemId: binding.planItemId, source: 'explicit',
+    });
   }
-  return {
-    ok: true,
-    stamp: { planId: binding.planId, planItemId: null, source: 'explicit' },
-  };
+  return gateResolvedStamp(deps, {
+    planId: binding.planId, planItemId: null, source: 'explicit',
+  });
 }
 
 /**
@@ -217,6 +260,9 @@ export async function buildDispatchTurnContext(
   const ownerAgentId = humanTerminal ? null : dispatch.ownerAgentId ?? null;
   const owner = ownerAgentId ? deps.getAgent(ownerAgentId) : null;
   const ownerBrickGeneration = owner ? owner.continuationGeneration ?? 0 : null;
+  // A trusted stamp arrives only through `withResolvedPlanStamp` from lifecycle rails
+  // (e.g. the Implement/dispatch service that has ALREADY minted the execution run), so
+  // it bypasses the WP-P5C-gate pre-Implement check applied to wire/default bindings.
   const trustedStamp = (dispatch as DispatchContext & TrustedStampCarrier)[TRUSTED_PLAN_STAMP];
   const resolution = trustedStamp
     ? { ok: true as const, stamp: trustedStamp }
