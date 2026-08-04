@@ -59,8 +59,11 @@ import { buildPlanDocuments, readPlanDocument, type PlanDocumentsDeps } from './
 import {
   createPlanComment,
   answerPlanComment,
+  listPlanComments,
+  defaultListPlanCommentsDeps,
   type CreatePlanCommentDeps,
   type AnswerPlanCommentDeps,
+  type ListPlanCommentsDeps,
 } from './plan-comments';
 
 // ── Save-card SC-WP-3D — plan-package `done` finalization wiring ──────────────
@@ -699,6 +702,32 @@ export function registerPlanCommentReplyIpc(ipc: PlanIpcLike, deps: AnswerPlanCo
   ipc.handle('plan:comment:reply', (_event, raw: unknown) => answerPlanComment(raw, deps));
 }
 
+// ── WP-P4D-proj — plan-comment projection (`plan:comment:list`) ────────────────
+//
+// The read surface the comments rail consumes. Every dep has a DB default (there
+// is no send/route seam to inject, unlike create/reply), so this channel is
+// registered directly by `registerPlanIpc` — a sibling of `registerPlanOverviewIpc`
+// / `registerPlanIntentsIpc`. The pure core takes only an opaque plan id; all
+// dual-source membership + logical-key resolution happens below the IPC boundary.
+
+/** Pure handler core. A malformed / empty plan id degrades to `null` (the rail
+ *  renders nothing); a missing workspace returns an empty projection with a
+ *  warning below in the service. */
+export function runPlanCommentList(
+  rawPlanId: unknown,
+  deps: ListPlanCommentsDeps = defaultListPlanCommentsDeps(),
+) {
+  if (typeof rawPlanId !== 'string' || rawPlanId === '') return null;
+  return listPlanComments(rawPlanId, deps);
+}
+
+export function registerPlanCommentListIpc(
+  ipc: PlanIpcLike,
+  deps: ListPlanCommentsDeps = defaultListPlanCommentsDeps(),
+): void {
+  ipc.handle('plan:comment:list', (_event, rawPlanId: unknown) => runPlanCommentList(rawPlanId, deps));
+}
+
 export function registerPlanIpc(manager: PlanPaneManager): void {
   // ── WP-P1A: planning-reader (read-only fs enumeration + safe read) ──────────
   // Bounded enumeration of bare proposals + §R0 plan folders, and a
@@ -783,6 +812,12 @@ export function registerPlanIpc(manager: PlanPaneManager): void {
   // supervisor-privileged, server-revalidated, revision-bumping write
   // (`plan:setOverview`). Keyed by the stable PlanTabKey domain.
   registerPlanOverviewIpc(ipcMain);
+
+  // WP-P4D-proj: plan-comment projection (`plan:comment:list`). Open read that
+  // rolls up a plan's comments across its registered external docs AND its
+  // folder-doc logical targets, each folded with its reply thread. All deps have
+  // DB defaults (no send/route seam), so it registers here directly.
+  registerPlanCommentListIpc(ipcMain);
 
   // Plan list for the "Plans" card gallery (workspace-scoped). Each row carries a
   // cheap description snippet derived from its already-served projection (or an

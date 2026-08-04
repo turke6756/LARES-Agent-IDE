@@ -43,7 +43,11 @@ import type {
   PathType,
   PlanCommentCreateRequest,
   PlanCommentCreateResult,
+  PlanCommentsProjection,
+  PlanCommentTarget,
+  PlanCommentThread,
   PlanDocumentRef,
+  PlanTabKey,
   PlanningReaderDocument,
   PlanningReaderEntry,
   PlanningReaderListResult,
@@ -61,6 +65,8 @@ import {
   getSelectionComment,
   getWorkspace,
   listRegisteredPlanDocumentsByWorkspace,
+  listSelectionComments,
+  listSelectionCommentReplies,
 } from '../database';
 import { translateStateRelPath } from '../workspace-state-dir';
 import { listPlanningEntries } from './planning-reader';
@@ -705,4 +711,226 @@ export async function answerPlanComment(
     authorAgentId: req.callerAgentId,
   });
   return { ok: true, reply };
+}
+
+// ── WP-P4D-proj — plan-comment projection (dual-source; logical-key resolution) ─
+//
+// The read side of the comments rail. `listPlanComments(planId)` rolls up every
+// comment on a plan across BOTH membership sources, each joined with its companion
+// reply thread and a resolved target descriptor:
+//
+//   1. Registered external docs — the plan's `proposal` / `legacy-html` rows. Each
+//      carries an ordinary physical `file_path`; its comments list exactly as any
+//      other file comment (the compatibility path — nothing about them changes).
+//   2. Folder-doc logical targets — comments whose `file_path` is a
+//      `lares-plan-doc:v1:` key. We parse ONLY the exact `v1:` form, attribute by
+//      the durable `plan_artifact_id` embedded in the key (so a FOLDER rename keeps
+//      the comment attached — the key is folder-path-free), and resolve the
+//      in-folder rel path against the plan's CURRENT folder manifest. A rel path
+//      that no longer resolves to a live manifest doc (an individual document
+//      rename / removal), or a `v1:` key with a bad/`..` rel path, renders as an
+//      explicit ORPHANED plan-document target — never a filesystem path, never
+//      silently dropped.
+//
+// A `lares-plan-doc:*` key that cannot be attributed to a plan at all — an unknown
+// version, an unparseable payload, or a missing artifact id — is a member of NO
+// plan: it is skipped here and is NEVER interpreted as an OS path or stat-ed (the
+// generic-fs-lookup guard). Only a physical `file_path` is ever fed to the
+// path-keyed comment query.
+
+/** Map a resolved folder doc's category to its stable `PlanTabKey`. Only the
+ *  commentable categories (those `commentableFolderDocRelPath` accepts) resolve;
+ *  anything else is not a folder tab document → null. */
+function folderDocTab(category: PlanningReaderDocument['category']): PlanTabKey | null {
+  switch (category) {
+    case 'plan':
+      return 'plan';
+    case 'arc':
+      return 'overview';
+    case 'deliberation':
+      return 'deliberations';
+    case 'research':
+      return 'research';
+    case 'supplement':
+      return 'supplements';
+    default:
+      return null;
+  }
+}
+
+/** External registered doc kind → its stable `PlanTabKey` (local mirror of the
+ *  WP-P4A mapping; a trivial two-case fold, not a resolution helper). */
+function registeredTab(docKind: string): PlanTabKey | null {
+  return docKind === 'proposal' ? 'proposal' : docKind === 'legacy-html' ? 'legacy-html' : null;
+}
+
+/**
+ * LENIENT decode of the EXACT `lares-plan-doc:v1:` form for PROJECTION attribution.
+ * Unlike `decodePlanDocKey` (all-or-nothing), this keeps the row attributable to a
+ * plan even when only the rel path is unusable: it returns the `plan_artifact_id`
+ * plus a canonicalized rel path OR null (a bad / `..` / absolute rel path → null
+ * rel path → the caller renders it as an orphaned target, still attached to its
+ * plan by the artifact id). It parses ONLY the `v1:` form; an unknown version, an
+ * unparseable payload, or a missing artifact id returns null (unattributable).
+ */
+function decodeV1ForAttribution(
+  filePath: string | null | undefined,
+): { planArtifactId: string; docRelPathWithinFolder: string | null } | null {
+  if (typeof filePath !== 'string' || !filePath.startsWith(LOGICAL_PLAN_DOC_V1_PREFIX)) return null;
+  const b64 = filePath.slice(LOGICAL_PLAN_DOC_V1_PREFIX.length);
+  if (b64 === '') return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(Buffer.from(b64, 'base64url').toString('utf-8'));
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== 'object') return null;
+  const planArtifactId = (parsed as Record<string, unknown>).plan_artifact_id;
+  if (typeof planArtifactId !== 'string' || planArtifactId === '') return null;
+  // A bad rel path yields null (orphaned) but does NOT unattribute the row.
+  const docRelPathWithinFolder = canonicalDocRelPath((parsed as Record<string, unknown>).doc_rel_path_within_folder);
+  return { planArtifactId, docRelPathWithinFolder };
+}
+
+/** Injectable db/reader seams so both membership sources are testable without a
+ *  live DB, electron, or fs. Defaults bind the real accessors. */
+export interface ListPlanCommentsDeps {
+  getPlanContext(planId: string): PlanContext | null;
+  getWorkspace(workspaceId: string): Workspace | null;
+  listPlanningEntries(workspaceRoot: string, opts: { pathType?: PathType }): PlanningReaderListResult;
+  /** The plan's registered external documents (`proposal` / `legacy-html`). */
+  listRegisteredDocuments(planId: string): RegisteredDocumentRow[];
+  /** Comments whose `file_path` equals an ordinary physical path (source 1). */
+  listCommentsByPath(workspaceId: string, filePath: string): SelectionComment[];
+  /** Every `lares-plan-doc:*` logical-key comment in the workspace (source 2). */
+  listLogicalComments(workspaceId: string): SelectionComment[];
+  listReplies(commentId: string): SelectionCommentReply[];
+}
+
+/** The plan's registered external docs, mirroring plan-documents' default query. */
+function defaultListRegisteredForPlan(planId: string): RegisteredDocumentRow[] {
+  const rows = getDb()
+    .prepare(
+      `SELECT id, plan_id, workspace_id, doc_kind, rel_path, sort_order
+         FROM plan_documents
+        WHERE plan_id = ? AND doc_kind IN ('proposal', 'legacy-html')
+        ORDER BY sort_order, id`,
+    )
+    .all(planId) as any[];
+  return rows.map((row) => ({
+    id: row.id,
+    planId: row.plan_id,
+    workspaceId: row.workspace_id,
+    docKind: row.doc_kind,
+    relPath: row.rel_path,
+    sortOrder: row.sort_order,
+  }));
+}
+
+/** Every logical-key comment in a workspace, mapped through the canonical
+ *  `getSelectionComment` (so anchor/pdf parsing matches the rest of the app). We
+ *  fetch ids by prefix — the `lares-plan-doc:` prefix contains no LIKE wildcard —
+ *  then hydrate each by id, keeping this out of database.ts (no new accessor). */
+function defaultListLogicalComments(workspaceId: string): SelectionComment[] {
+  const ids = getDb()
+    .prepare(
+      `SELECT id FROM selection_comments
+        WHERE workspace_id = ? AND file_path LIKE ?
+        ORDER BY created_at ASC, id ASC`,
+    )
+    .all(workspaceId, `${LOGICAL_PLAN_DOC_PREFIX}%`) as { id: string }[];
+  return ids
+    .map((r) => getSelectionComment(r.id))
+    .filter((c): c is SelectionComment => c != null);
+}
+
+export function defaultListPlanCommentsDeps(): ListPlanCommentsDeps {
+  return {
+    getPlanContext: defaultGetPlanContext,
+    getWorkspace,
+    listPlanningEntries,
+    listRegisteredDocuments: defaultListRegisteredForPlan,
+    listCommentsByPath: listSelectionComments,
+    listLogicalComments: defaultListLogicalComments,
+    listReplies: listSelectionCommentReplies,
+  };
+}
+
+/**
+ * The plan-comment projection. Lists a plan's comments across both membership
+ * sources, each folded with its reply thread and a resolved `PlanCommentTarget`.
+ * Returns null for a missing plan; a missing workspace degrades to an empty list
+ * with a warning (never a throw). Threads are ordered by the comment's creation
+ * time then id for a stable rail order.
+ */
+export function listPlanComments(
+  planId: string,
+  deps: ListPlanCommentsDeps = defaultListPlanCommentsDeps(),
+): PlanCommentsProjection | null {
+  if (typeof planId !== 'string' || planId === '') return null;
+  const context = deps.getPlanContext(planId);
+  if (!context) return null;
+  const workspace = deps.getWorkspace(context.workspaceId);
+  const warnings: string[] = [];
+  const threads: PlanCommentThread[] = [];
+  if (!workspace) return { planId, threads, warnings: ['workspace unavailable'] };
+
+  // ── Source 1: registered external docs (ordinary physical file_path). ──
+  for (const row of deps.listRegisteredDocuments(planId)) {
+    if (row.planId !== planId || row.workspaceId !== workspace.id) continue;
+    const tab = registeredTab(row.docKind);
+    if (!tab) continue;
+    const abs = registeredDocAbsPath(workspace, row.relPath);
+    if (!abs) continue; // failed path validation → no comments surfaced for it
+    const name = path.basename(abs.replace(/\\/g, '/'));
+    for (const comment of deps.listCommentsByPath(workspace.id, abs)) {
+      threads.push({
+        comment,
+        replies: deps.listReplies(comment.id),
+        target: { kind: 'registered', documentId: row.id, tab, name },
+      });
+    }
+  }
+
+  // ── Source 2: folder-doc logical targets (lares-plan-doc:v1: keys). ──
+  let manifest: PlanningReaderListResult;
+  try {
+    manifest = deps.listPlanningEntries(workspace.path, { pathType: workspace.pathType });
+    warnings.push(...manifest.warnings);
+  } catch (err) {
+    manifest = { entries: [], warnings: [] };
+    warnings.push(`folder manifest unavailable: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  const entry = currentFolderEntry(context, manifest);
+  // Current in-folder rel path → live manifest doc. Manifest membership IS the
+  // containment re-validation (planning-reader only lists contained docs), so a
+  // hit is provably inside the plan's CURRENT folder; a miss is a rename/removal.
+  const relIndex = new Map<string, PlanningReaderDocument>();
+  for (const doc of entry?.documents ?? []) {
+    const rel = commentableFolderDocRelPath(doc);
+    if (rel) relIndex.set(rel, doc);
+  }
+
+  for (const comment of deps.listLogicalComments(workspace.id)) {
+    const attribution = decodeV1ForAttribution(comment.filePath);
+    // Unattributable (unknown version / unparseable / no artifact id) → a member
+    // of no plan; never stat-ed, never path-converted. Different plan → skip.
+    if (!attribution || attribution.planArtifactId !== context.artifactId) continue;
+    const { docRelPathWithinFolder } = attribution;
+    const doc = docRelPathWithinFolder ? relIndex.get(docRelPathWithinFolder) : undefined;
+    const tab = doc ? folderDocTab(doc.category) : null;
+    const target: PlanCommentTarget =
+      doc && tab && docRelPathWithinFolder
+        ? { kind: 'folder-doc', documentId: doc.docId, tab, docRelPath: docRelPathWithinFolder, name: doc.name }
+        : { kind: 'orphaned', docRelPath: docRelPathWithinFolder };
+    threads.push({ comment, replies: deps.listReplies(comment.id), target });
+  }
+
+  threads.sort(
+    (a, b) =>
+      (a.comment.createdAt || '').localeCompare(b.comment.createdAt || '') ||
+      a.comment.id.localeCompare(b.comment.id),
+  );
+  return { planId, threads, warnings };
 }

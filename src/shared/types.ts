@@ -4756,6 +4756,64 @@ export type AnswerPlanCommentResult =
   | { ok: true; reply: SelectionCommentReply }
   | { ok: false; code: AnswerPlanCommentErrorCode; error: string };
 
+// ── WP-P4D-proj — plan-comment projection (dual-source; logical-key resolution) ─
+// The read surface for the comments rail. It rolls up EVERY comment on a plan —
+// across its registered external documents (ordinary physical `file_path`) AND its
+// folder-doc logical targets (`lares-plan-doc:v1:` keys) — each with its reply
+// thread and a resolved target descriptor telling the renderer which tab/document
+// it belongs to. Folder-doc keys are parsed ONLY in the exact `v1:` form and
+// resolved through the plan's CURRENT folder (a folder rename keeps them attached
+// via the durable `plan_artifact_id`). A key whose in-folder document no longer
+// resolves — or a malformed / bad-rel-path `v1:` key — surfaces as an explicit
+// ORPHANED plan-document target, never a filesystem path and never silently
+// dropped. A key that cannot be attributed to a plan at all (unknown version,
+// unparseable payload, missing artifact id) is a member of no plan.
+
+/** Where a listed comment attaches to the plan. A `registered` target is an
+ *  external proposal / legacy-html document (ordinary physical `file_path`); a
+ *  `folder-doc` target resolved to a live in-folder document (opaque manifest doc
+ *  id); an `orphaned` target is a folder-doc logical key whose document no longer
+ *  resolves through the current plan folder. */
+export type PlanCommentTarget =
+  | {
+      kind: 'registered';
+      /** The `plan_documents` row id (opaque handle for the renderer). */
+      documentId: string;
+      tab: PlanTabKey; // 'proposal' | 'legacy-html'
+      /** Basename for display. */
+      name: string;
+    }
+  | {
+      kind: 'folder-doc';
+      /** The CURRENT manifest doc id (opaque; the renderer reads it by id). */
+      documentId: string;
+      tab: PlanTabKey; // 'plan' | 'overview' | 'deliberations' | 'research' | 'supplements'
+      /** In-folder POSIX rel path the comment is durably keyed to. */
+      docRelPath: string;
+      /** Basename for display. */
+      name: string;
+    }
+  | {
+      kind: 'orphaned';
+      /** The in-folder rel path from the logical key when decodable, else null. */
+      docRelPath: string | null;
+    };
+
+/** One question comment rolled up with its companion reply thread and target. */
+export interface PlanCommentThread {
+  comment: SelectionComment;
+  /** The companion `selection_comment_replies` rows, oldest first. */
+  replies: SelectionCommentReply[];
+  target: PlanCommentTarget;
+}
+
+export interface PlanCommentsProjection {
+  planId: string;
+  threads: PlanCommentThread[];
+  /** Non-fatal diagnostics (folder manifest unavailable, workspace missing…). */
+  warnings: string[];
+}
+
 // ── WP-P2C — unified gallery projection ───────────────────────────────────────
 // A single server projection that unions three durable row kinds for the Plans
 // gallery: filesystem-owned proposals, folder-per-plan `structured` plans, and
