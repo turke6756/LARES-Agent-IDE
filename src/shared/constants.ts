@@ -5419,7 +5419,7 @@ export const BUNDLE_CONTRACT_VERSION = 1;
 export const COMMIT_CANDIDATE_TOKEN_CAP_PER_REPOSITORY = 128;
 export const RETENTION_PIN_QUOTA_BYTES = 536_870_912; // 512 MiB logical pinned-byte budget
 export const RETENTION_PIN_MAX_EXTENSION_MS = 2_592_000_000; // 30 days
-export const SAVE_CARD_COMMIT_COORDINATOR_ENABLED = false; // stays false until the Stage-4 adversarial matrix passes
+export const SAVE_CARD_COMMIT_COORDINATOR_ENABLED = true; // enabled after the Stage-4 adversarial matrix passed
 
 // ══════════════════════════════════════════════════════════════════════════
 // WP-P0C — proposal-to-plan skill tree (scaffold content). One versioned

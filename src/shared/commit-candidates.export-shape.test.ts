@@ -225,6 +225,6 @@ assert.equal(BUNDLE_CONTRACT_VERSION, 1);
 assert.equal(COMMIT_CANDIDATE_TOKEN_CAP_PER_REPOSITORY, 128);
 assert.equal(RETENTION_PIN_QUOTA_BYTES, 536_870_912);
 assert.equal(RETENTION_PIN_MAX_EXTENSION_MS, 2_592_000_000);
-assert.equal(SAVE_CARD_COMMIT_COORDINATOR_ENABLED, false);
+assert.equal(SAVE_CARD_COMMIT_COORDINATOR_ENABLED, true);
 
 console.log('commit-candidates export shape: ok');
