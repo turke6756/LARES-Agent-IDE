@@ -118,6 +118,10 @@ const TESTS = [
   'dist/main/main/database.active-agents.test.js',
   // Save-card SC-WP-2A: immutable turn plan-stamp schema, mapper, and guards.
   'dist/main/main/database.turnStamp.test.js',
+  // Save-card Stage ③ SC-WP-3A/3B — plan work-package schema/accessors and the
+  // finalizations table (WP-3Z registration).
+  'dist/main/main/database.planWorkPackages.test.js',
+  'dist/main/main/database.finalizations.test.js',
   'dist/main/main/dispatch-binding.boundary.test.js',
   // Save-card SC-WP-2H/2J/2K: pin policy/accounting and commit representation.
   'dist/main/main/git-checkpoints/protection-policy.test.js',
@@ -201,6 +205,11 @@ const TESTS = [
   // maintenance (idle-only slot, no config mutation, nonfatal on lock), storage report.
   'dist/main/main/git-checkpoints/retention.test.js',
   'dist/main/main/git-checkpoints/retention.pinning.test.js',
+  // Save-card Stage ③ SC-WP-3B/3D — finalization refs + crash-consistency
+  // reconcile and the boundary-ref retention partition (WP-3Z registration).
+  'dist/main/main/git-checkpoints/finalization-refs.test.js',
+  'dist/main/main/git-checkpoints/finalization-reconcile.test.js',
+  'dist/main/main/git-checkpoints/retention.boundaryRef.test.js',
   // Git-Native WP-G1.7: witness-join recorder + DB choke point (above the live-cache
   // dedupe), dispatch-context builder, and the send-queue → before-checkpoint wiring.
   'dist/main/main/git-checkpoints/witness-recorder.test.js',
@@ -239,6 +248,14 @@ const TESTS = [
   // the renderer workspaceId to a repository-scoped request and delegates to the
   // read-only facade (real temp git; only the registry + DB readers are faked).
   'dist/main/main/commit-candidates/save-card-routes.test.js',
+  // Save-card Stage ③ SC-WP-3C/3G — candidate build pipeline + immutable
+  // index-fingerprint snapshot, real finalization service, and the finalize/
+  // preview IPC facades (WP-3Z registration).
+  'dist/main/main/commit-candidates/candidate-service.build.test.js',
+  'dist/main/main/commit-candidates/index-fingerprint.test.js',
+  'dist/main/main/commit-candidates/finalization-service.test.js',
+  'dist/main/main/commit-candidates/save-card-ipc.finalize.test.js',
+  'dist/main/main/commit-candidates/save-card-ipc.preview.test.js',
   'dist/main/main/supervisor/send-queue-checkpoint.test.js',
   'dist/main/main/supervisor/initial-user-prompt.test.js',
   'dist/main/main/supervisor/hook-spool-tailer.test.js',
@@ -554,6 +571,8 @@ const TESTS = [
   'dist/main/main/plans/plan-rail-contract.test.js',
   // WP-P1A: planning-reader bounded enumeration + safe read IPC.
   'dist/main/main/plans/planning-reader.test.js',
+  // Save-card Stage ③ SC-WP-3E — plan-lens finalize IPC facade (WP-3Z registration).
+  'dist/main/main/plans/plan-ipc.finalize.test.js',
   // Planning-surface Stage P2 (gate P2Z) — folder-per-plan ingest + proposals.
   // WP-P2A: proposals table schema/accessors.
   'dist/main/main/database.proposals.test.js',
