@@ -39,9 +39,22 @@ export interface PlanIntentOutputProjection {
   foldedIn: boolean;
 }
 
+export type PlanIntentRunState = 'dispatched' | 'running' | 'returned' | 'abandoned';
+
+export interface PlanIntentRunProjection {
+  orchestrationId: string;
+  state: PlanIntentRunState;
+  /** The live value from orchestrations, retained for diagnostics. */
+  orchestrationStatus: string;
+  returnedOutputExists: boolean;
+}
+
 export interface PlanIntentProjection {
   intentId: string;
   status: 'active' | 'withdrawn' | 'superseded';
+  /** Server-witnessed only: true iff the composite orchestration join finds a row. */
+  ran: boolean;
+  runs: PlanIntentRunProjection[];
   returned: boolean;
   fullyFoldedIn: boolean;
   open: boolean;
@@ -344,6 +357,27 @@ function projection(planId: string): PlanIntentProjection[] {
     intent_id: string; rel_path: string; orchestration_id: string | null;
     present_on_disk: number; disposition: PlanIntentOutputProjection['disposition']; folded_in: number;
   }>;
+  // The ran rung is server-witnessed by the orchestration row. Both join terms
+  // are load-bearing because intent_id is unique only within one plan; the
+  // composite index idx_orchestrations_plan_intent serves this join.
+  const witnessedRuns = db.prepare(
+    `SELECT pi.intent_id, o.run_id, o.status,
+            EXISTS (
+              SELECT 1 FROM plan_intent_outputs pio
+               WHERE pio.plan_id = pi.plan_id
+                 AND pio.intent_id = pi.intent_id
+                 AND pio.orchestration_id = o.run_id
+                 AND pio.present_on_disk = 1
+            ) AS returned_output_exists
+       FROM plan_intents pi
+       JOIN orchestrations o
+         ON o.plan_id = pi.plan_id
+        AND o.planning_intent_id = pi.intent_id
+      WHERE pi.plan_id = ?
+      ORDER BY o.started_at, o.run_id`,
+  ).all(planId) as Array<{
+    intent_id: string; run_id: string; status: string; returned_output_exists: number;
+  }>;
   return intents.map((intent) => {
     const rows = outputs.filter((output) => output.intent_id === intent.intent_id).map((output) => ({
       relPath: output.rel_path,
@@ -355,9 +389,27 @@ function projection(planId: string): PlanIntentProjection[] {
     const present = rows.filter((output) => output.presentOnDisk);
     const required = present.filter((output) => output.disposition === 'active');
     const fullyFoldedIn = required.length > 0 && required.every((output) => output.foldedIn);
+    const runs = witnessedRuns
+      .filter((run) => run.intent_id === intent.intent_id)
+      .map((run): PlanIntentRunProjection => {
+        const returnedOutputExists = run.returned_output_exists === 1;
+        let state: PlanIntentRunState;
+        if (returnedOutputExists) state = 'returned';
+        else if (run.status === 'starting') state = 'dispatched';
+        else if (run.status === 'running') state = 'running';
+        else state = 'abandoned';
+        return {
+          orchestrationId: run.run_id,
+          state,
+          orchestrationStatus: run.status,
+          returnedOutputExists,
+        };
+      });
     return {
       intentId: intent.intent_id,
       status: intent.status,
+      ran: runs.length > 0,
+      runs,
       returned: present.length > 0,
       fullyFoldedIn,
       open: intent.status === 'active' && !fullyFoldedIn,

@@ -6931,6 +6931,7 @@ function rowToOrchestrationRun(row: any): OrchestrationRun {
     endedAt: row.ended_at ?? undefined,
     error: row.error ?? undefined,
     planId: row.plan_id ?? undefined,
+    planningIntentId: row.planning_intent_id ?? null,
     planItemId: row.plan_item_id ?? null,
     sectionAnchor: row.section_anchor ?? undefined,
     planBindingMode: row.plan_binding_mode ?? (row.plan_id ? 'explicit' : 'agent-default'),
@@ -6944,8 +6945,8 @@ export function insertOrchestration(r: OrchestrationRun): void {
        run_id, name, mode, status, workspace_id, supervisor_id, topic, plan_path,
        lead_provider, reviewer_provider, turn_timeout_ms, lead_id, reviewer_id,
        turn, round, last_relayed_ts, started_at, updated_at, ended_at, error,
-       plan_id, section_anchor, plan_item_id, plan_binding_mode
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       plan_id, section_anchor, plan_item_id, plan_binding_mode, planning_intent_id
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(run_id) DO UPDATE SET
        name = excluded.name, mode = excluded.mode, status = excluded.status,
        workspace_id = excluded.workspace_id, supervisor_id = excluded.supervisor_id,
@@ -6956,7 +6957,8 @@ export function insertOrchestration(r: OrchestrationRun): void {
        last_relayed_ts = excluded.last_relayed_ts, started_at = excluded.started_at,
        updated_at = excluded.updated_at, ended_at = excluded.ended_at, error = excluded.error,
        plan_id = excluded.plan_id, section_anchor = excluded.section_anchor,
-       plan_item_id = excluded.plan_item_id, plan_binding_mode = excluded.plan_binding_mode`,
+       plan_item_id = excluded.plan_item_id, plan_binding_mode = excluded.plan_binding_mode,
+       planning_intent_id = COALESCE(orchestrations.planning_intent_id, excluded.planning_intent_id)`,
     [
       r.runId, r.name, r.mode, r.status, r.workspaceId, r.supervisorId,
       r.topic, r.planPath, r.leadProvider, r.reviewerProvider, r.turnTimeoutMs,
@@ -6965,8 +6967,24 @@ export function insertOrchestration(r: OrchestrationRun): void {
       r.endedAt ?? null, r.error ?? null,
       r.planId ?? null, r.sectionAnchor ?? null, r.planItemId ?? null,
       r.planBindingMode ?? (r.planId ? 'explicit' : 'agent-default'),
+      r.planningIntentId ?? null,
     ]
   );
+}
+
+/** Trusted launch-boundary lookup for a requested planning intent. Identity is
+ * composite: the same intent_id may exist in another plan or workspace. */
+export function getActivePlanningIntentForLaunch(
+  workspaceId: string,
+  planId: string,
+  intentId: string,
+): { planId: string; intentId: string; status: 'active' } | null {
+  const row = queryOne(
+    `SELECT plan_id, intent_id, status FROM plan_intents
+     WHERE workspace_id = ? AND plan_id = ? AND intent_id = ? AND status = 'active'`,
+    [workspaceId, planId, intentId],
+  );
+  return row ? { planId: row.plan_id, intentId: row.intent_id, status: 'active' } : null;
 }
 
 /** Persist progress on an existing run (same upsert path as insert). */

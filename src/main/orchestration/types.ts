@@ -49,6 +49,9 @@ export interface RunOrchestrationRequest {
   // (AGENT_DASHBOARD_PLAN_ID / _PLAN_SECTION) via the WP1 launch rail, and drive
   // one-writer-per-plan enforcement (§D-WRITE-POLICY) + section-change done-detection.
   planId?: string;
+  /** Requested marked planning intent. Trusted launch code validates this
+   *  against (workspaceId, planId) before freezing it onto the run row. */
+  planningIntentId?: string;
   sectionAnchor?: string;
   leadProvider?: string;             // default 'claude'
   reviewerProvider?: string;         // default 'codex'
@@ -92,6 +95,8 @@ export interface OrchestrationRun {
   planPath: string;                  // absolute
   // WP6 planning-surface rail (frozen at dispatch). See RunOrchestrationRequest.
   planId?: string;
+  /** Server-witnessed planning-intent association, frozen for this run. */
+  planningIntentId?: string | null;
   /** Frozen item stamp for the run (SC-WP-3A). Null/absent for a plan-only or
    *  default binding; an explicit plan+item run carries the validated item id. */
   planItemId?: string | null;

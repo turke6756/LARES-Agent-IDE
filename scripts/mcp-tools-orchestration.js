@@ -183,6 +183,7 @@ function getOrchestrationToolDefinitions() {
           reviewer_provider:  { type: 'string', description: 'Default codex.' },
           turn_timeout_ms:    { type: 'number', description: 'Per-turn stall timeout, default 600000.' },
           plan_id:            { type: 'string', description: 'Plan rail: an existing plan id (from create_plan). The run edits that plan at section_anchor instead of writing a fresh plan file. One live run per plan (409 otherwise).' },
+          planning_intent_id: { type: 'string', description: 'Marked PLAN-INTENT id served by this planning deliberation. Requires plan_id; the server validates same-plan active status before launch.' },
           section_anchor:     { type: 'string', description: 'Plan rail: the sec_ section this run writes (required with plan_id); never sec_exectr.' },
           resume_run_id:      { type: 'string', description: 'Resume a prior stalled run by its runId.' },
           resume_lead_id:     { type: 'string', description: 'Legacy serial resume: lead agent id.' },
@@ -404,7 +405,8 @@ async function handleOrchestrationToolCall(name, args, apiRequest) {
       const params = {
         workspaceId: args.workspace_id, supervisorId: args.supervisor_id,
         mode: args.mode, topic: args.topic, planPath: args.plan_path,
-        planId: args.plan_id, sectionAnchor: args.section_anchor,
+        planId: args.plan_id, planningIntentId: args.planning_intent_id,
+        sectionAnchor: args.section_anchor,
         leadProvider: args.lead_provider, reviewerProvider: args.reviewer_provider,
         turnTimeoutMs: args.turn_timeout_ms,
         resumeRunId: args.resume_run_id, resumeLeadId: args.resume_lead_id,

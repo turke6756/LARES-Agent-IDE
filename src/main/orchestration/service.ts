@@ -11,6 +11,7 @@ import {
 } from './types';
 import {
   getWorkspace, getPlan,
+  getActivePlanningIntentForLaunch,
   insertOrchestration, updateOrchestration, getOrchestrationRun, listOrchestrationRuns,
   insertOrchestrationEvent, insertOrchestrationMember, markActiveRunsAborted,
 } from '../database';
@@ -107,10 +108,21 @@ export class OrchestrationService extends EventEmitter {
     if (req.resumeRunId) {
       const prior = getOrchestrationRun(req.resumeRunId);
       if (!prior) throw httpErr(404, `No such run: ${req.resumeRunId}`);
+      if (req.planningIntentId !== undefined && req.planningIntentId !== prior.planningIntentId) {
+        throw httpErr(409, 'A resumed orchestration cannot change its frozen planning intent');
+      }
       run = { ...prior, status: 'running', error: undefined, endedAt: undefined, updatedAt: nowIso() };
     } else {
       const ws = getWorkspace(req.workspaceId);
       if (!ws) throw httpErr(404, 'Workspace not found');
+      if (req.planningIntentId && !req.planId) {
+        throw httpErr(400, 'planningIntentId requires planId');
+      }
+      if (req.planningIntentId && !getActivePlanningIntentForLaunch(
+        req.workspaceId, req.planId!, req.planningIntentId,
+      )) {
+        throw httpErr(409, 'Planning intent is not active in the requested plan');
+      }
       // WP6 §D-WRITE-POLICY / GT-C §O.2 — one active writer per plan file, enforced
       // AT DISPATCH through the SHARED `assertPlanRailFree` guard (so this path and
       // `POST /api/agents` cannot drift). A second groupthink targeting a plan that
@@ -146,6 +158,7 @@ export class OrchestrationService extends EventEmitter {
         topic: req.topic || 'Research and plan a feature.',
         planPath: path.isAbsolute(planRel) ? planRel : path.join(ws.path, planRel),
         planId: req.planId,
+        planningIntentId: req.planningIntentId ?? null,
         sectionAnchor: req.sectionAnchor,
         leadProvider: req.leadProvider || 'claude',
         reviewerProvider: req.reviewerProvider || 'codex',
