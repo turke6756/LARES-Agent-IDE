@@ -4,9 +4,11 @@
 // Covers:
 //   1. Supervised codex launch on Windows mkdirs `.lares/workers/codex/`
 //      that the claude-only scaffolder would otherwise skip.
-//   2. Explicit `working_directory` that escapes the workspace root is
-//      rejected with a clear error instead of silently mkdir-ing arbitrary
-//      tree depth.
+//   2. Explicit canonical lane cwd is honored verbatim while all scaffolding
+//      remains rooted at the workspace.
+//   3. Explicit state-dir paths that are not canonical lanes are rejected.
+//   4. Explicit `working_directory` that escapes the workspace root is rejected
+//      with a clear error instead of silently mkdir-ing arbitrary tree depth.
 //
 // Compile via the main tsconfig and run with:
 //   npm run build:main
@@ -157,6 +159,96 @@ test('launchAgent mkdirs .lares/workers/<provider>/ for a supervised codex launc
       expectedCwd,
       'agentCwd persisted on the agent row must match the mkdir target',
     );
+    assert.ok(
+      fs.existsSync(path.join(workspacePath, '.lares', 'scripts', 'dashboard-status.mjs')),
+      'unset working_directory must keep scaffolding at the workspace root',
+    );
+    assert.equal(
+      fs.existsSync(path.join(expectedCwd, '.lares')),
+      false,
+      'unset working_directory must not grow a nested state directory in the derived lane',
+    );
+  } finally {
+    restoreRunners();
+    restoreDb();
+    fs.rmSync(workspacePath, { recursive: true, force: true });
+  }
+});
+
+test('launchAgent honors an explicit canonical worker lane cwd without nesting workspace scaffold', async () => {
+  const workspacePath = fs.mkdtempSync(path.join(os.tmpdir(), 'ad-cwd-explicit-lane-'));
+  const lanePath = path.join(workspacePath, '.lares', 'workers', 'codex');
+  fs.mkdirSync(lanePath, { recursive: true });
+  const created: Agent[] = [];
+  const restoreDb = patchDb(workspacePath, created);
+  const restoreRunners = patchRunners();
+  try {
+    const supervisor = makeSupervisor();
+
+    await supervisor.launchAgent({
+      workspaceId: 'ws-1',
+      title: 'resurrected codex worker',
+      provider: 'codex',
+      isSupervised: true,
+      workingDirectory: lanePath,
+      command: 'codex --dangerously-bypass-approvals-and-sandbox',
+    });
+
+    assert.equal(created.length, 1, 'one agent row should be created');
+    assert.equal(created[0].workingDirectory, lanePath, 'canonical lane cwd must be used verbatim');
+    assert.equal(created[0].isWorker, true, 'team-style worker lane flag must remain intact');
+    assert.equal(created[0].isSupervised, true, 'team-style supervised flag must remain intact');
+    assert.equal(
+      fs.existsSync(path.join(lanePath, '.lares')),
+      false,
+      'launch must not create a nested state directory inside the explicit lane cwd',
+    );
+    assert.ok(
+      fs.existsSync(path.join(workspacePath, '.lares', 'scripts', 'dashboard-status.mjs')),
+      'shared scaffold must land under workspace.path',
+    );
+    assert.ok(
+      fs.existsSync(path.join(workspacePath, '.lares', '.scaffold-versions.json')),
+      'scaffold version sidecar must land under workspace.path',
+    );
+  } finally {
+    restoreRunners();
+    restoreDb();
+    fs.rmSync(workspacePath, { recursive: true, force: true });
+  }
+});
+
+test('launchAgent rejects an explicit state-dir path that is not a canonical lane', async () => {
+  const workspacePath = fs.mkdtempSync(path.join(os.tmpdir(), 'ad-cwd-noncanonical-'));
+  const invalidPath = path.join(workspacePath, '.lares', 'workers', 'codex', 'nested');
+  const created: Agent[] = [];
+  const restoreDb = patchDb(workspacePath, created);
+  const restoreRunners = patchRunners();
+  try {
+    const supervisor = makeSupervisor();
+
+    await assert.rejects(
+      supervisor.launchAgent({
+        workspaceId: 'ws-1',
+        title: 'invalid nested lane',
+        provider: 'codex',
+        isWorker: true,
+        workingDirectory: invalidPath,
+      }),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /not a canonical lane directory/i);
+        assert.ok(
+          error.message.toLowerCase().includes(invalidPath.toLowerCase()),
+          `error must name rejected path ${invalidPath}; got: ${error.message}`,
+        );
+        return true;
+      },
+      'state-dir paths below a canonical lane must be rejected with the offending path',
+    );
+
+    assert.equal(created.length, 0, 'guard must reject before creating an agent row');
+    assert.equal(fs.existsSync(invalidPath), false, 'guard must reject before mkdir of the invalid cwd');
   } finally {
     restoreRunners();
     restoreDb();

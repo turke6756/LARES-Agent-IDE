@@ -2603,11 +2603,19 @@ export class AgentSupervisor extends EventEmitter {
       resolvedInput.ownerAgentId = undefined;   // no owner edge — a peer, not a child
     }
 
-    let workDir = resolvedInput.workingDirectory || workspace.path;
+    // Scaffolding and state-dir resolution are always anchored at the workspace
+    // root. An explicit workingDirectory controls only the launched agent's cwd;
+    // treating it as this root can recursively scaffold a full workspace kit
+    // inside an already-scaffolded lane directory.
+    let workDir = workspace.path;
     const pathType = detectPathType(workDir);
     // Convert UNC WSL paths (\\wsl.localhost\...) to Linux paths (/home/...)
     if (pathType === 'wsl' && workDir.startsWith('\\\\')) {
       workDir = uncToWslPath(workDir);
+    }
+    let explicitAgentCwd = resolvedInput.workingDirectory;
+    if (explicitAgentCwd && pathType === 'wsl' && explicitAgentCwd.startsWith('\\\\')) {
+      explicitAgentCwd = uncToWslPath(explicitAgentCwd);
     }
 
     // #18 — a persona may declare exactly one native lane in persona.json. Stamp
@@ -2759,16 +2767,24 @@ export class AgentSupervisor extends EventEmitter {
     // on first touch (and falling back to `.dashboard` for this session when
     // the rename is blocked by locked files) — see workspace-state-dir.ts.
     const stateDirName = workspaceStateDirName(workDir, pathType);
-    let agentCwd = workDir;
-    if (resolvedInput.persona) {
+    const normalizeLaunchPath = (p: string) => pathType === 'windows'
+      ? path.resolve(p).toLowerCase().replace(/[\\/]+$/, '')
+      : p.replace(/\/+$/, '');
+    const sep = pathType === 'windows' ? path.sep : '/';
+    const normRoot = normalizeLaunchPath(workDir);
+    const normExplicitCwd = explicitAgentCwd ? normalizeLaunchPath(explicitAgentCwd) : null;
+    const shouldDeriveLane = !explicitAgentCwd || normExplicitCwd === normRoot;
+
+    let agentCwd = explicitAgentCwd || workDir;
+    if (shouldDeriveLane && resolvedInput.persona) {
       agentCwd = pathType === 'windows'
         ? path.join(workDir, stateDirName, 'agents', resolvedInput.persona)
         : `${workDir}/${stateDirName}/agents/${resolvedInput.persona}`;
-    } else if (resolvedInput.isSupervisor) {
+    } else if (shouldDeriveLane && resolvedInput.isSupervisor) {
       agentCwd = pathType === 'windows'
         ? path.join(workDir, stateDirName, 'supervisor')
         : `${workDir}/${stateDirName}/supervisor`;
-    } else if (isResearcher) {
+    } else if (shouldDeriveLane && isResearcher) {
       // Researcher role-lane (browser-parity-and-capability-isolation §0): its
       // own .lares/researcher/ cwd so it picks up RESEARCHER_AGENT_MD as
       // native CLAUDE.md + the scaffolded settings.json (status + write-guard
@@ -2776,7 +2792,7 @@ export class AgentSupervisor extends EventEmitter {
       agentCwd = pathType === 'windows'
         ? path.join(workDir, stateDirName, 'researcher')
         : `${workDir}/${stateDirName}/researcher`;
-    } else if (isWorkerLane) {
+    } else if (shouldDeriveLane && isWorkerLane) {
       agentCwd = pathType === 'windows'
         ? path.join(workDir, stateDirName, 'workers', provider)
         : `${workDir}/${stateDirName}/workers/${provider}`;
@@ -2790,17 +2806,43 @@ export class AgentSupervisor extends EventEmitter {
     // or typo'd `working_directory` could escape the workspace via `..` or an
     // unrelated absolute path.
     {
-      const root = workspace.path;
-      const normalize = (p: string) => pathType === 'windows'
-        ? path.resolve(p).toLowerCase().replace(/[\\/]+$/, '')
-        : p.replace(/\/+$/, '');
-      const sep = pathType === 'windows' ? path.sep : '/';
-      const normRoot = normalize(root);
-      const normCwd = normalize(agentCwd);
+      const normCwd = normalizeLaunchPath(agentCwd);
       if (normCwd !== normRoot && !normCwd.startsWith(normRoot + sep)) {
         throw new Error(
-          `agentCwd '${agentCwd}' resolves outside workspace root '${root}'`,
+          `agentCwd '${agentCwd}' resolves outside workspace root '${workDir}'`,
         );
+      }
+
+      // A caller may revive/fork/resurrect an agent directly into its canonical
+      // lane. Reject every other explicit path containing a Lares state-dir
+      // segment so a typo cannot become a nested scaffold or an incidental cwd.
+      if (explicitAgentCwd) {
+        const comparableCwd = pathType === 'windows' ? normCwd.toLowerCase() : normCwd;
+        const stateSegments = comparableCwd.split(/[\\/]+/);
+        const laresName = pathType === 'windows' ? LARES_DIR_NAME.toLowerCase() : LARES_DIR_NAME;
+        const legacyName = pathType === 'windows' ? LEGACY_LARES_DIR_NAME.toLowerCase() : LEGACY_LARES_DIR_NAME;
+        const containsStateDir = stateSegments.includes(laresName) || stateSegments.includes(legacyName);
+        if (containsStateDir) {
+          const normStateRoot = normalizeLaunchPath(
+            pathType === 'windows'
+              ? path.join(workDir, stateDirName)
+              : `${workDir}/${stateDirName}`,
+          );
+          const relativeLane = normCwd.startsWith(normStateRoot + sep)
+            ? normCwd.slice(normStateRoot.length + sep.length).split(/[\\/]+/)
+            : [];
+          const isCanonicalLane =
+            (relativeLane.length === 1 && (relativeLane[0] === 'supervisor' || relativeLane[0] === 'researcher')) ||
+            (relativeLane.length === 2 && relativeLane[0] === 'workers' &&
+              Object.prototype.hasOwnProperty.call(PROVIDER_COMMANDS, relativeLane[1])) ||
+            (relativeLane.length === 2 && relativeLane[0] === 'agents' && relativeLane[1].length > 0);
+          if (!isCanonicalLane) {
+            throw new Error(
+              `Explicit workingDirectory '${explicitAgentCwd}' contains a Lares state-directory segment ` +
+              `but is not a canonical lane directory for workspace '${workDir}'`,
+            );
+          }
+        }
       }
     }
 
