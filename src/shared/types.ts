@@ -2248,6 +2248,59 @@ export interface PlanCandidatePreviewResponse {
   };
 }
 
+// ── WP-P7A-proj — conservative plan-review projection ────────────────────────
+
+/** A review diff is identified by its execution run and witnessed path set, never
+ * by the Save-card candidate id. The patch compares the pinned execution baseline
+ * to current worktree bytes; `unborn` means the run began before the first commit. */
+export interface PlanReviewBaselineDiff {
+  executionRunId: string;
+  baseline:
+    | { kind: 'head'; ref: string; headOid: string }
+    | { kind: 'unborn' };
+  witnessedPaths: string[];
+  repositoryPaths: string[];
+  patch: string;
+}
+
+export interface PlanReviewMixedAuthorshipAnnotation {
+  componentId: string;
+  planIds: Array<string | null>;
+  otherPlanIds: Array<string | null>;
+  contributingTurnIds: string[];
+  reasons: Array<'multiple-plans' | 'unattributed-contributor' | 'multiple-agents'>;
+  /** Conservative wording: component evidence cannot establish byte/line authorship. */
+  currentBytesMayContainMixedAuthorship: true;
+}
+
+export interface PlanReviewCaptureGapAnnotation {
+  source: 'component-capture' | 'plan-stamp';
+  componentId: string | null;
+  turnIds: string[];
+  pathsWithoutFinalizationEdge: string[];
+  reasons: Array<'capture-outage' | 'incomplete-edge' | 'unstamped-turn' | 'unverified-turn'>;
+}
+
+/**
+ * Primary plan-review DTO. This is deliberately NOT a candidate model: the only
+ * candidate identity remains inside the unchanged SC object. Baseline-diff path
+ * identity and Save-lens membership are separate fields and must not be equated.
+ */
+export interface PlanReviewProjection {
+  workspaceId: string;
+  planId: string;
+  baselineDiff: PlanReviewBaselineDiff;
+  scObject:
+    | import('./commit-candidates').CommitCandidate
+    | import('./commit-candidates').SelectionPreview;
+  annotations: {
+    mixedAuthorship: PlanReviewMixedAuthorshipAnnotation[];
+    captureGaps: PlanReviewCaptureGapAnnotation[];
+  };
+  /** Activity and diff evidence are review aids only; they never assert completion. */
+  evidenceSemantics: 'activity-only-never-completion';
+}
+
 /** IPC channel names for the renderer checkpoint surface — one source of truth for
  *  preload, the main registrar, and the contract test. */
 export const CHECKPOINT_CHANNELS = {
