@@ -586,6 +586,31 @@ const TESTS = [
   'dist/main/main/plans/structured-exclusion.test.js',
   // WP-P2B-folder: plan-folder-watcher — <workspaceStateDir()>/plans/*/ ingest.
   'dist/main/main/plans/plan-folder-watcher.test.js',
+  // Planning-surface Stage P3 (gate P3Z) — proposal→promotion→dispatchable-WP.
+  // WP-P3A′: responsibility + promotion_requests schema/accessors.
+  'dist/main/main/database.responsibility.test.js',
+  'dist/main/main/database.promotion-requests.test.js',
+  // WP-P2L-schema: plan-intents table schema. WP-P4D-reply: selection-comment
+  // replies DDL.
+  'dist/main/main/plan-intents.schema.test.js',
+  'dist/main/main/selection-comment-replies.schema.test.js',
+  // WP-P3-manifest: plan.json sidecar manifest loader + TS/JS interop.
+  'dist/main/main/plans/plan-manifest.test.js',
+  'dist/main/main/plans/plan-manifest-interop.test.js',
+  // WP-P3B-core: proposal→plan promotion core + supervisor launch binding.
+  'dist/main/main/plans/promote-proposal.core.test.js',
+  'dist/main/main/supervisor/promotion-launch-binding.test.js',
+  // WP-P3B-enrich: post-adoption enrichment (single source-proposal plan_documents row).
+  'dist/main/main/plans/promote-proposal.enrich.test.js',
+  // WP-P3-reconcile: pending-promotion startup reconstruction.
+  'dist/main/main/plans/promotion-reconciler.test.js',
+  // WP-P3C′: proposal:promote / proposal:promotionStatus IPC.
+  'dist/main/main/plans/proposal-promote-ipc.test.js',
+  // WP-P3-wire: promotion claim-scan + service wiring.
+  'dist/main/main/plans/promotion-claim-scan.test.js',
+  'dist/main/main/plans/promotion-service-wiring.test.js',
+  // WP-P2L-ingest: transactional plan-intent ledger scan.
+  'dist/main/main/plans/plan-intent-ledger.test.js',
   'dist/main/main/browser/credentialed-open-diagnostic.test.js',
   'dist/main/main/browser/browser-signin-workspace-exact.test.js',
   'dist/main/main/browser/browser-signin-expiry.test.js',
