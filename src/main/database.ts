@@ -7302,3 +7302,85 @@ export function recordPromotionFailed(input: {
   });
   tx();
 }
+// ── WP-P3B-enrich — the ONE SQLite transaction of the enrichment saga ──────────
+// ACCESSORS ONLY (A2 DDL window CLOSED). Runs SECOND, AFTER the manifest step has
+// observed the deterministic responsibility event outside SQLite (SQLite and
+// plan.json never share a transaction). In ONE transaction, atomically (§R-P3
+// points 3/4): attach the plan's `source_proposal_id` + `responsible_supervisor_id`,
+// set the supervisor's `supervisor_active_plan` + an ordinary `supervisor_focus`,
+// mark the source proposal `state='promoted'` + `promoted_to_plan_id`, write
+// EXACTLY ONE `plan_documents` row (the source proposal, idempotent — nothing else
+// is ever mirrored; the folder is the document set, §P3-GAP), and flip
+// `promotion_requests` pending → adopted. NEVER replaces the adopted `plans` row and
+// NEVER writes a P2-owned column (folder_rel_path / path / format / run_state /
+// artifact_id / mtime_ms / size_bytes). Idempotent across re-enrichment (a live
+// retry or the pending-scan reconciler redoes the same work with no duplicate row /
+// no state churn). The single `plan_documents` write is caller-id'd so a genuine PK
+// collision surfaces as a clean throw that rolls the WHOLE transaction back.
+export function enrichAdoptedPlanRow(input: {
+  requestId: string;
+  planId: string;
+  workspaceId: string;
+  sourceProposalId: string;
+  responsibleSupervisorId: string | null;
+  /** From `plan.json.source_proposal.rel_path`; containment-checked by the caller. */
+  sourceProposalRelPath: string;
+  /** Caller-generated id for the single source-proposal `plan_documents` row. */
+  docId: string;
+  /** Service-owned epoch ms for the INTEGER `updated_at`/`promoted_at` columns. */
+  nowMs: number;
+}): void {
+  const tx = db.transaction(() => {
+    // 1. Plan enrichment columns — P3-owned only. P2 columns are never named here.
+    run(
+      `UPDATE plans
+         SET source_proposal_id = ?, responsible_supervisor_id = ?,
+             promoted_at = ?, updated_at = datetime('now')
+       WHERE id = ?`,
+      [input.sourceProposalId, input.responsibleSupervisorId, input.nowMs, input.planId],
+    );
+    if (input.responsibleSupervisorId) {
+      // 2. supervisor_active_plan — at most one active plan per supervisor (PK).
+      run(
+        `INSERT INTO supervisor_active_plan (supervisor_id, plan_id)
+         VALUES (?, ?)
+         ON CONFLICT(supervisor_id) DO UPDATE SET
+           plan_id = excluded.plan_id, activated_at = datetime('now')`,
+        [input.responsibleSupervisorId, input.planId],
+      );
+      // 3. Ordinary supervisor focus (idempotent — never disturbs an existing note).
+      run(
+        `INSERT INTO supervisor_focus (supervisor_id, plan_id)
+         VALUES (?, ?)
+         ON CONFLICT(supervisor_id, plan_id) DO NOTHING`,
+        [input.responsibleSupervisorId, input.planId],
+      );
+    }
+    // 4. Source proposal → promoted, linked to the adopted plan.
+    run(
+      `UPDATE proposals SET state = 'promoted', promoted_to_plan_id = ?, updated_at = ?
+       WHERE id = ?`,
+      [input.planId, input.nowMs, input.sourceProposalId],
+    );
+    // 5. plan_documents — EXACTLY ONE row (source proposal), idempotent by
+    //    (plan_id, doc_kind='proposal', rel_path). Nothing else is ever mirrored.
+    const existingDoc = queryOne(
+      `SELECT id FROM plan_documents WHERE plan_id = ? AND doc_kind = 'proposal' AND rel_path = ?`,
+      [input.planId, input.sourceProposalRelPath],
+    );
+    if (!existingDoc) {
+      run(
+        `INSERT INTO plan_documents (id, plan_id, workspace_id, doc_kind, rel_path, sort_order)
+         VALUES (?, ?, ?, 'proposal', ?, 0)`,
+        [input.docId, input.planId, input.workspaceId, input.sourceProposalRelPath],
+      );
+    }
+    // 6. Flip the request pending → adopted INSIDE this same transaction — the
+    //    request becomes 'adopted' ONLY here, and only if every step above committed.
+    run(
+      `UPDATE promotion_requests SET state = 'adopted', updated_at = ? WHERE id = ?`,
+      [input.nowMs, input.requestId],
+    );
+  });
+  tx();
+}

@@ -24,12 +24,14 @@
 
 import path from 'path';
 import crypto from 'crypto';
+import { promises as fsp } from 'fs';
 import { v4 as uuidv4 } from 'uuid';
 import type { LaunchAgentInput } from '../../shared/types';
 import {
   insertOrReadPromotionRequest,
   getPromotionRequestByProposal,
   getPlanByWorkspaceArtifactId,
+  enrichAdoptedPlanRow,
   type PromotionRequestRow,
 } from '../database';
 import {
@@ -38,6 +40,12 @@ import {
   type PromotionDispatchInput,
   type PromotionDispatchResult,
 } from './promotion-dispatch';
+import {
+  resolvePlanFolder,
+  casAppendResponsibilityEvent,
+  type PlanManifest,
+  type ResponsibilityEvent,
+} from './plan-manifest';
 
 // ── Identity derivation (§R0, §R-P3 point 1) ────────────────────────────────
 
@@ -364,4 +372,175 @@ export async function promoteProposal(
 /** Re-read the durable request row for a proposal (helper for callers/tests). */
 export function readPromotionRequest(workspaceId: string, proposalArtifactId: string): PromotionRequestRow | null {
   return getPromotionRequestByProposal(workspaceId, proposalArtifactId);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WP-P3B-enrich — saga-ordered transactional enrichment of the adopted row.
+//
+// This is the real body of the WP-P3B-core `enrichAdoptedPlan` seam. It runs
+// against an ALREADY-adopted, filesystem-scaffolded plan row, in a PINNED order —
+// SQLite and plan.json do NOT share one transaction (§R-P3 points 3/4):
+//
+//   1. Manifest step FIRST (outside SQLite): via the WP-P3-manifest lock+CAS,
+//      OBSERVE the deterministic `promotion-service` `assigned` responsibility
+//      event by its deterministic `event_id` (stamped by the worker at scaffold
+//      time). For a MANUAL folder, VERIFY a pre-existing `manual-skill` `assigned`
+//      event matches the server-selected supervisor — a mismatch is DIAGNOSED and
+//      NEVER overwritten (§R-P3 point 10). The event is appended ONLY if the
+//      deterministic event is somehow absent, and idempotently (append is a no-op
+//      when already present, so it is observed exactly once across retries and a
+//      concurrent skill edit is preserved by the guard re-read).
+//   2. DB step SECOND (one SQLite transaction): enrichAdoptedPlanRow, which flips
+//      the request pending → adopted only inside that successful transaction.
+//
+// A crash after step 1 but before/inside step 2 leaves the request `pending`; a
+// retry (live or reconciler) re-observes the same `event_id` (no duplicate) and
+// redoes the idempotent DB transaction — idempotent completion of the same work.
+//
+// The state-dir/workspace resolution is INJECTED (this file never imports the
+// state-dir surface); the manifest + DB primitives default to the real modules and
+// are overridable for tests.
+
+const DEFAULT_PLANS_HOME_REL = '.lares/plans';
+
+export interface EnrichAdoptedPlanDeps {
+  /** Absolute plans-home root (`<workspaceStateDir()>/plans`) — the manifest CAS
+   *  containment root for this workspace. */
+  resolvePlansHomeRoot: (workspaceId: string) => string | Promise<string>;
+  /** Absolute workspace root — to containment-check the source-proposal rel path. */
+  resolveWorkspaceRoot: (workspaceId: string) => string | Promise<string>;
+  /** State-dir-relative plans home used to strip the request's target folder path
+   *  down to a path relative to the plans-home root (default '.lares/plans'). */
+  plansHomeRelPath?: string;
+  /** Read a folder's plan.json (default: containment-checked fs read). */
+  readManifest?: (plansHomeRoot: string, folderRelToHome: string) => Promise<PlanManifest>;
+  /** Append a responsibility event idempotently (default: casAppendResponsibilityEvent). */
+  appendResponsibilityEvent?: (
+    plansHomeRoot: string,
+    folderRelToHome: string,
+    event: ResponsibilityEvent,
+  ) => Promise<unknown>;
+  /** The atomic DB transaction (default: enrichAdoptedPlanRow). */
+  runDbStep?: (input: Parameters<typeof enrichAdoptedPlanRow>[0]) => void;
+  now?: () => number;
+  genId?: (prefix: string) => string;
+}
+
+/** Strip the state-dir-relative plans-home prefix off the request's target folder
+ *  path, yielding a path relative to the plans-home ROOT (what the manifest CAS
+ *  wants). Tolerates back-slashes and a trailing slash on the home. */
+function stripPlansHome(plansHomeRelPath: string, targetFolderRelPath: string): string {
+  const home = plansHomeRelPath.replace(/\\/g, '/').replace(/\/+$/, '');
+  const norm = targetFolderRelPath.replace(/\\/g, '/').replace(/\/+$/, '');
+  if (norm === home) return '.';
+  const prefix = `${home}/`;
+  return norm.startsWith(prefix) ? norm.slice(prefix.length) : norm;
+}
+
+/** Reject an absolute or workspace-escaping source-proposal rel path (rel-path only,
+ *  containment-checked). */
+function assertContainedRelPath(workspaceRoot: string, relPath: string): void {
+  if (typeof relPath !== 'string' || relPath.length === 0) {
+    throw new Error('[promotion enrich] source_proposal.rel_path is missing/empty');
+  }
+  if (path.isAbsolute(relPath)) {
+    throw new Error(`[promotion enrich] source_proposal.rel_path must be workspace-relative, got absolute: ${relPath}`);
+  }
+  const root = path.resolve(workspaceRoot);
+  const resolved = path.resolve(root, relPath);
+  const rel = path.relative(root, resolved);
+  if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) {
+    throw new Error(`[promotion enrich] source_proposal.rel_path escapes the workspace: ${relPath}`);
+  }
+}
+
+async function defaultReadManifest(plansHomeRoot: string, folderRelToHome: string): Promise<PlanManifest> {
+  const folder = await resolvePlanFolder(plansHomeRoot, folderRelToHome);
+  const raw = await fsp.readFile(path.join(folder, 'plan.json'), 'utf8');
+  return JSON.parse(raw) as PlanManifest;
+}
+
+function defaultAppendResponsibilityEvent(
+  plansHomeRoot: string,
+  folderRelToHome: string,
+  event: ResponsibilityEvent,
+): Promise<unknown> {
+  return casAppendResponsibilityEvent(plansHomeRoot, folderRelToHome, event, {
+    ownerKind: 'service',
+    ownerId: `promotion-service:pid-${process.pid}`,
+  });
+}
+
+/**
+ * Build the real WP-P3B-core `enrichAdoptedPlan` seam. Injected by the wiring lane
+ * as `enrichAdoptedPlan: makeEnrichAdoptedPlan({ resolvePlansHomeRoot,
+ * resolveWorkspaceRoot })`; also invoked by WP-P3-reconcile for pending rows.
+ */
+export function makeEnrichAdoptedPlan(deps: EnrichAdoptedPlanDeps): EnrichAdoptedPlanFn {
+  const now = deps.now ?? (() => Date.now());
+  const genId = deps.genId ?? ((prefix: string) => `${prefix}_${uuidv4()}`);
+  const plansHomeRelPath = deps.plansHomeRelPath ?? DEFAULT_PLANS_HOME_REL;
+  const readManifest = deps.readManifest ?? defaultReadManifest;
+  const appendEvent = deps.appendResponsibilityEvent ?? defaultAppendResponsibilityEvent;
+  const runDbStep = deps.runDbStep ?? enrichAdoptedPlanRow;
+
+  return async ({ request, planId, responsibilityEventId }) => {
+    const plansHomeRoot = await deps.resolvePlansHomeRoot(request.workspaceId);
+    const workspaceRoot = await deps.resolveWorkspaceRoot(request.workspaceId);
+    const folderRelToHome = stripPlansHome(plansHomeRelPath, request.targetFolderRelPath);
+
+    // ── Step 1: manifest observation (outside SQLite, FIRST). ──
+    const manifest = await readManifest(plansHomeRoot, folderRelToHome);
+    const events = Array.isArray(manifest.responsibility_events)
+      ? manifest.responsibility_events
+      : [];
+    const manualAssigned = events.find(
+      (e) => e && e.event === 'assigned' && e.source === 'manual-skill',
+    );
+    if (manualAssigned) {
+      // Manual folder: VERIFY the human-scaffolded assignment matches the
+      // server-selected supervisor. A mismatch is diagnosed and NEVER overwritten.
+      if (manualAssigned.agent_id !== request.supervisorId) {
+        throw new Error(
+          `[promotion enrich] manual-skill 'assigned' supervisor mismatch: manifest agent_id=` +
+            `${manualAssigned.agent_id} server-selected=${request.supervisorId} — diagnosed, never overwritten`,
+        );
+      }
+      // Matches → observed; nothing appended.
+    } else if (!events.some((e) => e && e.event_id === responsibilityEventId)) {
+      // Service folder whose deterministic event is somehow absent → append it
+      // idempotently (lock+CAS preserves a concurrent skill writer's events).
+      await appendEvent(plansHomeRoot, folderRelToHome, {
+        event_id: responsibilityEventId,
+        event: 'assigned',
+        agent_id: request.supervisorId ?? 'promotion-service',
+        at: now(),
+        source: 'promotion-service',
+      });
+    }
+    // else: the deterministic event is already present → observed, no append.
+
+    // Source-proposal rel path is disk truth (§P3-GAP): plan.json.source_proposal.rel_path.
+    const sourceProposalRelPath = manifest.source_proposal?.rel_path;
+    if (!sourceProposalRelPath || typeof sourceProposalRelPath !== 'string') {
+      throw new Error(
+        `[promotion enrich] plan.json missing source_proposal.rel_path for ${folderRelToHome}`,
+      );
+    }
+    assertContainedRelPath(workspaceRoot, sourceProposalRelPath);
+
+    // ── Step 2: DB enrichment (one SQLite transaction, SECOND). ──
+    runDbStep({
+      requestId: request.id,
+      planId,
+      workspaceId: request.workspaceId,
+      sourceProposalId: request.proposalId,
+      responsibleSupervisorId: request.supervisorId,
+      sourceProposalRelPath,
+      docId: genId('plandoc'),
+      nowMs: now(),
+    });
+
+    return { planId };
+  };
 }
