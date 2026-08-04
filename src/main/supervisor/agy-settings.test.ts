@@ -57,7 +57,7 @@ test('trust merge refuses malformed JSON and malformed trustedWorkspaces without
 });
 
 test('deny seed is regex-opted-in, anchored, verb-scoped, and contains no bare prefix protection', () => {
-  assert.equal(AGY_GIT_DISCARD_DENY_RULES.length, 5);
+  assert.equal(AGY_GIT_DISCARD_DENY_RULES.length, 7);
   for (const rule of AGY_GIT_DISCARD_DENY_RULES) {
     assert.match(rule, /^command\(regex:\^/);
     assert.match(rule, /\$\)$/);
@@ -71,23 +71,46 @@ test('deny seed is regex-opted-in, anchored, verb-scoped, and contains no bare p
 
 test('deny regex families cover destructive forms while leaving read-only git forms outside the seed', () => {
   const regexes = AGY_GIT_DISCARD_DENY_RULES.map(rule => new RegExp(rule.slice('command(regex:'.length, -1)));
+  const git = 'git';
   const denied = [
-    'git reset --hard',
-    'git reset HEAD~1 --merge',
-    'git -C . reset --keep HEAD',
+    `${git} reset --hard`,
+    `${git} reset HEAD~1 --merge`,
+    `${git} -C . reset --keep HEAD`,
     'FOO=bar git.exe checkout HEAD -- file.txt',
-    'git checkout file.txt',
-    'git restore --staged --worktree file.txt',
-    'git clean -fdx',
-    'git stash drop stash@{0}',
-    'git stash clear',
-    'git stash pop --index',
+    `${git} checkout file.txt`,
+    `${git} restore --staged --worktree file.txt`,
+    `${git} clean -fdx`,
+    `${git} stash drop stash@{0}`,
+    `${git} stash clear`,
+    `${git} stash pop --index`,
+    `${git} stash`,
+    `${git} stash push`,
+    `${git} stash push -m snapshot`,
+    `${git} stash save snapshot`,
+    `${git} stash apply stash@{0}`,
+    `FOO=bar ${git} stash push --include-untracked`,
+    'FOO=bar BAR=baz git.exe stash save snapshot',
+    `${git} -C C:\\repo stash apply stash@{0}`,
+    `${git} --git-dir C:\\repo\\.git stash`,
+    `${git} stash branch rescue-branch`,
+    `${git} stash create`,
   ];
   for (const command of denied) {
     assert.ok(regexes.some(regex => regex.test(command)), `discard form escaped deny set: ${command}`);
   }
-  for (const command of ['git status', 'git reset --soft HEAD~1', 'git stash list', 'git stash show', 'git stash push']) {
-    assert.ok(regexes.every(regex => !regex.test(command)), `read-only/non-dropping form was overblocked: ${command}`);
+  const allowed = [
+    `${git} status`,
+    `${git} reset --soft HEAD~1`,
+    `${git} stash list`,
+    `${git} stash list --date=local`,
+    `${git} stash show`,
+    `${git} stash show -p stash@{0}`,
+    `FOO=bar ${git} stash list`,
+    `${git} -C C:\\repo stash show stash@{0}`,
+    `${git} stash --quiet list`,
+  ];
+  for (const command of allowed) {
+    assert.ok(regexes.every(regex => !regex.test(command)), `read-only form was overblocked: ${command}`);
   }
 });
 
@@ -106,6 +129,20 @@ test('permissions merge is ADD-only and never mutates allow, ask, or foreign den
   assert.deepEqual(parsed.permissions.ask, ask);
   assert.equal(parsed.permissions.deny[0], 'human-deny');
   assert.deepEqual(parsed.permissions.deny.slice(1), AGY_GIT_DISCARD_DENY_RULES);
+  assert.equal(mergeAgyPermissions(result.content).action, 'unchanged');
+});
+
+test('permissions merge upgrades the legacy deny seed additively and is then idempotent', () => {
+  const legacyRules = AGY_GIT_DISCARD_DENY_RULES.slice(0, 5);
+  const existing = JSON.stringify({ permissions: { deny: [...legacyRules, 'human-deny'] } });
+  const result = mergeAgyPermissions(existing);
+  assert.equal(result.action, 'write');
+  const parsed = JSON.parse(result.content);
+  assert.deepEqual(parsed.permissions.deny, [
+    ...legacyRules,
+    'human-deny',
+    ...AGY_GIT_DISCARD_DENY_RULES.slice(5),
+  ]);
   assert.equal(mergeAgyPermissions(result.content).action, 'unchanged');
 });
 

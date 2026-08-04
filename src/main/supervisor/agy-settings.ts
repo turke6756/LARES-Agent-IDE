@@ -15,6 +15,8 @@ export const AGY_GIT_DISCARD_DENY_RULES = [
   `command(regex:${AGY_GIT_COMMAND_PREFIX}restore(\\s+.*)?$)`,
   `command(regex:${AGY_GIT_COMMAND_PREFIX}clean(\\s+.*)?$)`,
   `command(regex:${AGY_GIT_COMMAND_PREFIX}stash\\s+(drop|clear|pop)(\\s+.*)?$)`,
+  `command(regex:${AGY_GIT_COMMAND_PREFIX}stash$)`,
+  `command(regex:${AGY_GIT_COMMAND_PREFIX}stash\\s+(?!(?:-\\S+\\s+)*(?:list|show)(?:\\s|$)).+$)`,
 ] as const;
 
 const AGY_GIT_DISCARD_DENY_RULE_SET = new Set<string>(AGY_GIT_DISCARD_DENY_RULES);
