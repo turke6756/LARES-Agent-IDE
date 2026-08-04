@@ -1156,6 +1156,7 @@ export const WORKER_CODEX_AGENTS_MD_V2_HASH = '60a6b1bc6df13a8025b9a0ef12ea1ab9d
 // sha256Hex(live)!==HASH). The other eight tree files are unchanged and stay v1.
 export const PROPOSAL_TO_PLAN_SKILL_MD_V1_HASH = '8ff2d0d172f12c854275e670026d0fe1289fb0f078dda882398536a01eba8561';
 export const PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V1_HASH = 'ccad09cfe65ddf201498aeadde93c84d501e12048144328c53738747ce439546';
+export const PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V2_HASH = '1f6090987fbb83029340a1c67a41398521c84c382a137331c776613396564e77';
 export const PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD_V1_HASH = '41da3022372a7daec10fd98d2213443ff4dd960a5f0a6e920fe8bdb54d3f42db';
 export const PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD_V1_HASH = '78823a68f465874f05e7752a43ae1e82866c8d8b9485bedbf7465aa66048cf7f';
 export const PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V1_HASH = 'bee85a7aacc0efa624c12108c79100859f5fb640cedfc61ab29c912d84a64577';
@@ -1176,7 +1177,8 @@ export const PROPOSAL_TO_PLAN_CONTRACT_MANIFEST_LOCK_MD_V1_HASH = '5a172e514b466
 // roots (Claude+Codex x supervisor+worker). New-skill shape was version 1, no
 // previousHashes; WP-SKILLFIX bumps the five hardened files to v2 with a
 // previousHashes[1] so pristine v1 copies upgrade silently and hand-edited ones are
-// .bak'd. WP-SKILLBUMP then carries the two ca7ce2b-corrected carriers forward:
+// .bak'd. WP-AUTH-FM advances capture.md to v3 with previousHashes[2] for its
+// required display-author fields. WP-SKILLBUMP carries the two ca7ce2b-corrected carriers forward:
 // plan-manifest.mjs → v3 (previousHashes[1,2]) and manifest-lock.md → v2
 // (previousHashes[1]), since ca7ce2b changed their bodies without bumping. Unchanged
 // files stay v1 (an unmanaged file already at those names is treated as
@@ -1187,8 +1189,9 @@ const PROPOSAL_TO_PLAN_TREE: Array<{
 }> = [
   { rel: 'SKILL.md', content: PROPOSAL_TO_PLAN_SKILL_MD, version: 2,
     previousHashes: { 1: PROPOSAL_TO_PLAN_SKILL_MD_V1_HASH } },
-  { rel: 'references/activities/capture.md', content: PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD, version: 2,
-    previousHashes: { 1: PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V1_HASH } },
+  { rel: 'references/activities/capture.md', content: PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD, version: 3,
+    previousHashes: { 1: PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V1_HASH,
+                      2: PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V2_HASH } },
   { rel: 'references/activities/scope.md', content: PROPOSAL_TO_PLAN_ACTIVITY_SCOPE_MD },
   { rel: 'references/activities/promote.md', content: PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD, version: 2,
     previousHashes: { 1: PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD_V1_HASH } },

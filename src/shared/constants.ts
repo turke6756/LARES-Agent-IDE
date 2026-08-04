@@ -5490,7 +5490,7 @@ you do **not** owe a per-turn sentinel while working this skill. (PLAN-INTENT / 
 \`assertPlanRailFree\`.)
 `;
 
-export const PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD = `# Activity playbook — \`capture\`
+export const PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V2 = `# Activity playbook — \`capture\`
 
 **Purpose.** Write a stamped **flat** proposal markdown with zero ceremony. This is the universal
 cheap entry point; a bare proposal is valid as a **terminal state** — capture does not obligate any
@@ -5546,6 +5546,27 @@ later hardening.
 When a captured proposal looks worth hardening, the responsible supervisor runs **\`scope\`** next
 (hardening triage + markup). Capture itself makes no such judgment.
 `;
+
+const PROPOSAL_TO_PLAN_CAPTURE_AUTHOR_ROLE_LINE = '   author_role: supervisor | worker\n';
+const PROPOSAL_TO_PLAN_CAPTURE_AUTHOR_LINE =
+  '   author: <display name — your agent title (e.g. "P6 mission-board worker") or the human\'s name>\n';
+const PROPOSAL_TO_PLAN_CAPTURE_BODY_STEP =
+  '3. Write the proposal body in plain markdown.';
+const PROPOSAL_TO_PLAN_CAPTURE_REQUIRED_AUTHOR_FIELDS = [
+  '   **\`author\` and \`authored_at\` are required** — the Plans-pane proposal cards render them',
+  '   (author line + date); a proposal without them shows an anonymous, undated card.',
+  '',
+  '',
+].join('\n');
+export const PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD = PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V2
+  .replace(
+    PROPOSAL_TO_PLAN_CAPTURE_AUTHOR_ROLE_LINE,
+    PROPOSAL_TO_PLAN_CAPTURE_AUTHOR_ROLE_LINE + PROPOSAL_TO_PLAN_CAPTURE_AUTHOR_LINE,
+  )
+  .replace(
+    PROPOSAL_TO_PLAN_CAPTURE_BODY_STEP,
+    PROPOSAL_TO_PLAN_CAPTURE_REQUIRED_AUTHOR_FIELDS + PROPOSAL_TO_PLAN_CAPTURE_BODY_STEP,
+  );
 
 export const PROPOSAL_TO_PLAN_ACTIVITY_SCOPE_MD = `# Activity playbook — \`scope\`
 

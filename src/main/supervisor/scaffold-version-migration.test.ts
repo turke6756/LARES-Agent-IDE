@@ -56,6 +56,7 @@ import {
   proposalToPlanEntries,
   PROPOSAL_TO_PLAN_SKILL_MD_V1_HASH,
   PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V1_HASH,
+  PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V2_HASH,
   PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD_V1_HASH,
   PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD_V1_HASH,
   PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V1_HASH,
@@ -84,6 +85,7 @@ import {
   WORKER_CODEX_AGENTS_MD_V2,
   PROPOSAL_TO_PLAN_SKILL_MD,
   PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD,
+  PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V2,
   PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD,
   PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD,
   PROPOSAL_TO_PLAN_CONTRACT_ARC_MD,
@@ -3610,13 +3612,16 @@ test('WP-P0C-TREE-SUP. fresh supervisor scaffold writes the whole proposal-to-pl
   }
 });
 
-// WP-SKILLFIX bumped five files to v2 with previousHashes[1]; WP-SKILLBUMP then
-// carried the two ca7ce2b-corrected carriers forward — plan-manifest.mjs to v3
+// WP-SKILLFIX bumped five files to v2 with previousHashes[1]; WP-AUTH-FM advances
+// capture.md to v3 with previousHashes[2]. WP-SKILLBUMP carried the two ca7ce2b-corrected carriers forward — plan-manifest.mjs to v3
 // (previousHashes[1,2]) and manifest-lock.md to v2 (previousHashes[1]). The other six
 // files stay v1. Keep this map in sync with PROPOSAL_TO_PLAN_TREE in index.ts.
 const PROPOSAL_TO_PLAN_VERSIONED_FILES = new Map<string, { version: number; previousHashes: Record<number, string> }>([
   ['SKILL.md', { version: 2, previousHashes: { 1: PROPOSAL_TO_PLAN_SKILL_MD_V1_HASH } }],
-  ['references/activities/capture.md', { version: 2, previousHashes: { 1: PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V1_HASH } }],
+  ['references/activities/capture.md', { version: 3, previousHashes: {
+    1: PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V1_HASH,
+    2: PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V2_HASH,
+  } }],
   ['references/activities/promote.md', { version: 2, previousHashes: { 1: PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD_V1_HASH } }],
   ['references/activities/orient.md', { version: 2, previousHashes: { 1: PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD_V1_HASH } }],
   ['references/contracts/manifest-lock.md', { version: 2, previousHashes: { 1: PROPOSAL_TO_PLAN_CONTRACT_MANIFEST_LOCK_MD_V1_HASH } }],
@@ -3664,6 +3669,39 @@ test('WP-SKILLFIX-PRE. frozen v1 bodies hash to the previousHashes[1] literals A
   assert.notEqual(sha256Hex(PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS), PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V1_HASH);
 });
 
+test('WP-AUTH-FM-PRE. frozen capture v2 hashes to previousHashes[2] and differs from live v3', () => {
+  assert.equal(sha256Hex(PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V2), PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V2_HASH,
+    'frozen capture.md v2 body must hash to previousHashes[2]');
+  assert.notEqual(sha256Hex(PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD), PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V2_HASH,
+    'live capture.md v3 body must differ from frozen v2');
+});
+
+test('WP-AUTH-FM-MIG. pristine capture v2 silently upgrades to v3 without a backup', () => {
+  const workDir = mktmp('p2p-capture-v2');
+  const { supervisor, cleanup } = makeSupervisor();
+  try {
+    const rel = '.lares/workers/codex/.agents/skills/proposal-to-plan/references/activities/capture.md';
+    const capturePath = path.join(workDir, ...rel.split('/'));
+    fs.mkdirSync(path.dirname(capturePath), { recursive: true });
+    fs.writeFileSync(capturePath, PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V2, 'utf-8');
+    fs.mkdirSync(path.dirname(sidecarPath(workDir)), { recursive: true });
+    fs.writeFileSync(sidecarPath(workDir), JSON.stringify({
+      'workers/codex/.agents/skills/proposal-to-plan/references/activities/capture.md': 2,
+    }, null, 2) + '\n', 'utf-8');
+
+    supervisor.ensureWorkerScaffold(workDir, 'codex', 'windows');
+
+    assert.equal(fs.readFileSync(capturePath, 'utf-8'), PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD);
+    assert.equal(fs.readdirSync(path.dirname(capturePath)).filter((n) => n.startsWith('capture.md.bak.')).length, 0);
+    assert.equal(readSidecar(workDir)[
+      'workers/codex/.agents/skills/proposal-to-plan/references/activities/capture.md'
+    ], 3);
+  } finally {
+    cleanup();
+    rmrf(workDir);
+  }
+});
+
 test('WP-SKILLBUMP-PRE. frozen pre-ca7ce2b carrier bodies hash to their new previousHashes literals AND differ from the live corrected bodies', () => {
   // ca7ce2b rewrote plan-manifest.mjs (deployed v2) and manifest-lock.md (unversioned
   // v1) WITHOUT bumping their versions. WP-SKILLBUMP freezes those pre-ca7ce2b bodies
@@ -3703,6 +3741,11 @@ test('WP-SKILLFIX-CONTENT. the four defects are fixed in the live v2 bodies', ()
     'capture.md must specify prop_ + 8 lowercase hex generation');
   assert.ok(PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD.includes('collision check'),
     'capture.md must mandate a collision check');
+  assert.ok(PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD.includes(
+    'author: <display name — your agent title (e.g. "P6 mission-board worker") or the human\'s name>'),
+  'capture.md must include a displayable author frontmatter field');
+  assert.ok(PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD.includes('**\`author\` and \`authored_at\` are required**'),
+    'capture.md must require author and authored_at for Plans-pane proposal cards');
   // Fix 4 — sku slug derives from the frontmatter title, not the filename.
   const promoteFlat = PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD.replace(/\s+/g, ' ');
   assert.ok(promoteFlat.includes('slugified proposal `title` frontmatter'),
