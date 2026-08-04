@@ -281,6 +281,8 @@ const TESTS = [
   // attribution/outcome classification (committed / integrity-mismatch / uncertain /
   // drift / index-integrity) — fake-seam + real-git `git commit --only`.
   'dist/main/main/git-checkpoints/commit-coordinator.test.js',
+  // Save-card Stage 4 SC-WP-4H — real-repository adversarial race matrix.
+  'dist/main/main/git-checkpoints/commit-coordinator.races.test.js',
   'dist/main/main/supervisor/send-queue-checkpoint.test.js',
   'dist/main/main/supervisor/initial-user-prompt.test.js',
   'dist/main/main/supervisor/hook-spool-tailer.test.js',
