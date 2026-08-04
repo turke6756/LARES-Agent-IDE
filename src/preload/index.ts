@@ -213,6 +213,7 @@ const api: IpcApi = {
     gallery: (workspaceId, opts) => ipcRenderer.invoke('plan-gallery:list', workspaceId, opts),
     readProposal: (proposalId) => ipcRenderer.invoke('proposal:read', proposalId),
     getProjection: (planId, opts) => ipcRenderer.invoke('plan:projection', planId, opts),
+    listIntents: (planId) => ipcRenderer.invoke('plan:intents:list', planId),
     paneShow: (planId) => ipcRenderer.invoke('plan-pane:show', planId),
     paneHide: () => ipcRenderer.invoke('plan-pane:hide'),
     paneSetBounds: (bounds) => ipcRenderer.invoke('plan-pane:setBounds', bounds),

@@ -17,6 +17,7 @@ import type {
   Agent,
   PromoteProposalResult,
   PromotionStatus,
+  PlanIntentsProjection,
 } from '../../shared/types';
 import { hasSupervisorPrivilege } from '../../shared/types';
 import {
@@ -49,6 +50,7 @@ import {
   type PlanCandidatePreviewRequest,
   type PlanCandidatePreviewResponse,
 } from '../../shared/types';
+import { getPlanIntentsProjection } from './plan-intent-ledger';
 
 // ── Save-card SC-WP-3D — plan-package `done` finalization wiring ──────────────
 //
@@ -158,6 +160,35 @@ export async function finalizePlanItemDone(
 /** Minimal `ipcMain.handle` shape so the channel is testable without a live main. */
 export interface PlanIpcLike {
   handle(channel: string, listener: (event: unknown, ...args: unknown[]) => unknown): void;
+}
+
+// ── WP-P2L-proj — ledger + derived confidence read ──────────────────────────
+
+export interface PlanIntentsIpcDeps {
+  getProjection: (planId: string) => PlanIntentsProjection | null;
+}
+
+const defaultPlanIntentsIpcDeps: PlanIntentsIpcDeps = {
+  getProjection: getPlanIntentsProjection,
+};
+
+/** Pure handler core. The caller supplies only an opaque plan id; all confidence
+ * fields are computed below the IPC boundary from ledger/orchestration/disk truth. */
+export function runPlanIntentsList(
+  rawPlanId: unknown,
+  deps: PlanIntentsIpcDeps = defaultPlanIntentsIpcDeps,
+): PlanIntentsProjection | null {
+  if (typeof rawPlanId !== 'string' || rawPlanId === '') return null;
+  return deps.getProjection(rawPlanId);
+}
+
+export function registerPlanIntentsIpc(
+  ipc: PlanIpcLike,
+  deps: PlanIntentsIpcDeps = defaultPlanIntentsIpcDeps,
+): void {
+  ipc.handle('plan:intents:list', (_event, rawPlanId: unknown) =>
+    runPlanIntentsList(rawPlanId, deps),
+  );
 }
 
 /** The main-process seam the plan-lens preview channel drives. `resolvePreviewContext`
@@ -547,6 +578,10 @@ export function registerPlanIpc(manager: PlanPaneManager): void {
   // promotion-pending result. Both reject honestly until the wiring lane injects
   // the production service via `providePromotionService`.
   registerPromotionIpc(ipcMain);
+
+  // WP-P2L-proj: mid-altitude intent history + confidence, derived from the
+  // canonical ledger/orchestration join and current plan.md disk presence.
+  registerPlanIntentsIpc(ipcMain);
 
   // Plan list for the "Plans" card gallery (workspace-scoped). Each row carries a
   // cheap description snippet derived from its already-served projection (or an

@@ -339,6 +339,61 @@ export interface PlanListItem extends Plan {
   snippet: string | null;
 }
 
+// ── WP-P2L-proj — planning-intent ledger read model ─────────────────────────
+
+export type PlanIntentStatus = 'active' | 'withdrawn' | 'superseded';
+export type PlanIntentRung = 'marked' | 'ran' | 'returned' | 'folded-in';
+export type PlanIntentRunState = 'dispatched' | 'running' | 'returned' | 'abandoned';
+
+export interface PlanIntentOutputProjection {
+  relPath: string;
+  orchestrationId: string | null;
+  presentOnDisk: boolean;
+  disposition: 'active' | 'superseded' | 'withdrawn';
+  foldedIn: boolean;
+}
+
+export interface PlanIntentRunProjection {
+  orchestrationId: string;
+  state: PlanIntentRunState;
+  /** Raw server-witnessed orchestration status, retained for diagnostics. */
+  orchestrationStatus: string;
+  returnedOutputExists: boolean;
+}
+
+export interface PlanIntentProjection {
+  intentId: string;
+  status: PlanIntentStatus;
+  withdrawn: boolean;
+  superseded: boolean;
+  rung: PlanIntentRung;
+  integrationNote: string | null;
+  /** True only when the composite plan/intent orchestration join finds a row. */
+  ran: boolean;
+  runs: PlanIntentRunProjection[];
+  returned: boolean;
+  fullyFoldedIn: boolean;
+  open: boolean;
+  /** Historical output rows remain independent; missing rows are never collapsed. */
+  outputs: PlanIntentOutputProjection[];
+}
+
+export interface PlanIntentConfidenceProjection {
+  markedIntents: number;
+  satisfiedIntents: number;
+  openIntents: number;
+  deliberationsRun: number;
+  finalPlanExists: boolean;
+}
+
+/** Mid-altitude, read-only planning confidence projection. Every value is derived
+ * from the ledger, the orchestration join, or a current disk observation. */
+export interface PlanIntentsProjection {
+  planId: string;
+  intents: PlanIntentProjection[];
+  confidence: PlanIntentConfidenceProjection;
+}
+
 // ── WP-P3C′ — proposal-promotion IPC result contracts (§P3-GAP) ───────────────
 // The renderer-facing shape of `proposal:promote`. A discriminated union over the
 // two ACCEPTED outcomes the Promote dialog must transition between: an already
@@ -2607,6 +2662,8 @@ export interface IpcApi {
     /** Full activity projection (sections + trusted event trail) — the in-process
      *  mirror of GET /api/plans/:id/projection?events=full. `null` if unknown. */
     getProjection: (planId: string, opts?: { eventDetailId?: string }) => Promise<PlanActivityProjection | null>;
+    /** WP-P2L-proj — ledger/orchestration/disk-derived intent confidence read. */
+    listIntents: (planId: string) => Promise<PlanIntentsProjection | null>;
     /** Sandboxed render-pane lifecycle, same bounds-handoff as the browser pane:
      *  the renderer streams the pane rectangle while main drives the view. */
     paneShow: (planId: string) => Promise<void>;

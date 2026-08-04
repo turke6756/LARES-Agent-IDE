@@ -7,6 +7,20 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { getDb } from '../database';
+import type {
+  PlanIntentOutputProjection,
+  PlanIntentProjection,
+  PlanIntentRunProjection,
+  PlanIntentRunState,
+  PlanIntentsProjection,
+} from '../../shared/types';
+
+export type {
+  PlanIntentOutputProjection,
+  PlanIntentProjection,
+  PlanIntentRunProjection,
+  PlanIntentRunState,
+} from '../../shared/types';
 
 export const PLAN_INTENT_DOCUMENT_MAX_BYTES = 1_000_000;
 export const PLAN_INTENT_OUTPUT_MAX_BYTES = 2_000_000;
@@ -29,36 +43,6 @@ export interface PlanIntentLedgerDiagnostic {
   kind: PlanIntentLedgerDiagnosticKind;
   relPath: string;
   detail: string;
-}
-
-export interface PlanIntentOutputProjection {
-  relPath: string;
-  orchestrationId: string | null;
-  presentOnDisk: boolean;
-  disposition: 'active' | 'superseded' | 'withdrawn';
-  foldedIn: boolean;
-}
-
-export type PlanIntentRunState = 'dispatched' | 'running' | 'returned' | 'abandoned';
-
-export interface PlanIntentRunProjection {
-  orchestrationId: string;
-  state: PlanIntentRunState;
-  /** The live value from orchestrations, retained for diagnostics. */
-  orchestrationStatus: string;
-  returnedOutputExists: boolean;
-}
-
-export interface PlanIntentProjection {
-  intentId: string;
-  status: 'active' | 'withdrawn' | 'superseded';
-  /** Server-witnessed only: true iff the composite orchestration join finds a row. */
-  ran: boolean;
-  runs: PlanIntentRunProjection[];
-  returned: boolean;
-  fullyFoldedIn: boolean;
-  open: boolean;
-  outputs: PlanIntentOutputProjection[];
 }
 
 export interface ScanPlanIntentLedgerOptions {
@@ -348,8 +332,13 @@ function enumerateOutputs(
 function projection(planId: string): PlanIntentProjection[] {
   const db = getDb();
   const intents = db.prepare(
-    `SELECT intent_id, status FROM plan_intents WHERE plan_id = ? ORDER BY first_seen_at, intent_id`,
-  ).all(planId) as Array<{ intent_id: string; status: PlanIntentProjection['status'] }>;
+    `SELECT intent_id, status, integration_note
+       FROM plan_intents WHERE plan_id = ? ORDER BY first_seen_at, intent_id`,
+  ).all(planId) as Array<{
+    intent_id: string;
+    status: PlanIntentProjection['status'];
+    integration_note: string | null;
+  }>;
   const outputs = db.prepare(
     `SELECT intent_id, rel_path, orchestration_id, present_on_disk, disposition, folded_in
        FROM plan_intent_outputs WHERE plan_id = ? ORDER BY first_seen_at, rel_path`,
@@ -387,8 +376,9 @@ function projection(planId: string): PlanIntentProjection[] {
       foldedIn: output.folded_in === 1,
     }));
     const present = rows.filter((output) => output.presentOnDisk);
-    const required = present.filter((output) => output.disposition === 'active');
-    const fullyFoldedIn = required.length > 0 && required.every((output) => output.foldedIn);
+    const required = rows.filter((output) => output.disposition === 'active');
+    const fullyFoldedIn = required.length > 0
+      && required.every((output) => output.presentOnDisk && output.foldedIn);
     const runs = witnessedRuns
       .filter((run) => run.intent_id === intent.intent_id)
       .map((run): PlanIntentRunProjection => {
@@ -405,12 +395,18 @@ function projection(planId: string): PlanIntentProjection[] {
           returnedOutputExists,
         };
       });
+    const ran = runs.length > 0;
+    const returned = present.length > 0;
     return {
       intentId: intent.intent_id,
       status: intent.status,
-      ran: runs.length > 0,
+      withdrawn: intent.status === 'withdrawn',
+      superseded: intent.status === 'superseded',
+      rung: fullyFoldedIn ? 'folded-in' : returned ? 'returned' : ran ? 'ran' : 'marked',
+      integrationNote: intent.integration_note,
+      ran,
       runs,
-      returned: present.length > 0,
+      returned,
       fullyFoldedIn,
       open: intent.status === 'active' && !fullyFoldedIn,
       outputs: rows,
@@ -420,6 +416,44 @@ function projection(planId: string): PlanIntentProjection[] {
 
 export function getPlanIntentLedgerProjection(planId: string): PlanIntentProjection[] {
   return projection(planId);
+}
+
+function finalPlanExists(planId: string): boolean | null {
+  const row = getDb().prepare(
+    `SELECT p.path AS plan_path, w.path AS workspace_path
+       FROM plans p JOIN workspaces w ON w.id = p.workspace_id
+      WHERE p.id = ? AND p.deleted_at IS NULL`,
+  ).get(planId) as { plan_path: string; workspace_path: string } | undefined;
+  if (!row) return null;
+  const rootAbs = path.resolve(row.workspace_path);
+  const planAbs = path.resolve(rootAbs, row.plan_path);
+  if (!isContained(rootAbs, planAbs)) return false;
+  try {
+    const stat = fs.lstatSync(planAbs);
+    return stat.isFile() && !stat.isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
+/** Mid-altitude projection derived exclusively from durable ledger rows, the
+ * composite orchestration join, and the current plan.md disk observation. */
+export function getPlanIntentsProjection(planId: string): PlanIntentsProjection | null {
+  const exists = finalPlanExists(planId);
+  if (exists === null) return null;
+  const intents = projection(planId);
+  const marked = intents.filter((intent) => intent.status === 'active');
+  return {
+    planId,
+    intents,
+    confidence: {
+      markedIntents: marked.length,
+      satisfiedIntents: marked.filter((intent) => intent.fullyFoldedIn).length,
+      openIntents: marked.filter((intent) => intent.open).length,
+      deliberationsRun: intents.reduce((count, intent) => count + intent.runs.length, 0),
+      finalPlanExists: exists,
+    },
+  };
 }
 
 /** Scan one adopted structured plan folder. Fatal read/parse/cap errors perform
