@@ -321,6 +321,65 @@
   flex-wrap: wrap;
 }
 
+/* SC-WP-4F — lens-neutral post-attempt outcomes. The saved state is the one
+ * celebratory beat; every incident/refusal remains factual and low-motion. */
+.sc-outcome {
+  margin-top: 12px;
+  padding: 14px 16px;
+  border: 1px solid var(--color-surface-3);
+  border-left: 3px solid var(--color-fg-muted);
+  border-radius: 5px;
+  background: var(--color-surface-1);
+  color: var(--color-fg-secondary);
+}
+.sc-outcome h3 { margin: 1px 0 4px; color: var(--color-fg-bright); font-size: 14px; }
+.sc-outcome p { margin: 3px 0; }
+.sc-outcome-kicker {
+  color: var(--color-fg-muted);
+  font: 600 10.5px ui-monospace, "Cascadia Code", "Consolas", Menlo, monospace;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+.sc-outcome-saved {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  border-color: color-mix(in srgb, var(--color-accent-green) 45%, var(--color-surface-3));
+  border-left-color: var(--color-accent-green);
+  background: color-mix(in srgb, var(--color-accent-green) 10%, var(--color-surface-1));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--color-accent-green) 12%, transparent);
+}
+.sc-outcome-saved .sc-outcome-kicker,
+.sc-outcome-saved h3 { color: var(--color-accent-green); }
+.sc-outcome-save-mark {
+  display: grid;
+  place-items: center;
+  width: 38px;
+  height: 38px;
+  flex: 0 0 auto;
+  border: 1px solid var(--color-accent-green);
+  border-radius: 50%;
+  color: var(--color-accent-green);
+  font-size: 22px;
+  font-weight: 700;
+}
+.sc-outcome-stale { border-left-color: var(--color-accent-yellow); }
+.sc-outcome-integrity { border-left-color: var(--color-accent-red); }
+.sc-outcome-uncertain { border-left-color: var(--color-accent-orange); }
+.sc-outcome-detail { color: var(--color-fg-primary); }
+.sc-outcome-oid {
+  display: inline-block;
+  margin-top: 6px;
+  color: var(--color-fg-primary);
+  font-size: 11.5px;
+}
+.sc-outcome-paths { margin: 7px 0 0; padding-left: 20px; color: var(--color-fg-primary); }
+.sc-outcome-paths li { margin-top: 2px; font-family: ui-monospace, "Cascadia Code", "Consolas", Menlo, monospace; }
+.sc-outcome-facts { margin: 9px 0 0; }
+.sc-outcome-facts div { display: grid; grid-template-columns: 120px minmax(0, 1fr); gap: 8px; margin-top: 3px; }
+.sc-outcome-facts dt { color: var(--color-fg-muted); }
+.sc-outcome-facts dd { margin: 0; min-width: 0; overflow-wrap: anywhere; color: var(--color-fg-primary); }
+
 /* ── quiet already-protected list ──────────────── */
 .sc-saved {
   display: flex;

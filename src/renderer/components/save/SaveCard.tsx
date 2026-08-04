@@ -5,10 +5,11 @@ import {
   useSaveCardStore,
   useSaveCardAttention,
 } from '../../stores/save-card-store';
-import type { SaveCardInventoryResponse } from '../../../shared/types';
+import type { CommitCoordinatorConsumeResponse, SaveCardInventoryResponse } from '../../../shared/types';
 import type { SaveCardQuotaWeakening } from '../../../shared/commit-candidates';
 import SaveBundle, { isQuietlySaved, type WorkBundleDto } from './SaveBundle';
 import CandidatePreview, { type CandidatePreviewSelection } from './CandidatePreview';
+import CommitOutcome from './CommitOutcome';
 import QuotaWeakeningBanner from './QuotaWeakeningBanner';
 import { groupExpiryEdgesByBundle, formatExpiresIn } from './save-card-expiry';
 import './save-card.css';
@@ -43,6 +44,7 @@ function SavePreviewLauncher({
   workspaceId: string;
 }) {
   const [open, setOpen] = useState(false);
+  const [outcome, setOutcome] = useState<CommitCoordinatorConsumeResponse | null>(null);
   const selection = selectionForGroup(group);
   const hasSelectable =
     selection.selectedComponentIds.length > 0 || selection.selectedUnattributedEntryIds.length > 0;
@@ -54,7 +56,10 @@ function SavePreviewLauncher({
         className="ui-btn ui-btn-outline px-3 py-1 text-[12.5px]"
         data-testid="save-bundle-save"
         aria-expanded={open}
-        onClick={() => setOpen((v) => !v)}
+        onClick={() => {
+          setOutcome(null);
+          setOpen((v) => !v);
+        }}
       >
         {open ? 'Hide save preview' : 'Save…'}
       </button>
@@ -63,6 +68,25 @@ function SavePreviewLauncher({
           workspaceId={workspaceId}
           selection={selection}
           onClose={() => setOpen(false)}
+          onCommit={async (response, messageBody) => {
+            if (!response.isCandidate || !('token' in response.candidate) || !response.candidate.token) return;
+            const result = await window.api.commitCoordinator.commit({
+              candidateId: response.candidate.candidateId,
+              tokenId: response.candidate.token.tokenId,
+              message: messageBody,
+            });
+            setOutcome(result);
+            setOpen(false);
+          }}
+        />
+      )}
+      {outcome && (
+        <CommitOutcome
+          response={outcome}
+          onRepreview={() => {
+            setOutcome(null);
+            setOpen(true);
+          }}
         />
       )}
     </div>
