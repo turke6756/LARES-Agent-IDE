@@ -106,6 +106,8 @@ export interface PlanBindingBoundaryDeps {
   /** Authoritative plan_work_packages item lookup (SC-WP-3A). Omit to fail closed
    * (items rejected as unsupported at this boundary). */
   planItemInPlan?: (workspaceId: string, planId: string, planItemId: string) => boolean;
+  /** WP-P5D deterministic source for an omitted/agent-default binding. */
+  resolveActivePlanDefault?: () => string | null;
 }
 
 /** Resolve an untrusted API/IPC binding before anything is put on the delivery
@@ -143,6 +145,9 @@ export function resolvePlanBindingAtBoundary(
         return plan?.workspaceId === workspaceId && plan.deletedAt === null;
       },
       planItemInPlan: deps.planItemInPlan,
+      ...(deps.resolveActivePlanDefault
+        ? { resolveActivePlanDefault: () => deps.resolveActivePlanDefault!() }
+        : {}),
     },
     agent,
     requested,
@@ -157,6 +162,46 @@ export function resolvePlanBindingAtBoundary(
     throw err;
   }
   return withResolvedPlanStamp({ origin, requestedPlanBinding: requested }, resolution.stamp);
+}
+
+interface ExecutingSupervisorPlan {
+  planId: string;
+  title: string;
+}
+
+/**
+ * WP-P5D runtime source of truth. `supervisor_focus` is deliberately absent: a
+ * retained focus is orientation history, not authority to bind future turns.
+ * Requiring both plan state and the durable active-run row makes archive/close
+ * immediately remove the default even if `supervisor_active_plan` is retained.
+ */
+function getExecutingSupervisorPlan(supervisorId: string | null): ExecutingSupervisorPlan | null {
+  if (!supervisorId) return null;
+  try {
+    const row = getDb().prepare(
+      `SELECT p.id AS plan_id, p.slug AS slug, p.path AS path
+         FROM supervisor_active_plan sap
+         JOIN plans p ON p.id = sap.plan_id
+        WHERE sap.supervisor_id = ?
+          AND p.responsible_supervisor_id = ?
+          AND p.deleted_at IS NULL
+          AND p.run_state = 'executing'
+          AND EXISTS (
+            SELECT 1 FROM plan_execution_runs per
+             WHERE per.plan_id = p.id AND per.lifecycle_state = 'active'
+          )
+        LIMIT 1`,
+    ).get(supervisorId, supervisorId) as { plan_id?: unknown; slug?: unknown; path?: unknown } | undefined;
+    if (!row || typeof row.plan_id !== 'string') return null;
+    const path = typeof row.path === 'string' ? row.path : row.plan_id;
+    const title = typeof row.slug === 'string' && row.slug.length > 0
+      ? row.slug
+      : nodePath.basename(path).replace(/\.(?:html?|md)$/i, '');
+    return { planId: row.plan_id, title: title || row.plan_id };
+  } catch {
+    // Dispatch defaults and orientation text fail closed when DB state is unavailable.
+    return null;
+  }
 }
 
 /** Machine-readable failure classes the top-level error serializer is allowed
@@ -1820,7 +1865,11 @@ export class ApiServer {
       // before the busy gate, transient subscription, or either delivery call.
       // Invalid requests cannot write PTY bytes or allocate a turn row.
       const dispatch = resolvePlanBindingAtBoundary(
-        { getPlanById: getPlan, planItemInPlan },
+        {
+          getPlanById: getPlan,
+          planItemInPlan,
+          resolveActivePlanDefault: () => getExecutingSupervisorPlan(identity.supervisorId)?.planId ?? null,
+        },
         agent,
         'api',
         requestedPlanBinding !== undefined ? requestedPlanBinding : requested_plan_binding,
@@ -2370,6 +2419,7 @@ export class ApiServer {
       // `plans` key at all (consistent with supervisorId: null); only an asserted
       // caller can be attributed a subscription.
       const plans = identity.supervisorId ? getSupervisorFocusedPlans(identity.supervisorId, 10) : undefined;
+      const activePlan = getExecutingSupervisorPlan(identity.supervisorId);
       return {
         workspaceId,
         workspaceTitle: workspace.title,
@@ -2381,6 +2431,12 @@ export class ApiServer {
           : null,
         counts,
         ...(plans ? { plans } : {}),
+        ...(activePlan ? {
+          activePlan: {
+            ...activePlan,
+            runtimeText: `You are the responsible supervisor for ${activePlan.title}; workers you dispatch inherit it (once implemented)`,
+          },
+        } : {}),
       };
     }
 

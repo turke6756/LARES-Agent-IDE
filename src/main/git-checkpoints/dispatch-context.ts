@@ -110,6 +110,14 @@ export interface DispatchDeps {
    * unsupported rather than accepted through an always-true seam. */
   planItemInPlan?: (workspaceId: string, planId: string, planItemId: string) => boolean;
   /**
+   * WP-P5D agent-default source. Production resolves this from the dispatcher's
+   * `supervisor_active_plan`, returning a plan only while its execution run is
+   * active. The target agent's `planId` remains the compatibility fallback for
+   * older boundaries that have not wired the P5D source seam. A lookup failure
+   * defaults to no plan; it must never revive a stale agent/focus binding.
+   */
+  resolveActivePlanDefault?: (agent: DispatchAgentInfo) => string | null;
+  /**
    * WP-P5C-gate: the authoritative pre-Implement gate for a resolved plan binding,
    * keyed by the globally-unique plan id. It reports whether the plan is a
    * `format='structured'` plan and, if so, whether it currently has an ACTIVE
@@ -183,8 +191,16 @@ export function resolveRequestedPlanBinding(
     return gateResolvedStamp(deps, { planId: null, planItemId: null, source: 'explicit-none' });
   }
   if (binding.mode === 'agent-default') {
+    let planId = agent.planId ?? null;
+    if (deps.resolveActivePlanDefault) {
+      try {
+        planId = deps.resolveActivePlanDefault(agent);
+      } catch {
+        planId = null;
+      }
+    }
     return gateResolvedStamp(deps, {
-      planId: agent.planId ?? null, planItemId: null, source: 'agent-default',
+      planId, planItemId: null, source: 'agent-default',
     });
   }
 
