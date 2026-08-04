@@ -173,9 +173,9 @@ interface WorkspaceViewState {
   // viewer / browser panes: at most one center surface is open at a time, and
   // this flag is snapshotted/restored per workspace like the others.
   saveCardOpen: boolean;
-  // WP-P2D — the Plans gallery center pane; snapshotted/restored per workspace
-  // like the other center-surface flags.
-  galleryOpen: boolean;
+  // Plans center pane; snapshotted/restored per workspace like the other
+  // center-surface flags.
+  plansOpen: boolean;
   detailPane: 0 | 1 | 2;
 }
 
@@ -295,7 +295,7 @@ interface DashboardState {
   // opening either pane closes the other.
   browserOpen: boolean;
   // Save-card center-surface flag (SC-WP-1I). A peer of fileViewerOpen /
-  // browserOpen; the four show* actions are mutually exclusive and the center
+  // browserOpen; the show* actions are mutually exclusive and the center
   // dispatch resolves precedence file viewer > browser > save card > dashboard.
   saveCardOpen: boolean;
   // WP-P1S — one-shot "the Save card was opened by a user gesture" signal.
@@ -304,12 +304,9 @@ interface DashboardState {
   // leave it false, so a restore-driven mount stays silent. Transient — NOT part
   // of the per-workspace view snapshot.
   saveCardOpenGesture: boolean;
-  // WP-P2D — the Plans GALLERY center-pane flag. A first-class peer of
-  // fileViewerOpen / browserOpen / saveCardOpen (Edward's binding ruling: the
-  // gallery is a stable top-level pane, NEVER a modal popup). The show* actions
-  // are mutually exclusive; center dispatch resolves file viewer > browser >
-  // save card > gallery > dashboard.
-  galleryOpen: boolean;
+  // Plans center-pane flag. A first-class peer of fileViewerOpen, browserOpen,
+  // and saveCardOpen. Plans is an inline center surface, never a popup/overlay.
+  plansOpen: boolean;
   tabEditState: Record<string, TabEditState>;
 
   // Actions
@@ -410,8 +407,8 @@ interface DashboardState {
   hideBrowser: () => void;
   showDashboard: () => void;
   showSaveCard: () => void;
-  // WP-P2D — activate the Plans gallery center pane (closes the other panes).
-  showGallery: () => void;
+  // Activate the Plans center pane (closes the other panes).
+  showPlans: () => void;
   // WP-P1S — consume the one-shot gesture signal after SaveCard has witnessed it.
   consumeSaveCardGesture: () => void;
 
@@ -506,7 +503,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
   browserOpen: false,
   saveCardOpen: false,
   saveCardOpenGesture: false,
-  galleryOpen: false,
+  plansOpen: false,
   tabEditState: {},
 
   openTab: (filePath, rootDirectory, pathType, agentId?, workspaceId?, focusRange?) => {
@@ -1254,7 +1251,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
         fileViewerOpen: true,
         browserOpen: false,
         saveCardOpen: false,
-        galleryOpen: false,
+        plansOpen: false,
         activeTabId: activeBelongs ? activeTabId : wsTabs[0].id,
       });
     } else {
@@ -1275,7 +1272,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
 
   // Browser pane (WP1-B) — mirrors show/hideFileViewer. Opening either center
   // mode closes the other; the file viewer wins when both flags are set.
-  showBrowser: () => set({ browserOpen: true, fileViewerOpen: false, saveCardOpen: false, galleryOpen: false }),
+  showBrowser: () => set({ browserOpen: true, fileViewerOpen: false, saveCardOpen: false, plansOpen: false }),
   hideBrowser: () => set({ browserOpen: false }),
 
   // Save-card center surface (SC-WP-1I). Peer of the file viewer / browser
@@ -1283,13 +1280,12 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
   // inspect surface; there is no writer, so this only swaps what the center
   // renders. Not detachable (Stage ① non-goal), so no detached-view guard.
   showSaveCard: () =>
-    set({ saveCardOpen: true, saveCardOpenGesture: true, fileViewerOpen: false, browserOpen: false, galleryOpen: false }),
+    set({ saveCardOpen: true, saveCardOpenGesture: true, fileViewerOpen: false, browserOpen: false, plansOpen: false }),
 
-  // WP-P2D — activate the Plans gallery center pane. A peer of the file viewer /
-  // browser / save-card panes: opening it closes the others (explicit mutual
-  // exclusion). Not detachable (Stage P2 non-goal), so no detached-view guard.
-  showGallery: () =>
-    set({ galleryOpen: true, fileViewerOpen: false, browserOpen: false, saveCardOpen: false }),
+  // Activate Plans as an inline peer of the other center panes. No portal or
+  // component-local open state participates in top-level navigation.
+  showPlans: () =>
+    set({ plansOpen: true, fileViewerOpen: false, browserOpen: false, saveCardOpen: false }),
 
   // WP-P1S — SaveCard calls this on mount once it has recorded the voluntary-open
   // demand probe, so a later re-render / StrictMode remount can't re-fire it.
@@ -1300,7 +1296,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
   // ghost button stays inert (MainContent renders a placeholder instead).
   showDashboard: () => {
     if (get().detachedViews.includes('dashboard')) return;
-    set({ fileViewerOpen: false, browserOpen: false, saveCardOpen: false, galleryOpen: false });
+    set({ fileViewerOpen: false, browserOpen: false, saveCardOpen: false, plansOpen: false });
   },
 
   // Detachable views registry (renderer mirror of main's view-window registry).
@@ -1554,7 +1550,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
         fileViewerOpen: state.fileViewerOpen,
         browserOpen: state.browserOpen,
         saveCardOpen: state.saveCardOpen,
-        galleryOpen: state.galleryOpen,
+        plansOpen: state.plansOpen,
         detailPane: state.detailPane,
       };
     }
@@ -1572,7 +1568,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
     let nextFileViewerOpen: boolean;
     let nextBrowserOpen: boolean;
     let nextSaveCardOpen: boolean;
-    let nextGalleryOpen: boolean;
+    let nextPlansOpen: boolean;
     let nextDetailPane: 0 | 1 | 2;
 
     if (snap) {
@@ -1581,7 +1577,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
       nextFileViewerOpen = snap.fileViewerOpen;
       nextBrowserOpen = snap.browserOpen;
       nextSaveCardOpen = snap.saveCardOpen;
-      nextGalleryOpen = snap.galleryOpen;
+      nextPlansOpen = snap.plansOpen;
       nextDetailPane = snap.detailPane;
       // The remembered tab may have been closed while away; validate it still
       // exists and belongs to this workspace, else re-point to any of its tabs.
@@ -1594,7 +1590,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
       nextFileViewerOpen = false;
       nextBrowserOpen = false;
       nextSaveCardOpen = false;
-      nextGalleryOpen = false;
+      nextPlansOpen = false;
       nextDetailPane = state.detailPane;
       nextActiveTabId = fallbackTabId;
     }
@@ -1613,7 +1609,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
       fileViewerOpen: nextFileViewerOpen,
       browserOpen: nextBrowserOpen,
       saveCardOpen: nextSaveCardOpen,
-      galleryOpen: nextGalleryOpen,
+      plansOpen: nextPlansOpen,
       detailPane: nextDetailPane,
       workspaceViewState,
     });

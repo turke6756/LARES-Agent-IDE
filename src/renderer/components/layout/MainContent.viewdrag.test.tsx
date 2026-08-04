@@ -29,11 +29,14 @@ const storeMock = vi.hoisted(() => {
     selectedWorkspaceId: 'ws-1',
     fileViewerOpen: false,
     browserOpen: false,
+    saveCardOpen: false,
+    plansOpen: false,
     openTabs: [],
     detachedViews: [] as string[],
     showFileViewer: vi.fn(),
     showBrowser: vi.fn(),
     showDashboard: vi.fn(),
+    showSaveCard: vi.fn(),
     markViewDetached: vi.fn((v: string) => { state.detachedViews = [...state.detachedViews, v]; }),
   };
   const useDashboardStore: any = (selector: (s: typeof state) => unknown) => selector(state);
@@ -54,6 +57,8 @@ vi.mock('../agent/AgentGrid', () => ({ default: () => React.createElement('div',
 vi.mock('../agent/AgentLaunchDialog', () => ({ default: () => null }));
 vi.mock('../fileviewer/FileViewerPanel', () => ({ default: () => null }));
 vi.mock('../browser/BrowserPanel', () => ({ default: () => null }));
+vi.mock('../plan/PlansPane', () => ({ default: () => React.createElement('div', { 'data-testid': 'plans-pane' }) }));
+vi.mock('../save/SaveCard', () => ({ default: () => null }));
 // PlansMenu is its own component; here we only care that MainContent wires the
 // view-detach drag props onto it (draggable/aria-disabled + the drag handlers,
 // already bound to view:'plans'). Render a minimal button that forwards them so
@@ -96,6 +101,8 @@ beforeEach(() => {
   storeMock.state.detachedViews = [];
   storeMock.state.fileViewerOpen = false;
   storeMock.state.browserOpen = false;
+  storeMock.state.saveCardOpen = false;
+  storeMock.state.plansOpen = false;
   storeMock.state.markViewDetached = vi.fn((v: string) => { storeMock.state.detachedViews = [...storeMock.state.detachedViews, v]; });
   detach.mockClear();
   detach.mockResolvedValue({ ok: true, focusedExisting: false });
@@ -218,5 +225,15 @@ describe('MainContent Plans-button tear-off (drag props forwarded to PlansMenu)'
     const btn = plansBtn();
     expect(btn.getAttribute('draggable')).toBe('false');
     expect(btn.getAttribute('aria-disabled')).toBe('true');
+  });
+});
+
+describe('MainContent Plans center pane', () => {
+  it('mounts Plans in the center slot and exposes no Gallery button', () => {
+    storeMock.state.plansOpen = true;
+    render();
+    expect(container.querySelector('[data-testid="plans-pane"]')).not.toBeNull();
+    expect(container.querySelector('[data-testid="agent-grid"]')).toBeNull();
+    expect(container.querySelector('[data-testid="view-btn-gallery"]')).toBeNull();
   });
 });

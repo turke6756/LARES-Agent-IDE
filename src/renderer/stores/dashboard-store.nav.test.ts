@@ -31,6 +31,8 @@ beforeEach(() => {
   useDashboardStore.setState({
     browserOpen: false,
     fileViewerOpen: false,
+    saveCardOpen: false,
+    plansOpen: false,
     openTabs: [],
     activeTabId: null,
     tabEditState: {},
@@ -71,6 +73,29 @@ describe('showDashboard', () => {
     expect(s.fileViewerOpen).toBe(false);
     expect(s.openTabs).toEqual(openTabs);
     expect(s.activeTabId).toBe(activeTabId);
+  });
+});
+
+describe('Plans center-pane navigation', () => {
+  it('opens Plans as the exclusive center pane', () => {
+    useDashboardStore.setState({ fileViewerOpen: true, browserOpen: true, saveCardOpen: true });
+    useDashboardStore.getState().showPlans();
+    const state = useDashboardStore.getState();
+    expect(state.plansOpen).toBe(true);
+    expect(state.fileViewerOpen).toBe(false);
+    expect(state.browserOpen).toBe(false);
+    expect(state.saveCardOpen).toBe(false);
+  });
+
+  it.each([
+    ['Dashboard', () => useDashboardStore.getState().showDashboard()],
+    ['Browser', () => useDashboardStore.getState().showBrowser()],
+    ['Files', () => useDashboardStore.getState().showFileViewer()],
+  ])('switches from Plans to %s', (_label, navigate) => {
+    useDashboardStore.getState().openTab('C:/ws/a.ts', 'C:/ws', 'windows', undefined, 'ws-1');
+    useDashboardStore.getState().showPlans();
+    navigate();
+    expect(useDashboardStore.getState().plansOpen).toBe(false);
   });
 });
 
