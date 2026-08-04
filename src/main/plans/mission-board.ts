@@ -4,17 +4,25 @@
 // travel through separate fields. This module performs no state transitions and
 // activity evidence has no vocabulary that can represent package completion.
 
-import type { MissionBoardCard } from '../../shared/types';
+import type {
+  MissionBoardCard,
+  MissionBoardPackageTimeline,
+  MissionBoardTimelineEvent,
+} from '../../shared/types';
 import {
   getPlan,
+  listPackageFinalizations,
   listPlanWorkPackagePaths,
   listPlanWorkPackagesOrdered,
+  listPlanWpLifecycleEvents,
   listRecoveryOperations,
   listTurnRecords,
 } from '../database';
 import type {
+  PackageFinalization,
   PlanWorkPackage,
   PlanWorkPackagePath,
+  PlanWpLifecycleEvent,
   RecoveryOperation,
   TurnRecord,
 } from '../database';
@@ -103,5 +111,79 @@ export function listMissionBoardCards(
       durableTurns: packageEvidence?.durableTurns ?? [],
       recoveryOperations: packageEvidence?.recoveryOperations ?? [],
     };
+  });
+}
+
+export interface MissionBoardTimelineDeps {
+  getPlanWorkspaceId: (planId: string) => string | null;
+  listPackages: (planId: string) => PlanWorkPackage[];
+  listLifecycleEvents: (packageId: string) => PlanWpLifecycleEvent[];
+  listFinalizations: (packageId: string) => PackageFinalization[];
+}
+
+function defaultMissionBoardTimelineDeps(): MissionBoardTimelineDeps {
+  return {
+    getPlanWorkspaceId: (planId) => getPlan(planId)?.workspaceId ?? null,
+    listPackages: listPlanWorkPackagesOrdered,
+    listLifecycleEvents: listPlanWpLifecycleEvents,
+    // SC-WP-3D's stable finalization identity is a pure function of the plan item id.
+    listFinalizations: (packageId) => listPackageFinalizations(`plan-package:${packageId}`),
+  };
+}
+
+/**
+ * Project the ordered lifecycle of every package in a plan. Non-terminal state
+ * changes come only from WP-P5B's append-only ledger. `done` comes only from a
+ * successful SC finalization; abandoned boundary attempts did not flip package
+ * state and therefore must not appear as completion.
+ */
+export function listMissionBoardTimeline(
+  planId: string,
+  deps: MissionBoardTimelineDeps = defaultMissionBoardTimelineDeps(),
+): MissionBoardPackageTimeline[] {
+  const workspaceId = deps.getPlanWorkspaceId(planId);
+  if (workspaceId === null) return [];
+
+  const packages = deps.listPackages(planId).filter(
+    (pkg) => pkg.planId === planId && pkg.workspaceId === workspaceId,
+  );
+  return packages.map((pkg) => {
+    const lifecycle: MissionBoardTimelineEvent[] = deps.listLifecycleEvents(pkg.id)
+      .filter((event) => event.planId === planId && event.packageId === pkg.id)
+      .map((event) => ({
+        source: 'lifecycle',
+        eventId: event.id,
+        packageId: pkg.id,
+        occurredAt: event.ts,
+        fromState: event.fromState,
+        toState: event.toState,
+        actor: event.actor,
+        reason: event.reason,
+      }));
+    const finalizations: MissionBoardTimelineEvent[] = deps.listFinalizations(pkg.id)
+      .filter((finalization): finalization is PackageFinalization & {
+        lifecycleStatus: Exclude<PackageFinalization['lifecycleStatus'], 'abandoned'>;
+      } =>
+        finalization.finalizationKind === 'plan-package'
+        && finalization.planId === planId
+        && finalization.planItemId === pkg.id
+        && finalization.lifecycleStatus !== 'abandoned')
+      .map((finalization) => ({
+        source: 'finalization',
+        eventId: finalization.id,
+        packageId: pkg.id,
+        occurredAt: finalization.finalizedAt,
+        toState: 'done',
+        actor: finalization.finalizedBy,
+        packageRevision: finalization.packageRevision,
+        checkpointTurnId: finalization.checkpointTurnId,
+        boundaryStatus: finalization.boundaryStatus,
+        lifecycleStatus: finalization.lifecycleStatus,
+      }));
+    const events = [...lifecycle, ...finalizations].sort((left, right) =>
+      left.occurredAt - right.occurredAt
+      || (left.source === right.source ? 0 : left.source === 'lifecycle' ? -1 : 1)
+      || left.eventId.localeCompare(right.eventId));
+    return { packageId: pkg.id, events };
   });
 }

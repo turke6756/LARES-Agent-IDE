@@ -25,6 +25,7 @@ import type {
   PromotedPlanFolder,
   PromotedPlanFolderListResult,
   MissionBoardCard,
+  MissionBoardPackageTimeline,
 } from '../../shared/types';
 import { hasSupervisorPrivilege, isPlanTabKey } from '../../shared/types';
 import {
@@ -72,7 +73,7 @@ import {
 } from './plan-comments';
 import { registerPlanImplementIpc } from './plan-implement';
 import { workspaceStateDir } from '../workspace-state-dir';
-import { listMissionBoardCards } from './mission-board';
+import { listMissionBoardCards, listMissionBoardTimeline } from './mission-board';
 
 const MAX_PROMOTED_PLAN_JSON_BYTES = 256_000;
 const ARCHIVED_PLAN_STATUSES = new Set(['archived', 'superseded', 'cancelled', 'canceled']);
@@ -830,9 +831,20 @@ export function runMissionBoardList(
 export function registerMissionBoardIpc(
   ipc: PlanIpcLike,
   listCards: (planId: string) => MissionBoardCard[] = listMissionBoardCards,
+  listTimeline: (planId: string) => MissionBoardPackageTimeline[] = listMissionBoardTimeline,
 ): void {
   ipc.handle('plan:board:list', (_event, rawPlanId: unknown) =>
     runMissionBoardList(rawPlanId, listCards));
+  ipc.handle('plan:board:timeline', (_event, rawPlanId: unknown) =>
+    runMissionBoardTimeline(rawPlanId, listTimeline));
+}
+
+export function runMissionBoardTimeline(
+  rawPlanId: unknown,
+  listTimeline: (planId: string) => MissionBoardPackageTimeline[] = listMissionBoardTimeline,
+): MissionBoardPackageTimeline[] | null {
+  if (typeof rawPlanId !== 'string' || rawPlanId === '') return null;
+  return listTimeline(rawPlanId);
 }
 
 export function registerPlanIpc(manager: PlanPaneManager): void {

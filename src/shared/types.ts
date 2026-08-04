@@ -427,6 +427,42 @@ export interface MissionBoardCard {
   recoveryOperations: MissionBoardRecoveryOperation[];
 }
 
+// WP-P6D-timeline: the package history combines the non-terminal planning
+// ledger with SC-owned finalizations. Only the finalization variant can carry
+// `done`; consumers therefore never have to infer completion from activity.
+export interface MissionBoardLifecycleTimelineEvent {
+  source: 'lifecycle';
+  eventId: string;
+  packageId: string;
+  occurredAt: number;
+  fromState: string;
+  toState: Exclude<MissionBoardPackageState, 'done'>;
+  actor: string;
+  reason: string | null;
+}
+
+export interface MissionBoardFinalizationTimelineEvent {
+  source: 'finalization';
+  eventId: string;
+  packageId: string;
+  occurredAt: number;
+  toState: 'done';
+  actor: string;
+  packageRevision: number;
+  checkpointTurnId: string | null;
+  boundaryStatus: 'ready' | 'unavailable' | 'pruned';
+  lifecycleStatus: 'active' | 'superseded' | 'committed';
+}
+
+export type MissionBoardTimelineEvent =
+  | MissionBoardLifecycleTimelineEvent
+  | MissionBoardFinalizationTimelineEvent;
+
+export interface MissionBoardPackageTimeline {
+  packageId: string;
+  events: MissionBoardTimelineEvent[];
+}
+
 // ── WP-P2L-proj — planning-intent ledger read model ─────────────────────────
 
 export type PlanIntentStatus = 'active' | 'withdrawn' | 'superseded';

@@ -65,6 +65,7 @@ class FakeBetterSqlite {
 type DbModule = typeof import('../database');
 let dbm: DbModule;
 let listMissionBoardCards: typeof import('./mission-board')['listMissionBoardCards'];
+let listMissionBoardTimeline: typeof import('./mission-board')['listMissionBoardTimeline'];
 
 function createPlan(label: string) {
   const workspaceId = dbm.createWorkspace({
@@ -114,6 +115,7 @@ async function run(): Promise<void> {
   // real-SQL fixture.
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   listMissionBoardCards = require('./mission-board').listMissionBoardCards;
+  listMissionBoardTimeline = require('./mission-board').listMissionBoardTimeline;
 
   try {
     const fixture = createPlan('separation');
@@ -153,13 +155,61 @@ async function run(): Promise<void> {
     const handlers = new Map<string, (event: unknown, ...args: unknown[]) => unknown>();
     registerMissionBoardIpc({
       handle: (channel, listener) => { handlers.set(channel, listener); },
-    }, listMissionBoardCards);
-    assert.deepEqual([...handlers.keys()], ['plan:board:list']);
+    }, listMissionBoardCards, listMissionBoardTimeline);
+    assert.deepEqual([...handlers.keys()], ['plan:board:list', 'plan:board:timeline']);
     const ipcResult = handlers.get('plan:board:list')?.({}, fixture.planId);
     assert.equal(Array.isArray(ipcResult), true);
     assert.equal((ipcResult as ReturnType<typeof listMissionBoardCards>)[0]?.state, 'blocked');
     assert.equal(handlers.get('plan:board:list')?.({}, ''), null);
     console.log('  ok  plan:board:list exposes the one-shot card query');
+
+    dbm.transitionPlanWorkPackageState({
+      eventId: 'lifecycle-executing', packageId: 'blocked-package',
+      toState: 'executing', actor: 'supervisor', reason: 'dispatch confirmed',
+      ts: fixture.timestamp + 30,
+    });
+    dbm.transitionPlanWorkPackageState({
+      eventId: 'lifecycle-blocked', packageId: 'blocked-package',
+      toState: 'blocked', actor: 'worker', reason: 'needs input',
+      ts: fixture.timestamp + 40,
+    });
+    dbm.insertPackageFinalization({
+      id: 'finalization-done', packageId: 'plan-package:blocked-package',
+      repositoryKey: 'repo-1', finalizationKind: 'plan-package',
+      planId: fixture.planId, planItemId: 'blocked-package', packageRevision: 1,
+      finalizedAt: fixture.timestamp + 50, finalizedBy: 'supervisor',
+      checkpointTurnId: 'fresh-live-turn', checkpointOid: 'a'.repeat(40),
+      boundaryRef: 'refs/lares/finalizations/blocked-package/1', boundaryStatus: 'ready',
+      lifecycleStatus: 'active', supersededByFinalizationId: null, releasedAt: null,
+      memberManifestJson: '[]', contractVersion: 1, failureReason: null,
+      createdFromWorkspaceId: fixture.workspaceId,
+    });
+    // A failed finalization attempt is durable audit data, but it never flipped
+    // the package to done and must not be projected as a completion event.
+    dbm.insertPackageFinalization({
+      id: 'abandoned-finalization', packageId: 'plan-package:blocked-package',
+      repositoryKey: 'repo-1', finalizationKind: 'plan-package',
+      planId: fixture.planId, planItemId: 'blocked-package', packageRevision: 2,
+      finalizedAt: fixture.timestamp + 45, finalizedBy: 'supervisor',
+      checkpointTurnId: null, checkpointOid: 'b'.repeat(40), boundaryRef: null,
+      boundaryStatus: 'unavailable', lifecycleStatus: 'abandoned',
+      supersededByFinalizationId: null, releasedAt: null, memberManifestJson: '[]',
+      contractVersion: 1, failureReason: 'ref failed', createdFromWorkspaceId: fixture.workspaceId,
+    });
+
+    const timeline = listMissionBoardTimeline(fixture.planId);
+    assert.deepEqual(timeline.map((entry) => entry.packageId), ['blocked-package']);
+    assert.deepEqual(timeline[0]?.events.map((event) => ({
+      source: event.source, eventId: event.eventId, toState: event.toState,
+    })), [
+      { source: 'lifecycle', eventId: 'lifecycle-executing', toState: 'executing' },
+      { source: 'lifecycle', eventId: 'lifecycle-blocked', toState: 'blocked' },
+      { source: 'finalization', eventId: 'finalization-done', toState: 'done' },
+    ]);
+    assert.equal(dbm.getPlanWorkPackage('blocked-package')?.state, 'blocked');
+    assert.deepEqual(handlers.get('plan:board:timeline')?.({}, fixture.planId), timeline);
+    assert.equal(handlers.get('plan:board:timeline')?.({}, ''), null);
+    console.log('  ok  timeline IPC orders lifecycle events before authoritative finalization-done');
 
     dbm.closeTurn('fresh-live-turn', 'accepted', {
       touched: [{ path: 'src/blocked-package.ts', op: 'write' }],
