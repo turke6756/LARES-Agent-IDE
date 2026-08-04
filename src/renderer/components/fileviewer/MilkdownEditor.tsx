@@ -161,6 +161,16 @@ export function resolveImageUrl(url: string, docPath: string): string {
 // Component
 // ---------------------------------------------------------------------------
 
+export interface EmbeddedMilkdownPersistence {
+  draftContent: string;
+  dirty: boolean;
+  onDraftChange: (draft: string) => void;
+  onSave: (draft: string) => Promise<boolean>;
+  onUnmountFlush: (draft: string) => void;
+  registerSaveHandler: (save: () => Promise<boolean>) => (() => void) | void;
+  workspaceId: string;
+}
+
 interface Props {
   tabId: string;
   filePath: string;
@@ -168,6 +178,8 @@ interface Props {
   content: string;
   /** WP1-A seam (useFileContentCache); read once at mount. */
   registerFreshContentHandler?: RegisterFreshContentHandler;
+  /** Explicit persistence seam for real files rendered outside a file tab. */
+  embeddedPersistence?: EmbeddedMilkdownPersistence;
 }
 
 // Live instance accounting — exported for the leak unit test only.
@@ -180,7 +192,7 @@ function normalizeEolLocal(text: string): string {
   return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
 }
 
-function MilkdownEditor({ tabId, filePath, content, registerFreshContentHandler }: Props) {
+function MilkdownEditor({ tabId, filePath, content, registerFreshContentHandler, embeddedPersistence }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
 
   const setDraftContent = useDashboardStore((s) => s.setDraftContent);
@@ -190,7 +202,7 @@ function MilkdownEditor({ tabId, filePath, content, registerFreshContentHandler 
   // hook's unmount flush runs AFTER this component's layout cleanup (passive
   // cleanups follow layout cleanups), i.e. after flushDirtyDraft() landed the
   // final draft in the store — the coordinator's store adapter carries it.
-  const { onEdit, rootRef: autosaveRootRef } = useAutosave(tabId);
+  const { onEdit, rootRef: autosaveRootRef } = useAutosave(embeddedPersistence ? undefined : tabId);
   const onEditRef = useRef(onEdit);
   onEditRef.current = onEdit;
 
@@ -200,6 +212,8 @@ function MilkdownEditor({ tabId, filePath, content, registerFreshContentHandler 
   const setDraftContentRef = useRef(setDraftContent);
   const registerRef = useRef(registerFreshContentHandler);
   const contentRef = useRef(content);
+  const embeddedRef = useRef(embeddedPersistence);
+  embeddedRef.current = embeddedPersistence;
   useEffect(() => {
     setDraftContentRef.current = setDraftContent;
     registerRef.current = registerFreshContentHandler;
@@ -232,11 +246,12 @@ function MilkdownEditor({ tabId, filePath, content, registerFreshContentHandler 
     // DISK ORIGINAL bytes regardless, so post-draft-mount edits keep full
     // splice/EOL fidelity against what is actually on disk. B3 (store
     // draft/dirty) is left untouched — Save stays enabled.
-    const mountEditState = useDashboardStore.getState().tabEditState[tabId];
+    const embedded = embeddedRef.current;
+    const mountEditState = embedded ? undefined : useDashboardStore.getState().tabEditState[tabId];
     const mountReloadVersion = mountEditState?.reloadVersion ?? 0;
-    const mountedFromDraft = !!mountEditState?.dirty;
+    const mountedFromDraft = embedded ? embedded.dirty : !!mountEditState?.dirty;
     const mountText = mountedFromDraft
-      ? mountEditState.draftContent
+      ? (embedded?.draftContent ?? mountEditState?.draftContent ?? contentRef.current)
       : contentRef.current;
     mountBytesRef.current = mountText;
 
@@ -304,7 +319,7 @@ function MilkdownEditor({ tabId, filePath, content, registerFreshContentHandler 
       state: {
         init: () => null,
         apply: (tr) => {
-          if (tr.docChanged && tabId) onEditRef.current();
+          if (tr.docChanged && tabId && !embedded) onEditRef.current();
           return null;
         },
       },
@@ -324,15 +339,17 @@ function MilkdownEditor({ tabId, filePath, content, registerFreshContentHandler 
       const b = baselineRef.current;
       // Degraded path (baseline prep failed at mount): whole-doc, LF.
       const draft = b ? spliceMarkdown(b, markdown).content : markdown;
-      setDraftContentRef.current(tabId, draft);
+      if (embedded) embeddedRef.current?.onDraftChange(draft);
+      else setDraftContentRef.current(tabId, draft);
       return draft;
     };
 
     const editorIsDirty = (): boolean =>
       readyRef.current && !disposed && crepe.getMarkdown() !== loadSerializedRef.current;
 
-    const storeDirty = (): boolean =>
-      !!useDashboardStore.getState().tabEditState[tabId]?.dirty;
+    const storeDirty = (): boolean => embedded
+      ? !!embeddedRef.current?.dirty
+      : !!useDashboardStore.getState().tabEditState[tabId]?.dirty;
 
     /** Dirty-for-save ⇔ the live doc differs from THIS mount's serialization
      * (B2) OR any lagging/store authority still flags unsaved work (plan
@@ -354,7 +371,8 @@ function MilkdownEditor({ tabId, filePath, content, registerFreshContentHandler 
           // splice baseline's disk original (plan §1.3a). Writing the
           // original here would silently mark the store clean while the
           // canvas still shows unsaved work.
-          setDraftContentRef.current(tabId, mountBytesRef.current);
+          if (embedded) embeddedRef.current?.onDraftChange(mountBytesRef.current);
+          else setDraftContentRef.current(tabId, mountBytesRef.current);
         }
         return;
       }
@@ -428,6 +446,27 @@ function MilkdownEditor({ tabId, filePath, content, registerFreshContentHandler 
     // half-initialized snapshot that would misreport "pristine".
     let unregisterAdapter: (() => void) | null = null;
 
+    const saveEmbedded = async (): Promise<boolean> => {
+      const current = embeddedRef.current;
+      if (!current || disposed || !readyRef.current) return true;
+      const flushed = flushDirtyDraft();
+      const draft = flushed ?? (current.dirty ? current.draftContent : null);
+      if (draft === null) return true;
+      const ok = await current.onSave(draft);
+      if (ok && !disposed && readyRef.current) {
+        try {
+          baselineRef.current = prepareSpliceBaseline(draft);
+        } catch (err) {
+          console.error('[MilkdownEditor] embedded rebaseline after save failed', err);
+        }
+        mountBytesRef.current = draft;
+        loadSerializedRef.current = crepe.getMarkdown();
+        dirtyRef.current = false;
+      }
+      return ok;
+    };
+    const unregisterEmbeddedSave = embedded?.registerSaveHandler(saveEmbedded);
+
     const onKeyDown = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && !e.altKey && (e.key === 's' || e.key === 'S')) {
         e.preventDefault();
@@ -435,7 +474,8 @@ function MilkdownEditor({ tabId, filePath, content, registerFreshContentHandler 
         // DetachedFileView) double-fire on the same gesture (plan §2.3);
         // coordinator coalescing is the backstop, not the primary defense.
         e.stopPropagation();
-        if (tabId) void requestSave(tabId);
+        if (embedded) void saveEmbedded();
+        else if (tabId) void requestSave(tabId);
       }
     };
     container.addEventListener('keydown', onKeyDown);
@@ -472,7 +512,7 @@ function MilkdownEditor({ tabId, filePath, content, registerFreshContentHandler 
     // the new bytes come back around via the content prop and the sync effect
     // below refreshes the baseline). Phase 3 upgrades this to applying a
     // ProseMirror transaction and returning 'handled'.
-    const unregister = tabId
+    const unregister = tabId && !embedded
       ? registerRef.current?.(tabId, () => {
           // saveDirty() (plan §1.3b): a draft-mounted canvas is
           // editor-pristine but still carries unsaved store work — external
@@ -517,7 +557,7 @@ function MilkdownEditor({ tabId, filePath, content, registerFreshContentHandler 
       };
       if (disposed || !readyRef.current) return blocked('disposed-or-not-ready');
       if (crepe.getMarkdown() !== loadSerializedRef.current) return blocked('live-doc-differs');
-      if (useDashboardStore.getState().tabEditState[tabId]?.dirty) return blocked('store-dirty');
+      if (storeDirty()) return blocked('store-dirty');
       if (fresh === baselineRef.current?.originalContent) {
         // DIAG(edit-loss): fresh bytes already ARE the baseline — no-op.
         diag('apply-fresh-baseline-match', {
@@ -555,7 +595,7 @@ function MilkdownEditor({ tabId, filePath, content, registerFreshContentHandler 
         // Live snapshots are meaningful from here on — take over from the
         // coordinator's store-adapter fallback (identity-guarded unregister,
         // so a successor mount's registration is never torn down by us).
-        if (tabId) unregisterAdapter = registerSaveAdapter(tabId, saveAdapter);
+        if (tabId && !embedded) unregisterAdapter = registerSaveAdapter(tabId, saveAdapter);
         // Content prop may have moved while create() was in flight.
         applyFreshContent(contentRef.current);
         // Restore the remembered scroll position now that the doc is laid out.
@@ -582,7 +622,7 @@ function MilkdownEditor({ tabId, filePath, content, registerFreshContentHandler 
       // discarded draft over the reload — the successor mount would show it
       // instead of the disk bytes. The flush authority is scoped to this
       // mount's own reload generation.
-      const supersededByReload =
+      const supersededByReload = embedded ? false :
         (useDashboardStore.getState().tabEditState[tabId]?.reloadVersion ?? 0) !==
         mountReloadVersion;
       // DIAG(edit-loss): the single flushDirtyDraft() call — capture its
@@ -605,6 +645,8 @@ function MilkdownEditor({ tabId, filePath, content, registerFreshContentHandler 
       cancelAnimationFrame(restoreFrame);
       if (tabId && editorHandles.get(tabId) === handle) editorHandles.delete(tabId);
       if (typeof unregister === 'function') unregister();
+      if (typeof unregisterEmbeddedSave === 'function') unregisterEmbeddedSave();
+      if (embedded && flushedDraft !== null) embeddedRef.current?.onUnmountFlush(flushedDraft);
       // After this the coordinator's store-adapter fallback carries any
       // still-queued save for the flushed draft (Phase 4 adds the unmount
       // flush that relies on exactly that).
@@ -639,7 +681,12 @@ function MilkdownEditor({ tabId, filePath, content, registerFreshContentHandler 
   return (
     <div className="relative h-full" ref={autosaveRootRef}>
       <div ref={containerRef} className="milkdown-editor h-full overflow-auto" />
-      <FileCommentGutter tabId={tabId} scrollRef={containerRef} />
+      <FileCommentGutter
+        tabId={embeddedPersistence ? undefined : tabId}
+        filePath={embeddedPersistence ? filePath : undefined}
+        workspaceId={embeddedPersistence?.workspaceId}
+        scrollRef={containerRef}
+      />
     </div>
   );
 }

@@ -6,6 +6,7 @@ export interface ProposalCardMetadata {
   title: string;
   description: string;
   author: string | null;
+  dateLabel: string;
   content: string;
   truncated: boolean;
   mtimeMs: number;
@@ -81,6 +82,16 @@ export function proposalTimelineMs(fileName: string, mtimeMs: number): number {
   return Number.isNaN(timestamp) ? mtimeMs : timestamp;
 }
 
+export function formatProposalDate(fileName: string, mtimeMs: number): string {
+  const timestamp = proposalTimelineMs(fileName, mtimeMs);
+  return new Intl.DateTimeFormat('en-US', {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+    timeZone: 'UTC',
+  }).format(new Date(timestamp));
+}
+
 export function deriveProposalCardMetadata(
   document: PlanningReaderDocument,
   content: string,
@@ -96,7 +107,8 @@ export function deriveProposalCardMetadata(
     fileName: document.name,
     title,
     description: truncateDescription(descriptionSource) || 'No description provided.',
-    author: fields.author?.trim() || null,
+    author: fields.author?.trim() || fields.creator?.trim() || null,
+    dateLabel: formatProposalDate(document.name, document.mtimeMs),
     content,
     truncated,
     mtimeMs: document.mtimeMs,

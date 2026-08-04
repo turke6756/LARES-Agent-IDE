@@ -64,6 +64,12 @@ const lastDraft = () => drafts().at(-1)?.content;
 beforeEach(() => {
   storeMock.calls.length = 0;
   storeMock.setSaveResult(true);
+  (window as unknown as { api: unknown }).api = {
+    comments: {
+      list: vi.fn(async () => []),
+      onChanged: vi.fn(() => () => {}),
+    },
+  };
 });
 
 const sleep = (ms: number) =>
@@ -156,6 +162,40 @@ describe('MilkdownEditor lifecycle', () => {
 });
 
 describe('baseline / dirty / splice flow', () => {
+  it('persists an embedded WYSIWYG edit through the explicit file adapter', async () => {
+    const embeddedId = 'embedded:C:\\ws\\proposal.md';
+    let draft = ORIGINAL;
+    let saveHandler: (() => Promise<boolean>) | null = null;
+    const writes: string[] = [];
+    const mounted = await mountEditor(
+      <MilkdownEditor
+        tabId={embeddedId}
+        filePath="C:\\ws\\proposal.md"
+        content={ORIGINAL}
+        embeddedPersistence={{
+          draftContent: draft,
+          dirty: false,
+          onDraftChange: (next) => { draft = next; },
+          onSave: async (next) => { writes.push(next); return true; },
+          onUnmountFlush: () => {},
+          registerSaveHandler: (save) => { saveHandler = save; return () => { saveHandler = null; }; },
+          workspaceId: 'ws-1',
+        }}
+      />,
+    );
+
+    const view = getCanvasEditorHandle(embeddedId)!.getEditorView!()!;
+    const pos = findTextPos(view, 'Second paragraph');
+    act(() => { view.dispatch(view.state.tr.insertText('PLAN ', pos)); });
+    expect(saveHandler).not.toBeNull();
+    await act(async () => { await saveHandler!(); });
+
+    expect(writes).toHaveLength(1);
+    expect(writes[0]).toContain('PLAN Second paragraph to edit.');
+    expect(draft).toBe(writes[0]);
+    await mounted.unmount();
+  });
+
   it('stays store-silent while pristine, then pushes a minimal spliced draft on edit', async () => {
     const mounted = await mountEditor(
       <MilkdownEditor tabId="t1" filePath="C:\\ws\\doc.md" content={ORIGINAL} />,

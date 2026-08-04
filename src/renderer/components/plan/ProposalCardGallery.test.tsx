@@ -64,7 +64,7 @@ beforeEach(() => {
       read: vi.fn(async (docId: string) => ({
         docId,
         name: `${docId}.md`,
-        content: `# ${docId === 'new' ? 'Newest proposal' : 'Older proposal'}\n\nDescription for ${docId}.`,
+        content: `${docId === 'new' ? '---\nauthor: Edward\n---\n' : ''}# ${docId === 'new' ? 'Newest proposal' : 'Older proposal'}\n\nDescription for ${docId}.`,
         truncated: false,
         sizeBytes: 10,
       })),
@@ -98,14 +98,19 @@ describe('ProposalCardGallery', () => {
       expect.stringContaining('Newest proposal'),
       expect.stringContaining('Older proposal'),
     ]);
+    expect(cards[0].querySelector('[data-testid="proposal-card-date"]')?.textContent).toBe('Aug 3, 2026');
+    expect(cards[0].querySelector('[data-testid="proposal-card-author"]')?.textContent).toContain('Edward');
+    expect(cards[1].querySelector('[data-testid="proposal-card-author"]')).toBeNull();
 
     click('[data-testid="proposal-card"]');
     expect(container!.querySelector('[data-testid="proposal-expanded-reader"]')).not.toBeNull();
     expect(container!.querySelector('[data-testid="shared-markdown-reader"]')?.textContent).toContain('Newest proposal');
-    expect(container!.querySelector('[data-testid="plans-promoted-region"]')).not.toBeNull();
+    expect(container!.querySelector('[data-testid="plans-promoted-region"]')).toBeNull();
+    expect(container!.querySelector('[data-testid="plans-pane"]')?.getAttribute('data-proposal-expanded')).toBe('true');
 
     click('[data-testid="proposal-collapse"]');
     expect(container!.querySelectorAll('[data-testid="proposal-card"]')).toHaveLength(2);
+    expect(container!.querySelector('[data-testid="plans-promoted-region"]')).not.toBeNull();
   });
 
   it('converts vertical wheel motion into horizontal card-row scrolling', async () => {

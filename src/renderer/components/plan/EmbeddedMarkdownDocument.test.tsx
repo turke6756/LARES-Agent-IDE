@@ -4,14 +4,24 @@ import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import EmbeddedMarkdownDocument from './EmbeddedMarkdownDocument';
 
-vi.mock('../fileviewer/CodeMirrorEditor', () => ({
-  default: ({ initialContent, onChange, onSave }: { initialContent: string; onChange: (value: string) => void; onSave: () => void }) => (
-    <div>
-      <textarea data-testid="source-editor" defaultValue={initialContent} onChange={(event) => onChange(event.currentTarget.value)} />
-      <button type="button" onClick={onSave}>Editor save</button>
-    </div>
-  ),
+vi.mock('../fileviewer/MilkdownEditor', () => ({
+  default: ({ embeddedPersistence }: { embeddedPersistence: {
+    draftContent: string;
+    onDraftChange: (value: string) => void;
+    onSave: (value: string) => Promise<boolean>;
+    onUnmountFlush: (value: string) => void;
+    registerSaveHandler: (save: () => Promise<boolean>) => (() => void) | void;
+  } }) => {
+    const persistenceRef = React.useRef(embeddedPersistence);
+    persistenceRef.current = embeddedPersistence;
+    React.useEffect(() => persistenceRef.current.registerSaveHandler(
+      () => persistenceRef.current.onSave(persistenceRef.current.draftContent),
+    ), []);
+    React.useEffect(() => () => persistenceRef.current.onUnmountFlush(persistenceRef.current.draftContent), []);
+    return <textarea data-testid="milkdown-canvas" value={embeddedPersistence.draftContent} onChange={(event) => embeddedPersistence.onDraftChange(event.currentTarget.value)} />;
+  },
 }));
+vi.mock('../selection/SelectionSurface', () => ({ default: ({ children }: { children: React.ReactNode }) => <>{children}</> }));
 vi.mock('../fileviewer/MarkdownRenderer', () => ({
   default: ({ content }: { content: string }) => <article>{content}</article>,
 }));
@@ -55,7 +65,7 @@ describe('EmbeddedMarkdownDocument', () => {
   }
 
   function edit(value: string): void {
-    const input = host.querySelector<HTMLTextAreaElement>('[data-testid="source-editor"]')!;
+    const input = host.querySelector<HTMLTextAreaElement>('[data-testid="milkdown-canvas"]')!;
     const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')!.set!;
     act(() => {
       setter.call(input, value);
@@ -66,6 +76,7 @@ describe('EmbeddedMarkdownDocument', () => {
   it('loads the complete file and persists edits through the normal file writer', async () => {
     expect(host.textContent).toContain('# complete');
     click('proposal-edit');
+    expect(host.querySelector('[data-testid="milkdown-canvas"]')).not.toBeNull();
     edit('# edited in plans');
     click('proposal-save');
     await act(async () => {});

@@ -3,6 +3,7 @@ import * as Icons from 'lucide-react';
 import { useDashboardStore } from '../../stores/dashboard-store';
 import EmbeddedMarkdownDocument from './EmbeddedMarkdownDocument';
 import PromoteToPlanPanel from './PromoteToPlanPanel';
+import { usePlansPaneState } from './plans-pane-state';
 import {
   deriveProposalCardMetadata,
   orderProposalCards,
@@ -30,7 +31,8 @@ export default function ProposalCardGallery(): React.ReactElement {
   const openTab = useDashboardStore((state) => state.openTab);
   const showFileViewer = useDashboardStore((state) => state.showFileViewer);
   const [cards, setCards] = useState<ProposalCardMetadata[] | null>(null);
-  const [selectedDocId, setSelectedDocId] = useState<string | null>(null);
+  const selectedDocId = usePlansPaneState((state) => state.expandedProposalId);
+  const setSelectedDocId = usePlansPaneState((state) => state.setExpandedProposalId);
   const [error, setError] = useState<string | null>(null);
   const [promoteOpen, setPromoteOpen] = useState(false);
 
@@ -126,7 +128,6 @@ export default function ProposalCardGallery(): React.ReactElement {
           <PromoteToPlanPanel
             workspace={workspace}
             proposalFilePath={proposalPath(workspace.path, selected.fileName, workspace.pathType)}
-            proposalTitle={selected.title}
             onClose={() => setPromoteOpen(false)}
           />
         )}
@@ -186,8 +187,11 @@ export default function ProposalCardGallery(): React.ReactElement {
             >
               <span className="line-clamp-2 text-[14px] font-semibold leading-5 text-gray-100">{card.title}</span>
               <span className="mt-2 line-clamp-4 text-[12px] leading-5 text-gray-400">{card.description}</span>
+              <span className="mt-auto pt-3 text-[11px] text-gray-500" data-testid="proposal-card-date">
+                {card.dateLabel}
+              </span>
               {card.author && (
-                <span className="mt-auto pt-3 text-[11px] text-gray-500" data-testid="proposal-card-author">
+                <span className="pt-1 text-[11px] text-gray-500" data-testid="proposal-card-author">
                   by {card.author}
                 </span>
               )}

@@ -12,16 +12,15 @@ import {
 interface Props {
   workspace: Workspace;
   proposalFilePath: string;
-  proposalTitle: string;
   onClose: () => void;
 }
 
-export default function PromoteToPlanPanel({ workspace, proposalFilePath, proposalTitle, onClose }: Props): React.ReactElement {
+export default function PromoteToPlanPanel({ workspace, proposalFilePath, onClose }: Props): React.ReactElement {
   const agents = useDashboardStore((state) => state.agents);
   const loadAgents = useDashboardStore((state) => state.loadAgents);
   const [query, setQuery] = useState('');
   const [selectedId, setSelectedId] = useState<string>(NEW_SUPERVISOR_ID);
-  const [newTitle, setNewTitle] = useState(`${proposalTitle} planning supervisor`);
+  const [newTitle, setNewTitle] = useState('Planning supervisor');
   const [dispatching, setDispatching] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [confirmation, setConfirmation] = useState<PromotionDispatchResult | null>(null);
@@ -85,6 +84,14 @@ export default function PromoteToPlanPanel({ workspace, proposalFilePath, propos
             data-testid="promote-supervisor-search"
           />
           <div className="mt-2 max-h-36 space-y-1 overflow-y-auto scrollbar-thin" data-testid="promote-supervisor-list">
+            <button
+              type="button"
+              onClick={() => setSelectedId(NEW_SUPERVISOR_ID)}
+              className={`flex w-full items-center rounded px-3 py-2 text-left text-[12px] ${selectedId === NEW_SUPERVISOR_ID ? 'bg-accent-blue/15 text-gray-100' : 'text-gray-300 hover:bg-white/5'}`}
+              data-testid="promote-new-supervisor-option"
+            >
+              <Icons.Plus className="mr-2 h-3.5 w-3.5" /> New supervisor
+            </button>
             {supervisors.map((agent) => (
               <button
                 key={agent.id}
@@ -100,14 +107,6 @@ export default function PromoteToPlanPanel({ workspace, proposalFilePath, propos
                 </span>
               </button>
             ))}
-            <button
-              type="button"
-              onClick={() => setSelectedId(NEW_SUPERVISOR_ID)}
-              className={`flex w-full items-center rounded px-3 py-2 text-left text-[12px] ${selectedId === NEW_SUPERVISOR_ID ? 'bg-accent-blue/15 text-gray-100' : 'text-gray-300 hover:bg-white/5'}`}
-              data-testid="promote-new-supervisor-option"
-            >
-              <Icons.Plus className="mr-2 h-3.5 w-3.5" /> New supervisor
-            </button>
           </div>
           {selectedId === NEW_SUPERVISOR_ID && (
             <input

@@ -31,7 +31,7 @@ describe('PromoteToPlanPanel supervisor picker', () => {
     document.body.appendChild(host);
     root = createRoot(host);
     act(() => root.render(
-      <PromoteToPlanPanel workspace={workspace} proposalFilePath="C:\work\.lares\proposals\idea.md" proposalTitle="Idea" onClose={() => {}} />,
+      <PromoteToPlanPanel workspace={workspace} proposalFilePath="C:\work\.lares\proposals\idea.md" onClose={() => {}} />,
     ));
 
     const text = host.textContent ?? '';
@@ -41,5 +41,12 @@ describe('PromoteToPlanPanel supervisor picker', () => {
     expect(text).toContain('New supervisor');
     expect(text).not.toContain('Ordinary worker');
     expect(text).not.toContain('Foreign owner');
+    expect(text).not.toContain('Idea');
+    const options = [...host.querySelectorAll('[data-testid$="supervisor-option"]')];
+    expect(options[0]?.getAttribute('data-testid')).toBe('promote-new-supervisor-option');
+    expect(options.slice(1).map((option) => option.textContent)).toEqual([
+      expect.stringContaining('Live owner'),
+      expect.stringContaining('Done owner'),
+    ]);
   });
 });

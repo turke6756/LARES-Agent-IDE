@@ -2,8 +2,9 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import * as Icons from 'lucide-react';
 import type { PathType } from '../../../shared/types';
 import { contentHash } from '../fileviewer/markdownSplice';
-import CodeMirrorEditor from '../fileviewer/CodeMirrorEditor';
+import MilkdownEditor from '../fileviewer/MilkdownEditor';
 import MarkdownRenderer from '../fileviewer/MarkdownRenderer';
+import SelectionSurface from '../selection/SelectionSurface';
 
 interface Props {
   content: string;
@@ -35,6 +36,7 @@ export default function EmbeddedMarkdownDocument({
   const draftRef = useRef(draft);
   const baselineRef = useRef(initialContent);
   const savingRef = useRef(false);
+  const saveHandlerRef = useRef<(() => Promise<boolean>) | null>(null);
 
   draftRef.current = draft;
 
@@ -86,8 +88,8 @@ export default function EmbeddedMarkdownDocument({
     }
   }, [filePath, rootDirectory, pathType]);
 
-  // File tabs save before close. A center-pane switch unmounts this surface,
-  // so flush the latest synchronous CodeMirror draft through the same writer.
+  // A center-pane switch unmounts this surface, so flush the latest canvas
+  // draft through the same conflict-protected writer.
   useEffect(() => () => {
     const latest = draftRef.current;
     if (latest !== baselineRef.current) void persist(latest);
@@ -104,19 +106,19 @@ export default function EmbeddedMarkdownDocument({
     <div className="flex h-full min-h-0 flex-col bg-surface-0" data-testid="embedded-markdown-document">
       <div className="flex h-9 shrink-0 items-center justify-end gap-1 border-b border-white/10 px-3">
         <div className="flex items-center gap-0.5" role="group" aria-label="Markdown mode">
-          <button type="button" onClick={showView} className={`ui-btn text-[12px] ${mode === 'view' ? 'text-accent-blue' : ''}`}>
+          <button type="button" onClick={showView} className={`ui-btn text-[13px] ${mode === 'view' ? 'text-accent-blue' : ''}`} title="Rendered preview (read-only)">
             <Icons.Eye className="h-3 w-3" /> View
           </button>
-          <button type="button" onClick={() => setMode('edit')} className={`ui-btn text-[12px] ${mode === 'edit' ? 'text-accent-blue' : ''}`} data-testid="proposal-edit">
-            <Icons.Code className="h-3 w-3" /> Edit
+          <button type="button" onClick={() => setMode('edit')} className={`ui-btn text-[13px] ${mode === 'edit' ? 'text-accent-blue' : ''}`} data-testid="proposal-edit" title="Edit in the WYSIWYG canvas">
+            <Icons.PenLine className="h-3 w-3" /> Edit
           </button>
         </div>
         {mode === 'edit' && (
           <button
             type="button"
-            onClick={() => { void persist(draftRef.current); }}
+            onClick={() => { void (saveHandlerRef.current?.() ?? persist(draftRef.current)); }}
             disabled={saving}
-            className={`ui-btn text-[12px] ${draft !== baselineRef.current ? 'ui-btn-primary' : ''}`}
+            className={`ui-btn text-[13px] ${draft !== baselineRef.current ? 'ui-btn-primary' : ''}`}
             data-testid="proposal-save"
           >
             {saving ? <Icons.Loader2 className="h-3 w-3 animate-spin" /> : <Icons.Save className="h-3 w-3" />} Save
@@ -126,14 +128,35 @@ export default function EmbeddedMarkdownDocument({
       </div>
       <div className="min-h-0 flex-1">
         {mode === 'edit' ? (
-          <CodeMirrorEditor
-            key={filePath}
-            initialContent={draft}
-            language="markdown"
-            saving={saving}
-            onChange={setDraft}
-            onSave={() => { void persist(draftRef.current); }}
-          />
+          <SelectionSurface
+            tabId={`embedded:${filePath}`}
+            file={{ filePath, workspaceId, pathType, rootDirectory }}
+            getDocText={() => draftRef.current}
+          >
+            <MilkdownEditor
+              key={filePath}
+              tabId={`embedded:${filePath}`}
+              filePath={filePath}
+              content={baselineRef.current}
+              embeddedPersistence={{
+                draftContent: draft,
+                dirty: draft !== baselineRef.current,
+                onDraftChange: (next) => {
+                  draftRef.current = next;
+                  setDraft(next);
+                },
+                onSave: persist,
+                onUnmountFlush: (next) => { void persist(next); },
+                registerSaveHandler: (save) => {
+                  saveHandlerRef.current = save;
+                  return () => {
+                    if (saveHandlerRef.current === save) saveHandlerRef.current = null;
+                  };
+                },
+                workspaceId,
+              }}
+            />
+          </SelectionSurface>
         ) : (
           <MarkdownRenderer
             content={content}
