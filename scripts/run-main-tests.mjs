@@ -285,12 +285,18 @@ const TESTS = [
   // Save-card Stage 4 SC-WP-4E — lens-neutral IPC, main-process flag gate, and
   // saved-only-after the integrated CommitCoordinator → closure response path.
   'dist/main/main/commit-candidates/commit-coordinator-ipc.test.js',
+  // Save-card Stage 4 SC-WP-4K: production enablement with disabled behavior
+  // held invariant through the injected per-invocation flag seam.
+  'dist/main/main/commit-candidates/commit-coordinator.enablement.test.js',
   // Save-card Stage 4 SC-WP-4H — real-repository adversarial race matrix.
   'dist/main/main/git-checkpoints/commit-coordinator.races.test.js',
   // Save-card Stage 4 SC-WP-4J — real-repository path-semantics adversarial matrix.
   'dist/main/main/git-checkpoints/commit-coordinator.path-semantics.test.js',
   // Save-card Stage 4 SC-WP-4I — real hooks + §9.4 outcome/end-state matrix.
   'dist/main/main/git-checkpoints/commit-coordinator.hooks-outcomes.test.js',
+  // Save-card SC-WP-W2a: preload/source contract smoke test for inventory,
+  // preview, fleet-finalize, and coordinator bindings.
+  'dist/main/preload/save-card-surface.test.js',
   'dist/main/main/supervisor/send-queue-checkpoint.test.js',
   'dist/main/main/supervisor/initial-user-prompt.test.js',
   'dist/main/main/supervisor/hook-spool-tailer.test.js',
@@ -684,6 +690,14 @@ const TESTS = [
   'dist/main/main/git-checkpoints/dispatch-default.activePlan.test.js',
   // WP-P5-dispatch: package dispatch + persisted attempt/reconciliation (confirmed_turn_id).
   'dist/main/main/plans/package-dispatch.test.js',
+  // Planning-surface Stage P6 (gate P6Z) — live mission board.
+  // WP-SEP: stamped-evidence projection (live-activity + durable-trail base).
+  'dist/main/main/plans/stamped-evidence-projection.test.js',
+  // WP-P6A: board evidence projection (per-package/per-plan live + durable trail).
+  'dist/main/main/plans/mission-board-evidence.test.js',
+  // WP-P6B-query + WP-P6D-timeline: card DTO model (state ⟂ liveActivity) and the
+  // per-package timeline union (finalizations + lifecycle events).
+  'dist/main/main/plans/mission-board.test.js',
   'dist/main/main/browser/credentialed-open-diagnostic.test.js',
   'dist/main/main/browser/browser-signin-workspace-exact.test.js',
   'dist/main/main/browser/browser-signin-expiry.test.js',
