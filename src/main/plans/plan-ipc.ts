@@ -65,6 +65,7 @@ import {
   type AnswerPlanCommentDeps,
   type ListPlanCommentsDeps,
 } from './plan-comments';
+import { registerPlanImplementIpc } from './plan-implement';
 
 // ── Save-card SC-WP-3D — plan-package `done` finalization wiring ──────────────
 //
@@ -818,6 +819,12 @@ export function registerPlanIpc(manager: PlanPaneManager): void {
   // folder-doc logical targets, each folded with its reply thread. All deps have
   // DB defaults (no send/route seam), so it registers here directly.
   registerPlanCommentListIpc(ipcMain);
+
+  // WP-P5C: the human Implement trigger (`plan:implement`). Renderer-only /
+  // human-gesture — there is NO api-server route, so an agent cannot pull it, and
+  // `app_user_id` is derived main-side (never from the renderer payload). Pins a
+  // durable execution baseline and flips the plan `ready → executing`.
+  registerPlanImplementIpc(ipcMain);
 
   // Plan list for the "Plans" card gallery (workspace-scoped). Each row carries a
   // cheap description snippet derived from its already-served projection (or an

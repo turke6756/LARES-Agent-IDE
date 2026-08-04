@@ -2007,6 +2007,43 @@ function initContextOptimizerSchema(): void {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_plan_wp_lifecycle_plan
     ON plan_wp_lifecycle_events(plan_id, ts)`);
 
+  // Planning-surface WP-P5C — plan_execution_runs: the durable record of a human
+  // Implement trigger pull. One row per execution run of a structured plan, pinning
+  // the execution BASELINE. `baseline_ref` is a durable Git ref
+  // (`refs/lares/plans/<planId>/<runId>`) created at the pinned HEAD OID BEFORE this
+  // row commits — an OID stored only in SQLite would not protect an unreachable
+  // commit from Git GC, so the ref is what actually pins the baseline. The
+  // (baseline_kind) CHECK plus the paired-nullability CHECK make the unborn case an
+  // EXPLICIT marker (kind='unborn', no oid, no ref) rather than a bare nullable OID:
+  // a `head` run must carry both an OID and a ref; an `unborn` run must carry
+  // neither. `trigger_source` is always the app's factual origin tag
+  // ('renderer-user-action') and `app_user_id` a real app-observed identity — never
+  // a claimed human identity the app cannot prove. `lifecycle_state` starts 'active'
+  // and is closed to 'archived' by WP-P5-archive (never here). Cascades with its
+  // plan (plan deletion is the sole normal ref-release path — the ref sweep is the
+  // reconciler in plan-baseline-refs.ts). A2-serialized DDL slot, after the P5B
+  // ledger.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS plan_execution_runs (
+      id                 TEXT PRIMARY KEY,
+      plan_id            TEXT NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+      repository_key     TEXT,
+      baseline_kind      TEXT NOT NULL CHECK (baseline_kind IN ('head','unborn')),
+      baseline_head_oid  TEXT,
+      baseline_ref       TEXT,
+      trigger_source     TEXT NOT NULL,
+      app_user_id        TEXT,
+      triggered_at       INTEGER NOT NULL,
+      lifecycle_state    TEXT NOT NULL CHECK (lifecycle_state IN ('active','archived')),
+      CHECK (
+        (baseline_kind = 'unborn' AND baseline_head_oid IS NULL AND baseline_ref IS NULL) OR
+        (baseline_kind = 'head'   AND baseline_head_oid IS NOT NULL AND baseline_ref IS NOT NULL)
+      )
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_plan_exec_runs_plan
+    ON plan_execution_runs(plan_id, lifecycle_state)`);
+
   // WP-2B (Priority 0) — one-time, resumable workspace-lineage backfill. Populates
   // stream_lane_stats.workspace_id/workspace_root by folding each stream's launch cwd
   // to a root owned by EXACTLY one workspace. Idempotent (only NULL rows, ON a unique
@@ -5654,6 +5691,127 @@ export function planHasValidResponsibleSupervisor(planId: string): boolean {
     [planId],
   );
   return row !== null;
+}
+
+// ── Planning-surface WP-P5C — plan_execution_runs primitives ───────────────────
+//
+// DB-layer primitives for the WP-P5C Implement service (src/main/plans/
+// plan-implement.ts): the run-row read paths and the ATOMIC "activate" write — the
+// single txn that inserts the run row AND flips `plans.run_state ready→executing`.
+// The service creates the durable baseline ref BEFORE calling the activating insert,
+// so a txn failure here leaves only an orphan ref (reconciled at startup by
+// plan-baseline-refs.ts), never an executing run without a baseline. `done`/finish
+// is nowhere near this surface. Run CLOSURE (lifecycle_state → 'archived') is
+// WP-P5-archive's job, not here.
+
+export type PlanBaselineKind = 'head' | 'unborn';
+export type PlanRunLifecycleState = 'active' | 'archived';
+
+export interface PlanExecutionRun {
+  id: string;
+  planId: string;
+  repositoryKey: string | null;
+  baselineKind: PlanBaselineKind;
+  baselineHeadOid: string | null;
+  baselineRef: string | null;
+  triggerSource: string;
+  appUserId: string | null;
+  triggeredAt: number;
+  lifecycleState: PlanRunLifecycleState;
+}
+
+function rowToPlanExecutionRun(row: any): PlanExecutionRun {
+  return {
+    id: row.id,
+    planId: row.plan_id,
+    repositoryKey: row.repository_key ?? null,
+    baselineKind: row.baseline_kind,
+    baselineHeadOid: row.baseline_head_oid ?? null,
+    baselineRef: row.baseline_ref ?? null,
+    triggerSource: row.trigger_source,
+    appUserId: row.app_user_id ?? null,
+    triggeredAt: row.triggered_at,
+    lifecycleState: row.lifecycle_state,
+  };
+}
+
+export interface InsertPlanExecutionRunInput {
+  id: string;
+  planId: string;
+  repositoryKey?: string | null;
+  baselineKind: PlanBaselineKind;
+  baselineHeadOid?: string | null;
+  baselineRef?: string | null;
+  triggerSource: string;
+  appUserId?: string | null;
+  triggeredAt: number;
+}
+
+/**
+ * Insert a `plan_execution_runs` row AND flip the plan `run_state ready→executing`,
+ * atomically in ONE transaction. Guards that the plan is currently `ready` (re-read
+ * inside the txn so a raced state change aborts cleanly) — a plan that is not `ready`
+ * throws, and because the caller has already created the baseline ref, that failure
+ * leaves an orphan ref for startup reconciliation, never a half-activated plan. The
+ * new run is always `lifecycle_state='active'`. Returns the persisted row.
+ */
+export function insertPlanExecutionRunActivating(
+  input: InsertPlanExecutionRunInput,
+): PlanExecutionRun {
+  const database = getDb();
+  const tx = database.transaction((): PlanExecutionRun => {
+    const plan = getPlan(input.planId);
+    if (!plan) throw new Error(`insertPlanExecutionRunActivating: no plan ${input.planId}`);
+    if (plan.runState !== 'ready') {
+      throw new Error(
+        `insertPlanExecutionRunActivating: plan ${input.planId} is '${plan.runState}', not 'ready'`,
+      );
+    }
+    run(
+      `INSERT INTO plan_execution_runs
+         (id, plan_id, repository_key, baseline_kind, baseline_head_oid, baseline_ref,
+          trigger_source, app_user_id, triggered_at, lifecycle_state)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')`,
+      [input.id, input.planId, input.repositoryKey ?? null, input.baselineKind,
+        input.baselineHeadOid ?? null, input.baselineRef ?? null,
+        input.triggerSource, input.appUserId ?? null, input.triggeredAt],
+    );
+    run(
+      `UPDATE plans SET run_state = 'executing', updated_at = datetime('now')
+         WHERE id = ? AND run_state = 'ready'`,
+      [input.planId],
+    );
+    return getPlanExecutionRun(input.id)!;
+  });
+  return tx();
+}
+
+/** A single execution run by id, or null. */
+export function getPlanExecutionRun(id: string): PlanExecutionRun | null {
+  const row = queryOne('SELECT * FROM plan_execution_runs WHERE id = ?', [id]);
+  return row ? rowToPlanExecutionRun(row) : null;
+}
+
+/** The current ACTIVE execution run for a plan (latest by triggered_at), or null.
+ *  This is the "is there an active run?" gate the pre-Implement seam / dispatch
+ *  default (P5C-gate / P5D) read. */
+export function getActivePlanExecutionRun(planId: string): PlanExecutionRun | null {
+  const row = queryOne(
+    `SELECT * FROM plan_execution_runs
+       WHERE plan_id = ? AND lifecycle_state = 'active'
+       ORDER BY triggered_at DESC, id DESC LIMIT 1`,
+    [planId],
+  );
+  return row ? rowToPlanExecutionRun(row) : null;
+}
+
+/** Every execution-run id in the DB, REGARDLESS of lifecycle_state — the truth set
+ *  the baseline-ref orphan reconciler diffs `refs/lares/plans/*` against. An archived
+ *  run still has a row (and keeps its ref); only a ref with NO row at all is an
+ *  orphan. */
+export function listAllPlanExecutionRunIds(): Set<string> {
+  const rows = queryAll('SELECT id FROM plan_execution_runs', []);
+  return new Set(rows.map((r: any) => String(r.id)));
 }
 
 // ── Save-card SC-WP-3B — package_finalizations schema types + lifecycle accessors ──
