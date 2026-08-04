@@ -30,13 +30,22 @@ import {
   sendPersistedComments,
 } from '../../lib/selection/comment-actions';
 import { showSelectionToast } from '../../lib/selection/selection-toast';
+import type { PathType } from '../../../shared/types';
 import type { SelectionAgentTarget, SelectionContext } from '../../lib/selection/selection-types';
 import { getCanvasEditorHandle } from '../fileviewer/MilkdownEditor';
 
 export type SurfaceSelectionContext = Omit<SelectionContext, 'quotedText'>;
+export interface ExplicitFileSurface {
+  filePath: string;
+  workspaceId: string;
+  pathType?: PathType;
+  rootDirectory?: string;
+}
 
 interface Props {
   tabId?: string;
+  /** Explicit file identity for embedded readers that do not own a file tab. */
+  file?: ExplicitFileSurface;
   getContext?: () => SurfaceSelectionContext;
   /** Markdown source for anchor capture (read-mode renderers pass their
    * content prop). Fallback chain: this → canvas editor handle → tab edit
@@ -78,7 +87,7 @@ export function deriveFileSelectionContext(
   };
 }
 
-export default function SelectionSurface({ tabId, getContext, getDocText, children }: Props) {
+export default function SelectionSurface({ tabId, file, getContext, getDocText, children }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const tab = useDashboardStore((s) =>
     tabId ? s.openTabs.find((t) => t.id === tabId) : undefined,
@@ -110,8 +119,8 @@ export default function SelectionSurface({ tabId, getContext, getDocText, childr
       return createDraftComment({
         workspaceId: detail.context.workspaceId,
         filePath,
-        pathType: currentTab?.pathType,
-        rootDirectory: currentTab?.rootDirectory,
+        pathType: file?.pathType ?? currentTab?.pathType,
+        rootDirectory: file?.rootDirectory ?? currentTab?.rootDirectory,
         quotedText: detail.context.quotedText,
         body: detail.body,
         prefix: detail.prefix,
@@ -119,7 +128,7 @@ export default function SelectionSurface({ tabId, getContext, getDocText, childr
         docText: resolveDocText(),
       });
     },
-    [tabId, resolveDocText],
+    [tabId, file, resolveDocText],
   );
 
   const handleSaveComment = useCallback(
@@ -148,8 +157,8 @@ export default function SelectionSurface({ tabId, getContext, getDocText, childr
         await createHighlight({
           workspaceId: detail.context.workspaceId,
           filePath,
-          pathType: currentTab?.pathType,
-          rootDirectory: currentTab?.rootDirectory,
+          pathType: file?.pathType ?? currentTab?.pathType,
+          rootDirectory: file?.rootDirectory ?? currentTab?.rootDirectory,
           quotedText: detail.context.quotedText,
           prefix: detail.prefix,
           suffix: detail.suffix,
@@ -162,7 +171,7 @@ export default function SelectionSurface({ tabId, getContext, getDocText, childr
         );
       }
     },
-    [tabId, resolveDocText],
+    [tabId, file, resolveDocText],
   );
 
   const handleCommentAndSend = useCallback(
@@ -190,7 +199,7 @@ export default function SelectionSurface({ tabId, getContext, getDocText, childr
 
   const { menuElement } = useSelectionActions({
     containerRef,
-    getContext: getContext ?? (() => deriveFileSelectionContext(tab, selectedWorkspaceId)),
+    getContext: getContext ?? (() => deriveFileSelectionContext(file ?? tab, selectedWorkspaceId)),
     onSaveComment: handleSaveComment,
     onCommentAndSend: handleCommentAndSend,
     onHighlight: handleHighlight,

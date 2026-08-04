@@ -240,6 +240,25 @@ describe('SelectionSurface comment flows', () => {
     return document.getElementById('para')!;
   }
 
+  function mountExplicit(getDocText?: () => string | null) {
+    act(() => {
+      root.render(
+        <SelectionSurface
+          file={{
+            filePath: 'C:\\ws\\.lares\\proposals\\proposal.md',
+            workspaceId: 'ws-1',
+            rootDirectory: 'C:\\ws',
+            pathType: 'windows',
+          }}
+          getDocText={getDocText}
+        >
+          <p id="para">quoted file text</p>
+        </SelectionSurface>,
+      );
+    });
+    return document.getElementById('para')!;
+  }
+
   function selectContentsOf(el: HTMLElement) {
     const range = document.createRange();
     range.selectNodeContents(el);
@@ -318,6 +337,23 @@ describe('SelectionSurface comment flows', () => {
     expect(typeof input.docHash).toBe('string');
     expect((input.docHash as string).length).toBeGreaterThan(0);
     expect(sendSelectionToAgent).not.toHaveBeenCalled();
+  });
+
+  it('creates comments for an explicit proposal path without a file tab', async () => {
+    const para = mountExplicit(() => 'before quoted file text after');
+    selectContentsOf(para);
+    rightClick(para);
+    act(() => button('Add comment')!.click());
+    typeInPopover('proposal feedback');
+    await act(async () => button('Save comment')!.click());
+
+    expect(commentsApi.create).toHaveBeenCalledWith(expect.objectContaining({
+      workspaceId: 'ws-1',
+      filePath: 'C:\\ws\\.lares\\proposals\\proposal.md',
+      rootDirectory: 'C:\\ws',
+      pathType: 'windows',
+      body: 'proposal feedback',
+    }));
   });
 
   it('one-shot Comment & send on a markdown tab persists the row, then sends via comments:send', async () => {

@@ -9,10 +9,12 @@ import { useTabScrollMemory } from './scrollMemory';
 import { useModifierPathOpen, useUrlOpen } from './openFileHelpers';
 import SelectionSurface from '../selection/SelectionSurface';
 import FileCommentGutter from '../selection/FileCommentGutter';
+import type { ExplicitFileSurface } from '../selection/SelectionSurface';
 
 interface Props {
   content: string;
   tabId?: string;
+  file?: ExplicitFileSurface;
 }
 
 interface MarkdownHeading {
@@ -68,7 +70,7 @@ function extractMarkdownHeadings(markdown: string): MarkdownHeading[] {
   return headings;
 }
 
-export default function MarkdownRenderer({ content, tabId }: Props) {
+export default function MarkdownRenderer({ content, tabId, file }: Props) {
   const theme = useThemeStore((s) => s.theme);
   const isLight = theme === 'light';
   const outline = useMemo(() => extractMarkdownHeadings(content), [content]);
@@ -99,7 +101,7 @@ export default function MarkdownRenderer({ content, tabId }: Props) {
   const hasOutline = outline.length > 0;
 
   return (
-    <SelectionSurface tabId={tabId} getDocText={() => content}>
+    <SelectionSurface tabId={tabId} file={file} getDocText={() => content}>
     <div className="h-full min-w-0 flex bg-surface-0">
       <div className="relative flex-1 min-w-0 h-full">
       <div ref={scrollRef} onScroll={handleScroll} className="h-full min-w-0 overflow-auto p-6">
@@ -214,7 +216,12 @@ export default function MarkdownRenderer({ content, tabId }: Props) {
         </ReactMarkdown>
         </div>
       </div>
-      <FileCommentGutter tabId={tabId} scrollRef={scrollRef} />
+      <FileCommentGutter
+        tabId={tabId}
+        filePath={file?.filePath}
+        workspaceId={file?.workspaceId}
+        scrollRef={scrollRef}
+      />
       </div>
       {hasOutline && (
         outlineCollapsed ? (

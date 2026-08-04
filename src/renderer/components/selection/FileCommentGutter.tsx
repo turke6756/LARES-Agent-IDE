@@ -26,6 +26,9 @@ import CommentCard from './CommentCard';
 interface Props {
   /** File tab whose comments to show; the tab carries filePath/workspace. */
   tabId?: string;
+  /** Explicit identity for an embedded file surface without a file tab. */
+  filePath?: string;
+  workspaceId?: string;
   /** The surface's scrolling element — measure target and scroll source. */
   scrollRef: React.RefObject<HTMLElement | null>;
 }
@@ -159,12 +162,12 @@ const STATUS_LABEL: Record<string, string> = {
 
 const SENDABLE = new Set(['draft', 'send_failed', 'orphaned']);
 
-export default function FileCommentGutter({ tabId, scrollRef }: Props) {
+export default function FileCommentGutter({ tabId, filePath: explicitFilePath, workspaceId: explicitWorkspaceId, scrollRef }: Props) {
   const tab = useDashboardStore((s) =>
     tabId ? s.openTabs.find((t) => t.id === tabId) : undefined,
   );
-  const filePath = tab?.filePath || '';
-  const workspaceId = tab?.workspaceId || '';
+  const filePath = explicitFilePath || tab?.filePath || '';
+  const workspaceId = explicitWorkspaceId || tab?.workspaceId || '';
 
   const [comments, setComments] = useState<SelectionComment[]>([]);
   const [positions, setPositions] = useState<Map<string, MarkerPosition | null>>(new Map());
@@ -350,7 +353,7 @@ export default function FileCommentGutter({ tabId, scrollRef }: Props) {
     return () => setActiveHighlight(null);
   }, [expandedId, visible, scrollRef, positions]);
 
-  if (!tabId || !filePath || !workspaceId || (visible.length === 0 && highlights.length === 0)) {
+  if ((!tabId && !explicitFilePath) || !filePath || !workspaceId || (visible.length === 0 && highlights.length === 0)) {
     return null;
   }
 

@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import * as Icons from 'lucide-react';
 import { useDashboardStore } from '../../stores/dashboard-store';
-import MarkdownRenderer from '../fileviewer/MarkdownRenderer';
+import EmbeddedMarkdownDocument from './EmbeddedMarkdownDocument';
 import {
   deriveProposalCardMetadata,
   orderProposalCards,
@@ -111,7 +111,15 @@ export default function ProposalCardGallery(): React.ReactElement {
           </button>
         </div>
         <div className="min-h-0 flex-1" data-testid="proposal-expanded-reader">
-          <MarkdownRenderer content={selected.content} />
+          {workspace && (
+            <EmbeddedMarkdownDocument
+              content={selected.content}
+              filePath={proposalPath(workspace.path, selected.fileName, workspace.pathType)}
+              rootDirectory={workspace.path}
+              pathType={workspace.pathType}
+              workspaceId={workspace.id}
+            />
+          )}
         </div>
       </section>
     );

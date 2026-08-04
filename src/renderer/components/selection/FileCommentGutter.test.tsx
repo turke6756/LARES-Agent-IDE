@@ -103,6 +103,20 @@ function Host() {
   );
 }
 
+function ExplicitHost() {
+  const ref = useRef<HTMLDivElement>(null);
+  return (
+    <div className="relative">
+      <div ref={ref}><p>alpha bravo charlie</p></div>
+      <FileCommentGutter
+        filePath={'C:\\ws\\.lares\\proposals\\proposal.md'}
+        workspaceId="ws-1"
+        scrollRef={ref}
+      />
+    </div>
+  );
+}
+
 describe('FileCommentGutter', () => {
   let host: HTMLDivElement;
   let root: Root;
@@ -143,6 +157,19 @@ describe('FileCommentGutter', () => {
     expect(marker('c1')).toBeTruthy();
     expect(marker('c2')).toBeTruthy();
     expect(marker('c3')).toBeNull();
+  });
+
+  it('loads and displays comments for an explicit proposal path without a tab', async () => {
+    rows = [makeRow({
+      id: 'proposal-comment',
+      filePath: 'C:\\ws\\.lares\\proposals\\proposal.md',
+      quotedText: 'alpha bravo',
+    })];
+    await act(async () => { root.render(<ExplicitHost />); });
+    await act(async () => {});
+
+    expect(commentsApi.list).toHaveBeenCalledWith('ws-1', 'C:\\ws\\.lares\\proposals\\proposal.md');
+    expect(marker('proposal-comment')).toBeTruthy();
   });
 
   it('flips a draft whose text is gone to orphaned (and shows the orphan marker)', async () => {
