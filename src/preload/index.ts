@@ -212,6 +212,9 @@ const api: IpcApi = {
     // single-proposal markdown read that backs the WP-P2D gallery pane.
     gallery: (workspaceId, opts) => ipcRenderer.invoke('plan-gallery:list', workspaceId, opts),
     readProposal: (proposalId) => ipcRenderer.invoke('proposal:read', proposalId),
+    // WP-P4A: folder-native tab projection. Bodies use only main-issued handles.
+    documents: (planId) => ipcRenderer.invoke('plan:documents', planId),
+    readDocument: (planId, ref) => ipcRenderer.invoke('plan:document:read', planId, ref),
     getProjection: (planId, opts) => ipcRenderer.invoke('plan:projection', planId, opts),
     listIntents: (planId) => ipcRenderer.invoke('plan:intents:list', planId),
     paneShow: (planId) => ipcRenderer.invoke('plan-pane:show', planId),

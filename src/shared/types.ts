@@ -2659,6 +2659,12 @@ export interface IpcApi {
     /** WP-P2C/P2D — read one proposal's markdown by its proposals-row id, with
      *  read-time containment + byte-cap re-validation. `{ error }` on failure. */
     readProposal: (proposalId: string) => Promise<ProposalReadResult | { error: string }>;
+    /** WP-P4A — live folder-native tab projection and guarded body read. */
+    documents: (planId: string) => Promise<PlanDocumentsModel | null>;
+    readDocument: (
+      planId: string,
+      ref: PlanDocumentRef,
+    ) => Promise<PlanDocumentReadResult | { error: string }>;
     /** Full activity projection (sections + trusted event trail) — the in-process
      *  mirror of GET /api/plans/:id/projection?events=full. `null` if unknown. */
     getProjection: (planId: string, opts?: { eventDetailId?: string }) => Promise<PlanActivityProjection | null>;
@@ -4557,6 +4563,55 @@ export interface PlanningReaderReadResult {
   name: string;
   content: string;
   /** True when the file exceeded the per-file byte cap and was truncated. */
+  truncated: boolean;
+  sizeBytes: number;
+}
+
+// ── WP-P4A: folder-native plan document tabs ──
+
+/** Stable tab identity. Display labels are deliberately a renderer concern. */
+export type PlanTabKey =
+  | 'overview'
+  | 'proposal'
+  | 'plan'
+  | 'deliberations'
+  | 'research'
+  | 'supplements'
+  | 'packages'
+  | 'legacy-html';
+
+/** A document handle issued by main. Neither variant contains a filesystem path. */
+export type PlanDocumentRef =
+  | { source: 'folder'; documentId: string }
+  | { source: 'registered'; documentId: string };
+
+export interface PlanTabDocument {
+  ref: PlanDocumentRef;
+  name: string;
+  kind: 'arc' | 'plan' | 'deliberation' | 'research' | 'supplement' | 'proposal' | 'legacy-html';
+  sizeBytes: number;
+  mtimeMs: number | null;
+}
+
+export interface PlanDocumentTab {
+  key: PlanTabKey;
+  /** True only when a real document/overview exists, or Packages has real rows. */
+  populated: boolean;
+  documents: PlanTabDocument[];
+  /** Present only for the synthetic, deliberately-unpopulated Packages tab. */
+  placeholder?: string;
+}
+
+export interface PlanDocumentsModel {
+  planId: string;
+  tabs: PlanDocumentTab[];
+  warnings: string[];
+}
+
+export interface PlanDocumentReadResult {
+  ref: PlanDocumentRef;
+  name: string;
+  content: string;
   truncated: boolean;
   sizeBytes: number;
 }

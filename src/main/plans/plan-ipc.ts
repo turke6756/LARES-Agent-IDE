@@ -51,6 +51,7 @@ import {
   type PlanCandidatePreviewResponse,
 } from '../../shared/types';
 import { getPlanIntentsProjection } from './plan-intent-ledger';
+import { buildPlanDocuments, readPlanDocument, type PlanDocumentsDeps } from './plan-documents';
 
 // ── Save-card SC-WP-3D — plan-package `done` finalization wiring ──────────────
 //
@@ -160,6 +161,32 @@ export async function finalizePlanItemDone(
 /** Minimal `ipcMain.handle` shape so the channel is testable without a live main. */
 export interface PlanIpcLike {
   handle(channel: string, listener: (event: unknown, ...args: unknown[]) => unknown): void;
+}
+
+// ── WP-P4A: folder-native tab model + guarded body reads ──
+
+export function runPlanDocumentsList(rawPlanId: unknown, deps: PlanDocumentsDeps = {}) {
+  if (typeof rawPlanId !== 'string' || rawPlanId === '') return null;
+  return buildPlanDocuments(rawPlanId, deps);
+}
+
+export function runPlanDocumentRead(
+  rawPlanId: unknown,
+  rawRef: unknown,
+  deps: PlanDocumentsDeps = {},
+) {
+  if (typeof rawPlanId !== 'string' || rawPlanId === '') return { error: 'missing plan id' };
+  return readPlanDocument(rawPlanId, rawRef, deps);
+}
+
+export function registerPlanDocumentsIpc(
+  ipc: PlanIpcLike,
+  deps: PlanDocumentsDeps = {},
+): void {
+  ipc.handle('plan:documents', (_event, rawPlanId: unknown) =>
+    runPlanDocumentsList(rawPlanId, deps));
+  ipc.handle('plan:document:read', (_event, rawPlanId: unknown, rawRef: unknown) =>
+    runPlanDocumentRead(rawPlanId, rawRef, deps));
 }
 
 // ── WP-P2L-proj — ledger + derived confidence read ──────────────────────────
@@ -521,6 +548,8 @@ export function registerPlanIpc(manager: PlanPaneManager): void {
       return listPlanningEntries(workspaceRoot, { pathType });
     },
   );
+
+  registerPlanDocumentsIpc(ipcMain);
   ipcMain.handle(
     'planning-reader:read',
     (_e, docId: string, pathType?: PathType) => {
