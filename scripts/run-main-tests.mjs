@@ -698,6 +698,21 @@ const TESTS = [
   // WP-P6B-query + WP-P6D-timeline: card DTO model (state ⟂ liveActivity) and the
   // per-package timeline union (finalizations + lifecycle events).
   'dist/main/main/plans/mission-board.test.js',
+  // Planning-surface Stage P7 (gate P7Z) — evidence surfaces (conservative,
+  // confidence-labeled).
+  // WP-P7A-proj: PlanReviewProjection — baseline-to-current review diff over
+  // plan-witnessed paths + the UNCHANGED embedded SC SelectionPreview/
+  // CommitCandidate (only the SC object carries candidateId) + mixed-authorship/
+  // capture-gap annotations; never carves a sub-candidate from a cross-plan component.
+  'dist/main/main/plans/plan-review-projection.test.js',
+  // WP-P7B: pre-dispatch contention model — rolling path-contention graph from
+  // recent turn_records.touched, planned paths mapped through the workspace prefix
+  // into repo-relative pathBytesBase64 before comparison; advisory only, never blocks.
+  'dist/main/main/git-checkpoints/contention-model.test.js',
+  // WP-P7C: blame-to-intent — file→contributing turns→plans with a confidence
+  // label + conflicting-contributor list ("contributed," never "authored"); file-level
+  // v1, no exact-line/clobber overclaim; post-ledger strengthen via SC-WP-2G.
+  'dist/main/main/plans/blame-to-intent.test.js',
   'dist/main/main/browser/credentialed-open-diagnostic.test.js',
   'dist/main/main/browser/browser-signin-workspace-exact.test.js',
   'dist/main/main/browser/browser-signin-expiry.test.js',
