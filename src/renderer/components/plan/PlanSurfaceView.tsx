@@ -11,6 +11,8 @@ import PlanActivityTrail from './PlanActivityTrail';
 import PlanSectionNav from './PlanSectionNav';
 import type { FetchEventDetail } from './TrustedEventRow';
 import CandidatePreview, { type CandidatePreviewSelection } from '../save/CandidatePreview';
+import { useDashboardStore } from '../../stores/dashboard-store';
+import MissionBoard from './MissionBoard';
 
 /**
  * WP5 render-surface overlay. The plan document itself renders in a sandboxed
@@ -54,7 +56,11 @@ function PlanSurfaceView({
   // GT-C §3.3 — the surface owns the view-mode. 'section' is the only first-ship
   // structure (keeps PlanSectionNav targets); 'story' is an explicit flat,
   // oldest-first run narrative with the section nav hidden (no dangling targets).
-  const [viewMode, setViewMode] = useState<'section' | 'story'>('section');
+  const [viewMode, setViewMode] = useState<'section' | 'story' | 'packages'>('section');
+  const activePlanId = useDashboardStore((state) => {
+    const activeTab = state.openTabs.find((tab) => tab.id === state.activeTabId);
+    return activeTab?.kind === 'plan' ? activeTab.planId : null;
+  });
 
   // default the active pill to the first section once groups arrive
   useEffect(() => {
@@ -149,21 +155,41 @@ function PlanSurfaceView({
         >
           Story
         </button>
+        <button
+          type="button"
+          role="tab"
+          className={`plan-surface__viewtab${viewMode === 'packages' ? ' plan-surface__viewtab--active' : ''}`}
+          aria-selected={viewMode === 'packages'}
+          onClick={() => setViewMode('packages')}
+          data-testid="plan-view-packages"
+        >
+          Packages
+        </button>
       </div>
       {/* GT-C §3.3 — the section nav is meaningless in story mode (flat list, no
           scroll targets); hide it so there are no dangling jump destinations. */}
       {viewMode === 'section' && (
         <PlanSectionNav groups={groups} activeAnchor={activeAnchor} onJump={jump} />
       )}
-      <div className="plan-surface__scroll" data-testid="plan-surface-scroll" ref={scrollRef}>
-        <PlanActivityTrail
-          groups={groups}
-          events={events}
-          viewMode={viewMode}
-          highlightAnchor={highlightAnchor}
-          onFetchEventDetail={onFetchEventDetail}
-        />
-      </div>
+      {viewMode === 'packages' ? (
+        activePlanId ? (
+          <MissionBoard planId={activePlanId} paneVisible />
+        ) : (
+          <div className="mission-board__empty" data-testid="mission-board-no-plan">
+            No active plan selected.
+          </div>
+        )
+      ) : (
+        <div className="plan-surface__scroll" data-testid="plan-surface-scroll" ref={scrollRef}>
+          <PlanActivityTrail
+            groups={groups}
+            events={events}
+            viewMode={viewMode}
+            highlightAnchor={highlightAnchor}
+            onFetchEventDetail={onFetchEventDetail}
+          />
+        </div>
+      )}
     </div>
   );
 }

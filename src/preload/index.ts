@@ -741,4 +741,11 @@ const api: IpcApi = {
   },
 };
 
+// WP-P6C: read-only mission-board transport. The shared IpcApi declaration is
+// intentionally left untouched in this renderer-only package; the board narrows
+// this additive bridge member at its call site.
+(api.plans as IpcApi['plans'] & {
+  boardList: (planId: string) => Promise<import('../shared/types').MissionBoardCard[] | null>;
+}).boardList = (planId) => ipcRenderer.invoke('plan:board:list', planId);
+
 contextBridge.exposeInMainWorld('api', api);
