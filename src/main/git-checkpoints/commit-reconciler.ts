@@ -6,6 +6,9 @@
 
 import {
   getCommitRecord as dbGetCommitRecord,
+  getPackageFinalization as dbGetPackageFinalization,
+  listCommitPathLinks as dbListCommitPathLinks,
+  markPackageFinalizationCommitted as dbMarkPackageFinalizationCommitted,
   recordCommitLedger as dbRecordCommitLedger,
   getDb,
   setPackageFinalizationBoundaryStatus as dbSetBoundaryStatus,
@@ -14,9 +17,19 @@ import {
   type CommitRecord,
   type CommitTurnLink,
   type FinalizationBoundaryStatus,
+  type PackageFinalization,
 } from '../database';
+import type {
+  CandidateMember,
+  CommitOutcome,
+  FinalizationMemberDisposition,
+} from '../../shared/commit-candidates';
+import type { CandidateTokenSnapshot } from '../commit-candidates/candidate-service';
+import type { FrozenManifestMember } from '../commit-candidates/finalization-service';
 import {
   runGit as realRunGit,
+  runGitBytes as realRunGitBytes,
+  type GitRunBytesResult,
   type GitRunResult,
   type RunGitOptions,
 } from './git-command';
@@ -34,6 +47,12 @@ export type CommitReconcilerRunGit = (
   args: string[],
   options: RunGitOptions,
 ) => Promise<GitRunResult>;
+
+export type CommitReconcilerRunGitBytes = (
+  cwd: string,
+  args: string[],
+  options: RunGitOptions,
+) => Promise<GitRunBytesResult>;
 
 export interface CommitLedgerStore {
   getCommitRecord(repositoryKey: string, commitOid: string): CommitRecord | null;
@@ -136,6 +155,378 @@ export async function recordLaresCommit(input: RecordLaresCommitInput): Promise<
     })),
   });
   return record;
+}
+
+// ── Save-card SC-WP-4G — committed-candidate ledger + finalization closure ────
+
+export interface CommitClosureStore extends CommitLedgerStore {
+  getPackageFinalization(id: string): PackageFinalization | null;
+  listCommitPathLinks(repositoryKey: string, pathBytesBase64: readonly string[]): CommitPathLink[];
+  markPackageFinalizationCommitted(id: string, releasedAt: number): void;
+}
+
+const DATABASE_COMMIT_CLOSURE_STORE: CommitClosureStore = {
+  ...DATABASE_STORE,
+  getPackageFinalization: dbGetPackageFinalization,
+  listCommitPathLinks: dbListCommitPathLinks,
+  markPackageFinalizationCommitted: dbMarkPackageFinalizationCommitted,
+};
+
+export interface FinalizationClosureMemberResult {
+  pathBytesBase64: string;
+  /** Null means the member was evaluated but has no exact-content commit proof. */
+  disposition: FinalizationMemberDisposition | null;
+}
+
+export interface FinalizationClosureResult {
+  finalizationId: string;
+  closed: boolean;
+  lifecycleStatus: 'active' | 'committed';
+  members: FinalizationClosureMemberResult[];
+}
+
+export type CommitReconciliationErrorCode =
+  | 'outcome-not-committed'
+  | 'invalid-snapshot'
+  | 'parent-mismatch'
+  | 'tree-unverifiable'
+  | 'tree-mismatch'
+  | 'ledger-write-failed'
+  | 'closure-failed';
+
+export type ReconcileCommittedCandidateResult =
+  | {
+      ok: true;
+      record: CommitRecord;
+      finalizations: FinalizationClosureResult[];
+    }
+  | {
+      ok: false;
+      error: { code: CommitReconciliationErrorCode; message: string };
+    };
+
+export interface ReconcileCommittedCandidateInput extends ReconcilerGitOptions {
+  outcome: CommitOutcome;
+  snapshot: CandidateTokenSnapshot;
+  runGitBytes?: CommitReconcilerRunGitBytes;
+  store?: CommitClosureStore;
+  observedAt?: number;
+  now?: () => number;
+}
+
+interface CommitTreeEntry { mode: string; oid: string; }
+
+function parseCommitTree(stdout: Buffer): Map<string, CommitTreeEntry> {
+  const entries = new Map<string, CommitTreeEntry>();
+  let start = 0;
+  for (let i = 0; i <= stdout.length; i++) {
+    if (i < stdout.length && stdout[i] !== 0) continue;
+    if (i === start) { start = i + 1; continue; }
+    const record = stdout.subarray(start, i);
+    start = i + 1;
+    const tab = record.indexOf(0x09);
+    if (tab < 0) throw new Error('Malformed ls-tree record: missing TAB.');
+    const meta = record.subarray(0, tab).toString('ascii').split(' ');
+    if (meta.length !== 3 || !OID_RE.test(meta[2])) {
+      throw new Error('Malformed ls-tree metadata.');
+    }
+    entries.set(record.subarray(tab + 1).toString('base64'), { mode: meta[0], oid: meta[2] });
+  }
+  return entries;
+}
+
+function candidateMemberMatchesTree(
+  member: CandidateMember,
+  tree: ReadonlyMap<string, CommitTreeEntry>,
+): boolean {
+  const entry = tree.get(member.path.pathBytesBase64);
+  if (member.expectedWorktreeState === 'absent') return entry === undefined;
+  return entry !== undefined
+    && entry.oid === member.expectedCommitBlobOid
+    && entry.mode === member.expectedCommitMode;
+}
+
+function manifestMemberIsValid(member: FrozenManifestMember): boolean {
+  if (!member.pathBytesBase64 || !['present', 'absent'].includes(member.expectedState)) return false;
+  if (member.expectedState === 'absent') {
+    return member.commitBlobOid === null && member.commitMode === null;
+  }
+  return typeof member.commitBlobOid === 'string'
+    && OID_RE.test(member.commitBlobOid)
+    && typeof member.commitMode === 'string'
+    && member.commitMode.length > 0;
+}
+
+function selectedMatchesManifest(member: CandidateMember, frozen: FrozenManifestMember): boolean {
+  return member.expectedWorktreeState === frozen.expectedState
+    && member.expectedCommitBlobOid === frozen.commitBlobOid
+    && member.expectedCommitMode === frozen.commitMode;
+}
+
+function priorLinkMatchesManifest(link: CommitPathLink, frozen: FrozenManifestMember): boolean {
+  return link.expectedState === frozen.expectedState
+    && link.commitBlobOid === frozen.commitBlobOid
+    && link.commitMode === frozen.commitMode;
+}
+
+function parseManifest(json: string): FrozenManifestMember[] {
+  const value = JSON.parse(json) as unknown;
+  if (!Array.isArray(value) || value.length === 0 || !value.every(manifestMemberIsValid)) {
+    throw new Error('Finalization member manifest is malformed.');
+  }
+  const seen = new Set<string>();
+  for (const member of value) {
+    if (seen.has(member.pathBytesBase64)) throw new Error('Finalization manifest contains a duplicate path.');
+    seen.add(member.pathBytesBase64);
+  }
+  return value;
+}
+
+function buildExactLinks(snapshot: CandidateTokenSnapshot): {
+  turnLinks: Omit<CommitTurnLink, 'repositoryKey' | 'commitOid'>[];
+  pathLinks: Omit<CommitPathLink, 'repositoryKey' | 'commitOid'>[];
+} {
+  const turnById = new Map<string, Omit<CommitTurnLink, 'repositoryKey' | 'commitOid'>>();
+  for (const association of snapshot.associations) {
+    for (const turnId of association.contributingTurnIds) {
+      const link = {
+        turnId,
+        planId: association.planId,
+        planItemId: association.planItemId,
+        relation: 'candidate_member' as const,
+        captureQuality: null,
+      };
+      const prior = turnById.get(turnId);
+      if (prior && (prior.planId !== link.planId || prior.planItemId !== link.planItemId)) {
+        throw new Error(`Turn ${turnId} has conflicting frozen attribution.`);
+      }
+      turnById.set(turnId, link);
+    }
+  }
+
+  const pathLinks = snapshot.candidate.members.map((member) => {
+    const contributingTurnIds = [...new Set(
+      snapshot.associations
+        .filter((association) => association.memberEntryIds.includes(member.entryId))
+        .flatMap((association) => association.contributingTurnIds),
+    )].sort();
+    return {
+      pathBytesBase64: member.path.pathBytesBase64,
+      expectedState: member.expectedWorktreeState,
+      rawBlobOidAtCommit: member.rawWorktreeBlobOid,
+      commitBlobOid: member.expectedCommitBlobOid,
+      commitMode: member.expectedCommitMode,
+      contributingTurnIds,
+      overlapCount: contributingTurnIds.length,
+    };
+  });
+
+  return {
+    turnLinks: [...turnById.values()].sort((a, b) => a.turnId.localeCompare(b.turnId)),
+    pathLinks,
+  };
+}
+
+async function verifyCommitParentAndTree(
+  input: ReconcileCommittedCandidateInput,
+  commitOid: string,
+): Promise<
+  | { ok: true; parentOid: string | null }
+  | { ok: false; code: 'parent-mismatch' | 'tree-unverifiable' | 'tree-mismatch'; message: string }
+> {
+  const runGit = input.runGit ?? realRunGit;
+  const parentResult = await runGit(
+    input.repoRoot,
+    ['rev-list', '--parents', '-n', '1', commitOid],
+    { gitExe: input.gitExe, allowNonzero: true, timeoutMs: GIT_TIMEOUT_MS, maxBytes: 4096 },
+  ).catch(() => null);
+  if (!parentResult || parentResult.code !== 0) {
+    return { ok: false, code: 'parent-mismatch', message: 'Unable to verify the marked commit parent.' };
+  }
+  const words = parentResult.stdout.trim().split(/\s+/);
+  const parentOid = words.length === 2 && OID_RE.test(words[1]) ? words[1] : null;
+  const expectedParent = input.snapshot.pinnedHeadOid;
+  const parentMatches = words[0] === commitOid
+    && (expectedParent === null ? words.length === 1 : words.length === 2 && parentOid === expectedParent);
+  if (!parentMatches) {
+    return { ok: false, code: 'parent-mismatch', message: 'Marked commit parent does not match the pinned HEAD.' };
+  }
+
+  const runGitBytes = input.runGitBytes ?? realRunGitBytes;
+  const treeResult = await runGitBytes(
+    input.repoRoot,
+    ['ls-tree', '-r', '-z', '--full-tree', commitOid],
+    { gitExe: input.gitExe, allowNonzero: true, timeoutMs: GIT_TIMEOUT_MS, maxBytes: 64 << 20 },
+  ).catch(() => null);
+  if (!treeResult || treeResult.code !== 0) {
+    return { ok: false, code: 'tree-unverifiable', message: 'Unable to read the marked commit tree.' };
+  }
+  let tree: Map<string, CommitTreeEntry>;
+  try {
+    tree = parseCommitTree(treeResult.stdout);
+  } catch (error) {
+    return { ok: false, code: 'tree-unverifiable', message: error instanceof Error ? error.message : String(error) };
+  }
+  const mismatch = input.snapshot.candidate.members.find((member) => !candidateMemberMatchesTree(member, tree));
+  if (mismatch) {
+    return {
+      ok: false,
+      code: 'tree-mismatch',
+      message: `Marked commit tree does not contain the frozen bytes for ${mismatch.path.displayPath}.`,
+    };
+  }
+  return { ok: true, parentOid };
+}
+
+/**
+ * Synchronous response-path reconciliation after WP-4D returns `committed`.
+ * Parent/tree verification gates the exact ledger write; closure then evaluates
+ * every member of every frozen finalization manifest. No failure is swallowed.
+ */
+export async function reconcileCommittedCandidate(
+  input: ReconcileCommittedCandidateInput,
+): Promise<ReconcileCommittedCandidateResult> {
+  if (input.outcome.status !== 'committed') {
+    return {
+      ok: false,
+      error: { code: 'outcome-not-committed', message: `Cannot reconcile outcome ${input.outcome.status}.` },
+    };
+  }
+  const commitOid = input.outcome.commitOid;
+  if (!OID_RE.test(commitOid) || input.snapshot.repositoryKey !== input.snapshot.candidate.repository.repositoryKey) {
+    return { ok: false, error: { code: 'invalid-snapshot', message: 'Commit or repository identity is invalid.' } };
+  }
+
+  const verified = await verifyCommitParentAndTree(input, commitOid);
+  if (!verified.ok) return { ok: false, error: { code: verified.code, message: verified.message } };
+
+  const store = input.store ?? DATABASE_COMMIT_CLOSURE_STORE;
+  const selectedByPath = new Map(
+    input.snapshot.candidate.members.map((member) => [member.path.pathBytesBase64, member]),
+  );
+  const candidateFinalizationIds = new Set(
+    input.snapshot.candidate.finalizations.map((ref) => ref.finalizationId),
+  );
+
+  let closureInputs: Array<{
+    row: PackageFinalization;
+    manifest: FrozenManifestMember[];
+    priorLinks: CommitPathLink[];
+  }>;
+  try {
+    const frozenFinalizationIds = new Set(
+      input.snapshot.finalizationManifests.map((frozen) => frozen.finalizationId),
+    );
+    if (
+      candidateFinalizationIds.size !== input.snapshot.finalizationManifests.length
+      || frozenFinalizationIds.size !== input.snapshot.finalizationManifests.length
+      || [...candidateFinalizationIds].some((id) => !frozenFinalizationIds.has(id))
+    ) {
+      throw new Error('Candidate finalization refs and frozen manifests disagree.');
+    }
+    closureInputs = input.snapshot.finalizationManifests.map((frozen) => {
+      if (!candidateFinalizationIds.has(frozen.finalizationId)) {
+        throw new Error(`Frozen manifest ${frozen.finalizationId} is not covered by the candidate.`);
+      }
+      const row = store.getPackageFinalization(frozen.finalizationId);
+      if (!row || row.repositoryKey !== input.snapshot.repositoryKey) {
+        throw new Error(`Finalization ${frozen.finalizationId} is missing or belongs to another repository.`);
+      }
+      if (row.lifecycleStatus !== 'active' && row.lifecycleStatus !== 'committed') {
+        throw new Error(`Finalization ${frozen.finalizationId} is ${row.lifecycleStatus}, not closable.`);
+      }
+      if (row.memberManifestJson !== frozen.memberManifestJson) {
+        throw new Error(`Finalization ${frozen.finalizationId} changed after token mint.`);
+      }
+      const manifest = parseManifest(frozen.memberManifestJson);
+      const priorLinks = store.listCommitPathLinks(
+        input.snapshot.repositoryKey,
+        manifest.map((member) => member.pathBytesBase64),
+      ).filter((link) => link.commitOid !== commitOid);
+      return { row, manifest, priorLinks };
+    });
+  } catch (error) {
+    return {
+      ok: false,
+      error: { code: 'invalid-snapshot', message: error instanceof Error ? error.message : String(error) },
+    };
+  }
+
+  let exactLinks: ReturnType<typeof buildExactLinks>;
+  try {
+    exactLinks = buildExactLinks(input.snapshot);
+  } catch (error) {
+    return {
+      ok: false,
+      error: { code: 'invalid-snapshot', message: error instanceof Error ? error.message : String(error) },
+    };
+  }
+
+  let record: CommitRecord;
+  try {
+    record = await recordLaresCommit({
+      repositoryKey: input.snapshot.repositoryKey,
+      repoRoot: input.repoRoot,
+      gitExe: input.gitExe,
+      runGit: input.runGit,
+      remoteRefPatterns: input.remoteRefPatterns,
+      commitOid,
+      parentOid: verified.parentOid,
+      observedAt: input.observedAt,
+      turnLinks: exactLinks.turnLinks,
+      pathLinks: exactLinks.pathLinks,
+      store,
+      now: input.now,
+    });
+  } catch (error) {
+    return {
+      ok: false,
+      error: { code: 'ledger-write-failed', message: error instanceof Error ? error.message : String(error) },
+    };
+  }
+
+  const releasedAt = (input.now ?? Date.now)();
+  const finalizations: FinalizationClosureResult[] = [];
+  try {
+    for (const { row, manifest, priorLinks } of closureInputs) {
+      const members = manifest.map((frozen): FinalizationClosureMemberResult => {
+        const selected = selectedByPath.get(frozen.pathBytesBase64);
+        if (selected && selected.coveringFinalizationIds.includes(row.id)) {
+          if (!selectedMatchesManifest(selected, frozen)) {
+            throw new Error(`Selected member disagrees with finalization ${row.id}.`);
+          }
+          return {
+            pathBytesBase64: frozen.pathBytesBase64,
+            disposition: { state: 'selected-in-candidate', entryId: selected.entryId },
+          };
+        }
+        const prior = priorLinks.find((link) => priorLinkMatchesManifest(link, frozen));
+        return {
+          pathBytesBase64: frozen.pathBytesBase64,
+          disposition: prior
+            ? { state: 'already-locally-committed', commitOid: prior.commitOid }
+            : null,
+        };
+      });
+      const closed = members.every((member) => member.disposition !== null);
+      if (closed && row.lifecycleStatus === 'active') {
+        store.markPackageFinalizationCommitted(row.id, releasedAt);
+      }
+      finalizations.push({
+        finalizationId: row.id,
+        closed,
+        lifecycleStatus: closed ? 'committed' : 'active',
+        members,
+      });
+    }
+  } catch (error) {
+    return {
+      ok: false,
+      error: { code: 'closure-failed', message: error instanceof Error ? error.message : String(error) },
+    };
+  }
+
+  return { ok: true, record, finalizations };
 }
 
 export interface ExternalTurnMetadata {

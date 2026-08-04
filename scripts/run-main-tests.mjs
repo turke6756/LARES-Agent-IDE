@@ -202,6 +202,8 @@ const TESTS = [
   // on real git) + dangling-open close + paired-ref deletion + temp-artifact sweeper.
   'dist/main/main/git-checkpoints/reconciler.test.js',
   'dist/main/main/git-checkpoints/commit-reconciler.test.js',
+  // Save-card SC-WP-4G: exact post-commit ledger + whole-finalization closure.
+  'dist/main/main/git-checkpoints/commit-reconciler.closure.test.js',
   // Git-Native WP-G3.3 + Save-card SC-WP-2K: retention/pinning integration,
   // distill-before-prune ordering + G3 gate back-fill, triggered/bounded loose-object
   // maintenance (idle-only slot, no config mutation, nonfatal on lock), storage report.
