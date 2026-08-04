@@ -9,6 +9,7 @@ import PlansMenu from '../plan/PlansMenu';
 import PlansPane from '../plan/PlansPane';
 import SaveCard from '../save/SaveCard';
 import { useBrowserStore, ensureBrowserBridge } from '../../stores/browser-store';
+import { useSaveCardStore, useSaveCardAttentionActive } from '../../stores/save-card-store';
 import * as Icons from 'lucide-react';
 import vscodeIcon from '../../assets/material-icons/vscode.svg';
 
@@ -71,7 +72,38 @@ export default function MainContent() {
   const showDashboard = useDashboardStore((s) => s.showDashboard);
   const showSaveCard = useDashboardStore((s) => s.showSaveCard);
   const browserPaneAttention = useBrowserStore((s) => s.paneAttention);
+  // SC-WP-N2 — the Save entry's amber attention: true when a checkpoint edge for the
+  // selected workspace is expiring soon. Driven by the lightweight
+  // `savecard:getAttention` read + `savecard:attentionChanged` push, so the badge
+  // illuminates WITHOUT running the expensive full inventory probe.
+  const saveCardAttention = useSaveCardAttentionActive(selectedWorkspaceId);
+  const setSaveAttention = useSaveCardStore((s) => s.setAttention);
   const [showLaunch, setShowLaunch] = useState(false);
+
+  // Keep the store's per-workspace attention fresh: subscribe once to the push, and
+  // pull the current value whenever the selected workspace changes (so a workspace
+  // switch reflects its own expiry state immediately, not the previous cycle's).
+  useEffect(() => {
+    // Defensive: the bridge always exposes saveCard in production (preload), but a
+    // partial window.api (early boot / test harness) must not crash the shell.
+    return window.api.saveCard?.onAttentionChanged?.(({ workspaceId, notice }) => {
+      setSaveAttention(workspaceId, notice);
+    });
+  }, [setSaveAttention]);
+
+  useEffect(() => {
+    if (!selectedWorkspaceId || !window.api.saveCard?.getAttention) return;
+    let active = true;
+    void window.api.saveCard
+      .getAttention({ workspaceId: selectedWorkspaceId })
+      .then((notice) => {
+        if (active) setSaveAttention(selectedWorkspaceId, notice);
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, [selectedWorkspaceId, setSaveAttention]);
 
   const workspace = workspaces.find((w) => w.id === selectedWorkspaceId);
 
@@ -263,11 +295,20 @@ export default function MainContent() {
 
               <button
                 data-testid="view-btn-save"
+                data-attention={saveCardAttention ? 'expiring' : undefined}
                 onClick={showSaveCard}
                 className={`ui-btn ui-btn-outline shrink-0 whitespace-nowrap px-3 py-1.5 text-[13px] font-medium ${
-                  saveCardActive ? 'ui-btn-success is-active' : ''
+                  saveCardActive
+                    ? 'ui-btn-success is-active'
+                    : saveCardAttention
+                      ? 'ui-btn-warning animate-pulse'
+                      : ''
                 }`}
-                title="Save progress — inspect uncommitted work (read-only)"
+                title={
+                  saveCardAttention
+                    ? 'Save progress — recovery checkpoints are expiring soon; save to keep this work'
+                    : 'Save progress — inspect uncommitted work (read-only)'
+                }
               >
                 <Icons.Save className="w-4 h-4 shrink-0" />
                 {!toolbarCompact && 'Save'}

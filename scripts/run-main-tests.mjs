@@ -205,6 +205,9 @@ const TESTS = [
   // maintenance (idle-only slot, no config mutation, nonfatal on lock), storage report.
   'dist/main/main/git-checkpoints/retention.test.js',
   'dist/main/main/git-checkpoints/retention.pinning.test.js',
+  // Save-card SC-WP-N2 — checkpoint-expiry attention notice built from the retention
+  // pass's ACTUAL retained-pin selection (pure builder + end-to-end via runRetentionPass).
+  'dist/main/main/git-checkpoints/retention.expiry.test.js',
   // Save-card Stage ③ SC-WP-3B/3D — finalization refs + crash-consistency
   // reconcile and the boundary-ref retention partition (WP-3Z registration).
   'dist/main/main/git-checkpoints/finalization-refs.test.js',
@@ -244,6 +247,9 @@ const TESTS = [
   'dist/main/main/commit-candidates/candidate-service.read.test.js',
   'dist/main/main/commit-candidates/work-bundle.test.js',
   'dist/main/main/commit-candidates/save-card-ipc.test.js',
+  // Save-card SC-WP-N2: checkpoint-expiry attention IPC — the lightweight read
+  // channel (own channel, provider-gated, null before injection) + the push broadcast.
+  'dist/main/main/commit-candidates/save-card-attention-ipc.test.js',
   // Save-card SC-WP-1J: production route wiring — the bootstrap adapter that maps
   // the renderer workspaceId to a repository-scoped request and delegates to the
   // read-only facade (real temp git; only the registry + DB readers are faked).

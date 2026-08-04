@@ -38,10 +38,12 @@ import { startContinuationWatcher } from './supervisor/continuation-watcher-wiri
 import { runCheckpointStartupMaintenance } from './git-checkpoints/reconciler';
 import { createCheckpointEngine } from './git-checkpoints/engine-bootstrap';
 import { RETENTION_CYCLE_INTERVAL_MS } from '../shared/constants';
-import { registerIpcHandlers, setHumanCheckpointRoutes, setSaveCardRoutes, setSaveCardPreviewRoutes } from './ipc-handlers';
+import { registerIpcHandlers, setHumanCheckpointRoutes, setSaveCardRoutes, setSaveCardPreviewRoutes, setSaveCardAttentionProvider } from './ipc-handlers';
 import { createSaveCardRoutes } from './commit-candidates/save-card-routes';
 import { createPreviewRoutes } from './commit-candidates/preview-routes';
+import { broadcastSaveCardAttention } from './commit-candidates/save-card-ipc';
 import type { SaveCardQuotaWeakening } from '../shared/commit-candidates';
+import type { SaveCardCheckpointExpiryNotice } from '../shared/types';
 import { installExternalNavHandlers, forceCloseAllDetached, getDetachedEntries, type DetachedWindowDeps } from './detached-windows';
 import { runCloseFlush, type FlushTarget } from './close-flush';
 import { TAB_CHANNELS, LOG_RETENTION_CAP_BYTES, type FlushRequestPayload, type LogRetentionState } from '../shared/types';
@@ -841,6 +843,12 @@ app.whenReady().then(async () => {
           // refreshed by each retention cycle below. Empty until the first cycle runs;
           // the Save card omits the banner while a repo has no live weakening warning.
           const quotaWeakeningByRepo = new Map<string, SaveCardQuotaWeakening>();
+          // SC-WP-N2: latest checkpoint-expiry attention notice per workspace,
+          // refreshed by each retention cycle. Read by the lightweight
+          // `savecard:getAttention` channel (no inventory probe) and pushed on
+          // `savecard:attentionChanged`; empty until the first cycle publishes.
+          const attentionByWorkspace = new Map<string, SaveCardCheckpointExpiryNotice>();
+          setSaveCardAttentionProvider((workspaceId) => attentionByWorkspace.get(workspaceId) ?? null);
           // SC-WP-1J: hand the read-only Save-card inventory surface to the renderer
           // IPC layer, reusing the engine's already-resolved internal Git. Until this
           // runs the channel answers "save-card-engine-unavailable" honestly.
@@ -875,6 +883,20 @@ app.whenReady().then(async () => {
                     quotaWeakeningByRepo.set(retention.repositoryKey, retention.pinningWarning);
                   } else {
                     quotaWeakeningByRepo.delete(retention.repositoryKey);
+                  }
+                }
+                // SC-WP-N2: publish each workspace's freshest checkpoint-expiry notice
+                // and push it so the Save entry can illuminate. A pass that finds no
+                // edge expiring soon clears the workspace's notice (drops the glow).
+                for (const { workspaceId, retention } of results) {
+                  const notice = retention.checkpointExpiryNotice;
+                  if (notice && notice.edges.length > 0) {
+                    attentionByWorkspace.set(workspaceId, notice);
+                  } else {
+                    attentionByWorkspace.delete(workspaceId);
+                  }
+                  if (mainWindow && !mainWindow.isDestroyed()) {
+                    broadcastSaveCardAttention(mainWindow.webContents, workspaceId, notice ?? null);
                   }
                 }
               })

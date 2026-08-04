@@ -16,10 +16,15 @@
 import {
   SAVECARD_CHANNELS,
   SAVECARD_PREVIEW_CHANNEL,
+  SAVECARD_ATTENTION_CHANNEL,
+  SAVECARD_ATTENTION_CHANGED_CHANNEL,
   type SaveCardInventoryRequest,
   type SaveCardInventoryResponse,
   type SaveCardPreviewRequest,
   type SaveCardPreviewResponse,
+  type SaveCardAttentionRequest,
+  type SaveCardCheckpointExpiryNotice,
+  type SaveCardAttentionChangedPayload,
 } from '../../shared/types';
 import type {
   FinalizationBoundaryStatus,
@@ -96,6 +101,64 @@ export function registerSaveCardIpc(
     const routes = requireRoutes(getRoutes());
     return routes.getInventory(requireRequest(raw));
   });
+}
+
+// ── SC-WP-N2 — checkpoint-expiry attention channel (read + push) ──────────────
+
+/** The main-side seam the attention read drives: the freshest per-workspace
+ *  checkpoint-expiry notice, published by each retention cycle. Returns null when
+ *  the workspace has no edge expiring soon (or no cycle has run yet). */
+export type SaveCardAttentionProvider = (workspaceId: string) => SaveCardCheckpointExpiryNotice | null;
+
+/** Minimal `webContents.send` shape for the attention push (testable without a
+ *  live BrowserWindow). */
+export interface AttentionSenderLike {
+  send(channel: string, payload: SaveCardAttentionChangedPayload): void;
+}
+
+function requireAttentionRequest(raw: unknown): SaveCardAttentionRequest {
+  if (!raw || typeof raw !== 'object') {
+    throw new SaveCardIpcError(
+      'a request with a non-empty workspaceId is required',
+      'save-card-bad-request',
+    );
+  }
+  const workspaceId = (raw as { workspaceId?: unknown }).workspaceId;
+  if (typeof workspaceId !== 'string' || workspaceId === '') {
+    throw new SaveCardIpcError(
+      'a non-empty workspaceId is required',
+      'save-card-bad-request',
+    );
+  }
+  return { workspaceId };
+}
+
+/**
+ * Register the lightweight read channel. Unlike the inventory route this NEVER
+ * probes git — it only reads the in-memory notice the retention cycle published,
+ * so the Save entry can illuminate cheaply. `getProvider` is evaluated per
+ * invocation so registration can precede the async engine bootstrap that injects
+ * the provider (a missing provider answers null, never throws).
+ */
+export function registerSaveCardAttentionIpc(
+  ipc: IpcLike,
+  getProvider: () => SaveCardAttentionProvider | null,
+): void {
+  ipc.handle(SAVECARD_ATTENTION_CHANNEL, (_event, raw: unknown) => {
+    const request = requireAttentionRequest(raw);
+    const provider = getProvider();
+    return provider ? provider(request.workspaceId) : null;
+  });
+}
+
+/** Push the freshest attention notice for one workspace to a renderer. Kept here
+ *  (not inline in index.ts) so the wire shape has one owner and is unit-testable. */
+export function broadcastSaveCardAttention(
+  sender: AttentionSenderLike,
+  workspaceId: string,
+  notice: SaveCardCheckpointExpiryNotice | null,
+): void {
+  sender.send(SAVECARD_ATTENTION_CHANGED_CHANNEL, { workspaceId, notice });
 }
 
 // ── SC-WP-3E — fleet-adhoc mark-done finalization channel ─────────────────────

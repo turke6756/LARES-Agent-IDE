@@ -71,9 +71,11 @@ import {
   registerSaveCardIpc,
   registerSaveCardPreviewIpc,
   registerSaveCardFinalizeIpc,
+  registerSaveCardAttentionIpc,
   type SaveCardRoutes,
   type SaveCardPreviewRoutes,
   type SaveCardFinalizeRoutes,
+  type SaveCardAttentionProvider,
 } from './commit-candidates/save-card-ipc';
 import type { RequestedPlanBinding } from '../shared/commit-candidates';
 import { resolvePlanBindingAtBoundary } from './api-server';
@@ -116,6 +118,14 @@ export function setSaveCardPreviewRoutes(routes: SaveCardPreviewRoutes | null): 
 let saveCardFinalizeRoutes: SaveCardFinalizeRoutes | null = null;
 export function setSaveCardFinalizeRoutes(routes: SaveCardFinalizeRoutes | null): void {
   saveCardFinalizeRoutes = routes;
+}
+
+// SC-WP-N2 — the checkpoint-expiry attention provider, injected by the same async
+// engine-bootstrap seam once the retention cycle begins publishing notices. Until
+// it lands the `savecard:getAttention` read answers null honestly (no expiry yet).
+let saveCardAttentionProvider: SaveCardAttentionProvider | null = null;
+export function setSaveCardAttentionProvider(provider: SaveCardAttentionProvider | null): void {
+  saveCardAttentionProvider = provider;
 }
 
 function resolveMutationPathType(primaryPath: string, rootDirectory: string, pathType?: PathType): PathType {
@@ -225,6 +235,10 @@ export function registerIpcHandlers(
   // registered" error is exactly a channel that was defined but never registered.
   registerSaveCardPreviewIpc(ipcMain, () => saveCardPreviewRoutes);
   registerSaveCardFinalizeIpc(ipcMain, () => saveCardFinalizeRoutes);
+  // SC-WP-N2 — the lightweight checkpoint-expiry attention read. Registered here
+  // (lazy provider getter) so `savecard:getAttention` exists before the async
+  // engine bootstrap starts publishing notices; a missing provider answers null.
+  registerSaveCardAttentionIpc(ipcMain, () => saveCardAttentionProvider);
   // 'agent:stop' is registered by registerLifecycleIpc (lifecycle/lifecycle-ipc.ts)
   // so that every stop endpoint assigns its own reason in ONE place and a
   // renderer can never supply one (§B9).

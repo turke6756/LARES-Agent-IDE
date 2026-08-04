@@ -1905,6 +1905,47 @@ export interface SaveCardInventoryResponse {
   quotaWeakening: import('./commit-candidates').SaveCardQuotaWeakening | null;
 }
 
+// ── SC-WP-N2 — checkpoint-expiry attention signal ─────────────────────────────
+//
+// A LIGHTWEIGHT attention channel, deliberately kept OUT of `SAVECARD_CHANNELS`
+// (whose Stage ① audit test asserts exactly one read-only inventory route) —
+// mirroring how the preview + mark-done channels stay separate. It lets the Save
+// entry ILLUMINATE without running the expensive full inventory probe: the notice
+// is emitted straight from the retention pass's ACTUAL retained-pin selection.
+export const SAVECARD_ATTENTION_CHANNEL = 'savecard:getAttention' as const;
+export const SAVECARD_ATTENTION_CHANGED_CHANNEL = 'savecard:attentionChanged' as const;
+
+/**
+ * The checkpoint-expiry attention notice: the retained recovery edges whose pin
+ * extension expires within `expiresWithinMs` of `observedAt`. Built from the
+ * retention pass's real selection (never re-derived from turn age); each edge
+ * carries the exact `expiresAt` and the renderer-safe `affectedEntryIds` (dirty-
+ * entry identities, never raw paths) so the Save pane can group edges onto bundles.
+ */
+export interface SaveCardCheckpointExpiryNotice {
+  observedAt: number;
+  expiresWithinMs: number;
+  edges: Array<{
+    repositoryKey: string;
+    turnId: string;
+    edge: 'before' | 'after';
+    expiresAt: number;
+    affectedEntryIds: string[];
+  }>;
+}
+
+/** Renderer request for the checkpoint-expiry attention for one workspace. */
+export interface SaveCardAttentionRequest {
+  workspaceId: string;
+}
+
+/** Main → renderer push carrying the freshest per-workspace attention notice
+ *  (null when the workspace has no edge expiring soon). */
+export interface SaveCardAttentionChangedPayload {
+  workspaceId: string;
+  notice: SaveCardCheckpointExpiryNotice | null;
+}
+
 // ── SC-WP-3H — Save-lens candidate preview channel ────────────────────────────
 //
 // A SECOND Save-card channel, deliberately kept OUT of `SAVECARD_CHANNELS` (whose
@@ -2815,6 +2856,13 @@ export interface IpcApi {
   saveCard: {
     getInventory: (req: SaveCardInventoryRequest) => Promise<SaveCardInventoryResponse>;
     preview: (req: SaveCardPreviewRequest) => Promise<SaveCardPreviewResponse>;
+    /** SC-WP-N2 — lightweight checkpoint-expiry attention read (no full inventory
+     *  probe). Resolves the freshest notice for the workspace, or null. */
+    getAttention: (req: SaveCardAttentionRequest) => Promise<SaveCardCheckpointExpiryNotice | null>;
+    /** SC-WP-N2 — subscribe to per-workspace attention pushes. Returns an unsubscribe. */
+    onAttentionChanged: (
+      callback: (payload: SaveCardAttentionChangedPayload) => void,
+    ) => () => void;
   };
   checkpoints: {
     list: (workspaceId: string, opts?: { agentId?: string }) => Promise<CheckpointListResult>;

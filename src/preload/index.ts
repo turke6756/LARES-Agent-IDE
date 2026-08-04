@@ -1,6 +1,6 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron';
 import type { IpcApi, DetachRequest, DetachedClosedPayload, ViewDetachRequest, ViewDetachedClosedPayload, FlushRequestPayload, FlushReplyPayload } from '../shared/types';
-import { TAB_CHANNELS, VIEW_CHANNELS, CHECKPOINT_CHANNELS, SAVECARD_CHANNELS, SAVECARD_PREVIEW_CHANNEL, PLAN_PREVIEW_CHANNEL } from '../shared/types';
+import { TAB_CHANNELS, VIEW_CHANNELS, CHECKPOINT_CHANNELS, SAVECARD_CHANNELS, SAVECARD_PREVIEW_CHANNEL, SAVECARD_ATTENTION_CHANNEL, SAVECARD_ATTENTION_CHANGED_CHANNEL, PLAN_PREVIEW_CHANNEL } from '../shared/types';
 import { BROWSER_CHANNELS } from '../shared/browser';
 import type {
   AccessRequestDecision,
@@ -170,6 +170,13 @@ const api: IpcApi = {
   saveCard: {
     getInventory: (req) => ipcRenderer.invoke(SAVECARD_CHANNELS.getInventory, req),
     preview: (req) => ipcRenderer.invoke(SAVECARD_PREVIEW_CHANNEL, req),
+    // SC-WP-N2 — lightweight checkpoint-expiry attention read + push (no inventory probe).
+    getAttention: (req) => ipcRenderer.invoke(SAVECARD_ATTENTION_CHANNEL, req),
+    onAttentionChanged: (callback) => {
+      const listener = (_event: any, payload: any) => callback(payload);
+      ipcRenderer.on(SAVECARD_ATTENTION_CHANGED_CHANNEL, listener);
+      return () => ipcRenderer.removeListener(SAVECARD_ATTENTION_CHANGED_CHANNEL, listener);
+    },
   },
   // Git-Native WP-G2.2 — human checkpoint recovery surface (list/diff/preview/
   // restore/revert). Handlers live in git-checkpoints/checkpoint-ipc.ts (registered

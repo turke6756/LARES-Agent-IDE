@@ -3,12 +3,14 @@ import { useDashboardStore } from '../../stores/dashboard-store';
 import {
   isSaveCardInventoryFresh,
   useSaveCardStore,
+  useSaveCardAttention,
 } from '../../stores/save-card-store';
 import type { SaveCardInventoryResponse } from '../../../shared/types';
 import type { SaveCardQuotaWeakening } from '../../../shared/commit-candidates';
 import SaveBundle, { isQuietlySaved, type WorkBundleDto } from './SaveBundle';
 import CandidatePreview, { type CandidatePreviewSelection } from './CandidatePreview';
 import QuotaWeakeningBanner from './QuotaWeakeningBanner';
+import { groupExpiryEdgesByBundle, formatExpiresIn } from './save-card-expiry';
 import './save-card.css';
 
 // SC-WP-3H — derive the explicit WP-3G selection for a displayed group of
@@ -63,6 +65,46 @@ function SavePreviewLauncher({
           onClose={() => setOpen(false)}
         />
       )}
+    </div>
+  );
+}
+
+/**
+ * SC-WP-N2 — the checkpoint-expiry block. Groups the retention pass's expiring
+ * recovery edges onto the displayed bundles (by intersecting `affectedEntryIds`
+ * with each bundle's member entry ids) so the "expiring soon" warning lands on the
+ * exact package holding the work. Renders nothing when no bundle is affected — the
+ * signal is truthful (it comes from the real retained-pin selection, never a
+ * renderer-side re-derivation from turn age).
+ */
+function ExpiryBlock({
+  bundles,
+  workspaceId,
+}: {
+  bundles: WorkBundleDto[];
+  workspaceId: string | null;
+}) {
+  const notice = useSaveCardAttention(workspaceId);
+  const grouped = groupExpiryEdgesByBundle(notice, bundles);
+  if (!notice || grouped.length === 0) return null;
+  const now = notice.observedAt;
+  return (
+    <div className="sc-expiry" role="status" data-testid="save-card-expiry">
+      <div className="sc-expiry-title">
+        ⏳ Recovery checkpoints expiring soon
+      </div>
+      <div className="sc-expiry-body">
+        Automatic turn snapshots protecting this work will be pruned unless you save
+        it. Committing (or pushing) makes it permanent.
+      </div>
+      <ul className="sc-expiry-list">
+        {grouped.map(({ bundle, earliestExpiresAt }) => (
+          <li key={bundle.bundleId} data-testid="save-card-expiry-row">
+            <b>{bundle.label}</b>
+            <span className="sc-expiry-when"> · expires in {formatExpiresIn(earliestExpiresAt, now)}</span>
+          </li>
+        ))}
+      </ul>
     </div>
   );
 }
@@ -357,6 +399,8 @@ export default function SaveCard() {
       {header}
 
       <QuotaWeakeningBanner warning={quotaWeakening} />
+
+      <ExpiryBlock bundles={bundles} workspaceId={workspaceId ?? null} />
 
       <div className="sc-sect">
         <h2>Unsaved work</h2>

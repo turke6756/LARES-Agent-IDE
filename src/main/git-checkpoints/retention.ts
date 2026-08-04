@@ -66,10 +66,21 @@ import {
 import {
   selectRetentionPins,
   partitionBoundaryRefs,
+  type EdgePinCandidate,
   type RetentionPinWeakeningWarning,
   type BoundaryRefRecord,
 } from './protection-policy';
 import { deleteFinalizationRefs } from './finalization-refs';
+import type { SaveCardCheckpointExpiryNotice } from '../../shared/types';
+
+/**
+ * SC-WP-N2 — how soon a still-live retention pin must be to expire before it is
+ * surfaced as a Save-card attention signal. A pin's edge is extended to at most
+ * `normalPruneEligibleAt + RETENTION_PIN_MAX_EXTENSION_MS`; once that instant is
+ * within this window of now, the edge is "expiring soon". Injectable via
+ * `RetentionDeps.checkpointExpiryWindowMs` for tests. Default: 3 days.
+ */
+export const CHECKPOINT_EXPIRY_ATTENTION_WINDOW_MS = 3 * 24 * 60 * 60 * 1000;
 
 const DEFAULT_LOGGER: ReconLogger = {
   info: (m) => console.log(m),
@@ -122,6 +133,9 @@ export interface RetentionDeps {
   compactDiffMaxBytes?: number;
   /** Loose-object trigger threshold. Default `MAINTENANCE_LOOSE_OBJECT_THRESHOLD`. */
   looseObjectThreshold?: number;
+  /** SC-WP-N2 — checkpoint-expiry attention window (ms). Default
+   *  `CHECKPOINT_EXPIRY_ATTENTION_WINDOW_MS` (3 days). */
+  checkpointExpiryWindowMs?: number;
   /** Bounded `git maintenance run` runtime + MAINTENANCE-slot deadline (ms). */
   maintenanceRuntimeDeadlineMs?: number;
   platform?: NodeJS.Platform;
@@ -257,6 +271,12 @@ export interface RetentionPassResult {
    *  e.g. no live edges). Lets callers key `pinningWarning` per `repositoryKey` — the
    *  Save-card `readQuotaWeakening(repositoryKey)` lookup (SC-WP-2L). */
   repositoryKey: string | null;
+  /** SC-WP-N2 — the checkpoint-expiry attention notice built from this pass's ACTUAL
+   *  retained-pin selection (never a re-derivation): the retained edges whose max
+   *  extension expires within `checkpointExpiryWindowMs`. Null when no repository
+   *  identity was derived or no retained edge is expiring soon. Callers key it per
+   *  repository/workspace and hand it to the Save-card `savecard:getAttention` read. */
+  checkpointExpiryNotice: SaveCardCheckpointExpiryNotice | null;
 }
 
 /**
@@ -273,6 +293,14 @@ export async function runRetentionPass(deps: RetentionDeps): Promise<RetentionPa
     outcomes: [], distilled: 0, prunedTurns: 0, deleteFailures: 0,
     pinningWarning: pinning.warning,
     repositoryKey: pinning.repositoryKey,
+    // Built from the pass's ACTUAL retained selection — the same edges retention just
+    // decided to keep, never a fresh derivation from turn age.
+    checkpointExpiryNotice: buildCheckpointExpiryNotice({
+      retainedEdges: pinning.retainedEdges,
+      repositoryKey: pinning.repositoryKey,
+      now: pinning.now,
+      expiresWithinMs: cfg.checkpointExpiryWindowMs,
+    }),
   };
 
   for (const row of rows) {
@@ -293,6 +321,47 @@ export async function runRetentionPass(deps: RetentionDeps): Promise<RetentionPa
   return result;
 }
 
+/**
+ * SC-WP-N2 — build the checkpoint-expiry attention notice from a retention pass's
+ * ACTUAL retained-pin selection. Each retained edge's recovery snapshot survives
+ * only until `normalPruneEligibleAt + RETENTION_PIN_MAX_EXTENSION_MS` (the pin's
+ * max extension); an edge whose expiry falls within `expiresWithinMs` of `now` is
+ * "expiring soon" and is surfaced. Pure — no clock, no re-derivation from turn age.
+ *
+ * Returns null when there is no derived `repositoryKey` (the per-edge
+ * `repositoryKey` the contract requires would be unknown) or when NO retained edge
+ * is expiring soon (the empty case). Edges are ordered by soonest expiry first,
+ * then turnId, then edge, so the notice is deterministic.
+ */
+export function buildCheckpointExpiryNotice(params: {
+  retainedEdges: readonly EdgePinCandidate[];
+  repositoryKey: string | null;
+  now: number;
+  expiresWithinMs: number;
+}): SaveCardCheckpointExpiryNotice | null {
+  const { retainedEdges, repositoryKey, now, expiresWithinMs } = params;
+  if (repositoryKey === null) return null;
+  const horizon = now + expiresWithinMs;
+  const edges = retainedEdges
+    .map((edge) => ({
+      repositoryKey,
+      turnId: edge.turnId,
+      edge: edge.edge,
+      expiresAt: edge.normalPruneEligibleAt + RETENTION_PIN_MAX_EXTENSION_MS,
+      affectedEntryIds: [...edge.dirtyEntryIds],
+    }))
+    .filter((edge) => edge.expiresAt <= horizon)
+    .sort((left, right) =>
+      left.expiresAt !== right.expiresAt
+        ? left.expiresAt - right.expiresAt
+        : left.turnId !== right.turnId
+          ? left.turnId < right.turnId ? -1 : 1
+          : left.edge === right.edge ? 0 : left.edge === 'after' ? -1 : 1,
+    );
+  if (edges.length === 0) return null;
+  return { observedAt: now, expiresWithinMs, edges };
+}
+
 interface ResolvedConfig {
   workspaceId: string;
   repoRoot: string;
@@ -310,6 +379,7 @@ interface ResolvedConfig {
   retentionMs: number;
   compactDiffMaxBytes: number;
   looseObjectThreshold: number;
+  checkpointExpiryWindowMs: number;
   maintenanceRuntimeDeadlineMs: number;
   platform: NodeJS.Platform;
   log: ReconLogger;
@@ -333,6 +403,7 @@ function resolveConfig(deps: RetentionDeps): ResolvedConfig {
     retentionMs: deps.retentionMs ?? RETENTION_DENSE_WINDOW_MS,
     compactDiffMaxBytes: deps.compactDiffMaxBytes ?? COMPACT_DIFF_MAX_BYTES,
     looseObjectThreshold: deps.looseObjectThreshold ?? MAINTENANCE_LOOSE_OBJECT_THRESHOLD,
+    checkpointExpiryWindowMs: deps.checkpointExpiryWindowMs ?? CHECKPOINT_EXPIRY_ATTENTION_WINDOW_MS,
     maintenanceRuntimeDeadlineMs: deps.maintenanceRuntimeDeadlineMs ?? MAINTENANCE_RUNTIME_DEADLINE_MS,
     platform: deps.platform ?? process.platform,
     log: deps.logger ?? DEFAULT_LOGGER,
@@ -352,6 +423,14 @@ interface PreparedRetentionPins {
    *  thus a repositoryKey) is known; null on the no-edge / enumeration-failure paths
    *  where no identity could be derived. Lets the caller key the warning per repo. */
   repositoryKey: string | null;
+  /** SC-WP-N2 — the ACTUAL retained edge candidates (turnId/edge/dirtyEntryIds/
+   *  normalPruneEligibleAt), carried up so the caller can build the expiry notice
+   *  from the real selection. Empty on the error-fallback paths where no per-edge
+   *  entry-id attribution is available. */
+  retainedEdges: EdgePinCandidate[];
+  /** The `now` this preparation used, so the notice's within-window filter is
+   *  computed against the same instant the selection was. */
+  now: number;
 }
 
 /**
@@ -378,7 +457,7 @@ async function prepareRetentionPins(
     }
     return result;
   });
-  if (possible.length === 0) return { retainedEdgeKeys: new Set(), warning: null, repositoryKey: null };
+  if (possible.length === 0) return { retainedEdgeKeys: new Set(), warning: null, repositoryKey: null, retainedEdges: [], now };
 
   const liveKeys = await verifyLiveEdgesBatch({
     repoRoot: cfg.repoRoot,
@@ -395,7 +474,7 @@ async function prepareRetentionPins(
     const oid = edge === 'before' ? row.beforeOid : row.afterOid;
     return ref !== null && oid !== null && liveKeys.has(liveEdgeKey(ref, oid));
   });
-  if (live.length === 0) return { retainedEdgeKeys: new Set(), warning: null, repositoryKey: null };
+  if (live.length === 0) return { retainedEdgeKeys: new Set(), warning: null, repositoryKey: null, retainedEdges: [], now };
 
   let inventory: { repositoryKey: string; entries: DirtyEntry[] };
   try {
@@ -417,6 +496,8 @@ async function prepareRetentionPins(
       retainedEdgeKeys: new Set(selection.retainedEdges.map((edge) => pinEdgeKey(edge.turnId, edge.edge))),
       warning: selection.warning,
       repositoryKey: null,
+      retainedEdges: selection.retainedEdges,
+      now,
     };
   }
 
@@ -446,7 +527,7 @@ async function prepareRetentionPins(
       if (entries.size === 0) return [];
       return [{ turnId: row.id, edge, normalPruneEligibleAt, dirtyEntries: [...entries.values()] }];
     });
-    if (candidates.length === 0) return { retainedEdgeKeys: new Set(), warning: null, repositoryKey: inventory.repositoryKey };
+    if (candidates.length === 0) return { retainedEdgeKeys: new Set(), warning: null, repositoryKey: inventory.repositoryKey, retainedEdges: [], now };
 
     const activeBoundaryRefs = await cfg.activeBoundaryRefs();
     const selection = await accountAndSelectPins({
@@ -461,13 +542,20 @@ async function prepareRetentionPins(
       retainedEdgeKeys: new Set(selection.retainedEdges.map((edge) => pinEdgeKey(edge.turnId, edge.edge))),
       warning: selection.warning,
       repositoryKey: inventory.repositoryKey,
+      retainedEdges: selection.retainedEdges,
+      now,
     };
   } catch (error) {
     cfg.log.warn(`[retention] pin accounting failed; retaining live candidates: ${describeError(error)}`);
+    // Fail-safe: retain every live candidate, but with no per-edge byte accounting we
+    // have no dirty-entry-id attribution — the expiry notice is suppressed for this
+    // pass rather than emitting edges with empty/unknown affectedEntryIds.
     return {
       retainedEdgeKeys: new Set(live.map(({ row, edge }) => pinEdgeKey(row.id, edge))),
       warning: null,
       repositoryKey: inventory.repositoryKey,
+      retainedEdges: [],
+      now,
     };
   }
 }
