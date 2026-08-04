@@ -12,8 +12,8 @@
 //
 // FIRST-WINS ORDERING (WP-A4.5): the reverse map (mcp-toolset-map.ts
 // DASHBOARD_TOOLSETS) lists `plans-read` before `plans`, so the three shared
-// read-tool names resolve to `plans-read` and `create_plan` (only in `plans`)
-// resolves to `plans`.
+// read-tool names resolve to `plans-read` and supervisor-only focus verbs resolve
+// to `plans`.
 
 import { makeToolsetDefsProvider } from '../context-overhead/ipc-deps';
 import { getScriptPath } from '../supervisor/paths';

@@ -33,20 +33,10 @@ db.getWorkspace = (id: string) => (id === 'ws-1' ? { id: 'ws-1', path: os.tmpdir
 // keyed by id suffices; unknown ids fall back to null → the legacy planPath default.
 const plansStore = new Map<string, { id: string; workspaceId: string; path: string; format?: string }>();
 db.getPlan = (id: string) => (plansStore.has(id) ? clone(plansStore.get(id)!) : null);
-// WP-P0B trusted format-gate: `assertPlanRailFree` only guards legacy
-// `format === 'html'` plans, so the one-writer-per-plan run lock is exercised via
-// a registered html plan surface. (Unknown ids still resolve to null → bypass →
-// the legacy planPath default, unchanged.)
-plansStore.set('plan-lock', { id: 'plan-lock', workspaceId: 'ws-1', path: 'plans/lock.html', format: 'html' });
 db.insertOrchestration = (r: OrchestrationRun) => { runsStore.set(r.runId, clone(r)); };
 db.updateOrchestration = (r: OrchestrationRun) => { runsStore.set(r.runId, clone(r)); };
 db.getOrchestrationRun = (id: string) => (runsStore.has(id) ? clone(runsStore.get(id)!) : null);
 db.listOrchestrationRuns = () => Array.from(runsStore.values()).map(clone);
-// GT-C §O.2 — the fresh-run start branch now routes through the shared
-// `assertPlanRailFree`, which also consults `getLiveRailAgentForPlan`. These
-// lifecycle tests carry no live plan-bound agents, so stub it to null (the
-// one-writer-per-plan run lock is still exercised via `listOrchestrationRuns`).
-db.getLiveRailAgentForPlan = () => null;
 db.insertOrchestrationEvent = (e: any) => { eventsStore.push(clone(e)); };
 db.insertOrchestrationMember = () => {};
 db.markActiveRunsAborted = (reason: string) => {
@@ -235,7 +225,7 @@ test('boot reconcile marks orphaned running rows aborted + emits a resume hint',
   assert.equal(delivered.supervisorId, 'sup-boot');
 });
 
-// ── WP6: planning-surface rail persistence + one-writer-per-plan ─────────────
+// ── WP6: planning-surface rail persistence ──────────────────────────────────
 
 test('WP6: start_run persists planId + sectionAnchor onto the run row', async () => {
   const gate = deferred();
@@ -251,35 +241,24 @@ test('WP6: start_run persists planId + sectionAnchor onto the run row', async ()
   await waitFor(() => getRun(runId)?.status === 'complete');
 });
 
-test('WP6: a second dispatch to a plan with an active writer is rejected 409', async () => {
+test('WP-P8B: concurrent dispatches may target the same plan after HTML writeback removal', async () => {
   const gate = deferred();
   const runner: OrchestrationRunner = async () => { await gate.promise; };
   const { fn } = makeDeliver();
   const svc = new OrchestrationService(makeClient(), fn, { serial: runner, parallel: runner });
 
-  const first = svc.start_run(baseReq({ planId: 'plan-lock', sectionAnchor: 'sec_a' }));
+  const first = svc.start_run(baseReq({ planId: 'plan-shared', sectionAnchor: 'sec_a' }));
   await waitFor(() => getRun(first.runId)?.status === 'running');
+  const second = svc.start_run(baseReq({ planId: 'plan-shared', sectionAnchor: 'sec_b' }));
+  await waitFor(() => getRun(second.runId)?.status === 'running');
+  assert.notEqual(first.runId, second.runId);
 
-  let caught: any;
-  try {
-    svc.start_run(baseReq({ planId: 'plan-lock', sectionAnchor: 'sec_b' }));
-  } catch (err) { caught = err; }
-  assert.ok(caught, 'second dispatch to the locked plan threw');
-  assert.equal(caught.statusCode, 409, '409 conflict, not a silent second writer');
-  assert.match(caught.message, /active writer/i);
-
-  // A different plan is unaffected — the lock is per-plan, not global.
-  const other = svc.start_run(baseReq({ planId: 'plan-other', sectionAnchor: 'sec_a' }));
-  assert.ok(other.runId, 'a different plan dispatches concurrently');
-
-  // Once the first writer finishes, the plan frees up for a fresh dispatch.
   gate.resolve();
   await waitFor(() => getRun(first.runId)?.status === 'complete');
-  const reDispatch = svc.start_run(baseReq({ planId: 'plan-lock', sectionAnchor: 'sec_c' }));
-  assert.ok(reDispatch.runId, 'plan re-dispatchable after its writer completes');
+  await waitFor(() => getRun(second.runId)?.status === 'complete');
 });
 
-test('WP6: a run WITHOUT a planId is never blocked by the one-writer lock', () => {
+test('WP6: runs without a planId may coexist', () => {
   const gate = deferred();
   const runner: OrchestrationRunner = async () => { await gate.promise; };
   const { fn } = makeDeliver();
@@ -320,7 +299,7 @@ test('GT-C T1: a rail run materializes the trail while STILL running, exempts it
     assert.equal(calls.length, 1, 'materialize invoked exactly once for the rail run');
     assert.equal(calls[0].planId, 'plan-t1');
     assert.equal(calls[0].statusAtCall, 'running',
-      'materialize fired while the run row is STILL running (the one-writer 409 holds through the write)');
+      'materialize fired while the run row is still running');
     assert.equal(calls[0].opts.completingRunId, runId, 'the completing run exempts itself');
     assert.deepEqual(calls[0].opts.exemptAgentIds, ['lead-1', 'rev-1'],
       'its own members are exempt (they may still be idle)');

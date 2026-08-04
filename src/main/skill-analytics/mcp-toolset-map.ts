@@ -28,8 +28,8 @@ export const DASHBOARD_MCP_SERVER = 'agent-dashboard';
 // FIRST-WINS ORDERING (GT-A WP-A4.5): the reverse map is name-only and the first
 // toolset to claim a tool name wins. `plans-read` MUST precede `plans` so the
 // three shared read-tool names (list_plan_sections / read_plan_section /
-// read_plan_projection) resolve to `plans-read`, while `create_plan` — present
-// only in `plans` — resolves to `plans`.
+// read_plan_projection) resolve to `plans-read`, while supervisor-only focus
+// verbs resolve to `plans`.
 export const DASHBOARD_TOOLSETS: readonly string[] = [
   'orchestration',
   'teams',

@@ -120,8 +120,8 @@ function getObservabilityCoreToolDefinitions() {
         'plus owned: how many agents YOU launched are live vs terminal — pull the list via list_my_agents). ' +
         'When you are a supervisor it also returns `plans`: the plan surfaces you are subscribed to ' +
         '(planId, path, slug, format, focusedAt, lastAttendedAt, notes), most-recently-attended first, ' +
-        'capped at 10 — you auto-subscribe when you create_plan or dispatch a plan-bound agent/orchestration, ' +
-        'and can curate the set with focus_plan / unfocus_plan, so a plan you minted before the /clear is ' +
+        'capped at 10 — you auto-subscribe when you dispatch a plan-bound agent/orchestration, ' +
+        'and can curate the set with focus_plan / unfocus_plan, so a plan you followed before the /clear is ' +
         'not lost. Takes NO arguments — the dashboard scopes it to YOUR workspace from your injected ' +
         'identity. Call this FIRST on any revival, before trusting a wake hint, then self-orient via list_agents.',
       inputSchema: {

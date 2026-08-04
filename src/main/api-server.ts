@@ -27,8 +27,6 @@ import {
   getPlanEventRepoActivity,
 } from './database';
 import { toTier2Digest, toTier3Detail } from './plans/repo-activity';
-import { assertPlanRailFree } from './orchestration/plan-ownership';
-import { createPlanSurface } from './plans/create-plan';
 import { readPlanSection, listPlanSections, type ReadMode } from './plans/read-ladder';
 import { parsePlanHtmlSafe, type PlanProjection } from './plans/section-reader';
 import { getServedPlanProjection } from './plans/watch-plans';
@@ -2186,12 +2184,6 @@ export class ApiServer {
             { statusCode: 400 },
           );
         }
-        // GT-C §O.2 — one-writer-per-plan guard on the named `launch_agent` (MCP)
-        // dispatch path (I-10). 409s on an active run, an actively-working plan-bound
-        // agent, or an in-flight trail materialization. Idle plan-bound agents do NOT
-        // reserve the plan (amended ownership model, §4.4), so keeping a seed worker
-        // idle across phases stays legal.
-        assertPlanRailFree(input.planId);
       }
       // WP4 (plans/cross-workspace-collaboration.md) — normalize the snake_case
       // `mode` launch class to the camelCase `launchMode` LaunchAgentInput field
@@ -3637,28 +3629,12 @@ export class ApiServer {
       return p;
     }
 
-    // POST /api/plans
-    //   Create branch (WP3, R1 F0): { workspace_id, title } + no `path` → mint a
-    //     new surface from DEFAULT_SURFACE_TEMPLATE (createPlanSurface).
-    //   Register branch (B2): { workspace_id, path, format, … } → register an
-    //     existing file. Rename stays PATCH-only.
+    // POST /api/plans registers an existing file. Rename stays PATCH-only.
     if (method === 'POST' && path === '/api/plans') {
       const b = JSON.parse(await readBody(req));
       rejectMarkdownMigration(b); // F-F: markdown migration is deferred out of v1
       if ('id' in b) throw Object.assign(new Error('id is server-generated; do not supply it'), { statusCode: 400 }); // R2
       const workspaceId = pickBody<string>(b, 'workspace_id', 'workspaceId');
-
-      // Create branch: a title with no explicit file path mints a fresh surface.
-      const title = pickBody<string>(b, 'title', 'title');
-      if (title !== undefined && b.path === undefined) {
-        if (!workspaceId) throw Object.assign(new Error('Missing workspace_id'), { statusCode: 400 });
-        const created = createPlanSurface({ workspaceId, title }); // seedMarkdown intentionally not threaded (F-F)
-        // Planning-surface P1: auto-subscribe the creating supervisor so the freshly
-        // minted surface survives its /clear (best-effort; no-op for non-supervisors).
-        this.autoFocusPlan(identity, created.planId);
-        const plan = getPlan(created.planId);
-        return plan ?? created;
-      }
 
       const relPath = normalizePlanPath(b.path);
       const format = b.format;
@@ -3863,10 +3839,9 @@ export function queryNum(params: URLSearchParams, name: string): number | undefi
   return Number.isFinite(n) ? n : undefined;
 }
 
-/** F-F: markdown→zones migration is DEFERRED out of v1. The create/register
+/** F-F: markdown migration is DEFERRED out of v1. The registration
  *  boundary must REJECT any markdown-migration input rather than 200-with-silent
- *  ignore (which would fabricate migration success). `seedMarkdown` is inert in
- *  `createPlanSurface`, but the boundary never advertises or accepts it. */
+ *  ignore (which would fabricate migration success). */
 const MARKDOWN_MIGRATION_FIELDS = [
   'seed_markdown', 'seedMarkdown', 'markdown',
   'migrate', 'migrate_from', 'migrateFrom', 'migrate_md', 'migrateMd',

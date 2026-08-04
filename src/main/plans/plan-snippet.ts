@@ -4,8 +4,8 @@
 // parse pass, we reuse whatever PlanProjection the section reader already
 // produced (the served last-good projection, or an on-demand
 // `parsePlanHtmlSafe`) and pull the SUMMARY zone's prose out of it. The summary
-// zone (`data-zone="summary"`) is the plan's landing paragraph by convention
-// (SEED_ZONES); absent one we fall back to the first section that carries text.
+// zone (`data-zone="summary"`) is the legacy plan's landing paragraph by
+// convention; absent one we fall back to the first section that carries text.
 
 import type { PlanProjection, ParsedSection } from './section-reader';
 

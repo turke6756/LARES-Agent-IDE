@@ -43,7 +43,7 @@ export interface RunOrchestrationRequest {
   topic?: string;
   planPath?: string;                 // resolved against workspace root
   // WP6 planning-surface rail: when set, the run edits an EXISTING plan surface
-  // (created via create_plan) at `sectionAnchor` rather than writing a fresh
+  // registered in the plans table at `sectionAnchor` rather than writing a fresh
   // plan file. planId references a `plans` row; sectionAnchor is the `sec_`
   // writeback target. Both are stamped onto every launched member's env
   // (AGENT_DASHBOARD_PLAN_ID / _PLAN_SECTION) via the WP1 launch rail, and drive
@@ -192,8 +192,8 @@ export interface DashboardClient {
    *  section's byte-exact content hash has moved since `sinceIso` — i.e. a
    *  `plan_section_changes` row exists for (planId, sectionAnchor) in
    *  [sinceIso, now]. The relay loop uses this INSTEAD of existsSync(planPath)
-   *  when the run carries a plan rail, because the plan file already exists (the
-   *  surface was created up front by create_plan) — the deliverable is a native
+   *  when the run carries a plan rail, because the registered plan file already
+   *  exists — the deliverable is a native
    *  Edit of one section, not a fresh file appearing. Backed by
    *  database.getTurnSectionChanges (WP4). */
   sectionChangedSince(planId: string, sectionAnchor: string, sinceIso: string): boolean;

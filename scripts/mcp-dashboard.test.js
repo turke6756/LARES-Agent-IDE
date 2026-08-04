@@ -199,7 +199,7 @@ test('every retired analytics tool is unreachable under EVERY grant that could h
 test('SUPERVISOR grant keeps its operational surface after the analytics retirement', async () => {
   const proxy = loadProxy('orchestration,comms,observability-core,plans,browser-present');
   const names = namesOf(proxy.getToolDefinitions());
-  for (const kept of ['list_agents', 'read_agent_chat', 'get_my_context', 'launch_agent', 'create_plan']) {
+  for (const kept of ['list_agents', 'read_agent_chat', 'get_my_context', 'launch_agent']) {
     assert.ok(names.includes(kept), `supervisor must keep ${kept}`);
   }
 });
@@ -225,7 +225,7 @@ test('backward-compat: the `observability` alias resolves to the core surface an
 
 // ── WP-A4: plans-read worker grant exposes exactly the 3 read tools ──
 
-test('plans-read toolset exposes the 3 read tools + record_planning_event, not create_plan', async () => {
+test('plans-read toolset exposes the 3 read tools + record_planning_event', async () => {
   const proxy = loadProxy('plans-read');
   const names = namesOf(proxy.getToolDefinitions());
   // WP-P0PRE: record_planning_event is a telemetry ping (a demand probe), not a
@@ -236,20 +236,12 @@ test('plans-read toolset exposes the 3 read tools + record_planning_event, not c
     'read_plan_section',
     'record_planning_event',
   ]);
-  assert.ok(!names.includes('create_plan'), 'plans-read must NOT expose create_plan');
-
-  // create_plan is not routable under the plans-read grant (errors, no HTTP call).
-  const api = fakeApi();
-  const result = await proxy.handleToolCall('create_plan', { workspace_id: 'ws', title: 'T' }, api);
-  assert.ok(result.isError, 'create_plan must be an error under plans-read');
-  assert.strictEqual(api.calls.length, 0);
 });
 
-test('plans (supervisor) toolset still exposes create_plan + the read ladder + focus verbs', async () => {
+test('plans (supervisor) toolset exposes the read ladder + focus verbs', async () => {
   const proxy = loadProxy('plans');
   const names = namesOf(proxy.getToolDefinitions());
   assert.deepStrictEqual(names, [
-    'create_plan',
     'focus_plan',
     'list_plan_sections',
     'read_plan_projection',

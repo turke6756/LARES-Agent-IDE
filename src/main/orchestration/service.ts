@@ -15,7 +15,6 @@ import {
   insertOrchestration, updateOrchestration, getOrchestrationRun, listOrchestrationRuns,
   insertOrchestrationEvent, insertOrchestrationMember, markActiveRunsAborted,
 } from '../database';
-import { assertPlanRailFree } from './plan-ownership';
 import { trailMaterializer } from '../plans/execution-trail-writer';
 
 const READY_STATUSES = new Set(['idle', 'waiting']);
@@ -123,18 +122,6 @@ export class OrchestrationService extends EventEmitter {
       )) {
         throw httpErr(409, 'Planning intent is not active in the requested plan');
       }
-      // WP6 §D-WRITE-POLICY / GT-C §O.2 — one active writer per plan file, enforced
-      // AT DISPATCH through the SHARED `assertPlanRailFree` guard (so this path and
-      // `POST /api/agents` cannot drift). A second groupthink targeting a plan that
-      // already has a live (starting/running) run — or an actively-working plan-bound
-      // agent, or an in-flight trail materialization — is REJECTED 409 rather than
-      // queued (v1 choice): two concurrent deliberations editing the same surface
-      // would race the native writeback with no safe auto-merge. Resume re-arms the
-      // SAME writer (not a second one) and lives in the ELSE branch, so it never
-      // reaches this fresh-run guard.
-      if (req.planId) {
-        assertPlanRailFree(req.planId);
-      }
       // WP6 / planning-surface demo fix (2026-07-06): a plan-rail run (planId
       // set) edits an EXISTING plan surface, so its planPath MUST be that plan
       // row's real `path` — not the legacy `plans/new-plan.md` default. The
@@ -173,7 +160,7 @@ export class OrchestrationService extends EventEmitter {
       // failed archive throws here, refusing the start before any run row exists.
       // Gated on all three resume signals — resumeLeadId/resumeReviewerId can be
       // set via structured/legacy params even without resumeRunId.
-      // WP6: a plan-rail run edits an EXISTING surface (create_plan wrote it),
+      // WP6: a plan-rail run edits an EXISTING registered surface,
       // so NEVER archive it away — archiving is only for the legacy fresh-file
       // deliverable path where a leftover plan would trip the existsSync gate.
       if (!req.resumeRunId && !req.resumeLeadId && !req.resumeReviewerId && !req.planId) {

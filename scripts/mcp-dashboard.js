@@ -163,9 +163,9 @@ const TOOLSET_REGISTRY = {
       handleToolCall: mod.handlePlansToolCall,
     };
   },
-  // WP-A4 (GT-A I-1 / D-1): read-only plans subset for the worker lane — the
-  // three read tools, no create_plan. Advertised via getPlansReadToolDefinitions;
-  // handlePlansReadToolCall errors on create_plan belt-and-suspenders.
+  // WP-A4 (GT-A I-1 / D-1): read-only plans subset for the worker lane. Advertised
+  // via getPlansReadToolDefinitions; supervisor-only focus calls are rejected by
+  // handlePlansReadToolCall belt-and-suspenders.
   'plans-read': () => {
     const mod = require('./mcp-tools-plans');
     return {

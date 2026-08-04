@@ -20,7 +20,6 @@
 // future static content) are preserved verbatim. The system list never balloons
 // past the last ≤200 write-events.
 
-import { escapeHtml } from './templates/default-surface';
 import { parsePlanHtmlSafe } from './section-reader';
 import type { ObservedVia } from './plan-events';
 
@@ -30,6 +29,15 @@ export const EXEC_TRAIL_MAX_ENTRIES = 200;
 /** Target line length for a rendered `<li>` (§1.3 — soft cap on the server-derived
  *  metadata to keep the line legible; escaping happens AFTER truncation). */
 const TRAIL_LINE_TARGET = 160;
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
 
 export interface TrailEntry {
   planEventId: string;

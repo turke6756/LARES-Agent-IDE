@@ -52,10 +52,6 @@ db.listOrchestrationRuns = () => Array.from(svcRunsStore.values()).map(svcClone)
 db.insertOrchestrationEvent = (e: any) => { svcEvents.push(svcClone(e)); };
 db.insertOrchestrationMember = () => {};
 db.markActiveRunsAborted = () => [];
-// GT-C §O.2 — the fresh-run start branch routes through `assertPlanRailFree`, which
-// also consults `getLiveRailAgentForPlan`. No live plan-bound agent in this harness.
-db.getLiveRailAgentForPlan = () => null;
-
 // Clamp setTimeout so 2000ms polls fire in ≤2ms (same trick as groupthink-v2.test).
 const realSetTimeout = global.setTimeout;
 (global as any).setTimeout = ((fn: any, ms?: number, ...rest: any[]) =>
@@ -229,7 +225,7 @@ test('WSL site: wslEnvPrefix injects AGENT_DASHBOARD_PLAN_ID/_SECTION from agent
 test('done-detection: a rail run IGNORES an existing plan file and completes only on a section change', async () => {
   const run = makeRun({ planId: 'plan-x', sectionAnchor: 'sec_q' });
   // A file at planPath would short-circuit the LEGACY existsSync gate on turn 1.
-  fs.writeFileSync(run.planPath, 'pre-existing surface (create_plan artifact)');
+  fs.writeFileSync(run.planPath, 'pre-existing registered surface');
   // Section never changes → the run must keep deliberating to MAX_TURNS and STALL,
   // proving the plan FILE is no longer consulted for a rail run's done-detection.
   const { client } = makeFake({ sectionChanged: () => false });

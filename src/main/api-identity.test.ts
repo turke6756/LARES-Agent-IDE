@@ -110,13 +110,6 @@ db.getLiveRailAgentForPlan = () => null;
 function focusUpserted(): Record<string, unknown> | null { return lastFocusUpsert; }
 function focusBumped(): { supervisorId: string; planId: string } | null { return lastFocusBump; }
 
-// createPlanSurface is a direct import in api-server; patch the module export it
-// resolves at call time so POST /api/plans (create branch) mints a plan without
-// writing files / touching the DB.
-// eslint-disable-next-line @typescript-eslint/no-var-requires
-const createPlanMod = require('./plans/create-plan') as Record<string, unknown>;
-createPlanMod.createPlanSurface = () => ({ planId: 'plan-1' });
-
 let lastCreateTeamInput: Record<string, unknown> | null = null;
 db.createTeam = (input: Record<string, unknown>) => {
   lastCreateTeamInput = input;
@@ -562,8 +555,8 @@ test('OPTIONS preflight advertises X-Workspace-Id / X-Supervisor-Id / X-Project-
 // ── Planning-surface P1 — focus orientation + auto-subscribe ────────────────
 //
 // The context `plans` block appears ONLY for an asserted supervisor; auto-subscribe
-// fires on the natural verbs (create_plan / plan-bound launch_agent /
-// run_orchestration) and is a silent no-op for non-supervisor callers.
+// fires on plan-bound launch_agent / run_orchestration and is a silent no-op for
+// non-supervisor callers.
 
 test('P1 context: asserted supervisor gets the `plans` block (subscriptions), header-less callers do not', () =>
   withServer(async (port) => {
@@ -582,27 +575,6 @@ test('P1 context: asserted supervisor gets the `plans` block (subscriptions), he
     assert.equal('plans' in ctx2, false, 'header-less caller gets no plans key');
     assert.equal(ctx2.supervisorId, null);
     focusedPlansStub = [];
-  }));
-
-test('P1 auto-subscribe: create_plan by an asserted supervisor upserts a focus row', () =>
-  withServer(async (port) => {
-    lastFocusUpsert = null;
-    const res = await request(port, 'POST', '/api/plans',
-      { ...WS_HDR, 'X-Supervisor-Id': 'sup-1', 'Content-Type': 'application/json' },
-      JSON.stringify({ workspace_id: 'ws-1', title: 'My Plan' }));
-    assert.equal(res.status, 200);
-    assert.equal(focusUpserted()?.supervisorId, 'sup-1');
-    assert.equal(focusUpserted()?.planId, 'plan-1');
-  }));
-
-test('P1 auto-subscribe: create_plan by a header-less caller does NOT upsert (silent skip, still 200)', () =>
-  withServer(async (port) => {
-    lastFocusUpsert = null;
-    const res = await request(port, 'POST', '/api/plans',
-      { ...AUTH, 'Content-Type': 'application/json' },
-      JSON.stringify({ workspace_id: 'ws-1', title: 'My Plan' }));
-    assert.equal(res.status, 200, 'create still succeeds — focus attribution never gates it');
-    assert.equal(focusUpserted(), null, 'no supervisor identity → no focus row');
   }));
 
 test('P1 auto-subscribe: a plan-bound launch_agent by an asserted supervisor upserts a focus row', () =>

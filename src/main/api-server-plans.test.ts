@@ -125,6 +125,15 @@ test('POST /api/plans rejects a body containing id → 400 (R2 server-minted)', 
     assert.equal(created(), null, 'createOrRevivePlan never called');
   }));
 
+test('WP-P8B: POST /api/plans with title only does not author an HTML plan', () =>
+  withServer(async (port) => {
+    const res = await request(port, 'POST', '/api/plans', JSON_AUTH,
+      JSON.stringify({ workspace_id: 'ws-1', title: 'No legacy surface' }));
+    assert.equal(res.status, 400);
+    assert.match(JSON.parse(res.body).error, /path is required/i);
+    assert.equal(created(), null, 'no plan row was minted');
+  }));
+
 test('POST /api/plans happy path returns a uuid-like id (not path/slug-derived)', () =>
   withServer(async (port) => {
     const res = await request(port, 'POST', '/api/plans', JSON_AUTH,

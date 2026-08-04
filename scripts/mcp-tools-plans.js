@@ -1,5 +1,5 @@
 // Planning-surface MCP toolset (WP3). Thin HTTP callers over the dashboard's
-// /api/plans routes — the create primitive plus the read ladder. Identity flows
+// /api/plans routes — the read ladder plus supervisor focus controls. Identity flows
 // through the X-Self-Id (worker) / X-Supervisor-Id (supervisor) header that
 // apiRequest spreads from CALLER_HEADERS on every call, so the server records
 // the `source:'handler'` read breadcrumb against the calling agent (R2 §2.2).
@@ -9,37 +9,12 @@
 // input ("markdown migration is not supported in v1 (deferred)"); apiRequest
 // surfaces that as a thrown Error here rather than silent-ignoring it.
 //
-// WP-A4 (GT-A I-1): the defs are factored into a create primitive + a shared
-// READ_DEFS ladder. `plans` (supervisor lane) advertises the full set;
+// WP-A4 (GT-A I-1): the defs are factored into a shared READ_DEFS ladder plus
+// supervisor focus controls. `plans` (supervisor lane) advertises the full set;
 // `plans-read` (worker lane) advertises READ_DEFS only via
 // getPlansReadToolDefinitions(). `plan_id` is INTENTIONALLY optional in the
 // shared read schemas — an omitted plan_id falls back to the dispatched plan in
 // AGENT_DASHBOARD_PLAN_ID (D-2 soft env-default scoping); still-falsy → clear error.
-
-// create_plan — supervisor-only write primitive; keeps workspace_id/title required.
-const createDef = {
-  name: 'create_plan',
-  description:
-    'Create a new plan surface from the default six-zone template (summary, questions, ' +
-    'research, decisions, execution-trail, open-items). Mints a plans row + plan_sections ' +
-    'rows and writes the HTML surface file under the workspace `plans/` directory (a slug ' +
-    'derived from the title, with a collision suffix if needed). Returns the created plan. ' +
-    'Markdown migration is NOT supported in v1 (deferred) — supply a title only. ' +
-    'DISPATCH NOTE: the execution-trail section (`sec_exectr`) is system-owned — auto-generated ' +
-    'from trusted write events — so NEVER dispatch a writer to it; dispatch execution workers to ' +
-    'the section they UPDATE (`sec_opitem` for checklist execution). Plan-bound briefs must mandate ' +
-    "a turn-end writeback: the worker flips its completed items' `&#9744;`→`&#9745;` in its assigned " +
-    'section (native HTML edit) and emits a `<!--PLAN-EVENT …-->` sentinel — that edit is what ' +
-    'materializes the trail lines and the visible checkmarks.',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      workspace_id: { type: 'string', description: 'The workspace to create the plan in.' },
-      title: { type: 'string', description: 'Human-readable plan title (used to derive the slug/path).' },
-    },
-    required: ['workspace_id', 'title'],
-  },
-};
 
 // READ_DEFS — the read ladder shared by the `plans` and `plans-read` toolsets.
 // `plan_id` is optional in every schema here: supervisors normally pass it
@@ -112,8 +87,8 @@ const READ_DEFS = [
 ];
 
 // focus_plan / unfocus_plan — supervisor-only subscription verbs (planning-surface
-// P1). A supervisor auto-subscribes on the natural verbs (create_plan / plan-bound
-// launch_agent / run_orchestration), but these let it curate the set explicitly so a
+// P1). A supervisor auto-subscribes on plan-bound launch_agent / run_orchestration,
+// but these let it curate the set explicitly so a
 // plan it minted/dispatched — and thus resurfaces in get_my_context after a /clear —
 // can be added or dropped by hand. The subscriber is ALWAYS the calling supervisor,
 // derived server-side from the validated X-Supervisor-Id; there is no supervisor_id
@@ -125,7 +100,7 @@ const FOCUS_DEFS = [
     description:
       'Subscribe YOU (the calling supervisor) to a plan so it reappears in get_my_context after a ' +
       '/clear, restart, or revival. Idempotent — re-focusing an already-focused plan just refreshes ' +
-      "the optional note. You already auto-subscribe when you create_plan or dispatch a plan-bound " +
+      "the optional note. You already auto-subscribe when you dispatch a plan-bound " +
       'agent/orchestration; use this to add one you did neither for. Supervisor-only.',
     inputSchema: {
       type: 'object',
@@ -181,11 +156,11 @@ const recordPlanningEventDef = {
 };
 
 function getPlansToolDefinitions() {
-  return [createDef, ...READ_DEFS, ...FOCUS_DEFS, recordPlanningEventDef];
+  return [...READ_DEFS, ...FOCUS_DEFS, recordPlanningEventDef];
 }
 
 /** WP-A4 (D-1): the read-only subset advertised to the worker `plans-read`
- *  toolset — the three read tools, never create_plan. record_planning_event is
+ *  toolset — the three read tools. record_planning_event is
  *  included: it is a telemetry ping, not a plan write. */
 function getPlansReadToolDefinitions() {
   return [...READ_DEFS, recordPlanningEventDef];
@@ -207,16 +182,6 @@ function missingPlanIdError() {
 
 async function handlePlansToolCall(name, args, apiRequest) {
   switch (name) {
-    case 'create_plan': {
-      // Create branch of POST /api/plans: { workspace_id, title } + no path.
-      // seed_markdown/migrate inputs are NOT advertised; the boundary 400s them (F-F).
-      const plan = await apiRequest('POST', '/api/plans', {
-        workspace_id: args.workspace_id,
-        title: args.title,
-      });
-      return { content: [{ type: 'text', text: JSON.stringify(plan, null, 2) }] };
-    }
-
     case 'list_plan_sections': {
       const planId = resolvePlanId(args);
       if (!planId) return missingPlanIdError();
@@ -289,11 +254,11 @@ async function handlePlansToolCall(name, args, apiRequest) {
 
 /** Write tools advertised only in the supervisor `plans` toolset — never reachable
  *  from the read-only `plans-read` worker lane. */
-const PLANS_WRITE_ONLY = new Set(['create_plan', 'focus_plan', 'unfocus_plan']);
+const PLANS_WRITE_ONLY = new Set(['focus_plan', 'unfocus_plan']);
 
-/** WP-A4 (D-1): dispatcher for the read-only `plans-read` toolset. create_plan is
- *  never advertised to this toolset (getPlansReadToolDefinitions omits it); this
- *  belt-and-suspenders check errors if it is somehow invoked. The three read
+/** WP-A4 (D-1): dispatcher for the read-only `plans-read` toolset. Supervisor-only
+ *  focus controls are never advertised to this toolset; this belt-and-suspenders
+ *  check errors if one is somehow invoked. The three read
  *  tools delegate to the shared handlePlansToolCall (incl. the env-default
  *  plan_id scoping). */
 async function handlePlansReadToolCall(name, args, apiRequest) {

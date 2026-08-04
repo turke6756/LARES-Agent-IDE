@@ -17,10 +17,9 @@ function test(name, fn) { tests.push({ name, fn }); }
 
 // ── Tool surface ────────────────────────────────────────────────────────────
 
-test('the plans toolset — create + read ladder + focus verbs (supervisor lane)', () => {
+test('the plans toolset — read ladder + focus verbs (supervisor lane)', () => {
   const names = getPlansToolDefinitions().map((t) => t.name);
   assert.deepStrictEqual(names.sort(), [
-    'create_plan',
     'focus_plan',
     'list_plan_sections',
     'read_plan_projection',
@@ -70,7 +69,7 @@ test('read_plan_section advertises all four read modes incl. raw+editWindow', ()
 
 // ── WP-A4: plans-read read-only subset (worker lane) ────────────────────────
 
-test('getPlansReadToolDefinitions returns the 3 read tools + record_planning_event (no create_plan)', () => {
+test('getPlansReadToolDefinitions returns the 3 read tools + record_planning_event', () => {
   const names = getPlansReadToolDefinitions().map((t) => t.name);
   assert.deepStrictEqual(names.sort(), [
     'list_plan_sections',
@@ -78,7 +77,6 @@ test('getPlansReadToolDefinitions returns the 3 read tools + record_planning_eve
     'read_plan_section',
     'record_planning_event',
   ]);
-  assert.ok(!names.includes('create_plan'), 'plans-read must NOT advertise create_plan');
 });
 
 test('READ_DEFS make plan_id optional (shared by plans + plans-read)', () => {
@@ -86,17 +84,13 @@ test('READ_DEFS make plan_id optional (shared by plans + plans-read)', () => {
     assert.ok(!def.inputSchema.required.includes('plan_id'),
       `${def.name} must not require plan_id (env-default scoping)`);
   }
-  // create_plan is unaffected — still requires workspace_id + title.
-  const create = getPlansToolDefinitions().find((d) => d.name === 'create_plan');
-  assert.deepStrictEqual(create.inputSchema.required.sort(), ['title', 'workspace_id']);
 });
 
-test('handlePlansReadToolCall errors on create_plan (never advertised, belt-and-suspenders)', async () => {
+test('retired create_plan is not handled and makes no HTTP call', async () => {
   const api = fakeApi({});
-  const r = await handlePlansReadToolCall('create_plan', { workspace_id: 'ws', title: 'T' }, api);
-  assert.ok(r.isError, 'create_plan via plans-read must be an error');
-  assert.match(r.content[0].text, /create_plan is not available/i);
-  assert.strictEqual(api.calls.length, 0, 'no HTTP call may be made for the rejected create_plan');
+  assert.strictEqual(await handlePlansToolCall('create_plan', {}, api), null);
+  assert.strictEqual(await handlePlansReadToolCall('create_plan', {}, api), null);
+  assert.strictEqual(api.calls.length, 0, 'the retired tool must not issue an HTTP call');
 });
 
 test('handlePlansReadToolCall delegates the read tools to the shared handler', async () => {
@@ -179,39 +173,6 @@ test('returns null for non-plan tool names (caller switch keeps handling them)',
   assert.strictEqual(await handlePlansToolCall('list_agents', {}, api), null);
   assert.strictEqual(await handlePlansToolCall('browser_open_url', {}, api), null);
   assert.strictEqual(api.calls.length, 0);
-});
-
-test('create_plan POSTs { workspace_id, title } to /api/plans and returns the plan', async () => {
-  const api = fakeApi({
-    'POST /api/plans': { id: 'plan-1', title: 'My Plan', slug: 'my-plan', path: 'plans/my-plan.html' },
-  });
-  const r = await handlePlansToolCall('create_plan', { workspace_id: 'ws-1', title: 'My Plan' }, api);
-  assert.deepStrictEqual(api.calls[0], {
-    method: 'POST', path: '/api/plans', body: { workspace_id: 'ws-1', title: 'My Plan' },
-  });
-  const parsed = JSON.parse(r.content[0].text);
-  assert.strictEqual(parsed.id, 'plan-1');
-});
-
-test('create_plan does NOT forward any markdown-migration field (never constructs one)', async () => {
-  const api = fakeApi({ 'POST /api/plans': { id: 'plan-2' } });
-  // Even if a caller smuggles seed_markdown into args, the tool builds the body
-  // from title/workspace_id only — the field never reaches the wire.
-  await handlePlansToolCall('create_plan', { workspace_id: 'ws-1', title: 'T', seed_markdown: '# md' }, api);
-  const body = api.calls[0].body;
-  assert.deepStrictEqual(Object.keys(body).sort(), ['title', 'workspace_id']);
-});
-
-test('F-F: a 400 from the create boundary surfaces as a thrown error, not silent success', async () => {
-  // If the server rejects markdown migration (or any bad input), apiRequest
-  // rejects; the tool must propagate it rather than fabricate a 200 result.
-  const api = fakeApi({
-    'POST /api/plans': new Error('markdown migration is not supported in v1 (deferred)'),
-  });
-  await assert.rejects(
-    () => handlePlansToolCall('create_plan', { workspace_id: 'ws-1', title: 'T' }, api),
-    /markdown migration is not supported in v1 \(deferred\)/,
-  );
 });
 
 // ── focus_plan / unfocus_plan (planning-surface P1 explicit verbs) ───────────

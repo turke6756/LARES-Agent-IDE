@@ -152,8 +152,8 @@ export function archiveStalePlan(planPath: string, runId: string): string | null
 
 // --- WP6: done-detection (whole-file existsSync → section-anchor changed) ---
 // The legacy deliverable is a fresh plan FILE appearing at planPath; a
-// planning-surface run instead edits ONE section of an EXISTING surface (the
-// file was written up front by create_plan), so existsSync(planPath) is already
+// planning-surface run instead edits ONE section of an EXISTING registered
+// surface, so existsSync(planPath) is already
 // true at turn 1 and would complete the run with zero deliberation. For a
 // rail-carrying run we ask the DB (via the client's plan_section_changes lookup,
 // WP4) whether the dispatched section's byte-exact content hash has moved since
@@ -578,7 +578,7 @@ export async function runSerial(client: DashboardClient, ctx: OrchestrationRunCo
 
   // T2 defensive guard (covers direct-runner callers + the pressure tests):
   // archive a stale plan only on a genuinely fresh run, never on resume.
-  // WP6: never archive a plan-rail surface — it is the EXISTING create_plan
+  // WP6: never archive a plan-rail surface — it is the EXISTING registered
   // artifact this run edits into, not a leftover to clear.
   if (!resumeLeadId && !resumeReviewerId && !run.planId) archiveStalePlan(planPath, run.runId);
 

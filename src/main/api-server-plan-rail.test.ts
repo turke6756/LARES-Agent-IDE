@@ -40,12 +40,6 @@ db.getPlan = (id: string) => (id === PLAN.id ? PLAN : null);
 // The launch route reads no other db helpers on the no-identity-header path used
 // below; getAllAgents is only hit by GET, but stub it defensively.
 db.getAllAgents = () => [];
-// GT-C §O.2 — the launch route now applies the shared `assertPlanRailFree` guard
-// after plan-existence validation. It consults these two helpers; with no live
-// run / rail agent in this harness they return "free" so the launch proceeds.
-db.listOrchestrationRuns = () => [];
-db.getLiveRailAgentForPlan = () => null;
-
 let lastLaunchInput: Record<string, unknown> | null = null;
 const stubSupervisor = {
   launchAgent: async (input: Record<string, unknown>) => {

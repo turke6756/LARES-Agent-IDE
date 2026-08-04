@@ -31,7 +31,6 @@ import {
   defaultAnswerPlanCommentDeps,
 } from './plans/plan-comments';
 import { registerPlanCommentIpc, registerPlanCommentReplyIpc } from './plans/plan-ipc';
-import { assertPlanRailFree } from './orchestration/plan-ownership';
 import { getApiToken } from './security/api-auth';
 import { openInVSCode, openFileInVSCode, openFileInWorkspace } from './vscode-launcher';
 import { detectRuntimePrerequisites, toHealthCheck } from './runtime-prerequisites';
@@ -228,14 +227,7 @@ export function registerIpcHandlers(
   // Agent handlers
   ipcMain.handle('agent:list', (_e, workspaceId) => getAgentsByWorkspace(workspaceId));
   ipcMain.handle('agent:list-all', () => getAllAgents());
-  ipcMain.handle('agent:launch', (_e, input) => {
-    // GT-C §O.2 — the renderer "Launch Agent" IPC path must apply the SAME
-    // one-writer-per-plan guard as `POST /api/agents` so the two dispatch routes
-    // cannot drift. Normalizes both the camelCase and snake_case plan bindings.
-    const planId = input?.planId ?? input?.plan_id;
-    if (typeof planId === 'string' && planId !== '') assertPlanRailFree(planId);
-    return supervisor.launchAgent(input);
-  });
+  ipcMain.handle('agent:launch', (_e, input) => supervisor.launchAgent(input));
   // Git-Native WP-G2.2 — human checkpoint recovery surface (list/diff/preview/
   // restore/revert). Registered synchronously here with a lazy getter so the
   // channels exist before the async engine bootstrap injects the routes.

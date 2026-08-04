@@ -27,8 +27,8 @@ function withReviewerContract(base: string, planId?: string, sectionAnchor?: str
 }
 
 // WP6: when a run carries a planning-surface rail, the deliverable is a native
-// Edit of one section of an EXISTING plan surface (created up front by
-// create_plan), not a fresh markdown file. This block is appended to the
+// Edit of one section of an EXISTING registered plan surface, not a fresh
+// markdown file. This block is appended to the
 // termination contract so the finalizer writes back to the dispatched `sec_`
 // zone; the run's done-detection watches that section for a content change.
 function writebackClause(planPath: string, sectionAnchor?: string): string {

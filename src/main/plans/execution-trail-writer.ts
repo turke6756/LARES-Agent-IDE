@@ -92,12 +92,6 @@ export class TrailMaterializer {
     this.deps = deps;
   }
 
-  /** In-flight guard for the `assertPlanRailFree` 409 predicate. Fail-open (`false`)
-   *  before `configure` so the guards never throw during the startup window. */
-  isMaterializing(planId: string): boolean {
-    return this.inFlight.has(planId);
-  }
-
   /** True while a materialization is owed because a concurrent human/out-of-band
    *  edit was detected at the write boundary and the file was left untouched.
    *  Fail-open (`false`) before `configure`. This is the "trail pending due to

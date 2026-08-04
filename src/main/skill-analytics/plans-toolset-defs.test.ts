@@ -32,18 +32,19 @@ test('provider sources the real plans tool defs', () => {
 
 test('provider also sources the plans-read subset (GT-A WP-A4.5)', () => {
   const defs = makePlansAwareDefsProvider().defsFor('plans-read');
-  assert.ok(Array.isArray(defs) && defs.length === 3, `expected exactly 3 plans-read defs, got ${defs?.length}`);
+  assert.ok(Array.isArray(defs) && defs.length === 4, `expected exactly 4 plans-read defs, got ${defs?.length}`);
   const names = defs!.map((d) => d.name).sort();
-  assert.deepEqual(names, ['list_plan_sections', 'read_plan_projection', 'read_plan_section']);
-  assert.ok(!names.includes('create_plan'), 'plans-read must not include create_plan');
+  assert.deepEqual(names, [
+    'list_plan_sections', 'read_plan_projection', 'read_plan_section', 'record_planning_event',
+  ]);
 });
 
-test('reverse map: first-wins routes shared read tools to plans-read, create_plan to plans (GT-A WP-A4.5)', () => {
+test('reverse map: first-wins routes shared reads to plans-read and focus_plan to plans', () => {
   // DASHBOARD_TOOLSETS lists plans-read BEFORE plans, and the reverse map is
   // name-only first-wins — so the three shared read-tool names resolve to
-  // plans-read while create_plan (only in plans) resolves to plans.
+  // plans-read while focus_plan (only in plans) resolves to plans.
   const resolver = buildMcpToolsetReverseMap(makePlansAwareDefsProvider());
-  assert.equal(resolver.resolve('mcp__agent-dashboard__create_plan'), 'plans', 'create_plan → plans');
+  assert.equal(resolver.resolve('mcp__agent-dashboard__focus_plan'), 'plans', 'focus_plan → plans');
   for (const t of ['list_plan_sections', 'read_plan_section', 'read_plan_projection']) {
     assert.equal(resolver.resolve(`mcp__agent-dashboard__${t}`), 'plans-read', `${t} → plans-read`);
   }

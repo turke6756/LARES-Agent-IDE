@@ -157,8 +157,8 @@ export function makeFileReader(pathType: PathType): FileReader {
 
 // FIRST-WINS ORDERING (GT-A WP-A4.5): where a reverse map is built name-only, the
 // first toolset to claim a tool name wins — so `plans-read` MUST precede `plans`.
-// The three shared read-tool names then resolve to `plans-read` and `create_plan`
-// (only in `plans`) resolves to `plans`.
+// The three shared read-tool names then resolve to `plans-read`; supervisor-only
+// focus verbs resolve to `plans`.
 const TOOLSET_SCRIPT_MAP: Record<string, { script: string; fn: string }> = {
   orchestration: { script: 'mcp-tools-orchestration.js', fn: 'getOrchestrationToolDefinitions' },
   teams: { script: 'mcp-tools-teams.js', fn: 'getTeamsToolDefinitions' },

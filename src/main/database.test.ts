@@ -140,15 +140,8 @@ type DbModule = {
   getActiveRailWriterCount(planId: string): number;
   getTurnSectionChanges(planId: string, sinceIso: string, untilIso: string): Array<{ sectionAnchor: string }>;
   recordPlanSectionChange(input: { planId: string; sectionAnchor: string; blockAnchor?: string | null; contentHash: string; changedAt?: string }): string;
-  insertOrchestration(r: unknown): void;
 };
 let dbm: DbModule;
-
-// GT-C §O.2 — the shared ownership guard (real DB behind it, via the sql.js stand-in).
-type OwnershipModule = {
-  assertPlanRailFree(planId: string, opts?: { exemptRunId?: string; exemptAgentIds?: string[] }): void;
-};
-let ownership: OwnershipModule;
 
 let wsCounter = 0;
 function insertWorkspace(defaultCommand: string): string {
@@ -444,70 +437,6 @@ test('getTurnSectionChanges — omits a sec_exectr change row (attribution safet
   assert.ok(!anchors.includes('sec_exectr'), 'a system trail write is never counted as an agent effect');
 });
 
-// ── GT-C §O.5: assertPlanRailFree (amended — idle → no 409) ───────────────────
-
-function fakeRun(over: Record<string, unknown>): unknown {
-  return {
-    runId: 'run-x', name: 'groupthink', mode: 'serial', status: 'running',
-    workspaceId: 'ws', supervisorId: 'sup', topic: 't', planPath: 'p',
-    leadProvider: 'claude', reviewerProvider: 'codex', turnTimeoutMs: 1000,
-    lastRelayedTs: {}, startedAt: '2026-07-05T00:00:00.000Z', updatedAt: '2026-07-05T00:00:00.000Z',
-    ...over,
-  };
-}
-const is409 = (e: unknown): boolean => (e as { statusCode?: number }).statusCode === 409;
-
-// WP-P0B trusted format-gate: `assertPlanRailFree` guards ONLY `format === 'html'`
-// plans (read from the trusted `plans` row). These reservation tests therefore
-// seed an html plan row so the guard proceeds to its run/agent/materialize checks.
-let planGuardWs: string | null = null;
-function seedPlan(id: string, format: string): void {
-  if (!planGuardWs) planGuardWs = insertWorkspace(DEFAULT_COMMAND);
-  liveDb!.prepare(
-    `INSERT OR IGNORE INTO plans (id, workspace_id, path, slug, format, mtime_ms, size_bytes)
-     VALUES (?, ?, ?, ?, ?, 0, 0)`
-  ).run(id, planGuardWs, `plans/${id}.${format}`, id, format);
-}
-const seedHtmlPlan = (id: string): void => seedPlan(id, 'html');
-
-test('assertPlanRailFree — a free (html) plan does not throw', () => {
-  seedHtmlPlan('plan-free');
-  assert.doesNotThrow(() => ownership.assertPlanRailFree('plan-free'));
-});
-
-test('assertPlanRailFree — a structured plan is bypassed even with a live writer', () => {
-  // The stored row is structured, not html → the guard short-circuits before it
-  // ever consults the (present) live writer.
-  seedPlan('plan-structured', 'structured');
-  const a = makeAgentRow({ planId: 'plan-structured' });
-  dbm.updateAgentStatus(a.id, 'working');
-  assert.doesNotThrow(() => ownership.assertPlanRailFree('plan-structured'),
-    'a structured surface is not subject to the one-writer HTML-writeback guard');
-});
-
-test('assertPlanRailFree — idle plan-bound agent does NOT 409 (amended §4.4)', () => {
-  seedHtmlPlan('plan-idle-guard');
-  const a = makeAgentRow({ planId: 'plan-idle-guard' });
-  dbm.updateAgentStatus(a.id, 'idle');
-  assert.doesNotThrow(() => ownership.assertPlanRailFree('plan-idle-guard'),
-    'an idle kept worker must not block a subsequent dispatch');
-});
-
-test('assertPlanRailFree — an actively-working plan-bound agent 409s; exempt clears it', () => {
-  seedHtmlPlan('plan-busy');
-  const a = makeAgentRow({ planId: 'plan-busy' });
-  dbm.updateAgentStatus(a.id, 'working');
-  assert.throws(() => ownership.assertPlanRailFree('plan-busy'), is409);
-  assert.doesNotThrow(() => ownership.assertPlanRailFree('plan-busy', { exemptAgentIds: [a.id] }));
-});
-
-test('assertPlanRailFree — an active run 409s; exemptRunId clears it', () => {
-  seedHtmlPlan('plan-run');
-  dbm.insertOrchestration(fakeRun({ runId: 'run-active', status: 'running', planId: 'plan-run' }));
-  assert.throws(() => ownership.assertPlanRailFree('plan-run'), is409);
-  assert.doesNotThrow(() => ownership.assertPlanRailFree('plan-run', { exemptRunId: 'run-active' }));
-});
-
 // ── Runner ─────────────────────────────────────────────────────────────────────
 (async () => {
   // Keep initDatabase's mkdir off the real APPDATA profile.
@@ -532,11 +461,6 @@ test('assertPlanRailFree — an active run 409s; exemptRunId clears it', () => {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   dbm = require('./database') as DbModule;
   dbm.initDatabase();
-  // The shared ownership guard reads the SAME cached database module + the
-  // (unconfigured) trailMaterializer singleton → isMaterializing false.
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  ownership = require('./orchestration/plan-ownership') as OwnershipModule;
-
   let passed = 0;
   let failed = 0;
   for (const t of tests) {

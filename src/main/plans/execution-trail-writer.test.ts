@@ -104,9 +104,8 @@ test('gate — non-quiescent at the initial check → no read, no write', async 
   assert.equal(readCalls(), 0, 'gate short-circuits before any read');
 });
 
-test('before configure — materialize / request are inert, isMaterializing false', async () => {
+test('before configure — materialize / request are inert', async () => {
   const m = new TrailMaterializer();
-  assert.equal(m.isMaterializing(PLAN), false);
   await m.materialize(PLAN);       // no throw
   m.request(PLAN);                 // no throw
 });
@@ -198,23 +197,6 @@ test('exemption — a live rail agent blocks the write; blocked=false when exemp
     await m.materialize(PLAN);
     assert.equal(writes.length, 1);
   }
-});
-
-// ── in-flight dispatch guard ──────────────────────────────────────────────────
-
-test('in-flight — isMaterializing is true during the window, false after it settles', async () => {
-  let sawInFlight = false;
-  const m = new TrailMaterializer();
-  const { deps, writes } = makeDeps({
-    reads: [doc('x')],
-    onWrite: async () => { sawInFlight = m.isMaterializing(PLAN); },
-  });
-  m.configure(deps);
-  assert.equal(m.isMaterializing(PLAN), false, 'false before');
-  await m.materialize(PLAN);
-  assert.equal(sawInFlight, true, 'true during the write window');
-  assert.equal(m.isMaterializing(PLAN), false, 'false after it settles');
-  assert.equal(writes.length, 1);
 });
 
 // ── Clobber test C — human save AFTER the final reread (P0 rec #5) ─────────────
