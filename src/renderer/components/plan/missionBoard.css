@@ -71,5 +71,11 @@
 .work-package-card__quiet { color: rgb(107 114 128); font-size: 11px; }
 .work-package-card__trail { margin-top: 7px; border-top: 1px solid rgb(255 255 255 / 7%); padding-top: 5px; color: rgb(156 163 175); font-size: 10px; }
 .work-package-card__warning-slot { min-height: 4px; }
+.work-package-card__timeline { display: grid; gap: 4px; margin: 8px 0 0; border-top: 1px solid rgb(255 255 255 / 7%); padding: 7px 0 0 18px; color: rgb(156 163 175); font-size: 10px; }
+.work-package-card__timeline li { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 8px; }
+.work-package-card__timeline-state { color: rgb(209 213 219); }
+.work-package-card__timeline small { grid-column: 1 / -1; color: rgb(107 114 128); }
 .work-package-card__actions { justify-content: flex-end; margin-top: 7px; }
-.work-package-card__actions button { border: 1px solid rgb(255 255 255 / 8%); border-radius: 4px; background: transparent; padding: 3px 6px; color: rgb(107 114 128); font-size: 9px; }
+.work-package-card__actions button { border: 1px solid rgb(59 130 246 / 45%); border-radius: 4px; background: rgb(59 130 246 / 10%); padding: 3px 6px; color: rgb(191 219 254); font-size: 9px; cursor: pointer; }
+.work-package-card__actions button:disabled { border-color: rgb(255 255 255 / 8%); background: transparent; color: rgb(107 114 128); cursor: default; }
+.mission-board__commit { margin-top: 10px; }

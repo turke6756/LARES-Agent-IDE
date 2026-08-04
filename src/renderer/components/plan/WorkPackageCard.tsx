@@ -3,6 +3,7 @@ import type {
   MissionBoardCard as MissionBoardCardDto,
   MissionBoardDurableTurn,
   MissionBoardLiveActivity,
+  MissionBoardTimelineEvent,
   MissionBoardTouch,
 } from '../../../shared/types';
 
@@ -16,6 +17,10 @@ export interface WorkPackageCardProps {
   onOpenFile: (selection: WorkPackageFileSelection) => void;
   onOpenTurnDiff: (activity: MissionBoardLiveActivity) => void;
   onRestoreTurn: (turn: MissionBoardDurableTurn) => void;
+  timeline?: MissionBoardTimelineEvent[];
+  onMarkDone?: () => void;
+  onCommitPackage?: () => void;
+  actionPending?: 'done' | 'commit' | null;
 }
 
 function activityLabel(activity: MissionBoardLiveActivity): string {
@@ -28,9 +33,17 @@ export default function WorkPackageCard({
   onOpenFile,
   onOpenTurnDiff,
   onRestoreTurn,
+  timeline = [],
+  onMarkDone,
+  onCommitPackage,
+  actionPending = null,
 }: WorkPackageCardProps): React.ReactElement {
   const activeActivity = card.liveActivity.filter((activity) => activity.isActive);
   const isActive = activeActivity.length > 0;
+  const committableFinalization = [...timeline].reverse().find((event) =>
+    event.source === 'finalization'
+    && event.boundaryStatus === 'ready'
+    && event.lifecycleStatus === 'active');
 
   return (
     <article
@@ -104,6 +117,22 @@ export default function WorkPackageCard({
         </div>
       )}
 
+      {timeline.length > 0 && (
+        <ol className="work-package-card__timeline" aria-label="Package timeline">
+          {timeline.map((event) => (
+            <li key={`${event.source}:${event.eventId}`} data-source={event.source}>
+              <span className="work-package-card__timeline-state">
+                {event.source === 'finalization'
+                  ? `Done (revision ${event.packageRevision})`
+                  : `${event.fromState} → ${event.toState}`}
+              </span>
+              <span>{event.actor}</span>
+              {event.source === 'lifecycle' && event.reason && <small>{event.reason}</small>}
+            </li>
+          ))}
+        </ol>
+      )}
+
       <div
         className="work-package-card__warning-slot"
         data-testid={`contention-slot-${card.packageId}`}
@@ -111,11 +140,24 @@ export default function WorkPackageCard({
       />
 
       <footer className="work-package-card__actions">
-        <button type="button" disabled title="Package finalization lands in WP-P6D">
-          Mark done
+        <button
+          type="button"
+          disabled={!onMarkDone || card.state === 'done' || actionPending !== null}
+          onClick={onMarkDone}
+          data-testid={`mark-done-${card.packageId}`}
+        >
+          {actionPending === 'done' ? 'Finalizing…' : 'Mark done'}
         </button>
-        <button type="button" disabled title="Package commit lands in WP-P6D">
-          Commit package
+        <button
+          type="button"
+          disabled={!onCommitPackage || card.state !== 'done' || !committableFinalization || actionPending !== null}
+          onClick={onCommitPackage}
+          data-testid={`commit-package-${card.packageId}`}
+          title={card.state === 'done' && !committableFinalization
+            ? 'No active ready finalization is available'
+            : undefined}
+        >
+          {actionPending === 'commit' ? 'Preparing…' : 'Commit package'}
         </button>
       </footer>
     </article>
