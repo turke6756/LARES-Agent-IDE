@@ -16,6 +16,7 @@ import {
   getWorkspace,
   getAgent,
   listTurnRecords,
+  listActiveBoundaryRefs,
   recordWitnessedActivity,
   type WitnessObserver,
 } from '../database';
@@ -29,7 +30,11 @@ import { TurnCompletionTracker } from '../supervisor/turn-completion-tracker';
 import { WitnessRecorder } from './witness-recorder';
 import { buildDispatchTurnContext, type DispatchContext, type DispatchAgentInfo } from './dispatch-context';
 import { runCheckpointStartupMaintenance } from './reconciler';
-import { runWorkspaceRetention, type WorkspaceRetentionResult } from './retention';
+import {
+  runWorkspaceRetention,
+  type RetentionDeps,
+  type WorkspaceRetentionResult,
+} from './retention';
 import { initWorkspaceGitRepo } from './git-init';
 import {
   pruneWorkspaceCheckpoints,
@@ -77,6 +82,17 @@ export interface CheckpointEngineHandle {
    *  `setHumanCheckpointRoutes`. The Open #4 force gate (refuse while an active
    *  turn witnesses a path) lives in the IPC layer, not here. */
   humanCheckpointRoutes: HumanCheckpointRoutes;
+}
+
+/** Build the exact dependency object used by the production retention call. The
+ * accessor parameter is injectable so the database-to-retention bind is testable
+ * without starting Electron or probing a live repository. */
+export function buildWorkspaceRetentionDeps(
+  deps: Omit<RetentionDeps, 'activeBoundaryRefs'>,
+  readActiveBoundaryRefs: (repositoryKey: string) => readonly string[] | Promise<readonly string[]>
+    = listActiveBoundaryRefs,
+): RetentionDeps {
+  return { ...deps, activeBoundaryRefs: readActiveBoundaryRefs };
 }
 
 /** TurnRecord → the workspace-scoped list DTO. Carries witnessed PATHS only, never
@@ -389,14 +405,14 @@ export async function createCheckpointEngine(): Promise<CheckpointEngineHandle |
         const cap = await resolveCapabilityByWorkspace(ws.id);
         if (!cap || !cap.repoRoot || !cap.commonDirQueueKey) continue; // detect-and-degrade
         results.push(
-          await runWorkspaceRetention({
+          await runWorkspaceRetention(buildWorkspaceRetentionDeps({
             workspaceId: ws.id,
             repoRoot: cap.repoRoot,
             gitExe,
             queue,
             commonDirQueueKey: cap.commonDirQueueKey,
             workspacePrefix: cap.workspacePrefix ?? '',
-          }),
+          })),
         );
       } catch (err) {
         console.error(`[retention] workspace ${ws.id} cycle failed:`, err);

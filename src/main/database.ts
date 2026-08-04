@@ -6271,6 +6271,19 @@ export function getActivePackageFinalization(packageId: string): PackageFinaliza
   return row ? rowToPackageFinalization(row) : null;
 }
 
+/** Active durable boundary refs for one canonical repository identity. */
+export function listActiveBoundaryRefs(repositoryKey: string): string[] {
+  return queryAll(
+    `SELECT DISTINCT boundary_ref FROM package_finalizations
+      WHERE repository_key = ?
+        AND lifecycle_status = 'active'
+        AND boundary_ref IS NOT NULL
+        AND boundary_ref <> ''
+      ORDER BY boundary_ref ASC`,
+    [repositoryKey],
+  ).map((row) => row.boundary_ref as string);
+}
+
 /** Highest allocated revision for a package (0 when none) — WP-3C's `max+1` source. */
 export function maxPackageRevision(packageId: string): number {
   const row = queryOne(

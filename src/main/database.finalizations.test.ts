@@ -108,6 +108,7 @@ type DbModule = {
   getPackageFinalization(id: string): PackageFinalization | null;
   listPackageFinalizations(packageId: string): PackageFinalization[];
   getActivePackageFinalization(packageId: string): PackageFinalization | null;
+  listActiveBoundaryRefs(repositoryKey: string): string[];
   maxPackageRevision(packageId: string): number;
   supersedePackageFinalization(id: string, supersededBy: string): void;
   setPackageFinalizationBoundaryStatus(id: string, status: string): void;
@@ -206,6 +207,32 @@ test('getActivePackageFinalization is null when none active', () => {
     id: 'noact-1', packageId: 'pkg-noact', lifecycleStatus: 'committed', releasedAt: 5,
   }));
   assert.equal(dbm.getActivePackageFinalization('pkg-noact'), null);
+});
+
+test('listActiveBoundaryRefs returns only active non-null refs for the requested repository', () => {
+  const rows: Array<[string, string, PackageFinalization['lifecycleStatus'], string | null]> = [
+    ['bref-active', 'repo-boundary', 'active', 'refs/lares/finalizations/active/1'],
+    ['bref-committed', 'repo-boundary', 'committed', 'refs/lares/finalizations/committed/1'],
+    ['bref-superseded', 'repo-boundary', 'superseded', 'refs/lares/finalizations/superseded/1'],
+    ['bref-abandoned', 'repo-boundary', 'abandoned', 'refs/lares/finalizations/abandoned/1'],
+    ['bref-null', 'repo-boundary', 'active', null],
+    ['bref-other-repo', 'repo-other', 'active', 'refs/lares/finalizations/other/1'],
+  ];
+  for (const [id, repositoryKey, lifecycleStatus, boundaryRef] of rows) {
+    dbm.insertPackageFinalization(planPackage({
+      id,
+      packageId: `pkg-${id}`,
+      planItemId: `wp-${id}`,
+      repositoryKey,
+      lifecycleStatus,
+      boundaryRef,
+    }));
+  }
+  assert.deepEqual(
+    dbm.listActiveBoundaryRefs('repo-boundary'),
+    ['refs/lares/finalizations/active/1'],
+  );
+  assert.deepEqual(dbm.listActiveBoundaryRefs('repo-missing'), []);
 });
 
 test('supersedePackageFinalization flips status and records the successor', () => {

@@ -28,6 +28,8 @@ import {
   resolveFinalizationRef,
 } from './finalization-refs';
 import { accountAndSelectPins } from './pin-accounting';
+import { CheckpointQueue } from './checkpoint-queue';
+import { buildWorkspaceRetentionDeps } from './engine-bootstrap';
 
 interface TestCase { name: string; run(): void | Promise<void>; }
 const tests: TestCase[] = [];
@@ -114,6 +116,35 @@ test('partitionBoundaryRefs never releases a ref that any row still marks active
   ]);
   assert.deepEqual(part.protectedRefs, ['refs/lares/finalizations/S/1']);
   assert.deepEqual(part.releasableRefs, []);
+});
+
+test('production retention deps pass the derived repository key to the active-ref accessor', async () => {
+  const rows = [
+    { repositoryKey: 'repo-a', ...rec('refs/lares/finalizations/A/1', 'active') },
+    { repositoryKey: 'repo-a', ...rec('refs/lares/finalizations/B/1', 'committed') },
+    { repositoryKey: 'repo-a', ...rec('refs/lares/finalizations/C/1', 'superseded') },
+    { repositoryKey: 'repo-a', ...rec('refs/lares/finalizations/D/1', 'abandoned') },
+    { repositoryKey: 'repo-b', ...rec('refs/lares/finalizations/E/1', 'active') },
+  ];
+  const seen: string[] = [];
+  const deps = buildWorkspaceRetentionDeps({
+    workspaceId: 'ws-a',
+    repoRoot: 'C:/repo-a',
+    gitExe: 'git',
+    queue: new CheckpointQueue(),
+    commonDirQueueKey: 'odb-a',
+  }, (repositoryKey) => {
+    seen.push(repositoryKey);
+    return rows
+      .filter((row) => row.repositoryKey === repositoryKey && row.lifecycleStatus === 'active')
+      .map((row) => row.boundaryRef)
+      .filter((ref): ref is string => ref !== null);
+  });
+
+  assert.deepEqual(await deps.activeBoundaryRefs?.('repo-a'), [
+    'refs/lares/finalizations/A/1',
+  ]);
+  assert.deepEqual(seen, ['repo-a']);
 });
 
 // ── reconcileBoundaryRefs (real git) ─────────────────────────────────────────────

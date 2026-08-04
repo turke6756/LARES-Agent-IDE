@@ -120,8 +120,9 @@ export interface RetentionDeps {
   runGit?: RunGitLike;
   runGitBytes?: RunGitBytesLike;
   turnStore?: RetentionTurnStore;
-  /** Stage 3 supplies active finalization refs; absent in Stage 2. */
-  activeBoundaryRefs?: () => readonly string[] | Promise<readonly string[]>;
+  /** Stage 3 supplies active finalization refs for the derived repository identity;
+   *  absent in Stage 2. */
+  activeBoundaryRefs?: (repositoryKey: string) => readonly string[] | Promise<readonly string[]>;
   /** Test seam for dirty inventory. Production uses the normative WP-1B producer. */
   enumerateDirtyEntries?: () => Promise<{ repositoryKey: string; entries: DirtyEntry[] }>;
   /** Test seam for exact WP-2G ledger protection. */
@@ -372,7 +373,7 @@ interface ResolvedConfig {
   runGitBytes: RunGitBytesLike;
   turnStore: RetentionTurnStore;
   workspacePrefix: string;
-  activeBoundaryRefs: () => readonly string[] | Promise<readonly string[]>;
+  activeBoundaryRefs: (repositoryKey: string) => readonly string[] | Promise<readonly string[]>;
   enumerateDirtyEntries?: RetentionDeps['enumerateDirtyEntries'];
   readLocallyCommittedEntryIds?: RetentionDeps['readLocallyCommittedEntryIds'];
   now: () => number;
@@ -529,7 +530,7 @@ async function prepareRetentionPins(
     });
     if (candidates.length === 0) return { retainedEdgeKeys: new Set(), warning: null, repositoryKey: inventory.repositoryKey, retainedEdges: [], now };
 
-    const activeBoundaryRefs = await cfg.activeBoundaryRefs();
+    const activeBoundaryRefs = await cfg.activeBoundaryRefs(inventory.repositoryKey);
     const selection = await accountAndSelectPins({
       repoRoot: cfg.repoRoot,
       candidates,
