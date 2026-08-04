@@ -615,6 +615,20 @@ const TESTS = [
   'dist/main/main/plans/plan-intent-runs.test.js',
   // WP-P2L-proj: derived plan-intent confidence projection + IPC.
   'dist/main/main/plans/plan-intent-proj.test.js',
+  // Planning-surface Stage P4 (gate P4Z) — folder-native tabbed document home +
+  // intent lifecycle + overviews + comments.
+  // WP-P4A: folder-native tab-model projection (ARC→overview; plan.json/.gitkeep
+  // suppressed; membership check; guarded plan_work_packages populated flag).
+  'dist/main/main/plans/plan-documents.test.js',
+  // WP-P4C-backend: per-tab overview accessors + IPC, keyed to PlanTabKey.
+  'dist/main/main/plans/plan-overview.test.js',
+  // WP-P4D-create: plan-comment create + routing (durable lares-plan-doc:v1
+  // logical-key identity; plan-aware send adapter).
+  'dist/main/main/plans/plan-comment-create.test.js',
+  // WP-P4D-reply: companion replies table + answer_plan_comment service.
+  'dist/main/main/plans/plan-comment-reply.test.js',
+  // WP-P4D-proj: dual-source plan-comment projection (logical-key resolution).
+  'dist/main/main/plans/plan-comment-list.test.js',
   'dist/main/main/browser/credentialed-open-diagnostic.test.js',
   'dist/main/main/browser/browser-signin-workspace-exact.test.js',
   'dist/main/main/browser/browser-signin-expiry.test.js',
