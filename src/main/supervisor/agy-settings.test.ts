@@ -57,15 +57,25 @@ test('trust merge refuses malformed JSON and malformed trustedWorkspaces without
 });
 
 test('deny seed is regex-opted-in, anchored, verb-scoped, and contains no bare prefix protection', () => {
-  assert.equal(AGY_GIT_DISCARD_DENY_RULES.length, 7);
+  assert.equal(AGY_GIT_DISCARD_DENY_RULES.length, 6);
   for (const rule of AGY_GIT_DISCARD_DENY_RULES) {
     assert.match(rule, /^command\(regex:\^/);
     assert.match(rule, /\$\)$/);
     assert.ok(!/^command\(git/.test(rule), `bare exact matcher shipped: ${rule}`);
   }
   const joined = AGY_GIT_DISCARD_DENY_RULES.join('\n');
-  for (const fragment of ['reset', 'hard', 'merge', 'keep', 'checkout', 'restore', 'clean', 'stash', 'drop', 'clear', 'pop']) {
+  for (const fragment of [
+    'reset', 'hard', 'merge', 'keep', 'checkout', 'restore', 'clean', 'stash',
+    'push', 'save', 'apply', 'drop', 'clear', 'pop', 'branch', 'store', 'create',
+  ]) {
     assert.ok(joined.includes(fragment), `missing protected form: ${fragment}`);
+  }
+});
+
+test('deny seed contains no lookahead or lookbehind unsupported by agy', () => {
+  for (const rule of AGY_GIT_DISCARD_DENY_RULES) {
+    assert.ok(!rule.includes('(?!'), `negative lookahead shipped: ${rule}`);
+    assert.ok(!rule.includes('(?<'), `lookbehind shipped: ${rule}`);
   }
 });
 
@@ -88,12 +98,25 @@ test('deny regex families cover destructive forms while leaving read-only git fo
     `${git} stash push -m snapshot`,
     `${git} stash save snapshot`,
     `${git} stash apply stash@{0}`,
+    `${git} stash branch rescue-branch`,
+    `${git} stash store deadbeef`,
+    `${git} stash create`,
+    `${git} stash -q`,
+    `${git} stash --quiet`,
+    `${git} stash -q push -m snapshot`,
     `FOO=bar ${git} stash push --include-untracked`,
     'FOO=bar BAR=baz git.exe stash save snapshot',
     `${git} -C C:\\repo stash apply stash@{0}`,
+    `${git} --git-dir C:\\repo\\.git stash pop`,
+    `${git} --git-dir=C:\\repo\\.git stash drop stash@{0}`,
+    `${git} -c core.autocrlf=false stash clear`,
+    `${git} --work-tree C:\\repo stash create`,
+    `${git} --namespace=probe stash store deadbeef`,
+    `${git} --exec-path C:\\Git\\cmd stash push`,
     `${git} --git-dir C:\\repo\\.git stash`,
-    `${git} stash branch rescue-branch`,
-    `${git} stash create`,
+    `${git} status; ${git} stash push`,
+    `${git} status && ${git} stash save snapshot`,
+    `${git} status || FOO=bar ${git} -C C:\\repo stash apply stash@{0}`,
   ];
   for (const command of denied) {
     assert.ok(regexes.some(regex => regex.test(command)), `discard form escaped deny set: ${command}`);
@@ -114,7 +137,7 @@ test('deny regex families cover destructive forms while leaving read-only git fo
   }
 });
 
-test('permissions merge is ADD-only and never mutates allow, ask, or foreign deny entries', () => {
+test('permissions merge adds the reviewed set and never mutates allow, ask, or foreign deny entries', () => {
   const allow = [{ command: 'human-shape-survives' }, 'command(echo)'];
   const ask = ['command(curl)'];
   const existing = JSON.stringify({
@@ -132,17 +155,21 @@ test('permissions merge is ADD-only and never mutates allow, ask, or foreign den
   assert.equal(mergeAgyPermissions(result.content).action, 'unchanged');
 });
 
-test('permissions merge upgrades the legacy deny seed additively and is then idempotent', () => {
-  const legacyRules = AGY_GIT_DISCARD_DENY_RULES.slice(0, 5);
-  const existing = JSON.stringify({ permissions: { deny: [...legacyRules, 'human-deny'] } });
+test('permissions merge removes the broken lookahead, preserves the retired stash rule, and is idempotent', () => {
+  const brokenLookahead = String.raw`command(regex:^((env\s+)?[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*git(\.exe)?(\s+(-C|-c|--git-dir|--work-tree|--namespace|--exec-path)\s+\S+|\s+--(git-dir|work-tree|namespace|exec-path)=\S+)*\s+stash\s+(?!(?:-\S+\s+)*(?:list|show)(?:\s|$)).+$)`;
+  const retiredRule = String.raw`command(regex:^((env\s+)?[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*git(\.exe)?(\s+(-C|-c|--git-dir|--work-tree|--namespace|--exec-path)\s+\S+|\s+--(git-dir|work-tree|namespace|exec-path)=\S+)*\s+stash\s+(drop|clear|pop)(\s+.*)?$)`;
+  const existing = JSON.stringify({
+    permissions: { deny: [brokenLookahead, retiredRule, 'human-deny'] },
+  });
   const result = mergeAgyPermissions(existing);
   assert.equal(result.action, 'write');
   const parsed = JSON.parse(result.content);
   assert.deepEqual(parsed.permissions.deny, [
-    ...legacyRules,
+    retiredRule,
     'human-deny',
-    ...AGY_GIT_DISCARD_DENY_RULES.slice(5),
+    ...AGY_GIT_DISCARD_DENY_RULES,
   ]);
+  assert.ok(!parsed.permissions.deny.includes(brokenLookahead));
   assert.equal(mergeAgyPermissions(result.content).action, 'unchanged');
 });
 

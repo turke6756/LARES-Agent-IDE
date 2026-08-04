@@ -9,14 +9,22 @@ import path from 'node:path';
 const AGY_GIT_COMMAND_PREFIX =
   String.raw`^((env\s+)?[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*git(\.exe)?(\s+(-C|-c|--git-dir|--work-tree|--namespace|--exec-path)\s+\S+|\s+--(git-dir|work-tree|namespace|exec-path)=\S+)*\s+`;
 
+// Removed during merge because agy's native matcher does not support the
+// negative lookahead and therefore fails open on the commands it was meant to deny.
+const AGY_BROKEN_STASH_LOOKAHEAD_RULE =
+  `command(regex:${AGY_GIT_COMMAND_PREFIX}stash\\s+(?!(?:-\\S+\\s+)*(?:list|show)(?:\\s|$)).+$)`;
+
+// agy matches the complete shell string. Keep the optional chain prefix here
+// so a destructive stash command cannot escape by following another command.
+const AGY_STASH_MUTATION_DENY_RULE = String.raw`command(regex:^(?:.*(?:;|&&|\|\|)\s*)?((env\s+)?[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*git(\.exe)?(\s+(-C|-c|--git-dir|--work-tree|--namespace|--exec-path)\s+\S+|\s+--(git-dir|work-tree|namespace|exec-path)=\S+)*\s+stash\s+((?:-\S+\s+)*(?:push|save|apply|drop|clear|pop|branch|store|create)(?:\s+.*)?|(?:-\S+\s*)+)$)`;
+
 export const AGY_GIT_DISCARD_DENY_RULES = [
   `command(regex:${AGY_GIT_COMMAND_PREFIX}reset\\s+.*--(hard|merge|keep)(\\s+.*)?$)`,
   `command(regex:${AGY_GIT_COMMAND_PREFIX}checkout(\\s+.*)?$)`,
   `command(regex:${AGY_GIT_COMMAND_PREFIX}restore(\\s+.*)?$)`,
   `command(regex:${AGY_GIT_COMMAND_PREFIX}clean(\\s+.*)?$)`,
-  `command(regex:${AGY_GIT_COMMAND_PREFIX}stash\\s+(drop|clear|pop)(\\s+.*)?$)`,
   `command(regex:${AGY_GIT_COMMAND_PREFIX}stash$)`,
-  `command(regex:${AGY_GIT_COMMAND_PREFIX}stash\\s+(?!(?:-\\S+\\s+)*(?:list|show)(?:\\s|$)).+$)`,
+  AGY_STASH_MUTATION_DENY_RULE,
 ] as const;
 
 const AGY_GIT_DISCARD_DENY_RULE_SET = new Set<string>(AGY_GIT_DISCARD_DENY_RULES);
@@ -86,7 +94,8 @@ export function mergeAgyTrust(existing: string | null, keys: string[]): AgySetti
   return { action: 'write', content: `${JSON.stringify(parsed.root, null, 2)}\n` };
 }
 
-/** Add only the fixed, reviewed git-discard deny set. The optional argument is
+/** Add only the fixed, reviewed git-discard deny set and remove the known-broken
+ * stash lookahead rule. The optional argument is
  * a testable safety seam: any unreviewed/broad pattern is refused wholesale.
  * permissions.allow and permissions.ask are never assigned or normalized. */
 export function mergeAgyPermissions(
@@ -110,9 +119,10 @@ export function mergeAgyPermissions(
   if (currentDeny !== undefined && (!Array.isArray(currentDeny) || currentDeny.some(v => typeof v !== 'string'))) {
     return { action: 'invalid', reason: 'permissions.deny must be an array of strings' };
   }
-  const deny = (currentDeny ?? []) as string[];
+  const originalDeny = (currentDeny ?? []) as string[];
+  const deny = originalDeny.filter(rule => rule !== AGY_BROKEN_STASH_LOOKAHEAD_RULE);
   const present = new Set(deny);
-  let changed = false;
+  let changed = deny.length !== originalDeny.length;
   for (const rule of rules) {
     if (present.has(rule)) continue;
     deny.push(rule);
