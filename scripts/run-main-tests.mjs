@@ -611,6 +611,10 @@ const TESTS = [
   'dist/main/main/plans/promotion-service-wiring.test.js',
   // WP-P2L-ingest: transactional plan-intent ledger scan.
   'dist/main/main/plans/plan-intent-ledger.test.js',
+  // WP-P2L-runs: orchestration run links witness the active planning intent.
+  'dist/main/main/plans/plan-intent-runs.test.js',
+  // WP-P2L-proj: derived plan-intent confidence projection + IPC.
+  'dist/main/main/plans/plan-intent-proj.test.js',
   'dist/main/main/browser/credentialed-open-diagnostic.test.js',
   'dist/main/main/browser/browser-signin-workspace-exact.test.js',
   'dist/main/main/browser/browser-signin-expiry.test.js',
