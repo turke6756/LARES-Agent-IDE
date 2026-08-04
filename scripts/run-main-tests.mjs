@@ -273,6 +273,12 @@ const TESTS = [
   // the repository-exclusive synchronous compose latch consumed by WP-4D.
   'dist/main/main/commit-candidates/compose-lock-registry.test.js',
   'dist/main/main/commit-candidates/candidate-service.mint.test.js',
+  // Save-card Stage 4 SC-WP-4D — CommitCoordinator core: serialization ordering
+  // (compose-lock-before-CAS, double-click CAS, contract-version/invalid-message
+  // rejection), live reassembly + final byte revalidation, and the §9.4 commit-
+  // attribution/outcome classification (committed / integrity-mismatch / uncertain /
+  // drift / index-integrity) — fake-seam + real-git `git commit --only`.
+  'dist/main/main/git-checkpoints/commit-coordinator.test.js',
   'dist/main/main/supervisor/send-queue-checkpoint.test.js',
   'dist/main/main/supervisor/initial-user-prompt.test.js',
   'dist/main/main/supervisor/hook-spool-tailer.test.js',
