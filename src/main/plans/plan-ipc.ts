@@ -28,8 +28,15 @@ import type {
   MissionBoardPackageTimeline,
   BlameToIntentRequest,
   BlameToIntentResult,
+  PlanReviewProjection,
+  PlanReviewProjectionRequest,
+  SaveCardBundle,
 } from '../../shared/types';
-import { hasSupervisorPrivilege, isPlanTabKey } from '../../shared/types';
+import {
+  hasSupervisorPrivilege,
+  isPlanTabKey,
+  PLAN_REVIEW_PROJECTION_CHANNEL,
+} from '../../shared/types';
 import {
   getPlans,
   getPlanWorkPackage as dbGetPlanWorkPackage,
@@ -39,6 +46,12 @@ import {
   getPromotionRequestById as dbGetPromotionRequestById,
   getPlanTabOverview as dbGetPlanTabOverview,
   setPlanTabOverview as dbSetPlanTabOverview,
+  getActivePlanExecutionRun,
+  getWorkspace,
+  listPlanWorkPackagePaths,
+  listPlanWorkPackagesOrdered,
+  listRecoveryOperations,
+  listTurnRecords,
 } from '../database';
 import type { PlanWorkPackage, StructuredPlanRow, PromotionRequestRow } from '../database';
 import type { PromoteResult, ProposalRef } from './promote-proposal';
@@ -77,6 +90,13 @@ import { registerPlanImplementIpc } from './plan-implement';
 import { workspaceStateDir } from '../workspace-state-dir';
 import { listMissionBoardCards, listMissionBoardTimeline } from './mission-board';
 import { queryBlameToIntent } from './blame-to-intent';
+import { projectPlanReview, type PlanReviewProjectionInput } from './plan-review-projection';
+import { projectMissionBoardEvidence } from './mission-board-evidence';
+import { projectDurableStampedTrail, projectLiveStampedActivity } from './stamped-evidence-projection';
+import { probeWorkspaceGit } from '../git/git-runtime';
+import { computeBundleCaptureHealth } from '../commit-candidates/capture-health';
+import { projectWorkBundles } from '../commit-candidates/work-bundle';
+import { runGit } from '../git-checkpoints/git-command';
 
 const MAX_PROMOTED_PLAN_JSON_BYTES = 256_000;
 const ARCHIVED_PLAN_STATUSES = new Set(['archived', 'superseded', 'cancelled', 'canceled']);
@@ -518,6 +538,109 @@ export function registerPlanCandidatePreviewIpc(
       return buildPlanCandidatePreview(request, context);
     },
   );
+}
+
+async function resolvePlanReviewProjectionInput(
+  request: PlanReviewProjectionRequest,
+  routes: PlanCandidatePreviewRoutes,
+): Promise<PlanReviewProjectionInput> {
+  const plan = dbGetPlan(request.planId);
+  if (!plan || plan.workspaceId !== request.workspaceId) {
+    throw new Error('the requested plan does not belong to this workspace');
+  }
+  const executionRun = getActivePlanExecutionRun(request.planId);
+  if (!executionRun) throw new Error('the plan has no active execution baseline');
+
+  const workspace = getWorkspace(request.workspaceId);
+  if (!workspace) throw new Error('workspace not found');
+  const capability = await probeWorkspaceGit(workspace.path);
+  if (!capability.repoRoot) throw new Error('workspace has no repository root');
+
+  const previewRequest: PlanCandidatePreviewRequest = {
+    workspaceId: request.workspaceId,
+    planId: request.planId,
+    selectedComponentIds: [],
+    selectedUnattributedEntryIds: [],
+    finalizationIds: [],
+  };
+  const context = await routes.resolvePreviewContext(previewRequest);
+  const scObject = buildPlanCandidatePreview(previewRequest, context).candidate;
+
+  const packages = listPlanWorkPackagesOrdered(request.planId)
+    .filter((pkg) => pkg.workspaceId === request.workspaceId);
+  const plannedPaths = packages.flatMap((pkg) => listPlanWorkPackagePaths(pkg.id))
+    .filter((entry) => entry.workspaceId === request.workspaceId);
+  const planTurns = listTurnRecords(request.workspaceId, { limit: 200 });
+  const evidence = projectMissionBoardEvidence({
+    workspaceId: request.workspaceId,
+    planId: request.planId,
+    packages,
+    plannedPaths,
+    liveActivity: projectLiveStampedActivity(planTurns),
+    durableTrail: projectDurableStampedTrail(planTurns, listRecoveryOperations(request.workspaceId)),
+  });
+
+  const repositoryTurns = context.repository.workspaces.flatMap((entry) =>
+    listTurnRecords(entry.workspaceId, { limit: 200 }));
+  const turnsById = new Map(repositoryTurns.map((turn) => [turn.id, turn]));
+  const entriesById = new Map(context.inventory.entries.map((entry) => [entry.entryId, entry]));
+  const captureEntries = await Promise.all(context.components.map(async (component) => {
+    const contributingTurnIds = new Set(
+      component.associations.flatMap((association) => association.contributingTurnIds),
+    );
+    const turns = [...contributingTurnIds]
+      .map((turnId) => turnsById.get(turnId))
+      .filter((turn): turn is NonNullable<typeof turn> => turn !== undefined);
+    const dirtyEntries = component.dirtyEntryIds
+      .map((entryId) => entriesById.get(entryId))
+      .filter((entry): entry is NonNullable<typeof entry> => entry !== undefined);
+    return [component.componentId, await computeBundleCaptureHealth({
+      repoRoot: capability.repoRoot!, turns, dirtyEntries, runGit,
+    })] as const;
+  }));
+  const unattributedEntries = context.inventory.unattributedEntryIds
+    .map((entryId) => entriesById.get(entryId))
+    .filter((entry): entry is NonNullable<typeof entry> => entry !== undefined);
+  const unattributedCaptureHealth = await computeBundleCaptureHealth({
+    repoRoot: capability.repoRoot, turns: [], dirtyEntries: unattributedEntries, runGit,
+  });
+  const scBundles = projectWorkBundles({
+    inventory: context.inventory,
+    components: context.components,
+    captureHealthByComponentId: Object.fromEntries(captureEntries),
+    unattributedCaptureHealth,
+    protectionByEntryId: context.protectionByEntryId ?? {},
+  }) as SaveCardBundle[];
+  const workspacePrefix = context.repository.workspaces
+    .find((entry) => entry.workspaceId === request.workspaceId)?.workspacePrefix;
+  if (workspacePrefix === undefined) throw new Error('workspace is outside the candidate repository');
+
+  return {
+    workspaceId: request.workspaceId,
+    planId: request.planId,
+    repoRoot: capability.repoRoot,
+    workspacePrefix,
+    executionRun,
+    evidence,
+    scObject,
+    scBundles,
+  };
+}
+
+export function registerPlanReviewProjectionIpc(
+  ipc: PlanIpcLike,
+  getRoutes: () => PlanCandidatePreviewRoutes | null,
+): void {
+  ipc.handle(PLAN_REVIEW_PROJECTION_CHANNEL, async (_event, raw: unknown): Promise<PlanReviewProjection> => {
+    const request = raw as PlanReviewProjectionRequest;
+    if (!request || typeof request.workspaceId !== 'string' || !request.workspaceId
+        || typeof request.planId !== 'string' || !request.planId) {
+      throw new Error('a non-empty workspaceId and planId are required');
+    }
+    const routes = getRoutes();
+    if (!routes) throw new Error('plan review engine unavailable');
+    return projectPlanReview(await resolvePlanReviewProjectionInput(request, routes));
+  });
 }
 
 // ── WP-P3C′ — proposal-promotion IPC (`proposal:promote`, `proposal:promotionStatus`) ──
@@ -1013,6 +1136,7 @@ export function registerPlanIpc(manager: PlanPaneManager): void {
   // `providePlanPreviewRoutes` once the candidate engine bootstraps; until then the
   // channel rejects honestly (the plan lens simply shows no preview).
   registerPlanCandidatePreviewIpc(ipcMain, () => planPreviewRoutes);
+  registerPlanReviewProjectionIpc(ipcMain, () => planPreviewRoutes);
 
   // ── WP-P3C′: proposal promotion + concrete status poll ──────────────────────
   // The Promote dialog's supervisor-picker confirm (`proposal:promote`) and the

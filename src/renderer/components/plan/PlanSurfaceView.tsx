@@ -15,6 +15,8 @@ import CommitOutcome from '../save/CommitOutcome';
 import type { CommitCoordinatorConsumeResponse } from '../../../shared/types';
 import { useDashboardStore } from '../../stores/dashboard-store';
 import MissionBoard from './MissionBoard';
+import PlanReviewView from './PlanReviewView';
+import type { PlanReviewProjection } from '../../../shared/types';
 
 /**
  * WP5 render-surface overlay. The plan document itself renders in a sandboxed
@@ -59,11 +61,40 @@ function PlanSurfaceView({
   // GT-C §3.3 — the surface owns the view-mode. 'section' is the only first-ship
   // structure (keeps PlanSectionNav targets); 'story' is an explicit flat,
   // oldest-first run narrative with the section nav hidden (no dangling targets).
-  const [viewMode, setViewMode] = useState<'section' | 'story' | 'packages'>('section');
+  const [viewMode, setViewMode] = useState<'review' | 'section' | 'story' | 'packages'>('section');
+  const [reviewProjection, setReviewProjection] = useState<PlanReviewProjection | null>(null);
+  const [reviewError, setReviewError] = useState<string | null>(null);
   const activePlanId = useDashboardStore((state) => {
     const activeTab = state.openTabs.find((tab) => tab.id === state.activeTabId);
     return activeTab?.kind === 'plan' ? activeTab.planId : null;
   });
+
+  useEffect(() => {
+    if (!activePlanId || !workspaceId) {
+      setReviewProjection(null);
+      setReviewError(null);
+      return;
+    }
+    let active = true;
+    const getReviewProjection = window.api.plans.getReviewProjection;
+    // Older renderer-test fakes may not yet expose this additive read channel.
+    if (typeof getReviewProjection !== 'function') return;
+    void getReviewProjection({ workspaceId, planId: activePlanId })
+      .then((next) => {
+        if (!active) return;
+        setReviewProjection(next);
+        setReviewError(null);
+        setViewMode('review');
+      })
+      .catch((error: unknown) => {
+        if (!active) return;
+        setReviewProjection(null);
+        setReviewError(error instanceof Error ? error.message : 'Plan review is unavailable.');
+      });
+    return () => {
+      active = false;
+    };
+  }, [activePlanId, workspaceId]);
 
   // default the active pill to the first section once groups arrive
   useEffect(() => {
@@ -163,6 +194,16 @@ function PlanSurfaceView({
         <button
           type="button"
           role="tab"
+          className={`plan-surface__viewtab${viewMode === 'review' ? ' plan-surface__viewtab--active' : ''}`}
+          aria-selected={viewMode === 'review'}
+          onClick={() => setViewMode('review')}
+          data-testid="plan-view-review"
+        >
+          Review
+        </button>
+        <button
+          type="button"
+          role="tab"
           className={`plan-surface__viewtab${viewMode === 'section' ? ' plan-surface__viewtab--active' : ''}`}
           aria-selected={viewMode === 'section'}
           onClick={() => setViewMode('section')}
@@ -196,7 +237,15 @@ function PlanSurfaceView({
       {viewMode === 'section' && (
         <PlanSectionNav groups={groups} activeAnchor={activeAnchor} onJump={jump} />
       )}
-      {viewMode === 'packages' ? (
+      {viewMode === 'review' ? (
+        reviewProjection ? (
+          <PlanReviewView projection={reviewProjection} />
+        ) : (
+          <div className="mission-board__empty" data-testid="plan-review-unavailable">
+            {reviewError ?? 'Loading plan review…'}
+          </div>
+        )
+      ) : viewMode === 'packages' ? (
         activePlanId ? (
           <MissionBoard planId={activePlanId} paneVisible />
         ) : (

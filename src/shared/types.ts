@@ -2342,6 +2342,13 @@ export interface PlanReviewProjection {
   evidenceSemantics: 'activity-only-never-completion';
 }
 
+export const PLAN_REVIEW_PROJECTION_CHANNEL = 'plan:reviewProjection' as const;
+
+export interface PlanReviewProjectionRequest {
+  workspaceId: string;
+  planId: string;
+}
+
 /** IPC channel names for the renderer checkpoint surface — one source of truth for
  *  preload, the main registrar, and the contract test. */
 export const CHECKPOINT_CHANNELS = {
@@ -3041,6 +3048,11 @@ export interface IpcApi {
      *  member verdicts plus the D-1-filtered whole-component selection for the shared
      *  `CandidatePreview` component. Rejects until the engine route is injected. */
     previewCandidate: (req: PlanCandidatePreviewRequest) => Promise<PlanCandidatePreviewResponse>;
+    /** WP-P7A-ui — baseline-to-current review evidence. Read-only; activity and
+     * diff evidence never imply package or plan completion. */
+    getReviewProjection: (
+      req: PlanReviewProjectionRequest,
+    ) => Promise<PlanReviewProjection>;
     /** WP-P3C′ — promote a proposal into a plan (supervisor picker, §P3-GAP: NO
      *  document selection). Returns promptly with the discriminated
      *  `PromoteProposalResult`; NEVER blocks on the folder watcher. Rejects

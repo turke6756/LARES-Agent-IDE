@@ -1,6 +1,6 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron';
 import type { IpcApi, DetachRequest, DetachedClosedPayload, ViewDetachRequest, ViewDetachedClosedPayload, FlushRequestPayload, FlushReplyPayload } from '../shared/types';
-import { TAB_CHANNELS, VIEW_CHANNELS, CHECKPOINT_CHANNELS, SAVECARD_CHANNELS, SAVECARD_PREVIEW_CHANNEL, SAVECARD_FINALIZE_CHANNEL, SAVECARD_ATTENTION_CHANNEL, SAVECARD_ATTENTION_CHANGED_CHANNEL, PLAN_PREVIEW_CHANNEL, COMMIT_COORDINATOR_CHANNEL } from '../shared/types';
+import { TAB_CHANNELS, VIEW_CHANNELS, CHECKPOINT_CHANNELS, SAVECARD_CHANNELS, SAVECARD_PREVIEW_CHANNEL, SAVECARD_FINALIZE_CHANNEL, SAVECARD_ATTENTION_CHANNEL, SAVECARD_ATTENTION_CHANGED_CHANNEL, PLAN_PREVIEW_CHANNEL, PLAN_REVIEW_PROJECTION_CHANNEL, COMMIT_COORDINATOR_CHANNEL } from '../shared/types';
 import { BROWSER_CHANNELS } from '../shared/browser';
 import type {
   AccessRequestDecision,
@@ -243,6 +243,7 @@ const api: IpcApi = {
     paneSetVisible: (visible) => ipcRenderer.invoke('plan-pane:setVisible', visible),
     // SC-WP-3I — read-only plan-lens candidate preview (mirrors saveCard.preview).
     previewCandidate: (req) => ipcRenderer.invoke(PLAN_PREVIEW_CHANNEL, req),
+    getReviewProjection: (req) => ipcRenderer.invoke(PLAN_REVIEW_PROJECTION_CHANNEL, req),
     // WP-P3C′ — proposal promotion (supervisor picker; §P3-GAP: no doc selection)
     // + its concrete status poll. `promote` returns promptly (never blocks on the
     // watcher); `promotionStatus` reads the durable promotion_requests/plans rows.
