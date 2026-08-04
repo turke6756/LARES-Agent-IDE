@@ -196,6 +196,15 @@
   align-items: center;
   justify-content: center;
 }
+.sc-check-input {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  flex: none;
+  accent-color: var(--color-accent-green);
+  cursor: pointer;
+}
+.sc-check-input:disabled { cursor: wait; opacity: .7; }
 .sc-slot h2 {
   font-size: 13.5px;
   margin: 0;
@@ -320,6 +329,24 @@
   align-items: center;
   flex-wrap: wrap;
 }
+
+.sc-save-launcher > .ui-btn { margin: 10px 8px 0 0; }
+.sc-save-note { margin-top: 8px; color: var(--color-fg-secondary); font-size: 11.5px; }
+.sc-save-refusal {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--color-accent-yellow) 50%, var(--color-surface-3));
+  border-left: 3px solid var(--color-accent-yellow);
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--color-accent-yellow) 8%, var(--color-surface-1));
+  color: var(--color-fg-primary);
+}
+.sc-save-diff { margin-top: 8px; }
+.sc-save-diff strong { color: var(--color-accent-yellow); }
+.sc-save-diff ul { margin: 4px 0 0; padding-left: 20px; }
+.sc-save-diff li { font-family: ui-monospace, "Cascadia Code", "Consolas", Menlo, monospace; }
+.sc-save-diff p { margin: 4px 0 0; }
+.sc-repin { margin-top: 8px; }
 
 /* SC-WP-4F — lens-neutral post-attempt outcomes. The saved state is the one
  * celebratory beat; every incident/refusal remains factual and low-motion. */

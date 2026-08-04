@@ -17,8 +17,8 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
-import type { SaveCardBundle } from '../../../shared/types';
-import type { DirtyEntry, SaveCardQuotaWeakening } from '../../../shared/commit-candidates';
+import type { SaveCardBundle, SaveCardPreviewResponse } from '../../../shared/types';
+import type { CommitCandidate, DirtyEntry, SaveCardQuotaWeakening } from '../../../shared/commit-candidates';
 import SaveCard from './SaveCard';
 import { useSaveCardStore } from '../../stores/save-card-store';
 
@@ -156,6 +156,9 @@ const mixedBundle: WorkBundleDto = {
 let container: HTMLDivElement;
 let root: Root;
 let getInventory: ReturnType<typeof vi.fn>;
+let markDone: ReturnType<typeof vi.fn>;
+let preview: ReturnType<typeof vi.fn>;
+let commit: ReturnType<typeof vi.fn>;
 
 async function render() {
   await act(async () => {
@@ -169,7 +172,13 @@ beforeEach(() => {
   useSaveCardStore.getState().clearInventoryCache();
   storeState.selectedWorkspaceId = 'ws-1';
   getInventory = vi.fn();
-  (window as unknown as { api: unknown }).api = { saveCard: { getInventory } };
+  markDone = vi.fn();
+  preview = vi.fn();
+  commit = vi.fn();
+  (window as unknown as { api: unknown }).api = {
+    saveCard: { getInventory, markDone, preview },
+    commitCoordinator: { commit },
+  };
   container = document.createElement('div');
   document.body.appendChild(container);
   root = createRoot(container);
@@ -388,6 +397,155 @@ describe('SC-WP-2L quota-weakening banner', () => {
     getInventory.mockResolvedValue(inv([loudBundle], { ...weakening, releasedEdges: [] }));
     await render();
     expect(container.querySelector('[data-testid="save-card-quota-weakening"]')).toBeFalsy();
+  });
+});
+
+function readyMarkDone() {
+  return {
+    finalizationId: 'fin-1', packageId: 'b-loud', finalizationKind: 'fleet-adhoc' as const,
+    outcome: 'created' as const, boundaryRef: 'refs/lares/finalizations/fin-1',
+    boundaryStatus: 'ready' as const, packageRevision: 1,
+  };
+}
+
+function readyCandidatePreview(): SaveCardPreviewResponse {
+  const candidate: CommitCandidate = {
+    candidateId: 'candidate-1', contractVersion: 1,
+    repository: {
+      repositoryKey: 'repo-1', objectDatabaseKey: 'odb-1', gitObjectFormat: 'sha1',
+      bareRepo: false, workspaces: [{ workspaceId: 'ws-1', workspacePrefix: '' }],
+    },
+    componentIds: ['c1'], selectedUnattributedEntryIds: [],
+    members: [{
+      entryId: 'e1',
+      path: { pathBytesBase64: 'c3JjL21haW4vbWVtb3J5L3JlY2FsbC50cw==', displayPath: 'src/main/memory/recall.ts', utf8Clean: true },
+      expectedWorktreeState: 'present', rawWorktreeBlobOid: 'raw-1', expectedCommitBlobOid: 'blob-1',
+      expectedCommitMode: '100644', checkpointMode: '100644', coveringFinalizationIds: ['fin-1'],
+      packageVerification: 'verified-match', protection: 'checkpoint-protected',
+    }],
+    finalizations: [{ finalizationId: 'fin-1', packageId: 'b-loud', packageRevision: 1, boundaryStatus: 'ready' }],
+    eligibility: { eligible: true },
+    token: { tokenId: 'token-1', candidateId: 'candidate-1', contractVersion: 1, issuedAt: 1, expiresAt: 2 },
+  };
+  return {
+    candidate, isCandidate: true, laresTrailers: ['Lares-Turns: 2'],
+    defaultMessageBody: 'Save Memory Architecture', requiresOverlapAck: false,
+    unacknowledgedUnattributedEntryIds: [],
+  };
+}
+
+async function gestureClick(element: Element) {
+  await act(async () => {
+    (element as HTMLElement).click();
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+}
+
+describe('SaveCard decisive save gesture', () => {
+  beforeEach(() => {
+    getInventory.mockResolvedValue(inv([loudBundle]));
+    markDone.mockResolvedValue(readyMarkDone());
+    preview.mockResolvedValue(readyCandidatePreview());
+    commit.mockResolvedValue({
+      kind: 'saved',
+      outcome: { status: 'committed', commitOid: 'saved-oid', attemptId: 'attempt-1', indexIntegrity: 'verified' },
+      finalizations: [],
+    });
+  });
+
+  it('round-trips the package checkbox through markDone and leaves the ready pin checked', async () => {
+    await render();
+    const pin = container.querySelector('[data-testid="save-bundle-pin"]') as HTMLInputElement;
+    expect(pin.checked).toBe(false);
+    await gestureClick(pin);
+    expect(markDone).toHaveBeenCalledWith({ packageId: 'b-loud' });
+    expect(pin.checked).toBe(true);
+  });
+
+  it('submits preview then consume and renders Saved without opening the optional expander', async () => {
+    await render();
+    expect(container.querySelector('[data-testid="candidate-preview"]')).toBeNull();
+    expect(container.querySelector('[data-testid="save-bundle-details-toggle"]')?.getAttribute('aria-expanded')).toBe('false');
+    await gestureClick(container.querySelector('[data-testid="save-bundle-pin"]')!);
+    await gestureClick(container.querySelector('[data-testid="save-bundle-submit"]')!);
+
+    expect(preview).toHaveBeenCalledWith(expect.objectContaining({
+      workspaceId: 'ws-1', selectedComponentIds: ['c1'], finalizationIds: ['fin-1'],
+    }));
+    expect(commit).toHaveBeenCalledWith({
+      candidateId: 'candidate-1', tokenId: 'token-1', message: 'Save Memory Architecture',
+    });
+    expect(container.querySelector('[data-state="saved"]')?.textContent).toContain('Saved');
+    expect(container.querySelector('[data-testid="candidate-preview"]')).toBeNull();
+  });
+
+  it('makes a second submit inert while the first consume is still pending', async () => {
+    let resolveCommit!: (value: unknown) => void;
+    commit.mockImplementation(() => new Promise((resolve) => { resolveCommit = resolve; }));
+    await render();
+    await gestureClick(container.querySelector('[data-testid="save-bundle-pin"]')!);
+    const submit = container.querySelector('[data-testid="save-bundle-submit"]') as HTMLButtonElement;
+    await act(async () => {
+      submit.click();
+      submit.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(preview).toHaveBeenCalledTimes(1);
+    expect(commit).toHaveBeenCalledTimes(1);
+    expect(submit.disabled).toBe(true);
+    await act(async () => {
+      resolveCommit({
+        kind: 'saved',
+        outcome: { status: 'committed', commitOid: 'saved-oid', attemptId: 'attempt-1', indexIntegrity: 'verified' },
+        finalizations: [],
+      });
+      await Promise.resolve();
+    });
+  });
+
+  it('shows the surfaced drift prominently and re-previews without retrying commit', async () => {
+    commit.mockResolvedValue({
+      kind: 'outcome',
+      outcome: { status: 'aborted-stale', reason: 'src/main/memory/recall.ts changed after pin', attemptId: 'attempt-stale' },
+    });
+    await render();
+    await gestureClick(container.querySelector('[data-testid="save-bundle-pin"]')!);
+    await gestureClick(container.querySelector('[data-testid="save-bundle-submit"]')!);
+
+    const diff = container.querySelector('[data-testid="save-gesture-diff"]');
+    expect(diff?.textContent).toContain('What moved');
+    expect(diff?.textContent).toContain('src/main/memory/recall.ts changed after pin');
+    expect(container.querySelector('[data-state="stale-refused"]')).toBeTruthy();
+    expect(container.querySelector('[data-testid="save-bundle-repin"]')).toBeTruthy();
+
+    await gestureClick(container.querySelector('[data-testid="commit-outcome-repreview"]')!);
+    expect(preview).toHaveBeenCalledTimes(2);
+    expect(commit).toHaveBeenCalledTimes(1);
+    expect(container.querySelector('[data-testid="candidate-preview"]')).toBeTruthy();
+  });
+
+  it('uses the edited message and appends optional user trailers after one blank line', async () => {
+    await render();
+    await gestureClick(container.querySelector('[data-testid="save-bundle-pin"]')!);
+    await gestureClick(container.querySelector('[data-testid="save-bundle-details-toggle"]')!);
+    const message = container.querySelector('[data-testid="candidate-preview-message"]') as HTMLTextAreaElement;
+    const trailers = container.querySelector('[data-testid="candidate-preview-user-trailers"]') as HTMLTextAreaElement;
+    await act(async () => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')!.set!;
+      setter.call(message, 'feat: decisive save');
+      message.dispatchEvent(new Event('input', { bubbles: true }));
+      setter.call(trailers, 'Co-authored-by: Example <example@example.com>');
+      trailers.dispatchEvent(new Event('input', { bubbles: true }));
+      await Promise.resolve();
+    });
+
+    await gestureClick(container.querySelector('[data-testid="save-bundle-submit"]')!);
+    expect(commit).toHaveBeenCalledWith(expect.objectContaining({
+      message: 'feat: decisive save\n\nCo-authored-by: Example <example@example.com>',
+    }));
   });
 });
 

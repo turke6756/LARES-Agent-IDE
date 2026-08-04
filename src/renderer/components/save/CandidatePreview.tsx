@@ -34,6 +34,18 @@ export interface CandidatePreviewProps {
    *  eligible and every acknowledgement is satisfied. Absent ⇒ the enabled Save
    *  button is inert (no CommitCoordinator is wired in this stage). */
   onCommit?: (response: SaveCardPreviewResponse, messageBody: string) => void | Promise<void>;
+  /** SaveCard's decisive gesture lives outside this optional detail pane. Plan
+   * keeps the original in-pane action by default. */
+  showCommitAction?: boolean;
+  onDraftChange?: (draft: CandidatePreviewDraft) => void;
+}
+
+export interface CandidatePreviewDraft {
+  response: SaveCardPreviewResponse;
+  messageBody: string;
+  userTrailers: string;
+  canSave: boolean;
+  reservedTrailer: string | null;
 }
 
 type LoadState =
@@ -87,6 +99,8 @@ export default function CandidatePreview({
   title,
   onClose,
   onCommit,
+  showCommitAction = true,
+  onDraftChange,
 }: CandidatePreviewProps) {
   const [state, setState] = useState<LoadState>({ status: 'loading' });
   const [messageBody, setMessageBody] = useState('');
@@ -134,6 +148,24 @@ export default function CandidatePreview({
       active = false;
     };
   }, [load]);
+
+  useEffect(() => {
+    if (state.status !== 'ready' || !onDraftChange) return;
+    const response = state.response;
+    const eligible = response.candidate.eligibility.eligible === true;
+    const reservedTrailer = firstReservedTrailerLine(userTrailers);
+    const overlapSatisfied = !response.requiresOverlapAck || overlapAck;
+    const unattributedSatisfied = response.unacknowledgedUnattributedEntryIds.every((id) =>
+      unattributedAcks.has(id),
+    );
+    onDraftChange({
+      response,
+      messageBody,
+      userTrailers,
+      canSave: response.isCandidate && eligible && overlapSatisfied && unattributedSatisfied && !reservedTrailer,
+      reservedTrailer,
+    });
+  }, [state, onDraftChange, messageBody, userTrailers, overlapAck, unattributedAcks]);
 
   if (state.status === 'loading') {
     return (
@@ -193,7 +225,7 @@ export default function CandidatePreview({
         data-testid="candidate-preview-verdict"
         data-eligible={String(eligible)}
       >
-        {eligible ? (
+        {candidate.eligibility.eligible ? (
           <span>Disk matches this package byte-for-byte. Saving commits exactly the reviewed work.</span>
         ) : (
           <span>{REASON_LABEL[candidate.eligibility.reason]}</span>
@@ -292,7 +324,7 @@ export default function CandidatePreview({
       )}
 
       <div className="sc-actions">
-        <button
+        {showCommitAction && <button
           type="button"
           className="ui-btn ui-btn-primary px-3 py-1 text-[12.5px]"
           data-testid="candidate-preview-save"
@@ -304,8 +336,8 @@ export default function CandidatePreview({
           }}
         >
           {response.isCandidate ? `Save — commit ${candidate.members.length} file${candidate.members.length === 1 ? '' : 's'}` : 'Save'}
-        </button>
-        {!canSave && !reservedTrailer && (
+        </button>}
+        {showCommitAction && !canSave && !reservedTrailer && (
           <span className="sc-why" data-testid="candidate-preview-why">
             {!response.isCandidate || !eligible
               ? (candidate.eligibility.eligible === false

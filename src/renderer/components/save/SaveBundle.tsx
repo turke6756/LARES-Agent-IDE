@@ -78,9 +78,15 @@ export function isQuietlySaved(b: WorkBundleDto): boolean {
 export default function SaveBundle({
   bundle,
   bundles,
+  pinned = false,
+  pinning = false,
+  onPin,
 }: {
   bundle: WorkBundleDto;
   bundles?: WorkBundleDto[];
+  pinned?: boolean;
+  pinning?: boolean;
+  onPin?: () => void;
 }) {
   const [expanded, setExpanded] = useState(false);
   const grouped = bundles ?? [bundle];
@@ -139,9 +145,19 @@ export default function SaveBundle({
   return (
     <div className={slotClass} data-testid="save-bundle" data-bundle-id={bundle.bundleId} data-kind={bundle.kind}>
       <div className="sc-slothead">
-        {!isUnattributed && (
-          <span className={`sc-check${alreadyProtected ? ' sc-done' : ''}`} aria-hidden="true" />
-        )}
+        {onPin ? (
+            <input
+              type="checkbox"
+              className="sc-check-input"
+              data-testid="save-bundle-pin"
+              aria-label={`Finalize and pin ${identity?.name ?? bundle.label}`}
+              checked={pinned}
+              disabled={pinning}
+              onChange={onPin}
+            />
+          ) : !isUnattributed ? (
+            <span className={`sc-check${alreadyProtected ? ' sc-done' : ''}`} aria-hidden="true" />
+          ) : null}
         <h2>{isMixed ? 'Overlapping work' : identity?.name ?? bundle.label}</h2>
         <span className={pillClass} data-testid="save-bundle-pill">{pillText}</span>
       </div>

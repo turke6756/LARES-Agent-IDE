@@ -5,10 +5,18 @@ import {
   useSaveCardStore,
   useSaveCardAttention,
 } from '../../stores/save-card-store';
-import type { CommitCoordinatorConsumeResponse, SaveCardInventoryResponse } from '../../../shared/types';
+import type {
+  CommitCoordinatorConsumeResponse,
+  SaveCardFleetAdhocMarkDoneResponse,
+  SaveCardInventoryResponse,
+  SaveCardPreviewResponse,
+} from '../../../shared/types';
 import type { SaveCardQuotaWeakening } from '../../../shared/commit-candidates';
 import SaveBundle, { isQuietlySaved, type WorkBundleDto } from './SaveBundle';
-import CandidatePreview, { type CandidatePreviewSelection } from './CandidatePreview';
+import CandidatePreview, {
+  type CandidatePreviewDraft,
+  type CandidatePreviewSelection,
+} from './CandidatePreview';
 import CommitOutcome from './CommitOutcome';
 import QuotaWeakeningBanner from './QuotaWeakeningBanner';
 import { groupExpiryEdgesByBundle, formatExpiresIn } from './save-card-expiry';
@@ -20,14 +28,17 @@ import './save-card.css';
 // bundle DTO carries no finalization coverage yet, so `finalizationIds` is empty
 // — the preview is a `SelectionPreview` (previewable, never one-click) until a
 // later stage surfaces the covering finalizations.
-function selectionForGroup(group: WorkBundleDto[]): CandidatePreviewSelection {
+function selectionForGroup(
+  group: WorkBundleDto[],
+  finalizationIds: string[] = [],
+): CandidatePreviewSelection {
   const selectedComponentIds = group
     .filter((bundle) => bundle.kind === 'component' && bundle.component)
     .map((bundle) => bundle.component!.componentId);
   const selectedUnattributedEntryIds = group
     .filter((bundle) => bundle.kind === 'unattributed')
     .flatMap((bundle) => bundle.members.map((member) => member.entry.entryId));
-  return { selectedComponentIds, selectedUnattributedEntryIds, finalizationIds: [] };
+  return { selectedComponentIds, selectedUnattributedEntryIds, finalizationIds };
 }
 
 /**
@@ -36,48 +47,165 @@ function selectionForGroup(group: WorkBundleDto[]): CandidatePreviewSelection {
  * so the Stage ① read-only bundle card stays untouched. The pane itself decides
  * whether a one-click save is offered (never for mismatch/degraded/unfinalized).
  */
-function SavePreviewLauncher({
+function joinMessageAndUserTrailers(messageBody: string, userTrailers: string): string {
+  const trailers = userTrailers.trim();
+  return trailers ? `${messageBody.trimEnd()}\n\n${trailers}` : messageBody;
+}
+
+function previewMismatchPaths(response: SaveCardPreviewResponse): string[] {
+  return response.candidate.members
+    .filter((member) => member.packageVerification === 'verified-mismatch')
+    .map((member) => member.path.displayPath);
+}
+
+function PackageSaveGesture({
   group,
   workspaceId,
 }: {
   group: WorkBundleDto[];
   workspaceId: string;
 }) {
-  const [open, setOpen] = useState(false);
+  const [detailsOpen, setDetailsOpen] = useState(false);
+  const [pinning, setPinning] = useState(false);
+  const [pins, setPins] = useState<SaveCardFleetAdhocMarkDoneResponse[]>([]);
+  const [draft, setDraft] = useState<CandidatePreviewDraft | null>(null);
+  const [submitting, setSubmitting] = useState(false);
   const [outcome, setOutcome] = useState<CommitCoordinatorConsumeResponse | null>(null);
-  const selection = selectionForGroup(group);
+  const [gestureError, setGestureError] = useState<string | null>(null);
+  const [movedPaths, setMovedPaths] = useState<string[]>([]);
+  const submittingRef = useRef(false);
+  const finalizationIds = pins
+    .filter((pin) => pin.boundaryStatus === 'ready')
+    .map((pin) => pin.finalizationId);
+  const pinned = pins.length === group.length && finalizationIds.length === group.length;
+  const selection = React.useMemo(
+    () => selectionForGroup(group, finalizationIds),
+    [group.map((bundle) => bundle.bundleId).join('\0'), finalizationIds.join('\0')],
+  );
   const hasSelectable =
     selection.selectedComponentIds.length > 0 || selection.selectedUnattributedEntryIds.length > 0;
   if (!hasSelectable) return null;
+
+  const pinPackage = async () => {
+    if (pinning || submittingRef.current) return;
+    setPinning(true);
+    setGestureError(null);
+    setOutcome(null);
+    setMovedPaths([]);
+    try {
+      const responses = await Promise.all(
+        group.map((bundle) => window.api.saveCard.markDone({ packageId: bundle.bundleId })),
+      );
+      setPins(responses);
+      setDraft(null);
+      if (responses.some((response) => response.boundaryStatus !== 'ready')) {
+        setGestureError('Finalization could not capture a ready boundary. Nothing can be submitted yet.');
+      }
+    } catch (err) {
+      setGestureError(errorMessage(err));
+    } finally {
+      setPinning(false);
+    }
+  };
+
+  const submit = async () => {
+    if (!pinned || submittingRef.current) return;
+    submittingRef.current = true;
+    setSubmitting(true);
+    setGestureError(null);
+    setOutcome(null);
+    setMovedPaths([]);
+    try {
+      const response = await window.api.saveCard.preview({ workspaceId, ...selection });
+      const paths = previewMismatchPaths(response);
+      if (!response.isCandidate || !response.candidate.eligibility.eligible ||
+          !('token' in response.candidate) || !response.candidate.token) {
+        setMovedPaths(paths);
+        setGestureError(response.candidate.eligibility.eligible === false
+          ? `Pinned bytes no longer qualify: ${response.candidate.eligibility.reason}.`
+          : 'The pinned package did not produce a committable candidate.');
+        setDetailsOpen(true);
+        return;
+      }
+      if ((response.requiresOverlapAck || response.unacknowledgedUnattributedEntryIds.length > 0) &&
+          !draft?.canSave) {
+        setGestureError('Review and acknowledge the highlighted package details before submitting.');
+        setDetailsOpen(true);
+        return;
+      }
+      if (draft?.reservedTrailer) {
+        setGestureError('A user trailer uses the reserved Lares- namespace. Remove it before submitting.');
+        setDetailsOpen(true);
+        return;
+      }
+      const result = await window.api.commitCoordinator.commit({
+        candidateId: response.candidate.candidateId,
+        tokenId: response.candidate.token.tokenId,
+        message: joinMessageAndUserTrailers(
+          draft?.messageBody ?? response.defaultMessageBody,
+          draft?.userTrailers ?? '',
+        ),
+      });
+      setOutcome(result);
+      if (result.kind === 'outcome' && result.outcome.status === 'aborted-stale') {
+        setGestureError(result.outcome.reason);
+      }
+    } catch (err) {
+      setGestureError(errorMessage(err));
+    } finally {
+      submittingRef.current = false;
+      setSubmitting(false);
+    }
+  };
   return (
     <div className="sc-save-launcher">
+      <SaveBundle
+        bundle={group[0]}
+        bundles={group}
+        pinned={pinned}
+        pinning={pinning}
+        onPin={() => { void pinPackage(); }}
+      />
+      <button
+        type="button"
+        className="ui-btn ui-btn-primary px-3 py-1 text-[12.5px]"
+        data-testid="save-bundle-submit"
+        disabled={!pinned || submitting}
+        onClick={() => { void submit(); }}
+      >
+        {submitting ? 'Saving…' : 'Submit save'}
+      </button>
       <button
         type="button"
         className="ui-btn ui-btn-outline px-3 py-1 text-[12.5px]"
-        data-testid="save-bundle-save"
-        aria-expanded={open}
-        onClick={() => {
-          setOutcome(null);
-          setOpen((v) => !v);
-        }}
+        data-testid="save-bundle-details-toggle"
+        aria-expanded={detailsOpen}
+        onClick={() => setDetailsOpen((open) => !open)}
       >
-        {open ? 'Hide save preview' : 'Save…'}
+        {detailsOpen ? 'Hide preview & message' : 'Preview & message'}
       </button>
-      {open && (
+      {pinning && <div className="sc-save-note" role="status">Pinning reviewed bytes…</div>}
+      {gestureError && (
+        <div className="sc-save-refusal" role="alert" data-testid="save-gesture-refusal">
+          <b>Save refused safely.</b> {gestureError}
+          {(movedPaths.length > 0 || (outcome?.kind === 'outcome' && outcome.outcome.status === 'aborted-stale')) && (
+            <div className="sc-save-diff" data-testid="save-gesture-diff">
+              <strong>What moved</strong>
+              {movedPaths.length > 0
+                ? <ul>{movedPaths.map((path) => <li key={path}>{path}</li>)}</ul>
+                : <p>{gestureError}</p>}
+            </div>
+          )}
+        </div>
+      )}
+      {detailsOpen && pinned && (
         <CandidatePreview
+          key={finalizationIds.join(':')}
           workspaceId={workspaceId}
           selection={selection}
-          onClose={() => setOpen(false)}
-          onCommit={async (response, messageBody) => {
-            if (!response.isCandidate || !('token' in response.candidate) || !response.candidate.token) return;
-            const result = await window.api.commitCoordinator.commit({
-              candidateId: response.candidate.candidateId,
-              tokenId: response.candidate.token.tokenId,
-              message: messageBody,
-            });
-            setOutcome(result);
-            setOpen(false);
-          }}
+          showCommitAction={false}
+          onDraftChange={setDraft}
+          onClose={() => setDetailsOpen(false)}
         />
       )}
       {outcome && (
@@ -85,9 +213,20 @@ function SavePreviewLauncher({
           response={outcome}
           onRepreview={() => {
             setOutcome(null);
-            setOpen(true);
+            setGestureError(null);
+            setDetailsOpen(true);
           }}
         />
+      )}
+      {outcome && outcome.kind === 'outcome' && outcome.outcome.status === 'aborted-stale' && (
+        <button
+          type="button"
+          className="ui-btn ui-btn-outline px-3 py-1 text-[12.5px] sc-repin"
+          data-testid="save-bundle-repin"
+          onClick={() => { void pinPackage(); }}
+        >
+          Re-pin current bytes
+        </button>
       )}
     </div>
   );
@@ -335,9 +474,9 @@ export default function SaveCard() {
       </div>
       <p className="sc-sub">
         {workspace ? (
-          <>Workspace <b>{workspace.title}</b> · read-only inspection of uncommitted work</>
+          <>Workspace <b>{workspace.title}</b> · pin and save exact packages of work</>
         ) : (
-          <>Read-only inspection of uncommitted work</>
+          <>Pin and save exact packages of work</>
         )}
       </p>
       {refreshing && (
@@ -437,10 +576,9 @@ export default function SaveCard() {
         <div className="sc-slots">
           {loudGroups.map((group) => (
             <div key={group[0].identity?.groupingKey ?? group[0].bundleId} className="sc-slot-wrap">
-              <SaveBundle bundle={group[0]} bundles={group} />
               {/* workspaceId is non-null here: the ready state is only reached
                   after a successful load, which requires a selected workspace. */}
-              <SavePreviewLauncher group={group} workspaceId={workspaceId!} />
+              <PackageSaveGesture group={group} workspaceId={workspaceId!} />
             </div>
           ))}
         </div>
@@ -476,9 +614,8 @@ export default function SaveCard() {
       )}
 
       <div className="sc-keyline">
-        <b>Read-only.</b> This surface inspects your uncommitted work and how well it is protected — it makes
-        no change and no claim that inspection has made anything safer. Saving, pushing, and restore are later
-        stages.
+        <b>Exact-byte saves.</b> Pin freezes the package boundary; Submit creates and commits a fresh candidate.
+        If those bytes moved, Lares refuses and asks you to inspect or re-pin instead of guessing.
       </div>
     </div>
   );
