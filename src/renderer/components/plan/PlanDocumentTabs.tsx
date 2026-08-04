@@ -12,6 +12,7 @@ import type {
 import { PLAN_TAB_KEYS, hasSupervisorPrivilege } from '../../../shared/types';
 import { useDashboardStore } from '../../stores/dashboard-store';
 import IntentLifecycleStrip from './IntentLifecycleStrip';
+import PlanCommentsRail from './PlanCommentsRail';
 import ProposalReader from './ProposalReader';
 
 // WP-P4B — the tabbed, folder-native plan **document home**. Consumes the
@@ -151,6 +152,15 @@ export default function PlanDocumentTabs({ planId }: { planId: string }): React.
     return PLAN_TAB_KEYS.map((k) => byKey.get(k)).filter((t): t is PlanDocumentTab => Boolean(t));
   }, [tabs]);
   const activeTab = useMemo(() => tabs.find((t) => t.key === activeKey), [tabs, activeKey]);
+
+  // The currently-open document (matched by manifest id), passed to the comments
+  // rail so a new comment is created against its opaque ref and threads scope to
+  // it (WP-P4E). Null on Packages / empty tabs or before a doc has opened. Defined
+  // BEFORE the early returns below so hook order stays stable across renders.
+  const activeDoc = useMemo<PlanTabDocument | null>(
+    () => activeTab?.documents.find((d) => d.ref.documentId === doc?.documentId) ?? null,
+    [activeTab, doc?.documentId],
+  );
 
   // Read a document body by its opaque manifest id (never a raw path). Guards
   // against a stale response landing after the user moved on by keying on the id.
@@ -347,7 +357,8 @@ export default function PlanDocumentTabs({ planId }: { planId: string }): React.
         ))}
       </div>
 
-      <div className="flex min-h-0 flex-1 flex-col" data-testid="plan-tab-body">
+      <div className="flex min-h-0 flex-1" data-testid="plan-tab-body">
+       <div className="flex min-h-0 flex-1 flex-col">
         {/* Overview row — leads every tab. Supervisor-authored summary when
             present; "overview pending" on a populated tab that has none; an
             in-place editor for a supervisor (WP-P4C-editor). The Packages
@@ -477,6 +488,13 @@ export default function PlanDocumentTabs({ planId }: { planId: string }): React.
             </div>
           </div>
         )}
+       </div>
+
+        {/* WP-P4E — comments rail. Threads scope to the open document; a compose
+            box routes create through the server (which picks the recipient), and
+            orphaned targets stay visible but non-clickable. Suppressed on the
+            synthetic Packages tab, which has no document to comment on. */}
+        {!isPackages && <PlanCommentsRail planId={planId} activeDoc={activeDoc} />}
       </div>
     </div>
   );

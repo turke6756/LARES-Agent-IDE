@@ -232,6 +232,13 @@ const api: IpcApi = {
     // watcher); `promotionStatus` reads the durable promotion_requests/plans rows.
     promote: (input) => ipcRenderer.invoke('proposal:promote', input),
     promotionStatus: (input) => ipcRenderer.invoke('proposal:promotionStatus', input),
+    // WP-P4E — plan comments rail. `listComments` is an open read (any renderer);
+    // `createComment` supplies only planId + an opaque ref + body (server picks the
+    // recipient, builds the durable file_path); `replyComment` writes a companion
+    // reply (server revalidates the caller against the responsible supervisor).
+    listComments: (planId) => ipcRenderer.invoke('plan:comment:list', planId),
+    createComment: (req) => ipcRenderer.invoke('plan:comment:create', req),
+    replyComment: (req) => ipcRenderer.invoke('plan:comment:reply', req),
   },
   // WP-P1B: read-only planning reader (bounded fs enumeration + read-by-opaque-id).
   // `list` is a pure mount/refresh read (NO demand-probe); a voluntary open is

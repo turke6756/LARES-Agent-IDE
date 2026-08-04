@@ -2706,6 +2706,20 @@ export interface IpcApi {
      *  through: a runtime read over `promotion_requests` (+ the adopted `plans`
      *  row). The dialog polls this with bounded backoff. Rejects on an unknown id. */
     promotionStatus: (input: { promotionRequestId: string }) => Promise<PromotionStatus>;
+    /** WP-P4D-proj / WP-P4E — the plan-comment projection that backs the comments
+     *  rail: every comment on the plan (across its registered external documents
+     *  AND its folder-doc logical targets) rolled up with its reply thread and a
+     *  resolved target descriptor. `null` for a malformed/empty plan id. */
+    listComments: (planId: string) => Promise<PlanCommentsProjection | null>;
+    /** WP-P4D-create / WP-P4E — create a comment on a plan document. The renderer
+     *  supplies ONLY the `planId`, an opaque `PlanDocumentRef`, and a body (+
+     *  optional display anchors); the server picks the recipient (the plan's
+     *  current responsible supervisor) and builds the durable `file_path`. */
+    createComment: (req: PlanCommentCreateRequest) => Promise<PlanCommentCreateResult>;
+    /** WP-P4D-reply / WP-P4E — answer a plan comment with a companion reply. The
+     *  service revalidates `callerAgentId` against the plan's current responsible
+     *  supervisor server-side; a non-responsible id is rejected. */
+    replyComment: (req: AnswerPlanCommentRequest) => Promise<AnswerPlanCommentResult>;
   };
   /** WP-P1B: read-only planning reader. `list` enumerates bare proposals + §R0
    *  plan folders and is a pure mount/refresh read (emits NO demand-probe);
