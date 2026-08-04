@@ -56,6 +56,7 @@ import {
 } from '../../shared/types';
 import { getPlanIntentsProjection } from './plan-intent-ledger';
 import { buildPlanDocuments, readPlanDocument, type PlanDocumentsDeps } from './plan-documents';
+import { createPlanComment, type CreatePlanCommentDeps } from './plan-comments';
 
 // ── Save-card SC-WP-3D — plan-package `done` finalization wiring ──────────────
 //
@@ -665,6 +666,18 @@ export function registerPlanOverviewIpc(
 ): void {
   ipc.handle('plan:getOverview', (_event, raw: unknown) => runGetOverview(raw, deps));
   ipc.handle('plan:setOverview', (_event, raw: unknown) => runSetOverview(raw, deps));
+}
+
+// ── WP-P4D-create — plan-comment create + routing ─────────────────────────────
+//
+// A thin registrar over the `plan-comments.ts` create service. The deps (db
+// accessors + the plan-aware send/notification route) are supplied by the
+// ipc-handlers seam, which owns the supervisor + `comments:send` path this
+// channel routes through. Split out (like `registerPlanOverviewIpc`) so the ipc
+// test can drive registration against a fake ipcMain.
+
+export function registerPlanCommentIpc(ipc: PlanIpcLike, deps: CreatePlanCommentDeps): void {
+  ipc.handle('plan:comment:create', (_event, raw: unknown) => createPlanComment(raw, deps));
 }
 
 export function registerPlanIpc(manager: PlanPaneManager): void {

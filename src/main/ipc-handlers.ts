@@ -7,7 +7,7 @@ import type { ContinuationPhaseSignal, PathType, WslStatus, HealthCheck, Runtime
 import { TAB_CHANNELS, VIEW_CHANNELS } from '../shared/types';
 import { createDetachedWindow, createDetachedViewWindow, broadcastToDetachedViews, canWrite, handleDetachedCloseReply, type DetachedWindowDeps } from './detached-windows';
 import { handleFlushReply } from './close-flush';
-import type { FlushReplyPayload } from '../shared/types';
+import type { FlushReplyPayload, SelectionComment } from '../shared/types';
 import { AgentSupervisor } from './supervisor';
 import { TerminalListenerRegistry } from './terminal-listener-registry';
 import { computeTerminalAttachResult } from './terminal-attach-result';
@@ -24,6 +24,12 @@ import {
   markSelectionCommentsQueued, markSelectionCommentsSent, markSelectionCommentsSendFailed,
 } from './database';
 import { sendSelectionComments } from './selection-comments-send';
+import {
+  resolvePlanCommentForSend,
+  defaultResolvePlanCommentDeps,
+  defaultCreatePlanCommentDeps,
+} from './plans/plan-comments';
+import { registerPlanCommentIpc } from './plans/plan-ipc';
 import { assertPlanRailFree } from './orchestration/plan-ownership';
 import { getApiToken } from './security/api-auth';
 import { openInVSCode, openFileInVSCode, openFileInWorkspace } from './vscode-launcher';
@@ -452,36 +458,62 @@ export function registerIpcHandlers(
   ipcMain.handle('comments:update', (_e, id, updates) => updateSelectionComment(id, updates));
   ipcMain.handle('comments:delete', (_e, id) => deleteSelectionComment(id));
   ipcMain.handle('comments:resolve', (_e, id) => resolveSelectionComment(id));
-  ipcMain.handle('comments:send', (_e, request) =>
-    sendSelectionComments(
-      {
-        getComment: getSelectionComment,
-        getAgent,
-        isInputInFlight: (agentId) => supervisor.isInputInFlight(agentId),
-        sendInput: (agentId, text) => supervisor.sendInput(agentId, text),
-        launchAgent: (input) => supervisor.launchAgent(input),
-        markQueued: markSelectionCommentsQueued,
-        markSent: markSelectionCommentsSent,
-        markSendFailed: markSelectionCommentsSendFailed,
-        // Async delivery failures share the chat-input error surface (the
-        // renderer chat input already renders these inline).
-        onAsyncSendError: (payload) => {
-          console.error(`[comments] Background send to ${payload.agentId} failed:`, payload.error);
-          if (!mainWindow.isDestroyed()) {
-            mainWindow.webContents.send('agent:send-input-error', payload);
-          }
-        },
-        onCommentsChanged: (commentIds) => {
-          if (!mainWindow.isDestroyed()) {
-            const comments = commentIds
-              .map((id) => getSelectionComment(id))
-              .filter((c): c is NonNullable<typeof c> => c !== null);
-            mainWindow.webContents.send('comments:changed', { comments });
-          }
-        },
-      },
-      request,
-    ));
+
+  // WP-P4D-create — the plan-aware send/notification adapter. For a
+  // `lares-plan-doc:*` logical target the stored row's key is resolved to the
+  // current physical path on a CLONE (the row is never mutated) so the built
+  // prompt shows a real path; a target that no longer resolves is surfaced as an
+  // explicit orphaned plan-document target. Ordinary file comments pass through
+  // unchanged. Both `comments:send` and `plan:comment:create` route through this
+  // one seam.
+  const resolvePlanCommentDeps = defaultResolvePlanCommentDeps();
+  const planAwareGetComment = (id: string): SelectionComment | null =>
+    resolvePlanCommentForSend(getSelectionComment(id), resolvePlanCommentDeps);
+  const sendCommentDeps = {
+    getComment: planAwareGetComment,
+    getAgent,
+    isInputInFlight: (agentId: string) => supervisor.isInputInFlight(agentId),
+    sendInput: (agentId: string, text: string) => supervisor.sendInput(agentId, text),
+    launchAgent: (input: Parameters<typeof supervisor.launchAgent>[0]) => supervisor.launchAgent(input),
+    markQueued: markSelectionCommentsQueued,
+    markSent: markSelectionCommentsSent,
+    markSendFailed: markSelectionCommentsSendFailed,
+    // Async delivery failures share the chat-input error surface (the
+    // renderer chat input already renders these inline).
+    onAsyncSendError: (payload: { agentId: string; error: string }) => {
+      console.error(`[comments] Background send to ${payload.agentId} failed:`, payload.error);
+      if (!mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('agent:send-input-error', payload);
+      }
+    },
+    onCommentsChanged: (commentIds: string[]) => {
+      if (!mainWindow.isDestroyed()) {
+        const comments = commentIds
+          .map((id) => getSelectionComment(id))
+          .filter((c): c is NonNullable<typeof c> => c !== null);
+        mainWindow.webContents.send('comments:changed', { comments });
+      }
+    },
+  };
+  ipcMain.handle('comments:send', (_e, request) => sendSelectionComments(sendCommentDeps, request));
+
+  // WP-P4D-create — plan-comment create + routing. The renderer supplies only a
+  // planId + a `PlanDocumentRef` + body; the server picks the recipient (the
+  // plan's current responsible supervisor), builds the durable `file_path`
+  // (`lares-plan-doc:v1:` logical key for a folder target, an ordinary physical
+  // path for a registered external doc), creates the row, and routes it through
+  // the SAME plan-aware send path above.
+  registerPlanCommentIpc(
+    ipcMain,
+    defaultCreatePlanCommentDeps(
+      createSelectionComment,
+      (commentId, recipientId) =>
+        sendSelectionComments(sendCommentDeps, {
+          commentIds: [commentId],
+          target: { kind: 'existing', agentId: recipientId },
+        }),
+    ),
+  );
 
   // Persona handlers
   ipcMain.handle('persona:list', (_e, workspacePath, pathType) => scanPersonas(workspacePath, pathType));

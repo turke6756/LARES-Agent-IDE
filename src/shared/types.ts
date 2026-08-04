@@ -4664,6 +4664,50 @@ export interface PlanDocumentReadResult {
   sizeBytes: number;
 }
 
+// ── WP-P4D-create — plan-comment create + routing ─────────────────────────────
+// The renderer supplies ONLY a `planId`, an opaque `PlanDocumentRef` (folder- or
+// registered-manifest handle — never a filesystem path), and a `body` (+ optional
+// display anchors). The server picks the recipient (the plan's current
+// responsible supervisor), builds the durable `file_path` (a `lares-plan-doc:v1:`
+// logical key for a folder target; an ordinary physical path for a registered
+// external doc), creates the row, and routes it through the existing send path.
+// The renderer can inject neither recipient, nor file, nor logical key.
+
+export interface PlanCommentCreateRequest {
+  planId: string;
+  ref: PlanDocumentRef;
+  body: string;
+  /** Optional display/reattach fields — never a file path or recipient. */
+  quotedText?: string;
+  lineStart?: number;
+  lineEnd?: number;
+  anchorStart?: number;
+  anchorEnd?: number;
+  prefix?: string;
+  suffix?: string;
+  docHash?: string;
+}
+
+export type PlanCommentCreateErrorCode =
+  | 'plan-comment-bad-request'
+  | 'plan-not-found'
+  | 'workspace-not-found'
+  | 'document-not-in-plan';
+
+export type PlanCommentCreateResult =
+  | {
+      ok: true;
+      comment: SelectionComment;
+      /** The server-selected responsible supervisor the comment was routed to,
+       *  or null when the plan has no current responsible supervisor (the row
+       *  still persists and can be routed later). */
+      recipientId: string | null;
+      /** The outcome of the send/notification path, or null when there was no
+       *  recipient to route to. */
+      send: SendSelectionCommentsResult | null;
+    }
+  | { ok: false; code: PlanCommentCreateErrorCode; error: string };
+
 // ── WP-P2C — unified gallery projection ───────────────────────────────────────
 // A single server projection that unions three durable row kinds for the Plans
 // gallery: filesystem-owned proposals, folder-per-plan `structured` plans, and
