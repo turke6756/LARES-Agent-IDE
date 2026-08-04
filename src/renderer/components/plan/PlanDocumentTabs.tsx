@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import type {
@@ -8,7 +8,8 @@ import type {
   PlanTabKey,
   PlanTabOverview,
 } from '../../../shared/types';
-import { PLAN_TAB_KEYS } from '../../../shared/types';
+import { PLAN_TAB_KEYS, hasSupervisorPrivilege } from '../../../shared/types';
+import { useDashboardStore } from '../../stores/dashboard-store';
 import ProposalReader from './ProposalReader';
 
 // WP-P4B — the tabbed, folder-native plan **document home**. Consumes the
@@ -26,8 +27,13 @@ import ProposalReader from './ProposalReader';
 // surface exposes no raw-manifest affordance. An empty subdir reads "no
 // documents yet"; the synthetic Packages tab renders its placeholder.
 //
-// STRICTLY read-only: the overview EDITOR is WP-P4C-editor, not this WP. Links in
-// rendered bodies are inert (ProposalReader owns that).
+// WP-P4C-editor adds the in-place per-tab overview EDITOR here (keyed to the
+// active `PlanTabKey`), gated to supervisors: the affordance shows only when a
+// same-workspace privileged agent exists, and the write itself is re-validated
+// SERVER-side by `plan:setOverview` (`hasSupervisorPrivilege` + membership) — the
+// UI treats a rejection as a first-class outcome, never assumes success, and
+// re-fetches `getOverview` after a save so the shown revision bumps. Document
+// bodies stay read-only (ProposalReader owns their inert links).
 
 /** Human labels for the stable tab keys. Display is deliberately a renderer
  *  concern (see `PlanTabKey`), so the mapping lives here, not in shared. */
@@ -75,6 +81,35 @@ export default function PlanDocumentTabs({ planId }: { planId: string }): React.
   const [overview, setOverview] = useState<PlanTabOverview | null>(null);
   const [overviewLoading, setOverviewLoading] = useState(false);
   const [doc, setDoc] = useState<DocReadState | null>(null);
+
+  // WP-P4C-editor — in-place overview editing state (per active tab). `editing`
+  // toggles the inline form; `draft` is the working body; `supervisorId` is the
+  // authoring identity sent to the privileged write. `saveError` surfaces a
+  // server rejection (non-supervisor / unknown plan) as a first-class outcome.
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [supervisorId, setSupervisorId] = useState('');
+
+  // Candidate authors: privileged, same-workspace agents. Filtered client-side
+  // so the affordance only shows to a supervisor; the server independently
+  // re-validates the pick on write (a non-supervisor is rejected there).
+  const agents = useDashboardStore((s) => s.agents);
+  const selectedWorkspaceId = useDashboardStore((s) => s.selectedWorkspaceId);
+  const supervisors = useMemo(
+    () =>
+      agents
+        .filter((a) => a.workspaceId === selectedWorkspaceId && hasSupervisorPrivilege(a))
+        .map((a) => ({ id: a.id, title: a.title })),
+    [agents, selectedWorkspaceId],
+  );
+  const canEdit = supervisors.length > 0;
+
+  // Keep the live active key in a ref so an in-flight save that resolves after
+  // the user switched tabs never writes its result onto the wrong tab.
+  const activeKeyRef = useRef<PlanTabKey>(activeKey);
+  activeKeyRef.current = activeKey;
 
   // Load the live tab projection on mount / plan switch. Reset to the default
   // `overview` tab so a plan switch never strands the view on a key the new plan
@@ -175,6 +210,57 @@ export default function PlanDocumentTabs({ planId }: { planId: string }): React.
 
   const hasOverview = Boolean(overview?.body && overview.body.trim().length > 0);
 
+  // Leaving a tab (or switching plans) closes any open editor so the draft never
+  // bleeds across keys; the per-tab overview fetch above re-primes the body.
+  useEffect(() => {
+    setEditing(false);
+    setSaveError(null);
+  }, [activeKey, planId]);
+
+  // Open the inline editor seeded with the current overview body and a default
+  // author (the first candidate supervisor, kept if still valid).
+  const startEdit = useCallback(() => {
+    setDraft(overview?.body ?? '');
+    setSaveError(null);
+    setSupervisorId((prev) =>
+      prev && supervisors.some((s) => s.id === prev) ? prev : supervisors[0]?.id ?? '',
+    );
+    setEditing(true);
+  }, [overview, supervisors]);
+
+  const cancelEdit = useCallback(() => {
+    setEditing(false);
+    setSaveError(null);
+  }, []);
+
+  // Privileged write. Sends the trimmed body (all-whitespace ⇒ null, clearing the
+  // overview) under the chosen supervisor identity; on success re-fetches the same
+  // getOverview so the shown revision bumps, on rejection keeps the editor open
+  // and surfaces the reason — the server is the authority, so we never assume the
+  // write landed.
+  const saveOverview = useCallback(async () => {
+    if (!canEdit || !supervisorId || saving) return;
+    const key = activeKey;
+    const body = draft.trim().length > 0 ? draft : null;
+    setSaving(true);
+    setSaveError(null);
+    try {
+      await window.api.plans.setOverview({ planId, tab: key, body, supervisorId });
+      const ov = await window.api.plans.getOverview(planId, key);
+      // Guard against a tab switch mid-save landing on the wrong key.
+      if (activeKeyRef.current === key) {
+        setOverview(ov);
+        setEditing(false);
+      }
+    } catch {
+      if (activeKeyRef.current === key) {
+        setSaveError('Could not save the overview — only a supervisor can edit it.');
+      }
+    } finally {
+      setSaving(false);
+    }
+  }, [canEdit, supervisorId, saving, activeKey, draft, planId]);
+
   if (modelLoading) {
     return (
       <div className="flex h-full items-center justify-center text-[13px] text-gray-400" data-testid="plan-document-tabs">
@@ -227,17 +313,85 @@ export default function PlanDocumentTabs({ planId }: { planId: string }): React.
 
       <div className="flex min-h-0 flex-1 flex-col" data-testid="plan-tab-body">
         {/* Overview row — leads every tab. Supervisor-authored summary when
-            present; "overview pending" on a populated tab that has none. The
-            Packages placeholder is populated:false and never demands one. */}
-        {!isPackages && (hasOverview || (activeTab?.populated && !overviewLoading)) && (
+            present; "overview pending" on a populated tab that has none; an
+            in-place editor for a supervisor (WP-P4C-editor). The Packages
+            placeholder is populated:false and never demands one. */}
+        {!isPackages && (hasOverview || editing || (activeTab?.populated && !overviewLoading)) && (
           <div className="shrink-0 border-b border-white/10 bg-surface-1/40 px-6 py-3" data-testid="plan-tab-overview">
-            {hasOverview ? (
-              <div className="prose-custom max-w-3xl text-[13px] text-gray-300" data-testid="plan-tab-overview-body">
-                <ReactMarkdown remarkPlugins={[remarkGfm]}>{overview!.body!}</ReactMarkdown>
+            {editing ? (
+              <div className="max-w-3xl" data-testid="plan-overview-editor">
+                <textarea
+                  value={draft}
+                  onChange={(e) => setDraft(e.target.value)}
+                  rows={5}
+                  placeholder="Plain-language overview for this tab…"
+                  disabled={saving}
+                  data-testid="plan-overview-textarea"
+                  className="w-full resize-y rounded border border-white/15 bg-surface-0 px-2 py-1.5 text-[13px] text-gray-200 outline-none focus:border-accent-blue disabled:opacity-60"
+                />
+                <div className="mt-2 flex flex-wrap items-center gap-2">
+                  {supervisors.length > 1 && (
+                    <select
+                      value={supervisorId}
+                      onChange={(e) => setSupervisorId(e.target.value)}
+                      disabled={saving}
+                      data-testid="plan-overview-supervisor-select"
+                      aria-label="Authoring supervisor"
+                      className="rounded border border-white/15 bg-surface-0 px-1.5 py-1 text-[12px] text-gray-200"
+                    >
+                      {supervisors.map((s) => (
+                        <option key={s.id} value={s.id}>
+                          {s.title}
+                        </option>
+                      ))}
+                    </select>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => void saveOverview()}
+                    disabled={saving || !supervisorId}
+                    data-testid="plan-overview-save"
+                    className="rounded bg-accent-blue px-2.5 py-1 text-[12px] font-medium text-white disabled:opacity-60"
+                  >
+                    {saving ? 'Saving…' : 'Save'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={cancelEdit}
+                    disabled={saving}
+                    data-testid="plan-overview-cancel"
+                    className="rounded px-2.5 py-1 text-[12px] text-gray-400 hover:text-gray-200 disabled:opacity-60"
+                  >
+                    Cancel
+                  </button>
+                  {saveError && (
+                    <span className="text-[12px] text-red-400" data-testid="plan-overview-error" role="alert">
+                      {saveError}
+                    </span>
+                  )}
+                </div>
               </div>
             ) : (
-              <div className="text-[12px] italic text-gray-500" data-testid="plan-overview-pending">
-                overview pending
+              <div className="flex items-start justify-between gap-3">
+                {hasOverview ? (
+                  <div className="prose-custom min-w-0 max-w-3xl flex-1 text-[13px] text-gray-300" data-testid="plan-tab-overview-body">
+                    <ReactMarkdown remarkPlugins={[remarkGfm]}>{overview!.body!}</ReactMarkdown>
+                  </div>
+                ) : (
+                  <div className="flex-1 text-[12px] italic text-gray-500" data-testid="plan-overview-pending">
+                    overview pending
+                  </div>
+                )}
+                {canEdit && (
+                  <button
+                    type="button"
+                    onClick={startEdit}
+                    data-testid="plan-overview-edit"
+                    className="shrink-0 rounded border border-white/15 px-2 py-0.5 text-[11px] text-gray-400 hover:text-gray-200"
+                  >
+                    {hasOverview ? 'Edit' : 'Add overview'}
+                  </button>
+                )}
               </div>
             )}
           </div>
