@@ -1,5 +1,6 @@
 import React from 'react';
 import * as Icons from 'lucide-react';
+import ProposalCardGallery from './ProposalCardGallery';
 
 function ReservedRegion({
   icon,
@@ -38,12 +39,7 @@ export default function PlansPane(): React.ReactElement {
       className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto bg-surface-0 p-6 scrollbar-thin"
       data-testid="plans-pane"
     >
-      <ReservedRegion
-        icon={<Icons.LayoutGrid className="h-4 w-4 text-accent-blue" />}
-        title="Proposals"
-        description="Proposal cards will appear here."
-        testId="plans-proposals-region"
-      />
+      <ProposalCardGallery />
       <ReservedRegion
         icon={<Icons.Map className="h-4 w-4 text-accent-green" />}
         title="Promoted plans"
