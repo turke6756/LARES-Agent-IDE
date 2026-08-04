@@ -739,7 +739,7 @@ test('Agy status: an already-working worker demotes to idle after hook + raw PTY
   }
 });
 
-test('Agy status: PTY activity never promotes idle, and quiet inference stays agy-only', async () => {
+test('Agy status: Stop-driven idle is not fought by PTY activity, and quiet inference stays agy-only', async () => {
   const fakes = makeStatusMonitorFakes();
   const restore = patchDatabaseModule(fakes);
   try {
@@ -748,7 +748,8 @@ test('Agy status: PTY activity never promotes idle, and quiet inference stays ag
     });
     const agyMonitor = makeMonitor({ fakes, agent: idleAgy });
     fakes.lastRawOutputAt.set(idleAgy.id, fakes.now.value);
-    assert.equal(await inferStatus(agyMonitor, idleAgy), null, 'PTY bytes cannot start an agy turn');
+    assert.equal(await inferStatus(agyMonitor, idleAgy), null,
+      'fresh PTY bytes cannot override the idle status written by an agy Stop hook');
 
     const quietCodex = makeAgent('codex-quiet', {
       provider: 'codex', isWorker: true, isSupervised: false, status: 'working',

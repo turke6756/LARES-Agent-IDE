@@ -700,6 +700,9 @@ test('Agy: fresh scaffold seeds a flat workspace hook carrier in its own git roo
     assert.equal(handlers.length, 1);
     assert.equal(typeof handlers[0].command, 'string');
     assert.ok(!('matcher' in handlers[0]) && !('hooks' in handlers[0]), 'PreInvocation must be flat');
+    const stopHandlers = carrier[AGY_STATUS_HOOK_NAME].Stop;
+    assert.equal(stopHandlers.length, 1);
+    assert.ok(!('matcher' in stopHandlers[0]) && !('hooks' in stopHandlers[0]), 'Stop must be flat');
     assert.ok(!fs.readFileSync(carrierPath, 'utf-8').includes('${'));
     assert.ok(fs.existsSync(path.join(workerDir, '.git')), 'agy worker cwd must be a git root');
     assert.ok(fs.existsSync(path.join(workDir, '.lares', 'scripts', 'dashboard-status.mjs')));
@@ -708,6 +711,9 @@ test('Agy: fresh scaffold seeds a flat workspace hook carrier in its own git roo
     const encoded = generated[AGY_STATUS_HOOK_NAME].PreInvocation[0].command.match(/-EncodedCommand\s+(\S+)$/)?.[1];
     const invocation = Buffer.from(encoded, 'base64').toString('utf16le');
     assert.match(invocation, /& "C:\/Node Runtime\/node\.cmd" "C:\/Workspace With Space\/\.lares\/scripts\/dashboard-status\.mjs" working --event PreInvocation/);
+    const stopEncoded = generated[AGY_STATUS_HOOK_NAME].Stop[0].command.match(/-EncodedCommand\s+(\S+)$/)?.[1];
+    const stopInvocation = Buffer.from(stopEncoded, 'base64').toString('utf16le');
+    assert.match(stopInvocation, /& "C:\/Node Runtime\/node\.cmd" "C:\/Workspace With Space\/\.lares\/scripts\/dashboard-status\.mjs" --event Stop/);
   } finally {
     if (priorUserProfile === undefined) delete process.env.USERPROFILE;
     else process.env.USERPROFILE = priorUserProfile;

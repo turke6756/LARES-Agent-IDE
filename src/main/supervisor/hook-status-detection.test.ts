@@ -360,7 +360,7 @@ test('G5. compat.claude.hooks=false surfaces as UNHEALTHY (canary-timeout/broken
 
 // ── H. Antigravity workspace-local flat carrier (agy Commit 6) ─────────
 
-test('H1. agy carrier is one named workspace hook with flat PreInvocation only', () => {
+test('H1. agy carrier is one named workspace hook with flat PreInvocation + Stop handlers', () => {
   const raw = workerAgyHooksJson('C:\\Workspace', 'C:\\Node Runtime\\node.cmd');
   const carrier = JSON.parse(raw) as any;
   assert.equal(AGY_STATUS_HOOK_NAME, 'lares-dashboard-status');
@@ -368,17 +368,20 @@ test('H1. agy carrier is one named workspace hook with flat PreInvocation only',
   assert.equal(handlers.length, 1);
   assert.equal(typeof handlers[0].command, 'string');
   assert.ok(!('matcher' in handlers[0]) && !('hooks' in handlers[0]));
-  assert.deepEqual(Object.keys(carrier[AGY_STATUS_HOOK_NAME]), ['PreInvocation']);
+  const stopHandlers = carrier[AGY_STATUS_HOOK_NAME].Stop;
+  assert.equal(stopHandlers.length, 1);
+  assert.equal(typeof stopHandlers[0].command, 'string');
+  assert.ok(!('matcher' in stopHandlers[0]) && !('hooks' in stopHandlers[0]));
+  assert.deepEqual(Object.keys(carrier[AGY_STATUS_HOOK_NAME]), ['PreInvocation', 'Stop']);
   assert.ok(!raw.includes('${'));
 });
 
-test('H2. agy status starts only from PreInvocation; Stop is absent and idle is PTY-quiet-owned', () => {
+test('H2. agy PreInvocation starts working and Stop authoritatively ends the turn', () => {
   const entry = JSON.parse(workerAgyHooksJson('C:\\Workspace', 'C:\\Node Runtime\\node.cmd'))[AGY_STATUS_HOOK_NAME];
   const activeEvents = Object.entries(entry)
     .filter(([, handlers]) => Array.isArray(handlers) && handlers.length > 0)
     .map(([event]) => event);
-  assert.deepEqual(activeEvents, ['PreInvocation']);
-  assert.ok(!activeEvents.includes('Stop'), 'agy has no Stop hook and tests must never synthesize one');
+  assert.deepEqual(activeEvents, ['PreInvocation', 'Stop']);
   assert.equal(deriveHookAvailability('healthy').hooksUnavailable, false,
     'a real PreInvocation event is positive proof that the workspace carrier loaded');
 });
@@ -389,6 +392,10 @@ test('H3. agy PreInvocation handler is flat; the retired matcher/hooks group is 
   assert.equal(typeof handler.command, 'string');
   assert.equal(handler.matcher, undefined);
   assert.equal(handler.hooks, undefined);
+  const stopHandler = entry.Stop[0];
+  assert.equal(typeof stopHandler.command, 'string');
+  assert.equal(stopHandler.matcher, undefined);
+  assert.equal(stopHandler.hooks, undefined);
 
   for (const verdict of ['broken', 'degraded'] as const) {
     const availability = deriveHookAvailability(verdict);

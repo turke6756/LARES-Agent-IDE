@@ -19,7 +19,7 @@ import {
   WORKER_CLAUDE_MD, WORKER_CLAUDE_MD_V1, WORKER_BEHAVIORAL_MD,
   WORKER_CLAUDE_SETTINGS_JSON, WORKER_CLAUDE_SETTINGS_JSON_V2, WORKER_CLAUDE_SETTINGS_JSON_V3,
   WORKER_CLAUDE_SETTINGS_JSON_V4, WORKER_CLAUDE_SETTINGS_JSON_V5, WORKER_CLAUDE_SETTINGS_JSON_V6,
-  WORKER_CLAUDE_SETTINGS_JSON_V7, workerGrokSettingsJson, workerAgyHooksJson,
+  WORKER_CLAUDE_SETTINGS_JSON_V7, workerGrokSettingsJson, workerAgyHooksJson, workerAgyHooksJsonV2,
   WORKER_AGY_HOOKS_JSON_V1_HASH,
   WORKER_CODEX_CONFIG_TOML, WORKER_CODEX_CONFIG_TOML_V1, WORKER_CODEX_CONFIG_TOML_V2,
   WORKER_CODEX_CONFIG_TOML_V3, WORKER_CODEX_CONFIG_TOML_V4, WORKER_CODEX_CONFIG_TOML_V5,
@@ -3650,11 +3650,14 @@ export class AgentSupervisor extends EventEmitter {
         const agyFiles: Record<string, ScaffoldFile> = {
           [`.lares/workers/agy/.agents/hooks.json`]: {
             content: workerAgyHooksJson(workDir, nodePath),
-            version: 2,
-            // v1 was the broken global-shaped entry retained below as a frozen
-            // hash source. A pristine migrated copy upgrades silently; edited
-            // content is backed up by writeScaffoldMap.
-            previousHashes: { 1: WORKER_AGY_HOOKS_JSON_V1_HASH },
+            version: 3,
+            // v1 was the broken global-shaped entry; v2 was the path-dependent
+            // flat PreInvocation-only carrier. Recreate v2 with the same inputs
+            // so pristine lanes silently gain Stop while edited copies are backed up.
+            previousHashes: {
+              1: WORKER_AGY_HOOKS_JSON_V1_HASH,
+              2: sha256Hex(workerAgyHooksJsonV2(workDir, nodePath)),
+            },
           },
         };
         providerCreated += this.writeScaffoldMap(workDir, agyFiles, pathType);

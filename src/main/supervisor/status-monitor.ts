@@ -1188,13 +1188,12 @@ export class StatusMonitor extends EventEmitter {
     // didn't correspond to a real TUI prompt. `inferStatus` now only resolves
     // liveness (done/crashed, handled by the `!alive` branch above).
     //
-    // Antigravity 1.1.9 is the narrow exception established by Phase-0 probes:
-    // global named+nested PreInvocation fires and authoritatively marks working,
-    // but Stop never fires. For agy workers ONLY, demote an already-working turn
-    // after both its latest hook and raw PTY output have been quiet for the
-    // established 8 s threshold. Never promote from PTY bytes — PreInvocation
-    // remains the sole start signal, avoiding the false-start behavior that led
-    // to removal of generic PTY inference.
+    // Antigravity 1.1.10 fires the workspace carrier's Stop hook and normally
+    // reaches idle through the same authoritative hook path as Claude/Grok.
+    // Keep the original 8 s quiet demotion for older agy versions and hook
+    // failures. It is fallback-only: the guard requires status === 'working',
+    // so a Stop-driven idle cannot be overridden or fought by this inference.
+    // Never promote from PTY bytes — PreInvocation remains the sole start signal.
     if (
       agent.provider === 'agy'
       && (agent.isSupervised || agent.isWorker)

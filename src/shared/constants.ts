@@ -1651,11 +1651,11 @@ export function workerGrokSettingsJson(posixWorkspaceRoot: string): string {
   return `${JSON.stringify(carrier, null, 2)}\n`;
 }
 
-/** Antigravity worker hook carrier, generated for the worker cwd's
- *  `.agents/hooks.json`. agy 1.1.10 requires flat handler arrays for non-tool
- *  events. Both executable paths are absolute and JSON.stringify owns their
- *  quoting, so the command has no shell variables or cwd-dependent paths. */
-export function workerAgyHooksJson(workspaceRoot: string, nodePath: string): string {
+/** Frozen v2 Antigravity worker hook carrier (PreInvocation only). Its command
+ *  embeds workspace- and machine-specific absolute paths, so the v2 migration
+ *  hash is derived from this generator with the same inputs instead of being a
+ *  single machine-specific literal. */
+export function workerAgyHooksJsonV2(workspaceRoot: string, nodePath: string): string {
   const absoluteNode = nodePath.replace(/\\/g, '/');
   const statusScript = [
     workspaceRoot.replace(/\\/g, '/').replace(/\/+$/, ''),
@@ -1672,6 +1672,30 @@ export function workerAgyHooksJson(workspaceRoot: string, nodePath: string): str
   return `${JSON.stringify({
     'lares-dashboard-status': {
       PreInvocation: [{ command }],
+    },
+  }, null, 2)}\n`;
+}
+
+/** Antigravity worker hook carrier, generated for the worker cwd's
+ *  `.agents/hooks.json`. agy 1.1.10 requires flat handler arrays for non-tool
+ *  events and fires Stop after the final invocation. Both executable paths are
+ *  absolute and JSON.stringify owns their quoting, so the commands have no
+ *  shell variables or cwd-dependent paths. */
+export function workerAgyHooksJson(workspaceRoot: string, nodePath: string): string {
+  const absoluteNode = nodePath.replace(/\\/g, '/');
+  const statusScript = [
+    workspaceRoot.replace(/\\/g, '/').replace(/\/+$/, ''),
+    '.lares', 'scripts', 'dashboard-status.mjs',
+  ].join('/');
+  const command = (args: string): string => {
+    const invocation = `& ${JSON.stringify(absoluteNode)} ${JSON.stringify(statusScript)} ${args}`;
+    const encodedInvocation = Buffer.from(invocation, 'utf16le').toString('base64');
+    return `powershell.exe -NoProfile -NonInteractive -EncodedCommand ${encodedInvocation}`;
+  };
+  return `${JSON.stringify({
+    'lares-dashboard-status': {
+      PreInvocation: [{ command: command('working --event PreInvocation') }],
+      Stop: [{ command: command('--event Stop') }],
     },
   }, null, 2)}\n`;
 }

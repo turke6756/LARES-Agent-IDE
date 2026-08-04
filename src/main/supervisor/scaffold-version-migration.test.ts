@@ -73,6 +73,7 @@ import {
   DASHBOARD_STATUS_SCRIPT_V8_HASH,
   DASHBOARD_STATUS_SCRIPT_V9_HASH,
   WORKER_AGY_HOOKS_JSON_V1_HASH,
+  workerAgyHooksJsonV2,
   GUARD_GIT_DISCARD_MJS,
   RESEARCH_WRITE_GUARD_MJS,
   RESEARCH_STORE_README_MD,
@@ -107,6 +108,7 @@ import {
   WORKER_CLAUDE_SETTINGS_JSON_V6,
   WORKER_CLAUDE_SETTINGS_JSON_V7,
 } from '../../shared/constants';
+import { getNodeShimDir } from '../node-shim';
 import { AGY_STATUS_HOOK_ENTRY } from './agy-hooks';
 import {
   GUARD_GIT_DISCARD_MJS_V1,
@@ -437,7 +439,7 @@ test('2e1. pristine v9 script silently upgrades to v10 via previousHashes[9]', (
   }
 });
 
-test('2e2. pristine agy carrier v1 silently upgrades to flat workspace carrier v2', () => {
+test('2e2. pristine agy carrier v1 silently upgrades to Stop-enabled v3', () => {
   const workDir = mktmp('scaffold-agy-v1');
   const carrierPath = path.join(workDir, '.lares', 'workers', 'agy', '.agents', 'hooks.json');
   const oldBody = JSON.stringify({ 'lares-dashboard-status': AGY_STATUS_HOOK_ENTRY }, null, 2) + '\n';
@@ -457,9 +459,40 @@ test('2e2. pristine agy carrier v1 silently upgrades to flat workspace carrier v
     const upgraded = JSON.parse(fs.readFileSync(carrierPath, 'utf-8'));
     assert.equal(typeof upgraded['lares-dashboard-status'].PreInvocation[0].command, 'string');
     assert.ok(!('matcher' in upgraded['lares-dashboard-status'].PreInvocation[0]));
-    assert.equal(readSidecar(workDir)['workers/agy/.agents/hooks.json'], 2);
+    assert.equal(upgraded['lares-dashboard-status'].Stop.length, 1);
+    assert.equal(readSidecar(workDir)['workers/agy/.agents/hooks.json'], 3);
     const carrierDir = path.dirname(carrierPath);
     assert.equal(fs.readdirSync(carrierDir).filter((name) => name.startsWith('hooks.json.bak.')).length, 0);
+  } finally {
+    if (priorUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = priorUserProfile;
+    cleanup();
+    rmrf(workDir);
+  }
+});
+
+test('2e3. pristine path-dependent agy carrier v2 silently upgrades to Stop-enabled v3', () => {
+  const workDir = mktmp('scaffold-agy-v2');
+  const carrierPath = path.join(workDir, '.lares', 'workers', 'agy', '.agents', 'hooks.json');
+  const priorUserProfile = process.env.USERPROFILE;
+  process.env.USERPROFILE = path.join(workDir, 'fake-home');
+  const { supervisor, cleanup } = makeSupervisor();
+  try {
+    const oldBody = workerAgyHooksJsonV2(workDir, path.join(getNodeShimDir(), 'node.cmd'));
+    fs.mkdirSync(path.dirname(carrierPath), { recursive: true });
+    fs.writeFileSync(carrierPath, oldBody, 'utf-8');
+    fs.writeFileSync(
+      sidecarPath(workDir),
+      JSON.stringify({ 'workers/agy/.agents/hooks.json': 2 }, null, 2) + '\n',
+      'utf-8',
+    );
+    supervisor.ensureWorkerScaffold(workDir, 'agy', 'windows');
+    const upgraded = JSON.parse(fs.readFileSync(carrierPath, 'utf-8'));
+    assert.equal(upgraded['lares-dashboard-status'].PreInvocation.length, 1);
+    assert.equal(upgraded['lares-dashboard-status'].Stop.length, 1);
+    assert.notEqual(fs.readFileSync(carrierPath, 'utf-8'), oldBody);
+    assert.equal(readSidecar(workDir)['workers/agy/.agents/hooks.json'], 3);
+    assert.equal(fs.readdirSync(path.dirname(carrierPath)).filter((name) => name.startsWith('hooks.json.bak.')).length, 0);
   } finally {
     if (priorUserProfile === undefined) delete process.env.USERPROFILE;
     else process.env.USERPROFILE = priorUserProfile;
