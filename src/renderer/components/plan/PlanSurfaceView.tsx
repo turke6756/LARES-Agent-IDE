@@ -11,6 +11,8 @@ import PlanActivityTrail from './PlanActivityTrail';
 import PlanSectionNav from './PlanSectionNav';
 import type { FetchEventDetail } from './TrustedEventRow';
 import CandidatePreview, { type CandidatePreviewSelection } from '../save/CandidatePreview';
+import CommitOutcome from '../save/CommitOutcome';
+import type { CommitCoordinatorConsumeResponse } from '../../../shared/types';
 import { useDashboardStore } from '../../stores/dashboard-store';
 import MissionBoard from './MissionBoard';
 
@@ -53,6 +55,7 @@ function PlanSurfaceView({
   const scrollRef = useRef<HTMLDivElement>(null);
   const [activeAnchor, setActiveAnchor] = useState<string | null>(null);
   const [highlightAnchor, setHighlightAnchor] = useState<string | null>(null);
+  const [commitOutcome, setCommitOutcome] = useState<CommitCoordinatorConsumeResponse | null>(null);
   // GT-C §3.3 — the surface owns the view-mode. 'section' is the only first-ship
   // structure (keeps PlanSectionNav targets); 'story' is an explicit flat,
   // oldest-first run narrative with the section nav hidden (no dangling targets).
@@ -66,6 +69,13 @@ function PlanSurfaceView({
   useEffect(() => {
     setActiveAnchor((a) => a ?? groups[0]?.anchor ?? null);
   }, [groups]);
+
+  // A coordinator result belongs to the exact candidate token that produced it.
+  // Switching plans/selections must never leave that result attached to a new
+  // candidate surface.
+  useEffect(() => {
+    setCommitOutcome(null);
+  }, [workspaceId, candidateSelection]);
 
   // scroll-spy: update the active pill as sections cross the top of the scroll region.
   // Guarded so jsdom (no IntersectionObserver) is a no-op.
@@ -125,14 +135,29 @@ function PlanSurfaceView({
           )}
         </div>
       )}
-      {workspaceId && candidateSelection && (
+      {workspaceId && candidateSelection && !commitOutcome && (
         <div className="plan-surface__candidate" data-testid="plan-candidate-preview">
           <CandidatePreview
             workspaceId={workspaceId}
             selection={candidateSelection}
             title="Save this plan's work"
+            onCommit={async (response, messageBody) => {
+              if (!response.isCandidate || !('token' in response.candidate) || !response.candidate.token) return;
+              const result = await window.api.commitCoordinator.commit({
+                candidateId: response.candidate.candidateId,
+                tokenId: response.candidate.token.tokenId,
+                message: messageBody,
+              });
+              setCommitOutcome(result);
+            }}
           />
         </div>
+      )}
+      {commitOutcome && (
+        <CommitOutcome
+          response={commitOutcome}
+          onRepreview={() => setCommitOutcome(null)}
+        />
       )}
       <div className="plan-surface__viewtoggle" role="tablist" aria-label="Activity view" data-testid="plan-view-toggle">
         <button
