@@ -269,7 +269,7 @@ export async function resolveInternalGit(
 
 // ── Environment + arg-prefix construction ────────────────────────────────────
 
-export type GitEnvMode = 'read' | 'commit';
+export type GitEnvMode = 'read' | 'commit' | 'user-commit';
 
 /** Repo-routing vars an inherited environment could use to redirect our ops.
  *  All deleted before every git invocation (our own snapshot GIT_INDEX_FILE is
@@ -300,7 +300,8 @@ const LARES_CHECKPOINT_IDENTITY = {
  *   - deletes every repo-routing var (incl. all GIT_CONFIG_KEY_ / VALUE_ prefixes);
  *   • strips CLAUDECODE / CLAUDE_CODE_ENTRYPOINT / ELECTRON_RUN_AS_NODE;
  *   • sets GIT_TERMINAL_PROMPT=0 and GIT_OPTIONAL_LOCKS=0;
- *   • sets author/committer identity ONLY in `mode:'commit'`;
+ *   • sets the Lares author/committer identity ONLY in `mode:'commit'`;
+ *   • leaves identity unset in `mode:'user-commit'` so Git resolves the user;
  *   • leaves GIT_CONFIG_GLOBAL/SYSTEM/NOSYSTEM untouched (never set by us).
  */
 export function buildGitEnv(

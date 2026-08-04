@@ -99,7 +99,8 @@ export interface RunGitOptions {
   /** Per-op `GIT_INDEX_FILE` (a Lares-owned temp index, outside `.git/`). Injected
    *  after env sanitization; never inherited from the parent. */
   indexFile?: string;
-  /** Env mode for buildGitEnv — 'commit' sets the Lares identity. Default 'read'. */
+  /** Env mode for buildGitEnv — 'commit' sets the Lares identity while
+   *  'user-commit' defers identity resolution to Git. Default 'read'. */
   mode?: GitEnvMode;
   /** NUL-delimited stdin for plumbing that reads it (update-index --index-info,
    *  check-attr --stdin, hash-object --stdin). Written then closed immediately. */

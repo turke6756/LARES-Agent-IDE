@@ -3,11 +3,15 @@
 //   npm run build:main
 //   node dist/main/main/git/git-runtime.test.js
 //
-// NO real git runs here: discovery is exercised through pure functions
-// (parseGitVersion / pickInternalGit / describeAgentShellGit) and the workspace
-// probe through an injected `runGit` fixture + injected path/os deps.
+// Discovery is exercised through pure functions and the workspace probe through
+// injected deps. The user-commit identity test drives the resolved git in one
+// throwaway repository because the committed object is the contract boundary.
 
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 
 import type { GitCandidate, GitExecResult, RunGit } from './git-runtime';
 import {
@@ -168,16 +172,63 @@ test('buildGitEnv: leaves GIT_CONFIG_GLOBAL/SYSTEM/NOSYSTEM unset', () => {
   assert.equal(env.GIT_CONFIG_NOSYSTEM, undefined);
 });
 
-test('buildGitEnv: identity ONLY in commit mode', () => {
+test('buildGitEnv: checkpoint identity ONLY in commit mode', () => {
   const read = buildGitEnv({}, { mode: 'read' });
   assert.equal(read.GIT_AUTHOR_NAME, undefined);
   assert.equal(read.GIT_COMMITTER_EMAIL, undefined);
+
+  const userCommit = buildGitEnv({}, { mode: 'user-commit' });
+  assert.equal(userCommit.GIT_AUTHOR_NAME, undefined);
+  assert.equal(userCommit.GIT_AUTHOR_EMAIL, undefined);
+  assert.equal(userCommit.GIT_COMMITTER_NAME, undefined);
+  assert.equal(userCommit.GIT_COMMITTER_EMAIL, undefined);
+  assert.equal(userCommit.GIT_TERMINAL_PROMPT, '0');
+  assert.equal(userCommit.GIT_OPTIONAL_LOCKS, '0');
 
   const commit = buildGitEnv({}, { mode: 'commit' });
   assert.equal(commit.GIT_AUTHOR_NAME, 'Lares Checkpoints');
   assert.equal(commit.GIT_AUTHOR_EMAIL, 'checkpoints@lares.local');
   assert.equal(commit.GIT_COMMITTER_NAME, 'Lares Checkpoints');
   assert.equal(commit.GIT_COMMITTER_EMAIL, 'checkpoints@lares.local');
+});
+
+test('buildGitEnv: user-commit object uses the repository-configured user identity', async () => {
+  const internal = await resolveInternalGit();
+  assert.ok(internal, 'a compatible git is required for the user-commit contract test');
+
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'lares-user-commit-'));
+  try {
+    execFileSync(internal.execPath, ['init', '-q'], { cwd: repo });
+    execFileSync(internal.execPath, ['config', 'user.name', 'Save Card User'], { cwd: repo });
+    execFileSync(internal.execPath, ['config', 'user.email', 'save-card-user@example.test'], { cwd: repo });
+    fs.writeFileSync(path.join(repo, 'saved.txt'), 'saved\n');
+    execFileSync(internal.execPath, ['add', '--', 'saved.txt'], { cwd: repo });
+
+    const base: NodeJS.ProcessEnv = { ...process.env, GIT_DIR: path.join(repo, 'poison.git') };
+    delete base.GIT_AUTHOR_NAME;
+    delete base.GIT_AUTHOR_EMAIL;
+    delete base.GIT_COMMITTER_NAME;
+    delete base.GIT_COMMITTER_EMAIL;
+    const env = buildGitEnv(base, { mode: 'user-commit' });
+
+    assert.equal(env.GIT_DIR, undefined, 'routing-variable sanitization is retained');
+    assert.equal(env.GIT_TERMINAL_PROMPT, '0', 'user commits remain noninteractive');
+    execFileSync(internal.execPath, ['commit', '-q', '-m', 'save card'], { cwd: repo, env });
+
+    const identity = execFileSync(
+      internal.execPath,
+      ['show', '-s', '--format=%an%x00%ae%x00%cn%x00%ce', 'HEAD'],
+      { cwd: repo, encoding: 'utf8' },
+    ).trim().split('\0');
+    assert.deepEqual(identity, [
+      'Save Card User',
+      'save-card-user@example.test',
+      'Save Card User',
+      'save-card-user@example.test',
+    ]);
+  } finally {
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
 });
 
 // ── gitArgsPrefix ────────────────────────────────────────────────────────────
