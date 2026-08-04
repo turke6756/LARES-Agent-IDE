@@ -5,6 +5,7 @@ import type {
   CommitEligibility,
   PackageVerificationState,
 } from '../../../shared/commit-candidates';
+import { useSaveCardStore } from '../../stores/save-card-store';
 
 // SC-WP-3H — Save-lens candidate preview pane.
 //
@@ -32,7 +33,7 @@ export interface CandidatePreviewProps {
   /** Optional one-click commit hook. Invoked ONLY when the candidate is fully
    *  eligible and every acknowledgement is satisfied. Absent ⇒ the enabled Save
    *  button is inert (no CommitCoordinator is wired in this stage). */
-  onCommit?: (response: SaveCardPreviewResponse, messageBody: string) => void;
+  onCommit?: (response: SaveCardPreviewResponse, messageBody: string) => void | Promise<void>;
 }
 
 type LoadState =
@@ -92,6 +93,7 @@ export default function CandidatePreview({
   const [userTrailers, setUserTrailers] = useState('');
   const [overlapAck, setOverlapAck] = useState(false);
   const [unattributedAcks, setUnattributedAcks] = useState<Set<string>>(new Set());
+  const invalidateInventory = useSaveCardStore((s) => s.invalidateInventory);
 
   const request: SaveCardPreviewRequest = useMemo(
     () => ({
@@ -295,8 +297,10 @@ export default function CandidatePreview({
           className="ui-btn ui-btn-primary px-3 py-1 text-[12.5px]"
           data-testid="candidate-preview-save"
           disabled={!canSave}
-          onClick={() => {
-            if (canSave) onCommit?.(response, messageBody);
+          onClick={async () => {
+            if (!canSave || !onCommit) return;
+            await onCommit(response, messageBody);
+            invalidateInventory(workspaceId);
           }}
         >
           {response.isCandidate ? `Save — commit ${candidate.members.length} file${candidate.members.length === 1 ? '' : 's'}` : 'Save'}

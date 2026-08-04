@@ -25,6 +25,7 @@ import type {
   SelectionPreview,
 } from '../../../shared/commit-candidates';
 import CandidatePreview, { type CandidatePreviewSelection } from './CandidatePreview';
+import { useSaveCardStore } from '../../stores/save-card-store';
 
 (globalThis as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -104,6 +105,7 @@ async function render(props: Partial<React.ComponentProps<typeof CandidatePrevie
 }
 
 beforeEach(() => {
+  useSaveCardStore.getState().clearInventoryCache();
   preview = vi.fn();
   (window as unknown as { api: unknown }).api = { saveCard: { preview } };
   container = document.createElement('div');
@@ -241,10 +243,12 @@ describe('CandidatePreview', () => {
 
   it('fires onCommit only when eligible and acknowledged', async () => {
     const onCommit = vi.fn();
+    useSaveCardStore.getState().cacheInventory('ws-1', { bundles: [], quotaWeakening: null });
     preview.mockResolvedValue(response());
     await render({ onCommit });
 
     await act(async () => { (q('candidate-preview-save') as HTMLButtonElement).click(); });
     expect(onCommit).toHaveBeenCalledTimes(1);
+    expect(useSaveCardStore.getState().inventoryByWorkspace['ws-1'].loadedAt).toBe(0);
   });
 });

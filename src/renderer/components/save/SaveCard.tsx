@@ -1,5 +1,9 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useDashboardStore } from '../../stores/dashboard-store';
+import {
+  isSaveCardInventoryFresh,
+  useSaveCardStore,
+} from '../../stores/save-card-store';
 import type { SaveCardInventoryResponse } from '../../../shared/types';
 import type { SaveCardQuotaWeakening } from '../../../shared/commit-candidates';
 import SaveBundle, { isQuietlySaved, type WorkBundleDto } from './SaveBundle';
@@ -107,7 +111,20 @@ export default function SaveCard() {
   const workspace = useDashboardStore((s) =>
     s.workspaces.find((w) => w.id === s.selectedWorkspaceId),
   );
-  const [state, setState] = useState<LoadState>({ status: 'loading' });
+  const cached = useSaveCardStore((s) =>
+    workspaceId ? s.inventoryByWorkspace[workspaceId] : undefined,
+  );
+  const cacheInventory = useSaveCardStore((s) => s.cacheInventory);
+  const [state, setState] = useState<LoadState>(() =>
+    cached
+      ? {
+          status: 'ready',
+          bundles: cached.inventory.bundles,
+          quotaWeakening: cached.inventory.quotaWeakening,
+        }
+      : { status: 'loading' },
+  );
+  const [refreshing, setRefreshing] = useState(false);
   const [infoOpen, setInfoOpen] = useState(false);
   const infoRef = useRef<HTMLDivElement>(null);
   const infoButtonRef = useRef<HTMLButtonElement>(null);
@@ -150,13 +167,15 @@ export default function SaveCard() {
   }, [infoOpen]);
 
   const load = useCallback(
-    async (wsId: string, isCurrent: () => boolean) => {
-      setState({ status: 'loading' });
+    async (wsId: string, isCurrent: () => boolean, keepVisible: boolean) => {
+      if (keepVisible) setRefreshing(true);
+      else setState({ status: 'loading' });
       try {
         const response: SaveCardInventoryResponse = await window.api.saveCard.getInventory({
           workspaceId: wsId,
         });
         if (isCurrent()) {
+          cacheInventory(wsId, response);
           setState({
             status: 'ready',
             bundles: response.bundles,
@@ -164,29 +183,42 @@ export default function SaveCard() {
           });
         }
       } catch (err) {
-        if (isCurrent()) setState({ status: 'error', message: errorMessage(err) });
+        if (isCurrent() && !keepVisible) {
+          setState({ status: 'error', message: errorMessage(err) });
+        }
+      } finally {
+        if (isCurrent()) setRefreshing(false);
       }
     },
-    [],
+    [cacheInventory],
   );
 
   useEffect(() => {
     if (!workspaceId) {
+      setRefreshing(false);
       setState({ status: 'error', message: 'Select a workspace to inspect its save progress.' });
       return;
     }
+    if (cached) {
+      setState({
+        status: 'ready',
+        bundles: cached.inventory.bundles,
+        quotaWeakening: cached.inventory.quotaWeakening,
+      });
+      if (isSaveCardInventoryFresh(cached)) return;
+    }
     let active = true;
-    void load(workspaceId, () => active);
+    void load(workspaceId, () => active, Boolean(cached));
     return () => {
       active = false;
     };
-  }, [workspaceId, load]);
+  }, [workspaceId, cached?.loadedAt, load]);
 
   const refresh = useCallback(() => {
     if (!workspaceId) return;
     let active = true;
-    void load(workspaceId, () => active);
-  }, [workspaceId, load]);
+    void load(workspaceId, () => active, state.status === 'ready');
+  }, [workspaceId, load, state.status]);
 
   const header = (
     <>
@@ -242,6 +274,11 @@ export default function SaveCard() {
           <>Read-only inspection of uncommitted work</>
         )}
       </p>
+      {refreshing && (
+        <div className="sc-refreshing" data-testid="save-card-refreshing" role="status">
+          Refreshing save progress…
+        </div>
+      )}
     </>
   );
 

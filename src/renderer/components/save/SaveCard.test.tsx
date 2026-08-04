@@ -20,6 +20,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import type { SaveCardBundle } from '../../../shared/types';
 import type { DirtyEntry, SaveCardQuotaWeakening } from '../../../shared/commit-candidates';
 import SaveCard from './SaveCard';
+import { useSaveCardStore } from '../../stores/save-card-store';
 
 (globalThis as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -165,6 +166,7 @@ async function render() {
 }
 
 beforeEach(() => {
+  useSaveCardStore.getState().clearInventoryCache();
   storeState.selectedWorkspaceId = 'ws-1';
   getInventory = vi.fn();
   (window as unknown as { api: unknown }).api = { saveCard: { getInventory } };

@@ -15,6 +15,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import SaveCard from './SaveCard';
+import { useSaveCardStore } from '../../stores/save-card-store';
 
 (globalThis as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -49,6 +50,7 @@ async function render() {
 }
 
 beforeEach(() => {
+  useSaveCardStore.getState().clearInventoryCache();
   storeState.selectedWorkspaceId = 'ws-1';
   storeState.saveCardOpenGesture = false;
   // A clean tree so the card lands in its empty state with a Refresh button.

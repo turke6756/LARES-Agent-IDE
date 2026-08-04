@@ -98,6 +98,11 @@
   margin: 0 0 22px;
 }
 .sc-sub b { color: var(--color-fg-primary); font-weight: 600; }
+.sc-refreshing {
+  margin: -14px 0 14px;
+  color: var(--color-fg-muted);
+  font-size: 11px;
+}
 
 /* ── section rules ─────────────────────────────── */
 .sc-sect {
