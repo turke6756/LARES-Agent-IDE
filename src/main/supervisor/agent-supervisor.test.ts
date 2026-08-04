@@ -1883,17 +1883,19 @@ test('grok worker: the resolved .grok\\bin\\grok.exe + worker env reach runner.l
 
   const origWinLaunch = (WindowsRunner.prototype as { launch: unknown }).launch;
   let capturedCmd: string | undefined;
+  let capturedArgs: string[] | undefined;
   let capturedEnv: Record<string, string> | undefined;
   (WindowsRunner.prototype as { launch: unknown }).launch = function (
     this: WindowsRunner,
     _workDir: string,
     cmd: string,
-    _args: string[],
+    launchArgs: string[],
     _logPath: string,
     _directSpawn?: boolean,
     extraEnv?: Record<string, string>,
   ) {
     capturedCmd = cmd;
+    capturedArgs = launchArgs;
     capturedEnv = extraEnv;
     (this as unknown as { _pid: number; _alive: boolean })._pid = 1;
     (this as unknown as { _pid: number; _alive: boolean })._alive = true;
@@ -1910,6 +1912,7 @@ test('grok worker: the resolved .grok\\bin\\grok.exe + worker env reach runner.l
       capturedCmd!.endsWith(path.join('.grok', 'bin', 'grok.exe')),
       'the resolved grok binary must be the .grok\\bin\\grok.exe installer path',
     );
+    assert.ok(capturedArgs?.includes('--always-approve'), 'grok launches must auto-approve tool executions');
 
     // The generic (provider-agnostic) worker env reaches the runner.
     assert.ok(capturedEnv, 'a grok worker launch must inject extraEnv');
@@ -1964,17 +1967,19 @@ test('agy worker: the resolved %LOCALAPPDATA%\\agy\\bin\\agy.exe + worker env re
 
   const origWinLaunch = (WindowsRunner.prototype as { launch: unknown }).launch;
   let capturedCmd: string | undefined;
+  let capturedArgs: string[] | undefined;
   let capturedEnv: Record<string, string> | undefined;
   (WindowsRunner.prototype as { launch: unknown }).launch = function (
     this: WindowsRunner,
     _workDir: string,
     cmd: string,
-    _args: string[],
+    launchArgs: string[],
     _logPath: string,
     _directSpawn?: boolean,
     extraEnv?: Record<string, string>,
   ) {
     capturedCmd = cmd;
+    capturedArgs = launchArgs;
     capturedEnv = extraEnv;
     (this as unknown as { _pid: number; _alive: boolean })._pid = 1;
     (this as unknown as { _pid: number; _alive: boolean })._alive = true;
@@ -1983,6 +1988,7 @@ test('agy worker: the resolved %LOCALAPPDATA%\\agy\\bin\\agy.exe + worker env re
     await (h.supervisor as unknown as { launchWindowsAgent: (a: Agent) => Promise<void> })
       .launchWindowsAgent(agent);
     assert.equal(capturedCmd, agyExe);
+    assert.ok(capturedArgs?.includes('--dangerously-skip-permissions'), 'agy launches must auto-approve tool permissions');
     assert.equal(capturedEnv?.AGENT_ID, agent.id);
     assert.equal(capturedEnv?.DASHBOARD_PORT, String((h.supervisor as unknown as { apiServerPort: number }).apiServerPort));
     assert.ok(capturedEnv?.DASHBOARD_SPOOL_PATH);

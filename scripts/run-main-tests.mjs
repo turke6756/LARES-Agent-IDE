@@ -28,6 +28,7 @@ const TESTS = [
   'dist/main/main/supervisor/launch-first-user-message-prefix.test.js',
   'dist/main/main/supervisor/codex-rollout-freshness.test.js',
   'dist/main/main/supervisor/env-sanitize.test.js',
+  'dist/main/main/supervisor/provider-auto-approve.test.js',
   'dist/main/main/supervisor/provider-resolver.test.js',
   'dist/main/main/runtime-prerequisites.test.js',
   'dist/main/main/supervisor/codex-sid-recovery-on-chat-read.test.js',

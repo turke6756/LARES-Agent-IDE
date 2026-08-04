@@ -60,6 +60,7 @@ import {
 } from '../../shared/constants';
 import { removeGlobalAgyStatusHook } from './agy-hooks';
 import { ensureAgyPermissions, ensureAgyTrust } from './agy-settings';
+import { addProviderAutoApproveFlag } from './provider-auto-approve';
 import { ensureNodeShimDir } from '../node-shim';
 import { MEMORY_INDEX_MJS } from '../../shared/generated/memory-index-cli.generated';
 // WP-C — provider-neutral supervisor memory-index launch projection + Codex
@@ -4432,6 +4433,7 @@ export class AgentSupervisor extends EventEmitter {
     const parts = agent.command.split(/\s+/);
     const cmd = parts[0];
     let args = overrideArgs || parts.slice(1);
+    args = addProviderAutoApproveFlag(agent.provider, args);
 
     if (!overrideArgs) {
       const isClaude = agent.provider === 'claude';
