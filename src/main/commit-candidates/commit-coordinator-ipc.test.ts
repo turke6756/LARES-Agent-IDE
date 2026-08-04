@@ -160,6 +160,33 @@ test('main-process flag rejects direct IPC before route or token access', async 
   assert.equal(routeReads, 0, 'disabled invocation must not reach injected production routes');
 });
 
+test('the injected flag seam alone makes an injected coordinator route reachable', async () => {
+  const ipc = new FakeIpc();
+  let enabled = false;
+  let coordinatorCalls = 0;
+  registerCommitCoordinatorIpc(ipc, () => routesFixture({
+    coordinator: {
+      commit: async () => {
+        coordinatorCalls++;
+        return { kind: 'outcome', outcome: {
+          status: 'aborted-stale', reason: 'fresh route reached', attemptId: 'attempt-flag',
+        } };
+      },
+    },
+  }), () => enabled);
+  const request = { candidateId: 'candidate-1', tokenId: 'token-1', message: 'Save it' };
+
+  await assert.rejects(() => ipc.invoke(COMMIT_COORDINATOR_CHANNEL, request), /disabled/i);
+  assert.equal(coordinatorCalls, 0);
+  enabled = true;
+  const response = await ipc.invoke(COMMIT_COORDINATOR_CHANNEL, request);
+  assert.deepEqual(response, {
+    kind: 'outcome',
+    outcome: { status: 'aborted-stale', reason: 'fresh route reached', attemptId: 'attempt-flag' },
+  });
+  assert.equal(coordinatorCalls, 1);
+});
+
 test('candidateId must bind the token before 4D can consume it', async () => {
   const ipc = new FakeIpc();
   let coordinatorCalls = 0;

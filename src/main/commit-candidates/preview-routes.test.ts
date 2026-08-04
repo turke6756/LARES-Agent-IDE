@@ -17,7 +17,7 @@
 import assert from 'node:assert/strict';
 
 import { createPreviewRoutes, type PreviewRoutesDeps } from './preview-routes';
-import { buildCandidate } from './candidate-service';
+import { buildCandidate, computeCandidateTopologyDigest } from './candidate-service';
 import type { CandidateInventoryRead } from './candidate-service';
 import type {
   CommitCandidate,
@@ -275,6 +275,65 @@ test('an unknown target workspace is rejected honestly', async () => {
     }),
     /unknown target workspace/i,
   );
+});
+
+test('fleet-adhoc resolver captures and returns the checkpoint engine boundary OID', async () => {
+  const calls: Array<{ workspaceId: string; label: string }> = [];
+  const boundaryOid = 'c'.repeat(40);
+  const { saveCardFinalizeRoutes } = createPreviewRoutes(baseDeps({
+    captureFinalizationBoundary: async (workspaceId, label) => {
+      calls.push({ workspaceId, label });
+      return { oid: boundaryOid, treeOid: 'd'.repeat(40) };
+    },
+  }));
+
+  const context = await saveCardFinalizeRoutes.resolveBoundary({ packageId: 'component:c1' });
+  assert.deepEqual(calls, [{ workspaceId: 'ws-1', label: 'lares:finalization:component:c1' }]);
+  assert.equal(context.boundaryOid, boundaryOid, 'the fake engine OID is the durable boundary input');
+  assert.equal(context.repositoryKey, REPO_KEY);
+  assert.equal(context.members.length, 1);
+  assert.equal(context.members[0].path.pathBytesBase64, b64('e1'));
+});
+
+test('production coordinator seams reassemble a minted snapshot from the shared resolver', async () => {
+  const routes = createPreviewRoutes(baseDeps({
+    getPackageFinalization: (id) => (id === 'fin-1' ? finalization({
+      memberManifestJson: JSON.stringify([{
+        ...frozen('e1'),
+        commitBlobOid: OID,
+      }]),
+    }) : null),
+  }));
+  const request = {
+    workspaceId: 'ws-1',
+    selectedComponentIds: ['c1'],
+    selectedUnattributedEntryIds: [],
+    finalizationIds: ['fin-1'],
+  };
+  const context = await routes.saveCardPreviewRoutes.resolvePreviewContext(request);
+  const topology = computeCandidateTopologyDigest(context, ['c1'], []);
+  const minted = routes.productionSeams.candidateService.mintCandidateToken({
+    selectedComponentIds: ['c1'],
+    selectedUnattributedEntryIds: [],
+    finalizationIds: ['fin-1'],
+    acknowledgeTopologyDigest: topology,
+    acknowledgeUnattributedEntryIds: [],
+  }, context) as CommitCandidate;
+  assert.ok(minted.token, 'the production token store is the coordinator token store');
+  const snapshot = routes.productionSeams.candidateService.resolveCandidateToken(minted.token!.tokenId);
+  assert.ok(snapshot);
+
+  const live = await routes.productionSeams.reassemble(snapshot!);
+  assert.equal(live.candidateId, minted.candidateId);
+  assert.equal(live.componentTopologyDigest, topology);
+  assert.equal(live.eligible, true);
+  assert.deepEqual(live.members.map((member) => member.entryId), ['e1']);
+  assert.deepEqual(routes.productionSeams.locateRepository(snapshot!), { repoRoot: '/repo', gitExe: 'git' });
+  assert.deepEqual(routes.productionSeams.deriveTrailers(snapshot!), [
+    `Lares-Candidate: ${minted.candidateId}`,
+    'Lares-Turn: t1',
+    'Lares-Plan: plan-A',
+  ]);
 });
 
 (async () => {

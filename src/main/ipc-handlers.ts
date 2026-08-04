@@ -77,6 +77,10 @@ import {
   type SaveCardFinalizeRoutes,
   type SaveCardAttentionProvider,
 } from './commit-candidates/save-card-ipc';
+import {
+  registerCommitCoordinatorIpc,
+  type CommitCoordinatorRoutes,
+} from './commit-candidates/commit-coordinator-ipc';
 import type { RequestedPlanBinding } from '../shared/commit-candidates';
 import { resolvePlanBindingAtBoundary } from './api-server';
 
@@ -118,6 +122,14 @@ export function setSaveCardPreviewRoutes(routes: SaveCardPreviewRoutes | null): 
 let saveCardFinalizeRoutes: SaveCardFinalizeRoutes | null = null;
 export function setSaveCardFinalizeRoutes(routes: SaveCardFinalizeRoutes | null): void {
   saveCardFinalizeRoutes = routes;
+}
+
+// SC-WP-W2a — the shared Save/Plan consume route is late-injected beside the
+// preview/finalize routes. The registered handler still owns the feature-flag
+// gate, so a populated production route is unreachable while the seam is false.
+let commitCoordinatorRoutes: CommitCoordinatorRoutes | null = null;
+export function setCommitCoordinatorRoutes(routes: CommitCoordinatorRoutes | null): void {
+  commitCoordinatorRoutes = routes;
 }
 
 // SC-WP-N2 — the checkpoint-expiry attention provider, injected by the same async
@@ -235,6 +247,7 @@ export function registerIpcHandlers(
   // registered" error is exactly a channel that was defined but never registered.
   registerSaveCardPreviewIpc(ipcMain, () => saveCardPreviewRoutes);
   registerSaveCardFinalizeIpc(ipcMain, () => saveCardFinalizeRoutes);
+  registerCommitCoordinatorIpc(ipcMain, () => commitCoordinatorRoutes);
   // SC-WP-N2 — the lightweight checkpoint-expiry attention read. Registered here
   // (lazy provider getter) so `savecard:getAttention` exists before the async
   // engine bootstrap starts publishing notices; a missing provider answers null.

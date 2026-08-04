@@ -24,6 +24,7 @@ import {
   initDatabase, getWorkspaces, getActiveAgents, getAllAgents, reconcileStaleOpenContinuationAttempts,
   getPlan, getWorkspace, listOrchestrationRuns, getLiveRailAgentForPlan, getPlanEventsForRender,
   setWitnessObserver, getAgent, listTurnRecords,
+  insertPendingCommitAttempt, resolveCommitAttempt,
 } from './database';
 import { createHash } from 'crypto';
 import { readFileContents } from './file-reader';
@@ -38,9 +39,11 @@ import { startContinuationWatcher } from './supervisor/continuation-watcher-wiri
 import { runCheckpointStartupMaintenance } from './git-checkpoints/reconciler';
 import { createCheckpointEngine } from './git-checkpoints/engine-bootstrap';
 import { RETENTION_CYCLE_INTERVAL_MS } from '../shared/constants';
-import { registerIpcHandlers, setHumanCheckpointRoutes, setSaveCardRoutes, setSaveCardPreviewRoutes, setSaveCardAttentionProvider } from './ipc-handlers';
+import { registerIpcHandlers, setHumanCheckpointRoutes, setSaveCardRoutes, setSaveCardPreviewRoutes, setSaveCardFinalizeRoutes, setCommitCoordinatorRoutes, setSaveCardAttentionProvider } from './ipc-handlers';
 import { createSaveCardRoutes } from './commit-candidates/save-card-routes';
 import { createPreviewRoutes } from './commit-candidates/preview-routes';
+import { CommitCoordinator } from './git-checkpoints/commit-coordinator';
+import { runGit, runGitBytes } from './git-checkpoints/git-command';
 import { broadcastSaveCardAttention } from './commit-candidates/save-card-ipc';
 import type { SaveCardQuotaWeakening } from '../shared/commit-candidates';
 import type { SaveCardCheckpointExpiryNotice } from '../shared/types';
@@ -861,12 +864,42 @@ app.whenReady().then(async () => {
           // ONE shared assembly resolves the read-only `CandidateBuildContext`, so
           // `savecard:preview` and `plan:previewCandidate` return real
           // SelectionPreview/CommitCandidate verdicts. Until this runs both channels
-          // answer "preview engine unavailable" honestly. (The fleet-adhoc finalize
-          // route's boundary-OID resolver is engine-coupled and handed off; its
-          // channel is registered but its route stays null for now.)
-          const previewRoutes = createPreviewRoutes({ gitExe: engine.gitExe });
+          // answer "preview engine unavailable" honestly. The same production
+          // resolver owns the consume-time live reassembly/re-read/repository seams
+          // and the checkpoint-native fleet-finalization boundary capture.
+          const previewRoutes = createPreviewRoutes({
+            gitExe: engine.gitExe,
+            queue: engine.queue,
+            captureFinalizationBoundary: engine.captureFinalizationBoundary,
+          });
           setSaveCardPreviewRoutes(previewRoutes.saveCardPreviewRoutes);
           providePlanPreviewRoutes(previewRoutes.planPreviewRoutes);
+          setSaveCardFinalizeRoutes(previewRoutes.saveCardFinalizeRoutes);
+          const candidateService = previewRoutes.productionSeams.candidateService;
+          const coordinator = new CommitCoordinator({
+            composeLocks: previewRoutes.productionSeams.composeLocks,
+            queue: engine.queue,
+            tokens: {
+              resolve: candidateService.resolveCandidateToken.bind(candidateService),
+              tryConsume: candidateService.tryMarkTokenConsuming.bind(candidateService),
+              markConsumed: candidateService.markTokenConsumed.bind(candidateService),
+            },
+            attempts: {
+              insertPending: insertPendingCommitAttempt,
+              resolve: resolveCommitAttempt,
+            },
+            runGit,
+            runGitBytes,
+            reassemble: previewRoutes.productionSeams.reassemble,
+            readMemberRepresentation: previewRoutes.productionSeams.readMemberRepresentation,
+            locateRepository: previewRoutes.productionSeams.locateRepository,
+            deriveTrailers: previewRoutes.productionSeams.deriveTrailers,
+          });
+          setCommitCoordinatorRoutes({
+            coordinator,
+            resolveCandidateToken: candidateService.resolveCandidateToken.bind(candidateService),
+            locateRepository: previewRoutes.productionSeams.locateRepository,
+          });
           await engine.runStartupMaintenance();
           // WP-G3.3 — schedule the periodic retention cycle (distill-before-prune +
           // triggered loose-object maintenance + storage report) on the shared engine

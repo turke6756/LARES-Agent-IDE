@@ -16,20 +16,20 @@
 import {
   SAVECARD_CHANNELS,
   SAVECARD_PREVIEW_CHANNEL,
+  SAVECARD_FINALIZE_CHANNEL,
   SAVECARD_ATTENTION_CHANNEL,
   SAVECARD_ATTENTION_CHANGED_CHANNEL,
   type SaveCardInventoryRequest,
   type SaveCardInventoryResponse,
   type SaveCardPreviewRequest,
   type SaveCardPreviewResponse,
+  type SaveCardFleetAdhocMarkDoneRequest,
+  type SaveCardFleetAdhocMarkDoneResponse,
   type SaveCardAttentionRequest,
   type SaveCardCheckpointExpiryNotice,
   type SaveCardAttentionChangedPayload,
 } from '../../shared/types';
-import type {
-  FinalizationBoundaryStatus,
-  PackageFinalization,
-} from '../database';
+import type { PackageFinalization } from '../database';
 import {
   finalizePackage,
   type FinalizeOutcome,
@@ -42,6 +42,14 @@ import {
   type CandidateSelectionRequest,
 } from './candidate-service';
 import type { CommitCandidate, SelectionPreview } from '../../shared/commit-candidates';
+
+// Backward-compatible main-module exports for the focused IPC tests and any
+// main-side callers; the wire contract itself is owned by shared/types.
+export {
+  SAVECARD_FINALIZE_CHANNEL,
+  type SaveCardFleetAdhocMarkDoneRequest,
+  type SaveCardFleetAdhocMarkDoneResponse,
+} from '../../shared/types';
 
 /** Narrow read-only surface injected after the Save-card engine is available. */
 export interface SaveCardRoutes {
@@ -165,14 +173,6 @@ export function broadcastSaveCardAttention(
 
 /** The DISTINCT mutating channel. Kept out of `SAVECARD_CHANNELS` so the Stage 1
  *  read-only audit stays exact; carries the explicit `markDone` verb. */
-export const SAVECARD_FINALIZE_CHANNEL = 'savecard:markDoneFleetAdhoc' as const;
-
-/** Renderer request to mint a fleet-adhoc finalization for one package. Only the
- *  stable `packageId` crosses the wire; the main process resolves the boundary. */
-export interface SaveCardFleetAdhocMarkDoneRequest {
-  packageId: string;
-}
-
 /**
  * Everything `finalizePackage` needs EXCEPT the fleet-adhoc discriminants, which
  * this channel pins itself. A main-process provider resolves it (boundary oid,
@@ -187,16 +187,6 @@ export type FleetAdhocBoundaryContext = Omit<
 
 /** Renderer-safe result of a fleet-adhoc mark-done. `boundaryRef` is always
  *  captured — even an `unavailable` outcome names the ref it failed to pin. */
-export interface SaveCardFleetAdhocMarkDoneResponse {
-  finalizationId: string;
-  packageId: string;
-  finalizationKind: 'fleet-adhoc';
-  outcome: FinalizeOutcome;
-  boundaryRef: string | null;
-  boundaryStatus: FinalizationBoundaryStatus;
-  packageRevision: number;
-}
-
 /** The main-process seam the mark-done channel drives. `resolveBoundary` maps a
  *  renderer `packageId` to the full finalize context; `finalizeDeps` is left
  *  undefined in production so the live DB store + real ref writer are used. */

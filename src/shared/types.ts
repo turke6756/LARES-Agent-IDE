@@ -2121,6 +2121,33 @@ export interface SaveCardPreviewResponse {
   unacknowledgedUnattributedEntryIds: string[];
 }
 
+// ── SC-WP-3E — fleet-adhoc mark-done route ────────────────────────────────
+
+/** Kept separate from the Stage-1 read-only channel map because this explicit
+ * action mints a durable fleet-adhoc finalization boundary. */
+export const SAVECARD_FINALIZE_CHANNEL = 'savecard:markDoneFleetAdhoc' as const;
+
+export interface SaveCardFleetAdhocMarkDoneRequest {
+  packageId: string;
+}
+
+export type SaveCardFinalizeOutcome =
+  | 'created'
+  | 'existing-unchanged'
+  | 'superseded'
+  | 'reattached-ready'
+  | 'boundary-unavailable';
+
+export interface SaveCardFleetAdhocMarkDoneResponse {
+  finalizationId: string;
+  packageId: string;
+  finalizationKind: 'fleet-adhoc';
+  outcome: SaveCardFinalizeOutcome;
+  boundaryRef: string | null;
+  boundaryStatus: 'ready' | 'unavailable' | 'pruned';
+  packageRevision: number;
+}
+
 // ── SC-WP-4E — shared commit-coordinator consume route ───────────────────────
 
 /** Lens-neutral consume channel shared by the Save and Plan surfaces. */
@@ -3036,6 +3063,10 @@ export interface IpcApi {
   saveCard: {
     getInventory: (req: SaveCardInventoryRequest) => Promise<SaveCardInventoryResponse>;
     preview: (req: SaveCardPreviewRequest) => Promise<SaveCardPreviewResponse>;
+    /** Explicitly freeze and pin a fleet-adhoc package boundary. */
+    markDone: (
+      req: SaveCardFleetAdhocMarkDoneRequest,
+    ) => Promise<SaveCardFleetAdhocMarkDoneResponse>;
     /** SC-WP-N2 — lightweight checkpoint-expiry attention read (no full inventory
      *  probe). Resolves the freshest notice for the workspace, or null. */
     getAttention: (req: SaveCardAttentionRequest) => Promise<SaveCardCheckpointExpiryNotice | null>;

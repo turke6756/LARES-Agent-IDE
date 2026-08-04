@@ -43,6 +43,9 @@ import { probeWorkspaceGit as realProbeWorkspaceGit } from '../git/git-runtime';
 import { runGit as realRunGit, runGitBytes as realRunGitBytes } from '../git-checkpoints/git-command';
 import {
   CommitCandidateService,
+  computeCandidateTopologyDigest,
+  buildCandidate,
+  type CandidateTokenSnapshot,
   type CandidateBuildContext,
   type CandidateInventoryRead,
   type CandidateLedgerLink,
@@ -50,6 +53,13 @@ import {
   type CandidateWorkspaceInput,
   type CaptureTurnReader,
 } from './candidate-service';
+import { ComposeLockRegistry } from './compose-lock-registry';
+import type {
+  LiveReassembly,
+  ReadMemberRepresentationInput,
+  MemberRepresentation,
+} from '../git-checkpoints/commit-coordinator';
+import { CheckpointQueue } from '../git-checkpoints/checkpoint-queue';
 import { computeIndexFingerprint } from './index-fingerprint';
 import {
   readCurrentCommitRepresentation,
@@ -60,7 +70,11 @@ import { createTurnStampSource, type TurnStampRecordReader } from './stamp-proje
 import type { RunGitBytesLike, RunGitTextLike } from './dirty-inventory';
 import type { TurnWitnessReader } from './witness-projection';
 import type { CommitPathLinkReader } from './protection-read';
-import type { SaveCardPreviewRoutes } from './save-card-ipc';
+import type {
+  FleetAdhocBoundaryContext,
+  SaveCardFinalizeRoutes,
+  SaveCardPreviewRoutes,
+} from './save-card-ipc';
 import type { PlanCandidatePreviewRoutes } from '../plans/plan-ipc';
 
 const OID_RE = /^[0-9a-f]{40,64}$/;
@@ -92,6 +106,15 @@ export interface PreviewRoutesDeps {
    *  finalizations / reps / plan-owned defaulting) is exercised without re-running
    *  the whole real-git 1G pipeline (already covered by save-card-routes.test). */
   assembleInventory?: (req: CandidateReadRequest) => Promise<CandidateInventoryRead>;
+  /** Production uses the checkpoint engine's shared queue. */
+  queue?: CheckpointQueue;
+  /** Production checkpoint-native raw snapshot boundary; tests inject a fake. */
+  captureFinalizationBoundary?: (
+    workspaceId: string,
+    label: string,
+  ) => Promise<{ oid: string; treeOid: string }>;
+  /** Shared with the CommitCoordinator and token store. */
+  composeLocks?: ComposeLockRegistry;
 }
 
 /** The selection-independent portion of a preview assembly plus the resolved
@@ -107,6 +130,15 @@ interface PreviewScope {
   entriesById: ReadonlyMap<string, DirtyEntry>;
   /** Each component's member entry ids, so a whole-component selection expands. */
   componentEntryIds: ReadonlyMap<string, readonly string[]>;
+}
+
+export interface PreviewProductionSeams {
+  candidateService: CommitCandidateService;
+  composeLocks: ComposeLockRegistry;
+  reassemble(snapshot: CandidateTokenSnapshot): Promise<LiveReassembly>;
+  readMemberRepresentation(input: ReadMemberRepresentationInput): Promise<MemberRepresentation>;
+  locateRepository(snapshot: CandidateTokenSnapshot): { repoRoot: string; gitExe?: string };
+  deriveTrailers(snapshot: CandidateTokenSnapshot): string[];
 }
 
 function canonicalDir(realpath: (p: string) => string, p: string): string {
@@ -127,6 +159,8 @@ function canonicalDir(realpath: (p: string) => string, p: string): string {
 export function createPreviewRoutes(deps: PreviewRoutesDeps): {
   saveCardPreviewRoutes: SaveCardPreviewRoutes;
   planPreviewRoutes: PlanCandidatePreviewRoutes;
+  saveCardFinalizeRoutes: SaveCardFinalizeRoutes;
+  productionSeams: PreviewProductionSeams;
 } {
   const gitExe = deps.gitExe;
   const getWorkspaces = deps.getWorkspaces ?? dbGetWorkspaces;
@@ -144,6 +178,8 @@ export function createPreviewRoutes(deps: PreviewRoutesDeps): {
   const runGitBytes = deps.runGitBytes ?? realRunGitBytes;
   const realpath = deps.realpath ?? ((p) => fs.realpathSync.native(p));
   const contractVersion = deps.contractVersion ?? BUNDLE_CONTRACT_VERSION;
+  const composeLocks = deps.composeLocks ?? new ComposeLockRegistry();
+  const repositoryLocations = new Map<string, { repoRoot: string; gitExe?: string }>();
 
   const service = new CommitCandidateService({
     runGit,
@@ -152,6 +188,7 @@ export function createPreviewRoutes(deps: PreviewRoutesDeps): {
     stampSource: createTurnStampSource(readTurnRecord),
     readCaptureTurns,
     readCommitPathLinks,
+    tokenStore: { composeLocks },
   });
   const assembleInventory = deps.assembleInventory
     ?? ((req: CandidateReadRequest) => service.assembleInventory(req));
@@ -200,6 +237,7 @@ export function createPreviewRoutes(deps: PreviewRoutesDeps): {
     });
 
     const repository = read.inventory.repository;
+    repositoryLocations.set(repository.repositoryKey, { repoRoot, gitExe });
     const [pinnedHeadOid, indexFingerprint] = await Promise.all([
       resolvePinnedHead(repoRoot),
       computeIndexFingerprint({ repoRoot, runGitBytes, runGit, gitExe }),
@@ -267,6 +305,10 @@ export function createPreviewRoutes(deps: PreviewRoutesDeps): {
           gitExe: scope.gitExe,
           runGit: scope.runGit,
           runGitBytes: scope.runGitBytes,
+          queue: deps.queue,
+          commonDirQueueKey: deps.queue
+            ? scope.context.repository.objectDatabaseKey
+            : undefined,
         });
         return [entry.entryId, rep];
       }),
@@ -328,5 +370,152 @@ export function createPreviewRoutes(deps: PreviewRoutesDeps): {
     },
   };
 
-  return { saveCardPreviewRoutes, planPreviewRoutes };
+  async function reassemble(snapshot: CandidateTokenSnapshot): Promise<LiveReassembly> {
+    const workspaceId = snapshot.candidate.repository.workspaces[0]?.workspaceId;
+    if (!workspaceId) throw new Error('candidate snapshot has no repository workspace');
+    const scope = await assembleScope(workspaceId);
+    const request = snapshot.normalizedRequest;
+    const context = await buildContext(
+      scope,
+      request.selectedComponentIds,
+      request.selectedUnattributedEntryIds,
+      request.finalizationIds,
+    );
+    const rebuilt = buildCandidate(request, context);
+    const entriesById = new Map(context.inventory.entries.map((entry) => [entry.entryId, entry]));
+    const members = rebuilt.members.flatMap((member) => {
+      const entry = entriesById.get(member.entryId);
+      return entry ? [{
+        entryId: entry.entryId,
+        path: entry.path,
+        commitPathspecs: entry.commitPathspecs,
+        expectedWorktreeState: entry.expectedWorktreeState,
+        rawWorktreeBlobOid: entry.rawWorktreeBlobOid,
+      }] : [];
+    });
+    const selectedUnattributed = context.inventory.entries.filter((entry) =>
+      request.selectedUnattributedEntryIds.includes(entry.entryId),
+    );
+    return {
+      candidateId: 'candidateId' in rebuilt ? rebuilt.candidateId : '',
+      componentTopologyDigest: computeCandidateTopologyDigest(
+        context,
+        rebuilt.componentIds,
+        selectedUnattributed,
+      ),
+      eligible: rebuilt.eligibility.eligible,
+      ineligibleReason: rebuilt.eligibility.eligible ? null : rebuilt.eligibility.reason,
+      members,
+      pinnedHeadOid: context.pinnedHeadOid,
+    };
+  }
+
+  async function readMemberRepresentation(
+    input: ReadMemberRepresentationInput,
+  ): Promise<MemberRepresentation> {
+    return readCurrentCommitRepresentation({
+      repoRoot: input.repoRoot,
+      pinnedHeadOid: input.pinnedHeadOid,
+      entry: {
+        path: input.member.path,
+        commitPathspecs: input.member.commitPathspecs,
+        expectedWorktreeState: input.member.expectedWorktreeState,
+        rawWorktreeBlobOid: input.member.rawWorktreeBlobOid,
+      },
+      gitExe: input.gitExe,
+      runGit,
+      runGitBytes,
+    });
+  }
+
+  function locateRepository(
+    snapshot: CandidateTokenSnapshot,
+  ): { repoRoot: string; gitExe?: string } {
+    const location = repositoryLocations.get(snapshot.repositoryKey);
+    if (!location) throw new Error(`repository location unavailable for ${snapshot.repositoryKey}`);
+    return location;
+  }
+
+  function deriveTrailers(snapshot: CandidateTokenSnapshot): string[] {
+    const turnIds = new Set<string>();
+    const planIds = new Set<string>();
+    for (const association of snapshot.associations) {
+      for (const turnId of association.contributingTurnIds) turnIds.add(turnId);
+      if (association.planId) planIds.add(association.planId);
+    }
+    const trailers = [`Lares-Candidate: ${snapshot.candidate.candidateId}`];
+    for (const turnId of [...turnIds].sort()) trailers.push(`Lares-Turn: ${turnId}`);
+    for (const planId of [...planIds].sort()) trailers.push(`Lares-Plan: ${planId}`);
+    return trailers;
+  }
+
+  async function resolveFleetBoundary(packageId: string): Promise<FleetAdhocBoundaryContext> {
+    if (!deps.captureFinalizationBoundary) {
+      throw new Error('checkpoint boundary capture is unavailable');
+    }
+    const visitedRepositories = new Set<string>();
+    for (const workspace of getWorkspaces()) {
+      const scope = await assembleScope(workspace.id);
+      const repository = scope.context.repository;
+      if (visitedRepositories.has(repository.repositoryKey)) continue;
+      visitedRepositories.add(repository.repositoryKey);
+      const componentId = packageId.startsWith('component:')
+        ? packageId.slice('component:'.length)
+        : packageId;
+      const component = scope.context.components.find((candidate) => candidate.componentId === componentId);
+      const entryIds = component
+        ? component.dirtyEntryIds
+        : packageId === `unattributed:${repository.repositoryKey}`
+          ? scope.context.inventory.unattributedEntryIds
+          : null;
+      if (!entryIds) continue;
+      const entriesById = new Map(scope.context.inventory.entries.map((entry) => [entry.entryId, entry]));
+      const members = entryIds
+        .map((entryId) => entriesById.get(entryId))
+        .filter((entry): entry is DirtyEntry => entry !== undefined)
+        .map((entry): CommitRepresentationEntry => ({
+          path: entry.path,
+          commitPathspecs: entry.commitPathspecs,
+          expectedWorktreeState: entry.expectedWorktreeState,
+          rawWorktreeBlobOid: entry.rawWorktreeBlobOid,
+        }));
+      if (members.length === 0) throw new Error(`package has no dirty members: ${packageId}`);
+      const boundary = await deps.captureFinalizationBoundary(
+        workspace.id,
+        `lares:finalization:${packageId}`,
+      );
+      return {
+        packageId,
+        repositoryKey: repository.repositoryKey,
+        finalizedBy: 'human-ipc',
+        checkpointTurnId: null,
+        boundaryOid: boundary.oid,
+        contractVersion,
+        createdFromWorkspaceId: workspace.id,
+        members,
+        repoRoot: scope.repoRoot,
+        pinnedHeadOid: scope.pinnedHeadOid,
+        gitExe,
+        runGit,
+        runGitBytes,
+        queue: deps.queue,
+        commonDirQueueKey: deps.queue ? repository.objectDatabaseKey : undefined,
+      };
+    }
+    throw new Error(`unknown fleet-adhoc package: ${packageId}`);
+  }
+
+  const saveCardFinalizeRoutes: SaveCardFinalizeRoutes = {
+    resolveBoundary: (request) => resolveFleetBoundary(request.packageId),
+  };
+  const productionSeams: PreviewProductionSeams = {
+    candidateService: service,
+    composeLocks,
+    reassemble,
+    readMemberRepresentation,
+    locateRepository,
+    deriveTrailers,
+  };
+
+  return { saveCardPreviewRoutes, planPreviewRoutes, saveCardFinalizeRoutes, productionSeams };
 }

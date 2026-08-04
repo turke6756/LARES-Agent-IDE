@@ -250,6 +250,20 @@ export interface CaptureEdgeParams {
   lstat?: LstatFn;
 }
 
+/** Explicit fleet-finalization snapshot. Unlike a turn edge this creates no
+ * turn-row/ref side effects: the caller immediately pins the returned commit
+ * through refs/lares/finalizations/... after freezing its selected manifest. */
+export interface CaptureBoundaryParams {
+  capability: GitCapability;
+  label: string;
+  lstat?: LstatFn;
+}
+
+export interface CaptureBoundaryResult {
+  oid: string;
+  treeOid: string;
+}
+
 // ── the zero OID (delete form) ──────────────────────────────────────────────────
 
 const SHA1_ZERO = '0'.repeat(40);
@@ -353,6 +367,32 @@ export class CheckpointService {
       return this.abandon(edge, turnId, 'budget-exceeded', deadlineAt);
     }
     return settled;
+  }
+
+  /** Capture the current raw worktree as a checkpoint-native commit for an
+   * explicit finalization boundary. The shared object-db queue makes this one
+   * uninterrupted snapshot operation; no real-index mutation occurs. */
+  async captureBoundary(params: CaptureBoundaryParams): Promise<CaptureBoundaryResult> {
+    const gate = gateCheckpoint(params.capability);
+    if (!gate.ok || !params.capability.commonDirQueueKey) {
+      throw new Error(`finalization boundary unavailable: ${gate.ok ? 'missing-queue-key' : gate.skipped}`);
+    }
+    const captureDeadline = this.now() + 60_000;
+    const settled = await this.queue.withLock(
+      params.capability.commonDirQueueKey,
+      () => this.rawSnapshot({
+        repoRoot: gate.repoRoot,
+        repoState: gate.repoState,
+        workspacePrefix: gate.workspacePrefix,
+        captureDeadline,
+        label: params.label,
+        lstat: params.lstat,
+      }),
+    );
+    if (isSkippedDeadline(settled)) {
+      throw new Error('finalization boundary capture expired in the object-db queue');
+    }
+    return { oid: settled.candidateOid, treeOid: settled.treeOid };
   }
 
   // ── the cancellable capture + durable finalize (runs while holding the key) ─────

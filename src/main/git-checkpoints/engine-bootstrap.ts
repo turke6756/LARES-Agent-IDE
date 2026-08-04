@@ -44,6 +44,15 @@ export interface CheckpointEngineHandle {
   /** The internal Git exe this engine resolved. Reused by the Save-card route
    *  wiring (SC-WP-1J) so it does not re-resolve a second copy at bootstrap. */
   gitExe: string;
+  /** Shared object-database serializer. Commit composition must use the same
+   * instance as checkpoint restore/capture, never a parallel queue. */
+  queue: CheckpointQueue;
+  /** Create a checkpoint-native raw snapshot commit for an explicit package
+   * finalization; the finalization service immediately pins its returned OID. */
+  captureFinalizationBoundary: (
+    workspaceId: string,
+    label: string,
+  ) => Promise<{ oid: string; treeOid: string }>;
   coordinator: TurnCoordinator;
   completionTracker: TurnCompletionTracker;
   buildTurnContext: (agentId: string, dispatch: DispatchContext) => Promise<TurnContext | null>;
@@ -396,8 +405,21 @@ export async function createCheckpointEngine(): Promise<CheckpointEngineHandle |
     return results;
   };
 
+  const captureFinalizationBoundary = async (workspaceId: string, label: string) => {
+    const capability = await requireCapability(workspaceId);
+    // A finalization package may fuse sibling workspace aliases in one worktree.
+    // Capture the repository root, not only the initiating alias's prefix, so the
+    // pinned boundary commit reaches every member object in that package.
+    return service.captureBoundary({
+      capability: { ...capability, workspacePrefix: '' },
+      label,
+    });
+  };
+
   return {
     gitExe,
+    queue,
+    captureFinalizationBoundary,
     coordinator,
     completionTracker,
     buildTurnContext,

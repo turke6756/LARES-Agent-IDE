@@ -1,6 +1,6 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron';
 import type { IpcApi, DetachRequest, DetachedClosedPayload, ViewDetachRequest, ViewDetachedClosedPayload, FlushRequestPayload, FlushReplyPayload } from '../shared/types';
-import { TAB_CHANNELS, VIEW_CHANNELS, CHECKPOINT_CHANNELS, SAVECARD_CHANNELS, SAVECARD_PREVIEW_CHANNEL, SAVECARD_ATTENTION_CHANNEL, SAVECARD_ATTENTION_CHANGED_CHANNEL, PLAN_PREVIEW_CHANNEL, COMMIT_COORDINATOR_CHANNEL } from '../shared/types';
+import { TAB_CHANNELS, VIEW_CHANNELS, CHECKPOINT_CHANNELS, SAVECARD_CHANNELS, SAVECARD_PREVIEW_CHANNEL, SAVECARD_FINALIZE_CHANNEL, SAVECARD_ATTENTION_CHANNEL, SAVECARD_ATTENTION_CHANGED_CHANNEL, PLAN_PREVIEW_CHANNEL, COMMIT_COORDINATOR_CHANNEL } from '../shared/types';
 import { BROWSER_CHANNELS } from '../shared/browser';
 import type {
   AccessRequestDecision,
@@ -175,6 +175,7 @@ const api: IpcApi = {
   saveCard: {
     getInventory: (req) => ipcRenderer.invoke(SAVECARD_CHANNELS.getInventory, req),
     preview: (req) => ipcRenderer.invoke(SAVECARD_PREVIEW_CHANNEL, req),
+    markDone: (req) => ipcRenderer.invoke(SAVECARD_FINALIZE_CHANNEL, req),
     // SC-WP-N2 — lightweight checkpoint-expiry attention read + push (no inventory probe).
     getAttention: (req) => ipcRenderer.invoke(SAVECARD_ATTENTION_CHANNEL, req),
     onAttentionChanged: (callback) => {
@@ -751,6 +752,14 @@ const api: IpcApi = {
 // this additive bridge member at its call site.
 (api.plans as IpcApi['plans'] & {
   boardList: (planId: string) => Promise<import('../shared/types').MissionBoardCard[] | null>;
+  boardTimeline: (planId: string) => Promise<import('../shared/types').MissionBoardPackageTimeline[] | null>;
+  finalizeItemDone: (request: { planItemId: string }) => Promise<unknown>;
 }).boardList = (planId) => ipcRenderer.invoke('plan:board:list', planId);
+(api.plans as IpcApi['plans'] & {
+  boardTimeline: (planId: string) => Promise<import('../shared/types').MissionBoardPackageTimeline[] | null>;
+}).boardTimeline = (planId) => ipcRenderer.invoke('plan:board:timeline', planId);
+(api.plans as IpcApi['plans'] & {
+  finalizeItemDone: (request: { planItemId: string }) => Promise<unknown>;
+}).finalizeItemDone = (request) => ipcRenderer.invoke('plan:finalizeItemDone', request);
 
 contextBridge.exposeInMainWorld('api', api);
