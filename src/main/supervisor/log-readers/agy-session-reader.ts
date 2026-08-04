@@ -30,6 +30,16 @@ const TOOL_STEP_TYPE = 21;
 const FINAL_ASSISTANT_KIND = 2;
 const AGY_MODEL = 'antigravity';
 const CONVERSATION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const SQLITE_TIMESTAMP_WITHOUT_ZONE_RE = /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(\.\d+)?$/;
+
+/** Parse agent start times, treating SQLite CURRENT_TIMESTAMP strings as UTC. */
+export function parseStartedAtMs(startedAt?: string): number {
+  if (!startedAt) return 0;
+  if (SQLITE_TIMESTAMP_WITHOUT_ZONE_RE.test(startedAt)) {
+    return Date.parse(`${startedAt.replace(' ', 'T')}Z`);
+  }
+  return Date.parse(startedAt);
+}
 
 type WireValue = bigint | Buffer;
 type WireMessage = Map<number, WireValue[]>;
@@ -456,7 +466,8 @@ export function readAgyHistoryBinding(root: string, cwd: string, startedAt?: str
   } catch {
     return null;
   }
-  const floor = startedAt ? Date.parse(startedAt) - START_FLOOR_SLACK_MS : 0;
+  const floorBase = parseStartedAtMs(startedAt);
+  const floor = floorBase ? floorBase - START_FLOOR_SLACK_MS : 0;
   let best: { id: string; timestamp: number } | null = null;
   for (const line of raw.split(/\r?\n/)) {
     if (!line.trim()) continue;
@@ -566,7 +577,8 @@ export class AgySessionReader implements ChatLogReader {
 
     const conversationsDir = path.join(root, 'conversations');
     try {
-      const floor = session.startedAt ? Date.parse(session.startedAt) - START_FLOOR_SLACK_MS : 0;
+      const floorBase = parseStartedAtMs(session.startedAt);
+      const floor = floorBase ? floorBase - START_FLOOR_SLACK_MS : 0;
       const newest = fs.readdirSync(conversationsDir, { withFileTypes: true })
         .filter((entry) => entry.isFile() && /^[0-9a-f-]{36}\.db$/i.test(entry.name))
         .map((entry) => {

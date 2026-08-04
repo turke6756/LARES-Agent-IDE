@@ -6,7 +6,12 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import Database from 'better-sqlite3';
-import { AgySessionReader, decodeAgyWireMessage, readAgyHistoryBinding } from './agy-session-reader';
+import {
+  AgySessionReader,
+  decodeAgyWireMessage,
+  parseStartedAtMs,
+  readAgyHistoryBinding,
+} from './agy-session-reader';
 import { SessionLogDispatcher } from '../session-log-dispatcher';
 import type { ChatLogReaderSession } from './types';
 import type { SessionEvent } from '../../../shared/session-events';
@@ -325,6 +330,22 @@ test('history.jsonl binds an unbound active agent by cwd and conversationId', ()
   } finally { cleanup(root); }
 });
 
+test('SQLite-format startedAt is UTC when binding history rows', () => {
+  const root = tempRoot();
+  try {
+    fs.writeFileSync(path.join(root, 'history.jsonl'), JSON.stringify({
+      display: 'hello', timestamp: CREATED_MS + 1_000, workspace: CWD, conversationId: OTHER_SID,
+    }) + '\n');
+    assert.equal(readAgyHistoryBinding(root, CWD, '2026-08-03 16:55:28'), OTHER_SID);
+  } finally { cleanup(root); }
+});
+
+test('startedAt parser handles SQLite UTC, ISO-with-Z, and undefined', () => {
+  assert.equal(parseStartedAtMs('2026-08-03 16:55:28'), Date.parse('2026-08-03T16:55:28Z'));
+  assert.equal(parseStartedAtMs('2026-08-03T16:55:28.400Z'), CREATED_MS);
+  assert.equal(parseStartedAtMs(undefined), 0);
+});
+
 test('fallback chooses newest post-start DB whose metadata cwd matches', () => {
   const root = tempRoot();
   try {
@@ -332,6 +353,22 @@ test('fallback chooses newest post-start DB whose metadata cwd matches', () => {
     createFixture(root, { sid: OTHER_SID, rows: [{ idx: 0, type: 14, status: 3, payload: userPayload('cwd-match') }], mtimeMs: CREATED_MS + 20_000 });
     const user = readerAt(root).pollSession(session({ sessionId: '' })).find((e) => e.type === 'user-text');
     assert.ok(user?.type === 'user-text' && user.text === 'cwd-match');
+  } finally { cleanup(root); }
+});
+
+test('SQLite-format startedAt is UTC when resolving by conversation DB mtime', () => {
+  const root = tempRoot();
+  try {
+    createFixture(root, {
+      sid: OTHER_SID,
+      rows: [{ idx: 0, type: 14, status: 3, payload: userPayload('sqlite-floor-match') }],
+      mtimeMs: CREATED_MS + 1_000,
+    });
+    const events = readerAt(root).pollSession(session({
+      sessionId: '',
+      startedAt: '2026-08-03 16:55:28',
+    }));
+    assert.ok(events.some((e) => e.type === 'user-text' && e.text === 'sqlite-floor-match'));
   } finally { cleanup(root); }
 });
 
