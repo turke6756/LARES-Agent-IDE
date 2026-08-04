@@ -5814,6 +5814,58 @@ export function listAllPlanExecutionRunIds(): Set<string> {
   return new Set(rows.map((r: any) => String(r.id)));
 }
 
+// ── Planning-surface WP-P5-archive — plan archive (run closure) primitive ──────
+//
+// The atomic "archive" write that pairs the run-lifecycle closure with the plan-level
+// state flip — the mirror of insertPlanExecutionRunActivating. Run CLOSURE
+// (lifecycle_state active→archived) lives here, NOT in the P5C activate block. The
+// closed run row and its baseline ref are RETAINED for audit (release is only via plan
+// deletion / orphan reconciliation, per WP-P5C); package states are NOT touched (no
+// package-content rollback — WP-P5-archive non-goal). Re-Implement mints a FRESH run
+// via insertPlanExecutionRunActivating and never resurrects the closed row.
+
+export interface ArchivePlanClosingRunResult {
+  plan: Plan;
+  /** The execution run this archive closed (lifecycle_state active→archived), or null
+   *  when the plan had no active run (e.g. a `ready` plan never Implemented). */
+  closedRun: PlanExecutionRun | null;
+}
+
+/**
+ * Atomically archive a plan in ONE transaction: close its ACTIVE execution run
+ * (lifecycle_state active→archived, when one exists) AND flip `plans.run_state`
+ * executing/ready→archived. Guards that the plan is currently `executing` or `ready`
+ * (re-read inside the txn so a raced flip aborts cleanly). The archived run KEEPS its
+ * baseline ref for audit; package states are left untouched. Returns the archived plan
+ * and the run it closed (null if none).
+ */
+export function archivePlanClosingRun(planId: string): ArchivePlanClosingRunResult {
+  const database = getDb();
+  const tx = database.transaction((): ArchivePlanClosingRunResult => {
+    const plan = getPlan(planId);
+    if (!plan) throw new Error(`archivePlanClosingRun: no plan ${planId}`);
+    if (plan.runState !== 'executing' && plan.runState !== 'ready') {
+      throw new Error(
+        `archivePlanClosingRun: plan ${planId} is '${plan.runState}', not executing/ready`,
+      );
+    }
+    const active = getActivePlanExecutionRun(planId);
+    if (active) {
+      run(
+        `UPDATE plan_execution_runs SET lifecycle_state = 'archived' WHERE id = ?`,
+        [active.id],
+      );
+    }
+    run(
+      `UPDATE plans SET run_state = 'archived', updated_at = datetime('now')
+         WHERE id = ? AND run_state IN ('executing','ready')`,
+      [planId],
+    );
+    return { plan: getPlan(planId)!, closedRun: active ? getPlanExecutionRun(active.id) : null };
+  });
+  return tx();
+}
+
 // ── Save-card SC-WP-3B — package_finalizations schema types + lifecycle accessors ──
 //
 // DB-layer primitives only: insert, point/latest reads, revision high-water mark, and

@@ -20,17 +20,26 @@
 
 import type { Plan, PlanTabKey } from '../../shared/types';
 import {
+  archivePlanClosingRun,
   getPlan,
   getPlanTabOverview,
   listPlanWorkPackages,
   planHasValidResponsibleSupervisor,
   transitionPlanWorkPackageState,
   updatePlan,
+  type ArchivePlanClosingRunResult,
+  type PlanExecutionRun,
   type PlanWorkPackage,
   type PlanWpLifecycleEvent,
   type PlanWpTransitionState,
 } from '../database';
 import { buildPlanDocuments } from './plan-documents';
+import {
+  implementPlan,
+  type ImplementFailure,
+  type ImplementPlanDeps,
+  type ImplementResult,
+} from './plan-implement';
 
 export const PLAN_RUN_STATE_HARDENING = 'hardening';
 export const PLAN_RUN_STATE_READY = 'ready';
@@ -156,4 +165,161 @@ export function markPlanReady(
   }
   setRunState(input.planId, PLAN_RUN_STATE_READY);
   return { ok: true, runState: PLAN_RUN_STATE_READY, failures: [], tabsMissingOverview };
+}
+
+// ── plan archive / resurrection / re-implement (WP-P5-archive) ─────────────────
+//
+// Plan-level transitions layered on the P5C run primitives. A FINISHED or abandoned
+// plan is archived as a historical artifact (its active run closed; the run row + its
+// baseline ref RETAINED for audit — release only on plan deletion, per P5C); an
+// archived plan can be resurrected to `ready` to sit indefinitely; re-Implement mints a
+// BRAND-NEW execution run (fresh baseline ref via the P5C idiom) and NEVER resurrects a
+// closed run's row. `done` is never written here (SC-WP-3C-authoritative), and no
+// package-content rollback happens — previously done/archived package revisions are
+// retained, never flipped back to `ready`.
+
+export const PLAN_RUN_STATE_EXECUTING = 'executing';
+export const PLAN_RUN_STATE_ARCHIVED = 'archived';
+
+export type ArchivePlanFailure = 'plan-not-found' | 'plan-not-archivable';
+
+export interface ArchivePlanResult {
+  ok: boolean;
+  runState: string | null;
+  /** The execution run this archive closed, or null when the plan had no active run. */
+  closedRunId: string | null;
+  failures: ArchivePlanFailure[];
+}
+
+export interface ArchivePlanDeps {
+  getPlan?: (planId: string) => Plan | null;
+  archive?: (planId: string) => ArchivePlanClosingRunResult;
+}
+
+/**
+ * Archive a plan as a historical artifact: close its active execution run and flip the
+ * plan `executing`/`ready` → `archived`, atomically (DB primitive). Only `executing`
+ * and `ready` plans are archivable; any other state is refused with `plan-not-archivable`
+ * (structured result, never throws on an unmet condition). Package states are untouched
+ * (no content rollback); the closed run keeps its baseline ref for audit.
+ */
+export function archivePlan(
+  input: { planId: string; actor: string },
+  deps: ArchivePlanDeps = {},
+): ArchivePlanResult {
+  const getPlanFn = deps.getPlan ?? getPlan;
+  const archive = deps.archive ?? archivePlanClosingRun;
+
+  const plan = getPlanFn(input.planId);
+  if (!plan) {
+    return { ok: false, runState: null, closedRunId: null, failures: ['plan-not-found'] };
+  }
+  if (plan.runState !== PLAN_RUN_STATE_EXECUTING && plan.runState !== PLAN_RUN_STATE_READY) {
+    return {
+      ok: false,
+      runState: plan.runState,
+      closedRunId: null,
+      failures: ['plan-not-archivable'],
+    };
+  }
+  const result = archive(input.planId);
+  return {
+    ok: true,
+    runState: result.plan.runState,
+    closedRunId: result.closedRun?.id ?? null,
+    failures: [],
+  };
+}
+
+export type ResurrectPlanFailure = 'plan-not-found' | 'plan-not-archived';
+
+export interface ResurrectPlanResult {
+  ok: boolean;
+  runState: string | null;
+  failures: ResurrectPlanFailure[];
+}
+
+export interface ResurrectPlanDeps {
+  getPlan?: (planId: string) => Plan | null;
+  setRunState?: (planId: string, runState: string) => void;
+}
+
+/**
+ * Resurrect an archived plan back to `ready` so it can sit indefinitely or be
+ * re-Implemented. ONLY flips the plan `run_state archived → ready`: it never resurrects
+ * a closed execution-run row and never flips done/archived package revisions back to
+ * `ready`. Only an `archived` plan is resurrectable.
+ */
+export function resurrectPlan(
+  input: { planId: string; actor: string },
+  deps: ResurrectPlanDeps = {},
+): ResurrectPlanResult {
+  const getPlanFn = deps.getPlan ?? getPlan;
+  const setRunState =
+    deps.setRunState ?? ((planId, runState) => { updatePlan(planId, { runState }); });
+
+  const plan = getPlanFn(input.planId);
+  if (!plan) return { ok: false, runState: null, failures: ['plan-not-found'] };
+  if (plan.runState !== PLAN_RUN_STATE_ARCHIVED) {
+    return { ok: false, runState: plan.runState, failures: ['plan-not-archived'] };
+  }
+  setRunState(input.planId, PLAN_RUN_STATE_READY);
+  return { ok: true, runState: PLAN_RUN_STATE_READY, failures: [] };
+}
+
+export interface ReimplementPlanResult {
+  ok: boolean;
+  /** Whether the archived→ready resurrection flip happened. */
+  resurrected: boolean;
+  /** The FRESH execution run minted by Implement (new id + fresh baseline), or null. */
+  run: PlanExecutionRun | null;
+  failures: (ResurrectPlanFailure | ImplementFailure)[];
+  tabsMissingOverview: PlanTabKey[];
+}
+
+export interface ReimplementPlanDeps extends ResurrectPlanDeps {
+  implementPlan?: (
+    input: { planId: string; appUserId: string | null },
+    deps?: ImplementPlanDeps,
+  ) => Promise<ImplementResult>;
+  implementDeps?: ImplementPlanDeps;
+}
+
+/**
+ * Re-Implement an archived plan: resurrect it (`archived → ready`) then pull Implement,
+ * which mints a BRAND-NEW `plan_execution_runs` row with a FRESH baseline ref via the
+ * P5C idiom. The previously-archived run's row and baseline ref are never touched —
+ * re-Implement NEVER resurrects a closed run. If Implement fails AFTER resurrection the
+ * plan is left `ready` (a valid indefinitely-sitting state, `resurrected:true`), never
+ * a half-executing plan.
+ */
+export async function reimplementPlan(
+  input: { planId: string; appUserId: string | null },
+  deps: ReimplementPlanDeps = {},
+): Promise<ReimplementPlanResult> {
+  const resurrect = resurrectPlan(
+    { planId: input.planId, actor: input.appUserId ?? 'reimplement' },
+    deps,
+  );
+  if (!resurrect.ok) {
+    return {
+      ok: false,
+      resurrected: false,
+      run: null,
+      failures: resurrect.failures,
+      tabsMissingOverview: [],
+    };
+  }
+  const implement = deps.implementPlan ?? implementPlan;
+  const result = await implement(
+    { planId: input.planId, appUserId: input.appUserId },
+    deps.implementDeps,
+  );
+  return {
+    ok: result.ok,
+    resurrected: true,
+    run: result.run,
+    failures: result.failures,
+    tabsMissingOverview: result.tabsMissingOverview,
+  };
 }
