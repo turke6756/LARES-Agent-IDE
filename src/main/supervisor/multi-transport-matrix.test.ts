@@ -276,11 +276,18 @@ async function runCell(opts: CellOpts): Promise<void> {
         'Windows launch must inject the native spool path in extraEnv');
     }
 
+    if (isGrok) {
+      assert.deepEqual(runners.winCommands, [{
+        command: 'C:\\Users\\test\\.grok\\bin\\grok.exe',
+        args: ['--always-approve'],
+      }], 'grok Windows launch resolves the absolute installer binary with its auto-approve flag');
+    }
+
     if (isAgy) {
       assert.deepEqual(runners.winCommands, [{
         command: 'C:\\Users\\test\\AppData\\Local\\agy\\bin\\agy.exe',
-        args: [],
-      }], 'agy Windows launch resolves the absolute installer binary with no invented CLI flags');
+        args: ['--dangerously-skip-permissions'],
+      }], 'agy Windows launch resolves the absolute installer binary with its auto-approve flag');
 
       const monitor = (supervisor as unknown as {
         monitor: { isHookCanaryArmed: (id: string) => boolean; inferStatus: (a: Agent) => Promise<string | null> };
