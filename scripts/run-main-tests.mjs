@@ -629,6 +629,26 @@ const TESTS = [
   'dist/main/main/plans/plan-comment-reply.test.js',
   // WP-P4D-proj: dual-source plan-comment projection (logical-key resolution).
   'dist/main/main/plans/plan-comment-list.test.js',
+  // Planning-surface Stage P5 (gate P5Z) — work-package layout + lifecycle ledger,
+  // execution-run baselines, Implement trigger, pre-Implement gate, gated dispatch
+  // defaults, and persisted package dispatch/reconciliation.
+  // WP-P5A-schema/paths: plan_work_package_layout + plan_work_package_paths schema/accessors.
+  'dist/main/main/database.planWorkPackageLayoutPaths.test.js',
+  // WP-P5B: lifecycle-event service (ready/executing/blocked/archived ledger) + Mark-Ready.
+  'dist/main/main/plans/plan-lifecycle.test.js',
+  // WP-P5C: durable execution-run baseline refs (refs/lares/plans/<planId>/<runId>).
+  'dist/main/main/git-checkpoints/plan-baseline-refs.test.js',
+  // WP-P5C: Implement eligibility + execution-run mint + baseline pin (human-gated).
+  'dist/main/main/plans/plan-implement.test.js',
+  // WP-P5-archive: plan archive / resurrection / re-Implement (new run + fresh baseline).
+  'dist/main/main/plans/plan-archive.test.js',
+  // WP-P5C-gate: pre-Implement enforcement seam — reject structured-plan bindings
+  // (explicit or default) before an active execution run.
+  'dist/main/main/git-checkpoints/pre-implement-gate.test.js',
+  // WP-P5D: gated dispatch default — active plan binds only while its run is executing.
+  'dist/main/main/git-checkpoints/dispatch-default.activePlan.test.js',
+  // WP-P5-dispatch: package dispatch + persisted attempt/reconciliation (confirmed_turn_id).
+  'dist/main/main/plans/package-dispatch.test.js',
   'dist/main/main/browser/credentialed-open-diagnostic.test.js',
   'dist/main/main/browser/browser-signin-workspace-exact.test.js',
   'dist/main/main/browser/browser-signin-expiry.test.js',
