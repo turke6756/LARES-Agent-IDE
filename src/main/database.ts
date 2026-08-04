@@ -12,7 +12,7 @@ import { parseRepoActivityEvidence } from './plans/repo-activity';
 import { OrchestrationBinding, OrchestrationEvent, OrchestrationRun, OrchestrationPlanBindingMode } from './orchestration/types';
 import { resolveWorkspaceForCwd, WORKSPACE_LINEAGE_VERSION, type WorkspaceRecordLite } from './skill-analytics/workspace-lineage';
 import { unwrapOsc8, stripTerminalEscapes, canonicalizeToAbsolute, looksPolluted } from './file-activity-normalize';
-import type { ResolvedPlanStamp } from '../shared/commit-candidates';
+import type { CommitOutcome, ResolvedPlanStamp } from '../shared/commit-candidates';
 
 let db: Database.Database;
 let dbPath: string;
@@ -1695,6 +1695,36 @@ function initContextOptimizerSchema(): void {
       ON package_finalizations(plan_item_id, package_revision) WHERE finalization_kind = 'plan-package';
     CREATE INDEX IF NOT EXISTS idx_package_finalizations_repo
       ON package_finalizations(repository_key, package_id);
+  `);
+
+  // Save-card SC-WP-4C — durable attempt attribution (§9.4). This row is
+  // inserted pending before the coordinator performs any Git mutation, then
+  // resolved with the observed HEAD, any reflog-identified commit, and the
+  // terminal CommitOutcome status. There are deliberately no cascading FKs:
+  // attempt evidence must survive independently of in-memory candidate tokens.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS commit_attempts (
+      attempt_id TEXT PRIMARY KEY,
+      repository_key TEXT NOT NULL,
+      candidate_id TEXT NOT NULL,
+      token_id TEXT NOT NULL,
+      pinned_head_oid TEXT NOT NULL,
+      reflog_action TEXT NOT NULL,
+      started_at INTEGER NOT NULL,
+      resolved_head_oid TEXT,
+      identified_commit_oid TEXT,
+      outcome_status TEXT,
+      ended_at INTEGER,
+      CHECK (outcome_status IS NULL OR outcome_status IN (
+        'committed',
+        'committed-integrity-mismatch',
+        'repository-state-uncertain',
+        'aborted-stale',
+        'aborted-error'
+      ))
+    );
+    CREATE INDEX IF NOT EXISTS idx_commit_attempts_repository_started
+      ON commit_attempts(repository_key, started_at);
   `);
 
   // Planning-surface WP-P2A — proposals registry table + plans folder/promotion
@@ -6285,6 +6315,81 @@ export function markPackageFinalizationCommitted(id: string, releasedAt: number)
         SET lifecycle_status = 'committed', released_at = ?
       WHERE id = ?`,
     [releasedAt, id],
+  );
+}
+
+// ── Save-card SC-WP-4C — commit_attempts pending + outcome persistence ──
+
+export type CommitAttemptOutcomeStatus = CommitOutcome['status'];
+
+export interface PendingCommitAttempt {
+  attemptId: string;
+  repositoryKey: string;
+  candidateId: string;
+  tokenId: string;
+  pinnedHeadOid: string;
+  reflogAction: string;
+  startedAt: number;
+}
+
+export interface CommitAttempt extends PendingCommitAttempt {
+  resolvedHeadOid: string | null;
+  identifiedCommitOid: string | null;
+  outcomeStatus: CommitAttemptOutcomeStatus | null;
+  endedAt: number | null;
+}
+
+export interface CommitAttemptResolution {
+  resolvedHeadOid: string;
+  identifiedCommitOid: string | null;
+  outcomeStatus: CommitAttemptOutcomeStatus;
+  endedAt: number;
+}
+
+function rowToCommitAttempt(row: any): CommitAttempt {
+  return {
+    attemptId: row.attempt_id,
+    repositoryKey: row.repository_key,
+    candidateId: row.candidate_id,
+    tokenId: row.token_id,
+    pinnedHeadOid: row.pinned_head_oid,
+    reflogAction: row.reflog_action,
+    startedAt: row.started_at,
+    resolvedHeadOid: row.resolved_head_oid ?? null,
+    identifiedCommitOid: row.identified_commit_oid ?? null,
+    outcomeStatus: row.outcome_status ?? null,
+    endedAt: row.ended_at ?? null,
+  };
+}
+
+/** Insert-only pending evidence. Resolution fields cannot be supplied early. */
+export function insertPendingCommitAttempt(attempt: PendingCommitAttempt): void {
+  run(
+    `INSERT INTO commit_attempts (
+       attempt_id, repository_key, candidate_id, token_id, pinned_head_oid,
+       reflog_action, started_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    [attempt.attemptId, attempt.repositoryKey, attempt.candidateId, attempt.tokenId,
+      attempt.pinnedHeadOid, attempt.reflogAction, attempt.startedAt],
+  );
+}
+
+export function getCommitAttempt(attemptId: string): CommitAttempt | null {
+  const row = queryOne(`SELECT * FROM commit_attempts WHERE attempt_id = ?`, [attemptId]);
+  return row ? rowToCommitAttempt(row) : null;
+}
+
+/** Persist the coordinator's terminal repository observation and outcome. */
+export function resolveCommitAttempt(
+  attemptId: string,
+  resolution: CommitAttemptResolution,
+): void {
+  run(
+    `UPDATE commit_attempts
+        SET resolved_head_oid = ?, identified_commit_oid = ?, outcome_status = ?, ended_at = ?
+      WHERE attempt_id = ?`,
+    [resolution.resolvedHeadOid, resolution.identifiedCommitOid,
+      resolution.outcomeStatus, resolution.endedAt, attemptId],
   );
 }
 

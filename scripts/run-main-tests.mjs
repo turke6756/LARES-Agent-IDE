@@ -122,6 +122,8 @@ const TESTS = [
   // finalizations table (WP-3Z registration).
   'dist/main/main/database.planWorkPackages.test.js',
   'dist/main/main/database.finalizations.test.js',
+  // Save-card Stage ④ SC-WP-4C — durable pending commit-attempt evidence + resolution.
+  'dist/main/main/database.commitAttempts.test.js',
   'dist/main/main/dispatch-binding.boundary.test.js',
   // Save-card SC-WP-2H/2J/2K: pin policy/accounting and commit representation.
   'dist/main/main/git-checkpoints/protection-policy.test.js',
