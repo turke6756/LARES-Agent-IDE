@@ -2653,6 +2653,12 @@ export interface IpcApi {
     /** List a workspace's plans for the "Plans" card gallery. Each row carries a
      *  cheap description snippet (summary-zone prose) for `html` surfaces. */
     list: (workspaceId?: string) => Promise<PlanListItem[]>;
+    /** One row per valid folder in `<workspaceStateDir()>/plans/`. */
+    listPromotedFolders: (
+      workspaceId: string,
+      workspaceRoot: string,
+      pathType?: PathType,
+    ) => Promise<PromotedPlanFolderListResult>;
     /** WP-P2C/P2D — the unified Plans-gallery projection: proposals + structured
      *  folder plans + legacy `format='html'` plans (md rows NEVER projected). */
     gallery: (workspaceId: string, opts?: PlanGalleryOptions) => Promise<PlanGalleryResult>;
@@ -4883,6 +4889,24 @@ export interface PlanGalleryRow {
 export interface PlanGalleryResult {
   rows: PlanGalleryRow[];
   /** Projection-level diagnostics (unreadable plan.json, resolution failures…). */
+  warnings: string[];
+}
+
+/** Filesystem-first row for the Plans pane's promoted-plan tier. */
+export interface PromotedPlanFolder {
+  planArtifactId: string;
+  /** Adopted database id consumed by the existing full planning surface. */
+  planId: string;
+  folderName: string;
+  title: string;
+  status: string;
+  archived: boolean;
+  updatedAt: string | number | null;
+  responsibleSupervisor: PlanGalleryOwner | null;
+}
+
+export interface PromotedPlanFolderListResult {
+  plans: PromotedPlanFolder[];
   warnings: string[];
 }
 

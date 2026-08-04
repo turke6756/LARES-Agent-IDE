@@ -135,6 +135,10 @@ describe('ProposalCardGallery', () => {
     click('[data-testid="proposal-card"]');
     expect(container!.querySelector('[data-testid="proposal-expanded-reader"]')).not.toBeNull();
 
+    click('[data-testid="proposal-promote"]');
+    expect(container!.querySelector('[data-testid="promote-plan-panel"]')).not.toBeNull();
+    expect(container!.querySelector('[aria-modal="true"]')).toBeNull();
+
     click('[data-testid="dashboard-nav"]');
     expect(useDashboardStore.getState().plansOpen).toBe(false);
     expect(container!.querySelector('[data-testid="dashboard-view"]')).not.toBeNull();

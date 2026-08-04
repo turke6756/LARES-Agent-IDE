@@ -9,6 +9,8 @@
 
 import { ipcMain } from 'electron';
 import type { Rectangle } from 'electron';
+import fs from 'fs';
+import path from 'path';
 import type { PlanPaneManager } from './plan-pane-manager';
 import type {
   PlanListItem,
@@ -20,6 +22,8 @@ import type {
   PlanIntentsProjection,
   PlanTabKey,
   PlanTabOverview,
+  PromotedPlanFolder,
+  PromotedPlanFolderListResult,
 } from '../../shared/types';
 import { hasSupervisorPrivilege, isPlanTabKey } from '../../shared/types';
 import {
@@ -66,6 +70,88 @@ import {
   type ListPlanCommentsDeps,
 } from './plan-comments';
 import { registerPlanImplementIpc } from './plan-implement';
+import { workspaceStateDir } from '../workspace-state-dir';
+
+const MAX_PROMOTED_PLAN_JSON_BYTES = 256_000;
+const ARCHIVED_PLAN_STATUSES = new Set(['archived', 'superseded', 'cancelled', 'canceled']);
+
+function manifestString(manifest: Record<string, unknown>, ...keys: string[]): string | null {
+  for (const key of keys) {
+    const value = manifest[key];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return null;
+}
+
+function manifestOwner(manifest: Record<string, unknown>): PromotedPlanFolder['responsibleSupervisor'] {
+  const events = manifest.responsibility_events;
+  if (!Array.isArray(events)) return null;
+  for (let index = events.length - 1; index >= 0; index--) {
+    const event = events[index];
+    if (!event || typeof event !== 'object' || (event as Record<string, unknown>).event !== 'assigned') continue;
+    const row = event as Record<string, unknown>;
+    return {
+      display: typeof row.display === 'string' ? row.display : null,
+      agentId: typeof row.agent_id === 'string' ? row.agent_id : null,
+      source: typeof row.source === 'string' ? row.source : null,
+    };
+  }
+  return null;
+}
+
+/** Filesystem-first plan-folder projection. The state-dir helper preserves the
+ * `.dashboard` fallback; no renderer or IPC caller constructs that path. */
+export function listPromotedPlanFolders(
+  workspaceId: string,
+  workspaceRoot: string,
+  pathType: PathType = 'windows',
+  resolvePlanId: (workspaceId: string, artifactId: string) => string | null =
+    (wsId, artifactId) => dbGetPlanByWorkspaceArtifactId(wsId, artifactId)?.id ?? null,
+): PromotedPlanFolderListResult {
+  const plans: PromotedPlanFolder[] = [];
+  const warnings: string[] = [];
+  if (!workspaceId || !workspaceRoot) return { plans, warnings: ['workspace is required'] };
+  const plansRoot = path.join(workspaceStateDir(workspaceRoot, pathType), 'plans');
+  let folders: fs.Dirent[];
+  try {
+    folders = fs.readdirSync(plansRoot, { withFileTypes: true });
+  } catch {
+    return { plans, warnings };
+  }
+  for (const folder of folders.filter((entry) => entry.isDirectory()).sort((a, b) => a.name.localeCompare(b.name))) {
+    const manifestPath = path.join(plansRoot, folder.name, 'plan.json');
+    try {
+      const stat = fs.lstatSync(manifestPath);
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.size > MAX_PROMOTED_PLAN_JSON_BYTES) {
+        warnings.push(`skipped ${folder.name}: invalid plan.json`);
+        continue;
+      }
+      const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8')) as Record<string, unknown>;
+      const planArtifactId = manifestString(manifest, 'plan_artifact_id');
+      if (!planArtifactId) {
+        warnings.push(`skipped ${folder.name}: plan.json has no plan_artifact_id`);
+        continue;
+      }
+      const status = manifestString(manifest, 'status', 'run_state', 'phase') ?? 'promoted';
+      plans.push({
+        planArtifactId,
+        planId: resolvePlanId(workspaceId, planArtifactId) ?? planArtifactId,
+        folderName: folder.name,
+        title: manifestString(manifest, 'title', 'plan_title', 'plan_sku') ?? folder.name,
+        status,
+        archived: manifest.archived === true || ARCHIVED_PLAN_STATUSES.has(status.toLowerCase()),
+        updatedAt: typeof manifest.updated_at === 'string' || typeof manifest.updated_at === 'number'
+          ? manifest.updated_at
+          : null,
+        responsibleSupervisor: manifestOwner(manifest),
+      });
+    } catch {
+      warnings.push(`skipped ${folder.name}: unreadable plan.json`);
+    }
+  }
+  plans.sort((a, b) => Number(b.updatedAt ?? 0) - Number(a.updatedAt ?? 0));
+  return { plans, warnings };
+}
 
 // ── Save-card SC-WP-3D — plan-package `done` finalization wiring ──────────────
 //
@@ -730,6 +816,11 @@ export function registerPlanCommentListIpc(
 }
 
 export function registerPlanIpc(manager: PlanPaneManager): void {
+  ipcMain.handle(
+    'plan-folder:list',
+    (_e, workspaceId: string, workspaceRoot: string, pathType?: PathType) =>
+      listPromotedPlanFolders(workspaceId, workspaceRoot, pathType),
+  );
   // ── WP-P1A: planning-reader (read-only fs enumeration + safe read) ──────────
   // Bounded enumeration of bare proposals + §R0 plan folders, and a
   // read-by-opaque-manifest-id read path. Purely read-only: NO demand-probe is

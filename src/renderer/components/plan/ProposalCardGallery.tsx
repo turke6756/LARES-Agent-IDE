@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import * as Icons from 'lucide-react';
 import { useDashboardStore } from '../../stores/dashboard-store';
 import EmbeddedMarkdownDocument from './EmbeddedMarkdownDocument';
+import PromoteToPlanPanel from './PromoteToPlanPanel';
 import {
   deriveProposalCardMetadata,
   orderProposalCards,
@@ -31,11 +32,13 @@ export default function ProposalCardGallery(): React.ReactElement {
   const [cards, setCards] = useState<ProposalCardMetadata[] | null>(null);
   const [selectedDocId, setSelectedDocId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [promoteOpen, setPromoteOpen] = useState(false);
 
   const load = useCallback(async () => {
     setCards(null);
     setError(null);
     setSelectedDocId(null);
+    setPromoteOpen(false);
     if (!workspace) {
       setCards([]);
       return;
@@ -78,7 +81,7 @@ export default function ProposalCardGallery(): React.ReactElement {
         <div className="flex h-10 shrink-0 items-center gap-2 border-b border-white/10 px-3">
           <button
             type="button"
-            onClick={() => setSelectedDocId(null)}
+            onClick={() => { setSelectedDocId(null); setPromoteOpen(false); }}
             className="ui-btn flex items-center gap-1 px-2 py-1 text-[11px]"
             data-testid="proposal-collapse"
           >
@@ -89,6 +92,15 @@ export default function ProposalCardGallery(): React.ReactElement {
             {selected.title}
           </h2>
           {selected.truncated && <span className="text-[10px] text-accent-orange">truncated</span>}
+          <button
+            type="button"
+            onClick={() => setPromoteOpen((open) => !open)}
+            className="ui-btn flex items-center gap-1 px-2 py-1 text-[11px]"
+            data-testid="proposal-promote"
+          >
+            <Icons.ArrowUpCircle className="h-3.5 w-3.5" />
+            Promote to plan
+          </button>
           <button
             type="button"
             onClick={() => {
@@ -110,6 +122,14 @@ export default function ProposalCardGallery(): React.ReactElement {
             Open in Files
           </button>
         </div>
+        {promoteOpen && workspace && (
+          <PromoteToPlanPanel
+            workspace={workspace}
+            proposalFilePath={proposalPath(workspace.path, selected.fileName, workspace.pathType)}
+            proposalTitle={selected.title}
+            onClose={() => setPromoteOpen(false)}
+          />
+        )}
         <div className="min-h-0 flex-1" data-testid="proposal-expanded-reader">
           {workspace && (
             <EmbeddedMarkdownDocument

@@ -207,6 +207,8 @@ const api: IpcApi = {
     },
     // WP5 mount: data reads + render-pane lifecycle (registerPlanIpc, main).
     list: (workspaceId) => ipcRenderer.invoke('plan:list', workspaceId),
+    listPromotedFolders: (workspaceId, workspaceRoot, pathType) =>
+      ipcRenderer.invoke('plan-folder:list', workspaceId, workspaceRoot, pathType),
     // WP-P2C/P2D: the unified gallery projection (proposals + structured folders +
     // legacy HTML; md excluded) and the byte-capped, containment-revalidated
     // single-proposal markdown read that backs the WP-P2D gallery pane.
