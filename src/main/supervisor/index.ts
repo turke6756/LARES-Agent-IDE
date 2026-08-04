@@ -94,7 +94,7 @@ import {
 } from '../git-checkpoints/dispatch-context';
 import type { RequestedPlanBinding } from '../../shared/commit-candidates';
 import { detectInteractivePrompt } from './interactive-prompt-detector';
-import { isNonBlockingNotificationType } from '../../shared/notification-classify';
+import { isNonBlockingNotificationType, isTurnCompleteNotificationMessage } from '../../shared/notification-classify';
 import { workspaceStateDirName } from '../workspace-state-dir';
 import { ensureInstallationLauncher } from '../installation-descriptor';
 
@@ -742,8 +742,16 @@ export interface ParsedHookEvent {
    *  transport-determined (see applyHookStatusEvent step 8). */
   source?: string;
   /** Notification-hook excerpt (the `message` field) for a `state:'waiting'`
-   *  event — CR/LF-stripped + capped script-side; threaded to forceWaiting. */
+   *  event — CR/LF-stripped + capped script-side; threaded to forceWaiting.
+   *  HTTP maps the raw `excerpt` field to this at the endpoint (api-server.ts);
+   *  spool & tmux-option JSON.parse the raw record straight through, so on those
+   *  transports the message lives on the raw `excerpt` alias below, NOT here. */
   waitingExcerpt?: string;
+  /** Raw notification message as written by the hook script (`excerpt`). Only
+   *  the HTTP endpoint renames it to `waitingExcerpt`; spool/tmux-option carry
+   *  it under this name. Read both when classifying a waiting notification so a
+   *  message-based rule (e.g. grok's "Turn complete") works on every transport. */
+  excerpt?: string;
   /** Notification `notification_type` (e.g. permission_prompt / idle_prompt /
    *  elicitation_*) for diagnostics on a `state:'waiting'` event. */
   notificationType?: string;
@@ -7333,7 +7341,17 @@ export class AgentSupervisor extends EventEmitter {
       // canary) for this event; an idle reminder / informational notification proves
       // the agent is alive but must NOT flip the card to 'waiting'. Suppress the known
       // non-blocking types; unknown/missing notificationType → waiting (conservative).
-      if (!isNonBlockingNotificationType(event.notificationType)) {
+      // Message-class suppression too: the grok lane fires a Notification hook on
+      // turn COMPLETION ("Turn complete", no notification_type), which the
+      // type-based discriminator can't catch — it would strand an idle worker as
+      // 'waiting'. Read the message from waitingExcerpt (HTTP) OR the raw excerpt
+      // alias (spool/tmux-option) so the rule holds on every transport. Genuine
+      // input-needed / permission notifications don't match and still latch.
+      const notificationMessage = event.waitingExcerpt ?? event.excerpt;
+      if (
+        !isNonBlockingNotificationType(event.notificationType) &&
+        !isTurnCompleteNotificationMessage(notificationMessage)
+      ) {
         this.monitor.forceWaiting(agentId, 'notification', event.waitingExcerpt ?? '');
       }
     }

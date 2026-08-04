@@ -656,6 +656,103 @@ test('idle_prompt Notification suppressed on http / spool / tmux-option → no f
   }
 });
 
+// grok turn-complete phantom-waiting fix — the grok lane fires a Notification
+// hook on turn COMPLETION with the message "Turn complete" and NO
+// notification_type. The type-based discriminator can't catch it, so it used to
+// flip an already-idle worker to 'waiting' ~60s after a clean Stop→idle. The
+// message-based rule must suppress it on EVERY transport: HTTP carries the
+// message as `waitingExcerpt`, spool/tmux-option as the raw `excerpt` alias.
+
+/** HTTP-shaped grok turn-complete event (excerpt → waitingExcerpt, no type). */
+function httpTurnCompleteEvent(agentId: string, ts: number): ParsedHookEvent {
+  return {
+    agentId,
+    state: 'waiting',
+    source: 'hook-notification',
+    ts,
+    hookEventName: 'Notification',
+    turnId: `tc-${ts}`,
+    waitingExcerpt: 'Turn complete',
+  } as ParsedHookEvent;
+}
+
+/** spool/tmux-shaped grok turn-complete record: raw `excerpt`, no `waitingExcerpt`,
+ *  no `notificationType` — exactly the live pending-status.jsonl evidence. */
+function rawTurnCompleteRecord(agentId: string, ts: number): ParsedHookEvent {
+  return {
+    v: 1,
+    agentId,
+    state: 'waiting',
+    source: 'hook-notification',
+    ts,
+    hookEventName: 'Notification',
+    turnId: `tc-${ts}`,
+    excerpt: 'Turn complete',
+  } as unknown as ParsedHookEvent;
+}
+
+test('grok "Turn complete" Notification suppressed on http / spool / tmux-option → no forceWaiting', () => {
+  const cases: Array<{ transport: 'http' | 'spool' | 'tmux-option'; ev: (id: string, ts: number) => ParsedHookEvent }> = [
+    { transport: 'http', ev: httpTurnCompleteEvent },
+    { transport: 'spool', ev: rawTurnCompleteRecord },
+    { transport: 'tmux-option', ev: rawTurnCompleteRecord },
+  ];
+  for (const { transport, ev } of cases) {
+    const { supervisor, agent, audit, cleanup } = makeWaitingEnv();
+    try {
+      const wire = ev(agent.id, Date.now());
+      const result = (supervisor as unknown as {
+        applyHookStatusEvent: (id: string, e: ParsedHookEvent, t: 'http' | 'spool' | 'tmux-option') => string;
+      }).applyHookStatusEvent(agent.id, wire, transport);
+
+      assert.equal(result, 'applied', `${transport}: the turn-complete notice is still ACCEPTED (a heartbeat)`);
+      assert.equal(agent.status, 'working', `${transport}: "Turn complete" must NOT flip the worker to waiting`);
+      assert.deepStrictEqual(waitingChanges(audit), [], `${transport}: no waiting status_change from a turn-complete notice`);
+      assert.equal(agent.hookStatus, 'healthy', `${transport}: turn-complete still stamps hook health (heartbeat)`);
+    } finally {
+      cleanup();
+    }
+  }
+});
+
+/** spool/tmux-shaped genuine input-needed record: raw `excerpt`, no type. This
+ *  is the control — a REAL input gate that arrives with no notification_type
+ *  (like grok) must STILL latch 'waiting'; only turn-completion is suppressed. */
+function rawInputNeededRecord(agentId: string, ts: number): ParsedHookEvent {
+  return {
+    v: 1,
+    agentId,
+    state: 'waiting',
+    source: 'hook-notification',
+    ts,
+    hookEventName: 'Notification',
+    turnId: `in-${ts}`,
+    excerpt: 'Agent is waiting for your input',
+  } as unknown as ParsedHookEvent;
+}
+
+test('genuine input-needed Notification (no type) STILL latches waiting on http / spool / tmux-option', () => {
+  const cases: Array<{ transport: 'http' | 'spool' | 'tmux-option'; ev: (id: string, ts: number) => ParsedHookEvent }> = [
+    { transport: 'http', ev: (id, ts) => ({ ...rawInputNeededRecord(id, ts), waitingExcerpt: 'Agent is waiting for your input', excerpt: undefined } as unknown as ParsedHookEvent) },
+    { transport: 'spool', ev: rawInputNeededRecord },
+    { transport: 'tmux-option', ev: rawInputNeededRecord },
+  ];
+  for (const { transport, ev } of cases) {
+    const { supervisor, agent, audit, cleanup } = makeWaitingEnv();
+    try {
+      const result = (supervisor as unknown as {
+        applyHookStatusEvent: (id: string, e: ParsedHookEvent, t: 'http' | 'spool' | 'tmux-option') => string;
+      }).applyHookStatusEvent(agent.id, ev(agent.id, Date.now()), transport);
+
+      assert.equal(result, 'applied', `${transport}: input-needed notice accepted`);
+      assert.equal(agent.status, 'waiting', `${transport}: a genuine input gate MUST flip the worker to waiting`);
+      assert.equal(waitingChanges(audit).length, 1, `${transport}: exactly one waiting status_change`);
+    } finally {
+      cleanup();
+    }
+  }
+});
+
 test('STALE tmux-option / spool waiting → rejected by freshness & ordering gates, no flip, no stamp', () => {
   // (a) tmux-option: an option that survived a dashboard restart is 11 minutes
   //     old → tripped by the bounded-age gate (TMUX_OPTION_MAX_AGE_MS = 10min).

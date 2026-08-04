@@ -346,6 +346,35 @@ test('cwd discovery tails the session with no bound session id', () => {
   }
 });
 
+test('start floor: a live session whose mtime is just after a SQLite space-form createdAt is ACCEPTED (UTC parse)', () => {
+  // Regression for the start-floor timezone misparse: startedAt arrives from the
+  // agents table as SQLite `datetime('now')` space-form ("YYYY-MM-DD HH:MM:SS",
+  // UTC, no Z). A bare Date.parse reads it as LOCAL time, so on a west-of-UTC
+  // host the floor lands hours in the FUTURE and every real session is rejected
+  // as stale → discovery null → empty chat. Values use Date.UTC so the assertion
+  // holds on any runner timezone (green on UTC CI; proves the fix west of UTC).
+  const createdAtUtcMs = Date.UTC(2026, 7, 4, 17, 18, 38); // "2026-08-04 17:18:38" UTC
+  const startedAtSpaceForm = '2026-08-04 17:18:38';
+  const root = writeSessionTree({
+    cwd: FIXTURE_CWD,
+    sessionId: FIXTURE_SESSION_ID,
+    lines: FIXTURE_LINES,
+    mtimeMs: createdAtUtcMs + 5_000, // updates.jsonl written ~5s after the agent row
+  });
+  try {
+    const reader = makeDiscoveryReader(root);
+    const events = reader.pollSession(
+      makeSession({ agentId: 'a1', sessionId: '', workingDirectory: FIXTURE_CWD, startedAt: startedAtSpaceForm })
+    );
+    assert.ok(
+      events.some((e) => e.type === 'user-text' && e.text === 'list the files'),
+      'space-form createdAt must be treated as UTC so a just-after session is not falsely rejected as stale',
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('active_sessions.json selects the live session over a newer stale one', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'grok-home-'));
   const cwd = FIXTURE_CWD;

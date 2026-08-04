@@ -13,6 +13,7 @@ import type {
 } from '../../../shared/session-events';
 import { DEFAULT_CONTEXT_WINDOW_TOKENS, getContextWindowForModel } from '../../../shared/constants';
 import { resolveContextGaugeCap } from '../../context-gauge/context-gauge-cap';
+import { parseSqliteUtcMs } from '../sqlite-time';
 import type { AgentProvider } from '../../../shared/types';
 import {
   resolveWindowsHomeSubdir,
@@ -671,10 +672,14 @@ function normalizeCwd(p: string): string {
   return p.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
 }
 
+// `startedAt` arrives from the agents table as a SQLite `datetime('now')`
+// space-form UTC string ("YYYY-MM-DD HH:MM:SS", no zone marker). Bare
+// `Date.parse` reads that as LOCAL time and skews the start floor by the full
+// TZ offset — on a UTC-7 host the floor lands ~7h in the future and rejects
+// every live session. Delegate to the shared UTC-aware parser (ISO-Z values
+// still pass through unchanged).
 function parseIsoMs(value: string | undefined): number | null {
-  if (!value) return null;
-  const ms = Date.parse(value);
-  return Number.isFinite(ms) ? ms : null;
+  return parseSqliteUtcMs(value);
 }
 
 /** ISO timestamp for a grok update: prefer `_meta.agentTimestampMs` (ms),

@@ -9,6 +9,7 @@ import assert from 'node:assert/strict';
 import {
   NON_BLOCKING_NOTIFICATION_TYPES,
   isNonBlockingNotificationType,
+  isTurnCompleteNotificationMessage,
 } from './notification-classify';
 
 interface TestCase { name: string; run(): void; }
@@ -36,6 +37,25 @@ test('case + surrounding-whitespace insensitivity', () => {
   assert.equal(isNonBlockingNotificationType(' Idle_Prompt '), true, '" Idle_Prompt " → true');
   assert.equal(isNonBlockingNotificationType('IDLE_PROMPT'), true, 'IDLE_PROMPT → true');
   assert.equal(isNonBlockingNotificationType('  auth_success'), true, 'leading ws → true');
+});
+
+// ── isTurnCompleteNotificationMessage (grok turn-completion notice) ──────
+
+// The grok lane's turn-completion message is informational, not an input gate.
+test('grok "Turn complete" message → true (turn-completion notice)', () => {
+  assert.equal(isTurnCompleteNotificationMessage('Turn complete'), true, '"Turn complete" → true');
+  assert.equal(isTurnCompleteNotificationMessage('  turn complete  '), true, 'surrounding ws → true');
+  assert.equal(isTurnCompleteNotificationMessage('TURN COMPLETE'), true, 'case-insensitive → true');
+});
+
+// Genuine input-needed / permission notices must still latch waiting (false),
+// as must empty/missing messages.
+test('input-needed + permission + empty messages → false (still latch waiting)', () => {
+  assert.equal(isTurnCompleteNotificationMessage('Claude is waiting for your input'), false, 'input prompt → false');
+  assert.equal(isTurnCompleteNotificationMessage('Bash tool requires permission'), false, 'permission prompt → false');
+  assert.equal(isTurnCompleteNotificationMessage('Do you trust the files in this folder?'), false, 'trust prompt → false');
+  assert.equal(isTurnCompleteNotificationMessage(undefined), false, 'undefined → false (conservative)');
+  assert.equal(isTurnCompleteNotificationMessage(''), false, 'empty string → false (conservative)');
 });
 
 // ── Runner ───────────────────────────────────────────────────────────
