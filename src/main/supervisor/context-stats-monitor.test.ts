@@ -22,13 +22,13 @@ function test(name: string, fn: () => void | Promise<void>): void {
   tests.push({ name, run: fn });
 }
 
-function makeHarness(): {
+function makeHarness(workspaceRoot?: string): {
   reader: FakeReader;
   monitor: ContextStatsMonitor;
   emitted: JsonlFileActivity[];
 } {
   const reader = new FakeReader();
-  const monitor = new ContextStatsMonitor(reader as any);
+  const monitor = new ContextStatsMonitor(reader as any, workspaceRoot ? () => workspaceRoot : undefined);
   const emitted: JsonlFileActivity[] = [];
   monitor.on('fileActivity', (a) => emitted.push(a));
   monitor.start();
@@ -82,6 +82,58 @@ test('Gemini read_many_files with file_paths ignores non-string members', () => 
     { agentId: 'agent-1', filePath: 'a.ts', operation: 'read' },
     { agentId: 'agent-1', filePath: 'b.ts', operation: 'read' },
   ]);
+});
+
+test('Grok structured and terminal tools capture a read and a write', () => {
+  const { reader, emitted } = makeHarness('C:\\repo');
+  reader.emit('tool-use', toolUse('read_file', { target_file: 'src/grok-read.ts' }, 'grok-read'));
+  reader.emit('tool-use', toolUse('list_dir', { target_directory: 'src/grok-dir' }, 'grok-list'));
+  reader.emit('tool-use', toolUse(
+    'run_terminal_command',
+    { command: 'Set-Content src/grok-write.ts -Value updated' },
+    'grok-write',
+  ));
+  reader.emit('tool-result', toolResult('grok-write', 'exit: 0'));
+  assert.deepEqual(emitted, [
+    { agentId: 'agent-1', filePath: 'C:\\repo\\src\\grok-read.ts', operation: 'read' },
+    { agentId: 'agent-1', filePath: 'C:\\repo\\src\\grok-dir', operation: 'read' },
+    { agentId: 'agent-1', filePath: 'C:\\repo\\src\\grok-write.ts', operation: 'write' },
+  ]);
+});
+
+test('Antigravity run_command captures CommandLine reads and writes using Cwd', () => {
+  const { reader, emitted } = makeHarness();
+  reader.emit('tool-use', toolUse(
+    'run_command',
+    { CommandLine: 'Get-Content src/agy-read.ts', Cwd: 'C:\\repo' },
+    'agy-read',
+  ));
+  reader.emit('tool-result', toolResult('agy-read', 'read contents'));
+  reader.emit('tool-use', toolUse(
+    'run_command',
+    { CommandLine: 'Set-Content src/agy-write.ts -Value updated', Cwd: 'C:\\repo' },
+    'agy-write',
+  ));
+  reader.emit('tool-result', toolResult('agy-write', 'write complete'));
+  assert.deepEqual(emitted, [
+    { agentId: 'agent-1', filePath: 'C:\\repo\\src\\agy-read.ts', operation: 'read' },
+    { agentId: 'agent-1', filePath: 'C:\\repo\\src\\agy-write.ts', operation: 'write' },
+  ]);
+});
+
+test('newer Codex shell alias captures file activity', () => {
+  const { reader, emitted } = makeHarness();
+  reader.emit('tool-use', toolUse('shell', { command: 'Get-Content src/codex-read.ts', workdir: 'C:\\repo' }, 'codex-shell'));
+  reader.emit('tool-result', toolResult('codex-shell', 'Exit code: 0\ncontents'));
+  assert.deepEqual(emitted, [
+    { agentId: 'agent-1', filePath: 'C:\\repo\\src\\codex-read.ts', operation: 'read' },
+  ]);
+});
+
+test('unknown tool is still dropped', () => {
+  const { reader, emitted } = makeHarness();
+  reader.emit('tool-use', toolUse('unknown_file_tool', { file_path: 'src/ignored.ts' }));
+  assert.deepEqual(emitted, []);
 });
 
 test('structured tool duplicate paths WITHIN ONE tool-use are deduped', () => {

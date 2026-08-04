@@ -35,7 +35,17 @@ const TOOL_MAP: Record<string, FileOperation> = {
   'read_many_files': 'read',
   'write_file': 'create',
   'replace': 'write',
+  // Grok Build — read_file is shared with Gemini but uses `target_file`;
+  // list_dir reports its directory through `target_directory`.
+  'list_dir': 'read',
 };
+
+const SHELL_TOOL_NAMES = new Set([
+  'shell_command', // Codex (legacy/current function-call spelling)
+  'shell', // Codex (newer builds)
+  'run_terminal_command', // Grok Build
+  'run_command', // Antigravity
+]);
 
 export class ContextStatsMonitor extends EventEmitter {
   private stats = new Map<string, ContextStats>();
@@ -222,14 +232,27 @@ export class ContextStatsMonitor extends EventEmitter {
   };
 
   private handleToolUse = (e: ToolUseEvent): void => {
-    // Codex shell_command / apply_patch — parse the command string for
+    // Provider shell tools / Codex apply_patch — parse the command string for
     // file-touch shapes; stash by toolUseId and emit on successful tool-result.
-    if (e.toolName === 'shell_command' || e.toolName === 'apply_patch') {
-      const input = e.input as { command?: unknown; input?: unknown; workdir?: unknown } | null | undefined;
-      const workdir = typeof input?.workdir === 'string' ? input.workdir : '';
+    if (SHELL_TOOL_NAMES.has(e.toolName) || e.toolName === 'apply_patch') {
+      const input = e.input as {
+        command?: unknown;
+        CommandLine?: unknown;
+        input?: unknown;
+        workdir?: unknown;
+        Cwd?: unknown;
+      } | null | undefined;
+      const workdir = typeof input?.workdir === 'string'
+        ? input.workdir
+        : typeof input?.Cwd === 'string'
+          ? input.Cwd
+          : this.resolveWorkspaceRoot?.(e.agentId) ?? '';
       let parsed: ParsedShellActivity[] = [];
-      if (e.toolName === 'shell_command' && typeof input?.command === 'string') {
-        parsed = parseShellCommand(input.command, workdir);
+      if (SHELL_TOOL_NAMES.has(e.toolName)) {
+        const command = typeof input?.command === 'string'
+          ? input.command
+          : typeof input?.CommandLine === 'string' ? input.CommandLine : null;
+        if (command) parsed = parseShellCommand(command, workdir);
       } else if (e.toolName === 'apply_patch' && typeof input?.input === 'string') {
         parsed = parseApplyPatch(input.input, workdir);
       }
@@ -353,10 +376,14 @@ function extractStructuredToolPaths(input: unknown): string[] {
     path?: unknown;
     file_paths?: unknown;
     paths?: unknown;
+    target_file?: unknown;
+    target_directory?: unknown;
   };
   const out: string[] = [];
   if (typeof obj.file_path === 'string') out.push(obj.file_path);
   if (typeof obj.path === 'string') out.push(obj.path);
+  if (typeof obj.target_file === 'string') out.push(obj.target_file);
+  if (typeof obj.target_directory === 'string') out.push(obj.target_directory);
   if (Array.isArray(obj.file_paths)) {
     for (const p of obj.file_paths) {
       if (typeof p === 'string') out.push(p);
