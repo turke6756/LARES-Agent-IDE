@@ -10,9 +10,25 @@
 import { ipcMain } from 'electron';
 import type { Rectangle } from 'electron';
 import type { PlanPaneManager } from './plan-pane-manager';
-import type { PlanListItem, PathType } from '../../shared/types';
-import { getPlans, getPlanWorkPackage as dbGetPlanWorkPackage } from '../database';
-import type { PlanWorkPackage } from '../database';
+import type {
+  PlanListItem,
+  PathType,
+  Plan,
+  Agent,
+  PromoteProposalResult,
+  PromotionStatus,
+} from '../../shared/types';
+import { hasSupervisorPrivilege } from '../../shared/types';
+import {
+  getPlans,
+  getPlanWorkPackage as dbGetPlanWorkPackage,
+  getAgent as dbGetAgent,
+  getPlan as dbGetPlan,
+  getPlanByWorkspaceArtifactId as dbGetPlanByWorkspaceArtifactId,
+  getPromotionRequestById as dbGetPromotionRequestById,
+} from '../database';
+import type { PlanWorkPackage, StructuredPlanRow, PromotionRequestRow } from '../database';
+import type { PromoteResult, ProposalRef } from './promote-proposal';
 import { resolvePlanProjection, buildPlanActivityProjection } from '../api-server';
 import { derivePlanSnippet } from './plan-snippet';
 import { listPlanningEntries, readPlanningDocument } from './planning-reader';
@@ -268,6 +284,196 @@ export function registerPlanCandidatePreviewIpc(
   );
 }
 
+// ── WP-P3C′ — proposal-promotion IPC (`proposal:promote`, `proposal:promotionStatus`) ──
+//
+// Two thin handlers over the WP-P3B-core/enrich promotion service. This layer owns
+// NO promotion business logic (§P3-GAP: no document selection anywhere) — it does
+// exactly three things the renderer cannot:
+//   1. SERVER-side re-validate the picked supervisor — the client may only OFFER a
+//      privileged same-workspace agent; the server independently rejects anything
+//      else via hasSupervisorPrivilege + same-workspace membership.
+//   2. Drive the deps-bound WP-P3B-core `promoteProposal` (resolveProposal /
+//      scanClaims / deliverer / enrich all injected by the wiring lane) and map its
+//      internal `PromoteResult` down to the renderer-facing discriminated
+//      `PromoteProposalResult` — returning PROMPTLY, never blocking on the watcher.
+//   3. Expose the durable status read (`promotion_requests` + the adopted `plans`
+//      row) the dialog polls to resolve a `promotion-pending` result.
+//
+// The production service is injected by the wiring lane via
+// `providePromotionService` (mirrors `providePlanPreviewRoutes`); until wired, both
+// handlers reject honestly. This keeps the full core-deps wiring in the wiring
+// lane's file, not here.
+
+/** The deps-bound promotion seam the wiring lane injects. `promote` is
+ *  WP-P3B-core `promoteProposal` with all of its production deps bound;
+ *  `resolveProposal` is the SAME proposal resolver, exposed so the handler can
+ *  read the proposal's workspace for server-side supervisor revalidation before
+ *  minting anything. */
+export interface PromotionService {
+  promote(input: { proposalId: string; supervisorId: string }): Promise<PromoteResult>;
+  resolveProposal(proposalId: string): ProposalRef | null | Promise<ProposalRef | null>;
+}
+
+let promotionService: PromotionService | null = null;
+
+/** Inject (or clear) the production promotion service once the WP-P3B core/enrich
+ *  deps are wired. Until wired, `proposal:promote` / `proposal:promotionStatus`
+ *  reject honestly (the dialog surfaces "promotion unavailable"). */
+export function providePromotionService(service: PromotionService | null): void {
+  promotionService = service;
+}
+
+class PromoteError extends Error {
+  constructor(message: string, readonly code: string) {
+    super(message);
+    this.name = 'PromoteError';
+  }
+}
+
+/** Injectable seams for the two handlers — defaults to the real service + db
+ *  accessors; overridden wholesale in `proposal-promote-ipc.test.ts`. */
+export interface PromoteIpcDeps {
+  service: PromotionService | null;
+  getAgent: (id: string) => Agent | null;
+  getPlan: (id: string) => Plan | null;
+  getPlanByWorkspaceArtifactId: (workspaceId: string, artifactId: string) => StructuredPlanRow | null;
+  getPromotionRequestById: (id: string) => PromotionRequestRow | null;
+}
+
+function defaultPromoteIpcDeps(): PromoteIpcDeps {
+  return {
+    service: promotionService,
+    getAgent: dbGetAgent,
+    getPlan: dbGetPlan,
+    getPlanByWorkspaceArtifactId: dbGetPlanByWorkspaceArtifactId,
+    getPromotionRequestById: dbGetPromotionRequestById,
+  };
+}
+
+function requireStringField(raw: unknown, field: string): string {
+  const record = (raw && typeof raw === 'object') ? (raw as Record<string, unknown>) : null;
+  const value = record?.[field];
+  if (typeof value !== 'string' || value === '') {
+    throw new PromoteError(`a non-empty ${field} is required`, 'promote-bad-request');
+  }
+  return value;
+}
+
+/** Resolve the adopted plan row (full shared `Plan`) for a workspace + plan
+ *  artifact id, or null when no `plans` row exists yet. */
+function resolveAdoptedPlan(deps: PromoteIpcDeps, workspaceId: string, planArtifactId: string): Plan | null {
+  const row = deps.getPlanByWorkspaceArtifactId(workspaceId, planArtifactId);
+  if (!row) return null;
+  return deps.getPlan(row.id);
+}
+
+/**
+ * `proposal:promote` core. Server-side revalidates the picked supervisor, drives the
+ * deps-bound WP-P3B-core promote, and maps its `PromoteResult` to the renderer
+ * `PromoteProposalResult`. Rejecting outcomes (non-supervisor, duplicate, foreign,
+ * launch-failed) throw — they are never a silent status. Returns PROMPTLY (the core
+ * never blocks on the watcher); a repeat call on a pending/adopted proposal reflects
+ * the existing operation and mints nothing new (WP-P3B-core idempotency).
+ */
+export async function runPromoteProposal(
+  raw: unknown,
+  deps: PromoteIpcDeps,
+): Promise<PromoteProposalResult> {
+  const proposalId = requireStringField(raw, 'proposalId');
+  const supervisorId = requireStringField(raw, 'supervisorId');
+
+  const service = deps.service;
+  if (!service) {
+    throw new PromoteError(
+      'Promotion is unavailable (the promotion service has not finished bootstrapping)',
+      'promotion-service-unavailable',
+    );
+  }
+
+  // Resolve the proposal FIRST — its workspace bounds the supervisor revalidation.
+  const proposal = await service.resolveProposal(proposalId);
+  if (!proposal) {
+    throw new PromoteError(`proposal not found: ${proposalId}`, 'promote-proposal-not-found');
+  }
+
+  // ── Server-side supervisor revalidation (never trust the client's filter). ──
+  const agent = deps.getAgent(supervisorId);
+  if (!agent || !hasSupervisorPrivilege(agent) || agent.workspaceId !== proposal.workspaceId) {
+    throw new PromoteError(
+      `not an eligible supervisor for this workspace: ${supervisorId}`,
+      'promote-supervisor-rejected',
+    );
+  }
+
+  const result = await service.promote({ proposalId, supervisorId });
+
+  switch (result.status) {
+    case 'adopted': {
+      const plan = resolveAdoptedPlan(deps, proposal.workspaceId, result.planArtifactId);
+      if (!plan) {
+        throw new PromoteError(
+          `promotion adopted but no plan row for ${result.planArtifactId}`,
+          'promote-adopted-plan-missing',
+        );
+      }
+      return { status: 'adopted', plan };
+    }
+    case 'promotion-pending':
+      return {
+        status: 'promotion-pending',
+        promotionRequestId: result.requestId,
+        planArtifactId: result.planArtifactId,
+      };
+    case 'duplicate-blocked':
+      throw new PromoteError(result.diagnostic, 'promote-duplicate-blocked');
+    case 'rejected-foreign':
+      throw new PromoteError(result.diagnostic, 'promote-rejected-foreign');
+    case 'failed':
+      throw new PromoteError(result.reason, 'promote-failed');
+    default: {
+      // Exhaustiveness guard — a new PromoteResult variant must be mapped here.
+      const _never: never = result;
+      throw new PromoteError('unhandled promote result', 'promote-unhandled');
+    }
+  }
+}
+
+/**
+ * `proposal:promotionStatus` core. A runtime read over the durable
+ * `promotion_requests` row (+ the adopted `plans` row once enrichment surfaces it) —
+ * NOT a private durable skill format. The dialog polls this with bounded backoff to
+ * resolve a `promotion-pending` result to its plan.
+ */
+export function runPromotionStatus(raw: unknown, deps: PromoteIpcDeps): PromotionStatus {
+  const promotionRequestId = requireStringField(raw, 'promotionRequestId');
+  const request = deps.getPromotionRequestById(promotionRequestId);
+  if (!request) {
+    throw new PromoteError(`unknown promotion request: ${promotionRequestId}`, 'promotion-status-unknown');
+  }
+  const plan = request.state === 'adopted'
+    ? resolveAdoptedPlan(deps, request.workspaceId, request.planArtifactId)
+    : null;
+  return {
+    promotionRequestId: request.id,
+    state: request.state,
+    planArtifactId: request.planArtifactId,
+    plan,
+    failureReason: request.failureReason,
+    attemptCount: request.attemptCount,
+  };
+}
+
+/** Register the two WP-P3C′ promotion channels on the given ipc surface. Split from
+ *  `registerPlanIpc` so the ipc test can drive registration against a fake ipcMain. */
+export function registerPromotionIpc(ipc: PlanIpcLike): void {
+  ipc.handle('proposal:promote', (_event, raw: unknown) =>
+    runPromoteProposal(raw, defaultPromoteIpcDeps()),
+  );
+  ipc.handle('proposal:promotionStatus', (_event, raw: unknown) =>
+    runPromotionStatus(raw, defaultPromoteIpcDeps()),
+  );
+}
+
 export function registerPlanIpc(manager: PlanPaneManager): void {
   // ── WP-P1A: planning-reader (read-only fs enumeration + safe read) ──────────
   // Bounded enumeration of bare proposals + §R0 plan folders, and a
@@ -334,6 +540,13 @@ export function registerPlanIpc(manager: PlanPaneManager): void {
   // `providePlanPreviewRoutes` once the candidate engine bootstraps; until then the
   // channel rejects honestly (the plan lens simply shows no preview).
   registerPlanCandidatePreviewIpc(ipcMain, () => planPreviewRoutes);
+
+  // ── WP-P3C′: proposal promotion + concrete status poll ──────────────────────
+  // The Promote dialog's supervisor-picker confirm (`proposal:promote`) and the
+  // bounded status poll (`proposal:promotionStatus`) that resolves a
+  // promotion-pending result. Both reject honestly until the wiring lane injects
+  // the production service via `providePromotionService`.
+  registerPromotionIpc(ipcMain);
 
   // Plan list for the "Plans" card gallery (workspace-scoped). Each row carries a
   // cheap description snippet derived from its already-served projection (or an

@@ -27,7 +27,7 @@ let readMock: ReturnType<typeof vi.fn>;
 let planningList: ReturnType<typeof vi.fn>;
 let planningRead: ReturnType<typeof vi.fn>;
 let paneSetVisible: ReturnType<typeof vi.fn>;
-let onOpenLegacyPlan: ReturnType<typeof vi.fn>;
+let onOpenLegacyPlan: ReturnType<typeof vi.fn<(planId: string, title: string, workspaceId: string) => void>>;
 
 const PROPOSAL: PlanGalleryRow = {
   id: 'prop-1',
@@ -94,7 +94,7 @@ beforeEach(() => {
   planningList = vi.fn(async () => ({ entries: [], warnings: [] }));
   planningRead = vi.fn(async () => ({ error: 'none' }));
   paneSetVisible = vi.fn(async () => {});
-  onOpenLegacyPlan = vi.fn();
+  onOpenLegacyPlan = vi.fn<(planId: string, title: string, workspaceId: string) => void>();
   (window as unknown as { api: unknown }).api = {
     plans: { gallery: galleryMock, readProposal: readMock, paneSetVisible },
     planningReader: { list: planningList, read: planningRead },
@@ -153,7 +153,7 @@ describe('PlanGalleryPane', () => {
     expect(document.querySelector('[data-testid="gallery-author-chip"]')?.textContent).toContain('edward');
   });
 
-  it('clicking a proposal reads it into the reader pane; Promote is present but inert', async () => {
+  it('clicking a proposal reads it into the reader pane; Promote opens the WP-P3C′ dialog', async () => {
     readMock.mockResolvedValue(readResult({ content: '# Auth\n\nbody-here' }));
     await render(base());
     const propRow = [...rows()].find((r) => r.getAttribute('data-row-type') === 'proposal') as HTMLElement;
@@ -164,10 +164,14 @@ describe('PlanGalleryPane', () => {
     expect(readMock).toHaveBeenCalledWith('prop-1');
     expect(pane().textContent).toContain('body-here');
 
-    // Promote button: proposals only, disabled (behavior is P3C).
+    // Promote button: proposals only, now ENABLED — opens the supervisor picker
+    // (WP-P3C′). It mints nothing until confirmed.
     const promote = propRow.querySelector('[data-testid="gallery-promote"]') as HTMLButtonElement;
     expect(promote).toBeTruthy();
-    expect(promote.disabled).toBe(true);
+    expect(promote.disabled).toBe(false);
+    await act(async () => { promote.click(); });
+    await flush();
+    expect(document.querySelector('[data-testid="promote-dialog"]')).toBeTruthy();
   });
 
   it('a structured (hasFolder) row opens the reused WP-P1B folder reader overlay', async () => {

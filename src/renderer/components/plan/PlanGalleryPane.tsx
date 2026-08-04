@@ -5,8 +5,11 @@ import type {
   PlanGalleryRow,
   PlanGalleryResult,
 } from '../../../shared/types';
+import { hasSupervisorPrivilege } from '../../../shared/types';
+import { useDashboardStore } from '../../stores/dashboard-store';
 import ProposalReader from './ProposalReader';
 import ProposalReaderPane from './ProposalReaderPane';
+import PromoteDialog, { type SupervisorChoice } from './PromoteDialog';
 
 // WP-P2D — the Plans GALLERY pane. Edward's binding UX ruling: this is a STABLE
 // TOP-LEVEL center pane (peer of Dashboard / Files / Browser), never the legacy
@@ -93,6 +96,20 @@ export default function PlanGalleryPane({
   const [read, setRead] = useState<ReadState | null>(null);
   // The reused WP-P1B folder reader overlay, opened for a structured row.
   const [folderReaderOpen, setFolderReaderOpen] = useState(false);
+  // WP-P3C′ — the proposal currently open in the Promote dialog (null = closed).
+  const [promoteRow, setPromoteRow] = useState<PlanGalleryRow | null>(null);
+
+  // Candidate supervisors for the Promote picker: privileged, same-workspace
+  // agents. Filtered client-side for the picker; the server independently
+  // re-validates the pick on confirm (§P3-GAP: supervisor picker only).
+  const agents = useDashboardStore((s) => s.agents);
+  const supervisors = useMemo<SupervisorChoice[]>(
+    () =>
+      agents
+        .filter((a) => a.workspaceId === workspaceId && hasSupervisorPrivilege(a))
+        .map((a) => ({ id: a.id, title: a.title })),
+    [agents, workspaceId],
+  );
 
   const refresh = useCallback(() => {
     setError(null);
@@ -148,11 +165,12 @@ export default function PlanGalleryPane({
     [workspaceId, onOpenLegacyPlan, openProposal],
   );
 
-  // Promote — proposals only. Behavior lands in P3C; this is an inert stub that
-  // mints NO plan / registry row. Kept disabled so the affordance is visible but
-  // cannot be exercised before the promotion service exists.
-  const onPromote = useCallback((_row: PlanGalleryRow) => {
-    // Intentionally no-op (P3C).
+  // Promote — proposals only. Opens the WP-P3C′ supervisor picker (§P3-GAP: no
+  // document selection). All promotion business logic lives behind the injected
+  // `promote` / `promotionStatus` IPC seams (WP-P3B-core/enrich) — this pane only
+  // opens the dialog and refreshes the gallery once a plan is adopted.
+  const onPromote = useCallback((row: PlanGalleryRow) => {
+    setPromoteRow(row);
   }, []);
 
   const rows = result?.rows ?? null;
@@ -280,10 +298,9 @@ export default function PlanGalleryPane({
                           <div className="pl-5">
                             <button
                               onClick={() => onPromote(row)}
-                              disabled
-                              className="flex items-center gap-1 rounded border border-white/10 px-1.5 py-0.5 text-[10px] text-gray-500 opacity-60"
+                              className="flex items-center gap-1 rounded border border-white/10 px-1.5 py-0.5 text-[10px] text-gray-300 hover:bg-white/10 hover:text-gray-100"
                               data-testid="gallery-promote"
-                              title="Promote this proposal to a plan — arrives in P3C"
+                              title="Promote this proposal to a plan"
                             >
                               <Icons.ArrowUpCircle className="h-3 w-3" />
                               Promote
@@ -318,6 +335,22 @@ export default function PlanGalleryPane({
           pathType={pathType}
           workspaceId={workspaceId}
           onClose={() => setFolderReaderOpen(false)}
+        />
+      )}
+
+      {/* WP-P3C′ — the Promote supervisor picker (proposals only). */}
+      {promoteRow && (
+        <PromoteDialog
+          proposalId={promoteRow.id}
+          proposalTitle={promoteRow.title}
+          supervisors={supervisors}
+          promote={(input) => window.api.plans.promote(input)}
+          promotionStatus={(input) => window.api.plans.promotionStatus(input)}
+          onResolved={() => {
+            // A plan was adopted — refresh so the new structured row surfaces.
+            refresh();
+          }}
+          onClose={() => setPromoteRow(null)}
         />
       )}
     </div>

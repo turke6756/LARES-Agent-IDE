@@ -339,6 +339,38 @@ export interface PlanListItem extends Plan {
   snippet: string | null;
 }
 
+// ── WP-P3C′ — proposal-promotion IPC result contracts (§P3-GAP) ───────────────
+// The renderer-facing shape of `proposal:promote`. A discriminated union over the
+// two ACCEPTED outcomes the Promote dialog must transition between: an already
+// -adopted plan (return the plan directly), or a promotion still in flight (the
+// dialog then polls `proposal:promotionStatus` until the plan surfaces). The
+// rejecting outcomes (non-supervisor, duplicate, foreign, launch-failed) are NOT
+// members — they are surfaced as a thrown IPC error, never a silent status. There
+// is NO document-selection field anywhere (§P3-GAP: the Promote dialog is a
+// supervisor picker only).
+export type PromoteProposalResult =
+  | { status: 'adopted'; plan: Plan }
+  | { status: 'promotion-pending'; promotionRequestId: string; planArtifactId: string };
+
+/** The renderer-facing shape of `proposal:promotionStatus` — a runtime read over
+ *  the durable `promotion_requests` row (+ the adopted `plans` row when present),
+ *  NOT a private durable skill format. The Promote dialog polls this after a
+ *  `promotion-pending` result, transitioning to the plan once `state==='adopted'`
+ *  surfaces a non-null `plan`. */
+export interface PromotionStatus {
+  promotionRequestId: string;
+  /** The durable request state — mirrors `promotion_requests.state`. */
+  state: 'pending' | 'adopted' | 'failed';
+  planArtifactId: string;
+  /** The adopted plan row, present ONLY once enrichment has flipped the request to
+   *  `adopted` and the `plans` row exists; null while pending/failed. */
+  plan: Plan | null;
+  /** Mirrors `promotion_requests.failure_reason` — non-null only when `failed`. */
+  failureReason: string | null;
+  /** Mirrors `promotion_requests.attempt_count`. */
+  attemptCount: number;
+}
+
 export interface SupervisorFocus {
   supervisorId: string;
   planId: string;
@@ -2588,6 +2620,16 @@ export interface IpcApi {
      *  member verdicts plus the D-1-filtered whole-component selection for the shared
      *  `CandidatePreview` component. Rejects until the engine route is injected. */
     previewCandidate: (req: PlanCandidatePreviewRequest) => Promise<PlanCandidatePreviewResponse>;
+    /** WP-P3C′ — promote a proposal into a plan (supervisor picker, §P3-GAP: NO
+     *  document selection). Returns promptly with the discriminated
+     *  `PromoteProposalResult`; NEVER blocks on the folder watcher. Rejects
+     *  (throws) when the supervisor is not a privileged same-workspace agent, or on
+     *  a duplicate/foreign/launch-failed outcome. */
+    promote: (input: { proposalId: string; supervisorId: string }) => Promise<PromoteProposalResult>;
+    /** WP-P3C′ — the concrete status path a `promotion-pending` result resolves
+     *  through: a runtime read over `promotion_requests` (+ the adopted `plans`
+     *  row). The dialog polls this with bounded backoff. Rejects on an unknown id. */
+    promotionStatus: (input: { promotionRequestId: string }) => Promise<PromotionStatus>;
   };
   /** WP-P1B: read-only planning reader. `list` enumerates bare proposals + §R0
    *  plan folders and is a pure mount/refresh read (emits NO demand-probe);

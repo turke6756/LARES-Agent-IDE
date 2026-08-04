@@ -219,6 +219,11 @@ const api: IpcApi = {
     paneSetVisible: (visible) => ipcRenderer.invoke('plan-pane:setVisible', visible),
     // SC-WP-3I — read-only plan-lens candidate preview (mirrors saveCard.preview).
     previewCandidate: (req) => ipcRenderer.invoke(PLAN_PREVIEW_CHANNEL, req),
+    // WP-P3C′ — proposal promotion (supervisor picker; §P3-GAP: no doc selection)
+    // + its concrete status poll. `promote` returns promptly (never blocks on the
+    // watcher); `promotionStatus` reads the durable promotion_requests/plans rows.
+    promote: (input) => ipcRenderer.invoke('proposal:promote', input),
+    promotionStatus: (input) => ipcRenderer.invoke('proposal:promotionStatus', input),
   },
   // WP-P1B: read-only planning reader (bounded fs enumeration + read-by-opaque-id).
   // `list` is a pure mount/refresh read (NO demand-probe); a voluntary open is
