@@ -289,6 +289,8 @@ const TESTS = [
   'dist/main/main/git-checkpoints/commit-coordinator.races.test.js',
   // Save-card Stage 4 SC-WP-4J — real-repository path-semantics adversarial matrix.
   'dist/main/main/git-checkpoints/commit-coordinator.path-semantics.test.js',
+  // Save-card Stage 4 SC-WP-4I — real hooks + §9.4 outcome/end-state matrix.
+  'dist/main/main/git-checkpoints/commit-coordinator.hooks-outcomes.test.js',
   'dist/main/main/supervisor/send-queue-checkpoint.test.js',
   'dist/main/main/supervisor/initial-user-prompt.test.js',
   'dist/main/main/supervisor/hook-spool-tailer.test.js',
