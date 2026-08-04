@@ -56,7 +56,12 @@ import {
 } from '../../shared/types';
 import { getPlanIntentsProjection } from './plan-intent-ledger';
 import { buildPlanDocuments, readPlanDocument, type PlanDocumentsDeps } from './plan-documents';
-import { createPlanComment, type CreatePlanCommentDeps } from './plan-comments';
+import {
+  createPlanComment,
+  answerPlanComment,
+  type CreatePlanCommentDeps,
+  type AnswerPlanCommentDeps,
+} from './plan-comments';
 
 // ── Save-card SC-WP-3D — plan-package `done` finalization wiring ──────────────
 //
@@ -678,6 +683,20 @@ export function registerPlanOverviewIpc(
 
 export function registerPlanCommentIpc(ipc: PlanIpcLike, deps: CreatePlanCommentDeps): void {
   ipc.handle('plan:comment:create', (_event, raw: unknown) => createPlanComment(raw, deps));
+}
+
+// ── WP-P4D-reply — plan-comment answer (companion reply) ──────────────────────
+//
+// Thin registrar over the `plan-comments.ts` answer service, sibling to
+// `registerPlanCommentIpc`. The answer writes a COMPANION reply row and never
+// mutates the question comment. The caller identity (`callerAgentId`) is
+// established by the wiring seam and independently revalidated below the IPC
+// boundary against the plan's durable responsible supervisor — a self-asserted
+// non-responsible id is rejected (mirrors `plan:setOverview`'s server-side
+// supervisor revalidation).
+
+export function registerPlanCommentReplyIpc(ipc: PlanIpcLike, deps: AnswerPlanCommentDeps): void {
+  ipc.handle('plan:comment:reply', (_event, raw: unknown) => answerPlanComment(raw, deps));
 }
 
 export function registerPlanIpc(manager: PlanPaneManager): void {

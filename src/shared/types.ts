@@ -4708,6 +4708,54 @@ export type PlanCommentCreateResult =
     }
   | { ok: false; code: PlanCommentCreateErrorCode; error: string };
 
+// ── WP-P4D-reply — companion reply (answer) service ───────────────────────────
+// A reply is a COMPANION row keyed to its question comment. It never overwrites
+// `selection_comments.body` and never overloads that row's delivery-status
+// `status` machine — the question row is left untouched. The agent-callable
+// `answer_plan_comment(comment_id, body)` surface validates that the answering
+// caller IS the plan's current responsible supervisor (resolved server-side from
+// the comment → plan, never renderer-asserted). `authorAgentId` is nullable
+// (system/undeclared replies), `createdAt` a service-owned epoch-ms INTEGER.
+
+export interface SelectionCommentReply {
+  id: string;
+  commentId: string;
+  body: string;
+  authorAgentId: string | null;
+  /** Service-owned creation time, epoch milliseconds (the companion table's
+   *  `created_at INTEGER`) — distinct from `selection_comments`' text datetime. */
+  createdAt: number;
+}
+
+export interface CreateSelectionCommentReplyInput {
+  commentId: string;
+  body: string;
+  authorAgentId?: string | null;
+  /** Defaults to the current epoch-ms when omitted. */
+  createdAt?: number;
+}
+
+/** The agent-callable answer request. `callerAgentId` is the SERVER-established
+ *  identity of the answering agent — the service revalidates it against the
+ *  plan's durable responsible supervisor, exactly as `plan:setOverview`
+ *  revalidates its `supervisorId`; a self-asserted non-responsible id is
+ *  rejected, never trusted. */
+export interface AnswerPlanCommentRequest {
+  commentId: string;
+  body: string;
+  callerAgentId: string;
+}
+
+export type AnswerPlanCommentErrorCode =
+  | 'reply-bad-request'
+  | 'comment-not-found'
+  | 'plan-not-found'
+  | 'not-responsible-supervisor';
+
+export type AnswerPlanCommentResult =
+  | { ok: true; reply: SelectionCommentReply }
+  | { ok: false; code: AnswerPlanCommentErrorCode; error: string };
+
 // ── WP-P2C — unified gallery projection ───────────────────────────────────────
 // A single server projection that unions three durable row kinds for the Plans
 // gallery: filesystem-owned proposals, folder-per-plan `structured` plans, and

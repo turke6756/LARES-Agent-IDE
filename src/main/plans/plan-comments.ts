@@ -35,7 +35,11 @@
 import fs from 'fs';
 import path from 'path';
 import type {
+  Agent,
+  AnswerPlanCommentRequest,
+  AnswerPlanCommentResult,
   CreateSelectionCommentInput,
+  CreateSelectionCommentReplyInput,
   PathType,
   PlanCommentCreateRequest,
   PlanCommentCreateResult,
@@ -44,10 +48,20 @@ import type {
   PlanningReaderEntry,
   PlanningReaderListResult,
   SelectionComment,
+  SelectionCommentReply,
   SendSelectionCommentsResult,
   Workspace,
 } from '../../shared/types';
-import { getDb, getWorkspace } from '../database';
+import { hasSupervisorPrivilege } from '../../shared/types';
+import {
+  createSelectionCommentReply,
+  getAgent,
+  getDb,
+  getPlanByWorkspaceArtifactId,
+  getSelectionComment,
+  getWorkspace,
+  listRegisteredPlanDocumentsByWorkspace,
+} from '../database';
 import { translateStateRelPath } from '../workspace-state-dir';
 import { listPlanningEntries } from './planning-reader';
 import type { PlanContext, RegisteredDocumentRow } from './plan-documents';
@@ -201,14 +215,19 @@ function joinWorkspacePath(base: string, rel: string, pathType: PathType): strin
   return path.resolve(base, rel);
 }
 
+/** Canonical form of an absolute path for lexical comparison: POSIX separators,
+ *  no trailing slash, and case-folded on win32 for a non-wsl path (the same
+ *  normalization `isContainedLexical` and the reply reverse-match both rely on so
+ *  a stored physical `file_path` compares equal to a freshly-resolved one). */
+function normalizeAbs(p: string, pathType: PathType): string {
+  let v = (pathType === 'wsl' ? p : path.resolve(p)).replace(/\\/g, '/').replace(/\/+$/, '');
+  if (process.platform === 'win32' && pathType !== 'wsl') v = v.toLowerCase();
+  return v;
+}
+
 function isContainedLexical(parent: string, child: string, pathType: PathType): boolean {
-  const norm = (p: string): string => {
-    let v = (pathType === 'wsl' ? p : path.resolve(p)).replace(/\\/g, '/').replace(/\/+$/, '');
-    if (process.platform === 'win32' && pathType !== 'wsl') v = v.toLowerCase();
-    return v;
-  };
-  const par = norm(parent);
-  const ch = norm(child);
+  const par = normalizeAbs(parent, pathType);
+  const ch = normalizeAbs(child, pathType);
   return ch === par || ch.startsWith(`${par}/`);
 }
 
@@ -355,6 +374,20 @@ function buildFolderTarget(
   // path_type / root_directory intentionally omitted → stored NULL.
 }
 
+/** The contained, workspace-absolute physical path of a registered external doc's
+ *  state-relative `rel_path`, or null when it fails validation / escapes the
+ *  workspace. Shared by the create path (which STORES this as `file_path`) and the
+ *  reply reverse-match (which recomputes it to find a comment's owning plan), so
+ *  the two never drift. */
+function registeredDocAbsPath(workspace: Workspace, relPath: string): string | null {
+  const translated = translateStateRelPath(workspace.path, relPath, workspace.pathType);
+  const safe = safeRel(translated);
+  if (!safe) return null;
+  const abs = joinWorkspacePath(workspace.path, safe, workspace.pathType);
+  if (!isContainedLexical(workspace.path, abs, workspace.pathType)) return null;
+  return abs;
+}
+
 /** Registered external doc → its ordinary physical `file_path` (unchanged). */
 function buildRegisteredTarget(
   planId: string,
@@ -366,13 +399,8 @@ function buildRegisteredTarget(
   if (!row || row.planId !== planId || row.workspaceId !== workspace.id) {
     return { error: 'document is not registered to the plan' };
   }
-  const translated = translateStateRelPath(workspace.path, row.relPath, workspace.pathType);
-  const safe = safeRel(translated);
-  if (!safe) return { error: 'registered document failed path validation' };
-  const abs = joinWorkspacePath(workspace.path, safe, workspace.pathType);
-  if (!isContainedLexical(workspace.path, abs, workspace.pathType)) {
-    return { error: 'registered document escapes the workspace' };
-  }
+  const abs = registeredDocAbsPath(workspace, row.relPath);
+  if (!abs) return { error: 'registered document failed path validation' };
   return { filePath: abs, pathType: workspace.pathType, rootDirectory: workspace.path };
 }
 
@@ -496,4 +524,185 @@ export function resolvePlanCommentForSend(
     return orphanClone(comment, decoded.docRelPathWithinFolder);
   }
   return { ...comment, filePath: abs, pathType: workspace.pathType, rootDirectory: workspace.path };
+}
+
+// ── WP-P4D-reply — companion reply (answer) service ───────────────────────────
+//
+// The agent-callable `answer_plan_comment(comment_id, body)` service. It writes a
+// COMPANION reply row (`selection_comment_replies`) keyed to the question comment
+// and NEVER overwrites `selection_comments.body` nor overloads that row's
+// delivery-status `status` machine. The one gate: the answering caller must BE the
+// plan's CURRENT responsible supervisor — resolved server-side from the comment →
+// plan (durably via the `lares-plan-doc:v1:` key for a folder doc, or by reverse-
+// matching the stored physical path for a registered external doc), never
+// renderer-asserted. A non-responsible caller is rejected and NO row is written.
+
+/** The comment's owning plan + its current responsible supervisor, resolved
+ *  server-side from the comment alone (the answer tool takes only a comment id). */
+export interface ResolvedCommentPlan {
+  planId: string;
+  workspaceId: string;
+  responsibleSupervisorId: string | null;
+}
+
+/** The minimal `plans` shape the resolver needs from a durable artifact lookup. */
+export interface ResolverPlanRow {
+  id: string;
+  workspaceId: string;
+  deletedAt: string | null;
+}
+
+/** Injectable db seams for `resolvePlanForComment` so both resolution branches
+ *  (durable logical key + registered-path reverse-match) are testable without a
+ *  live DB. */
+export interface ResolveCommentPlanDeps {
+  getWorkspace(workspaceId: string): Workspace | null;
+  getPlanByArtifact(workspaceId: string, planArtifactId: string): ResolverPlanRow | null;
+  listRegisteredDocuments(workspaceId: string): { planId: string; relPath: string }[];
+  getPlanContext(planId: string): PlanContext | null;
+  getResponsibleSupervisorId(planId: string): string | null;
+}
+
+export function defaultResolveCommentPlanDeps(): ResolveCommentPlanDeps {
+  return {
+    getWorkspace,
+    getPlanByArtifact: (workspaceId, planArtifactId) => {
+      const plan = getPlanByWorkspaceArtifactId(workspaceId, planArtifactId);
+      return plan
+        ? { id: plan.id, workspaceId: plan.workspaceId, deletedAt: plan.deletedAt }
+        : null;
+    },
+    listRegisteredDocuments: (workspaceId) =>
+      listRegisteredPlanDocumentsByWorkspace(workspaceId).map((d) => ({
+        planId: d.planId,
+        relPath: d.relPath,
+      })),
+    getPlanContext: defaultGetPlanContext,
+    getResponsibleSupervisorId: defaultGetResponsibleSupervisorId,
+  };
+}
+
+/**
+ * Comment → owning plan + current responsible supervisor. A folder-doc comment
+ * resolves DURABLY from the logical key's `plan_artifact_id` (a folder rename
+ * keeps it attached; a malformed / unknown-version key is orphaned → null). A
+ * registered-doc comment reverse-matches its stored physical `file_path` against
+ * the workspace's registered plan documents — exactly one owning plan, else fail
+ * closed (no owner or an ambiguous match → null).
+ */
+export function resolvePlanForComment(
+  comment: SelectionComment,
+  deps: ResolveCommentPlanDeps = defaultResolveCommentPlanDeps(),
+): ResolvedCommentPlan | null {
+  if (isLogicalPlanDocKey(comment.filePath)) {
+    const decoded = decodePlanDocKey(comment.filePath); // only the exact v1 form decodes
+    if (!decoded) return null; // malformed / unknown-version → orphaned, unresolvable
+    const plan = deps.getPlanByArtifact(comment.workspaceId, decoded.planArtifactId);
+    if (!plan || plan.deletedAt != null) return null;
+    return {
+      planId: plan.id,
+      workspaceId: plan.workspaceId,
+      responsibleSupervisorId: deps.getResponsibleSupervisorId(plan.id),
+    };
+  }
+
+  // Registered external doc: reverse-match the stored absolute path to its plan.
+  if (!comment.filePath) return null;
+  const workspace = deps.getWorkspace(comment.workspaceId);
+  if (!workspace) return null;
+  const target = normalizeAbs(comment.filePath, workspace.pathType);
+  const matches = deps.listRegisteredDocuments(comment.workspaceId).filter((doc) => {
+    const abs = registeredDocAbsPath(workspace, doc.relPath);
+    return abs != null && normalizeAbs(abs, workspace.pathType) === target;
+  });
+  const uniquePlanIds = [...new Set(matches.map((m) => m.planId))];
+  if (uniquePlanIds.length !== 1) return null; // no owner, or ambiguous → fail closed
+  const planId = uniquePlanIds[0];
+  const context = deps.getPlanContext(planId);
+  if (!context) return null;
+  return {
+    planId,
+    workspaceId: context.workspaceId,
+    responsibleSupervisorId: deps.getResponsibleSupervisorId(planId),
+  };
+}
+
+export interface AnswerPlanCommentDeps {
+  getComment(commentId: string): SelectionComment | null;
+  /** comment → { plan, workspace, current responsible supervisor }, or null when
+   *  the comment resolves to no live plan (orphaned logical key, unknown/ambiguous
+   *  registered path, deleted plan). */
+  resolvePlanForComment(comment: SelectionComment): ResolvedCommentPlan | null;
+  getAgent(agentId: string): Agent | null;
+  createReply(input: CreateSelectionCommentReplyInput): SelectionCommentReply;
+}
+
+export function defaultAnswerPlanCommentDeps(): AnswerPlanCommentDeps {
+  return {
+    getComment: getSelectionComment,
+    resolvePlanForComment: (comment) => resolvePlanForComment(comment),
+    getAgent,
+    createReply: createSelectionCommentReply,
+  };
+}
+
+/**
+ * Server-side plan-comment ANSWER. Validates the caller is the plan's current
+ * responsible supervisor, then writes a companion reply row. A rejected answer
+ * (bad request, unknown comment, unresolvable plan, non-responsible caller) never
+ * writes a row and never touches the question comment.
+ */
+export async function answerPlanComment(
+  raw: unknown,
+  deps: AnswerPlanCommentDeps,
+): Promise<AnswerPlanCommentResult> {
+  const req = (raw && typeof raw === 'object' ? raw : null) as AnswerPlanCommentRequest | null;
+  if (!req || typeof req.commentId !== 'string' || req.commentId === '') {
+    return { ok: false, code: 'reply-bad-request', error: 'a non-empty commentId is required' };
+  }
+  if (typeof req.body !== 'string' || req.body === '') {
+    return { ok: false, code: 'reply-bad-request', error: 'a non-empty body is required' };
+  }
+  if (typeof req.callerAgentId !== 'string' || req.callerAgentId === '') {
+    return { ok: false, code: 'reply-bad-request', error: 'a non-empty callerAgentId is required' };
+  }
+
+  const comment = deps.getComment(req.commentId);
+  if (!comment) {
+    return { ok: false, code: 'comment-not-found', error: `comment not found: ${req.commentId}` };
+  }
+
+  const plan = deps.resolvePlanForComment(comment);
+  if (!plan) {
+    return { ok: false, code: 'plan-not-found', error: 'the comment does not resolve to a live plan' };
+  }
+
+  // ── Server-side responsible-supervisor revalidation ──
+  // The caller must BE the plan's current responsible supervisor — not merely a
+  // supervisor in the workspace. `callerAgentId` is re-checked against the durable
+  // `responsible_supervisor_id`; a self-asserted non-responsible id is rejected and
+  // NO reply row is written. The agent existence / privilege / same-workspace
+  // checks are defense-in-depth over the authoritative id equality.
+  const agent = deps.getAgent(req.callerAgentId);
+  if (
+    !plan.responsibleSupervisorId ||
+    req.callerAgentId !== plan.responsibleSupervisorId ||
+    !agent ||
+    !hasSupervisorPrivilege(agent) ||
+    agent.workspaceId !== plan.workspaceId
+  ) {
+    return {
+      ok: false,
+      code: 'not-responsible-supervisor',
+      error: 'only the plan current responsible supervisor may answer this comment',
+    };
+  }
+
+  // Companion row only — the question comment's body / status machine is untouched.
+  const reply = deps.createReply({
+    commentId: comment.id,
+    body: req.body,
+    authorAgentId: req.callerAgentId,
+  });
+  return { ok: true, reply };
 }

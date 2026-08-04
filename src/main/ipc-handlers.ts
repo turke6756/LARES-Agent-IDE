@@ -28,8 +28,9 @@ import {
   resolvePlanCommentForSend,
   defaultResolvePlanCommentDeps,
   defaultCreatePlanCommentDeps,
+  defaultAnswerPlanCommentDeps,
 } from './plans/plan-comments';
-import { registerPlanCommentIpc } from './plans/plan-ipc';
+import { registerPlanCommentIpc, registerPlanCommentReplyIpc } from './plans/plan-ipc';
 import { assertPlanRailFree } from './orchestration/plan-ownership';
 import { getApiToken } from './security/api-auth';
 import { openInVSCode, openFileInVSCode, openFileInWorkspace } from './vscode-launcher';
@@ -514,6 +515,12 @@ export function registerIpcHandlers(
         }),
     ),
   );
+
+  // WP-P4D-reply — plan-comment answer. The answering agent (the plan's current
+  // responsible supervisor) writes a COMPANION reply row; the service revalidates
+  // the caller server-side against the plan's durable responsible supervisor and
+  // never mutates the question comment.
+  registerPlanCommentReplyIpc(ipcMain, defaultAnswerPlanCommentDeps());
 
   // Persona handlers
   ipcMain.handle('persona:list', (_e, workspacePath, pathType) => scanPersonas(workspacePath, pathType));

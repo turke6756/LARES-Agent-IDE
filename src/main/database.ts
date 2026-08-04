@@ -5,7 +5,7 @@ import fs from 'fs';
 import crypto from 'crypto';
 import { v4 as uuidv4 } from 'uuid';
 import { AgentStopReason, deriveHookAvailability, isAgentStopReason, parseStopReason, PersistedAgentStatus } from '../shared/types';
-import { Agent, AgentProvider, AgentSessionRow, AgentStatus, AgentTemplate, CreateAgentTemplateInput, CreateSelectionCommentInput, CreateWorkspaceInput, CreateTeamInput, FileActivity, FileOperation, Plan, PlanFormat, PlanTabKey, PlanTabOverview, RepoActivityEvidenceV1, SelectionComment, SelectionCommentStatus, SupervisorFocus, Team, TeamChannel, TeamMember, TeamMessage, TeamMessageStatus, TeamStatus, TeamTask, TeamTaskStatus, UpdateSelectionCommentInput, Workspace } from '../shared/types';
+import { Agent, AgentProvider, AgentSessionRow, AgentStatus, AgentTemplate, CreateAgentTemplateInput, CreateSelectionCommentInput, CreateSelectionCommentReplyInput, CreateWorkspaceInput, CreateTeamInput, FileActivity, FileOperation, Plan, PlanFormat, PlanTabKey, PlanTabOverview, RepoActivityEvidenceV1, SelectionComment, SelectionCommentReply, SelectionCommentStatus, SupervisorFocus, Team, TeamChannel, TeamMember, TeamMessage, TeamMessageStatus, TeamStatus, TeamTask, TeamTaskStatus, UpdateSelectionCommentInput, Workspace } from '../shared/types';
 import { parsePdfSelectionAnchor, serializePdfSelectionAnchor, validatePdfSelectionAnchor, type PdfSelectionAnchorV1, type SelectionAnchorType } from '../shared/pdf-annotations';
 import { DEFAULT_COMMAND, DEFAULT_COMMAND_WSL, SUPERVISOR_AGENT_MD } from '../shared/constants';
 import { parseRepoActivityEvidence } from './plans/repo-activity';
@@ -6952,6 +6952,79 @@ export function markSelectionCommentsSendFailed(ids: string[]): void {
      WHERE id = ?`
   );
   for (const id of ids) stmt.run(id);
+}
+
+// ── WP-P4D-reply — companion reply accessors (ACCESSORS ONLY; DDL landed A2) ──
+//
+// A reply is a COMPANION row in `selection_comment_replies` keyed to its question
+// comment. These accessors ONLY touch that table — they never update
+// `selection_comments` (its `body` / `status` machine is untouched by an answer).
+// `created_at` is an epoch-ms INTEGER owned here; `author_agent_id` is nullable.
+
+function rowToSelectionCommentReply(row: any): SelectionCommentReply {
+  return {
+    id: row.id,
+    commentId: row.comment_id,
+    body: row.body,
+    authorAgentId: row.author_agent_id ?? null,
+    createdAt: row.created_at,
+  };
+}
+
+export function createSelectionCommentReply(input: CreateSelectionCommentReplyInput): SelectionCommentReply {
+  const id = uuidv4();
+  const createdAt = input.createdAt ?? Date.now();
+  run(
+    `INSERT INTO selection_comment_replies (id, comment_id, body, author_agent_id, created_at)
+     VALUES (?, ?, ?, ?, ?)`,
+    [id, input.commentId, input.body, input.authorAgentId ?? null, createdAt],
+  );
+  return getSelectionCommentReply(id)!;
+}
+
+export function getSelectionCommentReply(id: string): SelectionCommentReply | null {
+  const row = queryOne('SELECT * FROM selection_comment_replies WHERE id = ?', [id]);
+  return row ? rowToSelectionCommentReply(row) : null;
+}
+
+/** All replies for one question comment, oldest first (thread order) — the join
+ *  P4D-proj folds onto its question row. Ordered by `created_at` then `id` so
+ *  same-millisecond replies still have a stable order. */
+export function listSelectionCommentReplies(commentId: string): SelectionCommentReply[] {
+  return queryAll(
+    `SELECT * FROM selection_comment_replies
+     WHERE comment_id = ?
+     ORDER BY created_at ASC, id ASC`,
+    [commentId],
+  ).map(rowToSelectionCommentReply);
+}
+
+/** Registered external plan documents (the create path's `proposal` / `legacy-html`
+ *  targets) for one workspace, with their owning plan. The reply service reverse-
+ *  matches a non-logical comment `file_path` against these rows to resolve which
+ *  plan a registered-doc comment belongs to (folder-doc comments resolve durably
+ *  from their `lares-plan-doc:v1:` key instead). */
+export interface RegisteredPlanDocumentRow {
+  id: string;
+  planId: string;
+  workspaceId: string;
+  docKind: string;
+  relPath: string;
+}
+
+export function listRegisteredPlanDocumentsByWorkspace(workspaceId: string): RegisteredPlanDocumentRow[] {
+  return queryAll(
+    `SELECT id, plan_id, workspace_id, doc_kind, rel_path
+       FROM plan_documents
+      WHERE workspace_id = ? AND doc_kind IN ('proposal', 'legacy-html')`,
+    [workspaceId],
+  ).map((row) => ({
+    id: row.id,
+    planId: row.plan_id,
+    workspaceId: row.workspace_id,
+    docKind: row.doc_kind,
+    relPath: row.rel_path,
+  }));
 }
 
 // ── Orchestration operations ──────────────────────────────────────────────
