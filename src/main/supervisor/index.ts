@@ -1152,13 +1152,27 @@ export const PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD_V1_HASH = '41da3022372a7daec10
 export const PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD_V1_HASH = '78823a68f465874f05e7752a43ae1e82866c8d8b9485bedbf7465aa66048cf7f';
 export const PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V1_HASH = 'bee85a7aacc0efa624c12108c79100859f5fb640cedfc61ab29c912d84a64577';
 
+// WP-SKILLBUMP — SHA-256 hex of the PRE-ca7ce2b bodies of the two proposal-to-plan
+// carrier files whose content ca7ce2b (manifest-sync: claim-marker reclaim in the
+// helper + contract doc) rewrote WITHOUT a version bump. plan-manifest.mjs was
+// deployed at v2, so its pre-ca7ce2b body is previousHashes[2] for the v2→v3 bump;
+// manifest-lock.md was unversioned (v1), so its pre-ca7ce2b body is previousHashes[1]
+// for the v1→v2 bump. FROZEN literals; the byte-exact old bodies live in
+// proposal-to-plan-old-body-fixtures.ts (the migration precondition test asserts
+// sha256Hex(frozen)===HASH and sha256Hex(live)!==HASH).
+export const PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V2_HASH = '13b734310a667cc889e34c04588fd2e2fe8899dd44b1a90bc37fa14ad51f351e';
+export const PROPOSAL_TO_PLAN_CONTRACT_MANIFEST_LOCK_MD_V1_HASH = '5a172e514b4665e039fd6d6f8bce8c41487de2dcb3bb36cd3b69ec02d6c7d29c';
+
 // WP-P0C — proposal-to-plan skill tree deploy. One versioned content constant per
 // file (constants.ts); this manifest expands the tree under each of the four skill
 // roots (Claude+Codex x supervisor+worker). New-skill shape was version 1, no
 // previousHashes; WP-SKILLFIX bumps the five hardened files to v2 with a
 // previousHashes[1] so pristine v1 copies upgrade silently and hand-edited ones are
-// .bak'd. Unchanged files stay v1 (an unmanaged file already at those names is
-// treated as user-authored and .bak'd, never silently clobbered).
+// .bak'd. WP-SKILLBUMP then carries the two ca7ce2b-corrected carriers forward:
+// plan-manifest.mjs → v3 (previousHashes[1,2]) and manifest-lock.md → v2
+// (previousHashes[1]), since ca7ce2b changed their bodies without bumping. Unchanged
+// files stay v1 (an unmanaged file already at those names is treated as
+// user-authored and .bak'd, never silently clobbered).
 const PROPOSAL_TO_PLAN_TREE: Array<{
   rel: string; content: string; executable?: boolean;
   version?: number; previousHashes?: Record<number, string>;
@@ -1178,9 +1192,11 @@ const PROPOSAL_TO_PLAN_TREE: Array<{
   { rel: 'references/contracts/arc.md', content: PROPOSAL_TO_PLAN_CONTRACT_ARC_MD },
   { rel: 'references/contracts/folder-schema.md', content: PROPOSAL_TO_PLAN_CONTRACT_FOLDER_SCHEMA_MD },
   { rel: 'references/contracts/intent-lifecycle.md', content: PROPOSAL_TO_PLAN_CONTRACT_INTENT_LIFECYCLE_MD },
-  { rel: 'references/contracts/manifest-lock.md', content: PROPOSAL_TO_PLAN_CONTRACT_MANIFEST_LOCK_MD },
-  { rel: 'scripts/plan-manifest.mjs', content: PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS, executable: true, version: 2,
-    previousHashes: { 1: PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V1_HASH } },
+  { rel: 'references/contracts/manifest-lock.md', content: PROPOSAL_TO_PLAN_CONTRACT_MANIFEST_LOCK_MD, version: 2,
+    previousHashes: { 1: PROPOSAL_TO_PLAN_CONTRACT_MANIFEST_LOCK_MD_V1_HASH } },
+  { rel: 'scripts/plan-manifest.mjs', content: PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS, executable: true, version: 3,
+    previousHashes: { 1: PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V1_HASH,
+                      2: PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V2_HASH } },
 ];
 /** Expand the proposal-to-plan tree under a skill-root prefix into scaffold
  *  entries. Called for all four roots (Claude+Codex supervisor + worker). Each

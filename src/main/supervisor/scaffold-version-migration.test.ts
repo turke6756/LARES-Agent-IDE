@@ -59,6 +59,8 @@ import {
   PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD_V1_HASH,
   PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD_V1_HASH,
   PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V1_HASH,
+  PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V2_HASH,
+  PROPOSAL_TO_PLAN_CONTRACT_MANIFEST_LOCK_MD_V1_HASH,
   normalizeManagedKey,
   sha256Hex,
 } from './index';
@@ -85,6 +87,7 @@ import {
   PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD,
   PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD,
   PROPOSAL_TO_PLAN_CONTRACT_ARC_MD,
+  PROPOSAL_TO_PLAN_CONTRACT_MANIFEST_LOCK_MD,
   PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS,
   SUPERVISOR_CHECKPOINT_FORENSICS_SKILL,
   SUPERVISOR_CONTEXT_ANALYTICS_SKILL,
@@ -115,6 +118,8 @@ import {
   PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD_V1,
   PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD_V1,
   PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V1,
+  PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V2,
+  PROPOSAL_TO_PLAN_CONTRACT_MANIFEST_LOCK_MD_V1,
 } from './proposal-to-plan-old-body-fixtures';
 import {
   SUPERVISOR_V11_ORCH_THROUGH_BROWSER,
@@ -3605,14 +3610,20 @@ test('WP-P0C-TREE-SUP. fresh supervisor scaffold writes the whole proposal-to-pl
   }
 });
 
-// WP-SKILLFIX bumped these five files to v2 with previousHashes[1]; the other eight
-// stay v1. Keep this list in sync with PROPOSAL_TO_PLAN_TREE in index.ts.
-const PROPOSAL_TO_PLAN_V2_FILES = new Map<string, string>([
-  ['SKILL.md', PROPOSAL_TO_PLAN_SKILL_MD_V1_HASH],
-  ['references/activities/capture.md', PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V1_HASH],
-  ['references/activities/promote.md', PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD_V1_HASH],
-  ['references/activities/orient.md', PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD_V1_HASH],
-  ['scripts/plan-manifest.mjs', PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V1_HASH],
+// WP-SKILLFIX bumped five files to v2 with previousHashes[1]; WP-SKILLBUMP then
+// carried the two ca7ce2b-corrected carriers forward — plan-manifest.mjs to v3
+// (previousHashes[1,2]) and manifest-lock.md to v2 (previousHashes[1]). The other six
+// files stay v1. Keep this map in sync with PROPOSAL_TO_PLAN_TREE in index.ts.
+const PROPOSAL_TO_PLAN_VERSIONED_FILES = new Map<string, { version: number; previousHashes: Record<number, string> }>([
+  ['SKILL.md', { version: 2, previousHashes: { 1: PROPOSAL_TO_PLAN_SKILL_MD_V1_HASH } }],
+  ['references/activities/capture.md', { version: 2, previousHashes: { 1: PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V1_HASH } }],
+  ['references/activities/promote.md', { version: 2, previousHashes: { 1: PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD_V1_HASH } }],
+  ['references/activities/orient.md', { version: 2, previousHashes: { 1: PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD_V1_HASH } }],
+  ['references/contracts/manifest-lock.md', { version: 2, previousHashes: { 1: PROPOSAL_TO_PLAN_CONTRACT_MANIFEST_LOCK_MD_V1_HASH } }],
+  ['scripts/plan-manifest.mjs', { version: 3, previousHashes: {
+    1: PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V1_HASH,
+    2: PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V2_HASH,
+  } }],
 ]);
 
 test('WP-P0C-TREE-HELPER. proposalToPlanEntries expands 13 files under a root prefix; the script is executable', () => {
@@ -3621,10 +3632,13 @@ test('WP-P0C-TREE-HELPER. proposalToPlanEntries expands 13 files under a root pr
   for (const rel of PROPOSAL_TO_PLAN_REL_FILES) {
     const key = `.lares/workers/codex/.agents/skills/proposal-to-plan/${rel}`;
     assert.ok(entries[key], `missing entry ${key}`);
-    if (PROPOSAL_TO_PLAN_V2_FILES.has(rel)) {
-      assert.equal(entries[key].version, 2, `${rel} is a WP-SKILLFIX-hardened v2 entry`);
-      assert.equal(entries[key].previousHashes?.[1], PROPOSAL_TO_PLAN_V2_FILES.get(rel),
-        `${rel} must carry previousHashes[1] for the silent v1→v2 upgrade`);
+    if (PROPOSAL_TO_PLAN_VERSIONED_FILES.has(rel)) {
+      const exp = PROPOSAL_TO_PLAN_VERSIONED_FILES.get(rel)!;
+      assert.equal(entries[key].version, exp.version, `${rel} is a versioned entry at v${exp.version}`);
+      for (const [v, h] of Object.entries(exp.previousHashes)) {
+        assert.equal(entries[key].previousHashes?.[Number(v)], h,
+          `${rel} must carry previousHashes[${v}] for its silent upgrade`);
+      }
     } else {
       assert.equal(entries[key].version, 1, `${rel} is an unchanged new-skill v1 entry`);
       assert.equal(entries[key].previousHashes, undefined, `${rel} (unchanged) must carry no previousHashes`);
@@ -3648,6 +3662,24 @@ test('WP-SKILLFIX-PRE. frozen v1 bodies hash to the previousHashes[1] literals A
   assert.notEqual(sha256Hex(PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD), PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD_V1_HASH);
   assert.notEqual(sha256Hex(PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD), PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD_V1_HASH);
   assert.notEqual(sha256Hex(PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS), PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V1_HASH);
+});
+
+test('WP-SKILLBUMP-PRE. frozen pre-ca7ce2b carrier bodies hash to their new previousHashes literals AND differ from the live corrected bodies', () => {
+  // ca7ce2b rewrote plan-manifest.mjs (deployed v2) and manifest-lock.md (unversioned
+  // v1) WITHOUT bumping their versions. WP-SKILLBUMP freezes those pre-ca7ce2b bodies
+  // as the new previousHashes entries so pristine deployed copies upgrade silently:
+  //   plan-manifest.mjs  previousHashes[2]  (v2→v3)
+  //   manifest-lock.md   previousHashes[1]  (v1→v2)
+  assert.equal(sha256Hex(PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V2), PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V2_HASH,
+    'frozen pre-ca7ce2b plan-manifest.mjs body must hash to previousHashes[2]');
+  assert.equal(sha256Hex(PROPOSAL_TO_PLAN_CONTRACT_MANIFEST_LOCK_MD_V1), PROPOSAL_TO_PLAN_CONTRACT_MANIFEST_LOCK_MD_V1_HASH,
+    'frozen pre-ca7ce2b manifest-lock.md body must hash to previousHashes[1]');
+  // The live (post-ca7ce2b) bodies must differ from the frozen ones — proving the
+  // correction actually landed and the bump is not a no-op.
+  assert.notEqual(sha256Hex(PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS), PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V2_HASH,
+    'the live v3 plan-manifest.mjs body must differ from the frozen v2 hash');
+  assert.notEqual(sha256Hex(PROPOSAL_TO_PLAN_CONTRACT_MANIFEST_LOCK_MD), PROPOSAL_TO_PLAN_CONTRACT_MANIFEST_LOCK_MD_V1_HASH,
+    'the live v2 manifest-lock.md body must differ from the frozen v1 hash');
 });
 
 test('WP-SKILLFIX-CONTENT. the four defects are fixed in the live v2 bodies', () => {
