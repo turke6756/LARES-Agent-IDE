@@ -379,9 +379,9 @@ test('adopt writes NO author_* column (schema-checked): plans has no author colu
   assert.ok(!cols.some((c) => /^author_/.test(c)), `plans carries no author_* column (got: ${cols.join(', ')})`);
 });
 
-test('P2 imports nothing from P2L (no intent-ledger dependency)', () => {
+test('P2L ledger scan is wired through the settle seam', () => {
   const compiled = fs.readFileSync(path.join(__dirname, 'plan-folder-watcher.js'), 'utf8');
-  assert.ok(!/plan-intent/i.test(compiled), 'no plan-intent* import in the compiled module');
+  assert.match(compiled, /plan-intent-ledger/, 'compiled settle-seam module references plan-intent-ledger');
 });
 
 // ── runner ─────────────────────────────────────────────────────────────────────
