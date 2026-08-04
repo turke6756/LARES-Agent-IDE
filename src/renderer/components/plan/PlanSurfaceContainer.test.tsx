@@ -68,13 +68,28 @@ let getProjection: ReturnType<typeof vi.fn>;
 let paneShow: ReturnType<typeof vi.fn>;
 let paneHide: ReturnType<typeof vi.fn>;
 let paneSetBounds: ReturnType<typeof vi.fn>;
+let listMock: ReturnType<typeof vi.fn>;
+let documentsMock: ReturnType<typeof vi.fn>;
+let getOverviewMock: ReturnType<typeof vi.fn>;
+let readDocumentMock: ReturnType<typeof vi.fn>;
 
+// WP-P4B.1 — the container resolves plan format via `plans.list` and switches
+// the document pane: legacy `format:'html'` → sandboxed WebContentsView (below
+// tests default to this), folder-native → the WP-P4B tabbed home.
 beforeEach(() => {
   surfaceCbs = [];
   getProjection = vi.fn(async () => projection());
   paneShow = vi.fn(async () => {});
   paneHide = vi.fn(async () => {});
   paneSetBounds = vi.fn(async () => {});
+  listMock = vi.fn(async () => [{ id: 'plan-1', format: 'html' }]);
+  // Folder-native surface deps (only exercised when a structured plan renders
+  // PlanDocumentTabs); harmless no-ops for the legacy path.
+  documentsMock = vi.fn(async () => ({ planId: 'plan-1', warnings: [], tabs: [
+    { key: 'overview', populated: false, documents: [] },
+  ] }));
+  getOverviewMock = vi.fn(async () => null);
+  readDocumentMock = vi.fn(async () => ({ ref: { source: 'folder', documentId: 'x' }, name: 'x', content: '', truncated: false, sizeBytes: 0 }));
   (globalThis as unknown as { ResizeObserver: unknown }).ResizeObserver = FakeRO;
   (window as unknown as { api: unknown }).api = {
     plans: {
@@ -82,6 +97,10 @@ beforeEach(() => {
       paneShow,
       paneHide,
       paneSetBounds,
+      list: listMock,
+      documents: documentsMock,
+      getOverview: getOverviewMock,
+      readDocument: readDocumentMock,
       onSurfaceChanged: (cb: SurfaceCb) => {
         surfaceCbs.push(cb);
         return () => { surfaceCbs = surfaceCbs.filter((c) => c !== cb); };
@@ -90,11 +109,18 @@ beforeEach(() => {
   };
 });
 
+async function flush(): Promise<void> {
+  await act(async () => { await Promise.resolve(); await Promise.resolve(); await Promise.resolve(); });
+}
+
 async function render(el: React.ReactElement): Promise<HTMLDivElement> {
   container = document.createElement('div');
   document.body.appendChild(container);
   root = createRoot(container);
   await act(async () => { root!.render(el); });
+  // Let the format lookup + projection reads settle so the document surface
+  // (legacy host vs folder-native tabs) is resolved before assertions.
+  await flush();
   return container;
 }
 
@@ -118,6 +144,21 @@ describe('PlanSurfaceContainer', () => {
     expect(c.querySelector('[data-testid="plan-surface"]')).not.toBeNull();
     // The rail is the widened single-scroll column (WP1).
     expect(c.querySelector('.w-\\[384px\\]')).not.toBeNull();
+  });
+
+  it('folder-native plan: mounts the tabbed document home and never shows the sandboxed pane', async () => {
+    listMock.mockResolvedValue([{ id: 'plan-1', format: 'structured' }]);
+    const c = await render(<PlanSurfaceContainer planId="plan-1" />);
+    // The WP-P4B tabbed home owns the document region.
+    expect(c.querySelector('[data-testid="plan-document-tabs"]')).not.toBeNull();
+    // ...and the legacy WebContentsView host is gone, its pane never shown.
+    expect(c.querySelector('[data-testid="plan-doc-host"]')).toBeNull();
+    expect(paneShow).not.toHaveBeenCalled();
+    expect(paneSetBounds).not.toHaveBeenCalled();
+    // The provenance rail still renders alongside (Option (a): coexist).
+    expect(c.querySelector('[data-testid="plan-surface"]')).not.toBeNull();
+    // The tabs projection was read for this plan.
+    expect(documentsMock).toHaveBeenCalledWith('plan-1');
   });
 
   it('re-fetches on the reparse nudge for this plan, and ignores other plans', async () => {

@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { X } from 'lucide-react';
 import PlanSurfaceView from './PlanSurfaceView';
+import PlanDocumentTabs from './PlanDocumentTabs';
 import type { PlanSectionView, PlanEventView, PlanProjectionView } from './plan-surface-model';
 import type { FetchEventDetail } from './TrustedEventRow';
 import type { CandidatePreviewSelection } from '../save/CandidatePreview';
@@ -36,6 +37,11 @@ export default function PlanSurfaceContainer({ planId }: { planId: string }): Re
   // CandidatePreview component. Null until resolved (or while the engine route is
   // unwired) so the surface simply omits the preview rather than erroring.
   const [candidateSelection, setCandidateSelection] = useState<CandidatePreviewSelection | null>(null);
+  // WP-P4B.1 — which document surface the left pane shows. Legacy `format:'html'`
+  // plans keep the sandboxed WebContentsView (WP5); folder-native (structured)
+  // plans render the WP-P4B tabbed document home. `null` while the format is
+  // still resolving, so we neither show the pane nor mount the tabs prematurely.
+  const [isLegacy, setIsLegacy] = useState<boolean | null>(null);
 
   const closeTab = useDashboardStore((s) => s.closeTab);
   const selectedWorkspaceId = useDashboardStore((s) => s.selectedWorkspaceId);
@@ -84,14 +90,50 @@ export default function PlanSurfaceContainer({ planId }: { planId: string }): Re
     [planId],
   );
 
-  // Show the sandboxed pane + prime the rail on mount / plan switch; hide on unmount.
+  // Prime the rail on mount / plan switch. The rail serves BOTH surfaces, so it
+  // loads unconditionally — independent of the format switch below.
   useEffect(() => {
-    void window.api.plans.paneShow(planId);
     void load();
-    return () => {
-      void window.api.plans.paneHide();
-    };
   }, [planId, load]);
+
+  // WP-P4B.1 — resolve the plan format so the document pane can switch surfaces.
+  // `plans.list()` with no workspace filter returns every workspace's plans, so
+  // the id lookup works at both mount sites (FileViewerPanel + the detached
+  // window); an unknown / failed lookup falls back to the folder-native surface
+  // (the go-forward default). Prefer the selected workspace when known.
+  useEffect(() => {
+    let active = true;
+    setIsLegacy(null);
+    void window.api.plans
+      .list(selectedWorkspaceId ?? undefined)
+      .then((rows) => {
+        if (!active) return;
+        const row = rows.find((r) => r.id === planId);
+        setIsLegacy(row ? row.format === 'html' : false);
+      })
+      .catch(() => {
+        if (active) setIsLegacy(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [planId, selectedWorkspaceId]);
+
+  // Sandboxed WebContentsView lifecycle — ONLY for legacy html plans. Show on
+  // entry, hide on exit. For a folder-native plan the tabs own the region, so we
+  // never show the pane and proactively hide any pane a prior plan left up.
+  useEffect(() => {
+    if (isLegacy === true) {
+      void window.api.plans.paneShow(planId);
+      return () => {
+        void window.api.plans.paneHide();
+      };
+    }
+    if (isLegacy === false) {
+      void window.api.plans.paneHide();
+    }
+    return undefined;
+  }, [planId, isLegacy]);
 
   // SC-WP-3I — resolve the plan lens's whole-component candidate selection over the
   // read-only preview channel. Best-effort: any failure (including the engine route
@@ -135,7 +177,10 @@ export default function PlanSurfaceContainer({ planId }: { planId: string }): Re
   }, [planId, load]);
 
   // Stream the document region's rectangle to main (same as the browser pane).
+  // Only the legacy WebContentsView needs it; the folder-native tabs are plain
+  // renderer DOM with no pane to position.
   useEffect(() => {
+    if (isLegacy !== true) return;
     const el = hostRef.current;
     if (!el) return;
     const send = throttle(() => {
@@ -163,12 +208,22 @@ export default function PlanSurfaceContainer({ planId }: { planId: string }): Re
       window.removeEventListener('scroll', send, { capture: true });
       send.cancel();
     };
-  }, [planId]);
+  }, [planId, isLegacy]);
 
   return (
     <div className="h-full flex min-h-0" data-testid="plan-surface-container">
-      {/* Plan document — the sandboxed WebContentsView glues onto this host div. */}
-      <div ref={hostRef} className="flex-1 min-w-0 min-h-0" data-testid="plan-doc-host" />
+      {/* Plan document region. Legacy html plans expose the host div the sandboxed
+          WebContentsView glues onto; folder-native plans render the WP-P4B tabbed
+          document home in the same region (rail untouched, to its right). */}
+      <div className="flex-1 min-w-0 min-h-0" data-testid="plan-doc-region">
+        {isLegacy === true ? (
+          <div ref={hostRef} className="h-full w-full" data-testid="plan-doc-host" />
+        ) : isLegacy === false ? (
+          <PlanDocumentTabs planId={planId} />
+        ) : (
+          <div className="h-full w-full" data-testid="plan-doc-loading" />
+        )}
+      </div>
       {/* Provenance rail — renderer DOM beside the document (banner + section nav
           + activity trail). The view owns its own scroll region, so the rail is a
           plain flex column, not the scroll container. */}
