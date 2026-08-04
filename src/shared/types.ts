@@ -339,6 +339,94 @@ export interface PlanListItem extends Plan {
   snippet: string | null;
 }
 
+// WP-P6B-query — live mission-board card DTOs. Package state is the structured
+// SC-WP-3A value. Open-turn activity is separate and has no `done` value.
+export type MissionBoardPackageState =
+  | 'ready' | 'executing' | 'blocked' | 'done' | 'archived';
+
+export interface MissionBoardTouch {
+  path: string;
+  op: string;
+}
+
+export type MissionBoardEvidenceAssociation = 'package-stamp' | 'planned-path';
+
+export interface MissionBoardLiveActivity {
+  turnId: string;
+  workspaceId: string;
+  turnSeq: number;
+  agentId: string | null;
+  taskLabel: string | null;
+  startedAt: number | null;
+  planId: string | null;
+  planItemId: string | null;
+  planStampSource: string | null;
+  planStampStatus: 'verified' | 'unstamped' | 'unverified';
+  touched: MissionBoardTouch[];
+  association: MissionBoardEvidenceAssociation;
+  /** Activity evidence only; never a package lifecycle/completion state. */
+  isActive: boolean;
+}
+
+export interface MissionBoardDurableTurn {
+  turnId: string;
+  workspaceId: string;
+  turnSeq: number;
+  agentId: string | null;
+  taskLabel: string | null;
+  startedAt: number | null;
+  endedAt: number | null;
+  planId: string | null;
+  planItemId: string | null;
+  planStampSource: string | null;
+  planStampStatus: 'verified' | 'unstamped' | 'unverified';
+  touched: MissionBoardTouch[];
+  association: MissionBoardEvidenceAssociation;
+  diffStats: unknown | null;
+  compactDiff: string | null;
+  compactDiffProvenance: string | null;
+}
+
+export interface MissionBoardRecoveryOperation {
+  operationId: string;
+  workspaceId: string;
+  kind: 'restore_paths' | 'revert_turn';
+  actor: string;
+  sourceTurnId: string | null;
+  status: string;
+  requestedPaths: unknown | null;
+  completedPaths: unknown | null;
+  result: string | null;
+  failureReason: string | null;
+  createdAt: number | null;
+  endedAt: number | null;
+  association: 'source-turn';
+}
+
+export interface MissionBoardPlannedPath {
+  path: string;
+  intentKind: string | null;
+}
+
+export interface MissionBoardCard {
+  packageId: string;
+  workspaceId: string;
+  planId: string;
+  title: string;
+  acceptanceCondition: string | null;
+  /** Verbatim `plan_work_packages.state`; never inferred from activity. */
+  state: MissionBoardPackageState;
+  assigneeAgentId: string | null;
+  revision: number;
+  createdAt: number;
+  updatedAt: number;
+  plannedPaths: MissionBoardPlannedPath[];
+  /** Current open-turn evidence. This field can light a card, never complete it. */
+  liveActivity: MissionBoardLiveActivity[];
+  durableTurns: MissionBoardDurableTurn[];
+  recoveryOperations: MissionBoardRecoveryOperation[];
+}
+
 // ── WP-P2L-proj — planning-intent ledger read model ─────────────────────────
 
 export type PlanIntentStatus = 'active' | 'withdrawn' | 'superseded';

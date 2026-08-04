@@ -24,6 +24,7 @@ import type {
   PlanTabOverview,
   PromotedPlanFolder,
   PromotedPlanFolderListResult,
+  MissionBoardCard,
 } from '../../shared/types';
 import { hasSupervisorPrivilege, isPlanTabKey } from '../../shared/types';
 import {
@@ -71,6 +72,7 @@ import {
 } from './plan-comments';
 import { registerPlanImplementIpc } from './plan-implement';
 import { workspaceStateDir } from '../workspace-state-dir';
+import { listMissionBoardCards } from './mission-board';
 
 const MAX_PROMOTED_PLAN_JSON_BYTES = 256_000;
 const ARCHIVED_PLAN_STATUSES = new Set(['archived', 'superseded', 'cancelled', 'canceled']);
@@ -815,6 +817,24 @@ export function registerPlanCommentListIpc(
   ipc.handle('plan:comment:list', (_event, rawPlanId: unknown) => runPlanCommentList(rawPlanId, deps));
 }
 
+// WP-P6B-query — one-shot mission-board read. Polling cadence, cancellation,
+// stale-response suppression, and preload transport belong to WP-P6B-transport.
+export function runMissionBoardList(
+  rawPlanId: unknown,
+  listCards: (planId: string) => MissionBoardCard[] = listMissionBoardCards,
+): MissionBoardCard[] | null {
+  if (typeof rawPlanId !== 'string' || rawPlanId === '') return null;
+  return listCards(rawPlanId);
+}
+
+export function registerMissionBoardIpc(
+  ipc: PlanIpcLike,
+  listCards: (planId: string) => MissionBoardCard[] = listMissionBoardCards,
+): void {
+  ipc.handle('plan:board:list', (_event, rawPlanId: unknown) =>
+    runMissionBoardList(rawPlanId, listCards));
+}
+
 export function registerPlanIpc(manager: PlanPaneManager): void {
   ipcMain.handle(
     'plan-folder:list',
@@ -916,6 +936,10 @@ export function registerPlanIpc(manager: PlanPaneManager): void {
   // `app_user_id` is derived main-side (never from the renderer payload). Pins a
   // durable execution baseline and flips the plan `ready → executing`.
   registerPlanImplementIpc(ipcMain);
+
+  // WP-P6B-query: read-only package cards with structured state and transient
+  // open-turn activity kept in separate DTO fields. No polling or state writes.
+  registerMissionBoardIpc(ipcMain);
 
   // Plan list for the "Plans" card gallery (workspace-scoped). Each row carries a
   // cheap description snippet derived from its already-served projection (or an
