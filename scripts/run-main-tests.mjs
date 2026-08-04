@@ -282,6 +282,9 @@ const TESTS = [
   // attribution/outcome classification (committed / integrity-mismatch / uncertain /
   // drift / index-integrity) — fake-seam + real-git `git commit --only`.
   'dist/main/main/git-checkpoints/commit-coordinator.test.js',
+  // Save-card Stage 4 SC-WP-4E — lens-neutral IPC, main-process flag gate, and
+  // saved-only-after the integrated CommitCoordinator → closure response path.
+  'dist/main/main/commit-candidates/commit-coordinator-ipc.test.js',
   // Save-card Stage 4 SC-WP-4H — real-repository adversarial race matrix.
   'dist/main/main/git-checkpoints/commit-coordinator.races.test.js',
   'dist/main/main/supervisor/send-queue-checkpoint.test.js',

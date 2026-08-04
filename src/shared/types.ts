@@ -2121,6 +2121,57 @@ export interface SaveCardPreviewResponse {
   unacknowledgedUnattributedEntryIds: string[];
 }
 
+// ── SC-WP-4E — shared commit-coordinator consume route ───────────────────────
+
+/** Lens-neutral consume channel shared by the Save and Plan surfaces. */
+export const COMMIT_COORDINATOR_CHANNEL = 'commit-coordinator:consume' as const;
+
+/** Only stable candidate identity, its opaque token, and the editable message
+ * body cross the wire. Lares trailers and commit members remain main-owned. */
+export interface CommitCoordinatorConsumeRequest {
+  candidateId: string;
+  tokenId: string;
+  message: string;
+}
+
+export interface CommitCoordinatorClosureResult {
+  finalizationId: string;
+  closed: boolean;
+  lifecycleStatus: 'active' | 'committed';
+  members: Array<{
+    pathBytesBase64: string;
+    disposition: import('./commit-candidates').FinalizationMemberDisposition | null;
+  }>;
+}
+
+type CommittedCoordinatorOutcome = Extract<
+  import('./commit-candidates').CommitOutcome,
+  { status: 'committed' }
+>;
+type NonCommittedCoordinatorOutcome = Exclude<
+  import('./commit-candidates').CommitOutcome,
+  { status: 'committed' }
+>;
+
+/** `saved` is deliberately a distinct terminal envelope: main emits it only after
+ * WP-4G has verified the marked parent/tree, persisted exact links, and evaluated
+ * every frozen finalization manifest. */
+export type CommitCoordinatorConsumeResponse =
+  | { kind: 'token-unresolved' }
+  | { kind: 'invalid-message'; reason: string }
+  | { kind: 'compose-in-flight' }
+  | { kind: 'outcome'; outcome: NonCommittedCoordinatorOutcome }
+  | {
+      kind: 'reconciliation-error';
+      outcome: CommittedCoordinatorOutcome;
+      error: { code: string; message: string };
+    }
+  | {
+      kind: 'saved';
+      outcome: CommittedCoordinatorOutcome;
+      finalizations: CommitCoordinatorClosureResult[];
+    };
+
 // ── SC-WP-3I — Plan-lens candidate preview channel ────────────────────────────
 //
 // The plan lens's OWN read-only preview transport, deliberately kept SEPARATE from
@@ -2974,6 +3025,11 @@ export interface IpcApi {
    *  shared engine/service surface. `restore`/`revert` accept a `force`
    *  (stale-preview override) that is IPC-ONLY and refused while an active turn
    *  witnesses a requested path. */
+  /** Lens-neutral commit consume surface used by both Save and Plan. Main-process
+   *  flag enforcement remains authoritative even for direct IPC invocation. */
+  commitCoordinator: {
+    commit: (req: CommitCoordinatorConsumeRequest) => Promise<CommitCoordinatorConsumeResponse>;
+  };
   /** Save card: read-only dirty inventory (Stage ①) + the SC-WP-3H Save-lens
    *  candidate preview (also read-only — verdicts + read-only `Lares-*` trailer
    *  previews). No mutating method is exposed here. */

@@ -1,6 +1,6 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron';
 import type { IpcApi, DetachRequest, DetachedClosedPayload, ViewDetachRequest, ViewDetachedClosedPayload, FlushRequestPayload, FlushReplyPayload } from '../shared/types';
-import { TAB_CHANNELS, VIEW_CHANNELS, CHECKPOINT_CHANNELS, SAVECARD_CHANNELS, SAVECARD_PREVIEW_CHANNEL, SAVECARD_ATTENTION_CHANNEL, SAVECARD_ATTENTION_CHANGED_CHANNEL, PLAN_PREVIEW_CHANNEL } from '../shared/types';
+import { TAB_CHANNELS, VIEW_CHANNELS, CHECKPOINT_CHANNELS, SAVECARD_CHANNELS, SAVECARD_PREVIEW_CHANNEL, SAVECARD_ATTENTION_CHANNEL, SAVECARD_ATTENTION_CHANGED_CHANNEL, PLAN_PREVIEW_CHANNEL, COMMIT_COORDINATOR_CHANNEL } from '../shared/types';
 import { BROWSER_CHANNELS } from '../shared/browser';
 import type {
   AccessRequestDecision,
@@ -164,6 +164,11 @@ const api: IpcApi = {
   // .lares/detached/ dir; each row is PID-verified in main. Handle in index.ts.
   detached: {
     list: (workspaceRoot) => ipcRenderer.invoke('detached:list', workspaceRoot),
+  },
+  // SC-WP-4E — lens-neutral candidate consume. Both Save and Plan call this
+  // surface; the main-process route owns feature-flag enforcement and 4D → 4G.
+  commitCoordinator: {
+    commit: (req) => ipcRenderer.invoke(COMMIT_COORDINATOR_CHANNEL, req),
   },
   // SC-WP-1H — read-only inventory fetch. SC-WP-3H — read-only Save-lens candidate
   // preview (verdicts + server-derived read-only Lares-* trailer previews).
