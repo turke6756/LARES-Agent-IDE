@@ -35,9 +35,13 @@ import {
   getTurnRecord as dbGetTurnRecord,
   getTurnWitnessReads as dbGetTurnWitnessReads,
   getPackageFinalization as dbGetPackageFinalization,
+  getPlanWorkPackage as dbGetPlanWorkPackage,
+  listPlanWorkPackagePaths as dbListPlanWorkPackagePaths,
   listCommitPathLinks as dbListCommitPathLinks,
   listTurnRecords as dbListTurnRecords,
   type PackageFinalization,
+  type PlanWorkPackage,
+  type PlanWorkPackagePath,
 } from '../database';
 import { probeWorkspaceGit as realProbeWorkspaceGit } from '../git/git-runtime';
 import { runGit as realRunGit, runGitBytes as realRunGitBytes } from '../git-checkpoints/git-command';
@@ -75,7 +79,11 @@ import type {
   SaveCardFinalizeRoutes,
   SaveCardPreviewRoutes,
 } from './save-card-ipc';
-import type { PlanCandidatePreviewRoutes } from '../plans/plan-ipc';
+import type {
+  FinalizePlanItemDoneRequest,
+  PlanCandidatePreviewRoutes,
+  PlanFinalizeEnrichmentResult,
+} from '../plans/plan-ipc';
 
 const OID_RE = /^[0-9a-f]{40,64}$/;
 const HEAD_TIMEOUT_MS = 10_000;
@@ -96,6 +104,8 @@ export interface PreviewRoutesDeps {
    *  unlike the path-scoped `readCommitPathLinks` the service uses internally). */
   listRepoCommitPathLinks?: (repositoryKey: string) => readonly CandidateLedgerLink[];
   getPackageFinalization?: (id: string) => PackageFinalization | null;
+  getPlanWorkPackage?: (id: string) => PlanWorkPackage | null;
+  listPlanWorkPackagePaths?: (id: string) => PlanWorkPackagePath[];
   runGit?: RunGitTextLike;
   runGitBytes?: RunGitBytesLike;
   /** Best-effort canonicalizer; defaults to `fs.realpathSync.native`. */
@@ -174,6 +184,8 @@ export function createPreviewRoutes(deps: PreviewRoutesDeps): {
   const listRepoCommitPathLinks = deps.listRepoCommitPathLinks
     ?? ((repositoryKey: string) => dbListCommitPathLinks(repositoryKey));
   const getPackageFinalization = deps.getPackageFinalization ?? dbGetPackageFinalization;
+  const getPlanWorkPackage = deps.getPlanWorkPackage ?? dbGetPlanWorkPackage;
+  const listPlanWorkPackagePaths = deps.listPlanWorkPackagePaths ?? dbListPlanWorkPackagePaths;
   const runGit = deps.runGit ?? realRunGit;
   const runGitBytes = deps.runGitBytes ?? realRunGitBytes;
   const realpath = deps.realpath ?? ((p) => fs.realpathSync.native(p));
@@ -347,6 +359,102 @@ export function createPreviewRoutes(deps: PreviewRoutesDeps): {
     },
   };
 
+  async function resolvePlanFinalizeRequest(
+    planItemId: string,
+  ): Promise<PlanFinalizeEnrichmentResult> {
+    const pkg = getPlanWorkPackage(planItemId);
+    if (!pkg) {
+      return {
+        ok: false,
+        reason: 'plan-finalize-item-not-found',
+        message: `Cannot mark ${planItemId} done because its work package no longer exists.`,
+      };
+    }
+
+    let scope: PreviewScope;
+    try {
+      scope = await assembleScope(pkg.workspaceId);
+    } catch (error) {
+      return {
+        ok: false,
+        reason: 'plan-finalize-repository-unavailable',
+        message: `Cannot mark ${planItemId} done because its repository is unavailable: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+
+    // A member must come from concrete current inventory. Package-stamped turns are
+    // authoritative; exact planned-path matches are the package's second durable
+    // association rail. Neither rail invents a path or worktree representation.
+    const memberIds = new Set<string>();
+    for (const component of scope.context.components) {
+      for (const association of component.associations) {
+        if (association.planId === pkg.planId && association.planItemId === pkg.id) {
+          for (const entryId of association.memberEntryIds) memberIds.add(entryId);
+        }
+      }
+    }
+    const plannedPaths = new Set(listPlanWorkPackagePaths(pkg.id).map((entry) => entry.path));
+    for (const entry of scope.context.inventory.entries) {
+      const current = entry.path.utf8Clean ? entry.path.displayPath : null;
+      const original = entry.originalPath?.utf8Clean ? entry.originalPath.displayPath : null;
+      if ((current && plannedPaths.has(current)) || (original && plannedPaths.has(original))) {
+        memberIds.add(entry.entryId);
+      }
+    }
+    const members = [...memberIds]
+      .map((entryId) => scope.entriesById.get(entryId))
+      .filter((entry): entry is DirtyEntry => entry !== undefined)
+      .map((entry): CommitRepresentationEntry => ({
+        path: entry.path,
+        commitPathspecs: entry.commitPathspecs,
+        expectedWorktreeState: entry.expectedWorktreeState,
+        rawWorktreeBlobOid: entry.rawWorktreeBlobOid,
+      }));
+    if (members.length === 0) {
+      return {
+        ok: false,
+        reason: 'plan-finalize-members-unresolvable',
+        message: `Cannot mark ${planItemId} done because no concrete dirty members resolve from its package stamps or planned paths.`,
+      };
+    }
+    if (!deps.captureFinalizationBoundary) {
+      return {
+        ok: false,
+        reason: 'plan-finalize-boundary-unavailable',
+        message: `Cannot mark ${planItemId} done because checkpoint boundary capture is unavailable.`,
+      };
+    }
+
+    let boundary: { oid: string; treeOid: string };
+    try {
+      boundary = await deps.captureFinalizationBoundary(
+        pkg.workspaceId,
+        `lares:finalization:plan-package:${planItemId}`,
+      );
+    } catch (error) {
+      return {
+        ok: false,
+        reason: 'plan-finalize-boundary-unavailable',
+        message: `Cannot mark ${planItemId} done because its checkpoint boundary could not be captured: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+
+    const request: FinalizePlanItemDoneRequest = {
+      planItemId: pkg.id,
+      repositoryKey: scope.context.repository.repositoryKey,
+      boundaryOid: boundary.oid,
+      members,
+      checkpointTurnId: null,
+      finalizedBy: 'human-ipc',
+      createdFromWorkspaceId: pkg.workspaceId,
+      contractVersion,
+      repoRoot: scope.repoRoot,
+      pinnedHeadOid: scope.pinnedHeadOid,
+      gitExe,
+    };
+    return { ok: true, request };
+  }
+
   const planPreviewRoutes: PlanCandidatePreviewRoutes = {
     async resolvePreviewContext(req: PlanCandidatePreviewRequest): Promise<CandidateBuildContext> {
       const scope = await assembleScope(req.workspaceId);
@@ -368,6 +476,7 @@ export function createPreviewRoutes(deps: PreviewRoutesDeps): {
         req.finalizationIds,
       );
     },
+    resolveFinalizeRequest: resolvePlanFinalizeRequest,
   };
 
   async function reassemble(snapshot: CandidateTokenSnapshot): Promise<LiveReassembly> {

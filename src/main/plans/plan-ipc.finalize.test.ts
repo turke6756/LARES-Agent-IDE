@@ -16,6 +16,8 @@ import assert from 'node:assert/strict';
 import {
   finalizePlanItemDone,
   planPackageId,
+  runFinalizePlanItemDoneRequest,
+  PlanFinalizeError,
   type FinalizePlanItemDoneRequest,
 } from './plan-ipc';
 import {
@@ -196,6 +198,79 @@ test('a boundary-unavailable finalize leaves the work package NOT done', async (
   assert.equal(res.outcome, 'boundary-unavailable');
   assert.equal(store.workPackages.get('wp-1')?.state, 'executing', 'done never flips on an unavailable boundary');
   assert.equal(store.getActivePackageFinalization(planPackageId('wp-1')), null);
+});
+
+// â”€â”€ identity-only Mission Board enrichment seam â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+test('identity-only done resolves full freeze inputs and writes done atomically', async () => {
+  const store = new FakeStore();
+  store.workPackages.set('wp-1', workPackage({ state: 'executing' }));
+  const enriched = doneRequest({
+    repositoryKey: 'resolved-repo',
+    boundaryOid: 'b'.repeat(40),
+    members: [member('src/resolved.ts')],
+    repoRoot: '/resolved/repo',
+    pinnedHeadOid: 'c'.repeat(40),
+  });
+
+  const result = await runFinalizePlanItemDoneRequest(
+    { planItemId: 'wp-1' },
+    () => ({ resolveFinalizeRequest: async () => ({ ok: true, request: enriched }) }),
+    (request) => finalizePlanItemDone(request, {
+      getPlanWorkPackage: (id) => store.getPlanWorkPackage(id),
+      finalize: (req) => finalizePackage(req, {
+        store, writeRef: okWriter, freeze: fakeFreeze, now: () => 200, newId: () => 'fin-enriched',
+      }),
+    }),
+  );
+
+  assert.equal(result.finalization.repositoryKey, 'resolved-repo');
+  assert.equal(result.finalization.checkpointOid, 'b'.repeat(40));
+  assert.equal(store.workPackages.get('wp-1')?.state, 'done');
+  assert.equal(store.getActivePackageFinalization(planPackageId('wp-1'))?.id, 'fin-enriched');
+});
+
+test('unresolvable identity-only done returns a typed refusal and writes nothing', async () => {
+  const store = new FakeStore();
+  store.workPackages.set('wp-1', workPackage({ state: 'executing' }));
+  let finalizeCalls = 0;
+
+  await assert.rejects(
+    runFinalizePlanItemDoneRequest(
+      { planItemId: 'wp-1' },
+      () => ({
+        resolveFinalizeRequest: async () => ({
+          ok: false,
+          reason: 'plan-finalize-boundary-unavailable',
+          message: 'Cannot mark wp-1 done because its checkpoint boundary could not be captured.',
+        }),
+      }),
+      async () => { finalizeCalls++; throw new Error('must not finalize'); },
+    ),
+    (error: unknown) => error instanceof PlanFinalizeError
+      && error.code === 'plan-finalize-boundary-unavailable'
+      && error.message.includes('checkpoint boundary'),
+  );
+
+  assert.equal(finalizeCalls, 0);
+  assert.equal(store.workPackages.get('wp-1')?.state, 'executing');
+  assert.equal(store.rows.size, 0);
+});
+
+test('already-full done request passes through unchanged without consulting enrichment', async () => {
+  const full = doneRequest();
+  let routeReads = 0;
+  let seen: FinalizePlanItemDoneRequest | null = null;
+  await runFinalizePlanItemDoneRequest(
+    full,
+    () => { routeReads++; return null; },
+    async (request) => {
+      seen = request;
+      return { finalization: {} as PackageFinalization, outcome: 'created', memberManifestJson: '[]' };
+    },
+  );
+  assert.equal(routeReads, 0);
+  assert.equal(seen, full);
 });
 
 // ── runner ──────────────────────────────────────────────────────────────────────

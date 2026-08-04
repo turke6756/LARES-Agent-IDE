@@ -200,6 +200,28 @@ export interface FinalizePlanItemDoneRequest {
   deadlineAt?: number;
 }
 
+export type PlanFinalizeRefusalReason =
+  | 'plan-finalize-enrichment-unavailable'
+  | 'plan-finalize-item-not-found'
+  | 'plan-finalize-repository-unavailable'
+  | 'plan-finalize-members-unresolvable'
+  | 'plan-finalize-boundary-unavailable';
+
+export class PlanFinalizeError extends Error {
+  constructor(message: string, readonly code: PlanFinalizeRefusalReason) {
+    super(message);
+    this.name = 'PlanFinalizeError';
+  }
+}
+
+export type PlanFinalizeEnrichmentResult =
+  | { ok: true; request: FinalizePlanItemDoneRequest }
+  | { ok: false; reason: Exclude<PlanFinalizeRefusalReason, 'plan-finalize-enrichment-unavailable'>; message: string };
+
+export interface PlanFinalizeRoutes {
+  resolveFinalizeRequest(planItemId: string): Promise<PlanFinalizeEnrichmentResult>;
+}
+
 export interface FinalizePlanItemDoneDeps {
   getPlanWorkPackage?: (id: string) => PlanWorkPackage | null;
   finalize?: (
@@ -330,6 +352,10 @@ export function registerPlanIntentsIpc(
  *  bootstrap injects the production resolver via `providePlanPreviewRoutes`. */
 export interface PlanCandidatePreviewRoutes {
   resolvePreviewContext(req: PlanCandidatePreviewRequest): Promise<CandidateBuildContext>;
+  /** Main-only identity enrichment for Mission Board Done. Optional so preview-only
+   *  tests/injections remain honest: omission means Done is unavailable, never that
+   *  the IPC layer fabricates freeze inputs. */
+  resolveFinalizeRequest?: PlanFinalizeRoutes['resolveFinalizeRequest'];
 }
 
 class PlanPreviewError extends Error {
@@ -343,11 +369,57 @@ class PlanPreviewError extends Error {
  *  before the candidate engine finishes bootstrapping. Null ⇒ answer "unavailable"
  *  honestly (mirrors the save-lens channel's null-route pattern). */
 let planPreviewRoutes: PlanCandidatePreviewRoutes | null = null;
+let planFinalizeRoutes: PlanFinalizeRoutes | null = null;
 
 /** Inject (or clear) the production plan-lens preview route once the candidate
  *  engine has bootstrapped. Until wired, `PLAN_PREVIEW_CHANNEL` rejects honestly. */
 export function providePlanPreviewRoutes(routes: PlanCandidatePreviewRoutes | null): void {
   planPreviewRoutes = routes;
+  planFinalizeRoutes = routes?.resolveFinalizeRequest
+    ? { resolveFinalizeRequest: routes.resolveFinalizeRequest.bind(routes) }
+    : null;
+}
+
+function isFullFinalizePlanItemDoneRequest(raw: unknown): raw is FinalizePlanItemDoneRequest {
+  if (!raw || typeof raw !== 'object') return false;
+  const r = raw as Record<string, unknown>;
+  return typeof r.planItemId === 'string'
+    && typeof r.repositoryKey === 'string'
+    && typeof r.boundaryOid === 'string'
+    && Array.isArray(r.members)
+    && (typeof r.checkpointTurnId === 'string' || r.checkpointTurnId === null)
+    && typeof r.finalizedBy === 'string'
+    && typeof r.contractVersion === 'number'
+    && typeof r.repoRoot === 'string'
+    && (typeof r.pinnedHeadOid === 'string' || r.pinnedHeadOid === null);
+}
+
+/** Identity-only renderer requests are enriched below the trust boundary. Already-full
+ *  main-side callers retain the WP-3D pass-through contract unchanged. */
+export async function runFinalizePlanItemDoneRequest(
+  raw: unknown,
+  getRoutes: () => PlanFinalizeRoutes | null = () => planFinalizeRoutes,
+  finalize: (request: FinalizePlanItemDoneRequest) => Promise<FinalizePackageResult> = finalizePlanItemDone,
+): Promise<FinalizePackageResult> {
+  if (!raw || typeof raw !== 'object'
+      || typeof (raw as Record<string, unknown>).planItemId !== 'string'
+      || (raw as Record<string, unknown>).planItemId === '') {
+    throw new PlanFinalizeError('missing plan item id', 'plan-finalize-item-not-found');
+  }
+  if (isFullFinalizePlanItemDoneRequest(raw)) return finalize(raw);
+
+  const routes = getRoutes();
+  if (!routes) {
+    throw new PlanFinalizeError(
+      'Cannot mark this package done because finalization enrichment is unavailable.',
+      'plan-finalize-enrichment-unavailable',
+    );
+  }
+  const enriched = await routes.resolveFinalizeRequest(
+    (raw as { planItemId: string }).planItemId,
+  );
+  if (!enriched.ok) throw new PlanFinalizeError(enriched.message, enriched.reason);
+  return finalize(enriched.request);
 }
 
 function requirePlanPreviewRequest(raw: unknown): PlanCandidatePreviewRequest {
@@ -929,14 +1001,10 @@ export function registerPlanIpc(manager: PlanPaneManager): void {
   // ── SC-WP-3D: plan-package `done` transition → finalization ─────────────────
   // The renderer's explicit `done` gesture mints a plan-package finalization through
   // the WP-3C service (which also flips the work package to `done` in the same txn).
-  // The channel is a thin transport around `finalizePlanItemDone`; the boundary OID
-  // and members are computed upstream (WP-3G) and carried in the request.
-  ipcMain.handle('plan:finalizeItemDone', async (_e, request: FinalizePlanItemDoneRequest) => {
-    if (!request || typeof request.planItemId !== 'string' || !request.planItemId) {
-      return { error: 'missing plan item id' };
-    }
-    return finalizePlanItemDone(request);
-  });
+  // Identity-only renderer requests are enriched through the engine-backed lazy route.
+  // Full main-side WP-3D requests still pass through byte-for-byte unchanged.
+  ipcMain.handle('plan:finalizeItemDone', async (_e, request: unknown) =>
+    runFinalizePlanItemDoneRequest(request));
 
   // ── SC-WP-3I: plan-lens candidate preview (read-only) ───────────────────────
   // Sibling of the save-lens preview channel. Runs the SAME WP-3G `buildCandidate`

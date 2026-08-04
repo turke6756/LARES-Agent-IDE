@@ -86,11 +86,16 @@ function entry(id: string, over: Partial<DirtyEntry> = {}): DirtyEntry {
   };
 }
 
-function component(componentId: string, entryIds: string[], planId: string | null = 'plan-A'): ConflictComponent {
+function component(
+  componentId: string,
+  entryIds: string[],
+  planId: string | null = 'plan-A',
+  planItemId: string | null = null,
+): ConflictComponent {
   return {
     componentId,
     dirtyEntryIds: entryIds,
-    associations: [{ planId, planItemId: null, contributingTurnIds: ['t1'], memberEntryIds: entryIds }],
+    associations: [{ planId, planItemId, contributingTurnIds: ['t1'], memberEntryIds: entryIds }],
     overlap: {
       componentId,
       contributingAgentCount: 1,
@@ -293,6 +298,72 @@ test('fleet-adhoc resolver captures and returns the checkpoint engine boundary O
   assert.equal(context.repositoryKey, REPO_KEY);
   assert.equal(context.members.length, 1);
   assert.equal(context.members[0].path.pathBytesBase64, b64('e1'));
+});
+
+test('plan done resolver enriches identity from package state and fake checkpoint engine', async () => {
+  const captures: Array<{ workspaceId: string; label: string }> = [];
+  const boundaryOid = 'd'.repeat(40);
+  const { planPreviewRoutes } = createPreviewRoutes(baseDeps({
+    getPlanWorkPackage: (id) => id === 'wp-1' ? {
+      id, workspaceId: 'ws-1', planId: 'plan-A', title: 'Package',
+      acceptanceCondition: null, state: 'executing', assigneeAgentId: null,
+      revision: 1, createdAt: 1, updatedAt: 1,
+    } : null,
+    listPlanWorkPackagePaths: (id) => id === 'wp-1' ? [{
+      packageId: id, workspaceId: 'ws-1', path: 'src/e2.ts', intentKind: null, createdAt: 1,
+    }] : [],
+    assembleInventory: async () => read({
+      inventory: inventory([entry('e1'), entry('e2')], ['e2']),
+      components: [component('c1', ['e1'], 'plan-A', 'wp-1')],
+    }),
+    captureFinalizationBoundary: async (workspaceId, label) => {
+      captures.push({ workspaceId, label });
+      return { oid: boundaryOid, treeOid: 'e'.repeat(40) };
+    },
+  }));
+
+  assert.ok(planPreviewRoutes.resolveFinalizeRequest);
+  const result = await planPreviewRoutes.resolveFinalizeRequest!('wp-1');
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.deepEqual(captures, [{
+    workspaceId: 'ws-1', label: 'lares:finalization:plan-package:wp-1',
+  }]);
+  assert.equal(result.request.repositoryKey, REPO_KEY);
+  assert.equal(result.request.boundaryOid, boundaryOid);
+  assert.equal(result.request.repoRoot, '/repo');
+  assert.equal(result.request.pinnedHeadOid, 'a'.repeat(40));
+  assert.deepEqual(
+    result.request.members.map((candidate) => candidate.path.pathBytesBase64).sort(),
+    [b64('e1'), b64('e2')].sort(),
+  );
+});
+
+test('plan done resolver refuses unresolved members before calling checkpoint engine', async () => {
+  let captureCalls = 0;
+  const { planPreviewRoutes } = createPreviewRoutes(baseDeps({
+    getPlanWorkPackage: () => ({
+      id: 'wp-empty', workspaceId: 'ws-1', planId: 'plan-A', title: 'Empty',
+      acceptanceCondition: null, state: 'executing', assigneeAgentId: null,
+      revision: 1, createdAt: 1, updatedAt: 1,
+    }),
+    listPlanWorkPackagePaths: () => [],
+    assembleInventory: async () => read({
+      components: [component('c1', ['e1'], 'plan-A', null)],
+    }),
+    captureFinalizationBoundary: async () => {
+      captureCalls++;
+      return { oid: 'f'.repeat(40), treeOid: 'f'.repeat(40) };
+    },
+  }));
+
+  const result = await planPreviewRoutes.resolveFinalizeRequest!('wp-empty');
+  assert.deepEqual(result, {
+    ok: false,
+    reason: 'plan-finalize-members-unresolvable',
+    message: 'Cannot mark wp-empty done because no concrete dirty members resolve from its package stamps or planned paths.',
+  });
+  assert.equal(captureCalls, 0, 'an unresolved package never reaches the checkpoint oracle');
 });
 
 test('production coordinator seams reassemble a minted snapshot from the shared resolver', async () => {
