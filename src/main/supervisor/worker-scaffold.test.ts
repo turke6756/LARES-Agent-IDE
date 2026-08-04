@@ -17,7 +17,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { AgentSupervisor, SCAFFOLD_SIDECAR_REL } from './index';
+import { AgentSupervisor, ensureWorkerGitRepoRoot, SCAFFOLD_SIDECAR_REL } from './index';
 import {
   SUPERVISOR_CLAUDE_SETTINGS_JSON,
   WORKER_CLAUDE_SETTINGS_JSON,
@@ -593,66 +593,80 @@ test('Grok: fresh scaffold git-inits the worker cwd (.lares/workers/grok/.git ex
   }
 });
 
-test('Grok: re-scaffold does NOT re-init the worker cwd repo (idempotent, no churn)', () => {
+test('Grok: healthy repo takes the verified no-init fast path', () => {
   const workDir = mktmp('grok-gitinit-noop');
+  try {
+    fs.mkdirSync(path.join(workDir, '.git'));
+    const calls: string[][] = [];
+    ensureWorkerGitRepoRoot(workDir, 'grok', (args) => {
+      calls.push(args);
+      return `${workDir}\n`;
+    });
+    assert.deepEqual(calls, [['rev-parse', '--show-toplevel']], 'healthy repo must verify once and skip git init');
+  } finally {
+    rmrf(workDir);
+  }
+});
+
+test('Grok: corrupt .git directory is repaired before exact-root verification', () => {
+  const workDir = mktmp('grok-gitinit-repair');
+  const workerDir = path.join(workDir, '.lares', 'workers', 'grok');
   const { supervisor, cleanup } = makeSupervisor();
   try {
+    fs.mkdirSync(path.join(workerDir, '.git'), { recursive: true });
     supervisor.ensureWorkerScaffold(workDir, 'grok', 'windows');
-    const gitDir = path.join(workDir, '.lares', 'workers', 'grok', '.git');
-    assert.ok(fs.existsSync(gitDir), 'first scaffold must create the .git dir');
-
-    // Drop a sentinel INSIDE .git; a re-init would wipe/recreate the repo and the
-    // sentinel would vanish. Its survival proves the existing-repo short-circuit.
-    const sentinel = path.join(gitDir, 'COMMIT6_SENTINEL');
-    fs.writeFileSync(sentinel, 'do-not-reinit\n', 'utf-8');
-
-    supervisor.ensureWorkerScaffold(workDir, 'grok', 'windows');
-
-    assert.ok(
-      fs.existsSync(sentinel),
-      're-scaffold must short-circuit on an existing .git (no re-init) — sentinel inside .git must survive',
-    );
-    assert.equal(fs.readFileSync(sentinel, 'utf-8'), 'do-not-reinit\n', 'sentinel content must be untouched');
+    const root = String(require('node:child_process').execFileSync(
+      'git', ['rev-parse', '--show-toplevel'], { cwd: workerDir, encoding: 'utf-8' },
+    )).trim();
+    assert.equal(path.resolve(root).toLowerCase(), path.resolve(workerDir).toLowerCase());
   } finally {
     cleanup();
     rmrf(workDir);
   }
 });
 
-test('Grok: git unavailable → scaffold degrades with a warning, does not throw', () => {
+test('Grok: git unavailable refuses scaffold with a clear launch error', () => {
   const workDir = mktmp('grok-gitinit-nogit');
   const { supervisor, cleanup } = makeSupervisor();
   const origPath = process.env.PATH;
-  const origWarn = console.warn;
-  const warnings: string[] = [];
-  console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(' ')); };
   try {
-    // Make `git` unresolvable: with an empty PATH, execFileSync('git', …) throws
-    // ENOENT rather than spawning — exactly the git-unavailable production case.
     process.env.PATH = '';
-    // The scaffold's own file writes (fs.*) do not need PATH, so only the git
-    // init is affected. It must NOT throw out of ensureWorkerScaffold.
-    assert.doesNotThrow(
+    assert.throws(
       () => supervisor.ensureWorkerScaffold(workDir, 'grok', 'windows'),
-      'a missing git must not block the grok scaffold/launch',
+      /Cannot launch Grok worker:.*must be its own Git repository root; status hooks and the git-discard guard cannot load.*git init failed/is,
     );
-
-    // The carrier + identity are still delivered (git-init is best-effort, not a gate).
     assert.ok(
       fs.existsSync(path.join(workDir, '.lares', 'workers', 'grok', '.claude', 'settings.json')),
-      'the compat carrier must still be written even when git init fails',
+      'scaffold files may be repaired before the pre-launch refusal',
     );
-    // No repo was created…
     assert.ok(
       !fs.existsSync(path.join(workDir, '.lares', 'workers', 'grok', '.git')),
       'no .git should exist when git is unavailable',
     );
-    // …and the degradation was announced with its consequence named.
-    const warned = warnings.some((w) => /grok worker/.test(w) && /hooks\/guard will not load/.test(w));
-    assert.ok(warned, `expected a focused git-init warning naming the consequence; got: ${JSON.stringify(warnings)}`);
   } finally {
     process.env.PATH = origPath;
-    console.warn = origWarn;
+    cleanup();
+    rmrf(workDir);
+  }
+});
+
+test('Agy: git init failure is also a loud refusal', () => {
+  const workDir = mktmp('agy-gitinit-nogit');
+  const fakeHome = path.join(workDir, 'fake-home');
+  const priorUserProfile = process.env.USERPROFILE;
+  const priorPath = process.env.PATH;
+  process.env.USERPROFILE = fakeHome;
+  process.env.PATH = '';
+  const { supervisor, cleanup } = makeSupervisor();
+  try {
+    assert.throws(
+      () => supervisor.ensureWorkerScaffold(workDir, 'agy', 'windows'),
+      /Cannot launch Antigravity worker:.*must be its own Git repository root; workspace hooks cannot load.*git init failed/is,
+    );
+  } finally {
+    process.env.PATH = priorPath;
+    if (priorUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = priorUserProfile;
     cleanup();
     rmrf(workDir);
   }

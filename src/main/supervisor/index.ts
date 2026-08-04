@@ -478,6 +478,70 @@ export function grokTrustPathKey(dir: string, pathType: string): string | null {
   return key;
 }
 
+type WorkerGitRunner = (
+  args: string[],
+  options: { cwd: string; timeout: number; encoding?: BufferEncoding; stdio?: 'ignore' | ['ignore', 'pipe', 'ignore'] },
+) => string | Buffer;
+
+/** Ensure a provider lane is a real, self-rooted Git repository. */
+export function ensureWorkerGitRepoRoot(
+  workerCwd: string,
+  provider: 'grok' | 'agy',
+  runGit: WorkerGitRunner = (args, options) => execFileSync('git', args, options),
+): void {
+  const normalized = (value: string): string => {
+    let resolved = path.resolve(value.trim());
+    try { resolved = fs.realpathSync.native(resolved); } catch { /* compare resolved spelling */ }
+    return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+  };
+  const expectedRoot = normalized(workerCwd);
+  const probeRoot = (): string => String(runGit(
+    ['rev-parse', '--show-toplevel'],
+    { cwd: workerCwd, timeout: 20_000, encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] },
+  )).trim();
+
+  // Healthy lanes take one read-only probe and never re-run init.
+  try {
+    if (fs.existsSync(path.join(workerCwd, '.git'))) {
+      const root = probeRoot();
+      if (normalized(root) === expectedRoot) return;
+    }
+  } catch { /* corrupt/unreadable repo: fall through to init/repair */ }
+
+  let initFailure: unknown = null;
+  try {
+    runGit(['init', '-q'], { cwd: workerCwd, timeout: 20_000, stdio: 'ignore' });
+  } catch (err) {
+    initFailure = err;
+  }
+
+  let actualRoot: string | null = null;
+  let verifyFailure: unknown = null;
+  try {
+    actualRoot = probeRoot();
+    if (normalized(actualRoot) === expectedRoot) return;
+  } catch (err) {
+    verifyFailure = err;
+  }
+
+  const providerName = provider === 'grok' ? 'Grok' : 'Antigravity';
+  const consequence = provider === 'grok'
+    ? 'status hooks and the git-discard guard cannot load'
+    : 'workspace hooks cannot load';
+  const detail = initFailure
+    ? `git init failed: ${initFailure instanceof Error ? initFailure.message : String(initFailure)}`
+    : actualRoot
+      ? `git resolved the lane to ${actualRoot} instead`
+      : `repository verification failed: ${verifyFailure instanceof Error ? verifyFailure.message : String(verifyFailure)}`;
+  throw Object.assign(
+    new Error(
+      `Cannot launch ${providerName} worker: ${workerCwd} must be its own Git repository root; `
+      + `${consequence}. ${detail}`,
+    ),
+    { code: 'worker-git-root-required', statusCode: 500 },
+  );
+}
+
 const GROK_TOML_UNESCAPE_RE = /\\(["\\])/g;
 
 /** Unescape a TOML basic-string key's inner content for comparison. Path keys
@@ -3038,7 +3102,20 @@ export class AgentSupervisor extends EventEmitter {
       // Class IV (plans/class-iv-worker-hook-scaffold.md): worker agent
       // (supervised or plain) — scaffold the per-provider template + shared
       // hook script so turn-boundary status hooks fire.
-      this.ensureWorkerScaffold(workDir, provider, pathType);
+      try {
+        this.ensureWorkerScaffold(workDir, provider, pathType);
+      } catch (err) {
+        // These providers discover their hook carrier at the repository root.
+        // Persist the fail-closed refusal on the already-created row and reject
+        // the IPC/API promise so the same focused message reaches the caller/UI.
+        if (provider === 'grok' || provider === 'agy') {
+          const message = err instanceof Error ? err.message : String(err);
+          console.error(`[launch] ${message}`);
+          updateAgentStatus(agent.id, 'crashed');
+          addEvent(agent.id, 'crashed', JSON.stringify({ error: message }));
+        }
+        throw err;
+      }
       // Path A (probe 2026-07-28): native-Windows codex workers now carry their
       // hooks in the worker-cwd trusted-project .codex/config.toml (WORKER_CODEX_
       // CONFIG_TOML; ensureCodexProjectTrust trusts the cwd) and the launch
@@ -3757,9 +3834,10 @@ export class AgentSupervisor extends EventEmitter {
    *  AND the git-discard guard silently inert (empirically verified against
    *  grok.exe 0.2.118; regression captured as grok-tier0-smoke item 3.1).
    *
-   *  - Idempotent: an existing `.git` short-circuits — no re-init, no churn.
-   *  - Best-effort: if git is unavailable or `init` fails, log a focused warning
-   *    naming the consequence and return; a hook-less grok worker still launches.
+   *  - Idempotent: a verified healthy repo skips init; corrupt/misdirected repos
+   *    get an init/repair attempt.
+   *  - Fail-closed: init or exact-root verification failure aborts launch rather
+   *    than creating an unguarded worker.
    *  - Windows only: WSL grok is out of scope, so a `wsl` pathType is a no-op.
    *  - A bare `git init` (no initial commit) is sufficient — projectRoot
    *    resolution only needs the `.git` directory to exist (verified).
@@ -3770,34 +3848,14 @@ export class AgentSupervisor extends EventEmitter {
   private ensureGrokWorkerGitRepo(workDir: string, pathType: string): void {
     if (pathType === 'wsl') return;  // WSL grok deferred (Windows-first lane)
     const workerCwd = path.join(workDir, '.lares', 'workers', 'grok');
-    const gitDir = path.join(workerCwd, '.git');
-    try {
-      if (fs.existsSync(gitDir)) return;  // already a repo → no-op (no mtime churn)
-    } catch { /* unreadable — fall through and attempt init */ }
-    try {
-      execFileSync('git', ['init', '-q'], { cwd: workerCwd, timeout: 20_000, stdio: 'ignore' });
-    } catch (err) {
-      console.warn(
-        `[supervisor] grok worker \`git init\` failed in ${workerCwd} — grok hooks/guard `
-        + `will not load (projectRoot won't resolve to the worker cwd): `
-        + `${err instanceof Error ? err.message : String(err)}`,
-      );
-    }
+    ensureWorkerGitRepoRoot(workerCwd, 'grok');
   }
 
   /** agy discovers `.agents/hooks.json` only at a real repository root. */
   private ensureAgyWorkerGitRepo(workDir: string, pathType: string): void {
     if (pathType !== 'windows') return;
     const workerCwd = path.join(workDir, '.lares', 'workers', 'agy');
-    try {
-      if (fs.existsSync(path.join(workerCwd, '.git'))) return;
-      execFileSync('git', ['init', '-q'], { cwd: workerCwd, timeout: 20_000, stdio: 'ignore' });
-    } catch (err) {
-      console.warn(
-        `[supervisor] agy worker \`git init\` failed in ${workerCwd} — workspace hooks will not load: `
-        + `${err instanceof Error ? err.message : String(err)}`,
-      );
-    }
+    ensureWorkerGitRepoRoot(workerCwd, 'agy');
   }
 
   /** Seed the supervisor's memory (`.lares/supervisor/memory/MEMORY.md`) —

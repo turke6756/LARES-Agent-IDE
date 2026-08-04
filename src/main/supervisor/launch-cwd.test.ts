@@ -19,7 +19,7 @@ import { patchApplyStatusTransition } from './test-helpers/patch-apply-transitio
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { AgentSupervisor } from './index';
+import { AgentSupervisor, ensureWorkerGitRepoRoot } from './index';
 import { WindowsRunner } from './windows-runner';
 import { WslRunner } from './wsl-runner';
 import { makeAgent } from './test-helpers/fake-bridge-deps';
@@ -288,6 +288,74 @@ test('launchAgent rejects working_directory that escapes the workspace root', as
     restoreDb();
     fs.rmSync(workspacePath, { recursive: true, force: true });
     fs.rmSync(escapePath, { recursive: true, force: true });
+  }
+});
+
+test('Grok launch rejects with the repo-root refusal when git init cannot run', async () => {
+  const workspacePath = fs.mkdtempSync(path.join(os.tmpdir(), 'ad-cwd-grok-nogit-'));
+  const created: Agent[] = [];
+  const restoreDb = patchDb(workspacePath, created);
+  const restoreRunners = patchRunners();
+  const priorPath = process.env.PATH;
+  const priorError = console.error;
+  try {
+    const supervisor = makeSupervisor();
+    const s = supervisor as unknown as Record<string, unknown>;
+    // Keep the test inside its temporary workspace; only the real worker
+    // scaffold/repo-root gate is under test.
+    s.ensureResearchStoreScaffold = () => {};
+    s.ensureProviderDirTrust = () => {};
+    s.retireStaleRootMcpConfig = () => {};
+    s.loadAgentMd = () => null;
+    process.env.PATH = '';
+    console.error = () => {};
+
+    await assert.rejects(
+      supervisor.launchAgent({
+        workspaceId: 'ws-1',
+        title: 'grok worker',
+        provider: 'grok',
+        isWorker: true,
+      }),
+      /Cannot launch Grok worker:.*must be its own Git repository root; status hooks and the git-discard guard cannot load.*git init failed/is,
+    );
+    assert.equal(created.length, 1, 'the pre-launch refusal is persisted on the already-created agent row');
+    assert.equal(supervisor.hasRunner(created[0].id), false, 'provider process must never launch after the refusal');
+  } finally {
+    process.env.PATH = priorPath;
+    console.error = priorError;
+    restoreRunners();
+    restoreDb();
+    fs.rmSync(workspacePath, { recursive: true, force: true });
+  }
+});
+
+test('worker repo gate refuses when post-init rev-parse still resolves to an ancestor', () => {
+  const workspacePath = fs.mkdtempSync(path.join(os.tmpdir(), 'ad-cwd-grok-wrong-root-'));
+  const workerPath = path.join(workspacePath, '.lares', 'workers', 'grok');
+  fs.mkdirSync(path.join(workerPath, '.git'), { recursive: true });
+  const calls: string[][] = [];
+  try {
+    assert.throws(
+      () => ensureWorkerGitRepoRoot(workerPath, 'grok', (args) => {
+        calls.push(args);
+        return args[0] === 'rev-parse' ? `${workspacePath}\n` : Buffer.alloc(0);
+      }),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /git resolved the lane to .* instead/i);
+        assert.equal((error as Error & { code?: string }).code, 'worker-git-root-required');
+        assert.equal((error as Error & { statusCode?: number }).statusCode, 500);
+        return true;
+      },
+    );
+    assert.deepEqual(calls, [
+      ['rev-parse', '--show-toplevel'],
+      ['init', '-q'],
+      ['rev-parse', '--show-toplevel'],
+    ], 'an unhealthy root must get one repair attempt and a mandatory post-init verification');
+  } finally {
+    fs.rmSync(workspacePath, { recursive: true, force: true });
   }
 });
 
