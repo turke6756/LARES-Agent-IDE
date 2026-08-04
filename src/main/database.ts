@@ -1981,6 +1981,32 @@ function initContextOptimizerSchema(): void {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_plan_wp_paths_ws_path
     ON plan_work_package_paths(workspace_id, path)`);
 
+  // Planning-surface WP-P5B — plan_wp_lifecycle_events: the append-only ledger of
+  // NON-terminal package state transitions (ready/executing/blocked/archived) on
+  // SC-WP-3A plan_work_packages. WP-P5B's plan-lifecycle service is the sole writer.
+  // It NEVER records a `done` transition — `done` is SC-WP-3C's authoritative
+  // channel — and the CHECK(to_state IN (…)) makes a `done` to_state unledgerable at
+  // the schema level. from_state is the recorded prior state (any value, including a
+  // historical `done`, for faithful history). Cascades with its package. A2-serialized
+  // DDL slot, immediately after the P5A companions.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS plan_wp_lifecycle_events (
+      id          TEXT PRIMARY KEY,
+      package_id  TEXT NOT NULL REFERENCES plan_work_packages(id) ON DELETE CASCADE,
+      plan_id     TEXT NOT NULL,
+      from_state  TEXT NOT NULL,
+      to_state    TEXT NOT NULL,
+      actor       TEXT NOT NULL,
+      reason      TEXT,
+      ts          INTEGER NOT NULL,
+      CHECK (to_state IN ('ready','executing','blocked','archived'))
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_plan_wp_lifecycle_pkg
+    ON plan_wp_lifecycle_events(package_id, ts)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_plan_wp_lifecycle_plan
+    ON plan_wp_lifecycle_events(plan_id, ts)`);
+
   // WP-2B (Priority 0) — one-time, resumable workspace-lineage backfill. Populates
   // stream_lane_stats.workspace_id/workspace_root by folding each stream's launch cwd
   // to a root owned by EXACTLY one workspace. Idempotent (only NULL rows, ON a unique
@@ -5517,6 +5543,117 @@ export function listPlanWorkPackagePaths(packageId: string): PlanWorkPackagePath
     `SELECT * FROM plan_work_package_paths WHERE package_id = ? ORDER BY created_at, path`,
     [packageId],
   ).map(rowToPlanWorkPackagePath);
+}
+
+// ── Planning-surface WP-P5B — package lifecycle-event ledger primitives ─────────
+//
+// DB-layer primitives for the WP-P5B plan-lifecycle service: the atomic
+// state-transition + ledger write, the ledger read, and the responsible-supervisor
+// validity check Mark-Ready consumes. The SERVICE that composes these (Mark-Ready's
+// three-condition gate, archive delegation) is src/main/plans/plan-lifecycle.ts.
+// `done` is NEVER written here — the `to_state` type excludes it, the DDL CHECK
+// rejects it, and a `done` package is terminal (its state is SC-WP-3C's).
+
+/** The non-terminal transition targets this ledger owns. `done` is excluded by
+ *  design — SC-WP-3C is the authoritative `done` channel. */
+export type PlanWpTransitionState = 'ready' | 'executing' | 'blocked' | 'archived';
+
+export interface PlanWpLifecycleEvent {
+  id: string;
+  packageId: string;
+  planId: string;
+  fromState: string;
+  toState: PlanWpTransitionState;
+  actor: string;
+  reason: string | null;
+  ts: number;
+}
+
+function rowToPlanWpLifecycleEvent(row: any): PlanWpLifecycleEvent {
+  return {
+    id: row.id,
+    packageId: row.package_id,
+    planId: row.plan_id,
+    fromState: row.from_state,
+    toState: row.to_state,
+    actor: row.actor,
+    reason: row.reason ?? null,
+    ts: row.ts,
+  };
+}
+
+/**
+ * Atomically transition a package's `state` to a non-terminal target AND ledger the
+ * transition, in ONE transaction — the sole writer of `plan_work_packages.state`
+ * lifecycle moves. Rejects a `done` target (guard + DDL CHECK) and refuses to move a
+ * package that is already `done` (terminal, SC-WP-3C-owned). from_state is captured
+ * from the live row so the ledger is self-consistent. Returns the recorded event.
+ */
+export function transitionPlanWorkPackageState(input: {
+  eventId: string;
+  packageId: string;
+  toState: PlanWpTransitionState;
+  actor: string;
+  reason?: string | null;
+  ts: number;
+}): PlanWpLifecycleEvent {
+  if ((input.toState as string) === 'done') {
+    throw new Error('transitionPlanWorkPackageState: `done` is SC-WP-3C-owned, never ledgered here');
+  }
+  const database = getDb();
+  const tx = database.transaction((): PlanWpLifecycleEvent => {
+    const pkg = getPlanWorkPackage(input.packageId);
+    if (!pkg) throw new Error(`transitionPlanWorkPackageState: no package ${input.packageId}`);
+    if (pkg.state === 'done') {
+      throw new Error(`transitionPlanWorkPackageState: package ${input.packageId} is done (terminal)`);
+    }
+    const fromState = pkg.state;
+    run(
+      `UPDATE plan_work_packages SET state = ?, updated_at = ? WHERE id = ?`,
+      [input.toState, input.ts, input.packageId],
+    );
+    run(
+      `INSERT INTO plan_wp_lifecycle_events
+         (id, package_id, plan_id, from_state, to_state, actor, reason, ts)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [input.eventId, input.packageId, pkg.planId, fromState, input.toState,
+        input.actor, input.reason ?? null, input.ts],
+    );
+    return {
+      id: input.eventId, packageId: input.packageId, planId: pkg.planId,
+      fromState, toState: input.toState, actor: input.actor,
+      reason: input.reason ?? null, ts: input.ts,
+    };
+  });
+  return tx();
+}
+
+/** A package's lifecycle history, oldest first (ts, then id for a stable order). */
+export function listPlanWpLifecycleEvents(packageId: string): PlanWpLifecycleEvent[] {
+  return queryAll(
+    `SELECT * FROM plan_wp_lifecycle_events WHERE package_id = ? ORDER BY ts, id`,
+    [packageId],
+  ).map(rowToPlanWpLifecycleEvent);
+}
+
+/**
+ * True only when the plan has a responsible supervisor that is a REAL, valid
+ * supervisor: a non-null `responsible_supervisor_id` pointing at an agent that
+ * exists IN THE PLAN'S OWN WORKSPACE and is structurally a supervisor (or holds the
+ * supervisor privilege lane). A null pointer, a missing agent, a cross-workspace
+ * agent, or a non-supervisor agent all fail. One of Mark-Ready's three conditions.
+ */
+export function planHasValidResponsibleSupervisor(planId: string): boolean {
+  const row = queryOne(
+    `SELECT 1 AS ok
+       FROM plans p
+       JOIN agents a ON a.id = p.responsible_supervisor_id
+      WHERE p.id = ?
+        AND a.workspace_id = p.workspace_id
+        AND (a.is_supervisor = 1 OR a.privilege_lane = 'supervisor')`,
+    [planId],
+  );
+  return row !== null;
 }
 
 // ── Save-card SC-WP-3B — package_finalizations schema types + lifecycle accessors ──
