@@ -2044,6 +2044,29 @@ function initContextOptimizerSchema(): void {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_plan_exec_runs_plan
     ON plan_execution_runs(plan_id, lifecycle_state)`);
 
+  // Planning-surface WP-P5-dispatch — durable send-before-confirmation ledger.
+  // The pending row is committed before any worker bytes are sent. A confirmed
+  // turn id then anchors the ready→executing transition and restart reconciliation;
+  // no terminal turn status is consulted and this table never represents `done`.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS plan_dispatch_attempts (
+      id                     TEXT PRIMARY KEY,
+      package_id             TEXT NOT NULL REFERENCES plan_work_packages(id) ON DELETE CASCADE,
+      plan_id                TEXT NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+      execution_run_id       TEXT NOT NULL REFERENCES plan_execution_runs(id) ON DELETE CASCADE,
+      target_agent_id        TEXT,
+      requested_plan_item_id TEXT NOT NULL,
+      confirmed_turn_id      TEXT,
+      state                  TEXT NOT NULL
+        CHECK (state IN ('pending','delivered','failed','reconciled')),
+      created_at             INTEGER NOT NULL,
+      confirmed_at           INTEGER,
+      reconciled_at          INTEGER
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_plan_dispatch_attempts_reconcile
+    ON plan_dispatch_attempts(state, created_at)`);
+
   // WP-2B (Priority 0) — one-time, resumable workspace-lineage backfill. Populates
   // stream_lane_stats.workspace_id/workspace_root by folding each stream's launch cwd
   // to a root owned by EXACTLY one workspace. Idempotent (only NULL rows, ON a unique
@@ -2181,6 +2204,13 @@ function initMemoryV2Schema(): void {
       PRIMARY KEY (workspace_id, snapshot_id)
     );
   `);
+
+  // Startup hook for crash-safe package dispatch. It is idempotent and only moves
+  // a ready package when durable, matching turn-start evidence is unambiguous.
+  const dispatchReconcile = reconcilePlanDispatchAttempts();
+  for (const diagnostic of dispatchReconcile.diagnostics) {
+    console.warn(`[plan-dispatch] ${diagnostic}`);
+  }
 }
 
 function slugify(text: string): string {
@@ -5606,6 +5636,15 @@ export interface PlanWpLifecycleEvent {
   ts: number;
 }
 
+interface PlanWpTransitionInput {
+  eventId: string;
+  packageId: string;
+  toState: PlanWpTransitionState;
+  actor: string;
+  reason?: string | null;
+  ts: number;
+}
+
 function rowToPlanWpLifecycleEvent(row: any): PlanWpLifecycleEvent {
   return {
     id: row.id,
@@ -5626,42 +5665,40 @@ function rowToPlanWpLifecycleEvent(row: any): PlanWpLifecycleEvent {
  * package that is already `done` (terminal, SC-WP-3C-owned). from_state is captured
  * from the live row so the ledger is self-consistent. Returns the recorded event.
  */
-export function transitionPlanWorkPackageState(input: {
-  eventId: string;
-  packageId: string;
-  toState: PlanWpTransitionState;
-  actor: string;
-  reason?: string | null;
-  ts: number;
-}): PlanWpLifecycleEvent {
+function transitionPlanWorkPackageStateInTransaction(
+  input: PlanWpTransitionInput,
+): PlanWpLifecycleEvent {
   if ((input.toState as string) === 'done') {
     throw new Error('transitionPlanWorkPackageState: `done` is SC-WP-3C-owned, never ledgered here');
   }
-  const database = getDb();
-  const tx = database.transaction((): PlanWpLifecycleEvent => {
-    const pkg = getPlanWorkPackage(input.packageId);
-    if (!pkg) throw new Error(`transitionPlanWorkPackageState: no package ${input.packageId}`);
-    if (pkg.state === 'done') {
-      throw new Error(`transitionPlanWorkPackageState: package ${input.packageId} is done (terminal)`);
-    }
-    const fromState = pkg.state;
-    run(
-      `UPDATE plan_work_packages SET state = ?, updated_at = ? WHERE id = ?`,
-      [input.toState, input.ts, input.packageId],
-    );
-    run(
-      `INSERT INTO plan_wp_lifecycle_events
-         (id, package_id, plan_id, from_state, to_state, actor, reason, ts)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      [input.eventId, input.packageId, pkg.planId, fromState, input.toState,
-        input.actor, input.reason ?? null, input.ts],
-    );
-    return {
-      id: input.eventId, packageId: input.packageId, planId: pkg.planId,
-      fromState, toState: input.toState, actor: input.actor,
-      reason: input.reason ?? null, ts: input.ts,
-    };
-  });
+  const pkg = getPlanWorkPackage(input.packageId);
+  if (!pkg) throw new Error(`transitionPlanWorkPackageState: no package ${input.packageId}`);
+  if (pkg.state === 'done') {
+    throw new Error(`transitionPlanWorkPackageState: package ${input.packageId} is done (terminal)`);
+  }
+  const fromState = pkg.state;
+  run(
+    `UPDATE plan_work_packages SET state = ?, updated_at = ? WHERE id = ?`,
+    [input.toState, input.ts, input.packageId],
+  );
+  run(
+    `INSERT INTO plan_wp_lifecycle_events
+       (id, package_id, plan_id, from_state, to_state, actor, reason, ts)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    [input.eventId, input.packageId, pkg.planId, fromState, input.toState,
+      input.actor, input.reason ?? null, input.ts],
+  );
+  return {
+    id: input.eventId, packageId: input.packageId, planId: pkg.planId,
+    fromState, toState: input.toState, actor: input.actor,
+    reason: input.reason ?? null, ts: input.ts,
+  };
+}
+
+export function transitionPlanWorkPackageState(
+  input: PlanWpTransitionInput,
+): PlanWpLifecycleEvent {
+  const tx = getDb().transaction(() => transitionPlanWorkPackageStateInTransaction(input));
   return tx();
 }
 
@@ -5864,6 +5901,233 @@ export function archivePlanClosingRun(planId: string): ArchivePlanClosingRunResu
     return { plan: getPlan(planId)!, closedRun: active ? getPlanExecutionRun(active.id) : null };
   });
   return tx();
+}
+
+// ── Planning-surface WP-P5-dispatch — attempt ledger + reconciliation ──────────
+
+export type PlanDispatchAttemptState = 'pending' | 'delivered' | 'failed' | 'reconciled';
+
+export interface PlanDispatchAttempt {
+  id: string;
+  packageId: string;
+  planId: string;
+  executionRunId: string;
+  targetAgentId: string | null;
+  requestedPlanItemId: string;
+  confirmedTurnId: string | null;
+  state: PlanDispatchAttemptState;
+  createdAt: number;
+  confirmedAt: number | null;
+  reconciledAt: number | null;
+}
+
+function rowToPlanDispatchAttempt(row: any): PlanDispatchAttempt {
+  return {
+    id: row.id,
+    packageId: row.package_id,
+    planId: row.plan_id,
+    executionRunId: row.execution_run_id,
+    targetAgentId: row.target_agent_id ?? null,
+    requestedPlanItemId: row.requested_plan_item_id,
+    confirmedTurnId: row.confirmed_turn_id ?? null,
+    state: row.state,
+    createdAt: row.created_at,
+    confirmedAt: row.confirmed_at ?? null,
+    reconciledAt: row.reconciled_at ?? null,
+  };
+}
+
+/** Commit the durable `pending` row before the delivery adapter is invoked. The
+ * package/run tuple is re-read inside the transaction so a stale caller cannot
+ * dispatch an archived package or a package from a closed execution run. */
+export function insertPlanDispatchAttempt(input: {
+  id: string;
+  packageId: string;
+  planId: string;
+  executionRunId: string;
+  targetAgentId: string | null;
+  requestedPlanItemId: string;
+  createdAt: number;
+}): PlanDispatchAttempt {
+  return getDb().transaction((): PlanDispatchAttempt => {
+    const pkg = getPlanWorkPackage(input.packageId);
+    if (!pkg || pkg.id !== input.requestedPlanItemId || pkg.planId !== input.planId) {
+      throw new Error('insertPlanDispatchAttempt: package is not the requested plan item');
+    }
+    if (pkg.state !== 'ready') {
+      throw new Error(`insertPlanDispatchAttempt: package ${pkg.id} is '${pkg.state}', not ready`);
+    }
+    const executionRun = getPlanExecutionRun(input.executionRunId);
+    if (!executionRun || executionRun.planId !== input.planId || executionRun.lifecycleState !== 'active') {
+      throw new Error('insertPlanDispatchAttempt: no matching active execution run');
+    }
+    run(
+      `INSERT INTO plan_dispatch_attempts
+         (id, package_id, plan_id, execution_run_id, target_agent_id,
+          requested_plan_item_id, confirmed_turn_id, state, created_at,
+          confirmed_at, reconciled_at)
+       VALUES (?, ?, ?, ?, ?, ?, NULL, 'pending', ?, NULL, NULL)`,
+      [input.id, input.packageId, input.planId, input.executionRunId,
+        input.targetAgentId, input.requestedPlanItemId, input.createdAt],
+    );
+    return getPlanDispatchAttempt(input.id)!;
+  })();
+}
+
+export function getPlanDispatchAttempt(id: string): PlanDispatchAttempt | null {
+  const row = queryOne('SELECT * FROM plan_dispatch_attempts WHERE id = ?', [id]);
+  return row ? rowToPlanDispatchAttempt(row) : null;
+}
+
+export function listOpenPlanDispatchAttempts(): PlanDispatchAttempt[] {
+  return queryAll(
+    `SELECT * FROM plan_dispatch_attempts
+      WHERE state IN ('pending','delivered') ORDER BY created_at, id`,
+  ).map(rowToPlanDispatchAttempt);
+}
+
+/** A send rejected before accepting bytes. The package is deliberately untouched. */
+export function markPlanDispatchAttemptFailed(id: string): PlanDispatchAttempt {
+  run(
+    `UPDATE plan_dispatch_attempts SET state = 'failed'
+      WHERE id = ? AND state = 'pending'`,
+    [id],
+  );
+  const attempt = getPlanDispatchAttempt(id);
+  if (!attempt) throw new Error(`markPlanDispatchAttemptFailed: no attempt ${id}`);
+  return attempt;
+}
+
+function turnMatchesPlanDispatchAttempt(
+  attempt: PlanDispatchAttempt,
+  turn: TurnRecord,
+): boolean {
+  if (
+    turn.startedAt === null
+    || turn.startedAt < attempt.createdAt
+    || turn.agentId !== attempt.targetAgentId
+    || turn.planId !== attempt.planId
+    || turn.planItemId !== attempt.requestedPlanItemId
+  ) return false;
+  const executionRun = getPlanExecutionRun(attempt.executionRunId);
+  if (!executionRun || executionRun.planId !== attempt.planId) return false;
+  if (turn.startedAt < executionRun.triggeredAt) return false;
+  // Turn rows predate execution_run_id stamping. Bound a turn to the attempt's run
+  // by the run's time window; a later run opened before the turn makes it ineligible.
+  const laterRun = queryOne(
+    `SELECT 1 AS ok FROM plan_execution_runs
+      WHERE plan_id = ? AND id <> ? AND triggered_at > ? AND triggered_at <= ?
+      LIMIT 1`,
+    [attempt.planId, attempt.executionRunId, executionRun.triggeredAt, turn.startedAt],
+  );
+  return laterRun === null;
+}
+
+function listFallbackTurnsForPlanDispatch(attempt: PlanDispatchAttempt): TurnRecord[] {
+  return queryAll(
+    `SELECT * FROM turn_records
+      WHERE agent_id = ? AND plan_id = ? AND plan_item_id = ? AND started_at >= ?
+      ORDER BY started_at, turn_seq`,
+    [attempt.targetAgentId, attempt.planId, attempt.requestedPlanItemId, attempt.createdAt],
+  ).map(rowToTurnRecord).filter((turn) => turnMatchesPlanDispatchAttempt(attempt, turn));
+}
+
+/** Persist confirmation and perform ready→executing + its P5B event atomically.
+ * `turn_records.status` is intentionally never read: turn start is the evidence. */
+export function confirmPlanDispatchAttempt(input: {
+  attemptId: string;
+  confirmedTurnId: string;
+  eventId: string;
+  actor: string;
+  confirmedAt: number;
+  reconciledAt?: number | null;
+}): PlanDispatchAttempt {
+  return getDb().transaction((): PlanDispatchAttempt => {
+    const attempt = getPlanDispatchAttempt(input.attemptId);
+    if (!attempt) throw new Error(`confirmPlanDispatchAttempt: no attempt ${input.attemptId}`);
+    if (attempt.state === 'failed') {
+      throw new Error(`confirmPlanDispatchAttempt: attempt ${input.attemptId} is failed`);
+    }
+    const turn = getTurnRecord(input.confirmedTurnId);
+    if (!turn || !turnMatchesPlanDispatchAttempt(attempt, turn)) {
+      throw new Error('confirmPlanDispatchAttempt: confirmed turn does not match attempt');
+    }
+    const pkg = getPlanWorkPackage(attempt.packageId);
+    if (!pkg || pkg.state !== 'ready') {
+      throw new Error(`confirmPlanDispatchAttempt: package ${attempt.packageId} is not ready`);
+    }
+    const reconciled = input.reconciledAt !== undefined && input.reconciledAt !== null;
+    run(
+      `UPDATE plan_dispatch_attempts
+          SET state = ?, confirmed_turn_id = ?, confirmed_at = ?, reconciled_at = ?
+        WHERE id = ?`,
+      [reconciled ? 'reconciled' : 'delivered', input.confirmedTurnId,
+        input.confirmedAt, input.reconciledAt ?? null, input.attemptId],
+    );
+    transitionPlanWorkPackageStateInTransaction({
+      eventId: input.eventId,
+      packageId: attempt.packageId,
+      toState: 'executing',
+      actor: input.actor,
+      reason: reconciled ? 'dispatch-turn-start-reconciled' : 'dispatch-turn-start-confirmed',
+      ts: input.confirmedAt,
+    });
+    return getPlanDispatchAttempt(input.attemptId)!;
+  })();
+}
+
+export interface PlanDispatchReconcileResult {
+  reconciledAttemptIds: string[];
+  diagnostics: string[];
+}
+
+/** Startup/periodic reconciliation. Prefer the persisted confirmed turn id. When
+ * absent, accept exactly one matching stamped turn in the execution-run window;
+ * multiple candidates are ambiguous and remain pending with a diagnostic. */
+export function reconcilePlanDispatchAttempts(
+  now: number = Date.now(),
+): PlanDispatchReconcileResult {
+  const result: PlanDispatchReconcileResult = { reconciledAttemptIds: [], diagnostics: [] };
+  for (const attempt of listOpenPlanDispatchAttempts()) {
+    if (getPlanWorkPackage(attempt.packageId)?.state !== 'ready') continue;
+    let turn: TurnRecord | null = null;
+    if (attempt.confirmedTurnId) {
+      const confirmed = getTurnRecord(attempt.confirmedTurnId);
+      if (!confirmed || !turnMatchesPlanDispatchAttempt(attempt, confirmed)) {
+        result.diagnostics.push(
+          `attempt ${attempt.id} has a confirmed_turn_id that does not match its package stamp`,
+        );
+        continue;
+      }
+      turn = confirmed;
+    } else {
+      const matches = listFallbackTurnsForPlanDispatch(attempt);
+      if (matches.length > 1) {
+        result.diagnostics.push(
+          `attempt ${attempt.id} has ${matches.length} matching stamped turns; left pending`,
+        );
+        continue;
+      }
+      if (matches.length === 0) continue;
+      turn = matches[0];
+    }
+    try {
+      confirmPlanDispatchAttempt({
+        attemptId: attempt.id,
+        confirmedTurnId: turn.id,
+        eventId: `dispatch-reconcile-${attempt.id}`,
+        actor: 'startup-reconciler',
+        confirmedAt: attempt.confirmedAt ?? turn.startedAt ?? now,
+        reconciledAt: now,
+      });
+      result.reconciledAttemptIds.push(attempt.id);
+    } catch (err) {
+      result.diagnostics.push(
+        `attempt ${attempt.id} reconciliation failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+  return result;
 }
 
 // ── Save-card SC-WP-3B — package_finalizations schema types + lifecycle accessors ──

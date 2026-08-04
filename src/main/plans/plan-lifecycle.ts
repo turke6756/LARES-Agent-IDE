@@ -21,18 +21,34 @@
 import type { Plan, PlanTabKey } from '../../shared/types';
 import {
   archivePlanClosingRun,
+  confirmPlanDispatchAttempt,
+  getActivePlanExecutionRun,
+  getAgent,
   getPlan,
+  getPlanWorkPackage,
   getPlanTabOverview,
+  insertPlanDispatchAttempt,
   listPlanWorkPackages,
+  markPlanDispatchAttemptFailed,
+  planItemInPlan,
   planHasValidResponsibleSupervisor,
+  reconcilePlanDispatchAttempts,
   transitionPlanWorkPackageState,
   updatePlan,
   type ArchivePlanClosingRunResult,
   type PlanExecutionRun,
+  type PlanDispatchAttempt,
+  type PlanDispatchReconcileResult,
   type PlanWorkPackage,
   type PlanWpLifecycleEvent,
   type PlanWpTransitionState,
 } from '../database';
+import {
+  resolvePackageDispatchContext,
+  type DispatchContext,
+  type DispatchDeps,
+  type PlanBindingResolution,
+} from '../git-checkpoints/dispatch-context';
 import { buildPlanDocuments } from './plan-documents';
 import {
   implementPlan,
@@ -43,6 +59,188 @@ import {
 
 export const PLAN_RUN_STATE_HARDENING = 'hardening';
 export const PLAN_RUN_STATE_READY = 'ready';
+
+// ── package dispatch + durable confirmation (WP-P5-dispatch) ──────────────────
+
+export type PackageDeliveryResult =
+  | { disposition: 'failed'; reason?: string | null }
+  | { disposition: 'delivered-unconfirmed' }
+  | { disposition: 'confirmed'; confirmedTurnId: string; confirmedAt: number };
+
+export interface PackageDispatchInput {
+  attemptId: string;
+  lifecycleEventId: string;
+  packageId: string;
+  planId: string;
+  planItemId: string;
+  targetAgentId: string;
+  ownerAgentId: string | null;
+  promptText: string;
+  createdAt: number;
+}
+
+export interface PackageDispatchDeps {
+  getPackage?: typeof getPlanWorkPackage;
+  getActiveRun?: typeof getActivePlanExecutionRun;
+  dispatchDeps?: DispatchDeps;
+  insertAttempt?: typeof insertPlanDispatchAttempt;
+  markFailed?: typeof markPlanDispatchAttemptFailed;
+  confirmAttempt?: typeof confirmPlanDispatchAttempt;
+  deliver: (input: {
+    targetAgentId: string;
+    promptText: string;
+    dispatch: DispatchContext;
+  }) => Promise<PackageDeliveryResult>;
+}
+
+type PackageBindingFailure = Extract<PlanBindingResolution, { ok: false }>['reason'];
+
+export type PackageDispatchFailure =
+  | 'package-not-found'
+  | 'package-plan-item-mismatch'
+  | 'package-not-ready'
+  | 'target-agent-not-found'
+  | 'target-agent-workspace-mismatch'
+  | 'structured-plan-not-implemented'
+  | PackageBindingFailure
+  | 'send-failed'
+  | 'confirmation-persist-failed';
+
+export interface PackageDispatchResult {
+  ok: boolean;
+  attempt: PlanDispatchAttempt | null;
+  disposition: PackageDeliveryResult['disposition'] | null;
+  failure: PackageDispatchFailure | null;
+  diagnostic?: string;
+}
+
+function defaultPackageDispatchDeps(): DispatchDeps {
+  return {
+    getAgent: (id) => getAgent(id),
+    resolveCapability: async () => null,
+    planInWorkspace: (workspaceId, planId) => getPlan(planId)?.workspaceId === workspaceId,
+    planItemInPlan: (workspaceId, planId, planItemId) =>
+      planItemInPlan(workspaceId, planId, planItemId),
+    planImplementGate: (planId) => {
+      const plan = getPlan(planId);
+      if (!plan) return null;
+      return {
+        isStructured: plan.format === 'structured',
+        hasActiveExecutionRun: getActivePlanExecutionRun(planId) !== null,
+      };
+    },
+  };
+}
+
+/**
+ * Dispatch one ready work package. Validation and the active-run gate happen before
+ * the durable pending insert; that insert completes before `deliver` is invoked.
+ * Only a confirmed turn start can atomically move the package to `executing`.
+ */
+export async function dispatchPlanPackage(
+  input: PackageDispatchInput,
+  deps: PackageDispatchDeps,
+): Promise<PackageDispatchResult> {
+  const getPackage = deps.getPackage ?? getPlanWorkPackage;
+  const getActiveRun = deps.getActiveRun ?? getActivePlanExecutionRun;
+  const dispatchDeps = deps.dispatchDeps ?? defaultPackageDispatchDeps();
+  const pkg = getPackage(input.packageId);
+  if (!pkg) {
+    return { ok: false, attempt: null, disposition: null, failure: 'package-not-found' };
+  }
+  if (
+    pkg.planId !== input.planId
+    || pkg.id !== input.planItemId
+  ) {
+    return { ok: false, attempt: null, disposition: null, failure: 'package-plan-item-mismatch' };
+  }
+  if (pkg.state !== 'ready') {
+    return { ok: false, attempt: null, disposition: null, failure: 'package-not-ready' };
+  }
+  const agent = dispatchDeps.getAgent(input.targetAgentId);
+  if (!agent) {
+    return { ok: false, attempt: null, disposition: null, failure: 'target-agent-not-found' };
+  }
+  if (agent.workspaceId !== pkg.workspaceId) {
+    return {
+      ok: false, attempt: null, disposition: null,
+      failure: 'target-agent-workspace-mismatch',
+    };
+  }
+  const activeRun = getActiveRun(input.planId);
+  if (!activeRun) {
+    return {
+      ok: false, attempt: null, disposition: null,
+      failure: 'structured-plan-not-implemented',
+    };
+  }
+  const resolved = resolvePackageDispatchContext(dispatchDeps, agent, {
+    ownerAgentId: input.ownerAgentId,
+    planId: input.planId,
+    planItemId: input.planItemId,
+    taskLabel: pkg.title,
+  });
+  if (!resolved.ok) {
+    return { ok: false, attempt: null, disposition: null, failure: resolved.reason };
+  }
+  const insertAttempt = deps.insertAttempt ?? insertPlanDispatchAttempt;
+  const markFailed = deps.markFailed ?? markPlanDispatchAttemptFailed;
+  const confirmAttempt = deps.confirmAttempt ?? confirmPlanDispatchAttempt;
+  let attempt = insertAttempt({
+    id: input.attemptId,
+    packageId: input.packageId,
+    planId: input.planId,
+    executionRunId: activeRun.id,
+    targetAgentId: input.targetAgentId,
+    requestedPlanItemId: input.planItemId,
+    createdAt: input.createdAt,
+  });
+  let delivery: PackageDeliveryResult;
+  try {
+    delivery = await deps.deliver({
+      targetAgentId: input.targetAgentId,
+      promptText: input.promptText,
+      dispatch: resolved.dispatch,
+    });
+  } catch (err) {
+    attempt = markFailed(input.attemptId);
+    return {
+      ok: false, attempt, disposition: 'failed', failure: 'send-failed',
+      diagnostic: err instanceof Error ? err.message : String(err),
+    };
+  }
+  if (delivery.disposition === 'failed') {
+    attempt = markFailed(input.attemptId);
+    return {
+      ok: false, attempt, disposition: 'failed', failure: 'send-failed',
+      diagnostic: delivery.reason ?? undefined,
+    };
+  }
+  if (delivery.disposition === 'delivered-unconfirmed') {
+    return { ok: true, attempt, disposition: delivery.disposition, failure: null };
+  }
+  try {
+    attempt = confirmAttempt({
+      attemptId: input.attemptId,
+      confirmedTurnId: delivery.confirmedTurnId,
+      eventId: input.lifecycleEventId,
+      actor: input.ownerAgentId ?? 'package-dispatch',
+      confirmedAt: delivery.confirmedAt,
+    });
+    return { ok: true, attempt, disposition: 'confirmed', failure: null };
+  } catch (err) {
+    return {
+      ok: false, attempt, disposition: 'confirmed', failure: 'confirmation-persist-failed',
+      diagnostic: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+/** The idempotent startup/periodic hook exposed to the app lifecycle. Database
+ * initialization invokes the same primitive once at boot. */
+export function reconcilePackageDispatches(now?: number): PlanDispatchReconcileResult {
+  return reconcilePlanDispatchAttempts(now);
+}
 
 // ── package state transitions ─────────────────────────────────────────────────
 

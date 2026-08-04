@@ -59,6 +59,40 @@ export function withResolvedPlanStamp(
 }
 
 /**
+ * Resolve the explicit plan+package binding used by the planning-surface package
+ * dispatcher, then freeze that already-validated stamp onto the internal dispatch
+ * carrier. This deliberately goes THROUGH `resolveRequestedPlanBinding` first, so
+ * SC-WP-3A item membership and the WP-P5C active-run gate remain authoritative;
+ * callers cannot use the trusted carrier to bypass either check.
+ */
+export function resolvePackageDispatchContext(
+  deps: DispatchDeps,
+  agent: DispatchAgentInfo,
+  input: {
+    ownerAgentId: string | null;
+    planId: string;
+    planItemId: string;
+    taskLabel?: string | null;
+  },
+): Extract<PlanBindingResolution, { ok: false }>
+  | (Extract<PlanBindingResolution, { ok: true }> & { dispatch: DispatchContext }) {
+  const resolution = resolveRequestedPlanBinding(deps, agent, {
+    mode: 'explicit',
+    planId: input.planId,
+    planItemId: input.planItemId,
+  });
+  if (!resolution.ok) return resolution;
+  return {
+    ...resolution,
+    dispatch: withResolvedPlanStamp({
+      origin: 'orchestration',
+      ownerAgentId: input.ownerAgentId,
+      taskLabel: input.taskLabel ?? null,
+    }, resolution.stamp),
+  };
+}
+
+/**
  * Derive a turn's task label from free prompt text (WP3, defect-2 fallback). Used
  * only when the dispatch carries no explicit `taskLabel` (== dispatch brief). Steps,
  * in order: first non-empty trimmed line → collapse internal whitespace runs to a
