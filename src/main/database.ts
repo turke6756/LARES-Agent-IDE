@@ -1941,6 +1941,46 @@ function initContextOptimizerSchema(): void {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_selcomment_replies_comment
     ON selection_comment_replies(comment_id)`);
 
+  // Planning-surface WP-P5A (schema + paths) — the A2-serialized DDL slot for the
+  // first Stage-P5 nodes, rebased onto the current initContextOptimizerSchema()
+  // head (immediately after the P4D selection_comment_replies block). Two COMPANION
+  // tables over SC-WP-3A `plan_work_packages` (created above at the SC-WP-3A block,
+  // so both FK → plan_work_packages(id) resolve). No 12th column is added to
+  // SC-WP-3A's frozen 11-column shape; no lifecycle-state machine lands here (P5B
+  // owns transitions). Guarded CREATE TABLE/INDEX IF NOT EXISTS idiom, matching the
+  // sibling P3A/P4D DDL.
+
+  // plan_work_package_layout (WP-P5A-schema) — the ordering companion. One row per
+  // package (PK = package_id) carrying an explicit sort_order; packages with no row
+  // fall back to created_at ordering in the projection. Cascades away with its
+  // package so a deleted package leaves no dangling layout row.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS plan_work_package_layout (
+      package_id  TEXT PRIMARY KEY REFERENCES plan_work_packages(id) ON DELETE CASCADE,
+      sort_order  INTEGER NOT NULL
+    )
+  `);
+
+  // plan_work_package_paths (WP-P5A-paths) — planned (workspace-relative) paths per
+  // package; the populate seam is written from the editor and feeds P7B contention.
+  // Composite PK (package_id, path) enforces one row per planned path per package
+  // (idempotent re-save) without a synthetic id column. intent_kind is a free TEXT
+  // hint ('edit'/'create'/'delete'/…); created_at is a service-owned INTEGER epoch.
+  // The (workspace_id, path) index is the contention read seam. Cascades with its
+  // package.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS plan_work_package_paths (
+      package_id    TEXT NOT NULL REFERENCES plan_work_packages(id) ON DELETE CASCADE,
+      workspace_id  TEXT NOT NULL,
+      path          TEXT NOT NULL,
+      intent_kind   TEXT,
+      created_at    INTEGER NOT NULL,
+      PRIMARY KEY (package_id, path)
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_plan_wp_paths_ws_path
+    ON plan_work_package_paths(workspace_id, path)`);
+
   // WP-2B (Priority 0) — one-time, resumable workspace-lineage backfill. Populates
   // stream_lane_stats.workspace_id/workspace_root by folding each stream's launch cwd
   // to a root owned by EXACTLY one workspace. Idempotent (only NULL rows, ON a unique
@@ -5296,6 +5336,187 @@ export function planItemInPlan(workspaceId: string, planId: string, planItemId: 
     [planItemId, workspaceId, planId],
   );
   return row !== null;
+}
+
+// ── Planning-surface WP-P5A — work-package layout + planned-path companions ─────
+//
+// DB-layer primitives over the two P5A companion tables. WP-P5A-schema owns the
+// ordering companion + the same-workspace assignee validation; WP-P5A-paths owns
+// the planned-path populate/read seam. NO lifecycle-state transition lives here —
+// `state` mutations (`ready`/`executing`/`blocked`/`archived`) are WP-P5B's sole
+// domain, and `done` is SC-WP-3C's. `assignPlanWorkPackage` reuses SC-WP-3A CRUD
+// (get + upsert) rather than adding a column, so the frozen 11-column shape is
+// untouched.
+
+/** Set the explicit ordering slot for one package. Idempotent (PK upsert). */
+export function setPlanWorkPackageLayout(packageId: string, sortOrder: number): void {
+  run(
+    `INSERT INTO plan_work_package_layout (package_id, sort_order)
+     VALUES (?, ?)
+     ON CONFLICT(package_id) DO UPDATE SET sort_order = excluded.sort_order`,
+    [packageId, sortOrder],
+  );
+}
+
+/** The stored sort_order for a package, or null when it has no layout row. */
+export function getPlanWorkPackageLayoutOrder(packageId: string): number | null {
+  const row = queryOne(
+    `SELECT sort_order FROM plan_work_package_layout WHERE package_id = ?`,
+    [packageId],
+  );
+  return row ? (row.sort_order as number) : null;
+}
+
+/**
+ * Reorder a plan's packages by writing a dense 0..n-1 sort_order to the layout
+ * companion, in the given id order, inside one transaction. Only ids that belong
+ * to `planId` are written — a stray id is ignored, never silently reparented.
+ */
+export function reorderPlanWorkPackages(planId: string, orderedPackageIds: string[]): void {
+  const database = getDb();
+  const tx = database.transaction((ids: string[]) => {
+    let slot = 0;
+    for (const id of ids) {
+      const owns = queryOne(
+        `SELECT 1 AS ok FROM plan_work_packages WHERE id = ? AND plan_id = ?`,
+        [id, planId],
+      );
+      if (!owns) continue;
+      setPlanWorkPackageLayout(id, slot);
+      slot += 1;
+    }
+  });
+  tx(orderedPackageIds);
+}
+
+/**
+ * List a plan's packages in display order: explicit layout sort_order first (rows
+ * without a layout entry sort after, by created_at), then created_at, then id for
+ * a stable total order. Projection over SC-WP-3A + the layout companion.
+ */
+export function listPlanWorkPackagesOrdered(planId: string): PlanWorkPackage[] {
+  return queryAll(
+    `SELECT wp.* FROM plan_work_packages wp
+       LEFT JOIN plan_work_package_layout l ON l.package_id = wp.id
+      WHERE wp.plan_id = ?
+      ORDER BY (l.sort_order IS NULL), l.sort_order, wp.created_at, wp.id`,
+    [planId],
+  ).map(rowToPlanWorkPackage);
+}
+
+/**
+ * Assign (or clear, with `agentId=null`) a package's responsible agent. The
+ * assignee MUST be an agent in the package's OWN workspace — a cross-workspace or
+ * missing agent is rejected, never silently accepted. Reuses SC-WP-3A CRUD; no
+ * lifecycle state is touched.
+ */
+export function assignPlanWorkPackage(
+  packageId: string,
+  agentId: string | null,
+  updatedAt: number,
+): void {
+  const pkg = getPlanWorkPackage(packageId);
+  if (!pkg) throw new Error(`assignPlanWorkPackage: no package ${packageId}`);
+  if (agentId !== null) {
+    const ok = queryOne(
+      `SELECT 1 AS ok FROM agents WHERE id = ? AND workspace_id = ?`,
+      [agentId, pkg.workspaceId],
+    );
+    if (!ok) {
+      throw new Error(
+        `assignPlanWorkPackage: agent ${agentId} is not in workspace ${pkg.workspaceId}`,
+      );
+    }
+  }
+  upsertPlanWorkPackage({ ...pkg, assigneeAgentId: agentId, updatedAt });
+}
+
+export interface PlanWorkPackagePath {
+  packageId: string;
+  workspaceId: string;
+  path: string;
+  intentKind: string | null;
+  createdAt: number;
+}
+
+export interface PlanWorkPackagePathInput {
+  path: string;
+  intentKind?: string | null;
+}
+
+function rowToPlanWorkPackagePath(row: any): PlanWorkPackagePath {
+  return {
+    packageId: row.package_id,
+    workspaceId: row.workspace_id,
+    path: row.path,
+    intentKind: row.intent_kind ?? null,
+    createdAt: row.created_at,
+  };
+}
+
+/**
+ * Reject anything that is not a clean workspace-relative path: absolute (POSIX,
+ * UNC, or drive-rooted), empty, or outward-traversing. Returns the normalized
+ * POSIX path to store, or null to reject. Never coerces a failing shape into a
+ * passing one — a rejected entry is the caller's error, not a silent drop.
+ */
+function normalizePlannedPath(raw: string): string | null {
+  if (typeof raw !== 'string') return null;
+  const t = raw.trim();
+  if (t === '') return null;
+  if (t.includes('\\')) return null;              // not POSIX-separated / UNC
+  if (isVerifiedAbsolutePath(t)) return null;     // absolute / drive-rooted
+  const norm = path.posix.normalize(t);
+  if (norm === '' || norm === '.') return null;
+  if (norm === '..' || norm.startsWith('../')) return null; // outward traversal
+  return norm;
+}
+
+/**
+ * Populate the planned paths for a package (WP-P5A-paths). Replace semantics: the
+ * package's existing path rows are cleared and the given entries written, inside
+ * one transaction, so a re-save from the editor is idempotent. Every path must be
+ * workspace-relative — an absolute/traversing/empty path throws and rolls the
+ * whole populate back (no partial write). Duplicate paths in one call collapse to
+ * the last entry (PK = package_id, path).
+ */
+export function setPlanWorkPackagePaths(
+  packageId: string,
+  workspaceId: string,
+  entries: PlanWorkPackagePathInput[],
+  createdAt: number,
+): void {
+  const normalized = entries.map((e) => {
+    const p = normalizePlannedPath(e.path);
+    if (p === null) {
+      throw new Error(`setPlanWorkPackagePaths: not a workspace-relative path: ${JSON.stringify(e.path)}`);
+    }
+    return { path: p, intentKind: e.intentKind ?? null };
+  });
+  const database = getDb();
+  const tx = database.transaction(() => {
+    run(`DELETE FROM plan_work_package_paths WHERE package_id = ?`, [packageId]);
+    for (const e of normalized) {
+      run(
+        `INSERT INTO plan_work_package_paths (package_id, workspace_id, path, intent_kind, created_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(package_id, path) DO UPDATE SET
+           workspace_id = excluded.workspace_id,
+           intent_kind = excluded.intent_kind,
+           created_at = excluded.created_at`,
+        [packageId, workspaceId, e.path, e.intentKind, createdAt],
+      );
+    }
+  });
+  tx();
+}
+
+/** The planned paths for a package, in stable (created_at, path) order. */
+export function listPlanWorkPackagePaths(packageId: string): PlanWorkPackagePath[] {
+  return queryAll(
+    `SELECT * FROM plan_work_package_paths WHERE package_id = ? ORDER BY created_at, path`,
+    [packageId],
+  ).map(rowToPlanWorkPackagePath);
 }
 
 // ── Save-card SC-WP-3B — package_finalizations schema types + lifecycle accessors ──
