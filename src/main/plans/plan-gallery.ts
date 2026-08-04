@@ -426,8 +426,9 @@ export function readProposalDocument(
 }
 
 /** Point lookup of a proposal by id. Kept local (query in this module) rather
- *  than adding an accessor to the concurrently-edited database.ts. */
-function getProposalById(id: string): ProposalRecord | null {
+ *  than adding an accessor to the concurrently-edited database.ts. Exported for the
+ *  promotion wiring lane's `resolveProposal` seam (WP-P3-wire). */
+export function getProposalById(id: string): ProposalRecord | null {
   const workspaceId = (getDb()
     .prepare(`SELECT workspace_id AS ws, path AS p FROM proposals WHERE id = ?`)
     .get(id) as { ws: string; p: string } | undefined);

@@ -189,7 +189,11 @@ export type PromoteResult =
   | { status: 'rejected-foreign'; diagnostic: string }
   | { status: 'failed'; requestId: string; reason: string };
 
-function defaultBuildDispatch(ctx: DispatchBuildContext): { launchInput: LaunchAgentInput; prompt: string; marker: string } {
+/** The default planning-worker launch input + marked prompt builder. Exported so
+ *  the wiring lane can drive the WP-P3B-core delivery oracle's promptFactory /
+ *  launchInputFactory from a bare `promotion_requests` row (resumeDelivery re-send
+ *  + reserved-unbound re-bind) with the IDENTICAL body a first live send carries. */
+export function defaultBuildDispatch(ctx: DispatchBuildContext): { launchInput: LaunchAgentInput; prompt: string; marker: string } {
   const { request, proposal, responsibilityEventId, marker } = ctx;
   // The dispatched skill contract spans the full ruling-24 planning journey; the
   // worker's first mechanical act is atomic scaffold creation at the

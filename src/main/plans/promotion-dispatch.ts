@@ -64,6 +64,12 @@ export type TurnStartWitness = (agentId: string, sinceIso?: string) => boolean |
  *  paths so a full re-send carries the identical body a first send would. */
 export type PromotionPromptFactory = (req: PromotionRequestRow) => { prompt: string; marker: string };
 
+/** Builds the planning-worker LaunchAgentInput for a request — the SAME input a
+ *  first dispatch would carry (no initialUserPrompt; the task is delivered in
+ *  Phase 2b). Consumed ONLY by the reserved-unbound resume path, which re-enters
+ *  the launch/bind (Phase 2a) on the EXISTING reserved orchestration. */
+export type PromotionLaunchInputFactory = (req: PromotionRequestRow) => LaunchAgentInput;
+
 export interface PromotionDispatchInput {
   request: PromotionRequestRow;
   workspaceId: string;
@@ -206,6 +212,10 @@ export class PromotionDeliveryInspectorImpl implements PromotionDeliveryInspecto
     private readonly turnStartWitness: TurnStartWitness,
     private readonly promptFactory: PromotionPromptFactory,
     private readonly now: () => string = () => new Date().toISOString(),
+    /** OPTIONAL — the launch-input builder the reserved-unbound resume path needs
+     *  to re-enter Phase 2a. Without it, a reserved-unbound request is left
+     *  untouched (never a blind partial recovery); production wires it. */
+    private readonly launchInputFactory?: PromotionLaunchInputFactory,
   ) {}
 
   async inspectDelivery(orchestrationId: string): Promise<DeliveryProbe> {
@@ -236,13 +246,49 @@ export class PromotionDeliveryInspectorImpl implements PromotionDeliveryInspecto
 
   async resumeDelivery(orchestrationId: string): Promise<void> {
     const probe = await this.inspectDelivery(orchestrationId);
-    // Full body send is safe ONLY when a bound worker never had an attempt.
-    if (probe.state !== 'bound-undelivered') return;
-    const req = getPromotionRequestByOrchestration(orchestrationId);
-    if (!req) return;
-    const { prompt, marker } = this.promptFactory(req);
+
+    if (probe.state === 'bound-undelivered') {
+      // A bound worker that never had an attempt → the full marked body is safe
+      // to send ONCE against the SAME agent (no new orchestration, no new worker).
+      const req = getPromotionRequestByOrchestration(orchestrationId);
+      if (!req) return;
+      const { prompt, marker } = this.promptFactory(req);
+      await this.confirmedDeliver(orchestrationId, probe.agentId, prompt, marker);
+      return;
+    }
+
+    if (probe.state === 'reserved-unbound') {
+      // Phase 1 reserved the orchestration but Phase 2a never committed (crash
+      // inside/before the atomic agent+member+event txn) → RE-ENTER the launch path
+      // to atomically create+bind the agent on the EXISTING reserved orchestration
+      // (Phase 2a), then confirmed-deliver (Phase 2b). Binding onto `orchestrationId`
+      // reuses the reserved run — NO duplicate orchestration. Without a launch-input
+      // factory we cannot re-bind; leave it untouched for a wired boot (never a blind
+      // partial). resubmit/second-worker are structurally impossible here.
+      if (!this.launchInputFactory) return;
+      const req = getPromotionRequestByOrchestration(orchestrationId);
+      if (!req) return;
+      const launchInput = this.launchInputFactory(req);
+      const { prompt, marker } = this.promptFactory(req);
+      const agent = await this.deliverer.launchAgent(launchInput, {
+        orchestrationBinding: { runId: orchestrationId, role: 'worker', evidenceKind: 'promotion' },
+      });
+      await this.confirmedDeliver(orchestrationId, agent.id, prompt, marker);
+      return;
+    }
+    // Any other state (not-reserved / submitted-unconfirmed / delivered /
+    // indeterminate) is NOT a resumeDelivery case — do nothing (safe).
+  }
+
+  /** Phase 2b confirmed delivery against an already-bound agent: persist the
+   *  attempt BEFORE the send (so a crash reads submitted-unconfirmed, never a lost
+   *  attempt), submit through the turn-start-confirmed seam, and stamp
+   *  promotion.delivered ONLY on a matching turn-start confirmation. */
+  private async confirmedDeliver(
+    orchestrationId: string, agentId: string, prompt: string, marker: string,
+  ): Promise<void> {
     recordPromotionDeliveryAttempt(orchestrationId, this.now(), marker);
-    const res = await this.deliverer.sendInputConfirmed(probe.agentId, prompt);
+    const res = await this.deliverer.sendInputConfirmed(agentId, prompt);
     if (res.confirmed) recordPromotionDelivered(orchestrationId, this.now());
   }
 
