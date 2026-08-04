@@ -19,14 +19,15 @@
 //     by the test). Gallery attribution comes from `plan.json` responsibility
 //     history + the §R-ATTR projection, never a folder-adoption author claim.
 //   • No `responsible_supervisor_id` / doc-links / P3-owned column writes.
-//   • No intent-ledger ingest and NO import from any P2L module — P2L registers
-//     its scanner into the `onPlanFolderSettled` seam later (forward-decoupled).
+//   • P2L intent-ledger ingest runs at the settled seam after adoption; it does
+//     not alter folder validity, adoption, removal, or child-watch decisions.
 
 import fs from 'fs';
 import path from 'path';
 import type { Workspace } from '../../shared/types';
 import { adoptStructuredPlan, softDeletePlan, type StructuredPlanChange } from '../database';
 import { workspaceStateDir, workspaceStateDirName } from '../workspace-state-dir';
+import { scanPlanIntentLedger } from './plan-intent-ledger';
 
 /** Subdirs a plan folder scatters outputs into (§R0). Watched as bounded child
  *  subscriptions by PlansWatcher; enumerated here for the change signature. */
@@ -188,9 +189,9 @@ function safeSegment(name: string): boolean {
 
 export interface PlanFolderWatcherOptions {
   /** F-C seam: fired AFTER a folder's live `plans` row is resolved (adopt/change),
-   *  NEVER on removal. P2L registers its scanner here later; callback-less until
-   *  wired (this WP imports nothing from P2L). Awaited in a live reconcile;
-   *  detach-and-catch on the boot scan. */
+   *  NEVER on removal. The built-in P2L ledger scan runs first; this optional
+   *  callback remains available to downstream consumers. Awaited in a live
+   *  reconcile; detach-and-catch on the boot scan. */
   onPlanFolderSettled?: (planId: string, folderRelPath: string, changeKind: FolderChangeKind) => Promise<void> | void;
   /** Injected clock (tests). */
   now?: () => number;
@@ -350,7 +351,7 @@ export class PlanFolderWatcher {
 
       if (changeKind !== null) {
         result.settled.push({ planId: adopt.planId, folderRelPath, changeKind });
-        await this.fireSettled(adopt.planId, folderRelPath, changeKind, isBoot);
+        await this.fireSettled(ws, adopt.planId, folderAbs, folderRelPath, changeKind, isBoot);
       }
     }
 
@@ -375,14 +376,27 @@ export class PlanFolderWatcher {
    *  boot scan so a cold start with many folders isn't serialized (mirrors the
    *  legacy PlansWatcher F-C discipline). */
   private async fireSettled(
-    planId: string, folderRelPath: string, changeKind: FolderChangeKind, isBoot: boolean,
+    ws: Workspace, planId: string, folderAbs: string, folderRelPath: string,
+    changeKind: FolderChangeKind, isBoot: boolean,
   ): Promise<void> {
-    if (!this.onSettled) return;
+    const run = async (): Promise<void> => {
+      const scan = scanPlanIntentLedger({
+        workspaceId: ws.id,
+        workspaceRoot: ws.path,
+        planId,
+        folderAbs,
+        folderRelPath,
+      });
+      for (const diagnostic of scan.diagnostics) {
+        console.warn(`[plan-intent-ledger] ${diagnostic.kind}: ${diagnostic.detail}`);
+      }
+      if (this.onSettled) await this.onSettled(planId, folderRelPath, changeKind);
+    };
     if (isBoot) {
-      Promise.resolve(this.onSettled(planId, folderRelPath, changeKind))
+      Promise.resolve(run())
         .catch((err) => console.error('[plan-folder-watcher] onPlanFolderSettled (boot) threw', err));
     } else {
-      await Promise.resolve(this.onSettled(planId, folderRelPath, changeKind));
+      await run();
     }
   }
 
