@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import type {
+  PlanDocumentRef,
   PlanDocumentsModel,
   PlanDocumentTab,
   PlanTabDocument,
@@ -10,6 +11,7 @@ import type {
 } from '../../../shared/types';
 import { PLAN_TAB_KEYS, hasSupervisorPrivilege } from '../../../shared/types';
 import { useDashboardStore } from '../../stores/dashboard-store';
+import IntentLifecycleStrip from './IntentLifecycleStrip';
 import ProposalReader from './ProposalReader';
 
 // WP-P4B — the tabbed, folder-native plan **document home**. Consumes the
@@ -111,6 +113,11 @@ export default function PlanDocumentTabs({ planId }: { planId: string }): React.
   const activeKeyRef = useRef<PlanTabKey>(activeKey);
   activeKeyRef.current = activeKey;
 
+  // WP-P4F deep-link seam: when a caller asks to open a SPECIFIC document (not a
+  // tab's primary), stash its id here so the tab-change effect opens it instead of
+  // the primary. Cleared as soon as it is honored (a one-shot).
+  const pendingDocIdRef = useRef<string | null>(null);
+
   // Load the live tab projection on mount / plan switch. Reset to the default
   // `overview` tab so a plan switch never strands the view on a key the new plan
   // lacks; `plan.json` / `.gitkeep` are already absent (WP-P4A omits them).
@@ -199,14 +206,38 @@ export default function PlanDocumentTabs({ planId }: { planId: string }): React.
         setOverviewLoading(false);
       });
 
-    const primary = primaryDocOf(activeTab);
-    if (primary) openDoc(primary);
+    // Honor a pending deep-link target for this tab (a specific doc), else fall
+    // back to the tab's primary. The pending id is a one-shot — consume it here.
+    const pendingId = pendingDocIdRef.current;
+    pendingDocIdRef.current = null;
+    const pending = pendingId ? activeTab.documents.find((d) => d.ref.documentId === pendingId) : undefined;
+    const toOpen = pending ?? primaryDocOf(activeTab);
+    if (toOpen) openDoc(toOpen);
     else setDoc(null);
 
     return () => {
       active = false;
     };
   }, [planId, activeKey, model, activeTab, openDoc]);
+
+  // Controlled-selection seam (WP-P4F; WP-P6/P7 may reuse): switch to `key` and
+  // open the manifest doc `ref`. Same-tab opens directly (no key change to drive
+  // the effect); a cross-tab open stashes the target and lets the effect open it
+  // after the switch, so the primary-doc auto-open never clobbers the deep-link.
+  const openDocument = useCallback(
+    (key: PlanTabKey, ref: PlanDocumentRef) => {
+      const tab = model?.tabs.find((t) => t.key === key);
+      const target = tab?.documents.find((d) => d.ref.documentId === ref.documentId);
+      if (key === activeKeyRef.current) {
+        pendingDocIdRef.current = null;
+        if (target) openDoc(target);
+        return;
+      }
+      pendingDocIdRef.current = ref.documentId;
+      setActiveKey(key);
+    },
+    [model, openDoc],
+  );
 
   const hasOverview = Boolean(overview?.body && overview.body.trim().length > 0);
 
@@ -283,6 +314,11 @@ export default function PlanDocumentTabs({ planId }: { planId: string }): React.
 
   return (
     <div className="flex h-full min-h-0 flex-col bg-surface-0" data-testid="plan-document-tabs">
+      {/* WP-P4F — persistent intent-lifecycle strip ABOVE the tabs. It renders
+          nothing until the P2L projection resolves, so the document home is
+          untouched pre-ledger. Deep-links resolve through `openDocument`. */}
+      <IntentLifecycleStrip planId={planId} model={model} onOpenDocument={openDocument} />
+
       {/* Tab strip — stable keys, canonical order. Never one giant scroll. */}
       <div
         className="flex shrink-0 items-center gap-0.5 overflow-x-auto border-b border-white/10 px-2"
