@@ -248,6 +248,11 @@ const TESTS = [
   // the renderer workspaceId to a repository-scoped request and delegates to the
   // read-only facade (real temp git; only the registry + DB readers are faked).
   'dist/main/main/commit-candidates/save-card-routes.test.js',
+  // Save-card SC-WP-W1: production candidate-preview route composition — the
+  // bootstrap adapter that stitches the read-only `CandidateBuildContext` (ledger /
+  // HEAD / fingerprint / finalizations / per-member temp-index reps) for BOTH
+  // lenses. The 1G assembly seam is stubbed; the stitching is exercised directly.
+  'dist/main/main/commit-candidates/preview-routes.test.js',
   // Save-card Stage ③ SC-WP-3C/3G — candidate build pipeline + immutable
   // index-fingerprint snapshot, real finalization service, and the finalize/
   // preview IPC facades (WP-3Z registration).

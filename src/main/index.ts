@@ -38,8 +38,9 @@ import { startContinuationWatcher } from './supervisor/continuation-watcher-wiri
 import { runCheckpointStartupMaintenance } from './git-checkpoints/reconciler';
 import { createCheckpointEngine } from './git-checkpoints/engine-bootstrap';
 import { RETENTION_CYCLE_INTERVAL_MS } from '../shared/constants';
-import { registerIpcHandlers, setHumanCheckpointRoutes, setSaveCardRoutes } from './ipc-handlers';
+import { registerIpcHandlers, setHumanCheckpointRoutes, setSaveCardRoutes, setSaveCardPreviewRoutes } from './ipc-handlers';
 import { createSaveCardRoutes } from './commit-candidates/save-card-routes';
+import { createPreviewRoutes } from './commit-candidates/preview-routes';
 import type { SaveCardQuotaWeakening } from '../shared/commit-candidates';
 import { installExternalNavHandlers, forceCloseAllDetached, getDetachedEntries, type DetachedWindowDeps } from './detached-windows';
 import { runCloseFlush, type FlushTarget } from './close-flush';
@@ -64,7 +65,7 @@ import {
   PromotionDeliveryInspectorImpl,
   type TurnStartWitness, type PromotionDeliverer,
 } from './plans/promotion-dispatch';
-import { providePromotionService, type PromotionService } from './plans/plan-ipc';
+import { providePromotionService, providePlanPreviewRoutes, type PromotionService } from './plans/plan-ipc';
 import { makePromotionClaimScan } from './plans/promotion-claim-scan';
 import { getProposalById } from './plans/plan-gallery';
 import type { PromotionRequestRow } from './database';
@@ -847,6 +848,17 @@ app.whenReady().then(async () => {
             gitExe: engine.gitExe,
             readQuotaWeakening: (repositoryKey) => quotaWeakeningByRepo.get(repositoryKey) ?? null,
           }));
+          // SC-WP-W1: hand the Stage ③ candidate-preview routes (both lenses) to the
+          // renderer IPC layer, reusing the engine's already-resolved internal Git.
+          // ONE shared assembly resolves the read-only `CandidateBuildContext`, so
+          // `savecard:preview` and `plan:previewCandidate` return real
+          // SelectionPreview/CommitCandidate verdicts. Until this runs both channels
+          // answer "preview engine unavailable" honestly. (The fleet-adhoc finalize
+          // route's boundary-OID resolver is engine-coupled and handed off; its
+          // channel is registered but its route stays null for now.)
+          const previewRoutes = createPreviewRoutes({ gitExe: engine.gitExe });
+          setSaveCardPreviewRoutes(previewRoutes.saveCardPreviewRoutes);
+          providePlanPreviewRoutes(previewRoutes.planPreviewRoutes);
           await engine.runStartupMaintenance();
           // WP-G3.3 — schedule the periodic retention cycle (distill-before-prune +
           // triggered loose-object maintenance + storage report) on the shared engine

@@ -67,7 +67,14 @@ import {
 import { ensureInstallationLauncher } from './installation-descriptor';
 import { recordDemandProbe, isDemandProbeKind, DEMAND_PROBE_RECORD_CHANNEL } from './telemetry/demand-probe';
 import { registerCheckpointIpc, type HumanCheckpointRoutes } from './git-checkpoints/checkpoint-ipc';
-import { registerSaveCardIpc, type SaveCardRoutes } from './commit-candidates/save-card-ipc';
+import {
+  registerSaveCardIpc,
+  registerSaveCardPreviewIpc,
+  registerSaveCardFinalizeIpc,
+  type SaveCardRoutes,
+  type SaveCardPreviewRoutes,
+  type SaveCardFinalizeRoutes,
+} from './commit-candidates/save-card-ipc';
 import type { RequestedPlanBinding } from '../shared/commit-candidates';
 import { resolvePlanBindingAtBoundary } from './api-server';
 
@@ -91,6 +98,24 @@ export function setHumanCheckpointRoutes(routes: HumanCheckpointRoutes | null): 
 let saveCardRoutes: SaveCardRoutes | null = null;
 export function setSaveCardRoutes(routes: SaveCardRoutes | null): void {
   saveCardRoutes = routes;
+}
+
+// SC-WP-W1 — the Stage ③ Save-lens candidate-preview route, injected on the same
+// async engine-bootstrap seam as `setSaveCardRoutes`. Until it lands the channel
+// answers "save-card preview engine unavailable" honestly (never "No handler").
+let saveCardPreviewRoutes: SaveCardPreviewRoutes | null = null;
+export function setSaveCardPreviewRoutes(routes: SaveCardPreviewRoutes | null): void {
+  saveCardPreviewRoutes = routes;
+}
+
+// SC-WP-W1 — the DISTINCT fleet-adhoc mark-done finalization route. The channel is
+// registered here so it EXISTS in production (honest "unavailable" until injected),
+// but the production boundary-OID resolver is engine-coupled and handed off (see
+// the SC-WP-W1 patch summary); it stays null for now, so a mark-done rejects
+// honestly rather than hitting an unregistered channel.
+let saveCardFinalizeRoutes: SaveCardFinalizeRoutes | null = null;
+export function setSaveCardFinalizeRoutes(routes: SaveCardFinalizeRoutes | null): void {
+  saveCardFinalizeRoutes = routes;
 }
 
 function resolveMutationPathType(primaryPath: string, rootDirectory: string, pathType?: PathType): PathType {
@@ -194,6 +219,12 @@ export function registerIpcHandlers(
   // channels exist before the async engine bootstrap injects the routes.
   registerCheckpointIpc(ipcMain, () => humanCheckpointRoutes);
   registerSaveCardIpc(ipcMain, () => saveCardRoutes);
+  // SC-WP-W1 — Stage ③ candidate channels. Registered synchronously here (lazy
+  // getters) so `savecard:preview` / `savecard:markDoneFleetAdhoc` exist before the
+  // async engine bootstrap injects their routes — the reported "No handler
+  // registered" error is exactly a channel that was defined but never registered.
+  registerSaveCardPreviewIpc(ipcMain, () => saveCardPreviewRoutes);
+  registerSaveCardFinalizeIpc(ipcMain, () => saveCardFinalizeRoutes);
   // 'agent:stop' is registered by registerLifecycleIpc (lifecycle/lifecycle-ipc.ts)
   // so that every stop endpoint assigns its own reason in ONE place and a
   // renderer can never supply one (§B9).
