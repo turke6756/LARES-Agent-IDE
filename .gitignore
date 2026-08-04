@@ -44,10 +44,11 @@ experiments/
 .lares/*/.claude/.sysprompt-*.txt
 .lares/*/.claude/scheduled_tasks.lock
 .lares/main-crash.log
-# The root legacy dir is fully retired: nothing under it is ever tracked again
+# The root legacy dir is retired except for the research-store compatibility tier
 # (its last tracked scaffold files were git rm'd 2026-08-04 — git checkouts
 # were resurrecting the folder after the .lares rename).
-/.dashboard/
+/.dashboard/*
+!/.dashboard/research/
 .dashboard/.scaffold-versions.json
 .dashboard/workers/
 .dashboard/scripts/

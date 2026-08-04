@@ -47,7 +47,8 @@ describe('Plans navigation button', () => {
   });
 
   it('is inert while the Plans view is detached', () => {
-    const button = render({ detached: true });
+    const detached = true;
+    const button = render({ detached });
     act(() => button.click());
     expect(useDashboardStore.getState().plansOpen).toBe(false);
     expect(button.getAttribute('draggable')).toBe('false');
