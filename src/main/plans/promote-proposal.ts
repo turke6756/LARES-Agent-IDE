@@ -166,6 +166,15 @@ function latchKey(workspaceId: string, proposalArtifactId: string): string {
 export function isPromotionLatched(workspaceId: string, proposalArtifactId: string): boolean {
   return pendingLatches.has(latchKey(workspaceId, proposalArtifactId));
 }
+/** WP-P3-reconcile — re-acquire the in-memory pending latch for a still-open
+ *  request at startup reconstruction, so a concurrent live `proposal:promote`
+ *  coalesces onto the reconciled operation instead of dispatching a second worker.
+ *  Idempotent (backed by the durable promotion_requests row). */
+export function acquirePromotionLatch(
+  workspaceId: string, proposalArtifactId: string, requestId: string,
+): void {
+  pendingLatches.set(latchKey(workspaceId, proposalArtifactId), { requestId });
+}
 /** Test seam — clear the module-level latch map between cases. */
 export function _resetPromotionLatchesForTests(): void {
   pendingLatches.clear();

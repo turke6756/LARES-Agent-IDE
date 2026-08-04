@@ -54,6 +54,9 @@ import { shutdownJupyterServer } from './jupyter-server';
 import { disposeKernelClient } from './jupyter-kernel-client';
 import { closeAllWatchers as closeAllFsWatchers } from './fs-watcher';
 import { startPlansWatcher, PlansWatcher } from './plans-watcher';
+import { reconcilePendingPromotions } from './plans/promotion-reconciler';
+import { adoptPlanFolder } from './plans/plan-folder-watcher';
+import { makeEnrichAdoptedPlan } from './plans/promote-proposal';
 import { configureReparser, reparsePlanFile } from './plans/watch-plans';
 import { JUPYTER_BASE_PORT, JUPYTER_PORT_RETRIES } from './control-ports';
 import { buildChromeUA } from './browser/browser-decisions';
@@ -76,7 +79,7 @@ import type { MemorySnapshot, AdmissionDecision } from './watchdog/types';
 import { AttributionService } from './watchdog/attribution-service';
 import { usageForAgent } from './watchdog/attribution';
 import { composeSystemMemoryView } from './watchdog/system-memory-view';
-import { migrateWorkspaceStateDir, checkWorkspaceSecurityOnOpen } from './workspace-state-dir';
+import { migrateWorkspaceStateDir, checkWorkspaceSecurityOnOpen, workspaceStateDir } from './workspace-state-dir';
 import { parseAnalyticsSnapshotArgv, flushStdio } from './analytics-export/analytics-snapshot-argv';
 import {
   listDetachedProcesses,
@@ -953,6 +956,47 @@ app.whenReady().then(async () => {
         planPaneManager?.refresh(outcome.planId);
       },
     });
+    // WP-P3-reconcile (§R-P3 point 6) — pending-promotion startup reconstruction.
+    // After the folder watcher has had its boot pass, rebuild the in-memory pending
+    // latches from the durable `promotion_requests` rows and drive each still-pending
+    // request toward convergence: re-acquire its latch (so a concurrent live promote
+    // coalesces), ensure the adopted row exists via the idempotent single-folder
+    // adopt, and — once the promotion DELIVERY runtime (oracle + dispatch, wired with
+    // WP-P3C′) supplies an inspector — resume/enrich/dispatch per the crash matrix.
+    // Until that runtime is assembled, the delivery branches are safely deferred (no
+    // blind redrive). Fire-and-forget with a guard so it never blocks or crashes boot.
+    // Planning-lane only (Amendment 10) — never EXECUTION dispatch (Amendment 1c).
+    void reconcilePendingPromotions({
+      // inspector + dispatchFresh: OMITTED here. The delivery oracle's correct
+      // durable turn-start witness lives behind the promotion runtime (WP-P3C′);
+      // wiring it now would require a public accessor on the supervisor. Deferred
+      // deliberately — the safe reconstruction (latch + adopt) still runs every boot.
+      adoptPlanFolder: (req) => {
+        const ws = getWorkspace(req.workspaceId);
+        if (!ws) return Promise.resolve({ adopted: false, reason: 'absent' as const });
+        return adoptPlanFolder(ws, req.targetFolderRelPath);
+      },
+      enrichAdoptedPlan: makeEnrichAdoptedPlan({
+        resolvePlansHomeRoot: (workspaceId) => {
+          const ws = getWorkspace(workspaceId);
+          if (!ws) throw new Error(`[promotion reconcile] workspace not found: ${workspaceId}`);
+          const home = path.join(workspaceStateDir(ws.path, ws.pathType), 'plans');
+          return ws.pathType === 'wsl' ? wslToWindowsPath(home) : home;
+        },
+        resolveWorkspaceRoot: (workspaceId) => {
+          const ws = getWorkspace(workspaceId);
+          if (!ws) throw new Error(`[promotion reconcile] workspace not found: ${workspaceId}`);
+          return ws.pathType === 'wsl' ? wslToWindowsPath(ws.path) : ws.path;
+        },
+      }),
+    })
+      .then((report) => {
+        if (report.processed > 0) {
+          console.log(`[promotion reconcile] boot: ${report.processed} pending, ${report.diagnostics.length} diagnostic(s)`);
+          for (const d of report.diagnostics) console.warn('[promotion reconcile]', d.requestId, d.detail);
+        }
+      })
+      .catch((err) => console.error('[promotion reconcile] boot sweep failed', err));
     // GT-C Decision 1 (Configure site) — arm the Execution-Trail materializer ONCE,
     // now that the DB, the served-projection/reparse pipeline, and workspace
     // resolution are all live. Every dep re-derives from DB/fs on demand so the

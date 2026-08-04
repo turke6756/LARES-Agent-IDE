@@ -25,7 +25,7 @@
 import fs from 'fs';
 import path from 'path';
 import type { Workspace } from '../../shared/types';
-import { adoptStructuredPlan, softDeletePlan } from '../database';
+import { adoptStructuredPlan, softDeletePlan, type StructuredPlanChange } from '../database';
 import { workspaceStateDir, workspaceStateDirName } from '../workspace-state-dir';
 
 /** Subdirs a plan folder scatters outputs into (§R0). Watched as bounded child
@@ -389,5 +389,78 @@ export class PlanFolderWatcher {
   /** Test/inspection seam: the adopted-folder snapshot for a workspace. */
   adoptedFoldersForTests(workspaceId: string): string[] {
     return [...(this.adopted.get(workspaceId)?.keys() ?? [])];
+  }
+}
+
+// ── Narrow public idempotent single-folder adopt (WP-P3-reconcile) ────────────
+// A P3-owned, explicitly-listed extension of this file — NOT a behavior change to
+// the reconciler above. WP-P3-reconcile needs a public, idempotent
+// "ensure the adopted row exists for exactly this folder" entrypoint; it reuses
+// the SAME per-folder adopt steps `reconcileWorkspace` runs (§R0 validity →
+// plan.md/plan.json fs metadata → the disk-truth `adoptStructuredPlan` keyed by
+// (workspace_id, plan_artifact_id)). Idempotent: a second call for an
+// already-adopted folder is a no-op refresh (`change: 'unchanged'`).
+
+export type AdoptFailureReason = 'absent' | 'malformed' | 'no-artifact-id' | 'conflict';
+
+export interface AdoptResult {
+  /** true when a live `plans` row exists for this folder after the call. */
+  adopted: boolean;
+  /** The resolved `plans` row id when adopted. */
+  planId?: string;
+  /** What the underlying idempotent adopt did (adopted/revived/changed/unchanged). */
+  change?: StructuredPlanChange;
+  /** Why the folder was NOT adopted (absent dir/plan.json, malformed, no
+   *  artifact-id, or a constraint conflict) — never thrown, always reported. */
+  reason?: AdoptFailureReason;
+}
+
+/** Idempotently adopt exactly one §R0 plan folder under a workspace's state-dir
+ *  plans home, keyed by disk-truth `plan.json.plan_artifact_id`. `planFolderRelPath`
+ *  is the workspace-relative folder path (e.g. `.lares/plans/<sku>`); only its leaf
+ *  segment is trusted — the absolute path is re-derived from the LIVE state-dir
+ *  home (migration-aware), and the stored `folder_rel_path` is reconstructed to the
+ *  canonical `<stateDirName>/plans/<leaf>` form the watcher uses, so a reconciler
+ *  adopt and a watcher adopt converge on the same row. Never throws: an absent /
+ *  malformed / conflicting folder is reported via `reason`. */
+export async function adoptPlanFolder(ws: Workspace, planFolderRelPath: string): Promise<AdoptResult> {
+  const home = path.join(workspaceStateDir(ws.path, ws.pathType), 'plans');
+  const leaf = path.basename(planFolderRelPath.replace(/[\\/]+$/, ''));
+  if (!safeSegment(leaf)) return { adopted: false, reason: 'absent' };
+  const folderAbs = path.join(home, leaf);
+
+  // Reject a folder that is itself a reparse point escaping plans/ (mirror the
+  // reconcileWorkspace guard); an absent path is a clean 'absent', never a throw.
+  try {
+    if (fs.lstatSync(folderAbs).isSymbolicLink()) return { adopted: false, reason: 'malformed' };
+  } catch {
+    return { adopted: false, reason: 'absent' };
+  }
+
+  const validity = validatePlanFolder(folderAbs);
+  if (!validity.valid) {
+    return {
+      adopted: false,
+      reason: validity.reason === 'no-artifact-id' ? 'no-artifact-id'
+        : validity.reason === 'malformed' ? 'malformed' : 'absent',
+    };
+  }
+
+  const folderRelPath = `${workspaceStateDirName(ws.path, ws.pathType)}/plans/${leaf}`;
+  const meta = readPlanMdMeta(folderAbs);
+  try {
+    const adopt = adoptStructuredPlan({
+      workspaceId: ws.id,
+      artifactId: validity.planArtifactId,
+      folderRelPath,
+      planPath: `${folderRelPath}/plan.md`,
+      mtimeMs: meta.mtimeMs,
+      sizeBytes: meta.sizeBytes,
+    });
+    return { adopted: true, planId: adopt.planId, change: adopt.change };
+  } catch {
+    // A genuine constraint conflict (foreign path/folder collision) — quarantine,
+    // never throw; the caller keeps the request pending with a diagnostic.
+    return { adopted: false, reason: 'conflict' };
   }
 }
