@@ -463,6 +463,47 @@ export interface MissionBoardPackageTimeline {
   events: MissionBoardTimelineEvent[];
 }
 
+// WP-P7C: conservative file-level contribution evidence. These names avoid
+// authorship language deliberately: a witnessed touch or linked commit supports
+// contribution, never ownership of an exact line.
+export type BlameIntentConfidence = 'high' | 'medium' | 'low';
+
+export interface BlameIntentPlanRef {
+  id: string;
+  path: string;
+  slug: string | null;
+}
+
+export interface BlameIntentContributor {
+  turnId: string;
+  agentId: string | null;
+  taskLabel: string | null;
+  plan: BlameIntentPlanRef | null;
+  confidence: BlameIntentConfidence;
+  evidence: 'blamed-commit-exact-path' | 'blamed-commit' | 'turn-witness';
+  commitOids: string[];
+  /** True for all blame-ledger evidence: mixed-path commits remain commit-level. */
+  commitLevelOnly: boolean;
+}
+
+export interface BlameToIntentRequest {
+  workspaceId: string;
+  /** Workspace-relative POSIX path. File-level only in v1. */
+  path: string;
+}
+
+export interface BlameToIntentResult {
+  workspaceId: string;
+  path: string;
+  confidence: BlameIntentConfidence | null;
+  contributors: BlameIntentContributor[];
+  conflictingContributors: BlameIntentContributor[];
+  ledgerStrengthening: 'applied' | 'unavailable' | 'no-linked-commits';
+  /** Stable UI framing; consumers must not substitute line-authorship language. */
+  framing: 'These plans and turns contributed to this file.';
+  warnings: string[];
+}
+
 // ── WP-P2L-proj — planning-intent ledger read model ─────────────────────────
 
 export type PlanIntentStatus = 'active' | 'withdrawn' | 'superseded';
@@ -2972,6 +3013,8 @@ export interface IpcApi {
     getProjection: (planId: string, opts?: { eventDetailId?: string }) => Promise<PlanActivityProjection | null>;
     /** WP-P2L-proj — ledger/orchestration/disk-derived intent confidence read. */
     listIntents: (planId: string) => Promise<PlanIntentsProjection | null>;
+    /** WP-P7C - file-level contribution evidence; never exact-line authorship. */
+    blameToIntent: (request: BlameToIntentRequest) => Promise<BlameToIntentResult | null>;
     /** WP-P4C-backend — the stored, supervisor-authored per-tab overview for
      *  the stable `PlanTabKey`. Read is open (any renderer); `null` when the key
      *  is unset or the id/tab is invalid. */

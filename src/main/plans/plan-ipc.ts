@@ -26,6 +26,8 @@ import type {
   PromotedPlanFolderListResult,
   MissionBoardCard,
   MissionBoardPackageTimeline,
+  BlameToIntentRequest,
+  BlameToIntentResult,
 } from '../../shared/types';
 import { hasSupervisorPrivilege, isPlanTabKey } from '../../shared/types';
 import {
@@ -74,6 +76,7 @@ import {
 import { registerPlanImplementIpc } from './plan-implement';
 import { workspaceStateDir } from '../workspace-state-dir';
 import { listMissionBoardCards, listMissionBoardTimeline } from './mission-board';
+import { queryBlameToIntent } from './blame-to-intent';
 
 const MAX_PROMOTED_PLAN_JSON_BYTES = 256_000;
 const ARCHIVED_PLAN_STATUSES = new Set(['archived', 'superseded', 'cancelled', 'canceled']);
@@ -847,6 +850,28 @@ export function runMissionBoardTimeline(
   return listTimeline(rawPlanId);
 }
 
+// WP-P7C — file-level contribution evidence. The main service resolves the
+// workspace root and ledger capability; the renderer supplies no git paths or
+// repository identity.
+export function runBlameToIntent(
+  rawRequest: unknown,
+  query: (request: BlameToIntentRequest) => Promise<BlameToIntentResult | null> = queryBlameToIntent,
+): Promise<BlameToIntentResult | null> | null {
+  if (!rawRequest || typeof rawRequest !== 'object') return null;
+  const request = rawRequest as Partial<BlameToIntentRequest>;
+  if (typeof request.workspaceId !== 'string' || !request.workspaceId
+      || typeof request.path !== 'string' || !request.path) return null;
+  return query({ workspaceId: request.workspaceId, path: request.path });
+}
+
+export function registerBlameToIntentIpc(
+  ipc: PlanIpcLike,
+  query: (request: BlameToIntentRequest) => Promise<BlameToIntentResult | null> = queryBlameToIntent,
+): void {
+  ipc.handle('plan:blameToIntent', (_event, rawRequest: unknown) =>
+    runBlameToIntent(rawRequest, query));
+}
+
 export function registerPlanIpc(manager: PlanPaneManager): void {
   ipcMain.handle(
     'plan-folder:list',
@@ -952,6 +977,9 @@ export function registerPlanIpc(manager: PlanPaneManager): void {
   // WP-P6B-query: read-only package cards with structured state and transient
   // open-turn activity kept in separate DTO fields. No polling or state writes.
   registerMissionBoardIpc(ipcMain);
+
+  // WP-P7C: conservative file -> contributing turns/plans query.
+  registerBlameToIntentIpc(ipcMain);
 
   // Plan list for the "Plans" card gallery (workspace-scoped). Each row carries a
   // cheap description snippet derived from its already-served projection (or an
