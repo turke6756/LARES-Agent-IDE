@@ -294,13 +294,12 @@ async function commitPreview(pre: Preview, message: string): Promise<CommitOutco
   return committed;
 }
 
-async function assertCleanAbort(pre: Preview, message: string, reason: RegExp): Promise<void> {
-  const { coordinator, attempts } = harness(pre);
-  const refused = outcome(await coordinator.commit({ tokenId: pre.snapshot.token.tokenId, message }));
-  assert.equal(refused.status, 'aborted-error', JSON.stringify(refused));
-  assert.match(refused.reason, reason);
-  assert.equal(gitText(pre.root, ['rev-parse', 'HEAD']).trim(), pre.head, 'clean refusal leaves HEAD unchanged');
-  assert.equal(attempts.resolutions[0]?.resolution.outcomeStatus, 'aborted-error');
+function writeRejectingPreCommitHook(root: string): void {
+  const hookDir = path.join(root, '.git', 'hooks');
+  fs.mkdirSync(hookDir, { recursive: true });
+  const hook = path.join(hookDir, 'pre-commit');
+  fs.writeFileSync(hook, '#!/bin/sh\necho "rejected by hook" 1>&2\nexit 1\n', 'utf8');
+  fs.chmodSync(hook, 0o755);
 }
 
 test('row 1 — filename with spaces lands the previewed blob', async () => {
@@ -346,12 +345,28 @@ test('row 4 — leading-dash filename is data, never a Git option', async () => 
   await commitPreview(await preview(root, [{ entryId: 'dash', relative }]), 'leading dash');
 });
 
-test('row 5 — untracked file add is refused cleanly by git commit --only', async () => {
+test('row 5 — untracked new member commits exactly the pinned bytes (seeded into the index)', async () => {
   const root = repo();
-  fs.writeFileSync(path.join(root, 'added.bin'), Buffer.from([0, 1, 2, 13, 10, 255]));
+  // A foreign pre-existing staged hunk on an UNRELATED path must survive byte-identical.
+  fs.writeFileSync(path.join(root, 'foreign.txt'), 'foreign staged\n');
+  gitText(root, ['add', '--', 'foreign.txt']);
+  const foreignEntryBefore = gitBytes(root, ['ls-files', '--stage', '-z', '--', 'foreign.txt']);
+  const foreignBlobBefore = gitBytes(root, ['show', ':foreign.txt']);
+  // A genuinely untracked member whose raw bytes include NUL / CR / LF / 0xFF, to
+  // prove the seed carries authoritative bytes, not a decoded string.
+  const rawBytes = Buffer.from([0, 1, 2, 13, 10, 255]);
+  fs.writeFileSync(path.join(root, 'added.bin'), rawBytes);
   const pre = await preview(root, [{ entryId: 'add', relative: 'added.bin' }]);
-  await assertCleanAbort(pre, 'add path', /pathspec .* did not match any file|untracked/i);
-  assert.deepEqual(fs.readFileSync(path.join(root, 'added.bin')), Buffer.from([0, 1, 2, 13, 10, 255]), 'untracked bytes survive refusal');
+  const committed = await commitPreview(pre, 'untracked add');
+  assert.equal(committed.status === 'committed' && committed.indexIntegrity, 'verified');
+  // Exactly the previewed/pinned bytes landed (commitPreview also checks tree mode/oid).
+  assert.deepEqual(gitBytes(root, ['cat-file', 'blob', 'HEAD:added.bin']), rawBytes);
+  // The foreign staged entry is byte-identical afterward (acceptance b).
+  assert.deepEqual(gitBytes(root, ['ls-files', '--stage', '-z', '--', 'foreign.txt']), foreignEntryBefore);
+  assert.deepEqual(gitBytes(root, ['show', ':foreign.txt']), foreignBlobBefore);
+  // Only the member path entered the committed tree.
+  const changed = gitText(root, ['diff-tree', '--no-commit-id', '--name-only', '-r', 'HEAD']).trim().split(/\r?\n/).sort();
+  assert.deepEqual(changed, ['added.bin']);
 });
 
 test('row 6 — tracked deletion lands as an absent tree entry', async () => {
@@ -360,16 +375,22 @@ test('row 6 — tracked deletion lands as an absent tree entry', async () => {
   await commitPreview(await preview(root, [{ entryId: 'delete', relative: 'delete me.txt', state: 'absent' }]), 'delete path');
 });
 
-test('row 7 — rename with an untracked destination is refused cleanly by git commit --only', async () => {
+test('row 7 — rename with an untracked destination commits the pinned bytes and drops the source', async () => {
   const oldName = 'old name.txt';
   const newName = '-new name.txt';
   const root = repo({ [oldName]: 'rename bytes\n' });
   fs.renameSync(path.join(root, oldName), path.join(root, newName));
+  // Member path is the untracked destination; the tracked source is the extra
+  // pathspec `git commit --only` removes. Only the destination gets seeded.
   const pre = await preview(root, [{ entryId: 'rename', relative: newName, pathspecs: [oldName, newName] }]);
-  await assertCleanAbort(pre, 'rename path', /pathspec .* did not match any file|untracked/i);
-  assert.equal(fs.existsSync(path.join(root, oldName)), false, 'worktree rename source stays absent');
-  assert.equal(fs.readFileSync(path.join(root, newName), 'utf8'), 'rename bytes\n', 'worktree rename destination survives refusal');
-  assert.equal(gitBytes(root, ['cat-file', 'blob', `HEAD:${oldName}`]).toString('utf8'), 'rename bytes\n', 'HEAD retains the source');
+  await commitPreview(pre, 'rename to untracked dest');
+  const tree = headTree(root);
+  assert.equal(tree.get(Buffer.from(oldName, 'utf8').toString('base64')), undefined, 'source removed from committed tree');
+  assert.ok(tree.get(Buffer.from(newName, 'utf8').toString('base64')), 'destination present in committed tree');
+  assert.equal(gitBytes(root, ['cat-file', 'blob', `HEAD:${newName}`]).toString('utf8'), 'rename bytes\n', 'destination carries the pinned bytes');
+  // Worktree reflects the rename; no repair touched it.
+  assert.equal(fs.existsSync(path.join(root, oldName)), false, 'worktree source stays absent');
+  assert.equal(fs.readFileSync(path.join(root, newName), 'utf8'), 'rename bytes\n');
 });
 
 test('row 8 — executable-bit change lands when representable, otherwise says why Windows cannot express it', async () => {
@@ -471,6 +492,32 @@ test('row 13b — missing immutable snapshot is refused before attempt or commit
   assert.deepEqual(result, { kind: 'token-unresolved' });
   assert.equal(gitText(root, ['rev-parse', 'HEAD']).trim(), before);
   assert.equal(attempts.pending.length, 0, 'no attempt exists without a server-held snapshot');
+});
+
+test('row 14 — aborted attempt with a seeded untracked member leaves the index byte-identical', async () => {
+  const root = repo();
+  // Foreign staged hunk on an unrelated path must survive the aborted attempt.
+  fs.writeFileSync(path.join(root, 'foreign.txt'), 'foreign staged\n');
+  gitText(root, ['add', '--', 'foreign.txt']);
+  // An untracked member that the coordinator must seed to make committable.
+  fs.writeFileSync(path.join(root, 'added.txt'), 'seed me\n');
+  const pre = await preview(root, [{ entryId: 'add', relative: 'added.txt' }]);
+  const indexBefore = gitBytes(root, ['ls-files', '--stage', '-z']);
+  // A rejecting pre-commit hook: the commit never lands, so every seeded entry must
+  // be force-removed on the abort path (§9.4 abort invariant).
+  writeRejectingPreCommitHook(root);
+
+  const { coordinator, attempts } = harness(pre);
+  const refused = outcome(await coordinator.commit({ tokenId: pre.snapshot.token.tokenId, message: 'seed then abort' }));
+  assert.equal(refused.status, 'aborted-error', JSON.stringify(refused));
+  assert.equal(gitText(root, ['rev-parse', 'HEAD']).trim(), pre.head, 'aborted attempt leaves HEAD unchanged');
+  // The seed was rolled back: the index is byte-for-byte the pre-attempt index —
+  // no leaked entry on the member path, foreign staged hunk untouched.
+  assert.deepEqual(gitBytes(root, ['ls-files', '--stage', '-z']), indexBefore, 'no leaked seed entry; index byte-identical');
+  // The member is back to untracked; its worktree bytes are intact (no repair verb).
+  assert.equal(gitText(root, ['status', '--porcelain', '--', 'added.txt']).trim(), '?? added.txt');
+  assert.equal(fs.readFileSync(path.join(root, 'added.txt'), 'utf8'), 'seed me\n');
+  assert.equal(attempts.resolutions[0]?.resolution.outcomeStatus, 'aborted-error');
 });
 
 async function main(): Promise<void> {

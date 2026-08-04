@@ -219,6 +219,13 @@ function nulDelimited(paths: readonly EncodedGitPath[]): Buffer {
   return Buffer.concat(paths.flatMap((encoded) => [pathBytes(encoded), Buffer.from([0])]));
 }
 
+/** One `git update-index --index-info -z` record: `<mode> <oid>\t<pathbytes>\0`.
+ *  The path is transported as RAW bytes (like every other pathspec seam here) so a
+ *  spaced / leading-dash / non-UTF-8 name is never re-split into an argv token. */
+function indexInfoRecord(mode: string, oid: string, encoded: EncodedGitPath): Buffer {
+  return Buffer.concat([Buffer.from(`${mode} ${oid}\t`, 'ascii'), pathBytes(encoded), Buffer.from([0])]);
+}
+
 /** Union of every member's commitPathspecs, deduped by path bytes, deterministically
  *  sorted — the exact bytes written to the NUL pathspec file AND the set excluded from
  *  the post-commit index-integrity comparison. */
@@ -548,7 +555,31 @@ export class CommitCoordinator {
     const pathspecFile = path.join(tempDir, `${nonce}.paths`);
     const messageFile = path.join(tempDir, `${nonce}.msg`);
 
+    // Seeded index entries we introduced so `git commit --only` accepts otherwise-
+    // untracked members; force-removed again unless the commit actually lands. See
+    // seedUntrackedMembers / rollbackSeeds.
+    const seeded: EncodedGitPath[] = [];
+    let commitLanded = false;
+
     try {
+      // `git commit --only <pathspec>` matches its pathspecs ONLY against paths
+      // already known to Git (index/HEAD); a brand-new untracked member (or a
+      // rename whose destination is untracked) makes it refuse the whole commit.
+      // Pre-seed each such member into the real index with its PINNED clean-filtered
+      // blob/mode (the object was materialized during the revalidation read just
+      // above, so it exists) — never the working-tree bytes — so the pathspec
+      // matches. `commit --only` then re-reads the (already-revalidated-equal)
+      // worktree, so the seed's OID does not decide the committed bytes; it only
+      // makes the path committable. Every seed is rolled back below unless the
+      // commit lands (§9.4 abort invariant). Foreign staged paths are never touched:
+      // we seed strictly members that are absent from the real index.
+      const seedError = await this.seedUntrackedMembers(
+        repoRoot, gitExe, live.members, expectedByEntryId, beforeIndex, pinnedHeadOid, seeded,
+      );
+      if (seedError) {
+        return { kind: 'aborted-error', reason: seedError, resolvedHeadOid: (await this.readHead(repoRoot, gitExe)) ?? '' };
+      }
+
       await fs.promises.writeFile(pathspecFile, nulDelimited(pathspecs));
       const trailers = this.deriveTrailers(snapshot);
       const body = `${message}\n\n${trailers.join('\n')}\n`;
@@ -594,6 +625,11 @@ export class CommitCoordinator {
         return { kind: 'uncertain', identifiedCommitOid: null, resolvedHeadOid };
       }
 
+      // A marked commit exists ⇒ OUR commit landed and consumed any seeded entries
+      // into committed history; never roll them back (D-6 abort-never-repair). Only
+      // the no-marked-commit branches above reach the finally with commitLanded=false.
+      commitLanded = true;
+
       // Verify parent == pinnedHeadOid AND the committed tree entries.
       const parent = await this.readParent(repoRoot, gitExe, marked);
       const parentOk = pinnedHeadOid ? parent === pinnedHeadOid : parent === null;
@@ -621,8 +657,98 @@ export class CommitCoordinator {
 
       return { kind: 'committed', commitOid: marked, integrity, resolvedHeadOid, mismatchedTreePaths };
     } finally {
+      // No commit landed ⇒ undo every seed so an aborted-* / uncertain outcome
+      // leaves the real index byte-identical to before (§9.4 abort invariant).
+      // Best-effort: a rollback failure must not mask the classified outcome, and
+      // no repair verb is available to do better (D-6).
+      if (seeded.length > 0 && !commitLanded) {
+        await this.rollbackSeeds(repoRoot, gitExe, seeded).catch(() => undefined);
+      }
       await fs.promises.rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
     }
+  }
+
+  /** Stage each present member that `git commit --only` would refuse — i.e. one that
+   *  is GENUINELY UNTRACKED: absent from BOTH the real index AND the pinned HEAD tree
+   *  (a brand-new file, or a rename destination). A member already known to Git via
+   *  the index (foreign/own staged content) or via HEAD (e.g. removed from the index)
+   *  needs no seed and is left untouched. Seeds with the member's PINNED clean-filtered
+   *  `{expectedCommitBlobOid, expectedCommitMode}` — never working-tree bytes — so the
+   *  seed only makes the pathspec matchable; `commit --only` then re-reads the
+   *  already-revalidated-equal worktree for the committed bytes. Records each seeded
+   *  path in `seeded` for rollback. Returns a reason string on failure (nothing left
+   *  staged — `--index-info` is atomic), or null on success/no-op. */
+  private async seedUntrackedMembers(
+    repoRoot: string,
+    gitExe: string | undefined,
+    members: readonly LiveMember[],
+    expectedByEntryId: Map<string, CandidateMember>,
+    beforeIndex: Buffer | null,
+    pinnedHeadOid: string | null,
+    seeded: EncodedGitPath[],
+  ): Promise<string | null> {
+    // Without a readable baseline index we cannot tell tracked from untracked, so we
+    // seed nothing rather than risk clobbering a member path's existing staged entry.
+    if (!beforeIndex) return null;
+    const indexPaths = new Set(parseStageEntries(beforeIndex).map((entry) => entry.pathBytesBase64));
+    const indexAbsent = members.filter(
+      (member) => member.expectedWorktreeState === 'present' && !indexPaths.has(member.path.pathBytesBase64),
+    );
+    if (indexAbsent.length === 0) return null;
+
+    // A member absent from the index may still be known to Git via HEAD (which
+    // `commit --only` accepts without a seed). Only paths absent from HEAD too are
+    // truly untracked. If HEAD's tree is unreadable (unborn / corrupt) we cannot
+    // prove untracked, so we seed nothing and let the commit proceed or abort itself.
+    const headTree = pinnedHeadOid ? await this.readTree(repoRoot, gitExe, pinnedHeadOid) : null;
+    if (!headTree) return null;
+
+    const records: Buffer[] = [];
+    for (const member of indexAbsent) {
+      if (headTree.has(member.path.pathBytesBase64)) continue; // known to Git via HEAD
+      const expected = expectedByEntryId.get(member.entryId);
+      if (!expected || !expected.expectedCommitBlobOid || !expected.expectedCommitMode) {
+        // A present member with no pinned clean-filtered blob/mode cannot be seeded
+        // safely; refuse before any mutation so the index stays untouched.
+        return `cannot stage untracked member ${member.path.displayPath}: no pinned commit blob/mode`;
+      }
+      seeded.push(member.path);
+      records.push(indexInfoRecord(expected.expectedCommitMode, expected.expectedCommitBlobOid, member.path));
+    }
+    if (records.length === 0) return null;
+
+    try {
+      await this.d.runGit(repoRoot, ['update-index', '--add', '-z', '--index-info'], {
+        gitExe,
+        stdin: Buffer.concat(records),
+        timeoutMs: COMMIT_TIMEOUT_MS,
+        maxBytes: SMALL_MAX_BYTES,
+      });
+      return null;
+    } catch (error) {
+      // `--index-info` is atomic (a bad record aborts the whole batch), so nothing
+      // was applied — but the finally still force-removes `seeded` defensively
+      // (force-remove no-ops on an absent path). Report a clean abort.
+      return `failed to stage untracked member(s): ${error instanceof Error ? error.message : String(error)}`;
+    }
+  }
+
+  /** Remove seeded index entries. Every seeded path was absent from the index at
+   *  seed time (seedUntrackedMembers only stages index-absent members), so
+   *  `--force-remove` restores exactly that prior absent state; it is a no-op on any
+   *  path that never actually got staged. Never touches the worktree (D-6). */
+  private async rollbackSeeds(
+    repoRoot: string,
+    gitExe: string | undefined,
+    seeded: readonly EncodedGitPath[],
+  ): Promise<void> {
+    if (seeded.length === 0) return;
+    await this.d.runGit(repoRoot, ['update-index', '--force-remove', '-z', '--stdin'], {
+      gitExe,
+      stdin: nulDelimited(seeded),
+      timeoutMs: COMMIT_TIMEOUT_MS,
+      maxBytes: SMALL_MAX_BYTES,
+    });
   }
 
   // ── git reads (never mutate) ──────────────────────────────────────────────
