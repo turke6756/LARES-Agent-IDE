@@ -6,12 +6,14 @@
 // canonical component assembler exactly once.
 
 import * as fs from 'node:fs';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 
 import type {
   BundleCaptureHealth,
+  BundleAssociation,
   CandidateMember,
   CommitCandidate,
+  CommitCandidateToken,
   CommitEligibility,
   ConflictComponent,
   DirtyEntry,
@@ -22,7 +24,9 @@ import type {
   RepositoryIdentity,
   SelectionPreview,
   SaveCardQuotaWeakening,
+  MintCandidateTokenRequest,
 } from '../../shared/commit-candidates';
+import { COMMIT_CANDIDATE_TOKEN_CAP_PER_REPOSITORY } from '../../shared/constants';
 import { canonicalize } from './jcs';
 import type { CommitRepresentation } from './commit-representation';
 import type { FrozenManifestMember } from './finalization-service';
@@ -60,6 +64,42 @@ import {
   projectWorkBundles,
   type WorkBundle,
 } from './work-bundle';
+import { ComposeLockRegistry } from './compose-lock-registry';
+
+const DEFAULT_CANDIDATE_TOKEN_TTL_MS = 5 * 60 * 1000;
+
+export type CandidateTokenState = 'issued' | 'consuming' | 'consumed';
+
+export interface CandidateTokenSnapshot {
+  readonly token: CommitCandidateToken;
+  readonly candidate: CommitCandidate;
+  readonly repositoryKey: string;
+  readonly normalizedRequest: MintCandidateTokenRequest;
+  readonly componentTopologyDigest: string;
+  readonly pinnedHeadOid: string | null;
+  readonly indexFingerprint: string;
+  readonly indexWriteTreeOid: string | null;
+  readonly finalizationManifests: readonly {
+    readonly finalizationId: string;
+    readonly memberManifestJson: string;
+  }[];
+  readonly associations: readonly BundleAssociation[];
+}
+
+interface CandidateTokenRecord {
+  snapshot: CandidateTokenSnapshot;
+  state: CandidateTokenState;
+  lastAccessedAt: number;
+  sequence: number;
+}
+
+export interface CandidateTokenStoreOptions {
+  composeLocks?: ComposeLockRegistry;
+  now?: () => number;
+  randomTokenBytes?: () => Buffer;
+  tokenTtlMs?: number;
+  tokenCapPerRepository?: number;
+}
 
 export interface CandidateWorkspaceInput extends WorkspaceScopeInput {
   capability: Pick<
@@ -96,6 +136,19 @@ export interface CandidateServiceDeps {
   platform?: NodeJS.Platform;
   realpath?(path: string): string;
   fileExists?(path: string): boolean;
+  tokenStore?: CandidateTokenStoreOptions;
+}
+
+function deepFreeze<T>(value: T): T {
+  if (value && typeof value === 'object' && !Object.isFrozen(value)) {
+    Object.freeze(value);
+    for (const child of Object.values(value as Record<string, unknown>)) deepFreeze(child);
+  }
+  return value;
+}
+
+function cloneAndFreeze<T>(value: T): T {
+  return deepFreeze(structuredClone(value));
 }
 
 export interface CandidateInventoryRead {
@@ -158,6 +211,13 @@ export class CommitCandidateService {
   private readonly deps: Required<
     Pick<CandidateServiceDeps, 'platform' | 'realpath' | 'fileExists'>
   > & Omit<CandidateServiceDeps, 'platform' | 'realpath' | 'fileExists'>;
+  private readonly composeLocks: ComposeLockRegistry;
+  private readonly now: () => number;
+  private readonly randomTokenBytes: () => Buffer;
+  private readonly tokenTtlMs: number;
+  private readonly tokenCapPerRepository: number;
+  private readonly tokens = new Map<string, CandidateTokenRecord>();
+  private tokenSequence = 0;
 
   constructor(deps: CandidateServiceDeps) {
     this.deps = {
@@ -166,6 +226,161 @@ export class CommitCandidateService {
       realpath: deps.realpath ?? ((path) => fs.realpathSync.native(path)),
       fileExists: deps.fileExists ?? ((path) => fs.existsSync(path)),
     };
+    this.composeLocks = deps.tokenStore?.composeLocks ?? new ComposeLockRegistry();
+    this.now = deps.tokenStore?.now ?? (() => Date.now());
+    this.randomTokenBytes = deps.tokenStore?.randomTokenBytes ?? (() => randomBytes(32));
+    this.tokenTtlMs = deps.tokenStore?.tokenTtlMs ?? DEFAULT_CANDIDATE_TOKEN_TTL_MS;
+    this.tokenCapPerRepository = deps.tokenStore?.tokenCapPerRepository
+      ?? COMMIT_CANDIDATE_TOKEN_CAP_PER_REPOSITORY;
+  }
+
+  /** Build from fresh server state, validate acknowledgements, and mint an opaque token. */
+  mintCandidateToken(
+    request: MintCandidateTokenRequest,
+    context: CandidateBuildContext,
+  ): CommitCandidate | SelectionPreview {
+    const normalizedRequest: MintCandidateTokenRequest = {
+      selectedComponentIds: [...new Set(request.selectedComponentIds)].sort(compareBase64),
+      selectedUnattributedEntryIds: [...new Set(request.selectedUnattributedEntryIds)].sort(compareBase64),
+      finalizationIds: [...new Set(request.finalizationIds)].sort(compareBase64),
+      acknowledgeTopologyDigest: request.acknowledgeTopologyDigest,
+      acknowledgeUnattributedEntryIds:
+        [...new Set(request.acknowledgeUnattributedEntryIds)].sort(compareBase64),
+    };
+    const built = buildCandidate(normalizedRequest, context);
+    if (!('candidateId' in built) || !built.eligibility.eligible) return built;
+
+    const selectedUnattributed = context.inventory.entries.filter((entry) =>
+      normalizedRequest.selectedUnattributedEntryIds.includes(entry.entryId));
+    const topologyDigest = computeCandidateTopologyDigest(
+      context,
+      built.componentIds,
+      selectedUnattributed,
+    );
+    if (normalizedRequest.acknowledgeTopologyDigest !== topologyDigest) {
+      return { ...built, eligibility: { eligible: false, reason: 'overlap-not-acknowledged' } };
+    }
+    if (!sameStrings(
+      normalizedRequest.selectedUnattributedEntryIds,
+      normalizedRequest.acknowledgeUnattributedEntryIds,
+    )) {
+      return { ...built, eligibility: { eligible: false, reason: 'unattributed-not-acknowledged' } };
+    }
+    if (this.composeLocks.isHeld(context.repository.repositoryKey)) {
+      return { ...built, eligibility: { eligible: false, reason: 'compose-in-flight' } };
+    }
+
+    const now = this.now();
+    this.pruneExpired(now);
+    this.makeRoom(context.repository.repositoryKey);
+
+    let tokenId: string;
+    do tokenId = this.randomTokenBytes().toString('base64url');
+    while (this.tokens.has(tokenId));
+    const token: CommitCandidateToken = {
+      tokenId,
+      candidateId: built.candidateId,
+      contractVersion: built.contractVersion,
+      issuedAt: now,
+      expiresAt: now + this.tokenTtlMs,
+    };
+    const candidate = cloneAndFreeze({ ...built, token });
+    const selectedComponents = context.components.filter((component) =>
+      built.componentIds.includes(component.componentId));
+    const snapshot = cloneAndFreeze<CandidateTokenSnapshot>({
+      token,
+      candidate,
+      repositoryKey: context.repository.repositoryKey,
+      normalizedRequest,
+      componentTopologyDigest: topologyDigest,
+      pinnedHeadOid: context.pinnedHeadOid,
+      indexFingerprint: context.indexFingerprint.fingerprint,
+      indexWriteTreeOid: context.indexFingerprint.writeTreeOid,
+      finalizationManifests: context.finalizations
+        .filter((finalization) => normalizedRequest.finalizationIds.includes(finalization.id))
+        .map((finalization) => ({
+          finalizationId: finalization.id,
+          memberManifestJson: finalization.memberManifestJson,
+        })),
+      associations: selectedComponents.flatMap((component) => component.associations),
+    });
+    this.tokens.set(tokenId, {
+      snapshot,
+      state: 'issued',
+      lastAccessedAt: now,
+      sequence: this.tokenSequence++,
+    });
+    return candidate;
+  }
+
+  /** Read-only resolution used before 4D acquires the compose lock; never consumes. */
+  resolveCandidateToken(tokenId: string): CandidateTokenSnapshot | null {
+    const record = this.liveIssuedRecord(tokenId);
+    if (!record) return null;
+    record.lastAccessedAt = this.now();
+    record.sequence = this.tokenSequence++;
+    return record.snapshot;
+  }
+
+  /** Atomic compare-and-set. WP-4D calls this only after acquiring the compose lock. */
+  tryMarkTokenConsuming(tokenId: string): CandidateTokenSnapshot | null {
+    const record = this.liveIssuedRecord(tokenId);
+    if (!record) return null;
+    record.state = 'consuming';
+    record.lastAccessedAt = this.now();
+    record.sequence = this.tokenSequence++;
+    return record.snapshot;
+  }
+
+  markTokenConsumed(tokenId: string): boolean {
+    const record = this.tokens.get(tokenId);
+    if (!record || record.state !== 'consuming') return false;
+    record.state = 'consumed';
+    // A consumed token is invalidated immediately. Keeping the terminal assignment
+    // explicit documents the state-machine edge while bounding the in-memory map.
+    this.tokens.delete(tokenId);
+    return true;
+  }
+
+  tokenState(tokenId: string): CandidateTokenState | null {
+    const record = this.tokens.get(tokenId);
+    if (!record) return null;
+    if (record.state === 'issued' && record.snapshot.token.expiresAt <= this.now()) {
+      this.tokens.delete(tokenId);
+      return null;
+    }
+    return record.state;
+  }
+
+  private liveIssuedRecord(tokenId: string): CandidateTokenRecord | null {
+    const record = this.tokens.get(tokenId);
+    if (!record || record.state !== 'issued') return null;
+    if (record.snapshot.token.expiresAt <= this.now()) {
+      this.tokens.delete(tokenId);
+      return null;
+    }
+    return record;
+  }
+
+  private pruneExpired(now: number): void {
+    for (const [tokenId, record] of this.tokens) {
+      if (record.state === 'issued' && record.snapshot.token.expiresAt <= now) {
+        this.tokens.delete(tokenId);
+      }
+    }
+  }
+
+  private makeRoom(repositoryKey: string): void {
+    const repositoryRecords = [...this.tokens.entries()]
+      .filter(([, record]) => record.snapshot.repositoryKey === repositoryKey);
+    while (repositoryRecords.length >= this.tokenCapPerRepository) {
+      const oldestIssued = repositoryRecords
+        .filter(([, record]) => record.state === 'issued')
+        .sort((left, right) => left[1].sequence - right[1].sequence)[0];
+      if (!oldestIssued) break;
+      this.tokens.delete(oldestIssued[0]);
+      repositoryRecords.splice(repositoryRecords.findIndex(([id]) => id === oldestIssued[0]), 1);
+    }
   }
 
   async assembleInventory(request: CandidateReadRequest): Promise<CandidateInventoryRead> {
@@ -410,6 +625,10 @@ function compareBase64(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 
+function sameStrings(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
 function sha256Hex(value: string): string {
   return createHash('sha256').update(value, 'utf8').digest('hex');
 }
@@ -592,7 +811,7 @@ function ledgerProves(frozen: FrozenManifestMember, ledger: readonly CandidateLe
   );
 }
 
-function unionTopologyDigest(
+export function computeCandidateTopologyDigest(
   context: CandidateBuildContext,
   componentIds: readonly string[],
   unattributedEntries: readonly DirtyEntry[],
@@ -739,7 +958,7 @@ export function buildCandidate(
       expectedWorktreeState: member.expectedWorktreeState,
       coveringFinalizationIds: member.coveringFinalizationIds,
     })),
-    componentTopologyDigest: unionTopologyDigest(
+    componentTopologyDigest: computeCandidateTopologyDigest(
       context,
       selection.componentIds,
       selection.memberEntries.filter((entry) => selection.unattributedEntryIds.includes(entry.entryId)),
