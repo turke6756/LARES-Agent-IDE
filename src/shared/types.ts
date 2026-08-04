@@ -2670,6 +2670,19 @@ export interface IpcApi {
     getProjection: (planId: string, opts?: { eventDetailId?: string }) => Promise<PlanActivityProjection | null>;
     /** WP-P2L-proj — ledger/orchestration/disk-derived intent confidence read. */
     listIntents: (planId: string) => Promise<PlanIntentsProjection | null>;
+    /** WP-P4C-backend — the stored, supervisor-authored per-tab overview for
+     *  the stable `PlanTabKey`. Read is open (any renderer); `null` when the key
+     *  is unset or the id/tab is invalid. */
+    getOverview: (planId: string, tab: PlanTabKey) => Promise<PlanTabOverview | null>;
+    /** WP-P4C-backend — write (revision-bumping) the per-tab overview. Gated
+     *  SERVER-side by `hasSupervisorPrivilege` + same-workspace membership;
+     *  rejects (throws) for a non-supervisor or an unknown plan/agent. */
+    setOverview: (input: {
+      planId: string;
+      tab: PlanTabKey;
+      body: string | null;
+      supervisorId: string;
+    }) => Promise<PlanTabOverview>;
     /** Sandboxed render-pane lifecycle, same bounds-handoff as the browser pane:
      *  the renderer streams the pane rectangle while main drives the view. */
     paneShow: (planId: string) => Promise<void>;
@@ -4579,6 +4592,41 @@ export type PlanTabKey =
   | 'supplements'
   | 'packages'
   | 'legacy-html';
+
+/** The `PlanTabKey` domain as a runtime array — the single source of truth the
+ *  membership guard iterates so the type and the runtime set cannot drift. */
+export const PLAN_TAB_KEYS: readonly PlanTabKey[] = [
+  'overview',
+  'proposal',
+  'plan',
+  'deliberations',
+  'research',
+  'supplements',
+  'packages',
+  'legacy-html',
+];
+
+/** Runtime membership guard for the stable `PlanTabKey` domain. Used at the IPC
+ *  boundary so a renderer-supplied `tab` is validated before it keys a row. */
+export function isPlanTabKey(value: unknown): value is PlanTabKey {
+  return typeof value === 'string' && (PLAN_TAB_KEYS as readonly string[]).includes(value);
+}
+
+/** WP-P4C-backend — a stored, supervisor-authored per-tab overview, revisioned.
+ *  Keyed by (planId, tab) where `tab` is a stable `PlanTabKey`; `body` is the
+ *  plain-language summary rendered above the tab's document(s). The `overview`
+ *  key carries the summary shown above `ARC.md`. Read is open; write is
+ *  supervisor-privileged. `revision` bumps on every rewrite of the same key. */
+export interface PlanTabOverview {
+  planId: string;
+  tab: PlanTabKey;
+  body: string | null;
+  revision: number;
+  /** The agent id that last wrote the row (the revalidated supervisor). */
+  updatedBy: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
 
 /** A document handle issued by main. Neither variant contains a filesystem path. */
 export type PlanDocumentRef =

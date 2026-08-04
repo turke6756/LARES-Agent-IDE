@@ -5,7 +5,7 @@ import fs from 'fs';
 import crypto from 'crypto';
 import { v4 as uuidv4 } from 'uuid';
 import { AgentStopReason, deriveHookAvailability, isAgentStopReason, parseStopReason, PersistedAgentStatus } from '../shared/types';
-import { Agent, AgentProvider, AgentSessionRow, AgentStatus, AgentTemplate, CreateAgentTemplateInput, CreateSelectionCommentInput, CreateWorkspaceInput, CreateTeamInput, FileActivity, FileOperation, Plan, PlanFormat, RepoActivityEvidenceV1, SelectionComment, SelectionCommentStatus, SupervisorFocus, Team, TeamChannel, TeamMember, TeamMessage, TeamMessageStatus, TeamStatus, TeamTask, TeamTaskStatus, UpdateSelectionCommentInput, Workspace } from '../shared/types';
+import { Agent, AgentProvider, AgentSessionRow, AgentStatus, AgentTemplate, CreateAgentTemplateInput, CreateSelectionCommentInput, CreateWorkspaceInput, CreateTeamInput, FileActivity, FileOperation, Plan, PlanFormat, PlanTabKey, PlanTabOverview, RepoActivityEvidenceV1, SelectionComment, SelectionCommentStatus, SupervisorFocus, Team, TeamChannel, TeamMember, TeamMessage, TeamMessageStatus, TeamStatus, TeamTask, TeamTaskStatus, UpdateSelectionCommentInput, Workspace } from '../shared/types';
 import { parsePdfSelectionAnchor, serializePdfSelectionAnchor, validatePdfSelectionAnchor, type PdfSelectionAnchorV1, type SelectionAnchorType } from '../shared/pdf-annotations';
 import { DEFAULT_COMMAND, DEFAULT_COMMAND_WSL, SUPERVISOR_AGENT_MD } from '../shared/constants';
 import { parseRepoActivityEvidence } from './plans/repo-activity';
@@ -2846,6 +2846,61 @@ export function bumpSupervisorFocusAttended(supervisorId: string, planId: string
     [supervisorId, planId]
   );
   return getSupervisorFocusRow(supervisorId, planId);
+}
+
+// ── WP-P4C-backend — plan_tab_overviews accessors (revisioned; PK(plan_id, tab)) ──
+//
+// Accessors ONLY over the P3A `plan_tab_overviews` table (no DDL here — the table
+// exists). Reads are open; the supervisor-privilege gate lives at the IPC boundary
+// (plan-ipc.ts), not in the DB layer. `setPlanTabOverview` is a single-statement
+// upsert keyed on the (plan_id, tab) PK: a first write lands revision 1, and every
+// rewrite of the SAME key bumps `revision` by one and re-stamps `updated_at`. The
+// `tab` free-text column is keyed by the stable `PlanTabKey` domain by callers.
+
+function rowToPlanTabOverview(row: any): PlanTabOverview {
+  return {
+    planId: row.plan_id,
+    tab: row.tab as PlanTabKey,
+    body: row.body ?? null,
+    revision: Number(row.revision),
+    updatedBy: row.updated_by ?? null,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+/** The stored per-tab overview for (planId, tab), or null when the key is unset. */
+export function getPlanTabOverview(planId: string, tab: string): PlanTabOverview | null {
+  const row = queryOne(
+    `SELECT * FROM plan_tab_overviews WHERE plan_id = ? AND tab = ?`,
+    [planId, tab],
+  );
+  return row ? rowToPlanTabOverview(row) : null;
+}
+
+export interface PlanTabOverviewInput {
+  planId: string;
+  tab: string;
+  body: string | null;
+  /** The revalidated supervisor id recorded as the writer. */
+  updatedBy: string;
+}
+
+/** Upsert the per-tab overview. First write → revision 1; a rewrite of the same
+ *  (plan_id, tab) key bumps `revision` and re-stamps `updated_at`. Returns the
+ *  freshly-stored row (never null — the upsert always leaves a row). */
+export function setPlanTabOverview(input: PlanTabOverviewInput): PlanTabOverview {
+  run(
+    `INSERT INTO plan_tab_overviews (plan_id, tab, body, revision, updated_by, updated_at)
+     VALUES (?, ?, ?, 1, ?, datetime('now'))
+     ON CONFLICT(plan_id, tab) DO UPDATE SET
+       body = excluded.body,
+       revision = plan_tab_overviews.revision + 1,
+       updated_by = excluded.updated_by,
+       updated_at = datetime('now')`,
+    [input.planId, input.tab, input.body, input.updatedBy],
+  );
+  return getPlanTabOverview(input.planId, input.tab)!;
 }
 
 export type FocusedPlanSummary = {

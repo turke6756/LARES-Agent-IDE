@@ -217,6 +217,10 @@ const api: IpcApi = {
     readDocument: (planId, ref) => ipcRenderer.invoke('plan:document:read', planId, ref),
     getProjection: (planId, opts) => ipcRenderer.invoke('plan:projection', planId, opts),
     listIntents: (planId) => ipcRenderer.invoke('plan:intents:list', planId),
+    // WP-P4C-backend: per-tab supervisor overview. Read open; write privileged
+    // (server-revalidated) + revision-bumping. Wire shape is an object payload.
+    getOverview: (planId, tab) => ipcRenderer.invoke('plan:getOverview', { planId, tab }),
+    setOverview: (input) => ipcRenderer.invoke('plan:setOverview', input),
     paneShow: (planId) => ipcRenderer.invoke('plan-pane:show', planId),
     paneHide: () => ipcRenderer.invoke('plan-pane:hide'),
     paneSetBounds: (bounds) => ipcRenderer.invoke('plan-pane:setBounds', bounds),

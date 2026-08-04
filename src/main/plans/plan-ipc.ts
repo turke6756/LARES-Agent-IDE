@@ -18,8 +18,10 @@ import type {
   PromoteProposalResult,
   PromotionStatus,
   PlanIntentsProjection,
+  PlanTabKey,
+  PlanTabOverview,
 } from '../../shared/types';
-import { hasSupervisorPrivilege } from '../../shared/types';
+import { hasSupervisorPrivilege, isPlanTabKey } from '../../shared/types';
 import {
   getPlans,
   getPlanWorkPackage as dbGetPlanWorkPackage,
@@ -27,6 +29,8 @@ import {
   getPlan as dbGetPlan,
   getPlanByWorkspaceArtifactId as dbGetPlanByWorkspaceArtifactId,
   getPromotionRequestById as dbGetPromotionRequestById,
+  getPlanTabOverview as dbGetPlanTabOverview,
+  setPlanTabOverview as dbSetPlanTabOverview,
 } from '../database';
 import type { PlanWorkPackage, StructuredPlanRow, PromotionRequestRow } from '../database';
 import type { PromoteResult, ProposalRef } from './promote-proposal';
@@ -532,6 +536,137 @@ export function registerPromotionIpc(ipc: PlanIpcLike): void {
   );
 }
 
+// ── WP-P4C-backend — per-tab supervisor overview (`plan:getOverview` / `plan:setOverview`) ──
+//
+// Two thin handlers over the P3A `plan_tab_overviews` accessors. READS are open
+// (any renderer): the overview is durable, non-secret plan content. WRITES are
+// supervisor-privileged and revalidated SERVER-side exactly like the promotion IPC
+// — the client may only OFFER a supervisor; the server independently rejects a
+// non-privileged agent, an agent from a DIFFERENT workspace than the plan, or an
+// unknown plan/agent via `hasSupervisorPrivilege` + same-workspace membership. The
+// stored row is keyed by the stable `PlanTabKey` domain (validated here), never a
+// free-text tab from the renderer. The `overview` key holds the plain-language
+// summary rendered above `ARC.md`; ARC itself remains the overview tab's document.
+
+class PlanOverviewError extends Error {
+  constructor(message: string, readonly code: string) {
+    super(message);
+    this.name = 'PlanOverviewError';
+  }
+}
+
+/** Injectable seams for the two overview handlers — defaults to the real db
+ *  accessors; overridden wholesale in `plan-overview.test.ts` so the pure handler
+ *  cores are testable without a live DB or electron. */
+export interface PlanOverviewIpcDeps {
+  getAgent: (id: string) => Agent | null;
+  getPlan: (id: string) => Plan | null;
+  getOverview: (planId: string, tab: string) => PlanTabOverview | null;
+  setOverview: (input: {
+    planId: string;
+    tab: string;
+    body: string | null;
+    updatedBy: string;
+  }) => PlanTabOverview;
+}
+
+function defaultPlanOverviewIpcDeps(): PlanOverviewIpcDeps {
+  return {
+    getAgent: dbGetAgent,
+    getPlan: dbGetPlan,
+    getOverview: dbGetPlanTabOverview,
+    setOverview: dbSetPlanTabOverview,
+  };
+}
+
+/** Validate + narrow the (planId, tab) pair shared by both handlers. Returns null
+ *  when the request is not a well-formed read of a valid `PlanTabKey` — the read
+ *  handler degrades to `null`, the write handler throws (a write is a command). */
+function readPlanTabRequest(raw: unknown): { planId: string; tab: PlanTabKey } | null {
+  const record = (raw && typeof raw === 'object') ? (raw as Record<string, unknown>) : null;
+  const planId = record?.planId;
+  const tab = record?.tab;
+  if (typeof planId !== 'string' || planId === '') return null;
+  if (!isPlanTabKey(tab)) return null;
+  return { planId, tab };
+}
+
+/**
+ * `plan:getOverview` core. Open read: returns the stored per-tab overview or a
+ * clean `null` when the key is unset OR the request is malformed / not a valid
+ * `PlanTabKey`. Never throws for a caller — a missing overview and a bad key both
+ * degrade to `null` (the renderer shows "overview pending").
+ */
+export function runGetOverview(
+  raw: unknown,
+  deps: PlanOverviewIpcDeps = defaultPlanOverviewIpcDeps(),
+): PlanTabOverview | null {
+  const req = readPlanTabRequest(raw);
+  if (!req) return null;
+  return deps.getOverview(req.planId, req.tab);
+}
+
+/**
+ * `plan:setOverview` core. Supervisor-privileged, revision-bumping write. Mirrors
+ * the promotion IPC's server-side revalidation: resolve the plan (its workspace
+ * bounds the check), then reject anything that is not a privileged agent in the
+ * plan's OWN workspace. A malformed request / invalid tab, an unknown plan, or an
+ * ineligible supervisor all THROW — a rejected write is never a silent no-op.
+ */
+export function runSetOverview(
+  raw: unknown,
+  deps: PlanOverviewIpcDeps = defaultPlanOverviewIpcDeps(),
+): PlanTabOverview {
+  const req = readPlanTabRequest(raw);
+  if (!req) {
+    throw new PlanOverviewError(
+      'a non-empty planId and a valid tab key are required',
+      'overview-bad-request',
+    );
+  }
+  const record = raw as Record<string, unknown>;
+  const supervisorId = record.supervisorId;
+  if (typeof supervisorId !== 'string' || supervisorId === '') {
+    throw new PlanOverviewError('a non-empty supervisorId is required', 'overview-bad-request');
+  }
+  const body = record.body;
+  if (body !== null && body !== undefined && typeof body !== 'string') {
+    throw new PlanOverviewError('body must be a string or null', 'overview-bad-request');
+  }
+
+  // The plan's workspace bounds the supervisor revalidation.
+  const plan = deps.getPlan(req.planId);
+  if (!plan) {
+    throw new PlanOverviewError(`plan not found: ${req.planId}`, 'overview-plan-not-found');
+  }
+
+  // ── Server-side supervisor revalidation (never trust the client's filter). ──
+  const agent = deps.getAgent(supervisorId);
+  if (!agent || !hasSupervisorPrivilege(agent) || agent.workspaceId !== plan.workspaceId) {
+    throw new PlanOverviewError(
+      `not an eligible supervisor for this workspace: ${supervisorId}`,
+      'overview-supervisor-rejected',
+    );
+  }
+
+  return deps.setOverview({
+    planId: req.planId,
+    tab: req.tab,
+    body: (body ?? null) as string | null,
+    updatedBy: supervisorId,
+  });
+}
+
+/** Register the two WP-P4C-backend overview channels. Split from `registerPlanIpc`
+ *  so the ipc test can drive registration against a fake ipcMain. */
+export function registerPlanOverviewIpc(
+  ipc: PlanIpcLike,
+  deps: PlanOverviewIpcDeps = defaultPlanOverviewIpcDeps(),
+): void {
+  ipc.handle('plan:getOverview', (_event, raw: unknown) => runGetOverview(raw, deps));
+  ipc.handle('plan:setOverview', (_event, raw: unknown) => runSetOverview(raw, deps));
+}
+
 export function registerPlanIpc(manager: PlanPaneManager): void {
   // ── WP-P1A: planning-reader (read-only fs enumeration + safe read) ──────────
   // Bounded enumeration of bare proposals + §R0 plan folders, and a
@@ -611,6 +746,11 @@ export function registerPlanIpc(manager: PlanPaneManager): void {
   // WP-P2L-proj: mid-altitude intent history + confidence, derived from the
   // canonical ledger/orchestration join and current plan.md disk presence.
   registerPlanIntentsIpc(ipcMain);
+
+  // WP-P4C-backend: per-tab supervisor overview. Open read (`plan:getOverview`);
+  // supervisor-privileged, server-revalidated, revision-bumping write
+  // (`plan:setOverview`). Keyed by the stable PlanTabKey domain.
+  registerPlanOverviewIpc(ipcMain);
 
   // Plan list for the "Plans" card gallery (workspace-scoped). Each row carries a
   // cheap description snippet derived from its already-served projection (or an
