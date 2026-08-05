@@ -120,7 +120,7 @@ describe('ProposalCardGallery', () => {
     Object.defineProperty(row, 'clientWidth', { configurable: true, value: 300 });
     row.scrollLeft = 20;
 
-    const event = new WheelEvent('wheel', { bubbles: true, cancelable: true, deltaX: 75 });
+    const event = new WheelEvent('wheel', { bubbles: true, cancelable: true, deltaY: 75 });
     act(() => row.dispatchEvent(event));
     expect(row.scrollLeft).toBe(95);
     expect(event.defaultPrevented).toBe(true);

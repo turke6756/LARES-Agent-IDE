@@ -64,7 +64,7 @@ export default function ProposalCardGallery(): React.ReactElement {
 
   useEffect(() => {
     if (!cardRow) return;
-    return installHorizontalWheelScroll(cardRow);
+    return installHorizontalWheelScroll(cardRow, { translateVerticalWheel: true });
   }, [cardRow]);
 
   const selected = useMemo(

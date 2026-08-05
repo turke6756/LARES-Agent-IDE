@@ -52,6 +52,40 @@ describe('horizontal-wheel', () => {
     expect(preventDefault).toHaveBeenCalledTimes(1);
   });
 
+  it('translates plain vertical wheel movement when opted in', () => {
+    const preventDefault = vi.fn();
+    const el = { clientWidth: 100, scrollWidth: 300, scrollLeft: 25 };
+
+    const handled = applyHorizontalWheelScroll(el, {
+      deltaX: 0,
+      deltaY: 50,
+      deltaMode: WHEEL_DELTA_PIXEL,
+      shiftKey: false,
+      preventDefault,
+    }, { translateVerticalWheel: true });
+
+    expect(handled).toBe(true);
+    expect(el.scrollLeft).toBe(75);
+    expect(preventDefault).toHaveBeenCalledTimes(1);
+  });
+
+  it('ignores plain vertical wheel movement by default', () => {
+    const preventDefault = vi.fn();
+    const el = { clientWidth: 100, scrollWidth: 300, scrollLeft: 25 };
+
+    const handled = applyHorizontalWheelScroll(el, {
+      deltaX: 0,
+      deltaY: 50,
+      deltaMode: WHEEL_DELTA_PIXEL,
+      shiftKey: false,
+      preventDefault,
+    });
+
+    expect(handled).toBe(false);
+    expect(el.scrollLeft).toBe(25);
+    expect(preventDefault).not.toHaveBeenCalled();
+  });
+
   it('does not prevent default when the strip cannot scroll further', () => {
     const preventDefault = vi.fn();
     const el = { clientWidth: 100, scrollWidth: 300, scrollLeft: 200 };

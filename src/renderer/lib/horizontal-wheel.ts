@@ -12,6 +12,10 @@ type HorizontalScrollableLike = {
   scrollLeft: number;
 };
 
+export type HorizontalWheelOptions = {
+  translateVerticalWheel?: boolean;
+};
+
 export const WHEEL_DELTA_PIXEL = 0;
 export const WHEEL_DELTA_LINE = 1;
 export const WHEEL_DELTA_PAGE = 2;
@@ -22,11 +26,12 @@ export function getHorizontalWheelDelta(
   event: HorizontalWheelEventLike,
   pageSizePx: number,
   lineSizePx = DEFAULT_LINE_SIZE_PX,
+  options: HorizontalWheelOptions = {},
 ): number {
   let delta = event.deltaX;
 
   // Some mouse drivers expose the horizontal wheel as Shift+vertical wheel.
-  if (delta === 0 && event.shiftKey) {
+  if (delta === 0 && (event.shiftKey || options.translateVerticalWheel)) {
     delta = event.deltaY;
   }
 
@@ -45,11 +50,12 @@ export function getHorizontalWheelDelta(
 export function applyHorizontalWheelScroll(
   element: HorizontalScrollableLike,
   event: HorizontalWheelEventLike,
+  options: HorizontalWheelOptions = {},
 ): boolean {
   const maxScrollLeft = Math.max(0, element.scrollWidth - element.clientWidth);
   if (maxScrollLeft <= 0) return false;
 
-  const delta = getHorizontalWheelDelta(event, element.clientWidth);
+  const delta = getHorizontalWheelDelta(event, element.clientWidth, DEFAULT_LINE_SIZE_PX, options);
   if (delta === 0) return false;
 
   const nextScrollLeft = Math.min(maxScrollLeft, Math.max(0, element.scrollLeft + delta));
@@ -65,9 +71,12 @@ export function applyHorizontalWheelScroll(
  * this at the element so preventDefault is legal when we translate a wheel
  * gesture into horizontal scrolling.
  */
-export function installHorizontalWheelScroll(element: HTMLElement): () => void {
+export function installHorizontalWheelScroll(
+  element: HTMLElement,
+  options: HorizontalWheelOptions = {},
+): () => void {
   const onWheel = (event: WheelEvent) => {
-    applyHorizontalWheelScroll(element, event);
+    applyHorizontalWheelScroll(element, event, options);
   };
   element.addEventListener('wheel', onWheel, { passive: false });
   return () => element.removeEventListener('wheel', onWheel);
