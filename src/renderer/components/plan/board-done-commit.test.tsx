@@ -93,7 +93,10 @@ async function renderBoard(state: MissionBoardCard['state'], outcome?: CommitCoo
   }));
   (window as unknown as { api: unknown }).api = {
     plans: { finalizeItemDone, previewCandidate },
-    saveCard: { preview: vi.fn(async () => savePreview) },
+    saveCard: {
+      preview: vi.fn(async () => savePreview),
+      getInventory: vi.fn(async () => ({ bundles: [], quotaWeakening: null })),
+    },
     commitCoordinator: {
       mint: vi.fn(async () => ({
         ...savePreview,

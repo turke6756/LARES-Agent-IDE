@@ -78,7 +78,10 @@ async function renderAndCommit(
   };
   const mint = vi.fn(async () => mintOverride ?? tokenful);
   (window as unknown as { api: unknown }).api = {
-    saveCard: { preview: vi.fn(async () => preview) },
+    saveCard: {
+      preview: vi.fn(async () => preview),
+      getInventory: vi.fn(async () => ({ bundles: [], quotaWeakening: null })),
+    },
     commitCoordinator: { mint, commit },
   };
   container = document.createElement('div');

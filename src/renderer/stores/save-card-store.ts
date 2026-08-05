@@ -19,6 +19,7 @@ interface SaveCardStoreState {
     loadedAt?: number,
   ) => void;
   invalidateInventory: (workspaceId: string) => void;
+  refreshInventory: (workspaceId: string) => Promise<SaveCardInventoryResponse>;
   clearInventoryCache: () => void;
   // SC-WP-N2 — session-only checkpoint-expiry attention, keyed by workspace. Fed by
   // the `savecard:getAttention` read + `savecard:attentionChanged` push; drives the
@@ -54,6 +55,14 @@ export const useSaveCardStore = create<SaveCardStoreState>((set) => ({
         },
       };
     }),
+  refreshInventory: async (workspaceId) => {
+    // Invalidate before the read so every mounted Save surface observes stale
+    // state immediately; replace it only with the authoritative post-commit read.
+    useSaveCardStore.getState().invalidateInventory(workspaceId);
+    const inventory = await window.api.saveCard.getInventory({ workspaceId });
+    useSaveCardStore.getState().cacheInventory(workspaceId, inventory);
+    return inventory;
+  },
   clearInventoryCache: () => set({ inventoryByWorkspace: {} }),
   attentionByWorkspace: {},
   setAttention: (workspaceId, notice) =>

@@ -5,7 +5,6 @@ import type {
   CommitEligibility,
   PackageVerificationState,
 } from '../../../shared/commit-candidates';
-import { useSaveCardStore } from '../../stores/save-card-store';
 import { renderSaveRefusal } from './save-refusal-copy';
 
 // SC-WP-3H — Save-lens candidate preview pane.
@@ -38,6 +37,7 @@ export interface CandidatePreviewProps {
     response: SaveCardPreviewResponse,
     messageBody: string,
     acknowledgedUnattributedEntryIds: string[],
+    draft: CandidatePreviewDraft,
   ) => void | Promise<void>;
   /** SaveCard's decisive gesture lives outside this optional detail pane. Plan
    * keeps the original in-pane action by default. */
@@ -47,6 +47,10 @@ export interface CandidatePreviewProps {
 
 export interface CandidatePreviewDraft {
   response: SaveCardPreviewResponse;
+  previewedCandidateId: string | null;
+  componentTopologyDigest: string;
+  checkedUnattributedEntryIds: string[];
+  overlapAcknowledged: boolean;
   messageBody: string;
   userTrailers: string;
   canSave: boolean;
@@ -116,7 +120,6 @@ export default function CandidatePreview({
   const [userTrailers, setUserTrailers] = useState('');
   const [overlapAck, setOverlapAck] = useState(false);
   const [unattributedAcks, setUnattributedAcks] = useState<Set<string>>(new Set());
-  const invalidateInventory = useSaveCardStore((s) => s.invalidateInventory);
 
   const request: SaveCardPreviewRequest = useMemo(
     () => ({
@@ -167,15 +170,22 @@ export default function CandidatePreview({
     const unattributedSatisfied = response.unacknowledgedUnattributedEntryIds.every((id) =>
       unattributedAcks.has(id),
     );
+    const checkedUnattributedEntryIds = response.unacknowledgedUnattributedEntryIds.filter((id) =>
+      unattributedAcks.has(id),
+    );
     onDraftChange({
       response,
+      previewedCandidateId: response.isCandidate && 'candidateId' in response.candidate
+        ? response.candidate.candidateId
+        : null,
+      componentTopologyDigest: response.componentTopologyDigest,
+      checkedUnattributedEntryIds,
+      overlapAcknowledged: overlapAck,
       messageBody,
       userTrailers,
       canSave: response.isCandidate && eligible && overlapSatisfied && unattributedSatisfied && !reservedTrailer,
       reservedTrailer,
-      acknowledgedUnattributedEntryIds: response.unacknowledgedUnattributedEntryIds.filter((id) =>
-        unattributedAcks.has(id),
-      ),
+      acknowledgedUnattributedEntryIds: checkedUnattributedEntryIds,
     });
   }, [state, onDraftChange, messageBody, userTrailers, overlapAck, unattributedAcks]);
 
@@ -363,12 +373,28 @@ export default function CandidatePreview({
           disabled={!canSave}
           onClick={async () => {
             if (!canSave || !onCommit) return;
+            const checkedUnattributedEntryIds = response.unacknowledgedUnattributedEntryIds.filter((id) =>
+              unattributedAcks.has(id),
+            );
             await onCommit(
               response,
               messageBody,
-              response.unacknowledgedUnattributedEntryIds.filter((id) => unattributedAcks.has(id)),
+              checkedUnattributedEntryIds,
+              {
+                response,
+                previewedCandidateId: response.isCandidate && 'candidateId' in response.candidate
+                  ? response.candidate.candidateId
+                  : null,
+                componentTopologyDigest: response.componentTopologyDigest,
+                checkedUnattributedEntryIds,
+                overlapAcknowledged: overlapAck,
+                messageBody,
+                userTrailers,
+                canSave,
+                reservedTrailer,
+                acknowledgedUnattributedEntryIds: checkedUnattributedEntryIds,
+              },
             );
-            invalidateInventory(workspaceId);
           }}
         >
           {response.isCandidate ? `Save — commit ${candidate.members.length} file${candidate.members.length === 1 ? '' : 's'}` : 'Save'}

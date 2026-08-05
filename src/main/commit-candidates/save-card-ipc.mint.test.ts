@@ -129,7 +129,11 @@ function context(unattributed = false): CandidateBuildContext {
   };
 }
 
-function harness(ctx: CandidateBuildContext, composeLocks = new ComposeLockRegistry()) {
+function harness(
+  ctx: CandidateBuildContext,
+  composeLocks = new ComposeLockRegistry(),
+  telemetry?: (event: { stage: import('../../shared/commit-candidates').SaveRefusalStage; code: string }) => void,
+) {
   const service = new CommitCandidateService({ tokenStore: { composeLocks } } as CandidateServiceDeps);
   const routes: SaveCardMintRoutes = {
     mintCandidate: async (req) => ({
@@ -144,7 +148,7 @@ function harness(ctx: CandidateBuildContext, composeLocks = new ComposeLockRegis
     }),
   };
   const ipc = new FakeIpc();
-  registerSaveCardMintIpc(ipc, () => routes);
+  registerSaveCardMintIpc(ipc, () => routes, telemetry);
   return { ipc, service };
 }
 function request(ctx: CandidateBuildContext, unattributed = false): SaveCardMintRequest {
@@ -185,6 +189,12 @@ async function mint(ipc: FakeIpc, req: SaveCardMintRequest): Promise<SaveCardMin
   assert.equal(minted.candidateId, previewed.candidateId);
   assert.equal(response.componentTopologyDigest, request(ctx).acknowledgeTopologyDigest);
   assert.equal(service.resolveCandidateToken(minted.token!.tokenId)?.candidate.candidateId, minted.candidateId);
+
+  const telemetry: Array<{ stage: string; code: string }> = [];
+  const telemetryHarness = harness(ctx, new ComposeLockRegistry(), (event) => telemetry.push(event));
+  await mint(telemetryHarness.ipc, request(ctx));
+  assert.deepEqual(telemetry, [{ stage: 'mint', code: 'mint-token-issued' }]);
+  assert.deepEqual(Object.keys(telemetry[0]).sort(), ['code', 'stage']);
 
   const staleResponse = await mint(ipc, { ...request(ctx), acknowledgeTopologyDigest: 'stale' });
   const stale = candidate(staleResponse);

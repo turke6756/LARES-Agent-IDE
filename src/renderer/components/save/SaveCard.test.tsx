@@ -510,6 +510,39 @@ describe('SaveCard decisive save gesture', () => {
     expect(pin.checked).toBe(true);
   });
 
+  it('preserves successful grouped pins, names the failed package, and retries only the missing package', async () => {
+    const second = {
+      ...loudBundle,
+      bundleId: 'b-second',
+      label: 'Second package', labels: ['Second package'],
+      component: {
+        ...loudBundle.component!, componentId: 'c2', dirtyEntryIds: ['e2'],
+      },
+      members: [{ entry: entry('e2', 'src/second.ts'), protection: 'checkpoint-protected' as const }],
+    };
+    getInventory.mockResolvedValue(inv([loudBundle, second]));
+    let secondAttempts = 0;
+    markDone.mockImplementation(async ({ packageId }: { packageId: string }) => {
+      if (packageId === 'b-second' && secondAttempts++ === 0) throw new Error('pin unavailable');
+      return {
+        ...readyMarkDone(), packageId, finalizationId: `fin-${packageId}`,
+        pinnedSelection: {
+          selectedComponentIds: [packageId === 'b-loud' ? 'c1' : 'c2'],
+          selectedUnattributedEntryIds: [], frozenMemberCount: 1,
+        },
+      };
+    });
+    await render();
+    const pin = container.querySelector('[data-testid="save-bundle-pin"]')!;
+    await gestureClick(pin);
+    expect(container.querySelector('[data-testid="save-gesture-refusal"]')?.textContent).toContain('b-second');
+    expect(markDone.mock.calls.map(([request]) => request.packageId)).toEqual(['b-loud', 'b-second']);
+
+    await gestureClick(pin);
+    expect(markDone.mock.calls.map(([request]) => request.packageId)).toEqual(['b-loud', 'b-second', 'b-second']);
+    expect((pin as HTMLInputElement).checked).toBe(true);
+  });
+
   it('disables an unsaveable package inline and never calls markDone', async () => {
     getInventory.mockResolvedValue(inv([{
       ...loudBundle,

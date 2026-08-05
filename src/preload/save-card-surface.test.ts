@@ -17,6 +17,14 @@ const plan = fs.readFileSync(
   path.join(process.cwd(), 'src', 'renderer', 'components', 'plan', 'PlanSurfaceView.tsx'),
   'utf8',
 );
+const missionBoard = fs.readFileSync(
+  path.join(process.cwd(), 'src', 'renderer', 'components', 'plan', 'MissionBoard.tsx'),
+  'utf8',
+);
+const candidateSubmit = fs.readFileSync(
+  path.join(process.cwd(), 'src', 'renderer', 'components', 'save', 'candidate-submit.ts'),
+  'utf8',
+);
 
 for (const binding of [
   'getInventory: (req) => ipcRenderer.invoke(SAVECARD_CHANNELS.getInventory, req)',
@@ -29,9 +37,13 @@ for (const binding of [
 }
 
 assert.ok(saveCard.includes('window.api.saveCard.getInventory('));
-assert.ok(saveCard.includes('window.api.commitCoordinator.commit('));
-assert.ok(saveCard.includes('window.api.commitCoordinator.mint('));
-assert.ok(plan.includes('window.api.commitCoordinator.commit('));
-assert.ok(plan.includes('window.api.commitCoordinator.mint('));
+for (const surface of [saveCard, plan, missionBoard]) {
+  assert.ok(surface.includes('createCandidateSubmitter'));
+  assert.equal(surface.includes('window.api.commitCoordinator.commit('), false);
+  assert.equal(surface.includes('window.api.commitCoordinator.mint('), false);
+}
+assert.ok(candidateSubmit.includes('window.api.saveCard.preview('));
+assert.ok(candidateSubmit.includes('window.api.commitCoordinator.mint('));
+assert.ok(candidateSubmit.includes('window.api.commitCoordinator.commit('));
 
-console.log('  ✓ preload Save-card/finalize/coordinator bindings match renderer callers');
+console.log('  ✓ preload bindings match the one shared Save/Plan transaction helper');

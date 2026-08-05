@@ -211,6 +211,26 @@ test('candidateId must bind the token before 4D can consume it', async () => {
   assert.equal(coordinatorCalls, 0);
 });
 
+test('funnel telemetry contains stage and stable code only', async () => {
+  const ipc = new FakeIpc();
+  const telemetry: Array<{ stage: string; code: string }> = [];
+  registerCommitCoordinatorIpc(
+    ipc,
+    () => routesFixture(),
+    () => true,
+    (event) => telemetry.push(event),
+  );
+  await ipc.invoke(COMMIT_COORDINATOR_CHANNEL, {
+    candidateId: 'candidate-1', tokenId: 'secret-token', message: 'secret commit message',
+  });
+  assert.deepEqual(telemetry, [{ stage: 'reconciliation', code: 'save-verified' }]);
+  assert.deepEqual(Object.keys(telemetry[0]).sort(), ['code', 'stage']);
+  const serialized = JSON.stringify(telemetry);
+  assert.equal(serialized.includes('secret-token'), false);
+  assert.equal(serialized.includes('secret commit message'), false);
+  assert.equal(serialized.includes('C:\\repo'), false);
+});
+
 test('saved is withheld until the integrated 4D → 4G path completes', async () => {
   const ipc = new FakeIpc();
   const events: string[] = [];

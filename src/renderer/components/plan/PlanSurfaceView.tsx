@@ -1,8 +1,9 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import './planSurface.css';
 import CandidatePreview, { type CandidatePreviewSelection } from '../save/CandidatePreview';
 import CommitOutcome from '../save/CommitOutcome';
-import { coordinatorRefusal, mintRefusal, renderSaveRefusal } from '../save/save-refusal-copy';
+import { renderSaveRefusal } from '../save/save-refusal-copy';
+import { createCandidateSubmitter } from '../save/candidate-submit';
 import type { CommitCoordinatorConsumeResponse, PlanReviewProjection } from '../../../shared/types';
 import { useDashboardStore } from '../../stores/dashboard-store';
 import MissionBoard from './MissionBoard';
@@ -23,6 +24,8 @@ function PlanSurfaceView({
   const [viewMode, setViewMode] = useState<'review' | 'packages'>('review');
   const [reviewProjection, setReviewProjection] = useState<PlanReviewProjection | null>(null);
   const [reviewError, setReviewError] = useState<string | null>(null);
+  const submitterRef = useRef<ReturnType<typeof createCandidateSubmitter> | null>(null);
+  if (!submitterRef.current) submitterRef.current = createCandidateSubmitter();
   const activePlanId = useDashboardStore((state) => {
     const activeTab = state.openTabs.find((tab) => tab.id === state.activeTabId);
     return activeTab?.kind === 'plan' ? activeTab.planId : null;
@@ -61,36 +64,20 @@ function PlanSurfaceView({
             workspaceId={workspaceId}
             selection={candidateSelection}
             title="Save this plan's work"
-            onCommit={async (response, messageBody, acknowledgedUnattributedEntryIds) => {
-              let stage: 'mint' | 'token-consume' = 'mint';
-              try {
-                const minted = await window.api.commitCoordinator.mint({
+            onCommit={async (_response, _messageBody, _acknowledgedIds, draft) => {
+              const result = await submitterRef.current!.submit({
                 workspaceId,
-                ...candidateSelection,
-                acknowledgeTopologyDigest: response.componentTopologyDigest,
-                acknowledgeUnattributedEntryIds: acknowledgedUnattributedEntryIds,
+                selection: candidateSelection,
+                draft,
               });
-                const typedMintRefusal = mintRefusal(minted);
-                if (typedMintRefusal) {
-                  setCommitRefusal(renderSaveRefusal(typedMintRefusal));
-                  return;
-                }
-                if (!minted.isCandidate || !minted.candidate.eligibility.eligible || !minted.candidate.token) {
-                  setCommitRefusal('Unknown mint-stage refusal: the server omitted its typed refusal.');
-                  return;
-                }
-                stage = 'token-consume';
-                const result = await window.api.commitCoordinator.commit({
-                candidateId: minted.candidate.candidateId,
-                tokenId: minted.candidate.token.tokenId,
-                message: messageBody,
-              });
-                const typedCoordinatorRefusal = coordinatorRefusal(result);
-                setCommitRefusal(typedCoordinatorRefusal ? renderSaveRefusal(typedCoordinatorRefusal) : null);
-                setCommitOutcome(result);
-              } catch (error) {
-                const detail = error instanceof Error ? error.message : String(error);
-                setCommitRefusal(`${stage === 'mint' ? 'Mint' : 'Token-consume'} stage failed unexpectedly: ${detail}`);
+              if (result.kind === 'committed') {
+                setCommitRefusal(null);
+                setCommitOutcome(result.response);
+              } else if (result.kind === 'refused') {
+                setCommitRefusal(renderSaveRefusal(result.refusal));
+                if (result.response) setCommitOutcome(result.response);
+              } else {
+                setCommitRefusal(result.message);
               }
             }}
           />

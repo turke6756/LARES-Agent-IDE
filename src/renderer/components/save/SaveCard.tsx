@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useReducer, useRef, useState } from 'react';
 import { useDashboardStore } from '../../stores/dashboard-store';
 import {
   isSaveCardInventoryFresh,
@@ -6,13 +6,12 @@ import {
   useSaveCardAttention,
 } from '../../stores/save-card-store';
 import type {
-  CommitCoordinatorConsumeResponse,
   SaveCardFleetAdhocMarkDoneResponse,
   SaveCardFleetAdhocMarkDoneSuccess,
   SaveCardInventoryResponse,
   SaveCardPreviewResponse,
 } from '../../../shared/types';
-import type { SaveCardQuotaWeakening, SaveRefusalStage } from '../../../shared/commit-candidates';
+import type { SaveCardQuotaWeakening, SaveRefusal } from '../../../shared/commit-candidates';
 import SaveBundle, { isQuietlySaved, type WorkBundleDto } from './SaveBundle';
 import CandidatePreview, {
   type CandidatePreviewDraft,
@@ -21,7 +20,9 @@ import CandidatePreview, {
 import CommitOutcome from './CommitOutcome';
 import QuotaWeakeningBanner from './QuotaWeakeningBanner';
 import { groupExpiryEdgesByBundle, formatExpiresIn } from './save-card-expiry';
-import { coordinatorRefusal, mintRefusal, renderSaveRefusal } from './save-refusal-copy';
+import { renderSaveRefusal } from './save-refusal-copy';
+import { createCandidateSubmitter } from './candidate-submit';
+import { initialSaveGestureState, saveGestureReducer } from './save-gesture-state';
 import './save-card.css';
 
 // SC-WP-3H — derive the explicit WP-3G selection for a displayed group of
@@ -59,11 +60,6 @@ function selectionForPins(pins: SaveCardFleetAdhocMarkDoneSuccess[]): CandidateP
  * so the Stage ① read-only bundle card stays untouched. The pane itself decides
  * whether a one-click save is offered (never for mismatch/degraded/unfinalized).
  */
-function joinMessageAndUserTrailers(messageBody: string, userTrailers: string): string {
-  const trailers = userTrailers.trim();
-  return trailers ? `${messageBody.trimEnd()}\n\n${trailers}` : messageBody;
-}
-
 function previewMismatchPaths(response: SaveCardPreviewResponse): string[] {
   const blocking = [
     ...response.selectionDrift.missing,
@@ -81,14 +77,13 @@ function PackageSaveGesture({
   workspaceId: string;
 }) {
   const [detailsOpen, setDetailsOpen] = useState(false);
-  const [pinning, setPinning] = useState(false);
-  const [pins, setPins] = useState<SaveCardFleetAdhocMarkDoneSuccess[]>([]);
-  const [draft, setDraft] = useState<CandidatePreviewDraft | null>(null);
-  const [submitting, setSubmitting] = useState(false);
-  const [outcome, setOutcome] = useState<CommitCoordinatorConsumeResponse | null>(null);
-  const [gestureError, setGestureError] = useState<string | null>(null);
-  const [movedPaths, setMovedPaths] = useState<string[]>([]);
-  const submittingRef = useRef(false);
+  const [gesture, dispatch] = useReducer(saveGestureReducer, initialSaveGestureState);
+  const submitterRef = useRef<ReturnType<typeof createCandidateSubmitter> | null>(null);
+  if (!submitterRef.current) submitterRef.current = createCandidateSubmitter();
+  const updateDraft = useCallback((nextDraft: CandidatePreviewDraft) => {
+    dispatch({ type: 'draft-updated', draft: nextDraft });
+  }, []);
+  const { pins, draft } = gesture;
   const finalizationIds = pins
     .filter((pin) => pin.boundaryStatus === 'ready')
     .map((pin) => pin.finalizationId);
@@ -101,142 +96,127 @@ function PackageSaveGesture({
     selection.selectedComponentIds.length > 0 || selection.selectedUnattributedEntryIds.length > 0;
   if (!hasSelectable) return null;
 
-  const pinPackage = async () => {
-    if (pinning || submittingRef.current) return;
+  const pinPackage = async (replaceExisting = false) => {
+    if (gesture.status === 'pinning' || gesture.status === 'reviewing'
+      || gesture.status === 'minting' || gesture.status === 'committing') return;
     const unsaveable = group.find((bundle) => bundle.saveability?.saveable === false);
     if (unsaveable?.saveability?.saveable === false) {
-      setGestureError(unsaveable.saveability.refusal
-        ? renderSaveRefusal(unsaveable.saveability.refusal)
-        : `Saveability stage refused: No git repository — cannot pin/commit from workspace '${unsaveable.saveability.workspaceTitle}'.`);
+      dispatch({
+        type: 'refused',
+        refusal: unsaveable.saveability.refusal ?? {
+          stage: 'saveability',
+          code: 'save-card-no-repository',
+          message: `Saveability stage refused: No git repository — cannot pin/commit from workspace '${unsaveable.saveability.workspaceTitle}'.`,
+        },
+      });
       return;
     }
-    setPinning(true);
-    setGestureError(null);
-    setOutcome(null);
-    setMovedPaths([]);
-    try {
-      const responses: SaveCardFleetAdhocMarkDoneResponse[] = await Promise.all(
-        group.map((bundle) =>
-          window.api.saveCard.markDone({ packageId: bundle.bundleId, targetWorkspaceId: workspaceId }),
-        ),
-      );
-      const refusal = responses.find(
-        (response): response is Extract<SaveCardFleetAdhocMarkDoneResponse, { ok: false }> =>
-          'ok' in response && response.ok === false,
-      );
-      if (refusal) {
-        setPins([]);
-        setGestureError('stage' in refusal
-          ? renderSaveRefusal(refusal)
-          : `Boundary-capture stage refused: ${refusal.message}`);
+    const retained = replaceExisting ? [] : pins;
+    const pinnedPackages = new Set(retained.map((pin) => pin.packageId));
+    const missing = group.filter((bundle) => !pinnedPackages.has(bundle.bundleId));
+    if (missing.length === 0) return;
+    dispatch({ type: 'pin-started' });
+    const settled = await Promise.allSettled(missing.map((bundle) =>
+      window.api.saveCard.markDone({ packageId: bundle.bundleId, targetWorkspaceId: workspaceId }),
+    ));
+    const nextPins = [...retained];
+    const failures: Array<{ packageId: string; refusal: SaveRefusal }> = [];
+    settled.forEach((result, index) => {
+      const packageId = missing[index].bundleId;
+      if (result.status === 'rejected') {
+        failures.push({
+          packageId,
+          refusal: {
+            stage: 'boundary-capture', code: 'boundary-capture-failed',
+            message: `Boundary-capture stage failed for package ${packageId}: ${errorMessage(result.reason)}`,
+            paths: [packageId],
+          },
+        });
         return;
       }
-      const successful = responses as SaveCardFleetAdhocMarkDoneSuccess[];
-      setPins(successful);
-      setDraft(null);
-      if (successful.some((response) => response.boundaryStatus !== 'ready')) {
-        const freezeRefusal = successful.find((response) => response.refusal)?.refusal;
-        setGestureError(freezeRefusal
-          ? renderSaveRefusal(freezeRefusal)
-          : 'Freeze stage refused because finalization did not produce a ready boundary.');
+      const response: SaveCardFleetAdhocMarkDoneResponse = result.value;
+      if ('ok' in response && response.ok === false) {
+        failures.push({
+          packageId,
+          refusal: {
+            stage: response.stage ?? 'boundary-capture', code: response.code,
+            message: `${response.message} (package ${packageId})`, paths: [packageId],
+          },
+        });
+        return;
       }
-    } catch (err) {
-      setGestureError(`Boundary-capture stage failed unexpectedly: ${errorMessage(err)}`);
-    } finally {
-      setPinning(false);
+      nextPins.push(response);
+      if (response.boundaryStatus !== 'ready') {
+        failures.push({
+          packageId,
+          refusal: response.refusal ?? {
+            stage: 'freeze', code: 'freeze-boundary-unavailable',
+            message: `Freeze stage refused for package ${packageId} because its boundary is not ready.`,
+            paths: [packageId],
+          },
+        });
+      }
+    });
+    const uniquePins = [...new Map(nextPins.map((pin) => [pin.packageId, pin])).values()];
+    const complete = uniquePins.length === group.length
+      && uniquePins.every((pin) => pin.boundaryStatus === 'ready');
+    dispatch({ type: 'pins-updated', pins: uniquePins, complete });
+    if (failures.length > 0) {
+      const failed = failures[0];
+      dispatch({
+        type: 'refused',
+        refusal: {
+          ...failed.refusal,
+          message: failures.length === 1
+            ? failed.refusal.message
+            : `${failed.refusal.message} Failed packages: ${failures.map((item) => item.packageId).join(', ')}.`,
+          paths: failures.map((item) => item.packageId),
+        },
+      });
     }
   };
 
   const submit = async () => {
-    if (!pinned || submittingRef.current) return;
-    submittingRef.current = true;
-    setSubmitting(true);
-    setGestureError(null);
-    setOutcome(null);
-    setMovedPaths([]);
-    let activeStage: SaveRefusalStage = 'preview-verify';
-    try {
-      const response = await window.api.saveCard.preview({
-        workspaceId,
-        ...selection,
-      });
-      activeStage = 'mint';
-      const minted = await window.api.commitCoordinator.mint({
-        workspaceId,
-        ...selection,
-        acknowledgeTopologyDigest: response.requiresOverlapAck
-          ? (draft?.response.componentTopologyDigest ?? null)
-          : response.componentTopologyDigest,
-        acknowledgeUnattributedEntryIds: draft?.acknowledgedUnattributedEntryIds ?? [],
-      });
-      const paths = previewMismatchPaths(minted);
-      const reason = minted.candidate.eligibility.eligible === false
-        ? minted.candidate.eligibility.reason
-        : null;
-      if (paths.length > 0) {
-        setMovedPaths(paths);
-        setGestureError(
-          `${paths.length} of ${minted.pinnedSelection.frozenMemberCount} pinned files changed — re-pin to save current bytes.`,
-        );
-        setDetailsOpen(true);
-        return;
+    if (!pinned) return;
+    const result = await submitterRef.current!.submit({
+      workspaceId, selection, draft,
+      onStage: (stage) => dispatch({ type: 'submit-stage', stage }),
+    });
+    if (result.kind === 'committed') {
+      dispatch({ type: 'committed', outcome: result.response });
+      setDetailsOpen(false);
+    } else if (result.kind === 'uncertain') {
+      dispatch({ type: 'uncertain', ...result });
+    } else {
+      let refusal = result.refusal;
+      if (result.mint) {
+        const paths = previewMismatchPaths(result.mint);
+        if (paths.length > 0) {
+          refusal = {
+            ...refusal, paths,
+            message: `${paths.length} of ${result.mint.pinnedSelection.frozenMemberCount} pinned files changed — re-pin to save current bytes.`,
+          };
+        }
       }
-      const typedMintRefusal = mintRefusal(minted);
-      if (typedMintRefusal) {
-        setGestureError(renderSaveRefusal(typedMintRefusal));
-        setDetailsOpen(true);
-        return;
-      }
-      if (!minted.isCandidate) {
-        setGestureError('Unknown mint-stage refusal: the server returned a preview instead of a candidate.');
-        setDetailsOpen(true);
-        return;
-      }
-      if (!minted.candidate.eligibility.eligible) {
-        setGestureError(`Unknown mint-stage refusal: ${reason ?? 'candidate ineligible'}.`);
-        setDetailsOpen(true);
-        return;
-      }
-      if (!minted.candidate.token) {
-        setGestureError('Unknown mint-stage refusal: an eligible candidate had no token.');
-        setDetailsOpen(true);
-        return;
-      }
-      if (draft?.reservedTrailer) {
-        setGestureError('A user trailer uses the reserved Lares- namespace. Remove it before submitting.');
-        setDetailsOpen(true);
-        return;
-      }
-      activeStage = 'token-consume';
-      const result = await window.api.commitCoordinator.commit({
-        candidateId: minted.candidate.candidateId,
-        tokenId: minted.candidate.token.tokenId,
-        message: joinMessageAndUserTrailers(
-          draft?.messageBody ?? response.defaultMessageBody,
-          draft?.userTrailers ?? '',
-        ),
-      });
-      setOutcome(result);
-      if (result.kind !== 'saved') {
-        setGestureError(renderSaveRefusal(coordinatorRefusal(result)!));
-      }
-    } catch (err) {
-      const label = activeStage === 'preview-verify'
-        ? 'Preview verification'
-        : activeStage === 'mint' ? 'Mint' : 'Token-consume';
-      setGestureError(`${label} stage failed unexpectedly: ${errorMessage(err)}`);
-    } finally {
-      submittingRef.current = false;
-      setSubmitting(false);
+      dispatch({ type: 'refused', refusal, outcome: result.response });
+      setDetailsOpen(true);
     }
   };
+  const submitting = gesture.status === 'reviewing' || gesture.status === 'minting' || gesture.status === 'committing';
+  const gestureError = gesture.status === 'refused'
+    ? renderSaveRefusal(gesture.refusal)
+    : gesture.status === 'uncertain' ? gesture.message : null;
+  const movedPaths = gesture.status === 'refused' ? gesture.refusal.paths ?? [] : [];
+  const outcome = gesture.status === 'committed'
+    ? gesture.outcome
+    : gesture.status === 'refused' ? gesture.outcome ?? null : null;
   return (
     <div className="sc-save-launcher">
       <SaveBundle
         bundle={group[0]}
         bundles={group}
         pinned={pinned}
-        pinning={pinning}
+        pinning={gesture.status === 'pinning'}
         onPin={() => { void pinPackage(); }}
       />
       <button
@@ -257,7 +237,7 @@ function PackageSaveGesture({
       >
         {detailsOpen ? 'Hide preview & message' : 'Preview & message'}
       </button>
-      {pinning && <div className="sc-save-note" role="status">Pinning reviewed bytes…</div>}
+      {gesture.status === 'pinning' && <div className="sc-save-note" role="status">Pinning reviewed bytes…</div>}
       {gestureError && (
         <div className="sc-save-refusal" role="alert" data-testid="save-gesture-refusal">
           <b>Save refused safely.</b> {gestureError}
@@ -277,7 +257,7 @@ function PackageSaveGesture({
           workspaceId={workspaceId}
           selection={selection}
           showCommitAction={false}
-          onDraftChange={setDraft}
+          onDraftChange={updateDraft}
           onClose={() => setDetailsOpen(false)}
         />
       )}
@@ -285,18 +265,20 @@ function PackageSaveGesture({
         <CommitOutcome
           response={outcome}
           onRepreview={() => {
-            setOutcome(null);
-            setGestureError(null);
-            setDetailsOpen(true);
+            if (gesture.status === 'committed') dispatch({ type: 'acknowledged' });
+            else {
+              dispatch({ type: 'submit-stage', stage: 'reviewing' });
+              setDetailsOpen(true);
+            }
           }}
         />
       )}
-      {outcome && outcome.kind === 'outcome' && outcome.outcome.status === 'aborted-stale' && (
+      {gesture.status === 'refused' && (
         <button
           type="button"
           className="ui-btn ui-btn-outline px-3 py-1 text-[12.5px] sc-repin"
           data-testid="save-bundle-repin"
-          onClick={() => { void pinPackage(); }}
+          onClick={() => { void pinPackage(true); }}
         >
           Re-pin current bytes
         </button>

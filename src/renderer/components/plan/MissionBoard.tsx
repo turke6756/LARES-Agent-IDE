@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type {
   CheckpointTurnSummary,
   CommitCoordinatorConsumeResponse,
@@ -14,7 +14,8 @@ import FileHistoryView from '../checkpoints/FileHistoryView';
 import RestoreDialog from '../checkpoints/RestoreDialog';
 import CandidatePreview, { type CandidatePreviewSelection } from '../save/CandidatePreview';
 import CommitOutcome from '../save/CommitOutcome';
-import { coordinatorRefusal, mintRefusal, renderSaveRefusal } from '../save/save-refusal-copy';
+import { renderSaveRefusal } from '../save/save-refusal-copy';
+import { createCandidateSubmitter } from '../save/candidate-submit';
 import WorkPackageCard, { type WorkPackageFileSelection } from './WorkPackageCard';
 import './missionBoard.css';
 
@@ -99,6 +100,8 @@ export default function MissionBoard({
   const [commitSelection, setCommitSelection] = useState<CommitSelection | null>(null);
   const [commitOutcome, setCommitOutcome] = useState<CommitCoordinatorConsumeResponse | null>(null);
   const [commitRefusal, setCommitRefusal] = useState<string | null>(null);
+  const submitterRef = useRef<ReturnType<typeof createCandidateSubmitter> | null>(null);
+  if (!submitterRef.current) submitterRef.current = createCandidateSubmitter();
 
   const cardRevisionKey = useMemo(
     () => cards.map((card) => `${card.packageId}:${card.revision}:${card.state}`).join('|'),
@@ -226,36 +229,20 @@ export default function MissionBoard({
             selection={commitSelection.selection}
             title={`Commit ${commitSelection.packageId}`}
             onClose={() => setCommitSelection(null)}
-            onCommit={async (response, messageBody, acknowledgedUnattributedEntryIds) => {
-              let stage: 'mint' | 'token-consume' = 'mint';
-              try {
-                const minted = await window.api.commitCoordinator.mint({
+            onCommit={async (_response, _messageBody, _acknowledgedIds, draft) => {
+              const result = await submitterRef.current!.submit({
                 workspaceId: commitSelection.workspaceId,
-                ...commitSelection.selection,
-                acknowledgeTopologyDigest: response.componentTopologyDigest,
-                acknowledgeUnattributedEntryIds: acknowledgedUnattributedEntryIds,
+                selection: commitSelection.selection,
+                draft,
               });
-                const typedMintRefusal = mintRefusal(minted);
-                if (typedMintRefusal) {
-                  setCommitRefusal(renderSaveRefusal(typedMintRefusal));
-                  return;
-                }
-                if (!minted.isCandidate || !minted.candidate.eligibility.eligible || !minted.candidate.token) {
-                  setCommitRefusal('Unknown mint-stage refusal: the server omitted its typed refusal.');
-                  return;
-                }
-                stage = 'token-consume';
-                const result = await window.api.commitCoordinator.commit({
-                candidateId: minted.candidate.candidateId,
-                tokenId: minted.candidate.token.tokenId,
-                message: messageBody,
-              });
-                const typedCoordinatorRefusal = coordinatorRefusal(result);
-                setCommitRefusal(typedCoordinatorRefusal ? renderSaveRefusal(typedCoordinatorRefusal) : null);
-                setCommitOutcome(result);
-              } catch (error) {
-                const detail = error instanceof Error ? error.message : String(error);
-                setCommitRefusal(`${stage === 'mint' ? 'Mint' : 'Token-consume'} stage failed unexpectedly: ${detail}`);
+              if (result.kind === 'committed') {
+                setCommitRefusal(null);
+                setCommitOutcome(result.response);
+              } else if (result.kind === 'refused') {
+                setCommitRefusal(renderSaveRefusal(result.refusal));
+                if (result.response) setCommitOutcome(result.response);
+              } else {
+                setCommitRefusal(result.message);
               }
             }}
           />

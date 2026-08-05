@@ -274,6 +274,9 @@ describe('CandidatePreview', () => {
 
     await act(async () => { (q('candidate-preview-save') as HTMLButtonElement).click(); });
     expect(onCommit).toHaveBeenCalledTimes(1);
-    expect(useSaveCardStore.getState().inventoryByWorkspace['ws-1'].loadedAt).toBe(0);
+    // CandidatePreview is review UI only. The shared preview→mint→consume
+    // transaction owns invalidation plus the mandatory fresh read after a
+    // verified save, so merely invoking an injected callback does not stale it.
+    expect(useSaveCardStore.getState().inventoryByWorkspace['ws-1'].loadedAt).toBeGreaterThan(0);
   });
 });

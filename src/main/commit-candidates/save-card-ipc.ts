@@ -73,6 +73,14 @@ export interface IpcLike {
   handle(channel: string, listener: (event: unknown, ...args: unknown[]) => unknown): void;
 }
 
+export type SaveFunnelTelemetry = (event: { stage: SaveRefusalStage; code: string }) => void;
+
+const logSaveFunnelStage: SaveFunnelTelemetry = ({ stage, code }) => {
+  // This record is intentionally data-free. Never add request fields, paths,
+  // messages, candidate/token ids, exception text, or repository locations.
+  console.info('[save-funnel]', { stage, code });
+};
+
 class SaveCardIpcError extends Error {
   constructor(message: string, readonly code: string) {
     super(message);
@@ -287,6 +295,7 @@ function toMarkDoneResponse(
 export function registerSaveCardFinalizeIpc(
   ipc: IpcLike,
   getRoutes: () => SaveCardFinalizeRoutes | null,
+  telemetry: SaveFunnelTelemetry = logSaveFunnelStage,
 ): void {
   ipc.handle(SAVECARD_FINALIZE_CHANNEL, async (_event, raw: unknown) => {
     const routes = requireFinalizeRoutes(getRoutes());
@@ -296,7 +305,7 @@ export function registerSaveCardFinalizeIpc(
       context = await routes.resolveBoundary(request);
     } catch (error) {
       if (error instanceof SaveCardFinalizeRefusalError) {
-        return {
+        const response = {
           ok: false,
           code: error.code,
           message: error.message,
@@ -305,6 +314,8 @@ export function registerSaveCardFinalizeIpc(
           workspaceId: error.workspaceId,
           workspaceTitle: error.workspaceTitle,
         } satisfies SaveCardFleetAdhocMarkDoneResponse;
+        telemetry({ stage: error.stage, code: error.code });
+        return response;
       }
       throw error;
     }
@@ -316,8 +327,11 @@ export function registerSaveCardFinalizeIpc(
     };
     const result = await finalizePackage(finalizeRequest, routes.finalizeDeps);
     const response = toMarkDoneResponse(result.finalization, result.outcome, context.pinnedSelection);
-    if (result.outcome !== 'boundary-unavailable') return response;
-    return {
+    if (result.outcome !== 'boundary-unavailable') {
+      telemetry({ stage: 'freeze', code: 'freeze-ready' });
+      return response;
+    }
+    const refused = {
       ...response,
       refusal: {
         stage: 'freeze',
@@ -325,7 +339,9 @@ export function registerSaveCardFinalizeIpc(
         message: 'Freeze stage refused because the captured boundary could not be made durable.',
         paths: context.members.map((member) => member.path.pathBytesBase64),
       },
-    };
+    } satisfies SaveCardFleetAdhocMarkDoneResponse;
+    telemetry({ stage: 'freeze', code: 'freeze-boundary-unavailable' });
+    return refused;
   });
 }
 
@@ -608,6 +624,7 @@ function candidateRefusal(
 export function registerSaveCardPreviewIpc(
   ipc: IpcLike,
   getRoutes: () => SaveCardPreviewRoutes | null,
+  telemetry: SaveFunnelTelemetry = logSaveFunnelStage,
 ): void {
   ipc.handle(SAVECARD_PREVIEW_CHANNEL, async (_event, raw: unknown) => {
     const routes = requirePreviewRoutes(getRoutes());
@@ -619,13 +636,18 @@ export function registerSaveCardPreviewIpc(
       finalizationIds: request.finalizationIds,
     };
     const candidate = buildCandidate(selection, context);
-    return toPreviewResponse(request, candidate, context);
+    const response = toPreviewResponse(request, candidate, context);
+    telemetry(response.refusal
+      ? { stage: response.refusal.stage, code: response.refusal.code }
+      : { stage: 'preview-verify', code: 'preview-eligible' });
+    return response;
   });
 }
 
 export function registerSaveCardMintIpc(
   ipc: IpcLike,
   getRoutes: () => SaveCardMintRoutes | null,
+  telemetry: SaveFunnelTelemetry = logSaveFunnelStage,
 ): void {
   ipc.handle(COMMIT_CANDIDATE_MINT_CHANNEL, async (_event, raw: unknown) => {
     const request = requireMintRequest(raw);
@@ -637,6 +659,10 @@ export function registerSaveCardMintIpc(
       );
     }
     const { candidate, context } = await routes.mintCandidate(request);
-    return toPreviewResponse(request, candidate, context) satisfies SaveCardMintResponse;
+    const response = toPreviewResponse(request, candidate, context) satisfies SaveCardMintResponse;
+    telemetry(response.refusal
+      ? { stage: response.refusal.stage, code: response.refusal.code }
+      : { stage: 'mint', code: 'mint-token-issued' });
+    return response;
   });
 }

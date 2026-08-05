@@ -14,7 +14,7 @@ import {
   type CommitCoordinatorConsumeResponse,
 } from '../../shared/types';
 import type { CandidateTokenSnapshot } from './candidate-service';
-import type { IpcLike } from './save-card-ipc';
+import type { IpcLike, SaveFunnelTelemetry } from './save-card-ipc';
 import type {
   CommitCoordinator,
   CommitCoordinatorResult,
@@ -109,6 +109,9 @@ export function registerCommitCoordinatorIpc(
   ipc: IpcLike,
   getRoutes: () => CommitCoordinatorRoutes | null,
   isCoordinatorEnabled: () => boolean = () => SAVE_CARD_COMMIT_COORDINATOR_ENABLED,
+  telemetry: SaveFunnelTelemetry = ({ stage, code }) => {
+    console.info('[save-funnel]', { stage, code });
+  },
 ): void {
   ipc.handle(COMMIT_COORDINATOR_CHANNEL, async (_event, raw: unknown) => {
     if (!isCoordinatorEnabled()) {
@@ -122,20 +125,28 @@ export function registerCommitCoordinatorIpc(
     const routes = requireRoutes(getRoutes());
     const snapshot = routes.resolveCandidateToken(request.tokenId);
     if (!snapshot || snapshot.candidate.candidateId !== request.candidateId) {
-      return passthroughResult({ kind: 'token-unresolved' });
+      const response = passthroughResult({ kind: 'token-unresolved' });
+      telemetry({ stage: 'token-consume', code: 'token-unresolved-or-expired' });
+      return response;
     }
 
     const coordinated = await routes.coordinator.commit({
       tokenId: request.tokenId,
       message: request.message,
     });
-    if (coordinated.kind !== 'outcome') return passthroughResult(coordinated);
+    if (coordinated.kind !== 'outcome') {
+      const response = passthroughResult(coordinated);
+      if ('refusal' in response && response.refusal) {
+        telemetry({ stage: response.refusal.stage, code: response.refusal.code });
+      }
+      return response;
+    }
     if (coordinated.outcome.status !== 'committed') {
       const stale = coordinated.outcome.status === 'aborted-stale';
       const detail = 'reason' in coordinated.outcome
         ? coordinated.outcome.reason
         : coordinated.outcome.status;
-      return {
+      const response = {
         kind: 'outcome',
         outcome: coordinated.outcome,
         refusal: {
@@ -149,6 +160,8 @@ export function registerCommitCoordinatorIpc(
             : {}),
         },
       } satisfies CommitCoordinatorConsumeResponse;
+      telemetry({ stage: response.refusal.stage, code: response.refusal.code });
+      return response;
     }
 
     const repository = routes.locateRepository(snapshot);
@@ -159,7 +172,7 @@ export function registerCommitCoordinatorIpc(
       ...repository,
     });
     if (!reconciled.ok) {
-      return {
+      const response = {
         kind: 'reconciliation-error',
         outcome: coordinated.outcome,
         error: reconciled.error,
@@ -169,11 +182,15 @@ export function registerCommitCoordinatorIpc(
           message: `Reconciliation stage refused: ${reconciled.error.message}`,
         },
       } satisfies CommitCoordinatorConsumeResponse;
+      telemetry({ stage: response.refusal.stage, code: response.refusal.code });
+      return response;
     }
-    return {
+    const response = {
       kind: 'saved',
       outcome: coordinated.outcome,
       finalizations: reconciled.finalizations,
     } satisfies CommitCoordinatorConsumeResponse;
+    telemetry({ stage: 'reconciliation', code: 'save-verified' });
+    return response;
   });
 }
