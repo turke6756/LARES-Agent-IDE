@@ -1,19 +1,18 @@
-// B2 Task D — plans-watcher tests (P1-04) + F-C onPlanSettled fire matrix.
+// B2 Task D — plans-watcher tests (P1-04) + WP-P8C reparse-route removal.
 //
 // Two layers:
 //   1. The PURE reducer `reconcilePlanListing` — fed synthesized listings, no
 //      real fs / timing (D6): create, update, rename (dev/ino), soft-delete on
 //      grace expiry, and NO false rebind when identity doesn't match.
-//   2. The onPlanSettled FIRE MATRIX (F-C): drives `reconcileWorkspace` with the
-//      `./database` + `./file-reader` modules stubbed and internal state seeded,
-//      asserting the callback fires on boot/created/revived/changed/renamed/
-//      adopted and NEVER on soft-delete.
+//   2. `reconcileWorkspace` with the `./database` + `./file-reader` modules
+//      stubbed, proving row registration remains while no post-settle HTML
+//      reparse callback surface exists.
 //
 //   npm run build:main
 //   node dist/main/main/plans-watcher.test.js
 
 import assert from 'node:assert/strict';
-import type { PlanFileEntry, PlanFileSnapshot, PlanChange } from './plans-watcher';
+import type { PlanFileEntry, PlanFileSnapshot } from './plans-watcher';
 import { reconcilePlanListing, inferFormat, PlansWatcher } from './plans-watcher';
 
 interface TestCase { name: string; run(): Promise<void> | void; }
@@ -134,7 +133,7 @@ test('reducer: delete + UNRELATED create (no identity match) → soft-delete + c
   assert.deepEqual(kinds, ['create', 'soft-delete']);
 });
 
-// ── 2. onPlanSettled FIRE MATRIX (F-C) ─────────────────────────────────────────
+// ── 2. row reconciliation without the retired HTML reparse route ───────────────
 
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const db = require('./database') as Record<string, any>;
@@ -157,11 +156,9 @@ function de(name: string, over: Record<string, any> = {}): Record<string, any> {
 
 /** Build a watcher with a pre-seeded workspace state so reconcileWorkspace runs
  *  without subscribing / touching real fs. `listing` drives the stubbed lister. */
-function makeWatcher(listing: Record<string, any>[], onSettled: Array<[string, PlanChange]>): PlansWatcher {
+function makeWatcher(listing: Record<string, any>[]): PlansWatcher {
   fileReader.listDirectoryEntriesAsync = async () => listing;
-  const w = new PlansWatcher({
-    onPlanSettled: (plan, change) => { onSettled.push([plan.id, change]); },
-  });
+  const w = new PlansWatcher();
   (w as any).states.set(WS.id, {
     ws: WS, plansDir: '/home/x/ws/plans', snapshots: new Map(), pending: new Map(),
     unsubscribe: () => {}, debounce: null,
@@ -177,67 +174,21 @@ function installDbStubs(): void {
   // derivePlanSlug stays real (pure).
 }
 
-test('fire matrix: BOOT scan fires "boot" for each discovered plan', async () => {
+test('row reconciliation registers a discovered plan without a post-settle callback', async () => {
   installDbStubs();
-  const fired: Array<[string, PlanChange]> = [];
-  const w = makeWatcher([de('a.md')], fired);
-  await (w as any).reconcileWorkspace(WS, true);
-  assert.deepEqual(fired, [['p-new', 'boot']]);
-});
-
-test('fire matrix: a new plan on a live reconcile fires "created"', async () => {
-  installDbStubs();
-  const fired: Array<[string, PlanChange]> = [];
-  const w = makeWatcher([de('a.md')], fired);
+  let created = 0;
+  db.createOrRevivePlan = (input: any) => { created++; return planRow({ id: 'p-new', path: input.path }); };
+  const w = makeWatcher([de('a.md')]);
   await (w as any).reconcileWorkspace(WS, false);
-  assert.deepEqual(fired, [['p-new', 'created']]);
+  assert.equal(created, 1);
+  assert.equal('fireSettled' in (w as any), false, 'retired HTML reparse trigger is absent');
 });
 
-test('fire matrix: reviving a soft-deleted path fires "revived"', async () => {
-  installDbStubs();
-  db.getPlanByWorkspacePath = () => planRow({ deletedAt: 't-del' });  // tombstone present
-  const fired: Array<[string, PlanChange]> = [];
-  const w = makeWatcher([de('a.md')], fired);
-  await (w as any).reconcileWorkspace(WS, false);
-  assert.deepEqual(fired, [['p-new', 'revived']]);
-});
-
-test('fire matrix: an mtime/size change fires "changed"', async () => {
-  installDbStubs();
-  const fired: Array<[string, PlanChange]> = [];
-  const w = makeWatcher([de('a.md')], fired);
-  // Seed a snapshot so the file is "known", then change its mtime.
-  (w as any).states.get(WS.id).snapshots.set('plans/a.md',
-    { relPath: 'plans/a.md', format: 'md', sizeBytes: 10, mtimeMs: 100, planId: 'p1' });
-  fileReader.listDirectoryEntriesAsync = async () => [de('a.md', { mtimeMs: 999, size: 40 })];
-  await (w as any).reconcileWorkspace(WS, false);
-  assert.deepEqual(fired, [['p1', 'changed']]);
-});
-
-test('fire matrix: a rename fires "renamed"', async () => {
-  installDbStubs();
-  const fired: Array<[string, PlanChange]> = [];
-  const w = makeWatcher([de('bar.md', { dev: 1, ino: 42 })], fired);
-  (w as any).states.get(WS.id).snapshots.set('plans/foo.md',
-    { relPath: 'plans/foo.md', format: 'md', sizeBytes: 10, mtimeMs: 100, dev: 1, ino: 42, planId: 'p1' });
-  await (w as any).reconcileWorkspace(WS, false);
-  assert.deepEqual(fired, [['p1', 'renamed']]);
-});
-
-test('fire matrix: "adopted" is an accepted change type (WP3 will emit it)', async () => {
-  installDbStubs();
-  const fired: Array<[string, PlanChange]> = [];
-  const w = makeWatcher([], fired);
-  await (w as any).fireSettled(planRow({ id: 'p-adopt' }), 'adopted', false);
-  assert.deepEqual(fired, [['p-adopt', 'adopted']]);
-});
-
-test('fire matrix: SOFT-DELETE fires the DB soft-delete but NEVER onPlanSettled (F-C)', async () => {
+test('row reconciliation still soft-deletes vanished files', async () => {
   installDbStubs();
   let softDeleted: string | null = null;
   db.softDeletePlan = (id: string) => { softDeleted = id; return planRow({ id, deletedAt: 't-del' }); };
-  const fired: Array<[string, PlanChange]> = [];
-  const w = makeWatcher([], fired);   // empty listing
+  const w = makeWatcher([]);   // empty listing
   // Seed an already-expired pending removal so the reducer emits soft-delete now.
   (w as any).states.get(WS.id).pending.set('plans/gone.md', {
     snapshot: { relPath: 'plans/gone.md', format: 'md', sizeBytes: 10, mtimeMs: 100, planId: 'p-del' },
@@ -245,18 +196,6 @@ test('fire matrix: SOFT-DELETE fires the DB soft-delete but NEVER onPlanSettled 
   });
   await (w as any).reconcileWorkspace(WS, false);
   assert.equal(softDeleted, 'p-del', 'soft-delete DID run');
-  assert.deepEqual(fired, [], 'onPlanSettled NEVER fires on soft-delete');
-});
-
-test('fire matrix: watcher runs callback-less by default (pure B2 behavior, no throw)', async () => {
-  installDbStubs();
-  fileReader.listDirectoryEntriesAsync = async () => [de('a.md')];
-  const w = new PlansWatcher();     // no onPlanSettled
-  (w as any).states.set(WS.id, {
-    ws: WS, plansDir: '/home/x/ws/plans', snapshots: new Map(), pending: new Map(),
-    unsubscribe: () => {}, debounce: null,
-  });
-  await (w as any).reconcileWorkspace(WS, true);   // must not throw
 });
 
 // ── 3. Adoption decision (WP3 C6) — applyCreate via reconcileWorkspace ──────────
@@ -268,14 +207,10 @@ test('fire matrix: watcher runs callback-less by default (pure B2 behavior, no t
 /** Watcher with a pre-seeded WS state + injected adoption hooks. */
 function makeAdoptionWatcher(
   listing: Record<string, any>[],
-  onSettled: Array<[string, PlanChange]>,
   extra: Record<string, any>,
 ): PlansWatcher {
   fileReader.listDirectoryEntriesAsync = async () => listing;
-  const w = new PlansWatcher({
-    onPlanSettled: (plan: any, change: any) => { onSettled.push([plan.id, change]); },
-    ...extra,
-  });
+  const w = new PlansWatcher(extra);
   (w as any).states.set(WS.id, {
     ws: WS, plansDir: '/home/x/ws/plans', snapshots: new Map(), pending: new Map(),
     unsubscribe: () => {}, debounce: null,
@@ -290,12 +225,10 @@ test('adoption: embedded data-plan-id naming a live same-workspace plan is ADOPT
   let updateArgs: { id: string; updates: any } | null = null;
   db.updatePlan = (id: string, updates: any) => { updateArgs = { id, updates }; return planRow({ id, ...updates }); };
   db.getPlan = (id: string) => (id === 'p-embed' ? planRow({ id: 'p-embed', path: 'plans/old.md' }) : null);
-  const fired: Array<[string, PlanChange]> = [];
-  const w = makeAdoptionWatcher([de('a.md')], fired, {
+  const w = makeAdoptionWatcher([de('a.md')], {
     readPlanId: async () => 'p-embed',   // file embeds a known id
   });
   await (w as any).reconcileWorkspace(WS, false);
-  assert.deepEqual(fired, [['p-embed', 'adopted']]);
   assert.equal(minted, false, 'adoption must NOT mint a new plan');
   assert.equal(updateArgs!.id, 'p-embed', 'rebinds the adopted plan by its own id');
   assert.equal(updateArgs!.updates.path, 'plans/a.md', 'path rebound to the file');
@@ -306,13 +239,11 @@ test('adoption: unknown/absent data-plan-id → mint then patch the minted id ba
   db.getPlan = () => null;                 // embedded id names no live plan
   db.createOrRevivePlan = (input: any) => planRow({ id: 'p-new', path: input.path });
   let patchArgs: [string, string] | null = null;
-  const fired: Array<[string, PlanChange]> = [];
-  const w = makeAdoptionWatcher([de('a.md')], fired, {
+  const w = makeAdoptionWatcher([de('a.md')], {
     readPlanId: async () => 'p-stale',     // present but unknown → mint-and-patch
     patchPlanId: async (_ws: any, relPath: string, planId: string) => { patchArgs = [relPath, planId]; return true; },
   });
   await (w as any).reconcileWorkspace(WS, false);
-  assert.deepEqual(fired, [['p-new', 'created']]);
   assert.deepEqual(patchArgs, ['plans/a.md', 'p-new'], 'server UUID patched back into the file');
 });
 
@@ -322,15 +253,13 @@ test('adoption: a rename rebinds on the snapshot id and NEVER remints (identity 
   db.createOrRevivePlan = () => { minted = true; return planRow({ id: 'p-new' }); };
   let updateArgs: { id: string; updates: any } | null = null;
   db.updatePlan = (id: string, updates: any) => { updateArgs = { id, updates }; return planRow({ id, ...updates }); };
-  const fired: Array<[string, PlanChange]> = [];
   // dev/ino carry identity from the old path's snapshot to the renamed file.
-  const w = makeAdoptionWatcher([de('bar.md', { dev: 1, ino: 42 })], fired, {
+  const w = makeAdoptionWatcher([de('bar.md', { dev: 1, ino: 42 })], {
     readPlanId: async () => 'p-should-be-ignored',  // rename never consults data-plan-id
   });
   (w as any).states.get(WS.id).snapshots.set('plans/foo.md',
     { relPath: 'plans/foo.md', format: 'md', sizeBytes: 10, mtimeMs: 100, dev: 1, ino: 42, planId: 'p1' });
   await (w as any).reconcileWorkspace(WS, false);
-  assert.deepEqual(fired, [['p1', 'renamed']]);
   assert.equal(minted, false, 'a rename must NEVER mint a new plan');
   assert.equal(updateArgs!.id, 'p1', 'rebinds the pre-existing id from the snapshot');
   assert.equal(updateArgs!.updates.path, 'plans/bar.md');

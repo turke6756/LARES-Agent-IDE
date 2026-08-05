@@ -5,17 +5,13 @@
 // loopback), and correlates unlink+add pairs into a rename REBIND so a plan's
 // stable uuid `id` (and its `supervisor_focus` rows) survive a rename.
 //
-// F-C: this module is the SOLE `fs-watcher.subscribe` owner for `plans/`. It
-// exposes an injected async-safe `onPlanSettled(plan, change)` callback, fired
-// AFTER each live plan row is resolved (never on soft-delete). The callback is a
-// constructor dependency, not a hard import — the watcher runs callback-less
-// (pure B2 behavior) until WP4 wires `reparsePlanFile`, so the two workstreams
-// ship independently.
+// F-C: this module is the SOLE `fs-watcher.subscribe` owner for `plans/`. WP-P8C
+// retired the post-reconcile HTML reparse callback; this watcher now only keeps
+// legacy file rows registered while the deploy-time row cleanup remains pending.
 //
 // ── WP-P2B-folder: TWO ROOTS, one ownership module ───────────────────────────
 // This watcher now owns TWO plan roots per workspace, enumerated independently:
-//   1. LEGACY `<workspace>/plans/` — flat HTML/markdown, behavior UNCHANGED
-//      (the reconcile pipeline above; `onPlanSettled`).
+//   1. LEGACY `<workspace>/plans/` — flat HTML/markdown registration only.
 //   2. NEW `<workspaceStateDir()>/plans/` — STRUCTURED §R0 plan directories,
 //      adopted by `PlanFolderWatcher` (src/main/plans/plan-folder-watcher.ts).
 // The new root is watched RECURSIVELY via bounded child subscriptions (fs-watcher
@@ -35,7 +31,7 @@ import { subscribe } from './fs-watcher';
 import { listDirectoryEntriesAsync, readFileContents } from './file-reader';
 import {
   getWorkspaces, createOrRevivePlan, updatePlan, softDeletePlan,
-  getPlanByWorkspacePath, derivePlanSlug, getPlans, getPlan,
+  derivePlanSlug, getPlans, getPlan,
 } from './database';
 import {
   PlanFolderWatcher, PLAN_FOLDER_OUTPUT_SUBDIRS,
@@ -49,13 +45,7 @@ const DELETE_GRACE_MS = 1500;       // cross-cycle grace before a removal become
 const WORKSPACE_REFRESH_MS = 30_000;
 const HASH_MAX_BYTES = 1_000_000;
 
-export type PlanChange = 'boot' | 'created' | 'revived' | 'changed' | 'renamed' | 'adopted';
-
 export interface PlansWatcherOptions {
-  /** F-C: fired AFTER each live plan row is resolved (never on soft-delete).
-   *  Awaited inside the debounced reconcile; `.catch`'d in the boot scan.
-   *  Constructor dependency — the watcher runs callback-less until WP4 wires it. */
-  onPlanSettled?: (plan: Plan, change: PlanChange) => Promise<void> | void;
   /** Adoption-aware registration (WP3/C6): extract the file's embedded
    *  `data-plan-id`, or null when absent/unreadable. Injectable for tests;
    *  defaults to a file read + attribute scrape. */
@@ -404,31 +394,28 @@ export class PlansWatcher {
     });
     st.pending = pending;
 
-    // Apply actions against the DB, then fire onPlanSettled per resolved live row.
+    // Apply actions against the DB. WP-P8C intentionally performs no HTML
+    // reparse/projection callback after a row settles.
     for (const action of actions) {
       try {
         if (action.kind === 'create') {
-          const { plan, change } = await this.applyCreate(ws, action.entry, isBoot);
+          const plan = await this.applyCreate(ws, action.entry);
           this.setSnapshot(st, action.entry, plan.id);
-          await this.fireSettled(plan, change, isBoot);
         } else if (action.kind === 'update') {
-          const plan = updatePlan(action.planId, {
+          updatePlan(action.planId, {
             mtimeMs: action.entry.mtimeMs, sizeBytes: action.entry.sizeBytes, runState: null,
           });
           this.setSnapshot(st, action.entry, action.planId);
-          if (plan) await this.fireSettled(plan, 'changed', isBoot);
         } else if (action.kind === 'rename') {
-          const plan = updatePlan(action.planId, {
+          updatePlan(action.planId, {
             path: action.entry.relPath, slug: derivePlanSlug(action.entry.relPath),
             mtimeMs: action.entry.mtimeMs, sizeBytes: action.entry.sizeBytes,
           });
           st.snapshots.delete(action.oldRelPath);
           this.setSnapshot(st, action.entry, action.planId);
-          if (plan) await this.fireSettled(plan, 'renamed', isBoot);
         } else if (action.kind === 'soft-delete') {
           softDeletePlan(action.planId);
           st.snapshots.delete(action.relPath);
-          // NEVER fire onPlanSettled on soft-delete (F-C).
         }
       } catch (err) {
         log(`action ${action.kind} failed for ${ws.id}`, err);
@@ -450,7 +437,7 @@ export class PlansWatcher {
    * `data-plan-id` (mint-and-patch on unknown/missing id). The server UUID
    * always wins; the file's id is reconciled to it (R1 C6).
    */
-  private async applyCreate(ws: Workspace, entry: PlanFileEntry, isBoot: boolean): Promise<{ plan: Plan; change: PlanChange }> {
+  private async applyCreate(ws: Workspace, entry: PlanFileEntry): Promise<Plan> {
     const embeddedId = await this.resolvePlanId(ws, entry.relPath);
     if (embeddedId) {
       const known = getPlan(embeddedId);
@@ -459,12 +446,10 @@ export class PlansWatcher {
           path: entry.relPath, slug: derivePlanSlug(entry.relPath),
           format: entry.format, mtimeMs: entry.mtimeMs, sizeBytes: entry.sizeBytes,
         }) ?? known;
-        return { plan, change: 'adopted' };
+        return plan;
       }
     }
     // Unknown/missing id → mint (path-idempotent) then patch the file's id.
-    const existing = getPlanByWorkspacePath(ws.id, entry.relPath);
-    const change: PlanChange = isBoot ? 'boot' : (existing?.deletedAt ? 'revived' : 'created');
     const plan = createOrRevivePlan({
       workspaceId: ws.id, path: entry.relPath, format: entry.format,
       mtimeMs: entry.mtimeMs, sizeBytes: entry.sizeBytes,
@@ -473,7 +458,7 @@ export class PlansWatcher {
       try { await this.reconcilePlanId(ws, entry.relPath, plan.id); }
       catch (err) { log(`data-plan-id patch failed for ${entry.relPath}`, err); }
     }
-    return { plan, change };
+    return plan;
   }
 
   private async resolvePlanId(ws: Workspace, relPath: string): Promise<string | null> {
@@ -505,17 +490,6 @@ export class PlansWatcher {
       mtimeMs: entry.mtimeMs, dev: entry.dev, ino: entry.ino,
       contentHash: entry.contentHash, planId,
     });
-  }
-
-  /** Await in the debounced reconcile (deterministic ordering); detach-and-catch
-   *  in the boot scan so a cold start with many plans isn't serialized (F-C). */
-  private async fireSettled(plan: Plan, change: PlanChange, isBoot: boolean): Promise<void> {
-    if (!this.opts.onPlanSettled) return;
-    if (isBoot) {
-      Promise.resolve(this.opts.onPlanSettled(plan, change)).catch(err => log('onPlanSettled (boot) threw', err));
-    } else {
-      await Promise.resolve(this.opts.onPlanSettled(plan, change));
-    }
   }
 
   private async listPlanFiles(ws: Workspace, plansDir: string): Promise<PlanFileEntry[]> {
