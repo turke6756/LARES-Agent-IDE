@@ -46,6 +46,14 @@ export function isLaunchableAgentProvider(v: unknown): v is LaunchableAgentProvi
   return typeof v === 'string' && (LAUNCHABLE_AGENT_PROVIDERS as readonly string[]).includes(v);
 }
 
+/** Workspace-scoped provider preferences for orchestration features. */
+export interface OrchestrationProviderSettings {
+  groupthink: {
+    defaultLeadProvider: LaunchableAgentProvider;
+    defaultReviewerProvider: LaunchableAgentProvider;
+  };
+}
+
 // Hardcoded first-class app role-lanes. 'researcher' is a third lane alongside
 // 'supervisor' and 'worker' (browser-parity-and-capability-isolation §0); see
 // roleLaneOf() in src/main/supervisor/index.ts for the flag→lane mapping.

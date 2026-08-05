@@ -1,4 +1,9 @@
-import type { AgentProvider, ContextGaugeSettings, LaunchableAgentProvider } from './types';
+import type {
+  AgentProvider,
+  ContextGaugeSettings,
+  LaunchableAgentProvider,
+  OrchestrationProviderSettings,
+} from './types';
 import { buildUsageStatusText, buildUsageRawRecord } from './usage-limits-record';
 
 /** Workspace state folder name — `<workspace>/.lares/` holds the supervisor /
@@ -13,6 +18,10 @@ export const LARES_DIR_NAME = '.lares';
  *  analytics records, and unmigrated (rename-failed) workspaces still carry
  *  it. Never use it to construct a NEW path. */
 export const LEGACY_LARES_DIR_NAME = '.dashboard';
+
+export const DEFAULT_ORCHESTRATION_PROVIDER_SETTINGS: OrchestrationProviderSettings = {
+  groupthink: { defaultLeadProvider: 'claude', defaultReviewerProvider: 'codex' },
+};
 
 export const DEFAULT_COMMAND = 'claude --dangerously-skip-permissions';
 export const DEFAULT_COMMAND_WSL = 'ccode --dangerously-skip-permissions';

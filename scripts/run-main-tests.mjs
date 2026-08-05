@@ -591,6 +591,7 @@ const TESTS = [
   'dist/main/main/agent-knowledge/knowledge-behavior-enrichment.test.js',
   'dist/main/main/orchestration/dashboard-client.test.js',
   'dist/main/main/orchestration/orchestration-binding.test.js',
+  'dist/main/main/orchestration/orchestration-provider-settings.test.js',
   'dist/main/main/orchestration/orchestration-service.test.js',
   'dist/main/main/orchestration/groupthink-legacy.test.js',
   'dist/main/main/orchestration/groupthink-v2.test.js',
