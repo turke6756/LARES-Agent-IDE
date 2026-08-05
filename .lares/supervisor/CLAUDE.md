@@ -17,7 +17,7 @@ You have MCP tools provided by the AgentDashboard. Use these as your primary int
 - **stop_agent** — Stop an agent (args: agent_id)
 - **launch_agent** — Launch a new agent (args: workspace_id, title, role_description, prompt). Optional `mode`: `worker` (default — an owned child under you) or `supervisor-peer` (a TOP-LEVEL peer supervisor with NO owner edge, its own `.lares/supervisor` cwd and the supervisor toolset). `supervisor-peer` is the ONLY mode that may launch into another workspace (pass `workspace_id`), and cross-workspace peer launch is **supervisor-only**.
 - **fork_agent** — Fork to fresh context (args: agent_id)
-- **revive_agent** — Revive a DONE or CRASHED terminal agent: relaunch its ORIGINAL session (resume) in its original workspace/cwd, top-level (no new owner edge), carrying its full prior context (args: agent_id, message?, force?). Both cross-workspace AND same-workspace revival require **supervisor privilege** (revival is a launch-class mutation) and every attempt is audited. Supported providers: **claude, codex** (gemini is not session-addressable and is rejected). An optional `message` is queued and delivered only AFTER the revived agent can orient.
+- **revive_agent** — Revive a DONE or CRASHED terminal agent: relaunch its ORIGINAL session (resume) in its original workspace/cwd, top-level (no new owner edge), carrying its full prior context (args: agent_id, message?, force?). Both cross-workspace AND same-workspace revival require **supervisor privilege** (revival is a launch-class mutation) and every attempt is audited. Supported providers: **claude, codex**. Historical Gemini agents remain readable, but Gemini is discontinued and cannot be launched or revived; use Antigravity (agy) for new work. An optional `message` is queued and delivered only AFTER the revived agent can orient.
 
 **Fallback:** If MCP tools are unavailable, the same API is accessible via curl at `http://127.0.0.1:24678/api/agents`. In WSL, use the Windows host IP from `/etc/resolv.conf`.
 
@@ -253,6 +253,43 @@ gating, never proof of quality or an effort metric. Whole-turn attribution count
 incidental touches; never present the numbers as effort.
 <!-- /section:planning-surface -->
 
+<!-- section:planning-artifacts v1 -->
+## Where planning artifacts live
+
+You never guess where planning artifacts go — the app tells you here:
+
+- **Proposals** are flat markdown files in `.lares/proposals/` (deliberation /
+  detail docs go in `.lares/proposals/supporting/`). A bare proposal with a
+  portable `artifact_id` frontmatter is a valid terminal artifact — no folder,
+  no ceremony.
+- **Plan folders** live under `<workspaceStateDir()>/plans/` (resolves to
+  `.lares/plans/`, or the `.dashboard` fallback) — one folder per plan,
+  `plan.json` + `plan.md` + `ARC.md` + `deliberations/` `research/`
+  `supplements/` (§R0). This is **distinct** from the legacy workspace-root
+  `plans/` directory of flat HTML/markdown plans.
+- The **`proposal-to-plan` skill** is how you create or resume any of this:
+  `capture` a proposal, `scope` (triage + mark) it, `promote` it into a plan
+  folder, then `deliberate` / `integrate` / `package`, with `orient` as the
+  re-entry read. You never guess these paths — this section and the skill are
+  the source of truth.
+
+**`ARC.md` is YOUR job (ruling 29).** `ARC.md` is written and maintained by the
+plan's responsible supervisor — not a worker's. Create it at `promote` (the
+skill's scaffold seeds the skeleton) and refresh it on `orient` and `integrate`
+from current disk/ledger evidence, updating `ARC-META`. It is a summary that
+**cites** durable records (intent→orchestration links, turn stamps, commit
+records) — a prose row is never a substitute for work-time stamping.
+
+**Orient-first (ruling 30).** If you are subscribed to a plan and picking it
+up, `plan.json` + `ARC.md` + the intent markers are the FIRST place you look,
+before doing anything new. Run the skill's `orient` mode: it derives every
+intent's rung from disk (`marked → ran → returned → folded-in`; `ran` is
+unavailable until the ledger ships and is reported as such, never faked),
+reports safe next actions, and refreshes `ARC.md`. A plan is owned by one
+supervisor (the last `assigned` event in `plan.json`); a different supervisor
+must append a new `assigned` event before mutating — read-only `orient` is
+always allowed.
+<!-- /section:planning-artifacts -->
 <!-- section:continuation-request v1 -->
 ## Automatic continuation request
 
