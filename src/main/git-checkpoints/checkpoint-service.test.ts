@@ -397,10 +397,9 @@ test('deadline expires before candidate-persist → abandoned (degraded, no ref,
 
 test('finalize overrun → delivery released at deadlineAt, edge persisted non-ready; never usable before verify', async () => {
   const repo = mkRepo();
-  fs.writeFileSync(path.join(repo, 'a.txt'), 'x\n');
-  commitAll(repo);
   const store = new FakeStore();
   store.seedOpen('T', 'WS');
+  const fake = makeFakeGit();
 
   // Slow-update-ref seam: it wants to run far past the deadline; it instead resolves
   // (throwing a deadline kill) exactly AT deadlineAt — modelling git-command's bound.
@@ -411,11 +410,21 @@ test('finalize overrun → delivery released at deadlineAt, edge persisted non-r
       await sleep(Math.max(0, remaining));
       throw new GitCommandError('deadline', 'simulated update-ref overrun', null, '');
     }
-    return realRunGit(cwd, args, opts);
+    return fake.run(cwd, args, opts);
   };
-  // Budget 1500, finalize allowance 1000 ⇒ captureDeadline = enqueue+500 (capture fits),
-  // absolute deadlineAt = enqueue+1500 (finalize is cut off here).
-  const svc = mkService({ store, runGit: slowRunGit, timing: { beforeBudgetMs: 1500, finalizeAllowanceMs: 1000 } });
+  // Keep capture deterministic so this row tests only the finalize-overrun contract;
+  // real-Git capture duration is covered by the invariant rows above. Budget 300,
+  // finalize allowance 200 ⇒ captureDeadline = enqueue+100, while the absolute
+  // deadlineAt = enqueue+300 cuts off finalization.
+  const svc = mkService({
+    store,
+    runGit: slowRunGit,
+    enumerate: synthEnumeration({
+      capturable: [{ path: 'a.txt', type: 'regular', mode: 0o644, size: 1 }],
+      observed: { paths: 1, bytes: 1 },
+    }),
+    timing: { beforeBudgetMs: 300, finalizeAllowanceMs: 200 },
+  });
   const enqueueTime = Date.now();
   const res = await svc.captureEdge({
     edge: 'before', turnId: 'T', workspaceId: 'WS', agentId: 'a', capability: capFor(repo), quality: 'guaranteed', enqueueTime,
@@ -428,7 +437,7 @@ test('finalize overrun → delivery released at deadlineAt, edge persisted non-r
   assert.ok(res.ref, 'deterministic ref name persisted for reconciliation');
   assert.equal(res.ready, false);
   // Delivery is not held past the deadline: the service returns by ~deadlineAt.
-  assert.ok(elapsed <= 1500 + 400, `returned by ~deadlineAt (elapsed ${elapsed}ms)`);
+  assert.ok(elapsed <= 300 + 400, `returned by ~deadlineAt (elapsed ${elapsed}ms)`);
   // The row records the candidate but is NON-ready (ready=0) — never a usable guarantee.
   assert.equal(store.rows.get('T')!.beforeOid, res.oid);
   assert.equal(store.rows.get('T')!.beforeReady, false);
