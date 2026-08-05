@@ -460,7 +460,9 @@ describe('SaveCard decisive save gesture', () => {
     const pin = container.querySelector('[data-testid="save-bundle-pin"]') as HTMLInputElement;
     expect(pin.checked).toBe(false);
     await gestureClick(pin);
-    expect(markDone).toHaveBeenCalledWith({ packageId: 'b-loud' });
+    // SC-WP-W5: the mark-done carries the PANE's workspaceId so the finalize routes
+    // by the repository the pane is scoped to, never by a contributor's home.
+    expect(markDone).toHaveBeenCalledWith({ packageId: 'b-loud', targetWorkspaceId: 'ws-1' });
     expect(pin.checked).toBe(true);
   });
 

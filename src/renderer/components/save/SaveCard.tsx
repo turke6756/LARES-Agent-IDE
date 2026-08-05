@@ -102,7 +102,9 @@ function PackageSaveGesture({
     setMovedPaths([]);
     try {
       const responses: SaveCardFleetAdhocMarkDoneResponse[] = await Promise.all(
-        group.map((bundle) => window.api.saveCard.markDone({ packageId: bundle.bundleId })),
+        group.map((bundle) =>
+          window.api.saveCard.markDone({ packageId: bundle.bundleId, targetWorkspaceId: workspaceId }),
+        ),
       );
       const refusal = responses.find(
         (response): response is Extract<SaveCardFleetAdhocMarkDoneResponse, { ok: false }> =>

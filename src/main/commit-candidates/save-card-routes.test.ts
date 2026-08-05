@@ -220,7 +220,12 @@ test('candidate request carries every registered workspace so sibling lanes unio
   ]);
 });
 
-test('inventory annotates a package owned by an agent in a no-repo workspace', async () => {
+// SC-WP-W5 — LIVE BLOCKER regression: saveability keys off the PANE's workspace,
+// not a contributing agent's home workspace. A package whose files live in the
+// pane's repo (workspace-a) is saveable EVEN WHEN a contributing agent's home is a
+// repo-less "Computer Root" — the old code wrongly marked it unsavable, which
+// refused every save Edward attempted.
+test('a package contributed by an agent from a no-repo workspace is saveable in a repo-backed pane', async () => {
   const outsideAgent = {
     ...worker,
     workspaceId: 'workspace-outside',
@@ -234,14 +239,14 @@ test('inventory annotates a package owned by an agent in a no-repo workspace', a
     getAgent: (agentId) => agentId === outsideAgent.id ? outsideAgent : null,
   });
 
+  // Pane is workspace-a, which HAS a repo and where the package's files live.
   const { bundles } = await routes.getInventory({ workspaceId: 'workspace-a' });
   const component = bundles.find((bundle) => bundle.kind === 'component');
-  assert.deepEqual(component?.saveability, {
-    saveable: false,
-    reason: 'no-repository',
-    workspaceId: 'workspace-outside',
-    workspaceTitle: 'Computer Root',
-  });
+  assert.ok(component, 'expected the attributed component bundle');
+  assert.deepEqual(component?.saveability, { saveable: true });
+  // The unattributed pseudo-bundle in the same repo-backed pane is saveable too.
+  const unattributed = bundles.find((bundle) => bundle.kind === 'unattributed');
+  assert.deepEqual(unattributed?.saveability, { saveable: true });
 });
 
 test('issues only the read-only Git command family — never a mutating verb', async () => {

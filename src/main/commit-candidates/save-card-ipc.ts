@@ -235,7 +235,14 @@ function requireMarkDoneRequest(raw: unknown): SaveCardFleetAdhocMarkDoneRequest
       'save-card-bad-request',
     );
   }
-  return { packageId };
+  const targetWorkspaceId = (raw as { targetWorkspaceId?: unknown }).targetWorkspaceId;
+  if (typeof targetWorkspaceId !== 'string' || targetWorkspaceId === '') {
+    throw new SaveCardIpcError(
+      'a non-empty targetWorkspaceId is required',
+      'save-card-bad-request',
+    );
+  }
+  return { packageId, targetWorkspaceId };
 }
 
 function toMarkDoneResponse(

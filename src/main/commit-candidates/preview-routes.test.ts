@@ -292,7 +292,10 @@ test('fleet-adhoc resolver captures and returns the checkpoint engine boundary O
     },
   }));
 
-  const context = await saveCardFinalizeRoutes.resolveBoundary({ packageId: 'component:c1' });
+  const context = await saveCardFinalizeRoutes.resolveBoundary({
+    packageId: 'component:c1',
+    targetWorkspaceId: 'ws-1',
+  });
   assert.deepEqual(calls, [{ workspaceId: 'ws-1', label: 'lares:finalization:component:c1' }]);
   assert.equal(context.boundaryOid, boundaryOid, 'the fake engine OID is the durable boundary input');
   assert.equal(context.repositoryKey, REPO_KEY);
@@ -314,7 +317,80 @@ test('fleet-adhoc resolver identifies a fake no-repo workspace as a typed refusa
   }));
 
   await assert.rejects(
-    () => saveCardFinalizeRoutes.resolveBoundary({ packageId: 'component:proposal' }),
+    () => saveCardFinalizeRoutes.resolveBoundary({
+      packageId: 'component:proposal',
+      targetWorkspaceId: '54ad9887',
+    }),
+    (error: unknown) => error instanceof Error
+      && error.name === 'SaveCardFinalizeRefusalError'
+      && (error as Error & { code?: string }).code === 'save-card-no-repository'
+      && error.message.includes("workspace 'Computer Root'"),
+  );
+});
+
+// SC-WP-W5 — LIVE BLOCKER regression: a Save pane scoped to a real project repo
+// must route a fleet-adhoc mark-done to THAT repo, even when a broad repo-less
+// "Computer Root" workspace overlaps everything and is iterated first. The bug
+// was that resolveFleetBoundary scanned every workspace and threw the moment it
+// probed Computer Root (no repoRoot), poisoning EVERY save regardless of package.
+test('fleet-adhoc routes by the pane workspace, not a repo-less overlapping workspace', async () => {
+  const rootCap = capability();
+  rootCap.repoState = 'non-repo';
+  rootCap.repoRoot = null;
+  rootCap.commonDir = null;
+  rootCap.commonDirQueueKey = null;
+  rootCap.workspacePrefix = null;
+  const calls: Array<{ workspaceId: string; label: string }> = [];
+  // Computer Root is registered FIRST and overlaps everything but has no repo of
+  // its own; the project workspace carries the repo the package's files live in.
+  const { saveCardFinalizeRoutes } = createPreviewRoutes(baseDeps({
+    getWorkspaces: () => [
+      { id: 'computer-root', path: '/', title: 'Computer Root' },
+      { id: 'project', path: '/repo', title: 'Project' },
+    ],
+    probeWorkspaceGit: async (dir) => (dir === '/' ? rootCap : capability()),
+    captureFinalizationBoundary: async (workspaceId, label) => {
+      calls.push({ workspaceId, label });
+      return { oid: 'c'.repeat(40), treeOid: 'd'.repeat(40) };
+    },
+  }));
+
+  const context = await saveCardFinalizeRoutes.resolveBoundary({
+    packageId: 'component:c1',
+    targetWorkspaceId: 'project',
+  });
+  // The boundary is captured against the PANE's project workspace — Computer Root
+  // is never assembled and never poisons the resolve.
+  assert.deepEqual(calls, [{ workspaceId: 'project', label: 'lares:finalization:component:c1' }]);
+  assert.equal(context.createdFromWorkspaceId, 'project');
+  assert.equal(context.repositoryKey, REPO_KEY);
+  assert.equal(context.repoRoot, '/repo');
+  assert.equal(context.members.length, 1);
+});
+
+// The genuine no-repo case survives: when the PANE itself is the repo-less
+// workspace, the finalize still refuses typed (never a silent success).
+test('fleet-adhoc still refuses typed when the PANE workspace itself has no repo', async () => {
+  const rootCap = capability();
+  rootCap.repoState = 'non-repo';
+  rootCap.repoRoot = null;
+  rootCap.commonDir = null;
+  rootCap.commonDirQueueKey = null;
+  rootCap.workspacePrefix = null;
+  const { saveCardFinalizeRoutes } = createPreviewRoutes(baseDeps({
+    getWorkspaces: () => [
+      { id: 'computer-root', path: '/', title: 'Computer Root' },
+      { id: 'project', path: '/repo', title: 'Project' },
+    ],
+    probeWorkspaceGit: async (dir) => (dir === '/' ? rootCap : capability()),
+    captureFinalizationBoundary: async () => { throw new Error('must not capture'); },
+  }));
+
+  await assert.rejects(
+    () => saveCardFinalizeRoutes.resolveBoundary({
+      packageId: 'component:c1',
+      targetWorkspaceId: 'computer-root',
+    }),
     (error: unknown) => error instanceof Error
       && error.name === 'SaveCardFinalizeRefusalError'
       && (error as Error & { code?: string }).code === 'save-card-no-repository'

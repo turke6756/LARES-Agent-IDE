@@ -124,29 +124,34 @@ function attachBundleIdentity(
   witnesses: readonly TurnWitnessRead[],
   capabilityByWorkspaceId: ReadonlyMap<string, GitCapability>,
   workspaceTitleById: ReadonlyMap<string, string>,
+  targetWorkspaceId: string,
 ): SaveCardBundle {
+  // Saveability is a property of the PANE's workspace (the repository the commit
+  // would land in), NOT of any contributing agent's home workspace. The inventory
+  // is already repository-scoped to the pane's repo, so every package it surfaces
+  // has its files inside that repo. A package is unsavable ONLY when the pane's
+  // OWN workspace has no repoRoot (the genuine "Computer Root has no repo" case),
+  // never because a contributor came from a repo-less workspace. This mirrors the
+  // finalize routing, which pins by the pane's target workspace.
+  const targetCapability = capabilityByWorkspaceId.get(targetWorkspaceId);
+  const saveability: SaveCardPackageSaveability =
+    targetCapability && !targetCapability.repoRoot
+      ? {
+          saveable: false,
+          reason: 'no-repository',
+          workspaceId: targetWorkspaceId,
+          workspaceTitle: workspaceTitleById.get(targetWorkspaceId) ?? targetWorkspaceId,
+        }
+      : { saveable: true };
+
   if (bundle.kind === 'unattributed' || !bundle.component) {
-    return { ...bundle, identity: null, saveability: { saveable: true } };
+    return { ...bundle, identity: null, saveability };
   }
 
   const turnIds = new Set(bundle.component.associations.flatMap((a) => a.contributingTurnIds));
   const relevantWitnesses = witnesses.filter((witness) => turnIds.has(witness.turnId));
   const agentIds = new Set(relevantWitnesses.flatMap((w) => w.agentId ? [w.agentId] : []));
   const ownerIds = new Set<string>();
-
-  const noRepositoryWorkspace = [...agentIds]
-    .map((agentId) => agents.get(agentId)?.workspaceId)
-    .filter((workspaceId): workspaceId is string => Boolean(workspaceId))
-    .find((workspaceId) => capabilityByWorkspaceId.has(workspaceId)
-      && !capabilityByWorkspaceId.get(workspaceId)?.repoRoot);
-  const saveability: SaveCardPackageSaveability = noRepositoryWorkspace
-    ? {
-        saveable: false,
-        reason: 'no-repository',
-        workspaceId: noRepositoryWorkspace,
-        workspaceTitle: workspaceTitleById.get(noRepositoryWorkspace) ?? noRepositoryWorkspace,
-      }
-    : { saveable: true };
 
   // Owner resolution uses ONLY real data: the witness's recorded owner edge, else
   // the contributing agent's own owner edge. We never fabricate ownership — an
@@ -336,6 +341,7 @@ export function createSaveCardRoutes(deps: SaveCardRoutesDeps): SaveCardRoutes {
         witnesses,
         capabilityByWorkspaceId,
         workspaceTitleById,
+        req.workspaceId,
       )),
       quotaWeakening,
     };

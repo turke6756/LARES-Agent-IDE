@@ -2122,6 +2122,12 @@ export const SAVECARD_FINALIZE_CHANNEL = 'savecard:markDoneFleetAdhoc' as const;
 
 export interface SaveCardFleetAdhocMarkDoneRequest {
   packageId: string;
+  /** The workspace the Save PANE is scoped to — the repository the commit must
+   *  land in. A fleet-adhoc package's files live in the pane's repo regardless of
+   *  which agent's home workspace contributed them, so the finalize routes by this
+   *  (the same repository scope the inventory used), NEVER by a contributing
+   *  agent's home workspace or by scanning every registered workspace. */
+  targetWorkspaceId: string;
 }
 
 export type SaveCardFinalizeOutcome =

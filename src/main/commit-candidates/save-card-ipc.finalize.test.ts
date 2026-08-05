@@ -148,7 +148,7 @@ test('fleet-adhoc mark-done creates a distinct finalization that captures bounda
 
   const res = (await ipc.invoke(
     SAVECARD_FINALIZE_CHANNEL,
-    { packageId: 'pkg-fleet', ignoredRendererField: 'not-forwarded' },
+    { packageId: 'pkg-fleet', targetWorkspaceId: 'ws-1', ignoredRendererField: 'not-forwarded' },
   )) as Exclude<SaveCardFleetAdhocMarkDoneResponse, { ok: false }>;
 
   assert.equal(res.finalizationKind, 'fleet-adhoc');
@@ -184,7 +184,7 @@ test('a boundary-unavailable outcome still surfaces the ref it could not pin', a
 
   const res = (await ipc.invoke(
     SAVECARD_FINALIZE_CHANNEL,
-    { packageId: 'pkg-fleet' },
+    { packageId: 'pkg-fleet', targetWorkspaceId: 'ws-1' },
   )) as Exclude<SaveCardFleetAdhocMarkDoneResponse, { ok: false }>;
 
   assert.equal(res.finalizationKind, 'fleet-adhoc');
@@ -202,7 +202,20 @@ test('rejects a malformed mark-done request before resolving the boundary', asyn
   }));
 
   await assert.rejects(() => ipc.invoke(SAVECARD_FINALIZE_CHANNEL, null), /non-empty packageId/i);
-  await assert.rejects(() => ipc.invoke(SAVECARD_FINALIZE_CHANNEL, { packageId: '' }), /non-empty packageId/i);
+  await assert.rejects(
+    () => ipc.invoke(SAVECARD_FINALIZE_CHANNEL, { packageId: '', targetWorkspaceId: 'ws-1' }),
+    /non-empty packageId/i,
+  );
+  // targetWorkspaceId is equally required — a fleet-adhoc mark-done cannot route
+  // without knowing the pane's repository, so it is rejected before resolving.
+  await assert.rejects(
+    () => ipc.invoke(SAVECARD_FINALIZE_CHANNEL, { packageId: 'pkg-fleet' }),
+    /non-empty targetWorkspaceId/i,
+  );
+  await assert.rejects(
+    () => ipc.invoke(SAVECARD_FINALIZE_CHANNEL, { packageId: 'pkg-fleet', targetWorkspaceId: '' }),
+    /non-empty targetWorkspaceId/i,
+  );
   assert.equal(resolved, 0);
 });
 
@@ -210,7 +223,7 @@ test('an unwired finalization engine answers unavailable honestly', async () => 
   const ipc = new FakeIpc();
   registerSaveCardFinalizeIpc(ipc, () => null);
   await assert.rejects(
-    () => ipc.invoke(SAVECARD_FINALIZE_CHANNEL, { packageId: 'pkg-fleet' }),
+    () => ipc.invoke(SAVECARD_FINALIZE_CHANNEL, { packageId: 'pkg-fleet', targetWorkspaceId: 'ws-1' }),
     /unavailable|bootstrapping/i,
   );
 });
@@ -238,7 +251,7 @@ test('a no-repository boundary failure returns a typed refusal and never finaliz
 
   const response = await ipc.invoke(
     SAVECARD_FINALIZE_CHANNEL,
-    { packageId: 'component:proposal' },
+    { packageId: 'component:proposal', targetWorkspaceId: '54ad9887' },
   );
   assert.deepEqual(response, {
     ok: false,
@@ -264,7 +277,7 @@ test('an unknown workspace boundary failure is also returned as a typed refusal'
   }));
 
   assert.deepEqual(
-    await ipc.invoke(SAVECARD_FINALIZE_CHANNEL, { packageId: 'pkg-orphaned' }),
+    await ipc.invoke(SAVECARD_FINALIZE_CHANNEL, { packageId: 'pkg-orphaned', targetWorkspaceId: 'missing-ws' }),
     {
       ok: false,
       code: 'save-card-unknown-workspace',
@@ -281,7 +294,7 @@ test('unexpected boundary failures still reject the IPC invocation', async () =>
     resolveBoundary: async () => { throw new Error('unexpected freezer failure'); },
   }));
   await assert.rejects(
-    () => ipc.invoke(SAVECARD_FINALIZE_CHANNEL, { packageId: 'pkg-fleet' }),
+    () => ipc.invoke(SAVECARD_FINALIZE_CHANNEL, { packageId: 'pkg-fleet', targetWorkspaceId: 'ws-1' }),
     /unexpected freezer failure/,
   );
 });

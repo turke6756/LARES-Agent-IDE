@@ -584,64 +584,70 @@ export function createPreviewRoutes(deps: PreviewRoutesDeps): {
     return trailers;
   }
 
-  async function resolveFleetBoundary(packageId: string): Promise<FleetAdhocBoundaryContext> {
+  // Route a fleet-adhoc mark-done by the REPOSITORY THE PANE IS SCOPED TO — the
+  // same repository scope the inventory already used — NOT by scanning every
+  // registered workspace. The package's files physically live in the pane's repo;
+  // a contributing agent's home workspace (e.g. a broad "Computer Root" that
+  // overlaps every repo and has no repoRoot of its own) is irrelevant to WHERE the
+  // commit lands. `assembleScope(targetWorkspaceId)` throws the typed
+  // `save-card-no-repository` / `save-card-unknown-workspace` refusals for the
+  // genuine cases (the pane's OWN workspace has no repo, or is unregistered), so
+  // an unrelated repo-less workspace can no longer poison every save.
+  async function resolveFleetBoundary(
+    packageId: string,
+    targetWorkspaceId: string,
+  ): Promise<FleetAdhocBoundaryContext> {
     if (!deps.captureFinalizationBoundary) {
       throw new Error('checkpoint boundary capture is unavailable');
     }
-    const visitedRepositories = new Set<string>();
-    for (const workspace of getWorkspaces()) {
-      const scope = await assembleScope(workspace.id);
-      const repository = scope.context.repository;
-      if (visitedRepositories.has(repository.repositoryKey)) continue;
-      visitedRepositories.add(repository.repositoryKey);
-      const componentId = packageId.startsWith('component:')
-        ? packageId.slice('component:'.length)
-        : packageId;
-      const component = scope.context.components.find((candidate) => candidate.componentId === componentId);
-      const entryIds = component
-        ? component.dirtyEntryIds
-        : packageId === `unattributed:${repository.repositoryKey}`
-          ? scope.context.inventory.unattributedEntryIds
-          : null;
-      if (!entryIds) continue;
-      const entriesById = new Map(scope.context.inventory.entries.map((entry) => [entry.entryId, entry]));
-      const members = entryIds
-        .map((entryId) => entriesById.get(entryId))
-        .filter((entry): entry is DirtyEntry => entry !== undefined)
-        .map((entry): CommitRepresentationEntry => ({
-          path: entry.path,
-          commitPathspecs: entry.commitPathspecs,
-          expectedWorktreeState: entry.expectedWorktreeState,
-          rawWorktreeBlobOid: entry.rawWorktreeBlobOid,
-        }));
-      if (members.length === 0) throw new Error(`package has no dirty members: ${packageId}`);
-      const boundary = await deps.captureFinalizationBoundary(
-        workspace.id,
-        `lares:finalization:${packageId}`,
-      );
-      return {
-        packageId,
-        repositoryKey: repository.repositoryKey,
-        finalizedBy: 'human-ipc',
-        checkpointTurnId: null,
-        boundaryOid: boundary.oid,
-        contractVersion,
-        createdFromWorkspaceId: workspace.id,
-        members,
-        repoRoot: scope.repoRoot,
-        pinnedHeadOid: scope.pinnedHeadOid,
-        gitExe,
-        runGit,
-        runGitBytes,
-        queue: deps.queue,
-        commonDirQueueKey: deps.queue ? repository.objectDatabaseKey : undefined,
-      };
-    }
-    throw new Error(`unknown fleet-adhoc package: ${packageId}`);
+    const scope = await assembleScope(targetWorkspaceId);
+    const repository = scope.context.repository;
+    const componentId = packageId.startsWith('component:')
+      ? packageId.slice('component:'.length)
+      : packageId;
+    const component = scope.context.components.find((candidate) => candidate.componentId === componentId);
+    const entryIds = component
+      ? component.dirtyEntryIds
+      : packageId === `unattributed:${repository.repositoryKey}`
+        ? scope.context.inventory.unattributedEntryIds
+        : null;
+    if (!entryIds) throw new Error(`unknown fleet-adhoc package: ${packageId}`);
+    const entriesById = new Map(scope.context.inventory.entries.map((entry) => [entry.entryId, entry]));
+    const members = entryIds
+      .map((entryId) => entriesById.get(entryId))
+      .filter((entry): entry is DirtyEntry => entry !== undefined)
+      .map((entry): CommitRepresentationEntry => ({
+        path: entry.path,
+        commitPathspecs: entry.commitPathspecs,
+        expectedWorktreeState: entry.expectedWorktreeState,
+        rawWorktreeBlobOid: entry.rawWorktreeBlobOid,
+      }));
+    if (members.length === 0) throw new Error(`package has no dirty members: ${packageId}`);
+    const boundary = await deps.captureFinalizationBoundary(
+      targetWorkspaceId,
+      `lares:finalization:${packageId}`,
+    );
+    return {
+      packageId,
+      repositoryKey: repository.repositoryKey,
+      finalizedBy: 'human-ipc',
+      checkpointTurnId: null,
+      boundaryOid: boundary.oid,
+      contractVersion,
+      createdFromWorkspaceId: targetWorkspaceId,
+      members,
+      repoRoot: scope.repoRoot,
+      pinnedHeadOid: scope.pinnedHeadOid,
+      gitExe,
+      runGit,
+      runGitBytes,
+      queue: deps.queue,
+      commonDirQueueKey: deps.queue ? repository.objectDatabaseKey : undefined,
+    };
   }
 
   const saveCardFinalizeRoutes: SaveCardFinalizeRoutes = {
-    resolveBoundary: (request) => resolveFleetBoundary(request.packageId),
+    resolveBoundary: (request) => resolveFleetBoundary(request.packageId, request.targetWorkspaceId),
   };
   const productionSeams: PreviewProductionSeams = {
     candidateService: service,
