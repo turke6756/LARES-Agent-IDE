@@ -1,16 +1,9 @@
-// GT-C Decision 2 (§2.5/§2.7) — launch_agent rail-dispatch shim suffix test.
-//
-// Drives handleOrchestrationToolCall('launch_agent', …) against a fake apiRequest
-// that captures the POST /input body, and asserts:
-//   • a plan-rail launch (plan_id + section_anchor) appends the WRITER contract
-//     block to the submitted prompt;
-//   • a non-rail launch submits args.prompt verbatim.
+// launch_agent prompt forwarding tests.
 //
 // Run via: node scripts/mcp-tools-orchestration.test.js
 
 const assert = require('assert');
 const { getOrchestrationToolDefinitions, handleOrchestrationToolCall } = require('./mcp-tools-orchestration');
-const { planRailContractBlock } = require('./lib/plan-rail-contract.js');
 
 const tests = [];
 function test(name, fn) { tests.push({ name, fn }); }
@@ -40,7 +33,7 @@ test('launch_agent provider enum includes agy', () => {
   assert.ok(launch.inputSchema.properties.provider.enum.includes('agy'));
 });
 
-test('rail launch (plan_id + section_anchor) appends the writer contract to the submitted prompt', async () => {
+test('rail launch submits args.prompt verbatim', async () => {
   const { apiRequest, captured } = makeFakeApi();
   await handleOrchestrationToolCall('launch_agent', {
     title: 'Rail worker',
@@ -50,17 +43,10 @@ test('rail launch (plan_id + section_anchor) appends the writer contract to the 
   }, apiRequest);
 
   assert.ok(captured.inputBody, 'the /input route must have been called');
-  const expected = 'Do the thing.' + '\n\n' + planRailContractBlock('plan-42', 'sec_abc123');
-  assert.strictEqual(captured.inputBody.text, expected, 'submitted prompt must be the base prompt + writer contract');
-  // WP-P0B: the appended block is orientation only — it names the plan + section
-  // but carries NO per-turn sentinel and NO read-before-edit discipline.
-  assert.ok(captured.inputBody.text.includes('plan-42') && captured.inputBody.text.includes('sec_abc123'),
-    'the appended block names the bound plan + section');
-  assert.ok(!captured.inputBody.text.includes('raw+editWindow') && !captured.inputBody.text.includes('PLAN-EVENT'),
-    'the appended block must NOT carry the retired read-before-edit / per-turn-sentinel ceremony');
+  assert.strictEqual(captured.inputBody.text, 'Do the thing.', 'submitted prompt must be verbatim');
 });
 
-test('non-rail launch submits args.prompt verbatim (no contract appended)', async () => {
+test('non-rail launch submits args.prompt verbatim', async () => {
   const { apiRequest, captured } = makeFakeApi();
   await handleOrchestrationToolCall('launch_agent', {
     title: 'Plain worker',
@@ -69,10 +55,9 @@ test('non-rail launch submits args.prompt verbatim (no contract appended)', asyn
 
   assert.ok(captured.inputBody, 'the /input route must have been called');
   assert.strictEqual(captured.inputBody.text, 'Do the thing.', 'submitted prompt must be verbatim for a non-rail launch');
-  assert.ok(!captured.inputBody.text.includes('Plan-rail contract'), 'no rail contract for a non-rail launch');
 });
 
-test('plan_id without section_anchor submits verbatim (gate needs both)', async () => {
+test('plan_id without section_anchor submits verbatim', async () => {
   const { apiRequest, captured } = makeFakeApi();
   await handleOrchestrationToolCall('launch_agent', {
     title: 'Half-rail worker',

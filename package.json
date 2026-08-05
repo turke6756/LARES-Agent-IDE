@@ -14,7 +14,7 @@
     "test:renderer": "vitest run --config vitest.config.ts",
     "test:media": "npm run build:main && node dist/main/main/media-protocol.test.js",
     "test:supervisor": "npm run build:main && node scripts/run-main-tests.mjs",
-    "test:plans": "npm run build:main && node dist/main/main/plans-data-layer.test.js && node dist/main/main/api-server-plans.test.js && node dist/main/main/api-server-plans-create.test.js && node dist/main/main/api-server-focus.test.js && node dist/main/main/plans-watcher.test.js && node dist/main/main/plans/watch-plans.test.js && node dist/main/main/plans-snapshot-db.test.js && node dist/main/main/plans-provenance-db.test.js && node scripts/mcp-tools-plans.test.js",
+    "test:plans": "npm run build:main && node dist/main/main/plans-data-layer.test.js && node dist/main/main/api-server-plans.test.js && node dist/main/main/api-server-plans-create.test.js && node dist/main/main/api-server-focus.test.js && node dist/main/main/plans-watcher.test.js && node dist/main/main/plans-snapshot-db.test.js && node dist/main/main/plans-provenance-db.test.js && node scripts/mcp-tools-plans.test.js",
     "analytics:snapshot": "npm run build:main && electron dist/main/main/analytics-export/analytics-snapshot-cli.js",
     "analytics:snapshot:fast": "electron dist/main/main/analytics-export/analytics-snapshot-cli.js",
     "test:analytics": "npm run build:main && node dist/main/main/context-overhead/overhead-dto.test.js && node dist/main/main/analytics-export/analytics-exporter.test.js && node dist/main/main/api-server-overhead-route.test.js",
@@ -62,8 +62,7 @@
           "mcp-tools-notebooks.js",
           "mcp-tools-checkpoints.js",
           "mcp-browser-tools.js",
-          "mcp-browser-present-tools.js",
-          "lib/**"
+          "mcp-browser-present-tools.js"
         ]
       },
       {

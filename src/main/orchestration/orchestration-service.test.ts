@@ -17,7 +17,6 @@ import os from 'node:os';
 import path from 'node:path';
 import { OrchestrationService } from './service';
 import { DashboardClient, OrchestrationRun, OrchestrationRunContext, OrchestrationRunner } from './types';
-import { trailMaterializer } from '../plans/execution-trail-writer';
 
 // ── In-memory DB patch ───────────────────────────────────────────────
 // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -272,7 +271,7 @@ test('WP6: runs without a planId may coexist', () => {
 
 // ── GT-C §1.6 / §1.10 — T1 trail materialization ordering ────────────
 
-test('GT-C T1: a rail run materializes the trail while STILL running, exempts its members, skips stampPlanMembers', async () => {
+test('a rail run skips legacy stampPlanMembers', async () => {
   const gate = deferred();
   const runner: OrchestrationRunner = async () => { await gate.promise; };
   const svc = new OrchestrationService(makeClient(), makeDeliver().fn, { serial: runner, parallel: runner });
@@ -280,36 +279,14 @@ test('GT-C T1: a rail run materializes the trail while STILL running, exempts it
   let stampCalled = false;
   (svc as any).stampPlanMembers = () => { stampCalled = true; };
 
-  const calls: Array<{ planId: string; statusAtCall: string | undefined; opts: any }> = [];
-  const orig = trailMaterializer.materialize;
-  let runId = '';
-  (trailMaterializer as any).materialize = async (planId: string, opts?: any) => {
-    calls.push({ planId, statusAtCall: getRun(runId)?.status, opts });
-  };
-  try {
-    const started = svc.start_run(baseReq({
-      planId: 'plan-t1', sectionAnchor: 'sec_z',
-      resumeLeadId: 'lead-1', resumeReviewerId: 'rev-1',
-    }));
-    runId = started.runId;
-    await waitFor(() => getRun(runId)?.status === 'running');
-    gate.resolve();
-    await waitFor(() => getRun(runId)?.status === 'complete');
-
-    assert.equal(calls.length, 1, 'materialize invoked exactly once for the rail run');
-    assert.equal(calls[0].planId, 'plan-t1');
-    assert.equal(calls[0].statusAtCall, 'running',
-      'materialize fired while the run row is still running');
-    assert.equal(calls[0].opts.completingRunId, runId, 'the completing run exempts itself');
-    assert.deepEqual(calls[0].opts.exemptAgentIds, ['lead-1', 'rev-1'],
-      'its own members are exempt (they may still be idle)');
-    assert.equal(stampCalled, false, 'the legacy whole-file stamp is SKIPPED on a rail surface');
-  } finally {
-    (trailMaterializer as any).materialize = orig;
-  }
+  const { runId } = svc.start_run(baseReq({ planId: 'plan-t1', sectionAnchor: 'sec_z' }));
+  await waitFor(() => getRun(runId)?.status === 'running');
+  gate.resolve();
+  await waitFor(() => getRun(runId)?.status === 'complete');
+  assert.equal(stampCalled, false, 'the legacy whole-file stamp is skipped on a rail surface');
 });
 
-test('GT-C T1: a NON-rail run never materializes the trail and DOES stamp', async () => {
+test('a non-rail run stamps its legacy fresh-file output', async () => {
   const gate = deferred();
   const runner: OrchestrationRunner = async () => { await gate.promise; };
   const svc = new OrchestrationService(makeClient(), makeDeliver().fn, { serial: runner, parallel: runner });
@@ -317,19 +294,11 @@ test('GT-C T1: a NON-rail run never materializes the trail and DOES stamp', asyn
   let stampCalled = false;
   (svc as any).stampPlanMembers = () => { stampCalled = true; };
 
-  let materializeCalls = 0;
-  const orig = trailMaterializer.materialize;
-  (trailMaterializer as any).materialize = async () => { materializeCalls++; };
-  try {
-    const { runId } = svc.start_run(baseReq()); // no planId → legacy fresh-file run
-    await waitFor(() => getRun(runId)?.status === 'running');
-    gate.resolve();
-    await waitFor(() => getRun(runId)?.status === 'complete');
-    assert.equal(materializeCalls, 0, 'no plan rail → no trail materialization');
-    assert.equal(stampCalled, true, 'the non-rail path still stamps groupthink_run');
-  } finally {
-    (trailMaterializer as any).materialize = orig;
-  }
+  const { runId } = svc.start_run(baseReq());
+  await waitFor(() => getRun(runId)?.status === 'running');
+  gate.resolve();
+  await waitFor(() => getRun(runId)?.status === 'complete');
+  assert.equal(stampCalled, true, 'the non-rail path still stamps groupthink_run');
 });
 
 // ── Runner ───────────────────────────────────────────────────────────

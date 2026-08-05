@@ -2,29 +2,6 @@
 // These embed planPath and the deliberation contract that BUG-29 and the relay
 // loop depend on; do not paraphrase. Keep the wording byte-identical to the
 // script so behavior is unchanged across the in-process cutover.
-//
-// GT-C Decision 2 (§2.4): when a run carries a plan-rail (`planId` + `sectionAnchor`),
-// append the canonical rail-claim contract to the kickoff — writers get the
-// edit-discipline + PLAN-EVENT block (`planRailContractBlock`), non-writing
-// reviewer/R2 turns get the claim-only block (`planClaimConventionBlock`). The
-// append happens ONLY in the plan-rail branch; the no-rail path stays
-// byte-identical to the legacy verbatim script.
-
-import { planRailContractBlock, planClaimConventionBlock } from '../plans/plan-rail-contract';
-
-/** Append the writer rail contract when this is a plan-rail run. No-rail
- *  (missing planId/sectionAnchor) returns the base prompt byte-identically. */
-function withWriterContract(base: string, planId?: string, sectionAnchor?: string): string {
-  if (planId && sectionAnchor) return `${base}\n\n${planRailContractBlock(planId, sectionAnchor)}`;
-  return base;
-}
-
-/** Append the non-writer (review-turn) rail contract when this is a plan-rail
- *  run. No-rail returns the base prompt byte-identically. */
-function withReviewerContract(base: string, planId?: string, sectionAnchor?: string): string {
-  if (planId && sectionAnchor) return `${base}\n\n${planClaimConventionBlock(planId, sectionAnchor)}`;
-  return base;
-}
 
 // WP6: when a run carries a planning-surface rail, the deliverable is a native
 // Edit of one section of an EXISTING registered plan surface, not a fresh
@@ -36,12 +13,12 @@ function writebackClause(planPath: string, sectionAnchor?: string): string {
     return `write the plan file to ${planPath}`;
   }
   return `write the finalized plan by NATIVELY EDITING the existing plan surface at ${planPath}, ` +
-    `into the section anchored \`${sectionAnchor}\` (read it first with the plan read tools, then Edit that zone in place). ` +
+    `into the section anchored \`${sectionAnchor}\` (Edit that zone in place). ` +
     `Do NOT create a new file and do NOT edit any other section — the run completes when that section's content changes`;
 }
 
-export function serialLeadPrompt(topic: string, planPath: string, sectionAnchor?: string, planId?: string): string {
-  return withWriterContract(`You are the Lead Planner in a GroupThink deliberation.
+export function serialLeadPrompt(topic: string, planPath: string, sectionAnchor?: string, _planId?: string): string {
+  return `You are the Lead Planner in a GroupThink deliberation.
 
 Topic: ${topic}
 
@@ -51,11 +28,11 @@ Plan schema when you finalize: file paths, specific edits, clear instructions a 
 
 Termination contract: ${writebackClause(planPath, sectionAnchor)} ONLY after the Reviewer has explicitly approved the latest draft in their own message. The write ends the orchestration — a premature write terminates the deliberation before consensus.
 
-Begin by producing your first draft of the plan as your next message.`, planId, sectionAnchor);
+Begin by producing your first draft of the plan as your next message.`;
 }
 
-export function serialReviewerKickoff(topic: string, leadDraft: string, sectionAnchor?: string, planId?: string): string {
-  return withReviewerContract(`You are the Reviewer in a GroupThink deliberation.
+export function serialReviewerKickoff(topic: string, leadDraft: string, _sectionAnchor?: string, _planId?: string): string {
+  return `You are the Reviewer in a GroupThink deliberation.
 
 Topic: ${topic}
 
@@ -69,21 +46,21 @@ The Lead's first draft follows below. Respond with your initial review.
 
 ---
 
-${leadDraft}`, planId, sectionAnchor);
+${leadDraft}`;
 }
 
-export function parallelR1Prompt(topic: string, sectionAnchor?: string, planId?: string): string {
-  return withWriterContract(`You are one of two independent planners working in parallel on the same topic. Produce your strongest independent plan; you will see the other planner's draft afterward and have one round to compare notes before a synthesis turn.
+export function parallelR1Prompt(topic: string, _sectionAnchor?: string, _planId?: string): string {
+  return `You are one of two independent planners working in parallel on the same topic. Produce your strongest independent plan; you will see the other planner's draft afterward and have one round to compare notes before a synthesis turn.
 
 Topic: ${topic}
 
 Plan schema: file paths, specific edits, clear instructions a worker agent could execute without further questions.
 
-Do not write meta-narration ("I'll now do X", "I just finished Y") — produce the plan content itself. Begin your draft now.`, planId, sectionAnchor);
+Do not write meta-narration ("I'll now do X", "I just finished Y") — produce the plan content itself. Begin your draft now.`;
 }
 
-export function parallelR2Prompt(otherR1: string, sectionAnchor?: string, planId?: string): string {
-  return withReviewerContract(`The other planner produced this independent take on the same topic:
+export function parallelR2Prompt(otherR1: string, _sectionAnchor?: string, _planId?: string): string {
+  return `The other planner produced this independent take on the same topic:
 
 ---
 
@@ -93,11 +70,11 @@ ${otherR1}
 
 Compare it to your own draft. Where do you agree? Where do you disagree, and why? Refine your view in light of their reasoning.
 
-Do NOT write a final plan file yet — focus on engaging with the differences. A synthesis turn will follow.`, planId, sectionAnchor);
+Do NOT write a final plan file yet — focus on engaging with the differences. A synthesis turn will follow.`;
 }
 
-export function parallelSynthesisPrompt(otherR2: string, planPath: string, sectionAnchor?: string, planId?: string): string {
-  return withWriterContract(`Here is the other planner's reaction after seeing your initial draft and engaging with the differences:
+export function parallelSynthesisPrompt(otherR2: string, planPath: string, sectionAnchor?: string, _planId?: string): string {
+  return `Here is the other planner's reaction after seeing your initial draft and engaging with the differences:
 
 ---
 
@@ -109,5 +86,5 @@ You now have full context: your initial draft, the other planner's initial take,
 
 Identify where you both agree. Identify where you disagree and pick the right middle ground with reasoning. ${writebackClause(planPath, sectionAnchor).replace(/^write /, 'Write ')}.
 
-Plan schema: file paths, specific edits, clear instructions a worker agent could execute without further questions. The write ends the orchestration.`, planId, sectionAnchor);
+Plan schema: file paths, specific edits, clear instructions a worker agent could execute without further questions. The write ends the orchestration.`;
 }

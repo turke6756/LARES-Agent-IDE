@@ -1056,7 +1056,7 @@ export function registerBlameToIntentIpc(
     runBlameToIntent(rawRequest, query));
 }
 
-export function registerPlanIpc(_legacyManager?: unknown): void {
+export function registerPlanIpc(): void {
   ipcMain.handle(
     'plan-folder:list',
     (_e, workspaceId: string, workspaceRoot: string, pathType?: PathType) =>

@@ -22,16 +22,10 @@ import * as v8 from 'node:v8';
 import { loadPersistedTheme } from './theme-persistence';
 import {
   initDatabase, getWorkspaces, getActiveAgents, getAllAgents, reconcileStaleOpenContinuationAttempts,
-  getPlan, getWorkspace, listOrchestrationRuns, getLiveRailAgentForPlan, getPlanEventsForRender,
+  getWorkspace,
   setWitnessObserver, getAgent, listTurnRecords,
   insertPendingCommitAttempt, resolveCommitAttempt,
 } from './database';
-import { createHash } from 'crypto';
-import { readFileContents } from './file-reader';
-import { getServedPlanProjection } from './plans/watch-plans';
-import { trailMaterializer } from './plans/execution-trail-writer';
-import { EXEC_TRAIL_MAX_ENTRIES, observedViaLabel, type TrailEntry } from './plans/execution-trail';
-import { formatRepoDigest } from './plans/repo-activity';
 import { validateAndRepairClaudeJson, validateAndRepairWslClaudeJson, startClaudeJsonRuntimeWatcher, stopClaudeJsonRuntimeWatcher } from './claude-config-repair';
 import { checkManagedWebContents } from './security/webcontents-guard';
 import { AgentSupervisor } from './supervisor';
@@ -74,12 +68,10 @@ import { providePromotionService, providePlanPreviewRoutes, type PromotionServic
 import { makePromotionClaimScan } from './plans/promotion-claim-scan';
 import { getProposalById } from './plans/plan-gallery';
 import type { PromotionRequestRow } from './database';
-import { configureReparser, reparsePlanFile } from './plans/watch-plans';
 import { JUPYTER_BASE_PORT, JUPYTER_PORT_RETRIES } from './control-ports';
 import { buildChromeUA } from './browser/browser-decisions';
 import { BrowserManager } from './browser/browser-manager';
 import { registerBrowserIpc } from './browser/browser-ipc';
-import { PlanPaneManager } from './plans/plan-pane-manager';
 import { registerPlanIpc } from './plans/plan-ipc';
 import { stripClaudeChildEnvInPlace } from './supervisor/env-sanitize';
 import { ensureNodeShimDir } from './node-shim';
@@ -171,14 +163,6 @@ try {
   /* diagnostic only */
 }
 
-/** Join a workspace-relative `plans/…` path onto the workspace root (host sep).
- *  Mirrors api-server.ts `absPlanPath` — kept local to avoid a cross-module import
- *  for the Execution-Trail materializer wiring. */
-function planAbsPath(wsPath: string, relPath: string): string {
-  const sep = wsPath.includes('\\') ? '\\' : '/';
-  const base = wsPath.replace(/[\\/]+$/, '');
-  return `${base}${sep}${relPath.replace(/\//g, sep)}`;
-}
 function logCrash(kind: string, err: unknown): void {
   const detail = err instanceof Error ? (err.stack ?? err.message) : String(err);
   try {
@@ -313,9 +297,6 @@ let heapTelemetry: HeapTelemetry | null = null;
 let renderRecovery: RenderRecoveryPolicy | null = null;
 // WAVE-4 full-D5: per-agent memory attribution + budget/owned-cap admission.
 let attributionService: AttributionService | null = null;
-// WP5 mount: the sandboxed plan render pane (one WebContentsView, driven by the
-// renderer's plan-tab bounds handoff). Constructed once at ready.
-let planPaneManager: PlanPaneManager | null = null;
 // B2 D5: per-workspace `plans/` watcher (sole `plans/` fs subscription owner, F-C).
 let plansWatcher: PlansWatcher | null = null;
 
@@ -601,9 +582,6 @@ function createWindow(): void {
   const shellContents = mainWindow.webContents;
   mainWindow.on('closed', () => {
     trustedContents.delete(shellContents);
-    // WP5 mount: tear down the plan render pane's WebContentsView with its host
-    // window so it can't outlive the shell.
-    planPaneManager?.destroy();
     mainWindow = null;
   });
 }
@@ -956,18 +934,12 @@ app.whenReady().then(async () => {
       trustedContents,
       setConstructingDetached: (v: boolean) => { constructingDetached = v; },
       getMainWindow: () => mainWindow,
-      // View tear-off re-parenting for the native-view-backed views: move the
-      // plan pane / browser tabs into the detached window on detach, home on
-      // close. The managers are constructed later in this same ready handler, so
-      // these closures read the module-level `let`s lazily at fire time (a detach
-      // can only happen long after the managers exist).
+      // View tear-off re-parenting for native browser tabs.
       onViewWindowReady: (view, win) => {
-        if (view === 'plans') planPaneManager?.reparentTo(win);
-        else if (view === 'browser') browserManager?.reparentTo(win);
+        if (view === 'browser') browserManager?.reparentTo(win);
       },
       onViewWindowClosing: (view) => {
-        if (view === 'plans') planPaneManager?.reparentHome();
-        else if (view === 'browser') browserManager?.reparentHome();
+        if (view === 'browser') browserManager?.reparentHome();
       },
     };
     registerIpcHandlers(supervisor, mainWindow!, detachedWindowDeps);
@@ -1008,32 +980,7 @@ app.whenReady().then(async () => {
     // can never observe a stale pre-retry port.
     const apiPort = await apiServer.start();
     supervisor.setApiServerPort(apiPort);
-    // B2 D5 + WP4 (F-C): boot the plans watcher with the reparse callback.
-    // `plans-watcher.ts` is the SOLE `plans/` subscription owner; WP4 injects
-    // `onPlanSettled` (a constructor dep, not a hard import) so each settled live
-    // plan row is reparsed → section-cache → plan_section_changes → snapshot.
-    configureReparser();
-    plansWatcher = startPlansWatcher({
-      onPlanSettled: async (plan) => {
-        const outcome = await reparsePlanFile(plan);
-        // WP5: fs change → reparse → full re-render. The reparse just refreshed
-        // the served projection (last-good in memory); tell the renderer to
-        // re-fetch and re-render this plan surface. This rides the SAME reparse
-        // path — NOT a second `plans/` fs subscription (F-C: plans-watcher owns
-        // the only one). No in-place DOM patching: the renderer does a full
-        // re-render off the fresh projection.
-        if (mainWindow && !mainWindow.isDestroyed()) {
-          mainWindow.webContents.send('plan-surface:changed', {
-            planId: outcome.planId,
-            parseError: outcome.parseError,
-            degradedFrom: outcome.degradedFrom,
-          });
-        }
-        // WP5 mount: re-render the sandboxed pane from the freshly-served
-        // projection (no-op unless THIS plan is the one currently shown).
-        planPaneManager?.refresh(outcome.planId);
-      },
-    });
+    plansWatcher = startPlansWatcher();
     // ── WP-P3-wire — promotion runtime assembly ─────────────────────────────
     // Close the seams WP-P3C′ + WP-P3-reconcile left open. Build the deps-bound
     // WP-P3B-core promotion service (resolveProposal + claim-scan + the supervisor
@@ -1143,96 +1090,6 @@ app.whenReady().then(async () => {
         }
       })
       .catch((err) => console.error('[promotion reconcile] boot sweep failed', err));
-    // GT-C Decision 1 (Configure site) — arm the Execution-Trail materializer ONCE,
-    // now that the DB, the served-projection/reparse pipeline, and workspace
-    // resolution are all live. Every dep re-derives from DB/fs on demand so the
-    // materialized `sec_exectr` cache and `plan_events` can never diverge.
-    trailMaterializer.configure({
-      readPlanFile: async (planId) => {
-        const plan = getPlan(planId);
-        if (!plan || plan.deletedAt) return null;
-        const ws = getWorkspace(plan.workspaceId);
-        if (!ws) return null;
-        const fc = await readFileContents(planAbsPath(ws.path, plan.path), ws.pathType);
-        if (fc.error || typeof fc.content !== 'string') return null;
-        return fc.content;
-      },
-      writePlanFile: async (planId, html) => {
-        const plan = getPlan(planId);
-        if (!plan || plan.deletedAt) return;
-        const ws = getWorkspace(plan.workspaceId);
-        if (!ws) return;
-        // Resolve to a host-writable path (WSL plans convert to their \\wsl$ UNC
-        // form). Atomic: write a sibling tmp then rename over the target.
-        let abs = planAbsPath(ws.path, plan.path);
-        if (ws.pathType === 'wsl') abs = wslToWindowsPath(abs);
-        const tmp = `${abs}.exectr.tmp`;
-        fs.writeFileSync(tmp, html, 'utf8');
-        fs.renameSync(tmp, abs);
-      },
-      // Rec #5 (planning-surface-hardening-review) — compare-and-swap write. The
-      // sibling CAS writer calls this optional dep so a human/out-of-band save that
-      // lands after the materializer's last reread cannot be clobbered; without it
-      // the writer runs its weaker fallback.
-      writePlanFileIfUnchanged: async (planId, html, expectedHash) => {
-        const plan = getPlan(planId);
-        if (!plan || plan.deletedAt) return 'conflict';
-        const ws = getWorkspace(plan.workspaceId);
-        if (!ws) return 'conflict';
-        let abs = planAbsPath(ws.path, plan.path);
-        if (ws.pathType === 'wsl') abs = wslToWindowsPath(abs);
-        // Atomic compare-and-swap: synchronous reread → hash-compare → rename with
-        // no intervening event-loop turn, so a human/out-of-band save landing after
-        // the materializer's last reread cannot be clobbered (review rec #5).
-        let current: string;
-        try {
-          current = fs.readFileSync(abs, 'utf8');
-        } catch {
-          return 'conflict'; // vanished/unreadable under us → treat as contention
-        }
-        if (createHash('sha256').update(current, 'utf8').digest('hex') !== expectedHash) {
-          return 'conflict';
-        }
-        const tmp = `${abs}.exectr.tmp`;
-        fs.writeFileSync(tmp, html, 'utf8');
-        fs.renameSync(tmp, abs);
-        return 'written';
-      },
-      hasLiveOrchestration: (planId, exemptRunId) =>
-        listOrchestrationRuns().some(
-          (r) => r.planId === planId && r.runId !== exemptRunId && (r.status === 'starting' || r.status === 'running'),
-        ),
-      getLiveRailAgentForPlan: (planId, exemptAgentIds) => getLiveRailAgentForPlan(planId, exemptAgentIds),
-      listTrailEntries: (planId) => {
-        const projection = getServedPlanProjection(planId);
-        const headingFor = (anchor: string | null): string => {
-          if (!anchor) return '(unattributed)';
-          const s = projection?.sections.find((x) => x.anchor === anchor);
-          return s?.heading ?? anchor;
-        };
-        const writes = getPlanEventsForRender(planId).filter((e) => e.changeCount > 0);
-        const last = writes.slice(-EXEC_TRAIL_MAX_ENTRIES); // oldest→newest, last ≤200
-        return last.map((e): TrailEntry => {
-          return {
-            planEventId: e.id,
-            createdAt: e.createdAt,
-            agentTitle: e.agentTitle ?? e.agentId,
-            sectionHeading: headingFor(e.observedSectionAnchor),
-            viaLabel: observedViaLabel(e.observedVia),
-            // P0 Fix-1 (planning-surface-hardening-review) — the claimed self-report
-            // (`e.claimedPayload.result`) is agent narration and is DELIBERATELY NOT
-            // surfaced on the system-owned trail line. Only server-derived fields
-            // (attribution + observed-via) and the witnessed digest below are
-            // rendered, so a forged `result` can never sit beside trusted attribution.
-            // Fix-4 §5c — the witnessed digest for this write-turn (null when no
-            // repo activity was captured). `e.repoActivity` is the tolerantly-parsed
-            // blob from getPlanEventsForRender.
-            repoDigest: formatRepoDigest(e.repoActivity?.totals ?? null),
-          };
-        });
-      },
-      hashHtml: (html) => createHash('sha256').update(html, 'utf8').digest('hex'),
-    });
     // Context-brick Inc 5A — replace the relaunch route's conservative
     // awaiting-human stub with the real predicate (question-waiting latch OR
     // idle + ends-with-question cache).
@@ -1247,11 +1104,7 @@ app.whenReady().then(async () => {
     // EADDRINUSE auto-increment — never a hardcoded 24678.
     browserManager = new BrowserManager(() => mainWindow, apiPort);
     registerBrowserIpc(browserManager);
-    // WP5 mount: the plan render pane + its data/lifecycle IPC. Same factory
-    // pattern as the browser manager (`() => mainWindow`); kept out of
-    // ipc-handlers.ts to avoid contention, exactly like registerBrowserIpc.
-    planPaneManager = new PlanPaneManager(() => mainWindow);
-    registerPlanIpc(planPaneManager);
+    registerPlanIpc();
     // WP2-B ⇄ WP2-A seam: inject the Phase-2 browser-tool facade into the
     // API server. Setter, not constructor param, because the manager is
     // constructed AFTER the awaited apiServer.start() (its M2 filter needs

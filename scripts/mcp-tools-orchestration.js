@@ -1,10 +1,4 @@
 const { decidePollAction } = require('./mcp-supervisor-poll');
-// GT-C Decision 2 (§2.5): when a launch_agent call carries a plan-rail
-// (plan_id + section_anchor), append the canonical WRITER rail contract to the
-// submitted prompt so a launch_agent worker gets the same edit-discipline +
-// PLAN-EVENT sentinel as GroupThink writers. Byte-identical mirror of the TS
-// canonical (src/main/plans/plan-rail-contract.ts), guarded by the sync test.
-const { planRailContractBlock } = require('./lib/plan-rail-contract.js');
 
 function getOrchestrationToolDefinitions() {
   return [
@@ -30,8 +24,8 @@ function getOrchestrationToolDefinitions() {
           is_researcher: { type: 'boolean', description: 'Launch the workspace RESEARCHER role-lane (default: false). The researcher browses + researches the web and writes findings into .lares/research/inbox/, but cannot run Bash, edit code, run notebooks, or launch agents. Claude-only (non-claude is rejected). When true, the app manages cwd/command/tools and the browser MCP — `provider`, `command`, `template_id`, and `persona` are ignored.' },
           mode: { type: 'string', enum: ['worker', 'supervisor-peer'], description: 'Launch class (default: worker). `worker` launches an owned child under you. `supervisor-peer` launches a TOP-LEVEL peer supervisor with NO owner edge (renders un-nested), with the supervisor toolset and .lares/supervisor cwd. Peer mode is the ONLY way to launch into a workspace other than your own (pass `workspace_id`), and cross-workspace peer launch requires supervisor privilege. `supervisor-peer` is incompatible with `is_researcher`/`persona`.' },
           fresh_session: { type: 'boolean', description: 'Codex-only hint (default: false). When true, the agent launches without `codex resume` so the codex CLI mints a fresh conversation rather than inheriting any prior rollout in this workspace. The dashboard still discovers and binds the new session id. Use this when you want a clean context but parallel agents in the same workspace. No-op for non-codex providers.' },
-          plan_id: { type: 'string', description: 'Planning-surface rail: an existing registered plan id. Frozen onto the agent at launch and injected as AGENT_DASHBOARD_PLAN_ID so the worker\'s read/edit breadcrumbs and plan_events attribute to this plan. The launch route 400s an unknown plan_id.' },
-          section_anchor: { type: 'string', description: 'Planning-surface rail: the sec_ section anchor this agent is dispatched to write. Frozen at launch and injected as AGENT_DASHBOARD_PLAN_SECTION (the dispatched-intent fallback when no read/edit breadcrumb is observed). Set it to the section the worker will UPDATE — for checklist execution that is sec_opitem. NEVER dispatch to sec_exectr (the execution trail is system-owned, auto-generated from trusted write events; a writer there is dropped from attribution). The plan-bound brief must mandate a turn-end writeback: the worker flips its completed items\' `&#9744;`→`&#9745;` in this section (native HTML edit) and emits a `<!--PLAN-EVENT …-->` sentinel — that edit is what materializes the trail lines and the visible checkmarks.' },
+          plan_id: { type: 'string', description: 'Planning-surface rail: an existing registered plan id. Frozen onto the agent at launch and injected as AGENT_DASHBOARD_PLAN_ID. The launch route 400s an unknown plan_id.' },
+          section_anchor: { type: 'string', description: 'Planning-surface rail: the section this agent is dispatched to update. Frozen at launch and injected as AGENT_DASHBOARD_PLAN_SECTION. The plan-bound brief must identify the owned write target and required durable writeback.' },
         },
         required: ['title'],
       },
@@ -184,7 +178,7 @@ function getOrchestrationToolDefinitions() {
           turn_timeout_ms:    { type: 'number', description: 'Per-turn stall timeout, default 600000.' },
           plan_id:            { type: 'string', description: 'Plan rail: an existing registered plan id. The run targets that plan at section_anchor instead of writing a fresh plan file.' },
           planning_intent_id: { type: 'string', description: 'Marked PLAN-INTENT id served by this planning deliberation. Requires plan_id; the server validates same-plan active status before launch.' },
-          section_anchor:     { type: 'string', description: 'Plan rail: the sec_ section this run writes (required with plan_id); never sec_exectr.' },
+          section_anchor:     { type: 'string', description: 'Plan rail: the section this run updates (required with plan_id).' },
           resume_run_id:      { type: 'string', description: 'Resume a prior stalled run by its runId.' },
           resume_lead_id:     { type: 'string', description: 'Legacy serial resume: lead agent id.' },
           resume_reviewer_id: { type: 'string', description: 'Legacy serial resume: reviewer agent id.' },
@@ -309,15 +303,9 @@ async function handleOrchestrationToolCall(name, args, apiRequest) {
           // result reports whether the worker turn ACTUALLY started — not
           // just that bytes were typed.
           const submit = args.submit !== false;
-          // Rail dispatch: a plan-bound launch (plan_id + section_anchor) gets the
-          // writer contract appended to the submitted prompt. Non-rail launches
-          // send args.prompt verbatim.
-          const submittedPrompt = (args.plan_id && args.section_anchor)
-            ? args.prompt + '\n\n' + planRailContractBlock(args.plan_id, args.section_anchor)
-            : args.prompt;
           try {
             const r = await apiRequest('POST', `/api/agents/${agent.id}/input`, {
-              text: submittedPrompt,
+              text: args.prompt,
               submit,
               confirm: submit,
             });

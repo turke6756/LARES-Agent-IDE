@@ -1,5 +1,5 @@
 // Fix-4: witnessed repo-activity — pure caps / normalization / digest wording.
-// NO DB/FS I/O (mirrors execution-trail.ts's pure-render pattern). Imports ONLY
+// NO DB/FS I/O. Imports ONLY
 // shared types; this module owns the LOGIC and the cap/wording constants.
 import type {
   FileActivity,

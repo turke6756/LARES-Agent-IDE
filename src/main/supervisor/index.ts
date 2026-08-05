@@ -182,15 +182,10 @@ import {
   getLatestContinuationAttempt,
   insertAgentSession, closeAgentSession,
   getAgentsByOwner,
-  getPlan, planItemInPlan, recordPlanSectionTouch,
-  getTurnSectionTouches, getTurnSectionChanges, insertPlanEvent, getTurnRepoActivity,
+  getPlan, planItemInPlan,
   getDb,
   bindPromotionAgentAtomic,
 } from '../database';
-import { PlanTouchTracker } from '../plans/plan-touch-tracker';
-import { composePlanEvent, planEventTurnKey, TurnComposeGuard } from '../plans/plan-events';
-import { trailMaterializer } from '../plans/execution-trail-writer';
-import { resolveEditTargetAnchorForPlan } from '../plans/watch-plans';
 import { detectPathType, windowsToWslPath, uncToWslPath, wslToWindowsPath } from '../path-utils';
 import { getScriptPath, getLaresNativeDir } from './paths';
 import {
@@ -874,10 +869,6 @@ export function parseLatestClaudeHookSessionFromSpool(
 
 /** LRU cap for the per-agent applied-event dedupe registry. */
 const APPLIED_HOOK_EVENTS_MAX = 200;
-
-/** WP2 provenance spine — turn-window fallback when no working-hook start ts is
- *  known (cold start / start-hook missed). Bounds the touch/change lookback. */
-const PLAN_EVENT_FALLBACK_WINDOW_MS = 30 * 60 * 1000;
 
 /** SHA-256 hex of the pre-DASHBOARD_HOST `dashboard-status.mjs` shipped in
  *  every workspace scaffolded before the WSL-status fix landed. That script
@@ -1894,12 +1885,6 @@ export class AgentSupervisor extends EventEmitter {
   // APPLIED_HOOK_EVENTS_MAX per agent. ONLY applyHookStatusEvent touches it —
   // no transport dedupes on its own.
   private appliedHookEvents = new Map<string, Set<string>>();
-  // Planning-surface demo fix (2026-07-06): turn-scoped idempotency for the
-  // idle-path plan_events compose. The dedupe registry above is bypassed for
-  // `legacy` events and can't collapse a second idle delivery that carries a
-  // fresh ts, so a codex turn could compose two identical plan_events ms apart.
-  // This guard collapses them to one row per working→idle turn.
-  private planComposeGuard = new TurnComposeGuard();
   // Ordering guard: highest event `ts` applied per agent. An event with an
   // older ts than this is 'stale' (a laggy spool/tmux read must not flap a
   // newer HTTP-applied state).
@@ -2082,13 +2067,6 @@ export class AgentSupervisor extends EventEmitter {
         return messages[0]?.content;
       },
       getFileActivities: (id) => getFileActivities(id),
-      // WP2 provenance spine — transcript-side breadcrumb capture. DB-backed
-      // deps injected so the tracker stays unit-testable with stubs.
-      planTouchTracker: new PlanTouchTracker({
-        getAgentPlanId: (id) => getAgent(id)?.planId ?? null,
-        getPlanPath: (planId) => getPlan(planId)?.path ?? null,
-        recordPlanSectionTouch: (input) => recordPlanSectionTouch(input),
-      }),
     };
     this.bridge = new EventBridge(bridgeDeps);
 
@@ -2135,18 +2113,6 @@ export class AgentSupervisor extends EventEmitter {
     // initial user prompt on the first input-accepting transition.
     this.on('statusChanged', (data: StatusChangedEvent | undefined) => {
       if (data) this.maybeDeliverInitialUserPrompt(data.agentId, data.status);
-    });
-
-    // GT-C §1.7 T2 — a plan-bound (launch_agent rail) agent reaching a TERMINAL
-    // status (`done`/`crashed`) releases the plan, so materialize the Execution
-    // Trail. No exemption: the agent is already terminal, so
-    // `getLiveRailAgentForPlan` excludes it and the quiescence gate is honest.
-    // Best-effort (`materialize` never throws); it also no-ops if some OTHER writer
-    // still holds the plan, and the next safe trigger regenerates.
-    this.on('statusChanged', (data: StatusChangedEvent | undefined) => {
-      if (!data || (data.status !== 'done' && data.status !== 'crashed')) return;
-      const agent = getAgent(data.agentId);
-      if (agent?.planId) void trailMaterializer.materialize(agent.planId);
     });
 
     // Typed session-event reader — single source of truth for JSONL tailing.
@@ -6706,7 +6672,6 @@ export class AgentSupervisor extends EventEmitter {
     this.lastAppliedHookTs.delete(agentId);
     this.launchStartedAt.delete(agentId);
     this.lastInvalidHookWarnAt.delete(agentId);
-    this.planComposeGuard.forget(agentId);
     this.releaseSpoolTailer(agentId);
     // WP-P2 — drop any undelivered initial prompt with the agent record.
     this.pendingInitialPrompts.delete(agentId);
@@ -7394,11 +7359,6 @@ export class AgentSupervisor extends EventEmitter {
             : event.state === 'working' ? 'hook-start' : event.state === 'active' ? 'hook-session-start' : 'hook-stop');
 
     if (event.state === 'idle') {
-      // WP2 provenance spine — compose one trusted plan_events row for this turn,
-      // ONLY on the accepted, non-duplicate idle path (past the duplicate/stale
-      // guards above). Guarded on plan_id inside; tolerant + fire-and-forget so a
-      // resolver/scrape failure never blocks the status flip.
-      this.maybeComposePlanEvent(agentId, event.turnId ?? null, receivedAt);
       this.forceIdleFromHook(agentId, flipSource);
     } else if (event.state === 'working') {
       this.forceWorkingFromHook(agentId, flipSource);
@@ -7468,75 +7428,6 @@ export class AgentSupervisor extends EventEmitter {
       this.bindCodexSessionFromHook(agentId, event.sessionId);
     }
     return 'applied';
-  }
-
-  /** WP2 provenance spine — compose the turn's trusted plan_events row on the
-   *  accepted idle path. Guarded on plan_id; window = the working→idle span
-   *  (start-hook ts → this idle receivedAt). Tolerant + fire-and-forget: the
-   *  sentinel scrape is best-effort and never gates insertion (R2 §0). */
-  private maybeComposePlanEvent(agentId: string, turnId: string | null, idleReceivedAt: number): void {
-    const agent = getAgent(agentId);
-    if (!agent || !agent.planId) return; // no plan rail → no row (R1 risk 7)
-    // Window start: the turn's working-hook timestamp, else a bounded lookback.
-    const startMs = this.monitor.getLastStartHookEventAt(agentId);
-    const sinceMs = startMs !== undefined && startMs > 0
-      ? startMs
-      : idleReceivedAt - PLAN_EVENT_FALLBACK_WINDOW_MS;
-    // Turn-scoped idempotency (planning-surface demo fix): a second idle
-    // delivery for the SAME turn (codex Stop re-fire / legacy transport that
-    // bypasses the {ts,hookEventName,turnId} dedupe) must NOT compose a second
-    // plan_events row. Consulted synchronously here — before the async compose
-    // is scheduled — so the racing sibling event is suppressed. A genuinely new
-    // turn carries a new working-hook window start (or turn id) → a new key.
-    if (this.planComposeGuard.shouldSkip(agentId, planEventTurnKey(turnId, sinceMs))) return;
-    const sinceIso = new Date(sinceMs).toISOString();
-    const untilIso = new Date(idleReceivedAt).toISOString();
-
-    void (async () => {
-      let finalMessage: string | undefined;
-      try {
-        const messages = await this.chatService.getMessages(agentId, { limit: 1, role: 'assistant' });
-        finalMessage = messages[0]?.content;
-      } catch {
-        finalMessage = undefined; // scrape is best-effort; degrade to "no self-report"
-      }
-      try {
-        composePlanEvent(
-          {
-            getAgentPlan: (id) => {
-              const a = getAgent(id);
-              return a ? { planId: a.planId ?? null, planSection: a.planSection ?? null } : null;
-            },
-            getTurnSectionTouches: (id, s, u) => getTurnSectionTouches(id, s, u),
-            getTurnSectionChanges: (pid, s, u) => getTurnSectionChanges(pid, s, u),
-            insertPlanEvent: (input) => insertPlanEvent(input),
-            // Fix-4 — witnessed repo-activity capture. `getRepoActivityContext`
-            // resolves the plan's workspace root + relative HTML path (the rollup's
-            // exclusion/normalization inputs). `plan.path` is already
-            // workspace-relative; `ws.path` is the workspace root. Both deps are
-            // best-effort — composePlanEvent degrades to a NULL blob on any failure.
-            getTurnRepoActivity: (id, s, u) => getTurnRepoActivity(id, s, u),
-            getRepoActivityContext: (pid) => {
-              const plan = getPlan(pid);
-              if (!plan || plan.deletedAt) return null;
-              const ws = getWorkspace(plan.workspaceId);
-              if (!ws) return null;
-              return { workspaceRoot: ws.path, planRelPath: plan.path ?? null };
-            },
-            // WP4 byte-range matcher: resolves a native-edit payload to the
-            // section anchor whose byte-exact fragment contains it (optional dep).
-            resolveEditTargetAnchor: (payload, planId) => resolveEditTargetAnchorForPlan(payload, planId),
-            // GT-C §1.7 — a WRITE-turn REQUESTS trail materialization; it runs only
-            // if the plan is quiescent (never during a live run — an inter-turn idle
-            // is not quiescence), so this is a signal, not a forced write.
-            onWriteEvent: (e) => trailMaterializer.request(e.planId),
-          },
-          { agentId, turnId, sinceIso, untilIso, finalMessage: finalMessage ?? null },
-        );
-      } catch (err) {
-        console.warn(`[plan-events] compose failed for ${agentId}:`, err);
-      }
-    })();
   }
 
   /** Rate-limited (60 s/agent) warn helper for applyHookStatusEvent. */

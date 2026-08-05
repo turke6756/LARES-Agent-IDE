@@ -15,7 +15,6 @@ import {
   insertOrchestration, updateOrchestration, getOrchestrationRun, listOrchestrationRuns,
   insertOrchestrationEvent, insertOrchestrationMember, markActiveRunsAborted,
 } from '../database';
-import { trailMaterializer } from '../plans/execution-trail-writer';
 
 const READY_STATUSES = new Set(['idle', 'waiting']);
 
@@ -179,11 +178,6 @@ export class OrchestrationService extends EventEmitter {
     run.status = 'aborted'; run.endedAt = nowIso(); run.updatedAt = nowIso();
     updateOrchestration(run);
     this.emitActiveChanged();
-    // GT-C §1.6 abort path: best-effort trail materialization. The run is already
-    // `aborted` so the 409 no longer protects the write — the in-flight guard does.
-    // If the plan isn't quiescent (a kept member still working), this no-ops and the
-    // next terminal/safe trigger regenerates. No correctness claim beyond best-effort.
-    if (run.planId) trailMaterializer.request(run.planId);
     insertOrchestrationEvent({ runId, ts: nowIso(), kind: 'aborted', payload: {} });
     void this.cleanupMembers(run);
     void this.relay(runId, run.supervisorId,
@@ -212,21 +206,9 @@ export class OrchestrationService extends EventEmitter {
     try {
       if (run.mode === 'serial') await this.runners.serial(this.client, ctx);
       else await this.runners.parallel(this.client, ctx);
-      // GT-C §1.6 T1: the runner has returned → it will not press another turn.
-      // Materialize the Execution Trail while the row is STILL `running` (the
-      // one-writer 409 holds through the whole-file write) so no other run can start
-      // during it. Exempt this run + its own (possibly still-idle) members.
-      if (run.planId) {
-        await trailMaterializer.materialize(run.planId, {
-          completingRunId: run.runId,
-          exemptAgentIds: [run.leadId, run.reviewerId].filter(Boolean) as string[],
-        });
-      }
       run.status = 'complete'; run.endedAt = nowIso(); run.updatedAt = nowIso();
       updateOrchestration(run);
-      // Legacy fresh-file stamp is a whole-file write — NEVER on a rail surface
-      // (the run is recorded via plan_events / the exec-trail instead, and a raw
-      // stamp write would clobber the materialized trail). Non-rail path only.
+      // Legacy fresh-file stamping remains limited to non-rail runs.
       if (!run.planId) this.stampPlanMembers(run);
       ctx.emit('complete', { planPath: run.planPath });
       await this.relay(run.runId, run.supervisorId,
@@ -234,15 +216,6 @@ export class OrchestrationService extends EventEmitter {
       if (!keepAgents) await this.cleanupMembers(run);
     } catch (err: any) {
       if (controller.signal.aborted) return;   // abort() already handled delivery
-      // GT-C §1.6 T1 (stalled/error path): the runner has actually stopped and the
-      // row is still `running` (terminal flip is below), so the one-writer 409 still
-      // holds — materialize the trail under the held ownership before releasing it.
-      if (run.planId) {
-        await trailMaterializer.materialize(run.planId, {
-          completingRunId: run.runId,
-          exemptAgentIds: [run.leadId, run.reviewerId].filter(Boolean) as string[],
-        });
-      }
       const msg = err?.message || String(err);
       const isStall = msg.startsWith('STALL') || msg.includes('Timeout');
       run.status = isStall ? 'stalled' : 'error'; run.error = msg; run.endedAt = nowIso();

@@ -1,6 +1,6 @@
 import type { Agent, AgentStatus, ContextStats, FileActivity } from '../../shared/types';
 import { hasSupervisorPrivilege } from '../../shared/types';
-import type { ChatEventBatch, ToolUseEvent } from '../../shared/session-events';
+import type { ChatEventBatch } from '../../shared/session-events';
 import type { StatusChangedEvent } from './status-events';
 import type { ForceWorkingOpts, WaitingKind } from './status-monitor';
 import {
@@ -76,18 +76,6 @@ export interface EventBridgeDeps {
    *  wrapper over `getFileActivities(agentId)`. Returning an empty array (or
    *  throwing) makes the bridge omit the "Files touched:" section. */
   getFileActivities(agentId: string): FileActivity[];
-  /** WP2 provenance spine — transcript-side breadcrumb capture. When present,
-   *  `case 'tool-use':` forwards the event so plan read/edit-target touches are
-   *  persisted as trusted turn evidence. Optional: absent → the bridge runs
-   *  exactly as before (planning-surface code stays independently shippable). */
-  planTouchTracker?: PlanTouchTrackerCollaborator;
-}
-
-/** The one method the bridge needs from the tracker; injected so tests can stub
- *  it and so the tracker's DB deps stay out of the bridge. Tolerant by contract
- *  (never throws), so the bridge does not guard the call. */
-export interface PlanTouchTrackerCollaborator {
-  observeToolUse(agentId: string, event: ToolUseEvent): void;
 }
 
 // P2-03: 'waiting' is a trigger status so the supervisor gets a notification
@@ -594,12 +582,6 @@ export class EventBridge {
             });
             break;
           case 'tool-use':
-            // WP2 provenance spine (R2 §2.3) — capture read=intent + native
-            // edit-target breadcrumbs BEFORE the status latch. The transcript
-            // carries the tool name + args for both providers; native Edit never
-            // hits the MCP handler, so this is the ONLY capture path for edit
-            // targets. Tolerant by contract (never throws), so no guard here.
-            this.deps.planTouchTracker?.observeToolUse(agentId, event as ToolUseEvent);
             // BUG-18 Change 3 — mark the turn as in-flight; the latch keeps
             // tool-pending TTL even after this tool resolves until either
             // (a) the next refresh stores a longer ttlClass, or (b)

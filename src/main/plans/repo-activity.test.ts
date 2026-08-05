@@ -1,5 +1,5 @@
 // Fix-4 — pure repo-activity module tests (no I/O). Node-assert harness (matches
-// execution-trail.test.ts); build:main compiles it, then run the emitted JS:
+// build:main compiles it, then run the emitted JS:
 //
 //   npm run build:main
 //   node dist/main/main/plans/repo-activity.test.js
