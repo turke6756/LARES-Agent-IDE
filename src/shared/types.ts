@@ -39,6 +39,13 @@ export type AgentProvider = 'claude' | 'gemini' | 'codex' | 'grok' | 'agy';
  * persisted historical agents and templates can still be decoded and shown. */
 export type LaunchableAgentProvider = Exclude<AgentProvider, 'gemini'>;
 
+export const LAUNCHABLE_AGENT_PROVIDERS: readonly LaunchableAgentProvider[] =
+  ['claude', 'codex', 'grok', 'agy'] as const;
+
+export function isLaunchableAgentProvider(v: unknown): v is LaunchableAgentProvider {
+  return typeof v === 'string' && (LAUNCHABLE_AGENT_PROVIDERS as readonly string[]).includes(v);
+}
+
 // Hardcoded first-class app role-lanes. 'researcher' is a third lane alongside
 // 'supervisor' and 'worker' (browser-parity-and-capability-isolation §0); see
 // roleLaneOf() in src/main/supervisor/index.ts for the flag→lane mapping.

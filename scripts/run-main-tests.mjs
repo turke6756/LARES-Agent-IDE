@@ -576,6 +576,7 @@ const TESTS = [
   'dist/main/main/agent-dto-routes.test.js',
   'dist/main/main/api-server-optimizer-routes.test.js',
   'scripts/mcp-tools-observability.test.js',
+  'scripts/mcp-provider-enum-parity.test.js',
   'dist/main/main/skill-analytics/command-path-extractor.test.js',
   'dist/main/main/skill-analytics/skill-events.test.js',
   'dist/main/main/skill-analytics/mcp-toolset-map.test.js',
