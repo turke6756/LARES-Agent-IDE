@@ -2,7 +2,7 @@ import React, { useState, useRef, useEffect } from 'react';
 import * as Icons from 'lucide-react';
 import { useDashboardStore } from '../../stores/dashboard-store';
 import { useThemeStore } from '../../stores/theme-store';
-import logoImg from '../../assets/logo.png';
+import appIcon from '../../../../assets/icon.png';
 import { LARES_RELEASES_URL } from '../../../shared/constants';
 
 // The spanning top chrome for the frameless window. The window is
@@ -26,7 +26,7 @@ function AboutModal({ onClose }: { onClose: () => void }) {
       onClick={onClose}
     >
       <div className="ui-card p-6 max-w-sm text-center" onClick={(e) => e.stopPropagation()}>
-        <img src={logoImg} alt="" className="h-12 w-12 mx-auto mb-3 object-contain" />
+        <img src={appIcon} alt="" className="h-12 w-12 mx-auto mb-3 object-contain" />
         <h2 className="text-[15px] font-semibold text-gray-100 mb-1">Lares</h2>
         <p className="text-[12px] text-gray-500 mb-4">
           Watch, direct, and collaborate with teams of AI agents — in one workspace.
@@ -120,7 +120,7 @@ export default function TopBar() {
   return (
     <div className="titlebar panel-header flex items-center shrink-0 app-drag-region text-[12px] select-none">
       {/* Brand mark */}
-      <img src={logoImg} alt="" className="h-4 w-4 ml-2 mr-1 object-contain shrink-0 app-no-drag" />
+      <img src={appIcon} alt="" className="h-4 w-4 ml-2 mr-1 object-contain shrink-0 app-no-drag" />
 
       {/* App menus */}
       <nav ref={navRef} className="flex items-center app-no-drag">

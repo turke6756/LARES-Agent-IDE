@@ -35,6 +35,7 @@ import {
   SUPERVISOR_CLAUDE_SETTINGS_JSON,
   WORKER_CLAUDE_SETTINGS_JSON,
   WORKER_CLAUDE_SETTINGS_JSON_V5,
+  WORKER_CODEX_CONFIG_TOML,
 } from '../shared/constants';
 import { sha256Hex } from './scaffold-writer';
 
@@ -90,6 +91,42 @@ test('scaffoldPersona writes into .lares/agents/<name>/, not .claude/agents/', (
   assert.ok(!('agents/builder/CLAUDE.md' in sc), 'CLAUDE.md must NOT be managed (seed-once)');
   assert.ok(!('agents/builder/memory/MEMORY.md' in sc), 'MEMORY.md must NOT be managed (seed-once)');
   assert.ok(!('agents/builder/persona.json' in sc), 'persona.json must NOT be managed');
+});
+
+// ── codex persona hook carrier (Path A, profile-retirement step 1) ───
+
+test('persona scaffold writes the v6 codex .codex/config.toml with ${WORKSPACE_ROOT} materialized, managed at version 1', () => {
+  const ws = freshWorkspace();
+  scaffoldPersona(ws, 'windows', 'codex-bee');
+  const configPath = agentFile(ws, 'codex-bee', '.codex', 'config.toml');
+  assert.ok(fs.existsSync(configPath), '.codex/config.toml must exist after scaffold');
+  const body = fs.readFileSync(configPath, 'utf-8');
+  // Byte-identical to the v6 worker body with the same materialization the worker
+  // scaffold applies (native-Windows form: forward-slashed workspace root).
+  const expected = WORKER_CODEX_CONFIG_TOML.replace(/\$\{WORKSPACE_ROOT\}/g, ws.replace(/\\/g, '/'));
+  assert.equal(body, expected, 'persona config.toml must be the exact materialized v6 body');
+  // The placeholder must be fully materialized (no un-substituted ${WORKSPACE_ROOT}).
+  assert.ok(!body.includes('${WORKSPACE_ROOT}'), 'no un-substituted WORKSPACE_ROOT placeholder remains');
+  // It is the sole hook carrier on native Windows, so it must supply the gate,
+  // the SessionStart hook, and the PreToolUse git-discard guard directly.
+  assert.ok(/^\[features\]$/m.test(body), 'config.toml must carry the top-level [features] gate');
+  assert.ok(/\[features\]\s*\nhooks = true/.test(body), 'config.toml must set hooks = true');
+  assert.ok(body.includes('[[hooks.SessionStart]]'), 'config.toml must carry the SessionStart hook');
+  assert.ok(body.includes('[[hooks.PreToolUse]]') && /guard-git-discard\.mjs/.test(body),
+    'config.toml must carry the PreToolUse git-discard guard');
+  // Managed at version 1 (fresh entry — no legacy persona config to hash-migrate).
+  const sc = readSidecar(ws);
+  assert.equal(sc['agents/codex-bee/.codex/config.toml'], 1, 'codex config.toml is managed at version 1');
+});
+
+test('ensurePersonaScaffold restores a deleted .codex/config.toml (managed plumbing)', () => {
+  const ws = freshWorkspace();
+  scaffoldPersona(ws, 'windows', 'codex-restore');
+  const configPath = agentFile(ws, 'codex-restore', '.codex', 'config.toml');
+  fs.rmSync(configPath);
+  assert.ok(!fs.existsSync(configPath));
+  ensurePersonaScaffold(ws, 'windows', 'codex-restore');
+  assert.ok(fs.existsSync(configPath), 'deleted .codex/config.toml is restored by the managed kit');
 });
 
 // ── lane sidecar (D3 / D7) ───────────────────────────────────────────

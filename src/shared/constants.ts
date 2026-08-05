@@ -1354,8 +1354,30 @@ const WORKER_CLAUDE_MD_V10_PLANNING_NEW = [
   'sentinel + read-before-edit obligations no longer apply.',
   '<!-- /section:planning-surface -->',
 ].join('\n');
-export const WORKER_CLAUDE_MD = WORKER_CLAUDE_MD_V9
+export const WORKER_CLAUDE_MD_V10 = WORKER_CLAUDE_MD_V9
   .split(WORKER_CLAUDE_MD_V10_CEREMONY_OLD).join(WORKER_CLAUDE_MD_V10_PLANNING_NEW);
+
+// ── Directional memory flow: WORKER_CLAUDE_MD v10 → v11 ────────────────
+//  Freeze-then-derive (D11): WORKER_CLAUDE_MD_V10 above is the byte-exact
+//  frozen v10 body (the former live derivation, renamed). The live v11 body
+//  replaces the worker-side memory retrieval guidance with Edward's 2026-08-04
+//  directional model: supervisor briefs carry relevant memory; workers normally
+//  do not read the supervisor memory surface, use recall_memory only when a brief
+//  points at a capsule, and draft suggestions via the remember skill. The OLD
+//  block occurs EXACTLY ONCE in v10. The codex/grok/agy derivations inherit the
+//  replacement byte-identically because it contains none of their transform
+//  tokens.
+const WORKER_CLAUDE_MD_V11_MEMORY_OLD = WORKER_CLAUDE_MD_V9_BODY_NEW;
+const WORKER_CLAUDE_MD_V11_MEMORY_NEW = [
+  'Workspace memory is the supervisor\'s surface; your brief carries the relevant',
+  'context. You normally do **not** read `.lares/supervisor/memory/` yourself.',
+  'Use `recall_memory` only when your brief explicitly points you at a capsule.',
+  'When something happens that future agents shouldn\'t have to relearn, use the',
+  '`remember` skill to draft it for your supervisor — don\'t hand-write memory or',
+  'lesson files.',
+].join('\n');
+export const WORKER_CLAUDE_MD = WORKER_CLAUDE_MD_V10
+  .split(WORKER_CLAUDE_MD_V11_MEMORY_OLD).join(WORKER_CLAUDE_MD_V11_MEMORY_NEW);
 
 /** Seed content for the shared worker behavioral memory, written write-if-absent
  *  to <workspace>/.lares/workers/claude/behavioral.md on first Claude worker
@@ -1506,6 +1528,15 @@ export const WORKER_CODEX_AGENTS_MD_V1 = WORKER_CLAUDE_MD_V8
  *  AGENTS.md scaffold entry's v2 → v3 bump, so a pristine v2 workspace upgrades
  *  silently. */
 export const WORKER_CODEX_AGENTS_MD_V2 = WORKER_CLAUDE_MD_V9
+  .split('.lares/workers/claude/').join('.lares/workers/codex/')
+  .split('`AskUserQuestion`,\nplan-mode approval prompts, `(y/n)` confirmations, ')
+  .join('an interactive approval prompt or `(y/n)` confirmation, ')
+  .split('`WORKER_CLAUDE_MD` constant').join('`WORKER_CODEX_AGENTS_MD` constant');
+
+/** Directional-memory ruling: the frozen v3 Codex AGENTS.md — the byte-exact
+ *  Codex derivation of the FROZEN worker v10 body. previousHashes[3] for the
+ *  codex AGENTS.md scaffold entry's v3 → v4 bump. */
+export const WORKER_CODEX_AGENTS_MD_V3 = WORKER_CLAUDE_MD_V10
   .split('.lares/workers/claude/').join('.lares/workers/codex/')
   .split('`AskUserQuestion`,\nplan-mode approval prompts, `(y/n)` confirmations, ')
   .join('an interactive approval prompt or `(y/n)` confirmation, ')
@@ -3725,8 +3756,8 @@ the row is healthy and unambiguous.
 /** remember/SKILL.md — the ONE user-facing memory/lesson write entry (Memory &
  *  Lessons v2 WP-F1, proposal §5). Provisioned by SUPERVISOR_FILES,
  *  SUPERVISOR_FILES_CODEX, WORKER_FILES_CLAUDE, and the Codex worker map to all
- *  four lane/provider skill roots (WP-R verdict). Ships as a new-skill scaffold
- *  entry ({ version: 1 }, no previousHashes). The body triages INSIDE the skill —
+ *  four lane/provider skill roots (WP-R verdict). Ships as a managed v2 scaffold
+ *  entry whose v1 hash preserves silent upgrades. The body triages INSIDE the skill —
  *  worthiness → memory-vs-lesson → capsule/lesson authoring → a named way to die →
  *  validate — and routes to publish_lesson (lesson) or propose_graduation
  *  (graduation). Because this path lives under `.agents/`/`.claude/skills`, an
@@ -3789,7 +3820,7 @@ the write. A capsule looks like:
 - status: active            # active | done | note | archived
 - <a named way to die>      # REQUIRED for an active memory — see gate 4
 - read-if: <when a future agent should fetch the detail>   # optional
-- detail: .lares/supervisor/memory/details/<id>.md         # optional, for long bodies
+- detail: memory/details/<id>.md                           # optional, for long bodies
 <the memory, tight — what's true and why it matters>
 \`\`\`
 

@@ -23,7 +23,7 @@ import {
   CODEX_WORKER_PROFILE_TOML,
   CODEX_WORKER_PROFILE_NAME,
 } from '../../shared/constants';
-import { instrumentCodexWorkerCommand } from './index';
+import { instrumentCodexWorkerCommand, shouldUseWorkerCwdCodexHooks } from './index';
 import { deriveHookAvailability } from '../../shared/types';
 import { AGY_STATUS_HOOK_NAME } from './agy-hooks';
 
@@ -214,6 +214,56 @@ test('B2l. Path A: un-instrumentable (not recognizably codex) → instrumented:f
   const { command, instrumented } = instrumentCodexWorkerCommand('my-codex-wrapper.sh --go', { injectProfile: false });
   assert.equal(instrumented, false);
   assert.equal(command, 'my-codex-wrapper.sh --go', 'command must be returned unchanged');
+});
+
+// ── B3. shouldUseWorkerCwdCodexHooks — the injectProfile selector ─────
+//
+// Profile-retirement step 1: native-Windows codex PERSONAS join the worker lane
+// on the worker-cwd (trusted-project .codex/config.toml) hook carrier
+// (injectProfile=false); WSL is unchanged (still rides the CODEX_HOME profile,
+// injectProfile=true) for BOTH workers and personas.
+
+test('B3a. native-Windows WORKER lane → worker-cwd hooks (injectProfile=false)', () => {
+  assert.equal(shouldUseWorkerCwdCodexHooks({ pathType: 'windows', isWorkerLane: true, persona: false }), true);
+});
+
+test('B3b. native-Windows PERSONA → worker-cwd hooks (injectProfile=false), no profile', () => {
+  // The persona is NOT a worker lane, but on native Windows it still carries its
+  // hooks in its own cwd's config.toml — this is the profile-retirement change.
+  assert.equal(shouldUseWorkerCwdCodexHooks({ pathType: 'windows', isWorkerLane: false, persona: true }), true);
+});
+
+test('B3c. WSL PERSONA → profile path (injectProfile=true) — unchanged', () => {
+  assert.equal(shouldUseWorkerCwdCodexHooks({ pathType: 'wsl', isWorkerLane: false, persona: true }), false);
+});
+
+test('B3d. WSL WORKER lane → profile path (injectProfile=true) — unchanged', () => {
+  assert.equal(shouldUseWorkerCwdCodexHooks({ pathType: 'wsl', isWorkerLane: true, persona: false }), false);
+});
+
+test('B3e. end-to-end: a native-Windows persona command gets bypass kept + legacy --profile stripped', () => {
+  // The selector says worker-cwd (false), so the launch calls
+  // instrumentCodexWorkerCommand with injectProfile=false. A persona whose stored
+  // command carries the legacy --profile dashboard-worker must have it stripped
+  // (Run D double-fire) while the bypass flag is kept/added.
+  const useCwd = shouldUseWorkerCwdCodexHooks({ pathType: 'windows', isWorkerLane: false, persona: true });
+  const { command, instrumented } = instrumentCodexWorkerCommand(
+    `codex --profile ${CODEX_WORKER_PROFILE_NAME} --dangerously-bypass-approvals-and-sandbox`,
+    { injectProfile: !useCwd },
+  );
+  assert.equal(instrumented, true);
+  assert.ok(!/--profile/.test(command), `native-Windows persona must strip --profile; got: ${command}`);
+  assert.ok(command.includes('--dangerously-bypass-hook-trust'), `bypass flag must be present; got: ${command}`);
+  assert.ok(command.includes('--dangerously-bypass-approvals-and-sandbox'), 'original flag must survive');
+});
+
+test('B3f. end-to-end: a WSL persona command keeps the --profile path (injectProfile=true)', () => {
+  const useCwd = shouldUseWorkerCwdCodexHooks({ pathType: 'wsl', isWorkerLane: false, persona: true });
+  const { command, instrumented } = instrumentCodexWorkerCommand(
+    'codex --dangerously-bypass-approvals-and-sandbox', { injectProfile: !useCwd });
+  assert.equal(instrumented, true);
+  assert.ok(command.includes(`--profile ${CODEX_WORKER_PROFILE_NAME}`), `WSL persona must keep --profile; got: ${command}`);
+  assert.ok(command.includes('--dangerously-bypass-hook-trust'), `bypass flag must be present; got: ${command}`);
 });
 
 // ── WP2. deriveHookAvailability — the DTO projection of hook_status ───

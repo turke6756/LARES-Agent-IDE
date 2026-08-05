@@ -155,14 +155,16 @@ export default function MainContent() {
     ensureBrowserBridge();
   });
 
-  // Header toolbar responsive collapse. The five action buttons (Dashboard,
-  // Files, Browser, Open VS Code, Launch Agent) keep their labels while there
-  // is room, then drop to icon-only when the header gets too narrow — instead
-  // of squishing (clipped text) or bleeding past the header bounds. We measure
-  // the button group's full labelled width once (captured only while expanded,
-  // so it survives the collapse) and compare it against the available header
-  // width, reserving a slice for the workspace title. Hysteresis on the way
-  // back out avoids oscillation right at the breakpoint.
+  // Header toolbar. The action buttons (Dashboard, Files, Browser, Plans, Open
+  // VS Code, Launch Agent) are the ONLY thing in this header — the workspace
+  // title moved to the sidebar header — so they stretch to fill the full width
+  // (each `flex-1`), growing and shrinking as the pane resizes. They keep their
+  // labels for as long as those labels fit, then drop to icon-only when the pane
+  // gets so narrow the labelled buttons would overflow. The buttons never shrink
+  // below their label width (no `min-w-0`), so an overflowing toolbar reports its
+  // true labelled width via `scrollWidth`; we capture that at the moment of
+  // overflow and use it — plus hysteresis — to decide when it is safe to expand
+  // the labels back.
   const headerRowRef = useRef<HTMLDivElement>(null);
   const toolbarRef = useRef<HTMLDivElement>(null);
   const fullToolbarWidth = useRef(0);
@@ -173,17 +175,23 @@ export default function MainContent() {
     const toolbar = toolbarRef.current;
     if (!row || !toolbar) return;
 
-    const TITLE_MIN = 140; // px kept for the workspace title/path column
-    const HYSTERESIS = 32; // px slack before re-expanding, prevents flip-flop
+    const HYSTERESIS = 24; // px slack before re-expanding, prevents flip-flop
 
     const measure = () => {
-      if (!toolbarCompact) fullToolbarWidth.current = toolbar.scrollWidth;
-      const needed = fullToolbarWidth.current + TITLE_MIN;
       const avail = row.clientWidth;
-      setToolbarCompact((prev) => {
-        if (!prev) return avail < needed;
-        return avail < needed + HYSTERESIS; // stay compact until clearly roomy
-      });
+      if (!toolbarCompact) {
+        // Labels visible. When they no longer fit, the non-shrinking buttons
+        // overflow the row and scrollWidth reports the true labelled width —
+        // capture it so we know when re-expansion is safe, then collapse.
+        const natural = toolbar.scrollWidth;
+        if (natural > avail) {
+          fullToolbarWidth.current = natural;
+          setToolbarCompact(true);
+        }
+      } else if (fullToolbarWidth.current && avail >= fullToolbarWidth.current + HYSTERESIS) {
+        // Icon-only. Re-expand once the captured labelled width clearly fits.
+        setToolbarCompact(false);
+      }
     };
 
     measure();
@@ -216,120 +224,112 @@ export default function MainContent() {
     <div className="flex-1 flex flex-col min-w-0 overflow-hidden relative">
       {/* Header — fixed h-16 to match the sidebar header thickness.
           Doubles as a window-drag surface (the native title bar is hidden). */}
-      <div className="panel-header h-16 px-4 sticky top-0 z-10 flex items-center shrink-0 app-drag-region">
-        <div ref={headerRowRef} className="flex items-center justify-between w-full gap-3 min-w-0">
-          <div className="min-w-0">
-            <div className="flex items-baseline gap-2">
-              <h2 className="text-[18px] font-bold text-gray-100 truncate">
-                {workspace.title}
-              </h2>
-            </div>
-          </div>
-
-          <div className="flex items-center gap-4 app-no-drag shrink-0">
-            {/* No workspace-supervisor singleton: a supervisor is just one of
-                the agent types in the Launch Agent dialog, launchable as many
-                times as wanted. Each renders as its own grid card with its
-                launched agents nested beneath (buildAgentForest). */}
-            <div ref={toolbarRef} className="flex gap-2">
-              <button
-                data-testid="view-btn-dashboard"
-                draggable={!dashboardDetached}
-                onDragStart={(e) => handleViewDragStart(e, 'dashboard')}
-                onDragEnd={(e) => handleViewDragEnd(e, 'dashboard')}
-                onClick={() => { if (!dashboardDetached) showDashboard(); }}
-                aria-disabled={dashboardDetached}
-                className={`ui-btn ui-btn-outline shrink-0 whitespace-nowrap px-3 py-1.5 text-[13px] font-medium ${
-                  dashboardDetached
-                    ? 'opacity-40 cursor-not-allowed border-dashed'
-                    : dashboardActive ? 'ui-btn-success is-active' : ''
-                }`}
-                style={dashboardDetached ? { borderStyle: 'dashed' } : undefined}
-                title={dashboardDetached ? 'Dashboard is open in a separate window — close it to restore' : 'Agent dashboard — drag out to open in its own window'}
-              >
-                <Icons.LayoutGrid className="w-4 h-4 shrink-0" />
-                {!toolbarCompact && 'Dashboard'}
-              </button>
-              <button
-                data-testid="view-btn-files"
-                draggable={!filesDetached}
-                onDragStart={(e) => handleViewDragStart(e, 'files')}
-                onDragEnd={(e) => handleViewDragEnd(e, 'files')}
-                onClick={() => { if (!filesDetached) showFileViewer(); }}
-                aria-disabled={filesDetached}
-                className={`ui-btn ui-btn-outline shrink-0 whitespace-nowrap px-3 py-1.5 text-[13px] font-medium ${
-                  filesDetached
-                    ? 'opacity-40 cursor-not-allowed'
-                    : fileViewerOpen ? 'ui-btn-success is-active' : hasOpenTabs ? 'ui-btn-success' : ''
-                }`}
-                style={filesDetached ? { borderStyle: 'dashed' } : undefined}
-                title={filesDetached ? 'Files is open in a separate window — close it to restore' : hasOpenTabs ? `Files (${workspaceTabCount} tabs open) — drag out to open in its own window` : 'Browse files — drag out to open in its own window'}
-              >
-                <Icons.FileText className="w-4 h-4 shrink-0" />
-                {toolbarCompact ? (hasOpenTabs ? workspaceTabCount : '') : `Files${hasOpenTabs ? ` (${workspaceTabCount})` : ''}`}
-              </button>
-              <button
-                data-testid="view-btn-browser"
-                draggable={!browserDetached}
-                onDragStart={(e) => handleViewDragStart(e, 'browser')}
-                onDragEnd={(e) => handleViewDragEnd(e, 'browser')}
-                onClick={() => { if (!browserDetached) showBrowser(); }}
-                aria-disabled={browserDetached}
-                className={`ui-btn ui-btn-outline shrink-0 whitespace-nowrap px-3 py-1.5 text-[13px] font-medium ${
-                  browserDetached
-                    ? 'opacity-40 cursor-not-allowed'
-                    : browserOpen && !fileViewerOpen ? 'ui-btn-success is-active' : browserPaneAttention ? 'ui-btn-warning animate-pulse' : ''
-                }`}
-                style={browserDetached ? { borderStyle: 'dashed' } : undefined}
-                title={browserDetached ? 'Browser is open in a separate window — close it to restore' : browserPaneAttention ? 'Browser — an agent opened a page for you' : 'Open browser pane — drag out to open in its own window'}
-              >
-                <Icons.Globe className="w-4 h-4 shrink-0" />
-                {!toolbarCompact && 'Browser'}
-              </button>
-              <PlansMenu
-                compact={toolbarCompact}
-                detached={plansDetached}
-                onDragStart={(e) => handleViewDragStart(e, 'plans')}
-                onDragEnd={(e) => handleViewDragEnd(e, 'plans')}
-              />
-
-              <button
-                data-testid="view-btn-save"
-                data-attention={saveCardAttention ? 'expiring' : undefined}
-                onClick={showSaveCard}
-                className={`ui-btn ui-btn-outline shrink-0 whitespace-nowrap px-3 py-1.5 text-[13px] font-medium ${
-                  saveCardActive
-                    ? 'ui-btn-success is-active'
-                    : saveCardAttention
-                      ? 'ui-btn-warning animate-pulse'
-                      : ''
-                }`}
-                title={
-                  saveCardAttention
-                    ? 'Save progress — recovery checkpoints are expiring soon; save to keep this work'
-                    : 'Save progress — inspect uncommitted work (read-only)'
-                }
-              >
-                <Icons.Save className="w-4 h-4 shrink-0" />
-                {!toolbarCompact && 'Save'}
-              </button>
-              <button
-                onClick={() => window.api.workspaces.openInVSCode(workspace.id)}
-                className="ui-btn ui-btn-outline shrink-0 whitespace-nowrap px-3 py-1.5 text-[13px] font-medium"
-                title="Open workspace in VS Code"
-              >
-                <img src={vscodeIcon} alt="" className="w-4 h-4 shrink-0" />
-                {!toolbarCompact && 'Open VS Code'}
-              </button>
-              <button
-                onClick={() => setShowLaunch(true)}
-                className="ui-btn ui-btn-primary shrink-0 whitespace-nowrap px-3 py-1.5 text-[13px] font-medium"
-                title="Launch Agent"
-              >
-                <Icons.Plus className="w-4 h-4 shrink-0" />
-                {!toolbarCompact && 'Launch Agent'}
-              </button>
-            </div>
+      <div className="panel-header h-16 px-4 sticky top-0 z-10 flex items-center shrink-0">
+        {/* The action buttons are the whole header now — the workspace name lives
+            in the sidebar header. They stretch to fill the full width and collapse
+            to icon-only when the pane gets too narrow for their labels.
+            No workspace-supervisor singleton: a supervisor is just one of the
+            agent types in the Launch Agent dialog, launchable as many times as
+            wanted. Each renders as its own grid card with its launched agents
+            nested beneath (buildAgentForest). */}
+        <div ref={headerRowRef} className="w-full min-w-0 app-no-drag">
+          <div ref={toolbarRef} className="flex gap-2 w-full">
+            <button
+              data-testid="view-btn-dashboard"
+              draggable={!dashboardDetached}
+              onDragStart={(e) => handleViewDragStart(e, 'dashboard')}
+              onDragEnd={(e) => handleViewDragEnd(e, 'dashboard')}
+              onClick={() => { if (!dashboardDetached) showDashboard(); }}
+              aria-disabled={dashboardDetached}
+              className={`ui-btn ui-btn-outline flex-1 whitespace-nowrap px-3 py-1.5 text-[13px] font-medium ${
+                dashboardDetached
+                  ? 'opacity-40 cursor-not-allowed border-dashed'
+                  : dashboardActive ? 'ui-btn-success is-active' : ''
+              }`}
+              style={dashboardDetached ? { borderStyle: 'dashed' } : undefined}
+              title={dashboardDetached ? 'Dashboard is open in a separate window — close it to restore' : 'Agent dashboard — drag out to open in its own window'}
+            >
+              <Icons.LayoutGrid className="w-4 h-4 shrink-0" />
+              {!toolbarCompact && 'Dashboard'}
+            </button>
+            <button
+              data-testid="view-btn-files"
+              draggable={!filesDetached}
+              onDragStart={(e) => handleViewDragStart(e, 'files')}
+              onDragEnd={(e) => handleViewDragEnd(e, 'files')}
+              onClick={() => { if (!filesDetached) showFileViewer(); }}
+              aria-disabled={filesDetached}
+              className={`ui-btn ui-btn-outline flex-1 whitespace-nowrap px-3 py-1.5 text-[13px] font-medium ${
+                filesDetached
+                  ? 'opacity-40 cursor-not-allowed'
+                  : fileViewerOpen ? 'ui-btn-success is-active' : hasOpenTabs ? 'ui-btn-success' : ''
+              }`}
+              style={filesDetached ? { borderStyle: 'dashed' } : undefined}
+              title={filesDetached ? 'Files is open in a separate window — close it to restore' : hasOpenTabs ? `Files (${workspaceTabCount} tabs open) — drag out to open in its own window` : 'Browse files — drag out to open in its own window'}
+            >
+              <Icons.FileText className="w-4 h-4 shrink-0" />
+              {toolbarCompact ? (hasOpenTabs ? workspaceTabCount : '') : `Files${hasOpenTabs ? ` (${workspaceTabCount})` : ''}`}
+            </button>
+            <button
+              data-testid="view-btn-browser"
+              draggable={!browserDetached}
+              onDragStart={(e) => handleViewDragStart(e, 'browser')}
+              onDragEnd={(e) => handleViewDragEnd(e, 'browser')}
+              onClick={() => { if (!browserDetached) showBrowser(); }}
+              aria-disabled={browserDetached}
+              className={`ui-btn ui-btn-outline flex-1 whitespace-nowrap px-3 py-1.5 text-[13px] font-medium ${
+                browserDetached
+                  ? 'opacity-40 cursor-not-allowed'
+                  : browserOpen && !fileViewerOpen ? 'ui-btn-success is-active' : browserPaneAttention ? 'ui-btn-warning animate-pulse' : ''
+              }`}
+              style={browserDetached ? { borderStyle: 'dashed' } : undefined}
+              title={browserDetached ? 'Browser is open in a separate window — close it to restore' : browserPaneAttention ? 'Browser — an agent opened a page for you' : 'Open browser pane — drag out to open in its own window'}
+            >
+              <Icons.Globe className="w-4 h-4 shrink-0" />
+              {!toolbarCompact && 'Browser'}
+            </button>
+            <PlansMenu
+              compact={toolbarCompact}
+              detached={plansDetached}
+              onDragStart={(e) => handleViewDragStart(e, 'plans')}
+              onDragEnd={(e) => handleViewDragEnd(e, 'plans')}
+            />
+            <button
+              data-testid="view-btn-save"
+              data-attention={saveCardAttention ? 'expiring' : undefined}
+              onClick={showSaveCard}
+              className={`ui-btn ui-btn-outline flex-1 whitespace-nowrap px-3 py-1.5 text-[13px] font-medium ${
+                saveCardActive
+                  ? 'ui-btn-success is-active'
+                  : saveCardAttention
+                    ? 'ui-btn-warning animate-pulse'
+                    : ''
+              }`}
+              title={
+                saveCardAttention
+                  ? 'Save progress — recovery checkpoints are expiring soon; save to keep this work'
+                  : 'Save progress — inspect uncommitted work (read-only)'
+              }
+            >
+              <Icons.Save className="w-4 h-4 shrink-0" />
+              {!toolbarCompact && 'Save'}
+            </button>
+            <button
+              onClick={() => window.api.workspaces.openInVSCode(workspace.id)}
+              className="ui-btn ui-btn-outline flex-1 whitespace-nowrap px-3 py-1.5 text-[13px] font-medium"
+              title="Open workspace in VS Code"
+            >
+              <img src={vscodeIcon} alt="" className="w-4 h-4 shrink-0" />
+              {!toolbarCompact && 'Open VS Code'}
+            </button>
+            <button
+              onClick={() => setShowLaunch(true)}
+              className="ui-btn ui-btn-primary flex-1 whitespace-nowrap px-3 py-1.5 text-[13px] font-medium"
+              title="Launch Agent"
+            >
+              <Icons.Plus className="w-4 h-4 shrink-0" />
+              {!toolbarCompact && 'Launch Agent'}
+            </button>
           </div>
         </div>
       </div>

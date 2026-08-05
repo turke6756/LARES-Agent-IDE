@@ -238,6 +238,34 @@ test('BUG-26: invalidateAgent clears stats (getStats returns null)', () => {
   assert.equal(monitor.getStats('agent-1'), null, 'invalidateAgent drops cached stats');
 });
 
+test('last context reading survives monitor recreation and is cleared on session rebind', () => {
+  const persisted = new Map<string, any>();
+  const persistence = {
+    load: (agentId: string) => persisted.get(agentId) ?? null,
+    save: (stats: any) => persisted.set(stats.agentId, structuredClone(stats)),
+    delete: (agentId: string) => { persisted.delete(agentId); },
+  };
+
+  const firstReader = new FakeReader();
+  const first = new ContextStatsMonitor(firstReader as any, undefined, persistence);
+  first.start();
+  firstReader.emit('usage', makeUsage('agent-1', 'session-1', {
+    cumulativeContextTokens: 84_000,
+    contextPercentage: 42,
+  }));
+
+  // Simulate an app restart: the new monitor has no live in-memory reading.
+  const restored = new ContextStatsMonitor(new FakeReader() as any, undefined, persistence);
+  assert.equal(restored.getStats('agent-1')?.contextPercentage, 42);
+  assert.equal(restored.getStats('agent-1')?.sessionId, 'session-1');
+
+  // A rebound starts a new conversation, so the old session's bar must not be
+  // restored while waiting for the new session's first real usage event.
+  restored.invalidateAgent('agent-1');
+  const afterRebind = new ContextStatsMonitor(new FakeReader() as any, undefined, persistence);
+  assert.equal(afterRebind.getStats('agent-1'), null);
+});
+
 test('BUG-26: invalidateAgent does NOT emit statsChanged (next legitimate usage will)', () => {
   const reader = new FakeReader();
   const monitor = new ContextStatsMonitor(reader as any);

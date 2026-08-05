@@ -14,8 +14,10 @@ import {
   PERSONA_CREATE_PERSONA_SKILL, PERSONA_CREATE_PERSONA_SKILL_V1,
   PERSONA_READ_COMMENTS_SKILL, PERSONA_READ_COMMENTS_SKILL_V2, PERSONA_READ_COMMENTS_SKILL_V3, PERSONA_AGENT_MD_TEMPLATE,
   PERSONA_CREATE_PERSONA_SKILL_V3_HASH,
+  WORKER_CODEX_CONFIG_TOML,
 } from '../shared/constants';
 import { workspaceStateDirName } from './workspace-state-dir';
+import { windowsToWslPath } from './path-utils';
 
 const VALID_NAME = /^[a-z0-9_-]+$/;
 
@@ -121,11 +123,36 @@ function buildPersonaClaudeMd(displayName: string, roleDescription?: string): st
  *  because the worker body gained the Notification hook, and previousHashes[1] is
  *  the pre-Notification worker hash (WORKER_CLAUDE_SETTINGS_JSON_V5) so an existing
  *  persona carrying the old worker settings on disk upgrades silently (no `.bak`). */
-function buildPersonaManagedFiles(name: string, lane?: PersonaLane): Record<string, ScaffoldFile> {
+function buildPersonaManagedFiles(
+  workspacePath: string, pathType: PathType, name: string, lane?: PersonaLane,
+): Record<string, ScaffoldFile> {
   const base = `.lares/agents/${name}`;
   const settingsContent = lane === 'supervisor'
     ? SUPERVISOR_PERSONA_CLAUDE_SETTINGS_JSON
     : WORKER_CLAUDE_SETTINGS_JSON;
+  // Codex persona hook carrier (Path A, profile-retirement step 1). A codex
+  // persona launches from THIS cwd (.lares/agents/<name>/), which has no
+  // .codex/config.toml — so on native Windows it previously got its turn-boundary
+  // hooks from the CODEX_HOME --profile dashboard-worker file. It now rides the
+  // SAME worker-cwd trusted-project carrier the worker lane proved
+  // (WORKER_CODEX_CONFIG_TOML v6: [features] hooks=true + Stop/UserPromptSubmit/
+  // SessionStart + the PreToolUse git-discard guard). ensureProviderDirTrust
+  // already trust-seeds the persona cwd so Codex loads it. ${WORKSPACE_ROOT} is
+  // materialized at scaffold-write time (Codex has no ${CLAUDE_PROJECT_DIR}
+  // analog) — WSL Node can't read `C:/...`, so pick the runtime-resolvable form.
+  // This is a NEW managed entry at version 1: there is no legacy persona
+  // config.toml to hash-migrate, so version 1 points straight at the current v6
+  // body (no previousHashes). Written for every persona regardless of provider —
+  // harmless for a Claude launch (Claude ignores it); only a codex launch loads
+  // it. On WSL, personas still ride the profile (this file is inert there, exactly
+  // as the worker copy is), pending a WSL Path-A probe.
+  const posixWorkspaceRoot = pathType === 'wsl'
+    ? windowsToWslPath(workspacePath)
+    : workspacePath.replace(/\\/g, '/');
+  const codexConfig = WORKER_CODEX_CONFIG_TOML.replace(
+    /\$\{WORKSPACE_ROOT\}/g,
+    posixWorkspaceRoot,
+  );
   // v2 → v3 adds the statusLine → dashboard-statusline.mjs usage-capture block.
   // v3 → v4: the worker-lane body inherits the PreToolUse(Bash) → guard-git-discard.mjs
   // hook (WORKER_CLAUDE_SETTINGS_JSON gained it at its v8), so a worker-lane
@@ -152,6 +179,8 @@ function buildPersonaManagedFiles(name: string, lane?: PersonaLane): Record<stri
     // persona kit at sidecar version 2 carries); previousHashes[1] stays the
     // pre-rename body. Same single-hash caveat as create-persona above.
     [`${base}/.claude/skills/read-comments/SKILL.md`]:  { content: PERSONA_READ_COMMENTS_SKILL, version: 3, previousHashes: { 1: sha256Hex(PERSONA_READ_COMMENTS_SKILL_V2), 2: sha256Hex(PERSONA_READ_COMMENTS_SKILL_V3) } },
+    // Codex hook carrier (see comment above). Fresh at version 1 → current v6 body.
+    [`${base}/.codex/config.toml`]:                     { content: codexConfig, version: 1 },
   };
 }
 
@@ -172,7 +201,7 @@ export function ensurePersonaScaffold(workspacePath: string, pathType: PathType,
   // has working hooks + the default skills). Lane selects the settings.json
   // variant so a supervisor-privilege persona inherits the hook scaffold.
   const lane = readPersonaLane(workspacePath, pathType, name);
-  writeScaffoldMap(workspacePath, buildPersonaManagedFiles(name, lane), pathType, { logPrefix: '[persona]' });
+  writeScaffoldMap(workspacePath, buildPersonaManagedFiles(workspacePath, pathType, name, lane), pathType, { logPrefix: '[persona]' });
   // Identity — seed-once. A persona created by scaffoldPersona already has both;
   // a hand-written legacy persona (mr-job-hunt-agent) keeps its own CLAUDE.md.
   const base = `.lares/agents/${name}`;
@@ -389,7 +418,7 @@ export function scaffoldPersona(
   // Operational plumbing — managed (atomic + version-migrated + locked). The
   // declared lane selects the settings.json variant (supervisor-privilege persona
   // inherits the hook scaffold; everything else gets the worker variant).
-  writeScaffoldMap(workspacePath, buildPersonaManagedFiles(name, lane), pathType, { logPrefix: '[persona]' });
+  writeScaffoldMap(workspacePath, buildPersonaManagedFiles(workspacePath, pathType, name, lane), pathType, { logPrefix: '[persona]' });
   // Identity — seed-once. At create the dir is fresh, so CLAUDE.md is written here
   // with the user's role body; it is never overwritten on any later launch.
   seedFileIfAbsent(workspacePath, pathType, `${base}/CLAUDE.md`, buildPersonaClaudeMd(displayNameFor(name), roleDescription));

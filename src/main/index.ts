@@ -1,4 +1,4 @@
-import { app, BrowserWindow, crashReporter, dialog, protocol, session, nativeTheme, ipcMain } from 'electron';
+import { app, BrowserWindow, crashReporter, dialog, protocol, session, nativeTheme, ipcMain, nativeImage } from 'electron';
 import { powerMonitor } from 'electron';
 import { registerLifecycleIpc, LIFECYCLE_CHANNELS, type BulkStopDeps } from './lifecycle/lifecycle-ipc';
 import {
@@ -201,6 +201,15 @@ process.stderr?.on?.('error', () => {});
 // verbatim (0 ok / 2 partial / 4 cold index) via app.exit — app.quit() always
 // exits 0 and would silently erase them.
 const analyticsSnapshotArgv = parseAnalyticsSnapshotArgv(process.argv);
+
+// Windows resolves a taskbar button's identity while the process is starting,
+// before the first BrowserWindow necessarily exists. Assign the packaged app's
+// stable identity here (rather than inside whenReady) so a development launch
+// cannot briefly or permanently inherit electron.exe's atom icon.
+if (process.platform === 'win32' && analyticsSnapshotArgv === null) {
+  app.setAppUserModelId('com.lares.app');
+}
+
 if (analyticsSnapshotArgv !== null) {
   const finishSnapshotCli = (code: number): void => {
     process.exitCode = code;
@@ -395,9 +404,19 @@ function getWorkspaceRootsWin(): string[] {
 }
 
 function createWindow(): void {
-  const iconPath = app.isPackaged
-    ? path.join(process.resourcesPath, 'assets', 'icon.ico')
-    : path.join(__dirname, '..', '..', '..', 'assets', 'icon.ico');
+  const assetsPath = app.isPackaged
+    ? path.join(process.resourcesPath, 'assets')
+    : path.join(__dirname, '..', '..', '..', 'assets');
+  const iconPath = path.join(assetsPath, 'icon.ico');
+  let appIcon = nativeImage.createFromPath(iconPath);
+  if (appIcon.isEmpty()) {
+    const fallbackPath = path.join(assetsPath, 'icon.png');
+    console.warn(`[startup] failed to load ${iconPath}; trying ${fallbackPath}`);
+    appIcon = nativeImage.createFromPath(fallbackPath);
+  }
+  if (appIcon.isEmpty()) {
+    throw new Error(`[startup] application icon assets are missing or invalid in ${assetsPath}`);
+  }
 
   const theme = loadPersistedTheme();
   nativeTheme.themeSource = theme;
@@ -410,7 +429,7 @@ function createWindow(): void {
     minHeight: 700,
     center: true,
     title: 'Lares',
-    icon: iconPath,
+    icon: appIcon,
     // Hide the native title bar row ("Lares") to reclaim vertical
     // space. The min/max/close buttons float top-right via the overlay, and
     // the menu bar (File / Edit / View / Help) becomes the top row.
@@ -688,13 +707,6 @@ app.whenReady().then(async () => {
   // WP1: the analytics-snapshot branch above owns this launch end-to-end —
   // no window, no supervisor, no servers.
   if (analyticsSnapshotArgv !== null) return;
-  // Give Windows an explicit app identity so the taskbar/jump-list uses our
-  // window icon (the Lares mark) instead of falling back to electron.exe's
-  // default atom icon. No-op on macOS/Linux.
-  if (process.platform === 'win32') {
-    app.setAppUserModelId('com.lares.app');
-  }
-
   // Strip any frame-blocking headers from Jupyter responses. Don't add CORS
   // headers here — `Access-Control-Allow-Origin: *` combined with
   // `Access-Control-Allow-Credentials: true` is an invalid pair that Chromium

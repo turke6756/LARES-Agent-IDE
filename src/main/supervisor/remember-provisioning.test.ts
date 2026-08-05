@@ -17,7 +17,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { AgentSupervisor } from './index';
+import { AgentSupervisor, REMEMBER_SKILL_V1_HASH } from './index';
 import { REMEMBER_SKILL } from '../../shared/constants';
 import { lessonTargetRelPaths } from '../memory-index/skill-provisioning';
 
@@ -44,28 +44,28 @@ test('lessonTargetRelPaths(remember) enumerates exactly the four WP-R roots', ()
   ]);
 });
 
-test('the Claude-supervisor remember copy is a new-skill entry in SUPERVISOR_FILES', () => {
+test('the Claude-supervisor remember copy is a managed v2 entry in SUPERVISOR_FILES', () => {
   const e = statics.SUPERVISOR_FILES[CLAUDE_SUP];
   assert.ok(e, `SUPERVISOR_FILES has ${CLAUDE_SUP}`);
   assert.equal(e.content, REMEMBER_SKILL);
-  assert.equal(e.version, 1);
-  assert.equal(e.previousHashes, undefined, 'new-skill shape: no previousHashes');
+  assert.equal(e.version, 2);
+  assert.deepEqual(e.previousHashes, { 1: REMEMBER_SKILL_V1_HASH });
 });
 
-test('the Codex-supervisor remember copy is a new-skill entry in SUPERVISOR_FILES_CODEX', () => {
+test('the Codex-supervisor remember copy is a managed v2 entry in SUPERVISOR_FILES_CODEX', () => {
   const e = statics.SUPERVISOR_FILES_CODEX[CODEX_SUP];
   assert.ok(e, `SUPERVISOR_FILES_CODEX has ${CODEX_SUP}`);
   assert.equal(e.content, REMEMBER_SKILL);
-  assert.equal(e.version, 1);
-  assert.equal(e.previousHashes, undefined);
+  assert.equal(e.version, 2);
+  assert.deepEqual(e.previousHashes, { 1: REMEMBER_SKILL_V1_HASH });
 });
 
-test('the Claude-worker remember copy is a new-skill entry in WORKER_FILES_CLAUDE', () => {
+test('the Claude-worker remember copy is a managed v2 entry in WORKER_FILES_CLAUDE', () => {
   const e = statics.WORKER_FILES_CLAUDE[CLAUDE_WORKER];
   assert.ok(e, `WORKER_FILES_CLAUDE has ${CLAUDE_WORKER}`);
   assert.equal(e.content, REMEMBER_SKILL);
-  assert.equal(e.version, 1);
-  assert.equal(e.previousHashes, undefined);
+  assert.equal(e.version, 2);
+  assert.deepEqual(e.previousHashes, { 1: REMEMBER_SKILL_V1_HASH });
 });
 
 test('a real Codex-worker scaffold write lands the remember copy under .agents/skills/', () => {
@@ -86,6 +86,8 @@ test('a real Codex-worker scaffold write lands the remember copy under .agents/s
     const landed = path.join(wd, CODEX_WORKER);
     assert.ok(fs.existsSync(landed), `${CODEX_WORKER} was scaffolded`);
     assert.equal(fs.readFileSync(landed, 'utf8'), REMEMBER_SKILL);
+    const sidecar = JSON.parse(fs.readFileSync(path.join(wd, '.lares', '.scaffold-versions.json'), 'utf8')) as Record<string, number>;
+    assert.equal(sidecar['workers/codex/.agents/skills/remember/SKILL.md'], 2);
   } finally {
     db.addEvent = origAddEvent;
     try { fs.rmSync(wd, { recursive: true, force: true }); } catch { /* best-effort */ }

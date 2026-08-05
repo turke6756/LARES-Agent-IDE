@@ -189,6 +189,7 @@ import {
   insertAgentSession, closeAgentSession,
   getAgentsByOwner,
   getPlan, planItemInPlan,
+  saveAgentContextStats, getAgentContextStats, deleteAgentContextStats,
   getDb,
   bindPromotionAgentAtomic,
 } from '../database';
@@ -891,6 +892,11 @@ export const DASHBOARD_STATUS_SCRIPT_V1_HASH = '56df727b34103b7f4f206095a06ff3c5
  *  silent v2→v3 upgrade. */
 export const DASHBOARD_STATUS_SCRIPT_V2_HASH = 'a6e27a1330e7cd499ed5be2b7b3a68ea902e5305afc2506b21393ef63aa0627e';
 
+/** SHA-256 hex of the v1 `remember/SKILL.md` body whose capsule example used
+ *  `.lares/supervisor/memory/details/<id>.md`. v2 makes the pointer relative to
+ *  the supervisor state dir, matching the memory-index validator. */
+export const REMEMBER_SKILL_V1_HASH = 'e97e02e3a6bce521bdb37b535a89e61f25c267e0dd6b4194480b12fe8e6c9aea';
+
 /** SHA-256 hex of the pre-UserPromptSubmit `.claude/settings.json` (Stop +
  *  SubagentStop only). v2 adds the UserPromptSubmit hook entry. Used in the
  *  v2 settings file's previousHashes for silent v1→v2 upgrade. */
@@ -1204,6 +1210,11 @@ export const WORKER_CLAUDE_MD_V8_HASH = '05bb90b3427f7ca62d18be164f9fc7cfb5c3318
  *  live v10 body derives from it. previousHashes[9] for silent v9 → v10 upgrade. */
 export const WORKER_CLAUDE_MD_V9_HASH = '283c36d2fa384415c3e5f61aacfa4f40a1d3776cd2d3c045900a208de8ec8a1b';
 
+/** SHA-256 hex of the v10 `.lares/workers/claude/CLAUDE.md` — the body BEFORE
+ *  the v11 directional-memory edit. Frozen as WORKER_CLAUDE_MD_V10 in
+ *  constants.ts; previousHashes[10] enables silent pristine v10 → v11 upgrade. */
+export const WORKER_CLAUDE_MD_V10_HASH = '89c1675d008f34792c9fe9ca59a4d237f2c3b7cb5cf23cd7de62b2e2b583863c';
+
 /** SHA-256 hex of the v1 `.lares/workers/codex/AGENTS.md` — the Codex derivation
  *  of the FROZEN worker v8 body (WORKER_CODEX_AGENTS_MD_V1). v2 is the live
  *  WORKER_CODEX_AGENTS_MD (derived from the v9 worker body). Used in the codex
@@ -1215,6 +1226,11 @@ export const WORKER_CODEX_AGENTS_MD_V1_HASH = '430a331f1cfe54931583aac02036350a2
  *  the FROZEN worker v9 (WORKER_CODEX_AGENTS_MD_V2), i.e. the body BEFORE the worker
  *  v9 → v10 ceremony-drop. previousHashes[2] for the codex AGENTS.md v2 → v3 bump. */
 export const WORKER_CODEX_AGENTS_MD_V2_HASH = '60a6b1bc6df13a8025b9a0ef12ea1ab9d6db4583c90ccbf7ac473546dd62856c';
+
+/** SHA-256 hex of the v3 `.lares/workers/codex/AGENTS.md` — the Codex
+ *  derivation of frozen worker v10. previousHashes[3] enables silent pristine
+ *  v3 → v4 upgrade for the directional-memory edit. */
+export const WORKER_CODEX_AGENTS_MD_V3_HASH = '2666fc57e77d1d37eed3ac4a693ca52b244652a18b25a93ef92e67d64698bd47';
 
 // WP-SKILLFIX — SHA-256 hex of the v1 bundled bodies of the five proposal-to-plan
 // files hardened to v2 (fresh-agent test surfaced four doc defects: orient
@@ -1430,6 +1446,25 @@ export function isCodexHookPersona(a: { provider?: AgentProvider; wantsCodexHook
   return a.provider === 'codex' && !!a.wantsCodexHooks;
 }
 
+/** Path A hook-carrier selector (probe 2026-07-28; personas migrated in profile-
+ *  retirement step 1). Returns true when a codex launch should take its turn-
+ *  boundary hooks from its OWN cwd's trusted-project `.codex/config.toml` (no
+ *  CODEX_HOME `--profile`, injectProfile=false), false when it must still ride the
+ *  profile (injectProfile=true).
+ *
+ *  Native Windows carries them in-cwd for BOTH the worker lane AND codex personas:
+ *  the worker cwd (.lares/workers/codex/) and each persona cwd (.lares/agents/
+ *  <name>/) both ship a v6 WORKER_CODEX_CONFIG_TOML and are trust-seeded by
+ *  ensureProviderDirTrust, so Codex loads the config directly. WSL is NOT yet
+ *  migrated (needs its own probe): WSL workers AND WSL personas still ride the
+ *  CODEX_HOME profile, so this is windows-only. Only consulted under
+ *  `wantsCodexHooks` (provider === 'codex' already established by the caller). */
+export function shouldUseWorkerCwdCodexHooks(opts: {
+  pathType: string; isWorkerLane: boolean; persona: boolean;
+}): boolean {
+  return opts.pathType === 'windows' && (opts.isWorkerLane || opts.persona);
+}
+
 /** B2 (HOOK_SYSTEM_DESIGN.md §C) — ensure a hook-instrumented codex command
  *  carries the bypass flag (and, on the pre-Path-A paths, the dashboard hook
  *  profile) so its turn-boundary hooks fire.
@@ -1440,16 +1475,18 @@ export function isCodexHookPersona(a: { provider?: AgentProvider; wantsCodexHook
  *  permanently blind. This broadens to ANY recognizably-codex command,
  *  preserving the rest of the command verbatim.
  *
- *  Two modes, selected by `opts.injectProfile`:
- *   • injectProfile=true (default — WSL workers + codex personas): hooks ride
+ *  Two modes, selected by `opts.injectProfile` (see shouldUseWorkerCwdCodexHooks
+ *  for who gets which):
+ *   • injectProfile=true (default — WSL workers AND WSL personas): hooks ride
  *     the CODEX_HOME `--profile dashboard-worker` file, so inject BOTH
  *     `--profile dashboard-worker` and `--dangerously-bypass-hook-trust`
  *     (whichever is missing), immediately after the `codex`/`ccodex` launcher
  *     token so the flags bind to codex itself, ahead of any subcommand like
  *     `resume`.
- *   • injectProfile=false (Path A — native-Windows WORKER lane): hooks ride the
- *     worker-cwd trusted-project `.codex/config.toml` (ensureCodexProjectTrust
- *     marks the cwd trusted). Do NOT inject `--profile` — probe 2026-07-28 Run D
+ *   • injectProfile=false (Path A — native-Windows WORKER lane AND native-Windows
+ *     personas): hooks ride the launch cwd's trusted-project `.codex/config.toml`
+ *     (ensureProviderDirTrust marks the cwd trusted; the worker/persona scaffold
+ *     writes the v6 config there). Do NOT inject `--profile` — probe 2026-07-28 Run D
  *     proved a profile layer + the project layer MERGE, so every hook
  *     double-fires. If a stored/legacy command already carries OUR
  *     `--profile dashboard-worker`, STRIP it for the same reason. KEEP the
@@ -1465,7 +1502,7 @@ export function instrumentCodexWorkerCommand(
   command: string,
   opts: { injectProfile?: boolean } = {},
 ): { command: string; instrumented: boolean } {
-  const injectProfile = opts.injectProfile !== false; // default true (WSL + personas)
+  const injectProfile = opts.injectProfile !== false; // default true (WSL workers + WSL personas)
   // Locate the codex launcher token (`codex` or `ccodex`) as a whole word,
   // tolerating a path prefix (`/usr/bin/ccodex`) but not a substring match
   // inside an unrelated token.
@@ -2194,6 +2231,11 @@ export class AgentSupervisor extends EventEmitter {
         const a = getAgent(agentId);
         return a ? getEffectiveWorkspaceRoot(a) : null;
       },
+      {
+        load: getAgentContextStats,
+        save: saveAgentContextStats,
+        delete: deleteAgentContextStats,
+      },
     );
     this.chatService = new AgentChatService(this.sessionLogReader);
 
@@ -2803,19 +2845,23 @@ export class AgentSupervisor extends EventEmitter {
       // stored command. (No-op for other-provider commands, which never carry it.)
       command = command.replace(/\s+--chrome\b/g, '');
     }
-    // Class IV codex hooks. Path A (probe 2026-07-28): a native-Windows WORKER
-    // lane gets its turn-boundary hooks from the worker-cwd trusted-project
-    // .codex/config.toml (ensureCodexProjectTrust marks the cwd trusted, so Codex
-    // loads it), so it must NOT also carry `--profile dashboard-worker` (Run D:
-    // profile + project layers merge → every hook double-fires). Every OTHER
-    // codex-hook path still needs the CODEX_HOME profile: WSL workers (NOT yet
-    // migrated — WSL needs its own probe) and codex personas (no worker-cwd hook
-    // config of their own). `--dangerously-bypass-hook-trust` is load-bearing on
-    // ALL paths (Run C: hooks silently don't fire without it) and never stalls an
-    // automated launch. B2 (HOOK_SYSTEM_DESIGN.md §C): instrument ANY codex
-    // command (not just the pristine default); if it can't be safely
-    // instrumented, mark the agent hook_status='degraded' (set below).
-    const useWorkerCwdCodexHooks = pathType === 'windows' && isWorkerLane && !resolvedInput.persona;
+    // Class IV codex hooks. Path A (probe 2026-07-28): a native-Windows codex
+    // launch — WORKER lane OR persona — gets its turn-boundary hooks from its
+    // own cwd's trusted-project .codex/config.toml (ensureCodexProjectTrust marks
+    // the cwd trusted, so Codex loads it). The worker cwd (.lares/workers/codex/)
+    // and each persona cwd (.lares/agents/<name>/) both now ship the v6
+    // WORKER_CODEX_CONFIG_TOML, so neither must ALSO carry `--profile
+    // dashboard-worker` (Run D: profile + project layers merge → every hook
+    // double-fires). The only codex-hook path still on the CODEX_HOME profile is
+    // WSL (workers AND personas) — NOT yet migrated, needs its own probe.
+    // `--dangerously-bypass-hook-trust` is load-bearing on ALL paths (Run C: hooks
+    // silently don't fire without it) and never stalls an automated launch. B2
+    // (HOOK_SYSTEM_DESIGN.md §C): instrument ANY codex command (not just the
+    // pristine default); if it can't be safely instrumented, mark the agent
+    // hook_status='degraded' (set below).
+    const useWorkerCwdCodexHooks = shouldUseWorkerCwdCodexHooks({
+      pathType, isWorkerLane, persona: !!resolvedInput.persona,
+    });
     let codexHookDegraded = false;
     if (wantsCodexHooks) {
       const instrumented = instrumentCodexWorkerCommand(command, { injectProfile: !useWorkerCwdCodexHooks });
@@ -2941,7 +2987,8 @@ export class AgentSupervisor extends EventEmitter {
     // null, log stays 0 bytes); WSL's leading `cd '${dir}'` exits before the
     // provider CLI runs. The claude case self-heals as a side effect of
     // `ensureWorkerScaffold` writing files under `.lares/workers/claude/`,
-    // but providers with empty file maps would otherwise have no lane directory Provider-agnostic mkdir here closes the gap once for
+    // but providers with empty file maps would otherwise have no lane directory
+    // never be created. Provider-agnostic mkdir here closes the gap once for
     // every cwd resolution branch (supervisor, persona, supervised, explicit).
     if (pathType === 'windows') {
       fs.mkdirSync(agentCwd, { recursive: true });
@@ -3098,11 +3145,16 @@ export class AgentSupervisor extends EventEmitter {
       // (upgrade reaches existing personas incl. mr-job-hunt-agent).
       this.writeScaffoldMap(workDir, AgentSupervisor.WORKSPACE_SCRIPT_FILES, pathType);
       ensurePersonaScaffold(workDir, pathType, resolvedInput.persona);
-      // Codex personas: the instrumented command carries --profile, but the worker
-      // branch (which normally writes the CODEX_HOME profile) is skipped for
-      // personas. Ensure the profile file exists so --profile resolves. Idempotent
-      // (once-per-process-per-pathType guarded).
-      if (provider === 'codex') this.ensureCodexHookProfile(pathType);
+      // Codex personas (profile-retirement step 1): on native Windows a persona
+      // now carries its hooks in its own trusted-project .codex/config.toml
+      // (ensurePersonaScaffold writes it; useWorkerCwdCodexHooks → injectProfile
+      // =false strips any --profile), so the CODEX_HOME profile is neither loaded
+      // nor written for it — matching the native-Windows worker lane. WSL personas
+      // are NOT yet migrated: their instrumented command still carries --profile
+      // and the worker branch that writes the profile is skipped for personas, so
+      // ensure the profile file exists here. Idempotent (once-per-process-per-
+      // pathType guarded).
+      if (provider === 'codex' && pathType !== 'windows') this.ensureCodexHookProfile(pathType);
     } else if (resolvedInput.isSupervisor) {
       this.ensureSupervisorScaffold(workDir, pathType);
     } else if (isResearcher) {
@@ -3276,11 +3328,10 @@ export class AgentSupervisor extends EventEmitter {
     // Memory & Lessons v2 (WP-F1): the `remember` skill — the ONE user-facing
     // memory/lesson write entry — ships to the Claude SUPERVISOR skill root here
     // (the Codex supervisor `.agents/skills/` copy is SUPERVISOR_FILES_CODEX; the
-    // worker copies are WORKER_FILES_CLAUDE + codexFiles). New-skill shape
-    // ({ version: 1 }, no previousHashes — same as checkpoint-forensics above).
+    // worker copies are WORKER_FILES_CLAUDE + codexFiles).
     // Published lessons are NOT scaffold entries — the memory_lessons DB registry
     // is their record; only `remember` itself is managed here.
-    [`.lares/supervisor/.claude/skills/remember/SKILL.md`]:                       { content: REMEMBER_SKILL, version: 1 },
+    [`.lares/supervisor/.claude/skills/remember/SKILL.md`]:                       { content: REMEMBER_SKILL, version: 2, previousHashes: { 1: REMEMBER_SKILL_V1_HASH } }, // v2: fixes the capsule example's `detail:` path to the validator-accepted `memory/details/<id>.md` form
     // Persona kit (§1.4) — the two default skills ship into every native lane too
     // so the supervisor/researcher/worker can guide persona creation + read comments.
     [`.lares/supervisor/.claude/skills/create-persona/SKILL.md`]:                 { content: PERSONA_CREATE_PERSONA_SKILL, version: 4, previousHashes: { 1: sha256Hex(PERSONA_CREATE_PERSONA_SKILL_V1), 2: PERSONA_CREATE_PERSONA_SKILL_V2_HASH, 3: PERSONA_CREATE_PERSONA_SKILL_V3_HASH } }, // v4: `.lares` rename
@@ -3303,10 +3354,10 @@ export class AgentSupervisor extends EventEmitter {
    *  the research store) so the location is present whenever a workspace's
    *  supervisor might run on Codex — the `.agents/` path is inert for a Claude
    *  supervisor (Claude reads only `.claude/skills/`), so an always-present copy
-   *  is harmless. New-skill shape ({ version: 1 }, no previousHashes). */
+   *  is harmless. */
   private static SUPERVISOR_FILES_CODEX: Record<string, ScaffoldFile> = {
     ...proposalToPlanEntries('.lares/supervisor/.agents/skills/proposal-to-plan'),
-    [`.lares/supervisor/.agents/skills/remember/SKILL.md`]: { content: REMEMBER_SKILL, version: 1 },
+    [`.lares/supervisor/.agents/skills/remember/SKILL.md`]: { content: REMEMBER_SKILL, version: 2, previousHashes: { 1: REMEMBER_SKILL_V1_HASH } }, // v2: fixes the capsule example's `detail:` path to the validator-accepted `memory/details/<id>.md` form
   };
 
   /** Class IV — workspace-shared hook script. Written on first supervised
@@ -3386,8 +3437,8 @@ export class AgentSupervisor extends EventEmitter {
     ...proposalToPlanEntries('.lares/workers/claude/.claude/skills/proposal-to-plan'),
     [`.lares/workers/claude/CLAUDE.md`]:                       {
       content: WORKER_CLAUDE_MD,
-      version: 10, // v10 (WP-P0C planning-surface) replaces the retired every-turn PLAN-EVENT ceremony section with the worker planning-surface section (where proposals/plan folders live; a worker MAY author a proposal via capture; hardening + ARC.md stay the supervisor's job; the per-turn sentinel + read-before-edit obligations are gone — WP-P0B removed the runtime contract). Previously: v9 (memory-lessons v2, WP-G) retires the shared `behavioral.md` read/append instruction: the `## Memory: shared behavioral notes only` section becomes `## Memory & lessons` with the injection-aware resident pointer (memory injected at launch for supervisors; a worker fetches via the `recall_memory` tool or a raw read of `.lares/supervisor/memory/`), the cross-workspace discoverability line, and the `remember`-skill pointer. Previously: v2 adds the memory section; v3 (WP-G) adds the research-store pointer; v4 adds the online-research division of labor; v5 (planning-surface WP2) adds the plan-event sentinel section; v6 (GT-C D2) makes the PLAN-EVENT sentinel mandatory on every rail turn + expands the status vocab; v7 (Lares rebrand) renames `.dashboard/…` → `.lares/…`; v8 adds the "Never use git to discard uncommitted work" section (pairs with the PreToolUse guard-git-discard.mjs hook)
-      previousHashes: { 1: sha256Hex(WORKER_CLAUDE_MD_V1), 2: WORKER_CLAUDE_MD_V2_HASH, 3: WORKER_CLAUDE_MD_V3_HASH, 4: WORKER_CLAUDE_MD_V4_HASH, 5: WORKER_CLAUDE_MD_V5_HASH, 6: WORKER_CLAUDE_MD_V6_HASH, 7: WORKER_CLAUDE_MD_V7_HASH, 8: WORKER_CLAUDE_MD_V8_HASH, 9: WORKER_CLAUDE_MD_V9_HASH },
+      version: 11, // v11: removes worker-side memory-retrieval guidance — supervisor briefs carry relevant memory; workers suggest via the `remember` skill. Previously: v10 (WP-P0C planning-surface) replaces the retired every-turn PLAN-EVENT ceremony section with the worker planning-surface section (where proposals/plan folders live; a worker MAY author a proposal via capture; hardening + ARC.md stay the supervisor's job; the per-turn sentinel + read-before-edit obligations are gone — WP-P0B removed the runtime contract). Previously: v9 (memory-lessons v2, WP-G) retires the shared `behavioral.md` read/append instruction: the `## Memory: shared behavioral notes only` section becomes `## Memory & lessons` with the injection-aware resident pointer (memory injected at launch for supervisors; a worker fetches via the `recall_memory` tool or a raw read of `.lares/supervisor/memory/`), the cross-workspace discoverability line, and the `remember`-skill pointer. Previously: v2 adds the memory section; v3 (WP-G) adds the research-store pointer; v4 adds the online-research division of labor; v5 (planning-surface WP2) adds the plan-event sentinel section; v6 (GT-C D2) makes the PLAN-EVENT sentinel mandatory on every rail turn + expands the status vocab; v7 (Lares rebrand) renames `.dashboard/…` → `.lares/…`; v8 adds the "Never use git to discard uncommitted work" section (pairs with the PreToolUse guard-git-discard.mjs hook)
+      previousHashes: { 1: sha256Hex(WORKER_CLAUDE_MD_V1), 2: WORKER_CLAUDE_MD_V2_HASH, 3: WORKER_CLAUDE_MD_V3_HASH, 4: WORKER_CLAUDE_MD_V4_HASH, 5: WORKER_CLAUDE_MD_V5_HASH, 6: WORKER_CLAUDE_MD_V6_HASH, 7: WORKER_CLAUDE_MD_V7_HASH, 8: WORKER_CLAUDE_MD_V8_HASH, 9: WORKER_CLAUDE_MD_V9_HASH, 10: WORKER_CLAUDE_MD_V10_HASH },
     },
     [`.lares/workers/claude/.claude/settings.json`]:           {
       content: WORKER_CLAUDE_SETTINGS_JSON,
@@ -3403,8 +3454,8 @@ export class AgentSupervisor extends EventEmitter {
       },
     },
     // Memory & Lessons v2 (WP-F1): the `remember` skill for the Claude WORKER
-    // skill root. New-skill shape ({ version: 1 }, no previousHashes).
-    [`.lares/workers/claude/.claude/skills/remember/SKILL.md`]:       { content: REMEMBER_SKILL, version: 1 },
+    // skill root.
+    [`.lares/workers/claude/.claude/skills/remember/SKILL.md`]:       { content: REMEMBER_SKILL, version: 2, previousHashes: { 1: REMEMBER_SKILL_V1_HASH } }, // v2: fixes the capsule example's `detail:` path to the validator-accepted `memory/details/<id>.md` form
     // Persona kit (§1.4) — default skills for the Claude worker lane.
     [`.lares/workers/claude/.claude/skills/create-persona/SKILL.md`]: { content: PERSONA_CREATE_PERSONA_SKILL, version: 4, previousHashes: { 1: sha256Hex(PERSONA_CREATE_PERSONA_SKILL_V1), 2: PERSONA_CREATE_PERSONA_SKILL_V2_HASH, 3: PERSONA_CREATE_PERSONA_SKILL_V3_HASH } }, // v4: `.lares` rename
     [`.lares/workers/claude/.claude/skills/read-comments/SKILL.md`]:  { content: PERSONA_READ_COMMENTS_SKILL, version: 5, previousHashes: { 1: sha256Hex(PERSONA_READ_COMMENTS_SKILL_V1), 2: sha256Hex(PERSONA_READ_COMMENTS_SKILL_V2), 3: sha256Hex(PERSONA_READ_COMMENTS_SKILL_V3), 4: sha256Hex(PERSONA_READ_COMMENTS_SKILL_V4) } }, // v5: Python fallback removed (honest on a Python-free clean VM)
@@ -3582,17 +3633,17 @@ export class AgentSupervisor extends EventEmitter {
         // worker body) so a pristine v1 workspace upgrades silently.
         [`.lares/workers/codex/AGENTS.md`]: {
           content: WORKER_CODEX_AGENTS_MD,
-          version: 3, // v3 (WP-P0C): inherits worker v9->v10 (ceremony drop + planning-surface section)
-          previousHashes: { 1: WORKER_CODEX_AGENTS_MD_V1_HASH, 2: WORKER_CODEX_AGENTS_MD_V2_HASH },
+          version: 4, // v4: removes worker-side memory-retrieval guidance — supervisor briefs carry relevant memory; workers suggest via the `remember` skill. Previously: v3 (WP-P0C) inherits worker v9->v10 (ceremony drop + planning-surface section)
+          previousHashes: { 1: WORKER_CODEX_AGENTS_MD_V1_HASH, 2: WORKER_CODEX_AGENTS_MD_V2_HASH, 3: WORKER_CODEX_AGENTS_MD_V3_HASH },
         },
         // Memory & Lessons v2 (WP-F1): the `remember` skill for the Codex WORKER
         // skill root (WP-R proved `.agents/skills/` discovery + invocation from
-        // the Codex worker cwd). New-skill shape ({ version: 1 }, no
-        // previousHashes) — content is provider-neutral, identical to the Claude
-        // copies.
+        // the Codex worker cwd). Content is provider-neutral, identical to the
+        // Claude copies.
         [`.lares/workers/codex/.agents/skills/remember/SKILL.md`]: {
           content: REMEMBER_SKILL,
-          version: 1,
+          version: 2, // v2: fixes the capsule example's `detail:` path to the validator-accepted `memory/details/<id>.md` form
+          previousHashes: { 1: REMEMBER_SKILL_V1_HASH },
         },
       };
       providerCreated = this.writeScaffoldMap(workDir, codexFiles, pathType);

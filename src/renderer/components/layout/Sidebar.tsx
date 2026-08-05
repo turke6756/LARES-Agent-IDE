@@ -187,6 +187,12 @@ export default function Sidebar({ width }: SidebarProps) {
   const menuRef = useRef<HTMLDivElement>(null);
   const menuPosition = useCursorMenuPosition(menuRef, contextMenu, { width: 210, height: 245 }, confirmDelete);
   const collapsed = panelLayout.sidebarCollapsed;
+  // The pane header shows the currently selected workspace's name (the one whose
+  // agents fill the center pane), falling back to the section label when nothing
+  // is selected yet. This is the single place the active workspace name lives —
+  // the center pane no longer repeats it.
+  const selectedWorkspace = workspaces.find((w) => w.id === selectedWorkspaceId);
+  const headerLabel = selectedWorkspace?.title ?? 'Workspaces';
   const wslState = health?.wslStatus?.state;
   const wslLabel = healthChecking
     ? 'Checking...'
@@ -434,7 +440,7 @@ export default function Sidebar({ width }: SidebarProps) {
           <CollapseButton collapsed direction="left" onClick={() => togglePanelCollapsed('sidebarCollapsed')} />
         </div>
         <div className="mt-2 text-[13px] font-sans text-accent-blue writing-mode-vertical" style={{ writingMode: 'vertical-rl' }}>
-          Workspaces
+          {headerLabel}
         </div>
       </div>
     );
@@ -450,7 +456,7 @@ export default function Sidebar({ width }: SidebarProps) {
           TopBar, so this row is now just the Workspaces section label + actions
           (pinned outside the scroll container below). */}
       <div className="panel-header h-16 px-4 flex items-center justify-between shrink-0">
-        <span className="ui-section-header">Workspaces</span>
+        <span className="ui-section-header truncate" title={headerLabel}>{headerLabel}</span>
         <div className="flex items-center gap-1">
           <button
             onClick={() => void handleRefresh()}

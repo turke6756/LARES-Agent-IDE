@@ -146,11 +146,12 @@ test('Codex: scaffold writes AGENTS.md standing instructions + NO behavioral.md 
     assert.ok(!agents.includes('PLAN-EVENT'), 'retired every-turn PLAN-EVENT ceremony must be dropped (WP-P0C)');
     assert.ok(agents.includes('proposal-to-plan'), 'codex AGENTS.md must carry the proposal-to-plan planning-surface section');
     assert.ok(!agents.includes('AskUserQuestion'), 'Claude-Code-specific tool name removed');
-    // v2 (WP-G): the memory-lessons section points at the injected supervisor memory
-    // + recall_memory + remember, NOT a seeded behavioral.md.
+    // Directional memory flow: the supervisor brief carries relevant context;
+    // recall_memory is exceptional and remember drafts suggestions.
     assert.ok(agents.includes('## Memory & lessons'), 'codex AGENTS.md carries the new memory-lessons section');
-    assert.ok(agents.includes('recall_memory'), 'codex AGENTS.md names the recall_memory fetch tool');
-    assert.ok(agents.includes('.lares/supervisor/memory/MEMORY.md'), 'codex AGENTS.md names the raw-read fallback path');
+    assert.ok(agents.includes('only when your brief explicitly points you at a capsule'), 'codex AGENTS.md limits recall_memory to explicit brief pointers');
+    assert.ok(agents.includes('draft it for your supervisor'), 'codex AGENTS.md routes memory suggestions through the supervisor');
+    assert.ok(!agents.includes('.lares/supervisor/memory/MEMORY.md'), 'codex AGENTS.md removes raw index-read guidance');
     assert.ok(!agents.includes('The one durable exception is'), 'codex AGENTS.md drops the retired behavioral.md instruction');
 
     // WP-G retired seeding: fresh Codex scaffold must write NO behavioral.md.
@@ -304,8 +305,8 @@ test('Claude: scaffold writes NO worker behavioral.md (WP-G retired seeding)', (
     supervisor.ensureWorkerScaffold(workDir, 'claude', 'windows');
 
     // WP-G (memory-lessons v2): the shared worker behavioral.md is no longer
-    // seeded. A worker's CLAUDE.md (v9) points at the injected supervisor memory +
-    // the `remember` skill instead. A fresh scaffold must create no behavioral.md.
+    // seeded. A worker's CLAUDE.md points at supervisor-carried context + the
+    // `remember` skill instead. A fresh scaffold must create no behavioral.md.
     const memPath = path.join(workDir, '.lares', 'workers', 'claude', 'behavioral.md');
     assert.ok(!fs.existsSync(memPath), `WP-G: no Claude worker behavioral.md must be seeded; found ${memPath}`);
 
@@ -315,7 +316,9 @@ test('Claude: scaffold writes NO worker behavioral.md (WP-G retired seeding)', (
     assert.ok(fs.existsSync(mdPath), `expected worker CLAUDE.md at ${mdPath}`);
     const md = fs.readFileSync(mdPath, 'utf-8');
     assert.ok(md.includes('## Memory & lessons'), 'worker CLAUDE.md carries the new memory-lessons section');
-    assert.ok(md.includes('recall_memory') && md.includes('`remember`'), 'worker CLAUDE.md names recall_memory + remember');
+    assert.ok(md.includes('only when your brief explicitly points you at a capsule'), 'worker CLAUDE.md makes recall_memory exceptional');
+    assert.ok(md.includes('draft it for your supervisor'), 'worker CLAUDE.md routes memory suggestions through the supervisor');
+    assert.ok(!md.includes('.lares/supervisor/memory/MEMORY.md'), 'worker CLAUDE.md removes raw index-read guidance');
     assert.ok(!md.includes('The one durable exception is'), 'worker CLAUDE.md drops the retired behavioral.md instruction');
   } finally {
     cleanup();

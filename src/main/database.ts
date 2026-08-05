@@ -5,7 +5,7 @@ import fs from 'fs';
 import crypto from 'crypto';
 import { v4 as uuidv4 } from 'uuid';
 import { AgentStopReason, deriveHookAvailability, isAgentStopReason, parseStopReason, PersistedAgentStatus } from '../shared/types';
-import { Agent, AgentProvider, AgentSessionRow, AgentStatus, AgentTemplate, CreateAgentTemplateInput, CreateSelectionCommentInput, CreateSelectionCommentReplyInput, CreateWorkspaceInput, CreateTeamInput, FileActivity, FileOperation, Plan, PlanFormat, PlanTabKey, PlanTabOverview, SelectionComment, SelectionCommentReply, SelectionCommentStatus, SupervisorFocus, Team, TeamChannel, TeamMember, TeamMessage, TeamMessageStatus, TeamStatus, TeamTask, TeamTaskStatus, UpdateSelectionCommentInput, Workspace } from '../shared/types';
+import { Agent, AgentProvider, AgentSessionRow, AgentStatus, AgentTemplate, ContextStats, CreateAgentTemplateInput, CreateSelectionCommentInput, CreateSelectionCommentReplyInput, CreateWorkspaceInput, CreateTeamInput, FileActivity, FileOperation, Plan, PlanFormat, PlanTabKey, PlanTabOverview, SelectionComment, SelectionCommentReply, SelectionCommentStatus, SupervisorFocus, Team, TeamChannel, TeamMember, TeamMessage, TeamMessageStatus, TeamStatus, TeamTask, TeamTaskStatus, UpdateSelectionCommentInput, Workspace } from '../shared/types';
 import { parsePdfSelectionAnchor, serializePdfSelectionAnchor, validatePdfSelectionAnchor, type PdfSelectionAnchorV1, type SelectionAnchorType } from '../shared/pdf-annotations';
 import { DEFAULT_COMMAND, DEFAULT_COMMAND_WSL, SUPERVISOR_AGENT_MD } from '../shared/constants';
 import { OrchestrationBinding, OrchestrationEvent, OrchestrationRun, OrchestrationPlanBindingMode } from './orchestration/types';
@@ -100,6 +100,19 @@ export function initDatabase(): void {
       file_path   TEXT NOT NULL,
       operation   TEXT NOT NULL,
       timestamp   TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+  `);
+
+  // Last-known per-agent context reading. The live monitor remains authoritative
+  // while the app is running; this single-row cache lets terminal agent cards
+  // restore their useful context bar after a process restart (terminal agents
+  // are intentionally excluded from the live session-log polling registry).
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS agent_context_stats (
+      agent_id    TEXT PRIMARY KEY,
+      stats_json  TEXT NOT NULL,
+      updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE
     )
   `);
 
@@ -3360,6 +3373,44 @@ export function getAgent(id: string): Agent | null {
   return row ? rowToAgent(row) : null;
 }
 
+/** Persist the latest context-bar snapshot without creating orphan rows for an
+ * agent that was deleted while a final usage event was still in flight. */
+export function saveAgentContextStats(stats: ContextStats): void {
+  run(
+    `INSERT OR REPLACE INTO agent_context_stats (agent_id, stats_json, updated_at)
+     SELECT ?, ?, datetime('now') WHERE EXISTS (SELECT 1 FROM agents WHERE id = ?)`,
+    [stats.agentId, JSON.stringify(stats), stats.agentId],
+  );
+}
+
+/** Read the durable context-bar snapshot. Malformed data is treated as absent so
+ * a damaged cache can never prevent the dashboard from rendering. */
+export function getAgentContextStats(agentId: string): ContextStats | null {
+  const row = queryOne('SELECT stats_json FROM agent_context_stats WHERE agent_id = ?', [agentId]);
+  if (!row || typeof row.stats_json !== 'string') return null;
+  try {
+    const stats = JSON.parse(row.stats_json) as Partial<ContextStats> | null;
+    const numericFields: Array<keyof ContextStats> = [
+      'inputTokens', 'cacheCreationTokens', 'cacheReadTokens', 'outputTokens',
+      'totalOutputTokens', 'totalContextTokens', 'contextWindowMax',
+      'contextPercentage', 'turnCount',
+    ];
+    if (
+      !stats || stats.agentId !== agentId ||
+      typeof stats.sessionId !== 'string' || typeof stats.model !== 'string' ||
+      typeof stats.lastUpdatedAt !== 'string' ||
+      numericFields.some((field) => typeof stats[field] !== 'number' || !Number.isFinite(stats[field]))
+    ) return null;
+    return stats as ContextStats;
+  } catch {
+    return null;
+  }
+}
+
+export function deleteAgentContextStats(agentId: string): void {
+  run('DELETE FROM agent_context_stats WHERE agent_id = ?', [agentId]);
+}
+
 export function getAgentsByWorkspace(workspaceId: string): Agent[] {
   return queryAll('SELECT * FROM agents WHERE workspace_id = ? ORDER BY created_at ASC', [workspaceId]).map(rowToAgent);
 }
@@ -4651,6 +4702,7 @@ export function pruneFileActivitiesToRecentSessions(
 }
 
 export function deleteAgent(id: string): void {
+  deleteAgentContextStats(id);
   run('DELETE FROM file_activities WHERE agent_id = ?', [id]);
   run('DELETE FROM events WHERE agent_id = ?', [id]);
   // Git-Native WP-A0 (memory §4.2): deliberately DO NOT touch `turn_records` or
@@ -7932,6 +7984,7 @@ export function recordPromotionFailed(input: {
   });
   tx();
 }
+
 // ── WP-P3B-enrich — the ONE SQLite transaction of the enrichment saga ──────────
 // ACCESSORS ONLY (A2 DDL window CLOSED). Runs SECOND, AFTER the manifest step has
 // observed the deterministic responsibility event outside SQLite (SQLite and

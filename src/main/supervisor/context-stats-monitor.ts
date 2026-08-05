@@ -12,6 +12,14 @@ export interface JsonlFileActivity {
   operation: FileOperation;
 }
 
+/** Optional durable last-snapshot cache. It is deliberately injected so the
+ * monitor stays independently testable and remains usable without a database. */
+export interface ContextStatsPersistence {
+  load(agentId: string): ContextStats | null;
+  save(stats: ContextStats): void;
+  delete(agentId: string): void;
+}
+
 // WP-1b (memory hardening P1): cap grow-forever per-agent/global structures with
 // insertion-ordered Set/Map eviction (oldest-first FIFO). A Set/Map preserves
 // insertion order, so `values()/keys().next().value` is always the oldest live
@@ -67,11 +75,17 @@ export class ContextStatsMonitor extends EventEmitter {
   // addFileActivity), never inferred later from a shared cwd. Optional so tests
   // (and any non-wired caller) get raw pass-through.
   private resolveWorkspaceRoot?: (agentId: string) => string | null;
+  private persistence?: ContextStatsPersistence;
 
-  constructor(reader: SessionLogReader, resolveWorkspaceRoot?: (agentId: string) => string | null) {
+  constructor(
+    reader: SessionLogReader,
+    resolveWorkspaceRoot?: (agentId: string) => string | null,
+    persistence?: ContextStatsPersistence,
+  ) {
     super();
     this.reader = reader;
     this.resolveWorkspaceRoot = resolveWorkspaceRoot;
+    this.persistence = persistence;
   }
 
   start(): void {
@@ -91,7 +105,15 @@ export class ContextStatsMonitor extends EventEmitter {
   }
 
   getStats(agentId: string): ContextStats | null {
-    return this.stats.get(agentId) || null;
+    const live = this.stats.get(agentId);
+    if (live) return live;
+    try {
+      const persisted = this.persistence?.load(agentId) ?? null;
+      if (persisted) this.stats.set(agentId, persisted);
+      return persisted;
+    } catch {
+      return null;
+    }
   }
 
   /** Layer-3 memory telemetry gauges: O(1) `.size` reads of the retained maps.
@@ -141,6 +163,7 @@ export class ContextStatsMonitor extends EventEmitter {
    */
   invalidateAgent(agentId: string): void {
     this.stats.delete(agentId);
+    try { this.persistence?.delete(agentId); } catch { /* best-effort cache */ }
     this.seenUuids.delete(agentId);
     this.seenFiles.delete(agentId);
     const prefix = `${agentId}:`;
@@ -174,6 +197,7 @@ export class ContextStatsMonitor extends EventEmitter {
         100,
         Math.round((stats.totalContextTokens / windowMax) * 100),
       );
+      try { this.persistence?.save(stats); } catch { /* best-effort cache */ }
       this.emit('statsChanged', stats);
     }
   }
@@ -228,6 +252,7 @@ export class ContextStatsMonitor extends EventEmitter {
     stats.lastUpdatedAt = e.timestamp;
 
     this.stats.set(e.agentId, stats);
+    try { this.persistence?.save(stats); } catch { /* best-effort cache */ }
     this.emit('statsChanged', stats);
   };
 

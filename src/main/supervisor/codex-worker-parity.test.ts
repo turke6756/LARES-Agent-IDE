@@ -138,9 +138,13 @@ test('derivation: WP-G retired the promote-lessons pointer; neither constant nam
     'the retired promote-lessons pointer (Codex constant) must be gone from AGENTS.md too',
   );
   assert.ok(
-    WORKER_CODEX_AGENTS_MD.includes('## Memory & lessons') && WORKER_CODEX_AGENTS_MD.includes('recall_memory'),
-    'AGENTS.md must carry the new memory-lessons section (recall_memory / remember)',
+    WORKER_CODEX_AGENTS_MD.includes('## Memory & lessons')
+      && WORKER_CODEX_AGENTS_MD.includes('only when your brief explicitly points you at a capsule')
+      && WORKER_CODEX_AGENTS_MD.includes('draft it for your supervisor'),
+    'AGENTS.md must carry the directional memory model',
   );
+  assert.ok(!WORKER_CODEX_AGENTS_MD.includes('.lares/supervisor/memory/MEMORY.md'),
+    'AGENTS.md must not instruct workers to raw-read the supervisor memory index');
 });
 
 // ── behavioral.md derivation ────────────────────────────────────────────────
