@@ -42,6 +42,16 @@ function selectionForGroup(
   return { selectedComponentIds, selectedUnattributedEntryIds, finalizationIds };
 }
 
+function selectionForPins(pins: SaveCardFleetAdhocMarkDoneSuccess[]): CandidatePreviewSelection {
+  return {
+    selectedComponentIds: [...new Set(pins.flatMap((pin) => pin.pinnedSelection.selectedComponentIds))],
+    selectedUnattributedEntryIds: [
+      ...new Set(pins.flatMap((pin) => pin.pinnedSelection.selectedUnattributedEntryIds)),
+    ],
+    finalizationIds: pins.filter((pin) => pin.boundaryStatus === 'ready').map((pin) => pin.finalizationId),
+  };
+}
+
 /**
  * SC-WP-3H — the per-package "Save…" affordance. Toggles the read-only candidate
  * preview pane in place beneath the bundle card. Kept in SaveCard (not SaveBundle)
@@ -54,9 +64,12 @@ function joinMessageAndUserTrailers(messageBody: string, userTrailers: string): 
 }
 
 function previewMismatchPaths(response: SaveCardPreviewResponse): string[] {
-  return response.candidate.members
-    .filter((member) => member.packageVerification === 'verified-mismatch')
-    .map((member) => member.path.displayPath);
+  const blocking = [
+    ...response.selectionDrift.missing,
+    ...response.selectionDrift.byteMoved,
+    ...response.selectionDrift.reAttributed,
+  ];
+  return [...new Set(blocking)].map((path) => response.selectionDriftDisplayPaths[path] ?? path);
 }
 
 function PackageSaveGesture({
@@ -80,8 +93,8 @@ function PackageSaveGesture({
     .map((pin) => pin.finalizationId);
   const pinned = pins.length === group.length && finalizationIds.length === group.length;
   const selection = React.useMemo(
-    () => selectionForGroup(group, finalizationIds),
-    [group.map((bundle) => bundle.bundleId).join('\0'), finalizationIds.join('\0')],
+    () => pins.length > 0 ? selectionForPins(pins) : selectionForGroup(group, finalizationIds),
+    [group.map((bundle) => bundle.bundleId).join('\0'), pins],
   );
   const hasSelectable =
     selection.selectedComponentIds.length > 0 || selection.selectedUnattributedEntryIds.length > 0;
@@ -152,6 +165,14 @@ function PackageSaveGesture({
       const reason = minted.candidate.eligibility.eligible === false
         ? minted.candidate.eligibility.reason
         : null;
+      if (paths.length > 0) {
+        setMovedPaths(paths);
+        setGestureError(
+          `${paths.length} of ${minted.pinnedSelection.frozenMemberCount} pinned files changed — re-pin to save current bytes.`,
+        );
+        setDetailsOpen(true);
+        return;
+      }
       // A pending human acknowledgement wins over the generic no-token message:
       // route the user to the ack gate rather than a confusing "no candidate" line.
       // The SERVER is authoritative about whether acks are the blocker.

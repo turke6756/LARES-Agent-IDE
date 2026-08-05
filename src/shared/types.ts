@@ -2097,6 +2097,24 @@ export interface SaveCardMintRequest {
   acknowledgeUnattributedEntryIds: string[];
 }
 
+/** Path-byte-authoritative movement between a frozen finalization manifest and
+ * the package currently resolved by main. Added paths are informational; the
+ * other three categories block minting the frozen package. */
+export interface SelectionDrift {
+  added: string[];
+  missing: string[];
+  reAttributed: string[];
+  byteMoved: string[];
+}
+
+/** Main-owned selection identities corresponding to the frozen manifest. The
+ * renderer may echo these ids but must never derive them from paths. */
+export interface SaveCardPinnedSelection {
+  selectedComponentIds: string[];
+  selectedUnattributedEntryIds: string[];
+  frozenMemberCount: number;
+}
+
 /**
  * Renderer-safe result of a Save-lens preview. `candidate` is the WP-3G
  * `CommitCandidate` (finalization-backed) or `SelectionPreview` (unfinalized) —
@@ -2129,6 +2147,10 @@ export interface SaveCardPreviewResponse {
    *  the bytes). The renderer echoes it back as `acknowledgeTopologyDigest` when it
    *  forwards a mint intent for an overlapping package. */
   componentTopologyDigest: string;
+  selectionDrift: SelectionDrift;
+  /** Display-only names keyed by authoritative path bytes. */
+  selectionDriftDisplayPaths: Record<string, string>;
+  pinnedSelection: SaveCardPinnedSelection;
 }
 
 export interface SaveCardMintResponse extends SaveCardPreviewResponse {}
@@ -2164,6 +2186,7 @@ export interface SaveCardFleetAdhocMarkDoneSuccess {
   boundaryRef: string | null;
   boundaryStatus: 'ready' | 'unavailable' | 'pruned';
   packageRevision: number;
+  pinnedSelection: SaveCardPinnedSelection;
 }
 
 export type SaveCardFleetAdhocRefusalCode =

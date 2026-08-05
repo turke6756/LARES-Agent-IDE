@@ -77,6 +77,11 @@ function response(over: Partial<SaveCardPreviewResponse> = {}): SaveCardPreviewR
     requiresOverlapAck: false,
     unacknowledgedUnattributedEntryIds: [],
     componentTopologyDigest: 'topo-1',
+    selectionDrift: { added: [], missing: [], reAttributed: [], byteMoved: [] },
+    selectionDriftDisplayPaths: {},
+    pinnedSelection: {
+      selectedComponentIds: ['c1'], selectedUnattributedEntryIds: [], frozenMemberCount: 1,
+    },
     ...over,
   };
 }
@@ -196,6 +201,25 @@ describe('CandidatePreview', () => {
     const save = q('candidate-preview-save') as HTMLButtonElement;
     expect(save.disabled).toBe(true);
     expect(q('candidate-preview-verdict')!.textContent).toContain('no longer matches');
+  });
+
+  it('renders typed drift with the server-provided path name and pinned count', async () => {
+    const pathBytes = Buffer.from('src/e1.ts').toString('base64');
+    preview.mockResolvedValue(response({
+      candidate: candidate({ eligible: false, reason: 'byte-mismatch' }, [member('e1', 'verified-mismatch')]),
+      selectionDrift: { added: [], missing: [pathBytes], reAttributed: [], byteMoved: [] },
+      selectionDriftDisplayPaths: { [pathBytes]: 'src/e1.ts' },
+      pinnedSelection: {
+        selectedComponentIds: ['c1'], selectedUnattributedEntryIds: [], frozenMemberCount: 15,
+      },
+    }));
+    await render();
+
+    const verdict = q('candidate-preview-verdict')!.textContent ?? '';
+    expect(verdict).toContain('1 of 15 pinned files changed');
+    expect(verdict).toContain('src/e1.ts');
+    expect(verdict).toContain('re-pin to save current bytes');
+    expect((q('candidate-preview-save') as HTMLButtonElement).disabled).toBe(true);
   });
 
   it('never offers a one-click save for an unfinalized SelectionPreview', async () => {

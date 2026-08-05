@@ -81,6 +81,7 @@ import type {
   SaveCardPreviewRoutes,
   SaveCardMintRoutes,
 } from './save-card-ipc';
+import { resolvePinnedSelectionDrift } from './pinned-selection-drift';
 import type {
   FinalizePlanItemDoneRequest,
   PlanCandidatePreviewRoutes,
@@ -366,11 +367,21 @@ export function createPreviewRoutes(deps: PreviewRoutesDeps): {
     const finalizations = [...new Set(finalizationIds)]
       .map((id) => getPackageFinalization(id))
       .filter((f): f is PackageFinalization => f !== null);
+    const effectiveMembers = finalizationIds.length === 0
+      ? selectionMembers(scope, selectedComponentIds, selectedUnattributedEntryIds)
+      : resolvePinnedSelectionDrift({
+          repositoryKey: scope.context.repository.repositoryKey,
+          inventory: scope.context.inventory,
+          components: scope.context.components,
+          finalizations,
+          requestedComponentIds: selectedComponentIds,
+          requestedUnattributedEntryIds: selectedUnattributedEntryIds,
+        }).frozenEntries;
     const currentCommitReps = finalizationIds.length === 0
       ? new Map<string, CommitRepresentation>()
       : await resolveReps(
           scope,
-          selectionMembers(scope, selectedComponentIds, selectedUnattributedEntryIds),
+          effectiveMembers,
         );
     return { ...scope.context, finalizations, currentCommitReps };
   }
@@ -664,6 +675,11 @@ export function createPreviewRoutes(deps: PreviewRoutesDeps): {
       runGitBytes,
       queue: deps.queue,
       commonDirQueueKey: deps.queue ? repository.objectDatabaseKey : undefined,
+      pinnedSelection: {
+        selectedComponentIds: component ? [component.componentId] : [],
+        selectedUnattributedEntryIds: component ? [] : [...entryIds].sort(),
+        frozenMemberCount: members.length,
+      },
     };
   }
 

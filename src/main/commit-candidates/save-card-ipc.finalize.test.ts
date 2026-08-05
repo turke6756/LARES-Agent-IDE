@@ -122,6 +122,9 @@ function boundaryContext(over: Partial<FleetAdhocBoundaryContext> = {}): FleetAd
     checkpointTurnId: 'turn-1', boundaryOid: OID_A, contractVersion: 1,
     createdFromWorkspaceId: 'ws-1', members: [member('src/a.ts')],
     repoRoot: '/unused', pinnedHeadOid: null,
+    pinnedSelection: {
+      selectedComponentIds: [], selectedUnattributedEntryIds: ['entry-a'], frozenMemberCount: 1,
+    },
     ...over,
   };
 }

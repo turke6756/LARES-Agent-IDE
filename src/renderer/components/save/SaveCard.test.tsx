@@ -407,6 +407,9 @@ function readyMarkDone() {
     finalizationId: 'fin-1', packageId: 'b-loud', finalizationKind: 'fleet-adhoc' as const,
     outcome: 'created' as const, boundaryRef: 'refs/lares/finalizations/fin-1',
     boundaryStatus: 'ready' as const, packageRevision: 1,
+    pinnedSelection: {
+      selectedComponentIds: ['c1'], selectedUnattributedEntryIds: [], frozenMemberCount: 1,
+    },
   };
 }
 
@@ -433,6 +436,11 @@ function readyCandidatePreview(): SaveCardPreviewResponse {
     candidate, isCandidate: true, laresTrailers: ['Lares-Turns: 2'],
     defaultMessageBody: 'Save Memory Architecture', requiresOverlapAck: false,
     unacknowledgedUnattributedEntryIds: [], componentTopologyDigest: 'topo-1',
+    selectionDrift: { added: [], missing: [], reAttributed: [], byteMoved: [] },
+    selectionDriftDisplayPaths: {},
+    pinnedSelection: {
+      selectedComponentIds: ['c1'], selectedUnattributedEntryIds: [], frozenMemberCount: 1,
+    },
   };
 }
 
@@ -557,6 +565,32 @@ describe('SaveCard decisive save gesture', () => {
     const refusal = container.querySelector('[data-testid="save-gesture-refusal"]')?.textContent ?? '';
     expect(refusal).toContain('Review and acknowledge');
     expect(refusal).not.toContain('did not produce a committable candidate');
+    expect(commit).not.toHaveBeenCalled();
+  });
+
+  it('names server-reported pinned drift and asks for a re-pin', async () => {
+    const pathBytes = 'c3JjL21haW4vbWVtb3J5L3JlY2FsbC50cw==';
+    mint.mockResolvedValue({
+      ...readyCandidateMint(),
+      candidate: {
+        ...readyCandidateMint().candidate,
+        eligibility: { eligible: false, reason: 'byte-mismatch' },
+        token: null,
+      },
+      selectionDrift: { added: [], missing: [], reAttributed: [], byteMoved: [pathBytes] },
+      selectionDriftDisplayPaths: { [pathBytes]: 'src/main/memory/recall.ts' },
+      pinnedSelection: {
+        selectedComponentIds: ['c1'], selectedUnattributedEntryIds: [], frozenMemberCount: 15,
+      },
+    });
+    await render();
+    await gestureClick(container.querySelector('[data-testid="save-bundle-pin"]')!);
+    await gestureClick(container.querySelector('[data-testid="save-bundle-submit"]')!);
+
+    const refusal = container.querySelector('[data-testid="save-gesture-refusal"]')?.textContent ?? '';
+    expect(refusal).toContain('1 of 15 pinned files changed — re-pin to save current bytes');
+    expect(refusal).toContain('src/main/memory/recall.ts');
+    expect(refusal).not.toContain('Pinned bytes no longer qualify');
     expect(commit).not.toHaveBeenCalled();
   });
 

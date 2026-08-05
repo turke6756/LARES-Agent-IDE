@@ -204,6 +204,13 @@ export default function CandidatePreview({
 
   const { response } = state;
   const { candidate } = response;
+  const blockingDriftPaths = [...new Set([
+    ...response.selectionDrift.missing,
+    ...response.selectionDrift.byteMoved,
+    ...response.selectionDrift.reAttributed,
+  ])];
+  const blockingDriftNames = blockingDriftPaths.map((path) =>
+    response.selectionDriftDisplayPaths[path] ?? path);
   const eligible = candidate.eligibility.eligible === true;
   const reservedTrailer = firstReservedTrailerLine(userTrailers);
   const overlapSatisfied = !response.requiresOverlapAck || overlapAck;
@@ -236,12 +243,25 @@ export default function CandidatePreview({
         data-testid="candidate-preview-verdict"
         data-eligible={String(eligible)}
       >
-        {candidate.eligibility.eligible ? (
+        {blockingDriftNames.length > 0 ? (
+          <span>
+            {blockingDriftNames.length} of {response.pinnedSelection.frozenMemberCount} pinned files changed
+            {' — '}re-pin to save current bytes: {blockingDriftNames.join(', ')}.
+          </span>
+        ) : candidate.eligibility.eligible ? (
           <span>Disk matches this package byte-for-byte. Saving commits exactly the reviewed work.</span>
         ) : (
           <span>{REASON_LABEL[candidate.eligibility.reason]}</span>
         )}
       </div>
+
+      {response.selectionDrift.added.length > 0 && blockingDriftNames.length === 0 && (
+        <div className="sc-save-note" data-testid="candidate-preview-added-drift">
+          {response.selectionDrift.added.length} unpinned file
+          {response.selectionDrift.added.length === 1 ? ' was' : 's were'} added; this save still contains only the{' '}
+          {response.pinnedSelection.frozenMemberCount} pinned files.
+        </div>
+      )}
 
       {/* Per-member verification verdicts. */}
       <ul className="sc-preview-members" data-testid="candidate-preview-members">

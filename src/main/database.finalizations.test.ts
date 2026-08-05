@@ -108,6 +108,7 @@ type DbModule = {
   getPackageFinalization(id: string): PackageFinalization | null;
   listPackageFinalizations(packageId: string): PackageFinalization[];
   getActivePackageFinalization(packageId: string): PackageFinalization | null;
+  listActivePackageFinalizationsForRepository(repositoryKey: string): PackageFinalization[];
   listActiveBoundaryRefs(repositoryKey: string): string[];
   maxPackageRevision(packageId: string): number;
   supersedePackageFinalization(id: string, supersededBy: string): void;
@@ -207,6 +208,28 @@ test('getActivePackageFinalization is null when none active', () => {
     id: 'noact-1', packageId: 'pkg-noact', lifecycleStatus: 'committed', releasedAt: 5,
   }));
   assert.equal(dbm.getActivePackageFinalization('pkg-noact'), null);
+});
+
+test('listActivePackageFinalizationsForRepository is repository-scoped and excludes closed rows', () => {
+  dbm.insertPackageFinalization(planPackage({
+    id: 'repo-active-new', repositoryKey: 'repo-accessor', finalizedAt: 3000,
+  }));
+  dbm.insertPackageFinalization(planPackage({
+    id: 'repo-active-old', repositoryKey: 'repo-accessor', finalizedAt: 2000,
+  }));
+  dbm.insertPackageFinalization(planPackage({
+    id: 'repo-closed', repositoryKey: 'repo-accessor', finalizedAt: 4000,
+    lifecycleStatus: 'committed', releasedAt: 4001,
+  }));
+  dbm.insertPackageFinalization(planPackage({
+    id: 'repo-other-active', repositoryKey: 'repo-accessor-other', finalizedAt: 5000,
+  }));
+
+  assert.deepEqual(
+    dbm.listActivePackageFinalizationsForRepository('repo-accessor').map((row) => row.id),
+    ['repo-active-new', 'repo-active-old'],
+  );
+  assert.deepEqual(dbm.listActivePackageFinalizationsForRepository('repo-accessor-missing'), []);
 });
 
 test('listActiveBoundaryRefs returns only active non-null refs for the requested repository', () => {

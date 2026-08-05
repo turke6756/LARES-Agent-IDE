@@ -65,6 +65,10 @@ import {
   type WorkBundle,
 } from './work-bundle';
 import { ComposeLockRegistry } from './compose-lock-registry';
+import {
+  parseFinalizationManifest,
+  resolvePinnedSelectionDrift,
+} from './pinned-selection-drift';
 
 const DEFAULT_CANDIDATE_TOKEN_TTL_MS = 5 * 60 * 1000;
 
@@ -633,17 +637,6 @@ function sha256Hex(value: string): string {
   return createHash('sha256').update(value, 'utf8').digest('hex');
 }
 
-function parseFrozenManifest(finalization: PackageFinalization): FrozenManifestMember[] {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(finalization.memberManifestJson);
-  } catch {
-    return [];
-  }
-  if (!Array.isArray(parsed)) return [];
-  return parsed as FrozenManifestMember[];
-}
-
 interface ResolvedSelection {
   componentIds: string[];
   unattributedEntryIds: string[];
@@ -651,6 +644,7 @@ interface ResolvedSelection {
   /** A selected "unattributed" entry that actually belongs to a witnessed component
    *  is a smuggled proper-subset of that component — never allowed (contract §4). */
   subsetViolation: boolean;
+  blockingDrift: boolean;
 }
 
 /** Expand the request into its concrete member entries and detect a component
@@ -660,6 +654,33 @@ function resolveSelection(
   request: CandidateSelectionRequest,
   context: CandidateBuildContext,
 ): ResolvedSelection {
+  const requestedIds = new Set(request.finalizationIds);
+  const requestedFinalizations = context.finalizations.filter((row) => requestedIds.has(row.id));
+  // Fleet-adhoc unattributed packages are the unstable live-membership case WP-3
+  // addresses. Other package kinds retain whole-component expansion and closure
+  // semantics; their finalization producers already own a stable package model.
+  if (requestedFinalizations.length > 0
+    && requestedFinalizations.every((row) => row.packageId.startsWith('unattributed:'))) {
+    const resolved = resolvePinnedSelectionDrift({
+      repositoryKey: context.repository.repositoryKey,
+      inventory: context.inventory,
+      components: context.components,
+      finalizations: requestedFinalizations,
+      requestedComponentIds: request.selectedComponentIds,
+      requestedUnattributedEntryIds: request.selectedUnattributedEntryIds,
+    });
+    const componentEntryIds = new Set(context.components.flatMap((component) => component.dirtyEntryIds));
+    return {
+      componentIds: resolved.pinnedSelection.selectedComponentIds,
+      unattributedEntryIds: resolved.pinnedSelection.selectedUnattributedEntryIds,
+      memberEntries: resolved.frozenEntries,
+      subsetViolation: request.selectedUnattributedEntryIds.some((entryId) => componentEntryIds.has(entryId)),
+      // Missing frozen paths continue through the established closure proof:
+      // an exact ledger link may mean that member was already committed. Byte
+      // movement and re-attribution have no such safe closure escape hatch.
+      blockingDrift: resolved.drift.byteMoved.length > 0 || resolved.drift.reAttributed.length > 0,
+    };
+  }
   const entriesById = new Map(context.inventory.entries.map((entry) => [entry.entryId, entry]));
   const componentById = new Map(context.components.map((component) => [component.componentId, component]));
   const allComponentEntryIds = new Set<string>();
@@ -689,7 +710,7 @@ function resolveSelection(
     .map((entryId) => entriesById.get(entryId)!)
     .sort((left, right) => compareBase64(left.path.pathBytesBase64, right.path.pathBytesBase64));
 
-  return { componentIds, unattributedEntryIds, memberEntries, subsetViolation };
+  return { componentIds, unattributedEntryIds, memberEntries, subsetViolation, blockingDrift: false };
 }
 
 interface CoveringFrozen {
@@ -704,7 +725,7 @@ function coveringByPath(
   const byPath = new Map<string, CoveringFrozen[]>();
   for (const finalization of finalizations) {
     if (finalization.lifecycleStatus !== 'active') continue;
-    for (const frozen of parseFrozenManifest(finalization)) {
+    for (const frozen of parseFinalizationManifest(finalization)) {
       const list = byPath.get(frozen.pathBytesBase64) ?? [];
       list.push({ finalization, frozen });
       byPath.set(frozen.pathBytesBase64, list);
@@ -923,7 +944,7 @@ export function buildCandidate(
   // the finalization stays active.
   let closureUnproven = false;
   for (const finalization of includedFinalizations) {
-    for (const frozen of parseFrozenManifest(finalization)) {
+    for (const frozen of parseFinalizationManifest(finalization)) {
       if (selectedPaths.has(frozen.pathBytesBase64)) continue;
       if (!ledgerProves(frozen, context.ledger)) closureUnproven = true;
     }
@@ -931,6 +952,7 @@ export function buildCandidate(
 
   const eligibility = evaluateEligibility({
     subsetViolation: selection.subsetViolation,
+    blockingDrift: selection.blockingDrift,
     extraneous,
     hasUnmerged: context.indexFingerprint.hasUnmerged,
     verifications,
@@ -981,6 +1003,7 @@ export function buildCandidate(
 
 interface EligibilityInputs {
   subsetViolation: boolean;
+  blockingDrift: boolean;
   extraneous: boolean;
   hasUnmerged: boolean;
   verifications: readonly MemberVerification[];
@@ -992,6 +1015,7 @@ interface EligibilityInputs {
 function evaluateEligibility(inputs: EligibilityInputs): CommitEligibility {
   if (inputs.subsetViolation) return { eligible: false, reason: 'component-subset-not-allowed' };
   if (inputs.extraneous) return { eligible: false, reason: 'extraneous-finalization' };
+  if (inputs.blockingDrift) return { eligible: false, reason: 'byte-mismatch' };
 
   const states = inputs.verifications.map((v) => v.member.packageVerification);
   if (inputs.hasUnmerged || states.includes('unsupported-entry')) {

@@ -244,6 +244,9 @@ function previewResponse(): SaveCardPreviewResponse {
     requiresOverlapAck: false,
     unacknowledgedUnattributedEntryIds: [],
     componentTopologyDigest: 'topo-1',
+    selectionDrift: { added: [], missing: [], reAttributed: [], byteMoved: [] },
+    selectionDriftDisplayPaths: {},
+    pinnedSelection: { selectedComponentIds: ['c1'], selectedUnattributedEntryIds: [], frozenMemberCount: 2 },
   };
 }
 

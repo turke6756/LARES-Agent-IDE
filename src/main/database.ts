@@ -5791,6 +5791,20 @@ export function getActivePackageFinalization(packageId: string): PackageFinaliza
   return row ? rowToPackageFinalization(row) : null;
 }
 
+/** Every active finalization in one canonical repository, newest first. Package
+ * consumers may filter further by kind/boundary status without re-encoding the
+ * repository/lifecycle ownership rule. */
+export function listActivePackageFinalizationsForRepository(
+  repositoryKey: string,
+): PackageFinalization[] {
+  return queryAll(
+    `SELECT * FROM package_finalizations
+      WHERE repository_key = ? AND lifecycle_status = 'active'
+      ORDER BY finalized_at DESC, package_revision DESC, id ASC`,
+    [repositoryKey],
+  ).map(rowToPackageFinalization);
+}
+
 /** Active durable boundary refs for one canonical repository identity. */
 export function listActiveBoundaryRefs(repositoryKey: string): string[] {
   return queryAll(

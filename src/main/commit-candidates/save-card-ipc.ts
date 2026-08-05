@@ -26,6 +26,7 @@ import {
   type SaveCardPreviewResponse,
   type SaveCardMintRequest,
   type SaveCardMintResponse,
+  type SaveCardPinnedSelection,
   type SaveCardFleetAdhocMarkDoneRequest,
   type SaveCardFleetAdhocMarkDoneResponse,
   type SaveCardFleetAdhocRefusalCode,
@@ -46,6 +47,7 @@ import {
   type CandidateBuildContext,
   type CandidateSelectionRequest,
 } from './candidate-service';
+import { resolvePinnedSelectionDrift } from './pinned-selection-drift';
 import type {
   CommitCandidate,
   SelectionPreview,
@@ -191,7 +193,7 @@ export function broadcastSaveCardAttention(
 export type FleetAdhocBoundaryContext = Omit<
   FinalizePackageRequest,
   'finalizationKind' | 'planId' | 'planItemId'
->;
+> & { pinnedSelection: SaveCardPinnedSelection };
 
 /** Renderer-safe result of a fleet-adhoc mark-done. `boundaryRef` is always
  *  captured — even an `unavailable` outcome names the ref it failed to pin. */
@@ -255,6 +257,7 @@ function requireMarkDoneRequest(raw: unknown): SaveCardFleetAdhocMarkDoneRequest
 function toMarkDoneResponse(
   finalization: PackageFinalization,
   outcome: FinalizeOutcome,
+  pinnedSelection: SaveCardPinnedSelection,
 ): SaveCardFleetAdhocMarkDoneResponse {
   return {
     finalizationId: finalization.id,
@@ -264,6 +267,7 @@ function toMarkDoneResponse(
     boundaryRef: finalization.boundaryRef,
     boundaryStatus: finalization.boundaryStatus,
     packageRevision: finalization.packageRevision,
+    pinnedSelection,
   };
 }
 
@@ -305,7 +309,7 @@ export function registerSaveCardFinalizeIpc(
       planItemId: null,
     };
     const result = await finalizePackage(finalizeRequest, routes.finalizeDeps);
-    return toMarkDoneResponse(result.finalization, result.outcome);
+    return toMarkDoneResponse(result.finalization, result.outcome, context.pinnedSelection);
   });
 }
 
@@ -484,7 +488,7 @@ function selectionTopologyDigest(
   candidate: CommitCandidate | SelectionPreview,
   context: CandidateBuildContext,
 ): string {
-  const selectedUnattributed = new Set(request.selectedUnattributedEntryIds);
+  const selectedUnattributed = new Set(candidate.selectedUnattributedEntryIds);
   return computeCandidateTopologyDigest(
     context,
     candidate.componentIds,
@@ -499,6 +503,22 @@ function toPreviewResponse(
 ): SaveCardPreviewResponse {
   const memberCount = candidate.members.length;
   const defaultMessageBody = `Save ${memberCount} file${memberCount === 1 ? '' : 's'}`;
+  const requestedIds = new Set(request.finalizationIds);
+  const driftResult = request.finalizationIds.length > 0
+    ? resolvePinnedSelectionDrift({
+        repositoryKey: context.repository.repositoryKey,
+        inventory: context.inventory,
+        components: context.components,
+        finalizations: context.finalizations.filter((row) => requestedIds.has(row.id)),
+        requestedComponentIds: request.selectedComponentIds,
+        requestedUnattributedEntryIds: request.selectedUnattributedEntryIds,
+      })
+    : null;
+  const pinnedSelection = driftResult?.pinnedSelection ?? {
+    selectedComponentIds: [...candidate.componentIds],
+    selectedUnattributedEntryIds: [...candidate.selectedUnattributedEntryIds],
+    frozenMemberCount: candidate.members.length,
+  };
   return {
     candidate,
     isCandidate: isCommitCandidate(candidate),
@@ -506,8 +526,11 @@ function toPreviewResponse(
     defaultMessageBody,
     requiresOverlapAck: selectionRequiresOverlapAck(request, context),
     // Every selected unattributed atom needs an explicit acknowledgement (D-5).
-    unacknowledgedUnattributedEntryIds: [...request.selectedUnattributedEntryIds],
+    unacknowledgedUnattributedEntryIds: [...pinnedSelection.selectedUnattributedEntryIds],
     componentTopologyDigest: selectionTopologyDigest(request, candidate, context),
+    selectionDrift: driftResult?.drift ?? { added: [], missing: [], reAttributed: [], byteMoved: [] },
+    selectionDriftDisplayPaths: driftResult?.displayPaths ?? {},
+    pinnedSelection,
   };
 }
 

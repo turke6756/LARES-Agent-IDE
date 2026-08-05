@@ -231,10 +231,12 @@ function gitBytes(exe: string, repo: string, args: string[]): Buffer {
     assert.ok(finalized.boundaryRef);
     assert.equal(git(gitExe, repo, ['show-ref', '--verify', finalized.boundaryRef!]).length > 0, true);
 
+    const benignPath = '.lares/proposals/benign-16.md';
+    fs.writeFileSync(path.join(repo, benignPath), 'unrelated after pin\n');
     const selection = {
       workspaceId: 'ws-repo',
-      selectedComponentIds: [],
-      selectedUnattributedEntryIds: proposalMembers.map((member) => member.entry.entryId),
+      selectedComponentIds: finalized.pinnedSelection.selectedComponentIds,
+      selectedUnattributedEntryIds: finalized.pinnedSelection.selectedUnattributedEntryIds,
       finalizationIds: [finalized.finalizationId],
     };
     const preview = await ipc.invoke<SaveCardPreviewResponse>(SAVECARD_PREVIEW_CHANNEL, selection);
@@ -244,6 +246,9 @@ function gitBytes(exe: string, repo: string, args: string[]): Buffer {
       preview.candidate.members.map((member) => member.packageVerification),
       Array(15).fill('verified-match'),
     );
+    assert.deepEqual(preview.selectionDrift.added, [Buffer.from(benignPath).toString('base64')]);
+    assert.deepEqual(preview.selectionDrift.missing, []);
+    assert.equal(preview.candidate.eligibility.eligible, true, 'an unrelated 16th file does not invalidate the pin');
 
     const mintedResponse = await ipc.invoke<SaveCardMintResponse>(COMMIT_CANDIDATE_MINT_CHANNEL, {
       ...selection,
@@ -287,7 +292,9 @@ function gitBytes(exe: string, repo: string, args: string[]): Buffer {
     );
     const remainingPaths = refreshed.bundles.flatMap((item) =>
       item.members.map((member) => member.entry.path.displayPath));
-    assert.equal(remainingPaths.some((item) => item.startsWith('.lares/proposals/')), false);
+    assert.deepEqual(remainingPaths.filter((item) => item.startsWith('.lares/proposals/')), [benignPath]);
+    assert.equal(git(gitExe, repo, ['ls-tree', '--name-only', 'HEAD', '--', benignPath]), '', 'the unrelated 16th file is not committed');
+    fs.rmSync(path.join(repo, benignPath));
 
     // Sibling transition rows: byte movement on either side of mint is fail-closed,
     // and token expiry becomes an unresolved consume rather than a commit attempt.
@@ -309,9 +316,29 @@ function gitBytes(exe: string, repo: string, args: string[]): Buffer {
       acknowledgeUnattributedEntryIds: movedSelection.selectedUnattributedEntryIds,
     });
     assert.deepEqual(movedMint.candidate.eligibility, { eligible: false, reason: 'byte-mismatch' });
+    assert.deepEqual(movedMint.selectionDrift.byteMoved, [movedMember.entry.path.pathBytesBase64]);
+    assert.deepEqual(movedMint.selectionDrift.missing, []);
     assert.equal((movedMint.candidate as CommitCandidate).token, null);
 
     fs.rmSync(path.join(repo, '.lares/proposals/moved-before-mint.md'));
+
+    fs.writeFileSync(path.join(repo, '.lares/proposals/deleted-before-mint.md'), 'pin then delete\n');
+    const deletedInventory = await ipc.invoke<SaveCardInventoryResponse>(SAVECARD_CHANNELS.getInventory, { workspaceId: 'ws-repo' });
+    const deletedBundle = deletedInventory.bundles.find((item) => item.kind === 'unattributed')!;
+    const deletedMember = deletedBundle.members.find((item) => item.entry.path.displayPath.endsWith('deleted-before-mint.md'))!;
+    const deletedFinalized = await ipc.invoke<SaveCardFleetAdhocMarkDoneSuccess>(SAVECARD_FINALIZE_CHANNEL, {
+      packageId: deletedBundle.bundleId, targetWorkspaceId: 'ws-repo',
+    });
+    fs.rmSync(path.join(repo, '.lares/proposals/deleted-before-mint.md'));
+    const deletedPreview = await ipc.invoke<SaveCardPreviewResponse>(SAVECARD_PREVIEW_CHANNEL, {
+      workspaceId: 'ws-repo',
+      selectedComponentIds: deletedFinalized.pinnedSelection.selectedComponentIds,
+      selectedUnattributedEntryIds: deletedFinalized.pinnedSelection.selectedUnattributedEntryIds,
+      finalizationIds: [deletedFinalized.finalizationId],
+    });
+    assert.deepEqual(deletedPreview.selectionDrift.missing, [deletedMember.entry.path.pathBytesBase64]);
+    assert.deepEqual(deletedPreview.selectionDrift.byteMoved, []);
+    assert.equal(deletedPreview.candidate.eligibility.eligible, false);
 
     // Tracked modification + untracked addition travel through the same real
     // finalization/mint/consume pipeline and land together.
