@@ -13,6 +13,10 @@ type HorizontalScrollableLike = {
 };
 
 export type HorizontalWheelOptions = {
+  /**
+   * Translate an unmodified vertical wheel gesture by default. Pass false to
+   * require horizontal or Shift+wheel input.
+   */
   translateVerticalWheel?: boolean;
 };
 
@@ -30,8 +34,9 @@ export function getHorizontalWheelDelta(
 ): number {
   let delta = event.deltaX;
 
-  // Some mouse drivers expose the horizontal wheel as Shift+vertical wheel.
-  if (delta === 0 && (event.shiftKey || options.translateVerticalWheel)) {
+  // Shift+wheel always maps horizontally; unmodified vertical wheel does too
+  // unless a consumer explicitly opts out.
+  if (delta === 0 && (event.shiftKey || options.translateVerticalWheel !== false)) {
     delta = event.deltaY;
   }
 
@@ -68,8 +73,9 @@ export function applyHorizontalWheelScroll(
 
 /**
  * React's delegated wheel handler may be passive in Electron/Chromium. Install
- * this at the element so preventDefault is legal when we translate a wheel
- * gesture into horizontal scrolling.
+ * this at the element so preventDefault is legal when we translate wheel
+ * gestures into horizontal scrolling. Plain vertical wheel translation is on
+ * by default; pass `{ translateVerticalWheel: false }` to opt out.
  */
 export function installHorizontalWheelScroll(
   element: HTMLElement,

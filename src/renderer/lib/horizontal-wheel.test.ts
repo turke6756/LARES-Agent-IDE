@@ -17,12 +17,12 @@ describe('horizontal-wheel', () => {
     ).toBe(24);
   });
 
-  it('maps Shift+vertical wheel to horizontal movement', () => {
+  it('maps Shift+vertical wheel in both default and opt-out modes', () => {
+    const event = { deltaX: 0, deltaY: 3, deltaMode: WHEEL_DELTA_LINE, shiftKey: true };
+
+    expect(getHorizontalWheelDelta(event, 300)).toBe(48);
     expect(
-      getHorizontalWheelDelta(
-        { deltaX: 0, deltaY: 3, deltaMode: WHEEL_DELTA_LINE, shiftKey: true },
-        300,
-      ),
+      getHorizontalWheelDelta(event, 300, undefined, { translateVerticalWheel: false }),
     ).toBe(48);
   });
 
@@ -52,24 +52,7 @@ describe('horizontal-wheel', () => {
     expect(preventDefault).toHaveBeenCalledTimes(1);
   });
 
-  it('translates plain vertical wheel movement when opted in', () => {
-    const preventDefault = vi.fn();
-    const el = { clientWidth: 100, scrollWidth: 300, scrollLeft: 25 };
-
-    const handled = applyHorizontalWheelScroll(el, {
-      deltaX: 0,
-      deltaY: 50,
-      deltaMode: WHEEL_DELTA_PIXEL,
-      shiftKey: false,
-      preventDefault,
-    }, { translateVerticalWheel: true });
-
-    expect(handled).toBe(true);
-    expect(el.scrollLeft).toBe(75);
-    expect(preventDefault).toHaveBeenCalledTimes(1);
-  });
-
-  it('ignores plain vertical wheel movement by default', () => {
+  it('translates plain vertical wheel movement by default', () => {
     const preventDefault = vi.fn();
     const el = { clientWidth: 100, scrollWidth: 300, scrollLeft: 25 };
 
@@ -80,6 +63,23 @@ describe('horizontal-wheel', () => {
       shiftKey: false,
       preventDefault,
     });
+
+    expect(handled).toBe(true);
+    expect(el.scrollLeft).toBe(75);
+    expect(preventDefault).toHaveBeenCalledTimes(1);
+  });
+
+  it('can opt out of plain vertical wheel translation', () => {
+    const preventDefault = vi.fn();
+    const el = { clientWidth: 100, scrollWidth: 300, scrollLeft: 25 };
+
+    const handled = applyHorizontalWheelScroll(el, {
+      deltaX: 0,
+      deltaY: 50,
+      deltaMode: WHEEL_DELTA_PIXEL,
+      shiftKey: false,
+      preventDefault,
+    }, { translateVerticalWheel: false });
 
     expect(handled).toBe(false);
     expect(el.scrollLeft).toBe(25);
