@@ -9,6 +9,7 @@ import {
   DashboardClient, RunOrchestrationRequest, OrchestrationRun,
   OrchestrationDescriptor, OrchestrationRunContext, OrchestrationRunner,
 } from './types';
+import { LAUNCHABLE_AGENT_PROVIDERS, isLaunchableAgentProvider } from '../../shared/types';
 import {
   getWorkspace, getPlan,
   getActivePlanningIntentForLaunch,
@@ -24,6 +25,12 @@ function nowIso(): string {
 
 function httpErr(statusCode: number, message: string): Error & { statusCode: number } {
   return Object.assign(new Error(message), { statusCode });
+}
+
+export function assertGroupthinkProvider(role: 'lead_provider' | 'reviewer_provider', value: string | undefined): void {
+  if (value === undefined) return;
+  if (value === 'gemini') throw httpErr(422, 'Gemini provider discontinued; use Antigravity (agy). Historical Gemini agents remain readable.');
+  if (!isLaunchableAgentProvider(value)) throw httpErr(422, `Unsupported ${role} '${value}'; expected one of ${LAUNCHABLE_AGENT_PROVIDERS.join(', ')}.`);
 }
 
 export class OrchestrationService extends EventEmitter {
@@ -102,10 +109,6 @@ export class OrchestrationService extends EventEmitter {
       });
     }
 
-    if (req.leadProvider === 'gemini' || req.reviewerProvider === 'gemini') {
-      throw httpErr(422, 'Gemini provider discontinued; use Antigravity (agy). Historical Gemini agents remain readable.');
-    }
-
     let run: OrchestrationRun;
     if (req.resumeRunId) {
       const prior = getOrchestrationRun(req.resumeRunId);
@@ -116,8 +119,14 @@ export class OrchestrationService extends EventEmitter {
       if (req.planningIntentId !== undefined && req.planningIntentId !== prior.planningIntentId) {
         throw httpErr(409, 'A resumed orchestration cannot change its frozen planning intent');
       }
+      if (req.leadProvider && req.leadProvider !== prior.leadProvider)
+        throw httpErr(409, 'A resumed orchestration cannot change its lead provider.');
+      if (req.reviewerProvider && req.reviewerProvider !== prior.reviewerProvider)
+        throw httpErr(409, 'A resumed orchestration cannot change its reviewer provider.');
       run = { ...prior, status: 'running', error: undefined, endedAt: undefined, updatedAt: nowIso() };
     } else {
+      assertGroupthinkProvider('lead_provider', req.leadProvider);
+      assertGroupthinkProvider('reviewer_provider', req.reviewerProvider);
       const ws = getWorkspace(req.workspaceId);
       if (!ws) throw httpErr(404, 'Workspace not found');
       if (req.planningIntentId && !req.planId) {

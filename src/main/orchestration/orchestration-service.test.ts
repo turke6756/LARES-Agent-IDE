@@ -15,7 +15,7 @@
 import assert from 'node:assert/strict';
 import os from 'node:os';
 import path from 'node:path';
-import { OrchestrationService } from './service';
+import { assertGroupthinkProvider, OrchestrationService } from './service';
 import { DashboardClient, OrchestrationRun, OrchestrationRunContext, OrchestrationRunner } from './types';
 
 // ── In-memory DB patch ───────────────────────────────────────────────
@@ -110,19 +110,144 @@ function baseReq(extra: Record<string, unknown> = {}) {
 
 // ── Tests ────────────────────────────────────────────────────────────
 
+test('assertGroupthinkProvider accepts launchable providers and rejects discontinued or unsupported values', () => {
+  for (const role of ['lead_provider', 'reviewer_provider'] as const) {
+    for (const provider of ['claude', 'codex', 'grok', 'agy']) {
+      assert.doesNotThrow(() => assertGroupthinkProvider(role, provider));
+    }
+    assert.doesNotThrow(() => assertGroupthinkProvider(role, undefined));
+
+    for (const provider of ['gemini', 'unknown', '']) {
+      assert.throws(
+        () => assertGroupthinkProvider(role, provider),
+        (err: unknown) => {
+          const typed = err as { statusCode?: number; message?: string };
+          assert.equal(typed.statusCode, 422);
+          if (provider === 'gemini') {
+            assert.match(typed.message ?? '', /Gemini provider discontinued/);
+          } else {
+            assert.match(typed.message ?? '', new RegExp(`Unsupported ${role}`));
+            assert.match(typed.message ?? '', /claude, codex, grok, agy/);
+          }
+          return true;
+        },
+      );
+    }
+  }
+});
+
 test('discontinued Gemini providers are rejected before an orchestration run is persisted', () => {
   const svc = new OrchestrationService(makeClient(), makeDeliver().fn);
+  for (const field of ['leadProvider', 'reviewerProvider'] as const) {
+    const before = runsStore.size;
+    assert.throws(
+      () => svc.start_run(baseReq({ [field]: 'gemini' })),
+      (err: unknown) => {
+        const typed = err as { statusCode?: number; message?: string };
+        assert.equal(typed.statusCode, 422);
+        assert.match(typed.message ?? '', /Gemini provider discontinued/);
+        assert.match(typed.message ?? '', /Antigravity \(agy\)/);
+        return true;
+      },
+    );
+    assert.equal(runsStore.size, before);
+  }
+});
+
+test('fresh runs accept every provider in either slot, including same-provider pairs', () => {
+  const runner: OrchestrationRunner = async () => {};
+  const svc = new OrchestrationService(makeClient(), makeDeliver().fn, { serial: runner, parallel: runner });
+
+  for (const provider of ['claude', 'codex', 'grok', 'agy']) {
+    const leadRun = svc.start_run(baseReq({ leadProvider: provider }));
+    assert.equal(getRun(leadRun.runId)?.leadProvider, provider);
+
+    const reviewerRun = svc.start_run(baseReq({ reviewerProvider: provider }));
+    assert.equal(getRun(reviewerRun.runId)?.reviewerProvider, provider);
+
+    const sameProviderRun = svc.start_run(baseReq({ leadProvider: provider, reviewerProvider: provider }));
+    assert.equal(getRun(sameProviderRun.runId)?.leadProvider, provider);
+    assert.equal(getRun(sameProviderRun.runId)?.reviewerProvider, provider);
+  }
+});
+
+test('fresh runs reject unknown and empty providers before persistence', () => {
+  const svc = new OrchestrationService(makeClient(), makeDeliver().fn);
+  for (const field of ['leadProvider', 'reviewerProvider'] as const) {
+    for (const provider of ['unknown', '']) {
+      const before = runsStore.size;
+      assert.throws(
+        () => svc.start_run(baseReq({ [field]: provider })),
+        (err: unknown) => (err as { statusCode?: number }).statusCode === 422,
+      );
+      assert.equal(runsStore.size, before);
+    }
+  }
+});
+
+function priorRun(runId: string, leadProvider = 'claude', reviewerProvider = 'codex'): OrchestrationRun {
+  const now = new Date().toISOString();
+  return {
+    runId,
+    name: 'groupthink',
+    mode: 'serial',
+    status: 'aborted',
+    workspaceId: 'ws-1',
+    supervisorId: 'sup-1',
+    topic: 'Resume provider test',
+    planPath: path.join(os.tmpdir(), `${runId}.md`),
+    leadProvider,
+    reviewerProvider,
+    turnTimeoutMs: 600000,
+    lastRelayedTs: {},
+    startedAt: now,
+    updatedAt: now,
+  };
+}
+
+test('resume rejects provider mutation with 409, including legacy-command-derived providers', () => {
+  const svc = new OrchestrationService(makeClient(), makeDeliver().fn);
+  db.insertOrchestration(priorRun('resume-mismatch'));
+
   assert.throws(
-    () => svc.start_run(baseReq({ reviewerProvider: 'gemini' })),
+    () => svc.start_run(baseReq({ resumeRunId: 'resume-mismatch', leadProvider: 'grok' })),
+    (err: unknown) => (err as { statusCode?: number }).statusCode === 409,
+  );
+  assert.throws(
+    () => svc.start_run(baseReq({
+      resumeRunId: 'resume-mismatch',
+      legacyCommand: 'node scripts/groupthink-v2.js --reviewerProvider=agy',
+    })),
+    (err: unknown) => (err as { statusCode?: number }).statusCode === 409,
+  );
+});
+
+test('resume accepts matching providers', () => {
+  const runner: OrchestrationRunner = async () => {};
+  const svc = new OrchestrationService(makeClient(), makeDeliver().fn, { serial: runner, parallel: runner });
+  db.insertOrchestration(priorRun('resume-match', 'grok', 'agy'));
+
+  const resumed = svc.start_run(baseReq({
+    resumeRunId: 'resume-match',
+    leadProvider: 'grok',
+    reviewerProvider: 'agy',
+  }));
+  assert.equal(resumed.runId, 'resume-match');
+});
+
+test('historical Gemini runs remain readable but cannot be resumed', () => {
+  const svc = new OrchestrationService(makeClient(), makeDeliver().fn);
+  db.insertOrchestration(priorRun('resume-gemini', 'gemini', 'codex'));
+
+  assert.throws(
+    () => svc.start_run(baseReq({ resumeRunId: 'resume-gemini' })),
     (err: unknown) => {
       const typed = err as { statusCode?: number; message?: string };
       assert.equal(typed.statusCode, 422);
-      assert.match(typed.message ?? '', /Gemini provider discontinued/);
-      assert.match(typed.message ?? '', /Antigravity \(agy\)/);
+      assert.match(typed.message ?? '', /cannot be resumed/);
       return true;
     },
   );
-  assert.equal(runsStore.size, 0);
 });
 
 test('detached start_run returns a runId before the runner completes; status starts running', async () => {
