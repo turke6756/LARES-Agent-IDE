@@ -59,3 +59,16 @@ export function applyHorizontalWheelScroll(
   event.preventDefault?.();
   return true;
 }
+
+/**
+ * React's delegated wheel handler may be passive in Electron/Chromium. Install
+ * this at the element so preventDefault is legal when we translate a wheel
+ * gesture into horizontal scrolling.
+ */
+export function installHorizontalWheelScroll(element: HTMLElement): () => void {
+  const onWheel = (event: WheelEvent) => {
+    applyHorizontalWheelScroll(element, event);
+  };
+  element.addEventListener('wheel', onWheel, { passive: false });
+  return () => element.removeEventListener('wheel', onWheel);
+}
