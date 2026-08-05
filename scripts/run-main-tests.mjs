@@ -273,6 +273,8 @@ const TESTS = [
   'dist/main/main/commit-candidates/finalization-service.test.js',
   'dist/main/main/commit-candidates/save-card-ipc.finalize.test.js',
   'dist/main/main/commit-candidates/save-card-ipc.preview.test.js',
+  'dist/main/main/commit-candidates/save-card-ipc.mint.test.js',
+  'dist/main/main/commit-candidates/save-card.e2e.test.js',
   // Save-card Stage 4 SC-WP-4B — opaque candidate-token mint/store lifecycle and
   // the repository-exclusive synchronous compose latch consumed by WP-4D.
   'dist/main/main/commit-candidates/compose-lock-registry.test.js',

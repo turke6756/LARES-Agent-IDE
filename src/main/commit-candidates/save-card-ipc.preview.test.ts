@@ -27,11 +27,7 @@ import type {
   SelectionPreview,
   CommitCandidate,
 } from '../../shared/commit-candidates';
-import {
-  CommitCandidateService,
-  type CandidateBuildContext,
-  type CandidateServiceDeps,
-} from './candidate-service';
+import type { CandidateBuildContext } from './candidate-service';
 import type { CommitRepresentation } from './commit-representation';
 import type { PackageFinalization } from '../database';
 import type { FrozenManifestMember } from './finalization-service';
@@ -279,34 +275,6 @@ test('overlap component + selected unattributed entry surface the acknowledgemen
   assert.deepEqual(response.unacknowledgedUnattributedEntryIds, ['eu']);
 });
 
-// ── SC-WP-W6 — mint the commit token on the preview leg ───────────────────────
-//
-// LIVE BLOCKER regression. After W5 removed the "Computer Root has no repository"
-// refusal, a pinned, byte-verified package (e.g. 15 untracked-but-not-ignored
-// proposal files in the pane's real repo) reached the preview leg and STILL
-// refused with the generic "did not produce a committable candidate". Root cause:
-// the production preview called `buildCandidate` (which always returns
-// `token: null`) and NEVER minted — but the renderer's decisive submit requires
-// `candidate.token`. `mintCandidateToken` existed but was dead code, wired to no
-// IPC, so the commit-coordinator token store was always empty. These tests lock
-// the preview leg minting an eligible package's token (so submit can consume it)
-// while staying read-only for a display-only preview and preserving the human
-// acknowledgement gates.
-
-function serviceBackedRoutes(context: CandidateBuildContext): {
-  routes: SaveCardPreviewRoutes;
-  service: CommitCandidateService;
-} {
-  const service = new CommitCandidateService({ tokenStore: {} } as unknown as CandidateServiceDeps);
-  return {
-    service,
-    routes: {
-      resolvePreviewContext: async () => context,
-      mintCandidateToken: (request, ctx) => service.mintCandidateToken(request, ctx),
-    },
-  };
-}
-
 function eligibleContext(): CandidateBuildContext {
   return baseContext({
     finalizations: [finalization()],
@@ -316,33 +284,9 @@ function eligibleContext(): CandidateBuildContext {
   });
 }
 
-test('mintIfEligible mints a commit token for an eligible, no-overlap package', async () => {
+test('an otherwise-eligible production-shaped preview remains tokenless', async () => {
   const ipc = new FakeIpc();
-  const { routes, service } = serviceBackedRoutes(eligibleContext());
-  registerSaveCardPreviewIpc(ipc, () => routes);
-
-  const response = (await ipc.invoke(SAVECARD_PREVIEW_CHANNEL, {
-    workspaceId: 'ws-1',
-    selectedComponentIds: ['c1'],
-    selectedUnattributedEntryIds: [],
-    finalizationIds: ['fin-1'],
-    mintIfEligible: true,
-  })) as SaveCardPreviewResponse;
-
-  assert.equal(response.isCandidate, true);
-  const candidate = response.candidate as CommitCandidate;
-  assert.equal(candidate.eligibility.eligible, true);
-  assert.ok(candidate.token, 'an eligible no-overlap package mints a token so submit can consume it');
-  assert.ok(candidate.token && candidate.token.tokenId.length > 0);
-  // Coordinator integrity: the minted token resolves in the same service store the
-  // consume channel binds against — the commit path can actually find it.
-  assert.ok(service.resolveCandidateToken(candidate.token!.tokenId));
-  assert.equal(candidate.token!.candidateId, candidate.candidateId);
-});
-
-test('a display-only preview (no mintIfEligible) stays read-only — no token minted', async () => {
-  const ipc = new FakeIpc();
-  const { routes } = serviceBackedRoutes(eligibleContext());
+  const routes: SaveCardPreviewRoutes = { resolvePreviewContext: async () => eligibleContext() };
   registerSaveCardPreviewIpc(ipc, () => routes);
 
   const response = (await ipc.invoke(SAVECARD_PREVIEW_CHANNEL, {
@@ -356,55 +300,6 @@ test('a display-only preview (no mintIfEligible) stays read-only — no token mi
   const candidate = response.candidate as CommitCandidate;
   assert.equal(candidate.eligibility.eligible, true);
   assert.equal(candidate.token, null);
-});
-
-test('minting preserves the human ack gate: a selected unattributed atom refuses typed', async () => {
-  const ipc = new FakeIpc();
-  const e1 = entry('e1');
-  const eu = entry('eu');
-  const context = baseContext({
-    inventory: inventory([e1, eu], ['eu']),
-    components: [component('c1', ['e1'])],
-    finalizations: [finalization({ memberManifestJson: JSON.stringify([frozen('e1'), frozen('eu')]) })],
-    currentCommitReps: new Map<string, CommitRepresentation>([
-      ['e1', { expectedState: 'present', rawBlobOid: 'raw-e1', commitBlobOid: 'commit-e1', commitMode: '100644' }],
-      ['eu', { expectedState: 'present', rawBlobOid: 'raw-eu', commitBlobOid: 'commit-eu', commitMode: '100644' }],
-    ]),
-  });
-  const { routes } = serviceBackedRoutes(context);
-  registerSaveCardPreviewIpc(ipc, () => routes);
-
-  // Submit intent WITHOUT forwarding the unattributed acknowledgement: minting must
-  // refuse typed with the specific reason, never auto-ack the human's behalf.
-  const response = (await ipc.invoke(SAVECARD_PREVIEW_CHANNEL, {
-    workspaceId: 'ws-1',
-    selectedComponentIds: ['c1'],
-    selectedUnattributedEntryIds: ['eu'],
-    finalizationIds: ['fin-1'],
-    mintIfEligible: true,
-  })) as SaveCardPreviewResponse;
-
-  const candidate = response.candidate as CommitCandidate;
-  assert.equal(candidate.eligibility.eligible, false);
-  assert.equal(
-    candidate.eligibility.eligible === false ? candidate.eligibility.reason : null,
-    'unattributed-not-acknowledged',
-  );
-  assert.equal(candidate.token, null);
-  assert.deepEqual(response.unacknowledgedUnattributedEntryIds, ['eu']);
-
-  // Forwarding the acknowledgement (the human checked the box) mints the token.
-  const acked = (await ipc.invoke(SAVECARD_PREVIEW_CHANNEL, {
-    workspaceId: 'ws-1',
-    selectedComponentIds: ['c1'],
-    selectedUnattributedEntryIds: ['eu'],
-    finalizationIds: ['fin-1'],
-    mintIfEligible: true,
-    acknowledgeUnattributedEntryIds: ['eu'],
-  })) as SaveCardPreviewResponse;
-  const ackedCandidate = acked.candidate as CommitCandidate;
-  assert.equal(ackedCandidate.eligibility.eligible, true);
-  assert.ok(ackedCandidate.token, 'forwarding the unattributed ack lets the token mint');
 });
 
 (async () => {

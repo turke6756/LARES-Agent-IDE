@@ -136,19 +136,21 @@ function PackageSaveGesture({
     setOutcome(null);
     setMovedPaths([]);
     try {
-      // Submit intent: ask the server to mint a consumable commit token for an
-      // eligible candidate, forwarding the human acknowledgements the preview pane
-      // collected. A display-only preview (the expander) never sets `mintIfEligible`.
       const response = await window.api.saveCard.preview({
         workspaceId,
         ...selection,
-        mintIfEligible: true,
-        acknowledgeTopologyDigest: draft?.response.topologyDigest,
-        acknowledgeUnattributedEntryIds: draft?.acknowledgedUnattributedEntryIds,
       });
-      const paths = previewMismatchPaths(response);
-      const reason = response.candidate.eligibility.eligible === false
-        ? response.candidate.eligibility.reason
+      const minted = await window.api.commitCoordinator.mint({
+        workspaceId,
+        ...selection,
+        acknowledgeTopologyDigest: response.requiresOverlapAck
+          ? (draft?.response.componentTopologyDigest ?? null)
+          : response.componentTopologyDigest,
+        acknowledgeUnattributedEntryIds: draft?.acknowledgedUnattributedEntryIds ?? [],
+      });
+      const paths = previewMismatchPaths(minted);
+      const reason = minted.candidate.eligibility.eligible === false
+        ? minted.candidate.eligibility.reason
         : null;
       // A pending human acknowledgement wins over the generic no-token message:
       // route the user to the ack gate rather than a confusing "no candidate" line.
@@ -158,8 +160,8 @@ function PackageSaveGesture({
         setDetailsOpen(true);
         return;
       }
-      if (!response.isCandidate || !response.candidate.eligibility.eligible ||
-          !('token' in response.candidate) || !response.candidate.token) {
+      if (!minted.isCandidate || !minted.candidate.eligibility.eligible ||
+          !('token' in minted.candidate) || !minted.candidate.token) {
         setMovedPaths(paths);
         // Surface the SERVER's specific ineligibility reason when it named one; only
         // fall back to the generic line when an eligible candidate somehow lacks a
@@ -176,8 +178,8 @@ function PackageSaveGesture({
         return;
       }
       const result = await window.api.commitCoordinator.commit({
-        candidateId: response.candidate.candidateId,
-        tokenId: response.candidate.token.tokenId,
+        candidateId: minted.candidate.candidateId,
+        tokenId: minted.candidate.token.tokenId,
         message: joinMessageAndUserTrailers(
           draft?.messageBody ?? response.defaultMessageBody,
           draft?.userTrailers ?? '',

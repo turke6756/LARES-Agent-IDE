@@ -16,6 +16,7 @@
 import {
   SAVECARD_CHANNELS,
   SAVECARD_PREVIEW_CHANNEL,
+  COMMIT_CANDIDATE_MINT_CHANNEL,
   SAVECARD_FINALIZE_CHANNEL,
   SAVECARD_ATTENTION_CHANNEL,
   SAVECARD_ATTENTION_CHANGED_CHANNEL,
@@ -23,6 +24,8 @@ import {
   type SaveCardInventoryResponse,
   type SaveCardPreviewRequest,
   type SaveCardPreviewResponse,
+  type SaveCardMintRequest,
+  type SaveCardMintResponse,
   type SaveCardFleetAdhocMarkDoneRequest,
   type SaveCardFleetAdhocMarkDoneResponse,
   type SaveCardFleetAdhocRefusalCode,
@@ -45,7 +48,6 @@ import {
 } from './candidate-service';
 import type {
   CommitCandidate,
-  MintCandidateTokenRequest,
   SelectionPreview,
 } from '../../shared/commit-candidates';
 
@@ -316,16 +318,13 @@ export function registerSaveCardFinalizeIpc(
  *  assembler so both lenses share one identity/verdict computation. Read-only. */
 export interface SaveCardPreviewRoutes {
   resolvePreviewContext(req: SaveCardPreviewRequest): Promise<CandidateBuildContext>;
-  /** SC-WP-W6 — mint an opaque commit token for an eligible, acknowledged
-   *  candidate. Delegates to the SAME `CommitCandidateService` the commit
-   *  coordinator resolves tokens against, so a minted token is actually
-   *  consumable. This is the ONLY side-effect on the preview leg: it issues an
-   *  in-memory token; it never touches the worktree, index, or any ref. Optional
-   *  so the read-only display preview and the pre-bootstrap window need not mint. */
-  mintCandidateToken?(
-    request: MintCandidateTokenRequest,
-    context: CandidateBuildContext,
-  ): CommitCandidate | SelectionPreview;
+}
+
+export interface SaveCardMintRoutes {
+  mintCandidate(req: SaveCardMintRequest): Promise<{
+    candidate: CommitCandidate | SelectionPreview;
+    context: CandidateBuildContext;
+  }>;
 }
 
 function requirePreviewRoutes(routes: SaveCardPreviewRoutes | null): SaveCardPreviewRoutes {
@@ -353,19 +352,11 @@ function requirePreviewRequest(raw: unknown): SaveCardPreviewRequest {
     );
   }
   const asStringArray = (value: unknown, field: string): string[] => {
-    if (value === undefined) return [];
     if (!Array.isArray(value) || value.some((entry) => typeof entry !== 'string')) {
       throw new SaveCardIpcError(`${field} must be an array of strings`, 'save-card-bad-request');
     }
     return value as string[];
   };
-  // Only the selection fields + optional mint intent cross the wire — never
-  // members, trailers, or digests the assembler must own. Everything the assembler
-  // trusts is resolved main-side (D-7). The acknowledgement echoes (W6) are the one
-  // exception: the human's overlap/unattributed acks the mint gate validates.
-  const mintIfEligible = record.mintIfEligible === true;
-  const acknowledgeTopologyDigest =
-    typeof record.acknowledgeTopologyDigest === 'string' ? record.acknowledgeTopologyDigest : undefined;
   return {
     workspaceId: record.workspaceId,
     selectedComponentIds: asStringArray(record.selectedComponentIds, 'selectedComponentIds'),
@@ -374,16 +365,51 @@ function requirePreviewRequest(raw: unknown): SaveCardPreviewRequest {
       'selectedUnattributedEntryIds',
     ),
     finalizationIds: asStringArray(record.finalizationIds, 'finalizationIds'),
-    ...(mintIfEligible ? { mintIfEligible } : {}),
-    ...(acknowledgeTopologyDigest !== undefined ? { acknowledgeTopologyDigest } : {}),
-    ...(record.acknowledgeUnattributedEntryIds !== undefined
-      ? {
-          acknowledgeUnattributedEntryIds: asStringArray(
-            record.acknowledgeUnattributedEntryIds,
-            'acknowledgeUnattributedEntryIds',
-          ),
-        }
-      : {}),
+  };
+}
+
+const MINT_REQUEST_FIELDS = new Set([
+  'workspaceId',
+  'selectedComponentIds',
+  'selectedUnattributedEntryIds',
+  'finalizationIds',
+  'acknowledgeTopologyDigest',
+  'acknowledgeUnattributedEntryIds',
+]);
+
+function requireMintRequest(raw: unknown): SaveCardMintRequest {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new SaveCardIpcError('a mint request is required', 'save-card-bad-request');
+  }
+  const record = raw as Record<string, unknown>;
+  const unexpected = Object.keys(record).filter((field) => !MINT_REQUEST_FIELDS.has(field));
+  if (unexpected.length > 0) {
+    throw new SaveCardIpcError(`unexpected mint request field: ${unexpected[0]}`, 'save-card-bad-request');
+  }
+  if (typeof record.workspaceId !== 'string' || record.workspaceId === '') {
+    throw new SaveCardIpcError('a non-empty workspaceId is required', 'save-card-bad-request');
+  }
+  const strings = (field: string): string[] => {
+    const value = record[field];
+    if (!Array.isArray(value) || value.some((entry) => typeof entry !== 'string')) {
+      throw new SaveCardIpcError(`${field} must be an array of strings`, 'save-card-bad-request');
+    }
+    return value as string[];
+  };
+  if (record.acknowledgeTopologyDigest !== null
+      && typeof record.acknowledgeTopologyDigest !== 'string') {
+    throw new SaveCardIpcError(
+      'acknowledgeTopologyDigest must be a string or null',
+      'save-card-bad-request',
+    );
+  }
+  return {
+    workspaceId: record.workspaceId,
+    selectedComponentIds: strings('selectedComponentIds'),
+    selectedUnattributedEntryIds: strings('selectedUnattributedEntryIds'),
+    finalizationIds: strings('finalizationIds'),
+    acknowledgeTopologyDigest: record.acknowledgeTopologyDigest,
+    acknowledgeUnattributedEntryIds: strings('acknowledgeUnattributedEntryIds'),
   };
 }
 
@@ -481,37 +507,8 @@ function toPreviewResponse(
     requiresOverlapAck: selectionRequiresOverlapAck(request, context),
     // Every selected unattributed atom needs an explicit acknowledgement (D-5).
     unacknowledgedUnattributedEntryIds: [...request.selectedUnattributedEntryIds],
-    topologyDigest: selectionTopologyDigest(request, candidate, context),
+    componentTopologyDigest: selectionTopologyDigest(request, candidate, context),
   };
-}
-
-/**
- * SC-WP-W6 — mint a commit token for an eligible candidate on a submit-intent
- * preview. The topology digest is a commit-INTENT confirmation: when the package
- * fuses overlapping owners the human must confirm the exact fused topology (the
- * renderer forwards the digest it saw); when there is NOTHING to acknowledge (no
- * overlap) the server confirms the digest it just computed — no human gate is
- * bypassed. Unattributed atoms ALWAYS require the human's forwarded acknowledgement
- * (`mintCandidateToken` refuses typed otherwise); the server never acks them on the
- * human's behalf.
- */
-function mintEligibleCandidate(
-  request: SaveCardPreviewRequest,
-  candidate: CommitCandidate,
-  context: CandidateBuildContext,
-  mint: NonNullable<SaveCardPreviewRoutes['mintCandidateToken']>,
-): CommitCandidate | SelectionPreview {
-  const acknowledgeTopologyDigest = selectionRequiresOverlapAck(request, context)
-    ? (request.acknowledgeTopologyDigest ?? null)
-    : selectionTopologyDigest(request, candidate, context);
-  const mintRequest: MintCandidateTokenRequest = {
-    selectedComponentIds: request.selectedComponentIds,
-    selectedUnattributedEntryIds: request.selectedUnattributedEntryIds,
-    finalizationIds: request.finalizationIds,
-    acknowledgeTopologyDigest,
-    acknowledgeUnattributedEntryIds: request.acknowledgeUnattributedEntryIds ?? [],
-  };
-  return mint(mintRequest, context);
 }
 
 /**
@@ -537,15 +534,25 @@ export function registerSaveCardPreviewIpc(
       selectedUnattributedEntryIds: request.selectedUnattributedEntryIds,
       finalizationIds: request.finalizationIds,
     };
-    let candidate = buildCandidate(selection, context);
-    // Submit intent (`mintIfEligible`) mints a consumable token for an eligible
-    // candidate so the one-click save can commit it; a display-only preview stays
-    // read-only. If the ack gate refuses, mint returns the same candidate carrying
-    // the specific ineligible reason (token stays null) for the renderer to surface.
-    if (request.mintIfEligible && routes.mintCandidateToken
-        && isCommitCandidate(candidate) && candidate.eligibility.eligible) {
-      candidate = mintEligibleCandidate(request, candidate, context, routes.mintCandidateToken);
-    }
+    const candidate = buildCandidate(selection, context);
     return toPreviewResponse(request, candidate, context);
+  });
+}
+
+export function registerSaveCardMintIpc(
+  ipc: IpcLike,
+  getRoutes: () => SaveCardMintRoutes | null,
+): void {
+  ipc.handle(COMMIT_CANDIDATE_MINT_CHANNEL, async (_event, raw: unknown) => {
+    const request = requireMintRequest(raw);
+    const routes = getRoutes();
+    if (!routes) {
+      throw new SaveCardIpcError(
+        'Save-card mint engine unavailable (the engine has not finished bootstrapping)',
+        'save-card-engine-unavailable',
+      );
+    }
+    const { candidate, context } = await routes.mintCandidate(request);
+    return toPreviewResponse(request, candidate, context) satisfies SaveCardMintResponse;
   });
 }

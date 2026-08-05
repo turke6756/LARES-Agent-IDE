@@ -158,6 +158,7 @@ let root: Root;
 let getInventory: ReturnType<typeof vi.fn>;
 let markDone: ReturnType<typeof vi.fn>;
 let preview: ReturnType<typeof vi.fn>;
+let mint: ReturnType<typeof vi.fn>;
 let commit: ReturnType<typeof vi.fn>;
 
 async function render() {
@@ -174,10 +175,11 @@ beforeEach(() => {
   getInventory = vi.fn();
   markDone = vi.fn();
   preview = vi.fn();
+  mint = vi.fn();
   commit = vi.fn();
   (window as unknown as { api: unknown }).api = {
     saveCard: { getInventory, markDone, preview },
-    commitCoordinator: { commit },
+    commitCoordinator: { mint, commit },
   };
   container = document.createElement('div');
   document.body.appendChild(container);
@@ -425,12 +427,23 @@ function readyCandidatePreview(): SaveCardPreviewResponse {
     }],
     finalizations: [{ finalizationId: 'fin-1', packageId: 'b-loud', packageRevision: 1, boundaryStatus: 'ready' }],
     eligibility: { eligible: true },
-    token: { tokenId: 'token-1', candidateId: 'candidate-1', contractVersion: 1, issuedAt: 1, expiresAt: 2 },
+    token: null,
   };
   return {
     candidate, isCandidate: true, laresTrailers: ['Lares-Turns: 2'],
     defaultMessageBody: 'Save Memory Architecture', requiresOverlapAck: false,
-    unacknowledgedUnattributedEntryIds: [], topologyDigest: 'topo-1',
+    unacknowledgedUnattributedEntryIds: [], componentTopologyDigest: 'topo-1',
+  };
+}
+
+function readyCandidateMint(): SaveCardPreviewResponse {
+  const response = readyCandidatePreview();
+  return {
+    ...response,
+    candidate: {
+      ...response.candidate,
+      token: { tokenId: 'token-1', candidateId: 'candidate-1', contractVersion: 1, issuedAt: 1, expiresAt: 2 },
+    } as CommitCandidate,
   };
 }
 
@@ -448,6 +461,7 @@ describe('SaveCard decisive save gesture', () => {
     getInventory.mockResolvedValue(inv([loudBundle]));
     markDone.mockResolvedValue(readyMarkDone());
     preview.mockResolvedValue(readyCandidatePreview());
+    mint.mockResolvedValue(readyCandidateMint());
     commit.mockResolvedValue({
       kind: 'saved',
       outcome: { status: 'committed', commitOid: 'saved-oid', attemptId: 'attempt-1', indexIntegrity: 'verified' },
@@ -508,11 +522,12 @@ describe('SaveCard decisive save gesture', () => {
     await gestureClick(container.querySelector('[data-testid="save-bundle-pin"]')!);
     await gestureClick(container.querySelector('[data-testid="save-bundle-submit"]')!);
 
-    // SC-WP-W6: submit carries the mint intent so the server issues a consumable
-    // token; a display-only preview never would.
     expect(preview).toHaveBeenCalledWith(expect.objectContaining({
       workspaceId: 'ws-1', selectedComponentIds: ['c1'], finalizationIds: ['fin-1'],
-      mintIfEligible: true,
+    }));
+    expect(mint).toHaveBeenCalledWith(expect.objectContaining({
+      workspaceId: 'ws-1', selectedComponentIds: ['c1'], finalizationIds: ['fin-1'],
+      acknowledgeTopologyDigest: 'topo-1', acknowledgeUnattributedEntryIds: [],
     }));
     expect(commit).toHaveBeenCalledWith({
       candidateId: 'candidate-1', tokenId: 'token-1', message: 'Save Memory Architecture',
@@ -525,11 +540,11 @@ describe('SaveCard decisive save gesture', () => {
     // The server minted nothing because the human has not yet acknowledged the
     // unattributed atoms — it names the reason. The renderer must surface the ack
     // gate, never the confusing "did not produce a committable candidate".
-    preview.mockResolvedValue({
-      ...readyCandidatePreview(),
+    mint.mockResolvedValue({
+      ...readyCandidateMint(),
       isCandidate: true,
       candidate: {
-        ...readyCandidatePreview().candidate,
+        ...readyCandidateMint().candidate,
         eligibility: { eligible: false, reason: 'unattributed-not-acknowledged' },
         token: null,
       },

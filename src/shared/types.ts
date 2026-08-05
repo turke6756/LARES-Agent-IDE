@@ -2073,6 +2073,7 @@ export interface SaveCardAttentionChangedPayload {
 // safe verdicts plus server-derived, READ-ONLY `Lares-*` trailer previews. It
 // mutates nothing.
 export const SAVECARD_PREVIEW_CHANNEL = 'savecard:preview' as const;
+export const COMMIT_CANDIDATE_MINT_CHANNEL = 'savecard:mint' as const;
 
 /** Renderer request to preview a candidate for one explicit selection. Component
  *  ids expand server-side to ALL their entries; unattributed entries are
@@ -2083,19 +2084,17 @@ export interface SaveCardPreviewRequest {
   selectedComponentIds: string[];
   selectedUnattributedEntryIds: string[];
   finalizationIds: string[];
-  /** SC-WP-W6 — when true, and the assembled candidate is eligible with its
-   *  acknowledgement gates satisfied, the preview mints a commit token so the
-   *  one-click submit can consume it. A display-only preview omits this and stays
-   *  read-only (candidate `token` stays null; no token is issued). */
-  mintIfEligible?: boolean;
-  /** SC-WP-W6 — human acknowledgements forwarded from the renderer's ack gate,
-   *  used ONLY when `mintIfEligible` is set. The topology digest confirms an
-   *  overlapping package's exact fused topology (echoed from a prior preview's
-   *  `topologyDigest`); it is auto-supplied server-side only when the package has
-   *  NO overlap to acknowledge. Unattributed atoms are NEVER auto-acked — the
-   *  renderer must forward the ids the human checked. */
-  acknowledgeTopologyDigest?: string;
-  acknowledgeUnattributedEntryIds?: string[];
+}
+
+/** Dedicated token-issuing transition. Preview remains strictly read-only; the
+ * renderer may only echo server identities and explicit human acknowledgements. */
+export interface SaveCardMintRequest {
+  workspaceId: string;
+  selectedComponentIds: string[];
+  selectedUnattributedEntryIds: string[];
+  finalizationIds: string[];
+  acknowledgeTopologyDigest: string | null;
+  acknowledgeUnattributedEntryIds: string[];
 }
 
 /**
@@ -2129,8 +2128,10 @@ export interface SaveCardPreviewResponse {
    *  Stable across previews of the same selected set (a hash of the selection, not
    *  the bytes). The renderer echoes it back as `acknowledgeTopologyDigest` when it
    *  forwards a mint intent for an overlapping package. */
-  topologyDigest: string;
+  componentTopologyDigest: string;
 }
+
+export interface SaveCardMintResponse extends SaveCardPreviewResponse {}
 
 // ── SC-WP-3E — fleet-adhoc mark-done route ────────────────────────────────
 
@@ -3140,6 +3141,7 @@ export interface IpcApi {
   /** Lens-neutral commit consume surface used by both Save and Plan. Main-process
    *  flag enforcement remains authoritative even for direct IPC invocation. */
   commitCoordinator: {
+    mint: (req: SaveCardMintRequest) => Promise<SaveCardMintResponse>;
     commit: (req: CommitCoordinatorConsumeRequest) => Promise<CommitCoordinatorConsumeResponse>;
   };
   /** Save card: read-only dirty inventory (Stage ①) + the SC-WP-3H Save-lens

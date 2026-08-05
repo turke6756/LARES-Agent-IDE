@@ -62,10 +62,10 @@ const savePreview: SaveCardPreviewResponse = {
     }],
     finalizations: [{ finalizationId: 'fin-1', packageId: 'plan-package:WP-P6D', packageRevision: 1, boundaryStatus: 'ready' }],
     eligibility: { eligible: true },
-    token: { tokenId: 'token-1', candidateId: 'candidate-1', contractVersion: 1, issuedAt: 1, expiresAt: 2 },
+    token: null,
   },
   laresTrailers: ['Lares-Plan: plan-1'], defaultMessageBody: 'Save WP-P6D',
-  requiresOverlapAck: false, unacknowledgedUnattributedEntryIds: [], topologyDigest: 'topo-1',
+  requiresOverlapAck: false, unacknowledgedUnattributedEntryIds: [], componentTopologyDigest: 'topo-1',
 };
 
 let root: Root | null = null;
@@ -91,7 +91,16 @@ async function renderBoard(state: MissionBoardCard['state'], outcome?: CommitCoo
   (window as unknown as { api: unknown }).api = {
     plans: { finalizeItemDone, previewCandidate },
     saveCard: { preview: vi.fn(async () => savePreview) },
-    commitCoordinator: { commit },
+    commitCoordinator: {
+      mint: vi.fn(async () => ({
+        ...savePreview,
+        candidate: {
+          ...savePreview.candidate,
+          token: { tokenId: 'token-1', candidateId: 'candidate-1', contractVersion: 1, issuedAt: 1, expiresAt: 2 },
+        },
+      })),
+      commit,
+    },
     checkpoints: {},
   };
   container = document.createElement('div');

@@ -49,19 +49,13 @@ const preview: SaveCardPreviewResponse = {
       boundaryStatus: 'ready',
     }],
     eligibility: { eligible: true },
-    token: {
-      tokenId: 'token-shared-1',
-      candidateId: 'candidate-shared-1',
-      contractVersion: 1,
-      issuedAt: 1,
-      expiresAt: 2,
-    },
+    token: null,
   },
   laresTrailers: ['Lares-Plan: plan-1'],
   defaultMessageBody: 'Save finalized plan work',
   requiresOverlapAck: false,
   unacknowledgedUnattributedEntryIds: [],
-  topologyDigest: 'topo-1',
+  componentTopologyDigest: 'topo-1',
 };
 
 let container: HTMLDivElement;
@@ -69,9 +63,16 @@ let root: Root;
 
 async function renderAndCommit(response: CommitCoordinatorConsumeResponse): Promise<void> {
   const commit = vi.fn(async () => response);
+  const mint = vi.fn(async () => ({
+    ...preview,
+    candidate: {
+      ...preview.candidate,
+      token: { tokenId: 'token-shared-1', candidateId: 'candidate-shared-1', contractVersion: 1, issuedAt: 1, expiresAt: 2 },
+    },
+  }));
   (window as unknown as { api: unknown }).api = {
     saveCard: { preview: vi.fn(async () => preview) },
-    commitCoordinator: { commit },
+    commitCoordinator: { mint, commit },
   };
   container = document.createElement('div');
   document.body.appendChild(container);

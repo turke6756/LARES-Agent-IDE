@@ -22,6 +22,7 @@ for (const binding of [
   'getInventory: (req) => ipcRenderer.invoke(SAVECARD_CHANNELS.getInventory, req)',
   'preview: (req) => ipcRenderer.invoke(SAVECARD_PREVIEW_CHANNEL, req)',
   'markDone: (req) => ipcRenderer.invoke(SAVECARD_FINALIZE_CHANNEL, req)',
+  'mint: (req) => ipcRenderer.invoke(COMMIT_CANDIDATE_MINT_CHANNEL, req)',
   'commit: (req) => ipcRenderer.invoke(COMMIT_COORDINATOR_CHANNEL, req)',
 ]) {
   assert.ok(preload.includes(binding), `preload is missing binding: ${binding}`);
@@ -29,6 +30,8 @@ for (const binding of [
 
 assert.ok(saveCard.includes('window.api.saveCard.getInventory('));
 assert.ok(saveCard.includes('window.api.commitCoordinator.commit('));
+assert.ok(saveCard.includes('window.api.commitCoordinator.mint('));
 assert.ok(plan.includes('window.api.commitCoordinator.commit('));
+assert.ok(plan.includes('window.api.commitCoordinator.mint('));
 
 console.log('  ✓ preload Save-card/finalize/coordinator bindings match renderer callers');

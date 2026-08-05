@@ -223,11 +223,17 @@ export default function MissionBoard({
             selection={commitSelection.selection}
             title={`Commit ${commitSelection.packageId}`}
             onClose={() => setCommitSelection(null)}
-            onCommit={async (response, messageBody) => {
-              if (!response.isCandidate || !('token' in response.candidate) || !response.candidate.token) return;
+            onCommit={async (response, messageBody, acknowledgedUnattributedEntryIds) => {
+              const minted = await window.api.commitCoordinator.mint({
+                workspaceId: commitSelection.workspaceId,
+                ...commitSelection.selection,
+                acknowledgeTopologyDigest: response.componentTopologyDigest,
+                acknowledgeUnattributedEntryIds: acknowledgedUnattributedEntryIds,
+              });
+              if (!minted.isCandidate || !('token' in minted.candidate) || !minted.candidate.token) return;
               const result = await window.api.commitCoordinator.commit({
-                candidateId: response.candidate.candidateId,
-                tokenId: response.candidate.token.tokenId,
+                candidateId: minted.candidate.candidateId,
+                tokenId: minted.candidate.token.tokenId,
                 message: messageBody,
               });
               setCommitOutcome(result);

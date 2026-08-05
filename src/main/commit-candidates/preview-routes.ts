@@ -26,7 +26,7 @@
 
 import * as fs from 'node:fs';
 
-import type { GitCapability, SaveCardPreviewRequest } from '../../shared/types';
+import type { GitCapability, SaveCardMintRequest, SaveCardPreviewRequest } from '../../shared/types';
 import type { PlanCandidatePreviewRequest } from '../../shared/types';
 import type { DirtyEntry } from '../../shared/commit-candidates';
 import { BUNDLE_CONTRACT_VERSION } from '../../shared/constants';
@@ -79,6 +79,7 @@ import type {
   FleetAdhocBoundaryContext,
   SaveCardFinalizeRoutes,
   SaveCardPreviewRoutes,
+  SaveCardMintRoutes,
 } from './save-card-ipc';
 import type {
   FinalizePlanItemDoneRequest,
@@ -169,6 +170,7 @@ function canonicalDir(realpath: (p: string) => string, p: string): string {
  */
 export function createPreviewRoutes(deps: PreviewRoutesDeps): {
   saveCardPreviewRoutes: SaveCardPreviewRoutes;
+  saveCardMintRoutes: SaveCardMintRoutes;
   planPreviewRoutes: PlanCandidatePreviewRoutes;
   saveCardFinalizeRoutes: SaveCardFinalizeRoutes;
   productionSeams: PreviewProductionSeams;
@@ -383,10 +385,25 @@ export function createPreviewRoutes(deps: PreviewRoutesDeps): {
         req.finalizationIds,
       );
     },
-    // SC-WP-W6 — mint through the SAME service the commit coordinator resolves
-    // tokens against (`productionSeams.candidateService`), so a token minted on the
-    // preview leg is actually consumable by the consume channel.
-    mintCandidateToken: (request, context) => service.mintCandidateToken(request, context),
+  };
+  const saveCardMintRoutes: SaveCardMintRoutes = {
+    async mintCandidate(req: SaveCardMintRequest) {
+      const scope = await assembleScope(req.workspaceId);
+      const context = await buildContext(
+        scope,
+        req.selectedComponentIds,
+        req.selectedUnattributedEntryIds,
+        req.finalizationIds,
+      );
+      const candidate = service.mintCandidateToken({
+        selectedComponentIds: req.selectedComponentIds,
+        selectedUnattributedEntryIds: req.selectedUnattributedEntryIds,
+        finalizationIds: req.finalizationIds,
+        acknowledgeTopologyDigest: req.acknowledgeTopologyDigest,
+        acknowledgeUnattributedEntryIds: req.acknowledgeUnattributedEntryIds,
+      }, context);
+      return { candidate, context };
+    },
   };
 
   async function resolvePlanFinalizeRequest(
@@ -662,5 +679,5 @@ export function createPreviewRoutes(deps: PreviewRoutesDeps): {
     deriveTrailers,
   };
 
-  return { saveCardPreviewRoutes, planPreviewRoutes, saveCardFinalizeRoutes, productionSeams };
+  return { saveCardPreviewRoutes, saveCardMintRoutes, planPreviewRoutes, saveCardFinalizeRoutes, productionSeams };
 }

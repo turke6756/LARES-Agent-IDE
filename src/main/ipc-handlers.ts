@@ -69,10 +69,12 @@ import { registerCheckpointIpc, type HumanCheckpointRoutes } from './git-checkpo
 import {
   registerSaveCardIpc,
   registerSaveCardPreviewIpc,
+  registerSaveCardMintIpc,
   registerSaveCardFinalizeIpc,
   registerSaveCardAttentionIpc,
   type SaveCardRoutes,
   type SaveCardPreviewRoutes,
+  type SaveCardMintRoutes,
   type SaveCardFinalizeRoutes,
   type SaveCardAttentionProvider,
 } from './commit-candidates/save-card-ipc';
@@ -111,6 +113,11 @@ export function setSaveCardRoutes(routes: SaveCardRoutes | null): void {
 let saveCardPreviewRoutes: SaveCardPreviewRoutes | null = null;
 export function setSaveCardPreviewRoutes(routes: SaveCardPreviewRoutes | null): void {
   saveCardPreviewRoutes = routes;
+}
+
+let saveCardMintRoutes: SaveCardMintRoutes | null = null;
+export function setSaveCardMintRoutes(routes: SaveCardMintRoutes | null): void {
+  saveCardMintRoutes = routes;
 }
 
 // SC-WP-W1 — the DISTINCT fleet-adhoc mark-done finalization route. The channel is
@@ -238,6 +245,7 @@ export function registerIpcHandlers(
   // async engine bootstrap injects their routes — the reported "No handler
   // registered" error is exactly a channel that was defined but never registered.
   registerSaveCardPreviewIpc(ipcMain, () => saveCardPreviewRoutes);
+  registerSaveCardMintIpc(ipcMain, () => saveCardMintRoutes);
   registerSaveCardFinalizeIpc(ipcMain, () => saveCardFinalizeRoutes);
   registerCommitCoordinatorIpc(ipcMain, () => commitCoordinatorRoutes);
   // SC-WP-N2 — the lightweight checkpoint-expiry attention read. Registered here

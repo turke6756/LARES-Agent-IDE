@@ -1,6 +1,6 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron';
 import type { IpcApi, DetachRequest, DetachedClosedPayload, ViewDetachRequest, ViewDetachedClosedPayload, FlushRequestPayload, FlushReplyPayload } from '../shared/types';
-import { TAB_CHANNELS, VIEW_CHANNELS, CHECKPOINT_CHANNELS, SAVECARD_CHANNELS, SAVECARD_PREVIEW_CHANNEL, SAVECARD_FINALIZE_CHANNEL, SAVECARD_ATTENTION_CHANNEL, SAVECARD_ATTENTION_CHANGED_CHANNEL, PLAN_PREVIEW_CHANNEL, PLAN_REVIEW_PROJECTION_CHANNEL, COMMIT_COORDINATOR_CHANNEL } from '../shared/types';
+import { TAB_CHANNELS, VIEW_CHANNELS, CHECKPOINT_CHANNELS, SAVECARD_CHANNELS, SAVECARD_PREVIEW_CHANNEL, COMMIT_CANDIDATE_MINT_CHANNEL, SAVECARD_FINALIZE_CHANNEL, SAVECARD_ATTENTION_CHANNEL, SAVECARD_ATTENTION_CHANGED_CHANNEL, PLAN_PREVIEW_CHANNEL, PLAN_REVIEW_PROJECTION_CHANNEL, COMMIT_COORDINATOR_CHANNEL } from '../shared/types';
 import { BROWSER_CHANNELS } from '../shared/browser';
 import type {
   AccessRequestDecision,
@@ -168,6 +168,7 @@ const api: IpcApi = {
   // SC-WP-4E — lens-neutral candidate consume. Both Save and Plan call this
   // surface; the main-process route owns feature-flag enforcement and 4D → 4G.
   commitCoordinator: {
+    mint: (req) => ipcRenderer.invoke(COMMIT_CANDIDATE_MINT_CHANNEL, req),
     commit: (req) => ipcRenderer.invoke(COMMIT_COORDINATOR_CHANNEL, req),
   },
   // SC-WP-1H — read-only inventory fetch. SC-WP-3H — read-only Save-lens candidate

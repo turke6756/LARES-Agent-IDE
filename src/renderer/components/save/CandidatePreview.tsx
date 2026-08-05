@@ -33,7 +33,11 @@ export interface CandidatePreviewProps {
   /** Optional one-click commit hook. Invoked ONLY when the candidate is fully
    *  eligible and every acknowledgement is satisfied. Absent ⇒ the enabled Save
    *  button is inert (no CommitCoordinator is wired in this stage). */
-  onCommit?: (response: SaveCardPreviewResponse, messageBody: string) => void | Promise<void>;
+  onCommit?: (
+    response: SaveCardPreviewResponse,
+    messageBody: string,
+    acknowledgedUnattributedEntryIds: string[],
+  ) => void | Promise<void>;
   /** SaveCard's decisive gesture lives outside this optional detail pane. Plan
    * keeps the original in-pane action by default. */
   showCommitAction?: boolean;
@@ -338,7 +342,11 @@ export default function CandidatePreview({
           disabled={!canSave}
           onClick={async () => {
             if (!canSave || !onCommit) return;
-            await onCommit(response, messageBody);
+            await onCommit(
+              response,
+              messageBody,
+              response.unacknowledgedUnattributedEntryIds.filter((id) => unattributedAcks.has(id)),
+            );
             invalidateInventory(workspaceId);
           }}
         >

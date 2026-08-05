@@ -33,7 +33,7 @@ import { startContinuationWatcher } from './supervisor/continuation-watcher-wiri
 import { runCheckpointStartupMaintenance } from './git-checkpoints/reconciler';
 import { createCheckpointEngine } from './git-checkpoints/engine-bootstrap';
 import { RETENTION_CYCLE_INTERVAL_MS } from '../shared/constants';
-import { registerIpcHandlers, setHumanCheckpointRoutes, setSaveCardRoutes, setSaveCardPreviewRoutes, setSaveCardFinalizeRoutes, setCommitCoordinatorRoutes, setSaveCardAttentionProvider } from './ipc-handlers';
+import { registerIpcHandlers, setHumanCheckpointRoutes, setSaveCardRoutes, setSaveCardPreviewRoutes, setSaveCardMintRoutes, setSaveCardFinalizeRoutes, setCommitCoordinatorRoutes, setSaveCardAttentionProvider } from './ipc-handlers';
 import { createSaveCardRoutes } from './commit-candidates/save-card-routes';
 import { createPreviewRoutes } from './commit-candidates/preview-routes';
 import { CommitCoordinator } from './git-checkpoints/commit-coordinator';
@@ -851,6 +851,7 @@ app.whenReady().then(async () => {
             captureFinalizationBoundary: engine.captureFinalizationBoundary,
           });
           setSaveCardPreviewRoutes(previewRoutes.saveCardPreviewRoutes);
+          setSaveCardMintRoutes(previewRoutes.saveCardMintRoutes);
           providePlanPreviewRoutes(previewRoutes.planPreviewRoutes);
           setSaveCardFinalizeRoutes(previewRoutes.saveCardFinalizeRoutes);
           const candidateService = previewRoutes.productionSeams.candidateService;
