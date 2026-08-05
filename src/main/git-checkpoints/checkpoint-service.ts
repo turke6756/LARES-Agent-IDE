@@ -91,6 +91,7 @@ import {
 } from './git-command';
 import { CheckpointQueue, type CheckpointPriority, type SkippedDeadline } from './checkpoint-queue';
 import { checkpointRef, recoveryRef, type CheckpointEdge } from './ref-encoding';
+import { deriveRawGitMode } from './raw-git-mode';
 
 // ── injectable seams ──────────────────────────────────────────────────────────
 
@@ -497,7 +498,12 @@ export class CheckpointService {
           rejectedGitlinks.push(entry.path);
           continue;
         }
-        const mode = seeded ?? this.deriveMode(entry);
+        const mode = deriveRawGitMode(seeded ?? null, {
+          isFile: entry.type === 'regular',
+          isSymbolicLink: entry.type === 'symlink',
+          mode: entry.mode,
+        }, this.platform);
+        if (mode === null) throw new Error(`cannot derive raw Git mode for ${entry.path}`);
         if (mode === '160000') {
           rejectedGitlinks.push(entry.path);
           continue;
@@ -695,16 +701,6 @@ export class CheckpointService {
   }
 
   // ── mode derivation ────────────────────────────────────────────────────────────
-
-  /** Git filemode for a NEW untracked path from its lstat facts (invariant: only
-   *  new paths derive; tracked paths preserve their seeded mode). */
-  private deriveMode(entry: CapturableEntry): string {
-    if (entry.type === 'symlink') return '120000';
-    // POSIX owner-execute bit. On Windows lstat never reports it, so new files are
-    // 100644 there — which is correct (a tracked 100755 is preserved via the seed).
-    const executable = (entry.mode & 0o100) !== 0;
-    return executable ? '100755' : '100644';
-  }
 
   /** Parse `ls-files --stage -z` (against the temp index) → path → mode string. */
   private async readSeededModes(
@@ -1449,7 +1445,12 @@ export class CheckpointService {
         currentOid.set(p, oid);
         if (sampleOidLen === 0) sampleOidLen = oid.length;
         const st = currentStat.get(p);
-        const mode = seededModes.get(p) ?? this.deriveMode({ path: p, type: st?.isSymbolicLink ? 'symlink' : 'regular', mode: st?.mode ?? 0, size: st?.size ?? 0 });
+        const mode = deriveRawGitMode(
+          seededModes.get(p) ?? null,
+          st ? { isFile: st.isFile, isSymbolicLink: st.isSymbolicLink, mode: st.mode } : null,
+          this.platform,
+        );
+        if (mode === null) throw new Error(`cannot derive raw Git mode for ${p}`);
         included.push({ path: p, state: 'present', oid, mode });
         additions.push(`${mode} ${oid}\t${p}`);
       }

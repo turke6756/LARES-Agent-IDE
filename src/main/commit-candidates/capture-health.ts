@@ -2,8 +2,8 @@
 //
 // Capture health is a read-only projection. Live Git is authoritative for edge
 // liveness; persisted `*_ready` and `*_pruned_at` values are explanatory hints.
-// Stage 1 has no finalizations, so every dirty member is truthfully reported as
-// lacking an exact-byte finalization edge.
+// Finalization coverage is supplied by the exact protection projection; turn
+// capture health and pinned-boundary coverage remain separate facts.
 
 import type {
   BundleCaptureHealth,
@@ -38,6 +38,7 @@ export interface ComputeBundleCaptureHealthOptions {
   repoRoot: string;
   turns: readonly CaptureHealthTurn[];
   dirtyEntries: readonly Pick<DirtyEntry, 'path'>[];
+  finalizationCoveredPathBytes?: ReadonlySet<string>;
   runGit: LiveEdgeRunGit;
   gitExe?: string;
 }
@@ -181,10 +182,9 @@ export async function computeBundleCaptureHealth(
   return {
     turns,
     captureOutage: turns.some((turn) => turn.failureClass === 'capture-outage'),
-    // Stage 1 has no finalization manifests. Base64 is the authoritative exact
-    // Git-path-byte key; displayPath must never be substituted here.
-    pathsWithoutFinalizationEdge: options.dirtyEntries.map(
-      (entry) => entry.path.pathBytesBase64,
-    ),
+    // Missing coverage is normal before pinning, not a capture outage.
+    pathsWithoutFinalizationEdge: options.dirtyEntries
+      .map((entry) => entry.path.pathBytesBase64)
+      .filter((pathBytes) => !options.finalizationCoveredPathBytes?.has(pathBytes)),
   };
 }

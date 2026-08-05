@@ -5,6 +5,9 @@
 // the first gate: the immutable commit named by that edge must also record the
 // member's exact {path, expected state, raw blob OID, mode} tuple.
 
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+
 import {
   PROTECTION_RUNG_ORDER,
   type DirtyEntry,
@@ -20,17 +23,19 @@ import {
   verifyLiveEdgesBatch,
   type LiveEdgeRunGit,
 } from '../git-checkpoints/live-edge';
-import type { CommitPathLink } from '../database';
+import type { CommitPathLink, PackageFinalization } from '../database';
+import { deriveRawGitMode } from '../git-checkpoints/raw-git-mode';
 import {
   readCurrentCommitRepresentation,
   type CommitRepresentation,
   type ReadCurrentCommitRepresentationOptions,
 } from './commit-representation';
+import { parseFinalizationManifest } from './pinned-selection-drift';
 
 export type ProtectionMember = Pick<
   DirtyEntry,
   'entryId' | 'path' | 'expectedWorktreeState' | 'rawWorktreeBlobOid' | 'worktreeMode'
-> & Partial<Pick<DirtyEntry, 'commitPathspecs'>>;
+> & Partial<Pick<DirtyEntry, 'commitPathspecs' | 'headMode' | 'indexStatus'>>;
 
 export interface ProtectionCheckpointEdge {
   ref: string | null;
@@ -74,6 +79,9 @@ export interface EvaluateCheckpointProtectionOptions {
   repoRoot: string;
   members: readonly ProtectionMember[];
   checkpointEdges: readonly ProtectionCheckpointEdge[];
+  finalizations?: readonly PackageFinalization[];
+  readRawGitMode?: RawGitModeReader;
+  platform?: NodeJS.Platform;
   runGit: LiveEdgeRunGit;
   runGitBytes: RunProtectionGitBytes;
   readCheckpointTree?: CheckpointTreeReader;
@@ -103,7 +111,14 @@ export interface MemberProtectionResult {
 export interface CheckpointProtectionResult {
   members: MemberProtectionResult[];
   weakest: ProtectionRung;
+  finalizationCoveredPathBytes: ReadonlySet<string>;
 }
+
+export type RawGitModeReader = (
+  repoRoot: string,
+  member: ProtectionMember,
+  platform: NodeJS.Platform,
+) => string | null | Promise<string | null>;
 
 const GIT_TIMEOUT_MS = 10_000;
 const LS_TREE_MAX_BYTES = 1 << 20;
@@ -112,6 +127,36 @@ const LS_TREE_MAX_BYTES = 1 << 20;
 const CAT_FILE_MAX_BYTES = 256 << 20;
 const NUL = 0x00;
 const LF = 0x0a;
+
+function seededMode(member: ProtectionMember): string | null {
+  if (member.headMode) return member.headMode;
+  // Older synthetic callers omit inventory status/head fields; retain their
+  // explicit mode as the tracked seed. Production entries always carry both.
+  return member.indexStatus === undefined ? member.worktreeMode : null;
+}
+
+function readRawGitModeFromWorktree(
+  repoRoot: string,
+  member: ProtectionMember,
+  platform: NodeJS.Platform,
+): string | null {
+  const seed = seededMode(member);
+  if (seed) return seed;
+  if (member.expectedWorktreeState === 'absent' || !member.path.utf8Clean) return null;
+  const rawPath = Buffer.from(member.path.pathBytesBase64, 'base64');
+  const relativePath = rawPath.toString('utf8');
+  if (Buffer.compare(Buffer.from(relativePath, 'utf8'), rawPath) !== 0) return null;
+  try {
+    const stat = fs.lstatSync(path.resolve(repoRoot, relativePath));
+    return deriveRawGitMode(null, {
+      isFile: stat.isFile(),
+      isSymbolicLink: stat.isSymbolicLink(),
+      mode: stat.mode,
+    }, platform);
+  } catch {
+    return null;
+  }
+}
 
 /** True only when a path round-trips losslessly through UTF-8, so it can be sent
  *  as a `:(top,literal)` pathspec. Non-lossless paths can never be safely batched
@@ -473,10 +518,14 @@ export async function evaluateCheckpointProtection(
     throw new Error('cannot evaluate protection for an empty bundle');
   }
 
-  // (1) One batched liveness probe for the whole request.
+  const finalizationEdges = (options.finalizations ?? [])
+    .filter((row) => row.lifecycleStatus === 'active' && row.boundaryStatus === 'ready')
+    .map((row) => ({ ref: row.boundaryRef, oid: row.checkpointOid }));
+
+  // (1) One batched liveness probe for turn checkpoints and finalization boundaries.
   const liveKeys = await verifyLiveEdgesBatch({
     repoRoot: options.repoRoot,
-    edges: options.checkpointEdges,
+    edges: [...options.checkpointEdges, ...finalizationEdges],
     runGit: options.runGit,
     gitExe: options.gitExe,
   });
@@ -496,13 +545,47 @@ export async function evaluateCheckpointProtection(
 
   const reader = options.readCheckpointTree ?? readCheckpointTree;
   const protectedIds = new Set<string>();
+  const finalizationCoveredPathBytes = new Set<string>();
+  const rawModeReader = options.readRawGitMode ?? readRawGitModeFromWorktree;
+  const resolvedMembers: ProtectionMember[] = await Promise.all(options.members.map(async (member) => ({
+    ...member,
+    worktreeMode: member.expectedWorktreeState === 'present'
+      ? await rawModeReader(options.repoRoot, member, options.platform ?? process.platform)
+      : null,
+  })));
+
+  // A boundary tree covers the whole repository, but a finalization protects only
+  // paths named in its frozen manifest. Require active+ready lifecycle, a live ref
+  // resolving to the recorded OID, and the exact raw state/blob/mode tuple.
+  const memberByPath = new Map(resolvedMembers.map((member) => [member.path.pathBytesBase64, member]));
+  for (const finalization of options.finalizations ?? []) {
+    if (
+      finalization.lifecycleStatus !== 'active'
+      || finalization.boundaryStatus !== 'ready'
+      || !finalization.boundaryRef
+      || !finalization.checkpointOid
+      || (options.repositoryKey && finalization.repositoryKey !== options.repositoryKey)
+      || !liveKeys.has(liveEdgeKey(finalization.boundaryRef, finalization.checkpointOid))
+    ) continue;
+    for (const frozen of parseFinalizationManifest(finalization)) {
+      const member = memberByPath.get(frozen.pathBytesBase64);
+      if (!member) continue;
+      if (
+        member.expectedWorktreeState !== frozen.expectedState
+        || member.rawWorktreeBlobOid !== frozen.rawBlobOid
+        || member.worktreeMode !== frozen.commitMode
+      ) continue;
+      protectedIds.add(member.entryId);
+      finalizationCoveredPathBytes.add(member.path.pathBytesBase64);
+    }
+  }
 
   // Non-lossless-UTF-8 paths can never be represented as a literal pathspec, so
   // (mirroring the former per-path reader, which rejected them) they are never
   // batchable and remain unprotected. Paths containing LF can't ride the LF-framed
   // batch-check output either → they take the per-commit ls-tree fallback below.
-  const batchable = options.members.filter((member) => isCatFileSafePath(member.path));
-  const lsTreeOnly = options.members.filter(
+  const batchable = resolvedMembers.filter((member) => isCatFileSafePath(member.path));
+  const lsTreeOnly = resolvedMembers.filter(
     (member) => isLosslessUtf8Path(member.path) && !isCatFileSafePath(member.path),
   );
 
@@ -611,7 +694,7 @@ export async function evaluateCheckpointProtection(
   const ledgerProtection = await evaluateCommitLedgerProtection(options).catch(
     () => new Map<string, ProtectionRung>(),
   );
-  const members: MemberProtectionResult[] = options.members.map((member) => ({
+  const members: MemberProtectionResult[] = resolvedMembers.map((member) => ({
     entryId: member.entryId,
     protection: ledgerProtection.get(member.entryId)
       ?? (protectedIds.has(member.entryId) ? 'checkpoint-protected' : 'unprotected'),
@@ -620,5 +703,6 @@ export async function evaluateCheckpointProtection(
   return {
     members,
     weakest: weakestProtectionRung(members.map((member) => member.protection)),
+    finalizationCoveredPathBytes,
   };
 }

@@ -44,12 +44,11 @@ function pathStatus(entry: DirtyEntry): { cls: string; code: string } {
   return { cls: 'sc-mod', code: 'M' };
 }
 
-// Whether this bundle has any capture-health concern worth surfacing: a capture
-// outage, a turn whose snapshot failed, or dirty paths with no protection edge.
+// Missing finalization coverage is normal before pinning. Only actual capture
+// outages or degraded/failed turns deserve warning treatment.
 export function hasCaptureConcern(b: WorkBundleDto): boolean {
   return (
     b.captureHealth.captureOutage ||
-    b.captureHealth.pathsWithoutFinalizationEdge.length > 0 ||
     b.captureHealth.turns.some((t) => t.failureClass !== 'none')
   );
 }
@@ -248,10 +247,14 @@ export default function SaveBundle({
           <span>
             {grouped.some((item) => item.captureHealth.captureOutage)
               ? 'Capture outage — some turns in this bundle have no reliable snapshot.'
-              : grouped.some((item) => item.captureHealth.pathsWithoutFinalizationEdge.length > 0)
-                ? `${grouped.reduce((count, item) => count + item.captureHealth.pathsWithoutFinalizationEdge.length, 0)} path(s) have no protection edge — the witnessed union may not cover the tree.`
-                : 'Some turn snapshots are degraded — the card cannot vouch this bundle is fully captured.'}
+              : 'Some turn snapshots are degraded — the card cannot vouch this bundle is fully captured.'}
           </span>
+        </div>
+      )}
+
+      {!captureConcern && grouped.some((item) => item.captureHealth.pathsWithoutFinalizationEdge.length > 0) && (
+        <div className="sc-meta" data-testid="save-bundle-unpinned">
+          Not yet pinned — pin to create a save boundary. No live pinned finalization covers these exact bytes.
         </div>
       )}
 

@@ -120,6 +120,19 @@ const unattributedBundle: WorkBundleDto = {
   identity: null,
 };
 
+const unpinnedBundle: WorkBundleDto = {
+  ...unattributedBundle,
+  bundleId: 'b-unpinned',
+  members: Array.from({ length: 15 }, (_, index) => ({
+    entry: entry(`untracked-${index}`, `.lares/proposals/file-${index}.md`),
+    protection: 'unprotected' as const,
+  })),
+  captureHealth: {
+    turns: [], captureOutage: false,
+    pathsWithoutFinalizationEdge: Array.from({ length: 15 }, (_, index) => `path-${index}`),
+  },
+};
+
 const quietBundle: WorkBundleDto = {
   ...loudBundle,
   bundleId: 'b-quiet',
@@ -235,6 +248,15 @@ describe('SaveCard bundle rendering', () => {
     const flag = container.querySelector('[data-testid="save-bundle-capture"]');
     expect(flag).toBeTruthy();
     expect(flag?.textContent).toContain('Capture outage');
+  });
+
+  it('shows an unpinned package neutrally without a capture warning', async () => {
+    getInventory.mockResolvedValue(inv([unpinnedBundle]));
+    await render();
+    expect(container.querySelector('[data-testid="save-bundle-capture"]')).toBeNull();
+    const affordance = container.querySelector('[data-testid="save-bundle-unpinned"]');
+    expect(affordance?.textContent).toContain('Not yet pinned');
+    expect(affordance?.textContent).toContain('No live pinned finalization covers these exact bytes.');
   });
 
   it('groups component bundles from one supervisor and keeps worker sub-units inside', async () => {

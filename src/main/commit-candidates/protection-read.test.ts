@@ -10,6 +10,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 
 import type { ProtectionRung } from '../../shared/commit-candidates';
+import type { PackageFinalization } from '../database';
 import { resolveInternalGit } from '../git/git-runtime';
 import { runGit, runGitBytes } from '../git-checkpoints/git-command';
 import {
@@ -62,6 +63,27 @@ function member(
   };
 }
 
+function finalization(
+  memberValue: ProtectionMember,
+  overrides: Partial<PackageFinalization> = {},
+): PackageFinalization {
+  return {
+    id: 'fin-1', packageId: 'pkg-1', repositoryKey: 'repo', finalizationKind: 'fleet-adhoc',
+    planId: null, planItemId: null, packageRevision: 1, finalizedAt: 1, finalizedBy: 'human-ipc',
+    checkpointTurnId: null, checkpointOid, boundaryRef: CHECKPOINT_REF, boundaryStatus: 'ready',
+    lifecycleStatus: 'active', supersededByFinalizationId: null, releasedAt: null,
+    memberManifestJson: JSON.stringify([{
+      pathBytesBase64: memberValue.path.pathBytesBase64,
+      expectedState: memberValue.expectedWorktreeState,
+      rawBlobOid: memberValue.rawWorktreeBlobOid,
+      commitBlobOid: memberValue.rawWorktreeBlobOid,
+      commitMode: '100644',
+    }]),
+    contractVersion: 1, failureReason: null, createdFromWorkspaceId: 'ws-1',
+    ...overrides,
+  };
+}
+
 const unreachableBytes: RunProtectionGitBytes = async () => {
   throw new Error('unexpected binary Git call');
 };
@@ -102,6 +124,7 @@ test('deletion is protected by recorded absence but not while the path remains i
   assert.deepEqual(absentResult, {
     members: [{ entryId: 'deleted', protection: 'checkpoint-protected' }],
     weakest: 'checkpoint-protected',
+    finalizationCoveredPathBytes: new Set(),
   });
 
   const presentResult = await evaluateCheckpointProtection({
@@ -113,6 +136,59 @@ test('deletion is protected by recorded absence but not while the path remains i
     gitExe,
   });
   assert.equal(presentResult.members[0].protection, 'unprotected');
+});
+
+test('a ready active finalization protects an exact untracked member and reports live coverage', async () => {
+  const untracked = member('new', 'protected.txt', 'present', matchingBlobOid, null);
+  const result = await evaluateCheckpointProtection({
+    repoRoot: repo,
+    members: [untracked],
+    checkpointEdges: [],
+    finalizations: [finalization(untracked)],
+    readRawGitMode: () => '100644',
+    runGit,
+    runGitBytes,
+    gitExe,
+  });
+  assert.deepEqual(result.members, [{ entryId: 'new', protection: 'checkpoint-protected' }]);
+  assert.deepEqual([...result.finalizationCoveredPathBytes], [untracked.path.pathBytesBase64]);
+});
+
+test('edited bytes, mode mismatch, unreadable mode, and a missing finalization ref fail closed', async () => {
+  const exact = member('new', 'protected.txt', 'present', matchingBlobOid, null);
+  const cases = [
+    { member: member('new', 'protected.txt', 'present', '0'.repeat(40), null), mode: '100644', row: finalization(exact) },
+    { member: exact, mode: '100755', row: finalization(exact) },
+    { member: exact, mode: null, row: finalization(exact) },
+    { member: exact, mode: '100644', row: finalization(exact, { boundaryRef: 'refs/lares/missing' }) },
+  ] as const;
+  for (const item of cases) {
+    const result = await evaluateCheckpointProtection({
+      repoRoot: repo, members: [item.member], checkpointEdges: [], finalizations: [item.row],
+      readRawGitMode: () => item.mode, runGit, runGitBytes, gitExe,
+    });
+    assert.equal(result.members[0].protection, 'unprotected');
+    assert.equal(result.finalizationCoveredPathBytes.size, 0);
+  }
+});
+
+test('live finalization protection never weakens exact locally committed evidence', async () => {
+  const exact = member('local', 'protected.txt', 'present', matchingBlobOid, '100644');
+  const result = await evaluateCheckpointProtection({
+    repoRoot: repo, members: [exact], checkpointEdges: [], finalizations: [finalization(exact)],
+    repositoryKey: 'repo',
+    readCommitPathLinks: () => [{
+      repositoryKey: 'repo', commitOid: checkpointOid,
+      pathBytesBase64: exact.path.pathBytesBase64, expectedState: 'present', rawBlobOidAtCommit: null,
+      commitBlobOid: matchingBlobOid, commitMode: '100644', contributingTurnIds: [], overlapCount: 0,
+    }],
+    readCurrentRepresentation: async () => ({
+      expectedState: 'present', rawBlobOid: matchingBlobOid,
+      commitBlobOid: matchingBlobOid, commitMode: '100644',
+    }),
+    runGit, runGitBytes, gitExe,
+  });
+  assert.equal(result.members[0].protection, 'locally-committed');
 });
 
 test('a live ref + blob hit is insufficient when the mode-confirm read fails or differs', async () => {

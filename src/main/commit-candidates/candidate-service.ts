@@ -131,6 +131,7 @@ export interface CandidateServiceDeps {
   stampSource?: WitnessStampSource | null;
   readCaptureTurns: CaptureTurnReader;
   readCommitPathLinks?: CommitPathLinkReader;
+  readActiveFinalizations?: (repositoryKey: string) => readonly PackageFinalization[];
   /**
    * SC-WP-2L — latest retention pin quota-weakening warning for a repository,
    * produced by the WP-2K retention pass. Null/omitted ⇒ no banner is surfaced.
@@ -497,6 +498,35 @@ export class CommitCandidateService {
       (workspace) => [...this.deps.readCaptureTurns(workspace.workspaceId)],
     );
     const turnsById = new Map(allTurns.map((turn) => [turn.id, turn]));
+    let activeFinalizations: readonly PackageFinalization[] = [];
+    try {
+      activeFinalizations = this.deps.readActiveFinalizations?.(repository.repositoryKey) ?? [];
+    } catch {
+      // Protection is evidence, never an availability gate. A database read
+      // failure cannot invent a durable edge, so continue with no coverage.
+      activeFinalizations = [];
+    }
+    const protectionByEntryId: Record<string, ProtectionRung> = {};
+    let finalizationCoveredPathBytes: ReadonlySet<string> = new Set();
+    if (assembly.inventory.entries.length > 0) {
+      const protection = await evaluateCheckpointProtection({
+        repoRoot: target.capability.repoRoot,
+        members: assembly.inventory.entries,
+        checkpointEdges: checkpointEdges(allTurns),
+        finalizations: activeFinalizations,
+        repositoryKey: repository.repositoryKey,
+        readCommitPathLinks: this.deps.readCommitPathLinks,
+        runGit: this.deps.runGit,
+        runGitBytes: this.deps.runGitBytes as RunProtectionGitBytes,
+        platform: this.deps.platform,
+        gitExe,
+      });
+      finalizationCoveredPathBytes = protection.finalizationCoveredPathBytes;
+      for (const member of protection.members) {
+        protectionByEntryId[member.entryId] = member.protection;
+      }
+    }
+
     const captureHealthByComponentId: Record<string, BundleCaptureHealth> = {};
     for (const component of assembly.components) {
       const turns = [...contributingTurnIds(component)]
@@ -510,6 +540,7 @@ export class CommitCandidateService {
           repoRoot: target.capability.repoRoot,
           turns,
           dirtyEntries: entries,
+          finalizationCoveredPathBytes,
           runGit: this.deps.runGit,
           gitExe,
         });
@@ -522,26 +553,10 @@ export class CommitCandidateService {
       repoRoot: target.capability.repoRoot,
       turns: [],
       dirtyEntries: unattributedEntries,
+      finalizationCoveredPathBytes,
       runGit: this.deps.runGit,
       gitExe,
     });
-
-    const protectionByEntryId: Record<string, ProtectionRung> = {};
-    if (assembly.inventory.entries.length > 0) {
-      const protection = await evaluateCheckpointProtection({
-        repoRoot: target.capability.repoRoot,
-        members: assembly.inventory.entries,
-        checkpointEdges: checkpointEdges(allTurns),
-        repositoryKey: repository.repositoryKey,
-        readCommitPathLinks: this.deps.readCommitPathLinks,
-        runGit: this.deps.runGit,
-        runGitBytes: this.deps.runGitBytes as RunProtectionGitBytes,
-        gitExe,
-      });
-      for (const member of protection.members) {
-        protectionByEntryId[member.entryId] = member.protection;
-      }
-    }
 
     return {
       inventory: assembly.inventory,

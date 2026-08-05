@@ -166,17 +166,21 @@ function gitBytes(exe: string, repo: string, args: string[]): Buffer {
     };
 
     const empty = () => [];
+    const readActiveFinalizations = (repositoryKey: string) => [...persistence.finalizations.values()]
+      .filter((row) => row.repositoryKey === repositoryKey && row.lifecycleStatus === 'active');
     const previewRoutes = createPreviewRoutes({
       gitExe, captureFinalizationBoundary, getWorkspaces: () => workspaces,
       readTurnWitnesses, readCaptureTurns: empty, readCommitPathLinks: empty,
       listRepoCommitPathLinks: empty, readTurnRecord: () => null,
       getPackageFinalization: (id) => persistence.getPackageFinalization(id),
+      readActiveFinalizations,
       getPlanWorkPackage: () => null, listPlanWorkPackagePaths: empty,
     });
     previewRoutes.saveCardFinalizeRoutes.finalizeDeps = { store: persistence };
     const inventoryRoutes = createSaveCardRoutes({
       gitExe, getWorkspaces: () => workspaces,
       readTurnWitnesses, readCaptureTurns: empty, readCommitPathLinks: empty,
+      readActiveFinalizations,
       readTurnRecord: () => null, getAgentsByWorkspace: empty, getAgent: () => null,
       readBundleTurns: empty,
     });
@@ -230,6 +234,35 @@ function gitBytes(exe: string, repo: string, args: string[]): Buffer {
     assert.equal(finalized.boundaryStatus, 'ready');
     assert.ok(finalized.boundaryRef);
     assert.equal(git(gitExe, repo, ['show-ref', '--verify', finalized.boundaryRef!]).length > 0, true);
+
+    const pinnedInventory = await ipc.invoke<SaveCardInventoryResponse>(
+      SAVECARD_CHANNELS.getInventory,
+      { workspaceId: 'ws-repo' },
+    );
+    const pinnedBundle = pinnedInventory.bundles.find((item) => item.bundleId === bundle.bundleId);
+    assert.ok(pinnedBundle);
+    assert.equal(pinnedBundle.captureHealth.pathsWithoutFinalizationEdge.length, 0);
+    assert.deepEqual(
+      pinnedBundle.members.map((member) => member.protection),
+      Array(15).fill('checkpoint-protected'),
+    );
+
+    const [editedRelative, editedOriginal] = pinned.entries().next().value!;
+    fs.writeFileSync(path.join(repo, editedRelative), 'edited after pin\n');
+    const editedInventory = await ipc.invoke<SaveCardInventoryResponse>(
+      SAVECARD_CHANNELS.getInventory,
+      { workspaceId: 'ws-repo' },
+    );
+    const editedBundle = editedInventory.bundles.find((item) => item.bundleId === bundle.bundleId)!;
+    assert.deepEqual(editedBundle.captureHealth.pathsWithoutFinalizationEdge, [
+      Buffer.from(editedRelative).toString('base64'),
+    ]);
+    assert.equal(
+      editedBundle.members.find((member) => member.entry.path.displayPath === editedRelative)?.protection,
+      'unprotected',
+    );
+    assert.equal(editedBundle.members.filter((member) => member.protection === 'checkpoint-protected').length, 14);
+    fs.writeFileSync(path.join(repo, editedRelative), editedOriginal);
 
     const benignPath = '.lares/proposals/benign-16.md';
     fs.writeFileSync(path.join(repo, benignPath), 'unrelated after pin\n');

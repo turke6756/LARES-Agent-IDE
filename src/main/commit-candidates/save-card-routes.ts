@@ -28,6 +28,7 @@ import {
   getWorkspaces as dbGetWorkspaces,
   getTurnWitnessReads as dbGetTurnWitnessReads,
   listCommitPathLinks as dbListCommitPathLinks,
+  listActivePackageFinalizationsForRepository as dbListActivePackageFinalizationsForRepository,
   listTurnRecords as dbListTurnRecords,
   type TurnRecord,
   type TurnWitnessRead,
@@ -59,6 +60,7 @@ export interface SaveCardRoutesDeps {
   readTurnRecord?: TurnStampRecordReader;
   readCaptureTurns?: CaptureTurnReader;
   readCommitPathLinks?: CommitPathLinkReader;
+  readActiveFinalizations?: (repositoryKey: string) => readonly import('../database').PackageFinalization[];
   getAgentsByWorkspace?: (workspaceId: string) => readonly Agent[];
   getAgent?: (agentId: string) => Agent | null;
   readBundleTurns?: (workspaceId: string) => readonly BundleTurn[];
@@ -278,6 +280,7 @@ export function createSaveCardRoutes(deps: SaveCardRoutesDeps): SaveCardRoutes {
     stampSource: createTurnStampSource(readTurnRecord),
     readCaptureTurns,
     readCommitPathLinks,
+    readActiveFinalizations: deps.readActiveFinalizations ?? dbListActivePackageFinalizationsForRepository,
     readQuotaWeakening: deps.readQuotaWeakening,
   });
 

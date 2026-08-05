@@ -164,7 +164,7 @@ test('failure classifier keeps delivery and overlap out of outage even with misl
   assert.equal(classifyCaptureFailure('accepted', 'before-capture-threw:boom'), 'capture-outage');
 });
 
-test('pathsWithoutFinalizationEdge contains every dirty member keyed by exact path bytes', async () => {
+test('pathsWithoutFinalizationEdge contains only dirty members without live exact finalization coverage', async () => {
   const newlineBytes = Buffer.from('line\nname.txt', 'utf8').toString('base64');
   const nonUtf8Bytes = Buffer.from([0xff, 0x2e, 0x74, 0x78, 0x74]).toString('base64');
   const result = await computeBundleCaptureHealth({
@@ -174,10 +174,11 @@ test('pathsWithoutFinalizationEdge contains every dirty member keyed by exact pa
       dirty(newlineBytes, 'line\\nname.txt'),
       dirty(nonUtf8Bytes, '�.txt'),
     ],
+    finalizationCoveredPathBytes: new Set([newlineBytes]),
     runGit: fakeGit({}),
   });
 
-  assert.deepEqual(result.pathsWithoutFinalizationEdge, [newlineBytes, nonUtf8Bytes]);
+  assert.deepEqual(result.pathsWithoutFinalizationEdge, [nonUtf8Bytes]);
   assert.ok(!result.pathsWithoutFinalizationEdge.includes('line\\nname.txt'));
 });
 

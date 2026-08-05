@@ -39,6 +39,7 @@ import {
   listPlanWorkPackagePaths as dbListPlanWorkPackagePaths,
   listCommitPathLinks as dbListCommitPathLinks,
   listTurnRecords as dbListTurnRecords,
+  listActivePackageFinalizationsForRepository as dbListActivePackageFinalizationsForRepository,
   type PackageFinalization,
   type PlanWorkPackage,
   type PlanWorkPackagePath,
@@ -106,6 +107,7 @@ export interface PreviewRoutesDeps {
   /** Whole-repository commit ledger for the prior-exact-commit closure (unfiltered,
    *  unlike the path-scoped `readCommitPathLinks` the service uses internally). */
   listRepoCommitPathLinks?: (repositoryKey: string) => readonly CandidateLedgerLink[];
+  readActiveFinalizations?: (repositoryKey: string) => readonly PackageFinalization[];
   getPackageFinalization?: (id: string) => PackageFinalization | null;
   getPlanWorkPackage?: (id: string) => PlanWorkPackage | null;
   listPlanWorkPackagePaths?: (id: string) => PlanWorkPackagePath[];
@@ -204,6 +206,7 @@ export function createPreviewRoutes(deps: PreviewRoutesDeps): {
     stampSource: createTurnStampSource(readTurnRecord),
     readCaptureTurns,
     readCommitPathLinks,
+    readActiveFinalizations: deps.readActiveFinalizations ?? dbListActivePackageFinalizationsForRepository,
     tokenStore: { composeLocks },
   });
   const assembleInventory = deps.assembleInventory
