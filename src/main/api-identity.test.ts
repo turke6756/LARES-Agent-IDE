@@ -132,6 +132,7 @@ let inFlightIds = new Set<string>();
 let lastContinuationRelaunch: { agentId: string; brick: Record<string, unknown> } | null = null;
 const stubSupervisor = {
   getContextStats: () => null,
+  getUsageLimits: () => ({ available: false, reason: 'no_reading_yet', account_wide: true }),
   isInputInFlight: (id: string) => inFlightIds.has(id),
   continuationRelaunch: async (agentId: string, brick: Record<string, unknown>) => {
     lastContinuationRelaunch = { agentId, brick };
@@ -293,6 +294,9 @@ test('GET /api/supervisor/context with header → 200 summary (workspace, superv
     // Inc 3 (3.3): counts.owned follows the resolved supervisor — here the
     // LIMIT-1 fallback (sup-1), which owns 2 live + 2 terminal fixtures.
     assert.deepEqual(ctx.counts, { total: 3, live: 2, supervised: 2, owned: { live: 2, terminal: 2 } });
+    assert.equal(ctx.availableProviders.length, 4);
+    assert.deepEqual(ctx.availableProviders.map((row: { provider: string }) => row.provider),
+      ['claude', 'codex', 'grok', 'agy']);
     assert.deepEqual(ctx.orchestrationProviderDefaults, {
       groupthink: { defaultLeadProvider: 'grok', defaultReviewerProvider: 'agy' },
     });

@@ -42,6 +42,7 @@ import {
 } from './orchestration/orchestration-provider-settings-transport';
 import { OrchestrationProviderSettingsValidationError } from './orchestration/orchestration-provider-settings';
 import { getOrchestrationProviderSettingsCached } from './orchestration/orchestration-provider-settings';
+import { getAvailableProviders } from './provider-availability';
 import { TEAM_MAX_MESSAGES_PER_5MIN, TEAM_MAX_ALTERNATIONS, TEAM_ALTERNATION_WINDOW_MS, TEAM_PAIR_COOLDOWN_MS, CONTINUATION_BRICK_MAX_BYTES, CONTINUATION_ESCAPE_MAX_ATTEMPTS, CONTINUATION_ESCAPE_MAX_ALIVE_MS } from '../shared/constants';
 import { TeamMessageStatus, hasSupervisorPrivilege } from '../shared/types';
 import type { Agent, Workspace } from '../shared/types';
@@ -2460,6 +2461,7 @@ export class ApiServer {
           ? { id: supervisor.id, title: supervisor.title, provider: supervisor.provider, status: supervisor.status }
           : null,
         counts,
+        availableProviders: await getAvailableProviders({ getUsageLimits: () => this.supervisor.getUsageLimits() }),
         ...(plans ? { plans } : {}),
         ...(activePlan ? {
           activePlan: {

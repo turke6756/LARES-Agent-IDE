@@ -80,6 +80,13 @@ ok('get_my_context describes the workspace-scoped GroupThink provider defaults',
   assert.match(context.description, /orchestrationProviderDefaults\.groupthink/);
 });
 
+ok('get_my_context describes canonical provider availability', () => {
+  const context = defs.find((d) => d.name === 'get_my_context');
+  assert.ok(context, 'get_my_context must be registered');
+  assert.match(context.description, /availableProviders/);
+  assert.match(context.description, /all four launchable providers in canonical order/);
+});
+
 // ── read_comments: the in-process replacement for the pure-Python
 // .lares/scripts/read-comments.py (removes the app's only hard Python dep). ──
 ok('read_comments is registered on the core surface with a file_path-required schema', () => {
@@ -159,6 +166,17 @@ async function run() {
       return Promise.resolve(expected);
     });
     assert.deepStrictEqual(calls, [{ method: 'GET', path: '/api/supervisor/context' }]);
+    assert.deepStrictEqual(JSON.parse(result.content[0].text), expected);
+  });
+
+  await okAsync('get_my_context preserves provider availability through the MCP proxy', async () => {
+    const expected = {
+      workspaceId: 'ws-1',
+      availableProviders: ['claude', 'codex', 'grok', 'agy'].map(provider => ({
+        provider, status: 'available', installed: true, reasons: [], evidence: [],
+      })),
+    };
+    const result = await handleObservabilityToolCall('get_my_context', {}, () => Promise.resolve(expected));
     assert.deepStrictEqual(JSON.parse(result.content[0].text), expected);
   });
 

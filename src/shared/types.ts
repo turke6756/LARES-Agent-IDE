@@ -46,6 +46,43 @@ export function isLaunchableAgentProvider(v: unknown): v is LaunchableAgentProvi
   return typeof v === 'string' && (LAUNCHABLE_AGENT_PROVIDERS as readonly string[]).includes(v);
 }
 
+export type ProviderAvailabilityStatus = 'available' | 'degraded' | 'unavailable';
+
+export type ProviderAvailabilityReason =
+  | 'not-detected'
+  | 'auth-banner'
+  | 'free-usage-limit'
+  | 'quota-near-limit'
+  | 'quota-exhausted';
+
+/** Deterministic severity order for `reasons`/`evidence` (unavailable-class first). */
+export const PROVIDER_AVAILABILITY_REASON_ORDER: ProviderAvailabilityReason[] =
+  ['not-detected', 'auth-banner', 'free-usage-limit', 'quota-exhausted', 'quota-near-limit'];
+
+export interface ProviderQuotaNote {
+  source: 'claude_statusline' | 'runtime_observation';
+  note: string;
+  observedAt: number;
+  stale?: boolean;
+  resetsAt?: number;
+}
+
+export interface ProviderAvailabilityEvidence {
+  reason: ProviderAvailabilityReason;
+  detail: string;
+  observedAt: number;
+  source: 'static' | 'runtime_observation' | 'claude_statusline';
+}
+
+export interface ProviderAvailability {
+  provider: LaunchableAgentProvider;
+  status: ProviderAvailabilityStatus;
+  installed: boolean;
+  reasons: ProviderAvailabilityReason[];
+  evidence: ProviderAvailabilityEvidence[];
+  quota?: ProviderQuotaNote;
+}
+
 /** Workspace-scoped provider preferences for orchestration features. */
 export interface OrchestrationProviderSettings {
   groupthink: {
