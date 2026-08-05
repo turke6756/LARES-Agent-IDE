@@ -17,13 +17,11 @@ function test(name, fn) { tests.push({ name, fn }); }
 
 // ── Tool surface ────────────────────────────────────────────────────────────
 
-test('the plans toolset — read ladder + focus verbs (supervisor lane)', () => {
+test('the plans toolset — activity read + focus verbs (supervisor lane)', () => {
   const names = getPlansToolDefinitions().map((t) => t.name);
   assert.deepStrictEqual(names.sort(), [
     'focus_plan',
-    'list_plan_sections',
     'read_plan_projection',
-    'read_plan_section',
     'record_planning_event',
     'unfocus_plan',
   ]);
@@ -60,21 +58,12 @@ test('every definition has a description and an object inputSchema with required
   }
 });
 
-test('read_plan_section advertises all four read modes incl. raw+editWindow', () => {
-  const def = getPlansToolDefinitions().find((d) => d.name === 'read_plan_section');
-  assert.deepStrictEqual(def.inputSchema.properties.mode.enum.sort(), [
-    'outline', 'raw', 'raw+editWindow', 'text',
-  ]);
-});
-
 // ── WP-A4: plans-read read-only subset (worker lane) ────────────────────────
 
-test('getPlansReadToolDefinitions returns the 3 read tools + record_planning_event', () => {
+test('getPlansReadToolDefinitions returns the activity read + record_planning_event', () => {
   const names = getPlansReadToolDefinitions().map((t) => t.name);
   assert.deepStrictEqual(names.sort(), [
-    'list_plan_sections',
     'read_plan_projection',
-    'read_plan_section',
     'record_planning_event',
   ]);
 });
@@ -93,12 +82,12 @@ test('retired create_plan is not handled and makes no HTTP call', async () => {
   assert.strictEqual(api.calls.length, 0, 'the retired tool must not issue an HTTP call');
 });
 
-test('handlePlansReadToolCall delegates the read tools to the shared handler', async () => {
+test('handlePlansReadToolCall delegates the activity read to the shared handler', async () => {
   const api = fakeApi({
-    'GET /api/plans/plan-1/sections': { sections: [{ anchor: 'sec_abc123' }] },
+    'GET /api/plans/plan-1/projection': { sections: [{ anchor: 'sec_abc123' }] },
   });
-  const r = await handlePlansReadToolCall('list_plan_sections', { plan_id: 'plan-1' }, api);
-  assert.strictEqual(api.calls[0].path, '/api/plans/plan-1/sections');
+  const r = await handlePlansReadToolCall('read_plan_projection', { plan_id: 'plan-1' }, api);
+  assert.strictEqual(api.calls[0].path, '/api/plans/plan-1/projection');
   assert.match(r.content[0].text, /sec_abc123/);
 });
 
@@ -113,19 +102,13 @@ test('omitted plan_id falls back to AGENT_DASHBOARD_PLAN_ID', async () => {
   process.env.AGENT_DASHBOARD_PLAN_ID = 'env-plan-9';
   try {
     const api = fakeApi({
-      'GET /api/plans/env-plan-9/sections': { sections: [] },
       'GET /api/plans/env-plan-9/projection': { sections: [] },
-      'GET /api/plans/env-plan-9/sections/sec_x': { found: true },
     });
-    await handlePlansToolCall('list_plan_sections', {}, api);
     await handlePlansToolCall('read_plan_projection', {}, api);
-    await handlePlansToolCall('read_plan_section', { anchor: 'sec_x' }, api);
-    assert.strictEqual(api.calls[0].path, '/api/plans/env-plan-9/sections');
-    assert.strictEqual(api.calls[1].path, '/api/plans/env-plan-9/projection');
-    assert.strictEqual(api.calls[2].path, '/api/plans/env-plan-9/sections/sec_x');
+    assert.strictEqual(api.calls[0].path, '/api/plans/env-plan-9/projection');
     // Same env-default path via the plans-read dispatcher.
-    await handlePlansReadToolCall('list_plan_sections', {}, api);
-    assert.strictEqual(api.calls[3].path, '/api/plans/env-plan-9/sections');
+    await handlePlansReadToolCall('read_plan_projection', {}, api);
+    assert.strictEqual(api.calls[1].path, '/api/plans/env-plan-9/projection');
   } finally {
     if (prev === undefined) delete process.env.AGENT_DASHBOARD_PLAN_ID;
     else process.env.AGENT_DASHBOARD_PLAN_ID = prev;
@@ -137,12 +120,7 @@ test('absent plan_id AND absent env → clear error, no HTTP call', async () => 
   delete process.env.AGENT_DASHBOARD_PLAN_ID;
   try {
     const api = fakeApi({});
-    for (const name of ['list_plan_sections', 'read_plan_projection']) {
-      const r = await handlePlansToolCall(name, {}, api);
-      assert.ok(r.isError, `${name} with no plan_id must error`);
-      assert.match(r.content[0].text, /no plan_id supplied and no dispatched plan in env/);
-    }
-    const r = await handlePlansToolCall('read_plan_section', { anchor: 'sec_x' }, api);
+    const r = await handlePlansToolCall('read_plan_projection', {}, api);
     assert.ok(r.isError);
     assert.match(r.content[0].text, /no plan_id supplied and no dispatched plan in env/);
     assert.strictEqual(api.calls.length, 0, 'no HTTP call when plan_id is unresolvable');
@@ -252,16 +230,6 @@ test('handlePlansReadToolCall rejects focus_plan / unfocus_plan (write tools, su
   assert.strictEqual(api.calls.length, 0, 'no HTTP call may be made for a rejected write tool');
 });
 
-test('list_plan_sections GETs /api/plans/:id/sections and serializes', async () => {
-  const api = fakeApi({
-    'GET /api/plans/plan-1/sections': { sections: [{ anchor: 'sec_abc123', zone: 'summary', title: 'Summary' }] },
-  });
-  const r = await handlePlansToolCall('list_plan_sections', { plan_id: 'plan-1' }, api);
-  assert.strictEqual(api.calls[0].method, 'GET');
-  assert.strictEqual(api.calls[0].path, '/api/plans/plan-1/sections');
-  assert.match(r.content[0].text, /sec_abc123/);
-});
-
 test('read_plan_projection GETs /api/plans/:id/projection and serializes', async () => {
   const api = fakeApi({
     'GET /api/plans/plan-1/projection': { sections: [{ anchor: 'sec_abc123', eventCount: 3 }] },
@@ -324,49 +292,6 @@ test('read_plan_projection with no events flag → bare /projection (parity floo
   });
   await handlePlansToolCall('read_plan_projection', { plan_id: 'plan-1', section_anchor: 'sec_x' }, api);
   assert.strictEqual(api.calls[0].path, '/api/plans/plan-1/projection', 'no events:true → no query at all');
-});
-
-test('read_plan_section GETs the anchor route with no query when only anchor given', async () => {
-  const api = fakeApi({
-    'GET /api/plans/plan-1/sections/sec_abc123': { found: true, kind: 'section', mode: 'text' },
-  });
-  const r = await handlePlansToolCall('read_plan_section', { plan_id: 'plan-1', anchor: 'sec_abc123' }, api);
-  assert.strictEqual(api.calls[0].path, '/api/plans/plan-1/sections/sec_abc123');
-  assert.match(r.content[0].text, /"found": true/);
-});
-
-test('read_plan_section threads mode/offset/limit into the query string', async () => {
-  const api = fakeApi({
-    'GET /api/plans/plan-1/sections/sec_abc123?mode=raw%2BeditWindow&offset=10&limit=200':
-      { found: true, kind: 'section', mode: 'raw+editWindow', oldString: '<div>' },
-  });
-  const r = await handlePlansToolCall(
-    'read_plan_section',
-    { plan_id: 'plan-1', anchor: 'sec_abc123', mode: 'raw+editWindow', offset: 10, limit: 200 },
-    api,
-  );
-  assert.match(r.content[0].text, /raw\+editWindow/);
-});
-
-test('read_plan_section passes a blk_ anchor through (owning-section attribution is server-side)', async () => {
-  const api = fakeApi({
-    'GET /api/plans/plan-1/sections/blk_def456': { found: true, kind: 'block', mode: 'raw' },
-  });
-  const r = await handlePlansToolCall('read_plan_section', { plan_id: 'plan-1', anchor: 'blk_def456' }, api);
-  assert.strictEqual(api.calls[0].path, '/api/plans/plan-1/sections/blk_def456');
-  assert.match(r.content[0].text, /"kind": "block"/);
-});
-
-test('offset=0 / limit=0 are threaded (explicit zero is not dropped)', async () => {
-  const api = fakeApi({
-    'GET /api/plans/plan-1/sections/sec_abc123?offset=0&limit=0': { found: true },
-  });
-  await handlePlansToolCall(
-    'read_plan_section',
-    { plan_id: 'plan-1', anchor: 'sec_abc123', offset: 0, limit: 0 },
-    api,
-  );
-  assert.strictEqual(api.calls[0].path, '/api/plans/plan-1/sections/sec_abc123?offset=0&limit=0');
 });
 
 // ── Fix-4 §4d: event_detail_id Tier-3 drill-down threading ───────────────────

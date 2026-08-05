@@ -101,10 +101,10 @@ db.getSupervisorFocusedPlans = (_supervisorId: string, _limit?: number) => focus
 db.upsertSupervisorFocus = (input: Record<string, unknown>) => { lastFocusUpsert = input; return { ...input }; };
 db.bumpSupervisorFocusAttended = (supervisorId: string, planId: string) => { lastFocusBump = { supervisorId, planId }; return { supervisorId, planId }; };
 db.getPlan = (id: string) => (id === 'plan-1' ? { id: 'plan-1', workspaceId: 'ws-1', deletedAt: null } : null);
-// Serve an (empty) projection so resolvePlanProjection short-circuits before any
-// file / workspace read — the read routes reach bumpFocusOnRead against the stub DB.
-db.getServedPlanProjection = () => ({ sections: [], parseError: null, warnings: [], source: '' });
-db.recordPlanSectionTouch = () => undefined; // best-effort breadcrumb — keep it a no-op under the stub DB
+db.getPlanEventRollup = () => [];
+db.getPlanSections = () => [];
+db.getPlanEventsForRender = () => [];
+db.getPlanEventRepoActivity = () => null;
 db.listOrchestrationRuns = () => [];
 db.getLiveRailAgentForPlan = () => null;
 function focusUpserted(): Record<string, unknown> | null { return lastFocusUpsert; }
@@ -616,21 +616,17 @@ test('P1 auto-subscribe: run_orchestration with a plan_id upserts for the dispat
 
 test('P1-07 bump-on-read: an asserted supervisor reading a plan freshens its focus row', () =>
   withServer(async (port) => {
-    // list_plan_sections + read_plan_section wire the identical bumpFocusOnRead one-liner
-    // (read_plan_projection shares it too, but its response body is DB-backed — out of
-    // scope for this identity-level stub; the bump wiring is proven by these two routes).
-    for (const p of ['/api/plans/plan-1/sections', '/api/plans/plan-1/sections/sec_x']) {
-      lastFocusBump = null;
-      const res = await request(port, 'GET', p, { ...WS_HDR, 'X-Supervisor-Id': 'sup-1' });
-      assert.equal(res.status, 200, `${p} → ${res.body}`);
-      assert.deepEqual(focusBumped(), { supervisorId: 'sup-1', planId: 'plan-1' }, `${p} bumps (sup-1, plan-1)`);
-    }
+    lastFocusBump = null;
+    const res = await request(port, 'GET', '/api/plans/plan-1/projection',
+      { ...WS_HDR, 'X-Supervisor-Id': 'sup-1' });
+    assert.equal(res.status, 200, res.body);
+    assert.deepEqual(focusBumped(), { supervisorId: 'sup-1', planId: 'plan-1' });
   }));
 
 test('P1-07 bump-on-read: a header-less caller reading a plan bumps nothing (no auto-create)', () =>
   withServer(async (port) => {
     lastFocusBump = null;
-    const res = await request(port, 'GET', '/api/plans/plan-1/sections', WS_HDR);
+    const res = await request(port, 'GET', '/api/plans/plan-1/projection', WS_HDR);
     assert.equal(res.status, 200, res.body);
     assert.equal(focusBumped(), null, 'no supervisor identity → no attended bump');
   }));

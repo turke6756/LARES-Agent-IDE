@@ -23,13 +23,10 @@ import {
   planItemInPlan,
   getSupervisorFocus, upsertSupervisorFocus, deleteSupervisorFocus,
   bumpSupervisorFocusAttended, getSupervisorFocusedPlans,
-  recordPlanSectionTouch, getPlanSections, getPlanEventRollup, getPlanEventsForRender,
+  getPlanSections, getPlanEventRollup, getPlanEventsForRender,
   getPlanEventRepoActivity,
 } from './database';
 import { toTier2Digest, toTier3Detail } from './plans/repo-activity';
-import { readPlanSection, listPlanSections, type ReadMode } from './plans/read-ladder';
-import { parsePlanHtmlSafe, type PlanProjection } from './plans/section-reader';
-import { getServedPlanProjection } from './plans/watch-plans';
 import { readFileContents } from './file-reader';
 import {
   executeCell as kernelExecuteCell,
@@ -3682,59 +3679,21 @@ export class ApiServer {
       return { ok: true, planId: deleted.id, deletedAt: deleted.deletedAt };
     }
 
-    // ── Plan read ladder (WP3 — backs the mcp-tools-plans.js read tools) ──
-    // Every read handler records a `source:'handler'` breadcrumb BEFORE returning
-    // content (R2 §2.2); attribution is best-effort (never gates the content).
-
-    // GET /api/plans/:id/sections — list_plan_sections orientation (~200 tokens).
-    const planSectionsList = path.match(/^\/api\/plans\/([^/]+)\/sections$/);
-    if (method === 'GET' && planSectionsList) {
-      const resolved = await resolvePlanProjection(planSectionsList[1]);
-      if (!resolved) throw Object.assign(new Error('Plan not found'), { statusCode: 404 });
-      // One `'*'` orientation touch for the whole list (R2 §2.2), before content.
-      recordPlanReadBreadcrumb(req, resolved.plan.id, { sectionAnchor: '*', tool: 'list_plan_sections' });
-      this.bumpFocusOnRead(identity, resolved.plan.id); // P1-07: freshen an existing focus row
-      return listPlanSections(resolved.projection);
-    }
-
-    // GET /api/plans/:id/projection — read_plan_projection: trusted activity
-    // roll-up joined from plan_events, per live section.
+    // Transitional activity-only projection. The legacy HTML section projection
+    // is retired; P8E owns removal of the remaining plan-event payload.
     const planProjection = path.match(/^\/api\/plans\/([^/]+)\/projection$/);
     if (method === 'GET' && planProjection) {
-      const resolved = await resolvePlanProjection(planProjection[1]);
-      if (!resolved) throw Object.assign(new Error('Plan not found'), { statusCode: 404 });
-      recordPlanReadBreadcrumb(req, resolved.plan.id, { sectionAnchor: '*', tool: 'read_plan_projection' });
-      this.bumpFocusOnRead(identity, resolved.plan.id); // P1-07: freshen an existing focus row
-      const includeEvents = url.searchParams.get('events') === 'full';
-      const eventsLimit = queryNum(url.searchParams, 'events_limit');       // reuse I-5 helper
-      const eventsSectionAnchor = url.searchParams.get('section_anchor') || undefined;
-      const eventDetailId = url.searchParams.get('event_detail_id') || undefined;  // Fix-4 Tier-3
-      return buildPlanActivityProjection(resolved.plan.id, resolved.projection,
-        { includeEvents, eventsLimit, eventsSectionAnchor, eventDetailId });
-    }
-
-    // GET /api/plans/:id/sections/:anchor?mode=&offset=&limit= — read_plan_section.
-    const planSectionRead = path.match(/^\/api\/plans\/([^/]+)\/sections\/([^/]+)$/);
-    if (method === 'GET' && planSectionRead) {
-      const anchor = decodeURIComponent(planSectionRead[2]);
-      const resolved = await resolvePlanProjection(planSectionRead[1]);
-      if (!resolved) throw Object.assign(new Error('Plan not found'), { statusCode: 404 });
-      this.bumpFocusOnRead(identity, resolved.plan.id); // P1-07: freshen an existing focus row
-      const mode = (url.searchParams.get('mode') || undefined) as ReadMode | undefined;
-      const offset = queryNum(url.searchParams, 'offset');
-      const limit = queryNum(url.searchParams, 'limit');
-      const result = readPlanSection(resolved.projection, anchor, { mode, offset, limit });
-      // Breadcrumb BEFORE returning content — record the RESOLVED anchor (section
-      // vs block) so a `blk_` read is attributed to its owning section.
-      if (result.found) {
-        const sectionAnchor = result.kind === 'block' ? sectionAnchorOfBlock(resolved.projection, anchor) : anchor;
-        recordPlanReadBreadcrumb(req, resolved.plan.id, {
-          sectionAnchor: sectionAnchor ?? anchor,
-          blockAnchor: result.kind === 'block' ? anchor : null,
-          tool: 'read_plan_section', readMode: result.mode,
-        });
-      }
-      return result;
+      const plan = getPlan(planProjection[1]);
+      if (!plan || plan.deletedAt) throw Object.assign(new Error('Plan not found'), { statusCode: 404 });
+      this.bumpFocusOnRead(identity, plan.id);
+      return buildPlanActivityProjection(plan.id, {
+        sections: [], parseError: null, warnings: [],
+      }, {
+        includeEvents: url.searchParams.get('events') === 'full',
+        eventsLimit: queryNum(url.searchParams, 'events_limit'),
+        eventsSectionAnchor: url.searchParams.get('section_anchor') || undefined,
+        eventDetailId: url.searchParams.get('event_detail_id') || undefined,
+      });
     }
 
     // ── Supervisor-focus routes (B2 P1-03) — explicit supervisor_id; NO ACL (R1/R4) ──
@@ -3859,74 +3818,28 @@ function rejectMarkdownMigration(b: any): void {
 }
 
 /** Join a workspace-relative `plans/…` path onto the workspace root (host sep). */
-function absPlanPath(ws: Workspace, relPath: string): string {
-  const sep = ws.pathType === 'wsl' ? '/' : (ws.path.includes('\\') ? '\\' : '/');
-  const base = ws.path.replace(/[\\/]+$/, '');
-  return `${base}${sep}${relPath.replace(/\//g, sep)}`;
-}
-
 /** Resolve the projection a read tool serves for a plan (WP3). Prefers WP4's
  *  in-memory last-good projection; falls back to reading + parsing the file on
  *  disk (the reparser may not have run yet — e.g. right after create, or in
  *  tests where it is unconfigured). Returns null for a missing/deleted plan. */
-export async function resolvePlanProjection(planId: string): Promise<{ plan: import('../shared/types').Plan; projection: PlanProjection } | null> {
+interface RetiredPlanProjection {
+  sections: Array<{
+    anchor: string | null;
+    zone: string | null;
+    heading: string | null;
+    tokenEstimate: number;
+  }>;
+  parseError: string | null;
+  warnings: string[];
+}
+
+export async function resolvePlanProjection(planId: string): Promise<{
+  plan: import('../shared/types').Plan;
+  projection: RetiredPlanProjection;
+} | null> {
   const plan = getPlan(planId);
   if (!plan || plan.deletedAt) return null;
-  // WP-P2C-compat: a `format='structured'` (folder-adopted) plan has no HTML
-  // projection. Mechanically exclude it from EVERY HTML plan-projection path that
-  // funnels through here — the `/api/plans/:id/{sections,projection,sections/:anchor}`
-  // routes and the `plan:projection` IPC — by returning null (→ the routes 404 and
-  // the IPC returns null; a structured-not-applicable outcome, never a crash).
-  // Legacy `html`/`md` plans are unaffected (md keeps its existing HTML-parsed read).
-  if (plan.format === 'structured') return null;
-  const served = getServedPlanProjection(planId);
-  if (served) return { plan, projection: served };
-  const ws = getWorkspace(plan.workspaceId);
-  if (!ws) return { plan, projection: { sections: [], parseError: 'workspace not found', warnings: [], source: '' } };
-  try {
-    const fc = await readFileContents(absPlanPath(ws, plan.path), ws.pathType);
-    if (fc.error || typeof fc.content !== 'string') {
-      return { plan, projection: { sections: [], parseError: fc.error ?? 'no content', warnings: [], source: '' } };
-    }
-    return { plan, projection: parsePlanHtmlSafe(fc.content) };
-  } catch (err) {
-    return { plan, projection: { sections: [], parseError: err instanceof Error ? err.message : String(err), warnings: [], source: '' } };
-  }
-}
-
-/** The owning section anchor of a `blk_` block within a projection (else null). */
-function sectionAnchorOfBlock(projection: PlanProjection, blockAnchor: string): string | null {
-  for (const s of projection.sections) {
-    if (s.blocks.some((blk) => blk.anchor === blockAnchor)) return s.anchor;
-  }
-  return null;
-}
-
-/** Record a `source:'handler'` read breadcrumb BEFORE returning content (R2
- *  §2.2). The calling agent is the forwarded `X-Self-Id` (workers) falling back
- *  to `X-Supervisor-Id`. Tolerant: never throws, never gates the read. */
-function recordPlanReadBreadcrumb(
-  req: http.IncomingMessage,
-  planId: string,
-  args: { sectionAnchor: string; blockAnchor?: string | null; tool: string; readMode?: string | null },
-): void {
-  try {
-    const hdr = (name: string): string | null => {
-      const v = req.headers[name];
-      return typeof v === 'string' && v.length > 0 ? v : null;
-    };
-    const agentId = hdr('x-self-id') ?? hdr('x-supervisor-id');
-    if (!agentId) return; // no attributable caller → skip (best-effort provenance)
-    recordPlanSectionTouch({
-      agentId, planId,
-      sectionAnchor: args.sectionAnchor,
-      blockAnchor: args.blockAnchor ?? null,
-      tool: args.tool, kind: 'read',
-      readMode: args.readMode ?? null,
-      source: 'handler',
-      toolUseId: hdr('x-tool-use-id'),
-    });
-  } catch { /* provenance is best-effort — never fail the read (R2 §0) */ }
+  return { plan, projection: { sections: [], parseError: null, warnings: [] } };
 }
 
 /** read_plan_projection payload: each live section's structure + its trusted
@@ -3937,7 +3850,7 @@ function recordPlanReadBreadcrumb(
  *  split. Omitted by default to keep the tier-1 orient payload small (C7). */
 export function buildPlanActivityProjection(
   planId: string,
-  projection: PlanProjection,
+  projection: RetiredPlanProjection,
   opts?: { includeEvents?: boolean; eventsLimit?: number; eventsSectionAnchor?: string; eventDetailId?: string },
 ) {
   const rollup = new Map(getPlanEventRollup(planId).map((r) => [r.sectionAnchor, r]));

@@ -13,8 +13,8 @@
 //     that path,
 //   - `getSharedParseManager().ensureIndexed()` is NEVER called (it is a chunked
 //     background WRITER),
-//   - plan projections are composed DIRECTLY from `resolvePlanProjection` /
-//     `listPlanSections` / `buildPlanActivityProjection`. The plan HTTP routes are
+//   - transitional plan activity is composed DIRECTLY from `resolvePlanProjection` /
+//     `buildPlanActivityProjection`. The plan HTTP routes are
 //     never used: they fire `bumpFocusOnRead` → `bumpSupervisorFocusAttended`
 //     (api-server.ts:558-563), which would forge supervisor attention into the
 //     trusted plan-provenance trail.
@@ -67,7 +67,6 @@ import {
 import { makePathOps } from '../context-overhead/paths';
 import { TokenEstimator } from '../context-overhead/token-estimator';
 import { resolvePlanProjection, buildPlanActivityProjection } from '../api-server';
-import { listPlanSections } from '../plans/read-ladder';
 
 import {
   ANALYTICS_SCHEMA_VERSION, SNAPSHOT_MANIFEST_KIND, SURFACE_KEYS,
@@ -778,7 +777,7 @@ export async function captureAnalyticsSnapshot(o: AnalyticsSnapshotOptions): Pro
           status: resolved.plan.runState ?? '',
           updatedAt: resolved.plan.updatedAt,
         },
-        sections: listPlanSections(resolved.projection),
+        sections: [],
         // Default (counts-only) options: no per-event rows, no Tier-3 file lists.
         activity: d.buildPlanActivityProjection(resolved.plan.id, resolved.projection),
       });

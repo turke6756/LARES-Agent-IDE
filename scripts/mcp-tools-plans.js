@@ -1,5 +1,5 @@
 // Planning-surface MCP toolset (WP3). Thin HTTP callers over the dashboard's
-// /api/plans routes — the read ladder plus supervisor focus controls. Identity flows
+// /api/plans routes — the activity read plus supervisor focus controls. Identity flows
 // through the X-Self-Id (worker) / X-Supervisor-Id (supervisor) header that
 // apiRequest spreads from CALLER_HEADERS on every call, so the server records
 // the `source:'handler'` read breadcrumb against the calling agent (R2 §2.2).
@@ -16,51 +16,11 @@
 // shared read schemas — an omitted plan_id falls back to the dispatched plan in
 // AGENT_DASHBOARD_PLAN_ID (D-2 soft env-default scoping); still-falsy → clear error.
 
-// READ_DEFS — the read ladder shared by the `plans` and `plans-read` toolsets.
+// READ_DEFS — the read surface shared by the `plans` and `plans-read` toolsets.
 // `plan_id` is optional in every schema here: supervisors normally pass it
 // explicitly, but an omitted plan_id falls back to AGENT_DASHBOARD_PLAN_ID (the
 // dispatched plan) at handler time; still-falsy yields a clear error.
 const READ_DEFS = [
-  {
-    name: 'list_plan_sections',
-    description:
-      'Orient on a plan: list its live sections (anchor, zone, title, heading outline) — ~200 ' +
-      'tokens, no body content. Records a single `*` orientation read breadcrumb. Call this ' +
-      'first to find the section anchor you want, then read_plan_section for the body.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        plan_id: { type: 'string', description: 'The plan ID (optional — defaults to the dispatched plan in AGENT_DASHBOARD_PLAN_ID).' },
-      },
-      required: [],
-    },
-  },
-  {
-    name: 'read_plan_section',
-    description:
-      'Read one plan section (or a `blk_` block within it) by anchor. Modes: `outline` (headings ' +
-      'only), `text` (rendered text projection), `raw` (byte-exact HTML fragment), ' +
-      '`raw+editWindow` (byte-exact oldString + range + append point + edit-discipline guidance — ' +
-      'read this BEFORE natively Editing a zone). `offset`/`limit` page long sections. A `blk_` ' +
-      'anchor is attributed to its owning section. Records a read breadcrumb before returning content. ' +
-      'NOTE: the execution-trail section (`sec_exectr`) is system-owned (auto-generated from trusted ' +
-      'write events) — read it, but never edit it; edits there are dropped from write attribution.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        plan_id: { type: 'string', description: 'The plan ID (optional — defaults to the dispatched plan in AGENT_DASHBOARD_PLAN_ID).' },
-        anchor: { type: 'string', description: 'Section anchor (`sec_…`) or block anchor (`blk_…`).' },
-        mode: {
-          type: 'string',
-          enum: ['outline', 'text', 'raw', 'raw+editWindow'],
-          description: 'Projection mode (default server-side). Use `raw+editWindow` before a native Edit.',
-        },
-        offset: { type: 'number', description: 'Start offset for paging a long section.' },
-        limit: { type: 'number', description: 'Max length to return when paging.' },
-      },
-      required: ['anchor'],
-    },
-  },
   {
     name: 'read_plan_projection',
     description:
@@ -182,26 +142,6 @@ function missingPlanIdError() {
 
 async function handlePlansToolCall(name, args, apiRequest) {
   switch (name) {
-    case 'list_plan_sections': {
-      const planId = resolvePlanId(args);
-      if (!planId) return missingPlanIdError();
-      const result = await apiRequest('GET', `/api/plans/${encodeURIComponent(planId)}/sections`);
-      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
-    }
-
-    case 'read_plan_section': {
-      const planId = resolvePlanId(args);
-      if (!planId) return missingPlanIdError();
-      let p = `/api/plans/${encodeURIComponent(planId)}/sections/${encodeURIComponent(args.anchor)}`;
-      const q = [];
-      if (args.mode) q.push(`mode=${encodeURIComponent(args.mode)}`);
-      if (args.offset !== undefined) q.push(`offset=${encodeURIComponent(args.offset)}`);
-      if (args.limit !== undefined) q.push(`limit=${encodeURIComponent(args.limit)}`);
-      if (q.length) p += '?' + q.join('&');
-      const result = await apiRequest('GET', p);
-      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
-    }
-
     case 'read_plan_projection': {
       const planId = resolvePlanId(args);
       if (!planId) return missingPlanIdError();
