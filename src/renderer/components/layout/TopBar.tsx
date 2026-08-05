@@ -87,6 +87,7 @@ export default function TopBar() {
       { label: '', divider: true },
       { label: 'Context Overhead', onClick: () => openToolTab('context-overhead', 'Context Overhead') },
       { label: 'Context Window Warning', onClick: () => openToolTab('context-window-warning', 'Context Window Warning') },
+      { label: 'GroupThink Providers', onClick: () => openToolTab('groupthink-providers', 'GroupThink Providers') },
       { label: 'Agent Knowledge', onClick: () => openToolTab('agent-knowledge-graph', 'Agent Knowledge') },
       { label: 'Usage', onClick: () => openToolTab('skill-usage-analytics', 'Usage') },
       // A7: the capstone is the "Context Optimizer" entry; the detailed WP6b surface

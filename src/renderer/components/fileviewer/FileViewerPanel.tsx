@@ -14,6 +14,7 @@ import PlanSurfaceContainer from '../plan/PlanSurfaceContainer';
 import CapstonePanel from '../context-optimizer/CapstonePanel';
 import SystemMemoryView from '../watchdog/SystemMemoryView';
 import ContextWindowWarningPanel from '../context-gauge/ContextWindowWarningPanel';
+import GroupThinkProvidersPanel from '../orchestration/GroupThinkProvidersPanel';
 import { detectFileType } from './fileTypeUtils';
 import ResizeDivider from '../layout/ResizeDivider';
 import CollapseButton from '../layout/CollapseButton';
@@ -256,6 +257,8 @@ export default function FileViewerPanel() {
               <SystemMemoryView />
             ) : effectiveTab.toolId === 'context-window-warning' ? (
               <ContextWindowWarningPanel />
+            ) : effectiveTab.toolId === 'groupthink-providers' ? (
+              <GroupThinkProvidersPanel />
             ) : (
               <div className="flex items-center justify-center h-full text-gray-400 text-sm">Unknown tool</div>
             )
