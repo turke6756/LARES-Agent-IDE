@@ -385,7 +385,11 @@ export function registerIpcHandlers(
         readPriorSessionEvents: (p, wd, sid) => reader.readPriorSessionEvents(p, wd, sid),
       },
       agentId,
-      { sinceUuid },
+      // Hydration is request-driven, just like read_agent_chat. Force one
+      // provider poll before reading the ring so a newly-opened pane does not
+      // depend on the background tick having already discovered/tail-read the
+      // session (notably Grok and Agy).
+      { sinceUuid, pollLive: true },
     );
   });
   ipcMain.handle('agent:chat-subscribe', (_e, agentId) => {

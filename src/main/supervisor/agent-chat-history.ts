@@ -92,8 +92,8 @@ export interface ChatHistoryDeps {
 export interface ResolveChatOptions {
   /** Only meaningful for a LIVE agent: force a fresh tail before reading the
    *  ring. The MCP / HTTP path does this (a stale read there is a correctness
-   *  bug); the renderer IPC path does not, because it also holds a live
-   *  subscription and a forced poll on every pane render would be wasteful.
+   *  bug); the renderer IPC hydration path does this once when the pane opens,
+   *  then its live subscription carries subsequent events.
    *  Never runs for a terminal agent — `pollNow` is a no-op there by
    *  construction. */
   pollLive?: boolean;

@@ -107,11 +107,33 @@ test('live agent reads the RAM ring and never touches disk', () => {
   assert.equal(r.diskReads.length, 0, 'a live agent must never hit the disk reader');
 });
 
-test('pollLive:false (the renderer IPC path) does not force a poll', () => {
+test('pollLive:false does not force a poll', () => {
   const r = makeDeps({ agent: liveAgent, ring: [ev('u1', 'hi')] });
   const out = resolveAgentChatEvents(r.deps, 'a1');
   assert.equal(out.source, 'live');
   assert.deepEqual(r.polled, []);
+});
+
+test('renderer history hydration force-polls live Grok and Agy agents before returning records', () => {
+  for (const provider of ['grok', 'agy'] as const) {
+    const polled: string[] = [];
+    let ring: SessionEvent[] = [];
+    const deps: ChatHistoryDeps = {
+      getAgent: () => ({ ...liveAgent, provider }),
+      getCachedEvents: () => ({ events: ring, truncated: false }),
+      pollNow: (id) => {
+        polled.push(id);
+        // Model the provider reader filling the shared structured-event ring.
+        ring = [ev(`${provider}-user`, `hello from ${provider}`)];
+      },
+      readPriorSessionEvents: () => null,
+    };
+
+    const out = resolveAgentChatEvents(deps, 'a1', { pollLive: true });
+    assert.deepEqual(polled, ['a1'], `${provider} hydration must poll its reader`);
+    assert.equal(out.source, 'live');
+    assert.deepEqual(out.events.map((event) => event.uuid), [`${provider}-user`]);
+  }
 });
 
 // ── Dead agents come off disk ────────────────────────────────────────
@@ -135,6 +157,19 @@ test('dead agent: disk wins over a stale warm ring', () => {
   const out = resolveAgentChatEvents(r.deps, 'a1');
   assert.equal(out.source, 'disk');
   assert.deepEqual(out.events.map((e) => e.uuid), ['d1', 'd2']);
+});
+
+test('renderer history route returns terminal Grok and Agy records from the shared disk path', () => {
+  for (const provider of ['grok', 'agy'] as const) {
+    const records = [ev(`${provider}-user`, `past ${provider} turn`)];
+    const r = makeDeps({ agent: { ...deadAgent, provider }, ring: [], disk: records });
+    const out = resolveAgentChatEvents(r.deps, 'a1', { pollLive: true });
+
+    assert.equal(out.source, 'disk');
+    assert.deepEqual(out.events, records);
+    assert.deepEqual(r.diskReads, [[provider, '/repo', 'sess-1']]);
+    assert.deepEqual(r.polled, [], `${provider} terminal history must not poll a dead runner`);
+  }
 });
 
 test('dead agent: sinceUuid slices the disk read exactly like the live ring', () => {
