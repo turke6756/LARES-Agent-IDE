@@ -35,6 +35,7 @@ import {
 } from './jupyter-kernel-client';
 import { scanPersonas, scaffoldPersona } from './persona-scanner';
 import { applyContextGaugeSettings, type ContextGaugeIpcDeps } from './context-gauge/context-gauge-ipc';
+import { getOrchestrationProviderSettingsCached } from './orchestration/orchestration-provider-settings';
 import { TEAM_MAX_MESSAGES_PER_5MIN, TEAM_MAX_ALTERNATIONS, TEAM_ALTERNATION_WINDOW_MS, TEAM_PAIR_COOLDOWN_MS, CONTINUATION_BRICK_MAX_BYTES, CONTINUATION_ESCAPE_MAX_ATTEMPTS, CONTINUATION_ESCAPE_MAX_ALIVE_MS } from '../shared/constants';
 import { TeamMessageStatus, hasSupervisorPrivilege } from '../shared/types';
 import type { Agent, Workspace } from '../shared/types';
@@ -2406,9 +2407,11 @@ export class ApiServer {
       // caller can be attributed a subscription.
       const plans = identity.supervisorId ? getSupervisorFocusedPlans(identity.supervisorId, 10) : undefined;
       const activePlan = getExecutingSupervisorPlan(identity.supervisorId);
+      const orchestrationProviderDefaults = getOrchestrationProviderSettingsCached(workspace.path);
       return {
         workspaceId,
         workspaceTitle: workspace.title,
+        orchestrationProviderDefaults,
         // Inc 2 (2.3): the asserted caller's own id when X-Supervisor-Id was
         // present (validated in resolveIdentity); null for header-less callers.
         supervisorId: identity.supervisorId,

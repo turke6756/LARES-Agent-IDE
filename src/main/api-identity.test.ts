@@ -36,6 +36,7 @@ function test(name: string, fn: () => Promise<void> | void): void {
 //    api-auth.test.ts — routes resolve these at call time) ─────────────────
 
 const WS = { id: 'ws-1', title: 'Workspace One', path: 'C:/tmp/ws-1', pathType: 'windows' };
+const WS2 = { id: 'ws-2', title: 'Workspace Two', path: 'C:/tmp/ws-2', pathType: 'windows' };
 const SUP = { id: 'sup-1', title: 'Supervisor', provider: 'claude', status: 'idle' };
 const WS_AGENTS = [
   { id: 'a-1', workspaceId: 'ws-1', status: 'working', isSupervised: true },
@@ -85,7 +86,7 @@ db.getAgentsByOwner = (ownerId: string, opts?: { includeTerminal?: boolean }) =>
     .filter(a => opts?.includeTerminal || (a.status !== 'done' && a.status !== 'crashed'));
 db.getAgent = (id: string) => AGENT_ROWS.find(a => a.id === id) ?? null;
 db.getAgentsByWorkspace = (wsId: string) => WS_AGENTS.filter(a => a.workspaceId === wsId);
-db.getWorkspace = (id: string) => (id === WS.id ? WS : null);
+db.getWorkspace = (id: string) => (id === WS.id ? WS : id === WS2.id ? WS2 : null);
 db.getSupervisorAgent = (wsId: string) => (wsId === WS.id ? SUP : null);
 db.listTeams = (wsId: string) => [{ id: 'team-1', workspaceId: wsId, name: 'T', status: 'active', members: [] }];
 db.listAgentTemplates = (wsId?: string) => (wsId ? [{ id: 'tpl-ws', workspaceId: wsId }] : [{ id: 'tpl-all' }]);
@@ -115,6 +116,14 @@ function createdTeamInput(): Record<string, unknown> | null { return lastCreateT
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const personaScanner = require('./persona-scanner') as Record<string, unknown>;
 personaScanner.scanPersonas = (wsPath: string) => [{ name: 'p1', scannedFrom: wsPath }];
+
+// WP-4 preflight fixture: the context route must resolve provider defaults
+// from the workspace selected by the authenticated X-Workspace-Id.
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const providerSettings = require('./orchestration/orchestration-provider-settings') as Record<string, unknown>;
+providerSettings.getOrchestrationProviderSettingsCached = (workspaceRoot: string) => workspaceRoot === WS.path
+  ? { groupthink: { defaultLeadProvider: 'grok', defaultReviewerProvider: 'agy' } }
+  : { groupthink: { defaultLeadProvider: 'claude', defaultReviewerProvider: 'codex' } };
 
 let lastLaunchInput: Record<string, unknown> | null = null;
 // Inc 4 — per-test in-flight ids + continuationRelaunch capture. The stub
@@ -284,6 +293,23 @@ test('GET /api/supervisor/context with header → 200 summary (workspace, superv
     // Inc 3 (3.3): counts.owned follows the resolved supervisor — here the
     // LIMIT-1 fallback (sup-1), which owns 2 live + 2 terminal fixtures.
     assert.deepEqual(ctx.counts, { total: 3, live: 2, supervised: 2, owned: { live: 2, terminal: 2 } });
+    assert.deepEqual(ctx.orchestrationProviderDefaults, {
+      groupthink: { defaultLeadProvider: 'grok', defaultReviewerProvider: 'agy' },
+    });
+  }));
+
+test('GET /api/supervisor/context scopes orchestration provider defaults by X-Workspace-Id', () =>
+  withServer(async (port) => {
+    const res = await request(port, 'GET', '/api/supervisor/context', {
+      ...AUTH,
+      'X-Workspace-Id': 'ws-2',
+    });
+    assert.equal(res.status, 200);
+    const ctx = JSON.parse(res.body);
+    assert.equal(ctx.workspaceId, 'ws-2');
+    assert.deepEqual(ctx.orchestrationProviderDefaults, {
+      groupthink: { defaultLeadProvider: 'claude', defaultReviewerProvider: 'codex' },
+    });
   }));
 
 test('GET /api/supervisor/context: no header + no qp → 400', () =>

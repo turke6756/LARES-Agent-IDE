@@ -16,6 +16,7 @@ import {
   insertOrchestration, updateOrchestration, getOrchestrationRun, listOrchestrationRuns,
   insertOrchestrationEvent, insertOrchestrationMember, markActiveRunsAborted,
 } from '../database';
+import { getOrchestrationProviderSettingsCached } from './orchestration-provider-settings';
 
 const READY_STATUSES = new Set(['idle', 'waiting']);
 
@@ -150,6 +151,7 @@ export class OrchestrationService extends EventEmitter {
         const planRow = getPlan(req.planId);
         if (planRow?.path) planRel = planRow.path;
       }
+      const prov = getOrchestrationProviderSettingsCached(ws.path).groupthink;
       run = {
         runId: uuidv4().slice(0, 8),
         name: 'groupthink',
@@ -162,8 +164,8 @@ export class OrchestrationService extends EventEmitter {
         planId: req.planId,
         planningIntentId: req.planningIntentId ?? null,
         sectionAnchor: req.sectionAnchor,
-        leadProvider: req.leadProvider || 'claude',
-        reviewerProvider: req.reviewerProvider || 'codex',
+        leadProvider: req.leadProvider || prov.defaultLeadProvider,
+        reviewerProvider: req.reviewerProvider || prov.defaultReviewerProvider,
         turnTimeoutMs: req.turnTimeoutMs && req.turnTimeoutMs > 0 ? req.turnTimeoutMs : 600000,
         leadId: req.resumeLeadId,
         reviewerId: req.resumeReviewerId,

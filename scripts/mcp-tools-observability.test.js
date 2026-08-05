@@ -74,6 +74,12 @@ ok('NO observability tool NAME contains a mutation verb', () => {
   }
 });
 
+ok('get_my_context describes the workspace-scoped GroupThink provider defaults', () => {
+  const context = defs.find((d) => d.name === 'get_my_context');
+  assert.ok(context, 'get_my_context must be registered');
+  assert.match(context.description, /orchestrationProviderDefaults\.groupthink/);
+});
+
 // ── read_comments: the in-process replacement for the pure-Python
 // .lares/scripts/read-comments.py (removes the app's only hard Python dep). ──
 ok('read_comments is registered on the core surface with a file_path-required schema', () => {
@@ -140,6 +146,22 @@ ok('1C fixture: a MATERIAL unverified subtract IS surfaced by the default builde
 
 // ── handler audit: no retired tool routes, and no HTTP call escapes ──
 async function run() {
+  await okAsync('get_my_context preserves orchestration provider defaults through the MCP proxy', async () => {
+    const expected = {
+      workspaceId: 'ws-1',
+      orchestrationProviderDefaults: {
+        groupthink: { defaultLeadProvider: 'grok', defaultReviewerProvider: 'agy' },
+      },
+    };
+    const calls = [];
+    const result = await handleObservabilityToolCall('get_my_context', {}, (method, p) => {
+      calls.push({ method, path: p });
+      return Promise.resolve(expected);
+    });
+    assert.deepStrictEqual(calls, [{ method: 'GET', path: '/api/supervisor/context' }]);
+    assert.deepStrictEqual(JSON.parse(result.content[0].text), expected);
+  });
+
   await okAsync('no retired analytics tool routes through any observability handler', async () => {
     const calls = [];
     const fakeApi = (method, p) => { calls.push({ method, path: p }); return Promise.resolve({ ok: true }); };

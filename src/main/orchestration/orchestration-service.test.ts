@@ -13,10 +13,15 @@
 //   node dist/main/main/orchestration/orchestration-service.test.js
 
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { assertGroupthinkProvider, OrchestrationService } from './service';
 import { DashboardClient, OrchestrationRun, OrchestrationRunContext, OrchestrationRunner } from './types';
+import {
+  __resetOrchestrationProviderSettingsForTest,
+  updateOrchestrationProviderSettings,
+} from './orchestration-provider-settings';
 
 // ── In-memory DB patch ───────────────────────────────────────────────
 // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -25,8 +30,17 @@ const clone = <T>(o: T): T => JSON.parse(JSON.stringify(o));
 
 const runsStore = new Map<string, OrchestrationRun>();
 const eventsStore: Array<{ runId: string; ts: string; kind: string; payload: unknown }> = [];
+const providerSettingsRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'lares-orchestration-precedence-'));
+const workspaceRoots = {
+  defaulted: path.join(providerSettingsRoot, 'defaulted'),
+  builtIn: path.join(providerSettingsRoot, 'built-in'),
+};
 
-db.getWorkspace = (id: string) => (id === 'ws-1' ? { id: 'ws-1', path: os.tmpdir() } : null);
+db.getWorkspace = (id: string) => {
+  if (id === 'ws-1') return { id: 'ws-1', path: workspaceRoots.defaulted };
+  if (id === 'ws-built-in') return { id: 'ws-built-in', path: workspaceRoots.builtIn };
+  return null;
+};
 // Fix 3 (planning-surface demo): start_run now resolves getPlan(planId).path for
 // rail runs. These lifecycle tests don't assert path resolution, so a plans store
 // keyed by id suffices; unknown ids fall back to null → the legacy planPath default.
@@ -169,6 +183,31 @@ test('fresh runs accept every provider in either slot, including same-provider p
     assert.equal(getRun(sameProviderRun.runId)?.leadProvider, provider);
     assert.equal(getRun(sameProviderRun.runId)?.reviewerProvider, provider);
   }
+});
+
+test('fresh-run provider precedence is explicit over workspace default over built-in default', () => {
+  __resetOrchestrationProviderSettingsForTest();
+  updateOrchestrationProviderSettings({
+    groupthink: { defaultLeadProvider: 'grok', defaultReviewerProvider: 'agy' },
+  }, workspaceRoots.defaulted);
+  const runner: OrchestrationRunner = async () => {};
+  const svc = new OrchestrationService(makeClient(), makeDeliver().fn, { serial: runner, parallel: runner });
+
+  const explicit = svc.start_run(baseReq({ leadProvider: 'codex', reviewerProvider: 'claude' }));
+  assert.equal(getRun(explicit.runId)?.leadProvider, 'codex');
+  assert.equal(getRun(explicit.runId)?.reviewerProvider, 'claude');
+
+  const workspaceDefault = svc.start_run(baseReq());
+  assert.equal(getRun(workspaceDefault.runId)?.leadProvider, 'grok');
+  assert.equal(getRun(workspaceDefault.runId)?.reviewerProvider, 'agy');
+
+  const builtIn = svc.start_run(baseReq({ workspaceId: 'ws-built-in' }));
+  assert.equal(getRun(builtIn.runId)?.leadProvider, 'claude');
+  assert.equal(getRun(builtIn.runId)?.reviewerProvider, 'codex');
+
+  updateOrchestrationProviderSettings({
+    groupthink: { defaultLeadProvider: 'claude', defaultReviewerProvider: 'codex' },
+  }, workspaceRoots.defaulted);
 });
 
 test('fresh runs reject unknown and empty providers before persistence', () => {
@@ -455,5 +494,6 @@ test('a non-rail run stamps its legacy fresh-file output', async () => {
     }
   }
   console.log(`\n${passed} passed, ${failed} failed`);
+  fs.rmSync(providerSettingsRoot, { recursive: true, force: true });
   process.exit(failed === 0 ? 0 : 1);
 })();

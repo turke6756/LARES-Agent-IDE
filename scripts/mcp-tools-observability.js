@@ -118,6 +118,7 @@ function getObservabilityCoreToolDefinitions() {
         'own supervisorId (when you are a supervisor — validated from your injected identity), your ' +
         'workspace supervisor (id, title, provider, status), and agent counts (total / live / supervised, ' +
         'plus owned: how many agents YOU launched are live vs terminal — pull the list via list_my_agents). ' +
+        'Also returns `orchestrationProviderDefaults.groupthink` with the workspace\'s default lead and reviewer providers. ' +
         'When you are a supervisor it also returns `plans`: the plan surfaces you are subscribed to ' +
         '(planId, path, slug, format, focusedAt, lastAttendedAt, notes), most-recently-attended first, ' +
         'capped at 10 — you auto-subscribe when you dispatch a plan-bound agent/orchestration, ' +
