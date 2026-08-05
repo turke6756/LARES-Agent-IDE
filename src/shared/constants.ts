@@ -3192,6 +3192,8 @@ Orchestrations now run **in-process inside the dashboard** and are controlled th
 
 **Legacy resume.** Older plans/\`.runs\` may carry a \`node scripts/groupthink-v2.js … --resume-lead-id=… --resume-reviewer-id=…\` resume_hint. Don't run that script — pass the whole line through \`run_orchestration({name:'groupthink', workspace_id, supervisor_id, legacy_command:"<the whole old line>"})\`. The dashboard parses it into structured resume params and runs the in-process runner. (\`scripts/groupthink-v2.js\` still exists only as a thin compat shim that forwards to this same tool.)
 
+Resumes keep the original lead and reviewer. Supplying a different \`lead_provider\` or \`reviewer_provider\` on resume is rejected with 409; omit both unless restating the matching original values.
+
 \`groupthink\` is the only orchestration in the catalog; the table above and \`run_orchestration\`'s own schema are the authoritative parameter list.
 
 ## Workflow
@@ -3200,13 +3202,26 @@ Orchestrations now run **in-process inside the dashboard** and are controlled th
 
 The user will name one (e.g., "run a GroupThink on X") or describe a goal that maps to one. If unclear, ask. Don't guess — orchestrations launch real agents and burn real tokens. Today \`groupthink\` is the only one; the real choice is \`mode: 'serial'\` vs \`'parallel'\`.
 
-### 2. Discover IDs
+### 2. Discover IDs and preflight context
 
 Every run needs a \`workspace_id\` and a \`supervisor_id\`. You are the supervisor: use \`list_agents\` to find your own agent record (the supervisor for this workspace) and read its \`id\` (→ \`supervisor_id\`) and \`workspaceId\` (→ \`workspace_id\`). If exactly one active supervisor for the current workspace isn't identifiable, stop and report the ambiguity.
 
-### 3. Construct and confirm the call
+Before constructing the call, use \`get_my_context\` and read both \`orchestrationProviderDefaults.groupthink\` and \`availableProviders\`. Resolve each desired slot from an explicit run override, otherwise its workspace default, otherwise the built-in default (lead \`claude\`, reviewer \`codex\`). An omitted \`lead_provider\` or \`reviewer_provider\` inherits the workspace default; pass the argument only to override that default.
 
-Fill in required + useful optional params, e.g.:
+### 3. Resolve availability, construct, and confirm the call
+
+> Resolve the desired lead and reviewer independently using explicit run argument → workspace
+> default → built-in default. Then consult \`availableProviders\`. Keep a desired provider when
+> it is \`available\`; keep a \`degraded\` desired provider only after stating its caveat in the
+> preflight confirmation. When a desired provider is \`unavailable\`, propose a substitute from
+> providers marked \`available\`, using task fit and the reported reasons; if no provider is
+> \`available\`, a \`degraded\` provider may be proposed with its caveat. State the desired
+> provider, preference source, substitute, and reason before spend. Never call
+> \`run_orchestration\` until the user confirms the complete effective pair. If every provider is
+> \`unavailable\`, do not launch and report the reasons. Same-provider pairs remain valid. No
+> persisted fallback order exists in v5; when one is introduced, it governs substitute ranking.
+
+Fill in required + useful optional params. Omit provider args to inherit the workspace defaults; include either only for an intentional override, e.g.:
 
 \`\`\`
 run_orchestration({
@@ -3216,10 +3231,11 @@ run_orchestration({
   topic: 'Plan the X migration',
   plan_path: 'plans/x-migration.md',   // relative to workspace root
   mode: 'serial',                       // or 'parallel'
+  lead_provider: 'agy',                 // optional explicit override
 })
 \`\`\`
 
-Confirm with the user before launching anything that will burn tokens — show the constructed call. Don't autonomously launch.
+Show the user the desired pair, each preference source (explicit, workspace default, or built-in), any availability-driven substitute and reason, and the complete effective pair alongside the constructed call. Confirm before launching anything that will burn tokens. Don't autonomously launch. The effective lead and reviewer may be the same provider.
 
 ### 4. Launch (detached) and return to idle
 

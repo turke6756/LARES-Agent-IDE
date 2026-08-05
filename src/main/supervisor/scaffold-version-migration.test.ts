@@ -37,6 +37,7 @@ import {
   SUPERVISOR_AGENT_MD_V17_HASH,
   SUPERVISOR_AGENT_MD_V18_HASH,
   SUPERVISOR_AGENT_MD_V19_HASH,
+  SUPERVISOR_RUN_ORCHESTRATION_SKILL_V4_HASH,
   WORKER_CLAUDE_MD_V8_HASH,
   WORKER_CODEX_AGENTS_MD_V1_HASH,
   GUARD_GIT_DISCARD_MJS_V1_HASH,
@@ -81,6 +82,7 @@ import {
   RESEARCHER_AGENT_MD,
   RESEARCHER_CLAUDE_SETTINGS_JSON,
   SUPERVISOR_AGENT_MD,
+  SUPERVISOR_RUN_ORCHESTRATION_SKILL,
   SUPERVISOR_AGENT_MD_V19,
   SUPERVISOR_AGENT_MD_V20,
   SUPERVISOR_AGENT_MD_V21,
@@ -3854,6 +3856,85 @@ test('WP-P0C-STALE-2. hash-guarded removal: a MODIFIED retired tree file is pres
 });
 
 // ── Runner ───────────────────────────────────────────────────────────
+const RUN_ORCHESTRATION_V5_AVAILABILITY_RULE = `> Resolve the desired lead and reviewer independently using explicit run argument → workspace
+> default → built-in default. Then consult \`availableProviders\`. Keep a desired provider when
+> it is \`available\`; keep a \`degraded\` desired provider only after stating its caveat in the
+> preflight confirmation. When a desired provider is \`unavailable\`, propose a substitute from
+> providers marked \`available\`, using task fit and the reported reasons; if no provider is
+> \`available\`, a \`degraded\` provider may be proposed with its caveat. State the desired
+> provider, preference source, substitute, and reason before spend. Never call
+> \`run_orchestration\` until the user confirms the complete effective pair. If every provider is
+> \`unavailable\`, do not launch and report the reasons. Same-provider pairs remain valid. No
+> persisted fallback order exists in v5; when one is introduced, it governs substitute ranking.`;
+
+function reconstructRunOrchestrationSkillV4(): string {
+  return SUPERVISOR_RUN_ORCHESTRATION_SKILL
+    .replace(
+      '\n\nResumes keep the original lead and reviewer. Supplying a different `lead_provider` or `reviewer_provider` on resume is rejected with 409; omit both unless restating the matching original values.',
+      '',
+    )
+    .replace('### 2. Discover IDs and preflight context', '### 2. Discover IDs')
+    .replace(
+      '\n\nBefore constructing the call, use `get_my_context` and read both `orchestrationProviderDefaults.groupthink` and `availableProviders`. Resolve each desired slot from an explicit run override, otherwise its workspace default, otherwise the built-in default (lead `claude`, reviewer `codex`). An omitted `lead_provider` or `reviewer_provider` inherits the workspace default; pass the argument only to override that default.',
+      '',
+    )
+    .replace(
+      `### 3. Resolve availability, construct, and confirm the call\n\n${RUN_ORCHESTRATION_V5_AVAILABILITY_RULE}\n\nFill in required + useful optional params. Omit provider args to inherit the workspace defaults; include either only for an intentional override, e.g.:`,
+      '### 3. Construct and confirm the call\n\nFill in required + useful optional params, e.g.:',
+    )
+    .replace("\n  lead_provider: 'agy',                 // optional explicit override", '')
+    .replace(
+      'Show the user the desired pair, each preference source (explicit, workspace default, or built-in), any availability-driven substitute and reason, and the complete effective pair alongside the constructed call. Confirm before launching anything that will burn tokens. Don\'t autonomously launch. The effective lead and reviewer may be the same provider.',
+      'Confirm with the user before launching anything that will burn tokens — show the constructed call. Don\'t autonomously launch.',
+    );
+}
+
+test('WP-B5-0. frozen v4 hash matches the pristine pre-provider-preflight body', () => {
+  const v4 = reconstructRunOrchestrationSkillV4();
+  assert.equal(sha256Hex(v4), SUPERVISOR_RUN_ORCHESTRATION_SKILL_V4_HASH);
+  assert.notEqual(sha256Hex(SUPERVISOR_RUN_ORCHESTRATION_SKILL), SUPERVISOR_RUN_ORCHESTRATION_SKILL_V4_HASH);
+});
+
+test('WP-B5-1. v5 skill carries the exact availability and provider-preflight contract', () => {
+  assert.ok(SUPERVISOR_RUN_ORCHESTRATION_SKILL.includes(RUN_ORCHESTRATION_V5_AVAILABILITY_RULE),
+    'v5 must carry the Decision 5 availability rule verbatim as a blockquote');
+  assert.ok(SUPERVISOR_RUN_ORCHESTRATION_SKILL.includes('If every provider is\n> `unavailable`, do not launch'),
+    'launch is blocked only when every provider is unavailable');
+  assert.ok(SUPERVISOR_RUN_ORCHESTRATION_SKILL.includes('a `degraded` provider may be proposed with its caveat'),
+    'degraded providers remain eligible as fallback when none are available');
+  for (const source of ['explicit', 'workspace default', 'built-in']) {
+    assert.ok(SUPERVISOR_RUN_ORCHESTRATION_SKILL.includes(source), `preflight must name the ${source} preference source`);
+  }
+  assert.ok(SUPERVISOR_RUN_ORCHESTRATION_SKILL.includes('Same-provider pairs remain valid.'),
+    'availability resolution must preserve legal same-provider pairs');
+});
+
+test('WP-B5-2. pristine v4 run-orchestration skill silently upgrades to v5', () => {
+  const workDir = mktmp('run-orchestration-v4');
+  const { supervisor, cleanup } = makeSupervisor();
+  try {
+    const skillPath = path.join(workDir, '.lares', 'supervisor', '.claude', 'skills', 'run-orchestration', 'SKILL.md');
+    fs.mkdirSync(path.dirname(skillPath), { recursive: true });
+    fs.writeFileSync(skillPath, reconstructRunOrchestrationSkillV4(), 'utf-8');
+    fs.mkdirSync(path.dirname(sidecarPath(workDir)), { recursive: true });
+    fs.writeFileSync(
+      sidecarPath(workDir),
+      JSON.stringify({ 'supervisor/.claude/skills/run-orchestration/SKILL.md': 4 }, null, 2) + '\n',
+      'utf-8',
+    );
+
+    supervisor.ensureSupervisorScaffold(workDir, 'windows');
+
+    assert.equal(fs.readFileSync(skillPath, 'utf-8'), SUPERVISOR_RUN_ORCHESTRATION_SKILL);
+    assert.equal(fs.readdirSync(path.dirname(skillPath)).filter((name) => name.startsWith('SKILL.md.bak.')).length, 0,
+      'a pristine v4 skill must upgrade without a backup');
+    assert.equal(readSidecar(workDir)['supervisor/.claude/skills/run-orchestration/SKILL.md'], 5);
+  } finally {
+    cleanup();
+    rmrf(workDir);
+  }
+});
+
 (async () => {
   let passed = 0;
   let failed = 0;
