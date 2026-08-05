@@ -78,7 +78,28 @@ function requireRoutes(routes: CommitCoordinatorRoutes | null): CommitCoordinato
 }
 
 function passthroughResult(result: Exclude<CommitCoordinatorResult, { kind: 'outcome' }>): CommitCoordinatorConsumeResponse {
-  return result;
+  if (result.kind === 'token-unresolved') {
+    return {
+      ...result,
+      refusal: {
+        stage: 'token-consume', code: 'token-unresolved-or-expired',
+        message: 'Token-consume stage refused because the candidate token is unresolved or expired.',
+      },
+    };
+  }
+  if (result.kind === 'invalid-message') {
+    return {
+      ...result,
+      refusal: { stage: 'commit', code: 'commit-message-invalid', message: `Commit stage refused: ${result.reason}` },
+    };
+  }
+  return {
+    ...result,
+    refusal: {
+      stage: 'token-consume', code: 'token-consume-busy',
+      message: 'Token-consume stage refused because another save holds the repository coordinator.',
+    },
+  };
 }
 
 /** Register the shared Save/Plan consume channel. `isCoordinatorEnabled` is read
@@ -101,7 +122,7 @@ export function registerCommitCoordinatorIpc(
     const routes = requireRoutes(getRoutes());
     const snapshot = routes.resolveCandidateToken(request.tokenId);
     if (!snapshot || snapshot.candidate.candidateId !== request.candidateId) {
-      return { kind: 'token-unresolved' } satisfies CommitCoordinatorConsumeResponse;
+      return passthroughResult({ kind: 'token-unresolved' });
     }
 
     const coordinated = await routes.coordinator.commit({
@@ -110,7 +131,24 @@ export function registerCommitCoordinatorIpc(
     });
     if (coordinated.kind !== 'outcome') return passthroughResult(coordinated);
     if (coordinated.outcome.status !== 'committed') {
-      return { kind: 'outcome', outcome: coordinated.outcome } satisfies CommitCoordinatorConsumeResponse;
+      const stale = coordinated.outcome.status === 'aborted-stale';
+      const detail = 'reason' in coordinated.outcome
+        ? coordinated.outcome.reason
+        : coordinated.outcome.status;
+      return {
+        kind: 'outcome',
+        outcome: coordinated.outcome,
+        refusal: {
+          stage: 'commit',
+          code: stale ? 'coordinator-stale' : `commit-${coordinated.outcome.status}`,
+          message: stale
+            ? `Commit stage refused because coordinator state is stale: ${detail}`
+            : `Commit stage refused: ${detail}.`,
+          ...('mismatchedPaths' in coordinated.outcome
+            ? { paths: coordinated.outcome.mismatchedPaths.map((path) => path.pathBytesBase64) }
+            : {}),
+        },
+      } satisfies CommitCoordinatorConsumeResponse;
     }
 
     const repository = routes.locateRepository(snapshot);
@@ -125,6 +163,11 @@ export function registerCommitCoordinatorIpc(
         kind: 'reconciliation-error',
         outcome: coordinated.outcome,
         error: reconciled.error,
+        refusal: {
+          stage: 'reconciliation',
+          code: reconciled.error.code,
+          message: `Reconciliation stage refused: ${reconciled.error.message}`,
+        },
       } satisfies CommitCoordinatorConsumeResponse;
     }
     return {

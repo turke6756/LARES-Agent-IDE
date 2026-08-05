@@ -50,6 +50,8 @@ import {
 import { resolvePinnedSelectionDrift } from './pinned-selection-drift';
 import type {
   CommitCandidate,
+  SaveRefusal,
+  SaveRefusalStage,
   SelectionPreview,
 } from '../../shared/commit-candidates';
 
@@ -214,6 +216,8 @@ export class SaveCardFinalizeRefusalError extends Error {
     readonly code: SaveCardFleetAdhocRefusalCode,
     readonly workspaceId: string,
     readonly workspaceTitle: string,
+    readonly stage: SaveRefusalStage = 'boundary-capture',
+    readonly paths?: string[],
   ) {
     super(message);
     this.name = 'SaveCardFinalizeRefusalError';
@@ -296,6 +300,8 @@ export function registerSaveCardFinalizeIpc(
           ok: false,
           code: error.code,
           message: error.message,
+          stage: error.stage,
+          ...(error.paths ? { paths: error.paths } : {}),
           workspaceId: error.workspaceId,
           workspaceTitle: error.workspaceTitle,
         } satisfies SaveCardFleetAdhocMarkDoneResponse;
@@ -309,7 +315,17 @@ export function registerSaveCardFinalizeIpc(
       planItemId: null,
     };
     const result = await finalizePackage(finalizeRequest, routes.finalizeDeps);
-    return toMarkDoneResponse(result.finalization, result.outcome, context.pinnedSelection);
+    const response = toMarkDoneResponse(result.finalization, result.outcome, context.pinnedSelection);
+    if (result.outcome !== 'boundary-unavailable') return response;
+    return {
+      ...response,
+      refusal: {
+        stage: 'freeze',
+        code: 'freeze-boundary-unavailable',
+        message: 'Freeze stage refused because the captured boundary could not be made durable.',
+        paths: context.members.map((member) => member.path.pathBytesBase64),
+      },
+    };
   });
 }
 
@@ -519,6 +535,14 @@ function toPreviewResponse(
     selectedUnattributedEntryIds: [...candidate.selectedUnattributedEntryIds],
     frozenMemberCount: candidate.members.length,
   };
+  const blockingDriftPaths = driftResult
+    ? [...new Set([
+        ...driftResult.drift.missing,
+        ...driftResult.drift.byteMoved,
+        ...driftResult.drift.reAttributed,
+      ])]
+    : [];
+  const refusal = candidateRefusal(candidate, isCommitCandidate(candidate), request, blockingDriftPaths);
   return {
     candidate,
     isCandidate: isCommitCandidate(candidate),
@@ -531,7 +555,44 @@ function toPreviewResponse(
     selectionDrift: driftResult?.drift ?? { added: [], missing: [], reAttributed: [], byteMoved: [] },
     selectionDriftDisplayPaths: driftResult?.displayPaths ?? {},
     pinnedSelection,
+    refusal,
   };
+}
+
+function candidateRefusal(
+  candidate: CommitCandidate | SelectionPreview,
+  candidateBacked: boolean,
+  request: SaveCardPreviewRequest | SaveCardMintRequest,
+  paths: string[],
+): SaveRefusal | null {
+  const mint = 'acknowledgeTopologyDigest' in request;
+  const stage: SaveRefusalStage = mint ? 'mint' : 'preview-verify';
+  if (!candidateBacked) {
+    return {
+      stage,
+      code: mint ? 'mint-refused' : 'preview-ineligible',
+      message: `${mint ? 'Mint' : 'Preview verification'} stage refused because the selection has no ready finalization.`,
+      ...(paths.length > 0 ? { paths } : {}),
+    };
+  }
+  if (!candidate.eligibility.eligible) {
+    const acknowledgement = candidate.eligibility.reason === 'overlap-not-acknowledged'
+      || candidate.eligibility.reason === 'unattributed-not-acknowledged';
+    return {
+      stage,
+      code: mint && acknowledgement ? 'acknowledgement-stale' : mint ? 'mint-refused' : 'preview-ineligible',
+      message: `${mint ? 'Mint' : 'Preview verification'} stage refused: ${candidate.eligibility.reason}.`,
+      ...(paths.length > 0 ? { paths } : {}),
+    };
+  }
+  if (mint && isCommitCandidate(candidate) && !candidate.token) {
+    return {
+      stage: 'mint',
+      code: 'mint-token-missing',
+      message: 'Mint stage refused because an eligible candidate did not receive a token.',
+    };
+  }
+  return null;
 }
 
 /**

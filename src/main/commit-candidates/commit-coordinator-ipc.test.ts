@@ -183,6 +183,10 @@ test('the injected flag seam alone makes an injected coordinator route reachable
   assert.deepEqual(response, {
     kind: 'outcome',
     outcome: { status: 'aborted-stale', reason: 'fresh route reached', attemptId: 'attempt-flag' },
+    refusal: {
+      stage: 'commit', code: 'coordinator-stale',
+      message: 'Commit stage refused because coordinator state is stale: fresh route reached',
+    },
   });
   assert.equal(coordinatorCalls, 1);
 });
@@ -197,7 +201,13 @@ test('candidateId must bind the token before 4D can consume it', async () => {
   const response = await ipc.invoke(COMMIT_COORDINATOR_CHANNEL, {
     candidateId: 'different-candidate', tokenId: 'token-1', message: 'Save it',
   });
-  assert.deepEqual(response, { kind: 'token-unresolved' });
+  assert.deepEqual(response, {
+    kind: 'token-unresolved',
+    refusal: {
+      stage: 'token-consume', code: 'token-unresolved-or-expired',
+      message: 'Token-consume stage refused because the candidate token is unresolved or expired.',
+    },
+  });
   assert.equal(coordinatorCalls, 0);
 });
 
@@ -290,6 +300,10 @@ test('a 4G failure is explicit and can never be mislabeled saved', async () => {
     kind: 'reconciliation-error',
     outcome: committedResult().outcome,
     error: { code: 'tree-mismatch', message: 'marked tree differs' },
+    refusal: {
+      stage: 'reconciliation', code: 'tree-mismatch',
+      message: 'Reconciliation stage refused: marked tree differs',
+    },
   });
 });
 

@@ -12,7 +12,7 @@ import type {
   SaveCardInventoryResponse,
   SaveCardPreviewResponse,
 } from '../../../shared/types';
-import type { SaveCardQuotaWeakening } from '../../../shared/commit-candidates';
+import type { SaveCardQuotaWeakening, SaveRefusalStage } from '../../../shared/commit-candidates';
 import SaveBundle, { isQuietlySaved, type WorkBundleDto } from './SaveBundle';
 import CandidatePreview, {
   type CandidatePreviewDraft,
@@ -21,6 +21,7 @@ import CandidatePreview, {
 import CommitOutcome from './CommitOutcome';
 import QuotaWeakeningBanner from './QuotaWeakeningBanner';
 import { groupExpiryEdgesByBundle, formatExpiresIn } from './save-card-expiry';
+import { coordinatorRefusal, mintRefusal, renderSaveRefusal } from './save-refusal-copy';
 import './save-card.css';
 
 // SC-WP-3H — derive the explicit WP-3G selection for a displayed group of
@@ -104,9 +105,9 @@ function PackageSaveGesture({
     if (pinning || submittingRef.current) return;
     const unsaveable = group.find((bundle) => bundle.saveability?.saveable === false);
     if (unsaveable?.saveability?.saveable === false) {
-      setGestureError(
-        `No git repository — cannot pin/commit from workspace '${unsaveable.saveability.workspaceTitle}'.`,
-      );
+      setGestureError(unsaveable.saveability.refusal
+        ? renderSaveRefusal(unsaveable.saveability.refusal)
+        : `Saveability stage refused: No git repository — cannot pin/commit from workspace '${unsaveable.saveability.workspaceTitle}'.`);
       return;
     }
     setPinning(true);
@@ -125,17 +126,22 @@ function PackageSaveGesture({
       );
       if (refusal) {
         setPins([]);
-        setGestureError(refusal.message);
+        setGestureError('stage' in refusal
+          ? renderSaveRefusal(refusal)
+          : `Boundary-capture stage refused: ${refusal.message}`);
         return;
       }
       const successful = responses as SaveCardFleetAdhocMarkDoneSuccess[];
       setPins(successful);
       setDraft(null);
       if (successful.some((response) => response.boundaryStatus !== 'ready')) {
-        setGestureError('Finalization could not capture a ready boundary. Nothing can be submitted yet.');
+        const freezeRefusal = successful.find((response) => response.refusal)?.refusal;
+        setGestureError(freezeRefusal
+          ? renderSaveRefusal(freezeRefusal)
+          : 'Freeze stage refused because finalization did not produce a ready boundary.');
       }
     } catch (err) {
-      setGestureError(errorMessage(err));
+      setGestureError(`Boundary-capture stage failed unexpectedly: ${errorMessage(err)}`);
     } finally {
       setPinning(false);
     }
@@ -148,11 +154,13 @@ function PackageSaveGesture({
     setGestureError(null);
     setOutcome(null);
     setMovedPaths([]);
+    let activeStage: SaveRefusalStage = 'preview-verify';
     try {
       const response = await window.api.saveCard.preview({
         workspaceId,
         ...selection,
       });
+      activeStage = 'mint';
       const minted = await window.api.commitCoordinator.mint({
         workspaceId,
         ...selection,
@@ -173,23 +181,24 @@ function PackageSaveGesture({
         setDetailsOpen(true);
         return;
       }
-      // A pending human acknowledgement wins over the generic no-token message:
-      // route the user to the ack gate rather than a confusing "no candidate" line.
-      // The SERVER is authoritative about whether acks are the blocker.
-      if (reason === 'overlap-not-acknowledged' || reason === 'unattributed-not-acknowledged') {
-        setGestureError('Review and acknowledge the highlighted package details before submitting.');
+      const typedMintRefusal = mintRefusal(minted);
+      if (typedMintRefusal) {
+        setGestureError(renderSaveRefusal(typedMintRefusal));
         setDetailsOpen(true);
         return;
       }
-      if (!minted.isCandidate || !minted.candidate.eligibility.eligible ||
-          !('token' in minted.candidate) || !minted.candidate.token) {
-        setMovedPaths(paths);
-        // Surface the SERVER's specific ineligibility reason when it named one; only
-        // fall back to the generic line when an eligible candidate somehow lacks a
-        // token (the honest "unknown" case).
-        setGestureError(reason
-          ? `Pinned bytes no longer qualify: ${reason}.`
-          : 'The pinned package did not produce a committable candidate.');
+      if (!minted.isCandidate) {
+        setGestureError('Unknown mint-stage refusal: the server returned a preview instead of a candidate.');
+        setDetailsOpen(true);
+        return;
+      }
+      if (!minted.candidate.eligibility.eligible) {
+        setGestureError(`Unknown mint-stage refusal: ${reason ?? 'candidate ineligible'}.`);
+        setDetailsOpen(true);
+        return;
+      }
+      if (!minted.candidate.token) {
+        setGestureError('Unknown mint-stage refusal: an eligible candidate had no token.');
         setDetailsOpen(true);
         return;
       }
@@ -198,6 +207,7 @@ function PackageSaveGesture({
         setDetailsOpen(true);
         return;
       }
+      activeStage = 'token-consume';
       const result = await window.api.commitCoordinator.commit({
         candidateId: minted.candidate.candidateId,
         tokenId: minted.candidate.token.tokenId,
@@ -207,11 +217,14 @@ function PackageSaveGesture({
         ),
       });
       setOutcome(result);
-      if (result.kind === 'outcome' && result.outcome.status === 'aborted-stale') {
-        setGestureError(result.outcome.reason);
+      if (result.kind !== 'saved') {
+        setGestureError(renderSaveRefusal(coordinatorRefusal(result)!));
       }
     } catch (err) {
-      setGestureError(errorMessage(err));
+      const label = activeStage === 'preview-verify'
+        ? 'Preview verification'
+        : activeStage === 'mint' ? 'Mint' : 'Token-consume';
+      setGestureError(`${label} stage failed unexpectedly: ${errorMessage(err)}`);
     } finally {
       submittingRef.current = false;
       setSubmitting(false);

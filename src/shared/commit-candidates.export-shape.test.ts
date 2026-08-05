@@ -28,6 +28,7 @@ import type {
   RepositoryIdentity,
   RequestedPlanBinding,
   ResolvedPlanStamp,
+  SaveRefusal,
   SelectionPreview,
   TurnCaptureState,
 } from './commit-candidates';
@@ -221,6 +222,10 @@ assert.deepEqual(PROTECTION_RUNG_ORDER, {
   'locally-committed': 2,
   'remote-reachable': 3,
 });
+const typedRefusal: SaveRefusal = {
+  stage: 'reconciliation', code: 'ledger-write-failed', message: 'Reconciliation stage refused.', paths: ['cGF0aA=='],
+};
+assert.equal(typedRefusal.stage, 'reconciliation');
 assert.equal(BUNDLE_CONTRACT_VERSION, 1);
 assert.equal(COMMIT_CANDIDATE_TOKEN_CAP_PER_REPOSITORY, 128);
 assert.equal(RETENTION_PIN_QUOTA_BYTES, 536_870_912);

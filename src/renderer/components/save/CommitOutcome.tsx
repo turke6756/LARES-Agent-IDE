@@ -1,5 +1,6 @@
 import React from 'react';
 import type { CommitCoordinatorConsumeResponse } from '../../../shared/types';
+import { coordinatorRefusal, renderSaveRefusal } from './save-refusal-copy';
 
 export type CommitOutcomeState =
   | 'saved'
@@ -60,15 +61,8 @@ function Repreview({ onRepreview }: { onRepreview?: () => void }) {
 
 function StaleRefused({ response, onRepreview }: CommitOutcomeProps) {
   const changedSinceApproval = response.kind === 'outcome' && response.outcome.status === 'aborted-stale';
-  const reason = response.kind === 'outcome' && (
-    response.outcome.status === 'aborted-stale' || response.outcome.status === 'aborted-error'
-  )
-    ? response.outcome.reason
-    : response.kind === 'invalid-message'
-      ? response.reason
-      : response.kind === 'compose-in-flight'
-        ? 'Another save is already in progress for this repository.'
-        : 'That preview is no longer available.';
+  const refusal = coordinatorRefusal(response);
+  const reason = refusal ? renderSaveRefusal(refusal) : '';
   return (
     <div className="sc-outcome sc-outcome-stale" role="status" data-testid="commit-outcome" data-state="stale-refused">
       <div className="sc-outcome-kicker">Save refused safely</div>
@@ -93,7 +87,7 @@ function IntegrityIncident({ response }: CommitOutcomeProps) {
       ? outcome.indexMismatchedPaths ?? []
       : [];
   const detail = response.kind === 'reconciliation-error'
-    ? response.error.message
+    ? renderSaveRefusal(coordinatorRefusal(response)!)
     : outcome.status === 'committed-integrity-mismatch'
       ? 'The committed tree did not match the approved package.'
       : 'Lares could not verify that the repository index was preserved exactly.';

@@ -1989,6 +1989,7 @@ export type SaveCardPackageSaveability =
       reason: 'no-repository';
       workspaceId: string;
       workspaceTitle: string;
+      refusal: import('./commit-candidates').SaveRefusal;
     };
 
 /** One renderer-safe WorkBundle DTO element returned by the read-only service. */
@@ -2151,6 +2152,9 @@ export interface SaveCardPreviewResponse {
   /** Display-only names keyed by authoritative path bytes. */
   selectionDriftDisplayPaths: Record<string, string>;
   pinnedSelection: SaveCardPinnedSelection;
+  /** Null only when this transition may advance. SelectionDrift remains a
+   * separate typed DTO and supplies path-specific evidence for this refusal. */
+  refusal: import('./commit-candidates').SaveRefusal | null;
 }
 
 export interface SaveCardMintResponse extends SaveCardPreviewResponse {}
@@ -2187,16 +2191,23 @@ export interface SaveCardFleetAdhocMarkDoneSuccess {
   boundaryStatus: 'ready' | 'unavailable' | 'pruned';
   packageRevision: number;
   pinnedSelection: SaveCardPinnedSelection;
+  /** Present only when the freeze transition could not make the boundary live. */
+  refusal?: import('./commit-candidates').SaveRefusal;
 }
 
 export type SaveCardFleetAdhocRefusalCode =
   | 'save-card-no-repository'
-  | 'save-card-unknown-workspace';
+  | 'save-card-unknown-workspace'
+  | 'boundary-capture-unavailable'
+  | 'boundary-package-empty'
+  | 'boundary-package-unknown';
 
 export interface SaveCardFleetAdhocMarkDoneRefusal {
   ok: false;
   code: SaveCardFleetAdhocRefusalCode;
   message: string;
+  stage: import('./commit-candidates').SaveRefusalStage;
+  paths?: string[];
   workspaceId: string;
   workspaceTitle: string;
 }
@@ -2242,14 +2253,15 @@ type NonCommittedCoordinatorOutcome = Exclude<
  * WP-4G has verified the marked parent/tree, persisted exact links, and evaluated
  * every frozen finalization manifest. */
 export type CommitCoordinatorConsumeResponse =
-  | { kind: 'token-unresolved' }
-  | { kind: 'invalid-message'; reason: string }
-  | { kind: 'compose-in-flight' }
-  | { kind: 'outcome'; outcome: NonCommittedCoordinatorOutcome }
+  | { kind: 'token-unresolved'; refusal: import('./commit-candidates').SaveRefusal }
+  | { kind: 'invalid-message'; reason: string; refusal: import('./commit-candidates').SaveRefusal }
+  | { kind: 'compose-in-flight'; refusal: import('./commit-candidates').SaveRefusal }
+  | { kind: 'outcome'; outcome: NonCommittedCoordinatorOutcome; refusal: import('./commit-candidates').SaveRefusal }
   | {
       kind: 'reconciliation-error';
       outcome: CommittedCoordinatorOutcome;
       error: { code: string; message: string };
+      refusal: import('./commit-candidates').SaveRefusal;
     }
   | {
       kind: 'saved';

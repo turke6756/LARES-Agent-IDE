@@ -64,15 +64,19 @@ const preview: SaveCardPreviewResponse = {
 let container: HTMLDivElement;
 let root: Root;
 
-async function renderAndCommit(response: CommitCoordinatorConsumeResponse): Promise<void> {
+async function renderAndCommit(
+  response: CommitCoordinatorConsumeResponse,
+  mintOverride?: SaveCardPreviewResponse,
+): Promise<void> {
   const commit = vi.fn(async () => response);
-  const mint = vi.fn(async () => ({
+  const tokenful = {
     ...preview,
     candidate: {
       ...preview.candidate,
       token: { tokenId: 'token-shared-1', candidateId: 'candidate-shared-1', contractVersion: 1, issuedAt: 1, expiresAt: 2 },
     },
-  }));
+  };
+  const mint = vi.fn(async () => mintOverride ?? tokenful);
   (window as unknown as { api: unknown }).api = {
     saveCard: { preview: vi.fn(async () => preview) },
     commitCoordinator: { mint, commit },
@@ -94,11 +98,13 @@ async function renderAndCommit(response: CommitCoordinatorConsumeResponse): Prom
   expect(save.disabled).toBe(false);
   await act(async () => { save.click(); });
 
-  expect(commit).toHaveBeenCalledWith({
-    candidateId: 'candidate-shared-1',
-    tokenId: 'token-shared-1',
-    message: 'Save finalized plan work',
-  });
+  if (!mintOverride) {
+    expect(commit).toHaveBeenCalledWith({
+      candidateId: 'candidate-shared-1',
+      tokenId: 'token-shared-1',
+      message: 'Save finalized plan work',
+    });
+  }
 }
 
 afterEach(() => {
@@ -108,6 +114,17 @@ afterEach(() => {
 });
 
 describe('SC-WP-4L Plan-lens commit wiring', () => {
+  it('renders a typed mint-stage refusal instead of silently returning', async () => {
+    await renderAndCommit({
+      kind: 'token-unresolved',
+      refusal: { stage: 'token-consume', code: 'unused', message: 'unused' },
+    }, {
+      ...preview,
+      refusal: { stage: 'mint', code: 'mint-refused', message: 'Mint stage refused: compose-in-flight.' },
+      candidate: { ...preview.candidate, eligibility: { eligible: false, reason: 'compose-in-flight' } },
+    });
+    expect(container.querySelector('[data-testid="plan-save-refusal"]')?.textContent).toContain('Mint stage');
+  });
   const cases: Array<[string, CommitCoordinatorConsumeResponse]> = [
     ['saved', {
       kind: 'saved',

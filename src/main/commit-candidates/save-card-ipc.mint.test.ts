@@ -186,28 +186,35 @@ async function mint(ipc: FakeIpc, req: SaveCardMintRequest): Promise<SaveCardMin
   assert.equal(response.componentTopologyDigest, request(ctx).acknowledgeTopologyDigest);
   assert.equal(service.resolveCandidateToken(minted.token!.tokenId)?.candidate.candidateId, minted.candidateId);
 
-  const stale = candidate(await mint(ipc, { ...request(ctx), acknowledgeTopologyDigest: 'stale' }));
+  const staleResponse = await mint(ipc, { ...request(ctx), acknowledgeTopologyDigest: 'stale' });
+  const stale = candidate(staleResponse);
   assert.deepEqual(stale.eligibility, { eligible: false, reason: 'overlap-not-acknowledged' });
   assert.equal(stale.token, null);
+  assert.equal(staleResponse.refusal?.stage, 'mint');
+  assert.equal(staleResponse.refusal?.code, 'acknowledgement-stale');
   const missing = candidate(await mint(ipc, { ...request(ctx), acknowledgeTopologyDigest: null }));
   assert.deepEqual(missing.eligibility, { eligible: false, reason: 'overlap-not-acknowledged' });
   assert.equal(missing.token, null);
 
   const unattributed = context(true);
   const unattributedHarness = harness(unattributed);
-  const missingAck = candidate(await mint(unattributedHarness.ipc, {
+  const missingAckResponse = await mint(unattributedHarness.ipc, {
     ...request(unattributed, true), acknowledgeUnattributedEntryIds: [],
-  }));
+  });
+  const missingAck = candidate(missingAckResponse);
   assert.deepEqual(missingAck.eligibility, { eligible: false, reason: 'unattributed-not-acknowledged' });
   assert.equal(missingAck.token, null);
+  assert.equal(missingAckResponse.refusal?.code, 'acknowledgement-stale');
 
   const locks = new ComposeLockRegistry();
   const lease = locks.tryAcquire(REPOSITORY_KEY);
   assert.ok(lease);
   const lockedHarness = harness(ctx, locks);
-  const locked = candidate(await mint(lockedHarness.ipc, request(ctx)));
+  const lockedResponse = await mint(lockedHarness.ipc, request(ctx));
+  const locked = candidate(lockedResponse);
   assert.deepEqual(locked.eligibility, { eligible: false, reason: 'compose-in-flight' });
   assert.equal(locked.token, null);
+  assert.equal(lockedResponse.refusal?.code, 'mint-refused');
   lease!.release();
 
   await assert.rejects(

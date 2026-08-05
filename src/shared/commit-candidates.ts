@@ -6,6 +6,25 @@ export interface RepositoryIdentity {
   workspaces: Array<{ workspaceId: string; workspacePrefix: string }>;
 }
 
+export type SaveRefusalStage =
+  | 'saveability'
+  | 'boundary-capture'
+  | 'freeze'
+  | 'preview-verify'
+  | 'mint'
+  | 'token-consume'
+  | 'commit'
+  | 'reconciliation';
+
+/** Renderer-safe, pipeline-wide refusal. `paths` contains authoritative Git
+ * path bytes (base64), never renderer-derived membership. */
+export interface SaveRefusal {
+  stage: SaveRefusalStage;
+  code: string;
+  message: string;
+  paths?: string[];
+}
+
 export interface EncodedGitPath {
   pathBytesBase64: string;
   displayPath: string;

@@ -14,6 +14,7 @@ import FileHistoryView from '../checkpoints/FileHistoryView';
 import RestoreDialog from '../checkpoints/RestoreDialog';
 import CandidatePreview, { type CandidatePreviewSelection } from '../save/CandidatePreview';
 import CommitOutcome from '../save/CommitOutcome';
+import { coordinatorRefusal, mintRefusal, renderSaveRefusal } from '../save/save-refusal-copy';
 import WorkPackageCard, { type WorkPackageFileSelection } from './WorkPackageCard';
 import './missionBoard.css';
 
@@ -97,6 +98,7 @@ export default function MissionBoard({
   const [actionError, setActionError] = useState<string | null>(null);
   const [commitSelection, setCommitSelection] = useState<CommitSelection | null>(null);
   const [commitOutcome, setCommitOutcome] = useState<CommitCoordinatorConsumeResponse | null>(null);
+  const [commitRefusal, setCommitRefusal] = useState<string | null>(null);
 
   const cardRevisionKey = useMemo(
     () => cards.map((card) => `${card.packageId}:${card.revision}:${card.state}`).join('|'),
@@ -106,6 +108,7 @@ export default function MissionBoard({
   useEffect(() => {
     setCommitSelection(null);
     setCommitOutcome(null);
+    setCommitRefusal(null);
     setActionError(null);
   }, [planId]);
 
@@ -224,23 +227,41 @@ export default function MissionBoard({
             title={`Commit ${commitSelection.packageId}`}
             onClose={() => setCommitSelection(null)}
             onCommit={async (response, messageBody, acknowledgedUnattributedEntryIds) => {
-              const minted = await window.api.commitCoordinator.mint({
+              let stage: 'mint' | 'token-consume' = 'mint';
+              try {
+                const minted = await window.api.commitCoordinator.mint({
                 workspaceId: commitSelection.workspaceId,
                 ...commitSelection.selection,
                 acknowledgeTopologyDigest: response.componentTopologyDigest,
                 acknowledgeUnattributedEntryIds: acknowledgedUnattributedEntryIds,
               });
-              if (!minted.isCandidate || !('token' in minted.candidate) || !minted.candidate.token) return;
-              const result = await window.api.commitCoordinator.commit({
+                const typedMintRefusal = mintRefusal(minted);
+                if (typedMintRefusal) {
+                  setCommitRefusal(renderSaveRefusal(typedMintRefusal));
+                  return;
+                }
+                if (!minted.isCandidate || !minted.candidate.eligibility.eligible || !minted.candidate.token) {
+                  setCommitRefusal('Unknown mint-stage refusal: the server omitted its typed refusal.');
+                  return;
+                }
+                stage = 'token-consume';
+                const result = await window.api.commitCoordinator.commit({
                 candidateId: minted.candidate.candidateId,
                 tokenId: minted.candidate.token.tokenId,
                 message: messageBody,
               });
-              setCommitOutcome(result);
+                const typedCoordinatorRefusal = coordinatorRefusal(result);
+                setCommitRefusal(typedCoordinatorRefusal ? renderSaveRefusal(typedCoordinatorRefusal) : null);
+                setCommitOutcome(result);
+              } catch (error) {
+                const detail = error instanceof Error ? error.message : String(error);
+                setCommitRefusal(`${stage === 'mint' ? 'Mint' : 'Token-consume'} stage failed unexpectedly: ${detail}`);
+              }
             }}
           />
         </div>
       )}
+      {commitRefusal && <div role="alert" data-testid="board-save-refusal">{commitRefusal}</div>}
       {commitOutcome && (
         <CommitOutcome
           response={commitOutcome}

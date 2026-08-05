@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import './planSurface.css';
 import CandidatePreview, { type CandidatePreviewSelection } from '../save/CandidatePreview';
 import CommitOutcome from '../save/CommitOutcome';
+import { coordinatorRefusal, mintRefusal, renderSaveRefusal } from '../save/save-refusal-copy';
 import type { CommitCoordinatorConsumeResponse, PlanReviewProjection } from '../../../shared/types';
 import { useDashboardStore } from '../../stores/dashboard-store';
 import MissionBoard from './MissionBoard';
@@ -18,6 +19,7 @@ function PlanSurfaceView({
   candidateSelection?: CandidatePreviewSelection | null;
 }): React.ReactElement {
   const [commitOutcome, setCommitOutcome] = useState<CommitCoordinatorConsumeResponse | null>(null);
+  const [commitRefusal, setCommitRefusal] = useState<string | null>(null);
   const [viewMode, setViewMode] = useState<'review' | 'packages'>('review');
   const [reviewProjection, setReviewProjection] = useState<PlanReviewProjection | null>(null);
   const [reviewError, setReviewError] = useState<string | null>(null);
@@ -49,7 +51,7 @@ function PlanSurfaceView({
     return () => { active = false; };
   }, [activePlanId, workspaceId]);
 
-  useEffect(() => { setCommitOutcome(null); }, [workspaceId, candidateSelection]);
+  useEffect(() => { setCommitOutcome(null); setCommitRefusal(null); }, [workspaceId, candidateSelection]);
 
   return (
     <div className="plan-surface" data-testid="plan-surface">
@@ -60,23 +62,41 @@ function PlanSurfaceView({
             selection={candidateSelection}
             title="Save this plan's work"
             onCommit={async (response, messageBody, acknowledgedUnattributedEntryIds) => {
-              const minted = await window.api.commitCoordinator.mint({
+              let stage: 'mint' | 'token-consume' = 'mint';
+              try {
+                const minted = await window.api.commitCoordinator.mint({
                 workspaceId,
                 ...candidateSelection,
                 acknowledgeTopologyDigest: response.componentTopologyDigest,
                 acknowledgeUnattributedEntryIds: acknowledgedUnattributedEntryIds,
               });
-              if (!minted.isCandidate || !('token' in minted.candidate) || !minted.candidate.token) return;
-              const result = await window.api.commitCoordinator.commit({
+                const typedMintRefusal = mintRefusal(minted);
+                if (typedMintRefusal) {
+                  setCommitRefusal(renderSaveRefusal(typedMintRefusal));
+                  return;
+                }
+                if (!minted.isCandidate || !minted.candidate.eligibility.eligible || !minted.candidate.token) {
+                  setCommitRefusal('Unknown mint-stage refusal: the server omitted its typed refusal.');
+                  return;
+                }
+                stage = 'token-consume';
+                const result = await window.api.commitCoordinator.commit({
                 candidateId: minted.candidate.candidateId,
                 tokenId: minted.candidate.token.tokenId,
                 message: messageBody,
               });
-              setCommitOutcome(result);
+                const typedCoordinatorRefusal = coordinatorRefusal(result);
+                setCommitRefusal(typedCoordinatorRefusal ? renderSaveRefusal(typedCoordinatorRefusal) : null);
+                setCommitOutcome(result);
+              } catch (error) {
+                const detail = error instanceof Error ? error.message : String(error);
+                setCommitRefusal(`${stage === 'mint' ? 'Mint' : 'Token-consume'} stage failed unexpectedly: ${detail}`);
+              }
             }}
           />
         </div>
       )}
+      {commitRefusal && <div role="alert" data-testid="plan-save-refusal">{commitRefusal}</div>}
       {commitOutcome && <CommitOutcome response={commitOutcome} onRepreview={() => setCommitOutcome(null)} />}
       <div className="plan-surface__viewtoggle" role="tablist" aria-label="Plan view" data-testid="plan-view-toggle">
         <button

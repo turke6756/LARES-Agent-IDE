@@ -142,6 +142,18 @@ afterEach(() => {
 });
 
 describe('WP-P6D board done + commit integration', () => {
+  it('renders a typed mint-stage refusal instead of silently returning', async () => {
+    await renderBoard('done');
+    (window.api.commitCoordinator.mint as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ...savePreview,
+      refusal: { stage: 'mint', code: 'acknowledgement-stale', message: 'Mint stage refused.' },
+      candidate: { ...savePreview.candidate, eligibility: { eligible: false, reason: 'overlap-not-acknowledged' } },
+    });
+    await click('[data-testid="commit-package-WP-P6D"]');
+    await click('[data-testid="candidate-preview-save"]');
+    expect(container!.querySelector('[data-testid="board-save-refusal"]')?.textContent).toContain('Mint stage');
+    expect(commit).not.toHaveBeenCalled();
+  });
   it('routes done only through SC-WP-3D and never infers it from live activity', async () => {
     await renderBoard('executing');
     const cardElement = container!.querySelector('[data-testid="work-package-card-WP-P6D"]')!;

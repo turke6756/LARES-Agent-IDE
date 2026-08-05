@@ -215,6 +215,10 @@ test('unfinalized selection yields a previewable, never-committable SelectionPre
   assert.equal(preview.eligibility.eligible, false);
   assert.equal(preview.members.length, 1);
   assert.equal(preview.members[0].packageVerification, 'package-not-finalized');
+  assert.deepEqual(response.refusal, {
+    stage: 'preview-verify', code: 'preview-ineligible',
+    message: 'Preview verification stage refused because the selection has no ready finalization.',
+  });
   // Server-derived read-only trailers from the immutable snapshot: turns + plan.
   assert.deepEqual(response.laresTrailers, ['Lares-Turns: 2', 'Lares-Plan: plan-A']);
 });
@@ -246,6 +250,7 @@ test('finalization-backed, verified selection yields an eligible CommitCandidate
   ]);
   assert.equal(response.requiresOverlapAck, false);
   assert.deepEqual(response.unacknowledgedUnattributedEntryIds, []);
+  assert.equal(response.refusal, null);
 });
 
 test('overlap component + selected unattributed entry surface the acknowledgement gates', async () => {
@@ -300,6 +305,7 @@ test('an otherwise-eligible production-shaped preview remains tokenless', async 
   const candidate = response.candidate as CommitCandidate;
   assert.equal(candidate.eligibility.eligible, true);
   assert.equal(candidate.token, null);
+  assert.equal(response.refusal, null);
 });
 
 (async () => {

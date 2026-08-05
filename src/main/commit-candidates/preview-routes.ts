@@ -236,6 +236,7 @@ export function createPreviewRoutes(deps: PreviewRoutesDeps): {
         'save-card-unknown-workspace',
         workspaceId,
         workspaceId,
+        'saveability',
       );
     }
     const workspaces: CandidateWorkspaceInput[] = await Promise.all(
@@ -262,6 +263,7 @@ export function createPreviewRoutes(deps: PreviewRoutesDeps): {
         'save-card-unknown-workspace',
         workspaceId,
         workspaceRow.title ?? workspaceId,
+        'saveability',
       );
     }
     const repoRoot = target.capability.repoRoot;
@@ -272,6 +274,7 @@ export function createPreviewRoutes(deps: PreviewRoutesDeps): {
         'save-card-no-repository',
         workspaceId,
         workspaceTitle,
+        'saveability',
       );
     }
 
@@ -633,7 +636,12 @@ export function createPreviewRoutes(deps: PreviewRoutesDeps): {
     targetWorkspaceId: string,
   ): Promise<FleetAdhocBoundaryContext> {
     if (!deps.captureFinalizationBoundary) {
-      throw new Error('checkpoint boundary capture is unavailable');
+      throw new SaveCardFinalizeRefusalError(
+        'Boundary-capture stage refused because checkpoint capture is unavailable.',
+        'boundary-capture-unavailable',
+        targetWorkspaceId,
+        targetWorkspaceId,
+      );
     }
     const scope = await assembleScope(targetWorkspaceId);
     const repository = scope.context.repository;
@@ -646,7 +654,14 @@ export function createPreviewRoutes(deps: PreviewRoutesDeps): {
       : packageId === `unattributed:${repository.repositoryKey}`
         ? scope.context.inventory.unattributedEntryIds
         : null;
-    if (!entryIds) throw new Error(`unknown fleet-adhoc package: ${packageId}`);
+    if (!entryIds) {
+      throw new SaveCardFinalizeRefusalError(
+        `Boundary-capture stage refused because the fleet-adhoc package is unknown: ${packageId}.`,
+        'boundary-package-unknown',
+        targetWorkspaceId,
+        targetWorkspaceId,
+      );
+    }
     const entriesById = new Map(scope.context.inventory.entries.map((entry) => [entry.entryId, entry]));
     const members = entryIds
       .map((entryId) => entriesById.get(entryId))
@@ -657,7 +672,14 @@ export function createPreviewRoutes(deps: PreviewRoutesDeps): {
         expectedWorktreeState: entry.expectedWorktreeState,
         rawWorktreeBlobOid: entry.rawWorktreeBlobOid,
       }));
-    if (members.length === 0) throw new Error(`package has no dirty members: ${packageId}`);
+    if (members.length === 0) {
+      throw new SaveCardFinalizeRefusalError(
+        `Boundary-capture stage refused because the package has no dirty members: ${packageId}.`,
+        'boundary-package-empty',
+        targetWorkspaceId,
+        targetWorkspaceId,
+      );
+    }
     const boundary = await deps.captureFinalizationBoundary(
       targetWorkspaceId,
       `lares:finalization:${packageId}`,

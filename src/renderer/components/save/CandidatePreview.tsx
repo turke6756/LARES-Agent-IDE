@@ -6,6 +6,7 @@ import type {
   PackageVerificationState,
 } from '../../../shared/commit-candidates';
 import { useSaveCardStore } from '../../stores/save-card-store';
+import { renderSaveRefusal } from './save-refusal-copy';
 
 // SC-WP-3H — Save-lens candidate preview pane.
 //
@@ -143,7 +144,7 @@ export default function CandidatePreview({
         setOverlapAck(false);
         setUnattributedAcks(new Set());
       } catch (err) {
-        if (isCurrent()) setState({ status: 'error', message: errorMessage(err) });
+        if (isCurrent()) setState({ status: 'error', message: `Preview verification stage failed unexpectedly: ${errorMessage(err)}` });
       }
     },
     [request],
@@ -375,9 +376,9 @@ export default function CandidatePreview({
         {showCommitAction && !canSave && !reservedTrailer && (
           <span className="sc-why" data-testid="candidate-preview-why">
             {!response.isCandidate || !eligible
-              ? (candidate.eligibility.eligible === false
-                  ? REASON_LABEL[candidate.eligibility.reason]
-                  : 'Preview only — not finalized.')
+              ? (response.refusal
+                  ? renderSaveRefusal(response.refusal)
+                  : 'Unknown preview-verification refusal.')
               : 'Acknowledge the highlighted items to save.'}
           </span>
         )}

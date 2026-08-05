@@ -303,6 +303,36 @@ test('fleet-adhoc resolver captures and returns the checkpoint engine boundary O
   assert.equal(context.members[0].path.pathBytesBase64, b64('e1'));
 });
 
+test('fleet-adhoc boundary-capture gates reject with typed stage and stable codes', async () => {
+  const unavailable = createPreviewRoutes(baseDeps()).saveCardFinalizeRoutes;
+  await assert.rejects(
+    () => unavailable.resolveBoundary({ packageId: 'component:c1', targetWorkspaceId: 'ws-1' }),
+    (error: unknown) => error instanceof Error
+      && (error as Error & { stage?: string; code?: string }).stage === 'boundary-capture'
+      && (error as Error & { code?: string }).code === 'boundary-capture-unavailable',
+  );
+
+  const captured = async () => ({ oid: 'c'.repeat(40), treeOid: 'd'.repeat(40) });
+  const unknown = createPreviewRoutes(baseDeps({ captureFinalizationBoundary: captured })).saveCardFinalizeRoutes;
+  await assert.rejects(
+    () => unknown.resolveBoundary({ packageId: 'component:missing', targetWorkspaceId: 'ws-1' }),
+    (error: unknown) => error instanceof Error
+      && (error as Error & { stage?: string; code?: string }).stage === 'boundary-capture'
+      && (error as Error & { code?: string }).code === 'boundary-package-unknown',
+  );
+
+  const empty = createPreviewRoutes(baseDeps({
+    captureFinalizationBoundary: captured,
+    assembleInventory: async () => read({ inventory: inventory([]), components: [component('c1', ['missing'])] }),
+  })).saveCardFinalizeRoutes;
+  await assert.rejects(
+    () => empty.resolveBoundary({ packageId: 'component:c1', targetWorkspaceId: 'ws-1' }),
+    (error: unknown) => error instanceof Error
+      && (error as Error & { stage?: string; code?: string }).stage === 'boundary-capture'
+      && (error as Error & { code?: string }).code === 'boundary-package-empty',
+  );
+});
+
 test('fleet-adhoc resolver identifies a fake no-repo workspace as a typed refusal cause', async () => {
   const noRepo = capability();
   noRepo.repoState = 'non-repo';

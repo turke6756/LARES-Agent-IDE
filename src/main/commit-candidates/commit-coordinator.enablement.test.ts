@@ -58,7 +58,13 @@ async function run(): Promise<void> {
   enabled = true;
   assert.deepEqual(
     await ipc.invoke(COMMIT_COORDINATOR_CHANNEL, request),
-    { kind: 'token-unresolved' },
+    {
+      kind: 'token-unresolved',
+      refusal: {
+        stage: 'token-consume', code: 'token-unresolved-or-expired',
+        message: 'Token-consume stage refused because the candidate token is unresolved or expired.',
+      },
+    },
   );
   assert.equal(routeReads, 1, 'the same direct IPC route is reachable through the enabled seam');
 }

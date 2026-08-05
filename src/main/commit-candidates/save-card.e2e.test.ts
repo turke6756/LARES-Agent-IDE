@@ -455,7 +455,13 @@ function gitBytes(exe: string, repo: string, args: string[]): Buffer {
       const expired = await ipc.invoke<CommitCoordinatorConsumeResponse>(COMMIT_COORDINATOR_CHANNEL, {
         candidateId: expiryCandidate.candidateId, tokenId: expiryCandidate.token!.tokenId, message: 'Expired',
       });
-      assert.deepEqual(expired, { kind: 'token-unresolved' });
+      assert.deepEqual(expired, {
+        kind: 'token-unresolved',
+        refusal: {
+          stage: 'token-consume', code: 'token-unresolved-or-expired',
+          message: 'Token-consume stage refused because the candidate token is unresolved or expired.',
+        },
+      });
     } finally {
       Date.now = realNow;
     }
@@ -488,6 +494,7 @@ function gitBytes(exe: string, repo: string, args: string[]): Buffer {
     });
     assert.equal(hookRefusal.kind, 'outcome');
     assert.equal(hookRefusal.kind === 'outcome' ? hookRefusal.outcome.status : null, 'aborted-error');
+    assert.equal(hookRefusal.kind === 'outcome' ? hookRefusal.refusal.stage : null, 'commit');
     assert.equal(git(gitExe, repo, ['rev-parse', 'HEAD']), headBeforeHook);
 
     console.log('All save-card production-shaped e2e tests passed');

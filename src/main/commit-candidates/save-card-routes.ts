@@ -143,6 +143,11 @@ function attachBundleIdentity(
           reason: 'no-repository',
           workspaceId: targetWorkspaceId,
           workspaceTitle: workspaceTitleById.get(targetWorkspaceId) ?? targetWorkspaceId,
+          refusal: {
+            stage: 'saveability',
+            code: 'save-card-no-repository',
+            message: `Saveability stage refused because workspace '${workspaceTitleById.get(targetWorkspaceId) ?? targetWorkspaceId}' has no Git repository.`,
+          },
         }
       : { saveable: true };
 

@@ -193,6 +193,8 @@ test('a boundary-unavailable outcome still surfaces the ref it could not pin', a
   assert.equal(res.finalizationKind, 'fleet-adhoc');
   assert.equal(res.outcome, 'boundary-unavailable');
   assert.equal(res.boundaryStatus, 'unavailable');
+  assert.equal(res.refusal?.stage, 'freeze');
+  assert.equal(res.refusal?.code, 'freeze-boundary-unavailable');
   // Even when the pin fails, boundary_ref is captured (the ref it failed to create).
   assert.equal(res.boundaryRef, finalizationRef('pkg-fleet', 1));
 });
@@ -241,6 +243,7 @@ test('a no-repository boundary failure returns a typed refusal and never finaliz
         'save-card-no-repository',
         '54ad9887',
         'Computer Root',
+        'saveability',
       );
     },
     finalizeDeps: {
@@ -260,6 +263,7 @@ test('a no-repository boundary failure returns a typed refusal and never finaliz
     ok: false,
     code: 'save-card-no-repository',
     message: "No git repository — cannot pin/commit from workspace 'Computer Root'.",
+    stage: 'saveability',
     workspaceId: '54ad9887',
     workspaceTitle: 'Computer Root',
   });
@@ -275,6 +279,7 @@ test('an unknown workspace boundary failure is also returned as a typed refusal'
         'save-card-unknown-workspace',
         'missing-ws',
         'missing-ws',
+        'saveability',
       );
     },
   }));
@@ -285,6 +290,7 @@ test('an unknown workspace boundary failure is also returned as a typed refusal'
       ok: false,
       code: 'save-card-unknown-workspace',
       message: 'Cannot pin this package because it references an unknown workspace: missing-ws.',
+      stage: 'saveability',
       workspaceId: 'missing-ws',
       workspaceTitle: 'missing-ws',
     },
