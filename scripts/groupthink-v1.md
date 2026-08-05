@@ -53,7 +53,7 @@ node scripts/groupthink-v1.js `
 
 | Flag | Default | Description |
 |---|---|---|
-| `--leadProvider` | `claude` | Provider for the Lead agent (the writer of record). Choices: `claude`, `codex`, `gemini`. |
+| `--leadProvider` | `claude` | Provider for the Lead agent (the writer of record). Choices: `claude`, `codex`, `grok`, `agy`. |
 | `--reviewerProvider` | `codex` | Provider for the Reviewer. Cross-provider is the recommended default. |
 | `--keepAgents` | (unset) | If set, leaves both planners alive after success. Default behavior is to clean them up. |
 

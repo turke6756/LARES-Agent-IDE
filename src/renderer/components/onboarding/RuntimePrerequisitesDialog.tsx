@@ -11,8 +11,8 @@ import GitInitConsent from './GitInitConsent';
  *  Everything about the copy here is aimed at that person.
  *
  *  Three rules the copy must keep:
- *  1. Claude / Codex / Gemini are listed INDEPENDENTLY and the lead says "at
- *     least one". Nothing may imply all three are needed.
+ *  1. Launchable providers are listed independently and the lead says "at
+ *     least one". Nothing may imply every CLI is needed.
  *  2. Git, Python and an external Node sit under "Optional" with an explicit
  *     "none of these stop Lares from working" note. A missing Git must never
  *     read as "the app is incomplete".

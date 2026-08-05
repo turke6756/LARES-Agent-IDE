@@ -349,6 +349,10 @@ async function main() {
     ? parsedTurnTimeout
     : 600000;
 
+  if (args.leadProvider === 'gemini' || args.reviewerProvider === 'gemini') {
+    throw new Error('Gemini provider discontinued; use Antigravity (agy). Historical Gemini agents remain readable.');
+  }
+
   if (!workspaceId || !supervisorId) {
     console.error("Usage: groupthink.js --workspaceId=<id> --supervisorId=<id> [--topic=<topic>] [--planPath=<path>] [--turn-timeout-ms=<ms>] [--api-host=<host>] [--api-port=<port>]");
     process.exit(1);

@@ -274,7 +274,7 @@ export function registerIpcHandlers(
       const reportedStatus = supervisor.isInputInFlight(agentId) ? 'receiving' : agent.status;
       throw new Error(`Agent is "${reportedStatus}" — wait until it's idle before sending.`);
     }
-    // Fire-and-forget: the Windows codex/gemini path types one char at a time
+    // Fire-and-forget: the Windows codex path types incrementally
     // to dodge paste-burst, so multi-KB sends take 30+ seconds. Returning the
     // delivery promise here would freeze the chat input UI for that whole
     // window. WP8 — the eventual three-state SendOutcome is surfaced to the

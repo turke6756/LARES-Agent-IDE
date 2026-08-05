@@ -446,7 +446,7 @@ test('claude with a resumeSessionId but no jsonl on disk → revive-no-session (
   assert.equal((res as { code?: string }).code, 'revive-no-session');
 }));
 
-test('gemini → revive-unsupported-provider (422), message names supported providers', () => withHarness(async (h) => {
+test('gemini → discontinued-provider rejection (422) while the historical row remains readable', () => withHarness(async (h) => {
   const agent = terminalWorker(h.workspacePath, { provider: 'gemini' });
   h.agents.push(agent);
   let caught: { code?: string; statusCode?: number; message?: string } | null = null;
@@ -455,8 +455,9 @@ test('gemini → revive-unsupported-provider (422), message names supported prov
   assert.ok(caught, 'gemini revival throws');
   assert.equal(caught!.code, 'revive-unsupported-provider');
   assert.equal(caught!.statusCode, 422);
-  assert.ok(/claude/.test(caught!.message ?? '') && /codex/.test(caught!.message ?? ''),
-    'the error names the supported providers');
+  assert.match(caught!.message ?? '', /Gemini provider discontinued/);
+  assert.match(caught!.message ?? '', /historical agents remain readable/);
+  assert.equal(h.agents.find((candidate) => candidate.id === agent.id)?.provider, 'gemini');
 }));
 
 test('grok → revive-unsupported-provider (422), message names grok as not-yet-session-mapped', () => withHarness(async (h) => {
@@ -468,8 +469,7 @@ test('grok → revive-unsupported-provider (422), message names grok as not-yet-
   assert.ok(caught, 'grok revival throws');
   assert.equal(caught!.code, 'revive-unsupported-provider');
   assert.equal(caught!.statusCode, 422);
-  // Regression (plan §1.7): grok falls into the same default: branch as gemini,
-  // and the message now names grok explicitly so the copy is not misleading.
+  // Regression (plan §1.7): the default branch names grok explicitly.
   assert.ok(/grok/.test(caught!.message ?? ''), 'the error names grok');
   assert.ok(/claude/.test(caught!.message ?? '') && /codex/.test(caught!.message ?? ''),
     'the error still names the supported providers');
@@ -484,7 +484,7 @@ test('agy → revive-unsupported-provider (422), message names agy as not-yet-se
   assert.ok(caught, 'agy revival throws');
   assert.equal(caught!.code, 'revive-unsupported-provider');
   assert.equal(caught!.statusCode, 422);
-  assert.match(caught!.message ?? '', /gemini, grok and agy are not yet session-mapped/);
+  assert.match(caught!.message ?? '', /grok and agy are not yet session-mapped/);
 }));
 
 test('agy revive boundary rejects before synthesizing any cwd-based session identity', () => withHarness(async (h) => {
@@ -499,7 +499,7 @@ test('agy revive boundary rejects before synthesizing any cwd-based session iden
   try { await h.supervisor.reviveAgent(agent.id, {}); }
   catch (err) { caught = err as { code?: string; message?: string }; }
   assert.equal(caught?.code, 'revive-unsupported-provider');
-  assert.equal(caught?.message, 'revive supports: claude, codex; gemini, grok and agy are not yet session-mapped');
+  assert.equal(caught?.message, 'revive supports: claude, codex; grok and agy are not yet session-mapped');
   assert.equal(codexResolveCalls, 0, 'agy must never be routed through codex cwd/session discovery');
 }));
 

@@ -109,20 +109,6 @@ test('WSL codex: raw paste — no bracketed-paste flag, no per-line send-keys', 
     `body text must not appear in the command string; got: ${input.cmd}`);
 });
 
-test('WSL gemini: submit=true appends the kitty Enter', () => {
-  const input = buildTmuxSendInputCmd(SESSION, BODY, 'gemini', true);
-  assert.ok(input, 'expected a command');
-  assert.ok(input.cmd.includes(TMUX_KITTY_ENTER_HEX),
-    `gemini submit=true cmd should include kitty Enter; got: ${input.cmd}`);
-});
-
-test('WSL gemini: submit=false omits the kitty Enter', () => {
-  const input = buildTmuxSendInputCmd(SESSION, BODY, 'gemini', false);
-  assert.ok(input, 'expected a command (body must still be pasted)');
-  assert.ok(!input.cmd.includes(TMUX_KITTY_ENTER_HEX),
-    `gemini submit=false cmd should NOT include kitty Enter; got: ${input.cmd}`);
-});
-
 test('WSL codex: submit=true with empty body still sends Enter (submit-only)', () => {
   const input = buildTmuxSendInputCmd(SESSION, '', 'codex', true);
   assert.ok(input, 'expected a command');
@@ -147,7 +133,7 @@ test('WSL: command length is constant regardless of payload size (length-safety)
   const draft = Array.from({ length: 312 }, (_, i) =>
     `## Section ${i}: some draft text with 'quotes', $vars, \`backticks\` and unicode R² → ρ`).join('\n');
   assert.ok(draft.length > 20000, 'fixture should exceed 20 KB');
-  for (const provider of ['claude', 'codex', 'gemini'] as const) {
+  for (const provider of ['claude', 'codex'] as const) {
     const input = buildTmuxSendInputCmd(SESSION, draft, provider, true);
     assert.ok(input, 'expected a command');
     assert.ok(input.cmd.length < 512,
@@ -208,14 +194,7 @@ test('Windows codex submit sequence is VK_RETURN down+up pair', () => {
   );
 });
 
-test('Windows gemini submit sequence is VK_RETURN down+up pair', () => {
-  assert.equal(
-    getWindowsSubmitSequence('gemini'),
-    WIN32_KEY_ENTER_DOWN + WIN32_KEY_ENTER_UP,
-  );
-});
-
-test('Windows grok submit sequence is CR (matches Claude-on-Windows, not codex/gemini Win32)', () => {
+test('Windows grok submit sequence is CR (matches Claude-on-Windows, not codex Win32)', () => {
   // Source-verified: grok submits on a bare crossterm KeyCode::Enter/NONE over
   // ConPTY (grok-phase0-probe-results.md §0.1). Explicitly listed, not the CR
   // fall-through — and must equal the claude sequence, never the Win32 pair.

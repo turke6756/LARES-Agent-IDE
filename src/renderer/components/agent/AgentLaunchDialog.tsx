@@ -1,10 +1,12 @@
 import React, { useState, useEffect, useRef } from 'react';
-import type { AgentPersona, AgentProvider, AgentTemplate, PersonaLane, Workspace } from '../../../shared/types';
+import type { AgentPersona, AgentTemplate, LaunchableAgentProvider, PersonaLane, Workspace } from '../../../shared/types';
 import { PROVIDER_COMMANDS, PROVIDER_META, PROVIDER_INSTALL_HINTS } from '../../../shared/constants';
 import { useDashboardStore } from '../../stores/dashboard-store';
 import { useBrowserSuspension } from '../browser/useBrowserSuspension';
 
-const PROVIDERS: AgentProvider[] = ['claude', 'gemini', 'codex', 'grok', 'agy'];
+const PROVIDERS: LaunchableAgentProvider[] = ['claude', 'codex', 'grok', 'agy'];
+const isLaunchableProvider = (provider: string): provider is LaunchableAgentProvider =>
+  PROVIDERS.includes(provider as LaunchableAgentProvider);
 
 // Single "Agent type" selector values. The first three are first-class role
 // lanes (app-managed cwd + scaffold under .lares/); personas are custom
@@ -33,7 +35,7 @@ export default function AgentLaunchDialog({ workspace, onClose }: Props) {
   const [title, setTitle] = useState('');
   const [roleDescription, setRoleDescription] = useState('');
   const [workingDirectory, setWorkingDirectory] = useState(workspace.path);
-  const [provider, setProvider] = useState<AgentProvider>('claude');
+  const [provider, setProvider] = useState<LaunchableAgentProvider>('claude');
   const [command, setCommand] = useState(PROVIDER_COMMANDS.claude[workspace.pathType]);
   const [autoRestart, setAutoRestart] = useState(true);
   // Both workers and researchers launch UNSUPERVISED by default. `null` = no
@@ -93,13 +95,14 @@ export default function AgentLaunchDialog({ workspace, onClose }: Props) {
   const availableSupervisors = agents.filter(
     (a) => (a.isSupervisor || a.privilegeLane === 'supervisor') && !['done', 'crashed'].includes(a.status),
   );
-  // The "Supervised by" dropdown applies to the two supervisable lanes: workers
-  // (non-gemini — gemini has no hook scaffold) and researchers.
-  const showSupervisorPicker = (isWorkerType && provider !== 'gemini') || isResearcherType;
+  // The "Supervised by" dropdown applies to the two supervisable lanes.
+  const showSupervisorPicker = isWorkerType || isResearcherType;
 
   // Load templates and personas on mount
   useEffect(() => {
-    window.api.templates.list(workspace.id).then(setTemplates).catch(console.error);
+    window.api.templates.list(workspace.id)
+      .then((list) => setTemplates(list.filter((template) => isLaunchableProvider(template.provider))))
+      .catch(console.error);
     window.api.personas.list(workspace.path, workspace.pathType).then(list => {
       // Filter out supervisor — it's a role-lane option, not a custom agent.
       setPersonas(list.filter(p => !p.isSupervisor));
@@ -120,7 +123,7 @@ export default function AgentLaunchDialog({ workspace, onClose }: Props) {
       const template = templates.find(t => t.id === templateId);
       if (!template) return;
       if (template.roleDescription) setRoleDescription(template.roleDescription);
-      if (template.provider) {
+      if (template.provider && isLaunchableProvider(template.provider)) {
         setProvider(template.provider);
         setCommand(template.command || PROVIDER_COMMANDS[template.provider][workspace.pathType]);
       }
@@ -241,18 +244,17 @@ export default function AgentLaunchDialog({ workspace, onClose }: Props) {
         };
       } else if (isWorkerType) {
         // Worker role-lane → .lares/workers/<provider>/, ensureWorkerScaffold.
-        // Hook-based status; gemini has no hook scaffold so it never joins the
-        // lane (and can't be supervised). Unsupervised by default — the user
+        // Hook-based status. Unsupervised by default — the user
         // opts into supervision via the "Supervised by" dropdown, which also
         // sets the owner edge.
-        const ownerId = provider !== 'gemini' ? await resolveOwnerId() : null;
+        const ownerId = await resolveOwnerId();
         launchInput = {
           ...base,
           workingDirectory: workspace.path,
           command: command.trim(),
           provider,
-          isWorker: provider !== 'gemini',
-          isSupervised: ownerId != null && provider !== 'gemini',
+          isWorker: true,
+          isSupervised: ownerId != null,
           ownerAgentId: ownerId ?? undefined,
         };
       } else if (isNewAgent) {
@@ -342,8 +344,8 @@ export default function AgentLaunchDialog({ workspace, onClose }: Props) {
         command: command.trim() || null,
         autoRestart,
         // Persist worker/supervised intent from the selected role lane.
-        isSupervised: isWorkerType && supervisorId !== null && provider !== 'gemini',
-        isWorker: isWorkerType && provider !== 'gemini',
+        isSupervised: isWorkerType && supervisorId !== null,
+        isWorker: isWorkerType,
       });
       setTemplates(prev => [...prev, newTemplate]);
       setSelectedType(`template:${newTemplate.id}`);
@@ -551,11 +553,6 @@ export default function AgentLaunchDialog({ workspace, onClose }: Props) {
                 );
               })}
             </div>
-            {isWorkerType && provider === 'gemini' && (
-              <div className="mt-1 text-[11px] text-gray-600">
-                Gemini has no hook scaffold — it launches as a plain session, not a worker-lane agent.
-              </div>
-            )}
             {/* Grok first-run auth notice — informational only, never blocks
                 launch. Grok on WSL is refused at launch time (the supervisor
                 throws) and that error surfaces in the launchError panel below. */}

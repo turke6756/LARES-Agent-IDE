@@ -838,7 +838,8 @@ export class StatusMonitor extends EventEmitter {
       // detection on the next pass. Don't promote without a stamp.
       return true;
     }
-    const budget = LAUNCH_SETTLE_TIMEOUT_MS[agent.provider];
+    const budget = LAUNCH_SETTLE_TIMEOUT_MS[agent.provider as keyof typeof LAUNCH_SETTLE_TIMEOUT_MS]
+      ?? LAUNCH_SETTLE_TIMEOUT_MS.claude;
     const elapsed = this.now() - stamp;
     if (elapsed < budget) return true;
 

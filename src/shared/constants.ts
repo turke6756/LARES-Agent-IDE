@@ -1,4 +1,4 @@
-import type { AgentProvider, ContextGaugeSettings } from './types';
+import type { AgentProvider, ContextGaugeSettings, LaunchableAgentProvider } from './types';
 import { buildUsageStatusText, buildUsageRawRecord } from './usage-limits-record';
 
 /** Workspace state folder name — `<workspace>/.lares/` holds the supervisor /
@@ -312,7 +312,6 @@ export const MAX_SUBMIT_RETRIES = 3;
 // when a user reports keystroke-eating during boot.
 //   - AGENTDASH_LAUNCH_SETTLE_MS_CLAUDE
 //   - AGENTDASH_LAUNCH_SETTLE_MS_CODEX
-//   - AGENTDASH_LAUNCH_SETTLE_MS_GEMINI
 //   - AGENTDASH_LAUNCH_SETTLE_MS_GROK
 //   - AGENTDASH_LAUNCH_SETTLE_MS_AGY
 function _readSettleMs(envName: string, fallback: number): number {
@@ -322,10 +321,9 @@ function _readSettleMs(envName: string, fallback: number): number {
   if (!Number.isFinite(n) || n <= 0) return fallback;
   return n;
 }
-export const LAUNCH_SETTLE_TIMEOUT_MS: Record<AgentProvider, number> = {
+export const LAUNCH_SETTLE_TIMEOUT_MS: Record<LaunchableAgentProvider, number> = {
   claude: _readSettleMs('AGENTDASH_LAUNCH_SETTLE_MS_CLAUDE', 10_000),
   codex:  _readSettleMs('AGENTDASH_LAUNCH_SETTLE_MS_CODEX',  25_000),
-  gemini: _readSettleMs('AGENTDASH_LAUNCH_SETTLE_MS_GEMINI', 10_000),
   grok:   _readSettleMs('AGENTDASH_LAUNCH_SETTLE_MS_GROK',   15_000),
   agy:    _readSettleMs('AGENTDASH_LAUNCH_SETTLE_MS_AGY',    15_000),
 };
@@ -335,9 +333,8 @@ export const LAUNCH_SETTLE_TIMEOUT_MS: Record<AgentProvider, number> = {
 export const LAUNCH_SETTLE_OVERRUN_GRACE_MS = 5_000;
 
 /** Default CLI commands per provider and environment */
-export const PROVIDER_COMMANDS: Record<AgentProvider, { windows: string; wsl: string }> = {
+export const PROVIDER_COMMANDS: Record<LaunchableAgentProvider, { windows: string; wsl: string }> = {
   claude: { windows: 'claude --dangerously-skip-permissions', wsl: 'ccode --dangerously-skip-permissions' },
-  gemini: { windows: 'gemini --yolo', wsl: 'gemini --yolo' },
   codex:  {
     windows: 'codex --dangerously-bypass-approvals-and-sandbox',
     wsl: 'ccodex --dangerously-bypass-approvals-and-sandbox',
@@ -738,9 +735,13 @@ const SUPERVISOR_AGENT_MD_V21_PLANNING_BLOCK = [
   '<!-- /section:planning-artifacts -->',
   '',
 ].join('\n');
-export const SUPERVISOR_AGENT_MD = SUPERVISOR_AGENT_MD_V20
+export const SUPERVISOR_AGENT_MD_V21 = SUPERVISOR_AGENT_MD_V20
   .split(SUPERVISOR_AGENT_MD_V21_ANCHOR)
   .join(SUPERVISOR_AGENT_MD_V21_PLANNING_BLOCK + SUPERVISOR_AGENT_MD_V21_ANCHOR);
+export const SUPERVISOR_AGENT_MD = SUPERVISOR_AGENT_MD_V21.replace(
+  'Supported providers: **claude, codex** (gemini is not session-addressable and is rejected).',
+  'Supported providers: **claude, codex**. Historical Gemini agents remain readable, but Gemini is discontinued and cannot be launched or revived; use Antigravity (agy) for new work.',
+);
 
 export const SUPERVISOR_MEMORY_MD = `# Supervisor Memory
 
@@ -5300,7 +5301,7 @@ export interface ProviderInstallHint {
   verifiedOn: string;
 }
 
-export const PROVIDER_INSTALL_HINTS: Record<AgentProvider, ProviderInstallHint> = {
+export const PROVIDER_INSTALL_HINTS: Record<LaunchableAgentProvider, ProviderInstallHint> = {
   // The PowerShell installer is listed first deliberately: it installs to
   // %USERPROFILE%\.local\bin\claude.exe, which is exactly the first location
   // supervisor/provider-resolver.ts looks in. Following this command produces a
@@ -5323,19 +5324,6 @@ export const PROVIDER_INSTALL_HINTS: Record<AgentProvider, ProviderInstallHint> 
     installCommand: 'irm https://chatgpt.com/codex/install.ps1 | iex',
     installShell: 'PowerShell',
     altCommand: 'npm install -g @openai/codex',
-    verifiedOn: PROVIDER_INSTALL_HINTS_VERIFIED_ON,
-  },
-  // Gemini CLI has NO Node-free install path (npm/npx only; brew and conda
-  // routes also ride on Node) — verified against the official README. npm
-  // stays the primary command, and `installNote` says so out loud instead of
-  // handing a Node-less user a command that is guaranteed to fail.
-  gemini: {
-    label: 'Gemini CLI',
-    docsUrl: 'https://github.com/google-gemini/gemini-cli',
-    installCommand: 'npm install -g @google/gemini-cli',
-    installShell: 'PowerShell or CMD',
-    installNote:
-      'Requires Node.js 20+ (see Optional below) — Gemini CLI has no Node-free installer.',
     verifiedOn: PROVIDER_INSTALL_HINTS_VERIFIED_ON,
   },
   // Grok Build (xAI CLI). The PowerShell installer lands grok at

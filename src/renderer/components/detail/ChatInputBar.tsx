@@ -212,7 +212,7 @@ export default function ChatInputBar({
 
   // Async delivery failures (PTY closed mid-typing, runner removed, agent
   // mid auto-compact, etc.) arrive via this event channel because the IPC
-  // handler is fire-and-forget for the multi-KB codex/gemini typing path
+  // handler is fire-and-forget for the multi-KB codex typing path
   // (see ipc-handlers.ts: 'agent:send-input' resolves as soon as delivery is
   // QUEUED). By the time the failure lands, handleSend has already cleared
   // the box optimistically — so restore the typed text here, otherwise the

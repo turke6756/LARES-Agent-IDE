@@ -1,5 +1,5 @@
 /** Windows provider-CLI path resolution — the ONE place that decides where
- *  `claude` / `codex` / `gemini` live on this machine.
+ *  the launchable provider CLIs live on this machine.
  *
  *  This module exists so preflight and launch cannot disagree. Before it, the
  *  resolvers were private to `supervisor/index.ts` and the startup health check
@@ -66,18 +66,18 @@ export function findWindowsClaudePath(_env: NodeJS.ProcessEnv): Promise<string> 
   });
 }
 
-/** Absolute-path resolver for the codex / gemini / grok / agy CLIs on Windows.
+/** Absolute-path resolver for the codex / grok / agy CLIs on Windows.
  *
- *  Unlike claude (findWindowsClaudePath), codex and gemini have no known
+ *  Unlike claude (findWindowsClaudePath), these providers need a shared
  *  installer location, no existence preflight, and no clear error — so on a
  *  Windows machine they silently fail. Electron inherits the LOGIN-time PATH,
- *  NOT the user's shell PATH, so a `codex`/`gemini` shim that works in their
+ *  NOT the user's shell PATH, so a provider shim that works in their
  *  terminal can be invisible to a bare `cmd.exe /c codex`. Search the common
  *  npm-global and per-user install locations directly, then fall back to
  *  `where.exe` (which resolves anything already on the login PATH). Returns an
  *  absolute path — including a `.cmd` shim, which `cmd.exe /c` runs fine — or
  *  null when the binary genuinely cannot be found. */
-export function findWindowsProviderBinary(provider: 'codex' | 'gemini' | 'grok' | 'agy'): Promise<string | null> {
+export function findWindowsProviderBinary(provider: 'codex' | 'grok' | 'agy'): Promise<string | null> {
   const home = userHome();
   const appData = process.env.APPDATA || path.join(home, 'AppData', 'Roaming');
   const localAppData = process.env.LOCALAPPDATA || path.join(home, 'AppData', 'Local');
@@ -142,7 +142,7 @@ export function findWindowsProviderBinary(provider: 'codex' | 'gemini' | 'grok' 
  *  their candidate lists — if the launcher can't find it, neither can we, and
  *  vice versa. */
 export function probeWindowsProvider(
-  provider: 'claude' | 'codex' | 'gemini' | 'grok' | 'agy',
+  provider: 'claude' | 'codex' | 'grok' | 'agy',
 ): Promise<string | null> {
   if (provider === 'claude') {
     return findWindowsClaudePath(process.env as NodeJS.ProcessEnv).catch(() => null);
@@ -166,12 +166,12 @@ export function probeWindowsProvider(
  *
  *  Never let a missing executable degrade into a blank terminal or a bare
  *  exit code. */
-export function missingProviderMessage(provider: 'claude' | 'codex' | 'gemini' | 'grok' | 'agy'): string {
+export function missingProviderMessage(provider: 'claude' | 'codex' | 'grok' | 'agy'): string {
   const label = provider === 'claude'
     ? 'Claude Code'
     : provider === 'codex' ? 'Codex'
     : provider === 'grok' ? 'Grok Build'
-    : provider === 'agy' ? 'Antigravity CLI' : 'Gemini';
+    : 'Antigravity CLI';
   const namedCli = provider === 'agy' ? label : `${label} CLI`;
   return (
     `${namedCli} was not found.\n\n` +

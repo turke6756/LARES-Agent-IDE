@@ -10,9 +10,9 @@
 //   (d) the launch-time positional-arg `agentMdPrompt` path is byte-identical
 //       with vs without `initialUserPrompt` set — asserted per provider at
 //       both seams where the builders differ: the agentMdPrompt value handed
-//       to launchWindowsAgent (claude merges systemPrompt; codex/gemini do
+//       to launchWindowsAgent (claude merges systemPrompt; codex does
 //       not), and the actual argv built by launchWindowsAgent (claude carries
-//       the prompt as final positional arg; codex/gemini never put it in
+//       the prompt as final positional arg; codex never puts it in
 //       argv).
 //   Plus: accepting transition with no live runner keeps the entry; async
 //   delivery failure emits 'sendInputError' (→ 'agent:send-input-error').
@@ -406,7 +406,25 @@ test('delivery failure emits sendInputError (agent:send-input-error flow) and do
 
 // ── (d) launch-time positional-arg path untouched, per provider ──────
 
-const PROVIDERS: AgentProvider[] = ['claude', 'codex', 'gemini'];
+const PROVIDERS: AgentProvider[] = ['claude', 'codex'];
+
+test('(d0) discontinued gemini is rejected before launch with historical-read guidance', async () => {
+  const h = setup();
+  try {
+    await assert.rejects(
+      () => h.supervisor.launchAgent(launchInput(h, 'gemini')),
+      (error: unknown) => {
+        const typed = error as { code?: string; statusCode?: number; message?: string };
+        assert.equal(typed.code, 'provider-discontinued');
+        assert.equal(typed.statusCode, 422);
+        assert.match(typed.message ?? '', /Historical Gemini agents remain readable/);
+        return true;
+      },
+    );
+  } finally {
+    h.cleanup();
+  }
+});
 
 test('(d1) agentMdPrompt handed to the launch builder is byte-identical with vs without initialUserPrompt (per provider)', async () => {
   for (const provider of PROVIDERS) {
@@ -441,7 +459,7 @@ test('(d1) agentMdPrompt handed to the launch builder is byte-identical with vs 
   }
 });
 
-test('(d2) launchWindowsAgent argv is byte-identical with vs without a pending entry (claude positional arg; codex/gemini no prompt in argv)', async () => {
+test('(d2) launchWindowsAgent argv is byte-identical with vs without a pending entry (claude positional arg; codex no prompt in argv)', async () => {
   for (const provider of PROVIDERS) {
     const h = setup({ stubLaunch: false });
     // Capture argv at the runner boundary; never spawn a real process.

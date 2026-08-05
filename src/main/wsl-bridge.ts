@@ -508,12 +508,11 @@ export const TMUX_KITTY_ENTER_HEX = '1b 5b 31 33 75';            // \x1b[13u
 const TMUX_BP_START_HEX = '1b 5b 32 30 30 7e';             // \x1b[200~
 const TMUX_BP_END_HEX = '1b 5b 32 30 31 7e';               // \x1b[201~
 
-// Sleep covers codex's PasteBurst (8 ms) and gemini's bufferFastReturn (30 ms,
-// only active when kitty mode is *off* — the WSL pty doesn't always advertise
-// it) so the trailing submit Enter isn't rewritten as newline-insert.
+// Sleep covers codex's PasteBurst so the trailing submit Enter isn't rewritten
+// as newline-insert.
 const POST_BODY_SLEEP_SECONDS = '0.08';
 
-export type TmuxProvider = 'claude' | 'codex' | 'gemini' | 'unknown';
+export type TmuxProvider = 'claude' | 'codex' | 'unknown';
 
 /** Command + stdin payload produced by {@link buildTmuxSendInputCmd}. The
  *  body travels on stdin (consumed by `tmux load-buffer -`), never inside
@@ -545,7 +544,7 @@ export function buildTmuxSendInputCmd(
   provider: TmuxProvider,
   submit: boolean
 ): TmuxSendInputCommand | null {
-  if (provider !== 'claude' && provider !== 'codex' && provider !== 'gemini') {
+  if (provider !== 'claude' && provider !== 'codex') {
     return null;
   }
 
@@ -570,7 +569,7 @@ export function buildTmuxSendInputCmd(
   //   wrapping produced. Markers are sent via `send-keys -H`, not
   //   `paste-buffer -p`, because `-p` is conditional on the app having
   //   requested paste mode (see TMUX_BP_START_HEX).
-  // - codex/gemini: raw paste with default LF→CR translation, verified live
+  // - codex: raw paste with default LF→CR translation, verified live
   //   on WSL (plans/wsl-codex-relay-length-bug-2026-06-10.md): a 20 KB /
   //   312-line paste lands in codex's composer intact, with no premature
   //   submit and no external-editor confirmation flow. (An earlier comment
@@ -593,7 +592,7 @@ export function buildTmuxSendInputCmd(
  * Send `text` to a WSL agent via tmux, then submit, using a provider-aware
  * encoding. The body is piped to `tmux load-buffer -` on stdin and pasted
  * into the pane — length-safe for arbitrarily large relays (see
- * {@link buildTmuxSendInputCmd}). All three providers enable kitty keyboard
+ * {@link buildTmuxSendInputCmd}). Both supported providers enable kitty keyboard
  * protocol on Linux at startup; tmux's `send-keys Enter` (a bare `\r` byte)
  * is dropped in that mode, so submit must be sent as the kitty CSI key event
  * `\x1b[13u`.

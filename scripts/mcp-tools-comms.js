@@ -82,7 +82,7 @@ async function handleCommsToolCall(name, args, apiRequest) {
           content: [{
             type: 'text',
             text: `HANDSHAKE UNCONFIRMED — message delivered to agent ${args.agent_id} but no turn-start `
-              + `proof arrived in time (provider may lack an authoritative start signal, e.g. gemini). `
+              + `proof arrived in time (a hook-unavailable lane may lack an authoritative start signal). `
               + `The worker MAY be fine, but verify before relying on it: read_agent_log to see the PTY; `
               + `if the prompt sits unsubmitted, send_keys_to_agent {"agent_id":"${args.agent_id}","key":"enter"}.`,
           }],

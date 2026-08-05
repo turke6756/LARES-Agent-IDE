@@ -144,7 +144,7 @@ export async function sendSelectionComments(
     }
 
     deps.markQueued(ids, agent.id);
-    // Fire-and-forget past this point (Windows codex/gemini typing can take
+    // Fire-and-forget past this point (Windows codex typing can take
     // 30+ seconds — see the 'agent:send-input' handler); transitions land in
     // the DB and surface via onCommentsChanged.
     void deps.sendInput(agent.id, prompt).then(

@@ -33,6 +33,11 @@ test('launch_agent provider enum includes agy', () => {
   assert.ok(launch.inputSchema.properties.provider.enum.includes('agy'));
 });
 
+test('launch_agent provider enum excludes discontinued gemini', () => {
+  const launch = getOrchestrationToolDefinitions().find((tool) => tool.name === 'launch_agent');
+  assert.ok(!launch.inputSchema.properties.provider.enum.includes('gemini'));
+});
+
 test('rail launch submits args.prompt verbatim', async () => {
   const { apiRequest, captured } = makeFakeApi();
   await handleOrchestrationToolCall('launch_agent', {

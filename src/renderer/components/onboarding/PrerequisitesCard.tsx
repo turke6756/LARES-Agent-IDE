@@ -29,7 +29,7 @@ export default function PrerequisitesCard() {
           No agent CLI found — Lares can’t launch agents yet.
         </p>
         <p className="text-[12px] text-gray-400 mt-0.5">
-          Install Claude Code, Codex or Gemini (any one of them), then restart Lares.
+          Install Claude Code, Codex, Grok Build, or Antigravity (any one), then restart Lares.
         </p>
         <button
           onClick={openDialog}

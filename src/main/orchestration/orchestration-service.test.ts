@@ -110,6 +110,21 @@ function baseReq(extra: Record<string, unknown> = {}) {
 
 // ── Tests ────────────────────────────────────────────────────────────
 
+test('discontinued Gemini providers are rejected before an orchestration run is persisted', () => {
+  const svc = new OrchestrationService(makeClient(), makeDeliver().fn);
+  assert.throws(
+    () => svc.start_run(baseReq({ reviewerProvider: 'gemini' })),
+    (err: unknown) => {
+      const typed = err as { statusCode?: number; message?: string };
+      assert.equal(typed.statusCode, 422);
+      assert.match(typed.message ?? '', /Gemini provider discontinued/);
+      assert.match(typed.message ?? '', /Antigravity \(agy\)/);
+      return true;
+    },
+  );
+  assert.equal(runsStore.size, 0);
+});
+
 test('detached start_run returns a runId before the runner completes; status starts running', async () => {
   const gate = deferred();
   const runner: OrchestrationRunner = async () => { await gate.promise; };

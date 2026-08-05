@@ -391,28 +391,6 @@ function assistantText(agentId: string, overrides: Partial<AssistantTextEvent> =
   };
 }
 
-async function BR_19_geminiTurnCompleteFiresForceIdle_postBug09(): Promise<void> {
-  // BUG-09 §3.9 inverts BR-19. Pre-bug-09 the D-07 gate suppressed
-  // forceIdle for Gemini because the reader hardcoded turnComplete=true on
-  // every emission. With the gemini reader now gating turnComplete on
-  // allToolsResolved && usageLanded, Gemini routes through forceIdle on
-  // the same path as Claude/Codex.
-  const f = makeFakeBridgeDeps();
-  const gem = makeAgent('gem-1', { provider: 'gemini', status: 'working' });
-  f.agents.set(gem.id, gem);
-  const bridge = new EventBridge(f.deps);
-
-  bridge.onChatEvents(batchFor(gem.id, [
-    assistantText(gem.id, { turnComplete: true }),
-  ]));
-
-  assert.equal(f.statusForceCalls.length, 1,
-    'BUG-09 §3.9: Gemini turnComplete now fires forceIdle (D-07 removed)');
-  assert.equal(f.statusForceCalls[0].method, 'forceIdle');
-  assert.equal(f.statusForceCalls[0].source, 'turnComplete');
-  console.log('  BR-19 (BUG-09 §3.9) ✓ Gemini turnComplete fires forceIdle');
-}
-
 async function onChatEvents_codexTurnComplete(): Promise<void> {
   const f = makeFakeBridgeDeps();
   // Unsupervised: the chat stream is the working/idle source for this lane.
@@ -490,28 +468,6 @@ async function onChatEvents_dispatchTable(): Promise<void> {
     'BUG-09: tool-use forceWorking propagates toolUseId for latch pairing');
   assert.equal(toolCall.workingOpts?.ttlClass, 'tool-pending');
   console.log('  onChatEvents ✓ dispatch table maps each event type per §2.1');
-}
-
-async function onChatEvents_geminiToolUseStillRoutes(): Promise<void> {
-  // BR-19 is only about the assistant-text+turnComplete branch. Gemini's
-  // assistant-derived events (tool-use, task-started) still drive the latch.
-  // (user-text is no longer status-bearing on any provider — hooks own
-  // turn-start; a hookless gemini turn starts from its first assistant event.)
-  const f = makeFakeBridgeDeps();
-  const gem = makeAgent('gem-2', { provider: 'gemini', status: 'idle' });
-  f.agents.set(gem.id, gem);
-  const bridge = new EventBridge(f.deps);
-
-  const tool: ToolUseEvent = {
-    type: 'tool-use', uuid: 't', timestamp: '', agentId: gem.id,
-    toolUseId: 'gx', toolName: 'Read', input: {},
-  };
-  bridge.onChatEvents(batchFor(gem.id, [tool]));
-
-  assert.equal(f.statusForceCalls.length, 1);
-  assert.equal(f.statusForceCalls[0].method, 'forceWorking');
-  assert.equal(f.statusForceCalls[0].source, 'tool-use');
-  console.log('  onChatEvents ✓ Gemini tool-use still routes through bridge (D-07 is narrow)');
 }
 
 // ── BUG-09 §3.8 — initialLoad replay suppression ─────────────────────
@@ -594,25 +550,6 @@ async function BR_13_endsWithQuestionNoLongerFiresWaitingForHookWorker(): Promis
   assert.equal(f.statusForceCalls.length, 0,
     'BR-13: endsWithQuestion fires no force* for a hook-backed worker (status is hook-owned)');
   console.log('  BR-13 ✓ endsWithQuestion no longer maps to waiting (hook-owned worker)');
-}
-
-async function BR_13_geminiEndsWithQuestionGoesIdleNotWaiting(): Promise<void> {
-  // Gemini has no hook scaffold, so it stays on the chat-stream — but even
-  // there, endsWithQuestion must NOT produce waiting. A completed turn goes
-  // idle; `waiting` is unreachable without a Notification hook.
-  const f = makeFakeBridgeDeps();
-  const worker = makeAgent('w-q2', { provider: 'gemini', status: 'working' });
-  f.agents.set(worker.id, worker);
-  const bridge = new EventBridge(f.deps);
-
-  bridge.onChatEvents(batchFor(worker.id, [
-    assistantText(worker.id, { text: 'OK?', turnComplete: true, endsWithQuestion: true }),
-  ]));
-
-  assert.equal(f.statusForceCalls.length, 1);
-  assert.equal(f.statusForceCalls[0].method, 'forceIdle',
-    'BR-13: gemini endsWithQuestion+turnComplete → idle, never waiting');
-  console.log('  BR-13 ✓ gemini endsWithQuestion → idle (never waiting)');
 }
 
 async function BR_15_notifyUserInputClearsLatchOnWaiting(): Promise<void> {
@@ -2023,7 +1960,7 @@ async function WP7_hooksUnavailableFallsThroughToTranscript(): Promise<void> {
     'WP7: healthy hook-owned lane still skips the chat-stream status switch');
 
   // Same worker but the canary proved the hooks DEAD: it now falls through to the
-  // transcript switch (gemini path) and turnComplete → forceIdle.
+  // transcript fallback and turnComplete → forceIdle.
   const fDead = makeFakeBridgeDeps();
   const dead = makeAgent('wp7-dead', {
     provider: 'claude', status: 'working', isSupervised: true, isWorker: true,
@@ -2054,18 +1991,15 @@ async function main(): Promise<void> {
   await BR_10_multiSupervisorIsolation();
   await BR_QUEUE_recipientScoped();
   await BR_13_endsWithQuestionNoLongerFiresWaitingForHookWorker();
-  await BR_13_geminiEndsWithQuestionGoesIdleNotWaiting();
   await BR_15_notifyUserInputClearsLatchOnWaiting();
   await BR_15_notifyUserInputNoopWhenNotWaiting();
   await BR_15_notifyUserInputSkippedForSupervised();
-  await BR_19_geminiTurnCompleteFiresForceIdle_postBug09();
   await BR_20_waitingToWorkingIsSuppressed();
   await launchingToIdle_isSuppressed();
   await launchingToOtherStatuses_stillFire();
   await done_isNeverNotified();
   await onChatEvents_codexTurnComplete();
   await onChatEvents_dispatchTable();
-  await onChatEvents_geminiToolUseStillRoutes();
   await WP7_hooksUnavailableFallsThroughToTranscript();
   await onChatEvents_initialLoadSuppressesForceCalls();
   await onChatEvents_secondBatchIsNotInitialLoad();

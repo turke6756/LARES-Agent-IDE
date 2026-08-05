@@ -475,11 +475,7 @@ export class EventBridge {
 
   /**
    * Pipeline B → status wiring. See plans/agent-lifecycle-hardening-plan.md
-   * §2.1 for the dispatch table. Gemini agents skip the
-   * `assistant-text + turnComplete: true → forceIdle` branch (D-07) because
-   * `gemini-transcript-reader.ts:327` hardcodes `turnComplete: true` and the
-   * transcript can later rewrite the same turn with tool calls. Other
-   * branches (waiting detection, tool-use, etc.) apply to Gemini normally.
+   * §2.1 for the dispatch table.
    *
    * Branch order intentionally checks `endsWithQuestion === true` BEFORE the
    * `turnComplete === true` branch so when P2-01 lands the routing flips to
@@ -511,37 +507,28 @@ export class EventBridge {
         // ending a turn with a question is just a normal turn end (→ idle via
         // the Stop hook). Skip the entire status switch for these lanes.
         //
-        // Gemini has no hook scaffold, so it falls through to the chat-stream
-        // below as its only working/idle signal (it never reaches `waiting`).
-        //
         // WP7 (hook-absence-resilience) — the skip is now hook-health
         // CONDITIONAL. When the hooks are actually LIVE, they own status and the
         // chat-stream must not race them (skip). But when the launch canary
         // proved the scaffold dead (`hooksUnavailable`), these lanes get NO
         // working/idle from hooks — so fall through to the same transcript switch
-        // gemini uses (non-terminal assistant-text/thinking/tool-use →
+        // hookless lanes use (non-terminal assistant-text/thinking/tool-use →
         // forceWorking; turnComplete → forceIdle). A transcript question still
         // must NOT become `waiting` — that stays reserved for a Notification hook
         // (WP7 drives waiting from the PTY classifier in status-monitor instead).
         // Turn-START evidence for send confirmation (WP3) is recorded upstream in
         // the supervisor's chat-events handler regardless of this skip.
-        const hookOwned = (agent.isSupervised || agent.isWorker || agent.isSupervisor || agent.isResearcher)
-          && agent.provider !== 'gemini';
+        const hookOwned = agent.isSupervised || agent.isWorker || agent.isSupervisor || agent.isResearcher;
         if (hookOwned && !agent.hooksUnavailable) {
           continue;
         }
 
         switch (event.type) {
           case 'assistant-text': {
-            // Hookless providers (gemini) only. A turn that ends with a question
+            // Hookless or hook-unavailable lanes only. A turn that ends with a question
             // is a normal turn end (→ idle); `waiting` is reserved for a real
-            // Notification hook, which gemini does not emit.
+            // Notification hook; transcript punctuation alone is not waiting evidence.
             if (event.turnComplete === true) {
-              // BUG-09 §3.9 — D-07 gate removed. The Gemini reader now
-              // computes turnComplete from `allToolsResolved && usageLanded`
-              // and emits an assistant-text-patch when the turn later
-              // becomes complete, so we can route Gemini through forceIdle
-              // on the same path as Claude/Codex.
               this.deps.statusMonitor.forceIdle(agentId, 'turnComplete');
             } else {
               // BUG-09 §3.3 / C11 — any non-terminal assistant-text refreshes
@@ -559,10 +546,9 @@ export class EventBridge {
             break;
           }
           case 'assistant-text-patch': {
-            // Hookless providers (gemini) only — see assistant-text. No
+            // Hookless or hook-unavailable lanes only — see assistant-text. No
             // endsWithQuestion → waiting; turn completion routes to idle.
             if (event.turnComplete === true) {
-              // BUG-09 §3.9 — D-07 gate removed (see assistant-text branch).
               this.deps.statusMonitor.forceIdle(agentId, 'turnComplete');
             }
             break;
@@ -612,7 +598,7 @@ export class EventBridge {
             // The event still flows for chat display / telemetry; only the
             // status write is gone, for ALL providers. Turn-start now comes
             // exclusively from the hook pipeline (UserPromptSubmit / codex
-            // hook-spool). For a hookless provider (gemini today) turn-start
+            // hook-spool). For a hookless lane, turn-start
             // comes only from its FIRST assistant-derived event after submit
             // (assistant-text / thinking / tool-use / task-started) — genuine
             // agent output the send path cannot forge. When a future harness

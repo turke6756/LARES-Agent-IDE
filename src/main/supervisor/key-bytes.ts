@@ -9,11 +9,11 @@
 // Enter byte sequence depends on the agent's provider and host:
 //
 //   - claude (windows or wsl):     plain CR (`\r`)
-//   - codex/gemini on Windows:     Win32 Input Mode VK_RETURN down+up pair
-//   - codex/gemini on WSL (kitty): CSI-u `\x1b[13u`
+//   - codex on Windows:            Win32 Input Mode VK_RETURN down+up pair
+//   - codex on WSL (kitty):        CSI-u `\x1b[13u`
 //   - grok on Windows (ConPTY):    plain CR (`\r`) — grok submits on a bare
 //       crossterm KeyCode::Enter/NONE and never enables Win32 Input Mode, so it
-//       shares the Claude-on-Windows encoding, NOT the codex/gemini Win32 form.
+//       shares the Claude-on-Windows encoding, NOT the codex Win32 form.
 //       There is NO distinct Shift+Enter byte over ConPTY, so shift-enter uses
 //       backslash-continuation (`\` + CR). Source-verified in
 //       plans/grok-phase0-probe-results.md §0.1.
@@ -22,7 +22,7 @@
 //       C:/Users/turke/Projects/plans/agy-phase0-probe-results.md §0.1.
 //
 // Providers therefore do NOT all share one encoding: claude/grok/agy submit
-// with bare CR on Windows, while codex/gemini use Win32 records there.
+// with bare CR on Windows, while codex uses Win32 records there.
 //
 // This module exposes a small enum-based API that callers can use to ask
 // for a named key (`enter`, `esc`, `tab`, an arrow, Ctrl-C, etc.) and get
@@ -36,7 +36,7 @@
 
 import type { AgentProvider, PathType } from '../../shared/types';
 
-// Win32 Input Mode CSI sequences (ConPTY-aware). Codex/gemini enable Win32
+// Win32 Input Mode CSI sequences (ConPTY-aware). Codex enables Win32
 // Input Mode (ESC[?9001h) on launch and expect every keypress as a CSI
 // `ESC [ Vk ; Sc ; Uc ; Kd ; Cs ; Rc _` event with both down (Kd=1) and up
 // (Kd=0). Plain `\r` is auto-translated by ConPTY into a single KEY_DOWN
@@ -111,7 +111,7 @@ export function mapKeyToBytes(
       // claude (any host) accepts plain CR. grok submits on a bare
       // crossterm KeyCode::Enter/NONE over ConPTY, so it also takes CR — listed
       // explicitly (not the CR fall-through) so the contract is a verified
-      // decision. codex/gemini need the provider+host-specific submit event —
+      // decision. codex needs the provider+host-specific submit event —
       // otherwise bytes render as typed text without firing submit. Grok source:
       // prompt_widget/mod.rs:2142 (grok-phase0-probe-results.md §0.1).
       if (provider === 'claude') return '\r';
@@ -120,7 +120,7 @@ export function mapKeyToBytes(
       // bare CR is its canonical, legacy-robust submit byte. LF is deliberately
       // reserved for newline-without-submit (agy probe results §0.1).
       if (provider === 'agy') return '\r';
-      if (provider === 'codex' || provider === 'gemini') {
+      if (provider === 'codex') {
         return pathType === 'wsl' ? KITTY_ENTER : WIN32_KEY_ENTER;
       }
       return '\r';
@@ -139,7 +139,7 @@ export function mapKeyToBytes(
       // agy maps both Shift+Enter and Ctrl+J to prompt.newline; raw LF is the
       // probe-proven ConPTY byte and never starts a turn (agy probe results §0.1).
       if (provider === 'agy') return '\n';
-      if (provider === 'codex' || provider === 'gemini') {
+      if (provider === 'codex') {
         return pathType === 'wsl' ? KITTY_SHIFT_ENTER : WIN32_KEY_SHIFT_ENTER;
       }
       return '\n';

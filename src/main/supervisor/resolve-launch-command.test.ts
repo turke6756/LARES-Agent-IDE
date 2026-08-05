@@ -1,6 +1,6 @@
 // Tests for the launch-command resolver (src/main/supervisor/launch-command.ts).
 //
-// Covers the two correctness rules behind the codex/gemini "launched as Claude"
+// Covers the two correctness rules behind the non-Claude "launched as Claude"
 // bug:
 //   1. isFrameworkDefaultCommand() — a stored default that equals a framework
 //      default except for a trailing/standalone ` --chrome` token still counts
@@ -53,11 +53,10 @@ test('empty / null default command is not a framework default', () => {
 
 // ── isClaudeBinaryCommand ───────────────────────────────────────────────
 
-test('claude / ccode binaries are detected, codex / gemini are not', () => {
+test('claude / ccode binaries are detected and codex is not', () => {
   assert.equal(isClaudeBinaryCommand('claude --dangerously-skip-permissions'), true);
   assert.equal(isClaudeBinaryCommand('  ccode --dangerously-skip-permissions'), true);
   assert.equal(isClaudeBinaryCommand('codex --dangerously-bypass-approvals-and-sandbox'), false);
-  assert.equal(isClaudeBinaryCommand('gemini --yolo'), false);
 });
 
 // ── resolveLaunchCommand: framework-default normalization ───────────────
@@ -71,17 +70,6 @@ test('codex launch in a legacy-default workspace uses the codex binary, not clau
   });
   assert.equal(command, PROVIDER_COMMANDS.codex.windows);
   // Normalization handled it; the guard had nothing to override.
-  assert.equal(providerOverride, null);
-});
-
-test('gemini launch in a current-default workspace uses the gemini binary', () => {
-  const { command, providerOverride } = resolveLaunchCommand({
-    inputCommand: undefined,
-    workspaceDefaultCommand: DEFAULT_COMMAND,
-    provider: 'gemini',
-    pathType: 'windows',
-  });
-  assert.equal(command, PROVIDER_COMMANDS.gemini.windows);
   assert.equal(providerOverride, null);
 });
 

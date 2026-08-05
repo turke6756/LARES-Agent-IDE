@@ -4,12 +4,12 @@
 // Reconciles three inputs into the command that actually spawns:
 //   - the explicit launch input command (if any),
 //   - the workspace's stored `default_command`,
-//   - the requested provider (claude / codex / gemini).
+//   - the requested launchable provider.
 //
 // See resolve-launch-command.test.ts for the matrix, and src/main/supervisor/
 // index.ts (launchAgent) for the call site.
 
-import { AgentProvider, PathType } from '../../shared/types';
+import { LaunchableAgentProvider, PathType } from '../../shared/types';
 import { DEFAULT_COMMAND, DEFAULT_COMMAND_WSL, PROVIDER_COMMANDS } from '../../shared/constants';
 
 /**
@@ -41,7 +41,7 @@ function commandBinary(command: string): string {
 /**
  * The claude provider launches via the `claude` (Windows) or `ccode` (WSL)
  * binary. A command whose binary is one of these is a "claude binary" command —
- * the wrong thing to spawn for a codex/gemini provider.
+ * the wrong thing to spawn for a non-Claude provider.
  */
 export function isClaudeBinaryCommand(command: string): boolean {
   const bin = commandBinary(command);
@@ -57,13 +57,13 @@ export function isClaudeBinaryCommand(command: string): boolean {
  *  1. Framework-default normalization. When the workspace command is a pristine
  *     framework default (incl. a legacy ` --chrome` variant), respect the
  *     provider override and use PROVIDER_COMMANDS[provider][pathType] — so a
- *     `codex`/`gemini` launch in a default workspace spawns the correct binary
+ *     a non-Claude launch in a default workspace spawns the correct binary
  *     instead of the stored claude command.
  *
  *  2. Provider-mismatch guard. Even when the workspace command is a genuinely
  *     custom (non-framework) command, a non-claude provider must NEVER be
  *     silently launched as a claude/ccode binary. If the resolved command would
- *     be a claude/ccode command while the requested provider is codex/gemini,
+ *     be a claude/ccode command while the requested provider is non-Claude,
  *     prefer the provider's default command and flag the override so the caller
  *     can warn. (A `claude` provider with a custom wrapper keeps the wrapper —
  *     only non-claude providers trip the guard.)
@@ -71,7 +71,7 @@ export function isClaudeBinaryCommand(command: string): boolean {
 export function resolveLaunchCommand(opts: {
   inputCommand?: string | null;
   workspaceDefaultCommand?: string | null;
-  provider: AgentProvider;
+  provider: LaunchableAgentProvider;
   pathType: PathType;
 }): { command: string; providerOverride: { from: string; to: string } | null } {
   const { inputCommand, workspaceDefaultCommand, provider, pathType } = opts;

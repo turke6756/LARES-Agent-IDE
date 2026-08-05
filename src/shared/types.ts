@@ -35,6 +35,9 @@ import type {
 
 export type PathType = 'windows' | 'wsl';
 export type AgentProvider = 'claude' | 'gemini' | 'codex' | 'grok' | 'agy';
+/** Providers accepted for new launches. `gemini` remains in AgentProvider so
+ * persisted historical agents and templates can still be decoded and shown. */
+export type LaunchableAgentProvider = Exclude<AgentProvider, 'gemini'>;
 
 // Hardcoded first-class app role-lanes. 'researcher' is a third lane alongside
 // 'supervisor' and 'worker' (browser-parity-and-capability-isolation §0); see
@@ -1022,7 +1025,7 @@ export interface WslStatus {
  *  as much as a data field — the first-run UI groups by them, so getting one
  *  wrong is how "you're missing Git" turns into "this app is broken".
  *
- *  - `agent-cli`     at least ONE of claude/codex/gemini is needed to launch
+ *  - `agent-cli`     at least ONE launchable provider CLI is needed to launch
  *                    agents. Never all three; no surface may imply otherwise.
  *  - `wsl-feature`   only matters for WSL-backed workspaces / persistent
  *                    WSL terminals.
@@ -1102,7 +1105,7 @@ export interface PrerequisiteCheck {
 export interface RuntimePrerequisiteReport {
   appVersion: string;
   checkedAt: number;
-  /** claude / codex / gemini, always all three, always independent entries. */
+  /** One independent entry per launchable provider. */
   providers: PrerequisiteCheck[];
   /** True when AT LEAST ONE provider resolved. The single flag the UI should
    *  branch on for "can this user launch an agent at all". */

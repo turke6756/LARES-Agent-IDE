@@ -3,7 +3,7 @@
 // Verifies that `mapKeyToBytes` returns the right byte sequence for every
 // supported (key, provider, pathType) combination. The provider/host matrix
 // matters most for `enter` and `shift-enter`, where claude differs from
-// codex/gemini and Windows differs from WSL — get this wrong and Enter
+// codex and Windows differs from WSL — get this wrong and Enter
 // silently fails (renders as text without submitting).
 //
 // Compile via the existing main tsconfig and run with:
@@ -36,16 +36,9 @@ test('enter: codex/windows → Win32 VK_RETURN down+up', () => {
   );
 });
 
-test('enter: gemini/windows → Win32 VK_RETURN down+up', () => {
-  assert.equal(
-    mapKeyToBytes('enter', 'gemini', 'windows'),
-    '\x1b[13;28;13;1;0;1_\x1b[13;28;13;0;0;1_',
-  );
-});
-
 test('enter: grok/windows → bare CR (shares the Claude-on-Windows encoding)', () => {
   // Source-verified: grok submits on a bare crossterm KeyCode::Enter/NONE over
-  // ConPTY (grok-phase0-probe-results.md §0.1). Must be CR, not the codex/gemini
+  // ConPTY (grok-phase0-probe-results.md §0.1). Must be CR, not the codex
   // Win32 VK_RETURN pair.
   assert.equal(mapKeyToBytes('enter', 'grok', 'windows'), '\r');
   assert.equal(
@@ -71,10 +64,6 @@ test('enter: agy/windows → bare CR submit, never LF', () => {
 
 test('enter: codex/wsl → kitty CSI-u \\x1b[13u', () => {
   assert.equal(mapKeyToBytes('enter', 'codex', 'wsl'), '\x1b[13u');
-});
-
-test('enter: gemini/wsl → kitty CSI-u \\x1b[13u', () => {
-  assert.equal(mapKeyToBytes('enter', 'gemini', 'wsl'), '\x1b[13u');
 });
 
 // ── Shift-Enter: newline-without-submit, also provider+host-sensitive ──────
@@ -115,14 +104,10 @@ test('shift-enter: codex/wsl → kitty \\x1b[13;2u', () => {
   assert.equal(mapKeyToBytes('shift-enter', 'codex', 'wsl'), '\x1b[13;2u');
 });
 
-test('shift-enter: gemini/wsl → kitty \\x1b[13;2u', () => {
-  assert.equal(mapKeyToBytes('shift-enter', 'gemini', 'wsl'), '\x1b[13;2u');
-});
-
 // ── Provider-agnostic keys ──────────────────────────────────────────────────
 
 test('esc → \\x1b for every provider/host', () => {
-  for (const provider of ['claude', 'codex', 'gemini'] as const) {
+  for (const provider of ['claude', 'codex'] as const) {
     for (const pathType of ['windows', 'wsl'] as const) {
       assert.equal(mapKeyToBytes('esc', provider, pathType), '\x1b',
         `esc/${provider}/${pathType} should be \\x1b`);
@@ -131,7 +116,7 @@ test('esc → \\x1b for every provider/host', () => {
 });
 
 test('tab → \\t for every provider/host', () => {
-  for (const provider of ['claude', 'codex', 'gemini'] as const) {
+  for (const provider of ['claude', 'codex'] as const) {
     for (const pathType of ['windows', 'wsl'] as const) {
       assert.equal(mapKeyToBytes('tab', provider, pathType), '\t');
     }
@@ -139,7 +124,7 @@ test('tab → \\t for every provider/host', () => {
 });
 
 test('arrow keys → standard CSI sequences for every provider/host', () => {
-  for (const provider of ['claude', 'codex', 'gemini'] as const) {
+  for (const provider of ['claude', 'codex'] as const) {
     for (const pathType of ['windows', 'wsl'] as const) {
       assert.equal(mapKeyToBytes('up', provider, pathType), '\x1b[A');
       assert.equal(mapKeyToBytes('down', provider, pathType), '\x1b[B');
@@ -157,7 +142,7 @@ test('backspace → DEL (\\x7f), not BS (\\x08)', () => {
 });
 
 test('ctrl-c → \\x03 for every provider/host', () => {
-  for (const provider of ['claude', 'codex', 'gemini'] as const) {
+  for (const provider of ['claude', 'codex'] as const) {
     for (const pathType of ['windows', 'wsl'] as const) {
       assert.equal(mapKeyToBytes('ctrl-c', provider, pathType), '\x03');
     }
@@ -165,7 +150,7 @@ test('ctrl-c → \\x03 for every provider/host', () => {
 });
 
 test('ctrl-d → \\x04 for every provider/host', () => {
-  for (const provider of ['claude', 'codex', 'gemini'] as const) {
+  for (const provider of ['claude', 'codex'] as const) {
     for (const pathType of ['windows', 'wsl'] as const) {
       assert.equal(mapKeyToBytes('ctrl-d', provider, pathType), '\x04');
     }
@@ -195,7 +180,7 @@ test('isKeyName rejects unknown / non-string input', () => {
 
 test('every supported key resolves to non-empty bytes for every combo', () => {
   for (const key of SUPPORTED_KEY_NAMES) {
-    for (const provider of ['claude', 'codex', 'gemini'] as const) {
+    for (const provider of ['claude', 'codex'] as const) {
       for (const pathType of ['windows', 'wsl'] as const) {
         const bytes = mapKeyToBytes(key, provider, pathType);
         assert.ok(

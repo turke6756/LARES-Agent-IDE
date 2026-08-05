@@ -1,7 +1,7 @@
 /** Honest prerequisite detection (packaging plan §6).
  *
  *  THE PROBLEM THIS SOLVES. Lares can bundle its own JS runtime (Phase 3), but
- *  it cannot bundle Claude Code / Codex / Gemini — those are separate programs
+ *  it cannot bundle provider CLIs — those are separate programs
  *  it drives on the user's behalf. A real person installed Lares, had none of
  *  them, and got an app where "Launch Agent" simply did nothing legible. This
  *  module is the answer to that: find out what is actually there, and say so.
@@ -56,8 +56,8 @@ let cachedReport: RuntimePrerequisiteReport | null = null;
 let cachedAt = 0;
 let inFlight: Promise<RuntimePrerequisiteReport> | null = null;
 
-type ProviderId = 'claude' | 'codex' | 'gemini' | 'grok' | 'agy';
-const PROVIDER_IDS: ProviderId[] = ['claude', 'codex', 'gemini', 'grok', 'agy'];
+type ProviderId = 'claude' | 'codex' | 'grok' | 'agy';
+const PROVIDER_IDS: ProviderId[] = ['claude', 'codex', 'grok', 'agy'];
 
 /** Run `<binary> --version` and return the first non-empty output line.
  *

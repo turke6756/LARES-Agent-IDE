@@ -1818,7 +1818,7 @@ export class ApiServer {
     }
 
     // POST /api/agents/:id/input — queue a message for delivery and return.
-    // Default delivery is fire-and-forget: the Windows codex/gemini path types
+    // Default delivery is fire-and-forget: the Windows codex path types
     // one character at a time at WINDOWS_CODEX_TYPING_DELAY_MS to dodge the
     // paste-burst dialog, so multi-KB sends can take 30+ seconds. Holding
     // the HTTP request open that long invariably breaks callers' timeouts.

@@ -189,12 +189,12 @@ test('WSL running → the in-distro checks do run', async () => {
 });
 
 // ── Honesty rules the UI depends on ────────────────────────────────────────
-test('all five providers are always listed, independently, in the agent-cli tier', async () => {
+test('all four launchable providers are always listed independently in the agent-cli tier', async () => {
   const restore = withEmptyHome();
   reset();
   try {
     const report = await detectRuntimePrerequisites({ force: true });
-    assert.deepEqual(report.providers.map((p) => p.id), ['claude', 'codex', 'gemini', 'grok', 'agy']);
+    assert.deepEqual(report.providers.map((p) => p.id), ['claude', 'codex', 'grok', 'agy']);
     for (const p of report.providers) {
       assert.equal(p.tier, 'agent-cli');
       assert.equal(p.status, 'missing', `${p.id} should be missing in an empty home`);
@@ -405,7 +405,7 @@ test('never throws, even when every probe fails', async () => {
   process.env.SystemRoot = path.join(os.tmpdir(), 'no-such-windows-root');
   try {
     const report = await detectRuntimePrerequisites({ force: true });
-    assert.ok(report.providers.length === 5);
+    assert.ok(report.providers.length === 4);
     assert.equal(report.anyProviderAvailable, false);
   } finally {
     if (savedSystemRoot === undefined) delete process.env.SystemRoot;

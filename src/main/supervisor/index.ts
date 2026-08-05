@@ -4,7 +4,7 @@ import fs from 'fs';
 import crypto from 'crypto';
 import { execFileSync, execFile, spawn } from 'child_process';
 import { v4 as uuidv4 } from 'uuid';
-import { Agent, AgentProvider, AgentRoleLane, AgentStatus, AgentStopReason, BulkStopItemResult, ContextStats, ContinuationPhaseSignal, ContinuationPhaseState, ForceContinuationResult, HistoryNotice, LaunchAgentInput, QueryResult, RetentionExecutionResult, SendOutcome, StopEligibilityMode, StopResult, Team, TerminalDeadSnapshot, TerminalLogRange, TerminalLogTail, UsageLimitsReading, hasSupervisorPrivilege } from '../../shared/types';
+import { Agent, AgentProvider, AgentRoleLane, AgentStatus, AgentStopReason, BulkStopItemResult, ContextStats, ContinuationPhaseSignal, ContinuationPhaseState, ForceContinuationResult, HistoryNotice, LaunchAgentInput, LaunchableAgentProvider, QueryResult, RetentionExecutionResult, SendOutcome, StopEligibilityMode, StopResult, Team, TerminalDeadSnapshot, TerminalLogRange, TerminalLogTail, UsageLimitsReading, hasSupervisorPrivilege } from '../../shared/types';
 import { assembleGuardSnapshot, evaluateStopEligibility, type AgentBrowserState, type GuardDeps } from '../lifecycle/guards';
 import {
   TMUX_SESSION_PREFIX, PROVIDER_COMMANDS, WORKER_CLAUDE_MODEL,
@@ -356,8 +356,8 @@ export function codexProfileTrustIntact(
 //     Untrusted dirs pop the interactive "Do you trust the files in this
 //     folder?" dialog, which a headless worker can never answer.
 // The dashboard knows every directory it launches agents into, so it seeds
-// these entries at launch time. Gemini runs `--yolo` and has no equivalent
-// gate today, so it is skipped.
+// these entries at launch time for every launchable provider with a known
+// trust mechanism.
 
 /** The path-key variants Codex may match a Windows trusted project by.
  *  Codex 0.136 was observed rejecting a lowercase-only entry and accepting the
@@ -1159,6 +1159,8 @@ export const SUPERVISOR_AGENT_MD_V19_HASH = 'bb0c5b846bde9e4f857503ccd7c67087bc9
  *  SUPERVISOR_AGENT_MD_V20 in constants.ts; the live v21 body derives from it.
  *  previousHashes[20] for silent v20 → v21 upgrade of pristine workspaces. */
 export const SUPERVISOR_AGENT_MD_V20_HASH = 'd9191bb1f403d1ac659a57f5c3068c4713ed5081c53c015a58ac4b31369bce9f';
+/** Frozen v21 body before Gemini retirement guidance was added in v22. */
+export const SUPERVISOR_AGENT_MD_V21_HASH = 'cab43b74e35dcd71e3baf059212ec4890ff56759e37821cd2d6b2e7c3a2b7527';
 
 /** SHA-256 hex of the v6 `.dashboard/workers/claude/CLAUDE.md` (pre-`.lares`
  *  rename). Used in the v7 file's previousHashes. */
@@ -1502,7 +1504,7 @@ const BRACKETED_PASTE_START = '\x1b[200~';
 const BRACKETED_PASTE_END = '\x1b[201~';
 const WINDOWS_SEND_INPUT_ENTER_DELAY_MS = 80;
 const WINDOWS_CODEX_TYPING_DELAY_MS = 8;
-// Chars per PTY write in the codex/gemini Windows send loop. Was 1 (per-char).
+// Chars per PTY write in the codex Windows send loop. Was 1 (per-char).
 // Empirically, codex's paste-burst detector does not trip up to at least 512
 // chars per write so long as writes are separated by WINDOWS_CODEX_TYPING_DELAY_MS;
 // 64 is a conservative choice that gives a ~30× speedup on multi-KB sends
@@ -1510,7 +1512,7 @@ const WINDOWS_CODEX_TYPING_DELAY_MS = 8;
 const WINDOWS_CODEX_TYPING_CHUNK_SIZE = 64;
 
 // Win32 Input Mode CSI sequence for a VK_RETURN keypress (down + up).
-// Codex/gemini on Windows enable mode ?9001h and expect submit as a real
+// Codex on Windows enables mode ?9001h and expects submit as a real
 // key event, not the auto-converted single KEY_DOWN ConPTY emits for raw '\r'.
 // Format: ESC [ Vk ; Sc ; Uc ; Kd ; Cs ; Rc _
 const WIN32_KEY_ENTER_DOWN = '\x1b[13;28;13;1;0;1_';
@@ -1841,7 +1843,7 @@ export class AgentSupervisor extends EventEmitter {
   // Team message delivery
   private teamDeliveryEngine: TeamMessageDeliveryEngine;
 
-  // Per-agent serial input queue. The Windows codex/gemini path types one
+  // Per-agent serial input queue. The Windows codex path types one
   // character at a time at WINDOWS_CODEX_TYPING_DELAY_MS to dodge the
   // paste-burst dialog, so a single send can take 30+ seconds for a few KB
   // of text. We chain sends per agent so two callers can't interleave their
@@ -1901,7 +1903,7 @@ export class AgentSupervisor extends EventEmitter {
   private codexSidRecoveryPolls = new Set<string>();
   // Layer B (codex session-id race fix) — global per-codex-home serialization
   // gate around the launch→sid-bind window. Both codex homes ('windows'|'wsl')
-  // are distinct keys; claude/gemini launches never touch it. Instantiated in
+  // are distinct keys; non-codex launches never touch it. Instantiated in
   // the constructor with the hard cap sized to the discovery timeout + margin.
   private codexLaunchGate!: CodexLaunchGate;
   // Per-agent gate release handle, so whichever of {discovery-settle, hook-bind,
@@ -2579,6 +2581,12 @@ export class AgentSupervisor extends EventEmitter {
   }
 
   async launchAgent(input: LaunchAgentInput, internal?: InternalLaunchContext): Promise<Agent> {
+    if (input.provider === 'gemini') {
+      throw Object.assign(
+        new Error('Gemini provider discontinued; use Antigravity (agy). Historical Gemini agents remain readable.'),
+        { statusCode: 422, code: 'provider-discontinued' },
+      );
+    }
     // D5-lite admission gate (incident-2026-07-11 §5 D5): refuse NEW launches
     // under Critical commit pressure or at a static cap, BEFORE any side effect
     // (createAgent / spawn). The refusal carries a machine-readable `code`
@@ -2617,6 +2625,20 @@ export class AgentSupervisor extends EventEmitter {
         };
         console.log(`[supervisor] Resolved template "${template.name}" (${template.id}) for agent "${input.title}"`);
       }
+    }
+
+    const requestedProvider = resolvedInput.provider || 'claude';
+    if (requestedProvider === 'gemini') {
+      throw Object.assign(
+        new Error('Gemini provider discontinued; use Antigravity (agy). Historical Gemini agents remain readable.'),
+        { statusCode: 422, code: 'provider-discontinued' },
+      );
+    }
+    if (!(['claude', 'codex', 'grok', 'agy'] as string[]).includes(requestedProvider)) {
+      throw Object.assign(
+        new Error(`Unknown provider '${requestedProvider}'`),
+        { statusCode: 400, code: 'invalid-provider' },
+      );
     }
 
     // Multiple supervisors per workspace are allowed (Agent-type redesign): a
@@ -2684,7 +2706,7 @@ export class AgentSupervisor extends EventEmitter {
       // there is no single-researcher cap. Each launch is an independent agent.
     }
 
-    const provider = resolvedInput.provider || 'claude';
+    const provider = (resolvedInput.provider || 'claude') as LaunchableAgentProvider;
     const defaultCmd = PROVIDER_COMMANDS[provider][pathType];
     // The "worker lane": hook-based status + .lares/workers/<provider>/ cwd +
     // hook scaffold. A supervised worker is a worker that also notifies a
@@ -2704,7 +2726,7 @@ export class AgentSupervisor extends EventEmitter {
     // Resolve the launch command, reconciling explicit input, the workspace's
     // stored default command, and the requested provider. resolveLaunchCommand:
     //  (1) treats a pristine framework default (incl. a legacy ` --chrome`
-    //      variant) as overridable so a codex/gemini launch uses the correct
+    //      variant) as overridable so a non-Claude launch uses the correct
     //      provider binary instead of the stored claude command, and
     //  (2) guards against silently launching a non-claude provider via a
     //      claude/ccode binary even for a custom workspace command.
@@ -2752,7 +2774,7 @@ export class AgentSupervisor extends EventEmitter {
       // `--chrome` straight through — re-activating cic for worker/supervisor/
       // legacy/persona. Strip any standalone `--chrome` token here so cic is
       // genuinely unavailable to every NON-researcher lane regardless of the
-      // stored command. (No-op for codex/gemini commands, which never carry it.)
+      // stored command. (No-op for other-provider commands, which never carry it.)
       command = command.replace(/\s+--chrome\b/g, '');
     }
     // Class IV codex hooks. Path A (probe 2026-07-28): a native-Windows WORKER
@@ -2893,8 +2915,7 @@ export class AgentSupervisor extends EventEmitter {
     // null, log stays 0 bytes); WSL's leading `cd '${dir}'` exits before the
     // provider CLI runs. The claude case self-heals as a side effect of
     // `ensureWorkerScaffold` writing files under `.lares/workers/claude/`,
-    // but codex/gemini have empty file maps and their per-provider dir would
-    // never be created. Provider-agnostic mkdir here closes the gap once for
+    // but providers with empty file maps would otherwise have no lane directory Provider-agnostic mkdir here closes the gap once for
     // every cwd resolution branch (supervisor, persona, supervised, explicit).
     if (pathType === 'windows') {
       fs.mkdirSync(agentCwd, { recursive: true });
@@ -3177,8 +3198,8 @@ export class AgentSupervisor extends EventEmitter {
     ...proposalToPlanEntries('.lares/supervisor/.claude/skills/proposal-to-plan'),
     [`.lares/supervisor/CLAUDE.md`]:                                              {
       content: SUPERVISOR_AGENT_MD,
-      version: 21, // v21 (WP-P0C planning-surface) inserts the "Where planning artifacts live" section: proposals in .lares/proposals/, plan folders under <workspaceStateDir()>/plans/, the proposal-to-plan create/resume path, ARC.md owned by the responsible supervisor (created at promote, refreshed on orient/integrate), and the orient-first rule. Previously: v20 (memory-lessons v2, WP-G) rewrites the `## Memory` section to injection-aware text (the index is injected at launch for supervisors, not an instructed session-start read), adds the D2 cold-resume re-orientation preamble, a validate-after-edit pointer, and the discoverability paragraph (memories/lessons serve EVERY supervisor/worker, not just the author; `remember` to save, `recall_memory` to fetch); and replaces the D10 `see behavioral.md B-11/B-12` phantom with self-contained triage guidance. Previously: v19 (turn-history) adds the <!-- section:turn-history v1 --> block documenting the checkpoint toolset (list_checkpoints/diff_turn/restore_paths/revert_turn/prune_checkpoints/read_agent_files_touched), the three-layer evidence model, capture-health ambiguity, forward-only paging, and immediate/destructive mutation in a shared tree; points at the checkpoint-forensics skill. Previously: v18 (cross-workspace-collaboration WP6) extends the `launch_agent` tool bullet with the `supervisor-peer` launch mode (top-level peer, cross-workspace-only, supervisor-gated) and adds a `revive_agent` bullet (supervisor-only relaunch of a done/crashed session; providers claude+codex). Previously: v17 (WP1.3) widens the `list_agents` tool bullet to document that a foreign `workspace_id` is supervisor-only, and adds a `list_workspaces` bullet (cross-workspace discovery). Previously: v16 (Lares rebrand) renames every `.dashboard/…` state-folder reference to `.lares/…` (working-directory note, researcher inbox pointers, research-store section). Previously: v15 (continuation-request awareness) adds the `save_continuation_brick` tool bullet and the `<!-- section:continuation-request v1 -->` block: answer a dashboard continuation request THAT TURN, write per-agent state + pointers rather than prose, respect the stated byte cap, finish the current response normally (the dashboard waits for turn completion before swapping), and start no new work. Previously: v14 (MCP context-overhead cut) removes the resident documentation for two deleted MCP tools: the `get_context_stats` bullet is gone (the `list_agents` bullet now states the per-agent context reading is returned inline, so the capability is preserved), and `## Multi-agent orchestration` no longer says "Discover with `list_orchestrations`".
-      previousHashes: { 1: SUPERVISOR_AGENT_MD_V1_HASH, 2: SUPERVISOR_AGENT_MD_V2_HASH, 3: SUPERVISOR_AGENT_MD_V3_HASH, 4: SUPERVISOR_AGENT_MD_V4_HASH, 5: SUPERVISOR_AGENT_MD_V5_HASH, 6: SUPERVISOR_AGENT_MD_V6_HASH, 7: SUPERVISOR_AGENT_MD_V7_HASH, 8: SUPERVISOR_AGENT_MD_V8_HASH, 9: SUPERVISOR_AGENT_MD_V9_HASH, 10: SUPERVISOR_AGENT_MD_V10_HASH, 11: SUPERVISOR_AGENT_MD_V11_HASH, 12: SUPERVISOR_AGENT_MD_V12_HASH, 13: SUPERVISOR_AGENT_MD_V13_HASH, 14: SUPERVISOR_AGENT_MD_V14_HASH, 15: SUPERVISOR_AGENT_MD_V15_HASH, 16: SUPERVISOR_AGENT_MD_V16_HASH, 17: SUPERVISOR_AGENT_MD_V17_HASH, 18: SUPERVISOR_AGENT_MD_V18_HASH, 19: SUPERVISOR_AGENT_MD_V19_HASH, 20: SUPERVISOR_AGENT_MD_V20_HASH },
+      version: 22, // v22 documents Gemini's discontinuation while preserving historical reads. v21 added the planning-artifacts section.
+      previousHashes: { 1: SUPERVISOR_AGENT_MD_V1_HASH, 2: SUPERVISOR_AGENT_MD_V2_HASH, 3: SUPERVISOR_AGENT_MD_V3_HASH, 4: SUPERVISOR_AGENT_MD_V4_HASH, 5: SUPERVISOR_AGENT_MD_V5_HASH, 6: SUPERVISOR_AGENT_MD_V6_HASH, 7: SUPERVISOR_AGENT_MD_V7_HASH, 8: SUPERVISOR_AGENT_MD_V8_HASH, 9: SUPERVISOR_AGENT_MD_V9_HASH, 10: SUPERVISOR_AGENT_MD_V10_HASH, 11: SUPERVISOR_AGENT_MD_V11_HASH, 12: SUPERVISOR_AGENT_MD_V12_HASH, 13: SUPERVISOR_AGENT_MD_V13_HASH, 14: SUPERVISOR_AGENT_MD_V14_HASH, 15: SUPERVISOR_AGENT_MD_V15_HASH, 16: SUPERVISOR_AGENT_MD_V16_HASH, 17: SUPERVISOR_AGENT_MD_V17_HASH, 18: SUPERVISOR_AGENT_MD_V18_HASH, 19: SUPERVISOR_AGENT_MD_V19_HASH, 20: SUPERVISOR_AGENT_MD_V20_HASH, 21: SUPERVISOR_AGENT_MD_V21_HASH },
     },
     [`.lares/supervisor/.claude/settings.json`]:                                  {
       content: SUPERVISOR_CLAUDE_SETTINGS_JSON,
@@ -3710,7 +3731,7 @@ export class AgentSupervisor extends EventEmitter {
     if (lane === 'supervisor') Object.assign(files, AgentSupervisor.SUPERVISOR_FILES);
     else if (lane === 'researcher') Object.assign(files, AgentSupervisor.RESEARCHER_FILES);
     else if (lane === 'workers/claude') Object.assign(files, AgentSupervisor.WORKER_FILES_CLAUDE);
-    // codex/gemini workers: hooks ride CODEX_HOME / chat-stream, not cwd files.
+    // non-Claude workers use their provider-specific hook carriers.
 
     let wrote = 0;
     for (const [rel, file] of Object.entries(files)) {
@@ -3965,7 +3986,7 @@ export class AgentSupervisor extends EventEmitter {
    *  entries and unrelated config are never rewritten. Best-effort — a failure
    *  here degrades to today's behavior (the CLI prompts or refuses). */
   private ensureProviderDirTrust(workDir: string, agentCwd: string, provider: string, pathType: string): void {
-    if (provider !== 'claude' && provider !== 'codex' && provider !== 'grok' && provider !== 'agy') return;  // gemini --yolo has no trust gate today
+    if (provider !== 'claude' && provider !== 'codex' && provider !== 'grok' && provider !== 'agy') return;
     // agy trust is exact and non-cascading: seed precisely the cwd spelling
     // passed to its launch, with no grok-style git-root collapse or aliases.
     const dirs = provider === 'agy'
@@ -4639,16 +4660,6 @@ export class AgentSupervisor extends EventEmitter {
         }
       }
 
-      // Gemini resume: bare --resume picks the most recent session for this user.
-      // Caveat: not scoped to cwd or to this specific agent — if multiple Gemini
-      // agents are running, the wrong one's session can be picked. Acceptable for
-      // single-Gemini-agent workflows; named-session (--resume <name> via /chat
-      // save) is the proper fix and can be layered on later.
-      if (resume && agent.provider === 'gemini' && !args.includes('--resume') && !args.includes('-r')) {
-        args.push('--resume');
-        console.log(`[Windows] Resuming ${agent.title} (${agent.id}) with gemini --resume (most-recent session)`);
-      }
-
       if (resume && agent.provider === 'codex') {
         // BUG-04: `discoverNewCodexSession`'s 10 s post-launch poll often
         // misses the codex `session_meta` flush. Self-heal by falling back to
@@ -4726,7 +4737,7 @@ export class AgentSupervisor extends EventEmitter {
       }
     }
 
-    // §6.4 — claude's counterpart to the codex/gemini preflight below. When the
+    // §6.4 — claude's counterpart to the other-provider preflight below. When the
     // resolver finds nothing, the cmd.exe fallback above cannot work either:
     // findWindowsClaudePath's own fallback IS `where claude`, so a failure here
     // means the same PATH lookup cmd.exe would do has already come up empty.
@@ -4746,16 +4757,16 @@ export class AgentSupervisor extends EventEmitter {
     }
     const useDirectSpawn = needsDirectSpawn && launchCmd !== cmd;
 
-    // Codex/Gemini/Grok/Agy have no known-install resolver like claude's, and go
+    // Codex/Grok/Agy have no known-install resolver like claude's, and go
     // through pty-host's `cmd.exe /c` wrap (useDirectSpawn is claude-only).
-    // Electron's login-time PATH can omit a codex/gemini/grok/agy shim that works in
+    // Electron's login-time PATH can omit a codex/grok/agy shim that works in
     // the user's terminal, so a bare `cmd.exe /c codex` crashes with a cryptic
     // "'codex' is not recognized". Resolve the real binary to an absolute path
     // and launch that; if it genuinely can't be found, fail loudly with a
     // user-visible message. Keying off provider (not the literal token) also
     // rescues a wsl-style `ccodex`/`ccode` command that landed on the Windows
     // path. Known installer locations are preferred by provider-resolver.
-    if (agent.provider === 'codex' || agent.provider === 'gemini' || agent.provider === 'grok' || agent.provider === 'agy') {
+    if (agent.provider === 'codex' || agent.provider === 'grok' || agent.provider === 'agy') {
       const resolvedBinary = await findWindowsProviderBinary(agent.provider);
       if (resolvedBinary) {
         launchCmd = resolvedBinary;
@@ -5330,10 +5341,10 @@ export class AgentSupervisor extends EventEmitter {
     // A workspace typed 'wsl' on a machine WITHOUT WSL routes here and tries to
     // run `ccodex`/`ccode` inside a distro that doesn't exist, failing
     // cryptically — the Windows resolver in launchWindowsAgent can't help a
-    // wsl-typed workspace. Preflight WSL availability for codex/gemini and fail
+    // wsl-typed workspace. Preflight WSL availability for codex and fail
     // with a user-visible message instead. Uses the cached passive probe, so it
     // never re-triggers Windows' "install WSL" popup once WSL is known absent.
-    if (agent.provider === 'codex' || agent.provider === 'gemini') {
+    if (agent.provider === 'codex') {
       const wslStatus = await getPassiveWslStatus();
       if (wslStatus.state === 'unavailable' || wslStatus.state === 'no-distro') {
         const message = `Cannot launch ${agent.provider} in a WSL workspace — WSL is not available on this machine. Re-create the workspace as a Windows path type, or install WSL.`;
@@ -5421,7 +5432,7 @@ export class AgentSupervisor extends EventEmitter {
     // two can never diverge. SELF_ID is the forward-looking ownership hook (owner
     // id forwarded by a later script); no ownership logic is built here. An agent's
     // subprocesses inherit the agent's dashboard credential level BY DESIGN.
-    // Provider-agnostic like the Windows block: Codex/Gemini use this WSL path;
+    // Provider-agnostic like the Windows block: Codex uses this WSL path;
     // Grok/Agy are rejected above until their WSL transports are supported.
     if (roleLaneOf(agent) !== 'legacy') {
       // WP0.5 — the WSL child env carries the SAME single per-agent capability
@@ -5621,16 +5632,6 @@ export class AgentSupervisor extends EventEmitter {
           command += ` --session-id ${newId}`;
           console.warn(`[WSL] Resume session not found on disk for ${agent.id} (${missingId}); falling back to fresh launch with new session-id ${newId}`);
         }
-      }
-
-      // Gemini resume: bare --resume picks the most recent session for this user.
-      // Caveat: not scoped to cwd or to this specific agent — if multiple Gemini
-      // agents are running, the wrong one's session can be picked. Acceptable for
-      // single-Gemini-agent workflows; named-session (/chat save <name> + --resume
-      // <name>) is the proper fix and can be layered on later.
-      if (resume && agent.provider === 'gemini' && !command.includes('--resume') && !command.includes(' -r ')) {
-        command += ' --resume';
-        console.log(`[WSL] Resuming ${agent.title} (${agent.id}) with gemini --resume (most-recent session)`);
       }
 
       if (resume && agent.provider === 'codex') {
@@ -6779,9 +6780,13 @@ export class AgentSupervisor extends EventEmitter {
         if (!this.resolveCodexResumeSessionId(agent)) throw revErr('revive-no-session', 422);
         return;
       }
+      case 'gemini':
+        throw revErr('revive-unsupported-provider', 422, {
+          message: 'Gemini provider discontinued; historical agents remain readable but cannot be revived. Use Antigravity (agy) for new work.',
+        });
       default:
         throw revErr('revive-unsupported-provider', 422, {
-          message: 'revive supports: claude, codex; gemini, grok and agy are not yet session-mapped',
+          message: 'revive supports: claude, codex; grok and agy are not yet session-mapped',
         });
     }
   }
@@ -8162,7 +8167,7 @@ export class AgentSupervisor extends EventEmitter {
         // Grok and agy are intentionally NOT in this tmux known-provider
         // whitelist: both are refused on WSL until their Linux transports are
         // probed, so neither can reach this branch as a known provider.
-        const provider = agent.provider === 'claude' || agent.provider === 'codex' || agent.provider === 'gemini'
+        const provider = agent.provider === 'claude' || agent.provider === 'codex'
           ? agent.provider
           : 'unknown';
         await tmuxSendInput(agent.tmuxSessionName, text, provider, submit);
@@ -8198,8 +8203,8 @@ export class AgentSupervisor extends EventEmitter {
           winRunner.write(getWindowsSubmitSequence('agy'));
         }
         this.emitSyntheticUserEcho(agent, text);
-      } else if (agent?.provider === 'codex' || agent?.provider === 'gemini') {
-        // Codex/gemini enable Win32 Input Mode (ESC[?9001h). In this mode the
+      } else if (agent?.provider === 'codex') {
+        // Codex enables Win32 Input Mode (ESC[?9001h). In this mode the
         // TUI expects key events as CSI sequences with both KEY_DOWN and
         // KEY_UP. ConPTY auto-converts incoming bytes into a single KEY_DOWN
         // event, which is enough to render typed characters but not enough to
@@ -8279,9 +8284,9 @@ export class AgentSupervisor extends EventEmitter {
 
   private emitSyntheticUserEcho(agent: Agent, text: string): void {
     // Providers with no native dashboard-readable session log: submitted text
-    // would otherwise vanish from the chat pane. Grok and agy deliberately join
-    // gemini here; neither gets a SessionLogReader registration.
-    if (agent.provider !== 'codex' && agent.provider !== 'gemini' && agent.provider !== 'grok' && agent.provider !== 'agy') return;
+    // would otherwise vanish from the chat pane. Grok and agy have no native
+    // user-text event in their registered session readers.
+    if (agent.provider !== 'codex' && agent.provider !== 'grok' && agent.provider !== 'agy') return;
     this.sessionLogReader.appendSyntheticUserText(agent.id, text);
   }
 
@@ -8756,6 +8761,13 @@ export class AgentSupervisor extends EventEmitter {
     // Relaunch agents that were running before the app was closed
     const activeAgents = getActiveAgents();
     for (const agent of activeAgents) {
+      if (agent.provider === 'gemini') {
+        const message = 'Gemini provider discontinued; the historical agent remains readable but will not be relaunched. Use Antigravity (agy) for new work.';
+        const transition = applyStatusTransition(agent.id, 'crashed');
+        addEvent(agent.id, 'reconnect_failed', message);
+        this.emit('statusChanged', { agentId: agent.id, status: 'crashed', fromStatus: transition?.prior, source: 'restart-failed' } satisfies StatusChangedEvent);
+        continue;
+      }
       // These agents were "working"/"idle" when the app closed but their
       // processes are gone. Relaunch with --continue to resume conversations.
       const hasRunner = this.windowsRunners.has(agent.id) || this.wslRunners.has(agent.id);

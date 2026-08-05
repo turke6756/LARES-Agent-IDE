@@ -4,7 +4,7 @@ function getOrchestrationToolDefinitions() {
   return [
     {
       name: 'launch_agent',
-      description: 'Launch a new worker agent in a workspace. Optionally use a template or persona for pre-configured identity/prompt. When `prompt` is provided, the dashboard writes it into the agent\'s input buffer and presses Enter to submit (provider-appropriate: CR for Claude on Windows / kitty-encoded Enter for Codex+Gemini and for WSL agents). Pass `submit: false` to leave the prompt in the buffer without submitting (useful when the caller wants to append more input via send_keys_to_agent before the agent processes the turn). For codex agents, pass `fresh_session: true` to launch without `codex resume` so the codex CLI mints a fresh conversation rather than inheriting a prior rollout in this workspace — the dashboard still discovers and binds the new session id.',
+      description: 'Launch a new worker agent in a workspace. Optionally use a template or persona for pre-configured identity/prompt. When `prompt` is provided, the dashboard writes it into the agent\'s input buffer and presses Enter to submit (provider-appropriate: CR for Claude on Windows / kitty-encoded Enter for Codex and for WSL agents). Pass `submit: false` to leave the prompt in the buffer without submitting (useful when the caller wants to append more input via send_keys_to_agent before the agent processes the turn). For codex agents, pass `fresh_session: true` to launch without `codex resume` so the codex CLI mints a fresh conversation rather than inheriting a prior rollout in this workspace — the dashboard still discovers and binds the new session id.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -16,7 +16,7 @@ function getOrchestrationToolDefinitions() {
           template_id: { type: 'string', description: 'Optional template ID. Agent inherits the template persona, prompt, provider, etc.' },
           persona: { type: 'string', description: 'Persona subdirectory name under .claude/agents/. Agent inherits its CLAUDE.md as system instructions.' },
           system_prompt: { type: 'string', description: 'Optional identity prompt injected as the first message. Overrides template system_prompt.' },
-          provider: { type: 'string', enum: ['claude', 'gemini', 'codex', 'grok', 'agy'], description: 'AI provider (default: claude).' },
+          provider: { type: 'string', enum: ['claude', 'codex', 'grok', 'agy'], description: 'AI provider (default: claude). Gemini is discontinued; use Antigravity (`agy`).' },
           command: { type: 'string', description: 'Custom command to launch the agent process. Overrides the provider default.' },
           working_directory: { type: 'string', description: 'Working directory for the agent. Defaults to workspace root.' },
           auto_restart: { type: 'boolean', description: 'Auto-restart the agent on crash (default: true).' },
@@ -60,7 +60,8 @@ function getOrchestrationToolDefinitions() {
         'finished/crashed agent back with its full prior context instead of launching a fresh one. ' +
         'Cross-workspace and same-workspace revival BOTH require supervisor privilege (revival is a ' +
         'launch-class mutation) and every attempt is audited. Provider support: revive supports ' +
-        'claude and codex; gemini is not yet session-addressable and is rejected. Optionally pass ' +
+        'claude and codex. Historical Gemini agents remain readable, but Gemini is discontinued ' +
+        'and cannot be revived; use Antigravity (`agy`) for new work. Optionally pass ' +
         '`message` to queue a wake instruction — it is delivered only AFTER the revived agent can ' +
         'orient (the dashboard prepends a get_my_context orientation preamble). Pass `force: true` ' +
         'to revive a supervisor even when a live successor supervisor already exists in its workspace.',
@@ -98,10 +99,10 @@ function getOrchestrationToolDefinitions() {
         '(no automatic Enter, no line-ending normalization).\n\n' +
         'PREFERRED: pass a named `key` (e.g. {"key": "enter"}). The dashboard looks up the ' +
         'agent\'s provider and host and emits the correct byte sequence. This is the only reliable ' +
-        'way to submit Enter, because the right bytes for Enter differ across claude vs codex/gemini ' +
+        'way to submit Enter, because the right bytes for Enter differ across claude vs codex ' +
         'and Windows vs WSL. Supported `key` values:\n' +
         '  "enter"       — submit (provider+host-aware: \\r for claude, Win32 VK_RETURN down+up for\n' +
-        '                  codex/gemini on Windows, kitty CSI-u \\x1b[13u for codex/gemini on WSL)\n' +
+        '                  codex on Windows, kitty CSI-u \\x1b[13u for codex on WSL)\n' +
         '  "shift-enter" — newline without submit (Win32 Shift+Enter or kitty \\x1b[13;2u)\n' +
         '  "esc"         — \\x1b\n' +
         '  "tab"         — \\t\n' +
@@ -132,7 +133,7 @@ function getOrchestrationToolDefinitions() {
             ],
             description:
               'Named key. The dashboard translates this to the correct byte sequence for the ' +
-              'agent\'s provider (claude / codex / gemini) and host (Windows / WSL). PREFERRED ' +
+              'agent\'s provider and host (Windows / WSL). PREFERRED ' +
               'over `keys` for Enter and any other event whose encoding varies by target.',
           },
           count: {
@@ -298,7 +299,7 @@ async function handleOrchestrationToolCall(name, args, apiRequest) {
         } else {
           // BUG-01: submit defaults to true so the prompt is auto-pressed
           // (Enter is provider-appropriate: CR for Claude, kitty-encoded for
-          // Codex/Gemini and WSL). Pass submit:false to type without submit.
+          // Codex and WSL). Pass submit:false to type without submit.
           // Handoff handshake: submitted prompts use confirm:true so this
           // result reports whether the worker turn ACTUALLY started — not
           // just that bytes were typed.

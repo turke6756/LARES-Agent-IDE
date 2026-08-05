@@ -102,10 +102,17 @@ export class OrchestrationService extends EventEmitter {
       });
     }
 
+    if (req.leadProvider === 'gemini' || req.reviewerProvider === 'gemini') {
+      throw httpErr(422, 'Gemini provider discontinued; use Antigravity (agy). Historical Gemini agents remain readable.');
+    }
+
     let run: OrchestrationRun;
     if (req.resumeRunId) {
       const prior = getOrchestrationRun(req.resumeRunId);
       if (!prior) throw httpErr(404, `No such run: ${req.resumeRunId}`);
+      if (prior.leadProvider === 'gemini' || prior.reviewerProvider === 'gemini') {
+        throw httpErr(422, 'Gemini provider discontinued; historical Gemini orchestration runs remain readable but cannot be resumed. Use Antigravity (agy).');
+      }
       if (req.planningIntentId !== undefined && req.planningIntentId !== prior.planningIntentId) {
         throw httpErr(409, 'A resumed orchestration cannot change its frozen planning intent');
       }

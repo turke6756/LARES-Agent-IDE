@@ -51,6 +51,7 @@ import {
   WORKER_CLAUDE_MD_V5_HASH,
   RESEARCHER_AGENT_MD_V4_HASH,
   SUPERVISOR_AGENT_MD_V20_HASH,
+  SUPERVISOR_AGENT_MD_V21_HASH,
   WORKER_CLAUDE_MD_V9_HASH,
   WORKER_CODEX_AGENTS_MD_V2_HASH,
   proposalToPlanEntries,
@@ -82,6 +83,7 @@ import {
   SUPERVISOR_AGENT_MD,
   SUPERVISOR_AGENT_MD_V19,
   SUPERVISOR_AGENT_MD_V20,
+  SUPERVISOR_AGENT_MD_V21,
   WORKER_CLAUDE_MD_V9,
   WORKER_CODEX_AGENTS_MD_V2,
   PROPOSAL_TO_PLAN_SKILL_MD,
@@ -1689,7 +1691,7 @@ test('G5. supervisor CLAUDE.md: fresh scaffold carries the research-store pointe
     assert.equal(content, SUPERVISOR_AGENT_MD, 'supervisor CLAUDE.md must be exact bundled content');
     assert.equal(countMatches(content, RESEARCH_SECTION_MARKER), 1, 'research-store section appears exactly once');
     const sidecar = readSidecar(workDir);
-    assert.equal(sidecar['supervisor/CLAUDE.md'], 21, `sidecar must record the current bundled version; got ${JSON.stringify(sidecar)}`);
+    assert.equal(sidecar['supervisor/CLAUDE.md'], 22, `sidecar must record the current bundled version; got ${JSON.stringify(sidecar)}`);
 
     const beforeMtime = fs.statSync(mdPath).mtimeMs;
     supervisor.ensureSupervisorScaffold(workDir, 'windows');
@@ -1952,7 +1954,7 @@ test('CF-0. v19 is the current bundled version, previousHashes[18] is registered
   const managed = (AgentSupervisor as unknown as {
     SUPERVISOR_FILES: Record<string, { version: number; previousHashes?: Record<number, string> }>;
   }).SUPERVISOR_FILES['.lares/supervisor/CLAUDE.md'];
-  assert.equal(managed.version, 21, 'the bundled supervisor CLAUDE.md must be v21');
+  assert.equal(managed.version, 22, 'the bundled supervisor CLAUDE.md must be current v22');
   assert.equal(
     managed.previousHashes?.[18],
     SUPERVISOR_AGENT_MD_V18_HASH,
@@ -1965,7 +1967,7 @@ test('CF-0. v19 is the current bundled version, previousHashes[18] is registered
   );
   // WP-P0C pinned v20; v21 is now the head and must NOT pin its own hash yet.
   assert.equal(managed.previousHashes?.[20], SUPERVISOR_AGENT_MD_V20_HASH, 'previousHashes[20] must be SUPERVISOR_AGENT_MD_V20_HASH');
-  assert.equal(managed.previousHashes?.[21], undefined, 'v21 must not pin its own hash yet — that is added when v22 is created');
+  assert.equal(managed.previousHashes?.[21], SUPERVISOR_AGENT_MD_V21_HASH, 'previousHashes[21] must pin the frozen v21 body');
   assert.notEqual(
     sha256Hex(SUPERVISOR_AGENT_MD),
     SUPERVISOR_AGENT_MD_V20_HASH,
@@ -2000,7 +2002,7 @@ test('CF-1. supervisor CLAUDE.md: pristine v18 silently upgrades to v19 (no .bak
     assert.equal(countMatches(content, '<!-- section:turn-history v1 -->'), 1, 'the turn-history section lands exactly once (not double-appended)');
     const backups = fs.readdirSync(path.dirname(mdPath)).filter((n) => n.startsWith('CLAUDE.md.bak.'));
     assert.equal(backups.length, 0, 'known-hash v18→v19 upgrade must NOT create a backup');
-    assert.equal(readSidecar(workDir)['supervisor/CLAUDE.md'], 21, 'sidecar must record v19');
+    assert.equal(readSidecar(workDir)['supervisor/CLAUDE.md'], 22, 'sidecar must record v19');
     // The fresh skill rides along on the same scaffold pass.
     assert.equal(fs.readFileSync(checkpointSkillPath(workDir), 'utf-8'), SUPERVISOR_CHECKPOINT_FORENSICS_SKILL, 'the checkpoint-forensics skill must be the exact bundled content');
     assert.equal(readSidecar(workDir)['supervisor/.claude/skills/checkpoint-forensics/SKILL.md'], 1, 'skill sidecar must record v1');
@@ -2032,7 +2034,7 @@ test('CF-2. supervisor CLAUDE.md: locally-edited v18 (unknown hash) → .bak + o
     assert.equal(backups.length, 1, `expected exactly one CLAUDE.md .bak.<ts>; got: ${backups.join(', ')}`);
     assert.equal(fs.readFileSync(path.join(path.dirname(mdPath), backups[0]), 'utf-8'), edited,
       'backup must hold the locally-edited content verbatim');
-    assert.equal(readSidecar(workDir)['supervisor/CLAUDE.md'], 21, 'sidecar must record v19');
+    assert.equal(readSidecar(workDir)['supervisor/CLAUDE.md'], 22, 'sidecar must record v19');
   } finally {
     cleanup();
     rmrf(workDir);
@@ -2098,7 +2100,7 @@ test('ML-S-1. supervisor CLAUDE.md: pristine v19 silently upgrades to v20 (no .b
     assert.ok(!/behavioral\.md B-/.test(content), 'the upgraded body carries no behavioral.md B- phantom');
     const backups = fs.readdirSync(path.dirname(mdPath)).filter((n) => n.startsWith('CLAUDE.md.bak.'));
     assert.equal(backups.length, 0, 'known-hash v19→v20 upgrade must NOT create a backup');
-    assert.equal(readSidecar(workDir)['supervisor/CLAUDE.md'], 21, 'sidecar must record v20');
+    assert.equal(readSidecar(workDir)['supervisor/CLAUDE.md'], 22, 'sidecar must record v20');
   } finally {
     cleanup();
     rmrf(workDir);
@@ -2127,7 +2129,7 @@ test('ML-S-2. supervisor CLAUDE.md: locally-edited v19 (unknown hash) → .bak +
     assert.equal(backups.length, 1, `expected exactly one CLAUDE.md .bak.<ts>; got: ${backups.join(', ')}`);
     assert.equal(fs.readFileSync(path.join(path.dirname(mdPath), backups[0]), 'utf-8'), edited,
       'backup must hold the locally-edited content verbatim');
-    assert.equal(readSidecar(workDir)['supervisor/CLAUDE.md'], 21, 'sidecar must record v20');
+    assert.equal(readSidecar(workDir)['supervisor/CLAUDE.md'], 22, 'sidecar must record v20');
   } finally {
     cleanup();
     rmrf(workDir);
@@ -2205,7 +2207,7 @@ test('WP6-0. previousHashes[17] is registered and v18 documents revive_agent + s
   const managed = (AgentSupervisor as unknown as {
     SUPERVISOR_FILES: Record<string, { version: number; previousHashes?: Record<number, string> }>;
   }).SUPERVISOR_FILES['.lares/supervisor/CLAUDE.md'];
-  assert.equal(managed.version, 21, 'the bundled supervisor CLAUDE.md must be v21');
+  assert.equal(managed.version, 22, 'the bundled supervisor CLAUDE.md must be current v22');
   assert.equal(
     managed.previousHashes?.[17],
     SUPERVISOR_AGENT_MD_V17_HASH,
@@ -2237,7 +2239,7 @@ test('WP6-1. supervisor CLAUDE.md: pristine v17 silently upgrades to v18', () =>
       'pristine v17 supervisor CLAUDE.md must silently upgrade to the v18 bundled content');
     const backups = fs.readdirSync(path.dirname(mdPath)).filter((n) => n.startsWith('CLAUDE.md.bak.'));
     assert.equal(backups.length, 0, 'known-hash v17→v18 upgrade must NOT create a backup');
-    assert.equal(readSidecar(workDir)['supervisor/CLAUDE.md'], 21, 'sidecar must record v18');
+    assert.equal(readSidecar(workDir)['supervisor/CLAUDE.md'], 22, 'sidecar must record v18');
   } finally {
     cleanup();
     rmrf(workDir);
@@ -2267,7 +2269,7 @@ test('WP6-2. supervisor CLAUDE.md: locally-edited v17 (unknown hash) → .bak + 
     assert.equal(backups.length, 1, `expected exactly one CLAUDE.md .bak.<ts>; got: ${backups.join(', ')}`);
     assert.equal(fs.readFileSync(path.join(path.dirname(mdPath), backups[0]), 'utf-8'), edited,
       'backup must hold the locally-edited content verbatim');
-    assert.equal(readSidecar(workDir)['supervisor/CLAUDE.md'], 21, 'sidecar must record v18');
+    assert.equal(readSidecar(workDir)['supervisor/CLAUDE.md'], 22, 'sidecar must record v18');
   } finally {
     cleanup();
     rmrf(workDir);
@@ -2416,7 +2418,7 @@ test('CB-1. supervisor CLAUDE.md: pristine v8 silently upgrades to current carry
     const backups = fs.readdirSync(path.dirname(mdPath)).filter((n) => n.startsWith('CLAUDE.md.bak.'));
     assert.equal(backups.length, 0, 'known-hash v8→current upgrade must NOT create a backup');
     const sidecar = readSidecar(workDir);
-    assert.equal(sidecar['supervisor/CLAUDE.md'], 21, `sidecar must record the current bundled version; got ${JSON.stringify(sidecar)}`);
+    assert.equal(sidecar['supervisor/CLAUDE.md'], 22, `sidecar must record the current bundled version; got ${JSON.stringify(sidecar)}`);
   } finally {
     cleanup();
     rmrf(workDir);
@@ -2448,7 +2450,7 @@ test('CB-2. supervisor CLAUDE.md: locally-edited v8 (unknown hash) → .bak + ov
       edited,
       'backup must hold the locally-edited content verbatim',
     );
-    assert.equal(readSidecar(workDir)['supervisor/CLAUDE.md'], 21, 'sidecar must record the current bundled version');
+    assert.equal(readSidecar(workDir)['supervisor/CLAUDE.md'], 22, 'sidecar must record the current bundled version');
   } finally {
     cleanup();
     rmrf(workDir);
@@ -2499,7 +2501,7 @@ test('PS-1. supervisor CLAUDE.md: pristine v9 silently upgrades to v10 carrying 
     const backups = fs.readdirSync(path.dirname(mdPath)).filter((n) => n.startsWith('CLAUDE.md.bak.'));
     assert.equal(backups.length, 0, 'known-hash v9→current upgrade must NOT create a backup');
     const sidecar = readSidecar(workDir);
-    assert.equal(sidecar['supervisor/CLAUDE.md'], 21, `sidecar must record the current bundled version; got ${JSON.stringify(sidecar)}`);
+    assert.equal(sidecar['supervisor/CLAUDE.md'], 22, `sidecar must record the current bundled version; got ${JSON.stringify(sidecar)}`);
   } finally {
     cleanup();
     rmrf(workDir);
@@ -2531,7 +2533,7 @@ test('PS-2. supervisor CLAUDE.md: locally-edited v9 (unknown hash) → .bak + ov
       edited,
       'backup must hold the locally-edited content verbatim',
     );
-    assert.equal(readSidecar(workDir)['supervisor/CLAUDE.md'], 21, 'sidecar must record the current bundled version');
+    assert.equal(readSidecar(workDir)['supervisor/CLAUDE.md'], 22, 'sidecar must record the current bundled version');
   } finally {
     cleanup();
     rmrf(workDir);
@@ -2631,7 +2633,7 @@ test('ET-1. supervisor CLAUDE.md: pristine v10 silently upgrades to v11 carrying
     const backups = fs.readdirSync(path.dirname(mdPath)).filter((n) => n.startsWith('CLAUDE.md.bak.'));
     assert.equal(backups.length, 0, 'known-hash v10→v11 upgrade must NOT create a backup');
     const sidecar = readSidecar(workDir);
-    assert.equal(sidecar['supervisor/CLAUDE.md'], 21, `sidecar must record the current bundled version; got ${JSON.stringify(sidecar)}`);
+    assert.equal(sidecar['supervisor/CLAUDE.md'], 22, `sidecar must record the current bundled version; got ${JSON.stringify(sidecar)}`);
   } finally {
     cleanup();
     rmrf(workDir);
@@ -2663,7 +2665,7 @@ test('ET-2. supervisor CLAUDE.md: locally-edited v10 (unknown hash) → .bak + o
       edited,
       'backup must hold the locally-edited content verbatim',
     );
-    assert.equal(readSidecar(workDir)['supervisor/CLAUDE.md'], 21, 'sidecar must record the current bundled version');
+    assert.equal(readSidecar(workDir)['supervisor/CLAUDE.md'], 22, 'sidecar must record the current bundled version');
   } finally {
     cleanup();
     rmrf(workDir);
@@ -2692,7 +2694,7 @@ test('CP-0. precondition: the frozen v11 hash is registered for silent v11→v12
   const previous = (AgentSupervisor as unknown as {
     SUPERVISOR_FILES: Record<string, { version: number; previousHashes?: Record<number, string> }>;
   }).SUPERVISOR_FILES['.lares/supervisor/CLAUDE.md'];
-  assert.equal(previous.version, 21, 'supervisor CLAUDE.md must be at version 21');
+  assert.equal(previous.version, 22, 'supervisor CLAUDE.md must be at version 21');
   assert.equal(
     previous.previousHashes?.[11],
     SUPERVISOR_AGENT_MD_V11_HASH,
@@ -2738,7 +2740,7 @@ test('CP-1a. supervisor CLAUDE.md: pristine v11 silently upgrades to v12 (ungran
     const backups = fs.readdirSync(path.dirname(mdPath)).filter((n) => n.startsWith('CLAUDE.md.bak.'));
     assert.equal(backups.length, 0, 'known-hash v11→v12 upgrade must NOT create a backup');
     const sidecar = readSidecar(workDir);
-    assert.equal(sidecar['supervisor/CLAUDE.md'], 21, `sidecar must record the current bundled version; got ${JSON.stringify(sidecar)}`);
+    assert.equal(sidecar['supervisor/CLAUDE.md'], 22, `sidecar must record the current bundled version; got ${JSON.stringify(sidecar)}`);
   } finally {
     cleanup();
     rmrf(workDir);
@@ -2777,7 +2779,7 @@ test('CP-2. supervisor CLAUDE.md: locally-edited v11 (unknown hash) → .bak + o
       SUPERVISOR_AGENT_MD_V11_EDITED,
       'backup must hold the locally-edited content verbatim',
     );
-    assert.equal(readSidecar(workDir)['supervisor/CLAUDE.md'], 21, 'sidecar must record the current bundled version');
+    assert.equal(readSidecar(workDir)['supervisor/CLAUDE.md'], 22, 'sidecar must record the current bundled version');
   } finally {
     cleanup();
     rmrf(workDir);
@@ -2859,7 +2861,7 @@ test('EV-2. supervisor CLAUDE.md: pristine v12 silently upgrades to v13', () => 
     assert.equal(countMatches(content, PLANNING_SURFACE_MARKER), 1, 'planning-surface sentinel survives exactly once');
     const backups = fs.readdirSync(path.dirname(mdPath)).filter((n) => n.startsWith('CLAUDE.md.bak.'));
     assert.equal(backups.length, 0, 'known-hash v12→v13 upgrade must NOT create a backup');
-    assert.equal(readSidecar(workDir)['supervisor/CLAUDE.md'], 21, 'sidecar must record the current bundled version');
+    assert.equal(readSidecar(workDir)['supervisor/CLAUDE.md'], 22, 'sidecar must record the current bundled version');
   } finally {
     cleanup();
     rmrf(workDir);
@@ -2890,7 +2892,7 @@ test('EV-3. supervisor CLAUDE.md: locally-edited v12 (unknown hash) → .bak + o
       SUPERVISOR_AGENT_MD_V12_EDITED,
       'backup must hold the locally-edited content verbatim',
     );
-    assert.equal(readSidecar(workDir)['supervisor/CLAUDE.md'], 21, 'sidecar must record the current bundled version');
+    assert.equal(readSidecar(workDir)['supervisor/CLAUDE.md'], 22, 'sidecar must record the current bundled version');
   } finally {
     cleanup();
     rmrf(workDir);
@@ -2913,7 +2915,7 @@ test('OV-0. precondition: the frozen v13 hash is registered for silent v13→v14
   const managed = (AgentSupervisor as unknown as {
     SUPERVISOR_FILES: Record<string, { version: number; previousHashes?: Record<number, string> }>;
   }).SUPERVISOR_FILES['.lares/supervisor/CLAUDE.md'];
-  assert.equal(managed.version, 21, 'the bundled supervisor CLAUDE.md must be v21');
+  assert.equal(managed.version, 22, 'the bundled supervisor CLAUDE.md must be current v22');
   assert.equal(
     managed.previousHashes?.[13],
     SUPERVISOR_AGENT_MD_V13_HASH,
@@ -2967,7 +2969,7 @@ test('OV-2. supervisor CLAUDE.md: pristine v13 silently upgrades to v14', () => 
     assert.equal(countMatches(content, PLANNING_SURFACE_MARKER), 1, 'planning-surface sentinel survives exactly once');
     const backups = fs.readdirSync(path.dirname(mdPath)).filter((n) => n.startsWith('CLAUDE.md.bak.'));
     assert.equal(backups.length, 0, 'known-hash v13→current upgrade must NOT create a backup');
-    assert.equal(readSidecar(workDir)['supervisor/CLAUDE.md'], 21, 'sidecar must record v17');
+    assert.equal(readSidecar(workDir)['supervisor/CLAUDE.md'], 22, 'sidecar must record v17');
   } finally {
     cleanup();
     rmrf(workDir);
@@ -2998,7 +3000,7 @@ test('OV-3. supervisor CLAUDE.md: locally-edited v13 (unknown hash) → .bak + o
       SUPERVISOR_AGENT_MD_V13_EDITED,
       'backup must hold the locally-edited content verbatim',
     );
-    assert.equal(readSidecar(workDir)['supervisor/CLAUDE.md'], 21, 'sidecar must record v17');
+    assert.equal(readSidecar(workDir)['supervisor/CLAUDE.md'], 22, 'sidecar must record v17');
   } finally {
     cleanup();
     rmrf(workDir);
@@ -3019,7 +3021,7 @@ test('PV-0. precondition: the frozen v14 hash is registered for silent v14→v15
   const managed = (AgentSupervisor as unknown as {
     SUPERVISOR_FILES: Record<string, { version: number; previousHashes?: Record<number, string> }>;
   }).SUPERVISOR_FILES['.lares/supervisor/CLAUDE.md'];
-  assert.equal(managed.version, 21, 'the bundled supervisor CLAUDE.md must be v21');
+  assert.equal(managed.version, 22, 'the bundled supervisor CLAUDE.md must be current v22');
   assert.equal(
     managed.previousHashes?.[14],
     SUPERVISOR_AGENT_MD_V14_HASH,
@@ -3079,7 +3081,7 @@ test('PV-2. supervisor CLAUDE.md: pristine v14 silently upgrades to v15', () => 
     assert.equal(countMatches(content, V15_CONTINUATION_SECTION_OPEN), 1, 'the new block lands exactly once');
     const backups = fs.readdirSync(path.dirname(mdPath)).filter((n) => n.startsWith('CLAUDE.md.bak.'));
     assert.equal(backups.length, 0, 'known-hash v14→v15 upgrade must NOT create a backup');
-    assert.equal(readSidecar(workDir)['supervisor/CLAUDE.md'], 21, 'sidecar must record v17');
+    assert.equal(readSidecar(workDir)['supervisor/CLAUDE.md'], 22, 'sidecar must record v17');
   } finally {
     cleanup();
     rmrf(workDir);
@@ -3110,7 +3112,7 @@ test('PV-3. supervisor CLAUDE.md: locally-edited v14 (unknown hash) → .bak + o
       SUPERVISOR_AGENT_MD_V14_EDITED,
       'backup must hold the locally-edited content verbatim',
     );
-    assert.equal(readSidecar(workDir)['supervisor/CLAUDE.md'], 21, 'sidecar must record v17');
+    assert.equal(readSidecar(workDir)['supervisor/CLAUDE.md'], 22, 'sidecar must record v17');
   } finally {
     cleanup();
     rmrf(workDir);
@@ -3538,7 +3540,7 @@ test('WP-P0C-S0. precondition: frozen v20 supervisor CLAUDE.md hashes to the shi
   assert.equal(sha256Hex(SUPERVISOR_AGENT_MD_V20), SUPERVISOR_AGENT_MD_V20_HASH,
     'SUPERVISOR_AGENT_MD_V20 must hash to SUPERVISOR_AGENT_MD_V20_HASH (previousHashes[20]), or pristine v20 workspaces get .bak\'d instead of upgraded');
   const managed = supFilesMap()['.lares/supervisor/CLAUDE.md'];
-  assert.equal(managed.version, 21, 'the bundled supervisor CLAUDE.md must be v21');
+  assert.equal(managed.version, 22, 'the bundled supervisor CLAUDE.md must be current v22');
   assert.equal(managed.previousHashes?.[20], SUPERVISOR_AGENT_MD_V20_HASH,
     'previousHashes[20] must be SUPERVISOR_AGENT_MD_V20_HASH');
   assert.notEqual(sha256Hex(SUPERVISOR_AGENT_MD), SUPERVISOR_AGENT_MD_V20_HASH,
@@ -3552,15 +3554,25 @@ test('WP-P0C-S1. supervisor v20→v21 is a faithful derive-from-frozen transform
   // The new section is ABSENT from the frozen v20 and PRESENT in the live v21.
   assert.ok(!SUPERVISOR_AGENT_MD_V20.includes('## Where planning artifacts live'),
     'the frozen v20 body must NOT carry the planning-artifacts section');
-  assert.ok(SUPERVISOR_AGENT_MD.includes('## Where planning artifacts live'),
+  assert.ok(SUPERVISOR_AGENT_MD_V21.includes('## Where planning artifacts live'),
     'the live v21 body must carry the planning-artifacts section');
-  assert.ok(SUPERVISOR_AGENT_MD.includes('`ARC.md` is YOUR job'), 'v21 must state ARC.md ownership (ruling 29)');
-  assert.ok(SUPERVISOR_AGENT_MD.includes('Orient-first'), 'v21 must state the orient-first rule (ruling 30)');
-  assert.ok(SUPERVISOR_AGENT_MD.includes('proposal-to-plan'), 'v21 must name the proposal-to-plan skill');
+  assert.ok(SUPERVISOR_AGENT_MD_V21.includes('`ARC.md` is YOUR job'), 'v21 must state ARC.md ownership (ruling 29)');
+  assert.ok(SUPERVISOR_AGENT_MD_V21.includes('Orient-first'), 'v21 must state the orient-first rule (ruling 30)');
+  assert.ok(SUPERVISOR_AGENT_MD_V21.includes('proposal-to-plan'), 'v21 must name the proposal-to-plan skill');
   // Everything before the anchor is byte-identical (additive-only edit).
   const anchor = '<!-- section:continuation-request v1 -->';
-  assert.equal(SUPERVISOR_AGENT_MD.split(anchor)[1], SUPERVISOR_AGENT_MD_V20.split(anchor)[1],
+  assert.equal(SUPERVISOR_AGENT_MD_V21.split(anchor)[1], SUPERVISOR_AGENT_MD_V20.split(anchor)[1],
     'the continuation-request section (and everything after the anchor) must be unchanged');
+});
+
+test('WP-GEMINI-RM scaffold v21→v22 pins the old body and deploys discontinued-provider guidance', () => {
+  const managed = supFilesMap()['.lares/supervisor/CLAUDE.md'];
+  assert.equal(sha256Hex(SUPERVISOR_AGENT_MD_V21), SUPERVISOR_AGENT_MD_V21_HASH);
+  assert.equal(managed.version, 22);
+  assert.equal(managed.previousHashes?.[21], SUPERVISOR_AGENT_MD_V21_HASH);
+  assert.match(SUPERVISOR_AGENT_MD, /Gemini is discontinued and cannot be launched or revived/);
+  assert.match(SUPERVISOR_AGENT_MD, /use Antigravity \(agy\)/);
+  assert.notEqual(sha256Hex(SUPERVISOR_AGENT_MD), SUPERVISOR_AGENT_MD_V21_HASH);
 });
 
 test('WP-P0C-W0. precondition: frozen v9 worker CLAUDE.md hashes to the shipped constant', () => {

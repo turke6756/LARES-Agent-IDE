@@ -92,13 +92,13 @@ test('finds an npm-global .cmd shim without consulting PATH', async () => {
 // ── Paths containing spaces ────────────────────────────────────────────────
 // "C:\Users\Firstname Lastname\..." is completely ordinary on Windows and is
 // where naive quoting breaks. The resolver must return the path intact.
-test('resolves through a home directory containing spaces', async () => {
+test('resolves codex through a home directory containing spaces', async () => {
   const fake = withFakeHome('Firstname Lastname', (home) => {
-    writeShim(path.join(home, 'AppData', 'Roaming', 'npm', 'gemini.cmd'));
+    writeShim(path.join(home, 'AppData', 'Roaming', 'npm', 'codex.cmd'));
   });
   try {
-    const found = await findWindowsProviderBinary('gemini');
-    assert.ok(found, 'expected gemini.cmd under a spaced home to be found');
+    const found = await findWindowsProviderBinary('codex');
+    assert.ok(found, 'expected codex.cmd under a spaced home to be found');
     assert.ok(found.includes('Firstname Lastname'), `space lost in path: ${found}`);
     assert.ok(fs.existsSync(found), 'resolver returned a path that does not exist');
   } finally {
@@ -161,7 +161,7 @@ test('grok resolves .grok\\bin\\grok.exe before an npm shim', async () => {
 
 // ── Grok: candidate-directory fallback (npm-global shim) ───────────────────
 // With no installer binary, grok must still resolve from the npm-global dir the
-// same way codex/gemini do — the fallback path a `where.exe`-on-PATH install
+// same way codex does — the fallback path a `where.exe`-on-PATH install
 // also rides.
 test('grok falls back to an npm-global shim when the installer path is absent', async () => {
   const fake = withFakeHome('user', (home) => {
@@ -221,7 +221,6 @@ test('probeWindowsProvider absorbs the claude rejection instead of throwing', as
   const fake = withFakeHome('user', () => { /* nothing installed */ });
   try {
     assert.equal(await probeWindowsProvider('claude'), null);
-    assert.equal(await probeWindowsProvider('gemini'), null);
   } finally {
     fake.restore();
   }
@@ -248,7 +247,7 @@ test('preflight resolves to exactly what the launcher would use', async () => {
 
 // ── The user-facing copy (plan §6.4) ───────────────────────────────────────
 test('missing-provider copy says Lares is fine and names the restart step', () => {
-  for (const p of ['claude', 'codex', 'gemini', 'grok', 'agy'] as const) {
+  for (const p of ['claude', 'codex', 'grok', 'agy'] as const) {
     const msg = missingProviderMessage(p);
     assert.match(msg, /was not found/, `${p}: must state what is missing`);
     assert.match(msg, /Lares is installed correctly/, `${p}: must not read as "Lares is broken"`);

@@ -4411,6 +4411,9 @@ function rowToAgentTemplate(row: any): AgentTemplate {
 }
 
 export function createAgentTemplate(input: CreateAgentTemplateInput): AgentTemplate {
+  if (input.provider === 'gemini') {
+    throw new Error('Gemini provider discontinued; new templates must use Antigravity (agy) or another launchable provider.');
+  }
   const id = uuidv4();
   run(
     `INSERT INTO agent_templates (id, workspace_id, name, description, system_prompt, role_description, provider, command, auto_restart, is_supervisor, is_supervised, is_worker)
@@ -4439,6 +4442,9 @@ export function listAgentTemplates(workspaceId?: string): AgentTemplate[] {
 }
 
 export function updateAgentTemplate(id: string, updates: Partial<CreateAgentTemplateInput>): AgentTemplate {
+  if (updates.provider === 'gemini') {
+    throw new Error('Gemini provider discontinued; templates cannot be changed to Gemini. Use Antigravity (agy).');
+  }
   const sets: string[] = [];
   const params: any[] = [];
 
