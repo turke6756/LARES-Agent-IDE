@@ -2800,6 +2800,17 @@ export interface IpcApi {
     setSettings: (settings: ContextGaugeSettings) => Promise<ContextGaugeSettings>;
     onSettingsChanged: (cb: (settings: ContextGaugeSettings) => void) => () => void;
   };
+  orchestrationProviderSettings: {
+    get: (workspaceId: string) => Promise<OrchestrationProviderSettings>;
+    update: (
+      workspaceId: string,
+      settings: OrchestrationProviderSettings,
+    ) => Promise<OrchestrationProviderSettings>;
+    onChanged: (cb: (event: {
+      workspaceId: string;
+      settings: OrchestrationProviderSettings;
+    }) => void) => () => void;
+  };
   /** WP-8 — terminal-log retention first-sweep notice surface. `getState` is a
    *  PULL (a renderer mounting after the sweep still sees the notice);
    *  `onStateChanged` is the push; `acknowledgeNotice` dismisses the durable

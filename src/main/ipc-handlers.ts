@@ -83,6 +83,11 @@ import {
   type CommitCoordinatorRoutes,
 } from './commit-candidates/commit-coordinator-ipc';
 import type { RequestedPlanBinding } from '../shared/commit-candidates';
+import {
+  ORCHESTRATION_PROVIDER_SETTINGS_CHANNELS,
+  onOrchestrationProviderSettingsChanged,
+  registerOrchestrationProviderSettingsIpc,
+} from './orchestration/orchestration-provider-settings-transport';
 import { resolvePlanBindingAtBoundary } from './api-server';
 
 // Managed temp dir for clipboard-bitmap pastes. Dropped OS files inject their
@@ -158,6 +163,15 @@ export function registerIpcHandlers(
   mainWindow: BrowserWindow,
   detachedWindowDeps: DetachedWindowDeps,
 ): void {
+  registerOrchestrationProviderSettingsIpc(ipcMain, (workspaceId) =>
+    getWorkspace(workspaceId)?.path ?? null);
+  onOrchestrationProviderSettingsChanged((event) => {
+    if (!mainWindow.isDestroyed()) {
+      mainWindow.webContents.send(ORCHESTRATION_PROVIDER_SETTINGS_CHANNELS.changed, event);
+    }
+    broadcastToDetachedViews(ORCHESTRATION_PROVIDER_SETTINGS_CHANNELS.changed, event);
+  });
+
   // Workspace handlers
   ipcMain.handle('workspace:list', () => getWorkspaces());
   ipcMain.handle('workspace:create', (_e, input) => {

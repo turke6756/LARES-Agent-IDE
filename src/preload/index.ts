@@ -437,6 +437,16 @@ const api: IpcApi = {
       return () => ipcRenderer.removeListener('context-gauge:settings-changed', listener);
     },
   },
+  orchestrationProviderSettings: {
+    get: (workspaceId) => ipcRenderer.invoke('get_orchestration_provider_settings', workspaceId),
+    update: (workspaceId, settings) =>
+      ipcRenderer.invoke('update_orchestration_provider_settings', workspaceId, settings),
+    onChanged: (callback) => {
+      const listener = (_event: any, payload: any) => callback(payload);
+      ipcRenderer.on('orchestration_provider_settings_changed', listener);
+      return () => ipcRenderer.removeListener('orchestration_provider_settings_changed', listener);
+    },
+  },
   // WP-8 — terminal-log retention first-sweep notice (pull + push + dismiss).
   logRetention: {
     getState: () => ipcRenderer.invoke('log-retention:get-state'),

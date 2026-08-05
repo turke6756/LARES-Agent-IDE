@@ -35,6 +35,12 @@ import {
 } from './jupyter-kernel-client';
 import { scanPersonas, scaffoldPersona } from './persona-scanner';
 import { applyContextGaugeSettings, type ContextGaugeIpcDeps } from './context-gauge/context-gauge-ipc';
+import {
+  ORCHESTRATION_PROVIDER_SETTINGS_HTTP_PATH,
+  getOrchestrationProviderSettingsForWorkspace,
+  updateOrchestrationProviderSettingsForWorkspace,
+} from './orchestration/orchestration-provider-settings-transport';
+import { OrchestrationProviderSettingsValidationError } from './orchestration/orchestration-provider-settings';
 import { getOrchestrationProviderSettingsCached } from './orchestration/orchestration-provider-settings';
 import { TEAM_MAX_MESSAGES_PER_5MIN, TEAM_MAX_ALTERNATIONS, TEAM_ALTERNATION_WINDOW_MS, TEAM_PAIR_COOLDOWN_MS, CONTINUATION_BRICK_MAX_BYTES, CONTINUATION_ESCAPE_MAX_ATTEMPTS, CONTINUATION_ESCAPE_MAX_ALIVE_MS } from '../shared/constants';
 import { TeamMessageStatus, hasSupervisorPrivilege } from '../shared/types';
@@ -1376,6 +1382,41 @@ export class ApiServer {
       if (method === 'GET') return this.contextGaugeDeps.loadSettings();
       const body = await readBody(req);
       return applyContextGaugeSettings(JSON.parse(body), this.contextGaugeDeps);
+    }
+
+    // Workspace-scoped GroupThink provider defaults. The authenticated
+    // X-Workspace-Id assertion is the sole source of scope: query/body
+    // workspaceId values are intentionally neither inspected nor compared.
+    if (path === ORCHESTRATION_PROVIDER_SETTINGS_HTTP_PATH
+      && (method === 'GET' || method === 'PUT')) {
+      if (!identity.asserted || !identity.workspaceId) {
+        throw Object.assign(
+          new Error('workspace identity required (send X-Workspace-Id header)'),
+          { statusCode: 400 },
+        );
+      }
+      const resolveWorkspaceRoot = (workspaceId: string) =>
+        getWorkspaceRecord(workspaceId)?.path ?? null;
+      if (method === 'GET') {
+        return getOrchestrationProviderSettingsForWorkspace(
+          identity.workspaceId,
+          resolveWorkspaceRoot,
+        );
+      }
+      const body = await readBody(req);
+      const input = body ? JSON.parse(body) : {};
+      try {
+        return updateOrchestrationProviderSettingsForWorkspace(
+          identity.workspaceId,
+          input,
+          resolveWorkspaceRoot,
+        );
+      } catch (error) {
+        if (error instanceof OrchestrationProviderSettingsValidationError) {
+          throw Object.assign(error, { statusCode: 422 });
+        }
+        throw error;
+      }
     }
 
     // GET /api/usage-limits — account-wide Claude subscription usage reading.
