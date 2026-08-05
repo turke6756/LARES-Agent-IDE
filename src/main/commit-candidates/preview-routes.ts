@@ -383,6 +383,10 @@ export function createPreviewRoutes(deps: PreviewRoutesDeps): {
         req.finalizationIds,
       );
     },
+    // SC-WP-W6 — mint through the SAME service the commit coordinator resolves
+    // tokens against (`productionSeams.candidateService`), so a token minted on the
+    // preview leg is actually consumable by the consume channel.
+    mintCandidateToken: (request, context) => service.mintCandidateToken(request, context),
   };
 
   async function resolvePlanFinalizeRequest(

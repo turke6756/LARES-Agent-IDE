@@ -136,20 +136,37 @@ function PackageSaveGesture({
     setOutcome(null);
     setMovedPaths([]);
     try {
-      const response = await window.api.saveCard.preview({ workspaceId, ...selection });
+      // Submit intent: ask the server to mint a consumable commit token for an
+      // eligible candidate, forwarding the human acknowledgements the preview pane
+      // collected. A display-only preview (the expander) never sets `mintIfEligible`.
+      const response = await window.api.saveCard.preview({
+        workspaceId,
+        ...selection,
+        mintIfEligible: true,
+        acknowledgeTopologyDigest: draft?.response.topologyDigest,
+        acknowledgeUnattributedEntryIds: draft?.acknowledgedUnattributedEntryIds,
+      });
       const paths = previewMismatchPaths(response);
-      if (!response.isCandidate || !response.candidate.eligibility.eligible ||
-          !('token' in response.candidate) || !response.candidate.token) {
-        setMovedPaths(paths);
-        setGestureError(response.candidate.eligibility.eligible === false
-          ? `Pinned bytes no longer qualify: ${response.candidate.eligibility.reason}.`
-          : 'The pinned package did not produce a committable candidate.');
+      const reason = response.candidate.eligibility.eligible === false
+        ? response.candidate.eligibility.reason
+        : null;
+      // A pending human acknowledgement wins over the generic no-token message:
+      // route the user to the ack gate rather than a confusing "no candidate" line.
+      // The SERVER is authoritative about whether acks are the blocker.
+      if (reason === 'overlap-not-acknowledged' || reason === 'unattributed-not-acknowledged') {
+        setGestureError('Review and acknowledge the highlighted package details before submitting.');
         setDetailsOpen(true);
         return;
       }
-      if ((response.requiresOverlapAck || response.unacknowledgedUnattributedEntryIds.length > 0) &&
-          !draft?.canSave) {
-        setGestureError('Review and acknowledge the highlighted package details before submitting.');
+      if (!response.isCandidate || !response.candidate.eligibility.eligible ||
+          !('token' in response.candidate) || !response.candidate.token) {
+        setMovedPaths(paths);
+        // Surface the SERVER's specific ineligibility reason when it named one; only
+        // fall back to the generic line when an eligible candidate somehow lacks a
+        // token (the honest "unknown" case).
+        setGestureError(reason
+          ? `Pinned bytes no longer qualify: ${reason}.`
+          : 'The pinned package did not produce a committable candidate.');
         setDetailsOpen(true);
         return;
       }

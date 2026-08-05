@@ -65,7 +65,7 @@ const savePreview: SaveCardPreviewResponse = {
     token: { tokenId: 'token-1', candidateId: 'candidate-1', contractVersion: 1, issuedAt: 1, expiresAt: 2 },
   },
   laresTrailers: ['Lares-Plan: plan-1'], defaultMessageBody: 'Save WP-P6D',
-  requiresOverlapAck: false, unacknowledgedUnattributedEntryIds: [],
+  requiresOverlapAck: false, unacknowledgedUnattributedEntryIds: [], topologyDigest: 'topo-1',
 };
 
 let root: Root | null = null;

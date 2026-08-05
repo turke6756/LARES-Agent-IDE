@@ -61,6 +61,7 @@ const preview: SaveCardPreviewResponse = {
   defaultMessageBody: 'Save finalized plan work',
   requiresOverlapAck: false,
   unacknowledgedUnattributedEntryIds: [],
+  topologyDigest: 'topo-1',
 };
 
 let container: HTMLDivElement;

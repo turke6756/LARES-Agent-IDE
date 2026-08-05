@@ -243,6 +243,7 @@ function previewResponse(): SaveCardPreviewResponse {
     defaultMessageBody: 'Save 2 files',
     requiresOverlapAck: false,
     unacknowledgedUnattributedEntryIds: [],
+    topologyDigest: 'topo-1',
   };
 }
 

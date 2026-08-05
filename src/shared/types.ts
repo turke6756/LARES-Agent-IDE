@@ -2083,6 +2083,19 @@ export interface SaveCardPreviewRequest {
   selectedComponentIds: string[];
   selectedUnattributedEntryIds: string[];
   finalizationIds: string[];
+  /** SC-WP-W6 — when true, and the assembled candidate is eligible with its
+   *  acknowledgement gates satisfied, the preview mints a commit token so the
+   *  one-click submit can consume it. A display-only preview omits this and stays
+   *  read-only (candidate `token` stays null; no token is issued). */
+  mintIfEligible?: boolean;
+  /** SC-WP-W6 — human acknowledgements forwarded from the renderer's ack gate,
+   *  used ONLY when `mintIfEligible` is set. The topology digest confirms an
+   *  overlapping package's exact fused topology (echoed from a prior preview's
+   *  `topologyDigest`); it is auto-supplied server-side only when the package has
+   *  NO overlap to acknowledge. Unattributed atoms are NEVER auto-acked — the
+   *  renderer must forward the ids the human checked. */
+  acknowledgeTopologyDigest?: string;
+  acknowledgeUnattributedEntryIds?: string[];
 }
 
 /**
@@ -2112,6 +2125,11 @@ export interface SaveCardPreviewResponse {
   /** Selected unattributed entry ids that each need an individual acknowledgement
    *  before a one-click save (renderer-side ack gate). */
   unacknowledgedUnattributedEntryIds: string[];
+  /** SC-WP-W6 — the server-computed union topology digest for this exact selection.
+   *  Stable across previews of the same selected set (a hash of the selection, not
+   *  the bytes). The renderer echoes it back as `acknowledgeTopologyDigest` when it
+   *  forwards a mint intent for an overlapping package. */
+  topologyDigest: string;
 }
 
 // ── SC-WP-3E — fleet-adhoc mark-done route ────────────────────────────────

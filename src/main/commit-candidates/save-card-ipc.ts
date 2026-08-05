@@ -39,10 +39,15 @@ import {
 } from './finalization-service';
 import {
   buildCandidate,
+  computeCandidateTopologyDigest,
   type CandidateBuildContext,
   type CandidateSelectionRequest,
 } from './candidate-service';
-import type { CommitCandidate, SelectionPreview } from '../../shared/commit-candidates';
+import type {
+  CommitCandidate,
+  MintCandidateTokenRequest,
+  SelectionPreview,
+} from '../../shared/commit-candidates';
 
 // Backward-compatible main-module exports for the focused IPC tests and any
 // main-side callers; the wire contract itself is owned by shared/types.
@@ -311,6 +316,16 @@ export function registerSaveCardFinalizeIpc(
  *  assembler so both lenses share one identity/verdict computation. Read-only. */
 export interface SaveCardPreviewRoutes {
   resolvePreviewContext(req: SaveCardPreviewRequest): Promise<CandidateBuildContext>;
+  /** SC-WP-W6 — mint an opaque commit token for an eligible, acknowledged
+   *  candidate. Delegates to the SAME `CommitCandidateService` the commit
+   *  coordinator resolves tokens against, so a minted token is actually
+   *  consumable. This is the ONLY side-effect on the preview leg: it issues an
+   *  in-memory token; it never touches the worktree, index, or any ref. Optional
+   *  so the read-only display preview and the pre-bootstrap window need not mint. */
+  mintCandidateToken?(
+    request: MintCandidateTokenRequest,
+    context: CandidateBuildContext,
+  ): CommitCandidate | SelectionPreview;
 }
 
 function requirePreviewRoutes(routes: SaveCardPreviewRoutes | null): SaveCardPreviewRoutes {
@@ -344,8 +359,13 @@ function requirePreviewRequest(raw: unknown): SaveCardPreviewRequest {
     }
     return value as string[];
   };
-  // Only the four selection fields cross the wire — never members, trailers, acks,
-  // or digests. Everything the assembler trusts is resolved main-side (D-7).
+  // Only the selection fields + optional mint intent cross the wire — never
+  // members, trailers, or digests the assembler must own. Everything the assembler
+  // trusts is resolved main-side (D-7). The acknowledgement echoes (W6) are the one
+  // exception: the human's overlap/unattributed acks the mint gate validates.
+  const mintIfEligible = record.mintIfEligible === true;
+  const acknowledgeTopologyDigest =
+    typeof record.acknowledgeTopologyDigest === 'string' ? record.acknowledgeTopologyDigest : undefined;
   return {
     workspaceId: record.workspaceId,
     selectedComponentIds: asStringArray(record.selectedComponentIds, 'selectedComponentIds'),
@@ -354,6 +374,16 @@ function requirePreviewRequest(raw: unknown): SaveCardPreviewRequest {
       'selectedUnattributedEntryIds',
     ),
     finalizationIds: asStringArray(record.finalizationIds, 'finalizationIds'),
+    ...(mintIfEligible ? { mintIfEligible } : {}),
+    ...(acknowledgeTopologyDigest !== undefined ? { acknowledgeTopologyDigest } : {}),
+    ...(record.acknowledgeUnattributedEntryIds !== undefined
+      ? {
+          acknowledgeUnattributedEntryIds: asStringArray(
+            record.acknowledgeUnattributedEntryIds,
+            'acknowledgeUnattributedEntryIds',
+          ),
+        }
+      : {}),
   };
 }
 
@@ -407,16 +437,40 @@ function deriveLaresTrailers(
   return trailers;
 }
 
+/** Whether the selected components fuse ≥2 owners/plans and so need an explicit
+ *  overlap acknowledgement before a token can mint. */
+function selectionRequiresOverlapAck(
+  request: SaveCardPreviewRequest,
+  context: CandidateBuildContext,
+): boolean {
+  const selectedComponentIds = new Set(request.selectedComponentIds);
+  return context.components.some(
+    (component) =>
+      selectedComponentIds.has(component.componentId) && component.overlap.requiresOverlapAck,
+  );
+}
+
+/** The server-computed union topology digest for the exact selected set. Stable
+ *  across previews of the same selection (a hash of the selection, not the bytes),
+ *  so the renderer can echo it back as the overlap acknowledgement. */
+function selectionTopologyDigest(
+  request: SaveCardPreviewRequest,
+  candidate: CommitCandidate | SelectionPreview,
+  context: CandidateBuildContext,
+): string {
+  const selectedUnattributed = new Set(request.selectedUnattributedEntryIds);
+  return computeCandidateTopologyDigest(
+    context,
+    candidate.componentIds,
+    context.inventory.entries.filter((entry) => selectedUnattributed.has(entry.entryId)),
+  );
+}
+
 function toPreviewResponse(
   request: SaveCardPreviewRequest,
   candidate: CommitCandidate | SelectionPreview,
   context: CandidateBuildContext,
 ): SaveCardPreviewResponse {
-  const selectedComponentIds = new Set(request.selectedComponentIds);
-  const requiresOverlapAck = context.components.some(
-    (component) =>
-      selectedComponentIds.has(component.componentId) && component.overlap.requiresOverlapAck,
-  );
   const memberCount = candidate.members.length;
   const defaultMessageBody = `Save ${memberCount} file${memberCount === 1 ? '' : 's'}`;
   return {
@@ -424,10 +478,40 @@ function toPreviewResponse(
     isCandidate: isCommitCandidate(candidate),
     laresTrailers: deriveLaresTrailers(request, candidate, context),
     defaultMessageBody,
-    requiresOverlapAck,
+    requiresOverlapAck: selectionRequiresOverlapAck(request, context),
     // Every selected unattributed atom needs an explicit acknowledgement (D-5).
     unacknowledgedUnattributedEntryIds: [...request.selectedUnattributedEntryIds],
+    topologyDigest: selectionTopologyDigest(request, candidate, context),
   };
+}
+
+/**
+ * SC-WP-W6 — mint a commit token for an eligible candidate on a submit-intent
+ * preview. The topology digest is a commit-INTENT confirmation: when the package
+ * fuses overlapping owners the human must confirm the exact fused topology (the
+ * renderer forwards the digest it saw); when there is NOTHING to acknowledge (no
+ * overlap) the server confirms the digest it just computed — no human gate is
+ * bypassed. Unattributed atoms ALWAYS require the human's forwarded acknowledgement
+ * (`mintCandidateToken` refuses typed otherwise); the server never acks them on the
+ * human's behalf.
+ */
+function mintEligibleCandidate(
+  request: SaveCardPreviewRequest,
+  candidate: CommitCandidate,
+  context: CandidateBuildContext,
+  mint: NonNullable<SaveCardPreviewRoutes['mintCandidateToken']>,
+): CommitCandidate | SelectionPreview {
+  const acknowledgeTopologyDigest = selectionRequiresOverlapAck(request, context)
+    ? (request.acknowledgeTopologyDigest ?? null)
+    : selectionTopologyDigest(request, candidate, context);
+  const mintRequest: MintCandidateTokenRequest = {
+    selectedComponentIds: request.selectedComponentIds,
+    selectedUnattributedEntryIds: request.selectedUnattributedEntryIds,
+    finalizationIds: request.finalizationIds,
+    acknowledgeTopologyDigest,
+    acknowledgeUnattributedEntryIds: request.acknowledgeUnattributedEntryIds ?? [],
+  };
+  return mint(mintRequest, context);
 }
 
 /**
@@ -453,7 +537,15 @@ export function registerSaveCardPreviewIpc(
       selectedUnattributedEntryIds: request.selectedUnattributedEntryIds,
       finalizationIds: request.finalizationIds,
     };
-    const candidate = buildCandidate(selection, context);
+    let candidate = buildCandidate(selection, context);
+    // Submit intent (`mintIfEligible`) mints a consumable token for an eligible
+    // candidate so the one-click save can commit it; a display-only preview stays
+    // read-only. If the ack gate refuses, mint returns the same candidate carrying
+    // the specific ineligible reason (token stays null) for the renderer to surface.
+    if (request.mintIfEligible && routes.mintCandidateToken
+        && isCommitCandidate(candidate) && candidate.eligibility.eligible) {
+      candidate = mintEligibleCandidate(request, candidate, context, routes.mintCandidateToken);
+    }
     return toPreviewResponse(request, candidate, context);
   });
 }

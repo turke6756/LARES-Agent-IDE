@@ -46,6 +46,10 @@ export interface CandidatePreviewDraft {
   userTrailers: string;
   canSave: boolean;
   reservedTrailer: string | null;
+  /** SC-WP-W6 — the unattributed entry ids the human has checked. The submit leg
+   *  forwards these to the mint gate as the explicit acknowledgement; the server
+   *  never acks unattributed atoms on the human's behalf. */
+  acknowledgedUnattributedEntryIds: string[];
 }
 
 type LoadState =
@@ -164,6 +168,9 @@ export default function CandidatePreview({
       userTrailers,
       canSave: response.isCandidate && eligible && overlapSatisfied && unattributedSatisfied && !reservedTrailer,
       reservedTrailer,
+      acknowledgedUnattributedEntryIds: response.unacknowledgedUnattributedEntryIds.filter((id) =>
+        unattributedAcks.has(id),
+      ),
     });
   }, [state, onDraftChange, messageBody, userTrailers, overlapAck, unattributedAcks]);
 

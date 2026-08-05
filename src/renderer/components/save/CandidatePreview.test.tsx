@@ -76,6 +76,7 @@ function response(over: Partial<SaveCardPreviewResponse> = {}): SaveCardPreviewR
     defaultMessageBody: 'Save 1 file',
     requiresOverlapAck: false,
     unacknowledgedUnattributedEntryIds: [],
+    topologyDigest: 'topo-1',
     ...over,
   };
 }

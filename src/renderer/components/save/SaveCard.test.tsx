@@ -430,7 +430,7 @@ function readyCandidatePreview(): SaveCardPreviewResponse {
   return {
     candidate, isCandidate: true, laresTrailers: ['Lares-Turns: 2'],
     defaultMessageBody: 'Save Memory Architecture', requiresOverlapAck: false,
-    unacknowledgedUnattributedEntryIds: [],
+    unacknowledgedUnattributedEntryIds: [], topologyDigest: 'topo-1',
   };
 }
 
@@ -508,14 +508,41 @@ describe('SaveCard decisive save gesture', () => {
     await gestureClick(container.querySelector('[data-testid="save-bundle-pin"]')!);
     await gestureClick(container.querySelector('[data-testid="save-bundle-submit"]')!);
 
+    // SC-WP-W6: submit carries the mint intent so the server issues a consumable
+    // token; a display-only preview never would.
     expect(preview).toHaveBeenCalledWith(expect.objectContaining({
       workspaceId: 'ws-1', selectedComponentIds: ['c1'], finalizationIds: ['fin-1'],
+      mintIfEligible: true,
     }));
     expect(commit).toHaveBeenCalledWith({
       candidateId: 'candidate-1', tokenId: 'token-1', message: 'Save Memory Architecture',
     });
     expect(container.querySelector('[data-state="saved"]')?.textContent).toContain('Saved');
     expect(container.querySelector('[data-testid="candidate-preview"]')).toBeNull();
+  });
+
+  it('SC-WP-W6: routes an unacknowledged mint refusal to the ack gate, not the generic no-candidate line', async () => {
+    // The server minted nothing because the human has not yet acknowledged the
+    // unattributed atoms — it names the reason. The renderer must surface the ack
+    // gate, never the confusing "did not produce a committable candidate".
+    preview.mockResolvedValue({
+      ...readyCandidatePreview(),
+      isCandidate: true,
+      candidate: {
+        ...readyCandidatePreview().candidate,
+        eligibility: { eligible: false, reason: 'unattributed-not-acknowledged' },
+        token: null,
+      },
+      unacknowledgedUnattributedEntryIds: ['eu'],
+    });
+    await render();
+    await gestureClick(container.querySelector('[data-testid="save-bundle-pin"]')!);
+    await gestureClick(container.querySelector('[data-testid="save-bundle-submit"]')!);
+
+    const refusal = container.querySelector('[data-testid="save-gesture-refusal"]')?.textContent ?? '';
+    expect(refusal).toContain('Review and acknowledge');
+    expect(refusal).not.toContain('did not produce a committable candidate');
+    expect(commit).not.toHaveBeenCalled();
   });
 
   it('makes a second submit inert while the first consume is still pending', async () => {
