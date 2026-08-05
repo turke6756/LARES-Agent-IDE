@@ -248,6 +248,9 @@ async function runCell(opts: CellOpts): Promise<void> {
       provider: opts.provider,
       isSupervised: false,
       isWorker: true,
+      workspaceId: 'ws-matrix',
+      planId: 'plan-matrix',
+      planSection: 'section-matrix',
       status: 'idle',
       command: opts.provider,
       workingDirectory: cwd,
@@ -269,11 +272,32 @@ async function runCell(opts: CellOpts): Promise<void> {
       const expected = `DASHBOARD_SPOOL_PATH='${root}/.lares/pending-status.jsonl'`;
       assert.ok(cmd.includes(expected),
         `WSL launch must inject the shell-quoted WSL-native spool path; expected ${expected} in: ${cmd}`);
+      assert.ok(cmd.includes('AGENT_DASHBOARD_API_TOKEN='),
+        `${opts.provider} WSL launch must inject the dashboard capability token`);
+      assert.ok(cmd.includes('AGENT_DASHBOARD_API_PORT='));
+      assert.ok(cmd.includes('AGENT_DASHBOARD_API_HOST=10.0.0.42'));
+      assert.ok(cmd.includes(`AGENT_DASHBOARD_SELF_ID=${agent.id}`));
+      assert.ok(cmd.includes('AGENT_DASHBOARD_WORKSPACE_ID=\'ws-matrix\''));
+      assert.ok(cmd.includes('AGENT_DASHBOARD_PLAN_ID=\'plan-matrix\''));
+      assert.ok(cmd.includes('AGENT_DASHBOARD_PLAN_SECTION=\'section-matrix\''));
     } else {
       assert.equal(runners.winEnvs.length, 1);
       const env = runners.winEnvs[0]!;
       assert.equal(env.DASHBOARD_SPOOL_PATH, path.join(tmp, '.lares', 'pending-status.jsonl'),
         'Windows launch must inject the native spool path in extraEnv');
+      assert.ok(env.AGENT_DASHBOARD_API_TOKEN,
+        `${opts.provider} Windows launch must inject the dashboard capability token`);
+      assert.equal(env.AGENT_DASHBOARD_API_PORT,
+        String((supervisor as unknown as { apiServerPort: number }).apiServerPort));
+      assert.equal(env.AGENT_DASHBOARD_API_HOST, '127.0.0.1');
+      assert.equal(env.AGENT_DASHBOARD_SELF_ID, agent.id);
+      assert.equal(env.AGENT_DASHBOARD_WORKSPACE_ID, 'ws-matrix');
+      assert.equal(env.AGENT_DASHBOARD_PLAN_ID, 'plan-matrix');
+      assert.equal(env.AGENT_DASHBOARD_PLAN_SECTION, 'section-matrix');
+      assert.equal(env.AGENT_DASHBOARD_SUPERVISOR_ID, undefined,
+        'worker lanes must not receive a supervisor identity assertion');
+      assert.equal(env.CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION, opts.provider === 'claude' ? 'false' : undefined,
+        'the Claude-only prompt-suggestion flag must not leak to other providers');
     }
 
     if (isGrok) {
@@ -412,6 +436,64 @@ test('matrix cell: Codex × WSL', () => runCell({ provider: 'codex', pathType: '
 // session-discovery path runs for grok.
 test('matrix cell: Grok × Windows', () => runCell({ provider: 'grok', pathType: 'windows' }));
 test('matrix cell: Antigravity × Windows', () => runCell({ provider: 'agy', pathType: 'windows' }));
+
+test('grok supervisor-peer receives the full dashboard credential and identity env without Claude CLI flags', async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ad-matrix-grok-supervisor-'));
+  const agentsMap = new Map<string, Agent>();
+  const audit: AuditRow[] = [];
+  const restoreDb = patchDb(agentsMap, audit);
+  const runners = stubRunnerLaunches();
+  const prevGrokHome = process.env.GROK_HOME;
+  process.env.GROK_HOME = path.join(tmp, '.grok-home');
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const resolver = require('./provider-resolver') as Record<string, unknown>;
+  const origFindBinary = resolver.findWindowsProviderBinary;
+  resolver.findWindowsProviderBinary = async () => 'C:\\Users\\test\\.grok\\bin\\grok.exe';
+  try {
+    const cwd = path.join(tmp, '.lares', 'supervisor');
+    fs.mkdirSync(cwd, { recursive: true });
+    const agent = makeAgent('m-grok-supervisor', {
+      provider: 'grok',
+      isSupervisor: true,
+      isSupervised: false,
+      isWorker: false,
+      workspaceId: 'ws-peer',
+      planId: 'plan-peer',
+      planSection: 'section-peer',
+      command: 'grok',
+      workingDirectory: cwd,
+    });
+    agentsMap.set(agent.id, agent);
+
+    const supervisor = makeSupervisor();
+    await (supervisor as unknown as { launchWindowsAgent: (a: Agent) => Promise<void> })
+      .launchWindowsAgent(agent);
+
+    assert.equal(runners.winEnvs.length, 1);
+    const env = runners.winEnvs[0]!;
+    assert.ok(env.AGENT_DASHBOARD_API_TOKEN, 'supervisor-peer must receive its capability token');
+    assert.equal(env.AGENT_DASHBOARD_API_PORT,
+      String((supervisor as unknown as { apiServerPort: number }).apiServerPort));
+    assert.equal(env.AGENT_DASHBOARD_API_HOST, '127.0.0.1');
+    assert.equal(env.AGENT_DASHBOARD_SELF_ID, agent.id);
+    assert.equal(env.AGENT_DASHBOARD_WORKSPACE_ID, 'ws-peer');
+    assert.equal(env.AGENT_DASHBOARD_SUPERVISOR_ID, agent.id);
+    assert.equal(env.AGENT_DASHBOARD_PLAN_ID, 'plan-peer');
+    assert.equal(env.AGENT_DASHBOARD_PLAN_SECTION, 'section-peer');
+    assert.equal(env.CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION, undefined);
+    assert.deepEqual(runners.winCommands, [{
+      command: 'C:\\Users\\test\\.grok\\bin\\grok.exe',
+      args: ['--always-approve'],
+    }], 'Grok receives only its own auto-approve flag, never Claude-only launch flags');
+  } finally {
+    resolver.findWindowsProviderBinary = origFindBinary;
+    runners.restore();
+    restoreDb();
+    if (prevGrokHome === undefined) delete process.env.GROK_HOME;
+    else process.env.GROK_HOME = prevGrokHome;
+    try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* best effort */ }
+  }
+});
 
 test('matrix boundary: Antigravity × WSL is refused with the Windows-only teaching message', async () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ad-matrix-agy-wsl-refusal-'));

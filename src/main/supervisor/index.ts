@@ -4846,7 +4846,10 @@ export class AgentSupervisor extends EventEmitter {
     // or event-delivery logic is built here. Single source of truth for the gate:
     // roleLaneOf(agent) !== 'legacy', the same lane decision the MCP injection and
     // shouldDirectSpawn key off (mcp-config-builder.ts), so it can never diverge.
-    if (agent.provider === 'claude' && roleLaneOf(agent) !== 'legacy') {
+    // Provider-agnostic on purpose: Grok discovers its dashboard MCP config from
+    // the cwd, while Codex/Agy wiring is forward-looking, but every scoped lane
+    // needs the same credential and identity rail in its own process env.
+    if (roleLaneOf(agent) !== 'legacy') {
       // WP0.5 — the child env carries the SAME single per-agent capability token
       // as the MCP sidecar(s), never `getApiToken()`. This block is gated on
       // non-legacy, so `capabilityToken` was minted at entry (`needsToken`) and is
@@ -5418,7 +5421,9 @@ export class AgentSupervisor extends EventEmitter {
     // two can never diverge. SELF_ID is the forward-looking ownership hook (owner
     // id forwarded by a later script); no ownership logic is built here. An agent's
     // subprocesses inherit the agent's dashboard credential level BY DESIGN.
-    if (isClaude && roleLaneOf(agent) !== 'legacy') {
+    // Provider-agnostic like the Windows block: Codex/Gemini use this WSL path;
+    // Grok/Agy are rejected above until their WSL transports are supported.
+    if (roleLaneOf(agent) !== 'legacy') {
       // WP0.5 — the WSL child env carries the SAME single per-agent capability
       // token as the MCP sidecar(s), never `getApiToken()`. Non-legacy gate ⇒
       // `capabilityToken` was minted at entry and is defined here.
