@@ -113,15 +113,17 @@ describe('ProposalCardGallery', () => {
     expect(container!.querySelector('[data-testid="plans-promoted-region"]')).not.toBeNull();
   });
 
-  it('converts vertical wheel motion into horizontal card-row scrolling', async () => {
+  it('installs native horizontal wheel scrolling on the card row', async () => {
     await render(<PlansPane />);
     const row = container!.querySelector<HTMLElement>('[data-testid="proposal-card-row"]')!;
     Object.defineProperty(row, 'scrollWidth', { configurable: true, value: 800 });
     Object.defineProperty(row, 'clientWidth', { configurable: true, value: 300 });
     row.scrollLeft = 20;
 
-    act(() => row.dispatchEvent(new WheelEvent('wheel', { bubbles: true, cancelable: true, deltaY: 75 })));
+    const event = new WheelEvent('wheel', { bubbles: true, cancelable: true, deltaX: 75 });
+    act(() => row.dispatchEvent(event));
     expect(row.scrollLeft).toBe(95);
+    expect(event.defaultPrevented).toBe(true);
   });
 
   it('keeps top-level navigation reachable while a proposal is expanded', async () => {

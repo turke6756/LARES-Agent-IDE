@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import * as Icons from 'lucide-react';
+import { installHorizontalWheelScroll } from '../../lib/horizontal-wheel';
 import { useDashboardStore } from '../../stores/dashboard-store';
 import EmbeddedMarkdownDocument from './EmbeddedMarkdownDocument';
 import PromoteToPlanPanel from './PromoteToPlanPanel';
@@ -15,14 +16,6 @@ function proposalPath(workspacePath: string, fileName: string, pathType: 'window
   return [workspacePath.replace(/[\\/]+$/, ''), '.lares', 'proposals', fileName].join(separator);
 }
 
-export function scrollWheelHorizontally(event: React.WheelEvent<HTMLElement>): void {
-  const row = event.currentTarget;
-  const delta = event.deltaY || event.deltaX;
-  if (!delta || row.scrollWidth <= row.clientWidth) return;
-  event.preventDefault();
-  row.scrollLeft += delta;
-}
-
 export default function ProposalCardGallery(): React.ReactElement {
   const selectedWorkspaceId = useDashboardStore((state) => state.selectedWorkspaceId);
   const workspace = useDashboardStore((state) =>
@@ -35,6 +28,7 @@ export default function ProposalCardGallery(): React.ReactElement {
   const setSelectedDocId = usePlansPaneState((state) => state.setExpandedProposalId);
   const [error, setError] = useState<string | null>(null);
   const [promoteOpen, setPromoteOpen] = useState(false);
+  const [cardRow, setCardRow] = useState<HTMLDivElement | null>(null);
 
   const load = useCallback(async () => {
     setCards(null);
@@ -67,6 +61,11 @@ export default function ProposalCardGallery(): React.ReactElement {
   useEffect(() => {
     void load();
   }, [load]);
+
+  useEffect(() => {
+    if (!cardRow) return;
+    return installHorizontalWheelScroll(cardRow);
+  }, [cardRow]);
 
   const selected = useMemo(
     () => cards?.find((card) => card.docId === selectedDocId) ?? null,
@@ -173,8 +172,8 @@ export default function ProposalCardGallery(): React.ReactElement {
         </div>
       ) : (
         <div
+          ref={setCardRow}
           className="flex min-h-0 flex-1 items-stretch gap-3 overflow-x-auto overflow-y-hidden p-4 scrollbar-thin"
-          onWheel={scrollWheelHorizontally}
           data-testid="proposal-card-row"
         >
           {cards.map((card) => (
