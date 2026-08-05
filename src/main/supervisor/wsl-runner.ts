@@ -9,6 +9,7 @@ import { sanitizeClaudeChildEnv } from './env-sanitize';
 import { spawnBundledNode } from '../node-runtime';
 import { redactMcpToken } from './mcp-config-builder';
 import { stripAnsi } from './strip-ansi';
+import { TerminalScreenState } from './terminal-screen-state';
 
 /** BUG-22 Step 1 diagnostic metadata passed from `launchWslAgent` so the
  *  runner can append one complete JSONL record per launch attempt once the
@@ -244,6 +245,7 @@ export class WslRunner extends EventEmitter {
   // fresh mount / app restart restores the full session, aligned with the
   // renderer's 50k-line xterm scrollback. Both caps apply — the tighter wins.
   private outputRing: string[] = [];
+  private readonly currentScreen = new TerminalScreenState(120, 40);
   private outputRingBytes: number = 0;
   private static readonly MAX_RING_LINES = 50000;
   private static readonly MAX_RING_BYTES = 8_000_000;
@@ -721,6 +723,7 @@ export class WslRunner extends EventEmitter {
         // partial-line handling as WindowsRunner so a chunk ending mid-line
         // doesn't fragment the next-arriving prompt across two ring entries.
         {
+          this.currentScreen.write(msg.data);
           const newLines = msg.data.split('\n');
           if (this.outputRing.length > 0 && newLines.length > 0) {
             this.outputRing[this.outputRing.length - 1] += newLines[0];
@@ -811,6 +814,11 @@ export class WslRunner extends EventEmitter {
     const joined = this.outputRing.join('\n');
     if (joined.length <= maxBytes) return joined;
     return joined.slice(joined.length - maxBytes);
+  }
+
+  /** Visible terminal contents after applying VT cursor/erase operations. */
+  getCurrentScreen(): string {
+    return this.currentScreen.render();
   }
 
   /** BUG-15: return the entire ring buffer as a single string. Mirrors
@@ -906,6 +914,7 @@ export class WslRunner extends EventEmitter {
   }
 
   resize(cols: number, rows: number): void {
+    this.currentScreen.resize(cols, rows);
     this.sendToHost({ type: 'resize', cols, rows });
   }
 

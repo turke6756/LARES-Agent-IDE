@@ -9,6 +9,7 @@ import { spawnBundledNode } from '../node-runtime';
 import { ensureNodeShimDir, withNodeShimOnPath } from '../node-shim';
 import { ensureGitShimDir } from '../git/git-shim';
 import { readLastLines } from './log-readers/tail-file';
+import { TerminalScreenState } from './terminal-screen-state';
 
 /**
  * Spawns Claude via a separate Node.js process that uses node-pty.
@@ -43,6 +44,7 @@ export class WindowsRunner extends EventEmitter {
   // xterm scrollback (so the repaint isn't dropped) while keeping the on-mount
   // paint cost bounded. Both caps apply — the tighter one wins.
   private outputRing: string[] = [];
+  private readonly currentScreen = new TerminalScreenState(120, 40);
   private outputRingBytes: number = 0;
   private static readonly MAX_RING_LINES = 50000;
   private static readonly MAX_RING_BYTES = 8_000_000;
@@ -246,6 +248,7 @@ export class WindowsRunner extends EventEmitter {
           });
         });
         // Append to in-memory ring buffer for instant log reads
+        this.currentScreen.write(msg.data);
         const newLines = msg.data.split('\n');
         if (this.outputRing.length > 0 && newLines.length > 0) {
           // Append first chunk to last existing line (partial line continuation)
@@ -335,6 +338,11 @@ export class WindowsRunner extends EventEmitter {
     const joined = this.outputRing.join('\n');
     if (joined.length <= maxBytes) return joined;
     return joined.slice(joined.length - maxBytes);
+  }
+
+  /** Visible terminal contents after applying VT cursor/erase operations. */
+  getCurrentScreen(): string {
+    return this.currentScreen.render();
   }
 
   /** BUG-15: return the entire ring buffer as a single string. The terminal
@@ -442,6 +450,7 @@ export class WindowsRunner extends EventEmitter {
   }
 
   resize(cols: number, rows: number): void {
+    this.currentScreen.resize(cols, rows);
     this.sendToHost({ type: 'resize', cols, rows });
   }
 

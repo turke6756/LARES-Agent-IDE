@@ -145,6 +145,7 @@ function setup(opts: {
    *  status-monitor.test.ts. Set false to exercise the exhaustion/throw path. */
   confirmResult?: boolean;
   outputTail?: string;
+  currentScreen?: string;
 }): Harness {
   const agentsMap = new Map<string, Agent>([[opts.agent.id, opts.agent]]);
   const restoreDb = patchDb(agentsMap);
@@ -178,6 +179,7 @@ function setup(opts: {
     });
     (fake as unknown as { write: (data: string) => void }).write = () => { calls.push('runner.write'); };
     (fake as unknown as { getOutputRingTail: () => string }).getOutputRingTail = () => opts.outputTail ?? '';
+    (fake as unknown as { getCurrentScreen: () => string }).getCurrentScreen = () => opts.currentScreen ?? opts.outputTail ?? '';
     (supervisor as unknown as { windowsRunners: Map<string, WindowsRunner> })
       .windowsRunners.set(opts.agent.id, fake);
   } else if (opts.injectRunner === 'wsl') {
@@ -363,6 +365,37 @@ test('agy signed-out screen rejects a dashboard message before typing and return
     assert.equal(outcome.prompt?.kind, 'sign-in');
     assert.ok(!h.calls.includes('runner.write'), 'no prompt bytes may be typed into the auth screen');
     assert.ok(!h.calls.includes('notifyUserInputDelivered'), 'a rejected auth-screen send cannot clear waiting');
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('agy transient signed-out banner in scrollback does not block delivery after signed-in repaint', async () => {
+  const agent = makeAgent('agy-auth-ready', {
+    provider: 'agy',
+    status: 'idle',
+    isWorker: true,
+    command: 'agy',
+    workingDirectory: 'C:\\tmp',
+  });
+  const h = setup({
+    agent,
+    injectRunner: 'windows',
+    alive: true,
+    outputTail: [
+      'Welcome to the Antigravity CLI. You are currently not signed in.',
+      'Signing in...',
+      'Antigravity CLI',
+      'user@example.com',
+      'Ready',
+    ].join('\n'),
+    currentScreen: 'Antigravity CLI\nuser@example.com\nReady',
+  });
+  try {
+    const outcome = await h.supervisor.sendInputWithOutcome(agent.id, 'hello', { submit: true });
+    assert.notEqual(outcome.disposition, 'failed');
+    assert.equal(outcome.delivered, true);
+    assert.ok(h.calls.includes('runner.write'), 'signed-in current screen must allow PTY delivery');
   } finally {
     h.cleanup();
   }

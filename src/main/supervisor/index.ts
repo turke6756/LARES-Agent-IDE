@@ -8010,13 +8010,13 @@ export class AgentSupervisor extends EventEmitter {
     }
   }
 
-  /** WP4/WP5 — classify the agent's PTY ring tail for a blocking interactive
-   *  prompt (diagnostic only: labels a delivered-unconfirmed outcome, never
-   *  drives status — that is WP7's job). Pure classifier over the ring tail. */
+  /** WP4/WP5 — classify the agent's CURRENT visible terminal screen for a
+   *  blocking interactive prompt. The append-only ring retains erased TUI
+   *  frames, so scanning its tail can permanently latch a transient prompt. */
   private classifyPtyPrompt(agentId: string): { kind: string; label: string; excerpt: string } | null {
     const win = this.windowsRunners.get(agentId);
-    const tail = win ? win.getOutputRingTail() : this.wslRunners.get(agentId)?.getOutputRingTail();
-    const match = detectInteractivePrompt(tail);
+    const screen = win ? win.getCurrentScreen() : this.wslRunners.get(agentId)?.getCurrentScreen();
+    const match = detectInteractivePrompt(screen);
     return match ? { kind: match.kind, label: match.label, excerpt: match.excerpt } : null;
   }
 
