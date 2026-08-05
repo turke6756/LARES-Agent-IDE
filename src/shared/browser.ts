@@ -261,11 +261,15 @@ export interface BrowserAuditEntry {
 }
 
 /** Pushed main → renderer when a page's window.open / target=_blank popup is
- *  denied (M6) — the UI may offer "open as new tab" instead. */
+ *  denied as a native window (M6). Human-page requests are routed straight to
+ *  an app browser tab; agent-page requests still require trusted-chrome
+ *  confirmation. */
 export interface BrowserOpenRequest {
   /** Tab whose page requested the popup. */
   tabId: string;
   url: string;
+  /** Human popups use `new-tab`; omitted means show the confirmation banner. */
+  disposition?: 'new-tab';
 }
 
 // ── Website-access policy (plans/website-allowlist-simplification.md) ─────────
@@ -899,7 +903,7 @@ export const BROWSER_CHANNELS = {
   downloadPrompt: 'browser:download-prompt',
   /** () → BrowserDownload[] — newest-first list for the shelf's first paint */
   downloadList: 'browser:download-list',
-  /** (id) → boolean — open the saved file via the OS (shell.openPath) */
+  /** (id) → boolean — validate the saved file before opening it in app file view */
   downloadOpenFile: 'browser:download-open-file',
   /** (id) → void — reveal the saved file in the OS file manager */
   downloadShowInFolder: 'browser:download-show-in-folder',

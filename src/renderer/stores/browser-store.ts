@@ -132,10 +132,13 @@ export interface BrowserBounds {
   height: number;
 }
 
-/** Denied window.open payload. WP1-A emits `{ tabId, url }` (tabId = the tab
- * whose page requested the popup — see the progress log); we only need `url`,
- * and defensively also accept a bare URL string. */
-export type BrowserOpenRequest = { tabId?: string; url: string } | string;
+/** Denied native window.open payload. Human popups carry disposition:new-tab
+ * and open immediately inside the app; agent popups omit it and keep the
+ * trusted confirmation banner. Bare URL strings remain accepted for legacy
+ * senders. */
+export type BrowserOpenRequest =
+  | { tabId?: string; url: string; disposition?: 'new-tab' }
+  | string;
 
 // ── Overhaul (WP0) shared shapes — renderer mirror (keep in sync with
 //    src/shared/browser.ts). Mirror only; feature logic lands in later WPs. ──
@@ -667,15 +670,11 @@ interface BrowserStoreState {
   reopenClosedTab: () => Promise<void>;
 
   // ── Slice 10/11: session restore + frozen/discarded tab model ──────────────
-  // restoreSession PULLs the prior USER tabs back as FROZEN snapshots (no live
-  // view until activated) and seeds them into the strip; restoredCount drives a
-  // dismissible "Restored N tabs" note in the panel (0 = no note / dismissed).
-  // discardThresholdMs mirrors the idle-discard setting (null = "Never"); the
-  // settings control flips it through setDiscardThreshold.
-  restoredCount: number;
+  // restoreSession PULLs the prior USER tabs back as FROZEN snapshots and
+  // activates the first one in the visible workspace. discardThresholdMs
+  // mirrors the idle-discard setting (null = "Never").
   discardThresholdMs: number | null;
   restoreSession: () => Promise<void>;
-  dismissRestoredNote: () => void;
   setDiscardThreshold: (ms: number | null) => void;
 
   // ── Tab groups (renderer-derived UI state; see components/browser/tab-groups.ts) ──
@@ -913,7 +912,6 @@ export const useBrowserStore = create<BrowserStoreState>((set, get) => ({
 
   // Slice 10/11 — session restore + idle-discard threshold. 30 min is the
   // displayed default for the discard setting (mirror — main is authoritative).
-  restoredCount: 0,
   discardThresholdMs: 30 * 60 * 1000,
 
   // Slice-3 — denial toasts + Activity/Audit drawer initial state.
@@ -1219,6 +1217,14 @@ export const useBrowserStore = create<BrowserStoreState>((set, get) => ({
   handleOpenRequest: (req) => {
     const url = openRequestUrl(req);
     if (!url) return;
+    if (typeof req !== 'string' && req.disposition === 'new-tab') {
+      set({ pendingOpenUrl: null });
+      // about:blank is a valid window.open target but the browser navigation
+      // floor intentionally rejects the about: scheme. Create the app's normal
+      // empty tab instead of sending that URL through main.
+      void get().createTab('user', url === 'about:blank' ? undefined : url);
+      return;
+    }
     set({ pendingOpenUrl: url });
   },
 
@@ -1538,7 +1544,9 @@ export const useBrowserStore = create<BrowserStoreState>((set, get) => ({
   // PULL the prior USER tabs back as FROZEN snapshots and seed the strip. Merge
   // (don't blunt-replace) so an onTabState push that raced us isn't clobbered:
   // known tabs keep their slot with the snapshot fields layered on, unknown ones
-  // append in restore order. restoredCount (>0) lights the dismissible note.
+  // append in restore order. Activate the first restored tab in the current
+  // workspace so BrowserViewHost hydrates it immediately; tabs from another
+  // workspace remain frozen until that workspace is selected.
   restoreSession: async () => {
     const api = getBrowserApi();
     if (!api?.sessionRestore) return;
@@ -1551,14 +1559,15 @@ export const useBrowserStore = create<BrowserStoreState>((set, get) => ({
           const prev = byId.get(r.tabId);
           byId.set(r.tabId, prev ? { ...prev, ...r } : r);
         }
-        return { tabs: [...byId.values()], restoredCount: restored.length };
+        const activeTabId =
+          restored.find((tab) => (tab.workspaceId ?? null) === s.selectedWorkspaceId)?.tabId ??
+          s.activeTabId;
+        return { tabs: [...byId.values()], activeTabId };
       });
     } catch (err) {
       console.error('browser.sessionRestore failed:', err);
     }
   },
-
-  dismissRestoredNote: () => set({ restoredCount: 0 }),
 
   setDiscardThreshold: (ms) => {
     // Optimistic local mirror so the settings control reflects the choice; main
@@ -2200,11 +2209,27 @@ export const useBrowserStore = create<BrowserStoreState>((set, get) => ({
   dismissDownloadPrompt: () => set({ pendingDownloadPrompt: null }),
 
   openDownloadFile: (id) => {
+    const rec = get().downloads.find((download) => download.id === id);
+    if (!rec || rec.state !== 'completed') return;
     try {
       void getBrowserApi()?.downloadOpenFile?.(id);
     } catch (err) {
       console.error('browser.downloadOpenFile failed:', err);
     }
+    // Open through the app's tabbed file viewer instead of delegating to the
+    // OS. Downloads are stored in an app-managed Windows directory.
+    const dashboard = useDashboardStore.getState();
+    const workspaceId =
+      rec.workspaceId && dashboard.workspaces.some((workspace) => workspace.id === rec.workspaceId)
+        ? rec.workspaceId
+        : dashboard.selectedWorkspaceId ?? undefined;
+    if (workspaceId && workspaceId !== dashboard.selectedWorkspaceId) {
+      dashboard.selectWorkspace(workspaceId);
+    }
+    const normalized = rec.savePath.replace(/\//g, '\\');
+    const separator = normalized.lastIndexOf('\\');
+    const rootDirectory = separator > 2 ? normalized.slice(0, separator) : normalized;
+    dashboard.openTab(rec.savePath, rootDirectory, 'windows', undefined, workspaceId);
   },
 
   showDownloadInFolder: (id) => {

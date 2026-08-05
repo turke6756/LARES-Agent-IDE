@@ -102,7 +102,6 @@ beforeEach(() => {
     attentionTabIds: {},
     paneAttention: false,
     pendingOpenUrl: null,
-    restoredCount: 0,
     discardThresholdMs: 30 * 60 * 1000,
   });
   useDashboardStore.setState({
@@ -399,6 +398,63 @@ describe('denied window.open requests', () => {
     expect(useBrowserStore.getState().pendingOpenUrl).toBeNull();
     expect(api.createTab).not.toHaveBeenCalled();
   });
+
+  it('routes a human popup directly to a new in-app browser tab', async () => {
+    useBrowserStore.getState().handleOpenRequest({
+      tabId: 'opener',
+      url: 'https://popup.dev/',
+      disposition: 'new-tab',
+    });
+    await Promise.resolve();
+    expect(api.createTab).toHaveBeenCalledWith({
+      partition: 'user',
+      url: 'https://popup.dev/',
+      workspaceId: null,
+    });
+    expect(useBrowserStore.getState().pendingOpenUrl).toBeNull();
+  });
+
+  it('routes about:blank to a normal empty app tab', async () => {
+    useBrowserStore.getState().handleOpenRequest({
+      url: 'about:blank',
+      disposition: 'new-tab',
+    });
+    await Promise.resolve();
+    expect(api.createTab).toHaveBeenCalledWith({
+      partition: 'user',
+      url: undefined,
+      workspaceId: null,
+    });
+  });
+});
+
+describe('download opening', () => {
+  it('opens a completed download in the native file-view tab', () => {
+    useBrowserStore.setState({
+      downloads: [{
+        id: 'download-1',
+        url: 'https://files.dev/report.pdf',
+        filename: 'report.pdf',
+        savePath: 'C:\\Users\\me\\Downloads\\report.pdf',
+        partition: 'user',
+        workspaceId: null,
+        origin: 'https://files.dev',
+        bytesReceived: 10,
+        totalBytes: 10,
+        state: 'completed',
+        startedAt: 1,
+        endedAt: 2,
+      }],
+    });
+
+    useBrowserStore.getState().openDownloadFile('download-1');
+
+    const dashboard = useDashboardStore.getState();
+    expect(dashboard.openTabs.at(-1)?.filePath).toBe('C:\\Users\\me\\Downloads\\report.pdf');
+    expect(dashboard.openTabs.at(-1)?.rootDirectory).toBe('C:\\Users\\me\\Downloads');
+    expect(dashboard.fileViewerOpen).toBe(true);
+    expect(dashboard.browserOpen).toBe(false);
+  });
 });
 
 describe('event bridge', () => {
@@ -434,7 +490,7 @@ describe('BrowserApi facade calls', () => {
 });
 
 describe('Slice 10/11: session restore + frozen/discarded model', () => {
-  it('restoreSession seeds frozen snapshots and sets restoredCount', async () => {
+  it('restoreSession seeds frozen snapshots and activates the first visible restored tab', async () => {
     api.sessionRestore.mockResolvedValueOnce([
       tabState({ tabId: 'r1', frozen: true, partition: 'user' }),
       tabState({ tabId: 'r2', frozen: true, discarded: true, partition: 'user' }),
@@ -446,7 +502,19 @@ describe('Slice 10/11: session restore + frozen/discarded model', () => {
     // Restored tabs are user-partition only (agent tabs are never persisted —
     // a main-side guarantee; the renderer just renders what it's handed).
     expect(s.tabs.every((t) => t.partition === 'user')).toBe(true);
-    expect(s.restoredCount).toBe(2);
+    expect(s.activeTabId).toBe('r1');
+  });
+
+  it('restoreSession does not activate a tab from another workspace', async () => {
+    useBrowserStore.setState({ selectedWorkspaceId: 'workspace-a' });
+    api.sessionRestore.mockResolvedValueOnce([
+      tabState({ tabId: 'other', frozen: true, workspaceId: 'workspace-b' }),
+      tabState({ tabId: 'visible', frozen: true, workspaceId: 'workspace-a' }),
+    ]);
+
+    await useBrowserStore.getState().restoreSession();
+
+    expect(useBrowserStore.getState().activeTabId).toBe('visible');
   });
 
   it('restoreSession merges onto a known tab instead of duplicating it', async () => {
@@ -461,16 +529,10 @@ describe('Slice 10/11: session restore + frozen/discarded model', () => {
     expect(s.tabs[0].title).toBe('Snapshot');
   });
 
-  it('an empty restore leaves the note dark (restoredCount stays 0)', async () => {
+  it('an empty restore leaves the active tab unchanged', async () => {
     api.sessionRestore.mockResolvedValueOnce([]);
     await useBrowserStore.getState().restoreSession();
-    expect(useBrowserStore.getState().restoredCount).toBe(0);
-  });
-
-  it('dismissRestoredNote clears the count', () => {
-    useBrowserStore.setState({ restoredCount: 3 });
-    useBrowserStore.getState().dismissRestoredNote();
-    expect(useBrowserStore.getState().restoredCount).toBe(0);
+    expect(useBrowserStore.getState().activeTabId).toBeNull();
   });
 
   it('a frozen tab activates through the existing select path (lazy hydration in main)', async () => {

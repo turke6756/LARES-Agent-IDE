@@ -844,28 +844,34 @@ function errOf(tab: FakeTab): { code: string; description: string; url: string }
   return (tab as unknown as { lastError?: { code: string; description: string; url: string } | null }).lastError;
 }
 
-// ── Popup policy: USER tabs allow real OAuth popups; AGENT tabs stay gated ────
+// ── Popup policy: USER popups become app tabs; AGENT tabs stay gated ─────────
 
-test('USER-tab window.open() popup is ALLOWED (OAuth opener channel preserved)', () => {
+test('USER-tab window.open() is denied as a native window and routed to a new app tab', () => {
   const { mgr, sent } = makeManager();
   const tab = injectTab(mgr, { partition: 'user', url: 'https://app.example/' });
   priv<void>(mgr, 'wireViewEvents')(tab);
   const handler = tab.view.webContents.windowOpenHandler!;
   assert.ok(handler, 'setWindowOpenHandler registered');
   const res = handler({ url: 'https://accounts.google.com/o/oauth2/auth' }) as { action: string };
-  assert.equal(res.action, 'allow', 'human-driven popup opens natively so window.opener survives');
-  assert.equal(
-    sent.filter((s) => s.channel === CH.openRequest).length, 0,
-    'no "page tried to open a new window" confirmation surfaced for an allowed user popup',
-  );
+  assert.equal(res.action, 'deny', 'no standalone Electron window is created');
+  const req = sent.find((s) => s.channel === CH.openRequest);
+  assert.deepEqual(req?.payload, {
+    tabId: tab.id,
+    url: 'https://accounts.google.com/o/oauth2/auth',
+    disposition: 'new-tab',
+  });
 });
 
-test('about:blank popup from a USER tab is allowed (open-then-navigate OAuth flows)', () => {
-  const { mgr } = makeManager();
+test('about:blank popup from a USER tab is routed to an empty app tab', () => {
+  const { mgr, sent } = makeManager();
   const tab = injectTab(mgr, { partition: 'user', url: 'https://app.example/' });
   priv<void>(mgr, 'wireViewEvents')(tab);
   const res = tab.view.webContents.windowOpenHandler!({ url: 'about:blank' }) as { action: string };
-  assert.equal(res.action, 'allow');
+  assert.equal(res.action, 'deny');
+  assert.equal(
+    (sent.find((s) => s.channel === CH.openRequest)?.payload as { disposition?: string }).disposition,
+    'new-tab',
+  );
 });
 
 test('AGENT-tab popups stay DENIED and surface an open-request (no unattended OS window)', () => {

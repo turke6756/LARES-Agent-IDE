@@ -248,7 +248,7 @@ export default function NewTabPage({ onNavigate }: Props) {
   // ── Recent downloads (Slice 13) ────────────────────────────────────────────
   // Read straight from the store's download slice (the bridge seeds + upserts
   // it). Show only the most recent COMPLETED files, capped small. Clicking a row
-  // opens the saved file via the shell (store.openDownloadFile).
+  // opens the saved file in the app's native file view (store.openDownloadFile).
   const downloads = useBrowserStore((s) => s.downloads);
   const openDownloadFile = useBrowserStore((s) => s.openDownloadFile);
   const recentDownloads = useMemo(

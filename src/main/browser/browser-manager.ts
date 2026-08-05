@@ -796,12 +796,11 @@ export class BrowserManager {
    *  persistent SQLite reopen stack instead (session-store); `pushedAt` lets the
    *  reopen merge pick whichever side was closed more recently (Slice 10). */
   private closedTabStack: Array<{ url: string; partition: BrowserPartition; title: string; pushedAt: number }> = [];
-  /** Live OAuth/sign-in popups: native child windows we deliberately allowed
-   *  from a USER tab via setWindowOpenHandler (see wireViewEvents). Tracked so
-   *  the M4 managed-contents guard recognizes them (no "unknown web-contents"
-   *  loud-log) and so their UA-per-URL override can be wired. Entries are
-   *  removed when the popup's webContents is destroyed. Also holds Phase 2
-   *  quarantined AGENT sign-in popups (§D line 249) — allowed ONLY from a
+  /** Live quarantined AGENT sign-in popups: native child windows allowed ONLY
+   *  from a signinPending tab. Tracked so the M4 managed-contents guard
+   *  recognizes them (no "unknown web-contents" loud-log) and so their
+   *  UA-per-URL override can be wired. Entries are removed when the popup's
+   *  webContents is destroyed. These Phase 2 popups (§D line 249) are tied to a
    *  signinPending agent tab, tracked here so the M4 guard recognizes them, but
    *  ALSO listed in signinPopupWindows (below) so they stay non-drivable and are
    *  closed with the setup session. */
@@ -3066,13 +3065,11 @@ export class BrowserManager {
     return listDownloads();
   }
 
-  /** Open a completed download via the OS. Returns false if the record is
-   *  unknown or the OS reported an error. Trusted-chrome only. */
+  /** Validate that a completed download is still present before trusted chrome
+   *  opens it in the app's native file view. */
   async openDownloadFile(id: string): Promise<boolean> {
     const rec = getDownload(id);
-    if (!rec) return false;
-    const err = await shell.openPath(rec.savePath);
-    return err === '';
+    return rec?.state === 'completed' && existsSync(rec.savePath);
   }
 
   /** Reveal a download in the OS file manager. Trusted-chrome only. */
@@ -3750,24 +3747,17 @@ export class BrowserManager {
     // UI can offer open-as-new-tab (which re-enters the M6 gate); automation
     // must never spawn an unattended OS window.
     //
-    // USER tabs: real `window.open()` popups are ALLOWED as native child
-    // windows. This is required for human-driven OAuth ("Sign in with Google"
-    // and friends): the originating page keeps the handle window.open() returns
-    // and exchanges the result with the popup via window.opener.postMessage.
-    // Denying the popup (or re-opening the URL as a fresh tab) severs that
-    // opener channel, so the login can never complete — which is exactly the
-    // failure being fixed. Allowing keeps the opener link intact and removes the
-    // "Page tried to open a new window" confirmation for the human.
-    //
-    // The popup runs on the SAME persist:user session as its opener (Electron
-    // inherits it for window.open children), so every session-level guard the
-    // tab has — M2 loopback block, M5 permission deny-all, M7 download gating,
-    // the Chrome UA — already applies. Only http(s)/about:blank are auto-allowed
-    // (about:blank covers flows that open a blank popup then navigate it via
-    // JS); any other scheme falls through to the deny+surface path above.
+    // USER tabs: http(s)/about:blank window.open requests are denied as native
+    // windows and marked for immediate routing to a new in-app browser tab.
+    // Quarantined AGENT sign-in popups remain the narrow native exception below:
+    // their workspace-scoped session and window.opener channel are required for
+    // SSO completion. Other schemes and ordinary agent popups remain gated.
     wc.setWindowOpenHandler(({ url }) => {
       const allowPopup = this.decidePopupOpen(tab, url);
-      if (allowPopup) {
+      // Quarantined agent sign-in is the one exception: its child window must
+      // retain window.opener and the workspace-scoped agent Session for SSO.
+      // Ordinary human-page popups take the in-app tab route below.
+      if (allowPopup && tab.partition === 'agent') {
         const win = this.host();
         return {
           action: 'allow',
@@ -3783,11 +3773,12 @@ export class BrowserManager {
       this.host()?.webContents.send(BROWSER_CHANNELS.openRequest, {
         tabId: tab.id,
         url,
+        ...(allowPopup && tab.partition === 'user' ? { disposition: 'new-tab' as const } : {}),
       });
       return { action: 'deny' };
     });
 
-    // Configure each allowed USER popup: register it as a managed web-contents
+    // Configure each allowed quarantined sign-in popup as managed web-contents
     // (so the M4 guard doesn't loud-log it as unknown) and keep the per-URL UA
     // override the parent view uses (version-stripped Chrome UA on
     // accounts.google.com — the G1 BotGuard fix), since the popup is the actual
