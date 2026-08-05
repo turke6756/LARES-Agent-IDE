@@ -150,18 +150,18 @@ export function archiveStalePlan(planPath: string, runId: string): string | null
   }
 }
 
-// --- WP6: done-detection (whole-file existsSync → section-anchor changed) ---
-// The legacy deliverable is a fresh plan FILE appearing at planPath; a
-// planning-surface run instead edits ONE section of an EXISTING registered
-// surface, so existsSync(planPath) is already
-// true at turn 1 and would complete the run with zero deliberation. For a
-// rail-carrying run we ask the DB (via the client's plan_section_changes lookup,
-// WP4) whether the dispatched section's byte-exact content hash has moved since
-// the run started; rail-less runs keep the exact fresh-file semantics.
-function planDeliverableReady(client: DashboardClient, ctx: OrchestrationRunContext): boolean {
+// A folder-native plan binding points at a pre-existing document. Treat it as
+// delivered only after the document's filesystem timestamp moves past run start;
+// fresh-file runs retain their original existence check. This keeps completion
+// independent of the retired plan_section_changes table.
+function planDeliverableReady(_client: DashboardClient, ctx: OrchestrationRunContext): boolean {
   const { run } = ctx;
   if (run.planId && run.sectionAnchor) {
-    return client.sectionChangedSince(run.planId, run.sectionAnchor, run.startedAt);
+    try {
+      return fs.statSync(run.planPath).mtimeMs >= Date.parse(run.startedAt);
+    } catch {
+      return false;
+    }
   }
   return fs.existsSync(run.planPath);
 }

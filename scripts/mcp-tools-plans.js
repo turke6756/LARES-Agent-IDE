@@ -20,32 +20,7 @@
 // `plan_id` is optional in every schema here: supervisors normally pass it
 // explicitly, but an omitted plan_id falls back to AGENT_DASHBOARD_PLAN_ID (the
 // dispatched plan) at handler time; still-falsy yields a clear error.
-const READ_DEFS = [
-  {
-    name: 'read_plan_projection',
-    description:
-      'Read the trusted activity projection for a plan: each live section with its ' +
-      'plan_events roll-up (trusted event count + last event, observed_via + confidence, ' +
-      'plus witnessed repo-activity counts: repoFilesEdited/Created/Read per section). ' +
-      'Records a `*` read breadcrumb. Use to see who did what where on the plan. Per-event ' +
-      'tier-2 rows are opt-in (events:true) and default-capped (latest 50, hard max 200); ' +
-      'each tier-2 row carries a counts-only witnessed digest. For ONE event\'s full ' +
-      'witnessed file list (Tier-3 drill-down), pass event_detail_id. ' +
-      'scope to one zone with section_anchor to keep token cost down.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        plan_id: { type: 'string', description: 'The plan ID (optional — defaults to the dispatched plan in AGENT_DASHBOARD_PLAN_ID).' },
-        events: { type: 'boolean', description: 'Attach per-event tier-2 rows (agent, observed_via, confidence, claims, witnessed digest). Off by default — counts only.' },
-        events_limit: { type: 'number', description: 'Max events when events:true — returns the latest N (oldest-first within that window). Default 50, hard max 200; raise deliberately (token cost).' },
-        section_anchor: { type: 'string', description: 'When events:true, restrict events to those touching this section anchor.' },
-        event_detail_id: { type: 'string', description: 'Fetch the capped witnessed file list for ONE event (Tier-3 drill-down). Opt-in token cost.' },
-      },
-      required: [],
-    },
-  },
-];
-
+const READ_DEFS = [];
 // focus_plan / unfocus_plan — supervisor-only subscription verbs (planning-surface
 // P1). A supervisor auto-subscribes on plan-bound launch_agent / run_orchestration,
 // but these let it curate the set explicitly so a
@@ -142,26 +117,6 @@ function missingPlanIdError() {
 
 async function handlePlansToolCall(name, args, apiRequest) {
   switch (name) {
-    case 'read_plan_projection': {
-      const planId = resolvePlanId(args);
-      if (!planId) return missingPlanIdError();
-      let p = `/api/plans/${encodeURIComponent(planId)}/projection`;
-      const q = [];
-      if (args.events) {
-        q.push('events=full');
-        const reqLim = args.events_limit !== undefined ? Number(args.events_limit) : 50;
-        const lim = Number.isFinite(reqLim) ? Math.min(200, Math.max(0, Math.floor(reqLim))) : 50; // clamp + hard max
-        q.push(`events_limit=${lim}`);
-        if (args.section_anchor) q.push(`section_anchor=${encodeURIComponent(args.section_anchor)}`);
-      }
-      // Fix-4 Tier-3 — a detail fetch is INDEPENDENT of tier-2 (outside the events
-      // block): drilling into one event needs no per-event listing.
-      if (args.event_detail_id) q.push('event_detail_id=' + encodeURIComponent(args.event_detail_id));
-      if (q.length) p += '?' + q.join('&');
-      const result = await apiRequest('GET', p);
-      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
-    }
-
     case 'focus_plan': {
       const planId = resolvePlanId(args);
       if (!planId) return missingPlanIdError();

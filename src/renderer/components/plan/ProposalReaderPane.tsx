@@ -173,14 +173,11 @@ export default function ProposalReaderPane({
     refresh();
   }, [refresh]);
 
-  // Native WebContentsView panes composite above renderer DOM; hide the plan
-  // pane (visibility only, no reload) and suspend the browser pane while the
-  // reader overlay is up, mirroring the Plans gallery precedent.
+  // Native browser panes composite above renderer DOM, so suspend the browser
+  // pane while the reader overlay is up.
   useEffect(() => {
-    void window.api.plans.paneSetVisible(false);
     suspendBrowserPane();
     return () => {
-      void window.api.plans.paneSetVisible(true);
       resumeBrowserPane();
     };
   }, []);

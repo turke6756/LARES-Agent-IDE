@@ -264,9 +264,6 @@ describe('SC-WP-3I PlanSurfaceView candidate preview reuse', () => {
   it('renders the shared CandidatePreview for the plan lens when a selection is resolved', async () => {
     const c = await render(
       <PlanSurfaceView
-        projection={{ parseError: null, warnings: [] }}
-        sections={[]}
-        events={[]}
         workspaceId="ws-1"
         candidateSelection={{ selectedComponentIds: ['c1'], selectedUnattributedEntryIds: [], finalizationIds: ['fin-1'] }}
       />,
@@ -285,9 +282,6 @@ describe('SC-WP-3I PlanSurfaceView candidate preview reuse', () => {
   it('renders an EDITABLE message body and READ-ONLY Lares-* trailers', async () => {
     const c = await render(
       <PlanSurfaceView
-        projection={{ parseError: null, warnings: [] }}
-        sections={[]}
-        events={[]}
         workspaceId="ws-1"
         candidateSelection={{ selectedComponentIds: ['c1'], selectedUnattributedEntryIds: [], finalizationIds: ['fin-1'] }}
       />,
@@ -315,9 +309,6 @@ describe('SC-WP-3I PlanSurfaceView candidate preview reuse', () => {
   it('omits the preview when no candidate selection is resolved (unwired / nothing to save)', async () => {
     const c = await render(
       <PlanSurfaceView
-        projection={{ parseError: null, warnings: [] }}
-        sections={[]}
-        events={[]}
         workspaceId="ws-1"
         candidateSelection={null}
       />,

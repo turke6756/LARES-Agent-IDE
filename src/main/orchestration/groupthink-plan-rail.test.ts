@@ -1,8 +1,9 @@
+
 // WP6 — planning-surface rail on the GroupThink launch + done-detection paths.
 //
 // Proves the two hops that carry plan_id + section_anchor from a dispatched run
 // all the way to a launched member agent's environment, plus the done-detection
-// swap (whole-file existsSync → dispatched-section content change):
+// swap (whole-file existsSync → post-dispatch document mtime):
 //
 //   1. RUN → LAUNCH INPUT (behavioral): runSerial/runParallel stamp
 //      launchInput.planId / launchInput.planSection onto EVERY member from
@@ -14,10 +15,9 @@
 //      the dual-injection trap). Together these pin the whole chain so a member
 //      launched by a rail-carrying run demonstrably receives the plan env under
 //      Windows and WSL alike.
-//   3. DONE-DETECTION SWAP (behavioral): a rail run completes on a
-//      client.sectionChangedSince() signal and NOT on the plan file — an
-//      existing plan file no longer short-circuits it, and a run with no file
-//      completes as soon as the section changes.
+//   3. DONE-DETECTION SWAP (behavioral): a bound run completes only after its
+//      folder-native document changes after dispatch; a pre-existing file alone
+//      never short-circuits it.
 //
 //   npm run build:main
 //   node dist/main/main/orchestration/groupthink-plan-rail.test.js
@@ -67,7 +67,6 @@ interface FakeAgent {
 interface FakeState { agents: Map<string, FakeAgent>; launchInputs: any[]; events: string[]; sentPrompts: Array<{ id: string; text: string }>; }
 interface FakeConfig {
   onTurn?: (a: FakeAgent, state: FakeState) => void;
-  sectionChanged?: () => boolean;
 }
 
 let agentSeq = 0;
@@ -117,7 +116,6 @@ function makeFake(cfg: FakeConfig = {}): { client: DashboardClient; state: FakeS
     recoverChatBinding: () => {},
     isInputInFlight: () => false,
     stopAgent: async () => {},
-    sectionChangedSince: () => (cfg.sectionChanged ? cfg.sectionChanged() : false),
   };
   return { client, state };
 }
@@ -143,21 +141,14 @@ function makeCtx(run: OrchestrationRun): OrchestrationRunContext {
 interface TestCase { name: string; run(): Promise<void> | void; }
 const tests: TestCase[] = [];
 function test(name: string, fn: () => Promise<void> | void): void { tests.push({ name, run: fn }); }
-async function rejectsMatching(p: Promise<unknown>, re: RegExp): Promise<void> {
-  try { await p; } catch (err: any) { assert.match(err?.message || String(err), re); return; }
-  throw new Error(`expected rejection matching ${re}`);
-}
-
 // ── Hop 1: run → launch input ────────────────────────────────────────────────
 
 test('serial: every launched member carries the run planId + sectionAnchor', async () => {
   const run = makeRun({ planId: 'plan-9', sectionAnchor: 'sec_z' });
   // Terminate only once BOTH members have launched: fire the section change after
   // the Reviewer produces its first turn (BUG-29 launches it after lead turn 1).
-  let reviewerTurned = false;
   const { client, state } = makeFake({
-    onTurn: (a) => { if (a.title.startsWith('Reviewer')) reviewerTurned = true; },
-    sectionChanged: () => reviewerTurned,
+    onTurn: (a) => { if (a.title.startsWith('Reviewer')) fs.writeFileSync(run.planPath, 'updated'); },
   });
   try {
     await runSerial(client, makeCtx(run));
@@ -166,8 +157,7 @@ test('serial: every launched member carries the run planId + sectionAnchor', asy
       assert.equal(input.planId, 'plan-9', `${input.title} launch input carries planId`);
       assert.equal(input.planSection, 'sec_z', `${input.title} launch input carries planSection`);
     }
-    // Completed via section change — the plan FILE was never written.
-    assert.equal(fs.existsSync(run.planPath), false, 'no plan file created; completion came from the section change');
+    assert.equal(fs.existsSync(run.planPath), true, 'completion came from the bound document update');
   } finally { rm(run.planPath); }
 });
 
@@ -176,8 +166,9 @@ test('parallel: both planners carry the run planId + sectionAnchor', async () =>
   // Complete at R3: let the synthesizer's R3 turn fire the section change.
   let synthTurns = 0;
   const { client, state } = makeFake({
-    onTurn: (a) => { if (a.title.startsWith('Synthesizer')) synthTurns++; },
-    sectionChanged: () => synthTurns >= 3,   // R1,R2,R3 → true at the synthesis turn
+    onTurn: (a) => {
+      if (a.title.startsWith('Synthesizer') && ++synthTurns >= 3) fs.writeFileSync(run.planPath, 'updated');
+    },
   });
   try {
     await runParallel(client, makeCtx(run));
@@ -186,7 +177,7 @@ test('parallel: both planners carry the run planId + sectionAnchor', async () =>
       assert.equal(input.planId, 'plan-p', `${input.title} carries planId`);
       assert.equal(input.planSection, 'sec_syn', `${input.title} carries planSection`);
     }
-    assert.equal(fs.existsSync(run.planPath), false, 'no plan file; R3 completed on the section change');
+    assert.equal(fs.existsSync(run.planPath), true, 'R3 completed on the bound document update');
   } finally { rm(run.planPath); }
 });
 
@@ -220,33 +211,33 @@ test('WSL site: wslEnvPrefix injects AGENT_DASHBOARD_PLAN_ID/_SECTION from agent
   assert.match(SUPERVISOR_SRC, /wslEnvPrefix\.push\(`AGENT_DASHBOARD_PLAN_SECTION=\$\{[^}]*agent\.planSection[^}]*\}`\)/);
 });
 
-// ── Hop 3: done-detection swap (existsSync → section change) ──────────────────
+// ── Hop 3: done-detection swap (existsSync → post-dispatch mtime) ─────────────
 
-test('done-detection: a rail run IGNORES an existing plan file and completes only on a section change', async () => {
-  const run = makeRun({ planId: 'plan-x', sectionAnchor: 'sec_q' });
+test('done-detection: a bound run ignores a file older than dispatch and completes after it changes', async () => {
+  const startedAt = new Date().toISOString();
+  const run = makeRun({ planId: 'plan-x', sectionAnchor: 'sec_q', startedAt });
   // A file at planPath would short-circuit the LEGACY existsSync gate on turn 1.
   fs.writeFileSync(run.planPath, 'pre-existing registered surface');
-  // Section never changes → the run must keep deliberating to MAX_TURNS and STALL,
-  // proving the plan FILE is no longer consulted for a rail run's done-detection.
-  const { client } = makeFake({ sectionChanged: () => false });
+  const old = new Date(Date.parse(startedAt) - 10_000);
+  fs.utimesSync(run.planPath, old, old);
+  const { client, state } = makeFake({
+    onTurn: (a) => { if (a.title.startsWith('Lead')) fs.writeFileSync(run.planPath, 'updated after dispatch'); },
+  });
   try {
-    await rejectsMatching(runSerial(client, makeCtx(run)), /Max turns/);
+    await runSerial(client, makeCtx(run));
+    assert.equal(state.launchInputs.length, 1, 'the first post-dispatch update completes the run');
   } finally { rm(run.planPath); }
 });
 
-test('done-detection: a rail run completes as soon as the dispatched section changes', async () => {
+test('done-detection: a bound run completes as soon as its document is created', async () => {
   const run = makeRun({ planId: 'plan-y', sectionAnchor: 'sec_done' });
-  // Fire the change right after the Lead's first turn → runSerial returns before
-  // the Reviewer ever launches (no file involved).
-  let leadTurned = false;
   const { client, state } = makeFake({
-    onTurn: (a) => { if (a.title.startsWith('Lead')) leadTurned = true; },
-    sectionChanged: () => leadTurned,
+    onTurn: (a) => { if (a.title.startsWith('Lead')) fs.writeFileSync(run.planPath, 'created'); },
   });
   try {
     await runSerial(client, makeCtx(run));   // resolves (no throw)
-    assert.equal(state.launchInputs.length, 1, 'only the Lead launched — section change ended the run at turn 1');
-    assert.equal(fs.existsSync(run.planPath), false, 'completed with no plan file on disk');
+    assert.equal(state.launchInputs.length, 1, 'only the Lead launched — document creation ended the run at turn 1');
+    assert.equal(fs.existsSync(run.planPath), true, 'completed with the bound document on disk');
   } finally { rm(run.planPath); }
 });
 
@@ -274,10 +265,13 @@ const REAL_PLAN_BASENAME = 'demo-plan-planning-surface-acceptance.html';
 
 test('rail dispatch resolves the plan row path into run.planPath (never plans/new-plan.md)', async () => {
   svcPlansStore.set('plan-demo', { id: 'plan-demo', workspaceId: 'ws-1', path: REAL_PLAN_REL });
-  let reviewerTurned = false;
+  const realPlanPath = path.join(os.tmpdir(), REAL_PLAN_REL);
   const { client, state } = makeFake({
-    onTurn: (a) => { if (a.title.startsWith('Reviewer')) reviewerTurned = true; },
-    sectionChanged: () => reviewerTurned,
+    onTurn: (a) => {
+      if (!a.title.startsWith('Reviewer')) return;
+      fs.mkdirSync(path.dirname(realPlanPath), { recursive: true });
+      fs.writeFileSync(realPlanPath, 'updated');
+    },
   });
   const delivered: string[] = [];
   const svc = new OrchestrationService(client, async (_sup, text) => { delivered.push(text); return { ok: true }; },
@@ -309,6 +303,7 @@ test('rail dispatch resolves the plan row path into run.planPath (never plans/ne
   assert.ok(completeMsg, 'a groupthink.complete message was delivered');
   assert.ok(completeMsg!.includes(REAL_PLAN_BASENAME), 'completion message references the real plan path');
   assert.ok(!completeMsg!.includes('new-plan.md'), 'completion message never names the plan_path default');
+  rm(realPlanPath);
 });
 
 // ── Runner ───────────────────────────────────────────────────────────────────

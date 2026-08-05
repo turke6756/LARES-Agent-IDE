@@ -17,11 +17,10 @@ function test(name, fn) { tests.push({ name, fn }); }
 
 // ── Tool surface ────────────────────────────────────────────────────────────
 
-test('the plans toolset — activity read + focus verbs (supervisor lane)', () => {
+test('the plans toolset exposes focus verbs + the demand probe', () => {
   const names = getPlansToolDefinitions().map((t) => t.name);
   assert.deepStrictEqual(names.sort(), [
     'focus_plan',
-    'read_plan_projection',
     'record_planning_event',
     'unfocus_plan',
   ]);
@@ -60,10 +59,9 @@ test('every definition has a description and an object inputSchema with required
 
 // ── WP-A4: plans-read read-only subset (worker lane) ────────────────────────
 
-test('getPlansReadToolDefinitions returns the activity read + record_planning_event', () => {
+test('getPlansReadToolDefinitions returns only record_planning_event', () => {
   const names = getPlansReadToolDefinitions().map((t) => t.name);
   assert.deepStrictEqual(names.sort(), [
-    'read_plan_projection',
     'record_planning_event',
   ]);
 });
@@ -82,52 +80,10 @@ test('retired create_plan is not handled and makes no HTTP call', async () => {
   assert.strictEqual(api.calls.length, 0, 'the retired tool must not issue an HTTP call');
 });
 
-test('handlePlansReadToolCall delegates the activity read to the shared handler', async () => {
-  const api = fakeApi({
-    'GET /api/plans/plan-1/projection': { sections: [{ anchor: 'sec_abc123' }] },
-  });
-  const r = await handlePlansReadToolCall('read_plan_projection', { plan_id: 'plan-1' }, api);
-  assert.strictEqual(api.calls[0].path, '/api/plans/plan-1/projection');
-  assert.match(r.content[0].text, /sec_abc123/);
-});
-
 test('handlePlansReadToolCall returns null for non-plan tool names', async () => {
   const api = fakeApi({});
   assert.strictEqual(await handlePlansReadToolCall('list_agents', {}, api), null);
   assert.strictEqual(api.calls.length, 0);
-});
-
-test('omitted plan_id falls back to AGENT_DASHBOARD_PLAN_ID', async () => {
-  const prev = process.env.AGENT_DASHBOARD_PLAN_ID;
-  process.env.AGENT_DASHBOARD_PLAN_ID = 'env-plan-9';
-  try {
-    const api = fakeApi({
-      'GET /api/plans/env-plan-9/projection': { sections: [] },
-    });
-    await handlePlansToolCall('read_plan_projection', {}, api);
-    assert.strictEqual(api.calls[0].path, '/api/plans/env-plan-9/projection');
-    // Same env-default path via the plans-read dispatcher.
-    await handlePlansReadToolCall('read_plan_projection', {}, api);
-    assert.strictEqual(api.calls[1].path, '/api/plans/env-plan-9/projection');
-  } finally {
-    if (prev === undefined) delete process.env.AGENT_DASHBOARD_PLAN_ID;
-    else process.env.AGENT_DASHBOARD_PLAN_ID = prev;
-  }
-});
-
-test('absent plan_id AND absent env → clear error, no HTTP call', async () => {
-  const prev = process.env.AGENT_DASHBOARD_PLAN_ID;
-  delete process.env.AGENT_DASHBOARD_PLAN_ID;
-  try {
-    const api = fakeApi({});
-    const r = await handlePlansToolCall('read_plan_projection', {}, api);
-    assert.ok(r.isError);
-    assert.match(r.content[0].text, /no plan_id supplied and no dispatched plan in env/);
-    assert.strictEqual(api.calls.length, 0, 'no HTTP call when plan_id is unresolvable');
-  } finally {
-    if (prev === undefined) delete process.env.AGENT_DASHBOARD_PLAN_ID;
-    else process.env.AGENT_DASHBOARD_PLAN_ID = prev;
-  }
 });
 
 // ── Dispatch against a fake apiRequest ──────────────────────────────────────
@@ -228,112 +184,6 @@ test('handlePlansReadToolCall rejects focus_plan / unfocus_plan (write tools, su
     assert.match(r.content[0].text, new RegExp(`${name} is not available`));
   }
   assert.strictEqual(api.calls.length, 0, 'no HTTP call may be made for a rejected write tool');
-});
-
-test('read_plan_projection GETs /api/plans/:id/projection and serializes', async () => {
-  const api = fakeApi({
-    'GET /api/plans/plan-1/projection': { sections: [{ anchor: 'sec_abc123', eventCount: 3 }] },
-  });
-  const r = await handlePlansToolCall('read_plan_projection', { plan_id: 'plan-1' }, api);
-  assert.strictEqual(api.calls[0].path, '/api/plans/plan-1/projection');
-  assert.match(r.content[0].text, /"eventCount": 3/);
-});
-
-// ── I-7: read_plan_projection events opt-in + clamp + section scoping ─────────
-
-test('read_plan_projection def advertises events / events_limit / section_anchor', () => {
-  const def = getPlansReadToolDefinitions().find((d) => d.name === 'read_plan_projection');
-  const props = def.inputSchema.properties;
-  assert.strictEqual(props.events.type, 'boolean');
-  assert.strictEqual(props.events_limit.type, 'number');
-  assert.strictEqual(props.section_anchor.type, 'string');
-  assert.ok(!def.inputSchema.required.includes('events'), 'events is opt-in, never required');
-});
-
-test('read_plan_projection {events:true} → events=full&events_limit=50 (default cap)', async () => {
-  const api = fakeApi({
-    'GET /api/plans/plan-1/projection?events=full&events_limit=50': { sections: [], events: [] },
-  });
-  await handlePlansToolCall('read_plan_projection', { plan_id: 'plan-1', events: true }, api);
-  assert.strictEqual(api.calls[0].path, '/api/plans/plan-1/projection?events=full&events_limit=50');
-});
-
-test('read_plan_projection {events:true, events_limit:5000} → clamped to hard max 200', async () => {
-  const api = fakeApi({
-    'GET /api/plans/plan-1/projection?events=full&events_limit=200': { sections: [], events: [] },
-  });
-  await handlePlansToolCall('read_plan_projection', { plan_id: 'plan-1', events: true, events_limit: 5000 }, api);
-  assert.strictEqual(api.calls[0].path, '/api/plans/plan-1/projection?events=full&events_limit=200');
-});
-
-test('read_plan_projection {events:true, events_limit:-3} → clamped to 0', async () => {
-  const api = fakeApi({
-    'GET /api/plans/plan-1/projection?events=full&events_limit=0': { sections: [], events: [] },
-  });
-  await handlePlansToolCall('read_plan_projection', { plan_id: 'plan-1', events: true, events_limit: -3 }, api);
-  assert.strictEqual(api.calls[0].path, '/api/plans/plan-1/projection?events=full&events_limit=0');
-});
-
-test('read_plan_projection threads events_limit + section_anchor together', async () => {
-  const api = fakeApi({
-    'GET /api/plans/plan-1/projection?events=full&events_limit=12&section_anchor=sec_x': { sections: [], events: [] },
-  });
-  await handlePlansToolCall(
-    'read_plan_projection',
-    { plan_id: 'plan-1', events: true, events_limit: 12, section_anchor: 'sec_x' },
-    api,
-  );
-  assert.strictEqual(api.calls[0].path, '/api/plans/plan-1/projection?events=full&events_limit=12&section_anchor=sec_x');
-});
-
-test('read_plan_projection with no events flag → bare /projection (parity floor unchanged)', async () => {
-  const api = fakeApi({
-    'GET /api/plans/plan-1/projection': { sections: [] },
-  });
-  await handlePlansToolCall('read_plan_projection', { plan_id: 'plan-1', section_anchor: 'sec_x' }, api);
-  assert.strictEqual(api.calls[0].path, '/api/plans/plan-1/projection', 'no events:true → no query at all');
-});
-
-// ── Fix-4 §4d: event_detail_id Tier-3 drill-down threading ───────────────────
-
-test('read_plan_projection def advertises event_detail_id (Tier-3 drill-down param)', () => {
-  const def = getPlansReadToolDefinitions().find((d) => d.name === 'read_plan_projection');
-  assert.strictEqual(def.inputSchema.properties.event_detail_id.type, 'string');
-  assert.ok(!def.inputSchema.required.includes('event_detail_id'), 'event_detail_id is opt-in');
-  assert.match(def.description, /drill|detail|witnessed/i, 'description mentions the drill-down');
-});
-
-test('read_plan_projection {event_detail_id} alone → ?event_detail_id=… (independent of events)', async () => {
-  const api = fakeApi({
-    'GET /api/plans/plan-1/projection?event_detail_id=ev-7': { sections: [], eventDetail: null },
-  });
-  await handlePlansToolCall('read_plan_projection', { plan_id: 'plan-1', event_detail_id: 'ev-7' }, api);
-  assert.strictEqual(api.calls[0].path, '/api/plans/plan-1/projection?event_detail_id=ev-7',
-    'a detail fetch needs no events=full listing');
-});
-
-test('read_plan_projection threads event_detail_id alongside events=full', async () => {
-  const api = fakeApi({
-    'GET /api/plans/plan-1/projection?events=full&events_limit=50&event_detail_id=ev-9': { sections: [], events: [] },
-  });
-  await handlePlansToolCall('read_plan_projection', { plan_id: 'plan-1', events: true, event_detail_id: 'ev-9' }, api);
-  assert.strictEqual(api.calls[0].path, '/api/plans/plan-1/projection?events=full&events_limit=50&event_detail_id=ev-9');
-});
-
-test('read_plan_projection URL-encodes an event_detail_id with unsafe chars', async () => {
-  const api = fakeApi({
-    'GET /api/plans/plan-1/projection?event_detail_id=a%2Fb%20c': { sections: [], eventDetail: null },
-  });
-  await handlePlansToolCall('read_plan_projection', { plan_id: 'plan-1', event_detail_id: 'a/b c' }, api);
-  assert.strictEqual(api.calls[0].path, '/api/plans/plan-1/projection?event_detail_id=a%2Fb%20c');
-});
-
-test('read_plan_projection without event_detail_id → no event_detail_id param', async () => {
-  const api = fakeApi({
-    'GET /api/plans/plan-1/projection?events=full&events_limit=50': { sections: [], events: [] },
-  });
-  await handlePlansToolCall('read_plan_projection', { plan_id: 'plan-1', events: true }, api);
-  assert.ok(!api.calls[0].path.includes('event_detail_id'), 'absent arg → param omitted');
 });
 
 // ── Wiring into mcp-dashboard.js (static check for the plans toolset) ────────

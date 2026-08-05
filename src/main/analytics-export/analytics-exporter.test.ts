@@ -314,8 +314,6 @@ function makeDeps(over: Partial<ExporterDeps> = {}): { deps: Partial<ExporterDep
     },
     querySkillUsage: (() => skillResult()) as ExporterDeps['querySkillUsage'],
     queryMcpToolUsage: (() => mcpResult()) as ExporterDeps['queryMcpToolUsage'],
-    resolvePlanProjection: (async () => null) as unknown as ExporterDeps['resolvePlanProjection'],
-    buildPlanActivityProjection: (() => ({})) as unknown as ExporterDeps['buildPlanActivityProjection'],
     isEpochsBackfilled: () => true,
     skillIndexComplete: () => true,
     gitInfo: async () => ({ sha: 'abc123', branch: 'master', dirty: false }),

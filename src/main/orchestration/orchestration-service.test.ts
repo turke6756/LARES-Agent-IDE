@@ -70,7 +70,6 @@ function makeClient(overrides: Partial<DashboardClient> = {}): DashboardClient {
     recoverChatBinding: () => {},
     isInputInFlight: () => false,
     stopAgent: async () => {},
-    sectionChangedSince: () => false,
     ...overrides,
   };
 }

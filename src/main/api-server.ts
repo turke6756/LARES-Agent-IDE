@@ -23,10 +23,7 @@ import {
   planItemInPlan,
   getSupervisorFocus, upsertSupervisorFocus, deleteSupervisorFocus,
   bumpSupervisorFocusAttended, getSupervisorFocusedPlans,
-  getPlanSections, getPlanEventRollup, getPlanEventsForRender,
-  getPlanEventRepoActivity,
 } from './database';
-import { toTier2Digest, toTier3Detail } from './plans/repo-activity';
 import { readFileContents } from './file-reader';
 import {
   executeCell as kernelExecuteCell,
@@ -40,7 +37,7 @@ import { scanPersonas, scaffoldPersona } from './persona-scanner';
 import { applyContextGaugeSettings, type ContextGaugeIpcDeps } from './context-gauge/context-gauge-ipc';
 import { TEAM_MAX_MESSAGES_PER_5MIN, TEAM_MAX_ALTERNATIONS, TEAM_ALTERNATION_WINDOW_MS, TEAM_PAIR_COOLDOWN_MS, CONTINUATION_BRICK_MAX_BYTES, CONTINUATION_ESCAPE_MAX_ATTEMPTS, CONTINUATION_ESCAPE_MAX_ALIVE_MS } from '../shared/constants';
 import { TeamMessageStatus, hasSupervisorPrivilege } from '../shared/types';
-import type { Agent, Workspace, PlanActivityEvent, RepoActivityDetail } from '../shared/types';
+import type { Agent, Workspace } from '../shared/types';
 import fs from 'fs';
 import * as nodePath from 'path';
 // Checkpoint Surface Hardening WP4 — `canonicalizeToAbsolute` is used ONLY as the
@@ -3679,23 +3676,6 @@ export class ApiServer {
       return { ok: true, planId: deleted.id, deletedAt: deleted.deletedAt };
     }
 
-    // Transitional activity-only projection. The legacy HTML section projection
-    // is retired; P8E owns removal of the remaining plan-event payload.
-    const planProjection = path.match(/^\/api\/plans\/([^/]+)\/projection$/);
-    if (method === 'GET' && planProjection) {
-      const plan = getPlan(planProjection[1]);
-      if (!plan || plan.deletedAt) throw Object.assign(new Error('Plan not found'), { statusCode: 404 });
-      this.bumpFocusOnRead(identity, plan.id);
-      return buildPlanActivityProjection(plan.id, {
-        sections: [], parseError: null, warnings: [],
-      }, {
-        includeEvents: url.searchParams.get('events') === 'full',
-        eventsLimit: queryNum(url.searchParams, 'events_limit'),
-        eventsSectionAnchor: url.searchParams.get('section_anchor') || undefined,
-        eventDetailId: url.searchParams.get('event_detail_id') || undefined,
-      });
-    }
-
     // ── Supervisor-focus routes (B2 P1-03) — explicit supervisor_id; NO ACL (R1/R4) ──
     // GET /api/supervisor-focus?supervisorId=&workspaceId=
     if (method === 'GET' && path === '/api/supervisor-focus') {
@@ -3815,129 +3795,6 @@ function rejectMarkdownMigration(b: any): void {
       );
     }
   }
-}
-
-/** Join a workspace-relative `plans/…` path onto the workspace root (host sep). */
-/** Resolve the projection a read tool serves for a plan (WP3). Prefers WP4's
- *  in-memory last-good projection; falls back to reading + parsing the file on
- *  disk (the reparser may not have run yet — e.g. right after create, or in
- *  tests where it is unconfigured). Returns null for a missing/deleted plan. */
-interface RetiredPlanProjection {
-  sections: Array<{
-    anchor: string | null;
-    zone: string | null;
-    heading: string | null;
-    tokenEstimate: number;
-  }>;
-  parseError: string | null;
-  warnings: string[];
-}
-
-export async function resolvePlanProjection(planId: string): Promise<{
-  plan: import('../shared/types').Plan;
-  projection: RetiredPlanProjection;
-} | null> {
-  const plan = getPlan(planId);
-  if (!plan || plan.deletedAt) return null;
-  return { plan, projection: { sections: [], parseError: null, warnings: [] } };
-}
-
-/** read_plan_projection payload: each live section's structure + its trusted
- *  `plan_events` activity roll-up (count + last event). With
- *  `opts.includeEvents`, also attach the per-event trusted rows (WP5 tier-2:
- *  observed_via / attribution_confidence / section_mismatch + the kept-separate
- *  claimed self-report) so the render surface can show the trusted/claimed
- *  split. Omitted by default to keep the tier-1 orient payload small (C7). */
-export function buildPlanActivityProjection(
-  planId: string,
-  projection: RetiredPlanProjection,
-  opts?: { includeEvents?: boolean; eventsLimit?: number; eventsSectionAnchor?: string; eventDetailId?: string },
-) {
-  const rollup = new Map(getPlanEventRollup(planId).map((r) => [r.sectionAnchor, r]));
-  const archived = new Set(
-    getPlanSections(planId, { includeArchived: true })
-      .filter((s) => s.archivedAt)
-      .map((s) => s.anchor),
-  );
-  const sections = projection.sections.map((s) => {
-    const act = s.anchor ? rollup.get(s.anchor) : undefined;
-    return {
-      anchor: s.anchor,
-      zone: s.zone,
-      heading: s.heading,
-      tokenEstimate: s.tokenEstimate,
-      archived: s.anchor ? archived.has(s.anchor) : false,
-      // GT-A WP-A2.3 — surface the write/presence split from the reshaped rollup
-      // (D-4/D-6). eventCount/lastEventAt kept for back-compat; no route change.
-      writeCount: act?.writeCount ?? 0,
-      presenceCount: act?.presenceCount ?? 0,
-      lastWriteAt: act?.lastWriteAt ?? null,
-      eventCount: act?.eventCount ?? 0,
-      lastEventAt: act?.lastEventAt ?? null,
-      // Fix-4 §4a — witnessed repo rollup fields (the section literal is
-      // UNANNOTATED, so these must be added deliberately). tests*/lastCommit are
-      // inert in cut 1 (no capture) but present so the DTO shape is stable.
-      repoFilesRead: act?.repoFilesRead ?? 0,
-      repoFilesEdited: act?.repoFilesEdited ?? 0,
-      repoFilesCreated: act?.repoFilesCreated ?? 0,
-      testsRun: act?.testsRun ?? 0,
-      testsPassed: act?.testsPassed ?? 0,
-      testsFailed: act?.testsFailed ?? 0,
-      lastCommit: act?.lastCommit ?? null,
-    };
-  });
-  // I-7 — events are opt-in and BOUNDED. A cap (eventsLimit) or a section filter
-  // (eventsSectionAnchor) attaches eventsTruncated/eventsOmitted metadata; a bare
-  // ?events=full (no cap, no filter) stays byte-identical to the pre-I-7 payload
-  // so the dashboard rail is unaffected.
-  let eventsOut = opts?.includeEvents ? getPlanEventsForRender(planId) : undefined;
-  const bounded = opts?.eventsLimit !== undefined || !!opts?.eventsSectionAnchor;
-  let eventsTruncated = false, eventsOmitted = 0;
-  if (eventsOut) {
-    if (opts?.eventsSectionAnchor) {
-      const a = opts.eventsSectionAnchor;
-      // P0 Fix-1 (planning-surface-hardening-review) — section-scoped membership is
-      // an EFFECT-SET / DISPATCHED-fact predicate ONLY. `claimedSectionAnchor` is an
-      // untrusted, agent-supplied value; admitting it here let a forged sentinel
-      // select an event into a section's "trusted" projection. It is deliberately
-      // excluded, with NO replacement diagnostics filter in this pass.
-      eventsOut = eventsOut.filter((e) =>
-        e.observedSectionAnchor === a || e.dispatchedSectionAnchor === a);
-    }
-    if (opts?.eventsLimit !== undefined) {
-      const lim = Math.max(0, Math.floor(opts.eventsLimit)); // clamp: non-negative integer
-      if (eventsOut.length > lim) {
-        eventsOmitted = eventsOut.length - lim;
-        eventsOut = eventsOut.slice(eventsOut.length - lim);  // keep the latest N; rows stay oldest-first
-        eventsTruncated = true;
-      }
-    }
-  }
-  // Fix-4 §4a — Tier-2 strip: map events into a SEPARATE typed payload so the heavy
-  // `repoActivity` blob NEVER rides the wire (dropped here) and each event instead
-  // carries a counts-only `repoActivityDigest`. Tier-2 events carrying a digest is
-  // the fix itself — the payload is NOT byte-identical to pre-fix-4; no test asserts
-  // it is. The events_limit/section_anchor bounded-metadata behavior is unchanged.
-  const eventsPayload: PlanActivityEvent[] | undefined = eventsOut?.map((e) => {
-    const { repoActivity, ...rest } = e;
-    return { ...rest, repoActivityDigest: toTier2Digest(repoActivity ?? null) };
-  });
-  // Fix-4 §4a — Tier-3 drill-down: one event's capped witnessed file list, fetched
-  // ONLY when event_detail_id was requested. `plan_id` in the DB WHERE prevents
-  // cross-plan id probing; a bad/foreign id yields `null` (not an error).
-  let eventDetail: RepoActivityDetail | null = null;
-  if (opts?.eventDetailId) {
-    const ev = getPlanEventRepoActivity(planId, opts.eventDetailId);
-    eventDetail = ev ? toTier3Detail(opts.eventDetailId, ev) : null;
-  }
-  return {
-    planId, sections, parseError: projection.parseError, warnings: projection.warnings,
-    events: eventsPayload,
-    // metadata ONLY when a cap/filter was requested → bare ?events=full stays byte-identical
-    ...(eventsPayload && bounded ? { eventsTruncated, eventsOmitted } : {}),
-    // eventDetail key present ONLY when a drill-down was requested (opt-in cost).
-    ...(opts?.eventDetailId ? { eventDetail } : {}),
-  };
 }
 
 /** Best-effort file stat for DEC-2 metadata fill. Windows: statSync(join(ws.path, rel)).

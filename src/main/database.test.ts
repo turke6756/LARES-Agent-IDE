@@ -138,7 +138,6 @@ type DbModule = {
   // GT-C ownership + trail plumbing.
   getLiveRailAgentForPlan(planId: string, exemptAgentIds?: string[]): DbAgent | null;
   getActiveRailWriterCount(planId: string): number;
-  getTurnSectionChanges(planId: string, sinceIso: string, untilIso: string): Array<{ sectionAnchor: string }>;
 };
 let dbm: DbModule;
 

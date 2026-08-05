@@ -1653,71 +1653,6 @@ export interface UsageLimitsReading {
   seven_day?: UsageWindowReading | null;
 }
 
-/** WP5 render-refresh nudge broadcast after each WP4 reparse of a plan file.
- *  The renderer re-fetches `/api/plans/:id/projection` and full-re-renders.
- *  `parseError`/`degradedFrom` mirror the reparse outcome so the surface can
- *  show the F-E degradation banner without a second round-trip. */
-export interface PlanSurfaceChangedEvent {
-  planId: string;
-  parseError: string | null;
-  degradedFrom: 'memory' | 'snapshot' | 'empty' | null;
-}
-
-/** One section row of the WP5 activity projection (mirrors the server-side
- *  `buildPlanActivityProjection`). Shared so the plan-pane IPC passthrough and
- *  the renderer container agree on the shape. */
-export interface PlanActivitySection {
-  anchor: string | null;
-  zone: string | null;
-  heading: string | null;
-  tokenEstimate: number;
-  archived: boolean;
-  eventCount: number;
-  lastEventAt: string | null;
-  // ── Fix-4: witnessed repo-activity rollup (tests/commit fields inert in cut 1) ──
-  repoFilesRead: number;
-  repoFilesEdited: number;
-  repoFilesCreated: number;
-  testsRun: number;
-  testsPassed: number;
-  testsFailed: number;
-  lastCommit: string | null;
-}
-
-/** One trusted `plan_events` row + its (kept-separate) claimed self-report, as
- *  served for render. Field-for-field the renderer's `PlanEventView`. */
-export interface PlanActivityEvent {
-  id: string;
-  agentId: string;
-  agentTitle?: string | null;
-  createdAt: string;
-  observedSectionAnchor: string | null;
-  dispatchedSectionAnchor: string | null;
-  observedVia: string | null;
-  attributionConfidence: string | null;
-  sectionMismatch: boolean;
-  mismatchReason: string | null;
-  claimedSectionAnchor?: string | null;
-  claimedPayload?: Record<string, unknown> | null;
-  // Fix-4: Tier-2 witnessed digest (counts only, no file list). null = not captured.
-  repoActivityDigest?: RepoActivityDigest | null;
-}
-
-/** The full projection the WP5 surface renders — sections + degradation fields,
- *  plus the trusted event trail when requested (`events=full`). Returned by the
- *  `plan:projection` IPC (an in-process mirror of
- *  GET /api/plans/:id/projection?events=full). */
-export interface PlanActivityProjection {
-  planId: string;
-  sections: PlanActivitySection[];
-  parseError: string | null;
-  warnings: string[];
-  events?: PlanActivityEvent[];
-  // Fix-4: Tier-3 drill-down — one event's capped witnessed file list. Present
-  // only when the projection was requested with an `eventDetailId`.
-  eventDetail?: RepoActivityDetail | null;
-}
-
 // ── Fix-4: witnessed repo-activity evidence (V1, versioned) ──────────────────
 export interface RepoActivityFileItem {
   path: string;                                   // workspace-relative, forward-slash
@@ -2988,12 +2923,7 @@ export interface IpcApi {
   mcpToolUsage: {
     query: (req: McpToolUsageQuery) => Promise<McpToolUsageQueryResult>;
   };
-  /** WP5 plan render surface. `onSurfaceChanged` fires after each WP4 reparse
-   *  (fs change → reparse → re-render) so the renderer re-fetches the served
-   *  projection and does a full re-render — NOT a second `plans/` fs
-   *  subscription (F-C: plans-watcher owns the only one). */
   plans: {
-    onSurfaceChanged: (callback: (payload: PlanSurfaceChangedEvent) => void) => () => void;
     /** List a workspace's plans for the "Plans" card gallery. Each row carries a
      *  cheap description snippet (summary-zone prose) for `html` surfaces. */
     list: (workspaceId?: string) => Promise<PlanListItem[]>;
@@ -3015,9 +2945,6 @@ export interface IpcApi {
       planId: string,
       ref: PlanDocumentRef,
     ) => Promise<PlanDocumentReadResult | { error: string }>;
-    /** Full activity projection (sections + trusted event trail) — the in-process
-     *  mirror of GET /api/plans/:id/projection?events=full. `null` if unknown. */
-    getProjection: (planId: string, opts?: { eventDetailId?: string }) => Promise<PlanActivityProjection | null>;
     /** WP-P2L-proj — ledger/orchestration/disk-derived intent confidence read. */
     listIntents: (planId: string) => Promise<PlanIntentsProjection | null>;
     /** WP-P7C - file-level contribution evidence; never exact-line authorship. */
@@ -3035,14 +2962,6 @@ export interface IpcApi {
       body: string | null;
       supervisorId: string;
     }) => Promise<PlanTabOverview>;
-    /** Sandboxed render-pane lifecycle, same bounds-handoff as the browser pane:
-     *  the renderer streams the pane rectangle while main drives the view. */
-    paneShow: (planId: string) => Promise<void>;
-    paneHide: () => Promise<void>;
-    paneSetBounds: (bounds: { x: number; y: number; width: number; height: number }) => Promise<void>;
-    /** Visibility-only pane toggle (no document reload) — lets a renderer overlay
-     *  such as the Plans gallery temporarily hide the native pane so DOM wins. */
-    paneSetVisible: (visible: boolean) => Promise<void>;
     /** SC-WP-3I — plan-lens candidate preview (read-only). Runs the SAME WP-3G
      *  `buildCandidate` service as the save lens, so it returns identical identity +
      *  member verdicts plus the D-1-filtered whole-component selection for the shared

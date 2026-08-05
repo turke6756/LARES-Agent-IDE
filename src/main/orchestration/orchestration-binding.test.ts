@@ -187,7 +187,6 @@ function makeRun(overrides: Partial<OrchestrationRun> = {}): OrchestrationRun {
       resubmitEnter: () => {},
       isInputInFlight: () => false,
       stopAgent: async () => {},
-      sectionChangedSince: () => false,
     };
     await runSerial(client, {
       run, signal: new AbortController().signal, persist: () => {}, emit: () => {},

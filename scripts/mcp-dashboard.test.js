@@ -223,25 +223,23 @@ test('backward-compat: the `observability` alias resolves to the core surface an
   assert.strictEqual(api.calls[0].method, 'GET');
 });
 
-// ── WP-A4: plans-read worker grant exposes exactly the 3 read tools ──
+// ── plans-read worker grant retains only the demand probe ──
 
-test('plans-read toolset exposes the activity read + record_planning_event', async () => {
+test('plans-read toolset exposes record_planning_event', async () => {
   const proxy = loadProxy('plans-read');
   const names = namesOf(proxy.getToolDefinitions());
   // WP-P0PRE: record_planning_event is a telemetry ping (a demand probe), not a
-  // plan write, so it rides in the read-only worker lane alongside the activity read.
+  // plan write, so it rides in the read-only worker lane.
   assert.deepStrictEqual(names, [
-    'read_plan_projection',
     'record_planning_event',
   ]);
 });
 
-test('plans (supervisor) toolset exposes the activity read + focus verbs', async () => {
+test('plans (supervisor) toolset exposes focus verbs + the demand probe', async () => {
   const proxy = loadProxy('plans');
   const names = namesOf(proxy.getToolDefinitions());
   assert.deepStrictEqual(names, [
     'focus_plan',
-    'read_plan_projection',
     'record_planning_event',
     'unfocus_plan',
   ]);

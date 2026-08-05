@@ -81,7 +81,6 @@ function makeClient(): DashboardClient {
     resubmitEnter: () => {},
     isInputInFlight: () => false,
     stopAgent: async () => {},
-    sectionChangedSince: () => false,
   };
 }
 

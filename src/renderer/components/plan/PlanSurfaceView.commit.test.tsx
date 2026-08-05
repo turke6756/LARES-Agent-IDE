@@ -78,9 +78,6 @@ async function renderAndCommit(response: CommitCoordinatorConsumeResponse): Prom
   await act(async () => {
     root.render(
       <PlanSurfaceView
-        projection={{ parseError: null, warnings: [] }}
-        sections={[]}
-        events={[]}
         workspaceId="workspace-1"
         candidateSelection={selection}
       />,

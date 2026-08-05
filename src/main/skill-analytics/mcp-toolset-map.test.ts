@@ -99,7 +99,7 @@ test('plans tools map to the plans toolset', () => {
   const plansDefs: ToolsetDefsLike = {
     defsFor(t) {
       return t === 'plans'
-        ? [{ name: 'focus_plan' }, { name: 'read_plan_section' }, { name: 'read_plan_projection' }]
+        ? [{ name: 'focus_plan' }, { name: 'record_planning_event' }]
         : t === 'observability-core'
           ? [{ name: 'list_agents' }]
           : null;
@@ -108,8 +108,7 @@ test('plans tools map to the plans toolset', () => {
   // Default toolsets (which now include 'plans') are exercised here.
   const m = buildMcpToolsetReverseMap(plansDefs);
   assert.equal(m.resolve('mcp__agent-dashboard__focus_plan'), 'plans');
-  assert.equal(m.resolve('mcp__agent-dashboard__read_plan_section'), 'plans');
-  assert.equal(m.resolve('mcp__agent-dashboard__read_plan_projection'), 'plans');
+  assert.equal(m.resolve('mcp__agent-dashboard__record_planning_event'), 'plans');
   // WP-F (P5): list_agents is an observability-CORE tool after the split.
   assert.equal(m.resolve('mcp__agent-dashboard__list_agents'), 'observability-core');
 });

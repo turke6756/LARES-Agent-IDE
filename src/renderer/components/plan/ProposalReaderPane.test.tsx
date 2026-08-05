@@ -29,7 +29,6 @@ let root: Root | null = null;
 let listMock: ReturnType<typeof vi.fn>;
 let readMock: ReturnType<typeof vi.fn>;
 let recordMock: ReturnType<typeof vi.fn>;
-let paneSetVisible: ReturnType<typeof vi.fn>;
 
 const PROPOSAL: PlanningReaderEntry = {
   entryId: 'e-prop',
@@ -93,11 +92,10 @@ beforeEach(() => {
   listMock = vi.fn(async () => listResult());
   readMock = vi.fn(async () => readResult());
   recordMock = vi.fn(async () => ({ appended: true, duplicate: false }));
-  paneSetVisible = vi.fn(async () => {});
   (window as unknown as { api: unknown }).api = {
     planningReader: { list: listMock, read: readMock },
     demandProbe: { record: recordMock },
-    plans: { paneSetVisible },
+    plans: {},
   };
 });
 
@@ -225,7 +223,6 @@ describe('ProposalReaderPane', () => {
     await render(
       <ProposalReaderPane workspaceRoot="/ws" pathType="windows" workspaceId="ws-1" onClose={onClose} />,
     );
-    expect(paneSetVisible).toHaveBeenCalledWith(false);
   });
 
   // ── WP-P1C: Request-promotion affordance ──────────────────────────────────

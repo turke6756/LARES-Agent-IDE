@@ -96,19 +96,12 @@ db.listAgentTemplates = (wsId?: string) => (wsId ? [{ id: 'tpl-ws', workspaceId:
 // hook without touching the (uninitialized) real DB.
 let focusedPlansStub: Array<Record<string, unknown>> = [];
 let lastFocusUpsert: Record<string, unknown> | null = null;
-let lastFocusBump: { supervisorId: string; planId: string } | null = null;
 db.getSupervisorFocusedPlans = (_supervisorId: string, _limit?: number) => focusedPlansStub;
 db.upsertSupervisorFocus = (input: Record<string, unknown>) => { lastFocusUpsert = input; return { ...input }; };
-db.bumpSupervisorFocusAttended = (supervisorId: string, planId: string) => { lastFocusBump = { supervisorId, planId }; return { supervisorId, planId }; };
 db.getPlan = (id: string) => (id === 'plan-1' ? { id: 'plan-1', workspaceId: 'ws-1', deletedAt: null } : null);
-db.getPlanEventRollup = () => [];
-db.getPlanSections = () => [];
-db.getPlanEventsForRender = () => [];
-db.getPlanEventRepoActivity = () => null;
 db.listOrchestrationRuns = () => [];
 db.getLiveRailAgentForPlan = () => null;
 function focusUpserted(): Record<string, unknown> | null { return lastFocusUpsert; }
-function focusBumped(): { supervisorId: string; planId: string } | null { return lastFocusBump; }
 
 let lastCreateTeamInput: Record<string, unknown> | null = null;
 db.createTeam = (input: Record<string, unknown>) => {
@@ -613,23 +606,6 @@ test('P1 auto-subscribe: run_orchestration with a plan_id upserts for the dispat
     assert.equal(focusUpserted()?.planId, 'plan-1');
   } finally { server.stop(); }
 });
-
-test('P1-07 bump-on-read: an asserted supervisor reading a plan freshens its focus row', () =>
-  withServer(async (port) => {
-    lastFocusBump = null;
-    const res = await request(port, 'GET', '/api/plans/plan-1/projection',
-      { ...WS_HDR, 'X-Supervisor-Id': 'sup-1' });
-    assert.equal(res.status, 200, res.body);
-    assert.deepEqual(focusBumped(), { supervisorId: 'sup-1', planId: 'plan-1' });
-  }));
-
-test('P1-07 bump-on-read: a header-less caller reading a plan bumps nothing (no auto-create)', () =>
-  withServer(async (port) => {
-    lastFocusBump = null;
-    const res = await request(port, 'GET', '/api/plans/plan-1/projection', WS_HDR);
-    assert.equal(res.status, 200, res.body);
-    assert.equal(focusBumped(), null, 'no supervisor identity → no attended bump');
-  }));
 
 // ── Context-brick Inc 4 (4.4) — continuation attempt / brick / relaunch ─────
 //

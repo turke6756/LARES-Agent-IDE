@@ -188,15 +188,6 @@ export interface DashboardClient {
   // stays browsable). We name the seam `stopAgent` to match that semantics — not
   // `deleteAgent`, which fully purges the row.
   stopAgent(id: string): Promise<void>;
-  /** WP6 done-detection for planning-surface runs. Returns true once the target
-   *  section's byte-exact content hash has moved since `sinceIso` — i.e. a
-   *  `plan_section_changes` row exists for (planId, sectionAnchor) in
-   *  [sinceIso, now]. The relay loop uses this INSTEAD of existsSync(planPath)
-   *  when the run carries a plan rail, because the registered plan file already
-   *  exists — the deliverable is a native
-   *  Edit of one section, not a fresh file appearing. Backed by
-   *  database.getTurnSectionChanges (WP4). */
-  sectionChangedSince(planId: string, sectionAnchor: string, sinceIso: string): boolean;
 }
 
 /** Per-run hooks the runner calls to persist progress + emit events. */

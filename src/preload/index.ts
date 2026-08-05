@@ -210,15 +210,6 @@ const api: IpcApi = {
     pruneRepoWide: (req) => ipcRenderer.invoke(CHECKPOINT_CHANNELS.pruneRepoWide, req),
   },
   plans: {
-    // WP5: fires after each WP4 reparse so the renderer re-fetches the served
-    // projection and full-re-renders (no in-place DOM patching). Rides the
-    // reparse path, not a second fs subscription (F-C).
-    onSurfaceChanged: (callback) => {
-      const listener = (_event: any, payload: any) => callback(payload);
-      ipcRenderer.on('plan-surface:changed', listener);
-      return () => ipcRenderer.removeListener('plan-surface:changed', listener);
-    },
-    // WP5 mount: data reads + render-pane lifecycle (registerPlanIpc, main).
     list: (workspaceId) => ipcRenderer.invoke('plan:list', workspaceId),
     listPromotedFolders: (workspaceId, workspaceRoot, pathType) =>
       ipcRenderer.invoke('plan-folder:list', workspaceId, workspaceRoot, pathType),
@@ -230,17 +221,12 @@ const api: IpcApi = {
     // WP-P4A: folder-native tab projection. Bodies use only main-issued handles.
     documents: (planId) => ipcRenderer.invoke('plan:documents', planId),
     readDocument: (planId, ref) => ipcRenderer.invoke('plan:document:read', planId, ref),
-    getProjection: (planId, opts) => ipcRenderer.invoke('plan:projection', planId, opts),
     listIntents: (planId) => ipcRenderer.invoke('plan:intents:list', planId),
     blameToIntent: (request) => ipcRenderer.invoke('plan:blameToIntent', request),
     // WP-P4C-backend: per-tab supervisor overview. Read open; write privileged
     // (server-revalidated) + revision-bumping. Wire shape is an object payload.
     getOverview: (planId, tab) => ipcRenderer.invoke('plan:getOverview', { planId, tab }),
     setOverview: (input) => ipcRenderer.invoke('plan:setOverview', input),
-    paneShow: (planId) => ipcRenderer.invoke('plan-pane:show', planId),
-    paneHide: () => ipcRenderer.invoke('plan-pane:hide'),
-    paneSetBounds: (bounds) => ipcRenderer.invoke('plan-pane:setBounds', bounds),
-    paneSetVisible: (visible) => ipcRenderer.invoke('plan-pane:setVisible', visible),
     // SC-WP-3I — read-only plan-lens candidate preview (mirrors saveCard.preview).
     previewCandidate: (req) => ipcRenderer.invoke(PLAN_PREVIEW_CHANNEL, req),
     getReviewProjection: (req) => ipcRenderer.invoke(PLAN_REVIEW_PROJECTION_CHANNEL, req),

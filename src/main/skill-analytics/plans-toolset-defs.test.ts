@@ -25,25 +25,25 @@ function test(name: string, fn: () => void): void {
 
 test('provider sources the real plans tool defs', () => {
   const defs = makePlansAwareDefsProvider().defsFor('plans');
-  assert.ok(Array.isArray(defs) && defs.length === 4, `expected 4 plans defs, got ${defs?.length}`);
+  assert.ok(Array.isArray(defs) && defs.length === 3, `expected 3 plans defs, got ${defs?.length}`);
   const names = defs!.map((d) => d.name);
-  assert.ok(names.includes('read_plan_projection'), 'read_plan_projection present');
+  assert.ok(names.includes('focus_plan'), 'focus_plan present');
 });
 
 test('provider also sources the plans-read subset (GT-A WP-A4.5)', () => {
   const defs = makePlansAwareDefsProvider().defsFor('plans-read');
-  assert.ok(Array.isArray(defs) && defs.length === 2, `expected exactly 2 plans-read defs, got ${defs?.length}`);
+  assert.ok(Array.isArray(defs) && defs.length === 1, `expected exactly 1 plans-read def, got ${defs?.length}`);
   const names = defs!.map((d) => d.name).sort();
-  assert.deepEqual(names, ['read_plan_projection', 'record_planning_event']);
+  assert.deepEqual(names, ['record_planning_event']);
 });
 
-test('reverse map: first-wins routes shared reads to plans-read and focus_plan to plans', () => {
+test('reverse map: first-wins routes the shared demand probe to plans-read and focus_plan to plans', () => {
   // DASHBOARD_TOOLSETS lists plans-read BEFORE plans, and the reverse map is
-  // name-only first-wins — so the remaining shared read-tool name resolves to
+  // name-only first-wins — so the remaining shared tool name resolves to
   // plans-read while focus_plan (only in plans) resolves to plans.
   const resolver = buildMcpToolsetReverseMap(makePlansAwareDefsProvider());
   assert.equal(resolver.resolve('mcp__agent-dashboard__focus_plan'), 'plans', 'focus_plan → plans');
-  assert.equal(resolver.resolve('mcp__agent-dashboard__read_plan_projection'), 'plans-read');
+  assert.equal(resolver.resolve('mcp__agent-dashboard__record_planning_event'), 'plans-read');
 });
 
 test('non-plans toolsets still resolve through the decorated provider', () => {

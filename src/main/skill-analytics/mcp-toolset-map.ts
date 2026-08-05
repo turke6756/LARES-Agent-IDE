@@ -19,17 +19,15 @@ export const DASHBOARD_MCP_SERVER = 'agent-dashboard';
  *
  *  L1.1 registry-drift fix (wave2-mcp-tool-observability §1.1): `plans` was
  *  missing here even though `toolsetsForLane('supervisor')` grants it, so every
- *  logged `mcp__agent-dashboard__<plansTool>` resolved to a NULL toolset
- *  (verified live: `read_plan_projection` → null `mcp_toolset`). It is included
- *  now so the parse reverse-map attributes plans calls to the `plans` toolset.
+ *  logged `mcp__agent-dashboard__<plansTool>` resolved to a NULL toolset. It is
+ *  included so the parse reverse-map attributes plans calls to the `plans` toolset.
  *  The defs for `plans` are supplied by `makePlansAwareDefsProvider`
  *  (plans-toolset-defs.ts), since the base context-overhead provider still omits
  *  it. */
 // FIRST-WINS ORDERING (GT-A WP-A4.5): the reverse map is name-only and the first
 // toolset to claim a tool name wins. `plans-read` MUST precede `plans` so the
-// three shared read-tool names (list_plan_sections / read_plan_section /
-// read_plan_projection) resolve to `plans-read`, while supervisor-only focus
-// verbs resolve to `plans`.
+// the shared demand-probe name resolves to `plans-read`, while supervisor-only
+// focus verbs resolve to `plans`.
 export const DASHBOARD_TOOLSETS: readonly string[] = [
   'orchestration',
   'teams',

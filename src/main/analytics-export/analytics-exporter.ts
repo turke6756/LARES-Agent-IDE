@@ -13,11 +13,8 @@
 //     that path,
 //   - `getSharedParseManager().ensureIndexed()` is NEVER called (it is a chunked
 //     background WRITER),
-//   - transitional plan activity is composed DIRECTLY from `resolvePlanProjection` /
-//     `buildPlanActivityProjection`. The plan HTTP routes are
-//     never used: they fire `bumpFocusOnRead` → `bumpSupervisorFocusAttended`
-//     (api-server.ts:558-563), which would forge supervisor attention into the
-//     trusted plan-provenance trail.
+//   - plan metadata is read directly from the DB. The retired HTML activity
+//     projection and its focus-bumping HTTP route are never used.
 //
 // Cold start is REFUSED by default (exit 4) rather than frozen: skipping the
 // backfill on a cold DB would freeze a WRONG analysis in which every section reads
@@ -66,7 +63,6 @@ import {
 } from '../context-overhead/guidance-inventory';
 import { makePathOps } from '../context-overhead/paths';
 import { TokenEstimator } from '../context-overhead/token-estimator';
-import { resolvePlanProjection, buildPlanActivityProjection } from '../api-server';
 
 import {
   ANALYTICS_SCHEMA_VERSION, SNAPSHOT_MANIFEST_KIND, SURFACE_KEYS,
@@ -145,8 +141,6 @@ export interface ExporterDeps {
   runKnowledgeExtract(workspaceId: string, agentId: string, preScanned?: OverheadModel): ReturnType<typeof runKnowledgeExtract>;
   querySkillUsage: typeof querySkillUsage;
   queryMcpToolUsage: typeof queryMcpToolUsage;
-  resolvePlanProjection: typeof resolvePlanProjection;
-  buildPlanActivityProjection: typeof buildPlanActivityProjection;
   isEpochsBackfilled(db: unknown): boolean;
   skillIndexComplete(db: unknown): boolean;
   gitInfo(root: string): Promise<{ sha: string | null; branch: string | null; dirty: boolean | null }>;
@@ -170,8 +164,6 @@ function productionDeps(): ExporterDeps {
     runKnowledgeExtract,
     querySkillUsage,
     queryMcpToolUsage,
-    resolvePlanProjection,
-    buildPlanActivityProjection,
     isEpochsBackfilled: (db) => isEpochsBackfilled(db as Parameters<typeof isEpochsBackfilled>[0]),
     skillIndexComplete: defaultSkillIndexComplete,
     gitInfo: defaultGitInfo,
@@ -758,28 +750,23 @@ export async function captureAnalyticsSnapshot(o: AnalyticsSnapshotOptions): Pro
     }
   }
 
-  // 10. Plans — composed DIRECTLY. Never via the HTTP routes (they bump focus).
+  // 10. Plans — metadata composed DIRECTLY. The legacy section/activity fields
+  // stay empty/null for schema compatibility and never touch retired tables.
   const planEntries: PlanEntry[] = [];
   const planErrors: SurfaceError[] = [];
   for (const plan of d.getPlans({ workspaceId: ws.id })) {
     try {
-      const resolved = await d.resolvePlanProjection(plan.id);
-      if (!resolved) {
-        planErrors.push({ code: 'PLAN_UNRESOLVABLE', message: 'plan is missing or deleted', itemId: plan.id });
-        continue;
-      }
       planEntries.push({
         plan: {
-          id: resolved.plan.id,
+          id: plan.id,
           // `Plan` carries no title (types.ts:87-99). The slug is the display alias;
           // fall back to the workspace-RELATIVE path, which is already root-free.
-          title: resolved.plan.slug ?? resolved.plan.path,
-          status: resolved.plan.runState ?? '',
-          updatedAt: resolved.plan.updatedAt,
+          title: plan.title,
+          status: plan.status,
+          updatedAt: plan.updatedAt,
         },
         sections: [],
-        // Default (counts-only) options: no per-event rows, no Tier-3 file lists.
-        activity: d.buildPlanActivityProjection(resolved.plan.id, resolved.projection),
+        activity: null,
       });
     } catch (err) {
       planErrors.push({
