@@ -594,22 +594,16 @@ const TESTS = [
   'dist/main/main/api-server-plans.test.js',
   'dist/main/main/api-server-focus.test.js',
   'dist/main/main/plans-watcher.test.js',
-  'dist/main/main/plans/plan-touch-tracker.test.js',
-  'dist/main/main/plans/plan-events.test.js',
-  'dist/main/main/plans/section-cache.test.js',
-  'dist/main/main/plans-provenance-db.test.js',
-  'dist/main/main/plans/section-reader.test.js',
-  'dist/main/main/plans/section-anchors.test.js',
-  'dist/main/main/plans/watch-plans.test.js',
-  'dist/main/main/plans-snapshot-db.test.js',
+  // Stage P8 (WP-P8F): legacy-provenance DROP migration replaces the retired
+  // plans-provenance-db / plans-snapshot-db / section-cache / section-reader /
+  // section-anchors / watch-plans / plan-touch-tracker / plan-events suites.
+  'dist/main/main/plans-legacy-drop-migration.test.js',
   // Planning-surface Wave 1 — main/shared node tests landed this cycle.
   // WP-P0PRE: demand-probe append service (telemetry).
   'dist/main/main/telemetry/demand-probe.test.js',
-  // WP-P0B: trusted format-gate scope (assertPlanRailFree) + read-ladder
-  // enumeration bounds + the rewritten plan-rail-contract surface.
+  // WP-P0B: trusted format-gate scope (assertPlanRailFree). (Stage P8 retired
+  // the read-ladder and plan-rail-contract suites.)
   'dist/main/main/orchestration/plan-ownership.scope.test.js',
-  'dist/main/main/plans/read-ladder.test.js',
-  'dist/main/main/plans/plan-rail-contract.test.js',
   // WP-P1A: planning-reader bounded enumeration + safe read IPC.
   'dist/main/main/plans/planning-reader.test.js',
   // Save-card Stage ③ SC-WP-3E — plan-lens finalize IPC facade (WP-3Z registration).
@@ -623,8 +617,6 @@ const TESTS = [
   'dist/main/main/proposals-watcher.test.js',
   // WP-P2D: plan-gallery projection (date-grouped rows, type/state chips).
   'dist/main/main/plans/plan-gallery.test.js',
-  // WP-P2C-compat: structured-format exclusion from the HTML plan-projection path.
-  'dist/main/main/plans/structured-exclusion.test.js',
   // WP-P2B-folder: plan-folder-watcher — <workspaceStateDir()>/plans/*/ ingest.
   'dist/main/main/plans/plan-folder-watcher.test.js',
   // Planning-surface Stage P3 (gate P3Z) — proposal→promotion→dispatchable-WP.
