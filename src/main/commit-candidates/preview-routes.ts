@@ -567,7 +567,7 @@ export function createPreviewRoutes(deps: PreviewRoutesDeps): {
       }] : [];
     });
     const selectedUnattributed = context.inventory.entries.filter((entry) =>
-      request.selectedUnattributedEntryIds.includes(entry.entryId),
+      rebuilt.selectedUnattributedEntryIds.includes(entry.entryId),
     );
     return {
       candidateId: 'candidateId' in rebuilt ? rebuilt.candidateId : '',

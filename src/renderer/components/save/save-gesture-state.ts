@@ -2,6 +2,7 @@ import type { SaveRefusal, SaveRefusalStage } from '../../../shared/commit-candi
 import type {
   CommitCoordinatorConsumeResponse,
   SaveCardFleetAdhocMarkDoneSuccess,
+  SaveCardPreviewResponse,
 } from '../../../shared/types';
 import type { CandidatePreviewDraft } from './CandidatePreview';
 
@@ -18,7 +19,7 @@ export type SaveGestureState =
   | ({ status: 'minting' } & GestureContext)
   | ({ status: 'committing' } & GestureContext)
   | ({ status: 'committed'; outcome: Extract<CommitCoordinatorConsumeResponse, { kind: 'saved' }> } & GestureContext)
-  | ({ status: 'refused'; refusal: SaveRefusal; outcome?: CommitCoordinatorConsumeResponse } & GestureContext)
+  | ({ status: 'refused'; refusal: SaveRefusal; outcome?: CommitCoordinatorConsumeResponse; latestPreview?: SaveCardPreviewResponse | null } & GestureContext)
   | ({
       status: 'uncertain';
       stage: Extract<SaveRefusalStage, 'token-consume' | 'commit' | 'reconciliation'>;
@@ -31,7 +32,7 @@ export type SaveGestureEvent =
   | { type: 'pins-updated'; pins: SaveCardFleetAdhocMarkDoneSuccess[]; complete: boolean }
   | { type: 'draft-updated'; draft: CandidatePreviewDraft }
   | { type: 'submit-stage'; stage: 'reviewing' | 'minting' | 'committing' }
-  | { type: 'refused'; refusal: SaveRefusal; outcome?: CommitCoordinatorConsumeResponse }
+  | { type: 'refused'; refusal: SaveRefusal; outcome?: CommitCoordinatorConsumeResponse; latestPreview?: SaveCardPreviewResponse | null }
   | {
       type: 'uncertain';
       stage: Extract<SaveRefusalStage, 'token-consume' | 'commit' | 'reconciliation'>;
@@ -62,6 +63,7 @@ export function saveGestureReducer(state: SaveGestureState, event: SaveGestureEv
       return {
         status: 'refused', pins: state.pins, draft: state.draft,
         refusal: event.refusal, ...(event.outcome ? { outcome: event.outcome } : {}),
+        ...(event.latestPreview !== undefined ? { latestPreview: event.latestPreview } : {}),
       };
     case 'uncertain':
       return { status: 'uncertain', pins: state.pins, draft: state.draft, ...event };

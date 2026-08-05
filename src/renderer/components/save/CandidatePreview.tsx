@@ -43,6 +43,8 @@ export interface CandidatePreviewProps {
    * keeps the original in-pane action by default. */
   showCommitAction?: boolean;
   onDraftChange?: (draft: CandidatePreviewDraft) => void;
+  /** An authoritative submit-time response installed without another fetch. */
+  authoritativeResponse?: SaveCardPreviewResponse | null;
 }
 
 export interface CandidatePreviewDraft {
@@ -106,6 +108,13 @@ function firstReservedTrailerLine(userTrailers: string): string | null {
   return null;
 }
 
+function challengeIdentity(response: SaveCardPreviewResponse): string {
+  const candidateId = response.isCandidate && 'candidateId' in response.candidate
+    ? response.candidate.candidateId : '';
+  return [candidateId, response.requiresOverlapAck, response.componentTopologyDigest,
+    [...response.unacknowledgedUnattributedEntryIds].sort().join(',')].join('|');
+}
+
 export default function CandidatePreview({
   workspaceId,
   selection,
@@ -114,6 +123,7 @@ export default function CandidatePreview({
   onCommit,
   showCommitAction = true,
   onDraftChange,
+  authoritativeResponse,
 }: CandidatePreviewProps) {
   const [state, setState] = useState<LoadState>({ status: 'loading' });
   const [messageBody, setMessageBody] = useState('');
@@ -154,12 +164,21 @@ export default function CandidatePreview({
   );
 
   useEffect(() => {
+    if (authoritativeResponse) return;
     let active = true;
     void load(() => active);
     return () => {
       active = false;
     };
-  }, [load]);
+  }, [load, authoritativeResponse]);
+
+  const authIdentity = authoritativeResponse ? challengeIdentity(authoritativeResponse) : null;
+  useEffect(() => {
+    if (!authoritativeResponse) return;
+    setState({ status: 'ready', response: authoritativeResponse });
+    setOverlapAck(false);
+    setUnattributedAcks(new Set());
+  }, [authIdentity]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (state.status !== 'ready' || !onDraftChange) return;

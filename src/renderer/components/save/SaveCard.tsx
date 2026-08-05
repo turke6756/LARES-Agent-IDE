@@ -78,9 +78,11 @@ function PackageSaveGesture({
 }) {
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [gesture, dispatch] = useReducer(saveGestureReducer, initialSaveGestureState);
+  const draftRef = useRef<CandidatePreviewDraft | null>(null);
   const submitterRef = useRef<ReturnType<typeof createCandidateSubmitter> | null>(null);
   if (!submitterRef.current) submitterRef.current = createCandidateSubmitter();
   const updateDraft = useCallback((nextDraft: CandidatePreviewDraft) => {
+    draftRef.current = nextDraft;
     dispatch({ type: 'draft-updated', draft: nextDraft });
   }, []);
   const { pins, draft } = gesture;
@@ -179,8 +181,11 @@ function PackageSaveGesture({
   const submit = async () => {
     if (!pinned) return;
     const result = await submitterRef.current!.submit({
-      workspaceId, selection, draft,
+      workspaceId, selection, draft: draftRef.current ?? draft,
       onStage: (stage) => dispatch({ type: 'submit-stage', stage }),
+      onTransition: (event) => {
+        void window.api.demandProbe.record({ workspaceId, kind: `save_${event}` }).catch(() => {});
+      },
     });
     if (result.kind === 'committed') {
       dispatch({ type: 'committed', outcome: result.response });
@@ -198,7 +203,10 @@ function PackageSaveGesture({
           };
         }
       }
-      dispatch({ type: 'refused', refusal, outcome: result.response });
+      dispatch({
+        type: 'refused', refusal, outcome: result.response,
+        latestPreview: result.mint ?? result.preview ?? null,
+      });
       setDetailsOpen(true);
     }
   };
@@ -257,6 +265,7 @@ function PackageSaveGesture({
           workspaceId={workspaceId}
           selection={selection}
           showCommitAction={false}
+          authoritativeResponse={gesture.status === 'refused' ? (gesture.latestPreview ?? null) : null}
           onDraftChange={updateDraft}
           onClose={() => setDetailsOpen(false)}
         />

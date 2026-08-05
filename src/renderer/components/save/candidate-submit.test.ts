@@ -91,23 +91,81 @@ describe('candidate submit transaction', () => {
     }));
   });
 
-  it('echoes the reviewed digest for overlap work so topology movement is refused by mint', async () => {
+  it('mints and commits an acknowledged overlap using the fresh preview digest', async () => {
     const deps = api();
-    deps.preview.mockResolvedValue(preview({ requiresOverlapAck: true, componentTopologyDigest: 'fresh-moved' }));
-    deps.mint.mockImplementation(async (request) => preview({
-      refusal: { stage: 'mint', code: 'acknowledgement-stale', message: 'Mint stage refused: overlap-not-acknowledged.' },
-      candidate: {
-        ...preview().candidate,
-        eligibility: { eligible: false, reason: 'overlap-not-acknowledged' }, token: null,
-      },
-    }));
+    deps.preview.mockResolvedValue(preview({ requiresOverlapAck: true, componentTopologyDigest: 'fresh' }));
+    const result = await createCandidateSubmitter(deps).submit({
+      workspaceId: 'ws-1', selection,
+      draft: draft({ overlapAcknowledged: true, componentTopologyDigest: 'fresh' }),
+    });
+    expect(deps.mint).toHaveBeenCalledWith(expect.objectContaining({ acknowledgeTopologyDigest: 'fresh' }));
+    expect(result).toMatchObject({ kind: 'committed' });
+  });
+
+  it('refuses a fresh topology change locally and returns the fresh preview', async () => {
+    const deps = api();
+    const fresh = preview({ requiresOverlapAck: true, componentTopologyDigest: 'fresh-moved' });
+    deps.preview.mockResolvedValue(fresh);
     const result = await createCandidateSubmitter(deps).submit({
       workspaceId: 'ws-1', selection,
       draft: draft({ overlapAcknowledged: true, componentTopologyDigest: 'reviewed-old' }),
     });
-    expect(deps.mint).toHaveBeenCalledWith(expect.objectContaining({ acknowledgeTopologyDigest: 'reviewed-old' }));
-    expect(result).toMatchObject({ kind: 'refused', refusal: { stage: 'mint', code: 'acknowledgement-stale' } });
-    expect(deps.commit).not.toHaveBeenCalled();
+    expect(deps.mint).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ kind: 'refused', refusal: { code: 'overlap-ack-stale' }, preview: fresh });
+  });
+
+  it('refuses a changed candidate identity before mint', async () => {
+    const deps = api();
+    const result = await createCandidateSubmitter(deps).submit({
+      workspaceId: 'ws-1', selection, draft: draft({ previewedCandidateId: 'candidate-0' }),
+    });
+    expect(deps.mint).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ kind: 'refused', refusal: { code: 'candidate-ack-stale' } });
+  });
+
+  it('refuses an incomplete unattributed acknowledgement before mint', async () => {
+    const deps = api();
+    deps.preview.mockResolvedValue(preview({ unacknowledgedUnattributedEntryIds: ['u-1', 'u-2'] }));
+    const result = await createCandidateSubmitter(deps).submit({
+      workspaceId: 'ws-1', selection,
+      draft: draft({ acknowledgedUnattributedEntryIds: ['u-1'] }),
+    });
+    expect(deps.mint).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ kind: 'refused', refusal: { code: 'unattributed-ack-incomplete' } });
+  });
+
+  it('refuses a removed unattributed acknowledgement before mint', async () => {
+    const deps = api();
+    deps.preview.mockResolvedValue(preview({ unacknowledgedUnattributedEntryIds: ['u-1'] }));
+    const result = await createCandidateSubmitter(deps).submit({
+      workspaceId: 'ws-1', selection,
+      draft: draft({ acknowledgedUnattributedEntryIds: ['u-1', 'u-2'] }),
+    });
+    expect(deps.mint).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ kind: 'refused', refusal: { code: 'unattributed-ack-stale' } });
+  });
+
+  it('mints an exactly acknowledged unattributed challenge', async () => {
+    const deps = api();
+    deps.preview.mockResolvedValue(preview({ unacknowledgedUnattributedEntryIds: ['u-1', 'u-2'] }));
+    await createCandidateSubmitter(deps).submit({
+      workspaceId: 'ws-1', selection,
+      draft: draft({ acknowledgedUnattributedEntryIds: ['u-1', 'u-2'] }),
+    });
+    expect(deps.mint).toHaveBeenCalledWith(expect.objectContaining({
+      acknowledgeUnattributedEntryIds: ['u-1', 'u-2'],
+    }));
+  });
+
+  it('relabels a mint-time acknowledgement refusal as a race and retains P3', async () => {
+    const deps = api();
+    const mintResponse = preview({
+      refusal: { stage: 'mint', code: 'acknowledgement-stale', message: 'stale' },
+      candidate: { ...preview().candidate, eligibility: { eligible: false, reason: 'overlap-not-acknowledged' }, token: null },
+    });
+    deps.mint.mockResolvedValue(mintResponse);
+    const result = await createCandidateSubmitter(deps).submit({ workspaceId: 'ws-1', selection });
+    expect(result).toMatchObject({ kind: 'refused', refusal: { code: 'mint-ack-race' }, mint: mintResponse });
   });
 
   it('marks a consume transport loss uncertain and never retries automatically', async () => {
@@ -120,4 +178,3 @@ describe('candidate submit transaction', () => {
     expect(deps.commit).toHaveBeenCalledTimes(1);
   });
 });
-

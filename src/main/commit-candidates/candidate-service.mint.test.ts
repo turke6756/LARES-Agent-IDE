@@ -18,6 +18,7 @@ import type {
 } from '../../shared/commit-candidates';
 import {
   CommitCandidateService,
+  buildCandidate,
   computeCandidateTopologyDigest,
   type CandidateBuildContext,
   type CandidateServiceDeps,
@@ -255,7 +256,60 @@ function asCandidate(value: ReturnType<CommitCandidateService['mintCandidateToke
   assert.deepEqual(snapshot.normalizedRequest.acknowledgeUnattributedEntryIds, [loose.entryId]);
 }
 
-// 7: the server snapshot carries 3G's fingerprint/pin/manifests and is immutable.
+// 7–10: acknowledgement validation uses the resolved pin selection rather than
+// the stale/raw forwarded set, while retaining both negative gates.
+{
+  const x = entry('x.txt');
+  const y = entry('y.txt');
+  const z = entry('z.txt');
+  const fin = finalization([frozen('x.txt'), frozen('y.txt')]);
+  fin.packageId = `unattributed:${REPOSITORY_KEY}`;
+  const ctx = context({
+    entries: [x, y, z],
+    unattributed: [x.entryId, y.entryId, z.entryId],
+    finalizations: [fin],
+  });
+  const rawIds = [x.entryId, y.entryId, z.entryId];
+  const built = asCandidate(buildCandidate({
+    selectedComponentIds: [], selectedUnattributedEntryIds: rawIds, finalizationIds: [fin.id],
+  }, ctx));
+  assert.deepEqual(built.selectedUnattributedEntryIds, [x.entryId, y.entryId]);
+  const digest = computeCandidateTopologyDigest(
+    ctx,
+    built.componentIds,
+    ctx.inventory.entries.filter((item) => built.selectedUnattributedEntryIds.includes(item.entryId)),
+  );
+  const request: MintCandidateTokenRequest = {
+    selectedComponentIds: [], selectedUnattributedEntryIds: rawIds, finalizationIds: [fin.id],
+    acknowledgeTopologyDigest: digest,
+    acknowledgeUnattributedEntryIds: built.selectedUnattributedEntryIds,
+  };
+  const store = service();
+  const minted = asCandidate(store.mintCandidateToken(request, ctx));
+  assert.ok(minted.token, 'raw selection drift outside the frozen manifest still mints');
+  assert.deepEqual(
+    store.resolveCandidateToken(minted.token!.tokenId)!.normalizedRequest.acknowledgeUnattributedEntryIds,
+    [x.entryId, y.entryId],
+  );
+
+  const clean = asCandidate(service().mintCandidateToken({
+    ...request,
+    selectedUnattributedEntryIds: built.selectedUnattributedEntryIds,
+  }, ctx));
+  assert.ok(clean.token, 'clean raw-equals-resolved pin still mints');
+
+  const wrongDigest = asCandidate(service().mintCandidateToken({ ...request, acknowledgeTopologyDigest: 'wrong' }, ctx));
+  assert.deepEqual(wrongDigest.eligibility, { eligible: false, reason: 'overlap-not-acknowledged' });
+  assert.equal(wrongDigest.token, null);
+
+  const missingResolved = asCandidate(service().mintCandidateToken({
+    ...request, acknowledgeUnattributedEntryIds: [x.entryId],
+  }, ctx));
+  assert.deepEqual(missingResolved.eligibility, { eligible: false, reason: 'unattributed-not-acknowledged' });
+  assert.equal(missingResolved.token, null);
+}
+
+// 11: the server snapshot carries 3G's fingerprint/pin/manifests and is immutable.
 {
   const a = entry('snapshot.ts');
   const comp = component([a]);
@@ -378,4 +432,4 @@ function asCandidate(value: ReturnType<CommitCandidateService['mintCandidateToke
   assert.ok(minted.token);
 }
 
-console.log('candidate-service.mint: 14 contract rows passed');
+console.log('candidate-service.mint: 18 contract rows passed');

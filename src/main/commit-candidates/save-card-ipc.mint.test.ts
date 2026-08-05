@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 
 import {
   COMMIT_CANDIDATE_MINT_CHANNEL,
+  SAVECARD_PREVIEW_CHANNEL,
   type SaveCardMintRequest,
   type SaveCardMintResponse,
 } from '../../shared/types';
@@ -25,8 +26,10 @@ import {
 import { ComposeLockRegistry } from './compose-lock-registry';
 import {
   registerSaveCardMintIpc,
+  registerSaveCardPreviewIpc,
   type IpcLike,
   type SaveCardMintRoutes,
+  type SaveCardPreviewRoutes,
 } from './save-card-ipc';
 
 type Handler = (_event: unknown, ...args: unknown[]) => unknown;
@@ -151,6 +154,60 @@ function harness(
   registerSaveCardMintIpc(ipc, () => routes, telemetry);
   return { ipc, service };
 }
+
+function overlapContext(changedTopology = false): CandidateBuildContext {
+  const members = [entry('entry-1'), entry('entry-2'), entry('entry-3')];
+  const components = members.map((member, index) => {
+    const value = component(member);
+    const componentId = `component-${index + 1}`;
+    return {
+      ...value,
+      componentId,
+      overlap: { ...value.overlap, componentId, requiresOverlapAck: true, contributingAgentCount: 2 },
+      componentTopologyDigest: changedTopology && index === 1 ? 'topology-moved' : `topology-${index + 1}`,
+    };
+  });
+  const finalizations = members.map((member, index) => ({
+    ...finalization(member), id: `fin-${index + 1}`, packageId: `pkg-${index + 1}`,
+    boundaryRef: `refs/lares/fin-${index + 1}`,
+  }));
+  const base = context();
+  return {
+    ...base,
+    inventory: { ...base.inventory, entries: members },
+    components,
+    finalizations,
+    currentCommitReps: new Map(members.map((member) => [member.entryId, {
+      expectedState: 'present' as const,
+      rawBlobOid: member.rawWorktreeBlobOid,
+      commitBlobOid: `commit-${member.entryId}`,
+      commitMode: '100644',
+    }])),
+  };
+}
+
+function overlapHarness(previewCtx: CandidateBuildContext, mintCtx: CandidateBuildContext) {
+  const service = new CommitCandidateService({ tokenStore: {} } as CandidateServiceDeps);
+  const previewRoutes: SaveCardPreviewRoutes = {
+    resolvePreviewContext: async () => previewCtx,
+  };
+  const mintRoutes: SaveCardMintRoutes = {
+    mintCandidate: async (req) => ({
+      candidate: service.mintCandidateToken({
+        selectedComponentIds: req.selectedComponentIds,
+        selectedUnattributedEntryIds: req.selectedUnattributedEntryIds,
+        finalizationIds: req.finalizationIds,
+        acknowledgeTopologyDigest: req.acknowledgeTopologyDigest,
+        acknowledgeUnattributedEntryIds: req.acknowledgeUnattributedEntryIds,
+      }, mintCtx),
+      context: mintCtx,
+    }),
+  };
+  const ipc = new FakeIpc();
+  registerSaveCardPreviewIpc(ipc, () => previewRoutes, () => undefined);
+  registerSaveCardMintIpc(ipc, () => mintRoutes, () => undefined);
+  return ipc;
+}
 function request(ctx: CandidateBuildContext, unattributed = false): SaveCardMintRequest {
   const selectedComponentIds = unattributed ? [] : ['component-1'];
   const selectedUnattributedEntryIds = unattributed ? ['entry-1'] : [];
@@ -231,6 +288,34 @@ async function mint(ipc: FakeIpc, req: SaveCardMintRequest): Promise<SaveCardMin
     () => ipc.invoke(COMMIT_CANDIDATE_MINT_CHANNEL, { ...request(ctx), tokenId: 'renderer-token' }),
     /unexpected mint request field/i,
   );
+
+  const overlapSelection = {
+    workspaceId: 'ws-1',
+    selectedComponentIds: ['component-1', 'component-2', 'component-3'],
+    selectedUnattributedEntryIds: [],
+    finalizationIds: ['fin-1', 'fin-2', 'fin-3'],
+  };
+  const stableIpc = overlapHarness(overlapContext(), overlapContext());
+  const overlapPreview = await stableIpc.invoke(SAVECARD_PREVIEW_CHANNEL, overlapSelection) as import('../../shared/types').SaveCardPreviewResponse;
+  assert.equal(overlapPreview.requiresOverlapAck, true);
+  const overlapMint = await mint(stableIpc, {
+    ...overlapSelection,
+    acknowledgeTopologyDigest: overlapPreview.componentTopologyDigest,
+    acknowledgeUnattributedEntryIds: overlapPreview.unacknowledgedUnattributedEntryIds,
+  });
+  assert.ok(candidate(overlapMint).token, 'preview challenge echoed through a separate context mints');
+  assert.deepEqual(overlapMint.unacknowledgedUnattributedEntryIds, overlapPreview.unacknowledgedUnattributedEntryIds);
+
+  const movedIpc = overlapHarness(overlapContext(), overlapContext(true));
+  const beforeMove = await movedIpc.invoke(SAVECARD_PREVIEW_CHANNEL, overlapSelection) as import('../../shared/types').SaveCardPreviewResponse;
+  const moved = await mint(movedIpc, {
+    ...overlapSelection,
+    acknowledgeTopologyDigest: beforeMove.componentTopologyDigest,
+    acknowledgeUnattributedEntryIds: beforeMove.unacknowledgedUnattributedEntryIds,
+  });
+  assert.equal(moved.refusal?.code, 'acknowledgement-stale');
+  assert.deepEqual(candidate(moved).eligibility, { eligible: false, reason: 'overlap-not-acknowledged' });
+  assert.equal(candidate(moved).token, null);
   console.log('All save-card mint IPC tests passed');
 })().catch((error) => {
   console.error(error instanceof Error ? error.stack : String(error));

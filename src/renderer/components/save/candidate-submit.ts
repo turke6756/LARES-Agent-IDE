@@ -34,6 +34,7 @@ export interface CandidateSubmitInput {
   selection: CandidatePreviewSelection;
   draft?: CandidatePreviewDraft | null;
   onStage?: (stage: CandidateSubmitStage) => void;
+  onTransition?: (event: string) => void;
 }
 
 export interface CandidateSubmitApi {
@@ -56,6 +57,21 @@ function defaultApi(): CandidateSubmitApi {
 
 function localRefusal(stage: SaveRefusalStage, code: string, message: string): CandidateSubmitResult {
   return { kind: 'refused', refusal: { stage, code, message } };
+}
+
+function sortedIds(ids: readonly string[]): string[] {
+  return [...ids].sort();
+}
+function sameIds(a: readonly string[], b: readonly string[]): boolean {
+  const x = sortedIds(a); const y = sortedIds(b);
+  return x.length === y.length && x.every((v, i) => v === y[i]);
+}
+function freshCandidateId(preview: SaveCardPreviewResponse): string | null {
+  return preview.isCandidate && 'candidateId' in preview.candidate
+    ? preview.candidate.candidateId : null;
+}
+function staleRefusal(code: string, message: string, preview: SaveCardPreviewResponse): CandidateSubmitResult {
+  return { kind: 'refused', refusal: { stage: 'mint', code, message }, preview };
 }
 
 function editableMessage(draft: CandidatePreviewDraft | null | undefined, preview: SaveCardPreviewResponse): string {
@@ -109,16 +125,50 @@ async function runCandidateSubmit(
     };
   }
 
-  // Acknowledgements are evidence about the fresh preview. Work with no human
-  // acknowledgement gate echoes the fresh server digest automatically; opening
-  // the detail panel is never required merely to mint.
-  const acknowledgeTopologyDigest = preview.requiresOverlapAck
-    ? input.draft?.overlapAcknowledged
-      ? input.draft.componentTopologyDigest
-      : null
-    : preview.componentTopologyDigest;
-  const checked = new Set(input.draft?.checkedUnattributedEntryIds ?? []);
-  const acknowledgeUnattributedEntryIds = preview.unacknowledgedUnattributedEntryIds.filter((id) => checked.has(id));
+  // The human acknowledged the challenge shown in the card (input.draft, bound to
+  // an earlier preview). Submit just recomputed a FRESH preview mint will validate
+  // against. Only forward the fresh values when the reviewed challenge still holds.
+  const draftCandidateId = input.draft?.previewedCandidateId ?? null;
+  if (input.draft && draftCandidateId !== freshCandidateId(preview)) {
+    input.onTransition?.('submit-ack-candidate-changed');
+    return staleRefusal(
+      'candidate-ack-stale',
+      'Mint stage refused because the candidate changed after you reviewed it. The refreshed candidate is shown below — review it before saving.',
+      preview,
+    );
+  }
+  if (preview.requiresOverlapAck) {
+    if (!input.draft?.overlapAcknowledged) {
+      input.onTransition?.('submit-ack-missing');
+      return staleRefusal(
+        'overlap-ack-missing',
+        'Mint stage refused because this package fuses work from multiple agents or plans. Review the overlap in the preview below and check the acknowledgement, then submit again.',
+        preview,
+      );
+    }
+    if (input.draft.componentTopologyDigest !== preview.componentTopologyDigest) {
+      input.onTransition?.('submit-ack-topology-changed');
+      return staleRefusal(
+        'overlap-ack-stale',
+        'Mint stage refused because the overlap topology changed after you acknowledged it. The refreshed preview is shown below — review it and acknowledge again.',
+        preview,
+      );
+    }
+  }
+  const draftAcked = input.draft?.acknowledgedUnattributedEntryIds ?? [];
+  const freshUnattributed = preview.unacknowledgedUnattributedEntryIds;
+  if (!sameIds(draftAcked, freshUnattributed)) {
+    input.onTransition?.('submit-ack-unattributed-changed');
+    const added = sortedIds(freshUnattributed).filter((id) => !draftAcked.includes(id));
+    const code = added.length > 0 ? 'unattributed-ack-incomplete' : 'unattributed-ack-stale';
+    const message = added.length > 0
+      ? `Mint stage refused because ${added.length} unattributed change${added.length === 1 ? '' : 's'} in this package ${added.length === 1 ? 'was' : 'were'} not acknowledged. Confirm each unattributed change in the preview below, then submit again.`
+      : 'Mint stage refused because the unattributed selection changed after the preview. The current pinned selection is shown below — review and acknowledge again.';
+    return staleRefusal(code, message, preview);
+  }
+  const acknowledgeTopologyDigest = preview.componentTopologyDigest;
+  const acknowledgeUnattributedEntryIds = [...freshUnattributed];
+  input.onTransition?.('submit-ack-ok');
 
   input.onStage?.('minting');
   let mint: SaveCardMintResponse;
@@ -134,7 +184,13 @@ async function runCandidateSubmit(
   }
 
   const refusal = mintRefusal(mint);
-  if (refusal) return { kind: 'refused', refusal, preview, mint };
+  if (refusal) {
+    const remapped = refusal.code === 'acknowledgement-stale'
+      ? { ...refusal, code: 'mint-ack-race' }
+      : refusal;
+    if (remapped.code === 'mint-ack-race') input.onTransition?.('mint-ack-race');
+    return { kind: 'refused', refusal: remapped, preview, mint };
+  }
   if (!mint.isCandidate || !mint.candidate.eligibility.eligible || !mint.candidate.token) {
     return {
       kind: 'refused',

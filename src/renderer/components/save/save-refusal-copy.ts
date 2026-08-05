@@ -16,11 +16,21 @@ export function renderSaveRefusal(refusal: SaveRefusal): string {
       return refusal.message.startsWith('Freeze stage') ? refusal.message : `Freeze stage refused: ${refusal.message}`;
     case 'preview-verify':
       return refusal.message.startsWith('Preview verification stage') ? refusal.message : `Preview verification stage refused: ${refusal.message}`;
-    case 'mint':
+    case 'mint': {
+      const ackCopy: Record<string, string> = {
+        'overlap-ack-missing': 'This package fuses work from multiple agents or plans. Review the overlap in the preview below and check the acknowledgement to continue.',
+        'overlap-ack-stale': 'The overlap topology changed after you acknowledged it. The refreshed preview is shown below — review it and acknowledge again.',
+        'unattributed-ack-incomplete': 'The package contains unattributed changes that were not acknowledged. The refreshed preview is shown below — confirm each unattributed change, then submit again.',
+        'unattributed-ack-stale': 'The unattributed selection changed after the preview. The current pinned selection is shown below — review and acknowledge again.',
+        'candidate-ack-stale': 'The candidate changed after the preview even though the pinned files may still match. Review the refreshed candidate below before saving.',
+        'mint-ack-race': 'The package changed again while the save token was being minted. The newest preview is shown below — review and acknowledge again.',
+      };
+      if (ackCopy[refusal.code]) return `Mint stage refused: ${ackCopy[refusal.code]}`;
       if (refusal.code === 'acknowledgement-stale') {
-        return 'Mint stage refused because the package acknowledgement is stale or incomplete. Review and acknowledge the highlighted details again.';
+        return 'Mint stage refused because the package acknowledgement is stale or incomplete. The refreshed details are shown below — review and acknowledge again.';
       }
       return refusal.message.startsWith('Mint stage') ? refusal.message : `Mint stage refused: ${refusal.message}`;
+    }
     case 'token-consume':
       return refusal.message.startsWith('Token-consume stage') ? refusal.message : `Token-consume stage refused: ${refusal.message}`;
     case 'commit':

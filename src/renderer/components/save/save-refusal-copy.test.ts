@@ -23,4 +23,15 @@ describe('save refusal stage copy', () => {
       stage: 'mint', code: 'acknowledgement-stale', message: 'overlap-not-acknowledged',
     })).toContain('acknowledgement is stale or incomplete');
   });
+
+  it.each([
+    ['overlap-ack-missing', 'check the acknowledgement'],
+    ['overlap-ack-stale', 'overlap topology changed'],
+    ['unattributed-ack-incomplete', 'unattributed changes that were not acknowledged'],
+    ['unattributed-ack-stale', 'unattributed selection changed'],
+    ['candidate-ack-stale', 'candidate changed after the preview'],
+    ['mint-ack-race', 'changed again while the save token was being minted'],
+  ])('renders typed acknowledgement copy for %s', (code, copy) => {
+    expect(renderSaveRefusal({ stage: 'mint', code, message: 'ignored' })).toContain(copy);
+  });
 });

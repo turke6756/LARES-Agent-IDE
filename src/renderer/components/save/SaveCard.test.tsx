@@ -193,6 +193,7 @@ beforeEach(() => {
   (window as unknown as { api: unknown }).api = {
     saveCard: { getInventory, markDone, preview },
     commitCoordinator: { mint, commit },
+    demandProbe: { record: vi.fn(async () => undefined) },
   };
   container = document.createElement('div');
   document.body.appendChild(container);
@@ -599,6 +600,139 @@ describe('SaveCard decisive save gesture', () => {
     expect(container.querySelector('[data-testid="candidate-preview"]')).toBeNull();
   });
 
+  it('pins three overlapping components, checks once, submits once, and renders Saved', async () => {
+    const bundles = ['c1', 'c2', 'c3'].map((componentId, index) => ({
+      ...loudBundle,
+      bundleId: `b-${index + 1}`,
+      label: `Overlap ${index + 1}`,
+      labels: [`Overlap ${index + 1}`],
+      component: {
+        ...loudBundle.component!, componentId, dirtyEntryIds: [`e${index + 1}`],
+        overlap: { ...loudBundle.component!.overlap, componentId, requiresOverlapAck: true },
+      },
+      members: [{
+        entry: entry(`e${index + 1}`, `src/overlap-${index + 1}.ts`),
+        protection: 'checkpoint-protected' as const,
+      }],
+    }));
+    getInventory.mockResolvedValue(inv(bundles));
+    markDone.mockImplementation(async ({ packageId }: { packageId: string }) => {
+      const index = Number(packageId.slice(2));
+      return {
+        ...readyMarkDone(), packageId, finalizationId: `fin-${index}`,
+        pinnedSelection: {
+          selectedComponentIds: [`c${index}`], selectedUnattributedEntryIds: [], frozenMemberCount: 1,
+        },
+      };
+    });
+    const overlapPreview = {
+      ...readyCandidatePreview(),
+      requiresOverlapAck: true,
+      componentTopologyDigest: 'three-component-digest',
+      candidate: {
+        ...readyCandidatePreview().candidate,
+        componentIds: ['c1', 'c2', 'c3'],
+        finalizations: [1, 2, 3].map((index) => ({
+          finalizationId: `fin-${index}`, packageId: `b-${index}`, packageRevision: 1, boundaryStatus: 'ready' as const,
+        })),
+      } as CommitCandidate,
+      pinnedSelection: {
+        selectedComponentIds: ['c1', 'c2', 'c3'], selectedUnattributedEntryIds: [], frozenMemberCount: 3,
+      },
+    };
+    preview.mockResolvedValue(overlapPreview);
+    mint.mockResolvedValue({
+      ...overlapPreview,
+      candidate: {
+        ...overlapPreview.candidate,
+        token: { tokenId: 'token-1', candidateId: 'candidate-1', contractVersion: 1, issuedAt: 1, expiresAt: 2 },
+      },
+    });
+
+    await render();
+    await gestureClick(container.querySelector('[data-testid="save-bundle-pin"]')!);
+    await gestureClick(container.querySelector('[data-testid="save-bundle-details-toggle"]')!);
+    const acknowledgement = container.querySelector<HTMLInputElement>('[data-testid="candidate-preview-overlap-ack"] input')!;
+    await gestureClick(acknowledgement);
+    await gestureClick(container.querySelector('[data-testid="save-bundle-submit"]')!);
+
+    expect(preview).toHaveBeenCalledTimes(2); // one visible P1 plus one submit-time P2
+    expect(mint).toHaveBeenCalledTimes(1);
+    expect(mint).toHaveBeenCalledWith(expect.objectContaining({
+      selectedComponentIds: ['c1', 'c2', 'c3'],
+      acknowledgeTopologyDigest: 'three-component-digest',
+    }));
+    expect(commit).toHaveBeenCalledTimes(1);
+    expect(container.querySelector('[data-state="saved"]')?.textContent).toContain('Saved');
+  });
+
+  it('installs a changed submit-time preview and resets the overlap checkbox', async () => {
+    const first = { ...readyCandidatePreview(), requiresOverlapAck: true, componentTopologyDigest: 'digest-a' };
+    const second = { ...first, componentTopologyDigest: 'digest-b' };
+    preview.mockResolvedValueOnce(first).mockResolvedValue(second);
+    await render();
+    await gestureClick(container.querySelector('[data-testid="save-bundle-pin"]')!);
+    await gestureClick(container.querySelector('[data-testid="save-bundle-details-toggle"]')!);
+    let acknowledgement = container.querySelector<HTMLInputElement>('[data-testid="candidate-preview-overlap-ack"] input')!;
+    await gestureClick(acknowledgement);
+    await gestureClick(container.querySelector('[data-testid="save-bundle-submit"]')!);
+    acknowledgement = container.querySelector<HTMLInputElement>('[data-testid="candidate-preview-overlap-ack"] input')!;
+    expect(acknowledgement.checked).toBe(false);
+    expect(container.querySelector('[data-testid="save-gesture-refusal"]')?.textContent).toContain('overlap topology changed');
+    expect(mint).not.toHaveBeenCalled();
+
+    await gestureClick(acknowledgement);
+    await gestureClick(container.querySelector('[data-testid="save-bundle-submit"]')!);
+    expect(mint).toHaveBeenCalledWith(expect.objectContaining({ acknowledgeTopologyDigest: 'digest-b' }));
+  });
+
+  it('propagates a checkbox change into an immediately adjacent outer submit', async () => {
+    const overlap = { ...readyCandidatePreview(), requiresOverlapAck: true };
+    preview.mockResolvedValue(overlap);
+    await render();
+    await gestureClick(container.querySelector('[data-testid="save-bundle-pin"]')!);
+    await gestureClick(container.querySelector('[data-testid="save-bundle-details-toggle"]')!);
+    const acknowledgement = container.querySelector<HTMLInputElement>('[data-testid="candidate-preview-overlap-ack"] input')!;
+    const submit = container.querySelector<HTMLButtonElement>('[data-testid="save-bundle-submit"]')!;
+    await act(async () => {
+      acknowledgement.click();
+      submit.click();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(mint).toHaveBeenCalledWith(expect.objectContaining({ acknowledgeTopologyDigest: 'topo-1' }));
+    expect(commit).toHaveBeenCalledTimes(1);
+  });
+
+  it('installs the mint response when acknowledgement moves during mint', async () => {
+    const overlap = { ...readyCandidatePreview(), requiresOverlapAck: true };
+    const p3 = {
+      ...overlap,
+      componentTopologyDigest: 'topo-p3',
+      refusal: { stage: 'mint' as const, code: 'acknowledgement-stale', message: 'moved during mint' },
+      candidate: {
+        ...overlap.candidate,
+        members: [{
+          ...overlap.candidate.members[0],
+          path: { ...overlap.candidate.members[0].path, displayPath: 'src/p3-current.ts' },
+        }],
+        eligibility: { eligible: false as const, reason: 'overlap-not-acknowledged' as const },
+        token: null,
+      } as CommitCandidate,
+    };
+    preview.mockResolvedValue(overlap);
+    mint.mockResolvedValue(p3);
+    await render();
+    await gestureClick(container.querySelector('[data-testid="save-bundle-pin"]')!);
+    await gestureClick(container.querySelector('[data-testid="save-bundle-details-toggle"]')!);
+    await gestureClick(container.querySelector('[data-testid="candidate-preview-overlap-ack"] input')!);
+    await gestureClick(container.querySelector('[data-testid="save-bundle-submit"]')!);
+    expect(container.textContent).toContain('src/p3-current.ts');
+    expect(container.querySelector<HTMLInputElement>('[data-testid="candidate-preview-overlap-ack"] input')?.checked).toBe(false);
+    expect(preview).toHaveBeenCalledTimes(2);
+  });
+
   it('SC-WP-W6: routes an unacknowledged mint refusal to the ack gate, not the generic no-candidate line', async () => {
     // The server minted nothing because the human has not yet acknowledged the
     // unattributed atoms — it names the reason. The renderer must surface the ack
@@ -618,7 +752,7 @@ describe('SaveCard decisive save gesture', () => {
     await gestureClick(container.querySelector('[data-testid="save-bundle-submit"]')!);
 
     const refusal = container.querySelector('[data-testid="save-gesture-refusal"]')?.textContent ?? '';
-    expect(refusal).toContain('Review and acknowledge');
+    expect(refusal.toLowerCase()).toContain('review and acknowledge');
     expect(refusal).not.toContain('did not produce a committable candidate');
     expect(commit).not.toHaveBeenCalled();
   });

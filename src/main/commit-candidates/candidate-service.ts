@@ -255,8 +255,11 @@ export class CommitCandidateService {
     const built = buildCandidate(normalizedRequest, context);
     if (!('candidateId' in built) || !built.eligibility.eligible) return built;
 
+    // The acknowledgement is evidence about the RESOLVED candidate — the same
+    // `buildCandidate` output the preview surfaced its digest / unattributed set
+    // from — NOT the raw request. Validate against exactly what preview showed.
     const selectedUnattributed = context.inventory.entries.filter((entry) =>
-      normalizedRequest.selectedUnattributedEntryIds.includes(entry.entryId));
+      built.selectedUnattributedEntryIds.includes(entry.entryId));
     const topologyDigest = computeCandidateTopologyDigest(
       context,
       built.componentIds,
@@ -266,7 +269,7 @@ export class CommitCandidateService {
       return { ...built, eligibility: { eligible: false, reason: 'overlap-not-acknowledged' } };
     }
     if (!sameStrings(
-      normalizedRequest.selectedUnattributedEntryIds,
+      built.selectedUnattributedEntryIds,
       normalizedRequest.acknowledgeUnattributedEntryIds,
     )) {
       return { ...built, eligibility: { eligible: false, reason: 'unattributed-not-acknowledged' } };

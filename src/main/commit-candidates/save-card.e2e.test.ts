@@ -1,4 +1,9 @@
 import assert from 'node:assert/strict';
+// Ack coverage note: the earlier e2e echoed server values directly and therefore
+// bypassed CandidatePreviewDraft, checkbox propagation, and submit-time refresh;
+// the renderer tests now cover that full gesture. The earlier double-submit row
+// had no overlap gate, its stale-digest unit row enshrined stale forwarding, and
+// its typed-refusal fixture started after refusal instead of installing P2/P3.
 import { execFileSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
@@ -149,10 +154,22 @@ function gitBytes(exe: string, repo: string, args: string[]): Buffer {
       { id: 'ws-root', title: 'Computer Root', path: sandbox },
     ];
     const persistence = new MemoryPersistence();
-    const readTurnWitnesses = (workspaceId: string) => workspaceId === 'ws-repo' ? [{
-      turnId: 'foreign-turn', agentId: 'foreign-agent', ownerAgentId: null,
-      ownerBrickGeneration: null, touched: [{ path: 'foreign.txt', op: 'write' as const }],
-    }] : [];
+    const readTurnWitnesses = (workspaceId: string) => workspaceId === 'ws-repo' ? [
+      {
+        turnId: 'foreign-turn', agentId: 'foreign-agent', ownerAgentId: null,
+        ownerBrickGeneration: null, touched: [{ path: 'foreign.txt', op: 'write' as const }],
+      },
+      ...[0, 1, 2].flatMap((group) => [0, 1].map((agent) => ({
+        turnId: `proposal-turn-${group}-${agent}`,
+        agentId: `proposal-agent-${group}-${agent}`,
+        ownerAgentId: null,
+        ownerBrickGeneration: null,
+        touched: Array.from({ length: 5 }, (_, offset) => ({
+          path: `.lares/proposals/proposal-${String(group * 5 + offset + 1).padStart(2, '0')}.md`,
+          op: 'write' as const,
+        })),
+      }))),
+    ] : [];
 
     const captureFinalizationBoundary = async () => {
       const alternateIndex = path.join(sandbox, `boundary-${Date.now()}.index`);
@@ -221,29 +238,35 @@ function gitBytes(exe: string, repo: string, args: string[]): Buffer {
       SAVECARD_CHANNELS.getInventory,
       { workspaceId: 'ws-repo' },
     );
-    const bundle = inventory.bundles.find((item) => item.kind === 'unattributed');
-    assert.ok(bundle, 'the 15-file proposal package is surfaced as unattributed');
-    const proposalMembers = bundle.members.filter((member) =>
-      member.entry.path.displayPath.startsWith('.lares/proposals/'));
-    assert.equal(proposalMembers.length, 15);
+    const proposalBundles = inventory.bundles.filter((item) =>
+      item.kind === 'component'
+      && item.members.some((member) => member.entry.path.displayPath.startsWith('.lares/proposals/')),
+    );
+    assert.equal(proposalBundles.length, 3, 'the 15 proposals form three witnessed overlap components');
+    assert.equal(proposalBundles.flatMap((item) => item.members).length, 15);
+    assert.equal(proposalBundles.every((item) => item.component?.overlap.requiresOverlapAck), true);
 
-    const finalized = await ipc.invoke<SaveCardFleetAdhocMarkDoneSuccess>(SAVECARD_FINALIZE_CHANNEL, {
-      packageId: bundle.bundleId,
-      targetWorkspaceId: 'ws-repo',
-    });
-    assert.equal(finalized.boundaryStatus, 'ready');
-    assert.ok(finalized.boundaryRef);
-    assert.equal(git(gitExe, repo, ['show-ref', '--verify', finalized.boundaryRef!]).length > 0, true);
+    const finalized = await Promise.all(proposalBundles.map((bundle) =>
+      ipc.invoke<SaveCardFleetAdhocMarkDoneSuccess>(SAVECARD_FINALIZE_CHANNEL, {
+        packageId: bundle.bundleId,
+        targetWorkspaceId: 'ws-repo',
+      })));
+    assert.equal(finalized.every((item) => item.boundaryStatus === 'ready'), true);
+    for (const item of finalized) {
+      assert.ok(item.boundaryRef);
+      assert.equal(git(gitExe, repo, ['show-ref', '--verify', item.boundaryRef!]).length > 0, true);
+    }
 
     const pinnedInventory = await ipc.invoke<SaveCardInventoryResponse>(
       SAVECARD_CHANNELS.getInventory,
       { workspaceId: 'ws-repo' },
     );
-    const pinnedBundle = pinnedInventory.bundles.find((item) => item.bundleId === bundle.bundleId);
-    assert.ok(pinnedBundle);
-    assert.equal(pinnedBundle.captureHealth.pathsWithoutFinalizationEdge.length, 0);
+    const pinnedBundles = pinnedInventory.bundles.filter((item) =>
+      proposalBundles.some((original) => original.bundleId === item.bundleId));
+    assert.equal(pinnedBundles.length, 3);
+    assert.equal(pinnedBundles.every((item) => item.captureHealth.pathsWithoutFinalizationEdge.length === 0), true);
     assert.deepEqual(
-      pinnedBundle.members.map((member) => member.protection),
+      pinnedBundles.flatMap((item) => item.members).map((member) => member.protection),
       Array(15).fill('checkpoint-protected'),
     );
 
@@ -253,7 +276,8 @@ function gitBytes(exe: string, repo: string, args: string[]): Buffer {
       SAVECARD_CHANNELS.getInventory,
       { workspaceId: 'ws-repo' },
     );
-    const editedBundle = editedInventory.bundles.find((item) => item.bundleId === bundle.bundleId)!;
+    const editedBundle = editedInventory.bundles.find((item) =>
+      item.members.some((member) => member.entry.path.displayPath === editedRelative))!;
     assert.deepEqual(editedBundle.captureHealth.pathsWithoutFinalizationEdge, [
       Buffer.from(editedRelative).toString('base64'),
     ]);
@@ -261,16 +285,21 @@ function gitBytes(exe: string, repo: string, args: string[]): Buffer {
       editedBundle.members.find((member) => member.entry.path.displayPath === editedRelative)?.protection,
       'unprotected',
     );
-    assert.equal(editedBundle.members.filter((member) => member.protection === 'checkpoint-protected').length, 14);
+    assert.equal(
+      editedInventory.bundles.flatMap((item) => item.members)
+        .filter((member) => member.entry.path.displayPath.startsWith('.lares/proposals/')
+          && member.protection === 'checkpoint-protected').length,
+      14,
+    );
     fs.writeFileSync(path.join(repo, editedRelative), editedOriginal);
 
     const benignPath = '.lares/proposals/benign-16.md';
     fs.writeFileSync(path.join(repo, benignPath), 'unrelated after pin\n');
     const selection = {
       workspaceId: 'ws-repo',
-      selectedComponentIds: finalized.pinnedSelection.selectedComponentIds,
-      selectedUnattributedEntryIds: finalized.pinnedSelection.selectedUnattributedEntryIds,
-      finalizationIds: [finalized.finalizationId],
+      selectedComponentIds: finalized.flatMap((item) => item.pinnedSelection.selectedComponentIds),
+      selectedUnattributedEntryIds: finalized.flatMap((item) => item.pinnedSelection.selectedUnattributedEntryIds),
+      finalizationIds: finalized.map((item) => item.finalizationId),
     };
     const preview = await ipc.invoke<SaveCardPreviewResponse>(SAVECARD_PREVIEW_CHANNEL, selection);
     assert.equal((preview.candidate as CommitCandidate).token, null, 'preview is always tokenless');
@@ -279,14 +308,14 @@ function gitBytes(exe: string, repo: string, args: string[]): Buffer {
       preview.candidate.members.map((member) => member.packageVerification),
       Array(15).fill('verified-match'),
     );
-    assert.deepEqual(preview.selectionDrift.added, [Buffer.from(benignPath).toString('base64')]);
+    assert.deepEqual(preview.selectionDrift.added, [], 'unrelated unattributed work is outside the component pin');
     assert.deepEqual(preview.selectionDrift.missing, []);
     assert.equal(preview.candidate.eligibility.eligible, true, 'an unrelated 16th file does not invalidate the pin');
 
     const mintedResponse = await ipc.invoke<SaveCardMintResponse>(COMMIT_CANDIDATE_MINT_CHANNEL, {
       ...selection,
       acknowledgeTopologyDigest: preview.componentTopologyDigest,
-      acknowledgeUnattributedEntryIds: selection.selectedUnattributedEntryIds,
+      acknowledgeUnattributedEntryIds: preview.unacknowledgedUnattributedEntryIds,
     });
     const minted = mintedResponse.candidate as CommitCandidate;
     assert.ok(minted.token, `the dedicated mint bridge returns a token: ${JSON.stringify(minted.eligibility)}`);
@@ -315,9 +344,11 @@ function gitBytes(exe: string, repo: string, args: string[]): Buffer {
     const repositoryKey = minted.repository.repositoryKey;
     assert.equal(persistence.records.some((row) => row.repositoryKey === repositoryKey && row.commitOid === commitOid), true);
     assert.equal(persistence.pathLinks.filter((row) => row.commitOid === commitOid).length, 15);
-    const closed = persistence.getPackageFinalization(finalized.finalizationId);
-    assert.equal(closed?.lifecycleStatus, 'committed');
-    assert.ok(closed?.releasedAt, 'closure releases the boundary from active retention');
+    for (const item of finalized) {
+      const closed = persistence.getPackageFinalization(item.finalizationId);
+      assert.equal(closed?.lifecycleStatus, 'committed');
+      assert.ok(closed?.releasedAt, 'closure releases each boundary from active retention');
+    }
 
     const refreshed = await ipc.invoke<SaveCardInventoryResponse>(
       SAVECARD_CHANNELS.getInventory,
