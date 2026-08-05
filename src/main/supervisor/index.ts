@@ -134,6 +134,12 @@ import {
 } from './ownership';
 import { StatusMonitor } from './status-monitor';
 import type { StatusChangedEvent } from './status-events';
+import { classifyGrokFreeLimit } from './provider-quota-classifier';
+import {
+  clearProviderObservation,
+  getProviderObservations,
+  noteProviderObservation,
+} from './provider-runtime-observations';
 import { ContextStatsMonitor, JsonlFileActivity } from './context-stats-monitor';
 import { UsageLimitsWatcher } from '../usage-limits-watcher';
 import { SessionLogReader } from './session-log-reader';
@@ -2015,6 +2021,8 @@ export class AgentSupervisor extends EventEmitter {
       // BUG-09 §3.5 — raw PTY-byte timestamp keeps a `working` agent alive
       // during Coalescing / spinner-only phases.
       (agentId) => this.getLastRawOutputTime(agentId),
+      undefined,
+      (agentId) => this.getCurrentScreen(agentId),
     );
 
     // BUG-10 — give the monitor a way to replay a dropped submit keystroke.
@@ -7381,7 +7389,7 @@ export class AgentSupervisor extends EventEmitter {
             : event.state === 'working' ? 'hook-start' : event.state === 'active' ? 'hook-session-start' : 'hook-stop');
 
     if (event.state === 'idle') {
-      this.forceIdleFromHook(agentId, flipSource);
+      this.forceIdleFromHook(agentId, flipSource, receivedAt);
     } else if (event.state === 'working') {
       this.forceWorkingFromHook(agentId, flipSource);
     } else if (event.state === 'waiting') {
@@ -7475,8 +7483,20 @@ export class AgentSupervisor extends EventEmitter {
    *  through `promoteFromLaunching('stop-hook')`, the one surgical bypass,
    *  so the hook's information is preserved and the agent doesn't sit
    *  falsely-launching for the rest of the settle window. */
-  private forceIdleFromHook(agentId: string, source: string): void {
+  private forceIdleFromHook(agentId: string, source: string, appliedAt: number): void {
     const agent = getAgent(agentId);
+    if (agent?.provider === 'grok') {
+      const observation = getProviderObservations(appliedAt)
+        .get('grok')
+        ?.find((item) => item.reason === 'free-usage-limit');
+      if (
+        observation
+        && observation.observedAt < appliedAt
+        && !classifyGrokFreeLimit(this.getCurrentScreen(agentId))
+      ) {
+        clearProviderObservation('grok', 'free-usage-limit');
+      }
+    }
     if (agent && agent.status === 'launching') {
       this.monitor.promoteFromLaunching(agentId, 'stop-hook');
       return;
@@ -7871,6 +7891,7 @@ export class AgentSupervisor extends EventEmitter {
     if (submit && agent?.provider === 'agy') {
       const prompt = this.classifyPtyPrompt(agentId);
       if (prompt?.kind === 'sign-in') {
+        noteProviderObservation('agy', 'auth-banner', prompt.excerpt, Date.now());
         return this.recordSendOutcome({
           disposition: 'failed', agentId, delivered: false,
           reason: 'interactive-prompt', prompt, completedAt: Date.now(),
@@ -7962,6 +7983,7 @@ export class AgentSupervisor extends EventEmitter {
     updateAgentLastSend(outcome.agentId, outcome);
     if (outcome.disposition === 'confirmed') {
       const agent = getAgent(outcome.agentId);
+      if (agent?.provider === 'agy') clearProviderObservation('agy', 'auth-banner');
       if (agent?.lastSendError) updateAgentLastSendError(outcome.agentId, null);
     }
     this.emit('sendInputResult', outcome);
@@ -8031,10 +8053,14 @@ export class AgentSupervisor extends EventEmitter {
    *  blocking interactive prompt. The append-only ring retains erased TUI
    *  frames, so scanning its tail can permanently latch a transient prompt. */
   private classifyPtyPrompt(agentId: string): { kind: string; label: string; excerpt: string } | null {
-    const win = this.windowsRunners.get(agentId);
-    const screen = win ? win.getCurrentScreen() : this.wslRunners.get(agentId)?.getCurrentScreen();
-    const match = detectInteractivePrompt(screen);
+    const match = detectInteractivePrompt(this.getCurrentScreen(agentId));
     return match ? { kind: match.kind, label: match.label, excerpt: match.excerpt } : null;
+  }
+
+  private getCurrentScreen(agentId: string): string {
+    const win = this.windowsRunners.get(agentId);
+    if (win) return win.getCurrentScreen();
+    return this.wslRunners.get(agentId)?.getCurrentScreen() ?? '';
   }
 
   /**

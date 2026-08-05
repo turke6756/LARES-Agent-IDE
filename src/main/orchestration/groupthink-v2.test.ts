@@ -25,6 +25,10 @@ import path from 'node:path';
 import { runSerial, runParallel } from './groupthink-v2';
 import { Agent } from '../../shared/types';
 import { DashboardClient, OrchestrationRun, OrchestrationRunContext } from './types';
+import {
+  __resetProviderObservationsForTest,
+  getProviderObservations,
+} from '../supervisor/provider-runtime-observations';
 
 // ── Clamp setTimeout so 2000ms polls fire in ≤2ms ────────────────────
 const realSetTimeout = global.setTimeout;
@@ -256,10 +260,12 @@ test('serial: reviewer launches only after lead turn-1; claude AND codex via sen
 // ── Serial: turn-timeout → STALL throw ───────────────────────────────
 
 test('serial: a lead turn that never completes throws a Timeout (→ STALL)', async () => {
+  __resetProviderObservationsForTest();
   const run = makeRun({ turnTimeoutMs: 150 });
   const { client } = makeFake({ frozen: true });   // no turn ever materializes
   const { ctx } = makeCtx(run);
   await rejectsMatching(runSerial(client, ctx), /Timeout/);
+  assert.equal(getProviderObservations(Date.now()).size, 0, 'generic GroupThink stall mutates no provider observations');
 });
 
 // ── Serial: BUG-06 no-replay on resume ───────────────────────────────
@@ -412,6 +418,7 @@ test('WP2-e serial resume: a separator-only (corrupt) mark is NOT usable — see
 // ── Serial: receiver-ready gate respects isInputInFlight ─────────────
 
 test('serial: relay to lead is gated while isInputInFlight(lead) is true', async () => {
+  __resetProviderObservationsForTest();
   const run = makeRun({ turnTimeoutMs: 150 });
   let leadId = '';
   const { client, state } = makeFake({
@@ -429,6 +436,7 @@ test('serial: relay to lead is gated while isInputInFlight(lead) is true', async
   const { ctx } = makeCtx(run);
 
   await rejectsMatching(runSerial(client, ctx), /Timeout|ready for relay/);
+  assert.equal(getProviderObservations(Date.now()).size, 0, 'receiver-ready STALL mutates no provider observations');
   // The reviewer produced a turn, but the gate blocked the relay to the lead.
   assert.ok(!state.sendInputCalls.some((c) => c.id === leadId && /Reviewer Feedback/.test(c.text)),
     'no feedback was relayed to the lead while it was in-flight');

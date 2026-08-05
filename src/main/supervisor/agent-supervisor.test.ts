@@ -38,6 +38,11 @@ import { WindowsRunner } from './windows-runner';
 import { WslRunner } from './wsl-runner';
 import { makeAgent } from './test-helpers/fake-bridge-deps';
 import type { Agent, AgentStatus } from '../../shared/types';
+import {
+  __resetProviderObservationsForTest,
+  getProviderObservations,
+  noteProviderObservation,
+} from './provider-runtime-observations';
 
 interface TestCase {
   name: string;
@@ -344,6 +349,7 @@ test('Case 3c: sendInput on idle plain WORKER (isWorker) fires NO seed — statu
 });
 
 test('agy signed-out screen rejects a dashboard message before typing and returns the auth prompt', async () => {
+  __resetProviderObservationsForTest();
   const agent = makeAgent('agy-auth', {
     provider: 'agy',
     status: 'waiting',
@@ -365,8 +371,47 @@ test('agy signed-out screen rejects a dashboard message before typing and return
     assert.equal(outcome.prompt?.kind, 'sign-in');
     assert.ok(!h.calls.includes('runner.write'), 'no prompt bytes may be typed into the auth screen');
     assert.ok(!h.calls.includes('notifyUserInputDelivered'), 'a rejected auth-screen send cannot clear waiting');
+    assert.equal(getProviderObservations(Date.now()).get('agy')?.[0]?.reason, 'auth-banner');
   } finally {
+    __resetProviderObservationsForTest();
     h.cleanup();
+  }
+});
+
+test('WP-6b: confirmed agy outcome clears auth-banner only; confirmed Grok does not clear quota', () => {
+  __resetProviderObservationsForTest();
+  const agy = makeAgent('agy-confirmed', { provider: 'agy', status: 'working', isWorker: true });
+  const agyHarness = setup({ agent: agy, injectRunner: 'none' });
+  try {
+    noteProviderObservation('agy', 'auth-banner', 'signed out', Date.now());
+    noteProviderObservation('agy', 'free-usage-limit', 'unrelated reason', Date.now());
+    (agyHarness.supervisor as any).recordSendOutcome({
+      disposition: 'confirmed', agentId: agy.id, delivered: true, completedAt: Date.now(),
+    });
+    assert.deepEqual(
+      getProviderObservations(Date.now()).get('agy')?.map((item) => item.reason),
+      ['free-usage-limit'],
+      'confirmed agy clears only auth-banner',
+    );
+  } finally {
+    agyHarness.cleanup();
+  }
+
+  const grok = makeAgent('grok-confirmed', { provider: 'grok', status: 'working', isWorker: true });
+  const grokHarness = setup({ agent: grok, injectRunner: 'none' });
+  try {
+    noteProviderObservation('grok', 'free-usage-limit', 'You hit your free usage limit.', Date.now());
+    (grokHarness.supervisor as any).recordSendOutcome({
+      disposition: 'confirmed', agentId: grok.id, delivered: true, completedAt: Date.now(),
+    });
+    assert.equal(
+      getProviderObservations(Date.now()).get('grok')?.[0]?.reason,
+      'free-usage-limit',
+      'confirmed Grok input is not quota recovery evidence',
+    );
+  } finally {
+    __resetProviderObservationsForTest();
+    grokHarness.cleanup();
   }
 });
 
@@ -824,6 +869,42 @@ test('Hook: applied SessionStart (active) stamps healthy but does NOT change sta
       `session-start must not flip the agent to working; got ${JSON.stringify(seedCalls(h.calls))}`,
     );
   } finally {
+    h.cleanup();
+  }
+});
+
+test('WP-6b: Grok Stop hook retains quota while exhaustion remains visible', () => {
+  __resetProviderObservationsForTest();
+  const agent = makeAgent('grok-stop-exhausted', {
+    provider: 'grok', status: 'working', isWorker: true, command: 'grok', workingDirectory: 'C:\\tmp',
+  });
+  const h = setup({
+    agent,
+    injectRunner: 'windows',
+    currentScreen: 'You hit your free usage limit.\n1 Upgrade to SuperGrok\n2 Upgrade to SuperGrok Heavy',
+  });
+  try {
+    noteProviderObservation('grok', 'free-usage-limit', 'You hit your free usage limit.', Date.now() - 10);
+    assert.equal(h.supervisor.applyHookStatusEvent(agent.id, hookEvent('idle'), 'http'), 'applied');
+    assert.equal(getProviderObservations(Date.now()).get('grok')?.[0]?.reason, 'free-usage-limit');
+  } finally {
+    __resetProviderObservationsForTest();
+    h.cleanup();
+  }
+});
+
+test('WP-6b: later Grok Stop hook clears quota when current screen is not exhausted', () => {
+  __resetProviderObservationsForTest();
+  const agent = makeAgent('grok-stop-recovered', {
+    provider: 'grok', status: 'working', isWorker: true, command: 'grok', workingDirectory: 'C:\\tmp',
+  });
+  const h = setup({ agent, injectRunner: 'windows', currentScreen: 'Grok Build\nReady for another prompt' });
+  try {
+    noteProviderObservation('grok', 'free-usage-limit', 'You hit your free usage limit.', Date.now() - 10);
+    assert.equal(h.supervisor.applyHookStatusEvent(agent.id, hookEvent('idle'), 'http'), 'applied');
+    assert.equal(getProviderObservations(Date.now()).has('grok'), false);
+  } finally {
+    __resetProviderObservationsForTest();
     h.cleanup();
   }
 });

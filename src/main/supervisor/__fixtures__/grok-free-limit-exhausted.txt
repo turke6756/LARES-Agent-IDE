@@ -1,0 +1,11 @@
+Grok Build
+
+You   hit your
+free usage limit.
+
+1  (o)  Upgrade to SuperGrok
+   For everyday coding and productivity tasks
+2  (o)  Upgrade to SuperGrok Heavy
+   Get the most out of Grok Build. Highest usage limits.
+
+Up/Down navigate - Enter: submit - Esc: unselect

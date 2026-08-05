@@ -36,6 +36,10 @@ import {
 } from '../../shared/constants';
 import type { Agent } from '../../shared/types';
 import type { StatusChangedEvent } from './status-events';
+import {
+  __resetProviderObservationsForTest,
+  getProviderObservations,
+} from './provider-runtime-observations';
 
 interface TestCase {
   name: string;
@@ -64,6 +68,7 @@ function makeMonitor(opts: {
   agent: Agent;
   alive?: boolean;
   ringTails?: Map<string, string>;
+  currentScreens?: Map<string, string>;
 }) {
   const { fakes, agent } = opts;
   const alive = opts.alive ?? true;
@@ -72,6 +77,7 @@ function makeMonitor(opts: {
   // Default: PTY says "active right now" — we let tests override per scenario.
   fakes.lastOutputAt.set(agent.id, fakes.now.value);
   const ringTails = opts.ringTails ?? new Map<string, string>();
+  const currentScreens = opts.currentScreens ?? new Map<string, string>();
   const monitor = new StatusMonitor(
     async (a) => fakes.aliveOverride.get(a.id) ?? true,
     (id) => fakes.lastOutputAt.get(id) ?? 0,
@@ -82,6 +88,8 @@ function makeMonitor(opts: {
     // tests behave as before; new dual-signal tests override
     // `lastRawOutputAt` directly.
     (id) => fakes.lastRawOutputAt.get(id) ?? fakes.lastOutputAt.get(id) ?? 0,
+    undefined,
+    (id) => currentScreens.get(id) ?? '',
   );
   monitor.on('statusChanged', (payload: StatusChangedEvent) => {
     fakes.emissions.push(payload);
@@ -2183,6 +2191,68 @@ test('WP7: ongoing PTY waiting is a NO-OP for a healthy hook-owned agent (regres
     assert.equal(agent.status, 'idle', 'healthy hooks own status — the classifier must not drive waiting');
     assert.equal(monitor.getWaitingKind(agent.id), null);
   } finally {
+    restore();
+  }
+});
+
+test('WP-6b: Grok quota requires two current-screen polls and stays isolated from prompt stability', async () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  __resetProviderObservationsForTest();
+  try {
+    const agent = makeAgent('grok-quota', {
+      provider: 'grok', isWorker: true, status: 'idle', hookStatus: 'broken', hooksUnavailable: true,
+    });
+    const ringTails = new Map([[agent.id, 'Do you trust the files in this folder?']]);
+    const currentScreens = new Map([[
+      agent.id,
+      'You hit your free usage limit.\n1 Upgrade to SuperGrok\n2 Upgrade to SuperGrok Heavy',
+    ]]);
+    const monitor = makeMonitor({ fakes, agent, ringTails, currentScreens });
+
+    await poll(monitor);
+    assert.equal(getProviderObservations(fakes.now.value).size, 0, 'first quota sighting is not emitted');
+    assert.ok((monitor as any).lastPtyPromptSig.has(agent.id), 'prompt first-poll signature retained');
+    assert.ok((monitor as any).lastProviderQuotaSig.has(agent.id), 'quota first-poll signature retained separately');
+
+    fakes.now.value += 1;
+    await poll(monitor);
+    assert.equal(getProviderObservations(fakes.now.value).get('grok')?.[0]?.reason, 'free-usage-limit');
+    assert.equal(agent.status, 'waiting', 'the independent prompt signature also reaches stability');
+
+    currentScreens.set(agent.id, 'Grok Build\nReady for another prompt');
+    await poll(monitor);
+    assert.ok(!(monitor as any).lastProviderQuotaSig.has(agent.id), 'quota signature clears with the screen');
+    assert.ok((monitor as any).lastPtyPromptSig.has(agent.id), 'clearing quota stability does not erase prompt stability');
+
+    monitor.forgetAgent(agent.id);
+    assert.ok(!(monitor as any).lastProviderQuotaSig.has(agent.id), 'cleanup deletes quota stability');
+    assert.ok(!(monitor as any).lastPtyPromptSig.has(agent.id), 'cleanup deletes prompt stability');
+  } finally {
+    __resetProviderObservationsForTest();
+    restore();
+  }
+});
+
+test('WP-6b: Grok quota classifier never treats append-only ring history as a current blocker', async () => {
+  const fakes = makeStatusMonitorFakes();
+  const restore = patchDatabaseModule(fakes);
+  __resetProviderObservationsForTest();
+  try {
+    const agent = makeAgent('grok-ring-only', { provider: 'grok', isWorker: true, status: 'idle' });
+    const ringTails = new Map([[
+      agent.id,
+      'You hit your free usage limit.\n1 Upgrade to SuperGrok\n2 Upgrade to SuperGrok Heavy',
+    ]]);
+    const currentScreens = new Map([[agent.id, 'Grok Build\nReady for another prompt']]);
+    const monitor = makeMonitor({ fakes, agent, ringTails, currentScreens });
+
+    await poll(monitor);
+    await poll(monitor);
+    assert.equal(getProviderObservations(fakes.now.value).size, 0);
+    assert.ok(!(monitor as any).lastProviderQuotaSig.has(agent.id));
+  } finally {
+    __resetProviderObservationsForTest();
     restore();
   }
 });

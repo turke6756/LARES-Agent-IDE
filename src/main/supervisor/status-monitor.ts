@@ -20,6 +20,8 @@ import {
 import { getActiveAgents, applyStatusTransition, updateAgentHookStatus, addEvent } from '../database';
 import type { StatusChangedEvent } from './status-events';
 import { detectInteractivePrompt, InteractivePromptKind } from './interactive-prompt-detector';
+import { classifyGrokFreeLimit } from './provider-quota-classifier';
+import { noteProviderObservation } from './provider-runtime-observations';
 
 export type WaitingKind = 'question' | 'y-n' | 'enter' | 'choice' | 'approve' | 'tty-pattern' | 'notification';
 
@@ -142,6 +144,8 @@ export class StatusMonitor extends EventEmitter {
   /** P2-02: Pulls the trailing PTY bytes for prompt-pattern matching.
    *  Defaults to empty string when not injected (tests). */
   private getOutputRingTail: (agentId: string) => string;
+  /** Current rendered terminal screen. Quota classification must never use the ring. */
+  private getCurrentScreen: (agentId: string) => string;
   // Hold a status for a short period after a transition to prevent PTY
   // byte-flicker from immediately undoing it.
   private statusHoldUntil = new Map<string, number>();
@@ -219,6 +223,9 @@ export class StatusMonitor extends EventEmitter {
   // classifier's two-consecutive-polls stability gate. Cleared when the prompt
   // clears, when hooks come back, and in forgetAgent.
   private lastPtyPromptSig = new Map<string, string>();
+  // Provider quota stability is independent from interactive-prompt stability:
+  // neither classifier may erase the other classifier's first-poll evidence.
+  private lastProviderQuotaSig = new Map<string, string>();
   // Injected by AgentSupervisor: delivers the worker_stalled supervisor event
   // (EventBridge.onWorkerStalled). Left undefined in tests that don't
   // exercise the stall seam (then the watchdog is warn-only via console).
@@ -251,6 +258,8 @@ export class StatusMonitor extends EventEmitter {
     getLastRawOutput?: (agentId: string) => number,
     /** Optional injectable poll delay for {@link confirmSubmission}. */
     sleep?: (ms: number) => Promise<void>,
+    /** Current-screen accessor for provider quota classification. */
+    getCurrentScreen: (agentId: string) => string = () => '',
   ) {
     super();
     this.checkAlive = checkAlive;
@@ -259,6 +268,7 @@ export class StatusMonitor extends EventEmitter {
     this.getAgentFn = getAgentFn;
     this.now = now;
     this.getOutputRingTail = getOutputRingTail;
+    this.getCurrentScreen = getCurrentScreen;
     this.sleep = sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
   }
 
@@ -503,6 +513,7 @@ export class StatusMonitor extends EventEmitter {
     this.confirmInFlight.delete(agentId);
     this.workerStallWarned.delete(agentId);
     this.lastPtyPromptSig.delete(agentId);
+    this.lastProviderQuotaSig.delete(agentId);
   }
 
   /** Class IV §2.3 — called by `AgentSupervisor.forceIdleFromHook` and
@@ -761,6 +772,7 @@ export class StatusMonitor extends EventEmitter {
         // for healthy hook-owned lanes; runs after the canary so a just-flipped
         // agent participates on the next tick).
         this.checkPtyWaiting(agent);
+        this.checkProviderQuotaBlock(agent);
         // Handoff handshake — stalled-worker watchdog. One-shot
         // worker_stalled supervisor event when a worker sits `working` with
         // zero PTY/hook/input signal for WORKER_STALL_WARN_MS.
@@ -1006,6 +1018,24 @@ export class StatusMonitor extends EventEmitter {
     if (prev !== sig) return;
     if (this.getWaitingKind(agent.id) !== null) return;
     this.forceWaiting(agent.id, promptKindToWaitingKind(prompt.kind), prompt.excerpt);
+  }
+
+  /** Grok quota blocker: strict current-screen classification, stable for two polls. */
+  private checkProviderQuotaBlock(agent: Agent): void {
+    if (agent.provider !== 'grok') {
+      this.lastProviderQuotaSig.delete(agent.id);
+      return;
+    }
+    const match = classifyGrokFreeLimit(this.getCurrentScreen(agent.id));
+    if (!match) {
+      this.lastProviderQuotaSig.delete(agent.id);
+      return;
+    }
+    const sig = `${match.reason}:${match.detail}`;
+    const previous = this.lastProviderQuotaSig.get(agent.id);
+    this.lastProviderQuotaSig.set(agent.id, sig);
+    if (previous !== sig) return;
+    noteProviderObservation('grok', match.reason, match.detail, this.now());
   }
 
   /** Start-hook silence watchdog (BUG-10 paste-race fix). For supervised
