@@ -1977,6 +1977,17 @@ export interface SaveCardWorkerUnit {
   memberEntryIds: string[];
 }
 
+/** Whether the package can be pinned/finalized from its attributed workspace.
+ *  This is an honest capability annotation, not a repository re-attribution. */
+export type SaveCardPackageSaveability =
+  | { saveable: true }
+  | {
+      saveable: false;
+      reason: 'no-repository';
+      workspaceId: string;
+      workspaceTitle: string;
+    };
+
 /** One renderer-safe WorkBundle DTO element returned by the read-only service. */
 export interface SaveCardBundle {
   bundleId: string;
@@ -1993,6 +2004,9 @@ export interface SaveCardBundle {
   captureHealth: import('./commit-candidates').BundleCaptureHealth;
   weakestProtection: import('./commit-candidates').ProtectionRung | null;
   identity: SaveCardBundleIdentity | null;
+  /** Present on production Save inventory DTOs. Optional for older main-only
+   *  projections that reuse this renderer-safe shape outside the Save pane. */
+  saveability?: SaveCardPackageSaveability;
 }
 
 /**
@@ -2114,7 +2128,7 @@ export type SaveCardFinalizeOutcome =
   | 'reattached-ready'
   | 'boundary-unavailable';
 
-export interface SaveCardFleetAdhocMarkDoneResponse {
+export interface SaveCardFleetAdhocMarkDoneSuccess {
   finalizationId: string;
   packageId: string;
   finalizationKind: 'fleet-adhoc';
@@ -2123,6 +2137,23 @@ export interface SaveCardFleetAdhocMarkDoneResponse {
   boundaryStatus: 'ready' | 'unavailable' | 'pruned';
   packageRevision: number;
 }
+
+export type SaveCardFleetAdhocRefusalCode =
+  | 'save-card-no-repository'
+  | 'save-card-unknown-workspace';
+
+export interface SaveCardFleetAdhocMarkDoneRefusal {
+  ok: false;
+  code: SaveCardFleetAdhocRefusalCode;
+  message: string;
+  workspaceId: string;
+  workspaceTitle: string;
+}
+
+/** Known inability to pin is data, not a rejected IPC invocation. */
+export type SaveCardFleetAdhocMarkDoneResponse =
+  | SaveCardFleetAdhocMarkDoneSuccess
+  | SaveCardFleetAdhocMarkDoneRefusal;
 
 // ── SC-WP-4E — shared commit-coordinator consume route ───────────────────────
 

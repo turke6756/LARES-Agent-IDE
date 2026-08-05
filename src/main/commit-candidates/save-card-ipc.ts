@@ -25,6 +25,7 @@ import {
   type SaveCardPreviewResponse,
   type SaveCardFleetAdhocMarkDoneRequest,
   type SaveCardFleetAdhocMarkDoneResponse,
+  type SaveCardFleetAdhocRefusalCode,
   type SaveCardAttentionRequest,
   type SaveCardCheckpointExpiryNotice,
   type SaveCardAttentionChangedPayload,
@@ -195,6 +196,21 @@ export interface SaveCardFinalizeRoutes {
   finalizeDeps?: FinalizePackageDeps;
 }
 
+/** A known, renderer-actionable boundary refusal. Preview-route implementations
+ *  throw this below their trust boundary; the IPC handler alone converts it to
+ *  a typed response. Unexpected errors continue to reject. */
+export class SaveCardFinalizeRefusalError extends Error {
+  constructor(
+    message: string,
+    readonly code: SaveCardFleetAdhocRefusalCode,
+    readonly workspaceId: string,
+    readonly workspaceTitle: string,
+  ) {
+    super(message);
+    this.name = 'SaveCardFinalizeRefusalError';
+  }
+}
+
 function requireFinalizeRoutes(routes: SaveCardFinalizeRoutes | null): SaveCardFinalizeRoutes {
   if (!routes) {
     throw new SaveCardIpcError(
@@ -253,7 +269,21 @@ export function registerSaveCardFinalizeIpc(
   ipc.handle(SAVECARD_FINALIZE_CHANNEL, async (_event, raw: unknown) => {
     const routes = requireFinalizeRoutes(getRoutes());
     const request = requireMarkDoneRequest(raw);
-    const context = await routes.resolveBoundary(request);
+    let context: FleetAdhocBoundaryContext;
+    try {
+      context = await routes.resolveBoundary(request);
+    } catch (error) {
+      if (error instanceof SaveCardFinalizeRefusalError) {
+        return {
+          ok: false,
+          code: error.code,
+          message: error.message,
+          workspaceId: error.workspaceId,
+          workspaceTitle: error.workspaceTitle,
+        } satisfies SaveCardFleetAdhocMarkDoneResponse;
+      }
+      throw error;
+    }
     const finalizeRequest: FinalizePackageRequest = {
       ...context,
       finalizationKind: 'fleet-adhoc',

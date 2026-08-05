@@ -464,6 +464,41 @@ describe('SaveCard decisive save gesture', () => {
     expect(pin.checked).toBe(true);
   });
 
+  it('disables an unsaveable package inline and never calls markDone', async () => {
+    getInventory.mockResolvedValue(inv([{
+      ...loudBundle,
+      saveability: {
+        saveable: false,
+        reason: 'no-repository',
+        workspaceId: '54ad9887',
+        workspaceTitle: 'Computer Root',
+      },
+    }]));
+    await render();
+
+    const pin = container.querySelector('[data-testid="save-bundle-pin"]') as HTMLInputElement;
+    expect(pin.disabled).toBe(true);
+    expect(container.querySelector('[data-testid="save-bundle-unsaveable"]')?.textContent)
+      .toContain("No git repository — cannot pin/commit from workspace 'Computer Root'");
+    await gestureClick(pin);
+    expect(markDone).not.toHaveBeenCalled();
+  });
+
+  it('keeps the safe-refusal banner for a typed refusal that reaches the renderer', async () => {
+    markDone.mockResolvedValue({
+      ok: false,
+      code: 'save-card-no-repository',
+      message: "No git repository — cannot pin/commit from workspace 'Computer Root'.",
+      workspaceId: '54ad9887',
+      workspaceTitle: 'Computer Root',
+    });
+    await render();
+    await gestureClick(container.querySelector('[data-testid="save-bundle-pin"]')!);
+
+    expect(container.querySelector('[data-testid="save-gesture-refusal"]')?.textContent)
+      .toContain("No git repository — cannot pin/commit from workspace 'Computer Root'.");
+  });
+
   it('submits preview then consume and renders Saved without opening the optional expander', async () => {
     await render();
     expect(container.querySelector('[data-testid="candidate-preview"]')).toBeNull();

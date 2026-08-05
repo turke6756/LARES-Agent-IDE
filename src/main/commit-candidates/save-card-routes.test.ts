@@ -83,11 +83,11 @@ const worker = {
 // Fake registry: two lanes sharing ONE worktree (packages/a, packages/b) plus a
 // third registered workspace that is NOT in this repo — the adapter must pass all
 // three and let the facade's scope discovery narrow to the shared worktree.
-function fakeGetWorkspaces(): Array<{ id: string; path: string }> {
+function fakeGetWorkspaces(): Array<{ id: string; path: string; title: string }> {
   return [
-    { id: 'workspace-a', path: path.join(repo, 'packages', 'a') },
-    { id: 'workspace-b', path: path.join(repo, 'packages', 'b') },
-    { id: 'workspace-outside', path: outsideRepoDir },
+    { id: 'workspace-a', path: path.join(repo, 'packages', 'a'), title: 'Package A' },
+    { id: 'workspace-b', path: path.join(repo, 'packages', 'b'), title: 'Package B' },
+    { id: 'workspace-outside', path: outsideRepoDir, title: 'Computer Root' },
   ];
 }
 
@@ -218,6 +218,30 @@ test('candidate request carries every registered workspace so sibling lanes unio
     { workspaceId: 'workspace-a', workspacePrefix: 'packages/a' },
     { workspaceId: 'workspace-b', workspacePrefix: 'packages/b' },
   ]);
+});
+
+test('inventory annotates a package owned by an agent in a no-repo workspace', async () => {
+  const outsideAgent = {
+    ...worker,
+    workspaceId: 'workspace-outside',
+    ownerAgentId: null,
+  } as Agent;
+  const routes = buildRoutes({
+    readTurnWitnesses: (workspaceId) => workspaceId === 'workspace-a'
+      ? [{ ...witness('turn-a', 'one.txt'), ownerAgentId: null }]
+      : [],
+    getAgentsByWorkspace: () => [],
+    getAgent: (agentId) => agentId === outsideAgent.id ? outsideAgent : null,
+  });
+
+  const { bundles } = await routes.getInventory({ workspaceId: 'workspace-a' });
+  const component = bundles.find((bundle) => bundle.kind === 'component');
+  assert.deepEqual(component?.saveability, {
+    saveable: false,
+    reason: 'no-repository',
+    workspaceId: 'workspace-outside',
+    workspaceTitle: 'Computer Root',
+  });
 });
 
 test('issues only the read-only Git command family — never a mutating verb', async () => {

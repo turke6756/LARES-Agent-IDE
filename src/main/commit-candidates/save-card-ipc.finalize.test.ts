@@ -13,6 +13,7 @@ import assert from 'node:assert/strict';
 
 import {
   registerSaveCardFinalizeIpc,
+  SaveCardFinalizeRefusalError,
   SAVECARD_FINALIZE_CHANNEL,
   type FleetAdhocBoundaryContext,
   type IpcLike,
@@ -148,7 +149,7 @@ test('fleet-adhoc mark-done creates a distinct finalization that captures bounda
   const res = (await ipc.invoke(
     SAVECARD_FINALIZE_CHANNEL,
     { packageId: 'pkg-fleet', ignoredRendererField: 'not-forwarded' },
-  )) as SaveCardFleetAdhocMarkDoneResponse;
+  )) as Exclude<SaveCardFleetAdhocMarkDoneResponse, { ok: false }>;
 
   assert.equal(res.finalizationKind, 'fleet-adhoc');
   assert.equal(res.outcome, 'created');
@@ -184,7 +185,7 @@ test('a boundary-unavailable outcome still surfaces the ref it could not pin', a
   const res = (await ipc.invoke(
     SAVECARD_FINALIZE_CHANNEL,
     { packageId: 'pkg-fleet' },
-  )) as SaveCardFleetAdhocMarkDoneResponse;
+  )) as Exclude<SaveCardFleetAdhocMarkDoneResponse, { ok: false }>;
 
   assert.equal(res.finalizationKind, 'fleet-adhoc');
   assert.equal(res.outcome, 'boundary-unavailable');
@@ -211,6 +212,77 @@ test('an unwired finalization engine answers unavailable honestly', async () => 
   await assert.rejects(
     () => ipc.invoke(SAVECARD_FINALIZE_CHANNEL, { packageId: 'pkg-fleet' }),
     /unavailable|bootstrapping/i,
+  );
+});
+
+test('a no-repository boundary failure returns a typed refusal and never finalizes', async () => {
+  const ipc = new FakeIpc();
+  const store = new FakeStore();
+  registerSaveCardFinalizeIpc(ipc, () => ({
+    resolveBoundary: async () => {
+      throw new SaveCardFinalizeRefusalError(
+        "No git repository — cannot pin/commit from workspace 'Computer Root'.",
+        'save-card-no-repository',
+        '54ad9887',
+        'Computer Root',
+      );
+    },
+    finalizeDeps: {
+      store,
+      writeRef: makeWriter(store),
+      freeze: fakeFreeze,
+      now: () => 100,
+      newId: () => 'must-not-finalize',
+    },
+  }));
+
+  const response = await ipc.invoke(
+    SAVECARD_FINALIZE_CHANNEL,
+    { packageId: 'component:proposal' },
+  );
+  assert.deepEqual(response, {
+    ok: false,
+    code: 'save-card-no-repository',
+    message: "No git repository — cannot pin/commit from workspace 'Computer Root'.",
+    workspaceId: '54ad9887',
+    workspaceTitle: 'Computer Root',
+  });
+  assert.equal(store.rows.size, 0, 'a typed refusal never reaches finalization');
+});
+
+test('an unknown workspace boundary failure is also returned as a typed refusal', async () => {
+  const ipc = new FakeIpc();
+  registerSaveCardFinalizeIpc(ipc, () => ({
+    resolveBoundary: async () => {
+      throw new SaveCardFinalizeRefusalError(
+        'Cannot pin this package because it references an unknown workspace: missing-ws.',
+        'save-card-unknown-workspace',
+        'missing-ws',
+        'missing-ws',
+      );
+    },
+  }));
+
+  assert.deepEqual(
+    await ipc.invoke(SAVECARD_FINALIZE_CHANNEL, { packageId: 'pkg-orphaned' }),
+    {
+      ok: false,
+      code: 'save-card-unknown-workspace',
+      message: 'Cannot pin this package because it references an unknown workspace: missing-ws.',
+      workspaceId: 'missing-ws',
+      workspaceTitle: 'missing-ws',
+    },
+  );
+});
+
+test('unexpected boundary failures still reject the IPC invocation', async () => {
+  const ipc = new FakeIpc();
+  registerSaveCardFinalizeIpc(ipc, () => ({
+    resolveBoundary: async () => { throw new Error('unexpected freezer failure'); },
+  }));
+  await assert.rejects(
+    () => ipc.invoke(SAVECARD_FINALIZE_CHANNEL, { packageId: 'pkg-fleet' }),
+    /unexpected freezer failure/,
   );
 });
 

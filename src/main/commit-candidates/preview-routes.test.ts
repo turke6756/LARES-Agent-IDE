@@ -278,7 +278,7 @@ test('an unknown target workspace is rejected honestly', async () => {
     () => saveCardPreviewRoutes.resolvePreviewContext({
       workspaceId: 'ws-1', selectedComponentIds: [], selectedUnattributedEntryIds: [], finalizationIds: [],
     }),
-    /unknown target workspace/i,
+    /unknown workspace/i,
   );
 });
 
@@ -298,6 +298,28 @@ test('fleet-adhoc resolver captures and returns the checkpoint engine boundary O
   assert.equal(context.repositoryKey, REPO_KEY);
   assert.equal(context.members.length, 1);
   assert.equal(context.members[0].path.pathBytesBase64, b64('e1'));
+});
+
+test('fleet-adhoc resolver identifies a fake no-repo workspace as a typed refusal cause', async () => {
+  const noRepo = capability();
+  noRepo.repoState = 'non-repo';
+  noRepo.repoRoot = null;
+  noRepo.commonDir = null;
+  noRepo.commonDirQueueKey = null;
+  noRepo.workspacePrefix = null;
+  const { saveCardFinalizeRoutes } = createPreviewRoutes(baseDeps({
+    getWorkspaces: () => [{ id: '54ad9887', path: '/computer-root', title: 'Computer Root' }],
+    probeWorkspaceGit: async () => noRepo,
+    captureFinalizationBoundary: async () => { throw new Error('must not capture'); },
+  }));
+
+  await assert.rejects(
+    () => saveCardFinalizeRoutes.resolveBoundary({ packageId: 'component:proposal' }),
+    (error: unknown) => error instanceof Error
+      && error.name === 'SaveCardFinalizeRefusalError'
+      && (error as Error & { code?: string }).code === 'save-card-no-repository'
+      && error.message.includes("workspace 'Computer Root'"),
+  );
 });
 
 test('plan done resolver enriches identity from package state and fake checkpoint engine', async () => {

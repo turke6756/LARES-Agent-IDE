@@ -74,6 +74,7 @@ import { createTurnStampSource, type TurnStampRecordReader } from './stamp-proje
 import type { RunGitBytesLike, RunGitTextLike } from './dirty-inventory';
 import type { TurnWitnessReader } from './witness-projection';
 import type { CommitPathLinkReader } from './protection-read';
+import { SaveCardFinalizeRefusalError } from './save-card-ipc';
 import type {
   FleetAdhocBoundaryContext,
   SaveCardFinalizeRoutes,
@@ -94,7 +95,7 @@ const HEAD_TIMEOUT_MS = 10_000;
 export interface PreviewRoutesDeps {
   /** The internal Git exe already resolved by the checkpoint engine bootstrap. */
   gitExe: string;
-  getWorkspaces?: () => ReadonlyArray<{ id: string; path: string }>;
+  getWorkspaces?: () => ReadonlyArray<{ id: string; path: string; title?: string }>;
   probeWorkspaceGit?: (canonicalWorkspaceDir: string) => Promise<GitCapability>;
   readTurnWitnesses?: TurnWitnessReader;
   readTurnRecord?: TurnStampRecordReader;
@@ -221,8 +222,18 @@ export function createPreviewRoutes(deps: PreviewRoutesDeps): {
    *  reps and the requested finalizations. Probes every workspace (sibling union),
    *  runs the 1G facade, then reads the ledger / fingerprint / pinned HEAD. */
   async function assembleScope(workspaceId: string): Promise<PreviewScope> {
+    const registeredWorkspaces = getWorkspaces();
+    const workspaceRow = registeredWorkspaces.find((workspace) => workspace.id === workspaceId);
+    if (!workspaceRow) {
+      throw new SaveCardFinalizeRefusalError(
+        `Cannot pin this package because it references an unknown workspace: ${workspaceId}.`,
+        'save-card-unknown-workspace',
+        workspaceId,
+        workspaceId,
+      );
+    }
     const workspaces: CandidateWorkspaceInput[] = await Promise.all(
-      getWorkspaces().map(async (ws): Promise<CandidateWorkspaceInput> => {
+      registeredWorkspaces.map(async (ws): Promise<CandidateWorkspaceInput> => {
         const workspaceDir = canonicalDir(realpath, ws.path);
         const capability = await probeWorkspaceGit(workspaceDir);
         return {
@@ -239,9 +250,24 @@ export function createPreviewRoutes(deps: PreviewRoutesDeps): {
     );
 
     const target = workspaces.find((ws) => ws.workspaceId === workspaceId);
-    if (!target) throw new Error(`unknown target workspace: ${workspaceId}`);
+    if (!target) {
+      throw new SaveCardFinalizeRefusalError(
+        `Cannot pin this package because it references an unknown workspace: ${workspaceId}.`,
+        'save-card-unknown-workspace',
+        workspaceId,
+        workspaceRow.title ?? workspaceId,
+      );
+    }
     const repoRoot = target.capability.repoRoot;
-    if (!repoRoot) throw new Error(`workspace has no repository root: ${workspaceId}`);
+    if (!repoRoot) {
+      const workspaceTitle = workspaceRow.title ?? workspaceId;
+      throw new SaveCardFinalizeRefusalError(
+        `No git repository — cannot pin/commit from workspace '${workspaceTitle}'.`,
+        'save-card-no-repository',
+        workspaceId,
+        workspaceTitle,
+      );
+    }
 
     const read = await assembleInventory({
       targetWorkspaceId: workspaceId,

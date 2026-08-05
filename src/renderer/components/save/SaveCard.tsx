@@ -8,6 +8,7 @@ import {
 import type {
   CommitCoordinatorConsumeResponse,
   SaveCardFleetAdhocMarkDoneResponse,
+  SaveCardFleetAdhocMarkDoneSuccess,
   SaveCardInventoryResponse,
   SaveCardPreviewResponse,
 } from '../../../shared/types';
@@ -67,7 +68,7 @@ function PackageSaveGesture({
 }) {
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [pinning, setPinning] = useState(false);
-  const [pins, setPins] = useState<SaveCardFleetAdhocMarkDoneResponse[]>([]);
+  const [pins, setPins] = useState<SaveCardFleetAdhocMarkDoneSuccess[]>([]);
   const [draft, setDraft] = useState<CandidatePreviewDraft | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [outcome, setOutcome] = useState<CommitCoordinatorConsumeResponse | null>(null);
@@ -88,17 +89,34 @@ function PackageSaveGesture({
 
   const pinPackage = async () => {
     if (pinning || submittingRef.current) return;
+    const unsaveable = group.find((bundle) => bundle.saveability?.saveable === false);
+    if (unsaveable?.saveability?.saveable === false) {
+      setGestureError(
+        `No git repository — cannot pin/commit from workspace '${unsaveable.saveability.workspaceTitle}'.`,
+      );
+      return;
+    }
     setPinning(true);
     setGestureError(null);
     setOutcome(null);
     setMovedPaths([]);
     try {
-      const responses = await Promise.all(
+      const responses: SaveCardFleetAdhocMarkDoneResponse[] = await Promise.all(
         group.map((bundle) => window.api.saveCard.markDone({ packageId: bundle.bundleId })),
       );
-      setPins(responses);
+      const refusal = responses.find(
+        (response): response is Extract<SaveCardFleetAdhocMarkDoneResponse, { ok: false }> =>
+          'ok' in response && response.ok === false,
+      );
+      if (refusal) {
+        setPins([]);
+        setGestureError(refusal.message);
+        return;
+      }
+      const successful = responses as SaveCardFleetAdhocMarkDoneSuccess[];
+      setPins(successful);
       setDraft(null);
-      if (responses.some((response) => response.boundaryStatus !== 'ready')) {
+      if (successful.some((response) => response.boundaryStatus !== 'ready')) {
         setGestureError('Finalization could not capture a ready boundary. Nothing can be submitted yet.');
       }
     } catch (err) {

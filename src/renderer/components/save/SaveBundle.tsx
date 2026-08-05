@@ -90,6 +90,10 @@ export default function SaveBundle({
 }) {
   const [expanded, setExpanded] = useState(false);
   const grouped = bundles ?? [bundle];
+  const unsaveable = grouped.find((item) => item.saveability?.saveable === false);
+  const unsaveableReason = unsaveable?.saveability?.saveable === false
+    ? `No git repository — cannot pin/commit from workspace '${unsaveable.saveability.workspaceTitle}'`
+    : null;
 
   const isUnattributed = bundle.kind === 'unattributed';
   const captureConcern = grouped.some(hasCaptureConcern);
@@ -152,7 +156,7 @@ export default function SaveBundle({
               data-testid="save-bundle-pin"
               aria-label={`Finalize and pin ${identity?.name ?? bundle.label}`}
               checked={pinned}
-              disabled={pinning}
+              disabled={pinning || Boolean(unsaveableReason)}
               onChange={onPin}
             />
           ) : !isUnattributed ? (
@@ -161,6 +165,13 @@ export default function SaveBundle({
         <h2>{isMixed ? 'Overlapping work' : identity?.name ?? bundle.label}</h2>
         <span className={pillClass} data-testid="save-bundle-pill">{pillText}</span>
       </div>
+
+      {unsaveableReason && (
+        <div className="sc-flag sc-saveability-refusal" data-testid="save-bundle-unsaveable">
+          <Icons.AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+          <span>{unsaveableReason}</span>
+        </div>
+      )}
 
       {isUnattributed ? (
         <p className="sc-meta" data-testid="save-bundle-desc">

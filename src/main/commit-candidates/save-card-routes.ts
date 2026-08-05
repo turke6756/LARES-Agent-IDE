@@ -19,7 +19,7 @@
 
 import * as fs from 'node:fs';
 
-import type { Agent, GitCapability, SaveCardBundle, SaveCardBundleIdentity, SaveCardInventoryRequest, SaveCardInventoryResponse, SaveCardWorkerUnit } from '../../shared/types';
+import type { Agent, GitCapability, SaveCardBundle, SaveCardBundleIdentity, SaveCardInventoryRequest, SaveCardInventoryResponse, SaveCardPackageSaveability, SaveCardWorkerUnit } from '../../shared/types';
 import type { SaveCardQuotaWeakening } from '../../shared/commit-candidates';
 import {
   getAgentsByWorkspace as dbGetAgentsByWorkspace,
@@ -53,7 +53,7 @@ type BundleTurn = Pick<TurnRecord, 'id' | 'agentId' | 'agentTitle' | 'startedAt'
 export interface SaveCardRoutesDeps {
   /** The internal Git exe already resolved by the checkpoint engine bootstrap. */
   gitExe: string;
-  getWorkspaces?: () => ReadonlyArray<{ id: string; path: string }>;
+  getWorkspaces?: () => ReadonlyArray<{ id: string; path: string; title?: string }>;
   probeWorkspaceGit?: (canonicalWorkspaceDir: string) => Promise<GitCapability>;
   readTurnWitnesses?: TurnWitnessReader;
   readTurnRecord?: TurnStampRecordReader;
@@ -122,15 +122,31 @@ function attachBundleIdentity(
   agents: ReadonlyMap<string, Agent>,
   turns: ReadonlyMap<string, BundleTurn>,
   witnesses: readonly TurnWitnessRead[],
+  capabilityByWorkspaceId: ReadonlyMap<string, GitCapability>,
+  workspaceTitleById: ReadonlyMap<string, string>,
 ): SaveCardBundle {
   if (bundle.kind === 'unattributed' || !bundle.component) {
-    return { ...bundle, identity: null };
+    return { ...bundle, identity: null, saveability: { saveable: true } };
   }
 
   const turnIds = new Set(bundle.component.associations.flatMap((a) => a.contributingTurnIds));
   const relevantWitnesses = witnesses.filter((witness) => turnIds.has(witness.turnId));
   const agentIds = new Set(relevantWitnesses.flatMap((w) => w.agentId ? [w.agentId] : []));
   const ownerIds = new Set<string>();
+
+  const noRepositoryWorkspace = [...agentIds]
+    .map((agentId) => agents.get(agentId)?.workspaceId)
+    .filter((workspaceId): workspaceId is string => Boolean(workspaceId))
+    .find((workspaceId) => capabilityByWorkspaceId.has(workspaceId)
+      && !capabilityByWorkspaceId.get(workspaceId)?.repoRoot);
+  const saveability: SaveCardPackageSaveability = noRepositoryWorkspace
+    ? {
+        saveable: false,
+        reason: 'no-repository',
+        workspaceId: noRepositoryWorkspace,
+        workspaceTitle: workspaceTitleById.get(noRepositoryWorkspace) ?? noRepositoryWorkspace,
+      }
+    : { saveable: true };
 
   // Owner resolution uses ONLY real data: the witness's recorded owner edge, else
   // the contributing agent's own owner edge. We never fabricate ownership — an
@@ -210,6 +226,7 @@ function attachBundleIdentity(
     label: name,
     labels: [name, ...bundle.labels],
     identity,
+    saveability,
   };
 }
 
@@ -262,10 +279,16 @@ export function createSaveCardRoutes(deps: SaveCardRoutesDeps): SaveCardRoutes {
   async function getInventory(
     req: SaveCardInventoryRequest,
   ): Promise<SaveCardInventoryResponse> {
+    const registeredWorkspaces = getWorkspaces();
+    const capabilityByWorkspaceId = new Map<string, GitCapability>();
+    const workspaceTitleById = new Map(
+      registeredWorkspaces.map((workspace) => [workspace.id, workspace.title ?? workspace.id]),
+    );
     const workspaces: CandidateWorkspaceInput[] = await Promise.all(
-      getWorkspaces().map(async (ws): Promise<CandidateWorkspaceInput> => {
+      registeredWorkspaces.map(async (ws): Promise<CandidateWorkspaceInput> => {
         const workspaceDir = canonicalDir(realpath, ws.path);
         const capability = await probeWorkspaceGit(workspaceDir);
+        capabilityByWorkspaceId.set(ws.id, capability);
         return {
           workspaceId: ws.id,
           workspaceDir,
@@ -292,6 +315,12 @@ export function createSaveCardRoutes(deps: SaveCardRoutesDeps): SaveCardRoutes {
     const bundleTurns = [...includedWorkspaceIds].flatMap((workspaceId) => readBundleTurns(workspaceId));
     const turns = new Map(bundleTurns.map((turn) => [turn.id, turn]));
     const witnesses = [...includedWorkspaceIds].flatMap((workspaceId) => readTurnWitnesses(workspaceId));
+    for (const agentId of new Set(witnesses.flatMap((witness) => witness.agentId ? [witness.agentId] : []))) {
+      if (!agents.has(agentId)) {
+        const agent = getAgent(agentId);
+        if (agent) agents.set(agentId, agent);
+      }
+    }
     for (const ownerId of new Set(witnesses.flatMap((witness) => witness.ownerAgentId ? [witness.ownerAgentId] : []))) {
       if (!agents.has(ownerId)) {
         const owner = getAgent(ownerId);
@@ -305,6 +334,8 @@ export function createSaveCardRoutes(deps: SaveCardRoutesDeps): SaveCardRoutes {
         agents,
         turns,
         witnesses,
+        capabilityByWorkspaceId,
+        workspaceTitleById,
       )),
       quotaWeakening,
     };
