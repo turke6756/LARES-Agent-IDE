@@ -66,6 +66,29 @@ function test(name: string, fn: () => void | Promise<void>): void {
   tests.push({ name, run: fn });
 }
 
+test('unbound live reader emits its exact resolved provider session id', () => {
+  const reader: ChatLogReader = {
+    provider: 'grok',
+    pollSession: () => [],
+    invalidatePath: () => {},
+    getResolvedSessionId: () => '019fffff-1111-7222-a800-aaaaaaaaaaaa',
+  };
+  const dispatcher = new SessionLogDispatcher(() => [{
+    agentId: 'grok-1', sessionId: '', workingDirectory: '/repo', provider: 'grok',
+  }]);
+  dispatcher.register(reader);
+  const resolved: unknown[] = [];
+  dispatcher.on('session-resolved', (event) => resolved.push(event));
+
+  dispatcher.pollNow('grok-1');
+
+  assert.deepEqual(resolved, [{
+    agentId: 'grok-1',
+    provider: 'grok',
+    sessionId: '019fffff-1111-7222-a800-aaaaaaaaaaaa',
+  }]);
+});
+
 // ── Tests ────────────────────────────────────────────────────────────
 
 test('synthetic followed by matching real within window: real is dropped', () => {

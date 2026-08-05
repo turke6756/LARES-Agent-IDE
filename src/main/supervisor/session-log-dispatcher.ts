@@ -68,6 +68,12 @@ export interface AgentReboundEvent {
   agentId: string;
 }
 
+export interface SessionResolvedEvent {
+  agentId: string;
+  provider: AgentProvider;
+  sessionId: string;
+}
+
 /** Payload for `'session-stale'` — a Claude agent's tailed `.jsonl` went quiet
  *  (EOF streak). The supervisor uses this only as a RETRY trigger for a
  *  previously hook-bound /clear candidate; it is never the identity source.
@@ -207,12 +213,14 @@ export class SessionLogDispatcher extends EventEmitter {
   // payload instead of `any`.
   on(event: 'agent-rebound', listener: (payload: AgentReboundEvent) => void): this;
   on(event: 'session-stale', listener: (payload: SessionStaleEvent) => void): this;
+  on(event: 'session-resolved', listener: (payload: SessionResolvedEvent) => void): this;
   on(event: string | symbol, listener: (...args: any[]) => void): this;
   on(event: string | symbol, listener: (...args: any[]) => void): this {
     return super.on(event, listener);
   }
   emit(event: 'agent-rebound', payload: AgentReboundEvent): boolean;
   emit(event: 'session-stale', payload: SessionStaleEvent): boolean;
+  emit(event: 'session-resolved', payload: SessionResolvedEvent): boolean;
   emit(event: string | symbol, ...args: any[]): boolean;
   emit(event: string | symbol, ...args: any[]): boolean {
     return super.emit(event, ...args);
@@ -470,6 +478,20 @@ export class SessionLogDispatcher extends EventEmitter {
     return reader.readSessionEventsOnce(workingDirectory, sessionId);
   }
 
+  /** Recover a provider session for a terminal agent whose launch never bound
+   *  `resumeSessionId`. Readers enforce uniqueness within the agent's activity
+   *  window so a shared cwd can never silently attach a sibling's chat. */
+  recoverPriorSessionEvents(
+    provider: AgentProvider,
+    workingDirectory: string,
+    startedAt?: string,
+    endedAt?: string,
+  ): { sessionId: string; events: SessionEvent[] } | null {
+    const reader = this.readers.get(provider);
+    if (!reader?.recoverSessionEventsOnce) return null;
+    return reader.recoverSessionEventsOnce(workingDirectory, startedAt, endedAt);
+  }
+
   /** Drain each reader's session-pinned stale signals and re-emit them as
    *  `'session-stale'`. Called at the end of every tick / pollNow so rotation
    *  handling runs on a clean stack (NOT re-entrantly inside pollSession). */
@@ -569,6 +591,16 @@ export class SessionLogDispatcher extends EventEmitter {
     };
 
     const rawEvents = reader.pollSession(readerSession);
+    if (!session.sessionId) {
+      const resolvedSessionId = reader.getResolvedSessionId?.(session.agentId);
+      if (resolvedSessionId) {
+        this.emit('session-resolved', {
+          agentId: session.agentId,
+          provider: session.provider,
+          sessionId: resolvedSessionId,
+        });
+      }
+    }
     if (rawEvents.length === 0) return;
 
     const newEvents: SessionEvent[] = [];

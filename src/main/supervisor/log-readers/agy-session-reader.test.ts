@@ -393,6 +393,34 @@ test('one-shot read returns disk history only for bound matching cwd', () => {
   } finally { cleanup(root); }
 });
 
+test('terminal recovery binds the only Agy conversation in the agent activity window', () => {
+  const root = tempRoot();
+  try {
+    createFixture(root);
+    const recovered = readerAt(root).recoverSessionEventsOnce(
+      CWD,
+      new Date(CREATED_MS - 1_000).toISOString(),
+      new Date(CREATED_MS + 60_000).toISOString(),
+    );
+    assert.equal(recovered?.sessionId, SID);
+    assert.ok(recovered?.events.some((e) => e.type === 'assistant-text'));
+  } finally { cleanup(root); }
+});
+
+test('terminal recovery refuses ambiguous same-cwd Agy conversations', () => {
+  const root = tempRoot();
+  try {
+    createFixture(root, { sid: SID });
+    createFixture(root, { sid: OTHER_SID, createdMs: CREATED_MS + 10_000 });
+    const recovered = readerAt(root).recoverSessionEventsOnce(
+      CWD,
+      new Date(CREATED_MS - 1_000).toISOString(),
+      new Date(CREATED_MS + 60_000).toISOString(),
+    );
+    assert.equal(recovered, null);
+  } finally { cleanup(root); }
+});
+
 test('sessionFileExists validates both id and workspace metadata', () => {
   const root = tempRoot();
   try {

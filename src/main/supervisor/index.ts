@@ -2140,6 +2140,18 @@ export class AgentSupervisor extends EventEmitter {
     this.sessionLogReader.register(new GeminiTranscriptReader());
     this.sessionLogReader.register(new GrokSessionReader());
     this.sessionLogReader.register(new AgySessionReader());
+    this.sessionLogReader.on('session-resolved', ({ agentId, provider, sessionId }) => {
+      const agent = getAgent(agentId);
+      if (!agent || agent.provider !== provider || agent.resumeSessionId) return;
+      const ownedBySibling = getAllAgents().some(
+        (other) => other.id !== agentId && other.resumeSessionId === sessionId,
+      );
+      if (ownedBySibling) {
+        console.warn(`[chat] Refusing ${provider} session ${sessionId} for ${agentId}: already owned by another agent`);
+        return;
+      }
+      updateAgentResumeSessionId(agentId, sessionId);
+    });
     this.sessionLogReader.on('chat-events', (batch) => {
       // Phase 5A — the `endsWithQuestion` verdict no longer feeds the
       // awaiting-human gate (a merely-idle question-ending turn is available).

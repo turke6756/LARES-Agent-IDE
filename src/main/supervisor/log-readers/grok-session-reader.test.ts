@@ -467,6 +467,37 @@ test('readSessionEventsOnce parses a prior session located by id; null when miss
   }
 });
 
+test('terminal recovery binds the only Grok session in the agent activity window', () => {
+  const root = writeSessionTree({ cwd: FIXTURE_CWD, sessionId: FIXTURE_SESSION_ID, lines: FIXTURE_LINES });
+  try {
+    const recovered = makeDiscoveryReader(root).recoverSessionEventsOnce(
+      FIXTURE_CWD,
+      new Date(1785772799000).toISOString(),
+      new Date(1785772861000).toISOString(),
+    );
+    assert.equal(recovered?.sessionId, FIXTURE_SESSION_ID);
+    assert.ok(recovered?.events.some((e) => e.type === 'user-text' && e.text === 'list the files'));
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('terminal recovery refuses ambiguous same-cwd Grok sessions', () => {
+  const root = writeSessionTree({ cwd: FIXTURE_CWD, sessionId: FIXTURE_SESSION_ID, lines: FIXTURE_LINES });
+  try {
+    const group = path.join(root, 'sessions', encodeURIComponent(FIXTURE_CWD));
+    fs.cpSync(path.join(group, FIXTURE_SESSION_ID), path.join(group, '019fffff-1111-7222-a800-bbbbbbbbbbbb'), { recursive: true });
+    const recovered = makeDiscoveryReader(root).recoverSessionEventsOnce(
+      FIXTURE_CWD,
+      new Date(1785772799000).toISOString(),
+      new Date(1785772861000).toISOString(),
+    );
+    assert.equal(recovered, null);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 // ── Dispatcher wiring ──────────────────────────────────────────────────
 
 test('dispatcher routes grok events end-to-end via pollNow + getCachedEvents', () => {

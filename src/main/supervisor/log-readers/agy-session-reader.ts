@@ -508,6 +508,11 @@ export class AgySessionReader implements ChatLogReader {
     }
   }
 
+  getResolvedSessionId(agentId: string): string | null {
+    const resolved = this.resolvedPaths.get(agentId);
+    return resolved ? path.parse(resolved).name : null;
+  }
+
   async getFullToolResult(agentId: string, toolUseId: string): Promise<string | null> {
     return this.fullToolResults.get(`${agentId}:${toolUseId}`) ?? null;
   }
@@ -539,6 +544,45 @@ export class AgySessionReader implements ChatLogReader {
     const parsed = parseConversation(dbPath, session, true);
     if (!parsed || !cwdMatches(parsed.metadata.cwd, workingDirectory)) return null;
     return parsed.events;
+  }
+
+  recoverSessionEventsOnce(
+    workingDirectory: string,
+    startedAt?: string,
+    endedAt?: string,
+  ): { sessionId: string; events: SessionEvent[] } | null {
+    const root = this.getWindowsAgyRoot();
+    if (!root) return null;
+    const startMs = parseStartedAtMs(startedAt);
+    const endMs = parseStartedAtMs(endedAt);
+    const probe: ChatLogReaderSession = {
+      agentId: '__recover-prior-session__',
+      sessionId: '',
+      workingDirectory,
+      provider: this.provider,
+      subscribed: false,
+      startedAt,
+    };
+    const matches: string[] = [];
+    const conversationsDir = path.join(root, 'conversations');
+    try {
+      for (const entry of fs.readdirSync(conversationsDir, { withFileTypes: true })) {
+        if (!entry.isFile() || !CONVERSATION_ID_RE.test(path.parse(entry.name).name)) continue;
+        const dbPath = path.join(conversationsDir, entry.name);
+        const parsed = parseConversation(dbPath, probe, false);
+        if (!parsed || !cwdMatches(parsed.metadata.cwd, workingDirectory)) continue;
+        if (startMs && parsed.metadata.createdAtMs + START_FLOOR_SLACK_MS < startMs) continue;
+        if (endMs && parsed.metadata.createdAtMs - START_FLOOR_SLACK_MS > endMs) continue;
+        matches.push(parsed.metadata.conversationId);
+        if (matches.length > 1) return null;
+      }
+    } catch {
+      return null;
+    }
+    const sessionId = matches[0];
+    if (!sessionId) return null;
+    const events = this.readSessionEventsOnce(workingDirectory, sessionId);
+    return events ? { sessionId, events } : null;
   }
 
   pollSession(session: ChatLogReaderSession): SessionEvent[] {

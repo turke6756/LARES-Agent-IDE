@@ -45,6 +45,16 @@ export interface ChatLogReader {
   ): boolean;
   /** Re-read the full content of a previously-truncated tool_result. Returns null if the reader doesn't track this agent or tool result. */
   getFullToolResult?(agentId: string, toolUseId: string): Promise<string | null>;
+  /** Recover an unbound terminal agent from provider-owned history. Implementors
+   *  must return a result only when the cwd + activity window identify exactly
+   *  one session; shared-cwd ambiguity must degrade to null. */
+  recoverSessionEventsOnce?(
+    workingDirectory: string,
+    startedAt?: string,
+    endedAt?: string,
+  ): { sessionId: string; events: SessionEvent[] } | null;
+  /** Exact provider session id selected for an agent's current live tail. */
+  getResolvedSessionId?(agentId: string): string | null;
 }
 
 export const TOOL_RESULT_TRUNCATE_BYTES = 20_000;

@@ -25,14 +25,10 @@
  * `SessionLogDispatcher.forgetAgent`, called from the stop / runner-exit /
  * delete paths — safe precisely BECAUSE reads now come from disk.
  *
- * Provider support (deliberate, stated scope decision): only the Claude reader
- * implements `readSessionEventsOnce` today, so `readPriorSessionEvents` returns
- * `null` for codex/gemini. Rather than balloon this change into three log-reader
- * implementations, a dead non-Claude agent degrades EXPLICITLY: the result
- * carries `source: 'unavailable'` so the UI can say "history not available for
- * this provider" instead of rendering a silent empty pane. Implementing
- * `readSessionEventsOnce` for the codex/gemini readers is the follow-up that
- * flips those agents to `source: 'disk'` with no change to this file.
+ * Providers with an exact persisted session id use `readSessionEventsOnce`.
+ * Grok/Agy launches historically left that id null, so their readers also offer
+ * a fail-closed cwd + activity-window recovery: exactly one candidate is bound
+ * and persisted; ambiguous shared-cwd histories remain explicitly unavailable.
  */
 
 import type { AgentProvider, AgentStatus } from '../../shared/types';
@@ -71,6 +67,8 @@ export interface ChatHistoryAgent {
   provider: AgentProvider;
   workingDirectory: string;
   resumeSessionId?: string | null;
+  createdAt?: string;
+  lastOutputAt?: string | null;
 }
 
 /**
@@ -87,6 +85,13 @@ export interface ChatHistoryDeps {
     workingDirectory: string,
     sessionId: string,
   ): SessionEvent[] | null;
+  recoverPriorSessionEvents?(
+    provider: AgentProvider,
+    workingDirectory: string,
+    startedAt?: string,
+    endedAt?: string,
+  ): { sessionId: string; events: SessionEvent[] } | null;
+  bindRecoveredSessionId?(agentId: string, sessionId: string): void;
 }
 
 export interface ResolveChatOptions {
@@ -134,9 +139,27 @@ export function resolveAgentChatEvents(
   // ── Terminal agent ──────────────────────────────────────────────────
   // The ring is (or is about to be) released, and `pollNow` cannot refill it.
   const sessionId = agent.resumeSessionId || '';
-  const fromDisk = sessionId
+  let fromDisk = sessionId
     ? deps.readPriorSessionEvents(agent.provider, agent.workingDirectory, sessionId)
     : null;
+
+  // Grok/Agy mint their own session ids and older launches never persisted the
+  // binding. Recover only through a reader that can prove a unique cwd+time
+  // match, then persist the id so every later read is exact (including after a
+  // restart). Ambiguity returns null; showing no history is safer than showing
+  // a shared-cwd sibling's conversation.
+  if (!sessionId && deps.recoverPriorSessionEvents) {
+    const recovered = deps.recoverPriorSessionEvents(
+      agent.provider,
+      agent.workingDirectory,
+      agent.createdAt,
+      agent.lastOutputAt ?? undefined,
+    );
+    if (recovered) {
+      deps.bindRecoveredSessionId?.(agentId, recovered.sessionId);
+      fromDisk = recovered.events;
+    }
+  }
 
   if (fromDisk) {
     return { events: sliceSince(fromDisk, options.sinceUuid), truncated: false, source: 'disk' };

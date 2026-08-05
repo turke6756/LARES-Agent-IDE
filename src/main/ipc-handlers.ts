@@ -15,7 +15,7 @@ import { resolveAgentChatEvents } from './supervisor/agent-chat-history';
 import {
   getWorkspaces, createWorkspace, deleteWorkspace, getWorkspace, reorderWorkspaces,
   getAgentsByWorkspace, getAllAgents, getAgent, getPlan, planItemInPlan, getFileActivities, getWorkspaceAgentSummary,
-  checkAgentMdExists, updateAgentSupervised, getAgentSessions,
+  checkAgentMdExists, updateAgentSupervised, updateAgentResumeSessionId, getAgentSessions,
   createTeam, getTeam, listTeams, updateTeamStatus, addTeamMember, removeTeamMember,
   createChannel, removeChannel, getTeamMessages, getTeamTasks, createTeamTask, updateTeamTask,
   listAgentTemplates, createAgentTemplate, updateAgentTemplate, deleteAgentTemplate,
@@ -383,6 +383,11 @@ export function registerIpcHandlers(
         getCachedEvents: (id, since) => reader.getCachedEvents(id, since),
         pollNow: (id) => reader.pollNow(id),
         readPriorSessionEvents: (p, wd, sid) => reader.readPriorSessionEvents(p, wd, sid),
+        recoverPriorSessionEvents: (p, wd, startedAt, endedAt) =>
+          reader.recoverPriorSessionEvents(p, wd, startedAt, endedAt),
+        bindRecoveredSessionId: (id, sid) => {
+          if (!getAgent(id)?.resumeSessionId) updateAgentResumeSessionId(id, sid);
+        },
       },
       agentId,
       // Hydration is request-driven, just like read_agent_chat. Force one

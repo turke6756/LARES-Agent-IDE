@@ -43,6 +43,8 @@ interface Recorder {
   deps: ChatHistoryDeps;
   polled: string[];
   diskReads: Array<[string, string, string]>;
+  recoveryReads: Array<[string, string, string | undefined, string | undefined]>;
+  bindings: Array<[string, string]>;
 }
 
 function makeDeps(opts: {
@@ -50,13 +52,18 @@ function makeDeps(opts: {
   ring?: SessionEvent[];
   truncated?: boolean;
   disk?: SessionEvent[] | null;
+  recovered?: { sessionId: string; events: SessionEvent[] } | null;
 }): Recorder {
   const polled: string[] = [];
   const diskReads: Array<[string, string, string]> = [];
+  const recoveryReads: Array<[string, string, string | undefined, string | undefined]> = [];
+  const bindings: Array<[string, string]> = [];
   const ring = opts.ring ?? [];
   return {
     polled,
     diskReads,
+    recoveryReads,
+    bindings,
     deps: {
       getAgent: () => (opts.agent === undefined ? liveAgent : opts.agent),
       getCachedEvents: (_id, since) => {
@@ -72,6 +79,11 @@ function makeDeps(opts: {
         diskReads.push([p, wd, sid]);
         return opts.disk ?? null;
       },
+      recoverPriorSessionEvents: (p, wd, startedAt, endedAt) => {
+        recoveryReads.push([p, wd, startedAt, endedAt]);
+        return opts.recovered ?? null;
+      },
+      bindRecoveredSessionId: (id, sid) => bindings.push([id, sid]),
     },
   };
 }
@@ -196,11 +208,36 @@ test('dead agent on a provider with no one-shot reader degrades to `unavailable`
   assert.deepEqual(out.events, []);
 });
 
-test('dead agent with no resumeSessionId never attempts a disk read', () => {
-  const r = makeDeps({ agent: { ...deadAgent, resumeSessionId: null }, ring: [], disk: null });
+test('dead Grok/Agy agent with no resumeSessionId recovers, persists, and returns disk chat', () => {
+  for (const provider of ['grok', 'agy'] as const) {
+    const recovered = { sessionId: `${provider}-sid`, events: [ev(`${provider}-u`, 'history')] };
+    const r = makeDeps({
+      agent: {
+        ...deadAgent,
+        provider,
+        resumeSessionId: null,
+        createdAt: '2026-08-05 02:09:25',
+        lastOutputAt: '2026-08-05 02:12:25',
+      },
+      ring: [],
+      recovered,
+    });
+    const out = resolveAgentChatEvents(r.deps, 'a1');
+    assert.equal(out.source, 'disk');
+    assert.deepEqual(out.events, recovered.events);
+    assert.deepEqual(r.recoveryReads, [[provider, '/repo', '2026-08-05 02:09:25', '2026-08-05 02:12:25']]);
+    assert.deepEqual(r.bindings, [['a1', `${provider}-sid`]]);
+    assert.equal(r.diskReads.length, 0);
+  }
+});
+
+test('dead agent with no resumeSessionId stays unavailable when recovery is ambiguous', () => {
+  const r = makeDeps({ agent: { ...deadAgent, provider: 'grok', resumeSessionId: null }, ring: [], recovered: null });
   const out = resolveAgentChatEvents(r.deps, 'a1');
   assert.equal(out.source, 'unavailable');
   assert.equal(r.diskReads.length, 0);
+  assert.equal(r.recoveryReads.length, 1);
+  assert.deepEqual(r.bindings, []);
 });
 
 test('dead agent, disk unavailable but ring still warm: serve the ring, not an empty pane', () => {

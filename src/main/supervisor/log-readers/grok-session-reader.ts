@@ -132,6 +132,11 @@ export class GrokSessionReader implements ChatLogReader {
     }
   }
 
+  getResolvedSessionId(agentId: string): string | null {
+    const resolved = this.resolvedPaths.get(agentId);
+    return resolved ? path.basename(path.dirname(resolved)) : null;
+  }
+
   private forgetResolvedPath(agentId: string): void {
     this.resolvedPaths.delete(agentId);
     this.eofStreak.delete(agentId);
@@ -226,6 +231,26 @@ export class GrokSessionReader implements ChatLogReader {
       }
     }
     return out;
+  }
+
+  recoverSessionEventsOnce(
+    workingDirectory: string,
+    startedAt?: string,
+    endedAt?: string,
+  ): { sessionId: string; events: SessionEvent[] } | null {
+    const session: ChatLogReaderSession = {
+      agentId: '__recover-prior-session__',
+      sessionId: '',
+      workingDirectory,
+      provider: this.provider,
+      subscribed: false,
+      startedAt,
+    };
+    const candidates = this.findUpdatesInWindow(session, endedAt);
+    if (candidates.length !== 1) return null;
+    const sessionId = path.basename(path.dirname(candidates[0]));
+    const events = this.readSessionEventsOnce(workingDirectory, sessionId);
+    return events ? { sessionId, events } : null;
   }
 
   pollSession(session: ChatLogReaderSession): SessionEvent[] {
@@ -644,6 +669,30 @@ export class GrokSessionReader implements ChatLogReader {
     }
     return best ? best.p : null;
   }
+
+  /** Historical recovery is deliberately stricter than the live newest-file
+   *  heuristic: exactly one session must fall inside the agent's own activity
+   *  window or the caller receives null. */
+  private findUpdatesInWindow(session: ChatLogReaderSession, endedAt?: string): string[] {
+    const startMs = parseIsoMs(session.startedAt);
+    const endMs = parseIsoMs(endedAt);
+    const matches = new Set<string>();
+
+    for (const grokDir of this.candidateGrokDirs(session)) {
+      const sessionsDir = path.join(grokDir, 'sessions');
+      const groupDir = findGroupDirForCwd(sessionsDir, session.workingDirectory);
+      if (!groupDir) continue;
+      for (const sid of safeReaddir(groupDir)) {
+        const updatesPath = path.join(groupDir, sid, 'updates.jsonl');
+        const bounds = grokActivityBounds(updatesPath);
+        if (!bounds) continue;
+        if (startMs != null && bounds.lastMs + START_FLOOR_SLACK_MS < startMs) continue;
+        if (endMs != null && bounds.firstMs - START_FLOOR_SLACK_MS > endMs) continue;
+        matches.add(updatesPath);
+      }
+    }
+    return [...matches];
+  }
 }
 
 // ── Module helpers ──────────────────────────────────────────────────────
@@ -663,6 +712,28 @@ function safeReaddir(dir: string): string[] {
 function safeMtime(p: string): number | null {
   try {
     return fs.statSync(p).mtimeMs;
+  } catch {
+    return null;
+  }
+}
+
+function grokActivityBounds(p: string): { firstMs: number; lastMs: number } | null {
+  try {
+    let firstMs: number | null = null;
+    let lastMs: number | null = null;
+    for (const line of fs.readFileSync(p, 'utf-8').split(/\r?\n/)) {
+      if (!line.trim()) continue;
+      let entry: any;
+      try { entry = JSON.parse(line); } catch { continue; }
+      const metaMs = entry?.params?._meta?.agentTimestampMs;
+      const timestampMs = typeof metaMs === 'number'
+        ? metaMs
+        : (typeof entry?.timestamp === 'number' ? entry.timestamp * 1000 : null);
+      if (timestampMs == null || !isFinite(timestampMs)) continue;
+      if (firstMs == null || timestampMs < firstMs) firstMs = timestampMs;
+      if (lastMs == null || timestampMs > lastMs) lastMs = timestampMs;
+    }
+    return firstMs == null || lastMs == null ? null : { firstMs, lastMs };
   } catch {
     return null;
   }

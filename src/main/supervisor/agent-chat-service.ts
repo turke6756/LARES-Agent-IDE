@@ -1,5 +1,5 @@
 import { SessionLogReader } from './session-log-reader';
-import { getAgent } from '../database';
+import { getAgent, updateAgentResumeSessionId } from '../database';
 import { resolveAgentChatEvents } from './agent-chat-history';
 import { SessionEvent, AssistantTextEvent, UserTextEvent } from '../../shared/session-events';
 
@@ -216,6 +216,11 @@ export class AgentChatService {
         getCachedEvents: (id, since) => this.dispatcher.getCachedEvents(id, since),
         pollNow: (id) => this.dispatcher.pollNow(id),
         readPriorSessionEvents: (p, wd, sid) => this.dispatcher.readPriorSessionEvents(p, wd, sid),
+        recoverPriorSessionEvents: (p, wd, startedAt, endedAt) =>
+          this.dispatcher.recoverPriorSessionEvents(p, wd, startedAt, endedAt),
+        bindRecoveredSessionId: (id, sid) => {
+          if (!getAgent(id)?.resumeSessionId) updateAgentResumeSessionId(id, sid);
+        },
       },
       agentId,
       { pollLive: true },
