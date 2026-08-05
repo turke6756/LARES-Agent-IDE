@@ -1118,11 +1118,6 @@ export function initDatabase(): void {
   `);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_psc_plan_time ON plan_section_changes (plan_id, changed_at)`);
 
-  // GT-A WP-A1 (§2 A1.4) — reconstruct written-sets/change_count for pre-column
-  // plan_events rows. Called AFTER plan_section_changes exists (it reads that
-  // table). NULL-guarded + idempotent: a strict no-op once every row is backfilled.
-  backfillPlanEventWrittenSets();
-
   // WP4: snapshot history (amendments §F-B, DDL verbatim). Content-addressed blob
   // split — each distinct HTML body stored exactly ONCE globally; plan_snapshots is
   // the per-plan ordered reference history (consecutive-dedup skips no-op reparses).
@@ -1158,6 +1153,17 @@ export function initDatabase(): void {
 
   initContextOptimizerSchema();
   initMemoryV2Schema();
+
+  // WP-P8F (A2 terminal DDL exception) — retire the six legacy plan-provenance /
+  // snapshot tables once the global readiness check first holds, ONCE under a
+  // migration marker. Repeatable + idempotent: until ready the tables stay inert
+  // but present and this re-checks every launch; after the drop the marker blocks
+  // re-runs. Wrapped so a probe/DDL failure can never crash DB init.
+  try {
+    dropRetiredPlanProvenanceTablesIfReady(db);
+  } catch (err) {
+    console.warn('[database] WP-P8F legacy plan-provenance drop check failed:', err);
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3092,108 +3098,6 @@ export function getSupervisorFocusedPlans(supervisorId: string, limit = 10): Foc
   ) as FocusedPlanSummary[];
 }
 
-// ── WP2: Provenance spine — breadcrumb touches (R2 §2.1) ────────────────────
-
-/** A read=intent or edit-target breadcrumb captured from the MCP handler or the
- *  transcript. `sectionAnchor` may be a pending sentinel for unresolved native
- *  edits (resolved to a real anchor at Stop by the resolver, R2 §2.3/§2.5). */
-export type PlanSectionTouchInput = {
-  agentId: string;
-  planId: string;
-  sectionAnchor: string;
-  blockAnchor?: string | null;
-  tool: string;                 // 'read_plan_section' | 'list_plan_sections' | 'read_plan_projection' | 'edit' | 'apply_patch' | 'write'
-  kind: 'read' | 'edit-target';
-  readMode?: string | null;
-  source: 'handler' | 'transcript';
-  toolUseId?: string | null;
-  resolvePayload?: string | null;
-  observedAt?: string;          // ISO; defaults to now
-};
-
-export type PlanSectionTouchRow = {
-  id: string;
-  agentId: string;
-  planId: string;
-  sectionAnchor: string;
-  blockAnchor: string | null;
-  tool: string;
-  kind: 'read' | 'edit-target';
-  readMode: string | null;
-  source: 'handler' | 'transcript';
-  toolUseId: string | null;
-  resolvePayload: string | null;
-  observedAt: string;
-};
-
-function rowToPlanSectionTouch(row: any): PlanSectionTouchRow {
-  return {
-    id: row.id,
-    agentId: row.agent_id,
-    planId: row.plan_id,
-    sectionAnchor: row.section_anchor,
-    blockAnchor: row.block_anchor ?? null,
-    tool: row.tool,
-    kind: row.kind,
-    readMode: row.read_mode ?? null,
-    source: row.source,
-    toolUseId: row.tool_use_id ?? null,
-    resolvePayload: row.resolve_payload ?? null,
-    observedAt: row.observed_at,
-  };
-}
-
-/** Insert a breadcrumb with cross-source dedup (R2 §2.1): if a row with the same
- *  non-null `tool_use_id` already exists, or (when `tool_use_id` is null) a row
- *  matching (agent_id, tool, section_anchor, block_anchor) within a 2-second
- *  bucket of `observed_at`, this is a no-op. This lets the handler (source:handler)
- *  and the transcript (source:transcript) both fire without double counting.
- *  Returns the inserted row id, or null when deduped. Never throws on caller data
- *  the way the tracker feeds it — callers upstream stay tolerant. */
-export function recordPlanSectionTouch(input: PlanSectionTouchInput): string | null {
-  const observedAt = input.observedAt ?? new Date().toISOString();
-  const blockAnchor = input.blockAnchor ?? null;
-
-  if (input.toolUseId) {
-    const dup = queryOne(
-      'SELECT id FROM plan_section_touches WHERE tool_use_id = ?',
-      [input.toolUseId],
-    );
-    if (dup) return null;
-  } else {
-    // No tool_use_id → 2-second time-bucket dedup on the identifying tuple.
-    const dup = queryOne(
-      `SELECT id FROM plan_section_touches
-       WHERE agent_id = ? AND tool = ? AND section_anchor = ?
-         AND (block_anchor IS ? OR block_anchor = ?)
-         AND ABS((julianday(observed_at) - julianday(?)) * 86400.0) <= 2.0`,
-      [input.agentId, input.tool, input.sectionAnchor, blockAnchor, blockAnchor, observedAt],
-    );
-    if (dup) return null;
-  }
-
-  const id = uuidv4();
-  run(
-    `INSERT INTO plan_section_touches
-       (id, agent_id, plan_id, section_anchor, block_anchor, tool, kind, read_mode, source, tool_use_id, resolve_payload, observed_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [id, input.agentId, input.planId, input.sectionAnchor, blockAnchor, input.tool, input.kind,
-     input.readMode ?? null, input.source, input.toolUseId ?? null, input.resolvePayload ?? null, observedAt],
-  );
-  return id;
-}
-
-/** Window query for the Stop-time resolver (R2 §2.1/§2.5): all touches for an
- *  agent within [sinceIso, untilIso], ordered by observed_at. */
-export function getTurnSectionTouches(agentId: string, sinceIso: string, untilIso: string): PlanSectionTouchRow[] {
-  return queryAll(
-    `SELECT * FROM plan_section_touches
-     WHERE agent_id = ? AND observed_at >= ? AND observed_at <= ?
-     ORDER BY observed_at ASC`,
-    [agentId, sinceIso, untilIso],
-  ).map(rowToPlanSectionTouch);
-}
-
 /** GT-A WP-A2 shared parse helper: tolerantly decode a JSON anchor array (the
  *  `written_section_anchors_json` column). Returns `[]` on null / non-array /
  *  malformed input and drops non-string members — never throws. Deliberately NOT
@@ -3448,25 +3352,6 @@ function rowToPlanSectionChange(row: any): PlanSectionChangeRow {
   };
 }
 
-/** Insert one effect row for a section/block whose byte-exact inner-HTML hash
- *  moved on a reparse (R2 §2.4). Written by section-cache.ts on reparse. */
-export function recordPlanSectionChange(input: {
-  planId: string;
-  sectionAnchor: string;
-  blockAnchor?: string | null;
-  contentHash: string;
-  changedAt?: string;
-}): string {
-  const id = uuidv4();
-  run(
-    `INSERT INTO plan_section_changes (id, plan_id, section_anchor, block_anchor, content_hash, changed_at)
-     VALUES (?, ?, ?, ?, ?, ?)`,
-    [id, input.planId, input.sectionAnchor, input.blockAnchor ?? null, input.contentHash,
-     input.changedAt ?? new Date().toISOString()],
-  );
-  return id;
-}
-
 /** Effect anchors changed within [sinceIso, untilIso] for a plan (R2 §2.5 `changed`
  *  input), ordered by changed_at.
  *
@@ -3505,63 +3390,6 @@ export function getTurnRepoActivity(agentId: string, sinceIso: string, untilIso:
   ).map(rowToFileActivity);
 }
 
-/** Order-preserving de-dup of a nullable anchor list (drops null/empty). Shared by
- *  the WP-A1 backfill's effect-set reconstruction. */
-function uniqAnchors(anchors: (string | null | undefined)[]): string[] {
-  const seen = new Set<string>();
-  const out: string[] = [];
-  for (const a of anchors) {
-    if (!a || seen.has(a)) continue;
-    seen.add(a);
-    out.push(a);
-  }
-  return out;
-}
-
-/** GT-A WP-A1 (§2 A1.4) — reconstruct `written_section_anchors_json` +
- *  `change_count` for historical plan_events rows written before the columns
- *  existed. Idempotent + NULL-guarded: only rows where
- *  `written_section_anchors_json IS NULL` are processed, and every processed row
- *  is set to a non-NULL value (malformed envelope / missing window / parse throw
- *  → `[]` / 0), so a second run is a strict no-op and no row is ever reprocessed.
- *
- *  Accurate for the historical run: workers had no plan tools then (I-1), so the
- *  fs-diff `changed` set (plan_section_changes over the turn window) was the only
- *  write signal anyway. `change_count` is the RAW change cardinality (D-5), NOT
- *  the de-duplicated written-set length. One transaction; per-row try/catch keeps
- *  one bad row from aborting the batch. */
-export function backfillPlanEventWrittenSets(): void {
-  const rows = queryAll(
-    `SELECT id, trusted_envelope_json FROM plan_events WHERE written_section_anchors_json IS NULL`,
-  );
-  if (rows.length === 0) return; // strict no-op once every row is backfilled
-  const update = db.prepare(
-    `UPDATE plan_events
-       SET written_section_anchors_json = ?, change_count = ?
-     WHERE id = ?`,
-  );
-  const tx = db.transaction((batch: any[]) => {
-    for (const r of batch) {
-      try {
-        const env = JSON.parse(r.trusted_envelope_json ?? '');
-        const planId = env?.planId;
-        const since = env?.window?.since;
-        const until = env?.window?.until;
-        if (typeof planId !== 'string' || typeof since !== 'string' || typeof until !== 'string') {
-          update.run('[]', 0, r.id); // missing/malformed window → [] / 0, never NULL again
-          continue;
-        }
-        const changes = getTurnSectionChanges(planId, since, until);
-        const written = uniqAnchors(changes.map((c) => c.sectionAnchor));
-        update.run(JSON.stringify(written), changes.length, r.id); // change_count = RAW cardinality (D-5)
-      } catch {
-        update.run('[]', 0, r.id); // parse throw → [] / 0, never NULL again
-      }
-    }
-  });
-  tx(rows);
-}
-
 // ── WP4: Section registry (R1 §2) — plan_sections helpers ───────────────────
 // The durable side of addressability. HTML defines which sections exist and
 // their prose; this table records anchor identity, lifecycle and lineage only.
@@ -3598,161 +3426,156 @@ export function getPlanSections(planId: string, opts?: { includeArchived?: boole
   return queryAll(sql, [planId]).map(rowToPlanSection);
 }
 
-/** Look up one section by its (plan, anchor) identity — archived or not. */
-export function getPlanSectionByAnchor(planId: string, anchor: string): PlanSectionRow | null {
-  const row = queryOne(`SELECT * FROM plan_sections WHERE plan_id = ? AND anchor = ?`, [planId, anchor]);
-  return row ? rowToPlanSection(row) : null;
+// ── WP-P8F — readiness-gated retirement of the legacy plan-provenance tables ──
+//
+// A2 terminal DDL exception (the single deliberate `DROP TABLE` in initDatabase).
+// The bespoke HTML-plan provenance/snapshot spine — `plan_sections`,
+// `plan_events`, `plan_section_touches`, `plan_section_changes`,
+// `plan_snapshots`, `plan_snapshot_blobs` — is superseded by Git objects + SC
+// stamping. Its writers are gone (P8B–P8E); the remaining readers on
+// `plan_events`/`plan_sections`/`plan_section_changes` are consumed by the
+// activity projection + done-detection and are retired by WP-P8G, so these six
+// tables stay INERT BUT PRESENT until the global readiness check first holds.
+//
+// Readiness (2026-08-04 ruling — WP-P8A cut, no importer/parity markers exist):
+//   • zero active `format='html'` plan rows DB-wide, decomposed as
+//     (A) none in an AVAILABLE (or orphan) workspace, and
+//     (B) none in an UNAVAILABLE workspace ("no unavailable workspace with
+//         pending legacy rows").
+// (A)∧(B) is exactly "zero active html rows DB-wide"; keeping them separate lets
+// clause B block conservatively when a workspace with pending legacy rows cannot
+// be reached. When both hold, the six tables are DROPped ONCE under the
+// `applied_migrations` marker and never re-dropped; until then the check re-runs
+// every launch (repeatable, idempotent).
+
+/** The six retired tables, dropped as a set. Order is child→parent-safe under
+ *  `DROP TABLE IF EXISTS` (SQLite ignores FK ordering without PRAGMA enforcement). */
+export const RETIRED_PLAN_PROVENANCE_TABLES = [
+  'plan_snapshots',
+  'plan_snapshot_blobs',
+  'plan_section_touches',
+  'plan_section_changes',
+  'plan_events',
+  'plan_sections',
+] as const;
+
+/** Marker key recorded in `applied_migrations` once the drop has run. */
+export const LEGACY_PLAN_PROVENANCE_DROP_MARKER = 'p8f_drop_legacy_plan_provenance';
+
+/** Availability probe — injectable so tests force (un)availability without
+ *  touching the filesystem. Default: a workspace is available when its path
+ *  resolves on disk (a probe throw / missing path → unavailable, conservative). */
+export type WorkspaceAvailabilityProbe = (ws: { id: string; path: string; pathType: string }) => boolean;
+
+function defaultWorkspaceAvailable(ws: { path: string }): boolean {
+  try { return !!ws.path && fs.existsSync(ws.path); } catch { return false; }
 }
 
-/** Insert a section row (server-minted anchor). Idempotent on (plan_id, anchor)
- *  via INSERT OR IGNORE — a re-registered anchor never duplicates. Returns the
- *  row id (existing or new). */
-export function insertPlanSection(input: {
-  planId: string;
-  anchor: string;
-  parentSectionId?: string | null;
-  createdAt?: string;
-}): string {
-  const existing = getPlanSectionByAnchor(input.planId, input.anchor);
-  if (existing) {
-    // A previously-archived section that reappears un-archives (its prose came back).
-    if (existing.archivedAt) {
-      run(`UPDATE plan_sections SET archived_at = NULL WHERE id = ?`, [existing.id]);
-    }
-    return existing.id;
-  }
-  const id = uuidv4();
-  run(
-    `INSERT INTO plan_sections (id, plan_id, anchor, parent_section_id, created_at, archived_at)
-     VALUES (?, ?, ?, ?, ?, NULL)`,
-    [id, input.planId, input.anchor, input.parentSectionId ?? null, input.createdAt ?? new Date().toISOString()],
-  );
-  return id;
-}
-
-/** Soft-delete: set archived_at for an anchor that disappeared from the reparsed
- *  HTML (F-E). NEVER DELETE the row; its plan_events stay resolvable. No-op if
- *  the anchor is unknown or already archived. */
-export function archivePlanSection(planId: string, anchor: string, archivedAt?: string): void {
-  run(
-    `UPDATE plan_sections SET archived_at = ? WHERE plan_id = ? AND anchor = ? AND archived_at IS NULL`,
-    [archivedAt ?? new Date().toISOString(), planId, anchor],
-  );
-}
-
-// ── WP4: Snapshot history (amendments §F-B) — content-addressed blob store ────
-
-/** sha256 hex of the full HTML — the content-addressing key. */
-export function hashPlanHtml(html: string): string {
-  return crypto.createHash('sha256').update(html, 'utf8').digest('hex');
-}
-
-/**
- * Record a reparse snapshot (F-B). Consecutive-dedup: if the plan's latest
- * snapshot already carries this hash, nothing is written (a no-op reparse never
- * spams identical history rows). Otherwise the blob INSERT-OR-IGNORE (stores the
- * HTML once globally, even across A→B→A) and the history reference row are
- * written in ONE transaction, so a crash leaves neither an orphan blob nor a
- * dangling reference. Returns the new snapshot row id, or null on dedup skip.
- */
-export function recordPlanSnapshot(planId: string, html: string, createdAt?: string): string | null {
-  const hash = hashPlanHtml(html);
-  const latest = queryOne(
-    `SELECT content_hash FROM plan_snapshots WHERE plan_id = ? ORDER BY created_at DESC LIMIT 1`,
-    [planId],
-  );
-  if (latest && latest.content_hash === hash) return null; // consecutive-dedup: reparse changed nothing
-  const now = createdAt ?? new Date().toISOString();
-  const id = uuidv4();
-  const tx = db.transaction(() => {
-    run(
-      `INSERT OR IGNORE INTO plan_snapshot_blobs (content_hash, html, byte_size, first_seen_at)
-       VALUES (?, ?, ?, ?)`,
-      [hash, html, Buffer.byteLength(html, 'utf8'), now],
-    );
-    run(
-      `INSERT INTO plan_snapshots (id, plan_id, content_hash, created_at) VALUES (?, ?, ?, ?)`,
-      [id, planId, hash, now],
-    );
-  });
-  tx();
-  return id;
-}
-
-/** Latest successful snapshot HTML for a plan (F-E parse-failure reconstruction:
- *  reparse this blob when the live parse fails and no in-memory last-good exists). */
-export function getLatestPlanSnapshotHtml(planId: string): string | null {
-  const row = queryOne(
-    `SELECT b.html AS html FROM plan_snapshots s
-       JOIN plan_snapshot_blobs b ON b.content_hash = s.content_hash
-      WHERE s.plan_id = ? ORDER BY s.created_at DESC LIMIT 1`,
-    [planId],
-  );
-  return row ? (row.html as string) : null;
-}
-
-/** Observable growth metric (F-B; retention is "none, observable" in v1). Scoped
- *  to one plan's reference rows when planId is given; blob counts/bytes are
- *  global (blobs are shared content-addressed storage). */
-export function getPlanSnapshotStats(planId?: string): {
-  snapshotRows: number; blobRows: number; totalBlobBytes: number;
-} {
-  const snapshotRows = planId
-    ? (queryOne(`SELECT COUNT(*) AS c FROM plan_snapshots WHERE plan_id = ?`, [planId])?.c ?? 0)
-    : (queryOne(`SELECT COUNT(*) AS c FROM plan_snapshots`)?.c ?? 0);
-  const blobRows = queryOne(`SELECT COUNT(*) AS c FROM plan_snapshot_blobs`)?.c ?? 0;
-  const totalBlobBytes = queryOne(`SELECT COALESCE(SUM(byte_size), 0) AS s FROM plan_snapshot_blobs`)?.s ?? 0;
-  return { snapshotRows: Number(snapshotRows), blobRows: Number(blobRows), totalBlobBytes: Number(totalBlobBytes) };
-}
-
-/** Compose row shape written by composePlanEvent (F-A columns). */
-export type InsertPlanEventInput = {
-  planId: string;
-  agentId: string;
-  eventType: string;
-  dispatchedSectionAnchor?: string | null;
-  observedSectionAnchor?: string | null;
-  observedVia?: string | null;
-  attributionConfidence?: string | null;
-  observedCandidatesJson?: string | null;
-  readIntentAnchor?: string | null;
-  editTargetAnchor?: string | null;
-  sectionMismatch?: boolean;
-  mismatchReason?: string | null;
-  trustedEnvelopeJson: string;
-  claimedPayloadJson?: string | null;
-  claimedSectionAnchor?: string | null;
-  // GT-A WP-A1 (§2 A1.2) — effect-set columns. `writtenSectionAnchorsJson` = JSON
-  // array of anchors the turn actually wrote (uniq(changed); `[]`/omitted → NULL
-  // is never written by composePlanEvent, it always passes '[]'). `changeCount` =
-  // RAW fs-diff change cardinality (D-5).
-  writtenSectionAnchorsJson?: string | null;
-  changeCount?: number;
-  // Fix-4 — serialized RepoActivityEvidenceV1 (byte-capped at write time). NULL =
-  // not captured (deps absent / rollup failed / no plan context). Never blocks the row.
-  repoActivityJson?: string | null;
-  createdAt?: string;
+export type LegacyProvenanceDropResult = {
+  dropped: boolean;
+  alreadyDropped: boolean;
+  ready: boolean;
+  reason: 'dropped' | 'already-dropped' | 'active-html-rows' | 'unavailable-workspace-pending';
+  /** Active html rows attributed to available/orphan workspaces (clause A). */
+  htmlRowsAvailable: number;
+  /** Active html rows attributed to unavailable workspaces (clause B). */
+  htmlRowsUnavailable: number;
 };
 
-export function insertPlanEvent(input: InsertPlanEventInput): string {
-  const id = uuidv4();
-  run(
-    `INSERT INTO plan_events
-       (id, plan_id, agent_id, event_type, created_at,
-        dispatched_section_anchor, observed_section_anchor, observed_via,
-        attribution_confidence, observed_candidates_json, read_intent_anchor,
-        edit_target_anchor, section_mismatch, mismatch_reason,
-        trusted_envelope_json, claimed_payload_json, claimed_section_anchor,
-        written_section_anchors_json, change_count, repo_activity_json)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [id, input.planId, input.agentId, input.eventType, input.createdAt ?? new Date().toISOString(),
-     input.dispatchedSectionAnchor ?? null, input.observedSectionAnchor ?? null, input.observedVia ?? null,
-     input.attributionConfidence ?? null, input.observedCandidatesJson ?? null, input.readIntentAnchor ?? null,
-     input.editTargetAnchor ?? null, input.sectionMismatch ? 1 : 0, input.mismatchReason ?? null,
-     input.trustedEnvelopeJson, input.claimedPayloadJson ?? null, input.claimedSectionAnchor ?? null,
-     input.writtenSectionAnchorsJson ?? null, input.changeCount ?? 0, input.repoActivityJson ?? null],
-  );
-  return id;
+/** The marker store for repeatable, run-once migrations. Additive + idempotent. */
+function ensureAppliedMigrationsTable(database: Database.Database): void {
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS applied_migrations (
+      name       TEXT PRIMARY KEY,
+      applied_at TEXT NOT NULL
+    )
+  `);
+}
+
+/** WP-P8F migration. Evaluates the global readiness check and, only when it
+ *  holds, DROPs the six retired tables ONCE under the migration marker. Safe to
+ *  call every launch: marker-guarded (never re-drops) and repeatable (a not-ready
+ *  launch is a no-op that re-checks next time). Never assumes the tables exist —
+ *  `DROP TABLE IF EXISTS` tolerates a prior drop. */
+export function dropRetiredPlanProvenanceTablesIfReady(
+  database: Database.Database = db,
+  isAvailable: WorkspaceAvailabilityProbe = defaultWorkspaceAvailable,
+): LegacyProvenanceDropResult {
+  ensureAppliedMigrationsTable(database);
+
+  // Marker present → the drop already ran once; terminal, never re-run.
+  const marker = database
+    .prepare(`SELECT 1 AS present FROM applied_migrations WHERE name = ?`)
+    .get(LEGACY_PLAN_PROVENANCE_DROP_MARKER);
+  if (marker) {
+    return {
+      dropped: false, alreadyDropped: true, ready: false,
+      reason: 'already-dropped', htmlRowsAvailable: 0, htmlRowsUnavailable: 0,
+    };
+  }
+
+  // Per-workspace active (not soft-deleted) legacy html plan counts.
+  const counts = database
+    .prepare(
+      `SELECT workspace_id AS workspaceId, COUNT(*) AS c
+         FROM plans
+        WHERE format = 'html' AND deleted_at IS NULL
+        GROUP BY workspace_id`,
+    )
+    .all() as Array<{ workspaceId: string; c: number }>;
+
+  const workspaces = database
+    .prepare(`SELECT id, path, path_type AS pathType FROM workspaces`)
+    .all() as Array<{ id: string; path: string; pathType: string }>;
+  const wsById = new Map(workspaces.map((w) => [w.id, w]));
+
+  let htmlRowsAvailable = 0;   // clause A — available (or orphan) workspaces
+  let htmlRowsUnavailable = 0; // clause B — unavailable workspaces
+  for (const row of counts) {
+    const c = Number(row.c) || 0;
+    if (c === 0) continue;
+    const ws = wsById.get(row.workspaceId);
+    // Orphan rows (no workspace row) count as available/pending — they must not
+    // be silently ignored; they block via clause A until cleaned up.
+    let available = true;
+    if (ws) {
+      try { available = isAvailable({ id: ws.id, path: ws.path, pathType: ws.pathType }); }
+      catch { available = false; } // probe throw → treat as unavailable (block)
+    }
+    if (available) htmlRowsAvailable += c; else htmlRowsUnavailable += c;
+  }
+
+  // Clause A — active html rows in an available/orphan workspace block the drop.
+  if (htmlRowsAvailable > 0) {
+    return {
+      dropped: false, alreadyDropped: false, ready: false,
+      reason: 'active-html-rows', htmlRowsAvailable, htmlRowsUnavailable,
+    };
+  }
+  // Clause B — an unavailable workspace with pending legacy rows blocks the drop.
+  if (htmlRowsUnavailable > 0) {
+    return {
+      dropped: false, alreadyDropped: false, ready: false,
+      reason: 'unavailable-workspace-pending', htmlRowsAvailable, htmlRowsUnavailable,
+    };
+  }
+
+  // Ready → DROP the six tables + record the marker atomically. Once committed,
+  // the marker short-circuits every future launch.
+  const drop = database.transaction(() => {
+    for (const table of RETIRED_PLAN_PROVENANCE_TABLES) {
+      database.exec(`DROP TABLE IF EXISTS ${table}`);
+    }
+    database
+      .prepare(`INSERT OR IGNORE INTO applied_migrations (name, applied_at) VALUES (?, ?)`)
+      .run(LEGACY_PLAN_PROVENANCE_DROP_MARKER, new Date().toISOString());
+  });
+  drop();
+
+  return {
+    dropped: true, alreadyDropped: false, ready: true,
+    reason: 'dropped', htmlRowsAvailable: 0, htmlRowsUnavailable: 0,
+  };
 }
 
 // Workspace operations

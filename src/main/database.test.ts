@@ -139,7 +139,6 @@ type DbModule = {
   getLiveRailAgentForPlan(planId: string, exemptAgentIds?: string[]): DbAgent | null;
   getActiveRailWriterCount(planId: string): number;
   getTurnSectionChanges(planId: string, sinceIso: string, untilIso: string): Array<{ sectionAnchor: string }>;
-  recordPlanSectionChange(input: { planId: string; sectionAnchor: string; blockAnchor?: string | null; contentHash: string; changedAt?: string }): string;
 };
 let dbm: DbModule;
 
@@ -425,16 +424,6 @@ test('getActiveRailWriterCount — counts only working|launching', () => {
   const c = makeAgentRow({ planId: p }); dbm.updateAgentStatus(c.id, 'idle');   // not counted
   const d = makeAgentRow({ planId: p }); dbm.updateAgentStatus(d.id, 'done');   // not counted
   assert.equal(dbm.getActiveRailWriterCount(p), 2, 'idle + terminal are excluded');
-});
-
-test('getTurnSectionChanges — omits a sec_exectr change row (attribution safety)', () => {
-  const p = 'plan-chg';
-  const t0 = '2026-07-05T00:00:00.000Z', t1 = '2026-07-05T23:59:59.000Z';
-  dbm.recordPlanSectionChange({ planId: p, sectionAnchor: 'sec_summry', contentHash: 'h1', changedAt: '2026-07-05T01:00:00.000Z' });
-  dbm.recordPlanSectionChange({ planId: p, sectionAnchor: 'sec_exectr', contentHash: 'h2', changedAt: '2026-07-05T02:00:00.000Z' });
-  const anchors = dbm.getTurnSectionChanges(p, t0, t1).map((r) => r.sectionAnchor);
-  assert.ok(anchors.includes('sec_summry'), 'a genuine agent change is present');
-  assert.ok(!anchors.includes('sec_exectr'), 'a system trail write is never counted as an agent effect');
 });
 
 // ── Runner ─────────────────────────────────────────────────────────────────────
