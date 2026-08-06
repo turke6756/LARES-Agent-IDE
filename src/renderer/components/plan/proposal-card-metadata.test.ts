@@ -27,6 +27,7 @@ Body paragraph.
       title: 'Heading wins',
       description: 'A short human-readable summary.',
       author: 'Edward',
+      artifactId: null,
       promotedTo: null,
       promotedAt: null,
       dateLabel: 'Aug 1, 2026',
@@ -47,9 +48,15 @@ History remains discoverable.
 
     expect(card).toMatchObject({
       author: 'Planning supervisor',
+      artifactId: 'prop_0e1425af',
       promotedTo: '2026-08-05-split-the-proposal-lifecycle-an-authoring-skill--0e1425af',
       promotedAt: '2026-08-05',
     });
+  });
+
+  it('returns null when artifact_id is absent', () => {
+    const card = deriveProposalCardMetadata(document('2026-08-05-unstamped.md'), '# Unstamped');
+    expect(card.artifactId).toBeNull();
   });
 
   it('accepts creator as author and falls back to mtime for an undated filename', () => {

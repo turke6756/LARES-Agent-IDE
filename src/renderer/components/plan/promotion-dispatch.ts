@@ -1,15 +1,20 @@
 import type { Agent, LaunchAgentInput, Workspace } from '../../../shared/types';
+import { PROPOSAL_PROMOTION_PROMPT_TEMPLATE } from '../../../shared/constants';
 
 export const NEW_SUPERVISOR_ID = '__new_supervisor__';
 export const TERMINAL_AGENT_STATUSES = new Set(['done', 'crashed']);
 
-export function buildProposalToPlanInstruction(proposalFilePath: string): string {
-  return [
-    'Promote this proposal into a plan.',
-    `Proposal path: ${proposalFilePath}`,
-    'Run the `proposal-to-plan` skill on it and carry it through capture/scope/promote as applicable under that skill.',
-    'You are the responsible supervisor for the resulting plan folder.',
-  ].join('\n');
+export function isValidProposalArtifactId(value: string | null | undefined): boolean {
+  return /^prop_[0-9a-f]{8}$/.test((value ?? '').trim());
+}
+
+export function buildProposalToPlanInstruction(
+  proposalFilePath: string,
+  proposalArtifactId: string,
+): string {
+  return PROPOSAL_PROMOTION_PROMPT_TEMPLATE
+    .replace('{{proposalPath}}', proposalFilePath)
+    .replace('{{artifactId}}', proposalArtifactId.trim());
 }
 
 export interface PromotionDispatchDeps {
@@ -46,11 +51,16 @@ export async function reviveSupervisorViaApi(agentId: string, instruction: strin
 export async function dispatchProposalPromotion(input: {
   workspace: Workspace;
   proposalFilePath: string;
+  proposalArtifactId: string;
   selectedAgent: Agent | null;
   newSupervisorTitle: string;
   deps?: Partial<PromotionDispatchDeps>;
 }): Promise<PromotionDispatchResult> {
-  const instruction = buildProposalToPlanInstruction(input.proposalFilePath);
+  if (!isValidProposalArtifactId(input.proposalArtifactId)) {
+    throw new Error('Cannot promote: proposal is missing a valid artifact_id (expected prop_########).');
+  }
+
+  const instruction = buildProposalToPlanInstruction(input.proposalFilePath, input.proposalArtifactId);
   const deps: PromotionDispatchDeps = {
     launch: (launchInput) => window.api.agents.launch(launchInput),
     sendInput: (agentId, text) => window.api.agents.sendInput(agentId, text),

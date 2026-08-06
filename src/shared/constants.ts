@@ -25,6 +25,29 @@ export const DEFAULT_ORCHESTRATION_PROVIDER_SETTINGS: OrchestrationProviderSetti
 
 export const DEFAULT_COMMAND = 'claude --dangerously-skip-permissions';
 export const DEFAULT_COMMAND_WSL = 'ccode --dangerously-skip-permissions';
+
+// Injected by the Promote-to-plan gesture (renderer-consumed from the bundle; NOT a
+// provisioned scaffold — no scaffold-version bump for THIS constant). Pointer-not-payload:
+// binds the proposal and points at the on-disk method library.
+export const PROPOSAL_PROMOTION_PROMPT_TEMPLATE = [
+  'Promote this proposal into a plan. This message is the human promote gesture —',
+  'you are authorized to proceed through the lifecycle without asking permission between phases.',
+  '',
+  'Proposal path: {{proposalPath}}',
+  'Proposal artifact_id: {{artifactId}}',
+  '',
+  'Load the promotion method from the installed `proposal-to-plan` skill (follow its references)',
+  'and carry this proposal through, in order: scope -> promote -> deliberate -> integrate -> package.',
+  'Do NOT run capture — authoring is complete; this proposal already exists.',
+  '',
+  'Do not seek human permission between phases. When an authorized asynchronous run is pending',
+  '(e.g. a GroupThink deliberation), wait for or resume from its returned event, then continue;',
+  'do not poll, and do not package before all active outputs are folded in. The method library',
+  'remains authoritative for intent-rung and packaging gates. The one mandated stop is AFTER',
+  'package, where you present the plain-language human overview and await the explicit',
+  'implementation trigger. You are the responsible supervisor for the resulting plan folder.',
+].join('\n');
+
 export const TMUX_SESSION_PREFIX = 'cad__';
 export const STATUS_POLL_INTERVAL_MS = 1500;
 export const WORKING_THRESHOLD_MS = 8_000;

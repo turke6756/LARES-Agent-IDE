@@ -8,6 +8,12 @@ import PlansPane from './PlansPane';
 vi.mock('../fileviewer/MarkdownRenderer', () => ({
   default: ({ content }: { content: string }) => React.createElement('article', { 'data-testid': 'shared-markdown-reader' }, content),
 }));
+vi.mock('./PromoteToPlanPanel', () => ({
+  default: ({ proposalArtifactId }: { proposalArtifactId?: string | null }) => React.createElement('div', {
+    'data-testid': 'promote-plan-panel',
+    'data-proposal-artifact-id': proposalArtifactId ?? '',
+  }),
+}));
 
 (globalThis as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -67,7 +73,7 @@ beforeEach(() => {
         name: `${docId}.md`,
         content: docId === 'promoted'
           ? `---\nartifact_id: prop_0e1425af\nauthor: Planning supervisor\npromoted_to: 2026-08-05-split-the-proposal-lifecycle-an-authoring-skill--0e1425af\npromoted_at: 2026-08-05\n---\n# Promoted proposal\n\nPromoted history description.`
-          : `${docId === 'new' ? '---\nauthor: Edward\n---\n' : ''}# ${docId === 'new' ? 'Newest proposal' : 'Older proposal'}\n\nDescription for ${docId}.`,
+          : `${docId === 'new' ? '---\nartifact_id: prop_1234abcd\nauthor: Edward\n---\n' : ''}# ${docId === 'new' ? 'Newest proposal' : 'Older proposal'}\n\nDescription for ${docId}.`,
         truncated: false,
         sizeBytes: 10,
       })),
@@ -169,6 +175,15 @@ describe('ProposalCardGallery', () => {
     expect(useDashboardStore.getState().plansOpen).toBe(false);
     expect(container!.querySelector('[data-testid="dashboard-view"]')).not.toBeNull();
     expect(document.querySelector('[data-testid="proposal-expanded-reader"]')).toBeNull();
+  });
+
+  it('threads the selected card artifact id into the promotion panel', async () => {
+    await render(<PlansPane />);
+    click('[data-testid="proposal-card"]');
+    click('[data-testid="proposal-promote"]');
+
+    expect(container!.querySelector('[data-testid="promote-plan-panel"]')?.getAttribute('data-proposal-artifact-id'))
+      .toBe('prop_1234abcd');
   });
 
   it('opens the expanded proposal in the normal file-viewer navigation state', async () => {
