@@ -528,13 +528,81 @@ function selectionTopologyDigest(
   );
 }
 
+const DEFAULT_MESSAGE_MAX_LENGTH = 72;
+
+function sanitizeMessageMetadata(value: string): string {
+  return value
+    .normalize('NFKC')
+    .replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function uniqueSorted(values: readonly string[]): string[] {
+  return [...values]
+    .sort((left, right) => left < right ? -1 : left > right ? 1 : 0)
+    .filter((value, index, sorted) => index === 0 || value !== sorted[index - 1]);
+}
+
+function boundMessageLength(message: string): string {
+  const characters = Array.from(message);
+  if (characters.length <= DEFAULT_MESSAGE_MAX_LENGTH) return message;
+  return `${characters.slice(0, DEFAULT_MESSAGE_MAX_LENGTH - 1).join('').trimEnd()}…`;
+}
+
+/** Derive a stable commit subject from the immutable package/turn snapshot.
+ * Metadata is display-only: it is sanitized, sorted, deduplicated, and bounded;
+ * repository content is never read. */
+export function deriveDefaultMessageBody(
+  request: SaveCardPreviewRequest,
+  candidate: CommitCandidate | SelectionPreview,
+  context: CandidateBuildContext,
+): string {
+  const selectedComponentIds = new Set(request.selectedComponentIds);
+  const requestedFinalizationIds = new Set(request.finalizationIds);
+  const selectedComponents = context.components.filter((component) =>
+    selectedComponentIds.has(component.componentId),
+  );
+  const requestedFinalizations = context.finalizations.filter((finalization) =>
+    requestedFinalizationIds.has(finalization.id),
+  );
+
+  const packageIds = uniqueSorted([
+    ...requestedFinalizations.map((finalization) => finalization.packageId),
+    ...(isCommitCandidate(candidate) ? candidate.finalizations.map((ref) => ref.packageId) : []),
+  ].map(sanitizeMessageMetadata).filter(Boolean));
+  const turnIds = uniqueSorted([
+    ...selectedComponents.flatMap((component) =>
+      component.associations.flatMap((association) => association.contributingTurnIds),
+    ),
+    ...requestedFinalizations.flatMap((finalization) =>
+      finalization.checkpointTurnId ? [finalization.checkpointTurnId] : [],
+    ),
+  ]);
+
+  let message: string;
+  if (packageIds.length === 1) {
+    message = `Save ${packageIds[0]}`;
+  } else if (packageIds.length > 1) {
+    message = `Save packages ${packageIds.join(', ')}`;
+  } else if (turnIds.length > 0) {
+    message = `Save work from ${turnIds.length} turn${turnIds.length === 1 ? '' : 's'}`;
+  } else {
+    const memberCount = candidate.members.length;
+    message = `Save ${memberCount} file${memberCount === 1 ? '' : 's'}`;
+  }
+  if (packageIds.length > 0 && turnIds.length > 0) {
+    message += ` (${turnIds.length} turn${turnIds.length === 1 ? '' : 's'})`;
+  }
+  return boundMessageLength(message);
+}
+
 function toPreviewResponse(
   request: SaveCardPreviewRequest,
   candidate: CommitCandidate | SelectionPreview,
   context: CandidateBuildContext,
 ): SaveCardPreviewResponse {
-  const memberCount = candidate.members.length;
-  const defaultMessageBody = `Save ${memberCount} file${memberCount === 1 ? '' : 's'}`;
+  const defaultMessageBody = deriveDefaultMessageBody(request, candidate, context);
   const requestedIds = new Set(request.finalizationIds);
   const driftResult = request.finalizationIds.length > 0
     ? resolvePinnedSelectionDrift({

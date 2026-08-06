@@ -337,8 +337,11 @@ export default function CandidatePreview({
 
       {/* Editable commit-message body. */}
       <label className="sc-preview-msg-label" htmlFor="candidate-preview-message">
-        Commit message
+        Commit message (optional override)
       </label>
+      <div className="sc-save-note" data-testid="candidate-preview-message-help">
+        Generated from package details. You can edit it, but typing a message is not required to save.
+      </div>
       <textarea
         id="candidate-preview-message"
         className="sc-preview-msg"

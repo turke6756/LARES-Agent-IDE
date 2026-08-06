@@ -221,6 +221,7 @@ test('unfinalized selection yields a previewable, never-committable SelectionPre
   });
   // Server-derived read-only trailers from the immutable snapshot: turns + plan.
   assert.deepEqual(response.laresTrailers, ['Lares-Turns: 2', 'Lares-Plan: plan-A']);
+  assert.equal(response.defaultMessageBody, 'Save work from 2 turns');
 });
 
 test('finalization-backed, verified selection yields an eligible CommitCandidate + finalization trailer', async () => {
@@ -248,9 +249,55 @@ test('finalization-backed, verified selection yields an eligible CommitCandidate
   assert.deepEqual(response.laresTrailers, [
     'Lares-Turns: 2', 'Lares-Plan: plan-A', 'Lares-Finalization: pkg-1@3',
   ]);
+  assert.equal(response.defaultMessageBody, 'Save pkg-1 (2 turns)');
   assert.equal(response.requiresOverlapAck, false);
   assert.deepEqual(response.unacknowledgedUnattributedEntryIds, []);
   assert.equal(response.refusal, null);
+});
+
+test('default message falls back deterministically when package and turn metadata are missing', async () => {
+  const ipc = new FakeIpc();
+  const context = baseContext({
+    components: [component('c1', ['e1'], { associations: [] })],
+  });
+  registerSaveCardPreviewIpc(ipc, () => routesFor(context));
+  const request = {
+    workspaceId: 'ws-1',
+    selectedComponentIds: ['c1'],
+    selectedUnattributedEntryIds: [],
+    finalizationIds: [],
+  };
+
+  const first = await ipc.invoke(SAVECARD_PREVIEW_CHANNEL, request) as SaveCardPreviewResponse;
+  const second = await ipc.invoke(SAVECARD_PREVIEW_CHANNEL, request) as SaveCardPreviewResponse;
+  assert.equal(first.defaultMessageBody, 'Save 1 file');
+  assert.equal(second.defaultMessageBody, first.defaultMessageBody);
+});
+
+test('default message sanitizes metadata, is length-bounded, and is deterministic', async () => {
+  const ipc = new FakeIpc();
+  const unsafePackageId = `WP-10\nInjected\u0000${'x'.repeat(100)}`;
+  const context = baseContext({
+    finalizations: [finalization({ packageId: unsafePackageId })],
+    currentCommitReps: new Map<string, CommitRepresentation>([
+      ['e1', { expectedState: 'present', rawBlobOid: 'raw-e1', commitBlobOid: 'commit-e1', commitMode: '100644' }],
+    ]),
+  });
+  registerSaveCardPreviewIpc(ipc, () => routesFor(context));
+  const request = {
+    workspaceId: 'ws-1',
+    selectedComponentIds: ['c1'],
+    selectedUnattributedEntryIds: [],
+    finalizationIds: ['fin-1'],
+  };
+
+  const first = await ipc.invoke(SAVECARD_PREVIEW_CHANNEL, request) as SaveCardPreviewResponse;
+  const second = await ipc.invoke(SAVECARD_PREVIEW_CHANNEL, request) as SaveCardPreviewResponse;
+  assert.equal(first.defaultMessageBody, second.defaultMessageBody);
+  assert.equal(Array.from(first.defaultMessageBody).length, 72);
+  assert.match(first.defaultMessageBody, /^Save WP-10 Injected x+/);
+  assert.ok(first.defaultMessageBody.endsWith('…'));
+  assert.doesNotMatch(first.defaultMessageBody, /[\u0000-\u001f\u007f-\u009f]/);
 });
 
 test('overlap component + selected unattributed entry surface the acknowledgement gates', async () => {
