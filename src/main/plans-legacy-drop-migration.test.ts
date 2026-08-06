@@ -68,7 +68,9 @@ class FakeBetterSqlite {
     this.db = store;
   }
   pragma(_s: string): unknown { return undefined; }
-  close(): void { FakeBetterSqlite.stores.delete(this.dbPath); }
+  // Closing a real SQLite handle does not delete its on-disk database. Keep the
+  // keyed sql.js store so a close + initDatabase() models the next process boot.
+  close(): void { /* persisted store intentionally retained */ }
   exec(sql: string): this { this.db.exec(sql); return this; }
   prepare(sql: string) {
     const inner = this.db;
@@ -121,6 +123,7 @@ type Probe = (ws: { id: string; path: string; pathType: string }) => boolean;
 type DbModule = {
   initDatabase(): void;
   closeDatabaseForTests(): void;
+  getDb(): FakeHandle;
   dropRetiredPlanProvenanceTablesIfReady(database: unknown, isAvailable?: Probe): DropResult;
   RETIRED_PLAN_PROVENANCE_TABLES: readonly string[];
   LEGACY_PLAN_PROVENANCE_DROP_MARKER: string;
@@ -184,6 +187,23 @@ const drop = (h: FakeHandle, probe?: Probe): DropResult =>
 test('exported constants match the six retired tables + marker key', () => {
   assert.deepEqual([...dbm.RETIRED_PLAN_PROVENANCE_TABLES].sort(), [...SIX].sort());
   assert.equal(dbm.LEGACY_PLAN_PROVENANCE_DROP_MARKER, 'p8f_drop_legacy_plan_provenance');
+});
+
+test('boot 2 does not recreate the six retired tables after the marker is set', () => {
+  const firstBoot = dbm.getDb();
+  assert.deepEqual(presentTables(firstBoot), [], 'boot 1 retired all six tables');
+  assert.ok(markerSet(firstBoot), 'boot 1 recorded the retirement marker');
+
+  dbm.closeDatabaseForTests();
+  dbm.initDatabase();
+
+  const secondBoot = dbm.getDb();
+  assert.ok(markerSet(secondBoot), 'boot 2 retained the retirement marker');
+  assert.deepEqual(
+    presentTables(secondBoot),
+    [],
+    'boot 2 skipped every retired table and index CREATE instead of resurrecting them',
+  );
 });
 
 test('ready fixture — zero html rows → tables dropped exactly once, marker set, second run no-ops', () => {

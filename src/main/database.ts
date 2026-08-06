@@ -1012,6 +1012,16 @@ export function initDatabase(): void {
   // (legacy rows stay NULL = "never reclaimed"); idempotent PRAGMA guard.
   migrateTerminalHistoryReclaimedColumn(db);
 
+  // A retirement marker is terminal: after WP-P8F drops the legacy provenance
+  // tables, later boots must skip their entire CREATE/index block.
+  ensureAppliedMigrationsTable(db);
+  const legacyPlanProvenanceRetired = hasAppliedMigration(
+    db,
+    LEGACY_PLAN_PROVENANCE_DROP_MARKER,
+  );
+
+  if (!legacyPlanProvenanceRetired) {
+
   // WP2: provenance spine — all CREATE TABLE IF NOT EXISTS (idempotent regardless
   // of landing order). Four tables: plan_sections (anchor registry, R1 §2),
   // plan_events (reconciled schema, amendments §F-A — canonical dispatched-target
@@ -1151,6 +1161,7 @@ export function initDatabase(): void {
     )
   `);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_plan_snapshots_plan_time ON plan_snapshots (plan_id, created_at)`);
+  }
 
   // Context-brick Phase 1 — one-time, best-effort lineage backfill from the
   // append-only events trail. Per-agent guarded (skips agents already carrying
@@ -3319,6 +3330,12 @@ function ensureAppliedMigrationsTable(database: Database.Database): void {
   `);
 }
 
+function hasAppliedMigration(database: Database.Database, name: string): boolean {
+  return !!database
+    .prepare(`SELECT 1 AS present FROM applied_migrations WHERE name = ?`)
+    .get(name);
+}
+
 /** WP-P8F migration. Evaluates the global readiness check and, only when it
  *  holds, DROPs the six retired tables ONCE under the migration marker. Safe to
  *  call every launch: marker-guarded (never re-drops) and repeatable (a not-ready
@@ -3331,10 +3348,7 @@ export function dropRetiredPlanProvenanceTablesIfReady(
   ensureAppliedMigrationsTable(database);
 
   // Marker present → the drop already ran once; terminal, never re-run.
-  const marker = database
-    .prepare(`SELECT 1 AS present FROM applied_migrations WHERE name = ?`)
-    .get(LEGACY_PLAN_PROVENANCE_DROP_MARKER);
-  if (marker) {
+  if (hasAppliedMigration(database, LEGACY_PLAN_PROVENANCE_DROP_MARKER)) {
     return {
       dropped: false, alreadyDropped: true, ready: false,
       reason: 'already-dropped', htmlRowsAvailable: 0, htmlRowsUnavailable: 0,
