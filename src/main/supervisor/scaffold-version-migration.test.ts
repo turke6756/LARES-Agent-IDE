@@ -60,11 +60,13 @@ import {
   WORKER_CODEX_AGENTS_MD_V3_HASH,
   proposalToPlanEntries,
   writeProposalEntry,
+  readPlanningSurfaceEntry,
   PROPOSAL_TO_PLAN_SKILL_MD_V1_HASH,
   PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V1_HASH,
   PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V2_HASH,
   PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD_V1_HASH,
   PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD_V2_HASH,
+  PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD_V3_HASH,
   PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD_V1_HASH,
   PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD_V1_HASH,
   PROPOSAL_TO_PLAN_SKILL_MD_V2_HASH,
@@ -102,6 +104,7 @@ import {
   WORKER_CLAUDE_MD_V9,
   WORKER_CLAUDE_MD_V10,
   WRITE_PROPOSAL_SKILL_MD,
+  READ_PLANNING_SURFACE_SKILL_MD,
   WORKER_CODEX_AGENTS_MD_V2,
   WORKER_CODEX_AGENTS_MD_V3,
   PROPOSAL_TO_PLAN_SKILL_MD,
@@ -3820,9 +3823,10 @@ const PROPOSAL_TO_PLAN_VERSIONED_FILES = new Map<string, { version: number; prev
     2: PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V2_HASH,
     3: PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V3_HASH,
   } }],
-  ['references/activities/promote.md', { version: 3, previousHashes: {
+  ['references/activities/promote.md', { version: 4, previousHashes: {
     1: PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD_V1_HASH,
     2: PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD_V2_HASH,
+    3: PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD_V3_HASH,
   } }],
   ['references/activities/package.md', { version: 2, previousHashes: {
     1: PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD_V1_HASH,
@@ -3928,6 +3932,110 @@ test('WP-2-MIG. write-proposal is a managed v1 skill in every native lane', () =
         `${rel} must contain the exact shared skill body`);
       assert.equal(sidecar[rel.replace(/^\.lares\//, '')], 1, `${rel} must be recorded at v1`);
     }
+  } finally {
+    cleanup();
+    rmrf(workDir);
+  }
+});
+
+test('WP-3-CONTENT. read-planning-surface is whole-surface, read-only, epistemically bounded reporting', () => {
+  for (const phrase of [
+    '**never writes**',
+    'never launches agents',
+    'never appends `assigned`',
+    'never refreshes `ARC-META`',
+    'promoted-but-bare-card gap',
+    'terminal-valid',
+    '`ran: unavailable`',
+    'whether to look closer',
+    'Frontmatter authorship is a **self-claim**',
+    '`supporting/` is subordinate',
+    'responsibility.md` §`Determination`',
+    'it never decides that a supervisor may act',
+    'Gallery grouping or collapse',
+    'database projections of work packages or responsibility',
+    'readiness gates',
+    'documentation is deferred to plan_e0001372 after its WP-Z gates',
+  ]) {
+    assert.ok(READ_PLANNING_SURFACE_SKILL_MD.includes(phrase), `missing WP-3 contract phrase: ${phrase}`);
+  }
+  assert.ok(READ_PLANNING_SURFACE_SKILL_MD.includes('| Disk evidence | Report | Safe next action |'));
+  assert.ok(READ_PLANNING_SURFACE_SKILL_MD.includes('may\nrecommend “run `orient` on plan X” without running it'));
+  assert.ok(READ_PLANNING_SURFACE_SKILL_MD.includes('never with\n   `derivePlanSku()`'));
+});
+
+test('WP-3-MIG. read-planning-surface is a managed v1 skill in every native lane', () => {
+  const helperEntry = readPlanningSurfaceEntry('.lares/example/.agents/skills/read-planning-surface');
+  assert.deepEqual(helperEntry['.lares/example/.agents/skills/read-planning-surface/SKILL.md'], {
+    content: READ_PLANNING_SURFACE_SKILL_MD,
+    version: 1,
+  });
+
+  const workDir = mktmp('read-planning-surface-all-lanes');
+  const { supervisor, cleanup } = makeSupervisor();
+  const paths = [
+    '.lares/supervisor/.claude/skills/read-planning-surface/SKILL.md',
+    '.lares/supervisor/.agents/skills/read-planning-surface/SKILL.md',
+    '.lares/workers/claude/.claude/skills/read-planning-surface/SKILL.md',
+    '.lares/workers/codex/.agents/skills/read-planning-surface/SKILL.md',
+    '.lares/researcher/.claude/skills/read-planning-surface/SKILL.md',
+  ];
+  try {
+    supervisor.ensureSupervisorScaffold(workDir, 'windows');
+    supervisor.ensureWorkerScaffold(workDir, 'claude', 'windows');
+    supervisor.ensureWorkerScaffold(workDir, 'codex', 'windows');
+    supervisor.ensureResearcherScaffold(workDir, 'windows');
+
+    const sidecar = readSidecar(workDir);
+    for (const rel of paths) {
+      assert.equal(fs.readFileSync(path.join(workDir, ...rel.split('/')), 'utf8'), READ_PLANNING_SURFACE_SKILL_MD,
+        `${rel} must contain the exact shared skill body`);
+      assert.equal(sidecar[rel.replace(/^\.lares\//, '')], 1, `${rel} must be recorded at v1`);
+    }
+  } finally {
+    cleanup();
+    rmrf(workDir);
+  }
+});
+
+test('WP-3-PROMOTE. v3 hash is pinned and EEXIST uses the reader while retaining the loser rule citation', () => {
+  const v3 = PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD.replace(
+    'Use the read-only\n`read-planning-surface` path against the occupant and read its\n`plan.json.source_proposal.artifact_id`:',
+    'Run `orient` against\nthe occupant and read its `plan.json.source_proposal.artifact_id`:',
+  );
+  assert.equal(sha256Hex(v3), PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD_V3_HASH,
+    'the reconstructed pristine v3 promote body must pin previousHashes[3]');
+  assert.notEqual(sha256Hex(PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD), PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD_V3_HASH);
+  assert.ok(PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD.includes('Use the read-only\n`read-planning-surface` path'));
+  assert.ok(PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD.includes(
+    'responsibility.md` §Determination. If another supervisor is responsible'),
+  'the matching-EEXIST loser rule must still cite the responsibility determination');
+});
+
+test('WP-3-PROMOTE-MIG. pristine promote v3 silently upgrades to v4', () => {
+  const workDir = mktmp('p2p-promote-v3');
+  const { supervisor, cleanup } = makeSupervisor();
+  const rel = '.lares/workers/codex/.agents/skills/proposal-to-plan/references/activities/promote.md';
+  const promotePath = path.join(workDir, ...rel.split('/'));
+  const v3 = PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD.replace(
+    'Use the read-only\n`read-planning-surface` path against the occupant and read its\n`plan.json.source_proposal.artifact_id`:',
+    'Run `orient` against\nthe occupant and read its `plan.json.source_proposal.artifact_id`:',
+  );
+  try {
+    fs.mkdirSync(path.dirname(promotePath), { recursive: true });
+    fs.writeFileSync(promotePath, v3, 'utf8');
+    fs.mkdirSync(path.dirname(sidecarPath(workDir)), { recursive: true });
+    fs.writeFileSync(sidecarPath(workDir), JSON.stringify({
+      'workers/codex/.agents/skills/proposal-to-plan/references/activities/promote.md': 3,
+    }, null, 2) + '\n', 'utf8');
+
+    supervisor.ensureWorkerScaffold(workDir, 'codex', 'windows');
+
+    assert.equal(fs.readFileSync(promotePath, 'utf8'), PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD);
+    assert.equal(readSidecar(workDir)[
+      'workers/codex/.agents/skills/proposal-to-plan/references/activities/promote.md'
+    ], 4);
+    assert.equal(fs.readdirSync(path.dirname(promotePath)).filter((n) => n.startsWith('promote.md.bak.')).length, 0);
   } finally {
     cleanup();
     rmrf(workDir);
