@@ -7,14 +7,10 @@
 // channel — and it does not dispatch. WP-P5A's package editor delegates the package
 // `archive` transition here rather than writing state directly.
 //
-// Mark Ready gates on THREE conditions (Edward ruling 31 — the `ready` state is what a
-// visible ready-badge surfaces and what the human Implement trigger is justified by):
-//   1. the plan is currently `hardening`;
-//   2. at least one non-archived package exists;
-//   3. every *populated* plan tab has a supervisor overview (the empty Packages
-//      placeholder is `populated:false`, so it never forces a spurious overview —
-//      WP-P4A/P4C-editor); and
-//   4. the plan has a valid responsible supervisor.
+// Mark Ready consumes the one shared post-refresh readiness projection. It requires a
+// hardening structured plan, clean work-package/responsibility/overview projections,
+// at least one ready package, a non-empty overview for every populated tab, and a
+// currently valid responsible supervisor.
 // It returns a structured result (never throws on an unmet condition) so the surface
 // can render exactly why a plan is not yet ready.
 
@@ -24,14 +20,12 @@ import {
   confirmPlanDispatchAttempt,
   getActivePlanExecutionRun,
   getAgent,
+  getDb,
   getPlan,
   getPlanWorkPackage,
-  getPlanTabOverview,
   insertPlanDispatchAttempt,
-  listPlanWorkPackages,
   markPlanDispatchAttemptFailed,
   planItemInPlan,
-  planHasValidResponsibleSupervisor,
   reconcilePlanDispatchAttempts,
   transitionPlanWorkPackageState,
   updatePlan,
@@ -49,12 +43,13 @@ import {
   type DispatchDeps,
   type PlanBindingResolution,
 } from '../git-checkpoints/dispatch-context';
-import { buildPlanDocuments } from './plan-documents';
 import {
   implementPlan,
+  refreshAndGetPlanReadiness,
   type ImplementFailure,
   type ImplementPlanDeps,
   type ImplementResult,
+  type PlanReadiness,
 } from './plan-implement';
 
 export const PLAN_RUN_STATE_HARDENING = 'hardening';
@@ -281,7 +276,12 @@ export function archivePackage(
 export type MarkReadyFailure =
   | 'plan-not-found'
   | 'plan-not-hardening'
-  | 'no-active-package'
+  | 'plan-not-structured'
+  | 'plan-refresh-failed'
+  | 'work-package-ingest-not-synced'
+  | 'work-package-conflict'
+  | 'no-ready-package'
+  | 'overview-not-synced'
   | 'tab-overview-missing'
   | 'no-valid-responsible-supervisor';
 
@@ -294,25 +294,8 @@ export interface MarkReadyResult {
 }
 
 export interface MarkReadyDeps {
-  getPlan?: (planId: string) => Plan | null;
-  listPackages?: (planId: string) => PlanWorkPackage[];
-  /** The tabs that carry real content (documents/overview, or populated Packages). */
-  getPopulatedTabs?: (planId: string) => PlanTabKey[];
-  /** True when a non-empty supervisor overview exists for (planId, tab). */
-  hasOverview?: (planId: string, tab: PlanTabKey) => boolean;
-  hasValidResponsibleSupervisor?: (planId: string) => boolean;
-  setRunState?: (planId: string, runState: string) => void;
-}
-
-function defaultPopulatedTabs(planId: string): PlanTabKey[] {
-  const model = buildPlanDocuments(planId);
-  if (!model) return [];
-  return model.tabs.filter((tab) => tab.populated).map((tab) => tab.key);
-}
-
-function defaultHasOverview(planId: string, tab: PlanTabKey): boolean {
-  const overview = getPlanTabOverview(planId, tab);
-  return !!overview && typeof overview.body === 'string' && overview.body.trim() !== '';
+  refreshAndGetReadiness?: (planId: string) => Promise<PlanReadiness>;
+  compareAndSetReady?: (planId: string) => boolean;
 }
 
 /**
@@ -321,48 +304,45 @@ function defaultHasOverview(planId: string, tab: PlanTabKey): boolean {
  * leaves `run_state` untouched. A visible ready-badge (ruling 31) reads the resulting
  * `run_state`; the surface renders `failures` to explain a not-yet-ready plan.
  */
-export function markPlanReady(
+export async function markPlanReady(
   input: { planId: string; actor: string },
   deps: MarkReadyDeps = {},
-): MarkReadyResult {
-  const getPlanFn = deps.getPlan ?? getPlan;
-  const listPackages = deps.listPackages ?? listPlanWorkPackages;
-  const getPopulatedTabs = deps.getPopulatedTabs ?? defaultPopulatedTabs;
-  const hasOverview = deps.hasOverview ?? defaultHasOverview;
-  const hasValidSupervisor =
-    deps.hasValidResponsibleSupervisor ?? planHasValidResponsibleSupervisor;
-  const setRunState =
-    deps.setRunState ?? ((planId, runState) => { updatePlan(planId, { runState }); });
-
-  const failures: MarkReadyFailure[] = [];
-  const tabsMissingOverview: PlanTabKey[] = [];
-
-  const plan = getPlanFn(input.planId);
-  if (!plan) {
-    return { ok: false, runState: null, failures: ['plan-not-found'], tabsMissingOverview };
-  }
-  if (plan.runState !== PLAN_RUN_STATE_HARDENING) {
+): Promise<MarkReadyResult> {
+  const getReadiness = deps.refreshAndGetReadiness ?? refreshAndGetPlanReadiness;
+  const readiness = await getReadiness(input.planId);
+  const failures = [...readiness.failures] as MarkReadyFailure[];
+  if (readiness.runState !== PLAN_RUN_STATE_HARDENING && !failures.includes('plan-not-found')) {
     failures.push('plan-not-hardening');
   }
-  const packages = listPackages(input.planId);
-  if (!packages.some((pkg) => pkg.state !== 'archived')) {
-    failures.push('no-active-package');
-  }
-  for (const tab of getPopulatedTabs(input.planId)) {
-    if (!hasOverview(input.planId, tab)) tabsMissingOverview.push(tab);
-  }
-  if (tabsMissingOverview.length > 0) {
-    failures.push('tab-overview-missing');
-  }
-  if (!hasValidSupervisor(input.planId)) {
-    failures.push('no-valid-responsible-supervisor');
-  }
-
   if (failures.length > 0) {
-    return { ok: false, runState: plan.runState, failures, tabsMissingOverview };
+    return {
+      ok: false,
+      runState: readiness.runState,
+      failures,
+      tabsMissingOverview: readiness.tabsMissingOverview,
+    };
   }
-  setRunState(input.planId, PLAN_RUN_STATE_READY);
-  return { ok: true, runState: PLAN_RUN_STATE_READY, failures: [], tabsMissingOverview };
+  const compareAndSetReady = deps.compareAndSetReady ?? ((planId: string): boolean => {
+    const result = getDb().prepare(
+      `UPDATE plans SET run_state = 'ready', updated_at = datetime('now')
+         WHERE id = ? AND run_state = 'hardening'`,
+    ).run(planId);
+    return result.changes === 1;
+  });
+  if (!compareAndSetReady(input.planId)) {
+    return {
+      ok: false,
+      runState: getPlan(input.planId)?.runState ?? null,
+      failures: ['plan-not-hardening'],
+      tabsMissingOverview: readiness.tabsMissingOverview,
+    };
+  }
+  return {
+    ok: true,
+    runState: PLAN_RUN_STATE_READY,
+    failures: [],
+    tabsMissingOverview: readiness.tabsMissingOverview,
+  };
 }
 
 // ── plan archive / resurrection / re-implement (WP-P5-archive) ─────────────────

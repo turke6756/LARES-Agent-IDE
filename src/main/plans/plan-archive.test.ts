@@ -288,8 +288,14 @@ test('e2e: archive then reimplement mints a NEW run row; the archived run is ret
   // Re-Implement with real DB writes; git/tab/supervisor seams injected (unborn ⇒ no ref).
   const res = await svc.reimplementPlan({ planId, appUserId: 'edward' }, {
     implementDeps: {
-      getPopulatedTabs: () => [],
-      hasValidResponsibleSupervisor: () => true,
+      refreshAndGetReadiness: async () => ({
+        planId, runState: 'ready',
+        packageCounts: { ready: 1, blocked: 0, executing: 0, done: 0, archived: 0 },
+        wpStatus: 'synced', responsibilityStatus: 'valid', overviewStatus: 'synced',
+        supervisorValid: true, tabsMissingOverview: [], packageConflicts: [],
+        wpDiagnostics: [], overviewDiagnostics: [], refreshError: null, failures: [],
+        canMarkReady: false, canImplement: true,
+      }),
       resolveRepoContext: async () => ({ repoRoot: 'C:/w', repositoryKey: 'rk' }),
       probeBaseline: async () => ({ ok: true, kind: 'unborn' }),
     },

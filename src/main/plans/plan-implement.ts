@@ -36,10 +36,12 @@ import * as os from 'os';
 
 import type { Plan, PlanTabKey } from '../../shared/types';
 import {
+  getPlanFolderProjectionState,
   getPlan as dbGetPlan,
   getPlanTabOverview,
   getWorkspace,
   insertPlanExecutionRunActivating,
+  listManagedPlanWorkPackages,
   listPlanWorkPackages,
   planHasValidResponsibleSupervisor,
   type PlanBaselineKind,
@@ -55,6 +57,7 @@ import {
 } from '../git-checkpoints/plan-baseline-refs';
 import { resolveInternalGit } from '../git/git-runtime';
 import { buildPlanDocuments } from './plan-documents';
+import { reconcilePlanFolderProjections } from './plan-folder-reconciler';
 
 export const IMPLEMENT_TRIGGER_SOURCE = 'renderer-user-action';
 
@@ -62,7 +65,11 @@ export type ImplementFailure =
   | 'plan-not-found'
   | 'plan-not-structured'
   | 'plan-not-ready'
+  | 'plan-refresh-failed'
+  | 'work-package-ingest-not-synced'
+  | 'work-package-conflict'
   | 'no-ready-package'
+  | 'overview-not-synced'
   | 'tab-overview-missing'
   | 'no-valid-responsible-supervisor'
   | 'no-app-user'
@@ -111,6 +118,169 @@ export interface ImplementPlanDeps {
   insertRun?: typeof insertPlanExecutionRunActivating;
   newRunId?: () => string;
   now?: () => number;
+  /** Test seam for the one shared post-refresh readiness interpretation. */
+  refreshAndGetReadiness?: typeof refreshAndGetPlanReadiness;
+}
+
+export type PlanReadinessFailure =
+  | 'plan-not-found'
+  | 'plan-not-structured'
+  | 'plan-refresh-failed'
+  | 'work-package-ingest-not-synced'
+  | 'work-package-conflict'
+  | 'no-ready-package'
+  | 'overview-not-synced'
+  | 'tab-overview-missing'
+  | 'no-valid-responsible-supervisor';
+
+export interface PlanReadiness {
+  planId: string;
+  runState: string | null;
+  packageCounts: Record<'ready' | 'blocked' | 'executing' | 'done' | 'archived', number>;
+  wpStatus: 'unpackaged' | 'synced' | 'invalid' | 'conflict' | null;
+  responsibilityStatus: 'valid' | 'absent' | 'invalid' | null;
+  overviewStatus: 'absent' | 'synced' | 'invalid' | 'apply-error' | null;
+  supervisorValid: boolean;
+  tabsMissingOverview: PlanTabKey[];
+  packageConflicts: Array<{ packageId: string; sourceLocalId: string; state: string }>;
+  wpDiagnostics: unknown[];
+  overviewDiagnostics: unknown[];
+  refreshError: string | null;
+  failures: PlanReadinessFailure[];
+  canMarkReady: boolean;
+  canImplement: boolean;
+}
+
+export interface PlanReadinessDeps {
+  getPlan?: (planId: string) => Plan | null;
+  getWorkspace?: typeof getWorkspace;
+  reconcileFolder?: typeof reconcilePlanFolderProjections;
+  getProjectionState?: typeof getPlanFolderProjectionState;
+  listPackages?: (planId: string) => PlanWorkPackage[];
+  listManagedPackages?: typeof listManagedPlanWorkPackages;
+  getPopulatedTabs?: (planId: string) => PlanTabKey[];
+  hasOverview?: (planId: string, tab: PlanTabKey) => boolean;
+  hasValidResponsibleSupervisor?: (planId: string) => boolean;
+}
+
+function parseDiagnosticArray(value: string | undefined): unknown[] {
+  if (!value) return [];
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function emptyPackageCounts(): PlanReadiness['packageCounts'] {
+  return { ready: 0, blocked: 0, executing: 0, done: 0, archived: 0 };
+}
+
+/**
+ * The one readiness interpretation used by both explicit lifecycle actions. It first
+ * forces the canonical WP-E single-folder coordinator, then reads every gate once.
+ * Reconciliation may safely demote stale `ready` approval to `hardening`; this
+ * function never advances lifecycle state by itself.
+ */
+export async function refreshAndGetPlanReadiness(
+  planId: string,
+  deps: PlanReadinessDeps = {},
+): Promise<PlanReadiness> {
+  const getPlan = deps.getPlan ?? dbGetPlan;
+  const getWorkspaceFn = deps.getWorkspace ?? getWorkspace;
+  const reconcileFolder = deps.reconcileFolder ?? reconcilePlanFolderProjections;
+  const getProjection = deps.getProjectionState ?? getPlanFolderProjectionState;
+  const listPackages = deps.listPackages ?? listPlanWorkPackages;
+  const listManaged = deps.listManagedPackages ?? listManagedPlanWorkPackages;
+  const getPopulatedTabs = deps.getPopulatedTabs ?? defaultPopulatedTabs;
+  const hasOverview = deps.hasOverview ?? defaultHasOverview;
+  const hasValidSupervisor =
+    deps.hasValidResponsibleSupervisor ?? planHasValidResponsibleSupervisor;
+
+  let plan = getPlan(planId);
+  let refreshError: string | null = null;
+  if (plan?.format === 'structured') {
+    const workspace = getWorkspaceFn(plan.workspaceId);
+    const planPath = typeof plan.path === 'string' ? plan.path : '';
+    const planFolderRelPath = planPath.replace(/\/plan\.md$/i, '');
+    if (!workspace || !planPath || planFolderRelPath === planPath) {
+      refreshError = !workspace ? 'plan workspace is unavailable' : 'structured plan path has no plan folder';
+    } else {
+      try {
+        const refreshed = await reconcileFolder({
+          workspace,
+          planFolderRelPath,
+          changeKind: 'manual',
+        });
+        if (refreshed.planId !== planId) {
+          refreshError = `plan folder reconciled to ${refreshed.planId}`;
+        }
+      } catch (err) {
+        refreshError = err instanceof Error ? err.message : String(err);
+      }
+    }
+    plan = getPlan(planId);
+  }
+
+  const failures: PlanReadinessFailure[] = [];
+  const isStructured = plan?.format === 'structured';
+  const packageCounts = emptyPackageCounts();
+  const projection = isStructured ? getProjection(planId) : null;
+  const packages = isStructured ? listPackages(planId) : [];
+  for (const pkg of packages) {
+    if (pkg.state in packageCounts) {
+      packageCounts[pkg.state as keyof typeof packageCounts] += 1;
+    }
+  }
+  const packageConflicts = isStructured
+    ? listManaged(planId)
+      .filter(({ source }) => source.reconcileState === 'drift-conflict'
+        || source.reconcileState === 'missing-conflict')
+      .map(({ package: pkg, source }) => ({
+        packageId: pkg.id,
+        sourceLocalId: source.sourceLocalId,
+        state: source.reconcileState,
+      }))
+    : [];
+  const tabsMissingOverview: PlanTabKey[] = [];
+  if (isStructured) {
+    for (const tab of getPopulatedTabs(planId)) {
+      if (!hasOverview(planId, tab)) tabsMissingOverview.push(tab);
+    }
+  }
+  const supervisorValid = isStructured && hasValidSupervisor(planId);
+
+  if (!plan) failures.push('plan-not-found');
+  else if (plan.format !== 'structured') failures.push('plan-not-structured');
+  if (refreshError) failures.push('plan-refresh-failed');
+  if (isStructured && projection?.wpStatus !== 'synced') failures.push('work-package-ingest-not-synced');
+  if (packageConflicts.length > 0) failures.push('work-package-conflict');
+  if (isStructured && packageCounts.ready === 0) failures.push('no-ready-package');
+  if (isStructured && projection?.overviewStatus !== 'synced') failures.push('overview-not-synced');
+  if (tabsMissingOverview.length > 0) failures.push('tab-overview-missing');
+  if (isStructured && (projection?.responsibilityStatus !== 'valid' || !supervisorValid)) {
+    failures.push('no-valid-responsible-supervisor');
+  }
+
+  const commonReady = failures.length === 0;
+  return {
+    planId,
+    runState: plan?.runState ?? null,
+    packageCounts,
+    wpStatus: projection?.wpStatus ?? null,
+    responsibilityStatus: projection?.responsibilityStatus ?? null,
+    overviewStatus: projection?.overviewStatus ?? null,
+    supervisorValid,
+    tabsMissingOverview,
+    packageConflicts,
+    wpDiagnostics: parseDiagnosticArray(projection?.wpDiagnosticsJson),
+    overviewDiagnostics: parseDiagnosticArray(projection?.overviewDiagnosticsJson),
+    refreshError,
+    failures,
+    canMarkReady: commonReady && plan?.runState === 'hardening',
+    canImplement: commonReady && plan?.runState === 'ready',
+  };
 }
 
 function defaultPopulatedTabs(planId: string): PlanTabKey[] {
@@ -146,11 +316,7 @@ export async function implementPlan(
   deps: ImplementPlanDeps = {},
 ): Promise<ImplementResult> {
   const getPlan = deps.getPlan ?? dbGetPlan;
-  const listPackages = deps.listPackages ?? listPlanWorkPackages;
-  const getPopulatedTabs = deps.getPopulatedTabs ?? defaultPopulatedTabs;
-  const hasOverview = deps.hasOverview ?? defaultHasOverview;
-  const hasValidSupervisor =
-    deps.hasValidResponsibleSupervisor ?? planHasValidResponsibleSupervisor;
+  const getReadiness = deps.refreshAndGetReadiness ?? refreshAndGetPlanReadiness;
   const resolveRepoContext = deps.resolveRepoContext ?? defaultResolveRepoContext;
   const probeBaseline = deps.probeBaseline ?? ((ctx) => probePlanBaseline(ctx));
   const createBaselineRef =
@@ -161,28 +327,31 @@ export async function implementPlan(
   const now = deps.now ?? Date.now;
 
   const failures: ImplementFailure[] = [];
-  const tabsMissingOverview: PlanTabKey[] = [];
+  let tabsMissingOverview: PlanTabKey[] = [];
   const fail = (): ImplementResult => ({ ok: false, run: null, failures, tabsMissingOverview });
 
   // ── eligibility (no git touched until the plan is provably eligible) ──────────
+  const readiness = await getReadiness(input.planId, {
+    getPlan,
+    listPackages: deps.listPackages,
+    getPopulatedTabs: deps.getPopulatedTabs,
+    hasOverview: deps.hasOverview,
+    hasValidResponsibleSupervisor: deps.hasValidResponsibleSupervisor,
+  });
+  tabsMissingOverview = readiness.tabsMissingOverview;
+  failures.push(...readiness.failures);
+  if (readiness.runState !== 'ready' && !failures.includes('plan-not-found')) {
+    failures.push('plan-not-ready');
+  }
+  if (!input.appUserId || input.appUserId.trim() === '') failures.push('no-app-user');
+
+  if (failures.length > 0) return fail();
+
   const plan = getPlan(input.planId);
   if (!plan) {
     failures.push('plan-not-found');
     return fail();
   }
-  if (plan.format !== 'structured') failures.push('plan-not-structured');
-  if (plan.runState !== 'ready') failures.push('plan-not-ready');
-  if (!listPackages(input.planId).some((pkg) => pkg.state === 'ready')) {
-    failures.push('no-ready-package');
-  }
-  for (const tab of getPopulatedTabs(input.planId)) {
-    if (!hasOverview(input.planId, tab)) tabsMissingOverview.push(tab);
-  }
-  if (tabsMissingOverview.length > 0) failures.push('tab-overview-missing');
-  if (!hasValidSupervisor(input.planId)) failures.push('no-valid-responsible-supervisor');
-  if (!input.appUserId || input.appUserId.trim() === '') failures.push('no-app-user');
-
-  if (failures.length > 0) return fail();
 
   // ── baseline probe (repo / bare / unborn / head) ─────────────────────────────
   const ctx = await resolveRepoContext(plan);

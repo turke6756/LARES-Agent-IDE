@@ -155,7 +155,7 @@ test('the schema CHECK rejects an unborn run carrying an oid (explicit marker, n
 
 type SpyLog = string[];
 function svcDeps(over: Record<string, unknown> = {}, log: SpyLog = []): any {
-  return {
+  const deps: any = {
     getPlan: () => ({ id: 'plan-1', workspaceId: 'ws-1', format: 'structured', runState: 'ready' }),
     listPackages: () => [{ id: 'wp', state: 'ready' }],
     getPopulatedTabs: () => [],
@@ -167,9 +167,61 @@ function svcDeps(over: Record<string, unknown> = {}, log: SpyLog = []): any {
     insertRun: (input: any) => { log.push('row'); return { ...input, lifecycleState: 'active' }; },
     newRunId: () => 'run-fixed',
     now: () => 4242,
-    ...over,
   };
+  Object.assign(deps, over);
+  if (!Object.hasOwn(over, 'refreshAndGetReadiness')) {
+    deps.refreshAndGetReadiness = async (planId: string) => {
+      const plan = deps.getPlan(planId);
+      const packages = plan ? deps.listPackages(planId) : [];
+      const tabs = plan ? deps.getPopulatedTabs(planId) : [];
+      const tabsMissingOverview = tabs.filter((tab: string) => !deps.hasOverview(planId, tab));
+      const supervisorValid = !!plan && deps.hasValidResponsibleSupervisor(planId);
+      const failures: string[] = [];
+      if (!plan) failures.push('plan-not-found');
+      else if (plan.format !== 'structured') failures.push('plan-not-structured');
+      if (plan && !packages.some((pkg: { state: string }) => pkg.state === 'ready')) {
+        failures.push('no-ready-package');
+      }
+      if (tabsMissingOverview.length > 0) failures.push('tab-overview-missing');
+      if (plan && !supervisorValid) failures.push('no-valid-responsible-supervisor');
+      return {
+        planId, runState: plan?.runState ?? null,
+        packageCounts: { ready: packages.filter((p: { state: string }) => p.state === 'ready').length,
+          blocked: 0, executing: 0, done: 0, archived: 0 },
+        wpStatus: plan ? 'synced' : null,
+        responsibilityStatus: supervisorValid ? 'valid' : plan ? 'invalid' : null,
+        overviewStatus: plan ? 'synced' : null,
+        supervisorValid, tabsMissingOverview, packageConflicts: [], wpDiagnostics: [],
+        overviewDiagnostics: [], refreshError: null, failures,
+        canMarkReady: failures.length === 0 && plan?.runState === 'hardening',
+        canImplement: failures.length === 0 && plan?.runState === 'ready',
+      };
+    };
+  }
+  return deps;
 }
+
+test('the shared evaluator awaits coordinator refresh before reading every gate', async () => {
+  const log: string[] = [];
+  const plan = { id: 'plan-1', workspaceId: 'ws-1', path: '.lares/plans/p/plan.md',
+    format: 'structured', runState: 'hardening' } as any;
+  const readiness = await svc.refreshAndGetPlanReadiness('plan-1', {
+    getPlan: () => { log.push('plan'); return plan; },
+    getWorkspace: () => ({ id: 'ws-1', path: 'C:/w', pathType: 'windows' } as any),
+    reconcileFolder: async () => { log.push('refresh'); return { planId: 'plan-1' } as any; },
+    getProjectionState: () => { log.push('projection'); return {
+      wpStatus: 'synced', responsibilityStatus: 'valid', overviewStatus: 'synced',
+      wpDiagnosticsJson: '[]', overviewDiagnosticsJson: '[]',
+    } as any; },
+    listPackages: () => [{ state: 'ready' } as any],
+    listManagedPackages: () => [],
+    getPopulatedTabs: () => ['packages'],
+    hasOverview: () => true,
+    hasValidResponsibleSupervisor: () => true,
+  });
+  assert.equal(readiness.canMarkReady, true);
+  assert.ok(log.indexOf('refresh') < log.indexOf('projection'), log.join(','));
+});
 
 test('a valid head trigger creates the ref BEFORE the run row and records truthful fields', async () => {
   const log: SpyLog = [];
@@ -234,6 +286,15 @@ test('ineligible plans are refused with the right failure and touch no git', asy
     [{ resolveRepoContext: async () => null }, 'not-a-repository'],
     [{ probeBaseline: async () => ({ ok: false, reason: 'bare-repo' }) }, 'bare-repository'],
     [{ probeBaseline: async () => ({ ok: false, reason: 'not-a-repo' }) }, 'not-a-repository'],
+    [{ refreshAndGetReadiness: async () => ({
+      planId: 'plan-1', runState: 'ready',
+      packageCounts: { ready: 1, blocked: 0, executing: 0, done: 0, archived: 0 },
+      wpStatus: 'invalid', responsibilityStatus: 'valid', overviewStatus: 'synced',
+      supervisorValid: true, tabsMissingOverview: [], packageConflicts: [],
+      wpDiagnostics: [{ code: 'source-raced' }], overviewDiagnostics: [],
+      refreshError: null, failures: ['work-package-ingest-not-synced'],
+      canMarkReady: false, canImplement: false,
+    }) }, 'work-package-ingest-not-synced'],
   ];
   for (const [over, expected] of cases) {
     const log: SpyLog = [];

@@ -21,6 +21,7 @@ function test(name: string, fn: () => Promise<void> | void): void {
 type SqlJsDatabase = {
   exec(sql: string): unknown;
   run(sql: string, params?: unknown[]): unknown;
+  getRowsModified(): number;
   prepare(sql: string): {
     bind(params: unknown[]): boolean;
     step(): boolean;
@@ -49,7 +50,10 @@ class FakeBetterSqlite {
   prepare(sql: string) {
     const inner = this.db;
     return {
-      run: (...params: unknown[]) => { inner.run(sql, params); return {}; },
+      run: (...params: unknown[]) => {
+        inner.run(sql, params);
+        return { changes: inner.getRowsModified() };
+      },
       get: (...params: unknown[]) => {
         const stmt = inner.prepare(sql);
         try {
@@ -121,7 +125,7 @@ type ServiceModule = {
   markPlanReady(
     input: { planId: string; actor: string },
     deps?: Record<string, unknown>,
-  ): { ok: boolean; runState: string | null; failures: string[]; tabsMissingOverview: string[] };
+  ): Promise<{ ok: boolean; runState: string | null; failures: string[]; tabsMissingOverview: string[] }>;
 };
 
 let dbm: DbModule;
@@ -212,65 +216,94 @@ test('planHasValidResponsibleSupervisor accepts only a same-workspace supervisor
 // ── service: Mark Ready ───────────────────────────────────────────────────────
 
 function markDeps(over: Record<string, unknown> = {}): Record<string, unknown> {
+  const planId = typeof over.planId === 'string' ? over.planId : null;
+  const runState = planId ? dbm.getPlan(planId)?.runState ?? null : 'hardening';
+  const readiness = {
+    planId: planId ?? 'plan-1', runState,
+    packageCounts: { ready: 1, blocked: 0, executing: 0, done: 0, archived: 0 },
+    wpStatus: 'synced', responsibilityStatus: 'valid', overviewStatus: 'synced',
+    supervisorValid: true, tabsMissingOverview: [], packageConflicts: [],
+    wpDiagnostics: [], overviewDiagnostics: [], refreshError: null, failures: [],
+    canMarkReady: runState === 'hardening', canImplement: runState === 'ready',
+    ...(over.readiness as Record<string, unknown> | undefined),
+  };
   return {
-    listPackages: () => [makePackage({ state: 'ready' })],
-    getPopulatedTabs: () => [],
-    hasOverview: () => true,
-    hasValidResponsibleSupervisor: () => true,
-    ...over,
+    refreshAndGetReadiness: async () => readiness,
   };
 }
 
-test('Mark Ready flips hardening → ready when all conditions hold', () => {
+test('Mark Ready flips hardening → ready when all conditions hold', async () => {
   const ws = dbm.createWorkspace({ title: 'W', path: 'C:/w', pathType: 'windows' });
   const plan = dbm.createOrRevivePlan({ workspaceId: ws.id, path: 'p/ready', format: 'structured', runState: 'hardening' });
-  const res = svc.markPlanReady({ planId: plan.id, actor: 'sup' }, markDeps());
+  const res = await svc.markPlanReady({ planId: plan.id, actor: 'sup' }, markDeps({ planId: plan.id }));
   assert.deepEqual({ ok: res.ok, runState: res.runState, failures: res.failures }, { ok: true, runState: 'ready', failures: [] });
   assert.equal(dbm.getPlan(plan.id)?.runState, 'ready');
 });
 
-test('Mark Ready refuses a plan not in hardening and never flips run_state', () => {
+test('Mark Ready refuses a plan not in hardening and never flips run_state', async () => {
   const ws = dbm.createWorkspace({ title: 'W', path: 'C:/w', pathType: 'windows' });
   const plan = dbm.createOrRevivePlan({ workspaceId: ws.id, path: 'p/exec', format: 'structured', runState: 'executing' });
-  const res = svc.markPlanReady({ planId: plan.id, actor: 'sup' }, markDeps());
+  const res = await svc.markPlanReady({ planId: plan.id, actor: 'sup' }, markDeps({ planId: plan.id }));
   assert.equal(res.ok, false);
   assert.ok(res.failures.includes('plan-not-hardening'));
   assert.equal(dbm.getPlan(plan.id)?.runState, 'executing');
 });
 
-test('Mark Ready refuses when no non-archived package exists', () => {
+test('Mark Ready refuses when only blocked packages exist', async () => {
   const ws = dbm.createWorkspace({ title: 'W', path: 'C:/w', pathType: 'windows' });
   const plan = dbm.createOrRevivePlan({ workspaceId: ws.id, path: 'p/arc', format: 'structured', runState: 'hardening' });
-  const res = svc.markPlanReady({ planId: plan.id, actor: 'sup' },
-    markDeps({ listPackages: () => [makePackage({ state: 'archived' })] }));
+  const res = await svc.markPlanReady({ planId: plan.id, actor: 'sup' },
+    markDeps({ planId: plan.id, readiness: {
+      packageCounts: { ready: 0, blocked: 1, executing: 0, done: 0, archived: 0 },
+      failures: ['no-ready-package'], canMarkReady: false,
+    } }));
   assert.equal(res.ok, false);
-  assert.ok(res.failures.includes('no-active-package'));
+  assert.ok(res.failures.includes('no-ready-package'));
   assert.equal(dbm.getPlan(plan.id)?.runState, 'hardening');
 });
 
-test('Mark Ready refuses a populated tab without an overview and reports the tab', () => {
+test('Mark Ready refuses a populated tab without an overview and reports the tab', async () => {
   const ws = dbm.createWorkspace({ title: 'W', path: 'C:/w', pathType: 'windows' });
   const plan = dbm.createOrRevivePlan({ workspaceId: ws.id, path: 'p/tab', format: 'structured', runState: 'hardening' });
-  const res = svc.markPlanReady({ planId: plan.id, actor: 'sup' },
-    markDeps({ getPopulatedTabs: () => ['proposal', 'plan'], hasOverview: (_p: string, t: string) => t === 'proposal' }));
+  const res = await svc.markPlanReady({ planId: plan.id, actor: 'sup' },
+    markDeps({ planId: plan.id, readiness: {
+      tabsMissingOverview: ['plan'], failures: ['tab-overview-missing'], canMarkReady: false,
+    } }));
   assert.equal(res.ok, false);
   assert.ok(res.failures.includes('tab-overview-missing'));
   assert.deepEqual(res.tabsMissingOverview, ['plan']);
 });
 
-test('Mark Ready refuses without a valid responsible supervisor', () => {
+test('Mark Ready refuses without a valid responsible supervisor', async () => {
   const ws = dbm.createWorkspace({ title: 'W', path: 'C:/w', pathType: 'windows' });
   const plan = dbm.createOrRevivePlan({ workspaceId: ws.id, path: 'p/sup', format: 'structured', runState: 'hardening' });
-  const res = svc.markPlanReady({ planId: plan.id, actor: 'sup' },
-    markDeps({ hasValidResponsibleSupervisor: () => false }));
+  const res = await svc.markPlanReady({ planId: plan.id, actor: 'sup' },
+    markDeps({ planId: plan.id, readiness: {
+      responsibilityStatus: 'invalid', supervisorValid: false,
+      failures: ['no-valid-responsible-supervisor'], canMarkReady: false,
+    } }));
   assert.equal(res.ok, false);
   assert.ok(res.failures.includes('no-valid-responsible-supervisor'));
   assert.equal(dbm.getPlan(plan.id)?.runState, 'hardening');
 });
 
-test('Mark Ready reports a missing plan without throwing', () => {
-  const res = svc.markPlanReady({ planId: 'plan-nope', actor: 'sup' }, markDeps());
+test('Mark Ready reports a missing plan without throwing', async () => {
+  const res = await svc.markPlanReady({ planId: 'plan-nope', actor: 'sup' }, markDeps({ readiness: {
+    runState: null, failures: ['plan-not-found'], canMarkReady: false,
+  } }));
   assert.deepEqual({ ok: res.ok, failures: res.failures }, { ok: false, failures: ['plan-not-found'] });
+});
+
+test('Mark Ready uses compare-and-set and refuses a raced hardening state', async () => {
+  const ws = dbm.createWorkspace({ title: 'W', path: 'C:/w', pathType: 'windows' });
+  const plan = dbm.createOrRevivePlan({ workspaceId: ws.id, path: 'p/race', format: 'structured', runState: 'hardening' });
+  const res = await svc.markPlanReady({ planId: plan.id, actor: 'sup' }, {
+    ...markDeps({ planId: plan.id }),
+    compareAndSetReady: () => false,
+  });
+  assert.equal(res.ok, false);
+  assert.deepEqual(res.failures, ['plan-not-hardening']);
+  assert.equal(dbm.getPlan(plan.id)?.runState, 'hardening');
 });
 
 (async () => {
