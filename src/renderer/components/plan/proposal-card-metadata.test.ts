@@ -12,7 +12,7 @@ function document(name: string, mtimeMs = 10): PlanningReaderDocument {
 }
 
 describe('proposal card metadata', () => {
-  it('derives H1 title, summary, and author from proposal markdown', () => {
+  it('derives H1 title, summary, and a partial declared byline from proposal markdown', () => {
     const card = deriveProposalCardMetadata(document('2026-08-01-example.md'), `---
 title: Frontmatter title
 summary: "A short human-readable summary."
@@ -26,7 +26,15 @@ Body paragraph.
     expect(card).toMatchObject({
       title: 'Heading wins',
       description: 'A short human-readable summary.',
-      author: 'Edward',
+      declaredAuthor: {
+        title: 'Edward',
+        role: null,
+        agentId: null,
+        provider: null,
+        dateLabel: null,
+      },
+      witnessedAuthor: null,
+      authorshipMismatch: false,
       artifactId: null,
       promotedTo: null,
       promotedAt: null,
@@ -47,7 +55,7 @@ History remains discoverable.
 `);
 
     expect(card).toMatchObject({
-      author: 'Planning supervisor',
+      declaredAuthor: expect.objectContaining({ title: 'Planning supervisor' }),
       artifactId: 'prop_0e1425af',
       promotedTo: '2026-08-05-split-the-proposal-lifecycle-an-authoring-skill--0e1425af',
       promotedAt: '2026-08-05',
@@ -62,7 +70,7 @@ History remains discoverable.
   it('accepts creator as author and falls back to mtime for an undated filename', () => {
     const mtime = Date.UTC(2026, 6, 4);
     const card = deriveProposalCardMetadata(document('idea.md', mtime), `---\ncreator: Ada\n---\n# Idea`);
-    expect(card.author).toBe('Ada');
+    expect(card.declaredAuthor?.title).toBe('Ada');
     expect(card.dateLabel).toBe('Jul 4, 2026');
     expect(formatProposalDate('idea.md', mtime)).toBe('Jul 4, 2026');
   });
@@ -76,7 +84,37 @@ Later text.
 `);
 
     expect(card.description).toBe('This is the first paragraph with a useful link.');
-    expect(card.author).toBeNull();
+    expect(card.declaredAuthor).toBeNull();
+  });
+
+  it('keeps the specific self-declared and witnessed registers separate', () => {
+    const card = deriveProposalCardMetadata(document('2026-08-05-authored.md'), `---
+author: "Save Card Execution" (supervisor, AgentDashboard)
+author_agent_id: f57ca63c-1111-2222-3333-444444444444
+author_role: supervisor
+author_provider: claude
+authored_at: 2026-08-05T23:55:00Z
+---
+# Authored
+`, false, {
+      role: 'worker',
+      display: 'P6 mission-board worker',
+      agentId: 'abcd1234-1111-2222-3333-444444444444',
+    });
+
+    expect(card.declaredAuthor).toEqual({
+      title: 'Save Card Execution',
+      role: 'supervisor',
+      agentId: 'f57ca63c-1111-2222-3333-444444444444',
+      provider: 'claude',
+      dateLabel: 'Aug 5, 2026',
+    });
+    expect(card.witnessedAuthor).toEqual({
+      role: 'worker',
+      display: 'P6 mission-board worker',
+      agentId: 'abcd1234-1111-2222-3333-444444444444',
+    });
+    expect(card.authorshipMismatch).toBe(true);
   });
 
   it('truncates descriptions at a readable word boundary', () => {

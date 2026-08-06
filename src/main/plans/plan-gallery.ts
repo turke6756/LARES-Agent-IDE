@@ -292,9 +292,10 @@ function readGalleryPlanRows(workspaceId: string): RawPlanRow[] {
 const PROPOSAL_AUTHOR = (p: ProposalRecord): PlanGalleryAuthor => ({
   role: p.authorRole,
   display: p.authorDisplay,
+  agentId: p.authorAgentId,
 });
 
-const UNKNOWN_AUTHOR: PlanGalleryAuthor = { role: 'unknown', display: null };
+const UNKNOWN_AUTHOR: PlanGalleryAuthor = { role: 'unknown', display: null, agentId: null };
 
 /**
  * Build the unified gallery projection for one workspace. Proposals + structured
@@ -325,6 +326,7 @@ export function buildPlanGallery(
       type: 'proposal',
       typeLabel: 'Proposal',
       title: p.title ?? p.slug ?? path.basename(p.path).replace(/\.md$/i, ''),
+      artifactId: p.artifactId,
       state: p.state,
       dateGroup: toDateGroup(p.createdAt),
       createdAt: p.createdAt,
@@ -361,6 +363,7 @@ export function buildPlanGallery(
       type: isStructured ? 'structured' : 'legacy',
       typeLabel: isStructured ? 'Plan' : 'Legacy Plan',
       title: r.slug ?? path.basename(r.path).replace(/\.(html?|md|markdown)$/i, ''),
+      artifactId: null,
       state: r.run_state,
       dateGroup: toDateGroup(r.created_at),
       createdAt: r.created_at,

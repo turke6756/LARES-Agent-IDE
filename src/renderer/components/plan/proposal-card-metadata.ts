@@ -1,11 +1,21 @@
-import type { PlanningReaderDocument } from '../../../shared/types';
+import type { PlanGalleryAuthor, PlanningReaderDocument } from '../../../shared/types';
+
+export interface ProposalDeclaredAuthor {
+  title: string | null;
+  role: string | null;
+  agentId: string | null;
+  provider: string | null;
+  dateLabel: string | null;
+}
 
 export interface ProposalCardMetadata {
   docId: string;
   fileName: string;
   title: string;
   description: string;
-  author: string | null;
+  declaredAuthor: ProposalDeclaredAuthor | null;
+  witnessedAuthor: PlanGalleryAuthor | null;
+  authorshipMismatch: boolean;
   artifactId: string | null;
   promotedTo: string | null;
   promotedAt: string | null;
@@ -78,6 +88,30 @@ function fallbackTitle(fileName: string): string {
     .replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
+function declaredAuthorTitle(value: string | undefined): string | null {
+  const raw = value?.trim();
+  if (!raw) return null;
+  const quoted = /^(?:"([^"]+)"|'([^']+)')(?:\s+\([^)]*\))?$/.exec(raw);
+  if (quoted) return (quoted[1] ?? quoted[2]).trim() || null;
+  return raw.replace(/\s+\([^)]*\)\s*$/, '').trim() || null;
+}
+
+function formatAuthoredAt(value: string | undefined): string | null {
+  if (!value) return null;
+  const timestamp = Date.parse(value);
+  if (Number.isNaN(timestamp)) return null;
+  return new Intl.DateTimeFormat('en-US', {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+    timeZone: 'UTC',
+  }).format(new Date(timestamp));
+}
+
+export function shortAgentId(agentId: string): string {
+  return agentId.slice(0, 8);
+}
+
 export function proposalTimelineMs(fileName: string, mtimeMs: number): number {
   const match = /^(\d{4})-(\d{2})-(\d{2})(?:-|$)/.exec(fileName);
   if (!match) return mtimeMs;
@@ -99,18 +133,38 @@ export function deriveProposalCardMetadata(
   document: PlanningReaderDocument,
   content: string,
   truncated = false,
+  witnessedAuthor: PlanGalleryAuthor | null = null,
 ): ProposalCardMetadata {
   const { fields, body } = parseFrontmatter(content);
   const heading = /^ {0,3}#\s+(.+?)\s*#*\s*$/m.exec(body)?.[1];
   const title = plainText(heading ?? fields.title ?? '') || fallbackTitle(document.name);
   const descriptionSource = fields.summary || firstBodyParagraph(body);
+  const declaredAuthor: ProposalDeclaredAuthor = {
+    title: declaredAuthorTitle(fields.author || fields.creator),
+    role: fields.author_role?.trim() || null,
+    agentId: fields.author_agent_id?.trim() || null,
+    provider: fields.author_provider?.trim() || null,
+    dateLabel: formatAuthoredAt(fields.authored_at),
+  };
+  const hasDeclaredAuthor = [
+    declaredAuthor.title,
+    declaredAuthor.role,
+    declaredAuthor.agentId,
+    declaredAuthor.dateLabel,
+  ].some(Boolean);
+  const declaredAgentId = declaredAuthor.agentId?.toLowerCase() ?? null;
+  const witnessedAgentId = witnessedAuthor?.agentId?.toLowerCase() ?? null;
 
   return {
     docId: document.docId,
     fileName: document.name,
     title,
     description: truncateDescription(descriptionSource) || 'No description provided.',
-    author: fields.author?.trim() || fields.creator?.trim() || null,
+    declaredAuthor: hasDeclaredAuthor ? declaredAuthor : null,
+    witnessedAuthor,
+    authorshipMismatch: Boolean(
+      declaredAgentId && witnessedAgentId && declaredAgentId !== witnessedAgentId,
+    ),
     artifactId: fields.artifact_id?.trim() || null,
     promotedTo: fields.promoted_to?.trim() || null,
     promotedAt: fields.promoted_at?.trim() || null,

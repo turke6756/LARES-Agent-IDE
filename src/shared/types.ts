@@ -5293,6 +5293,8 @@ export type PlanGalleryRowType = 'proposal' | 'structured' | 'legacy';
 export interface PlanGalleryAuthor {
   role: 'supervisor' | 'worker' | 'unknown';
   display: string | null;
+  /** Server-witnessed dashboard agent identity; never inferred from role/display. */
+  agentId: string | null;
 }
 
 /** Responsible-supervisor / OWNER chip for a structured folder row, sourced from
@@ -5312,6 +5314,8 @@ export interface PlanGalleryRow {
   /** Type badge label — 'Proposal' | 'Plan' | 'Legacy Plan'. */
   typeLabel: string;
   title: string;
+  /** Portable proposal identity (proposal rows only; null for plan rows). */
+  artifactId: string | null;
   /** State chip: proposal|promoted|archived for proposals; the plan's run_state
    *  (nullable) for structured/legacy rows. */
   state: string | null;

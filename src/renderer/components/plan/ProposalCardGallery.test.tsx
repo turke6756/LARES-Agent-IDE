@@ -35,6 +35,17 @@ const documents = [
   { docId: 'promoted', name: '2026-08-05-promoted.md', category: 'proposal' as const, sizeBytes: 10, mtimeMs: 50 },
 ];
 
+const galleryRows = [
+  {
+    id: 'proposal-new', type: 'proposal', artifactId: 'prop_1234abcd',
+    author: { role: 'supervisor', display: 'Save Card Execution', agentId: 'f57ca63c-1111-2222-3333-444444444444' },
+  },
+  {
+    id: 'proposal-promoted', type: 'proposal', artifactId: 'prop_0e1425af',
+    author: { role: 'worker', display: 'Witnessed Worker', agentId: 'abcd1234-1111-2222-3333-444444444444' },
+  },
+];
+
 let root: Root | null = null;
 let container: HTMLDivElement | null = null;
 
@@ -72,11 +83,14 @@ beforeEach(() => {
         docId,
         name: `${docId}.md`,
         content: docId === 'promoted'
-          ? `---\nartifact_id: prop_0e1425af\nauthor: Planning supervisor\npromoted_to: 2026-08-05-split-the-proposal-lifecycle-an-authoring-skill--0e1425af\npromoted_at: 2026-08-05\n---\n# Promoted proposal\n\nPromoted history description.`
-          : `${docId === 'new' ? '---\nartifact_id: prop_1234abcd\nauthor: Edward\n---\n' : ''}# ${docId === 'new' ? 'Newest proposal' : 'Older proposal'}\n\nDescription for ${docId}.`,
+          ? `---\nartifact_id: prop_0e1425af\nauthor: "Planning Supervisor" (supervisor, AgentDashboard)\nauthor_agent_id: deadbeef-1111-2222-3333-444444444444\nauthor_role: supervisor\nauthored_at: 2026-08-05T10:00:00Z\npromoted_to: 2026-08-05-split-the-proposal-lifecycle-an-authoring-skill--0e1425af\npromoted_at: 2026-08-05\n---\n# Promoted proposal\n\nPromoted history description.`
+          : `${docId === 'new' ? '---\nartifact_id: prop_1234abcd\nauthor: "Save Card Execution" (supervisor, AgentDashboard)\nauthor_agent_id: f57ca63c-1111-2222-3333-444444444444\nauthor_role: supervisor\nauthored_at: 2026-08-03T12:00:00Z\n---\n' : ''}# ${docId === 'new' ? 'Newest proposal' : 'Older proposal'}\n\nDescription for ${docId}.`,
         truncated: false,
         sizeBytes: 10,
       })),
+    },
+    plans: {
+      gallery: vi.fn(async () => ({ rows: galleryRows, warnings: [] })),
     },
   };
   useDashboardStore.setState({
@@ -108,8 +122,13 @@ describe('ProposalCardGallery', () => {
       expect.stringContaining('Older proposal'),
     ]);
     expect(cards[0].querySelector('[data-testid="proposal-card-date"]')?.textContent).toBe('Aug 3, 2026');
-    expect(cards[0].querySelector('[data-testid="proposal-card-author"]')?.textContent).toContain('Edward');
-    expect(cards[1].querySelector('[data-testid="proposal-card-author"]')).toBeNull();
+    expect(cards[0].querySelector('[data-testid="proposal-card-declared-author"]')?.textContent)
+      .toContain('by Save Card Execution · supervisor · f57ca63c · Aug 3, 2026');
+    expect(cards[0].querySelector('[data-testid="proposal-card-witnessed-author"]')?.textContent)
+      .toContain('Save Card Execution · f57ca63c');
+    expect(cards[1].querySelector('[data-testid="proposal-card-declared-author"]')).toBeNull();
+    expect(cards[1].querySelector('[data-testid="proposal-card-witnessed-author"]')?.textContent)
+      .toContain('unavailable');
 
     click('[data-testid="proposal-card"]');
     expect(container!.querySelector('[data-testid="proposal-expanded-reader"]')).not.toBeNull();
@@ -148,7 +167,12 @@ describe('ProposalCardGallery', () => {
     expect(promotedCard.textContent).toContain('Promoted proposal');
     expect(promotedCard.textContent).toContain('Promoted history description.');
     expect(promotedCard.querySelector('[data-testid="proposal-card-date"]')?.textContent).toBe('Aug 5, 2026');
-    expect(promotedCard.querySelector('[data-testid="proposal-card-author"]')?.textContent).toContain('Planning supervisor');
+    expect(promotedCard.querySelector('[data-testid="proposal-card-declared-author"]')?.textContent)
+      .toContain('by Planning Supervisor · supervisor · deadbeef · Aug 5, 2026');
+    expect(promotedCard.querySelector('[data-testid="proposal-card-witnessed-author"]')?.textContent)
+      .toContain('Witnessed Worker · abcd1234');
+    expect(promotedCard.querySelector('[data-testid="proposal-card-author-mismatch"]')?.textContent)
+      .toContain('byline unwitnessed');
   });
 
   it('keeps top-level navigation reachable while a proposal is expanded', async () => {

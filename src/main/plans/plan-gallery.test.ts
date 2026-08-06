@@ -111,9 +111,9 @@ type ProposalRecord = {
 type PlanGalleryOptions = { includeArchived?: boolean; includePromoted?: boolean };
 type PlanGalleryRow = {
   id: string; type: 'proposal' | 'structured' | 'legacy'; typeLabel: string;
-  title: string; state: string | null; dateGroup: string;
+  title: string; artifactId: string | null; state: string | null; dateGroup: string;
   folderRelPath: string | null; hasFolder: boolean;
-  author: { role: string; display: string | null };
+  author: { role: string; display: string | null; agentId: string | null };
   owner: { display: string | null; agentId: string | null; source: string | null } | null;
 };
 type PlanGalleryResult = { rows: PlanGalleryRow[]; warnings: string[] };
@@ -261,12 +261,14 @@ test('owner reflects the LAST assigned event (append-only reassignment)', () => 
 
 test('proposal witnessed author is carried through', () => {
   dbm.insertProposalRecord(proposal({
-    id: 'p-authored', path: '.lares/proposals/authored.md', slug: 'authored', title: 'Authored',
-    authorRole: 'supervisor', authorDisplay: 'Sup Author',
+    id: 'p-authored', artifactId: 'prop_specific', path: '.lares/proposals/authored.md', slug: 'authored', title: 'Authored',
+    authorAgentId: 'f57ca63c-1111-2222-3333-444444444444', authorRole: 'supervisor', authorDisplay: 'Sup Author',
   }));
   const row = gallery.buildPlanGallery(wsId).rows.find((r) => r.id === 'p-authored')!;
+  assert.equal(row.artifactId, 'prop_specific');
   assert.equal(row.author.role, 'supervisor');
   assert.equal(row.author.display, 'Sup Author');
+  assert.equal(row.author.agentId, 'f57ca63c-1111-2222-3333-444444444444');
 });
 
 test('default filter hides archived + promoted proposals; opt-in reveals', () => {

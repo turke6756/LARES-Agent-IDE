@@ -9,6 +9,7 @@ import {
   deriveProposalCardMetadata,
   orderProposalCards,
   type ProposalCardMetadata,
+  shortAgentId,
 } from './proposal-card-metadata';
 
 function proposalPath(workspacePath: string, fileName: string, pathType: 'windows' | 'wsl'): string {
@@ -23,6 +24,11 @@ function ProposalCard({
   card: ProposalCardMetadata;
   onSelect: (docId: string) => void;
 }): React.ReactElement {
+  const declared = card.declaredAuthor;
+  const witnessed = card.witnessedAuthor;
+  const declaredDetails = declared
+    ? [declared.role, declared.agentId ? shortAgentId(declared.agentId) : null, declared.dateLabel].filter(Boolean)
+    : [];
   return (
     <button
       type="button"
@@ -35,9 +41,31 @@ function ProposalCard({
       <span className="mt-auto pt-3 text-[11px] text-gray-500" data-testid="proposal-card-date">
         {card.dateLabel}
       </span>
-      {card.author && (
-        <span className="pt-1 text-[11px] text-gray-500" data-testid="proposal-card-author">
-          by {card.author}
+      {declared && (
+        <span
+          className="pt-1 text-[11px] text-gray-500"
+          data-testid="proposal-card-declared-author"
+          title={`Self-declared authorship${declared.agentId ? ` (${declared.agentId})` : ''}${declared.provider ? ` via ${declared.provider}` : ''}`}
+        >
+          <span className="mr-1 uppercase tracking-wide text-gray-600">Declared</span>
+          by {declared.title
+            ? <><strong className="font-medium text-gray-400">{declared.title}</strong>{declaredDetails.map((part) => <React.Fragment key={part}>{' · '}{part}</React.Fragment>)}</>
+            : declaredDetails.join(' · ')}
+        </span>
+      )}
+      <span
+        className="pt-1 text-[11px] text-gray-500"
+        data-testid="proposal-card-witnessed-author"
+        title={witnessed?.agentId ? `Server-witnessed agent ${witnessed.agentId}` : 'No server-witnessed writer is available'}
+      >
+        <span className="mr-1 uppercase tracking-wide text-gray-600">Witnessed</span>
+        {witnessed?.agentId
+          ? <>{witnessed.display || 'Unknown agent'}{' · '}{shortAgentId(witnessed.agentId)}</>
+          : 'unavailable'}
+      </span>
+      {card.authorshipMismatch && (
+        <span className="pt-1 text-[10px] font-medium text-accent-orange" data-testid="proposal-card-author-mismatch">
+          byline unwitnessed
         </span>
       )}
     </button>
@@ -71,7 +99,15 @@ export default function ProposalCardGallery(): React.ReactElement {
     }
 
     try {
-      const result = await window.api.planningReader.list(workspace.path, workspace.pathType);
+      const [result, gallery] = await Promise.all([
+        window.api.planningReader.list(workspace.path, workspace.pathType),
+        window.api.plans.gallery(workspace.id, { includeArchived: true, includePromoted: true }),
+      ]);
+      const witnessedByArtifactId = new Map(
+        gallery.rows
+          .filter((row) => row.type === 'proposal' && row.artifactId)
+          .map((row) => [row.artifactId!, row.author]),
+      );
       const proposalDocuments = result.entries
         .filter((entry) => entry.kind === 'proposal')
         .map((entry) => entry.documents.find((document) => document.category === 'proposal'))
@@ -79,7 +115,13 @@ export default function ProposalCardGallery(): React.ReactElement {
       const reads = await Promise.all(proposalDocuments.map(async (document) => {
         const read = await window.api.planningReader.read(document.docId, workspace.pathType);
         if ('error' in read) return null;
-        return deriveProposalCardMetadata(document, read.content, read.truncated);
+        const preliminary = deriveProposalCardMetadata(document, read.content, read.truncated);
+        return deriveProposalCardMetadata(
+          document,
+          read.content,
+          read.truncated,
+          preliminary.artifactId ? witnessedByArtifactId.get(preliminary.artifactId) ?? null : null,
+        );
       }));
       setCards(orderProposalCards(reads.filter((card): card is ProposalCardMetadata => card !== null)));
     } catch {
