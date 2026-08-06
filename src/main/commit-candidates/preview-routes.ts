@@ -418,6 +418,12 @@ export function createPreviewRoutes(deps: PreviewRoutesDeps): {
         finalizationIds: req.finalizationIds,
         acknowledgeTopologyDigest: req.acknowledgeTopologyDigest,
         acknowledgeUnattributedEntryIds: req.acknowledgeUnattributedEntryIds,
+        ...(req.reviewedManifestDigest !== undefined
+          ? { reviewedManifestDigest: req.reviewedManifestDigest }
+          : {}),
+        ...(req.acknowledgedChallengeAtoms !== undefined
+          ? { acknowledgedChallengeAtoms: req.acknowledgedChallengeAtoms }
+          : {}),
       }, context);
       return { candidate, context };
     },

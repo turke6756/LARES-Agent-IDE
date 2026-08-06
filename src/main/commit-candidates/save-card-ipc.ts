@@ -43,17 +43,48 @@ import {
 } from './finalization-service';
 import {
   buildCandidate,
+  buildReviewedSemanticManifest,
   computeCandidateTopologyDigest,
+  rememberReviewedSemanticManifest,
+  reviewCarryVerdictFor,
   type CandidateBuildContext,
   type CandidateSelectionRequest,
 } from './candidate-service';
 import { resolvePinnedSelectionDrift } from './pinned-selection-drift';
 import type {
   CommitCandidate,
+  ReviewChallengeAtom,
   SaveRefusal,
   SaveRefusalStage,
   SelectionPreview,
 } from '../../shared/commit-candidates';
+
+function requireChallengeAtoms(value: unknown): ReviewChallengeAtom[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) {
+    throw new SaveCardIpcError('acknowledgedChallengeAtoms must be an array', 'save-card-bad-request');
+  }
+  for (const atom of value) {
+    if (!atom || typeof atom !== 'object' || Array.isArray(atom)) {
+      throw new SaveCardIpcError('acknowledgedChallengeAtoms contains an invalid atom', 'save-card-bad-request');
+    }
+    const record = atom as Record<string, unknown>;
+    if ((record.kind !== 'unattributed' && record.kind !== 'overlap')
+        || typeof record.atomId !== 'string'
+        || typeof record.digest !== 'string') {
+      throw new SaveCardIpcError('acknowledgedChallengeAtoms contains an invalid atom', 'save-card-bad-request');
+    }
+  }
+  return value as ReviewChallengeAtom[];
+}
+
+function requireOptionalDigest(value: unknown): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'string' || !/^[0-9a-f]{64}$/.test(value)) {
+    throw new SaveCardIpcError('reviewedManifestDigest must be a SHA-256 digest', 'save-card-bad-request');
+  }
+  return value;
+}
 
 // Backward-compatible main-module exports for the focused IPC tests and any
 // main-side callers; the wire contract itself is owned by shared/types.
@@ -401,6 +432,12 @@ function requirePreviewRequest(raw: unknown): SaveCardPreviewRequest {
       'selectedUnattributedEntryIds',
     ),
     finalizationIds: asStringArray(record.finalizationIds, 'finalizationIds'),
+    ...(record.reviewedManifestDigest !== undefined
+      ? { reviewedManifestDigest: requireOptionalDigest(record.reviewedManifestDigest) }
+      : {}),
+    ...(record.acknowledgedChallengeAtoms !== undefined
+      ? { acknowledgedChallengeAtoms: requireChallengeAtoms(record.acknowledgedChallengeAtoms) }
+      : {}),
   };
 }
 
@@ -411,6 +448,8 @@ const MINT_REQUEST_FIELDS = new Set([
   'finalizationIds',
   'acknowledgeTopologyDigest',
   'acknowledgeUnattributedEntryIds',
+  'reviewedManifestDigest',
+  'acknowledgedChallengeAtoms',
 ]);
 
 function requireMintRequest(raw: unknown): SaveCardMintRequest {
@@ -446,6 +485,12 @@ function requireMintRequest(raw: unknown): SaveCardMintRequest {
     finalizationIds: strings('finalizationIds'),
     acknowledgeTopologyDigest: record.acknowledgeTopologyDigest,
     acknowledgeUnattributedEntryIds: strings('acknowledgeUnattributedEntryIds'),
+    ...(record.reviewedManifestDigest !== undefined
+      ? { reviewedManifestDigest: requireOptionalDigest(record.reviewedManifestDigest) }
+      : {}),
+    ...(record.acknowledgedChallengeAtoms !== undefined
+      ? { acknowledgedChallengeAtoms: requireChallengeAtoms(record.acknowledgedChallengeAtoms) }
+      : {}),
   };
 }
 
@@ -597,6 +642,84 @@ export function deriveDefaultMessageBody(
   return boundMessageLength(message);
 }
 
+function reviewPayload(
+  candidate: CommitCandidate | SelectionPreview,
+  context: CandidateBuildContext,
+): Pick<SaveCardPreviewResponse, 'reviewedManifest' | 'durableFinalizationIntent' | 'reviewCarry'> {
+  const carry = reviewCarryVerdictFor(candidate);
+  const carryPayload = carry
+    ? {
+        reviewCarry: carry.carried
+          ? {
+              carried: true,
+              reviewedManifestDigest: carry.reviewedManifestDigest,
+              pendingPathBytesBase64: carry.pendingPathBytesBase64,
+              dischargedPathBytesBase64: carry.dischargedPathBytesBase64,
+            }
+          : {
+              carried: false,
+              reviewedManifestDigest: carry.reviewedManifestDigest,
+              reason: carry.reason,
+              ...(carry.paths ? { paths: carry.paths } : {}),
+            },
+      }
+    : {};
+  if (!isCommitCandidate(candidate) || candidate.members.some((member) =>
+    member.expectedCommitBlobOid === null && member.expectedWorktreeState === 'present')) {
+    return carryPayload;
+  }
+  try {
+    const manifest = buildReviewedSemanticManifest(candidate, context);
+    const reviewedManifestDigest = rememberReviewedSemanticManifest(manifest);
+    const paths = new Map<string, import('../../shared/commit-candidates').EncodedGitPath>();
+    for (const entry of context.inventory.entries) {
+      paths.set(entry.path.pathBytesBase64, entry.path);
+      if (entry.originalPath) paths.set(entry.originalPath.pathBytesBase64, entry.originalPath);
+      for (const path of entry.commitPathspecs) paths.set(path.pathBytesBase64, path);
+    }
+    const pathFor = (pathBytesBase64: string) => paths.get(pathBytesBase64) ?? {
+      pathBytesBase64,
+      displayPath: '[git path]',
+      utf8Clean: false,
+    };
+    return {
+      reviewedManifest: {
+        manifestVersion: manifest.manifestVersion,
+        reviewedManifestDigest,
+        members: manifest.members.map((member) => ({
+          finalPath: pathFor(member.finalPathBytesBase64),
+          expectedState: member.expectedState,
+          rawBlobOid: member.rawBlobOid,
+          commitBlobOid: member.commitBlobOid,
+          commitMode: member.commitMode,
+          commitEffects: member.commitEffects.map((effect) => ({
+            path: pathFor(effect.pathBytesBase64),
+            operation: effect.operation,
+            expectedState: effect.expectedState,
+            rawBlobOid: effect.rawBlobOid,
+            commitBlobOid: effect.commitBlobOid,
+            commitMode: effect.commitMode,
+          })),
+        })),
+        challengeVersion: manifest.challengeVersion,
+        challengeAtoms: manifest.challengeAtoms,
+      },
+      durableFinalizationIntent: manifest.finalizations.map((intent) => ({
+        finalizationId: intent.finalizationId,
+        packageId: intent.packageId,
+        packageRevision: intent.packageRevision,
+        boundaryStatus: intent.boundaryStatus,
+        frozenMemberManifestDigest: intent.frozenMemberManifestDigest,
+      })),
+      ...carryPayload,
+    };
+  } catch {
+    // An ineligible/legacy fixture may not carry structured WP-2 topology. Never
+    // manufacture a review identity from an opaque digest; simply omit it.
+    return carryPayload;
+  }
+}
+
 function toPreviewResponse(
   request: SaveCardPreviewRequest,
   candidate: CommitCandidate | SelectionPreview,
@@ -640,6 +763,7 @@ function toPreviewResponse(
     selectionDriftDisplayPaths: driftResult?.displayPaths ?? {},
     pinnedSelection,
     refusal,
+    ...reviewPayload(candidate, context),
   };
 }
 

@@ -535,6 +535,43 @@ test('production coordinator seams reassemble a minted snapshot from the shared 
   ]);
 });
 
+test('save-card mint route purely forwards reviewed digest and acknowledged atoms', async () => {
+  const routes = createPreviewRoutes(baseDeps({
+    getPackageFinalization: (id) => (id === 'fin-1' ? finalization({
+      memberManifestJson: JSON.stringify([{ ...frozen('e1'), commitBlobOid: OID }]),
+    }) : null),
+  }));
+  const service = routes.productionSeams.candidateService;
+  const original = service.mintCandidateToken.bind(service);
+  let forwarded: Parameters<typeof service.mintCandidateToken>[0] | null = null;
+  service.mintCandidateToken = ((request, context) => {
+    forwarded = request;
+    const { reviewedManifestDigest: _digest, acknowledgedChallengeAtoms: _atoms, ...legacy } = request;
+    return original(legacy, context);
+  }) as typeof service.mintCandidateToken;
+  const acknowledgedChallengeAtoms = [{
+    kind: 'unattributed' as const,
+    atomId: 'atom-1',
+    digest: 'digest-1',
+    pathBytesBase64: b64('e1'),
+    memberEffectDigest: 'member-1',
+  }];
+  await routes.saveCardMintRoutes.mintCandidate({
+    workspaceId: 'ws-1',
+    selectedComponentIds: ['c1'],
+    selectedUnattributedEntryIds: [],
+    finalizationIds: ['fin-1'],
+    acknowledgeTopologyDigest: 'topology',
+    acknowledgeUnattributedEntryIds: [],
+    reviewedManifestDigest: 'd'.repeat(64),
+    acknowledgedChallengeAtoms,
+  });
+  assert.ok(forwarded);
+  const observed = forwarded as Parameters<typeof service.mintCandidateToken>[0];
+  assert.equal(observed.reviewedManifestDigest, 'd'.repeat(64));
+  assert.deepEqual(observed.acknowledgedChallengeAtoms, acknowledgedChallengeAtoms);
+});
+
 (async () => {
   let failed = 0;
   for (const t of tests) {

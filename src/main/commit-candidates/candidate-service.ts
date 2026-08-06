@@ -26,8 +26,20 @@ import type {
   SaveCardQuotaWeakening,
   MintCandidateTokenRequest,
   NormalizedCommitEffect,
+  AttributionContributor,
+  ReviewChallengeAtom,
+  ReviewedAttributionTopology,
+  ReviewedClosureObligation,
+  ReviewedFinalizationIntent,
+  ReviewedSemanticManifest,
 } from '../../shared/commit-candidates';
-import { normalizeCommitEffects } from '../../shared/commit-candidates';
+import {
+  REVIEW_CHALLENGE_VERSION,
+  REVIEWED_SEMANTIC_MANIFEST_VERSION,
+  canonicalizeReviewedSemanticManifest,
+  normalizeCommitEffects,
+  normalizeReviewedSemanticManifest,
+} from '../../shared/commit-candidates';
 import { COMMIT_CANDIDATE_TOKEN_CAP_PER_REPOSITORY } from '../../shared/constants';
 import { canonicalize } from './jcs';
 import type { CommitRepresentation } from './commit-representation';
@@ -51,7 +63,10 @@ import {
   type TurnWitnessReader,
   type WitnessStampSource,
 } from './witness-projection';
-import { assembleConflictComponents } from './component-assembler';
+import {
+  assembleConflictComponents,
+  type ComponentAssembly,
+} from './component-assembler';
 import {
   computeBundleCaptureHealth,
   type CaptureHealthTurn,
@@ -73,6 +88,12 @@ import {
 } from './pinned-selection-drift';
 
 const DEFAULT_CANDIDATE_TOKEN_TTL_MS = 5 * 60 * 1000;
+const REVIEWED_MANIFEST_REGISTRY_CAP = 512;
+
+const assemblyByInventory = new WeakMap<DirtyInventory, ComponentAssembly>();
+const reviewedManifestByDigest = new Map<string, ReviewedSemanticManifest>();
+const dischargedPathsByDigest = new Map<string, Set<string>>();
+const carryVerdictByCandidate = new WeakMap<object, ReviewCarryVerdict>();
 
 export type CandidateTokenState = 'issued' | 'consuming' | 'consumed';
 
@@ -246,7 +267,7 @@ export class CommitCandidateService {
 
   /** Build from fresh server state, validate acknowledgements, and mint an opaque token. */
   mintCandidateToken(
-    request: MintCandidateTokenRequest,
+    request: MintCandidateTokenRequest & ReviewCarryEvidence,
     context: CandidateBuildContext,
   ): CommitCandidate | SelectionPreview {
     const normalizedRequest: MintCandidateTokenRequest = {
@@ -259,6 +280,52 @@ export class CommitCandidateService {
     };
     const built = buildCandidate(normalizedRequest, context);
     if (!('candidateId' in built) || !built.eligibility.eligible) return built;
+    let reviewCarried = false;
+
+    if (request.reviewedManifestDigest !== undefined) {
+      const reviewed = reviewedManifestByDigest.get(request.reviewedManifestDigest);
+      if (!reviewed) {
+        const verdict: ReviewCarryVerdict = {
+          carried: false,
+          reviewedManifestDigest: request.reviewedManifestDigest,
+          reason: 'review-manifest-unknown',
+        };
+        const refused = {
+          ...built,
+          eligibility: { eligible: false, reason: 'byte-mismatch' as const },
+        };
+        carryVerdictByCandidate.set(refused, verdict);
+        return refused;
+      }
+      const freshManifest = buildReviewedSemanticManifest(built, context);
+      const verdict = evaluateReviewedManifestCarry(
+        reviewed,
+        freshManifest,
+        request.acknowledgedChallengeAtoms ?? [],
+        context,
+        built.eligibility,
+        dischargedPathsByDigest.get(request.reviewedManifestDigest) ?? new Set(),
+      );
+      if (!verdict.carried) {
+        const acknowledgement = verdict.reason === 'challenge-not-covered';
+        const refused = {
+          ...built,
+          eligibility: {
+            eligible: false,
+            reason: acknowledgement
+              ? ('overlap-not-acknowledged' as const)
+              : ('byte-mismatch' as const),
+          },
+        };
+        carryVerdictByCandidate.set(refused, verdict);
+        return refused;
+      }
+      const discharged = dischargedPathsByDigest.get(request.reviewedManifestDigest) ?? new Set<string>();
+      for (const path of verdict.dischargedPathBytesBase64) discharged.add(path);
+      dischargedPathsByDigest.set(request.reviewedManifestDigest, discharged);
+      carryVerdictByCandidate.set(built, verdict);
+      reviewCarried = true;
+    }
 
     // The acknowledgement is evidence about the RESOLVED candidate — the same
     // `buildCandidate` output the preview surfaced its digest / unattributed set
@@ -270,10 +337,10 @@ export class CommitCandidateService {
       built.componentIds,
       selectedUnattributed,
     );
-    if (normalizedRequest.acknowledgeTopologyDigest !== topologyDigest) {
+    if (!reviewCarried && normalizedRequest.acknowledgeTopologyDigest !== topologyDigest) {
       return { ...built, eligibility: { eligible: false, reason: 'overlap-not-acknowledged' } };
     }
-    if (!sameStrings(
+    if (!reviewCarried && !sameStrings(
       built.selectedUnattributedEntryIds,
       normalizedRequest.acknowledgeUnattributedEntryIds,
     )) {
@@ -298,6 +365,8 @@ export class CommitCandidateService {
       expiresAt: now + this.tokenTtlMs,
     };
     const candidate = cloneAndFreeze({ ...built, token });
+    const carryVerdict = carryVerdictByCandidate.get(built);
+    if (carryVerdict) carryVerdictByCandidate.set(candidate, carryVerdict);
     const selectedComponents = context.components.filter((component) =>
       built.componentIds.includes(component.componentId));
     const commitEffects = candidateCommitEffects(built.members, context.inventory.entries, context);
@@ -498,6 +567,11 @@ export class CommitCandidateService {
       this.deps.stampSource ?? null,
     );
     const assembly = assembleConflictComponents(draft, witnesses);
+    // Keep the structured WP-2 topology paired with the exact inventory object.
+    // Preview routing preserves that object when it spreads the scope context, so
+    // review construction never has to reverse-engineer contributor tuples from
+    // renderer ids or an opaque topology digest.
+    assemblyByInventory.set(assembly.inventory, assembly);
     const planAttributionUnavailableTurnIds = new Set(
       witnesses
         .filter((witness) => !witness.planAttributionAvailable)
@@ -621,11 +695,53 @@ export interface CandidateSelectionRequest {
  *  (structurally satisfied by `database.CommitPathLink`). A member is proven
  *  `already-locally-committed` ONLY by an EXACT frozen commit-entry match. */
 export interface CandidateLedgerLink {
+  /** Reconciliation-ledger commit that established this exact path state. */
+  commitOid?: string;
   pathBytesBase64: string;
+  expectedState: 'present' | 'absent';
+  rawBlobOidAtCommit?: string | null;
+  commitBlobOid: string | null;
+  commitMode: string | null;
+}
+
+export interface ReviewCarryEvidence {
+  /** Digest of the immutable manifest actually reviewed by the human. */
+  reviewedManifestDigest?: string;
+  /** Exact independently comparable atoms shown and acknowledged. */
+  acknowledgedChallengeAtoms?: readonly ReviewChallengeAtom[];
+}
+
+export interface FreshHeadEntry {
   expectedState: 'present' | 'absent';
   commitBlobOid: string | null;
   commitMode: string | null;
 }
+
+export type ReviewCarryRefusalReason =
+  | 'review-manifest-unknown'
+  | 'contract-or-repository-changed'
+  | 'durable-intent-changed'
+  | 'reviewed-universe-changed'
+  | 'pending-effect-changed'
+  | 'discharge-unproven'
+  | 'attribution-changed'
+  | 'challenge-not-covered'
+  | 'fresh-eligibility-failed'
+  | 'fresh-closure-unproven';
+
+export type ReviewCarryVerdict =
+  | {
+      carried: true;
+      reviewedManifestDigest: string;
+      pendingPathBytesBase64: string[];
+      dischargedPathBytesBase64: string[];
+    }
+  | {
+      carried: false;
+      reviewedManifestDigest: string;
+      reason: ReviewCarryRefusalReason;
+      paths?: string[];
+    };
 
 /** Everything the pure assembler reads. Production callers resolve these from the
  *  read facade + WP-3B accessors + WP-2J temp-index reads + WP-3G fingerprint;
@@ -644,6 +760,15 @@ export interface CandidateBuildContext {
   currentCommitReps: ReadonlyMap<string, CommitRepresentation>;
   /** Repository-scoped exact commit ledger for the prior-exact-commit closure. */
   ledger: readonly CandidateLedgerLink[];
+  /** Optional fresh reachability batch supplied by a sweep iteration. A ledger
+   * row equal to pinned HEAD is reachable without appearing here. */
+  reachableCommitOids?: ReadonlySet<string>;
+  /** Fresh current-HEAD tree entries for discharged/closure paths. */
+  currentHeadEntriesByPath?: ReadonlyMap<string, FreshHeadEntry>;
+  /** Explicit test/alternate-assembly seam. Production normally obtains these
+   * structures from the exact ComponentAssembly cached for `inventory`. */
+  reviewedAttributionTopology?: ReviewedAttributionTopology;
+  reviewChallengeAtoms?: readonly ReviewChallengeAtom[];
   protectionByEntryId?: Readonly<Record<string, ProtectionRung>>;
   pinnedHeadOid: string | null;
   indexFingerprint: IndexFingerprintResult;
@@ -660,6 +785,417 @@ function sameStrings(left: readonly string[], right: readonly string[]): boolean
 
 function sha256Hex(value: string): string {
   return createHash('sha256').update(value, 'utf8').digest('hex');
+}
+
+function canonicalEqual(left: unknown, right: unknown): boolean {
+  return canonicalize(left) === canonicalize(right);
+}
+
+function ownershipGroupKey(contributor: AttributionContributor): string {
+  return canonicalize([
+    contributor.ownerAgentId ?? contributor.agentId,
+    contributor.planId,
+    contributor.planItemId,
+  ]);
+}
+
+function sortedUniqueStrings(values: Iterable<string>): string[] {
+  return [...new Set(values)].sort(compareBase64);
+}
+
+function projectTopology(
+  topology: ReviewedAttributionTopology,
+  retainedMemberPaths: ReadonlySet<string>,
+): ReviewedAttributionTopology {
+  const originalMemberPaths = new Set(topology.componentPathSets.flat());
+  for (const path of topology.selectedUnattributedPathBytesBase64) originalMemberPaths.add(path);
+  if (originalMemberPaths.size === retainedMemberPaths.size
+      && [...originalMemberPaths].every((path) => retainedMemberPaths.has(path))) {
+    return structuredClone(topology);
+  }
+  const componentPathSets = topology.componentPathSets
+    .map((paths) => paths.filter((path) => retainedMemberPaths.has(path)).sort(compareBase64))
+    .filter((paths) => paths.length > 0)
+    .sort((left, right) => compareBase64(canonicalize(left), canonicalize(right)));
+  const contributors = topology.contributors
+    .filter((contributor) => retainedMemberPaths.has(contributor.pathBytesBase64));
+  // Typed contributors let us project ordinary groups precisely. WP-2 also
+  // retains owner-less group keys whose contributor cannot inhabit the shared
+  // AttributionContributor type; conservatively retain those opaque groups while
+  // any component remains rather than silently dropping an obligation.
+  const typedOriginalGroups = new Set(topology.contributors.map(ownershipGroupKey));
+  const opaqueOriginalGroups = topology.ownershipGroupKeys.filter((key) => !typedOriginalGroups.has(key));
+  const ownershipGroupKeys = sortedUniqueStrings([
+    ...contributors.map(ownershipGroupKey),
+    ...(componentPathSets.length > 0 ? opaqueOriginalGroups : []),
+  ]);
+  const componentEdges = topology.componentEdges.filter((edge) =>
+    retainedMemberPaths.has(edge.leftPathBytesBase64)
+    && retainedMemberPaths.has(edge.rightPathBytesBase64));
+  const selectedUnattributedPathBytesBase64 = topology.selectedUnattributedPathBytesBase64
+    .filter((path) => retainedMemberPaths.has(path));
+  const requiresOverlapAck = ownershipGroupKeys.length >= 2 || componentPathSets.some((paths) => {
+    const pathSet = new Set(paths);
+    return new Set(
+      contributors
+        .filter((contributor) => pathSet.has(contributor.pathBytesBase64))
+        .map(ownershipGroupKey),
+    ).size >= 2;
+  });
+  return {
+    componentPathSets,
+    contributors,
+    ownershipGroupKeys,
+    componentEdges,
+    requiresOverlapAck,
+    selectedUnattributedPathBytesBase64,
+  };
+}
+
+function selectedTopologyEvidence(
+  candidate: CommitCandidate,
+  context: CandidateBuildContext,
+): { topology: ReviewedAttributionTopology; overlapAtoms: ReviewChallengeAtom[] } {
+  const selectedMemberPaths = new Set(candidate.members.map((member) => member.path.pathBytesBase64));
+  const assembly = assemblyByInventory.get(context.inventory);
+  const topology = context.reviewedAttributionTopology ?? assembly?.selectedTopology;
+  const atoms = context.reviewChallengeAtoms ?? assembly?.overlapChallengeAtoms;
+  if (topology && atoms) {
+    return {
+      topology: projectTopology(topology, selectedMemberPaths),
+      overlapAtoms: atoms.filter((atom) =>
+        atom.kind === 'overlap'
+        && atom.memberPathBytesBase64.every((path) => selectedMemberPaths.has(path))),
+    };
+  }
+
+  // Compatibility for directly-constructed, non-overlapping unit contexts. A
+  // carry-capable overlapping context must supply WP-2's structured evidence;
+  // an opaque digest is deliberately never promoted into review identity.
+  const selectedComponents = context.components.filter((component) =>
+    candidate.componentIds.includes(component.componentId));
+  if (selectedComponents.some((component) => component.overlap.requiresOverlapAck)) {
+    throw new Error('Structured overlap topology is unavailable for reviewed-manifest construction.');
+  }
+  const entryById = new Map(context.inventory.entries.map((entry) => [entry.entryId, entry]));
+  const componentPathSets = selectedComponents.map((component) => component.dirtyEntryIds
+    .map((entryId) => entryById.get(entryId)?.path.pathBytesBase64)
+    .filter((path): path is string => path !== undefined)
+    .sort(compareBase64));
+  return {
+    topology: {
+      componentPathSets,
+      contributors: [],
+      ownershipGroupKeys: [],
+      componentEdges: [],
+      requiresOverlapAck: false,
+      selectedUnattributedPathBytesBase64: candidate.selectedUnattributedEntryIds
+        .map((entryId) => entryById.get(entryId)?.path.pathBytesBase64)
+        .filter((path): path is string => path !== undefined)
+        .sort(compareBase64),
+    },
+    overlapAtoms: [],
+  };
+}
+
+function reviewedFrozenMembers(finalization: PackageFinalization) {
+  return parseFinalizationManifest(finalization)
+    .map((member) => ({
+      pathBytesBase64: member.pathBytesBase64,
+      expectedState: member.expectedState,
+      rawBlobOid: member.rawBlobOid,
+      commitBlobOid: member.commitBlobOid,
+      commitMode: member.commitMode,
+    }))
+    .sort((left, right) => compareBase64(left.pathBytesBase64, right.pathBytesBase64));
+}
+
+/** Build review identity from fresh main-owned state. Operational HEAD/index and
+ * candidate/token ids are intentionally absent. */
+export function buildReviewedSemanticManifest(
+  candidate: CommitCandidate,
+  context: CandidateBuildContext,
+): ReviewedSemanticManifest {
+  const entryById = new Map(context.inventory.entries.map((entry) => [entry.entryId, entry]));
+  const members = candidate.members.map((member) => {
+    const entry = entryById.get(member.entryId);
+    if (!entry) throw new Error(`Reviewed candidate member is absent from inventory: ${member.entryId}`);
+    return {
+      finalPathBytesBase64: member.path.pathBytesBase64,
+      expectedState: member.expectedWorktreeState,
+      rawBlobOid: member.rawWorktreeBlobOid,
+      commitBlobOid: member.expectedCommitBlobOid,
+      commitMode: member.expectedCommitMode,
+      coveringFinalizationIds: [...member.coveringFinalizationIds],
+      commitEffects: memberCommitEffects(member, entry, context),
+    };
+  });
+  const selectedFinalizationIds = new Set(candidate.finalizations.map((ref) => ref.finalizationId));
+  const selectedFinalizations = context.finalizations.filter((row) => selectedFinalizationIds.has(row.id));
+  const finalizations: ReviewedFinalizationIntent[] = selectedFinalizations.map((row) => {
+    if (row.boundaryStatus !== 'ready') {
+      throw new Error(`Finalization ${row.id} is not ready for semantic review.`);
+    }
+    const frozenMembers = reviewedFrozenMembers(row);
+    return {
+      finalizationId: row.id,
+      packageId: row.packageId,
+      packageRevision: row.packageRevision,
+      boundaryStatus: 'ready',
+      frozenMemberManifestDigest: sha256Hex(canonicalize(frozenMembers)),
+      frozenMembers,
+    };
+  });
+  const selectedLogicalPaths = new Set(members.map((member) => member.finalPathBytesBase64));
+  const closureObligations: ReviewedClosureObligation[] = finalizations.flatMap((intent) =>
+    intent.frozenMembers
+      .filter((member) => !selectedLogicalPaths.has(member.pathBytesBase64))
+      .map((member) => ({
+        finalizationId: intent.finalizationId,
+        pathBytesBase64: member.pathBytesBase64,
+        expectedState: member.expectedState,
+        commitBlobOid: member.commitBlobOid,
+        commitMode: member.commitMode,
+      })));
+  const topologyEvidence = selectedTopologyEvidence(candidate, context);
+  const unattributedPaths = new Set(
+    topologyEvidence.topology.selectedUnattributedPathBytesBase64,
+  );
+  const unattributedAtoms: ReviewChallengeAtom[] = members
+    .filter((member) => unattributedPaths.has(member.finalPathBytesBase64))
+    .map((member) => {
+      const memberEffectDigest = sha256Hex(canonicalize(member));
+      const body = { pathBytesBase64: member.finalPathBytesBase64, memberEffectDigest };
+      return {
+        kind: 'unattributed',
+        atomId: `unattributed:${sha256Hex(member.finalPathBytesBase64)}`,
+        digest: sha256Hex(canonicalize(body)),
+        ...body,
+      };
+    });
+  return normalizeReviewedSemanticManifest({
+    manifestVersion: REVIEWED_SEMANTIC_MANIFEST_VERSION,
+    candidateContractVersion: context.contractVersion,
+    repositoryKey: context.repository.repositoryKey,
+    objectDatabaseKey: context.repository.objectDatabaseKey,
+    gitObjectFormat: context.repository.gitObjectFormat,
+    finalizations,
+    members,
+    attributionTopology: topologyEvidence.topology,
+    closureObligations,
+    challengeVersion: REVIEW_CHALLENGE_VERSION,
+    challengeAtoms: [...topologyEvidence.overlapAtoms, ...unattributedAtoms],
+  });
+}
+
+export function reviewedSemanticManifestDigest(manifest: ReviewedSemanticManifest): string {
+  return sha256Hex(canonicalizeReviewedSemanticManifest(manifest));
+}
+
+/** Retain only manifests actually emitted by main. A renderer digest can select
+ * one of these records but can never manufacture semantic equivalence. */
+export function rememberReviewedSemanticManifest(manifest: ReviewedSemanticManifest): string {
+  const normalized = cloneAndFreeze(normalizeReviewedSemanticManifest(manifest));
+  const digest = reviewedSemanticManifestDigest(normalized);
+  reviewedManifestByDigest.delete(digest);
+  reviewedManifestByDigest.set(digest, normalized);
+  if (!dischargedPathsByDigest.has(digest)) dischargedPathsByDigest.set(digest, new Set());
+  while (reviewedManifestByDigest.size > REVIEWED_MANIFEST_REGISTRY_CAP) {
+    const oldest = reviewedManifestByDigest.keys().next().value as string | undefined;
+    if (!oldest) break;
+    reviewedManifestByDigest.delete(oldest);
+    dischargedPathsByDigest.delete(oldest);
+  }
+  return digest;
+}
+
+export function reviewCarryVerdictFor(
+  candidate: CommitCandidate | SelectionPreview,
+): ReviewCarryVerdict | null {
+  return carryVerdictByCandidate.get(candidate) ?? null;
+}
+
+function effectMap(manifest: ReviewedSemanticManifest): Map<string, NormalizedCommitEffect> {
+  const result = new Map<string, NormalizedCommitEffect>();
+  for (const member of manifest.members) {
+    for (const effect of member.commitEffects) {
+      const prior = result.get(effect.pathBytesBase64);
+      if (prior && !canonicalEqual(prior, effect)) {
+        throw new Error(`Conflicting reviewed effects for ${effect.pathBytesBase64}.`);
+      }
+      result.set(effect.pathBytesBase64, effect);
+    }
+  }
+  return result;
+}
+
+function exactLedgerLink(
+  expected: Pick<NormalizedCommitEffect, 'pathBytesBase64' | 'expectedState' | 'rawBlobOid' | 'commitBlobOid' | 'commitMode'>,
+  context: CandidateBuildContext,
+): CandidateLedgerLink | null {
+  return context.ledger.find((link) =>
+    typeof link.commitOid === 'string'
+    && link.pathBytesBase64 === expected.pathBytesBase64
+    && link.expectedState === expected.expectedState
+    && link.commitBlobOid === expected.commitBlobOid
+    && link.commitMode === expected.commitMode
+    && (link.rawBlobOidAtCommit === undefined || link.rawBlobOidAtCommit === expected.rawBlobOid)
+    && (link.commitOid === context.pinnedHeadOid
+      || context.reachableCommitOids?.has(link.commitOid))) ?? null;
+}
+
+function currentHeadMatches(
+  expected: Pick<NormalizedCommitEffect, 'pathBytesBase64' | 'expectedState' | 'commitBlobOid' | 'commitMode'>,
+  link: CandidateLedgerLink,
+  context: CandidateBuildContext,
+): boolean {
+  if (link.commitOid === context.pinnedHeadOid) return true;
+  const head = context.currentHeadEntriesByPath?.get(expected.pathBytesBase64);
+  return !!head
+    && head.expectedState === expected.expectedState
+    && head.commitBlobOid === expected.commitBlobOid
+    && head.commitMode === expected.commitMode;
+}
+
+function exactDischargeProof(effect: NormalizedCommitEffect, context: CandidateBuildContext): boolean {
+  const link = exactLedgerLink(effect, context);
+  return link !== null && currentHeadMatches(effect, link, context);
+}
+
+function freshClosureProven(manifest: ReviewedSemanticManifest, context: CandidateBuildContext): boolean {
+  return manifest.closureObligations.every((obligation) => {
+    const asEffect: NormalizedCommitEffect = {
+      pathBytesBase64: obligation.pathBytesBase64,
+      operation: obligation.expectedState === 'absent' ? 'delete' : 'retain',
+      expectedState: obligation.expectedState,
+      rawBlobOid: null,
+      commitBlobOid: obligation.commitBlobOid,
+      commitMode: obligation.commitMode,
+    };
+    const link = context.ledger.find((candidate) =>
+      typeof candidate.commitOid === 'string'
+      && candidate.pathBytesBase64 === obligation.pathBytesBase64
+      && candidate.expectedState === obligation.expectedState
+      && candidate.commitBlobOid === obligation.commitBlobOid
+      && candidate.commitMode === obligation.commitMode
+      && (candidate.commitOid === context.pinnedHeadOid
+        || context.reachableCommitOids?.has(candidate.commitOid))) ?? null;
+    return link !== null && currentHeadMatches(asEffect, link, context);
+  });
+}
+
+function atomsCovered(
+  current: readonly ReviewChallengeAtom[],
+  acknowledged: readonly ReviewChallengeAtom[],
+): boolean {
+  const acknowledgedCanonical = new Set(acknowledged.map((atom) => canonicalize(atom)));
+  return current.every((atom) => acknowledgedCanonical.has(canonicalize(atom)));
+}
+
+function challengeMatchesTopology(manifest: ReviewedSemanticManifest): boolean {
+  const unattributedAtoms = new Set(manifest.challengeAtoms
+    .filter((atom): atom is Extract<ReviewChallengeAtom, { kind: 'unattributed' }> =>
+      atom.kind === 'unattributed')
+    .map((atom) => atom.pathBytesBase64));
+  if (!manifest.attributionTopology.selectedUnattributedPathBytesBase64.every((path) =>
+    unattributedAtoms.has(path))) return false;
+  return !manifest.attributionTopology.requiresOverlapAck
+    || manifest.challengeAtoms.some((atom) => atom.kind === 'overlap');
+}
+
+/** Adopted carry predicate: equality of the reviewed universe with the sole
+ * proof-bearing asymmetry that an exact reviewed effect may be discharged. */
+export function evaluateReviewedManifestCarry(
+  reviewed: ReviewedSemanticManifest,
+  fresh: ReviewedSemanticManifest,
+  acknowledgedAtoms: readonly ReviewChallengeAtom[],
+  context: CandidateBuildContext,
+  freshEligibility: CommitEligibility,
+  previouslyDischargedPaths: ReadonlySet<string> = new Set(),
+): ReviewCarryVerdict {
+  const reviewedDigest = reviewedSemanticManifestDigest(reviewed);
+  const refuse = (reason: ReviewCarryRefusalReason, paths?: string[]): ReviewCarryVerdict => ({
+    carried: false,
+    reviewedManifestDigest: reviewedDigest,
+    reason,
+    ...(paths && paths.length > 0 ? { paths: sortedUniqueStrings(paths) } : {}),
+  });
+  if (reviewed.manifestVersion !== fresh.manifestVersion
+      || reviewed.candidateContractVersion !== fresh.candidateContractVersion
+      || reviewed.repositoryKey !== fresh.repositoryKey
+      || reviewed.objectDatabaseKey !== fresh.objectDatabaseKey
+      || reviewed.gitObjectFormat !== fresh.gitObjectFormat) {
+    return refuse('contract-or-repository-changed');
+  }
+  if (!canonicalEqual(reviewed.finalizations, fresh.finalizations)) {
+    return refuse('durable-intent-changed');
+  }
+  if (!freshEligibility.eligible || context.indexFingerprint.hasUnmerged) {
+    return refuse('fresh-eligibility-failed');
+  }
+  const reviewedEffects = effectMap(reviewed);
+  const pendingEffects = effectMap(fresh);
+  const outside = [...pendingEffects.keys()].filter((path) => !reviewedEffects.has(path));
+  if (outside.length > 0) return refuse('reviewed-universe-changed', outside);
+  const reintroduced = [...pendingEffects.keys()].filter((path) => previouslyDischargedPaths.has(path));
+  if (reintroduced.length > 0) return refuse('reviewed-universe-changed', reintroduced);
+  const pending: string[] = [];
+  const discharged: string[] = [];
+  for (const [path, effect] of reviewedEffects) {
+    const current = pendingEffects.get(path);
+    if (current) {
+      if (!canonicalEqual(effect, current)) return refuse('pending-effect-changed', [path]);
+      pending.push(path);
+    } else {
+      if (!exactDischargeProof(effect, context)) return refuse('discharge-unproven', [path]);
+      discharged.push(path);
+    }
+  }
+  if (pending.length + discharged.length !== reviewedEffects.size) {
+    return refuse('reviewed-universe-changed');
+  }
+
+  const pendingSet = new Set(pending);
+  const expectedClosure = [...reviewed.closureObligations];
+  for (const member of reviewed.members) {
+    if (member.commitEffects.some((effect) => pendingSet.has(effect.pathBytesBase64))) continue;
+    for (const finalizationId of member.coveringFinalizationIds) {
+      expectedClosure.push({
+        finalizationId,
+        pathBytesBase64: member.finalPathBytesBase64,
+        expectedState: member.expectedState,
+        commitBlobOid: member.commitBlobOid,
+        commitMode: member.commitMode,
+      });
+    }
+  }
+  if (!canonicalEqual(
+    normalizeReviewedSemanticManifest({ ...reviewed, closureObligations: expectedClosure }).closureObligations,
+    fresh.closureObligations,
+  ) || !freshClosureProven(fresh, context)) {
+    return refuse('fresh-closure-unproven');
+  }
+
+  const retainedLogicalPaths = new Set(reviewed.members
+    .filter((member) => member.commitEffects.some((effect) => pendingSet.has(effect.pathBytesBase64)))
+    .map((member) => member.finalPathBytesBase64));
+  const expectedTopology = projectTopology(reviewed.attributionTopology, retainedLogicalPaths);
+  if (!canonicalEqual(expectedTopology, fresh.attributionTopology)) {
+    return refuse('attribution-changed');
+  }
+  if (!challengeMatchesTopology(fresh)
+      || (discharged.length === 0 && !canonicalEqual(reviewed.challengeAtoms, fresh.challengeAtoms))) {
+    return refuse('challenge-not-covered');
+  }
+  if (!atomsCovered(fresh.challengeAtoms, acknowledgedAtoms)) {
+    return refuse('challenge-not-covered');
+  }
+  return {
+    carried: true,
+    reviewedManifestDigest: reviewedDigest,
+    pendingPathBytesBase64: pending.sort(compareBase64),
+    dischargedPathBytesBase64: discharged.sort(compareBase64),
+  };
 }
 
 function retainedEffect(

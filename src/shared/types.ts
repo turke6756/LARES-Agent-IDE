@@ -2138,6 +2138,10 @@ export interface SaveCardPreviewRequest {
   selectedComponentIds: string[];
   selectedUnattributedEntryIds: string[];
   finalizationIds: string[];
+  /** Optional prior main-issued review identity used by a fresh carry check. */
+  reviewedManifestDigest?: string;
+  /** Exact atoms the human saw and acknowledged; main validates coverage. */
+  acknowledgedChallengeAtoms?: import('./commit-candidates').ReviewChallengeAtom[];
 }
 
 /** Dedicated token-issuing transition. Preview remains strictly read-only; the
@@ -2149,6 +2153,10 @@ export interface SaveCardMintRequest {
   finalizationIds: string[];
   acknowledgeTopologyDigest: string | null;
   acknowledgeUnattributedEntryIds: string[];
+  /** Optional prior main-issued review identity used by a fresh carry check. */
+  reviewedManifestDigest?: string;
+  /** Exact atoms the human saw and acknowledged; never an equivalence claim. */
+  acknowledgedChallengeAtoms?: import('./commit-candidates').ReviewChallengeAtom[];
 }
 
 /** Path-byte-authoritative movement between a frozen finalization manifest and
@@ -2208,6 +2216,25 @@ export interface SaveCardPreviewResponse {
   /** Null only when this transition may advance. SelectionDrift remains a
    * separate typed DTO and supplies path-specific evidence for this refusal. */
   refusal: import('./commit-candidates').SaveRefusal | null;
+  /** Renderer-safe projection of the versioned manifest built by main. */
+  reviewedManifest?: ReviewedSemanticReviewView;
+  /** Durable re-resolution handles; no live component/bundle/entry ids. */
+  durableFinalizationIntent?: Array<{
+    finalizationId: string;
+    packageId: string;
+    packageRevision: number;
+    boundaryStatus: 'ready';
+    frozenMemberManifestDigest: string;
+  }>;
+  /** Main's predicate verdict when the request attempted to carry prior review. */
+  reviewCarry?: {
+    carried: boolean;
+    reviewedManifestDigest: string;
+    reason?: string;
+    pendingPathBytesBase64?: string[];
+    dischargedPathBytesBase64?: string[];
+    paths?: string[];
+  };
 }
 
 export interface SaveCardMintResponse extends SaveCardPreviewResponse {}

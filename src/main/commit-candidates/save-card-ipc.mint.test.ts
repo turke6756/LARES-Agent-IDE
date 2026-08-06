@@ -54,9 +54,14 @@ function repository(): RepositoryIdentity {
   };
 }
 function entry(id: string): DirtyEntry {
+  const path = {
+    pathBytesBase64: Buffer.from(`${id}.txt`, 'utf8').toString('base64'),
+    displayPath: `${id}.txt`,
+    utf8Clean: true,
+  };
   return {
     entryId: id,
-    path: { pathBytesBase64: `path-${id}`, displayPath: `${id}.txt`, utf8Clean: true },
+    path,
     originalPath: null,
     entryKind: 'ordinary',
     indexStatus: '.',
@@ -69,7 +74,7 @@ function entry(id: string): DirtyEntry {
     expectedWorktreeState: 'present',
     rawWorktreeBlobOid: `raw-${id}`,
     gitLevelEligibility: 'supported',
-    commitPathspecs: [],
+    commitPathspecs: [path],
   };
 }
 function component(member: DirtyEntry): ConflictComponent {
@@ -146,6 +151,8 @@ function harness(
         finalizationIds: req.finalizationIds,
         acknowledgeTopologyDigest: req.acknowledgeTopologyDigest,
         acknowledgeUnattributedEntryIds: req.acknowledgeUnattributedEntryIds,
+        reviewedManifestDigest: req.reviewedManifestDigest,
+        acknowledgedChallengeAtoms: req.acknowledgedChallengeAtoms,
       }, ctx),
       context: ctx,
     }),
@@ -199,6 +206,8 @@ function overlapHarness(previewCtx: CandidateBuildContext, mintCtx: CandidateBui
         finalizationIds: req.finalizationIds,
         acknowledgeTopologyDigest: req.acknowledgeTopologyDigest,
         acknowledgeUnattributedEntryIds: req.acknowledgeUnattributedEntryIds,
+        reviewedManifestDigest: req.reviewedManifestDigest,
+        acknowledgedChallengeAtoms: req.acknowledgedChallengeAtoms,
       }, mintCtx),
       context: mintCtx,
     }),
@@ -246,6 +255,64 @@ async function mint(ipc: FakeIpc, req: SaveCardMintRequest): Promise<SaveCardMin
   assert.equal(minted.candidateId, previewed.candidateId);
   assert.equal(response.componentTopologyDigest, request(ctx).acknowledgeTopologyDigest);
   assert.equal(service.resolveCandidateToken(minted.token!.tokenId)?.candidate.candidateId, minted.candidateId);
+
+  // WP-4: operational identity moves with HEAD, while the separately versioned
+  // reviewed manifest and exact acknowledged atoms carry server-side.
+  const movedHeadContext = { ...ctx, pinnedHeadOid: 'head-after-package-1' };
+  const carryIpc = overlapHarness(ctx, movedHeadContext);
+  const carrySelection = {
+    workspaceId: 'ws-1',
+    selectedComponentIds: ['component-1'],
+    selectedUnattributedEntryIds: [],
+    finalizationIds: ['fin-1'],
+  };
+  const reviewed = await carryIpc.invoke(
+    SAVECARD_PREVIEW_CHANNEL,
+    carrySelection,
+  ) as import('../../shared/types').SaveCardPreviewResponse;
+  assert.ok(reviewed.reviewedManifest, 'preview returns a versioned review digest and atoms');
+  assert.deepEqual(reviewed.durableFinalizationIntent?.map((intent) => intent.finalizationId), ['fin-1']);
+  const carried = await mint(carryIpc, {
+    ...carrySelection,
+    acknowledgeTopologyDigest: reviewed.componentTopologyDigest,
+    acknowledgeUnattributedEntryIds: [],
+    reviewedManifestDigest: reviewed.reviewedManifest!.reviewedManifestDigest,
+    acknowledgedChallengeAtoms: reviewed.reviewedManifest!.challengeAtoms,
+  });
+  assert.ok(candidate(carried).token, 'HEAD movement alone still mints a fresh operational token');
+  assert.notEqual(candidate(carried).candidateId, (reviewed.candidate as CommitCandidate).candidateId);
+  assert.equal(carried.reviewCarry?.carried, true);
+
+  const unknownReview = await mint(carryIpc, {
+    ...carrySelection,
+    acknowledgeTopologyDigest: reviewed.componentTopologyDigest,
+    acknowledgeUnattributedEntryIds: [],
+    reviewedManifestDigest: 'f'.repeat(64),
+    acknowledgedChallengeAtoms: reviewed.reviewedManifest!.challengeAtoms,
+  });
+  assert.equal(candidate(unknownReview).token, null, 'unknown renderer digest refuses before mint');
+  assert.equal(unknownReview.reviewCarry?.reason, 'review-manifest-unknown');
+
+  const unattributedCarryIpc = overlapHarness(context(true), context(true));
+  const unattributedSelection = {
+    workspaceId: 'ws-1', selectedComponentIds: [],
+    selectedUnattributedEntryIds: ['entry-1'], finalizationIds: ['fin-1'],
+  };
+  const unattributedReview = await unattributedCarryIpc.invoke(
+    SAVECARD_PREVIEW_CHANNEL,
+    unattributedSelection,
+  ) as import('../../shared/types').SaveCardPreviewResponse;
+  assert.equal(unattributedReview.reviewedManifest?.challengeAtoms.length, 1);
+  const rendererClaimWithoutAtom = await mint(unattributedCarryIpc, {
+    ...unattributedSelection,
+    acknowledgeTopologyDigest: unattributedReview.componentTopologyDigest,
+    acknowledgeUnattributedEntryIds: ['entry-1'],
+    reviewedManifestDigest: unattributedReview.reviewedManifest!.reviewedManifestDigest,
+    acknowledgedChallengeAtoms: [],
+  });
+  assert.equal(candidate(rendererClaimWithoutAtom).token, null);
+  assert.equal(rendererClaimWithoutAtom.reviewCarry?.reason, 'challenge-not-covered',
+    'main validates fresh atom coverage before mint');
 
   const telemetry: Array<{ stage: string; code: string }> = [];
   const telemetryHarness = harness(ctx, new ComposeLockRegistry(), (event) => telemetry.push(event));
