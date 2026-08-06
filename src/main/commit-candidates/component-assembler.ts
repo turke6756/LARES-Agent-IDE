@@ -1,11 +1,14 @@
 import { createHash } from 'node:crypto';
 
 import type {
+  AttributionContributor,
   BundleAssociation,
   BundleOverlap,
   ConflictComponent,
   DirtyEntry,
   DirtyInventory,
+  ReviewChallengeAtom,
+  ReviewedAttributionTopology,
 } from '../../shared/commit-candidates';
 import type { DirtyInventoryDraft } from './dirty-inventory';
 import { canonicalize } from './jcs';
@@ -14,16 +17,21 @@ import type { ProjectedWitness } from './witness-projection';
 export interface ComponentAssembly {
   inventory: DirtyInventory;
   components: ConflictComponent[];
+  selectedTopology: ReviewedAttributionTopology;
+  ownershipGroupKeys: string[];
+  overlapChallengeAtoms: ReviewChallengeAtom[];
 }
 
 interface TopologyContributor {
   turnId: string;
   agentId: string | null;
+  ownerAgentId: string | null;
   planId: string | null;
   planItemId: string | null;
 }
 
 interface TopologyEntry {
+  entryId: string;
   pathBytesBase64: string;
   contributors: TopologyContributor[];
 }
@@ -46,6 +54,7 @@ function compareNullableStrings(left: string | null, right: string | null): numb
 function compareContributors(left: TopologyContributor, right: TopologyContributor): number {
   return compareStrings(left.turnId, right.turnId)
     || compareNullableStrings(left.agentId, right.agentId)
+    || compareNullableStrings(left.ownerAgentId, right.ownerAgentId)
     || compareNullableStrings(left.planId, right.planId)
     || compareNullableStrings(left.planItemId, right.planItemId);
 }
@@ -65,12 +74,14 @@ function topologyEntries(
         const contributor: TopologyContributor = {
           turnId: witness.turnId,
           agentId: witness.agentId,
+          ownerAgentId: witness.ownerAgentId,
           planId: witness.planId,
           planItemId: witness.planItemId,
         };
         contributors.set(contributorKey(contributor), contributor);
       }
       return {
+        entryId: entry.entryId,
         pathBytesBase64: entry.path.pathBytesBase64,
         contributors: [...contributors.values()].sort(compareContributors),
       };
@@ -81,14 +92,16 @@ function topologyEntries(
     );
 }
 
-function topologyDigest(
+function topologyDigestForEntries(
   repositoryKey: string,
-  entries: readonly DirtyEntry[],
-  witnessesByEntry: ReadonlyMap<string, readonly ProjectedWitness[]>,
+  entries: readonly TopologyEntry[],
 ): string {
   return sha256(canonicalize({
     repositoryKey,
-    entries: topologyEntries(entries, witnessesByEntry),
+    entries: entries.map(({ pathBytesBase64, contributors }) => ({
+      pathBytesBase64,
+      contributors,
+    })),
   }));
 }
 
@@ -165,50 +178,115 @@ function associationsFor(
 
 function overlapFor(
   componentId: string,
-  entryIds: readonly string[],
-  witnessesByEntry: ReadonlyMap<string, readonly ProjectedWitness[]>,
+  entries: readonly TopologyEntry[],
+  ownershipGroupKeys: readonly string[],
 ): BundleOverlap {
   const agentIds = new Set<string>();
-  const ownershipPlanGroups = new Set<string>();
   const perPathContributors: BundleOverlap['perPathContributors'] = {};
 
-  for (const entryId of entryIds) {
+  for (const entry of entries) {
     const turnIds = new Set<string>();
     const pathAgentIds = new Set<string>();
     const planIds = new Set<string | null>();
 
-    for (const witness of witnessesByEntry.get(entryId) ?? []) {
-      turnIds.add(witness.turnId);
-      if (witness.agentId !== null) {
-        agentIds.add(witness.agentId);
-        pathAgentIds.add(witness.agentId);
+    for (const contributor of entry.contributors) {
+      turnIds.add(contributor.turnId);
+      if (contributor.agentId !== null) {
+        agentIds.add(contributor.agentId);
+        pathAgentIds.add(contributor.agentId);
       }
-      planIds.add(witness.planId);
+      planIds.add(contributor.planId);
 
-      // Workers launched by one owner remain one ownership unit. Unowned turns
-      // fall back to their own agent identity (or one explicit owner-less unit).
-      const ownerId = witness.ownerAgentId ?? witness.agentId;
-      ownershipPlanGroups.add(canonicalize([
-        ownerId,
-        witness.planId,
-        witness.planItemId,
-      ]));
     }
 
-    perPathContributors[entryId] = {
+    perPathContributors[entry.entryId] = {
       turnIds: sortedUnique(turnIds),
       agentIds: sortedUnique(pathAgentIds),
       planIds: [...planIds].sort(compareNullableStrings),
     };
   }
 
-  const mergedGroupCount = ownershipPlanGroups.size;
+  const mergedGroupCount = ownershipGroupKeys.length;
   return {
     componentId,
     contributingAgentCount: agentIds.size,
     mergedGroupCount,
     perPathContributors,
     requiresOverlapAck: mergedGroupCount >= 2,
+  };
+}
+
+function ownershipGroupKeysFor(entries: readonly TopologyEntry[]): string[] {
+  // Workers launched by one owner remain one ownership unit. Unowned turns
+  // fall back to their own agent identity (or one explicit owner-less unit).
+  return sortedUnique(entries.flatMap((entry) => entry.contributors.map((contributor) =>
+    canonicalize([
+      contributor.ownerAgentId ?? contributor.agentId,
+      contributor.planId,
+      contributor.planItemId,
+    ]),
+  )));
+}
+
+function reviewedContributorsFor(entries: readonly TopologyEntry[]): AttributionContributor[] {
+  return entries.flatMap((entry) => entry.contributors
+    // A witness without an agent identity still participates in the existing
+    // owner-less overlap group, but cannot satisfy AttributionContributor's
+    // explicit agent identity contract.
+    .filter((contributor): contributor is TopologyContributor & { agentId: string } =>
+      contributor.agentId !== null)
+    .map((contributor): AttributionContributor => ({
+      pathBytesBase64: entry.pathBytesBase64,
+      turnId: contributor.turnId,
+      agentId: contributor.agentId,
+      ownerAgentId: contributor.ownerAgentId,
+      planId: contributor.planId,
+      planItemId: contributor.planItemId,
+    })));
+}
+
+function componentEdgesFor(entries: readonly TopologyEntry[]): ReviewedAttributionTopology['componentEdges'] {
+  const edges: ReviewedAttributionTopology['componentEdges'] = [];
+  for (let leftIndex = 0; leftIndex < entries.length; leftIndex++) {
+    for (let rightIndex = leftIndex + 1; rightIndex < entries.length; rightIndex++) {
+      const left = entries[leftIndex];
+      const right = entries[rightIndex];
+      const connected = left.contributors.some((leftContributor) =>
+        right.contributors.some((rightContributor) =>
+          leftContributor.turnId === rightContributor.turnId
+          || (leftContributor.agentId !== null && leftContributor.agentId === rightContributor.agentId),
+        ));
+      if (connected) {
+        const [leftPathBytesBase64, rightPathBytesBase64] = [
+          left.pathBytesBase64,
+          right.pathBytesBase64,
+        ].sort(compareStrings);
+        edges.push({ leftPathBytesBase64, rightPathBytesBase64 });
+      }
+    }
+  }
+  return edges.sort((left, right) =>
+    compareStrings(left.leftPathBytesBase64, right.leftPathBytesBase64)
+    || compareStrings(left.rightPathBytesBase64, right.rightPathBytesBase64));
+}
+
+function overlapChallengeAtomFor(
+  entries: readonly TopologyEntry[],
+  ownershipGroupKeys: readonly string[],
+): ReviewChallengeAtom {
+  const memberPathBytesBase64 = sortedUnique(entries.map((entry) => entry.pathBytesBase64));
+  const contributors = reviewedContributorsFor(entries);
+  const atomBody = {
+    reasonVersion: 1 as const,
+    memberPathBytesBase64,
+    contributors,
+    ownershipGroupKeys: [...ownershipGroupKeys],
+  };
+  return {
+    kind: 'overlap',
+    atomId: `overlap:${sha256(canonicalize(memberPathBytesBase64))}`,
+    digest: sha256(canonicalize(atomBody)),
+    ...atomBody,
   };
 }
 
@@ -266,20 +344,26 @@ export function assembleConflictComponents(
     else entryIdsByRoot.set(root, [entryId]);
   }
 
+  const allTopologyEntries = topologyEntries(entries, witnessesByEntry);
+  const topologyByEntryId = new Map(allTopologyEntries.map((entry) => [entry.entryId, entry]));
+  const topologyEntriesByComponentId = new Map<string, TopologyEntry[]>();
+  const ownershipGroupKeysByComponentId = new Map<string, string[]>();
   const components = [...entryIdsByRoot.values()]
     .map((entryIds): ConflictComponent => {
       const dirtyEntryIds = sortedUnique(entryIds);
-      const componentEntries = dirtyEntryIds.map((entryId) => entriesById.get(entryId)!);
+      const componentTopologyEntries = dirtyEntryIds.map((entryId) => topologyByEntryId.get(entryId)!);
       const componentId = sha256(draft.repository.repositoryKey + dirtyEntryIds.join(''));
+      const componentOwnershipGroupKeys = ownershipGroupKeysFor(componentTopologyEntries);
+      topologyEntriesByComponentId.set(componentId, componentTopologyEntries);
+      ownershipGroupKeysByComponentId.set(componentId, componentOwnershipGroupKeys);
       return {
         componentId,
         dirtyEntryIds,
         associations: associationsFor(dirtyEntryIds, witnessesByEntry),
-        overlap: overlapFor(componentId, dirtyEntryIds, witnessesByEntry),
-        componentTopologyDigest: topologyDigest(
+        overlap: overlapFor(componentId, componentTopologyEntries, componentOwnershipGroupKeys),
+        componentTopologyDigest: topologyDigestForEntries(
           draft.repository.repositoryKey,
-          componentEntries,
-          witnessesByEntry,
+          componentTopologyEntries,
         ),
       };
     })
@@ -290,13 +374,45 @@ export function assembleConflictComponents(
     .map((entry) => entry.entryId)
     .sort(compareStrings);
 
+  const selectedUnattributedPathBytesBase64 = sortedUnique(unattributedEntryIds.map(
+    (entryId) => entriesById.get(entryId)!.path.pathBytesBase64,
+  ));
+  const componentTopologyEntries = components.map(
+    (component) => topologyEntriesByComponentId.get(component.componentId)!,
+  );
+  const ownershipGroupKeys = sortedUnique(components.flatMap(
+    (component) => ownershipGroupKeysByComponentId.get(component.componentId)!,
+  ));
+  const overlapChallengeAtoms = components
+    .filter((component) => component.overlap.requiresOverlapAck)
+    .map((component) => {
+      const topology = topologyEntriesByComponentId.get(component.componentId)!;
+      return overlapChallengeAtomFor(
+        topology,
+        ownershipGroupKeysByComponentId.get(component.componentId)!,
+      );
+    })
+    .sort((left, right) => compareStrings(left.atomId, right.atomId));
+  const selectedTopology: ReviewedAttributionTopology = {
+    componentPathSets: componentTopologyEntries.map((componentEntries) =>
+      sortedUnique(componentEntries.map((entry) => entry.pathBytesBase64))),
+    contributors: componentTopologyEntries.flatMap(reviewedContributorsFor),
+    ownershipGroupKeys,
+    componentEdges: componentTopologyEntries.flatMap(componentEdgesFor),
+    requiresOverlapAck: overlapChallengeAtoms.length > 0,
+    selectedUnattributedPathBytesBase64,
+  };
+
   return {
     inventory: {
       repository: draft.repository,
       entries,
       unattributedEntryIds,
-      topologyDigest: topologyDigest(draft.repository.repositoryKey, entries, witnessesByEntry),
+      topologyDigest: topologyDigestForEntries(draft.repository.repositoryKey, allTopologyEntries),
     },
     components,
+    selectedTopology,
+    ownershipGroupKeys,
+    overlapChallengeAtoms,
   };
 }

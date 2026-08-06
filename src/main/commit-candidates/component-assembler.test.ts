@@ -61,13 +61,14 @@ function witness(
   agentId: string | null,
   planId: string | null = null,
   planItemId: string | null = null,
+  ownerAgentId: string | null = null,
 ): ProjectedWitness {
   return {
     entryId,
     workspaceId: 'workspace',
     turnId,
     agentId,
-    ownerAgentId: null,
+    ownerAgentId,
     ownerBrickGeneration: null,
     planId,
     planItemId,
@@ -253,6 +254,42 @@ test('emits exact stamped associations and owner-plan overlap groups', () => {
   ]);
   assert.equal(component.overlap.mergedGroupCount, 2);
   assert.equal(component.overlap.requiresOverlapAck, true);
+});
+
+test('binds owner identity into topology digests and the overlap challenge', () => {
+  const inventory = draft('A', 'B');
+  const sharedOwner = assembleConflictComponents(inventory, [
+    witness('A', 'turn-1', 'agent-1', 'plan-1', 'item-1', 'owner-1'),
+    witness('B', 'turn-2', 'agent-1', 'plan-1', 'item-1', 'owner-1'),
+  ]);
+  const splitOwners = assembleConflictComponents(inventory, [
+    witness('A', 'turn-1', 'agent-1', 'plan-1', 'item-1', 'owner-1'),
+    witness('B', 'turn-2', 'agent-1', 'plan-1', 'item-1', 'owner-2'),
+  ]);
+
+  assert.equal(sharedOwner.components[0].overlap.requiresOverlapAck, false);
+  assert.equal(splitOwners.components[0].overlap.requiresOverlapAck, true);
+  assert.notEqual(
+    sharedOwner.components[0].componentTopologyDigest,
+    splitOwners.components[0].componentTopologyDigest,
+  );
+  assert.notEqual(sharedOwner.inventory.topologyDigest, splitOwners.inventory.topologyDigest);
+  assert.equal(sharedOwner.selectedTopology.requiresOverlapAck, false);
+  assert.deepEqual(sharedOwner.overlapChallengeAtoms, []);
+  assert.equal(splitOwners.selectedTopology.requiresOverlapAck, true);
+  assert.equal(splitOwners.ownershipGroupKeys.length, 2);
+  assert.equal(splitOwners.overlapChallengeAtoms.length, 1);
+  const [overlapAtom] = splitOwners.overlapChallengeAtoms;
+  assert.equal(overlapAtom.kind, 'overlap');
+  if (overlapAtom.kind !== 'overlap') throw new Error('expected overlap challenge atom');
+  assert.deepEqual(
+    overlapAtom.ownershipGroupKeys,
+    splitOwners.ownershipGroupKeys,
+  );
+  assert.deepEqual(
+    overlapAtom.contributors,
+    splitOwners.selectedTopology.contributors,
+  );
 });
 
 let failures = 0;
