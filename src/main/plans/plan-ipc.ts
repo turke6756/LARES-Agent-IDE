@@ -1,6 +1,7 @@
 // Main-process IPC surface for plans and proposals.
 
 import { ipcMain } from 'electron';
+import { randomBytes } from 'node:crypto';
 import fs from 'fs';
 import path from 'path';
 import type {
@@ -22,10 +23,13 @@ import type {
   PlanReviewProjection,
   PlanReviewProjectionRequest,
   SaveCardBundle,
+  Workspace,
+  ObservedOverviewSourceToken,
 } from '../../shared/types';
 import {
   hasSupervisorPrivilege,
   isPlanTabKey,
+  PLAN_TAB_KEYS,
   PLAN_REVIEW_PROJECTION_CHANNEL,
 } from '../../shared/types';
 import {
@@ -37,6 +41,10 @@ import {
   getPromotionRequestById as dbGetPromotionRequestById,
   getPlanTabOverview as dbGetPlanTabOverview,
   setPlanTabOverview as dbSetPlanTabOverview,
+  getDb,
+  getPlanFolderProjectionState,
+  listPlanTabOverviewSources,
+  recordPlanOverviewProjectionStatus,
   getActivePlanExecutionRun,
   getWorkspace,
   listPlanWorkPackagePaths,
@@ -76,7 +84,7 @@ import {
   type ListPlanCommentsDeps,
 } from './plan-comments';
 import { registerPlanImplementIpc } from './plan-implement';
-import { workspaceStateDir } from '../workspace-state-dir';
+import { workspaceStateDir, workspaceStateDirName } from '../workspace-state-dir';
 import { listMissionBoardCards, listMissionBoardTimeline } from './mission-board';
 import { queryBlameToIntent } from './blame-to-intent';
 import { projectPlanReview, type PlanReviewProjectionInput } from './plan-review-projection';
@@ -86,6 +94,10 @@ import { probeWorkspaceGit } from '../git/git-runtime';
 import { computeBundleCaptureHealth } from '../commit-candidates/capture-health';
 import { projectWorkBundles } from '../commit-candidates/work-bundle';
 import { runGit } from '../git-checkpoints/git-command';
+import { observeOverviewSource, parsePlanHumanOverview,
+  type OverviewSourceObservation } from './plan-human-overview';
+import { parseStrictJson } from './strict-json';
+import { reconcilePlanFolderProjections } from './plan-folder-reconciler';
 
 const MAX_PROMOTED_PLAN_JSON_BYTES = 256_000;
 const ARCHIVED_PLAN_STATUSES = new Set(['archived', 'superseded', 'cancelled', 'canceled']);
@@ -856,6 +868,14 @@ export interface PlanOverviewIpcDeps {
     body: string | null;
     updatedBy: string;
   }) => PlanTabOverview;
+  getStructuredContext?: (planId: string) => StructuredOverviewContext | null;
+  getProjectionState?: typeof getPlanFolderProjectionState;
+  listOverviewSources?: typeof listPlanTabOverviewSources;
+  observe?: (folderAbs: string) => OverviewSourceObservation;
+  replaceFile?: typeof replaceOverviewFile;
+  reconcile?: typeof reconcilePlanFolderProjections;
+  afterTempSync?: (input: { planId: string; tempAbs: string; destinationAbs: string }) => Promise<void> | void;
+  now?: () => number;
 }
 
 function defaultPlanOverviewIpcDeps(): PlanOverviewIpcDeps {
@@ -864,6 +884,25 @@ function defaultPlanOverviewIpcDeps(): PlanOverviewIpcDeps {
     getPlan: dbGetPlan,
     getOverview: dbGetPlanTabOverview,
     setOverview: dbSetPlanTabOverview,
+    getStructuredContext: defaultStructuredContext,
+    getProjectionState: getPlanFolderProjectionState,
+    listOverviewSources: listPlanTabOverviewSources,
+    observe: observeOverviewSource,
+    replaceFile: replaceOverviewFile,
+    reconcile: reconcilePlanFolderProjections,
+  };
+}
+
+function overviewDeps(deps: PlanOverviewIpcDeps) {
+  return {
+    ...deps,
+    getStructuredContext: deps.getStructuredContext ?? defaultStructuredContext,
+    getProjectionState: deps.getProjectionState ?? getPlanFolderProjectionState,
+    listOverviewSources: deps.listOverviewSources ?? listPlanTabOverviewSources,
+    observe: deps.observe ?? observeOverviewSource,
+    replaceFile: deps.replaceFile ?? replaceOverviewFile,
+    reconcile: deps.reconcile ?? reconcilePlanFolderProjections,
+    now: deps.now ?? Date.now,
   };
 }
 
@@ -879,6 +918,326 @@ function readPlanTabRequest(raw: unknown): { planId: string; tab: PlanTabKey } |
   return { planId, tab };
 }
 
+function parseDiagnosticMessages(raw: string): string[] {
+  try {
+    const value = JSON.parse(raw) as unknown;
+    if (!Array.isArray(value)) return [];
+    return value.map((item) => item && typeof item === 'object'
+      && typeof (item as Record<string, unknown>).detail === 'string'
+      ? (item as Record<string, unknown>).detail as string : String(item));
+  } catch { return []; }
+}
+
+type OverviewEditAction = 'save' | 'remove';
+interface OverviewEditRequest {
+  planId: string;
+  tab: PlanTabKey;
+  action: OverviewEditAction;
+  body: string | null;
+  expectedSourceHash: ObservedOverviewSourceToken;
+}
+
+function readOverviewEditRequest(raw: unknown): OverviewEditRequest {
+  const req = readPlanTabRequest(raw);
+  if (!req) throw new PlanOverviewError(
+    'a non-empty planId and a valid tab key are required', 'overview-bad-request',
+  );
+  const record = raw as Record<string, unknown>;
+  const action = record.action === 'remove' || record.body === null ? 'remove' : 'save';
+  const body = record.body;
+  if (action === 'save' && (typeof body !== 'string' || body.trim() === '')) {
+    throw new PlanOverviewError('an overview body is required; use Remove to delete a section', 'overview-empty-body');
+  }
+  if (body !== null && body !== undefined && typeof body !== 'string') {
+    throw new PlanOverviewError('body must be a string or null', 'overview-bad-request');
+  }
+  const token = record.expectedSourceHash;
+  if (typeof token !== 'string' || !/^(?:absent|unsafe|unreadable|sha256:[a-f0-9]{64})$/.test(token)) {
+    throw new PlanOverviewError('expectedSourceHash is required', 'overview-bad-request');
+  }
+  return { ...req, action, body: typeof body === 'string' ? body : null,
+    expectedSourceHash: token as ObservedOverviewSourceToken };
+}
+
+const OVERVIEW_HEADINGS: Record<PlanTabKey, string> = {
+  overview: 'Overview', proposal: 'Proposal', plan: 'Plan', deliberations: 'Deliberations',
+  research: 'Research', supplements: 'Supplements', packages: 'Packages', 'legacy-html': 'Legacy',
+};
+
+interface LocatedOverviewSection {
+  tab: PlanTabKey; heading: string; beginStart: number; beginEnd: number; endStart: number; endEnd: number;
+}
+
+function outsideMarkdownFenceComments(source: string): Array<{ start: number; end: number; inner: string }> {
+  const normalized = source.replace(/\r\n/g, '\n');
+  const fenceRanges: Array<{ start: number; end: number }> = [];
+  let active: { char: string; length: number; start: number } | null = null;
+  let offset = 0;
+  for (const lineWithBreak of normalized.match(/.*(?:\n|$)/g) ?? []) {
+    if (lineWithBreak === '') continue;
+    const line = lineWithBreak.endsWith('\n') ? lineWithBreak.slice(0, -1) : lineWithBreak;
+    if (!active) {
+      const open = line.match(/^ {0,3}(`{3,}|~{3,})/);
+      if (open) active = { char: open[1][0], length: open[1].length, start: offset };
+    } else {
+      const close = line.match(/^ {0,3}(`+|~+)[ \t]*$/);
+      if (close && close[1][0] === active.char && close[1].length >= active.length) {
+        fenceRanges.push({ start: active.start, end: offset + lineWithBreak.length });
+        active = null;
+      }
+    }
+    offset += lineWithBreak.length;
+  }
+  if (active) fenceRanges.push({ start: active.start, end: normalized.length });
+  const comments: Array<{ start: number; end: number; inner: string }> = [];
+  for (const match of normalized.matchAll(/<!--([\s\S]*?)-->/g)) {
+    if (match.index === undefined || fenceRanges.some((range) => match.index! >= range.start && match.index! < range.end)) continue;
+    comments.push({ start: match.index, end: match.index + match[0].length, inner: match[1] });
+  }
+  if (!source.includes('\r\n')) return comments;
+  const originalOffset = (at: number) => at + (normalized.slice(0, at).match(/\n/g)?.length ?? 0);
+  return comments.map((comment) => ({ start: originalOffset(comment.start), end: originalOffset(comment.end), inner: comment.inner }));
+}
+
+function locateOverviewSections(source: string, artifactId: string): {
+  newline: '\n' | '\r\n'; indexStart: number; indexEnd: number; entries: LocatedOverviewSection[];
+} {
+  const parsed = parsePlanHumanOverview(source, artifactId);
+  if (!parsed.ok) throw new PlanOverviewError(
+    'OVERVIEW.md is invalid; repair it in a file editor before section editing', 'overview-source-invalid',
+  );
+  const newline = source.includes('\r\n') ? '\r\n' : '\n';
+  const comments = outsideMarkdownFenceComments(source);
+  const index = comments.find((comment) => /^PLAN-TAB-OVERVIEWS:v1(?:\s|$)/.test(comment.inner));
+  if (!index) throw new PlanOverviewError('overview index is missing', 'overview-source-invalid');
+  const raw = parseStrictJson(index.inner.replace(/^PLAN-TAB-OVERVIEWS:v1\s*/, '')) as {
+    sections: Array<{ tab: PlanTabKey; heading: string }>;
+  };
+  const entries = raw.sections.map((entry) => {
+    const begin = comments.find((comment) => comment.inner.trim() === `PLAN-TAB-SECTION:${entry.tab}:BEGIN`)!;
+    const end = comments.find((comment) => comment.inner.trim() === `PLAN-TAB-SECTION:${entry.tab}:END`)!;
+    return { ...entry, beginStart: begin.start, beginEnd: begin.end, endStart: end.start, endEnd: end.end };
+  });
+  return { newline, indexStart: index.start, indexEnd: index.end, entries };
+}
+
+function canonicalOverviewIndex(artifactId: string,
+  entries: ReadonlyArray<{ tab: PlanTabKey; heading: string }>, newline: string): string {
+  const ordered = PLAN_TAB_KEYS.flatMap((tab) => {
+    const entry = entries.find((candidate) => candidate.tab === tab);
+    return entry ? [{ tab: entry.tab, heading: entry.heading }] : [];
+  });
+  const json = JSON.stringify({ schema_version: 1, plan_artifact_id: artifactId, sections: ordered }, null, 2)
+    .replace(/\n/g, newline);
+  return `<!--PLAN-TAB-OVERVIEWS:v1${newline}${json}${newline}-->`;
+}
+
+function sectionBlock(tab: PlanTabKey, heading: string, body: string, newline: string): string {
+  const normalizedBody = body.replace(/\r\n?/g, '\n').replace(/\n/g, newline);
+  return `<!--PLAN-TAB-SECTION:${tab}:BEGIN-->${newline}${newline}## ${heading}${newline}${newline}${normalizedBody}${newline}${newline}<!--PLAN-TAB-SECTION:${tab}:END-->`;
+}
+
+export function editPlanHumanOverview(source: string, artifactId: string, tab: PlanTabKey,
+  action: OverviewEditAction, body: string | null): string {
+  const located = locateOverviewSections(source, artifactId);
+  const current = located.entries.find((entry) => entry.tab === tab);
+  if (action === 'remove') {
+    if (!current) throw new PlanOverviewError('overview section is already absent', 'overview-section-absent');
+    let start = current.beginStart;
+    let end = current.endEnd;
+    if (source.slice(end, end + located.newline.length) === located.newline) end += located.newline.length;
+    else if (source.slice(start - located.newline.length, start) === located.newline) start -= located.newline.length;
+    const without = source.slice(0, start) + source.slice(end);
+    const index = canonicalOverviewIndex(artifactId, located.entries.filter((entry) => entry.tab !== tab), located.newline);
+    const removedBeforeIndex = start < located.indexStart ? end - start : 0;
+    const indexStart = located.indexStart - removedBeforeIndex;
+    const indexEnd = located.indexEnd - removedBeforeIndex;
+    return without.slice(0, indexStart) + index + without.slice(indexEnd);
+  }
+  if (!body || body.trim() === '') throw new PlanOverviewError('overview body is empty', 'overview-empty-body');
+  const heading = current?.heading ?? OVERVIEW_HEADINGS[tab];
+  const block = sectionBlock(tab, heading, body, located.newline);
+  if (current) return source.slice(0, current.beginStart) + block + source.slice(current.endEnd);
+  const rewrittenIndex = canonicalOverviewIndex(artifactId, [...located.entries, { tab, heading }], located.newline);
+  const withIndex = source.slice(0, located.indexStart) + rewrittenIndex + source.slice(located.indexEnd);
+  const delta = rewrittenIndex.length - (located.indexEnd - located.indexStart);
+  const following = located.entries.filter((entry) => PLAN_TAB_KEYS.indexOf(entry.tab) > PLAN_TAB_KEYS.indexOf(tab))
+    .sort((a, b) => PLAN_TAB_KEYS.indexOf(a.tab) - PLAN_TAB_KEYS.indexOf(b.tab))[0];
+  const insertAt = following ? following.beginStart + delta : withIndex.length;
+  const before = withIndex.slice(0, insertAt);
+  const after = withIndex.slice(insertAt);
+  const separator = before.endsWith(located.newline + located.newline) ? '' : located.newline;
+  const suffix = after === '' || after.startsWith(located.newline) ? '' : located.newline;
+  return before + separator + block + suffix + after;
+}
+
+function buildOverviewFile(artifactId: string, bodies: ReadonlyMap<PlanTabKey, string>, newline = '\n'): string {
+  const entries = PLAN_TAB_KEYS.filter((tab) => Boolean(bodies.get(tab)?.trim()))
+    .map((tab) => ({ tab, heading: OVERVIEW_HEADINGS[tab] }));
+  const frontmatter = `---${newline}plan_artifact_id: ${artifactId}${newline}kind: human-overview${newline}schema_version: 1${newline}---`;
+  const sections = entries.map((entry) => sectionBlock(entry.tab, entry.heading, bodies.get(entry.tab)!, newline))
+    .join(newline + newline);
+  return `${frontmatter}${newline}${newline}${canonicalOverviewIndex(artifactId, entries, newline)}${sections ? newline + newline + sections : ''}${newline}`;
+}
+
+function verifyStructuredContext(context: StructuredOverviewContext): void {
+  let manifest: unknown;
+  try {
+    const folder = fs.lstatSync(context.folderAbs);
+    const manifestAbs = path.join(context.folderAbs, 'plan.json');
+    const stat = fs.lstatSync(manifestAbs);
+    if (!folder.isDirectory() || folder.isSymbolicLink() || !stat.isFile() || stat.isSymbolicLink()) throw new Error('unsafe');
+    manifest = parseStrictJson(fs.readFileSync(manifestAbs, 'utf8'));
+  } catch {
+    throw new PlanOverviewError('the structured plan folder is unsafe or unreadable', 'overview-folder-unsafe');
+  }
+  if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)
+      || (manifest as Record<string, unknown>).plan_artifact_id !== context.artifactId) {
+    throw new PlanOverviewError('plan.json identity changed', 'overview-identity-mismatch');
+  }
+}
+
+function isTransientOverviewFsError(err: unknown): boolean {
+  const code = (err as NodeJS.ErrnoException).code;
+  return code === 'EPERM' || code === 'EACCES' || code === 'EBUSY';
+}
+
+async function delay(ms: number): Promise<void> {
+  await new Promise<void>((resolve) => setTimeout(resolve, ms));
+}
+
+/** Retried sibling-temp rename. A failure never deletes or rewrites the destination;
+ * the caller owns cleanup of the still-separate temp. */
+export async function replaceOverviewFile(tempAbs: string, destinationAbs: string): Promise<void> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      if (process.platform === 'win32') {
+        try { const stat = fs.lstatSync(destinationAbs); fs.chmodSync(destinationAbs, stat.mode | 0o200); } catch { /* absent/unsupported */ }
+      }
+      fs.renameSync(tempAbs, destinationAbs);
+      return;
+    } catch (err) {
+      if (attempt >= 4 || !isTransientOverviewFsError(err)) throw err;
+      await delay(20 * (attempt + 1));
+    }
+  }
+}
+
+async function writeOverviewReplacement(input: {
+  req: OverviewEditRequest;
+  context: StructuredOverviewContext;
+  next: Buffer;
+  expectedFinalToken: ObservedOverviewSourceToken;
+  deps: ReturnType<typeof overviewDeps>;
+}): Promise<ObservedOverviewSourceToken> {
+  const destinationAbs = path.join(input.context.folderAbs, 'OVERVIEW.md');
+  const tempAbs = `${destinationAbs}.tmp-${randomBytes(16).toString('hex')}`;
+  let handle: fs.promises.FileHandle | null = null;
+  try {
+    handle = await fs.promises.open(tempAbs, 'wx');
+    await handle.writeFile(input.next);
+    await handle.sync();
+    await handle.close();
+    handle = null;
+    await input.deps.afterTempSync?.({ planId: input.req.planId, tempAbs, destinationAbs });
+    verifyStructuredContext(input.context);
+    const finalObservation = input.deps.observe(input.context.folderAbs);
+    if (finalObservation.token !== input.expectedFinalToken) {
+      throw new PlanOverviewError('the overview changed on disk while editing', 'overview-source-stale');
+    }
+    // This last observation narrows the external-writer window but the filesystem
+    // offers no indivisible compare-and-replace primitive. An editor outside Lares
+    // can still write between this observation and rename; later reconciliation
+    // faithfully projects whichever bytes are actually present.
+    await input.deps.replaceFile(tempAbs, destinationAbs);
+    try {
+      const parent = await fs.promises.open(input.context.folderAbs, 'r');
+      try { await parent.sync(); } finally { await parent.close(); }
+    } catch { /* directory sync is unsupported on some platforms */ }
+    return input.deps.observe(input.context.folderAbs).token;
+  } finally {
+    if (handle) try { await handle.close(); } catch { /* best effort */ }
+    try { await fs.promises.unlink(tempAbs); } catch { /* absent or best-effort cleanup */ }
+  }
+}
+
+const overviewWriteTails = new Map<string, Promise<void>>();
+async function serializedOverviewWrite<T>(planId: string, operation: () => Promise<T>): Promise<T> {
+  const prior = overviewWriteTails.get(planId) ?? Promise.resolve();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const queued = prior.catch(() => undefined).then(() => gate);
+  overviewWriteTails.set(planId, queued);
+  await prior.catch(() => undefined);
+  try { return await operation(); }
+  finally {
+    release();
+    if (overviewWriteTails.get(planId) === queued) overviewWriteTails.delete(planId);
+  }
+}
+
+async function runStructuredSetOverview(req: OverviewEditRequest, context: StructuredOverviewContext,
+  deps: ReturnType<typeof overviewDeps>): Promise<PlanOverviewSaveResult> {
+  return serializedOverviewWrite(req.planId, async () => {
+    verifyStructuredContext(context);
+    const responsible = context.responsibleSupervisorId ? deps.getAgent(context.responsibleSupervisorId) : null;
+    if (!responsible || !hasSupervisorPrivilege(responsible) || responsible.workspaceId !== context.workspace.id) {
+      throw new PlanOverviewError('the plan has no valid responsible supervisor', 'overview-supervisor-rejected');
+    }
+    const first = deps.observe(context.folderAbs);
+    if (first.token !== req.expectedSourceHash) {
+      throw new PlanOverviewError('the overview changed on disk while editing', 'overview-source-stale');
+    }
+    if (first.present && (!first.safeRegularFile || first.oversized || !first.bytes)) {
+      throw new PlanOverviewError('OVERVIEW.md must be repaired in a file editor', 'overview-source-invalid');
+    }
+    let next: string;
+    if (first.bytes) {
+      next = editPlanHumanOverview(first.bytes.toString('utf8'), context.artifactId, req.tab, req.action, req.body);
+    } else {
+      if (req.action === 'remove') throw new PlanOverviewError('overview section is already absent', 'overview-section-absent');
+      const bodies = new Map<PlanTabKey, string>();
+      const state = deps.getProjectionState(req.planId);
+      if (state?.overviewAdoptionState === 'never-seen' && deps.listOverviewSources(req.planId).length === 0) {
+        for (const tab of PLAN_TAB_KEYS) {
+          const stored = deps.getOverview(req.planId, tab)?.body;
+          if (stored?.trim()) bodies.set(tab, stored);
+        }
+      }
+      bodies.set(req.tab, req.body!);
+      next = buildOverviewFile(context.artifactId, bodies);
+    }
+    const parsedNext = parsePlanHumanOverview(next, context.artifactId);
+    if (!parsedNext.ok) throw new PlanOverviewError('the edited overview did not validate', 'overview-edit-invalid');
+    const savedToken = await writeOverviewReplacement({
+      req, context, next: Buffer.from(next, 'utf8'), expectedFinalToken: first.token, deps,
+    });
+    let outcome: PlanOverviewSaveResult['outcome'] = 'overview-saved';
+    try {
+      await deps.reconcile({ workspace: context.workspace, planFolderRelPath: context.folderRelPath, changeKind: 'manual' });
+    } catch (err) {
+      outcome = 'overview-saved-projection-pending';
+      try {
+        recordPlanOverviewProjectionStatus({
+          workspaceId: context.workspace.id, planId: req.planId, status: 'apply-error',
+          sourceHash: savedToken.startsWith('sha256:') ? savedToken : null,
+          diagnostics: [{ code: 'overview-apply-failed', detail: err instanceof Error ? err.message : String(err) }],
+          reconciledAt: deps.now(), observedPresent: true,
+        });
+      } catch { /* durable disk write remains authoritative; reconciliation retries */ }
+    }
+    const stored = deps.getOverview(req.planId, req.tab);
+    const stamp = new Date(deps.now()).toISOString();
+    return {
+      planId: req.planId, tab: req.tab,
+      body: stored?.body ?? (req.action === 'remove' ? null : req.body),
+      revision: stored?.revision ?? 0, updatedBy: stored?.updatedBy ?? responsible.id,
+      createdAt: stored?.createdAt ?? stamp, updatedAt: stored?.updatedAt ?? stamp,
+      outcome, loadedSourceHash: savedToken,
+    };
+  });
+}
+
 /**
  * `plan:getOverview` core. Open read: returns the stored per-tab overview or a
  * clean `null` when the key is unset OR the request is malformed / not a valid
@@ -888,10 +1247,25 @@ function readPlanTabRequest(raw: unknown): { planId: string; tab: PlanTabKey } |
 export function runGetOverview(
   raw: unknown,
   deps: PlanOverviewIpcDeps = defaultPlanOverviewIpcDeps(),
-): PlanTabOverview | null {
+): PlanOverviewRead | PlanTabOverview | null {
   const req = readPlanTabRequest(raw);
   if (!req) return null;
-  return deps.getOverview(req.planId, req.tab);
+  const resolved = overviewDeps(deps);
+  const context = resolved.getStructuredContext(req.planId);
+  const stored = resolved.getOverview(req.planId, req.tab);
+  if (!context) return stored;
+  const observation = resolved.observe(context.folderAbs);
+  const state = resolved.getProjectionState(req.planId);
+  const stamp = new Date(0).toISOString();
+  return {
+    planId: req.planId, tab: req.tab, body: stored?.body ?? null,
+    revision: stored?.revision ?? 0, updatedBy: stored?.updatedBy ?? null,
+    createdAt: stored?.createdAt ?? stamp, updatedAt: stored?.updatedAt ?? stamp,
+    loadedSourceHash: observation.token,
+    sourceStatus: state?.overviewStatus ?? (observation.present ? 'invalid' : 'absent'),
+    sourceDiagnostics: state ? parseDiagnosticMessages(state.overviewDiagnosticsJson) : [],
+    diskBacked: true,
+  };
 }
 
 /**
@@ -903,8 +1277,12 @@ export function runGetOverview(
  */
 export function runSetOverview(
   raw: unknown,
+  deps?: PlanOverviewIpcDeps,
+): PlanTabOverview | PlanOverviewSaveResult;
+export function runSetOverview(
+  raw: unknown,
   deps: PlanOverviewIpcDeps = defaultPlanOverviewIpcDeps(),
-): PlanTabOverview {
+): PlanTabOverview | Promise<PlanOverviewSaveResult> {
   const req = readPlanTabRequest(raw);
   if (!req) {
     throw new PlanOverviewError(
@@ -912,6 +1290,12 @@ export function runSetOverview(
       'overview-bad-request',
     );
   }
+  const resolved = overviewDeps(deps);
+  const structured = resolved.getStructuredContext(req.planId);
+  if (structured) return runStructuredSetOverview(readOverviewEditRequest(raw), structured, resolved);
+
+  // Legacy/non-folder rows retain the direct DB behavior and the old explicit
+  // supervisor authorization contract.
   const record = raw as Record<string, unknown>;
   const supervisorId = record.supervisorId;
   if (typeof supervisorId !== 'string' || supervisorId === '') {
@@ -1005,6 +1389,49 @@ export function registerPlanCommentListIpc(
   deps: ListPlanCommentsDeps = defaultListPlanCommentsDeps(),
 ): void {
   ipc.handle('plan:comment:list', (_event, rawPlanId: unknown) => runPlanCommentList(rawPlanId, deps));
+}
+
+interface StructuredOverviewContext {
+  planId: string;
+  artifactId: string;
+  folderRelPath: string;
+  folderAbs: string;
+  workspace: Workspace;
+  responsibleSupervisorId: string | null;
+}
+
+export interface PlanOverviewRead extends PlanTabOverview {
+  loadedSourceHash: ObservedOverviewSourceToken;
+  sourceStatus: 'absent' | 'synced' | 'invalid' | 'apply-error';
+  sourceDiagnostics: string[];
+  diskBacked: boolean;
+}
+
+export interface PlanOverviewSaveResult extends PlanTabOverview {
+  outcome: 'overview-saved' | 'overview-saved-projection-pending';
+  loadedSourceHash: ObservedOverviewSourceToken;
+}
+
+function defaultStructuredContext(planId: string): StructuredOverviewContext | null {
+  const row = getDb().prepare(
+    `SELECT id, workspace_id, artifact_id, folder_rel_path, responsible_supervisor_id
+       FROM plans WHERE id = ? AND deleted_at IS NULL`,
+  ).get(planId) as {
+    id: string; workspace_id: string; artifact_id: string | null;
+    folder_rel_path: string | null; responsible_supervisor_id: string | null;
+  } | undefined;
+  if (!row?.artifact_id || !row.folder_rel_path) return null;
+  const workspace = getWorkspace(row.workspace_id);
+  if (!workspace) return null;
+  const stateName = workspaceStateDirName(workspace.path, workspace.pathType);
+  const parts = row.folder_rel_path.split('/');
+  if (parts.length !== 3 || parts[0] !== stateName || parts[1] !== 'plans'
+      || !parts[2] || parts[2] === '.' || parts[2] === '..') return null;
+  return {
+    planId: row.id, artifactId: row.artifact_id, folderRelPath: row.folder_rel_path,
+    folderAbs: path.join(workspaceStateDir(workspace.path, workspace.pathType), 'plans', parts[2]),
+    workspace, responsibleSupervisorId: row.responsible_supervisor_id,
+  };
 }
 
 // WP-P6B-query — one-shot mission-board read. Polling cadence, cancellation,

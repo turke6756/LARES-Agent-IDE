@@ -70,6 +70,17 @@ interface DocReadState {
   loading: boolean;
 }
 
+type DiskOverview = PlanTabOverview & {
+  loadedSourceHash?: 'absent' | 'unsafe' | 'unreadable' | `sha256:${string}`;
+  sourceStatus?: 'absent' | 'synced' | 'invalid' | 'apply-error';
+  sourceDiagnostics?: string[];
+  diskBacked?: boolean;
+};
+
+type DiskOverviewSave = PlanTabOverview & {
+  outcome?: 'overview-saved' | 'overview-saved-projection-pending';
+};
+
 /** The tab's primary (auto-opened) document. WP-P4A orders each tab's docs so
  *  the canonical one leads: `ARC.md` for overview, `plan.md` for plan, the sole
  *  external doc for proposal/legacy, else the first sibling. */
@@ -93,21 +104,16 @@ export default function PlanDocumentTabs({ planId }: { planId: string }): React.
   const [draft, setDraft] = useState('');
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
-  const [supervisorId, setSupervisorId] = useState('');
-
-  // Candidate authors: privileged, same-workspace agents. Filtered client-side
-  // so the affordance only shows to a supervisor; the server independently
-  // re-validates the pick on write (a non-supervisor is rejected there).
-  const agents = useDashboardStore((s) => s.agents);
-  const selectedWorkspaceId = useDashboardStore((s) => s.selectedWorkspaceId);
-  const supervisors = useMemo(
-    () =>
-      agents
-        .filter((a) => a.workspaceId === selectedWorkspaceId && hasSupervisorPrivilege(a))
-        .map((a) => ({ id: a.id, title: a.title })),
-    [agents, selectedWorkspaceId],
-  );
-  const canEdit = supervisors.length > 0;
+  const [legacySupervisorId, setLegacySupervisorId] = useState('');
+  const diskOverview = overview as DiskOverview | null;
+  const agents = useDashboardStore((state) => state.agents);
+  const selectedWorkspaceId = useDashboardStore((state) => state.selectedWorkspaceId);
+  const legacySupervisors = useMemo(() => agents
+    .filter((agent) => agent.workspaceId === selectedWorkspaceId && hasSupervisorPrivilege(agent))
+    .map((agent) => ({ id: agent.id, title: agent.title })), [agents, selectedWorkspaceId]);
+  const canEdit = diskOverview?.diskBacked
+    ? diskOverview.sourceStatus === 'synced' || diskOverview.sourceStatus === 'absent'
+    : legacySupervisors.length > 0;
 
   // Keep the live active key in a ref so an in-flight save that resolves after
   // the user switched tabs never writes its result onto the wrong tab.
@@ -263,11 +269,12 @@ export default function PlanDocumentTabs({ planId }: { planId: string }): React.
   const startEdit = useCallback(() => {
     setDraft(overview?.body ?? '');
     setSaveError(null);
-    setSupervisorId((prev) =>
-      prev && supervisors.some((s) => s.id === prev) ? prev : supervisors[0]?.id ?? '',
-    );
+    if (!diskOverview?.diskBacked) {
+      setLegacySupervisorId((prior) => legacySupervisors.some((agent) => agent.id === prior)
+        ? prior : legacySupervisors[0]?.id ?? '');
+    }
     setEditing(true);
-  }, [overview, supervisors]);
+  }, [overview, diskOverview?.diskBacked, legacySupervisors]);
 
   const cancelEdit = useCallback(() => {
     setEditing(false);
@@ -280,27 +287,69 @@ export default function PlanDocumentTabs({ planId }: { planId: string }): React.
   // and surfaces the reason — the server is the authority, so we never assume the
   // write landed.
   const saveOverview = useCallback(async () => {
-    if (!canEdit || !supervisorId || saving) return;
+    if (!canEdit || saving || (diskOverview?.diskBacked && !diskOverview.loadedSourceHash)) return;
     const key = activeKey;
-    const body = draft.trim().length > 0 ? draft : null;
+    if (draft.trim().length === 0) {
+      setSaveError('Enter an overview, or use Remove to delete the section.');
+      return;
+    }
     setSaving(true);
     setSaveError(null);
     try {
-      await window.api.plans.setOverview({ planId, tab: key, body, supervisorId });
+      const request = diskOverview?.diskBacked
+        ? { planId, tab: key, body: draft, action: 'save', expectedSourceHash: diskOverview.loadedSourceHash }
+        : { planId, tab: key, body: draft, supervisorId: legacySupervisorId };
+      const saved = await window.api.plans.setOverview(
+        request as Parameters<typeof window.api.plans.setOverview>[0],
+      ) as DiskOverviewSave;
       const ov = await window.api.plans.getOverview(planId, key);
       // Guard against a tab switch mid-save landing on the wrong key.
       if (activeKeyRef.current === key) {
         setOverview(ov);
         setEditing(false);
+        if (saved.outcome === 'overview-saved-projection-pending') {
+          setSaveError('The overview was saved to disk but has not reached the surface yet. Refresh to retry.');
+        }
       }
-    } catch {
+    } catch (err) {
       if (activeKeyRef.current === key) {
-        setSaveError('Could not save the overview — only a supervisor can edit it.');
+        const message = err instanceof Error ? err.message : String(err);
+        setSaveError(!diskOverview?.diskBacked
+          ? 'Could not save the overview — only a supervisor can edit it.'
+          : /stale|changed on disk/i.test(message)
+          ? 'The overview changed on disk while you were editing. Reload and merge your draft.'
+          : 'Could not save the overview. The responsible supervisor or file state may have changed.');
       }
     } finally {
       setSaving(false);
     }
-  }, [canEdit, supervisorId, saving, activeKey, draft, planId]);
+  }, [canEdit, saving, activeKey, draft, planId, diskOverview?.diskBacked,
+    diskOverview?.loadedSourceHash, legacySupervisorId]);
+
+  const removeOverview = useCallback(async () => {
+    if (!canEdit || saving || !diskOverview?.loadedSourceHash) return;
+    const key = activeKey;
+    setSaving(true);
+    setSaveError(null);
+    try {
+      await window.api.plans.setOverview({
+        planId, tab: key, body: null, action: 'remove',
+        expectedSourceHash: diskOverview.loadedSourceHash,
+      } as unknown as Parameters<typeof window.api.plans.setOverview>[0]);
+      const ov = await window.api.plans.getOverview(planId, key);
+      if (activeKeyRef.current === key) {
+        setOverview(ov);
+        setEditing(false);
+      }
+    } catch (err) {
+      if (activeKeyRef.current === key) {
+        const message = err instanceof Error ? err.message : String(err);
+        setSaveError(/stale|changed on disk/i.test(message)
+          ? 'The overview changed on disk while you were editing. Reload and merge your draft.'
+          : 'Could not remove the overview section.');
+      }
+    } finally { setSaving(false); }
+  }, [canEdit, saving, diskOverview?.loadedSourceHash, activeKey, planId]);
 
   if (modelLoading) {
     return (
@@ -363,7 +412,7 @@ export default function PlanDocumentTabs({ planId }: { planId: string }): React.
             present; "overview pending" on a populated tab that has none; an
             in-place editor for a supervisor (WP-P4C-editor). The Packages
             placeholder is populated:false and never demands one. */}
-        {!isPackages && (hasOverview || editing || (activeTab?.populated && !overviewLoading)) && (
+        {(!isPackages || activeTab?.populated) && (hasOverview || editing || (activeTab?.populated && !overviewLoading)) && (
           <div className="shrink-0 border-b border-white/10 bg-surface-1/40 px-6 py-3" data-testid="plan-tab-overview">
             {editing ? (
               <div className="max-w-3xl" data-testid="plan-overview-editor">
@@ -377,26 +426,24 @@ export default function PlanDocumentTabs({ planId }: { planId: string }): React.
                   className="w-full resize-y rounded border border-white/15 bg-surface-0 px-2 py-1.5 text-[13px] text-gray-200 outline-none focus:border-accent-blue disabled:opacity-60"
                 />
                 <div className="mt-2 flex flex-wrap items-center gap-2">
-                  {supervisors.length > 1 && (
+                  {!diskOverview?.diskBacked && legacySupervisors.length > 1 && (
                     <select
-                      value={supervisorId}
-                      onChange={(e) => setSupervisorId(e.target.value)}
+                      value={legacySupervisorId}
+                      onChange={(event) => setLegacySupervisorId(event.target.value)}
                       disabled={saving}
                       data-testid="plan-overview-supervisor-select"
                       aria-label="Authoring supervisor"
                       className="rounded border border-white/15 bg-surface-0 px-1.5 py-1 text-[12px] text-gray-200"
                     >
-                      {supervisors.map((s) => (
-                        <option key={s.id} value={s.id}>
-                          {s.title}
-                        </option>
+                      {legacySupervisors.map((supervisor) => (
+                        <option key={supervisor.id} value={supervisor.id}>{supervisor.title}</option>
                       ))}
                     </select>
                   )}
                   <button
                     type="button"
                     onClick={() => void saveOverview()}
-                    disabled={saving || !supervisorId}
+                    disabled={saving || (!diskOverview?.diskBacked && !legacySupervisorId)}
                     data-testid="plan-overview-save"
                     className="rounded bg-accent-blue px-2.5 py-1 text-[12px] font-medium text-white disabled:opacity-60"
                   >
@@ -411,6 +458,17 @@ export default function PlanDocumentTabs({ planId }: { planId: string }): React.
                   >
                     Cancel
                   </button>
+                  {hasOverview && diskOverview?.diskBacked && (
+                    <button
+                      type="button"
+                      onClick={() => void removeOverview()}
+                      disabled={saving}
+                      data-testid="plan-overview-remove"
+                      className="rounded px-2.5 py-1 text-[12px] text-red-400 hover:text-red-300 disabled:opacity-60"
+                    >
+                      Remove
+                    </button>
+                  )}
                   {saveError && (
                     <span className="text-[12px] text-red-400" data-testid="plan-overview-error" role="alert">
                       {saveError}
@@ -426,7 +484,11 @@ export default function PlanDocumentTabs({ planId }: { planId: string }): React.
                   </div>
                 ) : (
                   <div className="flex-1 text-[12px] italic text-gray-500" data-testid="plan-overview-pending">
-                    overview pending
+                    {diskOverview?.sourceStatus === 'invalid'
+                      ? 'The human overview could not be read. Repair OVERVIEW.md; the last valid summaries remain visible but cannot make the plan ready.'
+                      : diskOverview?.sourceStatus === 'absent'
+                        ? 'No human overview has been written yet. Package this plan or add an overview before Mark Ready.'
+                        : 'This tab has content but no plain-language summary. Add its section before Mark Ready.'}
                   </div>
                 )}
                 {canEdit && (
@@ -446,9 +508,15 @@ export default function PlanDocumentTabs({ planId }: { planId: string }): React.
 
         {/* Document region. */}
         {isPackages ? (
-          <div className="flex flex-1 items-center justify-center px-6 text-[13px] text-gray-500" data-testid="plan-packages-placeholder">
-            {activeTab?.placeholder ?? 'not yet implemented — pull Implement to begin'}
-          </div>
+          activeTab?.populated ? (
+            <div className="flex flex-1 items-center justify-center px-6 text-[13px] text-gray-500" data-testid="plan-packages-populated">
+              Work packages are available on the Mission Board below.
+            </div>
+          ) : (
+            <div className="flex flex-1 items-center justify-center px-6 text-[13px] text-gray-500" data-testid="plan-packages-placeholder">
+              No work-package definitions have been imported yet. Packaging writes the durable definitions; Refresh imports them into the Mission Board.
+            </div>
+          )
         ) : showEmpty ? (
           <div className="flex flex-1 items-center justify-center px-6 text-[13px] text-gray-500" data-testid="plan-tab-empty">
             no documents yet
