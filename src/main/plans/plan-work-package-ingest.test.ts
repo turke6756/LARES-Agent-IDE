@@ -66,6 +66,7 @@ type WatcherModule = typeof import('./plan-folder-watcher');
 let dbm: DbModule;
 let ingest: IngestModule;
 let watcher: WatcherModule;
+let folderCoordinator: typeof import('./plan-folder-reconciler');
 let root: string;
 let seq = 0;
 
@@ -432,9 +433,12 @@ test('watcher boot/change and explicit single-folder refresh share one projectio
   const source = path.join(folderAbs, 'supplements', 'work-packages.md');
   fs.writeFileSync(source, document([spec()], { artifactId }));
 
-  const bootWatcher = new watcher.PlanFolderWatcher();
+  let bootSettled!: () => void;
+  const bootCompletion = new Promise<void>((resolve) => { bootSettled = resolve; });
+  const bootWatcher = new watcher.PlanFolderWatcher({ onPlanFolderSettled: () => bootSettled() });
   const boot = await bootWatcher.reconcileWorkspace(workspace, true);
   const planId = boot.settled[0].planId;
+  await bootCompletion;
   assert.equal(dbm.getPlanFolderProjectionState(planId)?.wpStatus, 'synced');
   assert.equal(dbm.getPlanWorkPackage(`wp:${artifactId}:wp-a`)?.revision, 1);
 
@@ -446,6 +450,7 @@ test('watcher boot/change and explicit single-folder refresh share one projectio
   const manual = await watcher.adoptPlanFolder(workspace, folderRelPath);
   assert.equal(manual.adopted, true);
   assert.equal(manual.planId, planId);
+  await folderCoordinator.reconcilePlanFolderProjections({ workspace, planFolderRelPath: folderRelPath });
   assert.equal(dbm.getPlanWorkPackage(`wp:${artifactId}:wp-a`)?.revision, 2,
     'explicit refresh is idempotent after watcher convergence');
 
@@ -513,6 +518,7 @@ test('composite watcher signature converges overview creation, lower-mtime repla
   dbm.initDatabase();
   ingest = require('./plan-work-package-ingest') as IngestModule;
   watcher = require('./plan-folder-watcher') as WatcherModule;
+  folderCoordinator = require('./plan-folder-reconciler') as typeof import('./plan-folder-reconciler');
 
   let passed = 0; let failed = 0;
   for (const t of tests) {

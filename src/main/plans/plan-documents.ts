@@ -21,7 +21,8 @@ import type {
   PlanningReaderReadResult,
   Workspace,
 } from '../../shared/types';
-import { getDb, getWorkspace } from '../database';
+import { getDb, getPlanSourceProposalProjectionState, getWorkspace,
+  type PlanSourceProposalProjectionState } from '../database';
 import { translateStateRelPath, workspaceStateDir } from '../workspace-state-dir';
 import { listPlanningEntries, readPlanningDocument } from './planning-reader';
 
@@ -60,6 +61,7 @@ export interface PlanDocumentsDeps {
   listRegisteredDocuments?: (planId: string) => RegisteredDocumentRow[];
   getRegisteredDocument?: (planId: string, documentId: string) => RegisteredDocumentRow | null;
   hasWorkPackages?: (planId: string) => boolean;
+  getSourceProposalProjectionState?: (planId: string) => PlanSourceProposalProjectionState | null;
   maxRegisteredReadBytes?: number;
 }
 
@@ -125,6 +127,11 @@ function defaultHasWorkPackages(planId: string): boolean {
   return hasPlanWorkPackagesInDb(getDb(), planId);
 }
 
+function defaultSourceProposalProjectionState(planId: string): PlanSourceProposalProjectionState | null {
+  try { return getPlanSourceProposalProjectionState(planId); }
+  catch { return null; }
+}
+
 function depsWithDefaults(deps: PlanDocumentsDeps) {
   return {
     getPlanContext: deps.getPlanContext ?? defaultPlanContext,
@@ -134,6 +141,7 @@ function depsWithDefaults(deps: PlanDocumentsDeps) {
     listRegisteredDocuments: deps.listRegisteredDocuments ?? defaultListRegistered,
     getRegisteredDocument: deps.getRegisteredDocument ?? defaultGetRegistered,
     hasWorkPackages: deps.hasWorkPackages ?? defaultHasWorkPackages,
+    getSourceProposalProjectionState: deps.getSourceProposalProjectionState ?? defaultSourceProposalProjectionState,
     maxRegisteredReadBytes: deps.maxRegisteredReadBytes ?? MAX_REGISTERED_READ_BYTES,
   };
 }
@@ -270,6 +278,10 @@ export function buildPlanDocuments(
   if (!workspace) return { planId, tabs: emptyTabs(false), warnings: ['workspace unavailable'] };
 
   const warnings: string[] = [];
+  const sourceProjection = d.getSourceProposalProjectionState(planId);
+  if (sourceProjection?.status === 'invalid' || sourceProjection?.status === 'conflict') {
+    warnings.push(`source proposal ${sourceProjection.status}: ${sourceProjection.diagnosticCode ?? 'unknown'}`);
+  }
   let manifest: PlanningReaderListResult = { entries: [], warnings: [] };
   try {
     manifest = d.listPlanningEntries(workspace.path, { pathType: workspace.pathType });

@@ -1929,6 +1929,63 @@ function initContextOptimizerSchema(): void {
   `);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_plan_documents_plan ON plan_documents(plan_id)`);
 
+  // WP-E — durable status for the independently-atomic source-proposal
+  // projection. A malformed or conflicting observation must not disturb any of
+  // the other folder-derived projections.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS plan_source_proposal_projection_state (
+      plan_id                 TEXT PRIMARY KEY REFERENCES plans(id) ON DELETE CASCADE,
+      workspace_id            TEXT NOT NULL,
+      status                  TEXT NOT NULL
+                              CHECK (status IN ('absent','synced','invalid','conflict')),
+      source_artifact_id      TEXT,
+      source_rel_path         TEXT,
+      diagnostic_code        TEXT,
+      diagnostics_json        TEXT NOT NULL DEFAULT '[]',
+      observed_manifest_mtime INTEGER,
+      reconciled_at           INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_plan_source_projection_workspace_status
+      ON plan_source_proposal_projection_state(workspace_id, status);
+  `);
+
+  // The one-proposal-document invariant is deliberately deferred on dirty
+  // databases. Rows can back live handles/comments, so migration records a
+  // durable conflict for affected structured plans and never deletes or merges.
+  const duplicateProposalDocuments = db.prepare(`
+    SELECT plan_id FROM plan_documents
+     WHERE doc_kind = 'proposal'
+     GROUP BY plan_id HAVING COUNT(*) > 1
+  `).all() as Array<{ plan_id: string }>;
+  if (duplicateProposalDocuments.length === 0) {
+    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_plan_documents_one_proposal_per_plan
+      ON plan_documents(plan_id) WHERE doc_kind = 'proposal'`);
+  } else {
+    const recordConflict = db.prepare(`
+      INSERT INTO plan_source_proposal_projection_state
+        (plan_id, workspace_id, status, diagnostic_code, diagnostics_json, reconciled_at)
+      SELECT id, workspace_id, 'conflict', 'duplicate-proposal-documents', ?, ?
+        FROM plans WHERE id = ? AND format = 'structured'
+      ON CONFLICT(plan_id) DO UPDATE SET
+        workspace_id = excluded.workspace_id,
+        status = excluded.status,
+        source_artifact_id = NULL,
+        source_rel_path = NULL,
+        diagnostic_code = excluded.diagnostic_code,
+        diagnostics_json = excluded.diagnostics_json,
+        observed_manifest_mtime = NULL,
+        reconciled_at = excluded.reconciled_at
+    `);
+    const reconciledAt = Date.now();
+    for (const duplicate of duplicateProposalDocuments) {
+      recordConflict.run(
+        JSON.stringify([{ code: 'duplicate-proposal-documents', detail: 'multiple proposal documents are registered to this plan; migration deferred the unique index' }]),
+        reconciledAt,
+        duplicate.plan_id,
+      );
+    }
+  }
+
   // plan_tab_overviews — per-tab overview body, revisioned. PK(plan_id, tab): one
   // overview row per (plan, tab). Cascades away with its plan.
   db.exec(`
@@ -5506,6 +5563,220 @@ function rowToPlanFolderProjectionState(row: any): PlanFolderProjectionState {
 export function getPlanFolderProjectionState(planId: string): PlanFolderProjectionState | null {
   const row = queryOne('SELECT * FROM plan_folder_projection_state WHERE plan_id = ?', [planId]);
   return row ? rowToPlanFolderProjectionState(row) : null;
+}
+
+export type PlanSourceProposalProjectionStatus = 'absent' | 'synced' | 'invalid' | 'conflict';
+
+export interface PlanSourceProposalProjectionState {
+  planId: string;
+  workspaceId: string;
+  status: PlanSourceProposalProjectionStatus;
+  sourceArtifactId: string | null;
+  sourceRelPath: string | null;
+  diagnosticCode: string | null;
+  diagnosticsJson: string;
+  observedManifestMtime: number | null;
+  reconciledAt: number;
+}
+
+function rowToPlanSourceProposalProjectionState(row: any): PlanSourceProposalProjectionState {
+  return {
+    planId: row.plan_id,
+    workspaceId: row.workspace_id,
+    status: row.status,
+    sourceArtifactId: row.source_artifact_id ?? null,
+    sourceRelPath: row.source_rel_path ?? null,
+    diagnosticCode: row.diagnostic_code ?? null,
+    diagnosticsJson: row.diagnostics_json,
+    observedManifestMtime: row.observed_manifest_mtime ?? null,
+    reconciledAt: row.reconciled_at,
+  };
+}
+
+export function getPlanSourceProposalProjectionState(
+  planId: string,
+): PlanSourceProposalProjectionState | null {
+  const row = queryOne(`SELECT * FROM plan_source_proposal_projection_state WHERE plan_id = ?`, [planId]);
+  return row ? rowToPlanSourceProposalProjectionState(row) : null;
+}
+
+export function recordPlanSourceProposalProjectionStatus(input: {
+  planId: string;
+  workspaceId: string;
+  status: Exclude<PlanSourceProposalProjectionStatus, 'synced'>;
+  sourceArtifactId: string | null;
+  sourceRelPath: string | null;
+  diagnosticCode: string;
+  diagnosticsJson: string;
+  observedManifestMtime: number | null;
+  reconciledAt: number;
+}): PlanSourceProposalProjectionState {
+  run(`
+    INSERT INTO plan_source_proposal_projection_state
+      (plan_id, workspace_id, status, source_artifact_id, source_rel_path,
+       diagnostic_code, diagnostics_json, observed_manifest_mtime, reconciled_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(plan_id) DO UPDATE SET
+      workspace_id = excluded.workspace_id,
+      status = excluded.status,
+      source_artifact_id = excluded.source_artifact_id,
+      source_rel_path = excluded.source_rel_path,
+      diagnostic_code = excluded.diagnostic_code,
+      diagnostics_json = excluded.diagnostics_json,
+      observed_manifest_mtime = excluded.observed_manifest_mtime,
+      reconciled_at = excluded.reconciled_at
+  `, [input.planId, input.workspaceId, input.status, input.sourceArtifactId,
+    input.sourceRelPath, input.diagnosticCode, input.diagnosticsJson,
+    input.observedManifestMtime, input.reconciledAt]);
+  return getPlanSourceProposalProjectionState(input.planId)!;
+}
+
+export interface ApplyPlanSourceProposalProjectionInput {
+  planId: string;
+  planArtifactId: string;
+  workspaceId: string;
+  sourceProposalId: string;
+  sourceArtifactId: string;
+  sourceRelPath: string;
+  promotedAt: number;
+  observedManifestMtime: number;
+  reconciledAt: number;
+}
+
+/** Apply only source-proposal linkage. In particular, this transaction never
+ * names responsibility, supervisor_active_plan, work packages, or promotion
+ * request state. Document conflicts are durable and leave all linkage intact. */
+export function applyPlanSourceProposalProjection(
+  input: ApplyPlanSourceProposalProjectionInput,
+): PlanSourceProposalProjectionState {
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    const conflict = (code: string, detail: string): PlanSourceProposalProjectionState => {
+      run(`
+        INSERT INTO plan_source_proposal_projection_state
+          (plan_id, workspace_id, status, source_artifact_id, source_rel_path,
+           diagnostic_code, diagnostics_json, observed_manifest_mtime, reconciled_at)
+        VALUES (?, ?, 'conflict', ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(plan_id) DO UPDATE SET
+          workspace_id = excluded.workspace_id,
+          status = excluded.status,
+          source_artifact_id = excluded.source_artifact_id,
+          source_rel_path = excluded.source_rel_path,
+          diagnostic_code = excluded.diagnostic_code,
+          diagnostics_json = excluded.diagnostics_json,
+          observed_manifest_mtime = excluded.observed_manifest_mtime,
+          reconciled_at = excluded.reconciled_at
+      `, [input.planId, input.workspaceId, input.sourceArtifactId, input.sourceRelPath,
+        code, JSON.stringify([{ code, detail }]), input.observedManifestMtime,
+        input.reconciledAt]);
+      return getPlanSourceProposalProjectionState(input.planId)!;
+    };
+
+    const plan = queryOne(
+      `SELECT id, workspace_id, artifact_id, source_proposal_id
+         FROM plans WHERE id = ? AND deleted_at IS NULL`,
+      [input.planId],
+    );
+    if (!plan || plan.workspace_id !== input.workspaceId || plan.artifact_id !== input.planArtifactId) {
+      const result = conflict('plan-row-mismatch', 'the adopted plan row no longer matches the observed folder identity');
+      db.exec('COMMIT');
+      return result;
+    }
+    if (plan.source_proposal_id != null && plan.source_proposal_id !== input.sourceProposalId) {
+      const result = conflict('plan-source-mismatch', 'the plan is already linked to a different proposal row');
+      db.exec('COMMIT');
+      return result;
+    }
+
+    const proposal = queryOne(
+      `SELECT id, workspace_id, artifact_id, path, promoted_to_plan_id, deleted_at
+         FROM proposals WHERE id = ?`,
+      [input.sourceProposalId],
+    );
+    if (!proposal || proposal.workspace_id !== input.workspaceId
+        || proposal.artifact_id !== input.sourceArtifactId
+        || proposal.path !== input.sourceRelPath || proposal.deleted_at != null) {
+      const result = conflict('proposal-row-mismatch', 'the proposal row no longer matches the observed artifact and canonical path');
+      db.exec('COMMIT');
+      return result;
+    }
+    if (proposal.promoted_to_plan_id != null && proposal.promoted_to_plan_id !== input.planId) {
+      const result = conflict('proposal-plan-mismatch', 'the proposal is already linked to a different plan');
+      db.exec('COMMIT');
+      return result;
+    }
+
+    const docs = queryAll(
+      `SELECT id, workspace_id, rel_path, artifact_ref FROM plan_documents
+        WHERE plan_id = ? AND doc_kind = 'proposal' ORDER BY id`,
+      [input.planId],
+    );
+    if (docs.length > 1) {
+      const result = conflict('duplicate-proposal-documents', 'multiple proposal documents are registered to this plan');
+      db.exec('COMMIT');
+      return result;
+    }
+    let documentId = `plandoc:proposal:${input.planArtifactId}`;
+    if (docs.length === 1) {
+      const document = docs[0];
+      const identityMatch = document.artifact_ref === input.sourceArtifactId;
+      const legacyMatch = document.artifact_ref == null && document.rel_path === input.sourceRelPath;
+      if (!identityMatch && !legacyMatch) {
+        const result = conflict('proposal-document-mismatch', 'the existing proposal document has a different identity or path');
+        db.exec('COMMIT');
+        return result;
+      }
+      documentId = document.id;
+    } else {
+      const idOwner = queryOne(`SELECT id, plan_id, doc_kind FROM plan_documents WHERE id = ?`, [documentId]);
+      if (idOwner) {
+        const result = conflict('proposal-document-id-collision', 'the deterministic proposal document id is already in use');
+        db.exec('COMMIT');
+        return result;
+      }
+    }
+
+    run(`UPDATE plans
+            SET source_proposal_id = ?, promoted_at = COALESCE(promoted_at, ?),
+                updated_at = datetime('now')
+          WHERE id = ?`, [input.sourceProposalId, input.promotedAt, input.planId]);
+    run(`UPDATE proposals
+            SET state = 'promoted', promoted_to_plan_id = ?, updated_at = ?
+          WHERE id = ?`, [input.planId, input.reconciledAt, input.sourceProposalId]);
+    if (docs.length === 0) {
+      run(`INSERT INTO plan_documents
+             (id, plan_id, workspace_id, doc_kind, rel_path, artifact_ref, sort_order)
+           VALUES (?, ?, ?, 'proposal', ?, ?, 0)`,
+        [documentId, input.planId, input.workspaceId, input.sourceRelPath, input.sourceArtifactId]);
+    } else {
+      run(`UPDATE plan_documents
+              SET workspace_id = ?, rel_path = ?, artifact_ref = ?, sort_order = 0
+            WHERE id = ?`,
+        [input.workspaceId, input.sourceRelPath, input.sourceArtifactId, documentId]);
+    }
+    run(`
+      INSERT INTO plan_source_proposal_projection_state
+        (plan_id, workspace_id, status, source_artifact_id, source_rel_path,
+         diagnostic_code, diagnostics_json, observed_manifest_mtime, reconciled_at)
+      VALUES (?, ?, 'synced', ?, ?, NULL, '[]', ?, ?)
+      ON CONFLICT(plan_id) DO UPDATE SET
+        workspace_id = excluded.workspace_id,
+        status = 'synced',
+        source_artifact_id = excluded.source_artifact_id,
+        source_rel_path = excluded.source_rel_path,
+        diagnostic_code = NULL,
+        diagnostics_json = '[]',
+        observed_manifest_mtime = excluded.observed_manifest_mtime,
+        reconciled_at = excluded.reconciled_at
+    `, [input.planId, input.workspaceId, input.sourceArtifactId, input.sourceRelPath,
+      input.observedManifestMtime, input.reconciledAt]);
+    const result = getPlanSourceProposalProjectionState(input.planId)!;
+    db.exec('COMMIT');
+    return result;
+  } catch (err) {
+    try { db.exec('ROLLBACK'); } catch { /* preserve the original error */ }
+    throw err;
+  }
 }
 
 export interface PlanTabOverviewSource {

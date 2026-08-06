@@ -87,6 +87,7 @@ function fixture(documents: PlanningReaderDocument[] = []): Fixture {
     getRegisteredDocument: (planId, id) =>
       registered.find((row) => row.planId === planId && row.id === id) ?? null,
     hasWorkPackages: () => false,
+    getSourceProposalProjectionState: () => null,
   };
   return { root, context, workspace, manifest, registered, deps, dispose: () => fs.rmSync(root, { recursive: true, force: true }) };
 }
@@ -208,6 +209,20 @@ test('present plan_work_packages rows make Packages populated:true', () => {
     const packages = tab(buildPlanDocuments(PLAN_ID, f.deps)!, 'packages');
     assert.equal(packages.populated, true);
     assert.equal(packages.placeholder, undefined);
+  } finally { f.dispose(); }
+});
+
+test('invalid and conflicting source projections surface durable warnings', () => {
+  const f = fixture();
+  try {
+    f.deps.getSourceProposalProjectionState = () => ({
+      planId: PLAN_ID, workspaceId: f.workspace.id, status: 'conflict',
+      sourceArtifactId: 'prop_x', sourceRelPath: '.lares/proposals/x.md',
+      diagnosticCode: 'duplicate-proposal-documents', diagnosticsJson: '[]',
+      observedManifestMtime: 1, reconciledAt: 2,
+    });
+    assert.deepEqual(buildPlanDocuments(PLAN_ID, f.deps)!.warnings,
+      ['source proposal conflict: duplicate-proposal-documents']);
   } finally { f.dispose(); }
 });
 

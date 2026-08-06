@@ -27,9 +27,11 @@ import path from 'path';
 import type { ObservedOverviewSourceToken, Workspace } from '../../shared/types';
 import { adoptStructuredPlan, softDeletePlan, type StructuredPlanChange } from '../database';
 import { workspaceStateDir, workspaceStateDirName } from '../workspace-state-dir';
-import { scanPlanIntentLedger } from './plan-intent-ledger';
-import { reconcilePlanFolderPlanningState } from './plan-work-package-ingest';
 import { observeOverviewSource } from './plan-human-overview';
+import {
+  adoptPlanFolderRow,
+  reconcilePlanFolderProjections,
+} from './plan-folder-reconciler';
 
 /** Subdirs a plan folder scatters outputs into (§R0). Watched as bounded child
  *  subscriptions by PlansWatcher; enumerated here for the change signature. */
@@ -199,9 +201,8 @@ function safeSegment(name: string): boolean {
 // ── The ingest reconciler ────────────────────────────────────────────────────
 
 export interface PlanFolderWatcherOptions {
-  /** F-C seam: fired AFTER the built-in folder projections settle, NEVER on
-   *  removal. WP-D extends reconcilePlanFolderPlanningState immediately before
-   *  this callback; downstream consumers retain one ordered completion seam. */
+  /** Fired by the common coordinator only after source, responsibility, work
+   * packages, and overview have settled. Never fired on removal. */
   onPlanFolderSettled?: (planId: string, folderRelPath: string, changeKind: FolderChangeKind) => Promise<void> | void;
   /** Injected clock (tests). */
   now?: () => number;
@@ -362,7 +363,7 @@ export class PlanFolderWatcher {
 
       if (changeKind !== null) {
         result.settled.push({ planId: adopt.planId, folderRelPath, changeKind });
-        await this.fireSettled(ws, adopt.planId, folderAbs, folderRelPath, changeKind, isBoot);
+        await this.fireSettled(ws, adopt.planId, folderRelPath, changeKind, isBoot);
       }
     }
 
@@ -387,27 +388,22 @@ export class PlanFolderWatcher {
    *  boot scan so a cold start with many folders isn't serialized (mirrors the
    *  legacy PlansWatcher F-C discipline). */
   private async fireSettled(
-    ws: Workspace, planId: string, folderAbs: string, folderRelPath: string,
+    ws: Workspace, planId: string, folderRelPath: string,
     changeKind: FolderChangeKind, isBoot: boolean,
   ): Promise<void> {
     const run = async (): Promise<void> => {
-      const scan = scanPlanIntentLedger({
-        workspaceId: ws.id,
-        workspaceRoot: ws.path,
-        planId,
-        folderAbs,
-        folderRelPath,
+      const projections = await reconcilePlanFolderProjections({
+        workspace: ws,
+        planFolderRelPath: folderRelPath,
+        changeKind,
+        now: this.now,
+        downstreamCallbacks: this.onSettled
+          ? [(_result, kind) => this.onSettled!(planId, folderRelPath, kind as FolderChangeKind)]
+          : [],
       });
-      for (const diagnostic of scan.diagnostics) {
+      for (const diagnostic of projections.intentLedger.diagnostics) {
         console.warn(`[plan-intent-ledger] ${diagnostic.kind}: ${diagnostic.detail}`);
       }
-      const projections = reconcilePlanFolderPlanningState({
-        workspaceId: ws.id,
-        planId,
-        folderAbs,
-        folderRelPath,
-        now: this.now,
-      });
       if (projections.workPackages.status === 'invalid' || projections.workPackages.status === 'conflict') {
         for (const diagnostic of projections.workPackages.diagnostics) {
           console.warn(`[plan-work-package-ingest] ${diagnostic.code}: ${diagnostic.detail}`);
@@ -418,7 +414,6 @@ export class PlanFolderWatcher {
           console.warn(`[plan-human-overview] ${diagnostic.code}: ${diagnostic.detail}`);
         }
       }
-      if (this.onSettled) await this.onSettled(planId, folderRelPath, changeKind);
     };
     if (isBoot) {
       Promise.resolve(run())
@@ -466,52 +461,5 @@ export interface AdoptResult {
  *  adopt and a watcher adopt converge on the same row. Never throws: an absent /
  *  malformed / conflicting folder is reported via `reason`. */
 export async function adoptPlanFolder(ws: Workspace, planFolderRelPath: string): Promise<AdoptResult> {
-  const home = path.join(workspaceStateDir(ws.path, ws.pathType), 'plans');
-  const leaf = path.basename(planFolderRelPath.replace(/[\\/]+$/, ''));
-  if (!safeSegment(leaf)) return { adopted: false, reason: 'absent' };
-  const folderAbs = path.join(home, leaf);
-
-  // Reject a folder that is itself a reparse point escaping plans/ (mirror the
-  // reconcileWorkspace guard); an absent path is a clean 'absent', never a throw.
-  try {
-    if (fs.lstatSync(folderAbs).isSymbolicLink()) return { adopted: false, reason: 'malformed' };
-  } catch {
-    return { adopted: false, reason: 'absent' };
-  }
-
-  const validity = validatePlanFolder(folderAbs);
-  if (!validity.valid) {
-    return {
-      adopted: false,
-      reason: validity.reason === 'no-artifact-id' ? 'no-artifact-id'
-        : validity.reason === 'malformed' ? 'malformed' : 'absent',
-    };
-  }
-
-  const folderRelPath = `${workspaceStateDirName(ws.path, ws.pathType)}/plans/${leaf}`;
-  const meta = readPlanMdMeta(folderAbs);
-  try {
-    const adopt = adoptStructuredPlan({
-      workspaceId: ws.id,
-      artifactId: validity.planArtifactId,
-      folderRelPath,
-      planPath: `${folderRelPath}/plan.md`,
-      mtimeMs: meta.mtimeMs,
-      sizeBytes: meta.sizeBytes,
-    });
-    // Explicit/manual/forced refresh uses the exact same projection service as
-    // boot, adoption, watched changes, and over-cap reconciliation. This runs on
-    // `unchanged` too: callers requested convergence, not merely row adoption.
-    reconcilePlanFolderPlanningState({
-      workspaceId: ws.id,
-      planId: adopt.planId,
-      folderAbs,
-      folderRelPath,
-    });
-    return { adopted: true, planId: adopt.planId, change: adopt.change };
-  } catch {
-    // A genuine constraint conflict (foreign path/folder collision) — quarantine,
-    // never throw; the caller keeps the request pending with a diagnostic.
-    return { adopted: false, reason: 'conflict' };
-  }
+  return adoptPlanFolderRow(ws, planFolderRelPath);
 }

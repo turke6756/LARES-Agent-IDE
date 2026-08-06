@@ -631,6 +631,9 @@ const TESTS = [
   // Planning-surface WP-D: human-overview parser/observer + atomic DB projection.
   'dist/main/main/plans/plan-human-overview.test.js',
   'dist/main/main/database.planWorkPackageReconciliation.test.js',
+  // Planning-surface WP-E: awaited coordinator + isolated source projection and
+  // dirty-data-safe proposal-document uniqueness migration.
+  'dist/main/main/plans/plan-source-proposal-reconciler.test.js',
   // Planning-surface Stage P3 (gate P3Z) — proposal→promotion→dispatchable-WP.
   // WP-P3A′: responsibility + promotion_requests schema/accessors.
   'dist/main/main/database.responsibility.test.js',
