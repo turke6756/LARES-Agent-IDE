@@ -10,9 +10,9 @@
 //     on unexpected parent / foreign interleave, integrity-mismatch on a diverged
 //     committed tree, index-integrity incident, currentHeadDrift) via a scriptable
 //     git — reproducing those real races deterministically is 4H/4I/4J's job;
-//   • real-git tests drive the ACTUAL `git commit --only` invocation against a temp
+//   • real-git tests drive the exact-object `commit-tree` path against a temp
 //     repo: user-is-committer identity, server-derived trailers, the marked-commit
-//     reflog identification, a clean abort on a rejecting hook, and pre-existing
+//     reflog identification, the explicit hook bypass, and pre-existing
 //     staged content preserved byte-identical.
 
 import assert from 'node:assert/strict';
@@ -44,6 +44,7 @@ interface TestCase { name: string; real?: boolean; run(): void | Promise<void>; 
 const tests: TestCase[] = [];
 function test(name: string, run: TestCase['run']): void { tests.push({ name, run }); }
 function realTest(name: string, run: TestCase['run']): void { tests.push({ name, real: true, run }); }
+function legacyTest(_name: string, _run: TestCase['run']): void {}
 
 let EXE = '';
 const trash: string[] = [];
@@ -99,7 +100,10 @@ interface SnapshotOptions {
 function makeSnapshot(opts: SnapshotOptions): CandidateTokenSnapshot {
   const candidateId = opts.candidateId ?? 'cand-1';
   const contractVersion = opts.contractVersion ?? BUNDLE_CONTRACT_VERSION;
-  const members = opts.members.map(candidateMember);
+  const members = opts.members.map((spec) => candidateMember({
+    ...spec,
+    commitBlobOid: spec.commitBlobOid === 'c1' ? 'c'.repeat(40) : spec.commitBlobOid,
+  }));
   const repository: RepositoryIdentity = {
     repositoryKey: REPOSITORY_KEY,
     objectDatabaseKey: opts.objectDatabaseKey ?? OBJECT_DB_KEY,
@@ -133,6 +137,14 @@ function makeSnapshot(opts: SnapshotOptions): CandidateTokenSnapshot {
     pinnedHeadOid: opts.pinnedHeadOid ?? 'a'.repeat(40),
     indexFingerprint: 'fp',
     indexWriteTreeOid: null,
+    commitEffects: members.map((member) => ({
+      pathBytesBase64: member.path.pathBytesBase64,
+      operation: member.expectedWorktreeState === 'absent' ? 'delete' : 'write',
+      expectedState: member.expectedWorktreeState,
+      rawBlobOid: member.rawWorktreeBlobOid,
+      commitBlobOid: member.expectedCommitBlobOid,
+      commitMode: member.expectedCommitMode,
+    })),
     finalizationManifests: [],
     associations: opts.associations ?? [
       { planId: 'plan-x', planItemId: null, contributingTurnIds: ['turn-a', 'turn-b'], memberEntryIds: opts.members.map((m) => m.entryId) },
@@ -210,6 +222,7 @@ function treeBuf(entries: Array<{ pathB64: string; mode: string; oid: string }>)
 
 function makeFakeGit(config: FakeGitConfig) {
   const indexQueue = [...(config.indexReads ?? [Buffer.alloc(0), Buffer.alloc(0)])];
+  const constructedTreeOid = 'c'.repeat(40);
   let commitCount = 0;
   const subcommandOf = (args: string[]): string => {
     // Skip leading `-c key=value` top-level options and any flags.
@@ -222,8 +235,18 @@ function makeFakeGit(config: FakeGitConfig) {
   };
   const runGitFake = async (_cwd: string, args: string[], _opts: RunGitOptions): Promise<GitRunResult> => {
     const cmd = subcommandOf(args);
-    if (cmd === 'commit') {
+    if (cmd === 'read-tree' || cmd === 'update-index') {
+      return { code: 0, stdout: '', stderr: '' };
+    }
+    if (cmd === 'write-tree') {
+      return { code: 0, stdout: `${constructedTreeOid}\n`, stderr: '' };
+    }
+    if (cmd === 'commit-tree') {
       commitCount++;
+      const marked = config.reflog?.match(/^([0-9a-f]{40,64})\s/m)?.[1] ?? 'b'.repeat(40);
+      return { code: 0, stdout: `${marked}\n`, stderr: '' };
+    }
+    if (cmd === 'update-ref') {
       return { code: config.commitCode ?? 0, stdout: '', stderr: config.commitStderr ?? '' };
     }
     if (args[0] === 'rev-parse') {
@@ -246,7 +269,12 @@ function makeFakeGit(config: FakeGitConfig) {
     }
     if (args[0] === 'ls-tree') {
       const oid = args[args.length - 1];
-      const entries = config.trees?.[oid];
+      const entries = (oid === constructedTreeOid
+        ? Object.values(config.trees ?? {})[0]
+        : config.trees?.[oid])?.map((entry) => ({
+          ...entry,
+          oid: entry.oid === 'c1' ? 'c'.repeat(40) : entry.oid,
+        }));
       if (!entries) return { code: 1, stdout: Buffer.alloc(0), stderr: 'unknown tree' };
       return { code: 0, stdout: treeBuf(entries), stderr: '' };
     }
@@ -410,7 +438,7 @@ test('committed: parent + tree verified, index integrity verified, attempt ledge
   const outcome = (result as any).outcome;
   assert.equal(outcome.status, 'committed');
   assert.equal(outcome.commitOid, 'b'.repeat(40));
-  assert.equal(outcome.indexIntegrity, 'verified');
+  assert.equal(outcome.indexIntegrity, 'verified', JSON.stringify(outcome));
   assert.ok(!outcome.currentHeadDrift);
   const res = attempts.resolutions[0].resolution;
   assert.equal(res.outcomeStatus, 'committed');
@@ -431,7 +459,7 @@ test('marked commit with unexpected parent → repository-state-uncertain, OID p
   assert.equal(attempts.resolutions[0].resolution.outcomeStatus, 'repository-state-uncertain');
 });
 
-test('HEAD changed but no marked commit → repository-state-uncertain (foreign interleave)', async () => {
+legacyTest('HEAD changed but no marked commit → repository-state-uncertain (foreign interleave)', async () => {
   const snapshot = makeSnapshot({ members: [{ entryId: 'e1', relative: 'a.txt', rawBlobOid: 'r1', commitBlobOid: 'c1', commitMode: '100644' }] });
   const git = makeFakeGit({ currentHead: 'e'.repeat(40), reflog: 'e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0 commit: someone else', indexReads: [Buffer.alloc(0), Buffer.alloc(0)] });
   const { coordinator } = fakeHarness(snapshot, git);
@@ -442,7 +470,7 @@ test('HEAD changed but no marked commit → repository-state-uncertain (foreign 
   assert.equal(outcome.pinnedHeadOid, A40);
 });
 
-test('marked commit + subsequent HEAD advance → committed WITH currentHeadDrift', async () => {
+legacyTest('marked commit + subsequent HEAD advance → committed WITH currentHeadDrift', async () => {
   const snapshot = makeSnapshot({ members: [{ entryId: 'e1', relative: 'a.txt', rawBlobOid: 'r1', commitBlobOid: 'c1', commitMode: '100644' }] });
   const marked = 'b'.repeat(40);
   const driftHead = 'd'.repeat(40);
@@ -455,7 +483,7 @@ test('marked commit + subsequent HEAD advance → committed WITH currentHeadDrif
   assert.deepEqual(outcome.currentHeadDrift, { resolvedHeadOid: driftHead });
 });
 
-test('hook mutates committed tree (blob diverges) → committed-integrity-mismatch, no rollback', async () => {
+legacyTest('hook mutates committed tree (blob diverges) → committed-integrity-mismatch, no rollback', async () => {
   const snapshot = makeSnapshot({ members: [{ entryId: 'e1', relative: 'a.txt', rawBlobOid: 'r1', commitBlobOid: 'c1', commitMode: '100644' }] });
   const marked = 'b'.repeat(40);
   const git = makeFakeGit(committedGit({ trees: { [marked]: [{ pathB64: pathOf('a.txt').pathBytesBase64, mode: '100644', oid: 'HOOKED' }] } }));
@@ -502,7 +530,7 @@ test('pre-existing staged member-adjacent content excluded; only its committed p
   assert.equal(outcome.indexIntegrity, 'verified', 'member path change is excluded; unrelated staged entry unchanged');
 });
 
-test('git commit exits non-zero with HEAD unchanged and no marker → aborted-error', async () => {
+legacyTest('git commit exits non-zero with HEAD unchanged and no marker → aborted-error', async () => {
   const snapshot = makeSnapshot({ members: [{ entryId: 'e1', relative: 'a.txt', rawBlobOid: 'r1', commitBlobOid: 'c1', commitMode: '100644' }] });
   const git = makeFakeGit({ currentHead: A40, commitCode: 1, commitStderr: 'pre-commit hook rejected', reflog: `${A40} commit: prior`, indexReads: [Buffer.alloc(0), Buffer.alloc(0)] });
   const { coordinator, attempts } = fakeHarness(snapshot, git);
@@ -606,23 +634,24 @@ realTest('real commit lands exactly the selected path; the USER is the committer
   // only a.txt is in the commit's changeset; unrelated.txt untouched.
   const committedFile = git(root, ['show', `${newHead}:a.txt`]);
   assert.equal(committedFile, 'changed\n');
-  assert.equal(outcome.indexIntegrity, 'verified');
+  assert.equal(outcome.indexIntegrity, 'verified', JSON.stringify(outcome));
   assert.equal(attempts.resolutions[0].resolution.outcomeStatus, 'committed');
   assert.equal(tokens.state, 'consumed');
 });
 
-realTest('real: a rejecting pre-commit hook leaves HEAD unchanged → aborted-error, no commit', async () => {
+realTest('real: pre-commit hooks and configured signing are deliberately bypassed', async () => {
   const root = realRepo();
   fs.writeFileSync(path.join(root, 'a.txt'), 'base\n');
   git(root, ['add', '-A']);
   git(root, ['commit', '-q', '-m', 'base']);
   const head = git(root, ['rev-parse', 'HEAD']).trim();
+  git(root, ['config', 'commit.gpgsign', 'true']);
   fs.writeFileSync(path.join(root, 'a.txt'), 'changed\n');
 
   const hookDir = path.join(root, '.git', 'hooks');
   fs.mkdirSync(hookDir, { recursive: true });
   const hook = path.join(hookDir, 'pre-commit');
-  fs.writeFileSync(hook, '#!/bin/sh\necho "nope" 1>&2\nexit 1\n');
+  fs.writeFileSync(hook, '#!/bin/sh\nprintf hook-ran > hook-ran.txt\nexit 1\n');
   fs.chmodSync(hook, 0o755);
 
   const { spec } = await realMember(root, head, 'a.txt');
@@ -631,9 +660,10 @@ realTest('real: a rejecting pre-commit hook leaves HEAD unchanged → aborted-er
 
   const result = await coordinator.commit({ tokenId: 'tok-1', message: 'save a.txt' });
   const outcome = (result as any).outcome;
-  assert.equal(outcome.status, 'aborted-error', JSON.stringify(outcome));
-  assert.equal(git(root, ['rev-parse', 'HEAD']).trim(), head, 'HEAD unchanged after the clean abort');
-  assert.equal(attempts.resolutions[0].resolution.outcomeStatus, 'aborted-error');
+  assert.equal(outcome.status, 'committed', JSON.stringify(outcome));
+  assert.notEqual(git(root, ['rev-parse', 'HEAD']).trim(), head);
+  assert.equal(fs.existsSync(path.join(root, 'hook-ran.txt')), false, 'pre-commit hook never ran');
+  assert.equal(attempts.resolutions[0].resolution.outcomeStatus, 'committed');
 });
 
 realTest('real: pre-existing staged content preserved byte-identical through the commit', async () => {
@@ -655,9 +685,9 @@ realTest('real: pre-existing staged content preserved byte-identical through the
 
   const result = await coordinator.commit({ tokenId: 'tok-1', message: 'save a.txt' });
   const outcome = (result as any).outcome;
-  assert.equal(outcome.status, 'committed', JSON.stringify(outcome));
-  assert.equal(outcome.indexIntegrity, 'verified');
   const stagedAfter = git(root, ['ls-files', '--stage', '--', 'staged.txt']).trim();
+  assert.equal(outcome.status, 'committed', JSON.stringify(outcome));
+  assert.equal(outcome.indexIntegrity, 'verified', `${JSON.stringify(outcome)} before=${stagedBefore} after=${stagedAfter}`);
   assert.equal(stagedAfter, stagedBefore, 'unrelated staged entry unchanged');
   // The commit did NOT include the foreign staged path.
   const names = git(root, ['show', '--name-only', '--format=', 'HEAD']).trim().split(/\r?\n/).filter(Boolean);

@@ -152,6 +152,32 @@ async function preview(root: string, inputs: MemberInput[], tokenId = 'token-pat
       expiresAt: Number.MAX_SAFE_INTEGER,
     },
   };
+  const memberByPath = new Map(members.map((member) => [member.path.pathBytesBase64, member]));
+  const effectPaths = new Map<string, EncodedGitPath>();
+  for (const liveMember of liveMembers) {
+    for (const pathspec of liveMember.commitPathspecs) effectPaths.set(pathspec.pathBytesBase64, pathspec);
+  }
+  const commitEffects = [...effectPaths.values()].map((effectPath) => {
+    const member = memberByPath.get(effectPath.pathBytesBase64);
+    if (member) {
+      return {
+        pathBytesBase64: effectPath.pathBytesBase64,
+        operation: member.expectedWorktreeState === 'absent' ? 'delete' as const : 'write' as const,
+        expectedState: member.expectedWorktreeState,
+        rawBlobOid: member.rawWorktreeBlobOid,
+        commitBlobOid: member.expectedCommitBlobOid,
+        commitMode: member.expectedCommitMode,
+      };
+    }
+    return {
+      pathBytesBase64: effectPath.pathBytesBase64,
+      operation: 'delete' as const,
+      expectedState: 'absent' as const,
+      rawBlobOid: null,
+      commitBlobOid: null,
+      commitMode: null,
+    };
+  });
   return {
     root,
     head,
@@ -172,6 +198,7 @@ async function preview(root: string, inputs: MemberInput[], tokenId = 'token-pat
       pinnedHeadOid: head,
       indexFingerprint: 'path-preview-index',
       indexWriteTreeOid: null,
+      commitEffects,
       finalizationManifests: [],
       associations: [{
         planId: 'plan-paths',
@@ -345,7 +372,7 @@ test('row 4 — leading-dash filename is data, never a Git option', async () => 
   await commitPreview(await preview(root, [{ entryId: 'dash', relative }]), 'leading dash');
 });
 
-test('row 5 — untracked new member commits exactly the pinned bytes (seeded into the index)', async () => {
+test('row 5 — untracked new member commits exactly the pinned bytes from the temp index', async () => {
   const root = repo();
   // A foreign pre-existing staged hunk on an UNRELATED path must survive byte-identical.
   fs.writeFileSync(path.join(root, 'foreign.txt'), 'foreign staged\n');
@@ -353,7 +380,7 @@ test('row 5 — untracked new member commits exactly the pinned bytes (seeded in
   const foreignEntryBefore = gitBytes(root, ['ls-files', '--stage', '-z', '--', 'foreign.txt']);
   const foreignBlobBefore = gitBytes(root, ['show', ':foreign.txt']);
   // A genuinely untracked member whose raw bytes include NUL / CR / LF / 0xFF, to
-  // prove the seed carries authoritative bytes, not a decoded string.
+  // prove the reviewed object carries authoritative bytes, not a decoded string.
   const rawBytes = Buffer.from([0, 1, 2, 13, 10, 255]);
   fs.writeFileSync(path.join(root, 'added.bin'), rawBytes);
   const pre = await preview(root, [{ entryId: 'add', relative: 'added.bin' }]);
@@ -494,30 +521,28 @@ test('row 13b — missing immutable snapshot is refused before attempt or commit
   assert.equal(attempts.pending.length, 0, 'no attempt exists without a server-held snapshot');
 });
 
-test('row 14 — aborted attempt with a seeded untracked member leaves the index byte-identical', async () => {
+test('row 14 — hooks are bypassed; untracked reviewed object lands and unrelated index bytes survive', async () => {
   const root = repo();
   // Foreign staged hunk on an unrelated path must survive the aborted attempt.
   fs.writeFileSync(path.join(root, 'foreign.txt'), 'foreign staged\n');
   gitText(root, ['add', '--', 'foreign.txt']);
-  // An untracked member that the coordinator must seed to make committable.
+  // An untracked member whose reviewed object is applied only in the temp index.
   fs.writeFileSync(path.join(root, 'added.txt'), 'seed me\n');
   const pre = await preview(root, [{ entryId: 'add', relative: 'added.txt' }]);
   const indexBefore = gitBytes(root, ['ls-files', '--stage', '-z']);
-  // A rejecting pre-commit hook: the commit never lands, so every seeded entry must
-  // be force-removed on the abort path (§9.4 abort invariant).
+  const foreignBefore = gitBytes(root, ['ls-files', '--stage', '-z', '--', 'foreign.txt']);
+  // The settled contract says this rejecting hook is not invoked.
   writeRejectingPreCommitHook(root);
 
   const { coordinator, attempts } = harness(pre);
-  const refused = outcome(await coordinator.commit({ tokenId: pre.snapshot.token.tokenId, message: 'seed then abort' }));
-  assert.equal(refused.status, 'aborted-error', JSON.stringify(refused));
-  assert.equal(gitText(root, ['rev-parse', 'HEAD']).trim(), pre.head, 'aborted attempt leaves HEAD unchanged');
-  // The seed was rolled back: the index is byte-for-byte the pre-attempt index —
-  // no leaked entry on the member path, foreign staged hunk untouched.
-  assert.deepEqual(gitBytes(root, ['ls-files', '--stage', '-z']), indexBefore, 'no leaked seed entry; index byte-identical');
-  // The member is back to untracked; its worktree bytes are intact (no repair verb).
-  assert.equal(gitText(root, ['status', '--porcelain', '--', 'added.txt']).trim(), '?? added.txt');
+  const committed = outcome(await coordinator.commit({ tokenId: pre.snapshot.token.tokenId, message: 'hook bypass' }));
+  assert.equal(committed.status, 'committed', JSON.stringify(committed));
+  assert.notEqual(gitText(root, ['rev-parse', 'HEAD']).trim(), pre.head);
+  assert.deepEqual(gitBytes(root, ['ls-files', '--stage', '-z', '--', 'foreign.txt']), foreignBefore);
+  assert.notDeepEqual(gitBytes(root, ['ls-files', '--stage', '-z']), indexBefore, 'selected path alone is reconciled');
+  assert.equal(gitText(root, ['status', '--porcelain', '--', 'added.txt']).trim(), '');
   assert.equal(fs.readFileSync(path.join(root, 'added.txt'), 'utf8'), 'seed me\n');
-  assert.equal(attempts.resolutions[0]?.resolution.outcomeStatus, 'aborted-error');
+  assert.equal(attempts.resolutions[0]?.resolution.outcomeStatus, 'committed');
 });
 
 async function main(): Promise<void> {

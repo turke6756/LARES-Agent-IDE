@@ -152,6 +152,14 @@ async function preview(root: string, tokenId = 'token-1'): Promise<Preview> {
       pinnedHeadOid: head,
       indexFingerprint: 'preview-index-fingerprint',
       indexWriteTreeOid: null,
+      commitEffects: [{
+        pathBytesBase64: member.path.pathBytesBase64,
+        operation: 'write',
+        expectedState: 'present',
+        rawBlobOid: member.rawWorktreeBlobOid,
+        commitBlobOid: member.expectedCommitBlobOid,
+        commitMode: member.expectedCommitMode,
+      }],
       finalizationManifests: [],
       associations: [{
         planId: 'plan-race',
@@ -315,7 +323,7 @@ test('row 2 — non-selected edit commits exactly previewed selected bytes', asy
   assert.equal(gitText(root, ['diff', '--cached', '--name-only']).trim(), '');
 });
 
-test('row 3 — HEAD moves after reassembly; §9.4 classifies the marked commit uncertain', async () => {
+test('row 3 — HEAD moves before update-ref CAS; Lares advances nothing and aborts stale', async () => {
   const root = repo();
   fs.writeFileSync(path.join(root, 'selected.txt'), 'preview-selected\n');
   const pre = await preview(root);
@@ -323,24 +331,45 @@ test('row 3 — HEAD moves after reassembly; §9.4 classifies the marked commit 
   let moved = false;
   const { coordinator } = harness(pre, {
     runGit: async (cwd, args, opts) => {
-      if (!moved && args.includes('--only')) {
+      if (!moved && args[0] === 'update-ref') {
         moved = true;
-        fs.writeFileSync(path.join(root, 'other.txt'), 'external-head\n');
-        gitText(root, ['commit', '-q', '--only', '-m', 'external', '--', 'other.txt']);
-        externalHead = gitText(root, ['rev-parse', 'HEAD']).trim();
+        const externalTree = gitText(root, ['rev-parse', `${pre.head}^{tree}`]).trim();
+        externalHead = gitText(root, ['commit-tree', externalTree, '-p', pre.head, '-m', 'external']).trim();
+        gitText(root, ['update-ref', 'HEAD', externalHead, pre.head]);
       }
       return runGit(cwd, args, { ...opts, gitExe: EXE });
     },
   });
   const outcome = classified(await coordinator.commit({ tokenId: 'token-1', message: 'row 3' }));
-  assert.equal(outcome.status, 'repository-state-uncertain');
-  assert.equal(outcome.pinnedHeadOid, pre.head);
-  assert.notEqual(gitText(root, ['rev-parse', 'HEAD']).trim(), externalHead,
-    'the marked attempt commit exists on top of the foreign HEAD');
+  assert.equal(outcome.status, 'aborted-stale');
+  assert.equal(gitText(root, ['rev-parse', 'HEAD']).trim(), externalHead,
+    'only the foreign HEAD move landed');
   assertFile(root, 'selected.txt', 'preview-selected\n');
-  assertHeadFile(root, 'selected.txt', 'preview-selected\n');
-  assertHeadFile(root, 'other.txt', 'external-head\n');
+  assertHeadFile(root, 'selected.txt', 'base-selected\n');
+  assertHeadFile(root, 'other.txt', 'base-other\n');
   assert.equal(gitText(root, ['diff', '--cached', '--name-only']).trim(), '');
+});
+
+test('row 3b — write after final revalidation cannot enter commit and remains dirty', async () => {
+  const root = repo();
+  fs.writeFileSync(path.join(root, 'selected.txt'), 'reviewed-selected\n');
+  const pre = await preview(root);
+  let injected = false;
+  const { coordinator } = harness(pre, {
+    runGit: async (cwd, args, opts) => {
+      if (!injected && args[0] === 'read-tree') {
+        injected = true;
+        fs.writeFileSync(path.join(root, 'selected.txt'), 'concurrent-unreviewed\n');
+      }
+      return runGit(cwd, args, { ...opts, gitExe: EXE });
+    },
+  });
+  const outcome = classified(await coordinator.commit({ tokenId: 'token-1', message: 'row 3b' }));
+  assert.equal(outcome.status, 'committed', JSON.stringify(outcome));
+  assert.equal(injected, true, 'injection ran after the final representation read');
+  assertHeadFile(root, 'selected.txt', 'reviewed-selected\n');
+  assertFile(root, 'selected.txt', 'concurrent-unreviewed\n');
+  assert.equal(gitText(root, ['status', '--short', '--', 'selected.txt']).trim(), 'M selected.txt');
 });
 
 test('row 4 — index mutation after preview changes identity and aborts without repair', async () => {
@@ -411,7 +440,7 @@ test('row 6 — restore/revert wins queue race; confirmation revalidates restore
   assert.deepEqual(indexBytes(root), indexBefore);
 });
 
-test('row 7 — existing index.lock aborts cleanly and no repair verb runs', async () => {
+test('row 7 — existing index.lock cannot affect reviewed commit bytes; reconciliation is unavailable', async () => {
   const root = repo();
   fs.writeFileSync(path.join(root, 'selected.txt'), 'preview-selected\n');
   const pre = await preview(root);
@@ -425,8 +454,10 @@ test('row 7 — existing index.lock aborts cleanly and no repair verb runs', asy
     },
   });
   const outcome = classified(await coordinator.commit({ tokenId: 'token-1', message: 'row 7' }));
-  assert.equal(outcome.status, 'aborted-error');
-  assert.equal(gitText(root, ['rev-parse', 'HEAD']).trim(), pre.head);
+  assert.equal(outcome.status, 'committed');
+  assert.equal(outcome.status === 'committed' && outcome.indexIntegrity, 'unavailable');
+  assert.notEqual(gitText(root, ['rev-parse', 'HEAD']).trim(), pre.head);
+  assertHeadFile(root, 'selected.txt', 'preview-selected\n');
   assertFile(root, 'selected.txt', 'preview-selected\n');
   assert.deepEqual(indexBytes(root), indexBefore);
   assert.equal(fs.readFileSync(path.join(root, '.git', 'index.lock'), 'utf8'), 'external-lock');

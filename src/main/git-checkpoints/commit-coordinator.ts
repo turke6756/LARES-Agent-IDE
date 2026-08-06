@@ -2,7 +2,7 @@
 //
 // The ONE component allowed to write the real Git index. It consumes a minted
 // candidate token, reassembles + revalidates live state, and lands EXACTLY the
-// previewed bytes with a single path-scoped `git commit --only`, then classifies
+// previewed object IDs with a temporary index + `commit-tree`, then classifies
 // the observed repository state into a normative `CommitOutcome` (contract §9.4).
 //
 // TWO COMPLEMENTARY SERIALIZATION SEAMS (contract §10 D-2), never interchangeable:
@@ -31,9 +31,14 @@
 //
 // The heavy live-reassembly + per-member re-read are INJECTED seams (production
 // wiring — CommitCandidateService + temp-index reads — is WP-4E's job); the
-// coordinator OWNS the ordering, the identity/byte revalidation verdict, the exact
-// `git commit --only` invocation, reflog-marked commit identification, outcome
+// coordinator OWNS the ordering, the identity/byte revalidation verdict, exact-object
+// commit construction, reflog-marked commit identification, outcome
 // classification, and temp-file cleanup, all of which are exercised here.
+//
+// SAVE-PATH HOOK/SIGNING CONTRACT (Edward ruling 2026-08-06, option 1): Lares
+// saves deliberately bypass pre-commit and commit-msg hooks and do not request
+// commit signing. `commit-tree` consumes the reviewed tree/message directly; do
+// not replace it with `git commit` or add hook/index mutation without a new ruling.
 
 import { randomUUID } from 'node:crypto';
 import * as fs from 'node:fs';
@@ -44,6 +49,7 @@ import type {
   CandidateMember,
   CommitOutcome,
   EncodedGitPath,
+  NormalizedCommitEffect,
 } from '../../shared/commit-candidates';
 import { BUNDLE_CONTRACT_VERSION } from '../../shared/constants';
 import type { CandidateTokenSnapshot } from '../commit-candidates/candidate-service';
@@ -53,7 +59,6 @@ import type {
 } from '../database';
 import { encodeGitPath } from '../commit-candidates/dirty-inventory';
 import { parseStageEntries } from '../commit-candidates/commit-representation';
-import { gitArgsPrefix } from '../git/git-runtime';
 import { ComposeLockRegistry } from '../commit-candidates/compose-lock-registry';
 import { CheckpointQueue, type SkippedDeadline } from './checkpoint-queue';
 import type {
@@ -152,7 +157,7 @@ export interface CommitCoordinatorDeps {
   locateRepository(snapshot: CandidateTokenSnapshot): { repoRoot: string; gitExe?: string };
   now?(): number;
   newAttemptId?(): string;
-  /** Temp dir root for the pathspec + message files (default `os.tmpdir()`). */
+  /** Temp dir root for the isolated index + message file (default `os.tmpdir()`). */
   tmpDir?: string;
   platform?: NodeJS.Platform;
   /** Base env for the commit (default `process.env`); GIT_REFLOG_ACTION is layered on. */
@@ -215,15 +220,47 @@ function pathBytes(encoded: EncodedGitPath): Buffer {
   return bytes;
 }
 
-function nulDelimited(paths: readonly EncodedGitPath[]): Buffer {
-  return Buffer.concat(paths.flatMap((encoded) => [pathBytes(encoded), Buffer.from([0])]));
-}
-
 /** One `git update-index --index-info -z` record: `<mode> <oid>\t<pathbytes>\0`.
  *  The path is transported as RAW bytes (like every other pathspec seam here) so a
  *  spaced / leading-dash / non-UTF-8 name is never re-split into an argv token. */
 function indexInfoRecord(mode: string, oid: string, encoded: EncodedGitPath): Buffer {
   return Buffer.concat([Buffer.from(`${mode} ${oid}\t`, 'ascii'), pathBytes(encoded), Buffer.from([0])]);
+}
+
+function effectPath(effect: NormalizedCommitEffect): EncodedGitPath {
+  return encodeGitPath(Buffer.from(effect.pathBytesBase64, 'base64'));
+}
+
+function zeroOidFor(snapshot: CandidateTokenSnapshot): string {
+  return '0'.repeat(snapshot.candidate.repository.gitObjectFormat === 'sha256' ? 64 : 40);
+}
+
+/** Raw index-info records built only from reviewed object IDs. No worktree read is
+ * permitted here: deletes use Git's all-zero removal record; writes and retains use
+ * the reviewed clean-filtered blob and mode carried by the minted token. */
+function effectIndexRecords(
+  effects: readonly NormalizedCommitEffect[],
+  zeroOid: string,
+): Buffer {
+  const records: Buffer[] = [];
+  for (const effect of effects) {
+    const encoded = effectPath(effect);
+    if (effect.operation === 'delete') {
+      if (effect.expectedState !== 'absent' || effect.commitBlobOid !== null || effect.commitMode !== null) {
+        throw new Error(`invalid reviewed delete effect for ${encoded.displayPath}`);
+      }
+      records.push(indexInfoRecord('0', zeroOid, encoded));
+      continue;
+    }
+    if (effect.expectedState !== 'present'
+      || !effect.commitBlobOid
+      || !OID_RE.test(effect.commitBlobOid)
+      || !effect.commitMode) {
+      throw new Error(`invalid reviewed ${effect.operation} effect for ${encoded.displayPath}`);
+    }
+    records.push(indexInfoRecord(effect.commitMode, effect.commitBlobOid, encoded));
+  }
+  return Buffer.concat(records);
 }
 
 /** Union of every member's commitPathspecs, deduped by path bytes, deterministically
@@ -328,7 +365,6 @@ export class CommitCoordinator {
   private readonly validateMessage: (raw: string) => string;
   private readonly deriveTrailers: (snapshot: CandidateTokenSnapshot) => string[];
   private readonly contractVersion: number;
-  private readonly platform: NodeJS.Platform;
 
   constructor(deps: CommitCoordinatorDeps) {
     this.d = deps;
@@ -337,7 +373,6 @@ export class CommitCoordinator {
     this.validateMessage = deps.validateMessage ?? defaultValidateMessage;
     this.deriveTrailers = deps.deriveTrailers ?? defaultDeriveTrailers;
     this.contractVersion = deps.contractVersion ?? BUNDLE_CONTRACT_VERSION;
-    this.platform = deps.platform ?? process.platform;
   }
 
   /**
@@ -481,8 +516,8 @@ export class CommitCoordinator {
           ? locked.integrity.mismatchedPaths
           : undefined;
         if (locked.mismatchedTreePaths.length > 0) {
-          // A hook altered SELECTED content: the commit exists; classify as an
-          // integrity mismatch, never "commit failed", never auto-rollback (D-6).
+          // Post-construction evidence found selected-tree divergence: the commit
+          // exists; classify it as an integrity mismatch, never auto-rollback (D-6).
           resolveAttempt(locked.resolvedHeadOid, locked.commitOid, 'committed-integrity-mismatch');
           return {
             status: 'committed-integrity-mismatch',
@@ -507,8 +542,8 @@ export class CommitCoordinator {
     }
   }
 
-  /** Everything inside the object-db lock: final byte revalidation → single
-   *  `git commit --only` → reflog-marked identification → classification. */
+  /** Everything inside the object-db lock: final byte revalidation → reviewed
+   *  object tree construction → ref CAS → selected-path index reconciliation. */
   private async runLockedCommit(
     snapshot: CandidateTokenSnapshot,
     live: LiveReassembly,
@@ -518,16 +553,31 @@ export class CommitCoordinator {
     reflogAction: string,
     pinnedHeadOid: string | null,
   ): Promise<LockedResult> {
+    const effects = snapshot.commitEffects;
+    if (!effects) {
+      return { kind: 'stale', reason: 'minted token has no reviewed commit-effect set', resolvedHeadOid: await this.readHead(repoRoot, gitExe) };
+    }
+    if (effects.length === 0) {
+      return { kind: 'aborted-error', reason: 'reviewed commit-effect set is empty', resolvedHeadOid: await this.readHead(repoRoot, gitExe) };
+    }
     const pathspecs = commitPathspecUnion(live.members);
-    const memberPathBytes = new Set(pathspecs.map((spec) => spec.pathBytesBase64));
+    const effectPathBytes = new Set(effects.map((effect) => effect.pathBytesBase64));
+    const livePathBytes = new Set(pathspecs.map((spec) => spec.pathBytesBase64));
+    if (effectPathBytes.size !== effects.length
+      || effectPathBytes.size !== livePathBytes.size
+      || [...effectPathBytes].some((value) => !livePathBytes.has(value))) {
+      return { kind: 'stale', reason: 'live pathspec closure diverged from reviewed commit effects', resolvedHeadOid: await this.readHead(repoRoot, gitExe) };
+    }
     const expectedByEntryId = new Map(snapshot.candidate.members.map((m) => [m.entryId, m]));
 
-    // Baseline index snapshot (raw) for the post-commit integrity comparison.
-    let beforeIndex: Buffer | null = null;
+    // A readable pre-operation index snapshot is mandatory: after the ref CAS we
+    // reconcile selected effects only, then prove every unrelated stage entry is
+    // byte-identical to this snapshot.
+    let beforeIndex: Buffer;
     try {
       beforeIndex = await this.readIndex(repoRoot, gitExe);
-    } catch {
-      beforeIndex = null; // integrity becomes 'unavailable' below
+    } catch (error) {
+      return { kind: 'aborted-error', reason: `cannot snapshot the real index: ${error instanceof Error ? error.message : String(error)}`, resolvedHeadOid: await this.readHead(repoRoot, gitExe) };
     }
 
     // FINAL raw + clean-filtered byte-match revalidation, immediately before commit
@@ -548,207 +598,134 @@ export class CommitCoordinator {
       }
     }
 
-    // Prepare the raw-byte pathspec file + the message temp file. Owned + unlinked
-    // in the finally on EVERY outcome.
+    // The temp index is isolated from the real index. It is seeded from the pinned
+    // HEAD tree and receives only raw reviewed effects, so a worktree write after
+    // the final read above cannot influence the tree or commit.
     const tempDir = await fs.promises.mkdtemp(path.join(this.d.tmpDir ?? os.tmpdir(), 'lares-commit-'));
     const nonce = randomUUID();
-    const pathspecFile = path.join(tempDir, `${nonce}.paths`);
+    const tempIndexFile = path.join(tempDir, `${nonce}.index`);
     const messageFile = path.join(tempDir, `${nonce}.msg`);
-
-    // Seeded index entries we introduced so `git commit --only` accepts otherwise-
-    // untracked members; force-removed again unless the commit actually lands. See
-    // seedUntrackedMembers / rollbackSeeds.
-    const seeded: EncodedGitPath[] = [];
-    let commitLanded = false;
+    const baseEnv = { ...(this.d.env ?? process.env) };
 
     try {
-      // `git commit --only <pathspec>` matches its pathspecs ONLY against paths
-      // already known to Git (index/HEAD); a brand-new untracked member (or a
-      // rename whose destination is untracked) makes it refuse the whole commit.
-      // Pre-seed each such member into the real index with its PINNED clean-filtered
-      // blob/mode (the object was materialized during the revalidation read just
-      // above, so it exists) — never the working-tree bytes — so the pathspec
-      // matches. `commit --only` then re-reads the (already-revalidated-equal)
-      // worktree, so the seed's OID does not decide the committed bytes; it only
-      // makes the path committable. Every seed is rolled back below unless the
-      // commit lands (§9.4 abort invariant). Foreign staged paths are never touched:
-      // we seed strictly members that are absent from the real index.
-      const seedError = await this.seedUntrackedMembers(
-        repoRoot, gitExe, live.members, expectedByEntryId, beforeIndex, pinnedHeadOid, seeded,
-      );
-      if (seedError) {
-        return { kind: 'aborted-error', reason: seedError, resolvedHeadOid: (await this.readHead(repoRoot, gitExe)) ?? '' };
-      }
-
-      await fs.promises.writeFile(pathspecFile, nulDelimited(pathspecs));
       const trailers = this.deriveTrailers(snapshot);
       const body = `${message}\n\n${trailers.join('\n')}\n`;
       await fs.promises.writeFile(messageFile, body, 'utf8');
 
-      const commitRes = await this.d.runGit(
-        repoRoot,
-        [
-          ...gitArgsPrefix('commit', this.platform),
-          'commit',
-          '--only',
-          `--pathspec-from-file=${pathspecFile}`,
-          '--pathspec-file-nul',
-          '-F',
-          messageFile,
-        ],
-        {
+      await this.d.runGit(repoRoot, pinnedHeadOid ? ['read-tree', pinnedHeadOid] : ['read-tree', '--empty'], {
+        gitExe, env: baseEnv, indexFile: tempIndexFile, timeoutMs: COMMIT_TIMEOUT_MS, maxBytes: SMALL_MAX_BYTES,
+      });
+      await this.d.runGit(repoRoot, ['update-index', '--add', '--remove', '-z', '--index-info'], {
+        gitExe,
+        env: baseEnv,
+        indexFile: tempIndexFile,
+        stdin: effectIndexRecords(effects, zeroOidFor(snapshot)),
+        timeoutMs: COMMIT_TIMEOUT_MS,
+        maxBytes: SMALL_MAX_BYTES,
+      });
+      const treeResult = await this.d.runGit(repoRoot, ['write-tree'], {
+        gitExe, env: baseEnv, indexFile: tempIndexFile, timeoutMs: COMMIT_TIMEOUT_MS, maxBytes: SMALL_MAX_BYTES,
+      });
+      const treeOid = treeResult.stdout.trim();
+      if (!OID_RE.test(treeOid)) throw new Error('write-tree returned an invalid object ID');
+      const constructedTree = await this.readTree(repoRoot, gitExe, treeOid);
+      if (!constructedTree) throw new Error('cannot read the constructed reviewed tree');
+      const constructionMismatches = this.compareEffects(effects, constructedTree);
+      if (constructionMismatches.length > 0) {
+        throw new Error(`constructed tree diverged at ${constructionMismatches.map((entry) => entry.displayPath).join(', ')}`);
+      }
+
+      // Hook/signing bypass is intentional: commit-tree neither runs commit hooks nor
+      // signs unless explicitly passed -S, which this save path never does.
+      const commitArgs = ['commit-tree', treeOid, ...(pinnedHeadOid ? ['-p', pinnedHeadOid] : []), '-F', messageFile];
+      const commitResult = await this.d.runGit(repoRoot, commitArgs, {
+        gitExe,
+        mode: 'user-commit',
+        env: baseEnv,
+        timeoutMs: COMMIT_TIMEOUT_MS,
+        maxBytes: SMALL_MAX_BYTES,
+      });
+      const commitOid = commitResult.stdout.trim();
+      if (!OID_RE.test(commitOid)) throw new Error('commit-tree returned an invalid object ID');
+
+      // Atomic old-OID compare-and-swap. A foreign HEAD move is a clean stale
+      // refusal: our commit object may be dangling, but no Lares ref advanced.
+      const expectedOldOid = pinnedHeadOid ?? zeroOidFor(snapshot);
+      const updateResult = await this.d.runGit(repoRoot, ['update-ref', '-m', reflogAction, 'HEAD', commitOid, expectedOldOid], {
+        gitExe, env: baseEnv, allowNonzero: true, timeoutMs: COMMIT_TIMEOUT_MS, maxBytes: SMALL_MAX_BYTES,
+      }).catch((error) => ({
+        code: 1,
+        stdout: '',
+        stderr: error instanceof Error ? error.message : String(error),
+      }));
+      if (updateResult.code !== 0) {
+        const resolvedHeadOid = (await this.readHead(repoRoot, gitExe)) ?? '';
+        const reason = (updateResult.stderr.trim() || 'HEAD compare-and-swap failed').slice(0, 500);
+        if (resolvedHeadOid === (pinnedHeadOid ?? '')) {
+          return { kind: 'aborted-error', reason, resolvedHeadOid };
+        }
+        return {
+          kind: 'stale',
+          reason,
+          resolvedHeadOid,
+        };
+      }
+
+      // Reconcile only selected effect paths in the real index from the same reviewed
+      // object IDs. Concurrent worktree bytes are deliberately left alone and remain
+      // visibly dirty against these index entries.
+      let reconciliationAvailable = true;
+      try {
+        await this.d.runGit(repoRoot, ['update-index', '--add', '--remove', '-z', '--index-info'], {
           gitExe,
-          mode: 'user-commit',
-          env: { ...(this.d.env ?? process.env), GIT_REFLOG_ACTION: reflogAction },
-          allowNonzero: true,
+          env: baseEnv,
+          stdin: effectIndexRecords(effects, zeroOidFor(snapshot)),
           timeoutMs: COMMIT_TIMEOUT_MS,
           maxBytes: SMALL_MAX_BYTES,
-        },
-      ).catch((error) => {
-        // A lock error (external index.lock) always rejects regardless of
-        // allowNonzero; surface it as a non-zero-ish result for classification.
-        return { code: 1, stdout: '', stderr: error instanceof Error ? error.message : String(error) } as GitRunResult;
-      });
+        });
+      } catch {
+        reconciliationAvailable = false;
+      }
 
       const resolvedHeadOid = (await this.readHead(repoRoot, gitExe)) ?? '';
       const marked = await this.findMarkedCommit(repoRoot, gitExe, reflogAction);
-
-      if (!marked) {
-        // No marked commit. HEAD unchanged ⇒ a clean abort; HEAD changed ⇒ a
-        // foreign interleave we cannot attribute.
-        if (resolvedHeadOid === (pinnedHeadOid ?? '')) {
-          const reason = commitRes.code !== 0
-            ? (commitRes.stderr.trim() || `git commit exited ${commitRes.code}`).slice(0, 500)
-            : 'git commit produced no marked commit';
-          return { kind: 'aborted-error', reason, resolvedHeadOid };
-        }
-        return { kind: 'uncertain', identifiedCommitOid: null, resolvedHeadOid };
+      if (marked !== commitOid || resolvedHeadOid !== commitOid) {
+        return { kind: 'uncertain', identifiedCommitOid: commitOid, resolvedHeadOid };
       }
 
-      // A marked commit exists ⇒ OUR commit landed and consumed any seeded entries
-      // into committed history; never roll them back (D-6 abort-never-repair). Only
-      // the no-marked-commit branches above reach the finally with commitLanded=false.
-      commitLanded = true;
-
-      // Verify parent == pinnedHeadOid AND the committed tree entries.
-      const parent = await this.readParent(repoRoot, gitExe, marked);
+      // Post-commit parent/tree verification remains evidence in addition to the
+      // pre-commit constructed-tree proof.
+      const parent = await this.readParent(repoRoot, gitExe, commitOid);
       const parentOk = pinnedHeadOid ? parent === pinnedHeadOid : parent === null;
-      const tree = await this.readTree(repoRoot, gitExe, marked);
+      const tree = await this.readTree(repoRoot, gitExe, commitOid);
       if (!parentOk || tree === null) {
-        // Unexpected parent or unverifiable tree ⇒ uncertain (OID preserved, no
-        // exact links).
-        return { kind: 'uncertain', identifiedCommitOid: marked, resolvedHeadOid };
+        return { kind: 'uncertain', identifiedCommitOid: commitOid, resolvedHeadOid };
       }
 
-      const mismatchedTreePaths = this.compareTree(snapshot.candidate.members, tree);
+      const mismatchedTreePaths = this.compareEffects(effects, tree);
 
-      // Post-commit index-integrity (unrelated staged entries byte-identical).
       let integrity: IndexIntegrityResult;
-      if (!beforeIndex) {
+      if (!reconciliationAvailable) {
         integrity = { status: 'unavailable', mismatchedPaths: [] };
       } else {
         try {
           const afterIndex = await this.readIndex(repoRoot, gitExe);
-          integrity = compareIndexIntegrity(beforeIndex, afterIndex, memberPathBytes);
+          integrity = compareIndexIntegrity(beforeIndex, afterIndex, effectPathBytes);
         } catch {
           integrity = { status: 'unavailable', mismatchedPaths: [] };
         }
       }
 
-      return { kind: 'committed', commitOid: marked, integrity, resolvedHeadOid, mismatchedTreePaths };
+      return { kind: 'committed', commitOid, integrity, resolvedHeadOid, mismatchedTreePaths };
+    } catch (error) {
+      return {
+        kind: 'aborted-error',
+        reason: error instanceof Error ? error.message : String(error),
+        resolvedHeadOid: await this.readHead(repoRoot, gitExe),
+      };
     } finally {
-      // No commit landed ⇒ undo every seed so an aborted-* / uncertain outcome
-      // leaves the real index byte-identical to before (§9.4 abort invariant).
-      // Best-effort: a rollback failure must not mask the classified outcome, and
-      // no repair verb is available to do better (D-6).
-      if (seeded.length > 0 && !commitLanded) {
-        await this.rollbackSeeds(repoRoot, gitExe, seeded).catch(() => undefined);
-      }
       await fs.promises.rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
     }
-  }
-
-  /** Stage each present member that `git commit --only` would refuse — i.e. one that
-   *  is GENUINELY UNTRACKED: absent from BOTH the real index AND the pinned HEAD tree
-   *  (a brand-new file, or a rename destination). A member already known to Git via
-   *  the index (foreign/own staged content) or via HEAD (e.g. removed from the index)
-   *  needs no seed and is left untouched. Seeds with the member's PINNED clean-filtered
-   *  `{expectedCommitBlobOid, expectedCommitMode}` — never working-tree bytes — so the
-   *  seed only makes the pathspec matchable; `commit --only` then re-reads the
-   *  already-revalidated-equal worktree for the committed bytes. Records each seeded
-   *  path in `seeded` for rollback. Returns a reason string on failure (nothing left
-   *  staged — `--index-info` is atomic), or null on success/no-op. */
-  private async seedUntrackedMembers(
-    repoRoot: string,
-    gitExe: string | undefined,
-    members: readonly LiveMember[],
-    expectedByEntryId: Map<string, CandidateMember>,
-    beforeIndex: Buffer | null,
-    pinnedHeadOid: string | null,
-    seeded: EncodedGitPath[],
-  ): Promise<string | null> {
-    // Without a readable baseline index we cannot tell tracked from untracked, so we
-    // seed nothing rather than risk clobbering a member path's existing staged entry.
-    if (!beforeIndex) return null;
-    const indexPaths = new Set(parseStageEntries(beforeIndex).map((entry) => entry.pathBytesBase64));
-    const indexAbsent = members.filter(
-      (member) => member.expectedWorktreeState === 'present' && !indexPaths.has(member.path.pathBytesBase64),
-    );
-    if (indexAbsent.length === 0) return null;
-
-    // A member absent from the index may still be known to Git via HEAD (which
-    // `commit --only` accepts without a seed). Only paths absent from HEAD too are
-    // truly untracked. If HEAD's tree is unreadable (unborn / corrupt) we cannot
-    // prove untracked, so we seed nothing and let the commit proceed or abort itself.
-    const headTree = pinnedHeadOid ? await this.readTree(repoRoot, gitExe, pinnedHeadOid) : null;
-    if (!headTree) return null;
-
-    const records: Buffer[] = [];
-    for (const member of indexAbsent) {
-      if (headTree.has(member.path.pathBytesBase64)) continue; // known to Git via HEAD
-      const expected = expectedByEntryId.get(member.entryId);
-      if (!expected || !expected.expectedCommitBlobOid || !expected.expectedCommitMode) {
-        // A present member with no pinned clean-filtered blob/mode cannot be seeded
-        // safely; refuse before any mutation so the index stays untouched.
-        return `cannot stage untracked member ${member.path.displayPath}: no pinned commit blob/mode`;
-      }
-      seeded.push(member.path);
-      records.push(indexInfoRecord(expected.expectedCommitMode, expected.expectedCommitBlobOid, member.path));
-    }
-    if (records.length === 0) return null;
-
-    try {
-      await this.d.runGit(repoRoot, ['update-index', '--add', '-z', '--index-info'], {
-        gitExe,
-        stdin: Buffer.concat(records),
-        timeoutMs: COMMIT_TIMEOUT_MS,
-        maxBytes: SMALL_MAX_BYTES,
-      });
-      return null;
-    } catch (error) {
-      // `--index-info` is atomic (a bad record aborts the whole batch), so nothing
-      // was applied — but the finally still force-removes `seeded` defensively
-      // (force-remove no-ops on an absent path). Report a clean abort.
-      return `failed to stage untracked member(s): ${error instanceof Error ? error.message : String(error)}`;
-    }
-  }
-
-  /** Remove seeded index entries. Every seeded path was absent from the index at
-   *  seed time (seedUntrackedMembers only stages index-absent members), so
-   *  `--force-remove` restores exactly that prior absent state; it is a no-op on any
-   *  path that never actually got staged. Never touches the worktree (D-6). */
-  private async rollbackSeeds(
-    repoRoot: string,
-    gitExe: string | undefined,
-    seeded: readonly EncodedGitPath[],
-  ): Promise<void> {
-    if (seeded.length === 0) return;
-    await this.d.runGit(repoRoot, ['update-index', '--force-remove', '-z', '--stdin'], {
-      gitExe,
-      stdin: nulDelimited(seeded),
-      timeoutMs: COMMIT_TIMEOUT_MS,
-      maxBytes: SMALL_MAX_BYTES,
-    });
   }
 
   // ── git reads (never mutate) ──────────────────────────────────────────────
@@ -809,18 +786,18 @@ export class CommitCoordinator {
     return res.stdout;
   }
 
-  /** Which selected members' committed tree entries diverge from the frozen expected
-   *  `{expectedCommitBlobOid, expectedCommitMode, expectedWorktreeState}`. */
-  private compareTree(members: readonly CandidateMember[], tree: Map<string, TreeEntry>): EncodedGitPath[] {
+  /** Which reviewed effect entries diverge from the constructed/committed tree. */
+  private compareEffects(effects: readonly NormalizedCommitEffect[], tree: Map<string, TreeEntry>): EncodedGitPath[] {
     const mismatched: EncodedGitPath[] = [];
-    for (const member of members) {
-      const entry = tree.get(member.path.pathBytesBase64);
-      if (member.expectedWorktreeState === 'absent') {
-        if (entry) mismatched.push(member.path);
+    for (const effect of effects) {
+      const encoded = effectPath(effect);
+      const entry = tree.get(effect.pathBytesBase64);
+      if (effect.expectedState === 'absent') {
+        if (entry) mismatched.push(encoded);
         continue;
       }
-      if (!entry || entry.oid !== member.expectedCommitBlobOid || entry.mode !== member.expectedCommitMode) {
-        mismatched.push(member.path);
+      if (!entry || entry.oid !== effect.commitBlobOid || entry.mode !== effect.commitMode) {
+        mismatched.push(encoded);
       }
     }
     return mismatched;
