@@ -626,6 +626,8 @@ const TESTS = [
   'dist/main/main/plans/plan-gallery.test.js',
   // WP-P2B-folder: plan-folder-watcher — <workspaceStateDir()>/plans/*/ ingest.
   'dist/main/main/plans/plan-folder-watcher.test.js',
+  // Planning-surface WP-C: strict work-package ingest + responsibility convergence.
+  'dist/main/main/plans/plan-work-package-ingest.test.js',
   // Planning-surface Stage P3 (gate P3Z) — proposal→promotion→dispatchable-WP.
   // WP-P3A′: responsibility + promotion_requests schema/accessors.
   'dist/main/main/database.responsibility.test.js',

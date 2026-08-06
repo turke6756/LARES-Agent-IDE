@@ -5563,7 +5563,7 @@ export function getPlanWorkPackageRuntimeEvidence(packageId: string): PlanWorkPa
 export function recordPlanWorkPackageProjectionStatus(input: {
   workspaceId: string; planId: string;
   status: Exclude<PlanWorkPackageProjectionStatus, 'synced'>;
-  diagnostics: readonly string[]; reconciledAt: number;
+  diagnostics: readonly unknown[]; reconciledAt: number;
 }): void {
   run(
     `INSERT INTO plan_folder_projection_state
@@ -5573,6 +5573,92 @@ export function recordPlanWorkPackageProjectionStatus(input: {
        wp_diagnostics_json = excluded.wp_diagnostics_json,
        wp_reconciled_at = excluded.wp_reconciled_at`,
     [input.planId, input.workspaceId, input.status, JSON.stringify(input.diagnostics), input.reconciledAt]);
+}
+
+export type PlanResponsibilityProjectionStatus = 'valid' | 'absent' | 'invalid';
+
+export interface ReconcilePlanResponsibilityInput {
+  workspaceId: string;
+  planId: string;
+  status: PlanResponsibilityProjectionStatus;
+  eventId: string | null;
+  supervisorId: string | null;
+  /** Durable typed diagnostic JSON, or null for a clean valid/absent projection. */
+  detail: string | null;
+  reconciledAt: number;
+}
+
+export interface ReconcilePlanResponsibilityResult {
+  status: PlanResponsibilityProjectionStatus;
+  eventId: string | null;
+  supervisorId: string | null;
+  detail: string | null;
+}
+
+/** Apply manifest responsibility independently from every other folder projection. */
+export function reconcilePlanResponsibility(
+  input: ReconcilePlanResponsibilityInput,
+): ReconcilePlanResponsibilityResult {
+  return getDb().transaction(() => {
+    const plan = queryOne(
+      'SELECT workspace_id, responsible_supervisor_id FROM plans WHERE id = ?',
+      [input.planId],
+    ) as { workspace_id: string; responsible_supervisor_id: string | null } | null;
+    if (!plan || plan.workspace_id !== input.workspaceId) {
+      throw new Error(`reconcilePlanResponsibility: plan ${input.planId} is not in workspace ${input.workspaceId}`);
+    }
+
+    const priorSupervisorId = plan.responsible_supervisor_id ?? null;
+    let status = input.status;
+    let supervisorId = input.supervisorId;
+    let detail = input.detail;
+    if (status === 'valid') {
+      const candidate = supervisorId ? queryOne(
+        `SELECT id FROM agents WHERE id = ? AND workspace_id = ?
+          AND (is_supervisor = 1 OR privilege_lane = 'supervisor')`,
+        [supervisorId, input.workspaceId],
+      ) : null;
+      if (!candidate) {
+        status = 'invalid';
+        supervisorId = null;
+        detail = JSON.stringify({ code: 'assignee-invalid',
+          detail: 'latest assigned agent is missing, cross-workspace, or lacks supervisor privilege',
+          rejected_agent_id: input.supervisorId });
+      }
+    } else {
+      supervisorId = null;
+    }
+
+    const resolvedSupervisorId = status === 'valid' ? supervisorId : null;
+    run(`UPDATE plans SET responsible_supervisor_id = ?, updated_at = datetime('now')
+      WHERE id = ? AND responsible_supervisor_id IS NOT ?`,
+      [resolvedSupervisorId, input.planId, resolvedSupervisorId]);
+    if (status === 'valid' && supervisorId) {
+      run(
+        `INSERT INTO supervisor_focus (supervisor_id, plan_id, notes)
+         VALUES (?, ?, NULL)
+         ON CONFLICT(supervisor_id, plan_id) DO NOTHING`,
+        [supervisorId, input.planId],
+      );
+    }
+    if (priorSupervisorId && priorSupervisorId !== (status === 'valid' ? supervisorId : null)) {
+      run('DELETE FROM supervisor_active_plan WHERE supervisor_id = ? AND plan_id = ?',
+        [priorSupervisorId, input.planId]);
+    }
+    run(
+      `INSERT INTO plan_folder_projection_state
+         (plan_id, workspace_id, responsibility_event_id, responsibility_status,
+          responsibility_detail, responsibility_reconciled_at)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(plan_id) DO UPDATE SET
+         responsibility_event_id = excluded.responsibility_event_id,
+         responsibility_status = excluded.responsibility_status,
+         responsibility_detail = excluded.responsibility_detail,
+         responsibility_reconciled_at = excluded.responsibility_reconciled_at`,
+      [input.planId, input.workspaceId, input.eventId, status, detail, input.reconciledAt],
+    );
+    return { status, eventId: input.eventId, supervisorId: status === 'valid' ? supervisorId : null, detail };
+  })();
 }
 
 type NormalizedReconciledPackage = Omit<ReconciledPlanWorkPackageInput, 'paths'> & {

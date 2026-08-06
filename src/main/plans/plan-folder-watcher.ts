@@ -28,6 +28,7 @@ import type { Workspace } from '../../shared/types';
 import { adoptStructuredPlan, softDeletePlan, type StructuredPlanChange } from '../database';
 import { workspaceStateDir, workspaceStateDirName } from '../workspace-state-dir';
 import { scanPlanIntentLedger } from './plan-intent-ledger';
+import { reconcilePlanFolderPlanningState } from './plan-work-package-ingest';
 
 /** Subdirs a plan folder scatters outputs into (§R0). Watched as bounded child
  *  subscriptions by PlansWatcher; enumerated here for the change signature. */
@@ -188,10 +189,9 @@ function safeSegment(name: string): boolean {
 // ── The ingest reconciler ────────────────────────────────────────────────────
 
 export interface PlanFolderWatcherOptions {
-  /** F-C seam: fired AFTER a folder's live `plans` row is resolved (adopt/change),
-   *  NEVER on removal. The built-in P2L ledger scan runs first; this optional
-   *  callback remains available to downstream consumers. Awaited in a live
-   *  reconcile; detach-and-catch on the boot scan. */
+  /** F-C seam: fired AFTER the built-in folder projections settle, NEVER on
+   *  removal. WP-D extends reconcilePlanFolderPlanningState immediately before
+   *  this callback; downstream consumers retain one ordered completion seam. */
   onPlanFolderSettled?: (planId: string, folderRelPath: string, changeKind: FolderChangeKind) => Promise<void> | void;
   /** Injected clock (tests). */
   now?: () => number;
@@ -390,6 +390,18 @@ export class PlanFolderWatcher {
       for (const diagnostic of scan.diagnostics) {
         console.warn(`[plan-intent-ledger] ${diagnostic.kind}: ${diagnostic.detail}`);
       }
+      const projections = reconcilePlanFolderPlanningState({
+        workspaceId: ws.id,
+        planId,
+        folderAbs,
+        folderRelPath,
+        now: this.now,
+      });
+      if (projections.workPackages.status === 'invalid' || projections.workPackages.status === 'conflict') {
+        for (const diagnostic of projections.workPackages.diagnostics) {
+          console.warn(`[plan-work-package-ingest] ${diagnostic.code}: ${diagnostic.detail}`);
+        }
+      }
       if (this.onSettled) await this.onSettled(planId, folderRelPath, changeKind);
     };
     if (isBoot) {
@@ -470,6 +482,15 @@ export async function adoptPlanFolder(ws: Workspace, planFolderRelPath: string):
       planPath: `${folderRelPath}/plan.md`,
       mtimeMs: meta.mtimeMs,
       sizeBytes: meta.sizeBytes,
+    });
+    // Explicit/manual/forced refresh uses the exact same projection service as
+    // boot, adoption, watched changes, and over-cap reconciliation. This runs on
+    // `unchanged` too: callers requested convergence, not merely row adoption.
+    reconcilePlanFolderPlanningState({
+      workspaceId: ws.id,
+      planId: adopt.planId,
+      folderAbs,
+      folderRelPath,
     });
     return { adopted: true, planId: adopt.planId, change: adopt.change };
   } catch {
