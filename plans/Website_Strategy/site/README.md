@@ -13,10 +13,8 @@ browser; no build step or local server is required.
   fictional/abstract.
 - The Act 1 payoff is real Lares footage cropped from the source master. Run
   `./encode-media.sh` from a shell with `ffmpeg` on PATH to regenerate the
-  desktop/mobile MP4s and poster frames in `media/`. The current real footage
-  contains legacy local demo workspace names and truncated local paths; treat it
-  as a preproduction asset and replace it with a publication-cleared recapture
-  before the site goes live.
+  desktop/mobile MP4s and poster frames in `media/`. The footage is cleared for
+  publication; `VS_Code_JobHunt.png` is not cleared and must never be used.
 - Links use `#` placeholders until final GitHub and installation/docs URLs are
   selected.
 
