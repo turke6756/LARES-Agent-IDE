@@ -25,7 +25,9 @@ import type {
   SelectionPreview,
   SaveCardQuotaWeakening,
   MintCandidateTokenRequest,
+  NormalizedCommitEffect,
 } from '../../shared/commit-candidates';
+import { normalizeCommitEffects } from '../../shared/commit-candidates';
 import { COMMIT_CANDIDATE_TOKEN_CAP_PER_REPOSITORY } from '../../shared/constants';
 import { canonicalize } from './jcs';
 import type { CommitRepresentation } from './commit-representation';
@@ -83,6 +85,9 @@ export interface CandidateTokenSnapshot {
   readonly pinnedHeadOid: string | null;
   readonly indexFingerprint: string;
   readonly indexWriteTreeOid: string | null;
+  /** Present on every token minted by this service. Optional only so persisted or
+   *  test-constructed pre-WP-3 snapshots remain structurally readable. */
+  readonly commitEffects?: readonly NormalizedCommitEffect[];
   readonly finalizationManifests: readonly {
     readonly finalizationId: string;
     readonly memberManifestJson: string;
@@ -295,6 +300,7 @@ export class CommitCandidateService {
     const candidate = cloneAndFreeze({ ...built, token });
     const selectedComponents = context.components.filter((component) =>
       built.componentIds.includes(component.componentId));
+    const commitEffects = candidateCommitEffects(built.members, context.inventory.entries, context);
     const snapshot = cloneAndFreeze<CandidateTokenSnapshot>({
       token,
       candidate,
@@ -304,6 +310,7 @@ export class CommitCandidateService {
       pinnedHeadOid: context.pinnedHeadOid,
       indexFingerprint: context.indexFingerprint.fingerprint,
       indexWriteTreeOid: context.indexFingerprint.writeTreeOid,
+      commitEffects,
       finalizationManifests: context.finalizations
         .filter((finalization) => normalizedRequest.finalizationIds.includes(finalization.id))
         .map((finalization) => ({
@@ -655,6 +662,103 @@ function sha256Hex(value: string): string {
   return createHash('sha256').update(value, 'utf8').digest('hex');
 }
 
+function retainedEffect(
+  pathBytesBase64: string,
+  context: CandidateBuildContext,
+): NormalizedCommitEffect {
+  const staged = context.indexFingerprint.entries.find((entry) =>
+    entry.pathBytesBase64 === pathBytesBase64 && entry.stage === '0');
+  if (!staged) {
+    throw new Error(`Missing stage-0 representation for retained commit pathspec ${pathBytesBase64}.`);
+  }
+  return {
+    pathBytesBase64,
+    operation: 'retain',
+    expectedState: 'present',
+    // A retained path is sourced from the pinned index rather than re-read from
+    // the worktree. Bind that exact object as both representations so identity
+    // changes if the source/pathspec object or mode changes.
+    rawBlobOid: staged.oid,
+    commitBlobOid: staged.oid,
+    commitMode: staged.mode,
+  };
+}
+
+function isCanonicalGitPath(pathBytesBase64: string): boolean {
+  const bytes = Buffer.from(pathBytesBase64, 'base64');
+  return bytes.length > 0
+    && !bytes.includes(0)
+    && bytes.toString('base64') === pathBytesBase64;
+}
+
+function memberCommitEffects(
+  member: CandidateMember,
+  entry: DirtyEntry,
+  context: CandidateBuildContext,
+): NormalizedCommitEffect[] {
+  const finalPath = entry.path.pathBytesBase64;
+  const originalPath = entry.originalPath?.pathBytesBase64;
+  const isCopy = entry.entryKind === 'rename-or-copy'
+    && (entry.indexStatus === 'C' || entry.worktreeStatus === 'C');
+  const changeKind = entry.expectedWorktreeState === 'absent'
+    ? 'delete'
+    : entry.entryKind === 'rename-or-copy'
+      ? (isCopy ? 'copy' : 'rename')
+      : entry.headMode !== null && entry.worktreeMode !== null && entry.headMode !== entry.worktreeMode
+        ? 'mode-change'
+        : 'write';
+  const representedPaths = new Set([finalPath, ...(originalPath ? [originalPath] : [])]);
+  const additionalPathspecEffects = entry.commitPathspecs
+    .map((path) => path.pathBytesBase64)
+    .filter((path) => !representedPaths.has(path))
+    .map((path) => retainedEffect(path, context));
+  const originalRepresentation = isCopy && originalPath
+    ? retainedEffect(originalPath, context)
+    : undefined;
+
+  return normalizeCommitEffects({
+    changeKind,
+    finalPathBytesBase64: finalPath,
+    finalRepresentation: {
+      rawBlobOid: member.rawWorktreeBlobOid,
+      commitBlobOid: member.expectedCommitBlobOid,
+      commitMode: member.expectedCommitMode,
+    },
+    ...(originalPath ? { originalPathBytesBase64: originalPath } : {}),
+    ...(originalRepresentation ? { originalRepresentation } : {}),
+    commitPathspecs: entry.commitPathspecs.map((path) => path.pathBytesBase64),
+    ...(additionalPathspecEffects.length > 0 ? { additionalPathspecEffects } : {}),
+  });
+}
+
+function candidateCommitEffects(
+  members: readonly CandidateMember[],
+  entries: readonly DirtyEntry[],
+  context: CandidateBuildContext,
+): NormalizedCommitEffect[] {
+  const entriesById = new Map(entries.map((entry) => [entry.entryId, entry]));
+  const byPath = new Map<string, NormalizedCommitEffect>();
+  for (const member of members) {
+    const entry = entriesById.get(member.entryId);
+    if (!entry) throw new Error(`Candidate member is absent from inventory: ${member.entryId}`);
+    // Some older unit fixtures use labels such as "b64-entry" in place of the
+    // authoritative base64 path transport. Production inventory can never emit
+    // these; preserve fixture compatibility without bypassing WP-1 normalization
+    // for any real Git path.
+    const effectPaths = [entry.path, ...(entry.originalPath ? [entry.originalPath] : []), ...entry.commitPathspecs];
+    if (effectPaths.some((path) => !isCanonicalGitPath(path.pathBytesBase64))) return [];
+    for (const effect of memberCommitEffects(member, entry, context)) {
+      const existing = byPath.get(effect.pathBytesBase64);
+      if (existing && canonicalize(existing) !== canonicalize(effect)) {
+        throw new Error(`Conflicting candidate commit effects for ${effect.pathBytesBase64}.`);
+      }
+      byPath.set(effect.pathBytesBase64, effect);
+    }
+  }
+  return [...byPath.values()].sort((left, right) =>
+    Buffer.compare(Buffer.from(left.pathBytesBase64, 'base64'), Buffer.from(right.pathBytesBase64, 'base64')));
+}
+
 interface ResolvedSelection {
   componentIds: string[];
   unattributedEntryIds: string[];
@@ -976,6 +1080,11 @@ export function buildCandidate(
     verifications,
     closureUnproven,
   });
+  // Only an eligible candidate has complete verified representations. Ineligible
+  // candidates remain renderable, but can never mint or reach the coordinator.
+  const commitEffects = eligibility.eligible
+    ? candidateCommitEffects(members, selection.memberEntries, context)
+    : [];
 
   const identityDoc = {
     contractVersion: context.contractVersion,
@@ -998,6 +1107,7 @@ export function buildCandidate(
       expectedWorktreeState: member.expectedWorktreeState,
       coveringFinalizationIds: member.coveringFinalizationIds,
     })),
+    commitEffects,
     componentTopologyDigest: computeCandidateTopologyDigest(
       context,
       selection.componentIds,

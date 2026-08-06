@@ -494,6 +494,42 @@ test('candidateId changes when the finalization/coverage set changes', () => {
   assert.notEqual(mk(fa).candidateId, mk(faAlt).candidateId);
 });
 
+test('candidateId binds a rename source and every commit pathspec', () => {
+  const destination = enc('new-name.ts');
+  const rename = (source: string): DirtyEntry => entry('new-name.ts', {
+    entryId: 'entry-rename-fixed',
+    path: destination,
+    originalPath: enc(source),
+    entryKind: 'rename-or-copy',
+    indexStatus: 'R',
+    worktreeStatus: '.',
+    renameOrCopyScore: '100',
+    commitPathspecs: [destination, enc(source)],
+  });
+  const frozenDestination = frozen('new-name.ts');
+  const fin = finalization([frozenDestination], { id: 'fin-rename', packageId: 'pkg-rename' });
+  const comp = component(['entry-rename-fixed'], {
+    componentId: 'comp-rename', componentTopologyDigest: 'ctd-rename',
+  });
+  const mk = (source: string) => {
+    const renamed = rename(source);
+    return buildCandidate(
+      req({ selectedComponentIds: [comp.componentId], finalizationIds: [fin.id] }),
+      ctx({
+        inventory: inventory([renamed], []), components: [comp], finalizations: [fin],
+        currentCommitReps: new Map([[renamed.entryId, repMatching(frozenDestination)]]),
+      }),
+    ) as CommitCandidate;
+  };
+
+  const first = mk('old-a.ts');
+  const second = mk('old-b.ts');
+  assert.deepEqual(first.members, second.members,
+    'all member fields hashed before WP-3 remain equal');
+  assert.notEqual(first.candidateId, second.candidateId,
+    'changing only the rename source/pathspec must change operational identity');
+});
+
 // ── real git: genuine clean-filter (.gitattributes) divergence ───────────────
 
 const trash: string[] = [];

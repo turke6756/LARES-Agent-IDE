@@ -321,7 +321,16 @@ function asCandidate(value: ReturnType<CommitCandidateService['mintCandidateToke
   assert.equal(snapshot.indexFingerprint, 'index-fingerprint-3g');
   assert.equal(snapshot.pinnedHeadOid, 'h'.repeat(40));
   assert.equal(snapshot.finalizationManifests[0].memberManifestJson, fin.memberManifestJson);
+  assert.deepEqual(snapshot.commitEffects, [{
+    pathBytesBase64: a.path.pathBytesBase64,
+    operation: 'write',
+    expectedState: 'present',
+    rawBlobOid: 'raw-snapshot.ts',
+    commitBlobOid: 'commit-snapshot.ts',
+    commitMode: '100644',
+  }]);
   assert.equal(Object.isFrozen(snapshot), true);
+  assert.equal(Object.isFrozen(snapshot.commitEffects), true);
   assert.equal(Object.isFrozen(snapshot.candidate.members), true);
 }
 
