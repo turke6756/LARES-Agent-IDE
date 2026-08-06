@@ -11,7 +11,7 @@
     .act { --progress: 1; min-height: auto; padding: 7rem 0; }
     .act__layout { display: flex; flex-direction: column; }
     .act__visual { position: relative; height: auto; min-height: 70vh; }
-    .desktop-story { display: none; }
+    .story-stage { display: none; }
     .product-pane { position: relative; opacity: 1; transform: none; }
     .caption { min-height: auto; margin-top: 4.5rem; }
   </style></noscript>
@@ -50,7 +50,7 @@
       <h2 class="visually-hidden" id="act-one-title">From scattered projects to one workspace</h2>
       <div class="act__layout">
         <figure class="act__visual">
-          <div class="desktop-story" aria-hidden="true">
+          <div class="desktop-story story-stage" aria-hidden="true">
             <div class="lares-pane">
               <div class="lares-pane__top"><span>WORKSPACES</span><span class="add-mark">+</span></div>
               <div class="lares-pane__rows">
@@ -100,8 +100,68 @@
       </div>
     </section>
 
-    <!-- Placeholder only: Act 2 will be built in a later slice. -->
-    <section class="future-section" id="act-2" aria-label="Act 2 placeholder"></section>
+    <section class="act act--agents" id="act-2" aria-labelledby="act-two-title">
+      <h2 class="visually-hidden" id="act-two-title">From identical terminals to identifiable agents</h2>
+      <div class="act__layout">
+        <figure class="act__visual">
+          <div class="agent-story story-stage" aria-hidden="true">
+            <div class="agent-card agent-card--one">
+              <div class="agent-card__metadata">
+                <div class="agent-card__heading"><strong>api-refactor</strong><span>working</span></div>
+                <div class="agent-card__tags"><span>Worker</span><span>Codex</span></div>
+                <div class="agent-card__context"><span>Context</span><b>34%</b><i><em style="--usage: .34"></em></i></div>
+              </div>
+              <div class="agent-terminal"><div class="agent-terminal__bar"><i></i><i></i><i></i><span></span></div><div class="agent-terminal__lines"><i></i><i></i><i></i><i></i><i></i></div></div>
+            </div>
+            <div class="agent-card agent-card--two">
+              <div class="agent-card__metadata">
+                <div class="agent-card__heading"><strong>schema-migration</strong><span class="status-muted">idle</span></div>
+                <div class="agent-card__tags"><span>Worker</span><span>Claude Code</span></div>
+                <div class="agent-card__context"><span>Context</span><b>61%</b><i><em style="--usage: .61"></em></i></div>
+              </div>
+              <div class="agent-terminal"><div class="agent-terminal__bar"><i></i><i></i><i></i><span></span></div><div class="agent-terminal__lines"><i></i><i></i><i></i><i></i><i></i></div></div>
+            </div>
+            <div class="agent-card agent-card--three">
+              <div class="agent-card__metadata">
+                <div class="agent-card__heading"><strong>docs-sweep</strong><span>working</span></div>
+                <div class="agent-card__tags"><span>Worker</span><span>Codex</span></div>
+                <div class="agent-card__context"><span>Context</span><b>12%</b><i><em style="--usage: .12"></em></i></div>
+              </div>
+              <div class="agent-terminal"><div class="agent-terminal__bar"><i></i><i></i><i></i><span></span></div><div class="agent-terminal__lines"><i></i><i></i><i></i><i></i><i></i></div></div>
+            </div>
+            <div class="agent-card agent-card--four">
+              <div class="agent-card__metadata">
+                <div class="agent-card__heading"><strong>flake-hunt</strong><span class="status-muted">waiting</span></div>
+                <div class="agent-card__tags"><span>Researcher</span><span>Claude Code</span></div>
+                <div class="agent-card__context"><span>Context</span><b>47%</b><i><em style="--usage: .47"></em></i></div>
+              </div>
+              <div class="agent-terminal"><div class="agent-terminal__bar"><i></i><i></i><i></i><span></span></div><div class="agent-terminal__lines"><i></i><i></i><i></i><i></i><i></i></div></div>
+            </div>
+            <div class="agent-card agent-card--five">
+              <div class="agent-card__metadata">
+                <div class="agent-card__heading"><strong>release-prep</strong><span>working</span></div>
+                <div class="agent-card__tags"><span>Supervisor</span><span>Codex</span></div>
+                <div class="agent-card__context"><span>Context</span><b>78%</b><i><em style="--usage: .78"></em></i></div>
+              </div>
+              <div class="agent-terminal"><div class="agent-terminal__bar"><i></i><i></i><i></i><span></span></div><div class="agent-terminal__lines"><i></i><i></i><i></i><i></i><i></i></div></div>
+            </div>
+          </div>
+
+          <div class="product-pane product-pane--agents">
+            <video muted playsinline loop preload="none" poster="media/act-2-agent-cards-poster.webp" width="760" height="662" aria-label="Lares dashboard showing identifiable agent cards with roles, statuses, and context usage">
+              <source data-desktop-src="media/act-2-agent-cards.mp4" data-mobile-src="media/act-2-agent-cards-mobile.mp4" type="video/mp4">
+            </video>
+          </div>
+          <figcaption class="visually-hidden">Lares turns terminal sessions into identifiable agent cards with names, roles, providers, statuses, and context usage.</figcaption>
+        </figure>
+
+        <div class="act__captions">
+          <div class="caption caption--one" id="beat-4"><p>Five terminals. Every one of them looks the same.</p></div>
+          <div class="caption caption--two" id="beat-5"><p>Which one is refactoring the API?</p></div>
+          <div class="caption caption--three" id="beat-6"><p>Stop managing terminals. Start managing agents.</p></div>
+        </div>
+      </div>
+    </section>
     <!-- Placeholder only: Act 3 will be built in a later slice. -->
     <section class="future-section" id="act-3" aria-label="Act 3 placeholder"></section>
     <!-- Placeholder only: later feature sections will be built in a later slice. -->

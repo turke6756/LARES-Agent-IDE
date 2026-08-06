@@ -1,7 +1,7 @@
 # Lares marketing site — first slice
 
 This directory is a dependency-free static prototype containing the site shell,
-hero, and Act 1 of the scroll story. Open `index.html` directly in a modern
+hero, and Acts 1–2 of the scroll story. Open `index.html` directly in a modern
 browser; no build step or local server is required.
 
 ## What is here
@@ -15,6 +15,9 @@ browser; no build step or local server is required.
   `./encode-media.sh` from a shell with `ffmpeg` on PATH to regenerate the
   desktop/mobile MP4s and poster frames in `media/`. The footage is cleared for
   publication; `VS_Code_JobHunt.png` is not cleared and must never be used.
+- Act 2 reconstructs five fictional terminal sessions becoming agent cards,
+  then resolves to publication-cleared center-dashboard footage. Its measured
+  source crop is `crop=2290:1995:704:165`.
 - Links use `#` placeholders until final GitHub and installation/docs URLs are
   selected.
 
@@ -23,10 +26,10 @@ single `--progress` property. Below 768px it becomes normal document flow. With
 reduced motion enabled it shows the payoff state, disables autoplay, and exposes
 video controls. Captions remain semantic HTML and readable without JavaScript.
 The current encoded desktop MP4 is 107,254 bytes; the mobile MP4 is 60,940
-bytes.
+bytes. Act 2's desktop MP4 is 244,136 bytes; its mobile MP4 is 139,642 bytes.
 
 ## Not built yet
 
-Acts 2 and 3 and all later feature sections are intentionally empty section
-placeholders in `index.html`. Final copy, the final hero still, production URLs,
-and later story media remain outstanding.
+Act 3 and all later feature sections are intentionally empty section placeholders
+in `index.html`. Final copy, the final hero still, production URLs, and later
+story media remain outstanding.
