@@ -16,6 +16,34 @@ function proposalPath(workspacePath: string, fileName: string, pathType: 'window
   return [workspacePath.replace(/[\\/]+$/, ''), '.lares', 'proposals', fileName].join(separator);
 }
 
+function ProposalCard({
+  card,
+  onSelect,
+}: {
+  card: ProposalCardMetadata;
+  onSelect: (docId: string) => void;
+}): React.ReactElement {
+  return (
+    <button
+      type="button"
+      onClick={() => onSelect(card.docId)}
+      className="flex w-72 shrink-0 flex-col rounded-lg border border-white/10 bg-surface-0 p-4 text-left transition-colors hover:border-accent-blue/40 hover:bg-white/[0.04]"
+      data-testid="proposal-card"
+    >
+      <span className="line-clamp-2 text-[14px] font-semibold leading-5 text-gray-100">{card.title}</span>
+      <span className="mt-2 line-clamp-4 text-[12px] leading-5 text-gray-400">{card.description}</span>
+      <span className="mt-auto pt-3 text-[11px] text-gray-500" data-testid="proposal-card-date">
+        {card.dateLabel}
+      </span>
+      {card.author && (
+        <span className="pt-1 text-[11px] text-gray-500" data-testid="proposal-card-author">
+          by {card.author}
+        </span>
+      )}
+    </button>
+  );
+}
+
 export default function ProposalCardGallery(): React.ReactElement {
   const selectedWorkspaceId = useDashboardStore((state) => state.selectedWorkspaceId);
   const workspace = useDashboardStore((state) =>
@@ -28,6 +56,7 @@ export default function ProposalCardGallery(): React.ReactElement {
   const setSelectedDocId = usePlansPaneState((state) => state.setExpandedProposalId);
   const [error, setError] = useState<string | null>(null);
   const [promoteOpen, setPromoteOpen] = useState(false);
+  const [promotedOpen, setPromotedOpen] = useState(false);
   const [cardRow, setCardRow] = useState<HTMLDivElement | null>(null);
 
   const load = useCallback(async () => {
@@ -35,6 +64,7 @@ export default function ProposalCardGallery(): React.ReactElement {
     setError(null);
     setSelectedDocId(null);
     setPromoteOpen(false);
+    setPromotedOpen(false);
     if (!workspace) {
       setCards([]);
       return;
@@ -71,6 +101,8 @@ export default function ProposalCardGallery(): React.ReactElement {
     () => cards?.find((card) => card.docId === selectedDocId) ?? null,
     [cards, selectedDocId],
   );
+  const activeCards = useMemo(() => cards?.filter((card) => !card.promotedTo) ?? [], [cards]);
+  const promotedCards = useMemo(() => cards?.filter((card) => card.promotedTo) ?? [], [cards]);
 
   if (selected) {
     return (
@@ -171,31 +203,43 @@ export default function ProposalCardGallery(): React.ReactElement {
           {workspace ? 'No proposals yet.' : 'Select a workspace to view proposals.'}
         </div>
       ) : (
-        <div
-          ref={setCardRow}
-          className="flex min-h-0 flex-1 items-stretch gap-3 overflow-x-auto overflow-y-hidden p-4 scrollbar-thin"
-          data-testid="proposal-card-row"
-        >
-          {cards.map((card) => (
-            <button
-              key={card.docId}
-              type="button"
-              onClick={() => setSelectedDocId(card.docId)}
-              className="flex w-72 shrink-0 flex-col rounded-lg border border-white/10 bg-surface-0 p-4 text-left transition-colors hover:border-accent-blue/40 hover:bg-white/[0.04]"
-              data-testid="proposal-card"
+        <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">
+          {activeCards.length > 0 ? (
+            <div
+              ref={setCardRow}
+              className="flex min-h-0 flex-1 items-stretch gap-3 overflow-x-auto overflow-y-hidden p-4 scrollbar-thin"
+              data-testid="proposal-card-row"
             >
-              <span className="line-clamp-2 text-[14px] font-semibold leading-5 text-gray-100">{card.title}</span>
-              <span className="mt-2 line-clamp-4 text-[12px] leading-5 text-gray-400">{card.description}</span>
-              <span className="mt-auto pt-3 text-[11px] text-gray-500" data-testid="proposal-card-date">
-                {card.dateLabel}
-              </span>
-              {card.author && (
-                <span className="pt-1 text-[11px] text-gray-500" data-testid="proposal-card-author">
-                  by {card.author}
-                </span>
+              {activeCards.map((card) => (
+                <ProposalCard key={card.docId} card={card} onSelect={setSelectedDocId} />
+              ))}
+            </div>
+          ) : (
+            <div className="flex min-h-24 flex-1 items-center justify-center p-6 text-[12px] text-gray-500">
+              No active proposals.
+            </div>
+          )}
+          {promotedCards.length > 0 && (
+            <section className="shrink-0 border-t border-white/10" data-testid="proposal-promoted-group">
+              <button
+                type="button"
+                className="flex w-full items-center gap-2 px-4 py-3 text-left text-[12px] font-medium text-gray-400 hover:bg-white/[0.03] hover:text-gray-200"
+                aria-expanded={promotedOpen}
+                onClick={() => setPromotedOpen((open) => !open)}
+                data-testid="proposal-promoted-toggle"
+              >
+                <Icons.ChevronRight className={`h-3.5 w-3.5 transition-transform${promotedOpen ? ' rotate-90' : ''}`} />
+                Promoted ({promotedCards.length})
+              </button>
+              {promotedOpen && (
+                <div className="flex items-stretch gap-3 overflow-x-auto px-4 pb-4 scrollbar-thin" data-testid="proposal-promoted-card-row">
+                  {promotedCards.map((card) => (
+                    <ProposalCard key={card.docId} card={card} onSelect={setSelectedDocId} />
+                  ))}
+                </div>
               )}
-            </button>
-          ))}
+            </section>
+          )}
         </div>
       )}
     </section>

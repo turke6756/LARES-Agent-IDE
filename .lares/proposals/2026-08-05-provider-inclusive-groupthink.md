@@ -3,6 +3,8 @@ artifact_id: prop_pigt5a83
 title: Provider-inclusive GroupThink + user-shapeable provider selection
 author_role: supervisor
 authored_at: 2026-08-05T00:30:00-07:00
+promoted_to: 2026-08-05-provider-inclusive-groupthink-user-shapeable-pro-pigt5a83
+promoted_at: 2026-08-05
 ---
 
 # Proposal: provider-inclusive GroupThink deliberations + a user-facing provider-steering surface

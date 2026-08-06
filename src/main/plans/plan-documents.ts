@@ -213,6 +213,7 @@ function folderTab(kind: string, name: string): PlanTabKey | null {
   if (kind === 'deliberation') return 'deliberations';
   if (kind === 'research') return 'research';
   if (kind === 'supplement') return 'supplements';
+  if (kind === 'proposal') return 'proposal';
   return null;
 }
 
@@ -279,6 +280,7 @@ export function buildPlanDocuments(
   const entry = currentFolderEntry(context, manifest);
   const tabs = emptyTabs(d.hasWorkPackages(planId));
   const byKey = new Map(tabs.map((tab) => [tab.key, tab]));
+  const manifestProposalDocuments: PlanTabDocument[] = [];
 
   for (const doc of entry?.documents ?? []) {
     const key = folderTab(doc.category, doc.name);
@@ -290,7 +292,8 @@ export function buildPlanDocuments(
       sizeBytes: doc.sizeBytes,
       mtimeMs: doc.mtimeMs,
     };
-    byKey.get(key)!.documents.push(projected);
+    if (key === 'proposal') manifestProposalDocuments.push(projected);
+    else byKey.get(key)!.documents.push(projected);
   }
 
   for (const row of d.listRegisteredDocuments(planId)) {
@@ -305,6 +308,10 @@ export function buildPlanDocuments(
       sizeBytes: inspected.sizeBytes,
       mtimeMs: inspected.mtimeMs,
     });
+  }
+
+  if (byKey.get('proposal')!.documents.length === 0) {
+    byKey.get('proposal')!.documents.push(...manifestProposalDocuments);
   }
 
   for (const tab of tabs) {

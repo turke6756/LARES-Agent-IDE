@@ -538,7 +538,9 @@ async function resolvePlanReviewProjectionInput(
     throw new Error('the requested plan does not belong to this workspace');
   }
   const executionRun = getActivePlanExecutionRun(request.planId);
-  if (!executionRun) throw new Error('the plan has no active execution baseline');
+  if (!executionRun) {
+    throw new Error('no work packages implemented yet — pull Implement to begin');
+  }
 
   const workspace = getWorkspace(request.workspaceId);
   if (!workspace) throw new Error('workspace not found');

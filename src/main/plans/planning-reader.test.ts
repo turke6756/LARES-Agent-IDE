@@ -389,6 +389,10 @@ test('late plan.md — intents fall back to the linked source proposal, then ado
   fs.writeFileSync(nodePath.join(folder, 'deliberations', 'attr.md'), outputDoc('int_aaaa0001'));
 
   const before = listPlanningEntries(root).entries.find((e) => e.kind === 'plan-folder')!;
+  const sourceDoc = before.documents.find((document) => document.category === 'proposal')!;
+  assert.equal(sourceDoc.name, 'src.md');
+  const sourceRead = readPlanningDocument(sourceDoc.docId);
+  assert.ok(!('error' in sourceRead) && sourceRead.content.includes('# Proposal'));
   assert.equal(before.intents!.length, 1, 'intent derived from source proposal pre-hardening');
   assert.equal(before.intents![0].returned, true);
 
@@ -400,6 +404,23 @@ test('late plan.md — intents fall back to the linked source proposal, then ado
   const after = listPlanningEntries(root).entries.find((e) => e.kind === 'plan-folder')!;
   assert.equal(after.intents!.length, 1);
   assert.equal(after.intents![0].fullyFoldedIn, true, 'plan.md link now folds the output');
+});
+
+test('source proposal manifest fallback rejects paths outside the flat proposals boundary', () => {
+  const root = makeWorkspace();
+  fs.writeFileSync(nodePath.join(proposalsDir(root), 'safe.md'), '# safe');
+  for (const [index, sourceProposalRel] of [
+    '../proposals/safe.md',
+    '.lares/proposals/supporting/safe.md',
+    '.lares/research/cleared/safe.md',
+    'C:\\outside\\safe.md',
+  ].entries()) {
+    makePlanFolder(root, `sku-source-reject-${index}`, { sourceProposalRel });
+  }
+
+  const folders = listPlanningEntries(root).entries.filter((entry) => entry.kind === 'plan-folder');
+  assert.equal(folders.length, 4);
+  assert.ok(folders.every((entry) => !entry.documents.some((document) => document.category === 'proposal')));
 });
 
 // ── read-only guarantee + no demand-probe on mount ──────────────────────────

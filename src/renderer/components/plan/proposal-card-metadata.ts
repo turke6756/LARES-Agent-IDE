@@ -6,6 +6,8 @@ export interface ProposalCardMetadata {
   title: string;
   description: string;
   author: string | null;
+  promotedTo: string | null;
+  promotedAt: string | null;
   dateLabel: string;
   content: string;
   truncated: boolean;
@@ -108,6 +110,8 @@ export function deriveProposalCardMetadata(
     title,
     description: truncateDescription(descriptionSource) || 'No description provided.',
     author: fields.author?.trim() || fields.creator?.trim() || null,
+    promotedTo: fields.promoted_to?.trim() || null,
+    promotedAt: fields.promoted_at?.trim() || null,
     dateLabel: formatProposalDate(document.name, document.mtimeMs),
     content,
     truncated,

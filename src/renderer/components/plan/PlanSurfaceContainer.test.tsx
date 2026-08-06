@@ -18,7 +18,9 @@ beforeEach(() => {
       documents,
       readDocument: vi.fn(),
       getOverview: vi.fn(async () => null),
-      getReviewProjection: vi.fn(async () => Promise.reject(new Error('unavailable'))),
+      getReviewProjection: vi.fn(async () => Promise.reject(
+        new Error('no work packages implemented yet — pull Implement to begin'),
+      )),
       previewCandidate: vi.fn(async () => ({ candidate: { members: [] }, selection: null })),
     },
   };
@@ -56,5 +58,23 @@ describe('PlanSurfaceContainer after legacy-surface retirement', () => {
     const surface = container.querySelector('[data-testid="plan-surface-container"]') as HTMLElement;
     expect(surface.classList.contains('h-full')).toBe(true);
     expect(surface.classList.contains('flex-1')).toBe(false);
+  });
+
+  it('explains the empty review column before the first execution run', async () => {
+    useDashboardStore.setState({
+      selectedWorkspaceId: 'ws-1',
+      workspaces: [{
+        id: 'ws-1', title: 'Workspace', path: 'C:\\work', pathType: 'windows', description: '',
+        defaultCommand: '', createdAt: '', updatedAt: '', lastOpenedAt: null,
+      }],
+      openTabs: [{
+        id: 'plan-tab', kind: 'plan', planId: 'plan-1', label: 'Plan', filePath: '',
+        rootDirectory: 'C:\\work', pathType: 'windows', workspaceId: 'ws-1',
+      }],
+      activeTabId: 'plan-tab',
+    });
+    await render();
+    expect(container.querySelector('[data-testid="plan-review-unavailable"]')?.textContent)
+      .toContain('no work packages implemented yet — pull Implement to begin');
   });
 });

@@ -147,6 +147,30 @@ test('external proposal and legacy-html rows union with folder documents', () =>
   } finally { f.dispose(); }
 });
 
+test('manifest source proposal fills the Proposal tab until a registered row exists', () => {
+  const f = fixture([doc('manifest-proposal', 'source.md', 'proposal')]);
+  fs.writeFileSync(path.join(f.root, '.lares', 'proposals', 'source.md'), '# proposal');
+  try {
+    let model = buildPlanDocuments(PLAN_ID, f.deps)!;
+    assert.deepEqual(tab(model, 'proposal').documents.map((document) => document.ref), [
+      { source: 'folder', documentId: 'manifest-proposal' },
+    ]);
+    assert.match(
+      (readPlanDocument(PLAN_ID, { source: 'folder', documentId: 'manifest-proposal' }, f.deps) as any).content,
+      /manifest-proposal/,
+    );
+
+    f.registered.push({
+      id: 'proposal-row', planId: PLAN_ID, workspaceId: 'ws-1', docKind: 'proposal',
+      relPath: '.lares/proposals/source.md', sortOrder: 0,
+    });
+    model = buildPlanDocuments(PLAN_ID, f.deps)!;
+    assert.deepEqual(tab(model, 'proposal').documents.map((document) => document.ref), [
+      { source: 'registered', documentId: 'proposal-row' },
+    ]);
+  } finally { f.dispose(); }
+});
+
 test('deleted deliberation degrades to an empty tab on re-list', () => {
   const f = fixture([doc('delib-id', 'answer.md', 'deliberation')]);
   try {

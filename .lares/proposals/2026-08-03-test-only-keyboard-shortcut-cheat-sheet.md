@@ -3,6 +3,8 @@ artifact_id: prop_e3a91c4f
 title: "TEST-ONLY: keyboard shortcut cheat-sheet overlay"
 author_role: supervisor
 authored_at: 2026-08-03T00:00:00Z
+promoted_to: 2026-08-03-test-only-keyboard-shortcut-cheat-sheet-overlay-e3a91c4f
+promoted_at: 2026-08-03
 ---
 
 # TEST-ONLY: add a keyboard shortcut cheat-sheet overlay to the dashboard

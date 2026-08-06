@@ -26,6 +26,7 @@ const workspace = {
 const documents = [
   { docId: 'new', name: '2026-08-03-new.md', category: 'proposal' as const, sizeBytes: 10, mtimeMs: 30 },
   { docId: 'old', name: '2026-07-01-old.md', category: 'proposal' as const, sizeBytes: 10, mtimeMs: 40 },
+  { docId: 'promoted', name: '2026-08-05-promoted.md', category: 'proposal' as const, sizeBytes: 10, mtimeMs: 50 },
 ];
 
 let root: Root | null = null;
@@ -64,7 +65,9 @@ beforeEach(() => {
       read: vi.fn(async (docId: string) => ({
         docId,
         name: `${docId}.md`,
-        content: `${docId === 'new' ? '---\nauthor: Edward\n---\n' : ''}# ${docId === 'new' ? 'Newest proposal' : 'Older proposal'}\n\nDescription for ${docId}.`,
+        content: docId === 'promoted'
+          ? `---\nartifact_id: prop_0e1425af\nauthor: Planning supervisor\npromoted_to: 2026-08-05-split-the-proposal-lifecycle-an-authoring-skill--0e1425af\npromoted_at: 2026-08-05\n---\n# Promoted proposal\n\nPromoted history description.`
+          : `${docId === 'new' ? '---\nauthor: Edward\n---\n' : ''}# ${docId === 'new' ? 'Newest proposal' : 'Older proposal'}\n\nDescription for ${docId}.`,
         truncated: false,
         sizeBytes: 10,
       })),
@@ -124,6 +127,22 @@ describe('ProposalCardGallery', () => {
     act(() => row.dispatchEvent(event));
     expect(row.scrollLeft).toBe(95);
     expect(event.defaultPrevented).toBe(true);
+  });
+
+  it('moves a fixture-stamped proposal into a collapsed group with its full card metadata', async () => {
+    await render(<PlansPane />);
+
+    expect(container!.querySelectorAll('[data-testid="proposal-card-row"] [data-testid="proposal-card"]')).toHaveLength(2);
+    const group = container!.querySelector('[data-testid="proposal-promoted-group"]')!;
+    expect(group.querySelector('[data-testid="proposal-promoted-card-row"]')).toBeNull();
+    expect(group.textContent).toContain('Promoted (1)');
+
+    click('[data-testid="proposal-promoted-toggle"]');
+    const promotedCard = group.querySelector('[data-testid="proposal-card"]')!;
+    expect(promotedCard.textContent).toContain('Promoted proposal');
+    expect(promotedCard.textContent).toContain('Promoted history description.');
+    expect(promotedCard.querySelector('[data-testid="proposal-card-date"]')?.textContent).toBe('Aug 5, 2026');
+    expect(promotedCard.querySelector('[data-testid="proposal-card-author"]')?.textContent).toContain('Planning supervisor');
   });
 
   it('keeps top-level navigation reachable while a proposal is expanded', async () => {

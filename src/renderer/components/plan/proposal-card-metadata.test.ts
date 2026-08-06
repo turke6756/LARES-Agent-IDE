@@ -27,7 +27,28 @@ Body paragraph.
       title: 'Heading wins',
       description: 'A short human-readable summary.',
       author: 'Edward',
+      promotedTo: null,
+      promotedAt: null,
       dateLabel: 'Aug 1, 2026',
+    });
+  });
+
+  it('carries fixture-stamped promotion metadata without depending on the promote path', () => {
+    const card = deriveProposalCardMetadata(document('2026-08-05-promoted.md'), `---
+artifact_id: prop_0e1425af
+author: Planning supervisor
+promoted_to: 2026-08-05-split-the-proposal-lifecycle-an-authoring-skill--0e1425af
+promoted_at: 2026-08-05
+---
+# Promoted proposal
+
+History remains discoverable.
+`);
+
+    expect(card).toMatchObject({
+      author: 'Planning supervisor',
+      promotedTo: '2026-08-05-split-the-proposal-lifecycle-an-authoring-skill--0e1425af',
+      promotedAt: '2026-08-05',
     });
   });
 

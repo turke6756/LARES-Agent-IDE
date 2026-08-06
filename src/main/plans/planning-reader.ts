@@ -174,6 +174,41 @@ function resolveContained(boundary: string, rel: string): string | null {
   return abs;
 }
 
+/** Resolve the manifest-linked source proposal under the active state root.
+ * The manifest may retain either state-dir spelling across migration, but the
+ * proposal itself must be one flat markdown file inside proposals/. */
+function inspectSourceProposal(
+  proposalsDir: string,
+  rawRelPath: unknown,
+): FolderDoc | null {
+  if (typeof rawRelPath !== 'string') return null;
+  const safe = safeRelPath(rawRelPath);
+  if (safe === null) return null;
+  const parts = safe.split('/');
+  if (
+    parts.length !== 3
+    || !['.lares', '.dashboard'].includes(parts[0])
+    || parts[1] !== 'proposals'
+    || !/\.md$/i.test(parts[2])
+  ) return null;
+  const abs = resolveContained(proposalsDir, parts[2]);
+  if (abs === null) return null;
+  try {
+    const st = fs.lstatSync(abs);
+    if (st.isSymbolicLink() || !st.isFile()) return null;
+    return {
+      relPath: parts[2],
+      absPath: abs,
+      name: parts[2],
+      category: 'proposal',
+      size: st.size,
+      mtimeMs: st.mtimeMs,
+    };
+  } catch {
+    return null;
+  }
+}
+
 // ── §R1 markup parsing (read-only) ──────────────────────────────────────────
 
 interface RawIntent {
@@ -644,10 +679,23 @@ export function listPlanningEntries(
 
     const entryWarnings: string[] = [];
     const folderDocs = enumerateFolderDocs(folder, caps, entryWarnings);
+    let sourceProposal = inspectSourceProposal(proposalsDir, planJson.source_proposal?.rel_path);
+    if (sourceProposal && folderDocs.length >= caps.maxDocsPerFolder) {
+      entryWarnings.push(`document cap (${caps.maxDocsPerFolder}) reached; source proposal omitted`);
+      sourceProposal = null;
+    }
+    if (
+      sourceProposal
+      && folderDocs.reduce((total, doc) => total + doc.size, 0) + sourceProposal.size > caps.maxManifestBytes
+    ) {
+      entryWarnings.push(`manifest byte cap (${caps.maxManifestBytes}) reached; source proposal omitted`);
+      sourceProposal = null;
+    }
 
     // Register opaque ids + build the manifest.
-    const documents: PlanningReaderDocument[] = folderDocs.map((d) => ({
-      docId: registerDoc(folder, d.absPath, d.relPath, d.name),
+    const manifestDocs = sourceProposal ? [...folderDocs, sourceProposal] : folderDocs;
+    const documents: PlanningReaderDocument[] = manifestDocs.map((d) => ({
+      docId: registerDoc(d.category === 'proposal' ? proposalsDir : folder, d.absPath, d.relPath, d.name),
       name: d.name,
       category: d.category,
       sizeBytes: d.size,
@@ -665,16 +713,9 @@ export function listPlanningEntries(
     let markedDoc = planMd;
     if (markedDoc === null) {
       // Fall back to the linked source proposal (pre-hardening).
-      const srcRel: unknown = planJson.source_proposal?.rel_path;
-      if (typeof srcRel === 'string') {
-        // source_proposal.rel_path is workspace-relative (e.g. .lares/proposals/x.md);
-        // resolve inside the proposals boundary by basename.
-        const base = path.basename(srcRel.replace(/\\/g, '/'));
-        const srcAbs = resolveContained(proposalsDir, base);
-        if (srcAbs !== null) {
-          const r = readFileSafe(srcAbs, caps.maxReadBytes);
-          markedDoc = r ? r.content : null;
-        }
+      if (sourceProposal) {
+        const r = readFileSafe(sourceProposal.absPath, caps.maxReadBytes);
+        markedDoc = r ? r.content : null;
       }
     }
 
@@ -683,7 +724,7 @@ export function listPlanningEntries(
         ? deriveIntents(markedDoc, planMd, folderDocs, planArtifactId, readFolderDoc, entryWarnings)
         : [];
 
-    const mtimeMs = folderDocs.reduce((mx, d) => Math.max(mx, d.mtimeMs), 0);
+    const mtimeMs = manifestDocs.reduce((mx, d) => Math.max(mx, d.mtimeMs), 0);
     entries.push({
       entryId: opaqueId('pent', workspaceRoot, plansDir, sku),
       kind: 'plan-folder',
