@@ -645,18 +645,13 @@ const TESTS = [
   // WP-P3-manifest: plan.json sidecar manifest loader + TS/JS interop.
   'dist/main/main/plans/plan-manifest.test.js',
   'dist/main/main/plans/plan-manifest-interop.test.js',
-  // WP-P3B-core: proposal→plan promotion core + supervisor launch binding.
-  'dist/main/main/plans/promote-proposal.core.test.js',
+  // Legacy launch binding remains covered until its retired data is fully drained.
   'dist/main/main/supervisor/promotion-launch-binding.test.js',
-  // WP-P3B-enrich: post-adoption enrichment (single source-proposal plan_documents row).
-  'dist/main/main/plans/promote-proposal.enrich.test.js',
   // WP-P3-reconcile: pending-promotion startup reconstruction.
   'dist/main/main/plans/promotion-reconciler.test.js',
-  // WP-P3C′: proposal:promote / proposal:promotionStatus IPC.
-  'dist/main/main/plans/proposal-promote-ipc.test.js',
-  // WP-P3-wire: promotion claim-scan + service wiring.
+  // Server-authoritative promotion preflight + disk claim scan.
+  'dist/main/main/plans/promotion-preflight.test.js',
   'dist/main/main/plans/promotion-claim-scan.test.js',
-  'dist/main/main/plans/promotion-service-wiring.test.js',
   // WP-P2L-ingest: transactional plan-intent ledger scan.
   'dist/main/main/plans/plan-intent-ledger.test.js',
   // WP-P2L-runs: orchestration run links witness the active planning intent.

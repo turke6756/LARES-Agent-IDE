@@ -3,6 +3,7 @@ import type { Agent, Workspace } from '../../../shared/types';
 import {
   buildProposalToPlanInstruction,
   dispatchProposalPromotion,
+  isSafeProposalRelPath,
   isValidProposalArtifactId,
 } from './promotion-dispatch';
 
@@ -15,10 +16,10 @@ const agent = (over: Partial<Agent>): Agent => ({
 describe('proposal promotion dispatch', () => {
   it('binds the exact proposal path and artifact id to the promotion-only lifecycle instruction', () => {
     const instruction = buildProposalToPlanInstruction(
-      'C:\\work\\.lares\\proposals\\idea.md',
+      '.lares/proposals/idea.md',
       'prop_0e1425af',
     );
-    expect(instruction).toContain('Proposal path: C:\\work\\.lares\\proposals\\idea.md');
+    expect(instruction).toContain('Proposal path: .lares/proposals/idea.md');
     expect(instruction).toContain('Proposal artifact_id: prop_0e1425af');
     expect(instruction).toContain('proposal-to-plan');
     expect(instruction).toContain('Do NOT run capture');
@@ -32,10 +33,18 @@ describe('proposal promotion dispatch', () => {
     expect(isValidProposalArtifactId(null)).toBe(false);
   });
 
+  it('accepts only canonical server-relative proposal paths', () => {
+    expect(isSafeProposalRelPath('.lares/proposals/idea.md')).toBe(true);
+    expect(isSafeProposalRelPath('.dashboard/proposals/idea.md')).toBe(true);
+    expect(isSafeProposalRelPath('C:\\work\\.lares\\proposals\\idea.md')).toBe(false);
+    expect(isSafeProposalRelPath('.lares/proposals/../idea.md')).toBe(false);
+    expect(isSafeProposalRelPath('idea.md')).toBe(false);
+  });
+
   it('messages a live supervisor', async () => {
     const sendInput = vi.fn(async () => undefined);
     const result = await dispatchProposalPromotion({
-      workspace, proposalFilePath: 'C:\\work\\.lares\\proposals\\idea.md', proposalArtifactId: 'prop_0e1425af',
+      workspace, proposalRelPath: '.lares/proposals/idea.md', planArtifactId: 'plan_0e1425af',
       selectedAgent: agent({}), newSupervisorTitle: '',
       deps: { sendInput, launch: vi.fn(), revive: vi.fn() },
     });
@@ -46,18 +55,18 @@ describe('proposal promotion dispatch', () => {
   it('revives a terminal supervisor with the instruction queued atomically', async () => {
     const revive = vi.fn(async () => undefined);
     const result = await dispatchProposalPromotion({
-      workspace, proposalFilePath: 'C:\\work\\.lares\\proposals\\idea.md', proposalArtifactId: 'prop_0e1425af',
+      workspace, proposalRelPath: '.lares/proposals/idea.md', planArtifactId: 'plan_0e1425af',
       selectedAgent: agent({ status: 'done' }), newSupervisorTitle: '',
       deps: { sendInput: vi.fn(), launch: vi.fn(), revive },
     });
     expect(result.path).toBe('revived');
-    expect(revive).toHaveBeenCalledWith('super-1', expect.stringContaining('C:\\work\\.lares\\proposals\\idea.md'));
+    expect(revive).toHaveBeenCalledWith('super-1', expect.stringContaining('.lares/proposals/idea.md'));
   });
 
   it('launches a new structural supervisor with the instruction as its initial user prompt', async () => {
     const launch = vi.fn(async (input) => agent({ id: 'new-1', title: input.title }));
     const result = await dispatchProposalPromotion({
-      workspace, proposalFilePath: 'C:\\work\\.lares\\proposals\\idea.md', proposalArtifactId: 'prop_0e1425af',
+      workspace, proposalRelPath: '.lares/proposals/idea.md', planArtifactId: 'plan_0e1425af',
       selectedAgent: null, newSupervisorTitle: 'Plan owner',
       deps: { sendInput: vi.fn(), launch, revive: vi.fn() },
     });
@@ -75,12 +84,12 @@ describe('proposal promotion dispatch', () => {
 
     await expect(dispatchProposalPromotion({
       workspace,
-      proposalFilePath: 'C:\\work\\.lares\\proposals\\idea.md',
-      proposalArtifactId: 'prop_NOTVALID',
+      proposalRelPath: '.lares/proposals/idea.md',
+      planArtifactId: 'plan_NOTVALID',
       selectedAgent: agent({}),
       newSupervisorTitle: '',
       deps: { launch, sendInput, revive },
-    })).rejects.toThrow('proposal is missing a valid artifact_id');
+    })).rejects.toThrow('server preflight returned an invalid plan identity');
 
     expect(launch).not.toHaveBeenCalled();
     expect(sendInput).not.toHaveBeenCalled();

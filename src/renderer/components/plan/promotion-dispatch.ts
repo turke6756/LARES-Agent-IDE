@@ -8,6 +8,10 @@ export function isValidProposalArtifactId(value: string | null | undefined): boo
   return /^prop_[0-9a-f]{8}$/.test((value ?? '').trim());
 }
 
+export function isSafeProposalRelPath(value: string): boolean {
+  return /^(?:\.lares|\.dashboard)\/proposals\/[^/\\]+\.md$/i.test(value);
+}
+
 export function buildProposalToPlanInstruction(
   proposalFilePath: string,
   proposalArtifactId: string,
@@ -50,17 +54,22 @@ export async function reviveSupervisorViaApi(agentId: string, instruction: strin
 
 export async function dispatchProposalPromotion(input: {
   workspace: Workspace;
-  proposalFilePath: string;
-  proposalArtifactId: string;
+  /** Exact server-preflight output; never reconstructed from renderer metadata. */
+  proposalRelPath: string;
+  planArtifactId: string;
   selectedAgent: Agent | null;
   newSupervisorTitle: string;
   deps?: Partial<PromotionDispatchDeps>;
 }): Promise<PromotionDispatchResult> {
-  if (!isValidProposalArtifactId(input.proposalArtifactId)) {
-    throw new Error('Cannot promote: proposal is missing a valid artifact_id (expected prop_########).');
+  if (!isSafeProposalRelPath(input.proposalRelPath)) {
+    throw new Error('Cannot promote: server preflight returned an unsafe proposal path.');
+  }
+  const proposalArtifactId = input.planArtifactId.replace(/^plan_/, 'prop_');
+  if (!/^plan_[0-9a-f]{8}$/.test(input.planArtifactId) || !isValidProposalArtifactId(proposalArtifactId)) {
+    throw new Error('Cannot promote: server preflight returned an invalid plan identity.');
   }
 
-  const instruction = buildProposalToPlanInstruction(input.proposalFilePath, input.proposalArtifactId);
+  const instruction = buildProposalToPlanInstruction(input.proposalRelPath, proposalArtifactId);
   const deps: PromotionDispatchDeps = {
     launch: (launchInput) => window.api.agents.launch(launchInput),
     sendInput: (agentId, text) => window.api.agents.sendInput(agentId, text),

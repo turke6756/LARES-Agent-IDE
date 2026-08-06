@@ -231,11 +231,9 @@ const api: IpcApi = {
     // SC-WP-3I — read-only plan-lens candidate preview (mirrors saveCard.preview).
     previewCandidate: (req) => ipcRenderer.invoke(PLAN_PREVIEW_CHANNEL, req),
     getReviewProjection: (req) => ipcRenderer.invoke(PLAN_REVIEW_PROJECTION_CHANNEL, req),
-    // WP-P3C′ — proposal promotion (supervisor picker; §P3-GAP: no doc selection)
-    // + its concrete status poll. `promote` returns promptly (never blocks on the
-    // watcher); `promotionStatus` reads the durable promotion_requests/plans rows.
-    promote: (input) => ipcRenderer.invoke('proposal:promote', input),
-    promotionStatus: (input) => ipcRenderer.invoke('proposal:promotionStatus', input),
+    // Server-authoritative promotion preflight. The renderer supplies only the
+    // workspace plus an opaque planning-reader handle and optional stale-ID check.
+    promotionPreflight: (input) => ipcRenderer.invoke('proposal:promotionPreflight', input),
     // WP-P4E — plan comments rail. `listComments` is an open read (any renderer);
     // `createComment` supplies only planId + an opaque ref + body (server picks the
     // recipient, builds the durable file_path); `replyComment` writes a companion

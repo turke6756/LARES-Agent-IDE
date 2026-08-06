@@ -8,7 +8,7 @@ import PromoteToPlanPanel from './PromoteToPlanPanel';
 
 (globalThis as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT = true;
 const workspace = { id: 'ws-1', path: 'C:\\work', pathType: 'windows', title: 'Work' } as Workspace;
-const proposalFilePath = 'C:\\work\\.lares\\proposals\\idea.md';
+const proposalDocumentId = 'pdoc-idea';
 const validArtifactId = 'prop_0e1425af';
 const agent = (id: string, title: string, status: Agent['status'], isSupervisor = true): Agent => ({
   id, title, status, isSupervisor, workspaceId: 'ws-1',
@@ -23,20 +23,31 @@ function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
 let host: HTMLDivElement;
 let root: Root;
 
+function panel(proposalArtifactId: string | null, documentId = proposalDocumentId): React.ReactElement {
+  return (
+    <PromoteToPlanPanel
+      workspace={workspace}
+      proposalDocumentId={documentId}
+      proposalArtifactId={proposalArtifactId}
+      onClose={() => {}}
+    />
+  );
+}
+
 async function renderPanel(proposalArtifactId: string | null = validArtifactId): Promise<void> {
   host = document.createElement('div');
   document.body.appendChild(host);
   root = createRoot(host);
   await act(async () => {
-    root.render(
-      <PromoteToPlanPanel
-        workspace={workspace}
-        proposalFilePath={proposalFilePath}
-        proposalArtifactId={proposalArtifactId}
-        onClose={() => {}}
-      />,
-    );
+    root.render(panel(proposalArtifactId));
     await Promise.resolve();
+    await Promise.resolve();
+  });
+}
+
+async function rerenderPanel(documentId: string): Promise<void> {
+  await act(async () => {
+    root.render(panel(validArtifactId, documentId));
     await Promise.resolve();
   });
 }
@@ -71,8 +82,16 @@ beforeEach(() => {
       launch: vi.fn(),
     },
     system: { getApiToken: vi.fn(async () => 'token') },
+    plans: {
+      promotionPreflight: vi.fn(async () => ({
+        status: 'allowed',
+        proposalRelPath: '.lares/proposals/server-authoritative.md',
+        planArtifactId: 'plan_0e1425af',
+        targetFolderRelPath: '.lares/plans/server-authoritative-0e1425af',
+      })),
+    },
   };
-  useDashboardStore.setState({ agents: [] });
+  useDashboardStore.setState({ agents: [], openPlanTab: vi.fn() });
 });
 
 afterEach(() => {
@@ -210,6 +229,84 @@ describe('PromoteToPlanPanel proposal artifact id', () => {
       'live',
       expect.stringContaining('Proposal artifact_id: prop_0e1425af'),
     );
+  });
+
+  it('uses only the server-returned path in the instruction', async () => {
+    const supervisor = agent('live', 'Live owner', 'idle');
+    useDashboardStore.setState({ agents: [supervisor] });
+    vi.mocked(window.api.agents.getSupervisor).mockResolvedValue(supervisor);
+    await renderPanel();
+
+    click('[data-testid="promote-dispatch"]');
+    await flush();
+
+    expect(window.api.plans.promotionPreflight).toHaveBeenCalledWith({
+      workspaceId: 'ws-1', proposalDocumentId, artifactIdCrossCheck: validArtifactId,
+    });
+    expect(window.api.agents.sendInput).toHaveBeenCalledWith(
+      'live',
+      expect.stringContaining('Proposal path: .lares/proposals/server-authoritative.md'),
+    );
+    expect(window.api.agents.sendInput).not.toHaveBeenCalledWith(
+      'live',
+      expect.stringContaining('C:\\work'),
+    );
+    expect(host.querySelector('[data-testid="promote-confirmation"]')?.textContent).toContain('Assigned to');
+  });
+
+  it('navigates only for already-adopted and does not dispatch', async () => {
+    const openPlanTab = vi.fn();
+    useDashboardStore.setState({ openPlanTab });
+    vi.mocked(window.api.plans.promotionPreflight).mockResolvedValue({
+      status: 'already-adopted', proposalRelPath: '.lares/proposals/idea.md',
+      planId: 'plan-row', planArtifactId: 'plan_0e1425af', folderRelPath: '.lares/plans/existing',
+    });
+    await renderPanel();
+
+    click('[data-testid="promote-dispatch"]');
+    await flush();
+
+    expect(openPlanTab).toHaveBeenCalledWith('plan-row', 'plan_0e1425af', 'ws-1');
+    expect(window.api.agents.launch).not.toHaveBeenCalled();
+    expect(window.api.agents.sendInput).not.toHaveBeenCalled();
+  });
+
+  it('does not navigate or dispatch for a claimed folder awaiting adoption', async () => {
+    const openPlanTab = vi.fn();
+    useDashboardStore.setState({ openPlanTab });
+    vi.mocked(window.api.plans.promotionPreflight).mockResolvedValue({
+      status: 'folder-awaiting-adoption', proposalRelPath: '.lares/proposals/idea.md',
+      planArtifactId: 'plan_0e1425af', folderRelPath: '.lares/plans/existing',
+    });
+    await renderPanel();
+
+    click('[data-testid="promote-dispatch"]');
+    await flush();
+
+    expect(host.querySelector('[role="alert"]')?.textContent).toContain('awaiting adoption');
+    expect(openPlanTab).not.toHaveBeenCalled();
+    expect(window.api.agents.launch).not.toHaveBeenCalled();
+  });
+
+  it('invalidates a preflight result when the selected proposal changes', async () => {
+    const supervisor = agent('live', 'Live owner', 'idle');
+    useDashboardStore.setState({ agents: [supervisor] });
+    vi.mocked(window.api.agents.getSupervisor).mockResolvedValue(supervisor);
+    const pending = deferred<Awaited<ReturnType<typeof window.api.plans.promotionPreflight>>>();
+    vi.mocked(window.api.plans.promotionPreflight).mockReturnValue(pending.promise);
+    await renderPanel();
+
+    click('[data-testid="promote-dispatch"]');
+    await rerenderPanel('pdoc-other');
+    pending.resolve({
+      status: 'allowed', proposalRelPath: '.lares/proposals/original.md',
+      planArtifactId: 'plan_0e1425af', targetFolderRelPath: '.lares/plans/original-0e1425af',
+    });
+    await flush();
+
+    expect(window.api.agents.sendInput).not.toHaveBeenCalled();
+    expect(window.api.agents.launch).not.toHaveBeenCalled();
+    expect(host.querySelector('[role="alert"]')?.textContent).toContain('selected proposal changed');
   });
 
   it.each([

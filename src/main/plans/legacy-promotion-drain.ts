@@ -14,7 +14,7 @@ import {
   type LegacyPromotionRetirementResult,
   type PromotionRequestRow,
 } from '../database';
-import type { ClaimScanFn, ClaimScanResult } from './promote-proposal';
+import type { ClaimScanFn, ClaimScanResult } from './promotion-preflight';
 import {
   reconcilePlanFolderProjections,
   type PlanFolderProjectionResult,

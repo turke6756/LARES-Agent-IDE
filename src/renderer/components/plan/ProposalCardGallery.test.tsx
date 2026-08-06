@@ -9,9 +9,10 @@ vi.mock('../fileviewer/MarkdownRenderer', () => ({
   default: ({ content }: { content: string }) => React.createElement('article', { 'data-testid': 'shared-markdown-reader' }, content),
 }));
 vi.mock('./PromoteToPlanPanel', () => ({
-  default: ({ proposalArtifactId }: { proposalArtifactId?: string | null }) => React.createElement('div', {
+  default: ({ proposalArtifactId, proposalDocumentId }: { proposalArtifactId?: string | null; proposalDocumentId: string }) => React.createElement('div', {
     'data-testid': 'promote-plan-panel',
     'data-proposal-artifact-id': proposalArtifactId ?? '',
+    'data-proposal-document-id': proposalDocumentId,
   }),
 }));
 
@@ -208,6 +209,8 @@ describe('ProposalCardGallery', () => {
 
     expect(container!.querySelector('[data-testid="promote-plan-panel"]')?.getAttribute('data-proposal-artifact-id'))
       .toBe('prop_1234abcd');
+    expect(container!.querySelector('[data-testid="promote-plan-panel"]')?.getAttribute('data-proposal-document-id'))
+      .toBe('new');
   });
 
   it('opens the expanded proposal in the normal file-viewer navigation state', async () => {

@@ -19,7 +19,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { validatePlanFolder } from './plan-folder-watcher';
-import type { ClaimScanFn, ClaimScanResult } from './promote-proposal';
+import type { ClaimScanFn, ClaimScanResult } from './promotion-preflight';
 
 /** The minimal filesystem surface the scan needs — injectable so the classifier is
  *  unit-testable without a real plans tree. Defaults to the real `fs`. */

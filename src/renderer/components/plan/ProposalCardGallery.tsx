@@ -200,7 +200,7 @@ export default function ProposalCardGallery(): React.ReactElement {
         {promoteOpen && workspace && (
           <PromoteToPlanPanel
             workspace={workspace}
-            proposalFilePath={proposalPath(workspace.path, selected.fileName, workspace.pathType)}
+            proposalDocumentId={selected.docId}
             proposalArtifactId={selected.artifactId}
             onClose={() => setPromoteOpen(false)}
           />

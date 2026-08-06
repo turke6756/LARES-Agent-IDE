@@ -12,7 +12,7 @@ import {
 
 interface Props {
   workspace: Workspace;
-  proposalFilePath: string;
+  proposalDocumentId: string;
   proposalArtifactId?: string | null;
   onClose: () => void;
 }
@@ -23,12 +23,13 @@ function isEligibleSupervisor(agent: Agent | null, workspaceId: string): agent i
 
 export default function PromoteToPlanPanel({
   workspace,
-  proposalFilePath,
+  proposalDocumentId,
   proposalArtifactId,
   onClose,
 }: Props): React.ReactElement {
   const agents = useDashboardStore((state) => state.agents);
   const loadAgents = useDashboardStore((state) => state.loadAgents);
+  const openPlanTab = useDashboardStore((state) => state.openPlanTab);
   const [query, setQuery] = useState('');
   const [selectedId, setSelectedId] = useState<string>(NEW_SUPERVISOR_ID);
   const [resolvedDefault, setResolvedDefault] = useState<Agent | null>();
@@ -37,6 +38,7 @@ export default function PromoteToPlanPanel({
   const [error, setError] = useState<string | null>(null);
   const [confirmation, setConfirmation] = useState<PromotionDispatchResult | null>(null);
   const hasUserSelectedRef = useRef(false);
+  const selectionVersionRef = useRef(0);
   const normalizedArtifactId = proposalArtifactId?.trim() ?? '';
   const artifactIdValid = isValidProposalArtifactId(normalizedArtifactId);
 
@@ -62,6 +64,13 @@ export default function PromoteToPlanPanel({
     return () => { cancelled = true; };
   }, [workspace.id]);
 
+  useEffect(() => {
+    selectionVersionRef.current += 1;
+    setConfirmation(null);
+    setError(null);
+    return () => { selectionVersionRef.current += 1; };
+  }, [workspace.id, proposalDocumentId]);
+
   const availableSupervisors = useMemo(() => {
     const workspaceSupervisors = agents.filter((agent) =>
       isEligibleSupervisor(agent, workspace.id),
@@ -83,13 +92,33 @@ export default function PromoteToPlanPanel({
     ?? null;
 
   const dispatch = async (): Promise<void> => {
+    const selectionVersion = selectionVersionRef.current;
     setDispatching(true);
     setError(null);
     try {
+      const preflight = await window.api.plans.promotionPreflight({
+        workspaceId: workspace.id,
+        proposalDocumentId,
+        artifactIdCrossCheck: normalizedArtifactId,
+      });
+      if (selectionVersionRef.current !== selectionVersion) {
+        throw new Error('The selected proposal changed during preflight. Please try again.');
+      }
+      if (preflight.status === 'already-adopted') {
+        openPlanTab(preflight.planId, preflight.planArtifactId, workspace.id);
+        onClose();
+        return;
+      }
+      if (preflight.status !== 'allowed') {
+        const detail = 'detail' in preflight
+          ? preflight.detail
+          : 'That plan folder is still awaiting adoption and reconciliation.';
+        throw new Error(detail);
+      }
       const result = await dispatchProposalPromotion({
         workspace,
-        proposalFilePath,
-        proposalArtifactId: normalizedArtifactId,
+        proposalRelPath: preflight.proposalRelPath,
+        planArtifactId: preflight.planArtifactId,
         selectedAgent: selectedId === NEW_SUPERVISOR_ID ? null : selectedAgent,
         newSupervisorTitle: newTitle,
       });
@@ -116,7 +145,7 @@ export default function PromoteToPlanPanel({
         <div className="mt-3 rounded border border-accent-green/30 bg-accent-green/10 p-3" data-testid="promote-confirmation">
           <div className="flex items-center gap-2 text-[12px] font-medium text-accent-green">
             <Icons.CheckCircle2 className="h-4 w-4" />
-            Sent to {confirmation.supervisorTitle} ({confirmation.path}).
+            Assigned to {confirmation.supervisorTitle} ({confirmation.path}).
           </div>
           <pre className="mt-2 whitespace-pre-wrap text-[11px] leading-5 text-gray-300">{confirmation.instruction}</pre>
         </div>

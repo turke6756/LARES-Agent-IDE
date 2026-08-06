@@ -59,7 +59,7 @@ import {
   PromotionDeliveryInspectorImpl,
   type TurnStartWitness, type PromotionDeliverer,
 } from './plans/promotion-dispatch';
-import { providePromotionService, providePlanPreviewRoutes } from './plans/plan-ipc';
+import { providePlanPreviewRoutes } from './plans/plan-ipc';
 import { makePromotionClaimScan } from './plans/promotion-claim-scan';
 import { JUPYTER_BASE_PORT, JUPYTER_PORT_RETRIES } from './control-ports';
 import { buildChromeUA } from './browser/browser-decisions';
@@ -1014,9 +1014,8 @@ app.whenReady().then(async () => {
       stopAgent: (agentId) => supervisor!.stopAgent(agentId, { reason: 'supervisor' }),
       onDiagnostic: (requestId, detail) => console.warn('[legacy promotion drain]', requestId, detail),
     });
-    // The legacy mutation/status IPC remains intentionally unwired. No steady-
-    // state path can create a promotion_requests row after WP-I.
-    providePromotionService(null);
+    // Legacy promotion machinery is drain-only. The mutation/status IPC no
+    // longer exists, so no steady-state path can create a promotion_requests row.
     plansWatcher = startPlansWatcher({
       onPlanFolderSettled: async () => {
         const report = await legacyPromotionDrain.drainAndRetire();
