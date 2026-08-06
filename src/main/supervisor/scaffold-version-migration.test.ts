@@ -63,9 +63,13 @@ import {
   PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V1_HASH,
   PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V2_HASH,
   PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD_V1_HASH,
+  PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD_V2_HASH,
+  PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD_V1_HASH,
   PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD_V1_HASH,
+  PROPOSAL_TO_PLAN_SKILL_MD_V2_HASH,
   PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V1_HASH,
   PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V2_HASH,
+  PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V3_HASH,
   PROPOSAL_TO_PLAN_CONTRACT_MANIFEST_LOCK_MD_V1_HASH,
   normalizeManagedKey,
   sha256Hex,
@@ -98,9 +102,14 @@ import {
   PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD,
   PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V2,
   PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD,
+  PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD,
   PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD,
   PROPOSAL_TO_PLAN_CONTRACT_ARC_MD,
+  PROPOSAL_TO_PLAN_CONTRACT_HUMAN_OVERVIEW_MD,
+  PROPOSAL_TO_PLAN_CONTRACT_RESPONSIBILITY_MD,
+  PROPOSAL_TO_PLAN_CONTRACT_WORK_PACKAGES_MD,
   PROPOSAL_TO_PLAN_CONTRACT_MANIFEST_LOCK_MD,
+  PROPOSAL_TO_PLAN_SCRIPT_PLAN_IDENTITY_MJS,
   PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS,
   SUPERVISOR_CHECKPOINT_FORENSICS_SKILL,
   SUPERVISOR_CONTEXT_ANALYTICS_SKILL,
@@ -130,11 +139,15 @@ import {
 } from './guard-script-old-body-fixtures';
 import {
   PROPOSAL_TO_PLAN_SKILL_MD_V1,
+  PROPOSAL_TO_PLAN_SKILL_MD_V2,
   PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V1,
+  PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD_V1,
   PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD_V1,
+  PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD_V2,
   PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD_V1,
   PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V1,
   PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V2,
+  PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V3,
   PROPOSAL_TO_PLAN_CONTRACT_MANIFEST_LOCK_MD_V1,
 } from './proposal-to-plan-old-body-fixtures';
 import {
@@ -3557,8 +3570,12 @@ const PROPOSAL_TO_PLAN_REL_FILES = [
   'references/activities/orient.md',
   'references/contracts/arc.md',
   'references/contracts/folder-schema.md',
+  'references/contracts/human-overview.md',
   'references/contracts/intent-lifecycle.md',
   'references/contracts/manifest-lock.md',
+  'references/contracts/responsibility.md',
+  'references/contracts/work-packages.md',
+  'scripts/plan-identity.mjs',
   'scripts/plan-manifest.mjs',
 ];
 
@@ -3767,6 +3784,10 @@ test('WP-P0C-TREE-SUP. fresh supervisor scaffold writes the whole proposal-to-pl
       PROPOSAL_TO_PLAN_CONTRACT_ARC_MD, 'contracts/arc.md must be the exact bundled content in the codex root');
     assert.equal(fs.readFileSync(path.join(claudeRoot, 'scripts', 'plan-manifest.mjs'), 'utf-8'),
       PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS, 'plan-manifest.mjs must be the exact bundled content');
+    assert.equal(fs.readFileSync(path.join(codexRoot, 'scripts', 'plan-identity.mjs'), 'utf-8'),
+      PROPOSAL_TO_PLAN_SCRIPT_PLAN_IDENTITY_MJS, 'plan-identity.mjs must be the exact bundled content');
+    assert.equal(fs.readFileSync(path.join(codexRoot, 'references', 'contracts', 'responsibility.md'), 'utf-8'),
+      PROPOSAL_TO_PLAN_CONTRACT_RESPONSIBILITY_MD, 'responsibility contract must ship with its promote citation');
   } finally {
     cleanup();
     rmrf(workDir);
@@ -3778,23 +3799,33 @@ test('WP-P0C-TREE-SUP. fresh supervisor scaffold writes the whole proposal-to-pl
 // (previousHashes[1,2]) and manifest-lock.md to v2 (previousHashes[1]). The other six
 // files stay v1. Keep this map in sync with PROPOSAL_TO_PLAN_TREE in index.ts.
 const PROPOSAL_TO_PLAN_VERSIONED_FILES = new Map<string, { version: number; previousHashes: Record<number, string> }>([
-  ['SKILL.md', { version: 2, previousHashes: { 1: PROPOSAL_TO_PLAN_SKILL_MD_V1_HASH } }],
+  ['SKILL.md', { version: 3, previousHashes: {
+    1: PROPOSAL_TO_PLAN_SKILL_MD_V1_HASH,
+    2: PROPOSAL_TO_PLAN_SKILL_MD_V2_HASH,
+  } }],
   ['references/activities/capture.md', { version: 3, previousHashes: {
     1: PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V1_HASH,
     2: PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V2_HASH,
   } }],
-  ['references/activities/promote.md', { version: 2, previousHashes: { 1: PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD_V1_HASH } }],
+  ['references/activities/promote.md', { version: 3, previousHashes: {
+    1: PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD_V1_HASH,
+    2: PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD_V2_HASH,
+  } }],
+  ['references/activities/package.md', { version: 2, previousHashes: {
+    1: PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD_V1_HASH,
+  } }],
   ['references/activities/orient.md', { version: 2, previousHashes: { 1: PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD_V1_HASH } }],
   ['references/contracts/manifest-lock.md', { version: 2, previousHashes: { 1: PROPOSAL_TO_PLAN_CONTRACT_MANIFEST_LOCK_MD_V1_HASH } }],
-  ['scripts/plan-manifest.mjs', { version: 3, previousHashes: {
+  ['scripts/plan-manifest.mjs', { version: 4, previousHashes: {
     1: PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V1_HASH,
     2: PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V2_HASH,
+    3: PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V3_HASH,
   } }],
 ]);
 
-test('WP-P0C-TREE-HELPER. proposalToPlanEntries expands 13 files under a root prefix; the script is executable', () => {
+test('WP-P0C-TREE-HELPER. proposalToPlanEntries expands the full tree under a root prefix; scripts are executable', () => {
   const entries = proposalToPlanEntries('.lares/workers/codex/.agents/skills/proposal-to-plan');
-  assert.equal(Object.keys(entries).length, 13, 'the tree must have exactly 13 files');
+  assert.equal(Object.keys(entries).length, PROPOSAL_TO_PLAN_REL_FILES.length);
   for (const rel of PROPOSAL_TO_PLAN_REL_FILES) {
     const key = `.lares/workers/codex/.agents/skills/proposal-to-plan/${rel}`;
     assert.ok(entries[key], `missing entry ${key}`);
@@ -3812,6 +3843,83 @@ test('WP-P0C-TREE-HELPER. proposalToPlanEntries expands 13 files under a root pr
   }
   const scriptKey = '.lares/workers/codex/.agents/skills/proposal-to-plan/scripts/plan-manifest.mjs';
   assert.equal(entries[scriptKey].executable, true, 'plan-manifest.mjs must be executable');
+  assert.equal(entries['.lares/workers/codex/.agents/skills/proposal-to-plan/scripts/plan-identity.mjs'].executable, true,
+    'plan-identity.mjs must be executable');
+});
+
+test('WP-A-PRE. frozen current bodies pin every additive migration-history entry', () => {
+  assert.equal(sha256Hex(PROPOSAL_TO_PLAN_SKILL_MD_V2), PROPOSAL_TO_PLAN_SKILL_MD_V2_HASH);
+  assert.equal(sha256Hex(PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD_V1), PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD_V1_HASH);
+  assert.equal(sha256Hex(PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD_V2), PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD_V2_HASH);
+  assert.equal(sha256Hex(PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V3), PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V3_HASH);
+  assert.notEqual(sha256Hex(PROPOSAL_TO_PLAN_SKILL_MD), PROPOSAL_TO_PLAN_SKILL_MD_V2_HASH);
+  assert.notEqual(sha256Hex(PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD), PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD_V1_HASH);
+  assert.notEqual(sha256Hex(PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD), PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD_V2_HASH);
+  assert.notEqual(sha256Hex(PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS), PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V3_HASH);
+});
+
+test('WP-A-CONTENT. continuity, contracts, register bytes, and capture-row boundary are pinned', () => {
+  const captureRow = '| `capture` | Write a stamped **flat** proposal in `.lares/proposals/`; zero ceremony. Terminal-valid. | `references/activities/capture.md` |';
+  assert.ok(PROPOSAL_TO_PLAN_SKILL_MD_V2.includes(captureRow));
+  assert.ok(PROPOSAL_TO_PLAN_SKILL_MD.includes(captureRow), 'capture mode row must remain byte-untouched');
+  assert.ok(PROPOSAL_TO_PLAN_SKILL_MD.includes('## Hardening continuity'));
+  assert.ok(PROPOSAL_TO_PLAN_SKILL_MD.includes('scope → promote → deliberate → integrate → package'));
+  assert.ok(PROPOSAL_TO_PLAN_SKILL_MD.includes('The one built-in stop is **after `package`**'));
+  assert.ok(PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD.includes(
+    'written for the workspace owner — no\nsentinel names, no rung jargon, no file:line.'));
+  assert.ok(Buffer.from(PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD, 'utf8').includes(Buffer.from([0xe2, 0x80, 0x94])),
+    'package register sentence must contain literal UTF-8 U+2014 bytes');
+  assert.ok(PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD.includes(
+    'references/contracts/responsibility.md` §Determination'));
+  assert.ok(!PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD.includes('On a matching resume, run `orient`'));
+  assert.ok(PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD.includes('**plan SKU**'));
+  assert.ok(PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD.includes('`## Status` line'));
+  assert.ok(PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD.includes('re-read and verify the expected'));
+  assert.ok(PROPOSAL_TO_PLAN_CONTRACT_WORK_PACKAGES_MD.includes('PLAN-WORK-PACKAGES:v1'));
+  assert.ok(PROPOSAL_TO_PLAN_CONTRACT_HUMAN_OVERVIEW_MD.includes('PLAN-TAB-OVERVIEWS:v1'));
+});
+
+test('WP-A-MIG. pristine prior bodies migrate silently while a local edit is backed up', () => {
+  const workDir = mktmp('p2p-wpa-migration');
+  const { supervisor, cleanup } = makeSupervisor();
+  const rootRel = '.lares/workers/codex/.agents/skills/proposal-to-plan';
+  const fixtures = [
+    ['SKILL.md', PROPOSAL_TO_PLAN_SKILL_MD_V2, 2],
+    ['references/activities/promote.md', PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD_V2, 2],
+    ['scripts/plan-manifest.mjs', PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V3, 3],
+  ] as const;
+  try {
+    const sidecar: Record<string, number> = {};
+    for (const [rel, body, version] of fixtures) {
+      const full = path.join(workDir, ...rootRel.split('/'), ...rel.split('/'));
+      fs.mkdirSync(path.dirname(full), { recursive: true });
+      fs.writeFileSync(full, body, 'utf8');
+      sidecar[`workers/codex/.agents/skills/proposal-to-plan/${rel}`] = version;
+    }
+    const packageRel = 'references/activities/package.md';
+    const packagePath = path.join(workDir, ...rootRel.split('/'), ...packageRel.split('/'));
+    fs.mkdirSync(path.dirname(packagePath), { recursive: true });
+    fs.writeFileSync(packagePath, PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD_V1 + '\n<!-- local edit -->\n', 'utf8');
+    sidecar[`workers/codex/.agents/skills/proposal-to-plan/${packageRel}`] = 1;
+    fs.mkdirSync(path.dirname(sidecarPath(workDir)), { recursive: true });
+    fs.writeFileSync(sidecarPath(workDir), JSON.stringify(sidecar, null, 2) + '\n', 'utf8');
+
+    supervisor.ensureWorkerScaffold(workDir, 'codex', 'windows');
+
+    for (const [rel] of fixtures) {
+      const full = path.join(workDir, ...rootRel.split('/'), ...rel.split('/'));
+      assert.equal(fs.readdirSync(path.dirname(full)).filter((name) => name.startsWith(path.basename(full) + '.bak.')).length, 0,
+        `${rel} pristine migration must not create a backup`);
+    }
+    assert.equal(fs.readFileSync(packagePath, 'utf8'), PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD);
+    assert.equal(fs.readdirSync(path.dirname(packagePath)).filter((name) => name.startsWith('package.md.bak.')).length, 1,
+      'locally edited package.md must be preserved in one backup');
+    assert.ok(fs.existsSync(path.join(workDir, ...rootRel.split('/'), 'scripts', 'plan-identity.mjs')));
+    assert.ok(fs.existsSync(path.join(workDir, ...rootRel.split('/'), 'references', 'contracts', 'responsibility.md')));
+  } finally {
+    cleanup();
+    rmrf(workDir);
+  }
 });
 
 test('WP-SKILLFIX-PRE. frozen v1 bodies hash to the previousHashes[1] literals AND differ from the live v2 bodies', () => {

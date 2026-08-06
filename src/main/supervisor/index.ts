@@ -54,8 +54,12 @@ import {
   PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD,
   PROPOSAL_TO_PLAN_CONTRACT_ARC_MD,
   PROPOSAL_TO_PLAN_CONTRACT_FOLDER_SCHEMA_MD,
+  PROPOSAL_TO_PLAN_CONTRACT_HUMAN_OVERVIEW_MD,
   PROPOSAL_TO_PLAN_CONTRACT_INTENT_LIFECYCLE_MD,
   PROPOSAL_TO_PLAN_CONTRACT_MANIFEST_LOCK_MD,
+  PROPOSAL_TO_PLAN_CONTRACT_RESPONSIBILITY_MD,
+  PROPOSAL_TO_PLAN_CONTRACT_WORK_PACKAGES_MD,
+  PROPOSAL_TO_PLAN_SCRIPT_PLAN_IDENTITY_MJS,
   PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS,
 } from '../../shared/constants';
 import { removeGlobalAgyStatusHook } from './agy-hooks';
@@ -1258,6 +1262,13 @@ export const PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V1_HASH = 'bee85a7aacc0ef
 export const PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V2_HASH = '13b734310a667cc889e34c04588fd2e2fe8899dd44b1a90bc37fa14ad51f351e';
 export const PROPOSAL_TO_PLAN_CONTRACT_MANIFEST_LOCK_MD_V1_HASH = '5a172e514b4665e039fd6d6f8bce8c41487de2dcb3bb36cd3b69ec02d6c7d29c';
 
+// WP-A — hashes re-derived from the pristine pre-edit live bodies. These are
+// additive history entries: older entries remain required for multi-hop migration.
+export const PROPOSAL_TO_PLAN_SKILL_MD_V2_HASH = 'e6d80a0c937e34e4d30e4d68138263d425cfcaea69fc9bdcf95d359528bc0b64';
+export const PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD_V1_HASH = '942e7dc9ac6b53119e3297eee9266d11f2b422cee8688caff9483bd2775ba15b';
+export const PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD_V2_HASH = '8e393b94dd27bd5a33e12c2c39a04a8c7ecc8e02a4a978e2f42aeda36cf422c2';
+export const PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V3_HASH = '54261f6c4a0c88ce5b281e98583c49dc2e58b16510da48d72e13f25619c31cb0';
+
 // WP-P0C — proposal-to-plan skill tree deploy. One versioned content constant per
 // file (constants.ts); this manifest expands the tree under each of the four skill
 // roots (Claude+Codex x supervisor+worker). New-skill shape was version 1, no
@@ -1273,27 +1284,35 @@ const PROPOSAL_TO_PLAN_TREE: Array<{
   rel: string; content: string; executable?: boolean;
   version?: number; previousHashes?: Record<number, string>;
 }> = [
-  { rel: 'SKILL.md', content: PROPOSAL_TO_PLAN_SKILL_MD, version: 2,
-    previousHashes: { 1: PROPOSAL_TO_PLAN_SKILL_MD_V1_HASH } },
+  { rel: 'SKILL.md', content: PROPOSAL_TO_PLAN_SKILL_MD, version: 3,
+    previousHashes: { 1: PROPOSAL_TO_PLAN_SKILL_MD_V1_HASH,
+                      2: PROPOSAL_TO_PLAN_SKILL_MD_V2_HASH } },
   { rel: 'references/activities/capture.md', content: PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD, version: 3,
     previousHashes: { 1: PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V1_HASH,
                       2: PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V2_HASH } },
   { rel: 'references/activities/scope.md', content: PROPOSAL_TO_PLAN_ACTIVITY_SCOPE_MD },
-  { rel: 'references/activities/promote.md', content: PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD, version: 2,
-    previousHashes: { 1: PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD_V1_HASH } },
+  { rel: 'references/activities/promote.md', content: PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD, version: 3,
+    previousHashes: { 1: PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD_V1_HASH,
+                      2: PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD_V2_HASH } },
   { rel: 'references/activities/deliberate.md', content: PROPOSAL_TO_PLAN_ACTIVITY_DELIBERATE_MD },
   { rel: 'references/activities/integrate.md', content: PROPOSAL_TO_PLAN_ACTIVITY_INTEGRATE_MD },
-  { rel: 'references/activities/package.md', content: PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD },
+  { rel: 'references/activities/package.md', content: PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD, version: 2,
+    previousHashes: { 1: PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD_V1_HASH } },
   { rel: 'references/activities/orient.md', content: PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD, version: 2,
     previousHashes: { 1: PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD_V1_HASH } },
   { rel: 'references/contracts/arc.md', content: PROPOSAL_TO_PLAN_CONTRACT_ARC_MD },
   { rel: 'references/contracts/folder-schema.md', content: PROPOSAL_TO_PLAN_CONTRACT_FOLDER_SCHEMA_MD },
+  { rel: 'references/contracts/human-overview.md', content: PROPOSAL_TO_PLAN_CONTRACT_HUMAN_OVERVIEW_MD },
   { rel: 'references/contracts/intent-lifecycle.md', content: PROPOSAL_TO_PLAN_CONTRACT_INTENT_LIFECYCLE_MD },
   { rel: 'references/contracts/manifest-lock.md', content: PROPOSAL_TO_PLAN_CONTRACT_MANIFEST_LOCK_MD, version: 2,
     previousHashes: { 1: PROPOSAL_TO_PLAN_CONTRACT_MANIFEST_LOCK_MD_V1_HASH } },
-  { rel: 'scripts/plan-manifest.mjs', content: PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS, executable: true, version: 3,
+  { rel: 'references/contracts/responsibility.md', content: PROPOSAL_TO_PLAN_CONTRACT_RESPONSIBILITY_MD },
+  { rel: 'references/contracts/work-packages.md', content: PROPOSAL_TO_PLAN_CONTRACT_WORK_PACKAGES_MD },
+  { rel: 'scripts/plan-identity.mjs', content: PROPOSAL_TO_PLAN_SCRIPT_PLAN_IDENTITY_MJS, executable: true },
+  { rel: 'scripts/plan-manifest.mjs', content: PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS, executable: true, version: 4,
     previousHashes: { 1: PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V1_HASH,
-                      2: PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V2_HASH } },
+                      2: PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V2_HASH,
+                      3: PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V3_HASH } },
 ];
 /** Expand the proposal-to-plan tree under a skill-root prefix into scaffold
  *  entries. Called for all four roots (Claude+Codex supervisor + worker). Each

@@ -5504,6 +5504,14 @@ policy drives the work; \`orient\` derives the *known* state and offers *safe* n
 | \`package\` | **Last step:** decompose into bundle-shaped WPs + create-or-verify the \`plan-baseline\` tag. | \`references/activities/package.md\` |
 | \`orient\` | **Re-entry read.** Derive every intent's rung from disk; report safe next actions. Owns the decision table. | \`references/activities/orient.md\` |
 
+## Hardening continuity
+
+Once hardening starts, continue through **\`scope → promote → deliberate → integrate → package\`**
+without pausing between phases to ask "phase done, continue?" Resume from durable disk state when a
+turn boundary intervenes. The one built-in stop is **after \`package\`**, when the plan is presented
+to the workspace owner and waits for the explicit implementation trigger. Escalation for a genuine
+Tier-3 decision remains allowed; routine phase-boundary permission checks are not.
+
 There is **no standalone \`mark\` mode** — marking is owned inside \`scope\` (a separate mark would
 bypass hardening triage). The \`references/activities/*\` files are internal playbooks the dispatcher
 routes to; load only the one you need. Contracts live once under \`references/contracts/\`.
@@ -5723,7 +5731,8 @@ is **rejected and instructed** to hand off.
 **Contracts loaded.** \`references/contracts/folder-schema.md\` (§R0 — layout, identity, \`.gitkeep\`),
 \`references/contracts/manifest-lock.md\` (helper-only \`plan.json\` creation), \`references/contracts/arc.md\`
 (§R2 — the ARC skeleton created here), and \`references/contracts/intent-lifecycle.md\` (§R1 — the
-markup migrated into \`plan.md\`).
+markup migrated into \`plan.md\`). Responsibility is determined only by
+\`references/contracts/responsibility.md\` §Determination.
 
 > **All \`plan.json\` creation goes through \`scripts/plan-manifest.mjs scaffold\`.** The agent never
 > hand-writes \`plan.json\` (§P3-MANIFEST-LOCK, helper-only).
@@ -5770,6 +5779,12 @@ Run this via **\`plan-manifest.mjs scaffold\`**, which:
    - \`deliberations/.gitkeep\`, \`research/.gitkeep\`, \`supplements/.gitkeep\`.
 3. \`fsync\`s, then **atomically renames the complete folder** onto the deterministic target.
 4. Migrates the \`## Hardening scope\` verdict into \`plan.md\`/\`ARC.md → Decisions\`.
+5. After the successful rename, stamp the source proposal additively: set \`promoted_to\` to the
+   **plan SKU**, set \`promoted_at\` to the current ISO timestamp, and refresh the proposal's own
+   \`## Status\` line if that section is present. Preserve every unrelated frontmatter key and all
+   unrelated proposal body bytes. Make the edit concurrency-safe: re-read and verify the expected
+   bytes immediately before the targeted edit; on mismatch, re-read and retry rather than
+   clobbering. A matching existing stamp is idempotent; a conflicting stamp blocks and is reported.
 
 **No post-rename incomplete-plan interval exists** — \`plan.md\` is already inside the temp folder
 before the rename (Accept 3).
@@ -5780,7 +5795,10 @@ If the deterministic target already exists, **\`scaffold\` does not clobber it.*
 the occupant and read its \`plan.json.source_proposal.artifact_id\`:
 
 - **Matching \`source_proposal.artifact_id\`** → this is our own folder (a resumed/retried promotion).
-  **Orient/resume** — do not re-scaffold; continue hardening against the existing folder.
+  On a matching resume, apply the responsible-supervisor determination in
+  \`references/contracts/responsibility.md\` §Determination. If another supervisor is responsible,
+  stop without mutating, reassigning, or continuing. Otherwise do not re-scaffold; continue
+  hardening against the existing folder.
 - **Mismatching \`source_proposal.artifact_id\`** → an **unrelated** occupant of the deterministic
   path. **Report a collision and BLOCK.** Never adopt, never overwrite, leave the occupant
   untouched.
@@ -5925,8 +5943,9 @@ Packaging is decomposition; it is **not** scope (ruling 27).
 non-supervisor lane is **rejected and instructed** to hand off.
 
 **Contracts loaded.** \`references/contracts/arc.md\` (§R2 — recording the baseline + packages under
-Decisions/Work packages) and \`references/contracts/folder-schema.md\` (§R0 — the plan folder the WPs
-are recorded in).
+Decisions/Work packages), \`references/contracts/folder-schema.md\` (§R0 — the plan folder),
+\`references/contracts/work-packages.md\` (the strict \`PLAN-WORK-PACKAGES:v1\` projection), and
+\`references/contracts/human-overview.md\` (the \`OVERVIEW.md\` human register).
 
 ---
 
@@ -5935,11 +5954,29 @@ are recorded in).
 - Cut the hardened plan into **worker-sized packages**, each fitting one worker's context, in the
   **bundle-contract shape** (\`.lares/proposals/supporting/2026-07-30-shared-bundle-contract.md\`):
   every WP lists **Files · Dep · Do · Accept · Non-goals · Verify**.
+- Write exactly one \`kind: work-packages\` supplement. In the same operation, write its prose
+  bundle contracts and its additive \`PLAN-WORK-PACKAGES:v1\` block. Self-check that projected IDs
+  and titles have one-to-one parity with the prose headings, then validate the complete file against
+  \`references/contracts/work-packages.md\`.
 - Record the packages under \`ARC.md → ## Work packages\` (\`<id> <title> — <state> — <responsible/assignee>\`).
 - **Preconditions:** a defensible implementation plan exists — every marked intent is folded or
   legitimately trivial (\`## Hardening scope\` verdict present). Do not package an unhardened plan.
 
-## Part B — pre-implementation git prep (the baseline tag)
+## Part B — write the human overview
+
+Before git prep, derive the populated tab inventory from bounded, contained disk evidence per
+\`references/contracts/human-overview.md\` — never from SQLite. Overview and Plan are always
+present; Proposal is included only for a contained regular non-symlink manifest source;
+Deliberations, Research, and Supplements are included only when their directory has a real output
+other than \`.gitkeep\`; Packages is always included; Legacy HTML is never inferred.
+
+Write or update \`OVERVIEW.md\`, preserving valid unrelated sections and unmapped prose, and include
+a non-empty section for every discovered tab. The register is *written for the workspace owner — no
+sentinel names, no rung jargon, no file:line.* Validate \`OVERVIEW.md\` against
+\`references/contracts/human-overview.md\`, then validate the work-package supplement again. Do not
+declare dispatch readiness if either validation fails.
+
+## Part C — pre-implementation git prep (the baseline tag)
 
 Before declaring the plan **dispatch-ready**, create-or-verify a **local annotated** baseline tag so
 implementation has a human-visible recovery point:
@@ -5972,9 +6009,9 @@ one \`git show <tag>:<path>\` away — deletion WPs need **no** copy-aside archi
 
 ## Hand-off
 
-With packages recorded and the baseline tag in place, the plan is **dispatch-ready**. Implementation
-is a separate explicit human **trigger** (never auto-launched by the skill). \`orient\` reports
-readiness on pickup.
+With packages and \`OVERVIEW.md\` validated and the baseline tag in place, present the human overview
+and stop. The plan is **dispatch-ready**, but implementation is a separate explicit human **trigger**
+(never auto-launched by the skill). \`orient\` reports readiness on pickup.
 `;
 
 export const PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD = `# Activity playbook — \`orient\`
@@ -6350,6 +6387,213 @@ Rung derivation is **not** in the helper (that is the P1 reader / P2L ledger's c
 lock protects manifest integrity only.
 `;
 
+export const PROPOSAL_TO_PLAN_CONTRACT_WORK_PACKAGES_MD = `# Contract reference — PLAN-WORK-PACKAGES:v1
+
+The responsible supervisor writes exactly one regular, non-symlink Markdown file under
+\`supplements/\` with frontmatter \`kind: work-packages\` and the plan's exact
+\`plan_artifact_id\`. The existing prose remains in the bundle-contract shape: every package has
+\`Files\`, \`Dep\`, \`Do\`, \`Accept\`, \`Non-goals\`, and \`Verify\` sections.
+
+Immediately before the prose package sections, emit exactly one hidden machine block:
+
+\`\`\`markdown
+<!--PLAN-WORK-PACKAGES:v1
+{
+  "schema_version": 1,
+  "plan_artifact_id": "plan_e0001372",
+  "packages": [
+    {
+      "id": "WP-1",
+      "order": 10,
+      "title": "WP schema and parser",
+      "initial_state": "ready",
+      "acceptance_conditions": [
+        "Invalid input leaves package, layout, path, assignment, and lifecycle rows unchanged."
+      ],
+      "paths": [
+        { "path": "src/main/plans/plan-work-package-ingest.ts", "intent_kind": "create" }
+      ],
+      "depends_on": []
+    }
+  ]
+}
+-->
+\`\`\`
+
+## Validation
+
+- Bound both file and block to 1 MiB. Parse strict JSON: comments, trailing commas, duplicate keys,
+  unknown top-level/package keys, and strings containing \`-->\` are invalid.
+- \`schema_version\` is \`1\`; block, frontmatter, and \`plan.json\` artifact IDs match exactly;
+  \`packages\` is non-empty.
+- IDs match \`[A-Za-z0-9][A-Za-z0-9._-]{0,63}\` and are unique case-insensitively. Derive DB IDs as
+  \`wp:<plan_artifact_id>:<lowercase logical id>\`; retain authored casing for display.
+- \`order\` is a unique non-negative integer. Gaps are allowed; display order is
+  \`(order, lowercase id)\`. Titles are trimmed, non-empty, and at most 300 characters.
+- \`initial_state\` is exactly \`ready\` or \`blocked\`. Disk cannot declare runtime lifecycle,
+  assignment, revision, or completion state.
+- \`acceptance_conditions\` is a non-empty array of non-empty strings, stored joined by \`\\n\` in
+  authored order.
+- \`paths\` may be empty. Each entry has \`path\` and optional \`intent_kind\` in
+  \`create | edit | delete | verify\`. Paths are normalized workspace-relative POSIX paths; reject
+  absolute, drive, UNC, backslash, empty/\`.\`, NUL, and outward-traversal paths.
+- \`depends_on\` references projected logical IDs only. Reject missing/self references, cycles, or a
+  dependency whose \`order\` is not lower than its dependent.
+- Package content digests use canonical JSON over ID, title, initial state, acceptance conditions,
+  normalized paths, and dependencies, excluding \`order\`. The projection digest includes ordered
+  package records and \`order\`.
+- Require exactly one matching prose \`## <id> - <title>\` or \`## <id> — <title>\` heading for each
+  projected package and no extra prose WP headings. ARC duplicate/unknown-ID checks are advisory.
+
+This block is additive machine metadata. It does not replace bundle prose, the ARC ledger,
+PLAN-INTENT/PLAN-INTEGRATION sentinels, or the rung ladder. A prose-only legacy supplement is
+invalid until its responsible supervisor adds a reviewed v1 block.
+`;
+
+export const PROPOSAL_TO_PLAN_CONTRACT_HUMAN_OVERVIEW_MD = `# Contract reference — PLAN-TAB-OVERVIEWS:v1
+
+\`OVERVIEW.md\` lives beside \`ARC.md\` and is the human-register source for structured-plan tab
+summaries. It begins with exact frontmatter identity:
+
+\`\`\`markdown
+---
+plan_artifact_id: plan_e0001372
+kind: human-overview
+schema_version: 1
+---
+
+# Plan overview
+
+<!--PLAN-TAB-OVERVIEWS:v1
+{
+  "schema_version": 1,
+  "plan_artifact_id": "plan_e0001372",
+  "sections": [
+    { "tab": "overview", "heading": "What this plan changes" },
+    { "tab": "proposal", "heading": "Why this work exists" },
+    { "tab": "plan", "heading": "How the work will proceed" },
+    { "tab": "deliberations", "heading": "Important decisions" },
+    { "tab": "supplements", "heading": "Supporting material" },
+    { "tab": "packages", "heading": "Work packages" }
+  ]
+}
+-->
+
+<!--PLAN-TAB-SECTION:overview:BEGIN-->
+## What this plan changes
+
+Human-readable summary text.
+<!--PLAN-TAB-SECTION:overview:END-->
+\`\`\`
+
+The index binds stable tab keys to explicitly delimited sections. The first nonblank line after a
+begin delimiter is the indexed \`## <heading>\`; the body continues to its matching end delimiter.
+Unmapped prose is permitted, ignored by projection, and preserved by structured edits.
+
+## Validation
+
+- File size is at most 1 MiB. Frontmatter uses the bounded scalar subset, has one leading fence,
+  unique keys, and exact \`plan_artifact_id\`, \`kind: human-overview\`, and \`schema_version: 1\` values.
+- Require exactly one v1 index outside fenced code and exactly one begin/end pair for every indexed
+  tab. Reject unindexed delimiters, duplicate/unknown tabs, duplicate headings, crossed/nested
+  delimiters, missing headings, and empty bodies.
+- Parse the index as strict JSON. Reject comments, trailing commas, duplicate/unknown keys, and any
+  string containing \`-->\`.
+- Delimiter-like text in fenced code is prose. CRLF and LF parse identically; a mapped EOF section
+  is valid with or without a final newline. Raw bytes are not normalized for source observation.
+
+## Package-time inventory
+
+Derive tabs from bounded, contained disk evidence, never SQLite: Overview and Plan always; Proposal
+when the manifest source resolves to a contained regular non-symlink file; Deliberations, Research,
+and Supplements when their directories contain a regular non-symlink output other than
+\`.gitkeep\`; Packages always during \`package\`; never infer Legacy HTML.
+
+When editing a valid file, preserve unrelated sections and unmapped prose byte-for-byte. Replace
+only the selected body; insert/remove the index entry and complete delimited section together;
+retain newline style and final-newline presence. Canonical index rewrites use two-space JSON,
+top-level order \`schema_version\`, \`plan_artifact_id\`, \`sections\`, canonical tab order, and entry
+order \`tab\`, \`heading\`.
+`;
+
+export const PROPOSAL_TO_PLAN_CONTRACT_RESPONSIBILITY_MD = `# Contract reference — responsible supervisor
+
+## Determination
+
+The current responsible supervisor is the agent named by the **last \`assigned\` event** in
+\`plan.json.responsibility_events\`. Read it through \`scripts/plan-manifest.mjs inspect\`, which
+surfaces that event as \`current_responsible\`.
+
+A different supervisor must append a fresh \`assigned\` event through the manifest helper, under the
+lock, **before** any mutation. Read-only orientation is allowed without reassignment. A mutation by
+anyone other than the current responsible supervisor, or without the required fresh assignment, is
+refused. Judgment-bearing next actions are gated on the current responsible supervisor.
+`;
+
+export const PROPOSAL_TO_PLAN_SCRIPT_PLAN_IDENTITY_MJS = String.raw`// GENERATED from src/shared/plan-identity.ts — DO NOT EDIT.
+function parseScalar(raw) {
+    const value = raw.trim();
+    if (value.length >= 2 && value.startsWith('"') && value.endsWith('"')) {
+        try {
+            return JSON.parse(value);
+        }
+        catch {
+            return value.slice(1, -1);
+        }
+    }
+    if (value.length >= 2 && value.startsWith("'") && value.endsWith("'")) {
+        return value.slice(1, -1).replace(/''/g, "'");
+    }
+    return value;
+}
+export function parseProposalFrontmatter(markdown) {
+    const match = markdown.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
+    const frontmatter = {};
+    if (!match)
+        return frontmatter;
+    for (const line of match[1].split(/\r?\n/)) {
+        const pair = line.match(/^([A-Za-z0-9_]+):\s*(.*)$/);
+        if (pair)
+            frontmatter[pair[1]] = parseScalar(pair[2]);
+    }
+    return frontmatter;
+}
+export function slugifyPlanTitle(title) {
+    return String(title).toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-+|-+$/g, '')
+        .slice(0, 48) || 'plan';
+}
+function utcDate(value) {
+    if (value instanceof Date)
+        return value.toISOString().slice(0, 10);
+    if (typeof value === 'string')
+        return value.slice(0, 10);
+    return new Date().toISOString().slice(0, 10);
+}
+export function derivePlanIdentity(frontmatter, overrides = {}) {
+    const proposalArtifactId = String(overrides.proposalArtifactId ?? frontmatter.artifact_id ?? '').trim();
+    if (!proposalArtifactId)
+        throw new Error('Proposal frontmatter must contain artifact_id.');
+    const artifactHex = proposalArtifactId.replace(/^prop_/, '');
+    const planArtifactId = 'plan_' + artifactHex;
+    const artifactShort = artifactHex.slice(0, 8);
+    const date = overrides.date ?? frontmatter.authored_at?.slice(0, 10) ?? utcDate(overrides.now);
+    const slug = overrides.slug ?? slugifyPlanTitle(frontmatter.title ?? 'plan');
+    return {
+        proposalArtifactId,
+        planArtifactId,
+        artifactShort,
+        date,
+        slug,
+        planSku: date + '-' + slug + '-' + artifactShort,
+    };
+}
+export function derivePlanIdentityFromMarkdown(markdown, overrides = {}) {
+    return derivePlanIdentity(parseProposalFrontmatter(markdown), overrides);
+}
+`;
+
 export const PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS = `#!/usr/bin/env node
 // plan-manifest.mjs — the proposal-to-plan skill's ONLY write path for plan.json,
 // plus the atomic complete-folder scaffold and a read-only inspect dump.
@@ -6375,6 +6619,7 @@ export const PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS = `#!/usr/bin/env node
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { derivePlanIdentity, parseProposalFrontmatter } from './plan-identity.mjs';
 
 const SCHEMA_VERSION = 1;
 const HEARTBEAT_MS = 2000;      // §P3-MANIFEST-LOCK: refresh cadence
@@ -6411,34 +6656,45 @@ function parseArgs(argv) {
   return a;
 }
 
-// ---------- minimal YAML frontmatter reader (proposal artifact_id/title) ----------
-function readFrontmatter(mdPath) {
-  const raw = fs.readFileSync(mdPath, 'utf8');
-  const m = raw.match(/^---\\r?\\n([\\s\\S]*?)\\r?\\n---\\r?\\n?/);
-  const fm = {};
-  if (m) {
-    for (const line of m[1].split(/\\r?\\n/)) {
-      const kv = line.match(/^([A-Za-z0-9_]+):\\s*(.*)$/);
-      if (kv) fm[kv[1]] = kv[2].trim().replace(/^["']|["']$/g, '');
-    }
+function samePath(a, b) {
+  return process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
+}
+function isContained(parent, child) {
+  const rel = path.relative(parent, child);
+  return rel !== '' && !rel.startsWith('..' + path.sep) && rel !== '..' && !path.isAbsolute(rel);
+}
+function validateScaffoldPaths(proposalInput, plansHomeInput) {
+  const plansHomeAbs = path.resolve(plansHomeInput);
+  if (path.basename(plansHomeAbs) !== 'plans') die(2, 'scaffold: --plans-home leaf must be plans');
+  const stateDirAbs = path.dirname(plansHomeAbs);
+  const stateLeaf = path.basename(stateDirAbs);
+  if (stateLeaf !== '.lares' && stateLeaf !== '.dashboard') {
+    die(2, 'scaffold: --plans-home parent must be exactly .lares or .dashboard');
   }
-  return { fm, raw };
-}
-
-// deterministic identity: plan_<proposal-artifact-hex>
-function deriveIdentity(fm, args) {
-  const propArtifact = args['proposal-artifact-id'] || fm.artifact_id;
-  if (!propArtifact) die(2, 'scaffold: proposal has no artifact_id (frontmatter) and --proposal-artifact-id not given');
-  const propHex = String(propArtifact).replace(/^prop_/, '');
-  const planArtifactId = 'plan_' + propHex;
-  const artifactShort = propHex.slice(0, 8);
-  const date = args.date || fm.authored_at?.slice(0, 10) || new Date().toISOString().slice(0, 10);
-  const slug = args.slug || slugify(fm.title || 'plan');
-  const planSku = \`\${date}-\${slug}-\${artifactShort}\`;
-  return { propArtifact, planArtifactId, artifactShort, date, slug, planSku };
-}
-function slugify(s) {
-  return String(s).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 48) || 'plan';
+  const workspaceRootAbs = path.dirname(stateDirAbs);
+  const proposalRootAbs = path.join(stateDirAbs, 'proposals');
+  const proposalAbs = path.resolve(proposalInput);
+  if (!isContained(proposalRootAbs, proposalAbs)) die(2, 'scaffold: --proposal must be beneath the active proposals root');
+  let stat;
+  try { stat = fs.lstatSync(proposalAbs); } catch { die(2, 'scaffold: proposal is missing or unreadable'); }
+  if (!stat.isFile() || stat.isSymbolicLink()) die(2, 'scaffold: proposal must be a regular non-symlink file');
+  let realProposal, realProposalRoot, realStateDir, realWorkspaceRoot, realPlansHome;
+  try {
+    realProposal = fs.realpathSync.native(proposalAbs);
+    realProposalRoot = fs.realpathSync.native(proposalRootAbs);
+    realStateDir = fs.realpathSync.native(stateDirAbs);
+    realWorkspaceRoot = fs.realpathSync.native(workspaceRootAbs);
+    realPlansHome = fs.realpathSync.native(plansHomeAbs);
+  } catch { die(2, 'scaffold: proposal or active state-root path is missing or unreadable'); }
+  if (!samePath(realProposalRoot, proposalRootAbs) || !samePath(realStateDir, stateDirAbs) ||
+      !samePath(realWorkspaceRoot, workspaceRootAbs) || !samePath(realPlansHome, plansHomeAbs) ||
+      !samePath(realProposal, proposalAbs) || !isContained(realProposalRoot, realProposal)) {
+    die(2, 'scaffold: symlink/reparse or cross-root proposal traversal is forbidden');
+  }
+  const proposalRelPath = path.relative(realWorkspaceRoot, realProposal).replace(/\\\\/g, '/');
+  const expectedPrefix = stateLeaf + '/proposals/';
+  if (!proposalRelPath.startsWith(expectedPrefix)) die(2, 'scaffold: canonical proposal path is outside the active state root');
+  return { plansHomeAbs, proposalAbs, proposalRelPath };
 }
 
 // ---------- the lock (§P3-MANIFEST-LOCK) ----------
@@ -6641,12 +6897,19 @@ function buildArcSkeleton({ title, planSku, planArtifactId, verdictLine }) {
 }
 
 function cmdScaffold(args) {
-  const proposalPath = args.proposal;
-  const plansHome = args['plans-home'];
-  if (!proposalPath || !plansHome) die(2, 'scaffold: --proposal <flat-proposal.md> and --plans-home <state-dir/plans> required');
-  const { fm, raw } = readFrontmatter(proposalPath);
-  const id = deriveIdentity(fm, args);
-  const target = path.join(plansHome, id.planSku);
+  if (!args.proposal || !args['plans-home']) die(2, 'scaffold: --proposal <flat-proposal.md> and --plans-home <state-dir/plans> required');
+  const validated = validateScaffoldPaths(args.proposal, args['plans-home']);
+  const raw = fs.readFileSync(validated.proposalAbs, 'utf8');
+  const fm = parseProposalFrontmatter(raw);
+  let id;
+  try {
+    id = derivePlanIdentity(fm, {
+      proposalArtifactId: args['proposal-artifact-id'],
+      date: args.date,
+      slug: args.slug,
+    });
+  } catch (e) { die(2, 'scaffold: ' + e.message); }
+  const target = path.join(validated.plansHomeAbs, id.planSku);
   const requestId = args['request-id'] || hex(6);
   const agentId = args['agent-id'] || 'manual-skill-agent';
   const display = args.display || agentId;
@@ -6657,17 +6920,17 @@ function cmdScaffold(args) {
     let occupant = null;
     try { occupant = JSON.parse(fs.readFileSync(path.join(target, 'plan.json'), 'utf8')); } catch { /* malformed occupant */ }
     const occArtifact = occupant?.source_proposal?.artifact_id;
-    if (occArtifact && occArtifact === id.propArtifact) {
+    if (occArtifact && occArtifact === id.proposalArtifactId) {
       out({ action: 'resume', reason: 'EEXIST with matching source_proposal.artifact_id', target, plan_artifact_id: id.planArtifactId });
       return;
     }
     die(3, \`scaffold: EEXIST COLLISION — target \${target} is occupied by an unrelated plan \` +
-           \`(source_proposal.artifact_id=\${occArtifact ?? 'unknown/malformed'}, expected \${id.propArtifact}). \` +
+           \`(source_proposal.artifact_id=\${occArtifact ?? 'unknown/malformed'}, expected \${id.proposalArtifactId}). \` +
            \`Blocking; occupant left untouched. Run orient against it.\`);
   }
 
   // ----- build the COMPLETE folder in a request-ID-qualified temp sibling -----
-  const tmp = path.join(plansHome, \`\${id.planSku}.tmp-\${requestId}\`);
+  const tmp = path.join(validated.plansHomeAbs, \`\${id.planSku}.tmp-\${requestId}\`);
   if (fs.existsSync(tmp)) fs.rmSync(tmp, { recursive: true, force: true }); // resume only our own temp
   fs.mkdirSync(tmp, { recursive: true });
   for (const sub of ['deliberations', 'research', 'supplements']) {
@@ -6684,7 +6947,7 @@ function cmdScaffold(args) {
     schema_version: SCHEMA_VERSION,
     plan_artifact_id: id.planArtifactId,
     plan_sku: id.planSku,
-    source_proposal: { artifact_id: id.propArtifact, rel_path: toRelProposal(proposalPath) },
+    source_proposal: { artifact_id: id.proposalArtifactId, rel_path: validated.proposalRelPath },
     responsibility_events: [{
       event_id: 'rev_' + hex(8), event: 'assigned', agent_id: agentId, display,
       at: nowMs(), source: 'manual-skill',
@@ -6707,11 +6970,6 @@ function cmdScaffold(args) {
   out({ action: 'scaffolded', target, plan_artifact_id: id.planArtifactId, plan_sku: id.planSku });
 }
 
-function toRelProposal(p) {
-  const norm = p.replace(/\\\\/g, '/');
-  const i = norm.indexOf('.lares/proposals/');
-  return i >= 0 ? norm.slice(i) : path.basename(norm);
-}
 function fsyncDir(dir) {
   try { const fd = fs.openSync(dir, 'r'); fs.fsyncSync(fd); fs.closeSync(fd); }
   catch { /* directory fsync unsupported on some platforms (e.g. Windows) — non-fatal */ }
