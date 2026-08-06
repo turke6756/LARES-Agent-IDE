@@ -133,8 +133,9 @@ function makeInspector(opts: { turnStarted?: boolean; deliverer?: any } = {}) {
     resubmitEnter() { /* spy set per-case */ },
   };
   const witness = () => opts.turnStarted ?? false;
-  const promptFactory = (_req: any) => ({ prompt: 'FULL BODY', marker: 'promotion:x' });
-  return new dispatchMod.PromotionDeliveryInspectorImpl(deliverer, witness, promptFactory);
+  return new dispatchMod.PromotionDeliveryInspectorImpl(
+    deliverer, witness, () => new Date().toISOString(),
+  );
 }
 
 // ── cases ────────────────────────────────────────────────────────────────────
@@ -226,8 +227,9 @@ test('resumeSubmitOnly on a submitted-unconfirmed attempt re-presses submit, nev
     resubmitEnter(_id: string) { resubmits++; },
   };
   const witness = () => resubmits > 0;
-  const promptFactory = (_req: any) => ({ prompt: 'FULL BODY', marker: 'promotion:x' });
-  const inspector = new dispatchMod.PromotionDeliveryInspectorImpl(deliverer, witness, promptFactory);
+  const inspector = new dispatchMod.PromotionDeliveryInspectorImpl(
+    deliverer, witness, () => new Date().toISOString(),
+  );
   await inspector.resumeSubmitOnly(runId);
   assert.equal(resubmits, 1, 're-pressed submit exactly once');
   assert.equal(bodySends, 0, 'NEVER retyped the body');
@@ -235,87 +237,19 @@ test('resumeSubmitOnly on a submitted-unconfirmed attempt re-presses submit, nev
   void agent;
 });
 
-test('resumeDelivery on a bound-undelivered attempt sends the full body once; no new worker', async () => {
-  const { runId } = reservedRequest('rd');
-  const agent = bindAgent(runId);
-  const before = agentCount();
-  let bodySends = 0; let launches = 0;
-  const deliverer = {
-    async launchAgent() { launches++; throw new Error('must not launch'); },
-    async sendInputConfirmed(_id: string, _t: string) { bodySends++; return { delivered: true, confirmed: true, mode: 'hook' as const }; },
-    resubmitEnter() { /* n/a */ },
-  };
-  await makeInspector({ deliverer }).resumeDelivery(runId);
-  assert.equal(bodySends, 1, 'full body sent exactly once');
-  assert.equal(launches, 0, 'no second worker launched');
-  assert.equal(agentCount(), before, 'no new agent row');
-  assert.ok(dbm.hasOrchestrationEvent(runId, 'promotion.delivered'), 'confirmed → delivered');
-  assert.equal(dbm.getPromotionWorkerMember(runId), agent.id, 'still the exact bound agent');
+test('bound-undelivered has no full-body resumeDelivery surface', async () => {
+  assert.equal(typeof dispatchMod.PromotionDeliveryInspectorImpl.prototype.resumeDelivery, 'undefined',
+    'WP-I removes every full-body legacy recovery surface');
 });
 
-test('resumeDelivery on a reserved-unbound attempt re-binds (Phase 2a) on the SAME orchestration then confirmed-delivers; no duplicate orchestration, no second body', async () => {
-  const { requestId, runId } = reservedRequest('reru');
-  const agentsBefore = agentCount();
-  const runsBefore = orchestrationCount();
-  // Precondition: reserved (Phase 1) but never bound (Phase 2a never committed).
-  assert.equal(dbm.getPromotionWorkerMember(runId), null, 'no worker member → reserved-unbound');
-
-  let launches = 0; let bodySends = 0; let resubmits = 0;
-  const deliverer = {
-    // The supervisor's launchAgent runs Phase 2a atomically INSIDE the launch — the
-    // fake stands in for that by binding the worker onto the reserved runId it is
-    // handed via the InternalLaunchContext (never a new orchestration).
-    async launchAgent(_input: any, internal: any) {
-      launches++;
-      assert.equal(internal?.orchestrationBinding?.runId, runId, 're-bind targets the reserved run');
-      assert.equal(internal?.orchestrationBinding?.evidenceKind, 'promotion');
-      return bindAgent(internal.orchestrationBinding.runId);
-    },
-    async sendInputConfirmed(_id: string, _t: string) { bodySends++; return { delivered: true, confirmed: true, mode: 'hook' as const }; },
-    resubmitEnter() { resubmits++; },
-  };
-  const witness = () => false;
-  const promptFactory = (_req: any) => ({ prompt: 'FULL BODY', marker: `promotion:${requestId}` });
-  const launchInputFactory = (_req: any) => ({ workspaceId: wsId, title: 'promote-reru', provider: 'claude', isWorker: true });
-  const inspector = new dispatchMod.PromotionDeliveryInspectorImpl(
-    deliverer, witness, promptFactory, () => new Date().toISOString(), launchInputFactory,
-  );
-  assert.equal((await inspector.inspectDelivery(runId)).state, 'reserved-unbound');
-
-  await inspector.resumeDelivery(runId);
-
-  assert.equal(launches, 1, 're-entered the launch/bind exactly once');
-  assert.equal(bodySends, 1, 'the full marked body was delivered once after the re-bind');
-  assert.equal(resubmits, 0, 'a body send, not a submit-only re-press');
-  assert.equal(agentCount(), agentsBefore + 1, 'exactly one worker agent bound (no duplicate)');
-  assert.equal(orchestrationCount(), runsBefore, 'NO duplicate orchestration reserved');
-  const boundAgent = dbm.getPromotionWorkerMember(runId);
-  assert.ok(boundAgent, 'the reserved orchestration now has a bound worker member');
-  assert.ok(dbm.hasOrchestrationEvent(runId, 'promotion.agent_bound'), 'Phase 2a agent_bound event persisted');
-  assert.ok(dbm.hasOrchestrationEvent(runId, 'promotion.delivered'), 'confirmed turn start → delivered');
-  assert.deepEqual(await inspector.inspectDelivery(runId), { state: 'delivered', agentId: boundAgent },
-    'the request now inspects as delivered');
+test('reserved-unbound has no launch-or-deliver recovery surface', async () => {
+  assert.equal(typeof dispatchMod.PromotionDeliveryInspectorImpl.prototype.resumeDelivery, 'undefined',
+    'reserved-unbound recovery cannot launch or deliver after WP-I');
 });
 
-test('resumeDelivery on a reserved-unbound attempt WITHOUT a launch-input factory is a safe no-op (no launch, request untouched)', async () => {
-  const { runId } = reservedRequest('reru0');
-  const agentsBefore = agentCount();
-  let launches = 0; let bodySends = 0;
-  const deliverer = {
-    async launchAgent() { launches++; throw new Error('must not launch without a launch-input factory'); },
-    async sendInputConfirmed() { bodySends++; return { delivered: true, confirmed: true, mode: 'hook' as const }; },
-    resubmitEnter() {},
-  };
-  const witness = () => false;
-  const promptFactory = (_req: any) => ({ prompt: 'FULL BODY', marker: 'promotion:x' });
-  // No launchInputFactory (4-arg construction) → reserved-unbound cannot re-bind.
-  const inspector = new dispatchMod.PromotionDeliveryInspectorImpl(deliverer, witness, promptFactory);
-  await inspector.resumeDelivery(runId);
-  assert.equal(launches, 0, 'never launched');
-  assert.equal(bodySends, 0, 'never sent a body');
-  assert.equal(agentCount(), agentsBefore, 'no agent bound');
-  assert.equal(dbm.getPromotionWorkerMember(runId), null, 'still reserved-unbound (untouched)');
-  assert.ok(!dbm.hasOrchestrationEvent(runId, 'promotion.delivery_attempt'), 'no attempt recorded');
+test('legacy resumeDelivery API is absent', async () => {
+  assert.equal(typeof dispatchMod.PromotionDeliveryInspectorImpl.prototype.resumeDelivery, 'undefined',
+    'the legacy resumeDelivery API is absent');
 });
 
 test("markActiveRunsAborted EXCLUDES name='promotion' in SQL — promotion rows survive boot", () => {

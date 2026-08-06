@@ -2016,8 +2016,12 @@ function initContextOptimizerSchema(): void {
   // not altered). The durable cross-restart de-dup seam is
   // UNIQUE(workspace_id, proposal_artifact_id); CHECK(state) bounds the lifecycle set.
   // created_at/updated_at are INTEGER epochs (service-owned, not datetime defaults).
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS promotion_requests (
+  // WP-I retirement is terminal. Once its marker exists, later boots skip this
+  // CREATE entirely instead of resurrecting an empty legacy table.
+  ensureAppliedMigrationsTable(db);
+  if (!hasAppliedMigration(db, LEGACY_PROMOTION_REQUESTS_DROP_MARKER)) {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS promotion_requests (
       id TEXT PRIMARY KEY,
       workspace_id TEXT NOT NULL,
       proposal_id TEXT NOT NULL,
@@ -2035,6 +2039,7 @@ function initContextOptimizerSchema(): void {
       CHECK (state IN ('pending','adopted','failed'))
     )
   `);
+  }
 
   // selection_comment_replies (WP-P4D-reply — A2 DDL slot; frozen shape from the
   // planning-surface plan §WP-P4D-reply / P4-P8 rescope §WP-P4D-reply). A COMPANION
@@ -3299,6 +3304,7 @@ export const RETIRED_PLAN_PROVENANCE_TABLES = [
 
 /** Marker key recorded in `applied_migrations` once the drop has run. */
 export const LEGACY_PLAN_PROVENANCE_DROP_MARKER = 'p8f_drop_legacy_plan_provenance';
+export const LEGACY_PROMOTION_REQUESTS_DROP_MARKER = 'wp_i_drop_legacy_promotion_requests';
 
 /** Availability probe — injectable so tests force (un)availability without
  *  touching the filesystem. Default: a workspace is available when its path
@@ -5498,6 +5504,136 @@ export interface PlanWorkPackageSource {
   declaredState: ReconciledPlanWorkPackageState;
   reconcileState: PlanWorkPackageReconcileState; present: boolean;
   tombstonedAt: number | null; firstSeenAt: number; lastSeenAt: number;
+}
+
+export type LegacyPromotionRetirementReason =
+  | 'dropped'
+  | 'already-dropped'
+  | 'active-drain'
+  | 'pending-requests'
+  | 'nonterminal-promotion-runs'
+  | 'pointer-disagreement'
+  | 'unverified-live-bound-agent';
+
+export interface LegacyPromotionRetirementResult {
+  dropped: boolean;
+  alreadyDropped: boolean;
+  reason: LegacyPromotionRetirementReason;
+  pendingRequestIds: string[];
+  nonterminalRunIds: string[];
+  orphanNonterminalRunIds: string[];
+  pointerDisagreementRequestIds: string[];
+}
+
+function tableExists(database: Database.Database, name: string): boolean {
+  return !!database.prepare(
+    `SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = ?`,
+  ).get(name);
+}
+
+export function promotionRequestsTableExists(database: Database.Database = db): boolean {
+  return tableExists(database, 'promotion_requests');
+}
+
+function readLegacyPromotionRetirementBlockers(
+  database: Database.Database,
+): Omit<LegacyPromotionRetirementResult, 'dropped' | 'alreadyDropped' | 'reason'> {
+  const hasRequests = promotionRequestsTableExists(database);
+  const requestRows = hasRequests
+    ? database.prepare(`SELECT id, orchestration_id, state FROM promotion_requests`).all() as Array<{
+        id: string; orchestration_id: string | null; state: string;
+      }>
+    : [];
+  const pendingRequestIds = requestRows.filter((row) => row.state === 'pending').map((row) => row.id);
+  const requestByRun = new Map<string, string[]>();
+  for (const row of requestRows) {
+    if (!row.orchestration_id) continue;
+    const ids = requestByRun.get(row.orchestration_id) ?? [];
+    ids.push(row.id);
+    requestByRun.set(row.orchestration_id, ids);
+  }
+
+  const promotionRuns = database.prepare(
+    `SELECT run_id, status FROM orchestrations WHERE name = 'promotion'`,
+  ).all() as Array<{ run_id: string; status: string }>;
+  const runIds = new Set(promotionRuns.map((run) => run.run_id));
+  const nonterminalRunIds = promotionRuns
+    .filter((run) => run.status === 'starting' || run.status === 'running')
+    .map((run) => run.run_id);
+  const orphanNonterminalRunIds = nonterminalRunIds.filter((runId) => !requestByRun.has(runId));
+
+  const pointerDisagreement = new Set<string>();
+  for (const row of requestRows) {
+    if (row.orchestration_id && !runIds.has(row.orchestration_id)) pointerDisagreement.add(row.id);
+  }
+  for (const ids of requestByRun.values()) {
+    if (ids.length > 1) ids.forEach((id) => pointerDisagreement.add(id));
+  }
+  if (hasRequests) {
+    const reservedForRun = database.prepare(
+      `SELECT payload FROM orchestration_events
+        WHERE run_id = ? AND kind = 'promotion.reserved' ORDER BY id ASC`,
+    );
+    for (const request of requestRows) {
+      if (!request.orchestration_id || !runIds.has(request.orchestration_id)) continue;
+      const events = reservedForRun.all(request.orchestration_id) as Array<{ payload: string | null }>;
+      const matches = events.filter((event) => {
+        try {
+          const payload = event.payload ? JSON.parse(event.payload) as { requestId?: unknown } : null;
+          return payload?.requestId === request.id;
+        } catch { return false; }
+      });
+      // Historical retry runs may carry older reservation events. Only the run
+      // currently pointed to by the request must prove this exact request id.
+      if (matches.length !== 1) pointerDisagreement.add(request.id);
+    }
+  }
+
+  return {
+    pendingRequestIds,
+    nonterminalRunIds,
+    orphanNonterminalRunIds,
+    pointerDisagreementRequestIds: [...pointerDisagreement],
+  };
+}
+
+/** Drop the legacy request table atomically only after the caller proves its
+ * single-flight drain has settled and all external bound-agent checks passed. */
+export function dropLegacyPromotionRequestsIfReady(
+  input: { activeDrain: boolean; unverifiedLiveBoundAgentIds: readonly string[] },
+  database: Database.Database = db,
+): LegacyPromotionRetirementResult {
+  ensureAppliedMigrationsTable(database);
+  const empty = {
+    pendingRequestIds: [], nonterminalRunIds: [], orphanNonterminalRunIds: [],
+    pointerDisagreementRequestIds: [],
+  };
+  if (hasAppliedMigration(database, LEGACY_PROMOTION_REQUESTS_DROP_MARKER)) {
+    return { dropped: false, alreadyDropped: true, reason: 'already-dropped', ...empty };
+  }
+  const blockers = readLegacyPromotionRetirementBlockers(database);
+  const blocked = (reason: LegacyPromotionRetirementReason): LegacyPromotionRetirementResult => ({
+    dropped: false, alreadyDropped: false, reason, ...blockers,
+  });
+  if (input.activeDrain) return blocked('active-drain');
+  if (input.unverifiedLiveBoundAgentIds.length > 0) return blocked('unverified-live-bound-agent');
+  if (blockers.pendingRequestIds.length > 0) return blocked('pending-requests');
+  if (blockers.nonterminalRunIds.length > 0) return blocked('nonterminal-promotion-runs');
+  if (blockers.pointerDisagreementRequestIds.length > 0) return blocked('pointer-disagreement');
+
+  database.transaction(() => {
+    const rechecked = readLegacyPromotionRetirementBlockers(database);
+    if (rechecked.pendingRequestIds.length > 0
+        || rechecked.nonterminalRunIds.length > 0
+        || rechecked.pointerDisagreementRequestIds.length > 0) {
+      throw new Error('legacy promotion retirement blockers changed during the drop transaction');
+    }
+    database.exec(`DROP TABLE IF EXISTS promotion_requests`);
+    database.prepare(
+      `INSERT OR IGNORE INTO applied_migrations (name, applied_at) VALUES (?, ?)`,
+    ).run(LEGACY_PROMOTION_REQUESTS_DROP_MARKER, new Date().toISOString());
+  })();
+  return { dropped: true, alreadyDropped: false, reason: 'dropped', ...empty };
 }
 
 export interface PlanFolderProjectionState {
@@ -8845,6 +8981,7 @@ export function insertOrReadPromotionRequest(input: {
 }
 
 export function getPromotionRequestById(id: string): PromotionRequestRow | null {
+  if (!promotionRequestsTableExists()) return null;
   const row = queryOne('SELECT * FROM promotion_requests WHERE id = ?', [id]);
   return row ? rowToPromotionRequest(row) : null;
 }
@@ -8852,6 +8989,7 @@ export function getPromotionRequestById(id: string): PromotionRequestRow | null 
 export function getPromotionRequestByProposal(
   workspaceId: string, proposalArtifactId: string,
 ): PromotionRequestRow | null {
+  if (!promotionRequestsTableExists()) return null;
   const row = queryOne(
     'SELECT * FROM promotion_requests WHERE workspace_id = ? AND proposal_artifact_id = ?',
     [workspaceId, proposalArtifactId],
@@ -8860,6 +8998,7 @@ export function getPromotionRequestByProposal(
 }
 
 export function getPromotionRequestByOrchestration(orchestrationId: string): PromotionRequestRow | null {
+  if (!promotionRequestsTableExists()) return null;
   const row = queryOne(
     'SELECT * FROM promotion_requests WHERE orchestration_id = ?',
     [orchestrationId],
@@ -8868,8 +9007,66 @@ export function getPromotionRequestByOrchestration(orchestrationId: string): Pro
 }
 
 export function listPendingPromotionRequests(): PromotionRequestRow[] {
+  if (!promotionRequestsTableExists()) return [];
   return queryAll("SELECT * FROM promotion_requests WHERE state = 'pending' ORDER BY created_at ASC")
     .map(rowToPromotionRequest);
+}
+
+export function listPromotionRequests(): PromotionRequestRow[] {
+  if (!promotionRequestsTableExists()) return [];
+  return queryAll('SELECT * FROM promotion_requests ORDER BY created_at ASC').map(rowToPromotionRequest);
+}
+
+export function recordLegacyPromotionPendingDiagnostic(
+  requestId: string,
+  diagnostic: string,
+  nowMs: number = Date.now(),
+): void {
+  if (!promotionRequestsTableExists()) return;
+  run(
+    `UPDATE promotion_requests SET failure_reason = ?, updated_at = ?
+      WHERE id = ? AND state = 'pending'`,
+    [diagnostic, nowMs, requestId],
+  );
+}
+
+export function repairLegacyPromotionRequestPointer(
+  requestId: string,
+  orchestrationId: string,
+  nowMs: number = Date.now(),
+): void {
+  if (!promotionRequestsTableExists()) return;
+  run(
+    `UPDATE promotion_requests SET orchestration_id = ?, failure_reason = NULL, updated_at = ?
+      WHERE id = ? AND state = 'pending'`,
+    [orchestrationId, nowMs, requestId],
+  );
+}
+
+export function terminalizeLegacyPromotionRequest(input: {
+  requestId: string;
+  requestState: 'adopted' | 'failed';
+  reason: string | null;
+  runId?: string | null;
+  runStatus?: 'complete' | 'aborted' | 'error';
+  nowIso: string;
+  nowMs?: number;
+}): void {
+  if (!promotionRequestsTableExists()) return;
+  getDb().transaction(() => {
+    if (input.runId && input.runStatus) {
+      run(
+        `UPDATE orchestrations SET status = ?, error = ?, ended_at = ?, updated_at = ?
+          WHERE run_id = ? AND name = 'promotion'`,
+        [input.runStatus, input.reason, input.nowIso, input.nowIso, input.runId],
+      );
+    }
+    run(
+      `UPDATE promotion_requests SET state = ?, failure_reason = ?, updated_at = ?
+        WHERE id = ? AND state = 'pending'`,
+      [input.requestState, input.reason, input.nowMs ?? Date.now(), input.requestId],
+    );
+  })();
 }
 
 /** Phase 1 (§R-P3 points 5, 6) — reserve the promotion orchestration row AND bind

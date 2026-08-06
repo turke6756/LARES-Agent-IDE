@@ -46,6 +46,7 @@ class FakeBetterSqlite {
   }
 
   pragma(_sql: string): unknown { return undefined; }
+  close(): void { /* persisted store intentionally retained across boot fixtures */ }
   exec(sql: string): this { this.db.exec(sql); return this; }
   prepare(sql: string) {
     const inner = this.db;
@@ -103,7 +104,15 @@ class FakeBetterSqlite {
 
 type DbModule = {
   initDatabase(): void;
+  closeDatabaseForTests(): void;
   createWorkspace(input: { title: string; path: string; pathType: string }): { id: string };
+  insertOrchestration(run: Record<string, unknown>): void;
+  getOrchestrationRun(runId: string): Record<string, unknown> | null;
+  updateOrchestration(run: Record<string, unknown>): void;
+  dropLegacyPromotionRequestsIfReady(input: {
+    activeDrain: boolean; unverifiedLiveBoundAgentIds: readonly string[];
+  }): { dropped: boolean; reason: string; orphanNonterminalRunIds: string[] };
+  LEGACY_PROMOTION_REQUESTS_DROP_MARKER: string;
 };
 
 let dbm: DbModule;
@@ -177,6 +186,68 @@ test('the DDL is idempotent — CREATE TABLE IF NOT EXISTS never throws or drops
   const after = FakeBetterSqlite.rawAll(
     `SELECT COUNT(*) AS n FROM promotion_requests WHERE id='pr-idem'`)[0].n;
   assert.equal(after, before, 'a second migration pass must not throw or drop data');
+});
+
+test('one orphan nonterminal promotion run blocks retirement', () => {
+  dbm.insertOrchestration({
+    runId: 'orphan-promotion', name: 'promotion', mode: 'serial', status: 'starting',
+    workspaceId: 'ws-1', supervisorId: 'sup-1', topic: 'legacy', planPath: '.lares/plans/x',
+    leadProvider: 'claude', reviewerProvider: 'claude', turnTimeoutMs: 1,
+    lastRelayedTs: {}, startedAt: '2026-08-06T00:00:00.000Z', updatedAt: '2026-08-06T00:00:00.000Z',
+  });
+  const pending = dbm.dropLegacyPromotionRequestsIfReady({
+    activeDrain: false, unverifiedLiveBoundAgentIds: [],
+  });
+  assert.equal(pending.dropped, false);
+  assert.equal(pending.reason, 'pending-requests', 'pending rows fail closed before other blockers');
+  FakeBetterSqlite.rawExec(`UPDATE promotion_requests SET state='failed' WHERE state='pending'`);
+  const orphan = dbm.dropLegacyPromotionRequestsIfReady({
+    activeDrain: false, unverifiedLiveBoundAgentIds: [],
+  });
+  assert.equal(orphan.reason, 'nonterminal-promotion-runs');
+  assert.deepEqual(orphan.orphanNonterminalRunIds, ['orphan-promotion']);
+});
+
+test('active drain and unverified live bound agent independently block retirement', () => {
+  const run = dbm.getOrchestrationRun('orphan-promotion')!;
+  dbm.updateOrchestration({ ...run, status: 'aborted' });
+  assert.equal(
+    dbm.dropLegacyPromotionRequestsIfReady({ activeDrain: true, unverifiedLiveBoundAgentIds: [] }).reason,
+    'active-drain',
+  );
+  assert.equal(
+    dbm.dropLegacyPromotionRequestsIfReady({ activeDrain: false, unverifiedLiveBoundAgentIds: ['agent-live'] }).reason,
+    'unverified-live-bound-agent',
+  );
+});
+
+test('clean awaited retirement drops once and boot 2 never recreates promotion_requests', () => {
+  const first = dbm.dropLegacyPromotionRequestsIfReady({
+    activeDrain: false, unverifiedLiveBoundAgentIds: [],
+  });
+  assert.equal(first.dropped, true);
+  assert.equal(first.reason, 'dropped');
+  assert.equal(
+    FakeBetterSqlite.rawAll(`SELECT name FROM sqlite_master WHERE type='table' AND name='promotion_requests'`).length,
+    0,
+  );
+  const marker = FakeBetterSqlite.rawAll(
+    `SELECT name FROM applied_migrations WHERE name=?`,
+    [dbm.LEGACY_PROMOTION_REQUESTS_DROP_MARKER],
+  );
+  assert.equal(marker.length, 1);
+
+  dbm.closeDatabaseForTests();
+  dbm.initDatabase();
+  assert.equal(
+    FakeBetterSqlite.rawAll(`SELECT name FROM sqlite_master WHERE type='table' AND name='promotion_requests'`).length,
+    0,
+    'boot 2 skips CREATE after the retirement marker',
+  );
+  const again = dbm.dropLegacyPromotionRequestsIfReady({
+    activeDrain: false, unverifiedLiveBoundAgentIds: [],
+  });
+  assert.equal(again.reason, 'already-dropped');
 });
 
 (async () => {

@@ -54,20 +54,13 @@ import { shutdownJupyterServer } from './jupyter-server';
 import { disposeKernelClient } from './jupyter-kernel-client';
 import { closeAllWatchers as closeAllFsWatchers } from './fs-watcher';
 import { startPlansWatcher, PlansWatcher } from './plans-watcher';
-import { reconcilePendingPromotions } from './plans/promotion-reconciler';
-import { adoptPlanFolder } from './plans/plan-folder-watcher';
-import {
-  makeEnrichAdoptedPlan, promoteProposal, defaultBuildDispatch, deriveResponsibilityEventId,
-  type ProposalRef, type PromoteProposalDeps,
-} from './plans/promote-proposal';
+import { LegacyPromotionDrain } from './plans/legacy-promotion-drain';
 import {
   PromotionDeliveryInspectorImpl,
   type TurnStartWitness, type PromotionDeliverer,
 } from './plans/promotion-dispatch';
-import { providePromotionService, providePlanPreviewRoutes, type PromotionService } from './plans/plan-ipc';
+import { providePromotionService, providePlanPreviewRoutes } from './plans/plan-ipc';
 import { makePromotionClaimScan } from './plans/promotion-claim-scan';
-import { getProposalById } from './plans/plan-gallery';
-import type { PromotionRequestRow } from './database';
 import { JUPYTER_BASE_PORT, JUPYTER_PORT_RETRIES } from './control-ports';
 import { buildChromeUA } from './browser/browser-decisions';
 import { BrowserManager } from './browser/browser-manager';
@@ -993,116 +986,55 @@ app.whenReady().then(async () => {
     // can never observe a stale pre-retry port.
     const apiPort = await apiServer.start();
     supervisor.setApiServerPort(apiPort);
-    plansWatcher = startPlansWatcher();
-    // ── WP-P3-wire — promotion runtime assembly ─────────────────────────────
-    // Close the seams WP-P3C′ + WP-P3-reconcile left open. Build the deps-bound
-    // WP-P3B-core promotion service (resolveProposal + claim-scan + the supervisor
-    // deliverer + WP-P3B-enrich), inject it into plan-ipc so `proposal:promote` /
-    // `proposal:promotionStatus` go LIVE, then hand the SAME oracle + a fresh-dispatch
-    // route to the pending-promotion reconciler so the delivery branches run at boot.
     const promotionDeliverer: PromotionDeliverer = supervisor;
-    // Absolute plans-home + workspace roots (WSL folders resolve to their \\wsl$ UNC
-    // form). Shared by the enrich saga, the claim-scan, and the delivery oracle.
     const resolvePlansHomeRoot = (workspaceId: string): string => {
       const ws = getWorkspace(workspaceId);
       if (!ws) throw new Error(`[promotion] workspace not found: ${workspaceId}`);
       const home = path.join(workspaceStateDir(ws.path, ws.pathType), 'plans');
       return ws.pathType === 'wsl' ? wslToWindowsPath(home) : home;
     };
-    const resolveWorkspaceRoot = (workspaceId: string): string => {
-      const ws = getWorkspace(workspaceId);
-      if (!ws) throw new Error(`[promotion] workspace not found: ${workspaceId}`);
-      return ws.pathType === 'wsl' ? wslToWindowsPath(ws.path) : ws.path;
-    };
-    // resolveProposal: proposals-row → the WP-P3B-core ProposalRef (disk-truth path
-    // + portable artifact id). Null (no artifact id / missing row) → the IPC layer
-    // rejects honestly.
-    const resolveProposal = (proposalId: string): ProposalRef | null => {
-      const rec = getProposalById(proposalId);
-      if (!rec || !rec.artifactId) return null;
-      return { proposalId: rec.id, artifactId: rec.artifactId, relPath: rec.path, workspaceId: rec.workspaceId };
-    };
-    const enrichAdoptedPlan = makeEnrichAdoptedPlan({ resolvePlansHomeRoot, resolveWorkspaceRoot });
-    const promoteProposalDeps: PromoteProposalDeps = {
-      resolveProposal,
-      scanClaims: makePromotionClaimScan({ resolvePlansHomeRoot }),
-      deliverer: promotionDeliverer,
-      enrichAdoptedPlan,
-    };
-    const promotionService: PromotionService = {
-      promote: (input) => promoteProposal(input, promoteProposalDeps),
-      resolveProposal,
-    };
-    // proposal:promote + proposal:promotionStatus are now LIVE (they rejected
-    // honestly until this injection).
-    providePromotionService(promotionService);
-
-    // Delivery oracle for the reconciler. The turn-start witness MUST be durable —
-    // the in-memory monitor's start-hook signal resets on restart and would
-    // misclassify a delivered-but-unstamped attempt as submitted-unconfirmed. The
-    // durable ground truth is the `turn_records` spine: a bound promotion worker that
-    // began its first turn has a row with `started_at >= run.startedAt`. This is a
-    // pure DB read (no new supervisor surface required).
     const turnStartWitness: TurnStartWitness = (agentId, sinceIso) => {
-      const ag = getAgent(agentId);
-      if (!ag) return false;
+      const agent = getAgent(agentId);
+      if (!agent) return false;
       const sinceMs = sinceIso ? Date.parse(sinceIso) : NaN;
-      const rows = listTurnRecords(ag.workspaceId, {
+      return listTurnRecords(agent.workspaceId, {
         agentId,
         sinceTime: Number.isFinite(sinceMs) ? sinceMs : undefined,
         limit: 1,
-      });
-      return rows.length > 0;
+      }).length > 0;
     };
-    // promptFactory / launchInputFactory build the IDENTICAL body + launch input a
-    // first dispatch carries, from a bare request row (resolving the proposal for its
-    // disk-truth path). Used by resumeDelivery's full re-send + reserved-unbound
-    // re-bind.
-    const buildDispatchFor = (req: PromotionRequestRow) => {
-      const proposal = resolveProposal(req.proposalId)
-        ?? { proposalId: req.proposalId, artifactId: req.proposalArtifactId, relPath: '', workspaceId: req.workspaceId };
-      return defaultBuildDispatch({
-        request: req, proposal, responsibilityEventId: deriveResponsibilityEventId(req.id), marker: `promotion:${req.id}`,
-      });
-    };
-    const promotionInspector = new PromotionDeliveryInspectorImpl(
-      promotionDeliverer,
-      turnStartWitness,
-      (req) => { const b = buildDispatchFor(req); return { prompt: b.prompt, marker: b.marker }; },
-      () => new Date().toISOString(),
-      (req) => buildDispatchFor(req).launchInput,
-    );
-    // dispatchFresh (not-reserved): route through the assembled service so a fresh
-    // claim + planning-lane dispatch reuses the WP-P3B-core front half (dedup + latch
-    // coalescing) — never a bespoke second dispatch path.
-    const dispatchFreshPromotion = async (req: PromotionRequestRow): Promise<void> => {
-      await promotionService.promote({ proposalId: req.proposalId, supervisorId: req.supervisorId ?? '' });
-    };
-
-    // WP-P3-reconcile (§R-P3 point 6) — pending-promotion startup reconstruction.
-    // After the folder watcher's boot pass, rebuild the in-memory pending latches from
-    // the durable `promotion_requests` rows and drive each still-pending request to
-    // convergence per the crash matrix (resume / enrich / dispatch), re-acquiring each
-    // latch so a concurrent live promote coalesces. Idempotent, safe every boot.
-    // Planning-lane only (Amendment 10) — never EXECUTION dispatch (Amendment 1c).
-    // Fire-and-forget with a guard so it never blocks or crashes boot.
-    void reconcilePendingPromotions({
-      inspector: promotionInspector,
-      dispatchFresh: dispatchFreshPromotion,
-      adoptPlanFolder: (req) => {
-        const ws = getWorkspace(req.workspaceId);
-        if (!ws) return Promise.resolve({ adopted: false, reason: 'absent' as const });
-        return adoptPlanFolder(ws, req.targetFolderRelPath);
-      },
-      enrichAdoptedPlan,
-    })
-      .then((report) => {
+    const legacyPromotionDrain = new LegacyPromotionDrain({
+      inspector: new PromotionDeliveryInspectorImpl(
+        promotionDeliverer,
+        turnStartWitness,
+        () => new Date().toISOString(),
+      ),
+      scanClaims: makePromotionClaimScan({ resolvePlansHomeRoot }),
+      hasLiveRuntime: (agentId) => supervisor!.hasRunner(agentId),
+      stopAgent: (agentId) => supervisor!.stopAgent(agentId, { reason: 'supervisor' }),
+      onDiagnostic: (requestId, detail) => console.warn('[legacy promotion drain]', requestId, detail),
+    });
+    // The legacy mutation/status IPC remains intentionally unwired. No steady-
+    // state path can create a promotion_requests row after WP-I.
+    providePromotionService(null);
+    plansWatcher = startPlansWatcher({
+      onPlanFolderSettled: async () => {
+        const report = await legacyPromotionDrain.drainAndRetire();
         if (report.processed > 0) {
-          console.log(`[promotion reconcile] boot: ${report.processed} pending, ${report.diagnostics.length} diagnostic(s)`);
-          for (const d of report.diagnostics) console.warn('[promotion reconcile]', d.requestId, d.detail);
+          console.log(`[legacy promotion drain] settlement: ${report.processed} request(s), retirement=${report.retirement.reason}`);
         }
-      })
-      .catch((err) => console.error('[promotion reconcile] boot sweep failed', err));
+      },
+    });
+    // Await the boot drain. Boot folder callbacks may be detached, but this scan
+    // independently finds every artifact claimant and joins the coordinator's
+    // single-flight before retirement can be evaluated.
+    const legacyBootReport = await legacyPromotionDrain.drainAndRetire();
+    if (legacyBootReport.processed > 0 || legacyBootReport.retirement.dropped) {
+      console.log(
+        `[legacy promotion drain] boot: ${legacyBootReport.processed} request(s), ` +
+        `retirement=${legacyBootReport.retirement.reason}`,
+      );
+    }
     // Context-brick Inc 5A — replace the relaunch route's conservative
     // awaiting-human stub with the real predicate (question-waiting latch OR
     // idle + ends-with-question cache).
