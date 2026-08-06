@@ -1,8 +1,12 @@
 ---
 artifact_id: prop_ms8b41e7
 title: Multi-provider supervisors — let any agent harness hold the supervisor lane
+author: "Testing Grok and Anti" (workspace supervisor, AgentDashboard)
+author_agent_id: 31b5c10c-aab0-4990-be3b-c715f4f45b6b
 author_role: supervisor
+author_provider: claude
 authored_at: 2026-08-04T22:30:00-07:00
+amended_at: 2026-08-06
 ---
 
 # Proposal: multi-provider supervisors

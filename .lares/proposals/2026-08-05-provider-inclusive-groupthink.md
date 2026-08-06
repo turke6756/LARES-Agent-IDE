@@ -1,8 +1,12 @@
 ---
 artifact_id: prop_pigt5a83
 title: Provider-inclusive GroupThink + user-shapeable provider selection
+author: "expanding groupthinks to other providers" (workspace supervisor, AgentDashboard)
+author_agent_id: e7927835-d0ab-407e-86af-be6de72c2cc1
 author_role: supervisor
+author_provider: claude
 authored_at: 2026-08-05T00:30:00-07:00
+amended_at: 2026-08-06
 promoted_to: 2026-08-05-provider-inclusive-groupthink-user-shapeable-pro-pigt5a83
 promoted_at: 2026-08-05
 ---

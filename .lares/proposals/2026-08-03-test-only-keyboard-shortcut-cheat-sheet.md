@@ -1,8 +1,12 @@
 ---
 artifact_id: prop_e3a91c4f
 title: "TEST-ONLY: keyboard shortcut cheat-sheet overlay"
+author: "Planning-skill Wave-1 test run" (workspace supervisor, AgentDashboard)
+author_agent_id: ee7110d7-3e00-4c05-bf7c-f170242134aa
 author_role: supervisor
+author_provider: claude
 authored_at: 2026-08-03T00:00:00Z
+amended_at: 2026-08-06
 promoted_to: 2026-08-03-test-only-keyboard-shortcut-cheat-sheet-overlay-e3a91c4f
 promoted_at: 2026-08-03
 ---

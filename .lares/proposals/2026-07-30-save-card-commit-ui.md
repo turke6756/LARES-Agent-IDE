@@ -1,8 +1,12 @@
 ---
 artifact_id: prop_4c8d21b7
 title: Save card — uncommitted-work visibility and one-click commit staging
+author: "Plans" (workspace supervisor, AgentDashboard)
+author_agent_id: 4d98780c-1c95-4378-8031-eece84efad0c
 author_role: supervisor
+author_provider: claude
 authored_at: 2026-07-30T20:10:00Z
+amended_at: 2026-08-06
 ---
 
 # Save card: uncommitted-work visibility and commit staging
