@@ -823,7 +823,6 @@ test('Grok identity: git-discard section survived byte-identical; blocking-dialo
 
 const P2P_REL_FILES = [
   'SKILL.md',
-  'references/activities/capture.md',
   'references/activities/scope.md',
   'references/activities/promote.md',
   'references/activities/deliberate.md',
@@ -846,6 +845,8 @@ test('WP-P0C: fresh Claude worker scaffold writes the whole proposal-to-plan tre
     for (const rel of P2P_REL_FILES) {
       assert.ok(fs.existsSync(path.join(root, ...rel.split('/'))), `claude worker root missing ${rel}`);
     }
+    assert.ok(!fs.existsSync(path.join(root, 'references', 'activities', 'capture.md')),
+      'retired capture.md must not be written to a fresh Claude worker scaffold');
     assert.equal(fs.readFileSync(path.join(root, 'SKILL.md'), 'utf-8'), PROPOSAL_TO_PLAN_SKILL_MD,
       'SKILL.md must be the exact bundled content');
   } finally {
@@ -863,6 +864,8 @@ test('WP-P0C: fresh Codex worker scaffold writes the whole proposal-to-plan tree
     for (const rel of P2P_REL_FILES) {
       assert.ok(fs.existsSync(path.join(root, ...rel.split('/'))), `codex worker root missing ${rel}`);
     }
+    assert.ok(!fs.existsSync(path.join(root, 'references', 'activities', 'capture.md')),
+      'retired capture.md must not be written to a fresh Codex worker scaffold');
     assert.equal(fs.readFileSync(path.join(root, 'SKILL.md'), 'utf-8'), PROPOSAL_TO_PLAN_SKILL_MD,
       'SKILL.md must be the exact bundled content in the codex root');
   } finally {

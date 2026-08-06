@@ -5603,33 +5603,32 @@ from the Plans pane.
 export const PROPOSAL_TO_PLAN_SKILL_MD = `---
 name: proposal-to-plan
 description: >-
-  The house method for carrying a proposal to an implementation plan with
-  work packages — capture, scope (hardening triage + markup), promote (scaffold
-  the plan folder), deliberate, integrate, package, and orient. Use whenever you
-  author a proposal in .lares/proposals/, harden one into a plan folder under
-  <workspaceStateDir()>/plans/, or pick up an existing plan folder. One skill
-  root; the folder on disk is the resumable source of truth.
+  Promotion-entry method for turning the proposal selected by the Plans pane
+  into an implementation plan with work packages. Invoke only from the injected
+  promotion prompt, then scope, promote, deliberate, integrate, package, or
+  orient from the plan folder on disk, which is the resumable source of truth.
 ---
 
 # proposal-to-plan — dispatcher
 
-This skill carries a proposal all the way to an implementation plan: **capture → scope(+mark) →
-promote → deliberate → integrate → package**, with **orient** as the re-entry read. The **plan
-folder on disk is the resumable source of truth**; the responsible supervisor plus this skill's
-policy drives the work; \`orient\` derives the *known* state and offers *safe* next actions. There is
-**one** skill root — no second root, no journey driver process, no new orchestration.
+This skill begins only when the Plans pane injects its promotion prompt for a selected flat
+proposal. From that entry it carries the proposal through **scope(+mark) → promote → deliberate →
+integrate → package**, with **orient** as the responsible-supervisor re-entry method library. The
+**plan folder on disk is the resumable source of truth**; the responsible supervisor plus this
+skill's policy drives the work. Proposal creation belongs to the separate \`write-proposal\` skill.
+There is **one** promotion skill root — no second root, no journey driver process, no new
+orchestration.
 
-## Pick a mode (seven public entries)
+## Pick a mode (six public entries)
 
 | Mode | What it does | Playbook |
 |---|---|---|
-| \`capture\` | Write a stamped **flat** proposal in \`.lares/proposals/\`; zero ceremony. Terminal-valid. | \`references/activities/capture.md\` |
 | \`scope\` | **First hardening step:** triage what needs deliberation/research, **mark the flat proposal** (PLAN-INTENT), and record the required dated \`## Hardening scope\` verdict. **Owns marking.** | \`references/activities/scope.md\` |
 | \`promote\` | Atomic **complete-folder** scaffold (§R0) via temp-dir → rename, \`plan.md\` already inside. | \`references/activities/promote.md\` |
 | \`deliberate\` | Launch the **existing** groupthink/researcher lane keyed to **one** marked intent. | \`references/activities/deliberate.md\` |
 | \`integrate\` | Validate a returned output; **fold by Markdown-link + PLAN-INTEGRATION**; refresh \`ARC.md\`. | \`references/activities/integrate.md\` |
 | \`package\` | **Last step:** decompose into bundle-shaped WPs + create-or-verify the \`plan-baseline\` tag. | \`references/activities/package.md\` |
-| \`orient\` | **Re-entry read.** Derive every intent's rung from disk; report safe next actions. Owns the decision table. | \`references/activities/orient.md\` |
+| \`orient\` | **Responsible-supervisor re-entry methods.** Determine responsibility and refresh ARC-META/ARC; cross-surface reporting is split to \`read-planning-surface\`. | \`references/activities/orient.md\` |
 
 ## Hardening continuity
 
@@ -5645,14 +5644,14 @@ routes to; load only the one you need. Contracts live once under \`references/co
 
 ## Lane rules (who may run what)
 
-- **\`orient\` — anyone.** Its derivation and reporting are **read-only** for every runner: it never
-  launches, never auto-relaunches, and a non-supervisor lane never mutates the plan — so a
-  non-supervisor may **always** run it. The **one** exception is the ARC-META/ARC refresh (orient
-  step 4): that is a mutation, so it runs **only when the runner is the plan's current responsible
-  supervisor** (the last \`assigned\` event in \`plan.json\`); any other runner performs the read-only
-  derivation + report and **skips the refresh**. Judgment-bearing next actions it surfaces are
-  **gated on the responsible supervisor.** Orient-first is a standing rule: on picking up a plan
-  folder, \`plan.json\` + \`ARC.md\` + intent markers are the **FIRST** place you look.
+- **\`orient\` — anyone may determine responsibility.** Apply
+  \`references/contracts/responsibility.md\` §Determination first. The ARC-META/ARC refresh is a
+  mutation, so it runs **only when the runner is the plan's current responsible supervisor**; any
+  other runner **skips the refresh**. Cross-surface disk-state derivation and reporting belongs to
+  \`read-planning-surface\`, which is read-only for every runner and never launches or
+  auto-relaunches. Judgment-bearing next actions remain **gated on the responsible supervisor.**
+  Orient-first is a standing rule: on picking up a plan folder, \`plan.json\` + \`ARC.md\` + intent
+  markers are the **FIRST** place you look.
 - **\`mark\` (inside \`scope\`) / \`integrate\` / \`package\` — the responsible supervisor ONLY.** The
   current responsible supervisor = the **last \`assigned\` event** in \`plan.json\`. A non-supervisor
   lane that reaches these is **rejected and instructed** to hand off.
@@ -5660,9 +5659,8 @@ routes to; load only the one you need. Contracts live once under \`references/co
   (via the helper, under the lock) **before** any mutation. Read-only \`orient\` is allowed without
   reassignment; a mutation without a fresh \`assigned\` event is **refused**.
 - \`ARC.md\` is **supervisor-owned** — created at \`promote\`; its ARC-META/ARC refresh is performed by
-  the **responsible supervisor** via \`orient\`/\`integrate\` (a non-supervisor \`orient\` reports but does
-  **not** refresh).
-- \`capture\` is open to anyone (a worker may author with \`author_role: worker\`).
+  the **responsible supervisor** via \`orient\`/\`integrate\`; \`read-planning-surface\` provides the
+  read-only report without refreshing.
 
 ## Rung ladder (in brief — full text in \`references/contracts/intent-lifecycle.md\`)
 
@@ -5685,7 +5683,7 @@ stay native supervisor edits. (\`references/contracts/manifest-lock.md\`.)
 
 ## Dispatcher contract — mode selection replaces any per-turn sentinel
 
-Choosing and running one of the seven modes **is** this skill's turn obligation. **Mode selection
+Choosing and running one of the six modes **is** this skill's turn obligation. **Mode selection
 replaces any per-turn PLAN-EVENT sentinel obligation** — the durable record is the plan folder's
 artifacts (\`plan.json\`, \`plan.md\` markup/integration sentinels, \`ARC.md\`), which the surface reads;
 you do **not** owe a per-turn sentinel while working this skill. (PLAN-INTENT / PLAN-INTEGRATION are
@@ -6143,19 +6141,20 @@ and stop. The plan is **dispatch-ready**, but implementation is a separate expli
 
 export const PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD = `# Activity playbook — \`orient\`
 
-**Purpose.** The **re-entry interpreter**. On any pickup of an existing plan folder, \`orient\` derives
-the **known** lifecycle state from disk evidence and presents **safe** next actions — **before doing
-anything new** (ruling 23/30, orient-first). Re-entry is a **read**, not a process to resume.
+**Purpose.** The responsible-supervisor **re-entry method library**. It retains the two steps that
+gate or perform plan-folder writes: determine responsibility, then refresh \`ARC.md\`/\`ARC-META\`
+without clobbering prose. Cross-surface disk-state derivation and reporting has moved to the
+read-only \`read-planning-surface\` skill; use that skill for the lifecycle report and safe next
+actions.
 
-**Lane. Anyone may run \`orient\`** — its derivation + reporting are **read-only**: it never launches,
-never auto-relaunches, and a non-supervisor runner never mutates the plan. **Exception:** the
-ARC-META/ARC refresh (step 4) is a mutation, performed **only when the runner is the plan's current
-responsible supervisor** (the last \`assigned\` event in \`plan.json\`); any other runner does the
-read-only derivation + report and **skips the refresh**. Judgment-bearing actions it surfaces are
-**gated on the responsible supervisor**.
+**Lane.** Anyone may perform the read-only responsibility determination. The ARC-META/ARC refresh
+is a mutation and is performed **only when the runner is the plan's current responsible
+supervisor**; any other runner **SKIPS the refresh**. Judgment-bearing actions remain **gated on the
+responsible supervisor**.
 
 **Contracts loaded.** \`references/contracts/folder-schema.md\` (§R0), \`references/contracts/intent-lifecycle.md\`
-(§R1 rungs), \`references/contracts/arc.md\` (§R2 — refresh on re-run), and
+(§R1 rungs), \`references/contracts/arc.md\` (§R2 — refresh on re-run),
+\`references/contracts/responsibility.md\` (§Determination), and
 \`references/contracts/manifest-lock.md\` (read-only \`inspect\` only — orient never mutates \`plan.json\`).
 
 ---
@@ -6163,58 +6162,22 @@ read-only derivation + report and **skips the refresh**. Judgment-bearing action
 ## Steps
 
 1. **Inspect the folder.** Run \`scripts/plan-manifest.mjs inspect\` (read-only \`plan.json\` + folder
-   listing) and read \`ARC.md\` + the PLAN-INTENT / PLAN-INTEGRATION sentinels.
-2. **Derive every intent's rung from disk** per §R1: marked → (\`ran\` **unavailable**) → returned →
-   folded-in. Report each intent independently (multiple outputs each listed).
-3. **Report launch-state honestly.** \`ran\` is server-witnessed and **unavailable from disk pre-P2L**;
-   \`orient\` **never auto-relaunches**. A detached deliberation may be running with no artifact yet.
-4. **Refresh \`ARC.md\`/\`ARC-META\` — responsible supervisor ONLY.** This step is a mutation, so run it
-   **only if you are the plan's current responsible supervisor** (the last \`assigned\` event in
-   \`plan.json\`, surfaced as \`current_responsible\` by \`inspect\`); **any other runner SKIPS this step**
-   and simply reports the derived state. When you do refresh: route the mechanical **ARC-META** update
+   listing) and read \`ARC.md\`.
+2. **Determine responsibility.** Apply
+   \`references/contracts/responsibility.md\` §Determination. This is the normative write gate; do
+   not duplicate its rules here. If another supervisor is responsible, stop without mutating or
+   reassigning and **SKIP the refresh**.
+3. **Refresh \`ARC.md\`/\`ARC-META\` — responsible supervisor ONLY.** This step is a mutation, so run it
+   **only if §Determination says you are the plan's current responsible supervisor**. Route the
+   mechanical **ARC-META** update
    (\`last_refreshed_at\`, \`folder_mtime_ms\`) through **\`scripts/plan-manifest.mjs refresh-arc --dir
    <plan-folder>\`**, which rewrites **only** the ARC-META block atomically — every prose section stays
    byte-identical, and \`ARC.md\`'s own mtime is excluded from the cutoff. Any **prose** refresh (a
    \`## Deliberations\` / \`## Who did what\` append) is a **native supervisor edit** that must **add** to,
    and never clobber, existing content (Accept 12).
-5. **Surface the safe next action** from the table below; **gate any judgment-bearing action on the
-   responsible supervisor.**
-
-## Decision table (from the recommendation doc, verbatim)
-
-| Disk evidence | \`orient\` reports | Safe next action |
-|---|---|---|
-| intent marked; \`ran\` unavailable; no present output | launch state **unknown** | inspect known run context; **ask the supervisor** whether to launch or rerun — do **not** auto-launch |
-| ≥1 valid \`active\` output, not referenced | returned, **unfolded → open** | \`integrate\` that exact output |
-| every present \`active\` output referenced | fully folded | continue hardening / \`package\` if otherwise ready |
-| output present but malformed / identity-mismatched | **invalid, not returned** | quarantine + report; do **not** integrate |
-| intent superseded / withdrawn | historical, **not open** | no launch, no integration |
-| explicit trivial-scope verdict present, no intents | scope complete; **hardening intentionally skipped** | proceed to hardening / \`package\` |
-| no intents **and** no explicit verdict | scope status **unknown/incomplete** | do **not** infer readiness; run/complete \`scope\` |
-
-## Rules & acceptance touchpoints
-
-- **\`ran\` reported unknown/unavailable without relaunching** (Accept 5).
-- **No-intents-no-verdict is reported as scope-incomplete**, never as ready (Accept 5). The explicit
-  \`## Hardening scope\` trivial verdict is what distinguishes "nothing needs hardening" from "scope
-  never happened" (Accept 2).
-- **Malformed frontmatter, \`..\`-traversal, broken/unresolved links, mixed \`\\\`/\`/\` separators** are
-  reported **invalid, not returned/folded** (Accept 10) — quarantine, never integrate.
-- **Multiple outputs** for one intent are surfaced **independently** (Accept 6) — one folded rerun
-  never hides another pending result.
-- **Re-run refreshes \`ARC.md\`/\`ARC-META\` without clobbering** (Accept 12) — the refresh runs **only**
-  for the responsible supervisor (step 4, via \`refresh-arc\` for ARC-META); any other runner reports
-  the derived state without refreshing.
-- **Read-only for non-supervisors**: orient's derivation + report is the one thing a non-supervisor
-  lane may run; the ARC-META/ARC refresh (step 4), \`mark\`/\`integrate\`/\`package\` it may not. Mutation
-  (including the refresh) by a new supervisor requires a fresh \`assigned\` reassignment event **first**
-  (Accept 7, 8).
-
-## The EEXIST resume path
-
-\`promote\` delegates its EEXIST decision to \`orient\`: read the occupant's
-\`source_proposal.artifact_id\` — **matching** → orient/resume against it; **mismatching** → report a
-**collision** and **block** (occupant untouched). See \`promote.md\`.
+4. **Read the planning surface.** Use \`read-planning-surface\` for the moved cross-surface lifecycle
+   derivation and report. That read-only skill owns the decision table and reporting rules; it does
+   not perform this playbook's responsibility-gated refresh.
 `;
 
 export const PROPOSAL_TO_PLAN_CONTRACT_ARC_MD = `# Contract reference — §R2: the ARC summary file
@@ -6646,6 +6609,9 @@ order \`tab\`, \`heading\`.
 export const PROPOSAL_TO_PLAN_CONTRACT_RESPONSIBILITY_MD = `# Contract reference — responsible supervisor
 
 ## Determination
+
+This section is the stable, normative responsibility-determination anchor. Playbooks that gate a
+mutation cite this section instead of invoking \`orient\` or copying the rules.
 
 The current responsible supervisor is the agent named by the **last \`assigned\` event** in
 \`plan.json.responsibility_events\`. Read it through \`scripts/plan-manifest.mjs inspect\`, which

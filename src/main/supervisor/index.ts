@@ -1270,27 +1270,38 @@ export const PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD_V1_HASH = '942e7dc9ac6b53119e3
 export const PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD_V2_HASH = '8e393b94dd27bd5a33e12c2c39a04a8c7ecc8e02a4a978e2f42aeda36cf422c2';
 export const PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V3_HASH = '54261f6c4a0c88ce5b281e98583c49dc2e58b16510da48d72e13f25619c31cb0';
 
+// WP-4 — promotion-entry split. Frozen hashes of the pristine pre-WP-4 bodies;
+// all prior history entries remain in the cumulative maps below.
+export const PROPOSAL_TO_PLAN_SKILL_MD_V3_HASH = '68bd246eb7907c247b1442fb80df5d44acec0a217decd8b782ac58bb496a68fc';
+export const PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V3_HASH = '34917448550d78f430bb3909f807398224003f5c08477b121a937093d39e767a';
+export const PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD_V2_HASH = '9d5263fb61bae51fe985fc95b9f121c7f72b0386059595efe6ca383a69a09c20';
+export const PROPOSAL_TO_PLAN_CONTRACT_RESPONSIBILITY_MD_V1_HASH = '64a1f0a1f880fec8c56f702e8560eacd82b1d447278376ce01598368eb73bbcf';
+
 // WP-P0C — proposal-to-plan skill tree deploy. One versioned content constant per
 // file (constants.ts); this manifest expands the tree under each of the four skill
 // roots (Claude+Codex x supervisor+worker). New-skill shape was version 1, no
 // previousHashes; WP-SKILLFIX bumps the five hardened files to v2 with a
 // previousHashes[1] so pristine v1 copies upgrade silently and hand-edited ones are
 // .bak'd. WP-AUTH-FM advances capture.md to v3 with previousHashes[2] for its
-// required display-author fields. WP-SKILLBUMP carries the two ca7ce2b-corrected carriers forward:
+// required display-author fields. WP-4 retires capture.md at v4 and advances
+// SKILL.md/orient.md/responsibility.md with cumulative history. WP-SKILLBUMP carries
+// the two ca7ce2b-corrected carriers forward:
 // plan-manifest.mjs → v3 (previousHashes[1,2]) and manifest-lock.md → v2
 // (previousHashes[1]), since ca7ce2b changed their bodies without bumping. Unchanged
 // files stay v1 (an unmanaged file already at those names is treated as
 // user-authored and .bak'd, never silently clobbered).
 const PROPOSAL_TO_PLAN_TREE: Array<{
   rel: string; content: string; executable?: boolean;
-  version?: number; previousHashes?: Record<number, string>;
+  version?: number; previousHashes?: Record<number, string>; removed?: boolean;
 }> = [
-  { rel: 'SKILL.md', content: PROPOSAL_TO_PLAN_SKILL_MD, version: 3,
+  { rel: 'SKILL.md', content: PROPOSAL_TO_PLAN_SKILL_MD, version: 4,
     previousHashes: { 1: PROPOSAL_TO_PLAN_SKILL_MD_V1_HASH,
-                      2: PROPOSAL_TO_PLAN_SKILL_MD_V2_HASH } },
-  { rel: 'references/activities/capture.md', content: PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD, version: 3,
+                      2: PROPOSAL_TO_PLAN_SKILL_MD_V2_HASH,
+                      3: PROPOSAL_TO_PLAN_SKILL_MD_V3_HASH } },
+  { rel: 'references/activities/capture.md', content: '', removed: true, version: 4,
     previousHashes: { 1: PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V1_HASH,
-                      2: PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V2_HASH } },
+                      2: PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V2_HASH,
+                      3: PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V3_HASH } },
   { rel: 'references/activities/scope.md', content: PROPOSAL_TO_PLAN_ACTIVITY_SCOPE_MD },
   { rel: 'references/activities/promote.md', content: PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD, version: 3,
     previousHashes: { 1: PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD_V1_HASH,
@@ -1299,15 +1310,17 @@ const PROPOSAL_TO_PLAN_TREE: Array<{
   { rel: 'references/activities/integrate.md', content: PROPOSAL_TO_PLAN_ACTIVITY_INTEGRATE_MD },
   { rel: 'references/activities/package.md', content: PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD, version: 2,
     previousHashes: { 1: PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD_V1_HASH } },
-  { rel: 'references/activities/orient.md', content: PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD, version: 2,
-    previousHashes: { 1: PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD_V1_HASH } },
+  { rel: 'references/activities/orient.md', content: PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD, version: 3,
+    previousHashes: { 1: PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD_V1_HASH,
+                      2: PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD_V2_HASH } },
   { rel: 'references/contracts/arc.md', content: PROPOSAL_TO_PLAN_CONTRACT_ARC_MD },
   { rel: 'references/contracts/folder-schema.md', content: PROPOSAL_TO_PLAN_CONTRACT_FOLDER_SCHEMA_MD },
   { rel: 'references/contracts/human-overview.md', content: PROPOSAL_TO_PLAN_CONTRACT_HUMAN_OVERVIEW_MD },
   { rel: 'references/contracts/intent-lifecycle.md', content: PROPOSAL_TO_PLAN_CONTRACT_INTENT_LIFECYCLE_MD },
   { rel: 'references/contracts/manifest-lock.md', content: PROPOSAL_TO_PLAN_CONTRACT_MANIFEST_LOCK_MD, version: 2,
     previousHashes: { 1: PROPOSAL_TO_PLAN_CONTRACT_MANIFEST_LOCK_MD_V1_HASH } },
-  { rel: 'references/contracts/responsibility.md', content: PROPOSAL_TO_PLAN_CONTRACT_RESPONSIBILITY_MD },
+  { rel: 'references/contracts/responsibility.md', content: PROPOSAL_TO_PLAN_CONTRACT_RESPONSIBILITY_MD, version: 2,
+    previousHashes: { 1: PROPOSAL_TO_PLAN_CONTRACT_RESPONSIBILITY_MD_V1_HASH } },
   { rel: 'references/contracts/work-packages.md', content: PROPOSAL_TO_PLAN_CONTRACT_WORK_PACKAGES_MD },
   { rel: 'scripts/plan-identity.mjs', content: PROPOSAL_TO_PLAN_SCRIPT_PLAN_IDENTITY_MJS, executable: true },
   { rel: 'scripts/plan-manifest.mjs', content: PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS, executable: true, version: 4,
@@ -1324,6 +1337,7 @@ export function proposalToPlanEntries(rootPrefix: string): Record<string, Scaffo
     const entry: ScaffoldFile = { content: f.content, version: f.version ?? 1 };
     if (f.executable) entry.executable = true;
     if (f.previousHashes) entry.previousHashes = f.previousHashes;
+    if (f.removed) entry.removed = true;
     out[`${rootPrefix}/${f.rel}`] = entry;
   }
   return out;

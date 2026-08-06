@@ -68,6 +68,10 @@ import {
   PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD_V1_HASH,
   PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD_V1_HASH,
   PROPOSAL_TO_PLAN_SKILL_MD_V2_HASH,
+  PROPOSAL_TO_PLAN_SKILL_MD_V3_HASH,
+  PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V3_HASH,
+  PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD_V2_HASH,
+  PROPOSAL_TO_PLAN_CONTRACT_RESPONSIBILITY_MD_V1_HASH,
   PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V1_HASH,
   PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V2_HASH,
   PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V3_HASH,
@@ -142,11 +146,15 @@ import {
 import {
   PROPOSAL_TO_PLAN_SKILL_MD_V1,
   PROPOSAL_TO_PLAN_SKILL_MD_V2,
+  PROPOSAL_TO_PLAN_SKILL_MD_V3,
   PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V1,
+  PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V3,
   PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD_V1,
   PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD_V1,
   PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD_V2,
   PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD_V1,
+  PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD_V2,
+  PROPOSAL_TO_PLAN_CONTRACT_RESPONSIBILITY_MD_V1,
   PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V1,
   PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V2,
   PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V3,
@@ -3776,8 +3784,11 @@ test('WP-P0C-TREE-SUP. fresh supervisor scaffold writes the whole proposal-to-pl
     const claudeRoot = path.join(workDir, '.lares', 'supervisor', '.claude', 'skills', 'proposal-to-plan');
     const codexRoot = path.join(workDir, '.lares', 'supervisor', '.agents', 'skills', 'proposal-to-plan');
     for (const rel of PROPOSAL_TO_PLAN_REL_FILES) {
-      assert.ok(fs.existsSync(path.join(claudeRoot, ...rel.split('/'))), `Claude root missing ${rel}`);
-      assert.ok(fs.existsSync(path.join(codexRoot, ...rel.split('/'))), `Codex root missing ${rel}`);
+      const expected = rel !== 'references/activities/capture.md';
+      assert.equal(fs.existsSync(path.join(claudeRoot, ...rel.split('/'))), expected,
+        `Claude root ${expected ? 'missing' : 'must retire'} ${rel}`);
+      assert.equal(fs.existsSync(path.join(codexRoot, ...rel.split('/'))), expected,
+        `Codex root ${expected ? 'missing' : 'must retire'} ${rel}`);
     }
     // Content byte-exact for a representative file in each root.
     assert.equal(fs.readFileSync(path.join(claudeRoot, 'SKILL.md'), 'utf-8'), PROPOSAL_TO_PLAN_SKILL_MD,
@@ -3796,18 +3807,18 @@ test('WP-P0C-TREE-SUP. fresh supervisor scaffold writes the whole proposal-to-pl
   }
 });
 
-// WP-SKILLFIX bumped five files to v2 with previousHashes[1]; WP-AUTH-FM advances
-// capture.md to v3 with previousHashes[2]. WP-SKILLBUMP carried the two ca7ce2b-corrected carriers forward — plan-manifest.mjs to v3
-// (previousHashes[1,2]) and manifest-lock.md to v2 (previousHashes[1]). The other six
-// files stay v1. Keep this map in sync with PROPOSAL_TO_PLAN_TREE in index.ts.
+// Every entry is cumulative. WP-4 advances the dispatcher, orient, and responsibility
+// contract and permanently retains capture.md as a v4 retirement entry.
 const PROPOSAL_TO_PLAN_VERSIONED_FILES = new Map<string, { version: number; previousHashes: Record<number, string> }>([
-  ['SKILL.md', { version: 3, previousHashes: {
+  ['SKILL.md', { version: 4, previousHashes: {
     1: PROPOSAL_TO_PLAN_SKILL_MD_V1_HASH,
     2: PROPOSAL_TO_PLAN_SKILL_MD_V2_HASH,
+    3: PROPOSAL_TO_PLAN_SKILL_MD_V3_HASH,
   } }],
-  ['references/activities/capture.md', { version: 3, previousHashes: {
+  ['references/activities/capture.md', { version: 4, previousHashes: {
     1: PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V1_HASH,
     2: PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V2_HASH,
+    3: PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V3_HASH,
   } }],
   ['references/activities/promote.md', { version: 3, previousHashes: {
     1: PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD_V1_HASH,
@@ -3816,7 +3827,13 @@ const PROPOSAL_TO_PLAN_VERSIONED_FILES = new Map<string, { version: number; prev
   ['references/activities/package.md', { version: 2, previousHashes: {
     1: PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD_V1_HASH,
   } }],
-  ['references/activities/orient.md', { version: 2, previousHashes: { 1: PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD_V1_HASH } }],
+  ['references/activities/orient.md', { version: 3, previousHashes: {
+    1: PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD_V1_HASH,
+    2: PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD_V2_HASH,
+  } }],
+  ['references/contracts/responsibility.md', { version: 2, previousHashes: {
+    1: PROPOSAL_TO_PLAN_CONTRACT_RESPONSIBILITY_MD_V1_HASH,
+  } }],
   ['references/contracts/manifest-lock.md', { version: 2, previousHashes: { 1: PROPOSAL_TO_PLAN_CONTRACT_MANIFEST_LOCK_MD_V1_HASH } }],
   ['scripts/plan-manifest.mjs', { version: 4, previousHashes: {
     1: PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V1_HASH,
@@ -3834,10 +3851,8 @@ test('WP-P0C-TREE-HELPER. proposalToPlanEntries expands the full tree under a ro
     if (PROPOSAL_TO_PLAN_VERSIONED_FILES.has(rel)) {
       const exp = PROPOSAL_TO_PLAN_VERSIONED_FILES.get(rel)!;
       assert.equal(entries[key].version, exp.version, `${rel} is a versioned entry at v${exp.version}`);
-      for (const [v, h] of Object.entries(exp.previousHashes)) {
-        assert.equal(entries[key].previousHashes?.[Number(v)], h,
-          `${rel} must carry previousHashes[${v}] for its silent upgrade`);
-      }
+      assert.deepEqual(entries[key].previousHashes, exp.previousHashes,
+        `${rel} must preserve the full cumulative previousHashes map`);
     } else {
       assert.equal(entries[key].version, 1, `${rel} is an unchanged new-skill v1 entry`);
       assert.equal(entries[key].previousHashes, undefined, `${rel} (unchanged) must carry no previousHashes`);
@@ -3847,6 +3862,17 @@ test('WP-P0C-TREE-HELPER. proposalToPlanEntries expands the full tree under a ro
   assert.equal(entries[scriptKey].executable, true, 'plan-manifest.mjs must be executable');
   assert.equal(entries['.lares/workers/codex/.agents/skills/proposal-to-plan/scripts/plan-identity.mjs'].executable, true,
     'plan-identity.mjs must be executable');
+  const captureKey = '.lares/workers/codex/.agents/skills/proposal-to-plan/references/activities/capture.md';
+  assert.deepEqual(entries[captureKey], {
+    content: '',
+    removed: true,
+    version: 4,
+    previousHashes: {
+      1: PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V1_HASH,
+      2: PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V2_HASH,
+      3: PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V3_HASH,
+    },
+  }, 'capture.md must remain in the managed tree as a cumulative v4 retirement entry');
 });
 
 test('WP-2-CONTENT. write-proposal owns threshold, path, stamp, plain lead, and human hand-off', () => {
@@ -3919,13 +3945,19 @@ test('WP-A-PRE. frozen current bodies pin every additive migration-history entry
   assert.notEqual(sha256Hex(PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS), PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V3_HASH);
 });
 
-test('WP-A-CONTENT. continuity, contracts, register bytes, and capture-row boundary are pinned', () => {
+test('WP-A-CONTENT. continuity, contracts, and register bytes are pinned through WP-4', () => {
   const captureRow = '| `capture` | Write a stamped **flat** proposal in `.lares/proposals/`; zero ceremony. Terminal-valid. | `references/activities/capture.md` |';
   assert.ok(PROPOSAL_TO_PLAN_SKILL_MD_V2.includes(captureRow));
-  assert.ok(PROPOSAL_TO_PLAN_SKILL_MD.includes(captureRow), 'capture mode row must remain byte-untouched');
-  assert.ok(PROPOSAL_TO_PLAN_SKILL_MD.includes('## Hardening continuity'));
-  assert.ok(PROPOSAL_TO_PLAN_SKILL_MD.includes('scope → promote → deliberate → integrate → package'));
-  assert.ok(PROPOSAL_TO_PLAN_SKILL_MD.includes('The one built-in stop is **after `package`**'));
+  assert.ok(PROPOSAL_TO_PLAN_SKILL_MD_V3.includes(captureRow), 'WP-A left the capture row byte-untouched for WP-4');
+  const a2Continuity = `## Hardening continuity
+
+Once hardening starts, continue through **\`scope → promote → deliberate → integrate → package\`**
+without pausing between phases to ask "phase done, continue?" Resume from durable disk state when a
+turn boundary intervenes. The one built-in stop is **after \`package\`**, when the plan is presented
+to the workspace owner and waits for the explicit implementation trigger. Escalation for a genuine
+Tier-3 decision remains allowed; routine phase-boundary permission checks are not.`;
+  assert.ok(PROPOSAL_TO_PLAN_SKILL_MD_V3.includes(a2Continuity), 'the frozen post-WP-A body must carry A2 verbatim');
+  assert.ok(PROPOSAL_TO_PLAN_SKILL_MD.includes(a2Continuity), 'WP-4 must preserve the complete A2 continuity block verbatim');
   assert.ok(PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD.includes(
     'written for the workspace owner — no\nsentinel names, no rung jargon, no file:line.'));
   assert.ok(Buffer.from(PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD, 'utf8').includes(Buffer.from([0xe2, 0x80, 0x94])),
@@ -3938,6 +3970,94 @@ test('WP-A-CONTENT. continuity, contracts, register bytes, and capture-row bound
   assert.ok(PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD.includes('re-read and verify the expected'));
   assert.ok(PROPOSAL_TO_PLAN_CONTRACT_WORK_PACKAGES_MD.includes('PLAN-WORK-PACKAGES:v1'));
   assert.ok(PROPOSAL_TO_PLAN_CONTRACT_HUMAN_OVERVIEW_MD.includes('PLAN-TAB-OVERVIEWS:v1'));
+});
+
+test('WP-4-CONTENT. dispatcher is promotion-prompt-entry only and orient retains write gates', () => {
+  const retiredAuthoringVectors = [
+    'Use whenever you\n  author a proposal in .lares/proposals/',
+    '**capture → scope(+mark) →',
+    '| `capture` | Write a stamped **flat** proposal in `.lares/proposals/`; zero ceremony. Terminal-valid. |',
+    '`capture` is open to anyone (a worker may author with `author_role: worker`).',
+  ];
+  for (const vector of retiredAuthoringVectors) {
+    assert.ok(PROPOSAL_TO_PLAN_SKILL_MD_V3.includes(vector), `real v3 artifact must seed retired vector: ${vector}`);
+    assert.ok(!PROPOSAL_TO_PLAN_SKILL_MD.includes(vector), `promotion-only dispatcher must remove: ${vector}`);
+  }
+  assert.ok(PROPOSAL_TO_PLAN_SKILL_MD.includes('Plans pane injects its promotion prompt'));
+  assert.ok(PROPOSAL_TO_PLAN_SKILL_MD.includes('Invoke only from the injected\n  promotion prompt'));
+  assert.ok(PROPOSAL_TO_PLAN_SKILL_MD.includes('Proposal creation belongs to the separate `write-proposal` skill.'));
+  assert.ok(PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD.includes('references/contracts/responsibility.md` §Determination'));
+  assert.ok(PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD.includes('plan-manifest.mjs refresh-arc'));
+  assert.ok(PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD.includes('read-only `read-planning-surface` skill'));
+  assert.ok(!PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD.includes('## Decision table'),
+    'cross-surface reporting table moved out of orient');
+  assert.ok(PROPOSAL_TO_PLAN_CONTRACT_RESPONSIBILITY_MD.includes('## Determination'));
+  assert.ok(PROPOSAL_TO_PLAN_CONTRACT_RESPONSIBILITY_MD.includes('stable, normative responsibility-determination anchor'));
+  assert.ok(PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD.includes('references/contracts/responsibility.md` §Determination'));
+});
+
+test('WP-4-PRE. frozen pre-WP-4 bodies pin every new cumulative hash entry', () => {
+  assert.equal(sha256Hex(PROPOSAL_TO_PLAN_SKILL_MD_V3), PROPOSAL_TO_PLAN_SKILL_MD_V3_HASH);
+  assert.equal(sha256Hex(PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V3), PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V3_HASH);
+  assert.equal(sha256Hex(PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD_V2), PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD_V2_HASH);
+  assert.equal(sha256Hex(PROPOSAL_TO_PLAN_CONTRACT_RESPONSIBILITY_MD_V1), PROPOSAL_TO_PLAN_CONTRACT_RESPONSIBILITY_MD_V1_HASH);
+  assert.notEqual(sha256Hex(PROPOSAL_TO_PLAN_SKILL_MD), PROPOSAL_TO_PLAN_SKILL_MD_V3_HASH);
+  assert.notEqual(sha256Hex(PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD), PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD_V2_HASH);
+  assert.notEqual(sha256Hex(PROPOSAL_TO_PLAN_CONTRACT_RESPONSIBILITY_MD), PROPOSAL_TO_PLAN_CONTRACT_RESPONSIBILITY_MD_V1_HASH);
+});
+
+test('WP-4-MIG. pristine bodies upgrade silently and pristine or edited capture.md retires cleanly', () => {
+  const workDir = mktmp('p2p-wp4-migration');
+  const { supervisor, cleanup } = makeSupervisor();
+  const codexRoot = '.lares/workers/codex/.agents/skills/proposal-to-plan';
+  const claudeRoot = '.lares/workers/claude/.claude/skills/proposal-to-plan';
+  const pristine = [
+    ['SKILL.md', PROPOSAL_TO_PLAN_SKILL_MD_V3, 3],
+    ['references/activities/capture.md', PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V3, 3],
+    ['references/activities/orient.md', PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD_V2, 2],
+    ['references/contracts/responsibility.md', PROPOSAL_TO_PLAN_CONTRACT_RESPONSIBILITY_MD_V1, 1],
+  ] as const;
+  try {
+    const sidecar: Record<string, number> = {};
+    for (const [rel, body, version] of pristine) {
+      const full = path.join(workDir, ...codexRoot.split('/'), ...rel.split('/'));
+      fs.mkdirSync(path.dirname(full), { recursive: true });
+      fs.writeFileSync(full, body, 'utf8');
+      sidecar[`workers/codex/.agents/skills/proposal-to-plan/${rel}`] = version;
+    }
+    const editedCaptureRel = 'references/activities/capture.md';
+    const editedCapturePath = path.join(workDir, ...claudeRoot.split('/'), ...editedCaptureRel.split('/'));
+    fs.mkdirSync(path.dirname(editedCapturePath), { recursive: true });
+    fs.writeFileSync(editedCapturePath, PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V3 + '\n<!-- local edit -->\n', 'utf8');
+    sidecar[`workers/claude/.claude/skills/proposal-to-plan/${editedCaptureRel}`] = 3;
+    fs.mkdirSync(path.dirname(sidecarPath(workDir)), { recursive: true });
+    fs.writeFileSync(sidecarPath(workDir), JSON.stringify(sidecar, null, 2) + '\n', 'utf8');
+
+    supervisor.ensureWorkerScaffold(workDir, 'codex', 'windows');
+    supervisor.ensureWorkerScaffold(workDir, 'claude', 'windows');
+
+    const codexCapture = path.join(workDir, ...codexRoot.split('/'), ...editedCaptureRel.split('/'));
+    assert.ok(!fs.existsSync(codexCapture), 'pristine v3 capture.md must be deleted');
+    assert.equal(fs.readdirSync(path.dirname(codexCapture)).filter((n) => n.startsWith('capture.md.bak.')).length, 0,
+      'pristine capture retirement must not create a backup');
+    assert.ok(!fs.existsSync(editedCapturePath), 'user-modified capture.md must also be retired');
+    const editedBackups = fs.readdirSync(path.dirname(editedCapturePath)).filter((n) => n.startsWith('capture.md.bak.'));
+    assert.equal(editedBackups.length, 1, 'user-modified capture.md must be backed up exactly once');
+    assert.ok(fs.readFileSync(path.join(path.dirname(editedCapturePath), editedBackups[0]), 'utf8').includes('local edit'));
+
+    assert.equal(fs.readFileSync(path.join(workDir, ...codexRoot.split('/'), 'SKILL.md'), 'utf8'), PROPOSAL_TO_PLAN_SKILL_MD);
+    assert.equal(fs.readFileSync(path.join(workDir, ...codexRoot.split('/'), 'references/activities/orient.md'), 'utf8'), PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD);
+    assert.equal(fs.readFileSync(path.join(workDir, ...codexRoot.split('/'), 'references/contracts/responsibility.md'), 'utf8'), PROPOSAL_TO_PLAN_CONTRACT_RESPONSIBILITY_MD);
+    const migratedSidecar = readSidecar(workDir);
+    assert.equal(migratedSidecar['workers/codex/.agents/skills/proposal-to-plan/SKILL.md'], 4);
+    assert.equal(migratedSidecar['workers/codex/.agents/skills/proposal-to-plan/references/activities/capture.md'], 4);
+    assert.equal(migratedSidecar['workers/codex/.agents/skills/proposal-to-plan/references/activities/orient.md'], 3);
+    assert.equal(migratedSidecar['workers/codex/.agents/skills/proposal-to-plan/references/contracts/responsibility.md'], 2);
+    assert.equal(migratedSidecar['workers/claude/.claude/skills/proposal-to-plan/references/activities/capture.md'], 4);
+  } finally {
+    cleanup();
+    rmrf(workDir);
+  }
 });
 
 test('WP-A-MIG. pristine prior bodies migrate silently while a local edit is backed up', () => {
@@ -4006,7 +4126,7 @@ test('WP-AUTH-FM-PRE. frozen capture v2 hashes to previousHashes[2] and differs 
     'live capture.md v3 body must differ from frozen v2');
 });
 
-test('WP-AUTH-FM-MIG. pristine capture v2 silently upgrades to v3 without a backup', () => {
+test('WP-AUTH-FM-MIG. cumulative history retires pristine capture v2 directly at v4 without a backup', () => {
   const workDir = mktmp('p2p-capture-v2');
   const { supervisor, cleanup } = makeSupervisor();
   try {
@@ -4021,11 +4141,11 @@ test('WP-AUTH-FM-MIG. pristine capture v2 silently upgrades to v3 without a back
 
     supervisor.ensureWorkerScaffold(workDir, 'codex', 'windows');
 
-    assert.equal(fs.readFileSync(capturePath, 'utf-8'), PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD);
+    assert.ok(!fs.existsSync(capturePath), 'the retired capture file must be absent');
     assert.equal(fs.readdirSync(path.dirname(capturePath)).filter((n) => n.startsWith('capture.md.bak.')).length, 0);
     assert.equal(readSidecar(workDir)[
       'workers/codex/.agents/skills/proposal-to-plan/references/activities/capture.md'
-    ], 3);
+    ], 4);
   } finally {
     cleanup();
     rmrf(workDir);
@@ -4054,7 +4174,7 @@ test('WP-SKILLFIX-CONTENT. the four defects are fixed in the live v2 bodies', ()
   // Fix 1 — orient read-only EXCEPT the responsible-supervisor ARC refresh.
   assert.ok(PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD.includes('responsible supervisor ONLY'),
     'orient step 4 must gate the ARC refresh on the responsible supervisor');
-  assert.ok(PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD.includes('SKIPS this step'),
+  assert.ok(PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD.includes('SKIPS the refresh'),
     'orient must tell a non-supervisor runner to skip the refresh');
   assert.ok(PROPOSAL_TO_PLAN_SKILL_MD.includes('skips the refresh'),
     'SKILL.md must state a non-supervisor orient skips the refresh');
