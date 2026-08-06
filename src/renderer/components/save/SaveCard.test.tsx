@@ -383,7 +383,7 @@ describe('SaveCard honest non-populated states', () => {
     expect(err?.textContent).toContain('engine unavailable');
     // No bundles, and reveals-only messaging present.
     expect(container.querySelector('[data-testid="save-bundle"]')).toBeFalsy();
-    expect(err?.textContent).toContain('nothing was written');
+    expect(err?.textContent).toContain('Nothing was written');
   });
 
   it('renders the empty state when the tree is clean', async () => {
@@ -576,7 +576,8 @@ describe('SaveCard decisive save gesture', () => {
     await gestureClick(container.querySelector('[data-testid="save-bundle-pin"]')!);
 
     expect(container.querySelector('[data-testid="save-gesture-refusal"]')?.textContent)
-      .toContain("No git repository — cannot pin/commit from workspace 'Computer Root'.");
+      .toContain('Lares could not gather the current work for b-loud.');
+    expect(container.querySelectorAll('[data-testid="save-gesture-refusal"] button')).toHaveLength(1);
   });
 
   it('submits preview then consume and renders Saved without opening the optional expander', async () => {
@@ -678,7 +679,7 @@ describe('SaveCard decisive save gesture', () => {
     await gestureClick(container.querySelector('[data-testid="save-bundle-submit"]')!);
     acknowledgement = container.querySelector<HTMLInputElement>('[data-testid="candidate-preview-overlap-ack"] input')!;
     expect(acknowledgement.checked).toBe(false);
-    expect(container.querySelector('[data-testid="save-gesture-refusal"]')?.textContent).toContain('overlap topology changed');
+    expect(container.querySelector('[data-testid="save-gesture-refusal"]')?.textContent).toContain('multi-owner work changed');
     expect(mint).not.toHaveBeenCalled();
 
     await gestureClick(acknowledgement);
@@ -752,7 +753,7 @@ describe('SaveCard decisive save gesture', () => {
     await gestureClick(container.querySelector('[data-testid="save-bundle-submit"]')!);
 
     const refusal = container.querySelector('[data-testid="save-gesture-refusal"]')?.textContent ?? '';
-    expect(refusal.toLowerCase()).toContain('review and acknowledge');
+    expect(refusal.toLowerCase()).toContain('review it and confirm');
     expect(refusal).not.toContain('did not produce a committable candidate');
     expect(commit).not.toHaveBeenCalled();
   });
@@ -777,7 +778,7 @@ describe('SaveCard decisive save gesture', () => {
     await gestureClick(container.querySelector('[data-testid="save-bundle-submit"]')!);
 
     const refusal = container.querySelector('[data-testid="save-gesture-refusal"]')?.textContent ?? '';
-    expect(refusal).toContain('1 of 15 pinned files changed — re-pin to save current bytes');
+    expect(refusal).toContain('This package changed before Lares could save it.');
     expect(refusal).toContain('src/main/memory/recall.ts');
     expect(refusal).not.toContain('Pinned bytes no longer qualify');
     expect(commit).not.toHaveBeenCalled();
@@ -818,12 +819,11 @@ describe('SaveCard decisive save gesture', () => {
     await gestureClick(container.querySelector('[data-testid="save-bundle-submit"]')!);
 
     const diff = container.querySelector('[data-testid="save-gesture-diff"]');
-    expect(diff?.textContent).toContain('What moved');
-    expect(diff?.textContent).toContain('src/main/memory/recall.ts changed after pin');
-    expect(container.querySelector('[data-state="stale-refused"]')).toBeTruthy();
+    expect(diff?.textContent).toContain('Changed work');
+    expect(container.querySelector('[data-state="stale-refused"]')).toBeNull();
     expect(container.querySelector('[data-testid="save-bundle-repin"]')).toBeTruthy();
 
-    await gestureClick(container.querySelector('[data-testid="commit-outcome-repreview"]')!);
+    await gestureClick(container.querySelector('[data-testid="save-bundle-repin"]')!);
     expect(preview).toHaveBeenCalledTimes(2);
     expect(commit).toHaveBeenCalledTimes(1);
     expect(container.querySelector('[data-testid="candidate-preview"]')).toBeTruthy();

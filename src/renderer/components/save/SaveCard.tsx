@@ -108,7 +108,7 @@ function PackageSaveGesture({
         refusal: unsaveable.saveability.refusal ?? {
           stage: 'saveability',
           code: 'save-card-no-repository',
-          message: `Saveability stage refused: No git repository — cannot pin/commit from workspace '${unsaveable.saveability.workspaceTitle}'.`,
+          message: `This package cannot be saved from workspace '${unsaveable.saveability.workspaceTitle}'.`,
         },
       });
       return;
@@ -199,7 +199,7 @@ function PackageSaveGesture({
         if (paths.length > 0) {
           refusal = {
             ...refusal, paths,
-            message: `${paths.length} of ${result.mint.pinnedSelection.frozenMemberCount} pinned files changed — re-pin to save current bytes.`,
+            message: `${paths.length} of ${result.mint.pinnedSelection.frozenMemberCount} reviewed files changed.`,
           };
         }
       }
@@ -213,11 +213,19 @@ function PackageSaveGesture({
   const submitting = gesture.status === 'reviewing' || gesture.status === 'minting' || gesture.status === 'committing';
   const gestureError = gesture.status === 'refused'
     ? renderSaveRefusal(gesture.refusal)
-    : gesture.status === 'uncertain' ? gesture.message : null;
+    : gesture.status === 'uncertain' ? 'Lares could not confirm whether this package was saved.' : null;
   const movedPaths = gesture.status === 'refused' ? gesture.refusal.paths ?? [] : [];
   const outcome = gesture.status === 'committed'
     ? gesture.outcome
     : gesture.status === 'refused' ? gesture.outcome ?? null : null;
+  const recover = () => {
+    if (gesture.status === 'refused' && outcome) {
+      dispatch({ type: 'submit-stage', stage: 'reviewing' });
+      setDetailsOpen(true);
+      return;
+    }
+    void pinPackage(true);
+  };
   return (
     <div className="sc-save-launcher">
       <SaveBundle
@@ -234,7 +242,7 @@ function PackageSaveGesture({
         disabled={!pinned || submitting}
         onClick={() => { void submit(); }}
       >
-        {submitting ? 'Saving…' : 'Submit save'}
+        {submitting ? 'Saving…' : 'Save package'}
       </button>
       <button
         type="button"
@@ -243,20 +251,28 @@ function PackageSaveGesture({
         aria-expanded={detailsOpen}
         onClick={() => setDetailsOpen((open) => !open)}
       >
-        {detailsOpen ? 'Hide preview & message' : 'Preview & message'}
+        {detailsOpen ? 'Hide review & message' : 'Review & message'}
       </button>
-      {gesture.status === 'pinning' && <div className="sc-save-note" role="status">Pinning reviewed bytes…</div>}
+      {gesture.status === 'pinning' && <div className="sc-save-note" role="status">Preparing reviewed work…</div>}
       {gestureError && (
         <div className="sc-save-refusal" role="alert" data-testid="save-gesture-refusal">
-          <b>Save refused safely.</b> {gestureError}
+          {gestureError}
           {(movedPaths.length > 0 || (outcome?.kind === 'outcome' && outcome.outcome.status === 'aborted-stale')) && (
             <div className="sc-save-diff" data-testid="save-gesture-diff">
-              <strong>What moved</strong>
+              <strong>Changed work</strong>
               {movedPaths.length > 0
                 ? <ul>{movedPaths.map((path) => <li key={path}>{path}</li>)}</ul>
-                : <p>{gestureError}</p>}
+                : null}
             </div>
           )}
+          <button
+            type="button"
+            className="ui-btn ui-btn-outline px-3 py-1 text-[12.5px] sc-repin"
+            data-testid="save-bundle-repin"
+            onClick={recover}
+          >
+            {outcome ? 'Check package again' : 'Refresh package'}
+          </button>
         </div>
       )}
       {detailsOpen && pinned && (
@@ -270,7 +286,7 @@ function PackageSaveGesture({
           onClose={() => setDetailsOpen(false)}
         />
       )}
-      {outcome && (
+      {gesture.status === 'committed' && outcome && (
         <CommitOutcome
           response={outcome}
           onRepreview={() => {
@@ -281,16 +297,6 @@ function PackageSaveGesture({
             }
           }}
         />
-      )}
-      {gesture.status === 'refused' && (
-        <button
-          type="button"
-          className="ui-btn ui-btn-outline px-3 py-1 text-[12.5px] sc-repin"
-          data-testid="save-bundle-repin"
-          onClick={() => { void pinPackage(true); }}
-        >
-          Re-pin current bytes
-        </button>
       )}
     </div>
   );
@@ -348,7 +354,7 @@ type LoadState =
 function errorMessage(err: unknown): string {
   if (err instanceof Error && err.message) return err.message;
   if (typeof err === 'string' && err) return err;
-  return 'The Save engine could not be reached.';
+  return 'Lares could not load save progress.';
 }
 
 function groupBySupervisor(bundles: WorkBundleDto[]): WorkBundleDto[][] {
@@ -538,9 +544,9 @@ export default function SaveCard() {
       </div>
       <p className="sc-sub">
         {workspace ? (
-          <>Workspace <b>{workspace.title}</b> · pin and save exact packages of work</>
+          <>Workspace <b>{workspace.title}</b> · review and save exact packages of work</>
         ) : (
-          <>Pin and save exact packages of work</>
+          <>Review and save exact packages of work</>
         )}
       </p>
       {refreshing && (
@@ -571,8 +577,7 @@ export default function SaveCard() {
           <div className="sc-state-title">Save progress unavailable</div>
           <div className="sc-state-body">{state.message}</div>
           <div className="sc-state-hint">
-            The Save surface reveals state only — nothing was written. Try again once the workspace is a
-            git repository with at least one commit and the Save engine has finished starting.
+            Nothing was written, so try again once this workspace is ready.
           </div>
           <div className="sc-actions">
             <button
@@ -678,8 +683,7 @@ export default function SaveCard() {
       )}
 
       <div className="sc-keyline">
-        <b>Exact-byte saves.</b> Pin freezes the package boundary; Submit creates and commits a fresh candidate.
-        If those bytes moved, Lares refuses and asks you to inspect or re-pin instead of guessing.
+        <b>Exact-byte saves.</b> Lares saves the work you reviewed and asks you to refresh if it changes.
       </div>
     </div>
   );

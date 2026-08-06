@@ -4,39 +4,46 @@ import type {
   SaveCardMintResponse,
 } from '../../../shared/types';
 
-/** One renderer vocabulary for every Save/Plan surface. Main supplies the
- * actionable detail; this switch guarantees the failed pipeline stage is named. */
+/** One plain-language renderer vocabulary for every Save/Plan surface. */
 export function renderSaveRefusal(refusal: SaveRefusal): string {
   switch (refusal.stage) {
     case 'saveability':
-      return refusal.message.startsWith('Saveability stage') ? refusal.message : `Saveability stage refused: ${refusal.message}`;
+      return 'This package cannot be saved from this workspace.';
     case 'boundary-capture':
-      return refusal.message.startsWith('Boundary-capture stage') ? refusal.message : `Boundary-capture stage refused: ${refusal.message}`;
+      return refusal.paths?.length
+        ? `Lares could not gather the current work for ${refusal.paths.join(', ')}.`
+        : "Lares could not gather this package's current work.";
     case 'freeze':
-      return refusal.message.startsWith('Freeze stage') ? refusal.message : `Freeze stage refused: ${refusal.message}`;
+      return 'This package is not ready to save.';
     case 'preview-verify':
-      return refusal.message.startsWith('Preview verification stage') ? refusal.message : `Preview verification stage refused: ${refusal.message}`;
+      return 'This package changed since it was reviewed.';
     case 'mint': {
-      const ackCopy: Record<string, string> = {
-        'overlap-ack-missing': 'This package fuses work from multiple agents or plans. Review the overlap in the preview below and check the acknowledgement to continue.',
-        'overlap-ack-stale': 'The overlap topology changed after you acknowledged it. The refreshed preview is shown below — review it and acknowledge again.',
-        'unattributed-ack-incomplete': 'The package contains unattributed changes that were not acknowledged. The refreshed preview is shown below — confirm each unattributed change, then submit again.',
-        'unattributed-ack-stale': 'The unattributed selection changed after the preview. The current pinned selection is shown below — review and acknowledge again.',
-        'candidate-ack-stale': 'The candidate changed after the preview even though the pinned files may still match. Review the refreshed candidate below before saving.',
-        'mint-ack-race': 'The package changed again while the save token was being minted. The newest preview is shown below — review and acknowledge again.',
+      const acknowledgementCopy: Record<string, string> = {
+        'overlap-ack-missing': 'This package contains multi-owner work that needs your review.',
+        'overlap-ack-stale': 'The multi-owner work changed and needs another review.',
+        'unattributed-ack-incomplete': 'This package contains unattributed work that needs your review.',
+        'unattributed-ack-stale': 'The unattributed work changed and needs another review.',
+        'candidate-ack-stale': 'This package changed since it was reviewed.',
+        'mint-ack-race': 'This package changed, so review it and confirm the work again.',
       };
-      if (ackCopy[refusal.code]) return `Mint stage refused: ${ackCopy[refusal.code]}`;
+      if (acknowledgementCopy[refusal.code]) return acknowledgementCopy[refusal.code];
       if (refusal.code === 'acknowledgement-stale') {
-        return 'Mint stage refused because the package acknowledgement is stale or incomplete. The refreshed details are shown below — review and acknowledge again.';
+        return "This package's multi-owner or unattributed work needs your review.";
       }
-      return refusal.message.startsWith('Mint stage') ? refusal.message : `Mint stage refused: ${refusal.message}`;
+      return 'This package changed before Lares could save it.';
     }
     case 'token-consume':
-      return refusal.message.startsWith('Token-consume stage') ? refusal.message : `Token-consume stage refused: ${refusal.message}`;
-    case 'commit':
-      return refusal.message.startsWith('Commit stage') ? refusal.message : `Commit stage refused: ${refusal.message}`;
+      return 'This save is no longer current.';
+    case 'commit': {
+      const detail = refusal.message.startsWith('The package could not be saved: ')
+        ? refusal.message.slice(32)
+        : '';
+      return detail && !/\b(?:mint|candidate|pin(?:ned|ning)?|token|stage|topology|acknowledgement)\b/i.test(detail)
+        ? `Lares could not save this package because ${detail}`
+        : 'Lares could not save this package.';
+    }
     case 'reconciliation':
-      return refusal.message.startsWith('Reconciliation stage') ? refusal.message : `Reconciliation stage refused: ${refusal.message}`;
+      return 'Lares saved this package but could not verify the result.';
   }
 }
 
@@ -45,7 +52,7 @@ export function renderSaveRefusal(refusal: SaveRefusal): string {
 export function mintRefusal(response: SaveCardMintResponse): SaveRefusal | null {
   if (response.refusal) return response.refusal;
   if (!response.isCandidate) {
-    return { stage: 'mint', code: 'mint-refused', message: 'Mint stage refused because the server returned a preview.' };
+    return { stage: 'mint', code: 'mint-refused', message: 'The package changed before it could be saved.' };
   }
   const eligibility = response.candidate.eligibility;
   if (!eligibility.eligible) {
@@ -54,11 +61,11 @@ export function mintRefusal(response: SaveCardMintResponse): SaveRefusal | null 
     return {
       stage: 'mint',
       code: acknowledgement ? 'acknowledgement-stale' : 'mint-refused',
-      message: `Mint stage refused: ${eligibility.reason}.`,
+      message: `The package is not ready to save: ${eligibility.reason}.`,
     };
   }
   if (!response.candidate.token) {
-    return { stage: 'mint', code: 'mint-token-missing', message: 'Mint stage refused because the eligible candidate has no token.' };
+    return { stage: 'mint', code: 'mint-token-missing', message: 'The package could not be prepared for saving.' };
   }
   return null;
 }
@@ -67,13 +74,13 @@ export function coordinatorRefusal(response: CommitCoordinatorConsumeResponse): 
   if (response.kind === 'saved') return null;
   if (response.refusal) return response.refusal;
   if (response.kind === 'token-unresolved' || response.kind === 'compose-in-flight') {
-    return { stage: 'token-consume', code: response.kind, message: `Token-consume stage refused: ${response.kind}.` };
+    return { stage: 'token-consume', code: response.kind, message: 'This save is no longer current.' };
   }
   if (response.kind === 'reconciliation-error') {
-    return { stage: 'reconciliation', code: response.error.code, message: `Reconciliation stage refused: ${response.error.message}` };
+    return { stage: 'reconciliation', code: response.error.code, message: 'The save could not be verified.' };
   }
   const detail = response.kind === 'invalid-message'
     ? response.reason
     : 'reason' in response.outcome ? response.outcome.reason : response.outcome.status;
-  return { stage: 'commit', code: 'coordinator-stale', message: `Commit stage refused: ${detail}.` };
+  return { stage: 'commit', code: 'coordinator-stale', message: `The package could not be saved: ${detail}.` };
 }
