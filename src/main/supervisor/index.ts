@@ -44,6 +44,7 @@ import {
   MAX_TERMINAL_REPLAY_BYTES,
   FILE_ACTIVITY_RETENTION_SESSIONS,
   LARES_DIR_NAME, LEGACY_LARES_DIR_NAME,
+  WRITE_PROPOSAL_SKILL_MD,
   PROPOSAL_TO_PLAN_SKILL_MD,
   PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD,
   PROPOSAL_TO_PLAN_ACTIVITY_SCOPE_MD,
@@ -1326,6 +1327,14 @@ export function proposalToPlanEntries(rootPrefix: string): Record<string, Scaffo
     out[`${rootPrefix}/${f.rel}`] = entry;
   }
   return out;
+}
+
+/** The proposal authoring entry is shared by every native lane. It starts at
+ * version 1 because WP-2 is its first managed workspace deployment. */
+export function writeProposalEntry(rootPrefix: string): Record<string, ScaffoldFile> {
+  return {
+    [`${rootPrefix}/SKILL.md`]: { content: WRITE_PROPOSAL_SKILL_MD, version: 1 },
+  };
 }
 
 /** SHA-256 hex of the v5 `.dashboard/researcher/CLAUDE.md` (pre-`.lares`
@@ -3293,6 +3302,7 @@ export class AgentSupervisor extends EventEmitter {
    *  `version` triggers managed-upgrade-on-launch in old workspaces. */
   private static SUPERVISOR_FILES: Record<string, ScaffoldFile> = {
     ...proposalToPlanEntries('.lares/supervisor/.claude/skills/proposal-to-plan'),
+    ...writeProposalEntry('.lares/supervisor/.claude/skills/write-proposal'),
     [`.lares/supervisor/CLAUDE.md`]:                                              {
       content: SUPERVISOR_AGENT_MD,
       version: 22, // v22 documents Gemini's discontinuation while preserving historical reads. v21 added the planning-artifacts section.
@@ -3376,6 +3386,7 @@ export class AgentSupervisor extends EventEmitter {
    *  is harmless. */
   private static SUPERVISOR_FILES_CODEX: Record<string, ScaffoldFile> = {
     ...proposalToPlanEntries('.lares/supervisor/.agents/skills/proposal-to-plan'),
+    ...writeProposalEntry('.lares/supervisor/.agents/skills/write-proposal'),
     [`.lares/supervisor/.agents/skills/remember/SKILL.md`]: { content: REMEMBER_SKILL, version: 2, previousHashes: { 1: REMEMBER_SKILL_V1_HASH } }, // v2: fixes the capsule example's `detail:` path to the validator-accepted `memory/details/<id>.md` form
   };
 
@@ -3454,6 +3465,7 @@ export class AgentSupervisor extends EventEmitter {
    *  blocks on input flips to `waiting` (plans/hook-driven-waiting-status.md §4). */
   private static WORKER_FILES_CLAUDE: Record<string, ScaffoldFile> = {
     ...proposalToPlanEntries('.lares/workers/claude/.claude/skills/proposal-to-plan'),
+    ...writeProposalEntry('.lares/workers/claude/.claude/skills/write-proposal'),
     [`.lares/workers/claude/CLAUDE.md`]:                       {
       content: WORKER_CLAUDE_MD,
       version: 11, // v11: removes worker-side memory-retrieval guidance — supervisor briefs carry relevant memory; workers suggest via the `remember` skill. Previously: v10 (WP-P0C planning-surface) replaces the retired every-turn PLAN-EVENT ceremony section with the worker planning-surface section (where proposals/plan folders live; a worker MAY author a proposal via capture; hardening + ARC.md stay the supervisor's job; the per-turn sentinel + read-before-edit obligations are gone — WP-P0B removed the runtime contract). Previously: v9 (memory-lessons v2, WP-G) retires the shared `behavioral.md` read/append instruction: the `## Memory: shared behavioral notes only` section becomes `## Memory & lessons` with the injection-aware resident pointer (memory injected at launch for supervisors; a worker fetches via the `recall_memory` tool or a raw read of `.lares/supervisor/memory/`), the cross-workspace discoverability line, and the `remember`-skill pointer. Previously: v2 adds the memory section; v3 (WP-G) adds the research-store pointer; v4 adds the online-research division of labor; v5 (planning-surface WP2) adds the plan-event sentinel section; v6 (GT-C D2) makes the PLAN-EVENT sentinel mandatory on every rail turn + expands the status vocab; v7 (Lares rebrand) renames `.dashboard/…` → `.lares/…`; v8 adds the "Never use git to discard uncommitted work" section (pairs with the PreToolUse guard-git-discard.mjs hook)
@@ -3498,6 +3510,7 @@ export class AgentSupervisor extends EventEmitter {
    *  turn-boundary status hooks. CLAUDE.md is the generic base persona contract
    *  (RESEARCHER_AGENT_MD) — managed/version-migrated like the supervisor's. */
   private static RESEARCHER_FILES: Record<string, ScaffoldFile> = {
+    ...writeProposalEntry('.lares/researcher/.claude/skills/write-proposal'),
     [`.lares/researcher/CLAUDE.md`]:                         { content: RESEARCHER_AGENT_MD, version: 6, previousHashes: { 1: RESEARCHER_AGENT_MD_V1_HASH, 2: RESEARCHER_AGENT_MD_V2_HASH, 3: RESEARCHER_AGENT_MD_V3_HASH, 4: RESEARCHER_AGENT_MD_V4_HASH, 5: RESEARCHER_AGENT_MD_V5_HASH } }, // v6: `.lares` rename
     [`.lares/researcher/.claude/settings.json`]:             { content: RESEARCHER_CLAUDE_SETTINGS_JSON, version: 2, previousHashes: { 1: sha256Hex(RESEARCHER_CLAUDE_SETTINGS_JSON_V1) } },
     [`.lares/researcher/scripts/research-write-guard.mjs`]:  { content: RESEARCH_WRITE_GUARD_MJS, version: 5, previousHashes: { 1: RESEARCH_WRITE_GUARD_MJS_V1_HASH, 2: RESEARCH_WRITE_GUARD_MJS_V2_HASH, 3: RESEARCH_WRITE_GUARD_MJS_V3_HASH, 4: RESEARCH_WRITE_GUARD_MJS_V4_HASH }, executable: true }, // v5: deny exits 2 again (Claude-only lane; Claude 2.1.220 does not honor an exit-0 hookSpecificOutput deny, so v4's exit 0 left it UNENFORCING). v4 exited 0; v3 accepts both `.lares`/`.dashboard` research markers
@@ -3628,6 +3641,7 @@ export class AgentSupervisor extends EventEmitter {
       );
       const codexFiles: Record<string, ScaffoldFile> = {
         ...proposalToPlanEntries('.lares/workers/codex/.agents/skills/proposal-to-plan'),
+        ...writeProposalEntry('.lares/workers/codex/.agents/skills/write-proposal'),
         [`.lares/workers/codex/.codex/config.toml`]: {
           content: codexConfig,
           version: 6,

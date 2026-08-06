@@ -59,6 +59,7 @@ import {
   WORKER_CODEX_AGENTS_MD_V2_HASH,
   WORKER_CODEX_AGENTS_MD_V3_HASH,
   proposalToPlanEntries,
+  writeProposalEntry,
   PROPOSAL_TO_PLAN_SKILL_MD_V1_HASH,
   PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V1_HASH,
   PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V2_HASH,
@@ -96,6 +97,7 @@ import {
   SUPERVISOR_AGENT_MD_V21,
   WORKER_CLAUDE_MD_V9,
   WORKER_CLAUDE_MD_V10,
+  WRITE_PROPOSAL_SKILL_MD,
   WORKER_CODEX_AGENTS_MD_V2,
   WORKER_CODEX_AGENTS_MD_V3,
   PROPOSAL_TO_PLAN_SKILL_MD,
@@ -3845,6 +3847,65 @@ test('WP-P0C-TREE-HELPER. proposalToPlanEntries expands the full tree under a ro
   assert.equal(entries[scriptKey].executable, true, 'plan-manifest.mjs must be executable');
   assert.equal(entries['.lares/workers/codex/.agents/skills/proposal-to-plan/scripts/plan-identity.mjs'].executable, true,
     'plan-identity.mjs must be executable');
+});
+
+test('WP-2-CONTENT. write-proposal owns threshold, path, stamp, plain lead, and human hand-off', () => {
+  const normativeFrontmatterBlock = [
+    'author: "<agent title verbatim>" (<lane>, <workspace>)',
+    'author_agent_id: <dashboard agent uuid>',
+    'author_role: supervisor | worker | researcher',
+    'author_provider: claude | codex | grok | agy   # optional but cheap',
+    'authored_at: <ISO-8601>',
+  ].join('\n');
+
+  assert.ok(WRITE_PROPOSAL_SKILL_MD.includes(normativeFrontmatterBlock),
+    'Part 2 frontmatter block must appear verbatim');
+  assert.ok(WRITE_PROPOSAL_SKILL_MD.includes('artifact_id: prop_<8 lowercase hex>'));
+  assert.ok(WRITE_PROPOSAL_SKILL_MD.includes('scan every\nexisting `artifact_id:`'));
+  assert.ok(WRITE_PROPOSAL_SKILL_MD.includes('**fails the contract**'),
+    'a generic role label in author must explicitly fail');
+  assert.ok(WRITE_PROPOSAL_SKILL_MD.includes('`remember` to\n  create a memory'));
+  assert.ok(WRITE_PROPOSAL_SKILL_MD.includes('`remember` to create a lesson'));
+  assert.ok(WRITE_PROPOSAL_SKILL_MD.includes('`supporting/` is reserved for a supervisor subscribed to a plan'));
+  assert.ok(WRITE_PROPOSAL_SKILL_MD.includes('.lares/proposals/YYYY-MM-DD-<slug>.md'));
+  assert.ok(WRITE_PROPOSAL_SKILL_MD.includes('`## In plain terms`'));
+  assert.ok(WRITE_PROPOSAL_SKILL_MD.includes('what is this, why does it matter, and what changes\nfor the user?'));
+  assert.ok(WRITE_PROPOSAL_SKILL_MD.includes(
+    'Tell the human the proposal exists and where it is; the lifecycle continues only\nfrom the Plans pane.'));
+});
+
+test('WP-2-MIG. write-proposal is a managed v1 skill in every native lane', () => {
+  const helperEntry = writeProposalEntry('.lares/example/.agents/skills/write-proposal');
+  assert.deepEqual(helperEntry['.lares/example/.agents/skills/write-proposal/SKILL.md'], {
+    content: WRITE_PROPOSAL_SKILL_MD,
+    version: 1,
+  });
+
+  const workDir = mktmp('write-proposal-all-lanes');
+  const { supervisor, cleanup } = makeSupervisor();
+  const paths = [
+    '.lares/supervisor/.claude/skills/write-proposal/SKILL.md',
+    '.lares/supervisor/.agents/skills/write-proposal/SKILL.md',
+    '.lares/workers/claude/.claude/skills/write-proposal/SKILL.md',
+    '.lares/workers/codex/.agents/skills/write-proposal/SKILL.md',
+    '.lares/researcher/.claude/skills/write-proposal/SKILL.md',
+  ];
+  try {
+    supervisor.ensureSupervisorScaffold(workDir, 'windows');
+    supervisor.ensureWorkerScaffold(workDir, 'claude', 'windows');
+    supervisor.ensureWorkerScaffold(workDir, 'codex', 'windows');
+    supervisor.ensureResearcherScaffold(workDir, 'windows');
+
+    const sidecar = readSidecar(workDir);
+    for (const rel of paths) {
+      assert.equal(fs.readFileSync(path.join(workDir, ...rel.split('/')), 'utf8'), WRITE_PROPOSAL_SKILL_MD,
+        `${rel} must contain the exact shared skill body`);
+      assert.equal(sidecar[rel.replace(/^\.lares\//, '')], 1, `${rel} must be recorded at v1`);
+    }
+  } finally {
+    cleanup();
+    rmrf(workDir);
+  }
 });
 
 test('WP-A-PRE. frozen current bodies pin every additive migration-history entry', () => {
