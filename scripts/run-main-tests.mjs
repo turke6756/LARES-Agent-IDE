@@ -683,6 +683,8 @@ const TESTS = [
   'dist/main/main/git-checkpoints/plan-baseline-refs.test.js',
   // WP-P5C: Implement eligibility + execution-run mint + baseline pin (human-gated).
   'dist/main/main/plans/plan-implement.test.js',
+  // WP-Z: exact v3-era scaffold migration + real proposal/watcher/reconciler-to-Implement gate.
+  'dist/main/main/plans/proposal-to-implement.e2e.test.js',
   // WP-P5-archive: plan archive / resurrection / re-Implement (new run + fresh baseline).
   'dist/main/main/plans/plan-archive.test.js',
   // WP-P5C-gate: pre-Implement enforcement seam — reject structured-plan bindings

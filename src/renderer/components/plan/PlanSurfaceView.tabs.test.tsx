@@ -72,7 +72,7 @@ function model(): PlanDocumentsModel {
         key: 'packages',
         populated: false,
         documents: [],
-        placeholder: 'not yet implemented — pull Implement to begin',
+        placeholder: 'No work-package definitions have been imported yet.',
       },
     ],
   };
@@ -215,14 +215,15 @@ describe('PlanDocumentTabs (WP-P4B tabbed document home)', () => {
     expect(body().textContent).toContain('delib two');
   });
 
-  it('renders the Packages placeholder (populated:false) with NO "overview pending"', async () => {
+  it('renders truthful Packages import guidance (populated:false) with NO "overview pending"', async () => {
     await render(<PlanDocumentTabs planId="plan-1" />);
     await act(async () => {
       tabByKey('packages').click();
     });
     await flush();
     const ph = document.querySelector('[data-testid="plan-packages-placeholder"]');
-    expect(ph?.textContent).toContain('not yet implemented');
+    expect(ph?.textContent).toContain('No work-package definitions have been imported yet.');
+    expect(ph?.textContent).toContain('Refresh imports them into the Mission Board.');
     // The unpopulated placeholder must not force an overview.
     expect(document.querySelector('[data-testid="plan-overview-pending"]')).toBeNull();
     expect(document.querySelector('[data-testid="plan-tab-overview"]')).toBeNull();
