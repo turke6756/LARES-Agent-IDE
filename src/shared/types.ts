@@ -2212,6 +2212,31 @@ export interface SaveCardPreviewResponse {
 
 export interface SaveCardMintResponse extends SaveCardPreviewResponse {}
 
+/** Renderer-safe projection of a reviewed manifest: reviewable effects and the
+ * challenge the human saw, never repository topology, closure proof, or durable
+ * main-process intent internals. */
+export interface ReviewedSemanticReviewView {
+  manifestVersion: number;
+  reviewedManifestDigest: string;
+  members: Array<{
+    finalPath: import('./commit-candidates').EncodedGitPath;
+    expectedState: 'present' | 'absent';
+    rawBlobOid: string | null;
+    commitBlobOid: string | null;
+    commitMode: string | null;
+    commitEffects: Array<{
+      path: import('./commit-candidates').EncodedGitPath;
+      operation: import('./commit-candidates').CommitEffectOperation;
+      expectedState: 'present' | 'absent';
+      rawBlobOid: string | null;
+      commitBlobOid: string | null;
+      commitMode: string | null;
+    }>;
+  }>;
+  challengeVersion: number;
+  challengeAtoms: import('./commit-candidates').ReviewChallengeAtom[];
+}
+
 // ── SC-WP-3E — fleet-adhoc mark-done route ────────────────────────────────
 
 /** Kept separate from the Stage-1 read-only channel map because this explicit

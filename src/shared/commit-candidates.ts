@@ -1,3 +1,7 @@
+import { Buffer } from 'node:buffer';
+
+import { canonicalize } from '../main/commit-candidates/jcs';
+
 export interface RepositoryIdentity {
   repositoryKey: string;
   objectDatabaseKey: string;
@@ -113,6 +117,272 @@ export interface CandidateMember {
   coveringFinalizationIds: string[];
   packageVerification: PackageVerificationState;
   protection: ProtectionRung;
+}
+
+/** Schema versions for the main-owned review contract and its challenge atoms. */
+export const REVIEWED_SEMANTIC_MANIFEST_VERSION = 1 as const;
+export const REVIEW_CHALLENGE_VERSION = 1 as const;
+
+export interface ReviewedFrozenMember {
+  pathBytesBase64: string;
+  expectedState: 'present' | 'absent';
+  rawBlobOid: string | null;
+  commitBlobOid: string | null;
+  commitMode: string | null;
+}
+
+export interface ReviewedFinalizationIntent {
+  finalizationId: string;
+  packageId: string;
+  packageRevision: number;
+  boundaryStatus: 'ready';
+  frozenMemberManifestDigest: string;
+  frozenMembers: ReviewedFrozenMember[];
+}
+
+export type CommitEffectOperation = 'write' | 'delete' | 'retain';
+
+/** One path in the complete pathspec closure of a reviewed logical member. */
+export interface NormalizedCommitEffect {
+  pathBytesBase64: string;
+  operation: CommitEffectOperation;
+  expectedState: 'present' | 'absent';
+  rawBlobOid: string | null;
+  commitBlobOid: string | null;
+  commitMode: string | null;
+}
+
+export interface ReviewedSemanticMember {
+  finalPathBytesBase64: string;
+  expectedState: 'present' | 'absent';
+  rawBlobOid: string | null;
+  commitBlobOid: string | null;
+  commitMode: string | null;
+  coveringFinalizationIds: string[];
+  commitEffects: NormalizedCommitEffect[];
+}
+
+export interface AttributionContributor {
+  pathBytesBase64: string;
+  turnId: string;
+  agentId: string;
+  ownerAgentId: string | null;
+  planId: string | null;
+  planItemId: string | null;
+}
+
+export interface AttributionComponentEdge {
+  leftPathBytesBase64: string;
+  rightPathBytesBase64: string;
+}
+
+export interface ReviewedAttributionTopology {
+  componentPathSets: string[][];
+  contributors: AttributionContributor[];
+  ownershipGroupKeys: string[];
+  componentEdges: AttributionComponentEdge[];
+  requiresOverlapAck: boolean;
+  selectedUnattributedPathBytesBase64: string[];
+}
+
+export interface ReviewedClosureObligation {
+  finalizationId: string;
+  pathBytesBase64: string;
+  expectedState: 'present' | 'absent';
+  commitBlobOid: string | null;
+  commitMode: string | null;
+}
+
+export type ReviewChallengeAtom =
+  | {
+      kind: 'unattributed';
+      atomId: string;
+      digest: string;
+      pathBytesBase64: string;
+      memberEffectDigest: string;
+    }
+  | {
+      kind: 'overlap';
+      atomId: string;
+      digest: string;
+      reasonVersion: 1;
+      memberPathBytesBase64: string[];
+      contributors: AttributionContributor[];
+      ownershipGroupKeys: string[];
+    };
+
+/**
+ * Main-process-only review contract. It deliberately excludes operational
+ * candidate/token identity (HEAD, index fingerprint, candidate id and token id).
+ */
+export interface ReviewedSemanticManifest {
+  manifestVersion: typeof REVIEWED_SEMANTIC_MANIFEST_VERSION;
+  candidateContractVersion: number;
+  repositoryKey: string;
+  objectDatabaseKey: string;
+  gitObjectFormat: 'sha1' | 'sha256';
+  finalizations: ReviewedFinalizationIntent[];
+  members: ReviewedSemanticMember[];
+  attributionTopology: ReviewedAttributionTopology;
+  closureObligations: ReviewedClosureObligation[];
+  challengeVersion: typeof REVIEW_CHALLENGE_VERSION;
+  challengeAtoms: ReviewChallengeAtom[];
+}
+
+export type CommitEffectChangeKind = 'write' | 'delete' | 'rename' | 'copy' | 'mode-change';
+
+export interface CommitEffectRepresentation {
+  rawBlobOid: string | null;
+  commitBlobOid: string | null;
+  commitMode: string | null;
+}
+
+/** Inputs are already derived main-side from authoritative Git path bytes. */
+export interface NormalizeCommitEffectsInput {
+  changeKind: CommitEffectChangeKind;
+  finalPathBytesBase64: string;
+  finalRepresentation: CommitEffectRepresentation;
+  originalPathBytesBase64?: string;
+  /** Required for copy: the retained source can differ from the destination. */
+  originalRepresentation?: CommitEffectRepresentation;
+  commitPathspecs: string[];
+  /** Exact post-commit effects for pathspecs other than final/original paths. */
+  additionalPathspecEffects?: NormalizedCommitEffect[];
+}
+
+function comparePathBytes(a: string, b: string): number {
+  return Buffer.compare(Buffer.from(a, 'base64'), Buffer.from(b, 'base64'));
+}
+
+function assertCanonicalPathBytes(value: string): void {
+  const bytes = Buffer.from(value, 'base64');
+  if (bytes.length === 0 || bytes.includes(0) || bytes.toString('base64') !== value) {
+    throw new Error('Commit-effect paths must be canonical base64, non-empty, and contain no NUL.');
+  }
+}
+
+function effectFor(
+  pathBytesBase64: string,
+  operation: CommitEffectOperation,
+  representation: CommitEffectRepresentation,
+): NormalizedCommitEffect {
+  const expectedState = operation === 'delete' ? 'absent' : 'present';
+  if (expectedState === 'absent') {
+    return { pathBytesBase64, operation, expectedState, rawBlobOid: null, commitBlobOid: null, commitMode: null };
+  }
+  if (!representation.rawBlobOid || !representation.commitBlobOid || !representation.commitMode) {
+    throw new Error(`A present commit effect requires raw, commit-blob, and mode evidence for ${pathBytesBase64}.`);
+  }
+  return { pathBytesBase64, operation, expectedState, ...representation };
+}
+
+/**
+ * Produces a path-byte-sorted, duplicate-free pathspec closure. Rename sources
+ * are deletions; copy sources are explicit retained effects and are never guessed.
+ */
+export function normalizeCommitEffects(input: NormalizeCommitEffectsInput): NormalizedCommitEffect[] {
+  const requiredPaths = new Set(input.commitPathspecs);
+  requiredPaths.add(input.finalPathBytesBase64);
+  for (const path of requiredPaths) assertCanonicalPathBytes(path);
+
+  const effects: NormalizedCommitEffect[] = [effectFor(
+    input.finalPathBytesBase64,
+    input.changeKind === 'delete' ? 'delete' : 'write',
+    input.finalRepresentation,
+  )];
+
+  if (input.changeKind === 'rename' || input.changeKind === 'copy') {
+    if (!input.originalPathBytesBase64) {
+      throw new Error(`${input.changeKind} normalization requires an original path.`);
+    }
+    assertCanonicalPathBytes(input.originalPathBytesBase64);
+    requiredPaths.add(input.originalPathBytesBase64);
+    effects.push(effectFor(
+      input.originalPathBytesBase64,
+      input.changeKind === 'rename' ? 'delete' : 'retain',
+      input.originalRepresentation ?? { rawBlobOid: null, commitBlobOid: null, commitMode: null },
+    ));
+  } else if (input.originalPathBytesBase64 || input.originalRepresentation) {
+    throw new Error(`${input.changeKind} normalization cannot carry an original-path effect.`);
+  }
+
+  effects.push(...(input.additionalPathspecEffects ?? []));
+  const byPath = new Map<string, NormalizedCommitEffect>();
+  for (const effect of effects) {
+    assertCanonicalPathBytes(effect.pathBytesBase64);
+    const prior = byPath.get(effect.pathBytesBase64);
+    if (prior && canonicalize(prior) !== canonicalize(effect)) {
+      throw new Error(`Conflicting commit effects for ${effect.pathBytesBase64}.`);
+    }
+    byPath.set(effect.pathBytesBase64, effect);
+  }
+  for (const path of requiredPaths) {
+    if (!byPath.has(path)) throw new Error(`Missing commit effect for pathspec ${path}.`);
+  }
+  for (const path of byPath.keys()) {
+    if (!requiredPaths.has(path)) throw new Error(`Commit effect is outside the pathspec closure: ${path}.`);
+  }
+
+  const normalized = [...byPath.values()].sort((a, b) => comparePathBytes(a.pathBytesBase64, b.pathBytesBase64));
+  canonicalize(normalized);
+  return normalized;
+}
+
+function sortedStrings(values: string[]): string[] {
+  return [...values].sort((a, b) => comparePathBytes(a, b));
+}
+
+function sortedByJcs<T>(values: T[]): T[] {
+  return [...values].sort((a, b) => {
+    const left = canonicalize(a);
+    const right = canonicalize(b);
+    return left < right ? -1 : left > right ? 1 : 0;
+  });
+}
+
+/** Sort every set-like collection before JCS encoding; input order is not identity. */
+export function normalizeReviewedSemanticManifest(
+  manifest: ReviewedSemanticManifest,
+): ReviewedSemanticManifest {
+  return {
+    ...manifest,
+    finalizations: sortedByJcs(manifest.finalizations.map((finalization) => ({
+      ...finalization,
+      frozenMembers: [...finalization.frozenMembers]
+        .sort((a, b) => comparePathBytes(a.pathBytesBase64, b.pathBytesBase64)),
+    }))),
+    members: [...manifest.members]
+      .map((member) => ({
+        ...member,
+        coveringFinalizationIds: [...member.coveringFinalizationIds].sort(),
+        commitEffects: [...member.commitEffects]
+          .sort((a, b) => comparePathBytes(a.pathBytesBase64, b.pathBytesBase64)),
+      }))
+      .sort((a, b) => comparePathBytes(a.finalPathBytesBase64, b.finalPathBytesBase64)),
+    attributionTopology: {
+      ...manifest.attributionTopology,
+      componentPathSets: sortedByJcs(manifest.attributionTopology.componentPathSets.map(sortedStrings)),
+      contributors: sortedByJcs(manifest.attributionTopology.contributors),
+      ownershipGroupKeys: [...manifest.attributionTopology.ownershipGroupKeys].sort(),
+      componentEdges: sortedByJcs(manifest.attributionTopology.componentEdges),
+      selectedUnattributedPathBytesBase64:
+        sortedStrings(manifest.attributionTopology.selectedUnattributedPathBytesBase64),
+    },
+    closureObligations: sortedByJcs(manifest.closureObligations),
+    challengeAtoms: sortedByJcs(manifest.challengeAtoms.map((atom) => atom.kind === 'unattributed'
+      ? { ...atom }
+      : {
+          ...atom,
+          memberPathBytesBase64: sortedStrings(atom.memberPathBytesBase64),
+          contributors: sortedByJcs(atom.contributors),
+          ownershipGroupKeys: [...atom.ownershipGroupKeys].sort(),
+        })),
+  };
+}
+
+/** JCS bytes used by main for a typed manifest comparison or SHA-256 digest. */
+export function canonicalizeReviewedSemanticManifest(manifest: ReviewedSemanticManifest): string {
+  return canonicalize(normalizeReviewedSemanticManifest(manifest));
 }
 
 export interface FinalizationRef {
