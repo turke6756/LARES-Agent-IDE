@@ -304,6 +304,12 @@ export class PlansWatcher {
       // ── New state-dir plans root (ensured; attached independently) ──
       if (!this.folderStates.has(ws.id)) {
         await this.attachFolderRoot(ws, isBoot);
+      } else if (!isBoot) {
+        // Periodic backstop for over-cap folders and missed/coalesced filesystem
+        // notifications. The composite folder signature makes OVERVIEW.md
+        // creation, lower-mtime replacement, rename-away, and deletion visible.
+        try { await this.reconcileFolderRoot(ws, false); }
+        catch (err) { log(`periodic folder reconcile failed for ${ws.id}`, err); }
       }
     }
   }

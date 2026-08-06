@@ -628,6 +628,9 @@ const TESTS = [
   'dist/main/main/plans/plan-folder-watcher.test.js',
   // Planning-surface WP-C: strict work-package ingest + responsibility convergence.
   'dist/main/main/plans/plan-work-package-ingest.test.js',
+  // Planning-surface WP-D: human-overview parser/observer + atomic DB projection.
+  'dist/main/main/plans/plan-human-overview.test.js',
+  'dist/main/main/database.planWorkPackageReconciliation.test.js',
   // Planning-surface Stage P3 (gate P3Z) — proposal→promotion→dispatchable-WP.
   // WP-P3A′: responsibility + promotion_requests schema/accessors.
   'dist/main/main/database.responsibility.test.js',

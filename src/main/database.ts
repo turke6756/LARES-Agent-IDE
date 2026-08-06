@@ -4,7 +4,7 @@ import os from 'os';
 import fs from 'fs';
 import crypto from 'crypto';
 import { v4 as uuidv4 } from 'uuid';
-import { AgentStopReason, deriveHookAvailability, isAgentStopReason, parseStopReason, PersistedAgentStatus } from '../shared/types';
+import { AgentStopReason, deriveHookAvailability, isAgentStopReason, parseStopReason, PersistedAgentStatus, PLAN_TAB_KEYS } from '../shared/types';
 import { Agent, AgentProvider, AgentSessionRow, AgentStatus, AgentTemplate, ContextStats, CreateAgentTemplateInput, CreateSelectionCommentInput, CreateSelectionCommentReplyInput, CreateWorkspaceInput, CreateTeamInput, FileActivity, FileOperation, Plan, PlanFormat, PlanTabKey, PlanTabOverview, SelectionComment, SelectionCommentReply, SelectionCommentStatus, SupervisorFocus, Team, TeamChannel, TeamMember, TeamMessage, TeamMessageStatus, TeamStatus, TeamTask, TeamTaskStatus, UpdateSelectionCommentInput, Workspace } from '../shared/types';
 import { parsePdfSelectionAnchor, serializePdfSelectionAnchor, validatePdfSelectionAnchor, type PdfSelectionAnchorV1, type SelectionAnchorType } from '../shared/pdf-annotations';
 import { DEFAULT_COMMAND, DEFAULT_COMMAND_WSL, SUPERVISOR_AGENT_MD } from '../shared/constants';
@@ -2168,6 +2168,17 @@ function initContextOptimizerSchema(): void {
     );
     CREATE INDEX IF NOT EXISTS idx_plan_folder_projection_workspace
       ON plan_folder_projection_state(workspace_id, wp_status);
+
+    CREATE TABLE IF NOT EXISTS plan_tab_overview_sources (
+      plan_id          TEXT NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+      tab              TEXT NOT NULL,
+      source_rel_path  TEXT NOT NULL,
+      source_hash      TEXT NOT NULL,
+      body_hash        TEXT,
+      reconcile_state  TEXT NOT NULL CHECK (reconcile_state IN ('synced','missing')),
+      reconciled_at    INTEGER NOT NULL,
+      PRIMARY KEY (plan_id, tab)
+    );
   `);
 
   // WP-2B (Priority 0) — one-time, resumable workspace-lineage backfill. Populates
@@ -5495,6 +5506,169 @@ function rowToPlanFolderProjectionState(row: any): PlanFolderProjectionState {
 export function getPlanFolderProjectionState(planId: string): PlanFolderProjectionState | null {
   const row = queryOne('SELECT * FROM plan_folder_projection_state WHERE plan_id = ?', [planId]);
   return row ? rowToPlanFolderProjectionState(row) : null;
+}
+
+export interface PlanTabOverviewSource {
+  planId: string;
+  tab: PlanTabKey;
+  sourceRelPath: string;
+  sourceHash: string;
+  bodyHash: string | null;
+  reconcileState: 'synced' | 'missing';
+  reconciledAt: number;
+}
+
+export function listPlanTabOverviewSources(planId: string): PlanTabOverviewSource[] {
+  return queryAll(
+    'SELECT * FROM plan_tab_overview_sources WHERE plan_id = ? ORDER BY tab',
+    [planId],
+  ).map((row: any) => ({
+    planId: row.plan_id,
+    tab: row.tab as PlanTabKey,
+    sourceRelPath: row.source_rel_path,
+    sourceHash: row.source_hash,
+    bodyHash: row.body_hash ?? null,
+    reconcileState: row.reconcile_state,
+    reconciledAt: Number(row.reconciled_at),
+  }));
+}
+
+function nextOverviewAdoptionState(
+  prior: PlanOverviewAdoptionState | null,
+  observedPresent: boolean,
+  projected: boolean,
+): PlanOverviewAdoptionState {
+  if (projected) return 'projected';
+  if (prior === 'projected') return 'projected';
+  if (prior === 'observed' || observedPresent) return 'observed';
+  return 'never-seen';
+}
+
+/** Record an absent/invalid/apply-error observation without touching projected bodies or provenance. */
+export function recordPlanOverviewProjectionStatus(input: {
+  workspaceId: string;
+  planId: string;
+  status: Exclude<PlanOverviewProjectionStatus, 'synced'>;
+  sourceHash: string | null;
+  diagnostics: readonly unknown[];
+  reconciledAt: number;
+  observedPresent: boolean;
+}): void {
+  getDb().transaction(() => {
+    const prior = getPlanFolderProjectionState(input.planId);
+    const adoption = nextOverviewAdoptionState(
+      prior?.overviewAdoptionState ?? null,
+      input.observedPresent,
+      false,
+    );
+    run(
+      `INSERT INTO plan_folder_projection_state
+         (plan_id, workspace_id, overview_status, overview_source_hash,
+          overview_diagnostics_json, overview_reconciled_at, overview_adoption_state)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(plan_id) DO UPDATE SET
+         overview_status = excluded.overview_status,
+         overview_source_hash = excluded.overview_source_hash,
+         overview_diagnostics_json = excluded.overview_diagnostics_json,
+         overview_reconciled_at = excluded.overview_reconciled_at,
+         overview_adoption_state = CASE
+           WHEN plan_folder_projection_state.overview_adoption_state = 'projected' THEN 'projected'
+           WHEN plan_folder_projection_state.overview_adoption_state = 'observed' THEN 'observed'
+           ELSE excluded.overview_adoption_state
+         END`,
+      [input.planId, input.workspaceId, input.status, input.sourceHash,
+        JSON.stringify(input.diagnostics), input.reconciledAt, adoption],
+    );
+  })();
+}
+
+export type PlanOverviewApplyMutationStage = 'overviews' | 'sources' | 'projection-state';
+
+/** Atomically project every stable tab key and its provenance from one valid source snapshot. */
+export function applyPlanOverviewSnapshot(input: {
+  workspaceId: string;
+  planId: string;
+  sourceRelPath: string;
+  sourceHash: string;
+  bodies: ReadonlyMap<PlanTabKey, { body: string; bodyHash: string }>;
+  updatedBy: string | null;
+  reconciledAt: number;
+  afterMutationStage?: (stage: PlanOverviewApplyMutationStage) => void;
+}): void {
+  const database = getDb();
+  let transactionOpen = false;
+  try {
+    database.exec('BEGIN IMMEDIATE');
+    transactionOpen = true;
+    const plan = queryOne('SELECT workspace_id FROM plans WHERE id = ?', [input.planId]) as
+      { workspace_id: string } | null;
+    if (!plan || plan.workspace_id !== input.workspaceId) {
+      throw new Error(`applyPlanOverviewSnapshot: plan ${input.planId} is not in workspace ${input.workspaceId}`);
+    }
+    for (const tab of PLAN_TAB_KEYS) {
+      const mapped = input.bodies.get(tab);
+      const body = mapped?.body ?? null;
+      const current = queryOne(
+        'SELECT body FROM plan_tab_overviews WHERE plan_id = ? AND tab = ?',
+        [input.planId, tab],
+      ) as { body: string | null } | null;
+      if (!current) {
+        run(
+          `INSERT INTO plan_tab_overviews
+             (plan_id, tab, body, revision, updated_by, updated_at)
+           VALUES (?, ?, ?, 1, ?, datetime('now'))`,
+          [input.planId, tab, body, input.updatedBy],
+        );
+      } else if (current.body !== body) {
+        run(
+          `UPDATE plan_tab_overviews SET body = ?, revision = revision + 1,
+             updated_by = ?, updated_at = datetime('now') WHERE plan_id = ? AND tab = ?`,
+          [body, input.updatedBy, input.planId, tab],
+        );
+      } else {
+        run(
+          `UPDATE plan_tab_overviews SET updated_by = ?, updated_at = datetime('now')
+            WHERE plan_id = ? AND tab = ? AND updated_by IS NOT ?`,
+          [input.updatedBy, input.planId, tab, input.updatedBy],
+        );
+      }
+    }
+    input.afterMutationStage?.('overviews');
+    for (const tab of PLAN_TAB_KEYS) {
+      const mapped = input.bodies.get(tab);
+      run(
+        `INSERT INTO plan_tab_overview_sources
+           (plan_id, tab, source_rel_path, source_hash, body_hash, reconcile_state, reconciled_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(plan_id, tab) DO UPDATE SET
+           source_rel_path = excluded.source_rel_path,
+           source_hash = excluded.source_hash,
+           body_hash = excluded.body_hash,
+           reconcile_state = excluded.reconcile_state,
+           reconciled_at = excluded.reconciled_at`,
+        [input.planId, tab, input.sourceRelPath, input.sourceHash, mapped?.bodyHash ?? null,
+          mapped ? 'synced' : 'missing', input.reconciledAt],
+      );
+    }
+    input.afterMutationStage?.('sources');
+    run(
+      `INSERT INTO plan_folder_projection_state
+         (plan_id, workspace_id, overview_status, overview_source_hash,
+          overview_diagnostics_json, overview_reconciled_at, overview_adoption_state)
+       VALUES (?, ?, 'synced', ?, '[]', ?, 'projected')
+       ON CONFLICT(plan_id) DO UPDATE SET
+         overview_status = 'synced', overview_source_hash = excluded.overview_source_hash,
+         overview_diagnostics_json = '[]', overview_reconciled_at = excluded.overview_reconciled_at,
+         overview_adoption_state = 'projected'`,
+      [input.planId, input.workspaceId, input.sourceHash, input.reconciledAt],
+    );
+    input.afterMutationStage?.('projection-state');
+    database.exec('COMMIT');
+    transactionOpen = false;
+  } catch (err) {
+    if (transactionOpen) database.exec('ROLLBACK');
+    throw err;
+  }
 }
 
 export function listManagedPlanWorkPackages(planId: string): ManagedPlanWorkPackage[] {

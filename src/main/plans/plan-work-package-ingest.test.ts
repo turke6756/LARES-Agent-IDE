@@ -118,6 +118,35 @@ function writePackages(ctx: ReturnType<typeof context>, packages: PackageSpec[],
   return abs;
 }
 
+function overviewDocument(artifactId: string, overviewBody = 'Readable summary.', over: {
+  frontmatter?: string; index?: string;
+} = {}): string {
+  const frontmatter = over.frontmatter ?? `---\nplan_artifact_id: ${artifactId}\nkind: human-overview\nschema_version: 1\n---`;
+  const index = over.index ?? `<!--PLAN-TAB-OVERVIEWS:v1
+{"schema_version":1,"plan_artifact_id":"${artifactId}","sections":[
+  {"tab":"overview","heading":"What changes"},
+  {"tab":"packages","heading":"Work packages"}
+]}
+-->`;
+  return `${frontmatter}\n\n${index}\n\n<!--PLAN-TAB-SECTION:overview:BEGIN-->
+## What changes
+
+${overviewBody}
+<!--PLAN-TAB-SECTION:overview:END-->
+
+<!--PLAN-TAB-SECTION:packages:BEGIN-->
+## Work packages
+
+Readable packages.
+<!--PLAN-TAB-SECTION:packages:END-->\n`;
+}
+
+function writeOverview(ctx: ReturnType<typeof context>, body = 'Readable summary.'): string {
+  const abs = path.join(ctx.folderAbs, 'OVERVIEW.md');
+  fs.writeFileSync(abs, overviewDocument(ctx.artifactId, body));
+  return abs;
+}
+
 function reconcile(ctx: ReturnType<typeof context>, over: Record<string, unknown> = {}) {
   return ingest.reconcilePlanFolderPlanningState({ workspaceId: ctx.workspace.id,
     planId: ctx.plan.id, folderAbs: ctx.folderAbs, folderRelPath: ctx.folderRelPath,
@@ -305,6 +334,77 @@ test('moving responsibility clears only the prior pointer when it targets this p
   assert.equal(raw('SELECT * FROM supervisor_active_plan WHERE supervisor_id = ?', [next.id]).length, 0);
 });
 
+test('overview projects after responsibility and packages; invalid responsibility attributes NULL', () => {
+  const ctx = context();
+  writeManifest(ctx, [{ event_id: 'bad-owner', event: 'assigned', agent_id: 'missing-supervisor' }]);
+  writePackages(ctx, [spec()]);
+  writeOverview(ctx);
+  const result = reconcile(ctx);
+  assert.equal(result.responsibility.status, 'invalid');
+  assert.equal(result.workPackages.status, 'synced');
+  assert.equal(result.overview.status, 'synced');
+  const rows = raw('SELECT tab, body, revision, updated_by FROM plan_tab_overviews WHERE plan_id = ? ORDER BY tab',
+    [ctx.plan.id]) as Array<{ tab: string; body: string | null; revision: number; updated_by: string | null }>;
+  assert.equal(rows.length, 8);
+  assert.equal(rows.find((row) => row.tab === 'overview')?.body, 'Readable summary.');
+  assert.equal(rows.find((row) => row.tab === 'proposal')?.body, null);
+  assert.ok(rows.every((row) => row.updated_by === null));
+  assert.equal(dbm.getPlanFolderProjectionState(ctx.plan.id)?.overviewAdoptionState, 'projected');
+
+  const supervisor = dbm.createAgent({ workspaceId: ctx.workspace.id, title: 'Owner', roleDescription: '',
+    workingDirectory: ctx.workspace.path, command: 'x', isSupervisor: true,
+    tmuxSessionName: null, autoRestartEnabled: false, logPath: 'l' });
+  writeManifest(ctx, [{ event_id: 'valid-owner', event: 'assigned', agent_id: supervisor.id }]);
+  assert.equal(reconcile(ctx).overview.status, 'synced');
+  const attributed = raw('SELECT revision, updated_by FROM plan_tab_overviews WHERE plan_id = ? AND tab = ?',
+    [ctx.plan.id, 'overview'])[0] as { revision: number; updated_by: string };
+  assert.equal(Number(attributed.revision), 1, 'attribution-only convergence does not bump body revision');
+  assert.equal(attributed.updated_by, supervisor.id);
+});
+
+test('invalid and removed overview preserve last-applied bodies/provenance and never restore seeding', () => {
+  const ctx = context(); writeManifest(ctx); writePackages(ctx, [spec()]);
+  const source = writeOverview(ctx, 'Last valid body.');
+  assert.equal(reconcile(ctx).overview.status, 'synced');
+  const beforeRows = raw('SELECT tab, body, revision FROM plan_tab_overviews WHERE plan_id = ? ORDER BY tab', [ctx.plan.id]);
+  const beforeSources = raw('SELECT * FROM plan_tab_overview_sources WHERE plan_id = ? ORDER BY tab', [ctx.plan.id]);
+  fs.writeFileSync(source, overviewDocument(ctx.artifactId, 'Invalid body.').replace('"schema_version":1', '"schema_version":2'));
+  assert.equal(reconcile(ctx).overview.status, 'invalid');
+  assert.deepEqual(raw('SELECT tab, body, revision FROM plan_tab_overviews WHERE plan_id = ? ORDER BY tab', [ctx.plan.id]), beforeRows);
+  assert.deepEqual(raw('SELECT * FROM plan_tab_overview_sources WHERE plan_id = ? ORDER BY tab', [ctx.plan.id]), beforeSources);
+  fs.unlinkSync(source);
+  assert.equal(reconcile(ctx).overview.status, 'absent');
+  assert.deepEqual(raw('SELECT tab, body, revision FROM plan_tab_overviews WHERE plan_id = ? ORDER BY tab', [ctx.plan.id]), beforeRows);
+  assert.deepEqual(raw('SELECT * FROM plan_tab_overview_sources WHERE plan_id = ? ORDER BY tab', [ctx.plan.id]), beforeSources);
+  const state = dbm.getPlanFolderProjectionState(ctx.plan.id)!;
+  assert.equal(state.overviewStatus, 'absent');
+  assert.equal(state.overviewSourceHash, null);
+  assert.equal(state.overviewAdoptionState, 'projected');
+});
+
+test('observed invalid overview remains observed after removal and cannot return to never-seen', () => {
+  const ctx = context(); writeManifest(ctx); writePackages(ctx, [spec()]);
+  const source = writeOverview(ctx);
+  fs.writeFileSync(source, overviewDocument(ctx.artifactId).replace('kind: human-overview', 'kind: wrong'));
+  assert.equal(reconcile(ctx).overview.status, 'invalid');
+  assert.equal(dbm.getPlanFolderProjectionState(ctx.plan.id)?.overviewAdoptionState, 'observed');
+  fs.unlinkSync(source);
+  assert.equal(reconcile(ctx).overview.status, 'absent');
+  assert.equal(dbm.getPlanFolderProjectionState(ctx.plan.id)?.overviewAdoptionState, 'observed');
+});
+
+test('injected unsafe overview observation advances adoption without applying', () => {
+  const ctx = context(); writeManifest(ctx); writePackages(ctx, [spec()]);
+  const result = reconcile(ctx, { overviewObserve: () => ({
+    token: 'unsafe', present: true, safeRegularFile: false, oversized: false, bytes: null,
+    diagnostics: [{ code: 'overview-source-unsafe', detail: 'injected junction escape' }],
+  }) });
+  assert.equal(result.overview.status, 'invalid');
+  assert.equal(result.overview.token, 'unsafe');
+  assert.equal(dbm.getPlanFolderProjectionState(ctx.plan.id)?.overviewAdoptionState, 'observed');
+  assert.equal(raw('SELECT * FROM plan_tab_overviews WHERE plan_id = ?', [ctx.plan.id]).length, 0);
+});
+
 test('repeated refresh and simulated restart are idempotent', () => {
   const ctx = context(); writeManifest(ctx); writePackages(ctx, [spec()]);
   reconcile(ctx); reconcile(ctx);
@@ -353,6 +453,50 @@ test('watcher boot/change and explicit single-folder refresh share one projectio
   await restartedWatcher.reconcileWorkspace(workspace, true);
   assert.equal(dbm.getPlanWorkPackage(`wp:${artifactId}:wp-a`)?.revision, 2,
     'boot restart converges without another semantic revision');
+});
+
+test('composite watcher signature converges overview creation, lower-mtime replacement, rename-away, and restore', async () => {
+  seq += 1;
+  const workspacePath = path.join(root, `overview-watcher-ws-${seq}`);
+  const folderRelPath = `.lares/plans/overview-watcher-${seq}`;
+  const folderAbs = path.join(workspacePath, ...folderRelPath.split('/'));
+  fs.mkdirSync(path.join(folderAbs, 'supplements'), { recursive: true });
+  const workspace = dbm.createWorkspace({ title: `overview-watcher-${seq}`, path: workspacePath, pathType: 'windows' });
+  const artifactId = `plan_overview_watcher_${seq}`;
+  fs.writeFileSync(path.join(folderAbs, 'plan.json'), JSON.stringify({
+    schema_version: 1, plan_artifact_id: artifactId, plan_sku: `overview-watcher-${seq}`,
+    responsibility_events: [],
+  }));
+  fs.writeFileSync(path.join(folderAbs, 'plan.md'), '# watcher\n');
+  fs.writeFileSync(path.join(folderAbs, 'ARC.md'), '# newest managed file\n');
+  fs.writeFileSync(path.join(folderAbs, 'supplements', 'work-packages.md'), document([spec()], { artifactId }));
+  const watcherInstance = new watcher.PlanFolderWatcher();
+  const boot = await watcherInstance.reconcileWorkspace(workspace, true);
+  const planId = boot.settled[0].planId;
+  assert.equal(dbm.getPlanFolderProjectionState(planId)?.overviewStatus, 'absent');
+
+  const overview = path.join(folderAbs, 'OVERVIEW.md');
+  fs.writeFileSync(overview, overviewDocument(artifactId, 'Created.'));
+  const old = new Date(Date.now() - 86_400_000);
+  fs.utimesSync(overview, old, old);
+  await watcherInstance.reconcileWorkspace(workspace, false);
+  assert.equal(dbm.getPlanTabOverview(planId, 'overview')?.body, 'Created.');
+
+  fs.writeFileSync(overview, overviewDocument(artifactId, 'Lower mtime replacement.'));
+  const evenOlder = new Date(Date.now() - 172_800_000);
+  fs.utimesSync(overview, evenOlder, evenOlder);
+  await watcherInstance.reconcileWorkspace(workspace, false);
+  assert.equal(dbm.getPlanTabOverview(planId, 'overview')?.body, 'Lower mtime replacement.');
+
+  const renamed = path.join(folderAbs, 'OVERVIEW.away.md');
+  fs.renameSync(overview, renamed);
+  await watcherInstance.reconcileWorkspace(workspace, false);
+  assert.equal(dbm.getPlanFolderProjectionState(planId)?.overviewStatus, 'absent');
+  assert.equal(dbm.getPlanTabOverview(planId, 'overview')?.body, 'Lower mtime replacement.');
+  fs.renameSync(renamed, overview);
+  await watcherInstance.reconcileWorkspace(workspace, false);
+  assert.equal(dbm.getPlanFolderProjectionState(planId)?.overviewStatus, 'synced');
+  assert.equal(dbm.getPlanTabOverview(planId, 'overview')?.body, 'Lower mtime replacement.');
 });
 
 (async () => {

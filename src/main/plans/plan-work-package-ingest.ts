@@ -11,6 +11,7 @@ import {
   type ReconciledPlanWorkPackageState,
 } from '../database';
 import { parseStrictJson } from './strict-json';
+import { reconcilePlanHumanOverview, type PlanHumanOverviewReconcileResult } from './plan-human-overview';
 
 export const PLAN_WORK_PACKAGE_MAX_BYTES = 1_000_000;
 
@@ -67,6 +68,7 @@ export interface PlanFolderProjectionReconcileResult {
     diagnostics: PlanWorkPackageDiagnostic[];
     applyResult?: ApplyPlanWorkPackageSnapshotResult;
   };
+  overview: PlanHumanOverviewReconcileResult;
 }
 
 type ManifestRead = {
@@ -429,6 +431,8 @@ export function reconcilePlanFolderPlanningState(input: {
   now?: () => number;
   /** Test-only race seam, called after a valid parse and before the required re-stat. */
   beforeSourceRestat?: (attempt: number, sourceAbs: string) => void;
+  /** Test-only filesystem observer seam for overview safety/token outcomes. */
+  overviewObserve?: Parameters<typeof reconcilePlanHumanOverview>[0]['observe'];
 }): PlanFolderProjectionReconcileResult {
   const reconciledAt = (input.now ?? (() => Date.now()))();
   const manifest = readManifest(input.folderAbs);
@@ -437,12 +441,28 @@ export function reconcilePlanFolderPlanningState(input: {
     workspaceId: input.workspaceId, planId: input.planId, reconciledAt });
 
   const artifactId = manifest.value?.plan_artifact_id;
+  const complete = (
+    workPackages: PlanFolderProjectionReconcileResult['workPackages'],
+  ): PlanFolderProjectionReconcileResult => ({
+    responsibility,
+    workPackages,
+    overview: reconcilePlanHumanOverview({
+      workspaceId: input.workspaceId,
+      planId: input.planId,
+      folderAbs: input.folderAbs,
+      folderRelPath: input.folderRelPath,
+      expectedPlanArtifactId: typeof artifactId === 'string' ? artifactId : null,
+      updatedBy: responsibility.status === 'valid' ? responsibility.supervisorId : null,
+      reconciledAt,
+      observe: input.overviewObserve,
+    }),
+  });
   if (typeof artifactId !== 'string' || artifactId === '') {
     const diagnostics = manifest.diagnostics.length > 0 ? manifest.diagnostics
       : [{ code: 'manifest-invalid' as const, detail: 'plan.json has no plan_artifact_id' }];
     persistWpStatus({ workspaceId: input.workspaceId, planId: input.planId,
       status: 'invalid', diagnostics, reconciledAt });
-    return { responsibility, workPackages: { status: 'invalid', diagnostics } };
+    return complete({ status: 'invalid', diagnostics });
   }
 
   for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -455,13 +475,13 @@ export function reconcilePlanFolderPlanningState(input: {
         ? [{ code: 'source-absent' as const, detail: 'previously ingested work-package source is missing' }]
         : located.diagnostics;
       persistWpStatus({ workspaceId: input.workspaceId, planId: input.planId, status, diagnostics, reconciledAt });
-      return { responsibility, workPackages: { status, diagnostics } };
+      return complete({ status, diagnostics });
     }
     const parsed = parsePlanWorkPackageDocument(located.source.body, artifactId, located.source.sourceRelPath);
     if (!parsed.ok) {
       persistWpStatus({ workspaceId: input.workspaceId, planId: input.planId,
         status: 'invalid', diagnostics: parsed.diagnostics, reconciledAt });
-      return { responsibility, workPackages: { status: 'invalid', diagnostics: parsed.diagnostics } };
+      return complete({ status: 'invalid', diagnostics: parsed.diagnostics });
     }
     input.beforeSourceRestat?.(attempt, located.source.absPath);
     if (!sourceStillMatches(located.source)) {
@@ -470,7 +490,7 @@ export function reconcilePlanFolderPlanningState(input: {
         detail: 'work-package source changed twice before apply', sourceRelPath: located.source.sourceRelPath }];
       persistWpStatus({ workspaceId: input.workspaceId, planId: input.planId,
         status: 'invalid', diagnostics, reconciledAt });
-      return { responsibility, workPackages: { status: 'invalid', diagnostics } };
+      return complete({ status: 'invalid', diagnostics });
     }
     try {
       const applyResult = applyPlanWorkPackageSnapshot({
@@ -486,15 +506,15 @@ export function reconcilePlanFolderPlanningState(input: {
           ({ code: 'apply-conflict', detail, sourceRelPath: located.source.sourceRelPath }));
         persistWpStatus({ workspaceId: input.workspaceId, planId: input.planId,
           status: 'conflict', diagnostics, reconciledAt });
-        return { responsibility, workPackages: { status: 'conflict', diagnostics, applyResult } };
+        return complete({ status: 'conflict', diagnostics, applyResult });
       }
-      return { responsibility, workPackages: { status: 'synced', diagnostics: [], applyResult } };
+      return complete({ status: 'synced', diagnostics: [], applyResult });
     } catch (err) {
       const diagnostics: PlanWorkPackageDiagnostic[] = [{ code: 'apply-failed',
         detail: err instanceof Error ? err.message : String(err), sourceRelPath: located.source.sourceRelPath }];
       persistWpStatus({ workspaceId: input.workspaceId, planId: input.planId,
         status: 'invalid', diagnostics, reconciledAt });
-      return { responsibility, workPackages: { status: 'invalid', diagnostics } };
+      return complete({ status: 'invalid', diagnostics });
     }
   }
   throw new Error('unreachable work-package retry state');

@@ -127,7 +127,7 @@ type WatcherModule = {
     adoptedFoldersForTests(workspaceId: string): string[];
   };
   validatePlanFolder(folderAbs: string): { valid: boolean; reason?: string; planArtifactId?: string };
-  computeFolderSignature(folderAbs: string): number;
+  computeFolderSignature(folderAbs: string): { maxManagedMtimeMs: number; overviewToken: string };
   DEFAULT_FOLDER_CHILD_SUB_CAP: number;
   PLAN_FOLDER_OUTPUT_SUBDIRS: readonly string[];
 };
@@ -230,7 +230,8 @@ test('computeFolderSignature rises when a nested output file is added/edited', (
   fs.writeFileSync(out, '# out\n');
   fs.utimesSync(out, 5_000_000 / 1000, 5_000_000 / 1000);
   const s1 = wm.computeFolderSignature(folderAbsOf(sku));
-  assert.ok(s1 > s0, `nested edit bumps signature (${s0} → ${s1})`);
+  assert.ok(s1.maxManagedMtimeMs > s0.maxManagedMtimeMs,
+    `nested edit bumps signature (${s0.maxManagedMtimeMs} → ${s1.maxManagedMtimeMs})`);
 });
 
 // ── Adopt behavior ─────────────────────────────────────────────────────────────

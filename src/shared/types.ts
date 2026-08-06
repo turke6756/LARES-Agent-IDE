@@ -5070,6 +5070,13 @@ export const PLAN_TAB_KEYS: readonly PlanTabKey[] = [
   'legacy-html',
 ];
 
+/** Exact-byte observation token for a structured plan's disk-owned OVERVIEW.md. */
+export type ObservedOverviewSourceToken =
+  | 'absent'
+  | 'unsafe'
+  | 'unreadable'
+  | `sha256:${string}`;
+
 /** Runtime membership guard for the stable `PlanTabKey` domain. Used at the IPC
  *  boundary so a renderer-supplied `tab` is validated before it keys a row. */
 export function isPlanTabKey(value: unknown): value is PlanTabKey {

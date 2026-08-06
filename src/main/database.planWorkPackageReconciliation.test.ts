@@ -132,6 +132,9 @@ test('schema adds both companions and overview columns without changing the froz
   const projection = columns('plan_folder_projection_state');
   for (const name of ['overview_status', 'overview_source_hash', 'overview_diagnostics_json',
     'overview_reconciled_at', 'overview_adoption_state']) assert.ok(projection.includes(name), name);
+  assert.deepEqual(columns('plan_tab_overview_sources'), [
+    'plan_id', 'tab', 'source_rel_path', 'source_hash', 'body_hash', 'reconcile_state', 'reconciled_at',
+  ]);
 });
 
 test('initial apply creates managed packages, paths and order with synced provenance', () => {
@@ -290,6 +293,87 @@ test('every mutation-stage fault rolls back the entire applied snapshot', () => 
       },
     }), new RegExp(`fault:${stage}`));
     assert.equal(snapshot(ctx.planId), before, `rollback after ${stage}`);
+  }
+});
+
+function overviewSnapshot(planId: string): string {
+  return JSON.stringify({
+    overviews: rawRows('SELECT * FROM plan_tab_overviews WHERE plan_id = ? ORDER BY tab', [planId]),
+    sources: rawRows('SELECT * FROM plan_tab_overview_sources WHERE plan_id = ? ORDER BY tab', [planId]),
+    projection: rawRows('SELECT * FROM plan_folder_projection_state WHERE plan_id = ?', [planId]),
+  });
+}
+
+function applyOverview(ctx: ReturnType<typeof context>, entries: Array<[string, string]>, over: Record<string, unknown> = {}) {
+  return dbm.applyPlanOverviewSnapshot({
+    workspaceId: ctx.workspaceId,
+    planId: ctx.planId,
+    sourceRelPath: '.lares/plans/test/OVERVIEW.md',
+    sourceHash: 'sha256:source-1',
+    bodies: new Map(entries.map(([tab, body]) => [tab, { body, bodyHash: `hash:${body}` }])) as any,
+    updatedBy: null,
+    reconciledAt: 9000 + seq,
+    ...over,
+  });
+}
+
+test('overview projection writes all stable keys atomically and revisions only effective body changes', () => {
+  const ctx = context();
+  applyOverview(ctx, [['overview', 'Summary'], ['packages', 'Packages']]);
+  const rows = rawRows(
+    'SELECT tab, body, revision, updated_by FROM plan_tab_overviews WHERE plan_id = ? ORDER BY tab',
+    [ctx.planId],
+  ) as Array<{ tab: string; body: string | null; revision: number; updated_by: string | null }>;
+  assert.equal(rows.length, 8);
+  assert.deepEqual(rows.find((row) => row.tab === 'overview'),
+    { tab: 'overview', body: 'Summary', revision: 1, updated_by: null });
+  assert.deepEqual(rows.find((row) => row.tab === 'proposal'),
+    { tab: 'proposal', body: null, revision: 1, updated_by: null });
+  applyOverview(ctx, [['overview', 'Summary'], ['packages', 'Packages']], { sourceHash: 'sha256:source-2' });
+  assert.ok((rawRows('SELECT revision FROM plan_tab_overviews WHERE plan_id = ?', [ctx.planId]) as Array<{ revision: number }>)
+    .every((row) => Number(row.revision) === 1));
+  applyOverview(ctx, [['overview', 'Changed']], { sourceHash: 'sha256:source-3' });
+  const changed = rawRows('SELECT tab, body, revision FROM plan_tab_overviews WHERE plan_id = ? AND tab IN (?, ?) ORDER BY tab',
+    [ctx.planId, 'overview', 'packages']) as Array<{ tab: string; body: string | null; revision: number }>;
+  assert.deepEqual(changed, [
+    { tab: 'overview', body: 'Changed', revision: 2 },
+    { tab: 'packages', body: null, revision: 2 },
+  ]);
+  assert.equal(dbm.listPlanTabOverviewSources(ctx.planId).length, 8);
+  assert.equal(dbm.getPlanFolderProjectionState(ctx.planId)?.overviewAdoptionState, 'projected');
+});
+
+test('overview adoption is monotonic across invalid, absent, projected, and removed observations', () => {
+  const ctx = context();
+  dbm.recordPlanOverviewProjectionStatus({ workspaceId: ctx.workspaceId, planId: ctx.planId,
+    status: 'invalid', sourceHash: 'sha256:bad', diagnostics: ['bad'], reconciledAt: 1, observedPresent: true });
+  assert.equal(dbm.getPlanFolderProjectionState(ctx.planId)?.overviewAdoptionState, 'observed');
+  dbm.recordPlanOverviewProjectionStatus({ workspaceId: ctx.workspaceId, planId: ctx.planId,
+    status: 'absent', sourceHash: null, diagnostics: ['gone'], reconciledAt: 2, observedPresent: false });
+  assert.equal(dbm.getPlanFolderProjectionState(ctx.planId)?.overviewAdoptionState, 'observed');
+  applyOverview(ctx, [['overview', 'Applied']]);
+  const before = overviewSnapshot(ctx.planId);
+  dbm.recordPlanOverviewProjectionStatus({ workspaceId: ctx.workspaceId, planId: ctx.planId,
+    status: 'invalid', sourceHash: 'sha256:bad-again', diagnostics: ['bad'], reconciledAt: 3, observedPresent: true });
+  dbm.recordPlanOverviewProjectionStatus({ workspaceId: ctx.workspaceId, planId: ctx.planId,
+    status: 'absent', sourceHash: null, diagnostics: ['gone'], reconciledAt: 4, observedPresent: false });
+  assert.equal(dbm.getPlanFolderProjectionState(ctx.planId)?.overviewAdoptionState, 'projected');
+  assert.deepEqual(rawRows('SELECT body, revision FROM plan_tab_overviews WHERE plan_id = ? ORDER BY tab', [ctx.planId]),
+    (JSON.parse(before) as { overviews: Array<Record<string, unknown>> }).overviews.map(({ body, revision }) => ({ body, revision })));
+  assert.equal(dbm.listPlanTabOverviewSources(ctx.planId).length, 8, 'missing/invalid preserves provenance');
+});
+
+test('every overview mutation-stage fault rolls back bodies, provenance, and status together', () => {
+  const stages: Array<'overviews' | 'sources' | 'projection-state'> = ['overviews', 'sources', 'projection-state'];
+  for (const stage of stages) {
+    const ctx = context();
+    applyOverview(ctx, [['overview', 'Before'], ['packages', 'Before packages']]);
+    const before = overviewSnapshot(ctx.planId);
+    assert.throws(() => applyOverview(ctx, [['overview', 'After']], {
+      sourceHash: 'sha256:after',
+      afterMutationStage: (observed: string) => { if (observed === stage) throw new Error(`fault:${stage}`); },
+    }), new RegExp(`fault:${stage}`));
+    assert.equal(overviewSnapshot(ctx.planId), before, `overview rollback after ${stage}`);
   }
 });
 

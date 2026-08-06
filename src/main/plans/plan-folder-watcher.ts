@@ -24,11 +24,12 @@
 
 import fs from 'fs';
 import path from 'path';
-import type { Workspace } from '../../shared/types';
+import type { ObservedOverviewSourceToken, Workspace } from '../../shared/types';
 import { adoptStructuredPlan, softDeletePlan, type StructuredPlanChange } from '../database';
 import { workspaceStateDir, workspaceStateDirName } from '../workspace-state-dir';
 import { scanPlanIntentLedger } from './plan-intent-ledger';
 import { reconcilePlanFolderPlanningState } from './plan-work-package-ingest';
+import { observeOverviewSource } from './plan-human-overview';
 
 /** Subdirs a plan folder scatters outputs into (§R0). Watched as bounded child
  *  subscriptions by PlansWatcher; enumerated here for the change signature. */
@@ -137,7 +138,12 @@ function readPlanMdMeta(folderAbs: string): { mtimeMs: number; sizeBytes: number
  *  `plan.md`, `ARC.md`, and the files in the three output subdirs (bounded). A
  *  nested output edit bumps this even when `plan.md` is untouched, so the settled
  *  callback fires precisely on real content change rather than every scan. */
-export function computeFolderSignature(folderAbs: string): number {
+export interface PlanFolderSignature {
+  maxManagedMtimeMs: number;
+  overviewToken: ObservedOverviewSourceToken;
+}
+
+export function computeFolderSignature(folderAbs: string): PlanFolderSignature {
   let maxMtime = 0;
   let seen = 0;
   const consider = (abs: string): void => {
@@ -157,7 +163,7 @@ export function computeFolderSignature(folderAbs: string): number {
   try {
     top = fs.readdirSync(folderAbs, { withFileTypes: true });
   } catch {
-    return 0;
+    return { maxManagedMtimeMs: 0, overviewToken: observeOverviewSource(folderAbs).token };
   }
   for (const e of top) {
     if (e.isFile()) consider(path.join(folderAbs, e.name));
@@ -174,7 +180,11 @@ export function computeFolderSignature(folderAbs: string): number {
       if (e.isFile()) consider(path.join(folderAbs, sub, e.name));
     }
   }
-  return maxMtime;
+  return { maxManagedMtimeMs: maxMtime, overviewToken: observeOverviewSource(folderAbs).token };
+}
+
+function signaturesEqual(a: PlanFolderSignature, b: PlanFolderSignature): boolean {
+  return a.maxManagedMtimeMs === b.maxManagedMtimeMs && a.overviewToken === b.overviewToken;
 }
 
 // ── Path safety (local; no coupling to another lane's exports) ────────────────
@@ -202,7 +212,7 @@ export interface PlanFolderWatcherOptions {
 interface AdoptedFolder {
   planId: string;
   artifactId: string;
-  signature: number;
+  signature: PlanFolderSignature;
 }
 
 /** Per-workspace ingest state + reconciler. Holds the adopted-folder snapshot so
@@ -347,7 +357,8 @@ export class PlanFolderWatcher {
       let changeKind: FolderChangeKind | null = null;
       if (isBoot) changeKind = 'boot';
       else if (adopt.change === 'adopted' || adopt.change === 'revived') changeKind = 'adopted';
-      else if (adopt.change === 'changed' || (priorSnap != null && priorSnap.signature !== signature)) changeKind = 'changed';
+      else if (adopt.change === 'changed'
+        || (priorSnap != null && !signaturesEqual(priorSnap.signature, signature))) changeKind = 'changed';
 
       if (changeKind !== null) {
         result.settled.push({ planId: adopt.planId, folderRelPath, changeKind });
@@ -400,6 +411,11 @@ export class PlanFolderWatcher {
       if (projections.workPackages.status === 'invalid' || projections.workPackages.status === 'conflict') {
         for (const diagnostic of projections.workPackages.diagnostics) {
           console.warn(`[plan-work-package-ingest] ${diagnostic.code}: ${diagnostic.detail}`);
+        }
+      }
+      if (projections.overview.status === 'invalid' || projections.overview.status === 'apply-error') {
+        for (const diagnostic of projections.overview.diagnostics) {
+          console.warn(`[plan-human-overview] ${diagnostic.code}: ${diagnostic.detail}`);
         }
       }
       if (this.onSettled) await this.onSettled(planId, folderRelPath, changeKind);

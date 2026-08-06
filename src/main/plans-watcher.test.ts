@@ -198,6 +198,27 @@ test('row reconciliation still soft-deletes vanished files', async () => {
   assert.equal(softDeleted, 'p-del', 'soft-delete DID run');
 });
 
+test('periodic attach pass reconciles an already-attached structured folder root', async () => {
+  installDbStubs();
+  db.getWorkspaces = () => [WS];
+  const w = new PlansWatcher();
+  let reconciled = 0;
+  (w as any).folderWatcher.reconcileWorkspace = async () => {
+    reconciled += 1;
+    return { settled: [], watchable: [], overCap: [], removed: [], diagnostics: [] };
+  };
+  (w as any).folderStates.set(WS.id, {
+    ws: WS, home: '/home/x/ws/.lares/plans', rootUnsubscribe: () => {},
+    childSubs: new Map(), debounce: null,
+  });
+  (w as any).states.set(WS.id, {
+    ws: WS, plansDir: '/home/x/ws/plans', snapshots: new Map(), pending: new Map(),
+    unsubscribe: () => {}, debounce: null,
+  });
+  await (w as any).attachAll(false);
+  assert.equal(reconciled, 1, 'the periodic pass is the convergence backstop for over-cap/missed events');
+});
+
 // ── 3. Adoption decision (WP3 C6) — applyCreate via reconcileWorkspace ──────────
 // Drives the create-action path with injected readPlanId/patchPlanId so the
 // `data-plan-id` adoption ladder runs without real fs: adopt a known same-ws id
