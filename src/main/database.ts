@@ -2115,6 +2115,61 @@ function initContextOptimizerSchema(): void {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_plan_dispatch_attempts_reconcile
     ON plan_dispatch_attempts(state, created_at)`);
 
+  // Planning-surface WP-B: disk work-package provenance and the shared plan-folder
+  // projection status row. These are companions; plan_work_packages stays frozen.
+  // The overview columns are provisioned here for WP-D, their eventual sole writer.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS plan_work_package_sources (
+      package_id           TEXT PRIMARY KEY
+                           REFERENCES plan_work_packages(id) ON DELETE CASCADE,
+      workspace_id         TEXT NOT NULL,
+      plan_id              TEXT NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+      source_rel_path      TEXT NOT NULL,
+      source_local_id      TEXT NOT NULL COLLATE NOCASE,
+      source_format        TEXT NOT NULL CHECK (source_format = 'structured-v1'),
+      applied_hash         TEXT NOT NULL,
+      observed_hash        TEXT,
+      applied_order        INTEGER NOT NULL,
+      observed_order       INTEGER,
+      declared_state       TEXT NOT NULL CHECK (declared_state IN ('ready','blocked')),
+      reconcile_state      TEXT NOT NULL CHECK (reconcile_state IN (
+        'synced', 'drift-conflict', 'missing-pristine', 'missing-conflict'
+      )),
+      present              INTEGER NOT NULL CHECK (present IN (0,1)),
+      tombstoned_at        INTEGER,
+      first_seen_at        INTEGER NOT NULL,
+      last_seen_at         INTEGER NOT NULL,
+      UNIQUE(plan_id, source_local_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_plan_wp_sources_plan
+      ON plan_work_package_sources(plan_id, reconcile_state);
+
+    CREATE TABLE IF NOT EXISTS plan_folder_projection_state (
+      plan_id                       TEXT PRIMARY KEY REFERENCES plans(id) ON DELETE CASCADE,
+      workspace_id                  TEXT NOT NULL,
+      wp_status                     TEXT NOT NULL DEFAULT 'unpackaged'
+                                    CHECK (wp_status IN ('unpackaged','synced','invalid','conflict')),
+      wp_source_rel_path            TEXT,
+      wp_projection_hash            TEXT,
+      wp_diagnostics_json           TEXT NOT NULL DEFAULT '[]',
+      wp_reconciled_at              INTEGER,
+      responsibility_event_id       TEXT,
+      responsibility_status         TEXT NOT NULL DEFAULT 'absent'
+                                    CHECK (responsibility_status IN ('valid','absent','invalid')),
+      responsibility_detail         TEXT,
+      responsibility_reconciled_at  INTEGER,
+      overview_status               TEXT NOT NULL DEFAULT 'absent'
+                                    CHECK (overview_status IN ('absent','synced','invalid','apply-error')),
+      overview_source_hash          TEXT,
+      overview_diagnostics_json     TEXT NOT NULL DEFAULT '[]',
+      overview_reconciled_at        INTEGER,
+      overview_adoption_state       TEXT NOT NULL DEFAULT 'never-seen'
+                                    CHECK (overview_adoption_state IN ('never-seen','observed','projected'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_plan_folder_projection_workspace
+      ON plan_folder_projection_state(workspace_id, wp_status);
+  `);
+
   // WP-2B (Priority 0) — one-time, resumable workspace-lineage backfill. Populates
   // stream_lane_stats.workspace_id/workspace_root by folding each stream's launch cwd
   // to a root owned by EXACTLY one workspace. Idempotent (only NULL rows, ON a unique
@@ -5345,6 +5400,426 @@ export function planHasValidResponsibleSupervisor(planId: string): boolean {
 
 export type PlanBaselineKind = 'head' | 'unborn';
 export type PlanRunLifecycleState = 'active' | 'archived';
+
+// Planning-surface WP-B: disk work-package reconciliation.
+export type PlanWorkPackageReconcileState =
+  | 'synced' | 'drift-conflict' | 'missing-pristine' | 'missing-conflict';
+export type PlanWorkPackageProjectionStatus = 'unpackaged' | 'synced' | 'invalid' | 'conflict';
+export type PlanOverviewProjectionStatus = 'absent' | 'synced' | 'invalid' | 'apply-error';
+export type PlanOverviewAdoptionState = 'never-seen' | 'observed' | 'projected';
+export type ReconciledPlanWorkPackageState = 'ready' | 'blocked';
+
+export interface PlanWorkPackageSource {
+  packageId: string; workspaceId: string; planId: string; sourceRelPath: string;
+  sourceLocalId: string; sourceFormat: 'structured-v1'; appliedHash: string;
+  observedHash: string | null; appliedOrder: number; observedOrder: number | null;
+  declaredState: ReconciledPlanWorkPackageState;
+  reconcileState: PlanWorkPackageReconcileState; present: boolean;
+  tombstonedAt: number | null; firstSeenAt: number; lastSeenAt: number;
+}
+
+export interface PlanFolderProjectionState {
+  planId: string; workspaceId: string; wpStatus: PlanWorkPackageProjectionStatus;
+  wpSourceRelPath: string | null; wpProjectionHash: string | null;
+  wpDiagnosticsJson: string; wpReconciledAt: number | null;
+  responsibilityEventId: string | null;
+  responsibilityStatus: 'valid' | 'absent' | 'invalid';
+  responsibilityDetail: string | null; responsibilityReconciledAt: number | null;
+  overviewStatus: PlanOverviewProjectionStatus; overviewSourceHash: string | null;
+  overviewDiagnosticsJson: string; overviewReconciledAt: number | null;
+  overviewAdoptionState: PlanOverviewAdoptionState;
+}
+
+export interface ManagedPlanWorkPackage {
+  package: PlanWorkPackage;
+  source: PlanWorkPackageSource;
+}
+
+export interface PlanWorkPackageRuntimeEvidence {
+  assigned: boolean; nonReconcilerLifecycle: boolean; dispatchAttempt: boolean;
+  stampedTurn: boolean; durableAttribution: boolean; finalization: boolean;
+  executingOrDone: boolean; executionRun: boolean; runtimeOwned: boolean;
+}
+
+export interface ReconciledPlanWorkPackageInput {
+  id: string; sourceLocalId: string; title: string; acceptanceCondition: string | null;
+  declaredState: ReconciledPlanWorkPackageState; contentHash: string; sortOrder: number;
+  paths: readonly PlanWorkPackagePathInput[];
+}
+
+export type PlanWorkPackageApplyMutationStage =
+  | 'plan-demotion' | 'packages' | 'paths' | 'layout' | 'lifecycle' | 'sources'
+  | 'projection-state';
+
+export interface ApplyPlanWorkPackageSnapshotInput {
+  workspaceId: string; planId: string; sourceRelPath: string; projectionHash: string;
+  packages: readonly ReconciledPlanWorkPackageInput[]; reconciledAt: number;
+  /** Test-only fault seam. Throwing after a stage rolls back the full snapshot. */
+  afterMutationStage?: (stage: PlanWorkPackageApplyMutationStage) => void;
+}
+
+export interface ApplyPlanWorkPackageSnapshotResult {
+  status: 'applied' | 'conflict'; diagnostics: string[]; demotedToHardening: boolean;
+}
+
+function rowToPlanWorkPackageSource(row: any): PlanWorkPackageSource {
+  return {
+    packageId: row.package_id, workspaceId: row.workspace_id, planId: row.plan_id,
+    sourceRelPath: row.source_rel_path, sourceLocalId: row.source_local_id,
+    sourceFormat: row.source_format, appliedHash: row.applied_hash,
+    observedHash: row.observed_hash ?? null, appliedOrder: row.applied_order,
+    observedOrder: row.observed_order ?? null, declaredState: row.declared_state,
+    reconcileState: row.reconcile_state, present: row.present === 1,
+    tombstonedAt: row.tombstoned_at ?? null, firstSeenAt: row.first_seen_at,
+    lastSeenAt: row.last_seen_at,
+  };
+}
+
+function rowToPlanFolderProjectionState(row: any): PlanFolderProjectionState {
+  return {
+    planId: row.plan_id, workspaceId: row.workspace_id, wpStatus: row.wp_status,
+    wpSourceRelPath: row.wp_source_rel_path ?? null,
+    wpProjectionHash: row.wp_projection_hash ?? null,
+    wpDiagnosticsJson: row.wp_diagnostics_json, wpReconciledAt: row.wp_reconciled_at ?? null,
+    responsibilityEventId: row.responsibility_event_id ?? null,
+    responsibilityStatus: row.responsibility_status,
+    responsibilityDetail: row.responsibility_detail ?? null,
+    responsibilityReconciledAt: row.responsibility_reconciled_at ?? null,
+    overviewStatus: row.overview_status, overviewSourceHash: row.overview_source_hash ?? null,
+    overviewDiagnosticsJson: row.overview_diagnostics_json,
+    overviewReconciledAt: row.overview_reconciled_at ?? null,
+    overviewAdoptionState: row.overview_adoption_state,
+  };
+}
+
+export function getPlanFolderProjectionState(planId: string): PlanFolderProjectionState | null {
+  const row = queryOne('SELECT * FROM plan_folder_projection_state WHERE plan_id = ?', [planId]);
+  return row ? rowToPlanFolderProjectionState(row) : null;
+}
+
+export function listManagedPlanWorkPackages(planId: string): ManagedPlanWorkPackage[] {
+  return queryAll(
+    `SELECT wp.*, s.package_id AS s_package_id, s.workspace_id AS s_workspace_id,
+            s.plan_id AS s_plan_id, s.source_rel_path, s.source_local_id,
+            s.source_format, s.applied_hash, s.observed_hash, s.applied_order,
+            s.observed_order, s.declared_state, s.reconcile_state, s.present,
+            s.tombstoned_at, s.first_seen_at, s.last_seen_at
+       FROM plan_work_packages wp JOIN plan_work_package_sources s ON s.package_id = wp.id
+      WHERE wp.plan_id = ? ORDER BY s.applied_order, wp.id`,
+    [planId],
+  ).map((row) => ({
+    package: rowToPlanWorkPackage(row),
+    source: rowToPlanWorkPackageSource({ ...row, package_id: row.s_package_id,
+      workspace_id: row.s_workspace_id, plan_id: row.s_plan_id }),
+  }));
+}
+
+export function listUnmanagedPlanWorkPackages(planId: string): PlanWorkPackage[] {
+  return queryAll(
+    `SELECT wp.* FROM plan_work_packages wp
+       LEFT JOIN plan_work_package_sources s ON s.package_id = wp.id
+      WHERE wp.plan_id = ? AND s.package_id IS NULL ORDER BY wp.created_at, wp.id`,
+    [planId],
+  ).map(rowToPlanWorkPackage);
+}
+
+export function getPlanWorkPackageRuntimeEvidence(packageId: string): PlanWorkPackageRuntimeEvidence {
+  const pkg = getPlanWorkPackage(packageId);
+  if (!pkg) throw new Error(`getPlanWorkPackageRuntimeEvidence: no package ${packageId}`);
+  const exists = (sql: string, params: unknown[]): boolean => queryOne(sql, params) !== null;
+  const assigned = pkg.assigneeAgentId !== null;
+  const nonReconcilerLifecycle = exists(
+    `SELECT 1 AS ok FROM plan_wp_lifecycle_events
+      WHERE package_id = ? AND actor <> 'disk-reconciler' LIMIT 1`, [packageId]);
+  const dispatchAttempt = exists(
+    'SELECT 1 AS ok FROM plan_dispatch_attempts WHERE package_id = ? LIMIT 1', [packageId]);
+  const stampedTurn = exists(
+    `SELECT 1 AS ok FROM turn_records
+      WHERE plan_id = ? AND plan_item_id = ? AND plan_stamp_source <> 'legacy-unstamped' LIMIT 1`,
+    [pkg.planId, packageId]);
+  const durableAttribution = exists(
+    'SELECT 1 AS ok FROM commit_turn_links WHERE plan_id = ? AND plan_item_id = ? LIMIT 1',
+    [pkg.planId, packageId]) || exists(
+    `SELECT 1 AS ok FROM continuation_handoff_attempts
+      WHERE plan_id = ? AND plan_item_id = ? LIMIT 1`, [pkg.planId, packageId]) || exists(
+    'SELECT 1 AS ok FROM orchestrations WHERE plan_id = ? AND plan_item_id = ? LIMIT 1',
+    [pkg.planId, packageId]);
+  const finalization = exists(
+    `SELECT 1 AS ok FROM package_finalizations
+      WHERE package_id = ? OR (plan_id = ? AND plan_item_id = ?) LIMIT 1`,
+    [packageId, pkg.planId, packageId]);
+  const executingOrDone = pkg.state === 'executing' || pkg.state === 'done';
+  const executionRun = exists(
+    'SELECT 1 AS ok FROM plan_execution_runs WHERE plan_id = ? LIMIT 1', [pkg.planId]);
+  return {
+    assigned, nonReconcilerLifecycle, dispatchAttempt, stampedTurn, durableAttribution,
+    finalization, executingOrDone, executionRun,
+    runtimeOwned: assigned || nonReconcilerLifecycle || dispatchAttempt || stampedTurn
+      || durableAttribution || finalization || executingOrDone || executionRun,
+  };
+}
+
+/** WP-C's invalid/absent parser path: update only WP-owned diagnostic columns. */
+export function recordPlanWorkPackageProjectionStatus(input: {
+  workspaceId: string; planId: string;
+  status: Exclude<PlanWorkPackageProjectionStatus, 'synced'>;
+  diagnostics: readonly string[]; reconciledAt: number;
+}): void {
+  run(
+    `INSERT INTO plan_folder_projection_state
+       (plan_id, workspace_id, wp_status, wp_diagnostics_json, wp_reconciled_at)
+     VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(plan_id) DO UPDATE SET wp_status = excluded.wp_status,
+       wp_diagnostics_json = excluded.wp_diagnostics_json,
+       wp_reconciled_at = excluded.wp_reconciled_at`,
+    [input.planId, input.workspaceId, input.status, JSON.stringify(input.diagnostics), input.reconciledAt]);
+}
+
+type NormalizedReconciledPackage = Omit<ReconciledPlanWorkPackageInput, 'paths'> & {
+  paths: PlanWorkPackagePathInput[];
+};
+
+function normalizeReconciledPackages(
+  packages: readonly ReconciledPlanWorkPackageInput[],
+): NormalizedReconciledPackage[] {
+  const ids = new Set<string>();
+  const localIds = new Set<string>();
+  const orders = new Set<number>();
+  return packages.map((pkg) => {
+    const foldedLocalId = pkg.sourceLocalId.toLocaleLowerCase('en-US');
+    if (!pkg.id || !pkg.sourceLocalId || !pkg.contentHash) {
+      throw new Error('applyPlanWorkPackageSnapshot: package identity/hash must be non-empty');
+    }
+    if (!Number.isInteger(pkg.sortOrder) || pkg.sortOrder < 0) {
+      throw new Error(`applyPlanWorkPackageSnapshot: invalid order for ${pkg.sourceLocalId}`);
+    }
+    if (ids.has(pkg.id) || localIds.has(foldedLocalId) || orders.has(pkg.sortOrder)) {
+      throw new Error(`applyPlanWorkPackageSnapshot: duplicate id/local-id/order at ${pkg.sourceLocalId}`);
+    }
+    ids.add(pkg.id); localIds.add(foldedLocalId); orders.add(pkg.sortOrder);
+    const paths = pkg.paths.map((entry) => {
+      const normalized = normalizePlannedPath(entry.path);
+      if (normalized === null || normalized !== entry.path) {
+        throw new Error(`applyPlanWorkPackageSnapshot: non-canonical path ${JSON.stringify(entry.path)}`);
+      }
+      return { path: normalized, intentKind: entry.intentKind ?? null };
+    });
+    return { ...pkg, paths };
+  });
+}
+
+function writeWorkPackageProjectionConflict(
+  input: ApplyPlanWorkPackageSnapshotInput,
+  packages: readonly NormalizedReconciledPackage[],
+  diagnostics: readonly string[],
+): void {
+  const incoming = new Map(packages.map((pkg) => [pkg.sourceLocalId.toLocaleLowerCase('en-US'), pkg]));
+  getDb().transaction(() => {
+    for (const managed of listManagedPlanWorkPackages(input.planId)) {
+      const observed = incoming.get(managed.source.sourceLocalId.toLocaleLowerCase('en-US'));
+      if (observed) {
+        run(
+          `UPDATE plan_work_package_sources SET observed_hash = ?, observed_order = ?,
+              reconcile_state = CASE
+                WHEN present = 0 OR applied_hash <> ? OR applied_order <> ?
+                  THEN 'drift-conflict'
+                ELSE 'synced'
+              END,
+              last_seen_at = ? WHERE package_id = ?`,
+          [observed.contentHash, observed.sortOrder, observed.contentHash, observed.sortOrder,
+            input.reconciledAt, managed.package.id]);
+      } else if (managed.source.present) {
+        run(
+          `UPDATE plan_work_package_sources SET observed_hash = NULL, observed_order = NULL,
+              reconcile_state = 'missing-conflict' WHERE package_id = ?`, [managed.package.id]);
+      }
+    }
+    recordPlanWorkPackageProjectionStatus({ workspaceId: input.workspaceId, planId: input.planId,
+      status: 'conflict', diagnostics, reconciledAt: input.reconciledAt });
+  })();
+}
+
+/** Apply one complete, already-validated disk projection in one transaction. */
+export function applyPlanWorkPackageSnapshot(
+  input: ApplyPlanWorkPackageSnapshotInput,
+): ApplyPlanWorkPackageSnapshotResult {
+  const packages = normalizeReconciledPackages(input.packages);
+  const database = getDb();
+  database.exec('BEGIN IMMEDIATE');
+  let transactionOpen = true;
+  try {
+  const plan = getPlan(input.planId);
+  if (!plan || plan.workspaceId !== input.workspaceId || plan.format !== 'structured') {
+    throw new Error(`applyPlanWorkPackageSnapshot: plan ${input.planId} is not a structured plan in workspace ${input.workspaceId}`);
+  }
+  const managed = listManagedPlanWorkPackages(input.planId);
+  const unmanaged = listUnmanagedPlanWorkPackages(input.planId);
+  const byLocalId = new Map(managed.map((entry) =>
+    [entry.source.sourceLocalId.toLocaleLowerCase('en-US'), entry]));
+  const incomingLocalIds = new Set(packages.map((pkg) => pkg.sourceLocalId.toLocaleLowerCase('en-US')));
+  const diagnostics: string[] = [];
+  let hasChanges = unmanaged.length > 0;
+
+  for (const pkg of unmanaged) diagnostics.push(`unmanaged-package:${pkg.id}`);
+  for (const pkg of packages) {
+    const current = byLocalId.get(pkg.sourceLocalId.toLocaleLowerCase('en-US'));
+    if (!current) {
+      if (getPlanWorkPackage(pkg.id)) diagnostics.push(`package-id-collision:${pkg.sourceLocalId}:${pkg.id}`);
+      hasChanges = true;
+      continue;
+    }
+    if (current.package.id !== pkg.id) {
+      diagnostics.push(`deterministic-id-mismatch:${pkg.sourceLocalId}:${current.package.id}:${pkg.id}`);
+      hasChanges = true;
+      continue;
+    }
+    const changed = !current.source.present || current.source.appliedHash !== pkg.contentHash
+      || current.source.appliedOrder !== pkg.sortOrder;
+    if (changed) {
+      hasChanges = true;
+      if (getPlanWorkPackageRuntimeEvidence(current.package.id).runtimeOwned) {
+        diagnostics.push(`runtime-owned-change:${pkg.sourceLocalId}`);
+      }
+    }
+  }
+  for (const current of managed) {
+    if (!incomingLocalIds.has(current.source.sourceLocalId.toLocaleLowerCase('en-US'))
+        && current.source.present) {
+      hasChanges = true;
+      if (getPlanWorkPackageRuntimeEvidence(current.package.id).runtimeOwned) {
+        diagnostics.push(`runtime-owned-removal:${current.source.sourceLocalId}`);
+      }
+    }
+  }
+  if (hasChanges && plan.runState !== 'hardening' && plan.runState !== 'ready') {
+    diagnostics.push(`plan-state-blocks-change:${plan.runState ?? 'null'}`);
+  }
+  if (hasChanges && plan.runState === 'ready'
+      && queryOne('SELECT 1 AS ok FROM plan_execution_runs WHERE plan_id = ? LIMIT 1', [input.planId])) {
+    diagnostics.push('plan-execution-evidence');
+  }
+  if (diagnostics.length > 0) {
+    database.exec('ROLLBACK');
+    transactionOpen = false;
+    writeWorkPackageProjectionConflict(input, packages, diagnostics);
+    return { status: 'conflict', diagnostics, demotedToHardening: false };
+  }
+
+  const afterStage = (stage: PlanWorkPackageApplyMutationStage): void => input.afterMutationStage?.(stage);
+  const demotedToHardening = hasChanges && plan.runState === 'ready';
+    if (demotedToHardening) {
+      run(`UPDATE plans SET run_state = 'hardening', updated_at = datetime('now')
+        WHERE id = ? AND run_state = 'ready'`, [input.planId]);
+    }
+    afterStage('plan-demotion');
+
+    for (const pkg of packages) {
+      const current = byLocalId.get(pkg.sourceLocalId.toLocaleLowerCase('en-US'));
+      if (!current) {
+        run(
+          `INSERT INTO plan_work_packages
+             (id, workspace_id, plan_id, title, acceptance_condition, state,
+              assignee_agent_id, revision, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, NULL, 1, ?, ?)`,
+          [pkg.id, input.workspaceId, input.planId, pkg.title, pkg.acceptanceCondition,
+            pkg.declaredState, input.reconciledAt, input.reconciledAt]);
+      } else if (current.source.appliedHash !== pkg.contentHash) {
+        run(`UPDATE plan_work_packages SET title = ?, acceptance_condition = ?,
+          revision = revision + 1, updated_at = ? WHERE id = ?`,
+        [pkg.title, pkg.acceptanceCondition, input.reconciledAt, current.package.id]);
+      }
+    }
+    afterStage('packages');
+
+    for (const pkg of packages) {
+      const current = byLocalId.get(pkg.sourceLocalId.toLocaleLowerCase('en-US'));
+      if (current && current.source.appliedHash === pkg.contentHash) continue;
+      run('DELETE FROM plan_work_package_paths WHERE package_id = ?', [pkg.id]);
+      for (const entry of pkg.paths) run(
+        `INSERT INTO plan_work_package_paths
+           (package_id, workspace_id, path, intent_kind, created_at) VALUES (?, ?, ?, ?, ?)`,
+        [pkg.id, input.workspaceId, entry.path, entry.intentKind ?? null, input.reconciledAt]);
+    }
+    afterStage('paths');
+
+    for (const pkg of packages) {
+      const current = byLocalId.get(pkg.sourceLocalId.toLocaleLowerCase('en-US'));
+      if (current && current.source.appliedOrder === pkg.sortOrder) continue;
+      run(`INSERT INTO plan_work_package_layout (package_id, sort_order) VALUES (?, ?)
+        ON CONFLICT(package_id) DO UPDATE SET sort_order = excluded.sort_order`,
+      [pkg.id, pkg.sortOrder]);
+    }
+    afterStage('layout');
+
+    for (const pkg of packages) {
+      const current = byLocalId.get(pkg.sourceLocalId.toLocaleLowerCase('en-US'));
+      if (!current) continue;
+      const live = getPlanWorkPackage(current.package.id)!;
+      if (live.state !== pkg.declaredState) transitionPlanWorkPackageStateInTransaction({
+        eventId: uuidv4(), packageId: live.id, toState: pkg.declaredState,
+        actor: 'disk-reconciler', reason: `disk projection ${pkg.contentHash}`,
+        ts: input.reconciledAt,
+      });
+    }
+    for (const current of managed) {
+      if (incomingLocalIds.has(current.source.sourceLocalId.toLocaleLowerCase('en-US'))
+          || !current.source.present) continue;
+      transitionPlanWorkPackageStateInTransaction({ eventId: uuidv4(),
+        packageId: current.package.id, toState: 'archived', actor: 'disk-reconciler',
+        reason: 'source package removed during planning', ts: input.reconciledAt });
+    }
+    afterStage('lifecycle');
+
+    for (const pkg of packages) {
+      const current = byLocalId.get(pkg.sourceLocalId.toLocaleLowerCase('en-US'));
+      if (!current) {
+        run(
+          `INSERT INTO plan_work_package_sources
+             (package_id, workspace_id, plan_id, source_rel_path, source_local_id,
+              source_format, applied_hash, observed_hash, applied_order, observed_order,
+              declared_state, reconcile_state, present, tombstoned_at, first_seen_at, last_seen_at)
+           VALUES (?, ?, ?, ?, ?, 'structured-v1', ?, ?, ?, ?, ?, 'synced', 1, NULL, ?, ?)`,
+          [pkg.id, input.workspaceId, input.planId, input.sourceRelPath, pkg.sourceLocalId,
+            pkg.contentHash, pkg.contentHash, pkg.sortOrder, pkg.sortOrder, pkg.declaredState,
+            input.reconciledAt, input.reconciledAt]);
+      } else {
+        run(
+          `UPDATE plan_work_package_sources SET source_rel_path = ?, applied_hash = ?,
+              observed_hash = ?, applied_order = ?, observed_order = ?, declared_state = ?,
+              reconcile_state = 'synced', present = 1, tombstoned_at = NULL, last_seen_at = ?
+            WHERE package_id = ?`,
+          [input.sourceRelPath, pkg.contentHash, pkg.contentHash, pkg.sortOrder, pkg.sortOrder,
+            pkg.declaredState, input.reconciledAt, current.package.id]);
+      }
+    }
+    for (const current of managed) {
+      if (incomingLocalIds.has(current.source.sourceLocalId.toLocaleLowerCase('en-US'))
+          || !current.source.present) continue;
+      run(`UPDATE plan_work_package_sources SET observed_hash = NULL, observed_order = NULL,
+        reconcile_state = 'missing-pristine', present = 0, tombstoned_at = ? WHERE package_id = ?`,
+      [input.reconciledAt, current.package.id]);
+    }
+    afterStage('sources');
+
+    run(
+      `INSERT INTO plan_folder_projection_state
+         (plan_id, workspace_id, wp_status, wp_source_rel_path, wp_projection_hash,
+          wp_diagnostics_json, wp_reconciled_at)
+       VALUES (?, ?, 'synced', ?, ?, '[]', ?)
+       ON CONFLICT(plan_id) DO UPDATE SET wp_status = 'synced',
+         wp_source_rel_path = excluded.wp_source_rel_path,
+         wp_projection_hash = excluded.wp_projection_hash, wp_diagnostics_json = '[]',
+         wp_reconciled_at = excluded.wp_reconciled_at`,
+      [input.planId, input.workspaceId, input.sourceRelPath, input.projectionHash, input.reconciledAt]);
+    afterStage('projection-state');
+    database.exec('COMMIT');
+    transactionOpen = false;
+  return { status: 'applied', diagnostics: [], demotedToHardening };
+  } catch (err) {
+    if (transactionOpen) database.exec('ROLLBACK');
+    throw err;
+  }
+}
 
 export interface PlanExecutionRun {
   id: string;
