@@ -1,4 +1,12 @@
-import React, { useCallback, useEffect, useReducer, useRef, useState } from 'react';
+import React, {
+  forwardRef,
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useReducer,
+  useRef,
+  useState,
+} from 'react';
 import { useDashboardStore } from '../../stores/dashboard-store';
 import {
   isSaveCardInventoryFresh,
@@ -9,9 +17,15 @@ import type {
   SaveCardFleetAdhocMarkDoneResponse,
   SaveCardFleetAdhocMarkDoneSuccess,
   SaveCardInventoryResponse,
+  SaveSweepIntent,
+  SaveSweepResponse,
   SaveSweepTerminalResult,
 } from '../../../shared/types';
-import type { SaveCardQuotaWeakening, SaveRefusal } from '../../../shared/commit-candidates';
+import type {
+  ReviewChallengeAtom,
+  SaveCardQuotaWeakening,
+  SaveRefusal,
+} from '../../../shared/commit-candidates';
 import SaveBundle, { isQuietlySaved, type WorkBundleDto } from './SaveBundle';
 import CandidatePreview, {
   type CandidatePreviewDraft,
@@ -81,17 +95,44 @@ function terminalResultText(result: SaveSweepTerminalResult): string {
   }
 }
 
-function PackageSaveGesture({
-  group,
-  workspaceId,
-}: {
+interface PreparedSweepPackage {
+  intents: SaveSweepIntent[];
+  reviewedManifestDigest: string;
+  acknowledgedChallengeAtoms: ReviewChallengeAtom[];
+}
+
+interface PackageSaveGestureHandle {
+  prepareForSweep: () => Promise<PreparedSweepPackage | null>;
+  showSweepStarted: () => void;
+  clearSweepState: () => void;
+  showSweepUncertain: () => void;
+}
+
+function sweepSummary(results: readonly SaveSweepTerminalResult[], halted: boolean) {
+  return {
+    saved: results.filter((result) => result.kind === 'saved').length,
+    alreadySaved: results.filter((result) => result.kind === 'already-saved').length,
+    needsAttention: results.filter((result) =>
+      result.kind === 'needs-attention' || result.kind === 'blocked-unmerged',
+    ).length,
+    halted,
+  };
+}
+
+const PackageSaveGesture = forwardRef<PackageSaveGestureHandle, {
   group: WorkBundleDto[];
   workspaceId: string;
-}) {
+}>(({
+  group,
+  workspaceId,
+}, ref) => {
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [gesture, dispatch] = useReducer(saveGestureReducer, initialSaveGestureState);
   const draftRef = useRef<CandidatePreviewDraft | null>(null);
   const submitterRef = useRef<ReturnType<typeof createCandidateSubmitter> | null>(null);
+  const prepareInFlightRef = useRef<Promise<PreparedSweepPackage | null> | null>(null);
+  const pinInFlightRef = useRef(false);
+  const [previewBusy, setPreviewBusy] = useState(false);
   if (!submitterRef.current) submitterRef.current = createCandidateSubmitter();
   const updateDraft = useCallback((nextDraft: CandidatePreviewDraft) => {
     draftRef.current = nextDraft;
@@ -108,11 +149,12 @@ function PackageSaveGesture({
   );
   const hasSelectable =
     selection.selectedComponentIds.length > 0 || selection.selectedUnattributedEntryIds.length > 0;
-  if (!hasSelectable) return null;
 
-  const pinPackage = async (replaceExisting = false) => {
-    if (gesture.status === 'pinning' || gesture.status === 'reviewing'
-      || gesture.status === 'sweeping') return;
+  const pinPackage = async (
+    replaceExisting = false,
+  ): Promise<SaveCardFleetAdhocMarkDoneSuccess[] | null> => {
+    if (pinInFlightRef.current || gesture.status === 'pinning' || gesture.status === 'reviewing'
+      || gesture.status === 'sweeping') return null;
     const unsaveable = group.find((bundle) => bundle.saveability?.saveable === false);
     if (unsaveable?.saveability?.saveable === false) {
       dispatch({
@@ -123,12 +165,13 @@ function PackageSaveGesture({
           message: `This package cannot be saved from workspace '${unsaveable.saveability.workspaceTitle}'.`,
         },
       });
-      return;
+      return null;
     }
     const retained = replaceExisting ? [] : pins;
     const pinnedPackages = new Set(retained.map((pin) => pin.packageId));
     const missing = group.filter((bundle) => !pinnedPackages.has(bundle.bundleId));
-    if (missing.length === 0) return;
+    if (missing.length === 0) return retained;
+    pinInFlightRef.current = true;
     dispatch({ type: 'pin-started' });
     const settled = await Promise.allSettled(missing.map((bundle) =>
       window.api.saveCard.markDone({ packageId: bundle.bundleId, targetWorkspaceId: workspaceId }),
@@ -187,8 +230,99 @@ function PackageSaveGesture({
           paths: failures.map((item) => item.packageId),
         },
       });
+      pinInFlightRef.current = false;
+      return null;
     }
+    pinInFlightRef.current = false;
+    return complete ? uniquePins : null;
   };
+
+  const packageName = group[0].identity?.name ?? group[0].label;
+
+  useImperativeHandle(ref, () => ({
+    prepareForSweep: () => {
+      if (prepareInFlightRef.current) return prepareInFlightRef.current;
+      const run = (async (): Promise<PreparedSweepPackage | null> => {
+        const preparedPins = pinned ? pins : await pinPackage();
+        if (!preparedPins) return null;
+        const preparedSelection = selectionForPins(preparedPins);
+        dispatch({ type: 'submit-stage', stage: 'reviewing' });
+        let response;
+        try {
+          response = await window.api.saveCard.preview({ workspaceId, ...preparedSelection });
+        } catch {
+          dispatch({
+            type: 'refused',
+            refusal: {
+              stage: 'preview-verify',
+              code: 'preview-transport-failed',
+              message: `Lares could not verify ${packageName} before the sweep.`,
+            },
+          });
+          return null;
+        }
+        if (response.refusal || !response.isCandidate || !('repository' in response.candidate)
+            || !response.candidate.eligibility.eligible) {
+          dispatch({
+            type: 'refused',
+            refusal: response.refusal ?? {
+              stage: 'preview-verify',
+              code: 'preview-ineligible',
+              message: `${packageName} needs attention before it can be saved.`,
+            },
+            latestPreview: response,
+          });
+          return null;
+        }
+        const repositoryKey = response.candidate.repository.repositoryKey;
+        const reviewedManifestDigest = response.reviewedManifest?.reviewedManifestDigest;
+        const durableIntents = response.durableFinalizationIntent;
+        if (!reviewedManifestDigest || !durableIntents?.length) {
+          dispatch({
+            type: 'refused',
+            refusal: {
+              stage: 'preview-verify',
+              code: 'review-evidence-missing',
+              message: `${packageName} did not return the review evidence required to save it.`,
+            },
+            latestPreview: response,
+          });
+          return null;
+        }
+        const currentDraft = draftRef.current ?? draft;
+        const messageBody = currentDraft?.messageBody ?? response.defaultMessageBody;
+        const userTrailers = currentDraft?.userTrailers.trim() ?? '';
+        const message = userTrailers ? `${messageBody.trimEnd()}\n\n${userTrailers}` : messageBody;
+        return {
+          intents: durableIntents.map((intent) => ({
+            repositoryKey,
+            finalizationId: intent.finalizationId,
+            packageId: intent.packageId,
+            packageRevision: intent.packageRevision,
+            frozenMemberManifestDigest: intent.frozenMemberManifestDigest,
+            reviewedManifestDigest,
+            message,
+          })),
+          reviewedManifestDigest,
+          // Only echo atoms selected in the package review UI. The master gesture
+          // never creates acknowledgement evidence of its own.
+          acknowledgedChallengeAtoms: currentDraft?.acknowledgedChallengeAtoms ?? [],
+        };
+      })().finally(() => { prepareInFlightRef.current = null; });
+      prepareInFlightRef.current = run;
+      return run;
+    },
+    showSweepStarted: () => dispatch({ type: 'submit-stage', stage: 'sweeping' }),
+    clearSweepState: () => dispatch({ type: 'acknowledged' }),
+    showSweepUncertain: () => dispatch({
+      type: 'uncertain',
+      stage: 'commit',
+      code: 'repository-outcome-uncertain',
+      message: 'The save-all outcome is uncertain. Lares will not retry automatically.',
+    }),
+  }), [draft, group, packageName, pinned, pins, workspaceId]);
+
+  if (!hasSelectable) return null;
 
   const submit = async () => {
     if (!pinned) return;
@@ -227,7 +361,7 @@ function PackageSaveGesture({
         bundle={group[0]}
         bundles={group}
         pinned={pinned}
-        pinning={gesture.status === 'pinning'}
+        pinning={gesture.status === 'pinning' || gesture.status === 'reviewing' || previewBusy}
         onPin={() => { void pinPackage(); }}
       />
       <button
@@ -235,9 +369,14 @@ function PackageSaveGesture({
         className="ui-btn ui-btn-primary px-3 py-1 text-[12.5px]"
         data-testid="save-bundle-submit"
         disabled={!pinned || submitLocked}
+        aria-busy={submitting}
         onClick={() => { void submit(); }}
       >
-        {submitting ? 'Saving…' : 'Save package'}
+        {gesture.status === 'reviewing'
+          ? 'Verifying…'
+          : gesture.status === 'sweeping'
+            ? `Saving ${packageName}…`
+            : 'Save package'}
       </button>
       <button
         type="button"
@@ -248,7 +387,15 @@ function PackageSaveGesture({
       >
         {detailsOpen ? 'Hide review & message' : 'Review & message'}
       </button>
-      {gesture.status === 'pinning' && <div className="sc-save-note" role="status">Preparing reviewed work…</div>}
+      {(gesture.status === 'pinning' || gesture.status === 'reviewing' || gesture.status === 'sweeping') && (
+        <div className="sc-save-note" role="status" data-testid="save-package-progress">
+          {gesture.status === 'pinning'
+            ? `Preparing ${packageName}…`
+            : gesture.status === 'reviewing'
+              ? `Verifying ${packageName}…`
+              : `Saving ${packageName}…`}
+        </div>
+      )}
       {gestureError && (
         <div className="sc-save-refusal" role="alert" data-testid="save-gesture-refusal">
           {gestureError}
@@ -278,11 +425,17 @@ function PackageSaveGesture({
           showCommitAction={false}
           authoritativeResponse={gesture.status === 'refused' ? (gesture.latestPreview ?? null) : null}
           onDraftChange={updateDraft}
+          onBusyChange={setPreviewBusy}
           onClose={() => setDetailsOpen(false)}
         />
       )}
-      {gesture.status === 'completed' && (
+      {gesture.status === 'completed' && (() => {
+        const summary = sweepSummary(gesture.outcome.results, gesture.outcome.halted);
+        return (
         <div className="sc-save-note" data-testid="save-sweep-results">
+          <div role="status" data-testid="save-sweep-summary">
+            Saved {summary.saved} · already saved {summary.alreadySaved} · needs attention {summary.needsAttention} · halted {summary.halted ? 'yes' : 'no'}
+          </div>
           <ul>
             {gesture.outcome.results.map((result) => (
               <li
@@ -302,10 +455,12 @@ function PackageSaveGesture({
             Dismiss results
           </button>
         </div>
-      )}
+        );
+      })()}
     </div>
   );
-}
+});
+PackageSaveGesture.displayName = 'PackageSaveGesture';
 
 /**
  * SC-WP-N2 — the checkpoint-expiry block. Groups the retention pass's expiring
@@ -352,6 +507,17 @@ type LoadState =
   | { status: 'error'; message: string }
   | { status: 'ready'; bundles: WorkBundleDto[]; quotaWeakening: SaveCardQuotaWeakening | null };
 
+type SaveAllState =
+  | { status: 'idle' }
+  | { status: 'preparing'; currentPackage: string; current: number; total: number }
+  | { status: 'sweeping'; currentPackage: string; total: number }
+  | {
+      status: 'completed';
+      response: SaveSweepResponse;
+      localNeedsAttention: number;
+    }
+  | { status: 'uncertain'; currentPackage: string; localNeedsAttention: number };
+
 // Turn whatever the rejected getInventory invoke throws into a single honest
 // line. The Stage ① engine may be unavailable (route not yet injected), the
 // workspace may be a non-repo / unborn HEAD, or the read may have failed — all
@@ -373,6 +539,18 @@ function groupBySupervisor(bundles: WorkBundleDto[]): WorkBundleDto[][] {
     else groups.set(key, [bundle]);
   }
   return [...groups.values()];
+}
+
+function groupKey(group: WorkBundleDto[]): string {
+  return group[0].identity?.groupingKey ?? group[0].bundleId;
+}
+
+function groupName(group: WorkBundleDto[]): string {
+  return group[0].identity?.name ?? group[0].label;
+}
+
+function groupIsSaveable(group: WorkBundleDto[]): boolean {
+  return group.every((bundle) => bundle.saveability?.saveable !== false);
 }
 
 /**
@@ -405,6 +583,9 @@ export default function SaveCard() {
       : { status: 'loading' },
   );
   const [refreshing, setRefreshing] = useState(false);
+  const [saveAll, setSaveAll] = useState<SaveAllState>({ status: 'idle' });
+  const saveAllInFlightRef = useRef(false);
+  const packageGestureRefs = useRef(new Map<string, PackageSaveGestureHandle>());
   const [infoOpen, setInfoOpen] = useState(false);
   const infoRef = useRef<HTMLDivElement>(null);
   const infoButtonRef = useRef<HTMLButtonElement>(null);
@@ -605,6 +786,90 @@ export default function SaveCard() {
   const loudGroups = groupBySupervisor(loud);
   const quietGroups = groupBySupervisor(quiet);
   const loudFileCount = loud.reduce((n, b) => n + b.members.length, 0);
+  const saveableGroups = loudGroups.filter(groupIsSaveable);
+
+  const startSaveAll = async () => {
+    if (!workspaceId || saveAllInFlightRef.current || saveAll.status !== 'idle') return;
+    saveAllInFlightRef.current = true;
+    const prepared: Array<{
+      group: WorkBundleDto[];
+      handle: PackageSaveGestureHandle;
+      request: PreparedSweepPackage;
+    }> = [];
+    let localNeedsAttention = 0;
+    try {
+      for (let index = 0; index < saveableGroups.length; index += 1) {
+        const group = saveableGroups[index];
+        const handle = packageGestureRefs.current.get(groupKey(group));
+        setSaveAll({
+          status: 'preparing',
+          currentPackage: groupName(group),
+          current: index + 1,
+          total: saveableGroups.length,
+        });
+        if (!handle) {
+          localNeedsAttention += 1;
+          continue;
+        }
+        const request = await handle.prepareForSweep();
+        if (request) prepared.push({ group, handle, request });
+        else localNeedsAttention += 1;
+      }
+
+      if (prepared.length === 0) {
+        setSaveAll({
+          status: 'completed',
+          response: { results: [], halted: false, haltKind: null },
+          localNeedsAttention,
+        });
+        return;
+      }
+
+      prepared.forEach(({ handle }) => handle.showSweepStarted());
+      setSaveAll({
+        status: 'sweeping',
+        currentPackage: groupName(prepared[0].group),
+        total: prepared.length,
+      });
+      let response: SaveSweepResponse;
+      try {
+        const acknowledgedByKey = new Map<string, ReviewChallengeAtom>();
+        prepared.forEach(({ request }) => request.acknowledgedChallengeAtoms.forEach((atom) => {
+          acknowledgedByKey.set(`${atom.atomId}\0${atom.digest}`, atom);
+        }));
+        response = await window.api.saveCard.sweep({
+          intents: prepared.flatMap(({ request }) => request.intents),
+          reviewedManifestDigests: [
+            ...new Set(prepared.map(({ request }) => request.reviewedManifestDigest)),
+          ],
+          acknowledgedChallengeAtoms: [...acknowledgedByKey.values()],
+        });
+      } catch {
+        prepared.forEach(({ handle }) => handle.showSweepUncertain());
+        setSaveAll({
+          status: 'uncertain',
+          currentPackage: groupName(prepared[0].group),
+          localNeedsAttention,
+        });
+        return;
+      }
+
+      if (response.results.some((result) => result.kind === 'halted-uncertain')) {
+        prepared.forEach(({ handle }) => handle.showSweepUncertain());
+      } else {
+        prepared.forEach(({ handle }) => handle.clearSweepState());
+      }
+      setSaveAll({ status: 'completed', response, localNeedsAttention });
+      try {
+        await useSaveCardStore.getState().refreshInventory(workspaceId);
+      } catch {
+        // The server verdict and summary remain authoritative. A normal Refresh
+        // can heal presentation without risking a duplicate save.
+      }
+    } finally {
+      saveAllInFlightRef.current = false;
+    }
+  };
 
   if (bundles.length === 0) {
     return (
@@ -646,13 +911,58 @@ export default function SaveCard() {
           {loudGroups.length} package{loudGroups.length === 1 ? '' : 's'} · {loudFileCount} file{loudFileCount === 1 ? '' : 's'}
         </span>
       </div>
+      {saveableGroups.length > 0 && (
+        <div className="sc-actions">
+          <button
+            type="button"
+            className="ui-btn ui-btn-primary px-3 py-1 text-[12.5px]"
+            data-testid="save-all"
+            disabled={saveAll.status !== 'idle'}
+            aria-busy={saveAll.status === 'preparing' || saveAll.status === 'sweeping'}
+            onClick={() => { void startSaveAll(); }}
+          >
+            {saveAll.status === 'preparing'
+              ? 'Preparing packages…'
+              : saveAll.status === 'sweeping'
+                ? 'Saving packages…'
+                : 'Save all packages'}
+          </button>
+        </div>
+      )}
+      {(saveAll.status === 'preparing' || saveAll.status === 'sweeping') && (
+        <div className="sc-save-note" role="status" data-testid="save-all-progress">
+          {saveAll.status === 'preparing'
+            ? `Preparing ${saveAll.current} of ${saveAll.total} — current package: ${saveAll.currentPackage}`
+            : `Saving ${saveAll.total} package${saveAll.total === 1 ? '' : 's'} — current package: ${saveAll.currentPackage}`}
+        </div>
+      )}
+      {saveAll.status === 'completed' && (() => {
+        const summary = sweepSummary(saveAll.response.results, saveAll.response.halted);
+        return (
+          <div className="sc-save-note" role="status" data-testid="save-all-summary">
+            Saved {summary.saved} · already saved {summary.alreadySaved} · needs attention {summary.needsAttention + saveAll.localNeedsAttention} · halted {summary.halted ? 'yes' : 'no'}
+          </div>
+        );
+      })()}
+      {saveAll.status === 'uncertain' && (
+        <div className="sc-save-refusal" role="alert" data-testid="save-all-summary">
+          Saved 0 confirmed · already saved 0 confirmed · needs attention {saveAll.localNeedsAttention} · halted yes. The outcome while saving {saveAll.currentPackage} is uncertain; a commit may have been created, so Lares will not retry automatically.
+        </div>
+      )}
       {loud.length > 0 ? (
         <div className="sc-slots">
           {loudGroups.map((group) => (
             <div key={group[0].identity?.groupingKey ?? group[0].bundleId} className="sc-slot-wrap">
               {/* workspaceId is non-null here: the ready state is only reached
                   after a successful load, which requires a selected workspace. */}
-              <PackageSaveGesture group={group} workspaceId={workspaceId!} />
+              <PackageSaveGesture
+                ref={(handle) => {
+                  if (handle) packageGestureRefs.current.set(groupKey(group), handle);
+                  else packageGestureRefs.current.delete(groupKey(group));
+                }}
+                group={group}
+                workspaceId={workspaceId!}
+              />
             </div>
           ))}
         </div>

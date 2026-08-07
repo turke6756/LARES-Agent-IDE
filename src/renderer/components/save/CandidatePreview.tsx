@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { SaveCardPreviewRequest, SaveCardPreviewResponse } from '../../../shared/types';
 import type {
   CandidateMember,
@@ -46,6 +46,8 @@ export interface CandidatePreviewProps {
   onDraftChange?: (draft: CandidatePreviewDraft) => void;
   /** An authoritative submit-time response installed without another fetch. */
   authoritativeResponse?: SaveCardPreviewResponse | null;
+  /** Lets the package checkbox mirror preview/verification work in place. */
+  onBusyChange?: (busy: boolean) => void;
 }
 
 export interface CandidatePreviewDraft {
@@ -158,11 +160,19 @@ export default function CandidatePreview({
   showCommitAction = true,
   onDraftChange,
   authoritativeResponse,
+  onBusyChange,
 }: CandidatePreviewProps) {
   const [state, setState] = useState<LoadState>({ status: 'loading' });
   const [messageBody, setMessageBody] = useState('');
   const [userTrailers, setUserTrailers] = useState('');
   const [acknowledgedAtoms, setAcknowledgedAtoms] = useState<ReviewChallengeAtom[]>([]);
+  const [commitBusy, setCommitBusy] = useState(false);
+  const commitInFlightRef = useRef(false);
+
+  useEffect(() => {
+    onBusyChange?.(state.status === 'loading');
+    return () => onBusyChange?.(false);
+  }, [state.status, onBusyChange]);
 
   const request: SaveCardPreviewRequest = useMemo(
     () => ({
@@ -449,37 +459,49 @@ export default function CandidatePreview({
           type="button"
           className="ui-btn ui-btn-primary px-3 py-1 text-[12.5px]"
           data-testid="candidate-preview-save"
-          disabled={!canSave}
+          disabled={!canSave || commitBusy}
+          aria-busy={commitBusy}
           onClick={async () => {
-            if (!canSave || !onCommit) return;
+            if (!canSave || !onCommit || commitInFlightRef.current) return;
             const checkedUnattributedEntryIds = response.unacknowledgedUnattributedEntryIds.filter((id) =>
               isAcknowledged(acknowledgedAtoms, unattributedAtomForEntry(response, id)),
             );
-            await onCommit(
-              response,
-              messageBody,
-              checkedUnattributedEntryIds,
-              {
+            commitInFlightRef.current = true;
+            setCommitBusy(true);
+            try {
+              await onCommit(
                 response,
-                reviewedManifestDigest: response.reviewedManifest?.reviewedManifestDigest ?? null,
-                durableFinalizationIntent: response.durableFinalizationIntent ?? [],
-                acknowledgedChallengeAtoms: acknowledgedAtoms,
-                previewedCandidateId: response.isCandidate && 'candidateId' in response.candidate
-                  ? response.candidate.candidateId
-                  : null,
-                componentTopologyDigest: response.componentTopologyDigest,
-                checkedUnattributedEntryIds,
-                overlapAcknowledged: overlapSatisfied,
                 messageBody,
-                userTrailers,
-                canSave,
-                reservedTrailer,
-                acknowledgedUnattributedEntryIds: checkedUnattributedEntryIds,
-              },
-            );
+                checkedUnattributedEntryIds,
+                {
+                  response,
+                  reviewedManifestDigest: response.reviewedManifest?.reviewedManifestDigest ?? null,
+                  durableFinalizationIntent: response.durableFinalizationIntent ?? [],
+                  acknowledgedChallengeAtoms: acknowledgedAtoms,
+                  previewedCandidateId: response.isCandidate && 'candidateId' in response.candidate
+                    ? response.candidate.candidateId
+                    : null,
+                  componentTopologyDigest: response.componentTopologyDigest,
+                  checkedUnattributedEntryIds,
+                  overlapAcknowledged: overlapSatisfied,
+                  messageBody,
+                  userTrailers,
+                  canSave,
+                  reservedTrailer,
+                  acknowledgedUnattributedEntryIds: checkedUnattributedEntryIds,
+                },
+              );
+            } finally {
+              commitInFlightRef.current = false;
+              setCommitBusy(false);
+            }
           }}
         >
-          {response.isCandidate ? `Save — commit ${candidate.members.length} file${candidate.members.length === 1 ? '' : 's'}` : 'Save'}
+          {commitBusy
+            ? 'Saving…'
+            : response.isCandidate
+              ? `Save — commit ${candidate.members.length} file${candidate.members.length === 1 ? '' : 's'}`
+              : 'Save'}
         </button>}
         {showCommitAction && !canSave && !reservedTrailer && (
           <span className="sc-why" data-testid="candidate-preview-why">

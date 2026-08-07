@@ -508,6 +508,21 @@ describe('SaveCard decisive save gesture', () => {
     expect(pin.checked).toBe(true);
   });
 
+  it('makes a second package-checkbox fire inert while preparation is pending', async () => {
+    let resolveMarkDone!: (value: ReturnType<typeof readyMarkDone>) => void;
+    markDone.mockImplementation(() => new Promise((resolve) => { resolveMarkDone = resolve; }));
+    await render();
+    const pin = container.querySelector('[data-testid="save-bundle-pin"]') as HTMLInputElement;
+    await act(async () => {
+      pin.click();
+      pin.click();
+      await Promise.resolve();
+    });
+    expect(markDone).toHaveBeenCalledTimes(1);
+    expect(pin.disabled).toBe(true);
+    await act(async () => { resolveMarkDone(readyMarkDone()); await Promise.resolve(); });
+  });
+
   it('preserves successful grouped pins, names the failed package, and retries only the missing package', async () => {
     const second = {
       ...loudBundle,
@@ -844,6 +859,130 @@ describe('SaveCard decisive save gesture', () => {
         message: 'feat: decisive save\n\nCo-authored-by: Example <example@example.com>',
       }),
     ]);
+  });
+
+  it('starts one save-all sweep for every saveable package and renders one aggregate summary', async () => {
+    const second = {
+      ...loudBundle,
+      bundleId: 'b-second',
+      label: 'Second package',
+      labels: ['Second package'],
+      identity: { ...loudBundle.identity!, groupingKey: 'supervisor:sup-2', name: 'Second package' },
+      component: { ...loudBundle.component!, componentId: 'c2', dirtyEntryIds: ['e2'] },
+      members: [{ entry: entry('e2', 'src/second.ts'), protection: 'checkpoint-protected' as const }],
+    };
+    getInventory.mockResolvedValue(inv([loudBundle, second]));
+    markDone.mockImplementation(async ({ packageId }: { packageId: string }) => ({
+      ...readyMarkDone(),
+      packageId,
+      finalizationId: `fin-${packageId}`,
+      pinnedSelection: {
+        selectedComponentIds: [packageId === 'b-loud' ? 'c1' : 'c2'],
+        selectedUnattributedEntryIds: [], frozenMemberCount: 1,
+      },
+    }));
+    preview.mockImplementation(async ({ finalizationIds }: { finalizationIds: string[] }) => {
+      const packageId = finalizationIds[0].replace('fin-', '');
+      const componentId = packageId === 'b-loud' ? 'c1' : 'c2';
+      const base = readyCandidatePreview();
+      return {
+        ...base,
+        candidate: {
+          ...base.candidate,
+          componentIds: [componentId],
+          finalizations: [{
+            finalizationId: finalizationIds[0], packageId, packageRevision: 1, boundaryStatus: 'ready' as const,
+          }],
+        } as CommitCandidate,
+        reviewedManifest: {
+          ...base.reviewedManifest!, reviewedManifestDigest: `review-${packageId}`,
+        },
+        durableFinalizationIntent: [{
+          finalizationId: finalizationIds[0], packageId, packageRevision: 1,
+          boundaryStatus: 'ready' as const, frozenMemberManifestDigest: `frozen-${packageId}`,
+        }],
+      };
+    });
+    sweep.mockResolvedValue({
+      halted: false, haltKind: null,
+      results: [
+        { kind: 'saved', repositoryKey: 'repo-1', finalizationId: 'fin-b-loud', packageId: 'b-loud', packageRevision: 1, attemptId: 'a-1', commitOid: 'c-1' },
+        { kind: 'already-saved', repositoryKey: 'repo-1', finalizationId: 'fin-b-second', packageId: 'b-second', packageRevision: 1, provingCommitOids: ['c-2'] },
+      ],
+    });
+
+    await render();
+    await gestureClick(container.querySelector('[data-testid="save-all"]')!);
+
+    expect(markDone).toHaveBeenCalledTimes(2);
+    expect(preview).toHaveBeenCalledTimes(2);
+    expect(sweep).toHaveBeenCalledTimes(1);
+    expect(sweep.mock.calls[0][0].intents).toHaveLength(2);
+    expect(container.querySelectorAll('[data-testid="save-all-summary"]')).toHaveLength(1);
+    expect(container.querySelector('[data-testid="save-all-summary"]')?.textContent)
+      .toContain('Saved 1 · already saved 1 · needs attention 0 · halted no');
+  });
+
+  it('shows checkbox verification and Save-control progress without allowing a double fire', async () => {
+    let resolvePreview!: (value: SaveCardPreviewResponse) => void;
+    let resolveSweep!: (value: unknown) => void;
+    preview.mockImplementation(() => new Promise((resolve) => { resolvePreview = resolve; }));
+    sweep.mockImplementation(() => new Promise((resolve) => { resolveSweep = resolve; }));
+    await render();
+
+    const saveAllButton = container.querySelector('[data-testid="save-all"]') as HTMLButtonElement;
+    await gestureClick(saveAllButton);
+    const pin = container.querySelector('[data-testid="save-bundle-pin"]') as HTMLInputElement;
+    expect(pin.disabled).toBe(true);
+    expect(container.querySelector('[data-testid="save-all-progress"]')?.textContent)
+      .toContain('current package: Memory Architecture');
+    expect(container.querySelector('[data-testid="save-package-progress"]')?.textContent)
+      .toContain('Verifying Memory Architecture');
+
+    await act(async () => {
+      resolvePreview(readyCandidatePreview());
+      await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+    });
+    const packageSave = container.querySelector('[data-testid="save-bundle-submit"]') as HTMLButtonElement;
+    expect(packageSave.disabled).toBe(true);
+    expect(packageSave.getAttribute('aria-busy')).toBe('true');
+    expect(packageSave.textContent).toContain('Saving Memory Architecture');
+    saveAllButton.click();
+    expect(sweep).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      resolveSweep({
+        halted: false, haltKind: null,
+        results: [{ kind: 'saved', repositoryKey: 'repo-1', finalizationId: 'fin-1', packageId: 'b-loud', packageRevision: 1, attemptId: 'a-1', commitOid: 'c-1' }],
+      });
+      await Promise.resolve(); await Promise.resolve();
+    });
+  });
+
+  it('never turns the save-all gesture into acknowledgement evidence', async () => {
+    const overlapAtom = {
+      kind: 'overlap' as const, atomId: 'overlap-save-all', digest: 'digest-save-all', reasonVersion: 1 as const,
+      memberPathBytesBase64: ['c3JjL21haW4vbWVtb3J5L3JlY2FsbC50cw=='], contributors: [], ownershipGroupKeys: [],
+    };
+    preview.mockResolvedValue({
+      ...readyCandidatePreview(),
+      requiresOverlapAck: true,
+      reviewedManifest: { ...readyCandidatePreview().reviewedManifest!, challengeAtoms: [overlapAtom] },
+    });
+    sweep.mockResolvedValue({
+      halted: false, haltKind: null,
+      results: [{
+        kind: 'needs-attention', repositoryKey: 'repo-1', finalizationId: 'fin-1',
+        packageId: 'b-loud', packageRevision: 1, code: 'overlap-not-acknowledged',
+        message: 'Acknowledge the overlap in the package review.',
+      }],
+    });
+    await render();
+    await gestureClick(container.querySelector('[data-testid="save-all"]')!);
+
+    expect(sweep.mock.calls[0][0].acknowledgedChallengeAtoms).toEqual([]);
+    expect(container.querySelector('[data-testid="save-all-summary"]')?.textContent)
+      .toContain('needs attention 1');
   });
 });
 

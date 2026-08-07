@@ -341,4 +341,25 @@ describe('CandidatePreview', () => {
     // verified save, so merely invoking an injected callback does not stale it.
     expect(useSaveCardStore.getState().inventoryByWorkspace['ws-1'].loadedAt).toBeGreaterThan(0);
   });
+
+  it('shows Save progress and prevents a second commit while the first is pending', async () => {
+    let resolveCommit!: () => void;
+    const onCommit = vi.fn(() => new Promise<void>((resolve) => { resolveCommit = resolve; }));
+    preview.mockResolvedValue(response());
+    await render({ onCommit });
+
+    const save = q('candidate-preview-save') as HTMLButtonElement;
+    await act(async () => {
+      save.click();
+      save.click();
+      await Promise.resolve();
+    });
+    expect(onCommit).toHaveBeenCalledTimes(1);
+    expect(save.disabled).toBe(true);
+    expect(save.getAttribute('aria-busy')).toBe('true');
+    expect(save.textContent).toContain('Saving');
+
+    await act(async () => { resolveCommit(); await Promise.resolve(); });
+    expect((q('candidate-preview-save') as HTMLButtonElement).disabled).toBe(false);
+  });
 });
