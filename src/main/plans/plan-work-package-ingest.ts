@@ -143,13 +143,62 @@ function normalizedPlanPath(value: unknown): string | null {
   return normalized;
 }
 
+function visiblePackageProse(body: string): string {
+  return body.replace(/<!--PLAN-WORK-PACKAGES:v1[\s\S]*?-->/g, '').replace(/\r\n/g, '\n');
+}
+
+function recognizedProsePackageHeadings(visible: string): RegExpMatchArray[] {
+  return [...visible.matchAll(/^##\s+([A-Za-z0-9][A-Za-z0-9._-]{0,63})\s+(?:-|â€”|—)\s+(.+?)\s*$/gm)];
+}
+
 function prosePackageHeadings(body: string): Array<{ id: string; title: string }> {
-  const visible = body.replace(/<!--PLAN-WORK-PACKAGES:v1[\s\S]*?-->/g, '');
   const headings: Array<{ id: string; title: string }> = [];
-  for (const match of visible.matchAll(/^##\s+([A-Za-z0-9][A-Za-z0-9._-]{0,63})\s+(?:-|â€”|—)\s+(.+?)\s*$/gm)) {
+  for (const match of recognizedProsePackageHeadings(visiblePackageProse(body))) {
     headings.push({ id: match[1], title: match[2] });
   }
   return headings;
+}
+
+type ProseOutcomeResult =
+  | { ok: true; byId: Map<string, string | null> }
+  | { ok: false; detail: string; packageId?: string };
+
+function proseOutcomeById(body: string): ProseOutcomeResult {
+  const visible = visiblePackageProse(body);
+  const headings = recognizedProsePackageHeadings(visible);
+  const firstHeading = headings[0]?.index ?? visible.length;
+  if (/^\s*\*\*Outcome\b/m.test(visible.slice(0, firstHeading))) {
+    return { ok: false, detail: 'Outcome label must be inside a prose package section' };
+  }
+
+  const byId = new Map<string, string | null>();
+  for (let headingIndex = 0; headingIndex < headings.length; headingIndex += 1) {
+    const heading = headings[headingIndex];
+    const sectionStart = (heading.index ?? 0) + heading[0].length;
+    const sectionEnd = headings[headingIndex + 1]?.index ?? visible.length;
+    const lines = visible.slice(sectionStart, sectionEnd).split('\n');
+    const outcomeIndexes = lines.flatMap((line, index) =>
+      /^\s*\*\*Outcome\b/.test(line) ? [index] : []);
+    if (outcomeIndexes.length > 1) {
+      return { ok: false, detail: `duplicate Outcome labels for ${heading[1]}`, packageId: heading[1] };
+    }
+    if (outcomeIndexes.length === 0) {
+      byId.set(foldedId(heading[1]), null);
+      continue;
+    }
+
+    const outcomeIndex = outcomeIndexes[0];
+    const outcomeLine = lines[outcomeIndex];
+    const nextLine = lines[outcomeIndex + 1];
+    const strict = outcomeLine.match(/^\*\*Outcome:\*\* (\S.*)$/);
+    const nextLineAllowed = nextLine === undefined || /^\s*$/.test(nextLine)
+      || /^(?:\*\*|## |<!--)/.test(nextLine);
+    if (!strict || outcomeLine.length > 200 || !nextLineAllowed) {
+      return { ok: false, detail: `malformed Outcome for ${heading[1]}`, packageId: heading[1] };
+    }
+    byId.set(foldedId(heading[1]), strict[1]);
+  }
+  return { ok: true, byId };
 }
 
 function invalid(
@@ -286,6 +335,9 @@ export function parsePlanWorkPackageDocument(
       }
     }
   }
+
+  const outcomes = proseOutcomeById(body);
+  if (!outcomes.ok) return invalid('prose-mismatch', outcomes.detail, sourceRelPath, outcomes.packageId);
 
   const headings = prosePackageHeadings(body);
   const headingById = new Map<string, { id: string; title: string }>();

@@ -69,6 +69,8 @@ import {
   PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD_V2_HASH,
   PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD_V3_HASH,
   PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD_V1_HASH,
+  PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD_V2_HASH,
+  PROPOSAL_TO_PLAN_CONTRACT_WORK_PACKAGES_MD_V1_HASH,
   PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD_V1_HASH,
   PROPOSAL_TO_PLAN_SKILL_MD_V2_HASH,
   PROPOSAL_TO_PLAN_SKILL_MD_V3_HASH,
@@ -154,11 +156,13 @@ import {
   PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V1,
   PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V3,
   PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD_V1,
+  PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD_V2,
   PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD_V1,
   PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD_V2,
   PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD_V1,
   PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD_V2,
   PROPOSAL_TO_PLAN_CONTRACT_RESPONSIBILITY_MD_V1,
+  PROPOSAL_TO_PLAN_CONTRACT_WORK_PACKAGES_MD_V1,
   PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V1,
   PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V2,
   PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V3,
@@ -3830,8 +3834,9 @@ const PROPOSAL_TO_PLAN_VERSIONED_FILES = new Map<string, { version: number; prev
     2: PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD_V2_HASH,
     3: PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD_V3_HASH,
   } }],
-  ['references/activities/package.md', { version: 2, previousHashes: {
+  ['references/activities/package.md', { version: 3, previousHashes: {
     1: PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD_V1_HASH,
+    2: PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD_V2_HASH,
   } }],
   ['references/activities/orient.md', { version: 3, previousHashes: {
     1: PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD_V1_HASH,
@@ -3839,6 +3844,9 @@ const PROPOSAL_TO_PLAN_VERSIONED_FILES = new Map<string, { version: number; prev
   } }],
   ['references/contracts/responsibility.md', { version: 2, previousHashes: {
     1: PROPOSAL_TO_PLAN_CONTRACT_RESPONSIBILITY_MD_V1_HASH,
+  } }],
+  ['references/contracts/work-packages.md', { version: 2, previousHashes: {
+    1: PROPOSAL_TO_PLAN_CONTRACT_WORK_PACKAGES_MD_V1_HASH,
   } }],
   ['references/contracts/manifest-lock.md', { version: 2, previousHashes: { 1: PROPOSAL_TO_PLAN_CONTRACT_MANIFEST_LOCK_MD_V1_HASH } }],
   ['scripts/plan-manifest.mjs', { version: 4, previousHashes: {
@@ -4096,6 +4104,102 @@ test('WP-3-PROMOTE-MIG. pristine promote v3 silently upgrades to v4', () => {
   } finally {
     cleanup();
     rmrf(workDir);
+  }
+});
+
+test('WP-2-PRECONDITION. frozen pre-Outcome bodies pin both new migration-history entries', () => {
+  assert.equal(
+    sha256Hex(PROPOSAL_TO_PLAN_CONTRACT_WORK_PACKAGES_MD_V1),
+    PROPOSAL_TO_PLAN_CONTRACT_WORK_PACKAGES_MD_V1_HASH,
+    'frozen work-packages.md v1 must hash to previousHashes[1]',
+  );
+  assert.equal(
+    sha256Hex(PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD_V2),
+    PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD_V2_HASH,
+    'frozen package.md v2 must hash to previousHashes[2]',
+  );
+  assert.notEqual(
+    sha256Hex(PROPOSAL_TO_PLAN_CONTRACT_WORK_PACKAGES_MD),
+    PROPOSAL_TO_PLAN_CONTRACT_WORK_PACKAGES_MD_V1_HASH,
+    'live work-packages.md v2 must differ from frozen v1',
+  );
+  assert.notEqual(
+    sha256Hex(PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD),
+    PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD_V2_HASH,
+    'live package.md v3 must differ from frozen v2',
+  );
+});
+
+test('WP-2-CONTENT. package authoring requires a bounded, semantically checked Outcome', () => {
+  for (const phrase of [
+    'Files · Dep · Do · Accept · Non-goals · Verify · Outcome',
+    "Re-read each package's `Do`, `Accept`, and `Non-goals`",
+    'at least one acceptance condition must observably prove it',
+    'Do not declare\n  dispatch readiness if the semantic Outcome check fails.',
+  ]) {
+    assert.ok(PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD.includes(phrase), `missing package.md Outcome rule: ${phrase}`);
+  }
+  for (const phrase of [
+    '`**Outcome:** <one plain sentence: what the user can newly see or do when this package lands;',
+    'No file paths or identifiers.>`',
+    'The complete Outcome line must be at most 200 characters.',
+    'the Outcome must promise no behavior outside them',
+    'it cannot tell a legitimate legacy omission from a new-authoring omission',
+    'semantic self-check and review gate',
+  ]) {
+    assert.ok(PROPOSAL_TO_PLAN_CONTRACT_WORK_PACKAGES_MD.includes(phrase),
+      `missing work-packages.md Outcome rule: ${phrase}`);
+  }
+});
+
+test('WP-2-MIG. pristine work-packages v1 and package v1/v2 silently upgrade to current', () => {
+  const cases = [
+    {
+      name: 'work-packages-v1', rel: 'references/contracts/work-packages.md',
+      body: PROPOSAL_TO_PLAN_CONTRACT_WORK_PACKAGES_MD_V1, diskVersion: 1,
+      live: PROPOSAL_TO_PLAN_CONTRACT_WORK_PACKAGES_MD, currentVersion: 2,
+    },
+    {
+      name: 'package-v1', rel: 'references/activities/package.md',
+      body: PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD_V1, diskVersion: 1,
+      live: PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD, currentVersion: 3,
+    },
+    {
+      name: 'package-v2', rel: 'references/activities/package.md',
+      body: PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD_V2, diskVersion: 2,
+      live: PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD, currentVersion: 3,
+    },
+  ] as const;
+
+  for (const entry of cases) {
+    const workDir = mktmp(`wp2-${entry.name}`);
+    const { supervisor, cleanup } = makeSupervisor();
+    const rootRel = '.lares/workers/codex/.agents/skills/proposal-to-plan';
+    const fullRel = `${rootRel}/${entry.rel}`;
+    const fullPath = path.join(workDir, ...fullRel.split('/'));
+    const sidecarKey = fullRel.replace(/^\.lares\//, '');
+    try {
+      fs.mkdirSync(path.dirname(fullPath), { recursive: true });
+      fs.writeFileSync(fullPath, entry.body, 'utf8');
+      fs.mkdirSync(path.dirname(sidecarPath(workDir)), { recursive: true });
+      fs.writeFileSync(sidecarPath(workDir), JSON.stringify({
+        [sidecarKey]: entry.diskVersion,
+      }, null, 2) + '\n', 'utf8');
+
+      supervisor.ensureWorkerScaffold(workDir, 'codex', 'windows');
+
+      assert.equal(fs.readFileSync(fullPath, 'utf8'), entry.live);
+      assert.equal(readSidecar(workDir)[sidecarKey], entry.currentVersion);
+      assert.equal(
+        fs.readdirSync(path.dirname(fullPath)).filter((name) =>
+          name.startsWith(path.basename(fullPath) + '.bak.')).length,
+        0,
+        `${entry.name} must upgrade without a backup`,
+      );
+    } finally {
+      cleanup();
+      rmrf(workDir);
+    }
   }
 });
 

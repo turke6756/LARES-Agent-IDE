@@ -6202,11 +6202,14 @@ Decisions/Work packages), \`references/contracts/folder-schema.md\` (§R0 — th
 
 - Cut the hardened plan into **worker-sized packages**, each fitting one worker's context, in the
   **bundle-contract shape** (\`.lares/proposals/supporting/2026-07-30-shared-bundle-contract.md\`):
-  every WP lists **Files · Dep · Do · Accept · Non-goals · Verify**.
+  every WP lists **Files · Dep · Do · Accept · Non-goals · Verify · Outcome**.
 - Write exactly one \`kind: work-packages\` supplement. In the same operation, write its prose
   bundle contracts and its additive \`PLAN-WORK-PACKAGES:v1\` block. Self-check that projected IDs
   and titles have one-to-one parity with the prose headings, then validate the complete file against
   \`references/contracts/work-packages.md\`.
+- Re-read each package's \`Do\`, \`Accept\`, and \`Non-goals\`. Its Outcome must promise no behavior
+  outside them, and at least one acceptance condition must observably prove it. Do not declare
+  dispatch readiness if the semantic Outcome check fails.
 - Record the packages under \`ARC.md → ## Work packages\` (\`<id> <title> — <state> — <responsible/assignee>\`).
 - **Preconditions:** a defensible implementation plan exists — every marked intent is folded or
   legitimately trivial (\`## Hardening scope\` verdict present). Do not package an unhardened plan.
@@ -6606,7 +6609,15 @@ export const PROPOSAL_TO_PLAN_CONTRACT_WORK_PACKAGES_MD = `# Contract reference 
 The responsible supervisor writes exactly one regular, non-symlink Markdown file under
 \`supplements/\` with frontmatter \`kind: work-packages\` and the plan's exact
 \`plan_artifact_id\`. The existing prose remains in the bundle-contract shape: every package has
-\`Files\`, \`Dep\`, \`Do\`, \`Accept\`, \`Non-goals\`, and \`Verify\` sections.
+\`Files\`, \`Dep\`, \`Do\`, \`Accept\`, \`Non-goals\`, and \`Verify\` sections, and opens with exactly one:
+
+\`**Outcome:** <one plain sentence: what the user can newly see or do when this package lands; for a
+non-visible prerequisite, what user-facing capability or safety it unlocks and why it must land
+first. No file paths or identifiers.>\`
+
+The complete Outcome line must be at most 200 characters. Re-read \`Do\`, \`Accept\`, and \`Non-goals\`:
+the Outcome must promise no behavior outside them, and at least one acceptance condition must
+observably prove it.
 
 Immediately before the prose package sections, emit exactly one hidden machine block:
 
@@ -6658,6 +6669,10 @@ Immediately before the prose package sections, emit exactly one hidden machine b
   package records and \`order\`.
 - Require exactly one matching prose \`## <id> - <title>\` or \`## <id> — <title>\` heading for each
   projected package and no extra prose WP headings. ARC duplicate/unknown-ID checks are advisory.
+
+Ingest distinguishes a legitimate legacy omission (no Outcome label) from a malformed Outcome, but
+it cannot tell a legitimate legacy omission from a new-authoring omission. New-authoring compliance
+is enforced by the semantic self-check and review gate.
 
 This block is additive machine metadata. It does not replace bundle prose, the ARC ledger,
 PLAN-INTENT/PLAN-INTEGRATION sentinels, or the rung ladder. A prose-only legacy supplement is

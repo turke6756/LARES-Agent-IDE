@@ -85,11 +85,14 @@ function spec(over: Partial<PackageSpec> = {}): PackageSpec {
   };
 }
 
-function document(packages: PackageSpec[], over: { artifactId?: string; jsonText?: string } = {}): string {
+function document(packages: PackageSpec[], over: {
+  artifactId?: string; jsonText?: string; prose?: string;
+} = {}): string {
   const artifactId = over.artifactId ?? 'plan_fixture';
   const projection = over.jsonText ?? JSON.stringify({ schema_version: 1,
     plan_artifact_id: artifactId, packages }, null, 2);
-  const prose = packages.map((pkg) => `## ${pkg.id} - ${pkg.title}\n\n**Accept**\n- fixture`).join('\n\n');
+  const prose = over.prose
+    ?? packages.map((pkg) => `## ${pkg.id} - ${pkg.title}\n\n**Accept**\n- fixture`).join('\n\n');
   return `---\nplan_artifact_id: ${artifactId}\nkind: work-packages\n---\n\n`
     + `<!--PLAN-WORK-PACKAGES:v1\n${projection}\n-->\n\n${prose}\n`;
 }
@@ -184,6 +187,85 @@ test('valid projection has casing-stable ids and distinct content/projection has
   assert.equal(firstA.contentHash, reorderedA.contentHash, 'order is excluded from content digest');
   assert.notEqual(first.projection.projectionHash, reordered.projection.projectionHash,
     'order is included in projection digest');
+});
+
+test('Outcome validation accepts a legacy package with no Outcome label', () => {
+  const result = ingest.parsePlanWorkPackageDocument(document([spec()]), 'plan_fixture');
+  assert.equal(result.ok, true);
+});
+
+test('Outcome validation accepts one strict Outcome followed by a field marker', () => {
+  const prose = '## WP-A - Package A\n\n**Outcome:** The user can see package A working.\n**Accept**\n- fixture';
+  const result = ingest.parsePlanWorkPackageDocument(document([spec()], { prose }), 'plan_fixture');
+  assert.equal(result.ok, true);
+});
+
+test('Outcome validation accepts one strict Outcome at EOF', () => {
+  const prose = '## WP-A - Package A\n\n**Outcome:** The user can see package A working.';
+  const body = document([spec()], { prose }).replace(/\n$/, '');
+  const result = ingest.parsePlanWorkPackageDocument(body, 'plan_fixture');
+  assert.equal(result.ok, true);
+});
+
+for (const [name, outcome] of [
+  ['empty', '**Outcome:**'],
+  ['wrong-prefix', '**Outcome**: The user can see package A working.'],
+] as const) {
+  test(`Outcome validation rejects a ${name} Outcome label`, () => {
+    const prose = `## WP-A - Package A\n\n${outcome}\n\n**Accept**\n- fixture`;
+    const result = ingest.parsePlanWorkPackageDocument(document([spec()], { prose }), 'plan_fixture');
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.match(result.diagnostics[0].detail, /malformed Outcome/);
+  });
+}
+
+test('Outcome validation rejects an Outcome line over 200 characters', () => {
+  const outcome = '**Outcome:** ' + 'x'.repeat(201 - '**Outcome:** '.length);
+  assert.equal(outcome.length, 201);
+  const prose = `## WP-A - Package A\n\n${outcome}\n\n**Accept**\n- fixture`;
+  const result = ingest.parsePlanWorkPackageDocument(document([spec()], { prose }), 'plan_fixture');
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.match(result.diagnostics[0].detail, /malformed Outcome/);
+});
+
+test('Outcome validation rejects a physical continuation line', () => {
+  const prose = '## WP-A - Package A\n\n**Outcome:** The user can see package A working.\ncontinued on another line\n\n**Accept**\n- fixture';
+  const result = ingest.parsePlanWorkPackageDocument(document([spec()], { prose }), 'plan_fixture');
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.match(result.diagnostics[0].detail, /malformed Outcome/);
+});
+
+test('Outcome validation rejects duplicate Outcome labels in one package section', () => {
+  const prose = '## WP-A - Package A\n\n**Outcome:** The user can see A.\n\n**Outcome:** The user can do A.';
+  const result = ingest.parsePlanWorkPackageDocument(document([spec()], { prose }), 'plan_fixture');
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.match(result.diagnostics[0].detail, /duplicate Outcome/);
+});
+
+test('Outcome validation rejects an Outcome label outside a package section', () => {
+  const prose = '**Outcome:** This is outside every package.\n\n## WP-A - Package A\n\n**Accept**\n- fixture';
+  const result = ingest.parsePlanWorkPackageDocument(document([spec()], { prose }), 'plan_fixture');
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.match(result.diagnostics[0].detail, /inside a prose package section/);
+});
+
+test('Outcome-like text in the machine block is ignored', () => {
+  const machineOnly = spec({ acceptance_conditions: ['Machine example: **Outcome:** ignored.'] });
+  const result = ingest.parsePlanWorkPackageDocument(document([machineOnly]), 'plan_fixture');
+  assert.equal(result.ok, true);
+});
+
+test('Outcome validation has CRLF and LF parity', () => {
+  const validProse = '## WP-A - Package A\n\n**Outcome:** The user can see package A working.\n\n**Accept**\n- fixture';
+  const malformedProse = '## WP-A - Package A\n\n**Outcome:** The user can see package A working.\ncontinued';
+  for (const prose of [validProse, malformedProse]) {
+    const lf = document([spec()], { prose });
+    const crlf = lf.replace(/\n/g, '\r\n');
+    assert.equal(
+      ingest.parsePlanWorkPackageDocument(crlf, 'plan_fixture').ok,
+      ingest.parsePlanWorkPackageDocument(lf, 'plan_fixture').ok,
+    );
+  }
 });
 
 test('strict parser rejects duplicate/unknown keys, comments, traversal, dependencies, and prose drift', () => {
