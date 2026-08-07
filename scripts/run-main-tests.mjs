@@ -653,6 +653,7 @@ const TESTS = [
   'dist/main/main/plans/promotion-reconciler.test.js',
   // Server-authoritative promotion preflight + disk claim scan.
   'dist/main/main/plans/promotion-preflight.test.js',
+  'dist/main/main/plans/proposal-delete.test.js',
   'dist/main/main/plans/promotion-claim-scan.test.js',
   // WP-P2L-ingest: transactional plan-intent ledger scan.
   'dist/main/main/plans/plan-intent-ledger.test.js',

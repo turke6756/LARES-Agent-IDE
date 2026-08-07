@@ -648,6 +648,20 @@ export type PromotionPreflightResult =
   | { status: 'duplicate-blocked'; folderRelPaths: string[]; detail: string }
   | { status: 'foreign-blocked'; folderRelPath: string; detail: string };
 
+export interface DeleteProposalRequest {
+  workspaceId: string;
+  /** Opaque planning-reader document handle. Never a renderer-authored path. */
+  proposalDocumentId: string;
+}
+
+export type DeleteProposalResult =
+  | { ok: true }
+  | {
+      ok: false;
+      reason: 'workspace-not-found' | 'not-found' | 'promoted' | 'unsafe-path'
+        | 'plan-source-reference' | 'io-error';
+    };
+
 export interface SupervisorFocus {
   supervisorId: string;
   planId: string;
@@ -3255,6 +3269,8 @@ export interface IpcApi {
     /** Resolve a proposal's opaque reader handle and classify the sole promote
      * gesture using server-read bytes, disk claims, and converged folder state. */
     promotionPreflight: (input: PromotionPreflightRequest) => Promise<PromotionPreflightResult>;
+    /** Permanently remove one server-rebound, non-promoted proposal file. */
+    deleteProposal: (input: DeleteProposalRequest) => Promise<DeleteProposalResult>;
     /** WP-P4D-proj / WP-P4E — the plan-comment projection that backs the comments
      *  rail: every comment on the plan (across its registered external documents
      *  AND its folder-doc logical targets) rolled up with its reply thread and a

@@ -92,6 +92,7 @@ beforeEach(() => {
     },
     plans: {
       gallery: vi.fn(async () => ({ rows: galleryRows, warnings: [] })),
+      deleteProposal: vi.fn(async () => ({ ok: true })),
     },
   };
   useDashboardStore.setState({
@@ -222,5 +223,43 @@ describe('ProposalCardGallery', () => {
     expect(state.fileViewerOpen).toBe(true);
     expect(state.plansOpen).toBe(false);
     expect(state.openTabs[0]?.filePath).toBe('C:\\work\\.lares\\proposals\\2026-08-03-new.md');
+  });
+
+  it('disables deletion for promoted proposal source records with an explanatory tooltip', async () => {
+    await render(<PlansPane />);
+    click('[data-testid="proposal-promoted-toggle"]');
+    const disabled = container!.querySelector<HTMLButtonElement>('[data-testid="proposal-delete-disabled"]');
+    expect(disabled).not.toBeNull();
+    expect(disabled!.disabled).toBe(true);
+    expect(disabled!.title).toBe('Promoted proposals are retained as plan source records.');
+  });
+
+  it('confirms ordinary deletion through the identity-only API and reloads proposals', async () => {
+    await render(<PlansPane />);
+    const list = window.api.planningReader.list as ReturnType<typeof vi.fn>;
+    const remove = window.api.plans.deleteProposal as ReturnType<typeof vi.fn>;
+
+    click('[data-testid="proposal-delete"]');
+    expect(container!.querySelector('[role="dialog"]')?.textContent).toContain(
+      'Delete this proposal? This permanently removes the file 2026-08-03-new.md from disk. This cannot be undone.',
+    );
+    click('[data-testid="proposal-delete-confirm"]');
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+
+    expect(remove).toHaveBeenCalledWith({ workspaceId: 'ws-1', proposalDocumentId: 'new' });
+    expect(list).toHaveBeenCalledTimes(2);
+  });
+
+  it('cancels proposal deletion without calling the API or reloading', async () => {
+    await render(<PlansPane />);
+    const list = window.api.planningReader.list as ReturnType<typeof vi.fn>;
+    const remove = window.api.plans.deleteProposal as ReturnType<typeof vi.fn>;
+
+    click('[data-testid="proposal-delete"]');
+    click('[data-testid="proposal-delete-cancel"]');
+
+    expect(container!.querySelector('[data-testid="proposal-delete-confirm"]')).toBeNull();
+    expect(remove).not.toHaveBeenCalled();
+    expect(list).toHaveBeenCalledTimes(1);
   });
 });

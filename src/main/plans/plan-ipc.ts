@@ -23,6 +23,8 @@ import type {
   SaveCardBundle,
   Workspace,
   ObservedOverviewSourceToken,
+  DeleteProposalRequest,
+  DeleteProposalResult,
 } from '../../shared/types';
 import {
   hasSupervisorPrivilege,
@@ -96,6 +98,7 @@ import { observeOverviewSource, parsePlanHumanOverview,
 import { parseStrictJson } from './strict-json';
 import { reconcilePlanFolderProjections } from './plan-folder-reconciler';
 import { derivePromotedLifecycle } from './promoted-lifecycle';
+import { deleteProposal } from './proposal-delete';
 
 const MAX_PROMOTED_PLAN_JSON_BYTES = 256_000;
 const ARCHIVED_PLAN_STATUSES = new Set(['archived', 'superseded', 'cancelled', 'canceled']);
@@ -1331,6 +1334,24 @@ export function registerBlameToIntentIpc(
     runBlameToIntent(rawRequest, query));
 }
 
+export function registerProposalDeleteIpc(
+  ipc: PlanIpcLike,
+  remove: (request: DeleteProposalRequest) => DeleteProposalResult = deleteProposal,
+): void {
+  ipc.handle('proposal:delete', (_event, raw: unknown) => {
+    if (!raw || typeof raw !== 'object') return { ok: false, reason: 'not-found' };
+    const request = raw as Partial<DeleteProposalRequest>;
+    if (
+      typeof request.workspaceId !== 'string' || request.workspaceId === ''
+      || typeof request.proposalDocumentId !== 'string' || request.proposalDocumentId === ''
+    ) return { ok: false, reason: 'not-found' };
+    return remove({
+      workspaceId: request.workspaceId,
+      proposalDocumentId: request.proposalDocumentId,
+    });
+  });
+}
+
 export function registerPlanIpc(): void {
   ipcMain.handle(
     'plan-folder:list',
@@ -1405,6 +1426,7 @@ export function registerPlanIpc(): void {
   // The sole mounted promote gesture first resolves its opaque proposal handle
   // through this server-authoritative preflight.
   registerPromotionPreflightIpc(ipcMain);
+  registerProposalDeleteIpc(ipcMain);
 
   // WP-P2L-proj: mid-altitude intent history + confidence, derived from the
   // canonical ledger/orchestration join and current plan.md disk presence.

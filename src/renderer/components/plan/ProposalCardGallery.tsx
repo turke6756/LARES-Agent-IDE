@@ -20,20 +20,24 @@ function proposalPath(workspacePath: string, fileName: string, pathType: 'window
 function ProposalCard({
   card,
   onSelect,
+  onRequestDelete,
 }: {
   card: ProposalCardMetadata;
   onSelect: (docId: string) => void;
+  onRequestDelete: (card: ProposalCardMetadata) => void;
 }): React.ReactElement {
   const declared = card.declaredAuthor;
   const witnessed = card.witnessedAuthor;
   const declaredDetails = declared
     ? [declared.role, declared.agentId ? shortAgentId(declared.agentId) : null, declared.dateLabel].filter(Boolean)
     : [];
+  const promoted = Boolean(card.promotedTo);
   return (
+    <div className="relative w-72 shrink-0">
     <button
       type="button"
       onClick={() => onSelect(card.docId)}
-      className="flex w-72 shrink-0 flex-col rounded-lg border border-white/10 bg-surface-0 p-4 text-left transition-colors hover:border-accent-blue/40 hover:bg-white/[0.04]"
+      className="flex h-full w-full flex-col rounded-lg border border-white/10 bg-surface-0 p-4 pr-10 text-left transition-colors hover:border-accent-blue/40 hover:bg-white/[0.04]"
       data-testid="proposal-card"
     >
       <span className="line-clamp-2 text-[14px] font-semibold leading-5 text-gray-100">{card.title}</span>
@@ -69,6 +73,20 @@ function ProposalCard({
         </span>
       )}
     </button>
+      <button
+        type="button"
+        onClick={() => onRequestDelete(card)}
+        disabled={promoted}
+        className="absolute right-2 top-2 rounded p-1.5 text-gray-500 hover:bg-white/10 hover:text-accent-red disabled:cursor-not-allowed disabled:opacity-50"
+        data-testid={promoted ? 'proposal-delete-disabled' : 'proposal-delete'}
+        title={promoted
+          ? 'Promoted proposals are retained as plan source records.'
+          : `Delete ${card.fileName}`}
+        aria-label={promoted ? `Cannot delete promoted proposal ${card.title}` : `Delete proposal ${card.title}`}
+      >
+        <Icons.Trash2 className="h-3.5 w-3.5" />
+      </button>
+    </div>
   );
 }
 
@@ -86,6 +104,7 @@ export default function ProposalCardGallery(): React.ReactElement {
   const [promoteOpen, setPromoteOpen] = useState(false);
   const [promotedOpen, setPromotedOpen] = useState(false);
   const [cardRow, setCardRow] = useState<HTMLDivElement | null>(null);
+  const [pendingDelete, setPendingDelete] = useState<ProposalCardMetadata | null>(null);
 
   const load = useCallback(async () => {
     setCards(null);
@@ -93,6 +112,7 @@ export default function ProposalCardGallery(): React.ReactElement {
     setSelectedDocId(null);
     setPromoteOpen(false);
     setPromotedOpen(false);
+    setPendingDelete(null);
     if (!workspace) {
       setCards([]);
       return;
@@ -145,6 +165,20 @@ export default function ProposalCardGallery(): React.ReactElement {
   );
   const activeCards = useMemo(() => cards?.filter((card) => !card.promotedTo) ?? [], [cards]);
   const promotedCards = useMemo(() => cards?.filter((card) => card.promotedTo) ?? [], [cards]);
+
+  const confirmDelete = useCallback(async () => {
+    if (!workspace || !pendingDelete) return;
+    const result = await window.api.plans.deleteProposal({
+      workspaceId: workspace.id,
+      proposalDocumentId: pendingDelete.docId,
+    });
+    if (!result.ok) {
+      setPendingDelete(null);
+      setError(`Could not delete proposal (${result.reason}).`);
+      return;
+    }
+    await load();
+  }, [load, pendingDelete, workspace]);
 
   if (selected) {
     return (
@@ -222,7 +256,7 @@ export default function ProposalCardGallery(): React.ReactElement {
 
   return (
     <section
-      className="flex min-h-0 flex-1 flex-col rounded-lg border border-white/10 bg-surface-1"
+      className="relative flex min-h-0 flex-1 flex-col rounded-lg border border-white/10 bg-surface-1"
       aria-labelledby="plans-proposals-title"
       data-testid="plans-proposals-region"
     >
@@ -254,7 +288,7 @@ export default function ProposalCardGallery(): React.ReactElement {
               data-testid="proposal-card-row"
             >
               {activeCards.map((card) => (
-                <ProposalCard key={card.docId} card={card} onSelect={setSelectedDocId} />
+                <ProposalCard key={card.docId} card={card} onSelect={setSelectedDocId} onRequestDelete={setPendingDelete} />
               ))}
             </div>
           ) : (
@@ -277,12 +311,29 @@ export default function ProposalCardGallery(): React.ReactElement {
               {promotedOpen && (
                 <div className="flex items-stretch gap-3 overflow-x-auto px-4 pb-4 scrollbar-thin" data-testid="proposal-promoted-card-row">
                   {promotedCards.map((card) => (
-                    <ProposalCard key={card.docId} card={card} onSelect={setSelectedDocId} />
+                    <ProposalCard key={card.docId} card={card} onSelect={setSelectedDocId} onRequestDelete={setPendingDelete} />
                   ))}
                 </div>
               )}
             </section>
           )}
+        </div>
+      )}
+      {pendingDelete && (
+        <div className="absolute inset-0 z-20 flex items-center justify-center bg-black/60 p-4" role="dialog" aria-modal="true">
+          <div className="max-w-md rounded-lg border border-white/15 bg-surface-0 p-4 shadow-xl">
+            <p className="text-[13px] text-gray-200">
+              Delete this proposal? This permanently removes the file <code>{pendingDelete.fileName}</code> from disk. This cannot be undone.
+            </p>
+            <div className="mt-4 flex justify-end gap-2">
+              <button type="button" className="ui-btn px-3 py-1.5 text-[12px]" onClick={() => setPendingDelete(null)} data-testid="proposal-delete-cancel">
+                Cancel
+              </button>
+              <button type="button" className="ui-btn px-3 py-1.5 text-[12px] text-accent-red" onClick={() => void confirmDelete()} data-testid="proposal-delete-confirm">
+                Delete permanently
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </section>
