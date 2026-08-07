@@ -9,7 +9,6 @@
 //   • Subdir tabs (deliberations) render a sibling list opened read-only BY
 //     MANIFEST ID via `plans.readDocument`.
 //   • A populated tab with no supervisor overview shows "overview pending".
-//   • The Packages tab (populated:false) renders its placeholder, no pending.
 //   • An empty subdir shows "no documents yet".
 import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
 import React, { act } from 'react';
@@ -67,12 +66,6 @@ function model(): PlanDocumentsModel {
         key: 'research',
         populated: false,
         documents: [],
-      },
-      {
-        key: 'packages',
-        populated: false,
-        documents: [],
-        placeholder: 'No work-package definitions have been imported yet.',
       },
     ],
   };
@@ -166,7 +159,7 @@ describe('PlanDocumentTabs (WP-P4B tabbed document home)', () => {
   it('renders only projected keys — no plan.json / .gitkeep tab', async () => {
     await render(<PlanDocumentTabs planId="plan-1" />);
     const keys = tabButtons().map((b) => b.getAttribute('data-tab-key'));
-    expect(keys).toEqual(['overview', 'plan', 'deliberations', 'research', 'packages']);
+    expect(keys).toEqual(['overview', 'plan', 'deliberations', 'research']);
     expect(keys).not.toContain('plan.json');
     expect(keys).not.toContain('.gitkeep');
   });
@@ -213,20 +206,6 @@ describe('PlanDocumentTabs (WP-P4B tabbed document home)', () => {
     await flush();
     expect(readDocumentMock).toHaveBeenLastCalledWith('plan-1', { source: 'folder', documentId: 'd-del2' });
     expect(body().textContent).toContain('delib two');
-  });
-
-  it('renders truthful Packages import guidance (populated:false) with NO "overview pending"', async () => {
-    await render(<PlanDocumentTabs planId="plan-1" />);
-    await act(async () => {
-      tabByKey('packages').click();
-    });
-    await flush();
-    const ph = document.querySelector('[data-testid="plan-packages-placeholder"]');
-    expect(ph?.textContent).toContain('No work-package definitions have been imported yet.');
-    expect(ph?.textContent).toContain('Refresh imports them into the Mission Board.');
-    // The unpopulated placeholder must not force an overview.
-    expect(document.querySelector('[data-testid="plan-overview-pending"]')).toBeNull();
-    expect(document.querySelector('[data-testid="plan-tab-overview"]')).toBeNull();
   });
 
   it('an empty subdir tab shows "no documents yet"', async () => {

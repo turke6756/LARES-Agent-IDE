@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import './planSurface.css';
 import CandidatePreview, { type CandidatePreviewSelection } from '../save/CandidatePreview';
 import CommitOutcome from '../save/CommitOutcome';
@@ -21,9 +21,10 @@ function PlanSurfaceView({
 }): React.ReactElement {
   const [commitOutcome, setCommitOutcome] = useState<CommitCoordinatorConsumeResponse | null>(null);
   const [commitRefusal, setCommitRefusal] = useState<string | null>(null);
-  const [viewMode, setViewMode] = useState<'review' | 'packages'>('review');
   const [reviewProjection, setReviewProjection] = useState<PlanReviewProjection | null>(null);
   const [reviewError, setReviewError] = useState<string | null>(null);
+  const reviewRequestKeyRef = useRef<string | null>(null);
+  const currentReviewKeyRef = useRef<string | null>(null);
   const submitterRef = useRef<ReturnType<typeof createCandidateSubmitter> | null>(null);
   if (!submitterRef.current) submitterRef.current = createCandidateSubmitter();
   const activePlanId = useDashboardStore((state) => {
@@ -31,28 +32,38 @@ function PlanSurfaceView({
     return activeTab?.kind === 'plan' ? activeTab.planId : null;
   });
 
+  const reviewKey = activePlanId && workspaceId ? `${workspaceId}\0${activePlanId}` : null;
+  currentReviewKeyRef.current = reviewKey;
+
   useEffect(() => {
-    if (!activePlanId || !workspaceId) {
-      setReviewProjection(null);
-      setReviewError(null);
+    reviewRequestKeyRef.current = null;
+    setReviewProjection(null);
+    setReviewError(null);
+  }, [reviewKey]);
+
+  const loadReviewEvidence = useCallback((event: React.SyntheticEvent<HTMLDetailsElement>) => {
+    if (!event.currentTarget.open || !activePlanId || !workspaceId || !reviewKey) return;
+    if (reviewRequestKeyRef.current === reviewKey) return;
+    reviewRequestKeyRef.current = reviewKey;
+    setReviewProjection(null);
+    setReviewError(null);
+    const getReviewProjection = window.api.plans.getReviewProjection;
+    if (typeof getReviewProjection !== 'function') {
+      setReviewError('Plan review is unavailable.');
       return;
     }
-    let active = true;
-    const getReviewProjection = window.api.plans.getReviewProjection;
-    if (typeof getReviewProjection !== 'function') return;
     void getReviewProjection({ workspaceId, planId: activePlanId })
       .then((next) => {
-        if (!active) return;
+        if (currentReviewKeyRef.current !== reviewKey) return;
         setReviewProjection(next);
         setReviewError(null);
       })
       .catch((error: unknown) => {
-        if (!active) return;
+        if (currentReviewKeyRef.current !== reviewKey) return;
         setReviewProjection(null);
         setReviewError(error instanceof Error ? error.message : 'Plan review is unavailable.');
       });
-    return () => { active = false; };
-  }, [activePlanId, workspaceId]);
+  }, [activePlanId, reviewKey, workspaceId]);
 
   useEffect(() => { setCommitOutcome(null); setCommitRefusal(null); }, [workspaceId, candidateSelection]);
 
@@ -85,41 +96,21 @@ function PlanSurfaceView({
       )}
       {commitRefusal && <div role="alert" data-testid="plan-save-refusal">{commitRefusal}</div>}
       {commitOutcome && <CommitOutcome response={commitOutcome} onRepreview={() => setCommitOutcome(null)} />}
-      <div className="plan-surface__viewtoggle" role="tablist" aria-label="Plan view" data-testid="plan-view-toggle">
-        <button
-          type="button"
-          role="tab"
-          className={`plan-surface__viewtab${viewMode === 'review' ? ' plan-surface__viewtab--active' : ''}`}
-          aria-selected={viewMode === 'review'}
-          onClick={() => setViewMode('review')}
-          data-testid="plan-view-review"
-        >
-          Review
-        </button>
-        <button
-          type="button"
-          role="tab"
-          className={`plan-surface__viewtab${viewMode === 'packages' ? ' plan-surface__viewtab--active' : ''}`}
-          aria-selected={viewMode === 'packages'}
-          onClick={() => setViewMode('packages')}
-          data-testid="plan-view-packages"
-        >
-          Packages
-        </button>
-      </div>
-      {viewMode === 'review' ? (
-        reviewProjection ? (
+      {activePlanId ? (
+        <MissionBoard planId={activePlanId} paneVisible />
+      ) : (
+        <div className="mission-board__empty" data-testid="mission-board-no-plan">No active plan selected.</div>
+      )}
+      <details data-testid="plan-review-evidence" onToggle={loadReviewEvidence}>
+        <summary>Change evidence (diff)</summary>
+        {reviewProjection ? (
           <PlanReviewView projection={reviewProjection} />
         ) : (
           <div className="mission-board__empty" data-testid="plan-review-unavailable">
             {reviewError ?? 'Loading plan review…'}
           </div>
-        )
-      ) : activePlanId ? (
-        <MissionBoard planId={activePlanId} paneVisible />
-      ) : (
-        <div className="mission-board__empty" data-testid="mission-board-no-plan">No active plan selected.</div>
-      )}
+        )}
+      </details>
     </div>
   );
 }

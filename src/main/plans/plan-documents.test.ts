@@ -14,7 +14,6 @@ import type {
 } from '../../shared/types';
 import {
   buildPlanDocuments,
-  hasPlanWorkPackagesInDb,
   readPlanDocument,
   type PlanContext,
   type PlanDocumentsDeps,
@@ -86,7 +85,6 @@ function fixture(documents: PlanningReaderDocument[] = []): Fixture {
     listRegisteredDocuments: () => registered,
     getRegisteredDocument: (planId, id) =>
       registered.find((row) => row.planId === planId && row.id === id) ?? null,
-    hasWorkPackages: () => false,
     getSourceProposalProjectionState: () => null,
   };
   return { root, context, workspace, manifest, registered, deps, dispose: () => fs.rmSync(root, { recursive: true, force: true }) };
@@ -183,32 +181,10 @@ test('deleted deliberation degrades to an empty tab on re-list', () => {
   } finally { f.dispose(); }
 });
 
-test('absent plan_work_packages table yields Packages populated:false without throwing', () => {
-  const db = { prepare: () => ({ get: () => undefined }) };
-  assert.equal(hasPlanWorkPackagesInDb(db, PLAN_ID), false);
+test('document projection does not emit the synthetic Packages tab', () => {
   const f = fixture();
   try {
-    f.deps.hasWorkPackages = (id) => hasPlanWorkPackagesInDb(db, id);
-    const packages = tab(buildPlanDocuments(PLAN_ID, f.deps)!, 'packages');
-    assert.equal(packages.populated, false);
-    assert.match(packages.placeholder!, /not yet implemented/);
-  } finally { f.dispose(); }
-});
-
-test('present plan_work_packages rows make Packages populated:true', () => {
-  const db = {
-    prepare: (sql: string) => ({
-      get: (...params: unknown[]) => sql.includes('sqlite_master')
-        ? { ok: 1 }
-        : params[0] === PLAN_ID ? { ok: 1 } : undefined,
-    }),
-  };
-  const f = fixture();
-  try {
-    f.deps.hasWorkPackages = (id) => hasPlanWorkPackagesInDb(db, id);
-    const packages = tab(buildPlanDocuments(PLAN_ID, f.deps)!, 'packages');
-    assert.equal(packages.populated, true);
-    assert.equal(packages.placeholder, undefined);
+    assert.equal(buildPlanDocuments(PLAN_ID, f.deps)!.tabs.some((candidate) => candidate.key === 'packages'), false);
   } finally { f.dispose(); }
 });
 

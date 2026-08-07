@@ -40,14 +40,13 @@ import ProposalReader from './ProposalReader';
 
 /** Human labels for the stable tab keys. Display is deliberately a renderer
  *  concern (see `PlanTabKey`), so the mapping lives here, not in shared. */
-const TAB_LABELS: Record<PlanTabKey, string> = {
+const TAB_LABELS: Partial<Record<PlanTabKey, string>> = {
   overview: 'Overview',
   proposal: 'Proposal',
   plan: 'Plan',
   deliberations: 'Deliberations',
   research: 'Research',
   supplements: 'Supplements',
-  packages: 'Packages',
   'legacy-html': 'Legacy',
 };
 
@@ -367,9 +366,8 @@ export default function PlanDocumentTabs({ planId }: { planId: string }): React.
     );
   }
 
-  const isPackages = activeKey === 'packages';
   const siblings = activeTab && SUBDIR_TABS.has(activeKey) ? activeTab.documents : [];
-  const showEmpty = Boolean(activeTab && !isPackages && activeTab.documents.length === 0);
+  const showEmpty = Boolean(activeTab && activeTab.documents.length === 0);
 
   return (
     <div className="flex h-full min-h-0 flex-col bg-surface-0" data-testid="plan-document-tabs">
@@ -401,18 +399,17 @@ export default function PlanDocumentTabs({ planId }: { planId: string }): React.
                 : 'border-transparent text-gray-400 hover:text-gray-200'
             }`}
           >
-            {TAB_LABELS[t.key]}
+            {TAB_LABELS[t.key] ?? t.key}
           </button>
         ))}
       </div>
 
       <div className="flex min-h-0 flex-1" data-testid="plan-tab-body">
        <div className="flex min-h-0 flex-1 flex-col">
-        {/* Overview row — leads every tab. Supervisor-authored summary when
-            present; "overview pending" on a populated tab that has none; an
-            in-place editor for a supervisor (WP-P4C-editor). The Packages
-            placeholder is populated:false and never demands one. */}
-        {(!isPackages || activeTab?.populated) && (hasOverview || editing || (activeTab?.populated && !overviewLoading)) && (
+        {/* Overview row — leads every populated tab. Supervisor-authored summary
+            when present; "overview pending" on a populated tab that has none;
+            an in-place editor for a supervisor (WP-P4C-editor). */}
+        {(hasOverview || editing || (activeTab?.populated && !overviewLoading)) && (
           <div className="shrink-0 border-b border-white/10 bg-surface-1/40 px-6 py-3" data-testid="plan-tab-overview">
             {editing ? (
               <div className="max-w-3xl" data-testid="plan-overview-editor">
@@ -507,19 +504,12 @@ export default function PlanDocumentTabs({ planId }: { planId: string }): React.
         )}
 
         {/* Document region. */}
-        {isPackages ? (
-          activeTab?.populated ? (
-            <div className="flex flex-1 items-center justify-center px-6 text-[13px] text-gray-500" data-testid="plan-packages-populated">
-              Work packages are available on the Mission Board below.
-            </div>
-          ) : (
-            <div className="flex flex-1 items-center justify-center px-6 text-[13px] text-gray-500" data-testid="plan-packages-placeholder">
-              No work-package definitions have been imported yet. Packaging writes the durable definitions; Refresh imports them into the Mission Board.
-            </div>
-          )
-        ) : showEmpty ? (
-          <div className="flex flex-1 items-center justify-center px-6 text-[13px] text-gray-500" data-testid="plan-tab-empty">
-            no documents yet
+        {showEmpty ? (
+          <div
+            className="flex flex-1 items-center justify-center px-6 text-[13px] text-gray-500"
+            data-testid={activeTab?.placeholder ? 'plan-packages-placeholder' : 'plan-tab-empty'}
+          >
+            {activeTab?.placeholder ?? 'no documents yet'}
           </div>
         ) : (
           <div className="flex min-h-0 flex-1">
@@ -560,9 +550,8 @@ export default function PlanDocumentTabs({ planId }: { planId: string }): React.
 
         {/* WP-P4E — comments rail. Threads scope to the open document; a compose
             box routes create through the server (which picks the recipient), and
-            orphaned targets stay visible but non-clickable. Suppressed on the
-            synthetic Packages tab, which has no document to comment on. */}
-        {!isPackages && <PlanCommentsRail planId={planId} activeDoc={activeDoc} />}
+            orphaned targets stay visible but non-clickable. */}
+        <PlanCommentsRail planId={planId} activeDoc={activeDoc} />
       </div>
     </div>
   );

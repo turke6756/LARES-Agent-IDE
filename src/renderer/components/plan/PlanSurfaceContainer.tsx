@@ -51,7 +51,7 @@ export default function PlanSurfaceContainer({ planId }: { planId: string }): Re
       </div>
       <div className="w-[384px] shrink-0 min-h-0 flex flex-col border-l dark:border-white/10 light:border-black/10">
         <div className="shrink-0 flex items-center justify-between px-3 py-1.5 border-b dark:border-white/10 light:border-black/10">
-          <span className="text-[11px] uppercase tracking-wide text-gray-400">Plan review</span>
+          <span className="text-[11px] uppercase tracking-wide text-gray-400">Work packages</span>
           <button
             onClick={dismiss}
             className="p-1 rounded hover:bg-white/10 text-gray-400 hover:text-gray-200"

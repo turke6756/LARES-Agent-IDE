@@ -27,11 +27,9 @@ import { translateStateRelPath, workspaceStateDir } from '../workspace-state-dir
 import { listPlanningEntries, readPlanningDocument } from './planning-reader';
 
 const MAX_REGISTERED_READ_BYTES = 4_000_000;
-export const PACKAGES_PLACEHOLDER = 'not yet implemented — pull Implement to begin';
-
 const TAB_KEYS: readonly PlanTabKey[] = [
   'overview', 'proposal', 'plan', 'deliberations', 'research',
-  'supplements', 'packages', 'legacy-html',
+  'supplements', 'legacy-html',
 ];
 
 export interface PlanContext {
@@ -60,7 +58,6 @@ export interface PlanDocumentsDeps {
   ) => PlanningReaderReadResult | { error: string };
   listRegisteredDocuments?: (planId: string) => RegisteredDocumentRow[];
   getRegisteredDocument?: (planId: string, documentId: string) => RegisteredDocumentRow | null;
-  hasWorkPackages?: (planId: string) => boolean;
   getSourceProposalProjectionState?: (planId: string) => PlanSourceProposalProjectionState | null;
   maxRegisteredReadBytes?: number;
 }
@@ -107,26 +104,6 @@ function defaultGetRegistered(planId: string, documentId: string): RegisteredDoc
   return row ? rowToRegistered(row) : null;
 }
 
-/** Optional pre-P5 capability: absence of the table is a normal false result. */
-export function hasPlanWorkPackagesInDb(
-  database: { prepare(sql: string): { get(...params: unknown[]): unknown } },
-  planId: string,
-): boolean {
-  try {
-    const table = database.prepare(
-      `SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = 'plan_work_packages'`,
-    ).get();
-    if (!table) return false;
-    return !!database.prepare(`SELECT 1 AS ok FROM plan_work_packages WHERE plan_id = ? LIMIT 1`).get(planId);
-  } catch {
-    return false;
-  }
-}
-
-function defaultHasWorkPackages(planId: string): boolean {
-  return hasPlanWorkPackagesInDb(getDb(), planId);
-}
-
 function defaultSourceProposalProjectionState(planId: string): PlanSourceProposalProjectionState | null {
   try { return getPlanSourceProposalProjectionState(planId); }
   catch { return null; }
@@ -140,7 +117,6 @@ function depsWithDefaults(deps: PlanDocumentsDeps) {
     readPlanningDocument: deps.readPlanningDocument ?? readPlanningDocument,
     listRegisteredDocuments: deps.listRegisteredDocuments ?? defaultListRegistered,
     getRegisteredDocument: deps.getRegisteredDocument ?? defaultGetRegistered,
-    hasWorkPackages: deps.hasWorkPackages ?? defaultHasWorkPackages,
     getSourceProposalProjectionState: deps.getSourceProposalProjectionState ?? defaultSourceProposalProjectionState,
     maxRegisteredReadBytes: deps.maxRegisteredReadBytes ?? MAX_REGISTERED_READ_BYTES,
   };
@@ -257,12 +233,11 @@ function inspectRegistered(
   }
 }
 
-function emptyTabs(hasPackages: boolean): PlanDocumentTab[] {
+function emptyTabs(): PlanDocumentTab[] {
   return TAB_KEYS.map((key) => ({
     key,
-    populated: key === 'packages' ? hasPackages : false,
+    populated: false,
     documents: [],
-    ...(key === 'packages' && !hasPackages ? { placeholder: PACKAGES_PLACEHOLDER } : {}),
   }));
 }
 
@@ -275,7 +250,7 @@ export function buildPlanDocuments(
   const context = d.getPlanContext(planId);
   if (!context) return null;
   const workspace = d.getWorkspace(context.workspaceId);
-  if (!workspace) return { planId, tabs: emptyTabs(false), warnings: ['workspace unavailable'] };
+  if (!workspace) return { planId, tabs: emptyTabs(), warnings: ['workspace unavailable'] };
 
   const warnings: string[] = [];
   const sourceProjection = d.getSourceProposalProjectionState(planId);
@@ -290,7 +265,7 @@ export function buildPlanDocuments(
     warnings.push(`folder manifest unavailable: ${err instanceof Error ? err.message : String(err)}`);
   }
   const entry = currentFolderEntry(context, manifest);
-  const tabs = emptyTabs(d.hasWorkPackages(planId));
+  const tabs = emptyTabs();
   const byKey = new Map(tabs.map((tab) => [tab.key, tab]));
   const manifestProposalDocuments: PlanTabDocument[] = [];
 
@@ -326,9 +301,7 @@ export function buildPlanDocuments(
     byKey.get('proposal')!.documents.push(...manifestProposalDocuments);
   }
 
-  for (const tab of tabs) {
-    if (tab.key !== 'packages') tab.populated = tab.documents.length > 0;
-  }
+  for (const tab of tabs) tab.populated = tab.documents.length > 0;
   return { planId, tabs, warnings };
 }
 

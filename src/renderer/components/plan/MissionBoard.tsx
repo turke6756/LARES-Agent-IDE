@@ -8,6 +8,7 @@ import type {
   MissionBoardPackageTimeline,
   PlanCandidatePreviewResponse,
 } from '../../../shared/types';
+import { derivePackageRollup, type PackageStateCounts } from '../../../shared/package-rollup';
 import { useMissionBoardPolling, type MissionBoardList } from '../../stores/mission-board-store';
 import AttributionPanel from '../checkpoints/AttributionPanel';
 import FileHistoryView from '../checkpoints/FileHistoryView';
@@ -107,6 +108,11 @@ export default function MissionBoard({
     () => cards.map((card) => `${card.packageId}:${card.revision}:${card.state}`).join('|'),
     [cards],
   );
+  const packageRollup = useMemo(() => {
+    const counts: PackageStateCounts = { ready: 0, executing: 0, blocked: 0, done: 0, archived: 0 };
+    for (const card of cards) counts[card.state] += 1;
+    return derivePackageRollup(counts);
+  }, [cards]);
 
   useEffect(() => {
     setCommitSelection(null);
@@ -199,6 +205,13 @@ export default function MissionBoard({
         </div>
         {loading && <span className="mission-board__loading">Refreshing…</span>}
       </div>
+
+      <p
+        data-testid="mission-board-progress"
+        aria-label={`${packageRollup.landed} of ${packageRollup.total} landed, ${packageRollup.remaining} remaining, ${packageRollup.archived} archived`}
+      >
+        {packageRollup.landed} of {packageRollup.total} landed · {packageRollup.remaining} remaining · {packageRollup.archived} archived
+      </p>
 
       {error && <div className="mission-board__error" role="alert">Board unavailable: {error}</div>}
       {actionError && <div className="mission-board__error" role="alert">{actionError}</div>}

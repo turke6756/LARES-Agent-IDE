@@ -8,19 +8,23 @@ import { useDashboardStore } from '../../stores/dashboard-store';
 let container: HTMLDivElement;
 let root: Root;
 let documents: ReturnType<typeof vi.fn>;
+let getReviewProjection: ReturnType<typeof vi.fn>;
 
 beforeEach(() => {
   documents = vi.fn(async () => ({
     planId: 'plan-1', warnings: [], tabs: [{ key: 'overview', populated: false, documents: [] }],
   }));
+  getReviewProjection = vi.fn(async () => Promise.reject(
+    new Error('no work packages implemented yet — pull Implement to begin'),
+  ));
   (window as unknown as { api: unknown }).api = {
     plans: {
       documents,
       readDocument: vi.fn(),
       getOverview: vi.fn(async () => null),
-      getReviewProjection: vi.fn(async () => Promise.reject(
-        new Error('no work packages implemented yet — pull Implement to begin'),
-      )),
+      getReviewProjection,
+      boardList: vi.fn(async () => []),
+      boardTimeline: vi.fn(async () => []),
       previewCandidate: vi.fn(async () => ({ candidate: { members: [] }, selection: null })),
     },
   };
@@ -51,6 +55,7 @@ describe('PlanSurfaceContainer after legacy-surface retirement', () => {
     expect(container.querySelector('[data-testid="plan-document-tabs"]')).not.toBeNull();
     expect(container.querySelector('[data-testid="plan-surface"]')).not.toBeNull();
     expect(container.querySelector('[data-testid="plan-doc-host"]')).toBeNull();
+    expect(container.textContent).toContain('Work packages');
   });
 
   it('keeps the full-height sibling-panel layout', async () => {
@@ -60,7 +65,7 @@ describe('PlanSurfaceContainer after legacy-surface retirement', () => {
     expect(surface.classList.contains('flex-1')).toBe(false);
   });
 
-  it('explains the empty review column before the first execution run', async () => {
+  it('does not request change evidence until its collapsed disclosure is opened', async () => {
     useDashboardStore.setState({
       selectedWorkspaceId: 'ws-1',
       workspaces: [{
@@ -74,6 +79,16 @@ describe('PlanSurfaceContainer after legacy-surface retirement', () => {
       activeTabId: 'plan-tab',
     });
     await render();
+    const evidence = container.querySelector('[data-testid="plan-review-evidence"]') as HTMLDetailsElement;
+    expect(evidence.open).toBe(false);
+    expect(getReviewProjection).not.toHaveBeenCalled();
+    await act(async () => {
+      evidence.open = true;
+      evidence.dispatchEvent(new Event('toggle'));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(getReviewProjection).toHaveBeenCalledOnce();
     expect(container.querySelector('[data-testid="plan-review-unavailable"]')?.textContent)
       .toContain('no work packages implemented yet — pull Implement to begin');
   });

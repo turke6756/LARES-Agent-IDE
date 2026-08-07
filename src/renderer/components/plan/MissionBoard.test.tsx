@@ -19,6 +19,7 @@ vi.mock('../checkpoints/AttributionPanel', () => ({
   ),
 }));
 vi.mock('../checkpoints/RestoreDialog', () => ({ default: () => <div data-testid="restore-dialog" /> }));
+vi.mock('./PlanReviewView', () => ({ default: () => <div data-testid="plan-review-view" /> }));
 
 import MissionBoard from './MissionBoard';
 import PlanSurfaceView from './PlanSurfaceView';
@@ -28,6 +29,7 @@ let root: Root | null = null;
 let fileHistory: ReturnType<typeof vi.fn>;
 let diff: ReturnType<typeof vi.fn>;
 let boardList: ReturnType<typeof vi.fn>;
+let getReviewProjection: ReturnType<typeof vi.fn>;
 
 function activeCard(): MissionBoardCard {
   return {
@@ -84,9 +86,10 @@ beforeEach(() => {
     window: { available: true, reason: null, label: 'unattributed changes in this window', text: '' },
   }));
   boardList = vi.fn(async () => [activeCard()]);
+  getReviewProjection = vi.fn(async () => ({ workspaceId: 'ws-1', planId: 'plan-1' }));
   (window as unknown as { api: unknown }).api = {
     checkpoints: { fileHistory, diff },
-    plans: { boardList },
+    plans: { boardList, getReviewProjection },
   };
 });
 
@@ -105,6 +108,19 @@ describe('MissionBoard', () => {
     expect(card.getAttribute('data-live-active')).toBe('true');
     expect(card.getAttribute('data-state')).toBe('executing');
     expect(card.getAttribute('data-state')).not.toBe('done');
+  });
+
+  it('summarizes landed, remaining, and archived package states with the shared rollup semantics', async () => {
+    const cards = ['done', 'done', 'done', 'ready', 'blocked', 'archived', 'archived'].map((state, index) => ({
+      ...activeCard(),
+      packageId: `WP-${index + 1}`,
+      state: state as MissionBoardCard['state'],
+      liveActivity: [],
+    }));
+    await renderBoard(vi.fn(async () => cards));
+    const progress = container!.querySelector('[data-testid="mission-board-progress"]')!;
+    expect(progress.textContent).toContain('3 of 7 landed · 2 remaining · 2 archived');
+    expect(progress.getAttribute('aria-label')).toBe('3 of 7 landed, 2 remaining, 2 archived');
   });
 
   it('opens FileHistoryView for the clicked path with the contributor selected', async () => {
@@ -133,7 +149,7 @@ describe('MissionBoard', () => {
     expect(container!.querySelector('[data-testid="file-history-view"]')).toBeNull();
   });
 
-  it('mounts from the Packages tab of PlanSurfaceView for the active plan', async () => {
+  it('mounts the board by default and lazy-loads change evidence only on first open', async () => {
     useDashboardStore.setState({
       openTabs: [{
         id: 'plan:plan-1',
@@ -153,19 +169,37 @@ describe('MissionBoard', () => {
     await act(async () => {
       root!.render(
         <PlanSurfaceView
-          projection={{ parseError: null, warnings: [], degradedFrom: null }}
-          sections={[]}
-          events={[]}
           workspaceId="ws-1"
         />,
       );
     });
+    expect(boardList).toHaveBeenCalledWith('plan-1');
+    expect(container!.querySelector('[data-testid="mission-board"]')).not.toBeNull();
+    expect(container!.querySelector('[data-testid="plan-view-toggle"]')).toBeNull();
+    expect(container!.querySelector('[data-testid="plan-view-review"]')).toBeNull();
+    expect(container!.querySelector('[data-testid="plan-view-packages"]')).toBeNull();
+    const evidence = container!.querySelector('[data-testid="plan-review-evidence"]') as HTMLDetailsElement;
+    expect(evidence.open).toBe(false);
+    expect(evidence.querySelector('summary')?.textContent).toBe('Change evidence (diff)');
+    expect(getReviewProjection).not.toHaveBeenCalled();
+
     await act(async () => {
-      (container!.querySelector('[data-testid="plan-view-packages"]') as HTMLButtonElement).click();
+      evidence.open = true;
+      evidence.dispatchEvent(new Event('toggle'));
       await Promise.resolve();
       await Promise.resolve();
     });
-    expect(boardList).toHaveBeenCalledWith('plan-1');
-    expect(container!.querySelector('[data-testid="mission-board"]')).not.toBeNull();
+    expect(getReviewProjection).toHaveBeenCalledOnce();
+    expect(getReviewProjection).toHaveBeenCalledWith({ workspaceId: 'ws-1', planId: 'plan-1' });
+    expect(container!.querySelector('[data-testid="plan-review-view"]')).not.toBeNull();
+
+    await act(async () => {
+      evidence.open = false;
+      evidence.dispatchEvent(new Event('toggle'));
+      evidence.open = true;
+      evidence.dispatchEvent(new Event('toggle'));
+      await Promise.resolve();
+    });
+    expect(getReviewProjection).toHaveBeenCalledOnce();
   });
 });
